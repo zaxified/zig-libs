@@ -143,7 +143,32 @@ fn parseLine(gpa: std.mem.Allocator, line: []const u8) !MountinfoEntry {
     const mount_point_raw = toks.next() orelse return error.Malformed;
     const options = toks.next() orelse return error.Malformed;
 
-    // Zero or more optional fields, terminated by a bare "-" token.
+    // F8 audit finding: a real kernel-emitted row carries exactly ONE bare
+    // "-" token (the mandated separator, proc(5)) — none of the optional
+    // fields the kernel actually emits (`shared:N`, `master:N`,
+    // `propagate_from:N`, `unbindable`) is ever literally "-". The old scan
+    // stopped at the FIRST "-" and assumed it was the separator; a forged
+    // row (this parser's own doc comment already names untrusted
+    // bind-mounted/faked `/proc` and caller-supplied snapshot files as
+    // reachable inputs) carrying a SECOND "-" earlier than the real one made
+    // that assumption wrong silently: the real separator, fs_type,
+    // mount_source and super_options all shifted by one field each, with the
+    // genuine trailing tokens simply dropped unconsumed — not an error, a
+    // well-formed WRONG row (the same shape `mounts.unescapeOctal`'s
+    // out-of-range escape had before it was made to reject rather than
+    // wrap). Counting first, over a copy of the iterator so the real scan
+    // below is untouched, turns an ambiguous row into a rejected one instead
+    // of a silently mis-parsed one.
+    var dash_count: usize = 0;
+    var probe = toks;
+    while (probe.next()) |tok| {
+        if (std.mem.eql(u8, tok, "-")) dash_count += 1;
+    }
+    if (dash_count != 1) return error.Malformed;
+
+    // Zero or more optional fields, terminated by the bare "-" token just
+    // counted above (uniqueness guarantees the first occurrence found here
+    // is the only one, hence the real separator).
     var opt_start: ?usize = null;
     var opt_end: usize = 0;
     var found_sep = false;
@@ -282,6 +307,49 @@ test "parseMountinfo: malformed line (no '-' separator) is skipped, not fatal" {
     const entries = try parseMountinfo(testing.allocator, text);
     defer freeAll(testing.allocator, entries);
     try testing.expectEqual(@as(usize, 2), entries.len);
+}
+
+test "F8 TEETH: a forged row with a second '-' token is rejected, not silently shifted" {
+    // A genuine kernel row has exactly one bare "-" token. This one has two:
+    // an extra "-" standing in for an optional field, BEFORE the real
+    // separator. The old scan stopped at the first one and read
+    // fs_type/mount_source/super_options off the wrong tokens — "shared:1"
+    // as fs_type, the real separator "-" as mount_source, "ext4" (the real
+    // fs_type) as super_options — with the genuine "/dev/sda1" and
+    // "rw,relatime" silently dropped, unconsumed. That is a well-formed
+    // WRONG row, not a rejected one, which is what made this worth a test:
+    // the parser must now refuse it instead of returning it.
+    const text = "1 2 8:1 / /mnt rw - shared:1 - ext4 /dev/sda1 rw,relatime\n";
+    const entries = try parseMountinfo(testing.allocator, text);
+    defer freeAll(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 0), entries.len); // rejected, not shifted
+}
+
+test "F8 TEETH: a forged row whose second '-' lands exactly on the trailing fields is also rejected" {
+    // The narrower case the leftover-token shape above cannot by itself
+    // catch: the extra "-" replaces one of the three trailing fields
+    // (super_options here) instead of leaving anything unconsumed, so the
+    // token COUNT after the true separator still matches. Only counting all
+    // bare "-" tokens up front (not just checking for leftovers) catches
+    // this one.
+    const text = "1 2 8:1 / /mnt rw shared:1 - ext4 /dev/sda1 -\n";
+    const entries = try parseMountinfo(testing.allocator, text);
+    defer freeAll(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "F8 TEETH: positive control — a real single-separator row still parses" {
+    // Must survive: this is the shape of every genuine kernel row (and the
+    // existing `mountinfo_sample.txt`/`mountinfo_escaped.txt` goldens, which
+    // stay green through this change too) — one "-" token, used once.
+    const text = "36 35 98:0 / / rw,noatime shared:1 - ext3 /dev/root rw,errors=continue\n";
+    const entries = try parseMountinfo(testing.allocator, text);
+    defer freeAll(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqualStrings("ext3", entries[0].fs_type);
+    try testing.expectEqualStrings("/dev/root", entries[0].mount_source);
+    try testing.expectEqualStrings("rw,errors=continue", entries[0].super_options);
+    try testing.expectEqualStrings("shared:1", entries[0].optional_fields);
 }
 
 test "parseMountinfo: empty text yields zero entries, not an error" {

@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 audit, F8.** `mountinfo.parseLine` scanned for the mandated `-` separator
+  by stopping at the FIRST bare `-` token. A forged row (untrusted bind-mounted/faked `/proc`, or a
+  caller-supplied snapshot — both already-documented reachable inputs) carrying a SECOND `-` earlier
+  than the real one shifted `fs_type`/`mount_source`/`super_options` onto the wrong tokens with the
+  genuine trailing fields silently dropped — a well-formed WRONG row, not a rejected one. A real
+  kernel row never carries a literal `-` as an optional-field value, so `parseLine` now counts all
+  bare `-` tokens ahead of the scan and rejects the row (`error.Malformed`, already the row's
+  existing "skip, don't fail the table" outcome) unless there is exactly one. Not breaking: no new
+  error, no signature change — a strict superset of rows now rejected, all of them already
+  malformed/forged by the wire format's own rule. Also: `SPEC.md`'s "Limits and refusals" gained a
+  paragraph on **F7** (the 1 MiB read cap bounds bytes, not the ~830,000 allocations a dense table
+  turns into — measured 5.69s on `DebugAllocator` vs 0.05s on an arena; LOW, reachability-limited,
+  recorded as a caller-facing allocator choice rather than a code change, per the audit's own
+  suggested fix). `modules/diskfree/tools/` gained the audit's `diskfree-oracle` instruments
+  (`arch.zig`, `mutate.py`, `hostile-ns.sh`, `smith-semantics.zig`), moved in from the audit's
+  evidence directory per `CONVENTIONS.md` §9 rather than left to be rebuilt from scratch by the next
+  audit; `arch.zig` needs repair (references non-`pub` `statfs` internals) before it runs again — see
+  its own header.
+
 - **2026-09-04** — **Correction to the entry below.** That entry claimed
   `mountinfo` had stopped carrying its own duplicate of `readVirtualFile` and
   now called the fixed one. **It did not: the edit never reached the file**,

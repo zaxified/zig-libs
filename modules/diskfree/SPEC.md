@@ -202,8 +202,26 @@ Not applicable — no secret material is handled anywhere in this module.
   dropped to 300 bytes made `diskfree-demo` print "-- 0 filesystem(s)
   shown." and exit 0 on a 63-mount host.
 - A malformed row in either parser (too few columns, non-numeric IDs, a
-  missing `-` separator in `mountinfo`) is skipped, not fatal — one corrupt
-  line does not sink the whole table, matching `procnet`'s parsers.
+  missing `-` separator, or — **F7 audit finding** — a second `-` token in
+  `mountinfo`, which a real kernel row never has: see `mountinfo.parseLine`'s
+  doc comment) is skipped, not fatal — one corrupt line does not sink the
+  whole table, matching `procnet`'s parsers.
+- **F7 audit finding: the 1 MiB read cap bounds bytes, not the allocation
+  count parsing turns them into.** Measured: 1 MiB of minimal rows
+  (`"a b c d\n"` × 131,072 for `mounts`, `"1 1 0:1 / / r x - t s r\n"` ×
+  43,690 for `mountinfo`) parses in 0.05 s either way (the parse itself is
+  linear), but collecting the ~830,000 resulting small allocations on
+  `std.heap.DebugAllocator` — this collection's own default debugging
+  allocator — takes **5.69 s**, ~114× slower than the **0.05 s** the same
+  parse takes over an `ArenaAllocator`. Nothing here bounds allocation
+  *count*, only byte volume. Reachability is genuinely limited (filling the
+  reader's *own* `/proc/self/mountinfo` past 1 MiB needs mount privilege in
+  the reader's mount namespace; the fully open path is a caller-supplied
+  snapshot, same trust boundary as the parsers' other adversarial-input
+  findings) — LOW, and left as a documented property rather than a code
+  change: **a caller parsing an untrusted or unbounded-size snapshot should
+  use an arena (or another bulk allocator) rather than a general-purpose one**,
+  the same advice `procnet`'s own high-row-count parsers give.
 
 ## Anchoring
 
