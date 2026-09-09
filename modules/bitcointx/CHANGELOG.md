@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `NOTICE` was wrong in three places, each the same kind of wrong —
+  it described an older tree. It said 290 of `sighash.json`'s 500 rows were vendored behind
+  an `OP_CODESEPARATOR` filter; **all 500 are vendored and there is no filter** (the
+  exclusion went when `SerializeScriptCode` was implemented, and
+  `src/legacy_kat_vectors.zig` has said so in its own header ever since). The pin said
+  "fetched 2026-08 from `master`"; the generated files record tag **`v29.0`**, and a moving
+  branch is not a pin. And two further corpora were not named at all: `src/tx_wire_vectors.zig`
+  (213 transactions from Core's `tx_valid.json` + `tx_invalid.json`) and
+  `src/single_bug_kat_vectors.zig`. The latter names an **LGPL-3.0** library, so the file now
+  demonstrates rather than assumes that no copyleft term reaches this collection:
+  `scripts/gen-bitcointx-single-bug.py` builds its own transactions and takes only the
+  return value of `RawSignatureHash`, which is root `NOTICE` §0's black-box oracle. The MIT
+  text is now reproduced, not just cited by copyright line. No code or data changed.
 - **2026-09-08** — Test-only, no production change: the knobs both fuzz targets draw after
   their byte draw are alive, but three of them were **constant**, so the branches behind them
   had never executed in the ordinary lane. Measured 2026-09-08.

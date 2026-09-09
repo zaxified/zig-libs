@@ -6,18 +6,62 @@ reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
 in any copy. Redistributing this module — alone or as part of zig-libs — must
 keep this file with it.
 
-This adds no condition beyond MIT's own: it is the same "preserve the notice"
-requirement that already applies to zig-libs' own code, owed to a different
-author. No third-party SOURCE CODE is present — only test vectors.
+That is the same "preserve the notice" requirement zig-libs' own MIT code
+already carries, owed here to different authors — the MIT text itself is
+reproduced at the end of this file, because MIT asks for the permission notice
+and not only the copyright line. No third-party SOURCE CODE is present — only
+test vectors.
 
-## Bitcoin Core `script_tests.json`
+⛔ CORRECTED 2026-09-09. This file named ONE corpus. The module vendors FIVE,
+and one of them is from a DIFFERENT REPOSITORY this file had never heard of
+(`bitcoin-core/qa-assets`). Each of the four missing ones carries its own
+provenance paragraph in its own header, so nothing was undocumented in the
+tree — but a reader who opens `NOTICE` to answer "what does this module
+reproduce?" was given an answer that was one fifth of the truth. Two of the
+pins were also branch names rather than tags; the generated files record the
+tag (`v29.0`) they actually came from, and a moving branch is not a pin.
+
+## Bitcoin Core `script_tests.json` — two files, not one
 
 `src/script_tests_vectors.zig` reproduces a filtered subset of the official
 script-conformance corpus published by the Bitcoin Core project at
-`src/test/data/script_tests.json` (fetched 2026-07 from `master`). Each row's
-`scriptSig` / `scriptPubKey` assembly text, flag set, expected result and
+`src/test/data/script_tests.json` (`bitcoin/bitcoin`, tag **`v29.0`**). Each
+row's `scriptSig` / `scriptPubKey` assembly text, flag set, expected result and
 comment are transcribed verbatim by script, never hand-typed. The filter is
 mechanical and documented in `SPEC.md` ("script_tests.json coverage").
+
+`src/script_tests_witness_vectors.zig` reproduces the rows that file excludes
+wholesale: of the corpus's 1258 array entries, 51 are comment-only, leaving
+1207 data rows, of which **107 carry a witness field**. Same upstream, same
+tag, same terms.
+
+## Bitcoin Core `tx_valid.json` + `tx_invalid.json` — two more files
+
+`src/tx_findanddelete_vectors.zig` reproduces the `FindAndDelete` /
+`OP_CODESEPARATOR` / `SCRIPT_VERIFY_CONST_SCRIPTCODE` rows, and
+`src/tx_locktime_vectors.zig` the BIP65 / BIP112 boundary rows, both from
+`src/test/data/tx_valid.json` and `tx_invalid.json` (`bitcoin/bitcoin`, tag
+**`v29.0`**). These are REAL transactions, several of them mainnet or testnet3
+spends, serialized as Core stores them with their prevout scriptPubKeys in
+Core's own asm format. They exist because `script_tests.json`'s synthetic spend
+is fixed at `nLockTime = 0` and `nSequence = SEQUENCE_FINAL`, so no row of it
+can exercise the locktime opcodes at all.
+
+## `bitcoin-core/qa-assets` — a SECOND repository, MIT
+
+`src/consensus_kat_vectors.zig` reproduces BIP341/BIP342 consensus vectors
+machine-extracted, unmodified, from `unit_test_data/script_assets_test.json` in
+**`bitcoin-core/qa-assets`** — the corpus Core's own
+`script_tests.cpp:script_assets_test` consumes. That is a different repository
+from `bitcoin/bitcoin`, under its own `LICENSE`, verified 2026-09-09:
+
+  MIT License
+  Copyright (c) 2018 bitcoin-core/qa-assets contributors
+
+The upstream copyright line is literally `Copyright (c) 2018 ` with no holder
+named after the year; the attribution above names the project rather than
+inventing a person, and the absence is recorded instead of being filled in. The
+terms are the same MIT reproduced at the end of this file.
 
 The synthetic crediting/spending transaction pair the vectors are evaluated
 against follows `script_tests.cpp`'s `BuildCreditingTransaction` /
@@ -38,3 +82,24 @@ The sibling `bitcointx` module cites Bitcoin Core as a design reference for the
 legacy sighash algorithm; that is a design-reference record and lives in that
 module's own `README.md` `Provenance:` statement, not here, because nothing of
 theirs is reproduced there.
+
+MIT License, reproduced for both upstreams above
+-------------------------------------------------
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.

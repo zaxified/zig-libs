@@ -48,10 +48,25 @@ tools that look disposable once the work that needed them landed, and are not.
 | When | Command | What it does |
 |------|---------|--------------|
 | **While working** | `scripts/test.sh` | Tests only what your change can affect |
-| **Before committing** | `scripts/test.sh all` | Every module — the same gate CI runs |
+| **Before committing** | `scripts/test.sh all` | Every module — **most** of what CI runs; see the gap below |
 | Reproducing a CI lane | `scripts/test.sh all -Dstrict-debug` / `-Doptimize=ReleaseFast` | Trailing args pass through to `zig build` |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
 | Before cutting a tag | `scripts/test.sh interop` | Re-takes the six interop anchors against REAL peers — see below. Needs `scripts/ci-environment.sh interop`; ~35 s warm |
+
+### ⚠ `test.sh all` is NOT the whole of CI
+
+This table said "the same gate CI runs" until 2026-09-09, and it was not true.
+CI additionally runs a `consumer` job that `test.sh` never calls at all:
+`scripts/check-apps.sh --run` builds the five `example-apps/` packages and runs
+each one's `smoke.sh` in ReleaseSafe and then ReleaseFast, and
+`scripts/check-apps.sh --pinned` builds them through their published pins.
+
+That job is the only thing that goes through the real packaging machinery — the
+path a stranger who fetches the package actually takes — so it is exactly the
+half a local run cannot substitute for. If you want it before committing, run
+`scripts/check-apps.sh --run` yourself; it is not folded into `all` because
+`--pinned` is fail-closed off a tag ref and the `--run` half is minutes of
+whole-program builds.
 
 ## Environment gaps
 

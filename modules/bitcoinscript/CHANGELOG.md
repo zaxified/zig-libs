@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `NOTICE` named ONE vendored corpus; the module has **five**, and one
+  of them comes from a repository the file had never heard of. Added:
+  `src/script_tests_witness_vectors.zig` (the 107 witness-bearing rows of Core's
+  `script_tests.json`), `src/tx_findanddelete_vectors.zig` and `src/tx_locktime_vectors.zig`
+  (the `FindAndDelete`/`OP_CODESEPARATOR` and BIP65/BIP112 rows of `tx_valid.json` +
+  `tx_invalid.json`), and `src/consensus_kat_vectors.zig` — which is from
+  **`bitcoin-core/qa-assets`**, a separate MIT repository, not from `bitcoin/bitcoin`. Its
+  upstream copyright line is literally `Copyright (c) 2018 ` with no holder after the year;
+  the attribution names the project rather than inventing a person, and the absence is
+  recorded. Two pins were branch names and are now the `v29.0` tag the generated files
+  actually record. The MIT text is now reproduced. No code or data changed.
 - **2026-09-07** — **Test-only, two harnesses, and two recorded audit fixes
   that had never executed.** (a) `verify.fuzzVerifyScript` had NO corpus, so
   the ordinary test lane ran exactly one round of `in = ""` and every `Smith`

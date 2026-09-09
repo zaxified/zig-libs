@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `NOTICE`'s port inventory said "Ported so far:" and then listed ONE
+  file. Seven carry a `Ported from emersion/go-imap` line in their own headers — `utf7`,
+  `wire`, `command`, `response`, `client`, `fetch`, `search` — so the inventory was wrong by
+  six, which is most of the module. The reproduced MIT text was complete the whole time, so
+  nothing was legally owed that was not paid; what was wrong was the record of WHAT was
+  taken, and a record that answers the reader's question with a falsehood is worse than one
+  that is absent. No code changed.
 - **2026-09-08** — Test-only, no production change: the scalar knobs the three fuzz
   harnesses draw after their byte frame were measured across their corpora for the first
   time. `command.fuzzBuilders` was the one with a hole — `quoted_utf8` came out **true on 5

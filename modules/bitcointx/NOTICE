@@ -6,21 +6,76 @@ reproduces third-party TEST-CASE TEXT whose copyright notice must be preserved
 in any copy. Redistributing this module — alone or as part of zig-libs — must
 keep this file with it.
 
-This adds no condition beyond MIT's own: it is the same "preserve the notice"
-requirement that already applies to zig-libs' own code, owed to a different
-author. No third-party SOURCE CODE is present — only test vectors.
+That is the same "preserve the notice" requirement zig-libs' own MIT code
+already carries, owed here to a different author — the MIT text itself is
+reproduced at the end of this file, because MIT asks for the permission notice
+and not only the copyright line. No third-party SOURCE CODE is present — only
+test vectors.
+
+⛔ CORRECTED 2026-09-09. THE INVENTORY BELOW WAS WRONG IN THREE PLACES, and each
+was the same kind of wrong: the file described an older tree.
+
+  - It said 290 of `sighash.json`'s 500 rows were vendored behind an
+    `OP_CODESEPARATOR` filter. **All 500 are vendored and there is no filter.**
+    The exclusion existed because `sighash_legacy.zig` wrote `script_code`
+    verbatim instead of running Core's `SerializeScriptCode`; that step is
+    implemented, so the filter is gone. `src/legacy_kat_vectors.zig` has said so
+    in its own header the whole time — this file simply never caught up.
+  - The pin said "fetched 2026-08 from `master`". The generated file records the
+    tag it actually came from: **`v29.0`**. A moving branch is not a pin.
+  - Two further corpora from the same upstream and one from another were not
+    named here at all. They are below.
 
 ## Bitcoin Core `sighash.json`
 
 `src/legacy_kat_vectors.zig` reproduces the official legacy (pre-segwit)
 `SignatureHash()` reference-oracle corpus published by the Bitcoin Core
-project at `src/test/data/sighash.json` (fetched 2026-08 from `master`).
-Every row is included except those whose `script` field contains byte `0xab`
-(`OP_CODESEPARATOR`, out of scope — see `sighash_legacy.zig`'s module doc
-comment): 290 of the 500 rows pass that mechanical, row-content-based filter
-and are vendored, unfiltered further. Each row's `raw_transaction` / `script`
-/ `input_index` / `hashType` / `signature_hash` is transcribed by script,
-never hand-typed.
+project at `src/test/data/sighash.json` (`bitcoin/bitcoin`, tag **`v29.0`**).
+The file holds 501 array entries, one of them a header comment, so **500 data
+rows — and all 500 are vendored**, unfiltered. Each row's `raw_transaction` /
+`script` / `input_index` / `hashType` / `signature_hash` is transcribed by
+`scripts/gen-bitcoin-core-vectors.py`, never hand-typed.
+
+## Bitcoin Core `tx_valid.json` + `tx_invalid.json`
+
+`src/tx_wire_vectors.zig` reproduces every transaction in both files
+(`bitcoin/bitcoin`, tag **`v29.0`**) as a wire-format corpus for this module's
+serializer and deserializer: `tx_valid.json` contributes 120 data rows of its
+247 entries, `tx_invalid.json` 93 of its 201, for **213 transactions**. Same
+upstream, same MIT terms, same generator. It was not named in this file until
+2026-09-09.
+
+## Bitcoin Core `bip143`/`bip341` and the block-170 transaction
+
+`src/bip143_kat_vectors.zig`, `src/bip341_kat_vectors.zig` and the `segwit_*`
+entries of `src/tx_kat_vectors.zig` come from the BIPs' own published worked
+examples (`bip-0143.mediawiki`, `bip-0341/wallet-test-vectors.json`) rather
+than from Core. The `legacy_*` entries of `src/tx_kat_vectors.zig` are the
+block-170 P2PK transaction, fetched from a block explorer — bytes the Bitcoin
+network established, not anyone's authored corpus.
+
+## python-bitcoinlib (LGPL-3.0) — an ORACLE, and nothing is taken from it
+
+**Copyleft:** NONE-SHIPPED — python-bitcoinlib is an ORACLE this repository RUNS
+at generation time, not code it ships: `scripts/gen-bitcointx-single-bug.py`
+builds its own transactions and reads back only the value
+`RawSignatureHash` returns for them, so no python-bitcoinlib source and no
+python-bitcoinlib data is in this repository, and nothing links against it.
+
+`src/single_bug_kat_vectors.zig` names an **LGPL-3.0** library, so it is worth
+saying plainly why no copyleft term reaches this collection — root `NOTICE` §1
+makes copyleft in shipped material a defect to be removed, not a paperwork item,
+so "no term reaches us" has to be demonstrated rather than assumed.
+
+`scripts/gen-bitcointx-single-bug.py` builds its transactions ITSELF — `mk(n_in,
+n_out)` assembles inputs from `COutPoint(lx('aa'*32 …))` and outputs from
+`CScript(bytes([0x51 + i]))`, all of it our own construction — and takes from
+the library only the RETURN VALUE of `RawSignatureHash` on those inputs. That is
+the black-box oracle case root `NOTICE` §0 carves out: the observable behaviour
+of a program on our own input. No python-bitcoinlib source is read, ported or
+shipped, and the library is not linked into anything this repository
+distributes. Recorded here because the fact was true but nowhere written, which
+is how a reader ends up re-deriving it.
 
   Copyright (c) 2009-2010 Satoshi Nakamoto
   Copyright (c) 2009-present The Bitcoin Core developers
@@ -39,3 +94,24 @@ public BIP/spec-published examples (`bip-0143.mediawiki`, `bip-0341/
 wallet-test-vectors.json`), which are not third-party CODE or DATA in the
 sense this file exists to flag — see this module's `README.md` `Provenance:`
 statement for that design reference instead.
+
+MIT License, reproduced for the Bitcoin Core material above
+-----------------------------------------------------------
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.

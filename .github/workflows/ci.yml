@@ -792,6 +792,28 @@ jobs:
         # Only where module TESTS run. The examples and checks lanes have no
         # business paying for a root netns they never enter.
         if: matrix.tc
+        # ⚠ THE ONE `zig build` IN THIS FILE THAT IS NOT MEMORY-CAPPED, and it
+        # is recorded rather than fixed because the fix could not be MEASURED.
+        # `scripts/capped` wraps a command in `systemd-run --user --scope`;
+        # under `sudo` that targets root's user manager, which normally does not
+        # exist, so `capped` here would silently degrade to a bare `exec` and
+        # buy a false sense of a bound. A root-side fix (`systemd-run --scope`
+        # against the SYSTEM manager) is plausible but untested — this machine
+        # has no passwordless sudo, so it could not be exercised, and an
+        # unverified cap is worse than a recorded gap. `scripts/check-apps.sh`,
+        # the other uncapped site the same audit found, IS fixed: it runs under
+        # `capped` now, and the cap was proved to bound by killing a 3.2 GB
+        # allocator at a 256 MB limit.
+        #
+        # ⚠ SECOND, SEPARATE ISSUE AT THIS SITE, also recorded and not changed:
+        # the two `--cache-dir` paths point into `/tmp`. `scripts/test.sh`
+        # deliberately redirects `TMPDIR` off tmpfs because a multi-gigabyte
+        # build cache in RAM once OOM-killed a desktop here; passing
+        # `--cache-dir /tmp/...` by hand walks straight around that. It is left
+        # alone because the alternative — a root-owned cache inside the
+        # checkout — creates permission debris in the working tree, and picking
+        # between the two needs a measurement of this runner's `/tmp` (tmpfs or
+        # disk?) that has not been taken.
         run: |
           sudo unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
             --summary all \

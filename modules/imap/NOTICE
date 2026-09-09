@@ -14,12 +14,38 @@ NOTICE, which stays free of any third-party condition.
 ## emersion/go-imap v2  (wire layer)
 
 The `imap` module is a PORT of `github.com/emersion/go-imap` v2, not a
-clean-room implementation from RFC 9051. Ported so far:
+clean-room implementation from RFC 9051.
+
+⛔ CORRECTED 2026-09-09. This inventory said "Ported so far:" and then listed
+ONE file, `utf7.zig`. Seven files carry a `Ported from emersion/go-imap` line in
+their own headers — that is most of the module, and the inventory was wrong by
+six of them. The reproduced MIT text below was complete the whole time, so
+nothing was ever legally owed that was not paid; what was wrong was the record
+of WHAT was taken, and a record that is wrong is worse than one that is absent,
+because it answers the reader's question with a falsehood. The list below is now
+derived from the tree (`rg -ln 'Ported from .*emersion/go-imap' modules/imap/src/`),
+not maintained by hand.
+
+Ported (7 files, verified against the tree 2026-09-09):
 
   * `utf7.zig` — `internal/utf7/{utf7,decoder,encoder}.go`: the modified-UTF-7
     codec, including its rejection rules (padding, null shift, non-canonical
     base64 runs, unpaired surrogates). The vector table in this module's tests
     is `internal/utf7/decoder_test.go`.
+  * `wire.zig` — `internal/imapwire/decoder.go`: the IMAP wire grammar on the
+    decode side (atoms, quoted strings, literals, `NIL`, numbers,
+    parenthesised lists), including its tolerances for what real servers send.
+  * `command.zig` — `internal/imapwire/encoder.go` plus the command builders in
+    `imapclient`: the encode side, including when an `astring` must go as a
+    literal rather than quoted.
+  * `response.zig` — `imapclient/client.go`'s `readResponse` family: the
+    three response shapes and the same real-server tolerances.
+  * `client.zig` — `imapclient`: the session layer, reshaped from upstream's
+    goroutine-per-connection model into a synchronous one.
+  * `fetch.zig` — `imapclient/fetch.go`: `FETCH` and the `msg-att` reply,
+    including the recursive `BODYSTRUCTURE` grammar.
+  * `search.zig` — `imapclient/search.go`: `SEARCH` criteria and both the
+    IMAP4rev1 and `ESEARCH` reply shapes.
 
 go-imap is under the MIT license, reproduced here as its terms require:
 
