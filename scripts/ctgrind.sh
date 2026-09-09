@@ -180,6 +180,7 @@ declare -A TARGETS=(
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
     [paillier]="crt noncrt mul addm"
+    [aescbc]="pkcs7 xmlenc"
     [tlock]="fp12pow decrypt"
     [ibe]="extract decrypt fp12pow"
     # ── round 4, 2026-09-09: the secp256k1 signing family ──────────────────
@@ -228,6 +229,7 @@ declare -A MODES=(
     [threshold_ecdsa]="ReleaseFast"
     [bulletproofs]="ReleaseFast"
     [paillier]="ReleaseFast"
+    [aescbc]="ReleaseFast"
     [tlock]="ReleaseFast"
     [ibe]="ReleaseFast"
     [frost]="ReleaseFast"
@@ -364,6 +366,9 @@ declare -A PATTERN=(
     [paillier/noncrt]='root[.]zig|ff[.]zig|int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [paillier/mul]='root[.]zig|ff[.]zig'
     [paillier/addm]='root[.]zig|ff[.]zig'
+    # `aescbc` does its own arithmetic over a secret in exactly one file.
+    [aescbc/pkcs7]='root[.]zig'
+    [aescbc/xmlenc]='root[.]zig'
     [tlock/fp12pow]='tlock[.]zig|ciphersuite[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|scalar[.]zig'
     [tlock/decrypt]='tlock[.]zig|ciphersuite[.]zig|pairing[.]zig|fp12[.]zig|fp6[.]zig|fp2[.]zig|fp[.]zig|g2[.]zig|g1[.]zig|scalar[.]zig|mem[.]zig'
     [ibe/extract]='ibe[.]zig|g1[.]zig|fp[.]zig|scalar[.]zig'
@@ -446,6 +451,8 @@ declare -A LABEL=(
     [paillier/noncrt]='paillier decrypt non-CRT+std bigint'
     [paillier/mul]='paillier mulPlaintext (k)'
     [paillier/addm]='paillier addPlaintext (m)'
+    [aescbc/pkcs7]='aescbc unpadPkcs7 (N secret)'
+    [aescbc/xmlenc]='aescbc unpadXmlEnc (N secret)'
     [tlock/fp12pow]='tlock encrypt r->fp12Pow (F3)'
     [tlock/decrypt]='tlock decrypt+bls12_381 pairing'
     [ibe/extract]='ibe extract (msk -> G1)'

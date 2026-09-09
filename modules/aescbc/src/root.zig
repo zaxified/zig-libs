@@ -154,6 +154,17 @@ pub fn padPkcs7(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
 /// every check into a single flag with no secret-dependent early exit (no
 /// distinct control-flow signal for "bad length" vs. "bad pad byte") before
 /// returning `InvalidPadding`. Returns the unpadded length on success.
+///
+/// ⭐ MEASURED, not reviewed (`src/ctgrind_harness.zig`, target `pkcs7`; the
+/// row is pinned in `scripts/ctgrind-expected.tsv`). With the whole padded
+/// buffer marked undefined, memcheck reports ONE context in this file, at the
+/// `if (invalid != 0)` below — the accept/reject decision this function returns
+/// to its caller anyway. The scan loop contributes none, so there is no early
+/// exit and no per-reason signal, which is what the paragraph above claims.
+/// It is measured because the same `@intFromBool`/`u1` idiom did NOT survive
+/// the compiler in `fss` (`dpf.zig:326`): written branch-free, lowered to a
+/// jump on the secret at one of its three call sites. Reading this code is not
+/// evidence about the binary built from it.
 pub fn unpadPkcs7(buf: []const u8) PaddingError!usize {
     if (buf.len == 0 or buf.len % block_len != 0) return error.InvalidPadding;
     const n = buf[buf.len - 1];

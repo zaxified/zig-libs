@@ -382,3 +382,15 @@ tfhe	ReleaseFast	decrypt	1	<=10	ff62a60d16b52a66	b6d58329e7c93b2f
 tfhe	ReleaseFast	bootstrap	1	<=186	c546ed4f83700e54	4e39213562dbdc80
 dkg	ReleaseFast	coeffs	1	<=98	3f546b9ec9ff000d	ace23d0e40b2c8f5
 dkg	ReleaseFast	combine	1	0	9d983ff8e2433712	6407896882d3491c
+# aescbc — the two padding strippers, the only place this module does its own
+# arithmetic over a secret. ⭐ The claim these rows test is NOT "zero": both
+# functions END in `if (invalid != 0) return error.InvalidPadding` and return
+# `buf.len - pad_len`, and BOTH of those are disclosed to the caller by the
+# API's contract (accept/reject, and the plaintext length). The 1 is exactly
+# that decision, at `root.zig:170` — measured, not assumed. What the module's
+# own words forbid is an EARLY EXIT from the scan or a distinct signal per
+# failure reason, and the scan loop contributes 0 contexts, so there is neither.
+# ⚠ The same `u1`-flag idiom did NOT survive the compiler in fss
+# (`dpf.zig:326`), which is why this is measured rather than reviewed.
+aescbc	ReleaseFast	pkcs7	1	1	e007b2ab5512efa3	c4046968725e140d
+aescbc	ReleaseFast	xmlenc	1	1	e007b2ab5512efa3	c4046968725e140d
