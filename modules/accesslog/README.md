@@ -37,7 +37,7 @@ try accesslog.writeJsonLines(entry, &w);
 // {"ts":1734000000000000000,"remote_addr":"192.0.2.1:54321","method":"GET",
 //  "target":"/status?x=1","protocol":"HTTP/1.1","status":200,"request_bytes":null,
 //  "response_bytes":512,"latency_ns":1500000,"user_agent":"curl/8.0",
-//  "referer":null,"request_id":null}
+//  "referer":null,"request_id":null,"trace_id":null,"span_id":null}
 ```
 
 Or pick the format at runtime with the `Format` enum:

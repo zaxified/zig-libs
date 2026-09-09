@@ -501,6 +501,18 @@ fn writeClfEscaped(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     for (s) |c| switch (c) {
         '"' => try w.writeAll("\\\""),
         '\\' => try w.writeAll("\\\\"),
+        // `]` is not a control byte and Apache's own `ap_escape_logitem`
+        // does not escape it either — but it is the one non-control byte
+        // that is also a delimiter here: `time_formatted` sits inside the
+        // unquoted `[%t]` bracket, and this module's SPEC promises "no
+        // value, however crafted, can close its delimiter early" for every
+        // Combined field. A hand-built `Entry` whose `time_formatted`
+        // contains `]` could otherwise splice fabricated content between
+        // the real brackets (`entryFromRequest` can never produce this —
+        // see SPEC.md's threat model). Hex-escaped like the control bytes
+        // below, not backslash-escaped: a literal `\]` still contains the
+        // raw `]` byte a bracket-matching reader looks for.
+        ']' => try w.print("\\x{x:0>2}", .{c}),
         0x00...0x1F, 0x7F => try w.print("\\x{x:0>2}", .{c}),
         else => try w.writeByte(c),
     };
@@ -1138,6 +1150,34 @@ test "Combined: external anchor — quote escape prevents field breakout" {
         "192.0.2.1 - - [22/Jul/2026:10:00:00 +0000] \"quote\\\"inside quote\\\"inside HTTP/1.1\" 200 512 \"quote\\\"inside\" \"quote\\\"inside\"\n",
         w.buffered(),
     );
+}
+
+test "Combined: a `]` in time_formatted cannot close the [%t] bracket early" {
+    // A1 finding (LOW): `writeClfEscaped` passed `]` through unescaped, so a
+    // crafted `time_formatted` could close the real `[%t]` bracket wherever
+    // it liked and splice fabricated content in before the genuine close.
+    // Only reachable via a hand-built `Entry` -- `entryFromRequest` derives
+    // `time_formatted` from trusted formatting code, never from a header --
+    // but SPEC's threat model explicitly covers "any string field" of a
+    // hand-built Entry, and the module's own blanket promise is that "no
+    // value, however crafted, can close its delimiter early".
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCombined(.{
+        .timestamp_ns = 1,
+        .time_formatted = "22/Jul/2026:10:00:00 +0000] FORGED",
+        .remote_addr = "192.0.2.1",
+        .method = "GET",
+        .target = "/a",
+        .protocol = "HTTP/1.1",
+        .status = 200,
+        .response_bytes = 512,
+    }, &w);
+    const out = w.buffered();
+    // Exactly one raw `]` may reach the wire: the genuine bracket close this
+    // function itself writes. A second one means the attacker's byte closed
+    // the field early instead of being escaped.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "]"));
 }
 
 test "JSON Lines: round-trips through std.json — CRLF stays escaped" {

@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit close-out, 3 findings. (1) Combined's
+  `writeClfEscaped` now hex-escapes `]` the same way it already hex-escapes
+  control bytes: `]` is the one non-control byte that is also a delimiter
+  here (`time_formatted` sits inside the unquoted `[%t]` bracket), so a
+  hand-built `Entry` could otherwise splice fabricated content past the real
+  bracket close. `entryFromRequest` can never produce this (`time_formatted`
+  comes from trusted formatting code, never a header) but SPEC's threat
+  model explicitly covers "any string field" of a hand-built `Entry`.
+  Measured: RED (a crafted `time_formatted` put 2 raw `]` bytes on the wire)
+  → GREEN (1). (2) The SPEC/code key-count mismatch (SPEC.md's field table
+  and JSON key list were already fixed by `91d2744d`, 2026-09-01) is now
+  closed in README.md's quick-start example too, which still rendered the
+  pre-`trace_id`/`span_id` 12-key JSON comment. (3) The three fuzz harnesses
+  and the anti-degeneracy corpus test not reaching `trace_id`/`span_id` were
+  already fixed by `91d2744d` — verified structurally against `91d2744d^`
+  (7-slot `ill_formed` → 9-slot) and confirmed green in the current suite;
+  no further code change needed.
 - **2026-09-08** — Test-only, no production change: `fuzzEntry`'s five numeric draws
   (`timestamp_ns`, `status`, `request_bytes`, `response_bytes`, `latency_ns`) were dead on
   every corpus replay. They come after the field payloads, each corpus entry stopped at the
