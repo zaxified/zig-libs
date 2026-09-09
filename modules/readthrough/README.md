@@ -59,9 +59,9 @@ semantics, and the deliberately-deferred list (including stale-while-revalidate)
 ## Without the router (and without HTTP)
 
 Nothing in this module knows about requests, responses or `router` — `get`
-takes a key and a loader, `ifCached(key)` is the zero-allocation cache-hit
-probe. It composes with any call site that has a key and a way to fetch,
-HTTP handler or not.
+takes a key and a loader, `ifCached(key, ctx, f)` is the zero-allocation
+cache-hit probe. It composes with any call site that has a key and a way to
+fetch, HTTP handler or not.
 
 ## Ownership / return contract
 
