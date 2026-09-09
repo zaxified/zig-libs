@@ -216,8 +216,11 @@ header values out of your request type remains yours.
   within `throttle_window_ms` (default **5 s**; `0` disables) repeated
   401s from one client key are coalesced — the hook stays quiet and the
   suppressed count is **folded into the next admitted entry**
-  (`entry.suppressed`), so nothing is silently dropped while an
-  unauthenticated flood cannot flood the audit sink. Responses are never
+  (`entry.suppressed`), so nothing is silently dropped. ⚠ That bounds a
+  flood only as far as the throttle key is trustworthy — see the caveat
+  below; on a directly reachable server a client that varies its own
+  forwarded-IP header per request gets a fresh key every time and reaches
+  `on_audit` on every single denial. Responses are never
   throttled — every denied request still gets its 401. The store is
   bounded (`throttle_max_keys`, default 1024, LRU eviction; evicting a
   key may drop its pending fold count — bounded memory wins). Clock

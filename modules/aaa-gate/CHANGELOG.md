@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit disposition. Two open findings closed, both refuted
+  against the tree (the underlying bugs were real but already fixed by the
+  2026-09-01 middleware audit, `91d2744d`, outside this campaign):
+  - `throttle_max_keys = 0`: audit cited a Debug-only `std.debug.assert` guarding
+    a `t.lru.last.?` unwrap that ReleaseFast strips, corrupting the heap on an
+    empty store. The tree already replaced the unwrap with `if (t.lru.last) |tail|`
+    (no-op when there is no tail to evict). Reproduced the historical bug in a
+    standalone probe copying the pre-fix `Throttle.decide`
+    (`.zig-cache/probe/aaa-gate-throttle-max0.zig`, not committed — scratch):
+    50 calls with `max_keys = 0` on an empty store in ReleaseFast **SIGSEGV** with
+    the old unwrap, **1/1 pass** with the current tree's guarded version.
+  - "An unauthenticated flood cannot flood the audit sink": the same 2026-09-01
+    audit already corrected the module doc comment (`root.zig`) but never touched
+    `README.md`, which still asserted the false claim three lines above its own
+    correct caveat ("forged forwarding headers let a client pick its own throttle
+    key"). Reworded the README paragraph to match. `rg -n "cannot flood the audit
+    sink" README.md`: 1 hit before, 0 after.
+
+  Also closed the LOW backlog item ("`fuzzBearerToken` mostly exercises
+  `bearerTokenOf(null)`; `clientKeyFrom` has no fuzz target at all") left over
+  from the 2026-09-07 fuzz-draw fix below: added direct string-level fuzz
+  targets and pinned reach-guard tests for `bearerTokenOf` (9/10 seeds non-empty,
+  4 tokens, 21 octets) and `clientKeyFrom` (8/9 seeds non-empty, 2 hit the shared
+  fallback, 1 exercises the 48-byte clamp on a forged value) — `queryValue`
+  already had one. `clientKeyFrom`'s peer-address fallback stays on the existing
+  deterministic unit test; `std.Io.net.IpAddress` is not a byte string to draw.
+
 - **2026-09-07** — **All three fuzz harnesses were replaying an EMPTY input, and the
   API-key one had never run its query branch at all.**
 

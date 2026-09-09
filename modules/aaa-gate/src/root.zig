@@ -2631,6 +2631,123 @@ test "corpus: every query seed reaches queryValue, and what it returned is pinne
     try testing.expectEqual(@as(usize, 239), value_octets);
 }
 
+/// Raw `Authorization` header VALUES (not blocks — `bearerTokenOf` is the
+/// string-level half below `bearerToken`'s header lookup). Public per Z4, so
+/// it gets its own direct corpus rather than only being reached indirectly
+/// through `fuzzBearerToken`'s block-parsing detour.
+const bearer_value_seeds = [_][]const u8{
+    seed("Bearer abc123"), // the ordinary credential
+    seed("bearer abc123"), // case-INSENSITIVE scheme match
+    seed("  Bearer   abc123  "), // surrounding SP/TAB trimmed
+    seed("Bearer\tabc123"), // TAB after the scheme: not a space, so null
+    seed("Bearer"), // scheme only, nothing after
+    seed("Bearer "), // scheme + one space, empty credential
+    seed("Bearerabc"), // no delimiter after the scheme
+    seed("Basic dXNlcjpwdw=="), // another scheme entirely
+    seed(""), // empty value
+    seed("Bearer \xff\xfe\xfd"), // non-ASCII credential
+};
+
+test "fuzz bearerTokenOf never panics" {
+    try testing.fuzz({}, fuzzBearerTokenOf, .{ .corpus = &bearer_value_seeds });
+}
+
+fn fuzzBearerTokenOf(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = bearerTokenOf(buf[0..len]);
+}
+
+test "corpus: every bearer-value seed reaches bearerTokenOf, and what it returned is pinned" {
+    var nonempty: usize = 0;
+    var tokens_found: usize = 0;
+    var token_octets: usize = 0;
+    for (bearer_value_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const tok = bearerTokenOf(buf[0..len]) orelse continue;
+        tokens_found += 1;
+        token_octets += tok.len;
+    }
+    // Measured: 9 of 10 seeds non-empty (the empty-value seed is the one
+    // intentional zero), 4 tokens recovered, 21 octets total.
+    try testing.expectEqual(@as(usize, 9), nonempty);
+    try testing.expectEqual(@as(usize, 4), tokens_found);
+    try testing.expectEqual(@as(usize, 21), token_octets);
+}
+
+/// Raw `X-Forwarded-For`/`X-Real-IP` values — the attacker-controlled half of
+/// `clientKeyFrom`'s trust chain (the module doc's own caveat: a client that
+/// varies these per request picks its own throttle key). `clientKeyFrom` had
+/// **no** fuzz target at all before this; the peer-address fallback stays on
+/// the deterministic unit test above (`std.Io.net.IpAddress` is not a byte
+/// string to draw).
+const client_key_seeds = [_][]const u8{
+    seed("203.0.113.7"), // a single XFF hop, no X-Real-IP
+    seed("10.0.0.1, 203.0.113.7"), // multiple hops: the rightmost is trusted
+    seed("a, \x1f198.51.100.2"), // empty XFF tail falls through to X-Real-IP
+    seed("\x1f198.51.100.2"), // XFF absent (empty before the split), X-Real-IP present
+    seed(""), // neither side present: falls all the way to the shared fallback
+    seed(("x" ** 100)), // a forged value past the 48-byte cap: must clamp, never overflow
+    seed(" 198.51.100.2 \x1f"), // SP around the XFF value is trimmed
+    seed(",,,"), // degenerate separators only
+    seed("\xff\xfe\xfd\x1f\xfc\xfb"), // non-ASCII on both sides
+};
+
+test "fuzz clientKeyFrom never panics" {
+    try testing.fuzz({}, fuzzClientKeyFrom, .{ .corpus = &client_key_seeds });
+}
+
+fn fuzzClientKeyFrom(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const split: usize = fuzzSplitAt(buf[0..len]);
+    const xff = buf[0..split];
+    const real_ip = buf[@min(split + 1, len)..len];
+    var key_buf: [client_key_len_max]u8 = undefined;
+    const key = clientKeyFrom(
+        if (xff.len != 0) xff else null,
+        if (real_ip.len != 0) real_ip else null,
+        null,
+        &key_buf,
+    );
+    // Never panics AND never exceeds the bound the throttle store relies on.
+    try testing.expect(key.len <= client_key_len_max);
+}
+
+test "corpus: every client-key seed reaches clientKeyFrom, and the split is real" {
+    var nonempty: usize = 0;
+    var from_fallback: usize = 0;
+    var max_len_hits: usize = 0;
+    for (client_key_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const split: usize = fuzzSplitAt(buf[0..len]);
+        const xff = buf[0..split];
+        const real_ip = buf[@min(split + 1, len)..len];
+        var key_buf: [client_key_len_max]u8 = undefined;
+        const key = clientKeyFrom(
+            if (xff.len != 0) xff else null,
+            if (real_ip.len != 0) real_ip else null,
+            null,
+            &key_buf,
+        );
+        if (std.mem.eql(u8, key, fallback_key)) from_fallback += 1;
+        if (key.len == client_key_len_max) max_len_hits += 1;
+    }
+    // Measured: 8 of 9 seeds non-empty (the empty seed is the one
+    // intentional zero; the >256-byte over-length draw the corpus format
+    // itself cannot carry is not this one), 2 hit the shared fallback, and
+    // the 100-byte forged value clamps to `client_key_len_max` exactly once.
+    try testing.expectEqual(@as(usize, 8), nonempty);
+    try testing.expectEqual(@as(usize, 2), from_fallback);
+    try testing.expectEqual(@as(usize, 1), max_len_hits);
+}
+
 // ── tests (string-level extractors — no request type) ───────────────────────
 
 test "bearerTokenOf: RFC 9110 shapes map to a token or to null, never panic" {
