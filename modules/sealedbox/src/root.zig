@@ -566,6 +566,53 @@ test "too-short/garbage ciphertext: clean error, no panic" {
     try std.testing.expectError(error.AuthenticationFailed, open(&opened, &garbage, kp));
 }
 
+test "KAT: a key whose base64 uses BOTH `+` and `/` — the two alphabet slots nothing else covers" {
+    // ⛔ Audit finding L1. Mutation M13 (decoder switched to the URL-SAFE
+    // alphabet, `-` `_` instead of `+` `/`) was caught only BY LUCK: both
+    // fixed KAT strings in this module ("AAECAwQ…" and "dwdtCnMYpX08…")
+    // contain neither character, so the only test that could see the swap
+    // encoded a FRESHLY GENERATED key and its verdict rode on entropy.
+    // P(a random 32-byte key encodes without `+` or `/`) ≈ 0.255, two keys per
+    // run, so the gate went green roughly once every twelve runs — measured
+    // RED 11 / GREEN 1 of 12. A gate whose teeth are on a coin flip.
+    //
+    // This vector is chosen so that indices 62 (`+`) and 63 (`/`) both appear:
+    // three occurrences, at three different 6-bit positions.
+    const key: [public_length]u8 = .{
+        0x48, 0x47, 0x08, 0xfc, 0xe1, 0x0f, 0x53, 0x01,
+        0xf0, 0xd0, 0x02, 0x7e, 0x87, 0xdf, 0x9e, 0xc3,
+        0xa9, 0xfc, 0x9b, 0x6a, 0xb9, 0x9a, 0xd6, 0x80,
+        0x8e, 0x14, 0xef, 0xa3, 0xa0, 0x2e, 0xe8, 0xef,
+    };
+    const expected = "SEcI/OEPUwHw0AJ+h9+ew6n8m2q5mtaAjhTvo6Au6O8=";
+    try std.testing.expect(std.mem.indexOfScalar(u8, expected, '+') != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, expected, '/') != null);
+
+    // Public path — still `std.base64`, and the path M13 mutated.
+    const pub_b64 = encodePublicKeyBase64(key);
+    try std.testing.expectEqualStrings(expected, &pub_b64);
+    try std.testing.expectEqual(key, try parsePublicKeyBase64(expected));
+
+    // Secret path — this module's own constant-time codec, which must agree
+    // character for character on exactly these two slots.
+    const sec_b64 = encodeSecretKeyBase64(key);
+    try std.testing.expectEqualStrings(expected, &sec_b64);
+    try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyBase64(expected)));
+
+    // ⛔ And the url-safe spelling of the SAME key must be rejected by both,
+    // which is what makes this a test of the alphabet rather than of a string:
+    // an implementation that quietly accepted `-`/`_` would round-trip happily.
+    var urlsafe: [base64_pk_len]u8 = undefined;
+    @memcpy(&urlsafe, expected);
+    for (&urlsafe) |*c| c.* = switch (c.*) {
+        '+' => '-',
+        '/' => '_',
+        else => c.*,
+    };
+    try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&urlsafe));
+    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&urlsafe));
+}
+
 test "KAT: public key base64 + hex, exact strings and decode-back" {
     const pk: [public_length]u8 = blk: {
         var k: [public_length]u8 = undefined;
