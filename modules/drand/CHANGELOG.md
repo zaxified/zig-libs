@@ -5,6 +5,78 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, 3 of 6 remaining findings closed (test
+  quality only — this module has a real consumer, `example-apps/timecapsule`,
+  confirmed against `build.zig`'s `example_apps` table, not only
+  `module-graph`'s consumer count; P1's free-hardening license does NOT
+  apply here, so nothing that changes observable parse/verify behavior was
+  touched this session).
+
+  - **F13.** Both `max_document_bytes` tests (`chaininfo.zig`, `round.zig`)
+    allocate `max_document_bytes + 1` — self-referential, so widening the
+    constant a thousandfold (measured: 64 KiB → 64 MiB) left both green.
+    Added a direct pin (`expectEqual(64 * 1024, max_document_bytes)`) in
+    both files. Measured: the new pin is 1/57 red against the widened
+    constant (`expected 65536, found 65536000`), 57/57 green against the
+    real one, and the old self-referential test stays green throughout —
+    reproducing F13's own diagnosis exactly.
+
+  - **F16.** The "each alone must fail too" identity-guard test's own
+    comment claimed the guard was pinned per-side; mutating away either
+    half (M07/M08) still leaves 42/42 green. Rewrote the comment: neither
+    one-sided case is independently reachable through `verifyRoundPoints`'s
+    pairing check at all — `e(identity, G2gen) = 1` equals `e(qid, pubkey)`
+    only if `pubkey` is ALSO identity (`qid` is never identity for a real
+    round), so there is no forged input this half of the guard alone stops
+    that the pairing math does not already stop. Genuinely verified
+    redundant, not a testing gap a mutation-killing test could close;
+    documented as defense-in-depth instead of claiming coverage the suite
+    cannot have. `rg -n "Each alone must fail too" verify.zig`: 1 hit
+    before, 0 after.
+
+  - **F18.** No test exercised a round number above 2^32 (quicknet's real
+    rounds top out around 32 million); a mutation truncating
+    `ciphersuite.beaconId`'s input to the lower 32 bits left 42/42 green,
+    and `tlock`'s capsule format (which shares `beaconId` with this module
+    "so drand and tlock can never drift on the scheme") carries the round
+    as a full attacker-supplied u64. Added
+    `beaconId(2^32+1000) != beaconId(1000)` directly against the real,
+    imported `ciphersuite.beaconId`. Measured the test PATTERN's teeth via
+    a standalone local reproduction of `beaconId` (not touching
+    `modules/tlock`): the same assertion is 1/2 red against a
+    `round & 0xFFFF_FFFF` mutant (the two rounds collide under it) and 2/2
+    green against the real, unmutated math.
+
+  **Left open, with reasons (not P1-eligible, no clean additive fix):**
+
+  - **F4** (perf, 5.6x slower than drand's own Go client): the number
+    belongs to `bls12_381`'s pairing/subgroup-check performance, not to
+    anything in this module's own code — out of scope for a single-module
+    session.
+  - **F5** (G1 subgroup check paid twice on the parse+verify path):
+    **the audit's own suggested fix is UNSOUND, discovered by actually
+    trying it.** Implemented a private `verifyRound`-only variant skipping
+    the "already checked by `parseRound`" subgroup check; it broke an
+    EXISTING regression test (`W2-32: the full public path refuses the
+    forged round-1000 document`), which hand-constructs a `Round` with a
+    subgroup-invalid `sig_g1` WITHOUT going through `parseRound` at all —
+    `Round` is a plain, caller-mutable value type, so `verifyRound`'s
+    actual contract does not (and per its own doc comment, cannot) assume
+    every `Round` it is handed came from this module's own parser. Reverted
+    in full (`git diff` empty before committing). A safe fix needs an
+    API-level distinction between a parser-verified and a caller-assembled
+    `Round`, which changes public shape — a decision for the user.
+  - **F7** (3 parser/reference divergences: string-typed `round` and
+    exponent notation accepted here but rejected by drand's Go
+    `encoding/json`; duplicate `round` key rejected here but accepted
+    there, last-wins): every one of the three fixes changes what
+    `parseRound` accepts or rejects for some caller-visible input —
+    tightening two, loosening one — and this module has a real consumer
+    (`example-apps/timecapsule/src/main.zig` calls `parseRound` directly).
+    No subset of the three is purely additive.
+
+  `scripts/modtest drand`: 57/57.
+
 - **2026-09-07** — **Tests:** `fuzzParseVerify` parsed nothing but the empty
   document. It filled a buffer with `smith.bytes` and then drew the length with
   `valueRangeAtMost(u16, 0, buf.len)`; a ranged `Smith` draw reads eight octets

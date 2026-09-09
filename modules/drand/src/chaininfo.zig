@@ -514,6 +514,14 @@ test "parseInfo: oversized document → DocumentTooLarge" {
     try testing.expectError(error.DocumentTooLarge, parseInfo(testing.allocator, big));
 }
 
+test "parseInfo: max_document_bytes is pinned at 64 KiB, not just self-referential (A1 F13)" {
+    // Same shape as round.zig's version of this test: the oversized-document
+    // test above allocates `max_document_bytes + 1`, so it moves WITH the
+    // constant and cannot catch it being widened by three orders of
+    // magnitude. This pins the actual enforced byte count.
+    try testing.expectEqual(@as(usize, 64 * 1024), max_document_bytes);
+}
+
 test "parseInfo: a chained-scheme /info parses but leaves pubkey_g2 null" {
     // A 48-byte (G1) key under the legacy chained scheme: metadata still
     // parses; the point is not decoded (verify would reject the scheme).

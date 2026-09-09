@@ -326,6 +326,15 @@ test "parseRound: oversized document → DocumentTooLarge" {
     try testing.expectError(error.DocumentTooLarge, parseRound(testing.allocator, big));
 }
 
+test "parseRound: max_document_bytes is pinned at 64 KiB, not just self-referential (A1 F13)" {
+    // The test above allocates `max_document_bytes + 1` -- it moves WITH the
+    // constant, so it stays green even if the constant is mistakenly
+    // widened by three orders of magnitude (measured: mutating it to 64 MiB
+    // left the suite 42/42 green, only the test process's MaxRSS grew from
+    // 21 MB to 69 MB). This pins the actual enforced byte count.
+    try testing.expectEqual(@as(usize, 64 * 1024), max_document_bytes);
+}
+
 test "parseRound: chained round carries previous_signature (G2 sig, sig_g1 null)" {
     // A 96-byte (G2) signature with a previous_signature — legacy chained
     // shape. sig_g1 stays null; previous_signature is retained.

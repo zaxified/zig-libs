@@ -458,6 +458,25 @@ test "positive control: little-endian round hashing FAILS the genuine KAT (schem
     try testing.expect(!broken_ok);
 }
 
+test "ciphersuite.beaconId does not collapse the round's upper 32 bits (A1 F18)" {
+    // `ciphersuite.beaconId` (tlock, shared with this module -- "so drand
+    // and tlock can never drift on the scheme", root.zig) hashes the round
+    // as a full big-endian u64. Nothing in this suite exercised a round
+    // above 2^32 before this test: quicknet's real rounds top out around
+    // 32 million (3 s/round, ~408 years from 2^32), and a mutation
+    // truncating to the lower 32 bits (`round & 0xFFFF_FFFF`) left 42/42
+    // tests green. `tlock`'s capsule format carries the round as a full
+    // attacker-supplied u64, so two capsules differing only above bit 32
+    // must NOT hash to the same beacon identity.
+    const big_round: u64 = (@as(u64, 1) << 32) + 1000; // 4294968296
+    const truncated_round: u64 = 1000; // what `round & 0xFFFF_FFFF` would collapse it to
+    try testing.expect(!std.mem.eql(
+        u8,
+        &ciphersuite.beaconId(big_round),
+        &ciphersuite.beaconId(truncated_round),
+    ));
+}
+
 // ── fuzz: parsers + verify path never panic / OOB / hang ───────────────
 
 // ⛔ This harness fetched its document and then threw it away. `smith.bytes`
@@ -782,7 +801,20 @@ test "verifyRoundPoints rejects identity operands (total-forgery guard)" {
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.identity));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 12345, g1.Affine.identity));
 
-    // Each alone must fail too — a caller could supply one legitimate point.
+    // ⚠ A1 F16: these two calls do NOT pin the identity guard the way the
+    // pair above does. Removing (mutation M07) or narrowing (M08) the
+    // `pubkey.infinity or sig.infinity` check to only ONE side still passes
+    // both assertions below, 42/42 green — because with a genuine
+    // (non-identity) point on the other side, the pairing equation itself
+    // already fails: `e(identity, G2gen) = 1` (target-group identity)
+    // equals `e(qid, pubkey)` only if `pubkey` is ALSO identity (`qid` is
+    // never identity for a real round number), and symmetrically for
+    // `pubkey = identity, sig` genuine. There is no forged input this
+    // one-sided half of the guard alone stops that the pairing check does
+    // not already stop — it is pure defense-in-depth, verified redundant,
+    // not an independently pinned property. Kept as a guard in
+    // `verifyRoundPoints` anyway (cheap, and future-proofs a change to the
+    // pairing equation), but a test cannot honestly claim to enforce it.
     try std.testing.expect(!verifyRoundPoints(g2.Affine.identity, 1, g1.Affine.generator));
     try std.testing.expect(!verifyRoundPoints(g2.Affine.generator, 1, g1.Affine.identity));
 }
