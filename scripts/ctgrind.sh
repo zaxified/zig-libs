@@ -725,21 +725,69 @@ count_contexts_in() {
 # WITNESS second, and whatever matches neither is UNATTRIBUTED.
 #
 # `mode` selects the output: count-in / count-witness / count-unattr /
-# show-unattr (the offending blocks themselves, for the failure message).
+# show-unattr (the offending blocks themselves, for the failure message) /
+# count-launder and show-launder (see `guard_pattern` below).
+#
+# ── the `:0` class, and why this is a CHECK and not 101 pattern edits ───────
+#
+# A fully inlined callee gets its merged frame reported at `file.zig:0` — never
+# a real source line. Because PATTERN is tested against the whole paragraph and
+# BEFORE witness, such a frame can pull a paragraph into the in-file column that
+# belongs somewhere else: bolt3's `shachain` reported 2 where the honest count
+# was 0, and those two patterns carry a `root[.]zig:[1-9]` guard because of it.
+#
+# CTGRIND-OPEN-QUESTIONS.md left "review every bare-basename pattern" open, i.e.
+# the other 101. Measured 2026-09-09 over a full `--stacks` run, that sweep is
+# the wrong move: of 3696 in-file contexts, exactly TWO are in-file only by way
+# of a line-0 frame — `sphinx/process` (`process` at `core.zig:0`) and
+# `fss/eval` (`eval` at `dpf.zig:0`) — and BOTH are genuinely the module's own
+# code. Neither also matches witness. So guarding all 101 patterns would fix
+# nothing and break two rows, one of them by hiding fss's confirmed defect.
+#
+# What distinguishes bolt3's bad case from these two good ones is not the line-0
+# frame; it is that bolt3's paragraph ALSO matched WITNESS, so the module name
+# was not the only explanation on offer. That is checkable, so it is checked
+# here on every run instead of being carried as a manual review of 101 patterns
+# that today would be 101 unnecessary edits. Count is 0; a future inliner move
+# that makes it non-zero names the row and the block.
+guard_pattern() {
+    local alt out=""
+    local IFS='|'
+    for alt in $1; do
+        # An alternative that already constrains the line stays as written.
+        case "$alt" in
+            *:*) out="$out|$alt" ;;
+            *)   out="$out|$alt:[1-9]" ;;
+        esac
+    done
+    printf '%s' "${out#|}"
+}
+
 classify_contexts() {
     local log="$1" pattern="$2" mode="$3"
+    local gpat; gpat="$(guard_pattern "$pattern")"
     # Drop the harness's OWN stdout first: it is interleaved with memcheck's
     # report, it lands inside an error paragraph, and a harness that happens
     # to print a matching word would otherwise re-classify a real context.
     # Only `==pid==` lines survive; the `==pid==`-only separators then become
     # the paragraph breaks.
     sed -E -e '/^==[0-9]+==/!d' -e 's/^==[0-9]+==[[:space:]]*$//' "$log" \
-        | awk -v RS='' -v pat="$pattern" -v wit="$WITNESS" -v mode="$mode" '
-            BEGIN { in_c = 0; wit_c = 0; un_c = 0 }
+        | awk -v RS='' -v pat="$pattern" -v gpat="$gpat" -v wit="$WITNESS" -v mode="$mode" '
+            BEGIN { in_c = 0; wit_c = 0; un_c = 0; ln0_c = 0 }
             # not an error report (banner, HEAP SUMMARY, ERROR SUMMARY, …)
             $0 !~ /==[0-9]+==[[:space:]]+at 0x[0-9A-Fa-f]+:/ { next }
             {
-                if ($0 ~ pat)      { in_c++ }
+                if ($0 ~ pat) {
+                    in_c++
+                    # In-file ONLY through a frame with no line number, while a
+                    # witness frame is also present: the module name is not the
+                    # only account of this block, and the one that won is the
+                    # one that cannot be checked against a source line.
+                    if ($0 !~ gpat && $0 ~ wit) {
+                        ln0_c++
+                        if (mode == "show-launder") { printf "%s\n\n", $0 }
+                    }
+                }
                 else if ($0 ~ wit) { wit_c++ }
                 else {
                     un_c++
@@ -750,6 +798,7 @@ classify_contexts() {
                 if (mode == "count-in")      print in_c + 0
                 if (mode == "count-witness") print wit_c + 0
                 if (mode == "count-unattr")  print un_c + 0
+                if (mode == "count-launder") print ln0_c + 0
             }'
 }
 
@@ -1199,6 +1248,13 @@ while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog a
     fi
     if [[ "$aacc" == "0" ]]; then
         echo "FAIL $am/$amode/$atarget (tainted=$ataint, -fvalgrind=$avg): the classifier accounted for fewer contexts than valgrind reported ($atotal) — the paragraph walk in classify_contexts has gone stale against this memcheck's output format. Fix the walk, not the numbers." >&2
+        fail=1
+    fi
+    # ── the `:0` laundering check; see classify_contexts' header ───────────
+    launder=$(classify_contexts "$alog" "$apat" count-launder)
+    if [[ "$launder" != "0" ]]; then
+        echo "FAIL $am/$amode/$atarget (tainted=$ataint, -fvalgrind=$avg): $launder context(s) counted as this module's ONLY because of a frame reported at line 0, while a formatting frame is present too. That is bolt3's shape: an inlined callee's merged frame has no source line, PATTERN is tested before WITNESS, and the module wins an attribution it cannot be checked on. Do NOT accept the number; read the block, decide which it is, and if it is the witness constrain this row's pattern with ':[1-9]' (see bolt3/shachain):" >&2
+        classify_contexts "$alog" "$apat" show-launder >&2
         fail=1
     fi
 done <"$ACTUAL"
