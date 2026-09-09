@@ -120,6 +120,74 @@ test "sender-vouches policy: a Bearer confirmation is rejected -> SubjectConfirm
     try testing.expectError(error.SubjectConfirmationMethodNotAllowed, saml.consumeResponseXml(alloc, s.xml, cfg));
 }
 
+// ── A1 audit F9: regression teeth for guards a 33-mutation sweep found no test
+//    distinguishes (mutated -> the whole 148-test suite stayed green). These
+//    three are M05, M10 and M12 from that sweep -- named first because each is
+//    reachable from an unauthenticated POST and corresponds to a SAMLCore/
+//    SAMLProf MUST, not just an internal invariant. `mint`'s minted assertion
+//    lets each test isolate its guard without touching a byte the signature
+//    covers (unlike `fx.signed_response`, whose signed content none of this
+//    file's `std.mem.replaceOwned` tricks could reach). ─────────────────────
+
+const bearer_confirmation_own_expired =
+    "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">" ++
+    "<saml:SubjectConfirmationData NotOnOrAfter=\"2024-01-01T00:00:00Z\" Recipient=\"https://sp.example.org/acs\" InResponseTo=\"req-9988776655\"/>" ++
+    "</saml:SubjectConfirmation>";
+
+const bearer_confirmation_no_irt =
+    "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">" ++
+    "<saml:SubjectConfirmationData NotOnOrAfter=\"2024-06-01T12:05:00Z\" Recipient=\"https://sp.example.org/acs\"/>" ++
+    "</saml:SubjectConfirmation>";
+
+// Conditions with NO <AudienceRestriction> at all -- and, separately, no
+// <Conditions> element at all -- are the untested half of "M06 covers a
+// WRONG <Audience>" (test_fixture.zig:84).
+const conditions_no_audience_restriction =
+    "<saml:Conditions NotBefore=\"2024-06-01T11:59:00Z\" NotOnOrAfter=\"2024-06-01T12:05:00Z\"></saml:Conditions>";
+
+test "M05 teeth: assertion with NO <Conditions> at all is rejected -> AudienceMismatch" {
+    // The fail-closed audience rule ("require the SP be named") -- SPEC.md's
+    // most-advertised defence, and previously reachable only through the
+    // WRONG-<Audience> case (M06), never through "no <Conditions>/no
+    // <AudienceRestriction> at all" (the cross-SP-replay shape: an assertion
+    // the IdP minted for a different relying party).
+    const alloc = testing.allocator;
+    var s = try mint(alloc, bearer_confirmation, "", "");
+    defer s.deinit(alloc);
+    try testing.expectError(error.AudienceMismatch, saml.consumeResponseXml(alloc, s.xml, baseConfig(s.key)));
+}
+
+test "M05 teeth: assertion with <Conditions> but NO <AudienceRestriction> is rejected -> AudienceMismatch" {
+    const alloc = testing.allocator;
+    var s = try mint(alloc, bearer_confirmation, conditions_no_audience_restriction, "");
+    defer s.deinit(alloc);
+    try testing.expectError(error.AudienceMismatch, saml.consumeResponseXml(alloc, s.xml, baseConfig(s.key)));
+}
+
+test "M10 teeth: Bearer SubjectConfirmationData's OWN NotOnOrAfter is honoured, distinct from Conditions" {
+    // SAMLProf SS4.1.4.3 lists this as a MUST, separate from <Conditions
+    // NotOnOrAfter>. `conditions_valid`'s own NotOnOrAfter (12:05:00Z) is
+    // still in the future at `t_valid` (12:00:00Z), so this can ONLY be
+    // caught by the Bearer confirmation's own expiry check -- not by
+    // <Conditions>, which is what every existing "expired" test exercises
+    // (both dates were the same in that fixture).
+    const alloc = testing.allocator;
+    var s = try mint(alloc, bearer_confirmation_own_expired, conditions_valid, "");
+    defer s.deinit(alloc);
+    try testing.expectError(error.AssertionExpired, saml.consumeResponseXml(alloc, s.xml, baseConfig(s.key)));
+}
+
+test "M12 teeth: Bearer confirmation with NO InResponseTo is rejected when allow_idp_initiated is false" {
+    // `allow_idp_initiated` defaults to false. test_fixture.zig's InResponseTo
+    // tests all cover PRESENT-BUT-WRONG; ABSENT (the actual IdP-initiated
+    // shape) was untested.
+    const alloc = testing.allocator;
+    var s = try mint(alloc, bearer_confirmation_no_irt, conditions_valid, "");
+    defer s.deinit(alloc);
+    const cfg = baseConfig(s.key); // allow_idp_initiated stays false (default)
+    try testing.expectError(error.InResponseToMismatch, saml.consumeResponseXml(alloc, s.xml, cfg));
+}
+
 // ── Level of Assurance ───────────────────────────────────────────────────────
 
 test "LoA: returned high meets required substantial -> accepted" {

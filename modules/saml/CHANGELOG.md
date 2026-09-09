@@ -5,6 +5,40 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit: `Version` was written as `"2.0"` on every message this module
+  emits but never read back on the way in — a `<Response>` or `<Assertion>` with `Version`
+  missing or `"1.1"`/anything else was processed identically to a real SAML 2.0 message.
+  `consumeResponseXml`/`processEncryptedAssertion` now call a new `checkSamlVersion` guard
+  (new `error.UnsupportedSamlVersion`) on both, BEFORE signature verification, so this is
+  scoped to the SSO Response path only (Logout/Artifact messages are untouched — separate
+  , smaller finding, not in this pass). Measured: with the guard's body replaced by a no-op,
+  the whole 157-test suite drops to **152 pass / 3 fail** (exactly the three new regression
+  tests); restored, **155/157** (2 pre-existing skips). P1 applies (0 consumers in
+  `zig-libs`).
+  Also, from the same audit record:
+  - **F12 (MED), doc-only fix**: `ArtifactResponseResult.enclosed_message_xml`'s doc comment
+    claimed an inner signature "is unaffected" by the Exclusive-C14N extraction. True only
+    when that inner signature ALSO used Exclusive C14N for its own canonicalization — not
+    for one that used plain (inclusive) C14N, whose canonical form depends on ancestor
+    namespace context that extraction removes. Reproduced directly
+    (`test_artifact.zig`: a legitimate inclusive-C14N inner signature, valid pre-extraction,
+    fails `xmldsig.verify` after the exact extraction call `consumeArtifactResponseSoap`
+    makes). Doc corrected to state the real constraint; extraction itself (Exclusive C14N,
+    the SAML-recommended shape) is unchanged.
+  - **F9 (MED), partial**: 4 of the 10 mutation-tested-but-untested guards the audit found
+    now have a regression test — M05 (audience fail-closed with no `<Conditions>`/no
+    `<AudienceRestriction>`, two variants), M10 (Bearer `SubjectConfirmationData`'s OWN
+    `NotOnOrAfter`, distinct from `<Conditions>`), and M27 (the ArtifactResponse XSW pin —
+    the equivalent pins on the Response/decrypted-assertion/LogoutRequest already had one).
+    These four were the audit's own "first" recommendation (reachable from an
+    unauthenticated POST, each a SAMLCore/SAMLProf MUST). Measured: disabling all four
+    guards at once drops the suite to 156 pass / 5 fail (exactly the five new tests, one
+    test covers two M05 shapes); the M27 mutant additionally demonstrates the attack fully
+    SUCCEEDS when disabled (the caller receives the attacker's forged enclosed message).
+    Restored, all green. **7 guards remain untested** (M02, M19, M20, M23, M24, M28, M31 —
+    the audit's table lists 11 live rows besides M17/M18, which are dead code; this pass
+    did 4 of the 11) — left for a future pass, not a decision question.
+
 - **2026-09-08** — Test-only, no production change: `fuzzParseIdpMetadata`'s corpus comment
   said the per-octet substitution words were what "one seed here deliberately does not"
   omit. That was false when it was written — every seed used a bare `testkit.fuzz.seed`,

@@ -157,6 +157,54 @@ test "teeth: Response Destination mismatch is rejected" {
     try testing.expectError(error.DestinationMismatch, saml.consumeResponseXml(alloc, moved, baseConfig(fx.t_valid)));
 }
 
+// ── Version teeth (A1 audit: Version was written on every emitted message but
+//    never read back on the way in) ──────────────────────────────────────────
+
+test "teeth: Response Version != 2.0 is rejected, before the signature is even reached" {
+    // The Response-level Version is outside the signed Assertion, targeted via
+    // the Response's own unique ID so this cannot also touch the Assertion's
+    // identical-looking `Version="2.0" IssueInstant="..."` substring.
+    const alloc = testing.allocator;
+    const bad = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        fx.signed_response,
+        "ID=\"_resp0011223344556677889900aabbcc\" Version=\"2.0\"",
+        "ID=\"_resp0011223344556677889900aabbcc\" Version=\"1.1\"",
+    );
+    defer alloc.free(bad);
+    try testing.expectError(error.UnsupportedSamlVersion, saml.consumeResponseXml(alloc, bad, baseConfig(fx.t_valid)));
+}
+
+test "teeth: missing Response Version is rejected" {
+    const alloc = testing.allocator;
+    const bad = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        fx.signed_response,
+        "ID=\"_resp0011223344556677889900aabbcc\" Version=\"2.0\"",
+        "ID=\"_resp0011223344556677889900aabbcc\"",
+    );
+    defer alloc.free(bad);
+    try testing.expectError(error.UnsupportedSamlVersion, saml.consumeResponseXml(alloc, bad, baseConfig(fx.t_valid)));
+}
+
+test "teeth: Assertion Version != 2.0 is rejected before signature verification runs" {
+    // Tampering the Assertion's Version necessarily breaks its digest -- proving
+    // this is caught as UnsupportedSamlVersion (not SignatureInvalid) confirms
+    // the check runs BEFORE `verifyCovering`, matching root.zig's call order.
+    const alloc = testing.allocator;
+    const bad = try std.mem.replaceOwned(
+        u8,
+        alloc,
+        fx.signed_response,
+        "ID=\"_a1b2c3d4e5f60718293a4b5c6d7e8f90\" Version=\"2.0\"",
+        "ID=\"_a1b2c3d4e5f60718293a4b5c6d7e8f90\" Version=\"1.1\"",
+    );
+    defer alloc.free(bad);
+    try testing.expectError(error.UnsupportedSamlVersion, saml.consumeResponseXml(alloc, bad, baseConfig(fx.t_valid)));
+}
+
 test "teeth: wrong configured key fails the signature" {
     // A syntactically valid but wrong RSA key (different modulus) -> the SignedInfo
     // signature no longer verifies.

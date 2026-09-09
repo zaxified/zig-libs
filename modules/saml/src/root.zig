@@ -152,6 +152,12 @@ pub const saml_ns = "urn:oasis:names:tc:SAML:2.0:assertion";
 pub const md_ns = "urn:oasis:names:tc:SAML:2.0:metadata";
 
 const status_success = "urn:oasis:names:tc:SAML:2.0:status:Success";
+/// SAMLCore §3.2.2 (`<Response>`) and §2.3.3 (`<Assertion>`): `Version` is a
+/// REQUIRED attribute and MUST be `"2.0"`. A1 audit finding: this module built
+/// every message it emits with `Version="2.0"` but never read the attribute
+/// back on the way in, so a `Version="1.1"` (or missing) Response/Assertion
+/// was processed identically to a real SAML 2.0 one.
+const saml_version = "2.0";
 const cm_bearer = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
 const cm_holder_of_key = "urn:oasis:names:tc:SAML:2.0:cm:holder-of-key";
 const cm_sender_vouches = "urn:oasis:names:tc:SAML:2.0:cm:sender-vouches";
@@ -478,6 +484,9 @@ pub const ConsumeError = error{
     MalformedResponse,
     /// The document root is not `{samlp}Response`.
     NotSamlResponse,
+    /// `<Response>` or `<Assertion>` `Version` was missing or was not `"2.0"`
+    /// (SAMLCore §3.2.2 / §2.3.3, both REQUIRED). A1 audit — see `saml_version`.
+    UnsupportedSamlVersion,
     /// `<samlp:Status>` was not `…:status:Success`.
     StatusNotSuccess,
     /// `<Issuer>` did not equal `Config.idp_entity_id`.
@@ -626,9 +635,17 @@ pub fn consumeResponseXml(alloc: std.mem.Allocator, xml_bytes: []const u8, confi
 
 // ── core processing ──────────────────────────────────────────────────────────
 
+/// `el.attr("", "Version")` must be exactly `saml_version` ("2.0"). Missing
+/// counts as a mismatch — the attribute is REQUIRED, not optional-and-checked.
+fn checkSamlVersion(el: *const xml.Element) ConsumeError!void {
+    const v = el.attr("", "Version") orelse return error.UnsupportedSamlVersion;
+    if (!std.mem.eql(u8, v, saml_version)) return error.UnsupportedSamlVersion;
+}
+
 fn processResponse(alloc: std.mem.Allocator, doc: *const xml.Document, config: Config) ConsumeError!AuthnResult {
     const root = doc.root;
     if (!isEl(root, samlp_ns, "Response")) return error.NotSamlResponse;
+    try checkSamlVersion(root);
 
     // Status must be Success.
     const status = childEl(root, samlp_ns, "Status") orelse return error.MalformedResponse;
@@ -683,6 +700,7 @@ fn processResponse(alloc: std.mem.Allocator, doc: *const xml.Document, config: C
     if (enc_assertion) |enc| return processEncryptedAssertion(alloc, doc, root, enc, config);
 
     const asrt = assertion.?;
+    try checkSamlVersion(asrt);
 
     // ── signature + XSW defense ──────────────────────────────────────────────
     var cert_der: ?[]u8 = null;
@@ -814,6 +832,7 @@ fn processEncryptedAssertion(
 
     const asrt = inner.root;
     if (!isEl(asrt, saml_ns, "Assertion")) return error.NoAssertion;
+    try checkSamlVersion(asrt);
 
     // ── signature + XSW defense on the DECRYPTED assertion ────────────────────
     var cert_der: ?[]u8 = null;
@@ -2940,9 +2959,23 @@ pub const ArtifactResponseResult = struct {
     /// self-contained, standalone document — safe to re-parse and hand to
     /// `consumeResponseXml`/`consumeLogoutResponseXml`/etc., which perform
     /// their OWN full signature/condition verification independently.
-    /// Exclusive C14N is, by design, independent of ancestor context, so an
-    /// embedded signature inside the enclosed message (over ITS OWN content)
-    /// is unaffected by having been extracted this way. Owned by the caller.
+    ///
+    /// ⚠ A1 audit F12: an embedded signature inside the enclosed message
+    /// (over ITS OWN content) survives this extraction ONLY IF that inner
+    /// signature ALSO used Exclusive C14N for its own digest/SignedInfo
+    /// canonicalization — the case every IdP this module has been tested
+    /// against uses, and what SAML deployment profiles recommend precisely
+    /// to avoid this class of problem. It does NOT survive if the inner
+    /// signature used plain (inclusive) C14N: inclusive C14N of a subtree
+    /// renders every namespace in scope, including ones declared only on an
+    /// ANCESTOR outside the subtree (e.g. `<ArtifactResponse>` or
+    /// `<soap:Envelope>`), and extraction removes that ancestor — so the
+    /// re-serialized bytes differ and the inner digest no longer matches.
+    /// Reproduced directly: `test_artifact.zig`'s "exclusive-C14N extraction
+    /// breaks an inner signature that used INCLUSIVE C14N" mints a legitimate
+    /// inclusive-C14N inner signature (valid pre-extraction, confirmed) and
+    /// shows it fails `xmldsig.verify` after this exact extraction call.
+    /// Owned by the caller.
     enclosed_message_xml: []u8,
 
     pub fn deinit(self: *ArtifactResponseResult, alloc: std.mem.Allocator) void {
