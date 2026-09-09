@@ -98,7 +98,13 @@ below). See [README.md](README.md) for purpose and API.
   data-dependent loop on the per-decapsulation path. Measured:
   `prng.zig:216` and `:223`, 2 of `decaps`' 8 remaining contexts.
 
-  ⚠ **This is not fixable here.** Spec §3.5 mandates the split —
+  ⚠ **And masking it would be worse than leaving it.** `:223` (the accept
+  decision) could be turned into a blend, and the context would disappear
+  from the table — but the signal would not, because it is the ENCLOSING
+  loop's trip count, not the branch. That is a prettier measurement of the
+  same defect, and this file has a rule against those.
+
+  ⚠ **Nor is it fixable here.** Spec §3.5 mandates the split —
   `SampleFixedWeightVect$` (rejection, unbiased) for keygen's `x`/`y`,
   `SampleFixedWeightVect` (biased, constant draw count) for the
   ciphertext randomness — so sampling `y` the cheap way would produce a

@@ -24,6 +24,17 @@
 //! (`gate.decoder_core_implemented`, now true).
 
 const std = @import("std");
+
+/// Optimization barrier (montint `b199192` class): launder a value through an
+/// empty inline-asm so LLVM loses the equality knowledge that lets it turn a
+/// masked select back into a branch. No-op at runtime. Same idiom as
+/// `p256`/`k256`/`montint`, and as `fss`'s `dpf.zig`.
+inline fn blackBox16(x: u16) u16 {
+    return asm volatile (""
+        : [ret] "=r" (-> u16),
+        : [x] "0" (x),
+    );
+}
 const params = @import("params.zig");
 const gf = @import("gf256.zig");
 
@@ -333,8 +344,18 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
         /// 0xffff iff `x != 0`, branch-free (equivalent to the reference's
         /// `-((int32_t)x) >> 31` arithmetic-shift trick; valid here since
         /// every masked quantity is < 2^15).
+        ///
+        /// ⛔ The result is laundered through an empty inline-asm, and that is
+        /// load-bearing. Written as above, LLVM recovers "this is `x != 0`" and
+        /// re-introduces the branch the trick exists to avoid: measured
+        /// 2026-09-09, two contexts inside `computeErrorValues` (`:730`,
+        /// `:765`), where `x` is `err[i]` and therefore secret. The barrier
+        /// sits INSIDE the helper rather than at those two call sites on
+        /// purpose — `fss`'s `xorMasked` compiled branch-free at two call sites
+        /// and to a jump at a third in one binary, so "the sites that branch
+        /// today" is not a set worth pinning a fix to.
         inline fn maskNonzero(x: u16) u16 {
-            return 0 -% ((x | (0 -% x)) >> 15);
+            return blackBox16(0 -% ((x | (0 -% x)) >> 15));
         }
 
         /// Step 1 (reference: `compute_syndromes`): S_i = cdw[0] XOR
@@ -396,8 +417,14 @@ pub fn RS(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) ty
                 const mask1: u16 = 0 -% ((0 -% d) >> 15);
                 // mask2 = 0xffff iff deg_x_sigma_p > deg_sigma
                 const mask2: u16 = 0 -% ((deg_sigma -% deg_x_sigma_p) >> 15);
-                // mask12 = 0xffff iff deg_sigma increased
-                const mask12 = mask1 & mask2;
+                // mask12 = 0xffff iff deg_sigma increased.
+                // ⛔ Laundered for the same reason `maskNonzero` is: both inputs
+                // are comparisons on secret-derived values (`d`, the degrees),
+                // and LLVM turned this one back into a branch -- one context in
+                // `computeElp`, measured 2026-09-09. Everything downstream in
+                // this loop selects through `mask12`, so one barrier here covers
+                // the whole Berlekamp-Massey update.
+                const mask12 = blackBox16(mask1 & mask2);
                 deg_sigma ^= mask12 & (deg_x_sigma_p ^ deg_sigma);
 
                 if (mu == 2 * delta - 1) break;

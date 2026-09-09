@@ -278,20 +278,26 @@ ed448	ReleaseFast	ladder	1	0	dc6585ac248e91ee	43db8426e0d6c6e7
 # was NOT measured; that is different and much more expensive work. The claim
 # is "the module's stated property does not hold and nothing was testing it",
 # not "the key is out".
-# hqc, 2026-09-09, two fixes in one pass. `mul`/`inverse` stopped indexing the
-# exp/log tables (removing FOUR secret-indexed table loads, the only ones verified
-# anywhere in this repo, plus a branch), and the biased sampler's duplicate fixup
-# blends under a mask instead of `if (found)`. decaps 14 -> 5, encaps 6 -> 0.
-# NO context of the `Use of uninitialised value` (load-address) kind remains.
-# ⭐ encaps' 0 is only meaningful because the row carries an output pin: a harness
-# that stopped calling the module would report 0 too.
-# What is left in decaps, both by design rather than oversight: 3 in reedsolomon
-# (Berlekamp-Massey's discrepancy test, and encode via re-encryption) and 2 in
-# prng -- the rejection loop's trip count, which spec v5.0.0 §3.5 REQUIRES for
-# keygen's x/y, and decaps re-derives y from the seed on every call.
-hqc	ReleaseFast	decaps	1	5	ab5752b387f0d07e	91caa495ae54247e
-hqc	ReleaseFast	keygen	1	4	ab5752b387f0d07e	a20c02ff5f2e81ee
-hqc	ReleaseFast	encaps	1	0	ab5752b387f0d07e	e91a390cf03fd6ad
+# hqc, 2026-09-09. decaps 14 -> 2, encaps 6 -> 0. FOUR fixes, all measured:
+#   gf256.mul/inverse   dropped the exp/log tables -- the only secret-INDEXED
+#                       table loads verified anywhere in this repo (+7.3% decaps)
+#   sampleFixedWeightBiased   duplicate fixup blends under a mask
+#   maskNonzero               laundered; LLVM had turned the branch-free
+#                             `x != 0` trick back into a branch
+#   Berlekamp-Massey mask12   same, one barrier covers the whole update
+# The last three cost nothing measurable; the 7.3% is the algorithm swap alone.
+#
+# ⭐ Everything left, in EVERY target, is `sampleFixedWeightRejection`
+# (prng.zig:216 the rejection loop, :223 the accept decision). Spec v5.0.0 §3.5
+# REQUIRES that sampler for keygen's x/y, and decaps re-derives y from the seed
+# on every call because the spec fixes a seed-sized dkKEM. ⛔ Do NOT mask :223 to
+# make this number smaller: the leak is the ENCLOSING loop's trip count, so the
+# context would go and the timing signal would stay -- a prettier measurement of
+# the same defect. See SPEC.md.
+# ⭐ encaps' 0 means something only because the row carries an output pin.
+hqc	ReleaseFast	decaps	1	2	5904d46c877ea9a2	91caa495ae54247e
+hqc	ReleaseFast	keygen	1	4	5904d46c877ea9a2	a20c02ff5f2e81ee
+hqc	ReleaseFast	encaps	1	0	5904d46c877ea9a2	e91a390cf03fd6ad
 hqc	ReleaseFast	sampler	1	2	8eeeec94620e623e	b93fa60c89578576
 k256	ReleaseFast	field	1	0	2642e053d442bcc0	4f13cccddea81376
 k256	ReleaseFast	mul	1	2	5f54a05906a76759	729cb9458ddf4051
