@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking: a responder that answers a head and then
+  sends no body no longer parks `refresh` forever (F2).** `httpFetch`'s response-BODY
+  read had no deadline of its own — `Config.max_response_bytes` bounds SIZE, never TIME,
+  and `http.Client`'s own `total_timeout_ms` explicitly does not cover the body (its own
+  module doc says so: "wrap the read in your own `runBounded`-shaped race if you need
+  one"). `Config` gains `body_read_timeout_ms` (default 10000ms; `0` disables it, the old
+  unbounded behaviour), `FetchRequest` gains the matching `body_timeout_ms` that
+  `refresh` now always sets from it, and both `FetchError` and `RefreshError` gain
+  `Timeout`, kept apart from `Canceled` (nothing external canceled this — the task gave
+  up on its own deadline) and from `TransportFailed` for the same reason `Canceled` is.
+  **BREAKING (narrow):** an exhaustive `switch` over `FetchError` or `RefreshError` stops
+  compiling until it handles `error.Timeout`; every in-repo caller uses `else =>` and is
+  unaffected. Measured against a loopback peer that sends `Content-Length: 5` and no
+  body: before this, the only way to get the call back was an external `Future.cancel`
+  (still covered by the pre-existing cancellation test right above the new one); after,
+  the SAME peer shape makes `httpFetch` return `error.Timeout` on its own, bounded (test
+  asserts under 3000ms against a 200ms deadline), with a positive control confirming a
+  promptly-answering peer is unaffected by the same 200ms bound.
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** the `next_update_unix orelse (...)`
+  fallback inside `refresh` — RFC 6960 makes a responder's `nextUpdate` optional, and a
+  response omitting it falls back to `this_update_unix + Config.max_age_seconds` — had
+  zero test coverage; every fixture in this suite carries a real `nextUpdate`, so the
+  `None` arm, a legal wire shape, had never actually run. Split into a private
+  `Cache.nextUpdateFor` so it is unit-testable without a full signed-response round trip
+  through `ocsp.verify` (which is what building a fixture without `nextUpdate` would
+  otherwise require). Two new direct tests cover both arms; an off-by-one mutant of the
+  fallback arithmetic was confirmed to fail one of them before being reverted.
 - **2026-09-07** — Test-only, no production change: both fuzz targets replayed a single
   input, and in `fuzzRefresh` that pinned every branch it selects. Each opened
   `smith.bytes(&raw)` and then drew `raw_len` from a ranged draw, which returns the range

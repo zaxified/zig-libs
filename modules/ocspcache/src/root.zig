@@ -198,6 +198,15 @@ pub const FetchRequest = struct {
     /// Bound on the response body a `Transport` implementation must enforce
     /// (e.g. via a limited read) — never buffer an unbounded responder reply.
     max_response_bytes: usize,
+    /// Deadline, in milliseconds, for reading the response BODY once the
+    /// head has arrived. `0` disables it (the historical behaviour: an
+    /// unbounded read). `max_response_bytes` bounds SIZE, not TIME — a
+    /// responder that sends a head and then goes quiet parks the read
+    /// forever regardless of that bound (F2). `httpFetch`, the production
+    /// `Transport`, honours this; a hand-written `Transport` is free to
+    /// ignore it, the same way tests in this module already may ignore
+    /// `max_response_bytes`.
+    body_timeout_ms: u32 = 0,
 };
 
 pub const FetchResponse = struct {
@@ -220,6 +229,13 @@ pub const FetchError = error{
     /// down — can tell "we gave up waiting" from "the responder is
     /// unreachable"; the two call for different retry decisions.
     Canceled,
+    /// The response BODY was not fully read within
+    /// `FetchRequest.body_timeout_ms` (F2). Kept apart from `Canceled` —
+    /// this task gave up on its own deadline, nothing external canceled
+    /// it — and apart from `TransportFailed` for the same reason
+    /// `Canceled` is: a caller may want to retry a slow responder
+    /// differently than a dead one.
+    Timeout,
     OutOfMemory,
 };
 
@@ -285,13 +301,117 @@ fn httpFetch(context: *anyopaque, gpa: std.mem.Allocator, req: FetchRequest) Fet
     };
     defer response.deinit();
 
-    const body = response.readAllAlloc(gpa, req.max_response_bytes) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.BodyTooLarge => return error.ResponseTooLarge,
-        error.Canceled => return error.Canceled,
-        else => return error.TransportFailed,
+    // `http.Client`'s own `total_timeout_ms` bounds `request` above --
+    // redirect hops, TLS handshake, response-head read -- but says so itself
+    // (Client.zig's module doc) that it deliberately does NOT bound the body
+    // read that follows: "the caller drives those reads and decides how long
+    // a slow trickle is acceptable; wrap the read in your own
+    // `runBounded`-shaped race if you need one." Before this, nothing did --
+    // a responder that answers a head and then sends no body parked
+    // `refresh` forever (F2), with no counterpart to `max_response_bytes`,
+    // which bounds SIZE, not TIME. `body_timeout_ms == 0` keeps the old,
+    // unbounded behaviour byte for byte (default for a caller-built
+    // `FetchRequest`; `Cache.refresh` itself always sets a real deadline via
+    // `Config.body_read_timeout_ms`).
+    const body = if (req.body_timeout_ms == 0)
+        response.readAllAlloc(gpa, req.max_response_bytes) catch |err| return mapReadAllAllocError(err)
+    else body: {
+        const deadline: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(req.body_timeout_ms), .clock = .awake } };
+        // `.duration` always yields a `Timestamp` from `toTimestamp` (only
+        // `.none` yields null); `.?` is safe here, never `.none`.
+        break :body runBounded(client.io, deadline.toTimestamp(client.io).?, readAllAllocFn, .{ &response, gpa, req.max_response_bytes }) catch |err| switch (err) {
+            // No unit of concurrency to race with (single-threaded Io, or a
+            // `Threaded` at its `concurrent_limit`): run the read directly
+            // rather than silently dropping the bound's *intent* -- same
+            // choice `llmclient` makes at its own `runBounded` call site.
+            error.ConcurrencyUnavailable => response.readAllAlloc(gpa, req.max_response_bytes) catch |e| return mapReadAllAllocError(e),
+            error.Timeout => return error.Timeout,
+            error.Canceled => return error.Canceled,
+            else => |e| return mapReadAllAllocError(e),
+        };
     };
     return .{ .status = response.status, .body = body };
+}
+
+fn mapReadAllAllocError(err: http.Client.Error) FetchError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.BodyTooLarge => error.ResponseTooLarge,
+        error.Canceled => error.Canceled,
+        // `http.Client`'s own `Error.Timeout` (from `total_timeout_ms`) is a
+        // different deadline than this module's `body_timeout_ms`, but the
+        // meaning to a caller is the same -- give up giving it its own name
+        // too, rather than folding it into `TransportFailed` like a dead
+        // responder.
+        error.Timeout => error.Timeout,
+        else => error.TransportFailed,
+    };
+}
+
+/// `Response.readAllAlloc` as a plain function, so `runBounded` can race it
+/// on a concurrent task (a method value cannot be `io.concurrent`'d directly).
+fn readAllAllocFn(response: *http.Client.Response, gpa: std.mem.Allocator, max_len: usize) http.Client.Error![]u8 {
+    return response.readAllAlloc(gpa, max_len);
+}
+
+// ── a deadline for one blocking read ────────────────────────────────────────
+//
+// The same shape `http.Client` uses for its own `total_timeout_ms` (kept
+// private there -- a copy is the price of not widening `http`'s public API
+// for one consumer; `llmclient`'s `read_timeout_ms` makes the identical
+// copy for the identical reason). Contract: finished in time -> `func`'s own
+// result; deadline hit -> the task is canceled and joined, then
+// `error.Timeout` (a success that landed in the cancelation window is still
+// returned); this task canceled while waiting -> `error.Canceled`; no unit
+// of concurrency -> the caller runs `func` unbounded (`error.ConcurrencyUnavailable`).
+fn RunBoundedResult(comptime func: anytype) type {
+    const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+    const Payload = @typeInfo(Result).error_union.payload;
+    const Errs = @typeInfo(Result).error_union.error_set;
+    return (Errs || error{ Timeout, Canceled, ConcurrencyUnavailable })!Payload;
+}
+
+fn runBounded(
+    io: std.Io,
+    deadline: std.Io.Clock.Timestamp,
+    comptime func: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(func)),
+) RunBoundedResult(func) {
+    const Result = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
+    const Ctx = struct {
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+        result: Result = undefined,
+        state: std.atomic.Value(u32) = .init(0),
+
+        fn run(ctx: *@This(), io_: std.Io) void {
+            ctx.result = @call(.auto, func, ctx.args);
+            ctx.state.store(1, .release);
+            io_.futexWake(u32, &ctx.state.raw, 1);
+        }
+    };
+
+    var ctx: Ctx = .{ .args = args };
+    var future = io.concurrent(Ctx.run, .{ &ctx, io }) catch return error.ConcurrencyUnavailable;
+
+    var canceled = false;
+    var expired = false;
+    while (ctx.state.load(.acquire) == 0) {
+        if (deadline.durationFromNow(io).raw.nanoseconds <= 0) {
+            expired = true;
+            break;
+        }
+        io.futexWaitTimeout(u32, &ctx.state.raw, 0, .{ .deadline = deadline }) catch {
+            canceled = true;
+            break;
+        };
+    }
+    if (!expired and !canceled) {
+        future.await(io);
+        return ctx.result;
+    }
+    future.cancel(io);
+    if (ctx.result) |value| return value else |_| {}
+    return if (expired) error.Timeout else error.Canceled;
 }
 
 pub const BuildGetUrlError = error{OutOfMemory};
@@ -344,6 +464,14 @@ pub const Config = struct {
     /// certificates, not an open-ended set — this bounds memory against a
     /// caller accidentally calling `refresh` with unbounded distinct certs.
     max_entries: usize = 64,
+    /// Deadline for reading the responder's response BODY, in milliseconds
+    /// (F2). `0` disables it. `httpFetch`, the production `Transport`
+    /// `httpTransport` returns, honours this via `FetchRequest.body_timeout_ms`
+    /// (which `refresh` sets from this field on every fetch); a
+    /// hand-supplied `Transport` may ignore it. A responder that answers a
+    /// head and then sends no body previously parked `refresh` forever —
+    /// `max_response_bytes` bounds SIZE, never TIME.
+    body_read_timeout_ms: u32 = 10_000,
 };
 
 const CacheKey = [32]u8;
@@ -376,6 +504,9 @@ pub const RefreshError = error{
     /// The fetch was canceled through the `std.Io` cancellation protocol
     /// while waiting on the responder — see `FetchError.Canceled`.
     Canceled,
+    /// The response body was not fully read within
+    /// `Config.body_read_timeout_ms` (F2) — see `FetchError.Timeout`.
+    Timeout,
     /// The fetched response exceeded `Config.max_response_bytes`.
     ResponseTooLarge,
     /// The responder returned an HTTP status other than 200.
@@ -528,6 +659,19 @@ pub const Cache = struct {
         return now_unix > entry.next_update_unix - self.config.refresh_margin_seconds;
     }
 
+    /// This entry's `next_update_unix`: `verdict.next_update_unix` when the
+    /// response carried one, else synthesized as `this_update_unix +
+    /// max_age_seconds` — the same fallback `ocsp.verify`'s own freshness
+    /// check uses for a response silent on `nextUpdate` (RFC 6960 does not
+    /// require it). Split out from `refresh` so it is directly unit-testable
+    /// without a full signed-response round trip through `ocsp.verify`: the
+    /// `Some` arm had a positive control via every fixture in this suite,
+    /// but nothing ever built a response missing `nextUpdate`, so the `None`
+    /// arm — a legal RFC 6960 shape — had never actually run.
+    fn nextUpdateFor(verdict: ocsp.Verdict, max_age_seconds: i64) i64 {
+        return verdict.next_update_unix orelse (verdict.this_update_unix + max_age_seconds);
+    }
+
     /// Fetch a fresh OCSP response for `subject_cert_der` (issued by
     /// `issuer_cert_der`), verify it, and — only on full success — cache it.
     /// `now_unix` is used both for `ocsp.verify`'s freshness check and as
@@ -551,16 +695,17 @@ pub const Cache = struct {
         defer if (owned_get_url) |u| self.gpa.free(u);
 
         const freq: FetchRequest = switch (self.config.fetch_method) {
-            .post => .{ .method = .post, .url = responder_url, .body = req_der, .max_response_bytes = self.config.max_response_bytes },
+            .post => .{ .method = .post, .url = responder_url, .body = req_der, .max_response_bytes = self.config.max_response_bytes, .body_timeout_ms = self.config.body_read_timeout_ms },
             .get => blk: {
                 const full = buildGetUrl(self.gpa, responder_url, req_der) catch return error.OutOfMemory;
                 owned_get_url = full;
-                break :blk .{ .method = .get, .url = full, .max_response_bytes = self.config.max_response_bytes };
+                break :blk .{ .method = .get, .url = full, .max_response_bytes = self.config.max_response_bytes, .body_timeout_ms = self.config.body_read_timeout_ms };
             },
         };
 
         const resp = self.transport.fetch(self.gpa, freq) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.Timeout => return error.Timeout,
             error.ResponseTooLarge => return error.ResponseTooLarge,
             error.TransportFailed => return error.TransportFailed,
             error.Canceled => return error.Canceled,
@@ -604,7 +749,7 @@ pub const Cache = struct {
             .unknown => return error.CertStatusUnknown,
         }
 
-        const next_update = verdict.next_update_unix orelse (verdict.this_update_unix + self.config.max_age_seconds);
+        const next_update = nextUpdateFor(verdict, self.config.max_age_seconds);
         const key = keyOf(subject_cert_der);
 
         if (!self.entries.contains(key) and self.entries.count() >= self.config.max_entries) {
@@ -641,6 +786,37 @@ pub const Cache = struct {
 // ════════════════════════════════════════════════════════════════════════════
 
 const testing = std.testing;
+
+test "Cache.nextUpdateFor: a real nextUpdate wins over the max_age fallback" {
+    const verdict: ocsp.Verdict = .{
+        .status = .good,
+        .responder = .{ .by_name = "responder" },
+        .delegated = false,
+        .this_update_unix = 1_800_000_000,
+        .next_update_unix = 1_800_500_000,
+        .produced_at_unix = 1_800_000_000,
+    };
+    try testing.expectEqual(@as(i64, 1_800_500_000), Cache.nextUpdateFor(verdict, 60 * 60));
+}
+
+test "Cache.nextUpdateFor: a MISSING nextUpdate falls back to this_update + max_age (F2 coverage gap)" {
+    // Every other test in this suite, and every golden/fixture, carries a
+    // real `nextUpdate` -- RFC 6960 §4.2.1 makes it OPTIONAL, and a
+    // responder is free to omit it, but nothing here had ever actually
+    // built a `Verdict` without one. `next_update_unix orelse (...)` in
+    // `refresh` had zero coverage: this is the `None` arm, isolated from
+    // `ocsp.verify` (no signed-response fixture needed to reach it -- see
+    // `nextUpdateFor`'s doc comment for why the split makes that possible).
+    const verdict: ocsp.Verdict = .{
+        .status = .good,
+        .responder = .{ .by_name = "responder" },
+        .delegated = false,
+        .this_update_unix = 1_800_000_000,
+        .next_update_unix = null,
+        .produced_at_unix = 1_800_000_000,
+    };
+    try testing.expectEqual(@as(i64, 1_800_000_000 + 3600), Cache.nextUpdateFor(verdict, 3600));
+}
 
 test "an expired entry does not hold a cache slot forever" {
     // Nothing in this module ever removed an entry past its `next_update_unix`
@@ -1023,6 +1199,83 @@ test "httpFetch: a canceled body wait surfaces error.Canceled, not error.Transpo
     // the one parked in the kernel.
     try io.sleep(.fromMilliseconds(200), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "httpFetch: body_timeout_ms self-terminates against a responder that sends a head and never a body (F2)" {
+    // The test just above this one is the RED baseline for F2, unmodified:
+    // with `body_timeout_ms` at its old-default `0` (unbounded), the ONLY
+    // way to get the fetch back is an external `fut.cancel` — the read has
+    // no deadline of its own and parks forever on its own. Here the SAME
+    // peer shape gets a real `body_timeout_ms` instead of an external
+    // cancel, and must give up BY ITSELF.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("ocspcache timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = true };
+    const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    const transport = httpTransport(&client);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    const t0 = std.Io.Clock.Timestamp.now(io, .awake);
+    const result = transport.fetch(testing.allocator, .{ .url = url, .max_response_bytes = 1024, .body_timeout_ms = 200 });
+    const elapsed_ms = @divTrunc(t0.durationFromNow(io).raw.nanoseconds, -std.time.ns_per_ms);
+    try testing.expectError(error.Timeout, result);
+    // Measured before this test existed: with `body_timeout_ms = 0` (the
+    // only mode that existed then) this call does not return at all short
+    // of the peer thread's own `stop` flag — there is no number to put here
+    // because the call never reached a `return`. 3000 ms is generous
+    // headroom over the 200 ms deadline; what matters is that it is
+    // BOUNDED, not the exact margin.
+    try testing.expect(elapsed_ms < 3000);
+}
+
+test "httpFetch: body_timeout_ms does not fire on a responder that answers promptly (positive control, F2)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("ocspcache timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: RedirectTestPeer = .{ .io = io, .listener = &listener, .redirect_to_port = null };
+    const peer_thread = try std.Thread.spawn(.{}, RedirectTestPeer.run, .{&peer});
+    defer peer_thread.join();
+
+    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+    const transport = httpTransport(&client);
+
+    var url_buf: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+    // Same 200 ms deadline as the RED-baseline test above, against a peer
+    // that answers immediately: the bound must not cost a real, prompt
+    // response anything.
+    const resp = try transport.fetch(testing.allocator, .{ .url = url, .max_response_bytes = 1024, .body_timeout_ms = 200 });
+    defer testing.allocator.free(resp.body);
+    try testing.expectEqual(@as(u16, 200), resp.status);
+    try testing.expectEqualStrings("SECRET", resp.body);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
