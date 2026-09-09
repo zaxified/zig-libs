@@ -70,7 +70,15 @@ pub const meta = .{
     .role = .both, // client + server, publisher + subscriber
     // One Client/Server owns one association's buffers and invoke ids; one
     // Publisher/Subscriber owns one control block's counters. Nothing shared,
-    // no clock, no thread — those are the caller's.
+    // no clock, no thread — those are the caller's. A caller MAY multiplex
+    // several real connections onto one `Server` by setting `Server.peer`
+    // before each `handle` call (see that field's doc comment); the
+    // handshake state this needs (`Server.associated_peers`, bounded by
+    // `max_associations`) is the one piece of per-peer bookkeeping the
+    // struct itself carries for that case — everything else multiplexing
+    // needs (RCB `Owner`/`Resv`, control-point selection, setting-group
+    // ownership) is arbitrated per object, keyed by `peer`, not by this
+    // struct as a whole.
     .concurrency = .single_owner,
     .model_after = "ISO 9506 (MMS) as profiled by IEC 61850-8-1, over ISO 8073/8327/8823/8650, plus the IEC 61850-7-2 control model and IEC 61850-6 SCL; wire behaviour cross-checked against captured traffic between two independent third-party stacks, against the Wireshark mms/goose dissectors, and — for SCL — against the GetNameList of the IEDs the parsed files configure (see SPEC.md)",
     // `xml` is used by `scl` alone; every other file here is std-only.

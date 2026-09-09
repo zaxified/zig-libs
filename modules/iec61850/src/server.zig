@@ -40,6 +40,10 @@ pub const Error = mms.Error || presentation.Error || acse.Error ||
     /// The request is not one this responder models.
     Unsupported,
     BufferTooSmall,
+    /// `Server.max_associations` peers already hold a completed handshake;
+    /// a fresh AARQ is refused rather than sharing a slot with one of them
+    /// (A1 iec61850, "recorded and NOT fixed").
+    TooManyAssociations,
 };
 
 /// One named variable. `storage` holds a complete `Data` TLV; `len` is how much
@@ -131,6 +135,12 @@ pub const max_report_len: usize = 8192;
 /// budget a report segment has to fit.
 pub const envelope_overhead: usize = 64;
 
+/// How many peers may hold a completed handshake on one `Server` at once —
+/// see `Server.associated_peers`. Bounded because this module never
+/// allocates; a peer past the bound gets `error.TooManyAssociations` from
+/// its AARQ rather than sharing a slot with someone else's association.
+pub const max_associations: usize = 8;
+
 const Pending = struct {
     len: usize = 0,
     bytes: [max_notification_len]u8 = undefined,
@@ -140,7 +150,22 @@ pub const Server = struct {
     config: Config,
     model: Model,
     contexts: presentation.ContextTable = .{},
-    associated: bool = false,
+    /// Recorded and NOT fixed (A1 iec61850): peers that completed the
+    /// ACSE/MMS handshake on THIS `peer` id. Before this table, `associated`
+    /// was a bare `bool` shared by every multiplexed peer that ever called
+    /// `handle` on this `Server` (see the `peer` field's own doc comment for
+    /// how a front end multiplexes several connections onto one model): once
+    /// ANY peer completed its handshake, `associated` was `true` for
+    /// everyone, so a *fresh* peer that had never sent a `CR`, a CONNECT SPDU
+    /// or an AARQ reached `handleMms` the moment its first frame arrived, as
+    /// long as `self.peer` was set to its id. Bounded, no allocator, matching
+    /// this module's `.concurrency = .single_owner` metadata note that "one
+    /// Client/Server owns one association's buffers" — a handful of
+    /// concurrent clients (a SCADA master, an engineering tool, a redundant
+    /// master) is the real shape; a peer past the bound is refused a fresh
+    /// association rather than silently sharing another's.
+    associated_peers: [max_associations]u32 = @splat(0),
+    associated_count: usize = 0,
     transport_up: bool = false,
     /// W2-A8/iec61850-F6: COTP class-0 reassembly for an inbound *segmented*
     /// request — mirrors `client.zig`'s identical `reasm`/`reasm_len` pair.
@@ -210,6 +235,39 @@ pub const Server = struct {
         return .{ .config = config, .model = model };
     }
 
+    /// Whether `self.peer` — the association the caller says the current
+    /// frame arrived on — completed its own handshake. This is the table
+    /// that replaced a bare `associated: bool`; see `associated_peers`.
+    pub fn isAssociated(self: *const Server) bool {
+        for (self.associated_peers[0..self.associated_count]) |p| {
+            if (p == self.peer) return true;
+        }
+        return false;
+    }
+
+    /// Records `self.peer` as associated. Idempotent for a peer that already
+    /// holds a slot; refuses a new one once `max_associations` is full.
+    fn markAssociated(self: *Server) Error!void {
+        if (self.isAssociated()) return;
+        if (self.associated_count >= self.associated_peers.len) return error.TooManyAssociations;
+        self.associated_peers[self.associated_count] = self.peer;
+        self.associated_count += 1;
+    }
+
+    /// Drops `peer`'s slot, if it holds one. Swap-remove: association order
+    /// carries no meaning.
+    fn clearAssociated(self: *Server, peer: u32) void {
+        var i: usize = 0;
+        while (i < self.associated_count) {
+            if (self.associated_peers[i] == peer) {
+                self.associated_count -= 1;
+                self.associated_peers[i] = self.associated_peers[self.associated_count];
+                continue;
+            }
+            i += 1;
+        }
+    }
+
     /// One request packet in, one response packet out (or null: the peer has
     /// gone). `out` receives a complete TPKT.
     pub fn handle(self: *Server, frame: []const u8, out: []u8) Error!?[]const u8 {
@@ -239,7 +297,7 @@ pub const Server = struct {
                 return try tpkt.encode(cc, out);
             },
             .dr => {
-                self.associated = false;
+                self.clearAssociated(self.peer);
                 self.transport_up = false;
                 self.reasm_len = 0;
                 return null;
@@ -283,14 +341,25 @@ pub const Server = struct {
         switch (h.spdu) {
             .connect => return try self.handleConnect(spdu, out),
             .abort, .finish, .disconnect => {
-                self.associated = false;
+                self.clearAssociated(self.peer);
                 self.reasm_len = 0;
                 return null;
             },
             .give_tokens_or_data => {
-                if (!self.associated) return error.Unsupported;
+                if (!self.isAssociated()) return error.Unsupported;
                 const ppdu = try session.decodeDataTransfer(spdu);
                 const pdv = try presentation.decodeUserData(ppdu, &self.contexts);
+                // `decodeUserData`/`ContextTable.check` only confirm the context
+                // id was *defined and accepted* -- not that it is the MMS one.
+                // The ACSE context (id 1) is defined and accepted too, for the
+                // AARQ/AARE exchange inside the CP/CPA wrapper, so without this
+                // check a PDV addressed to the ACSE context but carrying bytes
+                // that happen to decode as a valid MMS PDU reached `handleMms`
+                // exactly like a PDV on the real MMS context would.
+                // `client.zig`'s matching read path (`decodeUserData` at its own
+                // call site) already carries this same guard; the server path
+                // did not (A1 iec61850 F-E).
+                if (pdv.context_id != self.mms_context) return error.UndefinedContext;
                 return try self.handleMms(pdv.value, pdv.context_id, out);
             },
             else => return error.Unsupported,
@@ -356,7 +425,7 @@ pub const Server = struct {
 
         var dt_buf: [2176]u8 = undefined;
         const dt = try cotp.encodeData(accept, true, &dt_buf);
-        self.associated = true;
+        try self.markAssociated();
         self.mms_context = mms_ctx;
         // `localDetailCalling` is the largest MMS PDU the **client** can
         // receive, so it — not our own `local_detail` — bounds what this server
@@ -374,7 +443,7 @@ pub const Server = struct {
         var body: [16384]u8 = undefined;
         const reply: []const u8 = switch (pdu) {
             .conclude_request => blk: {
-                self.associated = false;
+                self.clearAssociated(self.peer);
                 break :blk try mms.encodeConcludeResponse(&body);
             },
             .confirmed_request => |req| try self.service(req, &body),
@@ -1033,7 +1102,7 @@ pub const Server = struct {
     pub fn releaseAssociation(self: *Server) void {
         for (self.model.report_controls) |*cb| cb.associationLost();
         if (self.model.setting_groups) |sg| sg.associationLost(self.peer);
-        self.associated = false;
+        self.clearAssociated(self.peer);
     }
 
     /// One of several associations ended. Unlike `releaseAssociation` this
@@ -1048,7 +1117,7 @@ pub const Server = struct {
         // The dropped connection's half-sent frame goes with it, or the next
         // peer to reach the `.dt` arm inherits its octets.
         if (self.reasm_peer == peer) self.reasm_len = 0;
-        self.associated = false;
+        self.clearAssociated(peer);
     }
 
     fn findControl(self: *const Server, ld: []const u8, prefix: []const u8) ?usize {
@@ -1457,7 +1526,7 @@ test "round trip: our client against our server over an in-memory wire" {
 
     try c.connect();
     try testing.expect(c.isConnected());
-    try testing.expect(srv.associated);
+    try testing.expect(srv.isAssociated());
     // The server advertises exactly what it implements.
     try testing.expect(c.serverSupports(mms.Initiate.service_bit.read));
     try testing.expect(c.serverSupports(mms.Initiate.service_bit.write));
@@ -1526,9 +1595,95 @@ test "round trip: our client against our server over an in-memory wire" {
     try testing.expect((try it.next()) == null);
 
     c.disconnect();
-    try testing.expect(!srv.associated);
+    try testing.expect(!srv.isAssociated());
     try testing.expectEqual(@as(usize, 0), paired.failures);
     try testing.expect(srv.reads > 0 and srv.writes > 0 and srv.name_lists > 0);
+}
+
+// A1 iec61850 F-E: `decodeUserData`/`ContextTable.check` only confirm a PDV's
+// context id was defined and accepted -- never that it is *the MMS one*. The
+// ACSE context (id 1) is defined and accepted on every association too, for
+// the AARQ/AARE exchange, so a PDV addressed to it but carrying bytes that
+// happen to decode as a valid MMS PDU used to reach `handleMms` exactly like
+// a PDV on the real MMS context. `client.zig`'s read path already guards
+// this (`if (pdv.context_id != self.mms_context) return error.UndefinedContext;`
+// right after its own `decodeUserData` call); the server path did not.
+test "give-tokens-or-data on the ACSE context is refused, even carrying a valid MMS PDU" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    try testing.expect(srv.isAssociated());
+
+    const acse_ctx = srv.contexts.idFor(&ber.oids.acse_abstract_syntax).?;
+    try testing.expect(acse_ctx != srv.mms_context);
+
+    // A genuine, servable MMS Identify request -- smuggled on the ACSE context.
+    var mms_buf: [64]u8 = undefined;
+    const identify = try mms.encodeIdentify(999, &mms_buf);
+    var ud_buf: [128]u8 = undefined;
+    const ppdu = try presentation.encodeUserData(acse_ctx, identify, &ud_buf);
+    var spdu_buf: [160]u8 = undefined;
+    const spdu = try session.encodeDataTransfer(ppdu, &spdu_buf);
+    var dt_buf: [200]u8 = undefined;
+    const dt = try cotp.encodeData(spdu, true, &dt_buf);
+    var frame_buf: [220]u8 = undefined;
+    const frame = try tpkt.encode(dt, &frame_buf);
+
+    var out: [8192]u8 = undefined;
+    try testing.expectError(error.UndefinedContext, srv.handle(frame, &out));
+    // The real MMS context still works -- this is a context check, not a
+    // stuck association.
+    const ident = try c.identify();
+    try testing.expectEqualStrings("zig-libs", ident.vendor);
+    c.disconnect();
+}
+
+// Recorded and NOT fixed (A1 iec61850): `associated` used to be a bare
+// `bool` shared by every peer id that ever set `Server.peer` before calling
+// `handle` -- which is exactly what a multiplexing front end does, per the
+// `peer` field's own doc comment. So once ANY peer completed its handshake,
+// a peer that had sent NEITHER a `CR` NOR a CONNECT SPDU NOR an AARQ reached
+// `handleMms` the instant its first frame arrived, just by riding whatever
+// peer id the caller happened to have `Server.peer` set to. This is the
+// straight-line reproduction: one real peer associates; a second peer id
+// that has done nothing at all sends a well-formed MMS request straight to
+// `handle` on the *first* frame it ever sends this `Server`.
+test "a peer that never sent CR/CONNECT/AARQ cannot reach handleMms via another peer's association (recorded, not fixed)" {
+    var fx: Fixture = .{};
+    const model = try fx.init();
+    var srv = Server.init(.{}, model);
+    var paired = Paired{ .server = &srv };
+    var buf: [32768]u8 = undefined;
+    var c = try client.Client.init(paired.seam(), &buf, .{});
+    try c.connect();
+    try testing.expect(srv.isAssociated());
+
+    // A second, wholly unrelated peer id -- it has never appeared in a call
+    // to `handle` before this one. Its very first frame is a complete,
+    // well-formed MMS Identify request on the real MMS context.
+    var mms_buf: [64]u8 = undefined;
+    const identify = try mms.encodeIdentify(999, &mms_buf);
+    var ud_buf: [128]u8 = undefined;
+    const ppdu = try presentation.encodeUserData(srv.mms_context, identify, &ud_buf);
+    var spdu_buf: [160]u8 = undefined;
+    const spdu = try session.encodeDataTransfer(ppdu, &spdu_buf);
+    var dt_buf: [200]u8 = undefined;
+    const dt = try cotp.encodeData(spdu, true, &dt_buf);
+    var frame_buf: [220]u8 = undefined;
+    const frame = try tpkt.encode(dt, &frame_buf);
+
+    srv.peer = 0xDEAD_BEEF;
+    var out: [8192]u8 = undefined;
+    try testing.expectError(error.Unsupported, srv.handle(frame, &out));
+    try testing.expect(!srv.isAssociated());
+    // The genuinely associated peer is unaffected.
+    srv.peer = 1;
+    try testing.expect(srv.isAssociated());
+    c.disconnect();
 }
 
 // W2-A8/iec61850-F6: before this fix, `handle` fed every inbound `DT` TPDU
@@ -1547,7 +1702,7 @@ test "handle reassembles a request segmented across two COTP DT TPDUs" {
     var buf: [32768]u8 = undefined;
     var c = try client.Client.init(paired.seam(), &buf, .{});
     try c.connect();
-    try testing.expect(srv.associated);
+    try testing.expect(srv.isAssociated());
 
     // A genuine, correctly-negotiated read request, captured as the client
     // built and sent it (one DT TPDU, eot = true).
@@ -1813,12 +1968,17 @@ test "a parked COTP fragment cannot be completed under another peer's associatio
     };
 
     // B holds a legitimate select on the sbo-with-normal-security point.
+    // (White-box: both B and A below are simulated as already-associated
+    // peers riding the one real transport `c` set up, exactly like the
+    // Alice/Bob RCB-reservation test does — see `markAssociated`'s doc.)
     srv.peer = 0xBBBB;
+    try srv.markAssociated();
     try testing.expect(try c.selectObject("TESTLD/GGIO1.SPCSO2"));
 
     // A operating directly is refused. This is the ownership check working,
     // and it is the check the steal substitutes.
     srv.peer = 0xAAAA;
+    try srv.markAssociated();
     try testing.expectError(error.AccessFailed, c.operateObject("TESTLD/GGIO1.SPCSO2", cmd));
     try testing.expect(!try fx.stVal(1));
     const operates_before = srv.operates;
@@ -2175,7 +2335,7 @@ fn fuzzServer(_: void, smith: *std.testing.Smith) !void {
     var out: [8192]u8 = undefined;
     _ = srv.handle(input[0..len], &out) catch {};
     // And again once associated, so the MMS path is reached too.
-    srv.associated = true;
+    try srv.markAssociated();
     _ = srv.handle(input[0..len], &out) catch {};
 }
 
@@ -2199,7 +2359,7 @@ test "corpus: every server seed reaches handle, and the answered count is pinned
         var fx: Fixture = .{};
         const model = try fx.init();
         var srv = Server.init(.{}, model);
-        srv.associated = true;
+        try srv.markAssociated();
         var out: [8192]u8 = undefined;
         if (srv.handle(input[0..len], &out)) |reply| {
             accepted += 1;
@@ -2698,7 +2858,7 @@ test "releasing the association purges a URCB and keeps a BRCB" {
     srv.releaseAssociation();
     try testing.expectEqual(@as(usize, 0), srv.model.report_controls[0].buffer.count);
     try testing.expectEqual(@as(usize, 2), srv.model.report_controls[1].buffer.count);
-    try testing.expect(!srv.associated);
+    try testing.expect(!srv.isAssociated());
 }
 
 // ── segmentation, re-binding and reservation, client against server ─────────
@@ -2921,6 +3081,7 @@ test "two associations contend for one RCB and the reservation decides" {
 
     // Bob's frames arrive on his own association and he can do nothing at all.
     srv.peer = bob;
+    try srv.markAssociated();
     try testing.expectError(error.AccessFailed, c.writeObject(rcb ++ ".RptEna", .RP, yes));
     try testing.expectError(error.AccessFailed, c.writeObject(rcb ++ ".Resv", .RP, yes));
     try testing.expect(!srv.model.report_controls[0].rpt_ena);
@@ -2939,9 +3100,9 @@ test "two associations contend for one RCB and the reservation decides" {
     try testing.expect(!srv.model.report_controls[0].resv);
     try testing.expect(srv.model.report_controls[0].owner == null);
 
-    // Now Bob walks in, and `Owner` names him.
+    // Alice's slot is gone; Bob's own (marked above) survives untouched, and
+    // `Owner` names him.
     srv.peer = bob;
-    srv.associated = true;
     try c.writeObject(rcb ++ ".RptEna", .RP, yes);
     try testing.expectEqual(bob, srv.model.report_controls[0].owner.?);
     const owner2 = try c.readObject(rcb ++ ".Owner", .RP);
@@ -3040,8 +3201,10 @@ test "an abandoned setting-group edit expires on the server's own clock" {
     try c.writeObject(domain ++ "/LLN0.SGCB.EditSG", .SP, w.done());
     try testing.expectEqual(@as(u8, 2), fx.sgcb.edit_sg);
 
-    // A second client cannot take it while it is live…
+    // A second client cannot take it while it is live… (white-box: simulated
+    // as already-associated, same as the Alice/Bob RCB test.)
     srv.peer = 2;
+    try srv.markAssociated();
     var w2 = ber.Writer.init(&vbuf);
     try mmsdata.Emit.unsigned(&w2, 3);
     try testing.expectError(

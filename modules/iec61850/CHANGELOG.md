@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — ⛔⛔ **`Server.associated` was a bare `bool` shared by every
+  multiplexed peer, so a peer that had sent no `CR`, no CONNECT SPDU and no
+  AARQ reached `handleMms` the instant its first frame arrived, as long as
+  ANY other peer on the same `Server` had completed a handshake (A1
+  iec61850, "recorded and NOT fixed"; `.concurrency = .single_owner`'s own
+  documented multiplexing path — see the `peer` field's doc comment — is
+  exactly what made this reachable). Replaced with `associated_peers`, a
+  bounded (`max_associations = 8`) table of the peer ids that actually
+  completed their own handshake; `handleConnect` now returns the new
+  `error.TooManyAssociations` once it is full instead of quietly sharing a
+  slot. Reproduced straight-line: one real peer associates, a second,
+  never-before-seen peer id sends a well-formed MMS Identify request as its
+  *first* frame — before the fix `handle` decoded and answered it (a full
+  served MMS response, vendor `zig-libs`); after the fix it is
+  `error.Unsupported`, unconditionally. `zig build test-iec61850`: 2 failing
+  (the targeted regression plus one collateral) → 0 failing, 426/437 passing
+  (P1: 0 consumers in `zig-libs`).
+  Also (F-E, same audit): `handleSpdu`'s `give_tokens_or_data` arm checked a
+  PDV's presentation context was *defined and accepted*, never that it was
+  *the MMS one* — the ACSE context (id 1) is defined and accepted on every
+  association too. `client.zig`'s matching read path already carried this
+  guard (`if (pdv.context_id != self.mms_context) return error.UndefinedContext;`);
+  the server path did not. Reproduced: an MMS Identify request wrapped under
+  the accepted ACSE context id was served before the fix (a decoded, valid
+  reply) and is `error.UndefinedContext` after.
+
 - **2026-09-07** — ⭐ **`goose.fuzzStructuredGoose` had a corpus, and it chose
   0-or-1 for every decision it made.** The seed generator emitted one
   little-endian `u64` per draw carrying only a single bit. That was built on the
