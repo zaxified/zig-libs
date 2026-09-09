@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `src/xrate_vectors.zig` had no `SPDX-License-Identifier`. It was the
+  one file where that mattered — a corpus captured from an external project, with the one
+  line that says whose terms apply to the FILE missing. Added, and `zig build check-catalog`
+  now refuses any shipped `.zig`/`.c`/`.h` under `modules/**` without one.
 - **2026-08-18** — Portability fix (`check-portable`): `Limiter.allowAt`'s two
   `@fieldParentPtr("node", ...)` recoveries of `*Entry` from the intrusive
   `std.DoublyLinkedList.Node` failed to compile on a 32-bit target, same root cause as

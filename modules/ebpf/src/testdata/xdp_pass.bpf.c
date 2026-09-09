@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: XDP pass/drop, two program sections, no maps. */
 #define SEC(name) __attribute__((section(name), used))
 

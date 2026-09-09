@@ -1162,10 +1162,34 @@ cmd_changed() {
     capability_check
 
     local trigger_all=0 trigger_catalog=0 trigger_graph=0 trigger_changelog=0
-    local seeds=" " f name
+    local trigger_docs=0
+    local seeds=" " docs_only=" " f name
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
         case "$f" in
+            # ── DOCUMENTATION-ONLY files inside a module ──────────────────────
+            #
+            # These cannot change what compiles or what a test does, so they do
+            # NOT seed the reverse-dependency closure. Audit finding R27: eight
+            # changed files, all NOTICE and CHANGELOG.md, seeded four modules,
+            # pulled in fourteen more through `bls12_381` (which `bbs`, `ibe`,
+            # `tlock`, `frost` and `voprf` all depend on) and paid 51 steps and
+            # 1 425 tests to prove that prose still compiles the same way.
+            #
+            # ⛔ THE TRAP THIS AVOIDS, and it is the reason for `trigger_docs`
+            # rather than a plain `continue`: the gates that actually READ these
+            # files -- check-catalog, check-copyleft, check-changelog -- run
+            # unconditionally BELOW, but only if execution reaches them. The
+            # early exit further down ("no modules affected") would otherwise
+            # fire on a NOTICE-only change and skip exactly the checks that
+            # change was for. Cheaper is not the goal if it is cheaper by
+            # skipping the answer.
+            modules/*/*.md|modules/*/NOTICE|modules/*/LICENSE|modules/*/*/*.md)
+                name="${f#modules/}"
+                name="${name%%/*}"
+                case "$docs_only" in *" $name "*) ;; *) docs_only="$docs_only$name " ;; esac
+                trigger_docs=1
+                ;;
             modules/*/*)
                 name="${f#modules/}"
                 name="${name%%/*}"
@@ -1307,7 +1331,7 @@ cmd_changed() {
         fi
     done
 
-    if [[ ${#valid_seeds[@]} -eq 0 && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 ]]; then
+    if [[ ${#valid_seeds[@]} -eq 0 && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 && $trigger_docs -eq 0 ]]; then
         echo "changed: no modules affected — nothing to test"
         graph_save
         exit 0
@@ -1328,6 +1352,13 @@ cmd_changed() {
     local pulled_n=$(( total_n - changed_n ))
 
     echo "changed: $changed_n module(s) directly changed, $pulled_n pulled in via reverse-dep closure -> $total_n to test"
+    # Named, not merely counted: a reader who sees "0 to test" after editing ten
+    # files needs to be told the files were prose, or the next thing they do is
+    # distrust the narrowing.
+    if [[ $trigger_docs -eq 1 ]]; then
+        echo "  docs only:  ${docs_only# } — not built or tested (they cannot change what compiles);"
+        echo "              the gates that read them still run below."
+    fi
     [[ ${#valid_seeds[@]} -gt 0 ]] && echo "  changed:    ${valid_seeds[*]}"
     [[ -n "$pulled_only" ]] && echo "  reverse-dep: $pulled_only"
 

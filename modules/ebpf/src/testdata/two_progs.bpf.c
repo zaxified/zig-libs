@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: TWO programs in ONE section, sharing one map — the case where a
  * program does not start at byte 0 of its section and relocations have to be
  * split between the two functions. */

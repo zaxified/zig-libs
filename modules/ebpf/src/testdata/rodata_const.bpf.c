@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: .rodata global constants reached through BPF_PSEUDO_MAP_VALUE. */
 #define SEC(name) __attribute__((section(name), used))
 

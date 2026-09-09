@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `tools/wolfssl_peer.c` had no `SPDX-License-Identifier`; added (MIT —
+  the file is this repository's own `main`/`run_server`/`run_client` over wolfSSL's public
+  API, not wolfSSL source). `zig build check-catalog` now enforces the header on every
+  shipped source file.
 - **2026-09-07** — **BEHAVIOURAL, not breaking — remote crash fixed:**
   `messages.decodeCertificate` panicked with `integer overflow` on a peer's
   `Certificate` message whose `certificate_request_context` is 255 octets long.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 const std = @import("std");
 
 // Standalone build for the plaintext-only http.Client size probe (see

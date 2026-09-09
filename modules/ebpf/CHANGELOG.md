@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: the seven `src/testdata/*.bpf.c` fixtures had no
+  `SPDX-License-Identifier`; added (MIT — they are this repository's own BPF programs). Note
+  that these files also set `_license = "GPL"`, which is a value the kernel's BPF verifier
+  reads to decide which helpers a program may call, not a copyright notice — see this
+  module's README and the root `NOTICE`. `zig build check-catalog` now enforces the SPDX
+  header on every shipped source file.
 - **2026-09-07** — All five fuzz targets were replaying one fixed input, and the module's most
   dangerous parser had no target at all. `btf.parse`, `btfext.parseExt` and `elfsym.openImage`
   built a synthetic blob and then drew both a truncation length and a byte-flip count with

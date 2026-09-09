@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 // A real third-party DTLS 1.3 peer for `tools/interop.zig` — wolfSSL in
 // either role, speaking DTLS 1.3 on loopback.
 //

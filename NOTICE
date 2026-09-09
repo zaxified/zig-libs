@@ -63,6 +63,29 @@ prose. Accordingly:
     When in doubt, open the artifact; a fixture's description of itself is a
     claim, not a verification.
 
+  - QUOTED RFC TEXT is covered by a written grant, and this is the repository's
+    acknowledgement of it. The IETF Trust's Legal Provisions (TLP 5.0 §3.c.iii)
+    permit copying unmodified portions of an RFC "provided that each such
+    portion is clearly attributed to IETF and identifies the RFC". This
+    collection cites 290 distinct RFCs and every citation names the RFC and the
+    section it comes from — but until 2026-09-09 the word "IETF" appeared
+    nowhere at repository level, so the condition was being met only by
+    implication. It is met explicitly now: **RFC text quoted anywhere in this
+    repository is the IETF's, reproduced under TLP 5.0 §3.c.iii, and each
+    quotation identifies the RFC it came from.**
+
+    Extent, measured rather than asserted (2026-09-09): the largest single
+    contiguous reproduction in the tree is the WebSocket frame diagram from RFC
+    6455 §5.2, in `modules/websocket/src/frame.zig` — 926 bytes against that
+    RFC's 162 067, i.e. **0.57 % of the document**, with 12 of its 17 lines
+    byte-identical upstream. Nothing here comes near the "one fifth" figure at
+    which TLP asks for full legends.
+
+    ⚠ This paragraph is about QUOTED TEXT. RFC test vectors and reference code
+    are a different thing — they are Code Components, granted under TLP 5.0
+    §4.c's Revised BSD licence, and that licence is reproduced at the modules
+    that use them (`mls`, `cbor`, `decaf448`, `jwt`, `ctap2pin`), not here.
+
 ====================================================================
 1. IS THE WHOLE LIBRARY STILL PLAIN MIT?
 ====================================================================

@@ -2263,6 +2263,7 @@ fn checkCatalog(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anye
     checkNonGoals(readme, b, &failed);
     try checkProvenance(b, io, &failed);
     try checkNoticeLinksResolve(b, io, &failed);
+    try checkSpdxHeaders(b, io, &failed);
     try checkAnchors(b, io, &failed);
 
     if (failed) return step.fail("catalog drift — see errors above", .{});
@@ -2769,6 +2770,67 @@ fn unreleasedSection(text: []const u8) ?[]const u8 {
 ///     silently passed a build that did not compile (`build.zig:657: error:`
 ///     does not start the line with `error:`), so two mutations "survived"
 ///     against a binary that was never built.
+/// Every shipped source file under `modules/**` must declare its licence.
+///
+/// WHY THIS IS A GATE. `SPDX-License-Identifier: MIT` on every file was already
+/// the convention here, and it was only ever a convention: nothing checked it,
+/// so on 2026-09-09 twenty `.zig` files and eight shipped `.c` files did not
+/// have one. Most were harmless. `modules/ratelimit/src/xrate_vectors.zig` was
+/// not: it is a corpus captured from an external project, and the one line that
+/// would have said whose terms apply to the FILE was the line missing. An
+/// unlabelled file next to labelled ones does not read as "unlabelled", it
+/// reads as "not looked at yet", which is exactly the state a licence sweep is
+/// supposed to end.
+///
+/// It checks PRESENCE, not correctness -- the identifier could name the wrong
+/// licence and this would pass. That is deliberate: `check-copyleft` already
+/// reads the identifier's VALUE, and this gate exists so that it has something
+/// to read on every file rather than on most of them.
+fn checkSpdxHeaders(b: *std.Build, io: std.Io, failed: *bool) !void {
+    for (module_list) |m| {
+        scanSpdx(b, io, b.fmt("modules/{s}", .{m.name}), 0, failed);
+    }
+}
+
+fn scanSpdx(b: *std.Build, io: std.Io, dir_path: []const u8, depth: u8, failed: *bool) void {
+    if (depth > 6) return;
+    var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var it = dir.iterate();
+    while (it.next(io) catch return) |e| {
+        const path = b.fmt("{s}/{s}", .{ dir_path, e.name });
+        switch (e.kind) {
+            .directory => {
+                if (isBuildScratchDir(e.name)) continue;
+                scanSpdx(b, io, path, depth + 1, failed);
+            },
+            .file => {
+                const is_src = std.mem.endsWith(u8, e.name, ".zig") or
+                    std.mem.endsWith(u8, e.name, ".c") or
+                    std.mem.endsWith(u8, e.name, ".h");
+                if (!is_src) continue;
+                var file = b.build_root.handle.openFile(io, path, .{}) catch continue;
+                defer file.close(io);
+                // The header is at the top or it is not a header. Reading whole
+                // files to answer a question about their first two lines is how
+                // a cheap gate becomes one people switch off.
+                var head: [512]u8 = undefined;
+                const n = file.readPositionalAll(io, &head, 0) catch continue;
+                if (std.mem.indexOf(u8, head[0..n], "SPDX-License-Identifier") != null) continue;
+                std.log.err(
+                    "{s} has no `SPDX-License-Identifier` in its first {d} bytes. Every shipped " ++
+                        "source file in this collection declares its licence on line 1 — an " ++
+                        "unlabelled file does not read as unlabelled, it reads as not looked at yet.",
+                    .{ path, head.len },
+                );
+                failed.* = true;
+            },
+            else => continue,
+        }
+    }
+}
+
 /// Every relative pointer to a NOTICE inside `modules/**` must resolve to a file
 /// that exists.
 ///

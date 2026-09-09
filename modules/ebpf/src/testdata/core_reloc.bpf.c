@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: CO-RE field relocations (__attribute__((preserve_access_index))). */
 #define SEC(name) __attribute__((section(name), used))
 

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: kprobe + BTF-defined BPF_MAP_TYPE_HASH map. */
 #define SEC(name) __attribute__((section(name), used))
 /* The two macros libbpf's bpf_helpers.h spells the same way: a `__uint`

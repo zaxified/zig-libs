@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: BTF-defined BPF_MAP_TYPE_RINGBUF map + a tracepoint program. */
 #define SEC(name) __attribute__((section(name), used))
 #define __uint(name, val) int (*name)[val]

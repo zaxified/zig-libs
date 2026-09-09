@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — Docs: `sizeprobe/build.zig` had no `SPDX-License-Identifier`; added.
+  `zig build check-catalog` now enforces the header on every shipped `.zig`/`.c`/`.h` under
+  `modules/**`.
 - **2026-09-07** — **All twelve fuzz harnesses were replaying an EMPTY input, and now
   each has a corpus with a measured reach guard.** Every one of them opened with
   `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`. `bytes`

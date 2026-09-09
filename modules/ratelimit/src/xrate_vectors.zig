@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Frozen reference trace captured from Go `golang.org/x/time/rate`.
 //!
 //! `TokenBucket` is modelled on that package (see the type's doc comment). Its

@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* fixture: the pre-BTF `maps` section (struct bpf_map_def). */
 #define SEC(name) __attribute__((section(name), used))
 
