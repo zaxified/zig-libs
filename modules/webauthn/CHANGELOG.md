@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 F4 closed: §8.2.1's `id-fido-gen-ce-aaguid` certificate binding was
+  never checked.** `verifyLeafCertSignature` (the `packed`/x5c path) now calls
+  `checkAaguidExtension`, an independent DER walk over the leaf certificate via
+  `x509.extensions` (std's own `Certificate.parse` never surfaces an OID it does not
+  recognize, and this one — 1.3.6.1.4.1.45724.1.1.4 — is not in its table). When the
+  extension is present its value must equal `authData.aaguid`; absence is not an error
+  (§8.2.1 does not require it). Without this, a certificate that chains to a trusted
+  attestation root but was never issued for the claimed authenticator model could still
+  make `result.aaguid` say otherwise, spoofing which MODEL an RP's metadata-service
+  policy is trusting. `fido-u2f` is unaffected — §8.6 does not name this extension.
+  Measured: a hand-built DER fixture in `root.zig`'s own test (no real §16 vector carries
+  the extension) — disabling the equality check turns 1 of 74 `test-webauthn` tests red
+  (`error.AaguidExtensionMismatch` expected, `void` returned); restoring it is 74/74 green.
+  Still open, unchanged: no trust-chain validation, `basicConstraints`/`keyUsage`/validity
+  dates (see SPEC.md).
+
 - **2026-09-09** — The module has a `NOTICE` for the first time, and it carries a condition.
   `src/vectors.zig` reproduces W3C WebAuthn Level 3 §16's test vectors verbatim — the same
   rights holder `modules/tracecontext` already carries a full attribution for, while this

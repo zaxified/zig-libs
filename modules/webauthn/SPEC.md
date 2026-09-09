@@ -44,16 +44,22 @@ there is deliberately no root `/NOTICE` entry to point at.
   out-of-bounds read under ReleaseFast), and `x509/src/safe.zig` is this collection's single
   reconciled guard for exactly that hazard. It does
   **not** build or validate a trust chain to a root, check `basicConstraints`/
-  `keyUsage`, check certificate validity dates, **or check §8.2.1's
-  `id-fido-gen-ce-aaguid` extension (OID 1.3.6.1.4.1.45724.1.1.4) against `authData.aaguid`**.
-  That last one was not disclosed here until 2026-09-02 and is the one that binds the certificate
-  to the claim: an RP that *does* chain `leaf_cert_der` to an MDS-derived store and then reads
-  `result.aaguid` to decide which authenticator MODEL this is can be spoofed by anyone holding an
-  attestation key that chains to a root in that store (batch keys are shared across whole product
-  lines, and several have leaked). No §16 vector carries the extension, so the corpus could not
-  anchor the check even if it existed. Model-based policy, not authentication, is what breaks — WebAuthn attestation trust decisions (is this
-  authenticator model acceptable?) are a metadata-service (FIDO MDS) / RP-policy concern layered
-  above signature verification, and are explicitly out of scope here (see "Threat model" below).
+  `keyUsage`, or check certificate validity dates — those remain deferred, a metadata-service
+  (FIDO MDS) / RP-policy concern layered above signature verification (see "Threat model" below).
+  **Since 2026-09-10 it DOES check §8.2.1's `id-fido-gen-ce-aaguid` extension (OID
+  1.3.6.1.4.1.45724.1.1.4), when the leaf certificate carries it, against `authData.aaguid`**
+  (`checkAaguidExtension`, via `x509.extensions` — std's own `Certificate.parse` never surfaces an
+  OID it does not recognize, so this is an independent DER walk, not std's). Absence of the
+  extension is not itself rejected (§8.2.1 does not require it); a *mismatched* value is
+  `error.AaguidExtensionMismatch`. This is the binding that keeps `result.aaguid` honest for a
+  caller who *does* chain `leaf_cert_der` to an MDS-derived store to decide which authenticator
+  MODEL this is: without it, anyone holding an attestation key that chains to a root in that store
+  (batch keys are shared across whole product lines, and several have leaked) could claim any
+  AAGUID authData names. No §16 vector carries the extension, so the corpus alone could not anchor
+  the check — a hand-built DER fixture does, in `root.zig`'s own test. Still open: this is a
+  same-certificate content check, not chain validation — nothing here confirms the leaf itself
+  chains to a trusted attestation root, which is the `basicConstraints`/`keyUsage`/validity-dates
+  gap above.
 - **`authenticatorData`'s CBOR credential public key has no length prefix (WebAuthn §6.5.2) —
   handled via full-buffer CBOR decode, extensions therefore DEFERRED.** The wire format is
   `aaguid(16) ‖ credentialIdLength(2) ‖ credentialId(L) ‖ credentialPublicKey(CBOR, variable)

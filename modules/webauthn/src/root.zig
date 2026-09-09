@@ -504,6 +504,14 @@ pub const AttestationError = AttestationObjectError || AuthDataError || Signatur
     InvalidAttestationStatement,
     InvalidCertificate,
     UnsupportedFormat,
+    /// WebAuthn §8.2.1: the `packed` attestation certificate carries the
+    /// id-fido-gen-ce-aaguid extension (OID 1.3.6.1.4.1.45724.1.1.4) and its
+    /// value does not match `authData.aaguid`. The extension exists so a
+    /// relying party can trust the AAGUID it reads from `authData` — an
+    /// attacker who controls `authData` but not the attestation key cannot
+    /// also forge this binding, so a mismatch means the certificate was not
+    /// issued for the authenticator model `authData` claims to be.
+    AaguidExtensionMismatch,
 };
 
 pub const AttestationType = enum { none, basic, self_attestation };
@@ -638,10 +646,48 @@ fn parseAttestationObject(allocator: Allocator, raw: []const u8) (AttestationObj
 /// collection's single reconciled guard for exactly this std hazard — see
 /// `modules/x509/src/safe.zig`. Never call `cert.parse()` on `leaf_der`
 /// directly.
-fn verifyLeafCertSignature(leaf_der: []const u8, alg: i64, msg: []const u8, sig: []const u8) AttestationError!void {
+/// WebAuthn §8.2.1's id-fido-gen-ce-aaguid extension OID, 1.3.6.1.4.1.45724.1.1.4,
+/// as its DER `OBJECT IDENTIFIER` content octets (X.690 §8.19): arc 1.3 packs
+/// to 0x2B, then 6/1/4/1 as single bytes, then 45724 as the base-128 triple
+/// 0x82 0xE5 0x1C, then 1/1/4.
+const fido_gen_ce_aaguid_oid = [_]u8{ 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0xE5, 0x1C, 0x01, 0x01, 0x04 };
+
+/// WebAuthn §8.2.1: "If x5c is present, ... the Basic Constraints extension
+/// MUST have the CA component set to false" is chain-validation territory
+/// this module already documents as deferred (see SPEC.md), but the id-fido-
+/// gen-ce-aaguid binding is not — it is a same-certificate content check: IF
+/// the leaf carries that extension, its value MUST equal `authData.aaguid`
+/// (the very aaguid this call is verifying an attestation for). Absence of
+/// the extension is not itself a fault; §8.2.1 only constrains it when present.
+///
+/// `cert` must already have had `cert.parse()` called and checked — this
+/// walks the same buffer with `x509.extensions`' independent DER traversal
+/// (std's own `Certificate.parse` never surfaces unrecognized extension OIDs,
+/// which is exactly what this one is).
+fn checkAaguidExtension(cert: std.crypto.Certificate, expected_aaguid: [16]u8) AttestationError!void {
+    const maybe_slice = x509.extensions.findExtensions(cert) catch return error.InvalidCertificate;
+    const slice = maybe_slice orelse return; // v1/v2, or a v3 cert with no extensions field
+    var it = x509.extensions.iterate(slice, cert);
+    while (it.next() catch return error.InvalidCertificate) |entry| {
+        if (!std.mem.eql(u8, entry.oid, &fido_gen_ce_aaguid_oid)) continue;
+        // extnValue's content is itself `OCTET STRING (SIZE(16))` wrapping
+        // the raw AAGUID (WebAuthn §8.2.1) — one more DER unwrap.
+        const inner = x509.extensions.parseElement(entry.value, 0) catch return error.InvalidCertificate;
+        if (inner.identifier.tag != .octetstring) return error.InvalidCertificate;
+        const aaguid_bytes = entry.value[inner.slice.start..inner.slice.end];
+        if (!std.mem.eql(u8, aaguid_bytes, &expected_aaguid)) return error.AaguidExtensionMismatch;
+        return; // extension found and matches — done
+    }
+}
+
+/// `expected_aaguid` is non-null only for `packed` (§8.2.1 names this
+/// extension for that format specifically); `fido-u2f` (§8.6) has no such
+/// requirement, so its call site passes `null` and this check is skipped.
+fn verifyLeafCertSignature(leaf_der: []const u8, alg: i64, msg: []const u8, sig: []const u8, expected_aaguid: ?[16]u8) AttestationError!void {
     var scratch: [x509.safe.max_certificate_len + x509.safe.parse_slack]u8 = undefined;
     const cert = x509.safe.safeCertificate(leaf_der, &scratch) catch return error.InvalidCertificate;
     const parsed = cert.parse() catch return error.InvalidCertificate;
+    if (expected_aaguid) |aaguid| try checkAaguidExtension(cert, aaguid);
     switch (parsed.pub_key_algo) {
         .X9_62_id_ecPublicKey => |named_curve| {
             if (named_curve != .X9_62_prime256v1) return error.UnsupportedAlgorithm;
@@ -707,7 +753,7 @@ const StatementResult = struct {
 /// credential's own public key (the `alg` in `attStmt` and the algorithm
 /// bound to `credential_key` must agree — enforced inside `verifySignature`
 /// itself, which rejects any alg/key-family mismatch).
-fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key: CoseKey) AttestationError!StatementResult {
+fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key: CoseKey, aaguid: [16]u8) AttestationError!StatementResult {
     const alg_v = cborMapGetStr(att_stmt, "alg") orelse return error.MissingField;
     const alg = alg_v.toI64() orelse return error.WrongType;
     const sig_v = cborMapGetStr(att_stmt, "sig") orelse return error.MissingField;
@@ -717,7 +763,7 @@ fn verifyPacked(att_stmt: []const cbor.MapEntry, msg: []const u8, credential_key
     };
 
     if (try firstX5cDer(att_stmt, false)) |leaf_der| {
-        try verifyLeafCertSignature(leaf_der, alg, msg, sig);
+        try verifyLeafCertSignature(leaf_der, alg, msg, sig, aaguid);
         return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
     }
     try verifySignature(credential_key, alg, msg, sig);
@@ -762,7 +808,7 @@ fn verifyFidoU2f(
         &public_key_u2f,
     });
 
-    try verifyLeafCertSignature(leaf_der, cbor.cose.alg_es256, verification_data, sig);
+    try verifyLeafCertSignature(leaf_der, cbor.cose.alg_es256, verification_data, sig, null);
     return .{ .attestation_type = .basic, .leaf_cert_der = leaf_der };
 }
 
@@ -781,7 +827,7 @@ fn verifyStatement(
         return .{ .attestation_type = .none };
     } else if (std.mem.eql(u8, obj.fmt, "packed")) {
         const msg = try std.mem.concat(allocator, u8, &.{ obj.auth_data_raw, &client_data_hash });
-        return verifyPacked(obj.att_stmt, msg, att.credential_public_key);
+        return verifyPacked(obj.att_stmt, msg, att.credential_public_key, att.aaguid);
     } else if (std.mem.eql(u8, obj.fmt, "fido-u2f")) {
         return verifyFidoU2f(allocator, obj.att_stmt, obj.auth_data, client_data_hash);
     }
@@ -1295,4 +1341,113 @@ test "F5: parseAuthenticatorData decodes aaguid + user_present/user_verified byt
     try std.testing.expect(parsed.flags.user_verified);
     try std.testing.expect(parsed.attested_credential_data != null);
     try std.testing.expectEqualSlices(u8, &aaguid, &parsed.attested_credential_data.?.aaguid);
+}
+
+/// Hand-builds a minimal DER `Certificate` for `checkAaguidExtension` (audit
+/// `webauthn` F4): `x509.extensions.findExtensions` only needs a
+/// structurally valid path down to the `[3] EXPLICIT` extensions field (RFC
+/// 5280 §4.1) — issuer/validity/subject/subjectPublicKeyInfo can be empty
+/// SEQUENCEs, since nothing here calls `cert.parse()` (which would reject
+/// them). `ext_aaguid` non-null embeds one id-fido-gen-ce-aaguid extension
+/// carrying that value; `null` omits the extensions field entirely.
+fn buildMinimalCertWithAaguidExt(buf: []u8, ext_aaguid: ?[16]u8) []const u8 {
+    const version = [_]u8{ 0xA0, 0x03, 0x02, 0x01, 0x02 }; // [0] EXPLICIT INTEGER 2 (v3)
+    const serial = [_]u8{ 0x02, 0x01, 0x01 }; // INTEGER 1
+    const sig_alg = [_]u8{ 0x30, 0x03, 0x06, 0x01, 0x2A }; // SEQUENCE { OID }
+    const empty_seq = [_]u8{ 0x30, 0x00 }; // issuer / validity / subject / spki
+
+    var tbs_inner: [128]u8 = undefined;
+    var t: usize = 0;
+    @memcpy(tbs_inner[t..][0..version.len], &version);
+    t += version.len;
+    @memcpy(tbs_inner[t..][0..serial.len], &serial);
+    t += serial.len;
+    @memcpy(tbs_inner[t..][0..sig_alg.len], &sig_alg);
+    t += sig_alg.len;
+    inline for (0..4) |_| { // issuer, validity, subject, subjectPublicKeyInfo
+        @memcpy(tbs_inner[t..][0..empty_seq.len], &empty_seq);
+        t += empty_seq.len;
+    }
+
+    if (ext_aaguid) |aaguid| {
+        var ext_entry: [64]u8 = undefined;
+        var e: usize = 0;
+        ext_entry[e] = 0x06; // extnID OBJECT IDENTIFIER
+        e += 1;
+        ext_entry[e] = @intCast(fido_gen_ce_aaguid_oid.len);
+        e += 1;
+        @memcpy(ext_entry[e..][0..fido_gen_ce_aaguid_oid.len], &fido_gen_ce_aaguid_oid);
+        e += fido_gen_ce_aaguid_oid.len;
+        ext_entry[e] = 0x04; // extnValue OCTET STRING, content = OCTET STRING(16)
+        e += 1;
+        ext_entry[e] = 2 + 16;
+        e += 1;
+        ext_entry[e] = 0x04;
+        e += 1;
+        ext_entry[e] = 16;
+        e += 1;
+        @memcpy(ext_entry[e..][0..16], &aaguid);
+        e += 16;
+
+        var extension: [80]u8 = undefined;
+        extension[0] = 0x30; // Extension SEQUENCE
+        extension[1] = @intCast(e);
+        @memcpy(extension[2..][0..e], ext_entry[0..e]);
+        const ext_len = 2 + e;
+
+        var extensions_seq: [90]u8 = undefined;
+        extensions_seq[0] = 0x30; // Extensions ::= SEQUENCE OF Extension
+        extensions_seq[1] = @intCast(ext_len);
+        @memcpy(extensions_seq[2..][0..ext_len], extension[0..ext_len]);
+        const eseq_len = 2 + ext_len;
+
+        tbs_inner[t] = 0xA3; // [3] EXPLICIT
+        t += 1;
+        tbs_inner[t] = @intCast(eseq_len);
+        t += 1;
+        @memcpy(tbs_inner[t..][0..eseq_len], extensions_seq[0..eseq_len]);
+        t += eseq_len;
+    }
+
+    var tbs: [140]u8 = undefined;
+    tbs[0] = 0x30; // tbsCertificate SEQUENCE
+    tbs[1] = @intCast(t);
+    @memcpy(tbs[2..][0..t], tbs_inner[0..t]);
+    const tbs_len = 2 + t;
+
+    buf[0] = 0x30; // Certificate SEQUENCE (no signatureAlgorithm/signature —
+    buf[1] = @intCast(tbs_len); // findExtensions never looks past tbsCertificate)
+    @memcpy(buf[2..][0..tbs_len], tbs[0..tbs_len]);
+    return buf[0 .. 2 + tbs_len];
+}
+
+test "F4: checkAaguidExtension enforces WebAuthn §8.2.1's id-fido-gen-ce-aaguid binding" {
+    const aaguid = [16]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C };
+    var mismatched = aaguid;
+    mismatched[7] ^= 0xFF; // single-byte mutation: same length, different value
+
+    var buf: [256]u8 = undefined;
+
+    // Positive control: a certificate whose extension MATCHES authData's
+    // aaguid must be accepted. This one must survive.
+    {
+        const der_bytes = buildMinimalCertWithAaguidExt(&buf, aaguid);
+        const cert: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
+        try checkAaguidExtension(cert, aaguid);
+    }
+    // RED: a certificate that names a DIFFERENT AAGUID than authData claims
+    // must be rejected, not silently accepted -- this is the binding F4
+    // found completely unchecked.
+    {
+        const der_bytes = buildMinimalCertWithAaguidExt(&buf, mismatched);
+        const cert: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
+        try std.testing.expectError(error.AaguidExtensionMismatch, checkAaguidExtension(cert, aaguid));
+    }
+    // §8.2.1 does not require the extension -- its absence must not be an
+    // error either.
+    {
+        const der_bytes = buildMinimalCertWithAaguidExt(&buf, null);
+        const cert: std.crypto.Certificate = .{ .buffer = der_bytes, .index = 0 };
+        try checkAaguidExtension(cert, aaguid);
+    }
 }
