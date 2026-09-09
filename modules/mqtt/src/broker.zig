@@ -75,8 +75,11 @@ pub const max_in_flight = 64;
 /// one is refused with CONNACK `identifier_rejected`).
 pub const max_client_id = 256;
 
-/// Largest username the broker stores inline for ACL identity (a longer one is
-/// simply not retained — the ACL hook then sees a null username).
+/// Largest username the broker stores inline for ACL identity (a longer one
+/// is refused with CONNACK `bad_username_or_password`, mirroring
+/// `max_client_id` above — silently dropping it instead would leave the
+/// auth hook seeing a null username, indistinguishable from "no username
+/// sent", for a client that in fact sent one).
 pub const max_username = 256;
 
 /// Largest SUBSCRIBE the broker answers in one SUBACK (filters per packet).
@@ -850,12 +853,23 @@ pub const Broker = struct {
         };
 
         // Thread the identity onto the connection so the ACL hook can see it.
+        // A username too long to retain must not silently become "no
+        // username": an auth hook that treats a null username as anonymous
+        // would then admit this client as anonymous instead of rejecting a
+        // credential it can't record. Refuse explicitly, same as an
+        // oversized client id above.
         if (c.username) |uname| {
-            if (uname.len <= conn.username_buf.len) {
-                @memcpy(conn.username_buf[0..uname.len], uname);
-                conn.username_len = uname.len;
-                conn.has_username = true;
+            if (uname.len > conn.username_buf.len) {
+                var cbuf: [4]u8 = undefined;
+                try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
+                    .session_present = false,
+                    .return_code = .bad_username_or_password,
+                }));
+                return .close;
             }
+            @memcpy(conn.username_buf[0..uname.len], uname);
+            conn.username_len = uname.len;
+            conn.has_username = true;
         }
 
         // Authentication hook (FIX D). Checked BEFORE take-over so an
@@ -2275,6 +2289,43 @@ test "FIX D: authentication deny → CONNACK not_authorized" {
     const ack = (try tt.next()).?;
     try testing.expectEqual(packet.ConnectReturnCode.not_authorized, ack.connack.return_code);
     b.remove(conn);
+}
+
+test "handleConnect: username longer than max_username is refused, not silently anonymous" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    // Positive control: exactly at the limit still connects and threads the
+    // username through — this must not become collateral damage of the fix.
+    {
+        var tt = TestTransport{};
+        const conn = try b.accept(tt.transport());
+        var uname_buf: [max_username]u8 = undefined;
+        @memset(&uname_buf, 'a');
+        var buf: [max_username + 64]u8 = undefined;
+        try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = "ok", .username = &uname_buf }));
+        try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
+        try testing.expectEqualStrings(&uname_buf, conn.usernameOpt().?);
+        b.remove(conn);
+    }
+
+    // One byte over the limit: refused outright with CONNACK
+    // bad_username_or_password. Before the fix this instead threaded a null
+    // username onto the connection (has_username stayed false) — silently
+    // indistinguishable from a client that sent no username at all, which
+    // an ACL treating null as anonymous would then admit.
+    {
+        var tt = TestTransport{};
+        const conn = try b.accept(tt.transport());
+        var uname_buf: [max_username + 1]u8 = undefined;
+        @memset(&uname_buf, 'a');
+        var buf: [max_username + 64]u8 = undefined;
+        try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = "over", .username = &uname_buf }));
+        try testing.expectEqual(Disposition.close, try b.process(conn, 0));
+        const ack = (try tt.next()).?;
+        try testing.expectEqual(packet.ConnectReturnCode.bad_username_or_password, ack.connack.return_code);
+        b.remove(conn);
+    }
 }
 
 test "FIX D: credential auth allow threads the username; ACL gates pub + sub" {

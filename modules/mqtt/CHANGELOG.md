@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — The over-long-username gap recorded below (2026-09-03) is fixed: `handleConnect`
+  now refuses a CONNECT whose username exceeds `max_username` (256 B) with CONNACK
+  `bad_username_or_password` and closes, instead of silently leaving `has_username` false. P1
+  (no consumers in this repo): input hardening needed no sign-off. Measured RED → GREEN by
+  reverting the guard to the old "store if it fits, else do nothing" shape and rerunning
+  `test-mqtt`: 76 pass / 1 skip / **1 fail** (the new refusal test — `expected .close, found
+  .keep`), vs. 77 pass / 1 skip / 0 fail with the fix restored.
 - **2026-09-07** — Fuzz reach: `packet.fuzzDecode` never called `decode`. It opened with
   `smith.bytes(&buf)` and then `smith.valueRangeAtMost(u16, 0, buf.len)`; a ranged draw reads
   eight octets as a little-endian u64 and returns the range MINIMUM when fewer than eight
