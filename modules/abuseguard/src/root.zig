@@ -370,12 +370,19 @@ pub const Guard = struct {
         const drained = g.drainedSince(e, now_ns);
         e.strikes = @max(0, e.strikes - @as(f64, @floatFromInt(drained))) +
             @as(f64, @floatFromInt(weight));
+        // `record` returns above when `weight == 0`, so `weight >= 1` here
+        // and `e.strikes` (prior balance minus drain, floored at 0, plus
+        // `weight`) can therefore never be exactly 0. Enforced rather than
+        // just asserted in prose: if a future change makes the early return
+        // above stop covering `weight == 0`, this fires instead of quietly
+        // reviving the dead `e.strikes == 0` branch this used to carry.
+        std.debug.assert(e.strikes != 0);
         // Advance by what actually drained, not to `now`: discarding the
         // remainder would mean a client striking just inside the interval
         // never drains at all. When nothing is left to drain there is no
         // remainder worth keeping, and letting the mark lag would build up a
         // huge drain for the next strike.
-        e.strikes_updated_ns = if (e.strikes == 0 or g.options.strike_decay_ms == 0)
+        e.strikes_updated_ns = if (g.options.strike_decay_ms == 0)
             now_ns
         else
             e.strikes_updated_ns +| (drained *| (g.options.strike_decay_ms *| std.time.ns_per_ms));
