@@ -1,5 +1,23 @@
-sphinx — provenance note
+sphinx — third-party attribution
 =========================
+
+⛔ KIND CHANGED 2026-09-09, from `provenance note` to `third-party
+attribution`. This file carries a CONDITION now, and the reason is that it
+always did: `src/kat_vectors.zig` embeds the BOLT#4 onion test vector verbatim
+from `lightning/bolts`, and that repository is licensed CC-BY 4.0 — which asks
+for attribution. Redistributing this module — alone, or as part of zig-libs —
+must keep this file with it.
+
+⛔⛔ THE REPOSITORY WAS DISTRIBUTING TWO OPPOSITE ANSWERS ABOUT ONE UPSTREAM.
+`modules/lnwire/NOTICE`, `modules/lninvoice/NOTICE` and `modules/k256/NOTICE`
+all record `lightning/bolts` as CC-BY 4.0 and attribute it. This file, and its
+siblings `bolt8` and `bolt3`, said the opposite — that BOLT text is "not a
+copyrightable work (merger doctrine)" and needs no entry — while quoting that
+same repository at length and vendoring its test vector. Two incompatible
+answers about one rightsholder, shipped together, and the split was backwards:
+CC-BY 4.0 covers the specification TEXT at least as squarely as it covers a
+JSON vector file. The reader who opened two of these files side by side would
+have found the contradiction before we did.
 
 Kept as a module-local NOTICE (same placement as the sibling `bip340`/
 `taproot`/`musig2`/`dtls`/`falcon`/`slhdsa` modules, which are likewise
@@ -12,13 +30,18 @@ sphinx — clean-room implementation from BOLT#4 ("Onion Routing Protocol",
 `lightning/bolts`), covering: "Key Generation", "Pseudo Random Byte
 Stream", "Packet Structure" (incl. the `payload` TLV format), "Shared
 Secret", "Blinding Ephemeral Onion Keys", "Packet Construction", "Onion
-Decryption", and "Filler Generation". BOLT#4 is a public, open Lightning
-Network specification — not a copyrightable work (merger doctrine; see
-CONVENTIONS.md §5) — so no third-party-source NOTICE entry is strictly
-required for the spec citation alone. No reference implementation's source
-(lnd, c-lightning/core-lightning, eclair, ldk, etc.) was ported or
-consulted as a design reference for this module — it was built directly
-from the BOLT#4 specification text.
+Decryption", and "Filler Generation". The CODE is this module's own: no
+reference implementation's source (lnd, c-lightning/core-lightning, eclair,
+ldk, etc.) was ported or consulted as a design reference — it was built
+directly from the BOLT#4 specification text.
+
+What is NOT this module's own is the specification text it quotes and the test
+vector it vendors, and that is what the entry below is for. The sentence this
+paragraph replaced said BOLT#4 is "not a copyrightable work (merger doctrine;
+see CONVENTIONS.md §5)". The merger argument may well hold for a wire format's
+field layout; it is a strange thing to run against a repository that states its
+own licence in its own README, and it is not the argument this repository makes
+elsewhere about the identical upstream.
 
 BOLT#1 ("Base Protocol") is cited for the `bigsize` variable-length integer
 encoding (`bigsize.zig`), also a public specification artifact.
@@ -53,7 +76,18 @@ chacha.ChaCha20IETF`, `std.crypto.auth.hmac.sha2.HmacSha256`, and
 Zig itself); see `core.zig`'s and `keyderive.zig`'s module doc comments for
 the specific recon findings.
 
-No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+**Copyleft:** NONE-SHIPPED — no GPL/LGPL/AGPL source was consulted or copied
+anywhere in this module, and none is shipped with it. The Lightning reference
+implementations named above were not read at all; the only third-party material
+here is `lightning/bolts`' own specification text and test vectors, CC-BY 4.0,
+which is permissive and attached below.
+
+⭐ That sentence existed before 2026-09-09 in plain prose. It became a GATED
+line the moment this file's kind changed from `provenance note` to
+`third-party attribution`: `check-copyleft` only holds attribution files to the
+formal shape, so declaring the condition honestly is what pulled the file under
+a check it had never been under. Worth knowing before anyone changes a kind
+back to make a gate quiet.
 
 **Status: complete.** The packet codec, key-derivation primitives,
 `bigsize` codec, per-hop TLV framing, and the three crypto cores
@@ -62,3 +96,26 @@ KAT-tested against the official BOLT#4 test vector — `construct`
 reproduces the published 1366-byte onion packet byte-exact, and a full
 5-hop construct → process round-trip passes. See `SPEC.md`'s
 "TODO(fable) — done record" for the per-core verification detail.
+
+`lightning/bolts` — CC-BY 4.0
+-----------------------------
+
+  https://github.com/lightning/bolts
+  Licensed under CC-BY 4.0: http://creativecommons.org/licenses/by/4.0/
+  (stated in the repository's own README.md; there is no separate LICENSE
+  file). The same upstream and terms `modules/lnwire/NOTICE`,
+  `modules/lninvoice/NOTICE` and `modules/k256/NOTICE` already record.
+
+  RE-VERIFIED 2026-09-09 against `lightning/bolts` at commit
+  `152897261850d93c4f4597f39cf22d7d22d6ede6` (`master`, 2026-08-26): all 12
+  values this module vendors from `bolt04/onion-test.json` — the session key,
+  five hops' pubkeys and payloads, and the assembled 1366-byte onion — are
+  byte-identical to that upstream file today. The earlier record said only
+  "`master` branch", which is not a pin; this is.
+
+  INDICATION OF MODIFICATIONS, per CC-BY 4.0 §3(a)(1)(B): none. The values are
+  the published ones, hex-decoded from the form the JSON prints — a change of
+  encoding, not of content.
+
+  CC-BY 4.0 is not reproduced in full here because it does not ask to be:
+  §3(a)(1)(C) is satisfied by "a URI or hyperlink to this Public License".

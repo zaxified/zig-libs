@@ -1,5 +1,20 @@
-bolt3 — provenance note
+bolt3 — third-party attribution
 =======================
+
+⛔ KIND CHANGED 2026-09-09, from `provenance note` to `third-party
+attribution`. This file carries a CONDITION now, and the reason is that it
+always did: `src/root.zig` embeds BOLT#3's Appendix D and Appendix E test vectors verbatim from `lightning/bolts`, and that repository is
+licensed CC-BY 4.0 — which asks for attribution. Redistributing this module —
+alone, or as part of zig-libs — must keep this file with it.
+
+⛔⛔ THE REPOSITORY WAS DISTRIBUTING TWO OPPOSITE ANSWERS ABOUT ONE UPSTREAM.
+`modules/lnwire/NOTICE`, `modules/lninvoice/NOTICE` and `modules/k256/NOTICE`
+all record `lightning/bolts` as CC-BY 4.0 and attribute it. This file, and its
+siblings `sphinx` and `bolt8`, said the opposite — that BOLT text is "not a
+copyrightable work (merger doctrine)" and needs no entry — while quoting that
+same repository and vendoring its test vectors. Two incompatible answers about
+one rightsholder, shipped together.
+
 
 Kept as a module-local NOTICE (same placement as the sibling `bolt8`/`sphinx`/
 `bip340`/`taproot`/`musig2` modules, which are likewise self-contained
@@ -21,4 +36,27 @@ scalar-reduction idiom for hash-to-scalar mirrors this repository's own
 
 Verification vectors are the BOLT#3 Appendix D (generation) and Appendix E
 (key derivation) test vectors from the lightning/bolts repository, reproduced
-byte-exact in the module's tests.
+byte-exact in the module's tests — which is precisely why this file now carries
+a condition rather than being a record only. "Reproduced byte-exact" and "needs
+no attribution entry" cannot both be true of a CC-BY upstream.
+
+`lightning/bolts` — CC-BY 4.0
+-----------------------------
+
+  https://github.com/lightning/bolts
+  Licensed under CC-BY 4.0: http://creativecommons.org/licenses/by/4.0/
+  (stated in the repository's own README.md; there is no separate LICENSE
+  file). The same upstream and terms `modules/lnwire/NOTICE`,
+  `modules/lninvoice/NOTICE` and `modules/k256/NOTICE` already record.
+
+  RE-VERIFIED 2026-09-09 against `lightning/bolts` at commit
+  `152897261850d93c4f4597f39cf22d7d22d6ede6` (`master`, 2026-08-26):
+    all 16 hex literals of 32 characters or more that this module vendors
+    appear verbatim in today's `03-transactions.md`.
+
+  INDICATION OF MODIFICATIONS, per CC-BY 4.0 §3(a)(1)(B): none. The values are
+  the published ones, hex-decoded from the form the specification prints — a
+  change of encoding, not of content.
+
+  CC-BY 4.0 is not reproduced in full here because it does not ask to be:
+  §3(a)(1)(C) is satisfied by "a URI or hyperlink to this Public License".

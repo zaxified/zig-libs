@@ -1,5 +1,20 @@
-bolt8 — provenance note
+bolt8 — third-party attribution
 ========================
+
+⛔ KIND CHANGED 2026-09-09, from `provenance note` to `third-party
+attribution`. This file carries a CONDITION now, and the reason is that it
+always did: `src/kat_vectors.zig` embeds BOLT#8's Appendix A transport test vectors verbatim from `lightning/bolts`, and that repository is
+licensed CC-BY 4.0 — which asks for attribution. Redistributing this module —
+alone, or as part of zig-libs — must keep this file with it.
+
+⛔⛔ THE REPOSITORY WAS DISTRIBUTING TWO OPPOSITE ANSWERS ABOUT ONE UPSTREAM.
+`modules/lnwire/NOTICE`, `modules/lninvoice/NOTICE` and `modules/k256/NOTICE`
+all record `lightning/bolts` as CC-BY 4.0 and attribute it. This file, and its
+siblings `sphinx` and `bolt3`, said the opposite — that BOLT text is "not a
+copyrightable work (merger doctrine)" and needs no entry — while quoting that
+same repository and vendoring its test vectors. Two incompatible answers about
+one rightsholder, shipped together.
+
 
 Kept as a module-local NOTICE (same placement as the sibling `sphinx`/
 `bip340`/`taproot`/`musig2`/`dtls`/`falcon`/`slhdsa` modules, which are
@@ -16,13 +31,16 @@ Versioning", "Noise Protocol Instantiation", "Authenticated Key Exchange
 Handshake Specification" (Handshake State / Handshake State Initialization
 / Handshake Exchange — Acts One/Two/Three), "Lightning Message
 Specification" (Encrypting and Sending / Receiving and Decrypting
-Messages), and "Lightning Message Key Rotation". BOLT#8 is a public, open
-Lightning Network specification — not a copyrightable work (merger
-doctrine; see CONVENTIONS.md §5) — so no third-party-source NOTICE entry
-is strictly required for the spec citation alone. No reference
-implementation's source (lnd's `brontide`, core-lightning, eclair, ldk,
-etc.) was ported or consulted as a design reference for this module — it
-was built directly from the BOLT#8 specification text.
+Messages), and "Lightning Message Key Rotation". The CODE is this module's
+own: no reference implementation's source (lnd's `brontide`,
+core-lightning, eclair, ldk, etc.) was ported or consulted as a design
+reference — it was built directly from the BOLT#8 specification text.
+
+What is NOT this module's own is the specification text it quotes and the
+Appendix A vectors it vendors, and that is what the entry below is for. The
+sentence this paragraph replaced called BOLT#8 "not a copyrightable work
+(merger doctrine; see CONVENTIONS.md §5)" — an argument this repository does
+not make about the identical upstream anywhere else.
 
 This module is built ON this repo's own `noise` module (`../noise`,
 `Suite(DH, Cipher, Hash).SymmetricState`) — a from-scratch, clean-room
@@ -62,7 +80,18 @@ BOLT#4 `ECDH` primitive and `bip340`'s secp256k1 key-pair conventions —
 both already verified byte-exact against `std.crypto.ecc.Secp256k1`
 elsewhere in this repo; no new curve-arithmetic pattern was introduced.
 
-No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
+**Copyleft:** NONE-SHIPPED — no GPL/LGPL/AGPL source was consulted or copied
+anywhere in this module, and none is shipped with it. The Lightning reference
+implementations named above were not read at all; the only third-party material
+here is `lightning/bolts`' own specification text and test vectors, CC-BY 4.0,
+which is permissive and attached below.
+
+⭐ That sentence existed before 2026-09-09 in plain prose. It became a GATED
+line the moment this file's kind changed from `provenance note` to
+`third-party attribution`: `check-copyleft` only holds attribution files to the
+formal shape, so declaring the condition honestly is what pulled the file under
+a check it had never been under. Worth knowing before anyone changes a kind
+back to make a gate quiet.
 
 **Status: complete.** The act framing (`act.zig`), the secp256k1 DH
 adapter (`dh.zig`), the full three-act `Noise_XK` handshake driver
@@ -75,3 +104,25 @@ implemented and KAT-tested byte-exact against the official BOLT#8
 Appendix A vectors, including all published negative vectors — zero
 skipped tests. See `SPEC.md`'s "TODO(fable) — done record" for the
 per-function verification detail.
+
+`lightning/bolts` — CC-BY 4.0
+-----------------------------
+
+  https://github.com/lightning/bolts
+  Licensed under CC-BY 4.0: http://creativecommons.org/licenses/by/4.0/
+  (stated in the repository's own README.md; there is no separate LICENSE
+  file). The same upstream and terms `modules/lnwire/NOTICE`,
+  `modules/lninvoice/NOTICE` and `modules/k256/NOTICE` already record.
+
+  RE-VERIFIED 2026-09-09 against `lightning/bolts` at commit
+  `152897261850d93c4f4597f39cf22d7d22d6ede6` (`master`, 2026-08-26):
+    all 40 hex literals of 32 characters or more that this module vendors
+    appear verbatim in today's `08-transport.md`. The earlier record said only
+    "`master` branch", which is not a pin; this is.
+
+  INDICATION OF MODIFICATIONS, per CC-BY 4.0 §3(a)(1)(B): none. The values are
+  the published ones, hex-decoded from the form the specification prints — a
+  change of encoding, not of content.
+
+  CC-BY 4.0 is not reproduced in full here because it does not ask to be:
+  §3(a)(1)(C) is satisfied by "a URI or hyperlink to this Public License".
