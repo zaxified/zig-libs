@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, which also puts this module in the `ct` class and therefore in `scripts/ctgrind.sh`. Audit finding M2 was that the module's central claim — that nothing here branches on the client's query index — had never been machine-checked. It now is: **`query` and `reconstruct` both measure exactly 1 in-file context**, and both are the branches SPEC.md already names (`if (index >= domain_size)`, a contract check on a public bound, and `if (diff != 0) return error.AnswerRejected`, the abort the protocol publishes by definition). ⭐ The number that matters is the one that is **zero**: the fixed-trip check loops contribute no context, so there is no early exit and no signal revealing which word mismatched. ⚠ The harness pins `fss.prg.Sha256Prg` rather than the default `Aes128Mmo`, whose `constant_time` is `aes.has_hardware_support` — a row that would be green on an AES-NI host for a reason that does not hold on a soft-AES host says nothing, and SPEC.md §"Constant-time PRG selection" states outright that the soft fallback leaks the query index; **a green `query` row is therefore not a claim about the default instantiation on a soft-AES target**. ⭐ Worth measuring rather than reviewing because the sibling this builds on, `fss`, entered the same gate the same day and immediately failed.
+
 - **2026-09-08** — Test-only, no production change: `fuzzVerReconstruct` draws two knobs
   after its four answer frames — the record length and the client MAC secret `m` — and
   nothing pinned them. Measured across the seven built seeds: **6 of 7 carry a non-zero

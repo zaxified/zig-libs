@@ -327,8 +327,8 @@ bls12_381	ReleaseFast	field	1	1	397efcbf4800ff52	c1e8a3c184eada53
 bls12_381	ReleaseFast	g1_scalarmul	1	5	1def823fc775a7a6	b53b0d7808e48c1c
 bls12_381	ReleaseFast	g2_scalarmul	1	8	b20728e96d38eb2c	7f4e15a241002b3f
 bip340	ReleaseFast	sign	1	<=79	a1dc0ab00018aed2	0ce3274dc49157be
-blindrsa	ReleaseFast	blind	1	<=477	56e9b79636971444	39331e35c8b9371e
-blindrsa	ReleaseFast	sign	1	<=218	56e9b79636971444	4d5e3740a158032d
+blindrsa	ReleaseFast	blind	1	<=477	a7e1d9bb5d02bd3a	39331e35c8b9371e
+blindrsa	ReleaseFast	sign	1	<=218	a7e1d9bb5d02bd3a	4d5e3740a158032d
 threshold_ecdsa	ReleaseFast	share	1	<=127	0949d91bca3d536a	4a6777ac538b5e90
 threshold_ecdsa	ReleaseFast	nonce	1	<=400	0949d91bca3d536a	31f7e323b84fd8a7
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
@@ -449,3 +449,24 @@ sealedbox	ReleaseFast	hexenc	1	0	0dd782f63327e8dd	677e9993da327f0d
 sealedbox	ReleaseFast	hexdec	1	1	0dd782f63327e8dd	1c8749621d19a09b
 sealedbox	ReleaseFast	b64enc	1	0	0dd782f63327e8dd	ec1bc04ea2ea3ff7
 sealedbox	ReleaseFast	b64dec	1	1	0dd782f63327e8dd	1c8749621d19a09b
+# ── pir: the query index, and the client's check ───────────────────────────
+# A1 `pir.md` M2 -- the module's central claim had never been machine-checked,
+# and its sibling `fss` exposed a REAL defect the day it entered the gate.
+#
+# ⛔ Both rows are pinned at 1 and a 0 would be WRONG on both.
+#  * `query` 1 = `pir.zig:146` `if (index >= domain_size)`, a contract check on
+#    a PUBLIC bound whose outcome the caller already knows (it chose the index).
+#  * `reconstruct` 1 = `verify.zig:453` `if (diff != 0) return AnswerRejected`,
+#    which SPEC.md calls "the protocol's own public output" -- the abort is
+#    visible by definition.
+# What the claim forbids is a branch revealing WHICH word mismatched, and the
+# fixed-trip loops contribute 0. That is the SPEC sentence, measured.
+#
+# ⚠ The PRG is pinned to Sha256Prg, NOT the default Aes128Mmo, whose
+# `constant_time` is `aes.has_hardware_support`. On an AES-NI host the default
+# would measure green for a reason that does not hold on a soft-AES host, and
+# SPEC.md says the soft fallback leaks the query index. A row whose colour
+# depends on the gate's CPU says nothing. ⛔ So a green `query` row is NOT a
+# claim about the default instantiation on a soft-AES target.
+pir	ReleaseFast	query	1	1	52e6bf4c59a631f9	0dba0d89ed6fb4ab
+pir	ReleaseFast	reconstruct	1	1	d3e3564c69a176d3	b6ecd96f96e9b339

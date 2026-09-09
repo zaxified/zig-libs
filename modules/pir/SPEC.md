@@ -569,6 +569,32 @@ verified layer requires `index < db.count()`.
 
 ### Constant-time position
 
+⭐ **MEASURED 2026-09-09, and the claim below holds.**
+`modules/pir/src/ctgrind_harness.zig` + `scripts/ctgrind.sh pir`, ReleaseFast,
+valgrind/memcheck, pinned exactly in `scripts/ctgrind-expected.tsv` with an
+untainted control row and a no-`-fvalgrind` trap row at 0 beside each:
+
+| target | in-file | what the 1 is |
+|---|---:|---|
+| `query` (SECRET index → DPF Gen) | **1** | `pir.zig:146` `if (index >= domain_size)` — a contract check on a PUBLIC bound whose outcome the caller already knows |
+| `reconstruct` (client's check) | **1** | `verify.zig:453` `if (diff != 0) return error.AnswerRejected` — the abort this section itself calls the protocol's public output |
+
+⛔ A pin of **0** would be wrong on both, and the interesting number is the one
+that IS zero: the fixed-trip loops contribute **no context at all**, so there is
+no early exit and no signal saying which word mismatched. That is the sentence
+below, machine-checked rather than reviewed.
+
+⚠ The harness pins `fss.prg.Sha256Prg`, not the default `Aes128Mmo` — see
+§"Constant-time PRG selection". `Aes128Mmo`'s `constant_time` is
+`aes.has_hardware_support`, so on an AES-NI host the default would measure green
+for a reason that does not hold on a soft-AES host. **A green `query` row is
+therefore not a claim about the default instantiation on a soft-AES target.**
+
+⚠ This claim was unverified until 2026-09-09 (audit finding M2), and the sibling
+it stands on is the argument for having measured it: `fss` entered the same gate
+the same day and immediately failed — `xorMasked` skipped its XOR exactly when
+the secret bit was zero.
+
 The client's check is a fixed-trip loop of ring multiply/add/xor accumulating
 one difference word — no data-dependent branch, no early exit — with a single
 final branch on the accept bit, which is the protocol's own public output (the

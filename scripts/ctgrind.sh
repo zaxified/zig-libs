@@ -212,6 +212,9 @@ declare -A TARGETS=(
     # were right about different functions -- `seal`/`open` ARE pure std and are
     # deliberately not targets. The codecs are the module's own choice.
     [sealedbox]="hexenc hexdec b64enc b64dec"
+    # A1 `pir.md` M2: the module's central claim was never machine-checked, and
+    # its sibling `fss` exposed a real defect the day IT entered the gate.
+    [pir]="query reconstruct"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -255,6 +258,7 @@ declare -A MODES=(
     [tfhe]="ReleaseFast"
     [dkg]="ReleaseFast"
     [sealedbox]="ReleaseFast"
+    [pir]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -447,6 +451,8 @@ declare -A PATTERN=(
     # 3 witness contexts into sphinx's column. Every genuine paragraph here also
     # carries `encodeSecretKeyHex (root.zig:179)` or its siblings, so the module
     # frame is enough; verified by re-measuring with and without.
+    [pir/query]='pir[.]zig|dpf[.]zig|prg[.]zig'
+    [pir/reconstruct]='verify[.]zig|pir[.]zig|dpf[.]zig|prg[.]zig'
     [sealedbox/hexenc]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/hexdec]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/b64enc]='root[.]zig:[1-9]|base64[.]zig'
@@ -564,6 +570,8 @@ declare -A LABEL=(
     [dkg/combine]='dkg final combined share'
     # ⭐ Were 8/7/43/47 with std's tables; now table-free. The parsers keep ONE
     # context each and a pin of 0 would be WRONG there -- see the .tsv rows.
+    [pir/query]='pir Pir.query (SECRET index) + fss DPF Gen'
+    [pir/reconstruct]='pir Verified.reconstruct (client check)'
     [sealedbox/hexenc]='sealedbox encodeSecretKeyHex (CT, table-free)'
     [sealedbox/hexdec]='sealedbox parseSecretKeyHex (CT; 1 = accept/reject)'
     [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 (CT, table-free)'
