@@ -202,3 +202,7 @@ this app has no comparable module-boundary refusal to report. What it does
 NOT have is TLS termination — same posture as the `http` module's own
 example (`http-demo`): terminate TLS in front, this listens plaintext on
 loopback.
+
+## Licence
+
+MIT, like the rest of zig-libs — https://github.com/zaxified/zig-libs/blob/main/LICENSE

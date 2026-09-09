@@ -59,3 +59,7 @@ obscure later.
 
 It talks to OpenSSH in both directions — point a real `ssh` client at the server
 mode, or the client mode at a local `sshd`.
+
+## Licence
+
+MIT, like the rest of zig-libs — https://github.com/zaxified/zig-libs/blob/main/LICENSE

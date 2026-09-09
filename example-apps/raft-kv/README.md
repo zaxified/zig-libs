@@ -133,3 +133,7 @@ service.
 | `kv` | crash-consistent storage for term/vote/log (fsync per write) |
 | `framing` | length-prefixed frames over TCP |
 | `lockfree` | the `SpinLock` guarding all Raft state (see the note above) |
+
+## Licence
+
+MIT, like the rest of zig-libs — https://github.com/zaxified/zig-libs/blob/main/LICENSE

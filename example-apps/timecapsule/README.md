@@ -120,3 +120,7 @@ consumer would use them.
   (16 MiB plaintext cap).
 - No beacon other than quicknet. The chain hash is pinned; a capsule records
   which chain it was sealed on and `open` refuses a mismatched `/info`.
+
+## Licence
+
+MIT, like the rest of zig-libs — https://github.com/zaxified/zig-libs/blob/main/LICENSE

@@ -131,3 +131,7 @@ with its leaf index precisely because two members may publish the same one.
 | `src/client.zig` | One participant: identity, socket, the two threads, the keyboard commands. |
 | `src/appmsg.zig` | RFC 9420 §9 — the application-message layer built on the module's public parts. |
 | `src/wire.zig` | The client↔relay envelope. Not MLS: RFC 9420 specifies no transport. |
+
+## Licence
+
+MIT, like the rest of zig-libs — https://github.com/zaxified/zig-libs/blob/main/LICENSE
