@@ -29,13 +29,47 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   provides them — no custom KDF, no reduced-round variant, no home-rolled AEAD. Nonce derivation is
   deterministic-but-collision-safe by construction (fresh ephemeral key per call ⇒ fresh nonce
   input per call); the module never accepts a caller-supplied nonce that could be reused.
-- **Out of scope:** key management/storage, secret zeroization, side-channel hardening beyond what
-  `std.crypto` provides, and the full `crypto_box` (authenticated two-party) API.
+- **Constant-time scope (as implemented, and MEASURED).** The four SECRET-key text codecs —
+  `encodeSecretKeyBase64`, `parseSecretKeyBase64`, `encodeSecretKeyHex`, `parseSecretKeyHex` — are
+  table-free: no memory access in them has an address derived from key material, and no branch is
+  taken on one, except the accept/reject the parsers return anyway. ⛔ This is **not** inherited
+  from `std`: `std.base64` and `std.fmt.bytesToHex`/`hexToBytes` are table-driven, and until
+  2026-09-09 these functions handed them secrets, which measured as **8 / 7 / 43 / 47** memcheck
+  contexts — 95 of them on a LOAD, i.e. `movzbl <table>(%secret)`, the cache-timing class of
+  T-table AES. The **public**-key codecs still use `std` on purpose: their input discloses nothing,
+  so a table lookup there is not a leak and a hand-written decoder would be a worse trade.
+- ⚠ **The claim above is held by optimisation barriers, not by how the code reads.** `ctEq`/`ctGe`
+  launder their result mask through an empty `asm volatile` (`blackBox`, the montint `b199192`
+  idiom). Measured on this module: with the barrier on the *input* instead, LLVM still recognised
+  `ctEq(c,'+') & 62` as "62 or 0" and emitted a `test`/`je`. **Deleting `blackBox` as dead weight
+  silently reverts this property**, and no value test can see it — `scripts/ctgrind.sh sealedbox`
+  can, and its pins are exact. ⛔⛔ Verified by deploying the defect: with `blackBox` deleted,
+  only `b64dec`'s **count** moves (1 → 5) — the other three rows are caught **only** by the
+  source digest. On three of four rows the source pin is the whole gate.
+- **Out of scope:** key management/storage, secret zeroization, side-channel hardening of the
+  seal/open path beyond what `std.crypto` provides (that path is `std.crypto.nacl.SealedBox`
+  verbatim), and the full `crypto_box` (authenticated two-party) API.
 
 ## Verification
 
 RFC 7748-cross-checked X25519 KATs, end-to-end serialize→deserialize→seal→open, tamper/forgery
 rejection, and malformed-key-input typed errors. Run: `zig build test-sealedbox`.
+
+**Constant-time anchor:** `scripts/ctgrind.sh sealedbox` (valgrind/memcheck, ReleaseFast, the
+secret — or, for the parsers, the secret-derived text — marked undefined). Pinned in
+`scripts/ctgrind-expected.tsv`, exact, with an untainted control row and a no-`-fvalgrind` trap row
+at 0 beside each:
+
+| target | in-file | why |
+|---|---:|---|
+| `hexenc` / `b64enc` | **0** | pure arithmetic; the only indexed load left is `key[i]` over the loop counter |
+| `hexdec` / `b64dec` | **1** | `if (invalid != 0)` — the accept/reject the parser returns to its caller. ⛔ A pin of 0 here would be wrong; what the claim forbids is an early exit revealing WHICH character was bad, and the decode loops contribute 0 |
+
+**Value equivalence** is proved separately and exhaustively: every one of the 64 base64 indices, all
+256 characters through both parsers, all 16 nibbles, plus 512 random keys checked against the
+`std`-backed public-key codecs sitting next to them in the same binary. ⭐ That exhaustive agreement
+is also the reminder that it proves the *values*: `hqc`'s table lookup agreed with its replacement
+on all 65 536 pairs and still leaked, because what differed was the access pattern.
 
 **External anchor for the seal/open composition (`kat_test.zig` / `kat_vectors.zig`, added
 2026-07-28):** the tests above only round-trip through this module's own `seal`/`open` — a shared

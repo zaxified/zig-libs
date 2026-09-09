@@ -411,7 +411,41 @@ dkg	ReleaseFast	combine	1	0	9d983ff8e2433712	6407896882d3491c
 # (`dpf.zig:326`), which is why this is measured rather than reviewed.
 aescbc	ReleaseFast	pkcs7	1	1	e007b2ab5512efa3	c4046968725e140d
 aescbc	ReleaseFast	xmlenc	1	1	e007b2ab5512efa3	c4046968725e140d
-sealedbox	ReleaseFast	hexenc	1	8	6d1620022106c554	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	7	6d1620022106c554	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	43	6d1620022106c554	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	47	6d1620022106c554	1c8749621d19a09b
+# ── sealedbox: the secret-key text codecs ──────────────────────────────────
+# ⭐ These four were 8 / 7 / 43 / 47 until 2026-09-09, all of it std's
+# table-driven base64 and hex reached with a SECRET argument: 95 of the 105
+# contexts were reported on a LOAD, and the disassembly showed
+# `movzbl <table>(%reg)` over a secret byte and over a secret 6-bit group --
+# the cache-timing class of T-table AES. The module now carries its own
+# table-free codecs for SECRET material only; the public-key codecs still use
+# std, deliberately, because their input discloses nothing.
+#
+# The ENCODERS are pinned at exact 0: they are pure arithmetic, and the only
+# indexed load left in the disassembly is `key[i]` over the loop counter.
+#
+# ⛔ The PARSERS are pinned at 1 and a 0 there would be WRONG. The remaining
+# context is `if (invalid != 0)` -- the accept/reject decision the function
+# returns to its caller anyway, same reasoning as aescbc above. What the
+# constant-time claim forbids is an early exit that reveals WHICH character
+# was bad, and the decode loops contribute 0 contexts, so there is none.
+#
+# ⭐⭐ The out_sha values did not move by a single bit across the fix: the
+# branch changed, the result did not.
+#
+# ⚠ Measured, not reviewed -- and the reason is on this very module. The first
+# draft of `ctEq` put the optimisation barrier on the INPUT, which hides the
+# value but not the structure; LLVM still turned `ctEq(c,'+') & 62` into a
+# `test`/`je` at `root.zig:292`. Only moving the barrier onto the resulting
+# MASK removed it. Source review would not have found that.
+#
+# ⛔⛔ AND THE COUNTS ALONE WOULD NOT HOLD THIS. Verified by deploying the
+# defect: with `blackBox` deleted from `ctEq`/`ctGe`, only `b64dec` moves
+# (1 -> 5). `hexenc`, `hexdec` and `b64enc` keep their exact counts and are
+# caught ONLY by the src_sha column. So on three of these four rows the source
+# pin is the whole gate, which is why the guard-stripping fix that gave bolt3
+# its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
+# would have let the barrier be deleted in silence.
+sealedbox	ReleaseFast	hexenc	1	0	0dd782f63327e8dd	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	0dd782f63327e8dd	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	0dd782f63327e8dd	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	0dd782f63327e8dd	1c8749621d19a09b

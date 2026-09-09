@@ -562,10 +562,12 @@ declare -A LABEL=(
     [tfhe/bootstrap]='tfhe blindRotate/cmux/keySwitch'
     [dkg/coeffs]='dkg round-1 secret coefficients'
     [dkg/combine]='dkg final combined share'
-    [sealedbox/hexenc]='sealedbox encodeSecretKeyHex -- DEFECT 16B table, secret nibble'
-    [sealedbox/hexdec]='sealedbox parseSecretKeyHex -- DEFECT charToDigit branches'
-    [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 -- DEFECT 64B alphabet, secret 6-bit'
-    [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 -- DEFECT 256B char_to_index, secret byte'
+    # ⭐ Were 8/7/43/47 with std's tables; now table-free. The parsers keep ONE
+    # context each and a pin of 0 would be WRONG there -- see the .tsv rows.
+    [sealedbox/hexenc]='sealedbox encodeSecretKeyHex (CT, table-free)'
+    [sealedbox/hexdec]='sealedbox parseSecretKeyHex (CT; 1 = accept/reject)'
+    [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 (CT, table-free)'
+    [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT; 1 = accept/reject)'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────

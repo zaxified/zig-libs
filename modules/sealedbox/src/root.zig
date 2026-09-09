@@ -163,26 +163,26 @@ pub fn parsePublicKeyHex(text: []const u8) KeyEncodingError![public_length]u8 {
 /// the output grants full decryption capability; store/transmit accordingly,
 /// and `wipe` the returned buffer when done with it.
 pub fn encodeSecretKeyBase64(sk: [secret_length]u8) [base64_sk_len]u8 {
-    return encodeKeyBase64(sk);
+    return encodeSecretKeyBase64Ct(sk);
 }
 
 /// Parse a base64-encoded secret key (**SECRET material**). Same strict rules
 /// as `parsePublicKeyBase64`. Returns the raw X25519 scalar; rebuild a usable
 /// keypair with `keyPairFromSecretKey`.
 pub fn parseSecretKeyBase64(text: []const u8) KeyEncodingError![secret_length]u8 {
-    return parseKeyBase64(text);
+    return parseSecretKeyBase64Ct(text);
 }
 
 /// Encode a secret key as lowercase hex (64 chars). **SECRET material** —
 /// `wipe` the returned buffer when done with it.
 pub fn encodeSecretKeyHex(sk: [secret_length]u8) [hex_sk_len]u8 {
-    return std.fmt.bytesToHex(sk, .lower);
+    return encodeSecretKeyHexCt(sk);
 }
 
 /// Parse a hex-encoded secret key (**SECRET material**). Same strict rules as
 /// `parsePublicKeyHex`.
 pub fn parseSecretKeyHex(text: []const u8) KeyEncodingError![secret_length]u8 {
-    return parseKeyHex(text);
+    return parseSecretKeyHexCt(text);
 }
 
 /// Recompute the public key from a stored secret key (X25519 base-point
@@ -196,6 +196,230 @@ pub fn publicFromSecret(sk: [secret_length]u8) error{IdentityElement}![public_le
 /// recomputed — std's X25519 `KeyPair` treats the secret scalar as the seed).
 pub fn keyPairFromSecretKey(sk: [secret_length]u8) error{IdentityElement}!KeyPair {
     return .{ .public_key = try publicFromSecret(sk), .secret_key = sk };
+}
+
+// ── constant-time codecs for SECRET key text ───────────────────────────────
+//
+// ⛔⛔ Why these exist at all, in one measurement. `std.base64` and
+// `std.fmt.bytesToHex`/`hexToBytes` are table-driven, and a table indexed by a
+// secret byte is a cache-timing oracle -- the class of T-table AES. Measured
+// 2026-09-09 with `scripts/ctgrind.sh sealedbox` and confirmed by disassembly
+// before anything here was written:
+//
+//     movzbl %sil,%eax                 ; the secret character
+//     movzbl 0x100fde8(%rax),%eax      ; std's 256-byte char_to_index[secret]
+//     shr $0x34,%r8 ; and $0x3f,%r8d   ; a secret 6-bit group
+//     movzbl 0x100ff2e(%r8),%esi       ; std's 64-byte alphabet[secret]
+//
+// 43 / 47 / 8 / 7 in-file contexts across the four secret-key codecs, 95 of
+// them reported on a LOAD rather than a conditional jump. The values were
+// always correct; what leaked was the ADDRESS PATTERN, which no value test can
+// see.
+//
+// ⚠ The PUBLIC-key codecs deliberately still use `std`. Their input is public,
+// so a table lookup discloses nothing, and re-implementing them would trade a
+// well-tested decoder for a hand-written one to buy nothing. That asymmetry is
+// the point: this is not "std is bad", it is "this input is a secret".
+//
+// ⚠ These are also NOT a general base64/hex library. They accept exactly the
+// one length each key encoding has, and they are slower than std's. Do not
+// reach for them for anything but key material.
+
+/// Optimization barrier (montint `b199192` leak class): launder a value
+/// through an empty inline-asm so LLVM loses all range and equality knowledge
+/// about it. No-op at runtime. Same idiom as `p256/src/group.zig`,
+/// `k256/src/field.zig`, `fss/src/dpf.zig` and `montint`.
+///
+/// ⛔ LOAD-BEARING, not defensive. Every mask below is derived from a
+/// comparison against a secret, and LLVM is entitled to notice that a masked
+/// select over a small known range can be rewritten as a jump table or a
+/// branch -- which is exactly how `bfv`'s correctly-written branch-free `csub`
+/// became a real `cmp`/`jb` at one call site out of ninety-nine. The barrier is
+/// what makes the source claim survive into the binary.
+inline fn blackBox(x: u16) u16 {
+    return asm volatile (""
+        : [ret] "=r" (-> u16),
+        : [x] "0" (x),
+    );
+}
+
+/// `0xFFFF` when `a == b`, else 0. Constant time in both operands.
+///
+/// ⚠ `nz` must be ONE bit before it is negated into a mask. An earlier draft
+/// truncated a shifted `u32` and kept sixteen, so the "not equal" mask came out
+/// as garbage instead of zero and every OR-term bled into the result. The KAT
+/// caught it (`d` decoded as `f` — the index off by two), which is the argument
+/// for keeping a fixed published vector next to hand-rolled constant-time code.
+inline fn ctEq(a: u16, b: u16) u16 {
+    const d = a ^ b;
+    const nz: u16 = (d | (0 -% d)) >> 15; // 1 when d != 0, else 0
+    // ⛔⛔ The barrier goes on the RESULT, not on the input, and that is the
+    // whole lesson. Laundering `d` hides the VALUE but not the STRUCTURE:
+    // LLVM still saw that `ctEq(c,'+') & 62` is "62 when c=='+', else 0" and
+    // emitted a `test`/`je` for it -- measured at `root.zig:292`, one live
+    // branch in an otherwise clean run. Laundering the mask denies it the
+    // rewrite. Same placement as `fss`'s `xorMasked`.
+    return blackBox((nz ^ 1) *% 0xFFFF);
+}
+
+/// `0xFFFF` when `a >= b`, else 0. Operands must be < 2^15 (all are: they are
+/// bytes and 6-bit groups), so the subtraction cannot wrap into the sign bit
+/// for the wrong reason.
+inline fn ctGe(a: u16, b: u16) u16 {
+    const d = a -% b;
+    return blackBox((~(d >> 15) & 1) *% 0xFFFF);
+}
+
+/// `0xFFFF` when `lo <= x <= hi`, else 0.
+inline fn ctInRange(x: u16, lo: u16, hi: u16) u16 {
+    return ctGe(x, lo) & ctGe(hi, x);
+}
+
+/// Base64 index (0..63) -> standard-alphabet character, without a table.
+/// Shape follows libsodium's `b64_byte_to_char`.
+inline fn ctB64Char(x: u16) u8 {
+    const c =
+        (ctInRange(x, 0, 25) & (x +% 'A')) |
+        (ctInRange(x, 26, 51) & (x +% ('a' - 26))) |
+        (ctInRange(x, 52, 61) & (x -% (52 - '0'))) | // 52-'0' == 4
+        (ctEq(x, 62) & '+') |
+        (ctEq(x, 63) & '/');
+    return @truncate(c);
+}
+
+/// Standard-alphabet character -> base64 index, without a table.
+/// Returns `0x100` for any character outside the alphabet, so the caller
+/// accumulates one invalid flag instead of returning early.
+inline fn ctB64Index(c: u16) u16 {
+    const x =
+        (ctInRange(c, 'A', 'Z') & (c -% 'A')) |
+        (ctInRange(c, 'a', 'z') & (c -% ('a' - 26))) |
+        (ctInRange(c, '0', '9') & (c +% (52 -% '0'))) |
+        (ctEq(c, '+') & 62) |
+        (ctEq(c, '/') & 63);
+    // ⛔ `x == 0` is ambiguous: it is both the value of 'A' and the value of
+    // "nothing matched". Disambiguate on the CHARACTER, not on the result.
+    return x | (ctEq(x, 0) & ~ctEq(c, 'A') & 0x100);
+}
+
+/// Nibble -> lowercase hex digit, without a table.
+inline fn ctHexChar(n: u16) u8 {
+    // n < 10 -> '0'+n ; n >= 10 -> 'a'+n-10, and ('a'-10) - '0' == 39.
+    return @truncate(n +% '0' +% (ctGe(n, 10) & 39));
+}
+
+/// Lowercase or uppercase hex digit -> nibble, without a table. Returns
+/// `0x100` for any non-hex character.
+inline fn ctHexNibble(c: u16) u16 {
+    const v =
+        (ctInRange(c, '0', '9') & (c -% '0')) |
+        (ctInRange(c, 'a', 'f') & (c -% ('a' - 10))) |
+        (ctInRange(c, 'A', 'F') & (c -% ('A' - 10)));
+    // Same ambiguity as base64: 0 is the value of '0' and of "no match".
+    return v | (ctEq(v, 0) & ~ctEq(c, '0') & 0x100);
+}
+
+/// Constant-time base64 encode of SECRET key material. 32 bytes -> 44 chars
+/// (standard alphabet, one `=` of padding, since 32 = 3*10 + 2).
+fn encodeSecretKeyBase64Ct(key: [secret_length]u8) [base64_sk_len]u8 {
+    var out: [base64_sk_len]u8 = undefined;
+    var i: usize = 0;
+    var o: usize = 0;
+    // 10 full 3-byte groups -> 40 chars.
+    while (i + 3 <= secret_length) : (i += 3) {
+        const b0: u16 = key[i];
+        const b1: u16 = key[i + 1];
+        const b2: u16 = key[i + 2];
+        out[o] = ctB64Char(b0 >> 2);
+        out[o + 1] = ctB64Char(((b0 & 0x03) << 4) | (b1 >> 4));
+        out[o + 2] = ctB64Char(((b1 & 0x0f) << 2) | (b2 >> 6));
+        out[o + 3] = ctB64Char(b2 & 0x3f);
+        o += 4;
+    }
+    // The trailing 2 bytes -> 3 chars + '='. The loop bound and this tail are
+    // fixed by `secret_length`, not by data, so they carry no secret.
+    const b0: u16 = key[secret_length - 2];
+    const b1: u16 = key[secret_length - 1];
+    out[o] = ctB64Char(b0 >> 2);
+    out[o + 1] = ctB64Char(((b0 & 0x03) << 4) | (b1 >> 4));
+    out[o + 2] = ctB64Char((b1 & 0x0f) << 2);
+    out[o + 3] = '=';
+    return out;
+}
+
+/// Constant-time base64 decode of SECRET key material. Strict: exactly 44
+/// chars, standard alphabet, one trailing `=`.
+///
+/// ⛔ Every character is decoded before anything is rejected: an early return
+/// on the first bad character would leak WHERE the text went wrong, which is
+/// the padding-oracle shape one layer up.
+fn parseSecretKeyBase64Ct(text: []const u8) KeyEncodingError![secret_length]u8 {
+    if (text.len != base64_sk_len) return error.InvalidLength;
+
+    var invalid: u16 = 0;
+    var vals: [base64_sk_len]u16 = undefined;
+    for (text[0 .. base64_sk_len - 1], vals[0 .. base64_sk_len - 1]) |c, *v| {
+        const idx = ctB64Index(c);
+        invalid |= idx & 0x100;
+        v.* = idx & 0x3f;
+    }
+    // Padding is structural, not secret: the last character must be '='.
+    invalid |= ctEq(text[base64_sk_len - 1], '=') & 0x100 ^ 0x100;
+
+    var out: [secret_length]u8 = undefined;
+    var i: usize = 0;
+    var o: usize = 0;
+    while (o + 3 <= secret_length) : (o += 3) {
+        const acc = (@as(u32, vals[i]) << 18) | (@as(u32, vals[i + 1]) << 12) |
+            (@as(u32, vals[i + 2]) << 6) | @as(u32, vals[i + 3]);
+        out[o] = @truncate(acc >> 16);
+        out[o + 1] = @truncate(acc >> 8);
+        out[o + 2] = @truncate(acc);
+        i += 4;
+    }
+    const acc = (@as(u32, vals[i]) << 18) | (@as(u32, vals[i + 1]) << 12) | (@as(u32, vals[i + 2]) << 6);
+    out[secret_length - 2] = @truncate(acc >> 16);
+    out[secret_length - 1] = @truncate(acc >> 8);
+    // The final group's low 6 bits must be zero, or two distinct texts would
+    // decode to the same key (RFC 4648 §3.5 canonical form).
+    invalid |= ctEq(@as(u16, @truncate(acc)) & 0xff, 0) & 0x100 ^ 0x100;
+
+    if (invalid != 0) {
+        std.crypto.secureZero(u8, &out);
+        return error.InvalidKeyEncoding;
+    }
+    return out;
+}
+
+/// Constant-time lowercase-hex encode of SECRET key material.
+fn encodeSecretKeyHexCt(key: [secret_length]u8) [hex_sk_len]u8 {
+    var out: [hex_sk_len]u8 = undefined;
+    for (key, 0..) |b, i| {
+        out[2 * i] = ctHexChar(@as(u16, b) >> 4);
+        out[2 * i + 1] = ctHexChar(@as(u16, b) & 0x0f);
+    }
+    return out;
+}
+
+/// Constant-time hex decode of SECRET key material. Either case, exactly 64
+/// digits, and — like the base64 parser — every digit is decoded before any
+/// rejection.
+fn parseSecretKeyHexCt(text: []const u8) KeyEncodingError![secret_length]u8 {
+    if (text.len != hex_sk_len) return error.InvalidLength;
+
+    var invalid: u16 = 0;
+    var out: [secret_length]u8 = undefined;
+    for (&out, 0..) |*b, i| {
+        const hi = ctHexNibble(text[2 * i]);
+        const lo = ctHexNibble(text[2 * i + 1]);
+        invalid |= (hi | lo) & 0x100;
+        b.* = @truncate(((hi & 0x0f) << 4) | (lo & 0x0f));
+    }
+    if (invalid != 0) {
+        std.crypto.secureZero(u8, &out);
+        return error.InvalidKeyEncoding;
+    }
+    return out;
 }
 
 fn encodeKeyBase64(key: [32]u8) [base64_pk_len]u8 {
@@ -448,6 +672,115 @@ test "malformed key text: typed errors, no panic" {
     try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64("*" ++ good_b64[1..]));
     try std.testing.expectError(error.InvalidLength, parseSecretKeyHex("abc"));
     try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyHex("g" ++ good_hex[1..]));
+}
+
+test "constant-time codecs: EXHAUSTIVE agreement with std over every input byte" {
+    // ⭐ Exhaustive rather than sampled, and it is cheap: 64 + 256 + 16 + 256
+    // cases. The `hqc` precedent is the reason -- there, a table lookup and its
+    // constant-time replacement agreed on all 65 536 pairs and STILL differed
+    // in the only way that mattered (the memory access pattern). Value equality
+    // is what this test can prove; it proves it completely.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for (0..64) |i| {
+        try std.testing.expectEqual(alphabet[i], ctB64Char(@intCast(i)));
+    }
+    for (0..256) |c| {
+        const got = ctB64Index(@intCast(c));
+        if (std.mem.indexOfScalar(u8, alphabet, @intCast(c))) |idx| {
+            try std.testing.expectEqual(@as(u16, @intCast(idx)), got);
+        } else {
+            // ⛔ The invalid marker must be OUTSIDE the 0..63 range a valid
+            // index occupies, or "not in the alphabet" would decode as data.
+            try std.testing.expectEqual(@as(u16, 0x100), got & 0x100);
+        }
+    }
+
+    const hex_digits = "0123456789abcdef";
+    for (0..16) |n| {
+        try std.testing.expectEqual(hex_digits[n], ctHexChar(@intCast(n)));
+    }
+    for (0..256) |c| {
+        const got = ctHexNibble(@intCast(c));
+        const ch: u8 = @intCast(c);
+        const expected: ?u16 = switch (ch) {
+            '0'...'9' => ch - '0',
+            'a'...'f' => ch - 'a' + 10,
+            'A'...'F' => ch - 'A' + 10,
+            else => null,
+        };
+        if (expected) |e| {
+            try std.testing.expectEqual(e, got);
+        } else {
+            try std.testing.expectEqual(@as(u16, 0x100), got & 0x100);
+        }
+    }
+}
+
+test "constant-time codecs: agree with the std-backed public path on 512 keys" {
+    // ⭐ The public-key codecs still go through std, so they are a live oracle
+    // for the secret-key ones sitting right next to them -- the same bytes,
+    // encoded two independent ways, in the same test binary.
+    var seed: u64 = 0x5ea1edb0;
+    for (0..512) |_| {
+        var key: [secret_length]u8 = undefined;
+        for (&key) |*b| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            b.* = @truncate(seed >> 33);
+        }
+
+        const ct_b64 = encodeSecretKeyBase64(key);
+        const std_b64 = encodePublicKeyBase64(key);
+        try std.testing.expectEqualStrings(&std_b64, &ct_b64);
+
+        const ct_hex = encodeSecretKeyHex(key);
+        const std_hex = encodePublicKeyHex(key);
+        try std.testing.expectEqualStrings(&std_hex, &ct_hex);
+
+        try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyBase64(&ct_b64)));
+        try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyHex(&ct_hex)));
+        // Uppercase hex is accepted by both parsers.
+        var upper = ct_hex;
+        for (&upper) |*c| c.* = std.ascii.toUpper(c.*);
+        try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyHex(&upper)));
+    }
+}
+
+test "constant-time parsers reject exactly what the std-backed ones reject" {
+    var key: [secret_length]u8 = undefined;
+    for (&key, 0..) |*b, i| b.* = @intCast(i);
+    const b64 = encodeSecretKeyBase64(key);
+    const hex = encodeSecretKeyHex(key);
+
+    // A bad character in EVERY position, checked against the public parser.
+    for (0..b64.len) |i| {
+        var bad = b64;
+        bad[i] = if (bad[i] == '*') '#' else '*';
+        try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&bad));
+        try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&bad));
+    }
+    for (0..hex.len) |i| {
+        var bad = hex;
+        bad[i] = 'z';
+        try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyHex(&bad));
+        try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyHex(&bad));
+    }
+
+    // Length is structural, not secret, so it stays a distinct error.
+    try std.testing.expectError(error.InvalidLength, parseSecretKeyBase64(b64[0 .. b64.len - 1]));
+    try std.testing.expectError(error.InvalidLength, parseSecretKeyHex(hex[0 .. hex.len - 1]));
+
+    // Padding must be present and last.
+    var nopad = b64;
+    nopad[b64.len - 1] = 'A';
+    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&nopad));
+
+    // ⛔ Non-canonical final group: the last 6-bit value carries 2 bits that
+    // MUST be zero. Without this check two distinct texts decode to one key,
+    // which is a malleable key encoding (RFC 4648 §3.5).
+    var noncanon = b64;
+    noncanon[b64.len - 2] = ctB64Char(ctB64Index(noncanon[b64.len - 2]) | 1);
+    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&noncanon));
+    try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&noncanon));
 }
 
 test "wipe: the encoded secret really is gone from the buffer" {

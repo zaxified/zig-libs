@@ -41,17 +41,29 @@
 //! Public-key codecs are deliberately absent: identical code, public input,
 //! nothing to claim.
 //!
-//! ## What the honest expectation is
+//! ## What these rows measured, and what they measure now
 //!
-//! ⚠ **Not necessarily zero, and a reader should not want a zero here.** Both
-//! parsers begin with `if (text.len != …) return error.InvalidLength`, and a
-//! length is public — the caller chose the buffer. What would be a genuine
-//! finding is a branch or a memory access whose ADDRESS depends on the key
-//! bytes themselves: base64's alphabet table and hex's digit decode are both
-//! indexed lookups, the `hqc`/T-table AES class that memcheck reports as
-//! `Use of uninitialised value` on a LOAD rather than `Conditional jump`.
-//! Whoever reads these counts should look at the KIND of context, not only at
-//! the number.
+//! ⛔⛔ **The first run found the leak these rows were built to look for.**
+//! 8 / 7 / 43 / 47 in-file contexts, 95 of them reported on a LOAD rather than
+//! a conditional jump — and the disassembly showed
+//! `movzbl 0x…(%rax),%eax` over a secret character (std's 256-byte
+//! `char_to_index`) and `shr/and/movzbl 0x…(%r8)` over a secret 6-bit group
+//! (std's 64-byte alphabet). Secret-indexed table lookups, the cache-timing
+//! class of T-table AES.
+//!
+//! ✅ Fixed the same day: the module carries its own table-free codecs for
+//! secret material (`root.zig`, `ctB64Char`/`ctB64Index`/`ctHexChar`/
+//! `ctHexNibble`). **Encoders are now exact 0; parsers are exact 1.**
+//!
+//! ⚠ **That 1 is the right answer and a 0 would be wrong.** It is
+//! `if (invalid != 0)` — the accept/reject the parser returns to its caller by
+//! contract, the same shape `aescbc`'s rows carry. What the constant-time claim
+//! forbids is an early exit that reveals WHICH character was bad; the decode
+//! loops contribute 0, so there is none. Read the KIND of context, not only the
+//! number: there is no LOAD-kind context in-file any more.
+//!
+//! ⭐⭐ The `out_sha` column did not move by a bit across the fix — the branch
+//! changed, the result did not.
 //!
 //! ## The traps
 //!
