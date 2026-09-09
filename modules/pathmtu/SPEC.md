@@ -46,8 +46,8 @@ through (starts at the protocol floor, verified by our own probe before the
 search proper begins — see "Limits and refusals"); `hi` is the smallest
 size believed not to. Each probe outcome narrows the interval
 (`applyOutcome`): `.ok` raises `lo` to the confirmed-good size;
-`.local_reject`/`.no_reply` lower `hi` to the probed size itself (both are
-our own direct observations). `.frag_needed` is the one case that can move
+`.local_reject`/`.send_failed`/`.no_reply` lower `hi` to the probed size
+itself (all three are our own direct observations). `.frag_needed` is the one case that can move
 *both* bounds at once: when it carries a valid RFC 1191/4443 next-hop-MTU
 hint `h` strictly inside `(lo, size)`, the search trusts it the way a real
 kernel PMTUD implementation does — `lo` jumps to `h` and `hi` to `h + 1`,
@@ -85,7 +85,14 @@ silent" from "the whole path is silent" once any hop has spoken up.
 `.local_reject` (`EMSGSIZE` from the *local* kernel, against the outgoing
 interface's own configured MTU) narrows `hi` like a failure but touches
 neither flag — it is a real, definitive signal, but a purely local one that
-says nothing about the remote path.
+says nothing about the remote path. `.send_failed` (A1 F4: every retry's
+`sendto` failed for a reason OTHER than `EMSGSIZE` — permission, no route,
+...) is treated the same way and for the same reason: zero packets ever
+left this host for that size, which is not evidence about the path either.
+Before this fix `LiveProber.attempt` reported that as plain `.no_reply`
+after silently exhausting every retry on the send side, so a destination
+that refuses every send outright read exactly like a path that swallows
+genuinely sent probes — `blackhole = true` with nothing ever transmitted.
 
 **RFC 1191/4443 MTU hint.** Read directly from the raw ICMP bytes rather
 than through the sibling `icmp.echo` module's `Reply.icmp_error` (which

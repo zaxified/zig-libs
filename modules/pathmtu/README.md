@@ -67,14 +67,24 @@ const found = try pathmtu.probe(dest, .{ .timeout_ms = 1000, .retries = 2 });
 // found.mtu, found.source (.probed), found.blackhole, found.iface_mtu
 ```
 
-`Result{ mtu, source, blackhole, iface_mtu }`:
+`Result{ mtu, source, blackhole, iface_mtu, cache_is_exception }`:
 
 - `mtu` — the discovered/cached path MTU.
-- `source` — `.cached` (from `query`) or `.probed` (from `probe`).
+- `source` — `.cached` (from `query`) or `.probed` (from `probe`). `.cached`
+  alone does not mean a real PMTU exception was found — see
+  `cache_is_exception`.
 - `blackhole` — only ever set by `probe` (see above).
 - `iface_mtu` — set when `Options.iface` names an interface; read via
   `SIOCGIFMTU` (also exposed directly as `pathmtu.ifaceMtu("eth0")`). This
   module does no automatic egress-interface resolution — see SPEC.md.
+- `cache_is_exception` — only ever set by `query`, and only when
+  `Options.iface` resolved an interface MTU to compare against: `false` when
+  `mtu` reads back as exactly that interface's own MTU (consistent with "no
+  PMTU exception exists yet, this is just interface passthrough" — the
+  `.interface`-labeled failure mode "Why two functions" describes above),
+  `true` when it genuinely differs, `null` when there is nothing to compare
+  against. A `false` reading is not proof of absence, the same asymmetric
+  signal `blackhole` already gives elsewhere in this module (A1 F6).
 
 `Options{ timeout_ms, retries, ceiling_mtu, iface }` is shared by both
 functions (matching `sntp.QueryOptions`/`stun.QueryOptions`'s

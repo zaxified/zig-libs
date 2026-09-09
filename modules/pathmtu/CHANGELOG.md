@@ -5,6 +5,73 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign: the four remaining MEDIUM findings from the
+  first audit (P1 applies — this module has zero consumers anywhere in the
+  tree, confirmed against `build.zig`'s `example_apps` table too, not only
+  `module-graph`).
+
+  - **F5.** `query`'s oversized nudge datagram was a single hardcoded 1472-byte
+    payload for both families — the IPv4 number (`1500 - 20 - 8`). On IPv6 that
+    overruns an ordinary (1500-MTU) link's own MTU by the 20-byte header-size
+    gap (`1472 + 40 + 8 = 1520`), so the nudge never reached the wire at all on
+    any ordinary IPv6 link and `query` learned nothing. Sized per family now
+    (`nudgePayloadLen`: 1472 v4, 1452 v6). Measured RED→GREEN: a pinned test
+    asserting the invariant `payload + this family's header + UDP header <=
+    default_ceiling_mtu` — 1/31 red against the old single constant (`expected
+    1452, found 1472`), 31/31 green against the fix.
+
+  - **F4.** `LiveProber.attempt` treated any local `sendto` failure other than
+    `EMSGSIZE` (permission, no route, ...) as a silent retry, `continue`-ing
+    past it for every one of `self.retries + 1` attempts with no packet ever
+    sent, then falling through to the same `.no_reply` a genuinely-sent,
+    genuinely-unanswered probe produces — so a destination that refuses every
+    send outright read as `blackhole = true` with zero packets transmitted.
+    New `ProbeOutcome.send_failed` (additive union member, P1), tracked via an
+    `any_sent` flag; treated like `.local_reject` in `applyOutcome` — purely
+    local, must not feed the black-hole signal either way. Measured RED→GREEN
+    against a REAL closed-fd `EBADF` (deterministic, no network/root needed):
+    old code `.no_reply`, fixed code `.send_failed`.
+
+  - **F6.** `query` asserted `Source.cached` unconditionally, even though the
+    module's own doc explains a dropped `.interface` variant exists precisely
+    because "a `Result` whose `mtu` is just the raw interface MTU handed back
+    as if it were an answer about the path" is "the failure mode this module
+    exists to name and avoid" — and that is exactly what an unprivileged
+    `query` against a destination with no PMTU exception returns. New
+    `Result.cache_is_exception: ?bool` (additive struct field, P3): set when
+    `Options.iface` resolves an interface MTU to compare `mtu` against.
+    Comparison clamps the interface MTU to 65535 first — `IP_MTU`/`IPV6_MTU`
+    can never read back above the IP total-length field's own 16-bit width,
+    so `lo`'s raw 65536 default reads as a false "exception" without the
+    clamp (measured: `query("127.0.0.1", .{.iface="lo"})` → `mtu = 65535`
+    against `iface_mtu = 65536`, no exception in play). Measured RED→GREEN: a
+    live loopback test, red without the field (`expected false, found null`),
+    green with it.
+
+  - **F9.** The one test naming `.local_reject` mixed in a `.frag_needed` at
+    every interior probe, and `saw_frag_needed` alone already forces
+    `blackhole = false` — so the test could not observe `.local_reject`'s own
+    exclusion from the black-hole signal at all. Added a second fixture using
+    only `.ok`/`.local_reject`, never `.frag_needed`. Measured: mutating
+    `.local_reject`'s handling in `applyOutcome` to set `saw_timeout_boundary`
+    (i.e. treat it like `.no_reply`) reddened exactly the new test (1/34) and
+    left the original one green — confirming the original test's blindness
+    and the new one's teeth.
+
+  `scripts/modtest pathmtu`: 35/35 (Debug and ReleaseFast).
+
+  Also inspected `~/CML/20260901-zig-libs-audit/evidence/pathmtu-probes/`
+  (21 files) per `CONVENTIONS.md` §9: all reference `pub` audit-only helpers
+  (`auditQuery`, `audit_echo`, `auditRecvLoop`, `auditRandomStartSeq`) that no
+  longer exist on this source, or are point-in-time full-file snapshots of an
+  earlier `root.zig` (`mut*_src_root.zig`, `demo_src_root.zig`) already
+  superseded by the tree. None compile against current `root.zig` without
+  repair, and the network-probing ones (`work_v6probe.zig`, `work_zeromtu.zig`,
+  `v6nudge.sh`) need root/netns, outside this campaign's scope. Not relocated:
+  moving non-compiling scratch into `tools/` would not make it reachable by
+  any gate, which is the actual point of §9. Findings above are backed by
+  fresh tests in `src/root.zig` instead.
+
 - **2026-09-04** — **First audit.** Three HIGH-class defects, all fixed with
   tests that go red when the fix is reverted.
 

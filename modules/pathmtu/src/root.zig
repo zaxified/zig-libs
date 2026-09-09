@@ -145,6 +145,24 @@ pub const Result = struct {
     blackhole: bool = false,
     /// Set when `Options.iface` was supplied and `SIOCGIFMTU` resolved it.
     iface_mtu: ?u32 = null,
+    /// Only ever set by `query`, and only when `Options.iface` resolved an
+    /// interface MTU to compare `mtu` against (A1 F6). `Source.cached` is
+    /// asserted unconditionally by `query` even though the value it reads
+    /// (`IP_MTU`/`IPV6_MTU`) is, per this module's OWN documented threat
+    /// model, indistinguishable at the type level from "no PMTU exception
+    /// exists for this destination yet, so the kernel just handed back the
+    /// outgoing interface's own MTU" — precisely the `.interface`-labeled
+    /// failure mode the doc above says the type was designed to rule out.
+    /// `false` when `mtu` exactly equals the resolved interface MTU (that
+    /// reading is consistent with "no exception, interface passthrough");
+    /// `true` when it differs (only a real PMTU exception can make
+    /// `IP_MTU`/`IPV6_MTU` read anything else). `null` when `Options.iface`
+    /// was not supplied — `query` has nothing to compare against and
+    /// genuinely cannot tell, same as before this field existed. A `false`
+    /// reading is not proof of absence (a real exception could coincide
+    /// with the interface MTU), only the same asymmetric signal
+    /// `Result.blackhole` already gives elsewhere in this module.
+    cache_is_exception: ?bool = null,
 };
 
 /// Shared by `query` and `probe` (this repo avoids a third `*Options` shape
@@ -191,6 +209,7 @@ pub const max_probe_mtu: u16 = 9000;
 
 const ipv4_header_len: u16 = 20;
 const ipv6_header_len: u16 = 40;
+const udp_header_len: u16 = 8;
 
 /// RFC 792: ICMPv4 Destination Unreachable code for "fragmentation needed
 /// and DF set".
@@ -208,6 +227,24 @@ pub const QueryError = error{
     ConnectFailed,
     Unexpected,
 };
+
+/// UDP payload length for `query`'s oversized nudge datagram, per family
+/// (A1 F5). `default_ceiling_mtu` (1500) minus this family's IP header minus
+/// the UDP header: the largest payload that still fits an ordinary Ethernet
+/// link's own MTU, so the datagram actually reaches the wire and a real
+/// bottleneck downstream is what answers with ICMP -- not the local
+/// interface. A payload sized for the WRONG family's (20-byte) header
+/// overruns an IPv6 link's own 1500-byte MTU by the 20-byte gap between the
+/// two headers, so the kernel rejects the send locally on every ordinary
+/// link before the nudge is ever transmitted, and `query` never learns
+/// anything about the real path.
+fn nudgePayloadLen(family: icmp.Socket.Family) u16 {
+    const ip_header_len: u16 = switch (family) {
+        .v4 => ipv4_header_len,
+        .v6 => ipv6_header_len,
+    };
+    return default_ceiling_mtu - ip_header_len - udp_header_len;
+}
 
 /// Read the kernel's cached path MTU to `dest`: `IP_MTU_DISCOVER`/
 /// `IPV6_MTU_DISCOVER` = `PMTUDISC_DO` on a connected UDP socket, one
@@ -252,9 +289,12 @@ pub fn query(dest: netaddr.Ip, opts: Options) QueryError!Result {
 
     // Oversized nudge -- EMSGSIZE is the expected outcome once the kernel
     // already knows the path can't take this size; ignored either way, the
-    // getsockopt below is the actual read.
+    // getsockopt below is the actual read. Sized per family (F5): the same
+    // byte count for v4 and v6 overruns an ordinary IPv6 link's own MTU by
+    // the 20-byte header-size gap and never reaches the wire at all.
     var big: [1472]u8 = @splat(0);
-    _ = linux.sendto(fd, &big, big.len, 0, null, 0);
+    const nudge_len = nudgePayloadLen(family);
+    _ = linux.sendto(fd, &big, nudge_len, 0, null, 0);
 
     var mtu: u32 = 0;
     var optlen: linux.socklen_t = @sizeOf(u32);
@@ -265,7 +305,20 @@ pub fn query(dest: netaddr.Ip, opts: Options) QueryError!Result {
     if (linux.errno(grc) != .SUCCESS) return error.Unexpected;
 
     var result: Result = .{ .mtu = mtu, .source = .cached };
-    if (opts.iface) |name| result.iface_mtu = ifaceMtu(name) catch null;
+    if (opts.iface) |name| {
+        if (ifaceMtu(name) catch null) |im| {
+            result.iface_mtu = im;
+            // A1 F6. `IP_MTU`/`IPV6_MTU` can never read back above 65535 --
+            // the IP total-length field is 16 bits -- even with no PMTU
+            // exception and an interface MTU that itself exceeds that (`lo`
+            // defaults to 65536). Measured: `query("127.0.0.1", .{.iface =
+            // "lo"})` reads `mtu = 65535` against `iface_mtu = 65536` with
+            // no exception in play at all. Comparing against the capped
+            // value avoids reading that artifact as a false exception.
+            const compare_mtu = @min(im, std.math.maxInt(u16));
+            result.cache_is_exception = (mtu != compare_mtu);
+        }
+    }
     return result;
 }
 
@@ -288,7 +341,16 @@ pub const ProbeOutcome = union(enum) {
     /// Definitive, but purely local — it says nothing about the remote
     /// path, so it must not feed the black-hole signal either way.
     local_reject,
-    /// No reply of any kind arrived before the attempt budget was spent.
+    /// Every retry's `sendto` failed for a reason OTHER than `EMSGSIZE`
+    /// (`PermissionDenied`, `NetworkUnreachable`, ...): a probe that never
+    /// left this host at all (A1 F4). Distinct from `.no_reply`, which
+    /// means a probe WAS sent and nothing came back — that is real
+    /// evidence about the path; zero packets sent is not. Purely local,
+    /// like `.local_reject`, so it must not feed the black-hole signal
+    /// either way.
+    send_failed,
+    /// No reply of any kind arrived before the attempt budget was spent,
+    /// after at least one probe of this size was actually sent.
     no_reply,
 };
 
@@ -361,7 +423,7 @@ fn applyOutcome(size: u16, outcome: ProbeOutcome, lo: *u16, hi: *u16, saw_frag_n
             }
             hi.* = size;
         },
-        .local_reject => hi.* = size,
+        .local_reject, .send_failed => hi.* = size,
         .no_reply => {
             saw_timeout_boundary.* = true;
             hi.* = size;
@@ -547,6 +609,7 @@ const LiveProber = struct {
             .v6 => .v6,
         };
 
+        var any_sent = false;
         var tries: u8 = 0;
         while (tries <= self.retries) : (tries += 1) {
             const seq = self.seq;
@@ -567,6 +630,7 @@ const LiveProber = struct {
                 error.MessageTooLong => return .local_reject,
                 else => continue, // WouldBlock / transient failure: this attempt produced no signal, retry
             };
+            any_sent = true;
 
             const deadline: u64 = @as(u64, @intCast(icmp.monoNow())) + @as(u64, self.timeout_ms) * std.time.ns_per_ms;
             var recv_buf: [max_probe_mtu + 128]u8 = undefined;
@@ -599,7 +663,12 @@ const LiveProber = struct {
                 pollOnce(self.sock.fd, linux.POLL.IN, deadline - now);
             }
         }
-        return .no_reply;
+        // A1 F4: every retry's `sendto` failing for a reason other than
+        // `EMSGSIZE` used to fall through to this same `.no_reply`, so a
+        // destination that outright refuses every send (permission,
+        // unreachable route, ...) read exactly like a path that swallows
+        // real probes -- `blackhole = true` with zero packets ever sent.
+        return if (any_sent) .no_reply else .send_failed;
     }
 };
 
@@ -813,6 +882,25 @@ test "probeFits: the buffer-capacity invariant `attempt` panics on, at both ends
     try testing.expect(!probeFits(19, 20, buf_len));
     try testing.expect(probeFits(20, 20, buf_len));
     try testing.expect(!probeFits(0, 20, buf_len));
+}
+
+test "nudgePayloadLen: family-sized, so the nudge fits an ordinary link's own MTU (A1 F5)" {
+    // Before the fix this was one hardcoded 1472 for both families -- the v4
+    // number. Pinned here so a regression back to a single constant reddens.
+    try testing.expectEqual(@as(u16, 1472), nudgePayloadLen(.v4));
+    try testing.expectEqual(@as(u16, 1452), nudgePayloadLen(.v6));
+    // The invariant the finding was about: payload + this family's IP
+    // header + the UDP header must not exceed `default_ceiling_mtu`, or the
+    // nudge never reaches the wire on an ordinary (1500-MTU) link and
+    // `query` learns nothing. The old v4-sized constant broke this for v6
+    // by exactly the 20-byte header-size gap: 1472 + 40 + 8 = 1520 > 1500.
+    for ([_]icmp.Socket.Family{ .v4, .v6 }) |family| {
+        const ip_header_len: u16 = switch (family) {
+            .v4 => ipv4_header_len,
+            .v6 => ipv6_header_len,
+        };
+        try testing.expect(nudgePayloadLen(family) + ip_header_len + udp_header_len <= default_ceiling_mtu);
+    }
 }
 
 test "the probe buffer ships zeroed, not as stale stack" {
@@ -1143,6 +1231,29 @@ test "searchWith: local_reject narrows the bound without affecting blackhole eit
     try testing.expect(!r.blackhole);
 }
 
+test "searchWith: local_reject ALONE (no frag_needed anywhere) still converges without blackhole (A1 F9)" {
+    // The fixture above (`local_reject narrows the bound...`) always mixes
+    // in a `.frag_needed` at the interior probes, and `saw_frag_needed`
+    // alone already forces `blackhole = false` -- so that test's assertion
+    // would hold identically even if `.local_reject` were mistakenly
+    // treated like `.no_reply` (i.e. it cannot observe its own subject: a
+    // mutation to `.local_reject`'s handling in `applyOutcome` does not
+    // redden it). This fixture returns only `.ok`/`.local_reject`, never
+    // `.frag_needed`, so `!r.blackhole` below can only hold because
+    // `.local_reject` itself does not set `saw_timeout_boundary`.
+    const LocalRejectOnly = struct {
+        fn probeFn(_: *anyopaque, wire_size: u16) ProbeOutcome {
+            if (wire_size <= 1300) return .ok;
+            return .local_reject;
+        }
+    };
+    var dummy: u8 = 0;
+    const p: Prober = .{ .ctx = &dummy, .probeFn = LocalRejectOnly.probeFn };
+    const r = try searchWith(p, min_mtu_v4, default_ceiling_mtu, null);
+    try testing.expectEqual(@as(u32, 1300), r.mtu);
+    try testing.expect(!r.blackhole);
+}
+
 test "searchWith: iface_mtu passes through unchanged" {
     var fp: FakeProber = .{ .real_mtu = 1300, .explicit_icmp = true };
     const r = try searchWith(fp.prober(), min_mtu_v4, default_ceiling_mtu, 9000);
@@ -1351,6 +1462,61 @@ test "live: query() against loopback, unprivileged (no CAP_NET_RAW needed)" {
     const r = try query(dest, .{});
     try testing.expectEqual(Source.cached, r.source);
     try testing.expect(r.mtu > 0);
+}
+
+test "live: LiveProber.attempt returns send_failed, not no_reply, when every send fails (A1 F4)" {
+    if (!udpSocketsWork()) return error.SkipZigTest;
+
+    var sock = icmp.Socket.open(.v4, .auto, .{ .dont_fragment = true }) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    // Close the RAW fd directly (not `sock.close()`, which sets the whole
+    // struct `undefined`): every subsequent `sendTo` on this still-readable
+    // but now-invalid fd fails with EBADF -> `error.Unexpected`, every
+    // single retry, deterministically -- no network or root required. This
+    // is exactly the shape F4 is about: a destination that refuses every
+    // send for a reason other than `EMSGSIZE`.
+    _ = linux.close(sock.fd);
+
+    var lp: LiveProber = .{
+        .sock = &sock,
+        .family = .v4,
+        .ip_header_len = ipv4_header_len,
+        .strip_ip_header = false,
+        .dest = .{ .v4 = .{ .port = 0, .addr = @bitCast(netaddr.parseIp("127.0.0.1").?.v4) } },
+        .retries = 2,
+        .timeout_ms = 20,
+        .seq = 1,
+    };
+    // Before the fix this returned `.no_reply` (indistinguishable from a
+    // path that swallowed a genuinely sent probe) after silently
+    // `continue`-ing past every failed send for `self.retries + 1`
+    // iterations without ever reaching the receive loop.
+    try testing.expectEqual(ProbeOutcome.send_failed, lp.attempt(100));
+}
+
+test "live: query() with Options.iface sets cache_is_exception (A1 F6)" {
+    if (!udpSocketsWork()) return error.SkipZigTest;
+
+    // Loopback carries no PMTU exception -- nothing on `lo` ever fragments --
+    // so `IP_MTU` reads back exactly the interface's own MTU, and F6's field
+    // says so instead of asserting `.cached` with no way to tell.
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    const r = try query(dest, .{ .iface = "lo" });
+    try testing.expectEqual(Source.cached, r.source);
+    try testing.expect(r.iface_mtu != null);
+    // `mtu` reads 65535 (the IP total-length field's cap), `iface_mtu`
+    // reads `lo`'s raw 65536 -- the exact gap `cache_is_exception`'s
+    // 65535-clamped comparison exists to not misread as an exception.
+    try testing.expectEqual(@as(?bool, false), r.cache_is_exception);
+}
+
+test "query: cache_is_exception stays null without Options.iface (nothing to compare against)" {
+    if (!udpSocketsWork()) return error.SkipZigTest;
+    const dest = netaddr.parseIp("127.0.0.1").?;
+    const r = try query(dest, .{});
+    try testing.expectEqual(@as(?bool, null), r.cache_is_exception);
 }
 
 test "live: probe() against loopback (skipped without CAP_NET_RAW / ping_group_range)" {
