@@ -24,6 +24,17 @@ What it does:
   3. Normalises whitespace/quote-style on both sides and checks the claimed
      text is a literal substring of the real document.
 
+NOT A GATE, and that is decided (2026-09-09, A1 finding R13). This is an AUDIT
+instrument: a citation does not rot between two commits the way code does, it
+rots over years, and the moment to re-derive one is when someone is auditing the
+module. Wiring it into a lane would also put a 143-document network fetch back
+into a gate on the same day this repository took one out of `dns` for turning a
+slow resolver into a FAIL across 217 modules. The proposal that came with the
+finding -- freeze today's verdicts into a `citations-expected.tsv` and fail only
+on a NEW mismatch, the shape `portable-known-failures.tsv` uses -- was not
+rejected on merit and is still there if this is revisited. See
+`scripts/README.md`, "Standards citations".
+
 Verdicts: VERIFIED, MISMATCH, UNFETCHABLE (no primary source reachable) and
 UNCHECKED (the document was fetched, but the quote had no fragment of >= 4
 words left after splitting on ellipses, so nothing was compared). UNCHECKED was
@@ -115,14 +126,57 @@ def blocks(path):
         lines = f.read().split("\n")
     md = path.endswith(".md")
     cur, start = [], None
+    # ⚠ FENCED CODE IS NOT PROSE, and until 2026-09-09 this function read it as
+    # if it were. The markdown branch treated a ``` line as a block SEPARATOR
+    # rather than a toggle, so the body of every fenced example became an
+    # ordinary paragraph -- and `extract_file` then joins a block into one line
+    # and pairs `"` characters sequentially. Inside code that pairs the CLOSING
+    # quote of one string literal with the OPENING quote of the next, and hands
+    # back everything between them as a "quotation from the standard":
+    #
+    #   modules/whois/README.md:31 -> ") var qbuf: [whois.max_query_len + 2]u8
+    #                                  = undefined; const wire = try ..."
+    #   modules/rdap/README.md:37  -> "); _ = rdap.accept_header; // {"
+    #
+    # Those are not citations that failed to verify; they are not citations.
+    # They inflated MISMATCH -- the bucket a reader is supposed to ACT on -- with
+    # noise, which is the way a checker stops being read at all.
+    #
+    # One toggle serves both file types because a `.zig` doc comment fences its
+    # examples the same way (`//! ```zig`): the comment marker is stripped
+    # first, so the fence is visible in `body` either way.
+    in_fence = False
+    fence = None
     for i, ln in enumerate(lines, 1):
         if md:
-            iscmt = ln.strip() != "" and not ln.startswith("```")
+            iscmt = ln.strip() != ""
             body = ln.lstrip("> ").rstrip()
         else:
             m = CMT.match(ln)
             iscmt = m is not None
             body = CMT.sub("", ln).rstrip() if m else ""
+            # A doc comment that opened a fence and never closed it cannot
+            # swallow the rest of the file: the comment block ending ends it.
+            if not iscmt:
+                in_fence, fence = False, None
+
+        marker = body.strip()[:3]
+        if iscmt and marker in ("```", "~~~"):
+            if in_fence and marker == fence:
+                in_fence, fence = False, None
+            elif not in_fence:
+                in_fence, fence = True, marker
+            # The fence line itself is prose in neither direction, and it must
+            # still break the block -- otherwise the paragraph before an example
+            # and the one after it join into one.
+            if cur:
+                yield start, cur
+            cur, start = [], None
+            continue
+
+        if in_fence:
+            continue
+
         if iscmt:
             if start is None:
                 start = i
@@ -156,6 +210,37 @@ def extract_file(path, rel):
         for qm in QUOTE.finditer(text):
             q = qm.group(1)
             if len(q.split()) < 4:
+                continue
+            # ⚠ A CLAIM THAT BEGINS OR ENDS MID-SYNTAX IS NOT A QUOTATION.
+            #
+            # `QUOTE` pairs `"` characters sequentially across the joined block,
+            # so wherever prose uses quotes for LITERAL TOKENS rather than for
+            # quotation -- `origin-form ("/path") is what every client sends;
+            # asterisk-form ("*") is what ...` -- the closing quote of one token
+            # pairs with the opening quote of the next and the prose between
+            # them is handed back as a citation. Excluding fenced code (see
+            # `blocks`) does not reach these: they are in ordinary paragraphs.
+            #
+            # The discriminator is cheap and needs no grammar: no standard's
+            # sentence starts with `)` or `,` or ends with `(`. Measured on this
+            # tree with the fence fix already in, `--json` before and after:
+            #
+            #   drops 104 claims -- 97 MISMATCH, 4 UNFETCHABLE, 2 UNCHECKED,
+            #   and exactly 1 VERIFIED
+            #
+            # ⭐ That one VERIFIED is `voprf/root.zig:148  || I2OSP(mode, 1) ||`,
+            # which is the same artifact: a fragment of a formula lying between
+            # two quoted literals, which "verified" only because the whole
+            # formula really is in RFC 9497. A coincidental pass is what
+            # VERIFIED cannot distinguish from a real one, so losing it is the
+            # point rather than the price -- the four lost by the fence fix are
+            # the same shape and are listed in that commit.
+            #
+            # Net across both fixes: MISMATCH 499 -> 374. MISMATCH is the only
+            # bucket a reader is asked to ACT on, and a quarter of it was the
+            # extractor talking about itself.
+            qs = q.strip()
+            if qs[0] in ")],;:=&|}" or qs[-1] in "([{=&|":
                 continue
             lo = max(0, qm.start() - 160)
             before = text[lo:qm.start()]
