@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `cdp.ParseOptions.tolerant_trailing_tlv`
+  now only swallows a malformed trailing TLV when every byte from it to the end of the
+  buffer is zero (real 802.3 padding); previously it tolerated a malformed TLV anywhere in
+  the walk, so an early injected TLV silently dropped every TLV after it while parsing
+  still reported success. `lldp.Lldpdu.skipped_optionals` now saturates at 65535 instead of
+  wrapping past it on ≥131 KB of malformed `raw` input. `mac.Mac` gained
+  `formatBuf(buf: *[text_len]u8) []const u8` alongside the existing `format(buf: []u8)`:
+  the fixed-size pointer makes a too-small buffer a compile error in every build mode,
+  where `format`'s `std.debug.assert` guard compiles out in ReleaseFast; `format` is
+  unchanged and still there for callers that only have a slice.
 - **2026-09-09** — Licensing correction, no code change. `NOTICE` said the vendored
   tcpdump captures "add no condition beyond MIT's own"; tcpdump is 3-clause BSD and its
   third clause — no use of the authors' names to endorse derived products — has no MIT

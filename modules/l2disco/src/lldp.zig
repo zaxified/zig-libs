@@ -412,7 +412,9 @@ pub const Lldpdu = struct {
     /// Count of optional TLVs skipped under `ParseOptions.tolerant_optionals`
     /// because they were internally malformed. Always 0 in strict mode
     /// (`tolerant_optionals = false`) -- a malformed optional TLV aborts the
-    /// parse there instead of being counted.
+    /// parse there instead of being counted. Saturates at 65535 rather than
+    /// wrapping past it, so it stays a lower bound even against `raw` input
+    /// longer than any real Ethernet frame.
     skipped_optionals: u16 = 0,
 
     /// The whole TLV stream, for re-iteration (org-specific, extra
@@ -453,7 +455,16 @@ pub const Lldpdu = struct {
                 .system_capabilities => {
                     if (tlv.value.len != 4) {
                         if (opts.tolerant_optionals) {
-                            du.skipped_optionals += 1;
+                            // Saturating, not wrapping: a malformed optional
+                            // TLV needs only its 2-byte LLDP header, so
+                            // 65536 of them (>=131072 bytes) would wrap a
+                            // plain `+= 1` -- a panic in Debug/ReleaseSafe,
+                            // a silent wraparound in ReleaseFast, against a
+                            // README that promises no unconditional panic.
+                            // Not reachable from a real Ethernet frame, but
+                            // `raw` is caller-supplied and not bounded by
+                            // this parser to frame-sized input.
+                            du.skipped_optionals +|= 1;
                             continue;
                         }
                         return ParseError.BadTlvLength;
@@ -466,7 +477,9 @@ pub const Lldpdu = struct {
                 .management_address => if (du.management_address == null) {
                     du.management_address = ManagementAddress.parse(tlv.value) catch |err| {
                         if (opts.tolerant_optionals) {
-                            du.skipped_optionals += 1;
+                            // See the saturating-add note at the
+                            // `.system_capabilities` arm above.
+                            du.skipped_optionals +|= 1;
                             continue;
                         }
                         return err;
@@ -921,6 +934,37 @@ test "LLDP tolerant: an inconsistent Management Address is skipped the same way"
     try testing.expect(du.chassis_id.mac().?.eql(kat_mac));
     try testing.expectEqual(@as(?ManagementAddress, null), du.management_address);
     try testing.expectEqual(@as(u16, 1), du.skipped_optionals);
+}
+
+test "LLDP tolerant: skipped_optionals saturates at 65535 instead of wrapping" {
+    // W5: `skipped_optionals` is a u16 bumped by `+= 1` for every malformed
+    // optional TLV skipped. Each such TLV needs only its 2-byte LLDP header
+    // (a zero-length System Capabilities TLV), so 65536 of them -- >=131072
+    // bytes of `raw` -- wrap a plain `+= 1` past 65535: a reachable panic in
+    // Debug/ReleaseSafe, a silent wraparound to near-zero in ReleaseFast.
+    // Not reachable from a real 1500-byte Ethernet frame, but `raw` is not
+    // bounded to frame size by this parser. `+|= 1` saturates instead: this
+    // test pushes 70000 skips (comfortably past the u16 boundary) and
+    // requires the exact ceiling, not merely "did not panic" -- a silent
+    // wrap to a small number would still make this assertion fail.
+    const gpa = testing.allocator;
+    const malformed_count: usize = 70_000;
+    const buf = try gpa.alloc(u8, 64 + malformed_count * 2);
+    defer gpa.free(buf);
+
+    var b = Builder.init(buf);
+    try b.addChassisIdMac(kat_mac);
+    try b.addPortIdIfName("Gi0/1");
+    try b.addTtl(120);
+    var i: usize = 0;
+    while (i < malformed_count) : (i += 1) {
+        // value.len (0) != 4: hits the tolerant-skip path every time.
+        try b.addTlv(.system_capabilities, &.{});
+    }
+    const bytes = try b.finish();
+
+    const du = try Lldpdu.parse(bytes, .{ .tolerant_optionals = true });
+    try testing.expectEqual(@as(u16, std.math.maxInt(u16)), du.skipped_optionals);
 }
 
 test "LLDP garbage sweep: no panics on random input" {

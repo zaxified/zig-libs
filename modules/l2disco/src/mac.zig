@@ -39,8 +39,24 @@ pub const Mac = struct {
 
     /// Formats as lowercase `aa:bb:cc:dd:ee:ff` into `buf` (needs
     /// `text_len` bytes); returns the written slice.
+    ///
+    /// ⚠ `std.debug.assert` below is a Debug/ReleaseSafe-only guard --
+    /// ReleaseFast (the profile this suite also builds) compiles it out
+    /// entirely, so a too-small `buf` becomes 17 unconditioned
+    /// out-of-bounds writes with no check left at all. Prefer `formatBuf`,
+    /// whose `*[text_len]u8` parameter makes a too-small buffer a compile
+    /// error in every build mode instead of a runtime one. This
+    /// slice-taking overload is kept for callers that only have a slice.
     pub fn format(m: Mac, buf: []u8) []const u8 {
         std.debug.assert(buf.len >= text_len);
+        return m.formatBuf(buf[0..text_len]);
+    }
+
+    /// Formats as lowercase `aa:bb:cc:dd:ee:ff` into `buf`; returns the
+    /// written slice. `buf` is sized exactly `text_len` at the type level,
+    /// so a too-small buffer is a compile error in every build mode --
+    /// unlike `format`'s runtime-only (and ReleaseFast-compiled-out) assert.
+    pub fn formatBuf(m: Mac, buf: *[text_len]u8) []const u8 {
         const digits = "0123456789abcdef";
         for (m.octets, 0..) |b, i| {
             const off = i * 3;
@@ -95,6 +111,21 @@ test "Mac parse + format round-trip" {
     // Dash separator accepted.
     const d = Mac.parse("00-1b-21-3c-9d-f8").?;
     try std.testing.expect(m.eql(d));
+}
+
+test "Mac.formatBuf: same output as format, buffer size checked at compile time" {
+    // W6/W7: `format`'s only guard against a too-small `buf` is
+    // `std.debug.assert`, which ReleaseFast compiles out -- a too-small
+    // buffer there is 17 unconditioned out-of-bounds writes with nothing
+    // left to catch it. `formatBuf` takes `*[text_len]u8` instead of `[]u8`,
+    // so a too-small buffer is a *compile* error, in every build mode,
+    // rather than a runtime one that only some modes check. This test
+    // covers the happy path; the safety property itself is that passing a
+    // buffer shorter than `text_len` to `formatBuf` does not compile at
+    // all -- there is no runtime input that can exercise "does not compile".
+    const m = Mac.parse("00:1B:21:3c:9d:F8").?;
+    var buf: [Mac.text_len]u8 = undefined;
+    try std.testing.expectEqualStrings("00:1b:21:3c:9d:f8", m.formatBuf(&buf));
 }
 
 test "Mac parse rejects malformed input" {

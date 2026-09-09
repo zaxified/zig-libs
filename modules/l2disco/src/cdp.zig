@@ -200,17 +200,22 @@ pub const ParseOptions = struct {
     /// declared length not fitting the header, or not fitting the buffer --
     /// aborts the whole parse, same as any other malformed input.
     ///
-    /// `true`: when the TLV walk hits exactly that shape, stop and return
-    /// the frame with whatever TLVs parsed before it, instead of failing.
-    /// This is the real-world case: real CDP frames are carried inside an
-    /// Ethernet frame padded with zero bytes to the 802.3 60-byte minimum,
-    /// and this codec never sees the 802.3 length field that would let it
-    /// tell "padding" from "truncated" on its own -- the caller has to
-    /// bound the payload itself to avoid it, or opt into this. Only the
-    /// TLV *walk* is affected: the fixed 4-byte header (version/holdtime/
-    /// checksum) still always has to be present and, if `verify_checksum`
-    /// is on, still always has to verify. `Frame.trailing_tlv_truncated`
-    /// reports whether this happened.
+    /// `true`: when the TLV walk hits exactly that shape AND every byte
+    /// from the failing TLV to the end of the buffer is zero, stop and
+    /// return the frame with whatever TLVs parsed before it, instead of
+    /// failing. This is the real-world case: real CDP frames are carried
+    /// inside an Ethernet frame padded with zero bytes to the 802.3
+    /// 60-byte minimum, and this codec never sees the 802.3 length field
+    /// that would let it tell "padding" from "truncated" on its own --
+    /// the caller has to bound the payload itself to avoid it, or opt
+    /// into this. The all-zero check is what makes this *trailing*: a
+    /// malformed TLV earlier in the frame, with more (possibly valid)
+    /// bytes still following it, still aborts the parse -- tolerating it
+    /// too would silently drop every TLV after an injected one and still
+    /// report success. Only the TLV *walk* is affected: the fixed 4-byte
+    /// header (version/holdtime/checksum) still always has to be present
+    /// and, if `verify_checksum` is on, still always has to verify.
+    /// `Frame.trailing_tlv_truncated` reports whether this happened.
     tolerant_trailing_tlv: bool = false,
 };
 
@@ -254,8 +259,20 @@ pub const Frame = struct {
         var it = TlvIterator.init(f.tlvs_raw);
         while (true) {
             const tlv = it.next() catch |err| {
+                // `it.pos` was not advanced on error, so it still points at
+                // the start of the TLV that failed to parse. That is a real
+                // *trailing* TLV -- the doc-promised case -- only when
+                // everything from there to the end of the buffer is the
+                // Ethernet zero-padding real devices append to reach the
+                // 802.3 60-byte minimum. A short injected TLV earlier in the
+                // frame, followed by more (possibly valid) TLV bytes, fails
+                // the same way but is not padding: swallowing it here would
+                // silently drop every TLV after the injection and still
+                // report success. Only all-zero remainders are tolerated;
+                // anything else aborts the parse like the non-tolerant path.
                 if (opts.tolerant_trailing_tlv and
-                    (err == ParseError.TruncatedTlv or err == ParseError.BadTlvLength))
+                    (err == ParseError.TruncatedTlv or err == ParseError.BadTlvLength) and
+                    std.mem.allEqual(u8, f.tlvs_raw[it.pos..], 0))
                 {
                     f.trailing_tlv_truncated = true;
                     break;
@@ -573,6 +590,42 @@ test "CDP tolerant: 802.3 zero-padding to the 60-byte minimum truncates the trai
     const f = try Frame.parse(&padded, .{ .verify_checksum = false, .tolerant_trailing_tlv = true });
     try testing.expectEqualStrings("edge-sw1", f.device_id.?);
     try testing.expect(f.trailing_tlv_truncated);
+}
+
+test "CDP tolerant: a malformed TLV followed by more non-zero bytes is NOT padding, aborts even with the option on" {
+    // W3: `tolerant_trailing_tlv` must only swallow a malformed TLV that is
+    // genuinely trailing -- real 802.3 zero-padding, covered above. Before
+    // the all-zero check, ANY BadTlvLength/TruncatedTlv anywhere in the walk
+    // was treated as trailing, so a 4-byte injection early in a frame would
+    // silently drop every TLV after it and still report success. This frame
+    // has a valid Device ID TLV, then a TLV whose declared length (2) is
+    // below the 4-byte header minimum (BadTlvLength) -- but instead of zero
+    // padding after it, there are more non-zero bytes standing in for a
+    // legitimate TLV an attacker's injection made unreachable. That must
+    // abort exactly like the non-tolerant default, not get swallowed.
+    var buf: [64]u8 = undefined;
+    var b = try Builder.init(&buf, .{});
+    try b.addDeviceId("sw1");
+    const device_id_tlv = b.finish(); // header(4) + TLV(4 + 3 = 7) = 11 bytes
+
+    var frame_bytes: [11 + 4 + 8]u8 = undefined;
+    @memcpy(frame_bytes[0..device_id_tlv.len], device_id_tlv);
+    // Malformed TLV: type = platform (0x0006), declared total length = 2
+    // (< the 4-byte header it would need to be well-formed).
+    std.mem.writeInt(u16, frame_bytes[11..13], @intFromEnum(TlvType.platform), .big);
+    std.mem.writeInt(u16, frame_bytes[13..15], 2, .big);
+    // Non-zero trailer standing in for an unreachable, would-be-legitimate
+    // TLV -- the opposite of Ethernet zero-padding.
+    @memcpy(frame_bytes[15..23], "REALDATA");
+
+    try testing.expectError(
+        ParseError.BadTlvLength,
+        Frame.parse(&frame_bytes, .{ .verify_checksum = false }),
+    );
+    try testing.expectError(
+        ParseError.BadTlvLength,
+        Frame.parse(&frame_bytes, .{ .verify_checksum = false, .tolerant_trailing_tlv = true }),
+    );
 }
 
 test "CDP garbage sweep: no panics on random input" {
