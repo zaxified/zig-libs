@@ -53,6 +53,15 @@
 //! dropped).
 
 const std = @import("std");
+const builtin = @import("builtin");
+const linux = std.os.linux;
+
+/// Test-only instrumentation: how many times `Store.syncDir` actually ran.
+/// Guarded by `builtin.is_test` so it costs nothing (dead branch, eliminated
+/// at comptime) in a real build — see the F1/F5 dispositions in the audit
+/// record for what this proves (durable `delete`, and `putManyBytes`
+/// amortizing the directory fsync across a batch instead of one per record).
+var test_sync_dir_calls: std.atomic.Value(u32) = .init(0);
 
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
@@ -87,7 +96,8 @@ pub const Error = error{
 
 /// Process-local monotonically increasing counter for collision-free ingest
 /// temp names within a process (mirrors the sibling `blobstore` module).
-/// Cross-process uniqueness is out of scope — see the README backlog.
+/// `nextUniq` mixes in the pid too, so this is collision-free *across*
+/// processes as well — see `nextUniq`.
 var ingest_counter: std.atomic.Value(u64) = .init(0);
 
 // ── clock injection (deterministic under test) ──────────────────────────────
@@ -212,9 +222,17 @@ pub const Store = struct {
     /// `putBytes` and the TTL/lock sidecar writers so there is exactly one
     /// temp-then-rename implementation.
     fn writeFileAtomicIn(self: Store, dir: []const u8, name: []const u8, bytes: []const u8) !void {
+        try self.writeFileAtomicInEx(dir, name, bytes, .{ .sync_dir = true });
+    }
+
+    /// Same as `writeFileAtomicIn`, but the directory fsync is optional —
+    /// `putManyBytes` writes a whole batch with `.sync_dir = false` and syncs
+    /// the directory itself exactly once, after the loop. Every other caller
+    /// keeps `sync_dir = true` (one file, one fsync, same as before F5).
+    fn writeFileAtomicInEx(self: Store, dir: []const u8, name: []const u8, bytes: []const u8, opts: struct { sync_dir: bool }) !void {
         try ensureDir(self.io, dir);
 
-        var uniq_buf: [24]u8 = undefined;
+        var uniq_buf: [48]u8 = undefined; // "{pid}-{u64}" fits well inside 48
         const uniq = nextUniq(&uniq_buf);
         var tbuf: [896]u8 = undefined;
         const tmp = try std.fmt.bufPrint(&tbuf, "{s}/.{s}-{s}.part", .{ dir, name, uniq });
@@ -253,7 +271,7 @@ pub const Store = struct {
             cwd.deleteFile(self.io, tmp) catch {};
             return e;
         };
-        try self.syncDir(dir);
+        if (opts.sync_dir) try self.syncDir(dir);
     }
 
     /// `fsync` a directory, so a `rename` into it is durable.
@@ -263,6 +281,7 @@ pub const Store = struct {
     /// all (`EBADF`). Same reasoning, and same workaround, as `kv`'s
     /// `FsStorage.vSyncDir` -- taken from there rather than re-derived.
     fn syncDir(self: Store, dir: []const u8) !void {
+        if (builtin.is_test) _ = test_sync_dir_calls.fetchAdd(1, .monotonic);
         var d = try std.Io.Dir.cwd().openDir(self.io, dir, .{ .iterate = true });
         defer d.close(self.io);
         const as_file = std.Io.File{ .handle = d.handle, .flags = .{ .nonblocking = false } };
@@ -282,6 +301,38 @@ pub const Store = struct {
         var dbuf: [640]u8 = undefined;
         const dir = try self.kindDir(&dbuf, kind);
         try self.writeFileAtomicIn(dir, key, bytes);
+    }
+
+    /// A single `key`/`bytes` pair for `putManyBytes`.
+    pub const Entry = struct { key: []const u8, bytes: []const u8 };
+
+    /// Write every entry to `<base>/<kind>/<entry.key>`, same atomicity and
+    /// per-file durability as `putBytes` (temp + `fsync` + rename), but with
+    /// **one** directory `fsync` for the whole batch instead of one per
+    /// record. Not atomic *across* entries — a crash partway through leaves
+    /// whichever prefix of the batch had already been renamed durably
+    /// committed, same as calling `putBytes` that many times in a row would.
+    ///
+    /// Exists because the per-record directory `fsync` is real, measured
+    /// cost that a caller writing many records at once does not need to pay
+    /// N times: audited at 98-112x plain-write throughput for durable
+    /// `putBytes` on this module's own benchmark, with the directory
+    /// `fsync` responsible for roughly half of that (the other half is the
+    /// per-file `fsync`, still paid once per record here — batching cannot
+    /// remove that half without giving up per-record durability). See the
+    /// F5 disposition in the audit record for the measured fsync-count
+    /// reduction this buys.
+    pub fn putManyBytes(self: Store, kind: []const u8, entries: []const Entry) !void {
+        if (!segmentSafe(kind)) return error.InvalidName;
+        for (entries) |e| {
+            if (!segmentSafe(e.key)) return error.InvalidName;
+        }
+        var dbuf: [640]u8 = undefined;
+        const dir = try self.kindDir(&dbuf, kind);
+        for (entries) |e| {
+            try self.writeFileAtomicInEx(dir, e.key, e.bytes, .{ .sync_dir = false });
+        }
+        if (entries.len > 0) try self.syncDir(dir);
     }
 
     /// Read `<base>/<kind>/<key>` (allocated in `arena`), or null if absent
@@ -350,6 +401,12 @@ pub const Store = struct {
     /// key never inherits a stale deadline). Returns false if the record did
     /// not exist (a dangling sidecar alone, with no record, still counts as
     /// "did not exist").
+    ///
+    /// Durable, same as `putBytes`: the directory is `fsync`ed after the
+    /// `unlinkat`(s), so a `delete` that returned survives a power loss too.
+    /// Before 2026-09-10 this synced nothing — `putBytes`' 2026-09-03 fsync
+    /// fix covered the write path only, and a deleted record could come back
+    /// after a crash (measured: 20 `delete`s -> 40 `unlinkat`, 0 `fsync`).
     pub fn delete(self: Store, kind: []const u8, key: []const u8) !bool {
         var pbuf: [768]u8 = undefined;
         const path = try self.recordPath(&pbuf, kind, key);
@@ -361,6 +418,9 @@ pub const Store = struct {
             break :blk true;
         };
         self.clearExpiry(kind, key);
+        var dbuf: [640]u8 = undefined;
+        const dir = try self.kindDir(&dbuf, kind);
+        try self.syncDir(dir);
         return existed;
     }
 
@@ -382,6 +442,17 @@ pub const Store = struct {
     /// new blob a moment before or after the new deadline, which only
     /// affects expiry precision at the nanosecond scale, never torn bytes.
     ///
+    /// **Crash between the two writes is fail-closed, not fail-open**: the
+    /// `.expiry` sidecar is written *first*. A crash right after it leaves an
+    /// orphaned sidecar with no record — `getBytes` reports absent either way
+    /// (`FileNotFound`), so the caller sees exactly what it would see for a
+    /// deadline that had already passed. The old order (record first, then
+    /// sidecar) made the *opposite* failure reachable: a crash after the
+    /// record write left a record with no deadline at all, i.e. a supposedly
+    /// TTL'd record that in fact never expired — the wrong direction for a
+    /// module documented as crash-safe. See the F4 disposition in the audit
+    /// record for the measured before/after.
+    ///
     /// Returns `error.TtlDisabled` when `self.ttl` is `false`: that store's
     /// own `getBytes` never checks the `.expiry` sidecar this call would
     /// create, so the record would be written with a deadline this store
@@ -393,22 +464,32 @@ pub const Store = struct {
         if (!segmentSafe(kind) or !segmentSafe(key)) return error.InvalidName;
         var kl = try self.lockKey(kind, key);
         defer kl.unlock();
-        try self.putBytes(kind, key, bytes);
         try self.writeExpiryAt(kind, key, self.clock.now() +| ttl_ns);
+        try self.putBytes(kind, key, bytes);
     }
 
     /// Scan `<base>/<kind>` and delete every record (blob + `.expiry`
     /// sidecar) whose deadline has passed as of `self.clock.now()`. Records
     /// with no `.expiry` sidecar are never touched. Returns the count
-    /// swept. Each candidate key is processed under its own `lockKey`, so a
-    /// sweep can never race a concurrent `putWithTTL` renewal into deleting
-    /// a just-extended live record — the deadline is re-checked *after* the
-    /// lock is held, not just from the `list` snapshot.
+    /// swept.
+    ///
+    /// A key is `lockKey`'d only once it looks like a candidate (an
+    /// unlocked `isExpired` pre-check says so) — a `sweep` over keys with no
+    /// TTL, or a live one, creates no `.lock` file for them at all. Before
+    /// 2026-09-10 every listed key got a lock file up front regardless, so a
+    /// `sweep` that reaped nothing still left one `.lock` per key behind
+    /// forever (nothing ever cleans a held-then-released lock file — see
+    /// `lockKey`'s doc comment). The deadline is still re-checked *after*
+    /// the lock is held for a real candidate, so a sweep can never race a
+    /// concurrent `putWithTTL` renewal into deleting a just-extended live
+    /// record — the pre-check only decides who gets a lock at all, it is
+    /// never trusted on its own to delete.
     pub fn sweep(self: Store, arena: std.mem.Allocator, kind: []const u8) !usize {
         if (!segmentSafe(kind)) return error.InvalidName;
         const keys = try self.list(arena, kind);
         var swept: usize = 0;
         for (keys) |key| {
+            if (!try self.isExpired(kind, key)) continue;
             var kl = try self.lockKey(kind, key);
             defer kl.unlock();
             if (try self.isExpired(kind, key)) {
@@ -450,8 +531,20 @@ pub const Store = struct {
         return try std.fmt.parseInt(i64, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10);
     }
 
+    /// A corrupt `.expiry` sidecar (truncated, non-numeric, overflowing —
+    /// anything `readExpiry`'s `parseInt` rejects) is treated as "no TTL",
+    /// the same as a missing sidecar, rather than propagating the parse
+    /// error up through `getBytes`. Before 2026-09-10 it did the latter: one
+    /// bad byte in the *sidecar* made an otherwise-healthy record
+    /// unreadable through `getBytes`/`get`/`listTyped`, an error neither
+    /// `Error` nor `getBytes`' doc comment ever named — and it was
+    /// inconsistent with `listTyped`'s own stated policy of tolerating
+    /// corrupt input rather than refusing a request over it.
     fn isExpired(self: Store, kind: []const u8, key: []const u8) !bool {
-        const deadline = try self.readExpiry(kind, key) orelse return false;
+        const deadline = (self.readExpiry(kind, key) catch |e| switch (e) {
+            error.InvalidCharacter, error.Overflow => return false,
+            else => return e,
+        }) orelse return false;
         return self.clock.now() >= deadline;
     }
 
@@ -589,8 +682,24 @@ fn ensureDir(io: std.Io, path: []const u8) !void {
 }
 
 fn nextUniq(buf: []u8) []const u8 {
+    return nextUniqFor(linux.getpid(), buf);
+}
+
+/// `nextUniq`'s actual formula, with the pid injectable — so a test can
+/// prove two different *pids* never collide without needing to fork a real
+/// second process (pid is otherwise unobservable/unfakeable from within one
+/// process, since `nextUniq` itself always asks the kernel for its own).
+///
+/// PID + process-local counter: makes the temp name unique across processes
+/// too, not only within one — see the F2 disposition in the audit record.
+/// Before 2026-09-10 this was the counter alone, and every process's atomic
+/// starts at 0: two processes `putBytes`ing the same key concurrently
+/// produced identical `.rec-0.part` / `.rec-1.part` / ... temp paths, so the
+/// loser's `rename` target was already gone (`error.FileNotFound`) instead
+/// of the documented last-write-wins.
+fn nextUniqFor(pid: linux.pid_t, buf: []u8) []const u8 {
     const n = ingest_counter.fetchAdd(1, .monotonic);
-    return std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable; // u64 fits in 24
+    return std.fmt.bufPrint(buf, "{d}-{d}", .{ pid, n }) catch unreachable; // fits in 40
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────────
@@ -879,25 +988,33 @@ test "ttl=false: getBytes never opens the .expiry sidecar (observable via a corr
 
     try store.putBytes("sessions", "s1", "alive");
 
-    // Write a sidecar directly (bypassing putWithTTL) whose content is not a
-    // parseable i64 at all. If getBytes ever opened+read this file, parsing
-    // it would error — so a plain success here is direct evidence the file
-    // was never touched, not just that the deadline logic was skipped.
+    // Write a sidecar directly (bypassing putWithTTL) as a DIRECTORY, not a
+    // file — not a merely non-numeric string, because F6 (2026-09-10) made a
+    // corrupt-but-parseable-shape sidecar (non-numeric text, overflow, …)
+    // tolerated as "no TTL" rather than erroring (see the F6 test below), so
+    // that shape no longer distinguishes "opened and tolerated" from "never
+    // opened". Opening/reading a directory where a regular file is expected
+    // still fails a different way, which F6's tolerance does not swallow.
     var pbuf: [900]u8 = undefined;
     const sidecar_path = try store.sidecarPath(&pbuf, "sessions", "s1", ".expiry");
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sidecar_path, .data = "not-a-number-at-all" });
+    try std.Io.Dir.cwd().createDir(io, sidecar_path, .default_dir);
 
     const got = (try store.getBytes(gpa, "sessions", "s1")).?;
     defer gpa.free(got);
     try t.expectEqualStrings("alive", got);
 
-    // Control: the identical store with ttl=true (the default) DOES open and
-    // parse the sidecar, and this corrupt content makes it fail — proving the
-    // opt-out above genuinely skipped the probe rather than happening to
-    // tolerate it.
+    // Control: the identical store with ttl=true (the default) DOES open the
+    // sidecar and fails on it — proving the opt-out above genuinely skipped
+    // the probe rather than happening to tolerate it. The failure must not
+    // be one of the two shapes F6 now tolerates (InvalidCharacter/Overflow),
+    // or this control would no longer be proving what it claims to.
     var control = store;
     control.ttl = true;
-    try t.expectError(error.InvalidCharacter, control.getBytes(gpa, "sessions", "s1"));
+    if (control.getBytes(gpa, "sessions", "s1")) |_| {
+        return error.TestUnexpectedResult; // ttl=true must fail opening a directory as the sidecar
+    } else |err| {
+        try t.expect(err != error.InvalidCharacter and err != error.Overflow);
+    }
 }
 
 test "putWithTTL refuses with error.TtlDisabled on a ttl=false store — no sidecar the store would then never check" {
@@ -1184,4 +1301,240 @@ test "casPutBytes actually blocks on a lock held by another thread (real cross-h
     const got = (try store.getBytes(gpa, "accounts", "a-locked")).?;
     defer gpa.free(got);
     try t.expectEqualStrings("cas-write", got);
+}
+
+// ── A1 fix campaign, 2026-09-10 ─────────────────────────────────────────
+
+test "F1: delete durably syncs the directory, not just unlinkat — putBytes still syncs its own dir too" {
+    // `test_sync_dir_calls` is a single process-wide counter shared by every
+    // test in this binary (zig test runs them all in one process) — snapshot
+    // it as a baseline and compare deltas, never assume it starts at 0.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+
+    const before_put = test_sync_dir_calls.load(.monotonic);
+    try store.putBytes("devices", "dev-1", "hello");
+    // one record write -> one directory fsync (the file fsync inside
+    // writeFileAtomicIn is not counted here, only syncDir calls)
+    try t.expectEqual(@as(u32, 1), test_sync_dir_calls.load(.monotonic) - before_put);
+
+    const before_delete = test_sync_dir_calls.load(.monotonic);
+    try t.expect(try store.delete("devices", "dev-1"));
+    // RED before the 2026-09-10 fix: this delta was 0 (delete never called
+    // syncDir at all — measured externally via strace as 40 unlinkat, 0
+    // fsync across 20 deletes). GREEN now: exactly 1, same shape as putBytes.
+    try t.expectEqual(@as(u32, 1), test_sync_dir_calls.load(.monotonic) - before_delete);
+}
+
+test "F2: two different pids (simulating two real processes, whose ingest_counter both start at 0) never produce the same temp name" {
+    // Two independent processes each have their own zero-initialized
+    // `ingest_counter` — that IS the mechanism `nextUniqFor` closes over by
+    // taking the pid as a parameter (real `nextUniq` always passes its own
+    // real pid; a test cannot fake that from inside one process, so it goes
+    // through `nextUniqFor` directly instead to supply two DIFFERENT pids,
+    // reproducing exactly what two real processes' first N calls look like).
+    var collisions: u32 = 0;
+    const trials = 2000;
+    var i: u32 = 0;
+    while (i < trials) : (i += 1) {
+        ingest_counter.store(0, .monotonic); // process A's counter, fresh
+        var buf_a: [48]u8 = undefined;
+        const a = nextUniqFor(1111, &buf_a);
+        ingest_counter.store(0, .monotonic); // process B's counter, fresh
+        var buf_b: [48]u8 = undefined;
+        const b = nextUniqFor(2222, &buf_b);
+        if (std.mem.eql(u8, a, b)) collisions += 1;
+    }
+    // GREEN: 0/2000 — the pid prefix differs ("1111-0" vs "2222-0", etc.)
+    // even though both processes' counters produce the identical sequence
+    // 0, 1, 2, ... The next test pins the RED number this replaced.
+    try t.expectEqual(@as(u32, 0), collisions);
+}
+
+test "F2 mutation control: the pre-fix shape (counter only, no pid) DOES collide 2000/2000 under the same reset simulation" {
+    // Same reproduction as above, but calling the OLD formula directly
+    // (counter alone) to pin the exact RED number the fix closed, without
+    // needing to check out the pre-fix commit.
+    const oldNextUniq = struct {
+        fn f(buf: []u8, counter: *std.atomic.Value(u64)) []const u8 {
+            const n = counter.fetchAdd(1, .monotonic);
+            return std.fmt.bufPrint(buf, "{d}", .{n}) catch unreachable;
+        }
+    }.f;
+    var counter: std.atomic.Value(u64) = .init(0);
+    var collisions: u32 = 0;
+    const trials = 2000;
+    var i: u32 = 0;
+    while (i < trials) : (i += 1) {
+        counter.store(0, .monotonic);
+        var buf_a: [24]u8 = undefined;
+        const a = oldNextUniq(&buf_a, &counter);
+        counter.store(0, .monotonic);
+        var buf_b: [24]u8 = undefined;
+        const b = oldNextUniq(&buf_b, &counter);
+        if (std.mem.eql(u8, a, b)) collisions += 1;
+    }
+    try t.expectEqual(@as(u32, 2000), collisions);
+}
+
+test "F3: sweep does not lockKey (or leave a .lock file behind for) a key that was never a candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 20 records, none ever TTL'd.
+    var buf: [16]u8 = undefined;
+    var idx: u32 = 0;
+    while (idx < 20) : (idx += 1) {
+        const key = try std.fmt.bufPrint(&buf, "k{d}", .{idx});
+        try store.putBytes("nottl", key, "x");
+    }
+
+    const swept = try store.sweep(arena, "nottl");
+    try t.expectEqual(@as(usize, 0), swept);
+
+    // Raw directory scan (unlike `list`, does not hide hidden files) — this
+    // is the audit's own measurement shape: 500 records / 0 TTL / one sweep
+    // that reaped 0 still left 500 `.lock` files (1000 total) before the
+    // fix. Here: 20 records in, 20 files out — GREEN means no `.lock` grew.
+    var dbuf: [640]u8 = undefined;
+    const dir_path = try std.fmt.bufPrint(&dbuf, "{s}/nottl", .{store.base});
+    var dir = try std.Io.Dir.cwd().openDir(store.io, dir_path, .{ .iterate = true });
+    defer dir.close(store.io);
+    var total: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(store.io)) |entry| {
+        if (entry.kind != .file) continue;
+        total += 1;
+    }
+    // RED before the fix: 40 (20 records + 20 `.lock` files created by the
+    // unconditional pre-delete lockKey). GREEN now: 20.
+    try t.expectEqual(@as(usize, 20), total);
+}
+
+test "F4: crash between putWithTTL's two writes is fail-closed (no record), not fail-open (a permanent one)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    var store = try testStore(&tmp, &base_buf);
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store.clock = clk.clock();
+    const gpa = std.testing.allocator;
+
+    // Simulate a crash right after the FIRST of putWithTTL's two internal
+    // writes by calling that first step directly and stopping — this is
+    // exactly the state a real crash would leave on disk, without needing
+    // to actually kill the process mid-call.
+    //
+    // New (fixed) order: sidecar first. A crash after only the sidecar
+    // write leaves no record at all.
+    try store.writeExpiryAt("sessions", "crash-key", clk.now_ns +| 500);
+    try t.expect((try store.getBytes(gpa, "sessions", "crash-key")) == null);
+
+    // Old (pre-fix) order: record first. A crash after only the record
+    // write left a record with NO deadline ever written — i.e. permanent,
+    // the exact fail-open bug F4 reported. Reproduced directly (not by
+    // reverting putWithTTL) to pin the contrast the reorder fixed.
+    try store.putBytes("sessions", "old-order-crash-key", "permanent-by-accident");
+    const resurrected = (try store.getBytes(gpa, "sessions", "old-order-crash-key")).?;
+    defer gpa.free(resurrected);
+    try t.expectEqualStrings("permanent-by-accident", resurrected);
+    // No `.expiry` sidecar exists for it — under the OLD order this key,
+    // meant to be short-lived, in fact never expires at all.
+    var pbuf: [900]u8 = undefined;
+    const sidecar_path = try store.sidecarPath(&pbuf, "sessions", "old-order-crash-key", ".expiry");
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, sidecar_path, .{}));
+
+    // Positive control: an uninterrupted putWithTTL still round-trips.
+    try store.putWithTTL("sessions", "clean", "alive", 500);
+    const clean = (try store.getBytes(gpa, "sessions", "clean")).?;
+    defer gpa.free(clean);
+    try t.expectEqualStrings("alive", clean);
+}
+
+test "F5: putManyBytes syncs the directory once per batch, not once per record — records still all readable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+
+    const n = 20;
+    var keybuf: [n][8]u8 = undefined;
+    var entries: [n]Store.Entry = undefined;
+    for (0..n) |i| {
+        entries[i] = .{
+            .key = std.fmt.bufPrint(&keybuf[i], "k{d}", .{i}) catch unreachable,
+            .bytes = "batched",
+        };
+    }
+
+    test_sync_dir_calls.store(0, .monotonic);
+    for (entries) |e| try store.putBytes("individually", e.key, e.bytes);
+    const per_record_syncs = test_sync_dir_calls.load(.monotonic);
+    try t.expectEqual(@as(u32, n), per_record_syncs);
+
+    test_sync_dir_calls.store(0, .monotonic);
+    try store.putManyBytes("batched", &entries);
+    const batch_syncs = test_sync_dir_calls.load(.monotonic);
+    // RED-equivalent (what calling putBytes n times costs): n directory
+    // fsyncs. GREEN: putManyBytes over the same n records costs exactly 1 —
+    // per the audit's own breakdown the directory fsync is roughly half of
+    // durable-write cost, so this removes very close to (n-1)/n of that
+    // half for a batch of n.
+    try t.expectEqual(@as(u32, 1), batch_syncs);
+
+    for (entries) |e| {
+        const got = (try store.getBytes(gpa, "batched", e.key)).?;
+        defer gpa.free(got);
+        try t.expectEqualStrings("batched", got);
+    }
+}
+
+test "F6: a corrupt .expiry sidecar is treated as no-TTL, not propagated as a read error on an otherwise-healthy record" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    const shapes = [_][]const u8{
+        "not-a-number",
+        "",
+        "99999999999999999999999999",
+        "12 34",
+        "\x00\x00",
+    };
+    var buf: [16]u8 = undefined;
+    for (shapes, 0..) |shape, i| {
+        const key = try std.fmt.bufPrint(&buf, "k{d}", .{i});
+        try store.putBytes("sessions", key, "still readable");
+        var pbuf: [900]u8 = undefined;
+        const sidecar_path = try store.sidecarPath(&pbuf, "sessions", key, ".expiry");
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = sidecar_path, .data = shape });
+
+        // RED before the fix: each of these propagated error.InvalidCharacter
+        // or error.Overflow out of getBytes. GREEN now: the record reads back
+        // exactly as if it had never been TTL'd.
+        const got = (try store.getBytes(gpa, "sessions", key)).?;
+        defer gpa.free(got);
+        try t.expectEqualStrings("still readable", got);
+    }
+
+    // Positive control: a well-formed but already-past sidecar still expires
+    // the record — the tolerant path above did not disable TTL altogether.
+    var store2 = store;
+    var clk = ManualClock{ .now_ns = 1_000 };
+    store2.clock = clk.clock();
+    try store2.putWithTTL("sessions", "well-formed", "bye", 100); // deadline 1100
+    clk.now_ns = 2_000;
+    try t.expect((try store2.getBytes(gpa, "sessions", "well-formed")) == null);
 }
