@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit close-out, 4 findings from the original audit
+  report (the ledger's own table only carried 2 of them — the other 2 were
+  listed in `0a53c673`'s own commit message as "reported in the audit notes,
+  not fixed"). (1)+(2) `requestedHeadersAllowed`'s inactive-union-field read
+  (HIGH — a wild slice deref in ReleaseFast under the *default* `.reflect`
+  config) and the long-`Access-Control-Request-Headers`-turns-204-into-500
+  (MEDIUM) were already fixed by `0a53c673` (2026-09-01) — verified
+  structurally against `0a53c673^` and confirmed green in the current suite.
+  (3) NEW: `allow_unconditional_wildcard`'s preflight early return used to
+  answer a REAL preflight (ACRM present) with only
+  `Access-Control-Allow-Origin: *` — no Allow-Methods/-Headers/-Max-Age, so
+  a browser fails the very DELETE/PUT/custom-header request the flag exists
+  to permit "without changing what is on the wire". SPEC.md frames the flag
+  as skipping the origin/method/header GATES, not the emission; it now
+  emits the full grant while still skipping the three gates. (4) NEW: `init`
+  now rejects an empty `allowed_methods` with the new `error.EmptyAllowedMethods`
+  — the comptime `StaticOptions` twin already refuses this with a
+  `@compileError`, but the runtime `Options` path (the primary API) had no
+  equivalent, so a config-driven empty list silently emitted a bare
+  `Access-Control-Allow-Methods: ` on every preflight. Both (3) and (4) are
+  new behavior; the module has 0 consumers in the repo (P1). Measured: RED
+  37/39 → GREEN 39/39 (`zig build test-cors`).
 - **2026-09-07** — **Test-only: `fuzzGates` handed all three pure gates the
   empty string on every run.** It opened with `smith.bytes(&buf)` and then drew
   the length with `smith.valueRangeAtMost(u16, 0, buf.len)`; `bytes` consumes

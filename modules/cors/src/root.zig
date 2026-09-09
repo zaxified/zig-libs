@@ -186,6 +186,13 @@ pub const InitError = error{
     /// gate on without `.any`, so it is rejected rather than silently
     /// downgraded to a no-op.
     UnconditionalWildcardRequiresAnyOrigin,
+    /// `allowed_methods` named no method at all. `joinMethods` would happily
+    /// return `""`, and every preflight would then emit a bare
+    /// `Access-Control-Allow-Methods: ` — a silently degenerate policy
+    /// instead of a config error. The comptime twin (`StaticOptions`,
+    /// `validateStatic`) already refuses this with a `@compileError`; this
+    /// is the runtime API's equivalent.
+    EmptyAllowedMethods,
 };
 
 // Digits of maxInt(u32) — the precomputed Access-Control-Max-Age value.
@@ -248,6 +255,8 @@ pub const Cors = struct {
         }
         if (options.allow_unconditional_wildcard and options.allowed_origins != .any)
             return error.UnconditionalWildcardRequiresAnyOrigin;
+        if (options.allowed_methods.len == 0)
+            return error.EmptyAllowedMethods;
         if (std.debug.runtime_safety) {
             switch (options.allowed_origins) {
                 .list => |l| for (l) |o| assertValueClean(o),
@@ -326,8 +335,39 @@ pub const Cors = struct {
         // OPTIONS (no ACRM) only ever reaches here because of this flag
         // (see `middlewareRun`), and it has no requested method/headers to
         // gate on regardless.
+        //
+        // SPEC.md frames this as skipping the origin/method/header GATES —
+        // not skipping the emission. A `return` right after the origin
+        // header used to do exactly that: a REAL preflight (ACRM present)
+        // came back with only `Access-Control-Allow-Origin: *` and nothing
+        // else. Per the Fetch CORS-preflight algorithm an absent
+        // Allow-Methods yields an empty method set, so the browser fails a
+        // preflighted DELETE/PUT/PATCH (or any non-safelisted header)
+        // client-side — precisely the wire change this option exists to
+        // avoid for a legacy always-open API (SPEC.md, README.md).
         if (c.options.allow_unconditional_wildcard) {
             try res.setHeader("Access-Control-Allow-Origin", "*");
+            if (req.header("Access-Control-Request-Method") == null) return; // bare OPTIONS: nothing more to advertise
+            try res.setHeader("Access-Control-Allow-Methods", c.allow_methods_value);
+            const acrh = req.header("Access-Control-Request-Headers");
+            switch (c.options.allowed_headers) {
+                // Same HeaderBytesExhausted handling as the gated path below
+                // (root.zig, long-ACRH MEDIUM finding): a failed reflect
+                // omits the header rather than turning the promised 204
+                // into a 500.
+                .reflect => if (acrh) |h| {
+                    if (h.len != 0) res.setHeader("Access-Control-Allow-Headers", h) catch |e| switch (e) {
+                        error.HeaderBytesExhausted, error.TooManyHeaders => {},
+                        else => return e,
+                    };
+                },
+                .list => if (c.allow_headers_value.len != 0)
+                    try res.setHeader("Access-Control-Allow-Headers", c.allow_headers_value),
+            }
+            // `allow_credentials` is unreachable here — rejected together
+            // with `.any` at init (same as `applyActual`).
+            if (c.options.max_age_s != null)
+                try res.setHeader("Access-Control-Max-Age", c.max_age_buf[0..c.max_age_len]);
             return;
         }
 
@@ -1228,6 +1268,28 @@ test "allow_unconditional_wildcard requires .any (rejected at init otherwise)" {
     ok.deinit();
 }
 
+test "init rejects an empty allowed_methods — the comptime twin (StaticOptions) already does" {
+    // A1 finding (LOW): `joinMethods(gpa, &.{})` returns a zero-length slice
+    // and `init` used to succeed, so every preflight emitted a bare
+    // `Access-Control-Allow-Methods: ` (an empty value passes
+    // `validHeaderValue`). `validateStatic` (root.zig) refuses precisely
+    // this with `@compileError("cors.StaticOptions.allow_methods must name
+    // at least one method token.")` — the runtime `Options` path, the
+    // primary API, had no equivalent, so a config-driven consumer whose
+    // method list came out empty got a silently degenerate policy instead
+    // of an error.
+    try testing.expectError(error.EmptyAllowedMethods, Cors.init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{},
+    }));
+    // A non-empty list is untouched by the check.
+    var ok: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .{ .list = &.{"https://app.example"} },
+        .allowed_methods = &.{.get},
+    });
+    ok.deinit();
+}
+
 test "actual: allow_unconditional_wildcard emits the wildcard on every response, Origin absent or not (default withholds it)" {
     var buf: [2048]u8 = undefined;
     { // default posture: absent Origin is a same-origin/non-browser request
@@ -1293,6 +1355,38 @@ test "OPTIONS interception: default requires Access-Control-Request-Method; allo
         try expectStatus(got2, "204");
         try expectHeaderLine(got2, "Access-Control-Allow-Origin: *");
     }
+}
+
+test "allow_unconditional_wildcard: a real preflight (ACRM present) still needs Allow-Methods/-Headers/-Max-Age" {
+    // A1 finding (MEDIUM): the deviation is documented (SPEC.md) as skipping
+    // the origin/method/header GATES, not the emission -- but the early
+    // return in `applyPreflight` skipped the whole block, so a real
+    // preflight (ACRM present) got only `Access-Control-Allow-Origin: *`
+    // and nothing else. Per the Fetch CORS-preflight algorithm, an absent
+    // Allow-Methods yields an empty method set, so the browser fails a
+    // preflighted DELETE/PUT/PATCH client-side, before ever sending the
+    // request this flag exists to permit "without changing what is on the
+    // wire" (SPEC.md).
+    var c: Cors = try .init(testing.allocator, .{
+        .allowed_origins = .any,
+        .allow_unconditional_wildcard = true,
+        .allowed_methods = &.{ .get, .post, .delete },
+        .allowed_headers = .{ .list = &.{"content-type"} },
+        .max_age_s = 600,
+    });
+    defer c.deinit();
+    var flag: Flag = .{};
+    var r = try testRouter(&c, &flag);
+    defer r.deinit();
+    var buf: [2048]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/t", "Access-Control-Request-Method: DELETE\r\n" ++
+        "Access-Control-Request-Headers: content-type\r\n"), &buf);
+    try expectStatus(got, "204");
+    try expectHeaderLine(got, "Access-Control-Allow-Origin: *");
+    try expectHeaderLine(got, "Access-Control-Allow-Methods: GET, POST, DELETE");
+    try expectHeaderLine(got, "Access-Control-Allow-Headers: content-type");
+    try expectHeaderLine(got, "Access-Control-Max-Age: 600");
+    try testing.expect(!flag.hit); // still short-circuited, never routed
 }
 
 fn allowDevOrigins(_: ?*anyopaque, origin: []const u8) bool {
