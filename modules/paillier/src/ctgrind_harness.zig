@@ -3,9 +3,11 @@
 //! "Constant-time discipline" section, and the one item in it that is
 //! DELIBERATELY NOT constant-time:
 //!
-//!   "`decrypt`'s `c^λ mod n²` and `mulPlaintext`'s `c^k mod n²` use
-//!    `Modulus.pow` (constant-time Montgomery ladder) — `λ` is secret-key
-//!    material, `k` may be a secret scalar."
+//!   "`decrypt`'s `c^λ mod n²` and `mulPlaintext`'s `c^k mod n²` are routed
+//!    through `montint` (constant-time Montgomery ladder) — `λ` is
+//!    secret-key material, `k` may be a secret scalar." (paillier F5,
+//!    wave-3 audit: `mulPlaintext` used to go through `std.crypto.ff`'s
+//!    `Modulus.pow` instead — same constant-time posture, ~5× slower)
 //!   "**Known caveat:** `decrypt`'s L-function drops to `std.math.big.int`
 //!    for the exact `(x−1)/n` division (`ff` has no exact-division
 //!    primitive), and that division is variable-time in `x` — a
@@ -58,11 +60,12 @@
 //!                built via `fromBytes` from the first key's own
 //!                `n`/`lambda`/`mu` bytes (untainted), then `lambda`/`mu`
 //!                are tainted; `n`/`n_sq`/`n_sq_mont` stay public.
-//!   - `mul`    — `mulPlaintext`'s scalar `k` (the exponent `pk.n_sq.pow`
-//!                consumes, and the value `k.isZero()` branches on
-//!                directly in `root.zig` before ever reaching `pow`) is
-//!                tainted; the ciphertext operand is the fixed untainted
-//!                public one.
+//!   - `mul`    — `mulPlaintext`'s scalar `k` (the exponent `montint`'s
+//!                `montModexpSecret` consumes since paillier F5, wave-3
+//!                audit — previously `pk.n_sq.pow`; the value `k.isZero()`
+//!                branches on directly in `root.zig` before ever reaching
+//!                the modexp, unchanged by F5) is tainted; the ciphertext
+//!                operand is the fixed untainted public one.
 //!   - `addm`   — `addPlaintext`'s plaintext `m` is tainted; same fixed
 //!                ciphertext operand. Exercises `gPow`'s binomial-shortcut
 //!                path for the standard generator `g = n+1` — SPEC.md's

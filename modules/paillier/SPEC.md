@@ -10,10 +10,15 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 serialization, plus the full number-theoretic core: `fromPrimes` (n = p·q, λ = lcm(p−1,q−1),
 g = n+1, μ = L(g^λ mod n²)⁻¹ mod n with L(x) = (x−1)/n exact), `generate` (sieve +
 Miller-Rabin probable-prime search mirroring `rsa.generate`, minus its `e`-coprimality
-filter), `encrypt`/`decrypt`, and the three homomorphic ops. Everything is `std.crypto.ff`
-(`Uint`/`Modulus`/`Fe` at `max_bits = 4096`) with `std.math.big.int` only for the one-off
-derivations `ff` has no primitive for (gcd/lcm, extended-Euclid inverse, the exact L
-division).
+filter), `encrypt`/`decrypt`, and the three homomorphic ops. `std.crypto.ff`
+(`Uint`/`Modulus`/`Fe` at `max_bits = 4096`) carries every value and does keygen, the
+L-function's setup, the CRT/Garner recombination, and all serialization; the
+modular-exponentiation hot paths (`encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`, and
+`mulPlaintext`'s `c^k mod n²`) are routed through the sibling `montint` module instead
+(full-radix-2^64 Montgomery modexp, sized to the actual key width — ~3–4× faster than
+`ff` on `decrypt`/`encrypt`, plus a further ~3.4× for `decrypt` from Paillier-CRT when the
+key carries its factors). `std.math.big.int` is used only for the one-off derivations
+`ff` has no primitive for (gcd/lcm, extended-Euclid inverse, the exact L division).
 
 **The `g = n+1` binomial shortcut.** For the standard generator the binomial theorem
 collapses `(1+n)^m = Σ C(m,k)·n^k ≡ 1 + m·n (mod n²)` (every k ≥ 2 term carries an n²
@@ -58,27 +63,53 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
 
 **Constant-time discipline.** Mirrors `rsa`'s stance:
 
-- `decrypt`'s `c^λ mod n²` and `mulPlaintext`'s `c^k mod n²` use `Modulus.pow`
-  (constant-time Montgomery ladder) — `λ` is secret-key material, `k` may be a secret
-  scalar. `fromPrimes`'s `g^λ mod n²` likewise uses `pow`, never `powPublic` (`λ` is
-  factorization-equivalent).
-- `encrypt`'s `r^n` term uses `powPublic`: the exponent `n` is the public modulus, and
-  `powPublic` remains constant-time with respect to the base `r`.
+- `decrypt`'s `c^λ mod n²` and `mulPlaintext`'s `c^k mod n²` are routed through the
+  sibling `montint` module (`montModexpSecret`, a full-radix-2^64 constant-time
+  Montgomery ladder sized to the key's actual width) — `λ` is secret-key material, `k`
+  may be a secret scalar. When the key carries its factors (`SecretKey.crt`, the
+  `fromPrimes`/`generate` case), `decrypt` additionally splits into the Paillier-CRT
+  path: two half-width constant-time `montint` modexps (`c^dp mod p²`, `c^dq mod q²`)
+  Garner-recombined — see "CRT decrypt" below. `fromPrimes`'s `g^λ mod n²` still uses
+  `std.crypto.ff`'s `Modulus.pow`, never `powPublic` (`λ` is factorization-equivalent).
+  Constant-time in the secret exponent/scalar's *value*; per the module's ctgrind
+  harness (`src/ctgrind_harness.zig`, targets `crt`/`noncrt`/`mul`), `mulPlaintext`'s
+  `if (k.isZero())` short-circuit is a direct branch on `k` itself before the modexp is
+  ever reached — undocumented until the harness's own header comment named it; recorded
+  here rather than fixed, since removing it changes `mulPlaintext`'s `k = 0` handling and
+  is a decision for the fix queue, not a doc update.
+- **CRT decrypt's own variable-time surface, beyond the L-division below.** The Garner
+  recombination itself (`decryptCrtX`) is branchless `ff` field arithmetic (`ct.eql`/
+  `cmov`/`shiftIn`), but `feFromMontBytes`'s `stripLeadingZeros` call — used to turn each
+  CRT half's raw modexp output (`x_p`/`x_q`, both secret-derived) back into a canonical
+  `Fe` — is a `while` loop whose iteration count depends on the number of leading zero
+  bytes in that secret-derived value. Measured (wave-3 audit, ctgrind + callgrind):
+  ~0.113% of a decrypt's instructions are data-dependent this way, dwarfed by the
+  L-division below; recorded as a known residual, not fixed (a fixed-width `Fe`
+  construction that skips the strip would need a `std.crypto.ff` entry point this module
+  doesn't have).
+- `encrypt`'s `r^n` term uses `montint` too (the same `pk.n_sq_mont` params `mulPlaintext`
+  now shares), sized to the public modulus `n`'s width; the base `r` may be secret
+  (semantic security depends on it, see below) and the ladder does not branch on it.
 - `fromPrimes`'s one-time key derivation drops to `std.math.big.int`
   (variable-time extended-Euclid/gcd/lcm, exactly like `rsa.fromPrimesImpl` does for its
   own `d = e⁻¹ mod λ(n)`) — a one-time key-import cost, not a per-operation leak, same
   rationale as `rsa`'s SPEC.md.
 - **Known caveat:** `decrypt`'s L-function drops to `std.math.big.int` for the exact
   `(x−1)/n` division (`ff` has no exact-division primitive), and that division is
-  variable-time in `x` — a per-decryption, plaintext-derived value. The limb *widths* are
-  fixed by the key size (the dominant cost driver in `std.math.big.int`'s schoolbook
-  division), so the residual signal is small, but it is not the hard constant-time
-  guarantee the modexp has. Callers running in an environment with a co-located attacker
-  measuring single decryptions should be aware; a constant-time exact division is future
-  work if a consumer ever needs it.
+  variable-time in `x` — a per-decryption, plaintext-derived value. Measured (wave-3
+  audit, ctgrind): the majority of `decrypt`'s taint-tracked contexts sit on this one
+  division. The limb *widths* are fixed by the key size (the dominant cost driver in
+  `std.math.big.int`'s schoolbook division), so the residual signal is small, but it is
+  not the hard constant-time guarantee the modexp has. Callers running in an environment
+  with a co-located attacker measuring single decryptions should be aware; a
+  constant-time exact division is future work if a consumer ever needs it.
 - Prime generation (`generate`) is inherently variable-time in how *long* the search
   takes (every implementation's is); the Miller-Rabin modexps use `ff`'s constant-time
   path and all candidate buffers are `secureZero`ed — same posture as `rsa`.
+- **This section now has an instrument, not just prose** —
+  `src/ctgrind_harness.zig` + `scripts/ctgrind-expected.tsv` (targets `crt`/`noncrt`/
+  `mul`/`addm`); previously none of the sentences above had a measurement behind them
+  (wave-3 audit F3).
 
 **Semantic security relies on the randomness `r`.** Paillier is IND-CPA secure only because
 each encryption draws a fresh, uniform `r` coprime to `n`; `encrypt` accepts a caller-supplied
@@ -105,6 +136,12 @@ silently assumed.
   job); its self-checks (odd `n`, L-exactness of `g^λ`, invertibility of `μ`) reject many
   composites but NOT all — a key derived from composite factors silently decrypts garbage
   for most plaintexts. Deterministic construction is for KATs/round-tripping stored keys.
+- **`fromPrimes` also requires `gcd(n, φ(n)) = 1`** (equivalently `gcd(λ, n) = 1`), a
+  second precondition independent of primality — `generate`'s same-length prime search
+  satisfies it by construction, but a caller-supplied genuinely-prime pair can violate it
+  (e.g. `p=5, q=11`: `n=55`, `λ=20`, `5 | gcd(20,55)`). Rejected via the `μ`-invertibility
+  self-check above, under the same `error.InvalidPrimes` as every other rejection reason —
+  the error name does not say which precondition failed (paillier F9, wave-3 audit).
 - **Timing:** see "Constant-time discipline" above (secret-exponent modexps constant-time;
   decrypt's L-division and keygen's big.int derivation variable-time with documented
   rationale).

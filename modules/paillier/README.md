@@ -1,8 +1,12 @@
 # paillier
 
 Pure-Zig Paillier additively-homomorphic public-key cryptosystem (Paillier
-1999), built on `std.crypto.ff` — no bignum reimplementation, no libc, no
-`@cImport`.
+1999). `std.crypto.ff` carries every value and does keygen, serialization,
+and the CRT/Garner recombination; the modular-exponentiation hot paths
+(`encrypt`'s `r^n mod n²`, `decrypt`'s `c^λ mod n²`, `mulPlaintext`'s
+`c^k mod n²`) are routed through the sibling `montint` module instead (a
+faster constant-time Montgomery ladder — see SPEC.md "Design &
+invariants"). No libc, no `@cImport`.
 
 **Status: IMPLEMENTED (I2 Phase 1 complete).** Keygen (`generate` with a
 Miller-Rabin probable-prime search, `fromPrimes` for deterministic/KAT
@@ -22,9 +26,10 @@ see SPEC.md "Phase-2 boundary".
 
 - **Model after:** P. Paillier, "Public-Key Cryptosystems Based on Composite
   Degree Residuosity Classes", EUROCRYPT 1999 — the standard `g = n+1`
-  variant. Built on `std.crypto.ff` exactly like this repo's `rsa` module
-  (`Uint`/`Modulus`/`Fe`, the same fixed-width constant-time modular-
-  arithmetic primitive).
+  variant. Values are `std.crypto.ff` types (`Uint`/`Modulus`/`Fe`, the same
+  fixed-width constant-time modular-arithmetic primitive this repo's `rsa`
+  module uses); the modexp hot paths run through the sibling `montint`
+  module instead (see above).
 - **Platform:** any. **Role:** util (pure computation, no I/O of its own).
   **Concurrency:** reentrant — `PublicKey`/`SecretKey`/`Ciphertext` are plain
   value types, no shared/global state.
@@ -59,7 +64,8 @@ const kp = try paillier.fromPrimes(p_bytes, q_bytes); // deterministic (KAT/test
 // const kp = try paillier.generate(random, paillier.modulus_bits); // random
 
 const pk: paillier.PublicKey = kp.public;   // n, n_sq (=n²), g
-const sk: paillier.SecretKey = kp.secret;   // n, n_sq, lambda, mu
+var sk: paillier.SecretKey = kp.secret;     // n, n_sq, lambda, mu
+defer sk.deinit(); // zeroes lambda/mu/the CRT block when done with this key
 
 // m/r must be constructed canonical mod `pk.n_sq` — see the "Fe
 // construction contract" note at the top of src/root.zig.

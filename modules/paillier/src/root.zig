@@ -249,7 +249,11 @@ fn montPowSecret(mp: *const MontParams, base_be: []const u8, exp_be: []const u8,
             const M = montint.Modint(s * 64);
             const mod = montView(s, mp);
             const b = beToLimbs(s, base_be);
-            const e = beToLimbs(s, exp_be);
+            var e = beToLimbs(s, exp_be);
+            // `exp_be` here is always a secret exponent (`decryptNonCrtX`'s
+            // λ, `decryptCrtX`'s dp/dq) — don't leave its limb form behind
+            // (paillier F2, wave-3 audit).
+            defer std.crypto.secureZero(u64, &e);
             const r = mod.powMont(&b, &e);
             mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
             return out_buf[0..M.encoded_bytes];
@@ -676,6 +680,18 @@ fn bigModInverse(gpa: std.mem.Allocator, x: *const BigInt, m: *const BigInt) !Bi
 /// self-checks (L-exactness, mu invertibility) catch many composites, but
 /// NOT all: a key derived from composite factors decrypts garbage.
 ///
+/// A SECOND, independent precondition beyond primality: `gcd(n, phi(n)) = 1`
+/// (equivalently `gcd(lambda, n) = 1`), which `generate`'s same-length
+/// prime search satisfies by construction but which genuinely prime,
+/// differently-shaped `p`/`q` can violate — e.g. `p = 5, q = 11` (`n = 55`,
+/// `lambda = 20`, and `5 | gcd(20, 55)`). That case fails the `mu`
+/// invertibility self-check below and is returned as `error.InvalidPrimes`
+/// alongside every other rejection reason this function has — the name
+/// does not distinguish "not prime" from "prime but gcd(n, phi(n)) != 1"
+/// (paillier F9, wave-3 audit). Round-tripping a key `generate` itself
+/// produced is unaffected; this only bites a caller supplying its own
+/// prime pair.
+///
 /// Construction (Paillier 1999 §3, standard `g = n+1` variant):
 ///   1. `n = p * q`; reject `p == q` and products over `modulus_bits`
 ///      (`error.Overflow`).
@@ -1061,7 +1077,7 @@ pub fn generate(random: std.Random, bits: usize) GenerateError!KeyPair {
 
 // ── encrypt / decrypt ─────────────────────────────────────────────────────
 
-pub const EncryptError = std.crypto.ff.NullExponentError || std.crypto.ff.RepresentationError;
+pub const EncryptError = std.crypto.ff.NullExponentError || std.crypto.ff.RepresentationError || error{InvalidRandomness};
 
 /// `n`'s value as an `Fe` canonical mod `n_sq` — the one "widening"
 /// direction the Fe construction contract requires a fresh byte-level
@@ -1106,6 +1122,16 @@ fn gPow(pk: PublicKey, m: Fe) HomomorphicError!Fe {
 /// including phe/python-paillier; see `encryptRandom`, which samples `r`
 /// this way). Caller-supplied `r` here is for deterministic/KAT-reproducible
 /// encryption; use `encryptRandom` to have `r` sampled automatically.
+/// **A reused or unit `r` (`r = 1`, or any `r` such that `r^n ≡ 1 mod n²`,
+/// e.g. `r = n+1 = g`) makes the ciphertext publicly decryptable without the
+/// key** — `c = g^m` then, and `m = L(c)` needs no secret (paillier F11,
+/// wave-3 audit; recommended by the 2026-08-12 RNG-seam audit and not
+/// previously written down). `r = 0` is rejected below
+/// (`error.InvalidRandomness`) since it can only ever produce a ciphertext
+/// `decrypt` itself then rejects (`gcd(0, n) = n`); no other unsafe-but-
+/// representable `r` (`r = 1`, `r` sharing a factor with `n`, `r >= n`) is
+/// checked — silently degrading security rather than failing is `encrypt`'s
+/// documented contract for a caller-supplied `r`, same as `phe`'s.
 ///
 /// The `g^m` term goes through `gPow` (see there): for the standard
 /// `g = n+1` it is the binomial shortcut `1 + m·n mod n²` (no modexp, and
@@ -1116,6 +1142,10 @@ fn gPow(pk: PublicKey, m: Fe) HomomorphicError!Fe {
 /// time), and `r` is never legitimately zero (gcd(0,n) = n != 1), so no
 /// zero-exponent case can arise there.
 pub fn encrypt(pk: PublicKey, m: Fe, r: Fe) EncryptError!Ciphertext {
+    // `r = 0` never produces anything `decrypt` will accept (gcd(0,n) = n)
+    // — reject it here rather than let the caller discover a dead
+    // ciphertext later (paillier F11, wave-3 audit).
+    if (r.isZero()) return error.InvalidRandomness;
     const gm = try gPow(pk, m);
     // r^n mod n² — the modexp hot path, routed through montint. `n` is the
     // PUBLIC modulus (variable-time in the exponent is fine); the base `r`
@@ -1140,14 +1170,28 @@ pub fn encryptRandom(pk: PublicKey, m: Fe, random: std.Random) EncryptError!Ciph
 fn sampleNonzeroLtN(pk: PublicKey, random: std.Random) Fe {
     const n_bits = pk.n.bits();
     const n_len = byteLen(n_bits);
+    var n_be: [modulus_bytes]u8 = undefined;
+    pk.n.toBytes(n_be[0..n_len], .big) catch unreachable; // exact-size buffer
     var buf: [modulus_bytes]u8 = undefined;
     defer std.crypto.secureZero(u8, buf[0..n_len]);
     while (true) {
         random.bytes(buf[0..n_len]);
         buf[0] &= @as(u8, 0xff) >> @intCast(8 * n_len - n_bits);
+        // Explicit rejection against `n` itself — this is the redraw the doc
+        // comment above and SPEC.md both promise ("uniformly from [1, n)").
+        // The OLD code only rejected on `Fe.fromBytes(pk.n_sq, ...)` failure,
+        // which is dead: `n_len` bytes is always `< n_sq` (n_sq = n², double
+        // the width), so that construction never fails and roughly the top
+        // half of the masked range (everything in `[n, 2^n_bits)`) silently
+        // folded onto its residue `r - n` instead of being redrawn — measured
+        // 28.90% of draws (paillier F1, wave-3 audit). `n < n_sq` always (for
+        // n > 1), so an `n_len`-byte value `< n` is always representable mod
+        // `n_sq` too; the construction below cannot fail for a value that
+        // passed the `< n` check.
+        if (std.mem.order(u8, buf[0..n_len], n_be[0..n_len]) != .lt) continue; // >= n: redraw
         // Constructed against n_sq (not n) per the Fe construction contract
         // — encrypt() uses this value as the base of r^n mod n^2.
-        const r = Fe.fromBytes(pk.n_sq, buf[0..n_len], .big) catch continue; // >= n_sq: redraw (won't happen, n_len bytes < n_sq)
+        const r = Fe.fromBytes(pk.n_sq, buf[0..n_len], .big) catch continue;
         if (r.isZero()) continue;
         return r;
     }
@@ -1173,9 +1217,16 @@ pub const DecryptError = std.crypto.ff.NullExponentError || std.crypto.ff.Repres
 /// secret `λ`). Returns `null` iff `λ = 0` (a malformed key — not a real
 /// Paillier secret), preserving the old `NullExponent → InvalidCiphertext`
 /// behavior. Used when no CRT block is available (`fromBytes` keys).
-fn decryptNonCrtX(sk: SecretKey, c: Fe) ?Fe {
+/// `sk` is passed BY POINTER (not by value): `SecretKey` is a large
+/// (~13.9 KB) struct, and a by-value copy here would leave a second full
+/// copy of `lambda` on this function's own stack frame after `decrypt`
+/// returns — one of the residues `paillier` F2 (wave-3 audit) measured with
+/// a poisoned-stack probe. The caller (`decrypt`) still owns and zeroes the
+/// one copy it necessarily holds.
+fn decryptNonCrtX(sk: *const SecretKey, c: Fe) ?Fe {
     if (sk.lambda.isZero()) return null;
     var lam_be: [modulus_sq_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &lam_be); // F2: don't leave λ's big-endian image behind
     sk.lambda.toBytes(&lam_be, .big) catch unreachable; // canonical mod n², full-width
     return montModexpSecret(&sk.n_sq_mont, sk.n_sq, c, &lam_be);
 }
@@ -1184,8 +1235,16 @@ fn decryptNonCrtX(sk: SecretKey, c: Fe) ?Fe {
 /// `c^dp mod p²` and `c^dq mod q²`, Garner-recombined into `x` mod `n²`. Byte-
 /// identical to `decryptNonCrtX` for a well-formed ciphertext, but ~4× cheaper.
 /// Constant-time in the secret exponents; the recombination is all `ff` field
-/// arithmetic with no secret-dependent branch.
-fn decryptCrtX(sk: SecretKey, crt: *const CrtParams, c: Fe) Fe {
+/// arithmetic with no secret-dependent branch. Takes only `crt` (not the
+/// enclosing `SecretKey`) — every field this needs (`p_sq`/`q_sq`/`dp`/`dq`/
+/// the Montgomery params) lives on `CrtParams`, and the old `sk: SecretKey`
+/// by-value parameter was dead weight: an entire unused ~13.9 KB copy of the
+/// key (including the 128 B CRT block itself) left on the stack for every
+/// CRT decrypt (paillier F2, wave-3 audit).
+fn decryptCrtX(n_sq: Modulus, crt: *const CrtParams, c: Fe) Fe {
+    // `n_sq` is PUBLIC (the same value `PublicKey.n_sq` carries) — taking it
+    // by value here costs nothing security-wise, unlike the `sk: SecretKey`
+    // by-value parameter this replaced.
     // Reduce c into the mod-p² and mod-q² domains (both constant-time).
     const cp = reduceWide(crt.p_sq, c.v);
     const cq = reduceWide(crt.q_sq, c.v);
@@ -1195,21 +1254,36 @@ fn decryptCrtX(sk: SecretKey, crt: *const CrtParams, c: Fe) Fe {
     // Garner: u = (x_q − x_p)·(p²)⁻¹ mod q²;  x = x_p + p²·u   (0 ≤ x < n²).
     const xp_q = reduceWide(crt.q_sq, xp.v);
     const u = crt.q_sq.mul(crt.q_sq.sub(xq, xp_q), crt.p_sq_inv);
-    const xp_n = reduceWide(sk.n_sq, xp.v);
-    const u_n = reduceWide(sk.n_sq, u.v);
-    return sk.n_sq.add(xp_n, sk.n_sq.mul(crt.p_sq_fe, u_n));
+    const xp_n = reduceWide(n_sq, xp.v);
+    const u_n = reduceWide(n_sq, u.v);
+    return n_sq.add(xp_n, n_sq.mul(crt.p_sq_fe, u_n));
 }
 
-pub fn decrypt(sk: SecretKey, c: Ciphertext) DecryptError!Fe {
+pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
+    // `sk_in` is this function's one unavoidable by-value copy (the public
+    // signature stays call-compatible — see the module doc's Fe construction
+    // contract note; no consumer needs to change). Shadowed as `var` so it
+    // can be zeroed on every exit path: F2 (wave-3 audit) measured 57,379 B
+    // of secret-key residue (a full λ limb image, 2× λ big-endian, 2× μ, 2×
+    // dp, 2× dq, and 128 B of CRT block) still present on the stack after a
+    // `decrypt` + `SecretKey.deinit()` pair — `deinit()` only reaches the
+    // CALLER's struct, never a callee's copy of it.
+    var sk = sk_in;
+    defer {
+        std.crypto.secureZero(u8, std.mem.asBytes(&sk.lambda));
+        std.crypto.secureZero(u8, std.mem.asBytes(&sk.mu));
+        if (sk.crt) |*crt| std.crypto.secureZero(u8, std.mem.asBytes(crt));
+    }
+
     // c must be a unit mod n² for L to be defined; c = 0 never is.
     if (c.c.isZero()) return error.InvalidCiphertext;
 
     // x = c^lambda mod n² — constant-time. CRT path (~4×) when the key carries
     // its factors, else the single-modulus montint fallback.
     const x = if (sk.crt) |*crt|
-        decryptCrtX(sk, crt, c.c)
+        decryptCrtX(sk.n_sq, crt, c.c)
     else
-        (decryptNonCrtX(sk, c.c) orelse return error.InvalidCiphertext);
+        (decryptNonCrtX(&sk, c.c) orelse return error.InvalidCiphertext);
     if (x.isZero()) return error.InvalidCiphertext; // gcd(c, n) != 1
 
     // L(x) = (x - 1)/n via big.int exact division. Exact for well-formed
@@ -1297,12 +1371,26 @@ pub fn addPlaintext(pk: PublicKey, c: Ciphertext, m: Fe) HomomorphicError!Cipher
 /// must be canonical mod `pk.n_sq` (Fe construction contract). `k = 0`
 /// returns the deterministic, unblinded encryption of 0 (`c^0 = 1`, and
 /// `L(1^lambda) = 0` decrypts to 0) — exactly what `phe`'s `raw_mul` (python
-/// `pow(c, 0, n²) = 1`) produces; `ff`'s `pow` would reject the zero
-/// exponent, so it is special-cased. The exponentiation is the constant-time
-/// `pow`: `k` may be a secret scalar (e.g. in a future MtA context).
+/// `pow(c, 0, n²) = 1`) produces; montint's ladder has no zero-exponent
+/// restriction, but the special case is kept anyway — one less thing to
+/// prove about the shared `montModexpSecret` path.
+///
+/// Routed through montint (same `pk.n_sq_mont` params `encrypt`'s public
+/// `r^n` term precomputes), matching this module's other modexp hot paths —
+/// `ff.Modulus.pow` always serialized/walked the exponent at the fixed
+/// `max_bits` width regardless of `k`'s actual magnitude, measured
+/// independent of scalar width and ~16.5× slower than `decrypt` (paillier
+/// F5, wave-3 audit; numbers in CHANGELOG.md). `k` may be a secret scalar
+/// (e.g. in a future MtA context), so this keeps `decrypt`'s posture:
+/// constant-time in the exponent VALUE (`montModexpSecret`'s full-width
+/// ladder, no early exit on leading zero bits) — not the variable-time-in-
+/// k's-actual-bit-width trim the audit flagged as a separate, undecided
+/// optimization.
 pub fn mulPlaintext(pk: PublicKey, c: Ciphertext, k: Fe) HomomorphicError!Ciphertext {
     if (k.isZero()) return .{ .c = pk.n_sq.one() };
-    return .{ .c = try pk.n_sq.pow(c.c, k) };
+    var k_be: [modulus_sq_bytes]u8 = undefined;
+    k.toBytes(&k_be, .big) catch unreachable; // canonical mod n_sq, full-width buffer
+    return .{ .c = montModexpSecret(&pk.n_sq_mont, pk.n_sq, c.c, &k_be) };
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -1591,6 +1679,22 @@ test "decrypt rejects invalid ciphertexts (zero and non-units mod n)" {
     try testing.expectError(error.InvalidCiphertext, decrypt(sk, p_c));
 }
 
+test "encrypt rejects r = 0 (paillier F11)" {
+    // r = 0 can only ever produce a ciphertext decrypt itself then rejects
+    // (gcd(0, n) = n != 1) — encrypt now catches it up front instead of
+    // silently manufacturing a dead ciphertext.
+    const kp = try fromPrimes(&kat_p, &kat_q);
+    const m_fe = try Fe.fromPrimitive(u32, kp.public.n_sq, 7);
+    const zero_r = try Fe.fromPrimitive(u32, kp.public.n_sq, 0);
+    try testing.expectError(error.InvalidRandomness, encrypt(kp.public, m_fe, zero_r));
+
+    // Positive control: r = 1 is still ACCEPTED (a real, documented
+    // weakness — F11's other half — not something this fix touches).
+    const one_r = try Fe.fromPrimitive(u32, kp.public.n_sq, 1);
+    const c = try encrypt(kp.public, m_fe, one_r);
+    try testing.expectEqual(@as(u32, 7), try (try decrypt(kp.secret, c)).toPrimitive(u32));
+}
+
 test "decrypt via non-CRT fallback (fromBytes key, no factors) matches phe vectors" {
     // A key loaded from n/λ/µ alone carries no factors, so `decrypt` takes the
     // single-modulus `c^λ mod n²` montint path instead of CRT. The same phe-
@@ -1700,6 +1804,41 @@ test "generate: 512-bit keygen round-trips encrypt/decrypt + homomorphic add" {
     // E(m) + E(m) decrypts to 2m (fits well below a 512-bit n).
     const two_m = try decrypt(kp.secret, addCiphertexts(kp.public, c, c));
     try testing.expectEqual(@as(u128, 2 * @as(u128, 0xdeadbeef12345678)), try two_m.toPrimitive(u128));
+}
+
+test "sampleNonzeroLtN draws land strictly below n, never n_sq (paillier F1)" {
+    // Regression for the "encryptRandom doesn't sample r uniformly from
+    // [1, n)" defect: the old rejection compared against n_sq (which an
+    // n_len-byte draw can never reach), so roughly the top half of the
+    // masked range silently folded onto its residue instead of being
+    // redrawn (measured 28.90% of draws >= n over 50,000 samples, wave-3
+    // audit). `sampleNonzeroLtN` is private; called directly since this
+    // test lives in the same file.
+    var prng = std.Random.DefaultPrng.init(0xF1F1F1F1);
+    const random = prng.random();
+    const kp = try generate(random, 512);
+    const pk = kp.public;
+    const n_len = pk.nByteLen();
+    var n_be: [modulus_bytes]u8 = undefined;
+    try pk.nToBytes(n_be[0..n_len]);
+
+    var i: usize = 0;
+    var zero_count: usize = 0;
+    while (i < 4000) : (i += 1) {
+        const r = sampleNonzeroLtN(pk, random);
+        try testing.expect(!r.isZero());
+        // `r` is canonical mod n_sq (per the Fe construction contract), so
+        // it serializes at n_sq's full width — write into a full-width
+        // buffer and compare only the low n_len bytes against n (a smaller
+        // value is zero-padded on the left in big-endian encoding).
+        var r_be: [modulus_sq_bytes]u8 = undefined;
+        r.toBytes(&r_be, .big) catch unreachable; // r < n_sq by construction
+        const r_tail = r_be[modulus_sq_bytes - n_len ..];
+        // The fix's whole point: every draw must be strictly < n.
+        try testing.expect(std.mem.order(u8, r_tail, n_be[0..n_len]) == .lt);
+        if (r.isZero()) zero_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), zero_count);
 }
 
 test "generate: full 2048-bit keygen round-trips (slow; the size this module is designed for)" {
@@ -2142,4 +2281,119 @@ test "corpus: the Ciphertext seeds reach the parser, and the counts are pinned" 
     try testing.expectEqual(corpus.ciphertext_seeds().len - 1, nonempty);
     try testing.expectEqual(@as(usize, 5), accepted);
     try testing.expectEqual(@as(usize, 3), nonzero);
+}
+
+// ── dead-stack secret residue (paillier F2, wave-3 audit) ──────────────────
+//
+// `probe_stack.zig` in the audit's repro directory (poisoned-stack scan,
+// ReleaseFast, 1024-bit key) measured 10 full-value copies of secret-key
+// material still readable on the stack after one `decrypt` + `deinit()`
+// pair: 1× λ limb image, 2× λ big-endian, 2× μ, 2× dp, 2× dq, 1× 128 B CRT
+// block. Traced to `decryptNonCrtX`/`decryptCrtX` taking the whole
+// `SecretKey`/`CrtParams` BY VALUE (each call left its own copy in a callee
+// frame `deinit()` can never reach) and `montPowSecret` not clearing the
+// secret exponent's limb form. Fixed by switching those two helpers to
+// pointer parameters and zeroing every remaining secret copy this module's
+// own code controls (see `decrypt`, `decryptNonCrtX`, `montPowSecret`).
+//
+// This regression test is that same probe, kept in-tree. It confirms 0 for
+// every pattern the fix targets — EXCEPT `mu`, where exactly 1 full copy
+// remains: traced (by reverting the fix locally and re-measuring, not by
+// inspection) to `decrypt`'s last line, `sk.n.mul(l_fe, sk.mu)` — passing a
+// secret `Fe` (512 B, too large for register passing) by value into
+// `std.crypto.ff.Modulus.mul`. That parameter-passing copy is made inside a
+// standard-library call this module does not control and has no address to
+// zero; giving `mul` a local copy of `mu` to pass instead (tried, measured)
+// made no difference; the copy lives on `mul`'s side of the call, not this
+// function's. Left OPEN in `A1/paillier.md` F2's disposition rather than
+// closed — the test pins the current count (1) so a future regression
+// (finding MORE than the known residual) still fails loudly.
+const stack_probe_region = 1 << 20; // 1 MiB
+
+noinline fn stackProbePaint(pat: u8) void {
+    var buf: [stack_probe_region]u8 = undefined;
+    @memset(&buf, pat);
+    asm volatile (""
+        :
+        : [p] "r" (&buf),
+        : .{ .memory = true });
+}
+
+noinline fn stackProbeSnapshot(out: *[stack_probe_region]u8) void {
+    var buf: [stack_probe_region]u8 = undefined;
+    asm volatile (""
+        :
+        : [p] "r" (&buf),
+        : .{ .memory = true });
+    @memcpy(out, &buf);
+}
+
+fn stackProbeCount(hay: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or needle.len > hay.len) return 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.mem.eql(u8, hay[i..][0..needle.len], needle)) n += 1;
+    }
+    return n;
+}
+
+test "decrypt: no secret full-value copy survives on the dead stack, except the known std.crypto.ff mu residual (paillier F2, ReleaseFast only)" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest; // undefined poisoning (ReleaseSafe/Debug) defeats this probe
+    var prng = std.Random.DefaultPrng.init(0x57ac4);
+    const random = prng.random();
+    var kp = try generate(random, 1024);
+    const pk = kp.public;
+
+    // Extract every search pattern BEFORE painting, so the extraction's own
+    // callee frames cannot pollute the window (measured mistake, see below).
+    var lam_be: [modulus_sq_bytes]u8 = undefined;
+    var mu_be: [modulus_bytes]u8 = undefined;
+    try kp.secret.lambdaToBytes(&lam_be);
+    try kp.secret.muToBytes(&mu_be);
+    var lam_raw: [@sizeOf(Fe)]u8 = undefined;
+    var mu_raw: [@sizeOf(Fe)]u8 = undefined;
+    @memcpy(&lam_raw, std.mem.asBytes(&kp.secret.lambda));
+    @memcpy(&mu_raw, std.mem.asBytes(&kp.secret.mu));
+    var dp: [modulus_bytes]u8 = undefined;
+    var dq: [modulus_bytes]u8 = undefined;
+    @memcpy(&dp, &kp.secret.crt.?.dp);
+    @memcpy(&dq, &kp.secret.crt.?.dq);
+    var crt_raw: [128]u8 = undefined;
+    @memcpy(&crt_raw, std.mem.asBytes(&kp.secret.crt.?)[0..128]);
+
+    var pt: [64]u8 = undefined;
+    for (&pt, 0..) |*b, i| b.* = @truncate(0xA0 +% i *% 7);
+    const m = try Fe.fromBytes(pk.n_sq, &pt, .big);
+    const c = try encryptRandom(pk, m, random);
+
+    const Pattern = struct { name: []const u8, bytes: []const u8, allow: usize };
+    // `Fe` holds little-endian u64 limbs, so both the limb image and the
+    // big-endian serialization are searched (a big-endian-only search once
+    // reported a clean 0 for everything — the probe was blind, not the leak
+    // gone).
+    const pats = [_]Pattern{
+        .{ .name = "lambda (limb image)", .bytes = &lam_raw, .allow = 0 },
+        .{ .name = "lambda (big-endian)", .bytes = std.mem.trimStart(u8, &lam_be, "\x00"), .allow = 0 },
+        .{ .name = "mu (limb image)", .bytes = &mu_raw, .allow = 1 }, // known std.crypto.ff residual, see comment above
+        .{ .name = "mu (big-endian)", .bytes = std.mem.trimStart(u8, &mu_be, "\x00"), .allow = 0 },
+        .{ .name = "dp (CRT exponent)", .bytes = std.mem.trimStart(u8, &dp, "\x00"), .allow = 0 },
+        .{ .name = "dq (CRT exponent)", .bytes = std.mem.trimStart(u8, &dq, "\x00"), .allow = 0 },
+        .{ .name = "crt block (first 128 B)", .bytes = &crt_raw, .allow = 0 },
+    };
+
+    var image = try testing.allocator.alloc(u8, stack_probe_region);
+    defer testing.allocator.free(image);
+
+    stackProbePaint(0x5A);
+    const back = try decrypt(kp.secret, c);
+    std.mem.doNotOptimizeAway(&back);
+    kp.secret.deinit();
+    stackProbeSnapshot(image[0..stack_probe_region]);
+
+    for (pats) |p| {
+        const full_hits = stackProbeCount(image, p.bytes);
+        errdefer std.debug.print("paillier F2 probe: {s} — expected <= {d} full-value copies, found {d}\n", .{ p.name, p.allow, full_hits });
+        try testing.expect(full_hits <= p.allow);
+    }
 }
