@@ -660,7 +660,15 @@ pub const Client = struct {
     /// Wrap the request PDU in the configured framing, run one transport
     /// round-trip, unwrap + validate the reply ADU, return the reply PDU
     /// (a slice into `reply_buf`).
-    fn exchangePdu(c: *Client, unit: u8, request_pdu: []const u8, reply_buf: *[tcp.max_adu_len]u8) Error![]const u8 {
+    ///
+    /// Public (audit E2) so a master that builds one of the three
+    /// server-only PDUs by hand (see `FunctionCode`'s doc comment) can
+    /// actually do what that comment has always promised: reuse this
+    /// instead of re-implementing framing, the transaction-id check, and
+    /// the unit check next to the library. Before this it was private and
+    /// the module's own example had to duplicate it (`rawExchange`,
+    /// `example/main.zig`) to get the round-trip right.
+    pub fn exchangePdu(c: *Client, unit: u8, request_pdu: []const u8, reply_buf: *[tcp.max_adu_len]u8) Error![]const u8 {
         var adu_buf: [tcp.max_adu_len]u8 = undefined;
         switch (c.framing) {
             .tcp => {
@@ -693,6 +701,27 @@ pub const TcpTransport = struct {
     io: std.Io,
     stream: std.Io.net.Stream,
 
+    /// Bound one `exchange` (write request + read reply) by this many
+    /// milliseconds; `null` (the default) is today's behaviour, unbounded --
+    /// audit E1: nowhere in this transport is there a read deadline, so a
+    /// peer that legitimately stays silent (`Server.handleAdu` returns
+    /// `null` for a foreign unit, a broadcast, bad CRC, or listen-only)
+    /// blocks `exchangeFn` forever, and `TransportError.Timeout` is a value
+    /// this transport can never produce. Default stays `null` so an
+    /// existing caller that never sets the field keeps its exact behaviour
+    /// -- fleetsim, the module's one in-repo consumer, drives `Client`
+    /// through its own mock/shim transports and never touches this field.
+    ///
+    /// std 0.16.0 has no per-read deadline on a `net.Stream` (no
+    /// `SO_RCVTIMEO` seam) -- the same gap `dns.Resolver`, `http.Client` and
+    /// `whois.TcpTransport` hit, and all three bound a stream exchange the
+    /// same way: run it on its own concurrent task and cancel that task at
+    /// the deadline (`Io.Threaded.Future.cancel` signals the task's thread
+    /// until the blocked syscall returns `EINTR`). `runBounded` below is
+    /// that same construction, copied rather than shared because it is
+    /// module-private in all three.
+    timeout_ms: ?u32 = null,
+
     /// Standard Modbus TCP port.
     pub const default_port = 502;
 
@@ -711,7 +740,20 @@ pub const TcpTransport = struct {
 
     fn exchangeFn(ctx: *anyopaque, request: []const u8, reply_buf: []u8) TransportError!usize {
         const t: *TcpTransport = @ptrCast(@alignCast(ctx));
+        const ms = t.timeout_ms orelse return exchangeInner(t, request, reply_buf);
+        const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } })
+            .toTimestamp(t.io);
+        return runBounded(t.io, deadline, exchangeInner, .{ t, request, reply_buf }) catch |e| switch (e) {
+            error.Timeout => error.Timeout,
+            error.Canceled => error.Canceled,
+            // No unit of concurrency to run the bounded task on: conservatively
+            // a transport failure, never a silent unbounded run of the exchange.
+            error.ConcurrencyUnavailable => error.TransportFailed,
+            else => |e2| e2,
+        };
+    }
 
+    fn exchangeInner(t: *TcpTransport, request: []const u8, reply_buf: []u8) TransportError!usize {
         var wbuf: [tcp.max_adu_len]u8 = undefined;
         var sw = t.stream.writer(t.io, &wbuf);
         sw.interface.writeAll(request) catch return writeFailure(&sw);
@@ -735,6 +777,72 @@ pub const TcpTransport = struct {
             error.ReadFailed => return readFailure(&sr),
         };
         return total;
+    }
+
+    /// Run `func(args)` on its own concurrent task and give it until
+    /// `deadline` (null = no bound). Same construction as `dns.Resolver`'s,
+    /// `http.Client`'s and `whois.TcpTransport`'s `runBounded` (all
+    /// module-private, hence a fourth copy here) -- see `timeout_ms`'s doc
+    /// comment for why a stream exchange can't be bounded any other way in
+    /// std 0.16.0.
+    ///
+    /// Contract: finished in time → `func`'s own result; deadline hit → the
+    /// task is canceled and JOINED (its frame borrows this stack), then
+    /// `error.Timeout` -- unless it completed inside the cancelation
+    /// window, in which case its value is returned (a reply the task
+    /// already read must not be dropped); this task canceled while waiting
+    /// → the same unwind, then `error.Canceled`; no unit of concurrency →
+    /// this file's own `error.ConcurrencyUnavailable`, never a silent
+    /// unbounded run.
+    fn runBounded(
+        io: std.Io,
+        deadline: ?std.Io.Clock.Timestamp,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) (TransportError || error{ConcurrencyUnavailable})!usize {
+        const Ctx = struct {
+            io: std.Io,
+            args: std.meta.ArgsTuple(@TypeOf(func)),
+            result: TransportError!usize = undefined,
+            /// 0 while the task runs, 1 once `result` is published; doubles
+            /// as the futex word the waiter parks on.
+            state: std.atomic.Value(u32) = .init(0),
+
+            fn run(c: *@This()) void {
+                c.result = @call(.auto, func, c.args);
+                c.state.store(1, .release);
+                c.io.futexWake(u32, &c.state.raw, 1);
+            }
+        };
+
+        var ctx: Ctx = .{ .io = io, .args = args };
+        var future = io.concurrent(Ctx.run, .{&ctx}) catch return error.ConcurrencyUnavailable;
+
+        var canceled = false;
+        var expired = false;
+        while (ctx.state.load(.acquire) == 0) {
+            const timeout: std.Io.Timeout = if (deadline) |d| t: {
+                if (d.durationFromNow(io).raw.nanoseconds <= 0) {
+                    expired = true;
+                    break;
+                }
+                break :t .{ .deadline = d };
+            } else .none;
+            // Spurious wakeups are allowed here; the loop re-reads `state`.
+            io.futexWaitTimeout(u32, &ctx.state.raw, 0, timeout) catch {
+                canceled = true;
+                break;
+            };
+        }
+        if (!expired and !canceled) {
+            future.await(io);
+            return ctx.result;
+        }
+        future.cancel(io);
+        // `cancel` joined the task, so `result` is written either way. A
+        // success that landed in the cancelation window is still a success.
+        if (ctx.result) |value| return value else |_| {}
+        return if (expired) error.Timeout else error.Canceled;
     }
 
     /// Distinguish a canceled wait from a genuine read failure. `Io.Reader`'s
@@ -799,6 +907,103 @@ test "a canceled exchange read surfaces Canceled, not TransportFailed" {
     var fut = try io.concurrent(exchangeOnce, .{ &t, &.{ 0x00, 0x01 }, &reply_buf });
     // Long enough that the read is certainly parked in the kernel.
     try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+// -- test (read timeout, audit E1) -------------------------------------------
+//
+// A peer that accepts, drains the request, and never replies -- exactly the
+// legitimate outcome `Server.handleAdu` produces for a foreign unit id, a
+// broadcast, a bad CRC, or listen-only (see that function's `null` returns).
+// Run on its own OS thread, like `whois.TcpTransport`'s fixtures, so it does
+// not compete with `runBounded`'s own concurrent task for the same `Io`.
+
+const SilentPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+
+    fn run(p: *SilentPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [16]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        _ = sr.interface.readSliceShort(rbuf[0..2]) catch {}; // best-effort: drain the request
+        // No write: the peer stays silent for good, same as the modbus
+        // outcomes `Server.handleAdu` documents as legitimate "no reply".
+        // Hold the connection open well past the test's 80 ms bound instead
+        // of closing right away -- otherwise the client's read fails on EOF
+        // before the deadline, which would prove nothing about the timeout.
+        p.io.sleep(.fromMilliseconds(500), .awake) catch return;
+    }
+};
+
+test "TcpTransport: timeout_ms bounds a silent peer (audit E1)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Port 0: an ephemeral port cannot collide with a parallel test run.
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer srv.deinit(io);
+
+    var peer: SilentPeer = .{ .io = io, .listener = &srv };
+    const peer_thread = try std.Thread.spawn(.{}, SilentPeer.run, .{&peer});
+    defer peer_thread.join();
+
+    var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer t.close();
+    t.timeout_ms = 80;
+
+    var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, t.transport().exchange(&.{ 0x00, 0x01 }, &reply_buf));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    try testing.expect(elapsed_ns >= 50 * std.time.ns_per_ms); // didn't fire before the bound
+    try testing.expect(elapsed_ns < 5000 * std.time.ns_per_ms); // and didn't hang
+}
+
+test "TcpTransport: timeout_ms = null (default) preserves today's unbounded behaviour" {
+    // The default-off contract itself, not just the bounded path -- same
+    // peer/shape as "a canceled exchange read surfaces Canceled" above, now
+    // with `timeout_ms` explicitly left at its default next to it: a silent
+    // peer is stopped only by the CALLER's own cancel, never by a deadline
+    // this transport invents on its own.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var srv = addr.listen(io, .{ .reuse_address = true }) catch |err| {
+        std.debug.print("loopback listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer srv.deinit(io);
+
+    var accept_fut = try io.concurrent(acceptOne, .{ &srv, io });
+    var t = TcpTransport.connect(io, srv.socket.address) catch |err| {
+        if (accept_fut.cancel(io)) |s| s.close(io) else |_| {}
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer t.close();
+    try testing.expectEqual(@as(?u32, null), t.timeout_ms); // left at default
+
+    var peer = try accept_fut.await(io);
+    defer peer.close(io);
+
+    var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    var fut = try io.concurrent(exchangeOnce, .{ &t, &.{ 0x00, 0x01 }, &reply_buf });
+    // Well past `timeout_ms = 80` from the sibling test above -- if a
+    // default crept in, this would already have returned `error.Timeout`
+    // instead of still being parked when the cancel arrives.
+    try io.sleep(.fromMilliseconds(300), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
 }
 

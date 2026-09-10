@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign, E1/E2 (examples backlog).** `TcpTransport` had no
+  read deadline anywhere: `exchangeFn` ran `readSliceAll` straight through
+  `std.Io.net.Stream.Reader` with nothing bounding it, so a peer that legitimately stays
+  silent — `Server.handleAdu` returns `null` for a foreign unit, a broadcast, a bad CRC,
+  or listen-only — parked the caller forever, and `TransportError.Timeout` was a value
+  this transport could never produce. Measured against a live peer before the fix: the
+  same client/server pair took 0.108 s when addressed correctly and hit a hard
+  `timeout -s KILL 30` (exit 124, 30.038 s) when addressed to a silent unit. `TcpTransport`
+  now has an additive `timeout_ms: ?u32 = null` field (default preserves today's unbounded
+  behaviour byte for byte — no existing caller's behaviour changes); when set, one
+  `exchange` (write + read) is bounded by running it on its own concurrent task and
+  canceling that task at the deadline, the same `runBounded` construction `dns.Resolver`,
+  `http.Client` and `whois.TcpTransport` already use for the identical std 0.16.0 gap (no
+  per-read deadline on a `net.Stream`). New regression test
+  `TcpTransport: timeout_ms bounds a silent peer (audit E1)`: a silent peer plus
+  `timeout_ms = 80` returns `error.Timeout` in 50–5000 ms instead of hanging; a sibling
+  test pins the `null` default to the pre-existing unbounded behaviour. Also (E2):
+  `Client.exchangePdu` was private while `FunctionCode`'s doc comment told callers who
+  need one of the three server-only PDUs to "build it by hand and use `Client`'s framing"
+  — a promise the code could not keep (the module's own example had to duplicate the
+  twelve lines as `rawExchange` to get the transaction-id and unit checks right). Made
+  `pub` (P2: code now matches the documented promise); no signature changed.
+
 - **2026-09-07** — Fuzz reach: neither fuzz target ever handled a frame. `fuzzDecodeAdu`
   opened `smith.bytes(&buf)` and then drew the length with `smith.valueRangeAtMost`;
   `bytes` consumes `@min(buf.len, in.len)` octets and a ranged draw reads EIGHT more as a
