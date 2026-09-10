@@ -148,6 +148,43 @@ outside the root.
 - **No external resource access of any kind** — by construction, not by config.
 - **Canonicalization / signing themselves** — that is the `xmldsig` layer; this
   module only guarantees the infoset it needs.
+- **`isNameStartByte` accepts the full non-ASCII byte range (`>= 0x80`)
+  leniently, not the XML `NameStartChar` production.** Four measured
+  divergences from libxml2/expat, all in the ACCEPT direction (this parser
+  takes documents both reference implementations reject): a bare NameChar
+  used to start a name (U+00B7), a combining character starting a name
+  (U+0300), and two non-Name characters mid-name (U+00D7). A document that
+  round-trips through this parser and a stricter one can therefore disagree
+  on well-formedness (audit `A1/xml.md` F4, open).
+- **Line-ending normalization (XML §2.11, `\r\n`/`\r` → `\n`) applies to text
+  and attribute values only**, not to comment or PI content, even though
+  those also fall under the Char production §2.11 governs. A document
+  containing a raw CR inside a comment or PI canonicalizes to a different
+  byte sequence than libxml2 produces for the same input (audit `A1/xml.md`
+  F3, open — relevant to `xmldsig`'s `#WithComments` C14N mode, which a
+  document itself selects).
+- **Byte sequences inside a Name are not validated as UTF-8.**
+  `isNameStartByte`/`isNameByte` classify by raw byte value; a name can
+  therefore contain a byte sequence that is not valid UTF-8 at all (as
+  opposed to the leniency above, which is about valid-but-out-of-grammar
+  Unicode). Text and attribute VALUES are UTF-8-validated; names are not
+  (audit `A1/xml.md` F9 sub-finding "M16", open).
+- **A PI target reserved as `xml` (any ASCII case) is only checked as such
+  by `parsePi`, not consistently by `parseXmlDecl`.** `parseXmlDecl`
+  requires whitespace immediately after an exact-case `<?xml` at byte 0 of
+  the document or returns `MalformedPI`; the same construct anywhere else
+  (including `<?xml-stylesheet ...?>`, a W3C-recommended PI) reaches
+  `parsePi` instead, which only reserves the exact target `xml` — so
+  `<?xml-stylesheet href="a.xsl"?><a/>` is rejected at byte 0 and accepted
+  one byte later (audit `A1/xml.md` F7, open, LOW — fails closed).
+- **`DoctypePolicy.ignore`'s "skip the DOCTYPE without parsing it" does not
+  track quote state inside the external `SYSTEM`/`PUBLIC` literals** (only
+  inside an internal subset's `[ ... ]`), so a literal `>` inside a quoted
+  external identifier ends the skip early and the rest of the declaration
+  is parsed as document content, typically failing closed with
+  `TrailingContent` rather than being skipped as promised (audit
+  `A1/xml.md` F10, open, LOW — fails closed, and `.ignore` is not the
+  default policy).
 
 ## Validation
 
