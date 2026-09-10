@@ -40,7 +40,7 @@ to genetlink's private copy vs. `netlink`'s shared one:
 | 6 | `send` (INTR retry, `ENOBUFS`/`ENOMEM` → `SystemResources`, `EACCES`/`EPERM` → `AccessDenied`, else `SendFailed`) | Identical; shared. |
 | 7 | `nextSeq` (`+%= 1`, skip 0) | Identical; shared. |
 | 8 | `resolveFamily`'s reply loop ignored `NLMSG_DONE` and `NLMSG_OVERRUN` (both fell into its `else => {}` arm) — either would have made it block forever on the next `recvfrom` | **Stricter:** the loop is now `codec.classifyDumpMessage`, so `NLMSG_DONE` terminates like a bare ACK and `NLMSG_OVERRUN` is an error (`SystemResources`, matching the narrowed face). |
-| 9 | `NLM_F_DUMP_INTR` was ignored (the flag was never inspected) | **Stricter:** a flagged reply is dropped (`.restart` is treated as `.skip`) rather than trusted. It cannot occur — a `CTRL_CMD_GETFAMILY` *by name* is the kernel's `doit` path, not a dump — but an interrupted reply is not something to parse. |
+| 9 | `NLM_F_DUMP_INTR` was ignored (the flag was never inspected) | **Stricter:** a flagged reply is dropped (`.restart` is treated as `.skip`) rather than trusted. It cannot occur — a `CTRL_CMD_GETFAMILY` *by name* is the kernel's `doit` path, not a dump — but an interrupted reply is not something to parse. ⚠ **Correction, 2026-09-10 (audit finding F1):** "cannot occur" turned out to be a claim about *this* kernel, not a bound the loop enforced — nothing capped how many `.skip`/`.restart` messages it would wait through, so a peer that never reaches `NLMSG_DONE` (missing terminator, an endless `NLM_F_DUMP_INTR` stream, or a flood of foreign-`seq` datagrams) spun `resolveFamily`/`resolveMcastGroup` forever. Fixed with a `max_reply_messages` budget (65536, same value and rationale as `netlink`'s `max_await_messages`/`max_dump_messages`) — `error.TooManyMessages`, additive to `ResolveError`. The budget does not depend on row 9's claim holding. |
 | 10 | `NLMSG_NOOP` was ignored by falling through `else`; the shared triage skips it explicitly | Same outcome; shared. |
 | 11 | Neither copy had `handle()` / `setRecvTimeout()` | **Added** (they come free with the transport). A bounded receive on a genl event socket previously required reaching for the raw `fd`. |
 | 12 | A short `NLMSG_ERROR` payload: genetlink's `m.errorCode() catch → MalformedReply`, the triage's `.malformed` | Same outcome; shared. |
@@ -55,6 +55,79 @@ face is what a *command* socket wants (a resolve that hits `ENOBUFS` has simply 
 strict face is what an *event* socket wants, and both consumers run separate command and event
 sockets. `resolveFamily`'s and `resolveMcastGroup`'s own error sets are unchanged/additive: nothing
 in `ResolveError` moved, and `McastGroupError = ResolveError || error{GroupNotFound}`.
+
+## Reply identity verification (audit finding F2, closed 2026-09-10)
+A `CTRL_CMD_GETFAMILY` reply's data record used to be accepted on the strength of matching
+`(portid, seq)` alone — nothing checked that the record actually *was* an answer about the
+requested family. Live against a real kernel, `resolveFamily("nlctrl\x00zz")` resolved (the kernel
+reads `CTRL_ATTR_FAMILY_NAME` as a C string and stops at the embedded NUL; this module sent the
+raw Zig slice and never looked at what came back), and three more identity axes were provably
+unchecked (a reply named for a different family, a `CTRL_CMD_DELFAMILY` payload, a family id outside
+the kernel's own dynamic range). The four consumers had each independently noticed this gap and
+worked around it — `ethtool/src/goldens.zig:1387-1389` and `devlink/src/goldens.zig:699-700` both
+hand-assert `family_name == requested` and `family_id > GENL_ID_CTRL` after calling the resolver —
+which is the invariant this module now enforces itself instead of leaving to callers that remember to.
+
+`ctrlGetFamilyOver`'s `.family_id` branch now requires all three to hold before accepting a record:
+`CTRL_CMD_NEWFAMILY` (not `DELFAMILY` or any other control command), `CTRL_ATTR_FAMILY_NAME` present
+and byte-equal to the requested name (this closes the NUL-truncation confusion too: a name with an
+embedded NUL can never equal what the kernel echoes back, which it reads only up to its own NUL),
+and `CTRL_ATTR_FAMILY_ID` inside `[GENL_ID_CTRL, GENL_MAX_ID]` — the kernel's own dynamic-id range
+(`GENL_MIN_ID`/`GENL_MAX_ID` in `linux/genetlink.h`; `GENL_MIN_ID == GENL_ID_CTRL` by the kernel's own
+`#define`). Any other shape is `error.MalformedReply`, the vocabulary already used for a hostile or
+malformed datagram — no new error, no signature change. `findMcastGroupId`'s group-name path gained
+the matching hardening for its own two axes (F8): a matching group entry whose id is 0 is now
+`error.BadLength` (every id this module has observed from a real kernel is dynamically assigned and
+nonzero), and an empty `want` never matches an empty group name.
+
+## Reply loop message budget (audit finding F1, closed 2026-09-10)
+See row 9's correction above. `ctrlGetFamilyOver` now bounds its receive loop at
+`max_reply_messages` (65536) datagrams, returning `error.TooManyMessages` — additive to
+`ResolveError` — instead of spinning forever. Same constant value and the same rationale as
+`netlink`'s `max_await_messages`/`max_dump_messages`.
+
+## `lastErrorMessage` freshness (audit finding F3, closed 2026-09-10)
+Its own doc comment promises the extended-ACK reason is "valid until the next request on this
+socket", but `ctrlGetFamily` never cleared it — a caller that inspected `lastErrorMessage()` after a
+*successful* request, or after a *different* failure than the one that set it, could read stale text
+describing an earlier, unrelated error. `ctrlGetFamily` now clears `ext_ack_len` unconditionally
+before the request is even built, matching how `netlink.Socket.awaitAckStrict` clears its own
+`ext_ack_len`/`last_errno` before each bounded-engine call.
+
+## Sequence-number spend on a client-rejected request (audit finding F7, closed 2026-09-10)
+`ctrlGetFamily` called `t.nextSeq()` before `buildGetFamilyRequest`'s own `GENL_NAMSIZ` guard could
+run, so a name too long to ever be sent still advanced the socket's sequence counter — visible in a
+`strace` of the socket as a gap (`seq` 1, 3, with 2 missing). The `GENL_NAMSIZ` check now runs first,
+in `ctrlGetFamily` itself, before a transport view is even taken; `buildGetFamilyRequest`'s own check
+stays as defense in depth.
+
+## `resolveMcastGroups` — batch group resolution (audit finding F6, closed 2026-09-10)
+`resolveMcastGroup` costs one full `CTRL_CMD_GETFAMILY` round trip *per group name*, even though a
+single reply already carries every group the family publishes and `findMcastGroupId` is a pure walk
+over bytes already in hand. Measured against a real kernel: 1 name = 1 request + 4 receives (5
+syscalls); 6 names = 6 requests + 24 receives (30 syscalls) — `nl80211/src/client.zig:779` calls
+`resolveMcastGroup` once per group in a loop, and `nl80211` publishes 6+ groups (`config`, `scan`,
+`regulatory`, `mlme`, `vendor`, `nan`). `Socket.resolveMcastGroups(family, names, out)` resolves all of
+`names` over one round trip: `ctrlGetFamilyOver` gained a third `FamilyQuery` variant (`many_groups`)
+that calls `findMcastGroupId` once per name against each reply record instead of once total,
+leaving `out[i]` `null` for a name the family does not publish rather than failing the batch.
+Purely additive — `resolveFamily`/`resolveMcastGroup`'s signatures are unchanged. `nl80211` and the
+other three consumers still call the single-name resolver in a loop; adopting the batch entry point
+is the same later, purely-mechanical wave already on the backlog for `findMcastGroupId` itself (see
+below) — this only makes that adoption possible without a protocol change.
+
+## UAPI constant coverage (audit finding F9, closed 2026-09-10)
+`scripts/check-uapi-consts.py` diffed `ethtool`/`nl80211`/`devlink`/`conntrack`/`netlink` against
+this host's kernel headers but not `genetlink` itself — the only automatic check of `GENL_ID_CTRL`,
+`CTRL_CMD_GETFAMILY`, `CTRL_ATTR_FAMILY_ID`/`NAME`, `CTRL_ATTR_MCAST_GROUPS` and
+`CTRL_ATTR_MCAST_GRP_*` ran through `nl80211`'s own private copy of them, which the backlog below
+plans to delete once `nl80211`/`ethtool` adopt the shared resolver — at which point the check would
+have silently stopped covering these constants entirely. `genetlink` is now its own entry in
+`MODULES`, `zig_files: ["modules/genetlink/src/root.zig"]` (no separate `uapi.zig` — this module's
+constants live next to the resolver). `9 matched, 0 MISMATCH, 2 unresolved` (`header_len`, a
+repo-local sizing constant, and `GENL_ID_CTRL`, whose kernel spelling `NLMSG_MIN_TYPE` lives in a
+different header than the one it's `#define`d relative to, which this script's single-header
+evaluator does not cross-reference — both within the declared `unresolved_budget: 2`).
 
 ## Multicast group resolution — promoted, not deferred
 Previously "out of scope (deliberate extension point)". `nl80211` documented that it implemented
@@ -118,6 +191,21 @@ own `notify` group resolves to a nonzero dynamic id while an unknown group on a 
 exercised end-to-end (`handle()` agrees with `fd`, a nonzero `portid`, a `setRecvTimeout`-bounded
 receive on an idle socket returning `WouldBlock` from the strict path and `RecvFailed` from the
 narrow one, and `seq` still advancing afterwards). Run: `zig build test-genetlink`.
+
+**Scripted-transport tests over the reply loop itself (added 2026-09-10, audit findings F1/F2/F4).**
+Until this wave, `ctrlGetFamily`'s receive loop made real syscalls through `netlink.Socket`, so
+nothing in `zig build test-genetlink` could drive a mutation of it deterministically — the audit
+measured 10 of 23 mutations to the loop passing 16/16 green, including deleting the `(portid, seq)`
+match outright. `ctrlGetFamilyOver` is the same loop factored out over an `anytype` transport (the
+same shape `netlink`'s own `awaitAckOver`/`dumpOver` already use, for the same reason), so it now
+runs in-process against `GenlScripted`, a scripted fixture with no socket, no namespace, no
+privilege: the no-terminator hang, an endless `NLM_F_DUMP_INTR` stream, a foreign-portid reply, and
+all four identity-check rejections from F2, each with the positive control that must still resolve.
+Two more targeted regression tests cover F3 (`lastErrorMessage` does not survive into the next
+request) and F7 (a rejected request does not advance `seq`) against a real socket. Independently,
+`.zig-cache/probe/genetlink_{f2,f7,f8}_red_green.zig` hold RED/GREEN reproductions run once during
+the fix (pre-fix logic genuinely exhibits the bug; post-fix logic does not) — supplementary evidence,
+not part of the gate.
 
 The three reverse dependents (`nl80211`, `ethtool`, `wireguard`) are the real regression net — the
 first two run live tests against a Wi-Fi radio and an e1000e NIC. All three must keep identical

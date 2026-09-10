@@ -5,6 +5,42 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **security audit follow-up: five findings closed in the reply-resolution path,
+  two of them HIGH.**
+  - **F1 (HIGH):** `ctrlGetFamily`'s reply loop had no message budget — a kernel reply stream that
+    never reached `NLMSG_DONE`/a bare ACK (missing terminator, an endless `NLM_F_DUMP_INTR`
+    stream, or a flood of foreign-`seq` datagrams) spun `resolveFamily`/`resolveMcastGroup`
+    forever. Bounded at `max_reply_messages` (65536, same value/rationale as `netlink`'s
+    `max_await_messages`/`max_dump_messages`); new `error.TooManyMessages` on `ResolveError`
+    (additive — `nl80211`/`ethtool`/`devlink`'s `mapResolve` updated to fold it onto
+    `MalformedReply`, the only exhaustive switches over it in the repo).
+  - **F2 (HIGH):** a resolved family's identity was never checked — a reply naming a different
+    family, with no `CTRL_ATTR_FAMILY_NAME` at all, carrying `CTRL_CMD_DELFAMILY` instead of
+    `NEWFAMILY`, or with an id outside the kernel's own `[GENL_ID_CTRL, GENL_MAX_ID]` range, was
+    all accepted. Live and reachable with no attacker: `resolveFamily("nlctrl\x00zz")` resolved,
+    because the kernel reads `CTRL_ATTR_FAMILY_NAME` as a C string (stops at the embedded NUL)
+    while this module compared nothing at all. All three axes are now verified before a record is
+    accepted; any mismatch is `error.MalformedReply`, the vocabulary already used for a malformed
+    datagram — no new error, no signature change.
+  - **F3 (MED):** `lastErrorMessage()` could outlive the request it described — a caller reading it
+    after a successful call, or after an unrelated failure, saw stale text from an earlier request.
+    Cleared unconditionally before each request now.
+  - **F7 (LOW):** a name too long for `GENL_NAMSIZ` still advanced the socket's sequence counter,
+    even though the request was never built or sent. The length guard now runs before the counter
+    is touched.
+  - **F8 (LOW):** `findMcastGroupId` accepted a matching group entry whose id was 0 (every id this
+    module has observed from a real kernel is dynamically assigned and nonzero), and matched an
+    empty `want` against an empty group name. Both now `error.BadLength`/no match respectively.
+  - **F6 (LOW, new API):** `Socket.resolveMcastGroups(family, names, out)` resolves several group
+    names over one `CTRL_CMD_GETFAMILY` round trip instead of one round trip per name (measured:
+    6 names = 30 syscalls before, matches `nl80211`'s own subscribe loop). Additive; existing
+    resolvers unchanged.
+  - **F9 (LOW):** `genetlink` registered with `scripts/check-uapi-consts.py` (previously the only
+    automatic check of its constants ran through `nl80211`'s own private copy, which SPEC's backlog
+    plans to delete).
+  See `SPEC.md` for the full writeup and `~/CML/20260901-zig-libs-audit/A1/genetlink.md` for the
+  audit record.
+
 - **2026-09-07** — **both fuzz harnesses discarded the seed before reading a byte of it.**
   `fuzzSplitPayload` opened `smith.bytes(&buf)` and then sliced to
   `smith.valueRangeAtMost(u16, 0, buf.len)`; a `Smith` ranged draw reads eight input octets as

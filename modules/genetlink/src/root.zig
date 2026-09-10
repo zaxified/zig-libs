@@ -77,7 +77,10 @@ pub const header_len = 4;
 /// GENL_ID_CTRL — the fixed message type of the nlctrl (control) family.
 pub const GENL_ID_CTRL: u16 = 0x10;
 
-/// nlctrl commands (CTRL_CMD_*); only GETFAMILY is needed here.
+/// nlctrl commands (CTRL_CMD_*). `NEWFAMILY` is the reply to `GETFAMILY`,
+/// verified on every reply record (see F2 in the audit) so a `DELFAMILY`
+/// notification or another control message can't be mistaken for one.
+pub const CTRL_CMD_NEWFAMILY: u8 = 1;
 pub const CTRL_CMD_GETFAMILY: u8 = 3;
 
 /// nlctrl attributes (CTRL_ATTR_*).
@@ -94,6 +97,15 @@ pub const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
 /// GENL_NAMSIZ — family names incl. NUL. A longer CTRL_ATTR_FAMILY_NAME is
 /// rejected by the kernel's policy with EINVAL, so it is caught client-side.
 pub const GENL_NAMSIZ = 16;
+
+/// GENL_MAX_ID — the highest genl id the kernel's dynamic allocator ever
+/// hands out (`linux/genetlink.h`). The lower bound of that same range is
+/// `GENL_ID_CTRL` itself (`GENL_MIN_ID == NLMSG_MIN_TYPE == GENL_ID_CTRL` in
+/// the kernel header) — nlctrl resolving its own name returns exactly that
+/// value, so the valid range for a resolved family id is `[GENL_ID_CTRL,
+/// GENL_MAX_ID]` inclusive. Used to reject an out-of-range id in a reply
+/// (F2).
+pub const GENL_MAX_ID: u16 = 1023;
 
 // ── genlmsghdr codec ────────────────────────────────────────────────────────
 
@@ -153,8 +165,21 @@ pub fn buildGetFamilyRequest(
 /// captured reply. `Socket.resolveMcastGroup` is the round-trip on top.
 ///
 /// A group entry that carries a matching name but no id is a wire-format
-/// failure (`error.BadLength`): the kernel always emits both.
+/// failure (`error.BadLength`): the kernel always emits both. So is a
+/// matching entry whose id is 0 (F8): every genl multicast group id this
+/// module has ever observed from a real kernel is dynamically assigned and
+/// nonzero (this module's own integration test asserts exactly that —
+/// `"Its id is dynamic; only nonzero is guaranteed"` — and the captured
+/// `nlctrl`/`notify` golden below resolves to `0x15`), so an entry claiming
+/// id 0 is as malformed as one claiming no id at all, not a group callers
+/// should ever join.
+///
+/// `want.len == 0` never matches, even against a group entry whose own name
+/// is empty (also F8): no genl family publishes an unnamed group, so an
+/// empty `want` is a caller bug, not a lookup that should silently succeed
+/// against whatever unnamed entry happens to come first.
 pub fn findMcastGroupId(attr_bytes: []const u8, want: []const u8) codec.Error!?u32 {
+    if (want.len == 0) return null;
     var it: codec.AttrIterator = .{ .buf = attr_bytes };
     while (try it.next()) |a| {
         if (a.type != CTRL_ATTR_MCAST_GROUPS) continue;
@@ -169,7 +194,12 @@ pub fn findMcastGroupId(attr_bytes: []const u8, want: []const u8) codec.Error!?u
                 else => {},
             };
             if (name) |n| {
-                if (std.mem.eql(u8, n, want)) return id orelse return error.BadLength;
+                if (n.len == 0) continue;
+                if (std.mem.eql(u8, n, want)) {
+                    const v = id orelse return error.BadLength;
+                    if (v == 0) return error.BadLength;
+                    return v;
+                }
             }
         }
     }
@@ -212,6 +242,13 @@ pub const ResolveError = error{
     AccessDenied,
     SystemResources,
     Unexpected,
+    /// The reply loop consumed `max_reply_messages` datagrams without ever
+    /// reaching `NLMSG_DONE`/a bare ACK for our request. Bug F1: previously
+    /// unbounded — a kernel reply stream that never terminates the exchange
+    /// (missing `NLMSG_DONE`, a stuck `NLM_F_DUMP_INTR` restart, or a flood
+    /// of foreign-`seq` datagrams) spun `resolveFamily`/`resolveMcastGroup`
+    /// forever.
+    TooManyMessages,
 };
 
 /// `ResolveError` plus the one outcome that is specific to group resolution:
@@ -368,7 +405,7 @@ pub const Socket = struct {
     /// Resolve a genetlink family name (e.g. "wireguard") to its dynamic
     /// message-type id via `CTRL_CMD_GETFAMILY`. Unprivileged.
     pub fn resolveFamily(self: *Socket, name: []const u8) ResolveError!u16 {
-        const id = (try self.ctrlGetFamily(name, null)) orelse return error.MalformedReply;
+        const id = (try self.ctrlGetFamily(name, .family_id)) orelse return error.MalformedReply;
         return @truncate(id);
     }
 
@@ -384,62 +421,170 @@ pub const Socket = struct {
         family: []const u8,
         group: []const u8,
     ) McastGroupError!u32 {
-        return (try self.ctrlGetFamily(family, group)) orelse error.GroupNotFound;
+        return (try self.ctrlGetFamily(family, .{ .one_group = group })) orelse error.GroupNotFound;
     }
 
-    /// The one nlctrl round trip both resolvers share: send
-    /// `CTRL_CMD_GETFAMILY(family)`, then walk the replies until the ACK.
-    /// With `group == null` the answer is `CTRL_ATTR_FAMILY_ID`, otherwise the
-    /// id of that multicast group; `null` = the reply never carried it.
-    fn ctrlGetFamily(self: *Socket, family: []const u8, group: ?[]const u8) ResolveError!?u32 {
+    /// Resolve several of `family`'s multicast group names over a **single**
+    /// `CTRL_CMD_GETFAMILY` round trip, instead of one round trip per name
+    /// (audit finding F6: a caller joining N groups — `nl80211` joins 6+ on
+    /// `open()` — used to pay N request/reply pairs for information the
+    /// first reply already carried in full, since `findMcastGroupId` is a
+    /// pure walk over bytes already in hand).
+    ///
+    /// `names` and `out` must have equal length; `out[i]` receives the id of
+    /// `names[i]`, or stays `null` when the family does not publish a group
+    /// under that name — same per-name outcome as `resolveMcastGroup`
+    /// returning `error.GroupNotFound`, just not fatal to the rest of the
+    /// batch. `error.FamilyNotFound` still fails the whole call, same as
+    /// `resolveMcastGroup`.
+    pub fn resolveMcastGroups(
+        self: *Socket,
+        family: []const u8,
+        names: []const []const u8,
+        out: []?u32,
+    ) ResolveError!void {
+        std.debug.assert(names.len == out.len);
+        @memset(out, null);
+        _ = try self.ctrlGetFamily(family, .{ .many_groups = .{ .names = names, .out = out } });
+    }
+
+    /// What one `CTRL_CMD_GETFAMILY` round trip is being asked to extract
+    /// from the resolved family's reply, besides the family's own identity
+    /// (name and id), which `ctrlGetFamilyOver` verifies unconditionally.
+    const FamilyQuery = union(enum) {
+        /// `resolveFamily`: the answer is `CTRL_ATTR_FAMILY_ID` itself.
+        family_id,
+        /// `resolveMcastGroup`: one group name, resolved to its id.
+        one_group: []const u8,
+        /// `resolveMcastGroups`: many group names resolved over the same
+        /// reply (F6). `names[i]` -> `out[i]`.
+        many_groups: struct { names: []const []const u8, out: []?u32 },
+    };
+
+    /// The one nlctrl round trip every resolver shares: send
+    /// `CTRL_CMD_GETFAMILY(family)`, then hand the reply stream to
+    /// `ctrlGetFamilyOver`.
+    ///
+    /// F3: `lastErrorMessage()` must not outlive the request it describes —
+    /// cleared here, unconditionally, before the request is even sent, same
+    /// as `netlink.Socket.awaitAckStrict` clears its own `ext_ack_len`/
+    /// `last_errno` before each bounded engine call.
+    ///
+    /// F7: the `GENL_NAMSIZ` guard runs before `nextSeq()` is ever called, so
+    /// an oversized name never spends a sequence number on a request that is
+    /// never built or sent.
+    fn ctrlGetFamily(self: *Socket, family: []const u8, query: FamilyQuery) ResolveError!?u32 {
+        if (family.len >= GENL_NAMSIZ) return error.NameTooLong;
+
         var t = self.transport();
         defer self.sync(t);
+        t.ext_ack_len = 0;
 
         const seq = t.nextSeq();
         const req = try buildGetFamilyRequest(t.gpa, seq, family);
         defer t.gpa.free(req);
         try t.send(req);
 
-        var found: ?u32 = null;
-        while (true) {
-            const dgram = try t.recvDatagram();
-            var it: codec.MessageIterator = .{ .buf = dgram };
-            while (it.next() catch return error.MalformedReply) |m| {
-                // The shared dump triage: (portid, seq) matching, NLMSG_DONE /
-                // bare-ACK termination, NLMSG_OVERRUN and a short NLMSG_ERROR
-                // payload. `.restart` (NLM_F_DUMP_INTR) cannot reach a
-                // GETFAMILY-by-name — that is the kernel's doit path, not a
-                // dump — and a flagged reply is dropped rather than trusted.
-                switch (codec.classifyDumpMessage(m, t.portid, seq)) {
-                    .skip, .restart => {},
-                    .done => return found,
-                    .failed => |code| {
-                        t.captureExtAck(m);
-                        return resolveErrorFromCode(code);
-                    },
-                    .overrun => return error.SystemResources,
-                    .malformed => return error.MalformedReply,
-                    .record => |rec| {
-                        if (rec.type != GENL_ID_CTRL) continue;
-                        const p = splitPayload(rec.payload) catch return error.MalformedReply;
-                        if (group) |want| {
+        return ctrlGetFamilyOver(&t, family, query, seq);
+    }
+};
+
+/// Message budget for the nlctrl reply loop below — mirrors `netlink`'s
+/// `max_await_messages`/`max_dump_messages`. A reply stream that never
+/// reaches `NLMSG_DONE`/a bare ACK for our `seq` used to spin the loop
+/// forever: no terminator (audit F1 shape a), a stream of `NLM_F_DUMP_INTR`
+/// replies that `.restart` drops without acting on (shape b — the one
+/// SPEC's row 9 called impossible for a by-name lookup; the budget no longer
+/// depends on that holding), or a flood of foreign-`seq` datagrams (shape
+/// c). `ctrlGetFamilyOver` is the bounded engine, factored out so a scripted
+/// transport can drive it without a real socket.
+const max_reply_messages: u32 = 65536;
+
+/// The receive half of `Socket.ctrlGetFamily`: consume replies to `seq`
+/// until `NLMSG_DONE`/a bare ACK, an error, or `max_reply_messages`
+/// datagrams (`error.TooManyMessages`, F1). `transport` must offer
+/// `recvDatagram()`, `portId()` and `captureExtAck(msg)` — `netlink.Socket`
+/// and the `GenlScripted` test fixture below both do.
+///
+/// F2: a reply record is accepted only if **all three** of its identity axes
+/// agree with what was asked for: `CTRL_CMD_NEWFAMILY` (not `DELFAMILY` or
+/// any other control command), `CTRL_ATTR_FAMILY_NAME` present and equal to
+/// `family` byte-for-byte (the real kernel always echoes it — see the
+/// "golden: real nlctrl" test — so requiring it costs nothing and closes the
+/// NUL-truncation confusion: a `family` slice with an embedded NUL and
+/// trailing garbage can never equal the echoed name, which the kernel reads
+/// only up to its own NUL), and `CTRL_ATTR_FAMILY_ID` inside
+/// `[GENL_ID_CTRL, GENL_MAX_ID]`, the kernel's own dynamic-id range. Any
+/// other combination is `error.MalformedReply`, same vocabulary the wire
+/// already uses for a hostile/malformed datagram.
+fn ctrlGetFamilyOver(
+    transport: anytype,
+    family: []const u8,
+    query: Socket.FamilyQuery,
+    seq: u32,
+) ResolveError!?u32 {
+    var found: ?u32 = null;
+    var msgs: u32 = 0;
+    while (true) {
+        if (msgs >= max_reply_messages) return error.TooManyMessages;
+        const dgram = try transport.recvDatagram();
+        msgs += 1;
+        var it: codec.MessageIterator = .{ .buf = dgram };
+        while (it.next() catch return error.MalformedReply) |m| {
+            // The shared dump triage: (portid, seq) matching, NLMSG_DONE /
+            // bare-ACK termination, NLMSG_OVERRUN and a short NLMSG_ERROR
+            // payload. A `.restart` (NLM_F_DUMP_INTR) reply is dropped
+            // rather than trusted — see `max_reply_messages` above for why
+            // that no longer needs the "cannot occur" claim to be safe.
+            switch (codec.classifyDumpMessage(m, transport.portId(), seq)) {
+                .skip, .restart => {},
+                .done => return found,
+                .failed => |code| {
+                    transport.captureExtAck(m);
+                    return resolveErrorFromCode(code);
+                },
+                .overrun => return error.SystemResources,
+                .malformed => return error.MalformedReply,
+                .record => |rec| {
+                    if (rec.type != GENL_ID_CTRL) continue;
+                    const p = splitPayload(rec.payload) catch return error.MalformedReply;
+                    if (p.cmd != CTRL_CMD_NEWFAMILY) return error.MalformedReply;
+                    switch (query) {
+                        .family_id => {
+                            var attrs: codec.AttrIterator = .{ .buf = p.attrs };
+                            var name_ok = false;
+                            var id: ?u16 = null;
+                            while (attrs.next() catch return error.MalformedReply) |a| {
+                                switch (a.type) {
+                                    CTRL_ATTR_FAMILY_NAME => name_ok = std.mem.eql(u8, a.asString(), family),
+                                    CTRL_ATTR_FAMILY_ID => id = a.asU16() catch return error.MalformedReply,
+                                    else => {},
+                                }
+                            }
+                            if (id) |v| {
+                                if (!name_ok) return error.MalformedReply;
+                                if (v < GENL_ID_CTRL or v > GENL_MAX_ID) return error.MalformedReply;
+                                found = v;
+                            }
+                        },
+                        .one_group => |want| {
                             // Sticky: a later reply message that carries no
                             // group nest must not erase an id already found.
                             found = (findMcastGroupId(p.attrs, want) catch
                                 return error.MalformedReply) orelse found;
-                        } else {
-                            var attrs: codec.AttrIterator = .{ .buf = p.attrs };
-                            while (attrs.next() catch return error.MalformedReply) |a| {
-                                if (a.type == CTRL_ATTR_FAMILY_ID)
-                                    found = a.asU16() catch return error.MalformedReply;
+                        },
+                        .many_groups => |batch| {
+                            for (batch.names, batch.out) |want, *slot| {
+                                slot.* = (findMcastGroupId(p.attrs, want) catch
+                                    return error.MalformedReply) orelse slot.*;
                             }
-                        }
-                    },
-                }
+                        },
+                    }
+                },
             }
         }
     }
-};
+}
 
 // ── offline tests ───────────────────────────────────────────────────────────
 
@@ -858,6 +1003,44 @@ test "findMcastGroupId rejects a matching group with no id" {
     try testing.expectError(error.BadLength, findMcastGroupId(list.items, "scan"));
 }
 
+test "F8: findMcastGroupId rejects a matching group whose id is 0" {
+    // Every id this module has ever observed from a real kernel is nonzero
+    // (see the golden captures below); id 0 on a name match is as malformed
+    // as no id at all, not a group a caller should join.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const outer = try codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS);
+    const inner = try codec.nestBegin(testing.allocator, &list, 1);
+    try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, "peers");
+    try codec.appendAttrU32(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_ID, 0);
+    try codec.nestEnd(&list, inner);
+    try codec.nestEnd(&list, outer);
+
+    try testing.expectError(error.BadLength, findMcastGroupId(list.items, "peers"));
+
+    // Positive control: the same shape with a nonzero id must still resolve.
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(testing.allocator);
+    try buildMcastGroupsAttrs(testing.allocator, &ok, &.{.{ .name = "peers", .id = 7 }});
+    try testing.expectEqual(@as(?u32, 7), try findMcastGroupId(ok.items, "peers"));
+}
+
+test "F8: findMcastGroupId never matches an empty query against an empty group name" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const outer = try codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS);
+    const inner = try codec.nestBegin(testing.allocator, &list, 1);
+    try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, "");
+    try codec.appendAttrU32(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_ID, 42);
+    try codec.nestEnd(&list, inner);
+    try codec.nestEnd(&list, outer);
+
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(list.items, ""));
+    // Positive control: a real name against the same nest still misses (the
+    // group published is unnamed, not "peers").
+    try testing.expectEqual(@as(?u32, null), try findMcastGroupId(list.items, "peers"));
+}
+
 test "findMcastGroupId reports a truncated nest instead of reading past it" {
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(testing.allocator);
@@ -1008,4 +1191,310 @@ test "integration: the shared transport seam is reachable on a genl socket" {
     const before = sock.nextSeq();
     _ = try sock.resolveFamily("nlctrl");
     try testing.expect(sock.seq > before);
+}
+
+test "F7: a name too long for GENL_NAMSIZ is rejected before a sequence number is spent" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    const before = sock.seq;
+    try testing.expectError(error.NameTooLong, sock.resolveFamily("a-family-name-way-too-long"));
+    try testing.expectEqual(before, sock.seq);
+
+    // Positive control: a request that actually gets built and sent still
+    // advances `seq` — the guard above must not have swallowed the counter
+    // altogether.
+    _ = try sock.resolveFamily("nlctrl");
+    try testing.expect(sock.seq > before);
+}
+
+test "F3: lastErrorMessage does not survive into the next, unrelated request" {
+    // Real reproduction of a *stale, wrong-errno* message needs a kernel that
+    // attaches an extended-ACK reason to ENOENT, which this host's does not
+    // (see genetlink.md F3) — so this drives the socket's own state directly,
+    // which is exactly what `ctrlGetFamily` must clear regardless of why it
+    // was set. Before the fix, `ext_ack_len` was never touched by a
+    // successful call, so the stale text would still read back afterwards.
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    const stale = "stale reason from an earlier, unrelated failure";
+    @memcpy(sock.ext_ack_buf[0..stale.len], stale);
+    sock.ext_ack_len = stale.len;
+    try testing.expectEqualStrings(stale, sock.lastErrorMessage());
+
+    _ = try sock.resolveFamily("nlctrl");
+    try testing.expectEqual(@as(usize, 0), sock.lastErrorMessage().len);
+}
+
+test "integration: resolveMcastGroups resolves several names over one round trip (F6)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var sock = Socket.open(testing.allocator) catch return error.SkipZigTest;
+    defer sock.close();
+
+    var out: [3]?u32 = undefined;
+    try sock.resolveMcastGroups("nlctrl", &.{ "notify", "zig-libs-nope", "notify" }, &out);
+    try testing.expect(out[0] != null and out[0].? != 0);
+    try testing.expectEqual(@as(?u32, null), out[1]);
+    try testing.expectEqual(out[0], out[2]);
+
+    // Positive control: matches what the single-name resolver returns.
+    const single = try sock.resolveMcastGroup("nlctrl", "notify");
+    try testing.expectEqual(single, out[0].?);
+
+    // FamilyNotFound still fails the whole batch.
+    try testing.expectError(
+        error.FamilyNotFound,
+        sock.resolveMcastGroups("zig-libs-nope", &.{"notify"}, out[0..1]),
+    );
+}
+
+// ── scripted-transport tests: the reply loop itself (F1, F2, F4) ───────────
+//
+// `ctrlGetFamily`'s receive loop makes real syscalls through `netlink.Socket`,
+// so mutating its behaviour was previously unreachable from `zig build
+// test-genetlink` without a live or faked kernel (audit F4: 10 mutations to
+// this loop passed 16/16 green). `ctrlGetFamilyOver` is the same loop
+// factored out over an `anytype` transport — same shape `netlink`'s own
+// `awaitAckOver`/`dumpOver` already use for exactly this reason — so it runs
+// here against a scripted transport instead: deterministic, no socket, no
+// namespace, no privilege.
+
+/// A transport that satisfies `ctrlGetFamilyOver`'s shape without a socket.
+/// Scripted datagrams are delivered in order; once they run out, `filler` is
+/// returned forever (or `error.RecvFailed` if there is none) — the same
+/// design as `netlink`'s own `ScriptedTransport`.
+const GenlScripted = struct {
+    script: []const []const u8 = &.{},
+    filler: ?[]const u8 = null,
+    pos: usize = 0,
+    recvs: usize = 0,
+    pid: u32,
+    ext_ack_len: usize = 0,
+    ext_ack_buf: [64]u8 = @splat(0),
+
+    fn portId(self: *const GenlScripted) u32 {
+        return self.pid;
+    }
+    fn captureExtAck(self: *GenlScripted, m: codec.Message) void {
+        self.ext_ack_len = 0;
+        const msg = (m.errorMessage() catch return) orelse return;
+        const n = @min(msg.len, self.ext_ack_buf.len);
+        @memcpy(self.ext_ack_buf[0..n], msg[0..n]);
+        self.ext_ack_len = n;
+    }
+    fn recvDatagram(self: *GenlScripted) RecvError![]const u8 {
+        self.recvs += 1;
+        if (self.pos < self.script.len) {
+            defer self.pos += 1;
+            return self.script[self.pos];
+        }
+        return self.filler orelse error.RecvFailed;
+    }
+};
+
+/// Build one `CTRL_CMD_GETFAMILY` reply record (genl type = `GENL_ID_CTRL`)
+/// naming `name`/`id`, for the scripted-transport tests below.
+fn buildFamilyReply(
+    gpa: std.mem.Allocator,
+    list: *std.ArrayList(u8),
+    cmd: u8,
+    seq: u32,
+    pid: u32,
+    name: ?[]const u8,
+    id: ?u16,
+) !void {
+    const h = try codec.appendHeader(gpa, list, GENL_ID_CTRL, 0, seq, pid);
+    try appendHeader(gpa, list, cmd, 2);
+    if (name) |n| try codec.appendAttrString(gpa, list, CTRL_ATTR_FAMILY_NAME, n);
+    if (id) |v| try codec.appendAttrU16(gpa, list, CTRL_ATTR_FAMILY_ID, v);
+    codec.finishHeader(list, h);
+}
+
+/// Append a bare ACK (`NLMSG_ERROR`, errno 0) for (`seq`, `pid`) — the
+/// terminator a `CTRL_CMD_GETFAMILY` reply needs after its data record.
+fn appendBareAck(gpa: std.mem.Allocator, list: *std.ArrayList(u8), seq: u32, pid: u32) !void {
+    const h = try codec.appendHeader(gpa, list, codec.NLMSG_ERROR, 0, seq, pid);
+    try list.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 });
+    codec.finishHeader(list, h);
+}
+
+test "ctrlGetFamilyOver: positive control — a well-formed matching reply resolves" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try buildFamilyReply(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", GENL_ID_CTRL);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(
+        @as(?u32, @as(u32, GENL_ID_CTRL)),
+        try ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42),
+    );
+    try testing.expectEqual(@as(usize, 1), t.recvs);
+}
+
+test "F1: ctrlGetFamilyOver gives up instead of spinning when the reply never terminates" {
+    // Shape (a) from the audit: no NLMSG_DONE, no ACK — a NOOP addressed to
+    // us on our own seq, forever. Without a budget this loop never returns.
+    var noop: std.ArrayList(u8) = .empty;
+    defer noop.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &noop, codec.NLMSG_NOOP, 0, 42, 7);
+    codec.finishHeader(&noop, h);
+
+    var t: GenlScripted = .{ .filler = noop.items, .pid = 7 };
+    try testing.expectError(error.TooManyMessages, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+    try testing.expectEqual(@as(usize, max_reply_messages), t.recvs);
+}
+
+test "F1: a stream of NLM_F_DUMP_INTR replies (SPEC row 9's 'cannot occur' case) still terminates" {
+    // Shape (b) from the audit: `.restart` is dropped like `.skip`, so a
+    // kernel that only ever sends DUMP_INTR-flagged replies used to hang
+    // forever regardless of whether a real nlctrl would do this.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, GENL_ID_CTRL, codec.NLM_F_DUMP_INTR, 42, 7);
+    codec.finishHeader(&list, h);
+
+    var t: GenlScripted = .{ .filler = list.items, .pid = 7 };
+    try testing.expectError(error.TooManyMessages, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F2: a reply naming a different family than requested is rejected" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try buildFamilyReply(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", GENL_ID_CTRL);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "wireguard", .family_id, 42));
+}
+
+test "F2: a reply with no CTRL_ATTR_FAMILY_NAME at all is rejected" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try buildFamilyReply(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 42, 7, null, GENL_ID_CTRL);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F2: a CTRL_CMD_DELFAMILY payload is rejected, not parsed as a resolution" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    try buildFamilyReply(testing.allocator, &list, 2, 42, 7, "nlctrl", GENL_ID_CTRL); // 2 = CTRL_CMD_DELFAMILY
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F2: a family id outside [GENL_ID_CTRL, GENL_MAX_ID] is rejected" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    // id = 3, the numeric value of NLMSG_DONE — the audit's own live probe.
+    try buildFamilyReply(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", 3);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F4: a reply from a foreign portid is skipped, not accepted as ours" {
+    // A record from a foreign pid must be skipped, not accepted — the exact
+    // axis the audit's F4 found the module-level gate blind to (10 mutations
+    // to this loop, including deleting the (portid, seq) match, passed
+    // `zig build test-genetlink` 16/16 green). Skipped forever (a foreign
+    // pid never satisfies our DONE either) surfaces as the F1 budget, which
+    // is itself evidence the record was never treated as ours.
+    var only: std.ArrayList(u8) = .empty;
+    defer only.deinit(testing.allocator);
+    try buildFamilyReply(testing.allocator, &only, CTRL_CMD_NEWFAMILY, 42, 999, "nlctrl", GENL_ID_CTRL);
+
+    var t: GenlScripted = .{ .filler = only.items, .pid = 7 }; // foreign pid throughout
+    try testing.expectError(error.TooManyMessages, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F4: a record whose genl type is not GENL_ID_CTRL is ignored" {
+    // The `if (rec.type != GENL_ID_CTRL) continue;` filter, mutated away in
+    // the audit's F4 battery without a single test noticing (an earlier
+    // version of this test used `.filler` — an infinite repeat of the
+    // wrongly-typed record — which converges to `error.TooManyMessages`
+    // whether or not the filter runs, so it could not actually distinguish
+    // them; caught by mutating the filter away during this fix and finding
+    // 34/35 still green). A record typed for some other genl family (e.g.
+    // `nl80211`'s own dynamic id, modelled here as 0x99), followed by a
+    // real terminating ACK, must be skipped rather than read as the
+    // `CTRL_CMD_NEWFAMILY` reply it looks like: the resolve completes
+    // (reaches the ACK) but finds nothing, `null`, not the id the
+    // wrongly-typed record carried.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, 0x99, 0, 42, 7);
+    try appendHeader(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 2);
+    try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_FAMILY_NAME, "nlctrl");
+    try codec.appendAttrU16(testing.allocator, &list, CTRL_ATTR_FAMILY_ID, GENL_ID_CTRL);
+    codec.finishHeader(&list, h);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(@as(?u32, null), try ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F4: a group id already found survives a later record that carries no group nest (sticky)" {
+    // The one deliberate hardening SPEC already documents ("One deliberate
+    // hardening over the copies") — `found = find(...) orelse found` — had
+    // no test of its own: a mutation removing the `orelse found` (plain
+    // assignment instead) passed the module's gate green. Two records in
+    // one reply: the first carries the group nest, the second carries none.
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    // First record: genlmsghdr + FAMILY_NAME/_ID + the group nest, all
+    // inside ONE nlmsghdr (finishHeader closes it after everything is in).
+    {
+        const h = try codec.appendHeader(testing.allocator, &list, GENL_ID_CTRL, 0, 42, 7);
+        try appendHeader(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 2);
+        try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_FAMILY_NAME, "nlctrl");
+        try codec.appendAttrU16(testing.allocator, &list, CTRL_ATTR_FAMILY_ID, GENL_ID_CTRL);
+        const outer = try codec.nestBegin(testing.allocator, &list, CTRL_ATTR_MCAST_GROUPS);
+        const inner = try codec.nestBegin(testing.allocator, &list, 1);
+        try codec.appendAttrString(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_NAME, "notify");
+        try codec.appendAttrU32(testing.allocator, &list, CTRL_ATTR_MCAST_GRP_ID, 5);
+        try codec.nestEnd(&list, inner);
+        try codec.nestEnd(&list, outer);
+        codec.finishHeader(&list, h);
+    }
+    // A second, separate record in the same reply: same family, no group
+    // nest at all — this must not erase the id the first record found.
+    try buildFamilyReply(testing.allocator, &list, CTRL_CMD_NEWFAMILY, 42, 7, "nlctrl", GENL_ID_CTRL);
+    try appendBareAck(testing.allocator, &list, 42, 7);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectEqual(
+        @as(?u32, 5),
+        try ctrlGetFamilyOver(&t, "nlctrl", .{ .one_group = "notify" }, 42),
+    );
+}
+
+test "F4: NLMSG_OVERRUN is a typed error, not a silent skip" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, codec.NLMSG_OVERRUN, 0, 42, 7);
+    codec.finishHeader(&list, h);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.SystemResources, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
+}
+
+test "F4: a short NLMSG_ERROR payload is a typed error, not a silent skip" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(testing.allocator);
+    const h = try codec.appendHeader(testing.allocator, &list, codec.NLMSG_ERROR, 0, 42, 7);
+    try list.appendSlice(testing.allocator, &[_]u8{ 0, 0 }); // < 4 bytes: too short for errorCode()
+    codec.finishHeader(&list, h);
+
+    var t: GenlScripted = .{ .script = &.{list.items}, .pid = 7 };
+    try testing.expectError(error.MalformedReply, ctrlGetFamilyOver(&t, "nlctrl", .family_id, 42));
 }

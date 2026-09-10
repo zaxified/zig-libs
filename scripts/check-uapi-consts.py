@@ -224,6 +224,28 @@ MODULES = {
         # repo-local constants.
         "unresolved_budget": 3,
     },
+    "genetlink": {
+        # Audit finding F9: genetlink owns `GENL_ID_CTRL`, `CTRL_CMD_*` and
+        # `CTRL_ATTR_*` for four consumers (`nl80211`, `ethtool`, `devlink`,
+        # `wireguard`), but until now the only automatic check of those
+        # numbers was `nl80211`'s own private copy in `uapi.zig` -- which
+        # SPEC's backlog plans to delete once `nl80211`/`ethtool` adopt the
+        # shared resolver, at which point genetlink's constants would have
+        # had no UAPI check left anywhere. Unlike `ethtool`/`nl80211`/
+        # `devlink`, genetlink has no separate `uapi.zig`: its constants live
+        # alongside the resolver logic in `root.zig` itself.
+        "zig_files": ["modules/genetlink/src/root.zig"],
+        "headers": ["/usr/include/linux/genetlink.h"],
+        "prefixes": [""],
+        # `header_len` (this module's own sizing constant, not a kernel
+        # macro name) and `GENL_ID_CTRL` (the kernel spells it
+        # `NLMSG_MIN_TYPE` inside `linux/netlink.h`, a different header this
+        # single-header entry does not cross-reference -- `header_constants`
+        # evaluates each header with its own macro table, so a `#define`
+        # whose value is another header's macro never resolves here). If
+        # this number grows, something stopped being checked.
+        "unresolved_budget": 2,
+    },
 }
 
 # ── Zig side: structurally extract dotted-name -> int from a uapi.zig-shaped

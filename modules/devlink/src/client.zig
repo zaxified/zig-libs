@@ -776,6 +776,10 @@ fn mapParse(e: anyerror) RequestError {
 /// becomes `NoSuchDevice`, which is what an `ENOENT` from nlctrl mapped to
 /// before the resolver was shared; `NameTooLong` cannot happen for a name this
 /// module hardcodes.
+/// `TooManyMessages` (genetlink audit F1, added 2026-09-10: the resolver's
+/// reply loop is now budget-bounded instead of spinning forever) folds onto
+/// `MalformedReply` — same bucket as any other reply stream this module
+/// could not make sense of, and no new member on `SubscribeError` itself.
 fn mapResolve(e: genl.McastGroupError) SubscribeError {
     return switch (e) {
         error.GroupNotFound => error.GroupNotFound,
@@ -784,7 +788,7 @@ fn mapResolve(e: genl.McastGroupError) SubscribeError {
         error.OutOfMemory => error.OutOfMemory,
         error.SendFailed => error.SendFailed,
         error.RecvFailed => error.RecvFailed,
-        error.MalformedReply => error.MalformedReply,
+        error.MalformedReply, error.TooManyMessages => error.MalformedReply,
         error.AccessDenied => error.AccessDenied,
         error.SystemResources => error.SystemResources,
         error.Unexpected => error.Unexpected,
