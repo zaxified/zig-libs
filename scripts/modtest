@@ -207,7 +207,21 @@ if [[ "$mode" == file ]]; then
     # limit -- a mutant that loops forever prints forever, and a byte budget
     # alone only bounds how much of it we KEEP, not how long it runs.
     # (`--test-timeout` is a `zig build` flag; `zig test` rejects it.)
-    timeout "${ZIGLIBS_MODTEST_TIMEOUT:-120s}" zig test "$probe" "$@" 2>&1 \
+    # ⭐ A probe that needs OTHER modules must declare its own root module, and
+    # `zig test` refuses "main module provided both by -Mroot=... and by
+    # positional argument". So when the caller passes -Mroot=, hand the probe
+    # over only through their own module graph. Measured 2026-09-11: without
+    # this, `bip340` F2 could not be given a RED at all inside modtest, and the
+    # finding sat in the deferred ledger as "blocked on the environment" when it
+    # was really blocked on this line.
+    #
+    #   scripts/modtest --file p.zig --dep bip340 -Mroot=p.zig -Mbip340=modules/bip340/src/root.zig
+    probe_arg=("$probe")
+    for a in "$@"; do
+        [[ "$a" == -Mroot=* ]] && probe_arg=() && break
+    done
+    timeout "${ZIGLIBS_MODTEST_TIMEOUT:-120s}" \
+        zig test ${probe_arg[@]+"${probe_arg[@]}"} "$@" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 else
     # Wall-clock limit on the lane too, not just on `--file`. Measured
