@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, dojezd wave: `A1/opaque.md` M4 (0 consumers, P1
+  applies; no wire/API change).
+  - **M4**: the module's three fuzz harnesses only ever exercised `fromBytes` (plain
+    field slicing, nothing to reject); `generateKE2`, `generateKE3`, and
+    `createRegistrationResponse` — the functions that actually validate a peer's wire
+    bytes — had no fuzz target at all. Added three permanent fuzz harnesses for them
+    (configuration pinned to a real KAT vector, only the wire message itself is
+    fuzzed), plus three deterministic tests (each hands the validating function one
+    concrete non-canonical 32-byte string inside an otherwise-real KAT flow and
+    requires the function's own typed error, not a panic or a silent accept). The
+    deterministic tests exist because a single default fuzz invocation without
+    `--fuzz` fills its buffer with zero bytes, which decode as ristretto255's
+    identity element — a *valid* canonical encoding — so it alone would never reach
+    the rejection branch. Measured: mutating `createRegistrationResponse`'s
+    `catch return error.InvalidMessage` to `catch unreachable` crashes 2 of the 6 new
+    tests (27 pass, 2 crash out of 29); reverted after measurement, 29/29 (Debug and
+    ReleaseFast).
+  - Still open: M5 (needs the shared ctgrind/valgrind lane), M6 (KSF pluggability —
+    named question to the user), L2 (removing two unreachable error-set members —
+    P3, needs asking), L4 (preamble coverage rests entirely on the two RFC vectors —
+    closing it needs a hand-built independent construction of the preamble from
+    RFC §6.3.3, not attempted this wave).
 - **2026-09-10** — A1 audit fix campaign, `A1/opaque.md` H1/H2/M1/M2/L1/L3/L5 (0 consumers
   in this repo, P1 applies). None of these change the wire protocol or existing test
   vectors.
