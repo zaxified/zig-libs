@@ -95,8 +95,15 @@ pub const hwaddr_len = 6;
 pub const EthHeader = struct {
     dst: [hwaddr_len]u8,
     src: [hwaddr_len]u8,
-    /// EtherType in host byte order (e.g. `0x0806` for ARP). For an 802.1Q
-    /// frame this is `0x8100`; the real type sits inside the VLAN tag.
+    /// EtherType in host byte order (e.g. `0x0806` for ARP). ⚠ On Linux this
+    /// is the type the KERNEL delivered, not necessarily what a wire-level
+    /// tool like `tcpdump` reports: `skb_vlan_untag` strips an 802.1Q tag
+    /// before any AF_PACKET tap sees the frame, so a VLAN-tagged frame's
+    /// `ethertype` here is the INNER type, never `0x8100` — measured against
+    /// a real veth pair, `tcpdump` on the same wire shows the tag and this
+    /// module does not. The tag itself (`tp_vlan_tci`) isn't exposed by this
+    /// module at all. See `A1/rawsock.md` F3 (open — this is a documentation
+    /// fix only; making the tag visible needs `PACKET_AUXDATA` + `recvmsg`).
     ethertype: u16,
 
     /// Decode the first 14 bytes of `frame`; null if the frame is too short.
@@ -160,7 +167,13 @@ pub const LinkAddr = struct {
     protocol: u16,
     /// `PACKET_HOST` / `PACKET_BROADCAST` / `PACKET_OUTGOING` / … (see `pkt`).
     pkttype: u8,
-    /// Valid bytes of `hwaddr` (`sll_halen`; 6 for Ethernet, 0 for cooked).
+    /// Valid bytes actually copied into `hwaddr` — always `<= hwaddr_len`
+    /// (6 for Ethernet, 0 for cooked), even if the kernel's `sll_halen`
+    /// itself reports more. Before this clamp the field echoed the raw
+    /// `sll_halen` verbatim (up to 255, `u8`'s full range) while `hwaddr` is
+    /// a fixed `[6]u8` — `la.hwaddr[0..la.halen]`, which the doc's own
+    /// example invites, panicked in Debug/ReleaseSafe and was UB in
+    /// ReleaseFast. See `A1/rawsock.md` F7.
     halen: u8,
     /// Source hardware address, zero-padded to 6 bytes.
     hwaddr: [hwaddr_len]u8,
@@ -173,7 +186,7 @@ pub const LinkAddr = struct {
             .ifindex = sll.ifindex,
             .protocol = std.mem.bigToNative(u16, sll.protocol),
             .pkttype = sll.pkttype,
-            .halen = sll.halen,
+            .halen = @intCast(n), // clamped to hwaddr_len — see the field's doc (F7)
             .hwaddr = mac,
         };
     }
@@ -234,10 +247,13 @@ pub const bpf = struct {
     }
 };
 
-/// Build a classic-BPF program that accepts only frames whose outer EtherType
+/// Build a classic-BPF program that accepts only frames whose EtherType
 /// equals `ethertype` and drops the rest — the `ether proto X` filter, applied
-/// in-kernel via `Socket.setFilter`. Pure and usable without a socket. Note it
-/// matches the *outer* type, so 802.1Q-tagged frames read as `0x8100`.
+/// in-kernel via `Socket.setFilter`. Pure and usable without a socket. ⚠ On
+/// Linux the kernel has already stripped any 802.1Q tag before this filter
+/// runs (see `EthHeader.ethertype`'s doc), so for a tagged frame this matches
+/// the INNER type, not the outer `0x8100` — a filter built for "ARP only"
+/// passes ARP from every VLAN indiscriminately. See `A1/rawsock.md` F3.
 pub fn etherTypeFilter(ethertype: u16) [4]BpfInsn {
     return .{
         bpf.stmt(bpf.ld | bpf.h | bpf.abs, 12), // A = ethertype halfword at offset 12
@@ -275,17 +291,43 @@ pub const arp = struct {
     }
 
     /// A parsed ARP reply: the sender's IP (as `netaddr.Ip`) and MAC.
-    pub const Reply = struct { ip: netaddr.Ip, mac: [hwaddr_len]u8 };
+    pub const Reply = struct {
+        ip: netaddr.Ip,
+        mac: [hwaddr_len]u8,
+        /// Whether the Ethernet source address equals the ARP sender MAC.
+        /// True for an ordinary reply; false is not itself invalid — a
+        /// legitimate proxy-ARP responder answers on someone else's behalf —
+        /// but it is also the classic `arpwatch` signature of a spoofed
+        /// reply. RFC 826 doesn't require the two to match, so `parseReply`
+        /// doesn't reject on a mismatch; it surfaces the comparison and lets
+        /// the caller decide. See `A1/rawsock.md` F2.
+        sender_is_eth_src: bool,
+    };
 
     /// Parse an ARP *reply* frame → sender IP + MAC, or null (wrong
-    /// EtherType/oper or short frame). Skips outgoing requests (oper = 1).
+    /// EtherType/oper, short frame, or a hardware/protocol type this decoder
+    /// doesn't understand). Skips outgoing requests (oper = 1).
+    ///
+    /// Validates the four RFC 826 fields the frame itself declares —
+    /// `ar$hrd` (hardware type), `ar$pro` (protocol type), `ar$hln`
+    /// (hardware address length), `ar$pln` (protocol address length) — before
+    /// trusting the fixed byte offsets below them. Without this a frame that
+    /// declares `ar$pro = 0x86dd` (IPv6) with `ar$pln = 16` decodes the first
+    /// four bytes of a 16-byte IPv6 address as a bogus `netaddr.Ip.v4`; a
+    /// live 802.1Q-segment test found 16 of 23 forged replies accepted this
+    /// way before this check existed. See `A1/rawsock.md` F2.
     pub fn parseReply(frame: []const u8) ?Reply {
         if (frame.len < request_len) return null;
         if (std.mem.readInt(u16, frame[12..14], .big) != eth_p.arp) return null;
+        if (std.mem.readInt(u16, frame[14..16], .big) != 0x0001) return null; // ar$hrd: Ethernet
+        if (std.mem.readInt(u16, frame[16..18], .big) != eth_p.ip) return null; // ar$pro: IPv4
+        if (frame[18] != hwaddr_len) return null; // ar$hln
+        if (frame[19] != 4) return null; // ar$pln
         if (std.mem.readInt(u16, frame[20..22], .big) != 0x0002) return null; // not a reply
         return .{
             .ip = .{ .v4 = frame[28..32].* },
             .mac = frame[22..28].*,
+            .sender_is_eth_src = std.mem.eql(u8, frame[6..12], frame[22..28]),
         };
     }
 };
@@ -301,6 +343,12 @@ pub const OpenError = error{
     BindFailed,
     /// `socket(2)` failed for another reason.
     SocketFailed,
+    /// `Options.recv_timeout_ms` was requested but `SO_RCVTIMEO` could not be
+    /// set — previously discarded silently, leaving a socket that blocks
+    /// forever while the caller believes it has a timeout. See F13.
+    TimeoutFailed,
+    /// `Options.recv_buf_bytes` was requested but `SO_RCVBUF` could not be set.
+    RcvBufFailed,
 };
 
 pub const RecvError = error{
@@ -326,7 +374,16 @@ pub const FilterError = error{
 
 pub const PromiscError = error{ AccessDenied, PromiscFailed };
 
-pub const IfaceError = error{ NoSuchInterface, SocketFailed };
+pub const IfaceError = error{
+    NoSuchInterface,
+    SocketFailed,
+    /// `hwaddr()` only: the interface's hardware-address family isn't
+    /// `ARPHRD_ETHER` — a tunnel, `lo`, or anything else without a real
+    /// Ethernet MAC. See F6.
+    NotEthernet,
+};
+
+pub const StatsError = error{StatsFailed};
 
 // ── Socket ────────────────────────────────────────────────────────────────────
 
@@ -340,10 +397,25 @@ pub const Socket = struct {
     pub const Options = struct {
         /// Bind capture to this interface by name; null = all interfaces.
         iface: ?[]const u8 = null,
-        /// `SO_RCVTIMEO` in milliseconds; 0 = block forever.
+        /// `SO_RCVTIMEO` in milliseconds; 0 = block forever. ⚠ Bounds ONE
+        /// `recvfrom` call, not "wait up to N ms for a frame I care about" —
+        /// a caller that loops `recv` while discarding frames of the wrong
+        /// type restarts the timer every call, so the loop as a whole can
+        /// run far longer than this budget (measured: a 200 ms budget, a
+        /// loop discarding unwanted frames, and a flooding peer produced a
+        /// 19.2 SECOND wait). Attach a `setFilter` in-kernel filter instead
+        /// of filtering in the loop if the wait must actually be bounded —
+        /// the same setup measured 204–207 ms instead. See `A1/rawsock.md` F8.
         recv_timeout_ms: u32 = 0,
         /// Open the socket non-blocking (`recv` returns `WouldBlock`).
         nonblocking: bool = false,
+        /// `SO_RCVBUF` in bytes; null = kernel default (commonly ~212 KiB).
+        /// The socket's receive queue is exactly what stands between a burst
+        /// of frames and `PACKET_STATISTICS`' `drops` counter (`Socket.stats`)
+        /// — the default was measured losing 98.9% of a 20,000-frame burst
+        /// silently (`recv` returns `WouldBlock`, indistinguishable from a
+        /// quiet wire, unless the caller reads `stats()`). See F5/F14.
+        recv_buf_bytes: ?u32 = null,
     };
 
     /// Open a `SOCK_RAW` capture socket for `ethertype` (use `eth_p.all` for
@@ -363,7 +435,14 @@ pub const Socket = struct {
         const fd: i32 = @intCast(rc);
         errdefer _ = linux.close(fd);
 
-        if (opts.recv_timeout_ms != 0) setRcvTimeout(fd, opts.recv_timeout_ms);
+        if (opts.recv_buf_bytes) |bytes| {
+            var sz: u32 = bytes;
+            const rcvbuf_rc = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&sz), @sizeOf(u32));
+            if (linux.errno(rcvbuf_rc) != .SUCCESS) return error.RcvBufFailed;
+        }
+        if (opts.recv_timeout_ms != 0) {
+            setRcvTimeout(fd, opts.recv_timeout_ms) catch return error.TimeoutFailed;
+        }
         if (opts.iface) |name| {
             const idx = ifaceIndexOn(fd, name) catch return error.NoSuchInterface;
             try bindPacket(fd, idx, ethertype);
@@ -388,26 +467,56 @@ pub const Socket = struct {
         return .{ .fd = fd };
     }
 
-    /// Receive one frame into `buf`. `Frame.bytes` aliases `buf`; the source
-    /// link-layer address is decoded from `sockaddr_ll`.
+    /// Receive one frame into `buf`. `Frame.bytes` aliases `buf` (truncated
+    /// to `buf.len` if the frame was longer — compare against `Frame.wire_len`
+    /// to detect that); the source link-layer address is decoded from
+    /// `sockaddr_ll`.
     pub fn recv(self: Socket, buf: []u8) RecvError!Frame {
         var sll: linux.sockaddr.ll = undefined;
         var slen: linux.socklen_t = @sizeOf(linux.sockaddr.ll);
-        const n = linux.recvfrom(self.fd, buf.ptr, buf.len, 0, @ptrCast(&sll), &slen);
+        // MSG_TRUNC: on a truncated datagram/packet the kernel returns the
+        // full ON-THE-WIRE length, not the number of bytes actually copied
+        // into `buf` — without it those two numbers are conflated and a
+        // caller with a buffer smaller than the frame (a smaller MTU
+        // assumption, a jumbo frame, "I only need the header") gets a
+        // truncated frame that is indistinguishable from a complete one.
+        // See `A1/rawsock.md` F1.
+        const n = linux.recvfrom(self.fd, buf.ptr, buf.len, linux.MSG.TRUNC, @ptrCast(&sll), &slen);
         switch (linux.errno(n)) {
             .SUCCESS => {},
             .AGAIN => return error.WouldBlock,
             .INTR => return error.Interrupted,
             else => return error.RecvFailed,
         }
+        const wire_len: usize = n;
+        const copied = @min(wire_len, buf.len);
         const la = LinkAddr.fromSockaddr(sll);
         return .{
-            .bytes = buf[0..n],
+            .bytes = buf[0..copied],
+            .wire_len = wire_len,
             .ifindex = la.ifindex,
             .src_hwaddr = la.hwaddr,
             .ethertype = la.protocol,
             .pkttype = la.pkttype,
         };
+    }
+
+    /// `struct tpacket_stats` (not exposed by std): frames the kernel queued
+    /// for this socket and how many of those it had to drop because the
+    /// receive queue (`Options.recv_buf_bytes` / `SO_RCVBUF`) was full before
+    /// the caller ever called `recv`. ⚠ Reading this resets the kernel's
+    /// counters — `getsockopt(PACKET_STATISTICS)` semantics — so call it once
+    /// per measurement window, not speculatively between every `recv`.
+    ///
+    /// Without this there is no way to tell a socket that lost 98.9% of a
+    /// burst from one that saw a quiet wire: both return `error.WouldBlock`
+    /// from `recv`. See `A1/rawsock.md` F5.
+    pub fn stats(self: Socket) StatsError!struct { packets: u32, drops: u32 } {
+        var st: TpacketStats = undefined;
+        var len: linux.socklen_t = @sizeOf(TpacketStats);
+        const rc = linux.getsockopt(self.fd, linux.SOL.PACKET, linux.PACKET.STATISTICS, @ptrCast(&st), &len);
+        if (linux.errno(rc) != .SUCCESS) return error.StatsFailed;
+        return .{ .packets = st.packets, .drops = st.drops };
     }
 
     /// Cooked send: the kernel prepends an Ethernet header (dst = `dst_hwaddr`,
@@ -491,6 +600,11 @@ pub const Socket = struct {
 /// `SOCK_RAW` sockets).
 pub const Frame = struct {
     bytes: []u8,
+    /// The frame's real length on the wire — from `MSG_TRUNC`. Equal to
+    /// `bytes.len` when the whole frame fit in the caller's buffer;
+    /// `bytes.len < wire_len` means the frame was truncated to fit and
+    /// `bytes` holds only its first `bytes.len` octets. See F1.
+    wire_len: usize,
     ifindex: i32,
     src_hwaddr: [hwaddr_len]u8,
     /// EtherType from `sockaddr_ll` (host byte order).
@@ -525,7 +639,10 @@ pub fn ifaceName(fd: i32, ifindex: i32, out: *[16]u8) IfaceError![]const u8 {
 }
 
 /// Read an interface's hardware (MAC) address by index (`SIOCGIFNAME` then
-/// `SIOCGIFHWADDR`; ioctls on `fd`).
+/// `SIOCGIFHWADDR`; ioctls on `fd`). `error.NotEthernet` for an interface
+/// whose hardware-address family isn't `ARPHRD_ETHER` — a tunnel, `lo`, or
+/// anything else that doesn't have a real 6-byte MAC (see `hwaddrFromIfreq`
+/// and `A1/rawsock.md` F6).
 pub fn hwaddr(fd: i32, ifindex: i32) IfaceError![hwaddr_len]u8 {
     var namebuf: [16]u8 = undefined;
     const name = try ifaceName(fd, ifindex, &namebuf);
@@ -533,10 +650,7 @@ pub fn hwaddr(fd: i32, ifindex: i32) IfaceError![hwaddr_len]u8 {
     @memcpy(req.name[0..name.len], name);
     if (linux.errno(linux.ioctl(fd, linux.SIOCGIFHWADDR, @intFromPtr(&req))) != .SUCCESS)
         return error.NoSuchInterface;
-    // ifr_hwaddr is a sockaddr: family(2) then sa_data — MAC at bytes [2..8].
-    var mac: [hwaddr_len]u8 = undefined;
-    @memcpy(&mac, req.un[2..8]);
-    return mac;
+    return hwaddrFromIfreq(req) orelse error.NotEthernet;
 }
 
 /// Read an interface's IPv4 address by index (`SIOCGIFNAME` then
@@ -602,6 +716,35 @@ const PacketMreq = extern struct {
 /// but not the membership-request types).
 const PACKET_MR_PROMISC: u16 = 1;
 
+/// `struct tpacket_stats` (not exposed by std) — the payload of
+/// `getsockopt(SOL_PACKET, PACKET_STATISTICS)`, read by `Socket.stats`.
+const TpacketStats = extern struct {
+    packets: u32,
+    drops: u32,
+};
+
+/// `ARPHRD_ETHER` (`net/if_arp.h`, not exposed by std) — the hardware-address
+/// type `hwaddr()` knows how to interpret as a 6-byte Ethernet MAC.
+const ARPHRD_ETHER: u16 = 1;
+
+/// Decode `ifr_hwaddr` from a `SIOCGIFHWADDR` reply: family (2 bytes,
+/// native-endian, matching the `@bitCast` style `ifaceIndexOn` and the
+/// `sockaddrInAddr` test already use for this union) then sa_data — MAC at
+/// bytes [2..8], the same offset `sockaddrInAddr` documents for the sibling
+/// `sockaddr_in` shape (no port field here, unlike that one). Null when the
+/// family isn't `ARPHRD_ETHER`: a `sit` tunnel reports its own 4-byte remote
+/// address there (measured: `198.51.100.7` read back as MAC
+/// `c6:33:64:07:00:00`), and `lo`/`gre0` report an all-zero address
+/// indistinguishable from a real zero MAC. Neither is a MAC address this
+/// module has any business returning. See `A1/rawsock.md` F6.
+fn hwaddrFromIfreq(req: ifreq) ?[hwaddr_len]u8 {
+    const family: u16 = @bitCast(req.un[0..2].*);
+    if (family != ARPHRD_ETHER) return null;
+    var mac: [hwaddr_len]u8 = undefined;
+    @memcpy(&mac, req.un[2..8]);
+    return mac;
+}
+
 fn ifaceIndexOn(fd: i32, name: []const u8) error{NoSuchInterface}!i32 {
     if (name.len == 0 or name.len > 15) return error.NoSuchInterface;
     var req: ifreq = .{};
@@ -624,12 +767,18 @@ fn bindPacket(fd: i32, ifindex: i32, ethertype: u16) OpenError!void {
         return error.BindFailed;
 }
 
-fn setRcvTimeout(fd: i32, ms: u32) void {
+/// Set `SO_RCVTIMEO`. Was `fn (...) void` with `_ = linux.setsockopt(...)` —
+/// a failed `setsockopt` was silently discarded, so `open` could return a
+/// socket that blocks forever while the caller believes `recv_timeout_ms`
+/// is in effect. Now the failure reaches `open`'s caller as
+/// `error.TimeoutFailed`. See `A1/rawsock.md` F13.
+fn setRcvTimeout(fd: i32, ms: u32) error{TimeoutFailed}!void {
     const tv = linux.timeval{
         .sec = @intCast(ms / 1000),
         .usec = @intCast((ms % 1000) * 1000),
     };
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
+    const rc = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), @sizeOf(linux.timeval));
+    if (linux.errno(rc) != .SUCCESS) return error.TimeoutFailed;
 }
 
 fn sendTo(fd: i32, sll: *const linux.sockaddr.ll, data: []const u8) SendError!void {
@@ -677,6 +826,12 @@ test "hwaddr format/parse round-trip" {
         "",                  "0a:1b:2c:3d:4e",    "0a:1b:2c:3d:4e:5f:60",
         "0a:1b:2c:3d:4e:5g", "0a1b2c3d4e5f",      "0a:1b:2c:3d:4e:5",
         "0a:1b:2c-3d:4e:5f", "za:1b:2c:3d:4e:5f",
+        // F15: a right-length (17), right-hex-digit string whose separator is
+        // uniformly wrong throughout — the two prior bad vectors either fail
+        // on length ("0a1b2c3d4e5f") or on a MIXED separator
+        // ("0a:1b:2c-3d:4e:5f"), so neither exercises `sep != ':' and sep !=
+        // '-'` on its own; a mutant that deletes that check alone survived.
+        "0a.1b.2c.3d.4e.5f",
     };
     for (bad) |t| try testing.expectEqual(@as(?[hwaddr_len]u8, null), parseHwaddr(t));
 }
@@ -707,7 +862,13 @@ test "LinkAddr.fromSockaddr decode" {
     // to 6, not read/write past the fixed-size hwaddr buffer.
     var oversized = sll;
     oversized.halen = 8;
-    try testing.expectEqual([_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, LinkAddr.fromSockaddr(oversized).hwaddr);
+    const decoded_oversized = LinkAddr.fromSockaddr(oversized);
+    try testing.expectEqual([_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66 }, decoded_oversized.hwaddr);
+    // F7: the REPORTED halen must clamp too, not just the copy. Before this
+    // fix `la.halen` echoed `sll.halen` verbatim (8, even 255), so
+    // `la.hwaddr[0..la.halen]` — which the field's own doc example invited —
+    // panicked in Debug/ReleaseSafe and was UB in ReleaseFast.
+    try testing.expectEqual(@as(u8, hwaddr_len), decoded_oversized.halen);
 }
 
 test "etherTypeFilter encodes the classic ether-proto program" {
@@ -772,6 +933,135 @@ test "arp build/parse round-trip (surfaces netaddr.Ip)" {
     const got = arp.parseReply(&reply).?;
     try testing.expectEqual(rep_mac, got.mac);
     try testing.expect(got.ip.eql(.{ .v4 = target_ip }));
+    // F2: `reply`'s Ethernet source is still `src_mac` (only frame[22..32]
+    // was overwritten above), but the ARP sender MAC is `rep_mac` — a
+    // deliberate mismatch, e.g. a proxy-ARP responder answering on someone
+    // else's behalf. RFC 826 doesn't forbid this, so `parseReply` still
+    // ACCEPTS it; it only surfaces the disagreement for the caller to act on.
+    try testing.expect(!got.sender_is_eth_src);
+}
+
+test "F2 fix: RFC 826 hrd/pro/hln/pln validation, offline against the real-capture golden" {
+    // Vector #10 from A1/rawsock.md F2: a well-formed-looking reply whose
+    // ar$pro/ar$pln claim IPv6 (0x86dd / 16) instead of IPv4 (0x0800 / 4).
+    // Before this check, `parseReply` didn't read these fields at all and
+    // decoded the first four bytes of the (would-be) 16-byte IPv6 address as
+    // a bogus `netaddr.Ip.v4` — live on a real segment, 16 of 23 forged
+    // replies like this were accepted.
+    var ipv6_shaped = arp_reply_frame;
+    std.mem.writeInt(u16, ipv6_shaped[16..18], eth_p.ipv6, .big); // ar$pro
+    ipv6_shaped[19] = 16; // ar$pln
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&ipv6_shaped));
+
+    var bad_htype = arp_reply_frame;
+    std.mem.writeInt(u16, bad_htype[14..16], 6, .big); // ar$hrd = IEEE 802, not Ethernet
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&bad_htype));
+
+    var bad_hlen = arp_reply_frame;
+    bad_hlen[18] = 0; // ar$hln
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&bad_hlen));
+
+    var bad_pro = arp_reply_frame;
+    std.mem.writeInt(u16, bad_pro[16..18], eth_p.ip, .big); // ar$pro left IPv4 (correct)...
+    bad_pro[19] = 16; // ...but ar$pln alone claims 16 (RFC-inconsistent on its own)
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&bad_pro));
+
+    // Positive control: the real-capture golden, untouched, must still pass —
+    // these checks must not be stricter than a real ARP reply.
+    try testing.expect(arp.parseReply(&arp_reply_frame) != null);
+}
+
+test "F12: parseReply length boundary — 41B rejected, the real 42B golden accepted" {
+    // `m5`/`m6` from the audit's mutation matrix: deleting `frame.len <
+    // request_len` (m5) or weakening it to `< 22` (m6) both survived the
+    // existing tests because nothing in the suite exercised a frame between
+    // those two lengths and 42. 41 bytes: one short of a complete reply, and
+    // long enough (`> 22`) that a weakened check would let it through.
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(arp_reply_frame[0..41]));
+    try testing.expect(arp.parseReply(&arp_reply_frame) != null); // positive control
+}
+
+test "F12: parseReply rejects a 30-byte frame inside the m6-weakened `< 22` gap" {
+    var buf: [30]u8 = undefined;
+    @memcpy(&buf, arp_reply_frame[0..30]);
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&buf));
+}
+
+test "F12: parseReply rejects every oper value except 2 (reply), enumerated 0..15" {
+    // `m10`: `oper` compared by a single bit out of sixteen instead of exact
+    // equality survived because the suite's only rejection vector was
+    // `oper == 1`, which a 1-bit comparison also rejects — `arpmat` measured
+    // the 1-bit version accepting `oper == 8`. Enumerating every value in
+    // 0..15 individually forces exact equality, not just "differs from 1".
+    var f = arp_reply_frame;
+    var op: u16 = 0;
+    while (op <= 15) : (op += 1) {
+        std.mem.writeInt(u16, f[20..22], op, .big);
+        if (op == 0x0002) {
+            try testing.expect(arp.parseReply(&f) != null);
+        } else {
+            try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&f));
+        }
+    }
+}
+
+test "F16: ifaceIndexOn rejects an over-length interface name before any syscall" {
+    // `m21`: deleting `name.len == 0 or name.len > 15` survived the test
+    // gate in BOTH lanes and, in ReleaseFast, the module's own example
+    // exits 0 while `@memcpy` writes past the intent of the fixed 16-byte
+    // `ifreq.name` (a 30-byte name in that reproduction; here 20 is enough
+    // to prove the point without relying on Debug's bounds-check panic vs.
+    // ReleaseFast's silent UB — either way, with the guard PRESENT this call
+    // must return cleanly, syscall never reached (fd -1 would surface as a
+    // syscall failure, not this specific error, if the guard were skipped
+    // and the copy somehow survived).
+    const too_long = "a" ** 20;
+    try testing.expectEqual(error.NoSuchInterface, ifaceIndexOn(-1, too_long));
+}
+
+test "F12/F16: ifaceName on `lo` round-trips and is NUL-terminated (unprivileged)" {
+    // `m22`: `ifaceName` returning all 16 raw bytes of `ifr_ifrn.ifrn_name`
+    // instead of truncating at the NUL survived because nothing compared its
+    // result to the interface's actual (short) name. `ifaceByName`/
+    // `ifaceName` only need a throwaway AF_INET socket for the ioctl (see
+    // `ipv4Addr`'s test above), so this runs unconditionally.
+    const rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    try testing.expectEqual(.SUCCESS, linux.errno(rc));
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    const lo = try ifaceByName("lo");
+    var buf: [16]u8 = undefined;
+    const name = try ifaceName(fd, lo, &buf);
+    try testing.expectEqualStrings("lo", name);
+}
+
+test "F6: hwaddrFromIfreq rejects a non-Ethernet hardware-address family, offline" {
+    // Real values from the audit's `probe hwtypes` (A1/rawsock.md F6):
+    // ARPHRD_ETHER=1 (veth, a real MAC), ARPHRD_SIT=776 (a `sit` tunnel,
+    // whose 4-byte remote address `198.51.100.7` was read back as MAC
+    // `c6:33:64:07:00:00`), ARPHRD_LOOPBACK=772 (`lo`, all-zero).
+    var eth_req: ifreq = .{};
+    eth_req.un[0..2].* = @bitCast(@as(u16, 1)); // ARPHRD_ETHER
+    eth_req.un[2..8].* = .{ 0xbe, 0x68, 0x94, 0xcf, 0xca, 0xfc };
+    try testing.expectEqual([_]u8{ 0xbe, 0x68, 0x94, 0xcf, 0xca, 0xfc }, hwaddrFromIfreq(eth_req).?);
+
+    var sit_req: ifreq = .{};
+    sit_req.un[0..2].* = @bitCast(@as(u16, 776)); // ARPHRD_SIT
+    sit_req.un[2..8].* = .{ 0xc6, 0x33, 0x64, 0x07, 0x00, 0x00 }; // 198.51.100.7 as hex
+    try testing.expectEqual(@as(?[hwaddr_len]u8, null), hwaddrFromIfreq(sit_req));
+
+    var lo_req: ifreq = .{};
+    lo_req.un[0..2].* = @bitCast(@as(u16, 772)); // ARPHRD_LOOPBACK
+    try testing.expectEqual(@as(?[hwaddr_len]u8, null), hwaddrFromIfreq(lo_req));
+
+    // The offset itself, pinned: bytes [2..8) are the MAC, [8..10) are NOT —
+    // a mutant that shifts the read window (audit's `m23_hwaddr_offset`,
+    // `un[4..10]` instead of `un[2..8]`) must fail this.
+    var offset_req: ifreq = .{};
+    offset_req.un[0..2].* = @bitCast(@as(u16, 1));
+    offset_req.un[2..10].* = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0xff, 0xff };
+    try testing.expectEqual([_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 }, hwaddrFromIfreq(offset_req).?);
 }
 
 // ── real-capture goldens (veth pair, tcpdump, 2026-08-01) ───────────────────
@@ -1235,6 +1525,121 @@ test "loopback round-trip: inject a frame, capture it back (needs CAP_NET_RAW + 
         }
     }
     return error.SkipZigTest; // couldn't observe it within the window
+}
+
+test "F13 fix: setRcvTimeout surfaces a failed setsockopt instead of discarding it" {
+    // fd -1 makes setsockopt fail with EBADF, unconditionally, no privilege
+    // needed. Before F13 this call was `fn (...) void` with `_ =` in front
+    // of the setsockopt — there was no way to observe this at all; the
+    // socket would silently NOT have a timeout and nothing would say so.
+    try testing.expectError(error.TimeoutFailed, setRcvTimeout(-1, 200));
+}
+
+test "F1 fix: recv() reports wire_len distinct from a truncated bytes.len (needs CAP_NET_RAW + netns)" {
+    const lo = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+
+    var cap = Socket.open(test_ethertype, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+
+    var inj = Socket.openInject(lo) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer inj.close();
+
+    // A payload well over a deliberately small capture buffer: 100 bytes ->
+    // a 114-byte frame (14-byte Ethernet header + 100), read into 20 bytes.
+    var payload: [100]u8 = undefined;
+    @memset(&payload, 0xab);
+    const dst = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    inj.send(lo, dst, test_ethertype, &payload) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+
+    var small_buf: [20]u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const frame = cap.recv(&small_buf) catch |e| switch (e) {
+            error.WouldBlock, error.Interrupted => return error.SkipZigTest,
+            else => return e,
+        };
+        if (frame.ethertype != test_ethertype) continue;
+        // BEFORE F1 this frame was indistinguishable from a complete 20-byte
+        // one: `bytes.len == buf.len` either way, and `Frame` had no second
+        // number to compare it against. `wire_len` is the fix.
+        try testing.expectEqual(@as(usize, 20), frame.bytes.len);
+        try testing.expectEqual(@as(usize, eth_hdr_len + payload.len), frame.wire_len);
+        try testing.expect(frame.bytes.len < frame.wire_len);
+        return;
+    }
+    return error.SkipZigTest;
+}
+
+test "F5 fix: Socket.stats() reports a real packet count (needs CAP_NET_RAW + netns)" {
+    const lo = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+
+    var cap = Socket.open(test_ethertype, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+
+    var inj = Socket.openInject(lo) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer inj.close();
+    const dst = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    inj.send(lo, dst, test_ethertype, "stats-probe") catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+
+    // Drain until we see our own frame, so the kernel has definitely counted
+    // at least one packet for this socket.
+    var buf: [256]u8 = undefined;
+    var tries: usize = 0;
+    var seen = false;
+    while (tries < 8 and !seen) : (tries += 1) {
+        const frame = cap.recv(&buf) catch |e| switch (e) {
+            error.WouldBlock, error.Interrupted => break,
+            else => return e,
+        };
+        if (frame.ethertype == test_ethertype) seen = true;
+    }
+    if (!seen) return error.SkipZigTest;
+
+    // BEFORE F5 there was no way to ask the kernel this at all — a socket
+    // that lost every frame to a full receive queue and one that saw a
+    // quiet wire both returned `error.WouldBlock` from `recv`. `stats()` is
+    // the fix; a real, positive, kernel-reported count is the measurement.
+    const after = try cap.stats();
+    try testing.expect(after.packets >= 1);
+}
+
+test "F14 fix: Options.recv_buf_bytes actually moves SO_RCVBUF (needs CAP_NET_RAW)" {
+    var sock = Socket.open(test_ethertype, .{ .iface = "lo", .recv_buf_bytes = 8192 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer sock.close();
+
+    var got: u32 = 0;
+    var len: linux.socklen_t = @sizeOf(u32);
+    const rc = linux.getsockopt(sock.fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&got), &len);
+    try testing.expectEqual(.SUCCESS, linux.errno(rc));
+    // The kernel doubles whatever is requested and enforces its own floor
+    // (man socket(7)), so this isn't byte-exact — but BEFORE F14 there was no
+    // knob at all: every socket got this kernel's default, measured 212992
+    // in `A1/rawsock.md` F5/F14 (and directly responsible for that finding's
+    // 98.9% burst loss). Requesting 8192 must move it well below that.
+    try testing.expect(got < 212992);
 }
 
 test {

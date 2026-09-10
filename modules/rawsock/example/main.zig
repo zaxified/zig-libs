@@ -126,8 +126,16 @@ pub fn main() !void {
 
     const lo_name = try rawsock.ifaceName(fd, lo, &namebuf);
     if (!std.mem.eql(u8, lo_name, "lo")) return error.WrongIfaceName;
-    const lo_hw = try rawsock.hwaddr(fd, lo);
-    std.debug.print("lo: index={d} name={s} hwaddr={any}\n", .{ lo, lo_name, lo_hw });
+    if (rawsock.hwaddr(fd, lo)) |lo_hw| {
+        std.debug.print("lo: index={d} name={s} hwaddr={any}\n", .{ lo, lo_name, lo_hw });
+    } else |err| switch (err) {
+        // Expected on `lo`: its hardware-address family is ARPHRD_LOOPBACK,
+        // not ARPHRD_ETHER, so it has no real 6-byte MAC to report (A1/rawsock.md
+        // F6 — `hwaddr` used to return an all-zero address here, indistinguishable
+        // from a real zero MAC).
+        error.NotEthernet => std.debug.print("lo: index={d} name={s} hwaddr=n/a (not an Ethernet-shaped interface)\n", .{ lo, lo_name }),
+        else => return err,
+    }
 
     if (rawsock.ipv4Addr(fd, lo)) |addr| {
         std.debug.print("lo: ipv4={any} netmask={any}\n", .{ addr, try rawsock.ipv4Netmask(fd, lo) });
@@ -154,7 +162,10 @@ pub fn main() !void {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.NoSuchInterface => std.debug.print("ifaceByName(\"zig-libs-example-no-such-iface\"): NoSuchInterface (expected)\n", .{}),
-        error.SocketFailed => return err,
+        // `ifaceByName` never actually returns `NotEthernet` (only `hwaddr`
+        // does), but `IfaceError` is one shared set and this switch is
+        // exhaustive over it.
+        error.SocketFailed, error.NotEthernet => return err,
     }
 
     // ── 5. LIVE, gated on CAP_NET_RAW: the AF_PACKET path ──────────────────
@@ -194,7 +205,7 @@ pub fn main() !void {
             "Socket.open(AF_PACKET): AccessDenied (expected -- no CAP_NET_RAW on this host)\n",
             .{},
         ),
-        error.NoSuchInterface, error.BindFailed, error.SocketFailed => return err,
+        error.NoSuchInterface, error.BindFailed, error.SocketFailed, error.TimeoutFailed, error.RcvBufFailed => return err,
     }
 
     std.debug.print("OK: all rawsock example checks passed\n", .{});

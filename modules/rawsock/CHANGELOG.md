@@ -5,6 +5,50 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign (no consumers in-repo, P1 applies): ten of the audit's
+  sixteen findings closed. **New, additive:** `Frame.wire_len` via `MSG_TRUNC` — a frame
+  longer than the caller's buffer used to be indistinguishable from one that fit exactly
+  (F1); `Socket.stats()` (`PACKET_STATISTICS`) — a socket that silently dropped 98.9% of a
+  burst returned the same `error.WouldBlock` as a quiet wire, with no way to tell them apart
+  (F5); `Options.recv_buf_bytes` (`SO_RCVBUF`) — the only knob on the queue size that
+  directly bounds F5's loss (F14); `arp.Reply.sender_is_eth_src` — the Ethernet source vs.
+  ARP sender MAC comparison `arpwatch`-style spoof detection depends on, surfaced rather
+  than decided for the caller (part of F2). **Input hardening** (P1, no consumer to break):
+  `arp.parseReply` now validates RFC 826's `ar$hrd`/`ar$pro`/`ar$hln`/`ar$pln` — before this,
+  a frame declaring `ar$pro = 0x86dd` (IPv6) with `ar$pln = 16` decoded the first four bytes
+  of a 16-byte address as a bogus IPv4 one; live on a real segment, 16 of 23 forged replies
+  like this were accepted (F2). `hwaddr()` now checks the interface's hardware-address
+  family and returns `error.NotEthernet` for anything that isn't `ARPHRD_ETHER` — a `sit`
+  tunnel's own 4-byte remote address used to come back dressed as a MAC, and `lo`/`gre0`
+  came back as an all-zero MAC indistinguishable from a real one (F6). **Bug fixes:**
+  `LinkAddr.halen` now reports the bytes actually copied (`<= hwaddr_len`), not the kernel's
+  raw `sll_halen` verbatim — the doc's own suggested `la.hwaddr[0..la.halen]` panicked in
+  Debug/ReleaseSafe and was UB in ReleaseFast on an oversized `sll_halen` (F7);
+  `setRcvTimeout`'s `setsockopt` failure is no longer discarded — `Options.recv_timeout_ms`
+  can now fail `open` with `error.TimeoutFailed` instead of silently leaving a socket that
+  blocks forever (F13). **Test-only, no production change:** the interface-name length guard
+  (`ifaceIndexOn`) and `ifaceName`'s NUL-termination are now exercised directly in the
+  privilege-free part of the test gate, not only by the example in Debug mode (F16); a
+  17-character hwaddr with a uniformly wrong separator closes the one missing vector for an
+  already-working check (F15); `arp.parseReply` gained a length-boundary ladder and a full
+  `oper` enumeration (0..15) narrowing two of the audit's un-killed mutation survivors (part
+  of F12, not closed as a whole — the socket-path survivors are untested by a unit test and
+  would need the audit's own two-gate mutation run). **Docs only:** `EthHeader.ethertype`'s
+  and `etherTypeFilter`'s comments no longer claim Linux preserves an 802.1Q tag before
+  delivery — measured against a real veth pair and `tcpdump` on the same wire, it doesn't
+  (F3, doc half only — the tag stays invisible to this module); `Options.recv_timeout_ms`'s
+  doc now says explicitly that it bounds one `recvfrom` call, not a caller's whole wait loop
+  — measured 200 ms requested, 19.2 SECONDS actually waited against a flooding peer without
+  an attached filter (F8, closed — the module's own answer, an in-kernel filter, was already
+  correct; only the documentation gap remained).
+  Open, deferred: F3's code half (`PACKET_AUXDATA`/`recvmsg`, a new `Frame.vlan_tci`), F4
+  (the `setFilter` open→bind window), F10 (the `socket()`→`bind()` window), F11
+  (`formatHwaddr` perf, WONTFIX-shaped), F12 as a whole (see above). Measured RED→GREEN for
+  every closed item (mutation or a genuine live-socket run under `unshare --net`), and
+  `-Doptimize=ReleaseFast` in both a plain and a network-namespaced lane, not just Debug.
+  scripts/modtest rawsock: 27/32 (5 privileged skip without CAP_NET_RAW); under
+  `unshare --user --map-root-user --net`: 32/32, Debug and ReleaseFast alike.
+
 - **2026-09-07** — Test-only, no production change: two of the three fuzz targets had an
   entire arm that had never executed. `fuzzParseHwaddr` and `fuzzArpParseReply` both open
   with `smith.value(bool)` and neither had a corpus, so outside `--fuzz` the input was
