@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds a fuzz harness for
+  `KeyShare.fromBytesAlloc` (audit F8, MED — 12 of 15 public `fromBytes*`
+  entry points had zero fuzz coverage; this closes the highest-severity
+  one, the decoder whose missing validation was audit F2's HIGH). Corpus
+  seeds a real accepted `KeyShare`, the F2 "own index missing from
+  `public_keys`" shape as a corpus entry (not just the standalone
+  regression test), an index tampered to an absent value, a truncation,
+  and a header-only/empty input; a companion test pins that only the real
+  seed is accepted (1 of 5 non-empty seeds). No production code changed.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds a test isolating
   `verifyBobMtaWc`'s equation 6 (audit F4(a), MED) — the existing "wrong
   B" test tampers `b_point` only at verify time against a proof whose

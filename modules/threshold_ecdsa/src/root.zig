@@ -2190,6 +2190,7 @@ const Corpus = struct {
     const feld_buf_bytes = 512;
     const pk_buf_bytes = 4096;
     const aux_buf_bytes = 1024;
+    const ks_buf_bytes = 8192;
 
     feld_store: [8][4 + feld_buf_bytes]u8 = undefined,
     feld_entries: [8][]const u8 = undefined,
@@ -2197,6 +2198,8 @@ const Corpus = struct {
     pk_entries: [7][]const u8 = undefined,
     aux_store: [8][4 + aux_buf_bytes]u8 = undefined,
     aux_entries: [8][]const u8 = undefined,
+    ks_store: [6][4 + ks_buf_bytes]u8 = undefined,
+    ks_entries: [6][]const u8 = undefined,
 
     /// `bytes` with a u32-BE value written at `at`. The counted-field
     /// mutations are all of this shape: a real frame whose ONE length or count
@@ -2301,6 +2304,51 @@ const Corpus = struct {
         self.pk_entries[p] = fuzzSeedIntoLocal(&self.pk_store[p], "");
         p += 1;
         std.debug.assert(p == self.pk_entries.len);
+
+        // ── KeyShare: reuses the SAME real `key_shares[0]` built for the
+        //    PublicKeys section above, plus the audit F2 (HIGH) shape --
+        //    the "own index missing from public_keys" tuple that used to
+        //    panic/UB in `signWithShares` (2026-09-10 fix) -- as a fuzz
+        //    corpus seed, not just the standalone regression test at
+        //    "KeyShare.fromBytesAlloc rejects a tuple whose own index is
+        //    missing...". Audit F8: this decoder was one of 12 public
+        //    `fromBytes*` entry points with zero fuzz coverage, the same
+        //    dozen that includes every wire message a counterparty sends
+        //    during signing -- this closes the single highest-severity one
+        //    (F2 was HIGH, the others 11 are unfuzzed too but lower risk).
+        const ks_bytes = try key_shares[0].toBytesAlloc(allocator);
+        defer allocator.free(ks_bytes);
+        std.debug.assert(ks_bytes.len <= ks_buf_bytes);
+
+        var stripped_entries: std.ArrayList(PartyPublicKeys) = .empty;
+        defer stripped_entries.deinit(allocator);
+        for (key_shares[0].public_keys.entries) |e| {
+            if (e.index != key_shares[0].index) try stripped_entries.append(allocator, e);
+        }
+        var stripped = key_shares[0];
+        stripped.public_keys = .{ .entries = stripped_entries.items };
+        const ks_stripped_bytes = try stripped.toBytesAlloc(allocator);
+        defer allocator.free(ks_stripped_bytes);
+
+        var ks_scratch: [ks_buf_bytes]u8 = undefined;
+
+        var k: usize = 0;
+        self.ks_entries[k] = fuzzSeedIntoLocal(&self.ks_store[k], ks_bytes);
+        k += 1; // a real, accepted KeyShare
+        self.ks_entries[k] = fuzzSeedIntoLocal(&self.ks_store[k], ks_stripped_bytes);
+        k += 1; // audit F2 (HIGH): own index missing from public_keys -- must be rejected, not panic/UB
+        self.ks_entries[k] = fuzzSeedIntoLocal(
+            &self.ks_store[k],
+            withU32(&ks_scratch, ks_bytes, 0, 0xFFFF_FFFF),
+        );
+        k += 1; // index tampered to a value no public_keys entry carries either
+        self.ks_entries[k] = fuzzSeedIntoLocal(&self.ks_store[k], ks_bytes[0 .. ks_bytes.len - 1]);
+        k += 1; // truncated: the last length-prefixed field runs off the end
+        self.ks_entries[k] = fuzzSeedIntoLocal(&self.ks_store[k], ks_bytes[0..12]);
+        k += 1; // header only -- exercises the `bytes.len < 12 + Ns + Ne + Ne` floor
+        self.ks_entries[k] = fuzzSeedIntoLocal(&self.ks_store[k], "");
+        k += 1;
+        std.debug.assert(k == self.ks_entries.len);
 
         // ── AuxParams: a REAL ring-Pedersen triple, `h2 = h1^lambda mod Ñ`,
         //    from this module's own generator; plus the toy triple.
@@ -2466,6 +2514,41 @@ test "corpus: the AuxParams seeds reach the decoder, counts pinned" {
     try testing.expectEqual(corpus.aux_entries.len - 1, nonempty);
     try testing.expectEqual(@as(usize, 2), accepted);
     try testing.expectEqual(@as(usize, 2), n_widths);
+}
+
+test "fuzz: KeyShare.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    try testing.fuzz({}, fuzzKeyShareFromBytesAlloc, .{ .corpus = &corpus.ks_entries });
+}
+
+fn fuzzKeyShareFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [Corpus.ks_buf_bytes]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const result = KeyShare.fromBytesAlloc(allocator, buf[0..len]) catch return;
+    defer allocator.free(result.public_keys.entries);
+}
+
+test "corpus: the KeyShare seeds reach the decoder, only the well-formed one is accepted" {
+    // Pins that the audit-F2 "own index missing" seed, the tampered-index
+    // seed, the truncation and the header-only seed are all REJECTED (not
+    // silently mis-parsed) -- only the first, real seed decodes.
+    var corpus: Corpus = .{};
+    try corpus.build(testing.allocator);
+    var nonempty: usize = 0;
+    var accepted: usize = 0;
+    for (corpus.ks_entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [Corpus.ks_buf_bytes]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+        const result = KeyShare.fromBytesAlloc(testing.allocator, buf[0..len]) catch continue;
+        defer testing.allocator.free(result.public_keys.entries);
+        accepted += 1;
+    }
+    try testing.expectEqual(corpus.ks_entries.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 1), accepted);
 }
 
 /// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one — see the
