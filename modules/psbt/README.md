@@ -76,7 +76,7 @@ defer combined.deinit(allocator);
 
 ```zig
 // Mutates ps.inputs in place; one ?InputFinalizeError per input, null = finalized (or already was).
-const results = try psbt.finalize(allocator, ps);
+const results = try psbt.finalize(allocator, ps, .{});
 
 // Requires every input finalized (error.InputNotFinalized otherwise).
 var tx = try psbt.extract(allocator, ps);

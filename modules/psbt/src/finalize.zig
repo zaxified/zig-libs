@@ -319,7 +319,36 @@ pub const UtxoBindingError = error{
     /// the only one bound to the outpoint at all), so a `WITNESS_UTXO`
     /// contradicting it is a lie, not a shortcut.
     UtxoFieldsDisagree,
+    /// The resolved spent output's `value` is outside `0..=MAX_MONEY`
+    /// (A1 audit F1, unconditional half of the fix). Checked regardless of
+    /// which UTXO field supplied it: a `PSBT_IN_WITNESS_UTXO` carries no
+    /// link to the real previous transaction at all, so its `value` is a
+    /// bare assertion by the PSBT's (untrusted) author, and even a
+    /// txid-bound `PSBT_IN_NON_WITNESS_UTXO` only proves the bytes came
+    /// from *a* transaction with that txid preimage under sha256d, not that
+    /// the amount is a sane one -- neither check on its own bounds the
+    /// number `verifyScript`'s sighash computation, and downstream fee
+    /// arithmetic, will run on.
+    AmountOutOfRange,
+    /// `FinalizeOptions.require_non_witness_utxo` is set and this input
+    /// supplies no `PSBT_IN_NON_WITNESS_UTXO` (A1 audit F1, opt-in half of
+    /// the fix). With only a `PSBT_IN_WITNESS_UTXO`, the spent output's
+    /// scriptPubKey and amount are exactly what the PSBT's author typed in
+    /// -- `AmountOutOfRange` catches values outside the possible supply,
+    /// but a lie inside that range (audit's repro: a true 100 000 000 sat
+    /// UTXO asserted as 100 000) is internally consistent and passes it.
+    /// Off by default: a segwit-only signing flow that never sends
+    /// `NON_WITNESS_UTXO` is legitimate and this option would reject it
+    /// unconditionally (DECISIONS.md §2, psbt F1: "Vyžadovat
+    /// non_witness_utxo vždy ZAMÍTNUTO -- rozbije legitimní P2WPKH toky").
+    MissingNonWitnessUtxo,
 };
+
+/// Bitcoin's total possible supply in satoshis (21 000 000 BTC ×
+/// 100 000 000 sat/BTC) -- the same constant Bitcoin Core calls
+/// `MAX_MONEY` (`consensus/amount.h`) and checks every `CTxOut.nValue`
+/// against. Exported so callers can use it in their own policy checks too.
+pub const MAX_MONEY: i64 = 21_000_000 * 100_000_000;
 
 /// Resolve the output this input spends, **bound to the input**.
 ///
@@ -335,6 +364,7 @@ fn spentOutputFor(
     m: psbt.Map,
     utx: bitcointx.Transaction,
     index: usize,
+    require_non_witness_utxo: bool,
 ) (psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || UtxoBindingError)!?bitcointx.TxOut {
     if (index >= utx.vin.len) return null;
     const prevout = utx.vin[index].prevout;
@@ -349,13 +379,24 @@ fn spentOutputFor(
         from_non_witness = pt.vout[prevout.vout];
     }
 
-    if (try psbt.inputWitnessUtxo(m)) |wu| {
-        const nw = from_non_witness orelse return wu;
-        if (nw.value != wu.value or !std.mem.eql(u8, nw.script_pubkey, wu.script_pubkey))
-            return error.UtxoFieldsDisagree;
-        return nw;
+    if (require_non_witness_utxo and from_non_witness == null) return error.MissingNonWitnessUtxo;
+
+    const result: ?bitcointx.TxOut = blk: {
+        if (try psbt.inputWitnessUtxo(m)) |wu| {
+            const nw = from_non_witness orelse break :blk wu;
+            if (nw.value != wu.value or !std.mem.eql(u8, nw.script_pubkey, wu.script_pubkey))
+                return error.UtxoFieldsDisagree;
+            break :blk nw;
+        }
+        break :blk from_non_witness;
+    };
+    // Unconditional regardless of `require_non_witness_utxo` (A1 F1): an
+    // amount outside the possible supply is never legitimate, whichever
+    // field supplied it.
+    if (result) |r| {
+        if (r.value < 0 or r.value > MAX_MONEY) return error.AmountOutOfRange;
     }
-    return from_non_witness;
+    return result;
 }
 
 // ── input-map rebuild (the BIP174 "clear consumed fields" step) ────────
@@ -465,7 +506,22 @@ pub const InputFinalizeError = error{
     MissingTaprootSignature,
     /// A multisig script needs more matching signatures than are present.
     InsufficientSignatures,
-} || psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || bitcoinscript.VerifyError || UtxoBindingError || Allocator.Error;
+} || psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || bitcoinscript.VerifyError || UtxoBindingError || WitnessStackError || Allocator.Error;
+
+/// Options for `finalize`. Struct-of-defaults so existing call sites take
+/// `.{}` for today's behavior; see each field for what it changes.
+pub const FinalizeOptions = struct {
+    /// Reject any input whose spent output is resolved from
+    /// `PSBT_IN_WITNESS_UTXO` alone, with no `PSBT_IN_NON_WITNESS_UTXO` to
+    /// bind it to the real previous transaction (`error.MissingNonWitnessUtxo`).
+    /// Off by default because it breaks legitimate P2WPKH-only signing flows
+    /// that never send `NON_WITNESS_UTXO` at all (A1 audit F1 / DECISIONS.md
+    /// §2). Turning it on closes the "witness_utxo asserts a false amount"
+    /// class of attack completely, not just the out-of-range slice of it
+    /// `AmountOutOfRange` (checked unconditionally, regardless of this flag)
+    /// already closes.
+    require_non_witness_utxo: bool = false,
+};
 
 fn finalizeOneInput(
     allocator: Allocator,
@@ -479,14 +535,47 @@ fn finalizeOneInput(
     index: usize,
 ) InputFinalizeError!void {
     const m = ps.inputs[index];
-    if (m.find(psbt.input_key.FINAL_SCRIPTSIG) != null or m.find(psbt.input_key.FINAL_SCRIPTWITNESS) != null) {
-        return; // already finalized -- idempotent success, BIP174 doc comment
-    }
+    const already_sig = m.find(psbt.input_key.FINAL_SCRIPTSIG);
+    const already_witness = m.find(psbt.input_key.FINAL_SCRIPTWITNESS);
+    const already_finalized = already_sig != null or already_witness != null;
+
     if (binding_err[index]) |e| return e; // mis-bound UTXO: a named refusal, not "missing"
     if (!resolved[index]) return error.MissingUtxo;
 
     const script_pubkey = spent[index].script_pubkey;
     const expected_sighash = psbt.inputSighashType(m);
+
+    if (already_finalized) {
+        // A1 F2: this used to be a blind `return;` -- "already finalized"
+        // was treated as "already verified", so an attacker who supplies
+        // FINAL_SCRIPTSIG/FINAL_SCRIPTWITNESS directly (no PARTIAL_SIG, no
+        // valid script at all) sailed through as a reported success and
+        // `extract` happily spliced the tampered bytes into a "network-
+        // ready" transaction. Now the assembly this input already claims
+        // to be final is verified through the SAME `verifyScript` gate a
+        // freshly-assembled one goes through below, before being trusted.
+        // Idempotent success is preserved for a GENUINELY already-finalized
+        // input (module doc comment) -- it just now means "still verifies",
+        // not merely "a FINAL_* record happens to be present".
+        const decoded_witness: []const []const u8 = if (already_witness) |w|
+            try decodeWitnessStack(allocator, w.value)
+        else
+            &.{};
+        try bitcoinscript.verifyScript(
+            allocator,
+            if (already_sig) |r| r.value else &.{},
+            script_pubkey,
+            decoded_witness,
+            bitcoinscript.ScriptFlags.standard,
+            .{
+                .tx = utx,
+                .input_index = index,
+                .spent_outputs = spent,
+                .precomputed = precomputed,
+            },
+        );
+        return;
+    }
 
     var final_script_sig: ?[]const u8 = null;
     var final_witness: ?[][]const u8 = null;
@@ -546,7 +635,7 @@ pub const FinalizeSetupError = Allocator.Error || bitcointx.tx.DeserializeError 
 /// finalized (or already-finalized) input, the specific typed reason
 /// otherwise. Never all-or-nothing: an unfinalizable non-standard input
 /// doesn't block the rest.
-pub fn finalize(allocator: Allocator, ps: psbt.Psbt) FinalizeSetupError![]?InputFinalizeError {
+pub fn finalize(allocator: Allocator, ps: psbt.Psbt, options: FinalizeOptions) FinalizeSetupError![]?InputFinalizeError {
     var utx = try ps.unsignedTx(allocator);
     defer utx.deinit(allocator);
 
@@ -564,10 +653,12 @@ pub fn finalize(allocator: Allocator, ps: psbt.Psbt) FinalizeSetupError![]?Input
 
     for (ps.inputs, 0..) |m, i| {
         binding_err[i] = null;
-        const so = spentOutputFor(allocator, m, utx, i) catch |e| blk: {
+        const so = spentOutputFor(allocator, m, utx, i, options.require_non_witness_utxo) catch |e| blk: {
             switch (e) {
                 error.UtxoOutpointMismatch => binding_err[i] = error.UtxoOutpointMismatch,
                 error.UtxoFieldsDisagree => binding_err[i] = error.UtxoFieldsDisagree,
+                error.AmountOutOfRange => binding_err[i] = error.AmountOutOfRange,
+                error.MissingNonWitnessUtxo => binding_err[i] = error.MissingNonWitnessUtxo,
                 else => {},
             }
             break :blk null;
@@ -754,6 +845,27 @@ test "hostile: decodeWitnessStack rejects a count exceeding remaining bytes, no 
     // CompactSize count = 0xff-class claiming ~2^64 items, nothing follows.
     const bytes = [_]u8{0xff} ++ [_]u8{0xff} ** 8;
     try testing.expectError(error.Truncated, decodeWitnessStack(testing.allocator, &bytes));
+}
+
+test "hostile: the count-vs-remaining-bytes guard fires BEFORE any per-item allocation (A1 F9)" {
+    // count = 5, but only 2 bytes follow (exactly room for one minimal
+    // 1-byte item). The doc comment's promise is "rejected before any
+    // per-item allocation" -- the test above can't tell that apart from
+    // "rejected once the loop's own per-item decode eventually runs out of
+    // bytes", because a `count` with ZERO bytes following fails on the
+    // very first per-item read either way. This shape has one real item
+    // available, so without the guard the loop would decode AND ALLOCATE
+    // for that first item before failing on the second. A `FailingAllocator`
+    // that refuses the very first allocation turns "did an allocation
+    // happen" into an observable pass/fail: with the guard, `count(5) >
+    // remaining(2)` trips before the loop ever touches the allocator, so
+    // `error.Truncated` comes back with zero allocations attempted -- an
+    // allocator that fails on attempt #0 would otherwise surface as
+    // `error.OutOfMemory`, not `error.Truncated`.
+    const bytes = [_]u8{ 0x05, 0x01, 0xaa };
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.Truncated, decodeWitnessStack(failing.allocator(), &bytes));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
 }
 
 test "hostile: decodeWitnessStack rejects trailing bytes after a complete stack" {

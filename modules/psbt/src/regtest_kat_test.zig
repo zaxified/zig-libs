@@ -50,7 +50,7 @@ test "regtest P2WPKH: finalize reproduces Core's bytes and clears exactly what B
     // (A1 P1, 2026-09-06) the count was 3 per signature, i.e. 3 and 6 here
     // and 3 × signatures × inputs on a large transaction.
     bitcointx.instrument.reset();
-    _ = try psbt.finalize(a, ps);
+    _ = try psbt.finalize(a, ps, .{});
     try testing.expectEqual(@as(usize, 8), bitcointx.instrument.count());
 
     const got = try psbt.serialize(a, ps);
@@ -118,7 +118,7 @@ test "regtest P2WSH 2-of-3 multisig: finalize reproduces Core's bytes and clears
     // (A1 P1, 2026-09-06) the count was 3 per signature, i.e. 3 and 6 here
     // and 3 × signatures × inputs on a large transaction.
     bitcointx.instrument.reset();
-    _ = try psbt.finalize(a, ps);
+    _ = try psbt.finalize(a, ps, .{});
     try testing.expectEqual(@as(usize, 8), bitcointx.instrument.count());
 
     const got = try psbt.serialize(a, ps);

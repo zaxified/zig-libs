@@ -671,6 +671,8 @@ pub const UtxoBindingError = finalize_mod.UtxoBindingError;
 pub const FinalizeSetupError = finalize_mod.FinalizeSetupError;
 pub const ExtractError = finalize_mod.ExtractError;
 pub const WitnessStackError = finalize_mod.WitnessStackError;
+pub const FinalizeOptions = finalize_mod.FinalizeOptions;
+pub const MAX_MONEY = finalize_mod.MAX_MONEY;
 pub const finalize = finalize_mod.finalize;
 pub const extract = finalize_mod.extract;
 pub const encodeWitnessStack = finalize_mod.encodeWitnessStack;
@@ -1029,7 +1031,7 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var ps = parse(a, buf.items) catch return;
     defer ps.deinit(a);
 
-    if (finalize(a, ps)) |results| {
+    if (finalize(a, ps, .{})) |results| {
         if (results.len != n_in) return error.FinalizeResultCountMismatch;
     } else |_| {}
 
@@ -1087,7 +1089,7 @@ test "corpus: every script builds a distinct PSBT, and the map/record counts are
             defer arena.deinit();
             var ps = parse(arena.allocator(), buf.items) catch unreachable;
             defer ps.deinit(arena.allocator());
-            if (finalize(arena.allocator(), ps)) |_| {
+            if (finalize(arena.allocator(), ps, .{})) |_| {
                 finalized += 1;
             } else |_| {}
         } else |_| {}
@@ -1112,4 +1114,54 @@ test "corpus: every script builds a distinct PSBT, and the map/record counts are
     try testing.expectEqual(@as(usize, 13), output_maps);
     try testing.expectEqual(@as(usize, 3), records);
     try testing.expectEqual(@as(usize, 2), finalized);
+}
+
+// ── A1 audit F3/F8: guards with no teeth ────────────────────────────────
+//
+// `decodeWitnessUtxoValue`'s two bounds checks and `requireFixedValueLen`/
+// `requireBip32ValueShape` (wired into `validateInputMap`/`validateGlobalMap`/
+// `validateOutputMap` above) all existed in the tree already -- what was
+// missing was a test that would notice their removal. Each test below
+// mirrors one specific mutation the audit ran by hand and found survived
+// 49/49 green.
+
+test "hostile: WITNESS_UTXO value shorter than the 8-byte amount is rejected, not sliced OOB (A1 F3, isolates M28)" {
+    try testing.expectError(error.Truncated, decodeWitnessUtxoValue(&.{ 0x01, 0x02, 0x03 }));
+}
+
+test "hostile: WITNESS_UTXO script length claiming ~2^64 bytes is rejected, not overflowed (A1 F3, isolates M11b)" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var amt: [8]u8 = undefined;
+    std.mem.writeInt(i64, &amt, 1000, .little);
+    try buf.appendSlice(testing.allocator, &amt);
+    try buf.append(testing.allocator, 0xff); // CompactSize 9-byte form
+    try buf.appendSlice(testing.allocator, &([_]u8{0xff} ** 8)); // declares len = 2^64-1
+    try testing.expectError(error.Truncated, decodeWitnessUtxoValue(buf.items));
+}
+
+test "hostile: SIGHASH_TYPE value length != 4 is rejected (A1 F8, isolates requireFixedValueLen)" {
+    var recs = [_]Record{
+        .{ .keytype = input_key.SIGHASH_TYPE, .keydata = &.{}, .value = &.{ 0x01, 0x00, 0x00 } }, // 3 bytes, not 4
+    };
+    const bad: Map = .{ .records = &recs };
+    try testing.expectError(error.InvalidFixedFieldLength, validateInputMap(bad));
+}
+
+test "hostile: PSBT_GLOBAL_VERSION value length != 4 is rejected before its contents are even read (A1 F8, isolates requireFixedValueLen)" {
+    var recs = [_]Record{
+        .{ .keytype = global_key.VERSION, .keydata = &.{}, .value = &.{ 0x00, 0x00 } }, // 2 bytes, not 4
+    };
+    const bad: Map = .{ .records = &recs };
+    try testing.expectError(error.InvalidFixedFieldLength, validateGlobalMap(bad));
+}
+
+test "hostile: BIP32_DERIVATION value whose length isn't 4 + 4k is rejected (A1 F8, isolates requireBip32ValueShape)" {
+    const pubkey = [_]u8{0x02} ++ [_]u8{0xaa} ** 32;
+    var recs = [_]Record{
+        // Fingerprint (4B) + one path element (4B) + 2 stray bytes = 10, not 4+4k.
+        .{ .keytype = input_key.BIP32_DERIVATION, .keydata = &pubkey, .value = &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+    };
+    const bad: Map = .{ .records = &recs };
+    try testing.expectError(error.InvalidFixedFieldLength, validateInputMap(bad));
 }

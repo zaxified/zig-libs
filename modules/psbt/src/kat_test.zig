@@ -69,8 +69,16 @@ test "BIP174 official invalid vectors: specific expected error per named case" {
         .{ .idx = 17, .err = error.UnexpectedKeyData }, // invalid output witnessScript typed key
         .{ .idx = 18, .err = error.UnsignedTxNotLegacySerialization }, // witness-serialized unsigned tx
         // idx 19 ("invalid value data due to its size being not the stated
-        // size") is exercised only by the "some error" test above -- it's
-        // garbage bytes with no single well-defined rejection reason.
+        // size"): measured (A1 F10) rather than taken on faith -- it dies on
+        // the SAME rule as idx 18, not on any value-length check, so among
+        // the 20 official invalid vectors none actually exercises a
+        // value-shape/length mismatch. Pinned below so a future change that
+        // makes it fail for a DIFFERENT reason gets noticed. That gap is
+        // closed directly (not via this vector) by `root.zig`'s own
+        // "hostile: SIGHASH_TYPE value length != 4" / "hostile:
+        // PSBT_GLOBAL_VERSION value length != 4" / "hostile: BIP32_DERIVATION
+        // value whose length isn't 4 + 4k" tests (A1 F8).
+        .{ .idx = 19, .err = error.UnsignedTxNotLegacySerialization },
     };
     for (expected) |e| {
         const case = vectors.invalid[e.idx];
@@ -219,6 +227,59 @@ test "combine rejects PSBTs for different transactions" {
     var a = try psbt.parse(allocator, raw_a);
     defer a.deinit(allocator);
     var b = try psbt.parse(allocator, raw_b);
+    defer b.deinit(allocator);
+
+    try testing.expectError(error.DifferentTransactions, psbt.combine(allocator, a, b));
+}
+
+// A1 audit F5: the test above uses a pair that differs BOTH in txid AND in
+// map count, so it can't tell which of `combine`'s two guards
+// (`root.zig:625` txid compare, `root.zig:626` map-count compare) is the one
+// doing the rejecting -- mutating away either one alone left it 49/49 green
+// (M12b/M12c). These two isolate them: same map count, different txid; and
+// same txid, different map count.
+
+test "combine rejects different transactions by TXID ALONE, even with matching map counts (A1 F5, isolates M12b)" {
+    const allocator = testing.allocator;
+    var a: psbt.Psbt = .{
+        .global = .{ .records = try allocator.dupe(psbt.Record, &.{
+            .{ .keytype = psbt.global_key.UNSIGNED_TX, .keydata = &.{}, .value = "transaction-one" },
+        }) },
+        .inputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}),
+        .outputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}),
+    };
+    defer a.deinit(allocator);
+    var b: psbt.Psbt = .{
+        .global = .{ .records = try allocator.dupe(psbt.Record, &.{
+            .{ .keytype = psbt.global_key.UNSIGNED_TX, .keydata = &.{}, .value = "transaction-TWO-different" },
+        }) },
+        .inputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}), // SAME count as a
+        .outputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}), // SAME count as a
+    };
+    defer b.deinit(allocator);
+
+    try testing.expectError(error.DifferentTransactions, psbt.combine(allocator, a, b));
+}
+
+test "combine rejects a matching-txid pair with a DIFFERENT map count (A1 F5, isolates M12c)" {
+    const allocator = testing.allocator;
+    var a: psbt.Psbt = .{
+        .global = .{ .records = try allocator.dupe(psbt.Record, &.{
+            .{ .keytype = psbt.global_key.UNSIGNED_TX, .keydata = &.{}, .value = "same-transaction-bytes" },
+        }) },
+        .inputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}), // 1 input map
+        .outputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}),
+    };
+    defer a.deinit(allocator);
+    var b: psbt.Psbt = .{
+        .global = .{
+            .records = try allocator.dupe(psbt.Record, &.{
+                .{ .keytype = psbt.global_key.UNSIGNED_TX, .keydata = &.{}, .value = "same-transaction-bytes" }, // SAME txid bytes as a
+            }),
+        },
+        .inputs = try allocator.dupe(psbt.Map, &.{ .{ .records = &.{} }, .{ .records = &.{} } }), // 2 input maps -- the only difference
+        .outputs = try allocator.dupe(psbt.Map, &.{.{ .records = &.{} }}),
+    };
     defer b.deinit(allocator);
 
     try testing.expectError(error.DifferentTransactions, psbt.combine(allocator, a, b));

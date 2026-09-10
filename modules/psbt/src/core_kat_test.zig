@@ -187,7 +187,7 @@ test "Core invalid[39]/invalid[40]: a UTXO that does not bind to its input is re
         const p = try psbt.parse(allocator, raw);
         try testing.expect(p.inputs.len >= 1);
 
-        const results = try psbt.finalize(allocator, p);
+        const results = try psbt.finalize(allocator, p, .{});
         const got = results[0];
         const want: anyerror = switch (case.expect) {
             .outpoint_mismatch => error.UtxoOutpointMismatch,

@@ -177,3 +177,25 @@ validation surface (unlike the mandatory/common fields this module does validate
 **What the tests actually contain.** BIP174 vectors + Core rpc_psbt.json + live bitcoind v28 regtest (native P2WPKH/P2WSH captured); every spend shape now anchored
 
 **How it got there.** The anchoring work landed. DONE: finalize+extract byte-exact for bare P2SH multisig and P2SH-P2WSH multisig (BIP174 worked example, c713f6b), Core's rpc_psbt.json corpus (63c6cd1, found the GLOBAL_VERSION bug), NATIVE P2WPKH captured from a live bitcoind v28 regtest, and NATIVE P2WSH 2-of-3 multisig captured from the same (2026-08-05: watch-only wallet + wsh(multi(2,...)) descriptor imported active:false, funded via sendtoaddress not direct mining, two independent signer wallets + combinepsbt; finalize+extract byte-exact against Core's own bytes, extracted tx also confirmed acceptable by testmempoolaccept on the producing node). Every spend shape finalize/extract supports is now anchored -- no shapes left self-authored.
+
+## Throughput (A1 F11)
+
+Not previously published; no benchmark suite ships in this module (`perf_event_paranoid` on
+the auditing machine blocked `perf` itself), so the numbers below are from an instrumented
+`ReleaseFast` build counting bytes/ns directly, not a profiler -- treat them as an upper bound,
+not a precision measurement. `parse` is the path an attacker controls the size of, so it is
+the one measured; `combine`/`finalize` were not.
+
+- **Sparse (many small input maps):** 0.78-1.10 ns/byte, flat across 100-400,000 inputs
+  (4,221 B -> 16,800,027 B of wire). Not quadratic in input count.
+- **Dense (one map, many records):** 10.8 ns/byte at 1,000 records/map, growing to
+  34.5 ns/byte at 2,000,000 records/map -- roughly n^1.15 over that 2000x range (per-record
+  `StringHashMapUnmanaged` insert cost, not a quadratic blowup).
+- **Allocation amplification (peak LIVE bytes, not cumulative):** worst observed 15.91x
+  wire-to-peak (6,000,071 B wire -> 95,471,824 B peak, 57 allocations); sparse input maps
+  sit at 1.73-1.87x. `parseMap` grows its record list one successfully-decoded record at a
+  time -- there is no count-prefixed field in the map format to allocate ahead of parsing it,
+  so a hostile size claim can't force an allocation before the bytes backing it exist.
+
+A caller sizing a service off the sparse figure alone would be off by roughly 20-30x for a
+PSBT dominated by one dense map; size for the dense figure if map size isn't bounded upstream.

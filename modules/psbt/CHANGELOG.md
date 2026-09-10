@@ -5,6 +5,61 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, 8 of 11 open findings closed (F1, F2, F3, F5, F8, F9,
+  F10, F11; F4, F6, F7 remain open -- see the audit record's disposition for why).
+  - ⛔⛔ **F1 (HIGH):** `finalize` never checked the spent output's amount at all -- a
+    `PSBT_IN_WITNESS_UTXO` (which carries no link to the real previous transaction) could
+    claim any `i64`, including negative and multi-quadrillion-satoshi values, and `extract`
+    would still hand back a "network-ready" transaction. Fixed per the user's named decision
+    (A1 `DECISIONS.md` §2): amount range `0 <= v <= MAX_MONEY` is now checked
+    unconditionally (`error.AmountOutOfRange`), and a new opt-in
+    `FinalizeOptions.require_non_witness_utxo` (default off, so legitimate P2WPKH-only
+    signing flows are unaffected) rejects any input resolved from `WITNESS_UTXO` alone
+    (`error.MissingNonWitnessUtxo`). `finalize`'s signature gained a third `FinalizeOptions`
+    parameter; every in-module call site updated to `.{}`.
+  - ⛔⛔ **F2 (HIGH):** an input already carrying `FINAL_SCRIPTSIG`/`FINAL_SCRIPTWITNESS` was
+    treated as "already verified" and returned success without looking at the bytes at all --
+    an attacker who supplied those fields directly (no signature anywhere) sailed through.
+    `finalizeOneInput` now runs the SAME `verifyScript` gate a freshly-assembled candidate
+    goes through before accepting an already-present final field; idempotent success is
+    preserved only for an input that still genuinely verifies.
+  - F3 (MED): `decodeWitnessUtxoValue`'s two bounds checks (value shorter than 8 bytes;
+    script-length claim exceeding the buffer) had no test -- removing either panicked
+    (index-out-of-bounds / integer overflow) on attacker bytes rather than returning a typed
+    error. Two hostile tests added; no code change (the checks were already correct).
+  - F5 (MED): `combine`'s "different transactions" rejection had only one test that differed
+    in BOTH txid and map count at once, so either of its two guards alone could be deleted
+    and stay 49/49 green. Two isolated tests added (same map count/different txid; same
+    txid/different map count); no code change.
+  - F8 (MED): `requireFixedValueLen`/`requireBip32ValueShape` (SIGHASH_TYPE/VERSION/
+    BIP32_DERIVATION value-shape guards, wired into `parse` since before this module was
+    audited) had no test -- removing either was silent OR panicked (an untested
+    `PSBT_GLOBAL_VERSION` of the wrong length reads 4 bytes out of a 2-byte value). Three
+    hostile tests added; no code change.
+  - F9 (LOW): `decodeWitnessStack`'s count-vs-remaining-bytes guard's existing test could not
+    tell "rejected before any per-item allocation" (the documented promise) from "rejected by
+    the per-item decode running out of bytes anyway" -- both produce `error.Truncated`. A
+    `FailingAllocator`-based test added that fails on the very first allocation attempt,
+    making the difference observable; no code change.
+  - F10 (LOW): BIP174's own vector 19 ("invalid value data due to its size being not the
+    stated size") does not actually exercise a value-length check -- measured, it dies on
+    the same rule as vector 18. Pinned as such (was previously excluded from the
+    per-vector-error test) and cross-referenced to F8's tests, which are the real coverage
+    for this class.
+  - F11 (LOW): no throughput numbers were published anywhere in `SPEC.md`. Added, from the
+    A1 audit's own `ReleaseFast` measurements: 0.78-1.10 ns/byte sparse, 10.8-34.5 ns/byte
+    dense (~n^1.15 over a 2000x range), peak/wire allocation amplification up to 15.91x.
+  - Open: **F4** (legacy `SIGHASH_SINGLE` bug reproduction passes finalization silently --
+    correct behavior for a consensus-following *verifier*, but whether this "verify-on-
+    finalize" layer should flag or deviate from it is a policy call, not a bug fix).
+    **F6** (the module's one fuzz harness barely gets past its own `parse` call under the
+    default corpus-less draw -- a real fix needs either an explicit seed corpus or a
+    hand-built skeleton input, out of scope for this pass). **F7** (`findMatchingPartialSig`
+    takes the first sighash-matching `PARTIAL_SIG` and gives up if it doesn't verify, even
+    when a later record in the same map would -- a naive "try every candidate" fix is
+    correct but turns a hostile `combine`-merged PSBT with many decoy `PARTIAL_SIG` records
+    into an unbounded number of `verifyScript` calls per input, which is a new amplification
+    concern the audit didn't specify a bound for).
 - **2026-09-09** — Licensing correction, no code change. `NOTICE` named BSD-2-Clause for
   the BIP174 worked-example data and reproduced none of it: no clauses, no disclaimer, no
   copyright line. All three are now present. Recorded rather than papered over: BIP174

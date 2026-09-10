@@ -203,7 +203,7 @@ test "BIP174 anchor: re-finalizing valid[1]'s P2PKH input reproduces its officia
     };
     const ps: psbt.Psbt = .{ .global = original.global, .inputs = &my_inputs, .outputs = original.outputs };
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try testing.expect(results[0] == null);
     try testing.expect(results[1] != null); // still unsigned -- expected, not part of the anchor claim
 
@@ -256,7 +256,7 @@ test "finalize+extract: real P2WPKH spend, byte-exact FINAL_SCRIPTWITNESS; a tam
     var input_maps = [_]psbt.Map{.{ .records = &input_records }};
     const ps = try wrapPsbt(a, unsigned, &input_maps);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try testing.expect(results[0] == null);
 
     const fw = ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS).?;
@@ -283,7 +283,7 @@ test "finalize+extract: real P2WPKH spend, byte-exact FINAL_SCRIPTWITNESS; a tam
     };
     var bad_input_maps = [_]psbt.Map{.{ .records = &bad_input_records }};
     const bad_ps = try wrapPsbt(a, unsigned, &bad_input_maps);
-    const bad_results = try psbt.finalize(a, bad_ps);
+    const bad_results = try psbt.finalize(a, bad_ps, .{});
     try testing.expect(bad_results[0] != null); // verify-on-finalize must fail closed
 }
 
@@ -339,7 +339,7 @@ test "finalize: SIGHASH_TYPE mismatch is rejected (BIP174's own sighash-type enf
     var input_maps = [_]psbt.Map{.{ .records = &input_records }};
     const ps = try wrapPsbt(a, unsigned, &input_maps);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try testing.expect(results[0] != null);
     try testing.expectEqual(psbt.InputFinalizeError.MissingSignature, results[0].?);
     // Nothing was finalized: no FINAL_SCRIPTWITNESS/SCRIPTSIG got written,
@@ -386,7 +386,7 @@ test "finalize+extract: real P2SH 2-of-2 multisig, byte-exact FINAL_SCRIPTSIG; i
     var full_input_maps = [_]psbt.Map{.{ .records = &full_input_records }};
     const ps = try wrapPsbt(a, unsigned, &full_input_maps);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try testing.expect(results[0] == null);
 
     var expected: std.ArrayList(u8) = .empty;
@@ -420,7 +420,7 @@ test "finalize+extract: real P2SH 2-of-2 multisig, byte-exact FINAL_SCRIPTSIG; i
     };
     var short_input_maps = [_]psbt.Map{.{ .records = &short_input_records }};
     const short_ps = try wrapPsbt(a, unsigned, &short_input_maps);
-    const short_results = try psbt.finalize(a, short_ps);
+    const short_results = try psbt.finalize(a, short_ps, .{});
     try expectInputError(short_results, 0, error.InsufficientSignatures);
 }
 
@@ -460,7 +460,7 @@ test "finalize+extract: real native P2WSH 2-of-2 multisig, byte-exact FINAL_SCRI
     var input_maps = [_]psbt.Map{.{ .records = &input_records }};
     const ps = try wrapPsbt(a, unsigned, &input_maps);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try testing.expect(results[0] == null);
 
     const expected_items = [_][]const u8{ &.{}, sig1_ht, sig2_ht, witness_script };
@@ -491,7 +491,7 @@ test "finalize: P2TR key-path with no TAP_KEY_SIG present fails closed with Miss
     var input_maps = [_]psbt.Map{.{ .records = &input_records }};
     const ps = try wrapPsbt(a, unsigned, &input_maps);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try expectInputError(results, 0, error.MissingTaprootSignature);
 }
 
@@ -523,7 +523,7 @@ test "finalize: P2TR key-path fails closed with TaprootMissingAllUtxos when a SI
     };
     const ps = try wrapPsbt(a, unsigned, &input_maps);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try expectInputError(results, 0, error.TaprootMissingAllUtxos);
     try expectInputError(results, 1, error.MissingUtxo);
 }
@@ -565,7 +565,7 @@ test "BIP174 official Finalizer/Extractor worked example: finalize is byte-exact
     try testing.expect(hasAnyOfType(ps.inputs[1], psbt.input_key.BIP32_DERIVATION));
     try testing.expect(ps.inputs[1].find(psbt.input_key.WITNESS_SCRIPT) != null);
 
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try testing.expect(results[0] == null);
     try testing.expect(results[1] == null);
 
@@ -685,7 +685,7 @@ test "finalize: a NON_WITNESS_UTXO whose txid is not the input's prevout is refu
         };
         var maps = [_]psbt.Map{.{ .records = &recs }};
         const ps = try wrapPsbt(a, unsigned, &maps);
-        const results = try psbt.finalize(a, ps);
+        const results = try psbt.finalize(a, ps, .{});
         try testing.expect(results[0] == null);
     }
 
@@ -707,7 +707,7 @@ test "finalize: a NON_WITNESS_UTXO whose txid is not the input's prevout is refu
     };
     var bad_maps = [_]psbt.Map{.{ .records = &bad_recs }};
     const bad_ps = try wrapPsbt(a, unsigned, &bad_maps);
-    const bad_results = try psbt.finalize(a, bad_ps);
+    const bad_results = try psbt.finalize(a, bad_ps, .{});
     try expectInputError(bad_results, 0, error.UtxoOutpointMismatch);
     try testing.expect(bad_ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
 }
@@ -757,7 +757,201 @@ test "finalize: a WITNESS_UTXO contradicting the input's real NON_WITNESS_UTXO c
     };
     var maps = [_]psbt.Map{.{ .records = &recs }};
     const ps = try wrapPsbt(a, unsigned, &maps);
-    const results = try psbt.finalize(a, ps);
+    const results = try psbt.finalize(a, ps, .{});
     try expectInputError(results, 0, error.UtxoFieldsDisagree);
     try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
+}
+
+// ── H: A1 audit F1 -- witness_utxo amount is a bare assertion ──────────────
+
+test "finalize: spent-output amount outside 0..MAX_MONEY is rejected unconditionally; the boundary values are not (A1 F1)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Recognized by no script-type parser in finalize.zig -- isolates the
+    // amount check from script recognition entirely: if this test ever sees
+    // `AmountOutOfRange` for a boundary value, or something OTHER than
+    // `AmountOutOfRange` for an out-of-range one, the amount check itself is
+    // what broke, not script dispatch.
+    const dummy_script = [_]u8{0xff} ** 4;
+    const unsigned = try buildUnsignedTxSpending(a, [_]u8{0xaa} ** 32, 0, 900);
+
+    const out_of_range = [_]i64{ -1, psbt.MAX_MONEY + 1, std.math.minInt(i64), std.math.maxInt(i64) };
+    for (out_of_range) |amount| {
+        const wu = try buildWitnessUtxoValue(a, amount, &dummy_script);
+        var recs = [_]psbt.Record{.{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = wu }};
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps, .{});
+        try expectInputError(results, 0, error.AmountOutOfRange);
+    }
+
+    const boundary = [_]i64{ 0, psbt.MAX_MONEY };
+    for (boundary) |amount| {
+        const wu = try buildWitnessUtxoValue(a, amount, &dummy_script);
+        var recs = [_]psbt.Record{.{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = wu }};
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps, .{});
+        try expectInputError(results, 0, error.NonStandardScript);
+    }
+}
+
+test "finalize: FinalizeOptions.require_non_witness_utxo rejects a witness-utxo-only input; default (off) still allows it (A1 F1 opt-in)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seed: [32]u8 = [_]u8{0x94} ** 32;
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+
+    var script_code: [25]u8 = undefined;
+    script_code[0] = 0x76;
+    script_code[1] = 0xa9;
+    script_code[2] = 0x14;
+    @memcpy(script_code[3..23], &pkh);
+    script_code[23] = 0x88;
+    script_code[24] = 0xac;
+
+    const unsigned = try buildUnsignedTx(a, 900);
+    const credit_value: i64 = 5000;
+    const sighash = try bitcointx.bip143.sighash(a, unsigned, 0, &script_code, credit_value, SIGHASH_ALL);
+    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(sighash, null)), 0x01);
+    const witness_utxo_value = try buildWitnessUtxoValue(a, credit_value, &script_pubkey);
+
+    // Off by default: a legitimate P2WPKH-only signing flow that never sent
+    // NON_WITNESS_UTXO still finalizes (DECISIONS.md SS2, psbt F1: requiring
+    // it unconditionally "rozbije legitimni P2WPKH toky" -- breaks
+    // legitimate P2WPKH flows).
+    {
+        var input_records = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+            .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+        };
+        var input_maps = [_]psbt.Map{.{ .records = &input_records }};
+        const ps = try wrapPsbt(a, unsigned, &input_maps);
+        const results = try psbt.finalize(a, ps, .{});
+        try testing.expect(results[0] == null);
+    }
+
+    // Same shape, opted in: now refused by name instead of silently trusted.
+    {
+        var input_records = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+            .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+        };
+        var input_maps = [_]psbt.Map{.{ .records = &input_records }};
+        const ps = try wrapPsbt(a, unsigned, &input_maps);
+        const results = try psbt.finalize(a, ps, .{ .require_non_witness_utxo = true });
+        try expectInputError(results, 0, error.MissingNonWitnessUtxo);
+    }
+}
+
+// ── I: A1 audit F2 -- "already finalized" used to mean "trusted", not "verified" ──
+
+test "finalize: attacker-supplied FINAL_SCRIPTSIG/FINAL_SCRIPTWITNESS is verified, not trusted for merely existing (A1 F2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seed: [32]u8 = [_]u8{0x91} ** 32;
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined; // P2WPKH
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+
+    const unsigned = try buildUnsignedTx(a, 900);
+    const credit_value: i64 = 5000;
+    const witness_utxo_value = try buildWitnessUtxoValue(a, credit_value, &script_pubkey);
+
+    // (a) a bare FINAL_SCRIPTSIG the attacker made up directly: no
+    // PARTIAL_SIG, no FINAL_SCRIPTWITNESS, no signature anywhere. Pre-fix,
+    // `finalizeOneInput` saw a FINAL_SCRIPTSIG record and returned success
+    // ("already finalized") without looking any further -- this is the
+    // exact repro shape from the A1 audit record.
+    {
+        var recs = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+            .{ .keytype = psbt.input_key.FINAL_SCRIPTSIG, .keydata = &.{}, .value = "\xde\xad\xbe\xef not a script at all" },
+        };
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps, .{});
+        try testing.expect(results[0] != null); // must NOT report success for junk
+        try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTSIG) != null); // left as-is, not silently cleared
+    }
+
+    // (b) a bare FINAL_SCRIPTWITNESS the attacker made up: well-formed
+    // CompactSize framing (so decodeWitnessStack itself has nothing to
+    // reject), but not a real signature over anything.
+    {
+        const junk_witness = try psbt.encodeWitnessStack(a, &[_][]const u8{ "not a real sig", &pubkey });
+        var recs = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+            .{ .keytype = psbt.input_key.FINAL_SCRIPTWITNESS, .keydata = &.{}, .value = junk_witness },
+        };
+        var maps = [_]psbt.Map{.{ .records = &recs }};
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps, .{});
+        try testing.expect(results[0] != null); // must NOT report success for junk
+    }
+}
+
+test "finalize: a genuinely-finalized input re-finalizes idempotently (positive control for A1 F2)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seed: [32]u8 = [_]u8{0x93} ** 32;
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic(seed);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+
+    var script_code: [25]u8 = undefined;
+    script_code[0] = 0x76;
+    script_code[1] = 0xa9;
+    script_code[2] = 0x14;
+    @memcpy(script_code[3..23], &pkh);
+    script_code[23] = 0x88;
+    script_code[24] = 0xac;
+
+    const unsigned = try buildUnsignedTx(a, 900);
+    const credit_value: i64 = 5000;
+    const sighash = try bitcointx.bip143.sighash(a, unsigned, 0, &script_code, credit_value, SIGHASH_ALL);
+    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(sighash, null)), 0x01);
+    const witness_utxo_value = try buildWitnessUtxoValue(a, credit_value, &script_pubkey);
+
+    var input_records = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+    };
+    var input_maps = [_]psbt.Map{.{ .records = &input_records }};
+    const ps = try wrapPsbt(a, unsigned, &input_maps);
+
+    const first = try psbt.finalize(a, ps, .{});
+    try testing.expect(first[0] == null);
+    try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) != null);
+
+    // Second call sees an already-finalized input; it must still report
+    // success -- the "already finalized" shortcut now means "STILL
+    // verifies", not just "a FINAL_* record happens to be present".
+    const second = try psbt.finalize(a, ps, .{});
+    try testing.expect(second[0] == null);
 }
