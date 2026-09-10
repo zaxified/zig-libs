@@ -263,6 +263,15 @@ pub const ParseError = ber.Error || AcseRequirements.BitStringError || error{
     /// dangerous outcome regardless of whether the encoding is formally
     /// malformed or merely unspecified, so this is rejected either way.
     DuplicateField,
+    /// The outer `[APPLICATION n]` element's encoded length does not cover
+    /// the whole input: bytes exist after it that this parse ignored.
+    /// Audit finding N7, the second half of ledger F3 (2026-08-06) that the
+    /// disposition for F3 described as fixed but only `SignedToken.parse`
+    /// (`acse.zig:551`) actually got the check. `findAuthFields` reads the
+    /// FIRST APDU and would return an authentication verdict about it while
+    /// trailing bytes a peer or IDS also reads went unexamined — a parser
+    /// differential of exactly the kind F3 existed to close.
+    TrailingBytes,
 };
 
 /// The three authentication fields, located inside a caller-owned PDU.
@@ -293,6 +302,9 @@ pub const AuthFields = struct {
 pub fn findAuthFields(bytes: []const u8, kind: PduKind) ParseError!AuthFields {
     const outer = try ber.read(bytes);
     if (outer.tag != kind.identifier()) return error.NotAnAssociationPdu;
+    // Audit finding N7: reject trailing bytes the caller's outer element did
+    // not cover, the same rule `SignedToken.parse` already enforces.
+    if (outer.encoded_len != bytes.len) return error.TrailingBytes;
 
     var fields: AuthFields = .{ .kind = kind };
     var it = ber.iterate(outer.content);
@@ -414,6 +426,11 @@ pub const InsertError = ParseError || ber.Error;
 pub fn insertAuthFields(out: []u8, pdu: []const u8, kind: PduKind, fields: []const u8) InsertError![]u8 {
     const outer = try ber.read(pdu);
     if (outer.tag != kind.identifier()) return error.NotAnAssociationPdu;
+    // Audit finding N7: same rule as `findAuthFields`. This side is fail-safe
+    // either way (trailing bytes are silently dropped from the splice, not
+    // corrupted), but silently dropping caller bytes it never told the
+    // caller about is still the wrong default.
+    if (outer.encoded_len != pdu.len) return error.TrailingBytes;
 
     // Pass 1: measure.
     var body_len: usize = fields.len;
@@ -715,6 +732,26 @@ test "findAuthFields: the wrong APDU kind is refused" {
     try testing.expectError(error.NotAnAssociationPdu, findAuthFields(&sample_aarq, .aare));
 }
 
+test "findAuthFields: trailing bytes past the outer element are rejected, not silently dropped" {
+    // Audit finding N7, second half of ledger F3 (2026-08-06): only
+    // `SignedToken.parse` got the `encoded_len == bytes.len` check;
+    // `findAuthFields` read the FIRST APDU and returned a verdict about it
+    // regardless of what followed.
+    var trailing = sample_aarq ++ [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    try testing.expectError(error.TrailingBytes, findAuthFields(&trailing, .aarq));
+    // Positive control: the untouched vector still parses.
+    _ = try findAuthFields(&sample_aarq, .aarq);
+    _ = &trailing;
+}
+
+test "insertAuthFields: trailing bytes past the outer element are rejected" {
+    const trailing = sample_aarq ++ [_]u8{0xff};
+    var fields_buf: [128]u8 = undefined;
+    const fields = try buildAuthFields(&fields_buf, .{ .mechanism = .password_1, .value = .{ .charstring = "x" } });
+    var pdu_buf: [256]u8 = undefined;
+    try testing.expectError(error.TrailingBytes, insertAuthFields(&pdu_buf, &trailing, .aarq, fields));
+}
+
 test "password mechanism: build, splice, find, round-trip" {
     var fields_buf: [128]u8 = undefined;
     const fields = try buildAuthFields(&fields_buf, .{
@@ -880,6 +917,43 @@ test "passwordMatches is constant-time and length-independent in shape" {
     try testing.expect(!passwordMatches("hunter2", "hunter22"));
     try testing.expect(!passwordMatches("", "x"));
     try testing.expect(passwordMatches("", ""));
+}
+
+test "N6: a digest that agrees with the real one in only its first byte does not authenticate" {
+    // Audit finding N6: passwordMatches's own comparison is a correct,
+    // full 32-byte std.crypto.timing_safe.eql -- but no committed test
+    // distinguished that from a comparison narrowed to fewer bytes.
+    // Mutation A3 in the audit (`return a[0] == b[0];`) survived the
+    // 120/120 suite: "hunter2" vs "hunter3" differ at digest byte 0 most
+    // of the time, but only with probability 255/256 -- the same "coin
+    // flip gate" shape the campaign already found in sealedbox's L1.
+    //
+    // This removes the coin flip for byte 0: search (deterministically,
+    // fixed starting point, no entropy, average ~256 SHA-256 calls) for a
+    // second password whose digest agrees with "expected"'s in byte 0 and
+    // is an unrelated preimage everywhere else, then assert
+    // `passwordMatches` rejects it. A comparison narrowed to 1 byte would
+    // accept it; the real 32-byte comparison must not.
+    const expected = "correct horse battery staple";
+    var expected_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(expected, &expected_digest, .{});
+
+    var buf: [40]u8 = undefined;
+    var forged: ?[]const u8 = null;
+    var n: u32 = 0;
+    while (n < 100_000) : (n += 1) {
+        const candidate = std.fmt.bufPrint(&buf, "N6-search-candidate-{d}", .{n}) catch unreachable;
+        var d: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(candidate, &d, .{});
+        if (d[0] == expected_digest[0]) {
+            forged = candidate;
+            break;
+        }
+    }
+    // P(not found in 100_000 tries at p=1/256) is astronomically small;
+    // this is a defensive bound, not an expected exit.
+    const c = forged orelse return error.SkipZigTest;
+    try testing.expect(!passwordMatches(c, expected));
 }
 
 // ── signed token ────────────────────────────────────────────────────────────

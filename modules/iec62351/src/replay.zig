@@ -113,6 +113,17 @@ pub const GooseIdentity = struct {
     /// `t` — the entry time of the last state change, in nanoseconds since
     /// the UTC epoch (IEC 61850's `UtcTime` converted by the caller).
     t_ns: u64,
+    /// `t`'s quality bits, straight off `UtcTime` (IEC 61850-7-2 §6.2.2.4):
+    /// `clockFailure` / `clockNotSynchronized`. Default false (healthy) so a
+    /// caller that does not populate them sees the exact same behavior as
+    /// before these fields existed. Audit finding N4: the entire freshness
+    /// argument in this file rests on `t`, and until this field existed there
+    /// was nowhere to say "the publisher's clock is the reason `t` cannot be
+    /// trusted" — `SvIdentity.smp_synch` had a symmetric signal for Sampled
+    /// Values, GOOSE had none.
+    clock_failure: bool = false,
+    /// See `clock_failure`.
+    clock_not_synchronized: bool = false,
 };
 
 pub const GooseOptions = struct {
@@ -138,6 +149,11 @@ pub const GooseOptions = struct {
     allow_stnum_wrap: bool = true,
     /// Likewise for `sqNum`.
     allow_sqnum_wrap: bool = true,
+    /// Reject when `clock_failure` or `clock_not_synchronized` is set,
+    /// symmetric to `SvOptions.require_synchronised`. Off by default: turning
+    /// this on changes accept/reject behavior for every caller, and not every
+    /// GOOSE decoder surfaces `UtcTime`'s quality bits today (audit finding N4).
+    require_synchronised: bool = false,
 };
 
 /// Replay guard for one GOOSE stream (one GoCB reference).
@@ -167,6 +183,12 @@ pub const GooseGuard = struct {
     /// Decide, without changing anything.
     pub fn check(g: *const GooseGuard, id: GooseIdentity, now_ns: u64) Verdict {
         const o = g.options;
+
+        // Checked before anything else, same as the future-timestamp check
+        // below: an unsynchronised/failed clock undermines every later
+        // decision that reads `t`, including the very first frame.
+        if (o.require_synchronised and (id.clock_failure or id.clock_not_synchronized))
+            return .reject_not_synchronised;
 
         // A timestamp in the future is wrong in every state, including the
         // first frame, so it is checked before anything else.
@@ -473,6 +495,34 @@ test "GOOSE: a silent gap forces an explicit resynchronisation" {
     try testing.expectEqual(
         Verdict.accept_first,
         g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = later }, later),
+    );
+}
+
+test "GOOSE: clock-quality bits are ignored by default, matching pre-N4 behavior" {
+    var g: GooseGuard = .init(.{});
+    try testing.expectEqual(
+        Verdict.accept_first,
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .clock_failure = true, .clock_not_synchronized = true }, t0),
+    );
+}
+
+test "GOOSE: require_synchronised rejects a publisher reporting clock trouble, symmetric to SV" {
+    var g: GooseGuard = .init(.{ .require_synchronised = true });
+    // Audit finding N4: before this option existed there was no way to say
+    // "the publisher itself says its clock is bad" for GOOSE, even though
+    // the entire freshness argument in this file rests on `t`.
+    try testing.expectEqual(
+        Verdict.reject_not_synchronised,
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .clock_failure = true }, t0),
+    );
+    try testing.expectEqual(
+        Verdict.reject_not_synchronised,
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .clock_not_synchronized = true }, t0),
+    );
+    // A healthy clock still gets through.
+    try testing.expectEqual(
+        Verdict.accept_first,
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0),
     );
 }
 

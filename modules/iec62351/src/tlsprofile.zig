@@ -116,15 +116,23 @@ pub const SessionDescription = struct {
     version: TlsVersion,
     cipher_suite: CipherSuite,
     /// RFC 5746 secure-renegotiation indication was negotiated.
-    secure_renegotiation: bool = true,
+    ///
+    /// Audit finding N2: this and the next three fields used to default to
+    /// `true`, so a minimal `SessionDescription{ .version = ..., .cipher_suite
+    /// = ... }` silently claimed all four -- indistinguishable from a caller
+    /// who explicitly asserted them. That is exactly backwards for a module
+    /// whose own doc comment says "a policy object that silently implied it
+    /// had validated a chain would be worse than none." No default now: a
+    /// caller must say what it actually knows, every time.
+    secure_renegotiation: bool,
     /// TLS-level compression was negotiated (CRIME).
     compression: bool = false,
     /// The peer presented a certificate and it was required.
-    mutual_authentication: bool = true,
+    mutual_authentication: bool,
     /// The caller ran `x509.verifyChain` (or equivalent) on the peer chain.
-    chain_validated: bool = true,
+    chain_validated: bool,
     /// The caller checked revocation (CRL or OCSP) for the peer chain.
-    revocation_checked: bool = true,
+    revocation_checked: bool,
     /// How long this session has been open, in seconds.
     age_s: u64 = 0,
     /// Octets transferred over the session so far.
@@ -545,6 +553,13 @@ const testing = std.testing;
 const conforming_session: SessionDescription = .{
     .version = .tls12,
     .cipher_suite = .tls_ecdhe_rsa_with_aes_128_gcm_sha256,
+    // Explicit, not inherited from a default (audit finding N2): this is the
+    // one place in the suite that claims a session did everything right, and
+    // it now has to say so on every field rather than on the two it names.
+    .secure_renegotiation = true,
+    .mutual_authentication = true,
+    .chain_validated = true,
+    .revocation_checked = true,
 };
 
 test "a conforming session passes with no violations" {
@@ -902,6 +917,20 @@ test "facts: each certificate rule fires on its own" {
     {
         var f = good_facts;
         f.key_usage = .{ .digital_signature = true, .key_cert_sign = true };
+        try testing.expect(p.checkCertificateFacts(f, half).has(.certificate_is_a_ca));
+    }
+    {
+        // Audit finding N8/T10: `forbid_ca_certificate` has TWO independent
+        // arms (`basicConstraints cA` and `keyUsage keyCertSign`), and only
+        // the second one had a test — mutation T10 (deleting the
+        // `bc.is_ca` arm) survived the suite. A CA certificate whose
+        // `keyUsage` does not list `keyCertSign` (a real, if unusual, shape
+        // — RFC 5280 says `keyCertSign` SHOULD be asserted for a CA but a
+        // reader must not rely on that to catch `cA=TRUE`) must still be
+        // caught by the `basicConstraints` arm alone.
+        var f = good_facts;
+        f.basic_constraints = .{ .is_ca = true };
+        f.key_usage = .{ .digital_signature = true }; // no key_cert_sign
         try testing.expect(p.checkCertificateFacts(f, half).has(.certificate_is_a_ca));
     }
     {

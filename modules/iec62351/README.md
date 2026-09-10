@@ -166,7 +166,7 @@ var guard: iec62351.GooseReplayGuard = .init(.{ .max_state_age_ns = 10 * 1_000_0
 const verdict = guard.accept(.{
     .st_num = pdu.st_num,
     .sq_num = pdu.sq_num,
-    .t_ns   = pdu.t_ns,
+    .t_ns   = t_ns_from_utc_time(pdu.t), // your own UtcTime -> u64 ns conversion; see below
 }, now_ns);            // <- you supply the clock
 
 if (!verdict.accepted()) {
@@ -275,21 +275,41 @@ be — the seam is a byte slice:
 const iec61850 = @import("iec61850");
 const iec62351 = @import("iec62351");
 
-// Publish: encode, then authenticate.
-const apdu = try iec61850.goose.encodePdu(&apdu_buf, my_dataset);
+// Publish: encode the PDU, then authenticate the bytes.
+const pdu_apdu = try my_pdu.encode(&data_values, &apdu_buf); // iec61850.goose.Pdu.encode
 const frame = try iec62351.goose.build(&frame_buf, .{
-    .appid = cb.appid, .apdu = apdu, .auth = .{ .key_id = key_id, .tag = &.{} },
+    .appid = cb.appid, .apdu = pdu_apdu, .auth = .{ .key_id = key_id, .tag = &.{} },
 }, .{ .mac = .{ .algorithm = .hmac_sha256_128, .key = &group_key } });
 
 // Subscribe: authenticate, replay-check, then decode.
 const r = try iec62351.goose.verify(wire, .ed2020, verifier);
-const pdu = try iec61850.goose.decodePdu(r.frame.apdu);
-if (!guard.accept(.{ .st_num = pdu.st_num, .sq_num = pdu.sq_num, .t_ns = pdu.t }, now_ns).accepted())
+const pdu = try iec61850.goose.Pdu.decode(r.frame.apdu); // NOT `decodePdu` -- there is no such function
+
+// `pdu.t` is `iec61850.mmsdata.UtcTime` (4 octets of whole seconds + a 24-bit
+// binary fraction of a second), not a nanosecond count, and iec61850 ships no
+// converter -- there is no single canonical rounding rule IEC 61850 mandates,
+// so this arithmetic is the caller's own:
+const t_ns: u64 = @as(u64, pdu.t.seconds) * 1_000_000_000 +
+    (@as(u64, pdu.t.fraction) * 1_000_000_000) / (1 << 24);
+
+if (!guard.accept(.{
+    .st_num = pdu.st_num,
+    .sq_num = pdu.sq_num,
+    .t_ns = t_ns,
+    // `UtcTime`'s own quality bits, straight through to `GooseOptions.require_synchronised`.
+    .clock_failure = pdu.t.clock_failure,
+    .clock_not_synchronized = pdu.t.clock_not_synchronized,
+}, now_ns).accepted())
     return;
 ```
 
 (The `iec61850` call names above are illustrative — that module is a sibling,
-not a dependency, and this one never calls it.)
+not a dependency, and this one never calls it. Audit finding N5: an earlier
+version of this example named `encodePdu`/`decodePdu`, neither of which
+exists — the real names are `Pdu.encode`/`Pdu.decode` — and passed `pdu.t`
+[a `UtcTime` struct] directly where `GooseIdentity.t_ns` wants a `u64` of
+nanoseconds, with no converter in either module to bridge them. Corrected
+2026-09-10.)
 
 Order matters on receive: **authenticate first, then replay-check, then
 decode.** The replay counters are only meaningful once the frame is known to be

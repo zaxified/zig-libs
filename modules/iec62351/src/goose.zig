@@ -194,6 +194,15 @@ pub const ParseError = error{
     ExtensionFlagMismatch,
     /// The frame carries no security extension but one was required.
     NoExtension,
+    /// The two leading octets are not `ether_type_goose` (0x88b8) or
+    /// `ether_type_sv` (0x88ba). Audit finding N11: `parse` used to read
+    /// and return this field without checking it, so a caller who mis-sized
+    /// the link-layer offset it stripped before calling `parse` (14 octets
+    /// for an untagged frame vs 18 for one still carrying its 802.1Q tag --
+    /// common for GOOSE, and something `iec61850`'s own reader accounts for
+    /// and this module did not) got a `Frame` built from the wrong start
+    /// point with no signal that anything was wrong.
+    UnknownEtherType,
 };
 
 /// A parsed, borrowed view of an (optionally authenticated) GOOSE/SV frame.
@@ -229,6 +238,8 @@ pub const Frame = struct {
 /// `Frame.bytes`.
 pub fn parse(bytes: []const u8, profile: HeaderProfile) ParseError!Frame {
     if (bytes.len < apdu_offset) return error.Truncated;
+    const ether_type = std.mem.readInt(u16, bytes[0..2], .big);
+    if (ether_type != ether_type_goose and ether_type != ether_type_sv) return error.UnknownEtherType;
     const length = std.mem.readInt(u16, bytes[4..6], .big);
     if (length < header_size) return error.LengthTooSmall;
     const frame_len = ether_type_size + @as(usize, length);
@@ -248,7 +259,7 @@ pub fn parse(bytes: []const u8, profile: HeaderProfile) ParseError!Frame {
 
     return .{
         .bytes = frame,
-        .ether_type = std.mem.readInt(u16, bytes[0..2], .big),
+        .ether_type = ether_type,
         .appid = std.mem.readInt(u16, bytes[2..4], .big),
         .length = length,
         .reserved1 = reserved1,
@@ -1130,6 +1141,25 @@ test "parse: rejects short buffers and a Length below the header" {
     try testing.expectError(error.LengthTooSmall, parse(&short, .ed2020));
     var claims_more = [_]u8{ 0x88, 0xb8, 0x30, 0x01, 0x00, 0x40, 0, 0, 0, 0 };
     try testing.expectError(error.Truncated, parse(&claims_more, .ed2020));
+}
+
+test "parse: rejects a leading EtherType that is neither GOOSE nor SV" {
+    // Audit finding N11: `parse` used to read and return `ether_type`
+    // without checking it -- a caller who stripped the wrong number of
+    // link-layer octets (14 for untagged Ethernet, 18 with an 802.1Q tag
+    // still attached) got a `Frame` built from the wrong offset with no
+    // signal anything was wrong. Both real values are still accepted.
+    var goose_frame = [_]u8{ 0x88, 0xb8, 0x30, 0x01, 0x00, 0x08, 0, 0, 0, 0 };
+    try testing.expect(!std.meta.isError(parse(&goose_frame, .ed2020)));
+    var sv_frame = [_]u8{ 0x88, 0xba, 0x30, 0x01, 0x00, 0x08, 0, 0, 0, 0 };
+    try testing.expect(!std.meta.isError(parse(&sv_frame, .ed2020)));
+
+    var wrong_ethertype = [_]u8{ 0x08, 0x00, 0x30, 0x01, 0x00, 0x08, 0, 0, 0, 0 }; // 0x0800 = IPv4
+    try testing.expectError(error.UnknownEtherType, parse(&wrong_ethertype, .ed2020));
+    // The classic offset mistake this finding names: an 802.1Q-tagged frame
+    // handed to `parse` unstripped starts with the tag, not the EtherType.
+    var vlan_tagged = [_]u8{ 0x81, 0x00, 0x00, 0x64, 0x88, 0xb8, 0x30, 0x01, 0x00, 0x08, 0, 0, 0, 0 };
+    try testing.expectError(error.UnknownEtherType, parse(&vlan_tagged, .ed2020));
 }
 
 test "unauthenticated frames round-trip and are rejected by verify" {
