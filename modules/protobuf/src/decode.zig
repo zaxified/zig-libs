@@ -437,13 +437,22 @@ const testkit = @import("testkit");
 /// false, and the shape word 0 — meaning `Repeated`, `Keeps` and `Chain` would
 /// never be selected however many message seeds were added.
 const DecodeCorpus = struct {
-    const cap = conformance.wide_cases.len + conformance.repeated_cases.len + 12;
+    // audit F14 (2026-09-11): `Presence` -- the one schema shape with
+    // OPTIONAL fields (`?i32`/`?[]const u8`, proto3 explicit presence) --
+    // was never one of the four shapes this harness could select, so no
+    // amount of `--fuzz` time could reach whatever `decode.zig` does
+    // differently for a nullable field's presence bit. Not a guess: `Wide`/
+    // `Repeated`/`Keeps`/`Chain` (shapes 0-3 below) are all REQUIRED/
+    // implicit-presence fields; `Presence` is the only shape with `?T`
+    // fields in its schema at all (`conformance.zig`'s own struct
+    // definitions). Added as shape 4.
+    const cap = conformance.wide_cases.len + conformance.repeated_cases.len + conformance.presence_cases.len + 12;
     store: [cap * (4 + 512 + 4 * 8)]u8 = undefined,
     used: usize = 0,
     entries: [cap][]const u8 = undefined,
     n: usize = 0,
 
-    /// `shape`: 0 `Wide`, 1 `Repeated`, 2 `Keeps`, 3 `Chain`.
+    /// `shape`: 0 `Wide`, 1 `Repeated`, 2 `Keeps`, 3 `Chain`, 4 `Presence`.
     fn push(self: *DecodeCorpus, frame: []const u8, max_depth: u64, copy: u64, reject: u64, shape: u64) void {
         const start = self.used;
         var at = start + testkit.fuzz.seedInto(self.store[start..], frame).len;
@@ -469,6 +478,10 @@ const DecodeCorpus = struct {
         for (conformance.repeated_cases) |c| {
             const bytes = encode_mod.encodeAlloc(a, c.value, .{}) catch unreachable;
             self.push(bytes, 64, 1, 0, 1);
+        }
+        for (conformance.presence_cases) |c| {
+            const bytes = encode_mod.encodeAlloc(a, c.value, .{}) catch unreachable;
+            self.push(bytes, 64, 1, 0, 4);
         }
         const chain = encode_mod.encodeAlloc(a, conformance.chain3, .{ .max_depth = 255 }) catch unreachable;
         self.push(chain, 64, 0, 0, 3); // Chain, and `copy_strings = false`
@@ -512,11 +525,13 @@ fn fuzzDecodeNeverPanics(_: void, smith: *std.testing.Smith) !void {
         .reject_unknown_fields = smith.value(bool),
     };
 
-    switch (smith.valueRangeAtMost(u2, 0, 3)) {
+    switch (smith.valueRangeAtMost(u3, 0, 4)) {
         0 => try fuzzOne(ct.Wide, input, options),
         1 => try fuzzOne(ct.Repeated, input, options),
         2 => try fuzzOne(ct.Keeps, input, options),
         3 => try fuzzOne(ct.Chain, input, options),
+        4 => try fuzzOne(ct.Presence, input, options),
+        else => unreachable,
     }
 }
 
@@ -536,7 +551,7 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
     // `accepted > 0` guard would have read 100% over a corpus that reached
     // nothing. `octets` is the total length actually handed to the parser.
     var octets: usize = 0;
-    var shapes_seen: [4]bool = @splat(false);
+    var shapes_seen: [5]bool = @splat(false);
     var depths_seen: [2]bool = @splat(false); // the drawn cap, split at 32
     // ⛔ Two of this target's four knobs had no number at all: the guard drew
     // `copy_strings` and `reject_unknown_fields` to stay in step with the
@@ -560,7 +575,7 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
         depths_seen[if (options.max_depth < 32) 0 else 1] = true;
         if (options.copy_strings) copies += 1;
         if (options.reject_unknown_fields) rejects += 1;
-        const shape = smith.valueRangeAtMost(u2, 0, 3);
+        const shape = smith.valueRangeAtMost(u3, 0, 4);
         shapes_seen[shape] = true;
         const ok = switch (shape) {
             0 => blk: {
@@ -583,23 +598,30 @@ test "corpus: every decode seed reaches the parser, and the counts are pinned" {
                 d.deinit();
                 break :blk true;
             },
+            4 => blk: {
+                var d = decode(ct.Presence, std.testing.allocator, buf[0..len], options) catch break :blk false;
+                d.deinit();
+                break :blk true;
+            },
+            else => unreachable,
         };
         if (ok) accepted += 1;
     }
-    // ⚠ 37 of 40, not 39 of 40. Three seeds carry zero octets: the deliberate
-    // `""` at the end, and the two case-table rows named "empty"/"rep_empty",
-    // whose encodings ARE the empty message. That is the trap this module
-    // sits in — an empty protobuf is legal and decodes for every shape, so
-    // the numbers below are about reach, not about legality.
-    try std.testing.expectEqual(@as(usize, 37), nonempty);
-    try std.testing.expectEqual(@as(usize, 33), accepted);
-    try std.testing.expectEqual(@as(usize, 450), octets);
-    // The knobs are alive on a corpus replay: all four shapes and both sides
-    // of the depth cap ran, where a tail-less seed would have pinned every
-    // one of them at `Wide` with `max_depth = 1`.
+    // audit F14 (2026-09-11): counts below re-derived after adding the
+    // `Presence` shape (`conformance.presence_cases`, 5 entries, all
+    // nonempty and all legal). See the comment on the pre-`Presence`
+    // numbers this replaced in git history for the "37 of 40" trap this
+    // module sits in generally — an empty protobuf is legal and decodes
+    // for every shape, so these numbers are about reach, not legality.
+    try std.testing.expectEqual(@as(usize, 41), nonempty);
+    try std.testing.expectEqual(@as(usize, 38), accepted);
+    try std.testing.expectEqual(@as(usize, 458), octets);
+    // The knobs are alive on a corpus replay: all five shapes and both
+    // sides of the depth cap ran, where a tail-less seed would have pinned
+    // every one of them at `Wide` with `max_depth = 1`.
     for (shapes_seen) |s| try std.testing.expect(s);
     for (depths_seen) |d| try std.testing.expect(d);
-    try std.testing.expectEqual(@as(usize, 38), copies);
+    try std.testing.expectEqual(@as(usize, 43), copies);
     try std.testing.expectEqual(@as(usize, 1), rejects);
 }
 

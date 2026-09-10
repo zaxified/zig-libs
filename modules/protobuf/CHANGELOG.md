@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign (F14, partial). **No consumer-visible
+  change.** The main decode fuzz harness (`decode.zig`'s
+  `fuzz: decode never panics or leaks...`) could only ever select 4 of the
+  module's schema shapes (`Wide`/`Repeated`/`Keeps`/`Chain`) — `Presence`,
+  the ONE shape with optional fields (`?i32`/`?[]const u8`, proto3
+  explicit presence), was never reachable, so no amount of `--fuzz` time
+  could exercise whatever `decode.zig` does differently for a nullable
+  field's presence bit. Added as shape 4 (`conformance.presence_cases`
+  seeded into the corpus, shape selector widened `u2 0..3` to `u3 0..4`).
+  Not itself a fix for F14's plateau measurement (615345 runs, 7.17%
+  coverage) — `--fuzz` is not in this campaign's permitted command set
+  (`scripts/modtest` has no fuzz mode at all), so the percentage was not
+  and could not be re-measured this pass — but a concrete, verified
+  structural gap in what the harness could ever reach, closed. The
+  harness's OTHER target (`fuzzDepthCapBoundary`, the audit's "only 15
+  unique runs" observation) was reviewed and left alone: its 8 corpus
+  seeds already cover every interesting boundary in its narrow 2D
+  (`true_len`, `max_depth`) purpose by construction — a boundary-condition
+  probe reaching few unique combinations is not itself a defect the way a
+  general-purpose harness missing an entire schema shape is.
+  **RED→GREEN (structural, not `--fuzz`):** `scripts/modtest protobuf`'s
+  own corpus-count test used the single default draw to confirm the new
+  shape is genuinely reached: `nonempty 37→41`, `accepted 33→38`,
+  `octets 450→458`, all 5 shapes now hit (`shapes_seen` widened to
+  `[5]bool`, every entry required true). `scripts/modtest protobuf`:
+  74/74, unchanged count (widened an existing test, no new `test` block).
+  Consumer `grpc`: `scripts/modtest grpc` 122/122, unchanged.
+
 - **2026-09-11** — A1 fix campaign (F13). **No consumer-visible change** —
   new test coverage plus regenerated interop fixtures, no `src/` decoder or
   encoder logic touched.
