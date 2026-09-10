@@ -737,10 +737,23 @@ actually varies with anything a network adversary can correlate against
 signature and across sessions accumulates into a usable nonce leak. *Why
 the code cannot settle it:* this is a quantitative side-channel question
 (does limb-granularity timing carry usable information about a bijective
-function of a partially-masked secret?), and there is no dudect-class
-harness in this toolchain. Outcome should be either a constant-time exact
-division in `paillier`, or a *corrected* written rationale replacing the
-`β' mod N` one.
+function of a partially-masked secret?). **Update 2026-09-10 (audit F5,
+doc fix):** a dudect-class harness (`scripts/ctgrind.sh`, memcheck-based)
+now exists in this toolchain and this module HAS two registered targets
+(`share`, `nonce` in `src/ctgrind_harness.zig` /
+`scripts/ctgrind-expected.tsv`) — but those target the EC-scalar-mul call
+sites in `signing.zig` (`provePoK`'s nonce, `signWithShares`'s `gamma_i`),
+not this `paillier.decrypt` L-function division. The quantitative question
+above is therefore still open — the earlier audit pass (F5) ran an ad-hoc
+probe (not wired into this toolchain's harness registry) over the real
+`mtaAliceInitChecked → mtaBobResponseChecked → mtaAliceFinalize` chain and
+found 132 `Conditional jump or move depends on uninitialised value(s)`
+contexts, 69 of them on `paillier`'s `divFloor`/`writeTwosComplement`, with
+0 in the untainted negative control — a tainted signal is measurably
+present, but whether it is exploitable at limb granularity is not
+answered. Outcome should be either a constant-time exact division in
+`paillier`, a `paillier`-scoped ctgrind target added to this toolchain's
+registry, or a *corrected* written rationale replacing the `β' mod N` one.
 
 **A6 — Protocol composition: Πprm/Πmod is not auto-exchanged online.**
 `aux_proofs.proveWellFormed`/`verifyWellFormed` close audit F1's residuosity
@@ -752,6 +765,31 @@ floor per session, is sound — or whether the proofs must be re-verified
 against the tuple used in each signing session. *Why the code cannot settle
 it:* it is a question about the deployment's protocol composition, not about
 either function in isolation.
+
+**A6 addendum — the structural floor's known remaining gap, and why it stays
+a floor (2026-09-10 fix, user decision).** `AuxParams.validate` rejects an
+`h1`/`h2` of order dividing 2 (`h² ≡ 1 mod Ñ`): `h2 = Ñ-1` used to pass every
+prior check whenever `Ñ ≡ 1 (mod 4)` (the case `generateSafePrime`'s real
+safe primes, both `≡ 3 mod 4`, always land on — `Jacobi(-1|Ñ) =
+Jacobi(-1|p̃)·Jacobi(-1|q̃) = (-1)(-1) = +1`), and an order-2 generator
+collapses the Pedersen commitment's hiding: `z = h1^m · h2^rho mod Ñ` gives
+`z² = h1^(2m)` independent of the blinding `rho`, so `z²` becomes a
+deterministic function of the witness `m` — measured via
+`zkproofs.proveAliceRange`: `z²` came back byte-identical across three
+independently-sampled `rho` for the same witness, byte-different for a
+different witness. This is the **maximum** a structural check can close
+without the tuple's factorization: a value that is a quadratic non-residue
+mod BOTH prime factors of `Ñ` also has Jacobi symbol `+1` and order dividing
+2 is exactly that residual case restricted to `{Ñ-1}` and its cousins — the
+new check closes the residual case the Jacobi check alone missed, but the
+general non-residue-mod-both-factors gap A6 already describes is untouched.
+**This is deliberately a floor, not the fix** — closing the general gap
+needs Πprm (`h2 ∉ ⟨h1⟩` detection) as A6 describes, which the online path
+still does not require. Turning that on is a separate, deferred decision
+(protocol change: adds a setup-phase proof exchange), gated on the module
+acquiring a real consumer that needs it — see `root.AuxParams.validate`'s
+doc comment and the regression test `"AuxParams.validate rejects an order-2
+generator (audit F1 HIGH, 2026-09-10 fix)"` in `root.zig`.
 
 **A7 — The documented "abort-only v1" cut.** Nothing here proves a party
 used the SAME `k_i`/`γ_i`/`w_i` across the different pairwise MtA sessions

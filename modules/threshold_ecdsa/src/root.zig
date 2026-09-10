@@ -623,6 +623,26 @@ pub const AuxParams = struct {
         if (!auxFeJacobiIsOne(gpa, nt, self.h1)) return error.InvalidAuxParams;
         if (!auxFeJacobiIsOne(gpa, nt, self.h2)) return error.InvalidAuxParams;
 
+        // Audit F1 (2026-09-10 fix, user decision: cheap floor now, Πprm/
+        // Πmod deferred as a separate task): reject a generator of ORDER 2.
+        // `h2 = Ñ-1` slips past every check above whenever Ñ ≡ 1 (mod 4)
+        // (e.g. both prime factors ≡ 3 mod 4, which `generateSafePrime`
+        // always produces) -- Jacobi(-1/Ñ) = (-1)^((Ñ-1)/2) = +1 there, and
+        // -1 is trivially never 0 or 1. An order-2 h2 collapses the Pedersen
+        // commitment's hiding: z = h1^m * h2^rho mod Ñ gives
+        // z^2 = h1^(2m) * h2^(2rho) = h1^(2m) (the blinding `rho` cancels
+        // out via h2^2 == 1), so z^2 becomes a DETERMINISTIC function of the
+        // witness `m` alone -- confirmed by mutation: `z^2` came back
+        // byte-identical across three independent `rho` draws for the same
+        // witness, byte-DIFFERENT for a different witness (see
+        // `AuxParams.validate` order-2 tests below). Symmetric check on h1
+        // too: an order-2 h1 analogously collapses z^2 down to a function of
+        // `rho` alone. This is the "cheap, always-enforced floor" the doc
+        // comment above already promised, not the full Πprm/Πmod
+        // proof-of-correct-generation (SPEC.md A6, TODO) -- it closes the
+        // MAXIMUM of the residual gap that floor can reach without one.
+        if (nt.sq(self.h1).eql(one) or nt.sq(self.h2).eql(one)) return error.InvalidAuxParams;
+
         // F2: key-size floor Ñ > q⁷ (checked last — cheap structural checks
         // above catch most malformed tuples first).
         if (!nTildeMeetsFloor(nt)) return error.InvalidAuxParams;
@@ -1445,6 +1465,17 @@ pub const KeyShare = struct {
 
         const pubkeys_bytes = readLenPrefixed(bytes, &offset) catch return error.InvalidEncoding;
         const public_keys = try PublicKeys.fromBytesAlloc(allocator, pubkeys_bytes);
+        errdefer allocator.free(public_keys.entries);
+
+        // Audit F2 (HIGH, 2026-09-10 fix): reject a tuple whose own `index`
+        // is missing from `public_keys` -- `signing.signWithShares` looks
+        // itself up via `public_keys.get(index)`, and a `KeyShare` that
+        // decodes cleanly here but lacks its own entry used to make that
+        // lookup return `null` and panic/UB downstream. Defense in depth on
+        // top of `signWithShares`'s own fail-closed fix: a `KeyShare` built
+        // by any OTHER path (not through this codec) still gets caught
+        // there.
+        if (public_keys.get(index) == null) return error.InvalidEncoding;
 
         return .{
             .index = index,
@@ -1794,6 +1825,45 @@ test "KeyShare toBytesAlloc/fromBytesAlloc round-trip" {
     try testing.expectEqual(key_shares[0].public_keys.entries.len, back.public_keys.entries.len);
 }
 
+test "KeyShare.fromBytesAlloc rejects a tuple whose own index is missing from public_keys (audit F2 HIGH, 2026-09-10 fix)" {
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x66325f6869676832); // "f2_high2"
+    const random = prng.random();
+
+    const kp1 = try paillier.generate(random, paillier.min_generate_bits);
+    const kp2 = try paillier.generate(random, paillier.min_generate_bits);
+    const paillier_keys = [_]paillier.KeyPair{ kp1, kp2 };
+
+    const aux = toyAuxParams();
+    const aux_params = [_]AuxParams{ aux, aux };
+
+    const secret = testScalar(41);
+    const coeffs = [_]Scalar{testScalar(42)}; // t=2 needs exactly t-1=1 coefficient
+    const key_shares = try keygenTrustedDealer(allocator, 2, 2, secret, &coeffs, &paillier_keys, &aux_params);
+    defer allocator.free(key_shares);
+    defer allocator.free(key_shares[0].public_keys.entries);
+
+    // Strip party 1's own entry from the `public_keys` list it carries --
+    // reproduces the audit's `probe_keyshare_panic.zig` shape via the
+    // codec's public entry point (`toBytesAlloc` -> `fromBytesAlloc`), not
+    // a hand-built struct. This is the wire-format equivalent of a peer
+    // sending back a `KeyShare` a different, buggy dealer assembled.
+    var stripped_entries: std.ArrayList(PartyPublicKeys) = .empty;
+    defer stripped_entries.deinit(allocator);
+    for (key_shares[0].public_keys.entries) |e| {
+        if (e.index != key_shares[0].index) try stripped_entries.append(allocator, e);
+    }
+    try testing.expectEqual(key_shares[0].public_keys.entries.len - 1, stripped_entries.items.len);
+
+    var stripped = key_shares[0];
+    stripped.public_keys = .{ .entries = stripped_entries.items };
+
+    const bytes = try stripped.toBytesAlloc(allocator);
+    defer allocator.free(bytes);
+
+    try testing.expectError(error.InvalidEncoding, KeyShare.fromBytesAlloc(allocator, bytes));
+}
+
 test "smoke: module compiles and constants are sane" {
     try testing.expectEqual(@as(usize, 32), Ns);
     try testing.expectEqual(@as(usize, 33), Ne);
@@ -1942,6 +2012,64 @@ test "AuxParams.validate accepts a well-formed tuple and rejects malformed / sub
     // The F2 floor predicates in isolation.
     try testing.expect(nTildeMeetsFloor(nt_ok));
     try testing.expect(!nTildeMeetsFloor(AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable));
+}
+
+test "AuxParams.validate rejects an order-2 generator (audit F1 HIGH, 2026-09-10 fix)" {
+    var prng = std.Random.DefaultPrng.init(0x6f726465722d32); // "order-2"
+    const random = prng.random();
+
+    // A genuine ~2000-bit odd composite ≡ 1 (mod 4) -- the module's other
+    // `big_composite` fixture (`(2^1000+9)*(2^1000+15)`, used by the
+    // validate() test above) is ≡ 3 (mod 4), for which Jacobi(-1|Ñ) = -1
+    // and the PRE-EXISTING Jacobi check already rejects h2 = Ñ-1, so it
+    // cannot reproduce this bug. `(2^1000+9)*(2^1000+13)` is ≡ 1 (mod 4)
+    // (9*13 mod 4 = 1), giving Jacobi(-1|Ñ) = (-1)^((Ñ-1)/2) = +1 -- exactly
+    // the case `generateSafePrime`'s real safe primes (both ≡ 3 mod 4) land
+    // on, per the audit.
+    const big_composite = comptime comptimeIntBytes(256, ((1 << 1000) + 9) * ((1 << 1000) + 13));
+    const nt = AuxModulus.fromBytes(stripLeadingZeros(&big_composite), .big) catch unreachable;
+    const one = nt.one();
+    const h1_ok = AuxFe.fromBytes(nt, &[_]u8{4}, .big) catch unreachable; // 2², order != 2
+    const minus_one = nt.sub(nt.zero, one); // Ñ-1, order 2 for ANY odd Ñ
+
+    // Precondition: this Ñ actually reproduces the audit's exact scenario
+    // (h2 = Ñ-1 passes Jacobi, and has order 2) -- if either flips, the
+    // rejection below would come from the OLDER checks, not the new one.
+    var scratch: [aux_scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    try testing.expect(auxFeJacobiIsOne(fba.allocator(), nt, minus_one));
+    try testing.expect(nt.sq(minus_one).eql(one));
+    try testing.expect(!nt.sq(h1_ok).eql(one));
+
+    // h2 = Ñ-1: order 2, Jacobi +1, in range (1, Ñ) -- every OLDER check
+    // (composite, range, Jacobi, size floor) passes; only the new order-2
+    // guard can catch it.
+    {
+        const evil: AuxParams = .{ .n_tilde = nt, .h1 = h1_ok, .h2 = minus_one };
+        try testing.expectError(error.InvalidAuxParams, evil.validate(random));
+    }
+    // Symmetric: h1 = Ñ-1 instead of h2.
+    {
+        const evil: AuxParams = .{ .n_tilde = nt, .h1 = minus_one, .h2 = h1_ok };
+        try testing.expectError(error.InvalidAuxParams, evil.validate(random));
+    }
+    // Positive control: swapping in a non-degenerate h2 (the SAME Ñ/h1,
+    // structurally identical otherwise) must still be ACCEPTED -- proves
+    // the new check isn't rejecting everything on this Ñ.
+    {
+        const h2_ok = AuxFe.fromBytes(nt, &[_]u8{16}, .big) catch unreachable; // 4², order != 2
+        try testing.expect(!nt.sq(h2_ok).eql(one));
+        const good: AuxParams = .{ .n_tilde = nt, .h1 = h1_ok, .h2 = h2_ok };
+        try good.validate(random);
+    }
+
+    // NOTE: this fix also closes the entry-point-level collapse the audit
+    // measured (`zkproofs.proveAliceRange`/`proveBobMta`/`proveBobMtaWc`
+    // all call `validateReceivedParams` -> `AuxParams.validate` on the
+    // RECEIVED tuple before using it, fail-closed) -- an end-to-end test
+    // through one of those entry points with `evil` above would now just
+    // observe `error.InvalidAuxParams` from the SAME guard tested directly
+    // here, not exercise any additional code path, so it is not repeated.
 }
 
 // Pull the `zkproofs` submodule's tests into this module's test binary —

@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `AuxParams.validate` now
+  rejects an `h1`/`h2` of order 2 (audit F1, HIGH — an order-2 `h2` let a
+  malicious counterparty defeat the Pedersen commitment's hiding via
+  `z² = h1^(2m)`, independent of the blinding); this is the cheap
+  always-enforced floor the user decided on (Πprm/Πmod stay a deferred,
+  separate task). `KeyShare.fromBytesAlloc` now rejects a tuple whose own
+  `index` is missing from `public_keys` (`error.InvalidEncoding`), and
+  `signWithShares` fails closed with `error.InvalidParameters` on the same
+  condition instead of panicking (ReleaseSafe) or hitting undefined
+  behaviour (ReleaseFast) on a null-optional unwrap (audit F2, HIGH — a
+  real caller, `dkg`, assembles `KeyShare`s from DKG output). Any genuinely
+  well-formed tuple/share is accepted exactly as before; only the two
+  malformed/degenerate shapes above are now rejected instead of silently
+  accepted or crashing. Also fixes the Γ commit-reveal check inside
+  `signWithShares`, which compared a value against itself and so could
+  never reject anything (audit F3, MED) — internal-only, no observable
+  signature-shape or API change for a well-behaved caller.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **share 127 / nonce 400**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. Settles a disputed audit claim by measurement: `signing.zig:267`'s `Secp256k1.basePoint.mul(nonce) catch continue` does fire, but `k256`'s own `mul`/`combMulBase` end in `try q.rejectIdentity()` identically (`k256/src/group.zig:278`, `:347`), so routing through `k256` would remove nothing — the class was never fixed for secp256k1, only for Edwards/Ristretto, and it fires at p≈2⁻²⁵⁶. ⭐ Two things nobody was looking for: `paillier.decrypt`'s L-function does a variable-time big-integer division on `k_i`-derived data on EVERY run (audit item A5 had only theorised it), and `zkproofs.zig:345`'s `mulAddBytes` ripple-carry loop has a trip count that depends on the RAW secret witness, before the blinding that makes the published response safe — no document in this module mentions it. ⚠ These numbers are NOT adjusted for single-process over-taint (see `dkg`'s entry); a share of them is public commitment data that only looks secret because one process built it.
 
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** this module is out of

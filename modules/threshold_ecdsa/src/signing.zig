@@ -281,6 +281,75 @@ fn verifyPoK(index: u32, big_gamma: Element, proof: SchnorrProof) bool {
     return lhs.equivalent(e_gamma.add(r_pt));
 }
 
+/// Checks a Round-2 `GammaReveal` against the Round-1 `GammaCommitment` it
+/// claims to open: the index must match, `commitGamma` over the revealed
+/// `Γ_i` must equal the stored commitment hash, AND the accompanying
+/// Schnorr proof must verify against that same index/`Γ_i`. Split out from
+/// `signWithShares`'s loop (audit F3, 2026-09-10 fix) specifically so it is
+/// directly testable with adversarial, non-self-consistent inputs — a
+/// forged `Γ_i` revealed after a DIFFERENT one was committed, and a
+/// cross-index/foreign proof — see the two tests right below it. Before
+/// this split, `signWithShares` only ever called the equivalent of this
+/// check with `commitment`/`reveal` freshly derived from the SAME live
+/// `eph[idx].big_gamma` in the same breath, which could never disagree.
+fn verifyGammaReveal(commitment: GammaCommitment, reveal: GammaReveal) bool {
+    if (reveal.index != commitment.index) return false;
+    if (!std.mem.eql(u8, &commitGamma(reveal.index, reveal.big_gamma), &commitment.commitment)) return false;
+    return verifyPoK(reveal.index, reveal.big_gamma, reveal.proof);
+}
+
+test "verifyGammaReveal rejects a Γ_i revealed after a DIFFERENT one was committed (audit F3 MED, 2026-09-10 fix)" {
+    var prng = std.Random.DefaultPrng.init(0x6633636f6d6d6974); // "f3commit"
+    const random = prng.random();
+
+    const committed_gamma = randomScalar(random);
+    const committed_pt = Secp256k1.basePoint.mul(committed_gamma.toBytes(.big), .big) catch unreachable;
+    const committed_big_gamma = root.Element.fromPoint(committed_pt) catch unreachable;
+    const commitment: GammaCommitment = .{ .index = 1, .commitment = commitGamma(1, committed_big_gamma) };
+
+    // Party 1 REVEALS a different Γ_i than the one it committed to —
+    // rushing-adversary shape the doc comment describes. Proof is
+    // genuinely valid FOR the revealed (different) Γ_i, so only the
+    // commitment-hash check can catch this.
+    const revealed_gamma = randomScalar(random);
+    const revealed_pt = Secp256k1.basePoint.mul(revealed_gamma.toBytes(.big), .big) catch unreachable;
+    const revealed_big_gamma = root.Element.fromPoint(revealed_pt) catch unreachable;
+    try testing.expect(!std.mem.eql(u8, &revealed_big_gamma.toBytes(), &committed_big_gamma.toBytes()));
+    const proof = try provePoK(1, revealed_gamma, revealed_big_gamma, random);
+    const reveal: GammaReveal = .{ .index = 1, .big_gamma = revealed_big_gamma, .proof = proof };
+
+    try testing.expect(!verifyGammaReveal(commitment, reveal));
+
+    // Positive control: revealing the ACTUALLY-committed Γ_i with its own
+    // genuine proof passes — proves the rejection above is about the
+    // mismatch, not a broken predicate.
+    const honest_proof = try provePoK(1, committed_gamma, committed_big_gamma, random);
+    const honest_reveal: GammaReveal = .{ .index = 1, .big_gamma = committed_big_gamma, .proof = honest_proof };
+    try testing.expect(verifyGammaReveal(commitment, honest_reveal));
+}
+
+test "verifyGammaReveal rejects a foreign (cross-party) Schnorr proof (audit F3 MED, 2026-09-10 fix)" {
+    var prng = std.Random.DefaultPrng.init(0x66336669067265); // "f3foreign"
+    const random = prng.random();
+
+    const gamma_a = randomScalar(random);
+    const pt_a = Secp256k1.basePoint.mul(gamma_a.toBytes(.big), .big) catch unreachable;
+    const big_gamma_a = root.Element.fromPoint(pt_a) catch unreachable;
+    const commitment_a: GammaCommitment = .{ .index = 1, .commitment = commitGamma(1, big_gamma_a) };
+
+    // Party 2's genuine proof, over a DIFFERENT index and Γ entirely.
+    const gamma_b = randomScalar(random);
+    const pt_b = Secp256k1.basePoint.mul(gamma_b.toBytes(.big), .big) catch unreachable;
+    const big_gamma_b = root.Element.fromPoint(pt_b) catch unreachable;
+    const foreign_proof = try provePoK(2, gamma_b, big_gamma_b, random);
+
+    // Splice party 2's proof onto party 1's (genuinely-committed) Γ_i and
+    // index — the commitment-hash check alone would pass (Γ_i matches what
+    // was committed); only `verifyPoK` can catch the swapped proof.
+    const reveal: GammaReveal = .{ .index = 1, .big_gamma = big_gamma_a, .proof = foreign_proof };
+    try testing.expect(!verifyGammaReveal(commitment_a, reveal));
+}
+
 /// Round-2 reveal: `Γ_i` plus its knowledge-of-exponent proof. Every OTHER
 /// party checks this against the Round-1 `GammaCommitment` before trusting
 /// `Γ_i`.
@@ -510,17 +579,33 @@ pub fn signWithShares(
         eph[idx] = .{ .k = k_i, .gamma = gamma_i, .w = w_i, .big_gamma = big_gamma, .delta = Scalar.zero, .sigma = Scalar.zero };
     }
 
-    // Commit (Round 1), then reveal + verify (Round 2) — collapsed into one
-    // pass since this driver holds every party's state in-process, but the
-    // commit/verify STEPS are the real ones a networked implementation
-    // would run over `GammaCommitment`/`GammaReveal` messages.
+    // Round 1 (commit): every party broadcasts a `GammaCommitment`, stored
+    // here for EVERY party before any Round-2 reveal exists — routed
+    // through the wire codec (`GammaCommitment.toBytes`/`.fromBytes`) so
+    // `commitments[idx]` below is what a networked party would actually
+    // have on hand, a snapshot taken now, not a live re-read of
+    // `eph[idx].big_gamma`.
+    const commitments = try allocator.alloc(GammaCommitment, t);
+    defer allocator.free(commitments);
     for (shares, 0..) |s, idx| {
-        const commitment = commitGamma(s.index, eph[idx].big_gamma);
+        const msg: GammaCommitment = .{ .index = s.index, .commitment = commitGamma(s.index, eph[idx].big_gamma) };
+        commitments[idx] = GammaCommitment.fromBytes(msg.toBytes());
+    }
+
+    // Round 2 (reveal + verify): every party reveals `(Γ_i, proof)` —
+    // audit F3 fix (2026-09-10): the OLD code compared
+    // `commitGamma(s.index, eph[idx].big_gamma)` against a `commitment`
+    // local that was the IDENTICAL expression evaluated moments earlier
+    // over the SAME still-unchanged `eph[idx].big_gamma` — a tautology
+    // that no input could ever fail. `verifyGammaReveal` below is a
+    // standalone, directly-testable predicate (two adversarial tests
+    // below it) fed the Round-1 message STORED above, not a fresh alias
+    // of the value it is checking.
+    for (shares, 0..) |s, idx| {
         const proof = try provePoK(s.index, eph[idx].gamma, eph[idx].big_gamma, random);
-        // "Receive" + verify (self-consistency here; a networked party
-        // verifies every OTHER party's triple against what it broadcast).
-        if (!std.mem.eql(u8, &commitGamma(s.index, eph[idx].big_gamma), &commitment)) return error.InvalidCommitment;
-        if (!verifyPoK(s.index, eph[idx].big_gamma, proof)) return error.InvalidKnowledgeProof;
+        const reveal_msg: GammaReveal = .{ .index = s.index, .big_gamma = eph[idx].big_gamma, .proof = proof };
+        const reveal = GammaReveal.fromBytes(reveal_msg.toBytes()) catch unreachable; // just encoded above; the round-trip cannot fail
+        if (!verifyGammaReveal(commitments[idx], reveal)) return error.InvalidCommitment;
     }
 
     var gamma_sum = Secp256k1.identityElement;
@@ -531,13 +616,24 @@ pub fn signWithShares(
 
     // ── Phase 3: MtA (k·γ) + MtAwc (k·x) over every ordered pair ─────────
     for (shares, 0..) |ai_share, ii| {
-        const alice_pk = ai_share.public_keys.get(ai_share.index).?.paillier_pk;
+        // Audit F2 (HIGH, 2026-09-10 fix): `KeyShare.fromBytesAlloc` does no
+        // cross-check that `public_keys` actually contains the share's OWN
+        // `index` -- a `KeyShare` that round-trips through the module's own
+        // codec but was assembled with a stripped/mismatched entry list used
+        // to reach here via `.get(index).?`, panicking in ReleaseSafe (SIGABRT)
+        // and undefined behavior in ReleaseFast (an unchecked `.?` on `null`
+        // is UB in unsafe modes, not a panic) -- neither of which is in the
+        // doc-promised `Signature | SigningAborted | Invalid*` outcome set.
+        // Fail closed instead, same as every other malformed-input guard in
+        // this function.
+        const ai_pubkeys = ai_share.public_keys.get(ai_share.index) orelse return error.InvalidParameters;
+        const alice_pk = ai_pubkeys.paillier_pk;
         const alice_sk = ai_share.paillier_secret;
-        const alice_aux = ai_share.public_keys.get(ai_share.index).?.aux;
+        const alice_aux = ai_pubkeys.aux;
 
         for (shares, 0..) |aj_share, jj| {
             if (ii == jj) continue;
-            const bob_aux = aj_share.public_keys.get(aj_share.index).?.aux;
+            const bob_aux = (aj_share.public_keys.get(aj_share.index) orelse return error.InvalidParameters).aux;
 
             const gamma_res = try runCheckedMtA(allocator, eph[ii].k, eph[jj].gamma, alice_pk, alice_sk, alice_aux, bob_aux, random);
             eph[ii].delta = eph[ii].delta.add(gamma_res.alpha);
@@ -821,6 +917,38 @@ test "signWithShares: rejects a subset with fewer than 2 shares or mismatched gr
     defer kg2.deinit(allocator);
     const mixed = [_]root.KeyShare{ kg.key_shares[0], kg2.key_shares[1] };
     try testing.expectError(error.InvalidParameters, signWithShares(allocator, &mixed, "m", random));
+}
+
+test "signWithShares: fails closed, not panic/UB, when a KeyShare's own index is missing from public_keys (audit F2 HIGH, 2026-09-10 fix)" {
+    // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
+    // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
+    // it skips ONLY under `-Dstrict-debug` (audit N2 claimed the opposite).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x66325f68696768); // "f2_high"
+    const random = prng.random();
+
+    const kg = try testKeygen(allocator, random, 2, 3);
+    defer kg.deinit(allocator);
+
+    // Reproduces the audit's exact shape: a `KeyShare` whose `public_keys`
+    // does not contain an entry for its OWN `index`. Before this fix,
+    // `signWithShares` looked itself up with `.get(ai_share.index).?` --
+    // ReleaseSafe turned the `null` unwrap into a panic (SIGABRT);
+    // ReleaseFast made it undefined behavior instead of a panic or any of
+    // the documented `Invalid*`/`SigningAborted` outcomes.
+    var stripped_entries: std.ArrayList(root.PartyPublicKeys) = .empty;
+    defer stripped_entries.deinit(allocator);
+    for (kg.key_shares[0].public_keys.entries) |e| {
+        if (e.index != kg.key_shares[0].index) try stripped_entries.append(allocator, e);
+    }
+    try testing.expectEqual(kg.key_shares[0].public_keys.entries.len - 1, stripped_entries.items.len);
+
+    var victim = kg.key_shares[0];
+    victim.public_keys = .{ .entries = stripped_entries.items };
+    const subset = [_]root.KeyShare{ victim, kg.key_shares[1] };
+
+    try testing.expectError(error.InvalidParameters, signWithShares(allocator, &subset, "m", random));
 }
 
 /// A `std.Random` that hands back `scripted[i]` (exactly `48` bytes each) for
