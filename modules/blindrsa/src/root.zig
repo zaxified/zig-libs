@@ -340,6 +340,20 @@ pub const Context = struct {
     /// `finalize` doesn't need to re-derive it from a `PublicKey` it may
     /// not have handy in the same form `blind` did.
     modulus_len: usize,
+
+    /// Securely wipe `r_inv` (audit finding B7): `r_inv` is documented above
+    /// as SECRET — a party who learns it can link `blinded_msg` to the
+    /// eventual `sig`, breaking the ONE property RFC 9474 exists to
+    /// provide. `Context` previously had no path to clear it at all (no
+    /// `deinit`, and neither README nor SPEC.md told a caller to
+    /// `std.crypto.secureZero` it themselves) — mirrors the sibling `rsa`
+    /// module's `SecretKey.deinit()` convention. `prepared_msg` is a
+    /// borrowed slice (its bytes are not this struct's to wipe); `salt_len`
+    /// and `modulus_len` are not secret. Call once `finalize` has consumed
+    /// the `Context`; the struct must not be reused afterward.
+    pub fn deinit(ctx: *Context) void {
+        std.crypto.secureZero(u8, &ctx.r_inv);
+    }
 };
 
 // ── Blind (client) ───────────────────────────────────────────────────────
@@ -489,6 +503,13 @@ fn blindCore(
     var r_bytes: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &r_bytes);
     r.toBytes(&r_bytes, .big) catch unreachable; // zero-padded to full width
+    // `unreachable` is safe here (unlike the sk.rsasp1 call in blindSign,
+    // audit finding B1): rsavp1 is the PUBLIC operation and its
+    // PrimitiveError can only ever be MessageRepresentativeOutOfRange, never
+    // FaultDetected (that member is returned solely by the CRT PRIVATE op,
+    // privateOpCrt's Bellcore/BDL self-check) — and r came from sampleFe,
+    // which only ever returns a value < pk.n, so the range check cannot
+    // fire either.
     var x_bytes = rsa.rsavp1(max_modulus_len, r_bytes, pk) catch unreachable; // r < n in range
     defer std.crypto.secureZero(u8, &x_bytes);
     const x = rsa.Fe.fromBytes(pk.n, &x_bytes, .big) catch unreachable; // x < n canonical
@@ -578,6 +599,9 @@ pub fn blindSign(
         var b_bytes: [max_modulus_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &b_bytes);
         b.toBytes(&b_bytes, .big) catch unreachable; // b < n fits
+        // Same reasoning as blindCore's rsavp1 call above: rsavp1 is the
+        // PUBLIC op (never returns FaultDetected) and b came from sampleFe
+        // (always < sk.n), so MessageRepresentativeOutOfRange cannot fire.
         var xb_bytes = rsa.rsavp1(max_modulus_len, b_bytes, pk) catch unreachable; // b < n in range
         defer std.crypto.secureZero(u8, &xb_bytes);
         const x_b = rsa.Fe.fromBytes(sk.n, &xb_bytes, .big) catch unreachable; // < n canonical
@@ -586,7 +610,17 @@ pub fn blindSign(
         defer std.crypto.secureZero(u8, &mb_bytes);
         sk.n.mul(m, x_b).toBytes(&mb_bytes, .big) catch unreachable; // < n fits
         // The CRT private-key op itself — constant-time ff pow inside rsa.
-        var sb_bytes = rsa.rsasp1(max_modulus_len, mb_bytes, sk) catch unreachable; // < n in range
+        // Audit finding B1: this call's PrimitiveError is NOT range-only —
+        // unlike the rsavp1 (public-op) calls above, rsasp1 routes through
+        // privateOpCrt, whose Bellcore/BDL self-check (audit F3 in `rsa`)
+        // can legitimately return `error.FaultDetected` on a CRT fault
+        // (bit-flip, hardware glitch). That is exactly the event
+        // BlindSignError.SigningFailure and SPEC.md's "fail-closed by
+        // design" promise exist for; `catch unreachable` turned a
+        // documented, reachable failure into a Debug/ReleaseSafe panic and
+        // ReleaseFast UB instead. Range is still guaranteed (mb_bytes is a
+        // mod-n product), so the only realistic error left is the fault.
+        var sb_bytes = rsa.rsasp1(max_modulus_len, mb_bytes, sk) catch return error.SigningFailure;
         defer std.crypto.secureZero(u8, &sb_bytes);
         const s_b = rsa.Fe.fromBytes(sk.n, &sb_bytes, .big) catch unreachable; // < n canonical
 
@@ -619,6 +653,18 @@ pub const FinalizeError = error{
     /// one, and ReleaseFast compiles the assert (and the `toBytes` write's
     /// bounds check) out — an out-of-bounds write in the build that ships.
     OutputTooSmall,
+    /// `ctx.modulus_len` does not match `pk`'s actual modulus length, or
+    /// exceeds `max_modulus_len`. Returned rather than asserted: `Context`
+    /// is a `pub` struct with no constructor (`kat_test.zig` composes it by
+    /// hand, and a real deployment's `Context` survives a network round
+    /// trip between `blind` and `finalize`, so a corrupted or foreign
+    /// `Context` reaching here is realistic). ReleaseFast compiles the
+    /// former assert out together with the bounds check on the
+    /// `ctx.r_inv[0..ctx.modulus_len]` slice that follows, turning an
+    /// oversized `modulus_len` into an out-of-bounds read of up to
+    /// `max_modulus_len` extra bytes in the build that ships (audit finding
+    /// B4).
+    InvalidContext,
 } || rsa.VerifyPssError;
 
 /// RFC 9474 §4 **Finalize** (client): unblinds `blind_sig` using the
@@ -643,7 +689,12 @@ pub fn finalize(pk: rsa.PublicKey, comptime Hash: type, blind_sig: []const u8, c
     // Step 1: exact-length check.
     if (blind_sig.len != ctx.modulus_len) return error.InvalidBlindSignatureLength;
     if (out.len < ctx.modulus_len) return error.OutputTooSmall;
-    std.debug.assert(byteLen(pk.n.bits()) == ctx.modulus_len); // ctx must match pk
+    // ctx must match pk (audit finding B4) — checked, not asserted: a
+    // mismatched modulus_len would otherwise slice ctx.r_inv (a fixed
+    // [max_modulus_len]u8 array) out of bounds below, and ReleaseFast
+    // compiles both the assert and that slice's bounds check out together.
+    if (ctx.modulus_len > max_modulus_len or byteLen(pk.n.bits()) != ctx.modulus_len)
+        return error.InvalidContext;
 
     // Step 2: z = OS2IP(blind_sig), fail-closed on z >= n.
     const z = rsa.Fe.fromBytes(pk.n, blind_sig, .big) catch return error.SignatureVerificationFailed;
@@ -712,6 +763,39 @@ test "prepareRandomize is non-deterministic across calls (fresh prefix each time
     const p1 = try prepareRandomize("abc", csprng.random(), &out1);
     const p2 = try prepareRandomize("abc", csprng.random(), &out2);
     try std.testing.expect(!std.mem.eql(u8, p1[0..randomizer_len], p2[0..randomizer_len]));
+}
+
+// ── B10 anchor: entropy in EVERY prefix byte, not just "differs somewhere" ─
+//
+// ⛔⛔ The test above only proves two prefixes differ SOMEWHERE — true even if
+// only 4 of the 32 bytes carry real entropy and the other 28 are fixed or
+// derived (audit mutation `m12`: RFC 9474 §4/§7.4 require the full 32-byte
+// prefix to be MUST-level random; the delta in attacker search space is
+// 2^32 vs 2^256). This test instead checks EVERY one of the 32 positions
+// independently across many draws.
+test "B10: prepareRandomize's 32-byte prefix carries real entropy in every byte position (audit mutation m12)" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x70} ** 32);
+    const random = csprng.random();
+
+    const draws = 64;
+    var seen: [randomizer_len][256]bool = [_][256]bool{[_]bool{false} ** 256} ** randomizer_len;
+    var i: usize = 0;
+    while (i < draws) : (i += 1) {
+        var out: [randomizer_len]u8 = undefined;
+        const prepared = try prepareRandomize("", random, &out);
+        for (prepared[0..randomizer_len], 0..) |b, pos| seen[pos][b] = true;
+    }
+    // Every position must show MORE THAN ONE distinct value across 64
+    // independent draws. A position fed by real entropy essentially always
+    // will (P(all 64 draws collide) ~= (1/256)^63); a fixed or
+    // derived-from-elsewhere position shows exactly one.
+    for (seen) |pos_seen| {
+        var distinct: usize = 0;
+        for (pos_seen) |v| {
+            if (v) distinct += 1;
+        }
+        try std.testing.expect(distinct > 1);
+    }
 }
 
 test "pssEncode rejects a salt too long for the target size (RFC 8017 SS9.1.1 step 3)" {
@@ -882,4 +966,67 @@ test "sampleFe: always in [1, n), even for a modulus with few top-byte bits" {
         const v = try fe.toPrimitive(u16);
         try std.testing.expect(v >= 1 and v < 521);
     }
+}
+
+// ── B2 anchor: sampleFe's UNIFORMITY, not just its range ───────────────────
+//
+// ⛔⛔ The test above only pins the RANGE. RFC 9474 §4.2 makes uniformity a
+// MUST ("The blinding factor r MUST be randomly chosen from a uniform
+// distribution"), and SPEC.md's "Uniform sampling of r in [1, n)" section
+// explains why "reduce a wide random value mod n" is the wrong shortcut —
+// but nothing enforced it. Two audit mutations SURVIVED the range-only
+// test, 42/42 green: `m7b` (top-byte mask one bit too narrow, so every draw
+// lands in the LOWER HALF `[1, 2^(bits-1))`) and `m6` (drop the `isZero`
+// rejection). These two tests close that gap.
+
+test "B2: sampleFe is not biased toward the lower half of the modulus (audit mutation m7b)" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x66} ** 32);
+    const random = csprng.random();
+    // 1021 is prime; bits(1021) == 10 and 2^9 == 512 sits almost exactly at
+    // 1021's own midpoint (50.1%) -- deliberately chosen so a real uniform
+    // sampler over [1, 1021) puts roughly HALF its draws at >= 512, while a
+    // sampler whose top-byte mask is one bit too narrow can NEVER produce a
+    // value >= 512 at all: every draw collapses into [1, 512).
+    const m = try rsa.Modulus.fromPrimitive(u16, 1021);
+    const n: usize = 4000;
+    var above_half: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const fe = sampleFe(m, random);
+        const v = try fe.toPrimitive(u16);
+        try std.testing.expect(v >= 1 and v < 1021);
+        if (v >= 512) above_half += 1;
+    }
+    // True uniform expectation is ~50%; a halved-range sampler scores 0%.
+    // 30% is a wide margin below the true rate and a wide margin above the
+    // mutant's 0% -- not a coin-flip threshold.
+    try std.testing.expect(above_half >= n * 3 / 10);
+}
+
+test "B2: sampleFe rejects a zero draw and retries rather than returning it (audit mutation m6)" {
+    const ZeroThenRandom = struct {
+        inner: std.Random,
+        zeros_left: usize,
+
+        fn fill(self: *@This(), buf: []u8) void {
+            if (self.zeros_left > 0) {
+                self.zeros_left -= 1;
+                @memset(buf, 0);
+                return;
+            }
+            self.inner.bytes(buf);
+        }
+    };
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x67} ** 32);
+    var scripted = ZeroThenRandom{ .inner = csprng.random(), .zeros_left = 1 };
+    const random = std.Random.init(&scripted, ZeroThenRandom.fill);
+
+    const m = try rsa.Modulus.fromPrimitive(u16, 1021);
+    const fe = sampleFe(m, random);
+    const v = try fe.toPrimitive(u16);
+    // A sampler that skipped the isZero rejection would have returned 0
+    // straight from the scripted first (all-zero) draw.
+    try std.testing.expect(v != 0);
+    try std.testing.expect(v >= 1 and v < 1021);
+    try std.testing.expectEqual(@as(usize, 0), scripted.zeros_left); // the zero draw WAS consumed
 }

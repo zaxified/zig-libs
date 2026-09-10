@@ -49,13 +49,16 @@ implementation WAS consulted as a design reference (below).
    EMSA-PSS-ENCODE/MGF1 specifications, not from jedisct1's Rust-derived
    Zig code.
 3. **RFC 8017 (PKCS #1 v2.2)** — §9.1.1 (EMSA-PSS-ENCODE) and §B.2.1
-   (MGF1), independently re-implemented in `root.zig`'s `pssEncode`/
-   `mgf1Xor` because the sibling `rsa` module's own equivalents
-   (`emsaPssEncode`/`mgf1Xor`) are private/unexported (see SPEC.md). Same
-   public-spec/merger-doctrine basis as item 1 — this is clean-room
-   spec transcription, not a copy of `rsa`'s private source, and was
-   validated against RFC 9474's own published `encoded_msg` values before
-   being trusted (see item 1).
+   (MGF1). Historically independently re-implemented in this module because
+   the sibling `rsa` module's own equivalents were private/unexported; `rsa`
+   later made `emsaPssEncode` (which internally also owns MGF1) `pub`
+   specifically for this reuse, and `pssEncode` in `root.zig` is now a thin
+   wrapper over it — no local MGF1/`mgf1Xor` copy remains (see `root.zig`'s
+   "PSS-encode + MGF1 reuse" doc comment and SPEC.md). Kept as a NOTICE
+   entry regardless (audit finding B15): the original clean-room
+   transcription is what was validated against RFC 9474's own published
+   `encoded_msg` values (see item 1), and this module's provenance for that
+   validated construction predates the delegation.
 
 No GPL/LGPL/AGPL source was consulted or copied anywhere in this module.
 `std.crypto.hash.sha2.Sha384`/`std.crypto.ff` (MIT, part of Zig itself)
@@ -78,10 +81,14 @@ Status
 deterministic `blindWithFactor` KAT seam — `blindSign` with §7.2
 private-op blinding, `finalize`, `verify`), `pssEncode`, and
 `prepareIdentity`/`prepareRandomize` are implemented and validated
-byte-exact against RFC 9474 Appendix A.1 and A.4 (36/36 tests, Debug and
-ReleaseFast). The formerly-missing composite-modulus modular inverse is
-implemented locally (`bigModInverse`, extended Euclid over
-`std.math.big.int` — independently written from the textbook algorithm,
-the same one `rsa`'s private key-derivation helper uses; flagged
-`TODO(dry)` for a future consolidation into `rsa`'s public API). See
-`SPEC.md`'s "Resolved design decisions" and "Constant-time posture".
+byte-exact against RFC 9474 Appendix A.1, A.2, A.3, and A.4 (test count
+last synced here 2026-09-10, audit finding B15 — see `scripts/modtest
+blindrsa`'s own summary line for the current, authoritative count rather
+than a number restated here, which drifts every time a test is added).
+The formerly-missing composite-modulus modular inverse (extended Euclid
+over `std.math.big.int`) is no longer implemented locally: `rsa` needed
+the identical routine for its own key derivation and now exports it as
+`pub fn bigModInverse`; this module calls that directly (via `feInvert`)
+instead of carrying a local copy — see `root.zig`'s "composite-modulus
+inverse" doc comment. See `SPEC.md`'s "Resolved design decisions" and
+"Constant-time posture".

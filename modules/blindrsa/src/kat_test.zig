@@ -139,6 +139,115 @@ test "blindSign reproduces RFC 9474 Appendix A.4 blind_sig byte-exact" {
     try testing.expectEqualSlices(u8, &kat.a4.blind_sig, got);
 }
 
+// ── B14: RFC 9474 Appendix A.2/A.3 — the other two variants, wired ─────────
+//
+// A.1 (PSS-Randomized) and A.4 (PSSZERO-Deterministic) were the only two of
+// the four RFC 9474 Appendix A variants exercised byte-exact above; A.2
+// (PSSZERO-Randomized) and A.3 (PSS-Deterministic) share the same key and
+// blinding factor (see `kat_vectors.zig`) and are equally real vectors, but
+// nothing in this suite ran them — audit finding B14. One test per variant,
+// covering the whole `blindWithFactor -> blindSign -> finalize -> verify`
+// pipeline against each published intermediate, mirroring the A.1/A.4
+// per-stage tests above but collapsed into one test per variant for space.
+
+test "B14: RFC 9474 Appendix A.2 (PSSZERO-Randomized) reproduces every published value byte-exact" {
+    const sk = try kat.secretKey();
+    const pk = try kat.publicKey();
+
+    var em: [blindrsa.max_modulus_len]u8 = undefined;
+    try blindrsa.pssEncode(Sha384, &kat.a2.prepared_msg, &kat.a2.salt, pk.n.bits() - 1, em[0..kat.a2.encoded_msg.len]);
+    try testing.expectEqualSlices(u8, &kat.a2.encoded_msg, em[0..kat.a2.encoded_msg.len]);
+
+    var ctx: blindrsa.Context = undefined;
+    var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
+    const blinded = try blindrsa.blindWithFactor(pk, Sha384, &kat.a2.prepared_msg, &kat.a2.salt, &kat.r, &ctx, &blinded_msg);
+    try testing.expectEqualSlices(u8, &kat.a2.blinded_msg, blinded);
+    try testing.expectEqualSlices(u8, &kat.a2.inv, ctx.r_inv[0..kat.a2.inv.len]);
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x23} ** 32);
+    var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const blind_sig = try blindrsa.blindSign(sk, pk, csprng.random(), blinded, &blind_sig_buf);
+    try testing.expectEqualSlices(u8, &kat.a2.blind_sig, blind_sig);
+
+    var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const sig = try blindrsa.finalize(pk, Sha384, blind_sig, &ctx, &sig_buf);
+    try testing.expectEqualSlices(u8, &kat.a2.sig, sig);
+    try blindrsa.verify(pk, Sha384, &kat.a2.prepared_msg, sig, kat.a2.salt.len);
+}
+
+test "B14: RFC 9474 Appendix A.3 (PSS-Deterministic) reproduces every published value byte-exact" {
+    const sk = try kat.secretKey();
+    const pk = try kat.publicKey();
+
+    var em: [blindrsa.max_modulus_len]u8 = undefined;
+    try blindrsa.pssEncode(Sha384, &kat.a3.prepared_msg, &kat.a3.salt, pk.n.bits() - 1, em[0..kat.a3.encoded_msg.len]);
+    try testing.expectEqualSlices(u8, &kat.a3.encoded_msg, em[0..kat.a3.encoded_msg.len]);
+
+    var ctx: blindrsa.Context = undefined;
+    var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
+    const blinded = try blindrsa.blindWithFactor(pk, Sha384, &kat.a3.prepared_msg, &kat.a3.salt, &kat.r, &ctx, &blinded_msg);
+    try testing.expectEqualSlices(u8, &kat.a3.blinded_msg, blinded);
+    try testing.expectEqualSlices(u8, &kat.a3.inv, ctx.r_inv[0..kat.a3.inv.len]);
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x24} ** 32);
+    var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const blind_sig = try blindrsa.blindSign(sk, pk, csprng.random(), blinded, &blind_sig_buf);
+    try testing.expectEqualSlices(u8, &kat.a3.blind_sig, blind_sig);
+
+    var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const sig = try blindrsa.finalize(pk, Sha384, blind_sig, &ctx, &sig_buf);
+    try testing.expectEqualSlices(u8, &kat.a3.sig, sig);
+    try blindrsa.verify(pk, Sha384, &kat.a3.prepared_msg, sig, kat.a3.salt.len);
+}
+
+// ── B1: a CRT fault (Bellcore/BDL) must surface as SigningFailure ──────────
+//
+// `blindSign` used to swallow `rsa.rsasp1`'s `error.FaultDetected` into
+// `catch unreachable` (a Debug/ReleaseSafe panic, UB in ReleaseFast) — the
+// SAME technique `modules/rsa/src/root.zig`'s own test "privateOpCrt
+// Bellcore check rejects a faulted CRT half" uses to reach that error:
+// corrupt one CRT exponent directly on a `SecretKey` value (its fields are
+// all plain data, no encapsulation), which makes the recombined `m` fail
+// `rsa`'s internal `m^e == c` self-check (audit F3) — the exact fault a
+// bit-flip or voltage-glitch attack produces on real hardware.
+test "B1: blindSign surfaces a CRT fault (Bellcore/BDL) as SigningFailure instead of unreachable" {
+    var sk = try kat.secretKey();
+    const pk = try kat.publicKey();
+    sk.dp = sk.p.add(sk.dp, sk.p.one()); // persistent single-half fault
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x14} ** 32);
+    var out: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.SigningFailure,
+        blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, &out),
+    );
+}
+
+// ── B3: the mandatory self-check itself, isolated from B1's rsa-level fault ─
+//
+// B1 above shows `rsa`'s own F3 check catching a faulted CRT half. What
+// SPEC.md calls blindSign's OWN "mandatory self-check" (RFC 9474 SS4 step 3,
+// RSAVP1(pk, s) == m) is a SEPARATE, independent guard — audit finding B3 is
+// that nothing in the suite ever made it fail. `pk`'s only precondition
+// blindSign checks itself is `pk.n == sk.n` (a Debug-only assert); nothing
+// checks `pk.e`, so a `pk` sharing `sk`'s modulus but carrying a WRONG
+// public exponent passes that assert, lets the CRT op run and succeed
+// normally (rsa's F3 never fires — nothing about the private op was
+// faulted), and only blindSign's OWN self-check can catch the mismatch.
+test "B3: blindSign's own mandatory self-check rejects a pk with the wrong e, independent of rsa's F3 (audit finding B3)" {
+    const sk = try kat.secretKey();
+    // Same n as sk (passes the Debug-only pk.n == sk.n assert) but a
+    // different e: not sk's real public half.
+    const wrong_pk = try rsa.PublicKey.fromBytes(&kat.n, &[_]u8{5});
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x15} ** 32);
+    var out: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.SigningFailure,
+        blindrsa.blindSign(sk, wrong_pk, csprng.random(), &kat.a1.blinded_msg, &out),
+    );
+}
+
 test "blindSign rejects a wrong-length or out-of-range blinded_msg (RFC 9474 SS4 BlindSign range check)" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();
@@ -214,6 +323,77 @@ test "finalize fails closed on a tampered blind_sig (trailing verify rejects; no
         error.InvalidBlindSignatureLength,
         blindrsa.finalize(pk, Sha384, kat.a1.blind_sig[1..], &ctx, &out),
     );
+}
+
+// ── B4: a Context whose modulus_len does not match pk ──────────────────────
+//
+// `finalize` used to guard this with `std.debug.assert`, which ReleaseFast
+// compiles out together with the bounds check on the `ctx.r_inv[0..
+// ctx.modulus_len]` slice that follows — turning an oversized modulus_len
+// into an out-of-bounds read. `Context` has no constructor (this file
+// composes it by hand throughout), and a real Context survives a network
+// round trip between `blind` and `finalize`, so a corrupted/foreign one
+// reaching here is realistic (audit finding B4, `probe ctxoob`).
+test "B4: finalize rejects a Context whose modulus_len does not match pk, instead of reading out of bounds (audit finding B4)" {
+    const pk = try kat.publicKey(); // real modulus_len is 512
+    const ctx = blindrsa.Context{
+        .prepared_msg = &kat.a1.prepared_msg,
+        .salt_len = kat.a1.salt.len,
+        .r_inv = kat.a1.inv,
+        .modulus_len = 1024, // audit's own probe value: double the real length
+    };
+    var blind_sig_1024 = [_]u8{0} ** 1024;
+    @memcpy(blind_sig_1024[0..kat.a1.blind_sig.len], &kat.a1.blind_sig);
+    var out: [1024]u8 = undefined;
+    try testing.expectError(
+        error.InvalidContext,
+        blindrsa.finalize(pk, Sha384, &blind_sig_1024, &ctx, &out),
+    );
+}
+
+// ── B11: finalize's exact-length check, the LONGER half (audit mutation m13) ─
+//
+// The "wrong length" coverage elsewhere in this file only tries a blind_sig
+// one byte SHORTER than ctx.modulus_len (`kat.a1.blind_sig[1..]`) — which a
+// `!=` -> `<` weakening of the length check (audit mutation m13, "longer
+// signature passes") would still reject, since 511 < 512 stays true. This
+// test is the half that mutation would let through: RFC 9474 Finalize step
+// 1 requires the EXACT length, not merely "at least".
+test "B11: finalize rejects a blind_sig LONGER than ctx.modulus_len, not just shorter (audit mutation m13)" {
+    const pk = try kat.publicKey();
+    const ctx = blindrsa.Context{
+        .prepared_msg = &kat.a1.prepared_msg,
+        .salt_len = kat.a1.salt.len,
+        .r_inv = kat.a1.inv,
+        .modulus_len = kat.a1.blind_sig.len,
+    };
+    var too_long = [_]u8{0} ** (blindrsa.max_modulus_len + 1);
+    @memcpy(too_long[0..kat.a1.blind_sig.len], &kat.a1.blind_sig);
+    var out: [blindrsa.max_modulus_len + 1]u8 = undefined;
+    try testing.expectError(
+        error.InvalidBlindSignatureLength,
+        blindrsa.finalize(pk, Sha384, too_long[0 .. kat.a1.blind_sig.len + 1], &ctx, &out),
+    );
+}
+
+// ── B7: Context.deinit wipes the SECRET r_inv ───────────────────────────────
+test "B7: Context.deinit wipes r_inv (audit finding B7)" {
+    const pk = try kat.publicKey();
+    var ctx: blindrsa.Context = undefined;
+    var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
+    _ = try blindrsa.blindWithFactor(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, &kat.r, &ctx, &blinded_msg);
+
+    var any_nonzero = false;
+    for (ctx.r_inv[0..ctx.modulus_len]) |b| {
+        if (b != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(any_nonzero); // sanity: it really was populated
+
+    ctx.deinit();
+    for (ctx.r_inv) |b| try testing.expectEqual(@as(u8, 0), b);
 }
 
 test "finalize fails closed when the Context does not match the blind_sig (wrong message / wrong salt_len / wrong inv)" {
@@ -419,6 +599,51 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
         error.SignatureVerificationFailed,
         blindrsa.finalize(kp.public_key, Sha384, tampered[0..blind_sig.len], &ctx, &out2),
     );
+}
+
+// ── B8: RFC 9474 SS6.2 — a distinct key per encoding option ────────────────
+//
+// "if a server supports two different encoding options, then it MUST have
+// a distinct key pair for each option" (RFC 9474 SS6.2). `blindSign` cannot
+// enforce this itself (it takes a bare key pair with no encoding-option tag
+// attached — see SPEC.md's "Threat model / limits"), so this is a
+// demonstration that the two-separate-keys pattern this file's own example
+// (`example/main.zig`) now follows actually works end-to-end, not a new
+// library behavior. This is the pattern verified here BEFORE it was applied
+// to the example, which this test suite's gate does not build.
+test "B8: separate keys per encoding option round-trip independently (RFC 9474 SS6.2, audit finding B8)" {
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x25} ** 32);
+    const random = csprng.random();
+    const kp_pss = try rsa.generate(random, 1024, 65537);
+    const kp_psszero = try rsa.generate(random, 1024, 65537);
+    try testing.expect(!kp_pss.public_key.n.v.eql(kp_psszero.public_key.n.v)); // genuinely distinct keys
+
+    // -PSS-Randomized under kp_pss.
+    const msg_pss = "SS6.2 demo: PSS-Randomized request";
+    var salt: [Sha384.digest_length]u8 = undefined;
+    random.bytes(&salt);
+    var ctx_pss: blindrsa.Context = undefined;
+    var blinded_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const blinded_pss = try blindrsa.blind(kp_pss.public_key, Sha384, msg_pss, &salt, random, &ctx_pss, &blinded_pss_buf);
+    var blind_sig_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const blind_sig_pss = try blindrsa.blindSign(kp_pss.secret_key, kp_pss.public_key, random, blinded_pss, &blind_sig_pss_buf);
+    var sig_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const sig_pss = try blindrsa.finalize(kp_pss.public_key, Sha384, blind_sig_pss, &ctx_pss, &sig_pss_buf);
+    try blindrsa.verify(kp_pss.public_key, Sha384, msg_pss, sig_pss, salt.len);
+
+    // -PSSZERO-Deterministic under the SEPARATE kp_psszero.
+    const msg_zero = blindrsa.prepareIdentity("SS6.2 demo: PSSZERO-Deterministic request");
+    var ctx_zero: blindrsa.Context = undefined;
+    var blinded_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const blinded_zero = try blindrsa.blind(kp_psszero.public_key, Sha384, msg_zero, &.{}, random, &ctx_zero, &blinded_zero_buf);
+    var blind_sig_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const blind_sig_zero = try blindrsa.blindSign(kp_psszero.secret_key, kp_psszero.public_key, random, blinded_zero, &blind_sig_zero_buf);
+    var sig_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
+    const sig_zero = try blindrsa.finalize(kp_psszero.public_key, Sha384, blind_sig_zero, &ctx_zero, &sig_zero_buf);
+    try blindrsa.verify(kp_psszero.public_key, Sha384, msg_zero, sig_zero, 0);
+
+    // Cross-check: a token from ONE key must not verify under the OTHER.
+    try testing.expectError(error.SignatureVerificationFailed, blindrsa.verify(kp_psszero.public_key, Sha384, msg_pss, sig_pss, salt.len));
 }
 
 // A rigged `std.Random` that always returns `p` (a prime factor of the RFC

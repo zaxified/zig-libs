@@ -63,19 +63,18 @@ design decisions" below for how the former "TODO(fable)" items landed.
 | Variant | salt_len | Prepare | Wired KAT |
 |---|---:|---|---|
 | RSABSSA-SHA384-PSS-Randomized (RECOMMENDED) | 48 | `prepareRandomize` | Appendix A.1 |
-| RSABSSA-SHA384-PSSZERO-Randomized (RECOMMENDED) | 0 | `prepareRandomize` | not yet wired |
-| RSABSSA-SHA384-PSS-Deterministic | 48 | `prepareIdentity` | not yet wired |
+| RSABSSA-SHA384-PSSZERO-Randomized (RECOMMENDED) | 0 | `prepareRandomize` | Appendix A.2 |
+| RSABSSA-SHA384-PSS-Deterministic | 48 | `prepareIdentity` | Appendix A.3 |
 | RSABSSA-SHA384-PSSZERO-Deterministic | 0 | `prepareIdentity` | Appendix A.4 |
 
 All four variants mandate SHA-384 for both the message hash and MGF1 —
 this module takes `Hash` as a `comptime` parameter (matching `rsa.signPss`/
 `rsa.verifyPss`'s own convention) rather than hardcoding it, so a caller
 technically CAN pass a different hash; RFC 9474 compliance requires
-`Sha384`. Appendix A.2 (PSSZERO-Randomized) and A.3 (PSS-Deterministic)
-share the SAME 4096-bit key as A.1/A.4 (already in `kat_vectors.zig`) and
-are straightforward to add — only their `msg`-dependent fields
-(`encoded_msg`/`blinded_msg`/`blind_sig`/`sig`, and A.2's `msg_prefix`)
-are new transcription, not new design.
+`Sha384`. All four Appendix A subsections share the SAME 4096-bit key
+(`kat_vectors.zig`) and are now wired byte-exact end to end (audit
+finding B14 — `blindWithFactor -> blindSign -> finalize -> verify`,
+`kat_test.zig`).
 
 ## Resolved design decisions (the former "TODO(fable)" items)
 
@@ -206,19 +205,32 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   top of `blindrsa` must track spent tokens / apply its own issuance
   policy; that is out of scope here, same as `jwt`/`jwe` not tracking
   token replay.
+- **A server signing key MUST NOT be reused across different RSABSSA
+  encoding options** (RFC 9474 §6.2: "if a server supports two different
+  encoding options, then it MUST have a distinct key pair for each
+  option"). A shared key across, say, `-PSS-Randomized` and
+  `-PSSZERO-Deterministic` opens cross-protocol attacks the RFC's Message
+  Robustness analysis (§7.2) depends on each encoding option having its
+  own key to rule out. This module does not enforce it — `blindSign` takes
+  a bare `rsa.SecretKey`/`rsa.PublicKey` pair with no encoding-option tag
+  attached, so it cannot tell which option a given call is for, let alone
+  that a caller used the same key for two — the caller's key-management
+  layer owns this rule (audit finding B8; `example/main.zig` now uses a
+  separate key pair per encoding option to demonstrate it in practice).
 
 ## Verification
 
 - `zig build test-blindrsa` — pass, Debug AND
   `-Doptimize=ReleaseFast`, zero panics. `zig fmt` clean.
-- Byte-exact KATs against RFC 9474 Appendix A.1 (PSS-Randomized) and A.4
-  (PSSZERO-Deterministic): `pssEncode` → `encoded_msg`;
-  `blindWithFactor` (fed the RFC's fixed `r`) → `blinded_msg` AND
-  `ctx.r_inv` == the RFC's published `inv` (this pair independently
-  validates the local extended-Euclid inverse against RFC data);
-  `blindSign` → `blind_sig` (asserted under two different RNG seeds —
-  proves the §7.2 internal blinding is output-invariant); `finalize` →
-  `sig`; `verify` accepts both published `sig`s.
+- Byte-exact KATs against ALL FOUR RFC 9474 Appendix A subsections (A.1
+  PSS-Randomized, A.2 PSSZERO-Randomized, A.3 PSS-Deterministic, A.4
+  PSSZERO-Deterministic — audit finding B14 closed A.2/A.3): `pssEncode` →
+  `encoded_msg`; `blindWithFactor` (fed the RFC's fixed `r`) →
+  `blinded_msg` AND `ctx.r_inv` == the RFC's published `inv` (this pair
+  independently validates the local extended-Euclid inverse against RFC
+  data); `blindSign` → `blind_sig` (A.1/A.4 asserted under two different
+  RNG seeds — proves the §7.2 internal blinding is output-invariant);
+  `finalize` → `sig`; `verify` accepts every published `sig`.
 - Fail-closed reject coverage: tampered `blind_sig` (either end),
   wrong-length `blind_sig`, mismatched `Context` (wrong message, wrong
   `salt_len`, corrupted `r_inv`), tampered/wrong-message/wrong-salt-len

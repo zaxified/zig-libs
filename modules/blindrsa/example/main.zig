@@ -67,7 +67,14 @@ pub fn main() !void {
     // 1024 bits is the smallest modulus that fits a full SHA-384 PSS
     // encoding (em_len >= hLen + sLen + 2 = 48 + 48 + 2 = 98 bytes => >=
     // 784 bits), rounded up purely for this example's speed.
+    //
+    // TWO keys, not one: RFC 9474 SS6.2 MUST NOT — "if a server supports
+    // two different encoding options, then it MUST have a distinct key
+    // pair for each option" (audit finding B8; see SPEC.md's "Threat model
+    // / limits"). `kp` serves the two `-PSS-Randomized` requests below;
+    // `kp_psszero` serves the `-PSSZERO-Deterministic` one.
     const kp = try rsa.generate(random, 1024, 65537);
+    const kp_psszero = try rsa.generate(random, 1024, 65537);
 
     // ── request 1: RSABSSA-SHA384-PSS-Randomized ────────────────────────
     const msg1 = "anonymous-token request #1";
@@ -133,20 +140,21 @@ pub fn main() !void {
     // ── request 3: RSABSSA-SHA384-PSSZERO-Deterministic ─────────────────
     // salt_len = 0, prepareIdentity (no randomizer prefix) — the module's
     // OTHER real variant, not just the PSS-Randomized one the first two
-    // requests used.
+    // requests used. Signed under `kp_psszero`, a SEPARATE key from `kp`
+    // (RFC 9474 SS6.2 MUST NOT, audit finding B8 — see the key setup above).
     const msg3 = "anonymous-token request #3 (deterministic variant)";
     const prepared3 = blindrsa.prepareIdentity(msg3);
     var ctx3: blindrsa.Context = undefined;
     var blinded_buf3: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded3 = try blindrsa.blind(kp.public_key, Sha384, prepared3, &.{}, random, &ctx3, &blinded_buf3);
+    const blinded3 = try blindrsa.blind(kp_psszero.public_key, Sha384, prepared3, &.{}, random, &ctx3, &blinded_buf3);
 
     var blind_sig_buf3: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig3 = try blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded3, &blind_sig_buf3);
+    const blind_sig3 = try blindrsa.blindSign(kp_psszero.secret_key, kp_psszero.public_key, random, blinded3, &blind_sig_buf3);
 
     var sig_buf3: [blindrsa.max_modulus_len]u8 = undefined;
-    const sig3 = try blindrsa.finalize(kp.public_key, Sha384, blind_sig3, &ctx3, &sig_buf3);
-    try blindrsa.verify(kp.public_key, Sha384, prepared3, sig3, 0);
-    std.debug.print("request 3 (PSSZERO-Deterministic): token issued and verifies\n", .{});
+    const sig3 = try blindrsa.finalize(kp_psszero.public_key, Sha384, blind_sig3, &ctx3, &sig_buf3);
+    try blindrsa.verify(kp_psszero.public_key, Sha384, prepared3, sig3, 0);
+    std.debug.print("request 3 (PSSZERO-Deterministic, separate key per RFC 9474 SS6.2): token issued and verifies\n", .{});
 
     // ── negative paths: named errors only ──────────────────────────────
 

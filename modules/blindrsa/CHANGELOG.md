@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, audit findings B1/B2/B3/B4/B7/B8/B10/B11/B14/B15
+  closed (13/18 open findings; B6/B9/B16/B18 left open, B13/B19 found already fixed
+  elsewhere — see `~/CML/20260901-zig-libs-audit/A1/blindrsa.md`'s Dispozice section
+  for the full breakdown). **Breaking:** `blindSign` no longer `catch unreachable`s
+  `rsa.rsasp1`'s `error.FaultDetected` (a Debug/ReleaseSafe panic, UB in ReleaseFast,
+  on a CRT fault the sibling `rsa` module's own Bellcore/BDL self-check legitimately
+  raises) — it now returns the ALREADY-documented `error.SigningFailure` instead
+  (B1). `FinalizeError` gains `error.InvalidContext`: a `Context.modulus_len` that
+  does not match `pk` (previously `std.debug.assert`, compiled out together with the
+  following slice's bounds check in ReleaseFast — an out-of-bounds read) is now a
+  typed error (B4). `Context` gains `pub fn deinit()`, wiping the secret `r_inv`
+  (B7, previously undocumented how a caller was meant to clear it). Ten new tests
+  close B2 (sampleFe's uniformity, not just its range), B3 (the mandatory self-check
+  rejects a pk with the wrong e — independent of B1's rsa-level fault), B10
+  (prepareRandomize's full 32-byte entropy, not just "differs somewhere"), B11
+  (finalize rejects an over-long blind_sig, not just a short one), and B14 (RFC 9474
+  Appendix A.2/A.3 wired byte-exact, alongside A.1/A.4). SPEC.md gains an RFC 9474
+  §6.2 key-reuse paragraph and `example/main.zig` now signs its PSSZERO-Deterministic
+  request under a SEPARATE key pair (B8). NOTICE's test count and its now-stale
+  claim of a locally-reimplemented `mgf1Xor`/`bigModInverse` are corrected (B15).
+  `scripts/modtest blindrsa`: 45/45 (baseline) -> 56/56, Debug and ReleaseFast.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** two tests pin `maskedInvert`'s masking itself. The module's only existing guard asserted that the masked inverse equals the direct inverse — a VALUE, which is exactly what stays true when the masking disappears — so the audit's mutations both survived 42/42: `m8` (`maskedInvert` replaced by `return feInvert(m, x);`) and `m21b` (the fresh uniform scalar replaced by the constant 3). ⚠ ctgrind cannot see this either: a constant mask is still branch-free, so no context count moves. The property is "a fresh, uniform scalar is drawn per attempt", and the seam that makes it observable was already in the signature — `maskedInvert` takes its `std.Random` as a parameter. The tests script that RNG to return `p` (a factor of the RFC 9474 modulus `n`) on the first draw, so the masked product keeps the shared factor, `feInvert` must fail, and the loop must draw a SECOND, different scalar; the answer is still checked against the RFC's published `inv`. The second test scripts `p` for every draw and pins the four-attempt bound and the fail-closed `NotInvertible`. Verified by deploying both mutations: each is killed by both tests.
 
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **blind 477 / sign 218**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. 457 of the 477 are the extended-Euclid modular inverse, which `SPEC.md:188` already names as "the ONE inherently non-constant-time piece" and defends by masking — so this is the first MEASUREMENT of an admitted caveat, not a new finding. ⭐ The two `Modulus.mul` calls SPEC calls constant-time measured ZERO. ⛔⛔ Instrument defect found here and recorded in `scripts/ctgrind.sh`: `modules/blindrsa/src/root.zig` and `modules/rsa/src/root.zig` are different files with the SAME BASENAME, both appear in every stack, and the classifier matches regex text over the whole paragraph — so `root[.]zig` cannot tell them apart and this row's in-file column is "this module plus rsa". The author's first pass mis-attributed several lines that way and corrected it by reading valgrind's qualified symbol names.
