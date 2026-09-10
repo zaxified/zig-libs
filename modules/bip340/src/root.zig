@@ -188,9 +188,11 @@ pub const KeyPair = struct {
         // even though the input was validated above and it can never be taken.
         // The `Scalar` method cannot fail, so the branch does not exist at all
         // -- again exactly what step 7 does with `k0.neg()`.
-        const negated = d.neg().toBytes(.big);
+        var negated = d.neg().toBytes(.big);
+        defer std.crypto.secureZero(u8, &negated); // F2: the unchosen candidate is n-d, which reveals d just as directly
         const mask: u8 = @as(u8, 0) -% @intFromBool(xy.y.isOdd());
         var effective: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &effective); // F2: this is a SEPARATE stack slot from the copy returned below, and was never cleared
         for (&effective, sk.bytes, negated) |*ei, even, odd| ei.* = (even & ~mask) | (odd & mask);
         return .{ .secret = effective, .public = .{ .x = xy.x.toBytes(.big) } };
     }
@@ -529,6 +531,7 @@ test {
     _ = hash;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names BIP340 and std's Secp256k1" {

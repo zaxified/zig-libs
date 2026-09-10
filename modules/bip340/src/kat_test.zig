@@ -26,6 +26,8 @@
 const std = @import("std");
 const bip340 = @import("root.zig");
 const v = @import("kat_vectors.zig");
+const k256 = @import("k256");
+const Scalar = k256.Secp256k1.scalar.Scalar;
 
 fn hexAlloc(gpa: std.mem.Allocator, hex_str: []const u8) ![]u8 {
     const out = try gpa.alloc(u8, hex_str.len / 2);
@@ -368,4 +370,70 @@ test "corpus: every signature seed reaches fromBytes, and the outcomes are pinne
     try std.testing.expectEqual(@as(usize, 3), refused);
     try std.testing.expectEqual(@as(usize, 9), accepted);
     try std.testing.expectEqual(@as(usize, 1), verified);
+}
+
+// ── F1: verifyBatch's randomizers are what a mutation test needs to see ────
+//
+// A1 audit F1 (`~/CML/20260901-zig-libs-audit/A1/bip340.md`): the random
+// linear-combination coefficients `a_2..a_u` are the ONLY thing standing
+// between `verifyBatch` and an attacker who submits a batch of individually
+// INVALID signatures whose errors are crafted to cancel. Before this test,
+// no test in the suite could tell a working randomizer from a broken one —
+// mutating `verifyBatch` to always use `a_i = 1` passed the whole suite
+// green (the existing "corrupting any single item" test flips one bit of
+// `s`, which breaks a plain sum too, so it cannot distinguish the two).
+//
+// This test builds exactly that forged, cancelling pair:
+//   item1 = (P1, m1, (r1, s1 + d))   -- individually INVALID
+//   item2 = (P2, m2, (r2, s2 - d))   -- individually INVALID
+// With `a_i = 1` for both items the batch equation degenerates to
+// `sum(s_i)*G == sum(R_i + e_i*P_i)`, and the `+d`/`-d` errors cancel
+// exactly — the mutant batch verifier accepts two forgeries. With real
+// independent random `a_i`, the batch must reject.
+test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJECTED (F1)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk1 = try bip340.SecretKey.fromBytes([_]u8{0xa1} ** 32);
+    const sk2 = try bip340.SecretKey.fromBytes([_]u8{0xb2} ** 32);
+    var kp1 = try bip340.KeyPair.fromSecretKey(sk1);
+    defer kp1.deinit();
+    var kp2 = try bip340.KeyPair.fromSecretKey(sk2);
+    defer kp2.deinit();
+    const m1 = [_]u8{0x11} ** 32;
+    const m2 = [_]u8{0x22} ** 32;
+    const aux = [_]u8{0} ** 32;
+
+    const sig1 = try bip340.sign(sk1, &m1, aux, io);
+    const sig2 = try bip340.sign(sk2, &m2, aux, io);
+    const p1 = try bip340.Signature.fromBytes(sig1);
+    const p2 = try bip340.Signature.fromBytes(sig2);
+
+    // Sanity: the real signatures verify individually before we corrupt them.
+    try std.testing.expect(bip340.verify(kp1.public, &m1, p1));
+    try std.testing.expect(bip340.verify(kp2.public, &m2, p2));
+
+    // Craft the cancelling pair: s1 += delta, s2 -= delta.
+    const delta = Scalar.fromBytes([_]u8{0xde} ** 32, .big) catch unreachable;
+    const s1 = Scalar.fromBytes(p1.s, .big) catch unreachable;
+    const s2 = Scalar.fromBytes(p2.s, .big) catch unreachable;
+    const forged1 = bip340.Signature{ .r = p1.r, .s = s1.add(delta).toBytes(.big) };
+    const forged2 = bip340.Signature{ .r = p2.r, .s = s2.sub(delta).toBytes(.big) };
+
+    // Each forged signature must be individually invalid...
+    try std.testing.expect(!bip340.verify(kp1.public, &m1, forged1));
+    try std.testing.expect(!bip340.verify(kp2.public, &m2, forged2));
+
+    // ...and the batch that cancels them must still be rejected. This is
+    // the property that only a real (non-degenerate) randomizer draw can
+    // provide -- it is the whole point of F1.
+    const items = [_]bip340.BatchItem{
+        .{ .pubkey = kp1.public, .msg = &m1, .sig = forged1 },
+        .{ .pubkey = kp2.public, .msg = &m2, .sig = forged2 },
+    };
+    var trials: usize = 0;
+    while (trials < 20) : (trials += 1) {
+        try std.testing.expect(!bip340.verifyBatch(&items, io));
+    }
 }
