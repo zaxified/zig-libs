@@ -28,6 +28,7 @@ hinges on.
 | `kat_test.zig` | Byte-exact KAT assertions against that vector + a genuinely-blind end-to-end Prover<->Verifier run (no foreknowledge of either confirmation value) + mismatched-password, tamper-rejection, RFC 9383 §6 group-membership and non-canonical-scalar tests |
 | `bssl_w0w1_vectors.zig` | Frozen goldens captured from BoringSSL's `bssl::spake2plus::Register` — registration vectors plus modular-reduction boundary halves. The oracle for `computeW0W1`, which RFC 9383 Appendix C cannot reach |
 | `bssl_w0w1_test.zig` | Pins `computeW0W1` and `computeL` against those goldens byte for byte. Runs offline, with no skip path |
+| `ctgrind_harness.zig` | Instrument for SPEC.md's constant-time-discipline claims — runs the module's cores under memcheck with secret operands marked undefined, so a secret-dependent branch (in this module or in the `p256` calls it delegates to) surfaces as a reported context instead of living only in a claim |
 
 ## Import
 

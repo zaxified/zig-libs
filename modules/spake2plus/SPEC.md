@@ -201,17 +201,24 @@ self-consistency check; it closed audit finding F1.
   the same discipline `bip340`'s self-verify / `adaptor`'s tamper checks
   already establish elsewhere in this repository for MAC/signature
   comparisons that gate a security-relevant accept/reject decision.
-- **`K_main` and the confirmation keys MUST be discarded after use**:
-  RFC 9383 §3.4: "Neither K_main nor its derived confirmation keys are
-  used for anything except key derivation and confirmation and MUST be
-  discarded after the protocol execution." This module returns them in
+- **`K_main`, the confirmation keys, AND `TT` MUST be discarded after
+  use**: RFC 9383 §3.4: "Neither K_main nor its derived confirmation keys
+  are used for anything except key derivation and confirmation and MUST
+  be discarded after the protocol execution." This module returns them in
   `ProverFinishResult`/`VerifierFinishResult` for KAT-testing visibility
   (requirement (5) in `root.zig`'s module doc comment) — a production
   caller that is NOT testing against a KAT should zero them once
   `K_shared` has been extracted, the same "sensitive intermediate values
   are the caller's to scrub" division of labor this repository's other
   crypto modules leave to their callers (no built-in secure-erase
-  primitive is assumed here).
+  primitive is assumed here). `TT` (the `tt` field, allocator-owned —
+  the caller already frees it) belongs on this list too, not just
+  `K_main`: `VerifierConfirmResult`'s own doc comment establishes that
+  `TT` is a ONE-CALL pre-image of `K_shared` through this module's public
+  `deriveKeys` (`deriveKeys(tt).k_shared == K_shared`), exactly the same
+  distance as `K_main` — the caller-owned buffer it frees is exactly as
+  sensitive as the fixed-size key material next to it, and freeing it is
+  not the same as zeroing it first.
 - **`L` must be the record actually registered for THIS Prover
   identity**: `verifierFinish` takes `l` as a plain parameter rather
   than looking it up internally — binding `l` to the correct
