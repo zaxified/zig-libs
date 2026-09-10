@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CODE CHANGE.** A1 fix campaign, F14 (LOW), documentation
+  only. `addTarget`/`addTargetAddr`/`addTargetIp` validate nothing about the
+  destination (multicast/broadcast/loopback/unspecified are all accepted and
+  probed like any other target); the kernel itself already blocks the classic
+  smurf-amplification shape (no `SO_BROADCAST`), so this was left LOW rather
+  than fixed in code — but `SPEC.md`'s threat model had not one sentence about
+  it. Documented, including that `netaddr` (an existing dependency) already
+  exports the predicates (`isLoopback`/`isPrivate`/`isMulticast`/
+  `isLinkLocalUnicast`/`isUnspecified`) a caller can filter its own target list
+  with before calling `addTarget`. Doc-only, `scripts/modtest icmp`: 50/50,
+  unchanged.
+
 - **2026-09-10** — **A1 fix campaign: five findings closed.**
 
   - **F9 (HIGH-adjacent correctness): `checksum()` overflowed past 131074

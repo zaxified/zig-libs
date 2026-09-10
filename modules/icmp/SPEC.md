@@ -24,8 +24,16 @@ Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the 
 acquire privilege, only uses what it is given. It does **not authenticate replies** — a reply is
 matched to a live probe by echo ident + sequence via `seqmap`, so a spoofed reply with a guessed id
 resolves as genuine (correlation, not authentication). ICMP errors (unreachable, time exceeded) are
-counted but the probe still resolves via timeout. Out of scope: non-Linux platforms, capture/BPF,
-and any anti-spoofing token.
+counted but the probe still resolves via timeout. **`addTarget`/`addTargetAddr`/`addTargetIp`
+validate nothing about the destination** (audit A1 F14) — a multicast, broadcast, loopback, or
+unspecified address is accepted and probed exactly like any other. The kernel itself refuses to
+send to multicast/broadcast without `SO_BROADCAST` (which this module never sets), so the classic
+smurf-amplification shape is blocked below this module regardless; what is NOT blocked is a target
+list that silently includes loopback/`0.0.0.0`/link-local addresses a caller did not mean to probe.
+`netaddr` (an existing dependency) exports `isLoopback`/`isPrivate`/`isMulticast`/
+`isLinkLocalUnicast`/`isUnspecified` for a caller who wants to filter its own target list before
+handing it to `addTarget`. Out of scope: non-Linux platforms, capture/BPF, and any anti-spoofing
+token.
 
 ## Verification
 Offline: RFC 1071 checksum goldens (vector + wire-byte goldens v4/v6, comptime + property
