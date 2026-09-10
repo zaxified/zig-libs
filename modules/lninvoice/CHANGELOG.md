@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — ⛔ `bech32_raw.stripContinuation`'s 2026-08-08 neighbour-charset check (audit
+  F6) required both sides of a BOLT#12 `+` to be `1`/`b`/`i`/`o`-excluding bech32-alphabet
+  members — but `1`/`b`/`i`/`o` are exactly the letters/separator a human-readable prefix
+  (`lno`/`lnr`/`lni` + `1`) is made of, so a `+` landing right after the HRP (`"lno1+..."`) was
+  never stripped (wave-2 audit finding F7). Ported core-lightning's actual reference reader
+  (`common/bolt12.c` `b12_string_to_data`) instead: position-only (not first/last character of
+  the string), no neighbour-charset check at all. Verified against the official
+  `lightning/bolts` `bolt12/format-string-test.json` conformance vectors, including the two
+  state-machine edge cases they pin (a trailing `+` followed only by whitespace; two adjacent
+  `+`) — the audit's own vendored corpus could not distinguish the old and new readings, this
+  external oracle can.
 - **2026-09-07** — Fuzz reach: all three harnesses are R1 — their FIRST draw was a scalar one —
   and all three ran a single fixed input for their whole life. A scalar `Smith` draw reads eight
   octets as a little-endian u64 and returns the range MINIMUM unless the whole word falls inside
