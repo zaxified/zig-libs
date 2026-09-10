@@ -260,7 +260,31 @@ pub const lsp_fixed_len: usize = 27;
 /// that the LSP may be aged by systems without requiring re-computation." The
 /// field after Remaining Lifetime is the LSP ID (a.k.a. Source ID) at offset 12,
 /// which §7.3.11's NOTE confirms: "All Checksum calculations on the LSP are
-/// performed treating the Source ID field as the first octet."
+/// performed treating the Source ID field as the first octet. This procedure
+/// prevents the source from accidentally sending out Link State PDUs with some
+/// other system's ID as source."
+///
+/// ⚠ §7.3.11 states one more generation-time requirement this codec does NOT
+/// implement, quoted here in full rather than left to trail off where the
+/// paragraph above did: "As an additional precaution against hardware failure,
+/// when the source computes the Checksum, it shall start with the two checksum
+/// variables (C0 and C1) initialised to what they would be after computing for
+/// the systemID portion (i.e. the first 6 octets) of its Source ID. (This value
+/// is computed and stored when the Network entity is enabled and whenever
+/// systemID changes.) The IS shall then resume Checksum computation on the
+/// contents of the PDU after the first ID Length octets of the Source ID
+/// field." That is a redundancy check against a corrupted in-memory systemID
+/// (the cached prefix state and the freshly-read Source ID bytes must agree
+/// when resumed), not a different checksum construction: resuming from a
+/// cached prefix state that matches the actual prefix bytes is arithmetically
+/// identical to `checksum.compute`'s single continuous pass over the whole
+/// region (same bytes, same running sums in the same order), so the value on
+/// the wire is unaffected either way. It needs state this module does not
+/// hold by design (`isis` is a pure, zero-allocation codec — see SPEC.md
+/// "Scope"): the systemID-anchored checksum prefix, recomputed "when the
+/// Network entity is enabled and whenever systemID changes", belongs to
+/// whichever layer owns that lifecycle — a stateful consumer such as
+/// `isis-lsdb` — not this codec.
 pub const lsp_checksum_base: usize = 12;
 
 /// Offset of the first of the two Checksum octets in an LSP.

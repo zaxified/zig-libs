@@ -189,6 +189,15 @@ Green in Debug and `-Doptimize=ReleaseFast`; `zig fmt --check` clean;
   computed" (`ChecksumStatus.not_present`); the receive **policy** built on that
   — ISO §7.3.14.2's discard — belongs to the update process (`isis-lsdb`), not
   here.
+- **§7.3.11's hardware-failure precaution for checksum generation** ("start
+  with C0/C1 initialised to what they would be after computing for the
+  systemID portion … stored when the Network entity is enabled and whenever
+  systemID changes"): a redundancy check against a corrupted in-memory
+  systemID, requiring persistent state this pure codec does not hold. The
+  wire value is unaffected — resuming from a cached prefix that matches the
+  actual prefix bytes is arithmetically identical to `checksum.compute`'s one
+  continuous pass — so this is a robustness feature for a stateful generator,
+  not a decode/encode correctness gap. Full citation: `pdu.lsp_checksum_base`.
 - **Non-default ID lengths** in the typed bodies (only 6 is wired; the raw TLV
   walk is id-length-independent).
 - **Authentication TLV (#10)** and IS-IS crypto-auth (RFC 5304/5310); SPB digest

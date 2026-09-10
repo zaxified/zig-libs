@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — The `lsp_checksum_base` citation of ISO/IEC 10589 §7.3.11
+  quoted the opening paragraph and then jumped straight to the closing NOTE,
+  silently skipping the middle paragraph — a real normative requirement (an
+  "additional precaution against hardware failure": generation should resume
+  checksum computation from a persisted, systemID-anchored prefix state
+  rather than always starting at zero). Quoted in full now, with a note
+  explaining why this codec does not implement it: it is a redundancy check
+  against a corrupted in-memory systemID, requires state a pure/stateless
+  codec does not hold, and does not change the computed checksum value
+  (resuming from a cached prefix that matches the actual prefix bytes is
+  arithmetically identical to one continuous pass). Also documented (in its
+  own words) in SPEC.md's "Deliberately deferred" section. `grep -rln
+  "additional precaution" modules/isis/`: empty before this entry, `pdu.zig`
+  after.
 - **2026-09-07** — **`fuzzDecode` walked an EMPTY buffer, and the header bias its
   own TEETH test defends had never executed outside `--fuzz`.**
 
