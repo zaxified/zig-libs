@@ -123,12 +123,24 @@ pub const Generator = struct {
         // Converted (templated) path per route, index-aligned with `rs`.
         const converted = try arena.alloc([]const u8, rs.len);
         for (converted, rs) |*slot, rt| slot.* = try convertPattern(arena, rt.pattern);
-        // Unique paths in first-registration order.
+        // Unique paths in first-registration order, with the (registration-
+        // order) list of route indices at each path — one hashmap pass
+        // instead of the old O(routes·paths) linear-scan dedup, and the
+        // per-path route lists below turn the method-grouping loop from
+        // O(paths·13·routes) into O(routes·13): each route is visited once
+        // to build its group, then each group (summing to `routes` total)
+        // is scanned once per HTTP method.
         var paths: std.ArrayList([]const u8) = .empty;
-        for (converted) |p| {
-            for (paths.items) |seen| {
-                if (std.mem.eql(u8, seen, p)) break;
-            } else try paths.append(arena, p);
+        var path_index: std.StringArrayHashMapUnmanaged(usize) = .empty;
+        var route_groups: std.ArrayList(std.ArrayList(usize)) = .empty;
+        for (converted, 0..) |p, i| {
+            const gop = try path_index.getOrPut(arena, p);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = paths.items.len;
+                try paths.append(arena, p);
+                try route_groups.append(arena, .empty);
+            }
+            try route_groups.items[gop.value_ptr.*].append(arena, i);
         }
 
         var jw: std.json.Stringify = .{ .writer = w, .options = .{} };
@@ -148,17 +160,19 @@ pub const Generator = struct {
         try jw.endObject();
         try jw.objectField("paths");
         try jw.beginObject();
-        for (paths.items) |path| {
+        for (paths.items, route_groups.items) |path, group| {
             try jw.objectField(path);
             try jw.beginObject();
             // Methods in http.Method declaration order — deterministic
             // regardless of registration order; first registration wins on
-            // a (method, path) collision.
+            // a (method, path) collision. `group` already holds only the
+            // routes at THIS path (registration order), so this inner scan
+            // is bounded by that path's own route count, not by all routes.
             inline for (@typeInfo(http.Method).@"enum".fields) |f| {
                 const method: http.Method = @enumFromInt(f.value);
-                for (rs, converted) |rt, cp| {
-                    if (rt.method == method and std.mem.eql(u8, cp, path)) {
-                        try writeOperation(&jw, arena, rt);
+                for (group.items) |i| {
+                    if (rs[i].method == method) {
+                        try writeOperation(&jw, arena, rs[i]);
                         break;
                     }
                 }
@@ -263,11 +277,29 @@ fn writeOperation(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (
 
 /// `parameters` for every `:param`/`*wild` in the pattern — path params
 /// are always `required: true` with a string schema (raw path bytes).
+///
+/// A pattern that captures the same name twice (`/:id/.../:id`; `router`
+/// accepts this — it is a footgun there, `params.get` returns the first
+/// value) would otherwise emit a duplicate `(name, in)` pair, which OAS
+/// 3.1 §4.8.10 explicitly forbids ("The list MUST NOT include duplicated
+/// parameters."). A capped array of seen names (path segments are bounded
+/// in practice; router patterns are short) dedupes without allocating.
 fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Error!void {
     var it = std.mem.splitScalar(u8, pattern, '/');
     var any = false;
+    var seen_buf: [64][]const u8 = undefined;
+    var seen_count: usize = 0;
     while (it.next()) |seg| {
         if (seg.len < 2 or (seg[0] != ':' and seg[0] != '*')) continue;
+        const name = seg[1..];
+        const dup = for (seen_buf[0..seen_count]) |s| {
+            if (std.mem.eql(u8, s, name)) break true;
+        } else false;
+        if (dup) continue;
+        if (seen_count < seen_buf.len) {
+            seen_buf[seen_count] = name;
+            seen_count += 1;
+        }
         if (!any) {
             try jw.objectField("parameters");
             try jw.beginArray();
@@ -275,7 +307,7 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Erro
         }
         try jw.beginObject();
         try jw.objectField("name");
-        try jw.write(seg[1..]);
+        try jw.write(name);
         try jw.objectField("in");
         try jw.write("path");
         try jw.objectField("required");
@@ -307,7 +339,10 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Erro
 /// serving (`router/SPEC.md` §Concurrency), so a document generated once
 /// stays correct for the Endpoint's whole lifetime — caching it removes the
 /// per-request re-walk-and-re-parse cost with no invalidation to get wrong.
-/// The Endpoint must outlive the Router, at a stable address.
+/// A build that FAILS (an invalid `RouteDoc.request_schema`) caches too —
+/// it fails identically every time, so there is nothing to gain by paying
+/// full cost again on the next request. The Endpoint must outlive the
+/// Router, at a stable address.
 pub const Endpoint = struct {
     /// Generation scratch and the cache's owner.
     gpa: Allocator,
@@ -318,10 +353,14 @@ pub const Endpoint = struct {
     /// Optional docs-page path (e.g. "/docs"); null = no docs page.
     docs_path: ?[]const u8 = null,
 
-    /// The cached document, built on first access; `null` until then.
-    /// Guarded by `lock` — `spec()` may race across the server's
-    /// per-connection threads on the first request.
-    cached: ?[]const u8 = null,
+    /// The cached build outcome, resolved on first access; `null` until
+    /// then. Guarded by `lock` — `spec()` may race across the server's
+    /// per-connection threads on the first request. A FAILED build is
+    /// cached too (as `.err`): a `RouteDoc.request_schema` that fails to
+    /// parse fails identically on every call (the Router is immutable
+    /// once serving), so recomputing it per request buys nothing but cost
+    /// — see the F1 regression test below.
+    cached: ?CachedResult = null,
     lock: std.atomic.Mutex = .unlocked,
 
     pub fn middleware(e: *Endpoint) router.Middleware {
@@ -331,16 +370,86 @@ pub const Endpoint = struct {
     /// Free the cached document, if one was ever built. Call when the
     /// Endpoint is done serving.
     pub fn deinit(e: *Endpoint) void {
-        if (e.cached) |c| e.gpa.free(c);
+        if (e.cached) |c| switch (c) {
+            .ok => |doc| e.gpa.free(doc.json),
+            .err => {},
+        };
         e.* = undefined;
     }
 
-    /// The generated document, building it (once) on first use.
-    fn spec(e: *Endpoint) ![]const u8 {
+    /// The generated document (with its precomputed ETag), resolving it
+    /// (once) on first use — success or failure both stick, so a later
+    /// call never repeats the walk.
+    fn spec(e: *Endpoint) BuildError!CachedDoc {
+        // Fast path: someone already resolved it. Peek-under-lock only —
+        // no work happens while `lock` is held, so this never blocks a
+        // concurrent builder for longer than a pointer copy.
+        lockSpin(&e.lock);
+        const resolved = e.cached;
+        e.lock.unlock();
+        if (resolved) |c| return c.unwrap();
+
+        // Slow path: build OUTSIDE the lock. Concurrent first-callers may
+        // duplicate the walk once (bounded — never more than `nthreads`
+        // rebuilds, never the O(N²) pile-up a build-under-lock produces),
+        // but none of them spins on a lock held across hundreds of ms of
+        // work; see F2 in the audit for the wall-time cost of that.
+        const result: CachedResult = if (Generator.build(e.gpa, e.router, e.info)) |doc|
+            .{ .ok = .{ .json = doc, .etag = etagOf(doc) } }
+        else |err|
+            .{ .err = err };
+
         lockSpin(&e.lock);
         defer e.lock.unlock();
-        if (e.cached == null) e.cached = try Generator.build(e.gpa, e.router, e.info);
-        return e.cached.?;
+        if (e.cached == null) {
+            e.cached = result;
+        } else if (result == .ok) {
+            // Lost the race — another thread already published. Free our
+            // redundant copy rather than leak it.
+            e.gpa.free(result.ok.json);
+        }
+        return e.cached.?.unwrap();
+    }
+};
+
+/// The generated document plus its precomputed strong `ETag` (F14): the
+/// document is immutable for the Endpoint's whole lifetime (that is the
+/// entire premise of caching it — see the struct doc above), so hashing it
+/// once at build time and handing 304s to clients that already have it is
+/// the same insight the cache itself is built on, just applied to the wire
+/// instead of the CPU.
+const CachedDoc = struct {
+    json: []const u8,
+    /// Quoted strong ETag, e.g. `"0123456789abcdef"` — a fixed-seed Wyhash
+    /// fingerprint of `json` (same pattern as `filestore.versionOf`).
+    etag: [18]u8,
+};
+
+/// Fixed seed ("openapi__" truncated to 8 bytes) so the ETag is stable
+/// across process restarts serving the identical document, not derived
+/// from ASLR/pointer/PID.
+const etag_seed: u64 = 0x6f70656e6170695f;
+
+fn etagOf(json: []const u8) [18]u8 {
+    const h = std.hash.Wyhash.hash(etag_seed, json);
+    var buf: [18]u8 = undefined;
+    buf[0] = '"';
+    _ = std.fmt.bufPrint(buf[1..17], "{x:0>16}", .{h}) catch unreachable;
+    buf[17] = '"';
+    return buf;
+}
+
+/// A resolved `Endpoint.spec()` outcome — success or the `BuildError` that
+/// would otherwise have to be reproduced (at full cost) on every request.
+const CachedResult = union(enum) {
+    ok: CachedDoc,
+    err: BuildError,
+
+    fn unwrap(c: CachedResult) BuildError!CachedDoc {
+        return switch (c) {
+            .ok => |doc| doc,
+            .err => |err| err,
+        };
     }
 };
 
@@ -361,10 +470,19 @@ fn serveIntercepted(e: *Endpoint, ctx: *router.Ctx, what: enum { spec, docs }) a
     switch (ctx.req.method) {
         .get, .head => switch (what) {
             .spec => {
-                const json = try e.spec();
+                const doc = try e.spec();
+                // F14: the document is provably immutable for the
+                // Endpoint's whole lifetime (see CachedDoc doc comment), so
+                // a client that already has it can be told so with a 304
+                // instead of re-sending the whole body every scrape.
+                // `http.conditional` already implements the RFC 9110 §8.8.3
+                // comparison (weak match, `*`, multi-value lists) and stages
+                // the 304 (with `ETag`, no body) on a match; reuse it rather
+                // than re-deriving those rules here.
+                if (try http.conditional.apply(ctx.req, ctx.res, .{ .etag = &doc.etag })) return;
                 ctx.res.setStatus(200);
                 try ctx.res.setHeader("Content-Type", "application/json");
-                try ctx.res.writeAll(json);
+                try ctx.res.writeAll(doc.json);
             },
             .docs => {
                 ctx.res.setStatus(200);
@@ -970,6 +1088,264 @@ test "endpoint: the spec is built once and cached, not regenerated per request (
     const second = runWire(&r, wire("GET", "/openapi.json"), &buf);
     try expectStatus(second, "200");
     try testing.expect(std.mem.indexOf(u8, bodyOf(second), "/late") == null);
+}
+
+fn clkNs(comptime which: std.os.linux.clockid_t) u64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.errno(std.posix.system.clock_gettime(which, &ts)) != .SUCCESS) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+fn cpuNs() u64 {
+    return clkNs(.PROCESS_CPUTIME_ID);
+}
+fn monoNs() u64 {
+    return clkNs(.MONOTONIC);
+}
+
+fn addBenchRoutes(r: *router.Router, n: usize, poison_last: bool) !void {
+    var name_buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const p = try std.fmt.bufPrint(&name_buf, "/api/v1/resource{d}/:id", .{i});
+        const last = (i == n - 1);
+        try r.addDoc(.get, p, hOk, .{
+            .summary = "Fetch one",
+            .description = "Returns a single resource by its identifier.",
+            .tags = &.{"resources"},
+            .request_schema = if (last and poison_last)
+                "{\"type\":\"object\"," // truncated -> InvalidRequestSchema
+            else
+                "{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}",
+            .responses = &.{.{ .status = 200, .description = "OK" }},
+        });
+    }
+}
+
+test "endpoint: a malformed request_schema fails once, then a CACHED error on every later call (F1)" {
+    // Debug-mode timing is too noisy for the ratio assertion below (GC
+    // pauses, no optimization); the correctness half (same error every
+    // time) still runs, at a smaller N so Debug stays fast.
+    const release = @import("builtin").mode != .Debug;
+    const n: usize = if (release) 3000 else 200;
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try addBenchRoutes(&r, n, true);
+    var e: Endpoint = .{ .gpa = testing.allocator, .router = &r, .info = .{ .title = "T", .version = "1" } };
+    defer e.deinit();
+
+    const c0 = cpuNs();
+    try testing.expectError(error.InvalidRequestSchema, e.spec());
+    const c1 = cpuNs();
+    try testing.expectError(error.InvalidRequestSchema, e.spec());
+    const c2 = cpuNs();
+    try testing.expectError(error.InvalidRequestSchema, e.spec());
+    const c3 = cpuNs();
+
+    const first = c1 - c0;
+    const second = c2 - c1;
+    const third = c3 - c2;
+    std.debug.print("\n[F1] {d} routes, first={d}ns second={d}ns third={d}ns\n", .{ n, first, second, third });
+    // Before the fix (`if (e.cached == null) e.cached = try Generator.build(...)`),
+    // the error branch never populated `e.cached`, so EVERY call re-walked
+    // the whole route table — measured in A1/openapi.md F1 as 173-191ms per
+    // call, 5 calls straight, never converging. After it, only the first
+    // call does that work; every later call returns the cached error.
+    if (release) {
+        try testing.expect(second * 20 < first);
+        try testing.expect(third * 20 < first);
+    }
+}
+
+const SpecWorkerCtx = struct { e: *Endpoint, err_count: std.atomic.Value(u32) = .init(0) };
+
+fn specWorker(c: *SpecWorkerCtx) void {
+    _ = c.e.spec() catch {
+        _ = c.err_count.fetchAdd(1, .monotonic);
+    };
+}
+
+test "endpoint: concurrent first callers do not serialize behind a spinning lock (F2)" {
+    if (@import("builtin").mode == .Debug) return; // wall-time assertion needs ReleaseFast
+    const gpa = std.heap.smp_allocator;
+    const n: usize = 4000;
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    try addBenchRoutes(&r, n, false);
+
+    // Arm A: one caller, alone — the reference cost.
+    var wall_single: u64 = 0;
+    {
+        var e: Endpoint = .{ .gpa = gpa, .router = &r, .info = .{ .title = "T", .version = "1" } };
+        defer e.deinit();
+        const w0 = monoNs();
+        _ = try e.spec();
+        wall_single = monoNs() - w0;
+    }
+
+    // Arm B: several callers racing on the first request of a FRESH
+    // Endpoint (its own empty cache, so all of them actually race to build).
+    const cpus = std.Thread.getCpuCount() catch 4;
+    const nthreads = @min(cpus, 8);
+    var wall_concurrent: u64 = 0;
+    {
+        var e: Endpoint = .{ .gpa = gpa, .router = &r, .info = .{ .title = "T", .version = "1" } };
+        defer e.deinit();
+        var ctx: SpecWorkerCtx = .{ .e = &e };
+        var threads: [8]std.Thread = undefined;
+        const w0 = monoNs();
+        for (0..nthreads) |k| threads[k] = try std.Thread.spawn(.{}, specWorker, .{&ctx});
+        for (0..nthreads) |k| threads[k].join();
+        wall_concurrent = monoNs() - w0;
+        try testing.expectEqual(@as(u32, 0), ctx.err_count.load(.monotonic));
+    }
+
+    std.debug.print("\n[F2] 1 caller wall={d}ns, {d} callers wall={d}ns\n", .{ wall_single, nthreads, wall_concurrent });
+    // Before the fix, N callers spinning on `lockSpin` held across the
+    // WHOLE build made wall time go UP with concurrency (932ms -> 1762ms,
+    // +89%, measured in A1/openapi.md F2) — a pure spinlock is slower than
+    // no coordination at all when what it guards is not O(1). After it,
+    // concurrent first-callers build in parallel (at worst duplicating the
+    // walk a bounded number of times, never serialized behind a spin), so
+    // wall time under N callers must stay within a generous multiple of
+    // the single-caller wall time, not blow past it.
+    try testing.expect(wall_concurrent < wall_single * 3 + 50 * std.time.ns_per_ms);
+}
+
+test "generate: route-table build time scales linearly, not quadratically, with route count (F7)" {
+    if (@import("builtin").mode == .Debug) return; // timing assertion needs ReleaseFast
+    const gpa = std.heap.smp_allocator;
+    const small = try benchBuildNs(gpa, 500);
+    const big = try benchBuildNs(gpa, 4000); // 8x the routes
+    std.debug.print("\n[F7] 500 routes={d}ns, 4000 routes={d}ns, ratio={d:.2}\n", .{
+        small, big, @as(f64, @floatFromInt(big)) / @as(f64, @floatFromInt(small)),
+    });
+    // The old O(routes·paths) dedup scan + O(paths·13·routes) grouping scan
+    // cost ~4x per doubling (measured in A1/openapi.md F7: 11.2 -> 46.0 ->
+    // 159.4 -> 728.4 ms across 1000/2000/4000/8000 routes) — an 8x route
+    // increase would cost roughly 8^2 = 64x. A linear implementation costs
+    // ~8x plus constant overhead. 20x is a generous ceiling that separates
+    // the two without being sensitive to measurement noise.
+    try testing.expect(big < small * 20);
+}
+
+fn benchBuildNs(gpa: Allocator, n: usize) !u64 {
+    var r = router.Router.init(gpa);
+    defer r.deinit();
+    var name_buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const p = try std.fmt.bufPrint(&name_buf, "/api/v1/resource{d}/:id", .{i});
+        try r.addDoc(.get, p, hOk, .{ .summary = "s", .responses = &.{.{ .status = 200, .description = "OK" }} });
+    }
+    const w0 = monoNs();
+    const json = try Generator.build(gpa, &r, .{ .title = "T", .version = "1" });
+    const dt = monoNs() - w0;
+    gpa.free(json);
+    return dt;
+}
+
+test "generate: duplicate path-parameter name in one pattern dedupes instead of violating OAS uniqueness (F6)" {
+    // `router` accepts a pattern that captures the same name twice (it is a
+    // footgun there — `params.get` returns the first value — not a build
+    // error); openapi must not turn that into a document OAS 3.1 §4.8.10
+    // forbids: "The list MUST NOT include duplicated parameters."
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/a/:id/b/:id", hOk);
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+    const params = parsed.value.object.get("paths").?.object.get("/a/{id}/b/{id}").?.object
+        .get("get").?.object.get("parameters").?.array;
+    try testing.expectEqual(@as(usize, 1), params.items.len);
+    try testing.expectEqualStrings("id", params.items[0].object.get("name").?.string);
+}
+
+test "endpoint: byte-exact spec path — a neighboring route sharing the prefix is NOT shadowed (F15/M10)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var e: Endpoint = .{ .gpa = testing.allocator, .router = &r, .info = .{ .title = "T", .version = "1" } };
+    defer e.deinit();
+    try r.use(e.middleware());
+    try r.get("/openapi.json.sig", hHello); // shares the PREFIX with e.path
+
+    var buf: [16384]u8 = undefined;
+    const got = runWire(&r, wire("GET", "/openapi.json.sig"), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("hello", bodyOf(got));
+}
+
+test "endpoint: byte-exact docs path — a neighboring route sharing the prefix is NOT shadowed (F15/M16)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var e: Endpoint = .{
+        .gpa = testing.allocator,
+        .router = &r,
+        .info = .{ .title = "T", .version = "1" },
+        .docs_path = "/docs",
+    };
+    defer e.deinit();
+    try r.use(e.middleware());
+    try r.get("/docs-internal", hHello); // shares the PREFIX with e.docs_path
+
+    var buf: [16384]u8 = undefined;
+    const got = runWire(&r, wire("GET", "/docs-internal"), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("hello", bodyOf(got));
+}
+
+test "endpoint: ETag is served, and a matching If-None-Match gets 304 with no body (F14)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var e: Endpoint = .{ .gpa = testing.allocator, .router = &r, .info = .{ .title = "T", .version = "1" } };
+    defer e.deinit();
+    try r.use(e.middleware());
+    try r.get("/hello", hHello);
+
+    var buf: [16384]u8 = undefined;
+    const first = runWire(&r, wire("GET", "/openapi.json"), &buf);
+    try expectStatus(first, "200");
+    const etag_prefix = "\r\nETag: ";
+    const at = std.mem.indexOf(u8, first, etag_prefix).?;
+    const rest = first[at + etag_prefix.len ..];
+    const etag = rest[0..std.mem.indexOf(u8, rest, "\r\n").?];
+
+    var buf2: [16384]u8 = undefined;
+    var req_buf: [256]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET /openapi.json HTTP/1.1\r\nHost: t\r\nConnection: close\r\nIf-None-Match: {s}\r\n\r\n", .{etag});
+    const second = runWire(&r, req, &buf2);
+    try expectStatus(second, "304");
+    try testing.expectEqualStrings("", bodyOf(second));
+
+    // A stale/mismatched ETag must still get the full 200 body.
+    const third = runWire(&r, "GET /openapi.json HTTP/1.1\r\nHost: t\r\nConnection: close\r\nIf-None-Match: \"stale\"\r\n\r\n", &buf2);
+    try expectStatus(third, "200");
+    try testing.expect(bodyOf(third).len > 0);
+}
+
+test "conformance: the checker rejects an empty responses object (F16/M14)" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{\"/x\":{\"get\":{\"responses\":{}}}}}",
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectError(error.EmptyResponses, validateOpenApi31(parsed.value));
+}
+
+test "conformance: the checker rejects a paths key that does not start with '/' (F16/M15)" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        "{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"},\"paths\":{\"x\":{\"get\":{\"responses\":{\"200\":{\"description\":\"OK\"}}}}}}",
+        .{},
+    );
+    defer parsed.deinit();
+    try testing.expectError(error.InvalidPathKey, validateOpenApi31(parsed.value));
 }
 
 test "endpoint: self-contained docs page (no external assets)" {

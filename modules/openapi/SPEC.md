@@ -8,8 +8,9 @@ Two layers. `Generator` walks `Router.routes()` and emits a valid OpenAPI 3.1 JS
 `:id` → `{id}`, `*rest` → `{rest}` — methods grouped per path). `Endpoint` is an intercepting
 `router.Middleware` (the `metrics.Endpoint` pattern, needed because `router.Handler` is a stateless
 fn pointer and cannot close over state) serving the generated document on `GET /openapi.json`; must
-be registered before the routes it documents (chi's rule) but generates the spec fresh per
-request, so it still sees routes registered after it. Deterministic, minified output: paths in
+be registered before the routes it documents (chi's rule) — the document is built once, lazily, on
+the first request that needs it, and cached (behind a lock) for the Endpoint's whole lifetime, so a
+route registered AFTER that first request will not appear. Deterministic, minified output: paths in
 first-registration order, methods per path in `http.Method` declaration order, fixed key order
 inside every object, no whitespace — two runs over the same router produce byte-identical
 documents. Documented FastAPI-shape compromises: path parameters always `required: true` with
@@ -19,9 +20,13 @@ minimal 200-only operation; `operationId` deliberately omitted (fn-pointer route
 name to derive one from); implicit HEAD→GET auto-route and 404/405 fallbacks are not emitted (they
 are dispatch behavior, not operations). `RouteDoc.request_schema` (JSON Schema as text) is parsed
 and re-emitted normalized/minified; malformed text is a typed `error.InvalidRequestSchema`, never a
-panic or silent drop. Concurrency: reentrant — the generator is a pure function of an immutable
-(post-`build`) `Router`; `Endpoint` regenerates per request with no shared mutable state. No
-external assets: Swagger-UI needs CDN JS/CSS (a CSP/provenance problem) so it is deliberately not
+panic or silent drop. Concurrency: `Generator.build`/`Generator.write` are reentrant — pure
+functions of an immutable (post-`build`) `Router` — but `Endpoint` is `.threadsafe`, not
+`.reentrant`: it builds the document once behind a lock (a failed build is cached too, so a bad
+`request_schema` does not pay full generation cost on every request either) and serves the same
+cached bytes for its whole lifetime; a route registered after the first request is invisible to
+it. Responses carry a strong `ETag` (a fingerprint of the cached document); a matching
+`If-None-Match` gets `304`. No external assets: Swagger-UI needs CDN JS/CSS (a CSP/provenance problem) so it is deliberately not
 served; the optional `docs_path` instead serves a tiny self-contained HTML viewer (inline CSS +
 vanilla JS, zero external requests). Clean-room; design references only (behavior, no source
 copied — see NOTICE): FastAPI (document shape) and utoipa (route-metadata→spec mapping); format per
@@ -74,7 +79,7 @@ explicitly out of scope, not planned. Richer path-parameter typing beyond `strin
 `router` itself to carry richer capture types.
 
 ## Status
-`gap · any · util · reentrant` + deps: `router`, `http` (+ `std.json`) — canonical source is
+`gap · any · util · threadsafe` + deps: `router`, `http` (+ `std.json`) — canonical source is
 `pub const meta` in src/root.zig.
 
 ## Anchoring

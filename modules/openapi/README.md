@@ -11,9 +11,12 @@ code. Closes the Web service / API cluster.
   shape — operation key order, path-parameter objects, the default
   `"Successful Response"` 200) and utoipa (Rust; route-metadata→spec
   mapping). Document format per the OpenAPI Specification 3.1.0.
-- **Platform:** any. **Role:** util. **Concurrency:** reentrant — the
-  generator is a pure function of an immutable (post-build) Router; the
-  endpoint generates per request with no shared mutable state.
+- **Platform:** any. **Role:** util. **Concurrency:** threadsafe —
+  `Generator.build`/`Generator.write` are pure functions of an immutable
+  (post-build) Router, but `Endpoint` builds the document once (lazily, on
+  the first request) and caches it behind a lock, so it is not reentrant:
+  a route registered after that first request will not appear in the
+  served document.
 - **Deps:** `router`, `http` (+ `std.json`).
 
 Provenance: clean-room. Design references: FastAPI (MIT; generated-spec
@@ -37,8 +40,9 @@ var docs: openapi.Endpoint = .{
     // .docs_path = "/docs",           // optional self-contained HTML viewer
 };
 try r.use(docs.middleware());          // middleware BEFORE routes (chi rule);
-                                       // the spec is generated per request, so
-                                       // it sees everything registered below
+                                       // the spec is built ONCE, lazily, on the
+                                       // first request — register every
+                                       // documented route before that first hit
 try r.get("/health", health);          // undocumented → minimal operation
 try r.addDoc(.post, "/users", createUser, .{
     .summary = "Create a user",
@@ -68,7 +72,10 @@ defer gpa.free(json);
 **Endpoint** is an *intercepting* `router.Middleware` (the
 `metrics.Endpoint` pattern — `router.Handler` is a stateless fn pointer and
 cannot close over state): `GET`/`HEAD` on `path` answers the document, other
-methods get 405 + `Allow`, everything else passes through.
+methods get 405 + `Allow`, everything else passes through. The response
+carries a strong `ETag` (a fingerprint of the document, computed once when
+it is built); a request with a matching `If-None-Match` gets `304` instead
+of the full body.
 
 **Docs page choice:** Swagger-UI needs external JS/CSS (CDN or bundling —
 a CSP and provenance problem), so it is deliberately **not** served.
