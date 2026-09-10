@@ -54,9 +54,15 @@ Canonical in-memory columnar-typed table — the seam between data sources and c
 Not a security boundary — an in-memory data-shape primitive over caller-supplied or caller-parsed
 data. `deserialize` treats untrusted bytes defensively (bounds-checked, `error.Corrupt` on
 truncation/bad tag/length overflow, never a panic or OOB read) since a wire round-trip may cross a
-process or cache boundary. `Date.ordinal` is not a certified calendar-math primitive (see Design
-notes) — do not use it for legal/financial date arithmetic requiring exact historical calendar
-correctness.
+process or cache boundary. **The `ncol`/`nrow` guards bound the wire counts, not the resulting
+memory** — accepted input grows into a **~48×** larger `Dataset` (measured flat at 48.0–48.1× from
+64 KB to 8 MB input, worst case `ncol = 1`: `@sizeOf(Value)` = 32 B plus a 16 B/row slice header
+against a 1 B/cell wire minimum). A caller sizing an untrusted-input budget must size it around
+this factor, not around `bytes.len` — see the doc comment on `deserialize`. `Value.order` treats
+NaN as the greatest value and NaN == NaN (both floats reach `order` unfiltered from wire tag `2`
+with no finiteness check — see the doc comment on `Value.order`). `Date.ordinal` is not a certified
+calendar-math primitive (see Design notes) — do not use it for legal/financial date arithmetic
+requiring exact historical calendar correctness.
 
 ## Verification
 `zig build test-dataset` (+ `-Doptimize=ReleaseFast`; `zig fmt --check modules/dataset`):

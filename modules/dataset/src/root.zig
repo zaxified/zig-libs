@@ -158,11 +158,15 @@ pub const Value = union(enum) {
 
     /// Ordering for sort. null sorts first; numerics (int/float/decimal) by
     /// value — two `decimal`s compare exactly on the raw `i128`; text
-    /// lexicographic; bool false<true. Mixed types order by a stable type rank.
+    /// lexicographic; bool false<true. Mixed types order by a stable type
+    /// rank. **NaN sorts last** (greater than every other numeric value,
+    /// including +inf; two NaNs compare equal to each other) — see
+    /// `orderF64`. `deserialize` can hand a `.float` cell any bit pattern
+    /// from 8 wire bytes, NaN included, with no finiteness check.
     pub fn order(a: Value, b: Value) std.math.Order {
         if (a == .decimal and b == .decimal) return std.math.order(a.decimal, b.decimal);
         if (a.asFloat()) |af| {
-            if (b.asFloat()) |bf| return std.math.order(af, bf);
+            if (b.asFloat()) |bf| return orderF64(af, bf);
         }
         const ra = typeRank(a);
         const rb = typeRank(b);
@@ -172,6 +176,28 @@ pub const Value = union(enum) {
             .bool => |ab| std.math.order(@intFromBool(ab), @intFromBool(b.bool)),
             else => .eq, // both null
         };
+    }
+
+    /// `std.math.order(af, bf)` reaches `unreachable` whenever neither
+    /// operand compares — exactly the case when either is NaN, since every
+    /// one of `==`/`<`/`>` on a NaN operand is `false`. Debug/ReleaseSafe
+    /// panic there; ReleaseFast has none of the three branches left to fall
+    /// into and silently returns whatever the miscompiled tail produces
+    /// (measured: `.gt`, treating NaN as greater than any finite value) —
+    /// three build modes, three answers, on input `deserialize` accepts
+    /// from 8 arbitrary wire bytes with no finiteness check (tag `2`,
+    /// `Cursor.f64v`). This makes ReleaseFast's accidental answer the
+    /// deliberate, documented one in every mode: NaN sorts as the greatest
+    /// value, and NaN compares equal to NaN (so a sort is stable and total,
+    /// not merely non-panicking).
+    fn orderF64(af: f64, bf: f64) std.math.Order {
+        const an = std.math.isNan(af);
+        const bn = std.math.isNan(bf);
+        if (an or bn) {
+            if (an and bn) return .eq;
+            return if (an) .gt else .lt;
+        }
+        return std.math.order(af, bf);
     }
 
     fn typeRank(v: Value) u8 {
@@ -461,6 +487,31 @@ const Cursor = struct {
 /// zero-length name, and a 1-byte type tag.
 const min_encoded_column_bytes = 5;
 
+/// Decode `bytes` (as produced by `serialize`) into a `Dataset`, defensively:
+/// every wire count and length is bounds-checked against what the remaining
+/// input can actually supply, and any truncation, unknown tag, or oversized
+/// claim returns `DeserializeError.Corrupt` rather than panicking or reading/
+/// writing out of bounds (see SPEC.md's threat-model note — this is the one
+/// function in the module that treats its input as untrusted).
+///
+/// **On `error.Corrupt`, partial allocations from `a` are NOT freed.** This
+/// module's memory model is a caller-owned arena for the whole pipeline (see
+/// the module doc comment at the top of this file); a failed decode is not a
+/// special case of that contract, it is the same contract: free everything at
+/// once via the arena, succeeded or not. A caller that hands `deserialize` a
+/// general-purpose allocator and calls it in a loop over untrusted input (a
+/// cache file, a network peer) owns an unbounded leak on the error path.
+///
+/// **The `ncol`/`nrow` guards below bound the wire COUNTS `bytes` can prove,
+/// not the memory the accepted document then occupies.** Each accepted cell
+/// costs `@sizeOf(Value)` (32 B) plus its row's amortized slice header
+/// (16 B / `ncol`) versus a wire-minimum of 1 B — a measured **48×** blowup
+/// at `ncol = 1` (the worst case), flat across input sizes from 64 KB to
+/// 8 MB. A 10 MB cached blob is a legitimate ~480 MB `Dataset`. There is no
+/// caller-known cap on the RESULT here to check against (that would be a new
+/// parameter — a signature change, and a decision about what a reasonable
+/// caller-facing cap even is); a caller with an untrusted-size budget must
+/// size it around this factor, not around `bytes.len`.
 pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dataset {
     var cur = Cursor{ .bytes = bytes };
     const ncol = try cur.u32v();
@@ -519,6 +570,14 @@ pub fn deserialize(a: std.mem.Allocator, bytes: []const u8) DeserializeError!Dat
 //   {"columns":[{"name":..,"type":..}],"rows":[[..],..]}
 // Non-finite floats and null cells become JSON null.
 
+/// Render `d` as JSON. **Output size has no bound tied to input size**: a
+/// single `.float` cell prints its full decimal expansion (`{d}`, not
+/// scientific notation), so one 9-byte wire float can become 379 bytes of
+/// JSON (`5e-324`, measured) — a `deserialize`-produced `Dataset` from an
+/// untrusted 9-byte payload is not a 9-byte JSON document. A pipeline that
+/// decodes untrusted bytes and re-serializes them as JSON should size any
+/// output budget around cell count × worst-case float width, not around the
+/// original wire length.
 pub fn toJson(a: std.mem.Allocator, d: Dataset) SerializeError![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(a, "{\"columns\":[");
@@ -588,18 +647,46 @@ fn appendJsonDecimal(a: std.mem.Allocator, buf: *std.ArrayList(u8), raw: i128) S
     }
 }
 
+/// `deserialize` never validates UTF-8 on a `.text` cell (the wire format
+/// only bounds LENGTH, not content — see the doc comment on `deserialize`),
+/// so `s` here can carry arbitrary bytes decoded straight from an untrusted
+/// peer or cache file. Escaping byte-at-a-time and trusting `s` to already be
+/// valid UTF-8 would copy those bytes into the output verbatim, producing a
+/// document that is not valid UTF-8 and that a strict JSON receiver rejects
+/// WHOLE, not just the bad cell. Every multi-byte sequence is validated
+/// before it is copied; anything that does not decode is replaced with
+/// U+FFFD one byte at a time, so a single bad byte inside an otherwise-valid
+/// string costs one substitution, not the rest of the string.
 fn appendJsonString(a: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) SerializeError!void {
     try buf.append(a, '"');
-    for (s) |ch| {
-        switch (ch) {
-            '"' => try buf.appendSlice(a, "\\\""),
-            '\\' => try buf.appendSlice(a, "\\\\"),
-            '\n' => try buf.appendSlice(a, "\\n"),
-            '\r' => try buf.appendSlice(a, "\\r"),
-            '\t' => try buf.appendSlice(a, "\\t"),
-            0...8, 11, 12, 14...31 => try buf.print(a, "\\u{x:0>4}", .{ch}),
-            else => try buf.append(a, ch),
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = s[i];
+        if (ch < 0x80) {
+            switch (ch) {
+                '"' => try buf.appendSlice(a, "\\\""),
+                '\\' => try buf.appendSlice(a, "\\\\"),
+                '\n' => try buf.appendSlice(a, "\\n"),
+                '\r' => try buf.appendSlice(a, "\\r"),
+                '\t' => try buf.appendSlice(a, "\\t"),
+                0...8, 11, 12, 14...31 => try buf.print(a, "\\u{x:0>4}", .{ch}),
+                else => try buf.append(a, ch),
+            }
+            i += 1;
+            continue;
         }
+        const seq_len = std.unicode.utf8ByteSequenceLength(ch) catch {
+            try buf.appendSlice(a, &std.unicode.replacement_character_utf8);
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
+            try buf.appendSlice(a, &std.unicode.replacement_character_utf8);
+            i += 1;
+            continue;
+        }
+        try buf.appendSlice(a, s[i .. i + seq_len]);
+        i += seq_len;
     }
     try buf.append(a, '"');
 }
@@ -708,6 +795,25 @@ test "Value.eql and order" {
     try testing.expect(!Value.eql(.{ .text = "a" }, .{ .text = "b" }));
     try testing.expectEqual(std.math.Order.lt, Value.order(.{ .float = 1 }, .{ .float = 2 }));
     try testing.expectEqual(std.math.Order.lt, Value.order(.null, .{ .int = 0 }));
+}
+
+test "Value.order: NaN sorts as the greatest value, not `unreachable` -- F1" {
+    // `deserialize` hands a `.float` cell any wire bit pattern with no
+    // finiteness check (tag `2`, `Cursor.f64v`), so NaN is directly
+    // reachable from 8 attacker-supplied bytes. `std.math.order(af, bf)`
+    // used to reach `unreachable` on it: Debug/ReleaseSafe panic, ReleaseFast
+    // undefined behaviour. Before the fix this test panicked on its first
+    // line instead of reaching any `expectEqual` -- that IS the regression.
+    const nan = std.math.nan(f64);
+    try testing.expectEqual(std.math.Order.gt, Value.order(.{ .float = nan }, .{ .float = 1.0 }));
+    try testing.expectEqual(std.math.Order.lt, Value.order(.{ .float = 1.0 }, .{ .float = nan }));
+    try testing.expectEqual(std.math.Order.gt, Value.order(.{ .float = nan }, .{ .float = std.math.inf(f64) }));
+    try testing.expectEqual(std.math.Order.eq, Value.order(.{ .float = nan }, .{ .float = nan }));
+    // Sibling `eql` already handled NaN without panicking (`af == bf` is
+    // `false` for any NaN operand) -- pin that it still does, so the two
+    // don't drift into disagreeing about what NaN means.
+    try testing.expect(!Value.eql(.{ .float = nan }, .{ .float = nan }));
+    try testing.expect(!Value.eql(.{ .float = nan }, .{ .float = 1.0 }));
 }
 
 test "Value.eql/order: bool values compared by actual value, and bool's type rank sits between null and numeric" {
@@ -947,6 +1053,36 @@ test "toJson emits the {columns,rows} shape" {
         "{\"columns\":[{\"name\":\"sym\",\"type\":\"text\"},{\"name\":\"mv\",\"type\":\"float\"},{\"name\":\"qty\",\"type\":\"int\"}]," ++
             "\"rows\":[[\"A\\\"B\",100.5,3],[null,null,-7]]}",
         json,
+    );
+}
+
+test "toJson: invalid UTF-8 in a .text cell is replaced, not propagated -- F5" {
+    // `deserialize` never validates UTF-8 on `.text` (only LENGTH is
+    // bounds-checked), so a `.text` cell can carry arbitrary bytes. Before
+    // the fix, `appendJsonString` copied them byte-for-byte and produced a
+    // document that was not valid UTF-8 at all -- a strict receiver would
+    // reject the WHOLE document, not just the bad cell.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cols = [_]Column{.{ .name = "t", .type = .text }};
+    const rows = [_][]const Value{&.{.{ .text = "\x80\xff" }}};
+    const json = try toJson(a, .{ .columns = &cols, .rows = &rows });
+    try testing.expect(std.unicode.utf8ValidateSlice(json));
+    try testing.expectEqualStrings(
+        "{\"columns\":[{\"name\":\"t\",\"type\":\"text\"}],\"rows\":[[\"\u{FFFD}\u{FFFD}\"]]}",
+        json,
+    );
+
+    // Positive control: valid multi-byte UTF-8 (including a 4-byte sequence)
+    // passes through unchanged, and a valid sequence adjacent to an invalid
+    // byte is not itself corrupted by the substitution.
+    const rows2 = [_][]const Value{&.{.{ .text = "café\u{1F600}\xff" }}};
+    const json2 = try toJson(a, .{ .columns = &cols, .rows = &rows2 });
+    try testing.expect(std.unicode.utf8ValidateSlice(json2));
+    try testing.expectEqualStrings(
+        "{\"columns\":[{\"name\":\"t\",\"type\":\"text\"}],\"rows\":[[\"café\u{1F600}\u{FFFD}\"]]}",
+        json2,
     );
 }
 

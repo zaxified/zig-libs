@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign: four findings from the third audit.**
+  - `Value.order` reached `std.math.order`'s `unreachable` on NaN — reachable
+    directly from `deserialize`, which hands a `.float` cell any bit pattern
+    from 8 wire bytes with no finiteness check. Debug/ReleaseSafe panicked,
+    ReleaseFast silently returned `.gt`. Now defined and total in every mode:
+    NaN sorts as the greatest value, NaN == NaN. Regression: 20/22 pass, 1
+    fail, 1 crash (`unreachable`) before the fix; 22/22 after, Debug and
+    ReleaseFast.
+  - `toJson`'s `appendJsonString` copied `.text` bytes verbatim, so an invalid
+    UTF-8 cell (reachable the same way — `deserialize` bounds `.text` LENGTH,
+    not content) produced a JSON document that was not valid UTF-8 at all, not
+    just an invalid cell. Now validates each multi-byte sequence and
+    substitutes U+FFFD one byte at a time on anything that doesn't decode.
+    Regression: `utf8ValidateSlice` on the output false before, true after,
+    for the same `"\x80\xff"` input; a positive control (valid multi-byte and
+    4-byte sequences) still passes through byte-identical.
+  - `deserialize` had no doc comment stating that a failed decode does not
+    unwind its partial allocations (the contract lived only inside a test's
+    comment) — now stated on the function itself, alongside the exact
+    amplification factor between wire size and the memory an accepted
+    document occupies (measured 48.0–48.1×, flat from 64 KB to 8 MB input,
+    worst case `ncol = 1`). `toJson`'s unbounded output-size factor (one
+    9-byte wire float -> 379 bytes of JSON, `5e-324`) is now documented the
+    same way.
+  - The `fuzzDeserialize` harness that used to replay one empty image forever
+    (2026-09-07 entry below) and the two `@intFromFloat` guards (2026-09-03
+    entry below) were re-verified as still correct in this pass, not touched.
 - **2026-09-07** — **`fuzzDeserialize` was replaying an EMPTY image, and now has
   a 13-entry corpus with a measured reach guard.** It opened with
   `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;
