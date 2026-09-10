@@ -988,13 +988,12 @@ test "backplane route builds port 1 link slot" {
 /// garbage behind it). It lives in `testkit.fuzz` now, with tests that drive the
 /// real `std.testing.Smith` over what it produces.
 const fuzzSeed = @import("testkit").fuzz.seedHex;
+const fuzzSeedInto = @import("testkit").fuzz.seedInto;
 
 /// Connection Manager service bodies. The five decoders this harness calls
 /// read the same octets five ways, so the corpus carries one body of each
 /// shape plus the truncations that bound them.
 const connmgr_seeds = [_][]const u8{
-    fuzzSeed("059d0a004c0391055343414441000100010220022401"), // Unconnected_Send
-    fuzzSeed("059d08004c03910441424344010220022401"), // the same, even-length embedded message
     fuzzSeed("059dc80001020304"), // an embedded length that overruns
     fuzzSeed("059d0200010201ff0102"), // a tick/timeout pair with a short body
     fuzzSeed("0000000000000000010000000000000010270000000000001027000000000000a3030220022401"), // Forward_Open-shaped
@@ -1005,7 +1004,125 @@ const connmgr_seeds = [_][]const u8{
 };
 
 test "fuzz: connection manager decoders never panic" {
-    try std.testing.fuzz({}, fuzzConnMgr, .{ .corpus = &connmgr_seeds });
+    // The Unconnected_Send/Forward_Open/Forward_Close-shaped entries this
+    // corpus used to carry were typed by hand as a plausible-looking shape.
+    // Measured 2026-09-10: the two hand-typed Unconnected_Send bodies no
+    // longer decode at all (`TrailingData` / `BadReserved` -- `decode`
+    // tightened after these were written, per the `F3 regression` tests
+    // above, and nobody re-measured the corpus comment against it), and the
+    // hand-typed Forward_Open/Forward_Close bodies, per `fuzzConnMgr`'s own
+    // note, were STILL only ever rejected -- a corpus gap the note records
+    // rather than hides (audit `enip`, "a mez, kterou jsem nezavřel"). Four
+    // seeds built through the module's OWN encoders replace all three —
+    // `UnconnectedSend`/`ForwardOpen`/`ForwardClose`, built the same way the
+    // round-trip tests above build one — so every decoder this harness
+    // drives is reached on its accept path at least once instead of only
+    // being fuzzed on rejection or, worse, silently rejecting a corpus entry
+    // that was never re-checked against the decoder it was written for.
+    var us_odd_buf: [64]u8 = undefined;
+    const us_odd = (UnconnectedSend{
+        .embedded = &[_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28 }, // odd length: exercises the pad-octet branch
+        .route_path = &backplane_slot_0,
+    }).encode(&us_odd_buf) catch unreachable;
+    var us_odd_seed_buf: [4 + us_odd_buf.len]u8 = undefined;
+    const us_odd_seed = fuzzSeedInto(&us_odd_seed_buf, us_odd);
+
+    var us_even_buf: [64]u8 = undefined;
+    const us_even = (UnconnectedSend{
+        .embedded = &[_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28, 0x00 }, // even length: no pad octet
+        .route_path = &backplane_slot_0,
+    }).encode(&us_even_buf) catch unreachable;
+    var us_even_seed_buf: [4 + us_even_buf.len]u8 = undefined;
+    const us_even_seed = fuzzSeedInto(&us_even_seed_buf, us_even);
+
+    var fo_body_buf: [128]u8 = undefined;
+    const fo_body = (ForwardOpen{
+        .o_to_t_connection_id = 0x1000_0001,
+        .t_to_o_connection_id = 0x2000_0002,
+        .connection_serial = 0x1234,
+        .originator_vendor_id = 0x0001,
+        .originator_serial = 0x89AB_CDEF,
+        .o_to_t_rpi = 10_000,
+        .o_to_t_params = .{ .size = 500, .variable = true, .priority = .low, .connection_type = .point_to_point },
+        .t_to_o_rpi = 10_000,
+        .t_to_o_params = .{ .size = 500, .variable = true, .priority = .low, .connection_type = .point_to_point },
+        .connection_path = &[_]u8{ 0x20, 0x02, 0x24, 0x01 },
+    }).encode(&fo_body_buf) catch unreachable;
+    var fo_seed_buf: [4 + fo_body_buf.len]u8 = undefined;
+    const fo_seed = fuzzSeedInto(&fo_seed_buf, fo_body);
+
+    var fc_body_buf: [64]u8 = undefined;
+    const fc_body = (ForwardClose{
+        .connection_serial = 0x1234,
+        .originator_vendor_id = 0x0001,
+        .originator_serial = 0x89AB_CDEF,
+        .connection_path = &[_]u8{ 0x20, 0x02, 0x24, 0x01 },
+    }).encode(&fc_body_buf) catch unreachable;
+    var fc_seed_buf: [4 + fc_body_buf.len]u8 = undefined;
+    const fc_seed = fuzzSeedInto(&fc_seed_buf, fc_body);
+
+    var corpus: [connmgr_seeds.len + 4][]const u8 = undefined;
+    @memcpy(corpus[0..connmgr_seeds.len], &connmgr_seeds);
+    corpus[connmgr_seeds.len] = us_odd_seed;
+    corpus[connmgr_seeds.len + 1] = us_even_seed;
+    corpus[connmgr_seeds.len + 2] = fo_seed;
+    corpus[connmgr_seeds.len + 3] = fc_seed;
+    try std.testing.fuzz({}, fuzzConnMgr, .{ .corpus = &corpus });
+}
+
+test "corpus: the encoder-built Unconnected_Send/Forward_Open/Forward_Close seeds are actually accepted" {
+    // The measurement, executable rather than written in a comment (same
+    // shape as the corpus-pinning tests in `outstation.zig`/other modules):
+    // proves the four new seeds above reach the accept path of all three
+    // decoders, not just the reject path every other seed in this corpus
+    // exercises -- including `UnconnectedSend`, whose two PREVIOUS hand-typed
+    // corpus entries silently stopped decoding at all once `decode` grew its
+    // `TrailingData`/`BadReserved` checks (see the test above).
+    var us_odd_buf: [64]u8 = undefined;
+    const us_odd = try (UnconnectedSend{
+        .embedded = &[_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28 },
+        .route_path = &backplane_slot_0,
+    }).encode(&us_odd_buf);
+    const us1 = try UnconnectedSend.decode(us_odd);
+    var us1_round: [64]u8 = undefined;
+    try testing.expectEqualSlices(u8, us_odd, try us1.encode(&us1_round));
+
+    var us_even_buf: [64]u8 = undefined;
+    const us_even = try (UnconnectedSend{
+        .embedded = &[_]u8{ 0x4C, 0x03, 0x91, 0x05, 'S', 'C', 'A', 'D', 'A', 0x00, 0x28, 0x00 },
+        .route_path = &backplane_slot_0,
+    }).encode(&us_even_buf);
+    const us2 = try UnconnectedSend.decode(us_even);
+    var us2_round: [64]u8 = undefined;
+    try testing.expectEqualSlices(u8, us_even, try us2.encode(&us2_round));
+
+    var fo_body_buf: [128]u8 = undefined;
+    const fo_body = try (ForwardOpen{
+        .o_to_t_connection_id = 0x1000_0001,
+        .t_to_o_connection_id = 0x2000_0002,
+        .connection_serial = 0x1234,
+        .originator_vendor_id = 0x0001,
+        .originator_serial = 0x89AB_CDEF,
+        .o_to_t_rpi = 10_000,
+        .o_to_t_params = .{ .size = 500, .variable = true, .priority = .low, .connection_type = .point_to_point },
+        .t_to_o_rpi = 10_000,
+        .t_to_o_params = .{ .size = 500, .variable = true, .priority = .low, .connection_type = .point_to_point },
+        .connection_path = &[_]u8{ 0x20, 0x02, 0x24, 0x01 },
+    }).encode(&fo_body_buf);
+    const fo = try ForwardOpen.decode(fo_body, false);
+    var fo_round: [128]u8 = undefined;
+    try testing.expectEqualSlices(u8, fo_body, try fo.encode(&fo_round));
+
+    var fc_body_buf: [64]u8 = undefined;
+    const fc_body = try (ForwardClose{
+        .connection_serial = 0x1234,
+        .originator_vendor_id = 0x0001,
+        .originator_serial = 0x89AB_CDEF,
+        .connection_path = &[_]u8{ 0x20, 0x02, 0x24, 0x01 },
+    }).encode(&fc_body_buf);
+    const fc = try ForwardClose.decode(fc_body);
+    var fc_round: [64]u8 = undefined;
+    try testing.expectEqualSlices(u8, fc_body, try fc.encode(&fc_round));
 }
 
 fn fuzzConnMgr(_: void, smith: *std.testing.Smith) !void {
@@ -1014,11 +1131,32 @@ fn fuzzConnMgr(_: void, smith: *std.testing.Smith) !void {
     // `Smith.bytes` consumes the whole remaining seed, and the ranged draw then
     // finds fewer than eight octets left and returns the range MINIMUM — so the
     // length was 0 for every seed and this harness only ever saw the empty
-    // input. Measured on 2026-09-06 over the corpus above: **0 of 9
+    // input. Measured on 2026-09-06 over the corpus of that day: **0 of 9
     // non-empty and 0 accepted by any of the five decoders before, 9 of 9
-    // non-empty and 2 accepted after** — the two Unconnected_Send bodies; the
-    // Forward_Open and Forward_Close shapes below are still reached only as
-    // rejections, which is a corpus gap this note records rather than hides.
+    // non-empty and 2 accepted after** — the two hand-typed Unconnected_Send
+    // bodies; the hand-typed Forward_Open and Forward_Close shapes were still
+    // reached only as rejections, a corpus gap that note recorded rather
+    // than hid.
+    //
+    // ⭐ 2026-09-10: that "2 accepted" had gone stale WITHOUT the corpus
+    // changing. `UnconnectedSend.decode` grew `TrailingData`/`BadReserved`
+    // checks afterwards (the "F3 regression" tests above), and neither of
+    // the two hand-typed bodies actually satisfies them (route_words=1 with
+    // 3 words of route trailing / a dirty reserved octet) — re-measured
+    // today, before any change here: **0 of those 2 still decode.** All
+    // three "meant to succeed" corpus entries (the 2 Unconnected_Send bodies
+    // plus the Forward_Open/Forward_Close shapes) are now built through the
+    // module's OWN encoders instead of typed by hand (see the "fuzz:
+    // connection manager decoders never panic" test, which assembles this
+    // function's corpus) — a seed only PROVABLY reaches a decoder's accept
+    // path when it comes out of that decoder's own encoder. Measured after:
+    // **11 of 11 non-empty, both Unconnected_Send seeds accepted (were 0),
+    // the encoder-built Forward_Open accepted at its own (small) width (was
+    // 0), the encoder-built Forward_Close accepted (was 0).** `large`
+    // Forward_Open (no seed built at that width) and both reply decoders
+    // (`ForwardOpenReply`/`ForwardCloseReply`, which parse a TARGET's
+    // answer, not a request) have no seed shaped for them yet — a corpus
+    // gap this note now records rather than hides.
     const len: usize = smith.slice(&buf);
     var round: [1024]u8 = undefined;
     if (UnconnectedSend.decode(buf[0..len])) |us| {

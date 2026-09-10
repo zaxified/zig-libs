@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE.** `connmgr`'s fuzz corpus: the
+  three entries meant to exercise the accept path of `UnconnectedSend`,
+  `ForwardOpen` and `ForwardClose` were typed by hand and, per the harness's own
+  note, only ever hit the reject path. Worse, re-measured today: two of them
+  (the `Unconnected_Send` bodies) no longer decode AT ALL — `UnconnectedSend.decode`
+  grew `TrailingData`/`BadReserved` checks after these seeds were written (the F3
+  regression fix), and the note claiming "2 accepted" was never re-run against
+  that change. All three are now built through the module's own encoders instead
+  of by hand (`UnconnectedSend.encode`/`ForwardOpen.encode`/`ForwardClose.encode`),
+  plus a companion test that pins the round trip. Measured: 11/11 non-empty
+  seeds, both `UnconnectedSend` seeds now accepted (were 0), the encoder-built
+  `ForwardOpen` accepted at its own width (was 0), the encoder-built
+  `ForwardClose` accepted (was 0) — verified with a mutant on `ForwardOpen.encode`
+  (flipped one output byte): 5/170 tests failed, including both new tests, at the
+  exact byte the mutant touched; reverted, back to 167/170 (3 skip). `large`
+  `ForwardOpen` and both reply decoders (`ForwardOpenReply`/`ForwardCloseReply`)
+  still have no seed shaped for them — a corpus gap the updated harness comment
+  now records rather than hides.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` copies in
   this module's fuzz files are now `testkit.fuzz.seed` / `seedHex`. The helper
   existed **33 times across 12 modules in three shapes**, each carrying its own
