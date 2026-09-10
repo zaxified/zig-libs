@@ -2257,6 +2257,25 @@ test "AccessLog: combined format is CLF with placeholders and a quoted, escaped 
     );
 }
 
+// Regression for F15/M34 in the module's audit: `writeJsonString` got a
+// range-control-byte test (M33, above) but its CLF sibling `writeClfQuoted`
+// never did, so the same class of mutation (drop the `0x00...0x1F, 0x7F =>
+// \xHH` branch) survived the suite on the CLF side. Path is the only
+// wire-reachable field in either format (see F3), so this is the CLF half
+// of the same coverage gap.
+test "AccessLog: combined format escapes control bytes and DEL (0x01, 0x7F) as \\xHH" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .combined });
+
+    access.log(.{ .method = .get, .path = "/a\x01b\x7fc", .status = 200, .duration_ns = 1, .bytes = 0 });
+
+    try testing.expectEqualStrings(
+        "- - - [-] \"GET /a\\x01b\\x7fc\" 200 0 \"-\" \"-\"\n",
+        w.buffered(),
+    );
+}
+
 test "AccessLog: synchronized writes never interleave across threads" {
     var buf: [64 * 1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);

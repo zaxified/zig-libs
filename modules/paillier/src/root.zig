@@ -1532,6 +1532,22 @@ test "fromPrimes derives the phe-cross-checked toy key exactly (p=11, q=17)" {
     try testing.expectEqual(@as(u32, 180), try kp.secret.mu.toPrimitive(u32)); // 80^-1 mod 187
 }
 
+// F7 (wave-3 audit) flagged this test's guards as mutation-invisible: `m9`
+// (delete the `p == q` check, line ~730) and `m10` (delete both `p, q >= 3`
+// checks, line ~733-734) survive the suite GREEN, same as `m11` did for the
+// later L-exactness check (see the census test below). Unlike `m11`, the
+// audit did not run a redundancy census for `m9`/`m10` and left them as
+// unexamined "real gaps" in its accounting. Ran one directly (2026-09-10,
+// dojezd): with each guard disabled in turn (`if (false and ...)`),
+// exhaustive `p == q` over `v` in `[2, 99]` and exhaustive `p` (or `q`) in
+// `{0, 1, 2}` against `q` (or `p`) in `[2, 99]`, both orders — **0 of either
+// census got ACCEPTED, identical to the guards-enabled baseline (also 0)**.
+// Every case this test pins below is independently caught downstream (the
+// L-exactness check / `bigModInverse`'s implicit `gcd` requirement) even
+// with its own dedicated guard removed. `m9`/`m10` are therefore REFUTED —
+// harmless defense-in-depth, the same class as `m1`/`m2`/`m16`/`m11` — not
+// confirmed gaps; no new pin needed since this test already exercises every
+// case the census covered.
 test "fromPrimes rejects p == q, degenerate factors, and oversized products" {
     try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_p, &kat_p)); // p == q
     try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{0}, &kat_q));
@@ -2342,6 +2358,65 @@ test "corpus: the Ciphertext seeds reach the parser, and the counts are pinned" 
     try testing.expectEqual(corpus.ciphertext_seeds().len - 1, nonempty);
     try testing.expectEqual(@as(usize, 5), accepted);
     try testing.expectEqual(@as(usize, 3), nonzero);
+}
+
+// ── decrypt: a VALUE oracle, not just a crash check (paillier F6) ──────────
+//
+// The audit's own complaint about this module's three fuzz targets above:
+// their oracle is "didn't crash", and `decrypt` -- the one entry point that
+// processes a value from a possibly-hostile counterparty -- had no fuzz
+// target at all. A crash check on `decrypt` alone would still be weak (a
+// wrong-but-non-panicking answer passes silently); what makes this one a
+// value oracle instead is comparing `decrypt`'s two independent internal
+// implementations against EACH OTHER on the same input, the same
+// differential technique "CRT and non-CRT decrypt agree at a real 512-bit
+// key size" (above) already uses on one hand-picked ciphertext. Fuzzing
+// turns that one-off spot check into an always-on regression: any future
+// edit to either `decryptCrtX` or `decryptNonCrtX` that breaks the
+// agreement on some input this file's hand-picked ciphertext tables never
+// happened to try fails here, on malformed/hostile ciphertext bytes
+// included -- not just well-formed ones.
+test "fuzz: decrypt's CRT and non-CRT paths agree on arbitrary ciphertext bytes (paillier F6)" {
+    var corpus: Corpus = .{};
+    try corpus.build();
+    try testing.fuzz({}, fuzzDecryptPathsAgree, .{ .corpus = corpus.ciphertext_seeds() });
+}
+
+fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
+    // Toy KAT key (n=187) so this stays cheap per fuzz iteration; the CRT
+    // vs non-CRT split under test does not depend on key size (the 512-bit
+    // test above already covers the multi-limb case once).
+    const kp = fromPrimes(&kat_p, &kat_q) catch unreachable;
+    try testing.expect(kp.secret.crt != null);
+
+    // An independent decrypt path to the SAME n/λ/µ: round-tripped through
+    // `fromBytes` (which never sets `crt`), not a hand-copied struct. Full-
+    // width buffers passed straight through, same shape as "CRT and non-CRT
+    // decrypt agree at a real 512-bit key size" above (NOT a `[0..n_len]`
+    // slice taken AFTER a full-width `toBytes` call -- that reads the
+    // leading zero pad instead of the value; `toBytes` needs the exact
+    // output width up front, not a wider buffer to trim after the fact).
+    var n_b: [modulus_bytes]u8 = undefined;
+    var lam_b: [modulus_sq_bytes]u8 = undefined;
+    var mu_b: [modulus_bytes]u8 = undefined;
+    kp.secret.nToBytes(&n_b) catch unreachable;
+    kp.secret.lambdaToBytes(&lam_b) catch unreachable;
+    kp.secret.muToBytes(&mu_b) catch unreachable;
+    const sk_noncrt = SecretKey.fromBytes(&n_b, &lam_b, &mu_b) catch unreachable;
+    std.debug.assert(sk_noncrt.crt == null);
+
+    var buf: [modulus_sq_bytes + 16]u8 = undefined;
+    const bytes = fuzzedFieldBytes(smith, &buf);
+    const ct = Ciphertext.fromBytes(kp.public, bytes) catch return; // not a well-formed ciphertext under this key; nothing to compare
+
+    const r_crt = decrypt(kp.secret, ct);
+    const r_noncrt = decrypt(sk_noncrt, ct);
+    if (r_crt) |v_crt| {
+        const v_noncrt = r_noncrt catch return error.CrtNonCrtDisagree;
+        if (!v_crt.eql(v_noncrt)) return error.CrtNonCrtDisagree;
+    } else |_| {
+        if (r_noncrt) |_| return error.CrtNonCrtDisagree else |_| {}
+    }
 }
 
 // ── dead-stack secret residue (paillier F2, wave-3 audit) ──────────────────
