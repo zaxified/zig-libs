@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** added Wycheproof ECDSA
+  secp256k1/SHA-256 verification vectors (audit G3, MED) — this module
+  shipped zero ECDSA test vectors of its own (only BIP340 Schnorr vectors).
+  357 vectors (234 P1363 + 123 Bitcoin/low-S), run against `sign.ecdsaVerify`
+  and `sign.ecdsaVerifyLowS` in `wycheproof_kat_test.zig`. Third-party data
+  under Apache-2.0, attributed in `NOTICE`; generator is
+  `modules/k256/tools/gen-k256-wycheproof.py`, mirroring the sibling `p256`
+  module's own Wycheproof fixture. No production code changed; the point of
+  this entry is the fixture existing, not a behaviour change.
+
 - **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code changed,
   but a source comment was corrected. This module reproduces two bodies of published values and
   had a record for neither: BIP340's own test vectors (`src/kat_vectors.zig`, BSD-2-Clause,
