@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign, F15's last three mutations (M29, M31,
+  M32) get regression coverage (test-only, no production behavior change).
+  A prior pass left these open, reasoning that proving `writeText`/
+  `getOrRegister`/`AccessLog.log` actually take their spinlock needed either
+  a flaky race (the critical sections are too short for natural interleaving
+  to catch it, which is why the module's own existing stress tests missed
+  all three mutations) or production code changed just for testability.
+  Neither is necessary: the new tests take the lock from the TEST itself
+  before the function under test runs, so a correctly-locking function has
+  no choice but to spin until the test releases it, observed via a 50ms
+  window and an atomic "done" flag -- deterministic, not probabilistic.
+  Verified against all three mutations named in the audit (temporarily
+  removing each `lockSpin`/`unlock` pair and confirming exactly the matching
+  new test fails, 31/32, with the other 31 unaffected; reverted). F15 is now
+  closed in full (6/6 named mutations have a regression test). Zero
+  production lines touched.
+
+  scripts/modtest metrics: 32/32 (Debug and ReleaseFast).
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `RequestMetrics`'s
   `.status = .code` granularity and any registry with many unrelated metric
   families are both cheaper — `getOrRegister`'s family lookup was O(registry

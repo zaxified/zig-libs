@@ -2316,3 +2316,122 @@ test "AccessLog: synchronized writes never interleave across threads" {
     }
     try testing.expectEqual(@as(usize, n_threads * 100), count);
 }
+
+// ── F15 M29/M31/M32: does the lock actually get TAKEN? ─────────────────────
+//
+// The three stress tests above (and the module's own mutation audit, F15)
+// converge on the same shape: racing many threads over MANY iterations and
+// checking the aggregate is a race against a narrow window, and a critical
+// section of a few string compares is too short for the window to ever
+// open in practice — which is exactly why M29 (`writeText` dropping its
+// `lockSpin`), M31 (`getOrRegister` dropping its `lockSpin`) and M32
+// (`AccessLog.log` dropping its `lockSpin` even with `synchronized = true`)
+// all survived those tests untouched. A prior pass concluded this needed
+// either a flaky race or production instrumentation added just for
+// testability, and left it there.
+//
+// Neither is true: don't wait for a narrow window, FORCE one. Take the lock
+// from the test itself BEFORE the function under test ever runs, then check
+// whether it made progress anyway. A correctly-locking function has no
+// choice but to spin in `lockSpin` for as long as the test holds the lock;
+// a mutated one proceeds immediately regardless. This is not a probabilistic
+// race — as long as the test holds the lock for the whole sleep, a
+// still-`false` `done` flag is not "we got lucky", it is the only possible
+// outcome unless the lock was skipped. Zero production code touched: the
+// lock field and `lockSpin` are already private symbols in this same file.
+
+fn sleepMs(ms: u64) void {
+    const ts: std.os.linux.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    _ = std.os.linux.nanosleep(&ts, null);
+}
+
+test "F15/M29: writeText actually takes the registry lock" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    _ = try reg.counter("m29_probe_total", "probe", &.{});
+
+    lockSpin(&reg.lock); // held by the test, not by writeText
+
+    var done = std.atomic.Value(bool).init(false);
+    const Ctx = struct {
+        reg: *Registry,
+        done: *std.atomic.Value(bool),
+        fn run(ctx: *@This()) void {
+            var buf: [4096]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buf);
+            _ = ctx.reg.writeText(&w) catch {};
+            ctx.done.store(true, .seq_cst);
+        }
+    };
+    var ctx: Ctx = .{ .reg = &reg, .done = &done };
+    const t = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+
+    sleepMs(50);
+    // Still blocked on the lock the test is holding: this is only possible
+    // if writeText itself blocks on it too. A dropped lockSpin would let
+    // this thread finish and set `done` well within 50ms (a formatting pass
+    // over one family is microseconds).
+    try testing.expect(!done.load(.seq_cst));
+
+    reg.lock.unlock();
+    t.join();
+    try testing.expect(done.load(.seq_cst));
+}
+
+test "F15/M31: getOrRegister actually takes the registry lock" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    lockSpin(&reg.lock);
+
+    var done = std.atomic.Value(bool).init(false);
+    const Ctx = struct {
+        reg: *Registry,
+        done: *std.atomic.Value(bool),
+        fn run(ctx: *@This()) void {
+            _ = ctx.reg.counter("m31_probe_total", "probe", &.{}) catch {};
+            ctx.done.store(true, .seq_cst);
+        }
+    };
+    var ctx: Ctx = .{ .reg = &reg, .done = &done };
+    const t = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+
+    sleepMs(50);
+    try testing.expect(!done.load(.seq_cst));
+
+    reg.lock.unlock();
+    t.join();
+    try testing.expect(done.load(.seq_cst));
+    _ = try reg.counter("m31_probe_total", "probe", &.{}); // registered, not lost
+}
+
+test "F15/M32: AccessLog.log actually takes its lock when synchronized" {
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json, .synchronized = true });
+
+    lockSpin(&access.lock);
+
+    var done = std.atomic.Value(bool).init(false);
+    const Ctx = struct {
+        access: *AccessLog,
+        done: *std.atomic.Value(bool),
+        fn run(ctx: *@This()) void {
+            ctx.access.log(.{ .method = .get, .path = "/m32", .status = 200, .duration_ns = 1, .bytes = 0 });
+            ctx.done.store(true, .seq_cst);
+        }
+    };
+    var ctx: Ctx = .{ .access = &access, .done = &done };
+    const t = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+
+    sleepMs(50);
+    try testing.expect(!done.load(.seq_cst));
+
+    access.lock.unlock();
+    t.join();
+    try testing.expect(done.load(.seq_cst));
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "/m32") != null);
+}
