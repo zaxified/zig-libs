@@ -12,9 +12,16 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `Allow`, trailing-slash redirect) — see NOTICE.
 - **Frozen middleware chains:** outer→inner = registration order (router `use` → group → nested
   group → handler), computed per route at `add` time. `use` after any route has been registered is
-  `error.RoutesAlreadyRegistered` (chi's rule, surfaced as a typed error, not a footgun).
-  Router-level middleware also wraps the 404/405 fallbacks, so cross-cutting middleware sees misses
-  too.
+  `error.RoutesAlreadyRegistered` (chi's rule, surfaced as a typed error, not a footgun). A fallback
+  — 404, 405, auto-`OPTIONS`, `.reject_non_canonical`'s 400, and a trailing-slash redirect — runs
+  the middleware chain of whichever group's prefix the request path falls under (`Router.groupFor`,
+  cached per group the first time a route anywhere under it registers — see "Fallback middleware
+  scoping" below), router-level `use` alone when it falls under none. So `group("/api").use(gate)`
+  wraps every response for `/api`, not only the ones a route actually served (audit findings
+  router-F1/F2: before this, a 405/auto-`OPTIONS`/404 inside a group skipped the group's own
+  middleware entirely, and a trailing-slash redirect skipped the FULL chain including router-level
+  `use` — answered straight from `dispatch`, letting an unauthenticated caller enumerate the route
+  table via the 301-vs-404 difference).
 - **Deterministic precedence:** static > `:param` > `*wildcard` per segment, with chi-style
   backtracking (an endpoint-less static prefix falls back to a param sibling). Raw byte matching —
   no percent-decoding, no case folding; `:param` never matches empty, `*wildcard` must be last and
@@ -35,25 +42,44 @@ ahead of the router). `router` does not authenticate or authorize — identity a
 errors propagate to `http.Server`, which produces a plain 500 when nothing was sent; the router does
 not catch or classify errors itself.
 
-**`normalize_path` (dot-segment posture) — what this module can and cannot control.** The actual
-RFC 3986 §5.2.4 rewrite runs in `http.Server.serveOne`, upstream of `dispatch`, unconditionally —
-that call site is off-limits to this module. `req.target` is preserved raw there specifically so a
-private copy could be normalized without losing it, which is what makes all three `normalize_path`
-postures implementable entirely inside `router`: `.remove_dot_segments` (default) does nothing —
-`req.path` already carries the rewrite, unchanged from before this option existed.
-`.reject_non_canonical` recomputes the raw path from `req.target` (strip anything from `?` on) and
-byte-compares it against `req.path`; a mismatch means `removeDotSegments` changed something, so the
-request 400s before `matchRec` ever runs. `.off` overwrites `req.path` with that same raw
-recomputation before matching, so both the matcher and the handler see the un-rewritten bytes. None
-of this reaches into `http` — it is all a consequence of `req.target`/`req.path` already being two
-separate, mutable fields on a `Request` the router receives by pointer.
+**`normalize_path` (dot-segment posture) — what this module can and cannot control.** `http.Server`
+runs the same RFC 3986 §5.2.4 rewrite in `serveOne`, upstream of `dispatch`, unconditionally. `router`
+does not rely on that having happened, though: `req.target` is preserved raw specifically so a
+private copy can be normalized independently, which is what makes all three `normalize_path`
+postures implementable entirely inside `router`, correct for a caller driving `Router` directly
+(without `http.Server` in front, a supported use) and not only one sitting behind it.
+`.remove_dot_segments` (default) recomputes `rawPath(req.target)` and, using `http.Server`'s own
+`checkOriginPath`/`pathHasDotSegments`/`normalizePathInto` (the same building blocks `serveOne`
+itself uses), rewrites `req.path` to the canonical form before matching — redundant work when
+`http.Server` already did this (the result is byte-identical), but no longer a no-op for a direct
+caller, which it silently was before (audit finding router-F3: the option's name and doc promised
+this, `remove_dot_segments => {}` did not deliver it). `.reject_non_canonical` runs the same
+`checkOriginPath`/`pathHasDotSegments` check directly against `rawPath(req.target)` and 400s before
+`matchRec` ever runs when it finds a dot segment — no longer a byte-comparison against `req.path`
+(which, for that same direct caller, started out equal to the raw target and so never fired at all).
+`.off` overwrites `req.path` with that same raw recomputation before matching, so both the matcher
+and the handler see the un-rewritten bytes. None of this reaches into `http`'s private state — the
+three helpers it calls are already `pub`, used the same way `serveOne` uses them, and it is otherwise
+all a consequence of `req.target`/`req.path` already being two separate, mutable fields on a
+`Request` the router receives by pointer.
 
 **Match depth is bounded by this module.** `matchRec` descends one frame per path segment, and
 `max_path_segments` (256) refuses anything deeper — a 404, since nothing that deep is routable.
-The bound used to be inherited from `http.Server.max_normalized_path` (8 KiB, i.e. ~4096 frames for
+The bound used to be inherited from the server's own path-length cap (2 KiB, i.e. ~1024 frames for
 `/a/a/…`): safe on a default stack, but by an argument living in another module, and not applying
 at all to a caller driving `Router` directly, which is a supported use. The regression test goes at
 `matchRec` rather than through the wire for exactly that reason.
+
+**Fallback middleware scoping (`Router.groupFor`/`fallbackChain`).** Every `Group` a route is ever
+registered under (directly, or via a nested subgroup) gets its own chain — router-level `use` plus
+every ancestor's `use` root→leaf plus its own — cached exactly once, in `addRoute`, the first time
+`routes_added` transitions true for it. That transition point is the one safe moment: `routes_added`
+already gates `use()` on that group and, by walking every ancestor to the same true value, on every
+ancestor too, so by the time `own_chain` is read the `mws` lists it was built from can never change
+again. A fallback then picks the deepest registered group whose prefix is a segment-boundary prefix
+of the request path (`"/api"` matches `"/api/x"` and itself, not `"/apix"`) and runs that group's
+cached chain, or router-level `use` alone when the path falls under no group. All of this happens at
+registration time, not per request — `dispatch` remains allocation-free and lock-free.
 
 ## Verification
 

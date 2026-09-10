@@ -48,8 +48,8 @@ try r.get("/hello", hello);
 try r.get("/users/:id", user);
 try r.get("/static/*path", serveFile);  // trailing wildcard
 const api = try r.group("/api");        // prefix + per-group middleware
-try api.use(.{ .run = requireAuth });
-try api.get("/things/:id", thing);
+try api.use(.{ .run = requireAuth });   // gates every response under "/api",
+try api.get("/things/:id", thing);      // including 404/405/auto-OPTIONS/redirect
 
 var server = http.Server.init(io, gpa, .{
     .handler = r.handler(),
@@ -83,11 +83,11 @@ OpenAPI 3.1 document.
 | Precedence | static > `:param` > `*wildcard` per segment, with chi-style backtracking (an endpoint-less static prefix falls back to a param sibling) |
 | Params | `:param` never matches an empty segment; `*wildcard` must be the last segment and captures the remainder without the leading slash (may be `""`) |
 | Matching | raw bytes — no percent-decoding, no case folding |
-| Middleware | outer→inner = registration order: router `use` → group → nested group → handler; chains are frozen into routes at add time, so `use` after any route ⇒ `error.RoutesAlreadyRegistered`; router-level middleware also wraps 404/405 |
+| Middleware | outer→inner = registration order: router `use` → group → nested group → handler; chains are frozen into routes at add time, so `use` after any route ⇒ `error.RoutesAlreadyRegistered`; a fallback (404/405/auto-OPTIONS/redirect — see below) runs the chain of whichever group's prefix the request path falls under, router-level `use` alone when it falls under none — a `group("/api").use(requireAuth)` gate sees every response for `/api`, not only the ones a route actually served |
 | 404 / 405 | overridable `not_found` / `method_not_allowed` handlers; on 405 the router sets `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs |
 | HEAD | auto-routes to GET when no explicit HEAD route (the `ResponseWriter` suppresses the body and keeps GET framing) |
-| Trailing slash | `.redirect` (default, httprouter): 301 for GET/HEAD, 308 otherwise, toward the slash variant that has the route, query preserved; `.strict` (chi): 404. `/x` and `/x/` are always registrable as two distinct routes |
-| Path normalization | `normalize_path`, see below. Default `.remove_dot_segments`: today's behavior, unchanged |
+| Trailing slash | `.redirect` (default, httprouter): 301 for GET/HEAD, 308 otherwise, toward the slash variant that has the route, query preserved, run through the matched path's middleware chain (a gate registered there can deny it) — `.strict` (chi): 404. `/x` and `/x/` are always registrable as two distinct routes |
+| Path normalization | `normalize_path`, see below. Default `.remove_dot_segments`: normalizes the target itself now, so it holds for a caller driving `Router` directly too, not only behind `http.Server` |
 | Auto OPTIONS | `auto_options` (default off), see the worked example below |
 | Errors | handler/middleware errors propagate to `http.Server` → clean 500 when nothing was sent |
 
@@ -122,11 +122,15 @@ catch-all for CORS-style preflight handling.
 `http.Server` runs RFC 3986 §5.2.4 dot-segment removal on the request path
 **before** this module (or any handler) ever sees it, silently and
 unconditionally — `/a/../b` arrives at `dispatch` already rewritten to `/b`.
-That is invisible, and for most APIs exactly right. It is wrong for an API
-where a path segment is caller data rather than route structure — a blob
-store keyed by device/backup name, say — because a `..` segment then
-silently becomes a *different, valid route* instead of an error.
-`normalize_path` picks the posture:
+That is invisible, and for most APIs exactly right. `dispatch` reproduces
+that same rewrite itself now (from `req.target`, not by trusting `req.path`),
+so it holds unconditionally — including for a caller driving `Router`
+directly without `http.Server` in front, a supported use (`Router` does not
+require `http.Server`). It is wrong for an API where a path segment is
+caller data rather than route structure — a blob store keyed by
+device/backup name, say — because a `..` segment then silently becomes a
+*different, valid route* instead of an error. `normalize_path` picks the
+posture:
 
 ```zig
 var r = router.Router.init(gpa);
@@ -135,7 +139,7 @@ r.normalize_path = .reject_non_canonical; // or .off — see below
 
 | Value | Behavior |
 |---|---|
-| `.remove_dot_segments` (default) | Trust `http.Server`'s rewrite — today's behavior, unchanged |
+| `.remove_dot_segments` (default) | Normalize `req.target` itself before matching — reproduces `http.Server`'s rewrite exactly (redundant but harmless behind it), and holds for a direct caller too |
 | `.reject_non_canonical` | 400, before any route matches, whenever the raw target's path isn't already canonical (`..`/`.`/`/..` etc. would have changed it) |
 | `.off` | Bypass the rewrite for routing: dispatch on — and hand the handler — the raw, un-rewritten path (`ctx.req.path` reads the same raw value) |
 

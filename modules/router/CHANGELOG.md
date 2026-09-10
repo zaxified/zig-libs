@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, security-relevant fix (user-approved, changes observable behavior
+  for all 18 in-repo consumers)** — 404, 405, auto-`OPTIONS`, `.reject_non_canonical`'s 400, and the
+  trailing-slash redirect now run the middleware chain of whichever `group()`'s prefix the request
+  path falls under (router-level `use` alone when it falls under none), instead of only the
+  router-level chain (audit findings router-F1 HIGH, router-F2 HIGH). Before this, a gate registered
+  via `group("/api").use(requireAuth)` — exactly what README's own usage example showed — never ran
+  on a 405/auto-`OPTIONS`/404 inside `/api`, and the trailing-slash redirect skipped middleware
+  entirely (answered straight from `dispatch`, outside any chain), so an unauthenticated caller could
+  enumerate the protected route table via the 301-vs-404 difference and the canonical path it leaked
+  in `Location`. New `Router.groupFor`/`fallbackChain` compute this from a per-group chain cached
+  once at registration time (the first route anywhere under a group), so `dispatch` remains
+  allocation-free. Also fixes `.remove_dot_segments`/`.reject_non_canonical` for a caller driving
+  `Router` directly, without `http.Server` in front (audit finding router-F3 HIGH): both now
+  recompute from `req.target` using `http.Server`'s own `checkOriginPath`/`pathHasDotSegments`/
+  `normalizePathInto`, instead of trusting `req.path` was already normalized by something upstream —
+  which for a direct caller had never happened, silently turning `.remove_dot_segments` into a no-op
+  and `.reject_non_canonical` into a check that could never fire. Corrected three stale citations of
+  the server's path-length cap (2 KiB / ~1024 frames, not 8 KiB / ~4096) picked up along the way.
+  Consumers: run your own test suite if you register group middleware as an authorization boundary —
+  a 405/404/redirect inside that group now reaches it, where it previously did not.
 - **2026-08-18** — Security audit: README now states, next to `.reject_non_canonical` itself
   (not only in SPEC.md's threat model), that the option does not decode percent-encoding —
   `/v1/blob/%2e%2e/other` is already "canonical" by its raw-byte comparison and dispatches with

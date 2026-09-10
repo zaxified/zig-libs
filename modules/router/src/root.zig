@@ -14,8 +14,13 @@
 //! `use` first, then each group's middleware root→leaf, then the handler.
 //! Chains are precomputed per route at add time, so middleware must be
 //! registered before routes (chi's rule, surfaced as an error instead of a
-//! panic). The 404/405 defaults are overridable and run the router-level
-//! middleware, so metrics/cors-style middleware see misses too.
+//! panic). The 404/405/auto-OPTIONS defaults and the trailing-slash
+//! redirect are overridable and run the middleware chain of whichever
+//! group's prefix the request path falls under (router-level `use` alone
+//! when it falls under none) — a miss inside `group("/api")` runs `/api`'s
+//! own middleware, not just the router-level chain, so an auth gate
+//! registered via `group().use()` sees every response for its subtree,
+//! including the ones no route actually served.
 //!
 //! Documented policies (matching Go chi / julienschmidt/httprouter):
 //! - **HEAD → GET:** HEAD auto-routes to the GET handler when no explicit
@@ -43,12 +48,14 @@
 //!   case folding. `:param` never matches an empty segment; `*wildcard`
 //!   matches the whole remainder (without the leading slash), possibly "".
 //! - **Path normalization:** `normalize_path` (default `.remove_dot_segments`)
-//!   decides how `dispatch` treats `http.Server`'s silent, unconditional
-//!   dot-segment rewrite of `req.path` — trust it (default, unchanged),
-//!   reject a non-canonical target with 400 before matching
-//!   (`.reject_non_canonical`), or bypass it and dispatch on the raw,
-//!   un-rewritten path (`.off`). See `NormalizePath` and README's "Path
-//!   normalization" section.
+//!   decides how `dispatch` treats dot segments: normalize `req.target`
+//!   itself, RFC 3986 §5.2.4, before matching (`.remove_dot_segments`,
+//!   default — redundant but harmless when `http.Server` already did this,
+//!   and correct on its own for a caller driving `Router` directly, which
+//!   is a supported use), reject a non-canonical target with 400 before
+//!   matching (`.reject_non_canonical`), or bypass normalization entirely
+//!   and dispatch on the raw, un-rewritten path (`.off`). See
+//!   `NormalizePath` and README's "Path normalization" section.
 //!
 //! Introspection (what `openapi`/`metrics` build on): `Router.routes()`
 //! enumerates the registered route table in registration order, `addDoc`
@@ -90,10 +97,10 @@ pub const max_params = 16;
 ///
 /// This exists so the recursion depth is bounded by THIS module rather than by
 /// whatever the transport in front of it happens to cap a path at. `matchRec`
-/// recurses once per segment, so with only the server's
-/// `http.Server.max_normalized_path` (8 KiB) to stop it, a path of `"/a/a/…"`
-/// drives ~4096 frames — safe on a default 8-16 MiB thread stack, but safe by
-/// an argument that lives in a different module and could be re-tuned there
+/// recurses once per segment, so with only the server's own path-length cap
+/// (2 KiB) to stop it, a path of `"/a/a/…"` drives ~1024 frames — safe on a
+/// default 8-16 MiB thread stack, but safe by an argument that lives in a
+/// different module and could be re-tuned there
 /// (or bypassed entirely by a caller invoking `dispatch` directly, which is a
 /// supported use: `Router` does not require `http.Server`).
 ///
@@ -101,6 +108,12 @@ pub const max_params = 16;
 /// actually decides a match, and a real one is a handful of segments. A path
 /// deeper than this has no pattern to hit.
 pub const max_path_segments = 256;
+
+/// Scratch buffer size for `.remove_dot_segments`' own normalization pass
+/// (see `dispatch`). `http.Server.checkOriginPath` rejects anything longer
+/// before `normalizePathInto` ever runs, and `removeDotSegments` never
+/// grows a path — so every `raw` this buffer receives already fits.
+const normalize_buf_len = 2048;
 
 const method_count = @typeInfo(http.Method).@"enum".fields.len;
 
@@ -147,6 +160,11 @@ pub const Ctx = struct {
     data: ?*anyopaque = null,
     /// Pattern of the matched route — see `matchedPattern`.
     matched_pattern: ?[]const u8 = null,
+    /// Router-internal: set only when `answerRedirect` is the chain's
+    /// endpoint (see `tryRedirect`). Deliberately not `data` above —
+    /// middleware conventionally writes `ctx.data` before calling
+    /// `next.run`, which would clobber a value stashed there.
+    _redirect: ?*const RedirectInfo = null,
 
     /// The pattern of the route serving this request (e.g. "/users/:id"),
     /// router-owned. Null in the 404 and 405 fallback handlers (no route
@@ -201,16 +219,26 @@ pub const TrailingSlash = enum {
 /// route whose path segments are caller data (an object key, a device
 /// name) rather than route structure.
 pub const NormalizePath = enum {
-    /// Trust `http.Server`'s already-normalized `req.path` (today's
-    /// behavior, unchanged): `/a/../b` dispatches exactly like `/b`. Right
-    /// when path segments are route structure and a `..` walking a prefix
-    /// is meaningless anyway.
+    /// Normalize `req.target`'s path portion (RFC 3986 §5.2.4) before
+    /// matching, and hand the handler the normalized result:
+    /// `/a/../b` dispatches exactly like `/b`. Right when path segments are
+    /// route structure and a `..` walking a prefix is meaningless anyway.
+    ///
+    /// This runs the normalization itself rather than trusting the caller
+    /// to have already done it — `http.Server` does (so this reproduces its
+    /// rewrite exactly and is redundant work, not a behavior change, for
+    /// that caller), but a caller driving `Router` directly (a supported
+    /// use: `Router` does not require `http.Server`) does not, and
+    /// previously got no normalization at all under this option despite its
+    /// name and doc promising one (audit finding router-F3).
     remove_dot_segments,
     /// Refuse a request whose target path is not already canonical (i.e.
-    /// `removeDotSegments` would have rewritten it) with 400, before any
-    /// route is matched or handler runs. The right posture for a key-in-path
-    /// API: a `..` segment must be an error, never a silent reroute to a
-    /// different resource.
+    /// `removeDotSegments` would rewrite it) with 400, before any route is
+    /// matched or handler runs. The right posture for a key-in-path API: a
+    /// `..` segment must be an error, never a silent reroute to a different
+    /// resource. Checked directly against `req.target`, so — like
+    /// `.remove_dot_segments` above — this holds for a direct caller too,
+    /// not only one sitting behind `http.Server`.
     reject_non_canonical,
     /// Bypass the rewrite for routing purposes: dispatch on — and hand the
     /// handler — the raw, un-rewritten path straight off the wire (`req.path`
@@ -317,6 +345,12 @@ pub const Router = struct {
     routes_added: bool = false,
     /// Registered routes in registration order (see `routes`).
     route_list: std.ArrayList(Route),
+    /// Every group ever created (flat, creation order) — used by
+    /// `groupFor` to find which group's middleware should wrap a fallback
+    /// (404/405/auto-OPTIONS/400/redirect) for a path that didn't reach an
+    /// endpoint. Not a tree: `Group` only points at its parent, so the
+    /// router keeps the flat index.
+    groups: std.ArrayList(*Group),
 
     /// All registration state (nodes, patterns, chains, groups) lives in an
     /// internal arena owned by the Router — `deinit` frees everything.
@@ -326,6 +360,7 @@ pub const Router = struct {
             .root = .{},
             .mws = .empty,
             .route_list = .empty,
+            .groups = .empty,
         };
     }
 
@@ -409,15 +444,25 @@ pub const Router = struct {
         if (req.path.len == 0 or req.path[0] != '/')
             return r.runFallback(req, rw, r.not_found);
 
-        // `req.path` already reflects `http.Server`'s silent dot-segment
-        // rewrite by the time it reaches here — `normalize_path` decides
-        // whether that is trusted (default, below is a no-op), rejected, or
-        // bypassed by recomputing the raw path from the preserved
-        // `req.target` (see `NormalizePath`).
+        // `normalize_path` decides what happens to dot segments — see
+        // `NormalizePath`. `.remove_dot_segments` and `.reject_non_canonical`
+        // both work from `req.target` directly (not from `req.path`, which a
+        // caller driving `Router` without `http.Server` in front never had
+        // normalized in the first place — audit finding router-F3).
+        var normalize_buf: [normalize_buf_len]u8 = undefined;
         switch (r.normalize_path) {
-            .remove_dot_segments => {},
+            .remove_dot_segments => {
+                const raw = rawPath(req.target);
+                http.Server.checkOriginPath(raw) catch return r.runFallback(req, rw, r.bad_request);
+                req.path = if (http.Server.pathHasDotSegments(raw))
+                    http.Server.normalizePathInto(&normalize_buf, raw)
+                else
+                    raw;
+            },
             .reject_non_canonical => {
-                if (!std.mem.eql(u8, rawPath(req.target), req.path))
+                const raw = rawPath(req.target);
+                http.Server.checkOriginPath(raw) catch return r.runFallback(req, rw, r.bad_request);
+                if (http.Server.pathHasDotSegments(raw))
                     return r.runFallback(req, rw, r.bad_request);
             },
             .off => req.path = rawPath(req.target),
@@ -446,7 +491,7 @@ pub const Router = struct {
             else
                 r.method_not_allowed;
             var ctx: Ctx = .{ .req = req, .res = rw, .params = params, .state = r.state };
-            const next: Next = .{ .chain = r.mws.items, .endpoint = endpoint };
+            const next: Next = .{ .chain = r.fallbackChain(req.path), .endpoint = endpoint };
             return next.run(&ctx);
         }
 
@@ -458,13 +503,46 @@ pub const Router = struct {
 
     fn runFallback(r: *Router, req: *http.Server.Request, rw: *http.Server.ResponseWriter, h: Handler) anyerror!void {
         var ctx: Ctx = .{ .req = req, .res = rw, .params = .{}, .state = r.state };
-        const next: Next = .{ .chain = r.mws.items, .endpoint = h };
+        const next: Next = .{ .chain = r.fallbackChain(req.path), .endpoint = h };
         return next.run(&ctx);
     }
 
+    /// The deepest group (by prefix length) whose prefix is a
+    /// segment-boundary prefix of `path` and which has at least one route
+    /// registered somewhere under it (`own_chain` gets cached — see
+    /// `addRoute` — exactly when that first happens): the group whose
+    /// middleware would wrap a route at this path if one existed. `"/api"`
+    /// matches `"/api/x"` and `"/api"` itself, but not `"/apix"`.
+    fn groupFor(r: *const Router, path: []const u8) ?*Group {
+        var best: ?*Group = null;
+        for (r.groups.items) |g| {
+            if (g.own_chain == null) continue; // no route ever reached it
+            if (!std.mem.startsWith(u8, path, g.prefix)) continue;
+            if (path.len > g.prefix.len and path[g.prefix.len] != '/') continue;
+            if (best == null or g.prefix.len > best.?.prefix.len) best = g;
+        }
+        return best;
+    }
+
+    /// Middleware chain for a request that will NOT reach a route endpoint
+    /// — 404, `.reject_non_canonical`'s 400, a matched-path 405/auto-OPTIONS,
+    /// and a trailing-slash redirect all go through this (F1/F2): the
+    /// deepest enclosing group's own chain, or router-level `use` alone
+    /// when `path` falls under no group. Precomputed per group at
+    /// registration time (see `addRoute`), so — like the rest of
+    /// `dispatch` — this does no allocation.
+    fn fallbackChain(r: *const Router, path: []const u8) []const Middleware {
+        if (r.groupFor(path)) |g| return g.own_chain.?;
+        return r.mws.items;
+    }
+
     /// Probe the other trailing-slash variant; when it has this route,
-    /// answer 301 (GET/HEAD) / 308 with a Location preserving the query.
-    /// Paths beyond the fixed buffer just fall through to 404.
+    /// run the enclosing group's middleware chain (F2 — this used to answer
+    /// straight from `dispatch`, outside any chain, which let an
+    /// unauthenticated request enumerate the route table via the 301/404
+    /// difference) and answer 301 (GET/HEAD) / 308 with a Location
+    /// preserving the query. Paths beyond the fixed buffer just fall
+    /// through to 404.
     fn tryRedirect(r: *Router, req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!bool {
         const path = req.path;
         var probe: Params = .{};
@@ -483,13 +561,18 @@ pub const Router = struct {
         }
         if (req.query.len != 0) w.print("?{s}", .{req.query}) catch return false;
 
-        rw.setStatus(if (req.method == .get or req.method == .head) 301 else 308);
-        // `setHeader` copies `loc_buf` into the writer, so the head no longer
-        // has to be forced out before this frame dies. Timing is safe to give
-        // up here specifically: the redirect is answered from `dispatch`
-        // *outside* the middleware chain, so there is no post-`next.run` step
-        // that could have been relying on a committed head.
-        try rw.setHeader("Location", w.buffered());
+        var redirect: RedirectInfo = .{
+            .location = w.buffered(),
+            .status = if (req.method == .get or req.method == .head) 301 else 308,
+        };
+        // `setHeader` (inside `answerRedirect`) copies `loc_buf` into the
+        // writer, so the head no longer has to be forced out before this
+        // frame dies — safe to let `loc_buf`/`redirect` live only here:
+        // `next.run` below completes synchronously, entirely inside this
+        // call, before either goes out of scope.
+        var ctx: Ctx = .{ .req = req, .res = rw, .params = probe, .state = r.state, ._redirect = &redirect };
+        const next: Next = .{ .chain = r.fallbackChain(path), .endpoint = answerRedirect };
+        try next.run(&ctx);
         return true;
     }
 
@@ -511,7 +594,14 @@ pub const Router = struct {
         try r.route_list.append(a, .{ .method = method, .pattern = full, .doc = doc_copy });
         r.routes_added = true;
         var it: ?*Group = g;
-        while (it) |gr| : (it = gr.parent) gr.routes_added = true;
+        while (it) |gr| : (it = gr.parent) {
+            gr.routes_added = true;
+            // First route to reach this group (directly, or via a nested
+            // subgroup) — `gr.mws` and every ancestor's are frozen from
+            // here on (routes_added blocks further `use()`), so this is the
+            // one safe, allocation-at-registration-time moment to cache it.
+            if (gr.own_chain == null) gr.own_chain = try r.buildChain(gr);
+        }
     }
 
     /// Deep-copy a RouteDoc into the arena (strings, tags, responses), so
@@ -622,6 +712,25 @@ pub const Router = struct {
         try r.rebuildAllow(node);
     }
 
+    comptime {
+        // `rebuildAllow`'s buffer below must fit every registered method's
+        // token, comma-separated -- its `catch unreachable` would otherwise
+        // be an actual runtime panic in `add()` the day `http.Method` grows
+        // past what fits today (audit finding router-F9: today's 7 methods
+        // use 44 of 64 bytes, so there was room to grow silently until the
+        // panic, with nothing here to say by how much).
+        var worst: usize = 0;
+        for (@typeInfo(http.Method).@"enum".fields) |f| {
+            const m: http.Method = @enumFromInt(f.value);
+            worst += m.token().len + 2; // ", " separator; one spare is fine
+        }
+        if (worst > 64) @compileError(std.fmt.comptimePrint(
+            "router: http.Method has grown to {d} members ({d} bytes worst-case " ++
+                "Allow, ', '-joined) -- past rebuildAllow's 64-byte buffer, widen it",
+            .{ @typeInfo(http.Method).@"enum".fields.len, worst },
+        ));
+    }
+
     /// Recompute the node's `Allow` value: registered methods in
     /// `http.Method` order, HEAD implied by GET.
     fn rebuildAllow(r: *Router, node: *Node) error{OutOfMemory}!void {
@@ -649,6 +758,14 @@ pub const Group = struct {
     /// This group's own middleware (parents' are collected at add time).
     mws: std.ArrayList(Middleware),
     routes_added: bool,
+    /// This group's own chain (router-level `use` ++ every ancestor's
+    /// `use`, root→leaf, ++ this group's own `use`) — cached the first time
+    /// a route anywhere under this group makes `routes_added` true (see
+    /// `addRoute`), at which point `mws` here and on every ancestor is
+    /// frozen for good. Used by `Router.fallbackChain` (F1/F2) so a
+    /// fallback for a path under this group's prefix still runs its
+    /// middleware, even when no route actually matched.
+    own_chain: ?[]const Middleware = null,
 
     /// Append group middleware; must precede routes added through this
     /// group (or its children).
@@ -705,7 +822,9 @@ fn makeGroup(r: *Router, parent: ?*Group, prefix: []const u8) GroupError!*Group 
         .prefix = try std.mem.concat(a, u8, &.{ if (parent) |p| p.prefix else "", prefix }),
         .mws = .empty,
         .routes_added = false,
+        .own_chain = null,
     };
+    try r.groups.append(a, g);
     return g;
 }
 
@@ -745,6 +864,20 @@ fn rawPath(target: []const u8) []const u8 {
 fn defaultAutoOptions(ctx: *Ctx) anyerror!void {
     // dispatch already set the Allow header; 204 carries no body.
     ctx.res.setStatus(204);
+}
+
+/// A trailing-slash redirect's answer, computed by `tryRedirect` and handed
+/// down through `Ctx._redirect` so `answerRedirect` can run as an ordinary
+/// chain endpoint (see `tryRedirect` for why: F2).
+const RedirectInfo = struct {
+    location: []const u8,
+    status: u16,
+};
+
+fn answerRedirect(ctx: *Ctx) anyerror!void {
+    const info = ctx._redirect.?;
+    ctx.res.setStatus(info.status);
+    try ctx.res.setHeader("Location", info.location);
 }
 
 // ── the matcher ─────────────────────────────────────────────────────────────
@@ -789,7 +922,8 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// param sibling). `rest` is the remaining path after the leading '/';
 /// null = all segments consumed. `extra` appends one virtual "" segment
 /// (used to probe `path ++ "/"` without building the string). Recursion
-/// depth = segment count, bounded by the server's max_header_bytes.
+/// depth = segment count, bounded by this module's own `max_path_segments`
+/// (see `matchRecDepth`) — not by whatever caps the path upstream.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
     return matchRecDepth(node, rest, extra, params, 0);
 }
@@ -935,6 +1069,11 @@ fn hRewritten(ctx: *Ctx) anyerror!void {
 fn hRawCatch(ctx: *Ctx) anyerror!void {
     try ctx.res.writeAll("raw:");
     try ctx.res.writeAll(ctx.params.get("rest").?);
+}
+fn hCaptureLen(ctx: *Ctx) anyerror!void {
+    // F7: only the winning branch's capture should be live.
+    try testing.expectEqual(@as(usize, 1), ctx.params.len);
+    try ctx.res.writeAll(ctx.params.get("p").?);
 }
 
 // Middleware order recording — via Ctx.state, zero process globals.
@@ -1466,6 +1605,207 @@ test "middleware: router-level chain also wraps 404 and 405" {
     try testing.expectEqual(@as(u32, 2), count);
 }
 
+test "group middleware runs on 405, auto-OPTIONS, an in-group 404, and a redirect (F1/F2)" {
+    var trace: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    r.auto_options = true;
+    const api = try r.group("/api");
+    try api.use(.{ .run = mwG });
+    try api.get("/things/:id", hUser);
+
+    var buf: [1024]u8 = undefined;
+
+    // 405: path matches, method doesn't -- group middleware must still run
+    // (README teaches `group().use(.{ .run = requireAuth })` as an
+    // authorization boundary; before the fix it never saw this response).
+    trace = .{};
+    try expectStatus(runWire(&r, wire("DELETE", "/api/things/7"), &buf), "405");
+    try testing.expectEqualStrings("Gg", trace.get());
+
+    // auto-OPTIONS: path matches, no explicit OPTIONS route -- same requirement.
+    trace = .{};
+    try expectStatus(runWire(&r, wire("OPTIONS", "/api/things/7"), &buf), "204");
+    try testing.expectEqualStrings("Gg", trace.get());
+
+    // 404 entirely inside the group's subtree -- group middleware must run too.
+    trace = .{};
+    try expectStatus(runWire(&r, wire("GET", "/api/nope"), &buf), "404");
+    try testing.expectEqualStrings("Gg", trace.get());
+
+    // A path that only shares a textual prefix, not a '/'-bounded one, is
+    // NOT inside the group: "/apix" is not under "/api".
+    trace = .{};
+    try expectStatus(runWire(&r, wire("GET", "/apix"), &buf), "404");
+    try testing.expectEqualStrings("", trace.get());
+
+    // Redirect: "/api/things/7/" only matches with the slash stripped --
+    // group middleware must run before the 301 leaks that the route exists.
+    trace = .{};
+    const got = runWire(&r, wire("GET", "/api/things/7/"), &buf);
+    try expectStatus(got, "301");
+    try expectHeaderLine(got, "Location: /api/things/7");
+    try testing.expectEqualStrings("Gg", trace.get());
+}
+
+test "group middleware can deny a redirect before it reveals a route exists (F2)" {
+    var trace: Trace = .{};
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &trace;
+    const api = try r.group("/api");
+    try api.use(.{ .run = mwDeny }); // short-circuits 403, never calls next
+    try api.get("/secret", hHello);
+
+    var buf: [1024]u8 = undefined;
+    // Before the fix this answered 301 `Location: /api/secret` straight
+    // from `dispatch`, outside any chain -- proof, to a caller `mwDeny` was
+    // registered specifically to keep out, that the route exists at all.
+    const got = runWire(&r, wire("GET", "/api/secret/"), &buf);
+    try expectStatus(got, "403");
+    try testing.expectEqualStrings("denied", bodyOf(got));
+}
+
+test "normalize_path holds for a caller driving dispatch() directly, not only behind http.Server (F3)" {
+    // `Router.dispatch` is a documented, supported entry point without
+    // `http.Server` in front. Unlike `runWire` (which drives the full h1
+    // codec, so `req.path` already arrives pre-normalized), this builds
+    // `Request` by hand with `req.path` exactly as raw as `req.target` --
+    // what a direct caller actually has.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/v1/other", hRewritten);
+    try r.get("/v1/blob/*rest", hRawCatch);
+
+    var in: Reader = .fixed("GET /v1/blob/../other HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [512]u8 = undefined;
+    const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
+    var body_scratch: [64]u8 = undefined;
+    var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
+    var req: http.Server.Request = .{
+        .method = .get,
+        .target = head.target,
+        .path = head.target, // raw -- nobody normalized it first
+        .query = "",
+        .head = head,
+        .body = &body,
+        .context = &r,
+    };
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &response_body_buf, &chunk_buf, .{});
+
+    try r.dispatch(&req, &rw);
+    try rw.end();
+
+    // Before the fix, `.remove_dot_segments` was a no-op for this caller:
+    // the raw path (literal ".." bytes) went straight to the matcher, hit
+    // the wildcard, and never reached `/v1/other` at all.
+    const got = out.buffered();
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("rewritten", bodyOf(got));
+}
+
+test "reject_non_canonical rejects a raw dot-segment target from a direct caller too (F3)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.normalize_path = .reject_non_canonical;
+    try r.get("/v1/other", hRewritten);
+
+    var in: Reader = .fixed("GET /v1/../other HTTP/1.1\r\nHost: t\r\n\r\n");
+    var head_buf: [512]u8 = undefined;
+    const head = try http.h1.RequestHead.parse(try http.h1.readHead(&in, &head_buf));
+    var body_scratch: [64]u8 = undefined;
+    var body: http.Server.RequestBody = .init(&head, &in, &body_scratch);
+    var req: http.Server.Request = .{
+        .method = .get,
+        .target = head.target,
+        .path = head.target, // never normalized, unlike runWire
+        .query = "",
+        .head = head,
+        .body = &body,
+        .context = &r,
+    };
+
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &response_body_buf, &chunk_buf, .{});
+
+    try r.dispatch(&req, &rw);
+    try rw.end();
+
+    // Before the fix this compared `req.target`'s path against `req.path`
+    // -- for a direct caller they start out equal (neither has been
+    // normalized by anyone), so the check silently never fired.
+    try expectStatus(out.buffered(), "400");
+}
+
+test "backtracking never leaves a failed param branch's capture in params (F7)" {
+    // Mutation audit: `params.len = saved;` on the failed `:p` branch has no
+    // test of its own, and the suite stays green without it -- because
+    // `Params.get` returns the FIRST match by name, a stale leftover entry
+    // from the branch that didn't pan out is invisible to `get`, even though
+    // `params.len` is wrong. Assert the length, not just the value.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x/:p/a/end", hHello); // "/x/A/B" never reaches "end" -- no match
+    try r.get("/x/*p", hCaptureLen);
+
+    var buf: [1024]u8 = undefined;
+    try testing.expectEqualStrings("A/B", bodyOf(runWire(&r, wire("GET", "/x/A/B"), &buf)));
+}
+
+test "reject_non_canonical only inspects the path, not the query string (F12a)" {
+    // Mutation audit (pre-F3): deleting `rawPath`'s '?' truncation was
+    // GREEN against the old suite, because `.reject_non_canonical` was the
+    // only posture that ran with query strings, and it byte-compared raw
+    // against `req.path` directly -- a query string alone made them differ,
+    // 400ing a request with nothing non-canonical in its path. F3's fix
+    // moved every posture onto `rawPath`, including `.remove_dot_segments`
+    // (the default), which several PRE-EXISTING tests already exercise with
+    // a query string ("trailing slash: redirect policy", "...outlives the
+    // frame", "query string stays available") -- verified: mutating
+    // `rawPath` the same way now fails 3 tests, not 0. This test adds the
+    // one query+`.reject_non_canonical` combination none of those cover.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    r.normalize_path = .reject_non_canonical;
+    try r.get("/v1/other", hQuery);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("GET", "/v1/other?x=1&y=2"), &buf);
+    try expectStatus(got, "200");
+    try testing.expectEqualStrings("q=x=1&y=2", bodyOf(got));
+}
+
+test "OPTIONS * (asterisk-form) never matches a root route (F12b)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/", hRoot);
+
+    var buf: [1024]u8 = undefined;
+    // Mutation audit: dropping dispatch's `req.path[0] != '/'` guard lets
+    // `OPTIONS *`'s literal target ("*") fall through to `matchRec` and hit
+    // "/" as if an empty remainder had matched it -- it must not.
+    try expectStatus(runWire(&r, wire("OPTIONS", "*"), &buf), "404");
+}
+
+test "a ':'/'*' inside a capture's own name is rejected, not silently merged (F12c)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    // Mutation audit: dropping the `indexOfAny(name, ":*")` guard on the
+    // `:name` branch lets a typo like this register as ONE capture named
+    // "name*ext" instead of erroring -- which then 404s on every real
+    // request, silently, because nothing ever routes to that name.
+    try testing.expectError(error.InvalidPattern, r.get("/files/:name*ext", hHello));
+}
+
 test "use after a route → error.RoutesAlreadyRegistered" {
     var r = Router.init(testing.allocator);
     defer r.deinit();
@@ -1780,7 +2120,7 @@ test "integration: router behind http.Server, driven by http.Client" {
 
 test "match depth is bounded by the router, not by whatever caps the path upstream" {
     // Audit finding router-F1: `matchRec` recurses once per segment and the
-    // only thing that stopped it was `http.Server.max_normalized_path` (8 KiB)
+    // only thing that stopped it was the server's own path-length cap (2 KiB)
     // — a bound in a different module, which a caller driving the router
     // directly (a supported use; `Router` does not require `http.Server`) never
     // passes through at all. The bound is now the router's own, so this test
