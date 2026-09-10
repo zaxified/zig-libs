@@ -595,6 +595,39 @@ pub const CommandHandler = struct {
     }
 };
 
+/// Called whenever `serveSession` answers a `SSH_MSG_CHANNEL_OPEN` with
+/// `SSH_MSG_CHANNEL_OPEN_FAILURE` — a concurrent second channel, a
+/// non-`"session"` type, or a zero max-packet-size peer value (RFC 4254
+/// §5.1). Optional (`ServeConfig.on_channel_open_refused`, default `null`):
+/// today's behavior is already correct on the wire (the client gets the
+/// failure message either way), but with no hook the server side has no way
+/// to know it happened — `SPEC.md` documents one session channel per
+/// connection as this module's deliberate scope, but not that refusing a
+/// second one is otherwise silent server-side (A1/examples/ssh.md S3a).
+/// `ctx` is the caller's own state, same idiom as `CommandHandler` above.
+///
+/// ⚠ `kind` and `description` are borrowed for the duration of the call —
+/// same warning as `CommandHandler`'s `command`/`stdin` — they point into
+/// `serveSession`'s own scratch buffer; copy anything kept past the call.
+pub const ChannelOpenRejectedHandler = struct {
+    ctx: *anyopaque = transport.no_context,
+    onFn: *const fn (
+        ctx: *anyopaque,
+        kind: []const u8,
+        reason: messages.ChannelOpenFailureReason,
+        description: []const u8,
+    ) void,
+
+    pub fn call(
+        self: ChannelOpenRejectedHandler,
+        kind: []const u8,
+        reason: messages.ChannelOpenFailureReason,
+        description: []const u8,
+    ) void {
+        self.onFn(self.ctx, kind, reason, description);
+    }
+};
+
 pub const ServeConfig = struct {
     /// The authenticated identity (`userauth.AuthResult.user()`), passed
     /// through to the handlers.
@@ -620,6 +653,10 @@ pub const ServeConfig = struct {
     ///     empty stdin. Right for commands that take no input, and immune to
     ///     a client that holds its stdin open.
     stdin_mode: enum { collect_until_eof, ignore } = .collect_until_eof,
+    /// See `ChannelOpenRejectedHandler` above. `null` (default) keeps
+    /// today's behavior exactly: `serveSession` refuses on the wire either
+    /// way, this only adds an optional server-side observability seam.
+    on_channel_open_refused: ?ChannelOpenRejectedHandler = null,
 };
 
 /// Server: accept and serve exactly one `"session"` channel, then return.
@@ -674,15 +711,24 @@ pub fn serveSession(
                 const window = try c.uint32();
                 const max_packet = try c.uint32();
                 if (ch.open or ch.got_close) {
-                    try sendOpenFailure(t, sender, .resource_shortage, "only one session channel is supported");
+                    const reason: messages.ChannelOpenFailureReason = .resource_shortage;
+                    const desc = "only one session channel is supported";
+                    try sendOpenFailure(t, sender, reason, desc);
+                    if (config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
                     continue;
                 }
                 if (!std.mem.eql(u8, kind, "session")) {
-                    try sendOpenFailure(t, sender, .unknown_channel_type, "only \"session\" channels are supported");
+                    const reason: messages.ChannelOpenFailureReason = .unknown_channel_type;
+                    const desc = "only \"session\" channels are supported";
+                    try sendOpenFailure(t, sender, reason, desc);
+                    if (config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
                     continue;
                 }
                 if (max_packet == 0) {
-                    try sendOpenFailure(t, sender, .connect_failed, "zero maximum packet size");
+                    const reason: messages.ChannelOpenFailureReason = .connect_failed;
+                    const desc = "zero maximum packet size";
+                    try sendOpenFailure(t, sender, reason, desc);
+                    if (config.on_channel_open_refused) |hook| hook.call(kind, reason, desc);
                     continue;
                 }
                 ch.remote_id = sender;
@@ -2211,4 +2257,85 @@ test "serveSession REJECT: a non-session channel type gets OPEN_FAILURE, not a c
         @as(u32, @intFromEnum(messages.ChannelOpenFailureReason.unknown_channel_type)),
         try reply.uint32(),
     );
+}
+
+/// A1/examples/ssh.md S3a: `serveSession` used to refuse a second/wrong-type
+/// channel with no server-side seam at all — only the wire-level
+/// OPEN_FAILURE the test above already checks. Records what
+/// `on_channel_open_refused` was called with, for the regression test below.
+const RefusalRecorder = struct {
+    calls: usize = 0,
+    kind_buf: [64]u8 = undefined,
+    last_kind: []const u8 = "",
+    last_reason: ?messages.ChannelOpenFailureReason = null,
+    desc_buf: [128]u8 = undefined,
+    last_description: []const u8 = "",
+
+    // `kind`/`description` are borrowed for the duration of the call (same
+    // idiom as `CommandHandler`'s `command`/`stdin` — they point into
+    // `serveSession`'s own scratch buffer, freed when it returns), so this
+    // copies them out rather than storing the slices themselves.
+    fn onRefused(
+        ctx: *anyopaque,
+        kind: []const u8,
+        reason: messages.ChannelOpenFailureReason,
+        description: []const u8,
+    ) void {
+        const self: *RefusalRecorder = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const kn = @min(kind.len, self.kind_buf.len);
+        @memcpy(self.kind_buf[0..kn], kind[0..kn]);
+        self.last_kind = self.kind_buf[0..kn];
+        self.last_reason = reason;
+        const dn = @min(description.len, self.desc_buf.len);
+        @memcpy(self.desc_buf[0..dn], description[0..dn]);
+        self.last_description = self.desc_buf[0..dn];
+    }
+
+    fn handler(self: *RefusalRecorder) ChannelOpenRejectedHandler {
+        return .{ .ctx = self, .onFn = onRefused };
+    }
+};
+
+test "serveSession: on_channel_open_refused fires on a non-session channel type (A1/examples/ssh.md S3a)" {
+    // Same wire scenario as "a non-session channel type gets OPEN_FAILURE,
+    // not a channel" above, plus the new optional hook. `null` (the default,
+    // exercised by every other REJECT test in this file) must keep behaving
+    // exactly as before -- this test only adds an assertion, it does not
+    // change what's on the wire.
+    const t = std.testing;
+
+    var open_buf: [96]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&open_buf);
+    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try messages.writeString(&ow, "direct-tcpip");
+    try writeU32(&ow, 5);
+    try writeU32(&ow, 4096);
+    try writeU32(&ow, 4096);
+
+    var req_buf: [64]u8 = undefined;
+    var rw: std.Io.Writer = .fixed(&req_buf);
+    try writeChannelHeader(&rw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&rw, "exec");
+    try rw.writeByte(0);
+    try messages.writeString(&rw, "id");
+
+    var wire: [1024]u8 = undefined;
+    const framed = try framePackets(&wire, &.{ ow.buffered(), rw.buffered() });
+
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+
+    var rec: RefusalRecorder = .{};
+    try t.expectError(error.ChannelClosed, serveSession(&tr, t.allocator, .{
+        .exec = fuzz_label.handler(),
+        .on_channel_open_refused = rec.handler(),
+    }));
+
+    try t.expectEqual(@as(usize, 1), rec.calls);
+    try t.expectEqualStrings("direct-tcpip", rec.last_kind);
+    try t.expectEqual(messages.ChannelOpenFailureReason.unknown_channel_type, rec.last_reason.?);
+    try t.expectEqualStrings("only \"session\" channels are supported", rec.last_description);
 }

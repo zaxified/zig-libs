@@ -351,6 +351,31 @@ pub const Options = struct {
     reject_duplicate_keys: bool = true,
 };
 
+/// Hard ceiling this module enforces on `Options.max_depth`, regardless of
+/// what a caller configures.
+///
+/// A1/yaml.md F10: `composeNode` recurses one native call frame per nesting
+/// level, and `account()` only ever compares `depth` against whatever the
+/// caller put in `Options.max_depth` -- nothing stopped a caller from
+/// raising it past `scanner.max_depth` (4096). That field looks like a
+/// second, independent safety net, but it is not one: the scanner and
+/// parser are iterative (a flat event stream, no per-level recursion), so
+/// 4096 there is a sanity ceiling on documents, not a stack-safety bound.
+/// Reaching that same depth in `composeNode`'s own recursion overflows
+/// Debug's native stack -- SIGSEGV, not a catchable error -- well before
+/// the scanner's cap would ever refuse the input. `dupEql` (used by the
+/// duplicate-key check) has the identical shape: it also takes
+/// `Options.max_depth` as its own recursion ceiling.
+///
+/// `1024`, the shipped default, is the one depth this module has actually
+/// proven Debug-stack-safe: see `"composer depth boundary at the real
+/// default (1024), not a toy override"` below, which composes exactly that
+/// many levels without crashing. Clamping every caller-supplied
+/// `max_depth` to this ceiling is therefore strictly safer than trusting
+/// the field outright, and a no-op for every caller using the default or
+/// anything smaller than it.
+pub const max_safe_depth: usize = 1024;
+
 /// A composed stream that owns its own arena. Mirrors `std.json.Parsed`: the
 /// arena lives behind a pointer so the struct is freely movable.
 pub const Composed = struct {
@@ -489,10 +514,17 @@ const Composer = struct {
         return docs.items;
     }
 
+    /// The recursion ceiling actually enforced: the caller's `max_depth`,
+    /// clamped so it can never exceed `max_safe_depth` (A1/yaml.md F10).
+    /// `@min` only ever tightens a caller's setting, never loosens it.
+    fn effectiveMaxDepth(self: *const Composer) usize {
+        return @min(self.options.max_depth, max_safe_depth);
+    }
+
     fn account(self: *Composer, depth: usize) Error!void {
         self.nodes += 1;
         if (self.nodes > self.options.max_nodes) return error.TooManyNodes;
-        if (depth > self.options.max_depth) return error.TooDeep;
+        if (depth > self.effectiveMaxDepth()) return error.TooDeep;
     }
 
     /// Registers `name` before the node exists, so an alias inside the node
@@ -567,7 +599,7 @@ const Composer = struct {
                     const k = try self.composeNode(depth + 1);
                     const val = try self.composeNode(depth + 1);
                     if (self.options.reject_duplicate_keys) {
-                        if (try dup.checkAndInsert(self.alloc, k, self.options.max_depth, &self.dup_probes)) return error.DuplicateKey;
+                        if (try dup.checkAndInsert(self.alloc, k, self.effectiveMaxDepth(), &self.dup_probes)) return error.DuplicateKey;
                     }
                     try pairs.append(self.alloc, .{ .key = k, .value = val });
                 }
@@ -1149,6 +1181,42 @@ test "composer depth boundary at the real default (1024), not a toy override" {
     try one_too_deep.append(gpa, '\n');
 
     try testing.expectError(error.TooDeep, compose(gpa, one_too_deep.items, .{}));
+}
+
+test "F10 (A1/yaml.md): a caller-raised Options.max_depth cannot push composeNode past the safe ceiling" {
+    // Before this fix, `account()` and `checkAndInsert` trusted
+    // `Options.max_depth` outright -- a caller could set it past
+    // `scanner.max_depth` (4096) and `composeNode`'s own recursion would
+    // then run deep enough to overflow Debug's native stack (SIGSEGV,
+    // measured by hand at depth 4096 while building this fix -- not
+    // reproduced here on purpose, see the reasoning below).
+    //
+    // This test proves the clamp fires WITHOUT going anywhere near that
+    // crash: it reuses `max_safe_depth + 1` levels of nesting -- the exact
+    // depth the test right above this one already recurses to (and back)
+    // safely in Debug every time the suite runs -- so recursing this far is
+    // independently known not to crash. The only thing under test is
+    // whether an inflated `Options.max_depth` lets composeNode go PAST that
+    // depth uncaught.
+    const gpa = testing.allocator;
+    const n = max_safe_depth + 1; // 1025, same depth as the test above
+
+    var doc: std.ArrayList(u8) = .empty;
+    defer doc.deinit(gpa);
+    for (0..n) |_| try doc.append(gpa, '[');
+    try doc.append(gpa, '1');
+    for (0..n) |_| try doc.append(gpa, ']');
+    try doc.append(gpa, '\n');
+
+    // Without the clamp, `max_depth = 100_000_000` would let composeNode
+    // recurse straight through depth 1025 and succeed. With the clamp,
+    // `effectiveMaxDepth()` still reports `max_safe_depth` (1024), so the
+    // 1025th level is refused exactly as it is with the default `Options{}`.
+    try testing.expectError(error.TooDeep, compose(gpa, doc.items, .{ .max_depth = 100_000_000 }));
+
+    // Positive control: a caller who sets `max_depth` BELOW the ceiling
+    // keeps their own, stricter limit -- the clamp only ever tightens.
+    try testing.expectError(error.TooDeep, compose(gpa, doc.items, .{ .max_depth = 3 }));
 }
 
 test "a malformed document still fails as a parse error" {

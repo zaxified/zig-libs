@@ -152,7 +152,9 @@ pub const HostKey = union(enum) {
 
     pub const FromOpenSSHError = rsa.FromOpenSSHError || error{
         /// The container parsed structurally but names a key type this
-        /// module does not load (only `ssh-rsa` and `ssh-ed25519`).
+        /// module does not load (only `ssh-rsa`, `ssh-ed25519`, and
+        /// `ecdsa-sha2-nistp256` — also covers an ecdsa container naming a
+        /// curve other than nistp256, since `HostKey` has no other variant).
         UnsupportedKeyType,
     };
 
@@ -167,9 +169,10 @@ pub const HostKey = union(enum) {
     /// blob for (e, n); the result is pinned to `.sha2_256` (RFC 8332 leaves
     /// the rsa-sha2-* variant to negotiation, the container does not encode
     /// it — flip `.hash` after loading for `rsa-sha2-512`). `"ssh-ed25519"`
-    /// routes to `parseEd25519OpenSSH` (unencrypted containers only — real
-    /// deployed host keys are unencrypted; an encrypted ed25519 container is
-    /// rejected with `error.UnsupportedCipher`).
+    /// routes to `parseEd25519OpenSSH`, `"ecdsa-sha2-nistp256"` to
+    /// `parseEcdsaP256OpenSSH` (both unencrypted containers only — real
+    /// deployed host keys are unencrypted; an encrypted container of either
+    /// type is rejected with `error.UnsupportedCipher`).
     pub fn fromOpenSSH(text: []const u8, passphrase: ?[]const u8) FromOpenSSHError!HostKey {
         var bin_buf: [16 * 1024]u8 = undefined;
         defer std.crypto.secureZero(u8, &bin_buf);
@@ -195,6 +198,9 @@ pub const HostKey = union(enum) {
         }
         if (std.mem.eql(u8, key_type, "ssh-ed25519")) {
             return .{ .ed25519 = try parseEd25519OpenSSH(bin, passphrase orelse "") };
+        }
+        if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp256")) {
+            return .{ .ecdsa_p256 = try parseEcdsaP256OpenSSH(bin, passphrase orelse "") };
         }
         return error.UnsupportedKeyType;
     }
@@ -400,6 +406,81 @@ pub fn parseEd25519OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.From
     // fromSecretKey re-derives the public key from the seed; require it to
     // match the container's copy.
     if (!std.mem.eql(u8, &kp.public_key.toBytes(), pub_bytes)) return error.InvalidPrivateKey;
+    return kp;
+}
+
+/// Parse an `ecdsa-sha2-nistp256` private key from an **unencrypted**
+/// openssh-key-v1 container. Same shape and same restriction as
+/// `parseEd25519OpenSSH` right above (`passphrase` accepted but never
+/// consumed; an encrypted container is `error.UnsupportedCipher`).
+///
+/// Private-keys section layout (RFC 5656 §3.1 + OpenSSH `PROTOCOL.key`):
+/// `uint32` checkint1 == `uint32` checkint2, `string` keytype
+/// `"ecdsa-sha2-nistp256"`, `string` curve name `"nistp256"`, `string` Q
+/// (uncompressed SEC1 public point — re-derived from `d` below and checked
+/// against this, not trusted directly), `string` d (the private scalar, big
+/// -endian mpint-style with an optional leading zero byte), `string`
+/// comment, then deterministic padding.
+///
+/// A1/yaml.md sibling finding — this is `A1/examples/ssh.md` S4+S5: `HostKey`
+/// already has the `.ecdsa_p256` variant and `publicBlob`/`sign` already
+/// implement it; the loader was the only gap. `example-apps/ssh-demo` grew
+/// its own copy of exactly this parser to work around it (`main.zig`'s
+/// `parseEcdsaP256OpenSSH`, marked "MODULE GAP, worked around here rather
+/// than fought") — this closes the gap at its source instead.
+pub fn parseEcdsaP256OpenSSH(bin: []const u8, passphrase: []const u8) HostKey.FromOpenSSHError!EcdsaP256.KeyPair {
+    _ = passphrase; // encrypted containers are rejected below, never decrypted
+    const hdr = try parseContainerHeader(bin);
+    if (!std.mem.eql(u8, hdr.ciphername, "none")) return error.UnsupportedCipher;
+    if (!std.mem.eql(u8, hdr.kdfname, "none") or hdr.kdfoptions.len != 0)
+        return error.InvalidOpenSSH;
+
+    var cur = WireCursor{ .b = hdr.private_section };
+    if (cur.b.len < 8) return error.InvalidOpenSSH;
+    const check1 = std.mem.readInt(u32, cur.b[0..4], .big);
+    const check2 = std.mem.readInt(u32, cur.b[4..8], .big);
+    cur.i = 8;
+    if (check1 != check2) return error.InvalidOpenSSH;
+
+    const keytype = cur.string() catch return error.InvalidOpenSSH;
+    if (!std.mem.eql(u8, keytype, "ecdsa-sha2-nistp256")) return error.UnsupportedKeyType;
+    const curve = cur.string() catch return error.InvalidOpenSSH;
+    // Only nistp256 is wired up (`HostKey` has no nistp384/521 variant) —
+    // same "unsupported, not malformed" verdict the type dispatch above uses.
+    if (!std.mem.eql(u8, curve, "nistp256")) return error.UnsupportedKeyType;
+    _ = cur.string() catch return error.InvalidOpenSSH; // Q — rebuilt from d below, not trusted
+    const d_wire = cur.string() catch return error.InvalidOpenSSH;
+    _ = cur.string() catch return error.InvalidOpenSSH; // comment
+    // Deterministic padding to the cipher block size (8 for "none") — same
+    // check as parseEd25519OpenSSH above.
+    const pad = cur.b[cur.i..];
+    if (pad.len >= 8) return error.InvalidOpenSSH;
+    for (pad, 0..) |b, i| {
+        if (b != @as(u8, @intCast(i + 1))) return error.InvalidOpenSSH;
+    }
+
+    // `d` is mpint-encoded: big-endian magnitude, with a leading zero byte
+    // only when the top bit would otherwise read as a sign bit. Strip it and
+    // right-align into the fixed-width scalar `SecretKey.fromBytes` wants.
+    var scalar: [32]u8 = @splat(0);
+    const trimmed = std.mem.trimStart(u8, d_wire, &.{0});
+    if (trimmed.len > scalar.len or trimmed.len == 0) return error.InvalidPrivateKey;
+    @memcpy(scalar[scalar.len - trimmed.len ..], trimmed);
+    defer std.crypto.secureZero(u8, &scalar);
+
+    const sk = EcdsaP256.SecretKey.fromBytes(scalar) catch return error.InvalidPrivateKey;
+    const kp = EcdsaP256.KeyPair.fromSecretKey(sk) catch return error.InvalidPrivateKey;
+    // Do not trust the parsed `d` (or the container's own `Q`, which is never
+    // even read into a value above): rebuild K_S through publicBlob and
+    // require it to equal the container's plaintext public blob byte for
+    // byte, the same cross-check `fromOpenSSH`'s rsa branch already does for
+    // (e, n) and this file's own `parseEd25519OpenSSH` does for the seed.
+    var pb_buf: [1024]u8 = undefined;
+    var pb_w: std.Io.Writer = .fixed(&pb_buf);
+    messages.writeString(&pb_w, "ecdsa-sha2-nistp256") catch unreachable;
+    messages.writeString(&pb_w, "nistp256") catch unreachable;
+    messages.writeString(&pb_w, &kp.public_key.toUncompressedSec1()) catch unreachable;
+    if (!std.mem.eql(u8, pb_w.buffered(), hdr.public_blob)) return error.InvalidPrivateKey;
     return kp;
 }
 
@@ -1185,6 +1266,22 @@ const fixture_rsa_pub_b64 =
     "ymDvOHsYCrb6Ao+cIShkyM6741njJDDx1bblJ5qGzMY3EtG16h6Tp32Uke9u2t3MwsT9yLv8" ++
     "97Ry96ijBUvD";
 
+const fixture_ecdsa_p256_key =
+    \\-----BEGIN OPENSSH PRIVATE KEY-----
+    \\b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS
+    \\1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQhQ4cvIpboplGvcFaBMW/jRedkPGqA
+    \\788x4sH6ZuTBr50cBzpO6S9EcxxJZRQ1ECG/aPPtAXnR6u2RRv87CKlWAAAAuOihgOPooY
+    \\DjAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCFDhy8iluimUa9w
+    \\VoExb+NF52Q8aoDvzzHiwfpm5MGvnRwHOk7pL0RzHEllFDUQIb9o8+0BedHq7ZFG/zsIqV
+    \\YAAAAgTLRrzZQ6+kQBqIBZfCRC//prU3BuTHo0BDNBErPc11cAAAAZemlnLWxpYnMtc3No
+    \\LXRlc3QtZml4dHVyZQECAwQFBgc=
+    \\-----END OPENSSH PRIVATE KEY-----
+    \\
+;
+const fixture_ecdsa_p256_pub_b64 =
+    "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCFDhy8iluimUa9wVoExb+NF" ++
+    "52Q8aoDvzzHiwfpm5MGvnRwHOk7pL0RzHEllFDUQIb9o8+0BedHq7ZFG/zsIqVY=";
+
 fn decodeFixturePub(b64: []const u8, buf: []u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
     const n = try dec.calcSizeForSlice(b64);
@@ -1248,6 +1345,72 @@ test "HostKey.fromOpenSSH: rsa fixture parses; K_S matches .pub; sha2-256 and sh
     }
 }
 
+test "HostKey.fromOpenSSH: ecdsa-p256 fixture parses; K_S matches ssh-keygen's .pub blob (A1/examples/ssh.md S4+S5)" {
+    // Before this fix, `HostKey.fromOpenSSH` returned `error.UnsupportedKeyType`
+    // on exactly this fixture (an `ssh-keygen -t ecdsa -b 256` container) even
+    // though `HostKey.ecdsa_p256`, `publicBlob`, and `sign` already handled
+    // the variant fully -- the loader was the only gap. `example-apps/ssh-demo`
+    // carried its own copy of this parser to work around it.
+    const t = std.testing;
+    const hk = try HostKey.fromOpenSSH(fixture_ecdsa_p256_key, null);
+    try t.expectEqualStrings("ecdsa-sha2-nistp256", hk.algorithmName());
+
+    const blob = try hk.publicBlob(t.allocator);
+    defer t.allocator.free(blob);
+    var pubbuf: [256]u8 = undefined;
+    const expected = try decodeFixturePub(fixture_ecdsa_p256_pub_b64, &pubbuf);
+    try t.expectEqualSlices(u8, expected, blob);
+
+    // Sign + verify round-trip through the wire blob, same mpint(r)||mpint(s)
+    // decode the "wire shape verifies" test below uses.
+    const pk = hk.ecdsa_p256.public_key;
+    const h = [_]u8{0x3C} ** 32;
+    const sig_blob = try hk.sign(t.allocator, &h);
+    defer t.allocator.free(sig_blob);
+    var scur = WireCursor{ .b = sig_blob };
+    try t.expectEqualStrings("ecdsa-sha2-nistp256", try scur.string());
+    const inner = try scur.string();
+    var icur = WireCursor{ .b = inner };
+    const r_m = stripLeadingZeros(try icur.string());
+    const s_m = stripLeadingZeros(try icur.string());
+    try t.expect(r_m.len <= 32 and s_m.len <= 32);
+    var rs = [_]u8{0} ** 64;
+    @memcpy(rs[32 - r_m.len .. 32], r_m);
+    @memcpy(rs[64 - s_m.len .. 64], s_m);
+    try EcdsaP256.Signature.fromBytes(rs).verify(&h, pk);
+}
+
+test "parseEcdsaP256OpenSSH: a curve other than nistp256 is UnsupportedKeyType, not accepted" {
+    // Synthetic container (same construction style as the "rejects a key
+    // type none of the three loaders handle" test above), naming a curve
+    // this module has no `HostKey` variant for. `HostKey` only carries
+    // `ecdsa_p256`, so nistp384/521 must be refused, not silently truncated
+    // or misread as p256.
+    const t = std.testing;
+    var priv_buf: [256]u8 = undefined;
+    var pw: std.Io.Writer = .fixed(&priv_buf);
+    try pw.writeAll(&[_]u8{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11 }); // checkint1 == checkint2
+    try messages.writeString(&pw, "ecdsa-sha2-nistp256");
+    try messages.writeString(&pw, "nistp384"); // wrong curve, same key-type string
+    try messages.writeString(&pw, "");
+    try messages.writeString(&pw, "");
+    try messages.writeString(&pw, ""); // comment
+    // No padding needed: "none" cipher block size is 8, and this body's
+    // length already lands on an 8-byte boundary by construction below.
+
+    var bin: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&bin);
+    try w.writeAll("openssh-key-v1\x00");
+    try messages.writeString(&w, "none");
+    try messages.writeString(&w, "none");
+    try messages.writeString(&w, "");
+    try w.writeAll(&[_]u8{ 0, 0, 0, 1 });
+    try messages.writeString(&w, ""); // public blob (unchecked before the curve check)
+    try messages.writeString(&w, pw.buffered());
+
+    try t.expectError(error.UnsupportedKeyType, parseEcdsaP256OpenSSH(w.buffered(), ""));
+}
+
 test "HostKey.sign/publicBlob: ecdsa-p256 mpint(r)||mpint(s) wire shape verifies" {
     const t = std.testing;
     var seed: [32]u8 = undefined;
@@ -1294,7 +1457,13 @@ test "parseEd25519OpenSSH rejects an encrypted container with a clear error" {
     try t.expectError(error.UnsupportedCipher, parseEd25519OpenSSH(w.buffered(), "pw"));
 }
 
-test "HostKey.fromOpenSSH rejects a non-rsa/ed25519 key type" {
+test "HostKey.fromOpenSSH rejects a key type none of the three loaders handle" {
+    // `ssh-dss` (DSA) is a real OpenSSH container key-type name this module
+    // has never implemented for any of the three loaders (rsa, ed25519,
+    // ecdsa-p256) -- unlike `ecdsa-sha2-nistp256`, which used to be this
+    // test's example before `parseEcdsaP256OpenSSH` closed A1/examples/ssh.md
+    // S4+S5 (that type now has to route to a *different* error than this
+    // one, see the fixture/mutation tests above).
     const t = std.testing;
     var bin: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&bin);
@@ -1305,7 +1474,7 @@ test "HostKey.fromOpenSSH rejects a non-rsa/ed25519 key type" {
     try w.writeAll(&[_]u8{ 0, 0, 0, 1 });
     var pb: [64]u8 = undefined;
     var pw: std.Io.Writer = .fixed(&pb);
-    try messages.writeString(&pw, "ecdsa-sha2-nistp256");
+    try messages.writeString(&pw, "ssh-dss");
     try messages.writeString(&w, pw.buffered());
     try messages.writeString(&w, "");
     // Wrap as PEM.

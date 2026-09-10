@@ -190,8 +190,10 @@ environment with OpenSSH installed.
   string length, an off-by-one length and a truncated length prefix are each `error.ProtocolError`.
 - **Transport:** KEXINIT encode/decode, KDF-formula, per-cipher packet round-trips + tamper
   detection, RFC 3526 prime bit-lengths, degenerate-DH-value rejection.
-- **Host/user keys:** `HostKey.fromOpenSSH` fixtures (ed25519 + rsa, `K_S` byte-compared against
-  `ssh-keygen`'s `.pub`), ecdsa signature wire shape, error paths.
+- **Host/user keys:** `HostKey.fromOpenSSH` fixtures (ed25519, rsa, and ecdsa-p256 — the third
+  closes A1/examples/ssh.md S4+S5, `K_S` byte-compared against `ssh-keygen`'s `.pub`), ecdsa
+  signature wire shape, error paths (including a curve other than nistp256 inside an otherwise
+  well-formed ecdsa container).
 - **Userauth units:** `signedBlob` field-order/framing assertion, session-id-changes-the-message,
   the algorithm↔key-blob-type pairing table, an ed25519 signature that verifies under its own
   session id and fails under another, the borrow-not-copy `sessionId` regression, two crafted-
@@ -254,9 +256,13 @@ Parts 1-3 are implemented. What is deliberately *not* here:
   `subsystem` and `exit-status` are implemented. NB `exit-signal` not being implemented is why
   `ExecResult.exit_status` is optional: a command killed by a signal reports no exit status.
 - **One channel per connection.** `serveSession` serves exactly one `"session"` channel and
-  returns; a second concurrent SSH_MSG_CHANNEL_OPEN is refused with `resource_shortage`. A
-  multiplexing server (a channel table, per-channel state) is the natural next step and is not
-  here.
+  returns; a second concurrent SSH_MSG_CHANNEL_OPEN is refused with `resource_shortage`
+  (likewise `unknown_channel_type` for a non-`"session"` open, `connect_failed` for a zero
+  max-packet-size peer value). A multiplexing server (a channel table, per-channel state) is
+  the natural next step and is not here. The refusal is always correct on the wire; a caller
+  who wants to *know* it happened server-side (log it, count it) sets the optional
+  `ServeConfig.on_channel_open_refused` hook (A1/examples/ssh.md S3a) — `null` by default,
+  which is silent server-side exactly as before this hook existed.
 - **Server-side stdin is batch, not a pipe.** `CommandHandler` is a one-shot function, so
   `ServeConfig.stdin_mode` chooses between buffering CHANNEL_DATA until the client's EOF and then
   running (`.collect_until_eof`, the default) or running immediately with empty stdin
