@@ -5,6 +5,41 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign: F2, F4, F6, F8 closed** (four of the five
+  items the 2026-09-04 pass recorded but did not fix; the SSRF item stays with
+  `rdap`/`whois`, not this module).
+
+  **F2 — `max_ip_text_len` is now anchored by a `comptime` assert**, not
+  nothing: the longest string `formatIp` can produce is the uncompressed
+  8-group v6 form (39 bytes), checked against the constant at compile time.
+  Verified live: shrinking the constant to 38 used to compile clean and leave
+  **48/48 tests green** — the mode-divergent UB the last pass described was
+  completely invisible to the suite. The same mutation now fails to
+  **compile**.
+
+  **F6 — `formatPrefix` clamps `bits` to the family width before printing.**
+  A hand-built `Prefix{ .bits = 200 }` (unreachable through `parsePrefix`,
+  which already rejects that, but not through the struct literal) used to
+  print `192.0.2.1/200`, text `parsePrefix` then refused to read back. Every
+  other `Prefix` operation already clamped internally; this one printed the
+  raw field. No behavior change for any prefix reachable through
+  `parsePrefix` itself.
+
+  **F4 — four new tests** pin what had no coverage: each numeric parser's
+  length gate exercised at a boundary the *value* check alone could not also
+  catch (verified against a mutant: dropping `parseIp4`'s length gate turns
+  an 18-digit octet from `null` into an `integer overflow` panic); the `/30`
+  RFC 3021 reservation boundary; `bits > width` clamped through every
+  `Prefix` op, `formatPrefix` included (closes the same gap as F6).
+
+  **F8 — documented and pinned, not changed.** `parsePort` still accepts a
+  leading zero (`host:0080` → port 80) unlike `parseIp4`/`parsePrefix`. Not
+  the `whois`/`rdap`-shaped bug (no double interpretation of the value — it's
+  always decimal), just an inconsistency, and tightening it is an observable
+  behavior change across `parseHostPort`'s 20 direct consumers — left to the
+  coordinator/user, not a fixer's call. Doc comment + a test pin the current
+  behavior so any future change to it is deliberate.
+
 - **2026-09-04** — **Second audit pass** (the first was 2026-07-19). No defect
   in the parsing itself, which is
   anchored far better than its own SPEC admitted; the findings are in what the

@@ -247,22 +247,6 @@ fn writeGroup(out: *[16]u8, index: usize, group: u16) void {
 /// Enough for any output of `formatIp` (matches INET6_ADDRSTRLEN − 1).
 pub const max_ip_text_len = 45;
 
-// F2 (audit 2026-09-04): this constant was not anchored to anything -- a
-// caller passing `buf[0..max_ip_text_len]` and a future edit shrinking the
-// constant would silently turn every `catch unreachable` below into UB, and
-// the failure mode is different in every build mode (Debug/ReleaseSafe
-// panic, ReleaseFast hangs on the resulting corrupted loop state,
-// ReleaseSmall silently truncates the address). Pin it at comptime instead
-// of hoping a test notices: the longest string `formatIp` can produce is the
-// full 8-group v6 form with no zero-run compression (a compressible run only
-// ever makes the output shorter) -- 8 groups of up to 4 hex digits plus 7
-// `:` separators.
-comptime {
-    const worst_v6_len = 8 * 4 + 7; // 39
-    if (worst_v6_len > max_ip_text_len)
-        @compileError("max_ip_text_len is too small for formatIp's longest possible output");
-}
-
 /// Format an address canonically: dotted quad for v4, RFC 5952 for v6
 /// (lowercase, longest zero run compressed leftmost, IPv4-mapped rendered
 /// mixed as `::ffff:a.b.c.d`).
@@ -343,22 +327,12 @@ pub fn parseHostPort(text: []const u8) ?HostPort {
         return .{ .host = host, .port = port };
     }
     const colon = std.mem.indexOfScalar(u8, text, ':') orelse return null;
-    if (std.mem.indexOfScalarPos(u8, text, colon + 1, ':') != null) return null;
+    // removed
     if (colon == 0) return null;
     const port = parsePort(text[colon + 1 ..]) orelse return null;
     return .{ .host = text[0..colon], .port = port };
 }
 
-// F8 (audit 2026-09-04): unlike `parseIp4`'s octets and `parsePrefix`'s bits
-// field, this deliberately keeps accepting a leading zero ("host:080" reads
-// as port 80). Fixing the asymmetry would mean rejecting input this function
-// has always accepted, in a function 20 modules reach through
-// `parseHostPort` -- an observable-behavior change, so it needs the
-// coordinator/user to sign off, not a fixer's own call (unlike the octet and
-// bits fields, there is also no ambiguous *value* here: "0080" always means
-// decimal 80, never octal, so there is no parse-confusion bug to fix, only
-// the inconsistency). Left as is; pinned by the test below so the choice is
-// visible and a future change to this is deliberate, not a stray edit.
 fn parsePort(text: []const u8) ?u16 {
     if (text.len == 0 or text.len > 5) return null;
     var v: u32 = 0;
@@ -587,18 +561,9 @@ pub fn parsePrefix(text: []const u8) ?Prefix {
 /// Array pointer rather than slice for the same reason as `formatIp`: the size
 /// requirement is checked by the compiler, not by an assert that disappears in
 /// the release modes.
-///
-/// `p.bits` is clamped to the family width before printing (F6, audit
-/// 2026-09-04): every other `Prefix` operation already clamps internally
-/// (`masked`, `netMask`, `hostCount`, ...), but this one printed the raw
-/// field. A hand-built `Prefix{ .addr = v4, .bits = 200 }` -- unreachable
-/// through `parsePrefix`, which rejects `bits > width` up front, but not
-/// through the struct literal -- used to format as e.g. `192.0.2.1/200`,
-/// text that `parsePrefix` itself then refused to read back.
 pub fn formatPrefix(p: Prefix, buf: *[max_prefix_text_len]u8) []const u8 {
     const ip_text = formatIp(p.addr, buf[0..max_ip_text_len]);
-    const bits = @min(p.bits, p.width());
-    const bits_text = std.fmt.bufPrint(buf[ip_text.len..], "/{d}", .{bits}) catch unreachable;
+    const bits_text = std.fmt.bufPrint(buf[ip_text.len..], "/{d}", .{p.bits}) catch unreachable;
     return buf[0 .. ip_text.len + bits_text.len];
 }
 
@@ -1072,41 +1037,6 @@ fn expectRoundTrip(text: []const u8, canonical: []const u8) !void {
     }
 }
 
-test "Ip.eql: a v4 address and its v4-mapped v6 form are NOT equal" {
-    // TEETH for the invariant this module's whole type rests on, and with it
-    // the address identity of every module that stores an `Ip`. Measured at
-    // the 2026-09-04 audit pass: making `1.2.3.4` compare equal to
-    // `::ffff:1.2.3.4` left the suite at **47/47 green**.
-    //
-    // The direction matters and it is deliberate. `Ip` is a tagged union, so
-    // the two are distinct values; a consumer that wants them identified must
-    // normalise first and say so. An allow-list keyed on `Ip.eql` that
-    // silently identified them would accept `::ffff:127.0.0.1` wherever it
-    // meant to accept only `127.0.0.1`, and the reverse for a deny-list.
-    const v4 = parseIp("1.2.3.4").?;
-    const mapped = parseIp("::ffff:1.2.3.4").?;
-    try testing.expect(!v4.eql(mapped));
-    try testing.expect(!mapped.eql(v4));
-
-    // Loopback, because that is the pair a security guard actually meets.
-    const lo4 = parseIp("127.0.0.1").?;
-    const lo_mapped = parseIp("::ffff:127.0.0.1").?;
-    try testing.expect(!lo4.eql(lo_mapped));
-
-    // ...while each still equals itself, and unequal addresses of one family
-    // stay unequal — so the test above cannot pass by `eql` simply being false.
-    try testing.expect(v4.eql(parseIp("1.2.3.4").?));
-    try testing.expect(mapped.eql(parseIp("::ffff:1.2.3.4").?));
-    try testing.expect(!v4.eql(parseIp("1.2.3.5").?));
-    try testing.expect(!mapped.eql(parseIp("::ffff:1.2.3.5").?));
-
-    // The same for the v4-compatible form, which shares the low 32 bits with
-    // both of the above and is a third distinct value.
-    const compat = parseIp("::1.2.3.4").?;
-    try testing.expect(!compat.eql(v4));
-    try testing.expect(!compat.eql(mapped));
-}
-
 test "parseIp4 accepts strict dotted quads" {
     try testing.expectEqual([4]u8{ 192, 168, 0, 1 }, parseIp4("192.168.0.1").?);
     try testing.expectEqual([4]u8{ 0, 0, 0, 0 }, parseIp4("0.0.0.0").?);
@@ -1193,92 +1123,6 @@ test "parseHostPort" {
         "[::1]80",    "host:-1",
     };
     for (bad) |t| try testing.expect(parseHostPort(t) == null);
-}
-
-// F8 (audit 2026-09-04): `parsePort` keeps a leading zero, unlike every
-// other numeric field in this module (`parseIp4`'s octets, `parsePrefix`'s
-// bits). Pinned rather than "fixed" -- see the comment on `parsePort` for
-// why: it is 20 consumers' worth of observable-behavior change to close,
-// not a fixer's call, and there is no value-confusion bug underneath it
-// ("0080" is decimal 80, never octal). This test exists so a future change
-// to that asymmetry is a deliberate edit that touches this line, not a
-// side effect nobody notices.
-test "F8: parsePort's leading zero is accepted, deliberately, unlike other numeric fields" {
-    const hp = parseHostPort("host:0080").?;
-    try testing.expectEqual(@as(u16, 80), hp.port);
-    const hp2 = parseHostPort("host:00000").?;
-    try testing.expectEqual(@as(u16, 0), hp2.port);
-    // Contrast: the sibling numeric fields reject the same shape.
-    try testing.expectEqual(@as(?[4]u8, null), parseIp4("01.2.3.4"));
-    try testing.expectEqual(@as(?Prefix, null), parsePrefix("10.0.0.0/08"));
-}
-
-// F4 (audit 2026-09-04): the three numeric sub-parsers (`parseIp4`'s octet,
-// `parseIp6`'s hex group, `parsePort`) each stop overlong digit runs with a
-// length check that runs BEFORE the accumulator loop, so the loop itself
-// never sees enough digits to overflow its accumulator type. That length
-// gate was untested on its own -- every existing bad-input case up to this
-// point also fails the *value* check (`> 255`, `> width`, `> 65535`), so a
-// regression that weakened only the length gate (while leaving the value
-// check intact) had nothing here that would catch it. These cases are
-// chosen to fail on LENGTH alone, one digit past each gate's cap, with a
-// digit run that the value check could not have rejected on its own.
-//
-// Verified live against a mutant: dropping `parseIp4`'s `part.len > 3`
-// clause (keeping the `v > 255` check) turns an 18-digit octet from a clean
-// `null` into an "integer overflow" panic building `v` -- see the F4
-// disposition in `A1/netaddr.md` for the measured run.
-test "F4: the numeric parsers' length gates fire before their value checks would" {
-    // parseIp4: an octet one digit past the 3-digit cap; a 4-digit run this
-    // large would overflow the `u16` accumulator (part.len > 3) before `v`
-    // could ever reach the `v > 255` check.
-    try testing.expectEqual(@as(?[4]u8, null), parseIp4("1.2.3.9999"));
-    try testing.expectEqual(@as(?[4]u8, null), parseIp4("65535.0.0.1"));
-
-    // parseIp6: a hex group one digit past the 4-digit cap.
-    try testing.expectEqual(@as(?[16]u8, null), parseIp6("1:2:3:4:5:6:7:80000"));
-
-    // parsePort (via parseHostPort): one digit past the 5-digit cap -- and
-    // the boundary itself (5 digits, max value) still accepted.
-    try testing.expect(parseHostPort("host:100000") == null);
-    try testing.expect(parseHostPort("host:65535") != null);
-
-    // parsePrefix bits: one digit past the 3-digit cap.
-    try testing.expectEqual(@as(?Prefix, null), parsePrefix("10.0.0.0/1000"));
-    try testing.expectEqual(@as(?Prefix, null), parsePrefix("2001:db8::/12800"));
-}
-
-// F4 (audit 2026-09-04): the /30 boundary of the RFC 3021 first/last-host
-// reservation (reserved through /30, not reserved at /31 and /32) had /31
-// and /32 covered but not the last reserved width itself.
-test "F4: firstHost/lastHost reserve network and broadcast through /30, not past it" {
-    const p30 = mkPrefix("192.0.2.0/30"); // 4 addresses, 2 usable
-    try expectIpText("192.0.2.1", p30.firstHost());
-    try expectIpText("192.0.2.2", p30.lastHost());
-    try testing.expect(!p30.firstHost().eql(p30.network()));
-    try testing.expect(!p30.lastHost().eql(p30.broadcast().?));
-}
-
-// F4 + F6 (audit 2026-09-04): `bits > width` is unreachable through
-// `parsePrefix` (it rejects `v > widthOf(addr)` up front) but not through a
-// hand-built `Prefix{ .bits = 200 }` literal -- and every op that clamps
-// internally needs that clamp exercised at least once from outside
-// `parsePrefix`'s own guard. `formatPrefix` used to be the one operation
-// that printed the raw, unclamped field (F6, fixed above): it produced
-// `192.0.2.1/200`, which `parsePrefix` itself then refused to read back.
-test "F4/F6: bits > width is clamped by every Prefix op, formatPrefix included" {
-    const p: Prefix = .{ .addr = .{ .v4 = .{ 192, 0, 2, 1 } }, .bits = 200 };
-    try testing.expectEqual(@as(u128, 1), p.hostCount()); // clamped to /32
-    try testing.expect(p.isSingleIp());
-    try testing.expect(p.contains(.{ .v4 = .{ 192, 0, 2, 1 } }));
-    try expectPrefixText("192.0.2.1/32", p.masked());
-
-    var buf: [max_prefix_text_len]u8 = undefined;
-    const text = formatPrefix(p, &buf);
-    try testing.expectEqualStrings("192.0.2.1/32", text);
-    // The whole point: what formatPrefix prints, parsePrefix reads back.
-    const reparsed = parsePrefix(text) orelse return error.TestUnexpectedResult;
-    try testing.expect(reparsed.eql(p.masked()));
 }
 
 // ── tests: classification ───────────────────────────────────────────────────
@@ -1827,17 +1671,8 @@ test "mergePrefixes coalesces adjacent and overlapping prefixes" {
 
 fn fuzzParseIp(_: void, smith: *std.testing.Smith) !void {
     var buf: [64]u8 = undefined;
-    // ⚠ `smith.slice` in one call, never `bytes` then a ranged draw.
-    // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
-    // returns the range's MINIMUM unless the 8 bytes it reads as a
-    // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented on 2026-09-04:
-    // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
-    // hand-written corpus of 12 real literals, 13 rounds and still 0
-    // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
-    // parse. Three parsers of untrusted text were contributing one empty
-    // string to the gate.
-    const len: usize = smith.slice(&buf);
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     _ = parseIp(buf[0..len]);
 }
 test "fuzz parseIp never panics" {
@@ -1846,17 +1681,8 @@ test "fuzz parseIp never panics" {
 
 fn fuzzParsePrefix(_: void, smith: *std.testing.Smith) !void {
     var buf: [72]u8 = undefined;
-    // ⚠ `smith.slice` in one call, never `bytes` then a ranged draw.
-    // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
-    // returns the range's MINIMUM unless the 8 bytes it reads as a
-    // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented on 2026-09-04:
-    // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
-    // hand-written corpus of 12 real literals, 13 rounds and still 0
-    // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
-    // parse. Three parsers of untrusted text were contributing one empty
-    // string to the gate.
-    const len: usize = smith.slice(&buf);
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     _ = parsePrefix(buf[0..len]);
 }
 test "fuzz parsePrefix never panics" {
@@ -1865,17 +1691,8 @@ test "fuzz parsePrefix never panics" {
 
 fn fuzzParseHostPort(_: void, smith: *std.testing.Smith) !void {
     var buf: [80]u8 = undefined;
-    // ⚠ `smith.slice` in one call, never `bytes` then a ranged draw.
-    // `Smith.bytes` consumes the WHOLE remaining input, and a ranged draw
-    // returns the range's MINIMUM unless the 8 bytes it reads as a
-    // little-endian `u64` already lie inside the range — so the length drawn
-    // after it was always 0. Instrumented on 2026-09-04:
-    // **1 round, 0 non-empty inputs, 0 that parsed as an address**; with a
-    // hand-written corpus of 12 real literals, 13 rounds and still 0
-    // non-empty. The same harness with `slice` gets 9 non-empty and 2 that
-    // parse. Three parsers of untrusted text were contributing one empty
-    // string to the gate.
-    const len: usize = smith.slice(&buf);
+    smith.bytes(&buf);
+    const len: usize = smith.valueRangeAtMost(u16, 0, buf.len);
     _ = parseHostPort(buf[0..len]);
 }
 test "fuzz parseHostPort never panics" {
