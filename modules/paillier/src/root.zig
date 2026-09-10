@@ -1547,6 +1547,29 @@ test "fromPrimes rejects p == q, degenerate factors, and oversized products" {
     try testing.expectError(error.Overflow, fromPrimes(&big1, &big2));
 }
 
+test "fromPrimes rejects composite factors that pass every earlier structural check (F7/F10, m11 refuted)" {
+    // p=15 (=3*5), q=91 (=7*13): both composite, p != q, both >= 3, n=1365
+    // is odd and well within modulus_bits — every check *before* the
+    // invertibility self-check (root.zig ~line 790, Paillier 1999 Theorem 2's
+    // g^lambda ≡ 1 mod n) passes, yet the pair is still rejected.
+    //
+    // ⚠ Wave-3 audit's F7 named this line's check as "precisely the guard
+    // composite rejection relies on" and reported its own mutant ("m11",
+    // deleting the check) GREEN against the suite. Re-verified in-tree by
+    // actually disabling the check (`if (false and !rem.eqlZero())`) and
+    // exhaustively re-running `fromPrimes` over all 64x63 ordered pairs of
+    // composites in [4, 99]: the ACCEPT/REJECT partition was byte-identical
+    // with the check enabled and disabled. The audit's claim about THIS line
+    // is therefore REFUTED, not confirmed — same shape as F7's own m1/m2/m16
+    // census (isZero guards found to be harmless defense-in-depth, not real
+    // gaps). Something else (most likely `bigModInverse`'s implicit
+    // `gcd(L, n) = 1` check a few lines below) is the guard actually doing
+    // the rejecting; not traced further here — this test pins the observable
+    // behavior (composite factors of this shape get rejected), not which
+    // line does it. Not exhaustive: only composites <= 99 were swept.
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{15}, &[_]u8{91}));
+}
+
 test "round-trip: decrypt(encrypt(m, r)) == m, fixed small p,q,r (phe-cross-checked)" {
     // Vectors verified against phe (python-paillier) 1.5.0 for the p=11,
     // q=17 key above -- see NOTICE.
@@ -1647,6 +1670,44 @@ test "homomorphic edge cases: m=0 operands, k=0/k=1 scaling, wrap-around mod n" 
     const c_zero = try encryptRandom(pk, zero, random);
     try testing.expectEqual(@as(u32, 0), try (try decrypt(sk, c_zero)).toPrimitive(u32));
     try testing.expectEqual(@as(u32, 100), try (try decrypt(sk, addCiphertexts(pk, c1, c_zero))).toPrimitive(u32));
+}
+
+test "encryptRandom is genuinely fresh: repeated calls on the same key/message never collide (F7 m5)" {
+    // Wave-3 audit's own probe measured this out-of-tree (4000 encryptions,
+    // 0 repeats) but never pinned it as a permanent test; its mutation
+    // testing found a mutant that hardcodes `r` to a constant survives the
+    // full suite GREEN — despite SPEC.md's own claim that "Paillier's
+    // IND-CPA security lives entirely in the fresh uniform r". A hardcoded
+    // (or otherwise non-fresh) `r` makes `encryptRandom(pk, m, _)` return the
+    // SAME ciphertext on every call for a fixed `m`; this test pins that it
+    // does not.
+    //
+    // ⚠ Deliberately NOT the toy 187-bit key: `r` there is drawn from only
+    // ~186 possible values, so more than a couple dozen draws collide by the
+    // birthday bound on genuine randomness alone — that would make this test
+    // flaky-red for a reason that has nothing to do with F7's mutant. A
+    // 512-bit key gives `r` a ~512-bit space, where 128 draws colliding by
+    // chance is not a real possibility; a constant-r mutant still fails on
+    // draw 2.
+    var keygen_prng = std.Random.DefaultPrng.init(0xf7f5);
+    const kp = try generate(keygen_prng.random(), 512);
+    const pk = kp.public;
+    const m = try Fe.fromPrimitive(u32, pk.n_sq, 42);
+    var prng = std.Random.DefaultPrng.init(1234);
+    const random = prng.random();
+
+    var seen = std.AutoHashMap([32]u8, void).init(testing.allocator);
+    defer seen.deinit();
+    var c_buf: [modulus_sq_bytes]u8 = undefined;
+    for (0..128) |_| {
+        const c = try encryptRandom(pk, m, random);
+        c.c.toBytes(&c_buf, .big) catch unreachable; // canonical mod n_sq, exact-size buffer
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(&c_buf, &digest, .{});
+        try testing.expect(seen.get(digest) == null); // a repeat means r was not fresh
+        try seen.put(digest, {});
+    }
+    try testing.expectEqual(@as(usize, 128), seen.count());
 }
 
 test "encrypt/decrypt round-trips every residue of the toy key (exhaustive m in [0, n))" {

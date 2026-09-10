@@ -49,6 +49,57 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     edits invalidate that pin's source digest; needs a coordinator re-pin
     before the tier-A ctgrind queue is trusted again for this module.
 
+- **2026-09-10 (mop-up)** — A1 fix campaign, closing out what wave-3 left
+  unattempted (`A1/paillier.md` F6/F7/F10; see that file's "Dispozice
+  2026-09-10 (mop-up)" for the measurements). No public signature changed.
+  - **F6 narrowed, not closed.** Its first half (the three byte-loader fuzz
+    harnesses reach only the empty-string input via a broken length draw)
+    was **already fixed, not by this session**: a different commit
+    (2026-09-07, see below) replaced `fuzzedFieldBytes` with a
+    corpus-seeded `smith.slice` before this session started — the audit's
+    own commit reference predates that fix by a month of in-repo history,
+    so this half of F6 was stale on arrival. Confirmed in-tree rather than
+    assumed: the code the finding describes (`smith.bytes` + a post-hoc
+    ranged length draw) is not present. Its second half — **`decrypt`,
+    the only entry point that processes a value from a possibly-hostile
+    counterparty, has no fuzz harness at all** — is still true (confirmed:
+    `grep -c 'test "fuzz'` finds the three byte-loader targets and no
+    fourth). Adding one needs a value oracle (compare against a second,
+    simpler decryption), not just "didn't panic" — left open, M-effort.
+  - **F7 narrowed, not closed:** added two permanent regression tests.
+    (1) `encryptRandom` freshness — pins that repeated calls on the same
+    key/message never produce the same ciphertext (kills the audit's own
+    "m5" mutant, constant `r`); RED confirmed by temporarily hardcoding
+    `sampleNonzeroLtN`'s return value (fails on the 2nd draw), GREEN
+    restored. (2) a composite-factor rejection test — but the audit's own
+    "m11" claim (that `fromPrimesImpl`'s `rem.eqlZero()` invertibility
+    check, ~line 790, is "precisely the guard composite rejection relies
+    on") turned out to be **REFUTED**: disabling that exact check and
+    exhaustively re-running `fromPrimes` over all 64×63 ordered pairs of
+    composites in [4, 99] produced a byte-identical accept/reject
+    partition with the check on and off. Something else (most likely
+    `bigModInverse`'s implicit `gcd = 1` check a few lines later) is doing
+    the actual rejecting — not traced further. The new test pins the
+    *observed* behavior (this class of composite factors is rejected), not
+    the specific line. `m7` (Miller-Rabin round count untested against a
+    weak witness), `m8` (`topBitsMatch` untested at its `generate` call
+    site) and `m9`/`m10` ("test passes by the wrong route", not confirmed
+    redundant the way `m1`/`m2`/`m16` were) remain open — each needs
+    deliberately engineered adversarial values or PRNG streams, out of this
+    session's budget.
+  - **F10 closed:** its two components were (a) a numeric characterization
+    of composite-factor garbage decryption, already documented
+    qualitatively in SPEC.md and requiring no code change, and (b) the same
+    "m11 is mutation-invisible" claim F7 addresses above — now refuted with
+    evidence rather than left as an unverified audit assertion.
+  - **F8 left open — question for the user**, not attempted: no minimum
+    key-size floor on `PublicKey.fromBytes`/`SecretKey.fromBytes`/
+    `fromPrimes` (unlike `rsa`'s 512-bit floor), but the module's own KATs
+    use an 8-bit toy key (`kat_p = 11, kat_q = 17`) — a floor would need a
+    test-only bypass or a rewritten KAT. See `A1/paillier.md`.
+  - Touches `src/root.zig` again — same stale-ctgrind-pin note as the
+    wave-3 entry above applies to these edits too.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **crt 331 / noncrt 141 / mul 12 / addm 10**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. ⭐ Confirms both leads `threshold_ecdsa` raised indirectly, and CORRECTS one: the L-function's variable-time `divFloor` is real on every run, but at `root.zig:1253`, not the `:1205`/`:1213` that report cited — `:1205` is the PUBLIC ciphertext check and correctly never fires under taint. `mulPlaintext`'s `if (k.isZero())` at `root.zig:1304` is confirmed exactly, is a direct branch on a raw secret exponent, and is **not mentioned anywhere in SPEC.md** — an undocumented gap rather than a contradicted claim. ⭐ SPEC's binomial-shortcut claim ("a possibly-secret plaintext `m` never enters a bit-scanned exponent path") is true of this module's own control flow but NOT end to end: `std.crypto.ff.Modulus.mul`'s Montgomery machinery branches on `m`, **verified by disassembly to be a real `test`/`jne` and not a `cmov`** — the first agent in this campaign to settle that question by instruction rather than argument.
 
 - **2026-09-07** — The three byte-loader fuzz targets had never parsed a field. Every draw
