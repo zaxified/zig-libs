@@ -64,13 +64,25 @@ server said.
    (downgrade) or *add* `AUTH PLAIN` to a server that never offered it. `Session.
    tlsEstablished` frees `caps`, clears `esmtp`, and moves back to the `.ehlo` state; a
    test asserts that a pre-TLS `AUTH PLAIN` claim does not survive.
-2. **Buffered plaintext across the handshake is refused.** `Client.drive` checks
+2. **Plaintext this module already holds is refused.** `Client.drive` checks
    `parser.atBoundary()` before calling the TLS hook and returns
    `error.PlaintextInjection` if anything is buffered, then discards the parser entirely.
    This is the plaintext-command-injection class (CVE-2011-0411 and its many siblings): a
    server or a man in the middle appends `250 injected\r\n` to the `220 Ready to start
    TLS`, and a client that keeps its buffer executes it as though it had arrived inside
-   TLS. A test drives exactly those bytes.
+   TLS. A test drives exactly those bytes, and a second test drives the same bytes split
+   across two `feed()` calls to show the guard does not depend on how the reply happened
+   to be chunked (F3, `~/CML/20260901-zig-libs-audit/A1/smtp.md`).
+   ⚠ **This bounds what the module can see, not what is true on the wire.** `receiveReply`
+   returns as soon as one complete reply is parsed; bytes the peer already sent but this
+   process has not yet read off the socket are invisible to `atBoundary()` — it is a
+   property of the parser's buffer, not of the connection. If those bytes arrive in a
+   *later* read, after the TLS hook has already run, they are consumed as ciphertext (a
+   real TLS record layer will reject them) rather than caught by this check. The caller's
+   TLS hook is what owns the socket at that moment; it MUST ensure nothing is waiting to
+   be read before starting the handshake (e.g. `vstream_peek`-style non-blocking peek, the
+   technique Postfix uses), because this module cannot perform that check itself — it does
+   not own the socket, only the bytes already handed to it.
 3. **`tls = .required` never continues in the clear.** No STARTTLS advertised is
    `error.TlsNotOffered`; a caller with no TLS hook is `error.TlsUnavailable`; a refused
    STARTTLS keeps the reply's transient/permanent class. Only `.opportunistic` falls back,
@@ -173,8 +185,10 @@ terminated. Two cases, both deliberate:
 ### Live interop — a real, third-party SMTP server
 
 The live test in `client.zig` is gated on `SMTP_TEST_SERVER` (plus optional
-`SMTP_TEST_USER` / `SMTP_TEST_PASSWORD` / `SMTP_TEST_CAPTURE`) and prints `SKIPPED:` and
-passes without it, the pattern used by `netconf`, `ssh` and `tc`.
+`SMTP_TEST_USER` / `SMTP_TEST_PASSWORD` / `SMTP_TEST_CAPTURE`). Without it, it is a
+loud, counted `error.SkipZigTest` — shown in the summary as "N skip", never folded
+into "pass" — and prints `SKIPPED:` only when `ZIG_LIBS_VERBOSE_SKIP` is set, the
+pattern used by `netconf`, `ssh` and `tc`.
 
 It was run, and passes, against **Python `aiosmtpd` 1.4.6** (with `atpublic` 7.0.0, on
 CPython 3.14.4) — an independent async SMTP *server* implementation — listening on
@@ -319,7 +333,8 @@ LF, every LF preceded by CR, and every line within 998), and the whole message r
 `Content-Type` parameter, two delimiters and the closer).
 
 `zig build test-smtp` is green in both `Debug` and `--release=fast`. Without a live server,
-the one live test prints `SKIPPED:` and passes; with `SMTP_TEST_SERVER` set, it runs for real.
+the one live test is a counted skip, not a pass (see "Live interop" above); with
+`SMTP_TEST_SERVER` set, it runs for real.
 
 ## Provenance
 

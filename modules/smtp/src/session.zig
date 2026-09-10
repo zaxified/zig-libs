@@ -995,6 +995,52 @@ test "STARTTLS discards the pre-TLS capabilities and re-issues EHLO" {
     try testing.expectEqual(@as(?u64, 20480000), s.caps.max_size);
 }
 
+test "F9: capabilities are cleared the instant tlsEstablished() returns, before the post-TLS EHLO reply arrives" {
+    // The audit worried that a caller driving `Session` itself (rather than
+    // through the full happy-path flow) could call `serverCapabilities()` in
+    // the window between `tlsEstablished()` and the post-TLS EHLO reply and
+    // see the attacker's pre-TLS list — and that the existing regression
+    // test ("STARTTLS discards the pre-TLS capabilities...", above) does not
+    // actually prove the discard, because `onEhlo` re-clears `caps` anyway
+    // once the real reply lands. This test inspects state right INSIDE that
+    // window, before any post-TLS reply is fed, which the other test cannot.
+    const gpa = testing.allocator;
+    var s: Session = .init(gpa, .{ .ehlo_domain = "c.example.org", .tls = .required });
+    defer s.deinit();
+    var parser: reply_mod.Parser = .init(gpa, .{}, .{});
+    defer parser.deinit();
+    const replies = [_][]const u8{
+        "220 ready\r\n",
+        // Pre-TLS, attacker-shaped: claims AUTH exists.
+        "250-mail.example.com Hello\r\n250-STARTTLS\r\n250-AUTH PLAIN\r\n250 SIZE 100\r\n",
+        "220 2.0.0 Ready to start TLS\r\n",
+    };
+    var idx: usize = 0;
+    var guard: usize = 0;
+    while (guard < 200) : (guard += 1) {
+        switch (try s.next()) {
+            .send => {},
+            .send_body => return error.TestUnexpectedResult,
+            .recv => {
+                try parser.feed(replies[idx]);
+                idx += 1;
+                const r = (try parser.next()).?;
+                try s.feedReply(r);
+            },
+            .start_tls => {
+                try s.tlsEstablished();
+                // No post-TLS EHLO reply has been fed yet -- this IS the window.
+                try testing.expect(!s.esmtp);
+                try testing.expect(!s.caps.auth.plain);
+                try testing.expectEqual(@as(?u64, null), s.caps.max_size);
+                return;
+            },
+            .done => return error.TestUnexpectedResult,
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
 test "TLS required but not offered aborts instead of continuing in the clear" {
     const gpa = testing.allocator;
     var s: Session = .init(gpa, .{ .tls = .required });
@@ -1079,6 +1125,106 @@ test "AUTH is refused on a plaintext link unless the caller opts in" {
     try testing.expectEqual(State.closed, s.state);
     // The password never reached the wire.
     try testing.expect(std.mem.indexOf(u8, sc.sent.items, "AUTH") == null);
+}
+
+// ── F5: credential zeroization, verified on the artifact ────────────────────
+//
+// `secureZero` calls exist (`auth.plainResponse` `defer`s one over its base64
+// staging buffer; `wipeOut` above zeroizes `self.out`), but nothing in the
+// suite read memory back before this test: deleting either call left the
+// whole suite green (F5, `~/CML/20260901-zig-libs-audit/A1/smtp.md`). Method:
+// scrub a stack region with 0xAA, call the function under test AT THE SAME
+// CALL DEPTH so its frame lands inside that region, then re-enter a frame of
+// the same size and count occurrences of the plaintext password. A positive
+// control that deliberately leaves the needle behind proves the scan can see
+// a leak at all -- Debug and ReleaseSafe fill `undefined` with a poison
+// pattern and would make even that positive control read 0, so this only
+// runs in ReleaseFast.
+
+const f5_pass = "Q7x-N33dl3-P4ssw0rd-Zx9";
+const f5_user = "U5r-N33dl3-Zx9";
+const f5_region = 256 * 1024;
+
+fn f5Count(hay: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or needle.len > hay.len) return 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.mem.eql(u8, hay[i..][0..needle.len], needle)) n += 1;
+    }
+    return n;
+}
+
+noinline fn f5Scrub() void {
+    var b: [f5_region]u8 = undefined;
+    @memset(&b, 0xAA);
+    std.mem.doNotOptimizeAway(&b);
+}
+
+noinline fn f5Scan() usize {
+    var b: [f5_region]u8 = undefined;
+    std.mem.doNotOptimizeAway(&b);
+    return f5Count(&b, f5_pass);
+}
+
+noinline fn f5LeakControl() void {
+    var buf: [4096]u8 = undefined;
+    @memcpy(buf[0..f5_pass.len], f5_pass);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+noinline fn f5CallPlainResponse() void {
+    var out: [256]u8 = undefined;
+    const r = auth_mod.plainResponse(&out, "", f5_user, f5_pass) catch return;
+    std.mem.doNotOptimizeAway(r.ptr);
+    std.crypto.secureZero(u8, &out); // the caller's own copy is the caller's job
+}
+
+noinline fn f5DriveSessionAuth(gpa: std.mem.Allocator) void {
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = f5_user, .password = f5_pass },
+    });
+    defer s.deinit();
+    var p: reply_mod.Parser = .init(gpa, .{}, .{});
+    defer p.deinit();
+    const script = [_][]const u8{ "220 ready\r\n", "250-x\r\n250 AUTH PLAIN\r\n", "235 ok\r\n" };
+    var idx: usize = 0;
+    var guard: usize = 0;
+    while (guard < 20) : (guard += 1) {
+        const step = s.next() catch return;
+        switch (step) {
+            .send => |b| std.mem.doNotOptimizeAway(b.ptr),
+            .recv => {
+                if (idx >= script.len) return;
+                p.feed(script[idx]) catch return;
+                idx += 1;
+                const r = (p.next() catch return) orelse return;
+                s.feedReply(r) catch return;
+            },
+            .done => return,
+            else => return,
+        }
+    }
+}
+
+test "F5 (ReleaseFast only): plaintext password does not survive on the dead stack after AUTH" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = testing.allocator;
+
+    f5Scrub();
+    f5LeakControl();
+    const positive = f5Scan();
+    try testing.expect(positive > 0); // the scan itself must be able to see a leak
+
+    f5Scrub();
+    f5CallPlainResponse();
+    try testing.expectEqual(@as(usize, 0), f5Scan());
+
+    f5Scrub();
+    f5DriveSessionAuth(gpa);
+    try testing.expectEqual(@as(usize, 0), f5Scan());
 }
 
 test "a server offering only mechanisms we cannot do is a typed error" {

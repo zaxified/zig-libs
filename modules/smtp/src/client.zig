@@ -481,6 +481,55 @@ test "STARTTLS: buffered plaintext across the handshake is refused" {
     try testing.expectEqual(@as(usize, 0), srv.tls_upgrades);
 }
 
+test "F3: bytes that land on the wire DURING the handshake are not caught by atBoundary() -- a documented gap, not a bug in this module" {
+    // `atBoundary()` (checked in `.connect`, before the TLS hook runs) is a
+    // property of THIS module's parser buffer, never of the socket. The
+    // previous test proves the guard catches an injected reply that already
+    // arrived by the time the check runs (same TCP segment as the STARTTLS
+    // reply, or an incomplete line held mid-parse). This test is the other
+    // half: bytes the peer sends WHILE the handshake itself is in flight,
+    // arriving only on the NEXT read, are invisible to a check that already
+    // ran. `Injector.upgrade` stands in for that -- the injected bytes are
+    // appended to the wire from inside the TLS hook, i.e. strictly after
+    // `atBoundary()` already returned true.
+    const gpa = testing.allocator;
+    var srv = FakeServer.init(gpa, &.{
+        "250-mail.example.com Hello\r\n250 STARTTLS\r\n", // pre-TLS EHLO
+        "220 Ready to start TLS\r\n", // STARTTLS reply, exactly this and no more
+        "250-mail.example.com Hello\r\n250 PIPELINING\r\n", // the REAL post-TLS EHLO reply
+    });
+    defer srv.deinit();
+    try srv.outbox.appendSlice(gpa, "220 ready\r\n");
+
+    const Injector = struct {
+        fn upgrade(ctx: *anyopaque) TransportError!Transport {
+            const s: *FakeServer = @ptrCast(@alignCast(ctx));
+            s.tls_upgrades += 1;
+            // The bytes a real peer already sent while the handshake was
+            // running -- this module has no way to see them until its next
+            // read, which is exactly the gap SPEC.md documents (F3).
+            s.outbox.appendSlice(s.gpa, "250 injected\r\n") catch {};
+            return s.transport();
+        }
+    };
+
+    var c = try Client.init(gpa, srv.transport(), .{
+        .session = .{ .tls = .required },
+        .tls = .{ .ctx = &srv, .upgrade = Injector.upgrade },
+    });
+    defer c.deinit();
+    // Connects "successfully": atBoundary() saw nothing buffered, because
+    // the injected bytes had not arrived yet at the moment it checked.
+    try c.connect();
+    try testing.expectEqual(@as(usize, 1), srv.tls_upgrades);
+    // The session is desynchronised: the injected reply, not the real
+    // post-TLS capability list, is what the client parsed as the EHLO
+    // answer. This is the documented limitation, not an assertion that the
+    // module is broken -- closing it is the caller's TLS hook's job (see
+    // SPEC.md "STARTTLS: three separate protections", point 2).
+    try testing.expect(!c.serverCapabilities().pipelining);
+}
+
 test "STARTTLS: a clean handshake upgrades and re-issues EHLO" {
     const gpa = testing.allocator;
     var srv = FakeServer.init(gpa, &.{
@@ -570,8 +619,11 @@ test "Client.init rejects a body_chunk too small for Stuffer.finish's worst case
 // `aiosmtpd`. SMTP_TEST_USER / SMTP_TEST_PASSWORD enable the AUTH leg, and
 // SMTP_TEST_CAPTURE names a file the server writes the received message to, so
 // the test can assert on what the server ACTUALLY got rather than on what we
-// think we sent. Without SMTP_TEST_SERVER the test prints SKIPPED and passes,
-// exactly like the live tests in `netconf`, `ssh` and `tc`.
+// think we sent. Without SMTP_TEST_SERVER the test is a loud, counted SKIP —
+// `error.SkipZigTest`, shown in the summary as "N skip", not folded into
+// "pass" — and it prints "SKIPPED: ..." only when ZIG_LIBS_VERBOSE_SKIP is
+// set, same as the live tests in `netconf`, `ssh` and `tc` (F12,
+// `~/CML/20260901-zig-libs-audit/A1/smtp.md`).
 
 fn envVar(name: []const u8) ?[]const u8 {
     return std.process.Environ.getPosix(std.testing.environ, name);

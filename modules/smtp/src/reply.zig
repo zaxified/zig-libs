@@ -217,12 +217,25 @@ pub const Parser = struct {
 
     pub fn feed(self: *Parser, bytes: []const u8) ParseError!void {
         self.compact();
-        if (self.pending.items.len + bytes.len > self.limits.max_pending) return error.PendingTooLarge;
+        const live = self.pending.items.len - self.cursor;
+        if (live + bytes.len > self.limits.max_pending) return error.PendingTooLarge;
         try self.pending.appendSlice(self.gpa, bytes);
     }
 
+    /// Amortized: `next()` calls this after EVERY line, so actually moving
+    /// bytes on every call turns one `feed` of N lines into an O(n^2) shuffle
+    /// (F1: measured 26,214x the input size in bytes moved for a single
+    /// 256 KiB read of 84-octet replies, 1,933 ms wall for 8.4 MB of them).
+    /// Only compact once the discarded prefix is at least half the buffer,
+    /// same halving rule an amortized-doubling growth strategy uses, so the
+    /// total bytes moved across a stream stay O(total bytes read), not
+    /// O(bytes read x lines seen). `pending.items.len` can therefore exceed
+    /// the live region (`cursor..len`) between compactions — every reader of
+    /// it already goes through `pending.items[cursor..]`, never the raw
+    /// length, so that is safe.
     fn compact(self: *Parser) void {
         if (self.cursor == 0) return;
+        if (self.cursor * 2 < self.pending.items.len) return;
         const rest = self.pending.items.len - self.cursor;
         std.mem.copyForwards(u8, self.pending.items[0..rest], self.pending.items[self.cursor..]);
         self.pending.shrinkRetainingCapacity(rest);
@@ -521,6 +534,70 @@ test "pending input is bounded" {
     var p: Parser = .init(gpa, .{ .max_pending = 16 }, .{});
     defer p.deinit();
     try testing.expectError(error.PendingTooLarge, p.feed("2" ** 32));
+}
+
+fn nowNsF1(_: void) u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "bench (opt-in via SMTP_BENCH_F1): total decode cost does not depend on how large a single feed() is" {
+    // Regression for the quadratic `compact()`: with an unconditional
+    // per-line compact, feeding the SAME total bytes as one huge read (many
+    // reply lines landing in `pending` at once) cost O(lines^2) inside that
+    // one `next()` drain, while feeding it a few octets at a time — where
+    // `pending` never holds more than about one line — stayed linear.
+    // Measured pre-fix (F1, `~/CML/20260901-zig-libs-audit/A1/smtp.md`):
+    // 64 B feeds 22.3 ms vs 16 KiB feeds 524.6 ms over 8.4 MB of `250\r\n`
+    // replies (28x); a 256 KiB single feed was 1,151x a 64 B one. Amortized
+    // compact (halve-the-prefix rule) makes total cost O(bytes), independent
+    // of how the caller happens to chunk its reads.
+    //
+    // Opt-in and ReleaseFast-only, same shape as `accesslog`'s bench: a
+    // wall-clock assertion in the default Debug/ReleaseSafe gate, run
+    // concurrently with up to three other agents' lanes, is a flaky test
+    // waiting to happen. Run it with:
+    //   SMTP_BENCH_F1=1 scripts/modtest smtp -Doptimize=ReleaseFast
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("SMTP_BENCH_F1") == null) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    const one = "250 x\r\n";
+    const total_replies = 20_000;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.ensureTotalCapacity(gpa, total_replies * one.len);
+    for (0..total_replies) |_| wire.appendSliceAssumeCapacity(one);
+
+    const runChunked = struct {
+        fn run(bytes: []const u8, chunk_len: usize) !u64 {
+            var p: Parser = .init(testing.allocator, .{ .max_pending = 1 << 20 }, .{});
+            defer p.deinit();
+            const start = nowNsF1({});
+            var i: usize = 0;
+            while (i < bytes.len) {
+                const end = @min(i + chunk_len, bytes.len);
+                try p.feed(bytes[i..end]);
+                i = end;
+                while (try p.next()) |_| {}
+            }
+            return nowNsF1({}) - start;
+        }
+    }.run;
+
+    // Warm up (first call pays for page faults / allocator growth on both
+    // sides equally) before the timed comparison.
+    _ = try runChunked(wire.items, 64);
+    const small = try runChunked(wire.items, 64);
+    const large = try runChunked(wire.items, 16 * 1024);
+
+    // Pre-fix this ratio measured 28x at a 16 KiB feed size and climbed to
+    // 1,151x at 256 KiB. 15x is a wide margin over shared-machine noise
+    // (the audit's own repeated-run spread was under 5%) while still
+    // failing hard on any reintroduction of per-line compaction.
+    const ratio = @as(f64, @floatFromInt(large)) / @as(f64, @floatFromInt(@max(small, 1)));
+    std.debug.print("F1 bench: small(64B)={d}ns large(16KiB)={d}ns ratio={d:.1}\n", .{ small, large, ratio });
+    try testing.expect(ratio < 15.0);
 }
 
 test "bare LF is accepted only when explicitly opted into" {

@@ -208,12 +208,22 @@ const Rendered = struct {
 /// Render `msg` into one RFC 5322 document (CRLF line endings, ready to hand to
 /// `data.writeData`). `random` supplies boundaries and, when needed, the
 /// `Message-ID`.
+/// F10: `RenderOptions.max_depth` bounds `renderPart`'s recursion, but the
+/// field itself was unbounded — a caller (or a value forwarded from
+/// untrusted config) could set it high enough to blow the stack before the
+/// check on any one call ever fires. Measured (ReleaseFast): depth 12,288
+/// still returns cleanly (~1.6 MB of stack), depth 16,384 segfaults. 512 is
+/// two orders of magnitude under that crash boundary — room for legitimate
+/// nesting on an 8 MB thread stack and still safe on a constrained one.
+const max_safe_depth: usize = 512;
+
 pub fn render(
     gpa: std.mem.Allocator,
     msg: Message,
     random: std.Random,
     opts: RenderOptions,
 ) RenderError![]u8 {
+    if (opts.max_depth > max_safe_depth) return error.DepthExceeded;
     var body = try renderPart(gpa, msg.body, random, opts, 0);
     defer body.deinit(gpa);
 
@@ -240,11 +250,18 @@ pub fn render(
     {
         var idbuf: [128]u8 = undefined;
         const id = if (msg.message_id) |m| m else generateMessageId(&idbuf, random, msg.message_id_domain) catch return error.LineTooLong;
+        // F7: `id` (and `msg.message_id_domain`, folded into it by
+        // `generateMessageId`) is routinely lifted out of a message this
+        // library did not render, so a `<` or `>` inside it would splice in
+        // a second msg-id (RFC 5322 §3.6.4 allows exactly one). CR/LF/NUL
+        // are already `writeRawHeader`'s job; angle brackets are not.
+        try checkNoAngleBrackets(id);
         var line: [256]u8 = undefined;
         const v = std.fmt.bufPrint(&line, "<{s}>", .{id}) catch return error.LineTooLong;
         mime.writeRawHeader(w, "Message-ID", v, opts.mime) catch |e| return wrap(e);
     }
     if (msg.in_reply_to) |r| {
+        try checkNoAngleBrackets(r);
         var line: [256]u8 = undefined;
         const v = std.fmt.bufPrint(&line, "<{s}>", .{r}) catch return error.LineTooLong;
         mime.writeRawHeader(w, "In-Reply-To", v, opts.mime) catch |e| return wrap(e);
@@ -253,6 +270,7 @@ pub fn render(
         var f: mime.Folder = .init(w, opts.mime);
         f.raw("References:") catch |e| return wrap(e);
         for (msg.references) |r| {
+            try checkNoAngleBrackets(r);
             var line: [256]u8 = undefined;
             const v = std.fmt.bufPrint(&line, "<{s}>", .{r}) catch return error.LineTooLong;
             for (v) |c| if (c == '\r' or c == '\n' or c == 0) return error.ControlCharacterInHeader;
@@ -342,8 +360,27 @@ fn autoTextEncoding(body: []const u8, max_line: usize) Encoding {
     return .seven_bit;
 }
 
+/// Shared by every parameter that lands inside a **quoted** header value
+/// (`charset="…"`, `boundary="…"`, `Content-Type: …` itself): a bare `"` lets
+/// the caller's value close the quote early and append parameters the caller
+/// never asked for (F4 — `~/CML/20260901-zig-libs-audit/A1/smtp.md`), on top
+/// of the CR/LF/NUL header-injection check every other field already gets.
+fn checkQuotedParam(s: []const u8) RenderError!void {
+    for (s) |c| if (c == '\r' or c == '\n' or c == 0 or c == '"') return error.ControlCharacterInHeader;
+}
+
+/// F4 sibling for the `<{s}>` shape (`Message-ID`, `In-Reply-To`,
+/// `References`, `Content-ID`): a `<` or `>` inside the caller's value lets
+/// it close the angle bracket early and append a second msg-id. CR/LF/NUL
+/// are covered separately, by `writeRawHeader` or a field-local check.
+fn checkNoAngleBrackets(s: []const u8) RenderError!void {
+    for (s) |c| if (c == '<' or c == '>') return error.ControlCharacterInHeader;
+}
+
 fn renderText(gpa: std.mem.Allocator, t: Text, opts: RenderOptions) RenderError!Rendered {
     const enc = t.encoding orelse autoTextEncoding(t.body, opts.mime.max_line);
+    try checkQuotedParam(t.subtype);
+    try checkQuotedParam(t.charset);
 
     var hw: std.Io.Writer.Allocating = .init(gpa);
     errdefer hw.deinit();
@@ -369,6 +406,13 @@ fn renderAttachment(gpa: std.mem.Allocator, a: Attachment, opts: RenderOptions) 
     for (a.filename) |c| {
         if (c == '\r' or c == '\n' or c == 0 or c == '"') return error.ControlCharacterInHeader;
     }
+    // F4: `content_type` is written UNQUOTED (it is the media type itself,
+    // not a parameter value), so a caller-controlled `"` or `;` does not
+    // even need to break out of anything — it lands as a second parameter
+    // directly. `filename` already gets this same class of check.
+    for (a.content_type) |c| {
+        if (c == '\r' or c == '\n' or c == 0 or c == '"' or c == ';') return error.ControlCharacterInHeader;
+    }
 
     var hw: std.Io.Writer.Allocating = .init(gpa);
     errdefer hw.deinit();
@@ -388,6 +432,7 @@ fn renderAttachment(gpa: std.mem.Allocator, a: Attachment, opts: RenderOptions) 
         mime.writeRawHeader(&hw.writer, "Content-Disposition", lw.buffered(), opts.mime) catch |e| return wrap(e);
     }
     if (a.content_id) |cid| {
+        try checkNoAngleBrackets(cid);
         var line: [256]u8 = undefined;
         const v = std.fmt.bufPrint(&line, "<{s}>", .{cid}) catch return error.LineTooLong;
         for (v) |c| if (c == '\r' or c == '\n' or c == 0) return error.ControlCharacterInHeader;
@@ -705,6 +750,20 @@ test "multipart/alternative nests inside multipart/mixed" {
     try mime.checkLineLengths(out, 998);
 }
 
+test "F10: an unbounded max_depth itself is refused, not just the recursion it would allow" {
+    const gpa = testing.allocator;
+    var prng = fixedRandom(6);
+    const m = Message{
+        .from = .{ .addr = "a@example.com" },
+        .date = epoch_2026,
+        .body = .{ .text = .{ .body = "x\r\n" } },
+    };
+    try testing.expectError(error.DepthExceeded, render(gpa, m, prng.random(), .{ .max_depth = 1 << 30 }));
+    // Positive control: the default and a generous-but-bounded value work.
+    const out = try render(gpa, m, prng.random(), .{ .max_depth = max_safe_depth });
+    gpa.free(out);
+}
+
 test "an empty multipart and an over-deep tree are typed errors" {
     const gpa = testing.allocator;
     var prng = fixedRandom(6);
@@ -785,6 +844,82 @@ test "header injection through subject, display name or a custom header" {
         var m = base;
         m.references = &.{"a\r\nX-Injected: yes"};
         try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    // F7: `<`/`>` in the four fields interpolated into `<{s}>` splice in a
+    // second msg-id, without needing CR/LF at all.
+    {
+        var m = base;
+        m.message_id = "a@x.test> <victim@y.test";
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.in_reply_to = "a@x.test> <victim@y.test";
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.references = &.{"a@x.test> <victim@y.test"};
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.body = .{ .attachment = .{ .filename = "a.txt", .content_id = "a@x.test> <victim@y.test", .data = "x" } };
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    // Positive control: a legitimate message-id round-trips (this is what
+    // the check above must NOT reject).
+    {
+        var m = base;
+        m.message_id = "clean-id@x.test";
+        const out = try render(gpa, m, prng.random(), .{});
+        gpa.free(out);
+    }
+}
+
+test "F4: MIME parameter injection through subtype, charset or content_type" {
+    const gpa = testing.allocator;
+    var prng = fixedRandom(8);
+    const base = Message{
+        .from = .{ .addr = "a@example.com" },
+        .date = epoch_2026,
+        .message_id = "id@example.com",
+        .body = .{ .text = .{ .body = "x\r\n" } },
+    };
+    // `charset = 'x"; boundary="B'` used to widen `Content-Type: text/plain;
+    // charset="x"; boundary="B"` with an attacker-chosen parameter.
+    {
+        var m = base;
+        m.body = .{ .text = .{ .charset = "x\"; boundary=\"B", .body = "x\r\n" } };
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.body = .{ .text = .{ .subtype = "a; charset=\"evil\"", .body = "x\r\n" } };
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.body = .{ .attachment = .{ .filename = "f", .content_type = "x\"; boundary=\"B", .data = "x" } };
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    {
+        var m = base;
+        m.body = .{ .attachment = .{ .filename = "f", .content_type = "application/pdf; evil=1", .data = "x" } };
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, m, prng.random(), .{}));
+    }
+    // Positive control: ordinary values still render.
+    {
+        var m = base;
+        m.body = .{ .text = .{ .subtype = "plain", .charset = "utf-8", .body = "x\r\n" } };
+        const out = try render(gpa, m, prng.random(), .{});
+        gpa.free(out);
+    }
+    {
+        var m = base;
+        m.body = .{ .attachment = .{ .filename = "f.pdf", .content_type = "application/pdf", .data = "x" } };
+        const out = try render(gpa, m, prng.random(), .{});
+        gpa.free(out);
     }
 }
 

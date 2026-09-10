@@ -19,8 +19,11 @@ builds `multipart/mixed` and `multipart/alternative` trees with attachments.
 - **STARTTLS is a seam, not an implementation** (CONVENTIONS.md §2). The module negotiates
   it, the caller performs the handshake and returns the upgraded transport. The pre-TLS
   capability set is **discarded** and EHLO re-issued (RFC 3207 §4.2 — trusting it is a
-  downgrade vulnerability), and any byte buffered across the handshake is
-  `error.PlaintextInjection`, not leftover data.
+  downgrade vulnerability), and any byte this module already has buffered when the
+  handshake starts is `error.PlaintextInjection`, not leftover data. That check is a
+  property of this module's own parser buffer, not of the socket: bytes the peer sent but
+  the process has not yet read are invisible to it, so the caller's TLS hook is what must
+  confirm nothing is waiting on the wire before it starts the handshake (see SPEC.md).
 - **AUTH** PLAIN (RFC 4616) and LOGIN, refused on an unencrypted link unless the caller
   sets `allow_plaintext_auth` (RFC 4954 §9).
 - **DATA transparency.** Dot-stuffing on send, un-stuffing on receive, and the `CRLF.CRLF`
@@ -214,7 +217,7 @@ covers a call. The interesting ones are `error.TransientFailure` / `error.Perman
 ## Verify
 
 ```sh
-zig build test-smtp                 # unit/golden/fuzz; the live test prints SKIPPED and passes
+zig build test-smtp                 # unit/golden/fuzz; the live test is a counted SKIP without a server
 zig build test-smtp --release=fast  # same, optimized
 
 # With a real SMTP server (see SPEC.md for a ready-made aiosmtpd oracle):

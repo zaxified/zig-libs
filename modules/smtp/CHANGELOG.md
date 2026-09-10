@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `render` now rejects a `RenderOptions.
+  max_depth` above 512 with `error.DepthExceeded` (previously unbounded — a caller-set
+  value above ~16,384 segfaulted rather than returning an error), and `Text.subtype`/
+  `Text.charset`/`Attachment.content_type` now reject `"`/`;` and `message_id`/
+  `in_reply_to`/`references`/`Attachment.content_id` now reject `<`/`>`, both previously
+  accepted and able to inject an extra MIME parameter or a second msg-id into a header a
+  caller only partly controls. `reply.Parser` no longer re-compacts its buffer on every
+  line (amortized instead), fixing an O(lines^2) cost on a single large read of many short
+  replies. No public API changed shape.
 - **2026-09-08** — Test-only, no production change: `message.fuzzRender`'s corpus carried a
   24-octet tail for the three draws behind the blob, but sixteen of those octets were
   literally `[_]u8{0} ** 16` on all ten seeds. A tail that exists is not a tail that
