@@ -1301,7 +1301,35 @@ fn fuzzHandle(_: void, smith: *std.testing.Smith) !void {
     var points = demoPoints();
     var o = try Outstation.init(.{ .common_address = 47 }, &points);
     var s = CollectSink{};
-    o.handle(buf[0..len], s.sink()) catch return;
+    const request = buf[0..len];
+
+    // Second oracle (audit F9): a bare `catch return` can see only panics —
+    // structurally blind to a legal request `handle` fails to answer (F3's
+    // shape: a decodable ASDU whose SQ=1 addresses synthesised past the
+    // encoder's own ceiling, so the decoder accepted what the encoder then
+    // refused). Walk the SAME objects `handle` itself would walk, first,
+    // with a throwaway iterator of our own: when that walk completes with
+    // no decode-time complaint at all — including the ones deliberately
+    // raised lazily per object, like `ImpossibleTime`, which is a legitimate
+    // rejection `handle` is allowed to propagate even though the header
+    // decoded fine — an error out of `handle` is now provably about
+    // `handle`'s OWN construction, not about the request, and is propagated
+    // so the fuzzer records it as a finding instead of discarding it.
+    // `SinkFull` is excluded too: `CollectSink`'s fixed capacity is a
+    // harness limit, not a defect in the module under test.
+    const request_is_well_formed = wf: {
+        const a = asdu_mod.decode(request, o.opts.params) catch break :wf false;
+        var it = a.objects();
+        while (true) {
+            const obj = it.next() catch break :wf false;
+            if (obj == null) break;
+        }
+        break :wf true;
+    };
+    o.handle(request, s.sink()) catch |err| {
+        if (request_is_well_formed and err != error.SinkFull) return err;
+        return;
+    };
 }
 
 test "corpus: every outstation seed reaches handle, and the replies are pinned" {

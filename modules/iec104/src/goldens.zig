@@ -734,12 +734,17 @@ test "goldens: every wrap_table frame decodes and the rx sequence numbers are ex
 // point (the same technique `state.zig`'s pre-existing self-only wrap test
 // already uses — `recv_seq`/`send_seq`/`ack_seq`/`last_sent_ack` are public
 // fields for exactly this). Every `rx` frame is fed through `onFrame`; `tick`
-// runs after each one, exactly as `Client.poll` does, so the w=8 ack cadence
-// the capture shows is reproduced rather than assumed. This is not
-// decode∘encode agreeing with itself — `onFrame`'s `UnexpectedSequence`
-// check is what a consistent-but-wrong wrap implementation would trip, and
-// nothing here generated the sequence numbers being checked against: a real
-// `lib60870-C` outstation did, live.
+// runs after each one, exactly as `Client.poll` does, and every `tx` entry in
+// the table is checked against whatever `tick` produced immediately before
+// it — the w=8 ack cadence the capture shows is reproduced AND compared, not
+// just run through and discarded (audit F8: an earlier version of this test
+// called `tick` for its side effects and skipped every `tx` row with
+// `if (g.dir != .rx) continue`, so the N(R) this module actually chose to
+// ack with was never checked against what the real outstation received).
+// This is not decode∘encode agreeing with itself — `onFrame`'s
+// `UnexpectedSequence` check is what a consistent-but-wrong wrap
+// implementation would trip, and nothing here generated the sequence
+// numbers being checked against: a real `lib60870-C` outstation did, live.
 test "a real outstation's session replays byte-exact through this module's own Connection, across the wrap" {
     var c = try state.Connection.init(.{}, .controlling);
     c.beginConnect(0);
@@ -756,24 +761,55 @@ test "a real outstation's session replays byte-exact through this module's own C
     // is 0 for that reason, not because it was faked here.
     c.recv_seq = wrap_start_recv_seq;
     c.last_sent_ack = wrap_start_recv_seq;
+    // The capture window does not start on a w=8 ack-cycle boundary: the
+    // real outstation's first in-window ack (N(R) 32720) lands after only 4
+    // rx rows here, not 8, and every ack after that IS 8 apart (32728,
+    // 32736, ...). So 4 I-frames were already outstanding, unacked, when
+    // this window opens -- `unacked_rx` has to be fast-forwarded too, or
+    // this replay's first ack cycle runs a full 8 and misses the captured
+    // cadence at the very first comparison.
+    c.unacked_rx = 4;
 
     var buf: [apci.max_apdu_len]u8 = undefined;
     var now: u64 = 1;
     var rx_count: usize = 0;
+    var tx_count: usize = 0;
+    // `tick` after an `rx` frame either has nothing to do (`.none`) or owes
+    // exactly one S-frame ack; the very next `tx` row in the table is that
+    // ack hitting the wire in the real capture. A second `.send_s_frame`
+    // before the pending one is checked, or a `tx` row with nothing
+    // pending, are both a cadence bug this test must catch, not step past.
+    var pending: state.Action = .none;
     for (wrap_table) |g| {
-        if (g.dir != .rx) continue;
         const raw = bytesOf(g.hex, &buf);
         const f = try apci.decode(raw);
-        const event = c.onFrame(f, now) catch |e| {
-            std.debug.print("wrap replay failed at recv_seq={d}: {t}\n", .{ c.recv_seq, e });
-            return e;
-        };
-        try testing.expect(event == .asdu);
-        rx_count += 1;
-        now += 1;
-        _ = c.tick(now); // let acks go out on the same cadence Client.poll uses
+        switch (g.dir) {
+            .rx => {
+                const event = c.onFrame(f, now) catch |e| {
+                    std.debug.print("wrap replay failed at recv_seq={d}: {t}\n", .{ c.recv_seq, e });
+                    return e;
+                };
+                try testing.expect(event == .asdu);
+                rx_count += 1;
+                now += 1;
+                const action = c.tick(now); // same cadence Client.poll drives tick on
+                if (action != .none) {
+                    try testing.expectEqual(state.Action.none, pending); // no earlier ack dropped
+                    pending = action;
+                }
+            },
+            .tx => {
+                // The N(R) this real outstation actually put on the wire,
+                // checked against what THIS module's `tick` chose for the
+                // same moment.
+                try testing.expectEqual(state.Action{ .send_s_frame = f.control.s.recv_seq }, pending);
+                pending = .none;
+                tx_count += 1;
+            },
+        }
     }
     try testing.expectEqual(wrap_table.len - 7, rx_count); // 7 tx (S-format) entries in the table
+    try testing.expectEqual(@as(usize, 7), tx_count);
     // The wrap actually happened, driven entirely by real captured N(S)
     // values, not by a hand-picked expected value.
     try testing.expectEqual(@as(apci.Seq, 5), c.recv_seq);

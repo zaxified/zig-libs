@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign, F8/F9 (test teeth).** F8: the wrap-replay golden test
+  called `state.Connection.tick` for its side effects (`_ = c.tick(now);`) and skipped every
+  `tx` row in `wrap_table` outright (`if (g.dir != .rx) continue`), so the N(R) this module
+  actually chose for its own acks was never compared against what the real `lib60870-C`
+  outstation put on the wire — the doc comment's claim that "the w=8 ack cadence the capture
+  shows is reproduced rather than assumed" was false the day it was written. The test now
+  walks the table in order, tracks `tick`'s pending `send_s_frame` action, and checks it
+  against each `tx` row's own `f.control.s.recv_seq` when that row arrives (also caught: the
+  capture window does not open on a w=8 cycle boundary — `unacked_rx` had to be fast-forwarded
+  to 4, derived from the captured cadence itself, not guessed). Verified with a mutant
+  (`+% 1` on the acked N(R)): 6/140 tests failed, including this one, at the exact
+  `expectEqual` this fix added; reverted, back to 137/140 (3 skip).
+
+  F9: `outstation.fuzzHandle` ended `o.handle(...) catch return`, so the only failure class it
+  could ever report was a panic — structurally blind to a legal, fully-decodable request that
+  `handle` itself fails to answer (F3's shape: a decoder that accepted SQ=1 addresses the
+  encoder then refused). Added a second oracle: a throwaway pre-walk of the same request
+  (`asdu.decode` + drain the object iterator) decides whether the request was well-formed
+  end-to-end, including object-level errors raised lazily per object (`ImpossibleTime`, a
+  legitimate rejection `handle` is allowed to return even though the header decoded fine);
+  when that walk is clean, any `handle` error other than the harness's own `SinkFull` capacity
+  limit is now propagated so `std.testing.fuzz` records it as a finding instead of discarding
+  it. Verified with a mutant (`onInterrogation` unconditionally returning
+  `AddressOutOfRange` for a well-formed general-interrogation request): 11/140 tests failed,
+  including the fuzz test itself, propagating the injected error through the new check;
+  reverted, back to 137/140 (3 skip). Neither mutant changed production behaviour — both were
+  reverted before commit; the numbers above are the RED/GREEN measurement the campaign
+  requires, not a shipped change.
+
 - **2026-09-07** — Fuzz reach: all four harnesses drew their input and then threw it away.
   Each opened with `smith.bytes(&buf)` followed by `smith.valueRangeAtMost(u16, 0, buf.len)`;
   a ranged draw reads eight octets as a little-endian u64 and returns the range MINIMUM when
