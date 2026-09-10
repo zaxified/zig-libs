@@ -439,30 +439,53 @@ pub const SignError = std.mem.Allocator.Error || mta.MtaError || error{
     InvalidAuxParams,
 };
 
-/// One instance of the Phase-2c CHECKED MtA (`mta.zig`'s
-/// `*Checked`/`zkproofs`'s range+MtA proofs — GG18 Appendix A.1/A.3, all
-/// REAL) between `alice_secret` (owned by the party whose `alice_pk`/
-/// `alice_sk`/`alice_aux` are passed) and `bob_secret` (owned by the
-/// counterparty, whose `bob_aux` is passed — see `zkproofs.zig`'s
-/// "verifier-vs-prover aux-param ownership" note: `bob_aux` is what BOB
-/// uses to VERIFY Alice's range proof, `alice_aux` is what ALICE uses to
-/// verify Bob's MtA proof). Returns Alice's `alpha` and Bob's `beta` with
-/// `alpha + beta ≡ alice_secret · bob_secret (mod q)`.
-fn runCheckedMtA(
+/// Alice's Phase-2c encryption of her secret, plus its range proof against
+/// `bob_aux` — factored out so ONE ordered pair `(i, j)` builds it ONCE and
+/// shares it between the pair's two conversions (γ and w), instead of each
+/// rebuilding an independent `c_a = Enc(k_i)` and an independent range
+/// proof of the SAME secret under the SAME `alice_pk`/`bob_aux` (audit F7,
+/// MED, fixed 2026-09-10). Measured cost of the duplicate this replaces:
+/// ~118 ms of ~425 ms per ordered pair (13.7% of `t=4`'s total signing
+/// time) — see the disposition in `A1/threshold_ecdsa.md` for the RED/GREEN
+/// numbers. `r_a` (Alice's Paillier encryption randomness) is SECRET and is
+/// zeroed by the caller once both conversions for this pair are done with
+/// it (`aliceRangeProofOnce`'s own doc comment on `AliceInitChecked`: "retain
+/// until the range proof has produced [it], then zero it").
+const AliceRangeProof = struct {
+    init: mta.AliceInitChecked,
+};
+
+fn aliceRangeProofOnce(
     allocator: std.mem.Allocator,
     alice_secret: Scalar,
-    bob_secret: Scalar,
     alice_pk: paillier.PublicKey,
-    alice_sk: paillier.SecretKey,
-    alice_aux: root.AuxParams,
     bob_aux: root.AuxParams,
     random: std.Random,
-) SignError!struct { alpha: Scalar, beta: Scalar } {
+) SignError!AliceRangeProof {
     const alice_init = try mta.mtaAliceInitChecked(alice_secret, alice_pk, random);
     const range_proof = try zkproofs.proveAliceRange(allocator, alice_secret, alice_init.r_a, alice_pk, bob_aux, random);
     defer range_proof.deinit(allocator);
     if (!zkproofs.verifyAliceRange(range_proof, alice_init.c_a, alice_pk, bob_aux)) return error.InvalidRangeProof;
+    return .{ .init = alice_init };
+}
 
+/// One instance of the Phase-2c CHECKED MtA (`mta.zig`'s
+/// `*Checked`/`zkproofs`'s MtA proof — GG18 Appendix A.1/A.3, all REAL)
+/// between Alice (owned by the party whose `alice_pk`/`alice_sk`/
+/// `alice_aux` are passed, and whose already-proven `alice_range` the
+/// caller built via `aliceRangeProofOnce`) and `bob_secret` (owned by the
+/// counterparty). Returns Alice's `alpha` and Bob's `beta` with
+/// `alpha + beta ≡ alice_secret · bob_secret (mod q)`.
+fn runCheckedMtA(
+    allocator: std.mem.Allocator,
+    alice_range: AliceRangeProof,
+    bob_secret: Scalar,
+    alice_pk: paillier.PublicKey,
+    alice_sk: paillier.SecretKey,
+    alice_aux: root.AuxParams,
+    random: std.Random,
+) SignError!struct { alpha: Scalar, beta: Scalar } {
+    const alice_init = alice_range.init;
     const bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
     const beta_prime = bob_resp.beta.neg();
     const mta_proof = try zkproofs.proveBobMta(allocator, bob_secret, beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, random);
@@ -480,23 +503,20 @@ fn runCheckedMtA(
 /// `*Wc`-specific finalize wrapper, so this calls the plain (semi-honest)
 /// `mta.mtaAliceFinalize` for decryption AFTER this function's own
 /// `verifyBobMtaWc` gate — equivalent fail-closed posture to
-/// `mtaAliceFinalizeChecked`, just assembled locally.
+/// `mtaAliceFinalizeChecked`, just assembled locally. `alice_range` is the
+/// SAME already-proven encryption `runCheckedMtA` used for this ordered
+/// pair (audit F7 fix) — reused, not rebuilt.
 fn runCheckedMtAwc(
     allocator: std.mem.Allocator,
-    alice_secret: Scalar,
+    alice_range: AliceRangeProof,
     bob_secret: Scalar,
     alice_pk: paillier.PublicKey,
     alice_sk: paillier.SecretKey,
     alice_aux: root.AuxParams,
-    bob_aux: root.AuxParams,
     b_point: Element,
     random: std.Random,
 ) SignError!struct { alpha: Scalar, beta: Scalar } {
-    const alice_init = try mta.mtaAliceInitChecked(alice_secret, alice_pk, random);
-    const range_proof = try zkproofs.proveAliceRange(allocator, alice_secret, alice_init.r_a, alice_pk, bob_aux, random);
-    defer range_proof.deinit(allocator);
-    if (!zkproofs.verifyAliceRange(range_proof, alice_init.c_a, alice_pk, bob_aux)) return error.InvalidRangeProof;
-
+    const alice_init = alice_range.init;
     const bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
     const beta_prime = bob_resp.beta.neg();
     const wc_proof = try zkproofs.proveBobMtaWc(allocator, bob_secret, beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point, random);
@@ -635,7 +655,15 @@ pub fn signWithShares(
             if (ii == jj) continue;
             const bob_aux = (aj_share.public_keys.get(aj_share.index) orelse return error.InvalidParameters).aux;
 
-            const gamma_res = try runCheckedMtA(allocator, eph[ii].k, eph[jj].gamma, alice_pk, alice_sk, alice_aux, bob_aux, random);
+            // Audit F7 fix (2026-09-10): ONE `c_a = Enc(k_i)` + ONE range
+            // proof for this ordered pair, shared by both conversions below
+            // — `runCheckedMtA`/`runCheckedMtAwc` each used to build and
+            // verify their own independent copy of exactly this, against
+            // the same alice_secret/alice_pk/bob_aux.
+            var alice_range = try aliceRangeProofOnce(allocator, eph[ii].k, alice_pk, bob_aux, random);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&alice_range));
+
+            const gamma_res = try runCheckedMtA(allocator, alice_range, eph[jj].gamma, alice_pk, alice_sk, alice_aux, random);
             eph[ii].delta = eph[ii].delta.add(gamma_res.alpha);
             eph[jj].delta = eph[jj].delta.add(gamma_res.beta);
 
@@ -644,7 +672,7 @@ pub fn signWithShares(
             const wj_pt = xj_pt.mul(lambda_j.toBytes(.big), .big) catch return error.IdentityPoint;
             const w_point = Element.fromPoint(wj_pt) catch return error.IdentityPoint;
 
-            const x_res = try runCheckedMtAwc(allocator, eph[ii].k, eph[jj].w, alice_pk, alice_sk, alice_aux, bob_aux, w_point, random);
+            const x_res = try runCheckedMtAwc(allocator, alice_range, eph[jj].w, alice_pk, alice_sk, alice_aux, w_point, random);
             eph[ii].sigma = eph[ii].sigma.add(x_res.alpha);
             eph[jj].sigma = eph[jj].sigma.add(x_res.beta);
         }
@@ -1105,4 +1133,61 @@ test "Ephemeral scratch: secureZero wipes the secret per-party k/gamma/w/delta/s
         try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.delta.toBytes(.big));
         try testing.expectEqualSlices(u8, &zero_scalar_bytes, &e.sigma.toBytes(.big));
     }
+}
+
+// ── fuzz coverage for the five wire-message codecs a counterparty sends
+// during signing (audit F8, MED — continued from root.zig's KeyShare
+// harness). All five are FIXED-SIZE `fromBytes([N]u8)`, unlike root.zig's
+// `fromBytesAlloc` decoders: no length to draw, so `smith.bytes` reading the
+// exact-width buffer is the whole harness — none of the "ranged draw
+// returns its minimum without a corpus" trap applies here (there is no
+// ranged draw). No corpus: these are single already-narrow types with no
+// sub-message to assemble, unlike root.zig's KeyShare/PublicKeys/AuxParams
+// (which embed real Paillier/curve material a random 4096-byte draw could
+// not plausibly stumble into) — plain arbitrary-bytes coverage is what F8
+// asks for these five.
+
+test "fuzz: GammaCommitment.fromBytes never panics (audit F8)" {
+    try testing.fuzz({}, fuzzGammaCommitmentFromBytes, .{});
+}
+fn fuzzGammaCommitmentFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [GammaCommitment.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = GammaCommitment.fromBytes(buf);
+}
+
+test "fuzz: SchnorrProof.fromBytes never panics (audit F8)" {
+    try testing.fuzz({}, fuzzSchnorrProofFromBytes, .{});
+}
+fn fuzzSchnorrProofFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [SchnorrProof.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = SchnorrProof.fromBytes(buf) catch return;
+}
+
+test "fuzz: GammaReveal.fromBytes never panics (audit F8)" {
+    try testing.fuzz({}, fuzzGammaRevealFromBytes, .{});
+}
+fn fuzzGammaRevealFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [GammaReveal.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = GammaReveal.fromBytes(buf) catch return;
+}
+
+test "fuzz: DeltaShare.fromBytes never panics (audit F8)" {
+    try testing.fuzz({}, fuzzDeltaShareFromBytes, .{});
+}
+fn fuzzDeltaShareFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [DeltaShare.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = DeltaShare.fromBytes(buf) catch return;
+}
+
+test "fuzz: SigShare.fromBytes never panics (audit F8)" {
+    try testing.fuzz({}, fuzzSigShareFromBytes, .{});
+}
+fn fuzzSigShareFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [SigShare.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = SigShare.fromBytes(buf) catch return;
 }

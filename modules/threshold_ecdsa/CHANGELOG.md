@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `signWithShares` now builds
+  Alice's Paillier encryption of her secret and its range proof ONCE per
+  ordered `(i,j)` pair and shares it between the pair's γ- and w-conversions,
+  instead of rebuilding an independent copy for each (audit F7, MED — the
+  duplicate cost every existing consumer already paid silently). Output
+  signatures are unchanged (still verify under standard ECDSA); what changes
+  is that Alice now sends Bob one Paillier ciphertext + range proof per
+  ordered pair instead of two, and per-pair wall time drops accordingly.
+  Measured (ReleaseFast, `t=2`, mean of 3 reps): **1242 ms → 1024 ms, -17.6%**.
+  Internal-only signature change (`runCheckedMtA`/`runCheckedMtAwc`, both
+  file-private) — no public API touched.
+
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds fuzz harnesses for
+  the five fixed-size wire-message codecs `signing.zig` decodes from a
+  counterparty during signing (audit F8 continued — `GammaCommitment`,
+  `SchnorrProof`, `GammaReveal`, `DeltaShare`, `SigShare`.`fromBytes`). With
+  `KeyShare.fromBytesAlloc` (closed earlier this campaign), 6 of the 12
+  originally-unfuzzed public `fromBytes*` entry points now have coverage;
+  `RangeProof`/`MtaProof`/`MtaProofWc`.`fromBytesAlloc` and
+  `ModProof`/`PrmProof`.`fromBytesAlloc` remain open. No production code
+  changed.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds a fuzz harness for
   `KeyShare.fromBytesAlloc` (audit F8, MED — 12 of 15 public `fromBytes*`
   entry points had zero fuzz coverage; this closes the highest-severity
