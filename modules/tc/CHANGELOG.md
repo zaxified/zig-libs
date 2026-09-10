@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `Socket.qdiscs`/`classes`/`filters`/`actions`
+  could double-free their result buffer and crash the process after four consecutive
+  `NLM_F_DUMP_INTR` replies from the kernel (concurrent `tc`/daemon churn on the same
+  interface, not a malicious input) — fixed, no API change. `HtbClass`/`Tbf`/`Police`'s
+  `cell_log`/`ccell_log`/`pcell_log` now reject values above 23 with the new
+  `error.InvalidCellLog` (previously `>= 32` panicked in ReleaseSafe); `deriveCellLog` itself is
+  now capped at the same 23 instead of silently overflowing its rate table for `mtu >= 2^31`.
+  `buildQdiscSet`/`buildClassSet`/`buildFilterSetWith`/`buildFilterDel` return the existing
+  `error.OptionsTooLong` for a `kind` string past netlink's attribute length limit instead of
+  panicking; `Psched.calcXmitSize` saturates instead of trapping on an overflowing
+  kernel-supplied `rate`/`ticks`/`tick_den` product. See A1/tc.md F1/F2/F5/F7/F8/F11 for the
+  measured RED→GREEN of each.
+
 - **2026-09-07** — All four fuzz targets were replaying an EMPTY payload. Each opened with
   `smith.bytes(&raw)` and then drew its length with `valueRangeAtMost`, which reads eight input
   octets as a little-endian u64 and returns the range minimum when fewer remain — so the length

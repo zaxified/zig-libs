@@ -467,8 +467,19 @@ pub const Socket = struct {
                     switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
                         .skip => {},
                         .restart => {
-                            out.deinit(self.gpa);
-                            if (attempt < max_dump_attempts) continue :retry;
+                            // Only free `out` here on the path that keeps
+                            // going (a fresh one is declared next retry
+                            // iteration, so this avoids leaking it). The
+                            // path that gives up must NOT also free it here:
+                            // `return error.InconsistentDump` still runs the
+                            // `errdefer` above, and freeing twice is a
+                            // double-free (ArrayList.deinit leaves the
+                            // receiver `undefined`, so the second call frees
+                            // a garbage pointer) -- see F1 in A1/tc.md.
+                            if (attempt < max_dump_attempts) {
+                                out.deinit(self.gpa);
+                                continue :retry;
+                            }
                             return error.InconsistentDump;
                         },
                         .done => return out.toOwnedSlice(self.gpa),
@@ -628,8 +639,17 @@ pub const Socket = struct {
                     switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
                         .skip => {},
                         .restart => {
-                            out.deinit(self.gpa);
-                            if (attempt < max_dump_attempts) continue :retry;
+                            // See the matching comment in `actions()` above:
+                            // only free `out` on the path that retries (a
+                            // fresh one is declared next iteration). The
+                            // give-up path must leave it for the `errdefer`
+                            // -- freeing here too is a double-free, since
+                            // `ArrayList.deinit` sets the receiver to
+                            // `undefined` (F1 in A1/tc.md).
+                            if (attempt < max_dump_attempts) {
+                                out.deinit(self.gpa);
+                                continue :retry;
+                            }
                             return error.InconsistentDump;
                         },
                         .done => return out.toOwnedSlice(self.gpa),

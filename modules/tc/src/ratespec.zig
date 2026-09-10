@@ -163,9 +163,21 @@ pub const Psched = struct {
     /// iproute2 `tc_calc_xmitsize`: the inverse — how many bytes fit in
     /// `ticks` at `rate` bytes/second (rounded down). Used when decoding a
     /// dumped buffer/burst back into bytes.
+    ///
+    /// `rate` and `ticks` come straight off the wire (`TCA_*_RATE64`,
+    /// `tc_htb_opt.buffer`, both kernel-controlled), so — unlike its sibling
+    /// `calcXmitTime`, which guards every multiply — this used to multiply
+    /// them unchecked. `rate * ticks * tick_den` overflows `u128` once
+    /// `tick_den` (derived from this host's `/proc/net/psched`) grows past
+    /// roughly `2^30`: `std.math.mul` here saturates the SAME way
+    /// `calcXmitTime` already does, rather than trapping. F11 in A1/tc.md.
     pub fn calcXmitSize(ps: Psched, rate: u64, ticks: u32) u64 {
         if (ps.tick_num == 0) return 0;
-        const num = @as(u128, rate) * @as(u128, ticks) * @as(u128, ps.tick_den);
+        const num = blk: {
+            const a = std.math.mul(u128, @as(u128, rate), @as(u128, ticks)) catch
+                break :blk std.math.maxInt(u128);
+            break :blk std.math.mul(u128, a, @as(u128, ps.tick_den)) catch std.math.maxInt(u128);
+        };
         const den = @as(u128, ps.tick_num) * 1_000_000;
         if (den == 0) return 0;
         const bytes = num / den;
@@ -233,14 +245,46 @@ fn adjustSize(sz_in: u32, mpu: u32, linklayer: LinkLayer) u32 {
     };
 }
 
+/// Largest legal `cell_log`/`ccell_log`/`pcell_log`: `calcRateTable` shifts
+/// `(i + 1)` (`i` up to 255, so 256) left by `cell_log` into a `u32` table
+/// entry, and `256 << 24` already overflows that `u32` (wraps to 0 rather
+/// than trapping, since `<<` is a plain bit shift, not `@shlExact`/a checked
+/// multiply). One past that, at `cell_log >= 32`, the shift amount's
+/// `@intCast` to `u5` panics outright instead. `checkCellLog` rejects both;
+/// `deriveCellLog` below just never produces more than this on its own. See
+/// F2/F7 in A1/tc.md.
+pub const max_cell_log: u8 = 23;
+
 /// Pick the cell shift the way iproute2 does when the caller did not force
 /// one: the smallest shift for which `mtu >> cell_log` fits a 256-entry
-/// table. `mtu == 0` means "use iproute2's 2047 default".
+/// table. `mtu == 0` means "use iproute2's 2047 default". Capped at
+/// `max_cell_log` — without the cap, `mtu` in `[2^31, 2^32)` derives
+/// `cell_log = 24` and the rate table's `raw` shift silently overflows
+/// `u32` (F7: `RTAB[255]` comes out `0`, not the largest entry in the
+/// table). iproute2 has the same signed-overflow bug here (`tc_core.c`
+/// uses a signed `int`), so this is a deliberate divergence, not a
+/// byte-compatibility break: no golden exercises this range (see F4), and
+/// saturating instead of wrapping is the behaviour the module's own SPEC
+/// already promises for the rate arithmetic.
 pub fn deriveCellLog(mtu_in: u32) u8 {
     const mtu = if (mtu_in == 0) 2047 else mtu_in;
     var cell_log: u8 = 0;
-    while ((mtu >> @intCast(cell_log)) > 255) cell_log += 1;
+    while (cell_log < max_cell_log and (mtu >> @intCast(cell_log)) > 255) cell_log += 1;
     return cell_log;
+}
+
+/// Validate a caller-forced `cell_log`/`ccell_log`/`pcell_log` override
+/// (`HtbClass.cell_log`, `Tbf.cell_log`, `Police.cell_log`, ... — see
+/// `max_cell_log`'s doc comment for why the range ends at 23). `null` (“let
+/// it derive from `mtu`”) always passes. Before this existed, any value
+/// `>= 32` panicked in `calcRateTable`'s `@intCast` to the shift amount's
+/// `u5` — in ReleaseSafe that is `integer does not fit in destination
+/// type`, reachable straight from `buildClassSet`/`buildQdiscSet`/
+/// `buildFilterSetWith` with no privilege needed. F2 in A1/tc.md.
+pub fn checkCellLog(v: ?u8) error{InvalidCellLog}!void {
+    if (v) |cl| {
+        if (cl > max_cell_log) return error.InvalidCellLog;
+    }
 }
 
 /// iproute2 `tc_calc_rtable`: fill a 256-entry transmit-time table and patch
@@ -331,6 +375,45 @@ test "deriveCellLog matches iproute2's mtu-driven shift" {
     try testing.expectEqual(@as(u8, 0), deriveCellLog(255));
 }
 
+test "deriveCellLog never exceeds max_cell_log, even for mtu >= 2^31 (F7)" {
+    // Before the fix this returned 24 for `mtu == 2^31`, and
+    // `calcRateTable`'s `raw = 256 << 24` silently wrapped to 0 in the last
+    // table entry. `2^31 - 1` is the audit's documented last-safe value
+    // (cell_log 23); everything at and above `2^31` used to cross into the
+    // wrap.
+    try testing.expectEqual(@as(u8, 23), deriveCellLog(2147483647)); // 2^31 - 1
+    try testing.expectEqual(@as(u8, 23), deriveCellLog(2147483648)); // 2^31
+    try testing.expectEqual(@as(u8, 23), deriveCellLog(std.math.maxInt(u32)));
+}
+
+test "checkCellLog accepts [0, max_cell_log] and null, rejects the rest (F2)" {
+    try checkCellLog(null);
+    try checkCellLog(0);
+    try checkCellLog(max_cell_log);
+    try testing.expectError(error.InvalidCellLog, checkCellLog(max_cell_log + 1));
+    // The exact value the audit crashed `calcRateTable` with (`@intCast` to
+    // the shift's `u5` panics at 32, since a `u5` only holds 0-31).
+    try testing.expectError(error.InvalidCellLog, checkCellLog(32));
+    try testing.expectError(error.InvalidCellLog, checkCellLog(200));
+    try testing.expectError(error.InvalidCellLog, checkCellLog(255));
+}
+
+test "calcRateTable stays monotonic and in range at the F7 boundary" {
+    // Regression pin for F7: with `deriveCellLog` capped, `mtu ==
+    // maxInt(u32)` must no longer produce a table whose last entry drops
+    // below its neighbour (the observed pre-fix shape was
+    // `RTAB[254] == maxInt(u32)`, `RTAB[255] == 0`).
+    const ps = golden_psched;
+    var table: [rate_table_entries]u32 = undefined;
+    var spec: RateSpec = .{ .rate = 125_000 };
+    calcRateTable(ps, &spec, &table, null, std.math.maxInt(u32), .ethernet, null);
+    try testing.expectEqual(@as(u8, max_cell_log), spec.cell_log);
+    var i: usize = 1;
+    while (i < rate_table_entries) : (i += 1) {
+        try testing.expect(table[i] >= table[i - 1]);
+    }
+}
+
 test "calcRateTable reproduces tc's tables for the captured rates" {
     const ps = golden_psched;
     var table: [rate_table_entries]u32 = undefined;
@@ -394,4 +477,16 @@ test "calcXmitSize inverts calcXmitTime closely enough to print a burst" {
     const ps = golden_psched;
     try testing.expectEqual(@as(u64, 1600), ps.calcXmitSize(125_000, 200_000));
     try testing.expectEqual(@as(u64, 4096), ps.calcXmitSize(125_000, 512_000));
+}
+
+test "calcXmitSize saturates instead of overflowing u128 on hostile wire values (F11)" {
+    // `rate` and `ticks` are kernel-controlled (TCA_*_RATE64 / tc_htb_opt.buffer
+    // read back from a dump); before the fix this multiply trapped once
+    // `tick_den` grew large enough. Reproduces the audit's exact hostile
+    // calibration: `us2t = 45_000` -> `tick_den = 4.5e10`.
+    const hostile = Psched.fromFields(1, 45_000, 1_000_000, 100);
+    const bytes = hostile.calcXmitSize(std.math.maxInt(u64), std.math.maxInt(u32));
+    try testing.expectEqual(std.math.maxInt(u64), bytes);
+    // Positive control: an ordinary calibration is unaffected.
+    try testing.expectEqual(@as(u64, 1600), golden_psched.calcXmitSize(125_000, 200_000));
 }

@@ -169,6 +169,9 @@ pub const EncodeError = std.mem.Allocator.Error || error{
     MissingMtu,
     /// A pre-encoded `raw` payload longer than one netlink attribute.
     OptionsTooLong,
+    /// `cell_log`/`ccell_log` outside `[0, ratespec.max_cell_log]` — see
+    /// `ratespec.checkCellLog`.
+    InvalidCellLog,
 };
 
 // ── netem ───────────────────────────────────────────────────────────────────
@@ -468,6 +471,8 @@ fn appendHtbClassOptions(
     ps: Psched,
 ) EncodeError!void {
     if (c.rate == 0) return error.MissingRate;
+    try ratespec.checkCellLog(c.cell_log);
+    try ratespec.checkCellLog(c.ccell_log);
     const rate64 = c.rate;
     const ceil64 = if (c.ceil == 0) rate64 else c.ceil;
 
@@ -621,6 +626,8 @@ fn appendTbfOptions(
     if (t.burst == 0) return error.MissingBurst;
     if (t.limit == 0 and t.latency_us == 0) return error.MissingLimit;
     if (t.peakrate != 0 and t.mtu == 0) return error.MissingMtu;
+    try ratespec.checkCellLog(t.cell_log);
+    try ratespec.checkCellLog(t.pcell_log);
 
     var rate_spec: RateSpec = .{
         .rate = clampRate(t.rate),
@@ -1271,6 +1278,26 @@ test "clampRate pins >= 2^32 rates to ~0U" {
     try testing.expectEqual(@as(u32, 0xFFFFFFFF), clampRate(5_000_000_000));
 }
 
+test "appendHtbClassOptions rejects cell_log/ccell_log >= 32 instead of panicking (F2)" {
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    try testing.expectError(error.InvalidCellLog, appendHtbClassOptions(
+        .{ .rate = 125_000, .cell_log = 32 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
+    try testing.expectError(error.InvalidCellLog, appendHtbClassOptions(
+        .{ .rate = 125_000, .ccell_log = 200 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
+    // Positive control: the field this guards must still work untouched.
+    try appendHtbClassOptions(.{ .rate = 125_000, .cell_log = 3 }, gpa, &list, ratespec.golden_psched);
+}
+
 test "encode/decode round-trip: htb class options" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
@@ -1383,6 +1410,18 @@ test "spec validation rejects unbuildable qdiscs before allocating" {
         ps,
     ));
     try testing.expectError(error.MissingRate, appendHtbClassOptions(.{ .rate = 0 }, gpa, &list, ps));
+    try testing.expectError(error.InvalidCellLog, appendTbfOptions(
+        .{ .rate = 1, .burst = 1, .limit = 1, .cell_log = 32 },
+        gpa,
+        &list,
+        ps,
+    ));
+    try testing.expectError(error.InvalidCellLog, appendTbfOptions(
+        .{ .rate = 1, .burst = 1, .limit = 1, .pcell_log = 40 },
+        gpa,
+        &list,
+        ps,
+    ));
     try testing.expectEqual(@as(usize, 0), list.items.len);
 }
 

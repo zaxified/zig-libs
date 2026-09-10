@@ -780,6 +780,11 @@ test "flower rejects a port match the protocol cannot carry" {
 }
 
 test "u32 rejects an oversized key list" {
+    // F5 in A1/tc.md: pin the shipped limit literally before deriving
+    // `many`'s length from the same symbol (see the equivalent action.zig
+    // pins for `max_actions`/`max_cookie_len`/`max_actions_decoded`).
+    try testing.expectEqual(@as(usize, 128), u32_max_keys);
+
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);

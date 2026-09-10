@@ -135,9 +135,21 @@ fn appendKind(
     gpa: std.mem.Allocator,
     list: *std.ArrayList(u8),
     kind: []const u8,
-) std.mem.Allocator.Error!void {
+) (std.mem.Allocator.Error || error{OptionsTooLong})!void {
+    // `kind` is caller-supplied (`QdiscSpec.raw`/`ClassSpec.raw`/
+    // `FilterSpec.raw`, `buildFilterDel`'s `kind` parameter) and, unlike the
+    // fixed protocol strings the sibling `appendAttr*` helpers in
+    // netlink/codec.zig encode, has no compile-time bound. `AttrTooLong`
+    // only trips past 65 KiB (`codec.appendAttrString`'s `u16` length
+    // field), but a caller COULD hit that -- it used to `unreachable` there,
+    // i.e. a reachable safety-build panic straight from a public entry
+    // point with no privilege needed. F8 in A1/tc.md. (A `kind` this module
+    // can decode back is bounded far tighter, at `qdisc.kind_max` = 16 --
+    // but this function only builds the wire request, so it stays
+    // permissive and lets the request-decode round-trip mismatch stand as
+    // the caller's problem, same as before.)
     codec.appendAttrString(gpa, list, qdisc.TCA.KIND, kind) catch |err| switch (err) {
-        error.AttrTooLong => unreachable, // kind strings are <= IFNAMSIZ
+        error.AttrTooLong => return error.OptionsTooLong,
         error.OutOfMemory => return error.OutOfMemory,
     };
 }
@@ -283,7 +295,7 @@ pub fn buildFilterDel(
     seq: u32,
     target: FilterTarget,
     kind: ?[]const u8,
-) std.mem.Allocator.Error![]u8 {
+) BuildError![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
     const hdr = try codec.appendHeader(
@@ -559,4 +571,50 @@ test "filter requests put prio + protocol in tcm_info, not in an attribute" {
     defer gpa.free(req);
     const info = std.mem.readInt(u32, req[codec.header_len + 16 ..][0..4], native_endian);
     try testing.expectEqual(@as(u32, 0x0002dd86), info);
+}
+
+test "an oversized raw kind returns OptionsTooLong instead of panicking (F8)" {
+    // `appendKind` used to `unreachable` on `codec.appendAttrString`'s
+    // `AttrTooLong` (a caller-suppliable `[]const u8` was assumed to always
+    // be <= IFNAMSIZ, but nothing enforced that). A kind past the netlink
+    // attribute's 16-bit length field used to be a reachable safety-build
+    // panic; it must now surface as an ordinary error. Every entry point
+    // that (optionally) sends TCA_KIND is covered: qdisc/class/filter set,
+    // and filter del's optional `kind`.
+    const gpa = testing.allocator;
+    const huge_kind = try gpa.alloc(u8, 70_000);
+    defer gpa.free(huge_kind);
+    @memset(huge_kind, 'a');
+
+    try testing.expectError(error.OptionsTooLong, buildQdiscSet(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = 1, .handle = Handle.init(1, 0), .parent = Handle.root },
+        .{ .raw = .{ .kind = huge_kind } },
+        Psched.fallback,
+    ));
+    try testing.expectError(error.OptionsTooLong, buildClassSet(
+        gpa,
+        1,
+        .add,
+        .{ .ifindex = 1, .handle = Handle.init(1, 1), .parent = Handle.init(1, 0) },
+        .{ .raw = .{ .kind = huge_kind } },
+        Psched.fallback,
+    ));
+    try testing.expectError(error.OptionsTooLong, buildFilterDel(
+        gpa,
+        1,
+        .{ .ifindex = 1, .parent = Handle.init(1, 0), .prio = 1, .eth_type = filter.ETH_P.IP },
+        huge_kind,
+    ));
+
+    // Positive control: an ordinary short kind still goes through fine.
+    const req = try buildFilterDel(
+        gpa,
+        1,
+        .{ .ifindex = 1, .parent = Handle.init(1, 0), .prio = 1, .eth_type = filter.ETH_P.IP },
+        "flower",
+    );
+    gpa.free(req);
 }

@@ -299,6 +299,9 @@ pub const EncodeError = std.mem.Allocator.Error || error{
     MissingMtu,
     /// A pre-encoded `raw` payload longer than one netlink attribute.
     OptionsTooLong,
+    /// `cell_log`/`pcell_log` outside `[0, ratespec.max_cell_log]` — see
+    /// `ratespec.checkCellLog`.
+    InvalidCellLog,
 };
 
 // ── gact ────────────────────────────────────────────────────────────────────
@@ -704,6 +707,8 @@ fn appendPoliceOptions(
     if (p.rate == 0) return error.MissingRate;
     if (p.burst == 0) return error.MissingBurst;
     if (p.peakrate != 0 and p.mtu == 0) return error.MissingMtu;
+    try ratespec.checkCellLog(p.cell_log);
+    try ratespec.checkCellLog(p.pcell_log);
 
     var rate_spec: RateSpec = .{
         .rate = clampRate(p.rate),
@@ -1198,6 +1203,31 @@ test "action attribute constants agree with the kernel UAPI" {
     try testing.expectEqual(@as(usize, 4), tcamsg_len);
 }
 
+test "action.copyKind: kind_max is the delivered 16-byte TCA_KIND budget, and the boundary is exact" {
+    // F5 in A1/tc.md: `copyKind` exists twice, character-for-character
+    // identical, in `qdisc.zig` (pinned by an equivalent test there since
+    // 2026-08-11) and here in `action.zig` -- and this one had NO dedicated
+    // test, so mutating ITS bound (`s.len > kind_max`) went undetected.
+    // 16 pinned literally, same reasoning as the qdisc.zig test: a change to
+    // the constant must be caught here, not read off the symbol it is
+    // checked against.
+    try testing.expectEqual(@as(usize, 16), kind_max);
+
+    var buf: [kind_max]u8 = undefined;
+    var len: u8 = 0;
+
+    // Exactly at the boundary: accepted.
+    const at_boundary = "0123456789abcdef"; // 16 bytes
+    try testing.expectEqual(@as(usize, 16), at_boundary.len);
+    try copyKind(&buf, &len, at_boundary);
+    try testing.expectEqualStrings(at_boundary, buf[0..len]);
+
+    // One byte over: rejected, not truncated.
+    const over_boundary = "0123456789abcdefg"; // 17 bytes
+    try testing.expectEqual(@as(usize, 17), over_boundary.len);
+    try testing.expectError(error.BadLength, copyKind(&buf, &len, over_boundary));
+}
+
 test "TC_ACT verdicts round-trip through the non-exhaustive enum" {
     try testing.expectEqual(@as(i32, -1), Verdict.unspec.raw());
     try testing.expectEqual(@as(i32, 0), Verdict.ok.raw());
@@ -1270,6 +1300,12 @@ test "an empty action list appends nothing" {
 }
 
 test "action list rejects more than TCA_ACT_MAX_PRIO entries" {
+    // F5 in A1/tc.md: pinned literally FIRST, so a change to `max_actions`
+    // itself is caught here rather than only read back off the symbol the
+    // rest of this test derives `many`'s length from (a self-referential
+    // `max_actions + 1` moves both sides of the comparison together).
+    try testing.expectEqual(@as(usize, 32), max_actions);
+
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
@@ -1284,6 +1320,10 @@ test "action list rejects more than TCA_ACT_MAX_PRIO entries" {
 }
 
 test "a cookie longer than TC_COOKIE_MAX_SIZE is rejected before any output" {
+    // F5: same reasoning as `max_actions` above -- pin the shipped limit
+    // literally before using the symbol to build the oversized input.
+    try testing.expectEqual(@as(usize, 16), max_cookie_len);
+
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
@@ -1317,10 +1357,32 @@ test "police validates rate/burst/mtu before allocating" {
         &list,
         ratespec.golden_psched,
     ));
+    // F2: a caller-supplied cell_log >= 32 used to panic inside
+    // `calcRateTable`'s `@intCast` to the shift amount's `u5`, in
+    // ReleaseSafe -- reachable straight from this public entry point, no
+    // privilege needed. `cell_log` and `pcell_log` are both wired.
+    try testing.expectError(error.InvalidCellLog, appendPoliceOptions(
+        .{ .rate = 125_000, .burst = 1024, .cell_log = 64 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
+    try testing.expectError(error.InvalidCellLog, appendPoliceOptions(
+        .{ .rate = 125_000, .burst = 1024, .peakrate = 250_000, .mtu = 1500, .pcell_log = 32 },
+        gpa,
+        &list,
+        ratespec.golden_psched,
+    ));
     try testing.expectEqual(@as(usize, 0), list.items.len);
 }
 
 test "encode/decode round-trip: every modelled action kind" {
+    // F5: pin `max_actions_decoded` literally before this test relies on it
+    // below (`expectEqual(@as(u8, max_actions_decoded), decoded.len)` was
+    // comparing the symbol to itself -- a change to the constant moved both
+    // sides together and the assertion stayed green).
+    try testing.expectEqual(@as(u8, 4), max_actions_decoded);
+
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(gpa);
