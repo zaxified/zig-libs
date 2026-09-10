@@ -321,9 +321,10 @@ pub const Document = struct {
     /// Look up an element by its ID value. An attribute is treated as an ID if
     /// it is `xml:id` (the xml-namespace `id`) or its unqualified local name is
     /// one of `Options.id_attr_names` (default `ID`/`Id`/`id`). First match in
-    /// document order wins. The xmldsig layer resolving `URI="#foo"` uses this;
-    /// for signature-wrapping-safe lookup it may prefer `findByAttr` with the
-    /// exact ID attribute name it expects.
+    /// document order wins, but a SECOND declaration of the same ID is
+    /// rejected at parse time (`error.DuplicateId`), so reaching this call
+    /// means the value is unique among the ID-typed attributes this parse
+    /// recognized. The xmldsig layer resolving `URI="#foo"` uses this.
     pub fn getElementById(self: *const Document, id: []const u8) ?*Element {
         return self.ids.get(id);
     }
@@ -331,7 +332,18 @@ pub const Document = struct {
     /// Depth-first search for the first element carrying an attribute
     /// (`uri`,`local`) equal to `value`. `uri == ""` matches an unprefixed
     /// attribute. Gives the dsig layer full control over which attribute is the
-    /// ID, independent of the ID heuristic.
+    /// ID, independent of the ID heuristic — in particular, a PREFIXED
+    /// attribute (e.g. `s:ID` under a non-default namespace) is never treated
+    /// as ID-typed by `getElementById`/`DuplicateId`, only by this call.
+    ///
+    /// ⚠ Unlike `getElementById`, this does NOT check for a second element
+    /// with the same (uri, local, value): it returns the first match in
+    /// document order and is silent about whether a later one exists. A
+    /// caller for whom a second, uninspected match would be a forged
+    /// signature-wrapping envelope (the property `getElementById` gets from
+    /// the parser's `DuplicateId` guard) MUST enforce uniqueness itself before
+    /// trusting the result — see `xmldsig`'s own `resolveReference`, which
+    /// does exactly that and does not rely on this function for it.
     pub fn findByAttr(self: *const Document, uri: []const u8, local: []const u8, value: []const u8) ?*Element {
         return findByAttrRec(self.root, uri, local, value);
     }
@@ -385,9 +397,14 @@ pub const Options = struct {
     /// and reached 163 MB from ~1.5 KB of query string, pre-authentication.
     ///
     /// 1,048,576 is generous for every document this repo parses (a SAML
-    /// response is hundreds of elements) while keeping the worst case around
-    /// 160 MB rather than unbounded. A caller facing untrusted input should set
-    /// it far lower.
+    /// response is hundreds of elements) while keeping the worst case
+    /// **bounded rather than unbounded**. ⚠ That worst case is higher than
+    /// the three-row table above might suggest by extrapolation: it is NOT
+    /// ~160 MB. Measured directly at the cap (peak LIVE bytes, `page_allocator`,
+    /// ReleaseFast, one well-formed `<r>`-wrapped document of exactly
+    /// 1,048,576 elements, 4,194,307 B source): **367,223,862 B (~350 MiB)**.
+    /// A caller facing untrusted input should set it far lower — `saml` sets
+    /// 8192.
     max_elements: usize = 1 << 20,
     /// Maximum number of attributes on a single element.
     max_attributes: usize = 4096,
