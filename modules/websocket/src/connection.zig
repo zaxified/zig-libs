@@ -51,6 +51,21 @@ pub const Connection = struct {
     /// Frames consumed by the message currently being reassembled
     /// (including the initial one); reset when a message starts or ends.
     fragment_count: u32 = 0,
+    /// F9 remainder (this module's audit): `DataAfterClose` bounds DATA
+    /// frames arriving after `close_received`, but control frames (ping,
+    /// a second close) still flowed through unbounded -- measured: 10^6
+    /// PINGs after `close_received` produced 10^6 `.ping` events and 0
+    /// errors. RFC 6455 §1.4 says a peer "discards any further data
+    /// received" once it has seen a close frame; this caps how many
+    /// FRAMES of any kind may still arrive afterward before that is
+    /// enforced as a protocol violation instead of served forever.
+    /// Generous default: a well-behaved peer sends little more than its
+    /// own close frame (plus maybe one in-flight ping/pong) once it has
+    /// seen ours.
+    max_frames_after_close: u32 = 1 << 12,
+    /// Frames received while `close_received` was already true (the frame
+    /// that SETS `close_received` does not count itself).
+    frames_after_close: u32 = 0,
 
     pub fn init(role: frame.Role, message_buf: []u8, max_frame_size: u64) Connection {
         return .{ .role = role, .max_frame_size = max_frame_size, .message_buf = message_buf };
@@ -106,6 +121,11 @@ pub const Connection = struct {
         /// W3-websocket-F4: the reassembled message has consumed more than
         /// `max_fragments` frames. Close 1009.
         TooManyFragments,
+        /// F9 remainder: more than `max_frames_after_close` frames (of any
+        /// kind, including control frames) arrived after `close_received`
+        /// was already set. Close 1002 (falls through `closeCode`'s
+        /// default, same as `DataAfterClose`).
+        TooManyFramesAfterClose,
     };
 
     /// Feed the next available bytes. Consumes at most one frame per call
@@ -136,6 +156,18 @@ pub const Connection = struct {
             .need_more => return .{ .event = .need_more, .consumed = 0 },
             .frame => |f| f,
         };
+
+        // F9 remainder: bound frames of ANY kind (control included) once
+        // the peer has already told us it is closing. Checked before
+        // control-frame dispatch below, so it catches ping/pong/a second
+        // close too, not just data frames (`DataAfterClose` already
+        // covers those). The frame that SETS `close_received` (the first
+        // close) is not itself counted -- `self.close_received` is still
+        // false when it arrives here.
+        if (self.close_received) {
+            self.frames_after_close += 1;
+            if (self.frames_after_close > self.max_frames_after_close) return error.TooManyFramesAfterClose;
+        }
 
         if (parsed.opcode.isControl()) {
             return switch (parsed.opcode) {
@@ -732,6 +764,52 @@ test "a data frame after close_received is rejected, not delivered (close 1002)"
 
     var cont_wire = unmaskedFrame(0x80, "hi", 4);
     try testing.expectError(error.DataAfterClose, conn.receive(&cont_wire));
+}
+
+// F9 remainder (this module's audit): `DataAfterClose` only ever bounded
+// DATA frames. Control frames (ping, a second close) kept flowing through
+// after `close_received` with no cap at all -- the audit measured 10^6
+// PINGs producing 10^6 `.ping` events and 0 errors. This is the same shape
+// as `max_fragments` (F4): a cap on frame COUNT, not on any one frame's
+// size, since no individual frame here is oversized.
+test "frames after close_received are bounded, including control frames (close 1002)" {
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    conn.max_frames_after_close = 2;
+
+    var close_wire = [_]u8{ 0x88, 0x00 }; // close, no code/reason -- does not itself count
+    const r1 = try conn.receive(&close_wire);
+    try testing.expect(r1.event == .close);
+    try testing.expect(conn.close_received);
+    try testing.expectEqual(@as(u32, 0), conn.frames_after_close);
+
+    var ping1 = [_]u8{ 0x89, 0x00 }; // ping, fin=1, empty -- 1st frame after close (at the cap)
+    try testing.expect((try conn.receive(&ping1)).event == .ping);
+
+    var ping2 = [_]u8{ 0x89, 0x00 }; // 2nd frame after close (at the cap)
+    try testing.expect((try conn.receive(&ping2)).event == .ping);
+
+    var ping3 = [_]u8{ 0x89, 0x00 }; // 3rd frame after close -- over the cap
+    try testing.expectError(error.TooManyFramesAfterClose, conn.receive(&ping3));
+    try testing.expectEqual(@as(u16, 1002), frame.closeCode(error.TooManyFramesAfterClose));
+}
+
+// Positive control: well under the cap, frames after close keep being
+// served normally (not rejected wholesale the moment close is received).
+test "positive control: a couple of frames after close still deliver normally" {
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    // Default cap (1 << 12): nowhere near tripped by two frames.
+
+    var close_wire = [_]u8{ 0x88, 0x00 };
+    _ = try conn.receive(&close_wire);
+
+    var ping_wire = [_]u8{ 0x89, 0x02, 'h', 'i' };
+    const r = try conn.receive(&ping_wire);
+    switch (r.event) {
+        .ping => |p| try testing.expectEqualStrings("hi", p),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "unmasked client frame is rejected through the Connection too (close 1002)" {
