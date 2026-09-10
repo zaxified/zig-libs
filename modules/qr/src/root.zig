@@ -170,7 +170,11 @@ pub const Matrix = struct {
 };
 
 /// Encode `text` into `out`. Allocates nothing: `out` is the only storage the
-/// caller provides, and everything else lives on this frame.
+/// caller provides, and everything else lives on this frame — which is not
+/// small. Measured (`A1/qr.md` F5, native Debug, version 40 / ECC high): a
+/// 40 KB call stack still overflows, a 64 KB one does not. A caller on a
+/// constrained thread (a thread pool sized for a small default, a `wasm32`
+/// host with its own limit) should give this call at least that much room.
 pub fn encode(out: *Matrix, text: []const u8, opts: Options) Error!void {
     return encodeOne(out, text, opts, null);
 }
@@ -1067,6 +1071,9 @@ pub fn decode(m: *const Matrix, out: []u8) DecodeError![]u8 {
 /// and the parity check is what distinguishes "a symbol is missing" from "two
 /// different sequences were scanned into the same buffer", which an index and a
 /// count cannot.
+///
+/// Like `encode`, this frame is not small — see its doc comment for the
+/// measured stack floor (F5).
 pub fn decodePart(m: *const Matrix, out: []u8) DecodeError!Part {
     if (m.size < 21 or m.size > max_size or (m.size - 17) % 4 != 0) return DecodeError.BadSize;
     const version: u6 = @intCast((m.size - 17) / 4);
@@ -1674,6 +1681,33 @@ test "corpus: every encode seed reaches the encoder, and the symbols built are p
     try std.testing.expectEqual(@as(usize, 21), encoded);
     try std.testing.expectEqual(@as(usize, 4), versions);
     try std.testing.expectEqual(@as(usize, 21), round_tripped);
+}
+
+// F8: every golden vector in `golden_test.zig` forces `.mask`, so nothing in
+// the suite ever exercises `pickMask`/`penalty` choosing on its own -- a
+// regression there (wrong rule, wrong tie-break, wrong `< ` vs `<=`) changes
+// which mask a real caller gets and nothing catches it. This is not a
+// standard byte-for-byte anchor (no independent encoder to compare against
+// forces a *specific* auto choice, only that its own penalty score is no
+// worse than a hand implementation's -- see the audit's three-way vote in
+// `A1/qr.md` F8), so it pins today's own output instead: a behavior change
+// in the tie-break or a scoring rule is still caught, because the winner
+// moves.
+test "auto-selected mask is pinned across a spread of inputs (F8 anchor)" {
+    const Case = struct { text: []const u8, ecc: Ecc, version: ?u6, want_mask: u3 };
+    const cases = [_]Case{
+        .{ .text = "HELLO WORLD", .ecc = .low, .version = null, .want_mask = 7 },
+        .{ .text = "0123456789012345", .ecc = .medium, .version = null, .want_mask = 6 },
+        .{ .text = "https://example.com/path?q=1", .ecc = .quartile, .version = null, .want_mask = 7 },
+        .{ .text = "A", .ecc = .high, .version = 1, .want_mask = 4 },
+        .{ .text = "A", .ecc = .low, .version = 40, .want_mask = 2 },
+        .{ .text = "P\xc5\x99\xc3\xadli\xc5\xa1 \xc5\xbelu\xc5\xa5ou\xc4\x8dk\xc3\xbd k\xc5\xaf\xc5\x88", .ecc = .medium, .version = null, .want_mask = 2 },
+    };
+    var m: Matrix = undefined;
+    for (cases) |c| {
+        try encode(&m, c.text, .{ .ecc = c.ecc, .version = c.version });
+        try std.testing.expectEqual(c.want_mask, m.mask);
+    }
 }
 
 test "round trip: every mode, every level, across the version range" {

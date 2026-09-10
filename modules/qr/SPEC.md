@@ -89,6 +89,13 @@ against 1–40, and a length that does not fit is refused rather than truncated,
 which matters because a truncated QR code still scans and reads as a shorter
 message.
 
+**"Allocates nothing" moves the cost onto the call stack, and it is not
+small.** Measured (F5, native Debug, `encode`+`decode` at version 40 / ECC
+high, one call each on their own thread): a 40 KB thread stack overflows, a
+64 KB one does not. A caller running this on a thread with a small or
+explicitly sized stack — a thread pool, a `wasm32` host with its own limit —
+should budget at least 64 KB for either call.
+
 **The SVG renderer emits caller strings into a document.** The two colours and
 the `<title>` are XML-escaped, because the expected shape of this module in a web
 service is "text arrives in a request, comes back as a code" and the title is

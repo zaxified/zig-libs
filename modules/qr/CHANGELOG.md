@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign, F5 and F8.** Neither is a defect in the encoder or
+  decoder's output, both are missing anchors.
+
+  F5: `encode`/`decode` doc comments and SPEC's threat-model paragraph now say what
+  "allocates nothing" costs on the CALLER's stack instead of leaving it unstated. Measured
+  fresh (not reused from the 2026-09-03 audit number): a temporary thread-stack probe calling
+  `encode`+`decode` at version 40 / ECC high, native Debug — 24 KB and 40 KB both overflow
+  (clean `SIGSEGV`, Zig's own guard page), 64 KB does not. The probe was removed after
+  measuring; the number lives in the doc comment and SPEC now, not in a permanent test (this
+  module also targets `wasm32`, where `std.Thread` does not exist).
+
+  F8: `pickMask`/`penalty` (ISO/IEC 18004 §8.8.2 mask scoring) had no test that let the
+  auto-selection choose anything — every golden vector forces `.mask`. Added
+  `"auto-selected mask is pinned across a spread of inputs (F8 anchor)"`, pinning today's own
+  choice across six texts/versions/ECC levels (no independent encoder forces a *specific*
+  choice the way the golden byte-comparison does — see the audit's three-way mask vote, which
+  found this module is not an outlier). Verified as a real anchor, not a tautology: mutating
+  rule 1's run-length weight (`score += 3` -> `score += 30`) turns the pinned test red
+  (`expected 2, found 4`); reverted, green again.
+
+  Also closed without a code change: F1 (all four fuzz harnesses collapsing to one fixed
+  input) was already fixed by `75f09601` before this campaign started — confirmed by diffing
+  `75f09601^` against today's tree and `git merge-base --is-ancestor 75f09601 HEAD`. The
+  post-Forney re-check note (never observed firing in the audit's 3.4M-block sweep) is left
+  open: constructing a Reed-Solomon error pattern that fools Berlekamp-Massey into a
+  self-consistent-but-wrong locator is a targeted algebraic search this session did not
+  attempt, not a quick anchor.
+
+  `scripts/modtest qr`: 41/41 (was 40; one new anchor test). Also checked `-Doptimize=ReleaseFast`: 41/41.
+
 - **2026-09-07** — **All four fuzz harnesses ran one fixed input for their whole
   lives, and the one named "survives damage" had never damaged anything.**
 
