@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `recvDatagramStrict`'s
+  "only the kernel is a verified sender" guard was fail-OPEN on an
+  undersized `msg_namelen` (accepted the datagram instead of rejecting it);
+  now fail-closed. Not observable on today's ABI (`sockaddr_nl` is a fixed
+  12 bytes) — it only changes behaviour if that struct ever grows.
+  `Socket.neighborFlush` also no longer aborts a bulk flush the first time it
+  meets an `AF_BRIDGE` VXLAN FDB entry (`error.MixedFamilies`): that entry is
+  now counted in a new `FlushResult.skipped` field and the flush continues
+  over the regular entries after it, matching the `dst_len == 0` precedent
+  SPEC.md already documents. `scripts/check-uapi-consts.py`'s `netlink`
+  entry now also scans `root.zig` (~90 constants), not just `bridge.zig`.
+
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `bridge.fuzzBuilders` draws
   **31 knobs behind its two byte draws**, the longest such tail in the
   repository, and its corpus carried no octets past the name and the MAC. So

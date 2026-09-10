@@ -214,15 +214,35 @@ MODULES = {
         # The module's own namespace names (`IFLA_BR`, `IFLA_BRPORT`,
         # `IFLA_BRIDGE`, `BRIDGE_FLAGS`, `BRIDGE_MODE`, `BR_STATE`) are
         # already the kernel's own prefix, same shape as `conntrack` below.
-        "zig_files": ["modules/netlink/src/bridge.zig"],
+        #
+        # `root.zig` added 2026-09-10 (audit finding A6): ~90 hand-transcribed
+        # rtnetlink constants (`AF`, `IFF`, `RTA`, `NDA`, `NUD`, `RT_TABLE`,
+        # `RT_SCOPE`, `RTN`, `RTPROT`, `IFA_F`, `NTF`, `IFLA_INFO`) were live
+        # and completely outside this gate -- only `bridge.zig`'s ~100 were
+        # checked. Every one of those namespaces is already the kernel's own
+        # prefix too (`NUD.PERMANENT` -> `NUD_PERMANENT`), so no aliases were
+        # needed, same as `bridge.zig`.
+        "zig_files": ["modules/netlink/src/bridge.zig", "modules/netlink/src/root.zig"],
         "headers": [
             "/usr/include/linux/if_link.h",
             "/usr/include/linux/if_bridge.h",
             "/usr/include/linux/rtnetlink.h",
+            "/usr/include/linux/neighbour.h",
+            "/usr/include/linux/if.h",
+            "/usr/include/linux/if_addr.h",
+            "/usr/include/linux/netlink.h",
+            # glibc, not the kernel: `AF_*` is not in `linux/socket.h` (see
+            # `conntrack`'s own entry for the same caveat and the same path).
+            "/usr/include/x86_64-linux-gnu/bits/socket.h",
         ],
         "prefixes": [""],
-        # repo-local constants.
-        "unresolved_budget": 3,
+        # repo-local constants: bridge.zig's 3 (`bridge_vlan_info_len`,
+        # `vlan_id_max`, `vlan_id_min`) plus root.zig's 4 sizing constants
+        # with no kernel macro spelling (`ifinfomsg_len`, `ifaddrmsg_len`,
+        # `rtmsg_len`, `ndmsg_len` -- `ifnamsiz` DOES resolve, against
+        # `if.h`'s `IFNAMSIZ`). If this number grows, something stopped
+        # being checked.
+        "unresolved_budget": 7,
     },
     "genetlink": {
         # Audit finding F9: genetlink owns `GENL_ID_CTRL`, `CTRL_CMD_*` and

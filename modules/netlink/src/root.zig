@@ -880,6 +880,16 @@ pub const FlushResult = struct {
     /// far a destructive bulk operation actually got. `null` means every
     /// eligible entry was reached (deleted or raced) with no delete failure.
     stopped: ?WriteError = null,
+    /// Dumped entries that were eligible by state but could never have been
+    /// deleted at all: `error.MixedFamilies` from `buildNeighborRequest`,
+    /// e.g. an `AF_BRIDGE` VXLAN FDB entry whose `NDA_DST` is a tunnel
+    /// endpoint IP, not an address in the entry's own family. Same shape as
+    /// the `dst_len == 0` degenerate-entry skip right above this loop: a
+    /// delete-build error that is a property of the entry itself, not a
+    /// kernel condition, so it is skipped rather than treated like
+    /// `stopped` — one such entry must not stop a destructive bulk flush
+    /// over the regular ARP/NDP entries that follow it in the dump.
+    skipped: usize = 0,
 };
 
 /// `Socket.neighborFlush` fails outright only before it has deleted
@@ -889,6 +899,28 @@ pub const FlushResult = struct {
 /// recorded in `FlushResult.stopped` instead of being raised, so the counts
 /// already accumulated are never discarded. See `FlushResult.stopped`.
 pub const FlushError = DumpError;
+
+/// Per-entry outcome classifier for `Socket.neighborFlush`'s delete loop —
+/// pulled out of the loop body so the skip-vs-stop decision is
+/// unit-testable without a live netlink socket. Mutates `result` and
+/// reports whether the loop should skip this entry and keep going, or stop
+/// (`FlushResult.stopped` is set by this call in that case).
+fn classifyFlushDelete(result: *FlushResult, err: WriteError) enum { skip, stop } {
+    return switch (err) {
+        error.NotFound => blk: {
+            result.raced += 1;
+            break :blk .skip;
+        },
+        error.MixedFamilies => blk: {
+            result.skipped += 1;
+            break :blk .skip;
+        },
+        else => blk: {
+            result.stopped = err;
+            break :blk .stop;
+        },
+    };
+}
 
 // ── write requests: builders (pure, offline-testable) ───────────────────────
 
@@ -1405,6 +1437,20 @@ pub const SendError = error{
 /// socket opened with `openProtocol` use the raw seam — `nextSeq`, `send`,
 /// `recvDatagram`/`recvDatagramStrict`, `classifyDumpMessage`, `requestAck`/
 /// `awaitAckStrict` — plus that family's own message builders.
+/// The "is this datagram really from the kernel" test used by
+/// `Socket.recvDatagramStrict`. Fail CLOSED: an `msg_namelen` under
+/// `sizeof(sockaddr_nl)` means `pid` may not have been written by the
+/// kernel at all, so it cannot be trusted to decide "this is the kernel" —
+/// an undersized address is treated the same as a non-kernel sender rather
+/// than falling through and accepting the datagram. Not live on today's ABI
+/// (the kernel always writes the full 12-byte `sockaddr_nl`), but a future
+/// struct grow (e.g. an `nl_pad`-style field) must not silently flip this
+/// into fail-open — see the mutation test right below `familyOf`'s tests
+/// for the ladder that pins it.
+fn isVerifiedKernelSender(namelen: linux.socklen_t, pid: u32) bool {
+    return namelen >= @sizeOf(linux.sockaddr.nl) and pid == 0;
+}
+
 pub const Socket = struct {
     gpa: std.mem.Allocator,
     fd: i32,
@@ -1675,12 +1721,18 @@ pub const Socket = struct {
     /// deleting it, the kernel's own cache eviction) is a normal race, not a
     /// failure: it surfaces as `error.NotFound` from the delete, which this
     /// loop catches and counts in `FlushResult.raced` instead of aborting.
-    /// Any other delete failure (e.g. `error.AccessDenied` if CAP_NET_ADMIN
-    /// is lost mid-flush) stops the loop but is recorded in
-    /// `FlushResult.stopped` rather than raised — see that field, and
-    /// `FlushError`, for why: this is a destructive bulk operation, and a
-    /// caller that lost CAP_NET_ADMIN partway through needs to know how many
-    /// entries were already deleted, not just that something went wrong.
+    /// Any *operational* delete failure (e.g. `error.AccessDenied` if
+    /// CAP_NET_ADMIN is lost mid-flush, or `error.Busy`) stops the loop but
+    /// is recorded in `FlushResult.stopped` rather than raised — see that
+    /// field, and `FlushError`, for why: this is a destructive bulk
+    /// operation, and a caller that lost CAP_NET_ADMIN partway through needs
+    /// to know how many entries were already deleted, not just that
+    /// something went wrong. A delete-BUILD failure that is a property of
+    /// the dumped entry itself, not a kernel condition — `error
+    /// .MixedFamilies` from an `AF_BRIDGE` VXLAN FDB entry whose `NDA_DST`
+    /// is a tunnel endpoint IP — is counted in `FlushResult.skipped` and the
+    /// loop continues, same as the `dst_len == 0` skip right below: one such
+    /// entry must not stop the flush over the regular entries after it.
     pub fn neighborFlush(self: *Socket, filter: NeighborFlushFilter) FlushError!FlushResult {
         const entries = try self.neighbors(.{ .family = filter.family, .ifindex = filter.ifindex });
         defer self.gpa.free(entries);
@@ -1693,21 +1745,17 @@ pub const Socket = struct {
             // that) — skip it rather than letting a delete-build error abort
             // the whole flush over one entry that was never a real key.
             if (n.dst_len == 0) continue;
-            self.neighborDel(.{
+            const outcome = self.neighborDel(.{
                 .ifindex = n.ifindex,
                 .dst = n.dstBytes(),
                 .family = n.family,
-            }) catch |err| switch (err) {
-                error.NotFound => {
-                    result.raced += 1;
-                    continue;
-                },
-                else => {
-                    result.stopped = err;
-                    break;
-                },
-            };
-            result.deleted += 1;
+            });
+            if (outcome) |_| {
+                result.deleted += 1;
+            } else |err| switch (classifyFlushDelete(&result, err)) {
+                .skip => continue,
+                .stop => break,
+            }
         }
         return result;
     }
@@ -2104,7 +2152,7 @@ pub const Socket = struct {
                 .NOMEM => return error.SystemResources,
                 else => return error.RecvFailed,
             }
-            if (slen >= @sizeOf(linux.sockaddr.nl) and src.pid != 0) continue; // not the kernel
+            if (!isVerifiedKernelSender(slen, src.pid)) continue;
             return self.buf[0..rc];
         }
     }
@@ -2464,6 +2512,180 @@ test "filters: family and ifindex predicates" {
     const n: Neighbor = .{ .family = AF.INET, .ifindex = 2, .state = NUD.STALE, .flags = 0, .ntype = 0 };
     try testing.expect(matchNeighbor(n, .{ .ifindex = 2 }));
     try testing.expect(!matchNeighbor(n, .{ .family = AF.INET6 }));
+}
+
+test "isVerifiedKernelSender: rejects an undersized address regardless of pid" {
+    const full = @sizeOf(linux.sockaddr.nl);
+    // Positive control: full-size address, pid 0 — this MUST pass, or the
+    // socket could never accept a single genuine kernel reply.
+    try testing.expect(isVerifiedKernelSender(full, 0));
+
+    // Boundary ladder on namelen, pid held at the kernel's own value (0).
+    try testing.expect(!isVerifiedKernelSender(0, 0));
+    try testing.expect(!isVerifiedKernelSender(full - 4, 0));
+    try testing.expect(!isVerifiedKernelSender(full - 1, 0));
+    try testing.expect(isVerifiedKernelSender(full, 0));
+    try testing.expect(isVerifiedKernelSender(full + 1, 0));
+
+    // pid must still gate a full-size address (unrelated axis).
+    try testing.expect(!isVerifiedKernelSender(full, 1));
+    try testing.expect(!isVerifiedKernelSender(full, 0xFFFF_FFFF));
+
+    // ⛔ The exact fail-open case the audit found (A3): an undersized
+    // address carrying a nonzero (spoofed-looking) pid. The pre-fix formula
+    // was `namelen >= full and pid != 0 -> reject`, so its ACCEPT condition
+    // was the negation: `namelen < full or pid == 0` — which is true here,
+    // so the old code accepted this datagram. The fixed predicate must not.
+    try testing.expect(!isVerifiedKernelSender(full - 1, 7));
+
+    // RED→GREEN: the literal pre-fix formula, kept here as a mutation
+    // witness rather than reintroduced at the call site. 3/3 of the cases
+    // above that the fix newly rejects were accepted by this old formula.
+    const oldAccepts = struct {
+        fn f(namelen: linux.socklen_t, pid: u32) bool {
+            return !(namelen >= @sizeOf(linux.sockaddr.nl) and pid != 0);
+        }
+    }.f;
+    try testing.expect(oldAccepts(0, 0));
+    try testing.expect(oldAccepts(full - 4, 0));
+    try testing.expect(oldAccepts(full - 1, 7)); // the spoofed-looking case above
+    // And the old formula agrees with the new one on the cases that were
+    // never the bug (full-size address, pid axis):
+    try testing.expectEqual(isVerifiedKernelSender(full, 0), oldAccepts(full, 0));
+    try testing.expectEqual(!isVerifiedKernelSender(full, 1), !oldAccepts(full, 1));
+}
+
+test "classifyFlushDelete: a MixedFamilies entry is skipped, not stopped" {
+    var result: FlushResult = .{};
+    try testing.expectEqual(.skip, classifyFlushDelete(&result, error.MixedFamilies));
+    try testing.expectEqual(@as(usize, 1), result.skipped);
+    try testing.expect(result.stopped == null);
+    try testing.expectEqual(@as(usize, 0), result.raced);
+}
+
+test "classifyFlushDelete: an operational failure still stops the loop" {
+    var result: FlushResult = .{};
+    try testing.expectEqual(.stop, classifyFlushDelete(&result, error.AccessDenied));
+    try testing.expect(result.stopped != null);
+    try testing.expectEqual(@as(usize, 0), result.skipped);
+}
+
+test "classifyFlushDelete: RED->GREEN -- one VXLAN FDB entry no longer aborts the flush" {
+    // Simulates the exact shape the audit found (A4): a dump mixing one
+    // AF_BRIDGE VXLAN FDB entry (family mismatch -> MixedFamilies from
+    // buildNeighborRequest) among ordinary ARP/NDP entries. Pre-fix,
+    // MixedFamilies fell into the loop's `else` arm and stopped it; every
+    // entry after the bad one was silently never reached even though
+    // nothing about THEM failed — precisely the "destructive bulk operation
+    // that SPEC.md:244 claims to have handled" failure the audit named.
+    const errs = [_]?WriteError{ null, error.MixedFamilies, null, error.NotFound, null };
+
+    // GREEN: today's classifier (MixedFamilies -> .skip).
+    var result: FlushResult = .{};
+    var processed: usize = 0;
+    for (errs) |maybe_err| {
+        processed += 1;
+        if (maybe_err) |err| {
+            switch (classifyFlushDelete(&result, err)) {
+                .skip => continue,
+                .stop => break,
+            }
+        }
+        result.deleted += 1;
+    }
+    try testing.expectEqual(errs.len, processed); // every entry in the dump was reached
+    try testing.expectEqual(@as(usize, 3), result.deleted);
+    try testing.expectEqual(@as(usize, 1), result.raced);
+    try testing.expectEqual(@as(usize, 1), result.skipped);
+    try testing.expect(result.stopped == null);
+
+    // RED witness: the pre-fix classifier, MixedFamilies routed to `else`
+    // exactly like it was in the loop before this fix.
+    const oldClassify = struct {
+        fn f(r: *FlushResult, err: WriteError) enum { skip, stop } {
+            return switch (err) {
+                error.NotFound => blk: {
+                    r.raced += 1;
+                    break :blk .skip;
+                },
+                else => blk: {
+                    r.stopped = err;
+                    break :blk .stop;
+                },
+            };
+        }
+    }.f;
+    var old_result: FlushResult = .{};
+    var old_processed: usize = 0;
+    for (errs) |maybe_err| {
+        old_processed += 1;
+        if (maybe_err) |err| {
+            switch (oldClassify(&old_result, err)) {
+                .skip => continue,
+                .stop => break,
+            }
+        }
+        old_result.deleted += 1;
+    }
+    // RED: the loop stopped at the 2nd entry (the MixedFamilies one) — the
+    // trailing 3 entries (1 raced-but-skippable + 2 legitimately deletable)
+    // were never reached at all.
+    try testing.expectEqual(@as(usize, 2), old_processed);
+    try testing.expectEqual(@as(usize, 1), old_result.deleted);
+    try testing.expect(old_result.stopped != null);
+}
+
+test "live: a spoofed non-kernel sender is rejected (A2 -- the guard that had no test)" {
+    // A2: "only the kernel is a verified sender" is the reason FIVE other
+    // modules' reply loops carry no bound against an adversary — and the
+    // audit found that deleting the check left all 95 (now more) netlink
+    // tests green, because none of them drove two real sockets against each
+    // other. This one does: a second, ordinary AF_NETLINK socket ("the
+    // attacker") sends a forged NLMSG_ERROR straight at the victim's own
+    // port id. The kernel cannot be made to report that message's sender
+    // pid as 0 — pid 0 is reserved and unbindable by userland — so the
+    // guard has a real, non-spoofable signal to check. Needs only an
+    // ordinary unprivileged AF_NETLINK socket (no CAP_NET_ADMIN): skip
+    // gracefully if even that is refused (e.g. a locked-down sandbox).
+    var victim = Socket.open(testing.allocator) catch |err| switch (err) {
+        error.AccessDenied, error.ProtocolNotSupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer victim.close();
+    try victim.setRecvTimeout(200);
+
+    const arc = linux.socket(linux.AF.NETLINK, linux.SOCK.RAW | linux.SOCK.CLOEXEC, linux.NETLINK.ROUTE);
+    switch (linux.errno(arc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+    const attacker_fd: i32 = @intCast(arc);
+    defer _ = linux.close(attacker_fd);
+    const asa: linux.sockaddr.nl = .{ .pid = 0, .groups = 0 }; // autobind: kernel picks a nonzero pid
+    switch (linux.errno(linux.bind(attacker_fd, @ptrCast(&asa), @sizeOf(linux.sockaddr.nl)))) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+
+    // A minimal, syntactically-valid nlmsghdr forged as a bare ACK
+    // (NLMSG_ERROR, errno = 0) for seq 1. Content is irrelevant to this
+    // test — only that it is a real datagram from a real, non-kernel fd.
+    var forged: [codec.header_len + 4]u8 = @splat(0);
+    std.mem.writeInt(u32, forged[0..4], forged.len, native_endian);
+    std.mem.writeInt(u16, forged[4..6], codec.NLMSG_ERROR, native_endian);
+    std.mem.writeInt(u32, forged[8..12], 1, native_endian); // seq
+
+    const dst: linux.sockaddr.nl = .{ .pid = victim.portId(), .groups = 0 };
+    const src_rc = linux.sendto(attacker_fd, &forged, forged.len, 0, @ptrCast(&dst), @sizeOf(linux.sockaddr.nl));
+    switch (linux.errno(src_rc)) {
+        .SUCCESS => {},
+        else => return error.SkipZigTest,
+    }
+
+    // GREEN: the forged datagram is never handed to the caller — the guard
+    // filters it out client-side and the receive times out instead of
+    // returning attacker-controlled bytes.
+    try testing.expectError(error.WouldBlock, victim.recvDatagramStrict());
 }
 
 test "NEIGHBOR_FLUSH_DEFAULT_STATE: pins the iproute2-parity mask" {
