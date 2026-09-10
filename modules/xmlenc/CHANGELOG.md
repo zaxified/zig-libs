@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign. Verified against the TREE, not the
+  2026-09-03 audit ledger text (which is now stale on one of its two
+  "recorded, not fixed" items):
+  - **Fuzz-harness single-input finding — REFUTED, not fixed.** The
+    2026-09-03 entry below recorded `test "fuzz: decryptData never panics…"`
+    running exactly one empty-string input under `zig build test-xmlenc`.
+    That was true when written, but `a240f0d1` (2026-09-07, "xmlenc: one
+    document, built the same way, for ever" — already on this branch, `git
+    merge-base --is-ancestor a240f0d1 HEAD` confirms ancestor) already fixed
+    it: `xmlenc_seeds` now has 12 real scripted entries (measured there: 6/6
+    content algorithms, 5/6 key algorithms, 12 distinct documents, 1357
+    unstructured octets — see that entry above). Zig's `test_runner.zig`
+    `fuzz()` (non-`-Dfuzz` build) runs `testOne` once per corpus entry plus
+    one unconditional empty-`Smith` smoke test, so today's deterministic-lane
+    count is `12 + 1` from the corpus test plus `1` from the explicit
+    reachability call at the end of `test_roundtrip.zig` = **14** entries
+    into `fuzzDecryptData` (not 1). No further change made here.
+  - **The OAEP arm of the constant-time gap — STILL OPEN, left open.**
+    `rsaOaepUnwrap` (`root.zig`) still returns early
+    (`catch return error.DecryptionError`) on an OAEP decode failure, so the
+    per-arm asymmetry the 2026-09-03 fix closed for `rsa-1_5`/AES-KW remains
+    for `rsa-oaep`/`rsa-oaep-mgf1p` — confirmed unchanged in the tree, same
+    as `SPEC.md`'s "Constant-time posture" section already documents. Closing
+    it needs one of: (a) reimplementing OAEP unpadding locally inside
+    `xmlenc` (duplicating `rsa.decryptOaepH`'s crypto, so a decoy can be built
+    from the raw RSA block the way `rsaPkcs1v15Unwrap` already does), or (b)
+    extending the `rsa` module's own public surface (a module outside this
+    fixer's assigned scope, and a decision with its own consumers to weigh).
+    Neither is a mechanical fix a fixer should make unilaterally on a
+    security-sensitive decrypt path — see the disposition in
+    `A1/xmlenc.md` for the question left for the user.
+
 - **2026-09-07** — **Test-only: `fuzzDecryptData` built ONE document, the same
   way, for ever.** It had no corpus, so the ordinary test lane runs exactly one
   round of `in = ""` and every `Smith` draw on an exhausted input returns its
