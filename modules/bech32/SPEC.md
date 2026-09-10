@@ -102,7 +102,8 @@ property, not cryptographic unforgeability.
 
 ## Verification
 
-`zig build test-bech32` (headless; Debug + ReleaseFast). Anchors: the complete BIP173 "Test
+`zig build test-bech32` (headless; **Debug by default** — pass `-Doptimize=ReleaseFast` to
+also run the same suite in ReleaseFast; the bare command does not run both on its own). Anchors: the complete BIP173 "Test
 vectors" appendix (7 valid + 12 invalid generic bech32 strings) and BIP350's bech32m analogue (7
 valid + 14 invalid), each invalid vector asserted against its specific documented typed error;
 BIP350's "Test vectors for v0-v16 native segregated witness addresses" (8 valid, checked

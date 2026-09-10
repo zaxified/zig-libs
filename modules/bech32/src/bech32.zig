@@ -327,6 +327,19 @@ test "decode: checksum too short rejected" {
     try testing.expectError(error.DataTooShort, decode("li1dgmt3"));
 }
 
+test "decode: HRP longer than 83 is HrpTooLong, ahead of DataTooShort (A1 L2)" {
+    // No official BIP173/BIP350 vector exercises this: every published
+    // invalid vector with an over-length HRP also has a data part short
+    // enough to hit DataTooShort first, so this branch (and its ordering
+    // ahead of DataTooShort) can be dropped or reordered without moving the
+    // corpus. 84 'a's + an empty data part isolates it: HrpTooLong is the
+    // only guard that can fire.
+    var s: [max_hrp_len + 2]u8 = undefined; // 84 'a's + '1'
+    @memset(s[0 .. max_hrp_len + 1], 'a');
+    s[max_hrp_len + 1] = '1';
+    try testing.expectError(error.HrpTooLong, decode(&s));
+}
+
 test "decode: invalid data character rejected" {
     try testing.expectError(error.InvalidDataChar, decode("x1b4n0q5v"));
 }
@@ -346,6 +359,34 @@ test "encode: TooLong rejected" {
     var data_buf: [max_data_len]u5 = undefined;
     @memset(&data_buf, 0);
     try testing.expectError(error.TooLong, encode(&hrp_buf, &data_buf, .bech32));
+}
+
+test "encode: EmptyHrp rejected (A1 M5)" {
+    try testing.expectError(error.EmptyHrp, encode("", &.{}, .bech32));
+}
+
+test "encode: HrpTooLong rejected, pinned to hrp.len > 83 rather than the overall length limit (A1 M5)" {
+    // A weakened `hrp.len > max_hrp_len` check (or its removal) can hide
+    // behind `TooLong` for most data lengths -- an empty data part isolates
+    // this specific guard, since HrpTooLong is the only one that can fire.
+    var hrp_buf: [max_hrp_len + 1]u8 = undefined;
+    @memset(&hrp_buf, 'a');
+    try testing.expectError(error.HrpTooLong, encode(&hrp_buf, &.{}, .bech32));
+}
+
+test "encode: HrpCharOutOfRange rejected for a byte outside [33,126] (A1 M5)" {
+    try testing.expectError(error.HrpCharOutOfRange, encode(&[_]u8{0x20}, &.{}, .bech32));
+    try testing.expectError(error.HrpCharOutOfRange, encode(&[_]u8{0x7f}, &.{}, .bech32));
+}
+
+test "encode: TooLong is pinned to exactly max_len (90), not a looser bound (A1 M5)" {
+    // The test above builds a 172-character total, which stays TooLong under
+    // `> 91` or `> 200` alike -- it never exercises the real boundary. 91 is
+    // the smallest total that must fail; 90 is the largest that must succeed.
+    var data_buf: [max_data_len + 1]u5 = undefined; // 83
+    @memset(&data_buf, 0);
+    try testing.expectError(error.TooLong, encode("a", data_buf[0..83], .bech32)); // 1+1+83+6 = 91
+    _ = try encode("a", data_buf[0..82], .bech32); // 1+1+82+6 = 90, must succeed
 }
 
 // ── fuzz: bech32/bech32m string decode, never panics ────────────────────────

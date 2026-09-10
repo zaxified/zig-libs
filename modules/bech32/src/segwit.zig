@@ -240,6 +240,26 @@ test "decodeSegwit: v0 program length must be 20 or 32" {
     try testing.expectError(error.InvalidProgramLength, encodeSegwit("bc", 0, &program21));
 }
 
+test "decodeSegwit: v0 program lengths 21 and 40 rejected by decodeSegwit itself, not just encodeSegwit (A1 L1)" {
+    // The only official negative vector for the witver-0-specific width is
+    // 16 bytes (`bc1qr508d6qejxtdg4y5r3zarvaryv98gj9p` in kat_vectors.zig);
+    // 21 and 40 -- both inside the general [2,40] witness-program range --
+    // are untested, so a decode-side check silently widened to accept them
+    // for witver 0 too would pass the whole suite. `encodeSegwit` enforces
+    // the same 20-or-32 rule, so a v0/21-or-40-byte address has to be built
+    // by hand (via `programToQuintets` directly) to reach `decodeSegwit`'s
+    // own check independently of the encoder's.
+    inline for (.{ 21, 40 }) |len| {
+        var program: [len]u8 = undefined;
+        for (&program, 0..) |*b, i| b.* = @intCast((i * 13 + 5) % 256);
+        var data: [1 + ((max_program_len * 8 + 4) / 5)]u5 = undefined;
+        data[0] = 0; // witver 0
+        const nq = programToQuintets(&program, data[1..]);
+        const addr = try bech32.encode("bc", data[0 .. 1 + nq], .bech32);
+        try testing.expectError(error.InvalidProgramLength, decodeSegwit("bc", addr.slice()));
+    }
+}
+
 test "decodeSegwit: witver > 16 rejected" {
     var program: [20]u8 = undefined;
     @memset(&program, 1);
