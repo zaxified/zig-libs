@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit fix campaign, `A1/yaml.md` F1/F2/F3/F4/F6 (0 consumers in
+  this repo, P1 applies). The default-on duplicate-key check (`Options.reject_duplicate_keys
+  = true`) walked composed `Value`s with plain, unmemoized structural equality: an
+  alias-sharing document could force up to 2^n comparisons for n levels of anchor
+  sharing regardless of whether the comparison found a duplicate or not (F1, measured
+  13.4 s / 666 B and 3.7 s / 1.2 KB), an ordinary map with k distinct scalar keys and
+  no aliases at all was a separate O(k²) linear scan (F2, measured 17.6 s at k=64 000,
+  352× its own control), and the same unbounded recursion could walk a syntactically
+  shallow but alias-deep value past any real stack (F3, measured SIGABRT/SIGSEGV at
+  n=200 000). Replaced with `DupTracker`: scalar keys go into a hash set (O(1) amortized,
+  closes F2), sequence/mapping-typed keys use a new `dupEql` that memoizes per
+  `(pointer, pointer)` sub-comparison and is bounded by `Options.max_depth` (closes F1's
+  exponential blowup and F3's stack overflow — `error.TooDeep` instead of a crash).
+  Measured after the fix, same shapes: F1 wide-bomb 13.7 s → 0.2 ms, F1 "succeed" variant
+  3.7 s → 0.1 ms, F2 64 000-key map 15.5 s → 62.7 ms, F3 200 000-deep chain SIGABRT →
+  1.9 s clean `error.TooDeep`. Separately, `scanner.charWidth` treated every byte ≥ 0xF0
+  as a 4-byte UTF-8 lead, including 0xF5-0xFF which can never start a valid sequence
+  (RFC 3629 §3); one such byte before a structural character (`:`, `\n`) swallowed it and
+  silently changed the document's shape (F4) — fixed to consume one byte for 0xF5-0xFF,
+  same as every other invalid lead byte; this layer still does not validate UTF-8 (open,
+  SPEC.md §10). And a leading UTF-16/UTF-32 BOM, previously read as ordinary content and
+  folded into one nonsense scalar, is now rejected with `error.InvalidYaml` (F6) instead of
+  a silent wrong-document result a caller's `.get()` default could mask. Five permanent
+  regression tests added (`compose.zig`), pinned on `Composer.dup_probes` — a deterministic
+  step count in the same style as the existing `anchor_probes` — rather than a wall clock.
+  F5 (missing tests for other DoS-relevant caps), F7 (escaped astral surrogate pairs
+  rejected), F8 (fuzz harnesses miss non-ASCII input) and F9 (`max_nodes` bounds nodes,
+  not heap bytes) remain open — see `A1/yaml.md` dispozice.
 - **2026-09-07** — Both composer fuzz targets ran one fixed input for their whole existence.
   `fuzzComposeNeverPanics` drew its length with `smith.valueRangeAtMost(u16, 1, 512)` and each
   character with `smith.index(alphabet.len)`; a ranged `Smith` draw reads eight octets as a

@@ -189,7 +189,19 @@ pub const Scanner = struct {
         if (b < 0xC0) return 1; // stray continuation byte — consume one
         if (b < 0xE0) return 2;
         if (b < 0xF0) return 3;
-        return 4;
+        // 0xF0-0xF4 are the only valid 4-byte UTF-8 lead bytes (U+10000 up to
+        // the Unicode ceiling U+10FFFF, whose leading byte is 0xF4). 0xF5-0xFF
+        // can never start a valid UTF-8 sequence (RFC 3629 §3) — treating them
+        // as width 4 anyway swallowed up to three trailing bytes that were not
+        // part of any encoded character, structural or not (A1/yaml.md F4:
+        // one 0xF5-0xFF byte silently consumed a following `:` or `\n` and
+        // changed the shape of the document). This scanner still does not
+        // validate UTF-8 (SPEC.md: byte-transparent, composer's job) — an
+        // invalid byte still passes through unchanged — but it now consumes
+        // exactly one byte for it, like every other invalid lead byte above,
+        // instead of a wrong, larger count.
+        if (b < 0xF5) return 4;
+        return 1;
     }
 
     /// Advance one *character* (not byte); columns count characters.
@@ -608,9 +620,35 @@ pub const Scanner = struct {
         try self.simple_keys.append(self.arena, .{});
         self.stream_start_produced = true;
         // A leading BOM belongs to the stream, not to the first token.
-        if (self.at(0) == 0xEF and self.at(1) == 0xBB and self.at(2) == 0xBF) self.pos += 3;
+        if (self.at(0) == 0xEF and self.at(1) == 0xBB and self.at(2) == 0xBF) {
+            self.pos += 3;
+        } else if (isUtf1632Bom(self.src)) {
+            // YAML 1.2 §5.2 lets a leading BOM select UTF-16/UTF-32, but this
+            // scanner only ever reads UTF-8. Before this check, one of those
+            // BOMs was not recognised as a BOM at all: it fell through as
+            // ordinary (invalid) content bytes, and the document silently
+            // folded into one nonsense scalar instead of failing (A1/yaml.md
+            // F6 — `get("enabled")` on the wrong root returns `null`, a
+            // silent fallback to whatever default the caller has, not an
+            // error the caller can see). Rejecting it outright is a strict
+            // subset of what this scanner already refused (see the `bom_mid`
+            // test: a BOM anywhere but the very start was always an error) —
+            // it changes no UTF-8 document's outcome.
+            return self.fail("UTF-16/UTF-32 BOM: only UTF-8 input is supported");
+        }
         const m = self.mark();
         try self.enqueue(.{ .kind = .stream_start, .start = m, .end = m });
+    }
+
+    /// The four BOM encodings for non-UTF-8 (RFC 3629 / Unicode §23.8):
+    /// UTF-32 LE/BE and UTF-16 LE/BE. UTF-32's is checked first because it is
+    /// a strict byte-extension of UTF-16LE's (`FF FE 00 00` vs `FF FE`).
+    fn isUtf1632Bom(src: []const u8) bool {
+        if (src.len >= 4 and src[0] == 0x00 and src[1] == 0x00 and src[2] == 0xFE and src[3] == 0xFF) return true;
+        if (src.len >= 4 and src[0] == 0xFF and src[1] == 0xFE and src[2] == 0x00 and src[3] == 0x00) return true;
+        if (src.len >= 2 and src[0] == 0xFE and src[1] == 0xFF) return true;
+        if (src.len >= 2 and src[0] == 0xFF and src[1] == 0xFE) return true;
+        return false;
     }
 
     fn fetchStreamEnd(self: *Self) Error!void {

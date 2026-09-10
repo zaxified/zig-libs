@@ -307,6 +307,37 @@ already owns the ambiguity — interop with a producer that emits duplicate
 keys on purpose, or a consumer implementing its own resolution policy — not
 as a hidden default a caller could be surprised by.
 
+**The check itself used to be exactly the "walks the DAG as a tree" defect §7
+warns a *consumer* about — except it was inside the composer, on the default
+path.** Comparing a new key against every prior key called plain structural
+equality with no bound: two aliases of the same anchor still compare content
+by content (§7's sharing is invisible to a naive walk), so a billion-laughs
+document that shares an anchor n levels deep cost up to 2^n comparisons just
+to notice ordinary duplicate keys — and a document that is *not* a duplicate,
+merely alias-heavy, paid the same 2^n to find that out and return `OK`
+(A1/yaml.md F1, measured 13.4 s / 0.61 KB and 3.7 s / 1.2 KB respectively).
+The same unbounded scan was separately O(k²) on an ordinary map with k
+distinct scalar keys and no aliases at all — no exponent, just a linear scan
+per key (F2, measured 17.6 s at k=64 000, 352× its own control) — and its
+recursion depth tracked the *value's* nesting (which an alias chain can make
+arbitrarily deep at constant syntactic depth), not `Options.max_depth`, which
+only bounds the *composer's* recursion (F3, measured SIGABRT/SIGSEGV — a
+stack overflow, not a recoverable error — walking two 200 000-deep alias
+chains).
+
+Fixed by `DupTracker` (`compose.zig`): scalar keys — the common case — go
+into a hash set, one O(1) probe per key, closing F2 outright. Sequence/
+mapping-typed keys stay on a linear scan (rare in practice), but the
+comparison itself is `dupEql`, not `valueEql`: memoized per `(pointer, pointer)`
+pair so no sub-tree is walked twice within one comparison (closing F1's
+exponential blowup — the pointer-identity fast path alone closes the common
+"two aliases of the *same* anchor" shape in O(1)), and depth-bounded by
+`Options.max_depth` (closing F3 — a document whose *value* depth exceeds it
+now fails with `error.TooDeep` instead of exhausting the stack). Regression
+tests pin the complexity on `Composer.dup_probes` — a deterministic step
+count, the same style `anchor_probes` above already uses — rather than a
+wall clock.
+
 ## 9. Integer range — the one place resolution is lossy
 
 `Value.int` is an `i64`. An int-shaped scalar that does not fit stays a
@@ -332,8 +363,17 @@ consumer needing bignums has the exact text and can parse it itself.
   point at the scanner cursor rather than always at the offending construct's
   start. Good enough to debug with, not yet good enough to render a caret
   diagnostic against.
-- **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; only the UTF-8 BOM
-  is handled (and skipped), other encodings are not detected.
+- **UTF-16/UTF-32 input.** §5.2 allows a BOM to select them; this module reads
+  UTF-8 only. A leading UTF-16/UTF-32 BOM is now *rejected* (`error.InvalidYaml`,
+  `Scanner.fetchStreamStart`) rather than silently misread as content — see the
+  duplicate-key-check note in §8 below for why "not detected" used to be worse
+  than it sounds. Actually decoding the other encodings is still not done.
+- **`Options.max_nodes` bounds nodes on the wire; it does not bound the heap
+  amplification a small wire causes** (A1/yaml.md F9: 64 000 sequence items,
+  500 890 B on the wire, peaked at 59.6 MB live — 119×; the default
+  `max_nodes = 10_000_000` lets roughly half a gigabyte of heap build before it
+  fires). Capping bytes rather than nodes would need a running byte estimate
+  per `Value`, which this composer does not keep.
 
 ## Anchoring
 

@@ -89,10 +89,184 @@ pub const Pair = struct {
     value: Value,
 };
 
-/// Structural equality between two composed `Value`s — used only to detect
-/// a repeated mapping key under `Options.reject_duplicate_keys`. Aliases of
-/// the same anchor compare equal trivially (shared slices); two distinct
-/// nodes that merely look the same compare equal by content, recursively.
+/// A hashable, order-preserving key for a *scalar* `Value` (never sequence or
+/// mapping). Carries its own variant tag so `.int = 5` and `.float = 5.0`
+/// hash into different buckets, matching `valueEql`'s refusal to equate them.
+const ScalarKey = union(enum) {
+    null_v,
+    bool_v: bool,
+    int_v: i64,
+    /// `f64` bit pattern (`@bitCast`), not the float itself — see
+    /// `F1_F2_F3-duplicate-key-detection.md` §NaN for why this is a
+    /// deliberate, documented behaviour change from `valueEql`'s `==`.
+    float_bits: u64,
+    string_v: []const u8,
+
+    fn from(v: Value) ScalarKey {
+        return switch (v) {
+            .null => .null_v,
+            .bool => |x| .{ .bool_v = x },
+            .int => |x| .{ .int_v = x },
+            .float => |x| .{ .float_bits = @bitCast(x) },
+            .string => |x| .{ .string_v = x },
+            .sequence, .mapping => unreachable, // caller only routes scalars here
+        };
+    }
+};
+
+const ScalarKeyContext = struct {
+    pub fn hash(_: @This(), key: ScalarKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(&[_]u8{@intFromEnum(key)});
+        switch (key) {
+            .null_v => {},
+            .bool_v => |x| h.update(&[_]u8{@intFromBool(x)}),
+            .int_v => |x| h.update(std.mem.asBytes(&x)),
+            .float_bits => |x| h.update(std.mem.asBytes(&x)),
+            .string_v => |x| h.update(x),
+        }
+        return h.final();
+    }
+    pub fn eql(_: @This(), a: ScalarKey, b: ScalarKey) bool {
+        if (@intFromEnum(a) != @intFromEnum(b)) return false;
+        return switch (a) {
+            .null_v => true,
+            .bool_v => |x| x == b.bool_v,
+            .int_v => |x| x == b.int_v,
+            .float_bits => |x| x == b.float_bits,
+            .string_v => |x| std.mem.eql(u8, x, b.string_v),
+        };
+    }
+};
+
+/// Identifies one `dupEql` recursive sub-comparison by the address of the two
+/// slices being compared (`.sequence`/`.mapping` payload pointers), so the
+/// memo table below can recognise "already compared this exact pair" without
+/// caring what the values mean.
+const PtrPair = struct { a: usize, b: usize };
+
+/// Depth-bounded, memoized structural equality — used **only** by the
+/// duplicate-key check in `composeNode`'s `.mapping_start` arm, which is the
+/// one caller that sees attacker-controlled trees. Two properties `valueEql`
+/// (below, kept for the small in-repo equality test) does not have:
+///
+///  1. **Depth bound.** Recursion is capped at `max_depth` (the same knob
+///     `account()` already enforces on composition) and returns
+///     `error.TooDeep` past it, so a document whose *value* depth is huge
+///     because of alias chaining — syntactically shallow, semantically deep,
+///     see `A1/yaml.md` F3 — cannot exhaust the Zig call stack the way plain
+///     recursion did (measured: SIGSEGV at n≈20 000 in Debug).
+///  2. **Memoization.** Two sub-trees are compared **at most once** per
+///     distinct pointer pair, cached in `memo`. Without this, comparing two
+///     nearly-identical alias-compressed trees (each `O(n)` nodes, `O(2^n)`
+///     unraveled paths) reruns the same sub-comparison exponentially often —
+///     measured: 666 B / 30 anchor levels → 13.4 s. With memoization the
+///     total number of sub-comparisons is bounded by (nodes in `a`) ×
+///     (nodes in `b`), which `Options.max_nodes` already bounds.
+///
+/// The pointer-identity fast path (`av.ptr == b.ptr`) is what makes the
+/// *common* billion-laughs shape (two aliases of the *same* anchor) resolve
+/// in O(1) without even touching the memo table.
+fn dupEql(
+    a: Value,
+    b: Value,
+    memo: *std.AutoHashMapUnmanaged(PtrPair, bool),
+    alloc: std.mem.Allocator,
+    depth: usize,
+    max_depth: usize,
+    steps: *usize,
+) Error!bool {
+    if (depth > max_depth) return error.TooDeep;
+    steps.* += 1;
+    return switch (a) {
+        .null => b == .null,
+        .bool => |av| b == .bool and av == b.bool,
+        .int => |av| b == .int and av == b.int,
+        .float => |av| b == .float and av == b.float,
+        .string => |av| b == .string and std.mem.eql(u8, av, b.string),
+        .sequence => |av| blk: {
+            if (b != .sequence or av.len != b.sequence.len) break :blk false;
+            if (av.len == 0 or av.ptr == b.sequence.ptr) break :blk true;
+            const key: PtrPair = .{ .a = @intFromPtr(av.ptr), .b = @intFromPtr(b.sequence.ptr) };
+            if (memo.get(key)) |cached| break :blk cached;
+            var eq = true;
+            for (av, b.sequence) |x, y| {
+                if (!(try dupEql(x, y, memo, alloc, depth + 1, max_depth, steps))) {
+                    eq = false;
+                    break;
+                }
+            }
+            try memo.put(alloc, key, eq);
+            break :blk eq;
+        },
+        .mapping => |av| blk: {
+            if (b != .mapping or av.len != b.mapping.len) break :blk false;
+            if (av.len == 0 or av.ptr == b.mapping.ptr) break :blk true;
+            const key: PtrPair = .{ .a = @intFromPtr(av.ptr), .b = @intFromPtr(b.mapping.ptr) };
+            if (memo.get(key)) |cached| break :blk cached;
+            var eq = true;
+            for (av, b.mapping) |x, y| {
+                if (!(try dupEql(x.key, y.key, memo, alloc, depth + 1, max_depth, steps)) or
+                    !(try dupEql(x.value, y.value, memo, alloc, depth + 1, max_depth, steps)))
+                {
+                    eq = false;
+                    break;
+                }
+            }
+            try memo.put(alloc, key, eq);
+            break :blk eq;
+        },
+    };
+}
+
+/// Per-mapping duplicate-key tracker. Scalar keys (the overwhelming majority
+/// in real documents) are deduplicated in O(1) amortized via `scalars`, a
+/// hash set — closing the O(k²) linear-scan cost that F2 measured at 352× on
+/// a 64 000-key ordinary mapping. Sequence/mapping-typed keys are rare enough
+/// in practice that they stay on a linear scan against `collections`, but
+/// that scan now calls `dupEql` (bounded, memoized) instead of the old
+/// unbounded `valueEql` — so it can no longer blow up exponentially (F1) or
+/// stack-overflow (F3), only cost O(m) per key for m prior non-scalar keys.
+const DupTracker = struct {
+    scalars: std.HashMapUnmanaged(ScalarKey, void, ScalarKeyContext, std.hash_map.default_max_load_percentage) = .empty,
+    collections: std.ArrayList(Value) = .empty,
+    memo: std.AutoHashMapUnmanaged(PtrPair, bool) = .empty,
+
+    fn deinit(self: *DupTracker, alloc: std.mem.Allocator) void {
+        self.scalars.deinit(alloc);
+        self.collections.deinit(alloc);
+        self.memo.deinit(alloc);
+    }
+
+    /// Returns `true` if `k` duplicates a key already seen in this mapping;
+    /// otherwise records it and returns `false`. `steps` accumulates one
+    /// count per `dupEql` call (scalar keys count as a single O(1) hash
+    /// probe) — a regression test asserts a bound on it instead of on the
+    /// wall clock, the same style `anchor_probes` already uses below.
+    fn checkAndInsert(self: *DupTracker, alloc: std.mem.Allocator, k: Value, max_depth: usize, steps: *usize) Error!bool {
+        switch (k) {
+            .null, .bool, .int, .float, .string => {
+                steps.* += 1;
+                const gop = try self.scalars.getOrPut(alloc, ScalarKey.from(k));
+                return gop.found_existing;
+            },
+            .sequence, .mapping => {
+                for (self.collections.items) |prev| {
+                    if (try dupEql(prev, k, &self.memo, alloc, 0, max_depth, steps)) return true;
+                }
+                try self.collections.append(alloc, k);
+                return false;
+            },
+        }
+    }
+};
+
+/// Structural equality between two composed `Value`s — kept for the small,
+/// trusted-input `defined == via_alias` regression test below. ⚠ Not used
+/// on untrusted input: it has neither the depth bound nor the memoization
+/// `dupEql` (above) has, and the duplicate-key check in `composeNode` does
+/// NOT call this function precisely because untrusted input is what it must
+/// survive. See `dupEql`'s doc comment for the two measured failure modes.
 fn valueEql(a: Value, b: Value) bool {
     return switch (a) {
         .null => b == .null,
@@ -267,6 +441,12 @@ const Composer = struct {
     /// per entry walked for a linear scan. Lets a regression test pin the
     /// complexity class with a deterministic number rather than a stopwatch.
     anchor_probes: usize = 0,
+    /// `DupTracker`/`dupEql` steps across the whole document — see
+    /// `DupTracker.checkAndInsert`'s doc comment. Same purpose as
+    /// `anchor_probes`: a regression test pins the complexity class of the
+    /// duplicate-key check (F1/F2/F3 in A1/yaml.md) on a deterministic
+    /// number instead of a stopwatch.
+    dup_probes: usize = 0,
     nodes: usize = 0,
     /// One-event pushback, so a collection can test for its end marker.
     peeked: ?Event = null,
@@ -376,6 +556,8 @@ const Composer = struct {
             .mapping_start => |c| {
                 const slot = try self.beginAnchor(c.anchor);
                 var pairs: std.ArrayList(Pair) = .empty;
+                var dup: DupTracker = .{};
+                defer dup.deinit(self.alloc);
                 while (true) {
                     const nxt = (try self.peek()) orelse return error.InvalidYaml;
                     if (nxt == .mapping_end) {
@@ -385,9 +567,7 @@ const Composer = struct {
                     const k = try self.composeNode(depth + 1);
                     const val = try self.composeNode(depth + 1);
                     if (self.options.reject_duplicate_keys) {
-                        for (pairs.items) |p| {
-                            if (valueEql(p.key, k)) return error.DuplicateKey;
-                        }
+                        if (try dup.checkAndInsert(self.alloc, k, self.options.max_depth, &self.dup_probes)) return error.DuplicateKey;
                     }
                     try pairs.append(self.alloc, .{ .key = k, .value = val });
                 }
@@ -754,6 +934,152 @@ test "a repeated mapping key is rejected by default" {
     const r = try single("admin: false\nother: 1\n");
     defer r.deinit();
     try testing.expectEqual(@as(usize, 2), r.root.mapping.len);
+}
+
+test "F1 (A1/yaml.md): the duplicate-key check does not walk the alias DAG as a tree" {
+    // `a{i}` aliases `a{i-1}` TWICE (`[*a{i-1}, *a{i-1}]`) -- the classic
+    // billion-laughs shape. Two explicit keys both alias `a{n-1}`, so the
+    // duplicate-key check must compare them. Before the fix this was
+    // `valueEql`'s unmemoized recursion, which re-walked the shared subtree
+    // once per alias occurrence: 2^n comparisons for n levels (measured:
+    // 13.4 s at n=30, 666 bytes). `dupEql`'s pointer-identity fast path
+    // resolves this specific shape in O(1) -- both keys resolve to the exact
+    // same anchor slot, so `av.ptr == b.ptr` fires before any recursion.
+    const gpa = testing.allocator;
+    const n = 20;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "a0: &a0 [x, x]\n");
+    for (1..n) |i| try src.print(gpa, "a{d}: &a{d} [*a{d}, *a{d}]\n", .{ i, i, i - 1, i - 1 });
+    try src.print(gpa, "? *a{d}\n: 1\n? *a{d}\n: 2\n", .{ n - 1, n - 1 });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), src.items);
+    defer p.deinit();
+    var c: Composer = .{ .alloc = arena.allocator(), .p = &p, .options = .{} };
+    try testing.expectError(error.DuplicateKey, c.run());
+    // A scan-based walk of the unraveled DAG would cost on the order of 2^n
+    // (2^20 ~ 1e6) `dupEql` calls just for this one pair; measured (see
+    // dispozice) at n instead: the shared bottom leaf is what the identity
+    // fast path actually catches, not the top-level pair (both `*a{n-1}`
+    // reads resolve the SAME anchor slot, but nothing stops the recursion
+    // from walking into the two structurally-tied-together children first —
+    // see the fix's dispozice for the measured number this asserts).
+    try testing.expect(c.dup_probes <= 3 * n);
+}
+
+test "F1 (A1/yaml.md): two DISTINCT alias chains that agree everywhere but the base do not blow up either" {
+    // Same shape, but `a{n-1}` and `b{n-1}` are different anchors that only
+    // diverge at the very bottom -- no pointer-identity shortcut applies at
+    // any level, so this is the case the MEMO table (not the identity fast
+    // path) has to bound. Before the fix: composeAll still returned OK (not
+    // a duplicate), but only after ~2^n redundant re-comparisons of the same
+    // (a{i}, b{i}) pair (measured: 3.75 s at n=28, 1218 bytes, via
+    // `A1/repro/yaml/bomb2.zig`'s `succeed` mode).
+    const gpa = testing.allocator;
+    const n = 20;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "a0: &a0 [x]\nb0: &b0 [y]\n");
+    for (1..n) |i| {
+        try src.print(gpa, "a{d}: &a{d} [*a{d}]\n", .{ i, i, i - 1 });
+        try src.print(gpa, "b{d}: &b{d} [*b{d}]\n", .{ i, i, i - 1 });
+    }
+    try src.print(gpa, "? *a{d}\n: 1\n? *b{d}\n: 2\n", .{ n - 1, n - 1 });
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), src.items);
+    defer p.deinit();
+    var c: Composer = .{ .alloc = arena.allocator(), .p = &p, .options = .{} };
+    const docs = try c.run();
+    try testing.expectEqual(@as(usize, 1), docs.len);
+    // Memoized: at most one dupEql call per (node in a-chain, node in
+    // b-chain) pair, i.e. O(n), not O(2^n) (2^20 ~ 1e6).
+    try testing.expect(c.dup_probes <= 10 * n);
+}
+
+test "F2 (A1/yaml.md): duplicate-key check on scalar keys is not O(k^2)" {
+    // No aliases at all -- k distinct string keys. Before the fix this was a
+    // linear scan of `pairs.items` per new key (measured: 17.6 s at
+    // k=64 000, 352x its own `reject_duplicate_keys=false` control). The
+    // hash-set path in `DupTracker` does exactly one probe per key.
+    const gpa = testing.allocator;
+    const k = 3000;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    for (0..k) |i| try src.print(gpa, "key{d}: v\n", .{i});
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var p = parser.Parser.init(arena.allocator(), src.items);
+    defer p.deinit();
+    var c: Composer = .{ .alloc = arena.allocator(), .p = &p, .options = .{} };
+    const docs = try c.run();
+    try testing.expectEqual(@as(usize, k), docs[0].mapping.len);
+    // A scan-based check would cost ~k^2/2 (4.5M at k=3000); one hash probe
+    // per key is exactly k.
+    try testing.expectEqual(@as(usize, k), c.dup_probes);
+}
+
+test "F3 (A1/yaml.md): the duplicate-key check does not stack-overflow on a syntactically-shallow, semantically-deep value" {
+    // Two distinct n-deep alias chains again (no identity shortcut), this
+    // time with n well past `max_depth` (1024) -- large enough that the OLD
+    // unbounded `valueEql` recursion crashed (measured: SIGABRT/SIGSEGV,
+    // stack overflow inside `valueEql`, at n=200 000 in this environment;
+    // A1/yaml.md reports the same signature at n=20 000 on the audit
+    // machine). `dupEql`'s depth bound turns that crash into a clean,
+    // ordinary error instead.
+    const gpa = testing.allocator;
+    const n = 1100;
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    try src.appendSlice(gpa, "- &a0 [x]\n- &b0 [y]\n");
+    for (1..n) |i| {
+        try src.print(gpa, "- &a{d} [*a{d}]\n", .{ i, i - 1 });
+        try src.print(gpa, "- &b{d} [*b{d}]\n", .{ i, i - 1 });
+    }
+    try src.print(gpa, "-\n  ? *a{d}\n  : 1\n  ? *b{d}\n  : 2\n", .{ n - 1, n - 1 });
+
+    try testing.expectError(error.TooDeep, compose(gpa, src.items, .{}));
+}
+
+test "F4 (A1/yaml.md): an invalid UTF-8 lead byte (0xF5-0xFF) does not swallow the next three bytes" {
+    // `scanner.charWidth` used to treat every byte >= 0xF0 as a 4-byte UTF-8
+    // lead, including 0xF5-0xFF, which can never start a valid sequence
+    // (RFC 3629 §3 caps valid 4-byte leads at 0xF4). One such byte before a
+    // `:` silently ate the colon, the following space, and the value's first
+    // byte, collapsing `k\xff: v\n` into a single scalar instead of a
+    // one-pair mapping. This layer still does not VALIDATE UTF-8 (SPEC.md:
+    // byte-transparent, validation is the composer's job, still open --
+    // A1/yaml.md F4 decision item 2) -- the invalid byte still passes
+    // through unchanged, just no longer at the cost of its neighbours.
+    const r = try compose(testing.allocator, "k\xff: v\n", .{});
+    defer r.deinit();
+    try testing.expect(r.root == .mapping);
+    try testing.expectEqual(@as(usize, 1), r.root.mapping.len);
+    try testing.expectEqualStrings("v", r.root.mapping[0].value.string);
+}
+
+test "F6 (A1/yaml.md): a UTF-16/UTF-32 BOM is rejected, not silently folded into one scalar" {
+    // YAML 1.2 §5.2 lets a leading BOM select an encoding other than UTF-8,
+    // but this module only ever reads UTF-8. Before this fix, a non-UTF-8
+    // BOM was not recognised as a BOM at all: it read as ordinary (mostly
+    // NUL-interleaved) content, and the whole document folded into one
+    // nonsense scalar -- `doc.get("enabled")` on the wrong root silently
+    // returns `null`, indistinguishable from a caller's own missing-key
+    // default. A BOM anywhere but the very start of the stream was already
+    // rejected (see the sibling `anchors do not cross documents`-style
+    // tests above); this closes the one spot that was not covered.
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xff\xfea\x00:\x00 \x001\x00\n\x00", .{}));
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xfe\xff\x00a\x00:\x00 \x001", .{}));
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\x00\x00\xfe\xff\x00\x00\x00a", .{}));
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "\xff\xfe\x00\x00a\x00\x00\x00", .{}));
+    // Control: the UTF-8 BOM this module has always handled still works.
+    const r = try compose(testing.allocator, "\xef\xbb\xbfa: 1\n", .{});
+    defer r.deinit();
+    try testing.expectEqual(@as(i64, 1), r.root.get("a").?.int);
 }
 
 test "duplicate keys are preserved, not collapsed, under the explicit opt-out" {
