@@ -66,6 +66,184 @@ fn intoMontgomery(fe: FfFe) FfFe {
     return x;
 }
 
+// ── constant-time byte serialization ────────────────────────────────────
+//
+// `Fr.toBytes` used to remove the Montgomery factor via
+// `modulus.fromMontgomery` + `Fe.toBytes` (`std.crypto.ff`). Measured under
+// valgrind/memcheck (A1/bn254.md's open finding, reached from
+// `G1.Jacobian.scalarMul`'s `s.toBytes()`): `fromMontgomery` branches on the
+// secret value in exactly THREE places — `ff.zig`'s `fromMontgomery` itself,
+// its `shrink` call, and the masked conditional-subtract inside
+// `montgomeryMul` — each lowering to a data-dependent branch in this build
+// without a `blackBox`-style optimization barrier. That is the same class of
+// defect `fp.zig`'s own `blackBox` doc comment names, and that field's
+// hand-rolled backend was written to close; `std.crypto.ff` labels itself
+// "(best-effort) constant-time" for exactly this reason.
+//
+// So below, `toBytes` never calls `fromMontgomery`. It reads `Fr`'s raw
+// Montgomery-domain limbs directly — a field access, not a function call, so
+// there is nothing for a branch to depend on — and removes the Montgomery
+// factor with this module's OWN portable constant-time reduction: the same
+// CIOS + masked-conditional-subtract-behind-`blackBox` technique `fp.zig`
+// already uses for the base field, parameterized by `r` instead of `p`.
+//
+// `std.crypto.ff` stores a `Uint(256)` as FIVE redundant 63-bit limbs
+// (`Limb = usize`, one reserved carry bit per limb), so ITS Montgomery
+// constant is `R_ff = 2^(5*63) = 2^315`, not `2^256`. This is not read out
+// of `ff.zig`'s source; it is measured — the regression test below pins
+// `Fr.one`'s raw limbs against an independently computed `2^315 mod r`, so a
+// future std change to that layout fails loudly here instead of silently
+// mis-converting every value.
+//
+// The reduction below targets THIS module's own `R = 2^256` (`fp.zig`'s
+// convention, four 64-bit limbs), so it multiplies by `2^(256-315) mod r`
+// `= 2^-59 mod r`, computed once at comptime via Fermat's little theorem
+// (`r` is prime): `2^(r-1-59) ≡ 2^-59 (mod r)`.
+
+const L64: usize = 4;
+const Limbs64 = [L64]u64;
+
+fn ctToLimbs64(comptime x: comptime_int) Limbs64 {
+    comptime var v = x;
+    var out: Limbs64 = undefined;
+    inline for (&out) |*w| {
+        w.* = @as(u64, @intCast(v & 0xFFFF_FFFF_FFFF_FFFF));
+        v = v >> 64;
+    }
+    if (v != 0) @compileError("bn254: value exceeds 4 limbs");
+    return out;
+}
+
+/// `r` as a `comptime_int`, independently re-derived from `r_bytes` (NOT
+/// shared with `fp.zig`'s `p_int` — a different modulus entirely).
+const r_int: comptime_int = blk: {
+    var x: comptime_int = 0;
+    for (r_bytes) |b| x = x * 256 + @as(comptime_int, b);
+    break :blk x;
+};
+
+const r_limbs64: Limbs64 = ctToLimbs64(r_int);
+
+/// `-r[0]^{-1} mod 2^64` — the CIOS Montgomery reduction constant for `r`.
+const n0inv64: u64 = blk: {
+    var y: u64 = 1; // r[0]^{-1} mod 2 (r is odd)
+    for (0..6) |_| y = y *% (2 -% r_limbs64[0] *% y);
+    break :blk 0 -% y;
+};
+
+/// `a^e mod m` for `comptime_int` operands — comptime-only, not required to
+/// be constant time (it runs once, at compile time, over PUBLIC constants).
+fn comptimeModPow(base: comptime_int, exp: comptime_int, m: comptime_int) comptime_int {
+    var result: comptime_int = 1 % m;
+    var b: comptime_int = base % m;
+    var e: comptime_int = exp;
+    while (e > 0) : (e >>= 1) {
+        if (e & 1 == 1) result = (result * b) % m;
+        b = (b * b) % m;
+    }
+    return result;
+}
+
+/// `2^-59 mod r` — see the module doc comment above `L64` for the derivation.
+const y_int: comptime_int = blk: {
+    @setEvalBranchQuota(4_000_000);
+    break :blk comptimeModPow(2, r_int - 1 - 59, r_int);
+};
+const y_limbs64: Limbs64 = ctToLimbs64(y_int);
+
+/// Same barrier as `fp.zig`'s `blackBox` — launders a value through an empty
+/// inline-asm so LLVM cannot recover `bit ∈ {0,1}` and lower the masked
+/// select below to a data-dependent branch. See `fp.zig`'s doc comment for
+/// the full story: deleting it there left a measurable leak while the
+/// module's own test suite stayed green.
+inline fn ctBarrier(x: u64) u64 {
+    if (@inComptime()) return x;
+    return asm volatile (""
+        : [ret] "=r" (-> u64),
+        : [x] "0" (x),
+    );
+}
+
+/// Constant-time conditional subtract of `r` from the `(L64+1)`-word value —
+/// identical shape to `fp.zig`'s `condSubP`, parameterized by `r_limbs64`.
+fn condSubR(v: *Limbs64, top: u64) void {
+    var diff: Limbs64 = undefined;
+    var borrow: u1 = 0;
+    inline for (0..L64) |i| {
+        const s = @subWithOverflow(v[i], r_limbs64[i]);
+        const s2 = @subWithOverflow(s[0], borrow);
+        diff[i] = s2[0];
+        borrow = s[1] | s2[1];
+    }
+    const under = @subWithOverflow(top, borrow)[1];
+    const keep: u64 = 0 -% ctBarrier(@as(u64, under));
+    inline for (0..L64) |i| v[i] = (v[i] & keep) | (diff[i] & ~keep);
+}
+
+/// Portable constant-time CIOS Montgomery multiply `z = a·b·R⁻¹ mod r`
+/// (`R = 2^256`) — same algorithm as `fp.zig`'s `montMul`, parameterized by
+/// `r`. Used here for exactly one purpose: `montMulR(v, y_limbs64)` removes
+/// `std.crypto.ff`'s Montgomery factor (see the module doc comment above).
+fn montMulR(a: Limbs64, b: Limbs64) Limbs64 {
+    var t = [_]u64{0} ** (L64 + 2);
+    inline for (0..L64) |i| {
+        var carry: u64 = 0;
+        inline for (0..L64) |j| {
+            const pr = @as(u128, a[j]) * @as(u128, b[i]) + t[j] + carry;
+            t[j] = @truncate(pr);
+            carry = @truncate(pr >> 64);
+        }
+        const s = @as(u128, t[L64]) + carry;
+        t[L64] = @truncate(s);
+        t[L64 + 1] = @truncate(s >> 64);
+
+        const u = t[0] *% n0inv64;
+        const p0 = @as(u128, u) * @as(u128, r_limbs64[0]) + t[0];
+        var carry2: u64 = @truncate(p0 >> 64);
+        inline for (1..L64) |j| {
+            const pr = @as(u128, u) * @as(u128, r_limbs64[j]) + t[j] + carry2;
+            t[j - 1] = @truncate(pr);
+            carry2 = @truncate(pr >> 64);
+        }
+        const s2 = @as(u128, t[L64]) + carry2;
+        t[L64 - 1] = @truncate(s2);
+        t[L64] = t[L64 + 1] +% @as(u64, @truncate(s2 >> 64));
+    }
+    var z: Limbs64 = t[0..L64].*;
+    condSubR(&z, t[L64]);
+    return z;
+}
+
+/// Repacks `std.crypto.ff`'s five redundant 63-bit limbs (little-endian, bit
+/// 63 of each always 0) into four full 64-bit limbs. Pure shifts/masks — no
+/// comparison, so nothing here needs a `blackBox` barrier. Valid because
+/// every `Fr` value is `< r < 2^254`, so the source never carries more than
+/// ~254 significant bits.
+fn ffLimbsToLimbs64(lb: [5]u64) Limbs64 {
+    const m: u64 = (1 << 63) - 1;
+    const l0 = lb[0] & m;
+    const l1 = lb[1] & m;
+    const l2 = lb[2] & m;
+    const l3 = lb[3] & m;
+    const l4 = lb[4] & m;
+    return .{
+        l0 | ((l1 & 1) << 63),
+        (l1 >> 1) | ((l2 & 0x3) << 62),
+        (l2 >> 2) | ((l3 & 0x7) << 61),
+        (l3 >> 3) | ((l4 & 0xF) << 60),
+    };
+}
+
+/// Write little-endian 64-bit limbs to a big-endian 32-byte value.
+fn limbs64ToBe(v: Limbs64) [32]u8 {
+    var out: [32]u8 = undefined;
+    inline for (0..L64) |i| {
+        const off = 32 - 8 * (i + 1);
+        std.mem.writeInt(u64, out[off .. off + 8][0..8], v[i], .big);
+    }
+    return out;
+}
+
 /// An element of the BN254 scalar field `GF(r)`.
 ///
 /// ## Storage convention: Montgomery form, always
@@ -108,12 +286,15 @@ pub const Fr = struct {
 
     /// Serializes to big-endian 32 bytes. REAL — the Montgomery factor is
     /// removed here, which is the only place the wire encoding is produced.
+    /// Constant time: does NOT call `modulus.fromMontgomery` — see the
+    /// module doc comment above `L64` for why, and
+    /// `oldToBytesViaFf`/the differential test below for the oracle this
+    /// was checked against.
     pub fn toBytes(self: Fr) [encoded_bytes]u8 {
-        var canonical = self.fe;
-        modulus.fromMontgomery(&canonical) catch unreachable; // invariant: always Montgomery
-        var out: [encoded_bytes]u8 = undefined;
-        canonical.toBytes(&out, .big) catch unreachable;
-        return out;
+        std.debug.assert(self.fe.v.limbs_len == 5); // std.crypto.ff's Uint(256) layout; see module doc
+        const v64 = ffLimbsToLimbs64(self.fe.v.limbs_buffer);
+        const canonical = montMulR(v64, y_limbs64);
+        return limbs64ToBe(canonical);
     }
 
     pub fn isZero(self: Fr) bool {
@@ -341,4 +522,79 @@ test "Fr.random produces canonical, distinct draws" {
     const b = Fr.random(io);
     _ = try Fr.fromBytes(a.toBytes());
     try std.testing.expect(!a.eql(b));
+}
+
+// ── constant-time toBytes: the R_ff pin, and the differential oracle ──────
+
+fn mulmodWide(a: u512, b: u512, m: u512) u512 {
+    const wide: u1024 = @as(u1024, a) * @as(u1024, b);
+    return @intCast(wide % @as(u1024, m));
+}
+
+test "std.crypto.ff's internal Montgomery constant is really 2^315 (locks the R_ff assumption toBytes depends on)" {
+    // `Fr.one`'s raw limbs are `1 * R_ff mod r` by construction (every `Fr`
+    // constructor stores the Montgomery form). If a future std release
+    // changes the limb width, limb count, or Montgomery convention of
+    // `std.crypto.ff.Uint`, this fails loudly instead of `toBytes` silently
+    // returning the wrong value.
+    const raw = Fr.one.fe.v.limbs_buffer;
+    try std.testing.expectEqual(@as(usize, 5), Fr.one.fe.v.limbs_len);
+    var v: u512 = 0;
+    var i: usize = 5;
+    while (i > 0) {
+        i -= 1;
+        v = (v << 63) | (@as(u512, raw[i]) & ((1 << 63) - 1));
+    }
+
+    var r_wide: u512 = 0;
+    for (r_bytes) |b| r_wide = (r_wide << 8) | b;
+
+    var base: u512 = 2 % r_wide;
+    var e: u32 = 315;
+    var expected: u512 = 1 % r_wide;
+    while (e > 0) : (e >>= 1) {
+        if (e & 1 == 1) expected = mulmodWide(expected, base, r_wide);
+        base = mulmodWide(base, base, r_wide);
+    }
+    try std.testing.expectEqual(expected, v);
+}
+
+/// The OLD implementation, kept here ONLY as the differential oracle for the
+/// constant-time `toBytes` above — this is what `toBytes` did before this
+/// fix, and the two must always agree.
+fn oldToBytesViaFf(fr: Fr) [Fr.encoded_bytes]u8 {
+    var canonical = fr.fe;
+    modulus.fromMontgomery(&canonical) catch unreachable;
+    var out: [Fr.encoded_bytes]u8 = undefined;
+    canonical.toBytes(&out, .big) catch unreachable;
+    return out;
+}
+
+test "Fr.toBytes (constant-time path) matches the old std.crypto.ff-derived value" {
+    try std.testing.expectEqualSlices(u8, &oldToBytesViaFf(Fr.zero), &Fr.zero.toBytes());
+    try std.testing.expectEqualSlices(u8, &oldToBytesViaFf(Fr.one), &Fr.one.toBytes());
+
+    var a_bytes = [_]u8{0} ** 32;
+    a_bytes[31] = 0xef;
+    a_bytes[0] = 0x11;
+    const a = try Fr.fromBytes(a_bytes);
+    try std.testing.expectEqualSlices(u8, &oldToBytesViaFf(a), &a.toBytes());
+
+    var r_minus_1 = r_bytes;
+    r_minus_1[31] -= 1;
+    const rm1 = try Fr.fromBytes(r_minus_1);
+    try std.testing.expectEqualSlices(u8, &oldToBytesViaFf(rm1), &rm1.toBytes());
+
+    // Exercises reduceWide's output too, not just fromBytes'.
+    const wide = [_]u8{0xff} ** 64;
+    const w = Fr.reduceWide(&wide);
+    try std.testing.expectEqualSlices(u8, &oldToBytesViaFf(w), &w.toBytes());
+
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    for (0..30) |_| {
+        const rnd = Fr.random(io);
+        try std.testing.expectEqualSlices(u8, &oldToBytesViaFf(rnd), &rnd.toBytes());
+    }
 }

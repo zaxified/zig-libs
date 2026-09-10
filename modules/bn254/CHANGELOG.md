@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** `Fr.toBytes` no longer calls
+  `std.crypto.ff`'s `Modulus.fromMontgomery`. That call's internal `shrink`/
+  `montgomeryMul` branch on the secret value in this build, reachable from
+  `G1.Jacobian.scalarMul`'s scalar-to-bytes conversion; measured under valgrind
+  (ad hoc `ctgrind_harness.zig` build), the scalarmul target dropped from 9
+  memcheck contexts to 6, with the 3 removed ones all inside `ff.zig` via
+  `scalar.zig:113`. `toBytes` now removes the Montgomery factor with this
+  module's own CIOS + `blackBox`-barrier reduction (same technique `fp.zig`
+  already uses for `Fp`), parameterized by `r`'s modulus. Output is
+  byte-identical to before (differential-tested against the old
+  `std.crypto.ff`-derived path across zero/one/r-1/a `reduceWide` output/30
+  random draws); the wire format and every public signature are unchanged.
+
 - **2026-09-07** — The three precompile fuzz targets ran exactly one input each, for ever.
   Each drew `smith.bytes(&buf)` and then a ranged length, which returns the range minimum
   when fewer than eight input octets remain, so the length was 0 on every input; with no
