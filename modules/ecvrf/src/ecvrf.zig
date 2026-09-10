@@ -183,6 +183,12 @@ fn expandSecretKey(sk: SecretKey) ExpandedSecretKey {
     defer std.crypto.secureZero(u8, &h);
     var x: [32]u8 = h[0..32].*;
     scalar.clamp(&x);
+    // `x` is copied into the return value below; wiping this local AFTER
+    // that copy leaves the caller's copy intact while erasing this
+    // function's own dead frame (A1 E4 — one of the three surviving
+    // dead-frame copies of `x` the audit's stack-scan probe found; this is
+    // the one inside ecvrf's own module, not `ct25519`'s or std's).
+    defer std.crypto.secureZero(u8, &x);
     return .{ .x = x, .prefix = h[32..64].* };
 }
 
@@ -352,7 +358,13 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
     const gamma_string = gamma_point.toBytes();
 
     // Step 5: k = nonce_generation(SK, h_string).
-    const k = nonceGeneration(sk, h_string);
+    var k = nonceGeneration(sk, h_string);
+    // A1 E4: the secret nonce was never zeroed — unlike `exp.x`/`exp.prefix`
+    // just above, nothing wiped this function's own copy of `k` once it was
+    // no longer needed. `s = k + c*x mod q` makes a leaked `k` equivalent to
+    // a leaked `x` (`x = (s-k)*c^-1 mod q`), so this copy is exactly as
+    // sensitive as the ones `defer secureZero(&exp.x)` already covers.
+    defer std.crypto.secureZero(u8, &k);
 
     // Step 6: c = challenge_generation(Y, H, Gamma, k*B, k*H). `k` is the
     // secret nonce — the one scalar here that CAN legitimately be 0 mod q
@@ -376,6 +388,18 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
 }
 
 /// RFC 9381 §5.2 `ECVRF_proof_to_hash(pi_string)`.
+///
+/// RFC 9381 §5.2 (A1 E13): "`ECVRF_proof_to_hash` should be run only on a
+/// `pi_string` value that is known to have been produced by
+/// `ECVRF_prove`, or from within `ECVRF_verify`" — i.e. NOT called
+/// directly on an attacker-supplied `pi` a caller has not itself already
+/// run `verify` on. This function only checks `pi`'s STRUCTURAL validity
+/// (`decodeProof`); it has no way to check that `Gamma` was honestly
+/// derived from `(PK_string, alpha_string)` by the claimed key holder —
+/// that is exactly what `verify`'s challenge/response check establishes
+/// and `proofToHash` alone does not. A caller who wants "the random
+/// output for this `(pk, alpha, pi)`" should call `verify`, not this
+/// function directly on unauthenticated `pi`.
 pub fn proofToHash(pi: Proof) Error!Output {
     const d = try decodeProof(pi);
     const gamma_point = Edwards25519.fromBytes(d.gamma) catch unreachable; // decodeProof already validated

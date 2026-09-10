@@ -127,8 +127,12 @@ real — see "Implementation notes" below.
 
   **The number the dependency on `ct25519` is actually about is zero**:
   `scripts/ctgrind.sh ecvrf --pattern 'ct25519|root[.]zig'` reports
-  **0** contexts in the constant-time ladder, for all nine secret-scalar
-  multiplications `publicKey`/`prove` perform. The remaining 4 of the 7
+  **0** contexts in the constant-time ladder, for all five secret-scalar
+  multiplications `publicKey`/`prove` perform (`publicKey`'s one `mulBase`,
+  plus `prove`'s two `mulBase`/`mul` pairs for `Y`/`Gamma` and for `U`/`V` —
+  corrected 2026-09-10, A1 E12: this bullet previously said "nine", counted
+  from memory rather than from the call sites; `ecvrf.zig`'s own module doc
+  comment already said "five" and was right). The remaining 4 of the 7
   total are inside the harness's own non-constant-time hex formatter —
   the propagation witness that makes that zero mean "no branch found"
   rather than "the taint never arrived".
@@ -206,14 +210,24 @@ real — see "Implementation notes" below.
   guarantee against a determined local attacker (no memory locking /
   `mlock`, matching this repository's other secret-scalar-handling
   modules, e.g. `xeddsa.zig`).
-- **Degenerate-key/nonce panics are probability-~2^-252 events, not
-  attacker-reachable.** `publicKey`/`prove` `@panic` if the clamped
-  secret scalar or the derived nonce reduces to `0 mod q` — the same
-  posture `xeddsa.zig`'s `calculateKeyPair`/`sign` take for the
-  analogous cases, and RFC 9381 itself gives no "then what" for these
-  (they are not part of the "output INVALID" fail-closed surface, which
-  is reserved for attacker-controlled inputs to `verify`, not a
-  key-holder's own degenerate secret material).
+- **A degenerate secret scalar or nonce (probability ~2^-252) does NOT
+  panic.** *(Corrected 2026-09-10, A1 E11: this bullet used to claim
+  `publicKey`/`prove` `@panic` if the clamped secret scalar or derived
+  nonce reduces to `0 mod q`. That was true of this module's OLD ladder —
+  `std.crypto.ecc.Edwards25519.mul`'s trailing `rejectIdentity`, `catch
+  @panic(...)`'d at five call sites — and stopped being true when `prove`/
+  `publicKey` moved to `ct25519.mul`/`mulBase` (see the bullet above):
+  those return the neutral element as an ordinary value, no error union, so
+  there is nothing left to `catch`. `rg '@panic' modules/ecvrf/src` finds
+  exactly one `@panic`, in `encodeToCurve`'s unrelated `ctr`-exhaustion
+  path, not here. The doc comment on `ecvrf.zig` itself never made this
+  claim and was right; only this bullet was stale.)* A degenerate `x` is
+  provably unreachable regardless (RFC 8032 clamping puts it strictly
+  between `4L` and `5L`, never a multiple of `L`); a degenerate `k` simply
+  produces a proof carrying `U = k*B = O`, which `verify` recomputes
+  identically and which a genuinely low-order `Y` would still be rejected
+  for on the verifier side (`validateKey`, §5.4.5) — see `ecvrf.zig`'s
+  module doc comment for the full argument.
 
 ## Out of scope (this module)
 

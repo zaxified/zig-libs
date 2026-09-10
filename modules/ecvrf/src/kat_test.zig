@@ -232,6 +232,28 @@ test "negative: a small-order public key is rejected by verify, not a crash" {
     order2_pk[31] = 0x7f;
     try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order2_pk, alpha, pi));
 
+    // A1 E3: identity and order-2 are the ONLY two of the eight low-order
+    // points whose `x`-coordinate is zero — i.e. the only two a bare
+    // `rejectIdentity()` (without the preceding `clearCofactor()`) also
+    // happens to catch. Order-4 and order-8 points below have nonzero `x`
+    // and DO decode as distinct, non-identity points; only cofactor-clearing
+    // first exposes them as low-order. Without these, a mutation that drops
+    // `clearCofactor()` from `validateKey` passes this test file green while
+    // accepting 7 of these 10 points (measured: `A1/ecvrf.md` E3).
+    // RFC 9381 §5.4.5's own low-order point list, hex-encoded.
+    const order4_pk_a = try hex32("0000000000000000000000000000000000000000000000000000000000000000"); // y = 0, sign 0
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order4_pk_a, alpha, pi));
+    const order4_pk_b = try hex32("0000000000000000000000000000000000000000000000000000000000000080"[0..64]); // y = 0, sign 1
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order4_pk_b, alpha, pi));
+    const order8_pk_a = try hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a");
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order8_pk_a, alpha, pi));
+    const order8_pk_b = try hex32("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa");
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order8_pk_b, alpha, pi));
+    const order8_pk_c = try hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05");
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order8_pk_c, alpha, pi));
+    const order8_pk_d = try hex32("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85");
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(order8_pk_d, alpha, pi));
+
     // A structurally invalid encoding (not on the curve at all) must
     // also reject cleanly rather than crash `Edwards25519.fromBytes`.
     var not_on_curve = [_]u8{0xaa} ** 32;
@@ -241,6 +263,82 @@ test "negative: a small-order public key is rejected by verify, not a crash" {
     // fails to decode as a point OR fails validate_key — either is an
     // acceptable "rejected, not panicked" outcome.
     _ = ecvrf.verify(not_on_curve, alpha, pi) catch {};
+}
+
+test "negative: N random (c, s) forgery attempts against a valid Gamma all reject (E2)" {
+    // A1 E2: `verify`'s challenge comparison IS the full 16 bytes
+    // (`std.crypto.timing_safe.eql([c_len]u8, ...)`) — but every tamper test
+    // in this file flips a byte inside a REAL `c`, and SHA-512's avalanche
+    // means that always changes every one of `c`'s 16 bytes at once, so a
+    // mutation that only compares a PREFIX or SUFFIX of `c` still turns every
+    // existing tamper test red. What those tests cannot see is an EXISTENTIAL
+    // forgery: a random `(c, s)` pair against a real `Gamma`, which a
+    // narrowed comparison accepts roughly once every 2^(8*narrowed_width)
+    // tries. Measured (`A1/ecvrf.md` E2, 200000 trials): base 0 accepted,
+    // comparing only `c[0..1]` 768 accepted (1 in ~260), comparing only
+    // `c[15..16]` 786 accepted. This test drives a smaller N (fast enough for
+    // every optimize mode, including Debug) against the real, unmutated
+    // `verify` and expects exactly 0 acceptances; P(0 accepts | a 1-byte-wide
+    // comparison mutation, N=3000) is negligible so this still fails hard
+    // under that mutation.
+    const vec = v.vectors[0];
+    const pk = try hex32(vec.pk);
+    const alpha = "";
+    const real_pi = try hex80(vec.pi);
+    const gamma = real_pi[0..32].*;
+
+    var prng = std.Random.DefaultPrng.init(0xE2E2_C0DE_0000_0001);
+    const rand = prng.random();
+    var accepted: usize = 0;
+    const n: usize = 3000;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var pi: [80]u8 = undefined;
+        pi[0..32].* = gamma;
+        rand.bytes(pi[32..48]); // c: any 16 bytes is structurally valid (c < 2^128 < q always)
+        // s must be a CANONICAL scalar or decodeProof rejects it before the
+        // challenge comparison is even reached, which would test the wrong
+        // thing (structural rejection, not the comparison itself).
+        var s_wide: [32]u8 = undefined;
+        rand.bytes(&s_wide);
+        const s = std.crypto.ecc.Edwards25519.scalar.reduce(s_wide);
+        pi[48..80].* = s;
+        if (ecvrf.verify(pk, alpha, pi)) |_| accepted += 1 else |_| {}
+    }
+    try std.testing.expectEqual(@as(usize, 0), accepted);
+
+    // Sanity: the real vector still verifies (proves the loop above wasn't
+    // rejecting everything for an unrelated reason, e.g. a bad Gamma).
+    _ = try ecvrf.verify(pk, alpha, real_pi);
+}
+
+test "negative: decodeProof rejects a Gamma that is not a valid point encoding; proofToHash/verify do not return a beta for it (E5)" {
+    // A1 E5: `decodeProof`'s `Edwards25519.fromBytes(gamma_string) catch
+    // return error.InvalidProof` had no test of its own; without it, two
+    // `catch unreachable`s downstream (`proofToHash`, `verify`) are undefined
+    // behaviour in ReleaseFast on exactly this input. Measured
+    // (`A1/ecvrf.md` E5): 50057/100000 random 32-byte strings are not valid
+    // point encodings, so this is a hot path, not a corner case.
+    const Edwards25519 = std.crypto.ecc.Edwards25519;
+    const vec = v.vectors[0];
+    const pk = try hex32(vec.pk);
+    const alpha = "";
+    var pi = try hex80(vec.pi);
+
+    // Find a 32-byte value that is NOT a valid edwards25519 point encoding —
+    // a deterministic search, not a hardcoded magic constant.
+    var t: u32 = 0;
+    const bad_gamma: [32]u8 = while (t < 100_000) : (t += 1) {
+        var cand = [_]u8{0} ** 32;
+        std.mem.writeInt(u32, cand[0..4], t, .little);
+        cand[31] = 0x40;
+        if (Edwards25519.fromBytes(cand)) |_| {} else |_| break cand;
+    } else return error.NoInvalidEncodingFound;
+    pi[0..32].* = bad_gamma;
+
+    try std.testing.expectError(error.InvalidProof, ecvrf.decodeProof(pi));
+    try std.testing.expectError(error.InvalidProof, ecvrf.proofToHash(pi));
+    try std.testing.expectError(error.InvalidProof, ecvrf.verify(pk, alpha, pi));
 }
 
 test "negative: decodeProof rejects non-canonical s (s >= group order)" {
