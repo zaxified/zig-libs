@@ -63,16 +63,6 @@ for the full socket path).
 - **IPv6 Neighbor Discovery helpers** — the ND counterpart to the ARP codec; only ARP exists today.
 - **Remains Linux-only** — the documented AF_PACKET ceiling (no BSD `/dev/bpf`) is permanent, not a
   gap to close.
-- **802.1Q tag visibility** — Linux's `skb_vlan_untag` strips an 802.1Q tag before any AF_PACKET tap
-  sees the frame, so a VLAN-tagged frame's `EthHeader.ethertype`/`etherTypeFilter` match is the
-  INNER type, never the outer `0x8100`; the tag itself (`tp_vlan_tci`) isn't exposed at all. Fixing
-  it needs `PACKET_AUXDATA` + `recvmsg` instead of `recvfrom`, plus a new `Frame.vlan_tci: ?u16` —
-  not built. See `A1/rawsock.md` F3 (the two doc comments this entry used to contradict are fixed;
-  the visibility gap itself is not).
-- **`setFilter` race on the open→bind→filter window** — frames received after `bind` but before
-  `setFilter` are delivered even though the filter would reject them (`SO_RCVBUF`-sized window,
-  measured on a real segment). Fix needs an `Options.filter` attached before `bind`, not after
-  `open`. See `A1/rawsock.md` F4.
 
 ## Status
 

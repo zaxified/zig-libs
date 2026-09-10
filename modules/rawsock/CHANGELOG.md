@@ -5,7 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-10** — A1 fix campaign (no consumers in-repo, P1 applies): ten of the audit's
+- **2026-09-10** — A1 fix campaign, second-pass fix queue (no consumers in-repo, P1
+  applies): three more of the audit's sixteen findings closed (fourteen of sixteen total).
+  **New, additive:** `Socket.open`'s `Options.filter` — a classic-BPF program attached as
+  the very first thing done to the socket, before `bind`/`SO_RCVBUF`/`SO_RCVTIMEO`, closing
+  the window where a `setFilter` call made after `open` returns can leave frames the filter
+  would reject already queued and delivered anyway (measured: the pre-existing pattern —
+  `open`, then `setFilter` — still leaks a frame sent in between; `Options.filter` does not,
+  in three repeated runs) (F4). `recv` now uses `recvmsg` instead of `recvfrom`, requesting
+  `PACKET_AUXDATA`, and `Frame` gained `vlan_tci: ?u16` — the 802.1Q tag the kernel strips
+  before this module ever sees a frame (`EthHeader.ethertype`'s doc) is no longer simply
+  gone: the byte-stripping and ethertype-rewrite this module already exhibited are now a
+  permanent regression test (previously undocumented as *behavior*, only as prose), and the
+  new `PACKET_AUXDATA` parser is unit-tested against a real captured kernel control message.
+  ⚠ Live population of the tag value itself (`TP_STATUS_VLAN_VALID`) was never observed set
+  by this kernel for a manually-injected loopback frame in an unprivileged netns — `vlan_tci`
+  reads `null` in that live test, an environment limit disclosed in `A1/rawsock.md` F3, not a
+  code defect (part of F3 — the doc-comment half was already fixed in the prior pass).
+  **Bug fix, internal only (no behavior change):** `formatHwaddr` replaced `std.fmt.bufPrint`
+  with a hand-rolled hex table — byte-identical output (pinned by the existing round-trip
+  test plus a new 256-sample comparison against the old implementation), measured 69.78 ns
+  to 2.74 ns per call in `ReleaseFast` (25.5x) (F11).
+  Open, deferred: F10 (the `socket()`→`bind()` window — needs a second real interface to
+  reproduce, `lo` alone doesn't give it one) and F12 as a whole (the remaining socket-path
+  mutation survivors need the audit's own two-gate `mutate.py` harness, out of scope for a
+  single slot). scripts/modtest rawsock: 28/35 (7 privileged skip without CAP_NET_RAW);
+  under `unshare --user --map-root-user --net`: 35/35, Debug and ReleaseFast alike.
+
+- **2026-09-10** — A1 fix campaign, first pass (no consumers in-repo, P1 applies): ten of the audit's
   sixteen findings closed. **New, additive:** `Frame.wire_len` via `MSG_TRUNC` — a frame
   longer than the caller's buffer used to be indistinguishable from one that fit exactly
   (F1); `Socket.stats()` (`PACKET_STATISTICS`) — a socket that silently dropped 98.9% of a
