@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign, F13.** A UDP reply bigger than the resolver's receive buffer
+  used to be decoded truncated instead of retried over TCP whenever the server sent it without
+  setting the TC bit — a real server does set TC when it knows a reply will not fit, but nothing
+  stopped a broken or hostile one from sending an oversized reply and skipping it. `udpExchange` now
+  also consults the kernel's own delivery flag (`IncomingMessage.flags.trunc`, `MSG_TRUNC`) and
+  `query` retries over TCP on either signal — the TC bit the server set, or the kernel's own verdict
+  that the datagram did not fit. Measured: a loopback stub sending a 1800-byte reply with TC clear
+  against a 1232-byte `rbuf` — before the fix, `query` decoded the truncated bytes directly and
+  never dialed TCP at all (confirmed by running the new test under the pre-fix code: `scripts/modtest
+  dns -Dtest-filter=F13` timed out at its 25 s cap, `exit 124`, because the test's silent TCP peer was
+  never connected to); after the fix the same scenario reaches TCP and the test passes in \<1 s.
+  `test-dns`: 64/64 (was 63). SPEC's Backlog no longer lists this; the "consult `MSG_TRUNC`"
+  bullet is done.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** the seven `test "live: …"` leave the module and
   become the program `tools/live.zig` (`zig build live-dns`). They talked to real resolvers —
   recursive UDP and TCP, reverse PTR of `8.8.8.8`, and the three DoH shapes against `dns.google` and

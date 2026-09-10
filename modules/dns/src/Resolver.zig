@@ -388,14 +388,22 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
                 return r.decodeResponse(raw, id, name, ty);
             }
 
-            const raw = r.udpExchange(server, packet, id, rbuf) catch |err| switch (err) {
+            const udp = r.udpExchange(server, packet, id, rbuf) catch |err| switch (err) {
                 error.Canceled, error.OutOfMemory => |e| return e,
                 else => {
                     last_err = err;
                     continue;
                 },
             };
-            if (raw.len >= 3 and raw[2] & 0x02 != 0) { // TC bit → retry over TCP
+            const raw = udp.data;
+            // Retry over TCP when either says the UDP reply is not the whole
+            // answer: the TC bit the server itself set, or the kernel's own
+            // truncation flag for a datagram the server sent oversized
+            // without setting TC (audit F13). The truncated bytes are never
+            // decoded -- a header whose counts no longer match its body is
+            // exactly the malformed input this resolver already treats as
+            // untrustworthy, so there is nothing to gain from trying first.
+            if (udp.truncated or (raw.len >= 3 and raw[2] & 0x02 != 0)) {
                 const traw = r.tcpExchange(server, packet) catch |err| switch (err) {
                     error.Canceled, error.OutOfMemory => |e| return e,
                     else => {
@@ -584,10 +592,21 @@ fn runBounded(
     return if (expired) error.Timeout else error.Canceled;
 }
 
+/// Result of one UDP round-trip: `data` points into the caller's `rbuf`, and
+/// `truncated` is the kernel's own verdict (`MSG_TRUNC`) on whether the full
+/// datagram fit — independent of whatever the TC bit inside `data` says,
+/// because a server that sends an oversized reply without setting TC (a bug,
+/// or indifference to what it advertised) still gets its delivery truncated
+/// by the socket layer (audit F13).
+const UdpResult = struct {
+    data: []u8,
+    truncated: bool,
+};
+
 /// One UDP round-trip. Datagrams from the wrong peer or with the wrong id
 /// are ignored (anti-spoofing, same as Go/c-ares) until the deadline.
 /// The returned slice points into `rbuf`.
-fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rbuf: []u8) Error![]u8 {
+fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rbuf: []u8) Error!UdpResult {
     const io = r.io;
     const dest = toNetAddress(server, r.options.port);
     const bind_addr: net.IpAddress = switch (server) {
@@ -614,7 +633,7 @@ fn udpExchange(r: *Resolver, server: netaddr.Ip, packet: []const u8, id: u16, rb
         if (!incoming.from.eql(&dest)) continue;
         if (incoming.data.len < message.header_len) continue;
         if (std.mem.readInt(u16, incoming.data[0..2], .big) != id) continue;
-        return incoming.data;
+        return .{ .data = incoming.data, .truncated = incoming.flags.trunc };
     }
 }
 
@@ -1182,6 +1201,10 @@ const UdpStub = struct {
         off_bailiwick_plus_honest,
         /// Header only with the TC bit set: the resolver must go to TCP.
         truncated,
+        /// A datagram bigger than any resolver rbuf, TC bit NOT set: the kernel
+        /// truncates delivery and only `IncomingMessage.flags.trunc` says so
+        /// (audit F13).
+        oversized_no_tc,
     };
     // The two lying-question scripts this stub also used to carry
     // (`wrong_question`, `no_question`) moved to
@@ -1201,9 +1224,23 @@ const UdpStub = struct {
         const a_example = "\xc0\x0c" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xc0\x00\x02\x01";
         const a_victim = "\x06victim\x04test\x00" ++ "\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" ++ "\xcb\x00\x71\x42";
         var out: [512]u8 = undefined;
+        // Only `oversized_no_tc` needs more than `out` holds; kept out of the
+        // shared buffer so the common cases stay a small stack frame.
+        var big_out: [2048]u8 = undefined;
         const resp = switch (st.script) {
             .off_bailiwick_plus_honest => stubResponse(&out, q, 0x8180, question_echo, a_victim ++ a_example, 2),
             .truncated => stubResponse(&out, q, 0x8380, question_echo, "", 0),
+            .oversized_no_tc => blk: {
+                // TC bit clear (0x8180): a real server that respected the
+                // advertised EDNS size would set TC instead of doing this.
+                // The payload does not need to be a valid record -- the
+                // datagram is bigger than the resolver's rbuf regardless of
+                // what is inside it, and detection has to happen before
+                // decode ever runs.
+                var filler: [1800]u8 = undefined;
+                @memset(&filler, 0xaa);
+                break :blk stubResponse(&big_out, q, 0x8180, question_echo, &filler, 1);
+            },
         };
         try st.sock.send(st.io, &incoming.from, resp);
         st.served += 1;
@@ -1366,6 +1403,55 @@ test "query: the TC-bit path into a silent TCP server is bounded too (default tr
     udp_fut.await(io); // bounded: the stub's own receive deadline is 5 s
     udp_joined = true;
     try testing.expectEqual(@as(usize, 1), stub.served); // UDP answered with TC
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "query: a UDP reply the kernel truncated falls back to TCP even without TC set (audit F13)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Same shape as the TC-bit test above, but the UDP stub does not set TC:
+    // only `IncomingMessage.flags.trunc` (kernel MSG_TRUNC) can tell the
+    // resolver the reply did not fit. Before the fix `query` decoded the
+    // truncated bytes directly and returned `MalformedResponse` without ever
+    // dialing TCP -- this test's oracle is that it reaches the (silent) TCP
+    // server at all, the same way the TC-bit sibling proves it.
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    var silent: SilentTcp = .{ .io = io, .server = addr.listen(io, .{ .reuse_address = true }) catch return error.SkipZigTest };
+    defer silent.server.socket.close(io);
+    const port = silent.server.socket.address.ip4.port;
+    const udp_addr: net.IpAddress = .{ .ip4 = .loopback(port) };
+    const udp_sock = udp_addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    var stub: UdpStub = .{ .io = io, .sock = udp_sock, .script = .oversized_no_tc };
+    defer stub.sock.close(io);
+
+    var tcp_fut = try io.concurrent(SilentTcp.run, .{&silent});
+    defer {
+        silent.stop.store(1, .release);
+        io.futexWake(u32, &silent.stop.raw, 1);
+        tcp_fut.await(io);
+    }
+    var udp_fut = try io.concurrent(UdpStub.run, .{&stub});
+    var udp_joined = false;
+    defer if (!udp_joined) udp_fut.await(io);
+
+    var r = Resolver.init(io, testing.allocator, .{
+        .servers = &loopback_servers,
+        .port = port,
+        .timeout_ms = 300,
+        .attempts = 1,
+        .use_search = false,
+    });
+    defer r.deinit();
+
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    udp_fut.await(io);
+    udp_joined = true;
+    try testing.expectEqual(@as(usize, 1), stub.served); // UDP delivered (truncated), TCP was then tried
+    try testing.expect(elapsed_ns >= 250 * std.time.ns_per_ms); // spent the TCP budget, not a fast MalformedResponse
     try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 

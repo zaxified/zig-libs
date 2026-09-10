@@ -47,7 +47,7 @@ stream). It is a per-attempt, per-server budget, not a per-call one: `query` may
 value. The DoH-JSON `name` is validated by the wire path's rule and percent-encoded into the URL.
 
 ## Verification
-`zig build test-dns`: 63 offline tests + 7 live (70). Offline: golden query bytes; canned responses
+`zig build test-dns`: 64 offline tests + 7 live (71). Offline: golden query bytes; canned responses
 (name compression, CNAME chain, MX/TXT/SOA/OPT, PTR); adversarial packets (truncations at every
 offset, pointer loops, bad rdata lengths incl. SOA/MX shorter than their fields, hostile section
 counts **under a 4 KiB memory limit** so the up-front count guard is pinned by the allocation it
@@ -59,8 +59,8 @@ out-of-order CNAME chain, a loop and an over-long chain; DoH-JSON URL encoding a
 and request-line injection; a replay of the three replies `zig build interop-dns` captured off a
 real loopback socket (`src/testdata/reply_*.bin` — lying question, no question, honest); and
 loopback stubs — a UDP server that slips in an off-bailiwick record, and a TCP server that accepts
-and never answers (reached both via `transport = .tcp` and via a TC-bit UDP reply), each bounded by
-`timeout_ms`.
+and never answers (reached via `transport = .tcp`, via a TC-bit UDP reply, and via a UDP reply the
+kernel truncated without the server setting TC — audit F13), each bounded by `timeout_ms`.
 
 The exchange that proves the question check ON A SOCKET is a separate program,
 `tools/interop.zig` (`zig build interop-dns`; compiled by `check-interop`, run by
@@ -76,8 +76,6 @@ A gate run on a connected machine is therefore not offline.
 ## Backlog / deferred
 - resolv.conf `options timeout:`/`attempts:` are parsed and capped but never read
   (`Options.timeout_ms`/`attempts` win unconditionally) — a decision on whether to honour or drop them.
-- A UDP reply larger than the receive buffer is truncated by the kernel without `MSG_TRUNC` being
-  consulted, so it fails as `MalformedResponse` instead of retrying over TCP.
 - A per-CALL deadline for `resolve`/`lookupIp` (today the budget is per attempt per server).
 - The text name form collapses distinct wire names (see Threat model); a structured name type
   would be an API change.
