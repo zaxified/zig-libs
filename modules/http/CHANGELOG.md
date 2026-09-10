@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, first wave on `http`: four previously-unguarded
+  guards now have regression tests (request_timeout_ms's whole-request deadline, F6;
+  chunk-size overflow guard, F9; h2's strict content-length parse, F10; per-stream
+  flow-control window ceiling, F12 — each pinned RED→GREEN against the exact mutation
+  the audit described), `gzip` is reexported from the module root alongside every
+  other codec (G9), and two doc comments that overclaimed what a guard covers are
+  corrected: `Client.Options.buffer_pool` bounds the *idle* reserve, not checked-out
+  slabs (G11), and SPEC.md's "write timeout" line now says what `TimeoutWriter`
+  already documented — it resets per write, so it does not cover a RUDY-style trickle
+  reader (F15). No observable behavior changed. Two findings from the audit turned out
+  to already be fixed in-tree and are closed as refuted, not as new work: F3 (h2
+  `:authority`/`Host` mismatch) by `a4c1ab95`, and F8 (all twelve fuzz harnesses replaying
+  one empty input) by `5929cc81`.
 - **2026-09-09** — Docs: `sizeprobe/build.zig` had no `SPDX-License-Identifier`; added.
   `zig build check-catalog` now enforces the header on every shipped `.zig`/`.c`/`.h` under
   `modules/**`.

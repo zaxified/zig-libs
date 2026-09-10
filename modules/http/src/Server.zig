@@ -5268,6 +5268,67 @@ test "integration: stalled client is dropped after the read timeout" {
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
 }
 
+test "integration: request_timeout_ms bounds the WHOLE request even when no single stall does (F6)" {
+    // The per-read stall budget (`read_timeout_ms`) resets on every byte, so
+    // a "dribbling" client that stays just inside it can hold a connection
+    // open indefinitely -- exactly the slowloris shape `request_timeout_ms`
+    // exists to close (`armRequest()` at connMain start, Server.zig). This
+    // was the one guard in the module with zero coverage (A1 audit F6,
+    // mutation M20 -- deleting the `armRequest()` call left 479/479 green).
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // read_timeout_ms is generous -- no individual gap below is anywhere
+    // near it -- so only the whole-request deadline can be what cuts this
+    // off.
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .read_timeout_ms = 5_000,
+        .request_timeout_ms = 200,
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [256]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    // One byte of the head every 80 ms: each gap is 62x under
+    // read_timeout_ms, but six of them is 480 ms of wall clock -- over the
+    // 200 ms whole-request deadline. If only the per-read timer were live,
+    // this loop would run to completion and the server would still be
+    // waiting for the rest of the head (never sent: no blank line ends it).
+    const head = "GET /hello HTTP/1.1\r\n";
+    for (head) |c| {
+        sw.interface.writeAll(&.{c}) catch break; // server may have hung up already
+        sw.interface.flush() catch break;
+        try sleepMs(io, 80);
+    }
+    // Outcome alone does not discriminate the guard: with NO deadline armed
+    // at all, `read_timeout_ms` eventually drops this connection too, just
+    // ~5 s later than the request deadline would. Time the close instead --
+    // 800 ms sits comfortably above the 200 ms deadline path (armed) and
+    // comfortably below the earliest the 5 s stall fallback could fire
+    // (unarmed), so only the armed path can pass.
+    const started_ns = monotonicNowNs();
+    try testing.expectError(error.EndOfStream, sr.interface.take(1));
+    const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
+    try testing.expect(elapsed_ms < 800);
+}
+
 // ── tests (in-process integration — Phase 2.1 hardening) ────────────────────
 
 /// Poll `activeConnections` until it reaches `want` (bounded ≈ 10 s).

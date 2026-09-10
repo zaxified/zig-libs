@@ -150,6 +150,23 @@ pub const range = @import("range.zig");
 /// q-value parser (N1) — media-ranges with integer milli-unit weights.
 pub const conneg = @import("conneg.zig");
 
+/// Negotiated response compression for `Server` (`acceptsGzip`,
+/// `contentTypeCompressible`, `requestContentEncoding`, the `Scratch` /
+/// `DecodeScratch` compression/decompression buffers) — the pure,
+/// offline-testable half; the wire-side integration lives in `Server.zig`.
+/// Was missing from this list (A1 audit G9, 2026-09-04): every sibling
+/// codec module above is reachable by name through `http.<name>`, this one
+/// was reachable only by inference through `Server.Options.compression`.
+pub const gzip = @import("gzip.zig");
+
+/// Negotiated response compression for `Server` (`acceptsGzip`,
+/// `contentTypeCompressible`, `requestContentEncoding`, the `Scratch` /
+/// `DecodeScratch` compression/decompression buffers) — the pure,
+/// offline-testable half; the wire-side integration lives in `Server.zig`.
+/// Was missing from this list (A1 audit G9, 2026-09-04): every sibling
+/// codec module above is reachable by name through `http.<name>`, this one
+/// was reachable only by inference through `Server.Options.compression`.
+
 // ── request vocabulary ──────────────────────────────────────────────────────
 
 pub const Method = enum {
@@ -651,4 +668,14 @@ test "removeDotSegments" {
         @memcpy(buf[0..case.in.len], case.in);
         try testing.expectEqualStrings(case.out, buf[0..removeDotSegments(buf[0..case.in.len])]);
     }
+}
+
+test "gzip is reexported at the module root, like every other codec here (G9)" {
+    // Before this fix `root.zig` listed h1/hpack/h2/h2_client/h2_server/
+    // h2_upstream/bufpool/Client/Server/proxy/conditional/body/multipart/
+    // sse/range/conneg but not gzip, so a consumer had no name to reach
+    // `acceptsGzip`/`contentTypeCompressible`/etc through `@import("http")`
+    // with -- only inference via `Server.Options.compression` (A1 audit G9,
+    // 2026-09-04). This resolves iff the `pub const gzip` line exists.
+    try testing.expect(!gzip.acceptsGzip(null));
 }

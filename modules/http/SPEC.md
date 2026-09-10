@@ -147,8 +147,13 @@ Hardened for direct internet exposure (no reverse proxy required):
   (`InvalidHeader`, nothing framed). Measured end to end before the fix (2026-09-04, A1 G1): an
   unauthenticated h2c client's `:path` became a complete second HTTP/1.1 request on the
   backend's wire, answered 200. `proxy.zig`'s "A1 G1" integration test stands on that wire.
-- **Resource/DoS:** slowloris read/request/write timeouts; size caps (413/431/414); per-connection
-  request-count cap; inbound gzip is zip-bomb-capped (`max_decompressed_request_bytes` → 413).
+- **Resource/DoS:** slowloris read/request timeouts bound the whole request (`request_timeout_ms`
+  covers keep-alive idle + head + body reads together; response writing and handler compute time
+  are not counted). The write-side stall timeout (`write_timeout_ms`) is a *per-write* budget that
+  resets on every successful write — it drops a peer that stops reading outright, but not one that
+  keeps draining a response a trickle at a time (RUDY-style slow-read); see `TimeoutWriter`'s doc
+  comment. Size caps (413/431/414); per-connection request-count cap; inbound gzip is
+  zip-bomb-capped (`max_decompressed_request_bytes` → 413).
 - **HTTP/2 DoS:** rapid-reset (CVE-2023-44487), CONTINUATION-flood (CVE-2024-27316),
   MAX_CONCURRENT_STREAMS, control-frame flood budgets, total-streams-per-conn cap — all
   configurable, safe by default (so `enable_h2c` is hardened out of the box), and the shipped

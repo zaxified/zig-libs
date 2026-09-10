@@ -1296,6 +1296,16 @@ test "ChunkedReader rejects malformed and truncated input" {
         .{ .wire = "5\r\nab", .reason = .truncated_body }, // stream ends mid-chunk
         .{ .wire = "3\r\nabc\r\n", .reason = .truncated_body }, // stream ends before 0-chunk
         .{ .wire = "3\r\nabc\r\n0\r\n", .reason = .truncated_body }, // stream ends before trailer end
+        // F9 (A1 audit 2026-09-04): RFC 9112 §7.1 MUST — a chunk-size text
+        // over 16 hex digits must be rejected before it is folded into the
+        // u64 accumulator, or `size = (size << 4) | d` silently overflows
+        // instead of erroring. 17 digits, one past the cap; a leading `1`
+        // makes the *value* 2^64, which wraps to 0 under `<<`/`|` if the
+        // length guard is gone -- so a mutant that removes the guard does
+        // not merely mis-decode, it reads the wire as an IMMEDIATE last
+        // chunk instead of the (attacker-controlled) huge one it claims to
+        // be, which is the actual smuggling shape RFC 9112 §7.1 names.
+        .{ .wire = "10000000000000000\r\nDEBUGPROBE\r\n0\r\n\r\n", .reason = .malformed_chunk },
     };
     for (cases) |case| {
         var src: Reader = .fixed(case.wire);
@@ -1306,6 +1316,12 @@ test "ChunkedReader rejects malformed and truncated input" {
         try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
         try testing.expectEqual(case.reason, cr.fail_reason.?);
     }
+}
+
+test "ChunkedReader: chunk-size at exactly the 16 hex-digit cap still decodes (F9 boundary)" {
+    // Positive control for the guard above: 16 digits is the documented
+    // ceiling, not one past it, and must not be rejected as collateral.
+    try expectChunkedDecode("0000000000000005\r\nabcde\r\n0\r\n\r\n", "abcde");
 }
 
 test "ChunkedReader captures trailers when a buffer is provided" {

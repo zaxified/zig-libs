@@ -2155,6 +2155,25 @@ test "connection: connection window overflow → FLOW_CONTROL_ERROR" {
     try expectViolation(&conn, bytes.items, error.FlowControlError, .connection);
 }
 
+test "connection: STREAM send-window overflow → FLOW_CONTROL_ERROR (F12)" {
+    // §6.9.1's 2^31-1 ceiling is checked on both `st.send_window`
+    // (h2.zig:1517-1518) and `c.conn_send_window` (:1511-1512, tested
+    // above) -- but only the connection arm had a test (A1 audit F12,
+    // 2026-09-04): mutation M11 (delete the stream check) left 479/479
+    // green while its M12 connection-side twin was already caught.
+    const gpa = testing.allocator;
+    var conn = try testServer();
+    defer conn.deinit();
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(gpa);
+    // Open stream 1 first -- a WINDOW_UPDATE on an idle stream is §5.1
+    // PROTOCOL_ERROR, not the flow-control violation under test.
+    try encodeHeaders(gpa, &bytes, 1, &.{0x82}, .{});
+    // 65535 (initial) + 2^31-1 exceeds the cap on THIS stream's window.
+    try encodeWindowUpdate(gpa, &bytes, 1, max_window_size);
+    try expectViolation(&conn, bytes.items, error.FlowControlError, .stream);
+}
+
 test "connection: bad SETTINGS values rejected with the right codes" {
     const gpa = testing.allocator;
     {

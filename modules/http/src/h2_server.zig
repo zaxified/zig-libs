@@ -3124,6 +3124,34 @@ test "h2c serve: a `host` field beside :authority must agree (§8.3.1), is writt
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
 }
 
+test "h2c serve: h2 content-length is strict 1*DIGIT like h1's (F10) — leading `+`/`-`, embedded `_`, leading zero all rejected" {
+    // `h1.parseContentLengthStrict` is called here (h2_server.zig) but had
+    // no test on this path — only h1's own parser had one (A1 audit F10,
+    // 2026-09-04). Regression M18 (swap it back for `std.fmt.parseInt`)
+    // would let all four bad shapes through; this pins the strict parse.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+
+    const sid_plus = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-length", "+5"), true);
+    const sid_underscore = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-length", "1_0"), true);
+    const sid_minus_zero = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-length", "-0"), true);
+    const sid_hex = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-length", "0x5"), true);
+    const sid_space = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-length", " 5"), true);
+    // Positive control: a plain digit string, on an actually-empty body.
+    const sid_ok = try peer.conn.startStream(&peer.wire, &fieldsWith("/headers", "t", "content-length", "0"), true);
+
+    var out_buf: [16384]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    for ([_]u31{ sid_plus, sid_underscore, sid_minus_zero, sid_hex, sid_space }) |sid| {
+        try testing.expectEqual(@as(?h2.ErrorCode, .protocol_error), peer.resp(sid).rst);
+    }
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid_ok).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
 test "h2c serve: garbage after the preface → GOAWAY (offline)" {
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});

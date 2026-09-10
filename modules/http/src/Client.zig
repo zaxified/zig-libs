@@ -155,8 +155,14 @@ pub const Options = struct {
     /// `gpa.alloc`s its own `read_buffer_size + write_buffer_size` slab and
     /// frees it on `H2Session.close`, exactly as before. When set, that slab
     /// is checked out of / returned to the pool instead, so a gateway that
-    /// churns h2 upstream connections reuses a bounded set of slabs rather
-    /// than allocating one per dial. **The pool's `slab_size` MUST equal
+    /// churns h2 upstream connections reuses slabs across dials instead of
+    /// allocating a fresh one every time. ⚠ "Bounded" describes the IDLE
+    /// reserve (`bufpool.Options.max_idle_slabs`), not slabs currently
+    /// checked out: those are never counted against that cap (see
+    /// `bufpool.zig`'s own doc), so peak memory is still
+    /// `slab_size × concurrent dials`, same as the unpooled default — the
+    /// pool buys reuse, not a memory ceiling (A1 audit G11, 2026-09-04).
+    /// **The pool's `slab_size` MUST equal
     /// `read_buffer_size + write_buffer_size`** (`connectH2c` returns
     /// `error.BufferPoolSizeMismatch` otherwise) — it serves exactly that
     /// one size class. The h1 path deliberately does
