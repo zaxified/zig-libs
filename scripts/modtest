@@ -82,6 +82,16 @@ log_dir="$REPO_ROOT/.zig-cache/modtest"
 mkdir -p "$log_dir"
 log="$log_dir/$module.log"
 
+# ⛔ One lane per module at a time. Two concurrent runs of the same module write
+# the same log and clobber each other's result -- measured 2026-09-10, an agent
+# lost a measurement twice that way and could not tell which run it was reading.
+# `flock -n` on the log makes the second one say so instead of racing.
+exec 9>>"$log.lock" 2>/dev/null || true
+if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
+    echo "⛔ modtest $module is already running (log $log). Wait for it or use a different module." >&2
+    exit 2
+fi
+
 : "${ZIGLIBS_MEM_MAX:=4G}"
 : "${ZIGLIBS_MODTEST_LOG_MAX:=256M}"
 : "${NICE:=15}"
