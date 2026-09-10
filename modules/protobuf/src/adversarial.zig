@@ -154,7 +154,7 @@ test "hostile: truncation at every offset of a valid message never panics" {
             var m = d.*;
             m.deinit();
         } else |err| switch (err) {
-            error.Truncated, error.VarintOverflow, error.FieldNumberZero, error.FieldNumberOutOfRange, error.UnsupportedWireType => {},
+            error.Truncated, error.VarintOverflow, error.FieldNumberZero, error.FieldNumberOutOfRange, error.UnsupportedWireType, error.NonMinimalTag => {},
             else => return err,
         }
     }
@@ -190,6 +190,11 @@ test "hostile: byte-flip sweep never panics" {
                 // invalid UTF-8, which a `string` field must refuse — still
                 // a clean typed error, which is all this sweep asserts.
                 error.InvalidUtf8,
+                // A flip inside a tag's varint bytes can turn a minimally
+                // encoded tag into a non-minimal one (e.g. setting the
+                // continuation bit on what was the tag's last byte) — F3's
+                // new check, also a clean typed error.
+                error.NonMinimalTag,
                 => {},
                 else => return err,
             }
@@ -380,4 +385,110 @@ test "hostile: an empty input is a valid all-defaults message" {
     defer d.deinit();
     try testing.expectEqual(@as(i32, 0), d.value.i32_);
     try testing.expect(d.value.inner == null);
+}
+
+// ── F2: sint32 truncates *before* zigzag, matching the reference ───────────
+
+test "hostile: sint32 truncates to 32 bits before zigzag, not after" {
+    // Both vectors and their reference-observed results are from the wave-3
+    // audit (`google.protobuf` 4.21.12). Wide.s32 is field 5 (tag 0x28).
+    // Truncating after zigzag (the old order) and before it (the fix) agree
+    // below 2^32 and disagree above it, which is exactly why round-trip and
+    // golden tests never caught this: this module's own encoder never
+    // produces a varint >= 2^32 for an `i32` value.
+    const gpa = testing.allocator;
+
+    // varint = 2^32 (`80 80 80 80 10`): truncate-first gives 0, so zigzag
+    // decodes to 0. The old order zigzagged 2^32 on 64 bits first (giving a
+    // huge odd/even split) and then truncated, landing on i32 MIN instead.
+    {
+        var d = try pb.decode(ct.Wide, gpa, &.{ 0x28, 0x80, 0x80, 0x80, 0x80, 0x10 }, .{});
+        defer d.deinit();
+        try testing.expectEqual(@as(i32, 0), d.value.s32);
+    }
+    // varint = u64::MAX (ten 0xff-pattern bytes): truncate-first keeps the
+    // low 32 bits all set (0xffff_ffff), which zigzag-decodes to i32 MIN —
+    // the reference's actual answer for this input.
+    {
+        var d = try pb.decode(ct.Wide, gpa, &.{
+            0x28, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        }, .{});
+        defer d.deinit();
+        try testing.expectEqual(@as(i32, std.math.minInt(i32)), d.value.s32);
+    }
+    // Positive control: an ordinary small value is unaffected by the order.
+    {
+        var d = try pb.decode(ct.Wide, gpa, &.{ 0x28, 0x03 }, .{}); // zigzag(3) = -2
+        defer d.deinit();
+        try testing.expectEqual(@as(i32, -2), d.value.s32);
+    }
+}
+
+// ── F3: a non-minimally encoded TAG is refused; a non-minimal VALUE is not ──
+
+test "hostile: a non-minimally encoded tag is refused, not decoded as the field it names" {
+    const gpa = testing.allocator;
+    // Presence.explicit is field 2, wire varint: minimal tag byte is 0x10
+    // (16). `90 00` spells the same 16 non-minimally, in two bytes. The
+    // reference's pure-Python decoder dispatches on the tag's raw BYTES
+    // (`_decoders_by_tag[tag_bytes]`) and never matches a known field for a
+    // non-minimal encoding, so it reads `explicit` as unset — this decoder
+    // used to dispatch on the field NUMBER instead and read `explicit = 5`
+    // (wave-3 audit finding `protobuf` F3, 32/32 tested variants disagreed).
+    const attack = [_]u8{ 0x90, 0x00, 0x05 };
+    try testing.expectError(error.NonMinimalTag, pb.decode(ct.Presence, gpa, &attack, .{}));
+
+    // Positive control: the MINIMAL encoding of the very same field/value
+    // still decodes.
+    var ok = try pb.decode(ct.Presence, gpa, &.{ 0x10, 0x05 }, .{});
+    defer ok.deinit();
+    try testing.expectEqual(@as(?i32, 5), ok.value.explicit);
+}
+
+test "hostile: a non-minimal VALUE varint still decodes — only the tag got stricter" {
+    // SPEC's "Smaller hardening" claims non-minimal varints are accepted,
+    // verified parity with the reference. F3 narrows that claim to VALUES;
+    // this pins that the narrowing did not overreach into rejecting a
+    // non-minimally encoded value too. Wide.i32_ is field 1 (tag 0x08,
+    // already minimal); its value (1) is encoded non-minimally as `81 00`.
+    const gpa = testing.allocator;
+    var d = try pb.decode(ct.Wide, gpa, &.{ 0x08, 0x81, 0x00 }, .{});
+    defer d.deinit();
+    try testing.expectEqual(@as(i32, 1), d.value.i32_);
+}
+
+// ── F4: the length bound holds all the way to u64::MAX, not just below 2^40 ─
+
+test "hostile: declared lengths at 2^63 and u64::MAX are refused too, not just below 2^40" {
+    // `adversarial.zig`'s own prior coverage topped out at 0x7fff_ffff (see
+    // the "4 GiB" and "submessage length" tests above), which left the
+    // upper half of the u64 domain of `Cursor.take`'s bound untested —
+    // wave-3 audit finding `protobuf` F4. `Cursor.take` compares against
+    // `remaining()` widened to u64 with no upper special-case, so these are
+    // expected to already pass; the vectors were simply missing.
+    const gpa = testing.allocator;
+    for ([_]u64{ @as(u64, 1) << 40, @as(u64, 1) << 63, std.math.maxInt(u64) }) |n| {
+        var buf: [11]u8 = undefined;
+        buf[0] = 0x7a; // Wide.s, tag + wire type LEN
+        var e = pb.wire.Emitter.init(buf[1..]);
+        e.varint(n);
+        try testing.expectError(error.Truncated, pb.decode(ct.Wide, gpa, buf[0 .. 1 + e.pos], .{}));
+    }
+}
+
+// ── F5: UTF-8 validation holds past the first 64 bytes of a string ─────────
+
+test "hostile: invalid UTF-8 well past a 64-byte prefix is still refused" {
+    // `adversarial.zig`'s existing UTF-8 vectors are all 1-4 bytes, so a
+    // decoder that only validated a string's first N bytes (any N under the
+    // shortest real-world case) would pass every existing test — wave-3
+    // audit finding `protobuf` F5. This one is 80 bytes: 79 valid ASCII
+    // bytes, then one invalid start byte at offset 79 — past any small N.
+    const gpa = testing.allocator;
+    var msg: [82]u8 = undefined;
+    msg[0] = 0x7a; // Wide.s tag
+    msg[1] = 80; // length, one byte (< 128)
+    @memset(msg[2..81], 'a');
+    msg[81] = 0xff; // invalid UTF-8 start byte
+    try testing.expectError(error.InvalidUtf8, pb.decode(ct.Wide, gpa, &msg, .{}));
 }

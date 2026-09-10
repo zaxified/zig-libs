@@ -117,8 +117,11 @@ const name = decoded.value.name;
 
 Errors: `Truncated` (a declared length or a value ran past the end of the input),
 `VarintOverflow` (a varint longer than 10 bytes, or one whose value will not fit a `u64`),
-`FieldNumberZero`, `UnsupportedWireType` (groups — wire types 3/4 — and the two unassigned ones),
-`DepthExceeded`, `InvalidEnumValue`, `UnknownField`, `OutOfMemory`.
+`FieldNumberZero`, `FieldNumberOutOfRange` (field number above `2^29-1`), `UnsupportedWireType`
+(groups — wire types 3/4 — and the two unassigned ones), `NonMinimalTag` (a tag varint encoded
+with extra continuation bytes — no conforming encoder emits one), `DepthExceeded`,
+`InvalidUtf8` (a `string` field that is not valid UTF-8), `InvalidEnumValue`, `UnknownField`,
+`OutOfMemory`.
 
 ## Unknown fields
 
@@ -136,7 +139,7 @@ const forwarded = try protobuf.encodeAlloc(gpa, partial.value, .{}); // still ca
 ## Verify
 
 ```bash
-zig build test-protobuf --summary all      # 65 tests, none of them skipped
+zig build test-protobuf --summary all      # 73 tests, none of them skipped
 ```
 
 **The suite is hermetic.** It needs no python3, no subprocess and no network, and it has no skip

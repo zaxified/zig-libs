@@ -401,3 +401,113 @@ test "encodeInto writes into a caller buffer and refuses a short one" {
     var tiny: [3]u8 = undefined;
     try testing.expectError(error.NoSpaceLeft, pb.encodeInto(&tiny, v, .{}));
 }
+
+// ── F7: a message with dozens of fields still compiles ─────────────────────
+
+test "a 40-field message compiles and round-trips (28 was the old ceiling)" {
+    // `schema.infos`' comptime derivation hit `@setEvalBranchQuota`'s old
+    // budget (20_000) at exactly 29 fields — `evaluation exceeded 20000
+    // backwards branches`, pointing into schema.zig's own duplicate-number
+    // check rather than at anything the caller wrote (wave-3 audit finding
+    // `protobuf` F7). 40 fields is comfortably past that ceiling and not an
+    // unusual schema size in real protobuf use.
+    const Wide40 = struct {
+        f0: i32 = 0,
+        f1: i32 = 0,
+        f2: i32 = 0,
+        f3: i32 = 0,
+        f4: i32 = 0,
+        f5: i32 = 0,
+        f6: i32 = 0,
+        f7: i32 = 0,
+        f8: i32 = 0,
+        f9: i32 = 0,
+        f10: i32 = 0,
+        f11: i32 = 0,
+        f12: i32 = 0,
+        f13: i32 = 0,
+        f14: i32 = 0,
+        f15: i32 = 0,
+        f16: i32 = 0,
+        f17: i32 = 0,
+        f18: i32 = 0,
+        f19: i32 = 0,
+        f20: i32 = 0,
+        f21: i32 = 0,
+        f22: i32 = 0,
+        f23: i32 = 0,
+        f24: i32 = 0,
+        f25: i32 = 0,
+        f26: i32 = 0,
+        f27: i32 = 0,
+        f28: i32 = 0,
+        f29: i32 = 0,
+        f30: i32 = 0,
+        f31: i32 = 0,
+        f32: i32 = 0,
+        f33: i32 = 0,
+        f34: i32 = 0,
+        f35: i32 = 0,
+        f36: i32 = 0,
+        f37: i32 = 0,
+        f38: i32 = 0,
+        f39: i32 = 0,
+
+        pub const pb_fields = .{
+            .f0 = Field{ .number = 1, .kind = .int32 },
+            .f1 = Field{ .number = 2, .kind = .int32 },
+            .f2 = Field{ .number = 3, .kind = .int32 },
+            .f3 = Field{ .number = 4, .kind = .int32 },
+            .f4 = Field{ .number = 5, .kind = .int32 },
+            .f5 = Field{ .number = 6, .kind = .int32 },
+            .f6 = Field{ .number = 7, .kind = .int32 },
+            .f7 = Field{ .number = 8, .kind = .int32 },
+            .f8 = Field{ .number = 9, .kind = .int32 },
+            .f9 = Field{ .number = 10, .kind = .int32 },
+            .f10 = Field{ .number = 11, .kind = .int32 },
+            .f11 = Field{ .number = 12, .kind = .int32 },
+            .f12 = Field{ .number = 13, .kind = .int32 },
+            .f13 = Field{ .number = 14, .kind = .int32 },
+            .f14 = Field{ .number = 15, .kind = .int32 },
+            .f15 = Field{ .number = 16, .kind = .int32 },
+            .f16 = Field{ .number = 17, .kind = .int32 },
+            .f17 = Field{ .number = 18, .kind = .int32 },
+            .f18 = Field{ .number = 19, .kind = .int32 },
+            .f19 = Field{ .number = 20, .kind = .int32 },
+            .f20 = Field{ .number = 21, .kind = .int32 },
+            .f21 = Field{ .number = 22, .kind = .int32 },
+            .f22 = Field{ .number = 23, .kind = .int32 },
+            .f23 = Field{ .number = 24, .kind = .int32 },
+            .f24 = Field{ .number = 25, .kind = .int32 },
+            .f25 = Field{ .number = 26, .kind = .int32 },
+            .f26 = Field{ .number = 27, .kind = .int32 },
+            .f27 = Field{ .number = 28, .kind = .int32 },
+            .f28 = Field{ .number = 29, .kind = .int32 },
+            .f29 = Field{ .number = 30, .kind = .int32 },
+            .f30 = Field{ .number = 31, .kind = .int32 },
+            .f31 = Field{ .number = 32, .kind = .int32 },
+            .f32 = Field{ .number = 33, .kind = .int32 },
+            .f33 = Field{ .number = 34, .kind = .int32 },
+            .f34 = Field{ .number = 35, .kind = .int32 },
+            .f35 = Field{ .number = 36, .kind = .int32 },
+            .f36 = Field{ .number = 37, .kind = .int32 },
+            .f37 = Field{ .number = 38, .kind = .int32 },
+            .f38 = Field{ .number = 39, .kind = .int32 },
+            .f39 = Field{ .number = 40, .kind = .int32 },
+        };
+    };
+
+    const gpa = testing.allocator;
+    var v: Wide40 = .{};
+    v.f0 = 1;
+    v.f28 = 29; // the field number that used to be the ceiling
+    v.f39 = 40;
+
+    const bytes = try pb.encodeAlloc(gpa, v, .{});
+    defer gpa.free(bytes);
+    var d = try pb.decode(Wide40, gpa, bytes, .{});
+    defer d.deinit();
+    try testing.expectEqual(@as(i32, 1), d.value.f0);
+    try testing.expectEqual(@as(i32, 29), d.value.f28);
+    try testing.expectEqual(@as(i32, 40), d.value.f39);
+}

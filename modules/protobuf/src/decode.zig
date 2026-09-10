@@ -348,7 +348,14 @@ fn readValue(
         .int64 => @bitCast(try cur.varint()),
         .uint32 => @truncate(try cur.varint()),
         .uint64 => try cur.varint(),
-        .sint32 => @truncate(wire.zigzagDecode(try cur.varint())),
+        // Truncate to 32 bits *before* the zigzag transform, matching the
+        // reference (`ZigZagDecode32(static_cast<uint32>(v))`): a varint
+        // >= 2^32 in a `sint32` field is truncated first, then interpreted
+        // as a zigzagged 32-bit value. Doing zigzag on the full 64 bits and
+        // truncating afterwards (the old order here) agrees for varints
+        // below 2^32 but disagrees above it — wave-3 audit finding
+        // `protobuf` F2, verified against `google.protobuf` 4.21.12.
+        .sint32 => wire.zigzagDecode32(@truncate(try cur.varint())),
         .sint64 => wire.zigzagDecode(try cur.varint()),
         .bool => (try cur.varint()) != 0,
         .@"enum" => blk: {

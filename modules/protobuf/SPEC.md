@@ -165,6 +165,19 @@ reference rejects. The check is on the untrusted side, which is the side the thr
   the way upstream C++ does. Truncating lets one stream mean two different things to two readers,
   which is a parser-differential primitive; rejecting cannot, and the reference never emits such a
   varint, so nothing legitimate is lost.
+- **Non-minimal varints are accepted** for a field's *value* — checked against the oracle
+  (`18 81 00` → `ACCEPT n: 1`), so that one is parity, not a differential.
+- **A non-minimally encoded *tag* is rejected** (`error.NonMinimalTag`), which is the opposite
+  choice from the line above and deliberately so. The reference's pure-Python decoder dispatches
+  on the tag's raw bytes (`_decoders_by_tag[tag_bytes]`), so a non-minimal tag never matches a
+  known field there and is read as unknown — reading it by field number instead (this codec's old
+  behaviour) let one byte string name two different fields to two readers, and for `proto3
+  optional` a different *presence* verdict too (wave-3 audit finding `protobuf` F3, 32/32 tested
+  variants disagreed with the reference). No conforming encoder, including this module's own,
+  ever emits a non-minimal tag, so nothing legitimate is lost. ⚠ Honesty about scope: this was
+  checked against the pure-Python reference only — `upb` (upstream C++) was not available to
+  verify against, and reportedly dispatches by field number, which would agree with the old
+  behaviour instead. If that turns out to matter for a specific peer, this is the line to revisit.
 - **Field number 0** is reserved and rejected.
 - **A wire-type mismatch is not a parse failure** — protobuf's rule is that such a field is
   unknown. It is skipped (and preserved, if there is a sink), matching the reference.

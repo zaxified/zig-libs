@@ -5,6 +5,62 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, wave-3 audit findings. **Consumer-visible: a `sint32`
+  field's decoded value can change for a peer that sends a varint >= 2^32 (a bug fix — the
+  old order disagreed with the reference above that threshold), and a new error
+  `error.NonMinimalTag` can now surface from `decode` (a non-minimally encoded tag varint
+  used to be read as the field it names; it is refused instead, closing a smuggling
+  primitive — P1, input hardening, `grpc` propagates it through its existing catch-all
+  `|| protobuf.DecodeError` union, no exhaustive switch to update).**
+  - **F2 (HIGH):** `sint32` decode zigzagged on 64 bits and truncated to 32 *after* —
+    the reference truncates to 32 bits *first*. The two orders agree below 2^32 and
+    disagree above it. Fixed with a dedicated `wire.zigzagDecode32`. Measured: the
+    regression test failed `expected 0, found -2147483648` against the old order,
+    passes now (72/72).
+  - **F3 (HIGH):** a non-minimally encoded tag varint (e.g. `90 00` for tag byte `10`)
+    used to dispatch on the field NUMBER it decodes to, same as this module always has;
+    the pure-Python reference dispatches on the tag's raw BYTES and never matches a
+    known field for a non-minimal encoding, reading it as unknown instead (32/32 tested
+    variants disagreed; for `proto3 optional` the disagreement is in *presence*, not
+    just value). Now rejected with `error.NonMinimalTag`. A non-minimal *value* varint
+    is untouched — that half of "Smaller hardening" stays parity with the reference, not
+    a gap. ⚠ Checked against the pure-Python reference only; `upb` was not available to
+    verify against and reportedly dispatches by field number, which would agree with the
+    old behaviour — see SPEC.md. Measured: the regression test failed
+    `expected error.NonMinimalTag, found explicit=5` against the old behaviour, passes
+    now (72/72).
+  - **F4/F5 (MED, test-only):** the length bound (`Cursor.take`) and the UTF-8 check
+    were already correct in the tree — the audit's own mutations (`L4`: weaken the
+    length bound to values under 2^40; `U3`: weaken UTF-8 validation to strings under
+    64 bytes) proved that by surviving 69/69 green, because no test vector exercised
+    either boundary. New vectors (declared lengths at 2^63 and u64::MAX; a UTF-8 error
+    at offset 79 of an 80-byte string) close the gap. Measured: re-applying `L4` now
+    crashes the suite (index-out-of-bounds panic, 71/72 + 1 crash); re-applying `U3`
+    now fails it (71/72 + 1 leak). Both mutations reverted after measurement.
+  - **F7 (MED):** `schema.infos`'s comptime duplicate-field-number check is O(n²) and
+    hit `@setEvalBranchQuota`'s old budget (20 000) at exactly 29 fields —
+    `evaluation exceeded 20000 backwards branches`, pointing into this module's own
+    internals rather than the caller's schema. Raised to 2 000 000 (sized for a few
+    hundred fields). Measured: a new 40-field message type fails to compile with that
+    exact error at the old quota, compiles and round-trips at the new one.
+  - **F9 (LOW, no behaviour change):** `Cursor.varint`'s 10-byte cap was enforced by an
+    `i == 9` branch inside a `for (0..10)` loop that always returned, which made the
+    loop's own upper bound unable to affect anything and left a `return
+    error.VarintOverflow` after the loop that could never execute — mutating the loop
+    bound (`10` -> `11`) was a silent no-op, and both mutations the audit aimed at that
+    dead line survived 69/69 green. Refactored to read the first 9 bytes in a loop and
+    the 10th explicitly after it: same semantics, no unreachable line, and the loop
+    bound is now load-bearing. Measured: re-applying the audit's mutation (loop bound
+    `9` -> `10`) on the new code now crashes 5 tests (integer overflow panic) instead of
+    surviving; reverted after measurement.
+  - **F11 (LOW, doc-only):** README's error list was missing `FieldNumberOutOfRange`
+    (added by the 2026-08-06 wave) and `InvalidUtf8`; its test count ("65 tests") was
+    already stale on top of that (73 after this wave, including `NonMinimalTag`'s three
+    new tests, F4/F5's two, and F7's one). Both fixed.
+  - F1 (HIGH), F6/F8/F10/F12/F13/F14 (MED/LOW) — left open; see
+    `~/CML/20260901-zig-libs-audit/A1/protobuf.md`'s 2026-09-10 disposition for why each
+    one needs a decision this fix pass could not make on its own, or costs more than
+    this pass's budget covers.
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** two of `fuzzDecodeNeverPanics`'s
   four knobs had no number on them. The corpus guard drew `copy_strings` and
   `reject_unknown_fields` to stay in step with the harness's word stream and

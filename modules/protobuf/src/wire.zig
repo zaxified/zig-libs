@@ -53,6 +53,12 @@ pub const Error = error{
     /// Wire type 3 or 4 (groups), or one of the two unassigned wire types
     /// (6, 7) that no conforming encoder produces.
     UnsupportedWireType,
+    /// A tag varint encoded with extra continuation bytes beyond the
+    /// minimal length for its value — e.g. `80 00` instead of `00` for tag
+    /// 0. No conforming encoder emits this; see `Cursor.tag`'s doc for why
+    /// it is rejected rather than decoded (wave-3 audit finding `protobuf`
+    /// F3).
+    NonMinimalTag,
 };
 
 /// The number of bytes `value` occupies as a base-128 varint (1..10).
@@ -79,6 +85,17 @@ pub fn zigzagEncode(value: i64) u64 {
 }
 
 pub fn zigzagDecode(value: u64) i64 {
+    return @bitCast((value >> 1) ^ (~(value & 1) +% 1));
+}
+
+/// zigzag decode on 32 bits, for `sint32`. **Not** `zigzagDecode` truncated
+/// afterwards: the reference implementation truncates the wire varint to 32
+/// bits *first* and zigzags on that (`ZigZagDecode32(static_cast<uint32>(v))`
+/// upstream). The two orders agree for varints below 2^32 and disagree above
+/// it — `sint32` accepts arbitrarily large varints on the wire like every
+/// other integer kind, so a peer can legally send one (wave-3 audit finding
+/// `protobuf` F2).
+pub fn zigzagDecode32(value: u32) i32 {
     return @bitCast((value >> 1) ^ (~(value & 1) +% 1));
 }
 
@@ -133,22 +150,31 @@ pub const Cursor = struct {
     /// value no u64 can hold, and is rejected rather than silently truncated
     /// the way the C++ implementation does — a truncating decoder lets one
     /// stream mean two different things to two readers.
+    ///
+    /// The 9-then-1 split below is deliberate, not decorative: an earlier
+    /// version read all 10 bytes through one loop with an `i == 9` special
+    /// case that unconditionally returned, which made the loop's own upper
+    /// bound (`10`) unable to affect behaviour and left a `return
+    /// error.VarintOverflow` after the loop that could never execute —
+    /// mutating the loop bound (`10` -> `11`) was a silent no-op and two
+    /// mutations targeting the dead line both survived 69/69 green (wave-3
+    /// audit finding `protobuf` F9). Reading the first 9 bytes in the loop
+    /// and the 10th explicitly after it removes both: the loop bound is now
+    /// load-bearing, and there is no unreachable line left to point at.
     pub fn varint(self: *Cursor) Error!u64 {
         var result: u64 = 0;
         var shift: u6 = 0;
-        for (0..10) |i| {
+        for (0..9) |_| {
             const b = try self.takeByte();
-            if (i == 9) {
-                // Final permissible byte: only bit 63 is still addressable.
-                if (b > 1) return error.VarintOverflow;
-                result |= @as(u64, b) << 63;
-                return result;
-            }
             result |= @as(u64, b & 0x7f) << shift;
             if (b & 0x80 == 0) return result;
             shift += 7;
         }
-        return error.VarintOverflow;
+        // The 10th and final permissible byte: only bit 63 is addressable.
+        const b = try self.takeByte();
+        if (b > 1) return error.VarintOverflow;
+        result |= @as(u64, b) << 63;
+        return result;
     }
 
     pub fn fixed32(self: *Cursor) Error!u32 {
@@ -161,10 +187,29 @@ pub const Cursor = struct {
         return std.mem.readInt(u64, b[0..8], .little);
     }
 
-    /// Read a tag. Rejects field number 0 and the wire types this codec does
-    /// not implement, so callers never have to consider them.
+    /// Read a tag. Rejects field number 0, a non-minimally encoded tag
+    /// varint, and the wire types this codec does not implement, so callers
+    /// never have to consider them.
+    ///
+    /// The non-minimal check is scoped to the tag *only* — a **value**
+    /// varint stays accepted non-minimally (see `wire.varint`'s doc and
+    /// SPEC.md's "Smaller hardening": that is verified parity with the
+    /// reference, not a gap). The tag is different: the reference's pure-
+    /// Python decoder dispatches on the tag's *raw bytes*
+    /// (`_decoders_by_tag[tag_bytes]`), not on the field number `tag()`
+    /// decodes to, so a non-minimally encoded tag never matches a known
+    /// field there and falls through as unknown — while a field-number
+    /// dispatch (this decoder, and reportedly upstream C++) reads it as the
+    /// field the number names. Two readers, two different fields (and for
+    /// `proto3 optional`, a different *presence* verdict) from one byte
+    /// string is exactly the smuggling primitive `Truncated`/`DepthExceeded`
+    /// exist to close elsewhere; rejecting it here closes it for the tag too
+    /// (wave-3 audit finding `protobuf` F3 — no legitimate encoder, this one
+    /// included, ever emits a non-minimal tag, so nothing real is lost).
     pub fn tag(self: *Cursor) Error!Tag {
+        const start = self.pos;
         const raw = try self.varint();
+        if (self.pos - start != varintLen(raw)) return error.NonMinimalTag;
         const number: u64 = raw >> 3;
         if (number == 0) return error.FieldNumberZero;
         if (number > std.math.maxInt(u29)) return error.FieldNumberOutOfRange;

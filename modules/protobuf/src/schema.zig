@@ -134,9 +134,16 @@ fn typeName(comptime T: type) []const u8 {
 pub fn infos(comptime T: type) []const Info {
     comptime {
         // Derivation is O(fields^2) in the duplicate-number check and runs
-        // once per message type; the default quota is not enough for a
-        // message with more than a handful of fields.
-        @setEvalBranchQuota(20_000);
+        // once per message type. 20_000 was not enough for a message with
+        // more than a handful of fields — measured: a message with 28
+        // fields compiled, 29 hit "evaluation exceeded 20000 backwards
+        // branches" pointing into this function's internals rather than at
+        // the caller's schema (wave-3 audit finding `protobuf` F7). Real
+        // protobuf schemas routinely have dozens of fields, so this budget
+        // is sized for a few hundred: quadratic in `n` plus per-field
+        // overhead puts a 256-field message in the low hundreds of
+        // thousands of branches, not the low thousands.
+        @setEvalBranchQuota(2_000_000);
         if (@typeInfo(T) != .@"struct")
             @compileError("protobuf: " ++ typeName(T) ++ " is not a struct");
         if (!@hasDecl(T, "pb_fields"))
