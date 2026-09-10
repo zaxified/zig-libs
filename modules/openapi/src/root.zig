@@ -248,7 +248,28 @@ fn writeOperation(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (
     try jw.objectField("responses");
     try jw.beginObject();
     if (rt.doc != null and rt.doc.?.responses.len != 0) {
+        // F3 (wave-2 audit): two `RouteDoc.Response`s sharing a `status`
+        // used to both get written, producing a duplicate JSON object key
+        // -- a document `std.json`, the very parser this module's own
+        // tests and docs page use, refuses to re-read
+        // (`error.DuplicateField`), contradicting this module's own doc
+        // comment ("duplicate JSON keys are never emitted"). Same "first
+        // registration wins" rule `writePathParameters` already applies to
+        // a duplicate path-parameter name (F6) -- code brought in line
+        // with the documented contract (P2), not a new error: the
+        // pre-fix output was not valid JSON at all, so there is no
+        // well-formed behavior being taken away.
+        var seen_buf: [32]u16 = undefined;
+        var seen_count: usize = 0;
         for (rt.doc.?.responses) |resp| {
+            const dup = for (seen_buf[0..seen_count]) |s| {
+                if (s == resp.status) break true;
+            } else false;
+            if (dup) continue;
+            if (seen_count < seen_buf.len) {
+                seen_buf[seen_count] = resp.status;
+                seen_count += 1;
+            }
             var code_buf: [5]u8 = undefined;
             const code = std.fmt.bufPrint(&code_buf, "{d}", .{resp.status}) catch unreachable;
             try jw.objectField(code);
@@ -1262,6 +1283,33 @@ test "generate: duplicate path-parameter name in one pattern dedupes instead of 
         .get("get").?.object.get("parameters").?.array;
     try testing.expectEqual(@as(usize, 1), params.items.len);
     try testing.expectEqualStrings("id", params.items[0].object.get("name").?.string);
+}
+
+test "generate: two responses sharing a status code dedupe (first wins) instead of emitting a duplicate JSON key (F3)" {
+    // The pre-fix document here was not even well-formed: `std.json` --
+    // the same parser this module uses everywhere else -- refuses to
+    // re-parse an object with a duplicate key at all.
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/dup", hOk, .{
+        .responses = &.{
+            .{ .status = 200, .description = "first" },
+            .{ .status = 200, .description = "second" },
+        },
+    });
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+
+    // The whole point: this must parse at all (DuplicateField would fail
+    // it before the fix), and must round-trip through this module's own
+    // conformance checker.
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+    const responses = parsed.value.object.get("paths").?.object.get("/dup").?.object
+        .get("get").?.object.get("responses").?.object;
+    try testing.expectEqual(@as(usize, 1), responses.count());
+    try testing.expectEqualStrings("first", responses.get("200").?.object.get("description").?.string);
 }
 
 test "endpoint: byte-exact spec path — a neighboring route sharing the prefix is NOT shadowed (F15/M10)" {

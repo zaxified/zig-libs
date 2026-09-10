@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** Two `RouteDoc.Response`s sharing a `status`
+  used to both get written into the generated document, producing a duplicate JSON object
+  key that `std.json` — the parser this module uses everywhere, including its own docs page
+  — refuses to re-read (`error.DuplicateField`), contradicting this module's own doc comment
+  ("duplicate JSON keys are never emitted"). Now dedupes, first registration wins — same rule
+  `writePathParameters` already applies to a duplicate path-parameter name (F6). The pre-fix
+  output was not valid JSON at all, so no well-formed behavior is being taken away (wave-2
+  audit finding F3).
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A `/openapi.json` request that hits a
   route with a malformed `request_schema` used to redo the FULL document build, under a
   pure spinlock, on every single request forever (compounding to O(N²) CPU under

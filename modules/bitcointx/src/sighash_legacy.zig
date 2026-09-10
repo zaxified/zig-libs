@@ -292,20 +292,78 @@ pub fn sighash(
     return hash256.sha256d(buf.items);
 }
 
+/// `SigningError`, in addition to `LegacyError`: the SIGHASH_SINGLE bug's
+/// fixed constant (see `sighash_single_bug` and `sighash`'s SINGLE branch)
+/// would be a real, verifiable digest, but as a signature TARGET it is not
+/// cryptographically sound -- it is a fixed 32 bytes with no
+/// transaction-specific input at all, so a signature over it is valid for
+/// EVERY transaction that ever triggers the bug, not just this one.
+pub const SigningError = error{SighashSingleBugNoCorrespondingOutput} || LegacyError;
+
+/// Wave-2 audit finding `bitcointx` S1: `sighash` is correct for a
+/// VERIFIER, which must reproduce Bitcoin Core's exact behavior byte for
+/// byte -- returning `sighash_single_bug` on the SIGHASH_SINGLE bug is
+/// consensus, not a choice, and `sighash` keeps doing exactly that; nothing
+/// about it changes here. A SIGNER has no such obligation and every reason
+/// not to proceed: this function is the same algorithm, with the one
+/// difference that hitting the bug condition is a typed error instead of a
+/// value that looks like an ordinary digest. Purely additive -- `sighash`
+/// and every existing caller of it (a verifier, in this module's own
+/// consumers) are untouched.
+pub fn sighashForSigning(
+    allocator: Allocator,
+    transaction: tx.Transaction,
+    input_index: usize,
+    script_code: []const u8,
+    hash_type: u32,
+) SigningError![32]u8 {
+    if (input_index < transaction.vin.len) {
+        const base = hashtype.baseType(hash_type);
+        if (base == SINGLE and input_index >= transaction.vout.len) {
+            return error.SighashSingleBugNoCorrespondingOutput;
+        }
+    }
+    // Anything else -- including `input_index >= transaction.vin.len`,
+    // deliberately not re-checked above -- is identical to `sighash`, so
+    // delegate rather than duplicate the serialization.
+    return sighash(allocator, transaction, input_index, script_code, hash_type);
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const testutil = @import("testutil.zig");
 
-fn oneInOneOutTx(prevout_txid: [32]u8, out_value: i64) tx.Transaction {
+// DIAGNOSTIC FIXED 2026-09-10 (found chasing S1, not itself a wave-2 audit
+// finding): the old `oneInOneOutTx` returned a `Transaction` whose
+// `vin`/`vout` slices pointed at `&[_]T{...}` array literals -- temporaries
+// scoped to THIS function's own stack frame, not to the caller's. The
+// moment `oneInOneOutTx` returned, that frame was free to be reused by the
+// next call, and any caller holding onto `t` held a dangling pointer. Every
+// EXISTING caller happened to survive it: the sole prior use
+// (`input_index out of range is a typed error`, below) hits
+// `sighash`'s bounds check and returns `error.InputIndexOutOfRange` before
+// ever touching `transaction.vin`/`vout`, so the dangling read never
+// actually happened. The first test to run `sighash` to completion twice
+// against the same `t` (added for S1, further down) reliably reused enough
+// stack to corrupt it: `sighash`'s first call printed a correct-looking
+// digest, its second call General-Protection-faulted inside
+// `buf.appendSlice(..., vout.script_pubkey)` reading a `vout` that no
+// longer pointed at anything live. Fixed by having the CALLER own the
+// backing arrays (its stack frame persists for the whole test, unlike a
+// helper's) and `oneInOneOutTx` fill them in rather than manufacture and
+// return pointers into its own frame.
+fn oneInOneOutTx(vin_buf: *[1]tx.TxIn, vout_buf: *[1]tx.TxOut, prevout_txid: [32]u8, out_value: i64) tx.Transaction {
+    vin_buf.* = .{.{
+        .prevout = .{ .txid = prevout_txid, .vout = 0 },
+        .script_sig = &.{},
+        .sequence = 0xffffffff,
+    }};
+    vout_buf.* = .{.{ .value = out_value, .script_pubkey = &.{} }};
     return .{
         .version = 1,
-        .vin = @constCast(&[_]tx.TxIn{.{
-            .prevout = .{ .txid = prevout_txid, .vout = 0 },
-            .script_sig = &.{},
-            .sequence = 0xffffffff,
-        }}),
-        .vout = @constCast(&[_]tx.TxOut{.{ .value = out_value, .script_pubkey = &.{} }}),
+        .vin = vin_buf,
+        .vout = vout_buf,
         .witness = &.{},
         .locktime = 0,
         .has_witness = false,
@@ -313,7 +371,9 @@ fn oneInOneOutTx(prevout_txid: [32]u8, out_value: i64) tx.Transaction {
 }
 
 test "input_index out of range is a typed error" {
-    var t = oneInOneOutTx([_]u8{0} ** 32, 1000);
+    var vin_buf: [1]tx.TxIn = undefined;
+    var vout_buf: [1]tx.TxOut = undefined;
+    var t = oneInOneOutTx(&vin_buf, &vout_buf, [_]u8{0} ** 32, 1000);
     try testing.expectError(error.InputIndexOutOfRange, sighash(testing.allocator, t, 5, &.{}, ALL));
     _ = &t;
 }
@@ -341,6 +401,50 @@ test "SIGHASH_SINGLE bug: input_index with no corresponding output returns the f
     var fail_alloc = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     const got = try sighash(fail_alloc.allocator(), t, 1, &.{}, SINGLE);
     try testing.expectEqualSlices(u8, &sighash_single_bug, &got);
+    _ = &t;
+}
+
+// ── S1: sighashForSigning refuses the SIGHASH_SINGLE bug constant ───────────
+
+test "sighashForSigning: SIGHASH_SINGLE bug is a typed error, not the constant (S1)" {
+    // Same 2-in/1-out shape as the SIGHASH_SINGLE bug test above.
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{
+            .{ .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff },
+            .{ .prevout = .{ .txid = [_]u8{0xbb} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff },
+        }),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 1000, .script_pubkey = &.{} }}),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    try testing.expectError(
+        error.SighashSingleBugNoCorrespondingOutput,
+        sighashForSigning(testing.allocator, t, 1, &.{}, SINGLE),
+    );
+    _ = &t;
+}
+
+test "sighashForSigning: matches sighash bit-for-bit whenever the bug does not trigger (positive control)" {
+    var vin_buf: [1]tx.TxIn = undefined;
+    var vout_buf: [1]tx.TxOut = undefined;
+    var t = oneInOneOutTx(&vin_buf, &vout_buf, [_]u8{0x11} ** 32, 5000);
+    // ALL-like, NONE and an in-range SINGLE all avoid the bug condition --
+    // sighashForSigning must be byte-identical to sighash on every one.
+    for ([_]u32{ ALL, NONE, SINGLE }) |ht| {
+        const verifier = try sighash(testing.allocator, t, 0, &.{}, ht);
+        const signer = try sighashForSigning(testing.allocator, t, 0, &.{}, ht);
+        try testing.expectEqualSlices(u8, &verifier, &signer);
+    }
+    _ = &t;
+}
+
+test "sighashForSigning: out-of-range input_index still reports InputIndexOutOfRange (positive control)" {
+    var vin_buf: [1]tx.TxIn = undefined;
+    var vout_buf: [1]tx.TxOut = undefined;
+    var t = oneInOneOutTx(&vin_buf, &vout_buf, [_]u8{0} ** 32, 1000);
+    try testing.expectError(error.InputIndexOutOfRange, sighashForSigning(testing.allocator, t, 5, &.{}, ALL));
     _ = &t;
 }
 
