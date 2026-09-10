@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `object.open()` now
+  rejects three more classes of malformed `.BTF`/`.BTF.ext`/ELF input it
+  previously accepted or crashed on: a KFLAG struct's non-bitfield member at
+  a sub-byte `bit_offset` that made `btfext.fieldGeometry` underflow
+  (new `CoreError.MisalignedWideField`, additive); a map-value relocation
+  landing exactly on the value-size boundary (`RelocationOutOfRange`,
+  matching libbpf's own `>=`); a `.BTF.ext` func_info/line_info/core_relo
+  record whose `insn_off` is not 8-aligned, previously silently rounded
+  onto the wrong instruction (`RelocationOutOfRange`). No change for any
+  object a real compiler emits — all three shapes are wire-level
+  malformations a hostile or corrupt `.o` can carry, not something clang
+  produces. Also: `parseLegacyMaps` is now O(maps + symbols) instead of
+  O(maps * symbols) — same output, no behaviour change, only faster on an
+  object with many legacy map defs.
 - **2026-09-09** — `possibleCpuCount()` and `countCpuList()` are added (`perfbuf.zig`, re-exported from the module root). They report `/sys/devices/system/cpu/possible`, which is the number the kernel sizes **every per-CPU map's syscall transfer** by (`round_up(value_size, 8) * num_possible_cpus()`). ⛔ Deliberately distinct from the existing `onlineCpus`: a caller that sizes a per-CPU buffer from *online* CPUs — or from `std.Thread.getCpuCount()`, which is also online — under-allocates by the difference and the kernel writes past the end. Measured under QEMU on 2026-09-09 against `xdp-classifier`, whose 4-byte buffer took 8 bytes at 1 vCPU and 32 at 4. `countCpuList` is allocation-free because the callers that need it are sizing a buffer and have no allocator to hand; it is tested against `parseCpuList` on both accepted and rejected inputs, so the two cannot drift apart.
 
 - **2026-09-09** — Docs: the seven `src/testdata/*.bpf.c` fixtures had no

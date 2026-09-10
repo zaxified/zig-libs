@@ -195,6 +195,13 @@ pub const CoreError = error{
     TargetTypeNotFound,
     /// A bitfield whose bits do not fit in any load of <= 8 bytes.
     BitfieldTooWide,
+    /// A NON-bitfield member (`bitfield_size == 0`) whose `bit_offset` is not
+    /// a multiple of 8 and whose type is a full 8-byte scalar, so the load it
+    /// names straddles more than 64 bits and cannot be expressed as one
+    /// shifted load. A real compiler never emits this: a plain member is
+    /// byte-aligned. A KFLAG struct (set by ANY bitfield sibling) lets BTF
+    /// claim one anyway, and nothing else in the format rejects it.
+    MisalignedWideField,
     /// An array index times an element size overflowed the accumulated bit
     /// offset. Both factors come off the wire and neither is otherwise
     /// bounded: the index is parsed from a CO-RE access string in the BTF
@@ -701,6 +708,14 @@ pub fn fieldGeometry(b: *const Btf, type_id: u32, bit_offset: u64, bitfield_size
         }
         bit_size = @intCast(byte_size * 8);
         byte_offset = bit_offset / 8;
+        // The bitfield branch below widens `byte_size` until the member fits
+        // inside one aligned load, guaranteeing `inner <= 64` at the shared
+        // computation past this `if`. This branch has no such widening —
+        // `byte_size` is fixed at `sizeOf(type_id)` — so it must reject
+        // directly instead: when `byte_size == 8` (the only size for which
+        // `bit_size` alone can reach 64) and `bit_offset` is not
+        // byte-aligned, `inner` runs past 64 and `64 - inner` underflows.
+        if ((bit_offset - byte_offset * 8) + bit_size > 64) return error.MisalignedWideField;
     } else {
         bit_size = bitfield_size;
         byte_size = try b.sizeOf(type_id);
@@ -1481,6 +1496,31 @@ test "CO-RE: the local spec walk records names, not just offsets" {
     try testing.expectEqualStrings("fclone", spec3.steps[1].name.?);
     try testing.expectEqual(@as(u8, 2), spec3.bitfield_size);
     try testing.expectEqual(@as(u64, 34), spec3.bit_offset);
+}
+
+test "fieldGeometry: a KFLAG struct's non-bitfield member at an unaligned bit_offset is refused, not underflowed (D4)" {
+    // `struct S { unsigned flag : 1; unsigned long x; }` packed so `x`
+    // (bitfield_size == 0, a full 8-byte scalar) starts at bit_offset 1 --
+    // legal BTF for a KFLAG struct (set by ANY bitfield member, `flag`
+    // here), and nothing in the format rejects a non-bitfield member at a
+    // sub-byte offset. `fieldGeometry`'s non-bitfield branch computed
+    // `byte_offset = bit_offset / 8` and never re-checked that the 8-byte
+    // load it describes still fits in 64 bits: `inner = 71` for this input,
+    // and `64 - inner` underflows.
+    const gpa = testing.allocator;
+    var b = btf.Builder.init(gpa);
+    defer b.deinit();
+    const uint_id = try b.addInt("unsigned int", 4, 32, 0);
+    const ulong_id = try b.addInt("long unsigned int", 8, 64, 0);
+    _ = try b.addComposite(.@"struct", "S", 16, &.{
+        .{ .name = "flag", .type_id = uint_id, .bit_offset = 0, .bitfield_size = 1 },
+        .{ .name = "x", .type_id = ulong_id, .bit_offset = 1 },
+    });
+    const blob = try b.finish();
+    defer gpa.free(blob);
+    var fake = try btf.parse(gpa, blob, .{});
+    defer fake.deinit();
+    try testing.expectError(error.MisalignedWideField, fieldByName(&fake, "S", &.{"x"}));
 }
 
 // ── the real thing: relocate the fixture against the running kernel ─────────

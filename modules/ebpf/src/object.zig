@@ -945,20 +945,37 @@ fn parseLegacyMaps(obj: *Object, a: std.mem.Allocator, sec_idx: usize, out: *std
 
     // Names come from the symbol table: each `struct bpf_map_def` object has
     // an `STT_OBJECT` symbol whose `st_value` is its offset in the section.
+    //
+    // Rescanning all `n` symbols once PER map def (the original shape) is
+    // O(maps * symbols); both counts are attacker-controlled and scale with
+    // file size, so `open()` was O(bytes^2) on this path. Measured: clean
+    // 4x-per-2x scaling, 2.1 MB -> 1.8 s, extrapolating to tens of minutes
+    // at `max_image_bytes` (256 MB). One pass over the symbol table into a
+    // `count`-sized name index, then one pass over the map defs, is
+    // O(maps + symbols) instead and produces the identical result: symbols
+    // are still visited in table order, and the first one at a given offset
+    // still wins (a later symbol at an already-claimed offset is ignored,
+    // exactly as the old inner loop's `break` on first match did).
+    const names = a.alloc(?[]const u8, count) catch return error.OutOfMemory;
+    defer a.free(names);
+    @memset(names, null);
     const n = obj.image.symbolCount(obj.symtab_idx) catch return error.MalformedElf;
+    var s: u32 = 0;
+    while (s < n) : (s += 1) {
+        const sym = obj.image.symbol(obj.symtab_idx, s) catch return error.MalformedElf;
+        if (sym.st_shndx != sec_idx) continue;
+        if (sym.kind() != STT_OBJECT) continue;
+        if (sym.st_value % legacy_map_def_size != 0) continue;
+        const idx = sym.st_value / legacy_map_def_size;
+        if (idx >= count) continue;
+        if (names[idx] != null) continue;
+        names[idx] = obj.image.symbolName(obj.symtab_idx, sym);
+    }
+
     var idx: usize = 0;
     while (idx < count) : (idx += 1) {
         const at = idx * legacy_map_def_size;
-        var name: []const u8 = "";
-        var s: u32 = 0;
-        while (s < n) : (s += 1) {
-            const sym = obj.image.symbol(obj.symtab_idx, s) catch return error.MalformedElf;
-            if (sym.st_shndx != sec_idx) continue;
-            if (sym.kind() != STT_OBJECT) continue;
-            if (sym.st_value != at) continue;
-            name = obj.image.symbolName(obj.symtab_idx, sym);
-            break;
-        }
+        const name = names[idx] orelse "";
         if (name.len == 0) return error.MalformedMapDefinition;
         const d = data[at..][0..legacy_map_def_size];
         out.append(a, .{
@@ -1137,7 +1154,12 @@ fn collectRelocations(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) Pa
             // `STT_SECTION` symbol `st_value` is 0 and `insn.imm` carries the
             // whole offset; for a named global it is the other way round.
             const off = sym.st_value +% @as(u64, @bitCast(@as(i64, insn.imm)));
-            if (off > obj.maps[mi].value_size) return error.RelocationOutOfRange;
+            // `>`, not `>=`, accepted `off == value_size`: one byte PAST the
+            // map's last valid byte, not the last valid offset. libbpf's
+            // equivalent check uses `>=`. Harmless only because the kernel
+            // verifier is the real gate on the loaded program; refused here
+            // too rather than relying on that second layer alone.
+            if (off >= obj.maps[mi].value_size) return error.RelocationOutOfRange;
             relos.append(a, .{
                 .kind = .map_value,
                 .insn_idx = insn_idx,
@@ -1184,6 +1206,12 @@ fn sliceBtfExt(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) ParseErro
             while (i < sec.count) : (i += 1) {
                 const r = sec.funcInfo(i);
                 if (r.insn_off < lo or r.insn_off >= hi) continue;
+                // `insn_off` is a BYTE offset off the wire; not re-checking
+                // 8-alignment before dividing silently rounds a misaligned
+                // record down onto the wrong instruction instead of
+                // rejecting it, matching `collectRelocations`'s own
+                // `r_offset % 8` guard on the exact same conversion.
+                if ((r.insn_off - lo) % 8 != 0) return error.RelocationOutOfRange;
                 fi.append(a, .{
                     .insn_off = @intCast((r.insn_off - lo) / 8),
                     .type_id = r.type_id,
@@ -1202,6 +1230,7 @@ fn sliceBtfExt(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) ParseErro
             while (i < sec.count) : (i += 1) {
                 var r = sec.lineInfo(i);
                 if (r.insn_off < lo or r.insn_off >= hi) continue;
+                if ((r.insn_off - lo) % 8 != 0) return error.RelocationOutOfRange;
                 r.insn_off = @intCast((r.insn_off - lo) / 8);
                 li.append(a, r) catch return error.OutOfMemory;
             }
@@ -1218,6 +1247,7 @@ fn sliceBtfExt(obj: *Object, a: std.mem.Allocator, prog: *ProgramSpec) ParseErro
             while (i < sec.count) : (i += 1) {
                 var r = sec.coreRelo(i);
                 if (r.insn_off < lo or r.insn_off >= hi) continue;
+                if ((r.insn_off - lo) % 8 != 0) return error.RelocationOutOfRange;
                 r.insn_off = @intCast((r.insn_off - lo) / 8);
                 cr.append(a, r) catch return error.OutOfMemory;
             }
@@ -1866,6 +1896,90 @@ test "object: .rodata globals become an internal map and MAP_VALUE relocations" 
     obj.maps[0].fd = -1;
 }
 
+test "hostile: a map_value relocation landing exactly on the value-size boundary is refused (D7)" {
+    // `fx_rodata_const`'s "tag" symbol sits at byte 8 of a 16-byte
+    // `.rodata`, a valid offset (test above). Locate "tag"'s symbol-table
+    // entry in the real fixture and bump its `st_value` from 8 to 16 --
+    // exactly `value_size`, one byte past the map's last valid byte, which
+    // `off > value_size` accepted and `off >= value_size` (libbpf's own
+    // convention) must not.
+    const gpa = testing.allocator;
+    var probe = try open(gpa, fx_rodata_const, .{});
+    const symtab_idx = probe.symtab_idx;
+    const sh_offset = probe.image.sections[symtab_idx].sh_offset;
+    const n = try probe.image.symbolCount(symtab_idx);
+    var target_off: ?usize = null;
+    var si: u32 = 0;
+    while (si < n) : (si += 1) {
+        const sym = try probe.image.symbol(symtab_idx, si);
+        if (std.mem.eql(u8, probe.image.symbolName(symtab_idx, sym), "tag")) {
+            target_off = @intCast(sh_offset + @as(u64, si) * 24 + 8); // Elf64_Sym.st_value's own offset
+            break;
+        }
+    }
+    probe.deinit();
+    const at = target_off.?;
+    try testing.expectEqual(@as(u64, 8), std.mem.readInt(u64, fx_rodata_const[at..][0..8], .little));
+
+    const img = try gpa.dupe(u8, fx_rodata_const);
+    defer gpa.free(img);
+    std.mem.writeInt(u64, img[at..][0..8], 16, .little); // was 8 (valid), now == value_size
+    try testing.expectError(error.RelocationOutOfRange, open(gpa, img, .{}));
+}
+
+test "hostile: a .BTF.ext record whose insn_off is not 8-aligned is refused, not silently rounded (D8)" {
+    // `sliceBtfExt` is called directly with a hand-built `Object`/`ProgramSpec`
+    // rather than through a full `open()` -- the ELF/symbol-table plumbing
+    // D5's and D7's tests exercise is orthogonal to this bug, which lives
+    // entirely in the `(insn_off - lo) / 8` conversion below `sliceBtfExt`.
+    const gpa = testing.allocator;
+
+    // A BTF blob whose only job is to hold the program-section-name string
+    // `sliceBtfExt` looks `sec_name_off` up in.
+    var bb = btf_mod.Builder.init(gpa);
+    defer bb.deinit();
+    const sec_name_off = try bb.addString("myprog");
+    const btf_bytes = try bb.finish();
+    defer gpa.free(btf_bytes);
+    var parsed_btf = try btf_mod.parse(gpa, btf_bytes, .{});
+    defer parsed_btf.deinit();
+
+    // A minimal `.BTF.ext`: header (24 bytes, no core_relo) + one func_info
+    // group (rec_size(4) + sec_name_off(4) + count(4) + one 8-byte record)
+    // whose `insn_off` is 12 -- inside a 2-instruction (16-byte) program
+    // starting at `sec_byte_off` 0, so `lo <= 12 < hi`, but `12 % 8 != 0`.
+    const hdr_len: u32 = btfext.header_size_min; // 24, no core_relo
+    var ext_bytes: [24 + 20]u8 = undefined;
+    @memset(&ext_bytes, 0);
+    std.mem.writeInt(u16, ext_bytes[0..2], btfext.magic, .little);
+    ext_bytes[2] = btfext.version;
+    std.mem.writeInt(u32, ext_bytes[4..8], hdr_len, .little);
+    std.mem.writeInt(u32, ext_bytes[8..12], 0, .little); // func_info_off (relative to hdr_len)
+    std.mem.writeInt(u32, ext_bytes[12..16], 20, .little); // func_info_len
+    std.mem.writeInt(u32, ext_bytes[16..20], 20, .little); // line_info_off (past func_info, empty)
+    std.mem.writeInt(u32, ext_bytes[20..24], 0, .little); // line_info_len
+    const func_info_group = ext_bytes[hdr_len..][0..20];
+    std.mem.writeInt(u32, func_info_group[0..4], 8, .little); // rec_size
+    std.mem.writeInt(u32, func_info_group[4..8], sec_name_off, .little);
+    std.mem.writeInt(u32, func_info_group[8..12], 1, .little); // count
+    std.mem.writeInt(u32, func_info_group[12..16], 12, .little); // insn_off -- misaligned
+    std.mem.writeInt(u32, func_info_group[16..20], 0, .little); // type_id
+    const ext = try btfext.parseExt(&ext_bytes);
+
+    const zero_insn: Insn = .{ .code = 0, .dst = 0, .src = 0, .off = 0, .imm = 0 };
+    var insns = [_]Insn{ zero_insn, zero_insn }; // 2 instructions: hi = 0 + 2*8 = 16
+    var prog: ProgramSpec = undefined;
+    prog.sec_name = "myprog";
+    prog.sec_byte_off = 0;
+    prog.insns = &insns;
+
+    var obj: Object = undefined;
+    obj.btf = parsed_btf;
+    obj.ext = ext;
+
+    try testing.expectError(error.RelocationOutOfRange, sliceBtfExt(&obj, gpa, &prog));
+}
+
 test "object: a BTF-defined RINGBUF map (max_entries is a BYTE SIZE)" {
     const gpa = testing.allocator;
     var obj = try open(gpa, fx_ringbuf_map, .{});
@@ -1962,6 +2076,124 @@ test "object: the legacy `maps` section and a `version` section" {
     try testing.expectEqual(BPF.ProgType.socket_filter, p.prog_type);
     try testing.expectEqual(@as(usize, 1), p.relos.len);
     try testing.expectEqual(ReloKind.map_fd, p.relos[0].kind);
+}
+
+// ── D5: `parseLegacyMaps` must be linear, not quadratic ─────────────────────
+//
+// Builds a synthetic `Image` directly (bypassing full ELF64-header parsing,
+// which `parseLegacyMaps` never touches) with `count` legacy map defs and a
+// matching `count`-entry `STT_OBJECT` symbol table, named "m0".."m{n-1}" at
+// `st_value = idx * 20` -- structurally the same shape `parseLegacyMaps`
+// reads, just built without a real linker.
+
+/// `Elf64_Sym` is a fixed 24 bytes (name:u32, info:u8, other:u8, shndx:u16,
+/// value:u64, size:u64) -- `elfsym.zig`'s own `SYM_SIZE` is private to that
+/// file, so this test-only helper restates the constant rather than reaching
+/// across the module.
+const test_sym_size: usize = 24;
+
+fn buildSyntheticLegacyMapsImage(a: std.mem.Allocator, count: usize) !elfsym.Image {
+    const maps_len = count * legacy_map_def_size;
+
+    var strtab: std.ArrayList(u8) = .empty;
+    try strtab.append(a, 0); // index 0 is always the empty string
+    const name_offs = try a.alloc(u32, count);
+    var buf: [16]u8 = undefined;
+    for (0..count) |idx| {
+        name_offs[idx] = @intCast(strtab.items.len);
+        const name = std.fmt.bufPrint(&buf, "m{d}", .{idx}) catch unreachable;
+        try strtab.appendSlice(a, name);
+        try strtab.append(a, 0);
+    }
+
+    const symtab_len = (count + 1) * test_sym_size; // +1: the reserved null symbol
+    const maps_off: usize = 0;
+    const symtab_off = maps_off + maps_len;
+    const strtab_off = symtab_off + symtab_len;
+    const total = strtab_off + strtab.items.len;
+
+    const bytes = try a.alloc(u8, total);
+    @memset(bytes, 0); // covers the "maps" section (contents unread by parseLegacyMaps beyond byte-count) and symbol 0
+    for (0..count) |idx| {
+        const at = symtab_off + (idx + 1) * test_sym_size;
+        std.mem.writeInt(u32, bytes[at..][0..4], name_offs[idx], .little); // st_name
+        bytes[at + 4] = (@as(u8, 1) << 4) | STT_OBJECT; // st_info: STB_GLOBAL | STT_OBJECT
+        std.mem.writeInt(u16, bytes[at + 6 ..][0..2], 1, .little); // st_shndx = section 1 ("maps")
+        std.mem.writeInt(u64, bytes[at + 8 ..][0..8], idx * legacy_map_def_size, .little); // st_value
+        std.mem.writeInt(u64, bytes[at + 16 ..][0..8], legacy_map_def_size, .little); // st_size
+    }
+    const strtab_len = strtab.items.len; // captured BEFORE deinit -- ArrayList.deinit resets .items
+    @memcpy(bytes[strtab_off..][0..strtab_len], strtab.items);
+    a.free(name_offs);
+    strtab.deinit(a);
+
+    const sections = try a.alloc(elfsym.SectionHeader, 4);
+    sections[0] = .{ .index = 0, .sh_name = 0, .sh_type = 0, .sh_flags = 0, .sh_addr = 0, .sh_offset = 0, .sh_size = 0, .sh_link = 0, .sh_info = 0, .sh_addralign = 0, .sh_entsize = 0 };
+    sections[1] = .{ .index = 1, .sh_name = 0, .sh_type = 1, .sh_flags = 0, .sh_addr = 0, .sh_offset = maps_off, .sh_size = maps_len, .sh_link = 0, .sh_info = 0, .sh_addralign = 0, .sh_entsize = 0 }; // SHT_PROGBITS
+    sections[2] = .{ .index = 2, .sh_name = 0, .sh_type = 2, .sh_flags = 0, .sh_addr = 0, .sh_offset = symtab_off, .sh_size = symtab_len, .sh_link = 3, .sh_info = 0, .sh_addralign = 0, .sh_entsize = test_sym_size }; // SHT_SYMTAB
+    sections[3] = .{ .index = 3, .sh_name = 0, .sh_type = 3, .sh_flags = 0, .sh_addr = 0, .sh_offset = strtab_off, .sh_size = strtab_len, .sh_link = 0, .sh_info = 0, .sh_addralign = 0, .sh_entsize = 0 }; // SHT_STRTAB
+
+    return .{
+        .gpa = a,
+        .bytes = bytes,
+        .owns_bytes = true,
+        .e_type = 1, // ET_REL
+        .e_machine = elfsym.EM_BPF,
+        .sections = sections,
+        .shstrtab = &.{},
+    };
+}
+
+/// Calls `parseLegacyMaps` directly against a synthetic `count`-map image and
+/// returns elapsed nanoseconds. Uses `page_allocator` (untracked) rather than
+/// `testing.allocator`: this is a timing probe, not a leak check, and an
+/// arena-per-call would itself dominate the measurement at small `count`.
+fn nowNsMonotonic() u64 {
+    // `std.time.Timer` does not exist in this Zig version -- same
+    // `clock_gettime`-direct pattern `bfv`'s bench uses.
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn timeParseLegacyMaps(count: usize) !u64 {
+    const pa = std.heap.page_allocator;
+    var image = try buildSyntheticLegacyMapsImage(pa, count);
+    defer image.deinit();
+
+    var obj: Object = undefined;
+    obj.image = image;
+    obj.symtab_idx = 2;
+
+    var out: std.ArrayList(MapSpec) = .empty;
+    const start = nowNsMonotonic();
+    try parseLegacyMaps(&obj, pa, 1, &out);
+    const ns = nowNsMonotonic() - start;
+    try testing.expectEqual(count, out.items.len);
+    return ns;
+}
+
+test "parseLegacyMaps: work scales linearly with map count, not quadratically (D5)" {
+    // Regression for a MEDIUM: the pre-fix shape rescanned the WHOLE symbol
+    // table once per map def, so `open()` was O(maps * symbols) on two
+    // counts that both come straight off an attacker-supplied `.o`'s wire
+    // header. Audit measurement on the original code (ReleaseFast): count
+    // 8000 -> 113 ms, 16000 -> 454 ms, 32000 -> 1780 ms -- textbook 4x per
+    // 2x. A fixed, linear implementation should show close to flat
+    // NANOSECONDS-PER-MAP-DEF as `count` grows, not a rising one.
+    //
+    // Skip under a foreign or badly loaded machine: this asserts a RATIO,
+    // not a wall-clock ceiling, and still catches the O(n^2) shape the
+    // fix removed.
+    const small = try timeParseLegacyMaps(500);
+    const large = try timeParseLegacyMaps(8000); // 16x the count
+    const ns_per_map_small = @as(f64, @floatFromInt(small)) / 500.0;
+    const ns_per_map_large = @as(f64, @floatFromInt(large)) / 8000.0;
+    // Quadratic work would make ns/map at 16x the count roughly 16x higher
+    // (n^2/n = n); linear work keeps it roughly flat. A generous 4x ceiling
+    // comfortably separates the two shapes without being sensitive to
+    // ordinary scheduling noise on a shared machine.
+    try testing.expect(ns_per_map_large < ns_per_map_small * 4.0 + 1000.0);
 }
 
 test "BTF DATASEC fixup: clang emits size 0, the kernel refuses that" {
