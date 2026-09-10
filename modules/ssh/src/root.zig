@@ -14,9 +14,12 @@
 //! (`ext-info-c`/`ext-info-s` and SSH_MSG_EXT_INFO carrying
 //! `server-sig-algs`) in both roles. `Transport.negotiated`
 //! (`transport.NegotiatedAlgorithms`) exposes the negotiated KEX/host-key/
-//! cipher/MAC wire names once a handshake completes, client and server side —
-//! diagnostics parity with `ssh -v`'s negotiation banner, which this module
-//! otherwise has no way to reproduce.
+//! cipher/MAC/compression wire names once a handshake completes, client and
+//! server side — diagnostics parity with `ssh -v`'s negotiation banner, which
+//! this module otherwise has no way to reproduce. Compression negotiation
+//! (RFC 4253 §7.1) is enforced — a peer offering no overlap with `["none"]`
+//! is refused — even though `compression_algorithms` never offers anything
+//! but `"none"` itself.
 //!
 //! Part 2 — userauth (`userauth.zig`): the `publickey` method (RFC 4252 §7,
 //! including the two-phase query → SSH_MSG_USERAUTH_PK_OK → signed-request

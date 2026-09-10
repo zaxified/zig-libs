@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking.** `negotiate` now actually negotiates the
+  compression name-list (RFC 4253 §7.1) instead of decoding it and never looking again — a
+  peer offering no overlap with `["none"]` is now refused with `error.UnsupportedAlgorithm`
+  during KEXINIT, on both the client and the server, where it used to sail through
+  undetected. `Transport.negotiated` (`NegotiatedAlgorithms`) gained two trailing fields,
+  `compression_c2s`/`compression_s2c`, additive for any caller matching by field name.
+  Separately, `clientHandshake` now discards a server's wrongly-guessed first KEX packet
+  (`first_kex_packet_follows`, RFC 4253 §7) instead of reading it back as the real KEX reply
+  and desyncing — `serverHandshake` already did this for a client's guess; this closes the
+  missing client-side twin. Neither change is reachable against a conforming peer (every
+  real server offers `"none"` compression and OpenSSH never guesses); both close A1 audit
+  findings #4 and #7.
+
 - **2026-09-07** — Test-only, neither BREAKING nor BEHAVIOURAL. All six fuzz
   targets SYNTHESIZED their wire input from ranged `Smith` draws — a declared
   length here, a message count there, a `boolWeighted` bias in between. A ranged

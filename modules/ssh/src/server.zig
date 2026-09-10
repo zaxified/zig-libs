@@ -968,6 +968,13 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
     else
         pickFirst(client_kex.mac_algorithms_server_to_client, &transport.mac_algorithms) orelse
             return error.UnsupportedAlgorithm;
+    // RFC 4253 §7.1 negotiates compression the same as every other
+    // name-list and requires a disconnect on no overlap — mirrors the
+    // client-side fix in `transport.negotiate`.
+    const comp_c2s = pickFirst(client_kex.compression_algorithms_client_to_server, &transport.compression_algorithms) orelse
+        return error.UnsupportedAlgorithm;
+    const comp_s2c = pickFirst(client_kex.compression_algorithms_server_to_client, &transport.compression_algorithms) orelse
+        return error.UnsupportedAlgorithm;
 
     // Record what got negotiated (RFC 4253 §7.1) on `t` for the connection's
     // lifetime — see `transport.NegotiatedAlgorithms` for why every field
@@ -982,6 +989,8 @@ pub fn serverHandshake(t: *transport.Transport, gpa: std.mem.Allocator, config: 
         .cipher_s2c = cipher_s2c,
         .mac_c2s = mac_c2s,
         .mac_s2c = mac_s2c,
+        .compression_c2s = comp_c2s,
+        .compression_s2c = comp_s2c,
     };
 
     // RFC 4253 §7: a wrongly-guessed first KEX packet must be discarded
@@ -1748,6 +1757,165 @@ test "dhGroupKexServer: rejects a KEXDH_INIT carrying e == p or e == p-1 (F1 reg
             dhGroupKexServer(&r, &w, &none, "I_C", "I_S", "V_C", "V_S", hk, gpa, kex_name),
         );
     }
+}
+
+// ── RFC 4253 §7 wrongly-guessed first KEX packet (client side) ─────────────
+
+const GuessingClient = struct {
+    port: u16,
+    err: ?anyerror = null,
+    negotiated_kex: [64]u8 = undefined,
+    negotiated_kex_len: usize = 0,
+
+    fn run(self: *GuessingClient) void {
+        self.runInner() catch |e| {
+            self.err = e;
+        };
+    }
+
+    fn runInner(self: *GuessingClient) !void {
+        const gpa = std.testing.allocator;
+        var threaded = std.Io.Threaded.init(gpa, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        const addr = try std.Io.net.IpAddress.parse("127.0.0.1", self.port);
+        var stream: std.Io.net.Stream = blk: {
+            var tries: usize = 0;
+            while (tries < 60) : (tries += 1) {
+                if (addr.connect(io, .{ .mode = .stream })) |s| break :blk s else |_| {}
+                var ts = std.os.linux.timespec{ .sec = 0, .nsec = 50 * std.time.ns_per_ms };
+                _ = std.os.linux.nanosleep(&ts, null);
+            }
+            return error.ConnectionRefused;
+        };
+        defer stream.close(io);
+
+        var rbuf: [32 * 1024]u8 = undefined;
+        var wbuf: [32 * 1024]u8 = undefined;
+        var sr = stream.reader(io, &rbuf);
+        var sw = stream.writer(io, &wbuf);
+        const t = try transport.connect(&sr.interface, &sw.interface, gpa, accept_any_host_key);
+        if (t.negotiated) |neg| {
+            self.negotiated_kex_len = @min(neg.kex.len, self.negotiated_kex.len);
+            @memcpy(self.negotiated_kex[0..self.negotiated_kex_len], neg.kex[0..self.negotiated_kex_len]);
+        }
+    }
+};
+
+// Regression for the `ssh` A1 audit finding "`clientHandshake` ignores the
+// server's `first_kex_packet_follows`" (RFC 4253 §7): a server may set that
+// flag on its KEXINIT and immediately follow it with an optimistically
+// "guessed" first KEX packet. When the guess is WRONG (the negotiated
+// algorithm differs from what the server assumed), RFC 4253 §7 requires
+// that guessed packet be silently discarded — otherwise it sits on the wire
+// exactly where the client's real KEX reply belongs, and the KEX function
+// reads garbage instead.
+//
+// This drives a hand-rolled "server" (not `serverHandshake`, which never
+// guesses) through the real client entry point `transport.connect` →
+// `clientHandshake`. The server offers `diffie-hellman-group16-sha512`
+// FIRST and `diffie-hellman-group14-sha256` second, with no mlkem/curve25519
+// at all; the client's OWN preference order (mlkem > curve25519 >
+// curve25519@libssh.org > group14 > group16) then negotiates group14 — so a
+// `first_kex_packet_follows` guess of group16 is wrong by construction, and
+// the server sends one throwaway `SSH_MSG_IGNORE` as that "guessed" packet
+// before performing the REAL group14 KEX honestly.
+test "clientHandshake discards a server's wrongly-guessed first KEX packet instead of desyncing on it (RFC 4253 §7)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var port: u16 = 0;
+    var listener = try listenLoopback(io, &port);
+    defer listener.deinit(io);
+
+    var client = GuessingClient{ .port = port };
+    const th = try std.Thread.spawn(.{}, GuessingClient.run, .{&client});
+    var joined = false;
+    defer if (!joined) th.join();
+
+    var stream = try acceptBounded(io, &listener, accept_timeout_ms);
+    defer stream.close(io);
+    var rbuf: [32 * 1024]u8 = undefined;
+    var wbuf: [32 * 1024]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    // 1. Version exchange (server speaks first, as `serverHandshake` does).
+    const local_id = transport.IdentificationString{ .softwareversion = "zig_ssh_guess_test_srv" };
+    const v_c = try transport.exchangeVersions(gpa, &sr.interface, &sw.interface, local_id);
+    defer gpa.free(v_c);
+    const v_s = "SSH-2.0-zig_ssh_guess_test_srv";
+
+    var scratch: [64 * 1024]u8 = undefined;
+    var none_r: transport.CipherState = .none;
+    var none_w: transport.CipherState = .none;
+
+    // 2. Read the client's real KEXINIT.
+    const cpkt = try transport.readPacket(&sr.interface, &none_r, &scratch);
+    const i_c = try gpa.dupe(u8, cpkt.payload);
+    defer gpa.free(i_c);
+
+    // 3. Spoofed server KEXINIT: wrong guess, as described above.
+    var cookie: [16]u8 = undefined;
+    fillRandom(&cookie);
+    const empty: []const []const u8 = &.{};
+    const wrong_guess_kex = [_][]const u8{ "diffie-hellman-group16-sha512", "diffie-hellman-group14-sha256" };
+    const host_key_names = [_][]const u8{"ssh-ed25519"};
+    const spoofed_kex = transport.KexInit{
+        .cookie = cookie,
+        .kex_algorithms = &wrong_guess_kex,
+        .server_host_key_algorithms = &host_key_names,
+        .encryption_algorithms_client_to_server = &transport.encryption_algorithms,
+        .encryption_algorithms_server_to_client = &transport.encryption_algorithms,
+        .mac_algorithms_client_to_server = &transport.mac_algorithms,
+        .mac_algorithms_server_to_client = &transport.mac_algorithms,
+        .compression_algorithms_client_to_server = &transport.compression_algorithms,
+        .compression_algorithms_server_to_client = &transport.compression_algorithms,
+        .languages_client_to_server = empty,
+        .languages_server_to_client = empty,
+        .first_kex_packet_follows = true,
+        .reserved = 0,
+    };
+    var isbuf: [2048]u8 = undefined;
+    var isw: std.Io.Writer = .fixed(&isbuf);
+    try spoofed_kex.encode(&isw);
+    const i_s = try gpa.dupe(u8, isw.buffered());
+    defer gpa.free(i_s);
+    try transport.writePacket(&sw.interface, &none_w, i_s);
+
+    // 4. The "guessed" first KEX packet — under the WRONG algorithm, so a
+    // spec-correct client discards it sight unseen. Anything left unconsumed
+    // here sits exactly where the real KEXDH_REPLY belongs in step 5.
+    var junk_buf: [16]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&junk_buf);
+    try jw.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_IGNORE));
+    try messages.writeString(&jw, "x");
+    try transport.writePacket(&sw.interface, &none_w, jw.buffered());
+
+    // 5. The REAL KEX, honestly, under group14 — the algorithm the client
+    // actually negotiates. Proves the discard ate exactly one packet, not
+    // zero and not two.
+    const hk = try HostKey.fromOpenSSH(fixture_ed25519_key, null);
+    var res = try dhGroupKexServer(&sr.interface, &sw.interface, &none_w, i_c, i_s, v_c, v_s, hk, gpa, "diffie-hellman-group14-sha256");
+    defer res.zeroize();
+
+    // 6. NEWKEYS both ways.
+    try transport.writePacket(&sw.interface, &none_w, &[_]u8{@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS)});
+    const nk = try transport.readPacket(&sr.interface, &none_r, &scratch);
+    try std.testing.expectEqual(@intFromEnum(messages.MessageType.SSH_MSG_NEWKEYS), msgType(nk));
+
+    th.join();
+    joined = true;
+    // Before the fix: `client.err` is `error.KexFailed` (`dhGroupKex` reads
+    // the leftover `SSH_MSG_IGNORE` back as its KEXDH_REPLY and rejects the
+    // message type) — a full handshake never completes at all. After the
+    // fix: no error, and the negotiated algorithm really is group14 — the
+    // client never entertained the server's group16 guess.
+    try std.testing.expectEqual(@as(?anyerror, null), client.err);
+    try std.testing.expectEqualStrings("diffie-hellman-group14-sha256", client.negotiated_kex[0..client.negotiated_kex_len]);
 }
 
 // ── live interop: real OpenSSH `ssh` client → our server (gated) ────────────

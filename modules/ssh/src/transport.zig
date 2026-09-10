@@ -1859,6 +1859,13 @@ pub const NegotiatedAlgorithms = struct {
     /// "MAC: <implicit>" for the same case).
     mac_c2s: ?[]const u8,
     mac_s2c: ?[]const u8,
+    /// Negotiated compression method (RFC 4253 §7.1). Always `"none"` today —
+    /// `compression_algorithms` above offers nothing else — but the name is
+    /// still resolved through `pickFirst` against the peer's list rather than
+    /// assumed, so a peer that (against RFC 4253 §7.1's MUST) offers no
+    /// overlap is refused during negotiation instead of silently accepted.
+    compression_c2s: []const u8,
+    compression_s2c: []const u8,
 };
 
 /// True for a self-authenticating AEAD cipher (no separate negotiated MAC):
@@ -1884,7 +1891,22 @@ fn negotiate(server_kex: KexInit) TransportError!NegotiatedAlgorithms {
         null
     else
         pickFirst(&mac_algorithms, server_kex.mac_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
-    return .{ .kex = kex, .host_key = host_key, .cipher_c2s = c2s, .cipher_s2c = s2c, .mac_c2s = mac_c2s, .mac_s2c = mac_s2c };
+    // RFC 4253 §7.1 negotiates compression the same as every other
+    // name-list and requires a disconnect on no overlap — this used to be
+    // decoded and never negotiated at all (so a peer offering no "none"
+    // entry would sail through KEXINIT undetected).
+    const comp_c2s = pickFirst(&compression_algorithms, server_kex.compression_algorithms_client_to_server) orelse return error.UnsupportedAlgorithm;
+    const comp_s2c = pickFirst(&compression_algorithms, server_kex.compression_algorithms_server_to_client) orelse return error.UnsupportedAlgorithm;
+    return .{
+        .kex = kex,
+        .host_key = host_key,
+        .cipher_c2s = c2s,
+        .cipher_s2c = s2c,
+        .mac_c2s = mac_c2s,
+        .mac_s2c = mac_s2c,
+        .compression_c2s = comp_c2s,
+        .compression_s2c = comp_s2c,
+    };
 }
 
 // ── Transport ────────────────────────────────────────────────────────────
@@ -1991,8 +2013,26 @@ pub const Transport = struct {
 
         const neg = try negotiate(server_kex);
         t.negotiated = neg;
-        // NB: a server that sets first_kex_packet_follows with a wrong guess is
-        // not handled here (real OpenSSH never guesses); part 1 assumes none.
+        // RFC 4253 §7: if the server optimistically sent a guessed first KEX
+        // packet right after its KEXINIT (`first_kex_packet_follows`), and
+        // the guess does not match what negotiation actually picked, that
+        // packet must be silently discarded before the real KEX proceeds —
+        // otherwise it desyncs the stream: the KEX function below would read
+        // it back as the server's reply to OUR init and either fail with a
+        // wrong-message-type ProtocolError or, worse, misparse it as one.
+        // Mirrors `serverHandshake`'s twin discard of a wrongly-guessed
+        // CLIENT packet (real OpenSSH servers never guess, but this module's
+        // own audit class is C2 UNTRUSTED-WIRE — a peer that does is not
+        // assumed benign just because OpenSSH is not that peer).
+        if (server_kex.first_kex_packet_follows) {
+            const guess_ok = server_kex.kex_algorithms.len > 0 and
+                std.mem.eql(u8, server_kex.kex_algorithms[0], neg.kex) and
+                server_kex.server_host_key_algorithms.len > 0 and
+                std.mem.eql(u8, server_kex.server_host_key_algorithms[0], neg.host_key);
+            if (!guess_ok) {
+                _ = try readPacket(t.reader, &none_r, scratch);
+            }
+        }
 
         // KEX (sends KEXDH_INIT seq 1, reads KEXDH_REPLY seq 1). `negotiate`
         // only ever returns a name from `kex_algorithms`; every one of those
@@ -2133,6 +2173,53 @@ test "algorithm name-lists are non-empty" {
     try t.expect(mac_algorithms.len > 0);
     try t.expect(compression_algorithms.len > 0);
     try t.expect(public_key_algorithms.len > 0);
+}
+
+/// A structurally-complete server `KexInit` with every name-list set to this
+/// module's own offer, so `negotiate` succeeds end to end — the one field a
+/// caller passes in is the compression name-lists, which is exactly what
+/// the test below varies.
+fn kexInitFor(compression: []const []const u8) KexInit {
+    var cookie: [16]u8 = undefined;
+    for (&cookie, 0..) |*c, i| c.* = @intCast(i);
+    const empty: []const []const u8 = &.{};
+    return .{
+        .cookie = cookie,
+        .kex_algorithms = &kex_algorithms,
+        .server_host_key_algorithms = &server_host_key_algorithms,
+        .encryption_algorithms_client_to_server = &encryption_algorithms,
+        .encryption_algorithms_server_to_client = &encryption_algorithms,
+        .mac_algorithms_client_to_server = &mac_algorithms,
+        .mac_algorithms_server_to_client = &mac_algorithms,
+        .compression_algorithms_client_to_server = compression,
+        .compression_algorithms_server_to_client = compression,
+        .languages_client_to_server = empty,
+        .languages_server_to_client = empty,
+        .first_kex_packet_follows = false,
+        .reserved = 0,
+    };
+}
+
+// Regression for the `ssh` A1 audit finding "`negotiate` never negotiates
+// the compression algorithm" (RFC 4253 §7.1's MUST-disconnect-on-no-overlap
+// was simply not implemented — the name-list was decoded and never looked
+// at again). Before the fix, `negotiate` had no compression branch at all,
+// so a server offering NO overlap with `compression_algorithms` (`["none"]`)
+// sailed straight through KEXINIT undetected; after the fix it is refused
+// exactly like every other name-list already was.
+test "negotiate refuses a server that offers no overlapping compression algorithm" {
+    const server_kex = kexInitFor(&[_][]const u8{"zlib@openssh.com"});
+    try std.testing.expectError(error.UnsupportedAlgorithm, negotiate(server_kex));
+}
+
+// Positive control for the same fix, required by the fixer brief: the
+// overwhelmingly common case (both sides offer only "none") must still
+// negotiate cleanly and record what was picked.
+test "negotiate accepts a server offering \"none\" compression, both directions" {
+    const server_kex = kexInitFor(&compression_algorithms);
+    const neg = try negotiate(server_kex);
+    try std.testing.expectEqualStrings("none", neg.compression_c2s);
+    try std.testing.expectEqualStrings("none", neg.compression_s2c);
 }
 
 // ── RFC 8308 tests ─────────────────────────────────────────────────────────
