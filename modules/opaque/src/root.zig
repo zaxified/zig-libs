@@ -1190,3 +1190,131 @@ test "record and message serialization round-trips" {
     const ke1 = KE1.fromBytes(bytes[0..KE1.encoded_length].*);
     try std.testing.expectEqualSlices(u8, bytes[0..KE1.encoded_length], &ke1.toBytes());
 }
+
+// ── fuzz + hostile-wire tests: the functions that VALIDATE, not just decode ──
+//
+// A1/opaque.md M4: the three harnesses above exercise `fromBytes`, which is
+// plain field slicing with nothing to reject — every input is "valid". The
+// functions where a hostile peer's bytes actually get checked
+// (`createRegistrationResponse`, `generateKE2`, `generateKE3` — each starts
+// from attacker-controlled wire bytes and calls into peer-element
+// validation) had no fuzz target and no direct hostile-input test at all.
+// Configuration (keys, seeds, context) is pinned to a real KAT vector so the
+// only untrusted input is the wire message itself, same shape as the
+// `fromBytes` harnesses above.
+const kat_vectors = @import("kat_vectors.zig");
+
+fn fuzzCreateRegistrationResponseOnHostileRequest(_: void, smith: *std.testing.Smith) !void {
+    const v = kat_vectors.real_1;
+    var buf: [RegistrationRequest.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const request = RegistrationRequest.fromBytes(buf);
+    if (createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed)) |r| {
+        std.mem.doNotOptimizeAway(&r);
+    } else |_| {}
+}
+test "fuzz createRegistrationResponse never panics on a hostile RegistrationRequest" {
+    try std.testing.fuzz({}, fuzzCreateRegistrationResponseOnHostileRequest, .{});
+}
+
+fn fuzzGenerateKE2OnHostileKE1(_: void, smith: *std.testing.Smith) !void {
+    const v = kat_vectors.real_1;
+    const record = RegistrationRecord.fromBytes(v.registration_upload);
+    var buf: [KE1.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const ke1 = KE1.fromBytes(buf);
+    if (generateKE2(
+        v.server_private_key,
+        v.server_public_key,
+        record,
+        v.credential_identifier,
+        v.oprf_seed,
+        ke1,
+        .{},
+        v.context,
+        v.masking_nonce,
+        v.server_nonce,
+        v.server_keyshare_seed,
+    )) |r| {
+        std.mem.doNotOptimizeAway(&r);
+    } else |_| {}
+}
+test "fuzz generateKE2 never panics on a hostile KE1" {
+    try std.testing.fuzz({}, fuzzGenerateKE2OnHostileKE1, .{});
+}
+
+fn fuzzGenerateKE3OnHostileKE2(_: void, smith: *std.testing.Smith) !void {
+    const v = kat_vectors.real_1;
+    const login = generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed) catch return;
+    var buf: [KE2.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    const ke2 = KE2.fromBytes(buf);
+    if (generateKE3(login.state, .{}, v.context, ke2)) |r| {
+        std.mem.doNotOptimizeAway(&r);
+    } else |_| {}
+}
+test "fuzz generateKE3 never panics on a hostile KE2" {
+    try std.testing.fuzz({}, fuzzGenerateKE3OnHostileKE2, .{});
+}
+
+// The fuzz harnesses above run once (no `--fuzz`) on an all-zero input,
+// which decodes as the identity element — a *valid* canonical encoding — so
+// a single default run never reaches the rejection branch. These three are
+// deterministic instead: each hands the validating function one concrete
+// non-canonical 32-byte string (0xFF x 32, confirmed below to be outside the
+// canonical range) inside an otherwise-real KAT flow, and checks that the
+// function's own typed error — not a panic, not a silent accept — is what
+// comes back.
+
+test "M4: createRegistrationResponse rejects a non-canonical blinded_message" {
+    const v = kat_vectors.real_1;
+    const request = RegistrationRequest{ .blinded_message = [_]u8{0xFF} ** 32 };
+    try std.testing.expectError(
+        error.InvalidMessage,
+        createRegistrationResponse(request, v.server_public_key, v.credential_identifier, v.oprf_seed),
+    );
+}
+
+test "M4: generateKE2 rejects a non-canonical blinded_message in a hostile KE1" {
+    const v = kat_vectors.real_1;
+    const record = RegistrationRecord.fromBytes(v.registration_upload);
+    var login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    login.ke1.credential_request.blinded_message = [_]u8{0xFF} ** 32;
+    try std.testing.expectError(error.InvalidMessage, generateKE2(
+        v.server_private_key,
+        v.server_public_key,
+        record,
+        v.credential_identifier,
+        v.oprf_seed,
+        login.ke1,
+        .{},
+        v.context,
+        v.masking_nonce,
+        v.server_nonce,
+        v.server_keyshare_seed,
+    ));
+}
+
+test "M4: generateKE3 rejects a non-canonical server_public_keyshare in a hostile KE2" {
+    const v = kat_vectors.real_1;
+    const record = RegistrationRecord.fromBytes(v.registration_upload);
+    const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    var ke2 = (try generateKE2(
+        v.server_private_key,
+        v.server_public_key,
+        record,
+        v.credential_identifier,
+        v.oprf_seed,
+        login.ke1,
+        .{},
+        v.context,
+        v.masking_nonce,
+        v.server_nonce,
+        v.server_keyshare_seed,
+    )).ke2;
+    ke2.auth_response.server_public_keyshare = [_]u8{0xFF} ** 32;
+    try std.testing.expectError(
+        error.InvalidPublicKey,
+        generateKE3(login.state, .{}, v.context, ke2),
+    );
+}
