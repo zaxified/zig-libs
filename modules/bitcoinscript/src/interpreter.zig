@@ -836,17 +836,21 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
             // and `SIG_NULLDUMMY`.
             const script_code = try scriptCodeFor(allocator, state.script, state.last_codesep, state.sig_version, state.flags, sigs);
 
-            if (stack.items.len < 1) return error.InvalidStackOperation;
-            // Popped here (the dummy element must come off the stack either
-            // way) but the NULLDUMMY check itself is deferred until after
-            // the matching loop's NULLFAIL check below: Core's
-            // `OP_CHECKMULTISIG` raises `SIG_NULLFAIL` inside the
-            // stack-cleanup loop that runs BEFORE it pops the dummy and
-            // raises `SIG_NULLDUMMY`, so a script violating both must
-            // report `SigNullfail`, not `SigNulldummy` (wave-2 audit
-            // finding `bitcoinscript` F7 — error-class ordering, not the
-            // pass/fail verdict, which was already correct either way).
-            const dummy = stack.pop().?;
+            // The dummy element's presence is NOT checked here, even though
+            // it is the next thing conceptually on the stack: Core's
+            // `OP_CHECKMULTISIG` runs the ENTIRE matching loop below and its
+            // `SIG_NULLFAIL` cleanup check first, over the keys/sigs it
+            // already extracted, and only discovers a missing dummy
+            // afterward (`stack.size() < 1` right before the `SIG_NULLDUMMY`
+            // check, in the real source). A script that is simultaneously
+            // short the dummy element AND fails signature verification
+            // therefore reports `SIG_NULLFAIL`, not `INVALID_STACK_OPERATION`
+            // for the missing dummy — checking the dummy first (as this
+            // module did until 2026-09-10) has it backwards (wave-2 audit
+            // finding `bitcoinscript`, "CHECKMULTISIG with missing dummy" —
+            // error-class ordering, not the pass/fail verdict: a genuinely
+            // missing dummy is still rejected either way, just under a
+            // different error once the matching loop also fails).
 
             // Direct translation of Bitcoin Core's matching loop
             // (`interpreter.cpp` `OP_CHECKMULTISIG`): `key_i`/`sig_i` index
@@ -888,6 +892,12 @@ fn execOpcode(state: *State, opcode: u8, instr_next: usize) EvalError!void {
                 }
             }
 
+            // Only NOW does Core discover a missing dummy (`stack.size() <
+            // 1` right before the `SIG_NULLDUMMY` check) — see the note
+            // above `scriptCodeFor` on why this is checked here and not
+            // before the matching loop.
+            if (stack.items.len < 1) return error.InvalidStackOperation;
+            const dummy = stack.pop().?;
             if (state.flags.nulldummy and dummy.len != 0) return error.SigNulldummy;
 
             if (opcode == @intFromEnum(Opcode.OP_CHECKMULTISIGVERIFY)) {
@@ -1025,6 +1035,31 @@ fn evalCore(
         pc = instr.next;
         state.opcode_pos = opcode_pos;
 
+        // Op-count is metered for every non-push opcode > OP_16 (this
+        // includes IF/NOTIF/ELSE/ENDIF themselves), regardless of whether
+        // the current branch is executing -- Bitcoin Core counts this
+        // before ever consulting fExec, so a script can't hide unbounded
+        // opcodes inside a never-taken branch. BIP342 removes this limit for
+        // tapscript (the validation-weight budget bounds signature work
+        // instead). Checked FIRST, ahead of the disabled-opcode and
+        // reserved-conditional checks below: in the real source, EvalScript
+        // increments and tests nOpCount immediately after reading the
+        // opcode, before its CAT/SUBSTR-style disabled-opcode list and
+        // before the opcode switch even run — and OP_VERIF/OP_VERNOTIF are
+        // rejected by that switch's `default` case, i.e. after the op-count
+        // check, not before it. A script that is simultaneously over budget
+        // AND holds OP_VERIF/OP_VERNOTIF (or a CAT/SUBSTR-style disabled
+        // opcode) at the tripping position therefore reports `OpCount`, not
+        // `BadOpcode`/`DisabledOpcode` (wave-2 audit finding
+        // `bitcoinscript`, "OP_VERIF before the op-count meter" —
+        // error-class ordering, not the pass/fail verdict: both orders
+        // reject the same script; checking the opcode class first, as this
+        // module did until 2026-09-10, has it backwards).
+        if (!is_tapscript and instr.data == null and instr.opcode > @intFromEnum(Opcode.OP_16)) {
+            state.op_count += 1;
+            if (state.op_count > limits.max_ops_per_script) return error.OpCount;
+        }
+
         // In tapscript the legacy disabled-opcode set is instead the
         // OP_SUCCESSx set (already resolved to an unconditional success by
         // `scanOpSuccess` before execution begins), so the disabled check is
@@ -1032,18 +1067,6 @@ fn evalCore(
         // invalid in every version.
         if (!is_tapscript and opcodes.isDisabled(instr.opcode)) return error.DisabledOpcode;
         if (opcodes.isReservedConditional(instr.opcode)) return error.BadOpcode;
-
-        // Op-count is metered for every non-push opcode > OP_16 (this
-        // includes IF/NOTIF/ELSE/ENDIF themselves), regardless of whether
-        // the current branch is executing -- Bitcoin Core counts this
-        // before ever consulting fExec, so a script can't hide unbounded
-        // opcodes inside a never-taken branch. BIP342 removes this limit for
-        // tapscript (the validation-weight budget bounds signature work
-        // instead).
-        if (!is_tapscript and instr.data == null and instr.opcode > @intFromEnum(Opcode.OP_16)) {
-            state.op_count += 1;
-            if (state.op_count > limits.max_ops_per_script) return error.OpCount;
-        }
 
         // `const_scriptcode` policy: OP_CODESEPARATOR is rejected in a
         // non-witness script EVEN IN AN UNEXECUTED BRANCH — Bitcoin Core
@@ -1133,6 +1156,64 @@ test "OP_1 OP_2 OP_ADD OP_3 OP_EQUAL leaves true" {
     try eval(arena.allocator(), &stack, &.{ 0x51, 0x52, 0x93, 0x53, 0x87 }, dummyCtx(), .base, ScriptFlags.none);
     try testing.expectEqual(@as(usize, 1), stack.items.len);
     try testing.expect(number.castToBool(stack.items[0]));
+}
+
+// ── wave-2 audit finding `bitcoinscript`: two error-class orderings that
+// diverged from Bitcoin Core (recorded 2026-09-02, fixed 2026-09-10 once a
+// verified copy of `interpreter.cpp` was available to settle the real
+// order -- both orders already rejected the same scripts; only which
+// error fires changed) ──────────────────────────────────────────────────
+
+test "OP_VERIF at the op-count boundary reports OpCount, not BadOpcode (Core checks nOpCount first)" {
+    // 201 OP_NOPs raise op_count to exactly the limit without tripping it
+    // (limits.max_ops_per_script); the 202nd opcode is OP_VERIF, which is
+    // > OP_16 and therefore ALSO metered. Core's EvalScript increments and
+    // tests nOpCount immediately after reading each opcode, before its
+    // opcode switch (whose `default` case is what rejects OP_VERIF) ever
+    // runs -- so a script over budget AT an OP_VERIF position reports
+    // OP_COUNT. Before 2026-09-10 this module checked the opcode class
+    // first and always reported BadOpcode here, regardless of op_count.
+    const script = ([_]u8{0x61} ** limits.max_ops_per_script) ++ [_]u8{0x65};
+    try testing.expectError(error.OpCount, run(&script));
+}
+
+test "OP_VERIF well under the op-count budget still reports BadOpcode (positive control)" {
+    // Same opcode, nowhere near the limit: the reorder above must not
+    // change the ordinary case, only the boundary one.
+    try testing.expectError(error.BadOpcode, run(&.{0x65}));
+}
+
+test "CHECKMULTISIG with a missing dummy reports SigNullfail once signatures also fail, not InvalidStackOperation (Core checks the dummy last)" {
+    // <9-byte garbage "sig" + SIGHASH_ALL> <M=1> <1-byte "pubkey"> <N=1>
+    // CHECKMULTISIG, with NO dummy element underneath. strictenc/dersig
+    // are off, so the garbage signature reaches `parseDerLoose`, fails to
+    // parse, and the matching loop's lone attempt comes back false: with
+    // `nullfail` set that reports SIG_NULLFAIL. Core runs that entire
+    // matching loop and its NULLFAIL cleanup check BEFORE it ever looks at
+    // whether a dummy element is even there, so SIG_NULLFAIL is what a
+    // real node reports here. Before 2026-09-10 this module checked for
+    // the dummy first and reported InvalidStackOperation instead, without
+    // ever running the matching loop.
+    const script = [_]u8{
+        0x09, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x01, // push 9-byte garbage "sig"
+        0x51, // OP_1: nSigsCount = 1
+        0x01, 0xCC, // push 1-byte "pubkey"
+        0x51, // OP_1: nKeysCount = 1
+        0xae, // OP_CHECKMULTISIG
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stack: Stack = .empty;
+    try testing.expectError(error.SigNullfail, eval(arena.allocator(), &stack, &script, dummyCtx(), .base, .{ .nullfail = true }));
+}
+
+test "CHECKMULTISIG 0-of-0 with the dummy missing still reports InvalidStackOperation (positive control)" {
+    // <M=0> <N=0> CHECKMULTISIG, no dummy, no sigs, no pubkeys: the
+    // matching loop never runs (nSigsCount = 0) so NULLFAIL can never
+    // fire, leaving the moved-later missing-dummy check as the only thing
+    // that can still reject this script -- proving the reorder only
+    // delayed that check, it did not disable it.
+    try testing.expectError(error.InvalidStackOperation, run(&.{ 0x00, 0x00, 0xae }));
 }
 
 // ── scriptCode over an undecodable tail ──────────────────────────────────
