@@ -5,6 +5,43 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10 (2)** — A1 fix campaign, F12 (LOW), mutation-table coverage —
+  16 of the 22 surviving mutations now killed (17 new tests: 7 in `echo.zig`,
+  1 in `Socket.zig`, 9 in `pinger.zig`), no behavior change:
+  - **echo.zig** (m8, m15, m16, m18, m26, m27): each of the length-boundary
+    guards in `parseV4`/`parseV6`/`writeEchoRequest` is protected by a
+    DIFFERENT, more permissive check nearby, so a mutation on the specific
+    line the audit named left the suite green through the other check —
+    each new test is built to be observable ONLY through its named guard
+    (typically: the shortest input that makes the *next* line read/slice
+    past the buffer once the named guard is gone). Verified RED: all 6
+    crash under the exact `mut/mutate.py` mutation text; GREEN on revert.
+  - **Socket.zig** (m25): `parseControl`'s cmsg-list walk now has a test
+    with a cmsg claiming a `len` far past the control buffer. m28
+    (`parseSrc`'s `namelen < 2` check) is an EQUIVALENT MUTANT given the
+    current code shape — every downstream branch already requires
+    `namelen >= @sizeOf(sockaddr.in)` (16) or `>= @sizeOf(sockaddr.in6)`
+    (28), both of which imply `namelen >= 2`, so deleting the explicit
+    check changes no observable output for any input. Not testable because
+    there is nothing to distinguish, not because of a testing gap.
+  - **pinger.zig** (m2/m3/m31, m4/m32, m5, m6, m17, m19, m20, m23, m24):
+    correlation (RAW/error ident compared bit-by-bit in a 16-position
+    flip loop — kills "compare N bits" for any N and any bit position;
+    address-family cross-check; `check_source` actually enforced on the
+    `.echo_reply` arm, not just the `.icmp_error` arm F2 already covered;
+    duplicate-reply detection) and scheduling (`max_inflight` cap,
+    global pacing gap, stale-timeout-slot ownership, future timeouts not
+    firing early). Verified RED: all 9 fail/crash under the exact mutation
+    text (`if (false) ...` / `if (false and ...)`, matching
+    `mut/mutate.py`'s shapes); GREEN on revert, no collateral failures in
+    the other 57 tests.
+  - **m30** (`sendMany`'s `std.debug.assert`) is F1 territory (a user
+    decision item this session was told not to touch) — left untouched,
+    still open.
+  - `scripts/modtest icmp`: 66/66, Debug and ReleaseSafe. Consumers
+    unaffected (no production code touched): `scripts/modtest traceroute`
+    32/33 (1 skip), `scripts/modtest pathmtu` 35/35.
+
 - **2026-09-10** — **NO CODE CHANGE.** A1 fix campaign, F14 (LOW), documentation
   only. `addTarget`/`addTargetAddr`/`addTargetIp` validate nothing about the
   destination (multicast/broadcast/loopback/unspecified are all accepted and

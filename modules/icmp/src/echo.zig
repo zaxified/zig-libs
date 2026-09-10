@@ -571,6 +571,80 @@ test "short and foreign packets are ignored" {
     try std.testing.expectEqual(Reply.ignored, parseV6(&err6));
 }
 
+// ── A1 F12: mutation-table gaps in the length-boundary guards ───────────────
+//
+// icmp.md audit F12: a mutant that deletes/weakens one of these guards left
+// the whole 41-test suite green (survived), because every existing test
+// that reaches the same code path also satisfies a DIFFERENT, more
+// restrictive check downstream -- so the specific line a mutation touched
+// was never independently exercised. Each test below is built to be
+// unobservable EXCEPT through the exact guard it targets.
+
+test "A1 F12 m8: an IPv4 error with a zero-length quoted region is ignored, not read out of bounds" {
+    // `if (quoted.len < 20) return .ignored;` (echo.zig, right after `const
+    // quoted = buf[echo_header_len..];`). A quoted region of any length in
+    // [1,19] would ALSO be caught by the second check a few lines down
+    // (`quoted.len < qihl + echo_header_len`, and qihl is always >= 20 once
+    // it passes its own `qihl < 20` guard) -- so only a quoted region of
+    // length EXACTLY 0 distinguishes this check: deleting it makes the next
+    // line read `quoted[0]` on an empty slice.
+    var pkt: [echo_header_len]u8 = @splat(0); // buf.len == echo_header_len -> quoted.len == 0
+    pkt[0] = v4.time_exceeded;
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big); // A1 F7
+    try std.testing.expectEqual(Reply.ignored, parseV4(&pkt, false));
+}
+
+test "A1 F12 m16: a raw IPv4 packet whose declared IHL exceeds the buffer is ignored, not sliced out of bounds" {
+    // `if (ihl < 20 or buf.len < ihl) return .ignored;` -- the `ihl < 20`
+    // half alone does not protect `buf = buf[ihl..]` below it: an attacker
+    // can declare any IHL >= 20 while the actual buffer is shorter.
+    var pkt: [20]u8 = @splat(0); // satisfies the earlier `buf.len < 20` sanity check
+    pkt[0] = 0x4f; // version 4, IHL nibble = 15 -> ihl = 60, far past buf.len (20)
+    try std.testing.expectEqual(Reply.ignored, parseV4(&pkt, true));
+}
+
+test "A1 F12 m18: an IPv6 error with a quoted region of exactly 40 bytes (no room for the quoted header) is ignored" {
+    // `if (quoted.len < 40 + echo_header_len) return .ignored;` -- a quoted
+    // region of exactly 40 bytes (the IPv6 header alone, no quoted ICMPv6
+    // header after it) passes a weakened `< 40` check and falls through to
+    // `orig = quoted[40..]` (an empty slice) then `orig[0]`.
+    var pkt: [echo_header_len + 40]u8 = @splat(0);
+    pkt[0] = v6.time_exceeded;
+    pkt[echo_header_len + 6] = 58; // quoted next-header = ICMPv6, passes that check too
+    try std.testing.expectEqual(Reply.ignored, parseV6(&pkt));
+}
+
+test "A1 F12 m26: a timestamp reply shorter than the timestamp message is ignored, not read out of bounds" {
+    // `if (buf.len < timestamp_msg_len) return .ignored;` inside the
+    // `v4.timestamp_reply` case. Without it, `buf[8..12]` etc. read past a
+    // header-only (8-byte) buffer.
+    var pkt: [echo_header_len]u8 = @splat(0);
+    pkt[0] = v4.timestamp_reply;
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big); // A1 F7
+    try std.testing.expectEqual(Reply.ignored, parseV4(&pkt, false));
+}
+
+test "A1 F12 m27: a 1-byte IPv6 packet is ignored, not read out of bounds" {
+    // `if (buf.len < echo_header_len) return .ignored;` at the top of
+    // `parseV6`. `buf[0] = v6.echo_reply` forces the `.echo_reply` arm,
+    // which reads `buf[4..6]`/`buf[6..8]` -- out of bounds on a 1-byte
+    // buffer if the length guard is weakened to `< 1` (i.e. deleted in
+    // practice, since length is unsigned).
+    const pkt = [_]u8{v6.echo_reply};
+    try std.testing.expectEqual(Reply.ignored, parseV6(&pkt));
+}
+
+test "A1 F12 m15: writeEchoRequest rejects a buffer shorter than the header, not just some allocator guess" {
+    // `if (buf.len < echo_header_len) return error.BufferTooSmall;` in
+    // `writeEchoRequest`. A weakened `< 4` bound would accept a 7-byte
+    // buffer and then write `buf[6..8]` out of bounds.
+    var short: [echo_header_len - 1]u8 = undefined;
+    try std.testing.expectError(error.BufferTooSmall, writeEchoRequest(.v4, &short, 1, 1));
+    // Positive control: exactly `echo_header_len` succeeds.
+    var exact: [echo_header_len]u8 = undefined;
+    try writeEchoRequest(.v4, &exact, 1, 1);
+}
+
 test "A1 F7: parseV4 rejects an otherwise well-formed reply with a wrong checksum" {
     // Before this fix, the receive-side checksum was never verified at all
     // -- computed only when writing a request. Measured live 2026-09-05
