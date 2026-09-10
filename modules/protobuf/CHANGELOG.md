@@ -5,6 +5,37 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, dojezd wave. **No consumer-visible change.**
+  - **F10 (LOW, no behaviour change):** `emitMessage`'s own depth check
+    (`if (depth >= options.max_depth) return error.DepthExceeded;`) was
+    structurally unreachable — `encodeInto`/`encodeAlloc` always call
+    `encodedSize` -> `messageSize` first, which enforces the identical bound
+    at the identical depth before `emitMessage` is ever reached with it, and
+    `emitMessage` is private so nothing else can call it directly. Removed,
+    with a comment documenting the invariant instead of a second copy of the
+    same check. Measured: 73/73 before and after removal (Debug and
+    ReleaseFast) — unchanged, which is exactly what proves the branch was
+    dead.
+  - **F12 (LOW, test-only):** no float-pathology vector existed anywhere
+    (NaN payload, +-Inf, denormal); `@bitCast` makes our encode/decode round
+    trip bit-exact for these independent of any external oracle (the
+    python reference is lossy here and was not needed). Added
+    `codec_test.zig`'s "F12: float pathology (NaN payload, +-Inf, denormal)
+    round-trips bit-exact" — 7 `f64` + 7 `f32` bit patterns compared by
+    bits, not by `==` (NaN != NaN, so `expectEqual` on the float itself
+    cannot express this case). `-0.0` excluded on purpose: `isDefault`
+    treats it as the type default (`-0.0 == 0` in IEEE 754) and proto3
+    implicit presence never puts it on the wire, so a round trip through
+    an implicit-presence field cannot observe it either way. Measured:
+    masking the sign bit off in `decode.zig`'s float/double branches fails
+    4/74 tests (the new one plus two existing golden/interop cases that
+    also carry `-1.5e300` — confirming the mask is load-bearing for
+    existing coverage too); reverted after measurement, 74/74 (Debug and
+    ReleaseFast).
+  - F1/F6/F8/F13/F14 — still open; see
+    `~/CML/20260901-zig-libs-audit/A1/protobuf.md`'s 2026-09-10 dojezd
+    disposition for why each needs a decision or more budget than this
+    pass had.
 - **2026-09-10** — A1 fix campaign, wave-3 audit findings. **Consumer-visible: a `sint32`
   field's decoded value can change for a peer that sends a varint >= 2^32 (a bug fix — the
   old order disagreed with the reference above that threshold), and a new error

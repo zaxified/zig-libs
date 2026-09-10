@@ -137,7 +137,14 @@ fn valueSize(
 // ── emit pass ───────────────────────────────────────────────────────────────
 
 fn emitMessage(comptime T: type, value: T, e: *wire.Emitter, options: Options, depth: u8) Error!void {
-    if (depth >= options.max_depth) return error.DepthExceeded;
+    // A1/protobuf.md F10: no depth check here. `encodeInto`/`encodeAlloc`
+    // always call `messageSize` (via `encodedSize`) first, threading the
+    // exact same `depth` through the exact same recursion shape — so
+    // `messageSize`'s own check (above) has already rejected any value deep
+    // enough to trip this one before `emitMessage` is ever reached with it.
+    // A second copy of the same check here was dead code that looked like a
+    // guard: deleting it (mutation D4 in the audit's repro) changes no test
+    // outcome, because there is no reachable path where it would have fired.
 
     inline for (comptime schema.infos(T)) |info| {
         const f = @field(value, info.name);

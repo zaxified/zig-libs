@@ -217,6 +217,53 @@ test "round trip: every scalar kind at its extremes" {
     }
 }
 
+// A1/protobuf.md F12: the case list above stops at `-1.5e300` / `3.5` — no
+// NaN, no +-Inf, no denormal anywhere in the suite. Compared bit-for-bit,
+// not by value: NaN != NaN under `==`, so `testing.expectEqual` on the
+// float itself (as the block above does) cannot even express this case.
+// `-0.0` is deliberately excluded: `isDefault` treats it as the type
+// default (`-0.0 == 0` is true in IEEE 754), so proto3 implicit presence
+// never puts it on the wire at all — that is a documented, intentional
+// elision (A1/protobuf.md F12's own writeup), not something a round trip
+// through an implicit-presence field can observe either way.
+test "F12: float pathology (NaN payload, +-Inf, denormal) round-trips bit-exact" {
+    const gpa = testing.allocator;
+    const f64_cases = [_]u64{
+        0x7ff8000000000000, // qNaN, canonical payload
+        0x7ff0000000000001, // sNaN, minimal payload
+        0xfff8000000000001, // negative NaN, nonzero payload
+        0x7ff0000000000000, // +Inf
+        0xfff0000000000000, // -Inf
+        0x0000000000000001, // smallest positive denormal
+        0x8000000000000001, // smallest negative denormal
+    };
+    const f32_cases = [_]u32{
+        0x7fc00000, // qNaN
+        0x7f800001, // sNaN
+        0xffc00001, // negative NaN, nonzero payload
+        0x7f800000, // +Inf
+        0xff800000, // -Inf
+        0x00000001, // smallest positive denormal
+        0x80000001, // smallest negative denormal
+    };
+    for (f64_cases) |bits| {
+        const c = Wide{ .d = @bitCast(bits) };
+        const bytes = try pb.encodeAlloc(gpa, c, .{});
+        defer gpa.free(bytes);
+        var d = try pb.decode(Wide, gpa, bytes, .{});
+        defer d.deinit();
+        try testing.expectEqual(bits, @as(u64, @bitCast(d.value.d)));
+    }
+    for (f32_cases) |bits| {
+        const c = Wide{ .f = @bitCast(bits) };
+        const bytes = try pb.encodeAlloc(gpa, c, .{});
+        defer gpa.free(bytes);
+        var d = try pb.decode(Wide, gpa, bytes, .{});
+        defer d.deinit();
+        try testing.expectEqual(bits, @as(u32, @bitCast(d.value.f)));
+    }
+}
+
 test "round trip: repeated fields of every shape" {
     const gpa = testing.allocator;
     const v = Repeated{
