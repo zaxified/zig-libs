@@ -52,6 +52,27 @@ pub fn sealedLen(plaintext_len: usize) usize {
 
 // ── buffer API (no allocation) ────────────────────────────────────────────────
 
+/// Audit finding L2: `seal`'s inferred error set silently carries whatever
+/// `std.crypto.nacl.SealedBox.seal` happens to return today, so a std change
+/// can widen or narrow it without this module's own API surface saying so.
+/// Named explicitly instead: `InvalidBufferSize` is this module's own guard;
+/// `WeakPublicKey`/`IdentityElement` are std's (an attacker-chosen or
+/// degenerate `recipient_pk`).
+pub const SealError = error{InvalidBufferSize} ||
+    std.crypto.errors.WeakPublicKeyError ||
+    std.crypto.errors.IdentityElementError;
+
+/// Audit finding L2: `open`'s inferred error set has FOUR members
+/// (`InvalidCiphertext`/`IdentityElement`/`WeakPublicKey`/`AuthenticationFailed`)
+/// where the README/doc-comment only named two (tamper/short-input). Named
+/// explicitly so a caller doing an exhaustive `switch` sees all four, and a
+/// std change to the inferred set becomes a compile error here instead of a
+/// silent widening.
+pub const OpenError = error{InvalidCiphertext} ||
+    std.crypto.errors.IdentityElementError ||
+    std.crypto.errors.WeakPublicKeyError ||
+    std.crypto.errors.AuthenticationError;
+
 /// Seal `msg` to `recipient_pk`. `out` must be exactly `msg.len + overhead`
 /// bytes; a wrong size returns `error.InvalidBufferSize` rather than trusting
 /// the caller. `io` supplies entropy for the per-message ephemeral keypair.
@@ -60,7 +81,11 @@ pub fn sealedLen(plaintext_len: usize) usize {
 /// is compiled out in ReleaseFast, so the one build where a miscomputed buffer
 /// costs the most is the build where nothing would have caught it. `open`
 /// below has always returned an error for the same class of mistake.
-pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) !void {
+///
+/// Errors: see `SealError`. `IdentityElement` is reachable from
+/// attacker-controlled bytes (a degenerate `recipient_pk` some other layer
+/// parsed off the wire) -- not just a pathological caller mistake.
+pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length]u8) SealError!void {
     if (out.len != msg.len + overhead) return error.InvalidBufferSize;
     try SealedBox.seal(io, out, msg, recipient_pk);
 }
@@ -68,7 +93,21 @@ pub fn seal(io: std.Io, out: []u8, msg: []const u8, recipient_pk: [public_length
 /// Open a sealed message with the recipient keypair. `out` must be exactly
 /// `sealed.len - overhead` bytes. Returns an error (never panics) on a too-short
 /// or tampered ciphertext.
-pub fn open(out: []u8, sealed: []const u8, kp: KeyPair) !void {
+///
+/// Errors: see `OpenError`. Note `IdentityElement`/`WeakPublicKey` are
+/// reachable from the SENDER's bytes (the ephemeral public-key prefix an
+/// anonymous sender supplies) via the same path a fuzzer reaches with
+/// `sealed_bad_epk`-shaped input -- they are not only a caller mistake, and a
+/// caller that maps "AuthenticationFailed -> quietly drop" but treats
+/// everything else as an internal error gives an attacker a distinguishable
+/// log signal (audit finding L2).
+///
+/// On ANY error, `out`'s contents are unspecified -- audit finding L6: std's
+/// `@memset(m, undefined)` on the failure path is a documentation-only no-op
+/// in `ReleaseFast` (the actual bytes may be leftover keystream, not zeroed
+/// and not the plaintext). A caller must not read `out` unless `open`
+/// returned successfully.
+pub fn open(out: []u8, sealed: []const u8, kp: KeyPair) OpenError!void {
     if (sealed.len < overhead or sealed.len != out.len + overhead)
         return error.InvalidCiphertext;
     try SealedBox.open(out, sealed, kp);

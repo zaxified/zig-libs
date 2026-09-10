@@ -68,10 +68,13 @@ pub fn main() !void {
     //
     // Buffer sizing is the caller's job: `out` must be exactly
     // `msg.len + overhead` (48 bytes: 32-byte ephemeral pubkey + 16-byte
-    // Poly1305 tag) -- get this wrong and `seal`'s own debug-only assertion
-    // catches it in a safe build, but a ReleaseFast caller would corrupt memory
-    // instead, so the buffer math belongs in the caller's types, not in a
-    // runtime check alone.
+    // Poly1305 tag) -- get this wrong and `seal` returns `error.InvalidBufferSize`
+    // in EVERY build mode (see root.zig: the check is a real `if`, not
+    // `std.debug.assert`, precisely because ReleaseFast would otherwise compile
+    // the check out and turn a caller's sizing mistake into memory corruption
+    // in exactly the build where nothing would have caught it). This comment
+    // used to describe the old assert-based behavior after the code had
+    // already moved past it -- audit finding L3, 2026-09-05.
     const msg1 = "meet at the usual place, bring the fresh evidence";
     var boxed1: [msg1.len + sealedbox.overhead]u8 = undefined;
     must(boxed1.len == sealedbox.sealedLen(msg1.len), @src());

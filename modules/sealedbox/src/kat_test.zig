@@ -207,6 +207,140 @@ fn fuzzOpen(_: void, smith: *std.testing.Smith) !void {
     sealedbox.open(out_buf[0..out_len], sealed, kp) catch return;
 }
 
+// ── fuzz: seal on arbitrary plaintext ───────────────────────────────────
+//
+// Audit finding M2 (second half): the `open` corpus above fuzzes the
+// ciphertext BODY, but `seal` — the module's OTHER public entry point —
+// had no fuzz harness at all, so nothing exercised it on plaintext content
+// other than the fixed strings in the value tests. `seal` on a well-formed
+// recipient key should never fail for ANY plaintext bytes/length; a `try`
+// (not a `catch`) is deliberate here, so an unexpected error is a fuzz
+// failure, the same way a panic would be.
+fn fuzzSeal(_: void, smith: *std.testing.Smith) !void {
+    const io = std.testing.io;
+    const kp = sealedbox.KeyPair{
+        .public_key = hexDecode32(kat.recipient_pk_hex),
+        .secret_key = hexDecode32(kat.recipient_sk_hex),
+    };
+
+    var msg_buf: [256]u8 = undefined;
+    const msg_len: usize = smith.slice(&msg_buf);
+    const msg = msg_buf[0..msg_len];
+
+    var out_buf: [256 + sealedbox.overhead]u8 = undefined;
+    const out = out_buf[0 .. msg.len + sealedbox.overhead];
+    try sealedbox.seal(io, out, msg, kp.public_key);
+
+    var opened_buf: [256]u8 = undefined;
+    const opened = opened_buf[0..msg.len];
+    try sealedbox.open(opened, out, kp);
+    try testing.expectEqualSlices(u8, msg, opened);
+}
+
+test "fuzz: seal never fails or panics on arbitrary plaintext, and the result opens back" {
+    try std.testing.fuzz({}, fuzzSeal, .{ .corpus = &[_][]const u8{
+        seed(""),
+        seed("x"),
+        seed(kat.message),
+        seed(&[_]u8{0xAA} ** 256),
+    } });
+}
+
+// ── H1: a forged tag that only PARTIALLY matches must still be rejected ──
+//
+// Audit finding H1: the AEAD tag comparison this module relies on
+// (`std.crypto.timing_safe.eql` in `salsa20.zig`) is the ONLY thing standing
+// between a tampered ciphertext and a silently accepted forgery. Measured
+// 2026-09-09 (`A1/repro/sealedbox/forge.py`): with that comparison weakened
+// to check only the first 1/2/4/8/12/15 of the tag's 16 bytes, an attacker
+// who XOR-malleates the body of a real sealed box and brute-forces the
+// checked tag prefix gets 20/20 forgeries accepted (mean 109.3 guesses of
+// 256) — and the *un*-weakened suite stayed 17/17 green throughout, because
+// no committed test distinguishes "compares all 16 bytes" from "compares a
+// prefix". Full removal of the check was the only mutation any existing
+// test caught.
+//
+// This test proves the property without needing to weaken anything: for
+// N in {1, 2, 4, 8} (the audit's own ladder), it builds a tag that is
+// EXACTLY equal to a real box's tag in its first N bytes (bytes [0, N)) and
+// provably different starting at byte N (XOR with 0xFF always changes a
+// byte), then asserts `open` rejects it. A correct 16-byte comparison must
+// reject all four; a comparison narrowed to the first N bytes would instead
+// ACCEPT the corresponding case, and only that case, which is what makes
+// this a ladder rather than one test standing in for all of them.
+test "H1: a forged tag that agrees with the real one in its first 1/2/4/8 bytes is still rejected" {
+    const io = std.testing.io;
+    const kp = sealedbox.KeyPair.generate(io);
+    const msg = "H1 ladder: a partially-matching tag must not authenticate";
+
+    var boxed: [msg.len + sealedbox.overhead]u8 = undefined;
+    try sealedbox.seal(io, &boxed, msg, kp.public_key);
+    const real_tag = boxed[32..48].*;
+
+    const ladder = [_]usize{ 1, 2, 4, 8 };
+    for (ladder) |n| {
+        var forged = boxed;
+        var tag = real_tag;
+        tag[n] ^= 0xFF; // matches real_tag in [0, n), guaranteed different at n
+        @memcpy(forged[32..48], &tag);
+
+        // Sanity, executable rather than asserted only in the comment: this
+        // IS a "matches in the first N bytes, differs by byte N" forgery —
+        // exactly what an N-byte-prefix comparison would accept and what
+        // only a full 16-byte comparison can reject.
+        try testing.expect(std.mem.eql(u8, real_tag[0..n], tag[0..n]));
+        try testing.expect(!std.mem.eql(u8, &real_tag, &tag));
+
+        var opened: [msg.len]u8 = undefined;
+        try testing.expectError(error.AuthenticationFailed, sealedbox.open(&opened, &forged, kp));
+    }
+}
+
+// ── L5: degenerate / small-order X25519 points ──────────────────────────
+//
+// Audit finding L5: `A1/repro/sealedbox/smallorder.py` ran 13 degenerate and
+// non-canonical Curve25519 points through both this module and libsodium,
+// both directions (seal to a degenerate recipient key, open a box with a
+// degenerate ephemeral-key prefix), and found 0/13 accept/reject
+// divergences — the behavior is correct, it just had no committed test.
+// These six are libsodium's own small-order blacklist entries where BOTH
+// implementations reject (the audit's "+p" variants are accepted by both
+// and are a coordinate re-encoding of an ordinary point, not a rejection
+// case, so they are not pinned here).
+const degenerate_x25519_points = [_][]const u8{
+    "0000000000000000000000000000000000000000000000000000000000000000", // order-1, all-zero
+    "0100000000000000000000000000000000000000000000000000000000000000", // order-1, one
+    "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800", // order-8 #1
+    "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7", // order-8 #2
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // order-4 (p-1)
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f", // non-canonical p (=0)
+};
+
+test "L5: seal rejects a degenerate/small-order recipient key, matching libsodium" {
+    const io = std.testing.io;
+    inline for (degenerate_x25519_points) |hex| {
+        const pk = hexDecode32(hex);
+        var out: [4 + sealedbox.overhead]u8 = undefined;
+        try testing.expectError(error.IdentityElement, sealedbox.seal(io, &out, "test", pk));
+    }
+}
+
+test "L5: open rejects a sealed box whose ephemeral-key prefix is a degenerate/small-order point" {
+    const kp = sealedbox.KeyPair{
+        .public_key = hexDecode32(kat.recipient_pk_hex),
+        .secret_key = hexDecode32(kat.recipient_sk_hex),
+    };
+    inline for (degenerate_x25519_points) |hex| {
+        const epk = hexDecode32(hex);
+        // epk (32) || tag (16, arbitrary — the point rejection fires before
+        // the tag is ever consulted) || body (4, arbitrary).
+        var sealed: [32 + 16 + 4]u8 = [_]u8{0xAA} ** (32 + 16 + 4);
+        @memcpy(sealed[0..32], &epk);
+        var opened: [4]u8 = undefined;
+        try testing.expectError(error.IdentityElement, sealedbox.open(&opened, &sealed, kp));
+    }
+}
+
 test "corpus: every ciphertext reaches open, and the opened count is pinned" {
     // ⭐ The measurement, executable rather than written in a comment. A seed
     // longer than the harness's buffer reads back EMPTY (`Smith.slice` falls

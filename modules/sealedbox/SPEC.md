@@ -16,6 +16,12 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   so a persisted secret round-trips. Serialization is fixed-size base64/hex with typed errors.
 - **No bespoke crypto:** every primitive comes from `std.crypto` — this module composes, it does
   not implement, cryptographic primitives.
+- **`openAlloc` allocates before the tag is verified** (audit finding L7): the output buffer is
+  allocated first and freed via `errdefer` on a failed `open`. The amplification is bounded (1×:
+  one allocation the size of the plaintext, freed immediately on failure, never leaked — see the
+  example's `DebugAllocator` leak check on exactly this path), so this is not a finding on its own,
+  but a caller doing its own accounting for untrusted input should know the allocation happens
+  before authentication, not after.
 
 ## Threat model / out of scope
 
@@ -99,6 +105,29 @@ misreading of the spec on both sides would still pass. Two independent anchors c
    third-party-*published* fixed `crypto_box_seal` ciphertext exists anywhere to paste in; the
    vector above is the closest achievable substitute (real libsodium code, fixed inputs we chose),
    not a vector libsodium itself publishes.
+
+## Performance
+
+Audit finding M5: an earlier record (`20260808-zig-libs-audit/modules/sealedbox.md` B3) claimed
+this module "INHERITS std X25519 ... (NOT a finding)" citing a measurement against OpenSSL made for
+a *different* module, not `crypto_box_seal` against libsodium. Measured directly, same host, three
+rounds, `CLOCK_PROCESS_CPUTIME_ID` (`A1/repro/sealedbox/bench.zig` + `bench_sodium.c`):
+
+| operation | size | `sealedbox` (µs/op) | libsodium 1.0.18 (µs/op) | ratio |
+|---|---|---|---|---|
+| seal | 32 B | 112.7 | 84.9 | 1.33x slower |
+| open | 32 B | 54.5 | 43.9 | 1.24x |
+| seal | 1 kB | 111.2 | 84.9 | 1.31x |
+| open | 1 kB | 61.0 | 45.9 | 1.33x |
+| seal | 64 kB | 303.3 | 128.4 | 2.36x slower |
+| open | 64 kB | 249.1 | 88.9 | 2.80x slower |
+
+Marginal breakdown (64 kB − 1 kB): the asymmetric part (X25519) is ~1.28x slower than libsodium,
+close to the earlier estimate; the symmetric part (XSalsa20-Poly1305) is **4.4x** slower —
+std's Salsa20 is scalar, libsodium 1.0.18's is vectorized. Not a defect: this module implements no
+symmetric cipher of its own, it composes `std.crypto`. A caller sending large (~64 kB-class)
+messages through `sealedbox` should budget for this gap; small (config-key-sized) payloads are
+within ~1.3x either way.
 
 ## Backlog / deferred
 
