@@ -21,7 +21,10 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
     OCB) — **CBC is absent**, so `Aes256Cbc` here implements it
     (encrypt `c_i = E(p_i XOR c_{i-1})`, decrypt `p_i = D(c_i) XOR
     c_{i-1}`), no padding, per the CTAP2 requirement that plaintexts are
-    whole blocks.
+    whole blocks. (Audit finding L5: `aescbc` is a second, independent
+    from-scratch CBC in this repo, extracted for `xmlenc`/`jwe` — see
+    `README.md` for why this module keeps its own instead of depending
+    on it.)
   - `ecc.P256`: `fromAffineCoordinates` re-checks the curve equation
     (peer COSE-key validation), `Fe.fromBytes(.big)` rejects
     non-canonical coordinates, `mul(scalar, .big)` is the constant-time

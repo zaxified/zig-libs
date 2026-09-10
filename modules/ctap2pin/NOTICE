@@ -35,8 +35,9 @@ implementation's test suite):
     terms.
 
 `std.crypto` primitives are used via their public APIs (MIT, part of Zig
-itself): `core.aes.Aes256` (the raw block cipher — CBC mode is NOT in std
-and is this module's own, see `root.zig`'s module doc), `ecc.P256`,
+itself): `core.aes.Aes256` (the raw block cipher — CBC mode is NOT in std,
+so this module carries its own; a second from-scratch CBC also lives in
+the `aescbc` module, see `README.md`, audit finding L5), `ecc.P256`,
 `kdf.hkdf.HkdfSha256`, `auth.hmac.sha2.HmacSha256`, `hash.sha2.Sha256`,
 and `timing_safe.eql`.
 

@@ -7,11 +7,20 @@ authentication protecting the PIN/UV during CTAP2. The crypto layer both
 a CTAP2 platform and an authenticator implementation sit on.
 
 **Status: complete — both protocols, KAT-validated AND oracle-validated**
-(AES-256-CBC vs NIST SP 800-38A F.2.5/F.2.6 — CBC is this module's own, it
-is **not** in `std.crypto`; HKDF vs RFC 5869 A.1; P-256 ECDH vs RFC 5903
-§8.1; HMAC vs RFC 4231; plus the protocol FRAMING — encapsulate, the
-pinHashEnc/pinUvAuthToken exchange, and pinUvAuthParam in both keying
+(AES-256-CBC vs NIST SP 800-38A F.2.5/F.2.6 — CBC is **not** in `std.crypto`,
+so this module carries its own (see below); HKDF vs RFC 5869 A.1; P-256 ECDH
+vs RFC 5903 §8.1; HMAC vs RFC 4231; plus the protocol FRAMING — encapsulate,
+the pinHashEnc/pinUvAuthToken exchange, and pinUvAuthParam in both keying
 shapes — byte-exact against a live capture of Yubico's `python-fido2` SDK).
+
+Audit finding L5 (2026-09-05): the `aescbc` module exists precisely to give
+`xmlenc`/`jwe` a single shared CBC core instead of two hand-rolled copies —
+`ctap2pin` is a third, independent one, byte-exact to `aescbc` against the
+same NIST vector but written before `aescbc` existed and not folded onto it
+(that would add a dependency this module has never needed, and `aescbc`
+currently accepts `dst.len >= src.len`; this module requires exact equality,
+so folding is a behavior decision, not a doc fix). Noted here rather than
+silently left implying this is the repository's only from-scratch CBC.
 See `SPEC.md`.
 
 | File | Contents |

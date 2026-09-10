@@ -110,9 +110,11 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
 /// A malformed/mismatched authenticator public key -- standing in for a
 /// MITM substituting its own key, or a corrupted COSE_Key on the wire --
 /// is rejected by NAME before any shared secret (right or wrong) is ever
-/// derived. `(0, 0)` satisfies neither the P-256 curve equation nor
-/// happens to be the point at infinity's compressed form, so
-/// `fromAffineCoordinates` rejects it outright.
+/// derived. `(0, 0)` does not satisfy the P-256 curve equation, so
+/// `fromAffineCoordinates` rejects it outright. (It is a DIFFERENT point,
+/// `(0, 1)`, that is P-256's affine encoding of the point at infinity --
+/// `toPoint`, not `fromAffineCoordinates` alone, is what rejects that one,
+/// via `rejectIdentity`.)
 fn checkBadPeerKeyRejected() !void {
     const platform_scalar = [_]u8{0x02} ** 32;
     const bogus_peer = ctap2pin.PublicKey{ .x = [_]u8{0} ** 32, .y = [_]u8{0} ** 32 };

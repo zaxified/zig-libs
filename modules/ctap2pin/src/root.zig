@@ -135,12 +135,28 @@ pub const PublicKey = struct {
     x: [32]u8,
     y: [32]u8,
 
-    /// Validate the coordinates: each must be a canonical field element and
-    /// (x, y) must satisfy the P-256 curve equation. Returns the point.
+    /// Validate the coordinates: each must be a canonical field element,
+    /// (x, y) must satisfy the P-256 curve equation, and the point must not
+    /// be the identity element. Returns the point.
+    ///
+    /// ⛔ Audit finding M1 (2026-09-05): this used to accept `(0, 1)`, which
+    /// is P-256's affine encoding of the point at infinity (`group.zig:67`,
+    /// `:728`) — `fromAffineCoordinates` only checks `on_curve | is_identity`,
+    /// so the identity element passes it by name. A caller that validates a
+    /// received `platformKeyAgreementKey`/`authenticatorKeyAgreementKey` with
+    /// `toPoint` (exactly the use this function's own doc offers it for)
+    /// would accept and store a public key with no discrete log, then only
+    /// fail two calls later at `ecdhZ`'s `point.mul` — closed, but not by
+    /// the check whose name promised it. `rejectIdentity` closes the gap at
+    /// the boundary `toPoint` itself is the boundary for. Zero in-repo
+    /// consumers (`DECISIONS.md` P1): tightening what a validator accepts
+    /// needs no sign-off.
     pub fn toPoint(pk: PublicKey) EcdhError!P256 {
         const x = P256.Fe.fromBytes(pk.x, .big) catch return error.InvalidPublicKey;
         const y = P256.Fe.fromBytes(pk.y, .big) catch return error.InvalidPublicKey;
-        return P256.fromAffineCoordinates(.{ .x = x, .y = y }) catch return error.InvalidPublicKey;
+        const p = P256.fromAffineCoordinates(.{ .x = x, .y = y }) catch return error.InvalidPublicKey;
+        p.rejectIdentity() catch return error.InvalidPublicKey;
+        return p;
     }
 };
 
@@ -187,6 +203,16 @@ pub fn ecdhZ(private_scalar: [32]u8, peer: PublicKey) EcdhError![32]u8 {
 pub const Protocol = enum(u8) {
     one = 1,
     two = 2,
+
+    /// Decode the drawn `pinUvAuthProtocol` wire value. Audit finding L3
+    /// (2026-09-05): this enum is documented as a wire type, but this module
+    /// had nothing that validated one — `@enumFromInt(3)` is a panic in
+    /// safe modes and UB in `ReleaseFast`, on a byte a CBOR decoder above
+    /// this module reads directly off the wire. Purely additive (new
+    /// function): no existing signature changes.
+    pub fn fromWire(b: u8) error{InvalidProtocol}!Protocol {
+        return std.enums.fromInt(Protocol, b) orelse error.InvalidProtocol;
+    }
 };
 
 /// Comptime dispatch: `Impl(.one) == One`, `Impl(.two) == Two`.
@@ -238,13 +264,25 @@ pub const One = struct {
     /// §6.5.7 `encrypt(key, demPlaintext)`: AES-256-CBC with an all-zero
     /// IV, no padding, output is the bare ciphertext (`dst.len ==
     /// plaintext.len`, a multiple of 16).
-    pub fn encrypt(key: SharedSecret, dst: []u8, plaintext: []const u8) CbcError!void {
+    ///
+    /// Audit finding M3 (2026-09-05): `key` arrives BY VALUE, so every call
+    /// makes its own stack copy of the shared secret that a caller's
+    /// `secureZero(&encaps.shared_secret)` (the contract `Encapsulation`'s
+    /// doc comment asks for) never reaches — that copy is a different
+    /// address, on a frame this function owns. Zero this function's own
+    /// copy before returning.
+    pub fn encrypt(key_: SharedSecret, dst: []u8, plaintext: []const u8) CbcError!void {
+        var key = key_;
+        defer std.crypto.secureZero(u8, &key);
         try Aes256Cbc.encrypt(dst, plaintext, key, @splat(0));
     }
 
     /// §6.5.7 `decrypt(key, demCiphertext)`: inverse of `encrypt`
-    /// (`dst.len == ciphertext.len`, a multiple of 16).
-    pub fn decrypt(key: SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
+    /// (`dst.len == ciphertext.len`, a multiple of 16). See `encrypt`'s doc
+    /// comment (M3) for why `key` is re-bound to a `var` and zeroed here.
+    pub fn decrypt(key_: SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
+        var key = key_;
+        defer std.crypto.secureZero(u8, &key);
         try Aes256Cbc.decrypt(dst, ciphertext, key, @splat(0));
     }
 
@@ -288,7 +326,12 @@ pub const Two = struct {
     /// (32 bytes each); the shared secret is `hmacKey || aesKey`.
     pub fn kdf(z: [32]u8) SharedSecret {
         const salt: [32]u8 = @splat(0);
-        const prk = HkdfSha256.extract(&salt, &z);
+        var prk = HkdfSha256.extract(&salt, &z);
+        // Audit finding M3 (2026-09-05): `prk` regenerates BOTH halves of
+        // the shared secret and the caller never sees it at all (only the
+        // expanded `out` below) — nothing a caller does, however carefully,
+        // can reach it. Zero it here, the only place that can.
+        defer std.crypto.secureZero(u8, &prk);
         var out: SharedSecret = undefined;
         HkdfSha256.expand(out[0..32], "CTAP2 HMAC key", prk);
         HkdfSha256.expand(out[32..64], "CTAP2 AES key", prk);
@@ -322,7 +365,12 @@ pub const Two = struct {
     /// fresh randomness; taking it as a parameter keeps this deterministic
     /// and KAT-able). Output is `iv || ciphertext`, so `dst.len` must be
     /// `plaintext.len + 16` (`encryptedLength`).
-    pub fn encrypt(key: SharedSecret, iv: [iv_length]u8, dst: []u8, plaintext: []const u8) CbcError!void {
+    /// Audit finding M3 (2026-09-05): see `One.encrypt`'s doc comment —
+    /// same by-value-parameter copy, same fix, and this half (the AES key)
+    /// is exactly `n.aes_key` in the dead-stack probe.
+    pub fn encrypt(key_: SharedSecret, iv: [iv_length]u8, dst: []u8, plaintext: []const u8) CbcError!void {
+        var key = key_;
+        defer std.crypto.secureZero(u8, &key);
         if (dst.len != encryptedLength(plaintext.len)) return error.InvalidLength;
         try Aes256Cbc.encrypt(dst[iv_length..], plaintext, key[32..64].*, iv);
         dst[0..iv_length].* = iv;
@@ -330,8 +378,10 @@ pub const Two = struct {
 
     /// §6.5.8 `decrypt(key, demCiphertext)`: split off the leading 16-byte
     /// IV, AES-256-CBC-decrypt the rest with the AES-key half. `dst.len`
-    /// must equal `decryptedLength(ciphertext.len)`.
-    pub fn decrypt(key: SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
+    /// must equal `decryptedLength(ciphertext.len)`. M3: see `encrypt` above.
+    pub fn decrypt(key_: SharedSecret, dst: []u8, ciphertext: []const u8) CbcError!void {
+        var key = key_;
+        defer std.crypto.secureZero(u8, &key);
         const plaintext_len = try decryptedLength(ciphertext.len);
         if (dst.len != plaintext_len) return error.InvalidLength;
         try Aes256Cbc.decrypt(dst, ciphertext[iv_length..], key[32..64].*, ciphertext[0..iv_length].*);
@@ -367,6 +417,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("pin_protocol_oracle_vectors.zig");
     _ = @import("pin_protocol_oracle_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 // ── fuzz: untrusted-wire decoders never panic/OOB on arbitrary bytes ──────
@@ -377,8 +428,45 @@ fn fuzzPublicKeyToPoint(_: void, smith: *std.testing.Smith) !void {
     const pk = PublicKey{ .x = buf[0..32].*, .y = buf[32..64].* };
     _ = pk.toPoint() catch return;
 }
+
+/// ⛔ Audit finding I1 (2026-09-05): `smith.bytes(&buf)` draws 64 UNIFORM
+/// random bytes and asks them to land on P-256 — probability ≈ 2⁻²⁵⁶. An
+/// unseeded run of this harness can never reach `toPoint`'s accept path, and
+/// (after the M1 fix above) never reaches its `rejectIdentity` path either.
+/// Seed with one genuine on-curve point (the base point `G`) and the
+/// identity element's affine encoding `(0, 1)`, so both outcomes are
+/// exercised at least once and mutation has somewhere on-curve to start from.
+fn hx64(comptime hex_str: []const u8) [hex_str.len / 2]u8 {
+    var out: [hex_str.len / 2]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, hex_str) catch unreachable;
+    return out;
+}
+
+const to_point_seeds = [_][]const u8{
+    // The NIST P-256 base point G (FIPS 186-4 D.1.2.3) — a fixed, well-known
+    // on-curve point, decoded from hex at comptime (no curve arithmetic).
+    &(hx64("6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296") ++
+        hx64("4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5")),
+    &([_]u8{0} ** 32 ++ [_]u8{0} ** 31 ++ [_]u8{1}), // (0, 1): the identity element
+};
+
 test "fuzz PublicKey.toPoint never panics" {
-    try std.testing.fuzz({}, fuzzPublicKeyToPoint, .{});
+    try std.testing.fuzz({}, fuzzPublicKeyToPoint, .{ .corpus = &to_point_seeds });
+}
+
+test "corpus: the toPoint seeds reach both the accept and the identity-reject path" {
+    for (to_point_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [64]u8 = undefined;
+        smith.bytes(&buf);
+        const pk = PublicKey{ .x = buf[0..32].*, .y = buf[32..64].* };
+        _ = pk.toPoint() catch {};
+    }
+    try std.testing.expect(to_point_seeds[0].len == 64);
+    const on_curve = PublicKey{ .x = to_point_seeds[0][0..32].*, .y = to_point_seeds[0][32..64].* };
+    _ = try on_curve.toPoint();
+    const identity = PublicKey{ .x = to_point_seeds[1][0..32].*, .y = to_point_seeds[1][32..64].* };
+    try std.testing.expectError(error.InvalidPublicKey, identity.toPoint());
 }
 
 /// ⛔ `Two.decrypt` accepts exactly the lengths `16 + 16k`, and `cipher_len`

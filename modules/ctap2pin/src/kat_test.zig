@@ -146,6 +146,34 @@ test "ECDH: invalid inputs are typed errors, no panic" {
     try t.expectError(error.InvalidScalar, ctap2pin.publicKeyFromScalar(@splat(0xff)));
 }
 
+test "PublicKey.toPoint rejects the point at infinity, by name" {
+    // Audit finding M1 (2026-09-05): P-256's affine encoding of the
+    // identity element is (0, 1) -- NOT (0, 0), which is simply off-curve.
+    // `fromAffineCoordinates` accepts `(on_curve | is_identity)`, so a bare
+    // curve-equation check lets (0, 1) through. A caller using `toPoint` to
+    // validate a peer's `*KeyAgreementKey` (its documented use) would accept
+    // and store a public key with no discrete log.
+    var y_one: [32]u8 = @splat(0);
+    y_one[31] = 1;
+    const identity_point = ctap2pin.PublicKey{ .x = @splat(0), .y = y_one };
+    try t.expectError(error.InvalidPublicKey, identity_point.toPoint());
+    // Positive control: an ordinary on-curve, non-identity point still
+    // passes -- the identity check does not just reject everything.
+    _ = try gi.toPoint();
+}
+
+test "Protocol.fromWire: decodes the two defined wire values, rejects the rest" {
+    // Audit finding L3 (2026-09-05): before `fromWire` existed, the only way
+    // to turn a wire byte into a `Protocol` was `@enumFromInt`, which is not
+    // a decoder -- it is a panic (safe modes) or UB (ReleaseFast) on
+    // anything but 1 or 2.
+    try t.expectEqual(ctap2pin.Protocol.one, try ctap2pin.Protocol.fromWire(1));
+    try t.expectEqual(ctap2pin.Protocol.two, try ctap2pin.Protocol.fromWire(2));
+    for ([_]u8{ 0, 3, 4, 255 }) |b| {
+        try t.expectError(error.InvalidProtocol, ctap2pin.Protocol.fromWire(b));
+    }
+}
+
 // ── pinUvAuthProtocol One ──────────────────────────────────────────────────
 
 test "protocol one: kdf(Z) is SHA-256(Z)" {
@@ -196,9 +224,19 @@ test "protocol one: authenticate/verify, tamper and wrong-length rejection" {
     try t.expectEqualSlices(u8, full[0..16], &sig);
     try t.expect(One.verify(&key, msg, &sig));
     // Tampered signature, tampered message, wrong key.
-    var bad_sig = sig;
-    bad_sig[0] ^= 0x01;
-    try t.expect(!One.verify(&key, msg, &bad_sig));
+    //
+    // Audit finding H1 (2026-09-05): `verify` compared only `signature[0..1]`
+    // against `expected[0..1]` and this suite's old single-position tamper
+    // (byte 0 only) stayed green — a truncated compare is invisible to a
+    // probe that only ever damages the one byte it still checks. Loop over
+    // every byte of the MAC so a compare narrowed to any prefix (1, 2, 4, 8,
+    // ... bytes — the ladder a truncation bug would actually take) shows up
+    // as a byte position past the checked prefix that is wrongly accepted.
+    for (0..One.signature_length) |i| {
+        var bad_sig = sig;
+        bad_sig[i] ^= 0x01;
+        try t.expect(!One.verify(&key, msg, &bad_sig));
+    }
     try t.expect(!One.verify(&key, "ctap2 pinUvAuthToken payloae", &sig));
     var other_key = key;
     other_key[31] ^= 0x80;
@@ -288,6 +326,19 @@ test "protocol two: wrong-length inputs are typed errors, no panic" {
     var pt: [32]u8 = undefined;
     // Ciphertext shorter than the IV, or trailing partial block.
     try t.expectError(error.InvalidLength, Two.decryptedLength(15));
+    // Audit finding M2 (2026-09-05): `decryptedLength`'s own block-alignment
+    // half (`(ciphertext_len - iv_length) % block_length != 0`) had no test
+    // that exercised IT — every existing `InvalidLength` case for a
+    // misaligned length went through `Two.decrypt`, whose *inner*
+    // `Aes256Cbc.decrypt` has its own independent `% 16` guard and threw the
+    // same error via a different route (mutation D10: delete the alignment
+    // half of `decryptedLength` and the suite stayed green, because
+    // `decryptedLength(17)` silently returned `1`, `Two.decrypt` accepted a
+    // 1-byte `dst`, and only THEN did the inner AES-layer guard catch the
+    // misalignment). Call `decryptedLength` directly so removing its own
+    // check has nowhere left to hide.
+    try t.expectError(error.InvalidLength, Two.decryptedLength(17));
+    try t.expectError(error.InvalidLength, Two.decryptedLength(33));
     try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..0], buf[0..15]));
     try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..1], buf[0..17]));
     try t.expectError(error.InvalidLength, Two.decrypt(key, pt[0..8], buf[0..40]));
@@ -311,9 +362,14 @@ test "protocol two: authenticate/verify, tamper and wrong-length rejection" {
     std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, msg, key[0..32]);
     try t.expectEqualSlices(u8, &expected, &sig);
     try t.expect(Two.verify(&key, msg, &sig));
-    var bad_sig = sig;
-    bad_sig[31] ^= 0x01;
-    try t.expect(!Two.verify(&key, msg, &bad_sig));
+    // Same byte-position ladder as protocol One's H1 fix above, kept
+    // symmetric so a future truncated compare on either protocol shows up
+    // the same way (tamper a byte outside a narrowed prefix).
+    for (0..Two.signature_length) |i| {
+        var bad_sig = sig;
+        bad_sig[i] ^= 0x01;
+        try t.expect(!Two.verify(&key, msg, &bad_sig));
+    }
     try t.expect(!Two.verify(&key, "ctap2 clientPin command payloae", &sig));
     // Wrong-length signatures fail closed (incl. protocol-one-style 16).
     try t.expect(!Two.verify(&key, msg, sig[0..16]));
