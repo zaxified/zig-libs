@@ -69,6 +69,18 @@
 //! public WHOIS servers answering stock RFC 3912 queries over a public
 //! protocol, not a third-party implementation's source or design. No root
 //! NOTICE change accompanies this addition.
+//!
+//! ## ⚠ Personal data (audit F14)
+//!
+//! `iana_com_reply`/`verisign_example_com_reply` below embed a real postal
+//! address, phone, fax, and e-mail — but they are VeriSign's own corporate
+//! **role** contacts for the `.com` registry operator, published by IANA
+//! over the same public protocol this module queries, not a private
+//! individual's data. Low severity as captured. The capture recipe above is
+//! generic, though: running it against a domain whose WHOIS record names an
+//! individual registrant (common outside thin-registry TLDs like `.com`)
+//! would paste that person's data into a public repository. Do not repeat
+//! this recipe against a domain with a non-corporate, non-role registrant.
 
 const std = @import("std");
 const testing = std.testing;

@@ -114,6 +114,10 @@ pub const TransportError = error{
     /// cannot carry this, so the concrete reader records it and the transport
     /// recovers it -- see CONVENTIONS.md's cancelation invariant.
     Canceled,
+    /// `TcpTransport.timeout_ms` elapsed before connect+write+read finished.
+    /// Additive (audit F4): nothing produced this before `timeout_ms` existed,
+    /// so no existing caller's exhaustive `switch` can break on it.
+    Timeout,
 };
 
 /// The one I/O operation WHOIS needs: connect to `server:port`, send the
@@ -151,6 +155,15 @@ pub const Transport = struct {
 /// immediately after the key — `fieldValue(r, "whois")` matches `whois:` but
 /// not `Whois Server:`. Returns null if absent. This is deliberately the
 /// entire extent of response parsing.
+///
+/// The returned slice is NOT filtered for control bytes (a NUL, a CR with no
+/// following LF) or validated as UTF-8 — trimming only removes `" \t"` at the
+/// edges, nothing in the middle (audit F16). `nextServer`'s own use of this
+/// value is fail-closed regardless: `parseServerRef`'s charset check accepts
+/// only alnum/`.`/`-`/`_` in the host, so a value carrying stray control
+/// bytes is simply discarded as an unparseable referral, not acted on. A
+/// caller reading a field for anything beyond referral-chasing should
+/// validate the value itself.
 pub fn fieldValue(response: []const u8, key: []const u8) ?[]const u8 {
     if (key.len == 0) return null;
     var lines = std.mem.splitScalar(u8, response, '\n');
@@ -178,6 +191,16 @@ pub const Referral = struct {
 /// `whois://host[:port][/]`, `host[:port]`, or `host`. Anything with another
 /// scheme (`rwhois://…` is a different protocol) or a malformed host/port is
 /// rejected with null.
+///
+/// Deliberately looser than what the shipped `TcpTransport` can actually
+/// dial (audit F15): this accepts `_` in a host octet, host labels over 63
+/// bytes, a leading zero or a leading `+` in the port — all of which
+/// `std.Io.net.HostName.init`/`.lookup` refuse, so a referral this function
+/// parses can still end `TcpTransport.exchange` in `error.TransportFailed`,
+/// indistinguishable from "server unreachable". Sibling module `netaddr`
+/// carries the same asymmetry the other way (`parsePort` accepts a leading
+/// zero its own `A1/netaddr.md` F8 left DOCUMENTED, not tightened) — aligning
+/// the two is a decision about both modules together, not this one alone.
 pub fn parseServerRef(text: []const u8) ?Referral {
     var s = std.mem.trim(u8, text, " \t\r");
     if (std.ascii.startsWithIgnoreCase(s, "whois://")) {
@@ -213,9 +236,34 @@ pub const referral_keys = [_][]const u8{
 /// Scan a raw WHOIS reply for a referral to a more authoritative server.
 /// Returns null for a terminal reply (no usable referral). Never errors on
 /// malformed/empty/garbage input.
+///
+/// One pass over the lines, not one pass per key (audit F17: calling
+/// `fieldValue` once per `referral_keys` entry re-scanned the whole response
+/// from the top for every miss -- up to four full passes; measured 0,63
+/// ns/byte on a reply with no referral at all, vs 0,28 ns/byte on one that
+/// hits the third key, a ratio that tracked the pass count exactly). Same
+/// priority as before: the LOWEST-INDEX key in `referral_keys` that has ANY
+/// match anywhere in the response wins, not the key on the earliest line --
+/// `fieldValue`'s own "first occurrence, trimmed, non-empty" rule per key is
+/// unchanged, just computed for all four keys in the same walk instead of
+/// four separate walks.
 pub fn nextServer(response: []const u8) ?Referral {
-    for (referral_keys) |key| {
-        const value = fieldValue(response, key) orelse continue;
+    var values: [referral_keys.len]?[]const u8 = @splat(null);
+    var lines = std.mem.splitScalar(u8, response, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        for (referral_keys, 0..) |key, ki| {
+            if (values[ki] != null) continue; // keep the FIRST occurrence, like fieldValue
+            if (line.len <= key.len) continue;
+            if (!std.ascii.startsWithIgnoreCase(line, key)) continue;
+            if (line[key.len] != ':') continue;
+            const value = std.mem.trim(u8, line[key.len + 1 ..], " \t");
+            if (value.len == 0) continue;
+            values[ki] = value;
+        }
+    }
+    for (values) |maybe_value| {
+        const value = maybe_value orelse continue;
         if (parseServerRef(value)) |ref| return ref;
     }
     return null;
@@ -403,6 +451,25 @@ pub const TcpTransport = struct {
     /// to the caller's own `LookupOptions.root` either, only to referrals.
     deny_special_use: bool = true,
 
+    /// Bound one hop's WHOLE exchange (connect + write + read-to-EOF) by this
+    /// many milliseconds; `null` (the default) is today's behaviour, unbounded
+    /// -- audit F4: "nowhere in the module is there ANY read or connect
+    /// timeout -- a silent server holds the caller forever", measured at 147 s
+    /// blocked on a single `readv`. Default stays `null` so nothing about
+    /// existing callers changes (P1: 0 consumers, but this is additive
+    /// regardless -- a caller that never sets the field gets the exact
+    /// behaviour it has today).
+    ///
+    /// std 0.16.0 has no per-read deadline on a `net.Stream` (no `SO_RCVTIMEO`
+    /// seam, unlike `Socket.receiveTimeout` for UDP) -- the same gap `dns`'s
+    /// `Resolver` and `http.Client` hit, and both bound a stream exchange the
+    /// same way: run it on its own concurrent task and cancel that task at the
+    /// deadline (`Io.Threaded.Future.cancel` signals the task's thread until
+    /// the blocked syscall returns `EINTR`). `runBounded` below is that same
+    /// construction, copied rather than shared because it is module-private
+    /// in both of those too.
+    timeout_ms: ?u32 = null,
+
     pub fn transport(t: *TcpTransport) Transport {
         return .{ .ctx = t, .exchangeFn = exchangeFn };
     }
@@ -415,7 +482,26 @@ pub const TcpTransport = struct {
         response_buf: []u8,
     ) TransportError!usize {
         const t: *TcpTransport = @ptrCast(@alignCast(ctx));
+        const ms = t.timeout_ms orelse return exchangeInner(t, server, port, query, response_buf);
+        const deadline = (std.Io.Timeout{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } })
+            .toTimestamp(t.io);
+        return runBounded(t.io, deadline, exchangeInner, .{ t, server, port, query, response_buf }) catch |e| switch (e) {
+            error.Timeout => error.Timeout,
+            error.Canceled => error.Canceled,
+            // No unit of concurrency to run the bounded task on: conservatively
+            // a transport failure, never a silent unbounded run of the exchange.
+            error.ConcurrencyUnavailable => error.TransportFailed,
+            else => |e2| e2,
+        };
+    }
 
+    fn exchangeInner(
+        t: *TcpTransport,
+        server: []const u8,
+        port: u16,
+        query: []const u8,
+        response_buf: []u8,
+    ) TransportError!usize {
         const host = std.Io.net.HostName.init(server) catch return error.TransportFailed;
         const stream = connectChecked(t.io, host, port, t.deny_special_use) catch |e|
             return if (e == error.Canceled) error.Canceled else error.TransportFailed;
@@ -438,6 +524,70 @@ pub const TcpTransport = struct {
             if (m != 0) return error.ResponseTooLarge;
         }
         return n;
+    }
+
+    /// Run `func(args)` on its own concurrent task and give it until
+    /// `deadline` (null = no bound). Same construction as `dns.Resolver`'s and
+    /// `http.Client`'s `runBounded` (both module-private, hence a third copy
+    /// here) -- see `timeout_ms`'s doc comment for why a stream exchange can't
+    /// be bounded any other way in std 0.16.0.
+    ///
+    /// Contract: finished in time → `func`'s own result; deadline hit → the
+    /// task is canceled and JOINED (its frame borrows this stack), then
+    /// `error.Timeout` -- unless it completed inside the cancelation window,
+    /// in which case its value is returned (a response the task already read
+    /// must not be dropped); this task canceled while waiting → the same
+    /// unwind, then `error.Canceled`; no unit of concurrency → this file's own
+    /// `error.ConcurrencyUnavailable`, never a silent unbounded run.
+    fn runBounded(
+        io: std.Io,
+        deadline: ?std.Io.Clock.Timestamp,
+        comptime func: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(func)),
+    ) (TransportError || error{ConcurrencyUnavailable})!usize {
+        const Ctx = struct {
+            io: std.Io,
+            args: std.meta.ArgsTuple(@TypeOf(func)),
+            result: TransportError!usize = undefined,
+            /// 0 while the task runs, 1 once `result` is published; doubles as
+            /// the futex word the waiter parks on.
+            state: std.atomic.Value(u32) = .init(0),
+
+            fn run(c: *@This()) void {
+                c.result = @call(.auto, func, c.args);
+                c.state.store(1, .release);
+                c.io.futexWake(u32, &c.state.raw, 1);
+            }
+        };
+
+        var ctx: Ctx = .{ .io = io, .args = args };
+        var future = io.concurrent(Ctx.run, .{&ctx}) catch return error.ConcurrencyUnavailable;
+
+        var canceled = false;
+        var expired = false;
+        while (ctx.state.load(.acquire) == 0) {
+            const timeout: std.Io.Timeout = if (deadline) |d| t: {
+                if (d.durationFromNow(io).raw.nanoseconds <= 0) {
+                    expired = true;
+                    break;
+                }
+                break :t .{ .deadline = d };
+            } else .none;
+            // Spurious wakeups are allowed here; the loop re-reads `state`.
+            io.futexWaitTimeout(u32, &ctx.state.raw, 0, timeout) catch {
+                canceled = true;
+                break;
+            };
+        }
+        if (!expired and !canceled) {
+            future.await(io);
+            return ctx.result;
+        }
+        future.cancel(io);
+        // `cancel` joined the task, so `result` is written either way. A
+        // success that landed in the cancelation window is still a success.
+        if (ctx.result) |value| return value else |_| {}
+        return if (expired) error.Timeout else error.Canceled;
     }
 
     /// Tell a canceled wait apart from a genuine read failure. `Io.Reader`'s
@@ -692,6 +842,24 @@ test "parseServerRef: whois:// URL form, ports, rejects other schemes/garbage" {
     try testing.expect(parseServerRef("no spaces allowed") == null);
     try testing.expect(parseServerRef("") == null);
     try testing.expect(parseServerRef("x" ** (max_host_len + 1)) == null);
+}
+
+test "parseServerRef: the scheme guard is what rejects '://', not the slash truncation after it (audit F11)" {
+    // The two scheme-rejection cases just above ("rwhois://…", "http://…")
+    // pass even with the guard deleted (mutation M10): every "scheme://host"
+    // text has its FIRST '/' immediately after the scheme's own colon (the
+    // "//" of "://" IS that first slash), so the unconditional
+    // `if (indexOfScalar(s, '/')) |i| s = s[0..i]` a few lines below always
+    // truncates such text to "scheme:" before the guard would even matter --
+    // and "scheme:" fails on an EMPTY port regardless of who runs. Those two
+    // tests are green by that accident, not by the guard (F11).
+    //
+    // This text is built so the accident runs the OTHER way: its first '/'
+    // is well BEFORE the "://", so slash-truncation alone reduces it to a
+    // perfectly valid host ("evil.example") and never even reaches the
+    // scheme text. Only the guard -- which scans the WHOLE string for
+    // "://", not just a prefix -- rejects it.
+    try testing.expect(parseServerRef("evil.example/junk://internal:22") == null);
 }
 
 test "nextServer: known-answer referral extraction" {
@@ -960,6 +1128,74 @@ test "lookup: max_referrals clamped to chain capacity" {
     try testing.expectEqual(Chain.capacity, result.chain.count);
 }
 
+test "Chain.append refuses past capacity, on its own (audit F8)" {
+    // Two guards sit over the same bound: this one, in `Chain.append` itself
+    // (`c.count >= capacity`), and `lookup`'s own `@min(max_referrals+1,
+    // Chain.capacity)` clamp above. Deleting EITHER alone left the whole
+    // suite green (31/31) — deleting BOTH aborted on an out-of-bounds write
+    // to `hosts[8]`. Measured: `Chain.append`'s own guard is sufficient by
+    // itself (removing `lookup`'s clamp alone changes nothing observable,
+    // since `chain.append` still refuses at the same count and `lookup`
+    // falls back to its own `!chain.append(...)` truncation branch) — so
+    // THIS is the guard that actually matters, and a unit test that calls
+    // `Chain.append` directly, bypassing `lookup` entirely, is the one that
+    // can tell "this guard is broken" apart from "the OTHER guard is broken
+    // but this one still holds", which the end-to-end test above cannot: it
+    // only ever observes the pair together.
+    var chain: Chain = .{};
+    var name_buf: [Chain.capacity][4]u8 = undefined;
+    for (0..Chain.capacity) |i| {
+        const h = std.fmt.bufPrint(&name_buf[i], "h{d}", .{i}) catch unreachable;
+        try testing.expect(chain.append(h));
+    }
+    try testing.expectEqual(@as(usize, Chain.capacity), chain.count);
+    // The (capacity + 1)th call: refused, count unchanged. Without the guard
+    // this write goes to `hosts[capacity]`, past the array's last element.
+    try testing.expect(!chain.append("one-too-many"));
+    try testing.expectEqual(@as(usize, Chain.capacity), chain.count);
+}
+
+test "nextServer: a reply with no referral costs about the same per byte as one that hits (audit F17)" {
+    // Before the single-pass rewrite, `nextServer` re-scanned the WHOLE
+    // response once per `referral_keys` entry via `fieldValue`: a reply with
+    // NO referral at all paid for all four passes, a reply that hits early
+    // (e.g. the third key) paid for three. Audited ratio (ReleaseFast):
+    // 0,635/0,62 ns/byte (no-referral, 4 passes) vs 0,284/0,279 (hits 3rd
+    // key), i.e. the no-referral shape cost ~2,2x the hit shape. A single
+    // pass that tests all four keys per line should cost about the SAME per
+    // byte either way, since both shapes now walk the text exactly once.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const no_referral = ("% filler\n" ** 1600); // 14400 bytes, no referral anywhere
+    const realistic = ("% filler\n" ** 500) ++
+        "Registrar WHOIS Server: whois.markmonitor.com\r\n" ++ // hits the 3rd key
+        ("% filler\n" ** 1100); // 14449 bytes
+    // Both scale the same way (linear in length, per `nextServer`'s own
+    // known-flat-cost tests elsewhere), so this only needs a rough size
+    // match, not an exact one -- both cost/byte numbers below normalize it.
+    std.debug.assert(realistic.len > no_referral.len / 2 and realistic.len < no_referral.len * 2);
+
+    const iters = 300;
+    var results: [2]f64 = undefined;
+    inline for (.{ no_referral, realistic }, 0..) |text, idx| {
+        const start = std.Io.Clock.Timestamp.now(io, .awake);
+        var i: usize = 0;
+        while (i < iters) : (i += 1) std.mem.doNotOptimizeAway(nextServer(text));
+        const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+        results[idx] = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(iters * text.len));
+    }
+    std.debug.print(
+        "nextServer ns/byte: no-referral={d:.3} realistic={d:.3} ratio={d:.2}\n",
+        .{ results[0], results[1], results[0] / results[1] },
+    );
+    // The audited old code's ratio was ~2,2-2,3x. A generous 1,6x ceiling
+    // still fails on the old 4-pass shape and passes on the single-pass one
+    // without being a flaky bound on a shared, possibly loaded machine.
+    try testing.expect(results[0] / results[1] < 1.6);
+}
+
 test "lookup: empty and garbage responses are clean terminals" {
     var scripted: ScriptedTransport = .{ .entries = &.{
         .{ .server = "empty.example", .response = "" },
@@ -1215,6 +1451,94 @@ test "TcpTransport: default deny_special_use refuses a loopback address end-to-e
         error.TransportFailed,
         tcp.transport().exchange("127.0.0.1", port, "example.com\r\n", &buf),
     );
+}
+
+// -- test (read timeout, audit F4) ------------------------------------------
+//
+// The peer here is not silent -- it answers, just LATE (900 ms), well past a
+// 80 ms `timeout_ms`. Bounding elapsed time on the RIGHT is what tells
+// "the deadline actually fired" apart from "the peer happened to be fast
+// enough anyway": a transport with no timeout logic at all would also return
+// SOME error eventually (`ResponseTooLarge`/`TransportFailed` after the full
+// 900 ms), so only the elapsed-time ceiling makes this a regression test for
+// the bound itself, not just for "some error came back".
+
+const SlowPeer = struct {
+    io: std.Io,
+    listener: *std.Io.net.Server,
+    delay_ms: i64,
+
+    fn run(p: *SlowPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        defer s.close(p.io);
+        var rbuf: [256]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        _ = sr.interface.readSliceShort(rbuf[0..1]) catch {}; // best-effort: drain part of the query
+        p.io.sleep(.fromMilliseconds(p.delay_ms), .awake) catch return;
+        var wbuf: [32]u8 = undefined;
+        var sw = s.writer(p.io, &wbuf);
+        sw.interface.writeAll("late reply\r\n") catch return;
+        sw.interface.flush() catch return;
+    }
+};
+
+test "TcpTransport: timeout_ms bounds a slow-but-live peer (audit F4)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("whois timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: SlowPeer = .{ .io = io, .listener = &listener, .delay_ms = 900 };
+    const peer_thread = try std.Thread.spawn(.{}, SlowPeer.run, .{&peer});
+    defer peer_thread.join();
+
+    // `deny_special_use = false`: this test's peer is the fixture itself, same
+    // rationale as the cancellation test above.
+    var tcp: TcpTransport = .{ .io = io, .deny_special_use = false, .timeout_ms = 80 };
+    var buf: [256]u8 = undefined;
+
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, tcp.transport().exchange("127.0.0.1", port, "example.com\r\n", &buf));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    try testing.expect(elapsed_ns >= 50 * std.time.ns_per_ms); // didn't fire before the bound
+    try testing.expect(elapsed_ns < 500 * std.time.ns_per_ms); // and didn't wait for the peer's 900 ms
+}
+
+test "TcpTransport: timeout_ms = null (default) preserves today's unbounded behaviour" {
+    // The default-off contract itself, not just the bounded path: a peer that
+    // never answers is still stopped only by the CALLER's own cancel -- same
+    // shape as "TcpTransport: a canceled read surfaces error.Canceled" above,
+    // now with `timeout_ms` explicitly left at its default next to it.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("whois no-timeout test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var peer: CancelPeer = .{ .io = io, .listener = &listener };
+    const peer_thread = try std.Thread.spawn(.{}, CancelPeer.run, .{&peer});
+    defer peer_thread.join();
+    defer peer.stop.store(1, .release);
+
+    var tcp: TcpTransport = .{ .io = io, .deny_special_use = false }; // timeout_ms left at default null
+    var buf: [256]u8 = undefined;
+
+    var fut = try io.concurrent(exchangeOnce, .{ tcp.transport(), "127.0.0.1", port, &buf });
+    try io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectError(error.Canceled, fut.cancel(io)); // still needs an OUTSIDE cancel, not a bound
 }
 
 test {

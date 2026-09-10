@@ -56,8 +56,8 @@ caller's own `LookupOptions.root` from a referral — a caller who wants this tr
 loopback/private server on purpose (a local mirror, or a test peer) sets `deny_special_use = false`.
 
 ## Verification
-36 tests (`zig build test-whois` → 36/36; 30 in `root.zig` including the `goldens.zig` import, 6 in
-`goldens.zig`), all but one offline from canned buffers: `formatQuery` round-trip + CRLF-injection and
+43 tests (`zig build test-whois` → 43/43; 36 named tests in `root.zig` plus the 6 in `goldens.zig`
+it imports, plus the runner's own `test {}` import block), all but one offline from canned buffers: `formatQuery` round-trip + CRLF-injection and
 length rejection; the documented ARIN/Verisign query conveniences; `fieldValue` and `parseServerRef`
 (whois:// URL, ports, scheme/garbage rejection); a known-answer referral extraction; `isSpecialUseHost`
 classification (loopback/RFC 1918/link-local/unique-local/`localhost`, the trailing-dot spelling, and

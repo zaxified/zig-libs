@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `TcpTransport` gains
+  `timeout_ms: ?u32 = null` (default `null` preserves today's unbounded
+  behaviour) and `TransportError` gains `Timeout`. Bounds the whole
+  connect+write+read exchange by running it on its own concurrent task and
+  canceling at the deadline -- the same construction `dns.Resolver` and
+  `http.Client` already use for the identical gap (std 0.16.0 has no
+  per-read deadline on a `net.Stream`). Before this, nothing in the module
+  could stop a slow-but-live peer; only the caller's own outside cancel
+  could. `nextServer` also rewritten from one full-response scan per
+  referral key (up to 4 passes) to one pass over the lines that tests all
+  four keys per line -- same observable priority (lowest-index key in
+  `referral_keys` that matches anywhere still wins), measured ~2x-4x fewer
+  ns/byte depending on shape. Both internal: no consumer-visible change to
+  arguments or return types beyond the two additive members above. Audit
+  F4/F17, plus test-only closures for F8 (an unmasking unit test on
+  `Chain.append`), F11 (a scheme-rejection positive test slash-truncation
+  can't save), and doc-only closures for F14/F15/F16.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `isSpecialUseHost` now
   normalizes a trailing root dot before classifying (`"localhost."` is
   `"localhost"` to every resolver, and used to slip past the SSRF guard as
