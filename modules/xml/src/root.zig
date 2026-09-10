@@ -211,20 +211,29 @@ pub const Element = struct {
     /// caller-supplied allocator. Order is arbitrary; C14N sorts by prefix
     /// itself.
     pub fn inScopeNamespaces(self: *const Element, alloc: std.mem.Allocator) ![]NsDecl {
+        var probes: usize = 0;
+        return self.inScopeNamespacesCounted(alloc, &probes);
+    }
+
+    /// `inScopeNamespaces`, with a work counter — test-only seam, exactly like
+    /// `resolveNsCounted`. One probe = one prefix comparison against an
+    /// already-collected declaration on the scan path. (F1: this used to be an
+    /// O(out.items)-per-declaration rescan, i.e. O(k^2) in the number of
+    /// declarations on the axis — measured 6.485s CPU on a 2.83 MB document
+    /// with 102,400 declarations, 163x the cost of parsing the same document.
+    /// Now a seen-set keyed by prefix, O(k).)
+    fn inScopeNamespacesCounted(self: *const Element, alloc: std.mem.Allocator, probes: *usize) ![]NsDecl {
         var out: std.ArrayList(NsDecl) = .empty;
         errdefer out.deinit(alloc);
+        var seen: std.StringHashMapUnmanaged(void) = .empty;
+        defer seen.deinit(alloc);
         var cur: ?*const Element = self;
         while (cur) |el| : (cur = el.parent) {
             for (el.ns_decls) |d| {
-                var seen = false;
-                for (out.items) |o| {
-                    if (std.mem.eql(u8, o.prefix, d.prefix)) {
-                        seen = true;
-                        break;
-                    }
-                }
-                if (seen) continue; // a nearer declaration already won
+                probes.* += 1;
+                if (seen.contains(d.prefix)) continue; // a nearer declaration already won
                 if (d.prefix.len == 0 and d.uri.len == 0) continue; // undeclared default
+                try seen.put(alloc, d.prefix, {});
                 try out.append(alloc, d);
             }
         }
@@ -1486,6 +1495,71 @@ test "inScopeNamespaces returns inherited axis" {
         if (std.mem.eql(u8, d.prefix, "q")) have_q = std.mem.eql(u8, d.uri, "urn:q");
     }
     try testing.expect(have_p and have_q);
+}
+
+test "inScopeNamespaces: PIN — exact set and order ahead of the O(k) rewrite" {
+    // Pins today's output byte-for-byte (prefix, uri, and position) before
+    // `inScopeNamespaces` is rewritten from the O(k^2) `out.items` rescan to
+    // a linear seen-set (F1). Covers: nearest-declaration-wins on a repeated
+    // prefix ("p" redeclared on <b>), a plain pass-through prefix ("q"), and
+    // a default-namespace undeclaration nearer than its declaration ("a"
+    // sets a default, <c> undeclares it with xmlns=""). Must still pass,
+    // unchanged, after the rewrite — including the undeclared-default entry
+    // never being marked "seen", which lets the ancestor's default ("a") show
+    // up at position 2 even though the nearer <c> undeclared it; this test
+    // intentionally freezes that behaviour rather than judges it, per the
+    // fixer brief: "same set, same order". Not filed as a new finding here —
+    // out of scope for F1, which is a complexity fix, not a semantics audit.
+    const src = "<a xmlns:p=\"urn:p1\" xmlns=\"urn:d1\">" ++
+        "<b xmlns:q=\"urn:q\" xmlns:p=\"urn:p2\">" ++
+        "<c xmlns=\"\"/>" ++
+        "</b></a>";
+    var doc = try parse(testing.allocator, src, .{});
+    defer doc.deinit();
+    const c = doc.root.firstElementChild().?.firstElementChild().?;
+    const ns = try c.inScopeNamespaces(testing.allocator);
+    defer testing.allocator.free(ns);
+
+    try testing.expectEqual(@as(usize, 3), ns.len);
+    try testing.expectEqualStrings("q", ns[0].prefix);
+    try testing.expectEqualStrings("urn:q", ns[0].uri);
+    try testing.expectEqualStrings("p", ns[1].prefix);
+    try testing.expectEqualStrings("urn:p2", ns[1].uri);
+    try testing.expectEqualStrings("", ns[2].prefix);
+    try testing.expectEqualStrings("urn:d1", ns[2].uri);
+}
+
+test "complexity: Element.inScopeNamespaces is O(k) in declaration count, not O(k^2)" {
+    // F1 (HIGH): the original body rescanned `out.items` (already-collected
+    // declarations) for every declaration on the axis — O(k) work per
+    // declaration, O(k^2) total. Reachable pre-authentication: `xmldsig`
+    // calls this at the C14N apex, before the signature it canonicalizes for
+    // is checked. Measured before this fix (ReleaseFast, single call):
+    // 1,024 decls 0.805 ms -> 102,400 decls 6,485 ms, cleanly quadratic
+    // (2x input => 4.0-4.7x time).
+    //
+    // Assert the complexity, not the wall clock, exactly like
+    // "complexity: Element.resolveNs is O(1)...": `inScopeNamespacesCounted`
+    // reports prefix probes, one per declaration examined, so this pins the
+    // class deterministically. Before the fix this assertion fails outright
+    // (k=4096 costs ~2^23 probes, not <= 6*k); after it, the seen-set makes
+    // each declaration cost O(1) amortized.
+    const gpa = testing.allocator;
+    const k = 4096;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try buf.appendSlice(gpa, "<r");
+    for (0..k) |i| try buf.print(gpa, " xmlns:p{d}=\"urn:x{d}\"", .{ i, i });
+    try buf.appendSlice(gpa, "/>");
+
+    var doc = try parse(gpa, buf.items, .{ .max_attributes = k + 4 });
+    defer doc.deinit();
+
+    var probes: usize = 0;
+    const ns = try doc.root.inScopeNamespacesCounted(gpa, &probes);
+    defer gpa.free(ns);
+    try testing.expectEqual(k, ns.len);
+    try testing.expect(probes <= 4 * k);
 }
 
 // ── W3C-pattern not-well-formed vectors (modeled on xmlconf not-wf/sa) ────────
