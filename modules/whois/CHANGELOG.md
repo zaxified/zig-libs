@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `isSpecialUseHost` now
+  normalizes a trailing root dot before classifying (`"localhost."` is
+  `"localhost"` to every resolver, and used to slip past the SSRF guard as
+  unclassified). `TcpTransport` gained a `deny_special_use: bool = true`
+  field and now refuses to connect to any address a referral host RESOLVES
+  to when that address is special-use, not just a host string classified as
+  such -- closing the gap where an IPv4 literal spelled in an encoding
+  `netaddr.parseIp` does not recognise (`0177.0.0.1`, `2130706433`, `127.1`)
+  passed the string-level guard yet could still resolve into loopback/private
+  space. Set `deny_special_use = false` to point `TcpTransport` at a
+  loopback/private server on purpose (a local mirror, or a test peer) --
+  same shape as `rdap`'s `DestinationPolicy.deny_special_use`. Audit F1/F2.
 - **2026-09-07** — **Tests:** `fuzzParseServerRef` fetched its input and threw
   it away. It opened `smith.bytes(&buf)` and then drew the length with
   `valueRangeAtMost(u8, 0, buf.len)`; a ranged `Smith` draw reads eight octets

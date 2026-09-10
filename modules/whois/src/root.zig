@@ -240,9 +240,19 @@ pub fn nextServer(response: []const u8) ?Referral {
 /// `Transport` does its own resolution should apply the same check to the
 /// resolved address before connecting.
 pub fn isSpecialUseHost(host: []const u8) bool {
-    if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
-    if (std.ascii.endsWithIgnoreCase(host, ".localhost")) return true;
-    const ip = netaddr.parseIp(host) orelse return false;
+    // A trailing root dot is the ABSOLUTE spelling of the same name: every
+    // resolver treats `localhost.` as `localhost` -- `lookup` chased it to a
+    // live loopback service end-to-end through the shipped `TcpTransport` in
+    // the audit's `probe_chain.zig` (netns, `lo` only). Comparing the raw
+    // string let `netaddr.parseIp` reject the dotted form, so this returned
+    // false for the one hostname the guard exists to deny, spelled with a
+    // dot on the end (audit F1). `rdap`'s independent copy of this function
+    // carries the identical fix already (its re-audit F1).
+    const trimmed = std.mem.trimEnd(u8, host, ".");
+    if (trimmed.len == 0) return true; // "." / "" is not a destination
+    if (std.ascii.eqlIgnoreCase(trimmed, "localhost")) return true;
+    if (std.ascii.endsWithIgnoreCase(trimmed, ".localhost")) return true;
+    const ip = netaddr.parseIp(trimmed) orelse return false;
     return isSpecialUseIp(ip);
 }
 
@@ -378,6 +388,20 @@ pub fn lookup(
 /// `server:port`, send the query, read the reply to EOF.
 pub const TcpTransport = struct {
     io: std.Io,
+    /// Refuse to connect to any RESOLVED address in special-use space (see
+    /// `isSpecialUseIp`), not just names that look special-use as text.
+    /// Default true: this is the transport `lookup` hands off to for every
+    /// hop, referral hops included, and a hostile referral can name a host
+    /// spelled in an encoding `isSpecialUseHost`'s string check does not
+    /// recognise (`0177.0.0.1`, `2130706433`, `127.1` -- audit F2) that
+    /// nonetheless resolves into loopback/private/link-local space.
+    ///
+    /// Set false to point this transport at a loopback/private server on
+    /// purpose -- a local WHOIS mirror, or (as this module's own tests do) a
+    /// test peer. That is a caller decision about a server THEY named, not
+    /// one a referral chose; `isSpecialUseHost` (see `lookup`) never applies
+    /// to the caller's own `LookupOptions.root` either, only to referrals.
+    deny_special_use: bool = true,
 
     pub fn transport(t: *TcpTransport) Transport {
         return .{ .ctx = t, .exchangeFn = exchangeFn };
@@ -393,7 +417,7 @@ pub const TcpTransport = struct {
         const t: *TcpTransport = @ptrCast(@alignCast(ctx));
 
         const host = std.Io.net.HostName.init(server) catch return error.TransportFailed;
-        const stream = host.connect(t.io, port, .{ .mode = .stream }) catch |e|
+        const stream = connectChecked(t.io, host, port, t.deny_special_use) catch |e|
             return if (e == error.Canceled) error.Canceled else error.TransportFailed;
         defer stream.close(t.io);
 
@@ -429,7 +453,73 @@ pub const TcpTransport = struct {
         if (sw.err) |e| if (e == error.Canceled) return error.Canceled;
         return error.TransportFailed;
     }
+
+    /// Resolve `host_name` and connect to it, refusing to dial ANY address
+    /// that lands in special-use space -- not just names that LOOK
+    /// special-use as text. `isSpecialUseHost` (`lookup`, above) guards the
+    /// STRING a referral names, before this transport is ever called on it;
+    /// but a string encoding `netaddr.parseIp` does not recognise
+    /// (`0177.0.0.1`, `2130706433`, `127.1`, an octal/decimal-integer IPv4
+    /// literal -- audit F2) sails through that guard unclassified and lands
+    /// here anyway. This is the second gate: on what the name actually
+    /// RESOLVES TO, so an encoding trick alone cannot reach special-use space
+    /// through the transport this module ships (user decision, `A1/whois.md`
+    /// F1, "obě místa" -- both places).
+    ///
+    /// Fail-closed over the WHOLE answer set: a referral naming a host with
+    /// more than one A/AAAA record does not get to pick which resolved
+    /// address the guard evaluates -- one special-use hit refuses the host.
+    fn connectChecked(
+        io: std.Io,
+        host_name: std.Io.net.HostName,
+        port: u16,
+        deny_special_use: bool,
+    ) (std.Io.net.HostName.ConnectError || error{SpecialUseAddress})!std.Io.net.Stream {
+        var lookup_buf: [32]std.Io.net.HostName.LookupResult = undefined;
+        var lookup_queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buf);
+        // Documented not to block, given queue capacity >= 16 (it is 32).
+        try host_name.lookup(io, &lookup_queue, .{ .port = port });
+
+        var addrs: [32]std.Io.net.IpAddress = undefined;
+        var n: usize = 0;
+        while (lookup_queue.getOne(io)) |res| switch (res) {
+            .address => |addr| {
+                if (n < addrs.len) {
+                    addrs[n] = addr;
+                    n += 1;
+                }
+            },
+            .canonical_name => continue,
+        } else |err| switch (err) {
+            error.Closed => {}, // queue drained -- normal end of the answer set
+            error.Canceled => |e| return e,
+        }
+
+        if (deny_special_use and anyResolvedIsSpecialUse(addrs[0..n])) return error.SpecialUseAddress;
+        if (n == 0) return error.NoAddressReturned;
+
+        for (addrs[0..n]) |*addr| {
+            return addr.connect(io, .{ .mode = .stream }) catch continue;
+        }
+        return error.UnknownHostName;
+    }
 };
+
+/// True when any of `addrs` names special-use/non-routable address space,
+/// per `isSpecialUseIp`. Extracted out of `TcpTransport.connectChecked` so
+/// the classification -- the actual SSRF-relevant decision -- is testable
+/// without a live resolver; the resolve/connect glue around it is the same
+/// shape as `probe`'s `resolveAll` (`modules/probe/src/root.zig:837`).
+fn anyResolvedIsSpecialUse(addrs: []const std.Io.net.IpAddress) bool {
+    for (addrs) |addr| {
+        const ip: netaddr.Ip = switch (addr) {
+            .ip4 => |a| .{ .v4 = a.bytes },
+            .ip6 => |a| .{ .v6 = a.bytes },
+        };
+        if (isSpecialUseIp(ip)) return true;
+    }
+    return false;
+}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -491,6 +581,34 @@ const ScriptedTransport = struct {
             return e.response.len;
         }
         return error.TransportFailed;
+    }
+};
+
+/// A `Transport` that lies about how many bytes it wrote — anything a
+/// caller-supplied `Transport` could do, since the seam is public (audit
+/// F7). Exercises the one guard nothing else in this suite reaches:
+/// `Transport.exchange`'s own `n > response_buf.len` check.
+const OverclaimingTransport = struct {
+    claimed_n: usize,
+
+    fn transport(s: *OverclaimingTransport) Transport {
+        return .{ .ctx = s, .exchangeFn = exchangeFn };
+    }
+
+    fn exchangeFn(
+        ctx: *anyopaque,
+        _: []const u8,
+        _: u16,
+        _: []const u8,
+        response_buf: []u8,
+    ) TransportError!usize {
+        const s: *OverclaimingTransport = @ptrCast(@alignCast(ctx));
+        // Deliberately does NOT write `claimed_n` bytes -- a real broken
+        // transport reporting a bogus length wouldn't either; the point is
+        // that `response_buf[0..n]` must never become an out-of-bounds slice
+        // regardless of what a misbehaving `exchangeFn` returns.
+        _ = response_buf;
+        return s.claimed_n;
     }
 };
 
@@ -586,6 +704,19 @@ test "nextServer: known-answer referral extraction" {
     try testing.expect(nextServer("\x00\xff garbage \r\r\n::!") == null);
 }
 
+test "nextServer: refer: wins over ReferralServer: when a reply names both (audit F12)" {
+    // `referral_keys`'s doc comment claims this priority as a contract; no
+    // fixture previously carried two DIFFERENT referral keys in one reply to
+    // exercise it (mutation `M28`, swapping the first two entries of
+    // `referral_keys`, stayed green without this test).
+    const both = "refer: refer-wins.example\nReferralServer: whois://server-loses.example\n";
+    try testing.expectEqualStrings("refer-wins.example", nextServer(both).?.host);
+    // And the reverse order in the TEXT doesn't matter -- it's referral_keys'
+    // order, not line order, that decides.
+    const both_reversed_lines = "ReferralServer: whois://server-loses.example\nrefer: refer-wins.example\n";
+    try testing.expectEqualStrings("refer-wins.example", nextServer(both_reversed_lines).?.host);
+}
+
 test "lookup: follows the IANA → Verisign → registrar chain" {
     var scripted: ScriptedTransport = .{ .entries = &.{
         .{ .server = "whois.iana.org", .response = iana_reply },
@@ -660,6 +791,73 @@ test "isSpecialUseHost: classifies loopback/private/link-local/localhost, passes
     try testing.expect(!isSpecialUseHost("198.51.101.1"));
     try testing.expect(!isSpecialUseHost("203.0.114.1"));
     try testing.expect(!isSpecialUseHost("2001:db9::1"));
+}
+
+test "isSpecialUseHost: the ABSOLUTE spelling is the same name (audit F1)" {
+    // `localhost.` is `localhost` to every resolver on earth (verified with
+    // the shipped `TcpTransport` in the audit's `probe_chain.zig`, netns
+    // `lo`-only: the hostile referral `refer: localhost.:41205` reached a
+    // real loopback service). Comparing the raw string and letting
+    // `netaddr.parseIp` reject the dotted form is why this used to answer
+    // false for the one name the guard exists to deny.
+    for ([_][]const u8{
+        "localhost.",       "LOCALHOST.",     "LocalHost.", "localhost..",
+        "x.localhost.",     "a.b.localhost.", "127.0.0.1.", "10.0.0.1.",
+        "169.254.169.254.", "0.0.0.0.",       ".",          "",
+    }) |h| {
+        if (!isSpecialUseHost(h)) {
+            std.debug.print("host not classified special-use: '{s}'\n", .{h});
+            return error.TestUnexpectedResult;
+        }
+    }
+    // Unchanged: a public name is still not special-use, and a name that
+    // merely CONTAINS "localhost" is not either.
+    for ([_][]const u8{
+        "whois.verisign-grs.com",   "whois.verisign-grs.com.",
+        "localhost.evil.example",   "notlocalhost",
+        "203.0.113.9.evil.example",
+    }) |h| {
+        if (isSpecialUseHost(h)) {
+            std.debug.print("public host classified special-use: '{s}'\n", .{h});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "anyResolvedIsSpecialUse: catches address-level SSRF encodings a string check cannot see (audit F2)" {
+    // What `0177.0.0.1`, `2130706433`, `127.1`, `010.0.0.1` etc. would
+    // resolve to on a resolver that accepts those spellings -- Zig's own
+    // resolver does not (measured in the audit), but the point of this guard
+    // is not depending on that staying true, or on which `Transport` a
+    // caller plugs in (SPEC invites callers to supply their own).
+    const loopback: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 43 } };
+    const link_local: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 169, 254, 169, 254 }, .port = 43 } };
+    const loopback6: std.Io.net.IpAddress = .{ .ip6 = .{ .bytes = ([_]u8{0} ** 15) ++ [_]u8{1}, .port = 43 } };
+    const public: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 93, 184, 216, 34 }, .port = 43 } };
+
+    try testing.expect(anyResolvedIsSpecialUse(&.{loopback}));
+    try testing.expect(anyResolvedIsSpecialUse(&.{link_local}));
+    try testing.expect(anyResolvedIsSpecialUse(&.{loopback6}));
+    // Fail-closed over the whole answer set: one bad address among several
+    // good ones still refuses the host.
+    try testing.expect(anyResolvedIsSpecialUse(&.{ public, loopback }));
+    try testing.expect(!anyResolvedIsSpecialUse(&.{public}));
+    try testing.expect(!anyResolvedIsSpecialUse(&.{}));
+}
+
+test "lookup: refer: to the trailing-dot spelling of localhost is refused, chase stops (audit F1)" {
+    var scripted: ScriptedTransport = .{ .entries = &.{
+        .{ .server = "whois.iana.org", .response = "refer: localhost.:41205\n" },
+    } };
+    var buf: [256]u8 = undefined;
+    const result = try lookup(scripted.transport(), "example.com", .{}, &buf);
+    // Refused before the second hop is ever dialed: chain stays at 1, the
+    // response IS the referral line (same shape as every other refused
+    // referral -- see the RFC 5737 test below), and the scripted transport
+    // recorded exactly one call.
+    try testing.expectEqual(@as(usize, 1), result.chain.count);
+    try testing.expectEqual(@as(usize, 1), scripted.call_count);
+    try testing.expect(!result.truncated);
 }
 
 test "lookup: refer: to RFC 5737 TEST-NET is refused, chase stops (netaddr audit F3)" {
@@ -788,6 +986,18 @@ test "lookup: byte cap — oversized response surfaces ResponseTooLarge" {
         error.ResponseTooLarge,
         lookup(scripted.transport(), "q", .{ .root = "big.example" }, &small),
     );
+}
+
+test "Transport.exchange: a transport claiming more bytes than the buffer holds is rejected (audit F7)" {
+    var broken: OverclaimingTransport = .{ .claimed_n = 999 };
+    var buf: [64]u8 = undefined;
+    try testing.expectError(
+        error.TransportFailed,
+        broken.transport().exchange("x.example", default_port, "q\r\n", &buf),
+    );
+    // Exactly-full is fine -- only strictly-over is rejected.
+    var exact: OverclaimingTransport = .{ .claimed_n = buf.len };
+    try testing.expectEqual(@as(usize, buf.len), (try exact.transport().exchange("x.example", default_port, "q\r\n", &buf)).len);
 }
 
 test "lookup: referral port from whois:// URL is used on the next hop" {
@@ -966,7 +1176,11 @@ test "TcpTransport: a canceled read surfaces error.Canceled, not error.Transport
     defer peer_thread.join();
     defer peer.stop.store(1, .release);
 
-    var tcp: TcpTransport = .{ .io = io };
+    // `deny_special_use = false`: this test's peer IS loopback on purpose
+    // (it is the caller's own test fixture, not a referral an attacker
+    // steered), same as `LookupOptions.root` is never subject to
+    // `isSpecialUseHost` either -- see the guard's doc comment.
+    var tcp: TcpTransport = .{ .io = io, .deny_special_use = false };
     var buf: [256]u8 = undefined;
 
     var fut = try io.concurrent(exchangeOnce, .{ tcp.transport(), "127.0.0.1", port, &buf });
@@ -974,6 +1188,33 @@ test "TcpTransport: a canceled read surfaces error.Canceled, not error.Transport
     // one parked in the kernel.
     try io.sleep(.fromMilliseconds(200), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+test "TcpTransport: default deny_special_use refuses a loopback address end-to-end (audit F1/F2)" {
+    // Demonstrates the resolved-address guard is actually wired in and
+    // actually refuses the connection by default -- not just that
+    // `anyResolvedIsSpecialUse` classifies loopback correctly in isolation.
+    // A listener that WOULD accept the connection if the guard let it
+    // through: if this test regresses to a hang or to a successful
+    // response, the guard stopped running before the dial.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch |err| {
+        std.debug.print("whois SpecialUseAddress test listen failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    var tcp: TcpTransport = .{ .io = io }; // default: deny_special_use = true
+    var buf: [256]u8 = undefined;
+    try testing.expectError(
+        error.TransportFailed,
+        tcp.transport().exchange("127.0.0.1", port, "example.com\r\n", &buf),
+    );
 }
 
 test {

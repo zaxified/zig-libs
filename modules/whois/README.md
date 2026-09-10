@@ -46,7 +46,11 @@ const result = try whois.lookup(transport, "example.com", .{}, &buf);
 // result.chain     — servers consulted in order, root first
 // result.truncated — true if the referral depth cap stopped the chase
 
-// Optional real transport (the only network-touching code; tests never dial)
+// Optional real transport (the only network-touching code; no test dials a
+// real registry -- one exercises TcpTransport's cancellation over loopback).
+// Refuses to connect to a resolved loopback/private/link-local address by
+// default (`deny_special_use`); set it false for a caller-chosen internal
+// server, as that test does.
 var tcp: whois.TcpTransport = .{ .io = io };
 _ = try whois.lookup(tcp.transport(), "example.com", .{}, &buf);
 ```
