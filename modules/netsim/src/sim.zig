@@ -732,6 +732,82 @@ test "drive: an event scheduled exactly at `until` is still processed (inclusive
     try testing.expectEqual(@as(usize, 1), fired);
 }
 
+test "drive: an event scheduled AFTER `until` is never processed (audit F4 teeth)" {
+    // The companion to the boundary test above: `[0, until]` is inclusive on
+    // the near end (pinned above) but must be exclusive past it, or a mutant
+    // that deletes `if (t > self.until) break;` sails through unnoticed — the
+    // audit's own mutate.sh found exactly that ("mez until smazána" survived
+    // the pre-fix suite).
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var fired: usize = 0;
+
+    const Hooks = struct {
+        fn onMessage(ctx: *anyopaque, s: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+            _ = .{ ctx, s, node, from, payload };
+        }
+        fn onTimer(ctx: *anyopaque, s: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+            _ = .{ s, node, timer_id };
+            const count: *usize = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+        }
+    };
+    const protocol = Protocol{
+        .ctx = &fired,
+        .onMessageFn = Hooks.onMessage,
+        .onTimerFn = Hooks.onTimer,
+    };
+
+    var sim = Sim.init(gpa, 1, protocol, &log, 100, 1000);
+    defer sim.deinit();
+    _ = try sim.addNode(.{});
+    try sim.setTimer(0, 100, 0); // at `until` — must fire
+    try sim.setTimer(0, 101, 1); // past `until` — must NOT fire
+    _ = try sim.drive();
+
+    try testing.expectEqual(@as(usize, 1), fired);
+}
+
+test "drive: max_events_cap actually backstops a live-locked protocol (audit F4 teeth)" {
+    // `Case.max_events_cap` exists specifically to bound a protocol that
+    // reschedules itself forever (a live-lock) — the audit's mutate.sh found
+    // that deleting `if (self.events_processed >= self.max_events_cap)
+    // break;` survives the pre-fix suite untouched.
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var fired: usize = 0;
+
+    const Hooks = struct {
+        fn onMessage(ctx: *anyopaque, s: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+            _ = .{ ctx, s, node, from, payload };
+        }
+        fn onTimer(ctx: *anyopaque, s: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+            _ = timer_id;
+            const count: *usize = @ptrCast(@alignCast(ctx));
+            count.* += 1;
+            try s.setTimer(node, 0, 0); // reschedule at the SAME tick: live-lock
+        }
+    };
+    const protocol = Protocol{
+        .ctx = &fired,
+        .onMessageFn = Hooks.onMessage,
+        .onTimerFn = Hooks.onTimer,
+    };
+
+    // `until` set absurdly high so only the cap, not the clock, can stop this.
+    var sim = Sim.init(gpa, 1, protocol, &log, 1_000_000, 50);
+    defer sim.deinit();
+    _ = try sim.addNode(.{});
+    try sim.setTimer(0, 0, 0);
+    const outcome = try sim.drive();
+
+    try testing.expectEqual(RunOutcome.ok, outcome);
+    try testing.expectEqual(@as(u64, 50), sim.events_processed);
+    try testing.expectEqual(@as(usize, 50), fired);
+}
+
 test "applyFault: an out-of-range node id is rejected, not indexed unchecked (audit F1)" {
     const gpa = testing.allocator;
     var log = Log{};

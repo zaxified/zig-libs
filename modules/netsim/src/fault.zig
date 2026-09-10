@@ -275,6 +275,19 @@ fn sampleTopo() Topo {
     return .{ .node_count = 4, .links = &S.links };
 }
 
+test "Config: the documented defaults are pinned, not just prose (audit F4 teeth)" {
+    // The audit's mutate.sh found that shrinking the `max_events` default
+    // from 20 to 1 survives the pre-fix suite untouched — nothing pinned the
+    // struct's own defaults against its doc comments.
+    const cfg = Config{};
+    try testing.expectEqual(@as(usize, 20), cfg.max_events);
+    try testing.expectEqual(@as(Time, 1000), cfg.horizon);
+    try testing.expectEqual(@as(u16, 750), cfg.repair_permille);
+    try testing.expect(cfg.enable_partition);
+    try testing.expect(cfg.enable_crash);
+    try testing.expect(cfg.enable_clock_jump);
+}
+
 test "generate: identical seed reproduces the identical trace" {
     var a = try generate(testing.allocator, 12345, sampleTopo(), .{});
     defer a.deinit();

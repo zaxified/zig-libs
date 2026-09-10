@@ -211,6 +211,136 @@ const Flood = struct {
     }
 };
 
+/// A minimal 2-node ping/pong: node0 sends "ping" to node1 at t=0 (during
+/// bootstrap — synchronous, so a fault armed at t=0 does NOT catch this first
+/// send, same caveat as `example/main.zig`'s dup_once); node1 replies "pong"
+/// FROM WITHIN the event-processing loop, which a t=0 fault on the 1->0
+/// direction has already had a chance to arm. Used by the audit-F4 "teeth"
+/// tests below: each checks that a specific fault kind actually changes this
+/// protocol's observable behavior, not just that it appears in a trace.
+const PingPong = struct {
+    pings_sent: u32 = 0,
+    pongs_sent: u32 = 0,
+    pongs_received: u32 = 0,
+    last_pong_clock: i64 = 0,
+    /// If set, node0 also resends "ping" on a timer of this period — used by
+    /// the restart_node test, where the first several sends are expected to
+    /// be dropped (node1 still crashed) and a later one must get through.
+    resend_period: ?Time = null,
+
+    fn protocol(self: *PingPong) Protocol {
+        return .{ .ctx = self, .onStartFn = onStart, .onMessageFn = onMessage, .onTimerFn = onTimer };
+    }
+
+    fn cast(ctx: *anyopaque) *PingPong {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn sendPing(self: *PingPong, sim: *Sim) anyerror!void {
+        self.pings_sent += 1;
+        try sim.send(0, 1, "ping");
+        if (self.resend_period) |p| try sim.setTimer(0, p, 0);
+    }
+
+    fn onStart(ctx: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
+        const self = cast(ctx);
+        if (node == 0) try self.sendPing(sim);
+    }
+
+    fn onTimer(ctx: *anyopaque, sim: *Sim, node: NodeId, timer_id: u64) anyerror!void {
+        _ = timer_id;
+        const self = cast(ctx);
+        if (node == 0) try self.sendPing(sim);
+    }
+
+    fn onMessage(ctx: *anyopaque, sim: *Sim, node: NodeId, from: NodeId, payload: []const u8) anyerror!void {
+        _ = from;
+        const self = cast(ctx);
+        if (node == 1 and std.mem.eql(u8, payload, "ping")) {
+            self.pongs_sent += 1;
+            try sim.send(1, 0, "pong");
+        } else if (node == 0 and std.mem.eql(u8, payload, "pong")) {
+            self.pongs_received += 1;
+            self.last_pong_clock = sim.clock(0);
+        }
+    }
+};
+
+fn pingPongScenario(sim: *Sim) anyerror!void {
+    _ = try sim.addNode(.{});
+    _ = try sim.addNode(.{});
+    try sim.addBiLink(0, 1, .{ .latency = 5 });
+}
+
+test "F4 teeth: drop_once actually drops the message it targets, not just appears in the trace" {
+    const gpa = testing.allocator;
+    var pp = PingPong{};
+    const case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = pp.protocol(), .until = 100 };
+    const trace = [_]FaultEvent{.{ .time = 0, .kind = .{ .drop_once = .{ .a = 1, .b = 0 } } }};
+    _ = try replay(gpa, case, &trace, null);
+    try testing.expectEqual(@as(u32, 1), pp.pongs_sent); // node1 DID send the pong...
+    try testing.expectEqual(@as(u32, 0), pp.pongs_received); // ...but it never arrived
+
+    // Positive control: without the fault, the pong arrives.
+    var clean = PingPong{};
+    const clean_case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = clean.protocol(), .until = 100 };
+    _ = try replay(gpa, clean_case, &.{}, null);
+    try testing.expectEqual(@as(u32, 1), clean.pongs_received);
+}
+
+test "F4 teeth: link_down actually severs the direction it targets" {
+    const gpa = testing.allocator;
+    var pp = PingPong{};
+    const case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = pp.protocol(), .until = 100 };
+    const trace = [_]FaultEvent{.{ .time = 0, .kind = .{ .link_down = .{ .a = 1, .b = 0 } } }};
+    _ = try replay(gpa, case, &trace, null);
+    try testing.expectEqual(@as(u32, 1), pp.pongs_sent); // sent, but 1->0 is down
+    try testing.expectEqual(@as(u32, 0), pp.pongs_received);
+}
+
+test "F4 teeth: crash_node actually stops the node from processing messages" {
+    const gpa = testing.allocator;
+    var pp = PingPong{};
+    const case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = pp.protocol(), .until = 100 };
+    const trace = [_]FaultEvent{.{ .time = 0, .kind = .{ .crash_node = .{ .node = 1 } } }};
+    _ = try replay(gpa, case, &trace, null);
+    // node1 crashed before the ping (latency 5) arrives, so it never even
+    // runs onMessage — pongs_sent, not just pongs_received, must be 0.
+    try testing.expectEqual(@as(u32, 0), pp.pongs_sent);
+    try testing.expectEqual(@as(u32, 0), pp.pongs_received);
+}
+
+test "F4 teeth: restart_node actually revives the node (it resumes processing later messages)" {
+    const gpa = testing.allocator;
+    var pp = PingPong{ .resend_period = 20 };
+    const case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = pp.protocol(), .until = 100 };
+    const trace = [_]FaultEvent{
+        .{ .time = 0, .kind = .{ .crash_node = .{ .node = 1 } } },
+        .{ .time = 50, .kind = .{ .restart_node = .{ .node = 1 } } },
+    };
+    _ = try replay(gpa, case, &trace, null);
+    // Pings at t=0,20,40 arrive (latency 5) at t=5,25,45 — all before the
+    // t=50 restart, so all three are dropped while node1 is crashed. Pings
+    // at t=60,80 arrive at t=65,85, after the restart: those must land.
+    try testing.expect(pp.pongs_sent >= 1);
+}
+
+test "F4 teeth: delay_once actually delays the message it targets" {
+    const gpa = testing.allocator;
+    var pp = PingPong{};
+    const case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = pp.protocol(), .until = 200 };
+    const trace = [_]FaultEvent{.{ .time = 0, .kind = .{ .delay_once = .{ .a = 1, .b = 0, .extra = 50 } } }};
+    _ = try replay(gpa, case, &trace, null);
+    // Baseline: ping@0 -> arrives node1@5 -> pong@5 -> arrives node0@10.
+    // With +50 on the 1->0 leg: pong arrives node0@60, not @10.
+    try testing.expectEqual(@as(i64, 60), pp.last_pong_clock);
+
+    var clean = PingPong{};
+    const clean_case = Case{ .seed = 1, .scenario = pingPongScenario, .protocol = clean.protocol(), .until = 200 };
+    _ = try replay(gpa, clean_case, &.{}, null);
+    try testing.expectEqual(@as(i64, 10), clean.last_pong_clock);
+}
+
 const LOOPY_N = 4;
 const LOOPY_DEST: NodeId = 3;
 const LOOPY_MAX_EPOCH = 16;

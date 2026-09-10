@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 fix campaign, netsim F4
+  (partial). The audit's mutate.sh found 14 mutations that survive the suite
+  untouched — a fault kind or config bound that has no test observing its
+  actual EFFECT, only that it appears in a generated trace. Added 8 new tests
+  that each observe a mechanism's effect directly (a `PingPong` 2-node
+  fixture for the fault kinds, plus direct `Sim`/`Case` construction for the
+  two backstops and the config pin), each independently verified to fail
+  when its corresponding mutation is applied: `drop_once`, `link_down`,
+  `crash_node`, `restart_node`, `delay_once`, the `until` upper bound, the
+  `max_events_cap` backstop, and `Config`'s documented defaults.
+  `clock_jump` is covered incidentally by F1's positive control (already
+  asserts the offset changes). Still open, deliberately not attempted here
+  (time-boxed): `loss_permille`/`dup_permille`/`jitter`/`reorder_extra`/
+  `bandwidth` — these are `LinkConfig` statistical properties, not
+  `FaultKind`s, and need an N-sends statistical test shape rather than the
+  single-trace shape used above.
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 fix campaign, netsim F10
   + F12. F10: `replay` no longer builds the event `Log` when `log_out ==
   null` (a new internal `Sim.want_log` flag, default `true` — the 3 in-repo
