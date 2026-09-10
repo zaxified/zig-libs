@@ -20,12 +20,17 @@ no source copied.
   `clock_gettime` errno form (CLOCK_MONOTONIC); everything else is
   platform-free, and the clock is injectable.
 - **Role:** util. **Concurrency:** threadsafe — counters/gauges are single
-  atomics (`.monotonic`); registration lookups and `Histogram.observe` take
-  a documented spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std
-  SmpAllocator pattern — Zig 0.16 std has no io-less blocking mutex) with
-  string-compare-sized critical sections. `writeText` holds the registry
-  lock for the whole scrape; the middleware's steady-state hot path is
-  lock-free (atomic per-method/class caches).
+  atomics (`.monotonic`); registration lookups (an O(1) name→family index,
+  not a linear scan) and `Histogram.observe` take a documented spinlock
+  (`std.atomic.Mutex` + `spinLoopHint`, the std SmpAllocator pattern — Zig
+  0.16 std has no io-less blocking mutex) with string-compare-sized critical
+  sections. `writeText` holds the registry lock for the whole scrape, so a
+  large registry or concurrent scrapers make that lock hot (see the
+  module's audit, F2) — this is not amortized by a cache. The middleware's
+  **default** (`.status = .class`) steady-state hot path is lock-free
+  (atomic per-method/class caches); `.status = .code` always takes the
+  (now O(1), previously linear-in-registry-size) locked registry lookup —
+  see below.
 - **Deps:** `router` (Middleware/Ctx/Next), `http` (`Server.ResponseWriter`,
   `Method`).
 
@@ -70,7 +75,11 @@ label turns the registry into an unbounded memory leak and blows up
 Prometheus's index. This is why the middleware:
 
 - labels status as a **class** (`code="2xx"`…) by default —
-  `.status = .code` opts into exact codes (still bounded, ~×10 series);
+  `.status = .code` opts into exact codes (still bounded series count,
+  ~×10; the per-request lookup cost is now O(1) regardless of how many
+  *other*, unrelated families the registry holds — before the registration
+  index was added this was linear in total registry size, see the module's
+  audit F1/F7);
 - does **not** label by path. A route-pattern label (`/users/:id`, bounded)
   is planned once `router` exposes the matched pattern to `Ctx` (route
   enumeration is a tracked router follow-up); labeling by raw path would be

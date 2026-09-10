@@ -80,6 +80,16 @@ const Allocator = std.mem.Allocator;
 
 /// Spinlock acquire (std SmpAllocator pattern) — see the module doc for why
 /// a spinlock and what it guards.
+///
+/// ⚠ Tried and measured NOT to help (kept pure spin instead): replacing the
+/// `spinLoopHint` loop with a few spins then `std.Thread.yield()` (Zig 0.16
+/// std has no io-less blocking mutex). On an 8-core box with 8 contending
+/// threads there is no idle core for `sched_yield` to hand off to, so it
+/// just adds syscall overhead on top of the same busy-wait: measured worse,
+/// not better, on both the concurrent-scrape and the slow-sink benchmarks
+/// (see the module's audit F2/F4 disposition for the numbers). Left as pure
+/// spin; F2/F4 stay open pending a fix that shrinks the critical section
+/// instead of changing how waiters wait.
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
@@ -112,10 +122,18 @@ fn monotonicNowNs(_: ?*anyopaque) u64 {
 
 // ── labels ──────────────────────────────────────────────────────────────────
 
-/// One label pair. Values are free-form UTF-8 (escaped at exposition);
-/// names must match `[a-zA-Z_][a-zA-Z0-9_]*` and not start with `__`
-/// (reserved by Prometheus). Keep the *set of values* small and fixed —
-/// see the cardinality footgun in the module doc.
+/// One label pair. Values are intended to be UTF-8 (escaped at exposition:
+/// `\`, `"` and newline) but this is not validated or enforced — a value
+/// containing invalid UTF-8 or unescaped control bytes is written through
+/// unchanged, and the resulting exposition can then be invalid UTF-8 despite
+/// the `charset=utf-8` `Content-Type` (see the module's audit, F6). Values
+/// are populated by this module's own callers (`@tagName`/status-class
+/// strings, or whatever the application passes to `counter`/`gauge`/
+/// `histogram`), never parsed from a request, so treat "UTF-8" here as a
+/// caller contract, not a guarantee this module checks. Names must match
+/// `[a-zA-Z_][a-zA-Z0-9_]*` and not start with `__` (reserved by
+/// Prometheus). Keep the *set of values* small and fixed — see the
+/// cardinality footgun in the module doc.
 pub const Label = struct {
     name: []const u8,
     value: []const u8,
@@ -302,9 +320,22 @@ const Family = struct {
 /// endpoint is registered on, at a stable address.
 pub const Registry = struct {
     arena: std.heap.ArenaAllocator,
-    /// Guards `families` (lookup + registration) and `writeText` iteration.
+    /// Guards `families`/`family_index` (lookup + registration) and
+    /// `writeText` iteration.
     lock: std.atomic.Mutex = .unlocked,
+    /// Registration order — `writeText` iterates this so exposition order
+    /// stays deterministic (registration order, not sorted; see `writeText`).
     families: std.ArrayList(*Family) = .empty,
+    /// Name -> family, O(1) get-or-register lookup. `families` stays the
+    /// source of iteration order; this is purely an index into it.
+    family_index: std.StringHashMapUnmanaged(*Family) = .empty,
+    /// Advisory size of the last `writeText` output, used to pre-size the
+    /// next scrape's transient buffer so a steady-state registry (typical:
+    /// scrape interval far exceeds registration churn) does not repeatedly
+    /// double-and-copy that buffer mid-format. A stale or zero hint just
+    /// falls back to `Allocating`'s normal grow-as-needed behavior — this
+    /// changes only how much is pre-reserved, never what gets emitted.
+    exposition_size_hint: std.atomic.Value(usize) = .init(0),
 
     pub fn init(gpa: Allocator) Registry {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
@@ -357,9 +388,7 @@ pub const Registry = struct {
         lockSpin(&r.lock);
         defer r.lock.unlock();
 
-        const fam = for (r.families.items) |f| {
-            if (std.mem.eql(u8, f.name, name)) break f;
-        } else blk: {
+        const fam = if (r.family_index.get(name)) |f| f else blk: {
             const f = try a.create(Family);
             f.* = .{
                 .name = try a.dupe(u8, name),
@@ -369,6 +398,7 @@ pub const Registry = struct {
                 .buckets = if (kind == .histogram) try a.dupe(f64, buckets) else &.{},
             };
             try r.families.append(a, f);
+            try r.family_index.put(a, f.name, f);
             break :blk f;
         };
 
@@ -430,7 +460,17 @@ pub const Registry = struct {
         // slow/stalling scraper cannot stall first-touch series registration on
         // request threads (which contend for the same lock). An allocation
         // failure surfaces through the Allocating writer as `WriteFailed`.
-        var buf: std.Io.Writer.Allocating = .init(r.arena.child_allocator);
+        //
+        // Pre-sized from the last scrape's length (F8 in the module's audit:
+        // an unhinted buffer's geometric growth holds the old *and* new copy
+        // across a resize, measured at 4.33x the exposition's own size in
+        // transient peak memory). A correct hint makes that resize
+        // unnecessary; a stale or missing one (first scrape) just grows
+        // as before.
+        var buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(
+            r.arena.child_allocator,
+            r.exposition_size_hint.load(.monotonic),
+        ) catch .init(r.arena.child_allocator);
         defer buf.deinit();
         const bw = &buf.writer;
         {
@@ -459,6 +499,7 @@ pub const Registry = struct {
                 }
             }
         }
+        r.exposition_size_hint.store(buf.written().len, .monotonic);
         try w.writeAll(buf.written());
     }
 
@@ -804,7 +845,18 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
         // Handler done, nothing drained yet: the buffer holds the whole
         // body (a declared Content-Length is enforced against it at end()).
         .buffering => res.declared_len orelse res.interface.end,
-        // Streaming against a declared length — enforced exact at end().
+        // Streaming against a declared length. `res.declared_len.?` is
+        // deliberate, not `res.body.identity`: the latter looks like the
+        // declared total but is actually `http`'s *remaining*-bytes budget
+        // for the over/under-delivery guard — it decrements as the handler
+        // writes and is mid-flight (not the declared length, and not 0
+        // either) at the point this runs, still inside the handler's own
+        // middleware frame, before `end()`'s final flush. Measured: reading
+        // `res.body.identity` here for a declared 5000-byte body reported
+        // 392. `declared_len` is the one field that stays the declared
+        // total for the life of the response (see the module's audit, F11,
+        // where the missing test for this branch let a mutation survive —
+        // the branch had no coverage, not necessarily a wrong unwrap).
         .identity => res.declared_len.?,
         .discard => 0, // HEAD / 204 / 304: no body on the wire
         .chunked, .until_close, .gzip => null, // streamed; no running total kept
@@ -848,8 +900,15 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
 /// buffers). The writer is flushed after each line so records reach the sink
 /// promptly; pass a buffered `writer` if you would rather batch and flush
 /// yourself with `synchronized = false`. Writer errors are swallowed — an
-/// access log must never fail the request that produced it — and odd bytes in
-/// path/method are escaped, never panicked on.
+/// access log must never fail the request that produced it — and odd bytes
+/// in path/method never panic. That is weaker than "escaped": the JSON
+/// writer escapes `"`, `\` and control bytes 0x00-0x1F/0x7F (valid-JSON
+/// guarantee) but passes 0x80-0xFF through raw, and `path` is unvalidated
+/// bytes from the request line — HTTP/2 does not bound them the way HTTP/1.1
+/// does (see the module's audit, F3). A path containing such a byte
+/// (reachable, not just theoretical) produces a `.json` line that is no
+/// longer valid UTF-8/JSON, though still a complete, well-formed line with
+/// no injected structure (the quote/backslash escaping still holds).
 pub const AccessLog = struct {
     writer: *std.Io.Writer,
     options: Options,
@@ -1058,6 +1117,15 @@ test "registration: validation and mismatch errors" {
     _ = try reg.histogram("h3", "x", &.{}, &.{ 1, 2 });
     try testing.expectError(error.BucketsMismatch, reg.histogram("h3", "x", &.{}, &.{ 1, 3 }));
     try testing.expectError(error.BucketsMismatch, reg.histogram("h3", "x", &.{}, &.{1}));
+
+    // Label-name mismatch, same length AND same first byte, different rest
+    // (F14 in the module's audit): a comparator weakened to "length + first
+    // byte" would wrongly call these the same label and silently merge two
+    // distinct metrics into one series. The mismatch above (`"k"` vs.
+    // `"other"`) differs in length too, so it cannot catch that weakening —
+    // this one can only pass if the full name is compared.
+    _ = try reg.counter("d_total", "help", &.{.{ .name = "method", .value = "a" }});
+    try testing.expectError(error.LabelMismatch, reg.counter("d_total", "help", &.{.{ .name = "mangle", .value = "a" }}));
 }
 
 test "registration copies its inputs (stack temporaries are safe)" {
@@ -1647,6 +1715,24 @@ const FakeClock = struct {
     }
 };
 
+/// A clock whose second reading is *before* its first — `clock_gettime`
+/// failing once (which `monotonicNowNs` maps to `0`) is exactly this shape.
+/// Exercises `requestRun`'s `-|` (saturating) subtraction.
+const BackwardClock = struct {
+    readings: [2]u64,
+    i: usize = 0,
+
+    fn nowFn(ctx: ?*anyopaque) u64 {
+        const c: *BackwardClock = @ptrCast(@alignCast(ctx.?));
+        const v = c.readings[c.i];
+        c.i += 1;
+        return v;
+    }
+    fn clock(c: *BackwardClock) Clock {
+        return .{ .ctx = c, .nowFn = nowFn };
+    }
+};
+
 fn hOk(ctx: *router.Ctx) anyerror!void {
     try ctx.res.writeAll("ok");
 }
@@ -1660,6 +1746,21 @@ fn hMoved(ctx: *router.Ctx) anyerror!void {
 }
 fn hBoom(_: *router.Ctx) anyerror!void {
     return error.Boom;
+}
+/// A declared `Content-Length` plus a body large enough to force a drain
+/// before the handler returns — the wire framing `beginStreaming` picks is
+/// `.identity`, not `.buffering` (see `responseBytes`, F11 in the module's
+/// audit).
+fn hIdentityStream(ctx: *router.Ctx) anyerror!void {
+    try ctx.res.setHeader("Content-Length", "5000");
+    var chunk: [512]u8 = undefined;
+    @memset(&chunk, 'x');
+    var sent: usize = 0;
+    while (sent < 5000) {
+        const take = @min(chunk.len, 5000 - sent);
+        try ctx.res.writeAll(chunk[0..take]);
+        sent += take;
+    }
 }
 /// A status code outside the 100-599 HTTP range — exercises `classLabel`'s
 /// `else => "other"` fallback (`counterFor`'s `ci = ... else 0` path).
@@ -1747,6 +1848,34 @@ test "middleware: a status outside 100-599 falls into the 'other' class" {
     try testing.expectEqual(1, (try reg.counter("http_requests_total", rm.options.counter_help, &.{
         .{ .name = "method", .value = "get" }, .{ .name = "code", .value = "other" },
     })).value());
+}
+
+// Regression for F15/M28 in the module's audit: mutating `-|` (saturating)
+// to `-%` (wrapping) in `requestRun`'s duration calculation survived the
+// whole suite — every clock in the existing tests only ever moves forward.
+// A transient `clock_gettime` failure maps to `0` (see `monotonicNowNs`),
+// so a backwards step is a real, if rare, input; wrapping would poison the
+// latency histogram with ~2^64 ns (~5.8e11 seconds) instead of clamping to
+// zero.
+test "middleware: a clock that goes backwards saturates duration to zero" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var bc: BackwardClock = .{ .readings = .{ 1_000_000_000, 500_000_000 } }; // t1 < t0
+    var rm = try RequestMetrics.init(&reg, .{ .clock = bc.clock() });
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.get("/ok", hOk);
+
+    var buf: [4096]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/ok"), &buf), "200");
+
+    const h = try reg.histogram(rm.options.histogram_name, rm.options.histogram_help, &.{
+        .{ .name = "method", .value = "get" },
+    }, rm.options.buckets);
+    try testing.expectEqual(@as(u64, 1), h.observation_count);
+    try testing.expectEqual(@as(f64, 0), h.observation_sum);
 }
 
 test "middleware: .code granularity uses exact status codes" {
@@ -1868,6 +1997,33 @@ test "middleware: access-log hook gets method/path/status/duration/bytes" {
     try testing.expectEqual(200, e2.status);
     // HEAD keeps GET's buffered framing bytes observable (body never sent).
     try testing.expectEqual(2, e2.bytes.?);
+}
+
+// Regression for F11 in the module's audit: `responseBytes`'s `.identity`
+// branch had no test at all — mutating its `res.declared_len.?` unwrap to a
+// hardcoded `0` left the whole suite green. This exercises exactly that
+// branch (a declared Content-Length streamed in chunks, not buffered) so a
+// future regression on the `.identity` count is caught here, not just by
+// inspection.
+test "middleware: access-log hook reports the declared length for a streamed (.identity) body" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var capture: HookCapture = .{};
+    var rm = try RequestMetrics.init(&reg, .{
+        .on_request = HookCapture.hook,
+        .on_request_ctx = &capture,
+    });
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware());
+    try r.get("/big", hIdentityStream);
+
+    var out_buf: [16384]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/big"), &out_buf), "200");
+
+    try testing.expectEqual(1, capture.len);
+    try testing.expectEqual(@as(?u64, 5000), capture.entries[0].bytes);
 }
 
 test "endpoint: golden exposition response, HEAD framing, 405, pass-through" {
@@ -2038,6 +2194,28 @@ test "AccessLog: json format writes one object per request; specials escaped" {
     try testing.expectEqualStrings(
         "{\"method\":\"GET\",\"path\":\"/api/\\\"weird\\\"\\tpath\"," ++
             "\"status\":200,\"duration_ns\":1500,\"bytes\":1234}\n",
+        w.buffered(),
+    );
+}
+
+// Regression for F15/M33 in the module's audit: the existing "specials
+// escaped" test above only exercises control bytes with their own named
+// escape (`\t`, 0x09) — `writeJsonString`'s *range* branch
+// (0x00-0x07, 0x0B, 0x0E-0x1F -> `\uXXXX`) had no test at all, so mutating
+// it away (JSON escaping is the only escaping in the module reachable from
+// wire bytes — an h2 request path can carry these, see F3) survived the
+// whole suite. 0x01 and 0x1F fall only into the range branch, not any
+// single-character case above.
+test "AccessLog: json format escapes range control bytes (0x01, 0x1F), not just the named ones" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json });
+
+    access.log(.{ .method = .get, .path = "/a\x01b\x1fc", .status = 200, .duration_ns = 1, .bytes = 0 });
+
+    try testing.expectEqualStrings(
+        "{\"method\":\"GET\",\"path\":\"/a\\u0001b\\u001fc\"," ++
+            "\"status\":200,\"duration_ns\":1,\"bytes\":0}\n",
         w.buffered(),
     );
 }
