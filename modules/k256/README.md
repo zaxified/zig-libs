@@ -3,9 +3,11 @@
 `k256` is a performance-specialized secp256k1 — the fast alternative to
 `std.crypto.ecc.Secp256k1`. std's curve is portable pure-Zig (a fiat-crypto
 Montgomery field, no asm), which leaves it ~9–14× slower than libsecp256k1
-(hand-written asm + the GLV endomorphism + wNAF). Every Bitcoin/Lightning module
-in this repo (`bip340`, `taproot`, `musig2`, `adaptor`, `frost`, `sphinx`,
-`bolt3`, `bolt8`) rides std's curve today. k256 keeps the collection's
+(hand-written asm + the GLV endomorphism + wNAF). **11** modules in this repo
+depend on k256 today — the 8 Bitcoin/Lightning modules (`bip340`, `taproot`,
+`musig2`, `adaptor`, `frost`, `sphinx`, `bolt3`, `bolt8`) plus `bitcoinscript`,
+`lninvoice`, and `bip32` (`@import("k256")` in 22 files; verified 2026-09-10
+against the root `build.zig`). k256 keeps the collection's
 **zero-C/no-libc** invariant (inline asm is still native Zig) while pulling in the
 three techniques std forgoes:
 

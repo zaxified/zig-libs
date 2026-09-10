@@ -12,8 +12,10 @@ justified by two facts:
 
 1. **Measured gap.** std's curve is portable pure-Zig (a fiat-crypto Montgomery
    field, no asm, no GLV in the constant-time path), which is ~9–14× slower than
-   libsecp256k1. The 8 Bitcoin/Lightning modules in this repo all ride it, and we
-   cannot patch std.
+   libsecp256k1, and we cannot patch std. **11 modules in this repo ride k256
+   today, not std** (the 8 Bitcoin/Lightning modules plus `bitcoinscript`,
+   `lninvoice`, `bip32` — verified 2026-09-10, `@import("k256")` in 22 files;
+   see backlog item 5 below, which this closes).
 2. **The collection's thesis.** zig-libs exists so native Zig is usable INSTEAD
    of linking a C library. A secp256k1 that is within a small factor of
    libsecp256k1 — while staying zero-C/no-libc — is exactly that thesis applied to
@@ -94,6 +96,19 @@ Scalar multiply variants:
 The fast-path DESIGN the Fable phase targets: a comptime fixed-base wNAF table for
 `G` (constant-time base-point mul), and GLV for variable-base — documented here so
 the core author has the target shape.
+
+**Known limitation — compressed SEC1 is not a round-trip for the point at
+infinity.** `toCompressedSec1(identityElement)` encodes `03‖0^32`, and
+`fromSec1` of that same string returns `error.NotSquare` (7 is not a quadratic
+residue mod `p`, so `x = 0` has no compressed encoding). The uncompressed
+(`04‖0^32‖0^31 01`) and single-byte (`00`) encodings both round-trip correctly;
+only the compressed form breaks, and only for this one point (A1/k256.md F10,
+2026-09-10). `std.crypto.ecc.Secp256k1` has the identical gap, so this is an
+inherited property, not a regression — but the identity point is a real
+mid-computation value in the aggregation consumers (`musig2`, `taproot`,
+`bip32`), and the failure mode is fail-closed (an error, never a wrong point),
+so no fix is applied here; a caller that needs to serialize a possible
+infinity must use the uncompressed or single-byte form.
 
 ### GLV endomorphism (constants + decomposition)
 
@@ -376,7 +391,12 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
    **DONE** — `group.combMulBase` (fixed-base comb, w=4, signed-digit,
    blackBox-guarded CT gather). Sign ~4.3× faster (~2.3× libsecp256k1).
 4. Addition-chain field inverse (replace the Fermat square-and-multiply).
-5. Rewire the 8 Bitcoin/Lightning modules from `std.crypto.ecc.Secp256k1` to k256.
+5. ~~Rewire the 8 Bitcoin/Lightning modules from `std.crypto.ecc.Secp256k1` to
+   k256.~~ **DONE, and undercounted** — verified 2026-09-10 (A1/k256.md F6):
+   11 modules ride k256 in production, not 8 (the original 8 plus
+   `bitcoinscript`, `lninvoice`, `bip32`); the only remaining
+   `std.crypto.ecc.Secp256k1` references are comments and one test oracle
+   (`sphinx/src/kat_test.zig:28`).
 6. Side-channel review of the CT paths (inverse, GLV sign handling).
 
 ## Anchoring

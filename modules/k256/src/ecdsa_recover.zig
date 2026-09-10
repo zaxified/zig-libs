@@ -60,8 +60,20 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
 
     var v: [32]u8 = [_]u8{0x01} ** 32;
     var k: [32]u8 = [_]u8{0x00} ** 32;
+    // A1/k256.md G2: `v`/`k` (the DRBG state) and `buf`/`buf2` (which carry
+    // `privkey` and, once the loop finds a candidate, the nonce material
+    // itself) used to survive unzeroed on the dead stack after this function
+    // returns — measured (`.zig-cache/probe/k256_g2_zeroize.zig`, paint +
+    // rescan technique): the RFC 6979 nonce `k` (this function's return
+    // value, re-encoded) showed up 2/2/2/2/2 across 5 repeats. A leaked
+    // nonce plus its signature yields the private key by elementary algebra
+    // (`d = (s·k − e)·r⁻¹ mod n`), so this is zeroed like every other
+    // secret-derived buffer in the signing path.
+    defer std.crypto.secureZero(u8, &v);
+    defer std.crypto.secureZero(u8, &k);
 
     var buf: [32 + 1 + 32 + 32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
     buf[0..32].* = v;
     buf[32] = 0x00;
     buf[33..65].* = privkey;
@@ -106,6 +118,7 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
             if (!cand.isZero()) return cand;
         } else |_| {}
         var buf2: [32 + 1]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buf2);
         buf2[0..32].* = v;
         buf2[32] = 0x00;
         HmacSha256.create(&k, &buf2, &k);
@@ -127,8 +140,11 @@ pub fn sign(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
     if (d.isZero()) return error.InvalidPrivateKey;
     const e = reduceToScalar(hash32);
 
-    const k = rfc6979Nonce(privkey, hash32);
-    const R = Secp256k1.combMulBase(k.toBytes(.big), .big) catch return error.InvalidNonce;
+    var k = rfc6979Nonce(privkey, hash32);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
+    var k_bytes = k.toBytes(.big);
+    defer std.crypto.secureZero(u8, &k_bytes);
+    const R = Secp256k1.combMulBase(k_bytes, .big) catch return error.InvalidNonce;
     const Ra = R.affineCoordinates();
     const r = Scalar.fromBytes(Ra.x.toBytes(.big), .big) catch return error.InvalidNonce;
     if (r.isZero()) return error.InvalidNonce;

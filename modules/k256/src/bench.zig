@@ -15,6 +15,7 @@ const std = @import("std");
 const field = @import("field.zig");
 const group = @import("group.zig");
 const sign = @import("sign.zig");
+const ecdsa_recover = @import("ecdsa_recover.zig");
 
 const Secp256k1 = group.Secp256k1;
 const Std = std.crypto.ecc.Secp256k1;
@@ -234,6 +235,37 @@ test "bench (opt-in via K256_BENCH)" {
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("{s} bip340 verify     : {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
+
+        // A1/k256.md G6: the bench used to skip the ONE secret-key path an
+        // in-repo consumer (`lninvoice`/BOLT#11) actually calls —
+        // `ecdsa_recover.sign` (RFC 6979) and `recoverPubkey` — while
+        // measuring five things nothing in the repo calls. Added 2026-09-10.
+        const ec_privkey = [_]u8{9} ** 32;
+        var ec_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(msg, &ec_hash, .{});
+
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
+        while (i < sig_iters) : (i += 1) {
+            const s2 = ecdsa_recover.sign(ec_privkey, ec_hash) catch continue;
+            sink ^= s2.r[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("{s} ecdsa_recover.sign (RFC6979): {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
+
+        const ec_sig = ecdsa_recover.sign(ec_privkey, ec_hash) catch unreachable;
+        sink = 0;
+        t0 = nowNs();
+        i = 0;
+        while (i < sig_iters) : (i += 1) {
+            const q = ecdsa_recover.recoverPubkey(ec_hash, ec_sig.r, ec_sig.s, ec_sig.recid) catch continue;
+            sink ^= q.x.limbs[0];
+        }
+        dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(sink);
+        std.debug.print("{s} recoverPubkey                : {d:>8} ns/op\n", .{ k256_label, dt / sig_iters });
     }
     std.debug.print("(reference: libsecp256k1 on comparable hw ≈ 50µs verify, ≈ 25-40µs sign)\n\n", .{});
 }

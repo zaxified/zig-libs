@@ -363,3 +363,71 @@ test "GATED differential: mulDoubleBasePublic (GLV 4-way) == portable double-add
     const got_single = try Secp256k1.mulDoubleBasePublic(g, beBytes(7), g2, beBytes(0), .big);
     try std.testing.expect(want_single.equivalent(got_single));
 }
+
+// ── A1/k256.md fix-campaign guard tests ──────────────────────────────────
+//
+// F2/F3/F9: three validations the audit showed the suite could lose (source
+// deleted, or the check simply never called) without a single test going
+// red. Each test below is a genuine black-box regression test — mutating
+// away the guard it names changes the OBSERVABLE return value of a public
+// function, so these were verified RED (mutant) → GREEN (revert) by hand
+// during the fix pass; see `A1/k256.md`'s 2026-09-10 disposition for the
+// exact mutation and `scripts/modtest k256` output.
+
+test "F2: fromAffineCoordinates / fromSec1 reject an off-curve point" {
+    const Fe = field.Fe;
+
+    // x = 1: x³+7 = 8, and y = 1 gives y² = 1 ≠ 8 — off the curve. (NOT
+    // (0, 1): that pair IS this module's affine identity sentinel
+    // (`AffineCoordinates.identityElement`, group.zig:653) and is correctly
+    // accepted — verified the hard way, by first writing this test against
+    // (0, 1) and watching it fail on UNMUTATED code.)
+    try std.testing.expectError(
+        error.InvalidEncoding,
+        Secp256k1.fromAffineCoordinates(.{ .x = Fe.one, .y = Fe.one }),
+    );
+
+    var sec1: [65]u8 = undefined;
+    sec1[0] = 4;
+    @memset(sec1[1..33], 0);
+    sec1[32] = 1; // x = 1
+    @memset(sec1[33..64], 0);
+    sec1[64] = 1; // y = 1
+    try std.testing.expectError(error.InvalidEncoding, Secp256k1.fromSec1(&sec1));
+
+    // A random SEC1-decoded on-curve point must still round-trip — the
+    // guard rejects only what it should.
+    const p = try Secp256k1.basePoint.mul(comptime blk: {
+        var b: [32]u8 = undefined;
+        std.mem.writeInt(u256, &b, 12345, .big);
+        break :blk b;
+    }, .big);
+    const good_sec1 = p.toUncompressedSec1();
+    _ = try Secp256k1.fromSec1(&good_sec1);
+}
+
+test "F3: Secp256k1.mul(P, s) rejects s ≡ 0 (mod n), same as combMulBase" {
+    const g = Secp256k1.basePoint;
+    const n = @import("scalar.zig").field_order;
+
+    try std.testing.expectError(error.IdentityElement, g.mul(beBytes(0), .big));
+    try std.testing.expectError(error.IdentityElement, g.mul(beBytes(n), .big));
+
+    // Positive control: a nonzero scalar must still succeed and agree with
+    // combMulBase — proves the guard above didn't just start rejecting
+    // everything.
+    const from_mul = try g.mul(beBytes(7), .big);
+    const from_comb = try Secp256k1.combMulBase(beBytes(7), .big);
+    try std.testing.expect(from_mul.equivalent(from_comb));
+}
+
+test "F9: Fe.rejectNonCanonical actually rejects >= p and accepts < p" {
+    const Fe = field.Fe;
+    const p = field.field_order;
+
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(beBytes(p), .big));
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(beBytes(p + 1), .big));
+    try std.testing.expectError(error.NonCanonical, Fe.rejectNonCanonical(beBytes(std.math.maxInt(u256)), .big));
+    try Fe.rejectNonCanonical(beBytes(p - 1), .big);
+    try Fe.rejectNonCanonical(beBytes(0), .big);
+}
