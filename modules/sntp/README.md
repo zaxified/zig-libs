@@ -66,18 +66,31 @@ const r = try sntp.query(io, server, .{ .timeout_ms = 3000 }, null); // null: ig
 // r.reply (stratum, timestamps…), r.sample, r.offset_ns, r.roundtrip_ns
 ```
 
-`decodeResponse(bytes, kiss_out)` returns distinct errors: `InvalidLength` (not 48 bytes),
-`InvalidVersion` (VN = 0), `NotServerMode` (mode ≠ 4), `KissOfDeath` (stratum 0 —
-pass a non-null `kiss_out: ?*KissOfDeath` to get the parsed `KissCode` and raw
-4-byte reason from `reference_id`, per RFC 5905 §7.4), `UnsynchronizedStratum`
-(stratum ≥ 16 — RFC 5905: 16 is "unsynchronized", 17-255 reserved), and
-`TransmitTimestampUnset` (the server hasn't set its own clock yet). `query`
-forwards its own `kiss_out: ?*KissOfDeath` parameter the same way.
+`decodeResponse(bytes, kiss_out)` returns distinct errors: `InvalidLength` (not 48 bytes, including a
+UDP datagram the kernel had to truncate to fit), `InvalidVersion` (VN = 0), `NotServerMode` (mode ≠
+4), `KissOfDeath` (stratum 0 — pass a non-null `kiss_out: ?*KissOfDeath` to get the parsed `KissCode`
+and raw 4-byte reason from `reference_id`, per RFC 5905 §7.4), `UnsynchronizedStratum` (stratum ≥ 16
+— RFC 5905: 16 is "unsynchronized", 17-255 reserved), `UnsynchronizedLeap` (Leap Indicator = 3, RFC
+4330 §4's own "alarm condition, clock not synchronized" — the same verdict `UnsynchronizedStratum`
+reaches by a different field), `ReceiveTimestampUnset` and `TransmitTimestampUnset` (the server
+hasn't set its own clock yet). `query` forwards its own `kiss_out: ?*KissOfDeath` parameter the same
+way, and adds `OriginateMismatch` (the reply didn't echo `query`'s anti-spoof origin nonce),
+`EntropyUnavailable` (couldn't source fresh entropy for that nonce — fails closed rather than using a
+predictable one), and `ClockUnavailable` (the local clock couldn't be read for T1/T4).
+
+**Security note:** this module is a single unauthenticated UDP exchange. `query` validates the reply
+thoroughly (RFC 4330 §5's checks, including the peer address/port and an anti-spoof origin nonce) but
+that is not authentication — a network attacker who can observe traffic, not just spoof it blindly,
+can still forge a reply. Do not step a security-sensitive clock (TLS validity, TOTP, Kerberos, log
+ordering) from a single `query` result on a hostile network; use NTS or authenticated NTP for that,
+layered on top — this module doesn't provide it.
 
 **Known limitation — NTP era 0 (until 2036-02-07):** timestamps are decoded as
 a bare 32-bit seconds count with no era pivot, so arithmetic is only correct
 inside the current NTP era; see SPEC.md for detail. Not fixed here — no
-surveyed implementation has actually solved it either.
+surveyed implementation has actually solved it either. One of this module's
+own tests is a tripwire for the date, not just a comment: `test "nowTimestamp
+is in a sane modern range"` fails on its own two days before the rollover.
 
 ## Tests
 
@@ -85,10 +98,12 @@ surveyed implementation has actually solved it either.
 `LI|VN|Mode` byte + T1 placement), packet encode/decode round-trip, a canned
 server response (stratum/precision/timestamps/ref-id), the reject paths
 (length, version 0, mode, Kiss-o'-Death with its parsed reason code, stratum
-≥ 16, an unset Transmit Timestamp), NTP↔Unix epoch conversion at a known
-instant, fraction↔nanosecond round-trips, and offset/delay against
-hand-computed T1..T4 (including a negative offset). The live `query` test is
-gated behind `error.SkipZigTest`.
+≥ 16, Leap Indicator 3, an unset Receive Timestamp, an unset Transmit
+Timestamp), NTP↔Unix epoch conversion at a known instant, fraction↔nanosecond
+round-trips, offset/delay against hand-computed T1..T4 (including a negative
+offset), and `query`'s receive-side guards (peer address/port match,
+truncation, origin-nonce echo) exercised directly, without a socket. The live
+`query` test is gated behind `error.SkipZigTest`.
 
 ## Deferred (not in v1)
 

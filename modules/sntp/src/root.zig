@@ -342,10 +342,24 @@ pub const DecodeError = error{
     /// 16-255 range simply "reserved"). Neither is a valid, synchronized
     /// time source, so both are rejected the same way.
     UnsynchronizedStratum,
+    /// Leap Indicator is `.unsynchronized` (LI = 3, RFC 4330 §4's own "alarm
+    /// condition — clock not synchronized"). Audit finding F7: a reply with
+    /// stratum >= 16 was already rejected as not a valid synchronized time
+    /// source, but a reply saying the identical thing through its LI field
+    /// instead was accepted — an inconsistency, not a deliberate leniency
+    /// (see SPEC.md threat model).
+    UnsynchronizedLeap,
     /// The reply's Transmit Timestamp (T3) is the all-zero sentinel RFC
     /// 4330 uses for "not set" — RFC 4330 §5 sanity check 4 says to discard
     /// such a reply (the server hasn't set its own clock yet).
     TransmitTimestampUnset,
+    /// The reply's Receive Timestamp (T2) is the all-zero sentinel. Audit
+    /// finding F3: RFC 4330 §5 sanity check 4 applies to T2 exactly like
+    /// T3, but only T3 was checked before this. Left open, a server
+    /// reporting T2 = 0 sends `query`'s offset computation wherever the
+    /// server's T3 puts it, unbounded (measured: an offset of -63 years
+    /// from T2 = 0 alone, every other field left honest).
+    ReceiveTimestampUnset,
 };
 
 /// A validated server reply. Alias of `Packet` — the `originate`/`receive`/
@@ -353,9 +367,11 @@ pub const DecodeError = error{
 pub const Reply = Packet;
 
 /// Decode + validate a server response: exactly 48 bytes, a non-zero
-/// version, server mode, a stratum in 1..15, and a set (non-zero) transmit
-/// timestamp — the RFC 4330 §5 sanity-check list (item 4, VN-corrected per
-/// Errata 2263) plus RFC 5905's stratum range.
+/// version, server mode, a stratum in 1..15, a Leap Indicator that isn't
+/// `.unsynchronized`, and set (non-zero) Receive and Transmit timestamps —
+/// the RFC 4330 §5 sanity-check list (item 4, VN-corrected per Errata 2263)
+/// plus RFC 5905's stratum range, plus the LI/T2 checks closed by audit
+/// findings F7 and F3 respectively.
 ///
 /// On `error.KissOfDeath` (stratum 0), if `kiss_out` is non-null it is
 /// filled in with the parsed reason code and the raw `reference_id` bytes —
@@ -371,7 +387,9 @@ pub fn decodeResponse(bytes: []const u8, kiss_out: ?*KissOfDeath) DecodeError!Re
         return error.KissOfDeath;
     }
     if (p.stratum >= 16) return error.UnsynchronizedStratum;
+    if (p.leap == .unsynchronized) return error.UnsynchronizedLeap;
     if (p.transmit.isZero()) return error.TransmitTimestampUnset;
+    if (p.receive.isZero()) return error.ReceiveTimestampUnset;
     return p;
 }
 
@@ -429,28 +447,47 @@ pub fn computeDelayNanos(t1: Timestamp, t2: Timestamp, t3: Timestamp, t4: Timest
 
 // ── local clock ─────────────────────────────────────────────────────────────
 
+/// Failure to read the local clock (audit finding F11). Before this, a
+/// `clock_gettime` failure made `nowUnixNanos` silently return 0 — the Unix
+/// epoch, i.e. NTP timestamp 1900+70 years in the past — and that garbage
+/// value would go on to become T1 or T4 with no signal to the caller at all.
+/// Fail closed instead: a caller that can't read its own clock can't compute
+/// a meaningful offset, and should hear about it.
+pub const ClockError = error{ClockUnavailable};
+
+/// The pure error/timespec → nanoseconds step of `nowUnixNanos`'s POSIX
+/// branch, split out so it's directly testable without depending on
+/// `clock_gettime` actually failing (which it practically never does on
+/// Linux — vDSO). Audit finding F11 was "read from code, not reproduced";
+/// this is what makes the fail-closed behavior a measured fact instead.
+fn unixNanosFromClockResult(errno: std.posix.E, ts: std.posix.timespec) ClockError!i128 {
+    if (errno != .SUCCESS) return error.ClockUnavailable;
+    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+}
+
 /// Current wall-clock instant as nanoseconds since the Unix epoch. std's
 /// `std.time` timestamp helpers were removed in 0.16; this uses the libc-free
 /// `clock_gettime(REALTIME)` errno form (and `RtlGetSystemTimePrecise` on
 /// Windows), matching the sibling modules (jwt/jobqueue).
-pub fn nowUnixNanos() i128 {
+pub fn nowUnixNanos() ClockError!i128 {
     switch (builtin.os.tag) {
         .windows => {
             // 100 ns ticks since 1601-01-01; shift to the Unix epoch, then to ns.
+            // RtlGetSystemTimePrecise has no documented failure mode.
             const hns: i64 = std.os.windows.ntdll.RtlGetSystemTimePrecise();
             return @as(i128, hns - 116444736000000000) * 100;
         },
         else => {
             var ts: std.posix.timespec = undefined;
-            if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
-            return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+            const errno = std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts));
+            return unixNanosFromClockResult(errno, ts);
         },
     }
 }
 
 /// Current instant as an NTP `Timestamp`.
-pub fn nowTimestamp() Timestamp {
-    return Timestamp.fromUnixNanos(nowUnixNanos());
+pub fn nowTimestamp() ClockError!Timestamp {
+    return Timestamp.fromUnixNanos(try nowUnixNanos());
 }
 
 // ── UDP query ───────────────────────────────────────────────────────────────
@@ -467,12 +504,20 @@ pub const QueryError = error{
     Canceled,
     /// Any socket-level failure (bind/send/receive).
     NetworkFailed,
-    /// The reply's `originate` timestamp does not echo the `transmit`
-    /// timestamp (T1) this `query` sent — RFC 4330 §5's origin-timestamp
-    /// check failed. Either a spoofed/off-path reply or a badly broken
-    /// server; reject it either way (see `verifyOriginate`).
+    /// The reply's `originate` timestamp does not echo the origin nonce this
+    /// `query` sent (see `query`'s origin-nonce comment) — RFC 4330 §5's
+    /// origin-timestamp check failed. Either a spoofed/off-path reply or a
+    /// badly broken server; reject it either way (see `verifyOriginate`).
     OriginateMismatch,
-} || DecodeError;
+    /// `std.Io.randomSecure` could not source fresh entropy for the
+    /// anti-spoof origin-timestamp nonce (audit finding F4). Fails closed
+    /// rather than silently falling back to a predictable nonce — see
+    /// `query`'s origin-nonce comment and `modules/entropy`'s doc comment
+    /// ("if your signature can return an error, do not use [the
+    /// silently-degrading `std.Io.random`] — call `randomSecure` directly
+    /// and let the caller decide"), this repo's settled entropy policy.
+    EntropyUnavailable,
+} || ClockError || DecodeError;
 
 /// Result of a successful `query`: the validated server reply, the four
 /// timestamps, and the derived offset/delay in nanoseconds.
@@ -503,9 +548,32 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
     };
     defer sock.close(io);
 
-    // T1: build + send the request.
-    const t1 = nowTimestamp();
-    const req_pkt: Packet = .{ .version = options.version, .mode = .client, .transmit = t1 };
+    // T1: the real send instant — used for the offset/delay math in
+    // `validateReply`, nowhere else.
+    const t1 = try nowTimestamp();
+
+    // The wire origin nonce (audit finding F4): a client Transmit Timestamp
+    // built only from a wall-clock read is only as unpredictable as the
+    // clock's resolution — measured 21-24 bits of an off-path attacker's
+    // search space on this host, against `verifyOriginate`'s doc comment
+    // claiming all 64. Keep `t1.seconds` (the request still carries a
+    // plausible "now") but replace the fraction with 32 fresh bits from
+    // `std.Io.randomSecure` — fail-closed, not `std.Io.random`'s weaker,
+    // silently degrading seed (see `QueryError.EntropyUnavailable`).
+    // `verifyOriginate` below checks the reply against THIS nonce, not
+    // `t1` — the offset/delay math uses `t1` itself (see `validateReply`),
+    // so randomizing the wire value costs no accuracy.
+    var nonce_fraction_bytes: [4]u8 = undefined;
+    std.Io.randomSecure(io, &nonce_fraction_bytes) catch |err| switch (err) {
+        error.Canceled => return error.Canceled,
+        error.EntropyUnavailable => return error.EntropyUnavailable,
+    };
+    const origin_nonce: Timestamp = .{
+        .seconds = t1.seconds,
+        .fraction = std.mem.readInt(u32, &nonce_fraction_bytes, .big),
+    };
+
+    const req_pkt: Packet = .{ .version = options.version, .mode = .client, .transmit = origin_nonce };
     const request = req_pkt.encode();
 
     const dest = server;
@@ -514,7 +582,13 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
         else => return error.NetworkFailed,
     };
 
-    // Receive the reply from the server, ignoring datagrams from other peers.
+    // Receive the reply. `processReply`/`validateReply` carry BOTH anti-spoof
+    // guards (source-address/port match, origin-nonce echo) plus the
+    // truncation check — audit finding F1 was that `query`'s own receive
+    // loop held its guards in a form no test reached, so a mutation dropping
+    // either the peer check or the `verifyOriginate` call left the whole
+    // suite green. They now live in functions unit tests call directly; this
+    // loop is a thin, largely inert wrapper around them.
     const deadline = deadlineFromMs(io, options.timeout_ms);
     var rbuf: [packet_len]u8 = undefined;
     while (true) {
@@ -523,28 +597,69 @@ pub fn query(io: std.Io, server: net.IpAddress, options: QueryOptions, kiss_out:
             error.Canceled => return error.Canceled,
             else => return error.NetworkFailed,
         };
-        if (!incoming.from.eql(&dest)) continue;
-
-        // T4: local receive instant.
-        const t4 = nowTimestamp();
-        const reply = try decodeResponse(incoming.data, kiss_out);
-        // RFC 4330 §5 origin-timestamp check: reject unless the reply echoes
-        // back the T1 we sent. Must happen before the reply is trusted for
-        // anything else (offset/delay computation below).
-        try verifyOriginate(reply, t1);
-        const sample: Sample = .{
-            .originate = reply.originate, // T1 as echoed by the server
-            .receive = reply.receive, // T2
-            .transmit = reply.transmit, // T3
-            .destination = t4, // T4
-        };
-        return .{
-            .reply = reply,
-            .sample = sample,
-            .offset_ns = sample.offsetNanos(),
-            .roundtrip_ns = sample.roundtripDelayNanos(),
-        };
+        const t4 = try nowTimestamp(); // T4: local receive instant.
+        const result = processReply(incoming.data, incoming.flags.trunc, incoming.from, dest, origin_nonce, t1, t4, kiss_out) orelse continue;
+        return result;
     }
+}
+
+/// Validate one received datagram against a pending exchange: reject it
+/// unless it's from `server` (else a blind off-path attacker flooding from
+/// other ports/addresses could derail the exchange), then hand off to
+/// `validateReply`. Split out of `query`'s receive loop so this — the whole
+/// point of the peer-address guard — is directly unit-testable without a
+/// socket (audit finding F1).
+///
+/// Returns `null` when `from` doesn't match `server` — the caller's receive
+/// loop should keep waiting, not fail the query.
+fn processReply(
+    data: []const u8,
+    truncated: bool,
+    from: net.IpAddress,
+    server: net.IpAddress,
+    origin_nonce: Timestamp,
+    t1: Timestamp,
+    t4: Timestamp,
+    kiss_out: ?*KissOfDeath,
+) ?QueryError!QueryResult {
+    if (!from.eql(&server)) return null;
+    return validateReply(data, truncated, origin_nonce, t1, t4, kiss_out);
+}
+
+/// The truncation / decode / origin-echo checks and `QueryResult` build,
+/// split out of `processReply` so a test can drive it with a canned
+/// already-matched-peer datagram without constructing a `net.IpAddress`.
+fn validateReply(
+    data: []const u8,
+    truncated: bool,
+    origin_nonce: Timestamp,
+    t1: Timestamp,
+    t4: Timestamp,
+    kiss_out: ?*KissOfDeath,
+) QueryError!QueryResult {
+    // A truncated read means the real datagram was longer than
+    // `packet_len` — README/SPEC both promise those are rejected as
+    // `InvalidLength`, but nothing enforced it (audit finding F2): the
+    // kernel silently hands back exactly `packet_len` bytes either way, and
+    // only `incoming.flags.trunc` tells the two cases apart.
+    if (truncated) return error.InvalidLength;
+    const reply = try decodeResponse(data, kiss_out);
+    // RFC 4330 §5 origin-timestamp check: reject unless the reply echoes
+    // back the nonce this exchange sent. Must happen before the reply is
+    // trusted for anything else (offset/delay computation below).
+    try verifyOriginate(reply, origin_nonce);
+    const sample: Sample = .{
+        .originate = t1, // the real T1 clock reading, NOT the wire nonce
+        .receive = reply.receive, // T2
+        .transmit = reply.transmit, // T3
+        .destination = t4, // T4
+    };
+    return .{
+        .reply = reply,
+        .sample = sample,
+        .offset_ns = sample.offsetNanos(),
+        .roundtrip_ns = sample.roundtripDelayNanos(),
+    };
 }
 
 fn deadlineFromMs(io: std.Io, ms: u32) std.Io.Timeout {
@@ -662,6 +777,7 @@ test "decodeResponse: stratum 15 (top of the valid secondary-reference range) is
     var bytes = [_]u8{0} ** packet_len;
     bytes[0] = 0x24; // VN=4, server mode
     bytes[1] = 15;
+    std.mem.writeInt(u32, bytes[32..36], 1, .big); // non-zero receive (F3)
     std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
     const reply = try decodeResponse(&bytes, null);
     try testing.expectEqual(@as(u8, 15), reply.stratum);
@@ -671,8 +787,44 @@ test "decodeResponse: rejects an all-zero Transmit Timestamp (RFC 4330 §5 item 
     var bytes = [_]u8{0} ** packet_len;
     bytes[0] = 0x24; // VN=4, server mode
     bytes[1] = 2; // stratum 2, well clear of KissOfDeath/UnsynchronizedStratum
-    // bytes[40..48] (transmit) left all-zero.
+    // bytes[40..48] (transmit) left all-zero; receive left all-zero too, but
+    // the transmit check runs first so it's TransmitTimestampUnset that fires.
     try testing.expectError(error.TransmitTimestampUnset, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: rejects an all-zero Receive Timestamp (audit finding F3)" {
+    // Reproduces the audit's finding: a server echoing T1 correctly but
+    // reporting T2 = 0 passed every check before this and drove `query`'s
+    // offset to -63 years (measured against a live stub). transmit is set
+    // so only the new T2 check is isolated.
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0x24; // VN=4, server mode
+    bytes[1] = 2; // stratum 2
+    std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
+    // bytes[32..40] (receive) left all-zero.
+    try testing.expectError(error.ReceiveTimestampUnset, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: rejects Leap Indicator 3 (unsynchronized), a KoD-shaped stratum aside (audit finding F7)" {
+    // LI=3 (11), VN=4 (100), Mode=4 (100)  ->  11_100_100 = 0xE4.
+    var bytes = [_]u8{0} ** packet_len;
+    bytes[0] = 0xE4;
+    bytes[1] = 2; // stratum 2, clear of KissOfDeath/UnsynchronizedStratum
+    std.mem.writeInt(u32, bytes[32..36], 1, .big); // non-zero receive
+    std.mem.writeInt(u32, bytes[40..44], 1, .big); // non-zero transmit
+    try testing.expectError(error.UnsynchronizedLeap, decodeResponse(&bytes, null));
+}
+
+test "decodeResponse: LI 0-2 (not the alarm value) still accepted, isolating F7's check" {
+    inline for ([_]LeapIndicator{ .no_warning, .last_minute_61, .last_minute_59 }) |li| {
+        var bytes = [_]u8{0} ** packet_len;
+        bytes[0] = (@as(u8, @intFromEnum(li)) << 6) | (4 << 3) | 4; // LI | VN=4 | Mode=4
+        bytes[1] = 2;
+        std.mem.writeInt(u32, bytes[32..36], 1, .big);
+        std.mem.writeInt(u32, bytes[40..44], 1, .big);
+        const reply = try decodeResponse(&bytes, null);
+        try testing.expectEqual(li, reply.leap);
+    }
 }
 
 test "decodeResponse: stratum 0 is Kiss-o'-Death" {
@@ -855,8 +1007,27 @@ test "offset can be negative (local clock ahead)" {
     try testing.expectEqual(-@as(i128, 5_500_000_000), off);
 }
 
+test "offset rounding direction is pinned to truncation, not floor (audit finding F10)" {
+    // Every other offset test in this file sums to an EVEN nanosecond count,
+    // so `@divTrunc` and `@divFloor` agree on the whole file except here —
+    // `M12` (audit repro) swapped `computeOffsetNanos` from `@divTrunc` to
+    // `@divFloor` and the rest of the suite stayed green. `t1`/`t2` are
+    // identical (a = 0); `t4`'s fraction is the smallest value whose
+    // ns-conversion rounds to an odd nanosecond (1 ns, per
+    // `nanosSinceNtpEpoch`'s `>> 32`), so b = -1 ns and the sum is the
+    // smallest negative odd number possible: trunc(-1/2) = 0, floor(-1/2) =
+    // -1 — the two diverge on this input and only this shape of input.
+    const t1: Timestamp = .{ .seconds = 0, .fraction = 0 };
+    const t2: Timestamp = .{ .seconds = 0, .fraction = 0 }; // a = t2 - t1 = 0
+    const t3: Timestamp = .{ .seconds = 0, .fraction = 0 };
+    const t4: Timestamp = .{ .seconds = 0, .fraction = 5 }; // frac_ns(5) = 1, so b = -1
+    try testing.expectEqual(@as(u64, 1), t4.nanosSinceNtpEpoch()); // pin the odd-ns setup itself
+    const off = computeOffsetNanos(t1, t2, t3, t4);
+    try testing.expectEqual(@as(i128, 0), off); // trunc(-1/2) == 0; floor(-1/2) == -1
+}
+
 test "nowTimestamp is in a sane modern range" {
-    const ts = nowTimestamp();
+    const ts = try nowTimestamp();
     // After 2020-01-01 (NTP seconds for 2020 ≈ 3.786e9) and before the
     // era-0 rollover in 2036.
     try testing.expect(ts.seconds > 3_786_825_600);
@@ -866,6 +1037,92 @@ test "nowTimestamp is in a sane modern range" {
 test "query: live network (skipped offline)" {
     // Gate any real query behind SkipZigTest — no live server in CI.
     return error.SkipZigTest;
+}
+
+// ── audit finding F11: clock failure fails closed, not silently to 1970 ────
+
+test "unixNanosFromClockResult: converts a successful read the same way the old code did" {
+    const ts: std.posix.timespec = .{ .sec = 5, .nsec = 250_000_000 };
+    try testing.expectEqual(@as(i128, 5_250_000_000), try unixNanosFromClockResult(.SUCCESS, ts));
+}
+
+test "unixNanosFromClockResult: fails closed instead of silently returning epoch-zero (audit finding F11)" {
+    // Before this fix, a non-SUCCESS errno fell through to `return 0` —
+    // Unix epoch, i.e. 70+ years in the past — with no signal to the
+    // caller. `ts` is deliberately non-zero garbage to prove the error path
+    // doesn't just happen to look right because the timespec was empty.
+    const garbage_ts: std.posix.timespec = .{ .sec = 999_999, .nsec = 999_999_999 };
+    try testing.expectError(error.ClockUnavailable, unixNanosFromClockResult(.INVAL, garbage_ts));
+}
+
+// ── audit findings F1/F2/F4: query's guards, unit-tested without a socket ──
+
+const sntp_test_port: u16 = 123;
+
+fn cannedReply(originate: Timestamp) Packet {
+    return .{
+        .mode = .server,
+        .stratum = 2,
+        .originate = originate,
+        .receive = .{ .seconds = 100, .fraction = 0x4000_0000 },
+        .transmit = .{ .seconds = 100, .fraction = 0x8000_0000 },
+    };
+}
+
+test "validateReply: accepts a matching reply and uses the real T1, not the wire nonce, for offset math (F4)" {
+    // origin_nonce is what's on the wire and gets echo-checked; t1 is the
+    // real clock reading `query` captured and is what should end up in
+    // `sample.originate`. They're deliberately different values here.
+    const origin_nonce: Timestamp = .{ .seconds = 100, .fraction = 0xAAAA_AAAA };
+    const t1: Timestamp = .{ .seconds = 100, .fraction = 0x1111_1111 };
+    const t4: Timestamp = .{ .seconds = 101, .fraction = 0 };
+    const bytes = cannedReply(origin_nonce).encode();
+
+    const result = try validateReply(&bytes, false, origin_nonce, t1, t4, null);
+    try testing.expectEqual(t1, result.sample.originate);
+    try testing.expect(!t1.eql(origin_nonce));
+}
+
+test "validateReply: rejects a reply that doesn't echo the origin nonce (F1's verifyOriginate guard, unit-tested directly)" {
+    const origin_nonce: Timestamp = .{ .seconds = 100, .fraction = 1 };
+    const wrong_echo: Timestamp = .{ .seconds = 100, .fraction = 2 };
+    const t1 = origin_nonce;
+    const t4: Timestamp = .{ .seconds = 101 };
+    const bytes = cannedReply(wrong_echo).encode();
+    try testing.expectError(error.OriginateMismatch, validateReply(&bytes, false, origin_nonce, t1, t4, null));
+}
+
+test "validateReply: rejects a truncated datagram even though the buffer holds exactly packet_len bytes (audit finding F2)" {
+    // The kernel truncates an oversized UDP datagram down to the buffer
+    // size and signals it via a flag, not a shorter `data.len` — the ONLY
+    // way to tell a real 48-byte packet from a truncated bigger one apart
+    // is `truncated`. Bytes here are a perfectly well-formed 48-byte reply.
+    const origin_nonce: Timestamp = .{ .seconds = 100, .fraction = 1 };
+    const t1 = origin_nonce;
+    const t4: Timestamp = .{ .seconds = 101 };
+    const bytes = cannedReply(origin_nonce).encode();
+    try testing.expectError(error.InvalidLength, validateReply(&bytes, true, origin_nonce, t1, t4, null));
+}
+
+test "processReply: ignores a datagram from the wrong peer instead of failing the query (F1's peer guard, unit-tested directly)" {
+    const server = try net.IpAddress.parse("203.0.113.1", sntp_test_port);
+    const attacker = try net.IpAddress.parse("203.0.113.66", sntp_test_port);
+    const origin_nonce: Timestamp = .{ .seconds = 100, .fraction = 1 };
+    const t1 = origin_nonce;
+    const t4: Timestamp = .{ .seconds = 101 };
+    const bytes = cannedReply(origin_nonce).encode();
+    try testing.expect(processReply(&bytes, false, attacker, server, origin_nonce, t1, t4, null) == null);
+}
+
+test "processReply: a matching peer reaches validation and can succeed" {
+    const server = try net.IpAddress.parse("203.0.113.1", sntp_test_port);
+    const origin_nonce: Timestamp = .{ .seconds = 100, .fraction = 1 };
+    const t1 = origin_nonce;
+    const t4: Timestamp = .{ .seconds = 101 };
+    const bytes = cannedReply(origin_nonce).encode();
+    const maybe_result = processReply(&bytes, false, server, server, origin_nonce, t1, t4, null);
+    try testing.expect(maybe_result != null);
+    _ = try maybe_result.?;
 }
 
 // ── golden: one real SNTP exchange, captured once ───────────────────────────
@@ -974,9 +1231,15 @@ const decode_seeds = [_][]const u8{
     // UnsynchronizedStratum: stratum 16.
     seed("241000000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000"),
     // Stratum 15, the top of the valid secondary-reference range: accepted.
-    seed("240F00000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000"),
+    // Both receive and transmit set non-zero (F3 added a receive check).
+    seed("240F00000000000000000000000000000000000000000000000000000000000000000001000000000000000100000000"),
     // TransmitTimestampUnset: everything else valid, transmit left all-zero.
     seed("240200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
+    // ReceiveTimestampUnset (audit finding F3): transmit set, receive left all-zero.
+    seed("240200000000000000000000000000000000000000000000000000000000000000000000000000000000000100000000"),
+    // UnsynchronizedLeap (audit finding F7): LI=3, receive+transmit both set
+    // so only the leap check is isolated.
+    seed("E40200000000000000000000000000000000000000000000000000000000000000000001000000000000000100000000"),
     // KissOfDeath with a registered code, which is what writes `kiss_out`.
     seed("240000000000000000000000524154450000000000000000000000000000000000000000000000000000000000000000"),
     // KissOfDeath with an unregistered code → `.unrecognized`, not an error.

@@ -33,15 +33,44 @@ intended field is VN), mode (`error.NotServerMode` if mode ≠ 4), stratum (`err
 stratum 0 — the parsed reason code and raw `reference_id` bytes are returned via the optional
 `kiss_out: ?*KissOfDeath` parameter, per RFC 5905 §7.4's registered Kiss Code table;
 `error.UnsynchronizedStratum` on stratum ≥ 16, per RFC 5905 §7.3 Figure 11 — 16 is "unsynchronized",
-17-255 "reserved"), and the Transmit Timestamp (`error.TransmitTimestampUnset` if all-zero, RFC 4330
-§5 sanity check 4) before any field is trusted. Out of scope: NTP authentication (the optional
-MAC/extension fields — longer packets are rejected as `error.InvalidLength`, not parsed),
-server-side responder, multi-server sampling/racing and best-sample selection, full NTP (RFC 5905)
-intersection/clustering/combining algorithms, leap-second handling beyond surfacing the raw
-`LeapIndicator` flag, the RFC 4330 §5 sanity checks that need context outside a single packet
-(matching the client's own request address/port/T1, and the "truly paranoid," explicitly-optional
-Root Delay/Root Dispersion bound). A caller needing tamper-resistant time sync (e.g. NTS) must layer
-that itself — this module is a single unauthenticated query/response.
+17-255 "reserved"), Leap Indicator (`error.UnsynchronizedLeap` if LI = 3 — RFC 4330 §4's own "alarm
+condition, clock not synchronized"; audit finding F7 — this used to be checked on the stratum field
+only, an inconsistency, not a deliberate leniency), and the Receive and Transmit timestamps
+(`error.ReceiveTimestampUnset` / `error.TransmitTimestampUnset` if either is all-zero, RFC 4330 §5
+sanity check 4 — audit finding F3 found only Transmit was checked, so a server reporting Receive = 0
+drove `query`'s offset to an unbounded, measured -63 years) before any field is trusted.
+
+`query` layers RFC 4330 §5's *other* sanity check on top of `decodeResponse` — matching the reply
+against the client's own outstanding request — and it is fully implemented, not out of scope: the
+reply must come from the same source address **and port** as `server` (or it's ignored and `query`
+keeps waiting, RFC 4330 §5), and must echo an anti-spoof origin nonce in its `originate` field or
+it's rejected as `error.OriginateMismatch`. The nonce isn't `query`'s literal T1 clock reading —
+audit finding F4 measured the clock-derived timestamp at only 21-24 bits of unpredictability against
+`verifyOriginate`'s claimed 64, so `query` sends the true send second with 32 CSPRNG bits (from
+`std.Io.randomSecure`, fail-closed — `error.EntropyUnavailable` rather than a weaker degraded seed)
+in place of the fraction, and uses the real clock reading (not the nonce) for the offset/delay math,
+so the substitution costs no accuracy. The receive-side guards (peer match, nonce echo, and a
+truncated-datagram check for audit finding F2 — the kernel silently hands back exactly 48 bytes for
+an oversized datagram too, distinguishable only via the receive call's truncation flag) live in
+`processReply`/`validateReply`, unit-tested directly without a socket (audit finding F1: `query`'s
+own receive loop held these guards in a form no test reached before).
+
+Reading the local clock can itself fail; `nowUnixNanos`/`nowTimestamp` fail closed with
+`error.ClockUnavailable` rather than the previous silent fallback to the Unix epoch (audit finding
+F11 — an untested path, but a fail-open default that would have produced a garbage T1/T4 with no
+signal to the caller).
+
+Out of scope: NTP authentication (the optional MAC/extension fields — longer packets are rejected as
+`error.InvalidLength`, not parsed), server-side responder, multi-server sampling/racing and
+best-sample selection, full NTP (RFC 5905) intersection/clustering/combining algorithms, leap-second
+handling beyond surfacing the raw `LeapIndicator` flag, and the "truly paranoid," explicitly-optional
+Root Delay/Root Dispersion bound. A caller needing tamper-resistant time sync (e.g. NTS) must layer
+that itself — this module is a single unauthenticated query/response, and its offset/delay should
+never by itself step a security-sensitive clock (TLS validity windows, TOTP, Kerberos, log
+ordering): a single unauthenticated UDP exchange, even with every check above passing, is not a
+substitute for authenticated time sync on a hostile network (audit finding F12 — this caveat existed
+only as half a sentence in this file before, not anywhere a caller reading the API would see it; see
+also README.md).
 
 **Known bound — NTP era 0 (expires 2036-02-07):** `Timestamp.seconds` is a bare `u32` count of
 seconds since 1900-01-01, with no era pivot. It wraps at 2^32 seconds, i.e. at **2036-02-07T06:28:16
@@ -51,6 +80,10 @@ era-0 one unless the caller supplies external era context. This is not fixed her
 documents the identical gap and calls its own era-disambiguation heuristic "a nearest-era guess, not
 a verified result"; no anchored implementation in the survey has actually solved it. Track this as a
 hard deprecation date for any deployment of this module, not a someday-maybe: revisit before 2036.
+**One of this module's own tests is a tripwire for that date, not just a comment** (audit finding
+F9): `nowTimestamp is in a sane modern range` asserts the live clock reads before
+2036-02-05T06:00:00Z, two days ahead of the actual rollover — so `zig build test-sntp` starts failing
+on its own, unattended, before the wrap, rather than waiting for someone to remember the date.
 
 ## Verification
 
@@ -58,10 +91,12 @@ Offline, no live server: golden request bytes (the `LI|VN|Mode` byte + T1 placem
 encode/decode round-trip, a canned server response (stratum/precision/timestamps/ref-id), the
 reject paths (length, version 0, mode, Kiss-o'-Death — including the parsed `KissCode`/`raw` surfaced
 via `kiss_out` for both a registered code and an unrecognized one, `parseKissCode` against every
-RFC 5905 §7.4 registered code, stratum ≥ 16, an all-zero Transmit Timestamp), NTP↔Unix epoch
-conversion at a known instant, fraction↔nanosecond round-trips, and offset/delay against
-hand-computed T1..T4 (including a negative offset). The live `query` test is gated behind
-`error.SkipZigTest`. Run: `zig build test-sntp`.
+RFC 5905 §7.4 registered code, stratum ≥ 16, Leap Indicator 3, an all-zero Receive Timestamp, an
+all-zero Transmit Timestamp), NTP↔Unix epoch conversion at a known instant, fraction↔nanosecond
+round-trips, offset/delay against hand-computed T1..T4 (including a negative offset), and
+`processReply`/`validateReply` (peer-address match, truncation, origin-nonce echo, and that the
+offset math uses the real T1 rather than the wire nonce) exercised directly, without a socket. The
+live `query` test is gated behind `error.SkipZigTest`. Run: `zig build test-sntp`.
 
 ## Backlog / deferred
 
