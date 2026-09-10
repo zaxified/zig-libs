@@ -63,6 +63,12 @@ pub const Event = struct {
     retry: ?u32 = null,
 };
 
+fn isAllDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (!std.ascii.isDigit(c)) return false;
+    return true;
+}
+
 /// A reusable field accumulator over one live `std.Io.Reader`. Does not
 /// own the reader.
 pub const Parser = struct {
@@ -71,6 +77,12 @@ pub const Parser = struct {
     event_buf: std.ArrayList(u8),
     id_buf: std.ArrayList(u8),
     data_buf: std.ArrayList(u8),
+    /// Whether the very first line of the stream has been through the
+    /// leading-BOM check yet (WHATWG: "the leading U+FEFF BYTE ORDER MARK
+    /// character, if any, must be skipped"; A1 F24). Checked once, on the
+    /// first line only — a BOM mid-stream is just three odd bytes on
+    /// whatever field starts with them, same as any other client.
+    checked_bom: bool = false,
     /// Cap on one group's joined `data:` payload (the `\n`-joined lines,
     /// terminator included); `error.DataTooLarge` past it, and the
     /// buffers are released so the failed group's memory does not stay
@@ -129,7 +141,21 @@ pub const Parser = struct {
                     error.StreamTooLong => return error.LineTooLong,
                     error.ReadFailed => return error.ReadFailed,
                 };
-                const line = std.mem.trimEnd(u8, raw_line, "\r\n");
+                // Strip exactly the one line terminator `takeDelimiterInclusive`
+                // matched — CRLF or bare LF, never more. The old
+                // `trimEnd(raw_line, "\r\n")` stripped every trailing byte in
+                // that set, so a value that itself ended in `\r` (legal:
+                // `takeDelimiterInclusive` only recognizes `\n`, so a line
+                // like `data: foo\r\r\n` is one raw line, not two) lost that
+                // `\r` along with the real terminator (A1 F24).
+                var line = if (raw_line.len >= 2 and raw_line[raw_line.len - 2] == '\r')
+                    raw_line[0 .. raw_line.len - 2]
+                else
+                    raw_line[0 .. raw_line.len - 1];
+                if (!p.checked_bom) {
+                    p.checked_bom = true;
+                    if (std.mem.startsWith(u8, line, "\xEF\xBB\xBF")) line = line[3..];
+                }
                 if (line.len == 0) break; // blank line: end of this group
 
                 saw_line = true;
@@ -159,7 +185,11 @@ pub const Parser = struct {
                         try p.id_buf.appendSlice(p.gpa, val);
                     }
                 } else if (std.mem.eql(u8, field, "retry")) {
-                    retry = std.fmt.parseInt(u32, val, 10) catch null;
+                    // Per spec the value must be all ASCII digits; anything
+                    // else (including a leading `+`/`-`, which
+                    // `std.fmt.parseInt` otherwise accepts) makes the whole
+                    // line ignored, not merely reinterpreted (A1 F24).
+                    retry = if (isAllDigits(val)) std.fmt.parseInt(u32, val, 10) catch null else null;
                 }
                 // Unknown fields are ignored per spec.
             }
@@ -284,6 +314,82 @@ test "Parser: clean close between groups returns null" {
     try testing.expectEqualStrings("one", e.data);
     try testing.expect((try p.next()) == null);
 }
+
+// ── regression: mutation-ladder gaps from A1 (F16, F17, F21, F24) ──────────
+
+test "Parser: only ONE leading space is stripped from a field value, not every leading space (A1 F16)" {
+    // Per spec: if the byte after the colon is U+0020 SPACE, remove it —
+    // exactly one, not a trim of the whole run. `M16` (strip-all) and today's
+    // code both pass on a single leading space; this is the case that tells
+    // them apart.
+    var reader: std.Io.Reader = .fixed("data:  two leading spaces\n\n");
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e = (try p.next()).?;
+    try testing.expectEqualStrings(" two leading spaces", e.data);
+}
+
+test "Parser: an id: line with an embedded NUL is dropped, not just truncated (A1 F17)" {
+    // Spec: a `\0` anywhere in the value invalidates the whole `id:` line —
+    // the group dispatches with no id, not a truncated one.
+    var reader: std.Io.Reader = .fixed("id: good\ndata: a\n\nid: bad\x00id\ndata: b\n\n");
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e1 = (try p.next()).?;
+    try testing.expectEqualStrings("good", e1.id.?);
+    const e2 = (try p.next()).?;
+    try testing.expect(e2.id == null);
+}
+
+test "Parser: a second event: line in one group replaces the first, it does not accumulate (A1 F21)" {
+    // `event_buf`/`id_buf` are `clearRetainingCapacity`d before each
+    // append, so a repeated field is last-wins, not concatenated — but
+    // nothing exercised a group with two `event:` lines before this.
+    var reader: std.Io.Reader = .fixed("event: first\nevent: second\ndata: x\n\n");
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e = (try p.next()).?;
+    try testing.expectEqualStrings("second", e.event.?);
+}
+
+test "Parser: retry: with a leading + is ignored, not parsed as a signed-looking int (A1 F24)" {
+    // WHATWG: the value must consist of only ASCII digits; `std.fmt.parseInt`
+    // alone accepts a leading `+`/`-`, which is laxer than spec.
+    var reader: std.Io.Reader = .fixed("retry: +3000\ndata: a\n\n");
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e = (try p.next()).?;
+    try testing.expect(e.retry == null);
+}
+
+test "Parser: a trailing CR that is part of the value survives, only the line terminator is stripped (A1 F24)" {
+    // `takeDelimiterInclusive('\n')` only recognizes `\n`, so a value ending
+    // in a literal `\r` followed by the real `\r\n` terminator is one raw
+    // line, not two: `trimEnd(raw_line, "\r\n")` used to strip both,
+    // swallowing a byte that belonged to the value.
+    var reader: std.Io.Reader = .fixed("data: foo\r\r\n\n");
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e = (try p.next()).?;
+    try testing.expectEqualStrings("foo\r", e.data);
+}
+
+test "Parser: a leading UTF-8 BOM on the stream's first line is skipped (A1 F24)" {
+    var reader: std.Io.Reader = .fixed("\xEF\xBB\xBFevent: message_start\ndata: a\n\n");
+    var p = Parser.init(&reader, testing.allocator);
+    defer p.deinit();
+    const e = (try p.next()).?;
+    try testing.expectEqualStrings("message_start", e.event.?);
+    try testing.expectEqualStrings("a", e.data);
+}
+
+// A `LineTooLong` (`error.StreamTooLong` from the reader) needs a streaming
+// reader whose internal buffer is smaller than the line but that still has
+// more bytes behind it — `.fixed` can't reproduce that (its "buffer" is the
+// whole slice, so an overlong line there is just `EndOfStream`). That case
+// (A1 F14: does it surface as a real error or get degraded to a silent `null`
+// end-of-stream?) is exercised end-to-end against a real loopback peer in
+// `Client.zig`'s test of the same name.
 
 // ── fuzz: untrusted SSE bytes never panic ───────────────────────────────────
 

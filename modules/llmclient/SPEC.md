@@ -50,6 +50,12 @@ and the pace at which it sends it; each of the four is bounded by a knob on `Cli
   (`sse_parse.Parser.max_data_bytes`). Each line is bounded by the reader (~4 KiB); the number of
   lines in a group was not, and 10 MB of legal lines made 2.4 GB live that stayed allocated after
   the error (A1 F3/F15). Past it, `error.ResponseTooLarge` and the buffers are freed.
+  **The effective per-line ceiling is 4088 bytes, not ~4 KiB** — it comes from `http`'s own
+  `body_scratch_len = 4096` (`http/src/Client.zig:1060`), which is not configurable and which this
+  module does not otherwise surface (A1 F13). A single SSE line past it is `error.LineTooLong`
+  from `sse_parse`, which `EventIterator.next` maps to `error.HttpFailed` — indistinguishable from
+  a dead connection (see F14 below) unless the caller already knows about this ceiling. Not a knob
+  on `Client`: raising it would require a change in `http`, not here.
 - `read_timeout_ms` (60 s) — the body read: the whole body for `create`, each `next()` for a stream.
   `http.Client.total_timeout_ms` covers connect + request + response HEAD and, by its own design,
   not the body; a peer trickling one byte a second held `create` 30 s against a 2 s total timeout
@@ -72,8 +78,19 @@ generic browser-grade parser; malformed/hostile SSE bytes resolve to typed error
 `std.Io` cancelation is the real cause, `error.HttpFailed` otherwise), not panics. Out of
 scope: OpenAI-compatible variant, retries/429 backoff (compose with `resilience` instead),
 token-counting endpoint, prompt-caching tooling beyond the plain `cache_control` field, files/
-vision content blocks, the Batch API, and connection reuse (each request opens a fresh connection
-via `http.Client`'s `Connection: close`, so a long chat session pays a new TLS handshake per turn).
+vision content blocks, and the Batch API.
+
+**Connection reuse is entirely the caller's call, not this module's (A1 F22, corrected 2026-09-10).**
+Two places in this module's docs (this file's own Out-of-scope line and the README's DEFER list)
+used to claim "`http.Client` opens a fresh connection per request (`Connection: close`)" — that was
+never true of the code: `requestHeaders()` sends no `Connection`
+header at all, and `http.Client.Options.pool.enabled` **defaults to `true`** (`http/src/Client.zig:152`).
+`Client.init` takes a caller-owned, caller-configured `*http.Client` ("share it with other
+subsystems freely" — see the design comment above) and has no lever of its own to force or forbid
+pooling on it — there is no per-request override in `http.RequestOptions`, only the transport-wide
+`Options.pool` the caller set when they built it. So whether two `create`/`stream` calls through
+the same `Client` reuse a TCP/TLS connection is whatever the caller's `http.Client` was configured
+to do (pooled by default), not a guarantee either way this module makes.
 
 ## Verification
 Tests span `root.zig`/`Client.zig`/`response.zig`/`sse_parse.zig`/`types.zig` (dark-aggregated
@@ -122,8 +139,8 @@ network call. Run: `zig build test-llmclient`.
 Per the module README's DEFER list: OpenAI-compatible variant (sketched only); retries/429 backoff
 (defer to `resilience`); `/v1/messages/count_tokens`; prompt-caching tooling beyond
 `cache_control`; files/vision content blocks and the Files API; the Batch API
-(`/v1/messages/batches`); connection pooling/keep-alive (follow-up once `http.Client` grows it);
-upstreaming `sse_parse` as `http.sse.ClientReader` once a second client-side-SSE consumer exists in
+(`/v1/messages/batches`); upstreaming `sse_parse` as `http.sse.ClientReader` once a second
+client-side-SSE consumer exists in
 this repo.
 
 ## Status

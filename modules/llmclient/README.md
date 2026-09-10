@@ -121,10 +121,6 @@ never followed.
   (breakpoint-placement helpers, cache-hit diagnostics).
 - Files/vision (image and document content blocks, the Files API).
 - Batch API (`/v1/messages/batches`).
-- Connection reuse — `http.Client` opens a fresh connection per request
-  (`Connection: close`); this client inherits that, so a long chat session
-  pays a new TLS handshake per turn. Follow-up once `http.Client` grows
-  keep-alive/pooling.
 - Upstreaming `sse_parse` as `http.sse.ClientReader` — it's fully generic
   SSE parsing with nothing Anthropic-specific in it, and belongs in `http`
   once a second consumer needs client-side SSE.

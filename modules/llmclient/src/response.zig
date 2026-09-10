@@ -616,6 +616,65 @@ test "parseStreamEvent: missing content_block on content_block_start is a Malfor
     );
 }
 
+// ── regression: mutation-ladder gaps from A1 (F18, F19) ─────────────────────
+//
+// Each guard below already existed in the code; none had a test that would
+// fail if the guard were deleted or weakened (the A1 mutational ladder
+// M25/M27/M29/M32/M33 all survived — the check ran, but nothing was
+// watching it run).
+
+test "parseMessage/parseStreamEvent: a non-object top-level JSON value is MalformedResponse, not a union-tag confusion (A1 F18, M25)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "[1,2,3]"));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "\"just a string\""));
+    try testing.expectError(error.MalformedResponse, parseStreamEvent(a, "42"));
+    try testing.expectError(error.MalformedResponse, parseMessage(a, "[1,2,3]"));
+}
+
+test "parseStreamEvent: an unrecognized delta type is MalformedResponse, not an empty text_delta (A1 F18, M27)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        error.MalformedResponse,
+        parseStreamEvent(arena.allocator(),
+            \\{"type":"content_block_delta","index":0,"delta":{"type":"some_future_delta"}}
+        ),
+    );
+}
+
+test "parseStreamEvent: message_start with no message object is a MalformedResponse error (A1 F18, M29)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectError(
+        error.MalformedResponse,
+        parseStreamEvent(arena.allocator(), "{\"type\":\"message_start\"}"),
+    );
+}
+
+test "parseMessage: role \"user\" parses to .user, not the .assistant fallback (A1 F19, M32)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"id":"m","model":"m","role":"user","content":[],
+        \\"usage":{"input_tokens":1,"output_tokens":1}}
+    ;
+    const msg = try parseMessage(arena.allocator(), body);
+    try testing.expectEqual(Role.user, msg.role);
+}
+
+test "parseMessage: a non-string JSON value on a string field is treated as empty, not stringified (A1 F19, M33)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const body =
+        \\{"id":123,"model":"m","role":"assistant","content":[],
+        \\"usage":{"input_tokens":1,"output_tokens":1}}
+    ;
+    const msg = try parseMessage(arena.allocator(), body);
+    try testing.expectEqualStrings("", msg.id);
+}
+
 // ── fuzz: untrusted JSON bytes never panic ──────────────────────────────────
 
 // `smith.slice`, not `bytes` + a ranged length (that pair always yields the

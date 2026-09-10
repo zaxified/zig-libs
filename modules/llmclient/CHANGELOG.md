@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking — the remaining 16 A1 findings (F6-F8,
+  F11-F14, F16-F24), all closed.** A stream event whose `event:` name disagrees with its
+  JSON `"type"` is now `error.MalformedResponse` (F6) instead of silently dispatching on
+  the JSON alone. `sse_parse` now requires `retry:` to be all-ASCII-digits per WHATWG
+  (a leading `+`/`-` used to slip through `std.fmt.parseInt`), strips exactly the one
+  line terminator instead of trimming every trailing `\r`/`\n` (which used to eat a
+  legitimate trailing `\r` that belonged to a field value), and skips a leading UTF-8 BOM
+  on the stream's first line (F24). `messagesUrl` (an oversized `base_url`) now returns
+  a new error `error.BaseUrlTooLong` instead of reusing `error.MalformedResponse` — a
+  caller configuration mistake no longer looks like a wire failure (F23). Docs corrected,
+  not code: `SPEC.md`/`README.md` no longer claim `http.Client` opens "a fresh connection
+  per request (`Connection: close`)" — that was never true (`http.Client.Options.pool`
+  defaults to enabled and this module has no per-request lever over a caller-owned,
+  shared transport) (F22); `SPEC.md` now documents the ~4088-byte SSE line ceiling that
+  `http`'s own internal buffer imposes, previously unstated anywhere in this module (F13).
+  The other twelve findings (F7, F8, F11, F12, F14, F16-F21) needed no code change — each
+  guard already existed (several as a side effect of the entry below) but had no test that
+  would fail if the guard were deleted or weakened; 19 new regression tests close that gap,
+  each verified against the audit's own mutation. `scripts/modtest llmclient`: 32 → 51 pass
+  (+1 unconditionally-skipped live test, unchanged).
+
 - **2026-09-06** — **The key stays at `base_url`, the wire's numbers are checked, and
   what the peer sends is bounded in the quantity that costs.** The five HIGH findings
   of the A1 audit (2026-09-06), plus F9/F10/F15.

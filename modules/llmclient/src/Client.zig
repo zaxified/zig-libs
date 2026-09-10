@@ -78,6 +78,12 @@ pub const Error = error{
     /// so a caller can tell "the peer sent too much" from "the connection
     /// died".
     ResponseTooLarge,
+    /// `base_url` plus `/v1/messages` doesn't fit the 256-byte URL buffer.
+    /// A caller configuration mistake, not anything the peer sent — kept
+    /// distinct from `MalformedResponse` (whose name and doc comment are
+    /// both about the wire) so a caller can't confuse "my base_url is too
+    /// long" with "the server sent garbage" (A1 F23).
+    BaseUrlTooLong,
 };
 
 pub fn init(http_client: *http.Client, api_key: []const u8) Client {
@@ -106,8 +112,8 @@ fn requestHeaders(c: *const Client) [3]http.Header {
     };
 }
 
-fn messagesUrl(base_url: []const u8, buf: []u8) error{MalformedResponse}![]const u8 {
-    return std.fmt.bufPrint(buf, "{s}/v1/messages", .{base_url}) catch return error.MalformedResponse;
+fn messagesUrl(base_url: []const u8, buf: []u8) error{BaseUrlTooLong}![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/v1/messages", .{base_url}) catch return error.BaseUrlTooLong;
 }
 
 fn mapHttpError(err: http.Client.Error) Error {
@@ -465,7 +471,7 @@ pub const EventIterator = struct {
             // not keep the peer's bytes with it (A1 F15).
             const a = it.arena.allocator();
             var bounded: BoundedAllocator = .{ .child = a, .limit = it.max_parsed_bytes };
-            return response.parseStreamEvent(bounded.allocator(), ev.data) catch |err| switch (err) {
+            const parsed = response.parseStreamEvent(bounded.allocator(), ev.data) catch |err| switch (err) {
                 error.OutOfMemory => {
                     if (!bounded.exceeded) return error.OutOfMemory;
                     _ = it.arena.reset(.free_all);
@@ -474,6 +480,17 @@ pub const EventIterator = struct {
                 },
                 error.MalformedResponse => return error.MalformedResponse,
             };
+            // The SSE `event:` field name and the JSON payload's own
+            // `"type"` are two independently-parsed statements of the same
+            // fact; Anthropic keeps them consistent, but nothing checked
+            // that until now (A1 F6). `StreamEvent`'s variant names are
+            // exactly the API's `type`/`event:` strings, so the active tag
+            // name IS the expected `event:` value.
+            if (ev.event) |name| {
+                if (!std.mem.eql(u8, name, @tagName(std.meta.activeTag(parsed))))
+                    return error.MalformedResponse;
+            }
+            return parsed;
         }
     }
 
@@ -668,6 +685,15 @@ const Script = union(enum) {
     big_group: struct { lines: usize, width: usize },
     /// A 500 with a body of `n` bytes.
     long_error: usize,
+    /// A 200 `text/event-stream` body, sent byte-exact (A1 F6, F14).
+    sse_raw: []const u8,
+    /// A 200 `application/json` body, sent byte-exact (A1 F8: an exact
+    /// wire-byte-count boundary needs a body of a known exact length,
+    /// which `many_blocks`' computed length doesn't give a test for free).
+    blob: []const u8,
+    /// An arbitrary status line + body (A1 F7: the exact `300` boundary,
+    /// which `redirect`'s hardcoded `307` doesn't exercise).
+    status: struct { code: u16, body: []const u8 },
 };
 
 const FakePeer = struct {
@@ -676,6 +702,13 @@ const FakePeer = struct {
     scripts: []const Script,
     stop: std.atomic.Value(u32) = .init(0),
     accepted: usize = 0,
+    /// The most recent request body this peer received, captured for
+    /// assertions (A1 F11: did the client actually force `stream` on the
+    /// wire, or just in the type it handed to the caller?). Overwritten
+    /// per accepted connection; read it right after the call whose body
+    /// you want.
+    last_body_buf: [8192]u8 = undefined,
+    last_body_len: usize = 0,
 
     fn run(p: *FakePeer) void {
         for (p.scripts) |script| {
@@ -690,8 +723,17 @@ const FakePeer = struct {
             if (p.stop.load(.acquire) != 0) continue; // `finish` unparking us
             const head = http.h1.readHead(&sr.interface, &head_buf) catch continue;
             const req = http.h1.RequestHead.parse(head) catch continue;
-            // Drain the request body so the client's write never blocks.
-            if (req.content_length) |n| sr.interface.discardAll(@intCast(n)) catch continue;
+            // Capture the body (up to the capture buffer's size) so a test
+            // can assert what actually went out on the wire, then drain
+            // whatever's left so the client's write never blocks.
+            p.last_body_len = 0;
+            if (req.content_length) |raw_n| {
+                const n: usize = @intCast(raw_n);
+                const take = @min(n, p.last_body_buf.len);
+                sr.interface.readSliceAll(p.last_body_buf[0..take]) catch continue;
+                p.last_body_len = take;
+                if (n > take) sr.interface.discardAll(n - take) catch continue;
+            }
             const w = &sw.interface;
             // A failed write ends THIS script (the client hung up), not the
             // peer: the next script's accept must still happen.
@@ -741,6 +783,18 @@ const FakePeer = struct {
                 .long_error => |n| {
                     w.print("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{n}) catch break :script;
                     w.splatByteAll('e', n) catch break :script;
+                    w.flush() catch break :script;
+                },
+                .sse_raw => |body| {
+                    w.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break :script;
+                    w.flush() catch break :script;
+                },
+                .blob => |body| {
+                    w.print("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch break :script;
+                    w.flush() catch break :script;
+                },
+                .status => |st| {
+                    w.print("HTTP/1.1 {d} test\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ st.code, st.body.len, st.body }) catch break :script;
                     w.flush() catch break :script;
                 },
             }
@@ -890,6 +944,129 @@ test "Client.stream: a non-2xx body longer than the scratch is kept truncated in
     const body = c.lastErrorBody().?;
     try testing.expectEqual(@as(usize, error_scratch_len), body.len);
     try testing.expect(std.mem.allEqual(u8, body, 'e'));
+}
+
+// ── regression: mutation-ladder gaps from A1 (F6, F7, F8, F11, F14, F23) ────
+
+test "messagesUrl: a base_url that doesn't fit the buffer is BaseUrlTooLong, distinct from MalformedResponse (A1 F23)" {
+    var buf: [16]u8 = undefined; // too small for any real URL + "/v1/messages"
+    try testing.expectError(error.BaseUrlTooLong, messagesUrl("https://api.anthropic.com", &buf));
+    var big_buf: [256]u8 = undefined;
+    const url = try messagesUrl("https://api.anthropic.com", &big_buf);
+    try testing.expectEqualStrings("https://api.anthropic.com/v1/messages", url);
+}
+
+test "EventIterator.next: event: name inconsistent with the JSON \"type\" is MalformedResponse (A1 F6)" {
+    // `event: message_stop` announcing one thing, the payload's own `"type"`
+    // dispatching to another — before this check `EventIterator.next` read
+    // `.data` only and never looked at `.event` at all.
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .sse_raw = "event: message_stop\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"INJECTED\"}}\n" ++
+        "\n" }});
+    defer lb.finish();
+    var c = try lb.client();
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    try testing.expectError(error.MalformedResponse, it.next());
+}
+
+test "EventIterator.next: a consistent event: / type pair still parses (positive control for A1 F6)" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .sse_raw = "event: content_block_stop\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n" ++
+        "\n" }});
+    defer lb.finish();
+    var c = try lb.client();
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    const ev = (try it.next()).?;
+    try testing.expectEqual(@as(u32, 0), ev.content_block_stop.index);
+}
+
+test "EventIterator.next: an event with no event: field at all still parses (A1 F6 does not require the field)" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .sse_raw = "data: {\"type\":\"ping\"}\n\n" }});
+    defer lb.finish();
+    var c = try lb.client();
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    try testing.expect((try it.next()).? == .ping);
+}
+
+test "Client.create: status exactly 300 is UnexpectedStatus, the >= 300 boundary itself, not >= 301 (A1 F7)" {
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .status = .{ .code = 300, .body = "boundary" } }});
+    defer lb.finish();
+    var c = try lb.client();
+    try testing.expectError(error.UnexpectedStatus, c.create(testing.allocator, canned_request));
+    try testing.expectEqualStrings("boundary", c.lastErrorBody().?);
+}
+
+test "Client.create: max_response_bytes is enforced at the exact wire byte count, off by one either way (A1 F8)" {
+    // A minimal valid Message body of known exact length `L`. `http`'s own
+    // `readAllAlloc(a, max)` requires `max > L` to succeed (measured: `max
+    // == L` is already `error.BodyTooLarge`), so the tight pair is `max ==
+    // L` (must refuse) / `max == L + 1` (must succeed) — one byte apart.
+    // `max_response_bytes` is forwarded to it unmodified; this single pair
+    // catches M04 (cap removed), M05 (1024x looser) and M06 (a one-byte
+    // shift in what gets forwarded) all at once: under any of the three,
+    // `max == L` would wrongly succeed.
+    const min_msg = "{\"id\":\"m\",\"model\":\"m\",\"role\":\"assistant\",\"content\":[]," ++
+        "\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}";
+    var lb: Loopback = undefined;
+    try lb.start(&.{ .{ .blob = min_msg }, .{ .blob = min_msg } });
+    defer lb.finish();
+    var c = try lb.client();
+
+    c.max_response_bytes = min_msg.len;
+    try testing.expectError(error.ResponseTooLarge, c.create(testing.allocator, canned_request));
+
+    c.max_response_bytes = min_msg.len + 1;
+    var parsed = try c.create(testing.allocator, canned_request);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("m", parsed.value.id);
+}
+
+test "Client.create / Client.stream: stream is forced on the wire regardless of what the caller set it to (A1 F11)" {
+    // `req.stream` set the "wrong" way on purpose for both calls; `create`
+    // must still send `\"stream\":false` and `stream()` must still send
+    // `\"stream\":true` — verified against the actual captured request
+    // body, not the in-process struct `create`/`stream` build internally.
+    var lb: Loopback = undefined;
+    try lb.start(&.{ .{ .many_blocks = 1 }, .{ .sse_raw = "data: {\"type\":\"ping\"}\n\n" } });
+    defer lb.finish();
+    var c = try lb.client();
+
+    var wrong_stream_true = canned_request;
+    wrong_stream_true.stream = true;
+    var parsed = try c.create(testing.allocator, wrong_stream_true);
+    defer parsed.deinit();
+    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":true") == null);
+
+    var wrong_stream_false = canned_request;
+    wrong_stream_false.stream = false;
+    var it = try c.stream(testing.allocator, wrong_stream_false);
+    defer it.deinit();
+    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, lb.peer.last_body_buf[0..lb.peer.last_body_len], "\"stream\":false") == null);
+}
+
+test "EventIterator.next: a LineTooLong is a real error (HttpFailed), never a silent end of stream (A1 F14)" {
+    // One SSE line past the ~4088-byte ceiling `http`'s own scratch buffer
+    // imposes (A1 F13) — the only wire bound this module's SSE path has by
+    // construction, not a knob. `mapParserError` maps it to `HttpFailed`;
+    // the mutation this guards against (M21) makes that branch return
+    // `null` instead, which `it.next()` would report as an ordinary clean
+    // end of stream with zero events — indistinguishable from success.
+    var lb: Loopback = undefined;
+    try lb.start(&.{.{ .big_group = .{ .lines = 1, .width = 4200 } }});
+    defer lb.finish();
+    var c = try lb.client();
+    var it = try c.stream(testing.allocator, canned_request);
+    defer it.deinit();
+    try testing.expectError(error.HttpFailed, it.next());
 }
 
 test "BoundedAllocator: refuses past the limit, credits frees back, and flags the refusal" {
