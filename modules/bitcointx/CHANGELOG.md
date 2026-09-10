@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NEW, additive:** `legacy.sighashForSigning` — same algorithm as
+  `legacy.sighash`, for a SIGNER rather than a verifier: returns
+  `error.SighashSingleBugNoCorrespondingOutput` instead of the SIGHASH_SINGLE bug's fixed
+  constant (`sighash_single_bug`), which is not a sound signature target (wave-2 audit finding
+  S1). `sighash` itself, `LegacyError`, and every existing caller are unchanged. **NO
+  CONSUMER-VISIBLE CHANGE beyond the new symbol:** also fixed a dangling-pointer bug in the
+  test-only helper `oneInOneOutTx` (found while testing this — it returned slices into its own
+  stack frame), not itself an audit finding.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `bip341.commonSigMsg`/`commonSigMsgWith` now
   reject `CommonOptions` where `spend_type`'s annex bit and `annex_hash != null` disagree
   (new `Bip341Error.SpendTypeAnnexMismatch`, additive to the error set) — previously this
