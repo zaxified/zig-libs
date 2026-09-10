@@ -344,7 +344,19 @@ fn encodeArray(e: *encoding.Encoder, comptime T: type, items: ?[]const T, compti
     for (arr) |item| try encodeItem(e, item);
 }
 
-fn decodeArray(d: *encoding.Decoder, comptime T: type, comptime decodeItem: fn (*encoding.Decoder) encoding.DecodeError!T) encoding.DecodeError!?[]T {
+/// A `freeItem` that matches a value type owning no memory of its own.
+fn noFreeItem(comptime T: type) fn (std.mem.Allocator, T) void {
+    return struct {
+        fn f(_: std.mem.Allocator, _: T) void {}
+    }.f;
+}
+
+fn decodeArray(
+    d: *encoding.Decoder,
+    comptime T: type,
+    comptime decodeItem: fn (*encoding.Decoder) encoding.DecodeError!T,
+    comptime freeItem: fn (std.mem.Allocator, T) void,
+) encoding.DecodeError!?[]T {
     const len = try d.reader.takeInt(i32, .little);
     if (len == -1) return null;
     if (len < -1) return error.BadLength;
@@ -356,7 +368,15 @@ fn decodeArray(d: *encoding.Decoder, comptime T: type, comptime decodeItem: fn (
     // fails on `EndOfStream` reading the first missing element (exactly as
     // `encoding.decodeString` fails on `take`) long before the list grows.
     var list: std.ArrayList(T) = .empty;
-    errdefer list.deinit(d.allocator);
+    errdefer {
+        // A truncated array must not leak the elements already decoded — on
+        // the server's arena this is invisible (the whole arena is freed at
+        // once), but a client using a general-purpose allocator leaks every
+        // element a short read had already produced. `list.deinit` alone
+        // only frees the backing array, never what its elements own.
+        for (list.items) |it| freeItem(d.allocator, it);
+        list.deinit(d.allocator);
+    }
     for (0..n) |_| try list.append(d.allocator, try decodeItem(d));
     return try list.toOwnedSlice(d.allocator);
 }
@@ -370,6 +390,27 @@ fn decodeStringItem(d: *encoding.Decoder) encoding.DecodeError!?[]const u8 {
 
 fn freeOptStr(a: std.mem.Allocator, s: ?[]const u8) void {
     if (s) |bytes| a.free(bytes);
+}
+
+test "decodeArray frees already-decoded elements when the array is truncated (C4)" {
+    // Wire bytes, hand-built: Int32 count = 3, two well-formed strings, then
+    // nothing at all — the third element's own length prefix is missing.
+    // `testing.allocator` panics the test on any leak still held at deinit,
+    // so no extra bookkeeping is needed here: before the fix, `decodeArray`'s
+    // `errdefer list.deinit(...)` freed the backing array but never
+    // "first"/"second" themselves, and this test failed with "memory leaked".
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(i32, 3, .little);
+    try w.writeInt(i32, 5, .little);
+    try w.writeAll("first");
+    try w.writeInt(i32, 6, .little);
+    try w.writeAll("second");
+    // (no third element)
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = encoding.Decoder.init(&r, testing.allocator);
+    try testing.expectError(error.EndOfStream, decodeArray(&d, ?[]const u8, decodeStringItem, freeOptStr));
 }
 
 /// Skip one Int32-length-prefixed String/ByteString without allocating,
@@ -485,7 +526,7 @@ pub fn decodeResponseHeader(d: *encoding.Decoder) encoding.DecodeError!ResponseH
         .request_handle = try d.decodeUInt32(),
         .service_result = try d.decodeStatusCode(),
         .service_diagnostics = try d.decodeDiagnosticInfo(),
-        .string_table = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .string_table = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
         .additional_header = try d.decodeExtensionObject(),
     };
 }
@@ -531,7 +572,7 @@ pub fn decodeApplicationDescription(d: *encoding.Decoder) encoding.DecodeError!A
         .application_type = try decodeEnum(d, ApplicationType),
         .gateway_server_uri = try d.decodeString(),
         .discovery_profile_uri = try d.decodeString(),
-        .discovery_urls = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .discovery_urls = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
     };
 }
 
@@ -587,12 +628,14 @@ pub fn freeSignedSoftwareCertificateArray(a: std.mem.Allocator, arr: ?[]const Si
     freeSoftwareCertArray(a, arr);
 }
 
+fn freeSignedSoftwareCertificate(a: std.mem.Allocator, c: SignedSoftwareCertificate) void {
+    freeOptStr(a, c.certificate_data);
+    freeOptStr(a, c.signature);
+}
+
 fn freeSoftwareCertArray(a: std.mem.Allocator, arr: ?[]const SignedSoftwareCertificate) void {
     if (arr) |items| {
-        for (items) |c| {
-            freeOptStr(a, c.certificate_data);
-            freeOptStr(a, c.signature);
-        }
+        for (items) |c| freeSignedSoftwareCertificate(a, c);
         a.free(items);
     }
 }
@@ -668,7 +711,7 @@ pub fn decodeEndpointDescription(d: *encoding.Decoder) encoding.DecodeError!Endp
         .server_certificate = try d.decodeByteString(),
         .security_mode = try decodeEnum(d, MessageSecurityMode),
         .security_policy_uri = try d.decodeString(),
-        .user_identity_tokens = try decodeArray(d, UserTokenPolicy, decodeUserTokenPolicy),
+        .user_identity_tokens = try decodeArray(d, UserTokenPolicy, decodeUserTokenPolicy, freeUserTokenPolicy),
         .transport_profile_uri = try d.decodeString(),
         .security_level = try d.decodeByte(),
     };
@@ -917,8 +960,8 @@ pub fn decodeCreateSessionResponse(d: *encoding.Decoder) encoding.DecodeError!Cr
         .revised_session_timeout = try d.decodeDouble(),
         .server_nonce = try d.decodeByteString(),
         .server_certificate = try d.decodeByteString(),
-        .server_endpoints = try decodeArray(d, EndpointDescription, decodeEndpointDescription),
-        .server_software_certificates = try decodeArray(d, SignedSoftwareCertificate, decodeSignedSoftwareCertificate),
+        .server_endpoints = try decodeArray(d, EndpointDescription, decodeEndpointDescription, freeEndpointDescription),
+        .server_software_certificates = try decodeArray(d, SignedSoftwareCertificate, decodeSignedSoftwareCertificate, freeSignedSoftwareCertificate),
         .server_signature = try decodeSignatureData(d),
         .max_request_message_size = try d.decodeUInt32(),
     };
@@ -957,8 +1000,8 @@ pub fn decodeActivateSessionRequest(d: *encoding.Decoder) encoding.DecodeError!A
     return .{
         .request_header = try decodeRequestHeader(d),
         .client_signature = try decodeSignatureData(d),
-        .client_software_certificates = try decodeArray(d, SignedSoftwareCertificate, decodeSignedSoftwareCertificate),
-        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .client_software_certificates = try decodeArray(d, SignedSoftwareCertificate, decodeSignedSoftwareCertificate, freeSignedSoftwareCertificate),
+        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
         .user_identity_token = try d.decodeExtensionObject(),
         .user_token_signature = try decodeSignatureData(d),
     };
@@ -991,8 +1034,8 @@ pub fn decodeActivateSessionResponse(d: *encoding.Decoder) encoding.DecodeError!
     return .{
         .response_header = try decodeResponseHeader(d),
         .server_nonce = try d.decodeByteString(),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1126,7 +1169,7 @@ pub fn decodeReadRequest(d: *encoding.Decoder) encoding.DecodeError!ReadRequest 
         .request_header = try decodeRequestHeader(d),
         .max_age = try d.decodeDouble(),
         .timestamps_to_return = try decodeEnum(d, TimestampsToReturn),
-        .nodes_to_read = try decodeArray(d, ReadValueId, decodeReadValueId),
+        .nodes_to_read = try decodeArray(d, ReadValueId, decodeReadValueId, freeReadValueId),
     };
 }
 
@@ -1150,8 +1193,8 @@ pub fn encodeReadResponse(e: *encoding.Encoder, v: ReadResponse) encoding.Encode
 pub fn decodeReadResponse(d: *encoding.Decoder) encoding.DecodeError!ReadResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, encoding.DataValue, encoding.Decoder.decodeDataValue),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.DataValue, encoding.Decoder.decodeDataValue, encoding.freeDataValue),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1213,7 +1256,7 @@ pub fn encodeWriteRequest(e: *encoding.Encoder, v: WriteRequest) encoding.Encode
 pub fn decodeWriteRequest(d: *encoding.Decoder) encoding.DecodeError!WriteRequest {
     return .{
         .request_header = try decodeRequestHeader(d),
-        .nodes_to_write = try decodeArray(d, WriteValue, decodeWriteValue),
+        .nodes_to_write = try decodeArray(d, WriteValue, decodeWriteValue, freeWriteValue),
     };
 }
 
@@ -1237,8 +1280,8 @@ pub fn encodeWriteResponse(e: *encoding.Encoder, v: WriteResponse) encoding.Enco
 pub fn decodeWriteResponse(d: *encoding.Decoder) encoding.DecodeError!WriteResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1337,7 +1380,7 @@ pub fn decodeBrowseRequest(d: *encoding.Decoder) encoding.DecodeError!BrowseRequ
         .request_header = try decodeRequestHeader(d),
         .view = try decodeViewDescription(d),
         .requested_max_references_per_node = try d.decodeUInt32(),
-        .nodes_to_browse = try decodeArray(d, BrowseDescription, decodeBrowseDescription),
+        .nodes_to_browse = try decodeArray(d, BrowseDescription, decodeBrowseDescription, freeBrowseDescription),
     };
 }
 
@@ -1403,7 +1446,7 @@ pub fn decodeBrowseResult(d: *encoding.Decoder) encoding.DecodeError!BrowseResul
     return .{
         .status_code = try d.decodeStatusCode(),
         .continuation_point = try d.decodeByteString(),
-        .references = try decodeArray(d, ReferenceDescription, decodeReferenceDescription),
+        .references = try decodeArray(d, ReferenceDescription, decodeReferenceDescription, freeReferenceDescription),
     };
 }
 
@@ -1437,8 +1480,8 @@ pub fn encodeBrowseResponse(e: *encoding.Encoder, v: BrowseResponse) encoding.En
 pub fn decodeBrowseResponse(d: *encoding.Decoder) encoding.DecodeError!BrowseResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, BrowseResult, decodeBrowseResult),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, BrowseResult, decodeBrowseResult, freeBrowseResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1464,7 +1507,7 @@ pub fn decodeBrowseNextRequest(d: *encoding.Decoder) encoding.DecodeError!Browse
     return .{
         .request_header = try decodeRequestHeader(d),
         .release_continuation_points = try d.decodeBoolean(),
-        .continuation_points = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .continuation_points = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
     };
 }
 
@@ -1493,8 +1536,8 @@ pub fn encodeBrowseNextResponse(e: *encoding.Encoder, v: BrowseNextResponse) enc
 pub fn decodeBrowseNextResponse(d: *encoding.Decoder) encoding.DecodeError!BrowseNextResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, BrowseResult, decodeBrowseResult),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, BrowseResult, decodeBrowseResult, freeBrowseResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1527,7 +1570,7 @@ pub fn decodeCallMethodRequest(d: *encoding.Decoder) encoding.DecodeError!CallMe
     return .{
         .object_id = try d.decodeNodeId(),
         .method_id = try d.decodeNodeId(),
-        .input_arguments = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant),
+        .input_arguments = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant, encoding.freeVariant),
     };
 }
 
@@ -1557,7 +1600,7 @@ pub fn encodeCallRequest(e: *encoding.Encoder, v: CallRequest) encoding.EncodeEr
 pub fn decodeCallRequest(d: *encoding.Decoder) encoding.DecodeError!CallRequest {
     return .{
         .request_header = try decodeRequestHeader(d),
-        .methods_to_call = try decodeArray(d, CallMethodRequest, decodeCallMethodRequest),
+        .methods_to_call = try decodeArray(d, CallMethodRequest, decodeCallMethodRequest, freeCallMethodRequest),
     };
 }
 
@@ -1583,9 +1626,9 @@ pub fn encodeCallMethodResult(e: *encoding.Encoder, v: CallMethodResult) encodin
 pub fn decodeCallMethodResult(d: *encoding.Decoder) encoding.DecodeError!CallMethodResult {
     return .{
         .status_code = try d.decodeStatusCode(),
-        .input_argument_results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .input_argument_diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
-        .output_arguments = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant),
+        .input_argument_results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .input_argument_diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
+        .output_arguments = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant, encoding.freeVariant),
     };
 }
 
@@ -1617,8 +1660,8 @@ pub fn encodeCallResponse(e: *encoding.Encoder, v: CallResponse) encoding.Encode
 pub fn decodeCallResponse(d: *encoding.Decoder) encoding.DecodeError!CallResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, CallMethodResult, decodeCallMethodResult),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, CallMethodResult, decodeCallMethodResult, freeCallMethodResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1800,7 +1843,7 @@ pub fn decodeSetPublishingModeRequest(d: *encoding.Decoder) encoding.DecodeError
     return .{
         .request_header = try decodeRequestHeader(d),
         .publishing_enabled = try d.decodeBoolean(),
-        .subscription_ids = try decodeArray(d, u32, decodeU32Item),
+        .subscription_ids = try decodeArray(d, u32, decodeU32Item, noFreeItem(u32)),
     };
 }
 
@@ -1824,8 +1867,8 @@ pub fn encodeSetPublishingModeResponse(e: *encoding.Encoder, v: SetPublishingMod
 pub fn decodeSetPublishingModeResponse(d: *encoding.Decoder) encoding.DecodeError!SetPublishingModeResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -1850,7 +1893,7 @@ pub fn encodeDeleteSubscriptionsRequest(e: *encoding.Encoder, v: DeleteSubscript
 pub fn decodeDeleteSubscriptionsRequest(d: *encoding.Decoder) encoding.DecodeError!DeleteSubscriptionsRequest {
     return .{
         .request_header = try decodeRequestHeader(d),
-        .subscription_ids = try decodeArray(d, u32, decodeU32Item),
+        .subscription_ids = try decodeArray(d, u32, decodeU32Item, noFreeItem(u32)),
     };
 }
 
@@ -1874,8 +1917,8 @@ pub fn encodeDeleteSubscriptionsResponse(e: *encoding.Encoder, v: DeleteSubscrip
 pub fn decodeDeleteSubscriptionsResponse(d: *encoding.Decoder) encoding.DecodeError!DeleteSubscriptionsResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2018,7 +2061,7 @@ pub fn decodeCreateMonitoredItemsRequest(d: *encoding.Decoder) encoding.DecodeEr
         .request_header = try decodeRequestHeader(d),
         .subscription_id = try d.decodeUInt32(),
         .timestamps_to_return = try decodeEnum(d, TimestampsToReturn),
-        .items_to_create = try decodeArray(d, MonitoredItemCreateRequest, decodeMonitoredItemCreateRequest),
+        .items_to_create = try decodeArray(d, MonitoredItemCreateRequest, decodeMonitoredItemCreateRequest, freeMonitoredItemCreateRequest),
     };
 }
 
@@ -2042,8 +2085,8 @@ pub fn encodeCreateMonitoredItemsResponse(e: *encoding.Encoder, v: CreateMonitor
 pub fn decodeCreateMonitoredItemsResponse(d: *encoding.Decoder) encoding.DecodeError!CreateMonitoredItemsResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, MonitoredItemCreateResult, decodeMonitoredItemCreateResult),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, MonitoredItemCreateResult, decodeMonitoredItemCreateResult, freeMonitoredItemCreateResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2071,7 +2114,7 @@ pub fn decodeDeleteMonitoredItemsRequest(d: *encoding.Decoder) encoding.DecodeEr
     return .{
         .request_header = try decodeRequestHeader(d),
         .subscription_id = try d.decodeUInt32(),
-        .monitored_item_ids = try decodeArray(d, u32, decodeU32Item),
+        .monitored_item_ids = try decodeArray(d, u32, decodeU32Item, noFreeItem(u32)),
     };
 }
 
@@ -2095,8 +2138,8 @@ pub fn encodeDeleteMonitoredItemsResponse(e: *encoding.Encoder, v: DeleteMonitor
 pub fn decodeDeleteMonitoredItemsResponse(d: *encoding.Decoder) encoding.DecodeError!DeleteMonitoredItemsResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2157,8 +2200,8 @@ pub fn encodeDataChangeNotification(e: *encoding.Encoder, v: DataChangeNotificat
 
 pub fn decodeDataChangeNotification(d: *encoding.Decoder) encoding.DecodeError!DataChangeNotification {
     return .{
-        .monitored_items = try decodeArray(d, MonitoredItemNotification, decodeMonitoredItemNotification),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .monitored_items = try decodeArray(d, MonitoredItemNotification, decodeMonitoredItemNotification, freeMonitoredItemNotification),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2207,7 +2250,7 @@ pub fn encodeEventFieldList(e: *encoding.Encoder, v: EventFieldList) encoding.En
 pub fn decodeEventFieldList(d: *encoding.Decoder) encoding.DecodeError!EventFieldList {
     return .{
         .client_handle = try d.decodeUInt32(),
-        .event_fields = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant),
+        .event_fields = try decodeArray(d, encoding.Variant, encoding.Decoder.decodeVariant, encoding.freeVariant),
     };
 }
 
@@ -2231,7 +2274,7 @@ pub fn encodeEventNotificationList(e: *encoding.Encoder, v: EventNotificationLis
 }
 
 pub fn decodeEventNotificationList(d: *encoding.Decoder) encoding.DecodeError!EventNotificationList {
-    return .{ .events = try decodeArray(d, EventFieldList, decodeEventFieldList) };
+    return .{ .events = try decodeArray(d, EventFieldList, decodeEventFieldList, freeEventFieldList) };
 }
 
 pub fn freeEventNotificationList(a: std.mem.Allocator, v: EventNotificationList) void {
@@ -2254,7 +2297,7 @@ pub fn decodeNotificationMessage(d: *encoding.Decoder) encoding.DecodeError!Noti
     return .{
         .sequence_number = try d.decodeUInt32(),
         .publish_time = try d.decodeDateTime(),
-        .notification_data = try decodeArray(d, encoding.ExtensionObject, encoding.Decoder.decodeExtensionObject),
+        .notification_data = try decodeArray(d, encoding.ExtensionObject, encoding.Decoder.decodeExtensionObject, encoding.freeExtensionObject),
     };
 }
 
@@ -2313,7 +2356,7 @@ pub fn encodePublishRequest(e: *encoding.Encoder, v: PublishRequest) encoding.En
 pub fn decodePublishRequest(d: *encoding.Decoder) encoding.DecodeError!PublishRequest {
     return .{
         .request_header = try decodeRequestHeader(d),
-        .subscription_acknowledgements = try decodeArray(d, SubscriptionAcknowledgement, decodeSubscriptionAcknowledgement),
+        .subscription_acknowledgements = try decodeArray(d, SubscriptionAcknowledgement, decodeSubscriptionAcknowledgement, noFreeItem(SubscriptionAcknowledgement)),
     };
 }
 
@@ -2346,11 +2389,11 @@ pub fn decodePublishResponse(d: *encoding.Decoder) encoding.DecodeError!PublishR
     return .{
         .response_header = try decodeResponseHeader(d),
         .subscription_id = try d.decodeUInt32(),
-        .available_sequence_numbers = try decodeArray(d, u32, decodeU32Item),
+        .available_sequence_numbers = try decodeArray(d, u32, decodeU32Item, noFreeItem(u32)),
         .more_notifications = try d.decodeBoolean(),
         .notification_message = try decodeNotificationMessage(d),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2433,8 +2476,8 @@ pub fn decodeGetEndpointsRequest(d: *encoding.Decoder) encoding.DecodeError!GetE
     return .{
         .request_header = try decodeRequestHeader(d),
         .endpoint_url = try d.decodeString(),
-        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem),
-        .profile_uris = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
+        .profile_uris = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
     };
 }
 
@@ -2458,7 +2501,7 @@ pub fn encodeGetEndpointsResponse(e: *encoding.Encoder, v: GetEndpointsResponse)
 pub fn decodeGetEndpointsResponse(d: *encoding.Decoder) encoding.DecodeError!GetEndpointsResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .endpoints = try decodeArray(d, EndpointDescription, decodeEndpointDescription),
+        .endpoints = try decodeArray(d, EndpointDescription, decodeEndpointDescription, freeEndpointDescription),
     };
 }
 
@@ -2485,8 +2528,8 @@ pub fn decodeFindServersRequest(d: *encoding.Decoder) encoding.DecodeError!FindS
     return .{
         .request_header = try decodeRequestHeader(d),
         .endpoint_url = try d.decodeString(),
-        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem),
-        .server_uris = try decodeArray(d, ?[]const u8, decodeStringItem),
+        .locale_ids = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
+        .server_uris = try decodeArray(d, ?[]const u8, decodeStringItem, freeOptStr),
     };
 }
 
@@ -2510,7 +2553,7 @@ pub fn encodeFindServersResponse(e: *encoding.Encoder, v: FindServersResponse) e
 pub fn decodeFindServersResponse(d: *encoding.Decoder) encoding.DecodeError!FindServersResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .servers = try decodeArray(d, ApplicationDescription, decodeApplicationDescription),
+        .servers = try decodeArray(d, ApplicationDescription, decodeApplicationDescription, freeApplicationDescription),
     };
 }
 
@@ -2583,6 +2626,18 @@ pub fn decodeRelativePathElement(d: *encoding.Decoder) encoding.DecodeError!Rela
     };
 }
 
+fn freeRelativePathElement(a: std.mem.Allocator, v: RelativePathElement) void {
+    encoding.freeNodeId(a, v.reference_type_id);
+    encoding.freeQualifiedName(a, v.target_name);
+}
+
+fn freeRelativePathElementArray(a: std.mem.Allocator, arr: ?[]const RelativePathElement) void {
+    if (arr) |items| {
+        for (items) |el| freeRelativePathElement(a, el);
+        a.free(items);
+    }
+}
+
 pub const RelativePath = struct {
     elements: ?[]const RelativePathElement,
 };
@@ -2592,7 +2647,11 @@ pub fn encodeRelativePath(e: *encoding.Encoder, v: RelativePath) encoding.Encode
 }
 
 pub fn decodeRelativePath(d: *encoding.Decoder) encoding.DecodeError!RelativePath {
-    return .{ .elements = try decodeArray(d, RelativePathElement, decodeRelativePathElement) };
+    return .{ .elements = try decodeArray(d, RelativePathElement, decodeRelativePathElement, freeRelativePathElement) };
+}
+
+pub fn freeRelativePath(a: std.mem.Allocator, v: RelativePath) void {
+    freeRelativePathElementArray(a, v.elements);
 }
 
 pub const BrowsePath = struct {
@@ -2607,6 +2666,11 @@ pub fn encodeBrowsePath(e: *encoding.Encoder, v: BrowsePath) encoding.EncodeErro
 
 pub fn decodeBrowsePath(d: *encoding.Decoder) encoding.DecodeError!BrowsePath {
     return .{ .starting_node = try d.decodeNodeId(), .relative_path = try decodeRelativePath(d) };
+}
+
+pub fn freeBrowsePath(a: std.mem.Allocator, v: BrowsePath) void {
+    encoding.freeNodeId(a, v.starting_node);
+    freeRelativePath(a, v.relative_path);
 }
 
 pub const BrowsePathTarget = struct {
@@ -2624,6 +2688,17 @@ pub fn decodeBrowsePathTarget(d: *encoding.Decoder) encoding.DecodeError!BrowseP
     return .{ .target_id = try d.decodeExpandedNodeId(), .remaining_path_index = try d.decodeUInt32() };
 }
 
+fn freeBrowsePathTarget(a: std.mem.Allocator, v: BrowsePathTarget) void {
+    encoding.freeExpandedNodeId(a, v.target_id);
+}
+
+fn freeBrowsePathTargetArray(a: std.mem.Allocator, arr: ?[]const BrowsePathTarget) void {
+    if (arr) |items| {
+        for (items) |t| freeBrowsePathTarget(a, t);
+        a.free(items);
+    }
+}
+
 pub const BrowsePathResult = struct {
     status_code: encoding.StatusCode,
     targets: ?[]const BrowsePathTarget,
@@ -2634,10 +2709,14 @@ pub fn encodeBrowsePathResult(e: *encoding.Encoder, v: BrowsePathResult) encodin
     try encodeArray(e, BrowsePathTarget, v.targets, encodeBrowsePathTarget);
 }
 
+pub fn freeBrowsePathResult(a: std.mem.Allocator, v: BrowsePathResult) void {
+    freeBrowsePathTargetArray(a, v.targets);
+}
+
 pub fn decodeBrowsePathResult(d: *encoding.Decoder) encoding.DecodeError!BrowsePathResult {
     return .{
         .status_code = try d.decodeStatusCode(),
-        .targets = try decodeArray(d, BrowsePathTarget, decodeBrowsePathTarget),
+        .targets = try decodeArray(d, BrowsePathTarget, decodeBrowsePathTarget, freeBrowsePathTarget),
     };
 }
 
@@ -2654,7 +2733,7 @@ pub fn encodeTranslateBrowsePathsToNodeIdsRequest(e: *encoding.Encoder, v: Trans
 pub fn decodeTranslateBrowsePathsToNodeIdsRequest(d: *encoding.Decoder) encoding.DecodeError!TranslateBrowsePathsToNodeIdsRequest {
     return .{
         .request_header = try decodeRequestHeader(d),
-        .browse_paths = try decodeArray(d, BrowsePath, decodeBrowsePath),
+        .browse_paths = try decodeArray(d, BrowsePath, decodeBrowsePath, freeBrowsePath),
     };
 }
 
@@ -2673,8 +2752,8 @@ pub fn encodeTranslateBrowsePathsToNodeIdsResponse(e: *encoding.Encoder, v: Tran
 pub fn decodeTranslateBrowsePathsToNodeIdsResponse(d: *encoding.Decoder) encoding.DecodeError!TranslateBrowsePathsToNodeIdsResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, BrowsePathResult, decodeBrowsePathResult),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, BrowsePathResult, decodeBrowsePathResult, freeBrowsePathResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2711,6 +2790,10 @@ pub fn decodeMonitoredItemModifyRequest(d: *encoding.Decoder) encoding.DecodeErr
     };
 }
 
+pub fn freeMonitoredItemModifyRequest(a: std.mem.Allocator, v: MonitoredItemModifyRequest) void {
+    freeMonitoringParameters(a, v.requested_parameters);
+}
+
 pub const MonitoredItemModifyResult = struct {
     status_code: encoding.StatusCode,
     revised_sampling_interval: f64,
@@ -2734,6 +2817,10 @@ pub fn decodeMonitoredItemModifyResult(d: *encoding.Decoder) encoding.DecodeErro
     };
 }
 
+pub fn freeMonitoredItemModifyResult(a: std.mem.Allocator, v: MonitoredItemModifyResult) void {
+    encoding.freeExtensionObject(a, v.filter_result);
+}
+
 pub const ModifyMonitoredItemsRequest = struct {
     request_header: RequestHeader,
     subscription_id: u32,
@@ -2753,7 +2840,7 @@ pub fn decodeModifyMonitoredItemsRequest(d: *encoding.Decoder) encoding.DecodeEr
         .request_header = try decodeRequestHeader(d),
         .subscription_id = try d.decodeUInt32(),
         .timestamps_to_return = try decodeEnum(d, TimestampsToReturn),
-        .items_to_modify = try decodeArray(d, MonitoredItemModifyRequest, decodeMonitoredItemModifyRequest),
+        .items_to_modify = try decodeArray(d, MonitoredItemModifyRequest, decodeMonitoredItemModifyRequest, freeMonitoredItemModifyRequest),
     };
 }
 
@@ -2772,8 +2859,8 @@ pub fn encodeModifyMonitoredItemsResponse(e: *encoding.Encoder, v: ModifyMonitor
 pub fn decodeModifyMonitoredItemsResponse(d: *encoding.Decoder) encoding.DecodeError!ModifyMonitoredItemsResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, MonitoredItemModifyResult, decodeMonitoredItemModifyResult),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, MonitoredItemModifyResult, decodeMonitoredItemModifyResult, freeMonitoredItemModifyResult),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 
@@ -2805,7 +2892,7 @@ pub fn decodeSetMonitoringModeRequest(d: *encoding.Decoder) encoding.DecodeError
         .request_header = try decodeRequestHeader(d),
         .subscription_id = try d.decodeUInt32(),
         .monitoring_mode = try decodeEnum(d, MonitoringMode),
-        .monitored_item_ids = try decodeArray(d, u32, decodeU32Item),
+        .monitored_item_ids = try decodeArray(d, u32, decodeU32Item, noFreeItem(u32)),
     };
 }
 
@@ -2824,8 +2911,8 @@ pub fn encodeSetMonitoringModeResponse(e: *encoding.Encoder, v: SetMonitoringMod
 pub fn decodeSetMonitoringModeResponse(d: *encoding.Decoder) encoding.DecodeError!SetMonitoringModeResponse {
     return .{
         .response_header = try decodeResponseHeader(d),
-        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode),
-        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo),
+        .results = try decodeArray(d, encoding.StatusCode, encoding.Decoder.decodeStatusCode, noFreeItem(encoding.StatusCode)),
+        .diagnostic_infos = try decodeArray(d, encoding.DiagnosticInfo, encoding.Decoder.decodeDiagnosticInfo, freeDiagnosticInfo),
     };
 }
 

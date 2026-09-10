@@ -122,16 +122,22 @@ no `std.mem.eql` on a secret anywhere in the security path.
   `#None` connection, which is why the callers that predate the security layer
   are still correct.
 
-**Hostile DER is a first-class input.** `std.crypto.Certificate`'s reader
+**Hostile DER is a first-class input**, and the two extraction entry points
+now take different routes through it. `std.crypto.Certificate`'s reader
 indexes without bounds checks and computes element ends without clamping, so
-`security.certificatePublicKey`/`certificateValidity` put a recursive DER
-well-formedness walk plus a zero-padded scratch copy in front of it. That
-guard is now the shared **`x509.safe`** helper (`security.safeCertificate`
-delegates to `x509.safe.safeCertificate` — three modules needed the same
-guard; see `modules/x509/src/safe.zig`). A truncated, mutated or entirely
-fabricated certificate is `error.InvalidCertificate`; the tests sweep every
-prefix and every single-byte mutation of a real certificate and fuzz
-arbitrary bytes through both entry points.
+`security.certificateValidity` — which genuinely needs `notBefore`/`notAfter`
+— puts a recursive DER well-formedness walk plus a zero-padded scratch copy in
+front of it. That guard is the shared **`x509.safe`** helper
+(`security.safeCertificate` delegates to `x509.safe.safeCertificate` — three
+modules needed the same guard; see `modules/x509/src/safe.zig`).
+`security.certificatePublicKey` needs only the `SubjectPublicKeyInfo` and
+takes the leaner `x509.spkiOf` instead: it walks the DER with x509's own
+bounds-checked decoder, never reaches `std.crypto.Certificate.parse` at all,
+and needs no scratch buffer — see `certificatePublicKey`'s own doc comment in
+`security.zig` for why the two functions diverge. Either way, a truncated,
+mutated or entirely fabricated certificate is `error.InvalidCertificate`; the
+tests sweep every prefix and every single-byte mutation of a real certificate
+and fuzz arbitrary bytes through both entry points.
 
 **Resource bounds are the other half of the threat model.** A server is
 reachable by definition, so every unbounded thing is a DoS surface. Bounded

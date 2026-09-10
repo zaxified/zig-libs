@@ -233,6 +233,14 @@ pub const Config = struct {
     min_publishing_interval_ms: f64 = 50,
     max_publishing_interval_ms: f64 = 3_600_000,
     max_notifications_per_publish: u32 = 1024,
+    /// Longest `LifetimeCount` (§5.13.2) a client may be granted, in publish
+    /// cycles. `reviseLifetime` had a floor (`3 * keep_alive`) but no
+    /// ceiling, so a client requesting `0xFFFF_FFFF` got exactly that: a
+    /// subscription that never expires — `lifetime_counter` counts missed
+    /// publish cycles up toward this field, and its 1000-item-deep
+    /// `monitored_items` queues (capped per item, not per `Config`) simply
+    /// accumulate on the server heap for as long as the channel stays open.
+    max_lifetime_count: u32 = 10_000,
 };
 
 /// The two `UserTokenPolicy`s this server implements, advertised by every
@@ -2677,7 +2685,7 @@ pub const Connection = struct {
 
         const interval = reviseInterval(ctx.srv.config, request.requested_publishing_interval);
         const keep_alive = reviseKeepAlive(request.requested_max_keep_alive_count);
-        const lifetime = reviseLifetime(request.requested_lifetime_count, keep_alive);
+        const lifetime = reviseLifetime(ctx.srv.config, request.requested_lifetime_count, keep_alive);
 
         const sub = try ctx.srv.allocator.create(Subscription);
         errdefer ctx.srv.allocator.destroy(sub);
@@ -2718,9 +2726,12 @@ pub const Connection = struct {
     }
 
     /// §5.13.2: the lifetime count must be at least three keep-alive counts.
-    fn reviseLifetime(requested: u32, keep_alive: u32) u32 {
+    /// Ceiling added alongside the floor — see `Config.max_lifetime_count`'s
+    /// doc comment for why an unbounded top half defeated the whole cap.
+    fn reviseLifetime(cfg: Config, requested: u32, keep_alive: u32) u32 {
         const floor = keep_alive *| 3;
-        return @max(if (requested == 0) floor else requested, floor);
+        const raw = @max(if (requested == 0) floor else requested, floor);
+        return @min(raw, cfg.max_lifetime_count);
     }
 
     fn handleModifySubscription(c: *Connection, ctx: *Ctx, d: *encoding.Decoder) HandlerError!void {
@@ -2734,7 +2745,7 @@ pub const Connection = struct {
         };
         const interval = reviseInterval(ctx.srv.config, request.requested_publishing_interval);
         const keep_alive = reviseKeepAlive(request.requested_max_keep_alive_count);
-        const lifetime = reviseLifetime(request.requested_lifetime_count, keep_alive);
+        const lifetime = reviseLifetime(ctx.srv.config, request.requested_lifetime_count, keep_alive);
         sub.publishing_interval_ms = interval;
         sub.max_keep_alive_count = keep_alive;
         sub.lifetime_count = lifetime;
@@ -4918,6 +4929,47 @@ test "subscription: an absurd SamplingInterval is clamped, not turned into the f
         // Bounded, and bounded by the configured ceiling rather than by luck.
         try testing.expect(revised <= TestRig.defaultConfig().max_sampling_interval_ms);
         try testing.expect(revised >= TestRig.defaultConfig().min_sampling_interval_ms);
+    }
+}
+
+test "subscription: an absurd LifetimeCount is capped, not granted verbatim (C5)" {
+    // Regression for a MEDIUM. `reviseLifetime` had a floor (three
+    // keep-alive counts) but no ceiling, so a client requesting
+    // `0xFFFF_FFFF` got exactly that back: a subscription that never
+    // expires, whose `monitored_items` queues (capped per item, not per
+    // subscription) simply accumulate on the server heap for as long as the
+    // channel is held open.
+    var rig: TestRig = undefined;
+    try rig.init(testing.allocator, TestRig.defaultConfig());
+    defer rig.deinit();
+    try rig.connect();
+
+    for ([_]u32{ std.math.maxInt(u32), std.math.maxInt(u32) - 1 }) |hostile| {
+        const response = try rig.call(
+            .message,
+            services.type_id.create_subscription_request,
+            services.CreateSubscriptionRequest,
+            .{
+                .request_header = rig.header(rig.authToken()),
+                .requested_publishing_interval = 1000,
+                .requested_lifetime_count = hostile,
+                .requested_max_keep_alive_count = 3,
+                .max_notifications_per_publish = 0,
+                .publishing_enabled = true,
+                .priority = 0,
+            },
+            services.encodeCreateSubscriptionRequest,
+            services.CreateSubscriptionResponse,
+            services.type_id.create_subscription_response,
+            services.decodeCreateSubscriptionResponse,
+            services.result_fns.create_subscription,
+        );
+        defer services.freeCreateSubscriptionResponse(rig.gpa, response);
+        // Bounded, and bounded by the configured ceiling rather than by luck
+        // — and still at least three keep-alive counts, the floor `§5.13.2`
+        // requires.
+        try testing.expect(response.revised_lifetime_count <= TestRig.defaultConfig().max_lifetime_count);
+        try testing.expect(response.revised_lifetime_count >= 3 * response.revised_max_keep_alive_count);
     }
 }
 

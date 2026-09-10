@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** `decodeArray`/
+  `decodeVariantArraySlice` (private, services.zig/encoding.zig) now take a
+  `freeItem` so a truncated wire array frees what it already decoded instead
+  of leaking it (C4); five `nodestore.zig` `dup*` helpers now free an
+  earlier allocating step if a later one fails with OutOfMemory (C7); new
+  `pub fn freeRelativePath`/`freeBrowsePath`/`freeBrowsePathResult` fill a
+  pre-existing gap (those three types had no free function at all) needed
+  to wire C4's fix through `RelativePath`/`BrowsePath`/`BrowsePathResult`
+  arrays — additive, nothing existing calls them yet. `Config.max_lifetime_count`
+  (new field, default 10 000) caps `CreateSubscription`'s `LifetimeCount`,
+  which previously had a floor and no ceiling (C5) — additive default,
+  existing callers unaffected. Catalog `.doc` line and `SPEC.md` corrected
+  to match the code (C6, C8).
 - **2026-09-07** — Both fuzz targets had been running one fixed input for their whole
   existence. `security`'s certificate target was written as an inline
   `struct { fn run … }.run` — the one shape `check-fuzz-reach` reports as UNJUDGED rather

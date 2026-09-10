@@ -165,8 +165,13 @@ pub fn dupNodeId(a: std.mem.Allocator, v: encoding.NodeId) StoreError!encoding.N
 }
 
 pub fn dupExpandedNodeId(a: std.mem.Allocator, v: encoding.ExpandedNodeId) StoreError!encoding.ExpandedNodeId {
+    // Two sequential allocating steps: if `node_id` succeeds (it can itself
+    // allocate a `.string`/`.byte_string` id) and `namespace_uri` then fails
+    // with OutOfMemory, the already-duplicated `node_id` must not leak.
+    const node_id = try dupNodeId(a, v.node_id);
+    errdefer encoding.freeNodeId(a, node_id);
     return .{
-        .node_id = try dupNodeId(a, v.node_id),
+        .node_id = node_id,
         .namespace_uri = try dupOptStr(a, v.namespace_uri),
         .server_index = v.server_index,
     };
@@ -177,12 +182,20 @@ pub fn dupQualifiedName(a: std.mem.Allocator, v: encoding.QualifiedName) StoreEr
 }
 
 pub fn dupLocalizedText(a: std.mem.Allocator, v: encoding.LocalizedText) StoreError!encoding.LocalizedText {
-    return .{ .locale = try dupOptStr(a, v.locale), .text = try dupOptStr(a, v.text) };
+    // Same shape as `dupExpandedNodeId`: `locale` can succeed and then
+    // `text` can fail, and `locale`'s allocation must not leak.
+    const locale = try dupOptStr(a, v.locale);
+    errdefer if (locale) |s| a.free(s);
+    return .{ .locale = locale, .text = try dupOptStr(a, v.text) };
 }
 
 pub fn dupExtensionObject(a: std.mem.Allocator, v: encoding.ExtensionObject) StoreError!encoding.ExtensionObject {
+    // Same shape again: `type_id` can succeed and then the `body` dupe can
+    // fail, and `type_id`'s allocation must not leak.
+    const type_id = try dupNodeId(a, v.type_id);
+    errdefer encoding.freeNodeId(a, type_id);
     return .{
-        .type_id = try dupNodeId(a, v.type_id),
+        .type_id = type_id,
         .encoding = v.encoding,
         .body = if (v.body.len == 0) &.{} else try a.dupe(u8, v.body),
     };
@@ -230,7 +243,22 @@ pub fn dupVariantArrayItems(a: std.mem.Allocator, v: encoding.VariantArrayItems)
             const items = arr orelse return @unionInit(encoding.VariantArrayItems, @tagName(tag), null);
             const Elem = @TypeOf(items[0]);
             const out = try a.alloc(Elem, items.len);
-            errdefer a.free(out);
+            // Same shape as `services.decodeArray`'s truncated-array leak
+            // (C4): a failure partway through must not leak the elements
+            // already duplicated — `errdefer a.free(out)` alone only freed
+            // the backing array, never what its filled elements own.
+            var filled: usize = 0;
+            errdefer {
+                for (out[0..filled]) |el| switch (Elem) {
+                    encoding.NodeId => encoding.freeNodeId(a, el),
+                    encoding.ExpandedNodeId => encoding.freeExpandedNodeId(a, el),
+                    encoding.QualifiedName => encoding.freeQualifiedName(a, el),
+                    encoding.LocalizedText => encoding.freeLocalizedText(a, el),
+                    encoding.ExtensionObject => encoding.freeExtensionObject(a, el),
+                    else => unreachable,
+                };
+                a.free(out);
+            }
             for (items, 0..) |item, i| {
                 out[i] = switch (Elem) {
                     encoding.NodeId => try dupNodeId(a, item),
@@ -240,6 +268,7 @@ pub fn dupVariantArrayItems(a: std.mem.Allocator, v: encoding.VariantArrayItems)
                     encoding.ExtensionObject => try dupExtensionObject(a, item),
                     else => unreachable,
                 };
+                filled = i + 1;
             }
             return @unionInit(encoding.VariantArrayItems, @tagName(tag), out);
         },
@@ -250,10 +279,16 @@ pub fn dupVariant(a: std.mem.Allocator, v: encoding.Variant) StoreError!encoding
     return switch (v) {
         .empty => .empty,
         .scalar => |s| .{ .scalar = try dupVariantScalar(a, s) },
-        .array => |arr| .{ .array = .{
-            .items = try dupVariantArrayItems(a, arr.items),
-            .dimensions = if (arr.dimensions) |d| try a.dupe(i32, d) else null,
-        } },
+        .array => |arr| blk: {
+            // `items` can be a whole array of duplicated NodeIds/strings/…
+            // (`dupVariantArrayItems`, itself now leak-free on ITS OWN
+            // partial failure); if `dimensions` then fails, that whole
+            // array must not leak in turn.
+            const items = try dupVariantArrayItems(a, arr.items);
+            errdefer encoding.freeVariantArrayItems(a, items);
+            const dimensions = if (arr.dimensions) |d| try a.dupe(i32, d) else null;
+            break :blk .{ .array = .{ .items = items, .dimensions = dimensions } };
+        },
     };
 }
 
@@ -1706,6 +1741,68 @@ test "dup helpers round-trip through encoding.free* (no leak, no double free)" {
     const nid_copy = try dupNodeId(a, nid);
     defer encoding.freeNodeId(a, nid_copy);
     try testing.expect(services.nodeIdEql(nid, nid_copy));
+}
+
+fn dupAndFreeExpandedNodeId(a: std.mem.Allocator) !void {
+    const v: encoding.ExpandedNodeId = .{
+        .node_id = .{ .string = .{ .namespace = 1, .id = "node-string" } },
+        .namespace_uri = "urn:example",
+        .server_index = 0,
+    };
+    const d = try dupExpandedNodeId(a, v);
+    encoding.freeExpandedNodeId(a, d);
+}
+
+fn dupAndFreeLocalizedText(a: std.mem.Allocator) !void {
+    const v: encoding.LocalizedText = .{ .locale = "en", .text = "hello" };
+    const d = try dupLocalizedText(a, v);
+    encoding.freeLocalizedText(a, d);
+}
+
+fn dupAndFreeExtensionObject(a: std.mem.Allocator) !void {
+    const v: encoding.ExtensionObject = .{
+        .type_id = .{ .string = .{ .namespace = 1, .id = "eo-type" } },
+        .encoding = .byte_string,
+        .body = "payload",
+    };
+    const d = try dupExtensionObject(a, v);
+    encoding.freeExtensionObject(a, d);
+}
+
+fn dupAndFreeVariantExtensionObjectArray(a: std.mem.Allocator) !void {
+    // Two elements, so a mid-loop failure in `dupVariantArrayItems`'s
+    // node_id/…/extension_object branch has an already-filled element to
+    // leak if the fix regresses, plus `dimensions` after `items` so
+    // `dupVariant`'s own split is exercised too.
+    const items = [_]encoding.ExtensionObject{
+        .{ .type_id = .{ .string = .{ .namespace = 1, .id = "eo1" } }, .encoding = .byte_string, .body = "one" },
+        .{ .type_id = .{ .string = .{ .namespace = 1, .id = "eo2" } }, .encoding = .byte_string, .body = "two" },
+    };
+    const dims = [_]i32{2};
+    const v: encoding.Variant = .{ .array = .{
+        .items = .{ .extension_object = &items },
+        .dimensions = &dims,
+    } };
+    const d = try dupVariant(a, v);
+    encoding.freeVariant(a, d);
+}
+
+test "dup helpers leak nothing on OutOfMemory at any allocation point (C7)" {
+    // Regression for a MEDIUM: `dupExpandedNodeId`, `dupLocalizedText`,
+    // `dupExtensionObject`, `dupVariantArrayItems`'s node_id/…/
+    // extension_object branch, and `dupVariant`'s array branch each chain
+    // 2+ allocating steps with no `errdefer` on the earlier ones — so a
+    // later step failing with OutOfMemory (routine on the server's arena
+    // under load, or malicious client input inflating the size class) leaked
+    // whatever had already been duplicated. `checkAllAllocationFailures`
+    // replays each wrapper once per allocation with that one call point
+    // forced to fail, and fails the test if anything is still held at the
+    // point of failure — a plain `testing.allocator` round-trip (the test
+    // above) cannot see this because it never forces a MID-composite failure.
+    try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeExpandedNodeId, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeLocalizedText, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeExtensionObject, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, dupAndFreeVariantExtensionObjectArray, .{});
 }
 
 test "addNamespace / refreshNamespaceArray keeps i=2255 in sync" {

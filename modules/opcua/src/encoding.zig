@@ -317,7 +317,20 @@ fn encodeVariantArraySlice(e: *Encoder, comptime T: type, items: ?[]const T, com
     for (arr) |item| try encodeItem(e, item);
 }
 
-fn decodeVariantArraySlice(d: *Decoder, comptime T: type, comptime decodeItem: fn (*Decoder) DecodeError!T) DecodeError!?[]T {
+/// A `freeItem` that matches a value type owning no memory of its own — the
+/// common case for the scalar Variant array kinds.
+fn noFree(comptime T: type) fn (std.mem.Allocator, T) void {
+    return struct {
+        fn f(_: std.mem.Allocator, _: T) void {}
+    }.f;
+}
+
+fn decodeVariantArraySlice(
+    d: *Decoder,
+    comptime T: type,
+    comptime decodeItem: fn (*Decoder) DecodeError!T,
+    comptime freeItem: fn (std.mem.Allocator, T) void,
+) DecodeError!?[]T {
     const len = try d.reader.takeInt(i32, .little);
     if (len == -1) return null;
     if (len < -1) return error.BadLength;
@@ -329,7 +342,14 @@ fn decodeVariantArraySlice(d: *Decoder, comptime T: type, comptime decodeItem: f
     // claim fails on `EndOfStream` reading the first missing element (exactly
     // as `decodeString` fails on `take`) long before the list can grow large.
     var list: std.ArrayList(T) = .empty;
-    errdefer list.deinit(d.allocator);
+    errdefer {
+        // A truncated array must not leak the elements already decoded: each
+        // one already owns its own allocation (a string, a NodeId's opaque
+        // bytes, …). `list.deinit` alone only frees the backing array, never
+        // what its elements point at.
+        for (list.items) |it| freeItem(d.allocator, it);
+        list.deinit(d.allocator);
+    }
     for (0..n) |_| try list.append(d.allocator, try decodeItem(d));
     return try list.toOwnedSlice(d.allocator);
 }
@@ -871,28 +891,28 @@ pub const Decoder = struct {
     /// mirror of `decodeVariantScalarBody`.
     fn decodeVariantArrayItems(d: *Decoder, type_id: u8) DecodeError!VariantArrayItems {
         return switch (type_id) {
-            1 => .{ .boolean = try decodeVariantArraySlice(d, bool, Decoder.decodeBoolean) },
-            2 => .{ .sbyte = try decodeVariantArraySlice(d, i8, Decoder.decodeSByte) },
-            3 => .{ .byte = try decodeVariantArraySlice(d, u8, Decoder.decodeByte) },
-            4 => .{ .int16 = try decodeVariantArraySlice(d, i16, Decoder.decodeInt16) },
-            5 => .{ .uint16 = try decodeVariantArraySlice(d, u16, Decoder.decodeUInt16) },
-            6 => .{ .int32 = try decodeVariantArraySlice(d, i32, Decoder.decodeInt32) },
-            7 => .{ .uint32 = try decodeVariantArraySlice(d, u32, Decoder.decodeUInt32) },
-            8 => .{ .int64 = try decodeVariantArraySlice(d, i64, Decoder.decodeInt64) },
-            9 => .{ .uint64 = try decodeVariantArraySlice(d, u64, Decoder.decodeUInt64) },
-            10 => .{ .float = try decodeVariantArraySlice(d, f32, Decoder.decodeFloat) },
-            11 => .{ .double = try decodeVariantArraySlice(d, f64, Decoder.decodeDouble) },
-            12 => .{ .string = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeString) },
-            13 => .{ .date_time = try decodeVariantArraySlice(d, DateTime, Decoder.decodeDateTime) },
-            14 => .{ .guid = try decodeVariantArraySlice(d, Guid, Decoder.decodeGuid) },
-            15 => .{ .byte_string = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeByteString) },
-            16 => .{ .xml_element = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeXmlElement) },
-            17 => .{ .node_id = try decodeVariantArraySlice(d, NodeId, Decoder.decodeNodeId) },
-            18 => .{ .expanded_node_id = try decodeVariantArraySlice(d, ExpandedNodeId, Decoder.decodeExpandedNodeId) },
-            19 => .{ .status_code = try decodeVariantArraySlice(d, StatusCode, Decoder.decodeStatusCode) },
-            20 => .{ .qualified_name = try decodeVariantArraySlice(d, QualifiedName, Decoder.decodeQualifiedName) },
-            21 => .{ .localized_text = try decodeVariantArraySlice(d, LocalizedText, Decoder.decodeLocalizedText) },
-            22 => .{ .extension_object = try decodeVariantArraySlice(d, ExtensionObject, Decoder.decodeExtensionObject) },
+            1 => .{ .boolean = try decodeVariantArraySlice(d, bool, Decoder.decodeBoolean, noFree(bool)) },
+            2 => .{ .sbyte = try decodeVariantArraySlice(d, i8, Decoder.decodeSByte, noFree(i8)) },
+            3 => .{ .byte = try decodeVariantArraySlice(d, u8, Decoder.decodeByte, noFree(u8)) },
+            4 => .{ .int16 = try decodeVariantArraySlice(d, i16, Decoder.decodeInt16, noFree(i16)) },
+            5 => .{ .uint16 = try decodeVariantArraySlice(d, u16, Decoder.decodeUInt16, noFree(u16)) },
+            6 => .{ .int32 = try decodeVariantArraySlice(d, i32, Decoder.decodeInt32, noFree(i32)) },
+            7 => .{ .uint32 = try decodeVariantArraySlice(d, u32, Decoder.decodeUInt32, noFree(u32)) },
+            8 => .{ .int64 = try decodeVariantArraySlice(d, i64, Decoder.decodeInt64, noFree(i64)) },
+            9 => .{ .uint64 = try decodeVariantArraySlice(d, u64, Decoder.decodeUInt64, noFree(u64)) },
+            10 => .{ .float = try decodeVariantArraySlice(d, f32, Decoder.decodeFloat, noFree(f32)) },
+            11 => .{ .double = try decodeVariantArraySlice(d, f64, Decoder.decodeDouble, noFree(f64)) },
+            12 => .{ .string = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeString, freeOptStr) },
+            13 => .{ .date_time = try decodeVariantArraySlice(d, DateTime, Decoder.decodeDateTime, noFree(DateTime)) },
+            14 => .{ .guid = try decodeVariantArraySlice(d, Guid, Decoder.decodeGuid, noFree(Guid)) },
+            15 => .{ .byte_string = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeByteString, freeOptStr) },
+            16 => .{ .xml_element = try decodeVariantArraySlice(d, ?[]const u8, Decoder.decodeXmlElement, freeOptStr) },
+            17 => .{ .node_id = try decodeVariantArraySlice(d, NodeId, Decoder.decodeNodeId, freeNodeId) },
+            18 => .{ .expanded_node_id = try decodeVariantArraySlice(d, ExpandedNodeId, Decoder.decodeExpandedNodeId, freeExpandedNodeId) },
+            19 => .{ .status_code = try decodeVariantArraySlice(d, StatusCode, Decoder.decodeStatusCode, noFree(StatusCode)) },
+            20 => .{ .qualified_name = try decodeVariantArraySlice(d, QualifiedName, Decoder.decodeQualifiedName, freeQualifiedName) },
+            21 => .{ .localized_text = try decodeVariantArraySlice(d, LocalizedText, Decoder.decodeLocalizedText, freeLocalizedText) },
+            22 => .{ .extension_object = try decodeVariantArraySlice(d, ExtensionObject, Decoder.decodeExtensionObject, freeExtensionObject) },
             23, 24, 25 => return error.UnsupportedType,
             else => return error.BadEncodingByte,
         };
@@ -913,7 +933,7 @@ pub const Decoder = struct {
         }
         const items = try d.decodeVariantArrayItems(type_id);
         errdefer freeVariantArrayItems(d.allocator, items);
-        const dimensions: ?[]const i32 = if (has_dims) try decodeVariantArraySlice(d, i32, Decoder.decodeInt32) else null;
+        const dimensions: ?[]const i32 = if (has_dims) try decodeVariantArraySlice(d, i32, Decoder.decodeInt32, noFree(i32)) else null;
         return .{ .array = .{ .items = items, .dimensions = dimensions } };
     }
 
@@ -1160,6 +1180,27 @@ test "String: present, empty, null" {
     defer testing.allocator.free(s2);
     try testing.expectEqual(@as(usize, 0), s2.len);
     try testing.expectEqual(@as(?[]const u8, null), try d.decodeString());
+}
+
+test "decodeVariantArraySlice frees already-decoded elements when the array is truncated (C4)" {
+    // Same shape as services.zig's decodeArray regression: Int32 count = 3,
+    // two well-formed strings, then nothing — the third element's length
+    // prefix is missing. `testing.allocator` panics the test on any leak
+    // still held at deinit, so a leaked "first"/"second" fails this test on
+    // its own without extra bookkeeping.
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeInt(i32, 3, .little);
+    try w.writeInt(i32, 5, .little);
+    try w.writeAll("first");
+    try w.writeInt(i32, 6, .little);
+    try w.writeAll("second");
+    // (no third element)
+
+    var r: std.Io.Reader = .fixed(w.buffered());
+    var d = Decoder.init(&r, testing.allocator);
+    try testing.expectError(error.EndOfStream, decodeVariantArraySlice(&d, ?[]const u8, Decoder.decodeString, freeOptStr));
 }
 
 test "DateTime round-trip" {
