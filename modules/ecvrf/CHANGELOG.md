@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** `verify`'s last step used
+  to call `proofToHash(pi)`, which re-decoded `pi` (re-checking `s`'s
+  canonicity and re-parsing `Gamma`'s point encoding) purely to reach the
+  hash tail `verify` had already done that work for a few lines above.
+  Factored the tail into a private `hashOutputFromGamma`, called from both
+  `proofToHash` (after its own `decodeProof`) and `verify` (with the
+  `gamma_point` it already has). Same bytes out, bit-for-bit (existing
+  round-trip test unchanged, still passes). Measured (ReleaseFast, 400
+  iters): 167,788 ns/op after vs. 182,163 ns/op with the old re-decode
+  restored, +8.6% (A1 E10 point 3; points 1-2 — a `KeyPair`-shaped `prove`
+  API and a precomputed base in `ct25519` — remain open, real API
+  decisions).
 - **2026-09-10** — A1 fix campaign: `prove` now zeroes its own copy of the
   secret nonce `k` and `expandSecretKey`'s own dead-frame copy of `x`
   (E4, partial — residual copies of both remain, traced to std's own

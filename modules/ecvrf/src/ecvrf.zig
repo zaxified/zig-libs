@@ -403,6 +403,16 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
 pub fn proofToHash(pi: Proof) Error!Output {
     const d = try decodeProof(pi);
     const gamma_point = Edwards25519.fromBytes(d.gamma) catch unreachable; // decodeProof already validated
+    return hashOutputFromGamma(gamma_point);
+}
+
+/// The tail of `ECVRF_proof_to_hash` (RFC 9381 §5.2), given an already
+/// STRUCTURALLY-VALIDATED `Gamma` point rather than the raw `pi_string` —
+/// factored out so `verify` doesn't have to re-decode `pi` and re-parse
+/// `Gamma` a second time just to reach this hash (A1 E10 point 3: measured
+/// ~9.2us of `verify`'s ~180us, 5.1%, was exactly that repeat of work
+/// `verify` already has the result of).
+fn hashOutputFromGamma(gamma_point: Edwards25519) Output {
     const cofactor_gamma = gamma_point.clearCofactor();
 
     var st = Sha512.init(.{});
@@ -450,7 +460,13 @@ pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!O
 
     // Step 11: accept iff c == c'.
     if (!std.crypto.timing_safe.eql([c_len]u8, c_prime, d.c)) return error.InvalidProof;
-    return proofToHash(pi) catch unreachable; // pi already fully validated above
+    // A1 E10 point 3: was `proofToHash(pi) catch unreachable`, which
+    // re-decoded `pi` (re-checking `s`'s canonicity and re-parsing `Gamma`'s
+    // curve-point encoding, both already done above via `decodeProof`/
+    // `gamma_point`) purely to reach the same hash tail. `gamma_point` here
+    // is bit-for-bit `Edwards25519.fromBytes(d.gamma)` on the SAME `pi`, so
+    // this is the identical output, not an approximation of it.
+    return hashOutputFromGamma(gamma_point);
 }
 
 test "wire-shape constants match RFC 9381 §5.5 (ECVRF-EDWARDS25519-SHA512-TAI)" {
@@ -524,6 +540,35 @@ test "prove -> verify round-trips and recovers the same beta as proofToHash" {
         wrong_alpha[0] ^= 0x01;
         try std.testing.expectError(error.InvalidProof, verify(pk, &wrong_alpha, pi));
     }
+}
+
+test "verify: no longer re-decodes pi to reach proofToHash's tail (audit E10 point 3, informational)" {
+    // Print-only, no threshold assertion: the audited saving is ~5.1% of
+    // `verify`'s total cost (9.2us / 179.9us), which is too small a margin
+    // to assert on reliably against a shared, possibly-loaded machine (this
+    // audit's own numbers were taken at load 5.7 from concurrent agents).
+    // Kept as a standing measurement for whoever next touches this path,
+    // not as a pass/fail gate.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sk_wide: [64]u8 = undefined;
+    Sha512.hash("ecvrf-e10-perf-sk", &sk_wide, .{});
+    const sk: SecretKey = sk_wide[0..32].*;
+    const pk = publicKey(sk);
+    const alpha = "ecvrf-e10-perf-alpha";
+    const pi = prove(sk, alpha);
+
+    const iters = 400;
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    var i: usize = 0;
+    while (i < iters) : (i += 1) std.mem.doNotOptimizeAway(verify(pk, alpha, pi) catch unreachable);
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    std.debug.print(
+        "verify: {d:.0} ns/op over {d} iters\n",
+        .{ @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(iters)), iters },
+    );
 }
 
 // ── fuzz harnesses (untrusted-wire decoders) ────────────────────────────
