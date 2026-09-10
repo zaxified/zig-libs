@@ -434,7 +434,7 @@ pub fn verify(
     var cert_der: ?[]u8 = null;
     errdefer if (cert_der) |d| alloc.free(d);
     if (childByName(signature, "KeyInfo")) |ki| {
-        if (findX509Cert(ki)) |cert_el| {
+        if (findX509Cert(ki, 0)) |cert_el| {
             const der = try decodeBase64(alloc, try textOf(arena, cert_el));
             cert_der = der;
         }
@@ -564,7 +564,7 @@ fn resolveReference(doc: *const xml.Document, uri: []const u8, options: Options)
         // element they read" are free to be different elements. Enforce here what
         // `UriNotResolved` already promises — *exactly one*.
         const hit = doc.findByAttr("", name, id) orelse return error.UriNotResolved;
-        if (countByAttr(doc.root, name, id) != 1) return error.UriNotResolved;
+        if (try countByAttr(doc.root, name, id, 0) != 1) return error.UriNotResolved;
         return hit;
     }
     // Fall-through ONLY: this branch reads the parse-time ID index, which is
@@ -573,17 +573,37 @@ fn resolveReference(doc: *const xml.Document, uri: []const u8, options: Options)
     return doc.getElementById(id) orelse error.UriNotResolved;
 }
 
+/// Deepest element nesting `countByAttr` / `findX509Cert` will descend.
+///
+/// Both recurse on the machine stack, same as `c14n.Writer.writeElement` — and
+/// the only bound used to be `xml.Options.max_depth`, the knob the DOCUMENT was
+/// PARSED with. That knob is explicitly supported and safe for `xml`'s own
+/// parser (which keeps its stack on the heap), but not for a native-stack
+/// walker downstream of it — the exact class `c14n`'s own `MaxDepthExceeded`
+/// was added for (see its doc comment; measured there: depth 36 000 SIGSEGVs
+/// in ReleaseFast on an 8 MiB stack). 256 matches both `xml`'s and `c14n`'s
+/// own default.
+const max_walk_depth: usize = 256;
+
 /// How many elements in `el`'s subtree carry the unprefixed attribute `name`
 /// with value `value`, saturating at 2 — the only question asked is
 /// "exactly one?", and stopping early keeps a wide document cheap.
-fn countByAttr(el: *const xml.Element, name: []const u8, value: []const u8) usize {
+///
+/// Feeds `resolveReference`'s uniqueness check — the XML Signature Wrapping
+/// defense on the `id_attr` branch — so on exceeding `max_walk_depth` this
+/// fails CLOSED (`error.MaxDepthExceeded`) rather than silently returning an
+/// undercount: a "1" from a walk that could not reach the whole subtree would
+/// wave through a document whose deeper part really does carry a second,
+/// ambiguous match.
+fn countByAttr(el: *const xml.Element, name: []const u8, value: []const u8, depth: usize) VerifyError!usize {
+    if (depth > max_walk_depth) return error.MaxDepthExceeded;
     var n: usize = 0;
     if (el.attr("", name)) |v| {
         if (std.mem.eql(u8, v, value)) n += 1;
     }
     for (el.children) |c| switch (c.content) {
         .element => |child| {
-            n += countByAttr(child, name, value);
+            n += try countByAttr(child, name, value, depth + 1);
             if (n >= 2) return 2;
         },
         else => {},
@@ -698,11 +718,19 @@ fn textOf(arena: std.mem.Allocator, el: *const xml.Element) ![]u8 {
 }
 
 /// Depth-first: the first `X509Certificate` element anywhere under a KeyInfo.
-fn findX509Cert(el: *const xml.Element) ?*xml.Element {
+///
+/// Same recursion-depth hazard as `countByAttr`, bounded the same way
+/// (`max_walk_depth`). Unlike `countByAttr` this doesn't feed a security
+/// decision — `<KeyInfo>` is never trusted to supply the verification key
+/// (see the module doc comment) — so hitting the bound fails OPEN in the
+/// narrow sense of "stop looking", not "reject the signature": the caller
+/// just gets no certificate to pin, same as a `KeyInfo` that never carried one.
+fn findX509Cert(el: *const xml.Element, depth: usize) ?*xml.Element {
+    if (depth > max_walk_depth) return null;
     for (el.children) |c| switch (c.content) {
         .element => |child| {
             if (isDs(child, "X509Certificate")) return child;
-            if (findX509Cert(child)) |f| return f;
+            if (findX509Cert(child, depth + 1)) |f| return f;
         },
         else => {},
     };
@@ -1083,16 +1111,37 @@ test "EXTERNAL anchor: our own signer's output is byte-identical to openssl's ov
     // cross-check `buildSignedRsaDoc`'s own signer (used by every OTHER test in
     // this file) against `openssl dgst -sha256 -sign` run OFFLINE over the
     // identical canonical `<SignedInfo>` bytes, computed with `xmllint
-    // --exc-c14n` (independent of this module's own C14N). Reproduction
-    // commands (not run by the test suite):
+    // --exc-c14n` (independent of this module's own C14N).
+    //
+    // ⚠ Run LITERALLY on the whole `with_empty`/`with_digest` documents, these
+    // two commands do NOT reproduce the constants below — audited 2026-09-03
+    // (`A1/xmldsig.md` F-F): both constants ARE genuine and were independently
+    // re-derived, but the input file each command reads is a PREPARED subtree,
+    // not the raw document `buildSignedRsaDoc` constructs. Concretely:
+    //   - `ref_input.xml` is `with_empty` with its `<ds:Signature>…</ds:Signature>`
+    //     element REMOVED entirely — that removal is what the
+    //     enveloped-signature transform does; digesting the whole document
+    //     (placeholder Signature included) does not match what `verify()`
+    //     canonicalizes.
+    //   - `si_input.xml` is the `<ds:SignedInfo>` element of `with_digest`
+    //     EXTRACTED as its own standalone document, carrying its own
+    //     `xmlns:ds="http://www.w3.org/2000/09/xmldsig#"` declaration —
+    //     exclusive C14N renders that declaration because the `ds:` prefix is
+    //     visibly utilized inside `SignedInfo`, but an extracted fragment that
+    //     dropped the ancestor `<ds:Signature>` (where the original document
+    //     declared it) does not carry it for free; a naive `--xpath` extraction
+    //     will not add it back. Signing the WHOLE `with_digest` document
+    //     instead of this extracted, re-declared subtree signs the wrong bytes.
+    // Reproduction commands (not run by the test suite), against those two
+    // PREPARED files:
     //   xmllint --exc-c14n ref_input.xml | openssl dgst -sha256 -binary | base64
     //   xmllint --exc-c14n si_input.xml | openssl dgst -sha256 -sign priv.pem -binary | base64
     //   xmlsec1 --verify --lax-key-search --pubkey-pem pub.pem final_doc.xml   # => OK
-    // `ref_input.xml`/`si_input.xml` are the exact `with_empty`/`with_digest`
-    // documents `buildSignedRsaDoc` constructs for content="Hello World" under
-    // the SAME `test_rsa_priv_pem` embedded above. This is the same "EXTERNAL
-    // anchor" pattern `saml`'s `test_redirect_binding.zig` already uses for its
-    // Redirect-signing primitive.
+    // Both PEM keys are the SAME `test_rsa_priv_pem`/`test_rsa_pub_pem`
+    // embedded above; content is the SAME "Hello World" `buildSignedRsaDoc`
+    // uses. This is the same "EXTERNAL anchor" pattern `saml`'s
+    // `test_redirect_binding.zig` already uses for its Redirect-signing
+    // primitive.
     const external_digest_b64 = "qp5qp7UvMAZZZNnPy5biqRM83FVVRSmnkEymMrZATJE=";
     const external_signature_b64 =
         "hN3vrcjhR4T8Qa4i9XYStjFbbKWaNi26+ekfD8wxiFk1b+FkKEkgkRCk34000nnLqV2PVy9jVYFhw8ApaW9gTH/O/+rkOXys1u7Ye1vUBQFx+tuP0icIesNPp1BrD9h7cQGo3RSvjJXG67x+XdXHRjYGehHhVhicffTsA1ji0T40dUK05Crny68WwJD4Jq626ZCTvUMZwRToNbxoLUmHyBClymP/34Jrzln9bSQTgABBwZ1MxMFE5KuW/qcbCbcT5OhJ0eXGx4Zo5kmce1iW8EDBsVpZ3xg9QMbr9vzQQN7Puw3lWZK7OnQsX+sFU+QoIHxwZBB+4S/+aerQ9+Shqw==";
@@ -1707,6 +1756,79 @@ test "verify: not a Signature element is a typed error, never a panic" {
     defer doc.deinit();
     const pk = try rsa.PublicKey.fromPem(test_rsa_pub_pem);
     try testing.expectError(error.MalformedSignature, verify(a, &doc, doc.root, .{ .key = .{ .rsa = pk } }));
+}
+
+// ── recursion-depth guards on the two walkers `c14n`'s own fix did not reach ──
+//
+// `countByAttr` and `findX509Cert` recurse on the machine stack in exactly the
+// shape `c14n.writeElement` used to: the only bound was `xml.Options.max_depth`,
+// the knob the DOCUMENT was parsed with, which is safe for `xml` itself (heap
+// stack) but not for a native-stack walker downstream of it. `saml` never
+// raises that knob past the default (`untrustedXmlOptions` in `saml/root.zig`
+// does not set `max_depth`), so this is not reachable through the one consumer
+// today — but `verify()` is a public entry point that accepts any already-
+// parsed `xml.Document`, and a future or different caller that does raise it
+// would hit the same class of crash `c14n`'s `MaxDepthExceeded` was added for.
+
+test "countByAttr: nesting past max_depth is a typed error, not a stack overflow" {
+    const a = testing.allocator;
+
+    // Exactly at the bound: still counts correctly.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        for (0..max_walk_depth) |_| try src.appendSlice(a, "<a>");
+        try src.appendSlice(a, "<leaf x=\"v\"/>");
+        for (0..max_walk_depth) |_| try src.appendSlice(a, "</a>");
+        var doc = try xml.parse(a, src.items, .{ .max_depth = max_walk_depth + 8 });
+        defer doc.deinit();
+        try testing.expectEqual(@as(usize, 1), try countByAttr(doc.root, "x", "v", 0));
+    }
+    // One level deeper: refused by name, not by recursing past the bound.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        for (0..max_walk_depth + 1) |_| try src.appendSlice(a, "<a>");
+        try src.appendSlice(a, "<leaf x=\"v\"/>");
+        for (0..max_walk_depth + 1) |_| try src.appendSlice(a, "</a>");
+        var doc = try xml.parse(a, src.items, .{ .max_depth = max_walk_depth + 8 });
+        defer doc.deinit();
+        try testing.expectError(error.MaxDepthExceeded, countByAttr(doc.root, "x", "v", 0));
+    }
+}
+
+test "findX509Cert: nesting past max_depth stops the search rather than crashing" {
+    const a = testing.allocator;
+
+    // Well within the bound: the certificate is found.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        try src.appendSlice(a, "<ds:KeyInfo xmlns:ds=\"" ++ ds_ns ++ "\">");
+        for (0..max_walk_depth - 10) |_| try src.appendSlice(a, "<w>");
+        try src.appendSlice(a, "<ds:X509Certificate>Y2VydA==</ds:X509Certificate>");
+        for (0..max_walk_depth - 10) |_| try src.appendSlice(a, "</w>");
+        try src.appendSlice(a, "</ds:KeyInfo>");
+        var doc = try xml.parse(a, src.items, .{ .max_depth = max_walk_depth + 20 });
+        defer doc.deinit();
+        try testing.expect(findX509Cert(doc.root, 0) != null);
+    }
+    // Well past the bound: not found -- safe, because `<KeyInfo>` is never
+    // trusted to supply the verification key (see the module doc comment), so
+    // `verify()` just reports no certificate to pin, same as a `KeyInfo` that
+    // never carried one -- instead of a stack overflow.
+    {
+        var src: std.ArrayList(u8) = .empty;
+        defer src.deinit(a);
+        try src.appendSlice(a, "<ds:KeyInfo xmlns:ds=\"" ++ ds_ns ++ "\">");
+        for (0..max_walk_depth + 20) |_| try src.appendSlice(a, "<w>");
+        try src.appendSlice(a, "<ds:X509Certificate>Y2VydA==</ds:X509Certificate>");
+        for (0..max_walk_depth + 20) |_| try src.appendSlice(a, "</w>");
+        try src.appendSlice(a, "</ds:KeyInfo>");
+        var doc = try xml.parse(a, src.items, .{ .max_depth = max_walk_depth + 40 });
+        defer doc.deinit();
+        try testing.expect(findX509Cert(doc.root, 0) == null);
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════

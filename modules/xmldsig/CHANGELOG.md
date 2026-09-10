@@ -5,6 +5,47 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, closing the three findings the
+  2026-09-03 drift re-audit recorded but did not fix.
+  - **`countByAttr`/`findX509Cert` now bound their own recursion**
+    (`max_walk_depth = 256`, matching `c14n`'s own default). Both recursed on
+    the machine stack trusting whatever `xml.Options.max_depth` the document
+    was PARSED with — the same hazard `c14n.writeElement` had before its own
+    `MaxDepthExceeded` fix, differing only in whose knob it was trusting.
+    `countByAttr` feeds the XML Signature Wrapping uniqueness check, so it
+    fails CLOSED (`error.MaxDepthExceeded`, propagated through `VerifyError`)
+    rather than risk an undercount past the bound; `findX509Cert` feeds only
+    the (never-trusted) `KeyInfo` cert surfaced for caller pinning, so it fails
+    OPEN (stops searching, returns `null`). Not reachable through `saml` today
+    — its `untrustedXmlOptions()` never raises `max_depth` past the default —
+    but `verify()` is a public entry point over any already-parsed document,
+    same class of gap the two functions' recursion left open. Measured:
+    `scripts/modtest xmldsig` 48/49 → 50/51 (2 new boundary tests, both
+    directions: at the bound still correct, one level past it typed-refused /
+    stops rather than a would-be stack overflow).
+  - **The `EXTERNAL anchor` reproduction recipe (`root.zig`, next to
+    `buildSignedRsaDoc`) now says what it actually reproduces.** Both
+    committed constants were always genuine (independently re-derived by the
+    audit), but the recipe as written — `xmllint --exc-c14n` over the raw
+    `with_empty`/`with_digest` documents — omits two steps: the reference
+    input needs `<ds:Signature>` physically REMOVED first (what the
+    enveloped-signature transform does), and the signature input needs the
+    `<ds:SignedInfo>` subtree EXTRACTED with its own `xmlns:ds` declaration
+    (exclusive C14N renders it because the prefix is visibly utilized inside
+    `SignedInfo`, but a naive extraction does not add it back). Doc-only
+    fix — code and constants were already correct.
+  - **Fuzz-harness deterministic-lane coverage — REFUTED, not fixed.** The
+    audit measured `fuzzVerifySignature` entered twice per deterministic run
+    (`FUZZCALL=2`) with an empty `.corpus`. That was true when measured
+    (2026-09-03) but is stale: `16da0e70` (2026-09-07, already on this branch)
+    gave `verify_scripts` 8 real entries with genuine byte mutation. Zig's
+    `test_runner.zig` `fuzz()` (non-`-Dfuzz` build) runs `testOne` once per
+    corpus entry PLUS one unconditional empty-`Smith` smoke test — so today's
+    count is `8 + 1` from the corpus test plus `1` from the explicit
+    reachability call = **10** `fuzzVerifySignature` entries (not 2), each
+    driving 3 `fuzzVerifyDoc` modes. The finding's own number is gone; no
+    further change made here.
+
 - **2026-09-07** — Fuzz reach: `fuzzVerifySignature` ran one fixed document, forever. Its
   FIRST draw was `smith.value(bool)` (`allow_weak_sha1`), and a `Smith` scalar or ranged
   draw returns the range minimum when fewer than eight octets remain; with no corpus the
