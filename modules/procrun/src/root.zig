@@ -85,7 +85,9 @@ pub const EnvMode = enum {
 /// under `.clear` (child gets only `Spec.env`) or `.merge`, the `PATH` used
 /// to resolve `argv[0]` is the parent's actual `PATH`, not whatever `PATH`
 /// ends up in the child's environment (`std.process.SpawnOptions.
-/// environ_map`'s `PATH` is never consulted for this resolution).
+/// environ_map`'s `PATH` is never consulted for this resolution) —
+/// including under `Spec.rlimit` (`resolveArgv0ForRlimit`; fixed 2026-09-10,
+/// see F2 in the audit record — it did not hold there before).
 pub const Spec = struct {
     argv: []const []const u8,
     /// Overriding / explicit environment. Interpreted per `env_mode`.
@@ -96,7 +98,13 @@ pub const Spec = struct {
     stdin: StdioMode = .close,
     stdout: StdioMode = .pipe,
     stderr: StdioMode = .pipe,
-    /// Per-stream capture cap for `run`/`runTimeout`.
+    /// Per-stream capture cap for `run`/`runTimeout`. Bounds MEMORY only —
+    /// never time or I/O: the drain loop keeps reading (and discarding)
+    /// bytes past this cap so the child can flush and exit rather than
+    /// block on a full pipe, so a child that writes far more than this
+    /// costs the caller that much read() time regardless of the cap. Pair
+    /// with `runTimeout` (or `Spec.rlimit`) to also bound wall time or the
+    /// child's own resource use. See F5 in the audit record.
     max_output_bytes: usize = default_max_output_bytes,
     /// Backpressure permit count for `spawnStreaming` (stdout only).
     stream_permits: usize = default_stream_permits,
@@ -163,6 +171,18 @@ pub const Output = struct {
     /// the returned slice is the kept prefix.
     truncated_stdout: bool,
     truncated_stderr: bool,
+    /// `runTimeout` only (always `false` from `run`): the respective
+    /// stream's capture was cut short by `runTimeout`'s own deadline, NOT
+    /// by EOF — meaning a descendant the (now-killed) child forked is still
+    /// holding that pipe's write end open, so more output than what is
+    /// here may exist and will never arrive. Distinct from `truncated_*`,
+    /// which means "more bytes arrived than `max_output_bytes` could hold";
+    /// this means "fewer bytes may have been captured than the child would
+    /// eventually have produced, because waiting for the rest would have
+    /// made `runTimeout` itself unbounded". See F1's disposition in the
+    /// audit record.
+    stdout_deadline_stopped: bool = false,
+    stderr_deadline_stopped: bool = false,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -413,7 +433,7 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
     const effective_argv: []const []const u8 = blk: {
         const r = spec.rlimit orelse break :blk spec.argv;
         if (builtin.os.tag == .windows) return error.OperationUnsupported;
-        rlimit_wrap = try buildRlimitWrap(gpa, spec.argv, r);
+        rlimit_wrap = try buildRlimitWrap(gpa, io, spec.argv, r);
         break :blk rlimit_wrap.?.argv;
     };
 
@@ -440,17 +460,63 @@ fn spawnChild(gpa: std.mem.Allocator, io: std.Io, spec: Spec) !std.process.Child
 }
 
 const RlimitWrap = struct {
-    /// `["/bin/sh", "-c", script, "sh", <spec.argv...>]`. `argv[2]` (the
-    /// script) borrows `script`'s storage; every other element borrows
-    /// either a literal or the caller's `spec.argv`.
+    /// `["/bin/sh", "-c", script, "sh", <argv0 (possibly resolved)>,
+    /// <spec.argv[1..]...>]`. `argv[2]` (the script) borrows `script`'s
+    /// storage; `argv[4]` borrows `resolved_argv0` when that is non-null,
+    /// otherwise (and every other element) borrows either a literal or the
+    /// caller's `spec.argv`.
     argv: []const []const u8,
     script: []u8,
+    /// Owned storage for a PATH-resolved `argv[0]` — see `resolveArgv0ForRlimit`.
+    resolved_argv0: ?[]u8 = null,
 
     fn deinit(w: *RlimitWrap, gpa: std.mem.Allocator) void {
         gpa.free(w.argv);
         gpa.free(w.script);
+        if (w.resolved_argv0) |s| gpa.free(s);
     }
 };
+
+/// Resolve `argv0` against the PARENT's real `PATH` (read fresh via
+/// `loadParentEnv`, independent of `Spec.env_mode`) and return an owned
+/// absolute path, so the rlimit wrapper's `exec "$@"` can use it directly
+/// instead of letting the shell search the CHILD's `PATH`.
+///
+/// Returns `null` — meaning "pass `argv0` through unresolved, exactly as
+/// before this existed" — in two cases: `argv0` already contains a `/` (per
+/// POSIX/shell convention that means "use it as-is, no search", so there is
+/// nothing to resolve), or nothing matching was found anywhere on the
+/// parent's `PATH` (the eventual `exec` then fails exactly as it would have
+/// without this resolution — not a regression, just nothing to fix).
+///
+/// This exists because `Spec`'s own doc comment promises argv[0] resolution
+/// "ALWAYS reads from the real parent process environment, regardless of
+/// `env_mode`" — true for a normal spawn (`std.process.spawn` resolves
+/// bare argv[0] itself, against the real environment), but `Spec.rlimit`
+/// routes through `/bin/sh -c 'ulimit ...; exec "$@"'` instead, and a POSIX
+/// shell's own `exec` searches ITS environment's `PATH` — the CHILD's, per
+/// `env_mode`. Measured (F2 in the audit record): `env_mode = .clear` with
+/// `env.PATH` pointed at a planted decoy directory — without `rlimit`,
+/// `error.FileNotFound` (the documented behaviour); with `rlimit` and no
+/// fix, the decoy binary ran.
+fn resolveArgv0ForRlimit(gpa: std.mem.Allocator, io: std.Io, argv0: []const u8) !?[]u8 {
+    if (std.mem.indexOfScalar(u8, argv0, '/') != null) return null;
+
+    var parent_env = std.process.Environ.Map.init(gpa);
+    defer parent_env.deinit();
+    try loadParentEnv(gpa, io, &parent_env);
+    const path_var = parent_env.get("PATH") orelse return null;
+
+    var it = std.mem.tokenizeScalar(u8, path_var, ':');
+    while (it.next()) |dir| {
+        var buf: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+        const candidate = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, argv0 }) catch continue;
+        const rc = std.os.linux.access(candidate, std.posix.X_OK);
+        if (std.posix.errno(rc) != .SUCCESS) continue;
+        return try gpa.dupe(u8, candidate);
+    }
+    return null;
+}
 
 fn ceilDiv(numerator: u64, denominator: u64) u64 {
     return (numerator + denominator - 1) / denominator;
@@ -460,16 +526,29 @@ fn ceilDiv(numerator: u64, denominator: u64) u64 {
 /// documented on `RlimitSpec`. `sh`'s `ulimit` takes `-f` in 512-byte blocks
 /// and `-v` in kilobytes (POSIX/dash/bash agree on this); `-t` (seconds) and
 /// `-n` (fd count) are unit-for-unit. Each `ulimit` call is guarded with
-/// `|| exit 121` so a platform that rejects a particular limit fails the
-/// spawn loudly (surfacing as a non-.exited `Term`) instead of silently
+/// `|| kill -s USR1 $$` so a platform that rejects a particular limit fails
+/// the spawn loudly (a `Term` of `.signal = SIGUSR1`) instead of silently
 /// running unsandboxed.
-fn buildRlimitWrap(gpa: std.mem.Allocator, argv: []const []const u8, r: RlimitSpec) !RlimitWrap {
+///
+/// F3, 2026-09-10: this used to be `|| exit 121` — which the doc comment
+/// ABOVE already (and wrongly) described as "surfacing as a non-`.exited`
+/// `Term`". `exit 121` is `.exited = 121` by definition; it never was
+/// anything else, and it collided head-on with a real program that happens
+/// to exit 121 on its own (`sh -c 'exit 121'` produced the identical
+/// `Term{.exited=121}` as a rejected `ulimit`, with no way to tell them
+/// apart from `Term` alone). Signalling instead makes the two cases
+/// genuinely distinguishable, because this branch can only ever run BEFORE
+/// `exec "$@"` — the caller's program has not started yet, so it cannot
+/// itself be the source of this specific signal. (`Handle.signal` could in
+/// principle deliver `SIGUSR1` to an already-`exec`'d child for unrelated
+/// reasons — that is a real but separate call, not this one.)
+fn buildRlimitWrap(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, r: RlimitSpec) !RlimitWrap {
     var script: std.ArrayList(u8) = .empty;
     errdefer script.deinit(gpa);
-    if (r.cpu_seconds) |v| try script.print(gpa, "ulimit -t {d} || exit 121\n", .{v});
-    if (r.file_size_bytes) |v| try script.print(gpa, "ulimit -f {d} || exit 121\n", .{ceilDiv(v, 512)});
-    if (r.address_space_bytes) |v| try script.print(gpa, "ulimit -v {d} || exit 121\n", .{ceilDiv(v, 1024)});
-    if (r.open_files) |v| try script.print(gpa, "ulimit -n {d} || exit 121\n", .{v});
+    if (r.cpu_seconds) |v| try script.print(gpa, "ulimit -t {d} || kill -s USR1 $$\n", .{v});
+    if (r.file_size_bytes) |v| try script.print(gpa, "ulimit -f {d} || kill -s USR1 $$\n", .{ceilDiv(v, 512)});
+    if (r.address_space_bytes) |v| try script.print(gpa, "ulimit -v {d} || kill -s USR1 $$\n", .{ceilDiv(v, 1024)});
+    if (r.open_files) |v| try script.print(gpa, "ulimit -n {d} || kill -s USR1 $$\n", .{v});
     try script.print(gpa, "exec \"$@\"\n", .{});
 
     // Finalize the script buffer BEFORE it is referenced from `wrapped`:
@@ -479,15 +558,28 @@ fn buildRlimitWrap(gpa: std.mem.Allocator, argv: []const []const u8, r: RlimitSp
     const script_owned = try script.toOwnedSlice(gpa);
     errdefer gpa.free(script_owned);
 
+    // F2: resolve argv[0] against the PARENT's real PATH before handing it
+    // to the shell's `exec "$@"` — otherwise the shell resolves it against
+    // ITS OWN (i.e. the child's, per env_mode) environment, breaking the
+    // resolution guarantee `Spec`'s doc comment makes. See
+    // `resolveArgv0ForRlimit`.
+    const resolved0: ?[]u8 = if (argv.len > 0) try resolveArgv0ForRlimit(gpa, io, argv[0]) else null;
+    errdefer if (resolved0) |s| gpa.free(s);
+
     var wrapped: std.ArrayList([]const u8) = .empty;
     errdefer wrapped.deinit(gpa);
     try wrapped.append(gpa, "/bin/sh");
     try wrapped.append(gpa, "-c");
     try wrapped.append(gpa, script_owned);
-    try wrapped.append(gpa, "sh"); // becomes $0 inside the script; exec "$@" starts at spec.argv[0]
-    try wrapped.appendSlice(gpa, argv);
+    try wrapped.append(gpa, "sh"); // becomes $0 inside the script; exec "$@" starts at argv[0] below
+    if (resolved0) |s| {
+        try wrapped.append(gpa, s);
+        try wrapped.appendSlice(gpa, argv[1..]);
+    } else {
+        try wrapped.appendSlice(gpa, argv);
+    }
 
-    return .{ .argv = try wrapped.toOwnedSlice(gpa), .script = script_owned };
+    return .{ .argv = try wrapped.toOwnedSlice(gpa), .script = script_owned, .resolved_argv0 = resolved0 };
 }
 
 fn copyEnv(dst: *std.process.Environ.Map, src: *const std.process.Environ.Map) !void {
@@ -549,12 +641,37 @@ const Drainer = struct {
     cap: usize,
     truncated: *std.atomic.Value(bool),
     err: *?anyerror,
+    /// Absolute `monoNowNs()` deadline after which this loop stops WAITING
+    /// for more data and returns, even though the pipe's write end may
+    /// still be held open by a surviving descendant the direct child forked
+    /// (e.g. `sh -c 'sleep 100 & exit 0'` without `new_process_group`) —
+    /// `null` (the `run`/`spawnStreaming` callers) preserves the original
+    /// unbounded blocking read. See F1's disposition in the audit record:
+    /// before this, `runTimeout`'s own deadline bounded the CHILD but not
+    /// `runTimeout` itself, because `pumps.join()` waited on pipe EOF, which
+    /// SIGKILLing only the direct child does not guarantee.
+    deadline_ns: ?u64 = null,
+    /// Set (instead of erroring) when `deadline_ns` fired before EOF.
+    deadline_hit: *std.atomic.Value(bool),
 };
 
 fn drainLoop(d: Drainer) void {
     defer d.file.close(d.io);
     var rbuf: [8192]u8 = undefined;
     while (true) {
+        if (d.deadline_ns) |dl| {
+            const ms = remainingMs(dl);
+            if (ms == 0) {
+                d.deadline_hit.store(true, .release);
+                return;
+            }
+            // Not ready within this slice of the deadline: loop back and
+            // recompute the remaining budget rather than trusting one
+            // `poll` call to cover the whole wait — `remainingMs` is what
+            // actually enforces the deadline, `poll`'s timeout is only how
+            // long a single round is willing to sleep.
+            if (!pollReady(d.file.handle, std.posix.POLL.IN, ms)) continue;
+        }
         const n = d.file.readStreaming(d.io, &.{rbuf[0..]}) catch return;
         if (n == 0) return;
         const have = d.list.items.len;
@@ -598,6 +715,8 @@ const Pumps = struct {
     err_list: std.ArrayList(u8) = .empty,
     trunc_out: std.atomic.Value(bool) = .init(false),
     trunc_err: std.atomic.Value(bool) = .init(false),
+    deadline_hit_out: std.atomic.Value(bool) = .init(false),
+    deadline_hit_err: std.atomic.Value(bool) = .init(false),
     out_err: ?anyerror = null,
     err_err: ?anyerror = null,
     in_err: ?anyerror = null,
@@ -609,15 +728,18 @@ const Pumps = struct {
     /// failure, force the child down so any threads already started hit EOF,
     /// join them, and propagate the error — never leaving a detached thread
     /// writing into buffers the caller is about to free.
-    fn start(p: *Pumps, cap: usize, stdin_body: []const u8) !void {
-        p.startInner(cap, stdin_body) catch |e| {
+    ///
+    /// `deadline_ns` (absolute `monoNowNs()`) bounds only the stdout/stderr
+    /// DRAIN threads, not `stdin`'s write — see F1's disposition.
+    fn start(p: *Pumps, cap: usize, stdin_body: []const u8, deadline_ns: ?u64) !void {
+        p.startInner(cap, stdin_body, deadline_ns) catch |e| {
             p.child.kill(p.io);
             p.join();
             return e;
         };
     }
 
-    fn startInner(p: *Pumps, cap: usize, stdin_body: []const u8) !void {
+    fn startInner(p: *Pumps, cap: usize, stdin_body: []const u8, deadline_ns: ?u64) !void {
         const child = p.child;
         if (child.stdout) |f| {
             child.stdout = null; // transfer ownership; drainer closes it
@@ -629,6 +751,8 @@ const Pumps = struct {
                 .cap = cap,
                 .truncated = &p.trunc_out,
                 .err = &p.out_err,
+                .deadline_ns = deadline_ns,
+                .deadline_hit = &p.deadline_hit_out,
             }}) catch |e| {
                 f.close(p.io);
                 return e;
@@ -644,6 +768,8 @@ const Pumps = struct {
                 .cap = cap,
                 .truncated = &p.trunc_err,
                 .err = &p.err_err,
+                .deadline_ns = deadline_ns,
+                .deadline_hit = &p.deadline_hit_err,
             }}) catch |e| {
                 f.close(p.io);
                 return e;
@@ -694,7 +820,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, spec: Spec, stdin_body: []const u
 
     var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child };
     errdefer pumps.deinit();
-    try pumps.start(spec.max_output_bytes, stdin_body);
+    try pumps.start(spec.max_output_bytes, stdin_body, null);
     pumps.join();
 
     if (pumps.firstErr()) |e| return e;
@@ -706,6 +832,19 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, spec: Spec, stdin_body: []const u
 /// SIGKILL'd (TerminateProcess on Windows) and reaped. On timeout the returned
 /// `Output.term` is `.signal` (SIGKILL); the partial output captured so far is
 /// still returned.
+///
+/// `runTimeout` itself is bounded by roughly `timeout_ns` (plus a small fixed
+/// grace period, `pump_grace_ns`) even if the direct child (whether it is
+/// still running, or already exited on its own) forked a descendant that is
+/// still holding stdout/stderr's write end open — see
+/// `Output.stdout_deadline_stopped`/`.stderr_deadline_stopped` and F1's
+/// disposition in the audit record. Before 2026-09-10 this call waited on
+/// `pumps.join()` (i.e. pipe EOF) before ever checking the deadline, so
+/// `sh -c 'sleep 100 & exit 0'` made `runTimeout` itself wait for the full
+/// `sleep`, not `timeout_ns` — the direct `sh` here exits on its own well
+/// inside the deadline (`Output.term` is its ordinary `.exited`, nothing to
+/// kill), but its surviving `sleep`, never itself a target of the deadline
+/// kill, kept the pipe's write end open regardless.
 pub fn runTimeout(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -713,27 +852,44 @@ pub fn runTimeout(
     stdin_body: []const u8,
     timeout_ns: u64,
 ) !Output {
+    const start_ns = monoNowNs();
     ensureChildReaping();
     var child = try spawnChild(gpa, io, spec);
     errdefer child.kill(io);
 
     var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child };
     errdefer pumps.deinit();
-    try pumps.start(spec.max_output_bytes, stdin_body);
+    // The drain deadline sits `pump_grace_ns` AFTER the killer's own
+    // deadline, on purpose: `killerLoop` is guaranteed to have already sent
+    // SIGKILL by the time the pumps give up (its polling granularity, plus
+    // scheduling slop, is well inside this margin). That ordering matters —
+    // if the pumps' deadline could fire FIRST, `done.store(true)` below
+    // could race `killerLoop` into skipping the kill entirely (it checks
+    // `done` right before delivering the signal), and the child would then
+    // never be reaped at all: `waitTolerant` blocks until it actually exits.
+    const pump_grace_ns: u64 = 250 * std.time.ns_per_ms;
+    const pump_deadline_ns = start_ns +| timeout_ns +| pump_grace_ns;
+    try pumps.start(spec.max_output_bytes, stdin_body, pump_deadline_ns);
 
-    var done = std.atomic.Value(bool).init(false);
+    var done: std.Io.Event = .unset;
     const killer = try std.Thread.spawn(.{}, killerLoop, .{KillJob{
+        .io = io,
         .child = &child,
         .timeout_ns = timeout_ns,
         .done = &done,
         .grouped = spec.new_process_group,
     }});
 
-    // Pumps finish when the child exits — naturally, or because the killer
-    // forced it. Then stop the killer BEFORE reaping so no signal can race a
-    // reaped (and possibly reused) pid.
+    // Pumps finish when the child exits naturally, when the killer forces
+    // it AND the pipe's write end actually closes, or — the case this
+    // deadline exists for — when a surviving descendant keeps the write end
+    // open and the drain threads give up waiting at `pump_deadline_ns`
+    // instead of blocking forever. Either way, by the time `pumps.join()`
+    // returns the killer is guaranteed to have already fired (see
+    // `pump_grace_ns` above), so stopping it here is safe. Stop the killer
+    // BEFORE reaping so no signal can race a reaped (and possibly reused) pid.
     pumps.join();
-    done.store(true, .release);
+    done.set(io);
     killer.join();
 
     if (pumps.firstErr()) |e| return e;
@@ -751,29 +907,77 @@ fn finish(pumps: *Pumps, term: Term) !Output {
         .stderr = err,
         .truncated_stdout = pumps.trunc_out.load(.acquire),
         .truncated_stderr = pumps.trunc_err.load(.acquire),
+        .stdout_deadline_stopped = pumps.deadline_hit_out.load(.acquire),
+        .stderr_deadline_stopped = pumps.deadline_hit_err.load(.acquire),
     };
 }
 
 const KillJob = struct {
+    io: std.Io,
     child: *std.process.Child,
     timeout_ns: u64,
-    done: *std.atomic.Value(bool),
+    /// Woken (via `Event.set`) by `runTimeout` as soon as `pumps.join()`
+    /// returns — i.e. the moment the child is known to be finished, instead
+    /// of on the next fixed polling tick. See F4's disposition.
+    done: *std.Io.Event,
     /// Kill the child's whole process group instead of just the child
     /// itself — set from `Spec.new_process_group`; see `deliverGroup`.
     grouped: bool = false,
 };
 
+/// F4, 2026-09-10: this used to poll `j.done` in fixed 5ms steps
+/// (`sleepNs`), so a child that finished microseconds after a step began
+/// still cost up to 5ms of pure sleep before `runTimeout` noticed —
+/// measured at 4.7x `run()`'s cost for a child that exits immediately (mean
+/// 6.447ms vs 1.363ms over 100 paired runs), almost entirely polling
+/// granularity, not real work (the *minimum* observed was 1.430ms, i.e. the
+/// fast path already existed). `Event.waitTimeout` blocks on a futex
+/// instead: `runTimeout` wakes this loop the instant it knows the outcome,
+/// and absent that, this still fires within `timeout_ns` of spawn.
 fn killerLoop(j: KillJob) void {
-    const step: u64 = 5 * std.time.ns_per_ms;
-    var slept: u64 = 0;
-    while (slept < j.timeout_ns) {
-        if (j.done.load(.acquire)) return;
-        const chunk = @min(step, j.timeout_ns - slept);
-        sleepNs(chunk);
-        slept += chunk;
+    const deadline_ns = monoNowNs() +| j.timeout_ns;
+    while (true) {
+        const remaining = remainingNs(deadline_ns);
+        if (remaining == 0) break;
+        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(remaining)), .clock = .awake } };
+        // `error.Timeout` (the deadline elapsed) and a spurious wake both
+        // just loop back to re-check `remaining`/`isSet` below; `Cancelable`
+        // is likewise not actionable from a detached worker thread.
+        j.done.waitTimeout(j.io, timeout) catch {};
+        if (j.done.isSet()) return;
     }
-    if (j.done.load(.acquire)) return;
+    if (j.done.isSet()) return;
     if (j.grouped) deliverGroup(j.child, .kill, 0, true) else deliver(j.child, .kill, 0);
+}
+
+fn monoNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Nanoseconds remaining until `deadline_ns` (an absolute `monoNowNs()`
+/// timestamp) — `0` means "already past", never negative (never wraps).
+fn remainingNs(deadline_ns: u64) u64 {
+    const now = monoNowNs();
+    return if (now >= deadline_ns) 0 else deadline_ns - now;
+}
+
+/// Milliseconds remaining until `deadline_ns`, clamped to `[0, maxInt(i32)]`
+/// — never so large it overflows `poll`'s `i32 timeout_ms`.
+fn remainingMs(deadline_ns: u64) i32 {
+    const remaining_ms = remainingNs(deadline_ns) / std.time.ns_per_ms;
+    return if (remaining_ms > std.math.maxInt(i32)) std.math.maxInt(i32) else @intCast(remaining_ms);
+}
+
+/// `poll(2)` for `events` on `fd` with a bounded wait. A `poll` failure
+/// itself (as opposed to a timeout) is reported as "ready" — the caller's
+/// next `read`/`write` then hits the same condition directly and surfaces
+/// its own, more specific error, rather than this helper swallowing it.
+fn pollReady(fd: std.posix.fd_t, events: i16, timeout_ms: i32) bool {
+    var fds = [1]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+    const n = std.posix.poll(&fds, timeout_ms) catch return true;
+    return n > 0;
 }
 
 fn sleepNs(ns: u64) void {
@@ -1084,12 +1288,6 @@ fn streamErrLoop(ctx: *StreamCtx) void {
 
 const testing = std.testing;
 
-fn monoNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
-}
-
 test "run: echo captures stdout and exits 0" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!std.process.can_spawn) return error.SkipZigTest;
@@ -1200,6 +1398,96 @@ test "runTimeout: kills a child that outlives the deadline" {
 
     try testing.expect(out.term == .signal); // SIGKILL'd, not exited
     try testing.expect(elapsed < 5 * std.time.ns_per_s); // returned promptly
+}
+
+test "F1: runTimeout returns within its own deadline even when a backgrounded grandchild keeps stdout's pipe open" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Exactly the audit's own reproduction shape: the direct child
+    // backgrounds a longer-running process and exits immediately itself.
+    // Without `new_process_group`, SIGKILL reaches only the direct `sh`;
+    // `sleep 2` inherits the same stdout pipe and, as long as IT runs, the
+    // pipe's write end stays open — so waiting for EOF on that pipe waits
+    // for `sleep 2`, not for the 200ms deadline below.
+    const start = monoNowNs();
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "sleep 2 & exit 0" },
+    }, "", 200 * std.time.ns_per_ms);
+    defer out.deinit(testing.allocator);
+    const elapsed_ns = monoNowNs() - start;
+
+    // `term` is `.exited = 0` in BOTH the RED and GREEN cases here — the
+    // direct `sh` legitimately exits (code 0) almost immediately (that is
+    // the whole point of the repro), well before the deadline, so the
+    // killer has nothing to kill; this is exactly what the audit measured
+    // too (its own "term = .exited = 0" line, at a 500ms deadline). The bug
+    // was never about `term` — it was that `runTimeout` did not RETURN
+    // until the pipe closed, i.e. until `sleep 2`, the grandchild it never
+    // touched, also exited.
+    //
+    // RED before the 2026-09-10 fix (the audit's own measurement, same
+    // shape, 500ms deadline): ~5004ms elapsed. GREEN: bounded by the
+    // deadline plus the fixed pump grace (250ms), nowhere near the 2s
+    // `sleep` — and the new field records why stdout may be incomplete.
+    try testing.expect(elapsed_ns < 1 * std.time.ns_per_s);
+    try testing.expect(out.term == .exited);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expect(out.stdout_deadline_stopped);
+}
+
+test "F1 positive control: runTimeout does NOT report deadline-stopped for an ordinary child that exits well inside the deadline" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "/bin/echo", "hello" },
+    }, "", 5 * std.time.ns_per_s);
+    defer out.deinit(testing.allocator);
+
+    try testing.expect(out.term == .exited);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+    try testing.expectEqualStrings("hello\n", out.stdout);
+    try testing.expect(!out.stdout_deadline_stopped);
+    try testing.expect(!out.stderr_deadline_stopped);
+}
+
+test "F4: runTimeout on a child that exits immediately returns promptly, not delayed by fixed-interval polling" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // The audit measured the OLD (fixed 5ms-step polling) killerLoop adding
+    // ~5ms per call regardless of how fast the child actually finished —
+    // 100 paired runs: run() mean 1.363ms / min 1.018ms vs runTimeout()
+    // mean 6.447ms / min 1.430ms. The *minimum* being close to run()'s
+    // shows a fast path already existed; the mean being ~5x higher shows
+    // most calls paid a near-full polling step regardless. This bound is
+    // deliberately generous (a coarse regression guard, not a tight
+    // benchmark — this machine may run several other agents' test lanes
+    // concurrently) but is still well under what a *reintroduced*
+    // fixed-step poll would add on top of a sub-millisecond spawn.
+    const trials = 20;
+    var total_ns: u64 = 0;
+    var i: u32 = 0;
+    while (i < trials) : (i += 1) {
+        const start = monoNowNs();
+        var out = try runTimeout(testing.allocator, io, .{
+            .argv = &.{ "/bin/echo", "hi" },
+        }, "", 5 * std.time.ns_per_s);
+        out.deinit(testing.allocator);
+        total_ns += monoNowNs() - start;
+    }
+    const mean_ns = total_ns / trials;
+    try testing.expect(mean_ns < 50 * std.time.ns_per_ms);
 }
 
 test "spawnStreaming: separates streams and reports exit 3" {
@@ -1674,6 +1962,106 @@ test "RlimitSpec: generous limits do not disturb an ordinary command" {
     try testing.expect(out.term == .exited);
     try testing.expectEqual(@as(u8, 0), out.term.exited);
     try testing.expectEqualStrings("hello\n", out.stdout);
+}
+
+test "F2: under rlimit, argv[0] resolution still uses the PARENT's real PATH, not the child's" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest; // needs /proc for loadParentEnv
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A decoy "true" that is NOT the real one, on a PATH that contains
+    // nothing else — a resolution that actually searches THIS PATH finds
+    // only the decoy, which is loudly detectable (prints a marker; the real
+    // /bin/true or /usr/bin/true prints nothing).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile(io, "true", .{});
+        defer f.close(io);
+        var wbuf: [64]u8 = undefined;
+        var fw = f.writer(io, &wbuf);
+        try fw.interface.writeAll("#!/bin/sh\necho DECOY\n");
+        try fw.interface.flush();
+        try testing.expectEqual(@as(usize, 0), std.os.linux.fchmod(f.handle, 0o755));
+    }
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_abs_len = try tmp.dir.realPath(io, &path_buf);
+    const decoy_dir = path_buf[0..dir_abs_len];
+
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("PATH", decoy_dir); // the ONLY thing a genuine search of this PATH can find
+
+    // Without rlimit: positive control. `Spec`'s own doc comment already
+    // promises this resolves against the parent's real PATH regardless of
+    // env_mode — confirms the baseline the fix must not disturb.
+    {
+        var out = try run(testing.allocator, io, .{
+            .argv = &.{"true"},
+            .env = &env,
+            .env_mode = .clear,
+        }, "");
+        defer out.deinit(testing.allocator);
+        try testing.expect(out.term == .exited);
+        try testing.expectEqual(@as(u8, 0), out.term.exited);
+        try testing.expect(!std.mem.eql(u8, out.stdout, "DECOY\n")); // real `true`: no output
+    }
+
+    // With rlimit: RED before the 2026-09-10 fix — the wrapper shell's own
+    // `exec "$@"` resolved "true" against ITS environment (the decoy-only
+    // PATH from env_mode=.clear), running the decoy and printing "DECOY".
+    // GREEN: argv[0] is resolved against the parent's real PATH before the
+    // shell ever runs, so this still finds the real `true`, same as above.
+    {
+        var out = try run(testing.allocator, io, .{
+            .argv = &.{"true"},
+            .env = &env,
+            .env_mode = .clear,
+            .rlimit = .{ .cpu_seconds = 10 },
+        }, "");
+        defer out.deinit(testing.allocator);
+        try testing.expect(out.term == .exited);
+        try testing.expectEqual(@as(u8, 0), out.term.exited);
+        try testing.expect(!std.mem.eql(u8, out.stdout, "DECOY\n"));
+    }
+}
+
+test "F3: a rejected ulimit is a distinguishable signal, not the same Term as a child legitimately exiting 121" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // RED before the 2026-09-10 fix: both of these produced the IDENTICAL
+    // Term{.exited=121} — a rejected ulimit was indistinguishable from a
+    // child that just happens to exit 121 on its own (the audit's own
+    // reproduction, verbatim: `open_files = 1 << 40`). GREEN: the rejected
+    // ulimit now surfaces as Term{.signal=SIGUSR1}, which a real child
+    // cannot produce by exiting normally.
+    {
+        var out = try run(testing.allocator, io, .{
+            .argv = &.{ "/bin/echo", "unreached" },
+            .rlimit = .{ .open_files = 1 << 40 }, // rejected by `ulimit -n` on any real system
+        }, "");
+        defer out.deinit(testing.allocator);
+        try testing.expect(out.term == .signal);
+        try testing.expectEqual(std.posix.SIG.USR1, out.term.signal);
+    }
+
+    // Positive control: an ordinary child that legitimately exits 121 (no
+    // rlimit at all) still reports an honest .exited=121 — untouched by the
+    // fix.
+    {
+        var out = try run(testing.allocator, io, .{
+            .argv = &.{ "sh", "-c", "exit 121" },
+        }, "");
+        defer out.deinit(testing.allocator);
+        try testing.expect(out.term == .exited);
+        try testing.expectEqual(@as(u8, 121), out.term.exited);
+    }
 }
 
 // ── streaming stdin tests ───────────────────────────────────────────────────

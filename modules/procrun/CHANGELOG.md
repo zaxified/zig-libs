@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, six findings
+  from the 2026-09-04 audit. `runTimeout` is now actually bounded by roughly
+  its own `timeout_ns` (plus a small fixed grace): before, it waited on the
+  stdout/stderr pipes reaching EOF, which a descendant the direct child forked
+  (e.g. `sh -c 'sleep 100 & exit 0'`) could hold open indefinitely even after
+  the direct child was killed — `sh -c 'sleep 2 & exit 0'` at a 200ms deadline
+  used to return after the full `sleep`; now it returns within ~450ms. New
+  `Output.stdout_deadline_stopped`/`.stderr_deadline_stopped` fields say when
+  capture was cut short by the deadline rather than EOF. Under `Spec.rlimit`,
+  `argv[0]` PATH resolution now genuinely always uses the parent's real `PATH`
+  (as `Spec`'s doc comment already promised) instead of the wrapper shell's
+  own `exec "$@"` resolving it against the child's `PATH` per `env_mode`. A
+  rejected `ulimit` inside the `rlimit` wrapper now surfaces as
+  `Term{.signal = SIGUSR1}` instead of `Term{.exited = 121}`, which used to be
+  indistinguishable from a child that legitimately exits 121 on its own.
+  `runTimeout`'s internal killer thread no longer polls in fixed 5ms steps
+  (measured 4.7x overhead on a child that exits immediately) — it now blocks
+  on `std.Io.Event.waitTimeout` and is woken directly. `Spec.max_output_bytes`
+  and `Spec.rlimit`'s `/bin/sh` dependency are now documented accurately (were
+  previously silent or, in one case, actively wrong about what the code did).
+  See `A1/procrun.md`'s 2026-09-10 disposition for the measured before/after
+  on each.
 - **2026-09-03** — Drift re-audit. **A signal is no longer sent to a pid we may
   no longer own.** This module exists because a sibling thread's `wait4(-1)`
   can reap our child; the edge nobody had covered is what happens NEXT. Once

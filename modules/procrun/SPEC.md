@@ -18,7 +18,14 @@ the zig-libs authors (MIT).
 - **Deadlock-free capped stdio capture:** separate stdin-writer / stdout-drainer / stderr-drainer
   threads, so a stdin body larger than the pipe buffer can't deadlock a child withholding stdout. A
   per-stream cap **keeps the prefix and keeps draining** past the cap (unlike `std.process.run`'s
-  `error.StreamTooLong`, which discards everything).
+  `error.StreamTooLong`, which discards everything). **`Spec.max_output_bytes` bounds only the
+  MEMORY a `run`/`runTimeout` call retains — never time or I/O.** The drain-past-the-cap loop is
+  deliberate (so the child can flush and exit instead of blocking on a full pipe), but it still
+  reads and discards every byte the child writes: a hostile child that writes 1 GiB past a 1 KiB
+  cap costs the caller ~1 GiB of read()s and wall time 1:1, regardless of the cap. `run()` has no
+  time bound of its own — pair a small cap with `runTimeout` (F1, 2026-09-10, made `runTimeout`
+  itself actually bounded) to also bound wall time, or with `Spec.rlimit`'s `address_space_bytes`/
+  `cpu_seconds` to bound the child's own resource use directly. See F5 in `A1/procrun.md`.
 - **Three env policies** (`.inherit`/`.clear`/`.merge`): `.merge` reads the parent snapshot
   libc-free from `/proc/self/environ` (Linux) or the PEB (Windows); other POSIX targets without
   `/proc` may see an empty snapshot there — `.clear` is the documented fallback.
@@ -33,7 +40,15 @@ the zig-libs authors (MIT).
 Not a full sandbox: no seccomp/namespace isolation (that remains the caller's responsibility); an
 opt-in `RlimitSpec` (`Spec.rlimit`) covers the resource-exhaustion axis only (CPU/address-space/
 open-files/file-size), applied via a `/bin/sh -c 'ulimit ...; exec "$@"'` wrapper — see SPEC below
-for why (`std.process.spawn` has no post-fork/pre-exec hook). `argsafe` integration
+for why (`std.process.spawn` has no post-fork/pre-exec hook). **`Spec.rlimit` therefore hard-depends
+on `/bin/sh` existing and being POSIX-`ulimit`-capable — a caller sandboxing a distrusted program
+with `rlimit` runs a shell first to get there.** (F6, 2026-09-10: an earlier audit's headline PASS —
+"no `/bin/sh`, no `-c`, anywhere in the module" — was true before `rlimit` existed and is not
+true now; not rewritten in place, since it is a dated snapshot, but recorded here and in
+`A1/procrun.md`'s 2026-09-10 disposition.) Only numeric limit VALUES (formatted by this module,
+never caller-supplied text) are embedded in the generated script, and `Spec.argv` reaches the
+shell as positional parameters (`"$@"`), never re-parsed as shell syntax — so this does not by
+itself reopen a shell-injection surface, it only adds the dependency. `argsafe` integration
 (`runValidated`/`buildValidatedArgv`) is opt-in — the ordinary `run`/`runTimeout`/`spawnStreaming`
 entry points still treat `Spec.argv` as trusted-by-construction; callers building argv from
 untrusted input either use `runValidated` or sanitize it themselves. Full reap-race-tolerance
@@ -95,8 +110,14 @@ spawning anything** alongside an accept-and-actually-run case. Run: `zig build t
 - **Type-level "consumed" marker** — a move-only handle preventing a double-`wait`/double-reap at
   compile time. Still open.
 - **PATH-resolution policy** — explicit control over `argv[0]` PATH resolution independent of
-  `argsafe` (now wired in for argv *sanitization* via `runValidated`/`buildValidatedArgv`; PATH
-  *resolution* policy itself is unchanged from v1 — see `Spec`'s doc comment). Still open.
+  `argsafe` (now wired in for argv *sanitization* via `runValidated`/`buildValidatedArgv`). Still
+  open as a general knob. ~~One specific gap in it~~ — F2, 2026-09-10, fixed: under `Spec.rlimit`
+  the `exec "$@"` inside the wrapper shell used to resolve a `/`-less `argv[0]` against the
+  SHELL's (i.e. the child's, per `env_mode`) `PATH`, breaking `Spec`'s own documented promise that
+  resolution "ALWAYS reads from the real parent process environment, regardless of `env_mode`" —
+  true without `rlimit` (`std.process.spawn` resolves it directly, against the real environment),
+  false with it. `argv[0]` is now resolved against the parent's real `PATH` before the shell ever
+  runs (`resolveArgv0ForRlimit`), so the promise holds in both cases.
 - ~~**Process-group / `setsid` + whole-tree kill**~~ — done: `Spec.new_process_group` (`setpgid(0,
   0)`) + `Handle.cancelGroup`/`killGroup`/`signalGroup` + a grouped `runTimeout` deadline-kill.
 - ~~**rlimit control**~~ — done: `Spec.rlimit` (`RlimitSpec`: CPU/address-space/open-files/
