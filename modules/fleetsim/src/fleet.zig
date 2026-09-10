@@ -274,6 +274,13 @@ pub const Fleet = struct {
     /// Frames lost because a pool or budget was exhausted.
     capacity_losses: u64 = 0,
 
+    /// Test-only one-shot hook: the next `freeSlot` silently drops the slot
+    /// instead of returning it, then clears itself. Lets `Vopr`'s `SlotLeak`
+    /// invariant be exercised by a real (if synthetic) defect instead of only
+    /// existing as a measurement recorded in `SPEC.md` — see `vopr.zig`'s
+    /// `leak_slot` option. Never set outside a test.
+    leak_slot_once: bool = false,
+
     const Partition = struct { id: u32, cut: []const NodeId };
 
     /// Separate stream constant so the signal PRNG cannot alias the link one.
@@ -758,6 +765,10 @@ pub const Fleet = struct {
     }
 
     fn freeSlot(self: *Fleet, slot: u32) void {
+        if (self.leak_slot_once) {
+            self.leak_slot_once = false;
+            return; // deliberately dropped once, see `leak_slot_once`'s doc
+        }
         self.free_slots[self.free_count] = slot;
         self.free_count += 1;
     }

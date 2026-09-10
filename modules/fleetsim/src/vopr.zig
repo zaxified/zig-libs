@@ -188,6 +188,12 @@ pub const Options = struct {
     /// Use the hand-rolled toy device rather than `adapters.Modbus`. Implied by
     /// any `bug` other than `.none`.
     toy: bool = false,
+    /// Arm the fleet's `leak_slot_once` hook on every rebuild, so exactly one
+    /// in-flight slot is silently dropped instead of returned. `SlotLeak` is
+    /// fleet-internal — no `Bug` arm can trip it, because a `BrokenDevice`
+    /// only ever touches the bytes it hands back, never the pool that carries
+    /// them — so this is the invariant's own positive control.
+    leak_slot: bool = false,
 };
 
 /// A fleet of `device_count` Modbus devices polled by one master, wired up as a
@@ -441,6 +447,7 @@ pub fn Vopr(comptime device_count: usize) type {
                 .record_frames = false,
             });
             self.fleet_live = true;
+            self.fleet.leak_slot_once = self.opts.leak_slot;
 
             const toy = self.opts.toy or self.opts.bug != .none;
             for (0..device_count) |i| {
@@ -776,4 +783,69 @@ test "vopr: the netsim-driven fleet is deterministic across identical seeds" {
     try testing.expectEqual(fleet_fp1, h.fleet.fingerprint);
     try testing.expectEqual(replies1, h.totalReplies());
     try testing.expect(replies1 > 20);
+}
+
+test "vopr: SlotLeak fires when a slot is silently never returned" {
+    // The only positive control this invariant can have: no `Bug` arm on
+    // `BrokenDevice` reaches the in-flight pool, so without `leak_slot` this
+    // property is checked but never proven to bite (see F-E in the audit
+    // record). `leak_slot` arms `Fleet.leak_slot_once`, which drops the very
+    // first slot a response would otherwise return — no adversary needed, the
+    // pool goes short on the first reply.
+    const gpa = testing.allocator;
+    var h = Harness.init(gpa, .{ .fleet_seed = 7, .leak_slot = true });
+    defer h.deinit();
+
+    var gr = try netsim.run(gpa, h.case(0, run_until), .{});
+    defer gr.trace.deinit();
+
+    try testing.expectEqual(netsim.RunOutcome.violated, gr.result.outcome);
+    try testing.expectEqual(Violation.SlotLeak, gr.result.violation.?.err);
+}
+
+test "vopr: a reply naming transaction id 0 trips UnknownTransaction" {
+    // The `txid == 0` half of the check (F-G item 4) has no witness among the
+    // `BrokenDevice` bugs: `.invented_transaction` fabricates `0xF000 +
+    // counter`, which the run length never reaches zero within. Exercised
+    // directly against `onReply` instead — no fleet needed, this oracle reads
+    // only bytes.
+    const gpa = testing.allocator;
+    var h = Harness.init(gpa, .{ .fleet_seed = 7 });
+    defer h.deinit();
+    h.issued[0] = 1;
+
+    // MBAP: txid=0 proto=0 length=11 unit=1 | PDU: fc=0x03 count=8 4*u16=500
+    var payload = [_]u8{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x01,
+        0x03, 0x08, 0x01, 0xF4, 0x01, 0xF4, 0x01,
+        0xF4, 0x01, 0xF4,
+    };
+    h.onReply(1, &payload);
+    const v = h.violation orelse return error.NoViolationReported;
+    try testing.expectEqual(Violation.UnknownTransaction, v);
+}
+
+test "vopr: a byte count that disagrees with the read size trips MalformedReply" {
+    // F-G item 3: `length_counts_retransmit` trips the FRAME-length check
+    // (`n != payload.len`, one guard up) before this one is ever reached — so
+    // the byte-count/read-size agreement has never been the thing that made a
+    // test fail. Built self-consistent on purpose (`payload.len == 9 +
+    // byte_count`) so the frame-length check passes and only this guard can
+    // catch a device that answered with three registers where four were
+    // asked for.
+    const gpa = testing.allocator;
+    var h = Harness.init(gpa, .{ .fleet_seed = 7 });
+    defer h.deinit();
+    h.issued[0] = 1;
+
+    // MBAP: txid=1 proto=0 length=9 unit=1 | PDU: fc=0x03 count=6 3*u16=500
+    var payload = [_]u8{
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x09, 0x01,
+        0x03, 0x06, 0x01, 0xF4, 0x01, 0xF4, 0x01,
+        0xF4,
+    };
+    try testing.expectEqual(@as(usize, 15), payload.len);
+    h.onReply(1, &payload);
+    const v = h.violation orelse return error.NoViolationReported;
+    try testing.expectEqual(Violation.MalformedReply, v);
 }

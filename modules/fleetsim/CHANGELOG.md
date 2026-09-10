@@ -5,6 +5,78 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, oracle-audit follow-up (zero consumers,
+  confirmed against `build.zig`'s `example_apps` table as well as
+  `module-graph` — P1 applies without qualification). Four of the seven
+  findings turned out to be **already fixed** by the `2026-09-01` security
+  audit commit below, before this session started; verified against
+  `114eb1fe9^` (RED) vs. today's tree (GREEN), `114eb1fe9` confirmed an
+  ancestor of this branch. Two more get test-only fixes this session. One
+  stays open, deliberately.
+
+  - **F-A** (HIGH, OPC UA ACKF golden couldn't discriminate the handshake
+    negotiation it claimed to anchor) — already fixed in `114eb1fe9`: the
+    HELLO's four limits are asymmetric and straddle the server's ceilings,
+    re-anchored against a fresh Wireshark 4.6.4 reading. Confirmed still
+    fixed: both survivor mutations from the audit (drop the receive/send
+    cross-swap; echo `max_message_size` verbatim) go RED on this test alone.
+  - **F-B** (MED, S7comm Connect-Confirm golden couldn't discriminate the
+    COTP reference placement) — already fixed in `114eb1fe9`: the CR's
+    source reference is `0x0004` instead of `0x0001`, so destref/srcref
+    placement is no longer symmetric; re-anchored against Wireshark.
+  - **F-D** (MED, two concurrent `test-fleetsim` runs make one fail with a
+    wrong verdict) — already fixed in `114eb1fe9`: the three hardcoded TCP
+    ports (`15571`/`15572`/`15573`) now derive from the pid, strided by
+    four. `114eb1fe9^` still has the literal ports.
+  - **F-F** (LOW, EtherNet/IP Wireshark vector used an all-zero sender
+    context) — already fixed in `114eb1fe9`: the RegisterSession request
+    now carries `"zigfleet"` as the sender context instead of eight zero
+    bytes, so an adapter that drops the echo is now visible to this vector
+    too (previously mitigated only by the `master_goldens` pycomm3 corpus).
+  - **F-C** (MED, the S7 negotiated-PDU mark (`db2[8]`) is a verbatim echo
+    of the number the master itself proposed, because the live fixture's
+    device ceiling equals the master's proposal) — **left OPEN.** The
+    comment was already corrected in `114eb1fe9` to say plainly that the
+    mark is an echo; the substantive fix (re-record the VM-lane session
+    with the device ceiling set BELOW the master's proposal) needs the
+    disposable-VM master lane, which this session does not have access to.
+    ⏸ ODLOŽENO NA KONEC KAMPANĚ — vyžaduje VM lane / plnou bránu.
+  - **F-E** (MED, `SlotLeak` is a correct fleet-internal conservation
+    invariant with no positive control — no `Bug` arm on `BrokenDevice` can
+    reach the in-flight pool) — **fixed.** Added `Fleet.leak_slot_once`, a
+    test-only one-shot hook that silently drops the next slot instead of
+    returning it (default `false`, additive field), and `Vopr.Options
+    .leak_slot` to arm it on rebuild. New test
+    `"vopr: SlotLeak fires when a slot is silently never returned"`.
+    Measured: on `114eb1fe9` (pre-fix), neutering the `SlotLeak` predicate
+    (`if (false and ...)`) leaves the whole suite green (89/89, 0 fail) —
+    reproducing the audit's own "SURVIVED" finding exactly. On this fix,
+    the same neutering now fails the new test alone (89 pass, 1 fail);
+    reverted, clean tree is 90/90.
+  - **F-G** (LOW, four guards in `vopr.zig` are correct but untested) —
+    **partially fixed.** Items 3 and 4 get direct tests against `onReply`
+    (no fleet or adversary needed — the oracle reads only bytes): a reply
+    with `txid == 0` (item 4, the half of `UnknownTransaction` no existing
+    `Bug` arm reaches) and a reply whose PDU byte count disagrees with the
+    read size while staying frame-length-consistent (item 3 — until now
+    `length_counts_retransmit` always tripped the FRAME-length check one
+    guard up before this one was ever reached). Measured on the pre-fix
+    tree: neutering both guards together leaves the suite green (89/89).
+    On the fix: each neutered individually fails exactly its own new test
+    (91 pass/1 fail each); the byte-count mutation additionally turned up a
+    **real out-of-bounds panic** — without the guard, `onReply`'s value
+    loop reads `read_count * 2` bytes starting at a fixed offset regardless
+    of what the frame actually carries, so a short reply drives it past the
+    buffer end (a genuine bounds-safety property, not merely a grading
+    gap). Items 1 (the poll-timer generation guard) and 2 (the `pump` call
+    at the top of `onTimer`) are left open — both need a working `netsim.Sim`
+    (crash+restart timer races, tick-during-silence), out of proportion to
+    a LOW-severity, direct-unit-test session. Item 5 needs no action; its
+    own comment already states the guard is unreachable-by-design and that
+    was re-verified.
+
+  `scripts/modtest fleetsim`: 92/92 (8 skipped; Debug and ReleaseFast).
+
 - **2026-09-07** — **Test-only: the six-adapter dispatch fuzz target built no
   fleet, added no node and submitted no frame — it returned before allocating
   anything, on every run it has ever made.** `fuzzSmith` drew
