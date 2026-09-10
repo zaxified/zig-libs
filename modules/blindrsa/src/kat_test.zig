@@ -248,6 +248,36 @@ test "B3: blindSign's own mandatory self-check rejects a pk with the wrong e, in
     );
 }
 
+// ── B18: is the Debug-only pk.n == sk.n assert load-bearing in ReleaseFast? ─
+//
+// `blindSign` guards `pk.n == sk.n` with `std.debug.assert`, which ReleaseFast
+// compiles out entirely (audit finding B18). B3 above already showed the
+// mandatory self-check (RSAVP1(pk,s) == m) independently catches a `pk` that
+// shares `sk`'s modulus but has the WRONG exponent. This test closes the
+// other half: a `pk` whose MODULUS itself differs from `sk`'s (same byte
+// length, one bit flipped -- not a range mismatch, a genuine value
+// mismatch), built and run in ReleaseFast, where the assert is a no-op.
+// If the self-check did not independently reject this, blindSign would need
+// to fall back to the assert for safety and B18 would be a live gap.
+test "B18: even with the pk.n == sk.n assert compiled away (ReleaseFast), a pk with a different modulus is still rejected by the self-check (audit finding B18)" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const sk = try kat.secretKey();
+
+    // Same byte length as kat.n, same (odd) parity, one bit flipped deep in
+    // the middle -- a plausible "wrong modulus", not an out-of-range one.
+    var wrong_n = kat.n;
+    wrong_n[wrong_n.len / 2] ^= 0x40;
+    const wrong_pk = try rsa.PublicKey.fromBytes(&wrong_n, &kat.e);
+    try testing.expect(!wrong_pk.n.v.eql((try kat.publicKey()).n.v));
+
+    var csprng = std.Random.DefaultCsprng.init([_]u8{0x18} ** 32);
+    var out: [blindrsa.max_modulus_len]u8 = undefined;
+    try testing.expectError(
+        error.SigningFailure,
+        blindrsa.blindSign(sk, wrong_pk, csprng.random(), &kat.a1.blinded_msg, &out),
+    );
+}
+
 test "blindSign rejects a wrong-length or out-of-range blinded_msg (RFC 9474 SS4 BlindSign range check)" {
     const sk = try kat.secretKey();
     const pk = try kat.publicKey();

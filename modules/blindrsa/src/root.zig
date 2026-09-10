@@ -160,8 +160,19 @@ const InvertError = error{NotInvertible};
 /// `maskedInvert` instead; this direct form is for the deterministic
 /// `blindWithFactor` KAT seam and for values already independent of any
 /// long-term secret.
-fn feInvert(m: rsa.Modulus, x: rsa.Fe) InvertError!rsa.Fe {
+fn feInvert(m: rsa.Modulus, x_param: rsa.Fe) InvertError!rsa.Fe {
     const modulus_len = byteLen(m.bits());
+
+    // `x_param` arrives as a by-value Fe copy -- this function's OWN copy on
+    // its own frame, same class of gap as audit finding B6/B9 (which fixed
+    // `blind`/`blindCore`/`maskedInvert`/`blindSign`'s struct-level Fe
+    // copies but missed this one): only `x_bytes` below was ever wiped, not
+    // the struct-level `x` that produced it. `feInvert` is reached with a
+    // real, unmasked secret both via `maskedInvert` (masked `v`) and
+    // directly via `blindWithFactor` (the caller's raw `r`), so this is
+    // live, not theoretical.
+    var x = x_param;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&x));
 
     var x_bytes: [max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &x_bytes);
@@ -1185,9 +1196,41 @@ test "B9: blind()'s r_bytes buffer (the byte-level secureZero) does not survive 
     const hits_be = deadStackScan(be, base, window);
     // NOT asserted -- see the comment above this test (B6 stays open).
     const hits_le = deadStackScan(le, base, window);
+
+    // needle C/D: the OTHER half of B9 that never had an anchor -- the
+    // masked value `v` that maskedInvert actually feeds into feInvert's
+    // variable-time Euclid arena (`scratch` in `feInvert`), as opposed to
+    // `r` itself, which never reaches that arena directly. Under this
+    // test's DeadStackFixedRandom (every draw returns the SAME bytes,
+    // `kat.r`), `sampleFe`'s first accepted draw is `r` itself, so
+    // `maskedInvert`'s mask `u` is ALSO `kat.r` (same fixed source) and
+    // `v = r * u mod n = r^2 mod n` is fully computable here -- no need to
+    // instrument the module to know what value to search for.
+    const pk_n = pk.n;
+    const r_fe = rsa.Fe.fromBytes(pk_n, &kat.r, .big) catch unreachable;
+    const v_fe = pk_n.mul(r_fe, r_fe);
+    var v_bytes: [max_modulus_len]u8 = undefined;
+    v_fe.toBytes(&v_bytes, .big) catch unreachable;
+    const v_be = v_bytes[0..32];
+    var v_rev: [max_modulus_len]u8 = undefined;
+    for (v_bytes, 0..) |c, idx| v_rev[v_bytes.len - 1 - idx] = c;
+    const v_le = v_rev[0..32];
+
+    const hits_v_be = deadStackScan(v_be, base, window);
+    const hits_v_le = deadStackScan(v_le, base, window);
     std.debug.print(
-        "B9/B6 dead-stack scan, {d} KiB below blind()'s frame: r big-endian (r_bytes, wiped -- ASSERTED) = {d} hits, r ff.Fe limb order (std.crypto.ff internal, NOT asserted, B6 open) = {d} hits\n",
-        .{ window / 1024, hits_be, hits_le },
+        "B9/B6 dead-stack scan, {d} KiB below blind()'s frame: r big-endian (r_bytes, wiped -- ASSERTED) = {d} hits, r ff.Fe limb order (std.crypto.ff internal, NOT asserted, B6 open) = {d} hits, v=r^2 mod n big-endian (feInvert's x_bytes + Euclid scratch arena + x_param, NOT asserted -- see below) = {d} hits, v ff.Fe/big.int limb order (NOT asserted, same B6-class leak) = {d} hits\n",
+        .{ window / 1024, hits_be, hits_le, hits_v_be, hits_v_le },
     );
     try std.testing.expectEqual(@as(usize, 0), hits_be);
+    // B9 anchor for the Euclidean arena, but NOT a closing one: this needle
+    // found 2 hits even AFTER adding feInvert's own `x_param` struct-level
+    // wipe (see feInvert above) on top of the pre-existing `x_bytes`/
+    // `scratch` byte-level wipes -- RED before that fix, RED after it,
+    // identical count. Same class as B6 (a std.crypto.ff-internal copy this
+    // module's own secureZero calls cannot reach), just for `v` instead of
+    // `r`. NOT asserted -- asserting 0 here would be exactly the dishonest
+    // "measured as ineffective, checked off anyway" the campaign brief
+    // warns against. This is the anchor B9 was missing for its second half;
+    // it does not close B9, it gives it real, measured evidence.
 }
