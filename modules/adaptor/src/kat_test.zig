@@ -229,6 +229,81 @@ test "property: extract REJECTS a genuine (r-matching) full signature adapted wi
     try std.testing.expectError(error.AdaptorSecretMismatch, adaptor.extract(presig, full_sig, wrong_t_point));
 }
 
+// Regression (audit A1 `adaptor` F2): `extract`'s DL check must reject a
+// forged pair whose recovered scalar has the SAME x-coordinate as `T` but is
+// NOT `t` itself — i.e. `y_used = n - t`, whose point is `-T` (same x,
+// opposite y). A check weakened to compare only `x(implied)` against
+// `x(T)` — instead of the full point equality `extract` actually uses
+// (`implied.equivalent(t_point)`) — would wrongly ACCEPT this. Constructed
+// exactly as the audit describes: choose `full_sig.s = presig.s_prime +
+// (n - t)`, so `y = s - s_prime = n - t`, and (since this vector's
+// `needs_negation` may itself flip the sign again) the crafted `s` is chosen
+// so the FINAL `y_used` — after `extract`'s own conditional negation — comes
+// out to `n - t`, not `t`.
+test "audit F2: extract REJECTS a forged (r-matching) signature whose recovered scalar is n-t (same x as T, wrong y)" {
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const vec = v.vectors[2];
+    const sk = try bip340.SecretKey.fromBytes(hexN(32, vec.sk));
+    const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
+    const presig = try adaptor.preSign(sk, vec.msg, hexN(32, vec.aux_rand), t_point, io);
+
+    // Genuine adapt first, to confirm the baseline is honest and n != t.
+    const genuine_sig = try adaptor.adapt(presig, hexN(32, vec.t));
+    const genuine_full = try bip340.Signature.fromBytes(genuine_sig);
+    const genuine_recovered = try adaptor.extract(presig, genuine_full, t_point);
+    try std.testing.expectEqualSlices(u8, &hexN(32, vec.t), &genuine_recovered);
+
+    // Forge: want extract's `y_used` (AFTER its own conditional negation by
+    // `presig.needs_negation`) to equal `n - t`. `extract` computes
+    // `y_used = if (needs_negation) (s - s_prime).neg() else (s - s_prime)`.
+    // So pick `s - s_prime` accordingly: if `!needs_negation`, want
+    // `s - s_prime = n - t` directly; if `needs_negation`, want
+    // `(s - s_prime).neg() = n - t`, i.e. `s - s_prime = t`.
+    const s_prime = Scalar.fromBytes(presig.s_prime, .big) catch unreachable;
+    const t_scalar = Scalar.fromBytes(hexN(32, vec.t), .big) catch unreachable;
+    const delta = if (presig.needs_negation) t_scalar else t_scalar.neg();
+    const forged_s = s_prime.add(delta);
+    const forged_sig = bip340.Signature{ .r = presig.r, .s = forged_s.toBytes(.big) };
+
+    // Sanity: the forged pair really does share `r` (extract's step 1 must
+    // not be what rejects it — the DL check must be).
+    try std.testing.expectEqualSlices(u8, &presig.r, &forged_sig.r);
+    try std.testing.expectError(error.AdaptorSecretMismatch, adaptor.extract(presig, forged_sig, t_point));
+}
+
+// Pin (audit A1 `adaptor` F6, no code change — see `SPEC.md` Threat model for
+// why: this is algebraic, inherent to `rhs = R_even ± T`, not a bug). A
+// pre-signature verifies under `(T, needs_negation)` iff it ALSO verifies
+// under `(-T, !needs_negation)` — the two are the SAME statement viewed from
+// either sign. Pinned so a future change to `preVerify`'s equation is a
+// deliberate, tested decision, not a silent narrowing or widening of this.
+test "audit F6 (pin, not a bug): a pre-signature verifies under EITHER (T, flag) or (-T, !flag), never both flags for one T" {
+    const vec = v.vectors[0];
+    const px = try bip340.XOnlyPublicKey.fromBytes(hexN(32, vec.px));
+    const t_point = try adaptor.AdaptorPoint.fromBytes(hexN(33, vec.adaptor_point));
+    const t_real = try t_point.point();
+    const neg_t_point = try adaptor.AdaptorPoint.fromBytes(t_real.neg().toCompressedSec1());
+
+    const presig = adaptor.PreSignature{
+        .r = hexN(32, vec.r),
+        .s_prime = hexN(32, vec.s_prime),
+        .needs_negation = vec.needs_negation,
+    };
+    const flipped = adaptor.PreSignature{
+        .r = presig.r,
+        .s_prime = presig.s_prime,
+        .needs_negation = !presig.needs_negation,
+    };
+
+    try std.testing.expect(adaptor.preVerify(px, vec.msg, t_point, presig)); // (T, flag)
+    try std.testing.expect(!adaptor.preVerify(px, vec.msg, neg_t_point, presig)); // (-T, flag)
+    try std.testing.expect(!adaptor.preVerify(px, vec.msg, t_point, flipped)); // (T, !flag)
+    try std.testing.expect(adaptor.preVerify(px, vec.msg, neg_t_point, flipped)); // (-T, !flag)
+}
+
 test "property: adapt REJECTS an all-zero adaptor secret" {
     const vec = v.vectors[0];
     const presig = adaptor.PreSignature{

@@ -113,10 +113,13 @@ schnorr_fun's verdict and outputs on the six self-authored vectors above:
 `verify_encrypted_signature` accepted all six, and its `decrypt_signature`
 output is byte-identical to each vector's `sig` field.
 
-**Status: scaffold.** Wire codecs (`AdaptorPoint`, `PreSignature`) are
-implemented and tested for real. The four crypto cores (`preSign`,
-`preVerify`, `adapt`, `extract`) are `@panic("TODO(fable): ...")` stubs
-with their final signatures fixed and their exact construction fully
-specified in `root.zig`'s doc comments and `SPEC.md`; `kat_vectors.zig` /
-`kat_test.zig` are ready to validate a crypto-core implementation
-byte-exactly the moment one lands. See `SPEC.md`'s "TODO(fable)" section.
+**Status: complete** (audit A1 F9, 2026-09-10: this block said "scaffold"
+with all four crypto cores `@panic` stubs — stale since commit `e82da1a`
+implemented them for real; the interop vectors described immediately above
+this block were themselves proof the stubs were long gone, so this file
+contradicted itself). Wire codecs (`AdaptorPoint`, `PreSignature`) and all
+four crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) are
+implemented, KAT-validated against `kat_vectors.zig`'s six self-authored
+vectors, and cross-validated against the external `foreign_vectors` /
+`self_authored_cross_check` corpora described above. See `SPEC.md` for the
+construction and `root.zig`'s doc comments for the step-by-step algorithms.

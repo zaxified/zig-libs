@@ -131,8 +131,15 @@ pub const AdaptorPoint = struct {
 
     /// `T = t·G` from the adaptor SECRET `t` directly — the usual way a
     /// counterparty derives the public `AdaptorPoint` it hands to the
-    /// presigner.
+    /// presigner. Rejects a non-canonical `adaptor_secret >= n` (audit A1
+    /// F1): `combMulBase` reduces mod `n` internally rather than rejecting,
+    /// so before this check `fromSecret(n+1)` silently returned `T(t=1)` —
+    /// accepting bytes that `adapt` (which DOES check `>= n`, and is
+    /// documented to) would refuse to complete. An honest counterparty who
+    /// derived `T` this way from those bytes could never get its own
+    /// pre-signature adapted.
     pub fn fromSecret(adaptor_secret: [32]u8) AdaptorPointError!AdaptorPoint {
+        _ = Scalar.fromBytes(adaptor_secret, .big) catch return error.InvalidAdaptorPoint;
         const p = Secp256k1.combMulBase(adaptor_secret, .big) catch return error.InvalidAdaptorPoint;
         return .{ .bytes = p.toCompressedSec1() };
     }
@@ -216,8 +223,10 @@ pub const PreSignError = error{
 };
 
 /// Schnorr **PreSign** (a.k.a. "encrypted sign" — secp256kfun's
-/// terminology): produces a *pre-signature* cryptographically bound to the
-/// adaptor point `T = t·G`, which `adapt` later completes into an ordinary
+/// terminology): produces a *pre-signature* cryptographically bound to
+/// `±T` (see `SPEC.md`'s Threat model for what that means and why it is
+/// inherent to the construction, not a gap `preSign` alone can close) for
+/// the adaptor point `T = t·G`, which `adapt` later completes into an ordinary
 /// BIP340 signature once the adaptor SECRET `t` is known — and which
 /// `extract` can turn back into `t` once that completed signature is
 /// public. This is the whole "encryption" in "encrypted signature": the
@@ -288,9 +297,19 @@ pub fn preSign(
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
 
     // Step 1: even-y-normalized effective scalar d + x-only public key —
-    // exactly bip340.sign's own steps 1-2.
-    const kp = bip340.KeyPair.fromSecretKey(secret_key) catch return error.InvalidSecretKey;
-    const d_bytes = kp.secret;
+    // exactly bip340.sign's own steps 1-2, INCLUDING its scrub-on-return
+    // discipline (audit A1 F3: this doc comment already claimed "exactly
+    // bip340.sign's own steps 1-2", but the code omitted `kp.deinit()` and
+    // `d_bytes`'s `secureZero`, which those two steps carry in `bip340.sign`
+    // itself). Caveat stated as plainly as the audit stated it: this does not
+    // provably remove every copy — the same probe on `bip340.sign`, which has
+    // carried both calls all along, still finds `d` twice — but omitting the
+    // calls here left THREE, and the doc comment promises the sibling's exact
+    // steps, not a weaker version of them.
+    var kp = bip340.KeyPair.fromSecretKey(secret_key) catch return error.InvalidSecretKey;
+    defer kp.deinit();
+    var d_bytes = kp.secret;
+    defer std.crypto.secureZero(u8, &d_bytes);
     const px = kp.public.x;
 
     // Parse T eagerly (needed both as bytes for the nonce preimage and as
@@ -599,6 +618,7 @@ test {
     _ = @import("kat_test.zig");
     _ = @import("interop_vectors.zig");
     _ = @import("interop_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names the scriptless-scripts construction and the sibling bip340 dep" {
@@ -623,6 +643,37 @@ test "PreSignature round-trips through fromBytes/toBytes (codec only, no crypto 
     try std.testing.expectEqualSlices(u8, &bytes, &ps.toBytes());
 }
 
+// Regression (audit A1 `adaptor` F7): `AdaptorPoint.fromBytes`'s eager
+// validation (the doc comment's own stated reason: mirrors
+// `musig2.PlainPublicKey.fromBytes`'s eager-parse convention) had NO test
+// expecting `error.InvalidAdaptorPoint` from the wire codec before this —
+// mutation M1 (deleting the eager check) left the suite fully green, because
+// `point()` re-validates on every use and nothing exercised the CODEC path
+// on its own. All four shapes the audit measured by hand (`adv.zig` test E).
+test "audit F7: AdaptorPoint.fromBytes rejects all four malformed SEC1 shapes" {
+    // x = 0 with prefix 0x02: y^2 = 7, and 7 has no square root mod p — no
+    // on-curve solution.
+    var no_solution = [_]u8{0} ** 33;
+    no_solution[0] = 0x02;
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(no_solution));
+
+    // x >= p (all-0xFF x bytes with a valid-looking prefix).
+    var x_too_large = [_]u8{0xFF} ** 33;
+    x_too_large[0] = 0x02;
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(x_too_large));
+
+    // An otherwise-valid compressed point with the uncompressed-form prefix
+    // byte (0x04) instead of 0x02/0x03.
+    var uncompressed_prefix = (try AdaptorPoint.fromSecret([_]u8{0x01} ** 31 ++ [_]u8{0x01})).toBytes();
+    uncompressed_prefix[0] = 0x04;
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(uncompressed_prefix));
+
+    // Same point, prefix byte 0x00 (not a legal SEC1 prefix at all).
+    var zero_prefix = uncompressed_prefix;
+    zero_prefix[0] = 0x00;
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromBytes(zero_prefix));
+}
+
 test "PreSignature.fromBytes rejects a flag byte other than 0/1" {
     var bytes: [65]u8 = [_]u8{0} ** 65;
     bytes[0] = 1;
@@ -637,4 +688,36 @@ test "AdaptorPoint.fromSecret round-trips through .point() to the same secp256k1
     const got = try ap.point();
     const want = try Secp256k1.combMulBase(t_bytes, .big);
     try std.testing.expect(got.equivalent(want));
+}
+
+// Regression (audit A1 `adaptor` F1): `fromSecret` must reject a
+// non-canonical `t >= n` exactly like `adapt` does, not silently reduce it
+// mod n. Before the fix `fromSecret(n+1)` returned `T(t=1)` (bytewise
+// identical to `fromSecret([0]**31 ++ [1])`), while `adapt(presig, n+1)`
+// rejected the SAME bytes with `InvalidAdaptorSecret` — a pair `(T, t)` the
+// module's own derivation path could produce and its own completion path
+// would then refuse.
+test "audit F1: AdaptorPoint.fromSecret rejects adaptor_secret >= n (matches adapt's own check)" {
+    // n = FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE BAAEDCE6 AF48A03B BFD25E8C D0364141
+    const n_bytes = [_]u8{
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+        0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B, 0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+    };
+    var n_plus_1 = n_bytes;
+    n_plus_1[31] += 1; // n + 1, still fits in 32 bytes (n is not near 2^256)
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(n_plus_1));
+
+    // Control: `n + 1` and `1` used to alias to the SAME point (mod-n
+    // reduction) — confirm that pre-fix aliasing is what's being refused,
+    // not something unrelated.
+    const one = [_]u8{0x00} ** 31 ++ [_]u8{0x01};
+    const t_one = try AdaptorPoint.fromSecret(one);
+    _ = t_one;
+
+    // Control: the genuinely canonical values on both sides of the boundary
+    // still work exactly as before.
+    var n_minus_1 = n_bytes;
+    n_minus_1[31] -= 1;
+    _ = try AdaptorPoint.fromSecret(n_minus_1); // canonical (< n), still accepted
+    try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(n_bytes)); // == n, identity, unchanged behaviour
 }

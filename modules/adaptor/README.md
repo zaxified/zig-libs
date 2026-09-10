@@ -18,7 +18,9 @@ subtlety this scheme's correctness hinges on.
 |---|---|
 | `root.zig` | `AdaptorPoint` (33-byte general point), `PreSignature` (65-byte pre-signature codec), and the 4 crypto cores (`preSign`, `preVerify`, `adapt`, `extract`) — all REAL |
 | `kat_vectors.zig` | 6 self-authored reference vectors (no official BIP/spec exists for this scheme) — both `needs_negation` branches, both BIP340 key-normalization branches |
-| `kat_test.zig` | Byte-exact KAT assertions + a round-trip property harness (`preVerify` accept, `bip340.verify` accept, `extract` round-trip) + tamper-rejection tests |
+| `kat_test.zig` | Byte-exact KAT assertions + a round-trip property harness (`preVerify` accept, `bip340.verify` accept, `extract` round-trip) + tamper-rejection tests + a fuzz target on hostile `PreSignature` wire bytes |
+| `interop_vectors.zig` | 12 pre-signatures EXTERNALLY originated by LLFourn/secp256kfun's `schnorr_fun::adaptor` (0BSD), frozen 2026-08-09, plus that implementation's own verdict on the 6 self-authored vectors — see `NOTICE` |
+| `interop_test.zig` | Asserts `preVerify` accepts the 12 external pre-signatures and `adapt`/`extract` reproduce `schnorr_fun`'s `decrypt_signature`/`recover_decryption_key` byte-for-byte |
 
 ## Import
 
@@ -77,8 +79,12 @@ zig fmt --check modules/adaptor/
 against all 6 self-authored `kat_vectors.zig` vectors, plus a
 full-pipeline property test (`preSign → preVerify → adapt →
 bip340.verify → extract`) and tamper rejection (wrong `T`, wrong message,
-flipped `needs_negation`, mismatched nonce). No official BIP/spec test
-vectors exist for this scheme — see `NOTICE` for how the vectors here
-were generated and cross-validated.
+flipped `needs_negation`, mismatched nonce). `interop_test.zig` runs the
+same `preVerify`/`adapt`/`extract` calls against `interop_vectors.zig`'s 12
+EXTERNALLY-originated pre-signatures — a self-authored corpus alone cannot
+catch a convention error the code and the vectors share, since both come
+from the same source; the interop corpus comes from an independent
+implementation instead. No official BIP/spec test vectors exist for this
+scheme — see `NOTICE` for how both corpora were generated and cross-validated.
 
 Provenance: see [NOTICE](NOTICE).

@@ -173,6 +173,30 @@ solves differently). The chain of reasoning:
   with `presig` — the follow-up `implied.equivalent(T)` check catches
   most such cases, but the `r`-mismatch check fails fast and gives a
   clearer error (`error.NonceMismatch` vs `error.AdaptorSecretMismatch`).
+- **A pre-signature is bound to `±T`, not provably to `T` alone** (audit A1
+  F6, measured): `preVerify`'s acceptance equation is symmetric in sign —
+  `(r, s_prime, needs_negation)` verifies under `T` iff `(r, s_prime,
+  !needs_negation)` verifies under `-T`, and `adapt`ing either pair with the
+  matching `t`/`n-t` produces the exact SAME 64-byte signature. This is
+  algebraically inherent to the construction (`rhs = R_even ± T`), not a
+  module bug, and it leaks no secret on its own — knowing `dl(-T)` is exactly
+  as much information as knowing `dl(T)`. It IS a protocol-level trap for any
+  construction that uses `T` as an identity commitment (e.g. a PTLC payment
+  point): a presig that verifies for `T` also verifies for `-T` with the
+  flag inverted, so accepting `(presig, T)` as proof of commitment to `T`
+  SPECIFICALLY, rather than to `{T, -T}`, requires a protocol-level
+  countermeasure (e.g. the higher-level protocol independently proving
+  knowledge of, or fixing the sign of, the point it hands to `preSign`) —
+  this module cannot resolve it unilaterally, since both `T` and `-T` are
+  equally valid points with equally valid pre-signatures by construction.
+- **`adapt` performs no self-check, unlike `preSign`/`bip340.sign`** (audit
+  A1 F8) — it is not given `pubkey`/`msg`, so it has no independent equation
+  to re-verify against (unlike `preSign`, which can re-run `preVerify` on its
+  own output). **The caller MUST verify `adapt`'s output before relying on
+  it** — `bip340.verify(pubkey, msg, adapt(presig, t))`, exactly as the
+  README example does — since a `presig`/`t` pair that does not actually
+  match `(pubkey, msg, T)` will silently produce 64 bytes that simply fail
+  that check, not an error from `adapt` itself.
 
 ## The four crypto cores (all implemented)
 
@@ -209,11 +233,30 @@ independent correctness signal beyond the byte-exact numbers.
 
 ## Anchoring
 
-**Anchor grade:** class B · oracle REDERIVED
+**Anchor grade:** class B · oracle REDERIVED + EXTERNAL
 
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
-- **Oracle REDERIVED** — an in-house oracle re-deriving the answer by a different route. Catches implementation typos; does NOT catch a shared misreading of the spec.
+- **Oracle REDERIVED + EXTERNAL** — `kat_vectors.zig` is an in-house oracle
+  re-deriving the answer by a different route (catches implementation typos;
+  does NOT catch a shared misreading of the spec). `interop_vectors.zig`
+  closes that gap: twelve pre-signatures ORIGINATED by an independent
+  implementation (LLFourn/secp256kfun's `schnorr_fun::adaptor`, 0BSD), frozen
+  2026-08-09 — see `NOTICE` for exact versions and the regeneration command.
+  (Audit A1 F9: this section previously said no external oracle existed;
+  `interop_vectors.zig`/`interop_test.zig` were added the same day the KAT
+  corpus landed and this file was never updated to say so.)
 
-**What the tests actually contain.** no official spec/vectors; kat_vectors.zig computed independently in Python (NOTICE)
+**What the tests actually contain.** No official BIP/spec exists for Schnorr
+adaptor signatures. `kat_vectors.zig`: six self-authored vectors computed
+independently in Python (see `NOTICE`). `interop_vectors.zig`: twelve
+EXTERNALLY-originated pre-signatures from `secp256kfun`, plus that
+implementation's own verdict on all six self-authored vectors — this module's
+`preSign` can never produce these bytes itself (the nonce derivations differ
+by design), so they exercise `preVerify`/`adapt`/`extract` against inputs
+this codebase did not generate.
 
-**How it got there.** No external oracle exists for what remains. No schnorr adaptor vectors exist; DLC's ECDSA-adaptor.json is a different scheme
+**How it got there.** `kat_vectors.zig`: computed independently in Python from
+this exact construction (no shared code path with `root.zig`). `interop_vectors.zig`:
+captured from a real external implementation and frozen as bytes — fully
+offline afterward; see `NOTICE` for the regeneration command if the upstream
+crate needs re-checking.
