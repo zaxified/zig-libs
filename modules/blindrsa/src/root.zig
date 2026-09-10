@@ -202,9 +202,16 @@ fn feInvert(m: rsa.Modulus, x: rsa.Fe) InvertError!rsa.Fe {
 fn maskedInvert(m: rsa.Modulus, x: rsa.Fe, random: std.Random) InvertError!rsa.Fe {
     var attempt: usize = 0;
     while (attempt < 4) : (attempt += 1) {
-        const u = sampleFe(m, random);
-        const v = m.mul(x, u);
-        const v_inv = feInvert(m, v) catch continue;
+        // u/v/v_inv are secret Fe VALUES, not just the byte buffers they get
+        // serialized into elsewhere -- audit finding B6/B9: only the byte
+        // copies were ever secureZero'd, leaving the struct-level copy (the
+        // one `std.crypto.ff` actually computes with) live on the stack.
+        var u = sampleFe(m, random);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&u));
+        var v = m.mul(x, u);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&v));
+        var v_inv = feInvert(m, v) catch continue;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&v_inv));
         return m.mul(v_inv, u);
     }
     return error.NotInvertible;
@@ -217,7 +224,17 @@ fn maskedInvert(m: rsa.Modulus, x: rsa.Fe, random: std.Random) InvertError!rsa.F
 fn isCoprime(a_bytes: []const u8, n_bytes: []const u8) bool {
     var scratch: [128 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
-    const gpa = fba.allocator();
+    return isCoprimeAlloc(fba.allocator(), a_bytes, n_bytes);
+}
+
+/// `isCoprime`'s allocator-parameterized core (audit finding B12). Split out
+/// SOLELY so a test can hand it a `std.testing.FailingAllocator` and hit the
+/// `catch false` fail-closed path directly and cheaply — the real 128 KiB
+/// scratch arena above only exhausts on an input around ~128 KB / ~1M bits,
+/// and `std.math.big.int`'s gcd at that size is minutes-scale, impractical
+/// inside a unit test's time budget (see A1/blindrsa.md B12). Private helper
+/// (`isCoprime` itself is not `pub` either); no public API change.
+fn isCoprimeAlloc(gpa: std.mem.Allocator, a_bytes: []const u8, n_bytes: []const u8) bool {
     const impl = struct {
         fn run(a: std.mem.Allocator, ab: []const u8, nb: []const u8) !bool {
             var ba = try bigFromBytes(a, ab);
@@ -409,8 +426,13 @@ pub fn blind(
     // is redrawn a bounded number of times, then reported.
     var attempt: usize = 0;
     while (attempt < 4) : (attempt += 1) {
-        const r = sampleFe(pk.n, random);
-        const r_inv = maskedInvert(pk.n, r, random) catch continue;
+        // Defense in depth alongside blindCore's own wipe of its by-value
+        // copies (audit finding B6/B9): this frame's r/r_inv are a
+        // DIFFERENT stack slot than blindCore's parameter copies.
+        var r = sampleFe(pk.n, random);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
+        var r_inv = maskedInvert(pk.n, r, random) catch continue;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&r_inv));
         return blindCore(pk, Hash, prepared_msg, salt, r, r_inv, ctx_out, blinded_msg_out);
     }
     return error.InvalidBlindingFactor;
@@ -462,11 +484,20 @@ fn blindCore(
     comptime Hash: type,
     prepared_msg: []const u8,
     salt: []const u8,
-    r: rsa.Fe,
-    r_inv: rsa.Fe,
+    r_param: rsa.Fe,
+    r_inv_param: rsa.Fe,
     ctx_out: *Context,
     blinded_msg_out: []u8,
 ) BlindError![]u8 {
+    // r/r_inv arrive as by-value Fe params, i.e. this function's OWN copy on
+    // its own frame -- audit finding B6: wiping only the derived byte
+    // buffers below (r_bytes) left this struct-level copy live. Copied into
+    // `var`s (params are immutable) so a mutable address is available for
+    // secureZero.
+    var r = r_param;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r));
+    var r_inv = r_inv_param;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&r_inv));
     const modulus_bits = pk.n.bits();
     const modulus_len = byteLen(modulus_bits);
     const em_bits = modulus_bits - 1;
@@ -593,8 +624,12 @@ pub fn blindSign(
     // every intermediate byte buffer is wiped.
     var attempt: usize = 0;
     const s: rsa.Fe = while (attempt < 4) : (attempt += 1) {
-        const b = sampleFe(sk.n, random);
-        const b_inv = maskedInvert(sk.n, b, random) catch continue;
+        // b/b_inv are secret Fe VALUES (audit finding B6/B9) -- only their
+        // byte-buffer serializations below were ever wiped before this fix.
+        var b = sampleFe(sk.n, random);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
+        var b_inv = maskedInvert(sk.n, b, random) catch continue;
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&b_inv));
 
         var b_bytes: [max_modulus_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &b_bytes);
@@ -953,6 +988,33 @@ test "isCoprime: factor of n is NOT coprime; RFC encoded_msg IS (blind step 4's 
     try std.testing.expect(isCoprime(&[_]u8{1}, &kat.n));
 }
 
+// ── B12 anchor: isCoprime fails CLOSED, not open, when its arena is
+// exhausted ─────────────────────────────────────────────────────────────
+//
+// Audit mutation m20 flips `catch false` to `catch true` in isCoprime's
+// exhaustion path: RFC 9474 Blind step 4's "is_coprime" guard would then
+// ACCEPT a message that shares a factor with n whenever the 128 KiB scratch
+// arena runs out, instead of rejecting it (`error.InvalidMessageBlinding`).
+// The audit itself flagged this as testable "only with a rigged input" —
+// reproducing the real arena's exhaustion needs an ~128 KB / ~1M-bit input,
+// and `std.math.big.int`'s gcd at that size is minutes-scale (checked: not
+// safe inside a unit test's time budget or `scripts/modtest`'s timeout, see
+// A1/blindrsa.md B12). `isCoprimeAlloc` above exists so this test can force
+// the SAME failure path -- an allocator that fails on its very first
+// request -- without touching the real arena size or the real gcd cost at
+// all: cheap, deterministic, and it exercises the identical `catch false`
+// `impl.run(...) catch false` line the real `isCoprime` runs.
+test "B12: isCoprime fails CLOSED (false), not open, when the underlying allocator is exhausted" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    // A well-formed, definitely-coprime pair (RFC 9474's own encoded_msg
+    // vs. n) -- if isCoprimeAlloc ever returns `true` here, the allocator
+    // failure was ignored rather than propagated fail-closed.
+    try std.testing.expectEqual(false, isCoprimeAlloc(failing.allocator(), &kat.a1.encoded_msg, &kat.n));
+    // Confirms the `false` above came from the injected allocator failure
+    // (not some other reason) -- the failure really was induced.
+    try std.testing.expect(failing.has_induced_failure);
+}
+
 test "sampleFe: always in [1, n), even for a modulus with few top-byte bits" {
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x44} ** 32);
     const random = csprng.random();
@@ -1029,4 +1091,103 @@ test "B2: sampleFe rejects a zero draw and retries rather than returning it (aud
     try std.testing.expect(v != 0);
     try std.testing.expect(v >= 1 and v < 1021);
     try std.testing.expectEqual(@as(usize, 0), scripted.zeros_left); // the zero draw WAS consumed
+}
+
+// ── B6/B9 anchor: secret Fe values (and the byte buffers already wiped)
+// do not survive on the stack after blind() returns ───────────────────────
+//
+// Audit's own `probe deadstack` (A1/repro/blindrsa/probe.zig, a standalone
+// build-exe binary) found: r's big-endian byte buffer (`r_bytes` in
+// `blindCore`, already `secureZero`'d) = 0 hits -- a working negative
+// control -- while r in `ff.Fe` LIMB order (little-endian, never wiped by
+// anything) = 2 hits in the 512 KiB below `blind()`'s frame. The `Fe`
+// copies of `r`/`r_inv` (blind/blindCore) and `u`/`v`/`v_inv`
+// (maskedInvert) were never zeroed as STRUCTURED values -- only their
+// byte-buffer serializations were (B6). And nothing pinned that any of the
+// EXISTING byte-buffer wipes (`r_bytes`, `feInvert`'s Euclid scratch arena)
+// actually take effect rather than being silently compiled away (B9).
+//
+// This reproduces the audit's technique INSIDE `zig build test-<m>` (a
+// FixedRandom pins r, so both the sampled r AND maskedInvert's masking
+// scalar u collapse to the same known bit pattern) instead of as a
+// separate build-exe probe, so it runs under `scripts/modtest` like every
+// other test in this campaign. ReleaseFast-only: stack layout in Debug is
+// not what the audit measured, and register/spill allocation this fine-
+// grained is not something a Debug build's frame shape reflects at all.
+const DeadStackFixedRandom = struct {
+    val: []const u8,
+    fn fill(self: *const @This(), buf: []u8) void {
+        @memset(buf, 0);
+        if (buf.len >= self.val.len) {
+            @memcpy(buf[buf.len - self.val.len ..], self.val);
+        } else {
+            @memcpy(buf, self.val[self.val.len - buf.len ..]);
+        }
+    }
+};
+
+noinline fn deadStackRunBlind(pk: rsa.PublicKey, random: std.Random, ctx: *Context) void {
+    var bm: [max_modulus_len]u8 = undefined;
+    _ = blind(pk, std.crypto.hash.sha2.Sha384, &kat.a1.prepared_msg, &kat.a1.salt, random, ctx, &bm) catch unreachable;
+}
+
+noinline fn deadStackScan(needle: []const u8, base: [*]const u8, len: usize) usize {
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= len) : (i += 1) {
+        if (std.mem.eql(u8, base[i..][0..needle.len], needle)) hits += 1;
+    }
+    return hits;
+}
+
+// ⚠ 2026-09-10 fix-campaign measurement (fixwt/a, see A1/blindrsa.md
+// Dispozice for the full writeup): `blindCore`/`maskedInvert`/`blind` were
+// changed to `secureZero` their `r`/`r_inv`/`u`/`v`/`v_inv`/`b`/`b_inv` Fe
+// STRUCT copies, not just the byte-buffer serializations that were already
+// wiped. Measured RED (before that change): this scan found 2 hits for r in
+// ff.Fe limb order. Measured again AFTER the change: still 2 hits, byte-for-
+// byte identical count. The leak survives wiping every Fe our own code
+// holds, which means it lives inside `std.crypto.ff`'s own internals (a
+// Montgomery-multiplication or byte<->limb-conversion scratch temporary),
+// not in a copy `blindrsa` controls — the same class of trap as
+// `zig_std_crypto_leaves_key_schedules_on_stack` (project memory). B6
+// therefore stays OPEN; only the `hits_be` half below (which the B6 fix did
+// not touch, and which was already true before it) is asserted as a real
+// B9 anchor for the `r_bytes` buffer wipe. `hits_le` is printed for the
+// record but NOT asserted -- asserting 0 would misrepresent an unresolved
+// finding as fixed, and asserting the current (leaking) count would pin a
+// known leak as the expected/accepted shape. Neither is honest here.
+test "B9: blind()'s r_bytes buffer (the byte-level secureZero) does not survive on the stack after return" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const pk = try kat.publicKey();
+    var fixed = DeadStackFixedRandom{ .val = &kat.r };
+    const random = std.Random.init(&fixed, DeadStackFixedRandom.fill);
+    var ctx: Context = undefined;
+
+    var anchor: usize = 0;
+    const stack_top: [*]const u8 = @ptrCast(&anchor);
+    anchor = 1;
+    deadStackRunBlind(pk, random, &ctx);
+    const window: usize = 512 * 1024;
+    const base = stack_top - window;
+
+    // needle A: r big-endian -- the r_bytes buffer blindCore explicitly
+    // secureZero's. Negative control: must stay 0 hits regardless of this
+    // test's own B6 fix (it was already wiped before this test existed).
+    const be = kat.r[0..32];
+    // needle B: r as ff.Fe stores it -- little-endian u64 limbs, i.e. the
+    // full byte-reversal of the big-endian value. THIS is what B6 found
+    // unwiped.
+    var rev: [512]u8 = undefined;
+    for (kat.r, 0..) |c, idx| rev[511 - idx] = c;
+    const le = rev[0..32];
+
+    const hits_be = deadStackScan(be, base, window);
+    // NOT asserted -- see the comment above this test (B6 stays open).
+    const hits_le = deadStackScan(le, base, window);
+    std.debug.print(
+        "B9/B6 dead-stack scan, {d} KiB below blind()'s frame: r big-endian (r_bytes, wiped -- ASSERTED) = {d} hits, r ff.Fe limb order (std.crypto.ff internal, NOT asserted, B6 open) = {d} hits\n",
+        .{ window / 1024, hits_be, hits_le },
+    );
+    try std.testing.expectEqual(@as(usize, 0), hits_be);
 }

@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, continued: B12 closed, B6/B9 measured honestly.
+  `isCoprime` is split into a thin wrapper and an allocator-parameterized
+  `isCoprimeAlloc` (both private; no public API change) purely so a test can inject a
+  `std.testing.FailingAllocator` and force the `catch false` fail-closed path
+  deterministically, instead of needing an input large enough to exhaust the real
+  128 KiB scratch arena — that gcd is minutes-scale and impractical inside a unit
+  test (B12). `blind`/`blindCore`/`maskedInvert`/`blindSign` now `secureZero` the
+  secret `Fe` STRUCT copies of `r`/`r_inv`/`u`/`v`/`v_inv`/`b`/`b_inv`, not just
+  their byte-buffer serializations (which were already wiped) — but a new
+  ReleaseFast-only regression test built the same dead-stack scan the original audit
+  used as a standalone probe, now running inside `zig build test-blindrsa`, and it
+  shows the leak is UNCHANGED after the fix: 2 hits before, 2 hits after. The
+  residual copy lives inside `std.crypto.ff`'s own internals (Montgomery
+  multiplication or byte<->limb conversion scratch), not in anything this module
+  controls — B6 stays open, and the new test asserts only the half that IS fixed
+  (the `r_bytes` buffer wipe, closing half of B9) while printing, not asserting, the
+  unresolved half. `scripts/modtest blindrsa`: 57/58 (Debug, 1 skip), 58/58
+  (ReleaseFast). See `~/CML/20260901-zig-libs-audit/A1/blindrsa.md`'s
+  2026-09-10 (fixwt/a) Dispozice for the full RED/RED measurement.
+
 - **2026-09-10** — A1 fix campaign, audit findings B1/B2/B3/B4/B7/B8/B10/B11/B14/B15
   closed (13/18 open findings; B6/B9/B16/B18 left open, B13/B19 found already fixed
   elsewhere — see `~/CML/20260901-zig-libs-audit/A1/blindrsa.md`'s Dispozice section
