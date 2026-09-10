@@ -56,6 +56,30 @@ pub const default_client_capabilities = [_][]const u8{
     cap_notification,
 };
 
+/// Cap on the number of XML elements `parseHello` (and, via this constant,
+/// `reply.parseReply`/`reply.parseNotification`) will parse before refusing
+/// with `xml.ParseError.TooManyElements`.
+///
+/// `xml.parse`'s own default (`Options.max_elements = 1 << 20`) bounds
+/// *structure*, not memory: a 4.00 MiB `<a/>`-repeated document parses to
+/// 1,048,570 elements and 529.2 MiB of live bytes through this module (`Reply`
+/// additionally retains `raw` and `Client` a third copy) — a 132x amplification
+/// over the wire, and entirely decoupled from `framing.Limits.max_message`,
+/// which this module advertises as its hostile-input ceiling but which bounds
+/// bytes, not element count (2026-09-10 audit, `A1/netconf.md` N1). None of the
+/// three `xml.parse` call sites in this module set `max_elements`, so they all
+/// inherited the 1<<20 default.
+///
+/// 65536 keeps the worst case (one attribute per element, the audit's costliest
+/// shape) at roughly 56 MiB live — the same order of magnitude as
+/// `framing.Limits.max_message`'s 16 MiB default, not two orders above it —
+/// while still comfortably holding a large device configuration's worth of
+/// elements. There is no per-session way to raise it: the module has no
+/// consumer today, and the alternative (threading an `xml.Options` through
+/// three public parse functions) is a signature change reserved for when a
+/// real caller needs a different number.
+pub const default_max_elements: usize = 65536;
+
 pub const HelloError = error{
     /// Not a `<hello>` in the NETCONF base namespace, or `<capabilities>` is
     /// missing/ill-formed.
@@ -150,6 +174,28 @@ fn baseOf(uri: []const u8) []const u8 {
     return uri[0..q];
 }
 
+/// Strict decimal parse for a `<session-id>` (RFC 6241 §8.1: a positive
+/// integer, `1..4294967295`) or an `error-info/<session-id>`. Deliberately
+/// NOT `std.fmt.parseInt`: that function accepts `_` as a digit separator and
+/// a leading `+`, both Zig integer-literal syntax, neither of them a decimal
+/// digit string — `<session-id>1_0</session-id>` parsed as **10**, not a
+/// rejection, and the same text feeds `Client.sessionId()` (what a caller
+/// passes to `killSession`) and `RpcError.info_session_id` (what a caller
+/// reads to decide whose lock to break) (2026-09-10 audit, `A1/netconf.md`
+/// N4). Returns null for anything that is not `1*DIGIT`, including empty
+/// input and overflow past `u32`.
+pub fn parseSessionIdDigits(text: []const u8) ?u32 {
+    if (text.len == 0) return null;
+    var v: u32 = 0;
+    for (text) |c| {
+        if (c < '0' or c > '9') return null;
+        const d: u32 = c - '0';
+        if (v > (std.math.maxInt(u32) - d) / 10) return null; // would overflow u32
+        v = v * 10 + d;
+    }
+    return v;
+}
+
 /// A parsed `<hello>`.
 pub const Hello = struct {
     capabilities: Capabilities,
@@ -167,7 +213,7 @@ pub const Role = enum { client, server };
 /// Parse a `<hello>` document. `expect` says which side sent it, which decides
 /// whether `<session-id>` is required (server) or forbidden (client).
 pub fn parseHello(gpa: std.mem.Allocator, source: []const u8, expect: Role) HelloError!Hello {
-    var doc = try xml.parse(gpa, source, .{ .doctype = .reject });
+    var doc = try xml.parse(gpa, source, .{ .doctype = .reject, .max_elements = default_max_elements });
     defer doc.deinit();
 
     const root = doc.root;
@@ -189,7 +235,15 @@ pub fn parseHello(gpa: std.mem.Allocator, source: []const u8, expect: Role) Hell
             saw_capabilities = true;
             var cit = child.elementIterator();
             while (cit.next()) |cap| {
-                if (!std.mem.eql(u8, cap.local, "capability")) return error.MalformedHello;
+                // Both the local name AND the namespace must match: checking
+                // only `local` let `<x:capability xmlns:x="urn:evil">…</x:capability>`
+                // count as a real capability and decide the dialect via
+                // `negotiate` -- `<session-id>` a few lines below already
+                // checks its namespace the same way `<capabilities>` does a
+                // few lines above; `<capability>` was the one inconsistent
+                // branch (2026-09-10 audit, `A1/netconf.md` N11).
+                if (!std.mem.eql(u8, cap.local, "capability") or !std.mem.eql(u8, cap.uri, base_ns))
+                    return error.MalformedHello;
                 const text = try cap.textContent(gpa);
                 defer gpa.free(text);
                 // The RFC's own examples put the URI on its own indented line,
@@ -203,7 +257,7 @@ pub fn parseHello(gpa: std.mem.Allocator, source: []const u8, expect: Role) Hell
             const text = try child.textContent(gpa);
             defer gpa.free(text);
             const trimmed = std.mem.trim(u8, text, " \t\r\n");
-            const v = std.fmt.parseInt(u32, trimmed, 10) catch return error.InvalidSessionId;
+            const v = parseSessionIdDigits(trimmed) orelse return error.InvalidSessionId;
             if (v == 0) return error.InvalidSessionId; // session ids are 1..4294967295
             session_id = v;
         }
@@ -334,8 +388,39 @@ test "parseHello: hostile / malformed inputs" {
         .{ .src = "<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>4294967296</session-id></hello>", .want = error.InvalidSessionId },
         .{ .src = "<!DOCTYPE hello [<!ENTITY x \"y\">]><hello/>", .want = error.DoctypeForbidden }, // XXE surface stays shut
         .{ .src = "<hello", .want = error.UnexpectedEof },
+        // N4 regression: Zig's parseInt accepts `_` as a digit separator and
+        // `+` as a sign -- neither is a decimal digit, and RFC 6241 §8.1's
+        // session-id is `1*DIGIT`. Before the fix these were ACCEPTED as
+        // sessionId() = 10, 1000 and 7 respectively (a value that does not
+        // match what the digits show).
+        .{ .src = "<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>1_0</session-id></hello>", .want = error.InvalidSessionId },
+        .{ .src = "<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>1_0_0_0</session-id></hello>", .want = error.InvalidSessionId },
+        .{ .src = "<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><session-id>+7</session-id></hello>", .want = error.InvalidSessionId },
+        // N15 regression: a second `<capabilities>` element. `saw_capabilities`
+        // guards this (capabilities.zig) but had no dedicated test -- deleting
+        // the guard used to survive the suite green, which would have let the
+        // two capability sets silently merge.
+        .{ .src = "<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities/><capabilities/><session-id>1</session-id></hello>", .want = error.MalformedHello },
+        // N11 regression: `<capability>` in a foreign namespace. Only the
+        // local name was checked before the fix, so this counted as a real
+        // capability and could decide the framing dialect
+        // (`urn:evil:capability` carrying `:base:1.1` would have negotiated
+        // chunked framing on the strength of a spoofed element).
+        .{ .src = "<hello xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><capabilities><x:capability xmlns:x=\"urn:evil\">urn:ietf:params:netconf:base:1.1</x:capability></capabilities><session-id>1</session-id></hello>", .want = error.MalformedHello },
     };
     for (cases) |c| try testing.expectError(c.want, parseHello(gpa, c.src, .server));
+}
+
+test "sameCapability: RFC 6241 §8.1 strips ?parameters but does not do a PREFIX match" {
+    // N9 regression: `sameCapability` must use exact equality on the base
+    // part, not `startsWith`. A prefix match would let a foreign capability
+    // URI that merely BEGINS WITH ours (e.g. a vendor URI one character away
+    // from `:base:1.1`) count as a match -- here, deciding the framing
+    // dialect on the strength of a URI that is not actually `:base:1.1`.
+    try testing.expect(!sameCapability("urn:ietf:params:netconf:base:1.1x", cap_base_1_1));
+    try testing.expect(!sameCapability(cap_base_1_1, "urn:ietf:params:netconf:base:1.1x"));
+    // The real rule -- stripping `?parameters` -- still has to work.
+    try testing.expect(sameCapability("urn:ietf:params:netconf:base:1.1?x=1", cap_base_1_1));
 }
 
 test "capability comparison ignores ?parameters (RFC 6241 §8.1)" {

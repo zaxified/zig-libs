@@ -94,12 +94,40 @@ pub const Options = struct {
     /// Bytes per `pumpOnce` read.
     read_buffer_size: usize = 64 * 1024,
     /// Refuse to queue more than this many unread notifications; beyond it a
-    /// `call` fails rather than growing without bound.
+    /// `call` fails rather than growing without bound. Bounds ITEM COUNT, not
+    /// bytes: each queued notification is a raw copy of the message, up to
+    /// `Limits.max_message` in size, so the worst-case queue footprint is
+    /// `max_queued_notifications * Limits.max_message` (16 GiB at both
+    /// defaults). Lower `Limits.max_message` if a tighter byte bound matters
+    /// more than queue depth (2026-09-10 audit, `A1/netconf.md` N7).
     max_queued_notifications: usize = 1024,
     /// Refuse to buffer more than this many out-of-order replies (see
     /// `Client.receiveReply`'s reply queue); beyond it a `receiveReply` call
     /// fails rather than growing without bound.
     max_queued_replies: usize = 1024,
+    /// Consecutive `Transport.read` calls that returned 0 ("nothing this
+    /// round") before `receive` gives up with `error.IdleTimeout`, instead of
+    /// spinning forever.
+    ///
+    /// README's own "Read timeouts" recipe tells a caller to implement
+    /// `Transport.read` as one bounded wait (`poll`/`std.Io`) followed by a
+    /// read that returns 0 on timeout -- but nothing between that seam and
+    /// `Client.receive`'s loop ever stopped calling it again. A `Transport`
+    /// that follows the recipe literally, with a socket that never becomes
+    /// readable, measured 116,275,395 reads/second at ReleaseFast: not a
+    /// blocked wait, a 100%-CPU spin, because every "nothing this round"
+    /// answer costs a full loop iteration and nothing bounds how many of
+    /// those a session may see (2026-09-10 audit, `A1/netconf.md` N2).
+    ///
+    /// A correctly implemented `Transport.read` returns 0 only after actually
+    /// waiting some nonzero wall-clock time per call, so a legitimate stall
+    /// would need thousands of consecutive rounds to hit this cap -- at any
+    /// realistic wait granularity, far longer than a real timeout policy
+    /// would tolerate anyway. A `Transport.read` that returns 0 WITHOUT
+    /// waiting (the shape the spin above measured) turns an unbounded spin
+    /// into a typed error in a few milliseconds instead. 0 disables the cap
+    /// (the historical, unbounded behaviour).
+    max_idle_reads: usize = 300_000,
 };
 
 pub const SessionError = error{
@@ -112,6 +140,10 @@ pub const SessionError = error{
     NotificationQueueFull,
     /// More out-of-order replies buffered than `Options.max_queued_replies`.
     ReplyQueueFull,
+    /// `Transport.read` returned 0 ("nothing this round") for
+    /// `Options.max_idle_reads` consecutive calls without ever completing a
+    /// message. See `Options.max_idle_reads`.
+    IdleTimeout,
 } || TransportError || framing.FramerError || framing.WriteError ||
     capabilities.HelloError || reply_mod.ParseError || reply_mod.CheckError ||
     reply_mod.NotificationError ||
@@ -220,13 +252,21 @@ pub const Client = struct {
     /// The slice is owned by the client and is valid until the next `receive`
     /// / `call` / `deinit`.
     pub fn receive(self: *Client) SessionError![]const u8 {
+        var idle_reads: usize = 0;
         while (true) {
             if (try self.framer.next()) |m| {
                 self.current.clearRetainingCapacity();
                 try self.current.appendSlice(self.gpa, m);
                 return self.current.items;
             }
-            _ = try self.pumpOnce();
+            const n = try self.pumpOnce();
+            if (n == 0) {
+                idle_reads += 1;
+                if (self.opts.max_idle_reads != 0 and idle_reads >= self.opts.max_idle_reads)
+                    return error.IdleTimeout;
+            } else {
+                idle_reads = 0;
+            }
         }
     }
 
@@ -298,6 +338,21 @@ pub const Client = struct {
             const msg = try self.receive();
             switch (reply_mod.classify(msg)) {
                 .notification => {
+                    // `classify` only sniffs the root element's LOCAL NAME
+                    // (it does not resolve namespaces at all), while
+                    // `reply_mod.parseNotification` requires the RFC 5277 §4
+                    // namespace too. A `<notification>` in a foreign or
+                    // absent namespace used to queue here regardless, taking
+                    // up queue slots and memory, only to fail with
+                    // `error.NotANotification` much later -- at whatever
+                    // unrelated `nextNotification`/`awaitNotification` call
+                    // happened to dequeue it (2026-09-10 audit,
+                    // `A1/netconf.md` N10). Validating before queueing makes
+                    // this fail at the point the bad message actually
+                    // arrived, the same way `.hello`/`.rpc`/`.unknown` below
+                    // already do.
+                    var probe = try reply_mod.parseNotification(self.gpa, msg);
+                    probe.deinit();
                     if (self.notifications.items.len >= self.opts.max_queued_notifications)
                         return error.NotificationQueueFull;
                     const copy = try self.gpa.dupe(u8, msg);
@@ -544,6 +599,22 @@ pub const SshTransport = struct {
 // the client's state machine (hello → dialect switch → correlated calls) is
 // exercised end to end without a network. Cross-implementation validation is
 // the job of the live test at the bottom of this file.
+
+/// A `Transport` whose `read` always returns 0 ("nothing this round") and
+/// never delivers a byte -- the shape README's "Read timeouts" recipe
+/// produces from a socket that never becomes readable. Used only to prove
+/// `Options.max_idle_reads` bounds `Client.receive`'s loop (N2); everything
+/// else in this file uses `FakePeer`, which speaks real NETCONF.
+const AlwaysIdleTransport = struct {
+    fn readFn(_: *anyopaque, _: []u8) TransportError!usize {
+        return 0;
+    }
+    fn writeFn(_: *anyopaque, _: []const u8) TransportError!void {}
+    const vtable: Transport.VTable = .{ .read = readFn, .write = writeFn };
+    fn transport(self: *AlwaysIdleTransport) Transport {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
 
 const FakePeer = struct {
     gpa: std.mem.Allocator,
@@ -867,6 +938,128 @@ test "an interleaved notification is queued, not mistaken for the reply" {
     try testing.expect((try h.client.nextNotification()) == null);
 }
 
+test "nextNotification drains in arrival order (FIFO), not LIFO" {
+    // N14 regression: `Client.notifications`'s own doc comment (line 146)
+    // promises "in arrival order". Swapping `orderedRemove(0)` for `pop()` in
+    // `nextNotification` used to survive the suite green because nothing
+    // checked the ORDER of more than one queued notification, only that they
+    // came back at all.
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    const template =
+        \\<notification xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0"><eventTime>{s}</eventTime></notification>
+    ;
+    // Pushed directly onto the queue, oldest first -- this is exactly what
+    // `receiveReply`'s `.notification` branch does, one message at a time.
+    inline for (.{ "A", "B", "C" }) |tag| {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try aw.writer.print(template, .{tag});
+        try h.client.notifications.append(gpa, try gpa.dupe(u8, aw.written()));
+    }
+
+    var na = (try h.client.nextNotification()).?;
+    defer na.deinit();
+    var nb = (try h.client.nextNotification()).?;
+    defer nb.deinit();
+    var nc = (try h.client.nextNotification()).?;
+    defer nc.deinit();
+    // Arrival order was A, B, C. A `pop()` instead of `orderedRemove(0)`
+    // would hand these back C, B, A.
+    try testing.expectEqualStrings("A", na.event_time);
+    try testing.expectEqualStrings("B", nb.event_time);
+    try testing.expectEqualStrings("C", nc.event_time);
+}
+
+test "receiveReply rejects an interleaved <notification> in a foreign namespace instead of queueing it" {
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_notification }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    // N10 regression: `classify` only looks at the root element's LOCAL
+    // NAME, not its namespace, so this used to queue -- and only fail much
+    // later, whenever some unrelated `nextNotification`/`awaitNotification`
+    // call happened to dequeue it.
+    try h.peer.emit("<notification xmlns=\"urn:evil\"><eventTime>2026-01-01T00:00:00Z</eventTime></notification>");
+    try testing.expectError(error.NotANotification, h.client.call(.discard_changes));
+    // And nothing was buffered before the error fired.
+    try testing.expectEqual(@as(usize, 0), h.client.notifications.items.len);
+}
+
+test "receiveReply enforces max_queued_notifications rather than growing without bound" {
+    const gpa = testing.allocator;
+    const peer = try gpa.create(FakePeer);
+    peer.* = FakePeer.init(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1, capabilities.cap_notification });
+    defer {
+        peer.deinit();
+        gpa.destroy(peer);
+    }
+    var client = try Client.init(gpa, peer.transport(), .{ .max_queued_notifications = 1 });
+    defer client.deinit();
+    try client.hello();
+
+    // Hold the real reply back so it does not land on the wire (and get
+    // read) before the two notifications queued below.
+    peer.hold_next_reply = true;
+    const id = try client.send(.discard_changes);
+    const notif =
+        \\<notification xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0"><eventTime>2026-01-01T00:00:00Z</eventTime></notification>
+    ;
+    // Two notifications ahead of the reply against a cap of 1: the FIRST
+    // fills the queue (0 -> 1), the SECOND must be refused rather than
+    // growing the queue further. Before this had a test, `C-NOTIFQ-DEL`
+    // (deleting the check entirely) survived the suite green.
+    try peer.emit(notif);
+    try peer.emit(notif);
+    try testing.expectError(error.NotificationQueueFull, client.receiveReply(id));
+}
+
+test "receiveReply enforces max_queued_replies rather than growing without bound" {
+    const gpa = testing.allocator;
+    const peer = try gpa.create(FakePeer);
+    peer.* = FakePeer.init(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 });
+    defer {
+        peer.deinit();
+        gpa.destroy(peer);
+    }
+    var client = try Client.init(gpa, peer.transport(), .{ .max_queued_replies = 1 });
+    defer client.deinit();
+    try client.hello();
+
+    // Three requests outstanding, all three replies held back so they can be
+    // released onto the wire in send order.
+    peer.hold_next_reply = true;
+    _ = try client.send(.discard_changes); // reply A -- held
+    peer.hold_next_reply = true;
+    _ = try client.send(.discard_changes); // reply B -- held
+    peer.hold_next_reply = true;
+    const id_c = try client.send(.discard_changes); // reply C -- held
+    try peer.releaseHeld(); // A, B, C now on the wire, in that order
+
+    // receiveReply(id_c) reads A first (mismatch, buffered: queue 0 -> 1),
+    // then B (mismatch, queue already at the cap of 1) before it would ever
+    // reach C. Before this had a test, `C-REPLYQ-DEL` survived the suite
+    // green.
+    try testing.expectError(error.ReplyQueueFull, client.receiveReply(id_c));
+}
+
+test "receive gives up with IdleTimeout instead of spinning forever on a Transport that always returns 0" {
+    // N2 regression: README's "Read timeouts" recipe has a caller implement
+    // `Transport.read` as one bounded wait followed by a read that returns 0
+    // on timeout. A transport that returns 0 without ever completing a
+    // message used to make `receive`'s loop spin at 116,275,395 reads/second
+    // (ReleaseFast) with nothing to stop it -- not a blocked wait, live CPU.
+    const gpa = testing.allocator;
+    var t: AlwaysIdleTransport = .{};
+    var client = try Client.init(gpa, t.transport(), .{ .max_idle_reads = 1000 });
+    defer client.deinit();
+    try testing.expectError(error.IdleTimeout, client.hello());
+}
+
 test "calls before hello, and hello twice, are state errors" {
     const gpa = testing.allocator;
     const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
@@ -874,6 +1067,22 @@ test "calls before hello, and hello twice, are state errors" {
     try testing.expectError(error.InvalidState, h.client.call(.discard_changes));
     try h.client.hello();
     try testing.expectError(error.InvalidState, h.client.hello());
+}
+
+test "hello exchange rejects a first message that is not classified as hello" {
+    // N15 regression: `hello()`'s own `classify(msg) != .hello` check
+    // (client.zig, right after `self.receive()` in `hello`) is the ONLY
+    // guard against a peer that answers the hello exchange with something
+    // else -- nothing upstream of it does. It had no dedicated test: a peer
+    // that answered with, say, an `<rpc-reply>` was never exercised.
+    const gpa = testing.allocator;
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    // Queued before the client sends anything, so it is the first (and, for
+    // this test, only) message `receive()` decodes -- framed
+    // `.end_of_message`, exactly like a real hello reply always is.
+    try h.peer.emit("<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/></rpc-reply>");
+    try testing.expectError(error.UnexpectedMessage, h.client.hello());
 }
 
 test "close-session ends the session" {

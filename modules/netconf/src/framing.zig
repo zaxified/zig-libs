@@ -261,12 +261,21 @@ pub const Framer = struct {
 
             // At a header boundary: `\n#<size>\n` or `\n##\n`.
             var buf = self.pending.items[self.cursor..];
-            // Interop tolerance, and only here: a peer that terminated its
-            // `<hello>` with `]]>]]>\n` (the RFC's examples print the
-            // delimiter on its own line) leaves a stray LF in front of the
-            // first chunk header. Skipping LFs that are *followed by another
-            // LF* can never consume the LF that starts a real header, and each
-            // skipped byte is consumed, so it is not an unbounded input.
+            // Interop tolerance, and only here: a peer that terminates ANY
+            // message of this session with `]]>]]>\n` (the RFC's examples
+            // print the delimiter on its own line) leaves a stray LF in
+            // front of that message's chunk header -- not only the very
+            // first chunked message after the hello exchange. `in_message`
+            // and `got_chunk` both reset in `finish()` after every message,
+            // so this tolerance re-arms at every message boundary of the
+            // session, not once per session (the doc comment here and in
+            // SPEC.md used to say "the first chunk header", which reads as
+            // session-scoped; corrected 2026-09-10, `A1/netconf.md` N12 --
+            // the behaviour itself was already right, and stays covered by
+            // the "stray LF" test below). Skipping LFs that are *followed by
+            // another LF* can never consume the LF that starts a real
+            // header, and each skipped byte is consumed, so it is not an
+            // unbounded input.
             while (!self.in_message and self.got_chunk == false and
                 buf.len >= 2 and buf[0] == '\n' and buf[1] == '\n')
             {
@@ -650,6 +659,51 @@ test "message and pending ceilings are enforced" {
         defer f.deinit();
         try testing.expectError(error.PendingTooLarge, f.feed("abcdefghij"));
     }
+}
+
+test "N3(a): max_message is CUMULATIVE across chunks, not checked against the latest chunk alone" {
+    // The test above feeds everything in ONE call, so `msg.items.len` is
+    // still 0 the moment the bound is checked -- a guard weakened from
+    // `msg.items.len + n > max_message` to plain `n > max_message` passes it
+    // exactly the same way the correct guard does, and the weakening
+    // survives green. Measured 2026-09-10 (`A1/netconf.md` N3(a)): 32 chunks
+    // of 4 MiB each assembled to 128 MiB against a 16 MiB `max_message`, with
+    // the weakened guard never firing. This test instead uses two chunks,
+    // each individually under the cap, whose SUM is not.
+    const gpa = testing.allocator;
+    var f: Framer = .init(gpa, .chunked, .{ .max_message = 10, .max_chunk = 100 });
+    defer f.deinit();
+    try f.feed("\n#6\nAAAAAA\n#6\nBBBBBB\n##\n"); // 6, then 6 more: 12 > 10
+    try testing.expectError(error.MessageTooLarge, f.next());
+
+    // Positive control: the same two-chunk shape, comfortably under the cap,
+    // must still assemble cleanly.
+    var g: Framer = .init(gpa, .chunked, .{ .max_message = 100, .max_chunk = 100 });
+    defer g.deinit();
+    try g.feed("\n#6\nAAAAAA\n#6\nBBBBBB\n##\n");
+    const m = (try g.next()).?;
+    try testing.expectEqualStrings("AAAAAABBBBBB", m);
+}
+
+test "N3(b): max_pending is CUMULATIVE across feeds, not checked against the latest feed alone" {
+    // Same shape as N3(a) but for `feed`'s own ceiling: a guard weakened
+    // from `pending.items.len + bytes.len > max_pending` to plain
+    // `bytes.len > max_pending` never fires as long as every individual
+    // `feed` call stays under the cap, no matter how much unconsumed
+    // `pending` has already piled up. Measured 2026-09-10 (`A1/netconf.md`
+    // N3(b)): 128 MiB fed in 64 KiB reads against a 32 MiB `max_pending`,
+    // the weakened guard never firing.
+    const gpa = testing.allocator;
+    var f: Framer = .init(gpa, .end_of_message, .{ .max_pending = 10 });
+    defer f.deinit();
+    try f.feed("AAAAAA"); // 6 bytes: under the cap alone
+    try testing.expectError(error.PendingTooLarge, f.feed("BBBBBB")); // cumulative 12 > 10
+
+    // Positive control: the same two-feed shape, comfortably under the cap.
+    var g: Framer = .init(gpa, .end_of_message, .{ .max_pending = 100 });
+    defer g.deinit();
+    try g.feed("AAAAAA");
+    try g.feed("BBBBBB");
 }
 
 test "dialect switch is only legal at a message boundary" {

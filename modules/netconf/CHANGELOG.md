@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `parseHello`/`parseReply`/`parseNotification`
+  now reject XML with more than 65536 elements (`error.TooManyElements`) instead of inheriting
+  `xml`'s own 1<<20 default — closes a 132x wire-to-memory amplification. `Options.max_idle_reads`
+  (default 300000) now bounds `Client.receive` against a `Transport.read` that returns 0 without
+  ever waiting, failing with the new `error.IdleTimeout` instead of spinning at 100% CPU.
+  `<session-id>` parsing (hello and `error-info`) is now strict decimal digits, rejecting
+  `1_0`-style input `std.fmt.parseInt` used to accept as 10. `reply.classify` now skips a leading
+  UTF-8 BOM, matching `xml.parse`. `parseReply` now enforces RFC 6241 §4.2's "exactly one of
+  `<ok/>`/`<data>`/`<rpc-error>`" and rejects a combination with the new `error.AmbiguousReply`.
+  An interleaved `<notification>` in a foreign namespace is now rejected at receive time instead
+  of being queued and failing later at dequeue. `<capability>` elements are now checked by
+  namespace as well as local name, matching the sibling `<session-id>` check. Audit
+  `A1/netconf.md`, "Dispozice 2026-09-10": 10 of 18 findings fixed in code (all 3 HIGH), 6 closed
+  with regression tests only (guard was already correct), 1 doc-only, 1 out-of-scope
+  (inherited from `xml`); 2 left open (one policy question, one deferred pending fuzzer
+  instrumentation).
 - **2026-09-07** — All three fuzz targets had been running one fixed input for their whole
   existence. `fuzzHello`, `fuzzFramer` and `fuzzReply` each drew their document with
   `smith.bytes(&raw)` and then took a length from `smith.valueRangeAtMost(u16, 0, 512)`; a

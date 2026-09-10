@@ -134,6 +134,14 @@ fn readFn(ctx: *anyopaque, buf: []u8) netconf.TransportError!usize {
 caller decides whether to wait again or give up. `SshTransport` is the un-timed
 reference implementation of the same seam.
 
+⚠ If `Transport.read` returns 0 without actually waiting — the shape a buggy or hostile
+implementation of the recipe above can produce — `Client.receive`'s loop used to call it
+again immediately, forever: measured at 116,275,395 reads/second, 100% of a CPU core, with
+no timeout of its own to blame (2026-09-10 audit, `A1/netconf.md` N2). `Options.max_idle_reads`
+(default 300000) now bounds consecutive zero-byte reads with `error.IdleTimeout`; a
+correctly-implemented `Transport.read`, which returns 0 only after an actual bounded wait,
+would need thousands of real wait cycles to ever reach it.
+
 ## API
 
 ### Client

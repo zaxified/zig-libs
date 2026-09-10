@@ -54,6 +54,28 @@ one-byte-at-a-time feed:
 | assembled message > `Limits.max_message` | `error.MessageTooLarge` |
 | un-terminated input > `Limits.max_pending` | `error.PendingTooLarge` |
 
+⚠ Three of the rows above do not have independent teeth of their own — a neighbouring
+guard in the same code path fires first, so deleting them changes nothing measurable
+today (2026-09-10 audit, `A1/netconf.md` N12):
+
+* Zero chunk-size (row 1) is unreachable on its own: a zero-length `chunk-size` always
+  starts with the digit `'0'`, so the leading-zero guard (row 2) always fires first. The
+  two rows above are backed by ONE code branch (`framing.zig`'s leading-zero check), not
+  two independent ones.
+* `size > max_chunk_size_rfc` (row 5, the RFC's own 4294967295 cap) never fires at the
+  default `Limits.max_chunk = 4 MiB` — the smaller default rejects first. It only has
+  teeth once a caller raises `Limits.max_chunk` above the RFC cap, and the module's own
+  test suite never does that.
+* The "header longer than `\n#` + 10 digits + `\n`" bound (row 6) is unreachable: the
+  10-digit overflow check just ahead of it (`error.ChunkTooLarge` on an 11th digit) always
+  fires first.
+
+They stay in the code and in this table as **defence in depth**, not because each is
+independently exercised — a future change to the leading-zero rule or the digit-count
+check would silently remove the others' coverage too, and nothing here would notice
+(mutation-tested: deleting/weakening each of the three individually still leaves the
+suite green — see the audit record for the specific mutations).
+
 On the send side, `writeMessage(.end_of_message, payload)` refuses a payload containing
 `]]>]]>` (`error.DelimiterInPayload`) — RFC 6242 §4.1 is explicit that the sequence *can*
 legally occur inside XML, and a sender that emits it splits its own message at the wrong
@@ -63,11 +85,15 @@ caller-supplied URL, stream name or timestamp can contribute to a forged delimit
 Two deliberate deviations from a strict reading of the ABNF, both on the *receive* side
 only:
 
-1. After `]]>]]>` nothing is written, and a stray LF left in front of the first chunk
-   header by a peer that wrote `]]>]]>\n` is skipped — but only an LF that is *followed by
-   another LF*, which can never be the LF that starts a real header. Real implementations
-   do print the delimiter on its own line, and the alternative is failing the first
-   chunked message of every such session.
+1. After `]]>]]>` nothing is written, and a stray LF left in front of a chunk header by a
+   peer that wrote `]]>]]>\n` is skipped — but only an LF that is *followed by another
+   LF*, which can never be the LF that starts a real header. This re-arms at the start of
+   **every** message in the session (`in_message`/`got_chunk` reset in `Framer.finish`),
+   not only the first chunked message after the hello exchange — this paragraph and the
+   matching code comment used to say "the first chunk header", corrected 2026-09-10
+   (`A1/netconf.md` N12; the behaviour itself was already right). Real implementations do
+   print the delimiter on its own line, and the alternative is failing every such message
+   with the stray LF, not just the first.
 2. `Framer.next` hands out a slice into an internal buffer that is valid until the next
    call. This keeps the decode path allocation-light; `Client.receive` copies into its own
    buffer before returning to the caller.
@@ -108,6 +134,19 @@ where they bite:
 expansion attacks) is refused before anything else happens; its depth/attribute-count
 limits apply too. No second XML parser exists in this module — a NETCONF-specific one
 would be a new, unaudited attack surface for no gain.
+
+⚠ **`xml`'s structural limits bound elements, not memory, and this module's own
+`Limits.max_message` bounds wire bytes, not elements — the two are unrelated ceilings.**
+Before 2026-09-10 all three `xml.parse` call sites (`capabilities.parseHello`,
+`reply.parseReply`, `reply.parseNotification`) left `max_elements` at `xml`'s own default
+(`1 << 20`), so a 4.00 MiB `<a/>`-repeated `<rpc-reply>` — comfortably under the 16 MiB
+`max_message` default — cost **529.2 MiB of live bytes, a 132x amplification over the
+wire** (`A1/netconf.md` N1). All three call sites now pass `capabilities.default_max_elements`
+(65536) instead, which keeps the worst case in the same order of magnitude as
+`Limits.max_message`'s own default rather than two orders above it. The value is a fixed
+guard constant, not a per-session option: there is no consumer today to need a different
+number, and threading an `xml.Options` through three public parse functions is a signature
+change reserved for when one does.
 
 ## Verification
 

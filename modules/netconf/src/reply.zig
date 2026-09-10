@@ -128,6 +128,14 @@ pub const ParseError = error{
     NotAReply,
     /// `<rpc-reply>` with no recognisable body.
     MalformedReply,
+    /// RFC 6241 §4.2: `<rpc-reply>` content is exactly one of `<ok/>`, a
+    /// single `<data>`, or one-or-more `<rpc-error>`. The server sent more
+    /// than one of those three, or more than one `<ok/>`/`<data>` (2026-09-10
+    /// audit, `A1/netconf.md` N6/N17 -- before this, `<ok/>`+`<rpc-error>`
+    /// set both `Reply.ok = true` AND `Reply.hasErrors() = true`, and two
+    /// `<data>` elements made `Reply.body` and `Reply.expectData()` silently
+    /// point at DIFFERENT elements).
+    AmbiguousReply,
 } || xml.ParseError || std.mem.Allocator.Error;
 
 pub const CheckError = error{
@@ -215,7 +223,7 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
     const raw = try gpa.dupe(u8, source);
     errdefer gpa.free(raw);
 
-    var doc = try xml.parse(gpa, raw, .{ .doctype = .reject });
+    var doc = try xml.parse(gpa, raw, .{ .doctype = .reject, .max_elements = caps.default_max_elements });
     errdefer doc.deinit();
 
     const root = doc.root;
@@ -230,6 +238,8 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
     var body: ?[]const u8 = null;
     var body_element: ?*xml.Element = null;
     var ok = false;
+    var ok_count: usize = 0;
+    var data_count: usize = 0;
 
     var it = root.elementIterator();
     while (it.next()) |child| {
@@ -240,11 +250,13 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
         if (std.mem.eql(u8, child.uri, base_ns)) {
             if (std.mem.eql(u8, child.local, "ok")) {
                 ok = true;
+                ok_count += 1;
                 continue;
             }
             if (std.mem.eql(u8, child.local, "data")) {
                 data = child.span.slice(raw);
                 data_element = child;
+                data_count += 1;
                 continue;
             }
             if (std.mem.eql(u8, child.local, "rpc-error")) {
@@ -254,6 +266,17 @@ pub fn parseReply(gpa: std.mem.Allocator, source: []const u8) ParseError!Reply {
         }
         // Anything else is an RPC-specific output element; `body` holds it.
     }
+
+    // RFC 6241 §4.2: content is exactly one of `<ok/>`, `<data>`, or
+    // one-or-more `<rpc-error>`. More than one `<data>`/`<ok/>`, or more than
+    // one of the three categories present at once, is a protocol violation --
+    // see the `AmbiguousReply` doc comment for what silently diverged before
+    // this was enforced (N6/N17).
+    const categories_present: u2 =
+        @as(u2, @intFromBool(ok_count > 0)) +
+        @as(u2, @intFromBool(data_count > 0)) +
+        @as(u2, @intFromBool(errors.items.len > 0));
+    if (categories_present > 1 or ok_count > 1 or data_count > 1) return error.AmbiguousReply;
 
     return .{
         .gpa = gpa,
@@ -296,7 +319,13 @@ fn parseRpcError(el: *const xml.Element, source: []const u8) RpcError {
             var ii = f.elementIterator();
             while (ii.next()) |info_child| {
                 if (std.mem.eql(u8, info_child.local, "session-id")) {
-                    e.info_session_id = std.fmt.parseInt(u32, elementText(info_child, source), 10) catch null;
+                    // N4 (second site): same strict decimal rule as
+                    // `capabilities.parseSessionIdDigits` -- `parseInt`'s `_`
+                    // separator let `<session-id>4_5_4</session-id>` inside
+                    // `<error-info>` parse as 454, a value the digits do not
+                    // show, feeding `RpcError.info_session_id` (what a caller
+                    // reads to decide whose lock-holding session to kill).
+                    e.info_session_id = caps.parseSessionIdDigits(elementText(info_child, source));
                 }
             }
         }
@@ -347,7 +376,7 @@ pub const NotificationError = error{NotANotification} || xml.ParseError || std.m
 pub fn parseNotification(gpa: std.mem.Allocator, source: []const u8) NotificationError!Notification {
     const raw = try gpa.dupe(u8, source);
     errdefer gpa.free(raw);
-    var doc = try xml.parse(gpa, raw, .{ .doctype = .reject });
+    var doc = try xml.parse(gpa, raw, .{ .doctype = .reject, .max_elements = caps.default_max_elements });
     errdefer doc.deinit();
 
     const root = doc.root;
@@ -377,6 +406,16 @@ pub const MessageKind = enum { hello, rpc_reply, rpc, notification, unknown };
 /// validate — the real parser does that.
 pub fn classify(source: []const u8) MessageKind {
     var i: usize = 0;
+    // A leading UTF-8 BOM is legal XML (XML 1.0 §4.3.3) and `xml.parse`
+    // accepts it at byte 0 -- but `classify` used to stop at the very first
+    // byte check (`source[i] != '<'`) and return `.unknown`. A server that
+    // prefixed its `<rpc-reply>` with a BOM (RFC 6242 §3 requires UTF-8 but
+    // does not forbid one) was therefore routed as `.unknown` by this
+    // function while `parseReply` parsed it without complaint --
+    // `Client.receiveReply` trusts `classify` exclusively, so the session
+    // died on `error.UnexpectedMessage` over a reply the module could
+    // actually read (2026-09-10 audit, `A1/netconf.md` N5).
+    if (std.mem.startsWith(u8, source, "\xEF\xBB\xBF")) i = 3;
     while (i < source.len) {
         // Skip whitespace.
         while (i < source.len and (source[i] == ' ' or source[i] == '\t' or source[i] == '\r' or source[i] == '\n')) i += 1;
@@ -666,6 +705,137 @@ test "parseReply: hostile / wrong-document inputs" {
         .{ .src = "", .want = error.NoRootElement },
     };
     for (cases) |c| try testing.expectError(c.want, parseReply(gpa, c.src));
+}
+
+test "parseReply: N6/N17 -- more than one of ok/data/rpc-error is AmbiguousReply, not silently picked" {
+    const gpa = testing.allocator;
+    const cases = [_][]const u8{
+        // N17 r11: <ok/> AND <rpc-error> -- before the fix, Reply.ok = true
+        // AND Reply.hasErrors() = true simultaneously.
+        "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/><rpc-error><error-tag>in-use</error-tag></rpc-error></rpc-reply>",
+        // N17 r12: <data> AND <rpc-error>.
+        "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><data>x</data><rpc-error><error-tag>in-use</error-tag></rpc-error></rpc-reply>",
+        // N6 r13 / N17: two <data> elements -- before the fix, Reply.body was
+        // the FIRST ("<data>FIRST</data>") and Reply.expectData() was the
+        // LAST ("<data>SECOND</data>"): two different elements, silently.
+        "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><data>FIRST</data><data>SECOND</data></rpc-reply>",
+        // Two <ok/>.
+        "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/><ok/></rpc-reply>",
+    };
+    for (cases) |src| try testing.expectError(error.AmbiguousReply, parseReply(gpa, src));
+
+    // Positive control: each category ALONE, and an RPC-specific body with
+    // none of the three, must keep parsing -- the guard must not become
+    // over-eager.
+    var ok_only = try parseReply(gpa, rfc_7_5_lock_ok);
+    defer ok_only.deinit();
+    try testing.expect(ok_only.ok);
+
+    var data_only = try parseReply(gpa, rfc_7_1_reply);
+    defer data_only.deinit();
+    _ = try data_only.expectData();
+
+    var errors_only = try parseReply(gpa,
+        \\<rpc-reply message-id="1" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <rpc-error><error-tag>in-use</error-tag></rpc-error>
+        \\  <rpc-error><error-tag>too-big</error-tag></rpc-error>
+        \\</rpc-reply>
+    );
+    defer errors_only.deinit();
+    try testing.expectEqual(@as(usize, 2), errors_only.errors.len);
+
+    var body_only = try parseReply(gpa,
+        \\<rpc-reply message-id="105" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <config xmlns="http://example.com/schema/1.2/config"><users/></config>
+        \\</rpc-reply>
+    );
+    defer body_only.deinit();
+    try testing.expect(!body_only.hasErrors());
+}
+
+test "classify: a UTF-8 BOM before the root element does not defeat routing" {
+    const bom = "\xEF\xBB\xBF";
+    try testing.expectEqual(MessageKind.rpc_reply, classify(bom ++ "<rpc-reply message-id=\"1\"/>"));
+    try testing.expectEqual(MessageKind.hello, classify(bom ++ "<?xml version=\"1.0\"?>\n<hello xmlns=\"x\"/>"));
+    try testing.expectEqual(MessageKind.notification, classify(bom ++ "<notification>"));
+}
+
+test "parseReply: a BOM-prefixed reply classifies AND parses consistently" {
+    // N5 regression, exercised end to end: `classify` used to say `.unknown`
+    // for exactly the documents `parseReply` accepts here.
+    const gpa = testing.allocator;
+    const bom = "\xEF\xBB\xBF";
+    const src = bom ++ "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/></rpc-reply>";
+    try testing.expectEqual(MessageKind.rpc_reply, classify(src));
+    var r = try parseReply(gpa, src);
+    defer r.deinit();
+    try r.expectOk();
+}
+
+test "parseReply: N4 (error-info site) -- session-id with a digit separator is rejected, not silently reinterpreted" {
+    const gpa = testing.allocator;
+    var r = try parseReply(gpa,
+        \\<rpc-reply message-id="1" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+        \\  <rpc-error>
+        \\    <error-tag>lock-denied</error-tag>
+        \\    <error-info><session-id>4_5_4</session-id></error-info>
+        \\  </rpc-error>
+        \\</rpc-reply>
+    );
+    defer r.deinit();
+    // Before the fix this was 454 (the digits with the `_` dropped), not null.
+    try testing.expectEqual(@as(?u32, null), r.errors[0].info_session_id);
+}
+
+test "parseReply: N1 -- element count is bounded independent of Limits.max_message" {
+    // `xml.parse`'s own default (`Options.max_elements = 1 << 20`) let a
+    // small, well-under-`max_message` document balloon to hundreds of MiB of
+    // live bytes (2026-09-10 audit, `A1/netconf.md` N1: a 4.00 MiB
+    // `<a/>`-repeated reply cost 529.2 MiB, a 132x amplification, with
+    // `Limits.max_message` never engaging at all -- it bounds wire bytes, not
+    // element count, and the two are unrelated in this module).
+    // `caps.default_max_elements` (65536) is what `parseReply` now passes to
+    // `xml.parse` instead of inheriting that default.
+    const gpa = testing.allocator;
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(gpa);
+    try over.appendSlice(gpa, "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><data>");
+    var i: usize = 0;
+    // + the <rpc-reply> and <data> elements themselves push this over the cap.
+    while (i <= caps.default_max_elements) : (i += 1) try over.appendSlice(gpa, "<a/>");
+    try over.appendSlice(gpa, "</data></rpc-reply>");
+    try testing.expectError(error.TooManyElements, parseReply(gpa, over.items));
+
+    // Positive control: comfortably under the cap still parses in full.
+    var under: std.ArrayList(u8) = .empty;
+    defer under.deinit(gpa);
+    try under.appendSlice(gpa, "<rpc-reply message-id=\"1\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><data>");
+    i = 0;
+    while (i < caps.default_max_elements - 4) : (i += 1) try under.appendSlice(gpa, "<a/>");
+    try under.appendSlice(gpa, "</data></rpc-reply>");
+    var r = try parseReply(gpa, under.items);
+    defer r.deinit();
+    _ = try r.expectData();
+}
+
+test "parseReply: N18 -- expectMessageId is strict decimal-string comparison, by design" {
+    // N18 (LOW, audit's own verdict: "the strictness is security-correct;
+    // noting it as an interop risk, not a defect" -- confirmed here, not
+    // changed). A server that reflects `message-id` with a leading zero, a
+    // sign or surrounding whitespace fails correlation instead of being
+    // fuzzy-matched; RFC 6241 §4.1 says the id is returned, not that it is
+    // returned byte-identical, but treating anything other than an exact
+    // decimal echo as a mismatch is the safer of the two readings and this
+    // locks it in.
+    const gpa = testing.allocator;
+    const cases = [_][]const u8{ "01", " 1", "+1", "1\n" };
+    for (cases) |id| {
+        var buf: [256]u8 = undefined;
+        const src = try std.fmt.bufPrint(&buf, "<rpc-reply message-id=\"{s}\" xmlns=\"urn:ietf:params:xml:ns:netconf:base:1.0\"><ok/></rpc-reply>", .{id});
+        var r = try parseReply(gpa, src);
+        defer r.deinit();
+        try testing.expectError(error.MessageIdMismatch, r.expectMessageId(1));
+    }
 }
 
 test "parseReply: a reply with no message-id fails correlation" {
