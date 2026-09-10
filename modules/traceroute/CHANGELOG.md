@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, follow-up closing the
+  three findings left open by the same day's earlier fix wave below (F3, F4, F10 — all
+  three blocked on the sibling `icmp` module, which gained the needed field and check
+  today too; see `icmp.md`/`traceroute.md` dispositions). `traceWith`'s `.icmp_error`
+  branch now also requires the quoted destination inside the error to equal `dest`
+  before attributing it to a hop — an ICMP error quoting a DIFFERENT destination than
+  the one being traced (forged, or a stale reply from an unrelated concurrent trace
+  sharing the guessable ident/seq window) is now ignored instead of resolving the hop.
+  No public signature changed. `icmp.echo.parseV4` verifying the receive-side checksum
+  (icmp F7) also closes this module's own F4 for free, and F10 is closed the same way
+  icmp closed its own F15: documented, not coded.
 - **2026-09-10** — A1 fix campaign, 6 of 12 open findings closed (3 more documented as
   out-of-scope for this module; see SPEC.md "Threat model"):
   - **F1 (HIGH)**: an Echo Reply now must carry the destination's own source address to

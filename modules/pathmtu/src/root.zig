@@ -949,6 +949,11 @@ test "classify v4: matching echo reply is ok, mismatched ident/seq is ignored" {
     var buf: [echo.echo_header_len]u8 = @splat(0);
     try echo.writeEchoRequest(.v4, &buf, 0x1234, 7);
     buf[0] = echo.v4.echo_reply;
+    // A1 (icmp F7): icmp.echo.parseV4 now verifies the receive-side ICMP
+    // checksum. The checksum covers the type byte, so flipping it to
+    // echo_reply invalidates the request's own checksum -- recompute.
+    std.mem.writeInt(u16, buf[2..4], 0, .big);
+    std.mem.writeInt(u16, buf[2..4], echo.checksum(&buf), .big);
     try testing.expectEqual(Classified.ok, classify(.v4, false, &buf, 0x1234, 7).?);
     try testing.expectEqual(@as(?Classified, null), classify(.v4, false, &buf, 0x1234, 8));
     try testing.expectEqual(@as(?Classified, null), classify(.v4, false, &buf, 0x9999, 7));
@@ -964,6 +969,7 @@ test "classify v4: dest-unreachable/code 4 is frag_needed with the MTU hint; oth
     orig[0] = echo.v4.echo_request;
     std.mem.writeInt(u16, orig[4..6], 0xabcd, .big);
     std.mem.writeInt(u16, orig[6..8], 3, .big);
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big); // A1 (icmp F7)
 
     const c = classify(.v4, false, &pkt, 0xabcd, 3);
     try testing.expectEqual(@as(?u32, 1300), c.?.frag_needed);
@@ -971,7 +977,12 @@ test "classify v4: dest-unreachable/code 4 is frag_needed with the MTU hint; oth
     // A mutation that ignores the code (accepts ANY dest-unreachable as
     // frag_needed) must be caught here: code 1 (host unreachable) is a
     // different, unrelated ICMP error and must be ignored, not classified.
+    // Re-checksummed so the rejection is exercised via the code check, not
+    // incidentally via the checksum gate.
     pkt[1] = 1;
+    pkt[2] = 0;
+    pkt[3] = 0;
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
     try testing.expectEqual(@as(?Classified, null), classify(.v4, false, &pkt, 0xabcd, 3));
 }
 
@@ -1000,6 +1011,7 @@ test "classify: ip-header stripping is exact at the IHL boundary" {
     pkt[20] = echo.v4.echo_reply;
     std.mem.writeInt(u16, pkt[24..26], 1, .big);
     std.mem.writeInt(u16, pkt[26..28], 1, .big);
+    std.mem.writeInt(u16, pkt[22..24], echo.checksum(pkt[20..]), .big); // A1 (icmp F7)
     try testing.expectEqual(Classified.ok, classify(.v4, true, &pkt, 1, 1).?);
     // A packet shorter than its own claimed IHL must be rejected, not read
     // out of bounds.
@@ -1367,9 +1379,18 @@ test "regression (finding #3): probe's live path no longer starts seq at the fix
 // exception (1300, correct) against a destination that never got one
 // (1500, the interface MTU -- silently wrong).
 
+// A1 (icmp F7): icmp.echo.parseV4 now verifies the receive-side ICMP
+// checksum. The kernel's real reply quoted more of the original oversized
+// ping than the 28 bytes kept below (Linux quotes up to the original
+// packet's own length or a kernel-side cap, not just RFC 792's minimum 8),
+// so `0x0eb5` -- the checksum of the FULL, untruncated reply -- does not
+// verify against this already-truncated excerpt. Recomputed over the bytes
+// actually present here (`0x2a7e`) so the excerpt is internally consistent;
+// the quoted IP header, MTU hint and ident/seq bytes this test exists to
+// pin are unchanged.
 const real_v4_frag_needed = [_]u8{
     0x45, 0xc0, 0x02, 0x40, 0x1f, 0x0e, 0x00, 0x00, 0x40, 0x01, 0x44, 0xed, 0x0a, 0x00, 0x00, 0x02,
-    0x0a, 0x00, 0x00, 0x01, 0x03, 0x04, 0x0e, 0xb5, 0x00, 0x00, 0x05, 0x14, 0x45, 0x00, 0x05, 0x94,
+    0x0a, 0x00, 0x00, 0x01, 0x03, 0x04, 0x2a, 0x7e, 0x00, 0x00, 0x05, 0x14, 0x45, 0x00, 0x05, 0x94,
     0x00, 0x00, 0x40, 0x00, 0x40, 0x01, 0x20, 0x67, 0x0a, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x01, 0x02,
     0x08, 0x00, 0x87, 0xd6, 0x3d, 0x92, 0x00, 0x01,
 };

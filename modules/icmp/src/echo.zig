@@ -50,13 +50,20 @@ pub const Family = enum { v4, v6 };
 
 /// RFC 1071 internet checksum over `data`, returned in host byte order.
 /// Store the result big-endian into the packet.
+///
+/// A1 F9: `sum` used to accumulate in `u32`, which overflows once `data`
+/// carries more than 65537 sixteen-bit words (131074 bytes) of `0xffff` --
+/// a panic in Debug/ReleaseSafe and a silently wrong result in ReleaseFast.
+/// `data.len` has no documented bound, so a `u64` accumulator is used
+/// instead: the largest possible sum (every word `0xffff`, over a slice as
+/// long as `usize` can index) never approaches `u64`'s range.
 pub fn checksum(data: []const u8) u16 {
-    var sum: u32 = 0;
+    var sum: u64 = 0;
     var i: usize = 0;
     while (i + 1 < data.len) : (i += 2) {
-        sum += (@as(u32, data[i]) << 8) | data[i + 1];
+        sum += (@as(u64, data[i]) << 8) | data[i + 1];
     }
-    if (i < data.len) sum += @as(u32, data[i]) << 8;
+    if (i < data.len) sum += @as(u64, data[i]) << 8;
     while (sum >> 16 != 0) sum = (sum & 0xffff) + (sum >> 16);
     return @intCast(~sum & 0xffff);
 }
@@ -122,13 +129,53 @@ pub const Reply = union(enum) {
     /// `ts` is set for ICMP timestamp replies.
     echo_reply: struct { ident: u16, seq: u16, ts: ?TsData = null },
     /// ICMP error quoting an echo/timestamp request of ours.
-    icmp_error: struct { kind: ErrorKind, code: u8, orig_ident: u16, orig_seq: u16 },
+    icmp_error: struct {
+        kind: ErrorKind,
+        code: u8,
+        orig_ident: u16,
+        orig_seq: u16,
+        /// A1 F2: the quoted IP header's declared source and destination,
+        /// raw network-byte-order address bytes (IPv4 in the first 4 bytes,
+        /// the rest zero; IPv6 fills all 16). Before this field existed,
+        /// `parseV4`/`parseV6` read these bytes to locate the quoted
+        /// echo/timestamp header and then discarded them -- no caller
+        /// (`traceroute`, `pathmtu`, this module's own `Pinger`) could
+        /// verify that a quote actually describes a probe of theirs, only
+        /// that `orig_ident`/`orig_seq` happened to match. See A1 audit
+        /// record `icmp.md` §4.
+        quoted_src: [16]u8,
+        quoted_dst: [16]u8,
+        /// IPv4 protocol number / IPv6 next-header byte of the quoted
+        /// packet (always 1/ICMP or 58/ICMPv6 here, since only a quoted
+        /// echo/timestamp request is accepted -- kept for symmetry and so a
+        /// caller need not special-case the family).
+        quoted_proto: u8,
+    },
     /// Anything else (not ours, malformed, uninteresting type).
     ignored,
 };
 
 /// Parse a packet read from an IPv4 ICMP socket. `strip_ip_header` must be
 /// true for SOCK_RAW sockets, where the kernel prepends the IP header.
+///
+/// ⚠ A1 F15: `packet` must be genuine ICMPv4 bytes, as delivered by an
+/// `AF_INET` socket (`Socket` never mixes families -- an AF_INET raw socket
+/// cannot receive an IPv6 datagram). ICMPv4 and ICMPv6 number their types
+/// independently and the two spaces collide (e.g. ICMPv6 Time Exceeded is
+/// type 3, the same wire value as ICMPv4 Destination Unreachable): calling
+/// this function directly with ICMPv6 bytes silently misparses them as a
+/// different, valid-looking ICMPv4 message instead of rejecting them. Not
+/// reachable through `Socket`/`Pinger`, only through this function called
+/// directly with attacker- or caller-supplied bytes of the wrong family.
+///
+/// ⚠ A1 F15/F10 (`traceroute`): a quoted `timestamp_request` is accepted as
+/// "ours" alongside `echo_request` -- `Pinger`'s `icmp_timestamp` mode needs
+/// this, callers that never send timestamp requests (e.g. `traceroute`) get
+/// an extra, unneeded quoted-type shape an off-path attacker can use. This
+/// parser is shared by every consumer; narrowing it per-caller would need a
+/// second entry point (`DECISIONS.md` P3: a new function is additive, and is
+/// exactly what a caller that wants the narrower contract should add for
+/// itself; not done here for lack of a consumer that has asked for it).
 pub fn parseV4(packet: []const u8, strip_ip_header: bool) Reply {
     var buf = packet;
     if (strip_ip_header) {
@@ -138,6 +185,17 @@ pub fn parseV4(packet: []const u8, strip_ip_header: bool) Reply {
         buf = buf[ihl..];
     }
     if (buf.len < echo_header_len) return .ignored;
+
+    // A1 F7: verify the ICMP checksum before trusting anything else in the
+    // message. This was never checked on the receive path -- only computed
+    // when writing a request -- so a packet with an arbitrary (or absent)
+    // checksum was accepted exactly like a genuine one. RFC 1071: summing
+    // the whole message including its own checksum field folds to zero iff
+    // the checksum is valid. IPv6 is not checked here: this module never
+    // computes the IPv6 checksum itself (the doc comment at the top of this
+    // file explains why -- it needs the pseudo-header, which only the
+    // kernel has), so there is no in-module reference to verify against.
+    if (checksum(buf) != 0) return .ignored;
 
     switch (buf[0]) {
         v4.echo_reply => return .{ .echo_reply = .{
@@ -164,6 +222,10 @@ pub fn parseV4(packet: []const u8, strip_ip_header: bool) Reply {
             if (qihl < 20 or quoted.len < qihl + echo_header_len) return .ignored;
             const orig = quoted[qihl..];
             if (orig[0] != v4.echo_request and orig[0] != v4.timestamp_request) return .ignored;
+            var quoted_src: [16]u8 = @splat(0);
+            var quoted_dst: [16]u8 = @splat(0);
+            @memcpy(quoted_src[0..4], quoted[12..16]);
+            @memcpy(quoted_dst[0..4], quoted[16..20]);
             return .{ .icmp_error = .{
                 .kind = switch (buf[0]) {
                     v4.dest_unreachable => .dest_unreachable,
@@ -175,6 +237,9 @@ pub fn parseV4(packet: []const u8, strip_ip_header: bool) Reply {
                 .code = buf[1],
                 .orig_ident = std.mem.readInt(u16, orig[4..6], .big),
                 .orig_seq = std.mem.readInt(u16, orig[6..8], .big),
+                .quoted_src = quoted_src,
+                .quoted_dst = quoted_dst,
+                .quoted_proto = quoted[9],
             } };
         },
         else => return .ignored,
@@ -199,6 +264,10 @@ pub fn parseV6(packet: []const u8) Reply {
             if (quoted[6] != 58) return .ignored; // next header must be ICMPv6
             const orig = quoted[40..];
             if (orig[0] != v6.echo_request) return .ignored;
+            var quoted_src: [16]u8 = undefined;
+            var quoted_dst: [16]u8 = undefined;
+            @memcpy(&quoted_src, quoted[8..24]);
+            @memcpy(&quoted_dst, quoted[24..40]);
             return .{ .icmp_error = .{
                 .kind = switch (buf[0]) {
                     v6.dest_unreachable => .dest_unreachable,
@@ -210,6 +279,9 @@ pub fn parseV6(packet: []const u8) Reply {
                 .code = buf[1],
                 .orig_ident = std.mem.readInt(u16, orig[4..6], .big),
                 .orig_seq = std.mem.readInt(u16, orig[6..8], .big),
+                .quoted_src = quoted_src,
+                .quoted_dst = quoted_dst,
+                .quoted_proto = quoted[6],
             } };
         },
         else => return .ignored,
@@ -228,6 +300,21 @@ test "checksum odd length" {
     const data = [_]u8{ 0xff, 0xff, 0x01 };
     // sum = 0xffff + 0x0100 = 0x100ff -> fold -> 0x0100; ~0x0100 = 0xfeff
     try std.testing.expectEqual(@as(u16, 0xfeff), checksum(&data));
+}
+
+test "checksum does not overflow past 131074 bytes" {
+    // A1 F9: `sum` used to accumulate in `u32`. The largest possible
+    // per-16-bit-word contribution is 0xffff, so 65537 words (131074 bytes)
+    // of 0xff overflowed it: `panic: integer overflow` in Debug/ReleaseSafe,
+    // a silently wrong result (measured 2026-09-05: `-> 0x1`) in
+    // ReleaseFast. `checksum` is public API with no documented length
+    // bound. `expected` is computed here with an independent unbounded
+    // accumulator, not by calling the function under test.
+    var buf: [200_000]u8 = @splat(0xff);
+    var ref: u64 = 100_000 * @as(u64, 0xffff);
+    while (ref >> 16 != 0) ref = (ref & 0xffff) + (ref >> 16);
+    const expected: u16 = @intCast(~ref & 0xffff);
+    try std.testing.expectEqual(expected, checksum(&buf));
 }
 
 test "golden: v4 echo request wire bytes" {
@@ -251,8 +338,13 @@ test "echo request round-trip v4 dgram" {
     // Packet checksum must verify (sum over whole packet == 0).
     try std.testing.expectEqual(@as(u16, 0), checksum(&buf));
     // A reply differs only in type; emulate kernel echo by flipping type.
+    // The checksum covers the type byte too, so it must be recomputed --
+    // a real kernel reply carries its OWN valid checksum over the reply
+    // bytes, not the request's.
     var reply = buf;
     reply[0] = v4.echo_reply;
+    std.mem.writeInt(u16, reply[2..4], 0, .big);
+    std.mem.writeInt(u16, reply[2..4], checksum(&reply), .big); // A1 F7
     const parsed = parseV4(&reply, false);
     try std.testing.expectEqual(@as(u16, 0xabcd), parsed.echo_reply.ident);
     try std.testing.expectEqual(@as(u16, 42), parsed.echo_reply.seq);
@@ -274,6 +366,7 @@ test "echo reply v4 with raw IP header" {
     pkt[20] = v4.echo_reply;
     std.mem.writeInt(u16, pkt[24..26], 7, .big);
     std.mem.writeInt(u16, pkt[26..28], 9, .big);
+    std.mem.writeInt(u16, pkt[22..24], checksum(pkt[20..28]), .big); // A1 F7
     const parsed = parseV4(&pkt, true);
     try std.testing.expectEqual(@as(u16, 7), parsed.echo_reply.ident);
     try std.testing.expectEqual(@as(u16, 9), parsed.echo_reply.seq);
@@ -284,14 +377,31 @@ test "icmp v4 dest unreachable quoting our echo" {
     pkt[0] = v4.dest_unreachable;
     pkt[1] = 1; // host unreachable
     pkt[8] = 0x45; // quoted IP header
+    pkt[8 + 9] = 1; // quoted protocol = ICMP
+    // Quoted source/destination (A1 F2): a router reporting this error
+    // quotes the IP header of the packet it is complaining about, which
+    // carries OUR echo request's real source and the destination we sent
+    // it to.
+    const quoted_src = [4]u8{ 203, 0, 113, 7 };
+    const quoted_dst = [4]u8{ 8, 8, 8, 8 };
+    @memcpy(pkt[8 + 12 ..][0..4], &quoted_src);
+    @memcpy(pkt[8 + 16 ..][0..4], &quoted_dst);
     const orig = pkt[8 + 20 ..];
     orig[0] = v4.echo_request;
     std.mem.writeInt(u16, orig[4..6], 0x1234, .big);
     std.mem.writeInt(u16, orig[6..8], 77, .big);
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big); // A1 F7
     const parsed = parseV4(&pkt, false);
     try std.testing.expectEqual(ErrorKind.dest_unreachable, parsed.icmp_error.kind);
     try std.testing.expectEqual(@as(u16, 0x1234), parsed.icmp_error.orig_ident);
     try std.testing.expectEqual(@as(u16, 77), parsed.icmp_error.orig_seq);
+    // A1 F2: before this field existed, these bytes were read (to find
+    // `orig`) and then discarded -- no caller could verify a quote
+    // actually describes a probe of theirs.
+    try std.testing.expectEqual(@as(u8, 1), parsed.icmp_error.quoted_proto);
+    try std.testing.expectEqualSlices(u8, &quoted_src, parsed.icmp_error.quoted_src[0..4]);
+    try std.testing.expectEqualSlices(u8, &quoted_dst, parsed.icmp_error.quoted_dst[0..4]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 12), parsed.icmp_error.quoted_src[4..16]);
 }
 
 test "icmp v4 error kinds map correctly for every quoted-error type" {
@@ -313,6 +423,7 @@ test "icmp v4 error kinds map correctly for every quoted-error type" {
         orig[0] = v4.echo_request;
         std.mem.writeInt(u16, orig[4..6], 0x1234, .big);
         std.mem.writeInt(u16, orig[6..8], 77, .big);
+        std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big); // A1 F7
         const parsed = parseV4(&pkt, false);
         try std.testing.expectEqual(c.kind, parsed.icmp_error.kind);
     }
@@ -329,14 +440,22 @@ test "icmp v4 error quoting a timestamp request is accepted" {
     orig[0] = v4.timestamp_request;
     std.mem.writeInt(u16, orig[4..6], 0x55, .big);
     std.mem.writeInt(u16, orig[6..8], 66, .big);
+    pkt[2] = 0;
+    pkt[3] = 0;
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big); // A1 F7
     const parsed = parseV4(&pkt, false);
     try std.testing.expectEqual(ErrorKind.time_exceeded, parsed.icmp_error.kind);
     try std.testing.expectEqual(@as(u16, 0x55), parsed.icmp_error.orig_ident);
     try std.testing.expectEqual(@as(u16, 66), parsed.icmp_error.orig_seq);
 
     // A quoted type that is neither echo_request nor timestamp_request
-    // must be ignored, not accepted as "close enough".
+    // must be ignored, not accepted as "close enough" -- re-checksummed so
+    // the rejection below is exercised via the quoted-type check, not
+    // incidentally via the A1 F7 checksum gate added above.
     orig[0] = v4.echo_reply;
+    pkt[2] = 0;
+    pkt[3] = 0;
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big);
     try std.testing.expectEqual(Reply.ignored, parseV4(&pkt, false));
 }
 
@@ -352,6 +471,10 @@ test "icmp v4 quoted-header boundary is exact at qihl + echo_header_len" {
     pkt27[0] = v4.time_exceeded;
     pkt27[8] = 0x45; // ihl=5 -> qihl=20; only 7 bytes follow, need 8
     pkt27[28] = v4.echo_request; // quoted[20] = orig[0], so it isn't the reason for rejection
+    // A1 F7: checksummed so the rejection below is exercised via the
+    // length boundary this test is pinning, not incidentally via the
+    // checksum gate (which would also reject an all-zero checksum field).
+    std.mem.writeInt(u16, pkt27[2..4], checksum(&pkt27), .big);
     try std.testing.expectEqual(Reply.ignored, parseV4(&pkt27, false));
 
     var pkt28: [echo_header_len + 28]u8 = @splat(0);
@@ -359,6 +482,7 @@ test "icmp v4 quoted-header boundary is exact at qihl + echo_header_len" {
     pkt28[8] = 0x45;
     const orig = pkt28[8 + 20 ..];
     orig[0] = v4.echo_request;
+    std.mem.writeInt(u16, pkt28[2..4], checksum(&pkt28), .big); // A1 F7
     const parsed = parseV4(&pkt28, false);
     try std.testing.expectEqual(ErrorKind.time_exceeded, parsed.icmp_error.kind);
 }
@@ -375,6 +499,16 @@ test "icmp v6 error kinds map correctly for every quoted-error type" {
         pkt[0] = c.wire;
         const quoted = pkt[echo_header_len..];
         quoted[6] = 58; // next header = ICMPv6
+        quoted[8] = 0x20; // quoted source: 2001:db8::1
+        quoted[9] = 0x01;
+        quoted[10] = 0x0d;
+        quoted[11] = 0xb8;
+        quoted[23] = 0x01;
+        quoted[24] = 0x20; // quoted destination: 2001:db8::2
+        quoted[25] = 0x01;
+        quoted[26] = 0x0d;
+        quoted[27] = 0xb8;
+        quoted[39] = 0x02;
         const orig = quoted[40..];
         orig[0] = v6.echo_request;
         std.mem.writeInt(u16, orig[4..6], 0xbeef, .big);
@@ -383,6 +517,10 @@ test "icmp v6 error kinds map correctly for every quoted-error type" {
         try std.testing.expectEqual(c.kind, parsed.icmp_error.kind);
         try std.testing.expectEqual(@as(u16, 0xbeef), parsed.icmp_error.orig_ident);
         try std.testing.expectEqual(@as(u16, 9), parsed.icmp_error.orig_seq);
+        // A1 F2: quoted source/destination/next-header, filled for v6 too.
+        try std.testing.expectEqualSlices(u8, quoted[8..24], &parsed.icmp_error.quoted_src);
+        try std.testing.expectEqualSlices(u8, quoted[24..40], &parsed.icmp_error.quoted_dst);
+        try std.testing.expectEqual(@as(u8, 58), parsed.icmp_error.quoted_proto);
     }
 }
 
@@ -418,15 +556,56 @@ test "short and foreign packets are ignored" {
     try std.testing.expectEqual(Reply.ignored, parseV6(&.{}));
     var pkt: [echo_header_len]u8 = @splat(0);
     pkt[0] = 99;
+    // A1 F7: checksummed so this exercises the "unrecognized type" branch,
+    // not the checksum gate that now runs first.
+    std.mem.writeInt(u16, pkt[2..4], checksum(&pkt), .big);
     try std.testing.expectEqual(Reply.ignored, parseV4(&pkt, false));
     // Truncated error quotes must be ignored, not sliced out of bounds.
     var err4: [echo_header_len + 10]u8 = @splat(0);
     err4[0] = v4.time_exceeded;
     err4[8] = 0x45;
+    std.mem.writeInt(u16, err4[2..4], checksum(&err4), .big); // A1 F7, see above
     try std.testing.expectEqual(Reply.ignored, parseV4(&err4, false));
     var err6: [echo_header_len + 12]u8 = @splat(0);
     err6[0] = v6.time_exceeded;
     try std.testing.expectEqual(Reply.ignored, parseV6(&err6));
+}
+
+test "A1 F7: parseV4 rejects an otherwise well-formed reply with a wrong checksum" {
+    // Before this fix, the receive-side checksum was never verified at all
+    // -- computed only when writing a request. Measured live 2026-09-05
+    // (`badcsum_raw`): a forged echo reply with a deliberately wrong ICMP
+    // checksum was accepted as a genuine reply on the RAW socket path (the
+    // DGRAM path only rejected it because the kernel itself checks the
+    // checksum for ping sockets, not because this module did).
+    var buf: [echo_header_len + 8]u8 = @splat(0);
+    try writeEchoRequest(.v4, &buf, 0xabcd, 42);
+    buf[0] = v4.echo_reply;
+    std.mem.writeInt(u16, buf[2..4], 0, .big);
+    std.mem.writeInt(u16, buf[2..4], checksum(&buf), .big);
+
+    // Positive control: the correctly-checksummed reply parses.
+    try std.testing.expectEqual(@as(u16, 0xabcd), parseV4(&buf, false).echo_reply.ident);
+
+    // Flip one bit of the checksum field: a deliberately wrong checksum,
+    // otherwise identical packet.
+    var bad = buf;
+    bad[3] ^= 0x01;
+    try std.testing.expectEqual(Reply.ignored, parseV4(&bad, false));
+
+    // And an ICMP error with an otherwise-valid quoted header, but a wrong
+    // outer checksum, matching the live `badcsum_raw` case exactly.
+    var err: [echo_header_len + 20 + echo_header_len]u8 = @splat(0);
+    err[0] = v4.time_exceeded;
+    err[8] = 0x45;
+    const orig = err[8 + 20 ..];
+    orig[0] = v4.echo_request;
+    std.mem.writeInt(u16, orig[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, orig[6..8], 77, .big);
+    std.mem.writeInt(u16, err[2..4], checksum(&err), .big);
+    try std.testing.expectEqual(ErrorKind.time_exceeded, parseV4(&err, false).icmp_error.kind); // positive control
+    err[3] ^= 0x01;
+    try std.testing.expectEqual(Reply.ignored, parseV4(&err, false));
 }
 
 // ── real-capture goldens (loopback, tcpdump, 2026-08-01) ────────────────────
@@ -632,12 +811,16 @@ const parser_seeds = [_][]const u8{
     seed("080065D895550001DBDE6D6A00000000F2B4020000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v4 echo REQUEST: ours, but not a reply — ignored
     seed("45000054A9E100004001D2C57F0000017F000001" ++ "00006DD895550001DBDE6D6A00000000F2B4020000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // the same reply with its real IPv4 header: the SOCK_RAW path
     seed("03033D3A0000000045000021875740004011B5727F0000017F000001E1829C3F000DFE2068656C6C6F"), // v4 port-unreachable quoting a UDP datagram — not ours
-    seed("0301000000000000" ++ "45" ++ ("00" ** 19) ++ "080000001234004D"), // v4 host-unreachable quoting OUR echo request
-    seed("0B00000000000000" ++ "45" ++ ("00" ** 19) ++ "0D00000000550042"), // v4 time-exceeded quoting our TIMESTAMP request, the other accepted quote
+    // A1 F7: these two carry a real checksum (computed offline) instead of
+    // an all-zero field -- the receive-side checksum gate added for F7
+    // would otherwise reject them before they ever reach the quoted-header
+    // logic they exist to exercise.
+    seed("03019D7D00000000" ++ "45" ++ ("00" ** 19) ++ "080000001234004D"), // v4 host-unreachable quoting OUR echo request
+    seed("0B00A26800000000" ++ "45" ++ ("00" ** 19) ++ "0D00000000550042"), // v4 time-exceeded quoting our TIMESTAMP request, the other accepted quote
     seed("0D00AF6E13570001000030390000000000000000"), // v4 timestamp request: ignored
     seed("0E0046471357000100003039028FB184028FB184"), // v4 timestamp reply: carries TsData
     seed("0B" ++ ("00" ** 7) ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 6)), // 27 octets of quote: one short of qihl+8, rejected
-    seed("0B" ++ ("00" ** 7) ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 7)), // 28 octets of quote: the exact accepting edge
+    seed("0B00A7FF00000000" ++ "45" ++ ("00" ** 19) ++ "08" ++ ("00" ** 7)), // 28 octets of quote: the exact accepting edge (A1 F7: real checksum)
     seed("81004D52955A0001DBDE6D6A0000000087B90C0000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v6 echo reply, real loopback capture
     seed("80004E52955A0001DBDE6D6A0000000087B90C0000000000101112131415161718191A1B1C1D1E1F202122232425262728292A2B2C2D2E2F3031323334353637"), // v6 echo request: ignored
     seed("0104FF6E000000006002D283000E11400000000000000000000000000000000100000000000000000000000000000001DAC59C3F000E002168656C6C6F36"), // v6 port-unreachable quoting UDP: next header 17, not 58

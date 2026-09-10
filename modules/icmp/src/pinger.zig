@@ -79,7 +79,9 @@ pub const Config = struct {
     /// IPv4 only; run() fails with IcmpTimestampRequiresIpv4 on v6 targets.
     icmp_timestamp: bool = false,
     /// Discard replies whose source address differs from the target
-    /// (fping --check-source).
+    /// (fping --check-source). Also discards an ICMP error whose quoted
+    /// destination differs from the target (A1 F2) -- ident+seq alone name
+    /// a *slot*, not which target the error is actually about.
     check_source: bool = false,
     socket_mode: Socket.Mode = .auto,
     /// SO_RCVBUF for the ICMP sockets.
@@ -341,7 +343,11 @@ pub const Pinger = struct {
     stop_requested: std.atomic.Value(bool) = .init(false),
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !Pinger {
-        std.debug.assert(cfg.max_inflight < seqmap.capacity);
+        // A1 F4: this was `std.debug.assert`, which compiles out of
+        // ReleaseFast/ReleaseSmall -- the modes an integrator ships. A
+        // caller-configured `max_inflight` at or past `seqmap.capacity`
+        // then reached `seqmap.add` at runtime with no guard at all.
+        if (cfg.max_inflight >= seqmap.capacity) return error.MaxInflightTooLarge;
         const pkt_len = if (cfg.icmp_timestamp)
             echo.timestamp_msg_len
         else
@@ -763,7 +769,14 @@ pub const Pinger = struct {
         self.inflight -= 1;
         self.emit(ev.target, ev.probe, .timeout);
 
-        if (self.cfg.mode == .alive and !t.done and t.attempts < 1 + self.cfg.retries) {
+        // A1 F4: was `t.attempts < 1 + self.cfg.retries`. `1 + retries` is
+        // u16 arithmetic that overflows when `retries == 65535`: a panic in
+        // Debug/ReleaseSafe, and in ReleaseFast the optimizer may assume
+        // the overflow it is UB not to happen and fold the comparison away
+        // (measured 2026-09-05: the run never returned). `attempts <=
+        // retries` is arithmetically identical for every retries value
+        // that does not overflow, and adds no operation that can.
+        if (self.cfg.mode == .alive and !t.done and t.attempts <= self.cfg.retries) {
             t.timeout_ns = backoff(t.timeout_ns, self.cfg.backoff_factor);
             try self.ping_q.push(self.gpa, .{
                 .time = now,
@@ -833,9 +846,28 @@ pub const Pinger = struct {
             .icmp_error => |e| {
                 if (e.orig_ident != sock.ident) return;
                 const entry = self.seqmap.fetch(e.orig_seq) orelse return;
+                const t = &self.targets.items[entry.target];
+                // A1 F2: `check_source` used to sit only in the `.echo_reply`
+                // branch above -- an ICMP error correlated by (guessable)
+                // ident+seq alone counted toward `icmp_errors` even when its
+                // quoted destination named a DIFFERENT target than the one
+                // it resolved to (measured live 2026-09-05: a Time Exceeded
+                // quoting 8.8.8.8, forged with the right ident/seq for a
+                // 10.9.9.77 probe, still incremented that probe's
+                // icmp_errors with check_source = true). The quoted
+                // destination is the only part of the error that actually
+                // names which probe it is about; ident/seq only says which
+                // *slot*.
+                if (self.cfg.check_source) {
+                    const dest_matches = switch (t.addr) {
+                        .v4 => |ta| std.mem.eql(u8, e.quoted_dst[0..4], std.mem.asBytes(&ta.addr)),
+                        .v6 => |ta| std.mem.eql(u8, &e.quoted_dst, &ta.addr),
+                    };
+                    if (!dest_matches) return;
+                }
                 // Informational only; the probe is resolved by its timeout
                 // (fping semantics).
-                self.targets.items[entry.target].stats.icmp_errors += 1;
+                t.stats.icmp_errors += 1;
             },
             .ignored => {},
         }
@@ -896,7 +928,14 @@ pub const Pinger = struct {
 
 fn sourceMatches(src: Socket.RecvInfo.SrcAddr, target: Addr) bool {
     return switch (src) {
-        .none => true, // no source info available; cannot verify
+        // A1 F13: "cannot verify" is not "verified" -- this returned `true`,
+        // turning `check_source`, a fail-closed guard everywhere else, into
+        // fail-open for the one case it could not judge. Not reachable on
+        // Linux today: `recvmsg`/`recvmmsg` fill `msg_name` for both socket
+        // kinds and both families, so `parseSrc` never actually returns
+        // `.none` (see A1 audit record `icmp.md` F13). Fail closed anyway,
+        // defensively, since nothing guarantees that stays true.
+        .none => false,
         .v4 => |sa| switch (target) {
             .v4 => |ta| sa.addr == ta.addr,
             .v6 => false,
@@ -909,7 +948,18 @@ fn sourceMatches(src: Socket.RecvInfo.SrcAddr, target: Addr) bool {
 }
 
 fn backoff(timeout_ns: u64, factor: f32) u64 {
-    const scaled = @as(f64, @floatFromInt(timeout_ns)) * factor;
+    const scaled = @as(f64, @floatFromInt(timeout_ns)) * @as(f64, factor);
+    // A1 F4: `@intFromFloat` of a value that does not fit `u64` (NaN,
+    // infinity, negative, or simply too large) is UB -- a panic in
+    // Debug/ReleaseSafe, and in ReleaseFast (measured 2026-09-05: factors
+    // 1e30 / -1.0 / NaN each ran unbounded, never returning). None of these
+    // is a valid timeout multiplier's result, so none of them changes the
+    // timeout: NaN/±infinity/negative keep the previous timeout, and an
+    // overflowing product clamps to `cap`, a power of two (so it round-trips
+    // through f64 exactly) far past any real-world timeout.
+    if (!std.math.isFinite(scaled) or scaled < 0) return timeout_ns;
+    const cap: f64 = @as(f64, 1 << 62); // ~146 years
+    if (scaled > cap) return @intFromFloat(cap);
     return @intFromFloat(scaled);
 }
 
@@ -1079,6 +1129,10 @@ test "seqmap correlation: a parsed reply resolves to its probe" {
     var pkt: [echo.echo_header_len]u8 = @splat(0);
     try echo.writeEchoRequest(.v4, &pkt, 0xcafe, seq);
     pkt[0] = echo.v4.echo_reply; // kernel echoes the id/seq back
+    // A1 F7: the checksum covers the type byte -- a real reply carries its
+    // own valid checksum, not the request's.
+    std.mem.writeInt(u16, pkt[2..4], 0, .big);
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
     const parsed = echo.parseV4(&pkt, false);
     const entry = sm.fetch(parsed.echo_reply.seq).?;
     try std.testing.expectEqual(@as(u32, 42), entry.target);
@@ -1086,6 +1140,137 @@ test "seqmap correlation: a parsed reply resolves to its probe" {
     try std.testing.expectEqual(@as(i64, 123_456), entry.sent_ns);
     sm.release(seq);
     try std.testing.expectEqual(@as(?seqmap.Entry, null), sm.fetch(seq));
+}
+
+test "A1 F4: retries = 65535 does not overflow the retry-count comparison" {
+    // Before the fix, `t.attempts < 1 + self.cfg.retries` computed
+    // `1 + 65535` in u16 arithmetic: Debug/ReleaseSafe panicked with
+    // "integer overflow" (measured @ pinger.zig:766), ReleaseFast never
+    // returned. `retries = 65535` is an extreme but legitimate
+    // configuration choice, not a caller bug -- there was nothing to
+    // reject, only arithmetic to fix. `attempts` starts at 0 (no
+    // `prepareProbe` call happened here), so a retry must be scheduled.
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .alive, .retries = 65535 });
+    defer p.deinit();
+    _ = try p.addTarget("192.0.2.1");
+    const seq = try p.seqmap.add(0, 0, monoNow());
+    p.targets.items[0].pending = 1;
+    p.inflight = 1;
+    const ev: Event = .{ .time = monoNow(), .target = 0, .probe = 0, .seq = seq };
+    try p.handleTimeout(ev, monoNow());
+    try std.testing.expectEqual(@as(usize, 1), p.ping_q.items.len);
+    try std.testing.expect(!p.targets.items[0].done);
+}
+
+test "A1 F4: backoff() never produces UB for non-finite, negative, or overflowing factors" {
+    // Measured 2026-09-05: backoff_factor = 1e30 / -1.0 / NaN each panicked
+    // in Debug/ReleaseSafe (`@intFromFloat` of a value that does not fit
+    // u64) and ran unbounded in ReleaseFast.
+    try std.testing.expectEqual(@as(u64, 1) << 62, backoff(500_000_000, 1e30));
+    try std.testing.expectEqual(@as(u64, 500_000_000), backoff(500_000_000, -1.0));
+    try std.testing.expectEqual(@as(u64, 500_000_000), backoff(500_000_000, std.math.nan(f32)));
+    // The ordinary case is unaffected.
+    try std.testing.expectEqual(@as(u64, 750_000_000), backoff(500_000_000, 1.5));
+}
+
+test "A1 F4: max_inflight >= seqmap.capacity is reported, not asserted" {
+    // Was `std.debug.assert(cfg.max_inflight < seqmap.capacity)`, compiled
+    // out of ReleaseFast/ReleaseSmall.
+    try std.testing.expectError(
+        error.MaxInflightTooLarge,
+        Pinger.init(std.testing.allocator, .{ .max_inflight = seqmap.capacity }),
+    );
+    // Positive control: a legal value still initializes.
+    var p = try Pinger.init(std.testing.allocator, .{ .max_inflight = seqmap.capacity - 1 });
+    p.deinit();
+}
+
+test "A1 F13: no source information never counts as a source match" {
+    // `.none` used to return true ("cannot verify" read as "verified"), a
+    // fail-open reading of a guard that is fail-closed everywhere else.
+    const target = try Addr.parse("192.0.2.1");
+    try std.testing.expect(!sourceMatches(.none, target));
+    const target6 = try Addr.parse("2001:db8::1");
+    try std.testing.expect(!sourceMatches(.none, target6));
+}
+
+test "A1 F8: sourceMatches compares every octet, not just the first" {
+    // No test previously distinguished a comparison that only checked a
+    // subset of the address (A1 F12 mutation table, m7: "source compared by
+    // only its first octet") from the real one -- both left the suite
+    // green.
+    const target = try Addr.parse("192.0.2.1");
+    const wrong = [_][]const u8{ "10.0.2.1", "192.10.2.1", "192.0.10.1", "192.0.2.10" };
+    for (wrong) |w| {
+        const addr = try Addr.parse(w);
+        const sa: linux.sockaddr.in = switch (addr) {
+            .v4 => |a| a,
+            .v6 => unreachable,
+        };
+        try std.testing.expect(!sourceMatches(.{ .v4 = sa }, target));
+    }
+    const good: linux.sockaddr.in = switch (target) {
+        .v4 => |a| a,
+        .v6 => unreachable,
+    };
+    try std.testing.expect(sourceMatches(.{ .v4 = good }, target));
+
+    const target6 = try Addr.parse("2001:db8::1");
+    const wrong6 = [_][]const u8{ "2001:db9::1", "2001:db8::2" };
+    for (wrong6) |w| {
+        const addr = try Addr.parse(w);
+        const sa: linux.sockaddr.in6 = switch (addr) {
+            .v6 => |a| a,
+            .v4 => unreachable,
+        };
+        try std.testing.expect(!sourceMatches(.{ .v6 = sa }, target6));
+    }
+}
+
+test "A1 F2: check_source now validates the quoted destination inside an ICMP error too" {
+    // Before this fix, `check_source` sat only in the `.echo_reply` branch
+    // of handleReply. Measured live 2026-09-05 (`te_wrongdst_cs_raw`): a
+    // Time Exceeded quoting the WRONG destination but carrying the right
+    // (guessable) ident/seq still incremented that target's icmp_errors
+    // even with check_source = true.
+    var p = try Pinger.init(std.testing.allocator, .{ .check_source = true });
+    defer p.deinit();
+    const id = try p.addTarget("10.9.9.77");
+    // .dgram: no raw IP header to strip, so `pkt` below is the ICMP message
+    // as-is (recvmsg on a DGRAM ping socket never sees the IP header).
+    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    var pkt: [echo.echo_header_len + 20 + echo.echo_header_len]u8 = @splat(0);
+    pkt[0] = echo.v4.time_exceeded;
+    pkt[8] = 0x45; // quoted IHL = 5
+    const orig = pkt[8 + 20 ..];
+    orig[0] = echo.v4.echo_request;
+    std.mem.writeInt(u16, orig[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, orig[6..8], seq, .big);
+    // Quoted destination = 8.8.8.8, NOT the real target 10.9.9.77.
+    pkt[8 + 16] = 8;
+    pkt[8 + 17] = 8;
+    pkt[8 + 18] = 8;
+    pkt[8 + 19] = 8;
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big); // A1 F7
+
+    p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+    try std.testing.expectEqual(@as(u32, 0), p.stats(id).icmp_errors);
+
+    // Positive control: same packet, quoted destination corrected to the
+    // real target -- must be counted.
+    const target_bytes: [4]u8 = switch (p.targetAddr(id)) {
+        .v4 => |a| @bitCast(a.addr),
+        .v6 => unreachable,
+    };
+    @memcpy(pkt[8 + 16 ..][0..4], &target_bytes);
+    pkt[2] = 0;
+    pkt[3] = 0;
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
+    p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).icmp_errors);
 }
 
 // ── tests: integration (loopback; skipped without ICMP socket access) ───────

@@ -424,6 +424,21 @@ pub fn traceWith(
                         const j = slotOf(ie.orig_seq, opts.seq_base, total) orelse continue :recv;
                         const st = send_times[j] orelse continue :recv;
                         if (probes[j].kind != .timeout) continue :recv; // A1 F12, see above
+                        // A1 F3 (closed at its source, `icmp` module F2):
+                        // every probe this function sends targets `dest`
+                        // (TTL is the only thing that changes hop to hop),
+                        // so a genuine router's Time Exceeded / Destination
+                        // Unreachable always quotes `dest` back. Before
+                        // `icmp.echo.Reply.icmp_error` carried the quoted
+                        // header at all, this correlated on ident+seq
+                        // alone — the audit's own passing test proved it:
+                        // a fixture quoting dst = 10.0.2.5 (not the actual
+                        // `real_server_addr` probed) still resolved a hop.
+                        const quoted_dest_matches = switch (dest) {
+                            .v4 => |q| std.mem.eql(u8, ie.quoted_dst[0..4], &q),
+                            .v6 => |b| std.mem.eql(u8, &ie.quoted_dst, &b),
+                        };
+                        if (!quoted_dest_matches) continue :recv;
                         switch (ie.kind) {
                             .time_exceeded => probes[j] = .{
                                 .kind = .time_exceeded,
@@ -843,9 +858,29 @@ const FakeTransport = struct {
         const body = out[p..];
         body[0] = err_type;
         body[1] = code;
+        // A1 F3 (closed at its source, `icmp` module F2): the quoted IP
+        // header's destination must be `f.dest` -- every probe this fake
+        // network answers was addressed there, so a genuine router's error
+        // always quotes it back. Before `icmp.echo.Reply.icmp_error` carried
+        // the quoted destination at all, this canned-bytes builder never
+        // needed to fill it in either.
         switch (f.family) {
-            .v4 => body[echo.echo_header_len] = 0x45, // quoted IPv4 header, ihl=5
-            .v6 => body[echo.echo_header_len + 6] = 58, // quoted next header = ICMPv6
+            .v4 => {
+                body[echo.echo_header_len] = 0x45; // quoted IPv4 header, ihl=5
+                const dst4 = switch (f.dest) {
+                    .v4 => |q| q,
+                    .v6 => unreachable,
+                };
+                @memcpy(body[echo.echo_header_len + 16 ..][0..4], &dst4);
+            },
+            .v6 => {
+                body[echo.echo_header_len + 6] = 58; // quoted next header = ICMPv6
+                const dst6 = switch (f.dest) {
+                    .v6 => |b| b,
+                    .v4 => unreachable,
+                };
+                @memcpy(body[echo.echo_header_len + 24 ..][0..16], &dst6);
+            },
         }
         @memcpy(
             body[echo.echo_header_len + quoted_hdr ..],
@@ -1458,6 +1493,17 @@ const real_echo_reply_icmp = [_]u8{
 
 const real_router_addr = ip4(10, 0, 0, 2);
 const real_server_addr = ip4(10, 0, 1, 2);
+// A1 F3 (closed at its source, `icmp` module F2): `real_dest_unreachable_icmp`
+// quotes 10.0.2.5, the routed-unreachable prefix it was actually captured
+// against -- a DIFFERENT trace session than the one toward `real_server_addr`
+// that produced `real_time_exceeded_icmp`. Decoded from the fixture bytes,
+// quoted IP header at offset 28: `0a 00 02 05`. Before `icmp.echo.Reply`
+// carried the quoted destination, splicing both genuine captures into one
+// `traceWith` call toward `real_server_addr` and asserting both hops
+// resolved was the audit's own proof of F3: it passed *only* because the
+// quoted destination went unchecked. Named here instead of repeating the
+// literal.
+const real_unreachable_dest = ip4(10, 0, 2, 5);
 
 /// Minimal transport for the real-capture goldens: on each recv, hands back
 /// the NEXT captured packet verbatim — no synthesis, no recomputed checksum,
@@ -1498,16 +1544,14 @@ const ReplayTransport = struct {
     }
 };
 
-test "REAL CAPTURE: genuine kernel Time Exceeded, then genuine Destination Host Unreachable, from a live 2-hop router" {
+test "REAL CAPTURE: genuine kernel Time Exceeded from a live router" {
     try testing.expectEqual(@as(u16, 0), echo.checksum(real_time_exceeded_icmp[20..]));
-    try testing.expectEqual(@as(u16, 0), echo.checksum(real_dest_unreachable_icmp[20..]));
 
     var r: ReplayTransport = .{ .packets = &.{
         .{ .bytes = &real_time_exceeded_icmp, .from = real_router_addr },
-        .{ .bytes = &real_dest_unreachable_icmp, .from = real_router_addr },
     } };
     var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, .{
-        .max_hops = 2,
+        .max_hops = 1,
         .probes_per_hop = 1,
         .ident = 0x7472,
         .seq_base = 1,
@@ -1516,17 +1560,56 @@ test "REAL CAPTURE: genuine kernel Time Exceeded, then genuine Destination Host 
     defer tr.deinit(testing.allocator);
 
     try testing.expect(!tr.reached);
-    try testing.expectEqual(@as(usize, 2), tr.hops.len);
-    try testing.expectEqual(@as(?u8, 1), tr.unreachable_code); // real Host Unreachable
-
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
     const hop1 = tr.hops[0].probes[0];
     try testing.expectEqual(Probe.Kind.time_exceeded, hop1.kind);
     try testing.expect(hop1.address.?.eql(real_router_addr));
+}
 
-    const hop2 = tr.hops[1].probes[0];
-    try testing.expectEqual(Probe.Kind.dest_unreachable, hop2.kind);
-    try testing.expectEqual(@as(?u8, 1), hop2.code);
-    try testing.expect(hop2.address.?.eql(real_router_addr));
+test "REAL CAPTURE: genuine kernel Destination Host Unreachable for a routed-unreachable target" {
+    try testing.expectEqual(@as(u16, 0), echo.checksum(real_dest_unreachable_icmp[20..]));
+
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_dest_unreachable_icmp, .from = real_router_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_unreachable_dest, .{
+        .max_hops = 1,
+        .probes_per_hop = 1,
+        .ident = 0x7472,
+        .seq_base = 2,
+        .timeout_ms = 500,
+    });
+    defer tr.deinit(testing.allocator);
+
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(@as(usize, 1), tr.hops.len);
+    try testing.expectEqual(@as(?u8, 1), tr.unreachable_code); // real Host Unreachable
+
+    const hop1 = tr.hops[0].probes[0];
+    try testing.expectEqual(Probe.Kind.dest_unreachable, hop1.kind);
+    try testing.expectEqual(@as(?u8, 1), hop1.code);
+    try testing.expect(hop1.address.?.eql(real_router_addr));
+}
+
+test "A1 F3: an ICMP error quoting a DIFFERENT destination than the one being traced is ignored, not attributed" {
+    // Same real `real_dest_unreachable_icmp` capture as above, replayed
+    // against `real_server_addr` instead of the destination it actually
+    // quotes (`real_unreachable_dest`) -- this is exactly the audit's own
+    // proof of F3: before the quoted destination was checked, this passed
+    // and resolved the hop anyway.
+    var r: ReplayTransport = .{ .packets = &.{
+        .{ .bytes = &real_dest_unreachable_icmp, .from = real_router_addr },
+    } };
+    var tr = try traceWith(testing.allocator, r.transport(), real_server_addr, .{
+        .max_hops = 1,
+        .probes_per_hop = 1,
+        .ident = 0x7472,
+        .seq_base = 2,
+        .timeout_ms = 5,
+    });
+    defer tr.deinit(testing.allocator);
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+    try testing.expectEqual(@as(?u8, null), tr.unreachable_code);
 }
 
 test "REAL CAPTURE: genuine kernel Echo Reply reaches the destination" {
@@ -1673,10 +1756,23 @@ fn fuzzSeedTimeExceeded() [1 + 56]u8 {
     p[0] = 0x45; // outer IPv4, ihl 5
     p[20] = 11; // ICMP time exceeded
     p[28] = 0x45; // quoted IPv4 header, ihl 5
+    // A1 F3 (closed at its source, `icmp` module F2): the quoted
+    // destination must be `test_dest` (192.0.2.99, the only v4 dest
+    // `fuzzOneRun` traces to) -- every probe traced here was addressed
+    // there, so a genuine router's error always quotes it back.
+    p[44] = 192;
+    p[45] = 0;
+    p[46] = 2;
+    p[47] = 99;
     p[48] = 8; // quoted echo request
     p[52] = 0x74;
     p[53] = 0x72; // ident 0x7472
     p[55] = 1; // seq 1
+    // A1 (icmp F7): icmp.echo.parseV4 now verifies the receive-side ICMP
+    // checksum, so this seed needs a real one -- an all-zero checksum field
+    // made it `.ignored` before it ever reached the quoted-header logic
+    // this seed exists to exercise.
+    std.mem.writeInt(u16, p[22..24], echo.checksum(p[20..56]), .big);
     return b;
 }
 fn fuzzSeedEchoReply() [1 + 28]u8 {
@@ -1688,6 +1784,7 @@ fn fuzzSeedEchoReply() [1 + 28]u8 {
     p[24] = 0x74;
     p[25] = 0x72;
     p[27] = 1;
+    std.mem.writeInt(u16, p[22..24], echo.checksum(p[20..28]), .big); // A1 (icmp F7)
     return b;
 }
 const fuzz_seed_te = fuzzSeedTimeExceeded();
