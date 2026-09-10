@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign, netsim F15 (**NO CONSUMER-VISIBLE
+  CHANGE** — internal-only, `severed()` is private): `severed()` did two
+  `std.mem.indexOfScalar` scans of each active partition's cut list, for
+  every partition, on every delivery — O(partitions x |cut|) per delivery.
+  `ActivePartition` now also carries a `std.DynamicBitSetUnmanaged` built
+  once when the partition fault applies, and membership is an O(1) bit
+  test. Measured with the audit's own `A1/repro/netsim/p8_perf.zig` harness
+  (64-node ring + 64 isolated nodes, 4000 deliveries, 30 reps, same seed):
+  256 active partitions went from 16,345 us/run to 1,971 us/run (8.3x); the
+  per-partition-per-delivery cost itself dropped ~10.5x (~62ns -> ~5.9ns).
+  All 7 in-repo consumers (raft, df-elect, loopfree-reconv, liveness-hyst,
+  loopix, fleetsim, isis-sim) re-run unchanged after the fix. scripts/modtest
+  netsim: 44/44 (Debug and ReleaseFast).
+
 - **2026-09-10** — A1 fix campaign, netsim F4 (remainder), F9, F11.
 
   **F4 remainder** (**NO CONSUMER-VISIBLE CHANGE**): the 5 gaps left open by
