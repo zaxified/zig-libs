@@ -47,7 +47,7 @@
 #   NICE                 niceness                               (default 15)
 #   JOBS                 zig build -j                           (default 2)
 #   LINES                lines of tail printed on success       (default 40)
-#   ZIGLIBS_MODTEST_TIMEOUT   wall-clock limit for --file mode  (default 120s)
+#   ZIGLIBS_MODTEST_TIMEOUT   wall-clock limit: 900s for a lane, 120s for --file
 #
 # The 4G default is deliberately lower than `capped`'s 12G: this runner is for
 # the fix campaign, where up to four agents run lanes at once on a desktop the
@@ -111,7 +111,13 @@ if [[ "$mode" == file ]]; then
     timeout "${ZIGLIBS_MODTEST_TIMEOUT:-120s}" zig test "$probe" "$@" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 else
-    zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
+    # Wall-clock limit on the lane too, not just on `--file`. Measured
+    # 2026-09-10: a ReleaseFast `test-dnssec` sat at 99% of one core with a
+    # flat 3.2 MB RSS for 53 minutes -- an infinite loop, which no memory cap
+    # and no byte budget can see, because it neither allocates nor prints.
+    # A lane that hits this is a finding, and the exit code says so (124).
+    timeout "${ZIGLIBS_MODTEST_TIMEOUT:-900s}" \
+        zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 fi
 # pipefail makes this the BUILD's status, not `head`'s -- a truncated log must
@@ -122,6 +128,11 @@ bytes=$(stat -c %s "$log" 2>/dev/null || echo 0)
 budget=$(numfmt --from=iec "$ZIGLIBS_MODTEST_LOG_MAX" 2>/dev/null || echo 0)
 
 echo "── modtest $module ── exit $rc, log $log ($(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B)"
+
+if [[ "$rc" == 124 ]]; then
+    echo "⛔ TIMED OUT after ${ZIGLIBS_MODTEST_TIMEOUT:-900s} — a lane that neither" >&2
+    echo "   finishes nor allocates is an infinite loop, and that IS the finding." >&2
+fi
 
 # A lane that hits the byte budget is a finding in its own right, not a detail:
 # it is the shape that killed the editor.
