@@ -130,8 +130,21 @@ fn slotOffset(page: *const [page_size]u8, i: usize) usize {
     return std.mem.readInt(u16, page[base .. base + 2][0..2], .little);
 }
 
-pub fn kindOf(page: *const [page_size]u8) NodeKind {
-    return nodeKind(page);
+/// Bounds-checked dispatch on a page's kind byte: `null` for any byte that is
+/// not a valid `NodeKind` tag, instead of `@enumFromInt`'s illegal behavior
+/// (a checked panic under safety, undefined in ReleaseFast). Node pages carry
+/// no CRC (only meta pages do), so a single flipped byte on media — or a page
+/// this open session read after `recover`'s one-time validation but before it
+/// was next touched — is enough to reach an out-of-range byte here. Callers
+/// on the committed-tree read/write paths turn `null` into `error.Corrupt`;
+/// `nodeKind` (used by `Leaf.init`/`Branch.init`'s asserts) stays raw because
+/// every caller of THOSE has already gone through here first.
+pub fn kindOf(page: *const [page_size]u8) ?NodeKind {
+    return switch (page[0]) {
+        @intFromEnum(NodeKind.leaf) => .leaf,
+        @intFromEnum(NodeKind.branch) => .branch,
+        else => null,
+    };
 }
 
 /// Result of an in-node key search.
@@ -250,12 +263,23 @@ pub fn branchViewSafe(page: *const [page_size]u8) ?Branch {
     const count: usize = nodeCount(page);
     const dir_end = hdr_len + count * slot_len;
     if (dir_end > page_size) return null;
+    // Separators must be strictly ascending — not just in-bounds. A slot
+    // directory whose entries were reordered (or a torn write that shuffled
+    // them) stays perfectly in-bounds, so the bounds checks below accept it;
+    // `childIndexFor`'s binary search then still returns a valid 0..count
+    // ordinal (memory-safe) but routes to the WRONG child, so lookups on an
+    // adopted-but-unsorted branch silently miss keys that are physically
+    // present. Recovery must reject this, not adopt it.
+    var prev_key: ?[]const u8 = null;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const o = slotOffset(page, i);
         if (o < dir_end or o + 6 > page_size) return null;
         const klen = std.mem.readInt(u16, page[o .. o + 2][0..2], .little);
         if (o + 6 + @as(usize, klen) > page_size) return null;
+        const key = page[o + 6 ..][0..klen];
+        if (prev_key) |p| if (!std.mem.lessThan(u8, p, key)) return null;
+        prev_key = key;
     }
     return Branch.init(page);
 }
@@ -317,8 +341,6 @@ fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
 // buffer can be reused freely. This is the mechanical half of the B-tree; the
 // COW page-allocation + durability wrapping around it is `core.commit`.
 
-pub const max_key_len = std.math.maxInt(u16);
-
 /// A key/value pair a single leaf can never hold, no matter how empty (would
 /// not fit one page even alone) — the scaffold rejects it; overflow pages for
 /// large values are a documented backlog item (see SPEC.md).
@@ -350,7 +372,12 @@ pub const LeafBuilder = struct {
     }
 
     /// Insert or overwrite. Returns error.EntryTooLarge if a single k/v cannot
-    /// fit an otherwise-empty page.
+    /// fit an otherwise-empty page. This is the ONLY key-length bound this
+    /// module enforces (there used to be a separate, unenforced `max_key_len
+    /// = maxInt(u16)` constant here — dead, and looser than this check by
+    /// three orders of magnitude, since `leafCellBytes` already forces any
+    /// key over ~4080 bytes to fail here first; removed rather than left to
+    /// read as a live invariant it never was).
     pub fn put(self: *LeafBuilder, key: []const u8, val: []const u8) !void {
         if (leafCellBytes(key.len, val.len) + hdr_len + slot_len > page_size)
             return oversize_error;
@@ -700,4 +727,43 @@ test "oversize entry is rejected" {
     var b = LeafBuilder.init(arena_state.allocator());
     const huge = try arena_state.allocator().alloc(u8, page_size);
     try testing.expectError(error.EntryTooLarge, b.put("k", huge));
+}
+
+test "kindOf rejects any byte that is not a valid NodeKind tag" {
+    var page: [page_size]u8 = @splat(0);
+    page[0] = @intFromEnum(NodeKind.leaf);
+    try testing.expectEqual(NodeKind.leaf, kindOf(&page).?);
+    page[0] = @intFromEnum(NodeKind.branch);
+    try testing.expectEqual(NodeKind.branch, kindOf(&page).?);
+
+    // Every byte a freelist chain page's header (a `u16` entry count, low
+    // byte first) can legally put at offset 0 that is NOT 0 or 1 — exactly
+    // the "kind byte is actually a recycled freelist page's entry count"
+    // shape the audit's reachability argument named.
+    var v: usize = 2;
+    while (v <= 255) : (v += 1) {
+        page[0] = @intCast(v);
+        try testing.expect(kindOf(&page) == null);
+    }
+}
+
+test "branchViewSafe rejects a structurally in-bounds but unsorted slot directory" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var b = BranchBuilder.init(arena_state.allocator(), 10);
+    try b.insert("b", 20);
+    try b.insert("m", 30);
+    var page: [page_size]u8 = undefined;
+    b.encode(&page);
+    try testing.expect(branchViewSafe(&page) != null); // ascending: accepted
+
+    // Swap the two slot-directory entries only (not the cells themselves):
+    // every offset/length in the directory stays perfectly in-bounds, so the
+    // OLD geometry-only check accepted this — but keyAt(0) is now "m" and
+    // keyAt(1) is "b", not ascending.
+    const slot0 = page[hdr_len .. hdr_len + slot_len][0..slot_len].*;
+    const slot1 = page[hdr_len + slot_len .. hdr_len + 2 * slot_len][0..slot_len].*;
+    @memcpy(page[hdr_len .. hdr_len + slot_len], &slot1);
+    @memcpy(page[hdr_len + slot_len .. hdr_len + 2 * slot_len], &slot0);
+    try testing.expect(branchViewSafe(&page) == null);
 }

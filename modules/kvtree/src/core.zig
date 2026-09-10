@@ -73,6 +73,18 @@ pub const CommitError = error{
     OutOfMemory,
     /// Any lower-level storage error surfaced verbatim (see `pager.zig`).
     Storage,
+    /// A page on the base tree's root-to-leaf path failed its kind-byte
+    /// check (`format.kindOf` returned `null`) — on-disk bit rot on a node
+    /// page since `recover` last validated it (node pages carry no CRC,
+    /// unlike meta pages). The commit that discovered it aborts cleanly
+    /// instead of dispatching on an out-of-range `NodeKind`.
+    Corrupt,
+    /// `Db.begin` was called while a read-write transaction from this same
+    /// `Db` is already open. Single-writer is a documented caller contract
+    /// (`Db.begin`'s doc); this is its mechanical enforcement — the sibling
+    /// of `error.Locked` for a second `Db.open` over one file, which already
+    /// had one.
+    TxnInProgress,
 };
 
 pub const RecoverError = error{
@@ -317,7 +329,7 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
     try readForCommit(ctx.pager, id, &page);
     ctx.freed.append(ctx.arena, id) catch return error.OutOfMemory;
 
-    switch (format.kindOf(&page)) {
+    switch (format.kindOf(&page) orelse return error.Corrupt) {
         .leaf => {
             var b = format.LeafBuilder.fromPage(ctx.arena, &page) catch return error.OutOfMemory;
             for (ops) |op| {
@@ -950,12 +962,23 @@ test "corpus: the recover seeds drive every knob, and the counts are pinned" {
     // over 10 seeds x 4 data pages. Before the corpus there was ONE run, and
     // its four data pages were all shape 0.
     try testing.expectEqual([4]usize{ 25, 10, 1, 4 }, shapes);
-    // 3 of 10 seeds recover; the other 7 are the refusals named above. The txn
-    // sum pins WHICH three, so a seed that stops being adopted cannot be
-    // masked by another one starting to be.
-    try testing.expectEqual(@as(usize, 3), adopted);
-    try testing.expectEqual(@as(u64, 5 + 9 + 7), txn_total);
-    try testing.expectEqual(@as(usize, 1), branch_roots);
+    // 2 of 10 seeds recover; the other 8 are the refusals named above. The txn
+    // sum pins WHICH two, so a seed that stops being adopted cannot be masked
+    // by another one starting to be.
+    //
+    // Was 3 adopted / txn_total 5+9+7 / branch_roots 1 before `branchViewSafe`
+    // gained separator-ordering validation (kvtree A1 finding 7, LOW): seed
+    // txn_id=9's random branch page had in-bounds-but-unsorted separators,
+    // which the OLD geometry-only check accepted — recovery adopted it as the
+    // one branch-root seed in this corpus. It is now correctly refused as
+    // unrecoverable: an unsorted branch routes lookups to the wrong child
+    // (silent misses on present keys), which is exactly the defect that check
+    // closes. `branch_roots` dropping to 0 is this corpus's only branch-shaped
+    // root, so there being none left is the expected shape of the fix, not a
+    // gap in the corpus.
+    try testing.expectEqual(@as(usize, 2), adopted);
+    try testing.expectEqual(@as(u64, 5 + 7), txn_total);
+    try testing.expectEqual(@as(usize, 0), branch_roots);
     try testing.expectEqual(@as(usize, 1), freelists_walked);
 
     // Seed 9's page, spelled out: the claim that `leafViewSafe` is what

@@ -70,7 +70,7 @@ defer cur.deinit();
 try cur.seek("m");                  // first key >= "m"
 while (try cur.next()) |e| {        // ordered iteration; e.key/e.val borrow
     if (!std.mem.lessThan(u8, e.key, "t")) break; // scan [m, t)
-    // use e.key, e.val (valid until the next next()/seek())
+    // use e.key, e.val (valid until the cursor's next next()/seek()/first())
 }
 ```
 

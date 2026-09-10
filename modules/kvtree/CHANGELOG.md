@@ -5,6 +5,89 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit fix campaign, six findings (one HIGH, one MED, four
+  LOW/LOW-MED) closed with RED→GREEN tests; module lane `52/52`.
+
+  - **HIGH — a failed commit could be silently retried on the same `Db`.**
+    `CommitError.CommitFailed` already documented that its outcome is
+    indeterminate (the new meta may be durable-but-unacknowledged) and that
+    the caller "MUST NOT retry on the same `Db`… close and reopen" — but
+    nothing enforced it. `Db.begin` now refuses every further transaction
+    once a commit on this `Db` has returned `CommitFailed` (`Db.poisoned`,
+    cleared only by closing and reopening). Reads are unaffected. Test
+    injects a failure on exactly commit's second `fsync` (the one AFTER the
+    tree pages are durable) via a `Storage` wrapper that forwards the call
+    to the real backend before reporting failure — modeling "durable but
+    unacknowledged" faithfully rather than "nothing happened". RED (guard
+    disabled): `db.begin()` after the failure returns a live `Txn`, not an
+    error — 51/52. GREEN: `begin`/`put`/`del` all return `CommitFailed`;
+    closing and reopening correctly recovers the unacknowledged-but-durable
+    commit (both the pre-failure key and the failed commit's own key are
+    present) and the reopened `Db` is fully usable again.
+  - **LOW — `Db.begin` did not enforce "one RW txn at a time" either**, the
+    asymmetric sibling of the cross-process `error.Locked` guard this module
+    already had. New `Db.in_txn` + `error.TxnInProgress`. RED (guard
+    disabled): a second `begin()` while the first `Txn` is still open
+    returns a second live `Txn` instead of an error — 51/52. GREEN: refused;
+    releases (via `commit`/`rollback`) let a subsequent `begin()` through.
+  - **MED — `format.kindOf` used `@enumFromInt` on an untrusted page byte** —
+    illegal behavior (checked panic in Debug/ReleaseSafe, undefined in
+    ReleaseFast) for any value other than 0/1, reachable from a node page
+    corrupted after `recover`'s one-time open-time validation (node pages
+    carry no CRC). Now returns `?NodeKind`; the four call sites (`lookup`,
+    `Cursor.seek`, `Cursor.descendLeftmost`, `core.applyRec`) turn `null`
+    into `error.Corrupt` (added to `CommitError`, additive). RED (reverted
+    to the raw form): `thread … panic: invalid enum value` — crashes the
+    whole test binary (1 crash / 52). GREEN: `kindOf` returns `null` for
+    every byte 2..255, no panic.
+  - **LOW — `branchViewSafe` bounds-checked cell geometry but not separator
+    ORDER.** A branch page with in-bounds cells but an unsorted slot
+    directory passed validation and got adopted by `recover`; `childIndexFor`
+    then still returns a valid child ordinal (memory-safe) but routes to the
+    WRONG child, so an adopted-but-unsorted branch silently drops reachable
+    keys. Now rejected. RED→GREEN is the corpus regression test itself
+    (`core.zig`, "the recover seeds drive every knob"): one of its ten fixed
+    fuzz seeds (txn_id 9) has exactly this shape and used to be the corpus's
+    only adopted branch root — `adopted` 3→2, `branch_roots` 1→0, `txn_total`
+    21→12, pinned to the new values.
+  - **LOW-MED — `OpenError.NotAKvtreeFile` was declared and never returned.**
+    Any file under 8 KiB (two meta pages) at the target path was silently
+    reformatted by `initFresh` regardless of its actual content. Auto-init is
+    now `size == 0` only (a `writeAll` synchronously extends a file's
+    reported size, even un-synced, so a genuine torn `initFresh` cannot
+    itself leave a *nonzero* short file — that shape is only ever a
+    pre-existing foreign file); `0 < size < 2×page_size` now returns
+    `NotAKvtreeFile` directly, and a larger foreign file that fails
+    `core.recover` gets `NotAKvtreeFile` only when NEITHER meta slot
+    decodes at all (vs. `Corrupt` for a file that was structurally a kvtree
+    meta but failed the semantic/bounds check — kept distinguishable by a
+    new `looksLikeKvtree` re-check, mechanical scaffold only, `core.recover`
+    itself untouched). RED (old unconditional `size < 2×page_size` branch):
+    the simulator's own overwrite-safety assert fires because `initFresh`
+    tries to overwrite a foreign file's already-durable bytes without
+    `allow_overwrite` — 1 crash / 52 (on `FsStorage` this would instead be a
+    silent, successful destruction of the file). GREEN: three tests — short
+    foreign file untouched + `NotAKvtreeFile`, bigger foreign file also
+    `NotAKvtreeFile`, and a structurally-valid-but-semantically-bogus kvtree
+    file correctly gets `Corrupt` instead.
+  - **LOW — doc-only.** `Cursor.first()` invalidates previously-yielded `KV`
+    slices exactly like `next()`/`seek()` (same frame storage, reused via
+    `clearRetainingCapacity`) but the doc named only the other two. `KV`,
+    `Cursor`'s and `first()`'s doc comments, and `README.md`'s example now
+    say so. No behavior change (the audit's own conclusion: memory-safe
+    already, just surprising). Evidence: `grep` for the old wording is empty
+    repo-wide for this module; the new wording is present in both files.
+  - `format.max_key_len` (`maxInt(u16)`) removed: unused everywhere, and
+    looser than the page-fit check in `LeafBuilder.put` by three orders of
+    magnitude, so it read as a live invariant it never was.
+
+  Two findings the same audit record, `CommitFailed` needs a behavioural
+  guard aside, verified independently: the record's one-line summary named
+  no mechanism, and no trace of it exists in the auditing agent's actual
+  report — the fix above targets the hazard `CommitError.CommitFailed`'s OWN
+  doc comment already spelled out in full, which independently corroborates
+  it as real regardless of the ledger line's shaky provenance.
+
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `fuzzRecover` had **no seed
   corpus at all**, so outside `--fuzz` it ran exactly one input — the empty one
   — and every one of its fifteen knobs was its own range minimum. Traced

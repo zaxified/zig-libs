@@ -86,8 +86,11 @@ pub const GetError = kv.Storage.Error || error{ Corrupt, OutOfMemory };
 pub const CommitError = core.CommitError;
 
 /// A borrowed key/value pair yielded by a `Cursor`. The slices point into the
-/// cursor's current leaf-page buffer and stay valid only until the next
-/// `next()`/`seek()` call — copy them if you need to keep them.
+/// cursor's current leaf-page buffer and stay valid only until the cursor's
+/// next method call — `next()`, `seek()`, **or `first()`** (repositioning to
+/// the start reuses the same frame storage, `clearRetainingCapacity`, so it
+/// invalidates exactly like the other two even though it looks like a fresh
+/// start) — or `deinit()`. Copy them if you need to keep them past that.
 pub const KV = struct { key: []const u8, val: []const u8 };
 
 // ── Db ─────────────────────────────────────────────────────────────────────
@@ -109,6 +112,20 @@ pub const Db = struct {
     /// the reclaim gate must respect. Kept sorted-insert-free; min computed on
     /// demand (open-snapshot counts are tiny in the embedded model).
     open_snapshots: std.ArrayList(u64),
+    /// True once a `commit` has returned `error.CommitFailed` on this `Db`.
+    /// The outcome of that commit is INDETERMINATE (see `CommitError`'s doc)
+    /// — this in-memory `meta_rec` may already be stale. `begin` refuses to
+    /// hand out another transaction once this is set; nothing clears it
+    /// short of `close` + a fresh `open`, which is exactly the documented
+    /// recovery ("close and reopen, let `recover` establish which version
+    /// actually survived"). Reads (`get`/`cursor`/`snapshot`) are unaffected
+    /// — they still serve the last version this `Db` knows to be good.
+    poisoned: bool = false,
+    /// True while a read-write transaction obtained from `begin` has not yet
+    /// been consumed by `commit`/`rollback`. Single-writer is a documented
+    /// caller contract; this is its enforcement — the same-process sibling of
+    /// `Options.lock`'s cross-process `error.Locked`.
+    in_txn: bool = false,
 
     /// Open (or create) the store. A fresh/empty file is initialized
     /// mechanically (two meta pages + an empty-leaf root); an existing file is
@@ -140,15 +157,35 @@ pub const Db = struct {
 
         var pager = Pager.init(store, handle, 0);
         var meta_rec: format.Meta = undefined;
-        if (size < 2 * page_size) {
-            // Fresh (or a torn creation): lay down the initial store. Mechanical
-            // — a crash mid-init leaves < 2 meta pages, so the next open just
-            // re-initializes; there is no prior committed state to protect yet.
+        if (size == 0) {
+            // Genuinely new: nothing exists at `path` yet, so there is
+            // nothing a mechanical init could destroy. (`writeAll` at an
+            // offset synchronously extends a file's reported size — even
+            // un-synced — so a crash mid-`initFresh` cannot itself leave a
+            // *nonzero* short file behind; that shape is only ever a
+            // pre-existing file this library did not write.)
             meta_rec = try initFresh(&pager);
+        } else if (size < 2 * page_size) {
+            // Too short to ever be a committed kvtree store (the smallest
+            // one is 3 pages: both metas plus the root leaf) and not the
+            // size==0 case above — this is someone else's file. Destroying
+            // it by silently reformatting (the previous behavior:
+            // `OpenError.NotAKvtreeFile` existed but nothing ever returned
+            // it) is exactly the failure mode that error was declared for.
+            return error.NotAKvtreeFile;
         } else {
             pager.high_water = size / page_size;
             meta_rec = core.recover(gpa, &pager) catch |e| switch (e) {
-                error.Unrecoverable => return error.Corrupt,
+                error.Unrecoverable => {
+                    // Neither meta slot decoding at all (wrong magic/version/
+                    // CRC from the start) means the bytes never had this
+                    // format's shape, as opposed to having it and then
+                    // failing the semantic/bounds checks — a real kvtree file
+                    // torn or corrupted in place. Best-effort distinction:
+                    // never destroys anything either way.
+                    if (!looksLikeKvtree(&pager)) return error.NotAKvtreeFile;
+                    return error.Corrupt;
+                },
                 error.Storage => return error.Corrupt,
                 error.OutOfMemory => return error.OutOfMemory,
             };
@@ -174,6 +211,22 @@ pub const Db = struct {
         self.open_snapshots.deinit(self.gpa);
         self.gpa.free(self.path);
         self.* = undefined;
+    }
+
+    /// True iff at least one meta slot structurally decodes (magic, version,
+    /// geometry and CRC all hold) — i.e. this file was plausibly written by
+    /// this format at some point, even if `recover` then rejects both
+    /// candidates as torn/out-of-bounds. False means the bytes never had
+    /// kvtree's shape at all. Best-effort only (a `Storage` error while
+    /// re-reading just falls through to false) — used solely to pick which
+    /// already-failing open error to report, never to accept anything.
+    fn looksLikeKvtree(pager: *Pager) bool {
+        var buf: [page_size]u8 = undefined;
+        for ([_]format.PageId{ format.meta_page_a, format.meta_page_b }) |pid| {
+            pager.readPage(pid, &buf) catch continue;
+            if (format.Meta.decode(&buf) != null) return true;
+        }
+        return false;
     }
 
     /// Mechanical fresh-store init: an empty-leaf root at page 2, both meta
@@ -236,8 +289,15 @@ pub const Db = struct {
     // ── transactions ─────────────────────────────────────────────────────────
 
     /// Begin a read-write transaction: buffer put/del, then `commit` (atomic,
-    /// via the Fable core) or `rollback`. Single-writer — one RW txn at a time.
-    pub fn begin(self: *Db) Allocator.Error!Txn {
+    /// via the Fable core) or `rollback`. Single-writer — one RW txn at a
+    /// time, enforced: `error.TxnInProgress` if a previous `Txn` from this
+    /// `Db` has not yet been consumed, `error.CommitFailed` if this `Db` is
+    /// poisoned (see `Db.poisoned`) — in both cases nothing was opened or
+    /// touched.
+    pub fn begin(self: *Db) (Allocator.Error || error{ CommitFailed, TxnInProgress })!Txn {
+        if (self.poisoned) return error.CommitFailed;
+        if (self.in_txn) return error.TxnInProgress;
+        self.in_txn = true;
         return .{
             .db = self,
             .base = self.meta_rec,
@@ -360,22 +420,32 @@ pub const Txn = struct {
     /// reopen. See `CommitError.CommitFailed` for the full argument.
     pub fn commit(self: *Txn) CommitError!void {
         defer {
+            self.db.in_txn = false;
             self.arena.deinit();
             self.changes.deinit(self.db.gpa);
             self.* = undefined;
         }
-        const new_meta = try core.commit(
+        const new_meta = core.commit(
             self.db.gpa,
             &self.db.pager,
             self.base,
             self.changes.items,
             self.db.oldestReader(),
-        );
+        ) catch |e| {
+            // CommitFailed means the outcome is indeterminate (see the error's
+            // doc): `meta_rec` may already be stale relative to the file.
+            // Refuse every further transaction on this `Db` rather than let a
+            // caller that ignores the "close and reopen" contract retry on a
+            // base the durable state may no longer agree with.
+            if (e == error.CommitFailed) self.db.poisoned = true;
+            return e;
+        };
         self.db.meta_rec = new_meta;
         self.db.next_txn = new_meta.txn_id + 1;
     }
 
     pub fn rollback(self: *Txn) void {
+        self.db.in_txn = false;
         self.arena.deinit();
         self.changes.deinit(self.db.gpa);
         self.* = undefined;
@@ -424,7 +494,7 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
             try pager.readPage(id, &page);
             break :blk &page;
         };
-        switch (format.kindOf(bytes)) {
+        switch (format.kindOf(bytes) orelse return error.Corrupt) {
             .branch => id = format.Branch.init(bytes).childFor(key),
             .leaf => {
                 const leaf = format.Leaf.init(bytes);
@@ -437,8 +507,9 @@ fn lookup(pager: *Pager, root: PageId, gpa: Allocator, key: []const u8) GetError
 }
 
 /// In-order cursor over a B-tree version. Holds a root-to-leaf stack of page
-/// copies so it can walk leaves left to right; yielded slices borrow the leaf
-/// frame and are valid until the next call.
+/// copies so it can walk leaves left to right; yielded `KV` slices borrow the
+/// leaf frame and are valid only until the cursor's next method call — see
+/// `KV`'s doc (`first()` invalidates them too, same as `next()`/`seek()`).
 pub const Cursor = struct {
     gpa: Allocator,
     pager: *Pager,
@@ -468,7 +539,10 @@ pub const Cursor = struct {
         self.* = undefined;
     }
 
-    /// Position at the first (smallest) key.
+    /// Position at the first (smallest) key. Like `seek`, this invalidates any
+    /// `KV` still held from a previous `next()` — it reuses the same frame
+    /// storage (`clearRetainingCapacity`), so a stale `KV` stays in-bounds and
+    /// silently reads whatever this call wrote there, rather than crashing.
     pub fn first(self: *Cursor) (kv.Storage.Error || error{ Corrupt, OutOfMemory })!void {
         self.stack.clearRetainingCapacity();
         try self.descendLeftmost(self.root);
@@ -481,7 +555,7 @@ pub const Cursor = struct {
         while (true) {
             var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
             try self.pager.readPage(id, &frame.page);
-            switch (format.kindOf(&frame.page)) {
+            switch (format.kindOf(&frame.page) orelse return error.Corrupt) {
                 .branch => {
                     const br = format.Branch.init(&frame.page);
                     const ci = br.childIndexFor(key);
@@ -504,9 +578,9 @@ pub const Cursor = struct {
         while (true) {
             var frame = Frame{ .page = undefined, .id = id, .idx = 0 };
             try self.pager.readPage(id, &frame.page);
-            const is_leaf = format.kindOf(&frame.page) == .leaf;
+            const kind = format.kindOf(&frame.page) orelse return error.Corrupt;
             try self.stack.append(self.gpa, frame);
-            if (is_leaf) return;
+            if (kind == .leaf) return;
             id = format.Branch.init(&self.stack.items[self.stack.items.len - 1].page).childAtIndex(0);
         }
     }
@@ -895,4 +969,209 @@ test "Db.cursor releases its pin on deinit, so reclamation resumes" {
         try testing.expectEqual(@as(usize, 1), db.open_snapshots.items.len);
     }
     try testing.expectEqual(@as(usize, 0), db.open_snapshots.items.len);
+}
+
+// ── OpenError.NotAKvtreeFile: a foreign file must be refused, never reformatted ──
+
+test "open on a short non-kvtree file returns NotAKvtreeFile and leaves it untouched" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const foreign = "not a kvtree file, just some bytes";
+    try sim.installFile("notes.txt", foreign);
+
+    try testing.expectError(
+        error.NotAKvtreeFile,
+        Db.open(testing.allocator, sim.storage(), "notes.txt", .{}),
+    );
+    // `open` failed: it must not have written anything over the foreign file
+    // (the old code called this path `initFresh` unconditionally and did).
+    try testing.expectEqualStrings(foreign, sim.fileContent("notes.txt").?);
+}
+
+test "open on a bigger foreign file (past the 2-page threshold) also returns NotAKvtreeFile, not Corrupt" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const foreign = "x" ** (3 * page_size); // big enough to reach core.recover
+    try sim.installFile("big.dat", foreign);
+    try testing.expectError(
+        error.NotAKvtreeFile,
+        Db.open(testing.allocator, sim.storage(), "big.dat", .{}),
+    );
+}
+
+test "open on a structurally valid but semantically unrecoverable file returns Corrupt, not NotAKvtreeFile" {
+    // Distinct from the two tests above: this meta DOES decode (right magic/
+    // version/CRC) — it was a real kvtree meta shape — but its root is
+    // out-of-bounds, so `recover` still rejects both candidates. The two
+    // outcomes must stay distinguishable: this is a damaged kvtree file, not
+    // a foreign one.
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const h = try sim.storage().open("bad.kvt", .create_truncate);
+    var p = Pager.init(sim.storage(), h, 0);
+    var page: [page_size]u8 = undefined;
+
+    const m: format.Meta = .{ .txn_id = 1, .root = 99, .free_root = 0, .free_count = 0, .high_water = 3 };
+    m.encode(&page);
+    try p.writePage(format.meta_page_a, &page);
+    try p.writePage(format.meta_page_b, &page);
+    try p.sync();
+
+    try testing.expectError(
+        error.Corrupt,
+        Db.open(testing.allocator, sim.storage(), "bad.kvt", .{}),
+    );
+}
+
+// ── begin(): single-writer enforcement + CommitFailed poisoning ──────────────
+
+test "begin() while a Txn from this Db is still open returns TxnInProgress, not a second writer" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true; // two commits reuse the meta slots
+    var db = try Db.open(testing.allocator, sim.storage(), "onewriter.kvt", .{});
+    defer db.close();
+
+    var t1 = try db.begin();
+    try testing.expectError(error.TxnInProgress, db.begin());
+    try testing.expectError(error.TxnInProgress, db.put("x", "1")); // autocommit goes through begin() too
+    t1.rollback();
+
+    // Released: a fresh begin() now succeeds, and commits normally.
+    var t2 = try db.begin();
+    try t2.put("a", "1");
+    try t2.commit();
+    const got = try db.get(testing.allocator, "a");
+    defer if (got) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("1", got.?);
+}
+
+/// A `Storage` wrapper that fails one targeted `sync` call while still
+/// forwarding it to the inner backend first — modeling the worst case
+/// `CommitError.CommitFailed`'s doc names explicitly: the write reached the
+/// medium (the inner `sync` really ran and really succeeded) but the call
+/// itself reports failure, so the outcome is "durable but unacknowledged",
+/// not "nothing happened". `sync_calls` counts 1-based across the whole
+/// backend so a test can target "the Nth sync from here".
+const FailNthSync = struct {
+    inner: kv.Storage,
+    sync_calls: usize = 0,
+    fail_at: ?usize = null,
+
+    fn cast(ctx: *anyopaque) *FailNthSync {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn vOpen(ctx: *anyopaque, path: []const u8, mode: kv.Storage.OpenMode) kv.Storage.Error!kv.Storage.Handle {
+        return cast(ctx).inner.open(path, mode);
+    }
+    fn vSize(ctx: *anyopaque, h: kv.Storage.Handle) kv.Storage.Error!u64 {
+        return cast(ctx).inner.size(h);
+    }
+    fn vPread(ctx: *anyopaque, h: kv.Storage.Handle, buf: []u8, off: u64) kv.Storage.Error!usize {
+        return cast(ctx).inner.pread(h, buf, off);
+    }
+    fn vWriteAll(ctx: *anyopaque, h: kv.Storage.Handle, bytes: []const u8, off: u64) kv.Storage.Error!void {
+        return cast(ctx).inner.writeAll(h, bytes, off);
+    }
+    fn vSync(ctx: *anyopaque, h: kv.Storage.Handle) kv.Storage.Error!void {
+        const self = cast(ctx);
+        self.sync_calls += 1;
+        const n = self.sync_calls;
+        const r = self.inner.sync(h); // forward first: the medium sees it regardless
+        if (self.fail_at) |f| if (n == f) return error.InputOutput;
+        return r;
+    }
+    fn vTruncate(ctx: *anyopaque, h: kv.Storage.Handle, len: u64) kv.Storage.Error!void {
+        return cast(ctx).inner.truncate(h, len);
+    }
+    fn vClose(ctx: *anyopaque, h: kv.Storage.Handle) void {
+        cast(ctx).inner.close(h);
+    }
+    fn vRename(ctx: *anyopaque, old_path: []const u8, new_path: []const u8) kv.Storage.Error!void {
+        return cast(ctx).inner.rename(old_path, new_path);
+    }
+    fn vDelete(ctx: *anyopaque, path: []const u8) kv.Storage.Error!void {
+        return cast(ctx).inner.delete(path);
+    }
+    fn vSyncDir(ctx: *anyopaque) kv.Storage.Error!void {
+        return cast(ctx).inner.syncDir();
+    }
+    fn vTryLockExclusive(ctx: *anyopaque, h: kv.Storage.Handle) kv.Storage.Error!bool {
+        return cast(ctx).inner.tryLockExclusive(h);
+    }
+
+    const vtable = kv.Storage.VTable{
+        .open = vOpen,
+        .size = vSize,
+        .pread = vPread,
+        .writeAll = vWriteAll,
+        .sync = vSync,
+        .truncate = vTruncate,
+        .close = vClose,
+        .rename = vRename,
+        .delete = vDelete,
+        .syncDir = vSyncDir,
+        .tryLockExclusive = vTryLockExclusive,
+    };
+
+    fn storage(self: *FailNthSync) kv.Storage {
+        return .{ .ctx = self, .vtable = &vtable };
+    }
+};
+
+test "a Db poisoned by CommitFailed refuses begin/put/del until closed and reopened; reads and reopen stay safe" {
+    var sim = kv.SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var wrap = FailNthSync{ .inner = sim.storage() };
+    var db = try Db.open(testing.allocator, wrap.storage(), "poison.kvt", .{ .lock = .none });
+    errdefer db.close();
+
+    try db.put("a", "1"); // sync_calls: 1 (initFresh) + 2 (this commit's fsync#1/#2) = 3
+    const good = try db.get(testing.allocator, "a");
+    defer if (good) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("1", good.?);
+
+    // Fail exactly the SECOND sync of the next commit — fsync #2, the
+    // linearization point `CommitError.CommitFailed`'s doc calls out as the
+    // "durable but unacknowledged" case (fsync #1, for the tree pages,
+    // succeeds; only the meta's own fsync reports failure).
+    wrap.fail_at = wrap.sync_calls + 2;
+    var txn = try db.begin();
+    try txn.put("b", "2");
+    try testing.expectError(error.CommitFailed, txn.commit());
+
+    // The guard: three different entry points into "start a new write" on
+    // THIS Db must all be refused now, not silently allowed to retry on a
+    // base the file may no longer consider newest.
+    try testing.expectError(error.CommitFailed, db.begin());
+    try testing.expectError(error.CommitFailed, db.put("c", "3"));
+    try testing.expectError(error.CommitFailed, db.del("a"));
+
+    // Reads of the last-known-good version are unaffected by the poison.
+    const still = try db.get(testing.allocator, "a");
+    defer if (still) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("1", still.?);
+
+    // Close + reopen (the documented recovery) works normally. Because the
+    // failed commit's meta write really did reach the medium (this wrapper
+    // forwards before failing), `recover` finds it durable and CRC-valid
+    // with the higher txn_id and correctly adopts it — the "unacknowledged
+    // but durable" commit the doc says is a legal recovery target. Both "a"
+    // (from before the failure) and "b" (from the failed-but-durable commit)
+    // must be there.
+    db.close();
+    var db2 = try Db.open(testing.allocator, wrap.storage(), "poison.kvt", .{ .lock = .none });
+    defer db2.close();
+    const a2 = try db2.get(testing.allocator, "a");
+    defer if (a2) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("1", a2.?);
+    const b2 = try db2.get(testing.allocator, "b");
+    defer if (b2) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("2", b2.?);
+
+    try db2.put("d", "4"); // and it is fully usable again, unpoisoned
+    const d2 = try db2.get(testing.allocator, "d");
+    defer if (d2) |g| testing.allocator.free(g);
+    try testing.expectEqualStrings("4", d2.?);
 }
