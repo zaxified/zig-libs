@@ -77,7 +77,24 @@ test "KAT: full 'transport-initiator successful handshake' — act1/act2/act3 + 
     try testing.expectEqual(kv.init_rk.*, r.sk);
     try testing.expectEqual(kv.ck_temp_k3[0].*, r.ck);
     try testing.expectEqual(a3.result.handshake_hash, r.handshake_hash);
+    // Audit finding F1 (2026-09-05): the line above only ever compared the
+    // two sides against EACH OTHER, which a value both sides compute the
+    // same way will match even if computed wrong — two mutations that
+    // replaced handshake_hash outright (with `ck`, and with an all-zero
+    // constant) left this line green on both sides. Anchor against an
+    // INDEPENDENTLY computed value instead (see `kv.handshake_hash_final`'s
+    // doc comment for the recipe: a pure hash chain over published wire
+    // bytes, no secret material).
+    try testing.expectEqual(kv.handshake_hash_final.*, a3.result.handshake_hash);
     try testing.expectEqual(kv.init_ls_pub.*, responder.rs_pub.?);
+
+    // Audit finding F7 (2026-09-05): the peer's identity (in Lightning, the
+    // node id) used to live ONLY on the `Initiator`/`Responder` object,
+    // never in `HandshakeResult` -- each side's result must now carry the
+    // OTHER side's static public key, matching the published fixture keys.
+    try testing.expectEqual(kv.resp_ls_pub.*, a3.result.remote_static); // initiator sees the responder's key
+    try testing.expectEqual(kv.init_ls_pub.*, r.remote_static); // responder sees the initiator's key
+    try testing.expectEqual(responder.rs_pub.?, r.remote_static);
 
     // Transport round-trip over the freshly-derived keys: the initiator's
     // first message must be the published message-0 vector, and the
@@ -115,6 +132,27 @@ test "KAT: 'transport-responder act3 bad MAC test' — readAct3 must fail closed
     try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
 }
 
+test "KAT: 'transport-responder act1 bad key serialization test' — readAct1 must reject a malformed e.pub prefix" {
+    // Audit finding F4 (2026-09-05): of BOLT#8's 16 named test vectors, this
+    // was the one embedded nowhere and exercised nowhere. The module
+    // rejects it correctly today -- this pins that against regression.
+    const ls = try dh.KeyPair.generateDeterministic(kv.resp_ls_priv.*);
+    var responder = handshake.Responder.init(ls);
+    try testing.expectError(error.InvalidPublicKey, responder.readAct1(try act.Act1.fromBytes(kv.act1_bad_key_serialization)));
+    // Sanity check on the vector itself: exactly one byte different from
+    // the accepted `act1_bytes` (the e.pub SEC1 prefix, index 1), so this
+    // is genuinely testing key-serialization rejection and not some other
+    // accidental difference.
+    var diffs: usize = 0;
+    for (kv.act1_bytes, kv.act1_bad_key_serialization, 0..) |a, b, i| {
+        if (a != b) {
+            try testing.expectEqual(@as(usize, 1), i);
+            diffs += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), diffs);
+}
+
 test "KAT: 'transport-responder act3 bad rs test' — a decryptable-but-unparseable rs must abort (InvalidPublicKey)" {
     // The full crypto-level flow: readAct3 first decrypts `c` (its MAC
     // checks out — this is NOT a DecryptionFailed case), THEN must reject
@@ -135,10 +173,41 @@ test "wiring sanity: Transport built from the published sk/rk/ck reproduces the 
         .rk = kv.init_rk.*,
         .ck = kv.ck_temp_k3[0].*,
         .handshake_hash = [_]u8{0} ** 32,
+        .remote_static = [_]u8{0} ** 33,
     });
     var out: [transport.length_frame_len + 5 + 16]u8 = undefined;
     try t.sendMessage("hello", &out);
     try testing.expectEqualSlices(u8, kv.msg_outputs[0].bytes, &out);
+}
+
+test "README 'post-handshake transport' snippet, verbatim, with real types (F9 2026-09-05: it used to fail to compile)" {
+    // Audit finding F12 (2026-09-05): `var plain: [l]u8 = undefined;` where
+    // `l` is `Transport.recvLength`'s runtime `u16` result -- "unable to
+    // resolve comptime value". This is the corrected form, kept in the real
+    // suite (not just the doc) so it cannot silently rot again.
+    var sender = transport.Transport.init(.{
+        .sk = kv.init_sk.*,
+        .rk = kv.init_rk.*,
+        .ck = kv.ck_temp_k3[0].*,
+        .handshake_hash = [_]u8{0} ** 32,
+        .remote_static = [_]u8{0} ** 33,
+    });
+    var receiver = transport.Transport.init(.{
+        .sk = kv.init_rk.*,
+        .rk = kv.init_sk.*,
+        .ck = kv.ck_temp_k3[0].*,
+        .handshake_hash = [_]u8{0} ** 32,
+        .remote_static = [_]u8{0} ** 33,
+    });
+    const msg = "hello";
+    var out: [transport.length_frame_len + msg.len + 16]u8 = undefined;
+    try sender.sendMessage(msg, &out);
+
+    const l = try receiver.recvLength(out[0..transport.length_frame_len]);
+    var buf: [transport.max_message_len]u8 = undefined; // caller-owned upper bound
+    const plain = buf[0..l]; // `l` is runtime, so this must be a SLICE, not an array length
+    try receiver.recvMessage(out[transport.length_frame_len..], plain);
+    try testing.expectEqualStrings(msg, plain);
 }
 
 // ── differential: the AEAD swap must not move a single wire byte ───────
@@ -210,4 +279,32 @@ test "wiring sanity: Initiator.init/Responder.init from the published identities
     const responder = handshake.Responder.init(resp_ls);
     try testing.expectEqual(initiator.ss.h, responder.ss.h);
     try testing.expectEqualSlices(u8, kv.ck_after_init, &initiator.ss.ck);
+}
+
+test "F2: deinit zeroes the key material each object directly owns" {
+    // Audit finding F2 (2026-09-05): the module had no zeroization at all.
+    // This does not claim the dead stack is clean (see SPEC.md's note on
+    // that) -- only that the LIVE fields on these objects go to zero.
+    var initiator = try initiatorAfterAct1();
+    try testing.expect(!std.mem.allEqual(u8, &initiator.ls.secret_key, 0));
+    try testing.expect(!std.mem.allEqual(u8, &initiator.ephemeral.?.secret_key, 0));
+    initiator.deinit();
+    try testing.expect(std.mem.allEqual(u8, &initiator.ls.secret_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &initiator.ephemeral.?.secret_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &initiator.ss.ck, 0));
+    try testing.expect(std.mem.allEqual(u8, &initiator.ss.cipher_state.k, 0));
+
+    var responder = try responderAfterAct2();
+    try testing.expect(!std.mem.allEqual(u8, &responder.ls.secret_key, 0));
+    responder.deinit();
+    try testing.expect(std.mem.allEqual(u8, &responder.ls.secret_key, 0));
+    try testing.expect(std.mem.allEqual(u8, &responder.ss.ck, 0));
+
+    var t = transport.Transport.init(.{ .sk = kv.init_sk.*, .rk = kv.init_rk.*, .ck = kv.ck_temp_k3[0].*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    try testing.expect(!std.mem.allEqual(u8, &t.tx.cipher.k, 0));
+    t.deinit();
+    try testing.expect(std.mem.allEqual(u8, &t.tx.cipher.k, 0));
+    try testing.expect(std.mem.allEqual(u8, &t.tx.chain, 0));
+    try testing.expect(std.mem.allEqual(u8, &t.rx.cipher.k, 0));
+    try testing.expect(std.mem.allEqual(u8, &t.rx.chain, 0));
 }

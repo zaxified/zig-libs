@@ -61,6 +61,11 @@ var responder = bolt8.Responder.init(my_static_keypair);
 try responder.readAct1(act1_from_wire);
 const act2 = try responder.genAct2(entropy);
 const result = try responder.readAct3(act3_from_wire);
+// result.remote_static is the PEER's static public key (in Lightning, its
+// node id) -- the one output of the handshake's authentication step. Check
+// it against whatever identity you expected to reach before trusting the
+// connection; readAct3 only proves the peer knows the corresponding
+// private key, not that it is who you meant to dial.
 ```
 
 Each `Initiator`/`Responder` drives **one** handshake, in order. A second
@@ -80,8 +85,9 @@ var out: [bolt8.transport.length_frame_len + msg.len + 16]u8 = undefined;
 try t.sendMessage(msg, &out); // frames + encrypts + auto-rotates every 500 messages
 
 const l = try t.recvLength(wire_bytes[0..bolt8.transport.length_frame_len]);
-var plain: [l]u8 = undefined; // caller-sized once `l` is known
-try t.recvMessage(wire_bytes[bolt8.transport.length_frame_len..][0 .. l + 16], &plain);
+var buf: [bolt8.transport.max_message_len]u8 = undefined; // caller-owned upper bound
+const plain = buf[0..l]; // `l` is runtime, so this must be a SLICE, not an array length
+try t.recvMessage(wire_bytes[bolt8.transport.length_frame_len..][0 .. l + 16], plain);
 ```
 
 ## Verify

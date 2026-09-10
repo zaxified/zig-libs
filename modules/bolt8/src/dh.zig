@@ -93,6 +93,16 @@ pub const KeyPair = struct {
             return generateDeterministic(seed) catch continue;
         }
     }
+
+    /// Zero the private scalar. Audit finding F2 (2026-09-05): this module
+    /// had no zeroization anywhere; additive method, no existing signature
+    /// changes (`DECISIONS.md` P1/P3, zero in-repo consumers). Does not
+    /// reach copies of `secret_key` made by earlier by-value calls (e.g.
+    /// `dh.dh`'s own parameter) — those are `handshake.zig`'s problem, not
+    /// this type's; see `Initiator.deinit`/`Responder.deinit`.
+    pub fn deinit(self: *KeyPair) void {
+        std.crypto.secureZero(u8, &self.secret_key);
+    }
 };
 
 pub const DhError = error{

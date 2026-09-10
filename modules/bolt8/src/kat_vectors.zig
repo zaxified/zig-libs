@@ -104,6 +104,35 @@ pub const bad_pubkey_serialization = hx("04466d7fcae563e5cb09a0d1870bb5803448046
 /// the full handshake) recovers these bytes.
 pub const bad_recovered_static_key = hx("044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa");
 
+/// The final post-Act-Three transcript hash (`SymmetricState.h`, what
+/// `HandshakeResult.handshake_hash` is filled from) — audit finding F1
+/// (2026-09-05): BOLT#8 does not publish this value, and the only
+/// assertions on it compared the two sides of the SAME handshake against
+/// each other, which a channel-binding value that is IDENTICAL on both
+/// sides by construction (both run the same mixHash sequence) will always
+/// pass even if the whole thing were computed wrong — two mutations that
+/// replace it outright (with `ck`, and with all-zero) left the suite AND a
+/// live `brontide` interop both green. Computed independently here via
+/// Python hashlib (mirrors `handshake.zig`'s own `h_before_act1`, which
+/// this same recipe reproduces byte-exact as an intermediate step): `h`
+/// after `InitializeSymmetric(protocol_name)` (36 bytes, hashed since it is
+/// over `HASHLEN`) + `MixHash(prologue)` + `MixHash(resp_ls_pub)` (=
+/// `h_before_act1`, cross-checked) + `MixHash(act1's e.pub)` +
+/// `MixHash(act1's tag)` + `MixHash(act2's e.pub)` + `MixHash(act2's tag)`
+/// + `MixHash(act3's c)` + `MixHash(act3's t)` — every input a PUBLIC wire
+/// byte already published in this file, no secret material involved.
+pub const handshake_hash_final = hx("3e385d26eb49e88ddd66f70f7b24e597867feecf320bb2245b83adb5a2399ce3");
+
+/// "transport-responder act1 bad key serialization test": `act1_bytes`
+/// with `e.pub`'s SEC1 prefix patched `0x03` -> `0x04` (byte index 1, the
+/// first byte of the 33-byte key) — audit finding F4 (2026-09-05): of
+/// BOLT#8's 16 named test vectors, this was the one this module embedded
+/// nowhere and exercised nowhere (`kat_test.zig` confirms the module
+/// rejects it correctly with `error.InvalidPublicKey` via the full
+/// `Responder.readAct1` driver, matching `bad_pubkey_serialization`'s
+/// sibling rejection on act2's `e.pub`).
+pub const act1_bad_key_serialization = hx("00046360e856310ce5d294e8be33fc807077dc56ac80d95d9cd4ddbd21325eff73f70df6086551151f58b8afe6c195782c6a");
+
 // ── negative vectors: crypto-level (exercised via the handshake driver) ─
 //
 // These require an actual AEAD tag check to distinguish "wrong" from

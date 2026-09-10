@@ -203,7 +203,18 @@ BOLT#8 doesn't already spell out byte-for-byte, or was already solved by
   same posture as this repo's `ssh` module's transport layer), and
   anything above the Lightning-message byte boundary (message-type
   dispatch, `init`/`ping`/gossip semantics — BOLT#1/BOLT#7 territory, not
-  this module's concern).
+  this module's concern). ⚠ **Audit finding F8 (2026-09-05): that caller-owned
+  read loop needs a deadline, and this module cannot enforce one.**
+  `Responder.readAct1` cannot tell a genuine 50-byte Act One from 50 bytes
+  chosen by an attacker without first spending one variable-base secp256k1
+  scalar multiply (`es = ECDH(s.priv, re)`, measured ~244 µs CPU on this
+  audit's hardware) — the MAC that would reject a forgery is checked only
+  AFTER that ECDH, because `temp_k1` is derived from its output. `brontide`
+  bounds this with an explicit `handshakeReadTimeout` (5 s) around its own
+  read loop; this module's caller must supply the equivalent, since the
+  read loop itself lives outside this module's scope by design (above).
+  Without one, an attacker who never completes a handshake can hold a
+  responder in `readAct1` indefinitely per connection attempt.
 
 ## TODO(fable) — done record (fill-in pass completed 2026-07-12)
 

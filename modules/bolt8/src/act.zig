@@ -27,9 +27,15 @@ pub const act2_len = 50;
 pub const act3_len = 66;
 
 pub const ParseError = error{
-    /// Fewer than the fixed act length was available ("Read _exactly_ N
-    /// bytes from the network buffer" — a short read is a hard failure,
-    /// not a partial-parse; BOLT#8's own `*_READ_FAILED` test vectors).
+    /// The buffer was not exactly the fixed act length — too short OR too
+    /// long ("Read _exactly_ N bytes from the network buffer" — a short
+    /// read is a hard failure, not a partial-parse; BOLT#8's own
+    /// `*_READ_FAILED` test vectors). Audit finding F9 (2026-09-05):
+    /// `fromBytes` used to accept `bytes.len > act_len` and silently
+    /// discard the tail rather than reject it, and return no count of
+    /// bytes consumed — so a caller could never tell where the next
+    /// message started. Zero in-repo consumers (`DECISIONS.md` P1):
+    /// tightened to the spec's "exactly" without asking.
     ShortRead,
     /// The leading version byte was not `0` ("Clients MUST reject
     /// handshake attempts initiated with an unknown version" —
@@ -55,7 +61,7 @@ pub const Act1 = struct {
     }
 
     pub fn fromBytes(bytes: []const u8) ParseError!Act1 {
-        if (bytes.len < act1_len) return error.ShortRead;
+        if (bytes.len != act1_len) return error.ShortRead;
         if (bytes[0] != version) return error.BadVersion;
         return .{ .e_pub = bytes[1..34].*, .tag = bytes[34..50].* };
     }
@@ -78,7 +84,7 @@ pub const Act2 = struct {
     }
 
     pub fn fromBytes(bytes: []const u8) ParseError!Act2 {
-        if (bytes.len < act2_len) return error.ShortRead;
+        if (bytes.len != act2_len) return error.ShortRead;
         if (bytes[0] != version) return error.BadVersion;
         return .{ .e_pub = bytes[1..34].*, .tag = bytes[34..50].* };
     }
@@ -102,7 +108,7 @@ pub const Act3 = struct {
     }
 
     pub fn fromBytes(bytes: []const u8) ParseError!Act3 {
-        if (bytes.len < act3_len) return error.ShortRead;
+        if (bytes.len != act3_len) return error.ShortRead;
         if (bytes[0] != version) return error.BadVersion;
         return .{ .c = bytes[1..50].*, .t = bytes[50..66].* };
     }
@@ -167,6 +173,29 @@ test "Act3: 'transport-responder act3 bad version test' — leading 0x01 fails B
 
 test "Act3: 'transport-responder act3 short read test' — 65 bytes fails ShortRead" {
     try testing.expectError(error.ShortRead, Act3.fromBytes(act3_bytes[0 .. act3_len - 1]));
+}
+
+test "fromBytes rejects a buffer LONGER than the act, not just a shorter one (F9)" {
+    // Audit finding F9 (2026-09-05): BOLT#8 says "Read _exactly_ N bytes
+    // from the network buffer", but `fromBytes` used to accept
+    // `bytes.len > act_len` and silently discard the tail. Mutation A2 (the
+    // audit's own `!=` in place of `<`) left the OLD suite and a live
+    // `brontide` interop both green either way -- nothing tested which
+    // direction of length mismatch mattered. These three pin it directly.
+    var over1: [act1_len + 1]u8 = undefined;
+    over1[0..act1_len].* = act1_bytes.*;
+    over1[act1_len] = 0xAB;
+    try testing.expectError(error.ShortRead, Act1.fromBytes(&over1));
+
+    var over2: [act2_len + 1]u8 = undefined;
+    over2[0..act2_len].* = act2_bytes.*;
+    over2[act2_len] = 0xAB;
+    try testing.expectError(error.ShortRead, Act2.fromBytes(&over2));
+
+    var over3: [act3_len + 1]u8 = undefined;
+    over3[0..act3_len].* = act3_bytes.*;
+    over3[act3_len] = 0xAB;
+    try testing.expectError(error.ShortRead, Act3.fromBytes(&over3));
 }
 
 // ── fuzz: the untrusted-wire handshake framing never panics/OOB ────────────
@@ -238,8 +267,11 @@ const act1_seeds = [_][]const u8{
     fuzzSeedLocal(perturbed(kv.act1_bytes, 0, 0x01)),
     // "transport-responder act1 short read test": 49 octets -> ShortRead.
     fuzzSeedLocal(kv.act1_bytes[0 .. act1_len - 1]),
-    // A full act with 32 octets of trailing garbage, filling the buffer: the
-    // parser must ignore the tail rather than read into it.
+    // A full act with 32 octets of trailing garbage, filling the buffer.
+    // Audit finding F9 (2026-09-05): `fromBytes` used to silently ignore
+    // this tail instead of rejecting it (BOLT#8: "Read _exactly_ N bytes");
+    // now this seed is REJECTED (ShortRead), which is what the "accepted"
+    // count below counts.
     fuzzSeedLocal(&(kv.act1_bytes.* ++ [_]u8{0xAB} ** 32)),
     // Version 0 with every field zero — a third distinct ephemeral key, and
     // the shape the all-zero fuzz round would have produced had the length
@@ -278,7 +310,7 @@ test "corpus: Act1 seeds reach the parser, counts pinned" {
         try keys.add(a.e_pub);
     }
     try testing.expectEqual(act1_seeds.len - 1, nonempty); // all but seed("")
-    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 4), accepted); // F9: trailing-garbage seed now rejected (was 5)
     try testing.expectEqual(@as(usize, 3), keys.count);
 }
 
@@ -295,7 +327,7 @@ const act2_seeds = [_][]const u8{
     fuzzSeedLocal(perturbed(kv.act2_bytes, 0, 0x01)),
     // "transport-initiator act2 short read test": 49 octets -> ShortRead.
     fuzzSeedLocal(kv.act2_bytes[0 .. act2_len - 1]),
-    // Trailing octets past the act, filling the buffer.
+    // Trailing octets past the act, filling the buffer — F9: now rejected.
     fuzzSeedLocal(&(kv.act2_bytes.* ++ [_]u8{0xAB} ** 32)),
     // All-zero act: version 0, a third distinct key.
     fuzzSeedLocal(&[_]u8{0x00} ** act2_len),
@@ -326,7 +358,7 @@ test "corpus: Act2 seeds reach the parser, counts pinned" {
         try keys.add(a.e_pub);
     }
     try testing.expectEqual(act2_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 4), accepted); // F9: trailing-garbage seed now rejected (was 5)
     try testing.expectEqual(@as(usize, 3), keys.count);
 }
 
@@ -347,7 +379,7 @@ const act3_seeds = [_][]const u8{
     fuzzSeedLocal(perturbed(kv.act3_bytes, 0, 0x01)),
     // "transport-responder act3 short read test": 65 octets -> ShortRead.
     fuzzSeedLocal(kv.act3_bytes[0 .. act3_len - 1]),
-    // Trailing octets past the act, filling the buffer.
+    // Trailing octets past the act, filling the buffer — F9: now rejected.
     fuzzSeedLocal(&(kv.act3_bytes.* ++ [_]u8{0xAB} ** 32)),
     // All-zero act: version 0, a fourth distinct `c`.
     fuzzSeedLocal(&[_]u8{0x00} ** act3_len),
@@ -378,7 +410,7 @@ test "corpus: Act3 seeds reach the parser, counts pinned" {
         try ciphertexts.add(a.c);
     }
     try testing.expectEqual(act3_seeds.len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 6), accepted);
+    try testing.expectEqual(@as(usize, 5), accepted); // F9: trailing-garbage seed now rejected (was 6)
     try testing.expectEqual(@as(usize, 4), ciphertexts.count);
 }
 

@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking, plus one BREAKING and one additive
+  field:** A1 fix campaign, 11 of 12 open findings (F1-F4, F6-F9, F11-F13; F5 needs a
+  user decision, left open). **BREAKING:** `Act1`/`Act2`/`Act3.fromBytes` now reject a
+  buffer whose length is not EXACTLY the act length (was `<`, now `!=`) — F9, zero
+  in-repo consumers, `DECISIONS.md` P1. **Additive:** `HandshakeResult` gained
+  `remote_static: [33]u8` (the peer's static public key — F7) and
+  `Initiator`/`Responder`/`Transport`/`dh.KeyPair` gained `deinit()` (zeroes the key
+  material each object directly owns, not dead-stack copies inside the act functions —
+  F2). `handshake_hash` is now anchored against an independently-computed value instead
+  of only comparing the two sides of one handshake against each other (F1). Two fuzz
+  harnesses added for `Transport.recvLength`/`recvMessage` (F3, the act-framing half of
+  this finding was already fixed pre-campaign in `4063b8db`). Doc-only: `Transport`
+  desync warning (F6), unauthenticated-work deadline note (F8), backfilled the missing
+  2026-08-12 changelog entry (F11), fixed a README snippet that failed to compile
+  (F12), documented why `NonceExhausted` cannot occur today (F13), added the one
+  missing BOLT#8 named test vector (F4). See `~/CML/20260901-zig-libs-audit/A1/bolt8.md`
+  for the full disposition and RED/GREEN measurements.
+
 - **2026-09-09** — Licensing: `NOTICE` kind changed from `provenance note` (record only) to
   `third-party attribution` (carries a CONDITION). `src/kat_vectors.zig` embeds BOLT#8's Appendix A transport test vectors verbatim from `lightning/bolts`,
   which is CC-BY 4.0, so attribution is owed and was not being given. ⛔⛔ The repository was
@@ -60,6 +78,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   the second number is pinned because an accepted count cannot tell a corpus that
   collapsed to one frame from one that did not.
 
+- **2026-08-12** — **BREAKING (backfilled 2026-09-10, audit finding F11):** B6 RNG-seam
+  fix, commit `c36f2cac` — never recorded here even though the changelog file itself was
+  created three commits later the same evening (`da6c475c`) and simply omitted it.
+  `Initiator`/`Responder`'s public `e` field is GONE; `genAct1(std.Random)` /
+  `genAct2(std.Random)` became `genAct1(Ephemeral)` / `genAct2(Ephemeral)` (a tagged union
+  naming `.csprng` vs. `.seeded_for_test` at the call site — see `Ephemeral`'s own doc
+  comment). Before this, `self.e orelse dh.KeyPair.generate(random)` meant a consumer who
+  assigned `.e` got a CONSTANT ephemeral public key on every Act One (cross-session
+  linkability, and a constant `es`), with the `random` argument silently going dead — nobody
+  had to select the weak path, it was reachable by assignment. Also added: a linear
+  `state: State` machine (`error.WrongState` on any act run out of order or twice), closing
+  the sibling bug where a retry could reuse the previous ephemeral share.
 - **2026-08-21** — `noise`'s cipher calls gained `error.BufferTooSmall`; this module maps
   it to the `BufferWrongSize` it already publishes, so its own error sets are unchanged. It
   validates every buffer length itself before calling, so the mapped error is not reachable

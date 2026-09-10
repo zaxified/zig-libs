@@ -166,6 +166,17 @@ pub const HandshakeResult = struct {
     rk: [32]u8,
     ck: [32]u8,
     handshake_hash: [32]u8,
+    /// The peer's static public key — for the initiator this is the `rs`
+    /// it already knew before the handshake started (Noise_XK's whole
+    /// point); for the responder it is the `rs` Act Three just recovered
+    /// and validated. Audit finding F7 (2026-09-05): before this field
+    /// existed, the ONLY output of authentication (in Lightning, the peer's
+    /// node id) lived solely on the `Initiator`/`Responder` object itself
+    /// (`.rs_pub`) and this module had no in-repo consumer, so its own
+    /// `README.md` — the first thing a future consumer copies — never
+    /// mentioned it. Purely additive field at the end of the struct
+    /// (`DECISIONS.md` P3): no existing field changes shape or meaning.
+    remote_static: [33]u8,
 };
 
 /// The initiator's side of `Noise_XK(s, rs)`. BOLT#8 requires the
@@ -193,6 +204,28 @@ pub const Initiator = struct {
     state: State = .start,
 
     pub const State = enum { start, awaiting_act2, ready_act3, done };
+
+    /// Zero the key material this object directly owns: the long-term
+    /// static private key, the ephemeral private key (if one was drawn),
+    /// the running chaining key, and the embedded cipher key. Audit finding
+    /// F2 (2026-09-05): this module had no zeroization mechanism at all,
+    /// mirroring `noise.HandshakeState.wipe` (which this module does not
+    /// use — see the module doc comment — but the pattern is the same:
+    /// the transcript hash stays available for `getHandshakeHash`, only
+    /// key material is wiped). Additive method, no existing signature
+    /// changes (`DECISIONS.md` P1/P3, zero in-repo consumers).
+    ///
+    /// ⚠ Does NOT reach copies of these secrets left on the stack by
+    /// earlier by-value calls inside `act1`/`readAct2`/`genAct3` (`e`,
+    /// `es`, `ee`, `se` as local values) — that is a dead-stack problem
+    /// distinct from this object's own fields, unmeasured here; see
+    /// `SPEC.md`'s zeroization note.
+    pub fn deinit(self: *Initiator) void {
+        self.ls.deinit();
+        if (self.ephemeral) |*e| e.deinit();
+        std.crypto.secureZero(u8, &self.ss.ck);
+        std.crypto.secureZero(u8, &self.ss.cipher_state.k);
+    }
 
     /// BOLT#8 "Handshake State Initialization" — REAL, no DH/AEAD:
     ///
@@ -332,6 +365,7 @@ pub const Initiator = struct {
                 .rk = pair[1].k,
                 .ck = self.ss.ck,
                 .handshake_hash = self.ss.getHandshakeHash(),
+                .remote_static = self.rs_pub,
             },
         };
     }
@@ -353,6 +387,15 @@ pub const Responder = struct {
     state: State = .start,
 
     pub const State = enum { start, ready_act2, awaiting_act3, done };
+
+    /// See `Initiator.deinit` — same fields, same caveat about dead-stack
+    /// copies from `readAct1`/`act2`/`readAct3`'s own by-value locals.
+    pub fn deinit(self: *Responder) void {
+        self.ls.deinit();
+        if (self.ephemeral) |*e| e.deinit();
+        std.crypto.secureZero(u8, &self.ss.ck);
+        std.crypto.secureZero(u8, &self.ss.cipher_state.k);
+    }
 
     /// BOLT#8 "Handshake State Initialization" — REAL, mirrors
     /// `Initiator.init` exactly except the final mixHash: the responder
@@ -499,6 +542,7 @@ pub const Responder = struct {
             .rk = pair[0].k,
             .ck = self.ss.ck,
             .handshake_hash = self.ss.getHandshakeHash(),
+            .remote_static = self.rs_pub.?,
         };
     }
 };

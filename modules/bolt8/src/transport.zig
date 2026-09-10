@@ -86,6 +86,18 @@ pub const Direction = struct {
     }
 };
 
+/// ⚠ Audit finding F13 (2026-09-05): `NonceExhausted` in both error sets is
+/// structurally UNREACHABLE today. `maybeRotate` resets `n` to 0 the instant
+/// it reaches `rotation_interval` (1000), so `n` can never climb toward
+/// `CipherState`'s actual exhaustion point (2^64-1) — a `Direction` that
+/// only ever goes through this module's own `sendMessage`/`recvLength`/
+/// `recvMessage` cannot produce it (measured: 4000 messages, `max(n) ==
+/// 1000`; see the "F13" test below). Left in the error set
+/// rather than removed: it is what `CipherState.encryptWithAd`/
+/// `decryptWithAd` themselves can still return if `Direction`'s invariant
+/// is ever broken by a future change (e.g. a rotation call site skipped),
+/// and a caller that already handles it costs nothing extra. Pinned by the
+/// "F13: NonceExhausted is structurally unreachable" test below.
 pub const SendError = error{ MessageTooLong, BufferWrongSize, NonceExhausted };
 pub const RecvError = error{ DecryptionFailed, NonceExhausted, BufferWrongSize };
 
@@ -104,6 +116,18 @@ pub const Transport = struct {
             .tx = Direction.init(result.sk, result.ck),
             .rx = Direction.init(result.rk, result.ck),
         };
+    }
+
+    /// Zero both directions' live cipher key and rotation chaining key.
+    /// Audit finding F2 (2026-09-05): additive, no existing signature
+    /// changes (`DECISIONS.md` P1/P3, zero in-repo consumers). See
+    /// `handshake.Initiator.deinit`'s doc comment for the same caveat about
+    /// dead-stack copies this does not reach.
+    pub fn deinit(self: *Transport) void {
+        std.crypto.secureZero(u8, &self.tx.cipher.k);
+        std.crypto.secureZero(u8, &self.tx.chain);
+        std.crypto.secureZero(u8, &self.rx.cipher.k);
+        std.crypto.secureZero(u8, &self.rx.chain);
     }
 
     /// BOLT#8 "Encrypting and Sending Messages": encrypts the 2-byte
@@ -133,6 +157,19 @@ pub const Transport = struct {
     /// "Receiving and Decrypting Messages" steps 1-3: decrypt the 18-byte
     /// encrypted length prefix, returning the plaintext length `l` the
     /// caller must then read `l + 16` more bytes for (`recvMessage`).
+    ///
+    /// ⚠ Audit finding F6 (2026-09-05): `rx`'s nonce advances on EVERY call
+    /// to `recvLength` OR `recvMessage`, in strict alternation — there is no
+    /// state tracking which one is expected next. A `recvLength` whose
+    /// matching `recvMessage` never arrives (the caller read a header, then
+    /// hit a timeout or a lower-layer error before the body) permanently
+    /// desyncs `rx`: every later frame decrypts with the wrong nonce and
+    /// fails closed with `error.DecryptionFailed` forever, not just once.
+    /// `brontide`'s own `ReadHeader`/`ReadBody` carry the identical warning
+    /// ("SHOULD NOT be used in the case that the io.Reader may be
+    /// adversarial"). If your transport layer can fail between the two
+    /// calls, rebuild the `Transport` (a fresh handshake) rather than retry
+    /// on the same one.
     pub fn recvLength(self: *Transport, lc: *const [length_frame_len]u8) RecvError!u16 {
         var l_be: [2]u8 = undefined;
         self.rx.cipher.decryptWithAd("", lc, &l_be) catch |e| return switch (e) {
@@ -179,7 +216,7 @@ test "Direction.rotate: matches the published rotation intermediates byte-exact 
 }
 
 test "Transport.sendMessage: 1001x 'hello' reproduces all 6 published outputs, auto-rotating at message 500/1000" {
-    var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+    var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var want_i: usize = 0;
     var out: [length_frame_len + 5 + 16]u8 = undefined;
@@ -199,8 +236,8 @@ test "Transport: round-trip send/recv across a rotation boundary (real decrypt o
     // used only to send, one only to receive — decrypting the SAME
     // messages the sender produced (both directions rotate identically
     // since both start from the same (ck, sk) as "their own" tx key).
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var i: usize = 0;
     while (i < 1002) : (i += 1) {
@@ -216,7 +253,7 @@ test "Transport: round-trip send/recv across a rotation boundary (real decrypt o
 }
 
 test "Transport.sendMessage: rejects an oversized message and a wrong-size buffer" {
-    var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+    var t = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try testing.expectError(error.BufferWrongSize, t.sendMessage("hello", out[0 .. out.len - 1]));
 
@@ -238,8 +275,8 @@ test "Transport.recvMessage: rejects a mismatched-size out buffer BEFORE decrypt
     // `out`, leaving the rest of the caller's buffer untouched (stale/
     // uninitialized) while looking like a normal successful call — this
     // guard is what turns that into an explicit, loud rejection instead.
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try sender.sendMessage("hello", &out);
@@ -253,8 +290,8 @@ test "Transport.recvMessage: rejects a mismatched-size out buffer BEFORE decrypt
 }
 
 test "Transport.recvMessage: a tampered ciphertext fails closed with DecryptionFailed" {
-    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
-    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32 });
+    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
 
     var out: [length_frame_len + 5 + 16]u8 = undefined;
     try sender.sendMessage("hello", &out);
@@ -263,4 +300,108 @@ test "Transport.recvMessage: a tampered ciphertext fails closed with DecryptionF
     const l = try receiver.recvLength(out[0..length_frame_len]);
     var plain: [5]u8 = undefined;
     try testing.expectError(error.DecryptionFailed, receiver.recvMessage(out[length_frame_len..][0 .. l + 16], &plain));
+}
+
+test "F13: NonceExhausted is structurally unreachable through this module's own send/recv" {
+    // Audit finding F13 (2026-09-05): `maybeRotate` resets `n` to 0 at
+    // `rotation_interval` (1000), so a `Direction` driven only through
+    // `sendMessage`/`recvLength`/`recvMessage` can never approach
+    // `CipherState`'s real exhaustion point (2^64-1). 4000 messages spans
+    // four rotation boundaries; `n` must never exceed `rotation_interval`.
+    var sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var receiver = Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    var max_tx_n: u64 = 0;
+    var max_rx_n: u64 = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        var out: [length_frame_len + 5 + 16]u8 = undefined;
+        try sender.sendMessage("hello", &out);
+        max_tx_n = @max(max_tx_n, sender.tx.cipher.n);
+        const l = try receiver.recvLength(out[0..length_frame_len]);
+        var plain: [5]u8 = undefined;
+        try receiver.recvMessage(out[length_frame_len..][0 .. l + 16], &plain);
+        max_rx_n = @max(max_rx_n, receiver.rx.cipher.n);
+    }
+    try testing.expect(max_tx_n <= rotation_interval);
+    try testing.expect(max_rx_n <= rotation_interval);
+}
+
+// ── fuzz: the untrusted-wire transport decoders never panic/OOB ────────────
+//
+// Audit finding F3 (2026-09-05), second half: `act.zig`'s framing decoders
+// got real corpora in a prior session, but "transport `decode`" (this
+// file's `recvLength`/`recvMessage`) had NO harness at all — a fixed-size
+// `Transport`, wired from the published KAT keys so every draw exercises a
+// real AEAD decrypt rather than failing on an uninitialised cipher.
+
+fn freshReceiver() Transport {
+    return Transport.init(.{ .sk = msg_test_rk.*, .rk = msg_test_sk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+}
+
+fn fuzzRecvLength(_: void, smith: *std.testing.Smith) !void {
+    var t = freshReceiver();
+    // Fixed-size read (not a ranged draw before it), so every input, fuzzed
+    // or not, reaches `decryptWithAd` for real -- no `Smith` length-draw
+    // collapse for this harness to fall into.
+    var lc: [length_frame_len]u8 = undefined;
+    smith.bytes(&lc);
+    _ = t.recvLength(&lc) catch return;
+}
+test "fuzz Transport.recvLength never panics" {
+    // Seeded with a genuine encrypted length frame (from the published
+    // message-test fixture) so the corpus reaches the accept path at least
+    // once, not just the near-certain AEAD-tag rejection of random bytes.
+    var seed_out: [length_frame_len + 5 + 16]u8 = undefined;
+    var seed_sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    try seed_sender.sendMessage("hello", &seed_out);
+    try testing.fuzz({}, fuzzRecvLength, .{ .corpus = &.{seed_out[0..length_frame_len]} });
+}
+
+/// `recvMessage`'s nonce is the SECOND use of `rx.cipher` in a real
+/// send/recv pair (`recvLength` took the first). A fresh `Transport` handed
+/// straight to `recvMessage` would decrypt every fuzzed input at nonce 0,
+/// which is never what a real message body is keyed with -- so this target
+/// first spends one genuine `recvLength` call (on the published seed's own
+/// length frame, result ignored) purely to advance the nonce the way real
+/// usage would, THEN fuzzes only the message body.
+fn fuzzRecvMessage(_: void, smith: *std.testing.Smith) !void {
+    var t = freshReceiver();
+    _ = t.recvLength(&fixed_seed_length_frame) catch {};
+    var c: [5 + 16]u8 = undefined;
+    smith.bytes(&c);
+    var out: [5]u8 = undefined;
+    _ = t.recvMessage(&c, &out) catch return;
+}
+var fixed_seed_length_frame: [length_frame_len]u8 = undefined;
+test "fuzz Transport.recvMessage never panics" {
+    var seed_out: [length_frame_len + 5 + 16]u8 = undefined;
+    var seed_sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    try seed_sender.sendMessage("hello", &seed_out);
+    fixed_seed_length_frame = seed_out[0..length_frame_len].*;
+    try testing.fuzz({}, fuzzRecvMessage, .{ .corpus = &.{seed_out[length_frame_len..]} });
+}
+
+test "corpus: the transport seeds reach a real AEAD decrypt, not just the length gate" {
+    var seed_out: [length_frame_len + 5 + 16]u8 = undefined;
+    var seed_sender = Transport.init(.{ .sk = msg_test_sk.*, .rk = msg_test_rk.*, .ck = msg_test_ck.*, .handshake_hash = [_]u8{0} ** 32, .remote_static = [_]u8{0} ** 33 });
+    try seed_sender.sendMessage("hello", &seed_out);
+
+    var recv_len: Transport = freshReceiver();
+    var smith_len: std.testing.Smith = .{ .in = seed_out[0..length_frame_len] };
+    var lc: [length_frame_len]u8 = undefined;
+    smith_len.bytes(&lc);
+    const l = try recv_len.recvLength(&lc);
+    try testing.expectEqual(@as(u16, 5), l);
+
+    // recvMessage's nonce is the SECOND use of `rx.cipher` (recvLength took
+    // the first), so this check must consume that first nonce the same way
+    // real usage does before decrypting the body.
+    var recv_msg: Transport = freshReceiver();
+    _ = try recv_msg.recvLength(&lc);
+    var smith_msg: std.testing.Smith = .{ .in = seed_out[length_frame_len..] };
+    var c: [5 + 16]u8 = undefined;
+    smith_msg.bytes(&c);
+    var out: [5]u8 = undefined;
+    try recv_msg.recvMessage(&c, &out);
+    try testing.expectEqualStrings("hello", &out);
 }
