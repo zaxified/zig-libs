@@ -755,6 +755,44 @@ answered. Outcome should be either a constant-time exact division in
 `paillier`, a `paillier`-scoped ctgrind target added to this toolchain's
 registry, or a *corrected* written rationale replacing the `β' mod N` one.
 
+**Update 2026-09-10 (audit F5, third pass — the "reaches the division" half
+is now answered; the exploitability half is not).** `paillier` already HAD
+the `paillier`-scoped ctgrind target this note asked for — it was added
+independently of this module (`src/ctgrind_harness.zig` targets `crt`/
+`noncrt`, pinned as `scripts/ctgrind-expected.tsv` rows `paillier/crt`,
+`paillier/noncrt`) — this section simply had not been re-checked against
+it. Ran it ad hoc (`zig build-exe -fvalgrind` over
+`modules/paillier/src/ctgrind_harness.zig` + manual `valgrind
+--tool=memcheck`, the same technique this session used for `bn254`'s
+`Fr.toBytes` fix, NOT `scripts/ctgrind.sh`), tainting `lambda`/`mu`/the CRT
+block (`crt` target) and `lambda`/`mu` alone (`noncrt` target) — i.e. the
+secret key, which the L-function's input `x = c^λ mod n²` is a function
+of. **Result: `crt` 333 contexts / 92089 errors tainted vs 0/0 untainted;
+`noncrt` 143/3851 vs 0/0**, with `math.big.int.Managed.divFloor` called
+from `paillier.decrypt` (the exact disputed line) a first-class contributor
+in both, confirmed by reading the raw memcheck stack traces, not inferred.
+So: **the taint from the secret key does reach the L-function division** —
+this module's own pinned gate already exercises and would catch a
+regression in exactly the disputed code path, closing the "is there a
+harness that reaches this line" half of this note's own ask without a
+third target added here. Also found and fixed while checking this:
+`paillier.decrypt`'s own doc comment carried the *wrong* justification for
+why the leak was "accepted" — it named `samplePaillierRandomness`
+(`Z_N`-uniform ciphertext randomness) as the source of MtA's `β'`, when
+`β'` is actually `randomScalar` (`Zq`-uniform, matching the `~q²`-masked-
+by-`~q` accounting three paragraphs above in this very section — the
+`paillier` comment and this section disagreed with each other). Fixed
+there, not here, since the comment lives in `paillier` (commit `e98cdb2a`).
+**What remains open, and is explicitly NOT answered by this measurement:**
+whether `divFloor`'s limb-granularity timing on the `~q²`-masked plaintext
+is *exploitable* against `k_i` in practice, accumulated across `O(t²)` MtA
+instances per signature and across sessions — a genuine side-channel/
+statistical question needing a cryptographer's analysis (dudect-style
+leakage estimation, or a proof that limb-count variance is bounded
+independent of the masked value), not another ctgrind context count. Track
+this the same way as this module's own F4(b)/(c): needs a specialist, not
+another fixer pass.
+
 **A6 — Protocol composition: Πprm/Πmod is not auto-exchanged online.**
 `aux_proofs.proveWellFormed`/`verifyWellFormed` close audit F1's residuosity
 gap, but they are an out-of-band SETUP artifact — the online
