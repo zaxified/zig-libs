@@ -159,9 +159,14 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
   ciphersuite `voprf` does not build.
 - **Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs to
   the consumer; seam documented above. std has Argon2id when wanted.
-- **The "Fake" credential flow KATs** (C.2): the fake-record response
+- ~~**The "Fake" credential flow KATs** (C.2): the fake-record response
   is a server policy using the same `generateKE2` code path; nothing
-  new to pin.
+  new to pin.~~ **Incorrect, fixed 2026-09-10** (A1/opaque.md L3): C.2.1
+  (ristretto255) runs and is pinned (`kat_test.zig`) — it is the only
+  vector in this suite exercising the §6.3.2.2 user-enumeration defense
+  end-to-end, which C.1's "Real" vectors structurally cannot (there is no
+  missing registered record in a Real vector). C.2.2/C.2.3 (other
+  ciphersuites) remain out of scope per the point above.
 - **HMQV / SIGMA-I instantiations** (Appendix B): sketches only in the
   RFC, no vectors, no consumer.
 - **`randomized_password` backup login** (§10.13): storage-side

@@ -65,6 +65,8 @@ the server ever seeing a password, plus the client-side `export_key`
 for encrypting user vault material).
 
 **Status: complete.** Registration and login/AKE flows implemented and
-KAT-validated byte-exact against RFC 9807 Appendix C.1.1 + C.1.2
-(11/11 tests, Debug + ReleaseFast). See `SPEC.md` for the threat model
+KAT-validated byte-exact against RFC 9807 Appendix C.1.1 + C.1.2, plus
+the C.2.1 fake-credential-response vector (21/21 tests, Debug +
+ReleaseFast — A1/opaque.md L5: this count drifted from the suite after
+`cc73521` and was never updated). See `SPEC.md` for the threat model
 and the 3DH schedule notes.

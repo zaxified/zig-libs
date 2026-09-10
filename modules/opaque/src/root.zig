@@ -103,10 +103,20 @@
 //!   after all checks pass).
 //! - The "Fake" credential-response flow for unregistered users
 //!   (§6.3.2.2) is a server-side POLICY built on this API: keep one
-//!   fake `RegistrationRecord` (random `client_public_key` +
+//!   fake `RegistrationRecord` (a randomly generated **public key** +
 //!   `masking_key`, all-zero envelope) and call `generateKE2` with it;
-//!   nothing extra is needed from this module. Not KAT'd here (the
-//!   C.2 fake vectors add no new code path).
+//!   nothing extra is needed from this module. ⚠ "Randomly generated
+//!   public key" is NOT 32 uniformly random bytes reinterpreted as
+//!   `client_public_key` (A1/opaque.md M1: 93.754% of those are
+//!   rejected by `generateKE2`'s peer-element check as
+//!   `error.InvalidPublicKey`, since ristretto255 only accepts
+//!   canonically-encoded points — a server that builds its one fake
+//!   record that way has nothing valid to send an attacker enumerating
+//!   users, which defeats the whole point of §6.3.2.2). Build it the
+//!   same way any other AKE public key here is built: a random 32-byte
+//!   seed through `deriveAkeKeyPair`, keeping only `.public_key`.
+//!   KAT'd against RFC 9807 Appendix C.2.1 (see the "fake credential
+//!   response" test below).
 //!
 //! Wire sizes (§2/§6.1, ristretto255-SHA-512): Nn = Nseed = 32,
 //! Noe = Nok = Npk = Nsk = 32, Nh = Nm = Nx = 64; KE1 = 96, KE2 = 320,
@@ -268,6 +278,21 @@ pub const RegistrationRecord = struct {
             .envelope = Envelope.fromBytes(bytes[Npk + Nh ..].*),
         };
     }
+
+    /// A1/opaque.md L1: `fromBytes` is pure slicing — a server that stores
+    /// whatever bytes a registering client uploaded, unchecked, only
+    /// discovers a malformed `client_public_key` at the first login
+    /// attempt, as `generateKE2`'s `error.InvalidPublicKey` (via the
+    /// `diffieHellman` DH step). RFC 9807 §5.2.3 does not require the
+    /// server to validate on upload, so this is optional hardening, not a
+    /// conformance requirement — but validating at storage time turns a
+    /// permanently unusable account into an upload-time rejection the
+    /// client can retry from, instead of a login-time failure that looks
+    /// like a wrong password. Checks exactly what `diffieHellman` would
+    /// have checked anyway: canonical ristretto255 encoding.
+    pub fn validate(r: RegistrationRecord) error{InvalidPublicKey}!void {
+        _ = voprf.Element.fromBytes(r.client_public_key) catch return error.InvalidPublicKey;
+    }
 };
 
 /// §6.3.1 `CredentialRequest` (same shape as `RegistrationRequest`).
@@ -424,12 +449,34 @@ fn expandMulti(out: []u8, prk: *const [Nx]u8, info_parts: []const []const u8) vo
 }
 
 /// `I2OSP(len, 2)` (§1.2) — the 2-byte big-endian length prefix used
-/// throughout the envelope MAC and the AKE preamble.
+/// throughout the envelope MAC and the AKE preamble. Callers MUST check
+/// `len <= 0xffff` first (`checkI2ospLen`/`checkIdentities`) — an
+/// application-supplied identity or context past that bound reaches here
+/// only in ReleaseFast, where the assert below compiles out and the
+/// length silently wraps mod 65536 (A1/opaque.md M2).
 fn i2osp2(len: usize) [2]u8 {
     std.debug.assert(len <= 0xffff);
     var out: [2]u8 = undefined;
     std.mem.writeInt(u16, &out, @intCast(len), .big);
     return out;
+}
+
+/// A1/opaque.md M2: `identities.client`/`.server` and `context` are
+/// application-controlled byte strings with no documented or enforced
+/// bound, fed to `i2osp2` wherever the envelope MAC or the AKE transcript
+/// binds them (`envelopeAuthTag`, `runKeySchedule`). Past `0xffff` bytes,
+/// `i2osp2`'s length prefix is no longer injective: `debug.assert`
+/// panics in Debug/ReleaseSafe, and in ReleaseFast the length silently
+/// wraps mod 65536, so two DIFFERENT (identity, context) pairs can
+/// serialize to the IDENTICAL preamble and collide on the tag/transcript
+/// they are meant to bind apart. Checked once, at every public entry
+/// point that accepts these values, before anything derived from them is
+/// computed — 0 consumers in this repo, so a new rejection of input that
+/// used to panic or silently misbehave is P1 hardening, not a decision.
+fn checkIdentities(identities: Identities, context: []const u8) error{IdentityTooLong}!void {
+    if (identities.client) |s| if (s.len > 0xffff) return error.IdentityTooLong;
+    if (identities.server) |s| if (s.len > 0xffff) return error.IdentityTooLong;
+    if (context.len > 0xffff) return error.IdentityTooLong;
 }
 
 // ── key derivation (§4.1.1, §6.4.1.1) ────────────────────────────────────
@@ -553,7 +600,14 @@ fn store(
     var seed: [Nseed]u8 = undefined;
     defer std.crypto.secureZero(u8, &seed);
     expandMulti(&seed, randomized_password, &.{ &envelope_nonce, "PrivateKey" });
-    const kp = try deriveAkeKeyPair(seed);
+    // A1/opaque.md H2: `kp.private_key` is the client's long-term AKE
+    // private key, deterministic in (password, user) — whoever recovers it
+    // once owns the account forever, even across server key rotation. It
+    // never leaves this function (only `kp.public_key` is returned), so
+    // zeroing it here is free and closes exactly the stack residue the
+    // audit's `stackscan` probe measured.
+    var kp = try deriveAkeKeyPair(seed);
+    defer std.crypto.secureZero(u8, &kp.private_key);
 
     const server_identity = identities.server orelse &server_public_key;
     const client_identity = identities.client orelse &kp.public_key;
@@ -634,7 +688,9 @@ pub fn createRegistrationResponse(
     credential_identifier: []const u8,
     oprf_seed: [Nh]u8,
 ) CreateRegistrationResponseError!RegistrationResponse {
-    const oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
+    // A1/opaque.md H2: per-client OPRF key, never returned to the caller.
+    var oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
+    defer std.crypto.secureZero(u8, &oprf_key);
     const blinded = voprf.Element.fromBytes(request.blinded_message) catch return error.InvalidMessage;
     const evaluated = voprf.blindEvaluate(oprf_key, blinded);
     return .{
@@ -643,7 +699,7 @@ pub fn createRegistrationResponse(
     };
 }
 
-pub const FinalizeRegistrationError = error{ InvalidMessage, InvalidBlind, DeriveKeyPairFailed };
+pub const FinalizeRegistrationError = error{ InvalidMessage, InvalidBlind, DeriveKeyPairFailed, IdentityTooLong };
 
 pub const FinalizeRegistrationResult = struct {
     /// The `RegistrationRecord` to send to the server (§5.1
@@ -666,6 +722,7 @@ pub fn finalizeRegistrationRequest(
     identities: Identities,
     envelope_nonce: [Nn]u8,
 ) FinalizeRegistrationError!FinalizeRegistrationResult {
+    try checkIdentities(identities, "");
     var rp = try randomizedPassword(password, blind, response.evaluated_message);
     defer std.crypto.secureZero(u8, &rp);
     const stored = try store(&rp, response.server_public_key, identities, envelope_nonce);
@@ -735,7 +792,7 @@ pub fn generateKE1(
     } };
 }
 
-pub const GenerateKE2Error = error{ InvalidMessage, InvalidPublicKey, DeriveKeyPairFailed, InvalidSecretKey };
+pub const GenerateKE2Error = error{ InvalidMessage, InvalidPublicKey, DeriveKeyPairFailed, InvalidSecretKey, IdentityTooLong };
 
 pub const GenerateKE2Result = struct {
     ke2: KE2,
@@ -762,8 +819,11 @@ pub fn generateKE2(
     server_nonce: [Nn]u8,
     server_keyshare_seed: [Nseed]u8,
 ) GenerateKE2Error!GenerateKE2Result {
+    try checkIdentities(identities, context);
     // §6.3.2.2 CreateCredentialResponse.
-    const oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
+    // A1/opaque.md H2: per-client OPRF key, never returned to the caller.
+    var oprf_key = try deriveOprfKey(oprf_seed, credential_identifier);
+    defer std.crypto.secureZero(u8, &oprf_key);
     const blinded = voprf.Element.fromBytes(ke1.credential_request.blinded_message) catch
         return error.InvalidMessage;
     const evaluated = voprf.blindEvaluate(oprf_key, blinded);
@@ -779,7 +839,11 @@ pub fn generateKE2(
     };
 
     // §6.4.4 AuthServerRespond.
-    const keyshare = try deriveAkeKeyPair(server_keyshare_seed);
+    // A1/opaque.md H2: the server's ephemeral keyshare private key; only
+    // `keyshare.public_key` (below) and the DH outputs it feeds (already
+    // zeroed via `ikm`) leave this function.
+    var keyshare = try deriveAkeKeyPair(server_keyshare_seed);
+    defer std.crypto.secureZero(u8, &keyshare.private_key);
     const dh1 = try diffieHellman(keyshare.private_key, ke1.auth_request.client_public_keyshare);
     const dh2 = try diffieHellman(server_private_key, ke1.auth_request.client_public_keyshare);
     const dh3 = try diffieHellman(keyshare.private_key, record.client_public_key);
@@ -821,6 +885,7 @@ pub const GenerateKE3Error = error{
     InvalidPublicKey,
     EnvelopeRecovery,
     ServerAuthentication,
+    IdentityTooLong,
 };
 
 pub const GenerateKE3Result = struct {
@@ -846,6 +911,7 @@ pub fn generateKE3(
     context: []const u8,
     ke2: KE2,
 ) GenerateKE3Error!GenerateKE3Result {
+    try checkIdentities(identities, context);
     // §6.3.2.3 RecoverCredentials.
     var rp = try randomizedPassword(state.password, state.blind, ke2.credential_response.evaluated_message);
     defer std.crypto.secureZero(u8, &rp);
@@ -858,11 +924,20 @@ pub fn generateKE3(
     const server_public_key: [Npk]u8 = plaintext[0..Npk].*;
     const envelope = Envelope.fromBytes(plaintext[Npk..].*);
 
-    const credentials = try recover(&rp, server_public_key, envelope, identities);
+    // A1/opaque.md H2: the client's long-term AKE private key, statically
+    // derived from (password, user) — see the identical note in `store`.
+    var credentials = try recover(&rp, server_public_key, envelope, identities);
+    defer std.crypto.secureZero(u8, &credentials.client_private_key);
 
     // §6.4.3 AuthClientFinalize.
-    const dh1 = try diffieHellman(state.client_secret, ke2.auth_response.server_public_keyshare);
-    const dh2 = try diffieHellman(state.client_secret, server_public_key);
+    // A1/opaque.md H2: `state` is a by-value parameter, so this is already
+    // a local copy distinct from whatever the caller holds — zeroing it
+    // here is scoped to this function's own stack frame, the same scope
+    // the audit's `stackscan` probe measured.
+    var client_secret = state.client_secret;
+    defer std.crypto.secureZero(u8, &client_secret);
+    const dh1 = try diffieHellman(client_secret, ke2.auth_response.server_public_keyshare);
+    const dh2 = try diffieHellman(client_secret, server_public_key);
     const dh3 = try diffieHellman(credentials.client_private_key, ke2.auth_response.server_public_keyshare);
     var ikm = dh1 ++ dh2 ++ dh3;
     defer std.crypto.secureZero(u8, &ikm);
