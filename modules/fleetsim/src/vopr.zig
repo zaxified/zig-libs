@@ -825,6 +825,45 @@ test "vopr: a reply naming transaction id 0 trips UnknownTransaction" {
     try testing.expectEqual(Violation.UnknownTransaction, v);
 }
 
+test "vopr: a stale poll-timer chain from before a crash+restart cannot double the poll rate" {
+    // F-G item 1: the `timer_id != self.gen` guard at the top of `onTimer`.
+    // A crash does not remove a node's already-queued timer from netsim's
+    // heap — `sim.zig`'s `.timer` case only checks `crashed` at FIRE time —
+    // so a restart landing strictly before that timer's own fire time
+    // leaves it still queued. When it eventually fires, the guard is the
+    // only thing that tells it apart from the new chain the restart's
+    // `onStart` started. Without it, the stale timer's own body reads the
+    // CURRENT `self.gen` (already bumped by the restart) to reschedule
+    // itself, so it does not die — it becomes a second poll chain running
+    // 10ms out of phase with the real one, permanently doubling the rate.
+    const gpa = testing.allocator;
+
+    // t=0 onStart: gen=1, timer(0,1) fires -> onTimer reschedules
+    // timer(20,1). Crash at t=5 (before that fires); restart at t=10
+    // (still before t=20) leaves the stale timer(20,1) queued when node 0
+    // revives with gen=2.
+    var h = Harness.init(gpa, .{ .fleet_seed = 7 });
+    defer h.deinit();
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 5, .kind = .{ .crash_node = .{ .node = master } } },
+        .{ .time = 10, .kind = .{ .restart_node = .{ .node = master } } },
+    };
+    const r = try netsim.replay(gpa, h.case(0, 200), &trace, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+
+    // Same seeds, no fault: the reference poll count for an undisturbed
+    // chain over the same window.
+    var clean = Harness.init(gpa, .{ .fleet_seed = 7 });
+    defer clean.deinit();
+    const rc = try netsim.replay(gpa, clean.case(0, 200), &.{}, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, rc.outcome);
+
+    // Guarded: the crash+restart run's poll count tracks clean's (the
+    // restart's own immediate timer merely shifts the phase by 10ms, it
+    // does not add a second chain). A small slop covers that shift.
+    try testing.expect(h.polls <= clean.polls + 2);
+}
+
 test "vopr: a byte count that disagrees with the read size trips MalformedReply" {
     // F-G item 3: `length_counts_retransmit` trips the FRAME-length check
     // (`n != payload.len`, one guard up) before this one is ever reached — so
