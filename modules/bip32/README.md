@@ -16,7 +16,7 @@ design and threat model.
 | `wordlist.zig` | The official 2048-word BIP-39 English wordlist |
 | `bip39.zig` | `entropyToMnemonic`, `mnemonicToEntropy`, `validateMnemonic`, `mnemonicToSeed` |
 | `bip32.zig` | `masterFromSeed`, `ckdPriv`/`ckdPub`, `neuter`, `serializePriv`/`serializePub`/`parseExtended`, `parsePath`/`derivePath` |
-| `bip32_vectors.zig` | BIP-32 official Test Vectors 1/2/3/5, embedded |
+| `bip32_vectors.zig` | BIP-32 official Test Vectors 1/2/3/4/5, embedded |
 | `bip39_vectors.zig` | BIP-39 official Trezor English test vectors, embedded |
 | `kat_test.zig` | Full KAT assertions across both specs, incl. the BIP-39→BIP-32 seed→master-xprv seam |
 
@@ -92,10 +92,10 @@ zig build test-bip32 -Doptimize=ReleaseFast # ReleaseFast
 zig fmt --check modules/bip32/
 ```
 
-BIP-32 official Test Vectors 1/2/3 (`bip32_vectors.zig`): every chain
+BIP-32 official Test Vectors 1/2/3/4 (`bip32_vectors.zig`): every chain
 link's xprv AND xpub asserted byte-exact against the published strings,
 covering hardened + normal derivation and leading-zero-byte retention.
-Test Vector 5 (13 invalid extended keys) all rejected. BIP-39 official
+Test Vector 5 (16 invalid extended keys) all rejected. BIP-39 official
 Trezor vectors (24 English, `bip39_vectors.zig`): entropy → mnemonic →
 seed (passphrase `"TREZOR"`) → BIP-32 master xprv, every step byte-exact,
 including a round-trip back to entropy and a checksum-tamper positive

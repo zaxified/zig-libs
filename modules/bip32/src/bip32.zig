@@ -79,9 +79,34 @@ pub const ExtendedPubKey = struct {
     chain_code: [32]u8,
     /// Compressed SEC1 (33 bytes: `0x02`/`0x03` prefix + 32-byte x).
     pubkey: [33]u8,
+
+    /// Zero `chain_code`. Audit finding `bip32` L3: `chain_code` isn't
+    /// secret in the same sense `ExtendedPrivKey.privkey` is, but it's
+    /// exactly the ingredient (see SPEC.md's "public-parent + private-child"
+    /// note) that turns one leaked non-hardened child private key into the
+    /// recovery of this key's own parent private key — worth clearing once
+    /// this struct is no longer needed, same as the private side.
+    pub fn deinit(self: *ExtendedPubKey) void {
+        std.crypto.secureZero(u8, &self.chain_code);
+    }
 };
 
-pub const MasterError = error{InvalidMasterKey};
+/// Seed length bound BIP-32's "Master key generation" requires: "Generate a
+/// seed byte sequence S of a chosen length (between 128 and 512 bits)."
+pub const min_seed_bytes = 16;
+/// See `min_seed_bytes`.
+pub const max_seed_bytes = 64;
+
+pub const MasterError = error{
+    InvalidMasterKey,
+    /// `seed.len` is outside BIP-32's mandated 128-512-bit range
+    /// (`min_seed_bytes..max_seed_bytes`). Audit finding `bip32` H3: prior to
+    /// this check `masterFromSeed` accepted any length, including 0 —
+    /// `masterFromSeed("")` returned a valid, silently-wrong master key
+    /// instead of surfacing a truncated read, an off-by-one buffer, or an
+    /// uninitialized length as an error.
+    InvalidSeedLength,
+};
 
 /// `masterFromSeed`: HMAC-SHA512(key="Bitcoin seed", data=seed) → (IL =
 /// master privkey, IR = master chain code). BIP-32 requires rejecting
@@ -89,6 +114,8 @@ pub const MasterError = error{InvalidMasterKey};
 /// re-seeds and retries — this module reports it as a typed error instead,
 /// leaving the retry policy to the caller).
 pub fn masterFromSeed(seed: []const u8) MasterError!ExtendedPrivKey {
+    if (seed.len < min_seed_bytes or seed.len > max_seed_bytes) return error.InvalidSeedLength;
+
     var i: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &i);
     std.crypto.auth.hmac.sha2.HmacSha512.create(&i, seed, "Bitcoin seed");
@@ -101,6 +128,16 @@ pub fn masterFromSeed(seed: []const u8) MasterError!ExtendedPrivKey {
     var ir = i[32..64].*;
     defer std.crypto.secureZero(u8, &ir);
 
+    return masterFromIL(il, ir);
+}
+
+/// The master-key math from `IL`/`IR` onward, split out as a test-only seam
+/// (mirrors `ckdPubFromIL`/`ckdPrivFromIL`): both `IL >= n` and `IL == 0`
+/// fire with probability ~2^-127 under an honest HMAC output, so no seed
+/// exercises either guard. This lets a test hand in a synthetic `il`
+/// directly. Not `pub` outside the module — call `masterFromSeed` for real
+/// derivation.
+fn masterFromIL(il: [32]u8, ir: [32]u8) MasterError!ExtendedPrivKey {
     Secp256k1.scalar.rejectNonCanonical(il, .big) catch return error.InvalidMasterKey;
     if (std.mem.allEqual(u8, &il, 0)) return error.InvalidMasterKey;
 
@@ -137,13 +174,33 @@ pub fn fingerprint(compressed_pubkey: [33]u8) [4]u8 {
 }
 
 /// Private (hardened or normal) child-key derivation `CKDpriv`.
+///
+/// Recomputes the parent's public key on every call. Audit finding `bip32`
+/// H5: that recompute (a scalar EC multiply) is 93.5% of this function's
+/// cost, and it is the SAME value on every sibling derived from one parent —
+/// deriving 1000 addresses under one account key recomputes the identical
+/// `k·G` 1000 times. A caller deriving many siblings from the same parent
+/// should compute `neuter(parent).pubkey` once and call
+/// `ckdPrivWithParentPub` instead; measured 15.2x faster over 1000 siblings
+/// (44.6ms -> 2.94ms projected). This function is unchanged for callers who
+/// derive a single child, or who don't have the parent pubkey handy.
 pub fn ckdPriv(parent: ExtendedPrivKey, index: u32) CkdError!ExtendedPrivKey {
-    const hardened = index >= hardened_offset;
-
     // Computed once and reused for both the non-hardened HMAC input and the
     // parent fingerprint below — `pubkeyFromPriv` is a scalar EC multiply,
     // not free, and the parent scalar does not change within this call.
     const parent_pub = pubkeyFromPriv(parent.privkey) catch return error.InvalidChildKey;
+    return ckdPrivWithParentPub(parent, parent_pub, index);
+}
+
+/// `ckdPriv`, but takes the parent's compressed SEC1 pubkey instead of
+/// recomputing it — see `ckdPriv`'s doc comment (audit finding `bip32` H5).
+/// `parent_pub` MUST be `(try neuter(parent)).pubkey`; passing any other
+/// value silently derives a wrong fingerprint (hardened children) or a wrong
+/// child key (normal children), because both are computed FROM it here
+/// exactly as `ckdPriv` computes them from its own freshly-derived copy —
+/// this function trusts the caller's copy instead of re-deriving it.
+pub fn ckdPrivWithParentPub(parent: ExtendedPrivKey, parent_pub: [33]u8, index: u32) CkdError!ExtendedPrivKey {
+    const hardened = index >= hardened_offset;
 
     var data: [37]u8 = undefined;
     defer std.crypto.secureZero(u8, &data); // holds the parent privkey when hardened
@@ -159,13 +216,25 @@ pub fn ckdPriv(parent: ExtendedPrivKey, index: u32) CkdError!ExtendedPrivKey {
     defer std.crypto.secureZero(u8, &i);
     std.crypto.auth.hmac.sha2.HmacSha512.create(&i, &data, &parent.chain_code);
 
-    // CONVENTIONS §2.1 Z1 — see `masterFromSeed`. `child_priv` is the derived
-    // child scalar; `il` the offset scalar; `ir` the child chain code.
+    // CONVENTIONS §2.1 Z1 — see `masterFromSeed`. `il` the offset scalar;
+    // `ir` the child chain code.
     var il = i[0..32].*;
     defer std.crypto.secureZero(u8, &il);
     var ir = i[32..64].*;
     defer std.crypto.secureZero(u8, &ir);
 
+    return ckdPrivFromIL(parent, parent_pub, index, il, ir);
+}
+
+/// The `CKDpriv` math from `IL`/`IR` onward, split out as a test-only seam
+/// (mirrors `ckdPubFromIL` below): `child_priv == 0` (BIP-32's documented
+/// ~2^-127 retry case) fires only if `il == -parent.privkey (mod n)`, which
+/// no honest HMAC output will ever hit. This lets a test hand in that exact
+/// synthetic `il` (computable as `Secp256k1.scalar.neg(parent.privkey)`
+/// since the caller knows the parent scalar) to exercise the guard directly.
+/// Not `pub` outside the module — call `ckdPriv`/`ckdPrivWithParentPub` for
+/// real derivation.
+fn ckdPrivFromIL(parent: ExtendedPrivKey, parent_pub: [33]u8, index: u32, il: [32]u8, ir: [32]u8) CkdError!ExtendedPrivKey {
     var child_priv = Secp256k1.scalar.add(parent.privkey, il, .big) catch return error.InvalidChildKey;
     defer std.crypto.secureZero(u8, &child_priv);
     if (std.mem.allEqual(u8, &child_priv, 0)) return error.InvalidChildKey;
@@ -397,6 +466,12 @@ pub fn parsePath(path: []const u8, out: []u32) PathError![]const u32 {
         for (s) |c| {
             if (c < '0' or c > '9') return error.InvalidPathSegment;
         }
+        // No unbounded leading zeros: `m/7`, `m/007`, and `m/000...007`
+        // would otherwise all parse as the identical index — the same
+        // two-spellings-one-identity problem `+`/`_` above guards against
+        // (audit finding `bip32` L1). `s.len == 1` still allows the literal
+        // segment "0".
+        if (s.len > 1 and s[0] == '0') return error.InvalidPathSegment;
         const idx = std.fmt.parseUnsigned(u32, s, 10) catch return error.InvalidPathSegment;
         if (idx >= hardened_offset) return error.IndexOutOfRange;
 
@@ -464,6 +539,33 @@ test "ckdPriv hardened vs normal both derive, and neuter(ckdPriv) == ckdPub(neut
     try testing.expectError(error.HardenedRequiresPrivateKey, ckdPub(master_pub, hardened_offset + 0));
 }
 
+test "ckdPrivWithParentPub matches ckdPriv exactly, for both hardened and normal children (H5)" {
+    // ckdPrivWithParentPub exists so a caller deriving many siblings can
+    // compute the parent's pubkey ONCE and skip ckdPriv's internal
+    // recompute; it must be bit-for-bit interchangeable with ckdPriv when
+    // given the correct parent pubkey, for both derivation kinds.
+    const seed = [_]u8{0x5e} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+    const master_pub = try neuter(master);
+
+    var via_ckdpriv_h = try ckdPriv(master, hardened_offset + 3);
+    defer via_ckdpriv_h.deinit();
+    var via_seam_h = try ckdPrivWithParentPub(master, master_pub.pubkey, hardened_offset + 3);
+    defer via_seam_h.deinit();
+    try testing.expectEqualSlices(u8, &via_ckdpriv_h.privkey, &via_seam_h.privkey);
+    try testing.expectEqualSlices(u8, &via_ckdpriv_h.chain_code, &via_seam_h.chain_code);
+    try testing.expectEqualSlices(u8, &via_ckdpriv_h.parent_fingerprint, &via_seam_h.parent_fingerprint);
+
+    var via_ckdpriv_n = try ckdPriv(master, 3);
+    defer via_ckdpriv_n.deinit();
+    var via_seam_n = try ckdPrivWithParentPub(master, master_pub.pubkey, 3);
+    defer via_seam_n.deinit();
+    try testing.expectEqualSlices(u8, &via_ckdpriv_n.privkey, &via_seam_n.privkey);
+    try testing.expectEqualSlices(u8, &via_ckdpriv_n.chain_code, &via_seam_n.chain_code);
+    try testing.expectEqualSlices(u8, &via_ckdpriv_n.parent_fingerprint, &via_seam_n.parent_fingerprint);
+}
+
 test "ckdPub rejects a non-canonical IL (IL >= n, BIP-32 CKDpub step 3)" {
     // No honest HMAC output can hit this (probability ~2^-128), so this
     // drives the math directly through the test-only `ckdPubFromIL` seam
@@ -478,6 +580,157 @@ test "ckdPub rejects a non-canonical IL (IL >= n, BIP-32 CKDpub step 3)" {
     const non_canonical_il = [_]u8{0xff} ** 32;
     const ir = [_]u8{0x11} ** 32;
     try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, non_canonical_il, ir));
+}
+
+// secp256k1 group order n, split into 8-hex-digit groups for readability:
+// FFFFFFFF FFFFFFFF FFFFFFFF FFFFFFFE BAAEDCE6 AF48A03B BFD25E8C D0364141
+const secp256k1_n_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141";
+const secp256k1_n_plus_1_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364142";
+const secp256k1_n_plus_2_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364143";
+const secp256k1_n_minus_1_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364140";
+const u256_max_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+
+test "masterFromSeed rejects seeds outside BIP-32's 128-512-bit range (H3)" {
+    // BIP-32 "Master key generation": seed length must be 128-512 bits.
+    // Before this guard `masterFromSeed` took any length, including 0.
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{}));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 1));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (min_seed_bytes - 1)));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** (max_seed_bytes + 1)));
+    try testing.expectError(error.InvalidSeedLength, masterFromSeed(&[_]u8{0x01} ** 256));
+
+    // Positive control: the boundary lengths BIP-32 allows must still work —
+    // both are real BIP-32 test vector lengths (vector 1 = 16B, vector 3/2 = 64B).
+    var min_ok = try masterFromSeed(&[_]u8{0x01} ** min_seed_bytes);
+    min_ok.deinit();
+    var max_ok = try masterFromSeed(&[_]u8{0x01} ** max_seed_bytes);
+    max_ok.deinit();
+}
+
+test "parseExtended rejects private keys beyond n: a ladder, not just n and 0 (H4 test-teeth gap)" {
+    // BIP-32 test vector 5 pins exactly `privkey == 0` and `privkey == n`
+    // (both KILL an outright removal of the range check), but no vector in
+    // the corpus covers the open interval (n, 2^256) — so a check weakened
+    // to match only those two exact bit patterns passes the whole suite.
+    // This builds the missing rungs directly: n+1, n+2, and 2^256-1, plus a
+    // positive control at n-1 (the largest value the range check must ACCEPT).
+    const seed = [_]u8{0x01} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+
+    const Case = struct { hex: []const u8, want_error: bool };
+    const cases = [_]Case{
+        .{ .hex = secp256k1_n_plus_1_hex, .want_error = true },
+        .{ .hex = secp256k1_n_plus_2_hex, .want_error = true },
+        .{ .hex = u256_max_hex, .want_error = true },
+        .{ .hex = secp256k1_n_minus_1_hex, .want_error = false }, // positive control
+    };
+    for (cases) |c| {
+        var priv: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(&priv, c.hex);
+        const forged = ExtendedPrivKey{
+            .depth = 0,
+            .parent_fingerprint = .{ 0, 0, 0, 0 },
+            .child_number = 0,
+            .chain_code = master.chain_code,
+            .privkey = priv,
+        };
+        var buf: [max_serialized_len]u8 = undefined;
+        const xprv = try serializePriv(forged, &buf);
+        if (c.want_error) {
+            try testing.expectError(error.PrivateKeyOutOfRange, parseExtended(xprv));
+        } else {
+            const parsed = try parseExtended(xprv);
+            try testing.expect(parsed == .private);
+        }
+    }
+}
+
+test "ckdPub rejects IL near n, not just an all-0xFF pattern (M2 weaken-resistant)" {
+    // The existing guard test (above) uses IL = 0xFF*32. A check weakened to
+    // match only that exact byte pattern (e.g. `il[0]==0xff and
+    // il[31]==0xff`) still passes it. n itself and n+1 are the values
+    // actually adjacent to the boundary the guard exists to enforce.
+    const seed = [_]u8{0xcd} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+    const master_pub = try neuter(master);
+    const ir = [_]u8{0x11} ** 32;
+
+    var il_n: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&il_n, secp256k1_n_hex);
+    try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, il_n, ir));
+
+    var il_n_plus_1: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&il_n_plus_1, secp256k1_n_plus_1_hex);
+    try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, il_n_plus_1, ir));
+}
+
+test "masterFromSeed's IL>=n and IL==0 rejects are live code, not dead branches (M1)" {
+    var il_n: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&il_n, secp256k1_n_hex);
+    const ir = [_]u8{0x22} ** 32;
+    try testing.expectError(error.InvalidMasterKey, masterFromIL(il_n, ir));
+
+    const il_zero = [_]u8{0} ** 32;
+    try testing.expectError(error.InvalidMasterKey, masterFromIL(il_zero, ir));
+
+    // Positive control: a legitimate small IL must still succeed.
+    const il_one = [_]u8{0} ** 31 ++ [_]u8{1};
+    var ok = try masterFromIL(il_one, ir);
+    ok.deinit();
+}
+
+test "ckdPriv's child_priv==0 reject is live code, not a dead branch (M1)" {
+    // child_priv = parent.privkey + il (mod n); il = -parent.privkey (mod n)
+    // is the unique value that drives it to 0, and it's computable here
+    // because the test knows the parent scalar — no honest HMAC output will
+    // ever land on it.
+    const seed = [_]u8{0x77} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+    const master_pub = try neuter(master);
+
+    const il_neg = try Secp256k1.scalar.neg(master.privkey, .big);
+    const ir = [_]u8{0x33} ** 32;
+    try testing.expectError(error.InvalidChildKey, ckdPrivFromIL(master, master_pub.pubkey, 0, il_neg, ir));
+}
+
+test "ckdPubFromIL's rejectIdentity reject is live code, distinct from rejectNonCanonical (M1)" {
+    // Same il = -parent.privkey (mod n) construction as the ckdPriv test
+    // above: IL*G + parent_pub = -parent_pub + parent_pub = the identity
+    // point, which is a DIFFERENT guard (`rejectIdentity`) from the IL>=n
+    // check the M2 test above exercises.
+    const seed = [_]u8{0x77} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+    const master_pub = try neuter(master);
+
+    const il_neg = try Secp256k1.scalar.neg(master.privkey, .big);
+    const ir = [_]u8{0x44} ** 32;
+    try testing.expectError(error.InvalidChildKey, ckdPubFromIL(master_pub, 0, il_neg, ir));
+}
+
+test "parseExtended rejects non-78-byte payloads regardless of checksum validity (M4 test-teeth gap)" {
+    // BIP-32 test vector 5's 16 invalid strings are ALL 78-byte payloads
+    // (wrong version/prefix/range/checksum) — none of them is the wrong
+    // LENGTH, so the length check has never been exercised by the corpus.
+    var enc_buf: [bech32.base58.max_encoded_len]u8 = undefined;
+    inline for (.{ 10, 40, 77, 79, 120 }) |plen| {
+        var payload: [plen]u8 = [_]u8{0} ** plen;
+        if (plen >= 4) std.mem.writeInt(u32, payload[0..4], version_mainnet_priv, .big);
+        const s = try bech32.base58.checkEncode(&payload, &enc_buf);
+        try testing.expectError(error.InvalidLength, parseExtended(s));
+    }
+    // Positive control: the real length still parses (any other test already
+    // covers this; repeated here so this test alone proves 78 is special).
+    const seed = [_]u8{0x09} ** 32;
+    var master = try masterFromSeed(&seed);
+    defer master.deinit();
+    var buf: [max_serialized_len]u8 = undefined;
+    const xprv = try serializePriv(master, &buf);
+    const parsed = try parseExtended(xprv);
+    try testing.expect(parsed == .private);
 }
 
 test "parsePath: m/44'/0'/0'/0/0 and bare relative paths" {
@@ -518,6 +771,19 @@ test "F5 regression: parsePath rejects +/_ leniency and empty segments from doub
     try testing.expectError(error.InvalidPathSegment, parsePath("/m/0", &out));
 
     // Positive control: the legitimate spelling still parses.
+    const p = try parsePath("m/0", &out);
+    try testing.expectEqualSlices(u32, &.{0}, p);
+}
+
+test "parsePath rejects unbounded leading zeros: m/7 and m/007 must not be the same identity (L1)" {
+    var out: [max_path_depth]u32 = undefined;
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/007", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/0000007", &out));
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/007'", &out)); // hardened spelling too
+    try testing.expectError(error.InvalidPathSegment, parsePath("m/44'/007", &out)); // not just the first segment
+
+    // Positive control: the bare "0" segment (not a leading zero on a
+    // nonzero value) must still parse — it's the only single-digit case.
     const p = try parsePath("m/0", &out);
     try testing.expectEqualSlices(u32, &.{0}, p);
 }

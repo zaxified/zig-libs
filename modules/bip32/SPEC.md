@@ -83,7 +83,7 @@ secp256k1; see [README.md](README.md) for purpose and API.
   child-number" invariant, an unrecognized version (including the two
   "unknown extended key version" `DMwo58...` vectors — accepted by
   `base58.checkDecode`'s checksum but rejected by the version-byte switch),
-  and a bit-flipped checksum (caught by `base58.checkDecode` itself). All 13
+  and a bit-flipped checksum (caught by `base58.checkDecode` itself). All 16
   Test Vector 5 strings are asserted-rejected in `kat_test.zig`.
 - **Derivation paths** (`parsePath`/`derivePath`): `m/44'/0'/0'/0/0`-style
   strings, `'`/`h`/`H` all accepted as the hardened marker (all three appear
@@ -101,15 +101,51 @@ secp256k1; see [README.md](README.md) for purpose and API.
   raw Base58Check-decoded payload in `parseExtended` after the private
   scalar has been copied out) is `secureZero`'d before the owning function
   returns. `ExtendedPrivKey.deinit` zeros the long-lived struct's `privkey`
-  + `chain_code` — call it once a derived key is no longer needed. This
-  module does **not** claim full constant-time hardening against
-  microarchitectural side channels beyond what `k256`'s own field/group/
-  scalar operations already provide (the same posture as this repo's other
-  Bitcoin/Lightning modules riding `k256`); it defends against
-  memory-disclosure-after-use, not power/cache/timing analysis of the CKD
-  control flow itself (e.g. the hardened-vs-normal branch on `index` is
-  public information anyway — the branch reveals nothing beyond what the
-  caller already chose).
+  + `chain_code`; `ExtendedPubKey.deinit` zeros its `chain_code` (see the
+  "public-parent + private-child" note below for why that field, though not
+  itself secret, is worth wiping) — call the relevant one once a derived key
+  is no longer needed. This module does **not** claim full constant-time
+  hardening against microarchitectural side channels beyond what `k256`'s
+  own field/group/scalar operations already provide, and that qualifier
+  matters more here than the phrase "the same posture as this repo's other
+  Bitcoin/Lightning modules riding `k256`" used to suggest: `bip32.zig`'s own
+  CKD control flow (the hardened-vs-normal branch on `index`) is public
+  information anyway, so it costs nothing to leave unhardened — but
+  `bip39.zig`'s mnemonic path calls **no `k256` code at all**. Its
+  wordlist lookup (`wordIndex`, a binary search over the 2048-entry English
+  list) branches and indexes the table on the secret mnemonic word at every
+  step — audited 2026-09-06 at 601 valgrind/memcheck-flagged contexts on
+  `validateMnemonic` alone, none of which is covered by `k256`'s posture,
+  because none of it touches `k256`. `bip32`/`bech32` are also not yet under
+  this repo's ctgrind gate at all (`scripts/ctgrind-expected.tsv` covers 8
+  other modules); adding coverage, and deciding whether `wordIndex` should
+  be made constant-time or the non-constant-time posture simply documented,
+  is deferred past this fix campaign — it needs the full ctgrind lane to
+  verify, not a modtest lane.
+- **BIP-39 checksum comparison: constant iteration count, not a constant-time
+  proof**: `mnemonicToEntropy` used to return `error.InvalidChecksum` as soon
+  as it found a mismatching checksum bit, so the number of loop iterations
+  executed leaked how many of the candidate phrase's leading checksum bits
+  agreed with the real one — bit-by-bit feedback on a 24-word phrase's 8-bit
+  checksum instead of one 1-in-256 result, against an interface
+  (recovery-phrase validation) users are routinely invited to run on
+  attacker-influenced input. The comparison now XORs every bit into an
+  accumulator and checks it once after the loop, so the loop always runs
+  `cs_bits` iterations regardless of where a mismatch is. That closes the
+  iteration-COUNT oracle this finding named; it is not by itself a proof
+  that the compiled code takes uniform time — that needs the same ctgrind
+  coverage the `wordIndex` note above is deferring.
+- **A watch-only `xpub` plus ONE leaked non-hardened child private key
+  recovers the PARENT private key** — this is a property of BIP-32 itself,
+  not an implementation defect (`k_parent = k_child − HMAC(chain_code,
+  ser_P(pubkey_parent) ‖ index)[0..32] mod n`, computable from public data
+  plus that one child scalar), and it is the entire reason BIP-44 hardens
+  the first three path levels (`m/44'/0'/0'`). `parsePath` does not enforce
+  any BIP-44 purpose-field policy (see below) and will happily parse
+  `m/44/0/0/0/0` with no hardened segments at all — a caller that exports an
+  `xpub` for watch-only use from a non-hardened branch, and later has any
+  single descendant private key exposed, has exposed every private key
+  under that `xpub`.
 - **Unicode normalization not implemented**: BIP-39 mandates NFKD
   normalization of both the mnemonic and the passphrase before PBKDF2. The
   English wordlist is pure ASCII, where NFKD is the identity — so this is a
@@ -127,14 +163,14 @@ secp256k1; see [README.md](README.md) for purpose and API.
 
 ## Verification
 
-- **BIP-32 official Test Vectors 1, 2, 3** (`bip32_vectors.zig`, from
+- **BIP-32 official Test Vectors 1, 2, 3, 4** (`bip32_vectors.zig`, from
   `bitcoin/bips/bip-0032.mediawiki`): every chain link's serialized xprv
   AND xpub asserted byte-exact against the published strings, covering
   hardened derivation (`0'`), normal derivation, a large index
   (`2147483647'`, the max hardened index), and leading-zero-byte retention
   (Test Vector 3). CKDpub/CKDpriv cross-agreement is additionally checked at
   every non-hardened step.
-- **BIP-32 official Test Vector 5** (13 invalid extended keys): every one
+- **BIP-32 official Test Vector 5** (16 invalid extended keys): every one
   rejected by `parseExtended`.
 - **BIP-39 official Trezor test vectors** (24 English vectors,
   `bip39_vectors.zig`, from `trezor/python-mnemonic`'s `vectors.json`):

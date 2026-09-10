@@ -85,7 +85,18 @@ pub fn entropyToMnemonic(entropy: []const u8, out: []u8) Error![]const u8 {
 pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
     var idxs: [max_words]u11 = undefined;
     var count: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, mnemonic, ' ');
+    // `splitScalar`, not `tokenizeScalar`: tokenize silently collapses
+    // consecutive/leading/trailing separators, so a doubled space, a leading
+    // space or a trailing space would parse as the SAME word sequence as the
+    // canonical spelling — while `mnemonicToSeed` below hashes the raw bytes
+    // of whatever text it is given, unmodified. Two different ideas of "the
+    // phrase" from the same input silently produced two different wallets
+    // (audit finding `bip32` H1, 2026-09-06). An empty segment is not a
+    // wordlist entry, so `wordIndex("")` already refuses it below — this is
+    // the same non-canonical-spelling defense `parsePath` already applies
+    // (wave-2 finding F5): a derivation path and a mnemonic are both an
+    // identity, and two spellings must not map to two different keys.
+    var it = std.mem.splitScalar(u8, mnemonic, ' ');
     while (it.next()) |w| {
         if (count >= max_words) return error.InvalidWordCount;
         idxs[count] = wordIndex(w) orelse return error.WordNotInList;
@@ -113,13 +124,28 @@ pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
 
     var checksum: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(out[0..ent_bytes], &checksum, .{});
+    // Audit finding `bip32` M9: an early `return` on the first mismatching
+    // bit makes the number of loop iterations a function of how many
+    // LEADING checksum bits the candidate phrase got right — a caller who
+    // can time `mnemonicToEntropy`/`validateMnemonic` gets bit-by-bit
+    // feedback on an up-to-8-bit checksum instead of one 1-in-256 answer.
+    // Every bit is now compared unconditionally and OR-accumulated into
+    // `mismatch`, so the loop always runs `cs_bits` iterations regardless of
+    // where (or whether) a mismatch occurs; only the verdict after the loop
+    // depends on the accumulated result. This does not by itself constitute
+    // a constant-TIME proof (compiler/microarchitecture behavior is out of
+    // scope here, same caveat as the module's overall posture — see
+    // SPEC.md), only a constant iteration COUNT, which is what this finding
+    // named.
+    var mismatch: u1 = 0;
     var cbit: usize = 0;
     while (cbit < cs_bits) : (cbit += 1) {
         const abs_bit = ent_bits + cbit;
         const mnemonic_bit = wordBit(idxs[abs_bit / 11], abs_bit % 11);
         const checksum_bit: u1 = @truncate(checksum[cbit / 8] >> @intCast(7 - (cbit % 8)));
-        if (mnemonic_bit != checksum_bit) return error.InvalidChecksum;
+        mismatch |= mnemonic_bit ^ checksum_bit;
     }
+    if (mismatch != 0) return error.InvalidChecksum;
     return out[0..ent_bytes];
 }
 
@@ -127,6 +153,14 @@ pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
 /// returning the entropy.
 pub fn validateMnemonic(mnemonic: []const u8) Error!void {
     var buf: [max_entropy_bytes]u8 = undefined;
+    // CONVENTIONS §2.1 Z1 / audit finding `bip32` H2: `buf` holds the
+    // reconstructed BIP-39 entropy — the value the whole key tree is
+    // regenerated from, i.e. the wallet itself — even though this function
+    // only reports validity and never returns it. The module's own doc
+    // comment (`root.zig`) claims every stack buffer holding private-key-
+    // derived bytes is wiped; this one was not. `defer` runs whether
+    // `mnemonicToEntropy` succeeds or returns an error.
+    defer std.crypto.secureZero(u8, &buf);
     _ = try mnemonicToEntropy(mnemonic, &buf);
 }
 
@@ -262,6 +296,93 @@ test "mnemonicToEntropy rejects wrong word count and unknown words" {
         "notaword abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         &buf,
     ));
+}
+
+test "mnemonicToEntropy/validateMnemonic reject non-canonical spacing (H1: two spellings, two wallets)" {
+    // Before this fix, `validateMnemonic` (`tokenizeScalar`, which silently
+    // collapses runs of the separator) said OK to all four spellings below
+    // while `mnemonicToSeed` hashes the raw bytes of whatever text it's
+    // given — so each spelling produced a DIFFERENT master seed. A user who
+    // introduces a doubled or trailing space while copying a backup phrase
+    // got a silently wrong, empty wallet instead of a rejection.
+    const canonical = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    var canonical_buf: [max_entropy_bytes]u8 = undefined;
+    const canonical_entropy = try mnemonicToEntropy(canonical, &canonical_buf);
+    try validateMnemonic(canonical);
+
+    var scratch: [max_entropy_bytes]u8 = undefined;
+    // Variant 1: a doubled interior space.
+    try testing.expectError(error.WordNotInList, mnemonicToEntropy(
+        "abandon  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        &scratch,
+    ));
+    // Variant 2: a leading space.
+    try testing.expectError(error.WordNotInList, mnemonicToEntropy(
+        " abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+        &scratch,
+    ));
+    // Variant 3: a trailing space.
+    try testing.expectError(error.WordNotInList, mnemonicToEntropy(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about ",
+        &scratch,
+    ));
+    try testing.expectError(error.WordNotInList, validateMnemonic(
+        "abandon  abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    ));
+
+    // Positive control: the canonical spelling is unaffected.
+    var recheck_buf: [max_entropy_bytes]u8 = undefined;
+    try testing.expectEqualSlices(u8, canonical_entropy, try mnemonicToEntropy(canonical, &recheck_buf));
+}
+
+test "mnemonicToEntropy bounds word count against idxs[24] (M3)" {
+    // The only guard between attacker-chosen mnemonic text and a write past
+    // the 24-entry `idxs` array; BIP-39's own vectors never exceed 24 words,
+    // so this path had no test at all.
+    var word_buf: [512]u8 = undefined;
+    const counts = [_]usize{ 25, 30, 48, 60 };
+    for (counts) |n| {
+        var len: usize = 0;
+        for (0..n) |i| {
+            if (i > 0) {
+                word_buf[len] = ' ';
+                len += 1;
+            }
+            @memcpy(word_buf[len..][0..7], "abandon");
+            len += 7;
+        }
+        var buf: [max_entropy_bytes]u8 = undefined;
+        try testing.expectError(error.InvalidWordCount, mnemonicToEntropy(word_buf[0..len], &buf));
+    }
+}
+
+test "mnemonicToEntropy/entropyToMnemonic reject interior invalid counts and lengths, not just edges (M7)" {
+    // The existing edge tests (15/33 bytes, 3 words) only prove the two
+    // extremes are rejected; BIP-39 also excludes every value BETWEEN its
+    // five legal word counts / five legal entropy lengths, and nothing
+    // exercised those.
+    var buf: [max_entropy_bytes]u8 = undefined;
+    const bad_counts = [_]usize{ 13, 14, 16, 17, 19, 20, 22, 23 };
+    var word_buf: [256]u8 = undefined;
+    for (bad_counts) |n| {
+        var len: usize = 0;
+        for (0..n) |i| {
+            if (i > 0) {
+                word_buf[len] = ' ';
+                len += 1;
+            }
+            @memcpy(word_buf[len..][0..7], "abandon");
+            len += 7;
+        }
+        try testing.expectError(error.InvalidWordCount, mnemonicToEntropy(word_buf[0..len], &buf));
+    }
+
+    var out: [max_mnemonic_len]u8 = undefined;
+    const bad_ent_lens = [_]usize{ 17, 18, 19, 21, 23, 25, 27, 29, 31 };
+    for (bad_ent_lens) |elen| {
+        const ent_buf: [max_entropy_bytes]u8 = [_]u8{0} ** max_entropy_bytes;
+        try testing.expectError(error.InvalidEntropyLength, entropyToMnemonic(ent_buf[0..elen], &out));
+    }
 }
 
 test "mnemonicToSeed matches a hand-computed PBKDF2-HMAC-SHA512 call" {

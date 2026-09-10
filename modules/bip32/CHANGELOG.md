@@ -5,6 +5,61 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign: closed 19 of the 21 findings from the 2026-09-06
+  audit (`H1`-`H5`, `M1`-`M5`, `M7`-`M9`, `L1`-`L6`), each with a RED-before/GREEN-after
+  `scripts/modtest bip32` run. Highlights:
+  - **H1** `mnemonicToEntropy`/`validateMnemonic` used `tokenizeScalar`, which silently
+    collapses doubled/leading/trailing spaces, while `mnemonicToSeed` hashes the raw
+    bytes unmodified — so a doubled space produced the SAME "valid" verdict but a
+    DIFFERENT master seed. Now `splitScalar`, matching `parsePath`'s existing
+    two-spellings-one-identity defense (wave-2 finding F5).
+  - **H2** `validateMnemonic`'s own entropy buffer was never wiped, contradicting the
+    module's own zeroization doc comment. Now `defer secureZero`s it (measured: dead-stack
+    hits for the entropy pattern 3x -> 2x; two residual copies come from
+    `mnemonicToEntropy`'s own internal `idxs`/checksum buffers, a distinct, still-open gap).
+  - **H3** `masterFromSeed` had no seed-length bound; BIP-32 requires 128-512 bits.
+    New `error.InvalidSeedLength` (additive, module has 0 consumers).
+  - **H4** the `xprv` private-key range check was tested only at the exact bit patterns
+    of BIP-32 vector 5 (`0` and `n`); a weakened check matching just those two survived
+    the whole suite. New ladder tests at `n+1`/`n+2`/`2^256-1`.
+  - **H5** `ckdPriv` recomputed the parent's `k·G` on every call — 93.5% of its cost, and
+    identical across every sibling. New additive `ckdPrivWithParentPub(parent, parent_pub,
+    index)` lets a caller deriving many siblings compute the parent pubkey once. Measured
+    1000-sibling scan: 44.4ms -> 2.2ms (**20x**).
+  - **M1** four BIP-32-mandated reject branches (`masterFromSeed`'s `IL>=n`/`IL==0`,
+    `ckdPriv`'s `child_priv==0`, `ckdPubFromIL`'s identity-point reject) had zero tests;
+    all four SURVIVED direct mutation. New test-only seams (`masterFromIL`,
+    `ckdPrivFromIL`, mirroring the existing `ckdPubFromIL`) let tests drive each guard
+    with the exact synthetic `IL` that triggers it.
+  - **M2** the `ckdPubFromIL` non-canonical-`IL` test used a single value (`0xFF*32`); a
+    check weakened to match only that exact pattern survived. New tests at `n`/`n+1`.
+  - **M3**/**M4** the `idxs[24]` word-count bound and the 78-byte `parseExtended` length
+    check were untested; removing either SURVIVED the suite in Debug and caused an
+    out-of-bounds read/panic under mutation. New tests for both.
+  - **M5** already fixed 2026-09-07/08 (commits `93b87087`, `e816a729`): both fuzz
+    harnesses now actually read their input.
+  - **M7** added interior-invalid-value tests (word counts 13-23, entropy lengths 17-31)
+    alongside the existing edge-only tests.
+  - **M8** documented the "watch-only `xpub` + one leaked non-hardened child privkey
+    recovers the parent privkey" property in `SPEC.md` (a BIP-32 property, not a defect —
+    it's why BIP-44 hardens the first three path levels). `ExtendedPubKey.deinit` now
+    zeros `chain_code` (also closes **L3**).
+  - **M9** the BIP-39 checksum comparison exited on the first mismatching bit, leaking
+    how many leading bits matched. Now accumulates all bits via XOR/OR before checking
+    once, so the loop always runs `cs_bits` iterations (closes the iteration-count oracle;
+    not itself a constant-time proof — deferred to the ctgrind campaign along with **M6**).
+  - **L1** `parsePath` accepted unbounded leading zeros (`m/007` == `m/7`); now rejected,
+    matching the `+`/`_` leniency guard already there.
+  - **L2** `SPEC.md`/`README.md` said "13 invalid" / vectors "1/2/3/5"; corrected to the
+    actual 16 / "1/2/3/4/5".
+  - **L4**/**L5**/**L6** verified and closed with no module-level action: L4 (PBKDF2 vs
+    OpenSSL) and L6 (`base58.digitValue`) are `std`/`bech32` concerns, not `bip32`'s own
+    code; L5's "at parity" claim was in an old, separate audit ledger, not in this
+    module's own docs.
+  - **M6** (ctgrind coverage) and **L7** (testnet version bytes, an API-changing decision)
+    left open — see `A1/bip32.md`'s Dispozice section.
+  `scripts/modtest bip32`: 40/40 (Debug and ReleaseFast).
+
 - **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
   changed. `src/bip32_vectors.zig` and `src/bip39_vectors.zig` had both carried "see
   NOTICE / SPEC.md for provenance" in their own headers while `modules/bip32/NOTICE` did
