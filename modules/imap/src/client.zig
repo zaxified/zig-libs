@@ -34,6 +34,7 @@ const testing = std.testing;
 const command = @import("command.zig");
 const fetchmod = @import("fetch.zig");
 const searchmod = @import("search.zig");
+const listmod = @import("list.zig");
 const response = @import("response.zig");
 const wire = @import("wire.zig");
 
@@ -643,6 +644,126 @@ pub const Client = struct {
                 },
                 .data => |d| switch (d) {
                     .search, .esearch => |r| result = r,
+                    else => try c.handleData(d),
+                },
+            }
+        }
+    }
+
+    // ── LIST / LSUB / STATUS ────────────────────────────────────────────────
+    //
+    // Audit A1 F6: none of these three had a client method at all -- see
+    // list.zig's module comment. `reference`/`pattern` follow RFC 9051
+    // §6.3.9/§6.3.10's basic (non-extended) form; results are collected into
+    // `out_gpa` for the same reason `fetchMessages`/`searchMessages` do --
+    // the session arena is reset every response line and these commands can
+    // span many of them.
+
+    /// `LIST`, collecting every `* LIST` reply into `out_gpa`.
+    pub fn listMailboxes(
+        c: *Client,
+        out_gpa: Allocator,
+        reference: []const u8,
+        pattern: []const u8,
+    ) Error![]const listmod.Entry {
+        c.arm();
+        if (c.state != .authenticated and c.state != .selected) return error.BadState;
+
+        const tag = try c.tagger.next(c.gpa);
+        defer c.gpa.free(tag);
+        listmod.encodeList(&c.enc, tag, reference, pattern) catch |e| return c.unmask(e);
+        c.enc.w.flush() catch return error.WriteFailed;
+
+        var out: std.ArrayList(listmod.Entry) = .empty;
+        errdefer out.deinit(out_gpa);
+
+        while (true) {
+            c.rd.d.gpa = out_gpa;
+            const resp = c.rd.next() catch |e| return e;
+            switch (resp) {
+                .continuation => return error.NoContinuation,
+                .tagged => |t| {
+                    if (!std.mem.eql(u8, t.tag, tag)) return error.UnknownTag;
+                    try c.absorbCode(t.status.code);
+                    if (t.status.type != .ok) return error.CommandFailed;
+                    return out.toOwnedSlice(out_gpa);
+                },
+                .data => |d| switch (d) {
+                    .list => |entry| try out.append(out_gpa, entry),
+                    else => try c.handleData(d),
+                },
+            }
+        }
+    }
+
+    /// `LSUB` — same shape as `listMailboxes`, subscribed mailboxes only.
+    pub fn lsubMailboxes(
+        c: *Client,
+        out_gpa: Allocator,
+        reference: []const u8,
+        pattern: []const u8,
+    ) Error![]const listmod.Entry {
+        c.arm();
+        if (c.state != .authenticated and c.state != .selected) return error.BadState;
+
+        const tag = try c.tagger.next(c.gpa);
+        defer c.gpa.free(tag);
+        listmod.encodeLsub(&c.enc, tag, reference, pattern) catch |e| return c.unmask(e);
+        c.enc.w.flush() catch return error.WriteFailed;
+
+        var out: std.ArrayList(listmod.Entry) = .empty;
+        errdefer out.deinit(out_gpa);
+
+        while (true) {
+            c.rd.d.gpa = out_gpa;
+            const resp = c.rd.next() catch |e| return e;
+            switch (resp) {
+                .continuation => return error.NoContinuation,
+                .tagged => |t| {
+                    if (!std.mem.eql(u8, t.tag, tag)) return error.UnknownTag;
+                    try c.absorbCode(t.status.code);
+                    if (t.status.type != .ok) return error.CommandFailed;
+                    return out.toOwnedSlice(out_gpa);
+                },
+                .data => |d| switch (d) {
+                    .lsub => |entry| try out.append(out_gpa, entry),
+                    else => try c.handleData(d),
+                },
+            }
+        }
+    }
+
+    /// `STATUS`. RFC 9051 requires the server to answer with exactly one
+    /// `* STATUS` before the tagged completion; `error.UnexpectedByte` if a
+    /// server answers OK without ever sending it.
+    pub fn statusMailbox(
+        c: *Client,
+        out_gpa: Allocator,
+        mailbox: []const u8,
+        items: []const listmod.StatusItem,
+    ) Error!listmod.StatusReply {
+        c.arm();
+        if (c.state != .authenticated and c.state != .selected) return error.BadState;
+
+        const tag = try c.tagger.next(c.gpa);
+        defer c.gpa.free(tag);
+        listmod.encodeStatus(&c.enc, tag, mailbox, items) catch |e| return c.unmask(e);
+        c.enc.w.flush() catch return error.WriteFailed;
+
+        var result: ?listmod.StatusReply = null;
+        while (true) {
+            c.rd.d.gpa = out_gpa;
+            const resp = c.rd.next() catch |e| return e;
+            switch (resp) {
+                .continuation => return error.NoContinuation,
+                .tagged => |t| {
+                    if (!std.mem.eql(u8, t.tag, tag)) return error.UnknownTag;
+                    try c.absorbCode(t.status.code);
+                    if (t.status.type != .ok) return error.CommandFailed;
+                    return result orelse error.UnexpectedByte;
+                },
+                .data => |d| switch (d) {
+                    .mailbox_status => |r| result = r,
                     else => try c.handleData(d),
                 },
             }
