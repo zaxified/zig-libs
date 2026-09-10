@@ -637,6 +637,28 @@ pub const ServeConfig = struct {
     exec: ?CommandHandler = null,
     /// Handler for §6.5 `"subsystem"` (`command` is the subsystem name).
     subsystem: ?CommandHandler = null,
+    /// Restricts which subsystem NAMES `subsystem` is offered for
+    /// (A1/examples/ssh.md S3b). Today's request dispatch below only looks
+    /// at the request TYPE ("exec" vs "subsystem") — once `subsystem` is
+    /// set at all, ANY name gets SSH_MSG_CHANNEL_SUCCESS and then runs the
+    /// same handler, because there was nowhere to check the name before
+    /// replying. A client waiting for its own subsystem's init packet
+    /// (`sftp`'s SSH_FXP_INIT, say) against a server that only implements
+    /// some other one hangs instead of getting SSH_MSG_CHANNEL_FAILURE and
+    /// trying something else.
+    ///
+    /// Empty (the default) preserves today's behavior byte-for-byte: any
+    /// name is accepted, and it is `subsystem`'s own job to recognize or
+    /// ignore names it does not implement. A non-empty list makes a name
+    /// NOT on it fail on the wire — SSH_MSG_CHANNEL_FAILURE, handler never
+    /// invoked — the same way an unset `subsystem` already does for every
+    /// name. This does not give different names different handlers (that
+    /// needs `subsystem`'s type to become a list of `{name, handler}`
+    /// pairs, a breaking change to the existing field — see
+    /// `A1/examples/ssh.md`'s Dispozice for that variant and its cost); it
+    /// only lets a single-subsystem server reject names it was never going
+    /// to serve, before pretending otherwise.
+    subsystem_names: []const []const u8 = &.{},
     window_size: u32 = default_window_size,
     max_packet_size: u32 = default_max_packet_size,
     /// Cap on buffered client stdin.
@@ -808,6 +830,17 @@ pub fn serveSession(
                     continue;
                 }
                 const command = try c.string();
+                // S3b: for "subsystem", `command` is the requested NAME, not
+                // a command line. An empty `subsystem_names` (the default)
+                // accepts any name, same as before this field existed; a
+                // non-empty one rejects a name not on it right here, before
+                // SSH_MSG_CHANNEL_SUCCESS ever goes out.
+                if (std.mem.eql(u8, req, "subsystem") and config.subsystem_names.len > 0 and
+                    !nameInList(config.subsystem_names, command))
+                {
+                    if (want_reply) try sendChannelReply(t, &ch, false);
+                    continue;
+                }
                 if (want_reply) try sendChannelReply(t, &ch, true);
                 ran = true;
                 switch (config.stdin_mode) {
@@ -831,6 +864,13 @@ pub fn serveSession(
 /// typed error rather than something applied to whatever channel we do have.
 /// (`sent_close` is deliberately NOT checked here: the peer's own CLOSE in
 /// answer to ours is the normal way §5.3 ends.)
+/// `ServeConfig.subsystem_names` membership test — linear scan, since the
+/// list is a handful of static names a caller wrote out, not attacker data.
+fn nameInList(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 fn expectChannel(ch: *ChannelState, c: *Cursor) ChannelError!void {
     const recipient = try c.uint32();
     if (!ch.open or ch.got_close) return error.ChannelClosed;
@@ -2338,4 +2378,147 @@ test "serveSession: on_channel_open_refused fires on a non-session channel type 
     try t.expectEqualStrings("direct-tcpip", rec.last_kind);
     try t.expectEqual(messages.ChannelOpenFailureReason.unknown_channel_type, rec.last_reason.?);
     try t.expectEqualStrings("only \"session\" channels are supported", rec.last_description);
+}
+
+/// A `CommandHandler` that records the subsystem name it was called with,
+/// for the `subsystem_names` regression test below.
+const SubsystemRecorder = struct {
+    calls: usize = 0,
+    name_buf: [64]u8 = undefined,
+    last_name: []const u8 = "",
+
+    fn run(
+        ctx: *anyopaque,
+        gpa: std.mem.Allocator,
+        user: []const u8,
+        command: []const u8,
+        stdin: []const u8,
+        stdout: *std.ArrayList(u8),
+        stderr: *std.ArrayList(u8),
+    ) CommandError!u32 {
+        _ = gpa;
+        _ = user;
+        _ = stdin;
+        _ = stdout;
+        _ = stderr;
+        const self: *SubsystemRecorder = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        const n = @min(command.len, self.name_buf.len);
+        @memcpy(self.name_buf[0..n], command[0..n]);
+        self.last_name = self.name_buf[0..n];
+        return 0;
+    }
+
+    fn handler(self: *SubsystemRecorder) CommandHandler {
+        return .{ .ctx = self, .runFn = run };
+    }
+};
+
+test "serveSession: subsystem_names rejects a name not on the list before CHANNEL_SUCCESS (A1/examples/ssh.md S3b)" {
+    // Before this field existed, ANY subsystem name got SSH_MSG_CHANNEL_SUCCESS
+    // and then ran `config.subsystem`, once `config.subsystem` was set at
+    // all -- there was nowhere to check the NAME before replying. A real
+    // client waiting for its own subsystem's init packet against a server
+    // that only implements a different one would hang. This test opens a
+    // channel, requests an unrecognized subsystem name, then a recognized
+    // one, and inspects the actual wire replies (decoded through a second
+    // `Transport`, the same framing the peer itself would use) rather than
+    // just the handler's own call count -- the bug was specifically about
+    // what goes out BEFORE the handler runs.
+    const t = std.testing;
+
+    var open_buf: [32]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&open_buf);
+    try ow.writeByte(@intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN));
+    try messages.writeString(&ow, "session");
+    try writeU32(&ow, 5);
+    try writeU32(&ow, 4096);
+    try writeU32(&ow, 4096);
+
+    var bad_req_buf: [64]u8 = undefined;
+    var bw: std.Io.Writer = .fixed(&bad_req_buf);
+    try writeChannelHeader(&bw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&bw, "subsystem");
+    try bw.writeByte(1); // want_reply
+    try messages.writeString(&bw, "unknown-name");
+
+    var good_req_buf: [64]u8 = undefined;
+    var gw: std.Io.Writer = .fixed(&good_req_buf);
+    try writeChannelHeader(&gw, .SSH_MSG_CHANNEL_REQUEST, 0);
+    try messages.writeString(&gw, "subsystem");
+    try gw.writeByte(1); // want_reply
+    try messages.writeString(&gw, "netconf");
+
+    var close_buf: [16]u8 = undefined;
+    var cw: std.Io.Writer = .fixed(&close_buf);
+    try writeChannelHeader(&cw, .SSH_MSG_CHANNEL_CLOSE, 0);
+
+    var wire: [1024]u8 = undefined;
+    const framed = try framePackets(&wire, &.{ ow.buffered(), bw.buffered(), cw.buffered() });
+
+    var r: std.Io.Reader = .fixed(framed);
+    var sink_buf: [1024]u8 = undefined;
+    var sink: std.Io.Writer = .fixed(&sink_buf);
+    var tr = transport.Transport.init(&r, &sink);
+
+    var rec: SubsystemRecorder = .{};
+    try serveSession(&tr, t.allocator, .{
+        .subsystem = rec.handler(),
+        .subsystem_names = &.{"netconf"},
+    });
+
+    // The handler must never have run for the unrecognized name.
+    try t.expectEqual(@as(usize, 0), rec.calls);
+
+    // Decode the server's own replies through a second Transport -- the same
+    // framing a real peer would use to read them.
+    var reply_r: std.Io.Reader = .fixed(sink.buffered());
+    var reply_sink_buf: [16]u8 = undefined;
+    var reply_sink: std.Io.Writer = .fixed(&reply_sink_buf);
+    var reply_t = transport.Transport.init(&reply_r, &reply_sink);
+    var scratch: [256]u8 = undefined;
+
+    const open_reply = try reply_t.recvPacket(&scratch);
+    try t.expectEqual(
+        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_OPEN_CONFIRMATION)),
+        open_reply.payload[0],
+    );
+    const subsystem_reply = try reply_t.recvPacket(&scratch);
+    try t.expectEqual(
+        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_FAILURE)),
+        subsystem_reply.payload[0],
+    );
+
+    // Positive control, same channel: a name ON the list still succeeds and
+    // the handler still runs, with the right name -- the list restricts,
+    // it does not just refuse everything.
+    var wire2: [1024]u8 = undefined;
+    const framed2 = try framePackets(&wire2, &.{ ow.buffered(), gw.buffered(), cw.buffered() });
+    var r2: std.Io.Reader = .fixed(framed2);
+    var sink_buf2: [1024]u8 = undefined;
+    var sink2: std.Io.Writer = .fixed(&sink_buf2);
+    var tr2 = transport.Transport.init(&r2, &sink2);
+    var rec2: SubsystemRecorder = .{};
+    try serveSession(&tr2, t.allocator, .{
+        .subsystem = rec2.handler(),
+        .subsystem_names = &.{"netconf"},
+        // `.ignore` runs the handler immediately, not after CHANNEL_EOF (the
+        // default `.collect_until_eof`) -- this synthetic stream never sends
+        // one, and the point of this half of the test is the handler DOES
+        // run for a name on the list.
+        .stdin_mode = .ignore,
+    });
+    try t.expectEqual(@as(usize, 1), rec2.calls);
+    try t.expectEqualStrings("netconf", rec2.last_name);
+
+    var reply_r2: std.Io.Reader = .fixed(sink2.buffered());
+    var reply_sink_buf2: [16]u8 = undefined;
+    var reply_sink2: std.Io.Writer = .fixed(&reply_sink_buf2);
+    var reply_t2 = transport.Transport.init(&reply_r2, &reply_sink2);
+    _ = try reply_t2.recvPacket(&scratch); // OPEN_CONFIRMATION
+    const subsystem_reply2 = try reply_t2.recvPacket(&scratch);
+    try t.expectEqual(
+        @as(u8, @intFromEnum(messages.MessageType.SSH_MSG_CHANNEL_SUCCESS)),
+        subsystem_reply2.payload[0],
+    );
 }

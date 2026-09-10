@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **ADDITIVE, not breaking (two findings).**
+  - `ServeConfig` gained `subsystem_names: []const []const u8 = &.{}` (`connection.zig`).
+    Before this, once `subsystem` was set at all, ANY subsystem name got
+    `SSH_MSG_CHANNEL_SUCCESS` and then ran the same handler — there was nowhere to check the
+    name before replying, so a client waiting for its own subsystem's init packet against a
+    single-purpose server implementing a different one would hang instead of getting
+    `SSH_MSG_CHANNEL_FAILURE` and trying something else (`A1/examples/ssh.md` S3b). Empty
+    (the default) is byte-for-byte today's behavior; a non-empty list rejects a name not on
+    it on the wire, handler never invoked. Does not give different names different handlers
+    — that needs `subsystem`'s type to change to a list of `{name, handler}` pairs, a
+    breaking change to the existing field, recorded but not done (see `A1/examples/ssh.md`'s
+    Dispozice for the cost).
+  - `AuthConfig` gained an optional `on_rejected` hook (`RejectionHandler`, `userauth.zig`),
+    called synchronously on every rejected credential during `serveUserauth` — the same
+    moment `AuthConfig.failure` is written, not just the last one before the call returns.
+    Closes `A1/examples/ssh.md` S2: `failure` already held the right answer after ANY error
+    return, not only `error.AuthenticationFailed` (a peer that gives up after one rejected
+    credential and just closes the connection makes the call return `error.EndOfStream`
+    instead) — but a caller had no reliable way to tell "this field holds a real answer"
+    apart from "never touched, because no credential was ever rejected first".
+    `example-apps/ssh-demo` carried its own `self.keys.why == .not_called` bookkeeping only
+    to work around exactly that ambiguity; this hook removes the need for it. `failure`'s own
+    doc comment was corrected to state the true contract (it never actually needed
+    `AuthenticationFailed` specifically) rather than changing behavior.
+
 - **2026-09-10** — **ADDITIVE, not breaking.** `ServeConfig` gained an optional
   `on_channel_open_refused` hook (`ChannelOpenRejectedHandler`, `connection.zig`), called
   whenever `serveSession` answers a `SSH_MSG_CHANNEL_OPEN` with `SSH_MSG_CHANNEL_OPEN_FAILURE`
