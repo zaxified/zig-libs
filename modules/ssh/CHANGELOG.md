@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **ADDITIVE, not breaking.** `ServeConfig` gained an optional
+  `on_channel_open_refused` hook (`ChannelOpenRejectedHandler`, `connection.zig`), called
+  whenever `serveSession` answers a `SSH_MSG_CHANNEL_OPEN` with `SSH_MSG_CHANNEL_OPEN_FAILURE`
+  (a concurrent second channel, a non-`"session"` type, or a zero max-packet-size peer value).
+  Closes `A1/examples/ssh.md` S3a: the wire behavior was already correct (the client always
+  got the failure message), but the server side had no way to know it happened at all — a
+  multiplexing client's second session silently vanished from the server's point of view.
+  Default `null` keeps every existing caller's behavior byte-for-byte identical. New test
+  pins that the hook fires with the same kind/reason/description the wire-level OPEN_FAILURE
+  test right above it already checks. scripts/modtest ssh: 134/134 (was 133/133), ReleaseSafe
+  and ReleaseFast alike.
+
 - **2026-09-10** — **ADDITIVE, not breaking.** `HostKey.fromOpenSSH` (and its `userauth.AuthKey`
   alias) can now load an `ecdsa-sha2-nistp256` openssh-key-v1 container — new
   `parseEcdsaP256OpenSSH`, dispatched the same way `parseEd25519OpenSSH` already was. Closes
