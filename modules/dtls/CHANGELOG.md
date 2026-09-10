@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** the application-epoch
+  `send`/ack path now refuses (`error.SequenceNumberExhausted`, new
+  `SendError` member) the record that would need `send_seq` to wrap past its
+  48-bit ceiling, instead of silently reusing an AEAD nonce under the
+  unchanged traffic key (RFC 9147 §4.5.4, audit A1 F4/LOW4). The PQ-hybrid
+  key exchange now zeroizes the ML-KEM decapsulation key and both derived
+  shared secrets after use, not just the seeds that fed them (audit A1
+  F5/LOW5). No consumer exists yet (0 in-repo, `build.zig` is the only line
+  naming the module), so nothing downstream to update. Also: two stale doc
+  claims corrected (the anti-replay window comment's off-by-one, and the
+  `ecdhe_public` field doc's over-claim that the client checks the peer
+  share against both group AND value — only group is checked, matching RFC
+  8446 §4.2.8, audit A1 F7/LOW7) and the stateless-cookie-vs-fragmented-
+  ClientHello memory amplification documented as a known limitation (audit
+  A1 F6/LOW6) — both doc-only, see `SPEC.md`.
 - **2026-09-09** — Docs: `tools/wolfssl_peer.c` had no `SPDX-License-Identifier`; added (MIT —
   the file is this repository's own `main`/`run_server`/`run_client` over wolfSSL's public
   API, not wolfSSL source). `zig build check-catalog` now enforces the header on every

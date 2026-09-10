@@ -479,6 +479,27 @@ two `Connection`s written from the same reading of the RFC cannot see.
 
 ### Still not proven / not implemented
 
+- **The cookie exchange is not stateless against a FRAGMENTED ClientHello
+  (audit A1 F6/LOW6).** `serverProcessClientHello` fully reassembles the
+  ClientHello (`takeHandshakeMessage`) before the cookie check ever runs —
+  the cookie lives inside the ClientHello body, so it cannot be read from a
+  partial one. A 26-byte datagram declaring a 2048-byte message with a
+  1-byte fragment returns `need_more_data` before the cookie logic (or
+  `sendHelloRetryRequest`) is reached at all, and the caller cannot tell
+  that apart from a legitimately fragmenting client — both produce an empty
+  `out`. Each such source address then costs the server one live
+  `Connection` (~13 KB) held until `max_flight_bytes` forces
+  `FlightTooLarge`: a ~500x memory amplification against a 26-byte packet,
+  on the exact path §5.1's cookie exists to keep stateless.
+  `sendHelloRetryRequest`'s own "stores nothing" claim is true once reached
+  — the gap is everything upstream of it. Real design tension, not a coding
+  slip: a legitimate peer with a large (e.g. PQ-hybrid) ClientHello
+  genuinely needs to fragment, and `max_flight_bytes` bounds the growth of
+  one such connection, not how many a caller ends up holding. Left as a
+  documented limit; a fix would need either a lightweight pre-reassembly
+  return-routability check independent of the cookie, or accepting the
+  amplification as the cost of the fragmentation this module also needs to
+  support.
 - **A cookie-rotation overlap window.** RFC 9147 §5.1 RECOMMENDS a server be
   able to accept the previous `cookie_secret` for a period, so clients
   handshaking across a rotation are not dropped. `HelloRetryConfig` takes one

@@ -688,6 +688,18 @@ pub const SendError = error{
     /// not need resumption or key update can read the next datagram, but it
     /// is told what it is skipping.
     ReceivedPostHandshakeMessage,
+    /// RFC 9147 §4.5.4: the application-epoch send sequence number has
+    /// reached its 48-bit ceiling. `send_seq` is a `u48` incremented with
+    /// `+%=`, so without this guard the NEXT record after the ceiling would
+    /// silently wrap to 0 and reuse a nonce under the unchanged traffic key
+    /// (AES-GCM: authentication-key recovery + plaintext XOR; total loss of
+    /// the record layer). §4.5.4 requires terminating the connection (or
+    /// rekeying — not implemented here, see the file header) rather than
+    /// letting that happen. Audit A1 (dtls) F4/LOW4: theoretical at current
+    /// traffic rates (~9 years at 1M records/s on one epoch) but the failure
+    /// mode is silent and catastrophic rather than a typed error, which this
+    /// closes.
+    SequenceNumberExhausted,
 };
 
 /// One direction's record-protection key material, derived from a traffic
@@ -723,6 +735,13 @@ const content_type_handshake: u8 = 22;
 /// message body and leaves the carrying content type to its caller — this is
 /// that value.
 const content_type_ack: u8 = 26;
+
+/// RFC 9147 §4.5.4 ceiling for the application-epoch `send_seq` (a `u48`):
+/// see `protectRecord`'s guard. `send_seq == max_send_seq` (== `u48`'s own
+/// max) is refused rather than sent, so the last value this connection
+/// actually sends is `max_send_seq - 1` and the wraparound increment in
+/// `protectRecord` can never run.
+const max_send_seq: u48 = std.math.maxInt(u48);
 
 // ── incoming-flight reassembly bounds (RFC 9147 §5.2) ────────────────────
 //
@@ -1177,12 +1196,25 @@ fn ecdheSharedSecret(group: u16, secret: []const u8, peer_share: []const u8) Han
             // Re-expand the decapsulation key from its FIPS 203 seed (the
             // stored private form — see `ecdhe_secret_len`); one keygen,
             // tens of microseconds, once per handshake.
-            const kem_kp = MlKem768.KeyPair.generateDeterministic(secret[0..MlKem768.seed_length].*) catch return error.KeyExchangeFailed;
-            const ss_pq = kem_kp.secret_key.decaps(peer_share[0..MlKem768.ciphertext_length]) catch return error.KeyExchangeFailed;
-            const ss_x = X25519.scalarmult(
+            // Audit A1 (dtls) F5/LOW5: every SEED in this file is wiped on
+            // every exit, but the values derived from a seed are equally
+            // sufficient to recompute the session keys from a recorded
+            // handshake, and `kem_kp`/`ss_pq`/`ss_x` below are not seeds —
+            // `kem_kp` re-expands the FULL ML-KEM decapsulation key
+            // (~2.4 KB) from the stored seed, and the two `ss_*` are the raw
+            // (still un-combined-with-the-transcript) shared secrets. None
+            // of the three is read again after this function returns, so
+            // all three are wiped before returning, not just the seed that
+            // fed them.
+            var kem_kp = MlKem768.KeyPair.generateDeterministic(secret[0..MlKem768.seed_length].*) catch return error.KeyExchangeFailed;
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&kem_kp));
+            var ss_pq = kem_kp.secret_key.decaps(peer_share[0..MlKem768.ciphertext_length]) catch return error.KeyExchangeFailed;
+            defer std.crypto.secureZero(u8, &ss_pq);
+            var ss_x = X25519.scalarmult(
                 secret[MlKem768.seed_length..][0..32].*,
                 peer_share[MlKem768.ciphertext_length..][0..32].*,
             ) catch return error.KeyExchangeFailed;
+            defer std.crypto.secureZero(u8, &ss_x);
             var out: DheSecret = .{ .bytes = undefined, .len = 64 };
             out.bytes[0..32].* = ss_pq;
             out.bytes[32..64].* = ss_x;
@@ -1225,15 +1257,26 @@ fn ecdheServerExchange(group: u16, peer_share: []const u8, entropy: Entropy) Han
             const random = entropy.source();
             var encaps_seed: [MlKem768.encaps_seed_length]u8 = undefined;
             random.bytes(&encaps_seed);
-            const enc = ek.encapsDeterministic(&encaps_seed);
+            var enc = ek.encapsDeterministic(&encaps_seed);
             std.crypto.secureZero(u8, &encaps_seed);
+            // Audit A1 (dtls) F5/LOW5: `enc.shared_secret`, `x.secret_key`
+            // and `ss_x` are the DERIVED values, not the seeds that fed
+            // them — every seed in this function is already wiped, but
+            // these three are equally sufficient to recompute the session
+            // keys from a recorded handshake and were left on the stack.
+            // `enc.ciphertext` is copied into `r.public` (it is sent on the
+            // wire, not secret) and is fine to leave as-is; only the two
+            // secret fields below are cleared.
+            defer std.crypto.secureZero(u8, &enc.shared_secret);
             var x_seed: [32]u8 = undefined;
             random.bytes(&x_seed);
-            const x = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KeyExchangeFailed;
+            var x = X25519.KeyPair.generateDeterministic(x_seed) catch return error.KeyExchangeFailed;
             std.crypto.secureZero(u8, &x_seed);
+            defer std.crypto.secureZero(u8, &x.secret_key);
             // Same low-order/identity rejection as the classical arm — the
             // X25519 half of a hybrid must not be poisonable either.
-            const ss_x = X25519.scalarmult(x.secret_key, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
+            var ss_x = X25519.scalarmult(x.secret_key, peer_share[MlKem768.PublicKey.encoded_length..][0..32].*) catch return error.KeyExchangeFailed;
+            defer std.crypto.secureZero(u8, &ss_x);
             var r: ServerExchange = .{
                 .group = group,
                 .public = undefined,
@@ -1572,10 +1615,16 @@ pub const Connection = struct {
     /// secret, then zeroizes it immediately — forward secrecy; the SERVER
     /// generates + consumes it entirely within `serverProcessClientHello`.
     /// `ecdhe_public[0..ecdhe_public_len]` is the wire `key_share` value and
-    /// `ecdhe_group` the group it belongs to — the client checks the
-    /// ServerHello's share against BOTH, since a server that answers in a
-    /// group we never offered a share in has not done the key exchange we
-    /// did. Unused in `.psk` mode. Zeroized in `deinit`.
+    /// `ecdhe_group` the group it belongs to. (Audit A1 dtls F7/LOW7: this
+    /// used to say the client checks the ServerHello's share against BOTH —
+    /// it does not. `handleFlightClient` compares only `ecdhe_group`
+    /// against the ServerHello's named group, since a server that answers
+    /// in a group we never offered a share in has not done the key
+    /// exchange we did; RFC 8446 §4.2.8 requires only that group match, and
+    /// the peer share's LENGTH is separately exact-checked per-group inside
+    /// `ecdheSharedSecret`. Nothing is lost — `ecdhe_public` itself is never
+    /// consulted on receive, only sent.) Unused in `.psk` mode. Zeroized in
+    /// `deinit`.
     ecdhe_group: u16 = 0,
     ecdhe_secret: [ecdhe_secret_len]u8 = undefined,
     ecdhe_public: [max_key_share_len]u8 = undefined,
@@ -1906,6 +1955,13 @@ pub const Connection = struct {
     /// number space.
     fn protectRecord(self: *Connection, inner_content_type: u8, payload: []const u8, out: []u8) SendError![]const u8 {
         if (self.state != .connected) return error.NotConnected;
+        // RFC 9147 §4.5.4: refuse the record that would need `send_seq` to
+        // wrap on ITS NEXT increment. Refused at `max_send_seq`, not after
+        // it, so the wraparound `+%= 1` a few lines down can never actually
+        // execute past the ceiling — `send_seq` tops out one below
+        // `u48`'s max as the last sequence number this connection ever
+        // sends.
+        if (self.send_seq >= max_send_seq) return error.SequenceNumberExhausted;
         const params = suiteParams(self.suite) orelse return error.UnsupportedSuite;
 
         // DTLSInnerPlaintext = content || content_type (no extra padding).
@@ -2928,6 +2984,29 @@ pub const Connection = struct {
     /// first ClientHello produces a byte-identical HelloRetryRequest from a
     /// brand-new `Connection` — no memory of the first one is needed.
     ///
+    /// ⚠ Audit A1 (dtls) F6/LOW6: that "stores nothing" is true of THIS
+    /// function, but only once it is reached — and it is only reached after
+    /// `serverProcessClientHello` has fully REASSEMBLED the ClientHello
+    /// (`takeHandshakeMessage`, called before any of this file runs). A
+    /// FRAGMENTED ClientHello (a 26-byte datagram declaring a 2048-byte
+    /// message with a 1-byte fragment is enough) returns `need_more_data`
+    /// from `handleFlight` before this function — or the cookie check right
+    /// before it — is ever entered, and the caller has no signal to
+    /// distinguish that from a legitimately fragmenting client: an empty
+    /// `out` is what both produce. Each such source address then costs the
+    /// server one live `Connection` (~13 KB, dominated by `rx_flight`/
+    /// `last_flight`/`ecdhe_public`) held until `max_flight_bytes` forces
+    /// `FlightTooLarge` — a ~500x memory amplification against a 26-byte
+    /// packet, on the exact path the cookie exchange exists to keep
+    /// stateless. This is a real design tension, not a coding error: the
+    /// cookie extension lives inside the ClientHello body, so checking for
+    /// it before full reassembly would mean parsing extensions out of a
+    /// possibly-incomplete buffer, and a legitimate peer with a large
+    /// (e.g. PQ-hybrid) ClientHello genuinely must be allowed to fragment.
+    /// `max_flight_bytes` bounds the growth, not the count of such
+    /// half-open connections a caller may be holding. Left as a documented
+    /// limit rather than restructured here; see the module's SPEC.md.
+    ///
     /// The one thing it must decide up front is the cipher suite: RFC 8446
     /// §4.1.4 puts it in the HelloRetryRequest and requires the eventual
     /// ServerHello to match, so it goes into the cookie.
@@ -3888,8 +3967,11 @@ test "protectDispatch(chacha20_poly1305_sha256): byte-identical to Protection(ch
 /// the application epoch (`recv`) and the epoch-2 handshake-traffic
 /// analogue (`unprotectHandshakeMessage`). `window` is a 64-bit bitmap
 /// where bit 0 represents `high.*` (the highest sequence number accepted
-/// so far in this epoch) and bit `i` (`i` in `1..64`) represents
-/// `high.* - i`; a set bit means "already accepted".
+/// so far in this epoch) and bit `i` (`i` in `1..63`) represents
+/// `high.* - i`; a set bit means "already accepted". (Audit A1 dtls F7/LOW7:
+/// this used to say `i` in `1..64`, an off-by-one against the code's own
+/// `diff >= 64 -> false` floor below — the CODE is the conservative reading,
+/// RFC 9147 §4.5.1 only requires >=32, so only the comment needed fixing.)
 ///
 /// MUST be called only for a sequence number whose record has ALREADY
 /// passed AEAD authentication — never gate this on an unauthenticated
@@ -5209,6 +5291,36 @@ test "recv: the anti-replay window is exactly 64 records wide — 63 back is acc
     try testing.expectEqualSlices(u8, "s1", try server.recv(recs[1], &plain));
     // ...and it is still a one-shot: the same record again is a replay.
     try testing.expectError(error.ReplayedRecord, server.recv(recs[1], &plain));
+}
+
+test "protectRecord: send_seq is refused at its RFC 9147 §4.5.4 ceiling, not wrapped (audit F4/LOW4)" {
+    // `send_seq` is a `u48` advanced with `+%=`; without a ceiling check the
+    // record after `maxInt(u48)` would silently reuse sequence number 0
+    // under the SAME traffic key — an AEAD nonce repeat (AES-GCM:
+    // authentication-key recovery + plaintext XOR). This drives `send_seq`
+    // to the boundary directly rather than looping 2^48 times.
+    var client: Connection = undefined;
+    var server: Connection = undefined;
+    try connectedPair(.aes_128_gcm_sha256, 0x36, &client, &server);
+
+    var wire: [64]u8 = undefined;
+
+    // One below the ceiling: still sends normally (positive control — the
+    // guard must not fire early).
+    client.send_seq = max_send_seq - 1;
+    const rec = try client.send("last-legit", &wire);
+    try testing.expect(rec.len > 0);
+    // The successful send advanced send_seq to the ceiling itself.
+    try testing.expectEqual(max_send_seq, client.send_seq);
+
+    // At the ceiling: refused, not wrapped.
+    try testing.expectError(error.SequenceNumberExhausted, client.send("one-too-many", &wire));
+    // The refusal must not have mutated send_seq (no partial advance/wrap).
+    try testing.expectEqual(max_send_seq, client.send_seq);
+
+    // Still refused on a second attempt — this is a durable stop, not a
+    // one-shot rejection that the next call sails past.
+    try testing.expectError(error.SequenceNumberExhausted, client.send("still-no", &wire));
 }
 
 test "replayCheckAndUpdate: the 64-wide floor and the 64-record forward jump, at the boundary" {
