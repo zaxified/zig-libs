@@ -7,13 +7,25 @@ Typed model, one arena: `parse`/`parseDiag` build a `Package{ name?, sections:[]
 (`Section{ type, name?, anonymous, options:[]Option }`, `Option{ key, kind:.single|.list, values }`)
 in an internal arena — one `Package.deinit(gpa)` frees everything; `serialize` writes it back as
 canonical text. Reentrant, no shared state. Documented quoting, exactly: single quotes take no
-escapes; double quotes take `\" \' \\ \n \t \r` (a backslash before any other char yields that char);
-bare words end at whitespace; adjacent segments of one token concatenate (`'a'"b"c` → `abc`); quotes
-may not span lines; `#` starts a comment at the start of a token, OR anywhere inside a bare
-(unquoted) run — either way it truncates the token AND discards the rest of the line, matching real
-`uci` (audit A1 U4, measured against the real binary: `a#b` unquoted is `a`, not `a#b` — this SPEC
-previously claimed the opposite as "the format", which the real binary disproved); `#` inside quotes
-stays literal. CRLF accepted. Repeated-key semantics: a repeated `option` under one key overwrites
+escapes (everything between them, `\t`/`\n`/`\r` included, is literal); double quotes take `\" \' \\`
+as TRUE escapes, and a backslash before any OTHER character (including `n`/`t`/`r`) just drops the
+backslash and yields that character verbatim — UCI text has no backslash escape that PRODUCES a
+control byte, but `\t`/`\n`/`\r` can still appear literally, unescaped, inside either kind of quote
+(audit A1 U6, `uci_validate_text`, util.c:96 — the only three sub-0x20 bytes real `uci` allows in a
+value, written back raw, not via an escape); bare words end at whitespace; adjacent segments of one
+token concatenate (`'a'"b"c` → `abc`). Audit A1 U5: a quote (either kind) MAY span physical lines —
+real `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187) keeps reading via `uci_getln`
+until the matching quote closes, and the value keeps the real `\n` byte at each line break crossed;
+only running out of input with a quote still open is `error.UnterminatedQuote` (previously: any quote
+left open at the end of the line it started on, which rejected the ENTIRE file for a legitimate
+multi-line value — a certificate, an SSH key, a LuCI banner). Outside a quote the grammar is still
+exactly one physical line: a bare word, `#`, and the statement keyword never cross a `\n`. `#` starts
+a comment at the start of a token, OR anywhere inside a bare (unquoted) run — either way it truncates
+the token AND discards the rest of the line, matching real `uci` (audit A1 U4, measured against the
+real binary: `a#b` unquoted is `a`, not `a#b` — this SPEC previously claimed the opposite as "the
+format", which the real binary disproved); `#` inside quotes stays literal. CRLF accepted (outside a
+quote only — the CRLF tolerance is a statement-grammar convenience, not part of a quoted value's
+content). Repeated-key semantics: a repeated `option` under one key overwrites
 (last wins, matching `uci set`); `list` entries accumulate in order; mixing `option` and `list` under
 one key → `error.MixedOptionList`, and an `option`/`list` line with no value → `error.MissingArgument`
 — **both are this module's OWN additional strictness, not real UCI semantics** (audit A1 U11/U12):
@@ -34,8 +46,9 @@ Never-panic, line-numbered errors: malformed input yields a typed `ParseError` (
 `BadKeyword`, `MissingArgument`, `TooManyArguments`, `OptionOutsideSection`, `MixedOptionList`,
 `DuplicateSection`, `InvalidName`, `MemoryLimitExceeded`, …); `parseDiag` fills a 1-based
 `Diagnostics.line` (0 = not line-tied, e.g. `InputTooLarge`/`MemoryLimitExceeded`). Serialization of
-a value with a control char that has no UCI escape → `error.UnserializableValue`; a section
-type/name with a character `parse` would also have rejected → `error.InvalidName`.
+a value with a control byte other than `\t`/`\n`/`\r` (audit A1 U6: those three ARE representable,
+written literally) → `error.UnserializableValue`; a section type/name with a character `parse` would
+also have rejected → `error.InvalidName`.
 Bounded: input over 16 MiB → `error.InputTooLarge`; a line over 16 KiB → `error.LineTooLong`; the
 built model over 300000 total items (sections + options + values, combined) →
 `error.MemoryLimitExceeded` (audit A1 U3 — the 16 MiB text cap did not bound the MODEL built from
@@ -147,8 +160,29 @@ quoting/bare-word styles.
    through this module's own encoder/decoder pair (a self-consistent "blind oracle"; even the fuzz
    round-trip harness can't see a symmetric bug). Confirmed with 8 independent escape probes
    (`\\`,`\"`,`\'`,`\n`,`\t`,`\r`,`\y`, plus single-quote-takes-no-escapes) against the real binary.
-   Fixed in the parser and serializer (the latter now rejects ALL sub-0x20 bytes, not just
-   "other" ones, since none of them have a working escape).
+   Fixed in the parser and serializer. ⚠ **Correction (audit A1 U6, after this SPEC entry was
+   written):** the serializer fix above over-corrected — it rejected `\n`/`\t`/`\r` outright as
+   `error.UnserializableValue`, on the reasoning that "no escape produces them" implied "they can't be
+   represented". That conflates two different claims: real `uci_validate_text` (util.c:96) DOES allow
+   those three sub-0x20 bytes in a value, it just never needs a backslash escape for them — they're
+   written back literally, raw, inside the quotes. The serializer now does the same. `\n` in
+   particular is representable end to end only because a quote may now span physical lines (U5,
+   below) — a value containing a real newline round-trips as a multi-line quoted literal, the shape
+   `uci export` itself produces (e.g. `option multi 'line1<LF>line2'`).
+3. **Audit A1 U5 (found in the follow-up fix campaign, not the original audit pass):** the parser
+   used to be line-oriented — one statement, one physical line, full stop — so a quoted value that
+   didn't close before the line ended was `error.UnterminatedQuote`, rejecting the WHOLE file. Real
+   `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187) instead keeps reading further
+   lines via `uci_getln` until the quote closes; the value keeps the real `\n` byte at each line break.
+   A value with an embedded newline is not exotic here — a certificate, an SSH key, a LuCI banner —
+   and the old behavior failed on the entire package for one such value, not just that option. Fixed
+   by rewriting the tokenizer from line-oriented to byte-oriented: outside a quote, the statement
+   grammar is still exactly one physical line (unaffected); inside a quote, `\n` is ordinary content
+   and only genuine end-of-file with a quote still open is an error. Verified both directions: the
+   audit's own multi-line capture (`option multi 'line1<LF>line2'`) now parses AND round-trips, and
+   the full existing corpus (golden captures, real OpenWRT configs, the mutation suite, all
+   diagnostic-line-number tests) is unchanged — see `root.zig`'s "audit A1 U5" test and the fix
+   commit for the RED→GREEN numbers.
 2. Real `uci export` prints a bare, unquoted `package <name>` header when the name is
    identifier-safe (`package testcfg`, not `package 'testcfg'`). Fixed (`serialize` now treats the
    package name like a section-type word).

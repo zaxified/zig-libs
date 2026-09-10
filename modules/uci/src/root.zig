@@ -23,12 +23,18 @@
 //! character verbatim; UCI text has no escape that produces an actual
 //! control byte, confirmed against a real `uci` binary — see SPEC.md);
 //! bare words end at whitespace.
-//! Adjacent segments of one token concatenate (`'a'"b"c` -> `abc`), quotes
-//! may not span lines. `#` starts a comment at the start of a token, OR
-//! anywhere inside a bare (unquoted) run -- either way it truncates the
-//! current token and discards the rest of the *line* (audit A1 U4, measured
-//! against the real `uci` binary: `a#b` unquoted is `a`, not `a#b`). Inside
-//! quotes `#` is always literal.
+//! Adjacent segments of one token concatenate (`'a'"b"c` -> `abc`). Audit A1
+//! U5: a quote (either kind) MAY span physical lines -- real `uci`
+//! (`parse_single_quote`/`parse_double_quote`, file.c:157,187) keeps reading
+//! following lines via `uci_getln` until the matching quote closes, and the
+//! value keeps the real `\n` byte at each line break it crossed; only
+//! end-of-file inside an open quote is `error.UnterminatedQuote`. Everything
+//! OUTSIDE a quote is still exactly one physical line: a bare word, `#`, and
+//! the statement keyword never cross a `\n`. `#` starts a comment at the
+//! start of a token, OR anywhere inside a bare (unquoted) run -- either way
+//! it truncates the current token and discards the rest of the *line* (audit
+//! A1 U4, measured against the real `uci` binary: `a#b` unquoted is `a`, not
+//! `a#b`). Inside quotes `#` is always literal.
 //!
 //! Malformed input yields a typed `ParseError` (never a panic); pass a
 //! `Diagnostics` to `parseDiag` to learn the 1-based line number.
@@ -102,7 +108,9 @@ pub const ParseError = error{
     InputTooLarge,
     /// A line exceeds `max_line_len`.
     LineTooLong,
-    /// A single or double quote was not closed before end of line.
+    /// A single or double quote was not closed before end of INPUT (audit
+    /// A1 U5: a quote may span physical lines, so this is no longer raised
+    /// at the end of the line it opened on -- only at true end of file).
     UnterminatedQuote,
     /// Line starts with a token other than `config`/`option`/`list`/`package`.
     BadKeyword,
@@ -143,9 +151,14 @@ pub const ParseError = error{
 };
 
 pub const SerializeError = error{
-    /// A value contains a control character with no UCI escape (anything
-    /// below 0x20 — UCI text has no escape that produces an actual control
-    /// byte, `\n`/`\t`/`\r` included; see the parser's double-quote comment).
+    /// A value contains a control character below 0x20 that is neither
+    /// `\t`, `\n`, nor `\r` -- those three are the ONLY sub-0x20 bytes real
+    /// `uci`'s own validator (`uci_validate_text`, util.c:96) allows in a
+    /// value, and it writes them back literally (unescaped, inside quotes),
+    /// not via a backslash escape -- there is no backslash escape that
+    /// produces a control byte at all (audit A1 U6; see the parser's
+    /// double-quote comment). Any OTHER control byte genuinely cannot be
+    /// represented in UCI text and is rejected here.
     UnserializableValue,
     /// Audit A1 U7 (write side): a section name or section type uses a
     /// character real `uci` would refuse to load — see `ParseError.InvalidName`.
@@ -427,7 +440,17 @@ const SecBuild = struct {
 
 const Parser = struct {
     arena: Allocator,
-    line_no: usize = 0,
+    bytes: []const u8 = &.{},
+    /// Byte offset of the parser's cursor into `bytes`.
+    pos: usize = 0,
+    /// 1-based; the physical line the cursor is currently scanning.
+    /// Audit A1 U5: since a quote can now span physical lines, `line_no` is
+    /// bumped by `bump`/`quoteByte` whenever a `\n` is consumed AND more
+    /// input follows it -- a `\n` that is the LAST byte of the whole input
+    /// does not start a phantom next line. That keeps a diagnostic pointing
+    /// at the last line that actually had content (typically the statement
+    /// that is wrong), not at an empty line past end of file.
+    line_no: usize = 1,
     pkg_name: ?[]const u8 = null,
     sections: std.ArrayList(Section) = .empty,
     current: ?SecBuild = null,
@@ -437,13 +460,13 @@ const Parser = struct {
     total_items: usize = 0,
 
     fn run(p: *Parser, bytes: []const u8) ParseError!void {
-        var it = std.mem.splitScalar(u8, bytes, '\n');
-        while (it.next()) |raw_line| {
-            p.line_no += 1;
-            var line = raw_line;
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            if (line.len > max_line_len) return error.LineTooLong;
-            try p.parseLine(line);
+        p.bytes = bytes;
+        p.pos = 0;
+        p.line_no = 1;
+        if (bytes.len > 0) try p.checkLineLenAt(0);
+        while (p.pos < bytes.len) {
+            try p.parseLine();
+            try p.consumeLineEnd();
         }
         try p.flushSection();
         p.finished = try p.sections.toOwnedSlice(p.arena);
@@ -455,20 +478,93 @@ const Parser = struct {
         if (p.total_items > max_total_items) return error.MemoryLimitExceeded;
     }
 
-    fn parseLine(p: *Parser, line: []const u8) ParseError!void {
-        var pos: usize = 0;
-        const kw = (try p.nextToken(line, &pos)) orelse return; // blank or comment line
+    /// True at end of input, at a bare `\n`, or at a `\r` that is itself
+    /// immediately followed by `\n` (or is the last byte of the input) --
+    /// i.e. at the boundary of the CURRENT physical line, the way the old
+    /// per-line-sliced tokenizer saw it (it pre-stripped a line's trailing
+    /// `\r` before ever tokenizing). Used OUTSIDE quotes only: a bare word,
+    /// `#`, and the statement dispatch in `parseLine` never cross this.
+    fn atLineEnd(p: *const Parser) bool {
+        if (p.pos >= p.bytes.len) return true;
+        const c = p.bytes[p.pos];
+        if (c == '\n') return true;
+        if (c == '\r' and (p.pos + 1 >= p.bytes.len or p.bytes[p.pos + 1] == '\n')) return true;
+        return false;
+    }
+
+    /// Advance past whatever `atLineEnd` is currently looking at (a CRLF or
+    /// bare LF pair, or nothing at end of input), the way `run`'s loop moves
+    /// from one statement to the next.
+    fn consumeLineEnd(p: *Parser) ParseError!void {
+        if (p.pos >= p.bytes.len) return;
+        if (p.bytes[p.pos] == '\n' or p.bytes[p.pos] == '\r') _ = try p.bump();
+    }
+
+    /// Bound the physical line starting at `start` to `max_line_len` bytes
+    /// (a trailing `\r` of a CRLF line does not count, matching the old
+    /// per-line stripping). Audit A1 U5: this still guards every individual
+    /// physical line even when a quoted value spans several of them --
+    /// U5/U6 lift the "one statement = one line" restriction, not the
+    /// per-line size cap.
+    fn checkLineLenAt(p: *Parser, start: usize) ParseError!void {
+        var end = start;
+        while (end < p.bytes.len and p.bytes[end] != '\n') end += 1;
+        if (end > start and p.bytes[end - 1] == '\r') end -= 1;
+        if (end - start > max_line_len) return error.LineTooLong;
+    }
+
+    /// Consume one byte OUTSIDE a quote, folding a CRLF pair into a single
+    /// logical `\n` (matching the old per-line `\r`-stripping). Bumps
+    /// `line_no` (and checks the next physical line's length) whenever the
+    /// logical byte consumed is `\n` and more input follows.
+    fn bump(p: *Parser) ParseError!u8 {
+        var c = p.bytes[p.pos];
+        p.pos += 1;
+        if (c == '\r' and p.pos < p.bytes.len and p.bytes[p.pos] == '\n') {
+            c = p.bytes[p.pos];
+            p.pos += 1;
+        }
+        if (c == '\n' and p.pos < p.bytes.len) {
+            p.line_no += 1;
+            try p.checkLineLenAt(p.pos);
+        }
+        return c;
+    }
+
+    /// Consume one raw byte of QUOTED content. Audit A1 U5/U6: unlike
+    /// `bump`, this does NOT fold a `\r\n` pair -- every byte the file
+    /// actually has, `\r` included, becomes part of the value verbatim,
+    /// matching `uci_getln` (file.c:41), which just keeps reading raw bytes
+    /// rather than translating line endings the way the *statement* grammar
+    /// does. Still bumps `line_no` (and checks the next line's length) on a
+    /// `\n` that has more input after it.
+    fn quoteByte(p: *Parser) ParseError!u8 {
+        const c = p.bytes[p.pos];
+        p.pos += 1;
+        if (c == '\n' and p.pos < p.bytes.len) {
+            p.line_no += 1;
+            try p.checkLineLenAt(p.pos);
+        }
+        return c;
+    }
+
+    fn skipToEndOfLine(p: *Parser) void {
+        while (!p.atLineEnd()) p.pos += 1;
+    }
+
+    fn parseLine(p: *Parser) ParseError!void {
+        const kw = (try p.nextToken()) orelse return; // blank or comment line
 
         if (std.mem.eql(u8, kw, "config")) {
-            const sec_type = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
+            const sec_type = (try p.nextToken()) orelse return error.MissingArgument;
             // Audit A1 U7: section type must match real uci's (looser) name
             // rule. Zero-length is never produced here (nextToken returns
             // null, not "", at end of line -- MissingArgument already
             // covers that), so no empty-string carve-out is needed for the
             // type specifically; `config ''` below is the name case.
             if (!validTypeChars(sec_type)) return error.InvalidName;
-            const name_tok = try p.nextToken(line, &pos);
-            if (try p.nextToken(line, &pos) != null) return error.TooManyArguments;
+            const name_tok = try p.nextToken();
+            if (try p.nextToken() != null) return error.TooManyArguments;
             try p.flushSection();
             // An empty quoted name ('') is treated as anonymous.
             const name: ?[]const u8 = if (name_tok) |n| (if (n.len > 0) n else null) else null;
@@ -494,63 +590,68 @@ const Parser = struct {
             p.current = .{ .section_type = sec_type, .name = name, .options = .empty, .index = .empty };
         } else if (std.mem.eql(u8, kw, "option") or std.mem.eql(u8, kw, "list")) {
             if (p.current == null) return error.OptionOutsideSection;
-            const key = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
+            const key = (try p.nextToken()) orelse return error.MissingArgument;
             // Audit A1 U7: option key must match real uci's name rule.
             // Zero-length keys (`option '' v`) are exempted -- see
             // `validNameChars`'s doc comment (audit A1 U18).
             if (!validNameChars(key)) return error.InvalidName;
-            const value = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
-            if (try p.nextToken(line, &pos) != null) return error.TooManyArguments;
+            const value = (try p.nextToken()) orelse return error.MissingArgument;
+            if (try p.nextToken() != null) return error.TooManyArguments;
             const kind: Option.Kind = if (kw[0] == 'o') .single else .list;
             try p.addOption(key, value, kind);
         } else if (std.mem.eql(u8, kw, "package")) {
-            const name = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
-            if (try p.nextToken(line, &pos) != null) return error.TooManyArguments;
+            const name = (try p.nextToken()) orelse return error.MissingArgument;
+            if (try p.nextToken() != null) return error.TooManyArguments;
             p.pkg_name = name; // last one wins
         } else {
             return error.BadKeyword;
         }
     }
 
-    /// Read one whitespace-delimited token starting at `pos.*`, resolving
-    /// quotes and escapes. Returns null at end of line or at a comment.
-    fn nextToken(p: *Parser, line: []const u8, pos: *usize) ParseError!?[]const u8 {
-        var i = pos.*;
-        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) i += 1;
-        if (i >= line.len or line[i] == '#') {
-            pos.* = line.len;
+    /// Read one whitespace-delimited token starting at the parser's cursor,
+    /// resolving quotes and escapes. Returns null at end of line, at a
+    /// comment, or at end of input.
+    fn nextToken(p: *Parser) ParseError!?[]const u8 {
+        while (p.pos < p.bytes.len and (p.bytes[p.pos] == ' ' or p.bytes[p.pos] == '\t')) p.pos += 1;
+        if (p.atLineEnd()) return null;
+        if (p.bytes[p.pos] == '#') {
+            p.skipToEndOfLine();
             return null;
         }
 
         var buf: std.ArrayList(u8) = .empty;
-        while (i < line.len) {
-            const c = line[i];
+        outer: while (!p.atLineEnd()) {
+            const c = p.bytes[p.pos];
             if (c == ' ' or c == '\t') break;
             switch (c) {
                 '\'' => {
-                    // Single quotes: no escapes, everything literal.
-                    i += 1;
-                    const end = std.mem.indexOfScalarPos(u8, line, i, '\'') orelse
-                        return error.UnterminatedQuote;
-                    try buf.appendSlice(p.arena, line[i..end]);
-                    i = end + 1;
+                    // Single quotes: no escapes, everything literal. Audit
+                    // A1 U5: the closing `'` may be on a later physical
+                    // line; only running out of input unclosed is an error.
+                    p.pos += 1;
+                    while (true) {
+                        if (p.pos >= p.bytes.len) return error.UnterminatedQuote;
+                        const d = try p.quoteByte();
+                        if (d == '\'') break;
+                        try buf.append(p.arena, d);
+                    }
                 },
                 '"' => {
-                    i += 1;
+                    p.pos += 1;
                     var closed = false;
-                    while (i < line.len) {
-                        const d = line[i];
+                    while (p.pos < p.bytes.len) {
+                        const d = try p.quoteByte();
                         if (d == '"') {
                             closed = true;
-                            i += 1;
                             break;
                         }
                         if (d == '\\') {
-                            i += 1;
-                            if (i >= line.len) return error.UnterminatedQuote;
+                            if (p.pos >= p.bytes.len) return error.UnterminatedQuote;
                             // A backslash always just escapes-and-drops: the
                             // following character is kept verbatim, whatever
-                            // it is. Verified against the real `uci` binary
+                            // it is -- including a real `\n` where a quote
+                            // continues onto the next physical line (audit
+                            // A1 U5). Verified against the real `uci` binary
                             // (see SPEC.md's "real uci capture" section):
                             // `\n`/`\t`/`\r` are NOT special-cased to
                             // control bytes there either — `"a\nb"` round-
@@ -559,40 +660,42 @@ const Parser = struct {
                             // kept as-is, same as any other `\<char>`. UCI
                             // text has no escape that produces an actual
                             // control byte.
-                            try buf.append(p.arena, line[i]);
-                            i += 1;
+                            const e = try p.quoteByte();
+                            try buf.append(p.arena, e);
                         } else {
                             try buf.append(p.arena, d);
-                            i += 1;
                         }
                     }
                     if (!closed) return error.UnterminatedQuote;
                 },
+                '#' => {
+                    p.skipToEndOfLine();
+                    break :outer;
+                },
                 else => {
-                    // Bare run: up to whitespace, a quote (concatenation), or
-                    // '#'. Audit A1 U4: real `uci` (`parse_str`, file.c:206)
+                    // Bare run: up to whitespace, a quote (concatenation),
+                    // '#', or end of line -- a bare word never spans lines.
+                    // Audit A1 U4: real `uci` (`parse_str`, file.c:206)
                     // treats '#' ANYWHERE in a bare run as comment-start, not
                     // just at the start of a token -- it truncates the
                     // current token there and discards the rest of the
-                    // *line* (not just the token) as a comment. This module
-                    // previously kept '#' mid-word literal, which SPEC.md
-                    // documented as "the format", a claim the real binary
-                    // disproves (`a#b` -> `a` there, not `a#b`). '#' inside a
+                    // *line* (not just the token) as a comment. '#' inside a
                     // quoted segment is unaffected -- real uci's quote
                     // scanners never reach this branch at all.
-                    const start = i;
-                    while (i < line.len) : (i += 1) {
-                        const d = line[i];
+                    const start = p.pos;
+                    while (!p.atLineEnd()) {
+                        const d = p.bytes[p.pos];
                         if (d == ' ' or d == '\t' or d == '\'' or d == '"' or d == '#') break;
+                        p.pos += 1;
                     }
-                    try buf.appendSlice(p.arena, line[start..i]);
-                    if (i < line.len and line[i] == '#') {
-                        i = line.len; // discard the rest of the line too
+                    try buf.appendSlice(p.arena, p.bytes[start..p.pos]);
+                    if (!p.atLineEnd() and p.bytes[p.pos] == '#') {
+                        p.skipToEndOfLine(); // discard the rest of the line too
+                        break :outer;
                     }
                 },
             }
         }
-        pos.* = i;
         return try buf.toOwnedSlice(p.arena);
     }
 
@@ -718,10 +821,24 @@ fn writeWord(gpa: Allocator, out: *std.ArrayList(u8), word: []const u8) Serializ
     return writeValue(gpa, out, word);
 }
 
+/// Audit A1 U6: `\t`/`\n`/`\r` are the ONLY sub-0x20 bytes real `uci`
+/// permits in a value (`uci_validate_text`, util.c:96) and it writes them
+/// back LITERALLY, not via a backslash escape -- there is no backslash
+/// escape that produces a control byte at all (see the parser's
+/// double-quote comment). This module previously treated ALL sub-0x20 bytes
+/// alike and rejected them, which rejected three bytes real `uci` accepts
+/// and re-emits. `\n` in particular is now representable end to end because
+/// a quote may span physical lines (audit A1 U5): a value containing a real
+/// newline round-trips as a multi-line single- or double-quoted literal,
+/// the same shape `uci export` itself produces.
+fn isEscapelessControl(c: u8) bool {
+    return c < 0x20 and c != '\t' and c != '\n' and c != '\r';
+}
+
 fn writeValue(gpa: Allocator, out: *std.ArrayList(u8), value: []const u8) SerializeError!void {
     var needs_double = false;
     for (value) |c| {
-        if (c == '\'' or c < 0x20) {
+        if (c == '\'' or isEscapelessControl(c)) {
             needs_double = true;
             break;
         }
@@ -735,11 +852,11 @@ fn writeValue(gpa: Allocator, out: *std.ArrayList(u8), value: []const u8) Serial
     // Double-quote mode only round-trips `\\` and `\"` (the parser's
     // backslash rule drops the backslash and keeps ANY other character
     // literally — including n/t/r, verified against the real `uci` binary,
-    // see the parser comment above). So any actual control byte other than
-    // the quote-triggering `'` has no representable escape here and must be
-    // rejected, not silently mis-escaped as `\n`/`\t`/`\r`.
+    // see the parser comment above); `\t`/`\n`/`\r` need no escape at all
+    // and are written raw below. Any OTHER control byte still has no
+    // representable escape and must be rejected, not silently mis-escaped.
     for (value) |c| {
-        if (c < 0x20) return error.UnserializableValue;
+        if (isEscapelessControl(c)) return error.UnserializableValue;
     }
     try out.append(gpa, '"');
     for (value) |c| switch (c) {
@@ -1040,18 +1157,27 @@ test "serializer rejects unescapable control chars" {
     try testing.expectError(error.UnserializableValue, serialize(gpa, &pkg));
 }
 
-test "serializer rejects \\n \\t \\r too — UCI text has no escape that produces them (real-uci finding)" {
-    // Before the fix, these were treated as escapable via \n/\t/\r; the real
-    // `uci` binary's parser proves those aren't actual control-byte escapes
-    // (see "double-quote escapes" above), so a value containing a REAL
-    // newline/tab/CR byte cannot be represented in UCI text at all and must
-    // be rejected the same as any other sub-0x20 control byte.
+test "serializer WRITES \\n \\t \\r literally, unescaped -- audit A1 U6, supersedes the old rejection" {
+    // Audit A1 U6: real `uci_validate_text` (util.c:96) explicitly allows
+    // `\t`/`\n`/`\r` in a value -- the ONLY three sub-0x20 bytes it allows
+    // -- and real `uci export` writes them back raw, inside quotes, no
+    // escape at all. The module previously rejected all three as
+    // `error.UnserializableValue`, having conflated "no BACKSLASH escape
+    // produces a control byte" (true) with "no control byte can be
+    // represented" (false for these three: they're written literally, not
+    // escaped). `\n` round-trips as a real multi-line quoted value (audit
+    // A1 U5 lifted the one-statement-one-line restriction that used to make
+    // that impossible).
     const gpa = testing.allocator;
-    for ([_][]const u8{ "a\nb", "a\tb", "a\rb" }) |bad| {
-        const opts = [_]Option{.{ .key = "k", .kind = .single, .values = &.{bad} }};
+    for ([_][]const u8{ "a\nb", "a\tb", "a\rb" }) |v| {
+        const opts = [_]Option{.{ .key = "k", .kind = .single, .values = &.{v} }};
         const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
         const pkg: Package = .{ .sections = &secs };
-        try testing.expectError(error.UnserializableValue, serialize(gpa, &pkg));
+        const text = try serialize(gpa, &pkg);
+        defer gpa.free(text);
+        var reparsed = try parse(gpa, text);
+        defer reparsed.deinit(gpa);
+        try testing.expectEqualStrings(v, reparsed.sections[0].get("k").?);
     }
 }
 
@@ -1081,6 +1207,55 @@ test "error: unterminated double quote with line number" {
         parseDiag(gpa, "config s\n\toption a \"b\\\n", &diag),
     );
     try testing.expectEqual(@as(usize, 2), diag.line);
+}
+
+test "audit A1 U5: a quoted value may span physical lines, matching real uci" {
+    // Real `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187)
+    // keeps reading via `uci_getln` when a quote hits end of line without
+    // closing -- it does not error until end of FILE. The value keeps the
+    // real `\n` byte at every line break it crossed (file.c:41). This is
+    // the audit's own end-to-end example (single- and double-quoted).
+    const gpa = testing.allocator;
+    var pkg = try parse(
+        gpa,
+        "config t\n\toption tabbed 'a\tb'\n\toption multi 'line1\nline2'\n",
+    );
+    defer pkg.deinit(gpa);
+    try testing.expectEqualStrings("a\tb", pkg.sections[0].get("tabbed").?);
+    try testing.expectEqualStrings("line1\nline2", pkg.sections[0].get("multi").?);
+
+    // Double-quoted values span lines too, including through an escape that
+    // straddles the line break.
+    var pkg2 = try parse(
+        gpa,
+        "config t\n\toption v \"line1\\\nline2\"\n\toption w \"a\nb\"\n",
+    );
+    defer pkg2.deinit(gpa);
+    try testing.expectEqualStrings("line1\nline2", pkg2.sections[0].get("v").?);
+    try testing.expectEqualStrings("a\nb", pkg2.sections[0].get("w").?);
+
+    // A statement AFTER a multi-line quote is still parsed correctly --
+    // line_no tracking must have caught up, not gotten stuck. The quote
+    // itself spans physical lines 2-3 ("'a" / "b'"), so "bogus" is on
+    // physical line 4.
+    var diag: Diagnostics = .{};
+    try testing.expectError(
+        error.BadKeyword,
+        parseDiag(gpa, "config t\n\toption v 'a\nb'\nbogus\n", &diag),
+    );
+    try testing.expectEqual(@as(usize, 4), diag.line);
+
+    // Still unterminated if the closing quote never comes at all, even
+    // across several physical lines -- this is genuine end of FILE, not
+    // end of the first line.
+    try testing.expectError(
+        error.UnterminatedQuote,
+        parse(gpa, "config t\n\toption v 'a\nb\nc\n"),
+    );
+
+    // Round-trips: serialize(parse(x)) reparses to the same model, and a
+    // value with an embedded real newline survives the round trip too.
+    try expectRoundTrip("config t\n\toption multi 'line1\nline2'\n");
 }
 
 test "error: option before any section" {

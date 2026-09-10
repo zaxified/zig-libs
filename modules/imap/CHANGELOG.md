@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NEW, not breaking:** A1 fix campaign, F6 -- `LIST`/`LSUB`/`STATUS`
+  had no parser at all. `wire.expectMailbox` (the UTF-7 decoder + `INBOX` canonicaliser a
+  mailbox NAME needs) had zero production callers; `client.zig` had no `list`/`lsub`/
+  `status` method; `response.zig`'s own test said so directly ("LIST is not parsed yet").
+  New `list.zig`: `parseMailboxList` (`* LIST`/`* LSUB`, RFC 9051 §7.3.1), `parseStatus`
+  (`* STATUS`, §7.3.2, the eight attributes real servers send), `encodeList`/`encodeLsub`/
+  `encodeStatus` on the way out. Three new `response.Data` variants (`list`, `lsub`,
+  `mailbox_status`) and three new `Client` methods (`listMailboxes`, `lsubMailboxes`,
+  `statusMailbox`), built on the same `out_gpa`-collecting pattern as `fetchMessages`/
+  `searchMessages`. Not a port -- these three commands are not in `emersion/go-imap`'s
+  ported surface (`NOTICE`), so the shape follows this module's own encode/parse split.
+  An unknown `mbox-list-extended` item or `status-att` extension is discarded, not
+  rejected, matching the tolerance `readCode` already gives an unknown `[CODE]`.
+  `scripts/modtest imap`: 153/154 (was 146/147), Debug and ReleaseFast.
+
 - **2026-09-10** (2) — **BEHAVIOURAL, not breaking:** A1 fix campaign, F9 (partial: the
   `FETCH BODY[...]` section half). `fetch.isSectionChar` was `ch != ']'`, so
   `BODY[A\r\nB]`/`BODY[A\x00B]` parsed and handed the caller a section string with an

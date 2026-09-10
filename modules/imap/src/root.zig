@@ -4,8 +4,8 @@
 //!
 //! **Status: complete.** The mailbox-name codec, the wire grammar, the
 //! response decoder, the command encoder, the client session (`CAPABILITY` /
-//! `LOGIN` / `SELECT`) and `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE` are
-//! all here — see README.md.
+//! `LOGIN` / `SELECT`) and `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE` /
+//! `LIST` / `LSUB` / `STATUS` are all here — see README.md.
 //!
 //! Like `smtp` and `dtls`, this module **owns no socket and speaks no TLS**.
 //! It works on caller-supplied bytes and `std.Io` streams, so it drops onto
@@ -54,6 +54,9 @@ pub const fetch = @import("fetch.zig");
 /// `SEARCH` (RFC 9051 §6.4.4), both reply shapes.
 pub const search = @import("search.zig");
 
+/// `LIST` / `LSUB` (RFC 9051 §6.3.9, §6.3.10) and `STATUS` (§6.3.11).
+pub const list = @import("list.zig");
+
 /// The client session (RFC 9051 §3): state, tag matching, literal handshake.
 pub const client = @import("client.zig");
 pub const Client = client.Client;
@@ -68,6 +71,7 @@ test {
     _ = command;
     _ = fetch;
     _ = search;
+    _ = list;
     _ = client;
     // LIVE interop; skips loudly when the peer is not installed.
     _ = @import("live_test.zig");

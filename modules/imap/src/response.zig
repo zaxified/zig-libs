@@ -24,8 +24,9 @@ const testing = std.testing;
 const wire = @import("wire.zig");
 const fetchmod = @import("fetch.zig");
 const searchmod = @import("search.zig");
+const listmod = @import("list.zig");
 
-pub const Error = wire.Error || fetchmod.Error || searchmod.Error || error{
+pub const Error = wire.Error || fetchmod.Error || searchmod.Error || listmod.Error || error{
     /// A status word that is not OK / NO / BAD / PREAUTH / BYE.
     BadStatus,
     /// A tagged response may only carry OK, NO or BAD.
@@ -94,6 +95,13 @@ pub const Data = union(enum) {
     search: searchmod.Result,
     /// `* ESEARCH (TAG "x") ...` — the IMAP4rev2 shape.
     esearch: searchmod.Result,
+    /// `* LIST ...` (audit A1 F6).
+    list: listmod.Entry,
+    /// `* LSUB ...` — same shape as `LIST`, different command it answers.
+    lsub: listmod.Entry,
+    /// `* STATUS mailbox (...)` (audit A1 F6). Named `mailbox_status` to
+    /// stay clearly distinct from `Data.status` (`OK`/`NO`/.../`BYE`).
+    mailbox_status: listmod.StatusReply,
     /// A kind this module does not parse yet. `rest` is the remainder of the
     /// line, verbatim, so a caller can handle it and the reader stays in sync.
     other: struct {
@@ -203,6 +211,24 @@ pub const Reader = struct {
             const r = try searchmod.parseESearch(d);
             try d.expectCrlf();
             return .{ .esearch = r };
+        }
+
+        // Audit A1 F6: LIST/LSUB/STATUS had no parser here at all -- see
+        // list.zig's module comment.
+        if (std.ascii.eqlIgnoreCase(word, "LIST")) {
+            const entry = try listmod.parseMailboxList(d);
+            try d.expectCrlf();
+            return .{ .list = entry };
+        }
+        if (std.ascii.eqlIgnoreCase(word, "LSUB")) {
+            const entry = try listmod.parseMailboxList(d);
+            try d.expectCrlf();
+            return .{ .lsub = entry };
+        }
+        if (std.ascii.eqlIgnoreCase(word, "STATUS")) {
+            const reply = try listmod.parseStatus(d);
+            try d.expectCrlf();
+            return .{ .mailbox_status = reply };
         }
 
         if (number) |n| {
@@ -459,10 +485,12 @@ test "RFC 9051 §6.3.2: the whole SELECT transcript" {
     // after the backslash loses it -- and with it, "keywords may be created".
     try testing.expectEqualStrings("\\*", perm[2]);
 
-    // LIST is not parsed yet; it must still come back intact and in sync.
-    const list = (try rd.next()).data.other;
-    try testing.expectEqualStrings("LIST", list.kind);
-    try testing.expectEqualStrings("() \"/\" INBOX", list.rest.?);
+    // Audit A1 F6: this used to be `.data.other` (LIST had no parser at
+    // all). Now parsed like any other untagged data.
+    const list = (try rd.next()).data.list;
+    try testing.expectEqual(@as(usize, 0), list.flags.len);
+    try testing.expectEqualStrings("/", list.delimiter.?);
+    try testing.expectEqualStrings("INBOX", list.mailbox);
 
     const done = (try rd.next()).tagged;
     try testing.expectEqualStrings("A142", done.tag);

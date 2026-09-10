@@ -5,8 +5,10 @@ socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
 **Status: COMPLETE.** Modified UTF-7, the wire grammar, the response reader,
-the command encoder, the session, and — from part 2 — `FETCH` with `ENVELOPE`
-and `BODYSTRUCTURE`, `SEARCH` in both reply shapes, and `IDLE`.
+the command encoder, the session, `FETCH` with `ENVELOPE` and `BODYSTRUCTURE`,
+`SEARCH` in both reply shapes, `IDLE`, and `LIST` / `LSUB` / `STATUS` (audit
+A1 F6 — not a port, these three are not in go-imap's ported surface; see
+`NOTICE`).
 
 **Anchored against a live server.** Alongside the RFC transcripts (which pin
 the *parsing*), a LIVE test drives the client against **pymap** — an
