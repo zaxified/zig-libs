@@ -1576,3 +1576,35 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered));
     }
 }
+
+// ── audit F8: ModProof/PrmProof.fromBytesAlloc had no fuzz coverage —
+//    the two remaining decoders of the twelve the audit counted (with
+//    `RangeProof`/`MtaProof`/`MtaProofWc` from `zkproofs.zig`, closed
+//    alongside this). Both take a modulus context but do not allocate
+//    (fixed-size `entries` arrays), so the fixture is just the same toy
+//    8-bit `n_tilde` `root.zig`'s own `toyAuxParams`/this file's decoder
+//    fixture in `zkproofs.zig` both use — no Paillier key needed here. ──
+
+fn toyNTilde() root.AuxModulus {
+    return root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
+}
+
+test "fuzz: ModProof.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
+    try testing.fuzz({}, fuzzModProofFromBytesAlloc, .{});
+}
+
+fn fuzzModProofFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = ModProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch return;
+}
+
+test "fuzz: PrmProof.fromBytesAlloc never panics on arbitrary bytes (audit F8)" {
+    try testing.fuzz({}, fuzzPrmProofFromBytesAlloc, .{});
+}
+
+fn fuzzPrmProofFromBytesAlloc(_: void, smith: *std.testing.Smith) !void {
+    var buf: [4096]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    _ = PrmProof.fromBytesAlloc(toyNTilde(), buf[0..len]) catch return;
+}

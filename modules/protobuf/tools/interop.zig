@@ -324,7 +324,7 @@ fn liveCheck(ref: *Ref) !void {
             switch (frozen) {
                 .missing => bad("{s}: no frozen verdict — run with --capture", .{c.name}),
                 .rejected => bad("{s}: the fixture records a rejection, the reference accepted it", .{c.name}),
-                .normalized => |want| if (c.expect != .accept)
+                .normalized => |want| if (conf.referenceRejects(c.expect))
                     bad("{s}: the reference now ACCEPTS what the case table says it rejects", .{c.name})
                 else
                     expectBytes(c.name, want, got),
@@ -333,7 +333,7 @@ fn liveCheck(ref: *Ref) !void {
             error.ReferenceRejected => switch (frozen) {
                 .missing => bad("{s}: no frozen verdict — run with --capture", .{c.name}),
                 .normalized => bad("{s}: the fixture records an acceptance, the reference rejected it", .{c.name}),
-                .rejected => if (c.expect == .accept)
+                .rejected => if (!conf.referenceRejects(c.expect))
                     bad("{s}: the reference now REJECTS what the case table says it accepts", .{c.name})
                 else
                     ok("{s}", .{c.name}),
@@ -491,15 +491,15 @@ fn captureVectors(ref: *Ref, provenance: []const u8) !void {
         try out.print(gpa, "    .{{ .name = \"{s}\", .normalized = ", .{c.name});
         if (ref.normalize(conf.schemaName(c.msg), c.input)) |bytes| {
             defer gpa.free(bytes);
-            if (c.expect != .accept) {
+            if (conf.referenceRejects(c.expect)) {
                 std.debug.print("REFUSING TO CAPTURE: '{s}' is declared {s} but the reference accepted it\n", .{ c.name, @tagName(c.expect) });
                 return error.ReferenceChangedItsMind;
             }
             try hexBytes(&out, gpa, bytes);
         } else |e| switch (e) {
             error.ReferenceRejected => {
-                if (c.expect == .accept) {
-                    std.debug.print("REFUSING TO CAPTURE: '{s}' is declared accept but the reference rejected it\n", .{c.name});
+                if (!conf.referenceRejects(c.expect)) {
+                    std.debug.print("REFUSING TO CAPTURE: '{s}' predicts a reference acceptance but the reference rejected it\n", .{c.name});
                     return error.ReferenceChangedItsMind;
                 }
                 try out.appendSlice(gpa, "null");

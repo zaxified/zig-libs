@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds fuzz harnesses for
+  the last 5 of the 12 originally-unfuzzed public `fromBytes*` entry points
+  (audit F8, closed): `RangeProof`/`MtaProof`/`MtaProofWc`.`fromBytesAlloc`
+  (`zkproofs.zig`) and `ModProof`/`PrmProof`.`fromBytesAlloc`
+  (`aux_proofs.zig`). Same shape as the 7 already covered (a fixed, cheap,
+  one-time fixture built outside the fuzz loop — a toy 8-bit `n_tilde` and
+  a `min_generate_bits`/512-bit Paillier key, not the 2048-bit fixture this
+  module's security-relevant tests need — then arbitrary bytes into the
+  decoder). 12 of 12 now covered. No production code changed.
+
+- **2026-09-10** — **DOC ONLY, no behavior changed:** this file's
+  2026-07-15 entry below (and, independently, `paillier.decrypt`'s own doc
+  comment) both described the variable-time Paillier `L`-function division
+  as accepted because the value it divides is "masked by a fresh uniform
+  `β'` and is therefore independent of the secret nonce." That is wrong as
+  this module actually calls it: `mta.zig`'s `beta_prime` is drawn by
+  `randomScalar`, uniform over `Zq` (the curve's ~256-bit scalar field),
+  not over `Z_N` (this module's Paillier modulus, ~2048 bits) — a `Zq`-
+  sized mask over a `Z_N`-sized value is not the independence case either
+  sentence described. `SPEC.md`'s own "A5" section already had the correct
+  accounting; nobody had checked the CHANGELOG/`paillier` comment against
+  it. See `SPEC.md` A5 (this pass's addendum) for the measurement — an ad
+  hoc `zig build-exe -fvalgrind` run over `paillier`'s own gated ctgrind
+  harness confirms the L-function division IS reached by taint from the
+  secret key (333/143 contexts, `crt`/`noncrt`, vs 0/0 untainted) — and for
+  what remains genuinely open (whether it is *exploitable*, which no
+  measurement in this pass answers). Not re-litigating the older entry's
+  history below; recording the correction here instead.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `signWithShares` now builds
   Alice's Paillier encryption of her secret and its range proof ONCE per
   ordered `(i,j)` pair and shares it between the pair's γ- and w-conversions,

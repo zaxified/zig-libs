@@ -2827,3 +2827,70 @@ test "audit: an over-long s2 is refused before it is used as an exponent" {
         try testing.expect(!verifyAliceRange(evil, c_a, pk, setup.aux));
     }
 }
+
+// ── audit F8: RangeProof/MtaProof/MtaProofWc.fromBytesAlloc had no fuzz
+//    coverage — the wire decoders for exactly what a counterparty sends
+//    during signing (unlike `root.zig`'s three FUZZED decoders, which are
+//    all out-of-band dealer-issued material). Same cheap shape as
+//    `root.zig`'s `KeyShare.fromBytesAlloc` harness (audit F2's fix): a
+//    fixed one-time fixture built OUTSIDE the fuzz loop (cheap — a toy
+//    8-bit `n_tilde` and a real but small `min_generate_bits`-sized
+//    Paillier key, not the 2048-bit `realAuxAndKey` this file's OTHER
+//    tests need for the q^7 floor, which is irrelevant to whether the
+//    DECODER panics or over-allocates on arbitrary bytes) — then arbitrary
+//    bytes into each decoder. ────────────────────────────────────────────
+
+const DecoderFixture = struct {
+    n_tilde: root.AuxModulus,
+    alice_pk: paillier.PublicKey,
+};
+
+/// One-time, cheap: `n_tilde` is the same 8-bit toy modulus `root.zig`'s
+/// own `toyAuxParams` uses for its round-trip test (structurally valid,
+/// no safe-prime search); `alice_pk` is a real but `min_generate_bits`
+/// (512-bit, sub-millisecond) Paillier key — plenty for a decoder to have
+/// a modulus context to bound-check against, and far cheaper than the
+/// 2048-bit fixture this file's security-relevant tests require.
+fn buildDecoderFixture() DecoderFixture {
+    var prng = std.Random.DefaultPrng.init(0x646563666978); // "decfix"
+    const random = prng.random();
+    const kp = paillier.generate(random, paillier.min_generate_bits) catch unreachable;
+    const n_tilde = root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
+    return .{ .n_tilde = n_tilde, .alice_pk = kp.public };
+}
+
+test "fuzz: RangeProof.fromBytesAlloc never panics or over-allocates (audit F8)" {
+    try testing.fuzz(buildDecoderFixture(), fuzzRangeProofFromBytesAlloc, .{});
+}
+
+fn fuzzRangeProofFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const result = RangeProof.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
+    defer result.deinit(allocator);
+}
+
+test "fuzz: MtaProof.fromBytesAlloc never panics or over-allocates (audit F8)" {
+    try testing.fuzz(buildDecoderFixture(), fuzzMtaProofFromBytesAlloc, .{});
+}
+
+fn fuzzMtaProofFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const result = MtaProof.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
+    defer result.deinit(allocator);
+}
+
+test "fuzz: MtaProofWc.fromBytesAlloc never panics or over-allocates (audit F8)" {
+    try testing.fuzz(buildDecoderFixture(), fuzzMtaProofWcFromBytesAlloc, .{});
+}
+
+fn fuzzMtaProofWcFromBytesAlloc(fx: DecoderFixture, smith: *std.testing.Smith) !void {
+    const allocator = testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const result = MtaProofWc.fromBytesAlloc(allocator, fx.n_tilde, fx.alice_pk, buf[0..len]) catch return;
+    defer result.deinit(allocator);
+}

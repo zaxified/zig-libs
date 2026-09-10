@@ -23,7 +23,7 @@
 //!
 //!   zig build interop-protobuf -- --capture
 //!
-//! Reference: google.protobuf 4.21.12 on Python 3.14.4, 2026-09-06
+//! Reference: google.protobuf 4.21.12 on Python 3.14.4, 2026-09-11
 
 pub const Verdict = struct {
     name: []const u8,
@@ -41,4 +41,6 @@ pub const verdicts = [_]Verdict{
     .{ .name = "utf8_bad_surrogate", .normalized = null },
     .{ .name = "utf8_bad_truncated", .normalized = null },
     .{ .name = "utf8_raw_ff_ok", .normalized = &.{ 0x82, 0x01, 0x01, 0xff } },
+    .{ .name = "nonminimal_tag_stricter", .normalized = &.{ 0x90, 0x00, 0x05 } },
+    .{ .name = "field_number_out_of_range_stricter", .normalized = &.{ 0x80, 0x80, 0x80, 0x80, 0x10, 0x00 } },
 };

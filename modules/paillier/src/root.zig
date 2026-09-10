@@ -1293,20 +1293,51 @@ pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
     // below, so allocation failures are impossible (`catch unreachable`).
     //
     // `divFloor` is variable-time in `x` (`paillier` F3 / `threshold_ecdsa`
-    // F5, wave-2 audit): this is a real, accepted timing leak on the
-    // decrypted plaintext `m = L(x)*mu mod n`, not on the secret key
-    // (`lambda`/`mu`/the CRT factors never reach this division). It is
-    // accepted rather than made constant-time because `threshold_ecdsa`'s
-    // MtA — this repo's one consumer that decrypts a value it did not
-    // choose itself — never decrypts a bare secret: Bob's MtA ciphertext
-    // carries `a*b + beta'`, and `beta'` is drawn uniformly fresh per MtA
-    // instance (`samplePaillierRandomness`) *before* Alice's secret `a`
-    // (the nonce-share timing this leak would otherwise threaten) is
-    // combined into it. A uniform mask makes the masked sum
-    // information-theoretically independent of `a`, so whatever this
-    // division's timing reveals about `x`/`m` reveals nothing about the
-    // masked-out secret. Revisit if a future consumer ever decrypts an
-    // unmasked secret directly.
+    // F5, wave-2 audit): this is a real timing leak on the decrypted
+    // plaintext `m = L(x)*mu mod n`, not on the secret key (`lambda`/`mu`/
+    // the CRT factors never reach this division).
+    //
+    // ⚠ CORRECTED 2026-09-10 (threshold_ecdsa F5, third look): an earlier
+    // version of this comment called the leak "accepted" on the theory that
+    // `threshold_ecdsa`'s MtA masks the decrypted value with a uniform
+    // `beta'` drawn via `samplePaillierRandomness` before Alice's secret `a`
+    // is combined into it, making the masked sum information-theoretically
+    // independent of `a`. That reasoning does not hold as this module is
+    // actually wired, and `threshold_ecdsa`'s own `SPEC.md` (section "A5")
+    // already says so: `threshold_ecdsa/src/mta.zig`'s `beta_prime` is drawn
+    // by `randomScalar` — uniform over `Zq`, the ~256-bit curve scalar
+    // field — NOT by `samplePaillierRandomness` — uniform over `Z_N`, this
+    // module's ~2048-bit modulus. Those are two different functions over
+    // two very differently sized domains; `samplePaillierRandomness` in
+    // this file is `encrypt`'s/`mtaBobResponseChecked`'s *ciphertext*
+    // randomness `r`, never the MtA mask. The masked plaintext Bob actually
+    // decrypts is `a*b + beta'` — a value up to `~q²` masked by a `~q`
+    // blind — which is not remotely uniform over `Z_N`, so it is not
+    // independent of `a` (Alice's nonce share `k_i`) in the sense a full-
+    // width mask would give.
+    //
+    // What IS now measured (2026-09-10, ad hoc `zig build-exe -fvalgrind` +
+    // `valgrind --tool=memcheck` over this module's own gated
+    // `ctgrind_harness.zig`, `crt`/`noncrt` targets, `lambda`/`mu`/CRT-block
+    // tainted): the leak reaches this exact line. `target=crt`:
+    // **333 contexts / 92089 errors** tainted vs **0/0** untainted control;
+    // `target=noncrt`: **143/3851** vs **0/0**; `math.big.int.Managed.
+    // divFloor` called from `root.decrypt` (this line) is a first-class
+    // contributor in both (confirmed from the raw memcheck stack traces,
+    // not inferred). So: the taint DOES reach the L-function division —
+    // that half of the question is now answered, by this module's own
+    // pinned gate (`scripts/ctgrind-expected.tsv` rows `paillier/crt`,
+    // `paillier/noncrt`), not a new probe. What remains open — and is
+    // NOT something either this file or that gate can answer — is
+    // `threshold_ecdsa/SPEC.md`'s A5 quantitative question: whether
+    // divFloor's limb-granularity timing on this partially-masked value is
+    // exploitable against `k_i` in practice, accumulated across the
+    // `O(t²)` MtA instances per signature and across sessions. That is a
+    // genuine side-channel/statistical question for a cryptographer, not a
+    // fixer pass — treat it the same as `threshold_ecdsa` audit items
+    // F4(b)/(c). Do not re-introduce a blanket "accepted, harmless"
+    // characterization here without re-deriving it against the actual
+    // `Zq`-sized mask.
     var scratch: [scratch_bytes]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const gpa = fba.allocator();

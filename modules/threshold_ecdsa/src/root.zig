@@ -2551,6 +2551,24 @@ test "corpus: the KeyShare seeds reach the decoder, only the well-formed one is 
     try testing.expectEqual(@as(usize, 1), accepted);
 }
 
+// ── audit F8: `Element.fromBytes` was the 12th unfuzzed decoder this
+// finding counted -- present in the audit's own list ("root.KeyShare.
+// fromBytesAlloc, root.Element.fromBytes, zkproofs...") but overlooked by
+// every earlier pass at this finding (each one enumerated "the remaining
+// N" from the previous pass's own count rather than re-checking against
+// the audit's original twelve). FIXED-SIZE `fromBytes([Ne]u8)`, same shape
+// as `signing.zig`'s five wire-message codecs -- `smith.bytes` into the
+// exact-width buffer is the whole harness, no corpus needed. This closes
+// the audit's twelfth and last decoder.
+test "fuzz: Element.fromBytes never panics (audit F8)" {
+    try testing.fuzz({}, fuzzElementFromBytes, .{});
+}
+fn fuzzElementFromBytes(_: void, smith: *std.testing.Smith) !void {
+    var buf: [Element.encoded_length]u8 = undefined;
+    smith.bytes(&buf);
+    _ = Element.fromBytes(buf) catch return;
+}
+
 /// ⛔ A LOCAL COPY of `testkit.fuzz.seedInto`, and it has to be one — see the
 /// note on `check-testonly` below. Enrolling this module in `test_deps` puts it
 /// into that gate, whose probe imports the PUBLISHED module and references every
