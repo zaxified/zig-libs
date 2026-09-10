@@ -1532,6 +1532,22 @@ test "fromPrimes derives the phe-cross-checked toy key exactly (p=11, q=17)" {
     try testing.expectEqual(@as(u32, 180), try kp.secret.mu.toPrimitive(u32)); // 80^-1 mod 187
 }
 
+// F7 (wave-3 audit) flagged this test's guards as mutation-invisible: `m9`
+// (delete the `p == q` check, line ~730) and `m10` (delete both `p, q >= 3`
+// checks, line ~733-734) survive the suite GREEN, same as `m11` did for the
+// later L-exactness check (see the census test below). Unlike `m11`, the
+// audit did not run a redundancy census for `m9`/`m10` and left them as
+// unexamined "real gaps" in its accounting. Ran one directly (2026-09-10,
+// dojezd): with each guard disabled in turn (`if (false and ...)`),
+// exhaustive `p == q` over `v` in `[2, 99]` and exhaustive `p` (or `q`) in
+// `{0, 1, 2}` against `q` (or `p`) in `[2, 99]`, both orders — **0 of either
+// census got ACCEPTED, identical to the guards-enabled baseline (also 0)**.
+// Every case this test pins below is independently caught downstream (the
+// L-exactness check / `bigModInverse`'s implicit `gcd` requirement) even
+// with its own dedicated guard removed. `m9`/`m10` are therefore REFUTED —
+// harmless defense-in-depth, the same class as `m1`/`m2`/`m16`/`m11` — not
+// confirmed gaps; no new pin needed since this test already exercises every
+// case the census covered.
 test "fromPrimes rejects p == q, degenerate factors, and oversized products" {
     try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_p, &kat_p)); // p == q
     try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{0}, &kat_q));
