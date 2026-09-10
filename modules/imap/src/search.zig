@@ -318,6 +318,20 @@ pub fn parseSearch(d: *wire.Decoder) Error!Result {
 pub fn parseESearch(d: *wire.Decoder) Error!Result {
     var out: Result = .{};
 
+    // RFC 9051 §7.3.4 ABNF: `"ESEARCH" [SP search-correlator] *(SP
+    // search-return-data)` -- both the correlator and every return-data item
+    // are individually optional, so `* ESEARCH` alone, `* ESEARCH COUNT 5`
+    // (no correlator) and `* ESEARCH (TAG "x") COUNT 5` (both) are all
+    // legal. F10 (`~/CML/20260901-zig-libs-audit/A1/imap.md`): the caller
+    // used to consume this SP unconditionally before ever reaching here,
+    // which worked for the "has correlator" case but left the no-correlator
+    // case one SP short at the check below -- `COUNT 5` was mistaken for
+    // "nothing follows" and then `expectCrlf()` choked on the un-consumed
+    // "COUNT 5". Consuming it HERE, once, fixes both: nothing follows ->
+    // false -> empty result; a correlator or a return-data item follows ->
+    // true -> continue.
+    if (!try d.sp()) return out;
+
     if (try d.accept('(')) {
         const name = try d.expectAtom();
         defer d.gpa.free(name);
@@ -325,9 +339,8 @@ pub fn parseESearch(d: *wire.Decoder) Error!Result {
         try d.expectSp();
         out.tag = try d.expectAstring();
         try d.expect(')');
+        if (!try d.sp()) return out;
     }
-
-    if (!try d.sp()) return out;
     var name = try d.expectAtom();
 
     if (std.ascii.eqlIgnoreCase(name, "UID")) {
@@ -476,7 +489,7 @@ test "a criteria with no keys at all searches ALL" {
 
 test "RFC 9051 §6.4.4: the ESEARCH reply" {
     var f: Fx = undefined;
-    f.init("(TAG \"A282\") MIN 2 COUNT 3\r\n");
+    f.init(" (TAG \"A282\") MIN 2 COUNT 3\r\n");
     defer f.deinit();
 
     const r = try parseESearch(&f.d);
@@ -489,7 +502,7 @@ test "RFC 9051 §6.4.4: the ESEARCH reply" {
 
 test "ESEARCH: UID marks the numbers, and ALL stays a set" {
     var f: Fx = undefined;
-    f.init("(TAG \"A283\") UID ALL 2,10:11\r\n");
+    f.init(" (TAG \"A283\") UID ALL 2,10:11\r\n");
     defer f.deinit();
 
     const r = try parseESearch(&f.d);
@@ -501,7 +514,7 @@ test "ESEARCH: UID marks the numbers, and ALL stays a set" {
 
 test "ESEARCH: an unknown return item does not break the rest" {
     var f: Fx = undefined;
-    f.init("(TAG \"A1\") MIN 1 FUZZ (1 2) COUNT 7\r\n");
+    f.init(" (TAG \"A1\") MIN 1 FUZZ (1 2) COUNT 7\r\n");
     defer f.deinit();
     const r = try parseESearch(&f.d);
     try testing.expectEqual(@as(u32, 1), r.min.?);
@@ -510,7 +523,7 @@ test "ESEARCH: an unknown return item does not break the rest" {
 
 test "ESEARCH: a correlator that is not TAG is rejected" {
     var f: Fx = undefined;
-    f.init("(NOTATAG \"A1\") MIN 1\r\n");
+    f.init(" (NOTATAG \"A1\") MIN 1\r\n");
     defer f.deinit();
     try testing.expectError(error.BadCorrelator, parseESearch(&f.d));
 }

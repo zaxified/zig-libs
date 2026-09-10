@@ -264,6 +264,7 @@ pub const Parser = struct {
         errdefer items.deinit(p.d.gpa);
 
         var it = try p.d.expectList();
+        defer it.deinit(); // F13: safety net if an element below errors mid-list
         while (try it.next()) try items.append(p.d.gpa, try p.attribute());
 
         return .{ .seq = seq, .items = try items.toOwnedSlice(p.d.gpa) };
@@ -329,6 +330,7 @@ pub const Parser = struct {
         var flags: std.ArrayList([]const u8) = .empty;
         errdefer flags.deinit(d.gpa);
         var it = try d.expectList();
+        defer it.deinit(); // F13: safety net if an element below errors mid-list
         while (try it.next()) {
             _ = try d.sp(); // servers that open the list with a space
             const system = try d.accept('\\');
@@ -385,6 +387,7 @@ pub const Parser = struct {
         var out: std.ArrayList(Address) = .empty;
         errdefer out.deinit(d.gpa);
         var it = try d.expectList();
+        defer it.deinit(); // F13: safety net if an element below errors mid-list
         while (try it.next()) try out.append(d.gpa, try p.address());
         return out.toOwnedSlice(d.gpa);
     }
@@ -561,6 +564,7 @@ pub const Parser = struct {
         errdefer out.deinit(d.gpa);
         var key: ?[]const u8 = null;
         var it = try d.expectList();
+        defer it.deinit(); // F13: safety net if an element below errors mid-list
         while (try it.next()) {
             const s = try d.expectString();
             if (key == null) {
@@ -591,6 +595,7 @@ pub const Parser = struct {
         var out: std.ArrayList([]const u8) = .empty;
         errdefer out.deinit(d.gpa);
         var it = try d.expectList();
+        defer it.deinit(); // F13: safety net if an element below errors mid-list
         while (try it.next()) try out.append(d.gpa, try d.expectString());
         return out.toOwnedSlice(d.gpa);
     }
@@ -624,6 +629,16 @@ const Fx = struct {
     }
 };
 
+test "F3: fetch.Options.max_depth's delivered default is pinned" {
+    // Pre-fix, mutating `max_depth: usize = 64` to `100000000` left the
+    // suite green: every depth-related test set `.max_depth` explicitly
+    // rather than checking what `Options{}` ships with
+    // (`~/CML/20260901-zig-libs-audit/A1/imap.md` F3). The mechanism itself
+    // (`if (p.depth > p.opts.max_depth) return error.BodyTooDeep;`) WAS
+    // already covered -- only the shipped VALUE was not.
+    try testing.expectEqual(@as(usize, 64), (Options{}).max_depth);
+}
+
 test "Message.find returns the first item carrying the requested tag" {
     const t = std.testing;
     const items = [_]Item{
@@ -638,6 +653,27 @@ test "Message.find returns the first item carrying the requested tag" {
     try t.expectEqualStrings("17-Jul-1996 02:44:25 -0700", m.find(.internal_date).?.internal_date);
     // A tag that was not fetched is absent, not a default.
     try t.expectEqual(@as(?Item, null), m.find(.flags));
+}
+
+test "F13: an error while parsing a flag list ELEMENT does not leak Decoder.depth" {
+    // `defer it.deinit()` was missing on six of the seven `expectList()`
+    // call sites (`~/CML/20260901-zig-libs-audit/A1/imap.md` F13) --
+    // `flagList` was one of them. An error thrown while parsing an element
+    // BETWEEN `next()` calls never reaches the list's own clean `)` close,
+    // so without the safety net the outer list's depth slot is never
+    // released. `client.readLine` resets `depth` per line as a second line
+    // of defense, but `fetchMessages`/`searchMessages` read lines directly
+    // (bypassing that reset -- see F5), so this Decoder-level fix is the
+    // one line of defense that actually covers every caller.
+    var f: Fx = undefined;
+    // "(" right after the space is not a legal flag atom -- UnexpectedByte
+    // while parsing the SECOND element, with the outer list's depth (1)
+    // still held.
+    f.init("(\\Seen ()\r\n");
+    defer f.deinit();
+    var p = f.parser();
+    try testing.expectError(error.UnexpectedByte, p.flagList());
+    try testing.expectEqual(@as(usize, 0), f.d.depth);
 }
 
 test "RFC 9051 §7.5.2: the ENVELOPE example" {

@@ -196,7 +196,10 @@ pub const Reader = struct {
             return .{ .search = r };
         }
         if (std.ascii.eqlIgnoreCase(word, "ESEARCH")) {
-            try d.expectSp();
+            // F10: `parseESearch` now consumes its own leading SP (it needs
+            // to tell "nothing follows" apart from "no correlator, but a
+            // return-data item follows" -- both are SP-then-something or
+            // nothing, and only it knows which), so it is called directly.
             const r = try searchmod.parseESearch(d);
             try d.expectCrlf();
             return .{ .esearch = r };
@@ -321,6 +324,7 @@ pub const Reader = struct {
         errdefer flags.deinit(d.gpa);
 
         var it = try d.expectList();
+        defer it.deinit(); // F13: safety net if an element below errors mid-list
         while (try it.next()) {
             // Some servers start the list with a space (go-imap PR 633).
             _ = try d.sp();
@@ -650,6 +654,50 @@ test "FETCH, SEARCH and ESEARCH now come back parsed, not as raw text" {
     const s2 = (try rd.next()).data.esearch;
     try testing.expectEqualStrings("A282", s2.tag.?);
     try testing.expectEqual(@as(u32, 3), s2.count.?);
+}
+
+test "F10: ESEARCH without a correlator, which the ABNF allows, is not rejected" {
+    // Pre-fix, all three of these were `error.UnexpectedByte`
+    // (`~/CML/20260901-zig-libs-audit/A1/imap.md` F10): `parseESearch` was
+    // called after the caller had already consumed the one leading SP, so
+    // the "no correlator" branch's own SP check ran one SP short and
+    // mistook "COUNT 5" for "nothing follows here".
+    {
+        var f = Fixture.init("* ESEARCH COUNT 5\r\n");
+        defer f.deinit();
+        var rd = f.reader();
+        const r = (try rd.next()).data.esearch;
+        try testing.expect(r.tag == null);
+        try testing.expectEqual(@as(u32, 5), r.count.?);
+    }
+    {
+        var f = Fixture.init("* ESEARCH UID ALL 1:3\r\n");
+        defer f.deinit();
+        var rd = f.reader();
+        const r = (try rd.next()).data.esearch;
+        try testing.expect(r.uid);
+        try testing.expectEqualStrings("1:3", r.all.?);
+    }
+    {
+        // The ABNF allows an ESEARCH with neither a correlator nor any
+        // return-data item at all.
+        var f = Fixture.init("* ESEARCH\r\n");
+        defer f.deinit();
+        var rd = f.reader();
+        const r = (try rd.next()).data.esearch;
+        try testing.expect(r.tag == null);
+        try testing.expect(r.count == null);
+    }
+    // Positive control: WITH a correlator still works (this is what pinned
+    // the old behaviour and must keep passing).
+    {
+        var f = Fixture.init("* ESEARCH (TAG \"T1\") COUNT 5\r\n");
+        defer f.deinit();
+        var rd = f.reader();
+        const r = (try rd.next()).data.esearch;
+        try testing.expectEqualStrings("T1", r.tag.?);
+        try testing.expectEqual(@as(u32, 5), r.count.?);
+    }
 }
 
 // ── fuzz ─────────────────────────────────────────────────────────────────

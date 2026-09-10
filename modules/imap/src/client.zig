@@ -188,13 +188,16 @@ pub const Client = struct {
 
     /// True when the server advertised `name` (case-insensitive).
     pub fn hasCap(c: *Client, name: []const u8) bool {
-        var buf: [64]u8 = undefined;
-        if (name.len > buf.len) return false;
-        const upper = std.ascii.upperString(buf[0..name.len], name);
-        if (c.caps.contains(upper)) return true;
-        // The two mixed-case names are stored as spelled.
-        for ([_][]const u8{ "IMAP4rev1", "IMAP4rev2" }) |exact| {
-            if (std.ascii.eqlIgnoreCase(name, exact)) return c.caps.contains(exact);
+        // F11: compare against each stored name directly instead of
+        // uppercasing `name` into a fixed stack buffer -- the buffer had a
+        // silent 64-byte ceiling (measured: a 70-byte capability the server
+        // sent and the client stored still read back `false` from `hasCap`).
+        // This also drops the old IMAP4rev1/IMAP4rev2 special case: case-
+        // insensitive comparison against the stored spelling handles every
+        // name uniformly, mixed-case or not.
+        var it = c.caps.keyIterator();
+        while (it.next()) |k| {
+            if (std.ascii.eqlIgnoreCase(name, k.*)) return true;
         }
         return false;
     }
@@ -349,6 +352,15 @@ pub const Client = struct {
     fn setCaps(c: *Client, caps: []const []const u8) Error!void {
         c.freeCaps();
         for (caps) |cap| {
+            // F4: `put` on a key already present keeps the FIRST key and only
+            // updates the value, so a duplicate capability name would dupe a
+            // second copy that the map then never points at and `freeCaps`
+            // never finds -- a server that repeats a name grows this
+            // allocator by that name's length, unbounded, every time
+            // `setCaps` runs (untagged `* CAPABILITY` is accepted any time,
+            // not just after a command). Skip the duplicate before it is
+            // ever allocated.
+            if (c.caps.contains(cap)) continue;
             const owned = c.gpa.dupe(u8, cap) catch return error.OutOfMemory;
             c.caps.put(c.gpa, owned, {}) catch {
                 c.gpa.free(owned);
@@ -785,6 +797,42 @@ test "RFC 9051 §6.1.1 + §6.2.3 + §6.3.2: greet, capability, login, select" {
             "T3 SELECT INBOX\r\n",
         p.sent(),
     );
+}
+
+test "F4: a duplicate CAPABILITY name does not leak its own copy" {
+    // `HashMap.put` on a key already present keeps the FIRST key and only
+    // updates the value -- a naive dupe-then-put per name orphans a second
+    // allocation that `freeCaps` never finds. `testing.allocator` catches
+    // any such leak at `deinit()` without any manual bookkeeping here.
+    // Measured pre-fix (`~/CML/20260901-zig-libs-audit/A1/imap.md` F4): 50
+    // lines of 8,000x `DUP` left 1,199,850 B still allocated after deinit().
+    var p: Peer = undefined;
+    p.init("* OK [CAPABILITY IMAP4rev2] Service Ready\r\n" ++
+        "* CAPABILITY XX XX XX XX XX\r\n" ++
+        "T1 OK CAPABILITY completed\r\n");
+    var c = p.client(.{ .allow_plaintext_auth = true });
+    defer c.deinit();
+
+    _ = try c.greet();
+    _ = try c.capability();
+    try testing.expect(c.hasCap("XX"));
+    try testing.expectEqual(@as(usize, 1), c.caps.count());
+}
+
+test "F11: hasCap sees a capability name longer than the old 64-byte buffer" {
+    var p: Peer = undefined;
+    const long_name = "AUTH=" ++ "X" ** 70; // 75 bytes, well over the old buf[64]
+    p.init("* OK [CAPABILITY IMAP4rev2] Service Ready\r\n" ++
+        "* CAPABILITY " ++ long_name ++ "\r\n" ++
+        "T1 OK CAPABILITY completed\r\n");
+    var c = p.client(.{ .allow_plaintext_auth = true });
+    defer c.deinit();
+
+    _ = try c.greet();
+    _ = try c.capability();
+    try testing.expect(c.caps.contains(long_name)); // it WAS stored
+    try testing.expect(c.hasCap(long_name)); // and hasCap must see it
+    try testing.expect(c.hasCap("auth=" ++ "x" ** 70)); // case-insensitively
 }
 
 test "RFC 9051 §6.2.3: LOGINDISABLED refuses LOGIN instead of sending the password" {

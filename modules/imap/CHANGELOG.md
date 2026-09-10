@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** a new `wire.Options.max_literal_total`
+  (default 32 MiB) bounds the SUM of literal payload sizes accepted on one response line —
+  previously only each individual literal was capped, so many small literals could stack
+  past it (measured: 1,000 x 64 KiB literals on one line, 73.7 MB, was accepted outright).
+  `Client.hasCap` no longer has a silent 64-byte ceiling on capability names. `* ESEARCH`
+  without a correlator (`COUNT 5`, `UID ALL 1:3`, or bare `* ESEARCH`), which the RFC 9051
+  ABNF allows, is now parsed instead of failing with `UnexpectedByte`. A duplicate name in
+  `* CAPABILITY` no longer leaks a copy per repeat. No public API shape changed.
 - **2026-09-09** — Docs: `NOTICE`'s port inventory said "Ported so far:" and then listed ONE
   file. Seven carry a `Ported from emersion/go-imap` line in their own headers — `utf7`,
   `wire`, `command`, `response`, `client`, `fetch`, `search` — so the inventory was wrong by

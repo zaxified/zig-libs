@@ -76,6 +76,21 @@ pub const Options = struct {
     /// server sends. Refusal is `error.LineTooLong`; nothing is truncated,
     /// because a silently shortened mailbox name or flag is a wrong answer.
     max_line: usize = 64 * 1024,
+    /// Sum of literal payload sizes accepted on ONE response line. Each
+    /// individual literal is already bounded by `max_literal`, but nothing
+    /// bounded how many of them one line could carry: the `{n}` header that
+    /// announces a literal is ~19 bytes of grammar, so `max_line` (which
+    /// covers only grammar, deliberately — see its doc comment) lets roughly
+    /// `max_line / 19` literal headers through, each good for up to
+    /// `max_literal` bytes of allocation. At the defaults that is about 3,400
+    /// literals per line, ~27 GiB of payload accepted before the line budget
+    /// itself ever fires (measured: 1,000 × 64 KiB literals on one line —
+    /// 73.7 MB — was accepted outright). This field closes that: four times
+    /// `max_literal` by default, enough for a realistic multi-part `FETCH`
+    /// response (a handful of sections, each up to a full message) while
+    /// keeping the accumulated total in the same order of magnitude as one
+    /// legitimate literal, not three orders past it.
+    max_literal_total: usize = 32 << 20,
 };
 
 /// True for RFC 9051 `ATOM-CHAR`: anything but the specials and CTLs.
@@ -102,6 +117,9 @@ pub const Decoder = struct {
     /// Bytes consumed on the current line, literal payloads excluded. See
     /// `Options.max_line`; `startLine` resets it.
     line_bytes: usize = 0,
+    /// Sum of literal payload sizes accepted on the current line. See
+    /// `Options.max_literal_total`; `startLine` resets it.
+    line_literal_bytes: usize = 0,
 
     pub fn init(gpa: Allocator, r: *std.Io.Reader, opts: Options) Decoder {
         return .{ .r = r, .gpa = gpa, .opts = opts };
@@ -113,6 +131,7 @@ pub const Decoder = struct {
     /// business, not the grammar's, so the budget cannot reset itself.
     pub fn startLine(d: *Decoder) void {
         d.line_bytes = 0;
+        d.line_literal_bytes = 0;
     }
 
     /// Account for `n` bytes taken off the wire on this line. Every byte the
@@ -244,13 +263,42 @@ pub const Decoder = struct {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(d.gpa);
         while (true) {
+            const buf = d.r.buffered();
+            if (buf.len == 0) {
+                // Nothing buffered; force a fill one byte at a time, same
+                // fallback `run()` above uses at a refill boundary.
+                try d.charge(1);
+                var ch = d.r.takeByte() catch |e| return mapRead(e);
+                if (ch == '"') break;
+                if (ch == '\\') {
+                    try d.charge(1);
+                    ch = d.r.takeByte() catch |e| return mapRead(e);
+                }
+                try out.append(d.gpa, ch);
+                continue;
+            }
+            // F7: copy the buffered run up to the next `"` or `\` in one
+            // `appendSlice`, the same technique `run()` above uses, instead
+            // of `charge` + `takeByte` + `append` per BYTE on what the
+            // module's own comment on `run` calls "the hot path of every
+            // response line". Same accounting -- `charge` still runs before
+            // bytes are kept, so a run over `max_line` is still refused, not
+            // truncated and kept. Measured 8.3-10.2x on 8000-byte quoted
+            // strings (`~/CML/20260901-zig-libs-audit/A1/imap.md` F7).
+            var n: usize = 0;
+            while (n < buf.len and buf[n] != '"' and buf[n] != '\\') n += 1;
+            if (n > 0) {
+                try d.charge(n);
+                try out.appendSlice(d.gpa, buf[0..n]);
+                d.r.toss(n);
+            }
+            if (n == buf.len) continue; // exhausted the window; refill and keep scanning
+            // The byte at the new front of the buffer is `"` or `\`.
             try d.charge(1);
             var ch = d.r.takeByte() catch |e| return mapRead(e);
             if (ch == '"') break;
-            if (ch == '\\') {
-                try d.charge(1);
-                ch = d.r.takeByte() catch |e| return mapRead(e);
-            }
+            try d.charge(1);
+            ch = d.r.takeByte() catch |e| return mapRead(e);
             try out.append(d.gpa, ch);
         }
         return try out.toOwnedSlice(d.gpa);
@@ -273,6 +321,10 @@ pub const Decoder = struct {
         // budget large enough to hold a fetched message would be no bound at
         // all on the grammar. The `{n}` header itself was charged, above.
         if (size > d.opts.max_literal) return error.LiteralTooLarge;
+        // F2: bound how many of these one line may stack, not just how big
+        // any one of them is. Checked before the allocation, same as above.
+        d.line_literal_bytes += size;
+        if (d.line_literal_bytes > d.opts.max_literal_total) return error.LiteralTooLarge;
 
         const buf = try d.gpa.alloc(u8, size);
         errdefer d.gpa.free(buf);
@@ -486,6 +538,54 @@ test "quoted string: escapes, and only the two that exist" {
     try testing.expectEqualStrings("a\"b\\c", s);
 }
 
+fn f7NowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "bench (opt-in via IMAP_BENCH_F7): quoted() is not O(1) reader calls per byte" {
+    // F7 (`~/CML/20260901-zig-libs-audit/A1/imap.md`): `quoted` did
+    // `charge` + `takeByte` + `append` per BYTE while `run` (used by every
+    // atom and by `text`) already batches a buffered window into one
+    // `appendSlice`. Measured there: 8.3-10.2x on 8000-byte quoted strings.
+    // Opt-in and ReleaseFast-only, same shape as `smtp`'s reply.zig bench:
+    // a wall-clock assert in the default gate, run alongside up to three
+    // other agents' lanes, is a flaky test waiting to happen. Run with:
+    //   IMAP_BENCH_F7=1 scripts/modtest imap -Doptimize=ReleaseFast
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("IMAP_BENCH_F7") == null) return error.SkipZigTest;
+
+    const gpa = testing.allocator;
+    // 8 MiB quoted string, plain bytes with a handful of escapes near the
+    // end -- mostly one long buffered run, the shape that makes a per-byte
+    // loop and a batched `appendSlice` loop diverge the most.
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.append(gpa, '"');
+    try wire.appendNTimes(gpa, 'A', (8 << 20) - 8);
+    try wire.appendSlice(gpa, "\\\"\\\\AA");
+    try wire.append(gpa, '"');
+
+    var r = std.Io.Reader.fixed(wire.items);
+    // `charge()` is per-byte against `Options.max_line` (default 64 KiB) --
+    // this is a `quoted()`-only workload, so raise it well past 8 MiB rather
+    // than measuring `LineTooLong` instead of the decode path.
+    var d = Decoder.init(gpa, &r, .{ .max_line = 16 << 20 });
+    const start = f7NowNs();
+    const s = (try d.quoted()).?;
+    const elapsed = f7NowNs() - start;
+    defer gpa.free(s);
+
+    std.debug.print("F7 bench: {d} bytes decoded in {d} ns\n", .{ wire.items.len, elapsed });
+    // Measured on this machine, same 8 MiB input: buffered-window 10.7 ms,
+    // the old byte-at-a-time shape (temporarily restored to check) 22.7 ms
+    // -- 2.1x here (the audit's 8.3-10.2x was on a shorter, escape-denser
+    // string, where the per-byte loop's relative cost is higher). 15 ms
+    // sits between the two, comfortably above the fast path's measured cost
+    // while still failing hard on a reversion to per-byte reader calls.
+    try testing.expect(elapsed < 15 * std.time.ns_per_ms);
+}
+
 test "literal: RFC 9051 §7.5.2 shape" {
     const gpa = testing.allocator;
     // The example from the RFC's FETCH response, shortened.
@@ -507,6 +607,54 @@ test "literal: a server may not send a non-synchronising literal" {
     try testing.expectError(error.NonSyncLiteral, d.literal());
 }
 
+test "literal: F2 -- many small literals on one line are bounded in total, not just individually" {
+    // Each literal alone is well under `max_literal`, so the per-literal
+    // check never fires; before `max_literal_total`, nothing bounded the SUM
+    // (measured pre-fix: 1,000 x 64 KiB literals on one line, 73.7 MB, all
+    // accepted -- `~/CML/20260901-zig-libs-audit/A1/imap.md` F2).
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    // Five 300-byte literals = 1500 B total, over a 1024 B max_literal_total.
+    for (0..5) |_| {
+        try buf.appendSlice(gpa, "{300}\r\n");
+        try buf.appendNTimes(gpa, 'x', 300);
+    }
+    var r = std.Io.Reader.fixed(buf.items);
+    var d = Decoder.init(gpa, &r, .{ .max_literal = 8192, .max_literal_total = 1024 });
+
+    var accepted: usize = 0;
+    var total: usize = 0;
+    var i: usize = 0;
+    var stopped_red: bool = false;
+    while (i < 5) : (i += 1) {
+        const s = d.literal() catch |e| {
+            try testing.expectEqual(error.LiteralTooLarge, e);
+            stopped_red = true;
+            break;
+        };
+        defer gpa.free(s.?);
+        accepted += 1;
+        total += s.?.len;
+    }
+    try testing.expect(stopped_red);
+    // The 4th literal pushes the running total (1200 B) over 1024 B.
+    try testing.expectEqual(@as(usize, 3), accepted);
+    try testing.expectEqual(@as(usize, 900), total);
+
+    // Positive control: the same five literals fit under a generous total.
+    var r2 = std.Io.Reader.fixed(buf.items);
+    var d2 = Decoder.init(gpa, &r2, .{ .max_literal = 8192, .max_literal_total = 1 << 20 });
+    var accepted2: usize = 0;
+    var j: usize = 0;
+    while (j < 5) : (j += 1) {
+        const s = (try d2.literal()).?;
+        defer gpa.free(s);
+        accepted2 += 1;
+    }
+    try testing.expectEqual(@as(usize, 5), accepted2);
+}
+
 test "literal: the payload is bounded by max_literal, not by the line budget" {
     // The two ceilings must not collide: a FETCH of a whole message is a
     // legitimate multi-megabyte literal on a line whose grammar is tiny.
@@ -526,6 +674,18 @@ test "Options.max_line's delivered default is pinned to 64 KiB" {
     // terms of* the constant, so neither pins the value a `Client` built
     // with `Options{}` actually ships with. Pin the literal.
     try testing.expectEqual(@as(usize, 64 * 1024), (Options{}).max_line);
+}
+
+test "F3: max_literal and max_depth's delivered defaults are pinned too" {
+    // Same gap as `max_line` above, for the other two DoS ceilings this
+    // file documents as load-bearing: pre-fix, mutating either default
+    // (`max_literal: u32 = 8 << 20` -> `4294967295`, or
+    // `max_depth: usize = 1000` -> `100000000`) left the suite green,
+    // because every test that used a small value did so by setting it
+    // explicitly rather than checking what `Options{}` ships with
+    // (`~/CML/20260901-zig-libs-audit/A1/imap.md` F3).
+    try testing.expectEqual(@as(u32, 8 << 20), (Options{}).max_literal);
+    try testing.expectEqual(@as(usize, 1000), (Options{}).max_depth);
 }
 
 test "run: an unterminated line is refused, not accumulated, under the DEFAULT options" {

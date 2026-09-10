@@ -2,10 +2,10 @@
 
 //! imap — an IMAP4rev2 (RFC 9051) client, in pure Zig.
 //!
-//! **Status: part 1 of 2 — the wire layer.** What is here is the encoding
-//! that mailbox names travel in; the response decoder, the command encoder and
-//! the session (`CAPABILITY` / `LOGIN` / `SELECT`) land next, then `FETCH` /
-//! `BODYSTRUCTURE` / `SEARCH` / `IDLE`.
+//! **Status: complete.** The mailbox-name codec, the wire grammar, the
+//! response decoder, the command encoder, the client session (`CAPABILITY` /
+//! `LOGIN` / `SELECT`) and `FETCH` / `BODYSTRUCTURE` / `SEARCH` / `IDLE` are
+//! all here — see README.md.
 //!
 //! Like `smtp` and `dtls`, this module **owns no socket and speaks no TLS**.
 //! It works on caller-supplied bytes and `std.Io` streams, so it drops onto
