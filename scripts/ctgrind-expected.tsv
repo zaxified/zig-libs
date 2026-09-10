@@ -202,6 +202,17 @@ chachapoly	ReleaseSafe	aead	1	>=1	b08b7e78d8c87360	870a36cbebbc4588
 oscore	ReleaseFast	derive	1	0	7239dd7be7057571	2f7c17dad79da56d
 oscore	ReleaseFast	protect	1	0	7239dd7be7057571	6eac6a90e3479ab8
 oscore	ReleaseFast	unprotect	1	1	7239dd7be7057571	ed85db89e3d7e9fd
+# ct25519 — columns below are `total_min in_file`, NOT "in_file total_min".
+# Row 1's `1 0` is `total_min=1, in_file=0`: ct25519's OWN code has zero
+# expected contexts (the `total_min=1` is only the harness's print, a
+# propagation witness that the taint reached output at all). The `bound`
+# comment earlier in this file ("std's `rejectIdentity` context that
+# ct25519's negative control needs only to EXIST") is about row 2
+# (`ct25519 ReleaseFast std 1 >=1`), NOT this one — row 2 is std's own
+# source, hence `NO-OWN-SRC` in the src_sha column. Read `1 0` on row 1 as
+# "one witness context, zero in-file", never as "one expected context in
+# ct25519's own code" — that reading would describe the fragile
+# single-context pin this module deliberately does not have.
 ct25519	ReleaseFast	ct25519	1	0	47a4096a4ea6b856	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
 decaf448	ReleaseFast	scalarmul	1	0	e664aa6778fea0b1	77a1bd1038ca1053

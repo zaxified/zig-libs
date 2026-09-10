@@ -20,11 +20,25 @@ all, and the control flow is identical for every scalar including zero. Same
 algorithm, same table, same 64 iterations — the same cost, with the leak taken
 out of the tail. When the scalar is *public* (a signature's `s`, a Fiat-Shamir
 challenge a verifier replays) std's `mul`/`mulPublic`/`mulDoubleBasePublic` stay
-the right call and are faster; this module is only for the secret side.
+the right call; this module is only for the secret side. "Faster" there is
+modest, not categorical — measured on the base point, `mulPublic` is ~1.08×
+this module's `mulBase` (48.6 µs vs 52.5 µs) — the real reason to route a
+public scalar through std is that this module refuses to have the error
+union std's rejection would force on the caller, not raw speed.
 
 **API.** `mul(p, s)` / `mulBase(s)` on `Edwards25519`, `mulRistretto(p, s)` /
 `mulRistrettoBase(s)` on `Ristretto255`. The base-point table is folded at
 comptime, as std folds its own.
+
+**`s` is used as-is: all 256 bits are read, not just the low 253.** There is
+no clamping and no reduction mod the group order `L`, exactly like std's own
+`mul`. A caller that needs `s mod L` must reduce first
+(`scalar.reduce`/`reduce64`). An unreduced `s` above `L` still produces a
+result — but one that only this module and std agree on; libsodium's
+`crypto_scalarmult_ed25519*_noclamp` assumes `s < 2^255` and diverges on
+every scalar with bit 255 set (measured: 995/995 on a random sample). Every
+consumer in this repo already reduces or clamps its scalar; this is a trap
+for a future sixth one, not a defect in the ones here today.
 
 **Deliberately absent:** any rejection of the output (that is the point) and any
 `WeakPublicKey` check on the input point (a second error union, over a *public*
@@ -36,7 +50,8 @@ are discharged by that argument rather than by a runtime branch on secret data.
 
 **Consumers:** `voprf` (OPRF blind, `skS`, POPRF tweak, DLEQ nonce), `opaque`
 (3DH), `signal` (XEdDSA key/nonce), `bulletproofs` (witness + blinding scalars,
-and the finding that started this).
+and the finding that started this), `ecvrf` (the VRF proof's five secret-scalar
+multiplications).
 
 **Anchors.** Bit-exact against `std`'s `Edwards25519.mul`/`Ristretto255.mul` on
 base and non-base points over deterministic pseudorandom scalars; RFC 8032 §7.1

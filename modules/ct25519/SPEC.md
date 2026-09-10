@@ -71,6 +71,16 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
   where the point is attacker-supplied the caller MUST reject the identity
   and, on raw Edwards25519 (cofactor 8), low-order points, before calling.
   ristretto255 has prime order, so a decoded non-identity element is enough.
+  ⚠ **Canonicity alone is not enough.** std's `rejectNonCanonical` only checks
+  `y < p` and misses two signed-bit encodings that share a residue with a
+  canonical one: `01…80` re-encodes the identity and `ec…ff` re-encodes
+  `p−1` — both decode (via `fromBytes`) to points of low order, and both
+  read `rejectNonCanonical` reports as canonical. A caller that treats
+  "ran `rejectNonCanonical`" as sufficient point validation lets both
+  through; `rejectLowOrder`/`rejectIdentity` is mandatory regardless of
+  what `rejectNonCanonical` said. Measured 2026-09-06 against std's
+  `fromBytes`/`rejectNonCanonical` on five degenerate encodings — see the
+  audit's C6 for the full table.
 - **How "the shared secret MUST NOT be the identity" is discharged.** Over a
   prime-order group with a validated non-identity `P`, `s·P` is the identity
   **iff `s ≡ 0 (mod L)`** — a degenerate *local* secret, never something a
