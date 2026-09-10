@@ -64,7 +64,7 @@ Logical states: `down`, `initializing`, `up`. Events: `start(now)`, `stop()`,
 |-------|---|---|---|---|---|
 | `down` | → `initializing` (transition) | → `up` (`adjacency_up`) | **rejected `.neighbor_up_while_down`**, nothing recorded (RFC 5303 table: Down × Up = Down, "Neighbor restarted") | — (no hold set) | → `down` |
 | `initializing` | stay `initializing` | → `up` (`adjacency_up`) | as the echo column | → `down` (transition only) | → `down` |
-| `up` | → `initializing` (`adjacency_down = neighbor_restarted`) | stay `up` | as the echo column | → `down` (`adjacency_down = hold_expired`) | → `down` (`adjacency_down = stopped`) |
+| `up` | → `initializing` (`adjacency_down = neighbor_restarted`, **except** when the received 240 state is `down` — see below) | stay `up` | as the echo column | → `down` (`adjacency_down = hold_expired`) | → `down` (`adjacency_down = stopped`) |
 
 Two rules run BEFORE the table and before any mutation, on the received TLV 240
 (RFC 5303 §3.2): a neighbour block naming another system, or our system on
@@ -72,6 +72,15 @@ another extended local circuit id, discards the PDU whole (`.neighbor_mismatch`)
 and, at local `down`, a received three-way state of Up is the table's
 (Down, Up) cell — the peer's claim is stale, we record nothing and our next hello
 (Down, no neighbour block) sends it back through Initializing.
+
+**"Initialize" action, no event (A1 audit F4):** RFC 5303 §3.2's table has
+*every* cell in the "received three-way state = Down" column as action
+"Initialize": "no event is generated and the adjacency three-way state SHALL
+be set to `Initializing`". This is distinct from an ordinary echo-loss
+(received state still `initializing`/`up`, but the neighbour block no longer
+names us) — that case is NOT "Initialize" and keeps reporting
+`adjacency_down = .neighbor_restarted` exactly as before. Only a peer that
+reports *itself* Down is silent.
 
 - **echoed** ≡ the neighbour's TLV 240 carries a neighbour block whose
   (system-id, extended-local-circuit-id) equals **ours**. This is the loop guard.
@@ -144,7 +153,12 @@ Implemented (cheap, and they gate adjacency formation):
 - **Maximum Area Addresses mismatch** — the IIH's common-header Maximum Area
   Addresses (ISO 10589 §9.6) differs from `Config.max_area_addresses` →
   `rejected = .max_area_mismatch` (ISO 10589 §8.2). Always enforced; there is
-  no opt-out, since both sides always carry this field on the wire.
+  no opt-out, since both sides always carry this field on the wire. The
+  compared local value is *normalized*: `Config.max_area_addresses = 0` is the
+  same wire shorthand for 3 that `isis.header.decode` already normalizes on
+  receive, so a locally configured 0 does not reject every real (3-advertising)
+  neighbour (A1 audit F16); a genuine non-shorthand disagreement is still
+  rejected.
 - **Area-address mismatch (Level 1 only)** — ISO 10589 §8.2.2/§7.2.4: a Level 1
   adjacency requires the neighbour's Area Addresses (#1) TLV to name at least
   one area in common with `Config.local_areas` → `rejected = .area_mismatch`.
@@ -156,7 +170,10 @@ Implemented (cheap, and they gate adjacency formation):
   rejecting a `.level1_2` circuit on an area mismatch would also block the L2
   component ISO 10589 says must still form regardless of area. A malformed or
   absent Area Addresses TLV on an enforced circuit is treated as "no shared
-  area" (fail closed), not skipped.
+  area" (fail closed), not skipped. A neighbour may split its announced areas
+  across more than one #1 TLV; `rxHelloBytes` walks the whole stream and
+  consults every instance (up to 8; beyond that, fail closed rather than open —
+  A1 audit F8), not just the first `findFirst` would have returned.
 
 Malformed input is a typed **error** (not a soft reject) from `rxHelloBytes`:
 a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`

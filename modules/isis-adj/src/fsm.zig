@@ -221,6 +221,13 @@ pub const RxHello = struct {
     /// storage) so `rxHello` stays allocation-free; a malformed inner record is
     /// treated as "no shared area found" rather than corrupting the FSM.
     neighbor_area_addresses: ?[]const u8 = null,
+    /// Any FURTHER Area Addresses (#1) TLV instances beyond the first (ISO
+    /// 10589 permits a neighbour to split its announced areas across more than
+    /// one #1 TLV; audit A1 `isis-adj` F8). Additive default (empty) so every
+    /// existing caller that fills only `neighbor_area_addresses` is unaffected.
+    /// `rxHelloBytes` populates it from the wire; a hand-built `RxHello` that
+    /// wants the same coverage supplies it directly.
+    neighbor_area_addresses_more: []const []const u8 = &.{},
     /// The neighbour's TLV 240, if present. Absent means the neighbour is not
     /// speaking three-way (or omitted it): we can hear it but can never confirm
     /// the loop guard from it, so it can raise us at most to Initializing.
@@ -374,7 +381,30 @@ pub const Adjacency = struct {
         if (try isis.tlv.findFirst(p.tlv_bytes, three_way.tlv_code)) |val| {
             tw = try ThreeWayTlv.decode(val);
         }
-        const area_addresses = try isis.tlv.findFirst(p.tlv_bytes, isis.tlvs.code.area_addresses);
+        // Audit F8: a neighbour may legally split its announced areas across
+        // MORE than one Area Addresses (#1) TLV. `findFirst` only ever sees the
+        // first instance, so a shared area sitting in a second #1 TLV was
+        // missed whenever a non-matching first TLV preceded it — and, since
+        // `local_areas` matching is fail-closed, the adjacency was wrongly
+        // rejected. Walk the stream once collecting every #1 instance (bounded,
+        // no allocation) so `sharesArea` sees the neighbour's FULL area set.
+        var area_addresses: ?[]const u8 = null;
+        var more_buf: [7][]const u8 = undefined;
+        var more_len: usize = 0;
+        {
+            var it = isis.tlv.TlvIterator.init(p.tlv_bytes);
+            while (try it.next()) |raw| {
+                if (raw.code != isis.tlvs.code.area_addresses) continue;
+                if (area_addresses == null) {
+                    area_addresses = raw.value;
+                } else if (more_len < more_buf.len) {
+                    more_buf[more_len] = raw.value;
+                    more_len += 1;
+                }
+                // Beyond `more_buf.len` extra instances (implausible in
+                // practice) are not consulted — fail closed, never fail open.
+            }
+        }
         return self.rxHello(.{
             .source_id = p.source_id,
             .holding_time = p.holding_time,
@@ -382,6 +412,7 @@ pub const Adjacency = struct {
             .local_circuit_id = p.local_circuit_id,
             .max_area_addresses = p.header.max_area_addresses,
             .neighbor_area_addresses = area_addresses,
+            .neighbor_area_addresses_more = more_buf[0..more_len],
             .three_way = tw,
         }, now);
     }
@@ -408,7 +439,7 @@ pub const Adjacency = struct {
         // us on how many area addresses an IS may carry is discarded outright,
         // not merely noted — the two sides are running an incompatible
         // numbering plan and nothing downstream can paper over that.
-        if (rx.max_area_addresses != self.cfg.max_area_addresses) {
+        if (rx.max_area_addresses != self.effectiveMaxAreaAddresses()) {
             return .{ .rejected = .max_area_mismatch };
         }
         // Area-address matching (ISO 10589 §8.2.2/§7.2.4): required only for a
@@ -418,7 +449,9 @@ pub const Adjacency = struct {
         // would also block the L2 component, which ISO 10589 says must still
         // form. Skipped entirely when `local_areas` is unconfigured.
         if (self.cfg.circuit_type == .level1 and self.cfg.local_areas.len != 0) {
-            if (!self.sharesArea(rx.neighbor_area_addresses)) {
+            if (!self.sharesArea(rx.neighbor_area_addresses) and
+                !self.sharesAreaInAny(rx.neighbor_area_addresses_more))
+            {
                 return .{ .rejected = .area_mismatch };
             }
         }
@@ -501,10 +534,19 @@ pub const Adjacency = struct {
             // accepted hello. This is the DELIBERATELY WEAKER rule.
             .up;
 
-        return self.applyState(new_state, now);
+        // Audit F4 / RFC 5303 §3.2 table: EVERY cell in the "received Down"
+        // column is action "Initialize" — "no event is generated and the
+        // adjacency three-way state SHALL be set to 'Initializing'" — verbatim
+        // text confirmed against RFC 5303 §3.2. FRR agrees: the Initialize
+        // action only reschedules a hello, `adj_state` is left UP. A peer
+        // reporting itself Down is not the same as our echo/liveness check
+        // failing (the OTHER way `applyState` can leave Up, still reported
+        // below) — it is the peer TELLING us to reinitialize, silently.
+        const initialize_action = if (rx.three_way) |tw| tw.state == .down else false;
+        return self.applyState(new_state, now, initialize_action);
     }
 
-    fn applyState(self: *Adjacency, new_state: State, now: Time) Effect {
+    fn applyState(self: *Adjacency, new_state: State, now: Time, initialize_action: bool) Effect {
         _ = now;
         const prev = self.state;
         self.state = new_state;
@@ -512,8 +554,23 @@ pub const Adjacency = struct {
         if (new_state == prev) return eff;
         eff.transition = .{ .from = prev, .to = new_state };
         if (new_state == .up) eff.adjacency_up = true;
-        if (prev == .up and new_state != .up) eff.adjacency_down = .neighbor_restarted;
+        if (prev == .up and new_state != .up and !initialize_action) eff.adjacency_down = .neighbor_restarted;
         return eff;
+    }
+
+    /// Audit F16: `isis.header.decode` normalizes a WIRE `max_area_addresses`
+    /// of 0 (the ISO 10589 §9.6 shorthand for "3") to 3 before `rxHelloBytes`
+    /// ever sees it, so `rx.max_area_addresses` is never 0. `Config` is a
+    /// caller-supplied *value*, not decoded wire bytes, so the same shorthand
+    /// written there (`.max_area_addresses = 0`, "use the default") stayed
+    /// literally 0 and compared unequal to every real neighbour's normalized 3
+    /// — rejecting every one of them. Normalizing here, at the single point of
+    /// comparison, makes both sides speak the same normalized value.
+    fn effectiveMaxAreaAddresses(self: *const Adjacency) u8 {
+        return if (self.cfg.max_area_addresses == 0)
+            isis.header.default_max_area_addresses
+        else
+            self.cfg.max_area_addresses;
     }
 
     /// True iff `neighbor_tlv` (a neighbour's raw Area Addresses #1 TLV value,
@@ -533,6 +590,17 @@ pub const Adjacency = struct {
                 if (std.mem.eql(u8, local, a)) return true;
             }
         }
+    }
+
+    /// Audit F8: the neighbour's area set is the UNION of every Area Addresses
+    /// (#1) TLV it sent, not just the first — `sharesArea` alone only ever sees
+    /// one instance. A malformed instance is "no shared area found" for THAT
+    /// instance only (fail closed per-instance), same as `sharesArea` itself.
+    fn sharesAreaInAny(self: *const Adjacency, more: []const []const u8) bool {
+        for (more) |raw| {
+            if (self.sharesArea(raw)) return true;
+        }
+        return false;
     }
 };
 
@@ -1281,6 +1349,195 @@ test "tick emits hellos on the hello_interval cadence" {
     try testing.expect(adj.tick(10).send_hello != null); // due
     try testing.expect(adj.tick(11).send_hello == null);
     try testing.expect(adj.tick(20).send_hello != null); // next cadence
+}
+
+// Regression (audit A1 `isis-adj` F4): RFC 5303 §3.2 table, "Initialize"
+// action (received three-way state == Down, any local state) — "no event is
+// generated". Before the fix, `applyState` fired `adjacency_down =
+// .neighbor_restarted` on EVERY Up-losing transition, including this silent
+// one: a peer that reports itself Down (a normal, expected reinitialize, not
+// a security event) looked identical to a genuine loss of echo confirmation.
+test "audit F4: a peer reporting itself Down drops Up->Initializing SILENTLY (RFC 5303 Initialize action)" {
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    _ = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    }, 1);
+    try testing.expectEqual(State.up, adj.currentState());
+
+    // B restarts and its next hello reports itself Down (still echoing us —
+    // an echo is orthogonal to the peer's OWN reported state).
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .down, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    }, 2);
+    try testing.expectEqual(State.initializing, adj.currentState());
+    try testing.expectEqual(Transition{ .from = .up, .to = .initializing }, e.transition.?);
+    try testing.expect(e.adjacency_down == null); // was: .neighbor_restarted
+}
+
+// A genuine echo-loss (peer still reports Initializing/Up, just stops naming
+// us) is NOT the "Initialize" action (RFC table cell = "Accept": normal
+// procedures apply) and must keep reporting `adjacency_down` — F4's fix must
+// not silence this path too.
+test "audit F4 control: losing the echo while the peer still reports Initializing DOES report adjacency_down" {
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    _ = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } },
+    }, 1);
+    try testing.expectEqual(State.up, adj.currentState());
+
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 }, // no neighbour block anymore
+    }, 2);
+    try testing.expectEqual(State.initializing, adj.currentState());
+    try testing.expectEqual(DownReason.neighbor_restarted, e.adjacency_down.?);
+}
+
+// Regression (audit A1 `isis-adj` F8): ISO 10589 allows a neighbour to split
+// its announced Area Addresses across more than one #1 TLV; FRR compares
+// across all of them. Before the fix `findFirst` only ever saw ONE instance,
+// so a neighbour whose shared area sat in a SECOND #1 TLV (behind a
+// non-matching first one) was wrongly rejected `.area_mismatch`.
+test "audit F8: a shared area in the SECOND Area Addresses TLV is found, not just the first" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    const their_other_area = [_]u8{ 0x49, 0x99, 0x99 };
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1,
+        .local_areas = &.{&our_area},
+    });
+    _ = adj.start(0);
+    const echo: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 } };
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+        .local_circuit_id = 1,
+        // First TLV: an area we do NOT share.
+        .neighbor_area_addresses = &[_]u8{their_other_area.len} ++ their_other_area,
+        // Second TLV: the one we DO share — used to be invisible entirely.
+        .neighbor_area_addresses_more = &.{&([_]u8{our_area.len} ++ our_area)},
+        .three_way = echo,
+    }, 1);
+    try testing.expect(e.rejected == null);
+    try testing.expect(e.adjacency_up);
+}
+
+// Driven end-to-end through the real `isis` codec: two Area Addresses TLVs on
+// the wire, the second one shared with us.
+test "rxHelloBytes finds a shared area across two wire Area Addresses TLVs" {
+    const our_area = [_]u8{ 0x49, 0x00, 0x01 };
+    const their_other_area = [_]u8{ 0x49, 0x99, 0x99 };
+    var pdu_buf: [160]u8 = undefined;
+    var pb = try isis.pdu.P2pHelloBuilder.init(&pdu_buf, .{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1,
+    });
+    var val_buf: [15]u8 = undefined;
+    const tw: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 } };
+    try pb.tlvs.addTlv(three_way.tlv_code, try tw.encode(&val_buf));
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&their_other_area});
+    try isis.tlvs.addAreaAddresses(&pb.tlvs, &.{&our_area});
+    const wire = pb.finish();
+
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .circuit_type = .level1,
+        .local_areas = &.{&our_area},
+    });
+    _ = adj.start(0);
+    const e = try adj.rxHelloBytes(wire, 1);
+    try testing.expect(e.rejected == null);
+    try testing.expect(e.adjacency_up);
+}
+
+// Regression (audit A1 `isis-adj` F16): `isis.header.decode` normalizes a
+// wire Maximum Area Addresses of 0 to 3 (ISO 10589 §9.6 shorthand) before
+// `rx.max_area_addresses` is ever populated, but `Config.max_area_addresses`
+// — a caller-supplied value, not decoded wire bytes — was compared literally.
+// A caller writing the same shorthand (`= 0`, "use the default") into
+// `Config` rejected every real neighbour, which always arrives normalized.
+test "audit F16: Config.max_area_addresses = 0 (the wire shorthand for 3) does not reject a default-3 neighbour" {
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .max_area_addresses = 0, // shorthand for 3, same as the wire encoding
+    });
+    _ = adj.start(0);
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .max_area_addresses = 3, // a normalized neighbour, as rxHelloBytes always supplies
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 } },
+    }, 1);
+    try testing.expect(e.rejected == null);
+    try testing.expect(e.adjacency_up);
+}
+
+// A genuine, non-shorthand disagreement (2 vs 3) must still be rejected — the
+// F16 fix only forgives the 0-means-3 shorthand, it does not loosen the check.
+test "audit F16 control: a real Maximum Area Addresses disagreement is still rejected" {
+    var adj = Adjacency.init(.{
+        .system_id = sys_a,
+        .extended_local_circuit_id = 1,
+        .max_area_addresses = 2, // a genuine (non-shorthand) value
+    });
+    _ = adj.start(0);
+    const e = adj.rxHello(.{
+        .source_id = sys_b,
+        .holding_time = 30,
+        .circuit_type = .level1_2,
+        .local_circuit_id = 1,
+        .max_area_addresses = 3,
+        .three_way = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 1 } },
+    }, 1);
+    try testing.expectEqual(RejectReason.max_area_mismatch, e.rejected.?);
+}
+
+// Regression (audit A1 `isis-adj` F15, pin only — no functional change): a
+// duplicate TLV 240 uses the FIRST instance, discarding the second — the same
+// choice FRR makes (audit: "FRR druhé zahodí s varováním"). Pinned so a future
+// change to `findFirst`/the walk order is a deliberate, tested decision.
+test "audit F15: a duplicate TLV 240 uses the FIRST instance (matches FRR)" {
+    var pdu_buf: [160]u8 = undefined;
+    var pb = try isis.pdu.P2pHelloBuilder.init(&pdu_buf, .{ .source_id = sys_b, .holding_time = 30 });
+    var val_buf: [15]u8 = undefined;
+    // First 240: echoes us, state Initializing -> would bring adjacency Up.
+    const first: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1, .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 } };
+    try pb.tlvs.addTlv(three_way.tlv_code, try first.encode(&val_buf));
+    // Second 240: state-only, no echo — would hold at Initializing if it won.
+    const second: ThreeWayTlv = .{ .state = .down };
+    try pb.tlvs.addTlv(three_way.tlv_code, try second.encode(&val_buf));
+    const wire = pb.finish();
+
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const e = try adj.rxHelloBytes(wire, 1);
+    // The FIRST instance decided the outcome: echoed, past Down -> Up.
+    try testing.expect(e.adjacency_up);
+    try testing.expectEqual(State.up, adj.currentState());
 }
 
 test "stop from Up reports adjacency_down = stopped" {

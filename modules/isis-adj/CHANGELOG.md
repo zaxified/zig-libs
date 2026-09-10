@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, three of the remaining MED/LOW findings (module
+  still has zero in-repo consumers, verified against `build.zig`'s `example_apps`
+  table too — P1 applies without reservation). Additive only, no `RejectReason` /
+  `Effect` shape change. (1) **F4** — RFC 5303 §3.2's table has EVERY "received
+  three-way state = Down" cell as action "Initialize": "no event is generated...
+  set to Initializing" (verified against the RFC text directly; FRR agrees,
+  `adj_state` stays UP on that action). Before the fix, `applyState` fired
+  `adjacency_down = .neighbor_restarted` on every Up-losing transition regardless
+  of cause, so a peer's ordinary "I restarted, I'm Down" self-report looked
+  identical to a genuine loss of echo confirmation. A peer that stops echoing us
+  while still reporting Initializing/Up still reports `adjacency_down` — only the
+  RFC's silent case is now silent. (2) **F8** — a neighbour may split its
+  announced Area Addresses across more than one #1 TLV (FRR compares across all
+  instances); `RxHello` gained an additive `neighbor_area_addresses_more: []const
+  []const u8 = &.{}` field (default empty, no existing caller affected) and
+  `rxHelloBytes` now walks the whole TLV stream once collecting every #1 instance
+  (bounded to 8, fail-closed beyond that) instead of taking only the first via
+  `findFirst`. A neighbour whose shared area sat behind a non-matching first TLV
+  was previously rejected `.area_mismatch`. (3) **F16** — `Config.max_area_addresses
+  = 0` (the ISO 10589 §9.6 wire shorthand for 3) rejected every real neighbour,
+  because `isis.header.decode` normalizes a received 0 to 3 before `rxHelloBytes`
+  ever sees it, but the locally configured value was compared literally
+  unnormalized. Normalized at the single comparison site; a genuine (non-shorthand)
+  disagreement is still rejected exactly as before.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
   helper existed **33 times across 12 modules in three shapes**, each carrying its
