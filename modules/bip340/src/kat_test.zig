@@ -437,3 +437,63 @@ test "batch: a random-linear-combination forgery (cancelling +d/-d pair) is REJE
         try std.testing.expect(!bip340.verifyBatch(&items, io));
     }
 }
+
+// ── F4: the defensive re-checks verify()/verifyBatch() promise for ─────────
+// "hand-constructed values" ─────────────────────────────────────────────────
+//
+// `Signature.r`/`.s` and `XOnlyPublicKey.x` are public fields, so a caller can
+// build one directly, skipping `fromBytes`'s own canonical-range / on-curve
+// checks entirely (this repository actually does this:
+// `taproot.TweakedPublicKey.asXOnly` hands `bip340.verify` an x it labels
+// "not a re-validation"). `verify`'s doc comment promises "every check is
+// re-run here so verify is safe even on hand-constructed values" — before
+// this test, no test in the suite hand-constructed a value to check that
+// promise: all 19 official vectors reach these checks only through
+// `fromBytes`, which already filters them out first (audit A1 F4's coverage
+// table: vectors 5/12/13/14 die at `fromBytes`, never at `verify`'s own
+// re-checks).
+const p_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F"; // secp256k1 field prime
+const n_hex = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141"; // secp256k1 curve order
+
+test "F4: verify() re-checks r < p on a hand-constructed Signature (bypassing fromBytes)" {
+    const pk = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.vectors[0].public_key));
+    const hand_built = bip340.Signature{ .r = try hex32(p_hex), .s = try hex32("0000000000000000000000000000000000000000000000000000000000000001") };
+    try std.testing.expect(!bip340.verify(pk, "msg", hand_built));
+}
+
+test "F4: verify() re-checks s < n on a hand-constructed Signature (bypassing fromBytes)" {
+    const pk = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.vectors[0].public_key));
+    const hand_built = bip340.Signature{ .r = [_]u8{0} ** 32, .s = try hex32(n_hex) };
+    try std.testing.expect(!bip340.verify(pk, "msg", hand_built));
+}
+
+test "F4: verify() re-checks the pubkey lifts on a hand-constructed XOnlyPublicKey (bypassing fromBytes)" {
+    // Vector 5's x: "public key not on the curve" per the official CSV.
+    const off_curve_x = try hex32(v.vectors[5].public_key);
+    const hand_built_pk = bip340.XOnlyPublicKey{ .x = off_curve_x };
+
+    // A signature made with SecretKey = 1 (whose public key IS basePoint,
+    // i.e. exactly the fallback a mutant `pubkey.lift() catch basePoint`
+    // would substitute for a lift failure) -- the witness that actually
+    // distinguishes the re-check from a no-op: RED/GREEN measured below.
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const sk_one = try bip340.SecretKey.fromBytes([_]u8{0} ** 31 ++ [_]u8{1});
+    const msg = "F4 lift-check witness";
+    const sig_bytes = try bip340.sign(sk_one, msg, [_]u8{0} ** 32, io);
+    const sig = try bip340.Signature.fromBytes(sig_bytes);
+
+    try std.testing.expect(!bip340.verify(hand_built_pk, msg, sig));
+}
+
+test "F4: verifyBatch() re-checks s < n on a hand-constructed BatchItem (bypassing fromBytes)" {
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const pk = try bip340.XOnlyPublicKey.fromBytes(try hex32(v.vectors[0].public_key));
+    const hand_built = bip340.Signature{ .r = [_]u8{0} ** 32, .s = try hex32(n_hex) };
+    const items = [_]bip340.BatchItem{.{ .pubkey = pk, .msg = "msg", .sig = hand_built }};
+    try std.testing.expect(!bip340.verifyBatch(&items, io));
+}

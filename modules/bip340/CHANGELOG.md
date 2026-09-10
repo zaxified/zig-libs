@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F4 (MED). Added
+  four tests that hand-construct a `Signature`/`XOnlyPublicKey` directly
+  (bypassing `fromBytes`'s own range/on-curve checks, the way
+  `taproot.TweakedPublicKey.asXOnly` already does in this repo) and assert
+  `verify`/`verifyBatch` reject `r == p`, `s == n`, an off-curve pubkey x
+  (BIP340 vector 5's), and `verifyBatch`'s own `s == n` check — none of
+  which any existing test reached, since all 19 official vectors go through
+  `fromBytes` first, which filters those cases out before `verify`'s own
+  re-checks ever run. Mutation-tested two of the four: removing the `r < p`
+  re-check and substituting `pubkey.lift() catch basePoint` for the lift
+  failure both left the suite green, and both turned out to be
+  **provably non-exploitable given BIP340's own equation structure**, not
+  untested-but-fragile — see the F4 disposition in `A1/bip340.md` for why
+  (the final `x(R) == r` equality can never match non-canonical `r`, and the
+  challenge hash binds `pubkey.x` so a garbage x can never both fail to lift
+  and match the x a real signature was made against). The tests are kept as
+  coverage/regression pins regardless.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F1/F2 (HIGH). F1:
   added a regression test that crafts a cancelling forged pair (two
   individually-invalid signatures, `s1+delta`/`s2-delta`) and asserts
