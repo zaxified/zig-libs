@@ -42,6 +42,13 @@ pub fn findFailing(
     start: u64,
     end: u64,
 ) anyerror!?Failing {
+    // audit F7: the loop below has exactly one exit condition, `seed == end`.
+    // With `start > end` that never becomes true on the way up — the loop
+    // walks off the top of `u64`, wraps to 0, and keeps going until it
+    // reaches `end` roughly 2^64 seeds later (measured: ~2296 seeds/s, so
+    // ~2.5e8 years). `[start, end]` with `start > end` is documented as an
+    // inclusive sweep, which for a reversed range is the empty set, not that.
+    if (start > end) return null;
     var seed = start;
     while (true) : (seed += 1) {
         var case = template;
@@ -155,4 +162,51 @@ fn cloneSubset(gpa: Allocator, events: []const fault.FaultEvent, kept: []const u
         out[i] = ev;
     }
     return .{ .arena = arena, .events = out };
+}
+
+const testing = std.testing;
+
+fn noopOnMessage(_: *anyopaque, _: *sim.Sim, _: sim.NodeId, _: sim.NodeId, _: []const u8) anyerror!void {}
+
+fn twoNodeScenario(s: *sim.Sim) anyerror!void {
+    _ = try s.addNode(.{});
+    _ = try s.addNode(.{});
+}
+
+test "findFailing: a reversed range [start, end] with start > end is the empty sweep, not ~2^64 seeds (audit F7)" {
+    // Before the fix, the loop's only exit condition was `seed == end`; with
+    // `start > end` that is never reached on the way up, so it wraps almost
+    // the entire u64 space (measured in the audit: forward sweep runs at
+    // ~2296 seeds/s, so the wrap is ~2.5e8 years — confirmed here separately
+    // via a bounded probe that the pre-fix loop times out rather than
+    // returns). `[start, end]` is documented as inclusive, and a reversed
+    // range is the empty set, not "every seed".
+    const gpa = testing.allocator;
+    var unused: usize = 0;
+    const template = sim.Case{
+        .seed = 0,
+        .scenario = twoNodeScenario,
+        .protocol = .{ .ctx = &unused, .onMessageFn = noopOnMessage },
+        .until = 100,
+    };
+    const result = try findFailing(gpa, template, .{}, 100, 50);
+    try testing.expect(result == null);
+}
+
+fn alwaysViolatingCheck(_: *anyopaque, _: *const sim.Sim) anyerror!void {
+    return error.AlwaysBroken;
+}
+
+test "findFailing: a forward range still searches and returns a real failure (positive control for F7)" {
+    const gpa = testing.allocator;
+    var unused: usize = 0;
+    const template = sim.Case{
+        .seed = 0,
+        .scenario = twoNodeScenario,
+        .protocol = .{ .ctx = &unused, .onMessageFn = noopOnMessage, .checkFn = alwaysViolatingCheck },
+        .until = 100,
+    };
+    var failing = (try findFailing(gpa, template, .{}, 1, 10)) orelse return error.ExpectedFailure;
+    defer failing.deinit();
+    try testing.expectEqual(error.AlwaysBroken, failing.err);
 }

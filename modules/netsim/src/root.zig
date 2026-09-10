@@ -63,6 +63,7 @@ pub const Time = types.Time;
 
 pub const Sim = sim_mod.Sim;
 pub const LinkConfig = sim_mod.LinkConfig;
+pub const LinkConfigError = sim_mod.LinkConfigError;
 pub const NodeConfig = sim_mod.NodeConfig;
 pub const Protocol = sim_mod.Protocol;
 pub const Scenario = sim_mod.Scenario;

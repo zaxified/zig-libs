@@ -125,7 +125,15 @@ pub fn generate(gpa: Allocator, seed: u64, topo: Topo, cfg: Config) Error!FaultT
     var i: usize = 0;
     while (i < n) : (i += 1) {
         const t: Time = prng.belowWide(cfg.horizon);
-        const repair_t: Time = t + 1 + prng.belowWide(cfg.horizon / 2 + 1);
+        // audit F14: plain `+` overflows when `horizon` is close to
+        // `maxInt(u64)` (Debug: `panic: integer overflow`; ReleaseFast: wraps
+        // modularly, so a "repair" can land BEFORE the disruption it repairs
+        // and the trace sorts into a nonsensical order, silently). Saturating
+        // add instead: a `repair_t` that saturates at `maxInt(Time)` is still
+        // a valid, sortable, in-the-future tick — just one that will never
+        // actually occur before the run's `until` in practice, which is
+        // exactly what "the repair landed effectively never" should mean.
+        const repair_t: Time = t +| 1 +| prng.belowWide(cfg.horizon / 2 + 1);
         const has_links = topo.links.len > 0;
         const can_crash = cfg.enable_crash and topo.node_count > 0;
         const can_clock_jump = cfg.enable_clock_jump and topo.node_count > 0;
@@ -386,6 +394,26 @@ test "generate: disabling a fault kind redistributes its weight, not drops it (a
             };
         }
         try testing.expectEqual(total_intended, total_primary);
+    }
+}
+
+test "generate: a huge horizon does not overflow computing repair_t (audit F14)" {
+    // Pre-fix, `t + 1 + belowWide(horizon/2+1)` used plain `+`, so a horizon
+    // near `maxInt(u64)` panicked in Debug ("integer overflow") the first
+    // time a repair-bearing kind (link_down+link_up, crash+restart,
+    // partition+heal) was drawn — and wrapped modularly in ReleaseFast,
+    // putting the "repair" before the disruption it repairs. `repair_permille
+    // = 1000` forces a repair to be drawn every time one is eligible, and 50
+    // seeds over all fault kinds is enough to exercise the computation
+    // repeatedly at the overflow boundary.
+    var seed: u64 = 1;
+    while (seed <= 50) : (seed += 1) {
+        var tr = try generate(testing.allocator, seed, sampleTopo(), .{
+            .horizon = std.math.maxInt(u64),
+            .max_events = 10,
+            .repair_permille = 1000,
+        });
+        tr.deinit();
     }
 }
 

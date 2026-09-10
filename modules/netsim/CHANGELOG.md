@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, netsim F7 +
+  F13 + F14. F7: `findFailing(start, end)` with `start > end` now returns
+  `null` immediately instead of walking ~2^64 seeds before it could ever
+  reach `end` (its only exit condition was `seed == end`, never true on the
+  way up past a `u64` wrap) — confirmed hanging past a 15s bound pre-fix.
+  F13: `Sim.addLink`/`addBiLink` now reject a `LinkConfig` `_permille` field
+  above 1000 with a new `error.InvalidPermille` (additive to their existing
+  `Allocator.Error!void`) — `Prng.permille(rate)` silently saturates to
+  "always fires" for any `rate > 1000`, so a caller who mistypes "5%" as
+  `loss_permille = 5000` previously got a permanently dead link with no
+  config error, not the total-loss-on-purpose the value implies. The
+  documented range 0..=1000 (checked: every in-repo consumer stays at or
+  under 1000) is unaffected. F14: `fault.generate`'s `repair_t` computation
+  now uses saturating addition (`+|`) instead of `+`, so a `horizon` near
+  `maxInt(u64)` no longer panics in Debug ("integer overflow") or wraps a
+  repair to before its own disruption in ReleaseFast.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, netsim F1 +
   F5. F5: `generate`'s fault-kind draw no longer silently drops a disabled or
   inapplicable kind's share of the schedule — it excludes that kind from the

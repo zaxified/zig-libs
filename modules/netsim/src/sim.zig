@@ -51,6 +51,12 @@ pub const LinkConfig = struct {
     bandwidth: ?u64 = null,
 };
 
+pub const LinkConfigError = error{
+    /// A `_permille` field of `LinkConfig` exceeded 1000 (100%) — see
+    /// `Sim.addLink` (audit F13).
+    InvalidPermille,
+};
+
 pub const NodeConfig = struct {
     /// Constant offset added to the node's observed clock (see `Sim.clock`).
     clock_skew: i64 = 0,
@@ -337,7 +343,16 @@ pub const Sim = struct {
         return id;
     }
 
-    pub fn addLink(self: *Sim, a: NodeId, b: NodeId, cfg: LinkConfig) Allocator.Error!void {
+    pub fn addLink(self: *Sim, a: NodeId, b: NodeId, cfg: LinkConfig) (Allocator.Error || LinkConfigError)!void {
+        // audit F13: `Prng.permille(rate)` is `below(1000) < rate`, which for
+        // any `rate > 1000` is trivially true every time — a caller who
+        // mistypes "5%" as `loss_permille = 5000` (instead of `50`) gets a
+        // permanently dead link, not a config error, and the protocol under
+        // test then passes trivially because nothing is ever delivered.
+        // Rejected at the boundary where the value enters, mirroring
+        // `fault.ConfigError.ZeroHorizon`.
+        if (cfg.loss_permille > 1000 or cfg.dup_permille > 1000 or cfg.reorder_permille > 1000)
+            return error.InvalidPermille;
         const idx: u32 = @intCast(self.links.items.len);
         try self.links.append(self.gpa, .{ .a = a, .b = b, .cfg = cfg });
         errdefer _ = self.links.pop();
@@ -345,7 +360,7 @@ pub const Sim = struct {
     }
 
     /// Add both directions with the same config.
-    pub fn addBiLink(self: *Sim, a: NodeId, b: NodeId, cfg: LinkConfig) Allocator.Error!void {
+    pub fn addBiLink(self: *Sim, a: NodeId, b: NodeId, cfg: LinkConfig) (Allocator.Error || LinkConfigError)!void {
         try self.addLink(a, b, cfg);
         try self.addLink(b, a, cfg);
     }
@@ -825,4 +840,34 @@ test "adjacency index stays in agreement with the link list" {
     // anyway as a contract, not an accident of the current implementation).
     var exact: [4]NodeId = undefined;
     try testing.expectEqual(@as(usize, 4), try sim.neighbors(ids[0], &exact));
+}
+
+test "addLink: a _permille field above 1000 is rejected, not silently saturated to certainty (audit F13)" {
+    // `Prng.permille(rate)` is `below(1000) < rate`, which for ANY
+    // `rate > 1000` is trivially true on every call — a caller who mistypes
+    // "5%" as `loss_permille = 5000` gets a permanently dead link with no
+    // config error, and the protocol under test then passes trivially
+    // because nothing is ever delivered.
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    const Noop = struct {
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    };
+    var unused: usize = 0;
+    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onMessageFn = Noop.onMessage }, &log, 100, 1000);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+
+    try testing.expectError(error.InvalidPermille, sim.addLink(a, b, .{ .loss_permille = 5000 }));
+    try testing.expectError(error.InvalidPermille, sim.addLink(a, b, .{ .dup_permille = 1001 }));
+    try testing.expectError(error.InvalidPermille, sim.addLink(a, b, .{ .reorder_permille = 65535 }));
+    try testing.expectEqual(@as(usize, 0), sim.links.items.len); // none of the above were added
+
+    // Positive control: the documented range (0..=1000) still works,
+    // INCLUDING the boundary value 1000 itself — fleetsim relies on exactly
+    // `reorder_permille = 1000` / `dup_permille = 1000` in its own tests.
+    try sim.addLink(a, b, .{ .loss_permille = 1000 });
+    try testing.expectEqual(@as(usize, 1), sim.links.items.len);
 }
