@@ -75,7 +75,34 @@
 //! code.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Certificate = std.crypto.Certificate;
+
+/// Zig release `requireStdDescentPoints` below was last verified against by
+/// reading `std.crypto.Certificate.parse`'s source directly (A1 `x509.md` X1).
+/// The coupling is deliberate (see that function's doc comment) and this is
+/// its manual-review trip wire: a MINOR/MAJOR toolchain bump can change std's
+/// own walk while every test in this file stays green, because the tests pin
+/// SHAPES (`30 07 04 05 30 83 01 00 00` and friends), not the coupling to std.
+/// Bumping the constant below is the reviewer's signal that they re-read
+/// `Certificate.parse` in the new std and either found no new descent point,
+/// or added one to `requireStdDescentPoints` (and to this comment).
+const std_descent_points_verified_against: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
+comptime {
+    if (builtin.zig_version.major != std_descent_points_verified_against.major or
+        builtin.zig_version.minor != std_descent_points_verified_against.minor)
+    {
+        @compileError(
+            "requireStdDescentPoints (modules/x509/src/safe.zig) mirrors " ++
+                "std.crypto.Certificate.parse's descent points as verified against Zig " ++
+                "0.16.0. This toolchain is on a different minor/major version. Before " ++
+                "raising std_descent_points_verified_against: re-read " ++
+                "std.crypto.Certificate.parse's source in THIS toolchain, confirm " ++
+                "requireStdDescentPoints still names every position it descends " ++
+                "into, and update both if it gained one. See A1/x509.md X1.",
+        );
+    }
+}
 
 /// Deepest TLV nesting the validator will descend before giving up. A DER
 /// X.509 certificate nests roughly six or seven levels in practice; anything
@@ -1121,4 +1148,127 @@ test "the guard rejects a primitive at every position std descends into" {
     const fx = @import("fixtures_test.zig");
     const ok = try safeCertificate(&fx.leaf_rsa, &scratch);
     _ = try ok.parse();
+}
+
+// ── A1 x509.md X4: the two SUSPECTED-not-reproduced items ───────────────────
+//
+// (a) claimed an info leak through `common_name_slice`/`subject_alt_name_slice`
+// via the same primitive-where-std-descends mechanism as F1/F3, "not reachable
+// today because `requireStdDescentPoints` covers both paths -- but nobody
+// measured it." The test above already proves the position-based descent
+// points (TBS, SPKI). commonName and subjectAltName are reached through the
+// two LOOPS in `requireStdDescentPoints` (the RDN/ATAV walk and the
+// extensions walk) rather than a single fixed position -- a materially
+// different code path (a loop's second-and-later iteration can go unguarded
+// even when its first is checked). These two hostile certificates target the
+// loops directly: each is well-formed DER (so `validateCertificate` accepts
+// it) and, with the loop's `constructedAt` call replaced by plain
+// `decodeHeader` (verified by temporarily making that edit and re-running
+// this test: it flips from `error.PrimitiveWhereStdDescends` to the call
+// returning successfully -- `safeCertificate` would ACCEPT the hostile
+// certificate), the malformed element carries zero content so the walk exits
+// cleanly instead of tripping an unrelated bounds error first.
+test "the guard rejects a primitive inside the subject RDN loop (X4a, commonName)" {
+    // Minimal well-formed v1 TBS whose subject is a constructed SEQUENCE
+    // (passes the position-based `subject` check) holding one element that is
+    // a primitive, zero-length INTEGER rather than a constructed RDN (SET).
+    // Zero-length keeps the ATAV sub-loop from running at all, so an
+    // unguarded RDN check is the ONLY thing that would still catch this --
+    // isolating exactly the line this test is about.
+    const ec_algid = [_]u8{ 0x30, 0x13 } ++
+        [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 } ++ // ecPublicKey
+        [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 }; // prime256v1
+    const algid_sha256rsa = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00 };
+    const validity_der = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "250101000000Z".* ++
+        [_]u8{ 0x17, 0x0d } ++ "350101000000Z".*;
+    const spki_content = ec_algid ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 }; // BIT STRING, 1 data octet
+    const spki = [_]u8{ 0x30, spki_content.len } ++ spki_content;
+
+    const serial = [_]u8{ 0x02, 0x01, 0x01 };
+    const issuer = [_]u8{ 0x30, 0x00 };
+    // subject: SEQUENCE holding ONE element that is a primitive, zero-length
+    // INTEGER, not a constructed RDN. `walk` accepts it (a primitive INTEGER
+    // tiles fine, and `walk` does not validate INTEGER semantics);
+    // `constructedAt` inside the RDN loop is what must refuse it.
+    const subject_hostile = [_]u8{ 0x30, 0x02, 0x02, 0x00 };
+
+    const tbs_content = serial ++ algid_sha256rsa ++ issuer ++ validity_der ++ subject_hostile ++ spki;
+    const tbs = [_]u8{ 0x30, tbs_content.len } ++ tbs_content;
+    const sig_value = [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    const cert_content = tbs ++ algid_sha256rsa ++ sig_value;
+    const cert = [_]u8{ 0x30, cert_content.len } ++ cert_content;
+
+    // Well-formed DER throughout (every length tiles its container) -- the
+    // hazard is purely the constructed-bit confusion inside the RDN loop.
+    try validateCertificate(&cert);
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(&cert, &scratch));
+}
+
+test "the guard rejects a primitive inside the extensions loop (X4a, subjectAltName)" {
+    // Same shape, v3 this time with an empty (zero-RDN) subject and one
+    // extension that is a primitive, zero-length OCTET STRING instead of a
+    // constructed `Extension ::= SEQUENCE`. This is the descent std's
+    // subjectAltName read uses, and it is a different loop from the RDN one
+    // above.
+    const ec_algid = [_]u8{ 0x30, 0x13 } ++
+        [_]u8{ 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01 } ++
+        [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+    const algid_sha256rsa = [_]u8{ 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0x00 };
+    const validity_der = [_]u8{ 0x30, 0x1e, 0x17, 0x0d } ++ "250101000000Z".* ++
+        [_]u8{ 0x17, 0x0d } ++ "350101000000Z".*;
+    const spki_content = ec_algid ++ [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    const spki = [_]u8{ 0x30, spki_content.len } ++ spki_content;
+
+    const version_v3 = [_]u8{ 0xa0, 0x03, 0x02, 0x01, 0x02 };
+    const serial = [_]u8{ 0x02, 0x01, 0x01 };
+    const issuer = [_]u8{ 0x30, 0x00 };
+    const subject_empty = [_]u8{ 0x30, 0x00 };
+    // `[3] EXPLICIT SEQUENCE OF Extension` holding one primitive OCTET
+    // STRING where `Extension ::= SEQUENCE` is expected. Its CONTENT is a
+    // well-formed `extnID OID, extnValue OCTET STRING {}` pair -- not empty
+    // -- so that with the guard removed the loop body reads all the way
+    // through and returns cleanly instead of tripping an unrelated
+    // downstream bounds error, isolating exactly what the outer
+    // `constructedAt` on `extension` closes.
+    const extension_hostile = [_]u8{ 0x04, 0x07 } ++
+        [_]u8{ 0x06, 0x03, 0x55, 0x1d, 0x11 } ++ // extnID = 2.5.29.17 (subjectAltName)
+        [_]u8{ 0x04, 0x00 }; // extnValue, empty OCTET STRING
+    const extensions_seq = [_]u8{ 0x30, extension_hostile.len } ++ extension_hostile;
+    const outer_extensions = [_]u8{ 0xa3, extensions_seq.len } ++ extensions_seq;
+
+    const tbs_content = version_v3 ++ serial ++ algid_sha256rsa ++ issuer ++ validity_der ++
+        subject_empty ++ spki ++ outer_extensions;
+    const tbs = [_]u8{ 0x30, tbs_content.len } ++ tbs_content;
+    const sig_value = [_]u8{ 0x03, 0x02, 0x00, 0x00 };
+    const cert_content = tbs ++ algid_sha256rsa ++ sig_value;
+    const cert = [_]u8{ 0x30, cert_content.len } ++ cert_content;
+
+    try validateCertificate(&cert);
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    try testing.expectError(error.PrimitiveWhereStdDescends, safeCertificate(&cert, &scratch));
+}
+
+// (b) claimed `message_slice` (the bytes `Certificate.Parsed.verify` hashes)
+// is "correct because it comes from two validated tiles" without proof.
+// `std.crypto.Certificate.parse` builds it as
+// `.{ .start = certificate.slice.start, .end = tbs_certificate.slice.end }`
+// (Certificate.zig:539) -- i.e. from the SAME `tbs` header this module
+// already decodes at `certificate.content_start` as the very first line of
+// `requireStdDescentPoints`. This test makes that coupling an executable
+// check instead of a read of two source files: recompute the TBS header
+// independently (this module's own `decodeHeader`, not std's) and assert
+// `Parsed.message()` is byte-identical to the slice it names.
+test "message() is exactly the TBS header this module already validated (X4b)" {
+    const fx = @import("fixtures_test.zig");
+    var scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    const cert = try safeCertificate(&fx.leaf_rsa, &scratch);
+    const parsed = try cert.parse();
+
+    const outer = try decodeHeader(cert.buffer, 0, fx.leaf_rsa.len);
+    const tbs = try decodeHeader(cert.buffer, outer.content_start, outer.content_end);
+    // std's own formula: TBS's own tag+length octets (`outer.content_start`,
+    // where the TBS header begins) through TBS's content end.
+    const expected = cert.buffer[outer.content_start..tbs.content_end];
+    try testing.expectEqualSlices(u8, expected, parsed.message());
 }
