@@ -49,7 +49,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     edits invalidate that pin's source digest; needs a coordinator re-pin
     before the tier-A ctgrind queue is trusted again for this module.
 
-- **2026-09-10 (mop-up)** — A1 fix campaign, closing out what wave-3 left
+- **2026-09-10** — **BEHAVIOURAL, not breaking (mop-up pass):** A1 fix campaign, closing out what wave-3 left
   unattempted (`A1/paillier.md` F6/F7/F10; see that file's "Dispozice
   2026-09-10 (mop-up)" for the measurements). No public signature changed.
   - **F6 narrowed, not closed.** Its first half (the three byte-loader fuzz
