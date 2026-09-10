@@ -78,21 +78,47 @@ _ = pkg.eql(&other);
   `uci` binary confirms `\n`/`\t`/`\r` are not special-cased; see SPEC.md).
   Bare words; adjacent quoted/bare segments of one token concatenate
   (`'a'"b"c` → `abc`).
-- Comments: `#` to end of line at the start of a token; literal inside
-  quotes and inside a bare word. Quotes may not span lines; CRLF accepted.
+- Comments: `#` to end of line at the start of a token, OR anywhere inside a
+  bare (unquoted) run — either way it truncates the token and discards the
+  rest of the *line*, matching real `uci` (audit A1 U4: `a#b` unquoted is
+  `a`, not `a#b`). Literal inside quotes. Quotes may not span lines; CRLF
+  accepted.
 - Repeated `option` under one key: last wins. `list` accumulates in order.
-  Mixing `option`/`list` under one key → `error.MixedOptionList`.
+  Mixing `option`/`list` under one key is rejected here as
+  `error.MixedOptionList`, and an `option`/`list` with no value as
+  `error.MissingArgument` — both are this module's OWN additional
+  strictness, not real UCI semantics (audit A1 U11/U12): real `uci` merges a
+  mixed option/list (last kind for that key wins) and loads a file with a
+  valueless `option` by simply dropping it, rather than rejecting the whole
+  file either way.
+- Section/option names must be alphanumeric or `_` (not even `-`); section
+  types allow any other printable, non-space ASCII byte too. Real `uci`'s own
+  validator draws the same line, on both the read AND write path — a name it
+  would refuse to load is rejected here too (audit A1 U7, `error.InvalidName`;
+  not enforced on an option key when *writing*, see the source for why). A
+  zero-length name/type/key is the one exception (see below).
+- Two `config` blocks sharing a name are rejected as `error.DuplicateSection`
+  regardless of whether they share a type (audit A1 U1) — this module's
+  `[]Section` model cannot represent real `uci`'s same-type merge (last
+  option value wins), so rather than silently answering every accessor from
+  the FIRST block's now-stale values, it refuses the file.
 - Canonical output: optional `package <name>` header (bare when
   identifier-safe, quoted otherwise — matches real `uci export`'s own
   rendering), blank line between section blocks, tab-indented options, values
   single-quoted (double-quoted with escapes when they contain `'` or control
   characters).
 - Bounded: inputs over 16 MiB → `error.InputTooLarge`; lines over 16 KiB →
-  `error.LineTooLong`.
+  `error.LineTooLong`; the built model over 300000 total items (sections +
+  options + values, combined) → `error.MemoryLimitExceeded` (audit A1 U3 —
+  the text cap alone let a legal 16 MiB input cost 371+ MB of RSS).
 
 ## Notes / deviations
 
-- An empty quoted section name (`config rule ''`) is treated as anonymous.
+- An empty quoted section name (`config rule ''`) is treated as anonymous;
+  an empty quoted section type or option key (`config ''`, `option '' v`) is
+  accepted literally — the one case the name/type/key validation above does
+  not cover, since real `uci` treats a zero-length argument as "insufficient
+  arguments" (a different failure mode) rather than an invalid character.
 - Values containing ANY control character below 0x20 — `\n` `\t` `\r`
   included, since none of them has a working escape (see above) — cannot be
   represented in UCI text and serialize to `error.UnserializableValue`.

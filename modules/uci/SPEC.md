@@ -9,14 +9,40 @@ in an internal arena — one `Package.deinit(gpa)` frees everything; `serialize`
 canonical text. Reentrant, no shared state. Documented quoting, exactly: single quotes take no
 escapes; double quotes take `\" \' \\ \n \t \r` (a backslash before any other char yields that char);
 bare words end at whitespace; adjacent segments of one token concatenate (`'a'"b"c` → `abc`); quotes
-may not span lines; `#` starts a comment only at the start of a token; CRLF accepted. Repeated-key
-semantics: a repeated `option` under one key overwrites (last wins, matching `uci set`); `list`
-entries accumulate in order; mixing `option` and `list` under one key → `error.MixedOptionList`.
+may not span lines; `#` starts a comment at the start of a token, OR anywhere inside a bare
+(unquoted) run — either way it truncates the token AND discards the rest of the line, matching real
+`uci` (audit A1 U4, measured against the real binary: `a#b` unquoted is `a`, not `a#b` — this SPEC
+previously claimed the opposite as "the format", which the real binary disproved); `#` inside quotes
+stays literal. CRLF accepted. Repeated-key semantics: a repeated `option` under one key overwrites
+(last wins, matching `uci set`); `list` entries accumulate in order; mixing `option` and `list` under
+one key → `error.MixedOptionList`, and an `option`/`list` line with no value → `error.MissingArgument`
+— **both are this module's OWN additional strictness, not real UCI semantics** (audit A1 U11/U12):
+real `uci` merges a mixed option/list under one key (whichever kind appears LAST for that key wins,
+discarding the earlier kind) and loads a valueless `option` by simply dropping it, rather than
+rejecting the whole file either way. Section/option names real `uci` never accepts are rejected too
+(audit A1 U7, `error.InvalidName`; not enforced on an option KEY when *writing* — see
+`SerializeError.InvalidName` in `root.zig`): section/option names must be alphanumeric or `_` (not
+even `-`); section types are looser (alphanumeric/`_` or any other printable, non-space ASCII byte).
+A zero-length name/type/key is exempt from that check (see U7's fix commit) — `config ''`/`option ''
+v` producing a literal empty type/key stays accepted, per the deviation noted below. Two `config`
+blocks sharing a name are rejected outright as `error.DuplicateSection` (audit A1 U1) rather than
+silently building two `Section`s and answering every accessor from the FIRST one's values: real `uci`
+either merges same-type duplicates (last option value wins) or rejects a same-name/different-type
+collision, and this module's `[]Section` model cannot represent the merge, so it rejects both shapes
+rather than silently disagreeing with the device about which value is live.
 Never-panic, line-numbered errors: malformed input yields a typed `ParseError` (`UnterminatedQuote`,
-`BadKeyword`, `MissingArgument`, `TooManyArguments`, `OptionOutsideSection`, `MixedOptionList`, …);
-`parseDiag` fills a 1-based `Diagnostics.line` (0 = not line-tied). Serialization of a value with a
-control char that has no UCI escape → `error.UnserializableValue`. Bounded: input over 16 MiB →
-`error.InputTooLarge`; a line over 16 KiB → `error.LineTooLong`. Canonical output: optional `package
+`BadKeyword`, `MissingArgument`, `TooManyArguments`, `OptionOutsideSection`, `MixedOptionList`,
+`DuplicateSection`, `InvalidName`, `MemoryLimitExceeded`, …); `parseDiag` fills a 1-based
+`Diagnostics.line` (0 = not line-tied, e.g. `InputTooLarge`/`MemoryLimitExceeded`). Serialization of
+a value with a control char that has no UCI escape → `error.UnserializableValue`; a section
+type/name with a character `parse` would also have rejected → `error.InvalidName`.
+Bounded: input over 16 MiB → `error.InputTooLarge`; a line over 16 KiB → `error.LineTooLong`; the
+built model over 300000 total items (sections + options + values, combined) →
+`error.MemoryLimitExceeded` (audit A1 U3 — the 16 MiB text cap did not bound the MODEL built from
+it: a legal, `max_input_len`-sized input measured 22x-41.5x live-byte amplification, up to 371 MB RSS
+from a 16.6 MB file; a flat item-count cap bounds that regardless of input shape, independent of
+input size — see `max_total_items`'s doc comment in `root.zig` for why a size-relative ratio does
+not work here). Canonical output: optional `package
 '<name>'` header, blank line between section blocks, tab-indented options, values single-quoted
 (double-quoted with escapes only when they contain `'` or a control char). Accessors: `section(type,
 name)`, `get`/`getList`, `iterate(type)`, deep `eql`. Two more resolve the addressing forms a UCI key
@@ -37,12 +63,16 @@ binary used purely as a black-box oracle (root `NOTICE` §0).
 
 ## Threat model / out of scope
 Not security-sensitive; the hardening is denial-of-service and crash resistance on hostile config
-text — the input/line-length caps and the never-panic typed-error contract bound memory and rule out
-OOB/hang on garbage or bit-flipped input. Deviations to note: an empty quoted section name (`config
-rule ''`) is treated as anonymous; values with control chars other than `\n \t \r` cannot be
-represented in UCI text and fail serialization. Out of scope: the UCI CLI layer — `uci set/commit`,
-`/etc/config` discovery, the transactional delta/state files under `/var/state`, and typed value
-coercion. This is the file codec only.
+text — the input/line-length/item-count caps and the never-panic typed-error contract bound memory
+and rule out OOB/hang on garbage or bit-flipped input. Deviations to note: an empty quoted section
+name (`config rule ''`) is treated as anonymous; an empty quoted section type or option key
+(`config ''`, `option '' v`) is accepted literally (audit A1 U18's regression test relies on this;
+it is the one shape the U7 name/type/key validator deliberately does not cover, since real uci's own
+handling of a zero-length argument is a different failure mode — "insufficient arguments" at the
+CLI-argument layer — not a character-class violation); values with control chars other than
+`\n \t \r` cannot be represented in UCI text and fail serialization. Out of scope: the UCI CLI
+layer — `uci set/commit`, `/etc/config` discovery, the transactional delta/state files under
+`/var/state`, and typed value coercion. This is the file codec only.
 
 **The concrete trap in "this is the file codec only": a file-only reader loses staged-but-uncommitted
 state.** `uci set` without a following `commit` never touches `/etc/config/<pkg>` — it appends a
@@ -78,14 +108,18 @@ changes actually pending — check the file's contents/size, not merely whether 
 ## Verification
 Golden tests: parse a realistic `network` config into the model and assert its structure; round-trip
 stability (`parse∘serialize` equal, second pass byte-identical) and the exact canonical serialization
-bytes. Quoting: double-quote escapes, single-quote literalness, bare words, mid-word `#`, token
-concatenation of quoted segments, comments/blank lines, empty quoted value. Semantics: anonymous
-sections, list accumulation, duplicate-option last-wins, mixed option/list rejected. Errors (with
-asserted line numbers): unterminated single/double quote, option before any section, bad keyword,
-missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookups (incl.
+bytes. Quoting: double-quote escapes, single-quote literalness, bare words, mid-word `#` (truncates
+the token AND discards the rest of the line — audit A1 U4), token concatenation of quoted segments,
+comments/blank lines, empty quoted value. Semantics: anonymous sections, list accumulation,
+duplicate-option last-wins, mixed option/list rejected, duplicate SECTION name rejected regardless of
+type (audit A1 U1), invalid section/option names rejected (audit A1 U7), the model-size cap (audit A1
+U3, exact 2N+1-item boundary pinned). Errors (with asserted line numbers): unterminated single/double
+quote, option before any section, bad keyword, missing/too-many arguments, line-too-long,
+input-too-large. Plus accessor lookups (incl.
 `sectionByName`/`nth` against the real-`uci`-capture fixture below — name-across-types resolution,
 `@type[N]` positive/negative/out-of-range/no-match), CRLF input,
-`package` header serialization, and quoted keys/types round-tripping. Run: `zig build
+`package` header serialization, and quoted-type round-tripping (a type needing quotes but still
+valid per real uci's name rule — no equivalent case exists for a key, see U7 below). Run: `zig build
 test-uci`.
 
 **Fuzz corpus (audit A1 U15).** `fuzzParse`/`fuzzRoundTrip` run a fixed, pinned corpus
@@ -127,6 +161,50 @@ cosmetic difference with no behavioral impact. Also not replicated: real `uci ex
 extra trailing blank line after the very last section (this module's blank line is only ever
 *between* blocks) — a CLI-output-only convention, not a canonical-serialization invariant, and
 changing it would touch every other hand test asserting no trailing blank line.
+
+**Audit A1, second fix pass (2026-09-10, fixwt/c).** This module has zero consumers in this repo
+(verified against `example-apps/` too), so per the campaign's P1 rule, input-hardening decisions —
+including new error values and rejecting input that previously parsed — are the fixer's call, not a
+question for the user. Four findings closed this way:
+1. **U1 — duplicate section name.** Two `config` blocks sharing a name used to silently build TWO
+   `Section`s, with every accessor answering from the FIRST one's (stale) values — the device uses
+   the LAST. The model can't represent real uci's merge, so both a same-type collision (which real
+   uci merges) and a same-name/different-type collision (which real uci's strict mode already
+   rejects) now fail closed as `error.DuplicateSection`, rather than one implementation of "the
+   config" silently disagreeing with the other about which value is live.
+2. **U3 — the 16 MiB input cap didn't bound the built MODEL.** Measured 22x-41.5x live-byte
+   amplification on a legal, `max_input_len`-sized input (up to 371 MB RSS from 16.6 MB of text). A
+   ratio-of-input-size cap was tried and rejected: the worst measured shape amplifies close enough to
+   this module's OWN legitimate N=64000-distinct-keys perf test (U2's regression guard) that no ratio
+   can admit one and reject the other. `max_total_items` (a flat cap on sections+options+values
+   combined, independent of input size) does — `error.MemoryLimitExceeded`.
+3. **U4 — mid-word `#`.** This SPEC claimed, as fact about the format, that `#` only starts a comment
+   at the start of a token. The real binary disproves it: `#` anywhere in a bare (unquoted) run
+   truncates the token AND discards the rest of the line. Fixed in `nextToken`; the SPEC line above is
+   corrected, not just the code.
+4. **U7 — no name/type/key validation.** Real uci's own validator (`uci_validate_str`) never accepted
+   most of the 15 hand-written probes this module did (hyphens/dots/spaces/non-ASCII in a name or
+   type, hyphens/dots in a key) — dangerous on the WRITE path especially, since `serialize` could
+   produce a file real uci refuses to load back, breaking the whole package, not just one section.
+   Both `parse` and `serialize` now enforce it (`error.InvalidName`) for section type/name; `parse`
+   also enforces it for option keys, but `serialize` deliberately does not (see U14 below). Zero-length
+   names/keys are exempt — see the Threat model section's note on U18.
+
+Two more findings closed WITHOUT a code change, by correcting this SPEC instead (P2, "documentation is
+the spec, fix the code" — but here the code and doc already agreed with each other, they were just
+both wrong about what real uci does, so the fix corrects the CLAIM, not the code):
+- **U11/U12 — `MixedOptionList`/valueless-`option` rejection presented as "UCI semantics".** They
+  aren't: real uci is more lenient on both (merges a mixed option/list, whichever kind is LAST for a
+  key wins; loads a file with a valueless `option` and simply drops it). This module's stricter,
+  reject-the-whole-file behavior is intentional and unchanged, but the "Repeated-key semantics" line
+  above now says so explicitly instead of implying it is inherited from the format.
+
+**One tension this surfaced, for whoever revisits U5/U6/U8/U9/U10/U19 next:** U7's validation
+deliberately carves out a zero-length name/type/key (a real, load-bearing shape — U18's regression
+test) and deliberately does NOT reject an option key containing `'` at `serialize` time (U14's
+already-closed guarantee that such a key, however it got into a hand-built `Package`, is written
+quoted rather than bare/injectable). Both carve-outs are narrow and load-bearing on an *earlier* fix;
+widening U7 later without re-reading U14/U18 first will silently re-break one of them.
 
 ## Backlog / deferred
 None beyond the documented UCI-CLI-layer/typed-coercion out-of-scope list above, and the two

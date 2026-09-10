@@ -24,8 +24,11 @@
 //! control byte, confirmed against a real `uci` binary — see SPEC.md);
 //! bare words end at whitespace.
 //! Adjacent segments of one token concatenate (`'a'"b"c` -> `abc`), quotes
-//! may not span lines. `#` starts a comment at the start of a token; inside
-//! a token or inside quotes it is literal.
+//! may not span lines. `#` starts a comment at the start of a token, OR
+//! anywhere inside a bare (unquoted) run -- either way it truncates the
+//! current token and discards the rest of the *line* (audit A1 U4, measured
+//! against the real `uci` binary: `a#b` unquoted is `a`, not `a#b`). Inside
+//! quotes `#` is always literal.
 //!
 //! Malformed input yields a typed `ParseError` (never a panic); pass a
 //! `Diagnostics` to `parseDiag` to learn the 1-based line number.
@@ -68,6 +71,30 @@ pub const max_input_len: usize = 1 << 24; // 16 MiB
 /// Longest accepted single line, in bytes (excluding the newline).
 pub const max_line_len: usize = 1 << 14; // 16 KiB
 
+/// Audit A1 U3: `max_input_len` bounds the TEXT, not the MODEL it builds --
+/// measured amplification of a syntactically legal, `max_input_len`-sized
+/// input ranged 22x-41.5x live-byte overhead (depending on shape: one option
+/// per section vs. many options in one section), i.e. a 16 MiB file could
+/// legally cost 371+ MB of RSS on a device with typically 64-256 MB of RAM.
+///
+/// A bound expressed as "N times the input size" was tried first and
+/// rejected: the worst measured shape ("one option per section") already
+/// amplifies close to 42x, which is the SAME order of magnitude as the
+/// perfectly legitimate "many distinct options in one section" shape this
+/// module's own U2 regression test exercises at N=64000 -- so any ratio
+/// loose enough to admit that legitimate test back-derives to nearly the
+/// same 16 MiB-input ceiling the audit already showed doesn't bound memory
+/// (a ratio has to be looser than the worst offender it's meant to catch, or
+/// it catches good data too). A flat cap on total model ITEMS (sections +
+/// options + values, combined) avoids that: it is independent of input
+/// size, so it does not get looser as a file grows, and it directly bounds
+/// the allocation count that drives the amplification regardless of shape.
+/// `max_total_items` sits comfortably above the U2 test's 128001 items
+/// (roughly 2.3x) while still cutting the audit's "one option per section"
+/// shape off well before it reaches even a tenth of `max_input_len` --
+/// converting unbounded RSS growth into an early, controlled rejection.
+pub const max_total_items: usize = 300_000;
+
 // ── errors / diagnostics ────────────────────────────────────────────────────
 
 pub const ParseError = error{
@@ -88,6 +115,30 @@ pub const ParseError = error{
     OptionOutsideSection,
     /// `option` and `list` mixed under the same key in one section.
     MixedOptionList,
+    /// Audit A1 U1: two `config` sections share a name. Real `uci` either
+    /// merges same-type duplicates (last option value wins, `sections.len`
+    /// unaffected) or rejects a same-name/different-type collision outright
+    /// under `UCI_FLAG_STRICT` -- this module's `[]Section` model cannot
+    /// represent the merge (it always allocates a new `Section`, so
+    /// `sections.len` would silently disagree with real `uci`'s count and
+    /// the first-written values, not the winning ones, would answer every
+    /// accessor query). Rather than accept a file whose two implementations
+    /// of "the config" disagree about which value is live, this module
+    /// rejects ALL duplicate-name collisions (same type or not) rather than
+    /// silently returning the wrong side.
+    DuplicateSection,
+    /// Audit A1 U7: a section name, section type, or option key uses a
+    /// character real `uci`'s own validator (`uci_validate_str`, util.c)
+    /// never allows there -- anything other than alphanumeric/`_` for a
+    /// name/key, or non-printable/space for a type. Zero-length names/keys
+    /// are NOT covered by this check (see the comment on `validNameChars`):
+    /// `config ''`/`option '' v` stay accepted, a deliberately-tested shape
+    /// (audit A1 U18).
+    InvalidName,
+    /// Audit A1 U3: this input is syntactically legal (under
+    /// `max_input_len`) but the in-memory model it would build is
+    /// disproportionate to it -- see `checkMemoryLimit`.
+    MemoryLimitExceeded,
     OutOfMemory,
 };
 
@@ -96,6 +147,13 @@ pub const SerializeError = error{
     /// below 0x20 — UCI text has no escape that produces an actual control
     /// byte, `\n`/`\t`/`\r` included; see the parser's double-quote comment).
     UnserializableValue,
+    /// Audit A1 U7 (write side): a section name or section type uses a
+    /// character real `uci` would refuse to load — see `ParseError.InvalidName`.
+    /// Deliberately NOT enforced on an option *key* here: `writeWord`
+    /// already guarantees any key round-trips safely, quoted or not (audit
+    /// A1 U14), and a directly-constructed `Package` (bypassing `parse`,
+    /// which does enforce this for keys) is allowed to carry one.
+    InvalidName,
     OutOfMemory,
 };
 
@@ -275,6 +333,46 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
     return std.mem.eql(u8, av, bv);
 }
 
+// ── name validation (audit A1 U7) ───────────────────────────────────────────
+//
+// Real `uci`'s `uci_validate_str` (util.c:71) is called on three fields, with
+// two different character classes, and is the reason 15/15 hand-written
+// probes with an unusual section name/type/key were `MODULE-ACCEPTS-
+// LIBUCI-REJECTS` before this fix -- both on the READ path (this module
+// called a file "fine" that a real device's `uci_load` rejects outright) and,
+// worse, on the WRITE path (`serialize` could write a name/type real `uci`
+// will not load back, silently producing a config file that breaks the whole
+// package on the device, not just the one section).
+//
+// Deliberately NOT covered: a zero-length name/type/key. Real `uci`'s CLI
+// argument layer treats an empty quoted argument as "insufficient arguments"
+// (a different failure mode than a character-class violation), and this
+// module has its own, already-decided and already-tested contract for zero-
+// length names: `config ''` is anonymous (see "empty section name is
+// anonymous" below), and `config ''`/`option '' v` producing a literal empty
+// type/key is a deliberately supported round-trip shape pinned by the U18
+// regression test ("writeWord's empty-word path..."). Rejecting length-0
+// here would silently re-break that already-closed finding, so both
+// functions below only ever look at content, never length.
+
+/// Section names and option keys: real `uci` allows only alphanumeric or
+/// `_` there (NOT even `-`).
+fn validNameChars(s: []const u8) bool {
+    for (s) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
+}
+
+/// Section types: real `uci` is looser here -- alphanumeric/`_`, or any
+/// other printable, non-space ASCII byte (33-126).
+fn validTypeChars(s: []const u8) bool {
+    for (s) |c| {
+        if (c < 33 or c > 126) return false;
+    }
+    return true;
+}
+
 // ── parser ──────────────────────────────────────────────────────────────────
 
 /// Parse UCI text into a `Package`. All model memory comes from an internal
@@ -334,6 +432,9 @@ const Parser = struct {
     sections: std.ArrayList(Section) = .empty,
     current: ?SecBuild = null,
     finished: []Section = &.{},
+    /// Audit A1 U3: sections + options + values built so far, combined. See
+    /// `max_total_items` and `checkMemoryLimit`.
+    total_items: usize = 0,
 
     fn run(p: *Parser, bytes: []const u8) ParseError!void {
         var it = std.mem.splitScalar(u8, bytes, '\n');
@@ -348,21 +449,56 @@ const Parser = struct {
         p.finished = try p.sections.toOwnedSlice(p.arena);
     }
 
+    /// Audit A1 U3: abort once the model has grown past `max_total_items`
+    /// items. O(1) -- this does not reintroduce the U2 quadratic.
+    fn checkMemoryLimit(p: *Parser) ParseError!void {
+        if (p.total_items > max_total_items) return error.MemoryLimitExceeded;
+    }
+
     fn parseLine(p: *Parser, line: []const u8) ParseError!void {
         var pos: usize = 0;
         const kw = (try p.nextToken(line, &pos)) orelse return; // blank or comment line
 
         if (std.mem.eql(u8, kw, "config")) {
             const sec_type = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
+            // Audit A1 U7: section type must match real uci's (looser) name
+            // rule. Zero-length is never produced here (nextToken returns
+            // null, not "", at end of line -- MissingArgument already
+            // covers that), so no empty-string carve-out is needed for the
+            // type specifically; `config ''` below is the name case.
+            if (!validTypeChars(sec_type)) return error.InvalidName;
             const name_tok = try p.nextToken(line, &pos);
             if (try p.nextToken(line, &pos) != null) return error.TooManyArguments;
             try p.flushSection();
             // An empty quoted name ('') is treated as anonymous.
             const name: ?[]const u8 = if (name_tok) |n| (if (n.len > 0) n else null) else null;
+            // Audit A1 U7: a non-empty name must match real uci's name rule.
+            if (name) |n| {
+                if (!validNameChars(n)) return error.InvalidName;
+            }
+            // Audit A1 U1: real uci indexes section names in one namespace
+            // per package and either merges (same type) or rejects (mixed
+            // type) a second `config` block reusing an already-seen name.
+            // This module's `[]Section` model can't represent the merge (it
+            // always builds a new `Section`), so rather than silently
+            // answering every accessor from the FIRST block's values (what
+            // the device does not do -- it uses the LAST) it rejects any
+            // name collision, same type or not.
+            if (name) |n| {
+                for (p.sections.items) |*s| {
+                    if (s.name) |sn| {
+                        if (std.mem.eql(u8, sn, n)) return error.DuplicateSection;
+                    }
+                }
+            }
             p.current = .{ .section_type = sec_type, .name = name, .options = .empty, .index = .empty };
         } else if (std.mem.eql(u8, kw, "option") or std.mem.eql(u8, kw, "list")) {
             if (p.current == null) return error.OptionOutsideSection;
             const key = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
+            // Audit A1 U7: option key must match real uci's name rule.
+            // Zero-length keys (`option '' v`) are exempted -- see
+            // `validNameChars`'s doc comment (audit A1 U18).
+            if (!validNameChars(key)) return error.InvalidName;
             const value = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
             if (try p.nextToken(line, &pos) != null) return error.TooManyArguments;
             const kind: Option.Kind = if (kw[0] == 'o') .single else .list;
@@ -433,15 +569,26 @@ const Parser = struct {
                     if (!closed) return error.UnterminatedQuote;
                 },
                 else => {
-                    // Bare run: up to whitespace or a quote (concatenation).
-                    // '#' inside a bare word is literal; it only starts a
-                    // comment at the start of a token.
+                    // Bare run: up to whitespace, a quote (concatenation), or
+                    // '#'. Audit A1 U4: real `uci` (`parse_str`, file.c:206)
+                    // treats '#' ANYWHERE in a bare run as comment-start, not
+                    // just at the start of a token -- it truncates the
+                    // current token there and discards the rest of the
+                    // *line* (not just the token) as a comment. This module
+                    // previously kept '#' mid-word literal, which SPEC.md
+                    // documented as "the format", a claim the real binary
+                    // disproves (`a#b` -> `a` there, not `a#b`). '#' inside a
+                    // quoted segment is unaffected -- real uci's quote
+                    // scanners never reach this branch at all.
                     const start = i;
                     while (i < line.len) : (i += 1) {
                         const d = line[i];
-                        if (d == ' ' or d == '\t' or d == '\'' or d == '"') break;
+                        if (d == ' ' or d == '\t' or d == '\'' or d == '"' or d == '#') break;
                     }
                     try buf.appendSlice(p.arena, line[start..i]);
+                    if (i < line.len and line[i] == '#') {
+                        i = line.len; // discard the rest of the line too
+                    }
                 },
             }
         }
@@ -456,11 +603,17 @@ const Parser = struct {
             if (ob.kind != kind) return error.MixedOptionList;
             switch (kind) {
                 .single => {
-                    // Repeated `option` under one key: last one wins.
+                    // Repeated `option` under one key: last one wins -- a
+                    // REPLACED value, not a new item, so `total_items` is
+                    // unaffected.
                     ob.values.clearRetainingCapacity();
                     try ob.values.append(p.arena, value);
                 },
-                .list => try ob.values.append(p.arena, value),
+                .list => {
+                    try ob.values.append(p.arena, value);
+                    p.total_items += 1; // one new value
+                    try p.checkMemoryLimit();
+                },
             }
             return;
         }
@@ -469,6 +622,8 @@ const Parser = struct {
         const idx = cur.options.items.len;
         try cur.options.append(p.arena, .{ .key = key, .kind = kind, .values = values });
         try cur.index.put(p.arena, key, idx);
+        p.total_items += 2; // one new option, one new value
+        try p.checkMemoryLimit();
     }
 
     fn flushSection(p: *Parser) ParseError!void {
@@ -488,6 +643,8 @@ const Parser = struct {
             .options = options,
         });
         p.current = null;
+        p.total_items += 1; // one new section
+        try p.checkMemoryLimit();
     }
 };
 
@@ -511,6 +668,14 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
         try out.append(gpa, '\n');
     }
     for (pkg.sections, 0..) |*sec, i| {
+        // Audit A1 U7 (write side): a section type/name real `uci` could
+        // never have parsed must not be written -- see `ParseError.InvalidName`'s
+        // doc comment for why the option key is deliberately NOT checked here
+        // (audit A1 U14 already guarantees it round-trips safely either way).
+        if (!validTypeChars(sec.type)) return error.InvalidName;
+        if (sec.name) |n| {
+            if (!validNameChars(n)) return error.InvalidName;
+        }
         if (i != 0 or pkg.name != null) try out.append(gpa, '\n');
         try out.appendSlice(gpa, "config ");
         try writeWord(gpa, &out, sec.type);
@@ -702,12 +867,34 @@ test "single quotes take no escapes" {
 }
 
 test "bare words and mid-word hash" {
+    // Audit A1 U4: real `uci` truncates a bare word AND discards the rest of
+    // the line at a mid-word '#' (measured against the real binary; see the
+    // comment in `nextToken`'s bare-word branch). `option b a#b` therefore
+    // yields the *option* `b` with a value of `a`, not `a#b` -- and the `c`
+    // that would otherwise follow on the same line never becomes its own
+    // option because everything past `#` is gone.
     const gpa = testing.allocator;
     var pkg = try parse(gpa, "config t\n\toption a abc-def\n\toption b a#b\n");
     defer pkg.deinit(gpa);
     try testing.expectEqualStrings("abc-def", pkg.sections[0].get("a").?);
-    try testing.expectEqualStrings("a#b", pkg.sections[0].get("b").?);
-    try expectRoundTrip("config t\n\toption a abc-def\n\toption b a#b\n");
+    try testing.expectEqualStrings("a", pkg.sections[0].get("b").?);
+    try expectRoundTrip("config t\n\toption a abc-def\n\toption b 'a'\n");
+
+    // '#' immediately after a closing quote still truncates (concatenated
+    // bare continuation of a quoted segment) -- matches the real binary's
+    // `option v 'a'#b` -> `a`.
+    var pkg2 = try parse(gpa, "config t\n\toption v 'a'#b\n");
+    defer pkg2.deinit(gpa);
+    try testing.expectEqualStrings("a", pkg2.sections[0].get("v").?);
+
+    // A mid-word '#' inside a KEY truncates the key too and discards the
+    // rest of the line -- so the value token that would follow is gone,
+    // which is `error.MissingArgument`, not a key literally named "a#b".
+    var diag: Diagnostics = .{};
+    try testing.expectError(
+        error.MissingArgument,
+        parseDiag(gpa, "config t\n\toption a#b v\n", &diag),
+    );
 }
 
 test "token concatenation of quoted segments" {
@@ -1041,8 +1228,47 @@ test "package name needing quotes still gets them (not identifier-safe)" {
     try expectRoundTrip(text);
 }
 
-test "quoted keys and types round-trip" {
-    try expectRoundTrip("config 'weird type' 'n'\n\toption 'weird key' 'v'\n");
+test "quoted type round-trips when it needs quoting but is still a valid name" {
+    // Was "quoted keys and types round-trip", using a section type/option
+    // key containing a SPACE ("weird type"/"weird key") -- both now rejected
+    // by audit A1 U7's validation (a space is not alnum/`_`, and real uci's
+    // TYPE rule excludes it too). Kept as a *valid*-but-quoting-required
+    // case instead: '.' is valid per real uci's (looser) TYPE rule --
+    // printable ASCII 33-126 -- but is not `isBareSafe`, so it still needs
+    // the quoting path exercised. There is no equivalent "valid but needs
+    // quoting" KEY case: real uci's KEY rule (alnum/`_` only) is a strict
+    // subset of `isBareSafe`, so no valid key ever needs quotes.
+    try expectRoundTrip("config 'a.b' 'n'\n\toption k 'v'\n");
+}
+
+test "invalid section type, name, and option key are rejected" {
+    // Regression for audit A1 U7: real `uci`'s own validator
+    // (`uci_validate_str`, util.c) restricts section/option NAMEs to
+    // alphanumeric + `_`, and section TYPEs to printable ASCII (33-126,
+    // still excluding space). Before this fix all 15/15 hand-written probes
+    // with such a name/type/key were `MODULE-ACCEPTS-LIBUCI-REJECTS`; this
+    // pins a representative sample of each field/violation.
+    const gpa = testing.allocator;
+
+    // Section NAME: hyphen, dot -- both invalid for a name.
+    try testing.expectError(error.InvalidName, parse(gpa, "config t 'my-lan'\n"));
+    try testing.expectError(error.InvalidName, parse(gpa, "config t 'my.lan'\n"));
+
+    // Section TYPE: embedded space, non-ASCII byte -- both invalid for a
+    // type too (space and anything outside 33-126).
+    try testing.expectError(error.InvalidName, parse(gpa, "config 'a b' 'n'\n"));
+    try testing.expectError(error.InvalidName, parse(gpa, "config t\xc3\xa9\n")); // "té"
+
+    // Option KEY: hyphen, dot -- both invalid for a name (same rule as
+    // section name).
+    try testing.expectError(error.InvalidName, parse(gpa, "config t\n\toption dest-port '1'\n"));
+    try testing.expectError(error.InvalidName, parse(gpa, "config t\n\toption a.b '1'\n"));
+
+    // Positive control: this class of check must not reject ordinary
+    // alnum/`_` identifiers.
+    var pkg = try parse(gpa, "config my_type 'my_name'\n\toption my_key '1'\n");
+    defer pkg.deinit(gpa);
+    try testing.expectEqualStrings("my_type", pkg.sections[0].type);
 }
 
 test "meta is well-formed" {
@@ -1104,19 +1330,29 @@ test "isBareSafe boundary: a key containing a quote character must not be writte
     // because nothing in the suite exercises a key/type containing the one
     // character the bare-word tokenizer treats as a quote boundary (see
     // `nextToken`'s bare-word branch, which stops at `'`/`"`). This pins the
-    // boundary directly: a key containing `'` must round-trip, which
-    // requires `writeWord` to treat it as NOT bare-safe.
+    // boundary directly: a key containing `'` must come out QUOTED, never
+    // bare -- `serialize` deliberately does not validate option-key
+    // characters (see `SerializeError.InvalidName`'s doc comment), so a
+    // hand-built `Package` bypassing `parse` still gets this safety net.
+    //
+    // Audit A1 U7 (added after this test, and after U14 was already closed):
+    // real `uci` never accepts `'` in a key at all, so `parse`-side
+    // validation now refuses to read this safely-quoted text back in -- a
+    // stricter, but still safe, outcome: the key was never written bare
+    // (U14's actual guarantee, checked directly below), it just can no
+    // longer round-trip through TEXT, only survive as an in-memory model.
+    // `pkg.eql(&reparsed)` is gone from this test for that reason, not
+    // because the quoting regressed.
     const gpa = testing.allocator;
     const opts = [_]Option{.{ .key = "a'b", .kind = .single, .values = &.{"v"} }};
     const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
     const pkg: Package = .{ .sections = &secs };
     const text = try serialize(gpa, &pkg);
     defer gpa.free(text);
-    var reparsed = try parse(gpa, text);
-    defer reparsed.deinit(gpa);
-    try testing.expect(pkg.eql(&reparsed));
-    try testing.expectEqualStrings("a'b", reparsed.sections[0].options[0].key);
-    try testing.expectEqualStrings("v", reparsed.sections[0].options[0].values[0]);
+    // Written quoted (`"a'b"`), never as a bare `a'b` token.
+    try testing.expect(std.mem.indexOf(u8, text, "\"a'b\"") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "\ta'b ") == null);
+    try testing.expectError(error.InvalidName, parse(gpa, text));
 }
 
 test "writeWord's empty-word path round-trips an empty type and an empty key" {
@@ -1179,6 +1415,86 @@ test "addOption is not quadratic in distinct keys per section" {
         .{ times_ns[0], times_ns[1], ratio },
     );
     try testing.expect(ratio < 8.0);
+}
+
+test "duplicate named section is rejected" {
+    // Regression for audit A1 U1: real `uci` merges a same-type duplicate
+    // section name (last option value wins; `sections.len` unaffected) and
+    // rejects a same-name/different-type collision outright. This module's
+    // `[]Section` model cannot represent the merge (see
+    // `ParseError.DuplicateSection`'s doc comment), so instead of silently
+    // building two `Section`s and answering every accessor from the FIRST
+    // one's (stale) values -- what this module did before this fix, and the
+    // exact shape of the audit's reproduction -- it now rejects any name
+    // collision, same type or not.
+    const gpa = testing.allocator;
+    var diag: Diagnostics = .{};
+
+    // Same type, same name: real uci merges (last wins, `proto=none`); this
+    // module rejects rather than silently keeping the FIRST value
+    // (`proto=static`), which is what the pre-fix audit reproduction showed.
+    try testing.expectError(
+        error.DuplicateSection,
+        parseDiag(
+            gpa,
+            "config interface 'lan'\n\toption proto 'static'\n\nconfig interface 'lan'\n\toption proto 'none'\n",
+            &diag,
+        ),
+    );
+    try testing.expectEqual(@as(usize, 4), diag.line);
+
+    // Different type, same name: real uci's own strict mode rejects this
+    // too ("section of different type overwrites prior section with same
+    // name") -- this module accepted it before this fix.
+    try testing.expectError(
+        error.DuplicateSection,
+        parseDiag(gpa, "config interface 'lan'\n\nconfig rule 'lan'\n", &diag),
+    );
+
+    // Positive control: distinct names in the same file are unaffected.
+    var pkg = try parse(gpa, "config interface 'lan'\n\nconfig interface 'wan'\n");
+    defer pkg.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), pkg.sections.len);
+}
+
+test "total item cap: boundary is exact, one section many options" {
+    // Regression for audit A1 U3: `max_input_len` bounded the TEXT but not
+    // the MODEL it builds -- a legal 16 MiB input measured 22x-41.5x
+    // live-byte amplification against input size (up to 371 MB RSS on a
+    // 16.6 MB file). `max_total_items` bounds the model directly and
+    // independent of input size (see its doc comment for why a
+    // byte-size-relative ratio does not work here: the worst measured shape
+    // amplifies close enough to the perfectly legitimate N=64000 case in
+    // the test just above that no ratio can admit one and reject the
+    // other). This pins the exact boundary: N options in one section builds
+    // 2N+1 items (N options + N values + 1 section).
+    const gpa = testing.allocator;
+    var buf: [32]u8 = undefined;
+
+    const n_below = (max_total_items - 1) / 2; // 2*n_below + 1 <= max_total_items
+    var below: std.ArrayList(u8) = .empty;
+    defer below.deinit(gpa);
+    try below.appendSlice(gpa, "config t\n");
+    for (0..n_below) |k| {
+        const key = try std.fmt.bufPrint(&buf, "k{d}", .{k});
+        try below.appendSlice(gpa, "\toption ");
+        try below.appendSlice(gpa, key);
+        try below.appendSlice(gpa, " v\n");
+    }
+    var pkg = try parse(gpa, below.items);
+    pkg.deinit(gpa);
+
+    const n_over = n_below + 1; // 2*n_over + 1 > max_total_items
+    var over: std.ArrayList(u8) = .empty;
+    defer over.deinit(gpa);
+    try over.appendSlice(gpa, "config t\n");
+    for (0..n_over) |k| {
+        const key = try std.fmt.bufPrint(&buf, "k{d}", .{k});
+        try over.appendSlice(gpa, "\toption ");
+        try over.appendSlice(gpa, key);
+        try over.appendSlice(gpa, " v\n");
+    }
+    try testing.expectError(error.MemoryLimitExceeded, parse(gpa, over.items));
 }
 
 // ── fuzz: parse never panics; parse -> serialize -> parse is stable ───────
@@ -1415,9 +1731,12 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
 
     const gpa = testing.allocator;
     const s1 = serialize(gpa, &pkg) catch |err| switch (err) {
-        // A generated value containing an unescapable control byte — a
-        // documented rejection, not a round-trip question.
-        error.UnserializableValue, error.OutOfMemory => return,
+        // A generated value containing an unescapable control byte, or a
+        // generated type/name using a character real uci's own name
+        // validator (audit A1 U7) rejects — both documented rejections, not
+        // round-trip questions. `fuzzToken` draws raw random bytes for
+        // every field including type/name/key, so this is common, not rare.
+        error.UnserializableValue, error.InvalidName, error.OutOfMemory => return,
     };
     defer gpa.free(s1);
 

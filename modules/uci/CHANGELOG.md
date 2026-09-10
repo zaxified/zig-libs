@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — Audit A1 second fix pass (P1: this module has zero consumers in the repo, so
+  input-hardening decisions, including new error values, are the fixer's call). Three new
+  `ParseError` values, one new `SerializeError` value, and one behavior correction:
+  - `error.DuplicateSection` (U1): two `config` blocks sharing a name used to silently build two
+    `Section`s, with every accessor answering from the FIRST one's stale values; now rejected
+    outright, matching or exceeding real `uci`'s own same-name handling.
+  - `error.MemoryLimitExceeded` (U3): the 16 MiB input cap did not bound the model built from it
+    (measured 22x-41.5x live-byte amplification, up to 371 MB RSS from a legal 16.6 MB file). A new
+    `max_total_items` cap (sections + options + values combined, independent of input size — see
+    SPEC.md for why a size-relative ratio does not work here) closes that gap.
+  - `error.InvalidName` in both `ParseError` and `SerializeError` (U7): section/option names and
+    section types real `uci`'s own validator would refuse are now rejected on `parse`, and
+    section type/name (not option key — see SPEC.md) are rejected on `serialize` too, closing a
+    write-path gap where this module could produce a file real `uci` refuses to load back.
+  - `#` inside a bare (unquoted) word now truncates the token AND discards the rest of the line
+    (U4) — this module previously kept it literal there, which SPEC.md documented as "the format",
+    a claim the real binary disproves.
+  - SPEC.md/README.md corrected (no code change): `MixedOptionList`/valueless-`option` rejection
+    was presented as "UCI semantics"; it is this module's own additional strictness (U11/U12) —
+    real `uci` is more lenient on both.
+
 - **2026-09-08** — The addressing semantics are pinned to a measurement of the real `uci`
   binary. `sectionByName` and `nth` previously rested on prose; every fact they state was
   re-taken by RUNNING that binary in the `scripts/vm/` OpenWRT 25.12.4 guest, frozen as the
