@@ -23,10 +23,13 @@
 //! `blob.h` + `blobmsg.h`) — pinned by golden-byte tests derived from those
 //! headers, not from a captured device transcript. An integration test
 //! exercises `list`/`invoke` against a real ubusd when one is reachable
-//! (connectivity + well-formed JSON out, not byte comparison); a textual
-//! parity check of this client's output against `ubus -S`'s own output has
-//! not yet been done (see SPEC.md's backlog). Two daemon behaviors are
-//! reproduced exactly because ubusd depends on them:
+//! (connectivity + well-formed JSON out, not byte comparison); `codec.zig`'s
+//! "real-daemon capture" section additionally freezes wire bytes and the
+//! matching `ubus -S` JSON stdout from a real `ubus`/`ubusd` pair run once
+//! inside the `scripts/vm/` OpenWRT VM lane — a genuine textual byte-parity
+//! check, not just "parses without error" (audit F11: this comment used to
+//! say the opposite, stale after that capture landed — see SPEC.md).
+//! Two daemon behaviors are reproduced exactly because ubusd depends on them:
 //!
 //! 1. An INVOKE must carry a `UBUS_ATTR_DATA` attr even when there are no
 //!    arguments — ubusd rejects an arg-less invoke with INVALID_ARGUMENT.
@@ -78,6 +81,10 @@ pub const Error = error{
     UbusError,
     /// The argument JSON has no blobmsg mapping (null values / non-object).
     Unsupported,
+    /// A single call's reply stream ran past `call_deadline_ns` — the
+    /// per-recv `SO_RCVTIMEO` bounds only one syscall, so a chatty daemon
+    /// that keeps sending resets it forever without this (audit F2).
+    Timeout,
     OutOfMemory,
 };
 
@@ -89,6 +96,13 @@ pub const default_socket_paths = [_][]const u8{ "/var/run/ubus/ubus.sock", "/var
 const recv_timeout_s = 5;
 /// Reply-size cap — same ceiling as ubusd's own UBUS_MAX_MSG_LEN (1 MiB).
 const max_msg = 1024 * 1024;
+/// Whole-call wall-clock bound for a multi-message reply stream (`list`,
+/// `invoke`, `subscribe`'s handshake, `EventStream.poll`'s drain). Real
+/// round-trips finish in micro/milliseconds; this only has to be far above
+/// that. `recv_timeout_s` bounds a single `recv` — a peer that keeps
+/// sending resets it on every call, so it does not bound the call as a
+/// whole (audit F2).
+const call_deadline_ns: u64 = 2 * std.time.ns_per_s;
 /// sockaddr_un.sun_path capacity minus the terminating NUL.
 const max_path = @sizeOf(@FieldType(linux.sockaddr.un, "path")) - 1;
 
@@ -165,6 +179,49 @@ fn readMessage(fd: i32, gpa: std.mem.Allocator) Error!Msg {
     if (payload.len > 0) try readAll(fd, payload);
     return .{ .type = h.type, .seq = h.seq, .peer = h.peer, .payload = payload };
 }
+
+/// Bounds a whole reply-reading call (`list`, `invoke`, `lookupId`,
+/// `subscribe`'s handshake, one `EventStream.poll` drain) against a daemon
+/// that never stops talking. `readMessage`'s `max_msg` cap bounds one
+/// frame; it does not bound how many frames a `while (true)` reply loop
+/// reads before its own terminating message arrives. Two independent
+/// bounds, either one sufficient alone: a wall-clock deadline (catches a
+/// fast flood of tiny messages, which never trips a byte budget) and a
+/// total payload-byte budget across every message in the call (catches a
+/// slow drip that would otherwise run until the deadline while still
+/// allocating without limit) — audit F2, measured 96 062 933 B live from a
+/// LOOKUP reply that never sent a closing STATUS.
+/// Monotonic nanoseconds since some unspecified epoch (`CLOCK_MONOTONIC`) —
+/// `std.time.Timer`/`Instant` do not exist in this toolchain (0.16), and
+/// this module already talks to the kernel directly (`linux.*`, no
+/// `std.posix`) rather than through std wrappers.
+fn monoNs() u64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+const CallBudget = struct {
+    deadline_ns: u64,
+    bytes_left: usize = max_msg,
+
+    fn start() Error!CallBudget {
+        return .{ .deadline_ns = monoNs() +| call_deadline_ns };
+    }
+
+    /// `readMessage`, charged against this call's deadline and byte budget.
+    fn read(self: *CallBudget, fd: i32, gpa: std.mem.Allocator) Error!Msg {
+        if (monoNs() > self.deadline_ns) return Error.Timeout;
+        const msg = try readMessage(fd, gpa);
+        if (msg.payload.len > self.bytes_left) {
+            var m = msg;
+            m.deinit(gpa);
+            return Error.TooLarge;
+        }
+        self.bytes_left -= msg.payload.len;
+        return msg;
+    }
+};
 
 /// Frame + send one request: msghdr (BE seq/peer) followed by the top
 /// blob_attr (id 0) wrapping `children`.
@@ -291,9 +348,12 @@ pub const Client = struct {
             }
             objects.deinit(self.gpa);
         }
-        // One DATA reply per matching object, then a closing STATUS.
+        // One DATA reply per matching object, then a closing STATUS —
+        // bounded by CallBudget (audit F2: unbounded otherwise, against a
+        // daemon that never sends the closing STATUS).
+        var budget = try CallBudget.start();
         while (true) {
-            const msg = try readMessage(self.fd, self.gpa);
+            const msg = try budget.read(self.fd, self.gpa);
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
@@ -324,7 +384,14 @@ pub const Client = struct {
                 if (a.data.len >= 4) id = std.mem.readInt(u32, a.data[0..4], .big);
             },
             codec.ATTR.SIGNATURE => {
-                if (sig == null) sig = try decodeJson(self.gpa, a.data);
+                // Last one wins — matches upstream `blob_parse_attr`'s
+                // single-slot-per-id storage, and matches `name` above
+                // (already unconditional). Previously first-wins, the one
+                // mismatch audit F4 measured composing one `Object` out of
+                // two different duplicate LOOKUP DATA copies.
+                const decoded = try decodeJson(self.gpa, a.data);
+                if (sig) |old| self.gpa.free(old);
+                sig = decoded;
             },
             else => {},
         };
@@ -347,14 +414,20 @@ pub const Client = struct {
         try sendMessage(self.fd, self.gpa, codec.MSG.LOOKUP, seq, 0, children.items);
 
         var found: ?u32 = null;
+        var budget = try CallBudget.start();
         while (true) {
-            const msg = try readMessage(self.fd, self.gpa);
+            const msg = try budget.read(self.fd, self.gpa);
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
                 var it: codec.AttrIterator = .{ .buf = msg.payload };
                 while (it.next() catch return Error.BadMessage) |a| {
-                    if (a.id == codec.ATTR.OBJID and a.data.len >= 4 and found == null)
+                    // Last OBJID wins (was first-wins) — matching `list()`'s
+                    // last-wins for the same duplicate-attr case (audit F4):
+                    // an object name that duplicate LOOKUP DATA entries
+                    // resolve to two different ids under `list()` and
+                    // `invoke()` used to disagree with each other.
+                    if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
                         found = std.mem.readInt(u32, a.data[0..4], .big);
                 }
             } else if (msg.type == codec.MSG.STATUS) {
@@ -404,15 +477,21 @@ pub const Client = struct {
         // (no OBJID) → DATA (the result) → completion STATUS (carries OBJID
         // + the method's return code). Ignore the ack, capture the DATA,
         // stop on the completion — distinguished by the OBJID attr.
+        var budget = try CallBudget.start();
         while (true) {
-            const msg = try readMessage(self.fd, self.gpa);
+            const msg = try budget.read(self.fd, self.gpa);
             defer msg.deinit(self.gpa);
             if (msg.seq != seq) continue;
             if (msg.type == codec.MSG.DATA) {
                 var it: codec.AttrIterator = .{ .buf = msg.payload };
                 while (it.next() catch return Error.BadMessage) |a| {
-                    if (a.id == codec.ATTR.DATA and result == null)
-                        result = try decodeJson(self.gpa, a.data);
+                    // Last DATA wins (was first-wins) — the same
+                    // consistency fix as `list()`/`lookupId()` (audit F4).
+                    if (a.id == codec.ATTR.DATA) {
+                        const decoded = try decodeJson(self.gpa, a.data);
+                        if (result) |old| self.gpa.free(old);
+                        result = decoded;
+                    }
                 }
             } else if (msg.type == codec.MSG.STATUS) {
                 var status: i32 = 0;
@@ -457,8 +536,9 @@ pub const Client = struct {
         try sendMessage(conn.fd, gpa, codec.MSG.ADD_OBJECT, 1, 0, addobj.items);
 
         var obj_id: ?u32 = null;
+        var addobj_budget = try CallBudget.start();
         while (true) {
-            const msg = try readMessage(conn.fd, gpa);
+            const msg = try addobj_budget.read(conn.fd, gpa);
             defer msg.deinit(gpa);
             var it: codec.AttrIterator = .{ .buf = msg.payload };
             while (it.next() catch return Error.BadMessage) |a| {
@@ -489,8 +569,9 @@ pub const Client = struct {
         // The event registry is a ubusd-internal object, so "register" is
         // answered directly with a single STATUS (no forwarding ack/OBJID,
         // unlike a provider INVOKE).
+        var register_budget = try CallBudget.start();
         while (true) {
-            const msg = try readMessage(conn.fd, gpa);
+            const msg = try register_budget.read(conn.fd, gpa);
             defer msg.deinit(gpa);
             if (msg.type != codec.MSG.STATUS) continue;
             var status: i32 = 0;
@@ -523,11 +604,18 @@ pub const EventStream = struct {
     /// `ubus listen` output. Returns true when the daemon closed the
     /// connection (end of stream).
     pub fn poll(self: *EventStream, out: *std.ArrayList(u8)) Error!bool {
+        // Bounded the same way as the request/reply calls (audit F2: a
+        // flood of events that keeps the socket always-ready could
+        // otherwise keep this loop draining, and `out`, without limit — the
+        // per-call poll(timeout=0) below only means each ready message is
+        // read promptly, not that there is a bound on how many arrive
+        // before this drain would stop on its own).
+        var budget = try CallBudget.start();
         while (true) {
             var pfd = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
             const pr = linux.poll(&pfd, 1, 0);
             if (linux.errno(pr) != .SUCCESS or pr == 0) return false; // nothing ready
-            const msg = readMessage(self.fd, self.gpa) catch return true; // EOF / error → end
+            const msg = budget.read(self.fd, self.gpa) catch return true; // EOF / budget / error → end
             defer msg.deinit(self.gpa);
             if (msg.type != codec.MSG.INVOKE) continue;
 
@@ -847,6 +935,253 @@ test "client vs scripted daemon: subscribe, event delivery, EOF" {
     c.close();
     th.join();
     try testing.expect(!ctx.invoke_missing_data); // register carried DATA too
+}
+
+// ── tests: hostile/misbehaving scripted daemons (audit F2, F4, F7) ──────────
+
+fn floodConn(fd: i32) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
+    defer _ = linux.close(fd);
+    sendMessage(fd, gpa, codec.MSG.HELLO, 0, 200, &.{}) catch return;
+    const req = readMessage(fd, gpa) catch return;
+    defer req.deinit(gpa);
+    // One well-formed but unrecognized top-level attr per message (so
+    // `parseListEntry`'s walk never errors on it — id 99 hits its `else`
+    // branch and is ignored) carrying an 8000-byte filler payload.
+    const filler = gpa.alloc(u8, 8000) catch return;
+    defer gpa.free(filler);
+    @memset(filler, 0);
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(gpa);
+    codec.appendAttr(gpa, &body, 99, filler) catch return;
+    // 300 * ~8000 B = 2.4 MB, well past the 1 MiB call budget, and NO
+    // closing STATUS is ever sent -- this is the daemon audit F2 measured
+    // (a LOOKUP reply stream with no upper bound on message count or total
+    // bytes). The iteration cap is this test's own safety net, not the
+    // client's.
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        sendMessage(fd, gpa, codec.MSG.DATA, req.seq, 0, body.items) catch return;
+    }
+}
+
+fn floodAcceptAndServe(listen_fd: i32) void {
+    const rc = linux.accept(listen_fd, null, null);
+    if (linux.errno(rc) != .SUCCESS) return;
+    floodConn(@intCast(rc));
+}
+
+test "F2: list() is bounded by an aggregate byte budget, not by the daemon" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "flood");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+
+    const listen_fd = try mockBind(sock_path);
+    defer _ = linux.close(listen_fd);
+    const th = try std.Thread.spawn(.{}, floodAcceptAndServe, .{listen_fd});
+
+    var c = try Client.open(gpa, sock_path);
+    try testing.expectError(Error.TooLarge, c.list(null));
+    // Close BEFORE joining: the daemon is still mid-flood and will block on
+    // a full socket send buffer once this side stops reading (which is the
+    // point of the test) — closing unblocks that write with EPIPE/ECONNRESET
+    // instead of deadlocking against the still-open fd.
+    c.close();
+    th.join();
+}
+
+const DupCtx = struct { objid_seen: u32 = 0 };
+
+fn dupConnThread(ctx: *DupCtx, fd: i32) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
+    defer _ = linux.close(fd);
+    sendMessage(fd, gpa, codec.MSG.HELLO, 0, 300, &.{}) catch return;
+    while (true) {
+        const msg = readMessage(fd, gpa) catch return;
+        defer msg.deinit(gpa);
+        if (msg.type == codec.MSG.LOOKUP) {
+            // One LOOKUP DATA reply, two full copies of OBJID/OBJPATH/
+            // SIGNATURE for the "same" object -- the shape audit F4
+            // measured against a real daemon.
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(gpa);
+            codec.appendAttrU32(gpa, &out, codec.ATTR.OBJID, 0x1111) catch return;
+            codec.appendAttrString(gpa, &out, codec.ATTR.OBJPATH, "alpha") catch return;
+            var sig1: std.ArrayList(u8) = .empty;
+            defer sig1.deinit(gpa);
+            codec.appendTable(gpa, &sig1, "first", &.{}) catch return;
+            codec.appendAttr(gpa, &out, codec.ATTR.SIGNATURE, sig1.items) catch return;
+            codec.appendAttrU32(gpa, &out, codec.ATTR.OBJID, 0x2222) catch return;
+            codec.appendAttrString(gpa, &out, codec.ATTR.OBJPATH, "omega") catch return;
+            var sig2: std.ArrayList(u8) = .empty;
+            defer sig2.deinit(gpa);
+            codec.appendTable(gpa, &sig2, "second", &.{}) catch return;
+            codec.appendAttr(gpa, &out, codec.ATTR.SIGNATURE, sig2.items) catch return;
+            sendMessage(fd, gpa, codec.MSG.DATA, msg.seq, 0, out.items) catch return;
+            sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, &.{}) catch return;
+        } else if (msg.type == codec.MSG.INVOKE) {
+            var it: codec.AttrIterator = .{ .buf = msg.payload };
+            while (it.next() catch return) |a| {
+                if (a.id == codec.ATTR.OBJID and a.data.len >= 4)
+                    ctx.objid_seen = std.mem.readInt(u32, a.data[0..4], .big);
+            }
+            var fin: std.ArrayList(u8) = .empty;
+            defer fin.deinit(gpa);
+            codec.appendAttrU32(gpa, &fin, codec.ATTR.STATUS, 0) catch return;
+            codec.appendAttrU32(gpa, &fin, codec.ATTR.OBJID, ctx.objid_seen) catch return;
+            sendMessage(fd, gpa, codec.MSG.STATUS, msg.seq, 0, fin.items) catch return;
+            return;
+        }
+    }
+}
+
+fn dupAcceptAndServe(listen_fd: i32, ctx: *DupCtx) void {
+    const rc = linux.accept(listen_fd, null, null);
+    if (linux.errno(rc) != .SUCCESS) return;
+    dupConnThread(ctx, @intCast(rc));
+}
+
+test "F4: duplicate LOOKUP-reply attrs resolve consistently (last copy wins everywhere)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "dup");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+
+    const listen_fd = try mockBind(sock_path);
+    defer _ = linux.close(listen_fd);
+    var ctx: DupCtx = .{};
+    const th = try std.Thread.spawn(.{}, dupAcceptAndServe, .{ listen_fd, &ctx });
+
+    var c = try Client.open(gpa, sock_path);
+    defer c.close();
+
+    // Every field of the resulting Object must come from the SAME (the
+    // last) copy — before the fix, name/id came from the second copy while
+    // signature_json came from the first.
+    const objs = try c.list(null);
+    defer freeObjects(gpa, objs);
+    try testing.expectEqual(@as(usize, 1), objs.len);
+    try testing.expectEqualStrings("omega", objs[0].name);
+    try testing.expectEqual(@as(u32, 0x2222), objs[0].id);
+    try testing.expectEqualStrings("{\"second\":{}}", objs[0].signature_json.?);
+
+    // invoke()'s lookupId() must resolve the SAME id list() did (0x2222) —
+    // before the fix it took the FIRST OBJID (0x1111): the two calls
+    // disagreed about which object "the same name" meant.
+    const res = try c.invoke("anything", "method", null);
+    defer gpa.free(res);
+    th.join();
+    try testing.expectEqual(@as(u32, 0x2222), ctx.objid_seen);
+}
+
+fn nonHelloConn(fd: i32) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
+    defer _ = linux.close(fd);
+    // A STATUS where the HELLO greeting must be.
+    sendMessage(fd, gpa, codec.MSG.STATUS, 0, 0, &.{}) catch return;
+}
+
+fn nonHelloAcceptAndServe(listen_fd: i32) void {
+    const rc = linux.accept(listen_fd, null, null);
+    if (linux.errno(rc) != .SUCCESS) return;
+    nonHelloConn(@intCast(rc));
+}
+
+test "F7: a first message that is not HELLO is rejected, not accepted as the greeting" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "nohello");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    const listen_fd = try mockBind(sock_path);
+    defer _ = linux.close(listen_fd);
+    const th = try std.Thread.spawn(.{}, nonHelloAcceptAndServe, .{listen_fd});
+    try testing.expectError(Error.Connect, Client.open(testing.allocator, sock_path));
+    th.join();
+}
+
+fn shortObjidConn(fd: i32) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
+    defer _ = linux.close(fd);
+    sendMessage(fd, gpa, codec.MSG.HELLO, 0, 400, &.{}) catch return;
+    const req = readMessage(fd, gpa) catch return;
+    defer req.deinit(gpa);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    codec.appendAttrString(gpa, &out, codec.ATTR.OBJPATH, "short") catch return;
+    // OBJID with 2 payload bytes instead of 4 -- a hostile/short reply.
+    codec.appendAttr(gpa, &out, codec.ATTR.OBJID, &.{ 0x00, 0x01 }) catch return;
+    sendMessage(fd, gpa, codec.MSG.DATA, req.seq, 0, out.items) catch return;
+    sendMessage(fd, gpa, codec.MSG.STATUS, req.seq, 0, &.{}) catch return;
+}
+
+fn shortObjidAcceptAndServe(listen_fd: i32) void {
+    const rc = linux.accept(listen_fd, null, null);
+    if (linux.errno(rc) != .SUCCESS) return;
+    shortObjidConn(@intCast(rc));
+}
+
+test "F7: a too-short OBJID attr drops the entry instead of indexing out of bounds" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "shortid");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    const listen_fd = try mockBind(sock_path);
+    defer _ = linux.close(listen_fd);
+    const th = try std.Thread.spawn(.{}, shortObjidAcceptAndServe, .{listen_fd});
+    var c = try Client.open(gpa, sock_path);
+    defer c.close();
+    const objs = try c.list(null); // must not panic
+    defer freeObjects(gpa, objs);
+    try testing.expectEqual(@as(usize, 0), objs.len); // id never resolved -> entry dropped
+    th.join();
+}
+
+fn staleSeqConn(fd: i32) void {
+    const gpa = std.heap.page_allocator; // global-alloc-ok: test-only mock daemon thread body, not the published module; no caller-supplied allocator reaches a spawned thread
+    defer _ = linux.close(fd);
+    sendMessage(fd, gpa, codec.MSG.HELLO, 0, 500, &.{}) catch return;
+    const req = readMessage(fd, gpa) catch return;
+    defer req.deinit(gpa);
+    // A stray DATA from some earlier, already-abandoned request.
+    var stray: std.ArrayList(u8) = .empty;
+    defer stray.deinit(gpa);
+    codec.appendAttrString(gpa, &stray, codec.ATTR.OBJPATH, "ghost") catch return;
+    codec.appendAttrU32(gpa, &stray, codec.ATTR.OBJID, 0xdead) catch return;
+    sendMessage(fd, gpa, codec.MSG.DATA, req.seq +% 77, 0, stray.items) catch return;
+    // The real, correctly seq'd, empty reply.
+    sendMessage(fd, gpa, codec.MSG.STATUS, req.seq, 0, &.{}) catch return;
+}
+
+fn staleSeqAcceptAndServe(listen_fd: i32) void {
+    const rc = linux.accept(listen_fd, null, null);
+    if (linux.errno(rc) != .SUCCESS) return;
+    staleSeqConn(@intCast(rc));
+}
+
+test "F7: a reply carrying a stale sequence number is skipped, not merged in" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var pathbuf: [64]u8 = undefined;
+    const sock_path = try mockSocketPath(&pathbuf, "staleseq");
+    _ = linux.unlink(sock_path.ptr);
+    defer _ = linux.unlink(sock_path.ptr);
+    const listen_fd = try mockBind(sock_path);
+    defer _ = linux.close(listen_fd);
+    const th = try std.Thread.spawn(.{}, staleSeqAcceptAndServe, .{listen_fd});
+    var c = try Client.open(gpa, sock_path);
+    defer c.close();
+    const objs = try c.list(null);
+    defer freeObjects(gpa, objs);
+    try testing.expectEqual(@as(usize, 0), objs.len); // the stray "ghost" must not appear
+    th.join();
 }
 
 test "open reports Connect when no daemon is there" {

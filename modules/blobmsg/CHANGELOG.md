@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **A1 fix campaign: 9 of 11 audit findings closed** (0 in-repo
+  consumers, P1 — input hardening was free to tighten). `codec.zig`: a name/STRING
+  must be NUL-terminated where declared and truncates at an embedded NUL instead of
+  disagreeing with a C reader about the key/value (F3, F9abc); a TABLE field needs a
+  name, an ARRAY element must not have one (F5, F9d); a blobmsg type id outside
+  `BM.ARRAY..BM.DOUBLE` is rejected instead of decoding to JSON `null`, a shape this
+  module's own encoder could not round-trip (F8); a NaN/Infinity DOUBLE now errors
+  `error.InvalidValue` out of the JSON decoder instead of emitting `inf`/`-inf`
+  (invalid JSON) or `"nan"` (valid JSON, wrong type) — F1; the INT8/16/32/64/DOUBLE
+  exact-length guards gained oversized-payload tests closing the untested "too long"
+  side (F6, mutation `!=`→`<` now caught). `root.zig`: `list`/`invoke`/`lookupId`/
+  `subscribe`/`EventStream.poll` gained a `CallBudget` (1 MiB aggregate payload
+  bytes + 2 s wall clock per call) — a daemon that never stops replying used to run
+  unbounded, measured 96 062 933 B live from one LOOKUP that never closed (F2); a
+  duplicate attr id within one reply now resolves to its LAST copy everywhere
+  (matching upstream `blob_parse_attr`), closing the mismatch where `list()` and
+  `invoke()`'s id resolution disagreed about which of two copies "the same" object
+  meant (F4); mandatory-HELLO, stale-sequence-skip and too-short-OBJID guards
+  (already correct, never tested) gained tests (F7). README/root.zig doc comment: a
+  stale "byte-parity check has not been done" paragraph is now corrected — the real
+  ubusd VM capture that answers it landed in commit `463e443e`, before this audit,
+  and the paragraph was simply never updated (F11). Every closed finding has a
+  measured RED (pre-fix)→GREEN (post-fix) run in
+  `~/CML/20260901-zig-libs-audit/A1/blobmsg.md`'s disposition.
+  **F10 (both fuzz harnesses running one empty input) was already fixed** by the
+  2026-09-07 entry below, which postdates the audit — verified, not re-fixed. All
+  11 findings are now closed.
 - **2026-09-07** — **Both fuzz harnesses were replaying an EMPTY buffer, and the
   walker's buffer was too small for the module's own real captures.** Each opened
   with `smith.bytes(&raw)` followed by `smith.valueRangeAtMost(u16, 0, raw.len)`;

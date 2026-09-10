@@ -9,15 +9,35 @@ see /NOTICE.
   (EXTENDED<<31)|(id<<24)|len` (len counts the 4-byte header, pad does not); a `blobmsg` is a
   blob_attr with EXTENDED set, `id` = value type, data = `blobmsg_hdr` (BE u16 namelen + name + NUL
   + pad) + value. Every id_len/namelen is validated against the enclosing buffer before any slice is
-  formed; scalar sizes are exact (per libubox `blobmsg_check_attr`); each walk step advances ≥4
-  bytes; JSON decode caps nesting at `max_depth` (64). Malformed input →
-  `error.Truncated`/`BadLength`/`TooDeep`, never a panic or OOB read.
+  formed; scalar sizes are exact, in both directions (per libubox `blobmsg_check_attr`; audit F6
+  closed the untested "too long" side); each walk step advances ≥4 bytes; JSON decode caps nesting
+  at `max_depth` (64). A name must be NUL-terminated exactly at its declared `namelen`
+  (`blobmsg_check_name`) and, like a STRING value, truncates at an embedded NUL to match
+  `blobmsg_name()`/`blobmsg_get_string()`'s C-string reading (audit F3, F9) — a namelen-honest field
+  with an embedded NUL used to hand two different readers two different keys/values from the same
+  bytes. A STRING must carry its trailing NUL and be non-empty (`blob_type_minlen`); a TABLE field
+  needs a name and an ARRAY element must not have one (`blobmsg_check_attr`'s `name`/`!namelen`
+  rule, audit F5/F9d); a blobmsg type id outside `BM.ARRAY..BM.DOUBLE` is rejected
+  (`id > BLOBMSG_TYPE_LAST`, audit F8) rather than decoded to JSON `null` — a shape this module's own
+  encoder could not round-trip. A DOUBLE whose bits are NaN/Infinity decodes fine as a *value*
+  (`FieldIterator`) but `error.InvalidValue`s out of the *JSON* decoder, which would otherwise emit
+  `inf`/`-inf` (not valid JSON) or `"nan"` (valid JSON, wrong type) — audit F1. Malformed input →
+  `error.Truncated`/`BadLength`/`TooDeep`/`InvalidValue`, never a panic or OOB read.
 - JSON↔blobmsg mapping mirrors ubus's own: object→TABLE, array→ARRAY, string→STRING, bool→INT8,
   integer→INT32 (INT64 on i32 overflow), float→DOUBLE (BE u64 of the f64 bits).
 - **Client = one persistent connection, reentrant** (one `Client` per thread/loop, no globals). All
   socket work is errno-encoded `std.os.linux`, bounded recv timeout, `SOCK_CLOEXEC`, 1 MiB reply cap
-  (= ubusd's `UBUS_MAX_MSG_LEN`). Each request gets a fresh sequence number, replies matched on it
-  (stragglers skipped); the HELLO greeting is required.
+  (= ubusd's `UBUS_MAX_MSG_LEN`) **per message**. A whole multi-message call (`list`, `invoke`,
+  `lookupId`, `subscribe`'s handshake, one `EventStream.poll` drain) is additionally bounded by a
+  `CallBudget`: an aggregate payload-byte budget (1 MiB across the whole call, not just one frame)
+  and a 2 s wall-clock deadline — `SO_RCVTIMEO` only bounds a single `recv`, so a daemon that keeps
+  sending resets it forever without this (audit F2: measured 96 062 933 B live from a LOOKUP reply
+  that never closed). Each request gets a fresh sequence number, replies matched on it (stragglers
+  skipped); the HELLO greeting is required. Where a reply can legally repeat an attr id for "the same"
+  logical entity (a duplicate OBJID/OBJPATH/SIGNATURE in one LOOKUP DATA reply, a duplicate DATA in
+  one INVOKE reply), the **last** copy wins everywhere — matching upstream `blob_parse_attr`'s
+  single-slot-per-id storage (audit F4: `list()` and `invoke()`'s object-id resolution used to
+  disagree, each taking a different copy).
 - **Two daemon behaviors the ubusd daemon requires** (both mandatory): an INVOKE must carry
   `UBUS_ATTR_DATA` even with no args (INVALID_ARGUMENT otherwise); INVOKE reply choreography is
   ack-STATUS (no OBJID) → DATA → completion-STATUS (OBJID + return code), while ubusd-internal
@@ -32,7 +52,9 @@ see /NOTICE.
 ## Threat model / out of scope
 Trust boundary is a bit-flipped or hostile daemon reply: walkers + JSON decoder are fuzzed and
 bounds-check every length, so no reply can panic, loop, read OOB, or blow the stack (nesting cap);
-reply-size cap bounds memory. Does not authenticate the daemon or peers (ubus access control is
+the reply-size cap bounds memory **per call**, not just per message (`CallBudget`, audit F2) —
+a daemon that never stops replying is stopped by an aggregate byte budget and a wall-clock deadline,
+not by its own goodwill. Does not authenticate the daemon or peers (ubus access control is
 unix-socket permissions + ubusd ACLs — out of scope), does not implement the ubus server/
 object-provider side, no TLS/remote transport (local unix socket only). JSON args must be an object
 whose values all have a blobmsg mapping (null/non-object → `error.Unsupported`).

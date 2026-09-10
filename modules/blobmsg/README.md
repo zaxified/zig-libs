@@ -87,11 +87,18 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
 
 - **The codec is the security boundary.** Every id_len/namelen is validated
   against the enclosing buffer before any slice is formed; scalar sizes are
-  exact (per libubox `blobmsg_check_attr`); each walk step advances ≥ 4
-  bytes, so iteration is capped by construction; JSON nesting is capped at
-  `max_depth` (64) so hostile 16 MiB-deep nesting cannot blow the stack.
-  Malformed input → `error.Truncated`/`BadLength`/`TooDeep`, never a panic
-  or OOB read. Walkers and the JSON decoder are fuzzed (`std.testing.fuzz`).
+  exact in both directions (per libubox `blobmsg_check_attr`); a name/STRING
+  must be NUL-terminated where declared and truncates at an embedded NUL,
+  matching the C reader instead of disagreeing with it; a TABLE field needs a
+  name and an ARRAY element must not have one; an unrecognized blobmsg type
+  id is rejected rather than decoded to `null`; a NaN/Infinity DOUBLE value
+  decodes fine but is refused by the JSON encoder (`error.InvalidValue`,
+  since `inf`/`-inf`/`"nan"` are not what the wire declared). Each walk step
+  advances ≥ 4 bytes, so iteration is capped by construction; JSON nesting is
+  capped at `max_depth` (64) so hostile 16 MiB-deep nesting cannot blow the
+  stack. Malformed input → `error.Truncated`/`BadLength`/`TooDeep`/
+  `InvalidValue`, never a panic or OOB read. Walkers and the JSON decoder are
+  fuzzed (`std.testing.fuzz`).
 - **Two daemon behaviors the ubusd daemon requires** (both mandatory): an
   INVOKE must carry `UBUS_ATTR_DATA` even with no arguments
   (INVALID_ARGUMENT otherwise), and the INVOKE reply choreography is
@@ -103,9 +110,15 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
   connection with per-request sequence numbers and reply matching on seq;
   LOOKUP replies are drained to their closing STATUS so the stream stays in
   sync; SOCK_CLOEXEC on the socket; the reply cap is ubusd's own 1 MiB
-  UBUS_MAX_MSG_LEN; the HELLO greeting is required (its peer = the
-  daemon-assigned `client_id`); no hidden allocators. There is no
-  CLI-fallback layer — this module reports errors and lets the caller decide.
+  UBUS_MAX_MSG_LEN — applied to a whole multi-message call, not just one
+  frame, together with a wall-clock deadline (`CallBudget`), since a daemon
+  that keeps replying resets a per-`recv` timeout on every message; the
+  HELLO greeting is required (its peer = the daemon-assigned `client_id`);
+  a duplicate attr id within one reply resolves to its LAST copy everywhere
+  (matching upstream `blob_parse_attr`), so `list()` and `invoke()` never
+  disagree about which copy "the same" object or reply means; no hidden
+  allocators. There is no CLI-fallback layer — this module reports errors
+  and lets the caller decide.
 - **Testing without hardware:** a scripted in-process daemon (unix socket +
   thread) speaks the exact reply choreography, asserting both required
   behaviors from the daemon side; golden byte tests pin the wire format
@@ -114,7 +127,10 @@ bool→INT8, integer→INT32 (INT64 when it overflows i32), float→DOUBLE.
   `/var/run/ubus/ubus.sock` exists and skips cleanly otherwise — it checks
   that `list()` returns at least one object and that `invoke("system",
   "board", null)` round-trips to parseable JSON, **not** a byte-level
-  comparison against anything. **Not yet done:** a textual parity check of
-  this client's decoded output against `ubus -S`'s own output, captured on
-  real OpenWRT hardware or in the qemu VM lane (`scripts/vm/`) — no such
-  transcript or script exists in this repo yet; see SPEC.md's backlog.
+  comparison against anything. **Now done** (audit F11: this paragraph used
+  to say otherwise, stale after the fact): `codec.zig`'s "real-daemon
+  capture" section freezes wire bytes and the matching `ubus -S` JSON
+  stdout from a real `ubus`/`ubusd` pair, captured once in the
+  `scripts/vm/` OpenWRT VM lane — a genuine textual byte-parity check
+  against real hardware output, not merely "parses without error"; see
+  SPEC.md's "Real-daemon capture" section for the findings.

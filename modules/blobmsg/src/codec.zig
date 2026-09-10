@@ -45,6 +45,11 @@ pub const Error = error{
     BadLength,
     /// Container nesting exceeded `max_depth` (hostile input guard).
     TooDeep,
+    /// A wire value is well-formed but has no valid JSON representation
+    /// (currently: a DOUBLE whose bits decode to NaN or +/-Infinity, which
+    /// `std.json.Stringify` would otherwise turn into text `std.json` itself
+    /// refuses to parse back — audit F1).
+    InvalidValue,
 };
 
 pub const EncodeError = error{
@@ -233,7 +238,12 @@ pub const Value = union(enum) {
     table: []const u8,
     /// Nested blobmsg children (elements carry empty names).
     array: []const u8,
-    /// Unrecognized blobmsg type id (decoded to JSON null).
+    /// Unrecognized blobmsg type id. Kept for API stability; `parseField`
+    /// no longer produces it — an id outside `BM.ARRAY..BM.DOUBLE` is now a
+    /// parse error (`error.BadLength`), matching upstream
+    /// `blobmsg_check_attr_len`'s `id > BLOBMSG_TYPE_LAST` rejection
+    /// (audit F8: this module used to decode such ids to JSON `null`, a
+    /// shape its own encoder could not round-trip).
     unknown: u32,
 };
 
@@ -264,20 +274,43 @@ pub const FieldIterator = struct {
 /// Split a blob attr into its blobmsg_hdr (namelen BE16 + name + NUL, padded
 /// to 4) and typed value. Scalar sizes are exact (per libubox's
 /// blobmsg_check_attr); a STRING's single trailing NUL is stripped.
+///
+/// Two checks below are upstream `blobmsg_check_name`/`blob_check_type`
+/// rules this module did not enforce before audit F3/F8/F9: the declared
+/// name must actually be NUL-terminated at `namelen` (not just short enough
+/// to fit), and the blobmsg type id must be one `libubox` knows. Both are
+/// input-hardening on a module with zero in-repo consumers (P1) — see
+/// `CHANGELOG.md`.
 pub fn parseField(a: Attr) Error!Field {
     if (a.data.len < 2) return error.Truncated;
     const namelen: usize = std.mem.readInt(u16, a.data[0..2], .big);
     const hdrlen = alignUp(2 + namelen + 1);
     if (hdrlen > a.data.len) return error.Truncated;
-    const name = a.data[2 .. 2 + namelen];
+    // blobmsg_check_name: `hdr->name[namelen] != 0` is rejected — the
+    // declared name length must land exactly on the terminator (F3).
+    if (a.data[2 + namelen] != 0) return error.BadLength;
+    const raw_name = a.data[2 .. 2 + namelen];
+    // blobmsg_name() in C reads `name` as a NUL-terminated C string, so an
+    // embedded NUL inside a namelen-honest field silently truncates the
+    // name a C reader sees. Match that instead of exposing the bytes past
+    // it as part of this module's `name` (F3: "two readers, two keys").
+    const name = raw_name[0..(std.mem.indexOfScalar(u8, raw_name, 0) orelse raw_name.len)];
     const payload = a.data[hdrlen..];
 
     const value: Value = switch (a.id) {
-        BM.STRING => .{
-            .string = if (payload.len > 0 and payload[payload.len - 1] == 0)
-                payload[0 .. payload.len - 1]
-            else
-                payload,
+        BM.STRING => blk: {
+            // blob_type_minlen[BLOB_ATTR_STRING] = 1: the payload must carry
+            // at least the terminating NUL (F9, empty STRING).
+            if (payload.len == 0) return error.BadLength;
+            // blob_check_type: `data[len - 1] != 0` is rejected — a STRING
+            // must be NUL-terminated on the wire (F9, missing terminator).
+            if (payload[payload.len - 1] != 0) return error.BadLength;
+            const raw = payload[0 .. payload.len - 1];
+            // Same C-string truncation as the name above: blobmsg_get_string()
+            // stops at the first NUL, so an embedded one splits what this
+            // module and a C reader see as the value (F9, embedded NUL).
+            const cut = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
+            break :blk .{ .string = raw[0..cut] };
         },
         BM.INT8 => blk: {
             if (payload.len != 1) return error.BadLength;
@@ -301,7 +334,12 @@ pub fn parseField(a: Attr) Error!Field {
         },
         BM.TABLE => .{ .table = payload },
         BM.ARRAY => .{ .array = payload },
-        else => .{ .unknown = a.id },
+        // blobmsg_check_attr_len: `id > BLOBMSG_TYPE_LAST` (8, i.e. BM.DOUBLE)
+        // is rejected — this also covers id 0 (BLOBMSG_TYPE_UNSPEC), which
+        // upstream never produces on the wire either (F8). `Value.unknown`
+        // stays declared for API stability but `parseField` no longer
+        // reaches it.
+        else => return error.BadLength,
     };
     return .{ .type = a.id, .name = name, .value = value };
 }
@@ -329,6 +367,7 @@ pub fn decodeToJsonAlloc(
         error.Truncated => return error.Truncated,
         error.BadLength => return error.BadLength,
         error.TooDeep => return error.TooDeep,
+        error.InvalidValue => return error.InvalidValue,
     };
     return aw.toOwnedSlice();
 }
@@ -350,6 +389,18 @@ fn streamChildren(
     if (is_array) try s.beginArray() else try s.beginObject();
     var it = FieldIterator.init(children);
     while (try it.next()) |f| {
+        // upstream `blobmsg_check_attr`: a TABLE field without a name, or an
+        // ARRAY element WITH one, is rejected. `FieldIterator` walks either
+        // shape generically (the two share one wire encoding); only this
+        // JSON layer knows which context it is in, so the check lives here
+        // (audit F5: silently-accepted unnamed TABLE fields produced JSON
+        // objects a JSON parser could reject as duplicate/empty keys; F9d:
+        // a named ARRAY element's name used to be silently dropped).
+        if (is_array) {
+            if (f.name.len != 0) return error.BadLength;
+        } else {
+            if (f.name.len == 0) return error.BadLength;
+        }
         if (!is_array) try s.objectField(f.name);
         switch (f.value) {
             .table => |b| try streamChildren(s, b, false, depth + 1),
@@ -359,7 +410,15 @@ fn streamChildren(
             .int16 => |v| try s.write(v),
             .int32 => |v| try s.write(v),
             .int64 => |v| try s.write(v),
-            .double => |v| try s.write(v),
+            .double => |v| {
+                // A NaN/Infinity DOUBLE is a well-formed wire value with no
+                // JSON representation: `std.json.Stringify` would otherwise
+                // emit `inf`/`-inf` (not valid JSON at all) or `"nan"` (valid
+                // JSON, but a string where the wire declared a number) —
+                // audit F1.
+                if (!std.math.isFinite(v)) return error.InvalidValue;
+                try s.write(v);
+            },
             .unknown => try s.write(null),
         }
     }
@@ -868,12 +927,28 @@ test "empty containers and string edge cases" {
         \\{"t":{},"a":[],"e":""}
     , json);
 
-    // A STRING value without a trailing NUL is tolerated (kept verbatim).
+    // F9: a STRING value without a trailing NUL is now rejected (upstream
+    // `blob_check_type`: `data[len-1] != 0` is a BadLength) — it used to be
+    // tolerated and kept verbatim.
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(gpa);
     try appendField(gpa, &raw, BM.STRING, "s", "ab");
     var it = FieldIterator.init(raw.items);
-    try testing.expectEqualStrings("ab", (try it.next()).?.value.string);
+    try testing.expectError(error.BadLength, it.next());
+
+    // F9: an empty STRING payload (no NUL at all) is also rejected —
+    // upstream `blob_type_minlen[BLOB_ATTR_STRING] = 1`.
+    raw.clearRetainingCapacity();
+    try appendField(gpa, &raw, BM.STRING, "s", &.{});
+    it = FieldIterator.init(raw.items);
+    try testing.expectError(error.BadLength, it.next());
+
+    // F9: an embedded NUL truncates the value the same way C's
+    // `blobmsg_get_string()` would, instead of exposing the bytes after it.
+    raw.clearRetainingCapacity();
+    try appendField(gpa, &raw, BM.STRING, "s", "a\x00b\x00");
+    it = FieldIterator.init(raw.items);
+    try testing.expectEqualStrings("a", (try it.next()).?.value.string);
 }
 
 test "walker rejects truncated, bad-length and OOB attrs" {
@@ -908,14 +983,127 @@ test "blobmsg header + scalar validation" {
     try appendField(testing.allocator, &buf, BM.INT32, "n", &.{ 0x00, 0x01 });
     f = FieldIterator.init(buf.items);
     try testing.expectError(error.BadLength, f.next());
-    // Unknown blobmsg type id decodes to JSON null.
+    // F8: an unknown blobmsg type id is now rejected at parse time (upstream
+    // `id > BLOBMSG_TYPE_LAST`) — it used to decode to JSON null, a shape
+    // this module's own encoder could not round-trip.
     buf.clearRetainingCapacity();
     try appendField(testing.allocator, &buf, 0x33, "u", &.{0xaa});
-    const json = try decodeToJsonAlloc(testing.allocator, buf.items);
-    defer testing.allocator.free(json);
+    var uf = FieldIterator.init(buf.items);
+    try testing.expectError(error.BadLength, uf.next());
+    // id 0 (BLOBMSG_TYPE_UNSPEC) is rejected the same way.
+    buf.clearRetainingCapacity();
+    try appendField(testing.allocator, &buf, 0, "u", &.{0xaa});
+    uf = FieldIterator.init(buf.items);
+    try testing.expectError(error.BadLength, uf.next());
+}
+
+test "F3: a blobmsg name must be NUL-terminated at namelen, and truncates at an embedded NUL" {
+    // namelen=3 ("abc") but the byte at that offset is 'X', not the
+    // required NUL — upstream blobmsg_check_name rejects this outright
+    // (a namelen an attacker chose to run short of an actual terminator).
+    var f = FieldIterator.init(&.{
+        0x87, 0x00, 0x00, 0x0d, // INT8, total 13
+        0x00, 0x03, 'a', 'b', 'c', 'X', 0x00, 0x00, // namelen 3, byte[3]='X' not NUL
+        0x01, // value (never reached — the name check fires first)
+    });
+    try testing.expectError(error.BadLength, f.next());
+
+    // namelen=10 but the name bytes contain an embedded NUL at index 4
+    // ("user\0admin") — the declared terminator at data[10] is present (so
+    // the check above passes), but a C reader's blobmsg_name() stops at the
+    // embedded NUL and sees "user", not "user\0admin". This module must
+    // agree, or the same bytes name two different keys to two readers.
+    const gpa = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try appendField(gpa, &buf, BM.INT8, "user\x00admin", &.{1});
+    var it = FieldIterator.init(buf.items);
+    const fld = (try it.next()).?;
+    try testing.expectEqualStrings("user", fld.name);
+}
+
+test "F1: a non-finite DOUBLE decodes fine as a value but the JSON decoder refuses it" {
+    const gpa = testing.allocator;
+    for ([_]u64{
+        0x7ff0000000000000, // +Infinity
+        0xfff0000000000000, // -Infinity
+        0x7ff8000000000000, // a quiet NaN
+    }) |bits| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        try appendDouble(gpa, &buf, "d", @bitCast(bits));
+
+        // The typed walk still hands back the raw value — it is a
+        // perfectly well-formed wire DOUBLE.
+        var it = FieldIterator.init(buf.items);
+        const fld = (try it.next()).?;
+        try testing.expect(!std.math.isFinite(fld.value.double));
+
+        // The JSON decoder — the only path that must actually be textual
+        // JSON — refuses instead of emitting `inf`/`-inf` (not valid JSON)
+        // or `"nan"` (valid JSON, but a string where the wire said number).
+        try testing.expectError(error.InvalidValue, decodeToJsonAlloc(gpa, buf.items));
+    }
+    // A finite DOUBLE is unaffected.
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(gpa);
+    try appendDouble(gpa, &ok, "d", 3.5);
+    const json = try decodeToJsonAlloc(gpa, ok.items);
+    defer gpa.free(json);
     try testing.expectEqualStrings(
-        \\{"u":null}
+        \\{"d":3.5}
     , json);
+}
+
+test "F5/F9d: a TABLE field needs a name, an ARRAY element must not have one" {
+    const gpa = testing.allocator;
+
+    // An unnamed field inside a TABLE — upstream blobmsg_check_attr:
+    // `if (name && !hdr->namelen) return false`.
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(gpa);
+    try appendInt32(gpa, &t, "", 7);
+    var wrapped: std.ArrayList(u8) = .empty;
+    defer wrapped.deinit(gpa);
+    try appendTable(gpa, &wrapped, "t", t.items);
+    try testing.expectError(error.BadLength, decodeToJsonAlloc(gpa, wrapped.items));
+
+    // A named element inside an ARRAY — used to be silently dropped
+    // (F9d); upstream blobmsg_check_array_len rejects it.
+    var a: std.ArrayList(u8) = .empty;
+    defer a.deinit(gpa);
+    try appendInt32(gpa, &a, "secret", 7);
+    var wrapped2: std.ArrayList(u8) = .empty;
+    defer wrapped2.deinit(gpa);
+    try appendArray(gpa, &wrapped2, "a", a.items);
+    try testing.expectError(error.BadLength, decodeToJsonAlloc(gpa, wrapped2.items));
+}
+
+test "F6: an oversized scalar payload is rejected, not just a short one" {
+    // The pre-existing "INT32 whose payload is 2 bytes instead of 4" test
+    // above only mutates the guard from the short side. Audit F6 measured
+    // that a `!=` -> `<` weakening (INT8/16/32/64/DOUBLE all) survives the
+    // suite 36/36 because nothing tests the long side. One extra byte per
+    // scalar closes that: `!=` catches it, `<` would not.
+    const gpa = testing.allocator;
+    const Case = struct { t: u32, len: usize };
+    const cases = [_]Case{
+        .{ .t = BM.INT8, .len = 2 },
+        .{ .t = BM.INT16, .len = 3 },
+        .{ .t = BM.INT32, .len = 5 },
+        .{ .t = BM.INT64, .len = 9 },
+        .{ .t = BM.DOUBLE, .len = 9 },
+    };
+    for (cases) |c| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(gpa);
+        const oversized = try gpa.alloc(u8, c.len);
+        defer gpa.free(oversized);
+        @memset(oversized, 0);
+        try appendField(gpa, &buf, c.t, "n", oversized);
+        var it = FieldIterator.init(buf.items);
+        try testing.expectError(error.BadLength, it.next());
+    }
 }
 
 test "walker accepts a final unpadded attr" {
