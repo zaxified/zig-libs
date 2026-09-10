@@ -88,6 +88,15 @@ missing/too-many arguments, line-too-long, input-too-large. Plus accessor lookup
 `package` header serialization, and quoted keys/types round-tripping. Run: `zig build
 test-uci`.
 
+**Fuzz corpus (audit A1 U15).** `fuzzParse`/`fuzzRoundTrip` run a fixed, pinned corpus
+(`parse_seeds`/`roundtrip_scripts` in `root.zig`) on every `zig build test-uci` — no `--fuzz`
+needed for that baseline coverage; each seed's shape is asserted by a `corpus: …` test next to it.
+For continuous generative fuzzing beyond the pinned corpus: `zig build test-uci
+-Doptimize=ReleaseSafe --fuzz` (measured working 2026-09-05). `--fuzz` does not currently compile
+in Debug on this toolchain (`lib/compiler/test_runner.zig:566`, a toolchain limitation, not a
+module bug) — no CI/build-gate step in this repo runs `--fuzz` continuously for any module yet;
+wiring one in is a repo-wide `build.zig`/gate change, out of this module's scope.
+
 **Real `uci` capture (OpenWRT 25.12.4 VM lane).** Two hand-written configs were pushed into
 `/etc/config/` inside the `scripts/vm/` OpenWRT VM and run through the real `uci` binary; the raw
 config bytes plus the real `uci export`/`uci show` stdout are frozen in `root.zig`'s "real uci

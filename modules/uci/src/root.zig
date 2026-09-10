@@ -317,6 +317,14 @@ const SecBuild = struct {
     section_type: []const u8,
     name: ?[]const u8,
     options: std.ArrayList(OptBuild),
+    /// key -> index into `options.items`. Without this, `addOption` did a
+    /// linear scan of every option seen so far in the section, making a
+    /// section with N distinct keys cost O(N^2) — measured at 5 minutes on a
+    /// 4.3 MB config with 256000 distinct keys in one section (see the perf
+    /// probe in the fix commit). The model built is unchanged: this only
+    /// accelerates the "does this key already exist" check `addOption` was
+    /// already doing.
+    index: std.StringHashMapUnmanaged(usize),
 };
 
 const Parser = struct {
@@ -351,7 +359,7 @@ const Parser = struct {
             try p.flushSection();
             // An empty quoted name ('') is treated as anonymous.
             const name: ?[]const u8 = if (name_tok) |n| (if (n.len > 0) n else null) else null;
-            p.current = .{ .section_type = sec_type, .name = name, .options = .empty };
+            p.current = .{ .section_type = sec_type, .name = name, .options = .empty, .index = .empty };
         } else if (std.mem.eql(u8, kw, "option") or std.mem.eql(u8, kw, "list")) {
             if (p.current == null) return error.OptionOutsideSection;
             const key = (try p.nextToken(line, &pos)) orelse return error.MissingArgument;
@@ -443,8 +451,8 @@ const Parser = struct {
 
     fn addOption(p: *Parser, key: []const u8, value: []const u8, kind: Option.Kind) ParseError!void {
         const cur = &p.current.?;
-        for (cur.options.items) |*ob| {
-            if (!std.mem.eql(u8, ob.key, key)) continue;
+        if (cur.index.get(key)) |idx| {
+            const ob = &cur.options.items[idx];
             if (ob.kind != kind) return error.MixedOptionList;
             switch (kind) {
                 .single => {
@@ -458,7 +466,9 @@ const Parser = struct {
         }
         var values: std.ArrayList([]const u8) = .empty;
         try values.append(p.arena, value);
+        const idx = cur.options.items.len;
         try cur.options.append(p.arena, .{ .key = key, .kind = kind, .values = values });
+        try cur.index.put(p.arena, key, idx);
     }
 
     fn flushSection(p: *Parser) ParseError!void {
@@ -1037,6 +1047,138 @@ test "quoted keys and types round-trip" {
 
 test "meta is well-formed" {
     try testing.expect(meta.role == .codec);
+}
+
+/// `std.time.Timer` is unavailable in this toolchain's std, and this module
+/// is std-only / no libc (`.deps = .{}` in `meta`, no `-lc`). Read the
+/// monotonic clock via the raw Linux syscall wrapper instead, which needs
+/// neither.
+fn monotonicNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "accessors distinguish prefix-related names, not just a shared prefix" {
+    // Regression for audit A1 U13: a mutation campaign found four name
+    // comparisons in the accessor layer (`Section.option`, `Parser.addOption`,
+    // `TypeIterator.next`, `Package.sectionByName`) could each be weakened
+    // from `std.mem.eql` to `std.mem.startsWith` and the existing suite
+    // stayed green -- because no fixture anywhere paired a name with
+    // something it is a prefix of. These pairs are common in real OpenWRT
+    // configs: `key`/`keyfile`, `port`/`ports`, `lan`/`lan_guest`,
+    // `interface`/`interface6`. Each case below puts the LONGER name first,
+    // the shape that most exposes a `startsWith` bug (it matches on the
+    // first scanned entry sharing the prefix, not the one that's actually
+    // equal).
+    const gpa = testing.allocator;
+
+    // Parser.addOption / Section.option.
+    var pkg = try parse(gpa, "config t\n\toption keyfile '/etc/keys/pub'\n\toption key 'SECRET'\n");
+    defer pkg.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), pkg.sections[0].options.len);
+    try testing.expectEqualStrings("SECRET", pkg.sections[0].get("key").?);
+    try testing.expectEqualStrings("/etc/keys/pub", pkg.sections[0].get("keyfile").?);
+
+    // Package.sectionByName.
+    var pkg2 = try parse(gpa, "config t 'lan_guest'\n\toption v 'guest'\nconfig t 'lan'\n\toption v 'trusted'\n");
+    defer pkg2.deinit(gpa);
+    try testing.expectEqualStrings("trusted", pkg2.sectionByName("lan").?.get("v").?);
+    try testing.expectEqualStrings("guest", pkg2.sectionByName("lan_guest").?.get("v").?);
+
+    // TypeIterator.next.
+    var pkg3 = try parse(gpa, "config interface6 'a'\nconfig interface 'b'\n");
+    defer pkg3.deinit(gpa);
+    var it = pkg3.iterate("interface");
+    const only = it.next().?;
+    try testing.expectEqualStrings("b", only.name.?);
+    try testing.expectEqualStrings("interface", only.type);
+    try testing.expect(it.next() == null);
+}
+
+test "isBareSafe boundary: a key containing a quote character must not be written bare" {
+    // Regression for audit A1 U14: `isBareSafe` accepts alnum/`_`/`-`. A
+    // one-character widening (`or c == '\''`) survives the whole existing
+    // suite green, yet 200000-model stress produced 2142 failed reloads and
+    // 176 SILENT model drifts (`parse(serialize(m))` != `m`, undetected) --
+    // because nothing in the suite exercises a key/type containing the one
+    // character the bare-word tokenizer treats as a quote boundary (see
+    // `nextToken`'s bare-word branch, which stops at `'`/`"`). This pins the
+    // boundary directly: a key containing `'` must round-trip, which
+    // requires `writeWord` to treat it as NOT bare-safe.
+    const gpa = testing.allocator;
+    const opts = [_]Option{.{ .key = "a'b", .kind = .single, .values = &.{"v"} }};
+    const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
+    const pkg: Package = .{ .sections = &secs };
+    const text = try serialize(gpa, &pkg);
+    defer gpa.free(text);
+    var reparsed = try parse(gpa, text);
+    defer reparsed.deinit(gpa);
+    try testing.expect(pkg.eql(&reparsed));
+    try testing.expectEqualStrings("a'b", reparsed.sections[0].options[0].key);
+    try testing.expectEqualStrings("v", reparsed.sections[0].options[0].values[0]);
+}
+
+test "writeWord's empty-word path round-trips an empty type and an empty key" {
+    // Regression for audit A1 U18: `writeWord`'s empty-input branch (falls
+    // through to `writeValue`, producing `''`) had no test; a mutation that
+    // replaced it with "write nothing" passed the whole suite green, even
+    // though `parse` itself can produce both shapes: `config ''` -> an empty
+    // section type, `option '' v` -> an empty key.
+    const gpa = testing.allocator;
+    var pkg = try parse(gpa, "config ''\n\toption '' v\n");
+    defer pkg.deinit(gpa);
+    try testing.expectEqualStrings("", pkg.sections[0].type);
+    try testing.expectEqualStrings("", pkg.sections[0].options[0].key);
+
+    const text = try serialize(gpa, &pkg);
+    defer gpa.free(text);
+    try testing.expectEqualStrings("config ''\n\toption '' 'v'\n", text);
+
+    var reparsed = try parse(gpa, text);
+    defer reparsed.deinit(gpa);
+    try testing.expect(pkg.eql(&reparsed));
+}
+
+test "addOption is not quadratic in distinct keys per section" {
+    // Regression guard for a fixed HIGH->MED finding (audit A1 U2):
+    // `addOption` used to do a linear scan of every option already seen in
+    // the section, so a section with N distinct keys cost O(N^2) -- measured
+    // pre-fix at 11.05s for N=64000 (ReleaseFast), and a clean quadratic
+    // pattern across 16000/32000/64000/128000/256000. `SecBuild.index`
+    // (a key -> options-index hashmap, see `addOption`) makes the per-key
+    // lookup amortized O(1). This regression test uses N=16000/64000 (a 4x
+    // jump): a still-quadratic implementation would take ~16x longer for the
+    // 4x-larger input; a linear one takes ~4x longer. The bound below (8x)
+    // sits generously between the two so ordinary machine noise on a shared,
+    // loaded box cannot flip it, while a reintroduced O(N^2) scan still trips
+    // it by a wide margin.
+    const gpa = testing.allocator;
+    const sizes = [_]usize{ 16000, 64000 };
+    var times_ns: [sizes.len]u64 = undefined;
+    for (sizes, 0..) |n, i| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(gpa);
+        try input.appendSlice(gpa, "config t\n");
+        var buf: [32]u8 = undefined;
+        for (0..n) |k| {
+            const key = try std.fmt.bufPrint(&buf, "k{d}", .{k});
+            try input.appendSlice(gpa, "\toption ");
+            try input.appendSlice(gpa, key);
+            try input.appendSlice(gpa, " v\n");
+        }
+        const t0 = monotonicNs();
+        var pkg = try parse(gpa, input.items);
+        times_ns[i] = monotonicNs() - t0;
+        try testing.expectEqual(@as(usize, n), pkg.sections[0].options.len);
+        pkg.deinit(gpa);
+    }
+    const ratio = @as(f64, @floatFromInt(times_ns[1])) / @as(f64, @floatFromInt(@max(times_ns[0], 1)));
+    std.debug.print(
+        "uci U2 perf regression: N=16000 took {d}ns, N=64000 took {d}ns, ratio={d:.2} (quadratic would be ~16x, linear ~4x; gate is <8x)\n",
+        .{ times_ns[0], times_ns[1], ratio },
+    );
+    try testing.expect(ratio < 8.0);
 }
 
 // ── fuzz: parse never panics; parse -> serialize -> parse is stable ───────

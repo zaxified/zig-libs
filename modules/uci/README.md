@@ -72,23 +72,29 @@ _ = pkg.eql(&other);
 ## Format coverage / semantics
 
 - Named and anonymous sections; optional `package <name>` header line.
-- Single quotes: no escapes. Double quotes: `\"` `\'` `\\` `\n` `\t` `\r`
-  (backslash before any other character yields that character). Bare words;
-  adjacent quoted/bare segments of one token concatenate (`'a'"b"c` → `abc`).
+- Single quotes: no escapes. Double quotes: a backslash before ANY character
+  (including `n`/`t`/`r`) drops the backslash and keeps that character
+  literally — there is no escape that produces an actual control byte (real
+  `uci` binary confirms `\n`/`\t`/`\r` are not special-cased; see SPEC.md).
+  Bare words; adjacent quoted/bare segments of one token concatenate
+  (`'a'"b"c` → `abc`).
 - Comments: `#` to end of line at the start of a token; literal inside
   quotes and inside a bare word. Quotes may not span lines; CRLF accepted.
 - Repeated `option` under one key: last wins. `list` accumulates in order.
   Mixing `option`/`list` under one key → `error.MixedOptionList`.
-- Canonical output: optional `package '<name>'` header, blank line between
-  section blocks, tab-indented options, values single-quoted (double-quoted
-  with escapes when they contain `'` or control characters).
+- Canonical output: optional `package <name>` header (bare when
+  identifier-safe, quoted otherwise — matches real `uci export`'s own
+  rendering), blank line between section blocks, tab-indented options, values
+  single-quoted (double-quoted with escapes when they contain `'` or control
+  characters).
 - Bounded: inputs over 16 MiB → `error.InputTooLarge`; lines over 16 KiB →
   `error.LineTooLong`.
 
 ## Notes / deviations
 
 - An empty quoted section name (`config rule ''`) is treated as anonymous.
-- Values containing control characters other than `\n` `\t` `\r` cannot be
+- Values containing ANY control character below 0x20 — `\n` `\t` `\r`
+  included, since none of them has a working escape (see above) — cannot be
   represented in UCI text and serialize to `error.UnserializableValue`.
 - UCI CLI-level features (`uci set/commit`, `/etc/config` discovery, state
   files) are out of scope — this is the file codec only. In particular: a
