@@ -180,6 +180,45 @@ test "different n values still agree on the shared prefix" {
     for (small.h_vec, big.h_vec[0..small.n]) |a, b| try std.testing.expectEqualSlices(u8, &a.toBytes(), &b.toBytes());
 }
 
+// ── B7 (A1 audit): a value-level KAT, not just relational tests ────────────
+//
+// Every test above this line only checks RELATIONS (determinism, distinctness,
+// non-identity, shared-prefix agreement) -- none of them pin an actual byte
+// value. `domain` above documents that bumping it to a "v2" string would
+// "silently repoint EVERY commitment made under v1 onto different, unrelated
+// points" -- a refactor of the hash construction (reordered `h.update` calls,
+// a different index encoding, an accidental domain-string edit) would pass
+// every relational test above and STILL repoint every commitment. Audit
+// finding B7: `W11` (deleting the domain string from the hash) survived the
+// full 58/58 suite. These values were read off this exact toolchain via a
+// throwaway probe test (`std.debug.print`, discarded after use) and are
+// pinned here as the value-level anchor those relational tests cannot be.
+test "generators KAT: g/h/g_vec[0]/h_vec[0]/h_vec[63] are pinned byte values (n=64)" {
+    const gens = try Generators.init(std.testing.allocator, 64);
+    defer gens.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings(
+        "b84995b6253945c1c3304cb8381da9703de6b6102afdaaafaadee39c5efb8937",
+        &std.fmt.bytesToHex(gens.g.toBytes(), .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "b4ac3c51bae8a7651b1933820a92dccebf0607ca91dd19f21b5efa113a5a250d",
+        &std.fmt.bytesToHex(gens.h.toBytes(), .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "04ce1a60f3bfba388352d5da929ae6a70c06e01c5377af1c26775bf52772b952",
+        &std.fmt.bytesToHex(gens.g_vec[0].toBytes(), .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "9400d71d527df020f94180f3eb5bd77d1371539e5b95d88529235168654d1b2f",
+        &std.fmt.bytesToHex(gens.h_vec[0].toBytes(), .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "b4d3c2fcbaa2b4e97ddbe1883ed094716f71b1de446e933a2e60682e9da3d164",
+        &std.fmt.bytesToHex(gens.h_vec[63].toBytes(), .lower),
+    );
+}
+
 test "n = 0 gives empty vectors without error" {
     const gens = try Generators.init(std.testing.allocator, 0);
     defer gens.deinit(std.testing.allocator);

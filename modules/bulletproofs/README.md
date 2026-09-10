@@ -92,10 +92,15 @@ with dalek, libsecp256k1-zkp, or any other implementation. See
 ## Import graph
 
 ```
+bulletproofs → ct25519 (scalarvec.mulCt, the constant-time secret-scalar ladder)
 bulletproofs → std.crypto.ecc.Ristretto255 / std.crypto.hash.sha2.Sha512
 ```
 
-No sibling-module dependencies (`meta.deps = .{}`).
+One sibling-module dependency, `ct25519` (`meta.deps = .{"ct25519"}`) — this
+line previously claimed `meta.deps = .{}`, the same stale claim `NOTICE` made
+before audit finding B11's 2026-09-09 fix corrected it there; this copy of
+the claim was missed at the time and is corrected now (found while verifying
+this file's other claims against the tree for the B1/B10 fixes below).
 
 ## Verify
 

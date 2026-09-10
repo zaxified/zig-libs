@@ -220,6 +220,59 @@ test "soundness: tampering any proof field is rejected" {
     }
 }
 
+// ── 2b. Zero-knowledge: repeated proofs of the SAME witness are not
+//        bit-identical (GATED) — audit finding B2 ────────────────────────
+//
+// Every test above and below this one only checks COMPLETENESS (an honest
+// proof verifies) and TAMPER-rejection (changing a byte breaks verification)
+// -- both hold even for a prover that always draws the SAME "random"
+// blinding (or none at all). The audit's `recover.zig` demonstrated that a
+// predictable-blinding prover (its `W23` mutation: `randomScalar()` returns
+// a fixed constant) still passes every test in this file, 58/58, while
+// leaking the full witness `(gamma, v)` to anyone who sees the proof: with
+// `alpha`/`rho`/`s_L`/`s_R`/`tau1`/`tau2` all fixed, `A` is a deterministic
+// function of `(a_L, a_R)` alone (both fixed by `v`), so a SECOND proof of
+// the identical `(v, gamma)` reproduces `A` byte-for-byte. This test is the
+// suite's only guard against that regression.
+test "zero-knowledge: two proofs of the identical witness are not bit-identical" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+
+    const n: usize = 8;
+    const gens = try Generators.init(std.testing.allocator, n);
+    defer gens.deinit(std.testing.allocator);
+    const v: u64 = 137;
+    const gamma = [_]u8{42} ++ [_]u8{0} ** 31;
+
+    var t1 = Transcript.init(bulletproofs.rangeproof_domain);
+    const p1 = try bulletproofs.prove(std.testing.allocator, gens, &t1, v, gamma);
+    defer p1.deinit(std.testing.allocator);
+
+    var t2 = Transcript.init(bulletproofs.rangeproof_domain);
+    const p2 = try bulletproofs.prove(std.testing.allocator, gens, &t2, v, gamma);
+    defer p2.deinit(std.testing.allocator);
+
+    // Both must independently verify (positive control: a broken runner
+    // that always returns unequal would pass the checks below vacuously).
+    {
+        const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ [_]u8{0} ** 31, gamma);
+        var vt1 = Transcript.init(bulletproofs.rangeproof_domain);
+        try std.testing.expect(bulletproofs.verify(gens, &vt1, commitment, p1));
+        var vt2 = Transcript.init(bulletproofs.rangeproof_domain);
+        try std.testing.expect(bulletproofs.verify(gens, &vt2, commitment, p2));
+    }
+
+    // Every blinded commitment the proof carries must differ between the
+    // two runs -- a fixed-blinding regression would make ALL of these
+    // collide simultaneously (matching the audit's W23 recovery: A, S,
+    // tau_x, and mu all become deterministic functions of (v, gamma)).
+    try std.testing.expect(!p1.a.equivalent(p2.a));
+    try std.testing.expect(!p1.s.equivalent(p2.s));
+    try std.testing.expect(!p1.t1.equivalent(p2.t1));
+    try std.testing.expect(!p1.t2.equivalent(p2.t2));
+    try std.testing.expect(!std.mem.eql(u8, &p1.tau_x, &p2.tau_x));
+    try std.testing.expect(!std.mem.eql(u8, &p1.mu, &p2.mu));
+}
+
 // ── 3(c). Soundness: proof for V does not verify against a different V' ───
 
 test "soundness: a proof for V is rejected against a different commitment V'" {
@@ -263,6 +316,71 @@ test "soundness: verifying with a differently-sized Generators set is rejected" 
     // spuriously accept.
     var vt = Transcript.init(bulletproofs.rangeproof_domain);
     try std.testing.expect(!bulletproofs.verify(gens16, &vt, commitment, proof));
+}
+
+// ── 3(e). Soundness: randomized forgery — discriminating power, not just
+//         "some tampers are caught" (GATED) — audit finding B4 ───────────
+//
+// The hand-picked tampers in 3(b) each flip ONE bit of ONE field and all get
+// caught -- but a verifier that only compares, say, the first byte of the
+// final IPA equation's two sides would ALSO catch every one of those (a
+// single-bit flip almost always changes byte 0 too) while accepting roughly
+// 1 forged proof in 256. Audit finding B4, reproduced here structurally:
+// `ipa.verifyIpa`'s final check weakened from `lhs.equivalent(rhs)` to
+// comparing only the first encoded byte survives 3(b) entirely, 58/58, and
+// is caught only by measuring the ACCEPTANCE RATE of many independent
+// random forgeries rather than a fixed list of hand-picked ones.
+test "soundness: random forgeries of L_0 are never accepted (discriminating power)" {
+    if (!gate.core_implemented) return error.SkipZigTest;
+
+    const n: usize = 8;
+    const gens = try Generators.init(std.testing.allocator, n);
+    defer gens.deinit(std.testing.allocator);
+    const v: u64 = 200;
+    const gamma = [_]u8{5} ++ [_]u8{0} ** 31;
+    const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ [_]u8{0} ** 31, gamma);
+
+    var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
+    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, v, gamma);
+    defer proof.deinit(std.testing.allocator);
+
+    // Positive control: the untampered proof must verify, or the loop below
+    // proves nothing (a runner that always rejects would also show 0/N).
+    {
+        var vt = Transcript.init(bulletproofs.rangeproof_domain);
+        try std.testing.expect(bulletproofs.verify(gens, &vt, commitment, proof));
+    }
+
+    var prng = std.Random.DefaultPrng.init(0xB4_2026_0910);
+    const random = prng.random();
+    // 500, not the audit's own 20,000 -- this lane runs in Debug (10-50x
+    // slower per `verify` call than the audit's ReleaseFast measurement),
+    // and 500 trials already makes a ~1-in-256 acceptance rate (the exact
+    // rate a `W03`-style weakened comparison produces) fail with
+    // overwhelming probability (P(0 hits in 500 draws at p=1/256) ~= 15%,
+    // so a real regression at that rate is caught the large majority of
+    // runs and, per this fix's own RED measurement, was caught outright).
+    const trials = 500;
+    var accepted: usize = 0;
+    for (0..trials) |_| {
+        var tampered = proof;
+        var l_vec = try std.testing.allocator.dupe(Ristretto255, proof.ipa.l_vec);
+        defer std.testing.allocator.free(l_vec);
+        var wide: [64]u8 = undefined;
+        random.bytes(&wide);
+        const k = Ristretto255.scalar.reduce64(wide);
+        l_vec[0] = Ristretto255.basePoint.mul(k) catch continue; // a fresh random point
+        tampered.ipa.l_vec = l_vec;
+
+        var vt = Transcript.init(bulletproofs.rangeproof_domain);
+        if (bulletproofs.verify(gens, &vt, commitment, tampered)) accepted += 1;
+    }
+    // Measured 2026-09-10 against the real (unweakened) `equivalent` check:
+    // 0 of 500 accepted. A verifier weakened to compare only the first
+    // encoded byte of the final check (audit's `W03`) accepted 4 of 500 in
+    // the same run (~1-in-256 rate, matches the weakening exactly) --
+    // confirmed via a temporary mutation during this fix.
+    try std.testing.expectEqual(@as(usize, 0), accepted);
 }
 
 // ── 4. Codec round-trips are covered directly in ipa.zig/rangeproof.zig's

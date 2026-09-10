@@ -223,10 +223,81 @@ test "challengeScalar ratchets state: repeated calls under the same label differ
     try std.testing.expect(!std.mem.eql(u8, &c1, &c2));
 }
 
+test "absorb: length-prefixing prevents a REAL label/data boundary collision (audit B15)" {
+    // The existing test above ("Length-prefixing prevents...") compares
+    // `appendScalar("ab", 32 zero bytes)` against `appendScalar("a", 'b' ++
+    // 31 zero bytes)` -- but `appendScalar`'s data is always exactly 32
+    // bytes, so those two calls absorb 34 and 33 total bytes respectively.
+    // Different total lengths already differ under SHA-512 regardless of
+    // prefixing, so `W07` (deleting the two `writeInt` length-prefix calls)
+    // survives that test unchanged, 58/58 -- audit finding B15: the test
+    // asserts a property it cannot actually falsify.
+    //
+    // A genuine collision needs the UNPREFIXED concatenation `tag||label||
+    // data` to be byte-identical across two different (label, data) splits.
+    // `absorb` is private but same-file-accessible: calling it directly
+    // (instead of through the fixed-width `appendScalar`/`appendPoint`)
+    // lets `data` vary in length, which is what makes a real collision
+    // constructible: `"ab" ++ ""` and `"a" ++ "b"` are the same three bytes
+    // (tag, then 'a','b') split at a different label/data boundary.
+    var t1 = Transcript.init("x");
+    var t2 = Transcript.init("x");
+    t1.absorb('S', "ab", "");
+    t2.absorb('S', "a", "b");
+    // With length-prefixing (the real code): label_len differs (2 vs 1), so
+    // the states differ. Without it (W07), `tag||label||data` is identical
+    // for both and this assertion is exactly the one that would fail.
+    try std.testing.expect(!std.mem.eql(u8, &t1.state, &t2.state));
+}
+
 test "challengeScalar is label-sensitive" {
     var t1 = Transcript.init("z");
     var t2 = Transcript.init("z");
     const y = t1.challengeScalar("y");
     const z = t2.challengeScalar("z");
     try std.testing.expect(!std.mem.eql(u8, &y, &z));
+}
+
+test "challengeScalar: 300 draws carry real entropy (audit B3: Fiat-Shamir truncation is unguarded)" {
+    // Audit finding B3: nothing in this module's test suite checks the
+    // DISTRIBUTION of a drawn challenge -- only that it is deterministic,
+    // ratcheted, and label-sensitive (the tests above). A regression that
+    // truncates `challengeScalar`'s entropy (e.g. zeroing all but the low
+    // byte of the 64-byte digest before reduction, as the audit's `W27`
+    // mutation did) would still pass every one of those: truncating to one
+    // of 256 possible VALUES is still deterministic, still ratchets to a
+    // DIFFERENT (still-truncated) value next call, and still differs
+    // between two different labels most of the time.
+    //
+    // Two independent checks that a low-entropy draw fails and a real
+    // SHA-512-derived one passes:
+    var t = Transcript.init("entropy-probe");
+    var challenges: [300][32]u8 = undefined;
+    for (&challenges, 0..) |*c, i| {
+        var label_buf: [8]u8 = undefined;
+        const label = std.fmt.bufPrint(&label_buf, "c{d}", .{i}) catch unreachable;
+        c.* = t.challengeScalar(label);
+    }
+
+    // (1) No two of the 300 draws collide. At full ~252-bit entropy this is
+    // certain; at the W27 mutation's 256 possible values, 300 draws from a
+    // 256-value space collide with overwhelming probability (birthday
+    // bound: ~1 - exp(-300*299/2/256) is indistinguishable from 1).
+    for (challenges[0 .. challenges.len - 1], 0..) |ci, i| {
+        for (challenges[i + 1 ..]) |cj| {
+            try std.testing.expect(!std.mem.eql(u8, &ci, &cj));
+        }
+    }
+
+    // (2) The high byte (challenges are little-endian, so index 31 is the
+    // MOST significant) takes on more than a handful of distinct values.
+    // `W27` (`@memset(wide[1..], 0)` before reduction) fixes every byte
+    // above the low one to 0, so this would see exactly 1 distinct value;
+    // `W26` (truncate to 64 bits before reduction) would see very few, since
+    // the top ~24 bytes collapse to 0. A real SHA-512 draw over 300 samples
+    // sees dozens.
+    var seen = std.AutoHashMap(u8, void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (challenges) |c| try seen.put(c[31], {});
+    try std.testing.expect(seen.count() > 10);
 }

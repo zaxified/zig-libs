@@ -214,9 +214,23 @@ pub const InnerProductProof = struct {
             r.* = Ristretto255.fromBytes(bytes[off..][0..32].*) catch return error.InvalidEncoding;
             off += 32;
         }
+        // Audit finding B1: the two POINTS above are checked for canonical
+        // encoding by `Ristretto255.fromBytes` (it rejects `p + k*(2^255-19)`
+        // reductions), but these two raw SCALARS were not -- `a`/`b` never
+        // enter the transcript (they are the protocol's LAST values, sent
+        // and immediately checked, never bound by a prior challenge), so
+        // `a` and `a + k*L` (for any of the ~16 values of `k` with
+        // `a + k*L < 2^256`) decode to the same accepted proof under a
+        // DIFFERENT wire encoding -- 256 accepted byte-for-byte-distinct
+        // encodings of one logical proof (16 `a`-variants x 16
+        // `b`-variants), measured via exhaustive search over `k`. Rejecting
+        // non-canonical scalars here closes it at the codec boundary, the
+        // same place the point check already lives.
         const a = bytes[off..][0..32].*;
+        scalar.rejectNonCanonical(a) catch return error.InvalidEncoding;
         off += 32;
         const b = bytes[off..][0..32].*;
+        scalar.rejectNonCanonical(b) catch return error.InvalidEncoding;
         off += 32;
 
         return .{ .l_vec = l_vec, .r_vec = r_vec, .a = a, .b = b };
@@ -504,6 +518,55 @@ test "InnerProductProof.fromBytesAlloc: rejects a non-canonical point encoding" 
     try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, corrupt));
 }
 
+test "InnerProductProof.fromBytesAlloc: rejects non-canonical a/b scalars (audit B1: wire malleability)" {
+    // rounds=0: no L/R points in the wire layout, so `a` starts right after
+    // the 4-byte rounds header and `b` right after `a` -- mutating those two
+    // fixed offsets touches only the SCALAR fields, not a point encoding.
+    const proof = try fakeProof(std.testing.allocator, 0);
+    defer proof.deinit(std.testing.allocator);
+    const bytes = try proof.toBytesAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+
+    // `L` = the scalar field order (`Ristretto255.scalar`'s `L`), added to
+    // the honest `a`/`b` bytes with a 32-bit little-endian add (no modular
+    // reduction) -- reproduces one of the ~16 non-canonical re-encodings
+    // the audit's `count.zig` found accepted (16 a-variants x 16
+    // b-variants = 256 total, since `2^256 / L ~= 16`).
+    const l_bytes = [_]u8{
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+        0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+        0,    0,    0,    0,    0,    0,    0,    0,
+        0,    0,    0,    0,    0,    0,    0,    0x10,
+    };
+
+    var mutated_a = try std.testing.allocator.dupe(u8, bytes);
+    defer std.testing.allocator.free(mutated_a);
+    addLittleEndian(mutated_a[4..36], l_bytes);
+    try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, mutated_a));
+
+    var mutated_b = try std.testing.allocator.dupe(u8, bytes);
+    defer std.testing.allocator.free(mutated_b);
+    addLittleEndian(mutated_b[36..68], l_bytes);
+    try std.testing.expectError(error.InvalidEncoding, InnerProductProof.fromBytesAlloc(std.testing.allocator, mutated_b));
+
+    // Positive control: the untampered encoding must still decode.
+    const back = try InnerProductProof.fromBytesAlloc(std.testing.allocator, bytes);
+    back.deinit(std.testing.allocator);
+}
+
+/// `out += addend`, both 32-byte little-endian, ignoring the final carry
+/// (this module's scalars are always < 2^256 by representation, and the
+/// test above only needs the low bytes to change; the point is a
+/// DIFFERENT byte encoding of `a + L`, not modular correctness).
+fn addLittleEndian(out: []u8, addend: [32]u8) void {
+    var carry: u16 = 0;
+    for (out, addend) |*o, ad| {
+        const sum = @as(u16, o.*) + @as(u16, ad) + carry;
+        o.* = @truncate(sum);
+        carry = sum >> 8;
+    }
+}
+
 test "proveIpa: length mismatch rejected before reaching the stub" {
     var t = Transcript.init("bulletproofs/ipa/v1");
     const g_vec = [_]Ristretto255{ Ristretto255.basePoint, Ristretto255.basePoint.dbl() };
@@ -606,6 +669,13 @@ test "corpus: every IPA seed reaches the decoder, and the rounds decoded are pin
     // One seed is deliberately the empty slice.
     try std.testing.expectEqual(ipa_seeds.len - 1, nonempty);
     // Measured 2026-09-07. Before the draw was restructured both were 0.
-    try std.testing.expectEqual(@as(usize, 4), accepted);
-    try std.testing.expectEqual(@as(usize, 17), rounds_decoded);
+    // ⭐ Re-measured 2026-09-10 after audit finding B1's fix (non-canonical
+    // `a`/`b` now rejected): the `rounds=2` seed's `a`/`b` bytes are
+    // `0x11` repeated 32 times, whose top byte (0x11) exceeds the scalar
+    // order `L`'s top byte (0x10) -- i.e. it was exactly the kind of
+    // non-canonical encoding B1 closes, so it flips from accepted to
+    // rejected: accepted 4 -> 3, rounds_decoded 17 -> 15 (loses that seed's
+    // 2 rounds).
+    try std.testing.expectEqual(@as(usize, 3), accepted);
+    try std.testing.expectEqual(@as(usize, 15), rounds_decoded);
 }

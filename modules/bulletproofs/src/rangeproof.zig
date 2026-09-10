@@ -320,11 +320,23 @@ pub const RangeProof = struct {
         off += 32;
         const t2 = Ristretto255.fromBytes(bytes[off..][0..32].*) catch return error.InvalidEncoding;
         off += 32;
+        // Audit finding B1's defense-in-depth half: these three scalars ARE
+        // bound into the transcript (see `verify`'s replay below), so a
+        // non-canonical re-encoding of one of them changes the derived
+        // Fiat-Shamir challenges and a forged proof build atop it would not
+        // verify -- unlike `ipa.zig`'s `a`/`b`, this path was not a live
+        // malleability finding. Rejecting non-canonical bytes here anyway
+        // keeps every raw scalar field in this module's two codecs held to
+        // the same canonical-encoding standard as the point fields next to
+        // them, rather than only the ones a live exploit was found for.
         const tau_x = bytes[off..][0..32].*;
+        scalar.rejectNonCanonical(tau_x) catch return error.InvalidEncoding;
         off += 32;
         const mu = bytes[off..][0..32].*;
+        scalar.rejectNonCanonical(mu) catch return error.InvalidEncoding;
         off += 32;
         const t_hat = bytes[off..][0..32].*;
+        scalar.rejectNonCanonical(t_hat) catch return error.InvalidEncoding;
         off += 32;
         const ipa_proof = InnerProductProof.fromBytesAlloc(allocator, bytes[off..]) catch return error.InvalidEncoding;
         return .{ .a = a, .s = s, .t1 = t1, .t2 = t2, .tau_x = tau_x, .mu = mu, .t_hat = t_hat, .ipa = ipa_proof };
@@ -408,8 +420,18 @@ pub fn prove(
         .add(scalarvec.multiScalarMul(s_l, gens.g_vec) catch unreachable)
         .add(scalarvec.multiScalarMul(s_r, gens.h_vec) catch unreachable);
 
-    // 4. Bind V (recomputed from the witness — the same point the
-    //    verifier is handed), then A/S; draw y, z.
+    // 4. Bind n (audit finding B10: the bit-width was documented as an
+    //    `appendU64` use case but never actually bound -- `transcript.zig`'s
+    //    doc comment named it as an example and nothing called it; adding
+    //    this wires the doc comment's own claim into the real protocol as
+    //    defense-in-depth. No exploit was found without it (the round count
+    //    is already checked structurally in `verify`, and the generator set
+    //    is a deterministic function of `n`), but the module has no
+    //    consumer in this repo, so no proof anywhere depends on the exact
+    //    challenge derivation this changes. Then bind V (recomputed from
+    //    the witness — the same point the verifier is handed), then A/S;
+    //    draw y, z.
+    transcript.appendU64("n", n);
     var v_bytes = scalarvec.zero;
     defer std.crypto.secureZero(u8, &v_bytes);
     std.mem.writeInt(u64, v_bytes[0..8], v, .little);
@@ -535,6 +557,18 @@ pub fn verify(
     // Structural check: the proof's implied n (from its IPA round count)
     // must match this generator set — rejects, among other things, an
     // n=8 proof replayed against an n=16 Generators set.
+    //
+    // ⭐ Audit finding B14: `ipa.verifyIpa` (called below, at the end of
+    // this function) performs THIS EXACT check again on its own `rounds`
+    // parameter (derived from `g_vec.len`, which here is always `n`) against
+    // `proof.l_vec.len`/`proof.r_vec.len`. That duplication is deliberate
+    // defense-in-depth, not dead code left over from a refactor — `verifyIpa`
+    // is also called standalone (see `root.zig`'s re-export and
+    // `kat_test.zig`'s "IPA standalone" test), so it cannot drop its own
+    // copy without leaving THAT caller unchecked. A mutation that deletes
+    // the check here survives (`verifyIpa`'s copy still catches it) — that
+    // is expected, not evidence this line is redundant. Do not remove either
+    // copy on the strength of a surviving mutation on just one of them.
     if (proof.ipa.l_vec.len != rounds or proof.ipa.r_vec.len != rounds) return false;
 
     // The verifier is allocator-less by signature; scratch comes from the
@@ -544,7 +578,11 @@ pub fn verify(
     const scratch = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see doc comment above)
 
     // Replay step 4's transcript ops from the proof's own fields (and the
-    // public V) to recover the prover's y, z, x.
+    // public V) to recover the prover's y, z, x. `n` first (audit finding
+    // B10) — must mirror `prove`'s call exactly, same argument, same
+    // position, or completeness breaks immediately (see the regression test
+    // in this file's test block).
+    transcript.appendU64("n", n);
     transcript.appendPoint("V", v);
     transcript.appendPoint("A", proof.a);
     transcript.appendPoint("S", proof.s);
@@ -759,6 +797,49 @@ test "RangeProof.fromBytesAlloc: rejects truncated input" {
     try std.testing.expectError(error.InvalidEncoding, RangeProof.fromBytesAlloc(std.testing.allocator, bytes[0 .. bytes.len - 1]));
 }
 
+test "RangeProof.fromBytesAlloc: rejects non-canonical tau_x/mu/t_hat scalars (defense-in-depth, audit B1)" {
+    const gens = try Generators.init(std.testing.allocator, 4);
+    defer gens.deinit(std.testing.allocator);
+    const ipa_proof = try fakeIpaProof(std.testing.allocator, 2);
+    const proof = RangeProof{
+        .a = gens.g,
+        .s = gens.h,
+        .t1 = gens.g,
+        .t2 = gens.h,
+        .tau_x = scalarvec.one,
+        .mu = scalarvec.one,
+        .t_hat = scalarvec.one,
+        .ipa = ipa_proof,
+    };
+    defer proof.deinit(std.testing.allocator);
+    const bytes = try proof.toBytesAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+
+    // Same `L` little-endian bytes as ipa.zig's B1 test.
+    const l_bytes = [_]u8{
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
+        0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+        0,    0,    0,    0,    0,    0,    0,    0,
+        0,    0,    0,    0,    0,    0,    0,    0x10,
+    };
+    const offsets = [_]usize{ 128, 160, 192 }; // tau_x, mu, t_hat (after 4 points)
+    for (offsets) |base| {
+        var mutated = try std.testing.allocator.dupe(u8, bytes);
+        defer std.testing.allocator.free(mutated);
+        var carry: u16 = 0;
+        for (mutated[base .. base + 32], l_bytes) |*o, ad| {
+            const sum = @as(u16, o.*) + @as(u16, ad) + carry;
+            o.* = @truncate(sum);
+            carry = sum >> 8;
+        }
+        try std.testing.expectError(error.InvalidEncoding, RangeProof.fromBytesAlloc(std.testing.allocator, mutated));
+    }
+
+    // Positive control: the untampered encoding must still decode.
+    const back = try RangeProof.fromBytesAlloc(std.testing.allocator, bytes);
+    back.deinit(std.testing.allocator);
+}
+
 test "prove: rejects v >= 2^n at construction, without touching the stub" {
     const gens = try Generators.init(std.testing.allocator, 4); // n = 4, values must be < 16
     defer gens.deinit(std.testing.allocator);
@@ -767,13 +848,42 @@ test "prove: rejects v >= 2^n at construction, without touching the stub" {
     try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, 255, scalarvec.zero));
 }
 
-test "prove: n=64 never rejects any u64 value at the construction-time guard" {
-    // Cannot call prove() itself here (n=64 would fall through to the
-    // @panic stub) -- this test only exercises the shift-amount edge
-    // case of the guard's own arithmetic by re-deriving it directly,
-    // guarding against a regression that reintroduces a `<<64` overflow.
-    const n: usize = 64;
-    try std.testing.expect(n >= 64); // guard's `if (gens.n < 64)` branch is skipped for n=64
+test "prove: n=64 construction-time guard is skipped, and the boundary values it would have to handle actually verify (audit B6)" {
+    // The test this replaces asserted `n >= 64` -- a fact about `usize`
+    // literals, true unconditionally, that would pass even if `prove`/
+    // `verify` were deleted outright. Its own justification ("cannot call
+    // prove() itself here, n=64 would fall through to the @panic stub") is
+    // stale: there is no `@panic` stub left (`gate.core_implemented` is
+    // `true`, see `gate.zig`), so the real call it claimed was impossible
+    // has been possible since the Fable core pass. Audit finding B6: this
+    // module's flagship width, n=64 (README/SPEC/root.zig all name it as
+    // the typical case), was not exercised by ANY test -- the full suite
+    // ran entirely on n=8 (`kat_test.zig`) and n=4/n=8 (this file).
+    // (This file's own tests call `prove`/`verify` directly, ungated --
+    // gating on `gate.core_implemented` is `kat_test.zig`'s convention, for
+    // the cross-cutting end-to-end scenarios; see this file's other
+    // `prove`-calling tests above.)
+    const gens = try Generators.init(std.testing.allocator, 64);
+    defer gens.deinit(std.testing.allocator);
+    const gamma = [_]u8{7} ++ [_]u8{0} ** 31;
+
+    // The guard's own boundary values: 0, 1, and the maximum representable
+    // u64 (2^64 - 1) -- exactly the shift-amount edge case the removed
+    // test's comment worried about, now checked by actually running the
+    // guard AND the full proof it guards, rather than re-deriving one
+    // comparison in isolation.
+    for ([_]u64{ 0, 1, std.math.maxInt(u64) }) |v| {
+        var v_bytes = scalarvec.zero;
+        std.mem.writeInt(u64, v_bytes[0..8], v, .little);
+        const commitment = commit(gens, v_bytes, gamma);
+
+        var prove_t = Transcript.init(transcript_domain);
+        const proof = try prove(std.testing.allocator, gens, &prove_t, v, gamma);
+        defer proof.deinit(std.testing.allocator);
+
+        var verify_t = Transcript.init(transcript_domain);
+        try std.testing.expect(verify(gens, &verify_t, commitment, proof));
+    }
 }
 
 // ── fuzz: untrusted-input decoder never panics ──────────────────────────────
@@ -843,6 +953,13 @@ test "corpus: every range-proof seed reaches the decoder, and the nested IPA rou
     // One seed is deliberately the empty slice.
     try std.testing.expectEqual(rp_seeds.len - 1, nonempty);
     // Measured 2026-09-07. Before the draw was restructured both were 0.
-    try std.testing.expectEqual(@as(usize, 3), accepted);
-    try std.testing.expectEqual(@as(usize, 7), ipa_rounds);
+    // ⭐ Re-measured 2026-09-10 after audit finding B1's fix (non-canonical
+    // scalars now rejected, including the nested IPA's `a`/`b` via
+    // `ipa.zig`'s own fix): the "six nested IPA rounds" seed's `a`/`b`
+    // bytes are `0x44` repeated 32 times, non-canonical for the same
+    // reason as `ipa.zig`'s corpus test, so it flips from accepted to
+    // rejected: accepted 3 -> 2, ipa_rounds 7 -> 1 (loses that seed's 6
+    // rounds).
+    try std.testing.expectEqual(@as(usize, 2), accepted);
+    try std.testing.expectEqual(@as(usize, 1), ipa_rounds);
 }
