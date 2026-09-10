@@ -265,17 +265,37 @@ pub const Element = struct {
     pub fn textContent(self: *const Element, alloc: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
-        try appendTextContent(self, alloc, &out);
-        return out.toOwnedSlice(alloc);
-    }
 
-    fn appendTextContent(self: *const Element, alloc: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
-        for (self.children) |c| switch (c.content) {
-            .text => |t| try out.appendSlice(alloc, t),
-            .cdata => |t| try out.appendSlice(alloc, t),
-            .element => |e| try appendTextContent(e, alloc, out),
-            .comment, .pi => {},
-        };
+        // F5: was a native recursion (one machine-stack frame per nesting
+        // level) that SIGSEGV'd at depth ~500,000 in ReleaseFast/ReleaseSafe
+        // and ~35,000 in Debug — reachable because `xmldsig`'s own C14N
+        // comment claimed raising `xml.Options.max_depth` was "safe for
+        // `xml`" and it is not, for this call, the way it is for `parse`
+        // itself (an explicit heap stack already, per SPEC.md). Now an
+        // explicit heap stack too: each entry is the REMAINING children
+        // slice at one level of the subtree, so recursing into an element
+        // is "push its children", returning from it is "pop an emptied
+        // slice" — same depth-first, document-order output as the old
+        // recursive walk, bounded by the allocator, not by `ulimit -s`.
+        var stack: std.ArrayList([]const Child) = .empty;
+        defer stack.deinit(alloc);
+        try stack.append(alloc, self.children);
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (top.len == 0) {
+                _ = stack.pop();
+                continue;
+            }
+            const c = top.*[0];
+            top.* = top.*[1..];
+            switch (c.content) {
+                .text => |t| try out.appendSlice(alloc, t),
+                .cdata => |t| try out.appendSlice(alloc, t),
+                .element => |e| try stack.append(alloc, e.children),
+                .comment, .pi => {},
+            }
+        }
+        return out.toOwnedSlice(alloc);
     }
 };
 
@@ -2185,6 +2205,35 @@ test "complexity: Element.resolveNs is O(1) in depth and in declaration count" {
         }
         try testing.expect(total <= 6 * k);
     }
+}
+
+test "hardening: Element.textContent does not recurse on the machine stack (F5)" {
+    // `appendTextContent` used to be one native-recursion frame per nesting
+    // level, and `xmldsig`'s own C14N comment claimed raising
+    // `xml.Options.max_depth` was "safe for `xml`" for exactly this reason
+    // (it is safe for `parse` itself, which already uses an explicit heap
+    // stack per SPEC.md -- it was not safe for this read API).
+    //
+    // Measured (Debug, this probe's own OLD recursive body, before the
+    // fix): depth 100,000 succeeds, depth 200,000 SIGSEGVs. This test picks
+    // a depth two orders of magnitude past the default `max_depth` (256)
+    // as a cheap-to-run regression guard; the crash-boundary numbers
+    // themselves live in the fix commit message, reproduced from a
+    // one-off probe, not in the permanent suite (a 200k-deep parse on
+    // every `modtest xml` run would not be a cheap guard).
+    const gpa = testing.allocator;
+    const depth = 10_000;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    for (0..depth) |_| try buf.appendSlice(gpa, "<e>");
+    try buf.appendSlice(gpa, "leaf");
+    for (0..depth) |_| try buf.appendSlice(gpa, "</e>");
+
+    var doc = try parse(gpa, buf.items, .{ .max_depth = depth + 4 });
+    defer doc.deinit();
+    const txt = try doc.root.textContent(gpa);
+    defer gpa.free(txt);
+    try testing.expectEqualStrings("leaf", txt);
 }
 
 test "behaviour: resolveNs answers exactly what the parent-axis walk answers" {
