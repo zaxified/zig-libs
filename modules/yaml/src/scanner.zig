@@ -1455,3 +1455,84 @@ test "block-nesting cap: max_depth levels of '- ' scan clean, max_depth + 1 fail
     defer one_too_deep.deinit(gpa);
     try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_deep.items));
 }
+
+// F5 (A1/yaml.md), mutation ID `W04_scanner_depth`: the audit's mutation
+// changed `max_depth`'s VALUE (4096 -> 1_000_000) rather than removing the
+// check that reads it. The two tests above construct their input by reading
+// the live `max_depth` symbol, so they retarget themselves to whatever value
+// it holds and can never see a change to the value itself -- a fixer
+// confirmed this by hand 2026-09-10 (temporarily setting `max_depth = 5000`
+// and watching both tests keep passing). The fix is a THIRD test that reads
+// the literal `4096`/`4097`, never the symbol: it still passes today (the
+// literal and the symbol agree), but stops matching production behaviour --
+// and starts failing -- the moment `max_depth` is no longer 4096, which is
+// exactly the mutation this closes.
+test "block-nesting cap is pinned to the literal 4096, not just whatever `max_depth` says" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var one_too_deep: std.ArrayList(u8) = .empty;
+    for (0..4097) |i| {
+        for (0..2 * i) |_| try one_too_deep.append(gpa, ' ');
+        try one_too_deep.appendSlice(gpa, "- ");
+        if (i + 1 == 4097) try one_too_deep.append(gpa, 'x');
+        try one_too_deep.append(gpa, '\n');
+    }
+    defer one_too_deep.deinit(gpa);
+    try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_deep.items));
+}
+
+// F5 (A1/yaml.md), mutation ID `W03_simplekey_cap`: the audit's mutation
+// widened `staleSimpleKeys`'s 1024-character simple-key span (YAML 1.2 §7.4,
+// "the total number of characters that key can span is 1024") to 1_000_000
+// and 10 of 20 mutations, this one included, left the suite green -- nothing
+// exercised the cap at all. The mark is taken (`saveSimpleKey`, called from
+// `fetchPlainScalar` BEFORE the scalar is scanned) only when the key would be
+// `required` (`flow_level == 0 and indent == column`), i.e. it is not the
+// document's first key but a later one at the same block indent, so this
+// document opens the mapping with `admin: 1` first.
+test "simple-key cap: a required implicit key over 1024 characters is rejected, exactly 1024 is fine" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var at_bound: std.ArrayList(u8) = .empty;
+    try at_bound.appendSlice(gpa, "admin: 1\n");
+    for (0..1024) |_| try at_bound.append(gpa, 'x');
+    try at_bound.appendSlice(gpa, ": 2\n");
+    defer at_bound.deinit(gpa);
+    try scanAll(arena, at_bound.items);
+
+    var one_too_long: std.ArrayList(u8) = .empty;
+    try one_too_long.appendSlice(gpa, "admin: 1\n");
+    for (0..1025) |_| try one_too_long.append(gpa, 'x');
+    try one_too_long.appendSlice(gpa, ": 2\n");
+    defer one_too_long.deinit(gpa);
+    try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_long.items));
+}
+
+// F5 (A1/yaml.md), mutation ID `W11_tab_indent`: nothing in the suite drove a
+// tab into a position where it would have to serve as indentation, so the
+// `rollIndent` guard below ("a tab is never indentation", YAML 1.2 §6.1) went
+// untested. The three forms come straight from that guard's own comment.
+test "a tab is never indentation, but it is still legal separation" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The second `-` is followed by `1`, not a blank/EOL, so it starts the
+    // plain scalar `-1` rather than a new block sequence -- the tab before it
+    // is pure separation and never has to indent anything.
+    try scanAll(arena, "-\t-1\n");
+    // The second `-` IS followed by a blank/EOL here, so it opens a nested
+    // block sequence one column in -- and the only thing that got it to that
+    // column is the tab. Rejected.
+    try testing.expectError(error.InvalidYaml, scanAll(arena, "-\t-\n"));
+    // Same rule through the explicit-key indicator: the tab is what would
+    // indent the nested mapping `key:` opens.
+    try testing.expectError(error.InvalidYaml, scanAll(arena, "?\tkey:\n"));
+}
