@@ -1318,3 +1318,236 @@ test "M4: generateKE3 rejects a non-canonical server_public_keyshare in a hostil
         generateKE3(login.state, .{}, v.context, ke2),
     );
 }
+
+// ── audit L4: an INDEPENDENT construction of the AKE preamble ────────────
+//
+// L4's finding: every one of the seven pieces `runKeySchedule` streams
+// into the transcript hash (context, client_identity, KE1,
+// server_identity, credential_response, server_nonce,
+// server_public_keyshare) is checked ONLY by the RFC KAT above -- a
+// mutation that drops or reorders any one of them is invisible to the
+// live end-to-end tests, because both the client and the server call
+// the SAME `runKeySchedule`, so a bug there is self-consistent (the
+// handshake still completes, just not to an RFC-conformant value).
+// RFC 9807 does not publish "preamble" as a named vector field (it is
+// never materialized as a discrete byte string, only streamed into a
+// hash), so closing this means literally re-deriving §6.3.3's formula
+// by hand from the RFC text and checking it against a value the RFC
+// DOES publish directly: `handshake_secret`.
+//
+// `independentHandshakeSecret` below shares NO code with
+// `runKeySchedule`/`deriveSecret`/`expandMulti`/`i2osp2` -- it is a
+// second, separately-written implementation of RFC 9807 §6.3.3's
+// `Preamble` and the `DeriveKeys`/`Derive-Secret` half of §6.4.2.2 that
+// produces `handshake_secret`, built directly from `std.crypto.hash.
+// sha2.Sha512` and `std.crypto.kdf.hkdf.HkdfSha512.extract`/`.expand`
+// (trusted primitives, not what is in dispute) with its own I2OSP-2 and
+// TLS-1.3-style CustomLabel encoding, copied from the RFC text quoted
+// in this test, not from `root.zig`'s own doc comments elsewhere.
+//
+// What IS reused, deliberately: `ikm = dh1 ++ dh2 ++ dh3` is computed
+// with the SAME private helpers (`recover`, `diffieHellman`,
+// `randomizedPassword`, `expandMulti` for `masking_key`) `generateKE3`
+// itself calls -- ristretto255 DH and envelope recovery are NOT what L4
+// disputes (they are covered elsewhere: C3/C4 in the audit, H2's
+// zeroization work), and reimplementing them independently here would
+// be exactly the "rushed, uncertain result" this pass was told to avoid.
+// `client_secret` and `ke1` come from a real `generateKE1` call (already
+// pinned byte-exact against `v.ke1` by the KAT test above), and
+// `credential_response`/`server_nonce`/`server_public_keyshare` are
+// sliced directly out of the RFC's own published `v.ke2` bytes -- this
+// test never calls `generateKE2` at all.
+fn independentHandshakeSecret(
+    ikm: []const u8,
+    context: []const u8,
+    client_identity: []const u8,
+    server_identity: []const u8,
+    ke1_bytes: []const u8,
+    credential_response_bytes: []const u8,
+    server_nonce: []const u8,
+    server_public_keyshare: []const u8,
+) [64]u8 {
+    // RFC 9807 §6.3.3, quoted:
+    //   preamble = concat("OPAQUEv1-",
+    //                      I2OSP(len(context), 2), context,
+    //                      I2OSP(len(client_identity), 2), client_identity,
+    //                      ke1,
+    //                      I2OSP(len(server_identity), 2), server_identity,
+    //                      credential_response,
+    //                      server_nonce,
+    //                      server_public_keyshare)
+    var h = std.crypto.hash.sha2.Sha512.init(.{});
+    h.update("OPAQUEv1-");
+    var len2: [2]u8 = undefined;
+    std.mem.writeInt(u16, &len2, @intCast(context.len), .big);
+    h.update(&len2);
+    h.update(context);
+    std.mem.writeInt(u16, &len2, @intCast(client_identity.len), .big);
+    h.update(&len2);
+    h.update(client_identity);
+    h.update(ke1_bytes);
+    std.mem.writeInt(u16, &len2, @intCast(server_identity.len), .big);
+    h.update(&len2);
+    h.update(server_identity);
+    h.update(credential_response_bytes);
+    h.update(server_nonce);
+    h.update(server_public_keyshare);
+    var preamble_hash: [64]u8 = undefined;
+    h.final(&preamble_hash);
+
+    // RFC 9807 §6.4.2.1, quoted:
+    //   Derive-Secret(Secret, Label, Transcript-Hash) =
+    //       Expand-Label(Secret, Label, Transcript-Hash, Nx)
+    //   CustomLabel = I2OSP(Nx, 2) ||
+    //                 I2OSP(len("OPAQUE-" || Label), 1) ||
+    //                 "OPAQUE-" || Label ||
+    //                 I2OSP(len(Context), 1) || Context
+    // and §6.4.2.2:
+    //   prk = Extract("", ikm)
+    //   handshake_secret = Derive-Secret(prk, "HandshakeSecret", Hash(preamble))
+    const prk = std.crypto.kdf.hkdf.HkdfSha512.extract("", ikm);
+    const full_label = "OPAQUE-HandshakeSecret";
+    var info: [2 + 1 + full_label.len + 1 + 64]u8 = undefined;
+    var w: usize = 0;
+    std.mem.writeInt(u16, info[w..][0..2], 64, .big);
+    w += 2;
+    info[w] = full_label.len;
+    w += 1;
+    @memcpy(info[w..][0..full_label.len], full_label);
+    w += full_label.len;
+    info[w] = preamble_hash.len;
+    w += 1;
+    @memcpy(info[w..][0..preamble_hash.len], &preamble_hash);
+    w += preamble_hash.len;
+
+    var out: [64]u8 = undefined;
+    std.crypto.kdf.hkdf.HkdfSha512.expand(&out, info[0..w], prk);
+    return out;
+}
+
+test "audit L4: an independent §6.3.3 preamble construction reproduces C.1.1/C.1.2's published handshake_secret" {
+    for ([_]kat_vectors.RealVector{ kat_vectors.real_1, kat_vectors.real_2 }) |v| {
+        // Real, RFC-pinned client ephemeral keyshare + KE1 -- reused, not
+        // reimplemented (already checked byte-exact against v.ke1 above).
+        const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+
+        // credential_response / server_nonce / server_public_keyshare come
+        // straight out of the RFC's OWN published KE2 bytes -- this test
+        // never calls generateKE2.
+        const ke2 = KE2.fromBytes(v.ke2);
+
+        // Reused (not the disputed logic): unmask + recover the envelope,
+        // exactly what `generateKE3` itself does, to get a real
+        // client_private_key for dh3.
+        var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message);
+        defer std.crypto.secureZero(u8, &rp);
+        var masking_key: [Nh]u8 = undefined;
+        defer std.crypto.secureZero(u8, &masking_key);
+        expandMulti(&masking_key, &rp, &.{"MaskingKey"});
+        var plaintext = credentialResponsePad(&masking_key, ke2.credential_response.masking_nonce);
+        for (&plaintext, ke2.credential_response.masked_response) |*b, m| b.* ^= m;
+        const server_public_key: [Npk]u8 = plaintext[0..Npk].*;
+        const envelope = Envelope.fromBytes(plaintext[Npk..].*);
+        const identities: Identities = .{ .client = v.client_identity, .server = v.server_identity };
+        var credentials = try recover(&rp, server_public_key, envelope, identities);
+        defer std.crypto.secureZero(u8, &credentials.client_private_key);
+
+        // ikm = dh1 ++ dh2 ++ dh3 -- the SAME three DH calls generateKE3
+        // makes. NOT the disputed logic (covered by C3/C4 elsewhere).
+        const dh1 = try diffieHellman(login.state.client_secret, ke2.auth_response.server_public_keyshare);
+        const dh2 = try diffieHellman(login.state.client_secret, server_public_key);
+        const dh3 = try diffieHellman(credentials.client_private_key, ke2.auth_response.server_public_keyshare);
+        var ikm = dh1 ++ dh2 ++ dh3;
+        defer std.crypto.secureZero(u8, &ikm);
+
+        const client_identity = v.client_identity orelse &credentials.client_public_key;
+        const server_identity = v.server_identity orelse &server_public_key;
+        const cr_bytes = ke2.credential_response.toBytes();
+
+        // THE independent part: my own Preamble + Derive-Secret, sharing
+        // no code with runKeySchedule/deriveSecret/expandMulti/i2osp2.
+        const got = independentHandshakeSecret(
+            &ikm,
+            v.context,
+            client_identity,
+            server_identity,
+            &v.ke1,
+            &cr_bytes,
+            &ke2.auth_response.server_nonce,
+            &ke2.auth_response.server_public_keyshare,
+        );
+        try std.testing.expectEqualSlices(u8, &v.handshake_secret, &got);
+    }
+}
+
+test "audit L4: the independent preamble construction is NOT a silent no-op -- dropping any one of the seven pieces changes handshake_secret" {
+    // A companion to the test above: proves `independentHandshakeSecret`
+    // itself has teeth (each of the seven concatenated pieces is
+    // load-bearing), the same way the campaign requires a positive
+    // control for every mutation-style claim. Without this, a version of
+    // `independentHandshakeSecret` that ignored `server_nonce` entirely
+    // could still pass the test above by coincidence... except it
+    // couldn't (SHA-512 is not that coincidental), which is exactly what
+    // this proves rather than assumes.
+    const v = kat_vectors.real_1;
+    const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
+    const ke2 = KE2.fromBytes(v.ke2);
+    var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message);
+    defer std.crypto.secureZero(u8, &rp);
+    var masking_key: [Nh]u8 = undefined;
+    defer std.crypto.secureZero(u8, &masking_key);
+    expandMulti(&masking_key, &rp, &.{"MaskingKey"});
+    var plaintext = credentialResponsePad(&masking_key, ke2.credential_response.masking_nonce);
+    for (&plaintext, ke2.credential_response.masked_response) |*b, m| b.* ^= m;
+    const server_public_key: [Npk]u8 = plaintext[0..Npk].*;
+    const envelope = Envelope.fromBytes(plaintext[Npk..].*);
+    var credentials = try recover(&rp, server_public_key, envelope, .{});
+    defer std.crypto.secureZero(u8, &credentials.client_private_key);
+    const dh1 = try diffieHellman(login.state.client_secret, ke2.auth_response.server_public_keyshare);
+    const dh2 = try diffieHellman(login.state.client_secret, server_public_key);
+    const dh3 = try diffieHellman(credentials.client_private_key, ke2.auth_response.server_public_keyshare);
+    var ikm = dh1 ++ dh2 ++ dh3;
+    defer std.crypto.secureZero(u8, &ikm);
+    const client_identity = v.client_identity orelse &credentials.client_public_key;
+    const server_identity = v.server_identity orelse &server_public_key;
+    const cr_bytes = ke2.credential_response.toBytes();
+
+    const baseline = independentHandshakeSecret(
+        &ikm,
+        v.context,
+        client_identity,
+        server_identity,
+        &v.ke1,
+        &cr_bytes,
+        &ke2.auth_response.server_nonce,
+        &ke2.auth_response.server_public_keyshare,
+    );
+    try std.testing.expectEqualSlices(u8, &v.handshake_secret, &baseline);
+
+    // Drop each of the seven pieces to empty in turn (context and the two
+    // identities are already variable-length; ke1/credential_response/
+    // server_nonce/server_public_keyshare are fixed-width in the real
+    // protocol, but this function takes plain slices, so an empty slice
+    // is a valid, distinguishing probe even though the real callers could
+    // never produce one).
+    const empty: []const u8 = &.{};
+    inline for (.{
+        "context",             "client_identity", "ke1",                    "server_identity",
+        "credential_response", "server_nonce",    "server_public_keyshare",
+    }) |which| {
+        const mutated = independentHandshakeSecret(
+            &ikm,
+            if (std.mem.eql(u8, which, "context")) empty else v.context,
+            if (std.mem.eql(u8, which, "client_identity")) empty else client_identity,
+            if (std.mem.eql(u8, which, "server_identity")) empty else server_identity,
+            if (std.mem.eql(u8, which, "ke1")) empty else &v.ke1,
+            if (std.mem.eql(u8, which, "credential_response")) empty else &cr_bytes,
+            if (std.mem.eql(u8, which, "server_nonce")) empty else &ke2.auth_response.server_nonce,
+            if (std.mem.eql(u8, which, "server_public_keyshare")) empty else &ke2.auth_response.server_public_keyshare,
+        );
+        if (std.mem.eql(u8, &mutated, &v.handshake_secret)) {
+            std.debug.print("dropping '{s}' did not change handshake_secret\n", .{which});
+            return error.PieceNotLoadBearing;
+        }
+    }
+}
