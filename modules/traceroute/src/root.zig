@@ -208,6 +208,18 @@ pub const max_probes_per_hop = 16;
 /// Upper bound on `Options.payload_size` (bytes after the 8-byte header).
 pub const max_payload = 1024;
 
+/// Upper bound on an `Options`'s worst-case wall-clock run time (probe count
+/// times `timeout_ms`; every probe timing out is the worst case). A1 F6/F8:
+/// `max_hops`, `probes_per_hop` and `timeout_ms` are each bounded on their
+/// own, but nothing bounded their PRODUCT — the worst individually-legal
+/// combination (255 hops x 16 probes x a u32-max timeout) is 4080 probes
+/// worth ~202,817 days, and those same 4080 probes at `max_payload` also put
+/// ~4.2 MB on the wire toward one address with no rate limit. 30 minutes is
+/// far past any legitimate interactive or scripted use of this module and
+/// comfortably clears realistic large scans (e.g. 64 hops x 5 probes x 3 s
+/// = 16 min); `Options.validate` rejects anything past it.
+pub const max_run_ms: u64 = 30 * 60 * 1000;
+
 pub const Options = struct {
     /// Highest TTL probed (inclusive). Bounded by the u8 TTL itself.
     max_hops: u8 = 30,
@@ -229,6 +241,11 @@ pub const Options = struct {
         if (o.probes_per_hop == 0 or o.probes_per_hop > max_probes_per_hop) return error.InvalidOptions;
         if (o.timeout_ms == 0) return error.InvalidOptions;
         if (o.payload_size > max_payload) return error.InvalidOptions;
+        // A1 F6/F8: bound the PRODUCT, not just each field — see max_run_ms.
+        const hop_count: u64 = @as(u64, o.max_hops - o.first_ttl) + 1;
+        const total_probes: u64 = hop_count * @as(u64, o.probes_per_hop);
+        const worst_case_ms: u64 = total_probes * @as(u64, o.timeout_ms);
+        if (worst_case_ms > max_run_ms) return error.InvalidOptions;
     }
 };
 
@@ -371,6 +388,29 @@ pub fn traceWith(
                         if (er.ident != opts.ident) continue :recv;
                         const j = slotOf(er.seq, opts.seq_base, total) orelse continue :recv;
                         const st = send_times[j] orelse continue :recv; // not sent yet: spoof
+                        // A1 F12: a slot that already has a real answer keeps
+                        // it — the first non-timeout write wins, not the
+                        // last. Otherwise a duplicate or spoofed packet for
+                        // an already-resolved slot silently overwrites its
+                        // address/RTT (and, for `.icmp_error` below, could
+                        // re-trigger `unreachable_code`/terminate the trace)
+                        // with no test able to see it happen.
+                        if (probes[j].kind != .timeout) continue :recv;
+                        // A1 F1: `reached` (and the address it records) is
+                        // documented as "the destination sent an Echo
+                        // Reply" — the only signal this engine has for that
+                        // claim is the reply's own source address, so
+                        // require it to match `dest` when the transport
+                        // reports one. Without this, a single Echo Reply
+                        // from ANY address carrying the right ident/seq set
+                        // `reached = true` and truncated the whole trace to
+                        // one hop attributed to the spoofer. Routers
+                        // answering Time Exceeded / Destination Unreachable
+                        // from their own address (below) are unaffected —
+                        // that is the whole point of path measurement.
+                        if (resp.from) |from| {
+                            if (!from.eql(dest)) continue :recv;
+                        }
                         probes[j] = .{
                             .kind = .reply,
                             .address = resp.from orelse dest,
@@ -383,6 +423,7 @@ pub fn traceWith(
                         if (ie.orig_ident != opts.ident) continue :recv;
                         const j = slotOf(ie.orig_seq, opts.seq_base, total) orelse continue :recv;
                         const st = send_times[j] orelse continue :recv;
+                        if (probes[j].kind != .timeout) continue :recv; // A1 F12, see above
                         switch (ie.kind) {
                             .time_exceeded => probes[j] = .{
                                 .kind = .time_exceeded,
@@ -566,13 +607,45 @@ pub const LinuxTransport = struct {
 
 pub const LiveTraceError = TraceError || LinuxTransport.OpenError;
 
+/// A1 F2: best-effort per-trace ident and starting sequence, drawn from
+/// `getrandom(2)` rather than the raw ICMP socket's PID-derived identifier
+/// (`icmp.Socket` stamps `.raw` sockets with `getpid() & 0xffff` — that
+/// value is never used by the kernel to demux a raw socket's traffic, it is
+/// purely this module's own correlation token, so this module is free to
+/// pick a better one) and the fixed `Options{}.seq_base = 1` default.
+/// Measured on this host: PID-derived idents differ from a neighboring
+/// process's by exactly 1 in ~99.8% of cases, and `seq` was always exactly
+/// 1, 2, 3, … — together a ~2-guess off-path correlation window. Raises the
+/// bar against a *blind* off-path spoofer to a full unknown 16+16 bits;
+/// does nothing against an on-path attacker who reads the real values off
+/// the wire (see SPEC.md "Threat model"). Same posture as the sibling
+/// `pathmtu.randomStartSeq` (CONVENTIONS.md §2.2): not a secret, so a
+/// syscall failure falls back to the old fixed values rather than aborting.
+fn randomIdentAndSeq() struct { ident: u16, seq_base: u16 } {
+    var buf: [4]u8 = undefined;
+    while (true) {
+        const rc = linux.getrandom(&buf, buf.len, 0);
+        const signed: isize = @bitCast(rc);
+        if (signed == buf.len) return .{
+            .ident = std.mem.readInt(u16, buf[0..2], .little),
+            .seq_base = std.mem.readInt(u16, buf[2..4], .little),
+        };
+        if (signed == -@as(isize, @intFromEnum(linux.E.INTR))) continue;
+        return .{ .ident = 0x7472, .seq_base = 1 }; // getrandom unavailable: old fixed values
+    }
+}
+
 /// Trace the path to `dest` over a fresh raw ICMP socket (CAP_NET_RAW).
-/// `opts.ident` is overwritten with the socket's identifier.
+/// `opts.ident` and `opts.seq_base` are overwritten with fresh random
+/// values for this trace (A1 F2) — the socket's own PID-derived identifier
+/// is never used for probes sent by this function.
 pub fn trace(gpa: std.mem.Allocator, dest: netaddr.Ip, opts: Options) LiveTraceError!Trace {
     var lt = try LinuxTransport.open(dest);
     defer lt.close();
     var o = opts;
-    o.ident = lt.ident();
+    const r = randomIdentAndSeq();
+    o.ident = r.ident;
+    o.seq_base = r.seq_base;
     return traceWith(gpa, lt.transport(), dest, o);
 }
 
@@ -1112,6 +1185,161 @@ test "first_ttl offsets the hop window" {
     try testing.expectEqual(@as(u8, 2), f.sent.items[0].ttl);
 }
 
+// ── A1 fix-campaign regression tests ────────────────────────────────────────
+
+test "F1: an echo reply spoofed from a foreign source address does not resolve the trace" {
+    // Before this fix, `traceWith` accepted an Echo Reply carrying the
+    // right ident+seq from ANY source address, not just `dest` -- a single
+    // off-path spoofed packet set `reached = true` and truncated the whole
+    // trace to one hop, attributed to the spoofer's own address.
+    var alien: [echo.echo_header_len]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &alien, 0x7472, 1); // default ident, seq_base 1 -> slot 0
+    alien[0] = echo.v4.echo_reply;
+    // `.garbage` behavior stamps `from = router_a` (NOT `test_dest`).
+    var f: FakeTransport = .{ .behaviors = &.{.{ .garbage = &alien }} };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .max_hops = 1, .timeout_ms = 50 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+}
+
+test "F1: a genuine echo reply from the destination itself still resolves the trace" {
+    // Positive control for the check above: nothing about the fix should
+    // reject the ordinary case.
+    var f: FakeTransport = .{ .behaviors = &.{.reply} };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .max_hops = 1 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(tr.reached);
+    try testing.expectEqual(Probe.Kind.reply, tr.hops[0].probes[0].kind);
+    try testing.expect(tr.hops[0].probes[0].address.?.eql(test_dest));
+}
+
+test "F5: a reply with the right ident but a not-yet-sent slot is rejected" {
+    // Isolates the `send_times[j] orelse continue` guard from the ident
+    // check next to it. The audit's original "foreign ident" test used a
+    // WRONG ident whose seq also happened to land on an unsent slot, so a
+    // mutation deleting the ident check alone still passed (caught by this
+    // other guard instead) -- it never actually exercised the ident branch
+    // in isolation. Here the ident is correct (default 0x7472) and only the
+    // slot is wrong: seq_base 1, probe_per_hop 1 means seq 2 is hop 2's
+    // slot, which has not been sent while hop 1 is still waiting.
+    // `.garbage` always stamps `from = router_a`, and the A1 F1 fix now
+    // requires an echo reply's source to match `dest` -- so `dest` is set
+    // to `router_a` here too, or F1's check would reject this packet on
+    // its own and this test would stop isolating anything.
+    var alien: [echo.echo_header_len]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &alien, 0x7472, 2); // right ident, hop 2's (unsent) slot
+    alien[0] = echo.v4.echo_reply;
+    var f: FakeTransport = .{ .behaviors = &.{ .{ .garbage = &alien }, .drop }, .dest = router_a };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .max_hops = 2, .timeout_ms = 50 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[1].probes[0].kind);
+}
+
+test "F5: a reply with a wrong ident for an already-sent slot is rejected" {
+    // Isolates the ident check from the "not sent yet" guard, the other
+    // direction: the slot IS already sent (so the unsent-slot guard would
+    // NOT reject it on its own), and only the ident is wrong.
+    // Same reason as the test above: `dest = router_a` so the A1 F1 source
+    // check does not independently reject this packet and mask what this
+    // test is actually meant to isolate.
+    var alien: [echo.echo_header_len]u8 = @splat(0);
+    try echo.writeEchoRequest(.v4, &alien, 0x1111, 1); // wrong ident, hop 1's already-sent slot
+    alien[0] = echo.v4.echo_reply;
+    var f: FakeTransport = .{ .behaviors = &.{.{ .garbage = &alien }}, .dest = router_a };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .max_hops = 1, .ident = 0x7472, .timeout_ms = 50 });
+    defer tr.deinit(testing.allocator);
+    try testing.expect(!tr.reached);
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[0].probes[0].kind);
+}
+
+test "F12: a slot that already has a real answer keeps it; a duplicate for it is ignored" {
+    // "Eviction": hop 1 is genuinely answered by router_a inside its own
+    // window. A duplicate/spoofed Time Exceeded for the SAME slot (hop 1's
+    // seq) then arrives during hop 2's window -- exactly how a legitimate
+    // LATE reply is meant to land (see "late reply is attributed to the
+    // probe that triggered it" above), except this one targets a slot that
+    // is already resolved. Before this fix the duplicate silently
+    // overwrote hop 1's address/RTT with no test able to see it happen.
+    // A well-formed ICMP Time Exceeded, quoting hop 1's probe (seq 1, NOT
+    // hop 2's seq 2) -- same wire shape as the "ICMP redirect" test above.
+    var dup: [8 + 20 + echo.echo_header_len]u8 = @splat(0);
+    dup[0] = echo.v4.time_exceeded;
+    dup[8] = 0x45; // quoted IPv4 header, ihl=5
+    const dup_orig = dup[8 + 20 ..];
+    dup_orig[0] = echo.v4.echo_request;
+    std.mem.writeInt(u16, dup_orig[4..6], 0x7472, .big); // default Options.ident
+    std.mem.writeInt(u16, dup_orig[6..8], 1, .big); // hop 1's slot
+    var f: FakeTransport = .{
+        .behaviors = &.{
+            .{ .time_exceeded = router_a }, // hop 1: genuine answer, resolved on time
+            .{ .garbage = &dup }, // hop 2: a duplicate answer for hop 1's slot arrives instead
+            .reply, // hop 3: destination, still reachable
+        },
+    };
+    defer f.deinit();
+    var tr = try runFake(&f, .{ .probes_per_hop = 1, .max_hops = 3, .timeout_ms = 500 });
+    defer tr.deinit(testing.allocator);
+
+    const hop1 = tr.hops[0].probes[0];
+    try testing.expectEqual(Probe.Kind.time_exceeded, hop1.kind);
+    try testing.expect(hop1.address.?.eql(router_a));
+    // The RTT recorded is hop 1's OWN round trip (1st send -> 1ms in
+    // FakeTransport's deterministic clock), not hop 2's (2nd send -> 2ms) --
+    // if the guard were missing, the duplicate delivered in hop 2's window
+    // would have overwritten it.
+    try testing.expectEqual(@as(u64, 1 * std.time.ns_per_ms), hop1.rtt_ns.?);
+    // Hop 2 itself never got a real answer for ITS OWN slot: the duplicate
+    // consumed its window without resolving it.
+    try testing.expectEqual(Probe.Kind.timeout, tr.hops[1].probes[0].kind);
+    try testing.expect(tr.reached);
+}
+
+test "F2: randomIdentAndSeq draws fresh values, not the old fixed ident/seq_base=1" {
+    var idents = std.AutoHashMap(u16, void).init(testing.allocator);
+    defer idents.deinit();
+    var seqs = std.AutoHashMap(u16, void).init(testing.allocator);
+    defer seqs.deinit();
+    for (0..64) |_| {
+        const r = randomIdentAndSeq();
+        try idents.put(r.ident, {});
+        try seqs.put(r.seq_base, {});
+    }
+    // 64 draws from a 65536-value space landing on < 32 distinct values in
+    // either column would be an astronomically unlikely coincidence if the
+    // draws were actually random; the old code returned exactly ONE value
+    // (the fixed 0x7472 ident / seq_base 1) every single time.
+    try testing.expect(idents.count() > 32);
+    try testing.expect(seqs.count() > 32);
+}
+
+test "F6/F8: a run whose worst-case wall time is absurd is rejected up front" {
+    // The audit's worst individually-legal case: 255 hops x 16 probes x a
+    // u32-max timeout ~ 202,817 days, and the same 4080 probes at
+    // max_payload also amplify ~4.2 MB onto one address with no rate limit.
+    try testing.expectError(error.InvalidOptions, (Options{
+        .max_hops = 255,
+        .first_ttl = 1,
+        .probes_per_hop = max_probes_per_hop,
+        .timeout_ms = std.math.maxInt(u32),
+    }).validate());
+    // A legitimately large but sane scan (64 hops x 5 probes x 3s = 16 min)
+    // is nowhere near the ceiling and still validates.
+    try (Options{
+        .max_hops = 64,
+        .probes_per_hop = 5,
+        .timeout_ms = 3000,
+    }).validate();
+    // The default Options{} (90s worst case) is nowhere near it either.
+    try (Options{}).validate();
+}
+
 // ── SendFailed/RecvFailed: the partial Trace survives a transport error ────
 
 test "a send failure after two good hops returns the partial Trace, not nothing" {
@@ -1348,4 +1576,154 @@ test "live: trace to 127.0.0.1 (skipped without CAP_NET_RAW)" {
     const p = tr.hops[0].probes[0];
     try testing.expectEqual(Probe.Kind.reply, p.kind);
     try testing.expect(p.address.?.eql(dest));
+}
+
+// ── A1 F9: fuzz — arbitrary ICMP bytes through the full hop state machine ──
+//
+// The audit found zero fuzz harnesses (`grep -c testing.fuzz` -> 0) and
+// wrote one externally (CONVENTIONS.md §9: an instrument parked outside its
+// module's gates is never built again by anything). Ported in here instead
+// of rebuilt: same `FuzzTransport` (hands the fuzzer's bytes back as if a
+// router had sent them, then goes silent; a length-prefix byte carves the
+// input into several packets so a run can model a flood, not just one
+// packet), same corpus, same anti-vacuity check.
+
+const FuzzTransport = struct {
+    input: []const u8,
+    off: usize = 0,
+    clock: u64 = 1_000_000,
+    strip: bool,
+
+    fn transport(s: *FuzzTransport) Transport {
+        return .{ .ctx = s, .strip_ip_header = s.strip, .sendFn = fuzzSend, .recvFn = fuzzRecv, .nowFn = fuzzNow };
+    }
+    fn fuzzNow(ctx: *anyopaque) u64 {
+        return @as(*FuzzTransport, @ptrCast(@alignCast(ctx))).clock;
+    }
+    fn fuzzSend(_: *anyopaque, _: u8, _: []const u8) TransportError!void {}
+    fn fuzzRecv(ctx: *anyopaque, buf: []u8, timeout_ns: u64) TransportError!?Packet {
+        const s: *FuzzTransport = @ptrCast(@alignCast(ctx));
+        if (s.off >= s.input.len) {
+            s.clock += timeout_ns;
+            return null;
+        }
+        const want: usize = s.input[s.off];
+        s.off += 1;
+        const n = @min(@min(want, s.input.len -| s.off), buf.len);
+        @memcpy(buf[0..n], s.input[s.off..][0..n]);
+        s.off += n;
+        s.clock += std.time.ns_per_ms;
+        return .{ .len = n, .from = ip4(198, 51, 100, 66) };
+    }
+};
+
+fn fuzzOneRun(input: []const u8) anyerror!void {
+    const gpa = testing.allocator;
+    for ([_]bool{ true, false }) |strip| {
+        for ([_]netaddr.Ip{ test_dest, netaddr.parseIp("2001:db8::99").? }) |d| {
+            var f: FuzzTransport = .{ .input = input, .strip = strip };
+            var tr = traceWith(gpa, f.transport(), d, .{
+                .max_hops = 6,
+                .probes_per_hop = 2,
+                .timeout_ms = 5,
+            }) catch |e| switch (e) {
+                error.OutOfMemory => return,
+                error.InvalidOptions => unreachable,
+            };
+            defer tr.deinit(gpa);
+            // Touch every derived value: stats() and distinctAddresses() both
+            // index fixed stack scratch off attacker-influenced probe counts.
+            var buf: [max_probes_per_hop]netaddr.Ip = undefined;
+            for (tr.hops) |h| {
+                const st = h.stats();
+                std.mem.doNotOptimizeAway(st.mean_ns);
+                std.mem.doNotOptimizeAway(st.jitter_ns);
+                std.mem.doNotOptimizeAway(h.distinctAddresses(&buf).len);
+                std.mem.doNotOptimizeAway(h.address());
+            }
+        }
+    }
+}
+
+/// Corpus encoding: `[len:1][len bytes of packet] ...` repeated. Smith.bytes
+/// only -- the one primitive that copies its input through verbatim both
+/// under `zig build fuzz` and off it; a weighted/range draw collapses to its
+/// lower bound outside `--fuzz` (the repository-wide `Smith` trap recorded
+/// in `feedback_my_own_lint_measured_a_smaller_world` / accesslog's notes),
+/// which would leave this harness half-dead.
+fn fuzzTraceroute(_: void, smith: *testing.Smith) anyerror!void {
+    var pool: [1024]u8 = undefined;
+    var n: usize = 0;
+    inline for (0..4) |_| {
+        var lb: [1]u8 = undefined;
+        smith.bytes(&lb);
+        const want = @min(@as(usize, lb[0]), pool.len - n - 1);
+        pool[n] = @intCast(want);
+        n += 1;
+        smith.bytes(pool[n..][0..want]);
+        n += want;
+    }
+    try fuzzOneRun(pool[0..n]);
+}
+
+fn fuzzSeedTimeExceeded() [1 + 56]u8 {
+    var b: [1 + 56]u8 = @splat(0);
+    b[0] = 56; // length prefix
+    const p = b[1..];
+    p[0] = 0x45; // outer IPv4, ihl 5
+    p[20] = 11; // ICMP time exceeded
+    p[28] = 0x45; // quoted IPv4 header, ihl 5
+    p[48] = 8; // quoted echo request
+    p[52] = 0x74;
+    p[53] = 0x72; // ident 0x7472
+    p[55] = 1; // seq 1
+    return b;
+}
+fn fuzzSeedEchoReply() [1 + 28]u8 {
+    var b: [1 + 28]u8 = @splat(0);
+    b[0] = 28;
+    const p = b[1..];
+    p[0] = 0x45;
+    p[20] = 0; // echo reply
+    p[24] = 0x74;
+    p[25] = 0x72;
+    p[27] = 1;
+    return b;
+}
+const fuzz_seed_te = fuzzSeedTimeExceeded();
+const fuzz_seed_er = fuzzSeedEchoReply();
+
+const fuzz_corpus = [_][]const u8{
+    "",
+    &.{0},
+    &.{ 3, 0xff, 0x00, 0x01 },
+    &fuzz_seed_te,
+    &fuzz_seed_er,
+    // an IHL that lies (0x4f = 60 bytes claimed) plus filler
+    &(.{ 200, 0x4f } ++ .{0xaa} ** 199),
+};
+
+test "fuzz: arbitrary ICMP bytes through the full hop state machine never panic" {
+    try testing.fuzz({}, fuzzTraceroute, .{ .corpus = &fuzz_corpus });
+}
+
+test "fuzz corpus really reaches the classifier (a green fuzz run is not vacuous)" {
+    // Drive the same seeds directly, bypassing Smith, and prove at least one
+    // of them resolves a hop -- otherwise the fuzz test above would be
+    // exercising nothing but the timeout path.
+    const gpa = testing.allocator;
+    var resolved: usize = 0;
+    for (fuzz_corpus) |c| {
+        var f: FuzzTransport = .{ .input = c, .strip = true };
+        var tr = try traceWith(gpa, f.transport(), test_dest, .{
+            .max_hops = 6,
+            .probes_per_hop = 2,
+            .timeout_ms = 5,
+        });
+        defer tr.deinit(gpa);
+        for (tr.hops) |h| for (h.probes) |p| {
+            if (p.kind != .timeout) resolved += 1;
+        };
+    }
+    try testing.expect(resolved > 0);
 }

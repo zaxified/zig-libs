@@ -5,6 +5,41 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, 6 of 12 open findings closed (3 more documented as
+  out-of-scope for this module; see SPEC.md "Threat model"):
+  - **F1 (HIGH)**: an Echo Reply now must carry the destination's own source address to
+    complete the trace (`reached = true`). Before this, a single spoofed Echo Reply from
+    ANY address with the right ident+seq truncated the whole trace to one hop attributed
+    to the spoofer.
+  - **F2 (HIGH)**: `trace()` now draws a fresh random ident and starting sequence per call
+    via `getrandom(2)`, instead of the raw socket's PID-derived identifier (measured:
+    ~99.8% of neighboring processes' idents differed by exactly 1) and the fixed
+    `seq_base = 1` default (always 1, 2, 3, …). Same posture as the sibling
+    `pathmtu.randomStartSeq` (CONVENTIONS.md §2.2): not a secret, so a `getrandom` failure
+    falls back to the old fixed values.
+  - **F5 (MED)**: two new regression tests isolate the "foreign ident" and "not yet sent
+    slot" correlation guards from each other — the previous test suite could not tell a
+    mutation that deleted either guard from a passing suite, because both existing tests
+    happened to be caught by the OTHER guard instead.
+  - **F6 + F8 (MED)**: `Options.validate()` now bounds the worst-case wall-clock time of an
+    entire run (`max_run_ms`, 30 minutes), not just each field (`max_hops`,
+    `probes_per_hop`, `timeout_ms`) individually — the worst individually-legal combination
+    was ~202,817 days and ~4.2 MB toward one address with no rate limit.
+  - **F9 (LOW)**: added a corpus-seeded `testing.fuzz` test over the full hop state machine
+    (previously zero fuzz harnesses existed for this module).
+  - **F12 (LOW)**: a probe slot that already has a real answer now keeps it — the first
+    non-timeout write wins, not the last. Before this, a duplicate or spoofed packet for an
+    already-resolved slot silently overwrote its recorded address and RTT.
+  - **Docs**: SPEC.md "Threat model" documents the destination-validation stance (F7 — no
+    validation, by design for a diagnostic tool; callers facing an untrusted destination
+    must apply their own `netaddr` checks) and cross-references the two findings whose root
+    cause is the sibling `icmp` module's shared parser (F3, F4/F10 — the quoted IP header
+    inside an ICMP error is parsed and discarded before this module ever sees it, and the
+    receive path never verifies the ICMP checksum). README.md gained the same
+    not-authenticated caveat SPEC.md already carried (F11).
+  - Still open: F3 (HIGH, quoted-header comparison — blocked on `icmp`), F4 (MED, receive
+    checksum — blocked on `icmp`), F10 (LOW, quoted-type / ICMPv6-collision acceptance —
+    blocked on `icmp`).
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/root.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../../../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

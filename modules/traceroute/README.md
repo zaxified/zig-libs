@@ -8,6 +8,13 @@ Unreachable terminates the trace with its code recorded. Responses are
 correlated to their probe via the echo ident + sequence quoted inside the
 ICMP error, so late answers still land in the right hop slot.
 
+**Responses are not authenticated.** ICMP has no such mechanism, so any host
+that can reach this process's socket and guess (or read off the wire) the
+probe's ident+sequence can attribute itself to a hop — this is path
+*measurement*, the same caveat every traceroute-family tool carries, not
+proof that a given router or the destination actually sits on the path. See
+SPEC.md "Threat model" for exactly what is and is not checked.
+
 - No pure-Zig traceroute engine exists.
 - **Platform:** linux — the live path is a raw ICMP socket (`icmp.Socket`,
   CAP_NET_RAW) with per-probe `IP_TTL` / `IPV6_UNICAST_HOPS`; the hop state

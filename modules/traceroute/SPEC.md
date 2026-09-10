@@ -67,9 +67,42 @@ successful return. See CHANGELOG.md.
 The live trace needs CAP_NET_RAW (raw ICMP socket). Responses are **not authenticated**: only
 ident/seq quoted in the ICMP error are checked, so a spoofed router response with the right ident/seq
 would be attributed to a hop (path measurement, not authentication); a response quoting a slot not
-yet sent is rejected as a spoof. Malformed/hostile ICMP bytes never panic — anything unrecognized is
-`.ignored` and the probe falls through to a clean timeout (`*`). Out of scope: parallel/all-hops-at-
-once probing, UDP/TCP trace methods, non-Linux live path, MTU/PMTU discovery.
+yet sent, or a slot that already has an answer, is rejected as a spoof/duplicate (A1 F5/F12 — first
+non-timeout write wins a slot, not last). An Echo Reply additionally must carry the destination's own
+source address to complete the trace (`reached = true`) — A1 F1: without that check, a single spoofed
+Echo Reply with the right ident/seq from ANY address truncated the whole trace to one hop attributed
+to the spoofer, which is a stronger claim than "path measurement" and is what the `reached` field's
+own doc comment promises. `trace()` draws a fresh random ident and starting sequence per call via
+`getrandom(2)` (A1 F2) rather than the raw socket's PID-derived identifier and the fixed default
+`seq_base = 1` — this raises the bar against a *blind off-path* spoofer to a full unknown 16+16 bits;
+it does nothing against an on-path attacker, who reads the real values off the wire. `Options.validate`
+also bounds the worst-case wall time of a whole run, not just each field individually (A1 F6/F8 —
+`max_run_ms`), since `max_hops`/`probes_per_hop`/`timeout_ms` each being individually bounded still
+let the worst legal combination run for ~202,817 days and put ~4.2 MB on the wire toward one address
+with no rate limit. Malformed/hostile ICMP bytes never panic — anything unrecognized is `.ignored` and
+the probe falls through to a clean timeout (`*`); a corpus-seeded `testing.fuzz` test exercises this
+directly (A1 F9).
+
+**No destination validation (A1 F7, by design, not by oversight).** `trace`/`traceWith` accept and
+probe whatever `netaddr.Ip` they are given — loopback, link-local (including the `169.254.169.254`
+cloud-metadata address), private, unspecified (`0.0.0.0`) and multicast/broadcast destinations are
+all accepted and probed. `netaddr` is a declared dependency and exports `isLoopback`,
+`isLinkLocalUnicast`, `isPrivate`, `isMulticast`, `isUnspecified`; this module calls none of them.
+For a diagnostic tool, tracing to a link-local next hop or a private-range destination is normal,
+legitimate use — the previous absence of a documented stance (not the absence of the checks
+themselves) was the actual gap. **A caller that exposes `trace`/`traceWith` to a destination chosen
+by an untrusted party (the SSRF-shaped case) must apply its own `netaddr`-predicate validation before
+calling in** — this module will not do it for them.
+
+**Not covered by the ident/seq/source hardening above: the quoted IP header inside an ICMP error is
+parsed, used to find the quoted echo header, and then discarded** (`icmp.echo.Reply.icmp_error` has
+no field for the quoted destination/source/protocol) — so this module cannot compare a Time
+Exceeded's or Destination Unreachable's citation against what it actually sent, only the quoted
+ident+seq. That gap, and the fact that this module's receive path never verifies the ICMP checksum
+(nor does the kernel, on a raw socket, before delivery), are `icmp` module findings
+(`icmp`'s F2/F7 — A1 audit) shared with `pathmtu` and `icmp`'s own `Pinger`; fixing them here would
+duplicate `icmp`'s internal header parsing rather than close the gap at its source. Out of scope:
+parallel/all-hops-at-once probing, UDP/TCP trace methods, non-Linux live path, MTU/PMTU discovery.
 
 ## Verification
 Offline-first: the hop state machine runs against a fake transport that builds canned RFC 792-shaped
