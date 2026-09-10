@@ -1267,6 +1267,46 @@ test "mirred pairs each direction with the verdict tc sends" {
     try testing.expectEqual(Verdict.pipe, MirredAction.ingress_mirror.defaultVerdict());
 }
 
+test "parseMirredOptions rejects a TCA_MIRRED_PARMS attribute shorter than tc_mirred_len (F3)" {
+    // Wave-3 audit's F3 named this bound as untested fault-injection surface.
+    // A too-short PARMS attribute here doesn't crash (the reads inside stay
+    // in-bounds for anything a couple of bytes short), it silently produces
+    // wrong `eaction`/`ifindex` fields — so crash-only fuzzing cannot see
+    // whether the guard actually rejects it. Pinned directly instead.
+    const gpa = testing.allocator;
+
+    var short_list: std.ArrayList(u8) = .empty;
+    defer short_list.deinit(gpa);
+    try codec.appendAttr(gpa, &short_list, TCA_MIRRED.PARMS, &([_]u8{0} ** (tc_mirred_len - 1)));
+    var a: Action = .{ .order = 1 };
+    try testing.expectError(error.BadLength, parseMirredOptions(&a, short_list.items));
+
+    // Positive control: exactly tc_mirred_len bytes must still parse.
+    var ok_list: std.ArrayList(u8) = .empty;
+    defer ok_list.deinit(gpa);
+    try codec.appendAttr(gpa, &ok_list, TCA_MIRRED.PARMS, &([_]u8{0} ** tc_mirred_len));
+    var a2: Action = .{ .order = 1 };
+    try parseMirredOptions(&a2, ok_list.items);
+}
+
+test "parsePoliceOptions rejects a TCA_POLICE_TBF attribute shorter than tc_police_len (F3)" {
+    // Same F3 gap, the police action's TBF parameter block.
+    const gpa = testing.allocator;
+
+    var short_list: std.ArrayList(u8) = .empty;
+    defer short_list.deinit(gpa);
+    try codec.appendAttr(gpa, &short_list, TCA_POLICE.TBF, &([_]u8{0} ** (tc_police_len - 1)));
+    var a: Action = .{ .order = 1 };
+    try testing.expectError(error.BadLength, parsePoliceOptions(&a, short_list.items));
+
+    // Positive control: exactly tc_police_len bytes must still parse.
+    var ok_list: std.ArrayList(u8) = .empty;
+    defer ok_list.deinit(gpa);
+    try codec.appendAttr(gpa, &ok_list, TCA_POLICE.TBF, &([_]u8{0} ** tc_police_len));
+    var a2: Action = .{ .order = 1 };
+    try parsePoliceOptions(&a2, ok_list.items);
+}
+
 test "action list ordinals are 1-based (the classic mistake)" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;
@@ -1317,6 +1357,40 @@ test "action list rejects more than TCA_ACT_MAX_PRIO entries" {
         appendActionList(gpa, &list, 7, many, ratespec.golden_psched),
     );
     try testing.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "a large-options action list hits the wire-length limit before max_actions (F9)" {
+    // Wave-3 audit's F9: `max_actions` (32, `error.TooManyActions`) reads as
+    // THE cap in SPEC.md's prose, but for an action kind with a large
+    // options block (`police`'s rate tables), the real binding constraint is
+    // `TCA_ACT_TAB`'s u16 nest length (64 KiB) — reached well below 32. This
+    // is already fail-closed (no malformed request is ever sent, just a
+    // different error than the one SPEC's prose implies), so nothing to fix
+    // in the guard itself; pinning the audit's own boundary (30 succeeds, 31
+    // fails on `OptionsTooLong`, never reaching `TooManyActions`) so this
+    // stays true if either constant moves.
+    // `peakrate` matters: it doubles the per-action rate-table payload (RTAB
+    // + CTAB, 1 KiB each), which is what pulls the wire limit below 32 in
+    // the first place — a `police` spec without it doesn't hit
+    // `OptionsTooLong` until `TooManyActions` (33) would fire anyway
+    // (checked while writing this test, not assumed).
+    const gpa = testing.allocator;
+    const spec: ActionSpec = .{ .police = .{ .rate = 125_000, .burst = 1024, .peakrate = 250_000, .mtu = 1500 } };
+
+    var thirty: [30]ActionSpec = undefined;
+    @memset(&thirty, spec);
+    var list30: std.ArrayList(u8) = .empty;
+    defer list30.deinit(gpa);
+    try appendActionList(gpa, &list30, 7, &thirty, ratespec.golden_psched);
+
+    var thirty_one: [31]ActionSpec = undefined;
+    @memset(&thirty_one, spec);
+    var list31: std.ArrayList(u8) = .empty;
+    defer list31.deinit(gpa);
+    try testing.expectError(
+        error.OptionsTooLong,
+        appendActionList(gpa, &list31, 7, &thirty_one, ratespec.golden_psched),
+    );
 }
 
 test "a cookie longer than TC_COOKIE_MAX_SIZE is rejected before any output" {

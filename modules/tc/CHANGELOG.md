@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking (mop-up pass):** three more `A1/tc.md`
+  findings closed (F3, F4, F9); F6/F10/F12
+  remain open (F10 deliberately, deferred to the campaign's perf pass; F12 needs a user
+  decision — see the file's "Dispozice 2026-09-10 (mop-up)").
+  - **F3:** four of the seven fault-injection points the audit named
+    (`filter.zig`'s `TCA_U32_SEL` length, `qdisc.zig`'s `TCA_HTB_PARMS` length,
+    `action.zig`'s `TCA_MIRRED_PARMS`/`TCA_POLICE_TBF` lengths) had zero coverage even after
+    the 2026-09-07 fuzz-harness fix made the corpus reach real payloads — "never crashes" and
+    "rejects a too-short attribute" are different claims, and three of these four turned out
+    to be reachable out-of-bounds READS once the corpus could reach them (confirmed by
+    disabling each guard: 3 of 4 crash the existing fuzz test outright, not just a new
+    assertion). Four new permanent boundary tests pin all four; the other three named points
+    (`copyKind`, the cookie `@min` clamp, the `keys_len` loop bound) were already either
+    pinned or safe by construction.
+  - **F4:** captured a real golden (`unshare -rn strace` against stock `iproute2-6.19.0`,
+    `tc class add … htb rate 20gbit ceil 20gbit`, 2.5e9 B/s — inside `[2^31, 2^32)`, the band
+    no existing golden covered) rather than fabricating bytes. `clampRate`'s
+    `rate >= (1 << 32)` threshold and the separate `RATE64`-attach condition are two
+    independent checks on the same constant; moving just the former to `(1 << 31)` (the
+    audit's own proposed mutant) now fails exactly this one new golden and no other.
+  - **F9:** `max_actions = 32` (`error.TooManyActions`) isn't always the real limit — a
+    `police` action with `peakrate` set (two 1 KiB rate tables) hits `TCA_ACT_TAB`'s u16
+    nest-length limit (`error.OptionsTooLong`) at 31 entries, before `max_actions` would ever
+    fire. Already fail-closed either way; pinned the exact boundary as a test and added one
+    clarifying sentence to `SPEC.md` — no change to the guard itself.
+  - Touches `modules/tc/src/{qdisc,filter,action,goldens}.zig` and `SPEC.md`. No public
+    signature changed.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `Socket.qdiscs`/`classes`/`filters`/`actions`
   could double-free their result buffer and crash the process after four consecutive
   `NLM_F_DUMP_INTR` replies from the kernel (concurrent `tc`/daemon churn on the same

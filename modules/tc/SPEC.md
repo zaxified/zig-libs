@@ -91,7 +91,13 @@ Numbering from 0 is the classic mistake: attribute type 0 is `TCA_ACT_UNSPEC` an
 kernel's `tcf_action_init` rejects it, so the list silently fails to install.
 `action.appendActionList` is the only place this module numbers entries, and the
 two-action goldens pin `1` and `2` on the wire. The cap is `TCA_ACT_MAX_PRIO` = 32
-(`error.TooManyActions` above it).
+(`error.TooManyActions` above it) — but for an action kind with a large options
+block (`police` with `peakrate` set carries two 1 KiB rate tables), the real
+binding constraint can be `TCA_ACT_TAB`'s u16 nest length (64 KiB) reached well
+below 32 entries, surfacing as `error.OptionsTooLong` instead (wave-3 audit F9;
+pinned as a test in `action.zig`, 30 such police actions succeed, 31 do not).
+Already fail-closed either way — no malformed request is ever sent — this is
+about which error a caller sees, not a gap.
 
 Two nesting details are deliberately asymmetric, both copied from iproute2 and both
 pinned by goldens:

@@ -1298,6 +1298,31 @@ test "appendHtbClassOptions rejects cell_log/ccell_log >= 32 instead of panickin
     try appendHtbClassOptions(.{ .rate = 125_000, .cell_log = 3 }, gpa, &list, ratespec.golden_psched);
 }
 
+test "parseHtbClassOptions rejects a TCA_HTB_PARMS attribute shorter than tc_htb_opt_len (F3)" {
+    // Wave-3 audit's F3: this bound (root.zig-era line "qdisc.zig:546") was
+    // named as untested fault-injection surface — the fuzz corpus that was
+    // fixed 2026-09-07 exercises this parser with real-shaped payloads, but
+    // "never crashes" is not the same claim as "rejects a truncated PARMS
+    // attribute" (a short attribute here doesn't panic, it silently reads
+    // fewer fields than the wire format promises — a correctness bug, not a
+    // memory-safety one, and crash-only fuzzing cannot see it). Pinned
+    // directly instead.
+    const gpa = testing.allocator;
+
+    var short_list: std.ArrayList(u8) = .empty;
+    defer short_list.deinit(gpa);
+    var short: [tc_htb_opt_len - 1]u8 = @splat(0);
+    try appendAttr(gpa, &short_list, TCA_HTB.PARMS, &short);
+    try testing.expectError(error.BadLength, parseHtbClassOptions(short_list.items));
+
+    // Positive control: exactly tc_htb_opt_len bytes must still parse.
+    var ok_list: std.ArrayList(u8) = .empty;
+    defer ok_list.deinit(gpa);
+    var ok: [tc_htb_opt_len]u8 = @splat(0);
+    try appendAttr(gpa, &ok_list, TCA_HTB.PARMS, &ok);
+    _ = try parseHtbClassOptions(ok_list.items);
+}
+
 test "encode/decode round-trip: htb class options" {
     const gpa = testing.allocator;
     var list: std.ArrayList(u8) = .empty;

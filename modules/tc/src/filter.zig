@@ -794,6 +794,28 @@ test "u32 rejects an oversized key list" {
     try testing.expectError(error.TooManyKeys, appendU32Options(.{ .keys = many }, gpa, &list, test_ps));
 }
 
+test "parseU32Options rejects a TCA_U32_SEL attribute shorter than tc_u32_sel_len (F3)" {
+    // Wave-3 audit's F3 named this bound as untested fault-injection surface.
+    // The 2026-09-07 fuzz-corpus fix already feeds `parseU32Options` a
+    // shorter-than-16-byte SEL (`u32_short` in the corpus below), which
+    // proves the parser doesn't CRASH on it — but a too-short SEL here reads
+    // `a.data[0]`/`a.data[2]` inside bounds and just silently produces a
+    // wrong `flags`/`nkeys`, so crash-only fuzzing cannot see whether the
+    // guard actually rejects it. Pinned directly instead.
+    const gpa = testing.allocator;
+
+    var short_list: std.ArrayList(u8) = .empty;
+    defer short_list.deinit(gpa);
+    try codec.appendAttr(gpa, &short_list, TCA_U32.SEL, &([_]u8{0} ** (tc_u32_sel_len - 1)));
+    try testing.expectError(error.BadLength, parseU32Options(short_list.items));
+
+    // Positive control: exactly tc_u32_sel_len bytes must still parse.
+    var ok_list: std.ArrayList(u8) = .empty;
+    defer ok_list.deinit(gpa);
+    try codec.appendAttr(gpa, &ok_list, TCA_U32.SEL, &([_]u8{0} ** tc_u32_sel_len));
+    _ = try parseU32Options(ok_list.items);
+}
+
 /// Classifier `TCA_OPTIONS` bodies and whole `RTM_NEWTFILTER` payloads for
 /// `fuzzParseFilter`, laid out the way its draws read them: a `testkit.fuzz`
 /// slice seed (u32 length + frame) and then an eight-octet little-endian word
