@@ -3014,26 +3014,34 @@ fn verifyLeafSignature(
     try leaf.verifySignature(S, gpa, group_id orelse "", leaf_index orelse 0);
 }
 
-/// RFC 9420 §12.4.3.1's first joiner bullet, BOTH halves: "Verify that the
-/// group's protocol version and cipher suite are ones this client
-/// supports". The cipher-suite half was always here; the version half was
-/// not, so a `GroupInfo` whose `GroupContext` declared some future version
-/// was joined and operated as MLS 1.0 — the decoder does not reject it
-/// either (`ProtocolVersion` is non-exhaustive on purpose: which versions
-/// are acceptable is a validation decision, and this is where it is made).
+/// RFC 9420 §12.4.3.1's cipher-suite bullet, verbatim: "Verify that the
+/// cipher_suite in the GroupInfo matches the cipher_suite in the
+/// KeyPackage." That bullet covers the suite half only; the version half
+/// is not in it — §12.4.3.1's tree-integrity checklist instead defers
+/// per-leaf validation to "For each non-empty leaf node, validate the
+/// LeafNode as described in Section 7.3", and version checking lives in
+/// that §7.3 LeafNode validation. The cipher-suite half was always here;
+/// the version half was not, so a `GroupInfo` whose `GroupContext`
+/// declared some future version was joined and operated as MLS 1.0 — the
+/// decoder does not reject it either (`ProtocolVersion` is non-exhaustive
+/// on purpose: which versions are acceptable is a validation decision,
+/// and this is where it is made).
 ///
 /// One function rather than two adjacent lines at each call site, because
-/// the two checks are one RFC bullet and the version half went missing
-/// exactly by being a line somebody had to remember to add next to the
-/// suite check.
+/// both checks are the same GroupInfo-vs-KeyPackage compatibility step
+/// even though the RFC states them in two different places, and the
+/// version half went missing exactly by being a line somebody had to
+/// remember to add next to the suite check.
 fn checkGroupInfoVersionAndSuite(comptime S: type, gc: keyschedule.GroupContext) !void {
     if (gc.version != .mls10) return error.UnsupportedProtocolVersion;
     if (gc.cipher_suite != S.id) return error.CipherSuiteMismatch;
 }
 
-/// RFC 9420 §12.4.3.1's third tree-integrity bullet: "Verify the signature
-/// on all the LeafNodes in the tree" — the one a joiner has to run over a
-/// ratchet tree it is HANDED, as opposed to one it built by processing
+/// RFC 9420 §12.4.3.1's tree-integrity checklist, third sub-bullet under
+/// "Verify the integrity of the ratchet tree": "For each non-empty leaf
+/// node, validate the LeafNode as described in Section 7.3" — the one a
+/// joiner has to run over a ratchet tree it is HANDED, as opposed to one
+/// it built by processing
 /// Adds/Updates/Commits one at a time (where `verifyLeafSignature` already
 /// runs on every leaf as it arrives).
 ///
