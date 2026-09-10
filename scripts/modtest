@@ -230,6 +230,15 @@ rc=$?
 if [[ -f "$log.swept" ]]; then
     wait "$watchdog" 2>/dev/null
 else
+    # ⛔ Kill the watchdog's CHILDREN first. `kill $watchdog` ends the subshell
+    # but not the `sleep` it is blocked in -- that sleep is reparented, stays in
+    # the cgroup, and the sweep below then reports it as a stray on EVERY run.
+    # A false alarm on every run is worse than no alarm: it teaches the reader
+    # to ignore the real one. (Reported by a fixer agent 2026-09-11 as
+    # "stray: sleep 930" on all eight of its lanes.)
+    kids=$(ps -o pid= --ppid "$watchdog" 2>/dev/null || true)
+    # shellcheck disable=SC2086
+    [[ -n "$kids" ]] && kill $kids 2>/dev/null
     kill "$watchdog" 2>/dev/null
     wait "$watchdog" 2>/dev/null
 fi
