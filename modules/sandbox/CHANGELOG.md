@@ -5,6 +5,51 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, two of the five remaining LOW findings
+  closed (zero consumers, confirmed against `build.zig`'s `example_apps`
+  table as well as `module-graph` — P1 applies without qualification).
+  Test-only; no observable behavior changed.
+
+  - **S16.** `installTsync`'s whole reason to exist — catching a POSITIVE
+    return from the `seccomp(2)` TSYNC syscall, which `linux.errno()`
+    decodes as `.SUCCESS` because it only recognizes values in `(-4096, 0)`
+    as errors — had no witness. Reproduced the trigger by probe first (a
+    sibling thread whose OWN filter chain has already diverged from the
+    caller's, by calling `install()` on itself before the main thread calls
+    `installTsync()`, made the raw syscall return that thread's tid — a
+    positive number `linux.errno()` reads as success). New test installs
+    exactly that scenario through the module's own public API and asserts
+    `installTsync` reports `error.ThreadSyncFailed` rather than success.
+    Measured: neutering the positive-tid check (`if (false) return
+    error.ThreadSyncFailed;`) makes the new test fail cleanly with
+    `error.PositiveTidReadAsSuccess`; reverted, clean tree green again.
+  - **S19.** The 255-syscall cap on `seccomp.build`/`buildWx`
+    (`TooManySyscalls` — a single JEQ's jump offset is a `u8`) had no test
+    at either boundary. New test: 256 syscalls refused on both `build` and
+    `buildWx`, 255 accepted as a positive control. Measured: neutering
+    either cap check does not merely leave the suite green — it turns up a
+    real crash, `integer does not fit in destination type` on `const m: u8
+    = @intCast(allowed.len)` a few lines below, one call deep into the very
+    test that exercises it. Reverted both; clean tree green (Debug and
+    ReleaseFast).
+
+  **Left open:** S11 (the default allow-list is missing syscalls a real
+  program commonly needs) stays open on purpose — R5 in `DECISIONS.md`
+  already settled this: widening what a sandbox permits by default is a
+  decision, not a hardening, so P1 does not reach it. S13 (root-gated tests
+  are inert without a privileged run) and S17 (the `prctl`/`seccomp(2)`
+  error path — `prctl` never fails in this suite, so the typed error branch
+  is an acknowledged equivalent mutant here) stay open for the same reasons
+  the 2026-09-07 disposition already gave; this session had no `sudo` to
+  add to S13's coverage either. S18 (`landlockAbiVersion`'s
+  `NotSupported`/`Disabled` branches) stays open: this kernel reports ABI 8
+  (Landlock present and working), so neither branch is reachable without a
+  pre-5.13 or Landlock-disabled kernel — genuinely out of reach in this
+  environment, not a gap in the test.
+
+  `scripts/modtest sandbox`: 29/31 (2 skipped, root-gated), Debug and
+  ReleaseFast.
+
 - **2026-09-07** — A1 security audit, the five HIGH findings fixed. **BREAKING:**
   `Landlock.init()` takes no argument and handles EVERY filesystem right the kernel's ABI
   knows (`access.all`, deny by default); the old `init(handled)` is `initHandling(mask)`.

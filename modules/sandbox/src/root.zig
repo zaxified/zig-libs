@@ -1116,6 +1116,24 @@ test "seccomp.build/buildWx refuse an errno of 0 or above 4095 (audit S9)" {
     testing.allocator.free(ok2);
 }
 
+test "seccomp.build/buildWx refuse more than 255 allowed syscalls (audit S19)" {
+    // A single JEQ's jump offset (`jt`) is a `u8`, so 256 compares cannot be
+    // encoded in the flat allow/deny shape `build` emits — `TooManySyscalls`
+    // exists for exactly this. No test constructed the boundary before.
+    // `linux.SYS` has far fewer than 256 distinct members below one screen's
+    // worth of the enum, so the same syscall repeated is fine here — `build`
+    // only ever reads `allowed.len`.
+    var many: [256]linux.SYS = @splat(.getpid);
+    try testing.expectError(error.TooManySyscalls, seccomp.build(testing.allocator, &many, .kill_process));
+    try testing.expectError(error.TooManySyscalls, seccomp.buildWx(testing.allocator, &many, .kill_process, .kill_process));
+
+    // Positive control: exactly 255 is the documented limit, not off by one.
+    const ok = try seccomp.build(testing.allocator, many[0..255], .kill_process);
+    testing.allocator.free(ok);
+    const okwx = try seccomp.buildWx(testing.allocator, many[0..255], .kill_process, .kill_process);
+    testing.allocator.free(okwx);
+}
+
 test "seccomp.buildWx structure: arch guard with its jump targets, one 9-instruction block per guarded syscall, then the plain chain (audit S3)" {
     // `buildWx` had no structural test at all — its arch guard could be
     // deleted outright (91 -> 88 instructions) or weakened (`jf` 0 -> 1) with
@@ -1540,6 +1558,74 @@ test "seccomp(2)+TSYNC: filter installed on main thread also kills a pre-existin
     const res = try runInChild(childTsyncPropagation);
     if (res.exitedWith(120)) return error.SkipZigTest; // couldn't even spawn a thread here — not the module's code
     try testing.expect(res.killedBy(.SYS)); // TSYNC propagated: whole process died (102/103/55 are failures)
+}
+
+// Audit S16: `ThreadSyncFailed`'s whole reason to exist — a POSITIVE return
+// from the TSYNC syscall, which `linux.errno()` decodes as `.SUCCESS` because
+// it only recognizes values in `(-4096, 0)` as errors — had no witness.
+// Reproduced 2026-09-10 by probe (`.zig-cache/probe/tsync_probe2.zig`, since
+// discarded): TSYNC fails for a sibling thread whose OWN filter chain has
+// already diverged from the caller's — concretely, a worker that installed
+// its own single-thread filter via `install()` BEFORE the main thread calls
+// `installTsync()`. Measured raw: `seccomp(TSYNC)` returned the worker's tid
+// (236337 in that run) and `linux.errno()` on it read `.SUCCESS`.
+var g_tsync_collision_worker_prog: []const SockFilter = &.{};
+var g_tsync_collision_main_prog: []const SockFilter = &.{};
+
+fn tsyncCollisionWorker(ready: *std.atomic.Value(bool), release: *std.atomic.Value(bool)) void {
+    noNewPrivs() catch linux.exit(101);
+    // The worker's OWN single-thread install — NOT through TSYNC. This is
+    // what makes its filter chain diverge from the main thread's.
+    seccomp.install(g_tsync_collision_worker_prog) catch linux.exit(102);
+    ready.store(true, .release);
+    while (!release.load(.acquire)) {
+        var ts = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+}
+
+fn childTsyncCollision() void {
+    armWatchdog(5);
+    var ready = std.atomic.Value(bool).init(false);
+    var release = std.atomic.Value(bool).init(false);
+    const worker = std.Thread.spawn(.{}, tsyncCollisionWorker, .{ &ready, &release }) catch linux.exit(120);
+
+    while (!ready.load(.acquire)) {
+        var ts = linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = linux.nanosleep(&ts, null);
+    }
+
+    noNewPrivs() catch linux.exit(101);
+    const result = seccomp.installTsync(g_tsync_collision_main_prog);
+    release.store(true, .release);
+    worker.join();
+
+    if (result) |_| {
+        // The bug this test exists to catch: a positive-tid return silently
+        // read as success.
+        linux.exit(200);
+    } else |e| switch (e) {
+        error.ThreadSyncFailed => linux.exit(0), // correctly detected
+        error.SeccompFailed => linux.exit(201),
+    }
+}
+
+test "seccomp(2)+TSYNC: a sibling thread with its own prior, different filter is reported as ThreadSyncFailed, not silently as success (audit S16)" {
+    try requireSeccompFilter();
+    // Both need futex + munmap + nanosleep to keep `std.Thread.spawn`/`.join`
+    // itself working once a filter is live on that thread — same reasoning as
+    // `tsync_prop_allowed` above. Byte-identical program CONTENT is fine: two
+    // SEPARATE `install()` calls still diverge as kernel objects, which is
+    // the actual condition TSYNC's sync check is sensitive to, not content.
+    g_tsync_collision_worker_prog = try seccomp.build(testing.allocator, &tsync_prop_allowed, .kill_process);
+    defer testing.allocator.free(g_tsync_collision_worker_prog);
+    g_tsync_collision_main_prog = try seccomp.build(testing.allocator, &tsync_prop_allowed, .kill_process);
+    defer testing.allocator.free(g_tsync_collision_main_prog);
+
+    const res = try runInChild(childTsyncCollision);
+    if (res.exitedWith(120)) return error.SkipZigTest; // couldn't spawn a thread here
+    if (res.exitedWith(200)) return error.PositiveTidReadAsSuccess;
+    try testing.expect(res.exitedWith(0));
 }
 
 // ── real: landlock (fork children) ───────────────────────────────────────────
