@@ -5,6 +5,60 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 audit fix campaign (`staticfiles` has zero in-repo consumers, so input
+  hardening/tightening needed no sign-off; see `DECISIONS.md` P1). Three HIGH findings, all
+  containment/memory-safety, plus follow-on MED/LOW test and doc gaps:
+  - **F1 (HIGH):** `follow_symlinks = true` verified containment (`verifyContained`) only on
+    the single-leaf-file open path — never on index lookup or directory listing. A directory
+    component that was itself a symlink out of root, or a directory's own `index.html` being
+    a symlink out, or a directory listing of a symlinked-out target, all served 200 with
+    out-of-root content. `openIndex` now takes the scan root and runs the same containment
+    check; `openDirWithinRoot` (the listing path) runs an equivalent check
+    (`verifyContainedDir`) on the directory it is about to list. Default (`follow_symlinks =
+    false`) was never affected.
+  - **F2 (HIGH):** `Opened.mime_name` was a slice into `resolveFile`'s local scratch buffer —
+    dangling the instant `resolveFile` returned, so `Content-Type` could be computed from
+    freed stack (README's own documented `sendFile`-after-`resolveFile` pattern hit this
+    directly). `Opened` now owns its name in a fixed `mime_name_buf` field, read via
+    `mimeName()`.
+  - **F3 (HIGH):** the public `openWithinRoot` ("layer 2") did not itself reject `..` —
+    `openat(dirfd, "..")` is a legal syscall that neither `O_NOFOLLOW` nor `resolve_beneath`
+    stops, and `Dir.OpenOptions` (unlike `OpenFileOptions`) has no `resolve_beneath` field at
+    all. A caller reaching this `pub` function with an unsanitized path (exactly what it is
+    documented to accept as an independent second layer) walked straight out of root. It now
+    rejects `..` itself, independent of `sanitizePath`.
+  - **F4/F7/F9/F12 (MED):** added the missing test coverage the audit's mutation runner
+    found: a symlinked directory component under default options, `verifyContained`'s two
+    clauses (sibling-prefix guard and full-length prefix, tested independently), `..` with
+    `serve_dotfiles = true`, and dotfile entries in a directory listing.
+  - **F16 (LOW):** a symlinked directory component under default (no-follow) options answered
+    404, while a symlinked leaf file correctly answered the documented 403 — `openDir`'s own
+    error didn't reliably say "refused because it's a symlink" the way `openFile`'s
+    `SymLinkLoop` does. Both walk sites now fall back to a no-follow `statFile` on the failed
+    component to tell the two apart.
+  - **F14 (LOW):** SPEC.md claimed the per-request ETag/Last-Modified scratch lives in
+    threadlocal storage the response writer borrows without copying. Backwards on both counts
+    — they are plain locals, and `setHeader` copies. Corrected to match `root.zig`'s own
+    "Locals, not thread-locals" comment, which was already right.
+  - **F15 (LOW):** a test iterated three request paths but only asserted anything for one of
+    them, and its comment claimed a 404 the code never sends for the other two (it's 403).
+    Fixed both.
+  - **F18 (LOW):** added `X-Content-Type-Options: nosniff` (best-effort) on every
+    representation response, alongside the existing not-best-effort `Content-Type` guard.
+    SPEC.md now also records that the module does not offer a way to force a download
+    (`Content-Disposition`) — a deliberate Go/nginx-style trade-off, not an oversight.
+  - **F10 refuted:** already fixed 2026-09-07 (commit `9d96e069`, unrelated session) —
+    `fuzzSanitizePath` now draws length and bytes as one `smith.slice` call instead of length
+    then bytes, so a corpus replay no longer collapses to a zero-length input every time.
+  - Left open for the user (policy/API-shape decisions, not input hardening — see
+    `~/CML/20260901-zig-libs-audit/A1/staticfiles.md` §"Dispozice 2026-09-10"): F5 (ETag
+    strong vs. weak), F6 (gzip × 206 × ETag, spans `http` too), F13 (`NameTooLong` → 404 vs.
+    414), F17 (redirect bare directory requests to the trailing-slash form). Deferred as
+    excessive engineering risk for this pass: F8 (a FIFO fixture risks the same indefinite
+    hang the audit itself avoided), F11 (the directory-listing path re-walks from root a
+    second time; fixing it means threading an already-open `Dir` through the `IsDir` error
+    path, a real internal-API change).
+
 - **2026-09-07** — Test-only, no production change: `fuzzSanitizePath`'s own comment said
   "Length drawn BEFORE the bytes it bounds: every mutated byte the fuzzer spends then lands
   inside the slice", and that was not true when it was written. A ranged `Smith` draw

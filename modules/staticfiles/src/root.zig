@@ -318,14 +318,38 @@ pub const ResolveError = error{
     IoError,
 };
 
+/// Largest leaf/index name `Opened.mimeName()` will hold in full. Filesystem
+/// leaf names fit `NAME_MAX` (255 on Linux); a longer `Options.index` is a
+/// caller misconfiguration, truncated defensively rather than overflowed.
+pub const mime_name_max: usize = 255;
+
 /// An opened regular file within the root, plus the metadata a response needs.
 /// The caller owns `file` and must `close` it.
 pub const Opened = struct {
     file: File,
     stat: File.Stat,
-    /// The leaf name whose extension selects the `Content-Type` (the index
-    /// file name when a directory resolved to its index).
-    mime_name: []const u8,
+    /// Backing storage for `mimeName()` — NOT the leaf name's slice
+    /// borrowed from a caller's scratch buffer. (A1 F2: the previous
+    /// `mime_name: []const u8` field aliased a `resolveFile`-local `buf`,
+    /// so it dangled the moment `resolveFile` returned — a read of freed
+    /// stack after any intervening call. Copying the bytes into the struct
+    /// itself, and computing the slice fresh from `self` on every read,
+    /// means `mimeName()` is safe no matter where `Opened` has moved to.)
+    mime_name_buf: [mime_name_max]u8 = undefined,
+    mime_name_len: u8 = 0,
+
+    fn setMimeName(o: *Opened, name: []const u8) void {
+        const n = @min(name.len, mime_name_max);
+        @memcpy(o.mime_name_buf[0..n], name[0..n]);
+        o.mime_name_len = @intCast(n);
+    }
+
+    /// The name whose extension selects `Content-Type` (the index file name
+    /// when a directory resolved to its index). Safe to call any time after
+    /// `resolveFile`/`openWithinRoot` returns.
+    pub fn mimeName(o: *const Opened) []const u8 {
+        return o.mime_name_buf[0..o.mime_name_len];
+    }
 
     pub fn close(o: *Opened, io: Io) void {
         o.file.close(io);
@@ -343,7 +367,7 @@ pub const Opened = struct {
 pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) ResolveError!Opened {
     const follow = opts.follow_symlinks;
 
-    if (rel.len == 0) return openIndex(root, io, opts);
+    if (rel.len == 0) return openIndex(root, root, io, opts);
 
     // Walk every parent component as a directory, relative to the previous
     // handle; keep only the deepest (closing the rest). `root` is never closed.
@@ -358,15 +382,37 @@ pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) Resolve
     if (dir_part.len != 0) {
         var it = mem.splitScalar(u8, dir_part, '/');
         while (it.next()) |seg| {
+            // Layer-2 hardening (A1 F3): reject `..` here too, independent
+            // of `sanitizePath`. `openat(dirfd, "..")` is a legal syscall
+            // that neither `O_NOFOLLOW` nor `resolve_beneath` stops (it is
+            // not a symlink), and `Dir.OpenOptions` — unlike
+            // `OpenFileOptions` — has no `resolve_beneath` field at all. So
+            // a caller who reaches this `pub` function with an unsanitized
+            // `rel` walks straight out of root, one `..` at a time, with
+            // nothing here to stop it.
+            if (mem.eql(u8, seg, "..")) return error.Forbidden;
             const next = parent.openDir(io, seg, .{
                 .follow_symlinks = follow,
                 .access_sub_paths = true,
-            }) catch |e| return mapOpenError(e);
+            }) catch |e| {
+                // A1 F16: a symlinked DIRECTORY component under no-follow
+                // came back 404, while a symlinked LEAF file came back the
+                // documented 403 — `openDir`'s own error alone doesn't
+                // reliably say "refused because it's a symlink" the way
+                // `openFile`'s `error.SymLinkLoop` does. Ask directly with a
+                // no-follow stat (cheap, and only on this already-slow error
+                // path) so both shapes answer the same way.
+                if (!follow and isSymlinkComponent(parent, io, seg)) return error.Forbidden;
+                return mapOpenError(e);
+            };
             if (parent_owned) parent.close(io);
             parent = next;
             parent_owned = true;
         }
     }
+
+    // Same hardening for the leaf itself (`rel == ".."` with no slash).
+    if (mem.eql(u8, leaf, "..")) return error.Forbidden;
 
     // The leaf: try it as a regular file first. `allow_directory = false` turns
     // a directory target into `error.IsDir` (cheaply on Windows, one fstat
@@ -383,7 +429,7 @@ pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) Resolve
                 .access_sub_paths = true,
             }) catch |de| return mapOpenError(de);
             defer d.close(io);
-            return openIndex(d, io, opts);
+            return openIndex(d, root, io, opts);
         },
         else => return mapOpenError(e),
     };
@@ -402,12 +448,17 @@ pub fn openWithinRoot(root: Dir, io: Io, rel: []const u8, opts: Options) Resolve
         f.close(io);
         return error.Forbidden;
     };
-    return .{ .file = f, .stat = st, .mime_name = leaf };
+    var o: Opened = .{ .file = f, .stat = st };
+    o.setMimeName(leaf);
+    return o;
 }
 
 /// Open `dir`'s configured index file as a regular file, or `error.IsDir` when
 /// there is no index (index disabled, missing, or itself a directory).
-fn openIndex(dir: Dir, io: Io, opts: Options) ResolveError!Opened {
+/// `root` is the scan root (distinct from `dir` whenever the caller already
+/// descended into a subdirectory) — needed to verify containment when
+/// `opts.follow_symlinks` is on (A1 F1).
+fn openIndex(dir: Dir, root: Dir, io: Io, opts: Options) ResolveError!Opened {
     if (opts.index.len == 0) return error.IsDir;
     var f = dir.openFile(io, opts.index, .{
         .follow_symlinks = opts.follow_symlinks,
@@ -425,7 +476,20 @@ fn openIndex(dir: Dir, io: Io, opts: Options) ResolveError!Opened {
         f.close(io);
         return error.IsDir;
     }
-    return .{ .file = f, .stat = st, .mime_name = opts.index };
+    // A1 F1: the walk to `dir` may have crossed a symlinked component (or
+    // `dir` itself may be `root` with a symlinked `index.html`) when
+    // `follow_symlinks` is on, so this open can succeed on a file OUTSIDE
+    // `root` even though every individual `openDir`/`openFile` call along
+    // the way "succeeded". Verify containment exactly like the single-leaf-
+    // file path (`openWithinRoot` above) already does — this call was the
+    // gap: index lookups never ran it at all.
+    if (opts.follow_symlinks) verifyContained(root, io, &f) catch {
+        f.close(io);
+        return error.Forbidden;
+    };
+    var o: Opened = .{ .file = f, .stat = st };
+    o.setMimeName(opts.index);
+    return o;
 }
 
 /// Backstop for `follow_symlinks = true`: confirm the opened file's real path
@@ -444,6 +508,32 @@ fn verifyContained(root: Dir, io: Io, f: *File) error{Escaped}!void {
     // byte after the root prefix must be a separator (or the paths are equal).
     if (file_path.len > root_path.len and file_path[root_path.len] != '/')
         return error.Escaped;
+}
+
+/// Like `verifyContained`, but for a directory handle — used by the
+/// directory-listing path (A1 F1's 4th shape), which has no single opened
+/// file to check.
+fn verifyContainedDir(root: Dir, io: Io, d: Dir) error{Escaped}!void {
+    var root_buf: [Dir.max_path_bytes]u8 = undefined;
+    var dir_buf: [Dir.max_path_bytes]u8 = undefined;
+    const root_n = root.realPath(io, &root_buf) catch return error.Escaped;
+    const dir_n = d.realPath(io, &dir_buf) catch return error.Escaped;
+    const root_path = root_buf[0..root_n];
+    const dir_path = dir_buf[0..dir_n];
+    if (!mem.startsWith(u8, dir_path, root_path)) return error.Escaped;
+    if (dir_path.len > root_path.len and dir_path[root_path.len] != '/')
+        return error.Escaped;
+}
+
+/// Best-effort: is `seg` (a single path component under `parent`) a
+/// symlink? Used only on an already-failed `openDir`'s error path (A1 F16)
+/// to tell "refused because it's a symlink" apart from "doesn't exist" —
+/// `statFile` with `follow_symlinks = false` is a single stat-family call,
+/// never blocks (unlike opening e.g. a FIFO would), and any failure here
+/// just falls back to the original error mapping.
+fn isSymlinkComponent(parent: Dir, io: Io, seg: []const u8) bool {
+    const st = parent.statFile(io, seg, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .sym_link;
 }
 
 fn mapOpenError(e: anyerror) ResolveError {
@@ -582,12 +672,19 @@ pub const Handler = struct {
         }
 
         // NOT best-effort: a body served without `Content-Type` is sniffed.
-        rw.setHeader("Content-Type", mimeType(opened.mime_name, h.options.mime_overrides, h.options.default_mime)) catch
+        rw.setHeader("Content-Type", mimeType(opened.mimeName(), h.options.mime_overrides, h.options.default_mime)) catch
             return failUnsafeResponse(rw);
         // Best-effort, deliberately: `Accept-Ranges` only advertises that
         // range requests are supported. Losing it costs resumable downloads,
         // not correctness.
         rw.setHeader("Accept-Ranges", "bytes") catch {};
+        // Best-effort, deliberately (A1 F18): `Content-Type` above is
+        // already the strong guard against MIME-sniffing (`failUnsafeResponse`
+        // escalates rather than serve without it); `nosniff` is defense in
+        // depth against browsers that second-guess a correct `Content-Type`
+        // anyway. Losing this one header on budget exhaustion is not worth
+        // a 500 — the primary guard already held.
+        rw.setHeader("X-Content-Type-Options", "nosniff") catch {};
 
         // Range resolution (RFC 7233): single range → 206 + Content-Range,
         // unsatisfiable → 416, multi-range → fall back to a full 200.
@@ -681,10 +778,24 @@ pub const Handler = struct {
                 .follow_symlinks = h.options.follow_symlinks,
                 .access_sub_paths = true,
                 .iterate = true,
-            }) catch |e| return mapOpenError(e);
+            }) catch |e| {
+                // A1 F16, same shape as `openWithinRoot`'s walk.
+                if (!h.options.follow_symlinks and isSymlinkComponent(parent, h.io, seg))
+                    return error.Forbidden;
+                return mapOpenError(e);
+            };
             if (owned) parent.close(h.io);
             parent = next;
             owned = true;
+        }
+        // A1 F1 (directory-listing shape): the walk above may have crossed
+        // a symlinked component when `follow_symlinks` is on, landing
+        // `parent` outside `root` even though every `openDir` call
+        // individually "succeeded". Verify containment before handing back
+        // a directory this handler is about to list. `errdefer` above
+        // closes `parent` on this error return.
+        if (h.options.follow_symlinks and owned) {
+            verifyContainedDir(h.root, h.io, parent) catch return error.Forbidden;
         }
         return .{ .dir = parent, .owned = owned };
     }
@@ -863,6 +974,19 @@ test "sanitizePath: traversal + injection vectors all rejected" {
     try testing.expectEqualStrings("..../x", try sanitizePath("/....//x", &buf, .{ .allow_dotfiles = true }));
     // Dotfiles allowed when opted in.
     try testing.expectEqualStrings(".env", try sanitizePath("/.env", &buf, .{ .allow_dotfiles = true }));
+
+    // A1 F9: every traversal vector above was only ever tried with default
+    // options. `serve_dotfiles = true` is a documented, real `Options`
+    // setting — the `..` rejection must hold under it too, not just when
+    // dotfiles are refused. (A weakened guard that only special-cased the
+    // default-options path would sail through the block above and only
+    // show up here.)
+    for (bad) |c| {
+        if (c.err != error.Traversal) continue;
+        try testing.expectError(error.Traversal, sanitizePath(c.raw, &buf, .{ .allow_dotfiles = true }));
+    }
+    try testing.expectError(error.Traversal, sanitizePath("/../secret.txt", &buf, .{ .allow_dotfiles = true }));
+    try testing.expectError(error.Traversal, sanitizePath("/a/../../b", &buf, .{ .allow_dotfiles = true }));
 }
 
 test "sanitizePath: absolute-looking input cannot escape" {
@@ -1035,6 +1159,29 @@ const Fixture = struct {
         // A symlink inside root pointing to another file INSIDE root — safe
         // under `follow_symlinks = true` (unlike `escape` above).
         root.symLink(io, "hello.txt", "inside_link", .{}) catch {};
+
+        // A1 F1/F4 fixtures: symlinked DIRECTORY components (not just leaf
+        // files), so `follow_symlinks` containment can be exercised on the
+        // index and directory-listing routes, not only the single-file one.
+        var outside = try tmp.dir.createDirPathOpen(io, "outside", .{});
+        defer outside.close(io);
+        try outside.writeFile(io, .{ .sub_path = "index.html", .data = "OUTSIDE-INDEX-LEAK" });
+        try outside.writeFile(io, .{ .sub_path = "loot.txt", .data = "LOOT-LEAK" });
+        var outside_nofile = try tmp.dir.createDirPathOpen(io, "outside_nofile", .{ .open_options = .{ .iterate = true } });
+        defer outside_nofile.close(io);
+        try outside_nofile.writeFile(io, .{ .sub_path = "marker.txt", .data = "LISTING-LEAK" });
+        // A directory COMPONENT that is a symlink out of root, to a
+        // directory that has both an index and a plain file.
+        root.symLink(io, "../outside", "linkdir", .{}) catch {};
+        // Same, but the target has no index — the directory-LISTING leak
+        // shape (F1's 4th case), reachable only with `directory_listing`.
+        root.symLink(io, "../outside_nofile", "linklist", .{}) catch {};
+        // A directory genuinely INSIDE root whose own index.html is a
+        // symlink pointing out — the "index that escapes" shape, distinct
+        // from a symlinked directory component.
+        _ = try root.createDirPathOpen(io, "symidx", .{});
+        root.symLink(io, "../../secret.txt", "symidx/index.html", .{}) catch {};
+
         return .{ .tmp = tmp, .root = root };
     }
 
@@ -1346,6 +1493,9 @@ test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {
     try testing.expect(mem.indexOf(u8, resp, "ETag: \"") != null);
     try testing.expect(mem.indexOf(u8, resp, "Last-Modified: ") != null);
     try testing.expect(mem.indexOf(u8, resp, "Accept-Ranges: bytes\r\n") != null);
+    // A1 F18: nosniff alongside the correct Content-Type — defense in
+    // depth, not a substitute for it.
+    try testing.expect(mem.indexOf(u8, resp, "X-Content-Type-Options: nosniff\r\n") != null);
     try testing.expect(mem.endsWith(u8, resp, "hello world"));
 }
 
@@ -1400,12 +1550,20 @@ test "serve: directory request serves index.html" {
     defer fx.deinit();
     var h = Handler.init(testing.io, fx.root, .{});
     var out: [4096]u8 = undefined;
+    // A1 F15: this test used to assert nothing for 2 of its 3 cases, and
+    // its comment claimed a 404 that the code never sends — `serveDirectory`
+    // answers 403 for "no index, listing off" (confirmed against SPEC.md
+    // and against `serveDirectory`'s own `sendStatus(rw, 403)`), not 404.
     for ([_][]const u8{ "/", "/sub", "/sub/" }) |p| {
         const resp = get(&h, p, &out);
-        // "/" serves root index; "/sub" has no index → 404 (no listing).
         if (mem.eql(u8, p, "/")) {
+            // "/" has an index → served.
             try testing.expectEqual(@as(u16, 200), statusOf(resp));
             try testing.expect(mem.endsWith(u8, resp, "<h1>home</h1>"));
+        } else {
+            // "/sub" and "/sub/" have no index and listing is off → 403,
+            // per SPEC.md and `serveDirectory`'s `directory_listing` gate.
+            try testing.expectEqual(@as(u16, 403), statusOf(resp));
         }
     }
 }
@@ -1520,6 +1678,131 @@ test "serve: follow_symlinks=true serves an in-root symlink but still refuses an
     try testing.expect(mem.indexOf(u8, escaped, "TOP SECRET") == null);
 }
 
+test "serve: follow_symlinks containment reaches directory & index routes, not just leaf files (A1 F1, F4)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var out: [4096]u8 = undefined;
+
+    // Default mode (no-follow): every one of these must already be refused.
+    // This is F4's missing coverage — the default symlink policy on a
+    // DIRECTORY component (as opposed to a leaf file) had no test at all.
+    {
+        var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true });
+        for ([_][]const u8{ "/linkdir/", "/linkdir/loot.txt", "/linklist/" }) |p| {
+            const resp = get(&h, p, &out);
+            // A1 F16: every one of these must be 403 (a refused symlinked
+            // component per SPEC.md), never 404 — a 404 here would tell an
+            // attacker "no such name" instead of "exists, refused",
+            // leaking existence and contradicting the documented policy.
+            try testing.expectEqual(@as(u16, 403), statusOf(resp));
+            try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
+            try testing.expect(mem.indexOf(u8, resp, "LEAK") == null);
+        }
+        const r_symidx = get(&h, "/symidx/", &out);
+        try testing.expect(statusOf(r_symidx) >= 400 and statusOf(r_symidx) < 500);
+    }
+
+    // follow_symlinks = true: every escaping shape must STILL be refused.
+    // This is F1: `verifyContained` used to run only on the single-leaf-file
+    // open, never on the index-lookup or directory-listing routes.
+    {
+        var h = Handler.init(testing.io, fx.root, .{ .follow_symlinks = true, .directory_listing = true });
+
+        // (1) directory component is a symlink out; target has an index.
+        const r1 = get(&h, "/linkdir/", &out);
+        try testing.expect(statusOf(r1) >= 400 and statusOf(r1) < 500);
+        try testing.expect(mem.indexOf(u8, r1, "OUTSIDE-INDEX-LEAK") == null);
+
+        // (2) same directory, requesting the leaf directly — this path was
+        // already safe before the fix (the leaf-file check always ran); kept
+        // here as a positive-safety control alongside (1).
+        const r2 = get(&h, "/linkdir/loot.txt", &out);
+        try testing.expect(statusOf(r2) >= 400 and statusOf(r2) < 500);
+        try testing.expect(mem.indexOf(u8, r2, "LOOT-LEAK") == null);
+
+        // (3) directory component is a symlink out; target has NO index —
+        // the directory-LISTING route.
+        const r3 = get(&h, "/linklist/", &out);
+        try testing.expect(statusOf(r3) >= 400 and statusOf(r3) < 500);
+        try testing.expect(mem.indexOf(u8, r3, "LISTING-LEAK") == null);
+        try testing.expect(mem.indexOf(u8, r3, "marker.txt") == null);
+
+        // (4) the directory is genuinely inside root, but ITS index is a
+        // symlink pointing out.
+        const r4 = get(&h, "/symidx/", &out);
+        try testing.expect(statusOf(r4) >= 400 and statusOf(r4) < 500);
+        try testing.expect(mem.indexOf(u8, r4, "TOP SECRET") == null);
+
+        // Positive control: a legitimate in-root symlink still serves.
+        const ok = get(&h, "/inside_link", &out);
+        try testing.expectEqual(@as(u16, 200), statusOf(ok));
+    }
+}
+
+test "serve: root's own index behind a symlink is still verified for containment (A1 F1, root-index case)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "outside_index.html", .data = "ROOT-INDEX-LEAK" });
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    root.symLink(io, "../outside_index.html", "index.html", .{}) catch {};
+
+    var out: [4096]u8 = undefined;
+
+    // Default mode already refuses a symlinked index.html (no-follow open
+    // error) — the positive-safety control for F4.
+    var h_default = Handler.init(io, root, .{});
+    const r_default = get(&h_default, "/", &out);
+    try testing.expect(statusOf(r_default) >= 400 and statusOf(r_default) < 500);
+
+    var h_follow = Handler.init(io, root, .{ .follow_symlinks = true });
+    const r_follow = get(&h_follow, "/", &out);
+    try testing.expect(statusOf(r_follow) >= 400 and statusOf(r_follow) < 500);
+    try testing.expect(mem.indexOf(u8, r_follow, "ROOT-INDEX-LEAK") == null);
+}
+
+test "serve: verifyContained rejects a sibling whose name is a string-prefix of root (A1 F7, sibling guard)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    // "rootBAD" has "root" as a literal string prefix but is a DIFFERENT
+    // directory — the "/srv/wwwroot" vs "/srv/www" shape the audit named.
+    var sibling = try tmp.dir.createDirPathOpen(io, "rootBAD", .{});
+    defer sibling.close(io);
+    try sibling.writeFile(io, .{ .sub_path = "secret2.txt", .data = "SIBLING-LEAK" });
+    root.symLink(io, "../rootBAD/secret2.txt", "escape2", .{}) catch {};
+
+    var out: [4096]u8 = undefined;
+    var h = Handler.init(io, root, .{ .follow_symlinks = true });
+    const resp = get(&h, "/escape2", &out);
+    try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
+    try testing.expect(mem.indexOf(u8, resp, "SIBLING-LEAK") == null);
+}
+
+test "serve: verifyContained's prefix check covers the FULL root path, not just its first byte (A1 F7, prefix strength)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    // "roo2" is the SAME LENGTH as "root" (so the sibling guard's separator
+    // check coincidentally lines up too) but different content — only a
+    // full-length prefix compare, not a truncated one, tells them apart.
+    var decoy = try tmp.dir.createDirPathOpen(io, "roo2", .{});
+    defer decoy.close(io);
+    try decoy.writeFile(io, .{ .sub_path = "secret3.txt", .data = "DECOY-LEAK" });
+    root.symLink(io, "../roo2/secret3.txt", "escape3", .{}) catch {};
+
+    var out: [4096]u8 = undefined;
+    var h = Handler.init(io, root, .{ .follow_symlinks = true });
+    const resp = get(&h, "/escape3", &out);
+    try testing.expect(statusOf(resp) >= 400 and statusOf(resp) < 500);
+    try testing.expect(mem.indexOf(u8, resp, "DECOY-LEAK") == null);
+}
+
 test "serve: 304 on matching If-None-Match / If-Modified-Since" {
     var fx = try Fixture.init();
     defer fx.deinit();
@@ -1575,9 +1858,10 @@ test "serve: directory listing (opt-in) escapes names, off = 403" {
     var fx = try Fixture.init();
     defer fx.deinit();
     const io = testing.io;
-    // A subdir with an injection-y filename and no index.
+    // A subdir with an injection-y filename, a dotfile, and no index.
     _ = try fx.root.createDirPathOpen(io, "list", .{});
     try fx.root.writeFile(io, .{ .sub_path = "list/a<b>.txt", .data = "x" });
+    try fx.root.writeFile(io, .{ .sub_path = "list/.env", .data = "SECRET=1" });
 
     var out: [8192]u8 = undefined;
     var h_off = Handler.init(io, fx.root, .{});
@@ -1589,6 +1873,17 @@ test "serve: directory listing (opt-in) escapes names, off = 403" {
     // The raw "<b>" must not appear; the escaped form must.
     try testing.expect(mem.indexOf(u8, resp, "a<b>.txt") == null);
     try testing.expect(mem.indexOf(u8, resp, "a&lt;b&gt;.txt") != null);
+    // A1 F12: dotfiles must not appear in the listing by default — the
+    // listing route has its own dotfile-skip (root.zig, `serveDirectory`),
+    // separate from `sanitizePath`'s, and nothing exercised it.
+    try testing.expect(mem.indexOf(u8, resp, ".env") == null);
+
+    // Opting into `serve_dotfiles` must show it — the skip is a policy
+    // default, not a hardcoded omission.
+    var h_dot = Handler.init(io, fx.root, .{ .directory_listing = true, .serve_dotfiles = true });
+    const resp_dot = get(&h_dot, "/list/", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp_dot));
+    try testing.expect(mem.indexOf(u8, resp_dot, ".env") != null);
 }
 
 test "resolveFile standalone: opens within root, refuses escape" {
@@ -1605,6 +1900,34 @@ test "resolveFile standalone: opens within root, refuses escape" {
     try testing.expectError(error.Traversal, resolveFile(fx.root, io, "/../secret.txt", .{}));
     try testing.expectError(error.Forbidden, resolveFile(fx.root, io, "/escape", .{}));
     try testing.expectError(error.NotFound, resolveFile(fx.root, io, "/missing", .{}));
+}
+
+test "Opened.mimeName is backed by Opened's own storage, not a caller's scratch buffer (A1 F2)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const io = testing.io;
+    var opened = try resolveFile(fx.root, io, "/hello.txt", .{});
+    defer opened.close(io);
+    try testing.expectEqualStrings("hello.txt", opened.mimeName());
+    try testing.expectEqualStrings(
+        "text/plain; charset=utf-8",
+        mimeType(opened.mimeName(), &.{}, "application/octet-stream"),
+    );
+
+    // Structural check, deliberately NOT a "scribble the stack and see if
+    // the bytes changed" one: whether stale bytes are actually visible by
+    // the time anyone reads them is a UB timing question that manifests
+    // differently every run (this campaign has hit that class before).
+    // `mimeName()`'s bytes must live INSIDE `opened`'s own storage — a
+    // slice borrowed from a caller's local buffer (the pre-fix shape,
+    // A1 F2: `resolveFile`'s `buf`) never can, by construction, because
+    // that buffer is a different variable in a different, by-then-returned
+    // stack frame. This is true or false independent of what the compiler
+    // happened to leave lying around, so it can't flip between runs.
+    const struct_start = @intFromPtr(&opened);
+    const struct_end = struct_start + @sizeOf(Opened);
+    const name_ptr = @intFromPtr(opened.mimeName().ptr);
+    try testing.expect(name_ptr >= struct_start and name_ptr < struct_end);
 }
 
 /// Pull a header value (up to CRLF) out of a raw response, for the conditional

@@ -89,6 +89,15 @@ embedded table (html, htm, css, js, mjs, json, map, xml, txt, md, csv, svg, png,
 webp, avif, ico, bmp, woff, woff2, ttf, otf, eot, wasm, pdf, zip, gz, wav, mp3, mp4, webm, ogg),
 then `Options.default_mime` (`application/octet-stream`). No dot / unknown extension → default.
 
+Every representation response (200/206, not 304/412/416) also carries `X-Content-Type-Options:
+nosniff` (best-effort — losing it on header-budget exhaustion does not escalate to 500, unlike
+`Content-Type` itself). `Content-Type` from the table above is already the primary defense against
+MIME-sniffing; `nosniff` is defense in depth against a browser second-guessing it anyway. The
+module does not offer `Content-Disposition: attachment` or any other way to force a download — an
+uploaded `.html`/`.svg` inside the root is still served as an executable document on the serving
+origin if the caller allows such uploads into the root at all (A1 F18; this is the same trade-off
+Go's `net/http` `FileServer` and nginx make, not a gap specific to this module).
+
 ### Validators
 
 - **`Last-Modified`**: the file's mtime (`stat.mtime`), formatted as an IMF-fixdate.
@@ -97,9 +106,12 @@ then `Options.default_mime` (`application/octet-stream`). No dot / unknown exten
   against mtime-only touches, at the cost of reading the file) is the documented alternative; it is
   intentionally not the default because it turns every conditional GET into a full read.
 
-Both computed header values live in threadlocal scratch, because the response writer stores header
-value slices without copying and emits them after the handler returns (one request per thread, as
-throughout the http stack).
+Both computed header values live in plain locals, not threadlocal scratch: the response writer's
+`setHeader` copies the bytes into its own storage at call time (`http`'s `putHeader` → `dupe`), so
+the locals only need to outlive the `setHeader` calls that pass them, not the response. (A1 F14:
+this section, and the ledger entry that cited it, previously described the opposite mechanism —
+a threadlocal buffer the writer borrows without copying — which is not what the code does or ever
+did; see `root.zig`'s own "Locals, not thread-locals" comment at the `sendFile` call site.)
 
 ### Conditional requests (RFC 9110 §8.8/§13)
 
@@ -164,9 +176,9 @@ point on.
 
 A `Handler` is created once and shared read-only across the server's connection threads; it holds
 no mutable state, so `serve` is concurrency-safe. Per-request scratch (ETag, Last-Modified,
-Content-Length buffers) is threadlocal — one request is served to completion per thread, the same
-model `http.range` uses. No dynamic allocation on the serve path; the 64 KiB streaming buffer is
-stack-local per request.
+Content-Length buffers) is stack-local to the call that computes it, copied by the response
+writer's `setHeader` before that call returns — no threadlocal state involved. No dynamic
+allocation on the serve path; the 64 KiB streaming buffer is stack-local per request too.
 
 ## Anchoring
 
