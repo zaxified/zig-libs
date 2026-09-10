@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, F10 (found mid-fix during the second pass above;
+  0 consumers in this repo, P1 applies). `composeNode` recurses one native call frame
+  per nesting level, and `account()`/the duplicate-key check trusted `Options.max_depth`
+  outright — nothing stopped a caller from raising it past `scanner.max_depth` (4096).
+  That field looks like a second, independent safety net; it is not one, because the
+  scanner and parser are iterative (no per-level recursion). A caller-raised `max_depth`
+  therefore let `composeNode`'s own recursion run deep enough to overflow Debug's native
+  stack — SIGSEGV, not a catchable error — well before the scanner's own cap would have
+  refused the input (measured while finding this: SIGSEGV composing a 4096-deep tree
+  with `max_depth` raised to accommodate it). Fixed by clamping the depth ceiling
+  actually enforced (`Composer.effectiveMaxDepth`, new `compose.max_safe_depth = 1024`
+  constant) to the one depth this module has proven Debug-stack-safe — the shipped
+  default — regardless of what `Options.max_depth` is set to; `@min` only ever tightens
+  a caller's own setting, never loosens it, so this is a no-op for every caller at or
+  below the default. New regression test proves the clamp without going near the crash
+  itself: reuses the exact depth (1025) an existing test already recurses to safely, and
+  shows `max_depth = 100_000_000` no longer lets composition past it (RED: composed
+  successfully instead of `error.TooDeep`; GREEN: `error.TooDeep`, matching the default's
+  own boundary). scripts/modtest yaml: 59/59, Debug and ReleaseFast alike.
+
 - **2026-09-10** — A1 fix campaign, second-pass fix queue (0 consumers in this repo, P1
   applies): test-only, no production behavior change except where noted. `scanner.zig`'s
   OWN `max_depth = 4096` flow/block-nesting cap (a lower-level guard than the composer's

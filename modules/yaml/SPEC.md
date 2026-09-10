@@ -146,7 +146,14 @@ loop, never allocate without bound on arbitrary input** (CONVENTIONS.md §7.1).
   and validation belongs to the composer.
 - *Nesting exhaustion* — bounded by `max_depth` (§2), and independently by the
   composer's own `Options.max_depth`, which also keeps `composeNode`'s recursion
-  off the end of the stack.
+  off the end of the stack. ⚠ A1/yaml.md F10 (fixed 2026-09-10): the second
+  bound alone was not actually a bound — nothing clamped a caller-supplied
+  `Options.max_depth`, so setting it past `max_depth` (4096) let `composeNode`
+  recurse deep enough to overflow Debug's native stack before the scanner's
+  own cap ever refused the input. `compose.zig`'s `Composer.effectiveMaxDepth`
+  now clamps whatever the caller sets to `compose.max_safe_depth` (1024, the
+  shipped default and the one depth this module has proven Debug-stack-safe),
+  so `Options.max_depth` can only ever tighten this bound, never loosen it.
 - *Alias expansion bombs* — aliases share rather than copy, so "billion laughs"
   composes into O(n) nodes rather than O(2^n); `Options.max_nodes` bounds the
   total regardless. Cyclic aliases are rejected outright (§7).
