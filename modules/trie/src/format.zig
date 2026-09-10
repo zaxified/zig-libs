@@ -237,6 +237,22 @@ pub fn nodeAt(buf: []const u8, off: u32) DecodeError!NodeView {
     const edges_bytes = @as(usize, edge_count) * edge_size;
     if (edges_at + edges_bytes > buf.len) return error.Corrupt;
 
+    // The format requires edges sorted strictly ascending by label (the
+    // layout comment above, and the precondition `findEdge`'s binary search
+    // relies on) — nothing enforced it before. An unsorted or duplicate-label
+    // node made `lookup` (binary search) disagree with `prefixIterator`/`topN`
+    // (linear index order) on the very same buffer, and let a duplicate label
+    // hide a key from `lookup` entirely (A1/trie.md F3). One check here closes
+    // it for all three query paths at once, since they all go through `nodeAt`.
+    if (edge_count > 1) {
+        var i: usize = 1;
+        while (i < edge_count) : (i += 1) {
+            const prev_label = buf[edges_at + (i - 1) * edge_size];
+            const cur_label = buf[edges_at + i * edge_size];
+            if (cur_label <= prev_label) return error.Corrupt;
+        }
+    }
+
     return .{
         .buf = buf,
         .offset = off,
@@ -343,6 +359,65 @@ test "nodeAt rejects offsets and geometry that leave the buffer" {
     var bad = buf;
     std.mem.writeInt(u16, bad[header_size + 9 .. header_size + 11][0..2], 5000, .little);
     try testing.expectError(error.Corrupt, nodeAt(&bad, header_size));
+}
+
+test "nodeAt rejects edges that are not strictly ascending by label (and duplicates)" {
+    // Root: non-terminal, 3 edges labelled 'c','a','b' (in THAT order), each
+    // pointing at the same terminal leaf right after it. The layout comment
+    // requires edges "sorted ascending by label" and `findEdge`'s binary
+    // search depends on it, but nothing checked it before this fix — `lookup`
+    // (binary search) and `prefixIterator`/`topN` (linear edge order) then
+    // disagreed about the very same buffer, and a duplicate label could hide
+    // a key from `lookup` outright (A1/trie.md F3).
+    const root_edges = flags_size + best_size + edge_count_size + 3 * edge_size; // 22
+    const leaf_size = flags_size + value_size + best_size + edge_count_size; // 11
+    var body: [root_edges + leaf_size]u8 = undefined;
+    const leaf_off: u32 = header_size + root_edges;
+
+    body[0] = 0; // root: non-terminal
+    std.mem.writeInt(u32, body[1..5], 1, .little); // best
+    std.mem.writeInt(u16, body[5..7], 3, .little); // edge_count = 3
+    const labels_out_of_order = [_]u8{ 'c', 'a', 'b' };
+    for (labels_out_of_order, 0..) |label, i| {
+        const o = 7 + i * edge_size;
+        body[o] = label;
+        std.mem.writeInt(u32, body[o + 1 .. o + 5][0..4], leaf_off, .little);
+    }
+    body[root_edges] = terminal_bit; // leaf: terminal
+    std.mem.writeInt(u32, body[root_edges + 1 .. root_edges + 5][0..4], 1, .little); // value
+    std.mem.writeInt(u32, body[root_edges + 5 .. root_edges + 9][0..4], 1, .little); // best
+    std.mem.writeInt(u16, body[root_edges + 9 .. root_edges + 11][0..2], 0, .little); // edge_count = 0
+
+    var buf: [header_size + body.len]u8 = undefined;
+    @memcpy(buf[header_size..], &body);
+    var h = Header{ .version = format_version, .flags = 0, .node_region_len = body.len, .key_count = 1, .root_offset = header_size };
+    h.encode(&buf, buf[header_size..]);
+    try testing.expectError(error.Corrupt, nodeAt(&buf, header_size));
+
+    // Positive control: the SAME bytes, edges reordered strictly ascending,
+    // load cleanly — proving the rejection above is about order, not some
+    // other mistake in the hand-built buffer.
+    const labels_sorted = [_]u8{ 'a', 'b', 'c' };
+    for (labels_sorted, 0..) |label, i| {
+        const o = 7 + i * edge_size;
+        body[o] = label;
+        std.mem.writeInt(u32, body[o + 1 .. o + 5][0..4], leaf_off, .little);
+    }
+    @memcpy(buf[header_size..], &body);
+    h.encode(&buf, buf[header_size..]);
+    const n = try nodeAt(&buf, header_size);
+    try testing.expectEqual(@as(u16, 3), n.edge_count);
+
+    // Duplicate labels are equally rejected (strict `<`, not `<=`).
+    const labels_dup = [_]u8{ 'a', 'a', 'b' };
+    for (labels_dup, 0..) |label, i| {
+        const o = 7 + i * edge_size;
+        body[o] = label;
+        std.mem.writeInt(u32, body[o + 1 .. o + 5][0..4], leaf_off, .little);
+    }
+    @memcpy(buf[header_size..], &body);
+    h.encode(&buf, buf[header_size..]);
+    try testing.expectError(error.Corrupt, nodeAt(&buf, header_size));
 }
 
 test "follow enforces the strictly-increasing child-offset invariant" {

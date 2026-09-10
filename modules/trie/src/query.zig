@@ -19,7 +19,7 @@ const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 
 pub const LoadError = format.LoadError;
-pub const QueryError = format.DecodeError || error{KeyTooLong};
+pub const QueryError = format.DecodeError || error{ KeyTooLong, TooComplex };
 
 /// Options controlling `topN`'s bounded work.
 pub const QueryOptions = struct {
@@ -61,7 +61,17 @@ pub const Frozen = struct {
     /// traversal safe even though the body was not scanned here.
     pub fn load(buf: []const u8) LoadError!Frozen {
         const header = try format.Header.load(buf);
-        return .{ .buf = buf, .header = header };
+        // Bound the kept slice to exactly the node region `Header.load` just
+        // proved fits (`buf.len >= header_size + node_region_len`). `nodeAt`'s
+        // every bounds check is against this slice's `.len`, so this is what
+        // keeps a (possibly attacker-chosen) edge from ever resolving into the
+        // trailing padding `Header.load` tolerates on purpose ("an mmap'd file
+        // may be page-rounded") — see A1/trie.md F2: without it, `loadVerified`
+        // still reports success on a buffer whose padding was silently
+        // bit-flipped, because the CRC it checks never covered that padding
+        // and neither did any node's bounds check.
+        const end = format.header_size + @as(usize, header.node_region_len);
+        return .{ .buf = buf[0..end], .header = header };
     }
 
     /// Untrusted-file open: `load` plus a full node-region CRC check. Prefer
@@ -116,8 +126,28 @@ pub const Frozen = struct {
     /// borrows a small traversal stack from `gpa` (typically a reused arena, so
     /// effectively free); the frozen index itself is never copied. Call
     /// `deinit` when done.
+    ///
+    /// ⚠ Unbounded: nothing in the wire format forbids two edges from pointing
+    /// at the same child, so a buffer that is not self-built (or otherwise
+    /// trusted) can encode far more keys than its size suggests — a buffer
+    /// under 1 KB can be built to enumerate 2^60 keys (A1/trie.md F1). Over an
+    /// untrusted buffer, use `prefixIteratorBounded` instead.
     pub fn prefixIterator(self: Frozen, gpa: Allocator, prefix: []const u8) (QueryError || Allocator.Error)!PrefixIterator {
-        return PrefixIterator.init(gpa, self, prefix);
+        return PrefixIterator.init(gpa, self, prefix, 0);
+    }
+
+    /// Same as `prefixIterator`, but bounded: `next` returns `error.TooComplex`
+    /// once more than `max_visited` nodes have been decoded over the
+    /// iterator's whole lifetime, instead of continuing to walk an arbitrarily
+    /// large (over a hostile buffer, effectively unbounded) subtree. Prefer
+    /// this over `prefixIterator` whenever `buf` may not be self-built.
+    pub fn prefixIteratorBounded(
+        self: Frozen,
+        gpa: Allocator,
+        prefix: []const u8,
+        max_visited: usize,
+    ) (QueryError || Allocator.Error)!PrefixIterator {
+        return PrefixIterator.init(gpa, self, prefix, max_visited);
     }
 };
 
@@ -174,6 +204,15 @@ const Selector = struct {
         if (self.count < n) {
             dst = self.slot(self.count);
         } else {
+            // `stride == 0` happens whenever the caller's `key_buf` is
+            // shorter than `results.len` slots. Only an empty key can then
+            // pass the size check above, and a trie stores at most one empty
+            // key (the root), so a SECOND, better-ranked empty key reaching
+            // this eviction branch (the only place that divides by `stride`)
+            // was reasoned to be unreachable — but that reasoning lived only
+            // in a comment, nowhere a test held it (A1/trie.md F5). Reject it
+            // explicitly rather than dividing by zero.
+            if (self.stride == 0) return error.KeyTooLong;
             // Reuse the (about-to-be-evicted) worst slot's physical storage.
             const worst_ptr = self.results[n - 1].key.ptr;
             const idx = (@intFromPtr(worst_ptr) - @intFromPtr(self.key_buf.ptr)) / self.stride;
@@ -268,6 +307,11 @@ pub const PrefixIterator = struct {
     stack: std.ArrayListUnmanaged(Frame) = .empty,
     /// True once the subtree root's own terminal (if any) has been considered.
     exhausted: bool,
+    /// Node-decode budget for this iterator's whole lifetime. 0 (used by
+    /// `Frozen.prefixIterator`) means unbounded — see `prefixIteratorBounded`.
+    max_visited: usize = 0,
+    /// Nodes decoded (edges followed) so far.
+    visited: usize = 0,
 
     const Frame = struct {
         node: format.NodeView,
@@ -277,8 +321,8 @@ pub const PrefixIterator = struct {
         mark: usize,
     };
 
-    fn init(gpa: Allocator, frozen: Frozen, prefix: []const u8) (QueryError || Allocator.Error)!PrefixIterator {
-        var it = PrefixIterator{ .gpa = gpa, .frozen = frozen, .exhausted = false };
+    fn init(gpa: Allocator, frozen: Frozen, prefix: []const u8, max_visited: usize) (QueryError || Allocator.Error)!PrefixIterator {
+        var it = PrefixIterator{ .gpa = gpa, .frozen = frozen, .exhausted = false, .max_visited = max_visited };
         const sub = (try frozen.seek(prefix)) orelse {
             it.exhausted = true;
             return it;
@@ -309,6 +353,8 @@ pub const PrefixIterator = struct {
             if (top.edge_idx < top.node.edge_count) {
                 const e = top.node.edge(top.edge_idx);
                 top.edge_idx += 1;
+                if (self.max_visited != 0 and self.visited >= self.max_visited) return error.TooComplex;
+                self.visited += 1;
                 const child = try format.follow(top.node, e.child);
                 try self.path.append(self.gpa, e.label);
                 try self.stack.append(self.gpa, .{ .node = child, .mark = self.path.items.len - 1 });
@@ -335,6 +381,38 @@ const testing = std.testing;
 
 fn build(pairs: []const builder.Pair) ![]u8 {
     return builder.freezeFromPairs(testing.allocator, testing.allocator, pairs);
+}
+
+/// Hand-build a `k`-level chain where each non-terminal node has two edges
+/// ('a','b') pointing at the SAME next node, ending in one terminal leaf.
+/// `Builder` can never produce this (a child always has exactly one parent),
+/// but nothing in the wire format forbids it: the buffer is `17k + 11` bytes
+/// and denotes `2^k` distinct keys — the DAG shape from A1/trie.md F1.
+fn buildChainDag(allocator: std.mem.Allocator, k: usize) ![]u8 {
+    const region_len = 17 * k + 11;
+    const buf = try allocator.alloc(u8, format.header_size + region_len);
+    errdefer allocator.free(buf);
+    var i: usize = 0;
+    while (i < k) : (i += 1) {
+        const off = format.header_size + 17 * i;
+        const next_off: u32 = @intCast(format.header_size + 17 * (i + 1)); // last level -> the leaf
+        buf[off] = 0; // non-terminal
+        std.mem.writeInt(u32, buf[off + 1 .. off + 5][0..4], 0, .little); // best
+        std.mem.writeInt(u16, buf[off + 5 .. off + 7][0..2], 2, .little); // edge_count = 2
+        buf[off + 7] = 'a';
+        std.mem.writeInt(u32, buf[off + 8 .. off + 12][0..4], next_off, .little);
+        buf[off + 12] = 'b';
+        std.mem.writeInt(u32, buf[off + 13 .. off + 17][0..4], next_off, .little);
+    }
+    const leaf_off = format.header_size + 17 * k;
+    buf[leaf_off] = format.terminal_bit;
+    std.mem.writeInt(u32, buf[leaf_off + 1 .. leaf_off + 5][0..4], 1, .little); // value
+    std.mem.writeInt(u32, buf[leaf_off + 5 .. leaf_off + 9][0..4], 1, .little); // best
+    std.mem.writeInt(u16, buf[leaf_off + 9 .. leaf_off + 11][0..2], 0, .little); // edge_count = 0
+
+    const h = format.Header{ .version = format.format_version, .flags = 0, .node_region_len = @intCast(region_len), .key_count = 1, .root_offset = format.header_size };
+    h.encode(buf, buf[format.header_size..]);
+    return buf;
 }
 
 test "lookup: exact match, miss, prefix-of-a-key is not itself a key" {
@@ -470,4 +548,125 @@ test "loadVerified rejects a body bit-flip that load accepts" {
     corrupt[format.header_size + 2] ^= 0xff; // flip a node byte
     try testing.expect(Frozen.load(corrupt) != error.BodyCorrupt); // load still opens
     try testing.expectError(error.BodyCorrupt, Frozen.loadVerified(corrupt));
+}
+
+test "an edge redirected into trailing padding is rejected, not silently followed" {
+    // Real node region: root (1 edge 'h' -> child) + child (terminal, value=1).
+    // `node_region_len` declares only these 23 bytes; a further 11 bytes of
+    // "padding" (tolerated by `Header.load` for a page-rounded mmap) hold a
+    // PLANTED node the root's edge is redirected to point at instead of the
+    // real child — A1/trie.md F2.
+    const root_off = format.header_size;
+    const child_off = root_off + 12; // root: flags(1)+best(4)+edge_count(2)+1 edge(5)
+    const region_len = 12 + 11; // + child: flags(1)+value(4)+best(4)+edge_count(2)
+    const fake_off = root_off + region_len; // first byte past the declared region
+
+    var buf: [format.header_size + region_len + 11]u8 = undefined;
+    // root: non-terminal, 1 edge 'h' -> fake_off (NOT the real child_off)
+    buf[root_off] = 0;
+    std.mem.writeInt(u32, buf[root_off + 1 .. root_off + 5], 0, .little); // best
+    std.mem.writeInt(u16, buf[root_off + 5 .. root_off + 7], 1, .little); // edge_count = 1
+    buf[root_off + 7] = 'h';
+    std.mem.writeInt(u32, buf[root_off + 8 .. root_off + 12], fake_off, .little);
+    // the real child, present so the declared region is self-consistent, but
+    // never reached via the redirected edge
+    buf[child_off] = format.terminal_bit;
+    std.mem.writeInt(u32, buf[child_off + 1 .. child_off + 5], 1, .little); // value
+    std.mem.writeInt(u32, buf[child_off + 5 .. child_off + 9], 1, .little); // best
+    std.mem.writeInt(u16, buf[child_off + 9 .. child_off + 11], 0, .little); // edge_count = 0
+    // the planted node, living entirely in the padding beyond node_region_len
+    buf[fake_off] = format.terminal_bit;
+    std.mem.writeInt(u32, buf[fake_off + 1 .. fake_off + 5], 0xDEADBEEF, .little); // value
+    std.mem.writeInt(u32, buf[fake_off + 5 .. fake_off + 9], 0, .little); // best
+    std.mem.writeInt(u16, buf[fake_off + 9 .. fake_off + 11], 0, .little); // edge_count = 0
+
+    const h = format.Header{ .version = format.format_version, .flags = 0, .node_region_len = region_len, .key_count = 1, .root_offset = root_off };
+    h.encode(&buf, buf[format.header_size .. format.header_size + region_len]); // CRC covers ONLY the declared region
+
+    // RED (pre-fix shape): `Header.load` + a raw walk over the UNTRUNCATED
+    // buffer — exactly what the old `Frozen.load` handed `nodeAt`, since it
+    // kept the buffer by reference at full length — follows the redirected
+    // edge straight into the padding and reads the planted value back as if
+    // it were the real child's.
+    {
+        const hdr = try format.Header.load(&buf);
+        const root = try format.nodeAt(&buf, hdr.root_offset);
+        const e = root.findEdge('h').?;
+        const got = try format.follow(root, e.child);
+        try testing.expect(got.terminal);
+        try testing.expectEqual(@as(u32, 0xDEADBEEF), got.value); // padding, not the real child's 1
+    }
+
+    // GREEN: the fixed `Frozen.load` bounds its kept slice to exactly
+    // `header_size + node_region_len`. `loadVerified` still opens (the CRC
+    // never covered the padding either way — that half of the finding does
+    // not change), but the SAME redirected edge now lands outside the kept
+    // slice and every query on it is rejected instead of resolving.
+    const f = try Frozen.loadVerified(&buf);
+    try testing.expectError(error.Corrupt, f.lookup("h"));
+}
+
+test "prefixIteratorBounded aborts a DAG-shaped buffer long before draining it" {
+    // Chain of k levels, each with two edges ('a','b') pointing at the SAME
+    // next node: 2^k distinct root-to-leaf paths in O(k) buffer bytes — the
+    // shape from A1/trie.md F1 (there measured up to k=60: a 1067-byte file
+    // denoting 2^60 keys, "1142 years" to drain). k=20 here keeps the RED
+    // side below fast enough to actually run: the module's own measured
+    // throughput is ~32M keys/s, so draining 2^20 keys is tens of ms.
+    const k: usize = 20;
+    const buf = try buildChainDag(testing.allocator, k);
+    defer testing.allocator.free(buf);
+    const f = try Frozen.load(buf);
+
+    // RED: `prefixIterator` (the only entry point before this fix) has no
+    // way to stop early — it decodes every one of the 2^k paths.
+    {
+        var it = try f.prefixIterator(testing.allocator, "");
+        defer it.deinit();
+        var kb: [k]u8 = undefined;
+        var n: usize = 0;
+        while (try it.next(&kb)) |_| n += 1;
+        try testing.expectEqual(@as(usize, 1) << 20, n); // all 2^20 keys, no early stop
+    }
+
+    // GREEN: the SAME buffer, through `prefixIteratorBounded` with a budget
+    // three orders of magnitude below 2^k, aborts with `error.TooComplex`
+    // after visiting at most `budget` nodes — nowhere near a full drain.
+    {
+        const budget: usize = 1000;
+        var it = try f.prefixIteratorBounded(testing.allocator, "", budget);
+        defer it.deinit();
+        var kb: [k]u8 = undefined;
+        var n: usize = 0;
+        var saw_too_complex = false;
+        while (true) {
+            const c = it.next(&kb) catch |err| {
+                try testing.expectEqual(error.TooComplex, err);
+                saw_too_complex = true;
+                break;
+            };
+            if (c == null) break;
+            n += 1;
+        }
+        try testing.expect(saw_too_complex);
+        try testing.expect(n <= budget);
+    }
+}
+
+test "Selector.consider: stride == 0 (key_buf shorter than results.len) is KeyTooLong, not a division by zero" {
+    // `stride = key_buf.len / results.len` is 0 whenever `key_buf` is shorter
+    // than `results.len`. The `key.len > self.stride` guard alone stops any
+    // NON-empty key, but an empty key (len 0) passed it -- and if the
+    // selector is already full when a second, better-ranked empty key
+    // arrives, the eviction branch divides by `self.stride` (A1/trie.md F5).
+    // A real trie stores at most one empty key, so `topN`/`topNInto` cannot
+    // reach this today -- exercised directly against the (otherwise private)
+    // `Selector` so the guard is tested independent of that call-order
+    // reasoning, which is exactly what the finding says was never written
+    // down or held by a test.
+    var results: [1]Completion = undefined;
+    var key_buf: [0]u8 = .{};
+    var sel = Selector.init(&results, &key_buf);
+    try sel.consider(1, ""); // count 0 -> 1: an empty key fits an empty stride
+    try testing.expectError(error.KeyTooLong, sel.consider(2, "")); // would have divided by self.stride == 0
 }

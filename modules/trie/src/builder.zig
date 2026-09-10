@@ -18,7 +18,14 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const format = @import("format.zig");
 
-pub const BuildError = error{OutOfMemory};
+pub const BuildError = error{
+    OutOfMemory,
+    /// The pool would exceed the u32 node/edge id space (~4.29 billion). Same
+    /// bound `freeze` already enforces on the serialized offset space, just
+    /// checked here too — before the `@intCast`s below rather than after
+    /// (A1/trie.md F4: they narrowed silently, UB in ReleaseFast).
+    TooLarge,
+};
 
 pub const FreezeError = error{
     OutOfMemory,
@@ -30,6 +37,20 @@ pub const FreezeError = error{
 
 /// Sentinel "no edge" index — the empty first_edge / end of a sibling list.
 const no_edge: u32 = std.math.maxInt(u32);
+
+/// Cast an `ArrayList` length (a `usize`) to a node/edge id, or
+/// `error.TooLarge` if it would not fit in a `u32` — checked explicitly rather
+/// than left to `@intCast`, which is a safety-checked panic in Debug /
+/// ReleaseSafe but is undefined behaviour on out-of-range input in
+/// ReleaseFast (A1/trie.md F4). `freeze` already enforces the same ~4.29
+/// billion bound on the serialized offset space; this is the matching guard
+/// on the id space that feeds it, so both narrowings in `insert` (`new_id`,
+/// `new_edge`) go through it. `no_edge` (`maxInt(u32)`) stays reserved as the
+/// sentinel, so the bound is `>=`, not `>`.
+fn checkedId(len: usize) BuildError!u32 {
+    if (len >= std.math.maxInt(u32)) return error.TooLarge;
+    return @intCast(len);
+}
 
 /// One in-memory trie node. Children are an intrusive singly-linked sibling
 /// list threaded through the builder-global `edges` pool (`first_edge` heads
@@ -106,10 +127,10 @@ pub const Builder = struct {
                 // may realloc). Read the parent's old list head BEFORE the
                 // appends, then re-index the parent by id afterwards — never
                 // hold a pointer across an append.
-                const new_id: u32 = @intCast(self.nodes.items.len);
+                const new_id: u32 = try checkedId(self.nodes.items.len);
                 const prev_head = self.nodes.items[cur].first_edge;
                 try self.nodes.append(self.gpa, .{});
-                const new_edge: u32 = @intCast(self.edges.items.len);
+                const new_edge: u32 = try checkedId(self.edges.items.len);
                 try self.edges.append(self.gpa, .{ .label = b, .child = new_id, .next = prev_head });
                 const parent = &self.nodes.items[cur];
                 parent.first_edge = new_edge; // prepend (order fixed at freeze)
@@ -222,7 +243,10 @@ pub const Pair = struct { key: []const u8, value: u32 };
 pub fn freezeFromPairs(gpa: Allocator, out_gpa: Allocator, pairs: []const Pair) FreezeError![]u8 {
     var b = Builder.init(gpa) catch return error.OutOfMemory;
     defer b.deinit();
-    for (pairs) |pr| b.insert(pr.key, pr.value) catch return error.OutOfMemory;
+    // `insert`'s BuildError is now `{OutOfMemory, TooLarge}` — both are
+    // already members of FreezeError, so propagate rather than collapse (the
+    // old `catch return error.OutOfMemory` would have relabelled TooLarge).
+    for (pairs) |pr| b.insert(pr.key, pr.value) catch |err| return err;
     return b.freeze(out_gpa);
 }
 
@@ -272,6 +296,17 @@ test "freeze: subtree_best is the max value under each node" {
     const e = root.findEdge('a').?;
     const a_node = try format.follow(root, e.child);
     try testing.expectEqual(@as(u32, 9), a_node.subtree_best);
+}
+
+test "checkedId rejects the u32 boundary instead of narrowing silently" {
+    // Driving an actual builder to 2^32 nodes would need ~137 GB of build RSS
+    // (measured 28 B/node, A1/trie.md F4) and is not reproducible on this
+    // machine — but the guard itself is a pure length check, so it is tested
+    // directly at and around the boundary without building anything that big.
+    try testing.expectEqual(@as(u32, 0), try checkedId(0));
+    try testing.expectEqual(@as(u32, std.math.maxInt(u32) - 1), try checkedId(std.math.maxInt(u32) - 1));
+    try testing.expectError(error.TooLarge, checkedId(std.math.maxInt(u32)));
+    try testing.expectError(error.TooLarge, checkedId(@as(usize, std.math.maxInt(u32)) + 1));
 }
 
 test "freeze then load: header key_count and root offset are consistent" {
