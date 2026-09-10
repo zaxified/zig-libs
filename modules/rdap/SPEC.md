@@ -67,7 +67,8 @@ conformance/authentication extensions, and JSON schema validation beyond the tol
 
 ## Verification
 
-39 offline tests (no test reaches the public network; three bind a **loopback** socket — the
+41 offline tests, `src/root.zig` plus the two golden-fixture tests in `src/goldens.zig`
+(no test reaches the public network; three bind a **loopback** socket — the
 cancellation test and the redirect-gate test): `buildPath` KATs for all query types +
 percent-encoding, Accept-header check, base-join with/without trailing slash; response KATs for
 domain / ip-network / autnum shapes (RFC 9083 §5.3–5.5) and the typed error object (RFC 7480 §5.3),
