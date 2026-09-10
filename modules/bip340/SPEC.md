@@ -25,7 +25,17 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
     re-checking the curve equation.
   - `Secp256k1.basePoint.mul(scalar_bytes, .big)` computes `d*G` (uses the
     comptime-precomputed base-point table — this is the fast path for
-    public-key derivation and for the `s*G` half of verification).
+    public-key derivation and for the `s*G` half of verification). ⚠ **This
+    module does not call `basePoint.mul` directly** — it goes through
+    `@import("k256").Secp256k1`, byte-exact to `std.crypto.ecc.Secp256k1`
+    (see `meta.deps` and `root.zig`'s top-of-file import), and calls the
+    equivalent base-point multiply as `Secp256k1.combMulBase(scalar_bytes,
+    .big)` (`root.zig:163` — `KeyPair.fromSecretKey`'s public-key
+    derivation; `root.zig:322` — `sign`'s nonce-point `R = k'*G`;
+    `root.zig:517` — `verifyBatch`'s left-hand-side check). The recon above
+    describes `std`'s own API surface, which is still accurate for what
+    `k256` mirrors; a reader chasing `basePoint.mul` through this module's
+    actual call sites will not find it.
   - **Verify's `s*G − e*P`**: `Secp256k1.mulDoubleBasePublic(p1, s1, p2,
     s2, endian) IdentityElementError!Secp256k1` computes `p1*s1 + p2*s2`
     *in variable time* (explicitly documented for signature verification
@@ -185,8 +195,18 @@ All three formerly-stubbed cores are implemented and KAT-validated
    accumulates per item as one variable-time double-base multiply
    `a_i·R_i + (a_i·e_i)·P_i` plus a complete point addition (std's API
    tops out at two bases per multiply — same equation and acceptance
-   set as a single 2u+1-term multi-scalar multiply, just less batching
-   speedup; documented in the function's doc comment). A per-item
+   set as a single 2u+1-term multi-scalar multiply). ⚠ **Measured
+   2026-09-04 (A1 audit F3), ReleaseFast, best-of-5, both arms
+   interleaved in one process: `verifyBatch` is not faster than a plain
+   `for (items) |it| verify(it)` loop at ANY tested batch size — `u=1`
+   1.117× slower, `u=2` 1.074×, `u=8` 1.034×, `u=32` 1.029×, `u=64`
+   1.035× (never below 1.0, same direction at all five sizes) — and
+   costs `u-1` extra `getrandom(2)` syscalls on top (`u=64` → 630 calls
+   per batch, via `strace -c`).** It does not forgo *part of* the
+   batching speedup; measured, it has none. A caller who wants speed
+   from batching should use `verify` in a loop until this module gets a
+   real multi-scalar-multiply path (blocked on `k256`/std exposing one
+   — see the doc comment on `verifyBatch` for the API-shape reason). A per-item
    identity result contributes nothing and is skipped; a zero LHS
    scalar (base `mul` reports identity) accepts iff the RHS is the
    identity too. Validated by cross-check against `verify` (all-valid

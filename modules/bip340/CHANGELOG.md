@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F3/F10 (MED/LOW,
+  docs only). F3: `verifyBatch`'s doc comment and `SPEC.md` claimed it
+  "only forgoes part of the batching speedup" versus a real multi-scalar
+  multiply; measured (2026-09-04, ReleaseFast, both arms interleaved in one
+  process), it is measurably SLOWER than a plain `verify` loop at every
+  tested batch size (u=1,2,8,32,64: 1.03x-1.12x, never below 1.0) and costs
+  `u-1` extra `getrandom` syscalls per batch. Corrected both to state this
+  and to recommend a `verify` loop until a real MSM path exists (P2: code
+  and docs disagreed, and here the code -- or rather its performance
+  reality -- is what the docs must track; no code change, since there is no
+  cheap correct-and-faster alternative within this module's current `k256`
+  dependency, per the audit's own effort note). F10: `SPEC.md`'s "std
+  recon" section said the module computes `d*G`/`k'*G` via
+  `Secp256k1.basePoint.mul` (`std.crypto.ecc.Secp256k1`'s own API); the
+  module actually calls `k256`'s `Secp256k1.combMulBase` at all three call
+  sites (`root.zig:163,322,517`) -- `meta.deps`/the top-of-file import
+  already reflect the `k256` migration, SPEC.md did not. Corrected (P2,
+  code was right, doc was stale).
+
+- **2026-09-10** — **VERIFIED ALREADY FIXED, no change needed:** A1 audit
+  F8 (MED: example's release-mode checks were `std.debug.assert`, compiled
+  out under `-Doptimize=ReleaseFast`). `example/main.zig` already uses a
+  `must()` helper backed by `std.debug.panic` (not `assert`), which
+  survives every optimize mode -- fixed repo-wide in `d5bdf8d7` ("Three
+  gates that test power instead of presence, and the 593 asserts one of
+  them found", 2026-09-06), an ancestor of this branch predating this
+  session's work on the module.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F4 (MED). Added
   four tests that hand-construct a `Signature`/`XOnlyPublicKey` directly
   (bypassing `fromBytes`'s own range/on-curve checks, the way

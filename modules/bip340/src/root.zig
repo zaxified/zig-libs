@@ -441,8 +441,13 @@ pub const BatchItem = struct {
 /// variable-time double-base multiply (`a_i*R_i + (a_i*e_i)*P_i`) plus a
 /// complete point addition, rather than one large multi-scalar
 /// multiplication over all `2u+1` terms (std's API tops out at two bases
-/// per call). Same equation, same acceptance set — it only forgoes part of
-/// the batching speedup. If one item's combined term is the identity
+/// per call). Same equation, same acceptance set. ⚠ Measured (A1 audit F3,
+/// 2026-09-04, ReleaseFast): this does NOT "forgo part of" the batching
+/// speedup — at every tested batch size (u=1,2,8,32,64) it is measurably
+/// SLOWER than `for (items) |it| verify(it)` (1.03x-1.12x, never below
+/// 1.0), and costs u-1 extra `getrandom` syscalls per batch on top. See
+/// `SPEC.md` for the numbers. Until this module has a real multi-scalar
+/// multiply to call, prefer a plain loop over `verify`. If one item's combined term is the identity
 /// (std's double-base multiply reports it as `error.IdentityElement`), the
 /// identity contributes nothing and the item is skipped — NOT a failure:
 /// the equation, not any per-item property, decides.
