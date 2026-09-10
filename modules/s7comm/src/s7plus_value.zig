@@ -55,12 +55,31 @@ pub const Error = error{
     BufferTooSmall,
     /// A datatype code this codec does not model was encountered.
     UnsupportedDatatype,
+    /// The whole walk visited more elements than `max_walk_budget` allows
+    /// (F6). `max_depth`/`max_object_depth` bound how deep one branch nests;
+    /// they say nothing about how many *siblings* an array declares, and an
+    /// element of a zero-width datatype (`.null`) costs the wire nothing to
+    /// name but still costs a loop iteration to skip. Without a shared
+    /// budget, a peer can declare many such arrays, each separately allowed
+    /// up to `max_elements`, and multiply a handful of input octets into
+    /// tens of millions of iterations.
+    WalkBudgetExceeded,
 };
 
 /// How deep structs/arrays/variants may nest before a walk refuses to descend.
 /// A real controller nests only a handful of levels; this is pure hostile-input
 /// containment.
 pub const max_depth: u8 = 32;
+
+/// Total element visits (`skipOneBody` calls) allowed across one whole
+/// `skipValue` walk, shared by every array/sparse/scalar it contains at any
+/// depth -- see `WalkBudgetExceeded`. Same order of magnitude as
+/// `max_elements`, which is the cost of walking a single one of the largest
+/// arrays this codec would ever legitimately see; spending the whole budget
+/// takes low single-digit milliseconds (measured in `SPEC.md`), so this caps
+/// worst-case CPU per walk to that regardless of how many arrays the peer
+/// declares.
+pub const max_walk_budget: u32 = 1 << 20;
 
 /// Sane ceiling on an array count or a blob/string length. Nothing in a PLC
 /// object graph approaches this; it exists so a decoder cannot be steered into
@@ -120,7 +139,10 @@ pub fn varUintLen(v: u64) usize {
 }
 
 /// Writes `v` as a base-128 big-endian VLQ into `out`; returns the written
-/// slice. `max_octets` caps the width (5 for u32, 9 for u64).
+/// slice. There is no `max_octets` parameter here (unlike `getVarUint`) --
+/// the width is however many octets `v` actually needs, up to 5 for a value
+/// that fits u32 and up to 10 for the full u64 range (64 / 7 rounds up to
+/// 10, not 9). `error.BufferTooSmall` if `out` is shorter than that.
 pub fn putVarUint(v: u64, out: []u8) Error![]u8 {
     const n = varUintLen(v);
     if (out.len < n) return error.BufferTooSmall;
@@ -275,29 +297,44 @@ fn fixedBodyLen(dt: Datatype) ?usize {
 /// Advances the cursor. This is the single recursion point the whole codec
 /// funnels through, so the depth bound and the array/length guards live here
 /// and nowhere else.
-pub fn skipBody(cur: *Cursor, flags: Flags, dt: Datatype, depth: u8) Error!void {
+///
+/// `budget` is shared across the *whole* walk (every array, at every depth,
+/// started from the same top-level `skipValue`/`objectLen` call) and charged
+/// one unit per element visited, regardless of how many wire octets that
+/// element itself consumes -- see `WalkBudgetExceeded` (F6).
+pub fn skipBody(cur: *Cursor, flags: Flags, dt: Datatype, depth: u8, budget: *u32) Error!void {
     if (depth == 0) return error.DepthExceeded;
 
     if (flags.isArray()) {
         const count = try cur.varUint(u32, 5);
         if (count > max_elements) return error.TooLong;
         var k: u32 = 0;
-        while (k < count) : (k += 1) try skipOneBody(cur, dt, depth);
+        while (k < count) : (k += 1) try chargeAndSkipOne(cur, dt, depth, budget);
         return;
     }
     if (flags.isSparse()) {
         while (true) {
             const key = try cur.varUint(u32, 5);
             if (key == 0) break;
-            try skipOneBody(cur, dt, depth);
+            try chargeAndSkipOne(cur, dt, depth, budget);
         }
         return;
     }
-    try skipOneBody(cur, dt, depth);
+    try chargeAndSkipOne(cur, dt, depth, budget);
+}
+
+/// Charges one budget unit and skips one element. Every path into
+/// `skipOneBody` goes through here, whether the element came from an array,
+/// a sparse map, or the bare (non-array) case -- so nothing can visit an
+/// element for free.
+fn chargeAndSkipOne(cur: *Cursor, dt: Datatype, depth: u8, budget: *u32) Error!void {
+    if (budget.* == 0) return error.WalkBudgetExceeded;
+    budget.* -= 1;
+    try skipOneBody(cur, dt, depth, budget);
 }
 
 /// One scalar-or-composite body, without the array/sparse wrapper.
-fn skipOneBody(cur: *Cursor, dt: Datatype, depth: u8) Error!void {
+fn skipOneBody(cur: *Cursor, dt: Datatype, depth: u8, budget: *u32) Error!void {
     if (fixedBodyLen(dt)) |n| {
         _ = try cur.take(n);
         return;
@@ -312,12 +349,12 @@ fn skipOneBody(cur: *Cursor, dt: Datatype, depth: u8) Error!void {
             if (len > max_elements) return error.TooLong;
             _ = try cur.take(len);
         },
-        .variant => try skipValue(cur, depth - 1),
+        .variant => try skipValue(cur, depth - 1, budget),
         .s7struct => {
             while (true) {
                 const id = try cur.varUint(u32, 5);
                 if (id == 0) break;
-                try skipValue(cur, depth - 1);
+                try skipValue(cur, depth - 1, budget);
             }
         },
         else => return error.UnsupportedDatatype,
@@ -326,11 +363,20 @@ fn skipOneBody(cur: *Cursor, dt: Datatype, depth: u8) Error!void {
 
 /// Consumes one full value: the flags octet, the datatype octet, and the body.
 /// Advances the cursor to the octet after the value.
-pub fn skipValue(cur: *Cursor, depth: u8) Error!void {
+pub fn skipValue(cur: *Cursor, depth: u8, budget: *u32) Error!void {
     if (depth == 0) return error.DepthExceeded;
     const flags = try Flags.decode(try cur.byte());
     const dt: Datatype = @enumFromInt(try cur.byte());
-    try skipBody(cur, flags, dt, depth);
+    try skipBody(cur, flags, dt, depth, budget);
+}
+
+/// Convenience wrapper for callers that want the default, generous
+/// `max_walk_budget` rather than sharing one across several `skipValue`
+/// calls (see `s7plus_object.walkObject`, which threads its own budget
+/// through a whole object graph instead).
+pub fn skipValueDefaultBudget(cur: *Cursor, depth: u8) Error!void {
+    var budget: u32 = max_walk_budget;
+    try skipValue(cur, depth, &budget);
 }
 
 /// Validates that `bytes` is exactly one well-formed value and returns how many
@@ -338,7 +384,7 @@ pub fn skipValue(cur: *Cursor, depth: u8) Error!void {
 /// left for the caller (they are the next field).
 pub fn valueLen(bytes: []const u8) Error!usize {
     var cur = Cursor{ .bytes = bytes };
-    try skipValue(&cur, max_depth);
+    try skipValueDefaultBudget(&cur, max_depth);
     return cur.pos;
 }
 
@@ -727,7 +773,7 @@ fn fuzzValue(_: void, smith: *std.testing.Smith) !void {
     var cur = Cursor{ .bytes = buf[0..len] };
     // Either it validates a prefix as a value (consuming no more than present)
     // or it returns a typed error. Never a panic, never past the buffer.
-    skipValue(&cur, max_depth) catch return;
+    skipValueDefaultBudget(&cur, max_depth) catch return;
     try testing.expect(cur.pos <= len);
 }
 

@@ -151,11 +151,18 @@ pub const elem_attribute: u8 = 0xa3;
 /// ```
 pub fn objectLen(bytes: []const u8) Error!usize {
     var cur = value.Cursor{ .bytes = bytes };
-    try walkObject(&cur, max_object_depth);
+    // One element-visit budget shared by every attribute value in the whole
+    // object graph, however deeply nested -- see `value.WalkBudgetExceeded`
+    // (F6). Without this, each attribute's value walk got its own fresh
+    // `value.max_walk_budget`, so a peer could multiply a handful of input
+    // octets into tens of millions of loop iterations just by declaring many
+    // zero-width-element arrays across many attributes/objects.
+    var elem_budget: u32 = value.max_walk_budget;
+    try walkObject(&cur, max_object_depth, &elem_budget);
     return cur.pos;
 }
 
-fn walkObject(cur: *value.Cursor, depth: u8) Error!void {
+fn walkObject(cur: *value.Cursor, depth: u8, elem_budget: *u32) Error!void {
     if (depth == 0) return error.DepthExceeded;
     if (try cur.byte() != elem_start_object) return error.BadObject;
     _ = try cur.take(8); // relation id (u32) + class id (u32), fixed
@@ -165,17 +172,19 @@ fn walkObject(cur: *value.Cursor, depth: u8) Error!void {
             elem_terminating_object => return,
             elem_attribute => {
                 _ = try cur.varUint(u32, 5); // attribute id
-                // Hand the value walk the *remaining* object-walk budget, not
-                // a fresh `value.max_depth`. A fresh budget here let the two
-                // "independent" bounds compose on the real call stack: an
-                // attribute at object-depth 15 could still open a value
-                // nested 32 deep, for combined recursion nowhere close to
-                // what either constant alone suggests.
-                try value.skipValue(cur, depth);
+                // Hand the value walk the *remaining* object-walk depth
+                // budget, not a fresh `value.max_depth`. A fresh depth budget
+                // here let the two "independent" bounds compose on the real
+                // call stack: an attribute at object-depth 15 could still
+                // open a value nested 32 deep, for combined recursion
+                // nowhere close to what either constant alone suggests.
+                // `elem_budget` is a second, separate resource (total
+                // element visits, not depth) and is shared unconditionally.
+                try value.skipValue(cur, depth, elem_budget);
             },
             elem_start_object => {
                 cur.pos -= 1; // put the marker back for the nested walk
-                try walkObject(cur, depth - 1);
+                try walkObject(cur, depth - 1, elem_budget);
             },
             else => return error.BadObject,
         }
@@ -375,6 +384,49 @@ test "an attribute value inherits the object walk's remaining depth budget, not 
     try testing.expectError(error.DepthExceeded, objectLen(buf[0..w]));
 }
 
+/// Two attributes, each an array of `.null` (0 octets/element, so the wire
+/// cost of naming N elements is the same VLQ regardless of N) of `count1`
+/// and `count2` elements respectively.
+fn buildTwoNullArrayAttrs(out: []u8, count1: u32, count2: u32) ![]u8 {
+    var w: usize = 0;
+    w += (try beginObject(0, 1, out[w..])).len;
+    for ([_]u32{ count1, count2 }, 1..) |count, attr_id| {
+        w += (try beginAttribute(@intCast(attr_id), out[w..])).len;
+        out[w] = value.flag_array;
+        w += 1;
+        out[w] = @intFromEnum(value.Datatype.null);
+        w += 1;
+        w += (try value.putVarUint(count, out[w..])).len;
+    }
+    w += (try endObject(out[w..])).len;
+    return out[0..w];
+}
+
+test "F6: many small requests cannot each buy a fresh max_elements of CPU" {
+    // Each attribute's array count is legal on its own (<= max_elements,
+    // which per-array checks already enforced before this fix) -- the wire
+    // for BOTH attributes together is under 20 octets. Before the fix, each
+    // attribute's `skipValue` got its own fresh `max_walk_budget`
+    // (== max_elements), so two such attributes bought ~2x the iterations of
+    // one; a peer could keep adding more zero-width-element attributes,
+    // each nearly free on the wire, and multiply the CPU cost linearly with
+    // no shared ceiling (F6, measured in the audit: 231 wire octets -> 39.8M
+    // iterations / 142 ms).
+    var buf: [64]u8 = undefined;
+
+    // Positive control: split exactly at the shared budget -- must still
+    // succeed, proving the fix didn't just lower the per-array cap.
+    const half = value.max_walk_budget / 2;
+    const ok = try buildTwoNullArrayAttrs(&buf, half, half);
+    _ = try objectLen(ok);
+
+    // One element over the shared budget, split across two attributes that
+    // are each individually far under `max_elements`.
+    var buf2: [64]u8 = undefined;
+    const over = try buildTwoNullArrayAttrs(&buf2, half, half + 1);
+    try testing.expectError(error.WalkBudgetExceeded, objectLen(over));
+}
+
 test "integrity part round trips" {
     var buf: [16]u8 = undefined;
     const it = Integrity{ .id = 300, .digest = &[_]u8{ 0xDE, 0xAD } };
@@ -466,6 +518,7 @@ fn fuzzObject(_: void, smith: *std.testing.Smith) !void {
     // the unterminated object, which must be refused rather than walked.
     const len: usize = smith.slice(&buf);
     var cur = value.Cursor{ .bytes = buf[0..len] };
-    walkObject(&cur, max_object_depth) catch return;
+    var elem_budget: u32 = value.max_walk_budget;
+    walkObject(&cur, max_object_depth, &elem_budget) catch return;
     try testing.expect(cur.pos <= len);
 }

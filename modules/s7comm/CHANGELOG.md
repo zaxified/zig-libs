@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BREAKING** for `s7plus_value.skipValue`/`skipBody` (new
+  required `budget: *u32` parameter; `skipValueDefaultBudget` added for the
+  old single-call behaviour) — no in-repo caller outside this module, so
+  nothing here needed updating. **BEHAVIOURAL, not breaking** for everyone
+  else: A1 audit findings F1-F14 closed. Of note for `Responder` (`fleetsim`'s
+  consumer): a Read/Write Var request with a known function but a body too
+  short to parse now gets the same typed error reply an unknown function code
+  already got, instead of no reply at all (F8); a COTP `DT` with `EOT = 0`
+  (a fragment) now gets no reply instead of being processed as if it were the
+  whole request (F12); a bit-item reply now pads the item before it when
+  needed (F3, a wire-format correctness fix). `client.Error` gained
+  `ReplyExceedsNegotiatedPdu` and `CotpReferenceMismatch` (additive); a
+  hostile S7CommPlus `CreateObject` reply no longer panics or silently
+  truncates a session id (F1); `TcpTransport`'s read timeout now bounds a
+  packet body, not just its header (F2); `userdata.DataBlock.decode` now
+  refuses a bit-counted length that isn't a whole number of octets instead of
+  silently floor-dividing it (F9); `tpkt.Framer.feed` no longer recompacts its
+  buffer on every call (F10, perf only). Full detail and RED->GREEN
+  measurements: `~/CML/20260901-zig-libs-audit/A1/s7comm.md`.
+
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the local `fuzzSeed` /
   `fuzzSeedInto` copies in this module's fuzz files are now `testkit.fuzz`. The
   helper existed **33 times across 12 modules in three shapes**, each carrying its

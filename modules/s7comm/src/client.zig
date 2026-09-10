@@ -51,6 +51,13 @@ pub const Error = error{
     ItemCountMismatch,
     /// More items than a single request may carry.
     TooManyItems,
+    /// The peer's reply carries more octets than `pduLength()` says it agreed
+    /// to. `pduLength()` is documented as "enforced, not assumed" — this
+    /// closes the receiving half of that promise (F4).
+    ReplyExceedsNegotiatedPdu,
+    /// The COTP `CC`'s `dst_ref` does not echo this connection's `src_ref`
+    /// (F11).
+    CotpReferenceMismatch,
 } || transport.TransportError || tpkt.Error || cotp.Error || s7.Error ||
     items.Error || vars.Error || userdata.Error || address.Error;
 
@@ -148,7 +155,15 @@ pub const Client = struct {
 
         const reply = try self.readPacket();
         switch (try cotp.decode(reply)) {
-            .cc => {},
+            // F11: the CC's `dst_ref` is the peer's echo of the `src_ref` we
+            // put in the CR -- the COTP layer's own correlation field, which
+            // used to be decoded and then never compared (the S7 layer above
+            // it, by contrast, always checks `pdu_reference`). TCP already
+            // correlates the *connection*, so this is a second, weaker
+            // signal, not the only one; but a CC that answers a DIFFERENT CR
+            // than the one just sent should still be refused rather than
+            // silently accepted as this one's reply.
+            .cc => |cc| if (cc.dst_ref != self.config.src_ref) return error.CotpReferenceMismatch,
             .dr, .dc, .er => return error.ConnectionRefused,
             else => return error.UnexpectedReply,
         }
@@ -263,6 +278,15 @@ pub const Client = struct {
         const pdu = try s7.decode(dt.payload);
         if (pdu.header.pdu_reference != self.pdu_ref) return error.PduReferenceMismatch;
         if (pdu.header.isError()) return error.PlcError;
+        // `pduLength()` is documented as enforced on both directions, but
+        // only the outgoing request was checked above (F4): a peer that
+        // ignores the negotiated size (or a MITM inflating a reply) could
+        // hand back a PDU bigger than what callers sized their read-side
+        // budgets (`maxReadBytes`/`maxWriteBytes`) against.
+        if (self.negotiated_pdu_length != 0) {
+            const reply_len = pdu.header.len() + pdu.parameters.len + pdu.data.len;
+            if (reply_len > self.negotiated_pdu_length) return error.ReplyExceedsNegotiatedPdu;
+        }
         return pdu;
     }
 
@@ -682,6 +706,21 @@ test "a mismatched PDU reference is refused" {
     try testing.expectError(error.PduReferenceMismatch, c.readAddress("DB1.DBW20", 2, &out));
 }
 
+test "F7(c): a PDU reference that differs only in the LOW octet is still refused" {
+    // The audit's mutation weakened the comparison to the upper octet only
+    // (`>> 8`). The existing "mismatched PDU reference" test above uses
+    // `0x9999` against the expected `0x0002` -- the octets differ in BOTH
+    // positions, so that mutant still caught it. Expected is 2 (0x0002);
+    // reply says 3 (0x0003) -- same upper octet (0x00), different lower one.
+    var sc: Scripted = .{};
+    var buf: [1024]u8 = undefined;
+    var c = try connectedClient(&sc, &buf);
+    try sc.deliverHex("0300001d" ++ "02f080" ++ "320300000003000200080000" ++ "0401" ++
+        "ff04002012345678");
+    var out: [4]u8 = undefined;
+    try testing.expectError(error.PduReferenceMismatch, c.readAddress("DB1.DBW20", 2, &out));
+}
+
 test "a PLC-level error class is surfaced" {
     var sc: Scripted = .{};
     var buf: [1024]u8 = undefined;
@@ -775,6 +814,32 @@ fn buildReadReply(out: []u8, pdu_ref: u16, payload_len: usize) void {
     @memset(out[25..][0..payload_len], 0xAB);
 }
 
+test "F4: a reply bigger than the negotiated PDU is refused, not trusted (positive control at the boundary)" {
+    var sc: Scripted = .{};
+    var buf: [1024]u8 = undefined;
+    var c = try connectedClient(&sc, &buf); // negotiates 480, maxReadBytes() == 462
+    var frame: [25 + 462]u8 = undefined;
+    buildReadReply(&frame, 2, 462); // header(12) + params(2) + data(4+462) == 480, exactly at the limit
+    sc.lt.deliver(&frame);
+    var out: [462]u8 = undefined;
+    _ = try c.readAddress("DB1.DBB0", 462, &out);
+}
+
+test "F4: a reply bigger than the negotiated PDU is refused, not trusted" {
+    var sc: Scripted = .{};
+    var buf: [1024]u8 = undefined;
+    var c = try connectedClient(&sc, &buf); // negotiates 480, maxReadBytes() == 462
+    // A peer that answers a small request with an oversized reply -- one
+    // octet of payload past what `pduLength()` allows -- used to be believed
+    // outright (F4): only the outgoing request was checked against the
+    // negotiated size, never the incoming reply.
+    var frame: [25 + 463]u8 = undefined;
+    buildReadReply(&frame, 2, 463); // header(12) + params(2) + data(4+463) == 481, one over
+    sc.lt.deliver(&frame);
+    var out: [4]u8 = undefined;
+    try testing.expectError(error.ReplyExceedsNegotiatedPdu, c.readAddress("DB1.DBW20", 2, &out));
+}
+
 test "a multi-item read reports per-item outcomes without failing the call" {
     var sc: Scripted = .{};
     var buf: [1024]u8 = undefined;
@@ -855,6 +920,19 @@ test "a COTP disconnect instead of a CC is a refused connection" {
     try sc.deliverHex("0300000b" ++ "06800000000100");
     var c = try Client.init(sc.lt.transport(), &buf, .{});
     try testing.expectError(error.ConnectionRefused, c.connect());
+}
+
+test "F11: a CC whose dst_ref does not echo this connection's src_ref is refused" {
+    // `cc_frame` (`dst_ref = 0x0001`) is the positive control every other
+    // test in this file already relies on: it round-trips through `connect`
+    // successfully against `Config.src_ref`'s default of 1. Mutate only the
+    // `dst_ref` field to 0x0002, otherwise byte-identical.
+    const mismatched_cc = "0300001611d00002000100c0010ac1020100c2020101";
+    var sc: Scripted = .{};
+    var buf: [1024]u8 = undefined;
+    try sc.deliverHex(mismatched_cc);
+    var c = try Client.init(sc.lt.transport(), &buf, .{});
+    try testing.expectError(error.CotpReferenceMismatch, c.connect());
 }
 
 test "the PLC control services emit the captured parameter blocks" {

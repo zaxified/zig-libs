@@ -161,7 +161,7 @@ Concretely:
    for `0x0011`, `0x001C`, `0x0132` and `0x0424`; and `PLC stop`, `warm restart` and `cold
    restart` with their `P_PROGRAM` parameter blocks.
 
-2. **The responder's replies are byte-compared against the recorded CPU's.** Replaying the captured
+2. **The responder's replies are byte-compared against the captured snap7-server's.** Replaying the captured
    client requests through `Responder.handle` reproduces the snap7 server's answers octet for octet
    for: the `Setup communication` acknowledgement, a DB write, a DB read, a read of a DB that does
    not exist, and a read past the end of a DB that does.

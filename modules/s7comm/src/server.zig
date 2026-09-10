@@ -55,9 +55,11 @@ pub const Config = struct {
 };
 
 /// The length field a failed data item carries. It is meaningless — there is
-/// no payload behind it — but the reference CPU emits exactly `0x0004` for
-/// every failed item regardless of what was asked for, and the responder
-/// reproduces that so its replies are byte-identical to a real one's.
+/// no payload behind it — but the captured snap7-server emits exactly
+/// `0x0004` for every failed item regardless of what was asked for (F13: the
+/// capture's peer was snap7's software server-emulator, not a physical
+/// Siemens CPU), and the responder reproduces that so its replies are
+/// byte-identical to the capture's.
 pub const error_item_length: u16 = 4;
 
 pub const Responder = struct {
@@ -107,7 +109,19 @@ pub const Responder = struct {
                 self.connected = false;
                 return null;
             },
-            .dt => |dt| return try self.handleS7(dt.payload, out),
+            .dt => |dt| {
+                // F12: `EOT = 0` marks a fragment -- the peer is still
+                // sending more DTs of the same PDU. `cotp.zig`'s own doc
+                // comment claims a peer that clears it "is fragmenting,
+                // which this implementation refuses to reassemble" -- but
+                // nothing here ever read `dt.eot`, so the first fragment
+                // was processed as if it were the whole request. Since there
+                // is no reassembly, the honest answer to an incomplete
+                // request is the same as to a disconnect: no reply yet: a
+                // real CPU also would not answer until it had seen the rest.
+                if (!dt.eot) return null;
+                return try self.handleS7(dt.payload, out);
+            },
             else => return error.Unsupported,
         }
     }
@@ -147,7 +161,16 @@ pub const Responder = struct {
     }
 
     fn doRead(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
-        const req = try vars.decodeRequest(pdu.parameters);
+        // A parameter block this responder cannot even parse (F8: e.g. a
+        // Read Var request whose function octet is right but whose item
+        // count/spec is short) used to propagate the decode error straight
+        // out of `handle`, leaving the caller with NO reply at all -- unlike
+        // an unrecognised function code, which already gets a typed error
+        // reply below in `handleJob`. A real peer that sent a malformed but
+        // recognisable request sees a dead connection instead of a typed
+        // refusal, and (per the audit) that killed every later call on it.
+        const req = vars.decodeRequest(pdu.parameters) catch
+            return errorReply(pdu, .error_on_service_processing, 0x04, out);
         var it = req.iterator();
         // Build the data block into the tail of `out` and the parameters in
         // front of it once the length is known.
@@ -194,16 +217,12 @@ pub const Responder = struct {
                 items.DataTransportSize.byte_word_dword;
             if (ts == .bit) {
                 // One bit, reported the way a real CPU does: length 1.
+                // `addBit` pads the *previous* item first -- writing this
+                // shape straight into `data` (as this used to) skipped that
+                // pad whenever the previous item left an odd offset (F3).
                 const byte = store[item.byteOffset()];
-                const v: u8 = @intFromBool((byte >> item.bitOffset()) & 1 != 0);
-                if (w.pos + 5 > data.len) return error.BufferTooSmall;
-                data[w.pos] = @intFromEnum(items.ReturnCode.success);
-                data[w.pos + 1] = @intFromEnum(items.DataTransportSize.bit);
-                data[w.pos + 2] = 0;
-                data[w.pos + 3] = 1;
-                data[w.pos + 4] = v;
-                w.pos += 5;
-                w.pending_pad = true;
+                const v = (byte >> item.bitOffset()) & 1 != 0;
+                try w.addBit(v);
             } else {
                 try w.add(ts, store[start..][0..want]);
             }
@@ -214,7 +233,10 @@ pub const Responder = struct {
     }
 
     fn doWrite(self: *Responder, pdu: s7.Pdu, out: []u8) Error![]u8 {
-        const req = try vars.decodeRequest(pdu.parameters);
+        // Same reasoning as `doRead` above (F8): answer with a typed error
+        // rather than dropping the reply entirely.
+        const req = vars.decodeRequest(pdu.parameters) catch
+            return errorReply(pdu, .error_on_service_processing, 0x04, out);
         var it = req.iterator();
         var di = items.DataItemIterator.initRequest(pdu.data, req.count);
         var codes: [vars.max_items]u8 = undefined;
@@ -554,6 +576,86 @@ test "a Read Var item with count 0 on the bit path does not index past the area"
         &[_]u8{ @intFromEnum(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
         rep[21..],
     );
+}
+
+test "F7(a): a read that lands exactly on the end of the area succeeds (positive control)" {
+    // A byte-transport read of all 64 octets of a 64-octet DB: start=0,
+    // want=64, so `start + want == store.len` exactly.
+    var db: [64]u8 = @splat(0);
+    var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
+    var r = Responder.init(.{}, &areas);
+    var in: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    // ts=byte(0x02), count=0x0040 (64), db=1, area=DB(0x84), bit address 0.
+    const req = hex("0300001f" ++ "02f080" ++ "320100000001000e0000" ++ "0401" ++
+        "120a1002" ++ "0040" ++ "0001" ++ "84" ++ "000000", &in);
+    const rep = (try r.handle(req, &out)).?;
+    try testing.expectEqual(@intFromEnum(items.ReturnCode.success), rep[21]);
+}
+
+test "F7(a): a read that lands one octet past the end of the area is refused, not a stray byte" {
+    // Regression: the audit's mutation `start + want > store.len` ->
+    // `start + want > store.len + 1` survived the whole suite, because
+    // nothing exercised the exact boundary it changes -- `start + want ==
+    // store.len + 1`, i.e. reading one octet past a real, non-empty area
+    // (the earlier `count == 0` regression only covers `start == store.len`
+    // with `want == 0`). Same shape as that test, but a byte-transport read
+    // of 65 octets from a 64-octet DB: start=0, want=65.
+    var db: [64]u8 = @splat(0);
+    var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
+    var r = Responder.init(.{}, &areas);
+    var in: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    // ts=byte(0x02), count=0x0041 (65), db=1, area=DB(0x84), bit address 0.
+    const req = hex("0300001f" ++ "02f080" ++ "320100000001000e0000" ++ "0401" ++
+        "120a1002" ++ "0041" ++ "0001" ++ "84" ++ "000000", &in);
+    const rep = (try r.handle(req, &out)).?;
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{ @intFromEnum(items.ReturnCode.invalid_address), 0x00, 0x00, 0x04 },
+        rep[21..],
+    );
+}
+
+test "F8: a Read Var request too short to parse still gets a typed reply, not silence" {
+    // The audit's own capture against a real independent client: a Job with
+    // `parameter_length = 1` -- just the function octet (Read Var, 0x04),
+    // no item count. `vars.decodeRequest` correctly refuses it
+    // (`error.ShortParameters`), but that used to propagate straight out of
+    // `handle`, leaving `null` -- no reply at all. The peer that sent this
+    // frame timed out waiting for one, and (being a real stack, not this
+    // test) treated the whole connection as dead afterwards. An unknown
+    // FUNCTION code already got a typed reply (`handleJob`'s `else` arm);
+    // a malformed body for a known one now does too.
+    var db: [8]u8 = @splat(0);
+    var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
+    var r = Responder.init(.{}, &areas);
+    var in: [64]u8 = undefined;
+    var out: [64]u8 = undefined;
+    const req = hex("03000012" ++ "02f080" ++ "32010000" ++ "0007" ++ "0001" ++ "0000" ++ "04", &in);
+    const rep = (try r.handle(req, &out)).?;
+    const pdu = try s7.decode((try cotp.decode((try tpkt.decode(rep)).payload)).dt.payload);
+    try testing.expectEqual(@as(u16, 7), pdu.header.pdu_reference);
+    try testing.expectEqual(s7.ErrorClass.error_on_service_processing, pdu.header.error_class);
+    try testing.expectEqual(@as(u8, 0x04), pdu.header.error_code);
+}
+
+test "F12: a COTP DT with EOT=0 is a fragment and gets no reply, not processed whole" {
+    // Same well-formed Read Var request as the `count == 0` regression
+    // above, except the COTP DT header's EOT bit is cleared (TPDU number 3,
+    // `02 f0 03` instead of `02 f0 80`) -- the audit's own repro. `cotp.zig`
+    // documents this bit as "a peer that clears it is fragmenting, which
+    // this implementation refuses to reassemble", but nothing read it:
+    // before the fix this single (necessarily incomplete) DT was answered
+    // as a complete 29-octet reply.
+    var db: [64]u8 = @splat(0);
+    var areas = [_]AreaBinding{.{ .area = .db, .db_number = 1, .bytes = &db }};
+    var r = Responder.init(.{}, &areas);
+    var in: [64]u8 = undefined;
+    var out: [128]u8 = undefined;
+    const req = hex("0300001f" ++ "02f003" ++ "320100000001000e0000" ++ "0401" ++
+        "120a1001" ++ "0000" ++ "0001" ++ "84" ++ "000200", &in);
+    try testing.expectEqual(@as(?[]const u8, null), try r.handle(req, &out));
 }
 
 test "fuzz: the responder never panics on hostile requests inside a well-formed envelope" {

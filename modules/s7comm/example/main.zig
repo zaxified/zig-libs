@@ -67,7 +67,7 @@ pub fn main() !void {
     try client.writeAddress("DB1.DBW20", 2, &[_]u8{ 0x12, 0x34, 0x56, 0x78 });
     var out: [4]u8 = undefined;
     const read_back = try client.readAddress("DB1.DBW20", 2, &out);
-    std.debug.print("DB1.DBW20 read back: {x}\n", .{std.fmt.bytesToHex(read_back[0..4].*, .lower)});
+    std.debug.print("DB1.DBW20 read back: {s}\n", .{std.fmt.bytesToHex(read_back[0..4].*, .lower)});
 
     // CPU status via Read SZL.
     const status = try client.cpuStatus();

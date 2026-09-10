@@ -128,12 +128,23 @@ pub const Framer = struct {
     }
 
     pub fn feed(self: *Framer, bytes: []const u8) error{Overflow}!void {
-        if (self.pos > 0) {
-            std.mem.copyForwards(u8, self.buf[0..self.pending()], self.buf[self.pos..self.len]);
-            self.len -= self.pos;
-            self.pos = 0;
+        // F10: compact only when appending would otherwise overflow, not on
+        // every call. Compacting unconditionally whenever `pos > 0` made
+        // assembling one packet fed a few octets at a time cost O(pending)
+        // work PER `feed` call -- O(pending^2) overall for the whole packet
+        // (measured: 555x slower feeding 1 octet at a time vs the whole
+        // packet at once, ~32 MB moved to assemble one 8 KB packet). Most
+        // `feed` calls have room to just append; a `pos > 0` from an
+        // already-yielded packet only needs to be reclaimed once space
+        // actually runs out.
+        if (self.len + bytes.len > self.buf.len) {
+            if (self.pos > 0) {
+                std.mem.copyForwards(u8, self.buf[0..self.pending()], self.buf[self.pos..self.len]);
+                self.len -= self.pos;
+                self.pos = 0;
+            }
+            if (self.len + bytes.len > self.buf.len) return error.Overflow;
         }
-        if (self.len + bytes.len > self.buf.len) return error.Overflow;
         @memcpy(self.buf[self.len..][0..bytes.len], bytes);
         self.len += bytes.len;
     }
@@ -225,6 +236,37 @@ test "framer reassembles split packets and yields several per feed" {
     try testing.expectEqualSlices(u8, b[4..], (try f.next()).?.payload);
     try testing.expect((try f.next()) == null);
     try testing.expectEqual(@as(usize, 0), f.pending());
+}
+
+test "F10: feed does not recompact the buffer once a consumed packet's space isn't needed yet" {
+    // The audit's finding: `feed` unconditionally shifted the whole pending
+    // tail down to offset 0 whenever `pos > 0`, on EVERY call -- so
+    // assembling one packet fed one octet at a time cost O(pending) work
+    // PER OCTET instead of amortized O(1) (measured: 555x for a 1-octet feed
+    // vs an 8000-octet one, ~32 MB moved for one 8 KB packet). The fix defers
+    // that copy until it is actually needed to make room for the next
+    // append. Observable without timing: once a packet has been consumed
+    // (`pos > 0`) but the buffer still has free space at the end, one more
+    // small `feed` must NOT touch `pos` at all.
+    var storage: [256]u8 = undefined;
+    var f = Framer.init(&storage);
+    const a = [_]u8{ 0x03, 0x00, 0x00, 0x07, 0x02, 0xF0, 0x80 };
+    const b = [_]u8{ 0x03, 0x00, 0x00, 0x06, 0x01, 0xE0 };
+    try f.feed(&a);
+    _ = (try f.next()).?;
+    const pos_after_consume = f.pos;
+    try testing.expect(pos_after_consume > 0);
+
+    // One octet of the NEXT packet. Plenty of room left (256 - 7 octets
+    // used); a lazily-compacting `feed` leaves `pos` exactly where it was
+    // instead of shifting the (empty) pending tail down for no reason.
+    try f.feed(b[0..1]);
+    try testing.expectEqual(pos_after_consume, f.pos);
+
+    // Positive control: feeding the rest and decoding still works correctly
+    // -- laziness must not leak stale octets or desync the stream.
+    try f.feed(b[1..]);
+    try testing.expectEqualSlices(u8, b[4..], (try f.next()).?.payload);
 }
 
 test "framer refuses a packet larger than its storage instead of blocking forever" {

@@ -167,10 +167,27 @@ pub const TcpTransport = struct {
         // Past the header there is no graceful idle: a timeout here means the
         // peer stopped mid-packet and the connection is unusable, so even a
         // clean close counts as a failure. A cancel is still a cancel.
-        r.readSliceAll(buf[tpkt.header_len..total]) catch |e| switch (e) {
-            error.EndOfStream => return error.ReadFailed,
-            error.ReadFailed => return self.readFailure(),
-        };
+        //
+        // `readSliceAll` is not used here: it loops internally over as many
+        // underlying reads as it takes to fill the buffer, with no `poll`
+        // in between, so a peer that sends the header and then goes silent
+        // makes it block forever (F2) -- `read_timeout_ms` bounded the
+        // header above but nothing bounded the body. Pulling the body one
+        // `readVec` at a time, re-checking `waitReadable` whenever nothing
+        // is already buffered, gives the body the same timeout the header
+        // gets.
+        var got: usize = 0;
+        const want = total - tpkt.header_len;
+        while (got < want) {
+            if (r.bufferedLen() == 0 and !try self.waitReadable()) return error.ReadFailed;
+            var target: [1][]u8 = .{buf[tpkt.header_len + got .. total]};
+            const n = r.readVec(&target) catch |e| switch (e) {
+                error.EndOfStream => return error.ReadFailed,
+                error.ReadFailed => return self.readFailure(),
+            };
+            if (n == 0) return error.ReadFailed; // peer closed mid-packet
+            got += n;
+        }
         return total;
     }
 
@@ -369,4 +386,35 @@ test "a cancel during the read timeout's poll is not reported as an idle round" 
     var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
     try io.sleep(.fromMilliseconds(100), .awake);
     try testing.expectError(error.Canceled, fut.cancel(io));
+}
+
+// ── F2: a read timeout must bound the BODY, not just the header ────────────
+
+test "a peer that sends the header and then goes silent does not hang the body read" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = try silentListener(io);
+    defer server.deinit(io);
+    var fixture = try SilentPeer.open(io, &server);
+    defer fixture.close(io);
+
+    // Announce a 256-octet TPKT packet (4-octet header, length field = 256)
+    // and then go silent forever -- the remaining 252 octets never arrive.
+    fixture.tt.setReadTimeout(300);
+    const header = [_]u8{ 0x03, 0x00, 0x01, 0x00 };
+    _ = std.os.linux.write(fixture.peer.socket.handle, &header, header.len);
+
+    var buf: [4096]u8 = undefined;
+    var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
+    // Safety net, not the assertion: before the fix, the body read had no
+    // timeout at all and blocked forever on this exact peer shape (F2). Give
+    // it a bound of ~7x the 300 ms read timeout, then force the issue with
+    // `cancel` so a regression fails this test instead of hanging the whole
+    // suite. With the fix, `readFn` has already returned `error.ReadFailed`
+    // on its own well before this fires, so `cancel` finds nothing left to
+    // cancel and just hands back that same result.
+    try io.sleep(.fromMilliseconds(2000), .awake);
+    try testing.expectError(error.ReadFailed, fut.cancel(io));
 }

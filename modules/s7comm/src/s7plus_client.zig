@@ -275,7 +275,16 @@ fn findUdintAttr(bytes: []const u8, attr_id: u32) Error!u32 {
                 const rest = cur.bytes[cur.pos..];
                 const dec = try value.decodeScalar(rest);
                 cur.pos += dec.len;
-                if (id == attr_id) return @intCast(dec.value.unsigned);
+                if (id == attr_id) {
+                    // The peer's attribute may carry any scalar datatype; only
+                    // `.unsigned` (dword/udint/uint/usint/byte/word) is valid
+                    // here, and even then only if it fits u32 (ulint/lword can
+                    // carry up to 64 bits). Reject anything else with a typed
+                    // error instead of reading the wrong union field or
+                    // truncating silently.
+                    if (dec.value != .unsigned) return error.BadObject;
+                    return std.math.cast(u32, dec.value.unsigned) orelse error.BadObject;
+                }
             },
             else => return error.BadObject,
         }
@@ -535,4 +544,52 @@ test "responder rejects a replayed integrity id" {
 
     var out: [256]u8 = undefined;
     try testing.expectError(error.IntegrityReplay, r.handle(tframe, &out));
+}
+
+// ── F1: a hostile CreateObject reply must not desync the union or the width ─
+
+/// Builds a minimal CreateObject-response-shaped object stream carrying a
+/// single attribute `attr_session_id`, whose value is caller-supplied bytes
+/// (so the test can put an arbitrary scalar encoding there).
+fn buildSessionAttrObject(encoded_value: []const u8, out: []u8) []u8 {
+    var w: usize = 0;
+    w += (object.beginObject(0, session_class_id, out[w..]) catch unreachable).len;
+    w += (object.beginAttribute(attr_session_id, out[w..]) catch unreachable).len;
+    @memcpy(out[w..][0..encoded_value.len], encoded_value);
+    w += encoded_value.len;
+    w += (object.endObject(out[w..]) catch unreachable).len;
+    return out[0..w];
+}
+
+test "findUdintAttr: honest udint attribute still parses (positive control)" {
+    var enc: [8]u8 = undefined;
+    const v = try value.encodeScalar(.udint, i64, 123456, &enc);
+    var buf: [32]u8 = undefined;
+    const obj = buildSessionAttrObject(v, &buf);
+    try testing.expectEqual(@as(u32, 123456), try findUdintAttr(obj, attr_session_id));
+}
+
+test "findUdintAttr: a boolean attribute is a typed error, not a union-field panic" {
+    var enc: [8]u8 = undefined;
+    const v = try value.encodeScalar(.bool, i64, 1, &enc);
+    var buf: [32]u8 = undefined;
+    const obj = buildSessionAttrObject(v, &buf);
+    try testing.expectError(error.BadObject, findUdintAttr(obj, attr_session_id));
+}
+
+test "findUdintAttr: a ulint attribute past u32 is a typed error, not a truncated cast" {
+    var enc: [16]u8 = undefined;
+    // 2^40, matches the audit's repro value.
+    const v = try value.encodeScalar(.ulint, i64, 1 << 40, &enc);
+    var buf: [32]u8 = undefined;
+    const obj = buildSessionAttrObject(v, &buf);
+    try testing.expectError(error.BadObject, findUdintAttr(obj, attr_session_id));
+}
+
+test "findUdintAttr: a ulint attribute that DOES fit u32 still parses (positive control)" {
+    var enc: [16]u8 = undefined;
+    const v = try value.encodeScalar(.ulint, i64, 0xABCD, &enc);
+    var buf: [32]u8 = undefined;
+    const obj = buildSessionAttrObject(v, &buf);
+    try testing.expectEqual(@as(u32, 0xABCD), try findUdintAttr(obj, attr_session_id));
 }

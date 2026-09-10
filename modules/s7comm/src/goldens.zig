@@ -591,7 +591,7 @@ test "the PLC control requests carry the P_PROGRAM parameter block" {
     try testing.expectEqualSlices(u8, "P_PROGRAM", c[13..22]);
 }
 
-test "the responder's replies are byte-compared against the recorded CPU's" {
+test "the responder's replies are byte-compared against the captured snap7-server's" {
     const server = @import("server.zig");
     var db1: [256]u8 = @splat(0);
     var db2: [64]u8 = @splat(0);

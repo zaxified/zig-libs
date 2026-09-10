@@ -56,7 +56,7 @@ pub const wstring_hi = [_]u8{ 0x00, 0x15, 0x02, 0x48, 0x69 };
 
 // ── pinned frame goldens ────────────────────────────────────────────────────
 
-/// A minimal Connect PDU: header `72 01`, data length 9, a `CreateObject`
+/// A minimal Connect PDU: header `72 01`, data length 13, a `CreateObject`
 /// request header and an empty session object, no trailer.
 pub const connect_frame = [_]u8{
     0x72, 0x01, 0x00, 0x0d, // header: protid, connect, data length 13

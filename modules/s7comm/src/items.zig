@@ -415,6 +415,26 @@ pub const DataBlockWriter = struct {
         self.pending_pad = payload.len % 2 == 1;
     }
 
+    /// Appends a single-bit reply item (return code `success`, transport size
+    /// `bit`, length 1, one value octet), the way a real CPU reports a bit
+    /// read. Unlike `add`/`addWith`, a caller cannot build this shape by
+    /// hand and pass it through `add`: the wire length is 1 bit, not 1
+    /// octet, so `encodeLength` would compute the wrong `raw` length for it.
+    /// Pads the *previous* item first, exactly like every other `add*`
+    /// entry point -- a bit item written directly into `out` bypassing this
+    /// method loses that padding when the item before it left an odd offset.
+    pub fn addBit(self: *DataBlockWriter, value: bool) Error!void {
+        try self.padIfNeeded();
+        if (self.pos + 5 > self.out.len) return error.BufferTooSmall;
+        self.out[self.pos] = @intFromEnum(ReturnCode.success);
+        self.out[self.pos + 1] = @intFromEnum(DataTransportSize.bit);
+        self.out[self.pos + 2] = 0;
+        self.out[self.pos + 3] = 1;
+        self.out[self.pos + 4] = @intFromBool(value);
+        self.pos += 5;
+        self.pending_pad = true; // length 1 is always odd
+    }
+
     /// Appends a failed item: four octets, no payload, no padding after it.
     pub fn addError(self: *DataBlockWriter, rc: ReturnCode, raw_length: u16) Error!void {
         try self.padIfNeeded();
@@ -583,6 +603,29 @@ test "iterator refuses a length that runs past the block" {
     try testing.expectError(error.ShortItem, it3.next());
 }
 
+test "F7(b): a length one octet past the block is refused (boundary, not a gross overrun)" {
+    // The audit's mutation `self.pos + 4 + n > self.bytes.len` ->
+    // `> self.bytes.len + 1` survived the suite: the existing "runs past the
+    // block" test overshoots by 30 octets (32 claimed, 2 present), which
+    // both the real guard and the mutant reject. The exact boundary the
+    // mutant opens up -- `pos + 4 + n == bytes.len + 1`, one octet over --
+    // needs its own case.
+    //
+    // Positive control: header (4) + 2 octets present, length field claims
+    // exactly 2 octets (16 bits) -- fits exactly, must succeed.
+    const exact = [_]u8{ 0xFF, 0x04, 0x00, 0x10, 0xAA, 0xBB };
+    var it_ok = DataItemIterator.init(&exact, 1);
+    const good = (try it_ok.next()).?;
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xAA, 0xBB }, good.payload);
+
+    // Same block, length field claims 3 octets (24 bits) -- one more than
+    // the 2 that are actually present. Must be refused, not read as
+    // `bytes[4..][0..3]` (one octet past the 6-octet block).
+    const over = [_]u8{ 0xFF, 0x04, 0x00, 0x18, 0xAA, 0xBB };
+    var it_bad = DataItemIterator.init(&over, 1);
+    try testing.expectError(error.BadDataLength, it_bad.next());
+}
+
 test "writer reproduces the reference padding" {
     var buf: [64]u8 = undefined;
     var w = DataBlockWriter{ .out = &buf };
@@ -600,6 +643,31 @@ test "writer reproduces the reference padding" {
     try testing.expectEqual(@as(usize, 1), (try it.next()).?.payload.len);
     try testing.expectEqual(@as(usize, 3), (try it.next()).?.payload.len);
     try testing.expectEqual(@as(usize, 2), (try it.next()).?.payload.len);
+}
+
+test "F3: a bit item pads the item before it, and re-parses correctly" {
+    var buf: [64]u8 = undefined;
+    var w = DataBlockWriter{ .out = &buf };
+    // One octet (odd length -> pending_pad) followed by a bit item. Mirrors
+    // the audit repro: a byte read from DB1 followed by a bit from M0.0.
+    try w.add(.byte_word_dword, &[_]u8{0x5a});
+    try w.addBit(true);
+    try testing.expectEqualSlices(u8, &[_]u8{
+        0xFF, 0x04, 0x00, 0x08, 0x5a, 0x00, // item 0 + pad
+        0xFF, 0x03, 0x00, 0x01, 0x01, // item 1 (bit, value 1)
+    }, w.written());
+    // And it re-parses as two items, the second correctly a 1-octet bit
+    // payload with the value set -- before the fix, the missing pad byte
+    // shifted the decoder by one octet and item 1 came back as a `0x03`
+    // (`access_denied`) failed item instead.
+    var it = DataItemIterator.init(w.written(), 2);
+    const item0 = (try it.next()).?;
+    try testing.expect(item0.return_code.isSuccess());
+    try testing.expectEqualSlices(u8, &[_]u8{0x5a}, item0.payload);
+    const item1 = (try it.next()).?;
+    try testing.expect(item1.return_code.isSuccess());
+    try testing.expectEqual(DataTransportSize.bit, item1.transport_size);
+    try testing.expectEqualSlices(u8, &[_]u8{0x01}, item1.payload);
 }
 
 test "writer refuses to overflow the caller's buffer" {

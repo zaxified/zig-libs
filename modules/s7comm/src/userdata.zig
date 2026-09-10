@@ -46,7 +46,7 @@ pub const Error = error{
     BadSzl,
     /// The caller's output buffer is too small.
     BufferTooSmall,
-};
+} || items.Error;
 
 /// High nibble of the `type|group` octet.
 pub const MessageType = enum(u4) {
@@ -179,7 +179,14 @@ pub const DataBlock = struct {
         const rc: items.ReturnCode = @enumFromInt(bytes[0]);
         const ts: items.DataTransportSize = @enumFromInt(bytes[1]);
         const raw: u16 = (@as(u16, bytes[2]) << 8) | bytes[3];
-        const n: usize = if (ts.lengthInBits()) raw / 8 else raw;
+        // F9: this used to compute `raw / 8` by hand for a bit-counted
+        // length, silently floor-dividing a length that is not a whole
+        // number of octets -- `items.decodeLength` (the same wire concept,
+        // used by `items.DataItemIterator` for Read/Write Var) refuses that
+        // shape instead. Two decoders for the same length encoding
+        // disagreeing inside one module is exactly the parser differential
+        // an OT monitor watching the wire with one rule would desync on.
+        const n = try items.decodeLength(ts, raw);
         if (4 + n > bytes.len) return error.ShortData;
         return .{ .return_code = rc, .transport_size = ts, .payload = bytes[4..][0..n] };
     }
@@ -350,7 +357,9 @@ test "response sub-header round trip" {
         .last_data_unit = .no_more,
     };
     const enc = try p.encodeResponse(&buf);
-    // Byte for byte what a real CPU's Read-SZL response carried.
+    // Byte for byte what the captured snap7-server's Read-SZL response
+    // carried (F13: the capture's peer was snap7's software server-emulator,
+    // not a physical Siemens CPU).
     try testing.expectEqualSlices(u8, &[_]u8{
         0x00, 0x01, 0x12, 0x08, 0x12, 0x84, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
     }, enc);
@@ -411,6 +420,31 @@ test "userdata data block is octet-counted" {
     // Announcing more than is present is refused.
     try testing.expectError(error.ShortData, DataBlock.decode(&[_]u8{ 0xFF, 0x09, 0x00, 0x40, 0x00 }));
     try testing.expectError(error.ShortData, DataBlock.decode(&[_]u8{ 0xFF, 0x09 }));
+}
+
+test "F9: a bit-counted length that is not a whole octet is refused, not floor-divided" {
+    // Same values the audit measured directly against `items.decodeLength`
+    // (`ts = byte_word_dword`, which is bit-counted): before the fix this
+    // decoder computed `raw / 8` by hand and accepted every one of these,
+    // silently returning 0 or 1 octets instead of refusing a length that
+    // does not describe a whole number of octets.
+    for ([_]u16{ 1, 4, 12, 15, 17 }) |raw| {
+        var buf: [8]u8 = undefined;
+        buf[0] = @intFromEnum(items.ReturnCode.success);
+        buf[1] = @intFromEnum(items.DataTransportSize.byte_word_dword);
+        buf[2] = @intCast(raw >> 8);
+        buf[3] = @intCast(raw & 0xFF);
+        try testing.expectError(error.LengthTransportMismatch, DataBlock.decode(buf[0..8]));
+    }
+    // Positive control: a multiple of 8 still decodes, at the octet count
+    // `items.decodeLength` (and the old `raw / 8`) both agree on.
+    var ok: [8]u8 = undefined;
+    ok[0] = @intFromEnum(items.ReturnCode.success);
+    ok[1] = @intFromEnum(items.DataTransportSize.byte_word_dword);
+    ok[2] = 0;
+    ok[3] = 16; // 16 bits = 2 octets
+    const dec = try DataBlock.decode(&ok);
+    try testing.expectEqual(@as(usize, 2), dec.payload.len);
 }
 
 test "cpu status is read from the 0x0424 record" {
