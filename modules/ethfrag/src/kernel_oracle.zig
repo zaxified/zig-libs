@@ -101,11 +101,13 @@
 //!
 //! **This module intentionally diverges from the kernel on `duplicate`**:
 //! `Reassembler.insert` drops the whole datagram on ANY overlap, including
-//! an exact duplicate (`root.zig`'s doc comment already named this design
-//! choice explicitly, before this file existed: "there is deliberately no
-//! separate 'identical bytes, so merge it' fast path, because that
-//! distinction is exactly what overlap-based IDS-evasion attacks rely
-//! on"). This capture is the first EXTERNAL confirmation that a real,
+//! an exact duplicate (`SPEC.md`'s threat-model section already named this
+//! design choice explicitly, before this file existed: "there is
+//! deliberately no separate 'identical bytes, so merge it' fast path,
+//! because that distinction is exactly what overlap-based IDS-evasion
+//! attacks rely on" — Audit F12: this used to misattribute the quote to
+//! `root.zig`, which never carried it). This capture is the first EXTERNAL
+//! confirmation that a real,
 //! widely-deployed stack (this host's Linux kernel) does implement exactly
 //! that fast path for both IPv4 and IPv6 -- i.e. this module is
 //! deliberately, verifiably stricter than the reference implementation it

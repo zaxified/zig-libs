@@ -243,6 +243,18 @@ pub const ReassemblerConfig = struct {
     /// fragment for that id, or explicitly via `expireOlderThan`).
     /// Caller-clocked — this module never reads a clock itself.
     timeout_ns: u64,
+    /// Absolute cap in nanoseconds on how long an in-flight datagram may
+    /// be held, measured from its FIRST fragment, regardless of how
+    /// recently it last received one. `timeout_ns` alone only bounds the
+    /// GAP since the last accepted fragment — a steady trickle of fresh,
+    /// individually legitimate, non-overlapping fragments for the same
+    /// `frag_id` refreshes it forever and never goes idle, so nothing ever
+    /// reclaimed the slot (Audit F2, HIGH). `null` (the default) applies
+    /// `8 * timeout_ns`: enough slack for a legitimately bursty sender,
+    /// but a real ceiling rather than none. Enforced both inline (a fresh
+    /// fragment for a datagram past this age starts a new one, same as
+    /// the idle check) and by `expireOlderThan`.
+    max_lifetime_ns: ?u64 = null,
 };
 
 pub const InsertResult = union(enum) {
@@ -258,6 +270,20 @@ pub const InsertError = Header.DecodeError || error{
     /// declared `length` (too few = truncated on the wire; too many =
     /// unexplained trailing bytes — both rejected rather than guessed at).
     LengthMismatch,
+    /// A non-final (`more = true`) fragment carried zero payload bytes.
+    /// `fragment()` never produces one — a non-final fragment always
+    /// carries at least one payload byte, since the only `length == 0`
+    /// fragment it ever emits is the sole, final fragment of an empty
+    /// frame. A contentless `more = true` fragment therefore buys a
+    /// legitimate sender nothing, and (before this check existed) it was
+    /// the one shape RFC 5722 overlap rejection could not see on replay:
+    /// the half-open `[offset, offset+length)` overlap test degenerates
+    /// to the empty set whenever the incoming range has zero length, so a
+    /// zero-length fragment never overlapped anything — including an
+    /// exact resend of itself — and could be replayed at the wire's
+    /// cheapest possible cost (8 bytes, no state built) forever (Audit
+    /// F1: A3/A3b).
+    EmptyNonFinalFragment,
     /// This fragment's `[offset, offset+length)` span exceeds the
     /// configured `max_frame_len`, or exceeds a total length already
     /// established by an earlier `more=false` fragment for this datagram
@@ -296,6 +322,7 @@ pub const Reassembler = struct {
         covered: usize = 0,
         total_len: ?usize = null,
         last_seen_ns: u64,
+        created_ns: u64,
 
         fn deinit(self: *Entry, allocator: Allocator) void {
             allocator.free(self.buf);
@@ -303,9 +330,31 @@ pub const Reassembler = struct {
         }
     };
 
+    /// The effective absolute-lifetime ceiling for `config` (Audit F2):
+    /// `config.max_lifetime_ns` if the caller set one, else `8 *
+    /// timeout_ns` — saturating, so a `timeout_ns` near `maxInt(u64)`
+    /// caps at `maxInt(u64)` rather than wrapping to something small.
+    fn lifetimeCap(config: ReassemblerConfig) u64 {
+        return config.max_lifetime_ns orelse (8 *| config.timeout_ns);
+    }
+
     pub fn init(allocator: Allocator, config: ReassemblerConfig) Reassembler {
-        std.debug.assert(config.max_inflight >= 1);
-        std.debug.assert(config.max_frame_len >= 1 and config.max_frame_len <= max_frame_len);
+        // Audit F7: these three used to be `std.debug.assert`, which is
+        // compiled OUT of ReleaseFast entirely — so an invalid config there
+        // was not a controlled panic but undefined behaviour (measured:
+        // SIGSEGV). An unconditional `if`+`@panic` runs — and traps — in
+        // every build mode, Debug through ReleaseFast alike. This also adds
+        // the ONE config-shaped field that had no check at all before:
+        // `max_fragments_per_datagram == 0` used to pass `init` silently in
+        // every mode and only bite on the first `insert` (allocating and
+        // immediately freeing the full `max_frame_len` buffer forever,
+        // Audit F7's second half).
+        if (config.max_inflight < 1)
+            @panic("ReassemblerConfig.max_inflight must be at least 1");
+        if (config.max_frame_len < 1 or config.max_frame_len > max_frame_len)
+            @panic("ReassemblerConfig.max_frame_len must be at least 1 and at most max_frame_len");
+        if (config.max_fragments_per_datagram < 1)
+            @panic("ReassemblerConfig.max_fragments_per_datagram must be at least 1");
         return .{ .allocator = allocator, .config = config };
     }
 
@@ -342,9 +391,16 @@ pub const Reassembler = struct {
         var doomed: std.ArrayListUnmanaged(u16) = .empty;
         defer doomed.deinit(self.allocator);
 
+        const lifetime_cap = lifetimeCap(self.config);
         var it = self.entries.iterator();
         while (it.next()) |kv| {
-            if (now_ns -| kv.value_ptr.last_seen_ns > self.config.timeout_ns) {
+            const idle_expired = now_ns -| kv.value_ptr.last_seen_ns > self.config.timeout_ns;
+            // Audit F2: an entry that a steady trickle of fresh fragments
+            // keeps continuously "not idle" is otherwise never reclaimed —
+            // this is the absolute half of the check, measured from
+            // `created_ns` rather than `last_seen_ns`.
+            const lifetime_expired = now_ns -| kv.value_ptr.created_ns > lifetime_cap;
+            if (idle_expired or lifetime_expired) {
                 // Best-effort: on OOM here we simply expire fewer entries
                 // this round (no leak, no corruption — just deferred to the
                 // next call).
@@ -368,11 +424,24 @@ pub const Reassembler = struct {
         const payload = wire_bytes[header_len..];
         if (payload.len != hdr.length) return error.LengthMismatch;
 
+        if (hdr.length == 0 and hdr.more) return error.EmptyNonFinalFragment;
+
         const frag_end = @as(usize, hdr.offset) + @as(usize, hdr.length);
         if (frag_end > self.config.max_frame_len) return error.OutOfBounds;
 
         // A very late fragment for a timed-out datagram starts a fresh
-        // reassembly rather than resurrecting stale bytes.
+        // reassembly rather than resurrecting stale bytes. Deliberately
+        // idle-only, NOT the absolute lifetime cap (Audit F2) below: a
+        // fragment for the SAME id that keeps the entry idle-fresh is
+        // exactly the sender this codec is meant to serve (a slow but
+        // legitimate multi-fragment transfer), and resetting `created_ns`
+        // here every time its own age crossed the cap would let a sender
+        // renew its own slot forever just by continuing to send — the same
+        // failure mode F2 exists to close, one level up. The lifetime cap
+        // is enforced where it actually matters: when a DIFFERENT id needs
+        // the slot (`expireOlderThan`, called just below and from
+        // `expireOlderThan` callers directly) — that path an incumbent
+        // cannot keep triggering on itself.
         if (self.entries.getPtr(hdr.frag_id)) |e| {
             if (now_ns -| e.last_seen_ns > self.config.timeout_ns) self.dropEntry(hdr.frag_id);
         }
@@ -390,7 +459,7 @@ pub const Reassembler = struct {
                 _ = self.entries.remove(hdr.frag_id); // undo the getOrPut slot
                 return err;
             };
-            gop.value_ptr.* = .{ .buf = buf, .last_seen_ns = now_ns };
+            gop.value_ptr.* = .{ .buf = buf, .last_seen_ns = now_ns, .created_ns = now_ns };
         }
         const entry = gop.value_ptr;
         entry.last_seen_ns = now_ns;
@@ -440,6 +509,22 @@ pub const Reassembler = struct {
         // RFC 5722 §3: any overlap with a previously accepted byte range
         // (including an exact duplicate) drops the whole datagram.
         for (entry.intervals.items) |iv| {
+            // Audit F1 (A21): the general half-open `[offset, offset+length)`
+            // overlap test below degenerates to the empty set whenever BOTH
+            // sides have zero length — an empty range never intersects
+            // anything, including an identical empty range at the same
+            // offset — so a `more=false, length=0` fragment (the one
+            // legitimate use: closing an all-empty frame) could be resent
+            // and accepted a second time under the SAME id. `more=true`
+            // zero-length fragments are already rejected outright above
+            // (`EmptyNonFinalFragment`), so only the `more=false` case can
+            // still reach here; this closes it without touching length > 0
+            // behaviour at all (an exact non-zero-length duplicate already
+            // self-overlaps under the ordinary test just below).
+            if (hdr.length == 0 and iv.length == 0 and iv.offset == hdr.offset) {
+                self.dropEntry(hdr.frag_id);
+                return error.OverlappingFragment;
+            }
             const iv_end = @as(usize, iv.offset) + @as(usize, iv.length);
             if (@as(usize, hdr.offset) < iv_end and frag_end > @as(usize, iv.offset)) {
                 self.dropEntry(hdr.frag_id);
@@ -884,6 +969,286 @@ test "out-of-bounds offset+length beyond max_frame_len is rejected" {
     var buf: [header_len + 10]u8 = undefined;
     (Header{ .frag_id = 9, .offset = 10, .length = 10, .more = false }).encode(buf[0..header_len]);
     try testing.expectError(error.OutOfBounds, r.insert(&buf, 0));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+// ── audit regressions: F1, F2, F3 boundaries, F14 ──────────────────────────
+
+test "F1/A3: a non-final zero-length fragment is rejected outright, not silently accepted" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    var buf: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 10, .length = 0, .more = true }).encode(&buf);
+    try testing.expectError(error.EmptyNonFinalFragment, r.insert(&buf, 0));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "F1/A3b: the same zero-length fragment resent 6 times is rejected every time, not accepted every time" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000 });
+    defer r.deinit();
+
+    var buf: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 10, .length = 0, .more = true }).encode(&buf);
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try testing.expectError(error.EmptyNonFinalFragment, r.insert(&buf, @intCast(i)));
+    }
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "F1/A21: two final zero-length fragments claiming the same end are not both accepted" {
+    // Unlike A3/A3b these are `more = false` -- the one legitimate shape a
+    // zero-length fragment has (closing an all-empty frame) -- so they are
+    // not caught by the EmptyNonFinalFragment check above. The general
+    // half-open overlap test degenerates to the empty set for a
+    // zero-length-vs-zero-length comparison (an empty range never
+    // intersects an identical empty range), so before the fix the second
+    // one was accepted right alongside the first.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    var first: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 50, .length = 0, .more = false }).encode(&first);
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&first, 0));
+    try testing.expectEqual(@as(usize, 1), r.inflightCount());
+
+    var second: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 50, .length = 0, .more = false }).encode(&second);
+    try testing.expectError(error.OverlappingFragment, r.insert(&second, 1));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "F1/A29 (no regression): a zero-length fragment at an offset a later real fragment starts at still reassembles" {
+    // The fix must not turn this legitimate sequence into a false-positive
+    // overlap: a length-0 point at offset 0 carries no bytes, so it cannot
+    // truly conflict with a REAL fragment that later claims [0, 50).
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    var zero: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 0, .more = true }).encode(&zero);
+    try testing.expectError(error.EmptyNonFinalFragment, r.insert(&zero, 0));
+
+    var frame: [50]u8 = undefined;
+    for (&frame, 0..) |*b, i| b.* = @truncate(i);
+    var real: [header_len + 50]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 50, .more = false }).encode(real[0..header_len]);
+    @memcpy(real[header_len..], &frame);
+    const res = try r.insert(&real, 1);
+    switch (res) {
+        .complete => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualSlices(u8, &frame, bytes);
+        },
+        .incomplete => return error.TestUnexpectedResult,
+    }
+}
+
+test "F2: an absolute lifetime cap reclaims an entry that a steady trickle of accepted fragments keeps idle-fresh forever" {
+    // Audit F2 (HIGH). `entry.last_seen_ns` refreshes on every ACCEPTED
+    // fragment and the only expiry check used to be idle time since
+    // `last_seen_ns` -- there was no cap on total age. 100 fragments, each
+    // covering a fresh, non-overlapping single byte (nothing here is a
+    // duplicate or malformed -- every one is individually legitimate), 10ns
+    // apart -- always well inside `timeout_ns = 100` -- total 1000ns
+    // elapsed, which crosses the default absolute cap (8 * timeout_ns =
+    // 800ns) even though idle time never once did.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 1, .timeout_ns = 100 });
+    defer r.deinit();
+
+    var now: u64 = 0;
+    var offset: u16 = 0;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        var buf: [header_len + 1]u8 = undefined;
+        (Header{ .frag_id = 1, .offset = offset, .length = 1, .more = true }).encode(buf[0..header_len]);
+        buf[header_len] = 'x';
+        now += 10;
+        offset += 1;
+        _ = try r.insert(&buf, now);
+    }
+    try testing.expectEqual(@as(usize, 1), r.inflightCount());
+
+    // A distinct, legitimate frag_id must not starve forever just because
+    // the incumbent keeps refreshing itself.
+    var other: [header_len + 1]u8 = undefined;
+    (Header{ .frag_id = 2, .offset = 0, .length = 1, .more = true }).encode(other[0..header_len]);
+    other[header_len] = 'y';
+    now += 10;
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&other, now));
+}
+
+test "F3/M8-shape: overlap is checked against every interval, not just the most recently accepted one" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    var first: [header_len + 10]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 10, .more = true }).encode(first[0..header_len]);
+    @memset(first[header_len..], 'a');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&first, 0));
+
+    var second: [header_len + 10]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 20, .length = 10, .more = true }).encode(second[0..header_len]);
+    @memset(second[header_len..], 'b');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&second, 1));
+
+    // Overlaps the FIRST interval ([0,10)), not the most recently accepted
+    // one ([20,30)) -- a scan that only compared against the last interval
+    // would miss this.
+    var third: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 5, .length = 5, .more = true }).encode(third[0..header_len]);
+    @memset(third[header_len..], 'c');
+    try testing.expectError(error.OverlappingFragment, r.insert(&third, 2));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "F3/M1-shape: a one-byte overlap is rejected, not just a large one" {
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    var first: [header_len + 10]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 10, .more = true }).encode(first[0..header_len]);
+    @memset(first[header_len..], 'a');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&first, 0));
+
+    // [9, 19) overlaps [0, 10) by exactly one byte (offset 9).
+    var second: [header_len + 10]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 9, .length = 10, .more = true }).encode(second[0..header_len]);
+    @memset(second[header_len..], 'b');
+    try testing.expectError(error.OverlappingFragment, r.insert(&second, 1));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "F3/M2b-shape: frag_end exactly at max_frame_len is accepted, one past it is rejected" {
+    var accepted = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
+    defer accepted.deinit();
+    var at_limit: [header_len + 6]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 10, .length = 6, .more = true }).encode(at_limit[0..header_len]);
+    @memset(at_limit[header_len..], 'a');
+    // frag_end = 16 == max_frame_len: must be accepted.
+    try testing.expectEqual(InsertResult.incomplete, try accepted.insert(&at_limit, 0));
+    try testing.expectEqual(@as(usize, 1), accepted.inflightCount());
+
+    var rejected = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 16, .timeout_ns = 1000 });
+    defer rejected.deinit();
+    var over_limit: [header_len + 7]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 10, .length = 7, .more = true }).encode(over_limit[0..header_len]);
+    @memset(over_limit[header_len..], 'a');
+    // frag_end = 17 == max_frame_len + 1: must be rejected.
+    try testing.expectError(error.OutOfBounds, rejected.insert(&over_limit, 0));
+    try testing.expectEqual(@as(usize, 0), rejected.inflightCount());
+}
+
+test "F14: trailing bytes beyond the header's declared length are rejected, the same as too few" {
+    // SPEC.md and the doc comment on `LengthMismatch` both promise BOTH
+    // directions ("too few ... too many ... both rejected"), but the only
+    // existing test drove the too-few direction. `payload.len != hdr.length`
+    // is already symmetric in the code; this closes the coverage gap the
+    // doc promise had, in both directions at once.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    // Header claims 3 payload bytes; 10 are actually present.
+    var too_many: [header_len + 10]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 3, .more = false }).encode(too_many[0..header_len]);
+    try testing.expectError(error.LengthMismatch, r.insert(&too_many, 0));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+
+    // Header claims 10; only 3 present (the pre-existing direction, kept
+    // here so both directions live in one place).
+    var too_few: [header_len + 3]u8 = undefined;
+    (Header{ .frag_id = 2, .offset = 0, .length = 10, .more = false }).encode(too_few[0..header_len]);
+    try testing.expectError(error.LengthMismatch, r.insert(&too_few, 0));
+    try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "F3/M4b-shape: idle time exactly equal to timeout_ns has not yet expired" {
+    // `now_ns -| last_seen_ns > timeout_ns` -- a gap of EXACTLY timeout_ns
+    // must still count as "not yet expired" (strict >, not >=). Two
+    // non-overlapping fragments for the same id, the second arriving
+    // exactly timeout_ns after the first, must land in the SAME entry (and
+    // so go on to complete the datagram) rather than starting a fresh one.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    defer r.deinit();
+
+    var a: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 5, .more = true }).encode(a[0..header_len]);
+    @memset(a[header_len..], 'A');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&a, 0));
+
+    var b: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 5, .length = 5, .more = false }).encode(b[0..header_len]);
+    @memset(b[header_len..], 'B');
+    // now = 100 = last_seen(0) + timeout_ns exactly.
+    const res = try r.insert(&b, 100);
+    switch (res) {
+        .complete => |bytes| {
+            defer testing.allocator.free(bytes);
+            try testing.expectEqualSlices(u8, "AAAAABBBBB", bytes);
+        },
+        .incomplete => return error.TestUnexpectedResult,
+    }
+}
+
+test "F3/M6-shape: a retroactively-checked interval that lands exactly at the newly-established total_len is accepted, one past it is not" {
+    // Companion to the existing out-of-order teardrop-mirror regression
+    // test, which uses a margin of 50 bytes past total_len. This pins the
+    // exact boundary the retroactive check (`iv.offset + iv.length >
+    // frag_end`) draws: landing exactly AT the newly-established end must
+    // be accepted, one byte past it must not.
+    var fits = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 200, .timeout_ns = 1000 });
+    defer fits.deinit();
+    // A: [150, 200) -- arrives before total_len is known.
+    var a1: [header_len + 50]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 150, .length = 50, .more = true }).encode(a1[0..header_len]);
+    @memset(a1[header_len..], 'A');
+    try testing.expectEqual(InsertResult.incomplete, try fits.insert(&a1, 0));
+    // C: a zero-length final fragment at offset 200 establishes total_len =
+    // 200 exactly without overlapping A's [150,200) (a zero-length point at
+    // an existing interval's END does not overlap it under the ordinary
+    // half-open test -- only an exact zero-length duplicate does, Audit
+    // F1). A's interval fits [150,200) precisely under this total_len.
+    var c1: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 200, .length = 0, .more = false }).encode(&c1);
+    try testing.expectEqual(InsertResult.incomplete, try fits.insert(&c1, 1));
+    try testing.expectEqual(@as(usize, 1), fits.inflightCount());
+
+    var overshoots = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .max_frame_len = 300, .timeout_ns = 1000 });
+    defer overshoots.deinit();
+    // A: [150, 201) -- one byte past where C below will establish the end.
+    var a2: [header_len + 51]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 150, .length = 51, .more = true }).encode(a2[0..header_len]);
+    @memset(a2[header_len..], 'A');
+    try testing.expectEqual(InsertResult.incomplete, try overshoots.insert(&a2, 0));
+    var c2: [header_len]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 200, .length = 0, .more = false }).encode(&c2);
+    try testing.expectError(error.OutOfBounds, overshoots.insert(&c2, 1));
+    try testing.expectEqual(@as(usize, 0), overshoots.inflightCount());
+}
+
+test "F3/M7-shape: a second more=false claiming a SMALLER end is rejected too, not just a larger one" {
+    // The existing "contradictory more=false" test only drives the second
+    // claim LARGER than the first (105 then 205). `t != frag_end` is
+    // already symmetric in the code; this pins the other direction so a
+    // one-sided mutation (`frag_end > t` instead of `frag_end != t`) would
+    // be caught.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1000 });
+    defer r.deinit();
+
+    var a: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 5, .more = true }).encode(a[0..header_len]);
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&a, 0));
+
+    var b: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 195, .length = 5, .more = false }).encode(b[0..header_len]);
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&b, 1));
+
+    // A second "final" fragment claiming a SMALLER end (100) than the
+    // first (200).
+    var c: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 95, .length = 5, .more = false }).encode(c[0..header_len]);
+    try testing.expectError(error.ProtocolViolation, r.insert(&c, 2));
     try testing.expectEqual(@as(usize, 0), r.inflightCount());
 }
 

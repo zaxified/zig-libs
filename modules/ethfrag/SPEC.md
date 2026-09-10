@@ -1,8 +1,8 @@
 # ethfrag — spec
 
-Design + threat notes for auditors. Usage: see `src/root.zig` doc comments (no README —
-this module is a standalone codec with no separate consumer-facing surface beyond the two
-public entry points, `fragment`/`Reassembler`, already documented at their declarations).
+Design + threat notes for auditors. Usage: see `README.md` and `src/root.zig` doc comments
+(the two public entry points, `fragment`/`Reassembler`, are documented at their
+declarations).
 Attribution/provenance: see `/NOTICE` — none needed here (clean-room from RFC 791 §3.2 /
 RFC 5722 §3, both public specs, not third-party source).
 
@@ -34,9 +34,18 @@ is single-owner (no internal lock — one caller drives it, matching `ratelimit`
 style bounded-state modules in this collection).
 
 Every reassembly-table entry pre-allocates a fixed `config.max_frame_len`-byte buffer up
-front rather than growing on demand — total worst-case reassembler memory is therefore a
-deterministic `max_inflight * max_frame_len`, independent of what an attacker actually
-sends, which is the property the hard-resource-bounds goal asks for. The clock is 100%
+front rather than growing on demand, which bounds THAT part of the cost at a deterministic
+`max_inflight * max_frame_len` independent of what an attacker sends. **That is not the
+whole entry, though** — each accepted fragment also grows the entry's interval list
+(`Interval` records, plus `ArrayListUnmanaged` growth headroom), up to
+`max_fragments_per_datagram` (default 4096) per datagram, and that part scales with the
+number of fragments an attacker chooses to send, not with `max_frame_len`. Measured (Audit
+F4, `perf2.zig`, peak live bytes, `max_fragments_per_datagram = 4096`, 4095 zero-length
+fragments per id): `max_frame_len = 65535` → 1.37× the buffer-only bound; `= 9216` → 3.68×;
+`= 1500` (a real Ethernet MTU) → **17.49×**. The buffer bound is real and still the
+dominant term at the module's own default `max_frame_len`; it just is not the *whole*
+bound, and the gap widens as a consumer configures `max_frame_len` down. A consumer that
+needs the tight bound back should also cap `max_fragments_per_datagram`. The clock is 100%
 caller-supplied: every state-mutating call takes a plain `now_ns: u64`, and the module
 never calls `clock_gettime` or anything else itself — a consumer wires in whatever clock
 domain (monotonic, simulated, or a network-time source) fits its event loop.
@@ -52,6 +61,14 @@ enforcement point in `Reassembler.insert`:
   includes an exact byte-for-byte duplicate, which is simply the overlap-with-itself
   case — there is deliberately no separate "identical bytes, so merge it" fast path,
   because that distinction is exactly what overlap-based IDS-evasion attacks rely on.
+  A **non-final** (`more = true`) zero-length fragment is rejected outright
+  (`EmptyNonFinalFragment`, Audit F1): `fragment()` never produces one, and the
+  half-open `[offset, offset+length)` overlap test degenerates to the empty set for a
+  zero-length range, so before this check a zero-length fragment could be resent at
+  the wire's cheapest possible cost without ever tripping the duplicate check above. A
+  **final** (`more = false`) zero-length fragment is still legitimate (the only way to
+  close an all-empty frame); a second, identical one for the same offset is caught as
+  an ordinary duplicate.
 - **Teardrop overrun:** a fragment claiming to extend past an already-established total
   length (`more=false` seen once, or the running `max_frame_len` ceiling) is rejected as
   `OutOfBounds`, and a second, disagreeing `more=false` claim is rejected as
@@ -63,14 +80,28 @@ enforcement point in `Reassembler.insert`:
   per-datagram interval list unboundedly.
 - **Incomplete-reassembly memory exhaustion:** `config.max_inflight` caps the number of
   concurrently tracked `frag_id`s; once full, a new id is rejected (`TableFull`) unless
-  an `expireOlderThan` sweep reclaims a timed-out slot. Total memory is the
-  deterministic bound described above — an attacker cannot grow it past
-  `max_inflight * max_frame_len` no matter how many fragments or datagrams it sends.
+  an `expireOlderThan` sweep reclaims a timed-out slot, and `config.max_lifetime_ns`
+  (default `8 * timeout_ns`) additionally bounds how long any one datagram may occupy a
+  slot in total, not just how long it may sit idle — see the "Gap-then-never-completes"
+  bullet below. Per-datagram memory is `max_frame_len` (the buffer) plus up to
+  `max_fragments_per_datagram` interval records — see the note on the buffer-only bound
+  above; it is a real, deterministic ceiling but not the *whole* per-entry cost.
 - **Gap-then-never-completes:** `config.timeout_ns`, checked against caller-supplied
   `now_ns`, drops a datagram idle too long — either lazily (touched again by a fragment
   for the same id) or via an explicit `expireOlderThan` sweep. A very late fragment for
   an already-expired id starts a **fresh** reassembly rather than resurrecting stale
   bytes; it never partially completes against pruned state.
+- **Steady-trickle-never-idle (Audit F2, fixed):** `timeout_ns` alone only measures the
+  gap since the last accepted fragment, so a sender that keeps feeding a datagram fresh,
+  individually-legitimate, non-overlapping fragments never goes idle and — before this
+  fix — was never reclaimed, regardless of how long it held its slot.
+  `config.max_lifetime_ns` (default `8 * timeout_ns`) adds an absolute ceiling on top,
+  measured from the datagram's first fragment; `expireOlderThan` — including the sweep
+  `insert` runs internally when the table is full and a *different* id needs the slot —
+  enforces it alongside the idle check. Deliberately not enforced on the SAME id's own
+  inline refresh path: an incumbent legitimately extending its own reassembly is not
+  the problem this closes, and resetting the clock there would let a sender renew its
+  own slot forever just by continuing to send — the same failure mode one level up.
 - **Reserved-field smuggling:** `Header.decode` rejects any nonzero reserved flag bit or
   reserved byte outright (`InvalidHeader`) rather than masking and ignoring them — a
   strict decoder, not a lenient one.
@@ -88,8 +119,8 @@ no `frag_id` allocation/uniqueness policy (that's the caller's job, exactly as I
 identification field is the sender's job), no fragment retransmission/NACK, no
 authentication of fragment origin (a spoofed fragment with a guessed `frag_id` can poison
 or exhaust a slot exactly as a spoofed IP fragment can — bound by the same
-`max_inflight`/`timeout_ns` limits as any other adversarial sender, not a distinct
-weakness introduced by this module).
+`max_inflight`/`timeout_ns`/`max_lifetime_ns` limits as any other adversarial sender, not
+a distinct weakness introduced by this module).
 
 ## Verification
 

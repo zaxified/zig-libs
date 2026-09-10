@@ -48,22 +48,34 @@ switch (try r.insert(wire_bytes, now_ns)) {
 }
 ```
 
+⚠ **`max_frame_len` defaults to 65535 (its hard ceiling), and `Entry.buf` allocates the
+full `config.max_frame_len` bytes up front for every in-flight `frag_id`, regardless of
+how large the actual datagram turns out to be.** With the config above (`max_inflight =
+64`, default `max_frame_len`), 64 concurrently tracked zero-length in-flight datagrams —
+**512 bytes on the wire** — hold **4,212,312 bytes live** (measured, tracking allocator;
+Audit F5). Set `max_frame_len` to the largest frame your protocol actually needs; see
+`SPEC.md`'s memory-bound note for the full accounting (the buffer is not the only
+per-entry cost — the interval list scales with the number of fragments an attacker
+sends too, Audit F4).
+
 `now_ns` is caller-supplied on every call — the idle timeout that reclaims
 abandoned datagrams never reads a clock itself, so a test can drive it (and
 `expireOlderThan` sweeps explicitly when no fragment arrives to trigger it).
+`config.max_lifetime_ns` (default `8 * timeout_ns`) additionally bounds how long any one
+datagram may hold its slot in total, not just how long it may sit idle.
 
 ## Verify
 
 ```
-zig build test-ethfrag                          # Debug       — 26 pass
-zig build test-ethfrag -Doptimize=ReleaseFast   # ReleaseFast — 26 pass
+zig build test-ethfrag                          # Debug
+zig build test-ethfrag -Doptimize=ReleaseFast   # ReleaseFast
 ```
 
 Round-trip smoke, a 300-iteration seeded property test (fragment → shuffle →
 reassemble → byte-identical, across random frame lengths / MTUs / overheads),
-**one targeted adversarial test per threat-model bullet**: overlap,
+targeted adversarial tests per threat-model bullet: overlap,
 duplicate, teardrop overrun, contradictory `more=false`, tiny-fragment flood,
-concurrent-datagram cap, and timeout reclamation, and an **external anchor**
+concurrent-datagram cap, absolute-lifetime reclamation, and timeout reclamation, and an **external anchor**
 (`kernel_oracle.zig`) comparing this module's accept/drop/deliver decision
 against the real Linux kernel's own IPv4/IPv6 fragment reassembly for
 structurally equivalent fragment sets — see that file's doc comment for the
