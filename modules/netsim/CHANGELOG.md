@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 fix campaign, netsim F10
+  + F12. F10: `replay` no longer builds the event `Log` when `log_out ==
+  null` (a new internal `Sim.want_log` flag, default `true` — the 3 in-repo
+  consumers that call `Sim.init` directly and read `.log` themselves are
+  unaffected; only `replay`'s own internal `Sim` ever turns it off). Measured
+  ~1.8-2.2x (machine-dependent) over 30 replays of a 5-node flood scenario,
+  both Debug and ReleaseFast. Results (`RunResult`, including `fingerprint`)
+  are bit-identical either way — the fingerprint folds unconditionally in
+  `append`, only the discarded-anyway `log.entries` build is skipped. F12:
+  fixed two README `## Use` example bugs (`.loss = 0.01`, a field that never
+  existed — real field is `.loss_permille: u16`; `netsim.shrink`, an export
+  that doesn't exist — real name is `shrinkTrace`) and the stale "15 pass"
+  claim under `## Verify` (now 27). Deferred: the audit also suggested wiring
+  `findFailing`/`shrinkTrace` into `example/main.zig` so `check-examples`
+  compiles those two entry points too (today only `replay` is exercised
+  externally) — left open, since verifying an `example/` change requires the
+  `check-examples` gate, which this campaign's fixer role is not permitted
+  to run.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, netsim F7 +
   F13 + F14. F7: `findFailing(start, end)` with `start > end` now returns
   `null` immediately instead of walking ~2^64 seeds before it could ever

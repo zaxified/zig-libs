@@ -308,6 +308,16 @@ pub const Sim = struct {
     until: Time,
     max_events_cap: u64,
     log: *Log,
+    /// audit F10: `replay` built a full `Log` (including the tight ddmin
+    /// shrink loop, which calls it with `log_out = null` thousands of times)
+    /// even when nothing ever reads it — measured ~40% of a replay's time.
+    /// `log_out` is consulted only AFTER the run finishes, so `replay` now
+    /// sets this to `false` up front when it has nowhere to put the log.
+    /// Default `true`: every direct `Sim.init` caller (3 in-repo consumers
+    /// construct a `Sim` themselves and read `.log` afterward) is unaffected
+    /// — only `replay`'s own internal `Sim` ever turns this off. The
+    /// fingerprint is unaffected either way: `append` folds it unconditionally.
+    want_log: bool = true,
     violation: ?Violation = null,
 
     pub fn init(gpa: Allocator, seed: u64, protocol: Protocol, log: *Log, until: Time, cap: u64) Sim {
@@ -475,6 +485,7 @@ pub const Sim = struct {
         e.time = self.now;
         e.seq = self.nextSeq();
         self.fingerprint = foldFingerprint(self.fingerprint, e);
+        if (!self.want_log) return; // audit F10: nothing will ever read this entry
         // Best-effort: a log OOM must not corrupt the deterministic fingerprint,
         // which is already folded above.
         self.log.entries.append(self.gpa, e) catch {};
@@ -654,6 +665,10 @@ pub fn replay(gpa: Allocator, case: Case, trace: []const fault.FaultEvent, log_o
     defer log.deinit(gpa);
     var sim = try build(gpa, case, &log);
     defer sim.deinit();
+    // audit F10: nothing reads `log` unless the caller asked for it — the
+    // ddmin shrink loop calls `replay` with `log_out = null` thousands of
+    // times, and building the log was ~40% of that time.
+    sim.want_log = (log_out != null);
     try sim.injectFaults(trace);
     const outcome = try sim.drive();
     if (log_out) |lo| try lo.copyFrom(gpa, &log);

@@ -103,6 +103,15 @@ pub const shrinkTrace = shrink_mod.shrink;
 
 const testing = std.testing;
 
+/// Monotonic wall-clock read for the F10 perf test only — std.time.Timer was
+/// removed; this is the same `clock_gettime(.MONOTONIC)` pattern used by
+/// other modules' benches (e.g. `bfv`'s `bench.zig`).
+fn nowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 const FLOOD_N = 5;
 
 /// Correct epoch-broadcast flood with per-epoch duplicate suppression. The
@@ -442,6 +451,40 @@ test "shrink: a fuzzed failing schedule minimizes to a still-reproducing core" {
         if (std.meta.activeTag(e.kind) == .dup_once) has_dup = true;
     }
     try testing.expect(has_dup);
+}
+
+test "perf: replay(log_out=null) is not slower than replay(log_out=non-null) (audit F10)" {
+    // `replay` used to build the full event `Log` unconditionally, even when
+    // `log_out == null` — as the ddmin shrink loop calls it thousands of
+    // times. The audit's own A/B (ReleaseFast, ring topology, two
+    // independent sessions) measured ~1.68x: 2416µs with the log vs 1441µs
+    // without. This is a coarse, noise-tolerant regression guard (a strict
+    // ratio would be flaky across machines/CI): the no-log path must not
+    // come out slower than the with-log path, which would only happen if
+    // `want_log` stopped being honored.
+    const gpa = testing.allocator;
+    var flood = try Flood.init(gpa, FLOOD_N);
+    defer flood.deinit(gpa);
+    const case = Case{ .seed = 1, .scenario = floodScenario, .protocol = flood.protocol(), .until = 5000 };
+    const iters = 30;
+
+    const start1 = nowNs();
+    for (0..iters) |_| {
+        var log = Log{};
+        defer log.deinit(gpa);
+        _ = try replay(gpa, case, &.{}, &log);
+    }
+    const with_log_ns = nowNs() - start1;
+
+    const start2 = nowNs();
+    for (0..iters) |_| _ = try replay(gpa, case, &.{}, null);
+    const without_log_ns = nowNs() - start2;
+
+    std.debug.print(
+        "F10 perf: with_log={d}ns without_log={d}ns ({d} iters)\n",
+        .{ with_log_ns, without_log_ns, iters },
+    );
+    try testing.expect(without_log_ns <= with_log_ns);
 }
 
 test "replay: an out-of-range node id in an externally-supplied trace is rejected (audit F1)" {

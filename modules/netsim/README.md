@@ -33,7 +33,7 @@ const netsim = @import("netsim");
 // 1. Topology.
 fn scenario(sim: *netsim.Sim) anyerror!void {
     for (0..5) |_| _ = try sim.addNode(.{});
-    try sim.addBiLink(0, 1, .{ .latency = 10, .loss = 0.01 });
+    try sim.addBiLink(0, 1, .{ .latency = 10, .loss_permille = 10 });
 }
 
 // 2. Algorithm as a Protocol (onStart / onMessage / onTimer / check), then
@@ -43,7 +43,7 @@ const failing = try netsim.findFailing(gpa, case, .{}, 1, 300);
 
 // 3. Minimize whatever it found, and replay it deterministically.
 if (failing) |f| {
-    var min = try netsim.shrink(gpa, &f);   // .before / .after event counts
+    var min = try netsim.shrinkTrace(gpa, &f);   // .before / .after event counts
     defer min.deinit();
     _ = try netsim.replay(gpa, case, min.trace.events, null);
 }
@@ -56,8 +56,8 @@ oracle; `findFailing` + `shrink` search a seed range and minimize.
 ## Verify
 
 ```
-zig build test-netsim                          # Debug       — 15 pass
-zig build test-netsim -Doptimize=ReleaseFast   # ReleaseFast — 15 pass
+zig build test-netsim                          # Debug       — 27 pass
+zig build test-netsim -Doptimize=ReleaseFast   # ReleaseFast — 27 pass
 ```
 
 The determinism property is the load-bearing one and is tested directly: the
