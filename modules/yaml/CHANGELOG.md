@@ -5,6 +5,48 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign, F5 remainder + F8 closed (0 consumers in this
+  repo, P1/P4 apply; test-only, no production behavior change). F5 (A1/yaml.md):
+  the audit named ten surviving mutations against the module's DoS bounds; three
+  remained untested going into this pass (`R08_liveness`, `W03_simplekey_cap`,
+  `W11_tab_indent`), plus one (`W04_scanner_depth`) a prior pass had marked
+  structurally untestable. All four now have coverage:
+  - `W03_simplekey_cap` — new scanner-level test pins the 1024-character simple-key
+    span (YAML 1.2 §7.4) at the boundary (1024 passes, 1025 rejected). RED (mutant:
+    1024 -> 1_000_000): 1025-char key accepted. GREEN: rejected.
+  - `W11_tab_indent` — new scanner-level test pins "a tab is never indentation"
+    (YAML 1.2 §6.1) for both the block-sequence and explicit-key form. RED (mutant:
+    the `tab_on_line` guard in `rollIndent` disabled): both accepted. GREEN: both
+    rejected; the pure-separation control case (`-\t-1`) unaffected either way.
+  - `W04_scanner_depth` — new scanner-level test builds its input from the literal
+    `4097`, not the `max_depth` symbol, so it can no longer retarget itself to
+    whatever the constant says. RED (mutant: `max_depth` 4096 -> 1_000_000): the
+    4097-deep document that should be rejected passes instead. GREEN: rejected.
+  - `R08_liveness` — the parser's own anti-cycle invariant
+    (`events_since_token > max_depth + 8`) guards against a bug *elsewhere in the
+    parser*, not against any input; two independent passes found no document that
+    trips it unaided. Demonstrated instead by injecting the exact bug class it
+    exists to catch (a one-line state-loop mutation in
+    `parseBlockMappingValue`'s fallthrough) and showing the guard turns an
+    otherwise-unbounded cycle (100 000+ iterations, still running) into a clean
+    `error.InvalidYaml` after 4109. Not a standing test (would require shipping a
+    deliberately broken parser branch); reproduction lives in
+    `A1/repro/yaml/README.md` §7b.
+  All three scanner-level tests are permanent (`modules/yaml/src/scanner.zig`,
+  next to the existing `R06`/`R07` tests, using the same `scanAll`
+  helper — `Scanner.next()` in a loop, never through `compose()`, which recurses
+  and overflows the Debug stack at this depth).
+
+  F8 (A1/yaml.md): closed formally with independent verification rather than
+  taking the prior pass's claim on faith — read the current
+  `compose.zig`/`root.zig` source directly (two of the three fuzz generators
+  already draw raw bytes with no alphabet restriction, a side effect of an
+  unrelated commit; the third's alphabet now includes every invalid-UTF-8
+  lead-byte class and C0 control F4 named) and confirmed the fix commit is an
+  ancestor of this branch's base.
+
+  scripts/modtest yaml: 62/62, Debug and ReleaseFast alike.
+
 - **2026-09-10** — A1 fix campaign, F10 (found mid-fix during the second pass above;
   0 consumers in this repo, P1 applies). `composeNode` recurses one native call frame
   per nesting level, and `account()`/the duplicate-key check trusted `Options.max_depth`

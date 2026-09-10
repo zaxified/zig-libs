@@ -216,8 +216,23 @@ const LinkRec = struct {
 
 const ActivePartition = struct {
     id: u32,
-    cut: []NodeId, // owned by sim.arena
+    cut: []NodeId, // owned by sim.arena -- kept for the log's `.c = cut.len`
+    /// `cut` as a bitset over node ids, owned by sim.arena (audit F15:
+    /// `severed()` used to do two `indexOfScalar` scans of `cut` -- O(|cut|)
+    /// each -- for EVERY active partition on EVERY delivery. Membership is
+    /// now O(1). `bit_length` is the node count as of this fault's apply time
+    /// (topology is always built before any fault, so this equals
+    /// `nodes.items.len` for the run's whole remaining lifetime in every
+    /// known caller) -- `isNodeInCut` below still checks against it rather
+    /// than assuming, so a node id added afterward reads as "not cut" instead
+    /// of tripping `DynamicBitSetUnmanaged.isSet`'s bounds assert.
+    cut_set: std.DynamicBitSetUnmanaged,
 };
+
+fn isNodeInCut(set: *const std.DynamicBitSetUnmanaged, node: NodeId) bool {
+    const idx: usize = node;
+    return idx < set.bit_length and set.isSet(idx);
+}
 
 const EKind = union(enum) {
     deliver: struct { from: NodeId, to: NodeId, payload: []const u8 },
@@ -532,8 +547,8 @@ pub const Sim = struct {
         const link = self.findLink(a, b) orelse return true;
         if (!link.up) return true;
         for (self.partitions.items) |p| {
-            const in_a = std.mem.indexOfScalar(NodeId, p.cut, a) != null;
-            const in_b = std.mem.indexOfScalar(NodeId, p.cut, b) != null;
+            const in_a = isNodeInCut(&p.cut_set, a);
+            const in_b = isNodeInCut(&p.cut_set, b);
             if (in_a != in_b) return true;
         }
         return false;
@@ -573,7 +588,9 @@ pub const Sim = struct {
             },
             .partition => |p| {
                 const cut = try self.arena.allocator().dupe(NodeId, p.cut);
-                try self.partitions.append(self.gpa, .{ .id = p.id, .cut = cut });
+                var cut_set = try std.DynamicBitSetUnmanaged.initEmpty(self.arena.allocator(), self.nodes.items.len);
+                for (cut) |n| if (n < self.nodes.items.len) cut_set.set(n);
+                try self.partitions.append(self.gpa, .{ .id = p.id, .cut = cut, .cut_set = cut_set });
                 self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = p.id, .c = @intCast(p.cut.len) });
             },
             .heal => |h| {

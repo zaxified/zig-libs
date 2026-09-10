@@ -908,3 +908,151 @@ test "positive control: a later unrelated message still reassembles after an ear
         else => return error.TestUnexpectedResult,
     }
 }
+
+// ── fuzz: Connection.receive off the wire, client role, never panics ───────
+//
+// A1/websocket.md F5's "second half": `frame.parseFrame` got fuzz coverage
+// (2026-09-07, `857f7014`), but `connection.zig` -- the layer that does
+// fragment reassembly, the close handshake, and UTF-8 validation across
+// fragment boundaries -- had ZERO harnesses, and the `.client` role had
+// none anywhere in the module. `error.MaskedServerFrame` (the one rule that
+// only exists for that role -- a masked frame is illegal when it comes FROM
+// a server, RFC 6455 §5.1) was therefore never exercised by anything
+// adversarial in this repo.
+//
+// ⭐ Verified the harness actually reaches past a shallow parse before
+// trusting it (the `opaque` trap this campaign hit elsewhere: three
+// harnesses that never got past `fromBytes`, so no amount of fuzzing could
+// have found anything). The reach test below drives the SAME corpus through
+// the SAME loop deterministically and pins that it produces reassembled
+// messages, a close, a ping, and -- specifically -- `MaskedServerFrame`,
+// `InvalidUtf8`, `MessageTooLarge`, `TooManyFragments` and
+// `DataAfterClose`, not just early `need_more` returns.
+
+const fuzz = @import("testkit").fuzz;
+const seed = fuzz.seedHex;
+
+/// Frames a **client** receives from its server, in the format `Smith.slice`
+/// reads (see `frame.zig`'s fuzz harnesses / `testkit.fuzz` for why: one
+/// `smith.slice` call, never `smith.bytes` + a ranged length, which always
+/// collapses to the empty draw outside `--fuzz`).
+///
+/// ⚠ Server-to-client frames are UNMASKED by rule (RFC 6455 §5.1) -- the two
+/// seeds below that ARE masked are deliberately the illegal case this role
+/// exists to catch.
+const client_seeds = [_][]const u8{
+    seed("810548656c6c6f"), // unfragmented text "Hello"
+    seed("0103" ++ "48656c" ++ "8002" ++ "6c6f"), // fragmented "Hel"+"lo" -- reassembly
+    seed("880503e8627965"), // close, code 1000 + reason "bye"
+    seed("89026869"), // ping "hi"
+    seed("818537FA213D7F9F4D5158"), // MASKED text "Hello" -- illegal from a server
+    seed("8102FFFE"), // text with an invalid-UTF-8 payload
+    seed("0102" ++ "4142" ++ "8042" ++ ("43" ** 66)), // 2-byte fragment + 66-byte continuation, 68 > the harness's 64-byte message_buf -- MessageTooLarge mid-reassembly
+    seed("880503e8627965" ++ "810548656c6c6f"), // close, then a data frame after it -- DataAfterClose
+    seed("81"), // need_more: one octet, no length byte yet
+    seed("8185FA213D7F9F"), // a masked header is rejected before the mask key/payload even need to be present
+    seed("0100" ++ "0000" ** 8), // an empty start + 8 empty continuations against the harness's max_fragments=8 -- TooManyFragments
+};
+
+test "fuzz: Connection.receive never panics, client role" {
+    try testing.fuzz({}, fuzzConnectionReceiveClient, .{ .corpus = &client_seeds });
+}
+
+fn fuzzConnectionReceiveClient(_: void, smith: *std.testing.Smith) !void {
+    var buf: [256]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 16);
+    // Small on purpose: `TooManyFragments` has to be reachable from a short
+    // seed, not only from a synthetic multi-megabyte one no corpus entry
+    // could plausibly carry.
+    conn.max_fragments = 8;
+
+    var off: usize = 0;
+    var iterations: usize = 0;
+    while (off < len and iterations < 64) : (iterations += 1) {
+        const result = conn.receive(buf[off..len]) catch return;
+        switch (result.event) {
+            .need_more => return,
+            else => off += result.consumed,
+        }
+    }
+}
+
+test "corpus: every client seed reaches Connection.receive, and reassembly/close/masking/limits all fire" {
+    // ⭐ The measurement, executable rather than asserted in a comment, over
+    // the SAME corpus the harness gets — `frame.zig`'s own reach tests are
+    // the precedent. `nonempty` catches a seed grown past the 256-octet
+    // buffer (`Smith.slice` reads that back as the empty one, silently);
+    // every other counter is a claim about what the loop actually DID, not
+    // just that it ran.
+    var nonempty: usize = 0;
+    var messages: usize = 0;
+    var closes: usize = 0;
+    var pings: usize = 0;
+    var masked_server_frame: usize = 0;
+    var invalid_utf8: usize = 0;
+    var message_too_large: usize = 0;
+    var data_after_close: usize = 0;
+    var too_many_fragments: usize = 0;
+    var need_mores: usize = 0;
+
+    for (client_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [256]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        var scratch: [64]u8 = undefined;
+        var conn: Connection = .init(.client, &scratch, 1 << 16);
+        conn.max_fragments = 8;
+
+        var off: usize = 0;
+        var iterations: usize = 0;
+        while (off < len and iterations < 64) : (iterations += 1) {
+            const result = conn.receive(buf[off..len]) catch |e| {
+                switch (e) {
+                    error.MaskedServerFrame => masked_server_frame += 1,
+                    error.InvalidUtf8 => invalid_utf8 += 1,
+                    error.MessageTooLarge => message_too_large += 1,
+                    error.DataAfterClose => data_after_close += 1,
+                    error.TooManyFragments => too_many_fragments += 1,
+                    else => {},
+                }
+                break;
+            };
+            switch (result.event) {
+                .need_more => {
+                    need_mores += 1;
+                    break;
+                },
+                .frame_consumed => off += result.consumed,
+                .message => {
+                    messages += 1;
+                    off += result.consumed;
+                },
+                .close => {
+                    closes += 1;
+                    off += result.consumed;
+                },
+                .ping => {
+                    pings += 1;
+                    off += result.consumed;
+                },
+                .pong => off += result.consumed,
+            }
+        }
+    }
+
+    try testing.expectEqual(client_seeds.len, nonempty);
+    try testing.expectEqual(@as(usize, 2), messages); // seeds 0, 1 (the second via reassembly)
+    try testing.expectEqual(@as(usize, 2), closes); // seeds 2, 7 (7's close fires before its own DataAfterClose)
+    try testing.expectEqual(@as(usize, 1), pings); // seed 3
+    try testing.expectEqual(@as(usize, 2), masked_server_frame); // seeds 4, 9
+    try testing.expectEqual(@as(usize, 1), invalid_utf8); // seed 5
+    try testing.expectEqual(@as(usize, 1), message_too_large); // seed 6
+    try testing.expectEqual(@as(usize, 1), data_after_close); // seed 7, second frame
+    try testing.expectEqual(@as(usize, 1), too_many_fragments); // seed 10
+    try testing.expectEqual(@as(usize, 1), need_mores); // seed 8
+}

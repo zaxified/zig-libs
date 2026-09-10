@@ -5,6 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign, F5's second half (test-only, no
+  production behavior change): `connection.zig` and `handshake.zig` had zero
+  fuzz harnesses, and the `.client` role had none anywhere in the module, so
+  `error.MaskedServerFrame` (the one rule that only exists for that role)
+  was never exercised by anything adversarial. Three new fuzz targets, each
+  with a paired `corpus: ...` reach test that replays the same corpus
+  deterministically (no `--fuzz` needed) and pins how many seeds produce
+  each class of outcome -- the discipline this campaign's `opaque` module
+  needed and didn't have, where three harnesses never got past `fromBytes`
+  and so could never have found anything:
+  - `Connection.receive`, `.client` role: fragment reassembly across two
+    frames, the close handshake, `MessageTooLarge` mid-reassembly,
+    `TooManyFragments`, `DataAfterClose`, and -- the named gap --
+    `MaskedServerFrame` (a masked frame is illegal from a server).
+  - `handshake.verifyResponse`, `.client` role: fuzzes
+    `h1.ResponseHead.parse` and `verifyResponse` together (the real
+    attacker-controlled input is the raw bytes, not the pre-parsed head),
+    covering every one of its seven error variants including
+    `AcceptMismatch`, the core anti-cache-poisoning check.
+  - `handshake.acceptHandshake`, `.server` role: same shape, the other
+    direction, covering all eight of its error variants.
+
+  scripts/modtest websocket: 85/85 (Debug and ReleaseFast); consumer
+  `bacnet` unaffected (257/260, 3 pre-existing environment-gated skips).
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `verifyResponse` now rejects a `101` response
   that carries a `Sec-WebSocket-Extensions` header (`error.UnexpectedExtension` — this module
   never offers an extension, so any value there is unrequested per RFC 6455 §4.1 point 5) or a
