@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `fill`'s `error.Canceled`
+  arm is a real `@panic` with its own message now, not `unreachable` (audit
+  finding F3). `unreachable` was correct against a conforming `Io`, but
+  against one that violates the "honors `swapCancelProtection(.blocked)`"
+  contract it was undefined — and undefined does not mean inert: measured
+  under ReleaseFast, an exhaustive two-arm switch with one `unreachable` arm
+  collapsed into the *other* arm unconditionally, so `fill` still aborted,
+  but with a message blaming `EntropyUnavailable` for what was actually a
+  contract violation. `fill` still panics unconditionally on both causes; a
+  caller who was already relying on any abort at all sees no change. A
+  caller inspecting the panic message against a violating `Io` now gets the
+  true cause instead of a false one.
+
 - **2026-09-04** — **Second audit pass** (the first was 2026-08-13, which
   closed `SecureSource`'s missing output coverage and the swapped-message
   arms). The module's central guarantee — abort

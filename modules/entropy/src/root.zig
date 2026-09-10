@@ -70,10 +70,26 @@
 //! Aborting on that would be a library killing its host over a normal timeout,
 //! so `fill` does what std does at the identical site: it blocks cancellation
 //! around the draw (`std.Io.swapCancelProtection(.blocked)`, restored by
-//! `defer`) and the `error.Canceled` arm becomes `unreachable`. Compare
-//! `std.Io.Threaded`'s `randomMainThread`, which wraps its own `randomSecure`
-//! call the same way; `std.Io.swapCancelProtection`'s doc comment carries this
-//! exact idiom as its worked example.
+//! `defer`). Compare `std.Io.Threaded`'s `randomMainThread`, which wraps its
+//! own `randomSecure` call the same way.
+//!
+//! ⚠ `std.Io.swapCancelProtection`'s own doc comment carries `error.Canceled
+//! => unreachable` as its worked example for this idiom, and this module
+//! used to follow it verbatim. It does not anymore (audit finding F3,
+//! 2026-09-10): an `Io` that violates the "honors `.blocked`" contract sends
+//! `fill` down that arm for real, and in ReleaseFast an exhaustive
+//! two-member switch with one `unreachable` arm is free to collapse into
+//! the *other* arm unconditionally — so the panic that still fires reports
+//! `EntropyUnavailable` even though the actual failure was a contract
+//! violation. Fail-closed by accident, misleading by construction. `fill`
+//! instead panics on `error.Canceled` explicitly, with a message that names
+//! *that* cause — a real `@panic`, not a language-level "cannot happen"
+//! claim, so it is correct in every build mode rather than only in the ones
+//! where the arm is not optimized away. All four std backends honor
+//! `.blocked` (verified: `Threaded`, `Uring` and `Dispatch` all implement
+//! `swapCancelProtection` as a real state swap, never `unreachable`), so
+//! this arm is not expected to fire against any of them — it exists for the
+//! Io that gets it wrong.
 //!
 //! What that costs, stated plainly: a cancel aimed at a task that is inside
 //! `fill` is not observed until the draw returns. On a healthy host that is one
@@ -140,15 +156,32 @@ pub const meta = .{
 /// It aborts the host process, so it is written for whoever reads the crash:
 /// what was refused, what was NOT produced, and where to look.
 ///
-/// This is the only message `fill` can abort with. There used to be a second
-/// one for `error.Canceled`; that arm is `unreachable` now that the draw runs
-/// under blocked cancellation, so the constant is gone.
+/// This is the message `fill` aborts with on `error.EntropyUnavailable`. See
+/// `canceled_contract_violation_message` for the other one, below.
 pub const unavailable_message =
     "entropy.fill: std.Io.randomSecure returned error.EntropyUnavailable — " ++
     "the OS entropy source is unreachable, so NO secret was produced and this " ++
     "process aborted rather than mint one from a weak seed. Check whether a " ++
     "sandbox policy (seccomp/Landlock/container profile) is blocking getrandom(2), " ++
     "and on a libc build whether arc4random_buf is reachable.";
+
+/// The message `fill` aborts with when `randomSecure` returns
+/// `error.Canceled` despite the draw running under
+/// `swapCancelProtection(.blocked)` — i.e. the given `std.Io` violates the
+/// contract that error is supposed to be unreachable under. This USED to be
+/// a language-level `unreachable` (audit finding F3, 2026-09-10): correct
+/// against a conforming `Io`, but under a violating one, an exhaustive
+/// two-arm switch with one `unreachable` arm can be compiled so the
+/// `EntropyUnavailable` panic below fires regardless of which arm was
+/// actually taken — fail-closed, but the printed cause would be a lie. A
+/// real `@panic` with its own message has no such failure mode in any build
+/// mode.
+pub const canceled_contract_violation_message =
+    "entropy.fill: std.Io.randomSecure returned error.Canceled while the draw " ++
+    "was under swapCancelProtection(.blocked) — the given std.Io implementation " ++
+    "violates that contract (every std backend honors it: Threaded, Uring, " ++
+    "Dispatch). NO secret was produced; this process aborted rather than trust " ++
+    "a draw that ran while it should have been uncancelable.";
 
 /// Fail-closed entropy for secret-bearing material. Fills `buf` from
 /// `std.Io.randomSecure`, or aborts the process.
@@ -184,16 +217,21 @@ pub fn fill(io: std.Io, buf: []u8) void {
     // error channel to report a cancellation on. Blocking cancellation for the
     // length of one draw is what std does at the same site
     // (`std.Io.Threaded.randomMainThread`) and is the documented use of this
-    // API. It is what reduces `error.Canceled` below to `unreachable`.
+    // API. It is what makes `error.Canceled` below not expected to fire
+    // against a conforming `Io`.
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
 
     io.randomSecure(buf) catch |err| switch (err) {
         error.EntropyUnavailable => @panic(unavailable_message),
-        // Unreachable because of the two lines above, not because it cannot
-        // happen: `randomSecure` returns this whenever a non-blocked cancel is
-        // outstanding. Delete the protection and this becomes live again.
-        error.Canceled => unreachable,
+        // A real `@panic`, not `unreachable` (F3, 2026-09-10): the two lines
+        // above make this not expected to fire against a conforming `Io`, but
+        // "not expected" is not "cannot happen", and `unreachable` is a
+        // language-level promise that the OPTIMIZER gets to act on — collapsing
+        // this exhaustive two-arm switch into the other arm unconditionally,
+        // so a violating `Io` would still abort, but with a message that lies
+        // about why. This panic is correct in every build mode instead.
+        error.Canceled => @panic(canceled_contract_violation_message),
     };
 }
 
@@ -508,6 +546,113 @@ test "fill ABORTS when entropy is unavailable -- it does not return, and does no
     }
 }
 
+/// A `std.Io` whose `randomSecure` always returns `error.Canceled`,
+/// regardless of the cancel-protection state — the exact contract violation
+/// F3 is about. `swapCancelProtection` delegates to the real backend (same
+/// vtable-copy technique and the same constraint `CountingIo` documents:
+/// every slot `fill` reaches must be overridden here).
+const AlwaysCanceledIo = struct {
+    inner: std.Io,
+    vtable: std.Io.VTable = undefined,
+
+    fn io(self: *AlwaysCanceledIo) std.Io {
+        self.vtable = self.inner.vtable.*;
+        self.vtable.randomSecure = onRandomSecure;
+        self.vtable.swapCancelProtection = onSwapCancelProtection;
+        return .{ .userdata = self, .vtable = &self.vtable };
+    }
+
+    fn onRandomSecure(_: ?*anyopaque, _: []u8) std.Io.RandomSecureError!void {
+        return error.Canceled;
+    }
+
+    fn onSwapCancelProtection(
+        userdata: ?*anyopaque,
+        new: std.Io.CancelProtection,
+    ) std.Io.CancelProtection {
+        const self: *AlwaysCanceledIo = @ptrCast(@alignCast(userdata.?));
+        return self.inner.swapCancelProtection(new);
+    }
+};
+
+// F3: `error.Canceled` used to be `unreachable`, correct against a
+// conforming `Io` but undefined against a violating one -- and undefined
+// does not mean "does nothing", it means the compiler may act on the
+// promise. Fixed to a real `@panic` with its own message, so this is
+// well-defined in every build mode instead of only being testable at all in
+// the ones where the optimizer happens not to have collapsed the switch.
+test "fill ABORTS with an honest message when randomSecure violates the blocked-cancellation contract (F3)" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var violator: AlwaysCanceledIo = .{ .inner = threaded.io() };
+    const io = violator.io();
+
+    var fds: [2]i32 = undefined;
+    if (std.os.linux.pipe2(&fds, .{}) != 0) return error.SkipZigTest;
+
+    const rc = std.os.linux.fork();
+    const pid: isize = @bitCast(rc);
+    if (pid < 0) return error.SkipZigTest;
+    if (pid == 0) {
+        _ = std.os.linux.close(fds[0]);
+        _ = std.os.linux.dup3(fds[1], 2, 0);
+        var buf: [32]u8 = @splat(0xa5);
+        fill(io, &buf);
+        // 71: `fill` RETURNED against a contract-violating Io. That is the defect.
+        std.os.linux.exit(71);
+    }
+    _ = std.os.linux.close(fds[1]);
+
+    var msg: [4096]u8 = undefined;
+    var msg_len: usize = 0;
+    while (msg_len < msg.len) {
+        const n = std.os.linux.read(fds[0], msg[msg_len..].ptr, msg.len - msg_len);
+        const got: isize = @bitCast(n);
+        if (got <= 0) break;
+        msg_len += @intCast(got);
+    }
+    _ = std.os.linux.close(fds[0]);
+
+    var status: u32 = 0;
+    _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+    const sig = status & 0x7f;
+    const exit_code = (status >> 8) & 0xff;
+
+    if (sig == 0 and exit_code == 71) {
+        std.debug.print(
+            "\nfill() RETURNED against a contract-violating Io: the abort is gone\n",
+            .{},
+        );
+        return error.TestUnexpectedResult;
+    }
+    // SIGABRT (6) is what `@panic` produces, in every build mode -- unlike
+    // `unreachable`, whose ReleaseFast/ReleaseSmall behavior is undefined.
+    try std.testing.expectEqual(@as(u32, 6), sig);
+
+    const printed = msg[0..msg_len];
+    const needle = canceled_contract_violation_message[0..@min(canceled_contract_violation_message.len, 40)];
+    if (std.mem.indexOf(u8, printed, needle) == null) {
+        std.debug.print(
+            "\nfill() aborted, but not with `canceled_contract_violation_message`. It printed:\n{s}\n",
+            .{printed},
+        );
+        return error.TestUnexpectedResult;
+    }
+    // And the message must NOT blame EntropyUnavailable -- that would be
+    // exactly the lie F3 found: a real syscall failure that never happened,
+    // reported as the cause of a cancellation-contract violation.
+    if (std.mem.indexOf(u8, printed, "EntropyUnavailable") != null) {
+        std.debug.print(
+            "\nfill() blamed EntropyUnavailable for an error.Canceled contract violation:\n{s}\n",
+            .{printed},
+        );
+        return error.TestUnexpectedResult;
+    }
+}
+
 test "fill draws from randomSecure and never from random" {
     var probe: CountingIo = .{ .inner = testing.io };
     const io = probe.io();
@@ -672,21 +817,25 @@ test "SecureSource writes a large buffer completely, in one draw" {
     try testing.expect(!std.mem.allEqual(u8, buf[buf.len - 16 ..], sentinel));
 }
 
-// The abort path itself has no in-process test and cannot have one: Zig has no
-// catchable panic, so observing `@panic` needs a child process, and a module
-// test that re-execs the test binary buys a fork per run to assert a one-line
-// `catch`. What IS pinned is everything that decides whether that panic is
-// reachable and correct — that `fill` calls `randomSecure` (above), that the
-// draw runs under blocked cancellation so the other arm of
-// `std.Io.RandomSecureError` is genuinely `unreachable` (above), and that the
-// one surviving message names its cause (below). The switch is exhaustive, so
-// std adding an error member breaks the build rather than folding into this.
-//
-// Note what this test no longer has to do. There used to be two messages and
-// two `@panic` arms, and no test could tell which message was on which arm —
-// swapping them stayed green. There is one arm now, so the binding is
-// structural: the only `@panic` in the module is the `EntropyUnavailable` one.
-test "the abort message names its cause" {
+// The abort path itself has no cheap in-process test: Zig has no catchable
+// panic, so observing `@panic` needs a child process, and a module test that
+// re-execs the test binary buys a fork per run to assert a one-line `catch`.
+// The `EntropyUnavailable` arm's fork test is above ("fill ABORTS when
+// entropy is unavailable"); the `Canceled` arm's is the live fork test above
+// this one ("fill ABORTS with an honest message ... (F3)"). What THIS test
+// pins cheaply, without forking, is that the two messages cannot be
+// confused for each other: each names its own cause and neither one's
+// needle appears in the other. Until F3 (2026-09-10) `error.Canceled` was
+// `unreachable`, so there was only ever one message to keep straight; now
+// there are two real `@panic` arms and swapping them would be a live,
+// user-visible bug -- a wrong cause printed on a real abort -- not just a
+// stale comment.
+test "the abort messages each name their own cause, and only their own" {
     try testing.expect(std.mem.indexOf(u8, unavailable_message, "EntropyUnavailable") != null);
     try testing.expect(std.mem.indexOf(u8, unavailable_message, "getrandom(2)") != null);
+    try testing.expect(std.mem.indexOf(u8, unavailable_message, "Canceled") == null);
+
+    try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "Canceled") != null);
+    try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "swapCancelProtection") != null);
+    try testing.expect(std.mem.indexOf(u8, canceled_contract_violation_message, "EntropyUnavailable") == null);
 }
