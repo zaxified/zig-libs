@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, netsim F1 +
+  F5. F5: `generate`'s fault-kind draw no longer silently drops a disabled or
+  inapplicable kind's share of the schedule — it excludes that kind from the
+  weighted draw instead, so `Config.max_events` bounds the number of *emitted*
+  disruptions, not the number of draws (previously up to 40% weaker with
+  `enable_partition`/`enable_crash`/`enable_clock_jump` all off). The default,
+  fully-enabled, linked, multi-node case is unchanged byte-for-byte; any other
+  `(seed, topo, cfg)` combination now produces a different schedule — old
+  seeds pinned against a non-default config are not guaranteed to reproduce
+  the same trace (none of the 7 in-repo consumers were affected; verified by
+  running every consumer's test lane, all green). F1: `applyFault` now rejects
+  an out-of-range node id in `crash_node`/`restart_node`/`clock_jump` with a
+  new `error.UnknownNode` instead of indexing unchecked (Debug panic,
+  ReleaseFast out-of-bounds write reporting `outcome = .ok`) — additive, since
+  `applyFault`/`replay` were already `anyerror!...`.
 - **2026-08-18** — Portability fix: `Prng.below(n: usize) usize` was reused for
   `Time`-typed (`u64`) draws — `cfg.horizon` in `fault.generate` and
   `link.cfg.jitter`/`reorder_extra` in `Sim.send` — which fails to compile on a

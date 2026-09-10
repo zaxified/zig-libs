@@ -127,62 +127,95 @@ pub fn generate(gpa: Allocator, seed: u64, topo: Topo, cfg: Config) Error!FaultT
         const t: Time = prng.belowWide(cfg.horizon);
         const repair_t: Time = t + 1 + prng.belowWide(cfg.horizon / 2 + 1);
         const has_links = topo.links.len > 0;
+        const can_crash = cfg.enable_crash and topo.node_count > 0;
+        const can_clock_jump = cfg.enable_clock_jump and topo.node_count > 0;
+        const can_partition = cfg.enable_partition and topo.node_count >= 2;
 
-        // Weighted kind selection. Duplication is over-weighted so that
-        // duplicate-sensitive bugs (the loop-inducing class this harness is
-        // built to catch) are reliably reachable by the fuzzer.
-        var roll = prng.below(10);
-        if (!has_links and roll < 5) roll = 5 + prng.below(5); // no links → node-scoped kinds only
+        // Weighted kind selection over only the kinds this (topo, cfg) pair
+        // can currently EMIT. Weights mirror the original design: duplication
+        // is over-weighted (3) so duplicate-sensitive bugs (the loop-inducing
+        // class this harness is built to catch) stay reliably reachable;
+        // partition carries weight 2; every other kind is 1.
+        //
+        // audit F5: the previous version drew `roll = below(10)` over ALL ten
+        // slots unconditionally, then no-op'd the branches an inapplicable
+        // roll landed on (`enable_crash == false`, no links, a single node).
+        // That silently deletes that roll's share of the schedule instead of
+        // redistributing it — `Config.max_events` was documented as "maximum
+        // number of primary disruptions drawn" but was actually only a bound
+        // on the number of *draws*, of which some fraction (measured: up to
+        // 40% with all three optional kinds off) produced nothing. A disabled
+        // or inapplicable kind is now EXCLUDED from the draw itself, so every
+        // draw in `[0, n)` emits exactly one primary disruption and the
+        // config's promise holds regardless of which kinds are enabled.
+        //
+        // This changes the emitted schedule for any (seed, topo, cfg) where
+        // a kind is disabled or a link/node precondition doesn't hold — by
+        // design (user decision, DECISIONS.md §2 `netsim` F5): "the instrument
+        // that generates a different schedule than its config claims is the
+        // defective one; old seeds are sacrificed." For the fully-enabled,
+        // has-links, multi-node case (the module's own default `Config{}`)
+        // the ten weights below sum to 10 and this draw is unchanged.
+        const dup_w: usize = if (has_links) 3 else 0;
+        const drop_w: usize = if (has_links) 1 else 0;
+        const delay_w: usize = if (has_links) 1 else 0;
+        const link_down_w: usize = if (has_links) 1 else 0;
+        const crash_w: usize = if (can_crash) 1 else 0;
+        const clock_jump_w: usize = if (can_clock_jump) 1 else 0;
+        const partition_w: usize = if (can_partition) 2 else 0;
+        const total_w = dup_w + drop_w + delay_w + link_down_w + crash_w + clock_jump_w + partition_w;
+        if (total_w == 0) continue; // nothing this (topo, cfg) pair can express at all
 
-        switch (roll) {
-            0, 1, 2 => { // dup_once
-                const l = topo.links[prng.below(topo.links.len)];
-                try list.append(a, .{ .time = t, .kind = .{ .dup_once = l } });
-            },
-            3 => { // drop_once
-                const l = topo.links[prng.below(topo.links.len)];
-                try list.append(a, .{ .time = t, .kind = .{ .drop_once = l } });
-            },
-            4 => { // delay_once (reorder)
-                const l = topo.links[prng.below(topo.links.len)];
-                const extra: Time = 1 + prng.below(50);
-                try list.append(a, .{ .time = t, .kind = .{ .delay_once = .{ .a = l.a, .b = l.b, .extra = extra } } });
-            },
-            5 => { // link_down (+ maybe link_up)
-                if (has_links) {
-                    const l = topo.links[prng.below(topo.links.len)];
-                    try list.append(a, .{ .time = t, .kind = .{ .link_down = l } });
-                    if (prng.permille(cfg.repair_permille))
-                        try list.append(a, .{ .time = repair_t, .kind = .{ .link_up = l } });
-                }
-            },
-            6 => { // crash (+ maybe restart)
-                if (cfg.enable_crash and topo.node_count > 0) {
-                    const node: NodeId = @intCast(prng.below(topo.node_count));
-                    try list.append(a, .{ .time = t, .kind = .{ .crash_node = .{ .node = node } } });
-                    if (prng.permille(cfg.repair_permille))
-                        try list.append(a, .{ .time = repair_t, .kind = .{ .restart_node = .{ .node = node } } });
-                }
-            },
-            7 => { // clock_jump
-                if (cfg.enable_clock_jump and topo.node_count > 0) {
-                    const node: NodeId = @intCast(prng.below(topo.node_count));
-                    const mag: i64 = @intCast(1 + prng.below(100));
-                    const delta: i64 = if (prng.chance(1, 2)) mag else -mag;
-                    try list.append(a, .{ .time = t, .kind = .{ .clock_jump = .{ .node = node, .delta = delta } } });
-                }
-            },
-            else => { // partition (+ maybe heal)
-                if (cfg.enable_partition and topo.node_count >= 2) {
-                    const cut = try drawCut(a, &prng, topo.node_count);
-                    const id = part_id;
-                    part_id += 1;
-                    try list.append(a, .{ .time = t, .kind = .{ .partition = .{ .id = id, .cut = cut } } });
-                    if (prng.permille(cfg.repair_permille))
-                        try list.append(a, .{ .time = repair_t, .kind = .{ .heal = .{ .id = id } } });
-                }
-            },
+        var roll = prng.below(total_w);
+        if (roll < dup_w) {
+            const l = topo.links[prng.below(topo.links.len)];
+            try list.append(a, .{ .time = t, .kind = .{ .dup_once = l } });
+            continue;
         }
+        roll -= dup_w;
+        if (roll < drop_w) {
+            const l = topo.links[prng.below(topo.links.len)];
+            try list.append(a, .{ .time = t, .kind = .{ .drop_once = l } });
+            continue;
+        }
+        roll -= drop_w;
+        if (roll < delay_w) {
+            const l = topo.links[prng.below(topo.links.len)];
+            const extra: Time = 1 + prng.below(50);
+            try list.append(a, .{ .time = t, .kind = .{ .delay_once = .{ .a = l.a, .b = l.b, .extra = extra } } });
+            continue;
+        }
+        roll -= delay_w;
+        if (roll < link_down_w) {
+            const l = topo.links[prng.below(topo.links.len)];
+            try list.append(a, .{ .time = t, .kind = .{ .link_down = l } });
+            if (prng.permille(cfg.repair_permille))
+                try list.append(a, .{ .time = repair_t, .kind = .{ .link_up = l } });
+            continue;
+        }
+        roll -= link_down_w;
+        if (roll < crash_w) {
+            const node: NodeId = @intCast(prng.below(topo.node_count));
+            try list.append(a, .{ .time = t, .kind = .{ .crash_node = .{ .node = node } } });
+            if (prng.permille(cfg.repair_permille))
+                try list.append(a, .{ .time = repair_t, .kind = .{ .restart_node = .{ .node = node } } });
+            continue;
+        }
+        roll -= crash_w;
+        if (roll < clock_jump_w) {
+            const node: NodeId = @intCast(prng.below(topo.node_count));
+            const mag: i64 = @intCast(1 + prng.below(100));
+            const delta: i64 = if (prng.chance(1, 2)) mag else -mag;
+            try list.append(a, .{ .time = t, .kind = .{ .clock_jump = .{ .node = node, .delta = delta } } });
+            continue;
+        }
+        // else: partition (+ maybe heal) — the only remaining weight.
+        const cut = try drawCut(a, &prng, topo.node_count);
+        const id = part_id;
+        part_id += 1;
+        try list.append(a, .{ .time = t, .kind = .{ .partition = .{ .id = id, .cut = cut } } });
+        if (prng.permille(cfg.repair_permille))
+            try list.append(a, .{ .time = repair_t, .kind = .{ .heal = .{ .id = id } } });
     }
 
     const events = try list.toOwnedSlice(a);
@@ -279,6 +312,80 @@ test "generate: a partition cut is always a non-empty proper subset" {
             },
             else => {},
         };
+    }
+}
+
+fn noLinksTopo() Topo {
+    return .{ .node_count = 4, .links = &.{} };
+}
+
+test "generate: disabling a fault kind redistributes its weight, not drops it (audit F5)" {
+    // Before the fix, `generate` drew `roll = below(10)` unconditionally over
+    // ALL ten weighted slots, then no-op'd (silently dropped) any roll that
+    // landed on a disabled or inapplicable kind (`enable_crash == false`, a
+    // link-scoped kind with no links, `enable_partition == false`, …). So
+    // `Config.max_events` — documented as "maximum number of primary
+    // disruptions drawn" — actually bounded the number of *draws*, of which
+    // the audit measured up to 40% silently producing nothing with every
+    // optional kind off. `loopfree-reconv` turns all three off and so was
+    // getting a ~40% weaker schedule than its own `max_events = 20` promised.
+    //
+    // This test recomputes exactly how many draws `generate` intends to make
+    // (replaying the identical `seed ^ salt` PRNG stream it seeds internally)
+    // and asserts every intended draw now yields exactly one primary
+    // disruption, for every combination below, on a topology WITH links —
+    // where under the old code only the fully-enabled config lost nothing.
+    const cfgs = [_]Config{
+        .{}, // baseline: everything on
+        .{ .enable_partition = false },
+        .{ .enable_crash = false },
+        .{ .enable_clock_jump = false },
+        .{ .enable_partition = false, .enable_crash = false, .enable_clock_jump = false }, // audit's -40.1% case
+    };
+    for (cfgs) |cfg| {
+        var total_intended: usize = 0;
+        var total_primary: usize = 0;
+        var seed: u64 = 1;
+        while (seed <= 500) : (seed += 1) {
+            var p = Prng.init(seed ^ salt);
+            total_intended += p.below(cfg.max_events + 1);
+
+            var tr = try generate(testing.allocator, seed, sampleTopo(), cfg);
+            defer tr.deinit();
+            for (tr.events) |e| switch (e.kind) {
+                .dup_once, .drop_once, .delay_once, .link_down, .crash_node, .clock_jump, .partition => total_primary += 1,
+                .link_up, .heal, .restart_node => {}, // repairs, not primary draws
+            };
+        }
+        try testing.expectEqual(total_intended, total_primary);
+    }
+
+    // Same property on a topology WITHOUT links (audit's -19.9% case): only
+    // the node-scoped kinds are available, so exclude the all-optional-off
+    // combination (nothing at all would be expressible there, which is
+    // correctly zero, not a regression).
+    const link_free_cfgs = [_]Config{
+        .{},
+        .{ .enable_partition = false },
+        .{ .enable_crash = false },
+        .{ .enable_clock_jump = false },
+    };
+    for (link_free_cfgs) |cfg| {
+        var total_intended: usize = 0;
+        var total_primary: usize = 0;
+        var seed: u64 = 1;
+        while (seed <= 500) : (seed += 1) {
+            var p = Prng.init(seed ^ salt);
+            total_intended += p.below(cfg.max_events + 1);
+
+            var tr = try generate(testing.allocator, seed, noLinksTopo(), cfg);
+            defer tr.deinit();
+            for (tr.events) |e| switch (e.kind) {
+                .dup_once, .drop_once, .delay_once, .link_down, .crash_node, .clock_jump, .partition => total_primary += 1,
+                .link_up, .heal, .restart_node => {}, // repairs, not primary draws
+            };
+        }
+        try testing.expectEqual(total_intended, total_primary);
     }
 }
 

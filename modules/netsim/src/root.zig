@@ -443,6 +443,23 @@ test "shrink: a fuzzed failing schedule minimizes to a still-reproducing core" {
     try testing.expect(has_dup);
 }
 
+test "replay: an out-of-range node id in an externally-supplied trace is rejected (audit F1)" {
+    // `replay` is the module's one public entry point that takes a trace
+    // from ANYWHERE — a saved reproducer hand-edited before replay, or a
+    // shrunk trace applied to a topology smaller than the one that produced
+    // it (`fault.generate` itself always bounds ids by its own topology, so
+    // this case never reaches `applyFault` through the fuzzer). Before the
+    // fix, `crash_node{.node=99}` panicked in Debug and, in ReleaseFast,
+    // wrote past `Sim.nodes` while the run still reported `outcome = .ok`.
+    const gpa = testing.allocator;
+    var flood = try Flood.init(gpa, FLOOD_N); // FLOOD_N == 5, valid ids 0..4
+    defer flood.deinit(gpa);
+    const case = Case{ .seed = 1, .scenario = floodScenario, .protocol = flood.protocol(), .until = 200 };
+
+    const trace = [_]FaultEvent{.{ .time = 0, .kind = .{ .crash_node = .{ .node = 99 } } }};
+    try testing.expectError(error.UnknownNode, replay(gpa, case, &trace, null));
+}
+
 test "teeth: the fuzzer finds the loop bug across a seed sweep" {
     const gpa = testing.allocator;
     var loopy = try LoopyForward.init(gpa, LOOPY_N, LOOPY_DEST);

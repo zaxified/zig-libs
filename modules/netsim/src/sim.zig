@@ -524,15 +524,24 @@ pub const Sim = struct {
                 self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = h.id });
             },
             .crash_node => |c| {
+                // audit F1: `replay` is public and takes a trace from
+                // anywhere (a hand-edited reproducer, a shrunk trace applied
+                // to a smaller topology, ...) — unlike `fault.generate`,
+                // which only ever draws ids bounded by its own topology. An
+                // unchecked index here panicked in Debug and wrote past the
+                // array in ReleaseFast while still reporting `outcome = .ok`.
+                if (c.node >= self.nodes.items.len) return error.UnknownNode;
                 self.nodes.items[c.node].crashed = true;
                 self.append(.{ .tag = .crash, .a = c.node });
             },
             .restart_node => |r| {
+                if (r.node >= self.nodes.items.len) return error.UnknownNode;
                 self.nodes.items[r.node].crashed = false;
                 self.append(.{ .tag = .restart, .a = r.node });
                 if (self.protocol.onStartFn) |f| try f(self.protocol.ctx, self, r.node);
             },
             .clock_jump => |j| {
+                if (j.node >= self.nodes.items.len) return error.UnknownNode;
                 self.nodes.items[j.node].clock_offset += j.delta;
                 self.append(.{ .tag = .fault, .a = @intFromEnum(std.meta.activeTag(fk)), .b = j.node, .c = j.delta });
             },
@@ -691,6 +700,32 @@ test "drive: an event scheduled exactly at `until` is still processed (inclusive
     _ = try sim.drive();
 
     try testing.expectEqual(@as(usize, 1), fired);
+}
+
+test "applyFault: an out-of-range node id is rejected, not indexed unchecked (audit F1)" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    const Noop = struct {
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    };
+    var unused: usize = 0;
+    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onMessageFn = Noop.onMessage }, &log, 100, 1000);
+    defer sim.deinit();
+    _ = try sim.addNode(.{});
+    _ = try sim.addNode(.{});
+    _ = try sim.addNode(.{});
+    _ = try sim.addNode(.{}); // 4 nodes, valid ids 0..3
+
+    try testing.expectError(error.UnknownNode, sim.applyFault(.{ .crash_node = .{ .node = 99 } }));
+    try testing.expectError(error.UnknownNode, sim.applyFault(.{ .restart_node = .{ .node = 99 } }));
+    try testing.expectError(error.UnknownNode, sim.applyFault(.{ .clock_jump = .{ .node = 99, .delta = 5 } }));
+
+    // Positive control: a valid node id still works exactly as before.
+    try sim.applyFault(.{ .crash_node = .{ .node = 2 } });
+    try testing.expect(sim.nodes.items[2].crashed);
+    try sim.applyFault(.{ .clock_jump = .{ .node = 1, .delta = 7 } });
+    try testing.expectEqual(@as(i64, 7), sim.nodes.items[1].clock_offset);
 }
 
 test "event heap: pops in (time, seq) order" {
