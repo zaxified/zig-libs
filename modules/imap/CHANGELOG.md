@@ -5,7 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-10** — **BEHAVIOURAL, not breaking:** a new `wire.Options.max_literal_total`
+- **2026-09-10** (2) — **BEHAVIOURAL, not breaking:** A1 fix campaign, F9 (partial: the
+  `FETCH BODY[...]` section half). `fetch.isSectionChar` was `ch != ']'`, so
+  `BODY[A\r\nB]`/`BODY[A\x00B]` parsed and handed the caller a section string with an
+  embedded CR/LF/NUL — a value the module's own encoder (`command.checkSection`) has never
+  been able to build. Narrowed to mirror the encoder exactly: `ch != ']' and ch >= 0x20 and
+  ch < 0x7f`. A response whose section contains a control byte or non-ASCII now fails with
+  `error.UnexpectedByte` (the run stops at the disallowed byte, then the following
+  `d.expect(']')` finds it instead) rather than silently handing the caller a poisoned
+  section string. New test with the audit's own repro strings plus a positive control
+  (`HEADER.FIELDS (FROM TO)` still parses). The other half of F9 — a modified-UTF-7 shift
+  run decoding to a control character (`&AA0ACg-` → a bare CRLF) — is NOT closed this
+  session: the obvious fix (reject control-class scalars out of a shift run) contradicts a
+  cited upstream `go-imap` test table (`&AB8-`/`&AH8-`, U+001F/DEL, are asserted ACCEPTED
+  there as "tier 2 (go-imap table)" vectors) — closing it would diverge this module's
+  decoder from the reference implementation it is ported from, which is a bigger call than
+  "tighten an unowned input", so it is left open with a question instead of a silent
+  unilateral fix.
+
+
   (default 32 MiB) bounds the SUM of literal payload sizes accepted on one response line —
   previously only each individual literal was capped, so many small literals could stack
   past it (measured: 1,000 x 64 KiB literals on one line, 73.7 MB, was accepted outright).
