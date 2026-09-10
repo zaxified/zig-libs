@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — `decrypt`'s doc comment claimed the L-function division's
+  timing leak was "accepted, harmless" because `threshold_ecdsa`'s MtA masks
+  the decrypted plaintext with a uniform `beta'` drawn via
+  `samplePaillierRandomness`. That was wrong on two counts, found while
+  closing `threshold_ecdsa` audit F5 (not a `paillier`-side finding of its
+  own): (1) `beta'` is drawn by `threshold_ecdsa/src/mta.zig`'s
+  `randomScalar`, uniform over `Zq` (the ~256-bit curve scalar field), never
+  by `samplePaillierRandomness` (uniform over `Z_N`, this module's ~2048-bit
+  modulus) — the comment named the wrong function; (2) even fixing that
+  naming, a `Zq`-sized mask over a `Z_N`-sized value is not the
+  "information-theoretically independent" case the comment claimed.
+  `threshold_ecdsa/SPEC.md`'s own "A5" section already carried the correct
+  analysis; this module's comment did not match it. Rewrote the comment to
+  state the actual masking shape and point at the still-open quantitative
+  question (SPEC.md A5) instead of asserting it is settled. Added, from an
+  ad hoc `zig build-exe -fvalgrind` + `valgrind --tool=memcheck` run over
+  this module's own `src/ctgrind_harness.zig` (`crt`/`noncrt` targets,
+  `lambda`/`mu`/CRT-block tainted): **333 ctx/92089 err** (`crt`) and
+  **143 ctx/3851 err** (`noncrt`) vs **0/0** untainted, with
+  `math.big.int.Managed.divFloor` called from `root.decrypt` (the L-function
+  line) confirmed as a first-class contributor in both raw memcheck stack
+  traces — this module's own pinned ctgrind gate already reaches the
+  disputed division; whether the leak is *exploitable* against a
+  partially-masked nonce share is not something this module or its gate can
+  answer. Doc-only change, no behavior or public signature affected.
+  `scripts/modtest paillier`: 38/39 (1 skip), unchanged before/after.
+
 - **2026-09-10** — A1 fix campaign, wave 3 (F1/F2/F5 of `A1/paillier.md`;
   see that file's "Dispozice 2026-09-10" for the measurements). No public
   signature changed.
