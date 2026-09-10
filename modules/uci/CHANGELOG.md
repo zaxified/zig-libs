@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — Audit A1 U5/U6 (HIGH): the tokenizer was rewritten from line-oriented to
+  byte-oriented. Real `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187) lets a quote
+  span physical lines via `uci_getln`; this module used to reject the WHOLE FILE
+  (`error.UnterminatedQuote`) for a quote that didn't close before its line ended — availability
+  impact on the main parse path for any value with an embedded newline (a certificate, an SSH key, a
+  multi-line LuCI form field). Outside a quote, the grammar is still exactly one physical line
+  (unaffected). Downstream of that fix, U6: the serializer previously rejected ALL sub-0x20 bytes in
+  a value, including `\t`/`\n`/`\r` — the ONLY three real `uci_validate_text` (util.c:96) actually
+  allows, written back literally, not via an escape (the earlier "no escape produces a control byte"
+  fix had over-corrected into "no control byte can be represented" for those three). Both parser and
+  serializer now match real `uci`; the full existing corpus (golden captures, real OpenWRT configs,
+  the mutation suite, every diagnostic-line-number test) is unchanged. See SPEC.md for the RED→GREEN
+  measurement and `root.zig`'s "audit A1 U5"/"audit A1 U6" tests.
+
 - **2026-09-10** — Audit A1 second fix pass (P1: this module has zero consumers in the repo, so
   input-hardening decisions, including new error values, are the fixer's call). Three new
   `ParseError` values, one new `SerializeError` value, and one behavior correction:

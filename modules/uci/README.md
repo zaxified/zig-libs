@@ -72,17 +72,30 @@ _ = pkg.eql(&other);
 ## Format coverage / semantics
 
 - Named and anonymous sections; optional `package <name>` header line.
-- Single quotes: no escapes. Double quotes: a backslash before ANY character
-  (including `n`/`t`/`r`) drops the backslash and keeps that character
-  literally — there is no escape that produces an actual control byte (real
-  `uci` binary confirms `\n`/`\t`/`\r` are not special-cased; see SPEC.md).
-  Bare words; adjacent quoted/bare segments of one token concatenate
-  (`'a'"b"c` → `abc`).
+- Single quotes: no escapes — everything between them, `\t`/`\n`/`\r`
+  included, is literal. Double quotes: `\" \' \\` are true escapes; a
+  backslash before ANY OTHER character (including `n`/`t`/`r`) drops the
+  backslash and keeps that character literally — there is no BACKSLASH
+  escape that produces an actual control byte (real `uci` binary confirms
+  `\n`/`\t`/`\r` are not special-cased; see SPEC.md). That does not mean
+  those three bytes can't appear at all: `\t`/`\n`/`\r` are legal LITERAL
+  bytes inside either kind of quote (audit A1 U6 — the only three sub-0x20
+  bytes real `uci`'s own validator allows in a value) and this module writes
+  them back raw, unescaped, same as real `uci export`. Bare words; adjacent
+  quoted/bare segments of one token concatenate (`'a'"b"c` → `abc`).
+- **A quote (either kind) may span physical lines** (audit A1 U5): a value
+  containing a real newline — a certificate, an SSH key, a multi-line LuCI
+  form field — is accepted and round-trips as a multi-line quoted literal,
+  e.g. `option multi 'line1` + newline + `line2'`, matching real `uci`
+  (`uci_getln`, file.c:41). Only running out of input with a quote still
+  open is `error.UnterminatedQuote`. Everything OUTSIDE a quote is still
+  exactly one physical line — a bare word, `#`, and the statement keyword
+  never cross a `\n`.
 - Comments: `#` to end of line at the start of a token, OR anywhere inside a
   bare (unquoted) run — either way it truncates the token and discards the
   rest of the *line*, matching real `uci` (audit A1 U4: `a#b` unquoted is
-  `a`, not `a#b`). Literal inside quotes. Quotes may not span lines; CRLF
-  accepted.
+  `a`, not `a#b`). Literal inside quotes. CRLF accepted (statement grammar
+  only; not part of a quoted value's own content).
 - Repeated `option` under one key: last wins. `list` accumulates in order.
   Mixing `option`/`list` under one key is rejected here as
   `error.MixedOptionList`, and an `option`/`list` with no value as
