@@ -2457,6 +2457,63 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     try testing.expect(!verifyBobMta(proof.base, c_a, c_b, pk, setup.aux));
 }
 
+test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transcript unchanged (audit F4(a) MED, 2026-09-10)" {
+    // The "wrong B" case in the test above tampers `b_point` ONLY at
+    // VERIFY time, against a proof whose challenge was bound to a
+    // DIFFERENT b_point — so it fails equations 3/4/5 (challenge mismatch)
+    // before ever reaching equation 6. The audit found that shape is a
+    // detour: mutating away equation 6 in the verifier left this whole
+    // suite green, including the test above, because nothing exercises
+    // equation 6 on its own. This test does: prover and verifier agree on
+    // (and the challenge is bound to) the SAME `b_point` on both sides —
+    // so equations 3-5, which never reference `b_point` except through
+    // the challenge hash, succeed on their own terms — but that
+    // `b_point` is NOT `b·G` for the `b` actually used in the Paillier-side
+    // math. Only equation 6 (`[s1 mod q]*G == e*b_point + u1`) can catch
+    // that mismatch, exactly the "last-mover"-style attack the module doc
+    // comment describes: a malicious Bob whose MtA input diverges from
+    // the EC share he already committed to.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const setup = try realAuxAndKey(0xb0b_0005);
+    const pk = setup.kp.public;
+
+    var prng = std.Random.DefaultPrng.init(0x6571365f69736f); // "eq6_iso"
+    const random = prng.random();
+
+    const a = scalarFromU64(0xaaaa);
+    const b = scalarFromU64(0xbbbb);
+    const beta_prime = scalarFromU64(0xcccc);
+    const r_a = testPaillierRandomness(pk, random);
+    const r_b = testPaillierRandomness(pk, random);
+    const c_a = paillier.encrypt(pk, scalarToTestFe(a, pk), r_a) catch unreachable;
+    const b_bytes = b.toBytes(.big);
+    const bp_bytes = beta_prime.toBytes(.big);
+    const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
+
+    // `b_mismatch` is a DIFFERENT scalar than `b` — `wrong_point` is its
+    // `·G`, not `b`'s. Both prove and verify below use `wrong_point`
+    // consistently, so the Fiat-Shamir challenge matches on both sides.
+    const b_mismatch = scalarFromU64(0xdddd);
+    try testing.expect(!std.mem.eql(u8, &b_mismatch.toBytes(.big), &b.toBytes(.big)));
+    const wrong_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b_mismatch.toBytes(.big), .big) catch unreachable) catch unreachable;
+
+    const proof = try proveBobMtaWc(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, wrong_point, random);
+    defer proof.deinit(allocator);
+
+    // Equations 3-5 hold (same challenge on both sides, real Paillier
+    // relations over the real `b`) — only equation 6 can reject this.
+    try testing.expect(!verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, wrong_point));
+
+    // Positive control, same setup: proving/verifying against the point
+    // that genuinely IS `b`'s discrete log passes — proves the rejection
+    // above is about the b/B mismatch, not a broken predicate.
+    const true_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
+    const proof_honest = try proveBobMtaWc(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, true_point, random);
+    defer proof_honest.deinit(allocator);
+    try testing.expect(verifyBobMtaWc(proof_honest, c_a, c_b, pk, setup.aux, true_point));
+}
+
 // -- audit F1/F2: checked-path received-parameter validation (NEW) --
 //
 // A malicious counterparty supplies the `verifier_aux` a prover commits its

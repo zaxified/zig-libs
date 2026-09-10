@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds a test isolating
+  `verifyBobMtaWc`'s equation 6 (audit F4(a), MED) — the existing "wrong
+  B" test tampers `b_point` only at verify time against a proof whose
+  challenge was bound to a different point, so it fails equations 3-5
+  (Fiat-Shamir mismatch) before equation 6 is ever reached; the new test
+  keeps `b_point` consistent between prove and verify (so the transcript
+  matches and equations 3-5, which do not reference `b_point`/`u1_point`
+  in their own arithmetic, pass on their own terms) while that `b_point`
+  is not the Paillier witness `b`'s actual `·G` — isolating the rejection
+  to equation 6 alone. No production code changed. Also corrects a
+  `Pimod.verify` comment (audit F9, LOW) that claimed its Miller-Rabin
+  witnesses are outside the modulus-crafter's control; `SHA256(n_tilde)`
+  is a public deterministic function a crafter can evaluate offline, so
+  the real argument is cost (~2^-128 per grind attempt at 64 rounds), not
+  unpredictability — the underlying conclusion (per-round equations, not
+  MR, carry the check) is unchanged.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `AuxParams.validate` now
   rejects an `h1`/`h2` of order 2 (audit F1, HIGH — an order-2 `h2` let a
   malicious counterparty defeat the Pedersen commitment's hiding via

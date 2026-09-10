@@ -1145,11 +1145,22 @@ pub const Pimod = struct {
         // 1. n_tilde must be an odd composite. Odd is structural (ff
         //    rejects even moduli); composite = Miller-Rabin with witnesses
         //    drawn from a PRNG seeded by H(n_tilde) — `verify` takes no
-        //    CSPRNG parameter, and deriving the witnesses from the modulus
-        //    itself keeps them outside the modulus-crafter's control (the
-        //    modulus cannot be chosen AFTER its own witnesses are known).
-        //    An honest composite fails MR on the first witness; only a
-        //    (rejected) prime pays the full round count.
+        //    CSPRNG parameter. Audit F9 (2026-09-10 doc fix): the witnesses
+        //    are NOT outside the modulus-crafter's control — H(n_tilde) is
+        //    a public, deterministic function of a candidate the crafter
+        //    already holds, so nothing stops computing them offline for
+        //    any n_tilde before submitting it. What actually carries this
+        //    check is cost, not unpredictability: an honest PRIME survives
+        //    only with probability <= 4^-rounds per witness (rounds = 64
+        //    here, i.e. ~2^-128), so grinding for a prime whose SHA256-seeded
+        //    witnesses all happen to miss it is exactly as expensive as
+        //    guessing a witness blind would be. The per-round equations in
+        //    step 3+ are the ones load-bearing against a chosen-witness
+        //    attack in general (see the module's KAT with a genuinely
+        //    3-prime modulus); this step alone would not be sound against
+        //    an adversary who COULD predict the witnesses, but grinding one
+        //    who cannot see them coming is not a smaller problem than
+        //    factoring the near-miss.
         {
             var digest: [Sha256.digest_length]u8 = undefined;
             Sha256.hash(n_bytes, &digest, .{});
