@@ -74,7 +74,13 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   force buffering of an oversized frame merely by claiming a huge length (`error.FrameTooLarge`,
   close 1009). `Connection.message_buf.len` bounds the aggregate reassembled-message size
   (`error.MessageTooLarge`, close 1009) — this is the fragmentation-amplification bound: many
-  small, individually-compliant frames could otherwise build an unbounded message.
+  small, individually-compliant frames could otherwise build an unbounded message. ⚠ That bound is
+  on *bytes*, not *frames*: it does not stop a peer sending unbounded zero-byte (or otherwise
+  never-growing) `continuation` frames, which never trip a byte cap and never make progress either
+  (measured: 20,000,000 empty continuation frames, `message_len` stays 0, no error).
+  `Connection.max_fragments` (default 65536, generous relative to any legitimate low-MTU
+  fragmentation pattern) bounds how many frames — the initial frame plus every continuation — may
+  make up one reassembled message, `error.TooManyFragments` (close 1009) past it.
 - **Control-frame constraints (§5.5):** `FIN=0` on close/ping/pong → `error.FragmentedControlFrame`
   (close 1002); payload over 125 bytes → `error.ControlFrameTooLarge` (close 1002). Both checked
   before any payload bytes are required to be present.
@@ -87,6 +93,31 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   reason (same error) is rejected; binary messages are never validated.
 - **Fragmentation sequencing:** a continuation frame with no message in progress, or a new
   text/binary frame while one is already in progress, is `error.InvalidFragmentation` (close 1002).
+  Any error `Connection.receive` returns discards the fragmented message in progress
+  (`fragment_opcode`/`message_len`/`fragment_count` reset) before propagating — otherwise a message
+  rejected mid-reassembly (e.g. `MessageTooLarge` on its second fragment) left its bytes sitting in
+  `message_buf` with `fragment_opcode` still set, and a later, *unrelated* continuation frame would
+  complete using those leftover bytes: a message spliced together from data the caller had already
+  been told was rejected. This reset does not fail the `Connection` itself shut — the module owns
+  no I/O, and the caller (not `receive`) is the one who decides, from the returned error and
+  `frame.closeCode`, whether to keep using the connection for its next, unrelated message or to
+  close the transport.
+- **Duplicate handshake headers:** `Upgrade`, `Connection`, `Sec-WebSocket-Version`,
+  `Sec-WebSocket-Key` and `Sec-WebSocket-Protocol` each appearing more than once in a request
+  (`acceptHandshake`), and `Upgrade`, `Connection`, `Sec-WebSocket-Accept` and
+  `Sec-WebSocket-Protocol` more than once in a response (`verifyResponse`), are
+  `error.DuplicateHeader` (close 1002) rather than silently first-wins — `h1.RequestHead.header`/
+  `h1.ResponseHead.header` return only the first occurrence, so an intermediary that combines the
+  values or picks the last would derive a different accept key or negotiation decision from the
+  same bytes than this module does.
+- **Client-side request field injection:** `writeRequest` writes every `ClientRequestOptions` field
+  (`host`, `target`, `key`, each `protocols` entry, each `extra_headers` name/value) straight onto
+  the wire. Each is checked against `http`'s own field-syntax predicates
+  (`h1.isValidHost`/`h1.isValidRequestTarget`/`h1.isToken`/`h1.isValidFieldValue`) before anything
+  is written — the same predicates `http.Server`'s outbound `setHeader` holds response headers to
+  — and `error.InvalidRequestField` is returned instead of writing a request whose CR/LF/NUL a
+  caller's attacker-controlled input (e.g. `extra_headers` built from a cookie or bearer token)
+  could use to inject header lines or split the request.
 - **Close-code validation (RFC 6455 §7.4.1):** a close frame's status code is checked against the
   ranges the RFC actually permits on the wire — `1000-1003`, `1007-1011`, `3000-4999` — before its
   reason is even read. Codes `0-999` (unused), `1004`/`1005`/`1006`/`1015` (each specified "MUST NOT
@@ -104,17 +135,21 @@ every frame byte) — no panics on malformed input anywhere; every rejection is 
   mapping switch to build the failing close frame.
 - **Out of scope:** TLS/TCP transport (the caller's — see `http`'s BYO-TLS seam for the pattern),
   **permessage-deflate (RFC 7692)** — no extension negotiation of any kind is implemented, so
-  `Sec-WebSocket-Extensions` is never read or written and any RSV bit is always rejected (deferred:
-  a real perf win for text-heavy workloads, but a distinct, security-sensitive feature — DEFLATE
-  decompression bombs are a known WebSocket DoS vector — that deserves its own audited pass rather
-  than a token-budget afterthought here), origin-header policy / CSRF-via-WebSocket-handshake
+  `writeRequest` never sends a `Sec-WebSocket-Extensions` header and any RSV bit on the wire is
+  always rejected (deferred: a real perf win for text-heavy workloads, but a distinct,
+  security-sensitive feature — DEFLATE decompression bombs are a known WebSocket DoS vector — that
+  deserves its own audited pass rather than a token-budget afterthought here). `verifyResponse`
+  *does* read the response's `Sec-WebSocket-Extensions` (RFC 6455 §4.1 point 5), but only to reject
+  it: since this module never offers an extension, any value the server names there is by
+  definition one the client never requested, so the header's mere presence is
+  `error.UnexpectedExtension`. Also out of scope: origin-header policy / CSRF-via-WebSocket-handshake
   checks (the caller's — this module surfaces the `Origin` header like any other but doesn't police
   it, since the correct policy is application-specific), and automatic ping/keepalive scheduling
   (the caller drives the event loop; `frame.pongFor` is the one building block provided).
 
 ## Verification
 
-`zig build test-websocket` — 62 offline tests, green in Debug + ReleaseFast.
+`zig build test-websocket` — 77 offline tests, green in Debug + ReleaseFast.
 - **RFC 6455 vector-backed (byte-exact):** the §1.3 handshake worked example
   (`dGhlIHNhbXBsZSBub25jZQ==` → `s3pPLMBiTxaQ9kYGzzhZRbK+xOo=`, both as a standalone
   `computeAcceptKey` check and as a full `acceptHandshake` + `writeResponse` round trip over the

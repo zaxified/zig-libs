@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `verifyResponse` now rejects a `101` response
+  that carries a `Sec-WebSocket-Extensions` header (`error.UnexpectedExtension` — this module
+  never offers an extension, so any value there is unrequested per RFC 6455 §4.1 point 5) or a
+  duplicated `Upgrade`/`Sec-WebSocket-Accept`/`Sec-WebSocket-Protocol` header
+  (`error.DuplicateHeader`, mirroring the server side). `acceptHandshake` now also rejects a
+  duplicated `Sec-WebSocket-Protocol`. `writeRequest` now validates `host`/`target`/`key`/
+  `protocols`/`extra_headers` for CR/LF/NUL injection before writing anything
+  (`error.InvalidRequestField` — new member on `writeRequest`'s return type, additive). A caller
+  passing well-formed fields (the only kind a conforming implementation sends) sees no change.
+  `connection.Connection` gained `max_fragments` (default 65536, new field with a default) —
+  `error.TooManyFragments` once a single reassembled message exceeds it — and any error from
+  `receive` now resets in-progress fragmentation state instead of leaving it for a later,
+  unrelated frame to splice onto.
 - **2026-09-07** — Fuzz reach: both `frame.zig` harnesses ran on an empty input, and one of
   them never called the parser at all. Each opened with `smith.bytes(&buf)` followed by a
   ranged length draw; a ranged draw reads eight octets as a little-endian u64 and returns the

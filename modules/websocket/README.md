@@ -20,7 +20,11 @@ switch (try websocket.frame.parseFrame(read_buf, .server, max_frame_size)) {
 
 ```zig
 // client: generate a key, send the request, verify the 101 response
-var prng = std.Random.DefaultPrng.init(seed); // any std.Random — never std.crypto.random here
+// `random` can be any `std.Random` (the key is an anti-cache-poisoning nonce,
+// not a secret, so a fast non-CSPRNG is fine) — but RFC 6455 §4.1 point 7
+// requires it to be selected randomly FOR EACH CONNECTION, so the seed must
+// differ every time; never hardcode it the way this snippet used to.
+var prng = std.Random.DefaultPrng.init(std.crypto.random.int(u64));
 const key = websocket.handshake.generateKey(prng.random());
 try websocket.handshake.writeRequest(w, .{ .host = "example.com", .target = "/ws", .key = &key });
 // … read the response head with http.h1.ResponseHead.parse …
@@ -42,9 +46,12 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   `decodeCloseBody`, `closeCode(err) u16` (maps any error from this module to its RFC close code).
 - **`connection`** — `Connection.init(role, message_buf, max_frame_size)` +
   `receive(buf) Error!Result`: an optional small state machine that reassembles fragmented
-  messages into `message_buf` (whose length is the aggregate max-message-size cap), lets control
-  frames interleave mid-fragmentation, validates UTF-8 on the complete text message, and tracks
-  the close handshake (`close_sent`/`close_received`/`bothClosed()`).
+  messages into `message_buf` (whose length is the aggregate max-message-size cap, alongside
+  `max_fragments`, a per-message frame-count cap), lets control frames interleave
+  mid-fragmentation, validates UTF-8 on the complete text message, and surfaces the close
+  handshake: `close_received` is set automatically on receipt; `close_sent` is a plain field the
+  caller sets itself after writing its own close frame (this module does no I/O, so it cannot see
+  that write); `bothClosed()` reflects both.
 
 - **Role:** both (client + server). **Platform:** any. **Deps:** `http` (the handshake's
   `h1.RequestHead`/`ResponseHead` + `Header`), `std.crypto.hash.Sha1`, `std.base64`,
@@ -57,7 +64,7 @@ copied.
 
 ## Verification
 
-`zig build test-websocket` — 50 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
+`zig build test-websocket` — 77 offline tests, green in Debug + ReleaseFast: the RFC 6455 §1.3
 handshake worked example and the §5.7 frame examples byte-exact (both parse and serialize),
 plus constructed Autobahn-style adversarial cases (unmasked-client/masked-server rejection,
 RSV/opcode/length-encoding/size-cap/fragmentation-sequencing/UTF-8 rejections, each with a

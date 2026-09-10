@@ -123,7 +123,7 @@ pub const FrameError = error{
 /// close frame that fails the connection.
 pub fn closeCode(err: anyerror) u16 {
     return switch (err) {
-        error.FrameTooLarge, error.MessageTooLarge => 1009, // Message Too Big
+        error.FrameTooLarge, error.MessageTooLarge, error.TooManyFragments => 1009, // Message Too Big
         error.InvalidUtf8 => 1007, // Invalid frame payload data
         error.InvalidCloseCode => 1002, // Protocol error
         else => 1002, // Protocol error (the default / everything else here)

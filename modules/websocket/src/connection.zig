@@ -35,6 +35,22 @@ pub const Connection = struct {
     close_sent: bool = false,
     /// This side has received a close frame.
     close_received: bool = false,
+    /// W3-websocket-F4: `message_buf` bounds the reassembled message's
+    /// aggregate *size*, but §5.4 says nothing about frame *count* — many
+    /// small (even zero-byte) CONTINUATION frames can otherwise reassemble
+    /// forever without ever tripping `MessageTooLarge` (measured: 20,000,000
+    /// empty CONTINUATION frames, 0 bytes of payload, `message_len` stays 0,
+    /// the state machine stays open). Bounds how many frames — the initial
+    /// TEXT/BINARY frame plus every CONTINUATION — may make up one
+    /// reassembled message; exceeding it is `error.TooManyFragments` (close
+    /// 1009). The default is generous enough that no legitimate
+    /// low-MTU-driven fragmentation pattern should ever reach it (this
+    /// module's own consumer, `bacnet`, never fragments at all — one frame
+    /// per BVLC message).
+    max_fragments: u32 = 1 << 16,
+    /// Frames consumed by the message currently being reassembled
+    /// (including the initial one); reset when a message starts or ends.
+    fragment_count: u32 = 0,
 
     pub fn init(role: frame.Role, message_buf: []u8, max_frame_size: u64) Connection {
         return .{ .role = role, .max_frame_size = max_frame_size, .message_buf = message_buf };
@@ -87,12 +103,35 @@ pub const Connection = struct {
         /// should be closed, a peer discards any further data received."
         /// Close 1002.
         DataAfterClose,
+        /// W3-websocket-F4: the reassembled message has consumed more than
+        /// `max_fragments` frames. Close 1009.
+        TooManyFragments,
     };
 
     /// Feed the next available bytes. Consumes at most one frame per call
     /// (mirrors `frame.parseFrame`); loop, advancing by `consumed`, until
     /// `.need_more`.
+    ///
+    /// W3-websocket-F7: any error return discards a fragmented message
+    /// in progress (`fragment_opcode`/`message_len`/`fragment_count` reset)
+    /// before propagating. Before this, a message rejected mid-reassembly
+    /// (e.g. `MessageTooLarge` on its second fragment) left its bytes
+    /// sitting in `message_buf` with `fragment_opcode` still set — a later,
+    /// unrelated CONTINUATION frame would then complete using those
+    /// leftover bytes, splicing a message together from data the caller had
+    /// already been told was rejected. This does *not* close the
+    /// `Connection` permanently: the module owns no I/O and several
+    /// existing call sites (see the tests below) deliberately keep using a
+    /// `Connection` after an error to process the caller's next, unrelated
+    /// message — RFC 6455 §7.1.7's "Fail the Connection" is the transport
+    /// decision the caller makes from the returned error/close-code, same as
+    /// everywhere else in this module.
     pub fn receive(self: *Connection, buf: []u8) Error!Result {
+        errdefer {
+            self.fragment_opcode = null;
+            self.message_len = 0;
+            self.fragment_count = 0;
+        }
         const parsed = switch (try frame.parseFrame(buf, self.role, self.max_frame_size)) {
             .need_more => return .{ .event = .need_more, .consumed = 0 },
             .frame => |f| f,
@@ -123,10 +162,13 @@ pub const Connection = struct {
         switch (parsed.opcode) {
             .continuation => {
                 const start_opcode = self.fragment_opcode orelse return error.InvalidFragmentation;
+                self.fragment_count += 1;
+                if (self.fragment_count > self.max_fragments) return error.TooManyFragments;
                 try self.appendFragment(parsed.payload);
                 if (!parsed.fin) return .{ .event = .frame_consumed, .consumed = parsed.consumed };
 
                 self.fragment_opcode = null;
+                self.fragment_count = 0;
                 const payload = self.message_buf[0..self.message_len];
                 if (start_opcode == .text and !std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
                 return .{ .event = .{ .message = .{ .opcode = start_opcode, .payload = payload } }, .consumed = parsed.consumed };
@@ -147,6 +189,7 @@ pub const Connection = struct {
                     return .{ .event = .{ .message = .{ .opcode = parsed.opcode, .payload = parsed.payload } }, .consumed = parsed.consumed };
                 }
                 self.fragment_opcode = parsed.opcode;
+                self.fragment_count = 1;
                 self.message_len = 0;
                 try self.appendFragment(parsed.payload);
                 return .{ .event = .frame_consumed, .consumed = parsed.consumed };
@@ -705,4 +748,85 @@ test "need_more propagates from the underlying frame parser" {
     const r = try conn.receive(&partial);
     try testing.expectEqual(Connection.Event.need_more, r.event);
     try testing.expectEqual(@as(usize, 0), r.consumed);
+}
+
+// W3-websocket-F4: a bound on frame *count*, not just aggregate byte size —
+// §5.4 leaves an unbounded number of small (even zero-byte) fragments
+// unaddressed, and `message_buf`'s size cap never trips on them. Measured
+// on the unbounded code: 20,000,000 empty CONTINUATION frames, 0 bytes of
+// payload, no error, state machine still open.
+test "a message that exceeds max_fragments is rejected (close 1009)" {
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    conn.max_fragments = 2;
+
+    var wire1 = [_]u8{ 0x01, 0x00 }; // text, fin=0, empty payload -- fragment 1
+    try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(&wire1)).event);
+
+    var wire2 = [_]u8{ 0x00, 0x00 }; // continuation, fin=0, empty -- fragment 2 (at the cap)
+    try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(&wire2)).event);
+
+    var wire3 = [_]u8{ 0x00, 0x00 }; // continuation, fin=0, empty -- fragment 3 (over the cap)
+    try testing.expectError(error.TooManyFragments, conn.receive(&wire3));
+    try testing.expectEqual(@as(u16, 1009), frame.closeCode(error.TooManyFragments));
+}
+
+// Positive control: a fragmented message within the cap still reassembles.
+test "positive control: a message within max_fragments still reassembles" {
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+    conn.max_fragments = 2;
+
+    var wire1 = [_]u8{ 0x01, 0x03, 'H', 'e', 'l' }; // text, fin=0
+    try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(&wire1)).event);
+
+    var wire2 = [_]u8{ 0x80, 0x02, 'l', 'o' }; // continuation, fin=1 -- fragment 2, at the cap
+    const r = try conn.receive(&wire2);
+    switch (r.event) {
+        .message => |m| try testing.expectEqualStrings("Hello", m.payload),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+// W3-websocket-F7: an error mid-reassembly used to leave `fragment_opcode`
+// and `message_len` dirty, so a later, unrelated CONTINUATION frame would
+// complete using bytes from the message that was just rejected. Reproduces
+// the audit's exact repro: an 8-byte `message_buf`, a 6-byte first fragment
+// (OK), a second 6-byte fragment (`MessageTooLarge`, 12 > 8), then a 1-byte
+// FIN continuation — before this fix that returned `.message` with payload
+// "abcdefz", spliced together from the six bytes the second call had just
+// rejected. The correct outcome is that the dangling continuation now finds
+// no fragment in progress at all.
+test "an error mid-reassembly discards the in-progress message, no splicing" {
+    var scratch: [8]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+
+    var wire1 = [_]u8{ 0x01, 0x06 } ++ "abcdef".*; // text, fin=0, 6 bytes -- OK
+    try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(&wire1)).event);
+
+    var wire2 = [_]u8{ 0x00, 0x06 } ++ "ghijkl".*; // continuation, fin=0, +6 bytes -- 12 > 8
+    try testing.expectError(error.MessageTooLarge, conn.receive(&wire2));
+
+    var wire3 = [_]u8{ 0x80, 0x01, 'z' }; // continuation, fin=1, 1 byte
+    try testing.expectError(error.InvalidFragmentation, conn.receive(&wire3));
+}
+
+// Positive control: after an error on one message, the connection is still
+// usable for the caller's next, unrelated one (the module owns no I/O and
+// does not fail itself shut — see the doc comment on `receive`).
+test "positive control: a later unrelated message still reassembles after an earlier error" {
+    var scratch: [8]u8 = undefined;
+    var conn: Connection = .init(.client, &scratch, 1 << 20);
+
+    var wire1 = [_]u8{ 0x01, 0x06 } ++ "abcdef".*;
+    _ = try conn.receive(&wire1);
+    var wire2 = [_]u8{ 0x00, 0x06 } ++ "ghijkl".*;
+    try testing.expectError(error.MessageTooLarge, conn.receive(&wire2));
+
+    var wire3 = [_]u8{ 0x81, 0x04 } ++ "abcd".*; // a fresh, unfragmented message (FIN=1)
+    const r = try conn.receive(&wire3);
+    switch (r.event) {
+        .message => |m| try testing.expectEqualStrings("abcd", m.payload),
+        else => return error.TestUnexpectedResult,
+    }
 }

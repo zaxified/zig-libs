@@ -39,29 +39,49 @@ pub const HandshakeError = error{
     /// characters for 16 bytes.
     InvalidKey,
     /// `Upgrade`, `Connection`, `Sec-WebSocket-Version` or
-    /// `Sec-WebSocket-Key` appeared more than once. RFC 6455 §4.1/§4.2.1 say
-    /// nothing about a duplicated instance of any of these header fields —
-    /// fetched and read 2026-08-07 (https://www.rfc-editor.org/rfc/rfc6455.html):
-    /// the opening-handshake sections defer silently to general HTTP header
-    /// processing (RFC 2616) for anything they do not spell out themselves,
-    /// and that generic fallback does not resolve a duplicate either.
-    /// `h1.RequestHead.header` returns only the first occurrence, so a
-    /// duplicate used to be silently first-wins here — an intermediary in
-    /// front of this server that combines the values or picks the last
-    /// would derive a different accept key, or a different upgrade
-    /// decision, from the same bytes. Undefined + silently resolved is the
-    /// dangerous combination, so this is rejected rather than left to
-    /// chance.
+    /// `Sec-WebSocket-Key` appeared more than once (server-side request), or
+    /// `Upgrade`, `Connection`, `Sec-WebSocket-Accept` or
+    /// `Sec-WebSocket-Protocol` appeared more than once (client-side
+    /// response). RFC 6455 §4.1/§4.2.1 say nothing about a duplicated
+    /// instance of any of these header fields — fetched and read 2026-08-07
+    /// (https://www.rfc-editor.org/rfc/rfc6455.html): the opening-handshake
+    /// sections defer silently to general HTTP header processing (RFC 2616)
+    /// for anything they do not spell out themselves, and that generic
+    /// fallback does not resolve a duplicate either. `h1.RequestHead.header`
+    /// / `h1.ResponseHead.header` return only the first occurrence, so a
+    /// duplicate used to be silently first-wins — an intermediary in front
+    /// of (or behind) this endpoint that combines the values or picks the
+    /// last would derive a different accept key, or a different
+    /// upgrade/protocol decision, from the same bytes. Undefined + silently
+    /// resolved is the dangerous combination, so this is rejected rather
+    /// than left to chance.
     DuplicateHeader,
     /// (Client side) the response status was not 101.
     UnexpectedStatus,
     /// (Client side) the response advertised a `Sec-WebSocket-Protocol`
     /// the client never offered (§4.1 point 10 forbids this).
     UnexpectedSubprotocol,
+    /// (Client side) the response carried a `Sec-WebSocket-Extensions`
+    /// header naming an extension the client never offered (§4.1 point 5:
+    /// "the client MUST _Fail the WebSocket Connection_"). This module
+    /// never offers any extension (see SPEC.md — no `Sec-WebSocket-
+    /// Extensions` is ever sent by `writeRequest`), so *any* value in the
+    /// response's `Sec-WebSocket-Extensions` header is by definition one
+    /// the client did not ask for.
+    UnexpectedExtension,
     /// (Client side) `Sec-WebSocket-Accept` is missing or does not match
     /// the value computed from the key the client sent (§4.1 point 9) —
     /// the core anti-cache-poisoning / anti-cross-protocol check.
     AcceptMismatch,
+    /// (Client side, `writeRequest`) `host`, `target`, `key`, a
+    /// `protocols` entry, or an `extra_headers` name/value contained a
+    /// byte (CR, LF, NUL, or — for `host`/`target` — another control or
+    /// disallowed character) that would let the caller's input inject
+    /// extra header lines or split the request. Every field is written
+    /// verbatim onto the wire, so this is the module's only line of
+    /// defense against a caller that forwards attacker-controlled values
+    /// (e.g. `extra_headers` built from a cookie or bearer token).
+    InvalidRequestField,
 };
 
 /// SHA-1(key ++ guid), base64-encoded — RFC 6455 §1.3/§4.2.2 point 5.4.
@@ -124,7 +144,14 @@ pub fn acceptHandshake(head: h1.RequestHead, options: ServerAcceptOptions) Hands
     if (!std.ascii.eqlIgnoreCase(head.method, "GET")) return error.NotGet;
     if (head.http1_0) return error.UnsupportedHttpVersion;
 
-    inline for (.{ "upgrade", "connection", "sec-websocket-version", "sec-websocket-key" }) |name| {
+    // W3-websocket-F10: `sec-websocket-protocol` was the one handshake
+    // header `countHeader` didn't cover — `acceptHandshake` negotiates by
+    // taking the *first* occurrence (`selectProtocol` below), same as every
+    // other header here, so a duplicate silently negotiated whichever value
+    // came first while an intermediary reading the last would believe a
+    // different subprotocol won. Same class as the other four, closed the
+    // same way.
+    inline for (.{ "upgrade", "connection", "sec-websocket-version", "sec-websocket-key", "sec-websocket-protocol" }) |name| {
         if (countHeader(head, name) > 1) return error.DuplicateHeader;
     }
 
@@ -224,8 +251,35 @@ pub const ClientRequestOptions = struct {
     extra_headers: []const http.Header = &.{},
 };
 
-/// Write the client's upgrade request (§4.1).
-pub fn writeRequest(w: *std.Io.Writer, options: ClientRequestOptions) std.Io.Writer.Error!void {
+/// W3-websocket-F2: every `ClientRequestOptions` field used to go onto the
+/// wire byte-for-byte, with no check at all — `target`, `host`, `key`, each
+/// `protocols` entry, and each `extra_headers` name/value. A CR/LF in any of
+/// them splits the request line or injects extra header lines (request
+/// smuggling); a bare LF alone is enough against a lenient parser. Reuses
+/// `http`'s own field-syntax predicates (`h1.isValidHost`,
+/// `h1.isValidRequestTarget`, `h1.isToken`, `h1.isValidFieldValue`) — the
+/// same ones `http.Server`'s `setHeader` holds outbound response headers to
+/// (`Server.zig:2282`), so the client side of this module is now held to the
+/// class of check the server side of the sibling module already has.
+/// Checked before anything is written, so a rejected call never puts a
+/// partially-built request on the wire.
+fn validRequestFields(options: ClientRequestOptions) bool {
+    if (!h1.isValidHost(options.host)) return false;
+    if (!h1.isValidRequestTarget(options.target)) return false;
+    if (!h1.isValidFieldValue(options.key)) return false;
+    for (options.protocols) |p| if (!h1.isToken(p)) return false;
+    for (options.extra_headers) |h| {
+        if (!h1.isToken(h.name)) return false;
+        if (!h1.isValidFieldValue(h.value)) return false;
+    }
+    return true;
+}
+
+/// Write the client's upgrade request (§4.1). Returns
+/// `error.InvalidRequestField` if any field would inject bytes into the
+/// header block or split the request line — see `validRequestFields`.
+pub fn writeRequest(w: *std.Io.Writer, options: ClientRequestOptions) (std.Io.Writer.Error || error{InvalidRequestField})!void {
+    if (!validRequestFields(options)) return error.InvalidRequestField;
     try w.print("GET {s} HTTP/1.1\r\n", .{options.target});
     try w.print("Host: {s}\r\n", .{options.host});
     try w.writeAll("Upgrade: websocket\r\n");
@@ -259,6 +313,18 @@ pub const ClientVerifyResult = struct {
 pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols: []const []const u8) HandshakeError!ClientVerifyResult {
     if (head.status != 101) return error.UnexpectedStatus;
 
+    // W3-websocket-F3: `verifyResponse` had no duplicate-header check at
+    // all, though the server side (`acceptHandshake`) has one and explains
+    // at length why (`DuplicateHeader`'s doc comment) — an intermediary that
+    // combines or picks-last from a duplicated `Sec-WebSocket-Accept` would
+    // derive a different accept key than the one checked below; a
+    // duplicated `Upgrade`/`Connection` is the same ambiguity on the
+    // negotiation decision itself; a duplicated `Sec-WebSocket-Protocol` is
+    // the client-side twin of F10.
+    inline for (.{ "upgrade", "connection", "sec-websocket-accept", "sec-websocket-protocol" }) |name| {
+        if (countResponseHeader(head, name) > 1) return error.DuplicateHeader;
+    }
+
     const upgrade = head.header("upgrade") orelse return error.MissingUpgrade;
     if (!h1.tokenListContains(upgrade, "websocket")) return error.MissingUpgrade;
 
@@ -268,6 +334,14 @@ pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols:
     const accept = head.header("sec-websocket-accept") orelse return error.AcceptMismatch;
     const expected = computeAcceptKey(key);
     if (!std.mem.eql(u8, accept, &expected)) return error.AcceptMismatch;
+
+    // W3-websocket-F1: RFC 6455 §4.1 point 5 (the item right before point 6,
+    // which `UnexpectedSubprotocol` below already implements) requires
+    // failing the connection if the response names an extension the client
+    // never offered. This module never offers one (SPEC.md: "no extension
+    // negotiation of any kind is implemented"), so any value here is
+    // unrequested by construction.
+    if (head.header("sec-websocket-extensions") != null) return error.UnexpectedExtension;
 
     var protocol: ?[]const u8 = null;
     if (head.header("sec-websocket-protocol")) |p| {
@@ -282,6 +356,17 @@ pub fn verifyResponse(head: h1.ResponseHead, key: []const u8, offered_protocols:
         protocol = p;
     }
     return .{ .protocol = protocol };
+}
+
+/// How many header fields named `name` (case-insensitive) appear in `head`.
+/// Client-side twin of `countHeader` above, for `verifyResponse` (F3).
+fn countResponseHeader(head: h1.ResponseHead, name: []const u8) usize {
+    var n: usize = 0;
+    var it = head.iterate();
+    while (it.next()) |e| {
+        if (std.ascii.eqlIgnoreCase(e.name, name)) n += 1;
+    }
+    return n;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -435,4 +520,138 @@ test "verifyResponse: rejects an unoffered subprotocol" {
     try writeResponse(&resp_out, .{ .accept_key = accept, .protocol = "sneaky" });
     const head = try h1.ResponseHead.parse(resp_out.buffered());
     try testing.expectError(error.UnexpectedSubprotocol, verifyResponse(head, "dGhlIHNhbXBsZSBub25jZQ==", &.{"chat"}));
+}
+
+// W3-websocket-F1: RFC 6455 §4.1 point 5 — a response naming an extension
+// the client never offered MUST fail the connection. This module never
+// offers any extension, so any value here is unrequested by construction.
+test "verifyResponse: rejects a Sec-WebSocket-Extensions the client never offered" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const accept = computeAcceptKey(key);
+    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n", .{accept});
+    defer testing.allocator.free(resp);
+    const head = try h1.ResponseHead.parse(resp);
+    try testing.expectError(error.UnexpectedExtension, verifyResponse(head, key, &.{}));
+}
+
+// Positive control: the same response with no Sec-WebSocket-Extensions
+// header at all (what a conforming server sends, since this module never
+// offers one) must still be accepted.
+test "verifyResponse: positive control, no Sec-WebSocket-Extensions header is fine" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const accept = computeAcceptKey(key);
+    var resp_buf: [256]u8 = undefined;
+    var resp_out: std.Io.Writer = .fixed(&resp_buf);
+    try writeResponse(&resp_out, .{ .accept_key = accept, .protocol = null });
+    const head = try h1.ResponseHead.parse(resp_out.buffered());
+    _ = try verifyResponse(head, key, &.{});
+}
+
+// W3-websocket-F3: duplicate handshake-critical response headers used to go
+// unchecked on the client side, though the server side (`acceptHandshake`)
+// rejects the same shape via `DuplicateHeader`.
+test "verifyResponse: rejects duplicate Sec-WebSocket-Accept" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const accept = computeAcceptKey(key);
+    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n", .{accept});
+    defer testing.allocator.free(resp);
+    const head = try h1.ResponseHead.parse(resp);
+    try testing.expectError(error.DuplicateHeader, verifyResponse(head, key, &.{}));
+}
+
+test "verifyResponse: rejects duplicate Upgrade" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const accept = computeAcceptKey(key);
+    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept});
+    defer testing.allocator.free(resp);
+    const head = try h1.ResponseHead.parse(resp);
+    try testing.expectError(error.DuplicateHeader, verifyResponse(head, key, &.{}));
+}
+
+test "verifyResponse: rejects duplicate Sec-WebSocket-Protocol" {
+    const key = "dGhlIHNhbXBsZSBub25jZQ==";
+    const accept = computeAcceptKey(key);
+    const resp = try std.fmt.allocPrint(testing.allocator, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: superchat\r\n\r\n", .{accept});
+    defer testing.allocator.free(resp);
+    const head = try h1.ResponseHead.parse(resp);
+    try testing.expectError(error.DuplicateHeader, verifyResponse(head, key, &.{ "chat", "superchat" }));
+}
+
+// W3-websocket-F10: server-side twin — `sec-websocket-protocol` was the one
+// handshake header `countHeader` didn't cover.
+test "acceptHandshake: rejects a duplicated Sec-WebSocket-Protocol" {
+    const req = "GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Protocol: chat\r\n" ++
+        "Sec-WebSocket-Protocol: admin\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n";
+    const head = try h1.RequestHead.parse(req);
+    try testing.expectError(error.DuplicateHeader, acceptHandshake(head, .{ .protocols = &.{ "admin", "chat" } }));
+}
+
+// W3-websocket-F2: every `ClientRequestOptions` field used to go onto the
+// wire byte-for-byte with no check — CR/LF/NUL injection via any of them.
+// Naming each vector the way the audit measured it (8 of 8).
+test "writeRequest: rejects CR/LF/NUL injection in every field" {
+    var buf: [512]u8 = undefined;
+
+    // target: splits the request line into a second request.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/ws\r\nGET /admin HTTP/1.1\r\nX: 1", .key = "k" }));
+    }
+    // host: RFC 9110-illegal Host bytes, including a CRLF-smuggled second header.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h\r\nX-Injected: yes", .target = "/", .key = "k" }));
+    }
+    // key: base64 field, but still checked — a NUL must not sail through.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/", .key = "abc\x00def" }));
+    }
+    // protocols: a comma is legal syntax elsewhere but not inside one token.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/", .key = "k", .protocols = &.{"chat\r\nX-Injected: yes"} }));
+    }
+    // extra_headers name.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/", .key = "k", .extra_headers = &.{.{ .name = "Cookie\r\nX-Injected", .value = "1" }} }));
+    }
+    // extra_headers value: the exact attack from the audit report.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/", .key = "k", .extra_headers = &.{.{ .name = "Cookie", .value = "sid=abc\r\nAuthorization: Bearer attacker-token\r\nX-Smuggled: 1" }} }));
+    }
+    // a bare LF alone (no CR) is enough against a lenient parser.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h", .target = "/x\nX-Injected: yes", .key = "k" }));
+    }
+    // NUL alone.
+    {
+        var w: std.Io.Writer = .fixed(&buf);
+        try testing.expectError(error.InvalidRequestField, writeRequest(&w, .{ .host = "h\x00x", .target = "/", .key = "k" }));
+    }
+}
+
+// Positive control: ordinary fields (including a legitimate extra header)
+// still write the exact request they always did.
+test "writeRequest: positive control, ordinary fields still write correctly" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeRequest(&w, .{
+        .host = "example.com:8080",
+        .target = "/chat?x=1",
+        .key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .protocols = &.{ "chat", "superchat" },
+        .extra_headers = &.{.{ .name = "Origin", .value = "https://example.com" }},
+    });
+    const req = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, req, "GET /chat?x=1 HTTP/1.1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "Host: example.com:8080\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "Sec-WebSocket-Protocol: chat, superchat\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, req, "Origin: https://example.com\r\n") != null);
 }
