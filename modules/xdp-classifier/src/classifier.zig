@@ -700,18 +700,23 @@ test "structural: r6 is never used as a helper-call argument (would be clobbered
     try testing.expectEqual(@as(usize, 3), r6_roles);
 }
 
-/// Privileged, capability-gated real-load test: build the program with
-/// freshly created maps and hand it to the in-kernel verifier via
-/// `ebpf.load`. Skips (does NOT fail) without CAP_BPF/root, matching
-/// `ebpf`'s own gated tests — an unprivileged pass asserts the golden/
-/// structure only, NOT that the verifier accepted anything.
-fn hasBpfCapability() bool {
-    return linux.geteuid() == 0;
-}
+// Privileged, capability-gated real-load test: build the program with
+// freshly created maps and hand it to the in-kernel verifier via
+// `ebpf.load`. Skips (does NOT fail) without CAP_BPF/root, matching
+// `ebpf`'s own gated tests — an unprivileged pass asserts the golden/
+// structure only, NOT that the verifier accepted anything.
+//
+// F7: this used to also gate on `linux.geteuid() == 0` BEFORE attempting
+// any syscall — shutting out a process with `CAP_BPF` but no root, exactly
+// the configuration this module's own docs recommend (`README.md`/
+// `maps.zig` document the requirement as "CAP_BPF (or root pre-5.8)", not
+// "root"). Every map/load call below already attempts the real syscall and
+// treats `PermissionDenied` as `SkipZigTest`, which correctly distinguishes
+// "this process cannot do it" from "this process is not uid 0" — so that is
+// now the ONLY gate.
 
 test "load: buildClassifierProgram passes the in-kernel verifier (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!hasBpfCapability()) return error.SkipZigTest;
 
     const maps = @import("maps.zig");
 
@@ -937,7 +942,7 @@ test "positive control: a steer stream with the wrong redirect helper id is reje
 
 test "load: buildCpumapSteerProgram passes the in-kernel verifier (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!hasBpfCapability()) return error.SkipZigTest;
+    // F7: no euid pre-gate — see the comment above the classifier load test.
 
     const maps = @import("maps.zig");
 

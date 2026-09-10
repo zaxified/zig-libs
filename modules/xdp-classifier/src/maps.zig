@@ -23,6 +23,14 @@ pub const scratch_value_size: u32 = 4;
 /// `classifier.ClassifierOptions.scratch_map_fd`'s doc comment.
 pub const scratch_max_entries: u32 = 1;
 
+/// The scratch map's one and only key, native-endian `u32` 0. Every
+/// read/write helper below shares this ONE literal (F5: a mutation changing
+/// just one of three independent `.{0,0,0,0}` copies to a nonzero key would
+/// silently read/write the wrong slot on any map with `max_entries > 1`, and
+/// nothing but a CAP_BPF-gated round-trip — one of the module's root-gated
+/// skips — would ever have seen it).
+pub const scratch_key_bytes: [scratch_key_size]u8 = .{ 0, 0, 0, 0 };
+
 /// Bytes the kernel transfers PER CPU for the scratch map: the value size
 /// rounded up to 8. A `PERCPU_*` map's `bpf(2)` lookup/update always moves
 /// `round_up(value_size, 8) * num_possible_cpus()` bytes — there is no
@@ -100,13 +108,23 @@ pub const CreateMapError = error{
 /// it is a single-purpose, single-caller convenience specific to this
 /// module's one map type, not a general primitive worth growing `ebpf`'s
 /// public surface for.
+/// Pure builder for `createLpmTrieMap`'s `BPF_MAP_CREATE` attr — split out so
+/// the map_type/map_flags this function commits to are testable WITHOUT
+/// `CAP_BPF` (see the `smoke` test below). F5: a mutation dropping
+/// `BPF_F_NO_PREALLOC` or swapping the map type is otherwise invisible to
+/// every test in this file except the two CAP_BPF-gated round-trips.
+fn lpmTrieCreateAttr(max_entries: u32) BPF.MapCreateAttr {
+    var attr = std.mem.zeroes(BPF.MapCreateAttr);
+    attr.map_type = @intFromEnum(BPF.MapType.lpm_trie);
+    attr.key_size = lpm_key_size;
+    attr.value_size = lpm_value_size;
+    attr.max_entries = max_entries;
+    attr.map_flags = BPF.BPF_F_NO_PREALLOC;
+    return attr;
+}
+
 pub fn createLpmTrieMap(max_entries: u32) CreateMapError!linux.fd_t {
-    var attr = BPF.Attr{ .map_create = std.mem.zeroes(BPF.MapCreateAttr) };
-    attr.map_create.map_type = @intFromEnum(BPF.MapType.lpm_trie);
-    attr.map_create.key_size = lpm_key_size;
-    attr.map_create.value_size = lpm_value_size;
-    attr.map_create.max_entries = max_entries;
-    attr.map_create.map_flags = BPF.BPF_F_NO_PREALLOC;
+    var attr = BPF.Attr{ .map_create = lpmTrieCreateAttr(max_entries) };
     const rc = linux.bpf(.map_create, &attr, @sizeOf(BPF.MapCreateAttr));
     return switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
@@ -115,11 +133,19 @@ pub fn createLpmTrieMap(max_entries: u32) CreateMapError!linux.fd_t {
     };
 }
 
+/// The scratch map's kernel map type. MUST stay `.percpu_array` — a plain
+/// `.array` would race every packet classified concurrently on different
+/// CPUs onto the same shared slot (see `classifier.ClassifierOptions`'s doc
+/// comment on `scratch_map_fd`). Named so `createScratchMap` and its
+/// `smoke` test (F5) share one source of truth instead of two independent
+/// literals that a mutation could desync unnoticed.
+pub const scratch_map_type: BPF.MapType = .percpu_array;
+
 /// Create the single-slot `BPF_MAP_TYPE_PERCPU_ARRAY` scratch/output map.
 /// No flags gap here — `std.os.linux.BPF.map_create`'s ordinary wrapper is
 /// sufficient (PERCPU_ARRAY needs no creation-time flags).
 pub fn createScratchMap() !linux.fd_t {
-    return BPF.map_create(.percpu_array, scratch_key_size, scratch_value_size, scratch_max_entries);
+    return BPF.map_create(scratch_map_type, scratch_key_size, scratch_value_size, scratch_max_entries);
 }
 
 pub const PopulateError = error{
@@ -144,10 +170,21 @@ fn mapPopulateError(err: anyerror) PopulateError {
 /// constructs at runtime from a live packet (see that function's doc
 /// comment point 4 and `rules.zig`'s module doc for why the two must agree
 /// byte-for-byte).
+/// Pure LPM-trie VALUE encoding: a `u32` class handle in the host's native
+/// byte order (there is no wire-order convention for it — unlike the key's
+/// IPv4 address bytes, see `rules.LpmKey`'s doc comment). Split out so the
+/// byte order `populateRule` commits to is unit-testable WITHOUT `CAP_BPF`
+/// (see the `smoke` test below) — the kernel-round-trip test that used to be
+/// the only check of this is one of the module's root-gated skips (F5).
+pub fn ruleValueBytes(class: u32) [4]u8 {
+    var value: [4]u8 = undefined;
+    std.mem.writeInt(u32, &value, class, @import("builtin").cpu.arch.endian());
+    return value;
+}
+
 pub fn populateRule(lpm_map_fd: linux.fd_t, rule: rules.ClassifierRule) PopulateError!void {
     const key = rules.LpmKey.fromPrefix(rule.prefix).toBytes();
-    var value: [4]u8 = undefined;
-    std.mem.writeInt(u32, &value, rule.class, @import("builtin").cpu.arch.endian());
+    const value = ruleValueBytes(rule.class);
     BPF.map_update_elem(lpm_map_fd, &key, &value, 0) catch |e| return mapPopulateError(e);
 }
 
@@ -204,10 +241,9 @@ pub fn readScratchClass(scratch_map_fd: linux.fd_t) !u32 {
     const ncpu = ebpf.possibleCpuCount() catch return error.CpuEnumerationFailed;
     if (ncpu > scratch_max_stack_cpus) return error.TooManyCpus;
 
-    var key: [4]u8 = .{ 0, 0, 0, 0 };
     var value: [scratch_max_stack_cpus * scratch_percpu_stride]u8 = undefined;
     const need = @as(usize, scratch_percpu_stride) * ncpu;
-    try BPF.map_lookup_elem(scratch_map_fd, &key, value[0..need]);
+    try BPF.map_lookup_elem(scratch_map_fd, &scratch_key_bytes, value[0..need]);
     return std.mem.readInt(u32, value[0..4], @import("builtin").cpu.arch.endian());
 }
 
@@ -223,8 +259,7 @@ pub fn readScratchClassAll(gpa: std.mem.Allocator, scratch_map_fd: linux.fd_t) !
     const raw = try gpa.alloc(u8, @as(usize, scratch_percpu_stride) * ncpu);
     defer gpa.free(raw);
 
-    var key: [4]u8 = .{ 0, 0, 0, 0 };
-    try BPF.map_lookup_elem(scratch_map_fd, &key, raw);
+    try BPF.map_lookup_elem(scratch_map_fd, &scratch_key_bytes, raw);
 
     const out = try gpa.alloc(u32, ncpu);
     errdefer gpa.free(out);
@@ -254,8 +289,7 @@ pub fn writeScratchClassAll(gpa: std.mem.Allocator, scratch_map_fd: linux.fd_t, 
         std.mem.writeInt(u32, raw[i * scratch_percpu_stride ..][0..4], class, endian);
     }
 
-    var key: [4]u8 = .{ 0, 0, 0, 0 };
-    try BPF.map_update_elem(scratch_map_fd, &key, raw, 0);
+    try BPF.map_update_elem(scratch_map_fd, &scratch_key_bytes, raw, 0);
 }
 
 // ── CPUMAP steering (see classifier.buildCpumapSteerProgram) ────────────────
@@ -299,14 +333,59 @@ pub fn populateCpu(map_fd: linux.fd_t, cpu: u32, qsize: u32, prog_fd: ?linux.fd_
 const testing = std.testing;
 const builtin = @import("builtin");
 
-fn hasBpfCapability() bool {
-    return linux.geteuid() == 0;
-}
-
 test "smoke: map size/entry constants have the shape the LPM trie key layout expects" {
     try testing.expectEqual(@as(u32, 8), lpm_key_size);
     try testing.expectEqual(@as(u32, 4), lpm_value_size);
     try testing.expectEqual(@as(u32, 1), scratch_max_entries);
+}
+
+// F5: neprivileged anchors on the map creation/value-encoding decisions that
+// used to be checked ONLY by CAP_BPF-gated round-trips -- and every one of
+// the round-trips below is itself one of this module's six root-gated
+// skips, so on an unprivileged host (the common case) none of them ever ran.
+
+test "F5: createLpmTrieMap's attr carries BPF_F_NO_PREALLOC and the LPM_TRIE map type" {
+    // BPF_MAP_TYPE_LPM_TRIE mandates this flag at creation time (the kernel
+    // rejects map_create for this type without it, see createLpmTrieMap's
+    // doc comment) -- a mutation dropping it would only be caught by a real
+    // kernel map_create call, which needs CAP_BPF.
+    const attr = lpmTrieCreateAttr(64);
+    try testing.expectEqual(@intFromEnum(BPF.MapType.lpm_trie), attr.map_type);
+    try testing.expectEqual(BPF.BPF_F_NO_PREALLOC, attr.map_flags);
+    try testing.expectEqual(lpm_key_size, attr.key_size);
+    try testing.expectEqual(lpm_value_size, attr.value_size);
+    try testing.expectEqual(@as(u32, 64), attr.max_entries);
+}
+
+test "F5: the scratch map's type is PERCPU_ARRAY, not ARRAY" {
+    // A plain ARRAY would race every packet classified concurrently on
+    // different CPUs onto the same shared slot -- see scratch_map_type's doc
+    // comment. createScratchMap uses this SAME named constant, so this test
+    // and the production call site cannot desync silently.
+    try testing.expectEqual(BPF.MapType.percpu_array, scratch_map_type);
+}
+
+test "F5: ruleValueBytes encodes the class handle in native byte order" {
+    // populateRule's value encoding -- the counterpart to rules.LpmKey's own
+    // (already-anchored) key encoding. A byte-order flip here would silently
+    // misclassify a majority of rules on a little-endian host but was
+    // reachable only via the CAP_BPF-gated round-trip.
+    const bytes = ruleValueBytes(0x0102_0304);
+    try testing.expectEqual(@as(u32, 0x0102_0304), std.mem.readInt(u32, &bytes, builtin.cpu.arch.endian()));
+    // Cross-check against the same std primitive the kernel-facing
+    // round-trip test compares against, so both paths commit to one
+    // definition of "native order".
+    var expected: [4]u8 = undefined;
+    std.mem.writeInt(u32, &expected, 0x0102_0304, builtin.cpu.arch.endian());
+    try testing.expectEqualSlices(u8, &expected, &bytes);
+}
+
+test "F5: the scratch map's single key is all-zero" {
+    // scratch_max_entries == 1 -- the only valid key is 0. A mutation
+    // reading/writing a nonzero key would be silently wrong on any map with
+    // more than one slot, and every path that exercises this against a real
+    // map is CAP_BPF-gated.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, &scratch_key_bytes, builtin.cpu.arch.endian()));
 }
 
 // A bad fd is rejected by the kernel's fd-lookup before any privilege check,
@@ -324,7 +403,13 @@ test "populateRule/populateCpu: an invalid map fd surfaces PopulateError.BadFd" 
 
 test "createLpmTrieMap + populateRule + real lookup round-trip (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!hasBpfCapability()) return error.SkipZigTest;
+    // F7: no `hasBpfCapability()`/geteuid() pre-gate here -- that gate shut
+    // out a CAP_BPF-without-root process (the exact configuration the
+    // module's own docs recommend), skipping it before it ever reached the
+    // syscall. Every call below already attempts the real syscall and
+    // treats PermissionDenied as SkipZigTest, which is the correct test for
+    // "does this process actually have the capability" -- see F7's
+    // disposition for the measurement.
 
     const lpm_fd = createLpmTrieMap(16) catch |e| switch (e) {
         error.PermissionDenied => return error.SkipZigTest,
@@ -360,7 +445,13 @@ test "smoke: CpumapVal has the exact 8-byte struct bpf_cpumap_val layout" {
 
 test "createCpuMap + populateCpu + real lookup round-trip (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!hasBpfCapability()) return error.SkipZigTest;
+    // F7: no `hasBpfCapability()`/geteuid() pre-gate here -- that gate shut
+    // out a CAP_BPF-without-root process (the exact configuration the
+    // module's own docs recommend), skipping it before it ever reached the
+    // syscall. Every call below already attempts the real syscall and
+    // treats PermissionDenied as SkipZigTest, which is the correct test for
+    // "does this process actually have the capability" -- see F7's
+    // disposition for the measurement.
 
     const cpumap_fd = createCpuMap(4) catch |e| switch (e) {
         error.PermissionDenied => return error.SkipZigTest,
@@ -386,7 +477,13 @@ test "createCpuMap + populateCpu + real lookup round-trip (needs CAP_BPF/root)" 
 
 test "createScratchMap + readScratchClass round-trip (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!hasBpfCapability()) return error.SkipZigTest;
+    // F7: no `hasBpfCapability()`/geteuid() pre-gate here -- that gate shut
+    // out a CAP_BPF-without-root process (the exact configuration the
+    // module's own docs recommend), skipping it before it ever reached the
+    // syscall. Every call below already attempts the real syscall and
+    // treats PermissionDenied as SkipZigTest, which is the correct test for
+    // "does this process actually have the capability" -- see F7's
+    // disposition for the measurement.
 
     const scratch_fd = createScratchMap() catch |e| switch (e) {
         error.PermissionDenied => return error.SkipZigTest,
@@ -431,7 +528,13 @@ test "scratch transfer length is the kernel's per-CPU arithmetic, not the value 
 
 test "populateRuleSet loads every rule in a small ruleset (needs CAP_BPF/root)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
-    if (!hasBpfCapability()) return error.SkipZigTest;
+    // F7: no `hasBpfCapability()`/geteuid() pre-gate here -- that gate shut
+    // out a CAP_BPF-without-root process (the exact configuration the
+    // module's own docs recommend), skipping it before it ever reached the
+    // syscall. Every call below already attempts the real syscall and
+    // treats PermissionDenied as SkipZigTest, which is the correct test for
+    // "does this process actually have the capability" -- see F7's
+    // disposition for the measurement.
 
     const lpm_fd = createLpmTrieMap(16) catch |e| switch (e) {
         error.PermissionDenied => return error.SkipZigTest,

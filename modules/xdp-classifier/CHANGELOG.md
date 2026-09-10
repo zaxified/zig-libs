@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE beyond the additions already
+  listed below:** `maps.zig` gained four new `pub` items as part of the F5
+  work in the entry directly below (`ruleValueBytes`, `scratch_map_type`,
+  `scratch_key_bytes`, and `lpmTrieCreateAttr` is `pub`-visible for testing
+  but not re-exported from `root.zig`) — additive only, no existing
+  signature changed. Split into its own line because it lands in a separate
+  commit from the rest of the F4/F5/F6/F7/F9 work; see that entry for detail.
 - **2026-09-10** — A1 fix campaign, F4/F5/F6/F7/F9 (audit `~/CML/20260901-zig-libs-audit/A1/xdp-classifier.md`):
   - **F4 (userspace LPM reference disagreed with the kernel trie in two
     documented cases).** `lookupReference`'s tie-break used `>`, so a
