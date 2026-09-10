@@ -447,6 +447,22 @@ const LoopyForward = struct {
     }
 };
 
+// ── F9 perf: a ring big enough that topology-build cost isn't swamped by
+//    the noise of a shared dev machine (unlike a 5-node scenario) ───────────
+const F9_RING_N = 256;
+
+fn f9RingScenario(sim: *Sim) anyerror!void {
+    var i: usize = 0;
+    while (i < F9_RING_N) : (i += 1) _ = try sim.addNode(.{});
+    const cfg = LinkConfig{ .latency = 1 };
+    var j: NodeId = 0;
+    while (j < F9_RING_N) : (j += 1) try sim.addBiLink(j, @intCast((j + 1) % F9_RING_N), cfg);
+}
+
+const F9NoopProtocol = struct {
+    fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+};
+
 fn floodScenario(sim: *Sim) anyerror!void {
     var i: usize = 0;
     while (i < FLOOD_N) : (i += 1) _ = try sim.addNode(.{});
@@ -615,6 +631,61 @@ test "perf: replay(log_out=null) is not slower than replay(log_out=non-null) (au
         .{ with_log_ns, without_log_ns, iters },
     );
     try testing.expect(without_log_ns <= with_log_ns);
+}
+
+test "perf: run() builds the topology once, not twice (audit F9)" {
+    // `run` used to call `snapshotTopo` (which builds a whole `Sim`, running
+    // `case.scenario`, just to copy out the topology) and THEN `replay`
+    // (which builds ANOTHER fresh `Sim` and runs `case.scenario` again) —
+    // `case.scenario`'s own contract (deterministic, no unseeded randomness)
+    // makes the second build strictly redundant. The audit's own A/B
+    // (ReleaseFast, ring topology, two independent sessions) measured the
+    // two builds at ~47-51% of a `run()` call across 32/256/2048 nodes. This
+    // reconstructs that old two-build path explicitly (both halves are still
+    // public on their own) against the new single-build `run`, on a 256-node
+    // ring (a handful of nodes made the earlier draft of this test flaky —
+    // the build-cost difference was too small to clear the noise of a shared
+    // dev machine) and A/B-interleaved per iteration rather than run as two
+    // sequential blocks, so a load spike hits both arms rather than just one
+    // (`feedback_ratio_needs_one_instant`). Coarse, noise-tolerant regression
+    // guard, not a strict ratio.
+    const gpa = testing.allocator;
+    var unused: usize = 0;
+    const case = Case{
+        .seed = 1,
+        .scenario = f9RingScenario,
+        .protocol = .{ .ctx = &unused, .onMessageFn = F9NoopProtocol.onMessage },
+        .until = 2000,
+    };
+    const fault_cfg = fault_mod.Config{ .horizon = 1000 };
+    const iters = 60;
+
+    var two_build_ns: u64 = 0;
+    var one_build_ns: u64 = 0;
+    for (0..iters) |_| {
+        const t0 = nowNs();
+        {
+            const topo = try snapshotTopo(gpa, case);
+            defer gpa.free(topo.links);
+            var trace = try fault_mod.generate(gpa, case.seed, .{ .node_count = topo.node_count, .links = topo.links }, fault_cfg);
+            defer trace.deinit();
+            _ = try replay(gpa, case, trace.events, null);
+        }
+        two_build_ns += nowNs() - t0;
+
+        const t1 = nowNs();
+        {
+            var gr = try run(gpa, case, fault_cfg);
+            gr.trace.deinit();
+        }
+        one_build_ns += nowNs() - t1;
+    }
+
+    std.debug.print(
+        "F9 perf: two_build={d}ns one_build={d}ns ({d} iters, {d}-node ring)\n",
+        .{ two_build_ns, one_build_ns, iters, F9_RING_N },
+    );
+    try testing.expect(one_build_ns <= two_build_ns);
 }
 
 test "replay: an out-of-range node id in an externally-supplied trace is rejected (audit F1)" {

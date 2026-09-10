@@ -162,6 +162,12 @@ pub const Case = struct {
     /// Hard backstop on processed events (guards a mis-specified invariant from
     /// spinning forever on a live-locked protocol).
     max_events_cap: u64 = 5_000_000,
+    /// Optional cap on cumulative delivered-payload bytes for the run — see
+    /// `Sim.max_live_bytes` (audit F11). `null` (the default) is today's
+    /// behaviour, unbounded; a caller building a `Sim` directly instead of
+    /// through `build`/`replay`/`run` sets `sim.max_live_bytes` the same way
+    /// `want_log` is set post-init.
+    max_live_bytes: ?usize = null,
 };
 
 pub const RunOutcome = enum { ok, violated };
@@ -319,6 +325,16 @@ pub const Sim = struct {
     /// fingerprint is unaffected either way: `append` folds it unconditionally.
     want_log: bool = true,
     violation: ?Violation = null,
+    /// audit F11: cumulative bytes ever handed to `send`'s payload copies
+    /// (the arena that backs them is freed only at `deinit`, not as messages
+    /// are delivered) — a running total across the WHOLE run, not a live/
+    /// in-flight count. `null` (the default) is today's behaviour, unbounded:
+    /// measured at 20 000 sends of 64 KiB, `VmHWM` grows by the full
+    /// 1250 MiB, identically in Debug/ReleaseSafe/ReleaseFast/ReleaseSmall.
+    /// Set to bound a long or adversarial run instead of discovering the
+    /// limit as an OOM kill outside the process's own control.
+    max_live_bytes: ?usize = null,
+    live_bytes: usize = 0,
 
     pub fn init(gpa: Allocator, seed: u64, protocol: Protocol, log: *Log, until: Time, cap: u64) Sim {
         return .{
@@ -403,11 +419,29 @@ pub const Sim = struct {
         return adj.len;
     }
 
+    /// Failures `send` can report on top of `Allocator.Error`.
+    pub const SendError = Allocator.Error || error{
+        /// `max_live_bytes` is set and this payload copy would push the
+        /// run's cumulative delivered-byte count over it (audit F11).
+        LiveBytesExceeded,
+    };
+
+    /// Charge `n` bytes against `max_live_bytes`, loudly, BEFORE the
+    /// allocation that would spend them — a caller who set the cap gets
+    /// `error.LiveBytesExceeded` instead of an unbounded arena silently
+    /// growing past whatever budget they had in mind.
+    fn chargeLiveBytes(self: *Sim, n: usize) error{LiveBytesExceeded}!void {
+        if (self.max_live_bytes) |max| {
+            if (self.live_bytes + n > max) return error.LiveBytesExceeded;
+        }
+        self.live_bytes += n;
+    }
+
     /// Schedule delivery of `payload` (copied) from `from` to `to`, subject to
     /// the link's latency/jitter/loss/dup/reorder and any one-shot fault armed
     /// on it. Connectivity (link-down / partition / crashed receiver) is checked
     /// at DELIVERY time, so a link that fails after send drops the in-flight message.
-    pub fn send(self: *Sim, from: NodeId, to: NodeId, payload: []const u8) Allocator.Error!void {
+    pub fn send(self: *Sim, from: NodeId, to: NodeId, payload: []const u8) SendError!void {
         const link = self.findLink(from, to) orelse {
             self.append(.{ .tag = .drop, .a = from, .b = to });
             return;
@@ -434,12 +468,14 @@ pub const Sim = struct {
             link.delay_pending = 0;
         }
 
+        try self.chargeLiveBytes(payload.len);
         const buf = try self.arena.allocator().dupe(u8, payload);
         try self.pushDeliver(from, to, buf, self.now + delay);
 
         const dup_cfg = self.prng.permille(link.cfg.dup_permille);
         if (link.dup_pending > 0 or dup_cfg) {
             if (link.dup_pending > 0) link.dup_pending -= 1;
+            try self.chargeLiveBytes(payload.len);
             const buf2 = try self.arena.allocator().dupe(u8, payload);
             // +1 tick so the copy is distinguishable and ordering stays total.
             try self.pushDeliver(from, to, buf2, self.now + delay + 1);
@@ -642,6 +678,7 @@ pub const Sim = struct {
 fn build(gpa: Allocator, case: Case, log: *Log) anyerror!Sim {
     var sim = Sim.init(gpa, case.seed, case.protocol, log, case.until, case.max_events_cap);
     errdefer sim.deinit();
+    sim.max_live_bytes = case.max_live_bytes; // audit F11, additive: null preserves today's unbounded behaviour
     try case.scenario(&sim);
     return sim;
 }
@@ -682,12 +719,43 @@ pub fn replay(gpa: Allocator, case: Case, trace: []const fault.FaultEvent, log_o
 
 /// Fuzz a fault schedule from `case.seed`, then replay it. Returns the result
 /// AND the schedule it used (the reproducer) — call `.trace.deinit()`.
+///
+/// audit F9: this used to build the topology TWICE — once via `snapshotTopo`
+/// (which builds a whole `Sim`, running `case.scenario`, just to copy out the
+/// node count and link list before throwing the `Sim` away) and once more
+/// inside `replay`, which builds its own fresh `Sim` and runs the SAME
+/// `case.scenario` again. Measured (ReleaseFast, ring topology, 200 reps):
+/// `snapshotTopo` + `build`'s own topology construction was **~50% of a
+/// `run()` call** across every size tried (32/256/2048 nodes, two independent
+/// sessions). `Scenario`'s own contract ("add nodes/links deterministically,
+/// no unseeded randomness") is exactly what makes the second build
+/// redundant: it can only ever reproduce the first one. Now the topology is
+/// built ONCE and the same `Sim` both supplies it to `fault.generate` and
+/// then drives the trace — the two builds collapse into one without
+/// changing what either half sees.
 pub fn run(gpa: Allocator, case: Case, fault_cfg: fault.Config) anyerror!GenResult {
-    const topo = try snapshotTopo(gpa, case);
-    defer gpa.free(topo.links);
-    var trace = try fault.generate(gpa, case.seed, .{ .node_count = topo.node_count, .links = topo.links }, fault_cfg);
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = try build(gpa, case, &log);
+    defer sim.deinit();
+    // `run` never asks `replay` for a log either (it always passed
+    // `log_out = null`), so this preserves today's behaviour exactly.
+    sim.want_log = false;
+
+    const links = try gpa.alloc(fault.Link, sim.links.items.len);
+    defer gpa.free(links);
+    for (sim.links.items, links) |lr, *l| l.* = .{ .a = lr.a, .b = lr.b };
+
+    var trace = try fault.generate(gpa, case.seed, .{ .node_count = sim.nodes.items.len, .links = links }, fault_cfg);
     errdefer trace.deinit();
-    const result = try replay(gpa, case, trace.events, null);
+    try sim.injectFaults(trace.events);
+    const outcome = try sim.drive();
+    const result: RunResult = .{
+        .outcome = outcome,
+        .events_processed = sim.events_processed,
+        .fingerprint = sim.fingerprint,
+        .violation = sim.violation,
+    };
     return .{ .result = result, .trace = trace };
 }
 
@@ -961,4 +1029,229 @@ test "addLink: a _permille field above 1000 is rejected, not silently saturated 
     // `reorder_permille = 1000` / `dup_permille = 1000` in its own tests.
     try sim.addLink(a, b, .{ .loss_permille = 1000 });
     try testing.expectEqual(@as(usize, 1), sim.links.items.len);
+}
+
+// ── F4 teeth: the five LinkConfig properties `mutate.sh` found untested ──────
+//
+// `drop_once`/`link_down`/`crash_node`/`restart_node`/`delay_once` (one-shot
+// faults, tested above in `root.zig`) and `dup_once` (the one one-shot fault
+// that already had teeth, per the audit) all have a single deterministic
+// trace to test against. These five are different: `loss_permille`,
+// `dup_permille`, `jitter`, `reorder_extra` and `bandwidth` are STATIC
+// per-message properties of `LinkConfig` applied by `Sim.send` itself
+// (`:420-447`), not one-shot faults from a trace — a mutation that turns any
+// one of them into a no-op still produces a legally-shaped run, so the right
+// check is "N sends, then a statistical property of the log", not "one trace,
+// one exact outcome". A test whose sends land 0% of the time on the
+// mutated behaviour would be worthless (indistinguishable from the mutant);
+// every test below is sized so it fails hard, not flakily, against a no-op.
+
+fn statNoopSim(gpa: Allocator, log: *Log, seed: u64) Sim {
+    const Noop = struct {
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    };
+    return Sim.init(gpa, seed, .{ .ctx = undefined, .onMessageFn = Noop.onMessage }, log, 1_000_000, 1_000_000);
+}
+
+test "F4 teeth: loss_permille actually drops messages at roughly the configured rate" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = statNoopSim(gpa, &log, 7);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{ .loss_permille = 300 });
+
+    const n = 4000;
+    var i: usize = 0;
+    while (i < n) : (i += 1) try sim.send(a, b, "x");
+
+    var drops: usize = 0;
+    for (log.entries.items) |e| {
+        if (e.tag == .drop) drops += 1;
+    }
+    // Expected ~1200/4000 (30%). A no-op mutation gives 0; a mutation that
+    // drops unconditionally gives ~4000. Both are far outside this band.
+    try testing.expect(drops > 800 and drops < 1600);
+}
+
+test "F4 teeth: dup_permille actually duplicates messages at roughly the configured rate" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = statNoopSim(gpa, &log, 11);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{ .dup_permille = 300 });
+
+    const n = 4000;
+    var i: usize = 0;
+    while (i < n) : (i += 1) try sim.send(a, b, "x");
+
+    var dups: usize = 0;
+    for (log.entries.items) |e| {
+        if (e.tag == .dup) dups += 1;
+    }
+    try testing.expect(dups > 800 and dups < 1600);
+}
+
+test "F4 teeth: jitter actually varies the per-message delay, not a fixed offset" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = statNoopSim(gpa, &log, 13);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{ .latency = 10, .jitter = 50 });
+
+    const n = 2000;
+    var i: usize = 0;
+    while (i < n) : (i += 1) try sim.send(a, b, "x");
+
+    // Nothing drove the queue, so `sim.now` never moved: every queued
+    // deliver event's absolute time IS its delay.
+    var min_delay: Time = std.math.maxInt(Time);
+    var max_delay: Time = 0;
+    i = 0;
+    while (i < n) : (i += 1) {
+        const ev = sim.queue.pop();
+        try testing.expect(ev.kind == .deliver);
+        try testing.expect(ev.time >= 10 and ev.time <= 60); // latency + [0, jitter]
+        min_delay = @min(min_delay, ev.time);
+        max_delay = @max(max_delay, ev.time);
+    }
+    // A no-op mutation collapses every delay to exactly 10 (min == max).
+    // Over 2000 draws of `belowWide(51)` the observed range should come
+    // close to both ends; this is a loose band, not a distribution check
+    // (`prng.zig` already owns the distribution itself).
+    try testing.expect(min_delay <= 12);
+    try testing.expect(max_delay >= 58);
+}
+
+test "F4 teeth: reorder_extra actually delays a fraction of messages further, not just the ones that got it in the trace" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = statNoopSim(gpa, &log, 17);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{ .latency = 10, .reorder_permille = 300, .reorder_extra = 1000 });
+
+    const n = 2000;
+    var i: usize = 0;
+    while (i < n) : (i += 1) try sim.send(a, b, "x");
+
+    var reordered: usize = 0;
+    i = 0;
+    while (i < n) : (i += 1) {
+        const ev = sim.queue.pop();
+        try testing.expect(ev.kind == .deliver);
+        try testing.expect(ev.time == 10 or (ev.time > 10 and ev.time <= 1010));
+        if (ev.time > 10) reordered += 1;
+    }
+    // Expected ~600/2000 (30%). A no-op mutation (either the trigger or the
+    // extra-delay draw silenced) gives 0.
+    try testing.expect(reordered > 350 and reordered < 850);
+}
+
+test "F4 teeth: bandwidth actually adds a payload-size-dependent serialization delay" {
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = statNoopSim(gpa, &log, 19);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{ .latency = 5, .bandwidth = 100 });
+
+    var small_payload: [250]u8 = @splat('x');
+    try sim.send(a, b, &small_payload);
+    var large_payload: [1000]u8 = @splat('y');
+    try sim.send(a, b, &large_payload);
+
+    const ev1 = sim.queue.pop();
+    const ev2 = sim.queue.pop();
+    // Deterministic (no PRNG involved): latency + payload.len / bandwidth.
+    try testing.expectEqual(@as(Time, 5 + 250 / 100), ev1.time); // 7
+    try testing.expectEqual(@as(Time, 5 + 1000 / 100), ev2.time); // 15
+}
+
+test "send: max_live_bytes bounds cumulative delivered payload bytes (audit F11)" {
+    // Unlike the five properties above, this isn't a per-message coin flip —
+    // it's a running total, so a single deterministic sequence is enough.
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var sim = statNoopSim(gpa, &log, 23);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{});
+
+    // Positive control first: the default (null) is genuinely unbounded —
+    // many sends that would trip a 100-byte cap must all succeed with it
+    // left at its default.
+    try testing.expectEqual(@as(?usize, null), sim.max_live_bytes);
+    var i: usize = 0;
+    while (i < 10) : (i += 1) try sim.send(a, b, "0123456789"); // 100 bytes total
+    try testing.expectEqual(@as(usize, 100), sim.live_bytes);
+
+    sim.max_live_bytes = 150;
+    i = 0;
+    while (i < 4) : (i += 1) try sim.send(a, b, "0123456789"); // +40 -> 140, still under
+    try testing.expectEqual(@as(usize, 140), sim.live_bytes);
+    // The 5th 10-byte send would land on exactly 150 -- at the cap, not over
+    // it, so it must still be accepted (a boundary-off-by-one would refuse
+    // this one instead of the next).
+    try sim.send(a, b, "0123456789");
+    try testing.expectEqual(@as(usize, 150), sim.live_bytes);
+    try testing.expectError(error.LiveBytesExceeded, sim.send(a, b, "0123456789"));
+    // A refused send must not have charged anything -- the total stays put,
+    // not silently grown past the cap it just enforced.
+    try testing.expectEqual(@as(usize, 150), sim.live_bytes);
+}
+
+test "build: Case.max_live_bytes reaches the Sim it builds (audit F11)" {
+    // The Sim-level field is covered above directly; this is the OTHER half
+    // -- that `replay`/`run` (the entry points nearly every consumer uses,
+    // not raw `Sim.init`) actually plumb `Case.max_live_bytes` through
+    // `build` rather than leaving it stranded on the `Case` value.
+    const gpa = testing.allocator;
+    const OneShotSender = struct {
+        fn onStart(_: *anyopaque, sim: *Sim, node: NodeId) anyerror!void {
+            if (node == 0) try sim.send(0, 1, "hello"); // 5 bytes
+        }
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    };
+    const scenario = struct {
+        fn build2(sim: *Sim) anyerror!void {
+            _ = try sim.addNode(.{});
+            _ = try sim.addNode(.{});
+            try sim.addBiLink(0, 1, .{ .latency = 5 });
+        }
+    }.build2;
+    var unused: usize = 0;
+    const case = Case{
+        .seed = 1,
+        .scenario = scenario,
+        .protocol = .{ .ctx = &unused, .onStartFn = OneShotSender.onStart, .onMessageFn = OneShotSender.onMessage },
+        .until = 100,
+        .max_live_bytes = 3, // "hello" is 5 bytes -- too small on purpose
+    };
+    try testing.expectError(error.LiveBytesExceeded, replay(gpa, case, &.{}, null));
+
+    // Positive control: the same scenario with room to spare succeeds.
+    const roomy_case = Case{
+        .seed = 1,
+        .scenario = scenario,
+        .protocol = .{ .ctx = &unused, .onStartFn = OneShotSender.onStart, .onMessageFn = OneShotSender.onMessage },
+        .until = 100,
+        .max_live_bytes = 1000,
+    };
+    const result = try replay(gpa, roomy_case, &.{}, null);
+    try testing.expectEqual(RunOutcome.ok, result.outcome);
 }

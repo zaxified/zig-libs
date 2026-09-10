@@ -5,6 +5,50 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, netsim F4 (remainder), F9, F11.
+
+  **F4 remainder** (**NO CONSUMER-VISIBLE CHANGE**): the 5 gaps left open by
+  the earlier F4 pass — `loss_permille`, `dup_permille`, `jitter`,
+  `reorder_extra`, `bandwidth` — are `LinkConfig` statistical properties
+  applied unconditionally in `Sim.send`, not one-shot `FaultKind`s, so each
+  got an N-sends-then-check-the-log test instead of a single trace. Each
+  verified independently: mutating its mechanism to a no-op (`false and
+  ...`) failed exactly that test (5/41), nothing else; reverted, 41/41.
+
+  **F9**: `run()` built the topology TWICE — once via `snapshotTopo` (builds
+  a whole `Sim`, runs `case.scenario`, discards it) and once more inside
+  `replay` (builds another fresh `Sim`, runs the SAME `case.scenario`
+  again). `Scenario`'s own contract (deterministic, no unseeded randomness)
+  makes the second build strictly redundant. `run` now builds one `Sim`,
+  reads the topology off it directly, then reuses the SAME `Sim` to drive
+  the generated trace — `snapshotTopo`/`replay` are unchanged and still
+  public on their own. Measured (interleaved A/B, 256-node ring, 60 iters):
+  Debug 448.9ms → 239.8ms, ReleaseFast 82.2ms → 47.8ms (~1.7-1.9x,
+  consistent with the audit's own ~47-51% at comparable sizes). Verified
+  with a mutant (`run` reverted to the two-build shape): the two arms
+  collapse to statistically the same cost and the regression-guard test
+  fails; reverted.
+
+  **F11** (additive, aditivní pole dle P3): `Sim.send` copies every payload
+  into an arena freed only at `deinit` — memory grows with the TOTAL bytes
+  ever sent, not the in-flight count, and had no cap (audit measured
+  `VmHWM +1251 MiB` for 20 000×64 KiB sends, identically across all four
+  optimize modes). Added `Sim.max_live_bytes: ?usize = null` (default `null`
+  = today's exact unbounded behaviour) and `Case.max_live_bytes` (threaded
+  into `Sim` by `build`, so `replay`/`run` callers get it without touching
+  `Sim.init` — whose signature is untouched, so the module's 3 direct
+  `Sim.init` callers are unaffected). Exceeding the cap returns
+  `Sim.SendError.LiveBytesExceeded` (a new, additive error-set member) loudly
+  from `send` instead of continuing to grow. All 7 in-repo consumers
+  re-verified (`raft` 61/61, `df-elect` 37/37, `loopfree-reconv` 11/11,
+  `liveness-hyst` 16/16, `loopix` 28/28, `fleetsim` 92/100+8 skip,
+  `isis-sim` 21/21) — unchanged, since the default preserves exact prior
+  behaviour. Verified with a mutant (the cap check short-circuited to
+  never trigger): both new tests failed at the exact assertion; reverted.
+
+  `scripts/modtest netsim`: 44/44 (was 37/37 before this entry's three
+  items), Debug and ReleaseFast.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 fix campaign, netsim F4
   (partial). The audit's mutate.sh found 14 mutations that survive the suite
   untouched — a fault kind or config bound that has no test observing its
