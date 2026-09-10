@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **ADDITIVE, not breaking.** `HostKey.fromOpenSSH` (and its `userauth.AuthKey`
+  alias) can now load an `ecdsa-sha2-nistp256` openssh-key-v1 container — new
+  `parseEcdsaP256OpenSSH`, dispatched the same way `parseEd25519OpenSSH` already was. Closes
+  `A1/examples/ssh.md` S4+S5: `HostKey` already had the `.ecdsa_p256` variant and `publicBlob`/
+  `sign` already implemented it, so an `ssh-keygen -t ecdsa` host or user key came back
+  `error.UnsupportedKeyType` from the loader alone — `example-apps/ssh-demo` carried its own
+  copy of this exact parser to work around the gap (`main.zig`'s `loadUnsupportedHostKey`,
+  marked "MODULE GAP, worked around here rather than fought"). A curve other than nistp256
+  inside an otherwise well-formed ecdsa container is still `error.UnsupportedKeyType` (no other
+  `HostKey` variant exists for it). New fixture test (`ssh-keygen -t ecdsa -b 256`) parses,
+  round-trips `K_S` against `ssh-keygen`'s own `.pub`, and signs/verifies; a synthetic-container
+  test pins the wrong-curve rejection. One PRE-EXISTING test had to change: it used
+  `ecdsa-sha2-nistp256` as its example of an unsupported key type, which is no longer true —
+  switched to `ssh-dss`, a type this module has never implemented for any loader.
+  scripts/modtest ssh: 133/133 (was 131/131), ReleaseSafe and ReleaseFast alike.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking.** `negotiate` now actually negotiates the
   compression name-list (RFC 4253 §7.1) instead of decoding it and never looking again — a
   peer offering no overlap with `["none"]` is now refused with `error.UnsupportedAlgorithm`

@@ -190,8 +190,10 @@ environment with OpenSSH installed.
   string length, an off-by-one length and a truncated length prefix are each `error.ProtocolError`.
 - **Transport:** KEXINIT encode/decode, KDF-formula, per-cipher packet round-trips + tamper
   detection, RFC 3526 prime bit-lengths, degenerate-DH-value rejection.
-- **Host/user keys:** `HostKey.fromOpenSSH` fixtures (ed25519 + rsa, `K_S` byte-compared against
-  `ssh-keygen`'s `.pub`), ecdsa signature wire shape, error paths.
+- **Host/user keys:** `HostKey.fromOpenSSH` fixtures (ed25519, rsa, and ecdsa-p256 — the third
+  closes A1/examples/ssh.md S4+S5, `K_S` byte-compared against `ssh-keygen`'s `.pub`), ecdsa
+  signature wire shape, error paths (including a curve other than nistp256 inside an otherwise
+  well-formed ecdsa container).
 - **Userauth units:** `signedBlob` field-order/framing assertion, session-id-changes-the-message,
   the algorithm↔key-blob-type pairing table, an ed25519 signature that verifies under its own
   session id and fails under another, the borrow-not-copy `sessionId` regression, two crafted-
