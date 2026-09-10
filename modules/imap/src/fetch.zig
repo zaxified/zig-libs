@@ -606,7 +606,13 @@ fn isAttNameChar(ch: u8) bool {
 }
 
 fn isSectionChar(ch: u8) bool {
-    return ch != ']';
+    // audit F9: mirrors `command.checkSection` (the encoder side), which
+    // refuses `]` (closes the brackets early) and any control byte or
+    // non-ASCII (`< 0x20 or >= 0x7f`). This decoder used to accept anything
+    // but `]` -- `BODY[A\r\nB]`/`BODY[A\x00B]` parsed and handed the caller a
+    // section string with an embedded CR/LF/NUL, something the module's own
+    // encoder has never been able to build.
+    return ch != ']' and ch >= 0x20 and ch < 0x7f;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -861,6 +867,39 @@ test "msg-att: an empty section and a NIL payload" {
     const m = try p.message(1);
     try testing.expectEqualStrings("", m.items[0].body_section.section);
     try testing.expect(m.items[0].body_section.data == null);
+}
+
+test "msg-att: F9 -- a section containing CR/LF/NUL is rejected, not silently accepted" {
+    // Before: `isSectionChar` was `ch != ']'`, so `BODY[A\r\nB]` parsed and
+    // handed the caller `section = "A\r\nB"` -- a value the module's own
+    // ENCODER (`command.checkSection`) has never been able to build. The
+    // decoder now applies the same character class the encoder already
+    // enforces, so the run stops at the control byte and the following
+    // `d.expect(']')` fails on it instead.
+    {
+        var f: Fx = undefined;
+        f.init("(BODY[A\r\nB] NIL)");
+        defer f.deinit();
+        var p = f.parser();
+        try testing.expectError(error.UnexpectedByte, p.message(1));
+    }
+    {
+        var f: Fx = undefined;
+        f.init("(BODY[A\x00B] NIL)");
+        defer f.deinit();
+        var p = f.parser();
+        try testing.expectError(error.UnexpectedByte, p.message(1));
+    }
+    // Positive control: a normal section (parens and a space, both within
+    // the accepted range) still parses -- this isn't a blanket lockdown.
+    {
+        var f: Fx = undefined;
+        f.init("(BODY[HEADER.FIELDS (FROM TO)] NIL)");
+        defer f.deinit();
+        var p = f.parser();
+        const m = try p.message(1);
+        try testing.expectEqualStrings("HEADER.FIELDS (FROM TO)", m.items[0].body_section.section);
+    }
 }
 
 test "msg-att: a partial origin is consumed" {

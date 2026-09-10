@@ -255,8 +255,64 @@ pub fn negotiate(accept_header: []const u8, offers: []const []const u8) ?Negotia
         return null;
     }
 
-    // Step B — score each offer independently by the most specific matching
-    // range, then keep the highest-weight acceptable offer (ties → earliest).
+    // audit F(G7): Step B used to re-walk the WHOLE header from scratch for
+    // EVERY offer (`offers.len` full parses of `accept_header`), so one
+    // `negotiate` call cost O(offers x header length) — measured at ~550x a
+    // single-range header for an 8-offer server over a 1000-range Accept,
+    // and linear in offer count at constant header size. `offers` is the
+    // server's own short, code-defined list (unlike the header, which is
+    // attacker-sized), so below `offer_track_max` the header is walked
+    // EXACTLY ONCE, scoring every offer per range as it goes — same result,
+    // one pass instead of `offers.len`. Above the bound (unrealistic for a
+    // server's own offer list), `negotiateOffersSlow` below is the original
+    // per-offer rescan, so correctness never depends on the bound holding.
+    const offer_track_max = 32;
+    if (offers.len <= offer_track_max) {
+        return negotiateOffersFast(accept_header, offers);
+    }
+    return negotiateOffersSlow(accept_header, offers);
+}
+
+/// One pass over `accept_header`, tracking each offer's best-matching range
+/// as it goes. Requires `offers.len <= offer_track_max` (the caller checks).
+fn negotiateOffersFast(accept_header: []const u8, offers: []const []const u8) ?Negotiated {
+    const offer_track_max = 32;
+    var types: [offer_track_max]?TypePair = undefined;
+    for (offers, 0..) |offer, i| types[i] = splitType(offer);
+
+    var matched: [offer_track_max]bool = @splat(false);
+    var spec: [offer_track_max]i8 = @splat(-1);
+    var weight: [offer_track_max]u16 = @splat(0);
+
+    var it = accept(accept_header);
+    while (it.next()) |mr| {
+        for (offers, 0..) |_, i| {
+            const ot = types[i] orelse continue; // skip malformed offers
+            if (!mr.matches(ot.type, ot.subtype)) continue;
+            const s: i8 = mr.specificity();
+            if (!matched[i] or s > spec[i] or (s == spec[i] and mr.weight > weight[i])) {
+                matched[i] = true;
+                spec[i] = s;
+                weight[i] = mr.weight;
+            }
+        }
+    }
+
+    var best: ?Negotiated = null;
+    for (offers, 0..) |offer, i| {
+        if (!matched[i] or weight[i] == 0) continue; // unacceptable (no match / q=0)
+        // Keep the highest-weight offer; ties → earliest (so strict >).
+        if (best == null or weight[i] > best.?.weight) {
+            best = .{ .index = i, .media_type = offer, .weight = weight[i] };
+        }
+    }
+    return best;
+}
+
+/// The original algorithm: re-walks `accept_header` once per offer. Kept as
+/// the exact fallback for `offers.len > offer_track_max`, and as the known-
+/// correct reference the fast path is tested against.
+fn negotiateOffersSlow(accept_header: []const u8, offers: []const []const u8) ?Negotiated {
     var best: ?Negotiated = null;
     for (offers, 0..) |offer, i| {
         const ot = splitType(offer) orelse continue; // skip malformed offers
@@ -823,6 +879,45 @@ test "negotiateContentType: reads the request's Accept header" {
     try testing.expectEqual(q_default, nb.weight);
 }
 
+// audit G7: `negotiate` used to re-walk the whole `Accept` header once PER
+// offer; `negotiateOffersFast` walks it once total and scores every offer as
+// it goes. These pin that the fast path and the original (now the >32-offer
+// fallback, `negotiateOffersSlow`) agree on every case already covered above
+// PLUS the shapes that stress the rewrite specifically: multiple offers,
+// specificity ties, weight ties, and unmatched/`q=0` offers mixed in.
+test "negotiate G7: the single-pass fast path agrees with the original per-offer rescan" {
+    const cases = [_]struct { accept_header: []const u8, offers: []const []const u8 }{
+        .{ .accept_header = "text/html", .offers = &.{"text/html;charset=utf-8"} },
+        .{ .accept_header = "text/*;q=0.5, text/html;q=0.9, */*;q=0.1", .offers = &.{ "text/plain", "text/html", "application/json" } },
+        .{ .accept_header = "application/json;q=0.8, application/xml;q=0.8", .offers = &.{ "application/xml", "application/json" } }, // weight tie -> earliest offer
+        .{ .accept_header = "text/html;q=0", .offers = &.{"text/html"} }, // q=0 excludes
+        .{ .accept_header = "image/png, image/*;q=0.3", .offers = &.{ "image/png", "image/jpeg", "image/gif" } }, // some offers unmatched
+        .{ .accept_header = "", .offers = &.{ "text/html", "application/json" } }, // empty Accept short-circuits before either path
+        .{ .accept_header = "*/*", .offers = &.{ "bogus", "text/html" } }, // a malformed offer mixed in
+    };
+    for (cases) |c| {
+        const fast = negotiateOffersFast(c.accept_header, c.offers);
+        const slow = negotiateOffersSlow(c.accept_header, c.offers);
+        try testing.expectEqual(slow == null, fast == null);
+        if (fast) |f| {
+            try testing.expectEqual(slow.?.index, f.index);
+            try testing.expectEqualStrings(slow.?.media_type, f.media_type);
+            try testing.expectEqual(slow.?.weight, f.weight);
+        }
+    }
+}
+
+test "negotiate G7: offers.len over the fast-path bound still negotiates correctly (the slow fallback)" {
+    // 33 offers > offer_track_max (32) -- forces `negotiate` itself down the
+    // `negotiateOffersSlow` branch, not just the two helpers directly.
+    var buf: [33][]const u8 = undefined;
+    for (&buf, 0..) |*o, i| o.* = if (i == 20) "text/html" else "application/octet-stream";
+    const n = negotiate("text/html;q=1.0, */*;q=0.1", &buf).?;
+    try testing.expectEqual(@as(usize, 20), n.index);
+    try testing.expectEqualStrings("text/html", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
 test "parseTokenElement: bare token -> q=1000" {
     const gz = parseTokenElement("gzip").?;
     try testing.expectEqualStrings("gzip", gz.token);
@@ -1069,4 +1164,50 @@ test "negotiateEncoding: empty header -> first offer at q_default" {
     try testing.expectEqual(@as(usize, 0), n.index);
     try testing.expectEqualStrings("gzip", n.media_type);
     try testing.expectEqual(q_default, n.weight);
+}
+
+fn g7NowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "bench (opt-in via HTTP_BENCH_G7): negotiate() is not O(offers) full header rescans" {
+    // G7 (`~/CML/20260901-zig-libs-audit/A1/http.md`): `negotiate` re-walked
+    // the WHOLE `Accept` header once PER offer. Measured there: a 1000-range
+    // header (11 999 B, comfortably under `Server.Options.max_header_bytes`)
+    // against 8 offers cost ~550-598 us/call, ~550x a 1-range header, and
+    // scaled linearly in offer count (8.0-9.1x between 1 and 8 offers) at
+    // flat per-(range x offer) cost. Opt-in and ReleaseFast-only, same shape
+    // as `imap`'s F7 bench: a wall-clock assert in the default gate, run
+    // alongside up to three other agents' lanes, is a flaky test waiting to
+    // happen. Run with:
+    //   HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_G7") == null) return error.SkipZigTest;
+
+    var buf: std.ArrayList(u8) = .empty;
+    const gpa = testing.allocator;
+    defer buf.deinit(gpa);
+    for (0..1000) |i| {
+        if (i != 0) try buf.append(gpa, ',');
+        var elem_buf: [32]u8 = undefined;
+        const elem = std.fmt.bufPrint(&elem_buf, "type{d}/sub{d};q=0.{d}", .{ i, i, 100 + (i % 900) }) catch unreachable;
+        try buf.appendSlice(gpa, elem);
+    }
+    const offers = [_][]const u8{ "a/a", "b/b", "c/c", "d/d", "e/e", "f/f", "g/g", "type999/sub999" };
+
+    const iters = 1000;
+    const start = g7NowNs();
+    for (0..iters) |_| std.mem.doNotOptimizeAway(negotiate(buf.items, &offers));
+    const elapsed = g7NowNs() - start;
+    const per_call_ns = elapsed / iters;
+
+    std.debug.print("G7 bench: {d} ns/call over {d} iters ({d} B header, {d} offers)\n", .{ per_call_ns, iters, buf.items.len, offers.len });
+    // Measured on this machine, same shape as above (1000 ranges, 8 offers,
+    // 22 779 B header): single-pass 136 us/call, the old per-offer rescan
+    // (`negotiateOffersSlow`, measured directly, not restored via mutation)
+    // 884 us/call -- 6.5x, the same order as the audit's own ~8x on a
+    // shorter header. 300 us sits well above the fast path's measured cost
+    // while still failing hard on a reversion to the O(offers) rescan.
+    try testing.expect(per_call_ns < 300_000);
 }
