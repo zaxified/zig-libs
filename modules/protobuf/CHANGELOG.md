@@ -5,6 +5,46 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign (F13). **No consumer-visible change** —
+  new test coverage plus regenerated interop fixtures, no `src/` decoder or
+  encoder logic touched.
+  - **F13 (LOW):** `reference_interop.zig`'s successor
+    (`conformance.zig`'s `semantic_cases` / `interop_replay_test.zig` /
+    `tools/interop.zig`, restructured 2026-09-06) only ever asked the live
+    Python reference about WELL-FORMED values; the two divergences
+    `SPEC.md`'s "Smaller hardening" section calls "deliberately stricter"
+    (a non-minimal tag, a field number above 2^29-1) were hand-typed claims,
+    never actually checked against the reference. Extended `Expect` with a
+    third case, `reject_stricter` (reference expected to ACCEPT; our
+    decoder expected to reject with a named error — the opposite polarity
+    from `reject_invalid_utf8`, where both sides reject), and a
+    `referenceRejects(Expect) bool` helper so `tools/interop.zig`'s
+    capture/live-check logic asks the right question for all three cases
+    uniformly. Added two new `semantic_cases`, captured live against
+    `google.protobuf` 4.21.12 (`zig build-exe` over `tools/interop.zig`
+    directly, then `--capture`, since `zig build interop-protobuf` is a
+    build-graph step this campaign's fixer lane does not run): a
+    non-minimal tag on `Presence` (`90 00 05`) and an out-of-range field
+    number on `Wide` (`80 80 80 80 10 00`, the same construction
+    `wire.zig`'s own "F4 regression" test uses). **Both confirmed live: the
+    reference ACCEPTS each, treats it as an unknown field, and re-serializes
+    it byte-for-byte unchanged** — genuine divergences, not assumptions.
+    **Also probed and NOT added:** the audit's own large-scale mutation
+    campaign classified `VarintOverflow` (627 of 200000 mutated inputs) the
+    same way, but a direct live check of the specific 11-byte shape
+    `wire.zig`'s "an over-long varint is refused" test uses shows the
+    reference REJECTS it too (`DecodeError: Too many bytes when decoding
+    varint`) — no divergence for that particular shape, so it was not
+    pinned as one; the audit's 627-count most likely spans a range of
+    *different* overlong constructions this session did not reconstruct.
+    `interop_replay_test.zig`'s count canary rewritten for the three-way
+    split (reference-rejections vs. our-own-stricter-rejections vs. plain
+    acceptances) rather than the old two-way one, which could not represent
+    a case where the two sides' verdicts point in opposite directions.
+    `scripts/modtest protobuf`: 74/74, unchanged count (both new cases
+    exercised inside two already-existing tests, not new `test` blocks).
+    Consumer `grpc` reverified: `scripts/modtest grpc` 122/122, unchanged.
+
 - **2026-09-10** — A1 fix campaign, dojezd wave. **No consumer-visible change.**
   - **F10 (LOW, no behaviour change):** `emitMessage`'s own depth check
     (`if (depth >= options.max_depth) return error.DepthExceeded;`) was

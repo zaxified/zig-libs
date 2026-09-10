@@ -92,6 +92,28 @@ test "interop replay: the reference's reading of every non-canonical input, no p
                 }
                 try testing.expectError(error.InvalidUtf8, pb.decode(T, gpa, c.input, .{}));
             },
+            .reject_stricter => {
+                // The opposite polarity from `reject_invalid_utf8`: the
+                // fixture must record an ACCEPTANCE (the reference took this
+                // input) -- a `null` here would mean the reference rejects it
+                // too, and this is no longer a divergence worth pinning as
+                // "stricter".
+                if (frozen == null) {
+                    std.debug.print("case '{s}' is declared reject_stricter (reference should ACCEPT), the fixture records a rejection -- this is no longer a divergence\n", .{c.name});
+                    return error.FixtureContradictsCase;
+                }
+                if (pb.decode(T, gpa, c.input, .{})) |_| {
+                    std.debug.print("'{s}': we now ACCEPT this input -- it is no longer one of our deliberately stricter rejections; update or remove the case\n", .{c.name});
+                    return error.NoLongerStricter;
+                } else |e| {
+                    const want = c.our_error orelse @panic("reject_stricter case with no our_error");
+                    const got = @errorName(e);
+                    if (!std.mem.eql(u8, want, got)) {
+                        std.debug.print("'{s}': we rejected with {s}, expected {s}\n", .{ c.name, got, want });
+                        return error.WrongError;
+                    }
+                }
+            },
         }
     }
 }
@@ -176,19 +198,44 @@ test "interop replay: a message proxied through a partial schema is unchanged" {
 // verdict lingers — and a capture run that silently produced fewer entries
 // than it meant to.
 
-test "interop replay: vector count canary — 8 semantic cases, 4 of them rejections" {
-    try testing.expectEqual(@as(usize, 8), conf.semantic_cases.len);
-    try testing.expectEqual(@as(usize, 8), vectors.verdicts.len);
+test "interop replay: vector count canary — 10 semantic cases, 4 reference rejections, 2 of our own stricter ones" {
+    try testing.expectEqual(@as(usize, 10), conf.semantic_cases.len);
+    try testing.expectEqual(@as(usize, 10), vectors.verdicts.len);
 
-    var rejections: usize = 0;
+    // The reference's OWN rejections (fixture is `null`) — must match
+    // exactly the cases that PREDICT a reference rejection
+    // (`conf.referenceRejects`), independent of what OUR decoder does.
+    var reference_rejections: usize = 0;
     for (vectors.verdicts) |v| {
-        if (v.normalized == null) rejections += 1;
+        if (v.normalized == null) reference_rejections += 1;
     }
-    try testing.expectEqual(@as(usize, 4), rejections);
+    try testing.expectEqual(@as(usize, 4), reference_rejections);
 
-    var declared_rejections: usize = 0;
+    var declared_reference_rejections: usize = 0;
+    var declared_our_stricter: usize = 0;
     for (conf.semantic_cases) |c| {
-        if (c.expect != .accept) declared_rejections += 1;
+        if (conf.referenceRejects(c.expect)) declared_reference_rejections += 1;
+        if (c.expect == .reject_stricter) declared_our_stricter += 1;
     }
-    try testing.expectEqual(@as(usize, 4), declared_rejections);
+    try testing.expectEqual(@as(usize, 4), declared_reference_rejections);
+    try testing.expectEqual(@as(usize, 2), declared_our_stricter);
+
+    // Every `reject_stricter` case's own fixture entry must be a reference
+    // ACCEPTANCE (non-null) -- the opposite of the reference-rejection
+    // count above. This is what would break if a future capture run ever
+    // found the reference started rejecting one of these too (at which
+    // point it is no longer "stricter", just "agrees", and the case
+    // belongs in a different bucket -- `interop_replay_test.zig`'s own
+    // per-case check already stops the build for that; this canary catches
+    // it even if nobody runs the fuller test in the same session).
+    var stricter_with_reference_acceptance: usize = 0;
+    for (conf.semantic_cases) |c| {
+        if (c.expect != .reject_stricter) continue;
+        for (vectors.verdicts) |v| {
+            if (std.mem.eql(u8, v.name, c.name) and v.normalized != null) {
+                stricter_with_reference_acceptance += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 2), stricter_with_reference_acceptance);
 }

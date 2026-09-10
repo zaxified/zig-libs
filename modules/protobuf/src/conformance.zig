@@ -255,7 +255,29 @@ pub const Msg = enum { wide, repeated, presence, chain };
 /// field is the hand-written claim the capture cross-checks against, so a
 /// reference that changes its mind fails the capture instead of being
 /// silently written into the record.
-pub const Expect = enum { accept, reject_invalid_utf8 };
+///
+/// `reject_stricter` is audit F13's addition (2026-09-11): SPEC.md's
+/// "Smaller hardening" section names byte strings where THIS decoder is
+/// deliberately stricter than the reference (rejects what the reference
+/// accepts-as-unknown) — `FieldNumberOutOfRange`, `NonMinimalTag`. Before
+/// this, that claim was hand-typed and never checked against a live
+/// reference (audit F13's own words: "the reference is never actually
+/// asked" about a malformed vector). Distinct from `reject_invalid_utf8`,
+/// where BOTH sides reject: here the reference is expected to ACCEPT (the
+/// fixture records its normalized bytes, same as `.accept`), while OUR
+/// decoder is expected to reject with `Semantic.our_error` — checked in
+/// `interop_replay_test.zig`, the one place both verdicts meet.
+pub const Expect = enum { accept, reject_invalid_utf8, reject_stricter };
+
+/// Whether `e` predicts the REFERENCE rejects `Semantic.input` — the only
+/// question `tools/interop.zig`'s capture/live-check logic needs to ask
+/// about `Expect` (what OUR decoder does with a `reject_stricter` case is a
+/// question only `interop_replay_test.zig` asks, using `Semantic.our_error`).
+/// `reject_stricter` predicts the reference ACCEPTS, same as `.accept` —
+/// that is the entire point of the finding it exists for.
+pub fn referenceRejects(e: Expect) bool {
+    return e == .reject_invalid_utf8;
+}
 
 /// A byte string a conforming parser has to judge, together with the message
 /// type it is judged as. None of these are shapes a canonical encoder emits,
@@ -267,6 +289,9 @@ pub const Semantic = struct {
     msg: Msg,
     input: []const u8,
     expect: Expect,
+    /// Only meaningful when `expect == .reject_stricter`: the exact error
+    /// name OUR decoder must return. `null` for every other `expect`.
+    our_error: ?[]const u8 = null,
 };
 
 pub const semantic_cases = [_]Semantic{
@@ -312,6 +337,63 @@ pub const semantic_cases = [_]Semantic{
     // for both sides, so the four rejections above are a check on `string`,
     // not a blanket byte filter.
     .{ .name = "utf8_raw_ff_ok", .msg = .wide, .input = &.{ 0x82, 0x01, 0x01, 0xff }, .expect = .accept },
+
+    // ── audit F13: SPEC's "deliberately stricter" divergences, verified
+    // against the LIVE reference instead of hand-typed. Both confirmed by
+    // direct experiment against `tools/reference.py normalize` before being
+    // added here (not assumed from the audit's own campaign, which reported
+    // a different vector's classification for the SAME error name — see
+    // the "not added" note below `field_number_out_of_range`).
+
+    // `Presence.explicit` is field 2, wire varint: the minimal tag byte is
+    // 0x10. `90 00` spells the same field/wire-type non-minimally, in two
+    // bytes with a trailing zero continuation byte, followed by the value
+    // 5. The reference's pure-Python decoder dispatches on the tag's raw
+    // BYTES (`_decoders_by_tag[tag_bytes]`), never matches `90 00` against
+    // its one-byte table entry for field 2, and files it as an unknown
+    // field — ACCEPTING the message and re-serializing the unknown field's
+    // raw bytes verbatim (confirmed live: `normalize` on `90 00 05`
+    // returns exactly `90 00 05`, byte-for-byte). Our decoder rejects it
+    // outright (`error.NonMinimalTag`, audit F3's fix, policy (a): closes
+    // smuggling from both directions rather than mirroring the reference).
+    .{
+        .name = "nonminimal_tag_stricter",
+        .msg = .presence,
+        .input = &.{ 0x90, 0x00, 0x05 },
+        .expect = .reject_stricter,
+        .our_error = "NonMinimalTag",
+    },
+
+    // `Wide.i32_` is field 1. `80 80 80 80 10 00` tags field 2^29 (the
+    // smallest field number this decoder refuses, `wire.zig`'s own "F4
+    // regression" test uses the identical construction) with wire type 0
+    // and value 0. The reference ACCEPTS an out-of-range field number and
+    // treats it as unknown (confirmed live: `normalize` returns the input
+    // unchanged, byte-for-byte — same round-trip-through-unknown-fields
+    // signature as the tag case above). Our decoder rejects it
+    // (`error.FieldNumberOutOfRange`, audit F4's fix, wave-2 audit).
+    .{
+        .name = "field_number_out_of_range_stricter",
+        .msg = .wide,
+        .input = &.{ 0x80, 0x80, 0x80, 0x80, 0x10, 0x00 },
+        .expect = .reject_stricter,
+        .our_error = "FieldNumberOutOfRange",
+    },
+
+    // NOT ADDED: an over-long (11-byte) varint. The wave-3 audit's own
+    // large-scale mutation campaign classified `zig=VarintOverflow` (627 of
+    // 200000 mutated inputs) as a "documented stricter choice" alongside
+    // the two cases above — but a direct probe of the specific 11-byte
+    // shape `wire.zig`'s own "an over-long varint is refused" test uses
+    // (`08 ff*10 01`, tag=field1/wire0 on `Wide`) shows the reference
+    // REJECTS it too (`DecodeError: Too many bytes when decoding varint`,
+    // confirmed live). So for at least this shape there is no divergence
+    // to pin — the audit's 627-count almost certainly covers a range of
+    // *different* overlong shapes (other field numbers, other wire types,
+    // other byte counts), not this one specifically, and reconstructing
+    // that full census is out of this finding's scope. Recorded here
+    // rather than silently omitted, since "the audit's classification did
+    // not survive a direct check" is itself worth knowing.
 };
 
 /// The Zig type a `Msg` names.

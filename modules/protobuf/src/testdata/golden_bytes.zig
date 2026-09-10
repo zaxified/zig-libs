@@ -24,7 +24,7 @@
 //!
 //!   zig build interop-protobuf -- --capture
 //!
-//! Reference: google.protobuf 4.21.12 on Python 3.14.4, 2026-09-06
+//! Reference: google.protobuf 4.21.12 on Python 3.14.4, 2026-09-11
 
 const Entry = struct { name: []const u8, bytes: []const u8 };
 
