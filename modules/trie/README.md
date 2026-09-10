@@ -105,3 +105,22 @@ end); the frozen output is ~40 MB per 1 M keys. Freeze is a one-time cost — sh
 the frozen buffer and never build in the request path. A bare `ArenaAllocator`
 still costs a little more than a freeing GPA (it never reuses a pool's old halves
 after a realloc), but both are safe at scale; see `SPEC.md` for the numbers.
+
+### Frozen size depends heavily on how much keys share prefixes
+
+The "~40 B per key" figure above is a rough midpoint, not a guarantee: the
+frozen buffer's bytes-per-key ratio is a function of how much the keyset
+shares prefixes, and it swings **5.6x** across corpus shapes (A1 trie F7,
+2026-09-11). Measured, three corpus shapes:
+
+| corpus | B/key | × raw key bytes |
+|---|---:|---:|
+| clustered addresses (this module's target use case) | **18.5** | 0.72x (compression) |
+| 6-byte keys, alphabet 256 | 55.7 | 9.28x |
+| random hex, 12 chars | **102.9** | 8.57x |
+
+On the target corpus (clustered, prefix-sharing keys) the trie **compresses**
+below the raw key bytes. On high-entropy keys with little shared prefix
+structure it inflates well past them, because there is almost nothing to
+share. **`trie` is the wrong data structure for high-entropy / random keys** —
+pick it when keys cluster by prefix, not as a general-purpose key→value store.

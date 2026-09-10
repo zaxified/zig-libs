@@ -104,8 +104,13 @@ pub const Builder = struct {
     }
 
     /// Index of the edge under node `parent` whose label is `b`, or `no_edge`.
-    /// Linear over the sibling list — child counts are tiny (≤ 256 distinct
-    /// byte labels, in practice a handful).
+    /// Linear over the sibling list — child counts are bounded by 256 distinct
+    /// byte labels, but "in practice a handful" does NOT hold for byte-valued
+    /// keys (hashes, binary IDs): measured build throughput at fixed key
+    /// length/count, alphabet as the only variable, was 2038-2212 k nodes/s at
+    /// alphabet 16 (447869 nodes) vs. 334-358 k nodes/s at alphabet 256
+    /// (861627 nodes) — a 6.2x slower build for only 1.9x more nodes, i.e.
+    /// ~3.2x more expensive per node (A1 trie F6, 2026-09-11).
     fn findChildEdge(self: *const Builder, parent: u32, b: u8) u32 {
         var e = self.nodes.items[parent].first_edge;
         while (e != no_edge) : (e = self.edges.items[e].next) {
