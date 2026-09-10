@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign: `A1/opaque.md` L4 (0 consumers, P1
+  applies; test-only, no production code, wire format or API change).
+  - **L4**: the AKE transcript's seven-piece preamble (context,
+    client_identity, KE1, server_identity, credential_response,
+    server_nonce, server_public_keyshare) was checked ONLY by the RFC
+    KATs — the live end-to-end tests could not see a dropped or
+    reordered piece, because both sides call the same `runKeySchedule`.
+    Added a SECOND, independently-written implementation of RFC 9807
+    §6.3.3's `Preamble` and the `Derive-Secret`/`HandshakeSecret` half of
+    §6.4.2.2 (`independentHandshakeSecret`, sharing no code with
+    `runKeySchedule`/`deriveSecret`/`expandMulti`/`i2osp2` — built
+    directly from `std.crypto.hash.sha2.Sha512` and
+    `std.crypto.kdf.hkdf.HkdfSha512`, with its own I2OSP-2 and
+    CustomLabel encoding copied from the RFC text). Fed with `ikm`
+    obtained by reusing the module's own (not-in-dispute) DH/envelope-
+    recovery code — reimplementing ristretto255 DH independently was
+    judged out of scope and unnecessary risk for what L4 actually
+    disputes — it reproduces RFC 9807 Appendix C.1.1's AND C.1.2's
+    published `handshake_secret` exactly. A companion test proves the
+    independent construction has teeth: dropping any one of the seven
+    pieces to empty changes the result (all seven, not assumed).
+    `scripts/modtest opaque`: **29/29 → 31/31** (Debug and ReleaseFast).
+
 - **2026-09-10** — A1 fix campaign, dojezd wave: `A1/opaque.md` M4 (0 consumers, P1
   applies; no wire/API change).
   - **M4**: the module's three fuzz harnesses only ever exercised `fromBytes` (plain
