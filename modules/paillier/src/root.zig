@@ -1563,6 +1563,154 @@ test "fromPrimes rejects p == q, degenerate factors, and oversized products" {
     try testing.expectError(error.Overflow, fromPrimes(&big1, &big2));
 }
 
+// F7 (wave-3 audit) reported `m7` (Miller-Rabin round count 64 -> 1) and
+// `m8` (FIPS 186-5 closeness guard bypassed at `generate`'s call site) as
+// GREEN mutations, in the same accounting that also named `m9`/`m10`/`m11`
+// -- all five later turned out to need the SAME redundancy census m9/m10/
+// m11 already got. Unlike those three, **m7 and m8 are CONFIRMED real,
+// not refuted**: this module has a THIRD instance of "the guard the audit
+// named turns out not to be the one that matters", but this time in the
+// opposite direction -- the guard that survives mutation testing here is
+// genuinely load-bearing, and nothing downstream backstops it.
+//
+// `m7`: known base-2 strong pseudoprimes (composite values a single
+// Miller-Rabin round with witness a=2 misreports as "probably prime") are
+// exactly the class the hypothesis "the structural self-check in
+// `fromPrimesImpl` would catch it anyway" (which held for m9/m10/m11's
+// RANDOM composites) predicted would be caught too. Measured instead
+// (2026-09-10, dojezd): `fromPrimes` ACCEPTED 24 of 32 base-2 strong
+// pseudoprime/`kat_q` pairs (both orders) as "valid" keys -- the structural
+// check has a blind spot for exactly this class of composite, because
+// pseudoprimes share deep number-theoretic structure with primes that
+// coincidentally satisfies Theorem 2. One accepted case (p=2047=23*89,
+// q=17) was checked for functional correctness too: 18 of 20 plaintexts
+// round-tripped fine, but 2 (m=4, m=16) failed to decrypt at all -- the
+// same "silently wrong for some plaintexts" shape as F10. `isProbablePrime`
+// AT THE REAL `mr_rounds` (64) correctly rejected every one of these same
+// pseudoprimes (0 of 80 draws across 5 independent seeds each) -- so
+// production is safe today, but only because `mr_rounds` stays at 64. The
+// test below pins that; reducing it (m7's exact mutation) removes the only
+// thing standing between `generate()` and a broken key like the 2047/17
+// one, and the audit's own m6 finding (`isProbablePrime` always true, fully
+// disabled) already showed the other extreme genuinely gets caught -- by
+// `generate()`'s retry loop simply never terminating on typical random
+// draws, not by a structural check on the resulting key.
+//
+// `m8`: `fromPrimesImpl` has no closeness check anywhere (confirmed by
+// reading it end to end: only `p == q` and `p, q >= 3` run before the
+// structural self-check) -- so the ONLY thing standing between `generate()`
+// and a Fermat-factorable key is the `topBitsMatch` call in its search
+// loop. Measured: two genuinely prime, DISTINCT 128-bit values found 61
+// linear-search steps apart (a magnitude that guarantees their top 100
+// bits coincide) were accepted by `fromPrimes` with no complaint -- an
+// attacker who obtained such an `n` could recover `p`/`q` in ~61 trial
+// values via Fermat's method, instead of the ~2^127 an independent pair
+// would need. `topBitsMatch` itself was already exhaustively unit-tested
+// above (byte-exact at the 100-bit boundary); this is the missing half --
+// confirming there is no OTHER guard anywhere in the module that would
+// catch a collision if that one call site were ever bypassed.
+test "isProbablePrime rejects known base-2 strong pseudoprimes at the real mr_rounds (F7 m7, confirmed not refuted)" {
+    const pseudoprimes_base2 = [_]u32{ 2047, 3277, 4033, 4681, 8321, 15841, 29341, 42799, 49141, 52633, 65281, 74665, 80581, 85489, 88357, 90751 };
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const random = prng.random();
+    for (pseudoprimes_base2) |pp| {
+        const pb = std.mem.toBytes(std.mem.nativeToBig(u32, pp));
+        const m = Modulus.fromBytes(&pb, .big) catch unreachable;
+        var seed: usize = 0;
+        while (seed < 5) : (seed += 1) { // several independent draws per value
+            try testing.expect(!isProbablePrime(m, random)); // mr_rounds=64 sees through it every time
+        }
+    }
+}
+
+test "fromPrimes' structural self-check alone does NOT catch a base-2 strong pseudoprime (F7 m7, the gap m64-round isProbablePrime guards against)" {
+    const pb = std.mem.toBytes(std.mem.nativeToBig(u32, @as(u32, 2047))); // 23 * 89, composite
+    const kp = try fromPrimes(&pb, &kat_q); // ACCEPTED -- this is the finding, not a bug to fix here
+    try testing.expectEqual(@as(usize, 16), kp.public.n.bits());
+
+    // And the resulting "key" is silently wrong for some plaintexts, same
+    // shape as F10's composite-factor finding.
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const random = prng.random();
+    var mismatches: usize = 0;
+    var m_val: u16 = 0;
+    while (m_val < 20) : (m_val += 1) {
+        const m_fe = try Fe.fromPrimitive(u16, kp.public.n_sq, m_val);
+        const c = try encryptRandom(kp.public, m_fe, random);
+        const got = decrypt(kp.secret, c) catch {
+            mismatches += 1;
+            continue;
+        };
+        if ((got.toPrimitive(u16) catch 0xffff) != m_val) mismatches += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), mismatches); // m=4 and m=16, pinned
+}
+
+test "fromPrimes has no closeness defense: two Fermat-factorably-close primes are accepted (F7 m8, confirmed not refuted)" {
+    // Two DISTINCT, genuinely prime, adjacent-ish 128-bit values found by
+    // linear search from a fixed seed (deterministic: the search AND every
+    // isProbablePrime witness draw both come from the same seeded prng).
+    const half_bytes = 16; // 128 bits
+    var seed_buf: [half_bytes]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x8899);
+    const random = prng.random();
+    random.bytes(&seed_buf);
+    seed_buf[0] |= 0xc0; // top two bits set, same convention as generatePrime
+    seed_buf[half_bytes - 1] |= 1; // odd
+
+    var candidate = seed_buf;
+    var p_bytes: [half_bytes]u8 = undefined;
+    var q_bytes: [half_bytes]u8 = undefined;
+    var gap_steps: u64 = 0;
+    var found: u2 = 0;
+    var steps: u64 = 0;
+    while (found < 2 and steps < 2_000_000) : (steps += 1) {
+        const m = Modulus.fromBytes(&candidate, .big) catch unreachable;
+        if (isProbablePrime(m, random)) {
+            if (found == 0) {
+                p_bytes = candidate;
+                found = 1;
+            } else {
+                q_bytes = candidate;
+                found = 2;
+                break;
+            }
+        }
+        var carry: u16 = 2; // candidate += 2, staying odd
+        var i: usize = candidate.len;
+        while (i > 0 and carry != 0) {
+            i -= 1;
+            const sum = @as(u16, candidate[i]) + carry;
+            candidate[i] = @truncate(sum);
+            carry = sum >> 8;
+        }
+        if (found == 1) gap_steps += 1;
+    }
+    try testing.expectEqual(@as(u2, 2), found);
+    try testing.expect(gap_steps < 10_000); // a magnitude 2^28 below the 100-bit closeness threshold at this size
+    try testing.expect(topBitsMatch(&p_bytes, &q_bytes)); // exactly what generate()'s call site checks before accepting q
+
+    const kp = try fromPrimes(&p_bytes, &q_bytes); // ACCEPTED -- the finding: nothing else in the module refuses this
+    try testing.expectEqual(@as(usize, half_bytes * 2 * 8), kp.public.n.bits());
+}
+
+// F7's fifth named mutation, `m14` (delete `n_bytes.len > modulus_bytes`
+// from `PublicKey`/`SecretKey.fromBytesImpl`): REFUTED, same class as
+// m9/m10/m11. `stripLeadingZeros` runs first, so a stripped `n_bytes.len`
+// over `modulus_bytes` (256) always means an actual bit length >= 2049 (a
+// 257th byte cannot be all-zero after stripping) -- whose square needs
+// >= 4098 bits, over `max_bits` (4096). `squareModulus`'s own `Overflow`
+// check (unconditional, computed before any explicit length bound could
+// matter) therefore always fires first; measured directly by calling
+// `squareModulus` on a 260-byte all-0xff value the same way
+// `fromBytesImpl` would reach it with the explicit bound deleted.
+test "squareModulus's Overflow independently catches what the explicit length bound catches (F7 m14, refuted)" {
+    var oversized: [modulus_bytes + 4]u8 = undefined; // 260 bytes = 2080 bits
+    @memset(&oversized, 0xff);
+    try testing.expectError(error.Overflow, squareModulus(&oversized));
+    try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(&oversized, null));
+}
+
 test "fromPrimes rejects composite factors that pass every earlier structural check (F7/F10, m11 refuted)" {
     // p=15 (=3*5), q=91 (=7*13): both composite, p != q, both >= 3, n=1365
     // is odd and well within modulus_bits — every check *before* the
