@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** (3) — A1 fix campaign, third wave on `http`: `conneg.negotiate` (G7),
+  performance only, no observable change. It used to re-walk the WHOLE `Accept` header once
+  PER offer, so one call cost O(offers × header length) — measured by the audit at
+  ~550-598 µs/call for an 8-offer server against a 1000-range header (~550× a 1-range
+  header), scaling linearly in offer count (8.0-9.1× between 1 and 8 offers) at flat
+  per-(range × offer) cost. Since `offers` is the server's own short, code-defined list
+  (unlike the header, which is attacker-sized), the header is now walked EXACTLY ONCE for up
+  to 32 offers, scoring every offer per range as it goes (`negotiateOffersFast`); above that
+  bound, the original per-offer rescan (`negotiateOffersSlow`) still runs, so correctness
+  never depends on the bound holding — same winner, same weight, in every case, just fewer
+  header parses. Opt-in `HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast`
+  measured on this machine (1000 ranges, 8 offers, 22 779 B header): 136 µs/call fast path
+  vs. 884 µs/call slow path — 6.5×, same order as the audit's own ~8× on a shorter header.
+  Verified with a mutant (the fast path's tracker-update condition forced to `false`): 7
+  crashed + 1 failed of the existing `negotiate*` test suite, plus the new differential test
+  added alongside this fix; reverted, 511/512 (1 skip = the opt-in bench). `negotiateLanguage`
+  and `negotiateEncoding` have the identical shape (flagged by the audit as such) and were
+  NOT touched this session — same fix applies, left for a future pass.
+
 - **2026-09-10 (2)** — A1 fix campaign, second wave on `http`: three shipped resource-limit
   defaults had their VALUE pinned by a test for the first time (G8) — `range.default_max_ranges`
   (16), `multipart.Limits.max_parts` (1000) and `.max_header_bytes` (16 KiB), and
