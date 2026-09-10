@@ -273,3 +273,72 @@ test "sse: invalid event/id/comment fields are rejected before writing" {
     var body_buf: [256]u8 = undefined;
     try testing.expectEqualStrings("data: ok\n\n", dechunk(raw, &body_buf));
 }
+
+// ── G10: does an empty-data event actually reach the client? ────────────────
+//
+// A1 audit G10 (`~/CML/20260901-zig-libs-audit/A1/http.md`) worried that
+// `Event{ .data = "" }` produces `data:\n`, and read from memory (network was
+// unavailable to that fixer) that a conformant `EventSource` silently DROPS
+// an event whose data buffer is empty, while still advancing
+// `lastEventId` — so `es.send(.{ .event = "ping", .id = "7" })` would look
+// sent but never arrive. **Verified against the live WHATWG HTML spec,
+// "server-sent events" §9.2.6, fetched 2026-09-10** (network was available
+// this session): the "process the field" steps for a `data` field are
+// *"Append the field value to the data buffer, then append a single U+000A
+// LINE FEED (LF) character to the data buffer"* — unconditional, even for an
+// empty field value. So ONE `data:` line (empty value) already makes the
+// client's data buffer `"\n"`, which is NOT the empty string, so the
+// dispatch algorithm's early return — *"If the data buffer is an empty
+// string, set the data buffer and the event type buffer to the empty string
+// and return"*, the step that actually drops an event — never fires; the
+// event dispatches with `data` trimmed back to `""`. `writeDataLine`'s
+// `line.len == 0` branch means `writeEvent` always emits exactly one `data:`
+// line, even for `Event{ .data = "" }`, so this module can never produce the
+// shape the early return is actually for (an event with ZERO `data:` lines
+// at all, e.g. only `event:`/`id:`). **G10 is refuted, not a defect.**
+/// A minimal client-side re-implementation of the WHATWG "dispatch the
+/// event" bookkeeping (HTML §9.2.6) — just enough to answer one question:
+/// given the wire bytes one `writeEvent` call produced, does a conformant
+/// `EventSource` actually dispatch a "message" event, and with what `data`
+/// length? `null` means the spec's early return fired (event silently NOT
+/// delivered); otherwise the length of `data` after the trailing-LF trim.
+fn clientDispatchedDataLen(wire: []const u8) ?usize {
+    var buf: [256]u8 = undefined;
+    var n: usize = 0;
+    var saw_data_field = false; // <=> the spec's "data buffer" is non-empty
+    var lines = std.mem.splitScalar(u8, wire, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0) break; // blank line: end of this event's fields
+        const colon = std.mem.indexOfScalar(u8, line, ':');
+        const field = if (colon) |i| line[0..i] else line;
+        var value = if (colon) |i| line[i + 1 ..] else "";
+        if (value.len > 0 and value[0] == ' ') value = value[1..];
+        if (std.mem.eql(u8, field, "data")) {
+            saw_data_field = true;
+            @memcpy(buf[n..][0..value.len], value);
+            n += value.len;
+            buf[n] = '\n';
+            n += 1;
+        }
+    }
+    if (!saw_data_field) return null;
+    return n - 1; // spec: drop the data buffer's trailing LF before dispatch
+}
+
+test "sse G10: writeEvent's mandatory empty `data:` line makes an empty-data event actually dispatch" {
+    var wire_buf: [64]u8 = undefined;
+    var w: Writer = .fixed(&wire_buf);
+    try writeEvent(&w, .{ .id = "7", .data = "" });
+    const dispatched = clientDispatchedDataLen(w.buffered());
+    try testing.expect(dispatched != null); // NOT silently dropped
+    try testing.expectEqual(@as(usize, 0), dispatched.?); // data == ""
+}
+
+test "sse G10: an event with NO data field at all is what the spec's early return is actually for" {
+    // `writeEvent` cannot produce this shape (it always emits a data: line);
+    // this only pins the reference simulator against the early-return
+    // branch G10 mistook `Event{ .data = "" }` for.
+    const wire = "event: ping\r\nid: 7\r\n\r\n";
+    try testing.expect(clientDispatchedDataLen(wire) == null);
+}

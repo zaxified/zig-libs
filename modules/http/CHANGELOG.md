@@ -5,6 +5,58 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** (4) — A1 fix campaign, fourth wave on `http`, five findings:
+  - **G7 remainder** — `negotiateLanguage`/`negotiateEncoding` had the identical
+    O(tags/codings × header length) shape `negotiate` was fixed for last wave, flagged
+    then as "not touched this session". Same fix, same shape:
+    `negotiateLanguageFast`/`negotiateEncodingFast` walk the header exactly once for up
+    to 32 tags/codings, scoring every one as they go; above that bound the original
+    per-tag/per-coding rescan (`*Slow`) still runs. Differential tests pin fast == slow
+    on every case, plus the >32 fallback. Opt-in bench (`HTTP_BENCH_G7=1`): language
+    ~95-100 µs/call fast vs. ~523 µs/call slow (~5.3×); encoding ~79-81 µs/call fast vs.
+    ~583 µs/call slow (~7.3×) — same order as `negotiate`'s own 6.5×. Verified with the
+    same mutant-on-the-tracker-condition technique as G7: RED (existing tests crash/fail)
+    → revert → GREEN.
+  - **G6** — `range.apply` bounded the NUMBER of ranges (`default_max_ranges`, 16) but
+    not the bytes they cover: a handful of overlapping/repeated ranges still multiplies
+    the served representation (audit measured 16× from 53 request bytes). New
+    `range.applyBounded(req, rw, total, out, max_bytes: ?u64)` adds an opt-in byte-sum
+    cap on top of `apply`'s existing behavior — `apply` itself is unchanged (calls
+    `applyBounded(..., null)` internally, reproducing its exact historical behavior). A
+    set whose summed byte length exceeds the cap falls back to `.no_range` (plain 200,
+    whole representation) rather than 416. RED (cap check forced to `false`): the new
+    "falls back" test fails; GREEN after revert.
+  - **F11** — a stream with HEADERS but no END_STREAM (no body, never dispatched to a
+    handler) occupied its `max_concurrent_streams` slot forever; 100 such streams on one
+    connection permanently refused every new request. New opt-in
+    `Limits.evict_idle_streams_on_capacity` (default `false` = today's exact behavior):
+    when the jobs map is full and a new stream arrives, evict the OLDEST job that has
+    made no progress at all (no body bytes, never dispatched, not complete) with
+    RST_STREAM(REFUSED_STREAM) — retryable per §8.7, since nothing was processed on it —
+    before refusing the new stream. A stream that received even one body byte, or is
+    already dispatched, is never a candidate. Three new tests: default-false is
+    unchanged, eviction picks the oldest idle stream (not just any), and a stream with
+    body progress is never evicted in favor of a genuinely idle one. Each RED (mutating
+    the opt-in gate, then the candidate filter) → GREEN on revert.
+  - **G10 — REFUTED, not a defect.** The prior pass worried (from memory; network was
+    unavailable then) that a conformant `EventSource` silently drops an event whose
+    `data` is empty. Verified against the live WHATWG HTML spec, "server-sent events"
+    §9.2.6 (fetched 2026-09-10, network available this session): the `data` field's
+    processing step unconditionally appends a LF to the client's data buffer, even for
+    an empty field value — so a lone `data:\n` line (what `writeDataLine` already emits
+    for `Event{ .data = "" }`) makes that buffer `"\n"`, not the empty string, so the
+    dispatch algorithm's actual empty-buffer early return never fires. Added two tests:
+    a small reference re-implementation of the client's dispatch bookkeeping shows an
+    empty-data event DOES dispatch (data == ""), and that the early return is for a
+    DIFFERENT shape this module cannot even produce (zero `data:` lines at all).
+    Demonstrated the tests are meaningful by mutating `writeDataLine` to skip the empty
+    line entirely (i.e. reproducing the shape the audit worried about) — RED, 2 failures
+    including a pre-existing golden test — then reverting to GREEN.
+
+  `scripts/modtest http`: 523/526 (3 skip = opt-in G7 benches), Debug;
+  `scripts/modtest http -Doptimize=ReleaseSafe`: 523/526;
+  `HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast`: 518/518 (benches unlocked).
+
 - **2026-09-10** (3) — A1 fix campaign, third wave on `http`: `conneg.negotiate` (G7),
   performance only, no observable change. It used to re-walk the WHOLE `Accept` header once
   PER offer, so one call cost O(offers × header length) — measured by the audit at

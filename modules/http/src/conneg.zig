@@ -469,8 +469,56 @@ pub fn negotiateLanguage(header: []const u8, tags: []const []const u8) ?Negotiat
         return .{ .index = 0, .media_type = tags[0], .weight = q_default };
     }
 
-    // Step B — score each tag independently by the most specific matching
-    // range, then keep the highest-weight acceptable tag (ties → earliest).
+    // audit G7 (remainder): same O(tags x header length) shape `negotiate`
+    // had before the fix above — one full `header` walk PER tag. `tags` is
+    // the server's own short, code-defined list (unlike the header, which is
+    // attacker-sized), so below `offer_track_max` the header is walked
+    // EXACTLY ONCE, scoring every tag per range as it goes. Above the bound,
+    // `negotiateLanguageSlow` is the original per-tag rescan, so correctness
+    // never depends on the bound holding.
+    const offer_track_max = 32;
+    if (tags.len <= offer_track_max) {
+        return negotiateLanguageFast(header, tags);
+    }
+    return negotiateLanguageSlow(header, tags);
+}
+
+/// One pass over `header`, tracking each tag's best-matching range as it
+/// goes. Requires `tags.len <= offer_track_max` (the caller checks).
+fn negotiateLanguageFast(header: []const u8, tags: []const []const u8) ?Negotiated {
+    const offer_track_max = 32;
+    var matched: [offer_track_max]bool = @splat(false);
+    var spec: [offer_track_max]i16 = @splat(-1);
+    var weight: [offer_track_max]u16 = @splat(0);
+
+    var it = tokenList(header);
+    while (it.next()) |wt| {
+        const s: i16 = subtagCount(wt.token);
+        for (tags, 0..) |tag, i| {
+            if (!languageMatches(wt.token, tag)) continue;
+            if (!matched[i] or s > spec[i] or (s == spec[i] and wt.weight > weight[i])) {
+                matched[i] = true;
+                spec[i] = s;
+                weight[i] = wt.weight;
+            }
+        }
+    }
+
+    var best: ?Negotiated = null;
+    for (tags, 0..) |tag, i| {
+        if (!matched[i] or weight[i] == 0) continue; // unacceptable (no match / q=0)
+        // Keep the highest-weight tag; ties → earliest (so strict >).
+        if (best == null or weight[i] > best.?.weight) {
+            best = .{ .index = i, .media_type = tag, .weight = weight[i] };
+        }
+    }
+    return best;
+}
+
+/// The original algorithm: re-walks `header` once per tag. Kept as the exact
+/// fallback for `tags.len > offer_track_max`, and as the known-correct
+/// reference the fast path is tested against.
+fn negotiateLanguageSlow(header: []const u8, tags: []const []const u8) ?Negotiated {
     var best: ?Negotiated = null;
     for (tags, 0..) |tag, i| {
         // Find this tag's best-matching range: highest specificity, then
@@ -545,6 +593,68 @@ pub fn encodingQuality(header: []const u8, coding: []const u8) ?u16 {
 /// serves `identity`, which is itself acceptable unless the header forbade it —
 /// test with `encodingQuality(header, "identity")`).
 pub fn negotiateEncoding(header: []const u8, codings: []const []const u8) ?Negotiated {
+    // audit G7 (remainder): same O(codings x header length) shape `negotiate`
+    // had before the fix above — one full `header` walk (inside
+    // `encodingQuality`) PER coding. `codings` is the server's own short,
+    // code-defined list (unlike the header, which is attacker-sized), so
+    // below `offer_track_max` the header is walked EXACTLY ONCE, scoring
+    // every coding as it goes. Above the bound, `negotiateEncodingSlow` is
+    // the original per-coding `encodingQuality` call, so correctness never
+    // depends on the bound holding.
+    const offer_track_max = 32;
+    if (codings.len <= offer_track_max) {
+        return negotiateEncodingFast(header, codings);
+    }
+    return negotiateEncodingSlow(header, codings);
+}
+
+/// One pass over `header`, tracking each coding's explicit (exact-token)
+/// weight and the shared `*` weight as it goes, then applying the same
+/// scoring rules as `encodingQuality` per coding. Requires
+/// `codings.len <= offer_track_max` (the caller checks).
+fn negotiateEncodingFast(header: []const u8, codings: []const []const u8) ?Negotiated {
+    const offer_track_max = 32;
+    var explicit: [offer_track_max]?u16 = @splat(null);
+    var star: ?u16 = null;
+    var any = false;
+
+    var it = tokenList(header);
+    while (it.next()) |wt| {
+        any = true;
+        if (std.mem.eql(u8, wt.token, "*")) {
+            if (star == null) star = wt.weight;
+            continue;
+        }
+        for (codings, 0..) |coding, i| {
+            if (explicit[i] == null and std.ascii.eqlIgnoreCase(wt.token, coding)) {
+                explicit[i] = wt.weight;
+            }
+        }
+    }
+
+    var best: ?Negotiated = null;
+    for (codings, 0..) |coding, i| {
+        const q: ?u16 = blk: {
+            if (!any) break :blk q_default; // empty/absent header -> accept anything
+            if (explicit[i]) |w| break :blk if (w > 0) w else null;
+            if (star) |w| break :blk if (w > 0) w else null;
+            if (std.ascii.eqlIgnoreCase(coding, "identity")) break :blk q_default;
+            break :blk null;
+        };
+        const w = q orelse continue;
+        if (w == 0) continue; // q=0 already nulled above, but be safe
+        if (best == null or w > best.?.weight) {
+            best = .{ .index = i, .media_type = coding, .weight = w };
+        }
+    }
+    return best;
+}
+
+/// The original algorithm: calls `encodingQuality` (one full `header` walk)
+/// once per coding. Kept as the exact fallback for `codings.len >
+/// offer_track_max`, and as the known-correct reference the fast path is
+/// tested against.
+fn negotiateEncodingSlow(header: []const u8, codings: []const []const u8) ?Negotiated {
     var best: ?Negotiated = null;
     for (codings, 0..) |coding, i| {
         const q = encodingQuality(header, coding) orelse continue;
@@ -1166,6 +1276,88 @@ test "negotiateEncoding: empty header -> first offer at q_default" {
     try testing.expectEqual(q_default, n.weight);
 }
 
+// audit G7 (remainder): `negotiateLanguage` used to re-walk the whole header
+// once PER tag, same shape as `negotiate` before its fix above.
+// `negotiateLanguageFast` walks it once total. These pin that the fast path
+// and the original (now the >32-tag fallback, `negotiateLanguageSlow`) agree
+// on every case already covered above PLUS shapes that stress the rewrite
+// specifically: multiple tags, specificity ties, weight ties, and
+// unmatched/`q=0` tags mixed in.
+test "negotiateLanguage G7: the single-pass fast path agrees with the original per-tag rescan" {
+    const cases = [_]struct { header: []const u8, tags: []const []const u8 }{
+        .{ .header = "en-US", .tags = &.{"en-US"} },
+        .{ .header = "en;q=0.5, en-US;q=0.9", .tags = &.{ "en-US", "en-GB" } },
+        .{ .header = "de;q=0.9, en;q=0.4", .tags = &.{ "en", "de" } },
+        .{ .header = "*", .tags = &.{ "fr", "de" } }, // weight tie -> earliest tag
+        .{ .header = "en, en-US;q=0", .tags = &.{ "en-US", "en-GB" } }, // q=0 excludes one
+        .{ .header = "fr, de;q=0.5", .tags = &.{"en"} }, // no match at all
+        .{ .header = "", .tags = &.{ "en", "de" } }, // empty header short-circuits before either path
+    };
+    for (cases) |c| {
+        const fast = negotiateLanguageFast(c.header, c.tags);
+        const slow = negotiateLanguageSlow(c.header, c.tags);
+        try testing.expectEqual(slow == null, fast == null);
+        if (fast) |f| {
+            try testing.expectEqual(slow.?.index, f.index);
+            try testing.expectEqualStrings(slow.?.media_type, f.media_type);
+            try testing.expectEqual(slow.?.weight, f.weight);
+        }
+    }
+}
+
+test "negotiateLanguage G7: tags.len over the fast-path bound still negotiates correctly (the slow fallback)" {
+    // 33 tags > offer_track_max (32) -- forces `negotiateLanguage` itself
+    // down the `negotiateLanguageSlow` branch, not just the two helpers
+    // directly.
+    var buf: [33][]const u8 = undefined;
+    for (&buf, 0..) |*t, i| t.* = if (i == 20) "en-US" else "de";
+    const n = negotiateLanguage("en-US;q=1.0, *;q=0.1", &buf).?;
+    try testing.expectEqual(@as(usize, 20), n.index);
+    try testing.expectEqualStrings("en-US", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
+// audit G7 (remainder): `negotiateEncoding` used to call `encodingQuality`
+// (one full header walk) once PER coding, same shape as `negotiate` before
+// its fix above. `negotiateEncodingFast` walks the header once total. These
+// pin that the fast path and the original (now the >32-coding fallback,
+// `negotiateEncodingSlow`) agree on every case already covered above PLUS
+// shapes that stress the rewrite specifically: multiple codings, explicit
+// vs. `*` weights, implicit identity, and unmatched/`q=0` codings mixed in.
+test "negotiateEncoding G7: the single-pass fast path agrees with the original per-coding rescan" {
+    const cases = [_]struct { header: []const u8, codings: []const []const u8 }{
+        .{ .header = "br;q=1, gzip;q=0.5", .codings = &.{ "gzip", "br" } },
+        .{ .header = "gzip, *;q=0", .codings = &.{ "br", "gzip" } },
+        .{ .header = "*;q=0", .codings = &.{ "gzip", "br" } }, // nothing acceptable
+        .{ .header = "deflate", .codings = &.{ "gzip", "br" } }, // no match, no identity offered
+        .{ .header = "*", .codings = &.{ "br", "gzip" } }, // weight tie -> earliest coding
+        .{ .header = "", .codings = &.{ "gzip", "br" } }, // empty header accepts anything
+        .{ .header = "gzip;q=0.5, *;q=0.3", .codings = &.{ "gzip", "br", "identity" } },
+    };
+    for (cases) |c| {
+        const fast = negotiateEncodingFast(c.header, c.codings);
+        const slow = negotiateEncodingSlow(c.header, c.codings);
+        try testing.expectEqual(slow == null, fast == null);
+        if (fast) |f| {
+            try testing.expectEqual(slow.?.index, f.index);
+            try testing.expectEqualStrings(slow.?.media_type, f.media_type);
+            try testing.expectEqual(slow.?.weight, f.weight);
+        }
+    }
+}
+
+test "negotiateEncoding G7: codings.len over the fast-path bound still negotiates correctly (the slow fallback)" {
+    // 33 codings > offer_track_max (32) -- forces `negotiateEncoding` itself
+    // down the `negotiateEncodingSlow` branch, not just the two helpers
+    // directly.
+    var buf: [33][]const u8 = undefined;
+    for (&buf, 0..) |*c, i| c.* = if (i == 20) "br" else "unused-coding";
+    const n = negotiateEncoding("br;q=1.0, *;q=0.1", &buf).?;
+    try testing.expectEqual(@as(usize, 20), n.index);
+    try testing.expectEqualStrings("br", n.media_type);
+    try testing.expectEqual(q_default, n.weight);
+}
+
 fn g7NowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
@@ -1209,5 +1401,73 @@ test "bench (opt-in via HTTP_BENCH_G7): negotiate() is not O(offers) full header
     // 884 us/call -- 6.5x, the same order as the audit's own ~8x on a
     // shorter header. 300 us sits well above the fast path's measured cost
     // while still failing hard on a reversion to the O(offers) rescan.
+    try testing.expect(per_call_ns < 300_000);
+}
+
+test "bench (opt-in via HTTP_BENCH_G7): negotiateLanguage() is not O(tags) full header rescans" {
+    // G7 remainder: same shape as `negotiate` above, applied to
+    // `negotiateLanguage`. Same header size/shape (1000 ranges), 8 tags.
+    // Run with:
+    //   HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_G7") == null) return error.SkipZigTest;
+
+    var buf: std.ArrayList(u8) = .empty;
+    const gpa = testing.allocator;
+    defer buf.deinit(gpa);
+    for (0..1000) |i| {
+        if (i != 0) try buf.append(gpa, ',');
+        var elem_buf: [16]u8 = undefined;
+        const elem = std.fmt.bufPrint(&elem_buf, "lang{d};q=0.{d}", .{ i, 100 + (i % 900) }) catch unreachable;
+        try buf.appendSlice(gpa, elem);
+    }
+    const tags = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "lang999" };
+
+    const iters = 1000;
+    const start = g7NowNs();
+    for (0..iters) |_| std.mem.doNotOptimizeAway(negotiateLanguage(buf.items, &tags));
+    const elapsed = g7NowNs() - start;
+    const per_call_ns = elapsed / iters;
+
+    std.debug.print("G7 negotiateLanguage bench: {d} ns/call over {d} iters ({d} B header, {d} tags)\n", .{ per_call_ns, iters, buf.items.len, tags.len });
+    // Measured on this machine, same shape as above (1000 ranges, 8 tags,
+    // 15 889 B header): single-pass ~95-100 us/call, the old per-tag rescan
+    // (`negotiateLanguageSlow`, measured directly, not restored via
+    // mutation) ~523 us/call -- ~5.3x. 300 us sits well above the fast
+    // path's measured cost while still failing hard on a reversion to the
+    // O(tags) rescan.
+    try testing.expect(per_call_ns < 300_000);
+}
+
+test "bench (opt-in via HTTP_BENCH_G7): negotiateEncoding() is not O(codings) full header rescans" {
+    // G7 remainder: same shape as `negotiate` above, applied to
+    // `negotiateEncoding`. Same header size/shape (1000 ranges), 8 codings.
+    // Run with:
+    //   HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_G7") == null) return error.SkipZigTest;
+
+    var buf: std.ArrayList(u8) = .empty;
+    const gpa = testing.allocator;
+    defer buf.deinit(gpa);
+    for (0..1000) |i| {
+        if (i != 0) try buf.append(gpa, ',');
+        var elem_buf: [16]u8 = undefined;
+        const elem = std.fmt.bufPrint(&elem_buf, "enc{d};q=0.{d}", .{ i, 100 + (i % 900) }) catch unreachable;
+        try buf.appendSlice(gpa, elem);
+    }
+    const codings = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "enc999" };
+
+    const iters = 1000;
+    const start = g7NowNs();
+    for (0..iters) |_| std.mem.doNotOptimizeAway(negotiateEncoding(buf.items, &codings));
+    const elapsed = g7NowNs() - start;
+    const per_call_ns = elapsed / iters;
+
+    std.debug.print("G7 negotiateEncoding bench: {d} ns/call over {d} iters ({d} B header, {d} codings)\n", .{ per_call_ns, iters, buf.items.len, codings.len });
+    // Measured on this machine, same shape as above (1000 ranges, 8
+    // codings, 14 889 B header): single-pass ~79-81 us/call, the old
+    // per-coding rescan (`negotiateEncodingSlow`, measured directly, not
+    // restored via mutation) ~583 us/call -- ~7.3x. 300 us sits well above
+    // the fast path's measured cost while still failing hard on a
+    // reversion to the O(codings) rescan.
     try testing.expect(per_call_ns < 300_000);
 }
