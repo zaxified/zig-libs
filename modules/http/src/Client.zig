@@ -2231,6 +2231,15 @@ test "redirect chain on fabricated responses" {
     try testing.expectEqual(@as(?http.Method, null), http.redirectMethodFor(head3.status, method2));
 }
 
+test "Options.max_redirects default is 10 (G8) — the cap-on-the-chain mechanism was verified, not this value" {
+    // A1 audit G8 (2026-09-04): mutating this literal 10 -> 255 left the
+    // suite green — the existing coverage (`redirects` counted outside the
+    // hop loop, `TooManyRedirects` at `Client.zig:448`/`:561`) exercises the
+    // MECHANISM with its own small `redirects`/cap values, never this
+    // shipped default.
+    try testing.expectEqual(@as(u8, 10), (Options{}).max_redirects);
+}
+
 test "setupBody framing decisions on fabricated heads" {
     // Fabricate a Conn without a socket — only the fields setupBody and the
     // body readers touch.

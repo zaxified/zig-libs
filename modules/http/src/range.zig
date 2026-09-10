@@ -671,6 +671,21 @@ test "TooManyRanges via a small out buffer" {
     try testing.expectEqual(@as(usize, 2), specs.len);
 }
 
+test "default_max_ranges is 16, and is what a `[default_max_ranges]ByteRangeSpec` caller actually gets (G8)" {
+    // A1 audit G8 (2026-09-04): mutating this literal up by four orders of
+    // magnitude (16 -> 100_000) left the suite green -- every existing test
+    // sizes its own `out` buffer explicitly instead of using the constant a
+    // caller like `MultipartRanges` (range.zig) actually declares its buffer
+    // with. This is also the one number that bounds G6's per-range-count
+    // amplification (overlapping ranges still multiply per accepted range).
+    try testing.expectEqual(@as(usize, 16), default_max_ranges);
+    var buf: [default_max_ranges]ByteRangeSpec = undefined;
+    const sixteen = "bytes=0-0,1-1,2-2,3-3,4-4,5-5,6-6,7-7,8-8,9-9,10-10,11-11,12-12,13-13,14-14,15-15";
+    const specs = try parse(sixteen, &buf);
+    try testing.expectEqual(@as(usize, 16), specs.len);
+    try testing.expectError(error.TooManyRanges, parse(sixteen ++ ",16-16", &buf));
+}
+
 // ── fuzz: Range header parse, never panic on arbitrary bytes ───────────────
 //
 // `parse` is the untrusted-wire entry point (§2.1's `byte-ranges-specifier`

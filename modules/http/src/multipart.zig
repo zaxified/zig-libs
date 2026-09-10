@@ -343,6 +343,18 @@ test "limits: max_parts → TooManyParts; header block → HeadersTooLarge" {
     try testing.expectError(error.HeadersTooLarge, it2.next());
 }
 
+test "Limits defaults are pinned (G8) — the mechanism above was tested, not the shipped values" {
+    // A1 audit G8 (2026-09-04): mutating these two DEFAULT literals up by
+    // 5-8 orders of magnitude (max_parts 1000 -> 100_000_000, max_header_bytes
+    // 16 KiB -> 1 TiB) left the whole suite green, because every test above
+    // passes an explicit override instead of exercising `Limits{}`. `G6`'s
+    // amplification (a `Range` header that multiplies the represented body)
+    // and this module's own DoS surface both lean on these two numbers being
+    // what SPEC.md says they are.
+    try testing.expectEqual(@as(usize, 1000), (Limits{}).max_parts);
+    try testing.expectEqual(@as(usize, 16 * 1024), (Limits{}).max_header_bytes);
+}
+
 test "malformed bodies → MalformedBody" {
     // No opening delimiter at all.
     var it1 = parse("no delimiter here", test_boundary, .{});

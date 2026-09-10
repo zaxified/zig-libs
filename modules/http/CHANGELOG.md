@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10 (2)** — A1 fix campaign, second wave on `http`: three shipped resource-limit
+  defaults had their VALUE pinned by a test for the first time (G8) — `range.default_max_ranges`
+  (16), `multipart.Limits.max_parts` (1000) and `.max_header_bytes` (16 KiB), and
+  `Client.Options.max_redirects` (10). Each had its enforcement MECHANISM already tested with an
+  explicit override, but no test exercised the actual shipped default, so mutating the literal by
+  4-8 orders of magnitude (verified against each: `default_max_ranges` -> 32, `max_parts` ->
+  100_000_000, `max_header_bytes` -> 1 TiB, `max_redirects` -> 255) left the whole suite green.
+  No behavior changed — this only adds coverage.
 - **2026-09-10** — A1 fix campaign, first wave on `http`: four previously-unguarded
   guards now have regression tests (request_timeout_ms's whole-request deadline, F6;
   chunk-size overflow guard, F9; h2's strict content-length parse, F10; per-stream
