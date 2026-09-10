@@ -80,6 +80,30 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   driving the Reed-Muller/Reed-Solomon decode path) — `zig build check-fuzz`
   no longer names this module. No panic/OOB found; **neither breaking nor
   behavioural**.
+- **2026-07-21** — Verification: an independent external anchor for the
+  Reed-Solomon corrector (constant-time Berlekamp-Massey → Gao-Mateer
+  additive-FFT root-finding → Forney), which until now was validated only
+  by self-consistent round-trips. Adds an independent syndrome oracle
+  (`S_i = Σ c_j·α^{(i+1)j}`, computed separately from the module's own
+  `computeSyndromes`) plus four tests: independent-syndrome validity
+  (all three parameter sets), a closed-form single-error Peterson anchor
+  (recovers an injected position/value by textbook formulas — a different
+  construction than BM/FFT/Forney), a delta-capacity positive control
+  (exactly δ errors, confirmed RED for a neutered decode before this
+  landed), and a beyond-capacity determinism check. No production code
+  changed; test-only.
+- **2026-07-19** — **Performance: `gf2x.mul` is CLMUL+Karatsuba, not
+  schoolbook, ~22-42x faster on `encaps`/`decaps`.** The portable
+  shift-and-mask-xor multiply (`mulPortable`, O(n²/64)) is now the
+  fallback for non-x86_64/non-pclmul targets and the correctness oracle a
+  differential test pins the new path against; on every x86_64+pclmul
+  host (i.e. what this module actually ships on) `mul` dispatches to a
+  recursive Karatsuba multiply over a `pclmulqdq`-based 64×64→127-bit
+  carryless base multiply. Bit-for-bit identical output (KAT suite
+  unchanged, plus the new differential test). ⚠ **This entry was missing
+  until 2026-09-10** (audit A1 finding `hqc` L5) — `SPEC.md` also
+  described only the old schoolbook path for seven weeks after this
+  landed; both are corrected together, see `SPEC.md`'s "Design" section.
 - **2026-07-18** — Security audit: two findings fixed (part of the collection-wide
   audit; the root changelog records no further detail than this). Verified: Byte-exact
   vs official NIST v5.0.0 `.rsp` (`kat_vectors_kem.zig`, curl-fetched from `pqc-hqc/hqc`

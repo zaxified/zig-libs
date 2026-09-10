@@ -72,21 +72,26 @@ pub fn Pke(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         ///   dk_pke = seed_dk
         pub fn keygen(seed: *const [params.seed_bytes]u8) KeyPair {
             var keypair_seed: [64]u8 = undefined;
+            defer std.crypto.secureZero(u8, &keypair_seed);
             prng.hashI(&keypair_seed, seed);
             const seed_dk = keypair_seed[0..params.seed_bytes];
             const seed_ek = keypair_seed[params.seed_bytes..64];
 
             var dk_xof = prng.Xof.init(seed_dk);
             var y_support: [p.omega]u32 = undefined;
+            defer std.crypto.secureZero(u32, &y_support);
             prng.sampleFixedWeightRejection(&dk_xof, p.n, p.nMu(), p.rejectionThreshold(), p.omega, &y_support);
             var y = Ring.zero;
+            defer std.crypto.secureZero(u64, &y);
             prng.writeSupportToVector(p.omega, &y_support, &y);
 
             // x continues the SAME Xof context (not re-initialized) —
             // see module doc.
             var x_support: [p.omega]u32 = undefined;
+            defer std.crypto.secureZero(u32, &x_support);
             prng.sampleFixedWeightRejection(&dk_xof, p.n, p.nMu(), p.rejectionThreshold(), p.omega, &x_support);
             var x = Ring.zero;
+            defer std.crypto.secureZero(u64, &x);
             prng.writeSupportToVector(p.omega, &x_support, &x);
 
             var ek_xof = prng.Xof.init(seed_ek);
@@ -121,6 +126,7 @@ pub fn Pke(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         fn dkParse(dk: DecKey) Ring.Elem {
             var dk_xof = prng.Xof.init(&dk);
             var y_support: [p.omega]u32 = undefined;
+            defer std.crypto.secureZero(u32, &y_support);
             prng.sampleFixedWeightRejection(&dk_xof, p.n, p.nMu(), p.rejectionThreshold(), p.omega, &y_support);
             var y = Ring.zero;
             prng.writeSupportToVector(p.omega, &y_support, &y);
@@ -187,7 +193,8 @@ pub fn Pke(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
         /// hqc_pke_decrypt: `m = C.decode(v - Truncate(u*y))` (spec
         /// §3.5). Over F2, subtraction is XOR, same as addition.
         pub fn decrypt(dk: DecKey, ct: Ciphertext) Message {
-            const y = dkParse(dk);
+            var y = dkParse(dk);
+            defer std.crypto.secureZero(u64, &y);
             const uy = Ring.mul(y, ct.u);
             const trunc_bytes = truncatedBytes(uy);
 

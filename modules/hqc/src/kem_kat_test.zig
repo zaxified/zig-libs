@@ -155,6 +155,155 @@ test "implicit reject: corrupted ciphertext decaps returns a differing, determin
     try testImplicitReject(Kem256, 102);
 }
 
+// ── H2: the FO comparison must depend on every byte of `v`, not just u/salt ─
+//
+// Audit A1 finding `hqc` H2: `vectCompare(&ct_prime, &ct)` can be shrunk to
+// compare only `u` (2209 of 4433 B) or even a single byte of `ct`, and the
+// suite above stayed 75/75 green, because the only corruption it ever tried
+// was a bit inside `u` (`corrupted[0]`) or inside `salt` (the last byte) --
+// never inside `v`. Demonstrated as a real IND-CCA2 break in the audit
+// record (`A1/hqc.md` H2, `repro/hqc/attack.zig`): a ciphertext with one bit
+// flipped inside `v` was accepted as genuine, recovering the real shared
+// secret, once the comparison no longer covered `v`. This test corrupts
+// several positions spread across EACH of the three ciphertext components
+// (u, v, salt) and requires every one of them to be rejected.
+
+fn testImplicitRejectEveryComponent(comptime Kem: type, seed_val: u64) !void {
+    const t = testing;
+    var rng = std.Random.DefaultPrng.init(seed_val);
+    const random = rng.random();
+
+    var seed_kem: [params.seed_bytes]u8 = undefined;
+    random.bytes(&seed_kem);
+    const kp = Kem.keypair(&seed_kem);
+
+    var coins: [Kem.coins_bytes]u8 = undefined;
+    random.bytes(&coins);
+    const enc = Kem.encaps(kp.ek, &coins);
+
+    const u_bytes = Kem.Ring.n_bytes;
+    const v_bytes = Kem.Pke.Code.codeword_len;
+    const ct_len = enc.ct.len;
+    std.debug.assert(u_bytes + v_bytes + params.salt_bytes == ct_len);
+
+    const Range = struct { start: usize, end: usize, name: []const u8 };
+    const ranges = [_]Range{
+        .{ .start = 0, .end = u_bytes, .name = "u" },
+        .{ .start = u_bytes, .end = u_bytes + v_bytes, .name = "v" },
+        .{ .start = u_bytes + v_bytes, .end = ct_len, .name = "salt" },
+    };
+
+    for (ranges) |r| {
+        const span = r.end - r.start;
+        const step = @max(span / 8, 1); // ~8 sampled positions across the component
+        var pos = r.start;
+        while (pos < r.end) : (pos += step) {
+            var corrupted = enc.ct;
+            corrupted[pos] ^= 0x01;
+            const rejected = Kem.decaps(kp.dk, corrupted);
+            t.expect(!std.mem.eql(u8, &rejected, &enc.ss)) catch |err| {
+                std.debug.print("component {s} byte {d}: decaps accepted the corrupted ciphertext as genuine\n", .{ r.name, pos });
+                return err;
+            };
+        }
+    }
+}
+
+test "implicit reject: every ciphertext component (u, v, salt) is covered, not just u/salt" {
+    try testImplicitRejectEveryComponent(Kem128, 200);
+    try testImplicitRejectEveryComponent(Kem192, 201);
+    try testImplicitRejectEveryComponent(Kem256, 202);
+}
+
+// ── H3: the implicit-rejection value has no anchor -- add what black-box
+// coverage is cheaply available ──────────────────────────────────────────
+//
+// Audit A1 finding `hqc` H3: `K_bar = J(H(ek), sigma, ct)` (the implicit-
+// rejection value) has no external KAT vector (the reference's own fixture
+// never exercises the reject path), and the only test touching it before
+// this one checked "differs from the real ss" and "is deterministic" --
+// both of which are ALSO true of `sigma` itself, so a mutant returning
+// `sigma` verbatim (i.e. leaking the long-term rejection secret on every
+// rejected decapsulation) passed 75/75. `A1/hqc.md` recommends, as the
+// cheap partial fix short of a full external anchor for `hashJ`: a test that
+// `K_bar` is not equal to any part of `dk`, and a test that it depends on
+// `ct`. Both below.
+
+fn testImplicitRejectNotSigma(comptime Kem: type, seed_val: u64) !void {
+    const t = testing;
+    var rng = std.Random.DefaultPrng.init(seed_val);
+    const random = rng.random();
+
+    var seed_kem: [params.seed_bytes]u8 = undefined;
+    random.bytes(&seed_kem);
+    const kp = Kem.keypair(&seed_kem);
+
+    var coins: [Kem.coins_bytes]u8 = undefined;
+    random.bytes(&coins);
+    const enc = Kem.encaps(kp.ek, &coins);
+
+    var corrupted = enc.ct;
+    corrupted[0] ^= 0x01;
+    const rejected = Kem.decaps(kp.dk, corrupted);
+
+    // dk_kem = ek || dk_pke(seed_bytes) || sigma(security_bytes) || seed_kem
+    // (kem.zig's `keypair` doc). `sigma` is the implicit-rejection secret;
+    // the rejection value must not simply BE it.
+    const sigma_offset = Kem.ek_bytes + params.seed_bytes;
+    const sigma: [Kem.security_bytes]u8 = kp.dk[sigma_offset..][0..Kem.security_bytes].*;
+    try t.expect(!std.mem.eql(u8, rejected[0..Kem.security_bytes], &sigma));
+}
+
+test "implicit reject: rejection value is not the raw sigma secret" {
+    try testImplicitRejectNotSigma(Kem128, 300);
+    try testImplicitRejectNotSigma(Kem192, 301);
+    try testImplicitRejectNotSigma(Kem256, 302);
+}
+
+fn testImplicitRejectDependsOnCt(comptime Kem: type, seed_val: u64) !void {
+    const t = testing;
+    var rng = std.Random.DefaultPrng.init(seed_val);
+    const random = rng.random();
+
+    var seed_kem: [params.seed_bytes]u8 = undefined;
+    random.bytes(&seed_kem);
+    const kp = Kem.keypair(&seed_kem);
+
+    var coins: [Kem.coins_bytes]u8 = undefined;
+    random.bytes(&coins);
+    const enc = Kem.encaps(kp.ek, &coins);
+
+    const u_bytes = Kem.Ring.n_bytes;
+    const v_bytes = Kem.Pke.Code.codeword_len;
+
+    var corrupt_u = enc.ct;
+    corrupt_u[0] ^= 0x01; // inside u
+    var corrupt_v = enc.ct;
+    corrupt_v[u_bytes] ^= 0x01; // inside v
+    var corrupt_salt = enc.ct;
+    corrupt_salt[u_bytes + v_bytes] ^= 0x01; // inside salt
+
+    const reject_u = Kem.decaps(kp.dk, corrupt_u);
+    const reject_v = Kem.decaps(kp.dk, corrupt_v);
+    const reject_salt = Kem.decaps(kp.dk, corrupt_salt);
+
+    // Three DIFFERENT corrupted ciphertexts must produce three DIFFERENT
+    // rejection values. An honest implementation hashes over the literal
+    // `ct` bytes it was given, so this holds trivially; a mutant that
+    // derives `K_bar` from something that does not vary with `ct` (e.g. a
+    // fixed domain constant, or the re-encrypted `ct'` in a case where
+    // `ct'` happens not to depend on the corrupted byte) would collide here.
+    try t.expect(!std.mem.eql(u8, &reject_u, &reject_v));
+    try t.expect(!std.mem.eql(u8, &reject_v, &reject_salt));
+    try t.expect(!std.mem.eql(u8, &reject_u, &reject_salt));
+}
+
+test "implicit reject: rejection value depends on which ciphertext byte was corrupted" {
+    try testImplicitRejectDependsOnCt(Kem128, 400);
+    try testImplicitRejectDependsOnCt(Kem192, 401);
+    try testImplicitRejectDependsOnCt(Kem256, 402);
+}
+
 // ── fuzz: decaps on arbitrary ciphertext bytes ──────────────────────────
 //
 // `decaps` is the module's untrusted-input entry point: a `Ciphertext`

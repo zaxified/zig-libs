@@ -34,6 +34,22 @@ below). See [README.md](README.md) for purpose and API.
   FN-DSA (header/domain-separation changes, not ring/decoder math
   changes) — Part 3's KAT reproduction targets `v5.0.0` and should be
   revisited if/when a FIPS draft KAT appears.
+
+  ⭐ **This module is deliberately pinned to the `v5.0.0` TAG, not to
+  upstream's `main`/default branch (audit A1 finding `hqc` L4, noted
+  2026-09-10).** `gitlab.com/pqc-hqc/hqc`'s default branch is
+  `next-release`, which as of 2026-08-27 (`2e531c26`, 4 commits past
+  `v5.0.0`) had already changed the fixed-weight sampler ("Update
+  sampling (#15)") and the GF(2^8) polynomial ("Update polynomial used in
+  GF(2^8)") — changes with their own KAT vectors: against that HEAD, only
+  9 of 36 `.rsp` seeds still produce matching pk/sk/ct/ss for this module.
+  A reader who clones upstream without `git checkout v5.0.0` gets vectors
+  that will not match this module and will read as a bug here — it is
+  not one; this module targets the tagged release, and `next-release` is
+  presumably itself heading toward whatever the eventual NIST FIPS draft
+  becomes, which is the revision anticipated above. `zig-libs`'s own
+  `model_after` field in `root.zig`'s `meta` names the tag explicitly for
+  exactly this reason.
 - **KAT source for Part 3**: `kats/ref/hqc-{1,3,5}/PQCkemKAT_*.rsp`
   (fetched via `curl`, not a paraphrasing tool — see
   `kat_vectors_kem.zig`) — the `.rsp` files ship count=0..99
@@ -65,28 +81,53 @@ below). See [README.md](README.md) for purpose and API.
   `vect_set_random`/`vect_print` produce (confirmed byte-exact, see
   Verification below), so no repacking is needed anywhere.
 - **`mul`** implements the spec's convolution product w_k = Σ_{i+j≡k mod
-  n} u_i·v_j directly: for every bit position of `a` (all n of them, not
-  just set ones — see below), XOR a shift-and-mask of `b` into a
-  double-width accumulator, then fold bits [n, 2n−2] back onto [0, n−2]
-  (X^{n+j} ≡ X^j). This is mathematically identical to the reference's
-  word-aligned Toom-Cook/Karatsuba + `pclmul` elementary multiply (spec
-  §3.3, Table 2) but O(n²/64) instead of near-linear — **a deliberate
-  Part-1 simplification**: this is the mechanical ring-arithmetic
-  foundation, not the performance path, and n²/64 is still fast in
-  practice (≈52M word-XORs for the largest parameter set, hqc-256,
-  n=57637 — well under a second even in Debug). A Toom-Cook/Karatsuba
-  rewrite is flagged as follow-up work, not required for Part 2/3
-  correctness.
-- **Constant-time posture**: `mul` iterates over every bit position of
-  `a` unconditionally (never skips a zero bit) and selects each
-  contribution via an arithmetic mask (`0 -% bit`), never a branch —
-  mirroring the spec's explicit requirement (§3.3: "Multiplications ...
-  are performed without taking account of the sparsity ... in order to
-  avoid potential leakage of information"). The reduction fold is
+  n} u_i·v_j (§3.3), reduced mod (X^n − 1) by folding bits [n, 2n−2] back
+  onto [0, n−2] (X^{n+j} ≡ X^j; `reduceProduct`, shared by both multiply
+  paths below).
+
+  ⭐ **CORRECTED 2026-09-10 (audit A1 finding `hqc` M1): this section
+  described a schoolbook-only `mul` that was replaced by `3dc73616`
+  (2026-07-19), more than seven weeks before this correction landed. What
+  actually ships is CLMUL+Karatsuba, not schoolbook** — the paragraph
+  below described `mulPortable` as if it were the only path, and the
+  follow-up work it flagged had already been done. There are now two
+  multiply paths, both in `gf2x.zig`, both producing bit-identical output
+  (pinned by a differential test, see Verification below):
+  - **`mulClmul`** (comptime-selected whenever `x86_64 + pclmul`, i.e. on
+    every host this module actually ships on): a recursive Karatsuba
+    multiply over a `pclmulqdq`-based 64×64→127-bit carryless base
+    multiply (`clmulKar`/`clmul64`), same structural shape as the
+    reference's own word-aligned Toom-Cook/Karatsuba + `pclmul` elementary
+    multiply (§3.3, Table 2) — O(L^1.58) CLMULs instead of O(L²). This is
+    what every KAT, benchmark and ctgrind measurement in this document
+    exercises.
+  - **`mulPortable`** — the schoolbook shift-and-mask-xor multiply this
+    section used to describe as the only path. It is still here, as the
+    fallback for non-x86_64/non-pclmul targets and, on this host, as the
+    correctness oracle `mulClmul` is pinned against (`gf2x.zig`'s
+    differential test). O(n²/64), but that is no longer the performance
+    story for the path that ships on this host — see §4/M4 of the audit
+    record for the actual `mulClmul` cost breakdown.
+- **Constant-time posture**: both `mul` paths are branch-free by
+  construction. `mulPortable` iterates over every bit position of `a`
+  unconditionally (never skips a zero bit) and selects each contribution
+  via an arithmetic mask (`0 -% bit`), never a branch — mirroring the
+  spec's explicit requirement (§3.3: "Multiplications ... are performed
+  without taking account of the sparsity ... in order to avoid potential
+  leakage of information"). `mulClmul`'s Karatsuba recursion depth, split
+  points and loop trip counts depend only on the PUBLIC limb count, never
+  on operand values, and `pclmulqdq` itself is a fixed-latency instruction
+  (see `gf2x.zig`'s CLMUL section doc comment). The reduction fold is
   likewise branch-free (bit extraction + shift, no `if` on the bit's
-  value). The fixed-weight samplers' duplicate-rejection scans
-  (`prng.zig`) are full linear scans with no early exit, matching the
-  reference's `vect_generate_random_support{1,2}` access pattern.
+  value), shared by both paths. The fixed-weight samplers' duplicate-
+  rejection scans (`prng.zig`) are full linear scans with no early exit,
+  matching the reference's `vect_generate_random_support{1,2}` access
+  pattern.
+
+  ⚠ "Branch-free in the source" and "compiled branch-free" are different
+  claims — see the ctgrind findings immediately below, which is exactly
+  where that gap was actually found (in `prng.writeSupportToVector`, not
+  in either `mul` path).
 
   ⛔⛔ **That sentence is about the duplicate SCAN, and it left the louder
   thing unsaid: the rejection LOOP's trip count.**
@@ -238,13 +279,17 @@ below). See [README.md](README.md) for purpose and API.
 
 ## Threat model / limits
 
-- Part 1 has **no side-channel machine verification** (see "Constant-time
-  posture" above) — structural match to the reference only.
-- `gf2x.mul`'s O(n²/64) schoolbook algorithm is a correctness-first
-  stand-in for the reference's Toom-Cook/Karatsuba; fine for KAT
-  reproduction and even a modest-throughput KEM, but a real deployment
-  wanting reference-level performance should revisit it (flagged as
-  follow-up, not blocking Part 2/3).
+- Part 1 has **no side-channel machine verification from Part 1 itself**
+  — see "ctgrind" measurements further up this document and in
+  `ctgrind_harness.zig`/`ctgrind-expected.tsv` for the actual machine-
+  checked (and only partially clean) picture, added 2026-09-08/09.
+- ⭐ **CORRECTED 2026-09-10 (M1): `gf2x.mul` is no longer schoolbook-only.**
+  `3dc73616` (2026-07-19) added `mulClmul` (CLMUL+Karatsuba), which is the
+  path this module actually uses on every x86_64+pclmul host; `mulPortable`
+  (the schoolbook algorithm this bullet used to describe as the whole
+  story) is now the fallback/oracle path only. See "Design" above for the
+  current split and Verification below for the differential test pinning
+  them equal.
 - `sampleFixedWeightBiased` and `hashH`/`hashJ` are transcribed from the
   reference's C source with the same care as everything else here, but —
   unlike `Xof`, `Prng`'s construction, `hashI`, `hashG`, and
@@ -255,8 +300,17 @@ below). See [README.md](README.md) for purpose and API.
   (unambiguous C source, same construction pattern as the pinned
   primitives) but carry a lower confidence tier — flagged honestly rather
   than silently treated as equally verified.
-- No key generation, encryption, decryption, or KEM operations exist in
-  Part 1 — nothing here is usable as a KEM yet.
+- ⭐ **CORRECTED 2026-09-10 (audit A1 finding `hqc` M2): this bullet is
+  Part-1-scoped and stale.** It originally read "No key generation,
+  encryption, decryption, or KEM operations exist in Part 1 — nothing here
+  is usable as a KEM yet", written when this file described only Part 1.
+  Left standalone under a section a reader consults to check what's safe
+  to deploy, it directly contradicted `README.md`'s "the arc is complete —
+  this is a usable KEM" and `root.zig`'s "Part 3 completes the arc". **Part
+  3 supersedes this**: `pke.zig`/`kem.zig` exist, and `Hqc128`/`Hqc192`/
+  `Hqc256` are a usable KEM, byte-exact against the official NIST KAT (see
+  "Part 3" below). This bullet is kept, corrected, rather than deleted, as
+  the record of what Part 1 alone did NOT provide.
 
 ## Verification
 
@@ -270,7 +324,7 @@ below). See [README.md](README.md) for purpose and API.
 | `hashG` | Numeric-KAT-pinned | kat_test.zig: `G(H(ek_kem), m, salt) == K ‖ theta` exactly |
 | `sampleVect` | Numeric-KAT-pinned | kat_test.zig: reproduces the reference's `h` exactly, including the top-word mask |
 | `sampleFixedWeightRejection` + `writeSupportToVector` | Numeric-KAT-pinned | kat_test.zig: reproduces the reference's `y` and `x` (chained) exactly |
-| `gf2x.mul`/`add`/`weight`/codecs | Algebraic self-test only | No official gf2x-level KAT is published (the reference ships no isolated multiply vectors — checked `tests/unit/test_vector.c`, it's property-based, no fixed multiply I/O); pinned instead via hand-verifiable monomial-wraparound cases (`X^i · X^j = X^{(i+j) mod n}`, including the mod-reduction wraparound) plus commutativity/distributivity/identity-element/weight-bound checks |
+| `gf2x.mul`/`add`/`weight`/codecs | Algebraic self-test + differential (CLMUL vs. schoolbook) | No official gf2x-level KAT is published (the reference ships no isolated multiply vectors — checked `tests/unit/test_vector.c`, it's property-based, no fixed multiply I/O); pinned via hand-verifiable monomial-wraparound cases (`X^i · X^j = X^{(i+j) mod n}`, including the mod-reduction wraparound) plus commutativity/distributivity/identity-element/weight-bound checks — **and**, since `3dc73616` added the CLMUL+Karatsuba path, a differential test requiring `mulClmul(a,b) == mulPortable(a,b)` bit-for-bit on 64 random pairs + zero/monomial/all-ones edge operands per parameter set (`gf2x.zig`'s `testClmulDifferential`) |
 | `hashH`, `hashJ` | Source-matched only | Transcribed from `symmetric.c`; not independently numeric-pinned (see Limits above) |
 | `sampleFixedWeightBiased` | Source-matched + property-tested | Transcribed from `vector.c`'s `vect_generate_random_support2`; self-tested for exact weight / no duplicates / in-range, not numeric-KAT-pinned |
 | `gf256.exp`/`log` tables | Numeric-KAT-pinned (self-derived) | `gf256.zig`: `generateTables` independently re-derives both tables from `poly` via the reference's own `gf_generate` recurrence; matches the transcribed `gf.h` tables byte-exact |
@@ -356,17 +410,23 @@ script (no hand transcription, no LLM-summarized hex) — see
 which vectors are pinned at full depth (hqc-128) vs. lighter depth
 (hqc-192/256).
 
-**GF(2^8) note**: this module's `mul` uses a discrete-log table lookup,
-NOT the reference's carryless-multiply-then-reduce (`gf_carryless_mul` +
-`gf_reduce`, a `pclmulqdq`-emulation for the reference's target hardware).
-Both compute the same field product (GF(2^8) multiplication is uniquely
-determined by the primitive polynomial + generator, not by the algorithm)
-— confirmed in `gf256.zig`'s tests by independently re-deriving the
-`exp`/`log` tables from the primitive polynomial via the reference's own
-`gf_generate` recurrence and checking byte-exact agreement with the
-transcribed tables, plus the standard field-axiom tests. This is the same
-tradeoff Part 1's `gf2x.zig` made for its ring `mul` (schoolbook vs.
-Toom-Cook/Karatsuba) — see that section above.
+**GF(2^8) note**: ⭐ **CORRECTED 2026-09-10 — this paragraph described a
+table lookup that no longer exists.** It used to say this module's `mul`
+"uses a discrete-log table lookup, NOT the reference's carryless-multiply-
+then-reduce", i.e. the opposite of what `gf256.zig` does since audit A1
+finding `hqc` L2 was fixed (`110f4190`, 2026-09-09): `gf256.mul`/`inverse`
+were rewritten off the `exp`/`log` tables onto the reference's own
+carryless-multiply-then-reduce construction (eight masked shift-and-xor
+steps, then eight masked folds for `mul`; `a^254` via square-and-multiply
+for `inverse`) — the table lookup this paragraph described was a genuine,
+measured, secret-indexed cache-timing channel (the only one found anywhere
+in this repository; `A1/hqc.md` L2), not a benign algorithm choice, and it
+is gone. The `exp`/`log` tables still exist in `gf256.zig` (`reedsolomon.zig`
+indexes them at PUBLIC positions) but the secret-operand path no longer
+touches them. Equivalence between the two `mul` implementations was proven
+exhaustively before the table path was removed: all 65536 byte pairs and
+all 256 `inverse` inputs, table method vs. carryless, see `gf256.zig`'s
+tests.
 
 **Constant-time posture of the decoders**: the two decode cores
 (`RS(p,g).decode`, `RM(p).decodeSymbol`) add **no new secret-dependent
@@ -374,17 +434,22 @@ branches or memory indices** — they port the reference's constant-time
 structure directly: masked branch-free selects in Berlekamp-Massey
 (`compute_elp`), a data-independent additive-FFT access pattern,
 constant-access-pattern Forney bookkeeping (`compute_error_values`), and a
-branch-free `find_peaks`. The **one** pre-existing, module-wide caveat is
-that `gf256.mul`/`inverse` do their work through the `exp`/`log` tables,
-i.e. **secret-indexed table loads** (a cache-timing side channel on the
-field elements the decoder handles), whereas the reference's
-`gf_carryless_mul`+`gf_reduce` is a table-free carryless multiply. This is
-the Part-1 field-arithmetic tradeoff noted above, inherited unchanged by
-Part 2; a follow-up could switch `gf256` to a constant-time carryless
-multiply if machine-checked side-channel resistance is required (flagged as
-follow-up, not blocking Part 2/3 correctness). As with Part 1, no
-dudect/ctgrind machine verification has been run — the structural match to
-the reference is by construction, not instrument-verified.
+branch-free `find_peaks`. ⭐ **CORRECTED 2026-09-10: the caveat that used to
+stand here (`gf256.mul`/`inverse` as secret-indexed table loads) was FIXED
+2026-09-09** (`110f4190`, audit A1 finding `hqc` L2) — `gf256` now uses the
+same table-free carryless-multiply-then-reduce construction as the
+reference, so this decoder pair has no known secret-indexed memory access
+left. What ctgrind machine verification (added 2026-09-08/09, see the
+"Constant-time posture" ctgrind table further up this document) actually
+found in this area was different from what this paragraph predicted: not
+the table load (that was found and fixed independently, see above), but
+ordinary conditional branches over secret-derived data in the rejection
+sampler (`prng.zig:216/223/268`) and a couple of `reedsolomon`/`gf256`
+comparisons — see the ctgrind table and `CHANGELOG.md`'s Unreleased section
+for the current, measured (not by-construction) picture. Machine
+verification here is no longer absent, and it disagreed with the earlier
+"no new secret-dependent branches" claim on several specific lines, all
+now tracked as recorded defects rather than closed silently.
 
 ## Part 3 (PKE + FO KEM composition) — status
 

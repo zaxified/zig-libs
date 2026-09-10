@@ -502,6 +502,25 @@ test "fromBytes/toBytes round-trip and LSB-first bit convention" {
     try t.expectEqualSlices(u64, &parsed, &reparsed);
 }
 
+test "fromBytes zeroes bits >= n even when the raw source bytes have them set (L1)" {
+    const t = std.testing;
+    // Audit A1 finding `hqc` L1: `maskTop` inside `fromBytes` had no
+    // discriminating test. The round-trip test above compares `parsed`
+    // against `reparsed` (itself re-derived FROM `parsed`'s own masked
+    // bytes), so a mutant that deletes the `maskTop` call still passes it:
+    // both sides already lack the same masked bits, so the round-trip just
+    // carries whatever was in bits >= n straight through unchanged. This
+    // test asserts the canonical invariant directly against a RAW byte
+    // source with every bit set, including the ones beyond n.
+    const raw = [_]u8{0xFF} ** R128.n_bytes;
+    const v = R128.fromBytes(&raw);
+    var i: u32 = R128.bit_len;
+    while (i < R128.words * 64) : (i += 1) {
+        const bit = (v[i / 64] >> @intCast(i % 64)) & 1;
+        try t.expectEqual(@as(u64, 0), bit);
+    }
+}
+
 test "truncate zeroes bits >= n1n2, keeps bits below" {
     const t = std.testing;
     const P = params.hqc128;

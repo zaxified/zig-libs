@@ -187,17 +187,24 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
             var off: usize = 0;
             const ek: EncapsKey = dk[off..][0..ek_bytes].*;
             off += ek_bytes;
-            const dk_pke: Pke.DecKey = dk[off..][0..params.seed_bytes].*;
+            // dk_pke and sigma are copies of the secret half of the
+            // decapsulation key — H4: 0 `secureZero` calls in this module
+            // before 2026-09-10 left both on the stack after every decaps.
+            var dk_pke: Pke.DecKey = dk[off..][0..params.seed_bytes].*;
+            defer std.crypto.secureZero(u8, &dk_pke);
             off += params.seed_bytes;
-            const sigma: [security_bytes]u8 = dk[off..][0..security_bytes].*;
+            var sigma: [security_bytes]u8 = dk[off..][0..security_bytes].*;
+            defer std.crypto.secureZero(u8, &sigma);
 
             const parsed = deserializeCt(ct);
-            const m_prime = Pke.decrypt(dk_pke, .{ .u = parsed.u, .v = parsed.v });
+            var m_prime = Pke.decrypt(dk_pke, .{ .u = parsed.u, .v = parsed.v });
+            defer std.crypto.secureZero(u8, &m_prime);
 
             var h_ek: [params.seed_bytes]u8 = undefined;
             prng.hashH(&h_ek, &ek);
 
             var k_theta_prime: [64]u8 = undefined;
+            defer std.crypto.secureZero(u8, &k_theta_prime);
             prng.hashG(&k_theta_prime, &h_ek, &m_prime, &parsed.salt);
             const theta_prime = k_theta_prime[32..64];
 
@@ -205,6 +212,7 @@ pub fn Kem(comptime p: params.Params, comptime generator: [2 * p.delta + 1]u8) t
             const ct_prime = serializeCt(c_prime.u, c_prime.v, parsed.salt);
 
             var k_bar: SharedSecret = undefined;
+            defer std.crypto.secureZero(u8, &k_bar);
             prng.hashJ(&k_bar, &h_ek, &sigma, &ct);
 
             // result: 0 if ct'==ct (match), 1 otherwise — then wrapped
