@@ -532,6 +532,46 @@ pub const AuthFailure = enum {
     peer_disconnected,
 };
 
+/// Called synchronously, once, every time `serveUserauth` rejects a
+/// credential — i.e. every time `AuthConfig.failure` would be written, not
+/// just the last one before the call ultimately returns (A1/examples/ssh.md
+/// S2). Optional (`AuthConfig.on_rejected`, default `null`, no behavior
+/// change without it).
+///
+/// `AuthConfig.failure` already DOES hold the right answer after any of
+/// `serveUserauth`'s error returns, not only `error.AuthenticationFailed` —
+/// it is written unconditionally on every rejection — but a caller who only
+/// reads it once the call has returned has no reliable way to tell "this
+/// field holds a real answer" apart from "this field was never touched,
+/// because no credential was ever rejected before some OTHER error (a
+/// malformed first packet, say)". The common case: a client that gives up
+/// after one rejected key and simply closes the TCP connection, with no SSH
+/// disconnect message, makes `serveUserauth` return `error.EndOfStream`,
+/// not `AuthenticationFailed` — `example-apps/ssh-demo` carries its own
+/// `self.keys.why == .not_called` bookkeeping today only to work around
+/// exactly that ambiguity.
+///
+/// This hook sidesteps it: it fires at the moment of rejection, before
+/// there is any question of how the connection later ends, so the caller
+/// never has to guess whether `failure` means anything.
+///
+/// ⚠ `user` is borrowed for the duration of the call — same warning as
+/// `CommandHandler`'s `command`/`stdin` in `connection.zig` — it points
+/// into `serveUserauth`'s own packet scratch buffer; copy it if kept.
+/// `user` is `null` for `.peer_disconnected`: an `SSH_MSG_DISCONNECT` can
+/// arrive before any `SSH_MSG_USERAUTH_REQUEST` names an identity at all.
+///
+/// `ctx` is the caller's own state, same idiom as `CommandHandler` and
+/// `connection.ChannelOpenRejectedHandler`.
+pub const RejectionHandler = struct {
+    ctx: *anyopaque = transport.no_context,
+    onFn: *const fn (ctx: *anyopaque, user: ?[]const u8, reason: AuthFailure) void,
+
+    pub fn call(self: RejectionHandler, user: ?[]const u8, reason: AuthFailure) void {
+        self.onFn(self.ctx, user, reason);
+    }
+};
+
 pub const AuthConfig = struct {
     /// Enables the `publickey` method when set.
     authorized_key: ?AuthorizedKeyCheck = null,
@@ -556,10 +596,22 @@ pub const AuthConfig = struct {
     /// Optional out-pointer for why authentication failed — the same idiom
     /// `transport.HostKeyPolicy.failure` and `sntp`'s Kiss-o'-Death code use,
     /// because `error.AuthenticationFailed` cannot carry a payload. Written
-    /// on every refusal, so after `serveUserauth` returns it holds the LAST
-    /// one: what a server would log. Untouched on success and on unrelated
-    /// failures, so do not read it unless the call failed.
+    /// on every refusal (not just the one that ultimately ends the call), so
+    /// after `serveUserauth` returns it holds the LAST one: what a server
+    /// would log. Untouched on success, and untouched if the call returns
+    /// without ever rejecting a credential (e.g. a malformed first packet).
+    /// ⚠ It is NOT only meaningful when the call returns
+    /// `error.AuthenticationFailed` specifically — a peer that simply closes
+    /// the connection after one rejected credential makes this return
+    /// `error.EndOfStream` instead, and `failure` already holds the right
+    /// answer even then (A1/examples/ssh.md S2). If you need to tell "holds
+    /// a real answer" apart from "never touched" without tracking that
+    /// yourself, use `on_rejected` below instead of this field.
     failure: ?*AuthFailure = null,
+    /// See `RejectionHandler` above. `null` (default) keeps today's
+    /// behavior exactly: `failure` is still written on every rejection,
+    /// this only adds an optional, unambiguous way to observe it.
+    on_rejected: ?RejectionHandler = null,
 };
 
 /// Which method actually succeeded.
@@ -616,6 +668,7 @@ pub fn serveUserauth(
             .SSH_MSG_IGNORE, .SSH_MSG_DEBUG => continue,
             .SSH_MSG_DISCONNECT => {
                 if (config.failure) |out| out.* = .peer_disconnected;
+                if (config.on_rejected) |h| h.call(null, .peer_disconnected);
                 return error.AuthenticationFailed;
             },
             .SSH_MSG_USERAUTH_REQUEST => {},
@@ -644,6 +697,7 @@ pub fn serveUserauth(
         // protocol is not something this module supports.
         if (!std.mem.eql(u8, service, connection_service)) {
             if (config.failure) |out| out.* = .no_acceptable_method;
+            if (config.on_rejected) |h| h.call(user, .no_acceptable_method);
             attempts += 1;
             try sendFailure(t, config);
             continue;
@@ -663,6 +717,7 @@ pub fn serveUserauth(
                 .pk_ok_sent => continue,
                 .failure => |why| {
                     if (config.failure) |out| out.* = why;
+                    if (config.on_rejected) |h| h.call(user, why);
                     attempts += 1;
                     try sendFailure(t, config);
                     continue;
@@ -682,6 +737,7 @@ pub fn serveUserauth(
                 return res;
             }
             if (config.failure) |out| out.* = .wrong_password;
+            if (config.on_rejected) |h| h.call(user, .wrong_password);
             attempts += 1;
             try sendFailure(t, config);
             continue;
@@ -690,6 +746,7 @@ pub fn serveUserauth(
         // "none" (§5.2, the conventional way a client asks which methods are
         // available) and anything unsupported both land here.
         if (config.failure) |out| out.* = .no_acceptable_method;
+        if (config.on_rejected) |h| h.call(user, .no_acceptable_method);
         attempts += 1;
         try sendFailure(t, config);
     }
@@ -1378,6 +1435,76 @@ test "the userauth policy hooks carry the caller's own context" {
     }));
     try t.expectEqual(@as(usize, 1), refusing.calls);
     try t.expectEqual(AuthFailure.wrong_password, why);
+}
+
+/// Records what `on_rejected` was called with. `user` is borrowed for the
+/// duration of the call (points into `serveUserauth`'s own packet scratch),
+/// same contract as `RejectionHandler`'s own doc comment states — copied
+/// into a fixed buffer here rather than stored as a slice, the same fix
+/// `connection.zig`'s `RefusalRecorder` needed for `ChannelOpenRejectedHandler`
+/// (A1/examples/ssh.md S3a) after the first version of that test segfaulted.
+const RejectionRecorder = struct {
+    calls: usize = 0,
+    user_buf: [64]u8 = undefined,
+    last_user: ?[]const u8 = null,
+    last_reason: ?AuthFailure = null,
+
+    fn onRejected(ctx: *anyopaque, user: ?[]const u8, reason: AuthFailure) void {
+        const self: *RejectionRecorder = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        if (user) |u| {
+            const n = @min(u.len, self.user_buf.len);
+            @memcpy(self.user_buf[0..n], u[0..n]);
+            self.last_user = self.user_buf[0..n];
+        } else {
+            self.last_user = null;
+        }
+        self.last_reason = reason;
+    }
+
+    fn handler(self: *RejectionRecorder) RejectionHandler {
+        return .{ .ctx = self, .onFn = onRejected };
+    }
+};
+
+test "serveUserauth: on_rejected fires even when the call ends in error.EndOfStream, not AuthenticationFailed (A1/examples/ssh.md S2)" {
+    // A client that offers one bad credential, then simply closes the
+    // connection (no SSH_MSG_DISCONNECT) instead of retrying or waiting out
+    // `max_attempts`, makes `serveUserauth` return `error.EndOfStream` on
+    // its next `recvPacket` -- NOT `error.AuthenticationFailed`.
+    // `AuthConfig.failure` already holds the right answer even then (see
+    // its own doc comment) -- proving the data was never the problem -- but
+    // a caller who only checks it once the call has returned
+    // `AuthenticationFailed` misses it entirely, which is exactly what
+    // `example-apps/ssh-demo`'s own `self.keys.why == .not_called`
+    // workaround exists to paper over. `on_rejected` sidesteps the
+    // ambiguity: it fires synchronously, before there is any question of
+    // how the connection later ends.
+    const t = std.testing;
+    var refusing: PasswordPolicy = .{ .accepts = "never-matches" };
+
+    var tail_buf: [64]u8 = undefined;
+    var tw: std.Io.Writer = .fixed(&tail_buf);
+    try tw.writeByte(0); // not a password-change request
+    try messages.writeString(&tw, "wrong");
+
+    var wire: [512]u8 = undefined;
+    var payload: [256]u8 = undefined;
+    const framed = try frameAuthRequest(&wire, &payload, "password", tw.buffered());
+
+    var rec: RejectionRecorder = .{};
+    var why: AuthFailure = .bad_signature;
+    try t.expectError(error.EndOfStream, runServeUserauth(framed, .{
+        .password = refusing.hook(),
+        .max_attempts = 20, // deliberately not exhausted -- the stream just ends
+        .failure = &why,
+        .on_rejected = rec.handler(),
+    }));
+
+    try t.expectEqual(AuthFailure.wrong_password, why);
+    try t.expectEqual(@as(usize, 1), rec.calls);
+    try t.expectEqualStrings("alice", rec.last_user.?);
+    try t.expectEqual(AuthFailure.wrong_password, rec.last_reason.?);
 }
 
 test "serveUserauth reports WHY it refused, which the wire deliberately cannot" {

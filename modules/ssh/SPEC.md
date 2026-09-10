@@ -87,7 +87,14 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `error.HostKeyVerificationFailed` covered four different situations — unknown host, changed key,
   revoked key, user declined — plus this module's own signature/algorithm refusals. Nothing about
   them reaches the wire: RFC 4252 §5.1's SSH_MSG_USERAUTH_FAILURE still carries no reason at all
-  (see "Known limits" below), deliberately.
+  (see "Known limits" below), deliberately. `AuthConfig.failure` is written on EVERY rejected
+  credential, not only the one that ultimately ends the call, so it is valid to read after ANY
+  error `serveUserauth` returns — not only `error.AuthenticationFailed` — as long as at least one
+  credential was actually rejected first (A1/examples/ssh.md S2: a peer that closes the connection
+  after one rejected credential makes the call return `error.EndOfStream` instead, and `failure`
+  already holds the right answer). `AuthConfig.on_rejected` is the unambiguous alternative: it
+  fires at the moment of each rejection, so a caller never has to guess whether `failure` was
+  touched at all.
 - **Userauth key material is the same union as host keys.** `userauth.AuthKey == server.HostKey`:
   the wire formats for "a public key blob plus a signature made by it" are identical whether the
   key authenticates a host during KEX or a user during RFC 4252, so `publicBlob`/`sign`/
@@ -255,6 +262,11 @@ Parts 1-3 are implemented. What is deliberately *not* here:
   arriving is answered SSH_MSG_CHANNEL_FAILURE / SSH_MSG_CHANNEL_OPEN_FAILURE. `exec`,
   `subsystem` and `exit-status` are implemented. NB `exit-signal` not being implemented is why
   `ExecResult.exit_status` is optional: a command killed by a signal reports no exit status.
+  `subsystem` is one `CommandHandler` for every name by default (an empty
+  `ServeConfig.subsystem_names`); a non-empty list restricts which names are accepted, rejecting
+  the rest with `SSH_MSG_CHANNEL_FAILURE` before the handler ever runs (A1/examples/ssh.md S3b).
+  It does not give different names different handlers — every accepted name still runs the same
+  one.
 - **One channel per connection.** `serveSession` serves exactly one `"session"` channel and
   returns; a second concurrent SSH_MSG_CHANNEL_OPEN is refused with `resource_shortage`
   (likewise `unknown_channel_type` for a non-`"session"` open, `connect_failed` for a zero
