@@ -326,6 +326,36 @@ pub fn apply(
     total: u64,
     out: []ResolvedRange,
 ) Server.ResponseWriter.SetHeaderError!Applied {
+    return applyBounded(req, rw, total, out, null);
+}
+
+/// Same as `apply`, but additionally bounds the SUM of the resolved ranges'
+/// byte lengths (not just their count) against `max_bytes`.
+///
+/// G6 (`~/CML/20260901-zig-libs-audit/A1/http.md`): `default_max_ranges`
+/// bounds the NUMBER of ranges, not the bytes they cover — a handful of
+/// overlapping/repeated ranges can still multiply the served representation
+/// many times over (measured: `bytes=0-` repeated 16 times, 53 request
+/// bytes → 16x the representation, 3 165 541x the header). `max_bytes ==
+/// null` reproduces `apply`'s exact historical behavior (unbounded byte
+/// sum, count-only cap) — `apply` itself is unchanged and still calls this
+/// with `null`.
+///
+/// A resolved set whose summed byte length exceeds `max_bytes` is treated
+/// the same as "no usable `Range` header": `.no_range`, served as a plain
+/// 200 with the whole representation. RFC 7233 doesn't distinguish "too
+/// expensive to honor" from "the client didn't ask for a range", and
+/// falling back to the full representation (rather than 416, which would
+/// tell the client its syntactically-valid range was rejected outright) is
+/// always a safe, correct response — the same shape nginx's `max_ranges`
+/// takes when a request asks for more than the configured range budget.
+pub fn applyBounded(
+    req: *const Server.Request,
+    rw: *Server.ResponseWriter,
+    total: u64,
+    out: []ResolvedRange,
+    max_bytes: ?u64,
+) Server.ResponseWriter.SetHeaderError!Applied {
     if (req.method != .get and req.method != .head) return .{ .outcome = .no_range, .ranges = &.{} };
     const raw = req.header("range") orelse return .{ .outcome = .no_range, .ranges = &.{} };
 
@@ -333,6 +363,11 @@ pub fn apply(
     const specs = parse(raw, &specbuf) catch return .{ .outcome = .no_range, .ranges = &.{} };
 
     const ranges = resolve(specs, total, out);
+    if (max_bytes) |cap| {
+        var sum: u64 = 0;
+        for (ranges) |r| sum += r.len();
+        if (sum > cap) return .{ .outcome = .no_range, .ranges = &.{} };
+    }
     // Local, not thread-local: setHeader copies the bytes into its own
     // header_buf at call time, so this only has to outlive the call below.
     var content_range_buf: [72]u8 = undefined;
@@ -983,6 +1018,100 @@ test "apply: malformed Range ignored → 200 whole body" {
         "Content-Length: 10\r\n" ++
         "\r\n" ++
         "0123456789", got);
+}
+
+// ── G6: applyBounded byte cap ───────────────────────────────────────────────
+//
+// audit G6 (`~/CML/20260901-zig-libs-audit/A1/http.md`): `default_max_ranges`
+// caps range COUNT, not the bytes they cover — overlapping/repeated ranges
+// still multiply the served representation per accepted range. `applyBounded`
+// adds an opt-in byte-sum cap on top of `apply`'s existing behavior;
+// `max_bytes = null` (what `apply` itself passes) must reproduce `apply`
+// exactly.
+
+fn rangeHandlerBoundedCap8(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    var out: [4]ResolvedRange = undefined;
+    const applied = try applyBounded(req, rw, golden_body.len, &out, 8);
+    switch (applied.outcome) {
+        .no_range => {
+            rw.setStatus(200);
+            try rw.writeAll(golden_body);
+        },
+        .not_satisfiable => try rw.writeAll(""),
+        .single => {
+            const r = applied.ranges[0];
+            try rw.writeAll(golden_body[@intCast(r.start)..@intCast(r.end + 1)]);
+        },
+        .multiple => try rw.writeAll("MULTI"),
+    }
+}
+
+fn runRangeStreamBoundedCap8(wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    Server.serveStream(.{
+        .handler = rangeHandlerBoundedCap8,
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+test "applyBounded G6: sum of resolved ranges over max_bytes falls back to the whole representation" {
+    // Three overlapping full-representation ranges (10 bytes each, sum 30)
+    // against a cap of 8 -- count (3) is well under `default_max_ranges`
+    // (16), only the BYTE sum trips the cap. Falls back exactly like an
+    // absent/malformed Range: 200, whole body, no Content-Range.
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStreamBoundedCap8("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=0-9,0-9,0-9\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 200 OK\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 10\r\n" ++
+        "\r\n" ++
+        "0123456789", got);
+}
+
+test "applyBounded G6: sum within max_bytes negotiates normally" {
+    // A single 4-byte range is comfortably under the cap of 8 -- behaves
+    // exactly like plain `apply` (206 + Content-Range + sliced body).
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStreamBoundedCap8("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=2-5\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 206 Partial Content\r\n" ++
+        "Accept-Ranges: bytes\r\n" ++
+        "Content-Range: bytes 2-5/10\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 4\r\n" ++
+        "\r\n" ++
+        "2345", got);
+}
+
+test "applyBounded G6: max_bytes = null reproduces apply()'s exact historical behavior" {
+    // Same overlapping-ranges wire as the falls-back test above, but through
+    // `apply` (which calls `applyBounded(..., null)` internally) -- no cap,
+    // so it negotiates the full multi-range response instead of falling
+    // back. Pins that `apply` itself is untouched by the G6 fix.
+    var out_buf: [4096]u8 = undefined;
+    const got = runRangeStream("GET / HTTP/1.1\r\nHost: t\r\n" ++
+        "Range: bytes=0-9,0-9,0-9\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqualStrings("HTTP/1.1 206 Partial Content\r\n" ++
+        "Accept-Ranges: bytes\r\n" ++
+        "Server: test\r\n" ++
+        "Connection: close\r\n" ++
+        "Content-Length: 5\r\n" ++
+        "\r\n" ++
+        "MULTI", got);
 }
 
 // ── R3 tests ─────────────────────────────────────────────────────────────────

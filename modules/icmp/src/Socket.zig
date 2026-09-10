@@ -459,6 +459,23 @@ fn parseControl(control: []const u8, info: *RecvInfo) void {
     }
 }
 
+test "A1 F12 m25: parseControl stops at a cmsg claiming more bytes than the control buffer holds" {
+    // `if (cmsg.len < hdr_len or off + cmsg.len > control.len) break;` --
+    // the `cmsg.len < hdr_len` half alone does not protect the `data =
+    // control[off + hdr_len .. off + cmsg.len]` slice a few lines below:
+    // a cmsg can declare a `len` field far past the actual control buffer
+    // (this is exactly the kind of value a peer/kernel bug or a crafted
+    // ancillary-data blob could produce), and without the second half of
+    // the OR, that slice's end index exceeds `control.len`.
+    const hdr_len = @sizeOf(linux.cmsghdr);
+    var control: [hdr_len + 4]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
+    const cmsg: *linux.cmsghdr = @ptrCast(&control);
+    cmsg.* = .{ .len = 1000, .level = linux.SOL.SOCKET, .type = linux.SO.TIMESTAMPNS_OLD };
+    var info: RecvInfo = .{ .packet = &.{} };
+    parseControl(&control, &info); // must not panic
+    try std.testing.expectEqual(@as(?i64, null), info.timestamp_real_ns);
+}
+
 test "recvBatch rejects an undersized slab instead of letting the kernel write past it" {
     // fd -1 is never reached: the size check runs before recvmmsg, which is
     // the whole point — the old `std.debug.assert` compiled out of

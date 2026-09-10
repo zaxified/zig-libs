@@ -1273,6 +1273,265 @@ test "A1 F2: check_source now validates the quoted destination inside an ICMP er
     try std.testing.expectEqual(@as(u32, 1), p.stats(id).icmp_errors);
 }
 
+// ── A1 F12: mutation-table gaps in the correlation/scheduling layer ─────────
+//
+// icmp.md audit F12: 22 mutations across the correlation and scheduling
+// layer left the whole suite green. Unlike the boundary-check gaps in
+// echo.zig/Socket.zig above, these are not "unreachable without a specific
+// input shape" -- they are simply guards nothing ever exercised through
+// `handleReply`/`dispatchDue`/`handleTimeout`/`step` with a case built to
+// depend on them.
+
+test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, not part of it" {
+    // `if (sock.kind == .raw and r.ident != sock.ident) return;` -- m2
+    // deletes it outright, m3 weakens it to the high byte only, m31 to a
+    // single bit. A single test that flips every bit position one at a time
+    // (all other bits matching) catches all three: whichever subset of bits
+    // a weakened comparison actually checks, at least one of the 16 flips
+    // touches a bit outside that subset and would wrongly be accepted.
+    var p = try Pinger.init(std.testing.allocator, .{});
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .raw, .ident = 0x1234 };
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    var pkt: [20 + echo.echo_header_len]u8 = @splat(0);
+    pkt[0] = 0x45; // IP header, IHL = 5 -> 20 bytes, stripped by the .raw path
+    const icmp = pkt[20..];
+    icmp[0] = echo.v4.echo_reply;
+    std.mem.writeInt(u16, icmp[6..8], seq, .big);
+
+    var bit: u4 = 0;
+    while (true) : (bit += 1) {
+        const wrong_ident = p.sock4.?.ident ^ (@as(u16, 1) << bit);
+        std.mem.writeInt(u16, icmp[4..6], wrong_ident, .big);
+        icmp[2] = 0;
+        icmp[3] = 0;
+        std.mem.writeInt(u16, icmp[2..4], echo.checksum(icmp), .big);
+        p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+        if (bit == 15) break;
+    }
+    try std.testing.expectEqual(@as(u32, 0), p.stats(id).recv);
+
+    // Positive control: the correct ident resolves the probe.
+    std.mem.writeInt(u16, icmp[4..6], p.sock4.?.ident, .big);
+    icmp[2] = 0;
+    icmp[3] = 0;
+    std.mem.writeInt(u16, icmp[2..4], echo.checksum(icmp), .big);
+    p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).recv);
+}
+
+test "A1 F12 m4/m32: an ICMP error's orig_ident check compares the WHOLE 16 bits, not part of it" {
+    // `if (e.orig_ident != sock.ident) return;` -- same bit-flip technique
+    // as m2/m3/m31 above, applied to the ICMP-error correlation path.
+    var p = try Pinger.init(std.testing.allocator, .{});
+    defer p.deinit();
+    const id = try p.addTarget("10.9.9.77");
+    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    var pkt: [echo.echo_header_len + 20 + echo.echo_header_len]u8 = @splat(0);
+    pkt[0] = echo.v4.time_exceeded;
+    pkt[8] = 0x45; // quoted IHL = 5
+    const orig = pkt[8 + 20 ..];
+    orig[0] = echo.v4.echo_request;
+    std.mem.writeInt(u16, orig[6..8], seq, .big);
+    const target_bytes: [4]u8 = switch (p.targetAddr(id)) {
+        .v4 => |a| @bitCast(a.addr),
+        .v6 => unreachable,
+    };
+    @memcpy(pkt[8 + 16 ..][0..4], &target_bytes); // correct quoted dest -- isolate the ident check
+
+    var bit: u4 = 0;
+    while (true) : (bit += 1) {
+        const wrong_ident = p.sock4.?.ident ^ (@as(u16, 1) << bit);
+        std.mem.writeInt(u16, orig[4..6], wrong_ident, .big);
+        pkt[2] = 0;
+        pkt[3] = 0;
+        std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big); // A1 F7
+        p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+        if (bit == 15) break;
+    }
+    try std.testing.expectEqual(@as(u32, 0), p.stats(id).icmp_errors);
+
+    // Positive control: the correct ident counts the error.
+    std.mem.writeInt(u16, orig[4..6], p.sock4.?.ident, .big);
+    pkt[2] = 0;
+    pkt[3] = 0;
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
+    p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).icmp_errors);
+}
+
+test "A1 F12 m5: a reply arriving on the wrong address family's socket does not resolve a probe" {
+    // `if (t.addr.family() != fam) return;` -- a seq number is a 16-bit
+    // space SHARED across both sockets (comment above `SeqMap`), so nothing
+    // else stops an event on the wrong family's socket from matching a
+    // live entry by seq number alone.
+    var p = try Pinger.init(std.testing.allocator, .{});
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1"); // a v4 target
+    p.sock6 = .{ .fd = -1, .family = .v6, .kind = .dgram, .ident = 0x1234 };
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    var pkt6: [echo.echo_header_len]u8 = @splat(0);
+    pkt6[0] = echo.v6.echo_reply;
+    std.mem.writeInt(u16, pkt6[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, pkt6[6..8], seq, .big);
+    p.handleReply(.v6, .{ .packet = &pkt6 }, monoNow());
+    try std.testing.expectEqual(@as(u32, 0), p.stats(id).recv);
+
+    // Positive control: the SAME seq, delivered on the matching (v4) family.
+    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    var pkt4: [echo.echo_header_len]u8 = @splat(0);
+    pkt4[0] = echo.v4.echo_reply;
+    std.mem.writeInt(u16, pkt4[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, pkt4[6..8], seq, .big);
+    std.mem.writeInt(u16, pkt4[2..4], echo.checksum(&pkt4), .big);
+    p.handleReply(.v4, .{ .packet = &pkt4 }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).recv);
+}
+
+test "A1 F12 m6: check_source, when enabled, is actually enforced on echo replies (not just ICMP errors)" {
+    // `if (self.cfg.check_source and !sourceMatches(info.src, t.addr)) {`
+    // in the `.echo_reply` arm -- the F2 fix added the equivalent gate to
+    // the `.icmp_error` arm (see the F2 test above) but nothing exercised
+    // THIS one with an actual mismatched source.
+    var p = try Pinger.init(std.testing.allocator, .{ .check_source = true });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    var pkt: [echo.echo_header_len]u8 = @splat(0);
+    pkt[0] = echo.v4.echo_reply;
+    std.mem.writeInt(u16, pkt[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, pkt[6..8], seq, .big);
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
+
+    const wrong = try Addr.parse("10.0.0.9");
+    const wrong_sa: linux.sockaddr.in = switch (wrong) {
+        .v4 => |a| a,
+        .v6 => unreachable,
+    };
+    p.handleReply(.v4, .{ .packet = &pkt, .src = .{ .v4 = wrong_sa } }, monoNow());
+    try std.testing.expectEqual(@as(u32, 0), p.stats(id).recv);
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).source_mismatches);
+
+    // Positive control: the correct source resolves the (still-live) probe.
+    const good = try Addr.parse("192.0.2.1");
+    const good_sa: linux.sockaddr.in = switch (good) {
+        .v4 => |a| a,
+        .v6 => unreachable,
+    };
+    p.handleReply(.v4, .{ .packet = &pkt, .src = .{ .v4 = good_sa } }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).recv);
+}
+
+test "A1 F12 m17: a second reply to an already-answered probe counts as a duplicate, not a second reply" {
+    // `if (entry.answered) { t.stats.duplicates += 1; ...; return; }` --
+    // without it a replayed/duplicated reply on the wire would resolve the
+    // probe (and decrement pending/inflight) a second time.
+    var p = try Pinger.init(std.testing.allocator, .{});
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    var pkt: [echo.echo_header_len]u8 = @splat(0);
+    pkt[0] = echo.v4.echo_reply;
+    std.mem.writeInt(u16, pkt[4..6], 0x1234, .big);
+    std.mem.writeInt(u16, pkt[6..8], seq, .big);
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
+
+    p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).recv);
+    try std.testing.expectEqual(@as(u32, 0), p.stats(id).duplicates);
+
+    p.handleReply(.v4, .{ .packet = &pkt }, monoNow());
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).recv); // unchanged
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).duplicates);
+}
+
+test "A1 F12 m19: dispatchDue never sends past max_inflight" {
+    // `if (self.inflight + n >= self.cfg.max_inflight) break :collect;`
+    var p = try Pinger.init(std.testing.allocator, .{ .max_inflight = 4 });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    p.inflight = 4; // already at the cap
+    const now = monoNow();
+    try p.ping_q.push(p.gpa, .{ .time = now, .target = id, .probe = 0 });
+    try p.dispatchDue();
+    try std.testing.expectEqual(@as(usize, 1), p.ping_q.items.len); // still queued, not sent
+    try std.testing.expectEqual(@as(u32, 4), p.inflight); // unchanged
+}
+
+test "A1 F12 m20: dispatchDue waits out the global pacing gap before sending" {
+    // `if (now - self.last_send_ns < interval_ns) break :collect;` (the
+    // n == 0 branch of the collect loop's pacing gate).
+    var p = try Pinger.init(std.testing.allocator, .{ .interval_ns = 10 * std.time.ns_per_ms });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    const now = monoNow();
+    p.last_send_ns = now; // a packet just left
+    try p.ping_q.push(p.gpa, .{ .time = now, .target = id, .probe = 0 });
+    try p.dispatchDue();
+    try std.testing.expectEqual(@as(usize, 1), p.ping_q.items.len); // still queued, gap not elapsed
+    try std.testing.expectEqual(@as(u32, 0), p.inflight);
+}
+
+test "A1 F12 m23: a stale timeout event for a reused slot is dropped, not misattributed" {
+    // `if (entry.target != ev.target or entry.probe != ev.probe) return;`
+    // inside `handleTimeout` -- a second line of defense past `step`'s own
+    // owner check, for a slot that was released and reused between when a
+    // timeout event was scheduled and when it fires.
+    var p = try Pinger.init(std.testing.allocator, .{ .mode = .alive, .retries = 3 });
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    const seq = try p.seqmap.add(id, 5, monoNow()); // the slot now belongs to probe 5
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+
+    // A stale event for the SAME seq but a DIFFERENT probe, as if the slot
+    // had been released and reused since the event was scheduled.
+    const stale: Event = .{ .time = monoNow(), .target = id, .probe = 999, .seq = seq };
+    try p.handleTimeout(stale, monoNow());
+
+    try std.testing.expectEqual(@as(u32, 1), p.inflight); // untouched
+    try std.testing.expectEqual(@as(u32, 1), p.targets.items[id].pending); // untouched
+    try std.testing.expectEqual(@as(usize, 0), p.ping_q.items.len); // no bogus retry scheduled
+}
+
+test "A1 F12 m24: a timeout scheduled in the future does not fire early" {
+    // `if (ev.time > now) break;` in `step`'s timeout-draining loop.
+    var p = try Pinger.init(std.testing.allocator, .{});
+    defer p.deinit();
+    const id = try p.addTarget("192.0.2.1");
+    const seq = try p.seqmap.add(id, 0, monoNow());
+    p.targets.items[id].pending = 1;
+    p.inflight = 1;
+    const now = monoNow();
+    try p.timeout_q.push(p.gpa, .{
+        .time = now + 60 * std.time.ns_per_s, // far in the future
+        .target = id,
+        .probe = 0,
+        .seq = seq,
+    });
+    _ = try p.step();
+    try std.testing.expectEqual(@as(u32, 1), p.inflight);
+    try std.testing.expectEqual(@as(u32, 1), p.targets.items[id].pending);
+    try std.testing.expect(p.seqmap.fetch(seq) != null);
+}
+
 // ── tests: integration (loopback; skipped without ICMP socket access) ───────
 
 /// Captures per-probe outcomes for the loopback integration tests.

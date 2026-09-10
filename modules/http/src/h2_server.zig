@@ -451,6 +451,21 @@ pub const Limits = struct {
     /// closing one. The handler-parallelism knob is
     /// `Dispatcher.max_concurrent_handlers` (default 8); see its doc comment.
     max_concurrent_streams: u32 = 100,
+    /// F11 (`~/CML/20260901-zig-libs-audit/A1/http.md`): when the jobs map
+    /// is at `max_concurrent_streams` and a NEW stream arrives, evict the
+    /// oldest job that has made no progress at all (no body bytes received,
+    /// handler never dispatched) to make room instead of refusing the new
+    /// stream outright. Default `false` reproduces today's exact behavior —
+    /// a peer that opens `max_concurrent_streams` HEADERS and never sends
+    /// another byte occupies every slot on the connection until it closes.
+    /// `true` bounds that: a parked, contentless stream is the cheapest
+    /// thing on the connection to give up, and RST_STREAM(REFUSED_STREAM)
+    /// is exactly the retryable signal §8.7 reserves for streams nothing
+    /// was processed on. Streams that have received ANY body byte, or are
+    /// already dispatched to a handler, are never evicted by this — they
+    /// made progress and freeing them would be strictly more disruptive
+    /// than the exhaustion this closes.
+    evict_idle_streams_on_capacity: bool = false,
     /// Total request streams allowed on one connection; once reached the
     /// server finishes what is ready and closes with GOAWAY(NO_ERROR).
     max_streams_per_connection: u32 = 10_000,
@@ -1038,9 +1053,13 @@ const Session = struct {
         // also caps in-flight request state (the jobs map): a peer cannot
         // force unbounded buffered streams awaiting the handler.
         if (s.jobs.count() >= s.opts.limits.max_concurrent_streams) {
-            hd.headers.deinit(s.gpa);
-            s.conn.sendRstStream(&s.wire, hd.stream_id, .refused_stream) catch {};
-            return;
+            // F11: try to evict an idle, no-progress job to make room before
+            // refusing the new stream outright (opt-in, see the field doc).
+            if (!s.opts.limits.evict_idle_streams_on_capacity or !s.evictIdleJob()) {
+                hd.headers.deinit(s.gpa);
+                s.conn.sendRstStream(&s.wire, hd.stream_id, .refused_stream) catch {};
+                return;
+            }
         }
         // The incremental-request opt-in is decided HERE and only here —
         // the one moment at which "buffer the body first" and "run the
@@ -1277,6 +1296,26 @@ const Session = struct {
             }
             job.deinit(s.gpa);
         }
+    }
+
+    /// F11 (`~/CML/20260901-zig-libs-audit/A1/http.md`, opt-in via
+    /// `Limits.evict_idle_streams_on_capacity`): find the OLDEST job that
+    /// has made no progress at all — no body bytes received, handler never
+    /// dispatched, not yet complete — and evict it: RST_STREAM
+    /// (REFUSED_STREAM), safe to retry because nothing was processed
+    /// (§8.7), then `removeJob` to free the slot and return its receive
+    /// window credit. `s.jobs` is an `AutoArrayHashMapUnmanaged`, so
+    /// `.keys()` is admission order: the first match is the longest-parked
+    /// one. Returns whether a slot was freed.
+    fn evictIdleJob(s: *Session) bool {
+        for (s.jobs.keys()) |id| {
+            const job = s.jobs.getPtr(id).?;
+            if (job.dispatched or job.complete or job.body.items.len != 0) continue;
+            s.conn.sendRstStream(&s.wire, id, .refused_stream) catch {};
+            s.removeJob(id);
+            return true;
+        }
+        return false;
     }
 
     /// Retire a served stream. A streaming handler may well have answered
@@ -3320,6 +3359,96 @@ test "h2c serve: streams over SETTINGS_MAX_CONCURRENT_STREAMS → RST_STREAM(REF
     try testing.expectEqualStrings("one", peer.resp(sid1).body.items);
     try testing.expectEqual(@as(u16, 200), peer.resp(sid2).status);
     try testing.expectEqualStrings("two", peer.resp(sid2).body.items);
+}
+
+test "h2c serve: evict_idle_streams_on_capacity=false (default) still refuses — no behavior change" {
+    // Pins that the F11 opt-in defaults to today's exact behavior: two
+    // streams parked with HEADERS only (no DATA, no END_STREAM) at a limit
+    // of 2, then a third arrives — refused, same as the
+    // SETTINGS_MAX_CONCURRENT_STREAMS test above, WITHOUT setting the new
+    // field at all (its default is what is under test here).
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    _ = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid3 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_concurrent_streams = 2 },
+    }, &out_buf);
+
+    // sid1 is untouched (still parked, no response at all)...
+    try testing.expect(!peer.resps.contains(sid1));
+    // ...and sid3, the new stream, was refused rather than admitted.
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.refused_stream), peer.resp(sid3).rst);
+}
+
+test "h2c serve: evict_idle_streams_on_capacity=true evicts the oldest idle, no-progress stream" {
+    // F11 (`~/CML/20260901-zig-libs-audit/A1/http.md`): "100 parked HEADERS
+    // with no END_STREAM occupy every slot on the connection forever." Two
+    // streams open HEADERS only (no DATA, no END_STREAM) against a limit of
+    // 2 -- exactly that shape. A third, COMPLETE stream must evict the
+    // OLDEST parked one (sid1) rather than being refused.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid2 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid3 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_concurrent_streams = 2, .evict_idle_streams_on_capacity = true },
+    }, &out_buf);
+
+    // sid1 (the oldest, still-parked stream) was evicted, retryable...
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.refused_stream), peer.resp(sid1).rst);
+    // ...sid2 is untouched -- it never got DATA/END_STREAM either, so it is
+    // STILL parked and got no response at all. This is what pins "oldest",
+    // not just any idle job: if eviction picked sid2 instead, this would
+    // fail.
+    try testing.expect(!peer.resps.contains(sid2));
+    // ...and sid3 was admitted into the freed slot and served normally.
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid3).status);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: evict_idle_streams_on_capacity=true never evicts a stream that received body bytes" {
+    // The eviction candidate set is "no progress at all" -- a stream that
+    // has received even one DATA byte is excluded, even though it is not
+    // yet complete/dispatched. Two streams at the limit: sid1 got a DATA
+    // frame (no END_STREAM yet), sid2 is fully parked (HEADERS only). A
+    // third stream should evict sid2 (the genuinely idle one), not sid1.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    try peer.conn.sendData(&peer.wire, sid1, "partial", false); // progress, not complete
+    const sid2 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/echo"), false);
+    const sid3 = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+    var out_buf: [4096]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .limits = .{ .max_concurrent_streams = 2, .evict_idle_streams_on_capacity = true },
+    }, &out_buf);
+
+    // sid1 (has body bytes, not idle) is untouched -- no response at all...
+    try testing.expect(!peer.resps.contains(sid1));
+    // ...sid2 (genuinely idle) was evicted instead...
+    try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.refused_stream), peer.resp(sid2).rst);
+    // ...and sid3 was admitted.
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid3).status);
 }
 
 test "h2c serve: PING flood → GOAWAY(ENHANCE_YOUR_CALM)" {
