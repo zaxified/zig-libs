@@ -52,6 +52,12 @@ ripemd160.hash160(pubkey_bytes, &out);
   that path.
 - **`hash160`** composes this module's `Ripemd160` with
   `std.crypto.hash.sha2.Sha256` — no reimplementation of SHA-256.
+- **`final()` is single-use.** It does not clear or reset `Self` — a second
+  `final()` call, an `update()` after `final()`, or reusing a struct without
+  a fresh `init()` all return a well-defined but almost certainly not the
+  digest you want. Same shape as `std.crypto.hash.md5.Md5` and the rest of
+  `std.crypto.hash`: call `init()` again for the next message rather than
+  recycling a finished one.
 
 ## Verify
 

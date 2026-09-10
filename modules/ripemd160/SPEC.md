@@ -28,6 +28,12 @@ message tail leaves no room), then the 64-bit bit-length as **LE** bytes.
 Streaming cache (`buf`/`buf_len`/`total_len`) mirrors
 `std.crypto.hash.md5.Md5`'s shape.
 
+**`final()` is single-use, deliberately, matching `std.crypto.hash`.** It
+does not clear `Self`: a second `final()`, an `update()` after `final()`, or
+reuse without a fresh `init()` all return a digest, just not the one over the
+bytes a caller probably meant. None of `sha2`/`sha3`/`blake2`/`blake3` in
+`std` offer a `reset()` either — the fix is `init()` again, not recycling.
+
 ## Threat model / out of scope
 
 Not secret-input-sensitive in this repo's usage (content hashing / Bitcoin
@@ -60,8 +66,19 @@ digest. `hash160`: cross-checked against a real secp256k1 compressed pubkey
 generated locally (`openssl ecparam -genkey -name secp256k1`) piped through
 `openssl dgst -sha256 | openssl dgst -rmd160` — the same
 SHA256∘RIPEMD160 composition Bitcoin uses — plus an in-module differential
-against a manual `Sha256` → `Ripemd160` composition. Run:
-`zig build test-ripemd160`.
+against a manual `Sha256` → `Ripemd160` composition. Also `Hmac(Ripemd160)`
+against the RFC 2286 HMAC-RIPEMD160 vectors — the one test that actually
+reads `block_length`, rather than comparing it to its own hardcoded copy.
+Run: `zig build test-ripemd160`.
+
+**Fuzz:** one `testing.fuzz` target, `fuzzStreamingMatchesOneShot` —
+differential oracle, streaming `update`/`final` against one-shot `hash`, at
+however many block-boundary-straddling splits the input's own bytes pick.
+Corpus seeds sit at the lengths the KATs don't reach (55/56, 63/64/65, and
+others around `block_length`). It does not re-check byte-exactness against
+an external reference — the KATs above already pin that — it checks the
+buffer arithmetic (`update`'s partial-fill / full-block / remainder logic)
+the KATs' one-shot calls can't exercise.
 
 ## Backlog / deferred
 

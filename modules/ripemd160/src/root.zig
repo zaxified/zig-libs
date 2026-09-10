@@ -176,7 +176,13 @@ pub const Ripemd160 = struct {
     }
 
     pub fn final(d: *Self, out: *[digest_length]u8) void {
-        // Buffer is never completely full here (compress drains at 64).
+        // Buffer is never completely full here (compress drains at 64) --
+        // pinned, not just commented: a guard weakened from `>= 64` to `> 64`
+        // in `update` lets `buf_len` reach exactly 64 on entry, which without
+        // this assert writes `d.buf[64]` out of bounds (OOB in Debug/
+        // ReleaseSafe, a silently wrong digest in ReleaseFast -- both
+        // reproduced against this exact mutation).
+        std.debug.assert(d.buf_len < 64);
         @memset(d.buf[d.buf_len..], 0);
 
         d.buf[d.buf_len] = 0x80;
@@ -335,6 +341,26 @@ test "final() padding boundary: message length 55 (mod 64) needs no extra block"
     try expectHex("3c86963b3ff646a65ae42996e9664c747cc7e5e6", out);
 }
 
+test "final() padding boundary: message length 56 (mod 64) forces a second padding block" {
+    // F1: 55 (above) is the last length whose padding still fits in the
+    // block being finished; 56 is the FIRST length that doesn't, so `final`
+    // must compress a padding block and then start a fresh all-zero block
+    // for the length suffix -- the other branch of the `if (64 - d.buf_len <
+    // 8)` check. None of the KATs above land here either: message lengths
+    // mod 64 are 0,1,3,14,26,62,16,55,8,0,38,33,32 -- 56 is not among them.
+    // A one-token weakening of that guard (`< 8` -> `< 7`) passes every
+    // other test in this file and 300k+ `--fuzz` runs (the fuzz oracle is
+    // streaming == one-shot, and the mutation changes both paths the same
+    // way) while returning a wrong digest on exactly this boundary.
+    // Reference computed independently: openssl dgst -r -rmd160 and Python
+    // hashlib.new('ripemd160') agree.
+    var msg: [56]u8 = undefined;
+    for (&msg, 0..) |*byte, i| byte.* = @intCast(i % 251);
+    var out: [Ripemd160.digest_length]u8 = undefined;
+    Ripemd160.hash(&msg, &out, .{});
+    try expectHex("ebdd79cfd4fd9949ef8089673d2620427f487cfb", out);
+}
+
 test "streaming: chunked update equals one-shot, across block boundaries" {
     for (kats) |v| {
         var one_shot: [Ripemd160.digest_length]u8 = undefined;
@@ -363,6 +389,30 @@ test "streaming: chunked update equals one-shot, across block boundaries" {
     d.update(msg[130..200]);
     var streamed: [Ripemd160.digest_length]u8 = undefined;
     d.final(&streamed);
+    try testing.expectEqualSlices(u8, &one_shot, &streamed);
+}
+
+test "final() immediately after update fills exactly to a block boundary" {
+    // F8: the test above always follows the block-filling update with MORE
+    // update() calls before final(), so it never exercises the moment
+    // `buf_len` has just been reset to 0 by the partial-fill branch of
+    // `update` and `final` runs right away. Two updates land exactly on the
+    // 64-byte boundary here, then `final` runs with no update() in between --
+    // must still agree with the one-shot hash of the same bytes. (This is
+    // also the shape the `final` assert above exists to guard: weakening
+    // `update`'s `>= 64` to `> 64` makes `buf_len` land on 64 instead of 0 at
+    // exactly this call sequence.)
+    var msg: [64]u8 = undefined;
+    for (&msg, 0..) |*byte, i| byte.* = @intCast(i % 251);
+
+    var one_shot: [Ripemd160.digest_length]u8 = undefined;
+    Ripemd160.hash(&msg, &one_shot, .{});
+
+    var d = Ripemd160.init(.{});
+    d.update(msg[0..1]);
+    d.update(msg[1..64]); // exactly fills the block on THIS call
+    var streamed: [Ripemd160.digest_length]u8 = undefined;
+    d.final(&streamed); // immediately -- no update() in between
     try testing.expectEqualSlices(u8, &one_shot, &streamed);
 }
 
@@ -409,14 +459,46 @@ test "block_length / digest_length" {
     try testing.expectEqual(@as(usize, 20), Ripemd160.digest_length);
 }
 
+test "HMAC-RIPEMD160: RFC 2286 test vectors via std.crypto.auth.hmac.Hmac(Ripemd160)" {
+    // F6: `block_length` above is a declaration nothing INSIDE this module
+    // reads -- compress/update/final all use the literal 64 -- so the test
+    // above only compares the declaration with its own hardcoded copy; a
+    // consistent edit of both (as a careless rename would produce) sails
+    // through it. std's generic `Hmac(H)` genuinely reads `H.block_length` to
+    // size its key-padding blocks, so this is the first test in the module
+    // that CONSUMES the declaration rather than restating it.
+    // Vectors: RFC 2286 (HMAC-RIPEMD160), cross-checked independently against
+    // both Python's `hmac.new(key, msg, ripemd160)` and `openssl dgst -rmd160
+    // -mac HMAC -macopt hexkey:...` (agree on 6 of 7; the 7th, an empty key,
+    // is outside what OpenSSL's CLI can express but not what Python's hmac
+    // module can).
+    const Hmac = std.crypto.auth.hmac.Hmac(Ripemd160);
+    const Case = struct { key: []const u8, msg: []const u8, hex: *const [40]u8 };
+    const cases = [_]Case{
+        .{ .key = "\x0b" ** 20, .msg = "Hi There", .hex = "24cb4bd67d20fc1a5d2ed7732dcc39377f0a5668" },
+        .{ .key = "Jefe", .msg = "what do ya want for nothing?", .hex = "dda6c0213a485a9e24f4742064a7f033b43c4069" },
+        .{ .key = "\xaa" ** 20, .msg = "\xdd" ** 50, .hex = "b0b105360de759960ab4f35298e116e295d8e7c1" },
+        .{ .key = "\xaa" ** 80, .msg = "Test Using Larger Than Block-Size Key - Hash Key First", .hex = "6466ca07ac5eac29e1bd523e5ada7605b791fd8b" },
+        .{ .key = "\xaa" ** 131, .msg = "Test With Truncation", .hex = "d02200748bbc0d22c4ff839623ce1f0fcba3d2d7" },
+        .{ .key = "k", .msg = "", .hex = "1c4760c49feb2f7bb5a8390950a48521d6557be5" },
+        .{ .key = "", .msg = "", .hex = "44d86b658a3e7cbc1a2010848b53e35c917720ca" },
+    };
+    for (cases) |c| {
+        var tag: [Hmac.mac_length]u8 = undefined;
+        Hmac.create(&tag, c.msg, c.key);
+        try expectHex(c.hex, tag);
+    }
+}
+
 // ── fuzz: streaming `update` agrees with one-shot `hash`, at any split ─────
 //
-// W2 A3 (F1): CLASS B, zero `testing.fuzz(` harnesses — this module was
-// absent from `scripts/fuzz-sweep.sh`'s target list entirely. Per the
-// campaign brief, a crypto primitive's byte-exactness is already pinned by
-// the KATs above (including the LE-length-padding stress vector); fuzzing
-// it again would duplicate that, not add to it. What the KATs do NOT cover
-// is `update`'s own buffer arithmetic — the partial-buffer fill, the
+// W2 A3 (F1), historical: this module used to have zero `testing.fuzz(`
+// harnesses and was absent from `scripts/fuzz-sweep.sh`'s target list
+// entirely. The harness below closed that. Per the campaign brief, a crypto
+// primitive's byte-exactness is already pinned by the KATs above (including
+// the LE-length-padding stress vector); fuzzing it again would duplicate
+// that, not add to it. What the KATs do NOT cover is `update`'s own buffer
+// arithmetic — the partial-buffer fill, the
 // full-block loop, and the remainder copy that has to stay correct across
 // however many calls and however the caller chops the message up. The
 // existing "streaming: chunked update equals one-shot" test only tries a
