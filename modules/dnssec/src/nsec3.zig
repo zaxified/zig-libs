@@ -175,15 +175,59 @@ const cname_type: u16 = 5;
 /// response as insecure rather than spend the work.
 pub const max_nsec3_iterations: u16 = 100;
 
+/// Upper bound on how many NSEC3 records `proveDenial` will consider for one
+/// proof — the |set| side of the O(depth × |set|) cost this function used to
+/// pay uncapped (audit F2): a 253-octet qname climbs up to 128 closest-
+/// encloser candidates, and each candidate used to re-decode every record's
+/// base32hex owner-hash label from scratch. Measured 2026-09-04: 885 minimal
+/// NSEC3 RRs (~74 bytes each) is what fits in one maximum-size (64 KB TCP)
+/// DNS response; this cap sits comfortably above that so no legitimate
+/// answer is rejected, while still bounding the per-query cost to a fixed
+/// decode-once pass. Mirrors `max_nsec3_iterations`'s role on the other
+/// (hash-cost) axis of the same amplification.
+pub const max_nsec3_records: usize = 1200;
+
+/// One NSEC3 record with its owner-hash label already decoded to a raw
+/// SHA-1 digest — computed once per `proveDenial` call, not once per
+/// closest-encloser candidate (see `max_nsec3_records`'s doc comment).
+const DecodedRecord = struct {
+    owner: [sha1_digest_len]u8,
+    rdata: rdata.Nsec3,
+};
+
 pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []const u8, iterations: u16) DenialResult {
     // RFC 9276 §3.2: refuse to do the amplified hashing work for an over-limit
     // iteration count — downgrade to provably-insecure before any hashName call.
     if (iterations > max_nsec3_iterations) return .insecure;
     const set = nsec3_set.records;
+    // The other axis of the same amplification (audit F2): an oversized set
+    // costs O(depth × |set|) base32hex decodes below. Refuse rather than
+    // spend it — no real zone cut needs more than this many NSEC3 RRs to
+    // deny one name (see `max_nsec3_records`'s doc comment).
+    if (set.len > max_nsec3_records) return .bogus;
+
+    // Decode every usable record's owner-hash label ONCE, up front. Before
+    // this fix, `matchNsec3`/`coverNsec3` each re-decoded the base32hex
+    // label of EVERY record on EVERY call, and the closest-encloser loop
+    // below calls one of them once per label of `qname` (up to 128 for a
+    // maximal name) — decode work that does not depend on the candidate
+    // name at all, paid again for each candidate. Measured (ReleaseFast,
+    // audit F2): 885 records × depth 127 = 23.0 ms end-to-end vs. 2.4 ms
+    // decoding once — 9-10×.
+    var decoded_buf: [max_nsec3_records]DecodedRecord = undefined;
+    var decoded_len: usize = 0;
+    for (set) |r| {
+        if (!usableRecord(r, salt, iterations)) continue;
+        var oh: [sha1_digest_len]u8 = undefined;
+        if (decodeOwnerHash(r.owner_hash_label, &oh) == null) continue;
+        decoded_buf[decoded_len] = .{ .owner = oh, .rdata = r.rdata };
+        decoded_len += 1;
+    }
+    const decoded = decoded_buf[0..decoded_len];
 
     // (1) Direct match on QNAME (§8.5): the name provably exists, so the only
     // denial it can support is NODATA (queried type + CNAME both absent).
-    if (matchNsec3(set, qname, salt, iterations)) |m| {
+    if (matchDecoded(decoded, qname, salt, iterations)) |m| {
         if (m.types.contains(qtype) or m.types.contains(cname_type)) return .bogus;
         return .no_data;
     }
@@ -197,7 +241,7 @@ pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []c
         var cur: []const u8 = parentOf(prev);
         var found = false;
         while (true) {
-            if (matchNsec3(set, cur, salt, iterations)) |_| {
+            if (matchDecoded(decoded, cur, salt, iterations)) |_| {
                 closest_encloser = cur;
                 next_closer = prev;
                 found = true;
@@ -211,13 +255,13 @@ pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []c
     }
 
     // (3) The next closer name must be covered (proves it does not exist).
-    const nc_cover = coverNsec3(set, next_closer, salt, iterations) orelse return .bogus;
+    const nc_cover = coverDecoded(decoded, next_closer, salt, iterations) orelse return .bogus;
     const opt_out = nc_cover.optOut();
 
     // (4) Wildcard at the closest encloser.
     var wc_buf: [2 + wire.max_name_text_len]u8 = undefined;
     const wildcard = wildcardName(closest_encloser, &wc_buf) orelse return .bogus;
-    if (matchNsec3(set, wildcard, salt, iterations)) |wm| {
+    if (matchDecoded(decoded, wildcard, salt, iterations)) |wm| {
         // The wildcard exists: NODATA if it lacks the type, else a positive
         // wildcard answer (RFC 5155 §8.7 / §8.8).
         if (wm.types.contains(qtype) or wm.types.contains(cname_type)) return .wildcard_answer;
@@ -227,7 +271,7 @@ pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []c
     // the next-closer cover downgrades the proof to insecure (§8.9): the next
     // closer name could be an unsigned (opt-out) delegation rather than truly
     // absent.
-    _ = coverNsec3(set, wildcard, salt, iterations) orelse return .bogus;
+    _ = coverDecoded(decoded, wildcard, salt, iterations) orelse return .bogus;
     if (opt_out) return .insecure;
     return .name_error;
 }
@@ -286,33 +330,30 @@ fn decodeOwnerHash(label: []const u8, out: *[sha1_digest_len]u8) ?[]const u8 {
 }
 
 /// The NSEC3 whose owner hash equals `hash(name)`, if any (§8.3 "match").
-fn matchNsec3(set: []const Nsec3Record, name: []const u8, salt: []const u8, iterations: u16) ?rdata.Nsec3 {
+/// `decoded` is `proveDenial`'s once-per-call decode of the whole set (see
+/// `max_nsec3_records`'s doc comment) — `usableRecord`/`decodeOwnerHash`
+/// already ran when it was built, so only `name`'s own hash is computed here.
+fn matchDecoded(decoded: []const DecodedRecord, name: []const u8, salt: []const u8, iterations: u16) ?rdata.Nsec3 {
     const h = hashName(name, salt, iterations) orelse return null;
-    for (set) |r| {
-        if (!usableRecord(r, salt, iterations)) continue;
-        var oh: [sha1_digest_len]u8 = undefined;
-        const owner = decodeOwnerHash(r.owner_hash_label, &oh) orelse continue;
-        if (std.mem.eql(u8, owner, &h)) return r.rdata;
+    for (decoded) |d| {
+        if (std.mem.eql(u8, &d.owner, &h)) return d.rdata;
     }
     return null;
 }
 
 /// The NSEC3 that covers `hash(name)` — i.e. owner_hash < H < next_hash, with
 /// the last record in the chain wrapping (owner_hash >= next_hash) — if any
-/// (§8.3 "cover").
-fn coverNsec3(set: []const Nsec3Record, name: []const u8, salt: []const u8, iterations: u16) ?rdata.Nsec3 {
+/// (§8.3 "cover"). See `matchDecoded`'s doc comment for `decoded`.
+fn coverDecoded(decoded: []const DecodedRecord, name: []const u8, salt: []const u8, iterations: u16) ?rdata.Nsec3 {
     const h = hashName(name, salt, iterations) orelse return null;
-    for (set) |r| {
-        if (!usableRecord(r, salt, iterations)) continue;
-        var oh: [sha1_digest_len]u8 = undefined;
-        const owner = decodeOwnerHash(r.owner_hash_label, &oh) orelse continue;
-        const next = r.rdata.next_hashed_owner_name;
+    for (decoded) |d| {
+        const next = d.rdata.next_hashed_owner_name;
         if (next.len != sha1_digest_len) continue;
-        const o_lt_h = std.mem.order(u8, owner, &h) == .lt;
+        const o_lt_h = std.mem.order(u8, &d.owner, &h) == .lt;
         const h_lt_n = std.mem.order(u8, &h, next) == .lt;
-        const wraps = std.mem.order(u8, owner, next) != .lt; // owner >= next
+        const wraps = std.mem.order(u8, &d.owner, next) != .lt; // owner >= next
         const covered = if (wraps) (o_lt_h or h_lt_n) else (o_lt_h and h_lt_n);
-        if (covered) return r.rdata;
+        if (covered) return d.rdata;
     }
     return null;
 }
@@ -489,6 +530,61 @@ test "proveDenial: over-limit NSEC3 iterations downgrade to insecure (RFC 9276, 
     // At the cap it still runs the proof (empty set can't prove denial -> bogus),
     // confirming 100 is accepted and 101 is the first rejected value.
     try testing.expectEqual(DenialResult.bogus, proveDenial("www.example", 1, empty, "", max_nsec3_iterations));
+}
+
+test "proveDenial: over-cap NSEC3 record count is refused even when a real proof is inside it (audit F2)" {
+    // `max_nsec3_iterations` bounds the per-candidate hashing cost; this
+    // bounds |set| itself, the other factor in the O(depth * |set|) cost the
+    // closest-encloser climb used to pay uncapped. The positive control is
+    // what makes this a real test rather than a shape check: the SAME
+    // genuinely-matching record is present in both sets below, so the two
+    // different verdicts can only come from the count, not from whether a
+    // proof exists.
+    var label_buf: [64]u8 = undefined;
+    const real_label = ownerLabel("www.example", "", 0, &label_buf);
+    const real_record: Nsec3Record = .{
+        .owner_hash_label = real_label,
+        .rdata = .{
+            .hash_algorithm = hash_algorithm_sha1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = "",
+            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .types = .{ .raw = "" }, // empty bitmap: direct match -> NODATA
+        },
+    };
+    // Filler that never matches anything real (`hash("filler")` for a name no
+    // test ever queries), padding the set out to and past the cap.
+    var filler_label_buf: [64]u8 = undefined;
+    const filler_label = ownerLabel("filler.example", "", 0, &filler_label_buf);
+    const filler_record: Nsec3Record = .{
+        .owner_hash_label = filler_label,
+        .rdata = .{
+            .hash_algorithm = hash_algorithm_sha1,
+            .flags = 0,
+            .iterations = 0,
+            .salt = "",
+            .next_hashed_owner_name = &[_]u8{0} ** sha1_digest_len,
+            .types = .{ .raw = "" },
+        },
+    };
+
+    var records: [max_nsec3_records + 1]Nsec3Record = undefined;
+    records[0] = real_record;
+    for (records[1..]) |*r| r.* = filler_record;
+
+    // At exactly the cap (the real record included, at the end): the proof
+    // still runs and finds it.
+    try testing.expectEqual(
+        DenialResult.no_data,
+        proveDenial("www.example", 1, .{ .records = records[0..max_nsec3_records] }, "", 0),
+    );
+    // One filler over the cap (the SAME real record still present, now
+    // pushed past `max_nsec3_records`): refused before the scan even starts.
+    try testing.expectEqual(
+        DenialResult.bogus,
+        proveDenial("www.example", 1, .{ .records = &records }, "", 0),
+    );
 }
 
 // ── fuzz: NSEC3 owner-hash label decode, never panics ───────────────────────

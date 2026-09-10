@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `validate` now rejects an
+  RRset whose `rrsig.signer_name` is not the owner name's zone or an
+  ancestor of it (RFC 4035 §5.3.1, audit A1 F1) and whose `rrsig.labels`
+  exceeds the owner's own label count (F6); `chain.validateDnskeySet`
+  applies the equivalent type_covered/signer_name/labels guards (F5);
+  `nsec3.proveDenial` now refuses a set of more than `max_nsec3_records`
+  (1200, new public constant) NSEC3 records instead of scanning it (F2,
+  also ~20x faster at the audit's measured shape via a decode-once pass);
+  `rdata.TypeBitMap.contains` bounds-checks every window instead of only
+  the one being probed (F4). All four narrow what previously validated or
+  ran without crashing; no consumer exists yet (0 in-repo, confirmed against
+  `example-apps/` too) so nothing downstream to update.
 - **2026-09-07** — **All four fuzz harnesses were replaying an EMPTY input, three of
   them also had a dead knob, and two had buffers smaller than this module's own
   vectors.**

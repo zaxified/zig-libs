@@ -114,6 +114,21 @@ pub fn rrsigTimeValid(rrsig: rdata.Rrsig, now: u32) bool {
     return since_inception >= 0 and until_expiration >= 0;
 }
 
+/// Number of labels in a dotted name, per RFC 4034 §3.1.3 (the root has 0).
+/// Mirrors `canonical.labelCount`/`nsec.splitLabels`'s label-counting
+/// convention (both private to their own files); duplicated here rather than
+/// exported because it is one line and callers in three files would
+/// otherwise fight over which one owns it.
+fn ownerLabelCount(name: []const u8) u8 {
+    const n = if (std.mem.endsWith(u8, name, ".")) name[0 .. name.len - 1] else name;
+    if (n.len == 0) return 0;
+    var count: u8 = 1;
+    for (n) |c| {
+        if (c == '.') count +|= 1;
+    }
+    return count;
+}
+
 // ── top-level validation entry point ───────────────────────────────────────
 
 pub const ValidationResult = enum {
@@ -179,6 +194,20 @@ pub fn validate(
     // mismatch here, before the dispatch (RFC 4035: the RRSIG and the DNSKEY
     // that signed it necessarily share one algorithm).
     if (rrsig.algorithm != dnskey.algorithm) return .bogus;
+    // RFC 4035 §5.3.1: "The RRSIG RR's Signer's Name field MUST be the name
+    // of the zone that contains the RRset" — owner_name must be signer_name
+    // itself or a descendant of it. Without this, a key for `example.com`
+    // could vouch for an RRset owned by an unrelated name (`www.victim.org`)
+    // simply because the attacker supplies that RRSIG's signer_name as
+    // `example.com` while the owner_name stays victim.org: nothing here
+    // compared the two (audit F1).
+    if (!nsec.isNameOrDescendant(owner_name, rrsig.signer_name)) return .bogus;
+    // RFC 4035 §5.3.1: "The number of labels in the RRset owner name MUST be
+    // greater than or equal to the value in the RRSIG RR's Labels field."
+    // `signedOwnerName` (canonical.zig) silently treats an over-large
+    // `labels` as "not a wildcard" and signs the plain owner name instead of
+    // rejecting it (audit F6) — reject here, before that ever runs.
+    if (rrsig.labels > ownerLabelCount(owner_name)) return .bogus;
 
     // Reconstruct the raw DNSKEY RDATA (RFC 4034 §2.1) so the trust anchor
     // (which digests/compares raw bytes) can be checked against this key.
@@ -289,6 +318,123 @@ test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confu
         .signer_name = owner,
         .signature = &[_]u8{0} ** 64,
     };
+    const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
+    const r = try validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000 });
+    try testing.expectEqual(ValidationResult.bogus, r);
+}
+
+test "regression: validate does not bind rrsig.signer_name to owner_name (audit F1)" {
+    // A key trusted for `example.com` must not vouch for an RRset owned by an
+    // unrelated name. Before the fix `validate` never compared `owner_name`
+    // to `rrsig.signer_name` at all: as long as the signature verified over
+    // whatever signer_name the attacker supplied, the RRset validated
+    // `.secure` regardless of whose name it actually sat at — reproduced
+    // here with a REAL Ed25519 signature over the attacker's chosen
+    // signer_name, not just a shape check.
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const pub_bytes = kp.public_key.toBytes();
+
+    const dnskey: rdata.Dnskey = .{
+        .flags = rdata.Dnskey.flag_zone_key,
+        .protocol = 3,
+        .algorithm = rdata.algorithm.ed25519,
+        .public_key = &pub_bytes,
+    };
+    var raw: [4 + 32]u8 = undefined;
+    std.mem.writeInt(u16, raw[0..2], dnskey.flags, .big);
+    raw[2] = dnskey.protocol;
+    raw[3] = dnskey.algorithm;
+    @memcpy(raw[4..], &pub_bytes);
+
+    // The attacker owns `example.com` (the trust anchor vouches for exactly
+    // this key), but claims to sign an RRset owned by `www.victim.org`.
+    const owner = "www.victim.org";
+    var rrsig: rdata.Rrsig = .{
+        .type_covered = 16, // TXT
+        .algorithm = rdata.algorithm.ed25519,
+        .labels = 3,
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = rdata.keyTag(&raw, dnskey.algorithm),
+        .signer_name = "example.com", // attacker's own zone, NOT victim.org
+        .signature = &[_]u8{0} ** 64,
+    };
+    const rrset = [_]dns.Record{.{
+        .name = owner,
+        .ty = @enumFromInt(16),
+        .class = .in,
+        .ttl = 3600,
+        .data = .{ .unknown = "pwned" },
+    }};
+
+    // Sign the EXACT bytes `validate` itself builds, so the forged RRSIG is
+    // a real signature, not a stand-in that would fail for an unrelated
+    // reason.
+    const signed = try canonical.buildSignedData(testing.allocator, &rrset, rrsig, owner);
+    defer testing.allocator.free(signed);
+    const sig = try kp.sign(signed, null);
+    const sig_bytes = sig.toBytes();
+    rrsig.signature = &sig_bytes;
+
+    const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
+    const r = try validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000 });
+    try testing.expectEqual(ValidationResult.bogus, r);
+}
+
+test "regression: rrsig.labels greater than the owner's own label count is rejected (audit F6)" {
+    // RFC 4035 §5.3.1: "The number of labels in the RRset owner name MUST be
+    // greater than or equal to the value in the RRSIG RR's Labels field."
+    // `canonical.signedOwnerName` treats `labels >= owner's label count` as
+    // "not a wildcard" — so an over-large `labels` field used to sail
+    // through unexamined. Not independently exploitable (the signature must
+    // still verify over the exact `labels` the attacker chose), but it is a
+    // norm-mandated guard this validator skipped. Real Ed25519 signature,
+    // same shape as the F1 regression above.
+    var seed: [32]u8 = undefined;
+    for (&seed, 0..) |*b, i| b.* = @intCast(i + 1);
+    const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+    const pub_bytes = kp.public_key.toBytes();
+
+    const dnskey: rdata.Dnskey = .{
+        .flags = rdata.Dnskey.flag_zone_key,
+        .protocol = 3,
+        .algorithm = rdata.algorithm.ed25519,
+        .public_key = &pub_bytes,
+    };
+    var raw: [4 + 32]u8 = undefined;
+    std.mem.writeInt(u16, raw[0..2], dnskey.flags, .big);
+    raw[2] = dnskey.protocol;
+    raw[3] = dnskey.algorithm;
+    @memcpy(raw[4..], &pub_bytes);
+
+    const owner = "www.example.com"; // 3 labels
+    var rrsig: rdata.Rrsig = .{
+        .type_covered = 16, // TXT
+        .algorithm = rdata.algorithm.ed25519,
+        .labels = 200, // far over the owner's 3 labels
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = rdata.keyTag(&raw, dnskey.algorithm),
+        .signer_name = "example.com",
+        .signature = &[_]u8{0} ** 64,
+    };
+    const rrset = [_]dns.Record{.{
+        .name = owner,
+        .ty = @enumFromInt(16),
+        .class = .in,
+        .ttl = 3600,
+        .data = .{ .unknown = "x" },
+    }};
+    const signed = try canonical.buildSignedData(testing.allocator, &rrset, rrsig, owner);
+    defer testing.allocator.free(signed);
+    const sig = try kp.sign(signed, null);
+    const sig_bytes = sig.toBytes();
+    rrsig.signature = &sig_bytes;
+
     const anchor: chain.TrustAnchor = .{ .dnskey_rdata = &raw };
     const r = try validate(testing.allocator, &rrset, rrsig, owner, dnskey, anchor, .{ .now = 1000 });
     try testing.expectEqual(ValidationResult.bogus, r);

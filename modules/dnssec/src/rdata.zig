@@ -169,6 +169,18 @@ pub const TypeBitMap = struct {
     raw: []const u8,
 
     /// Whether RR type `wanted_type` is asserted present in this bitmap.
+    ///
+    /// Bounds-checks EVERY window, not just the one matching `window` — the
+    /// doc comment above claims the invariant "validated once at parse time,
+    /// `contains` never re-validates and cannot go out of bounds" is only
+    /// true for `raw` slices that actually came from `parseTypeBitMap`.
+    /// `TypeBitMap.raw` is `pub` and `proveDenial` (both `nsec.zig` and
+    /// `nsec3.zig`) accepts caller-assembled `rdata.Nsec`/`rdata.Nsec3`
+    /// values directly, so a hostile `raw` can reach here unchecked (audit
+    /// F4): the old code sliced `self.raw[i + 2 ..][0..len]` BEFORE testing
+    /// `w == window`, so an over-long declared length on a window nobody
+    /// asked about still panicked (ReleaseSafe) or read out of bounds
+    /// (ReleaseFast).
     pub fn contains(self: TypeBitMap, wanted_type: u16) bool {
         const window: u8 = @truncate(wanted_type >> 8);
         const bit: u8 = @truncate(wanted_type & 0xff);
@@ -176,8 +188,9 @@ pub const TypeBitMap = struct {
         while (i + 2 <= self.raw.len) {
             const w = self.raw[i];
             const len = self.raw[i + 1];
-            const bitmap = self.raw[i + 2 ..][0..len];
+            if (i + 2 + len > self.raw.len) return false; // malformed window: fail closed
             if (w == window) {
+                const bitmap = self.raw[i + 2 ..][0..len];
                 const byte_idx = bit / 8;
                 if (byte_idx >= len) return false;
                 return bitmap[byte_idx] & (@as(u8, 0x80) >> @intCast(bit % 8)) != 0;
@@ -447,6 +460,23 @@ test "TypeBitMap: multiple windows, non-increasing window rejected" {
 test "TypeBitMap: truncated bitmap errors" {
     const raw = [_]u8{ 0, 5, 0x80 }; // claims 5 bytes, has 1
     try testing.expectError(error.Truncated, parseTypeBitMap(&raw));
+}
+
+test "regression: TypeBitMap.contains does not read past a caller-assembled raw (audit F4)" {
+    // `TypeBitMap.raw` is `pub` and `proveDenial` accepts caller-assembled
+    // `rdata.Nsec`/`rdata.Nsec3` values directly (the module's own tests do
+    // exactly this via `.{ .raw = "" }`-style literals) — so `raw` reaching
+    // `contains` is not guaranteed to have gone through `parseTypeBitMap`.
+    // Window 0 declares length 200 but only 2 bytes follow: ReleaseSafe used
+    // to panic "index out of bounds: index 202, len 4" and ReleaseFast
+    // silently read out of bounds. `contains` must now fail closed to
+    // `false` regardless of which type is asked for, and regardless of
+    // whether that type's window is the malformed one.
+    const evil = "\x00\xc8\xaa\xbb"; // window=0, len=200(0xc8), 2 bytes available
+    const tbm: TypeBitMap = .{ .raw = evil };
+    try testing.expect(!tbm.contains(0)); // type 0: window 0, the malformed window itself
+    try testing.expect(!tbm.contains(7)); // type 7: same window, different bit
+    try testing.expect(!tbm.contains(256)); // type 256: window 1, never reached — also false
 }
 
 test "parseNsec: next name + bitmap" {

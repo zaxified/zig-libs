@@ -74,10 +74,18 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
     RRSIG it is handed; it does not enforce a policy that rejects a
     weak/deprecated algorithm when a stronger one is present in the same
     DNSKEY set. A consumer must apply RFC 8624 algorithm selection.
-  - **NSEC3 iteration-count DoS (RFC 9276).** `nsec3.proveDenial` /
-    `iteratedHash` honour whatever iteration count the record carries; there
-    is no cap, so a malicious high count is an amplification vector. A
-    consumer must reject/limit per RFC 9276 (recommended: 0).
+  - ~~NSEC3 iteration-count DoS (RFC 9276).~~ **Fixed.** `nsec3.proveDenial`
+    rejects (`.insecure`, before any hashing work) any set whose iteration
+    count exceeds `max_nsec3_iterations` (100, RFC 9276 §3.2's recommended
+    ceiling) — this bullet used to say "there is no cap"; there has been one
+    since the 07-19 audit round (this file had drifted from the code).
+    ⭐ **Also fixed (audit A1 F2, 2026-09-10):** the closest-encloser search's
+    OTHER amplification axis, record-set size, is now bounded too
+    (`max_nsec3_records`) and the per-candidate owner-hash decode that used to
+    re-run once per closest-encloser candidate now runs once per `proveDenial`
+    call — O(depth) candidates × O(1) amortized lookup instead of O(depth ×
+    |set|). Measured (ReleaseFast, 885 records, 253-octet/127-label qname):
+    22.6 ms → 1.1 ms, ~20×.
   - **Plain-NSEC denial proof.** `nsec.proveDenial` implements the NSEC-based
     NXDOMAIN/NODATA/wildcard/insecure-delegation reasoning (the analogue of
     `nsec3.proveDenial`) over the RFC 4034 §6.1 canonical name order. Like the
@@ -88,6 +96,24 @@ The `.secure`/`.bogus` verdict IS attackable now, so:
     `.insecure` rather than asserting secure non-existence), but the wider
     "opt-out cannot hide an otherwise-signed delegation" property is the
     resolver's to enforce across cuts.
+  - **Wildcard expansion is not accompanied by a denial-of-existence
+    requirement (audit A1 F7).** `validate` accepts an RRSIG whose `labels`
+    is less than the owner name's own label count (a wildcard-synthesized
+    answer, RFC 4034 §3.1.3) purely on the signature verifying — it does not
+    itself demand a matching NSEC/NSEC3 proof that no exact-match record
+    exists for the queried name (RFC 4035 §5.3.4: a resolver accepting a
+    wildcard answer MUST also verify that proof). `nsec.proveDenial` and
+    `nsec3.proveDenial` both already implement that denial, so this is a
+    responsibility split, not a missing capability: `validate` authenticates
+    one RRset against one RRSIG (the "is this signature genuine" question);
+    stitching a wildcard RRSIG to its required denial proof is the
+    multi-RRset, multi-record resolver logic above it, the same scope
+    boundary `chain.zig`'s header draws for delegation walking. A consumer
+    that accepts a `.secure` wildcard-synthesized answer without separately
+    calling `proveDenial` for the exact-match qname is NOT RFC 4035
+    §5.3.4-compliant — spelled out here explicitly because "the module has
+    the denial machinery so it must be doing this already" is the wrong
+    inference.
 
 ## Verification
 

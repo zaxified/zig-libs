@@ -28,6 +28,22 @@ const rdata = @import("rdata.zig");
 const ds_mod = @import("ds.zig");
 const keys = @import("keys.zig");
 const canonical = @import("canonical.zig");
+const nsec = @import("nsec.zig");
+
+/// Number of labels in a dotted name, per RFC 4034 §3.1.3 (the root has 0).
+/// Duplicated from `root.zig`'s `ownerLabelCount` (private to that file, and
+/// `root.zig` imports this file, so the reverse import would cycle) — see
+/// that copy's doc comment for why this is one small function rather than a
+/// shared export three files would fight over.
+fn ownerLabelCount(name: []const u8) u8 {
+    const n = if (std.mem.endsWith(u8, name, ".")) name[0 .. name.len - 1] else name;
+    if (n.len == 0) return 0;
+    var count: u8 = 1;
+    for (n) |c| {
+        if (c == '.') count +|= 1;
+    }
+    return count;
+}
 
 /// A configured trust anchor for a zone: either a DS record (the normal
 /// case, verified against a candidate DNSKEY via `ds.matches`) or a
@@ -64,6 +80,20 @@ pub fn validateDnskeySet(
     trust_anchor: TrustAnchor,
 ) ChainError!ChainResult {
     if (dnskey_rrset.len == 0) return .bogus;
+    // RFC 4035 §5.3.1, the two guards `root.zig`'s `validate` applies to
+    // every other RRset type but this entry point skipped for the DNSKEY
+    // RRset itself: the RRSIG must cover the DNSKEY type (not some other
+    // type whose signature happens to verify against a matched key — a
+    // union/dispatch confusion one level up from the algorithm-mismatch
+    // guard already below) and must be signed by the zone name itself, not
+    // a descendant (a subdomain's DNSKEY RRSIG must never vouch for the
+    // parent's key set). DNSKEY RRsets sit at the zone apex and are never
+    // wildcard-synthesized, so `labels` must equal the apex's own label
+    // count exactly — not merely "not greater than", the looser bound that
+    // is all a synthesizable RRset (root.zig's F6) can require (audit F5).
+    if (dnskey_rrsig.type_covered != rdata.rr_type.dnskey) return .bogus;
+    if (!nsec.namesEqual(dnskey_rrsig.signer_name, zone_name)) return .bogus;
+    if (dnskey_rrsig.labels != ownerLabelCount(zone_name)) return .bogus;
 
     // Which keys in the set are vouched for by the trust anchor?
     var any_matched = false;
@@ -172,5 +202,125 @@ test "regression: algorithm-mismatched DNSKEY/RRSIG is rejected, not union-confu
     // A pinned trust anchor equal to the key's raw RDATA makes `anchorMatches`
     // pass, so WITHOUT the guard execution would reach the crashing dispatch.
     const anchor: TrustAnchor = .{ .dnskey_rdata = &raw };
+    try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, anchor));
+}
+
+/// Shared rig for the three audit-F5 regression tests below: a real Ed25519
+/// key pinned as the trust anchor, and a real signature over whatever bytes
+/// `validateDnskeySet` itself would build for the given (possibly bogus)
+/// `rrsig` — so each test reproduces the actual exploit (a genuinely
+/// verifying signature the pre-fix code accepted), not a shape check.
+const F5Rig = struct {
+    raw: [4 + 32]u8,
+    kp: std.crypto.sign.Ed25519.KeyPair,
+
+    fn init(seed_byte: u8) !F5Rig {
+        var seed: [32]u8 = undefined;
+        for (&seed, 0..) |*b, i| b.* = seed_byte +% @as(u8, @intCast(i));
+        const kp = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(seed);
+        const pub_bytes = kp.public_key.toBytes();
+        var raw: [4 + 32]u8 = undefined;
+        std.mem.writeInt(u16, raw[0..2], rdata.Dnskey.flag_zone_key, .big);
+        raw[2] = 3;
+        raw[3] = rdata.algorithm.ed25519;
+        @memcpy(raw[4..], &pub_bytes);
+        return .{ .raw = raw, .kp = kp };
+    }
+
+    /// Sign the exact bytes `validateDnskeySet` itself would build for
+    /// `rrsig` (whose `.signature` field is ignored by `buildSignedData` —
+    /// it is excluded from the signed data by RFC 4034 §3.1.8.1 — so it need
+    /// not be filled in yet). Returns the real signature bytes; the caller
+    /// stores them in a local and points `rrsig.signature` at that local
+    /// (this function's own stack frame does not outlive the call).
+    fn sign(self: F5Rig, zone_name: []const u8, rrsig: rdata.Rrsig) ![64]u8 {
+        const records = [_]dns.Record{.{
+            .name = zone_name,
+            .ty = @enumFromInt(rdata.rr_type.dnskey),
+            .class = .in,
+            .ttl = 0,
+            .data = .{ .unknown = &self.raw },
+        }};
+        const signed = try canonical.buildSignedData(testing.allocator, &records, rrsig, zone_name);
+        defer testing.allocator.free(signed);
+        const sig = try self.kp.sign(signed, null);
+        return sig.toBytes();
+    }
+};
+
+test "regression: DNSKEY RRSIG covering the wrong type is not authenticated (audit F5)" {
+    // A genuinely-verifying RRSIG whose `type_covered` is TXT, not DNSKEY,
+    // must not authenticate the DNSKEY set (RFC 4035 §5.2 step 2: the key
+    // must have signed the DNSKEY RRset it is being used to vouch for).
+    var rig = try F5Rig.init(0);
+    const zone = "example.com"; // 2 labels
+    var rrsig: rdata.Rrsig = .{
+        .type_covered = 16, // TXT, NOT dnskey
+        .algorithm = rdata.algorithm.ed25519,
+        .labels = 2,
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = zone,
+        .signature = &[_]u8{0} ** 64,
+    };
+    const sig_bytes = try rig.sign(zone, rrsig);
+    rrsig.signature = &sig_bytes;
+    const rrset = [_][]const u8{&rig.raw};
+    const anchor: TrustAnchor = .{ .dnskey_rdata = &rig.raw };
+    try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, anchor));
+}
+
+test "regression: DNSKEY RRSIG signed by a different zone is not authenticated (audit F5)" {
+    // Real signature, real matched key — but `rrsig.signer_name` names a
+    // DIFFERENT zone than the `zone_name` `validateDnskeySet` was asked to
+    // validate. RFC 4035 §5.2: a DNSKEY RRSIG must be signed by the zone
+    // itself. `labels` still matches the REAL owner (`example.com`, 2
+    // labels) so this isolates the signer_name check from the labels one.
+    var rig = try F5Rig.init(10);
+    const zone = "example.com"; // 2 labels — the zone actually being validated
+    var rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = rdata.algorithm.ed25519,
+        .labels = 2, // matches `zone`'s real label count
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = "sub.example.com", // a DIFFERENT zone
+        .signature = &[_]u8{0} ** 64,
+    };
+    const sig_bytes = try rig.sign(zone, rrsig);
+    rrsig.signature = &sig_bytes;
+    const rrset = [_][]const u8{&rig.raw};
+    const anchor: TrustAnchor = .{ .dnskey_rdata = &rig.raw };
+    try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, anchor));
+}
+
+test "regression: DNSKEY RRSIG with the wrong labels count is not authenticated (audit F5)" {
+    // Real signature, real matched key, correct signer_name — but `labels`
+    // does not match the zone apex's own label count. A DNSKEY RRset is
+    // never wildcard-synthesized, so unlike root.zig's F6 guard (which only
+    // rejects an OVER-large `labels`, because a smaller one can be a
+    // legitimate wildcard expansion for other RR types) this one must be
+    // exact.
+    var rig = try F5Rig.init(20);
+    const zone = "example.com"; // 2 labels
+    var rrsig: rdata.Rrsig = .{
+        .type_covered = rdata.rr_type.dnskey,
+        .algorithm = rdata.algorithm.ed25519,
+        .labels = 1, // wrong: example.com has 2 labels
+        .original_ttl = 3600,
+        .expiration = 2000,
+        .inception = 0,
+        .key_tag = 0,
+        .signer_name = zone,
+        .signature = &[_]u8{0} ** 64,
+    };
+    const sig_bytes = try rig.sign(zone, rrsig);
+    rrsig.signature = &sig_bytes;
+    const rrset = [_][]const u8{&rig.raw};
+    const anchor: TrustAnchor = .{ .dnskey_rdata = &rig.raw };
     try testing.expectEqual(ChainResult.bogus, try validateDnskeySet(testing.allocator, zone, &rrset, rrsig, anchor));
 }

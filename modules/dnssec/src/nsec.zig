@@ -30,6 +30,12 @@ const std = @import("std");
 const rdata = @import("rdata.zig");
 const wire = @import("wire.zig");
 
+/// Test-only. `testkit.fuzz.seedInto` is the corpus format `Smith.slice`
+/// actually reads: a little-endian `u32` length prefix, then the frame. A
+/// raw string handed to `Smith.slice` without that prefix arrives minus its
+/// own first four bytes.
+const testkit = @import("testkit");
+
 // ── RR type numbers referenced by the proof logic ───────────────────────────
 
 const cname_type: u16 = 5;
@@ -178,6 +184,29 @@ fn canonicalNameCmp(a: []const u8, b: []const u8) ?std.math.Order {
     return std.math.order(al.len, bl.len);
 }
 
+/// Whether `a` and `b` are the same name under DNSSEC canonical (case-folded)
+/// comparison. Malformed names are never equal to anything, including
+/// themselves — a parse failure must fail closed for a trust-chain check.
+/// Exported for `chain.zig`'s RFC 4035 §5.2 signer-name binding (audit F5).
+pub fn namesEqual(a: []const u8, b: []const u8) bool {
+    return canonicalNameCmp(a, b) == .eq;
+}
+
+/// Whether `name` is `zone` itself or a proper descendant of it — i.e.
+/// `zone`'s labels are a right-aligned (canonical, case-folded) suffix of
+/// `name`'s labels. Malformed names return false, never true. Exported for
+/// `root.zig`'s RFC 4035 §5.3.1 signer-name binding (audit F1): "The RRSIG
+/// RR's Signer's Name field MUST be the name of the zone that contains the
+/// RRset."
+pub fn isNameOrDescendant(name: []const u8, zone: []const u8) bool {
+    var nbuf: [max_labels][]const u8 = undefined;
+    var zbuf: [max_labels][]const u8 = undefined;
+    const nl = splitLabels(name, &nbuf) orelse return false;
+    const zl = splitLabels(zone, &zbuf) orelse return false;
+    if (zl.len > nl.len) return false;
+    return commonSuffixLabels(name, zone) == zl.len;
+}
+
 /// Number of trailing labels `a` and `b` share (case-insensitively) — the
 /// length, in labels, of their longest common suffix. Malformed names share 0.
 fn commonSuffixLabels(a: []const u8, b: []const u8) usize {
@@ -317,6 +346,30 @@ test "canonicalNameCmp: malformed name yields null (no panic)" {
     try testing.expectEqual(@as(?std.math.Order, null), canonicalNameCmp("a..b", "a.b"));
     const too_long = "a" ** 64; // over the 63-octet label limit
     try testing.expectEqual(@as(?std.math.Order, null), canonicalNameCmp(too_long, "a.b"));
+}
+
+test "isNameOrDescendant: equal, descendant, unrelated, and malformed names" {
+    try testing.expect(isNameOrDescendant("example.com", "example.com"));
+    try testing.expect(isNameOrDescendant("www.example.com", "example.com"));
+    try testing.expect(isNameOrDescendant("a.b.www.example.com", "example.com"));
+    try testing.expect(isNameOrDescendant("EXAMPLE.com", "example.COM")); // case-insensitive
+    // Not a descendant: `zone` is not a suffix of `name`.
+    try testing.expect(!isNameOrDescendant("www.victim.org", "example.com"));
+    // Reversed: `zone` is the longer name.
+    try testing.expect(!isNameOrDescendant("example.com", "www.example.com"));
+    // A same-suffix-text attack that is NOT a label suffix: "evilexample.com"
+    // ends with the same bytes as "example.com" but is a sibling label, not a
+    // descendant.
+    try testing.expect(!isNameOrDescendant("evilexample.com", "example.com"));
+    // Malformed input fails closed.
+    try testing.expect(!isNameOrDescendant("a..b", "a.b"));
+    try testing.expect(!isNameOrDescendant("a.b", "a..b"));
+}
+
+test "namesEqual: case-insensitive, and malformed names are never equal" {
+    try testing.expect(namesEqual("example.com", "EXAMPLE.com"));
+    try testing.expect(!namesEqual("www.example.com", "example.com"));
+    try testing.expect(!namesEqual("a..b", "a..b")); // malformed: never equal, even to itself
 }
 
 test "proveDenial NXDOMAIN: qname inside the gap, wildcard covered (positive control)" {
@@ -475,4 +528,125 @@ test "proveDenial: empty set and malformed qname fail closed to bogus (no panic)
         .{ .owner = "a.example", .rdata = .{ .next_domain_name = "example", .types = buildTbm(&b, &.{1}) } },
     };
     try testing.expectEqual(DenialResult.bogus, proveDenial("a..example", 1, .{ .records = &set }));
+}
+
+// ── fuzz: proveDenial never panics on hostile owner/next-domain-name/qname
+//    text (audit A1 F8) ──────────────────────────────────────────────────
+//
+// `nsec3.zig`'s `proveDenial` has a fuzz harness over its attacker-
+// controlled owner-hash LABEL (base32hex). This file's `proveDenial` has the
+// same class of exposure but over UNHASHED, attacker-supplied dotted names:
+// `splitLabels`/`labelCmp`/`canonicalNameCmp`/`lastLabels`/
+// `commonSuffixLabels` all run hand-written label-boundary arithmetic
+// directly on an NSEC record's owner/next-domain-name text and the queried
+// name. The file header's own trust boundary note says records are "ASSUMED
+// already signature-validated", never "assumed well-formed" — and this
+// module's own tests build `NsecRecord`/`NsecSet` values by hand
+// (`.{ .owner = "...", .rdata = ... }`), so a hostile owner/next/qname can
+// reach this arithmetic directly, not only through a wire parser upstream.
+// Audit A1 F8 (2026-09-04): this file had no fuzz harness at all, unlike its
+// NSEC3 sibling, despite being "478 lines, the largest file in the module and
+// the main content of the module's last 872-line drift".
+
+/// Length-prefixed frames the reject/edge-case seeds below draw from, in the
+/// SAME order the harness reads them: owner, next_domain_name, qname.
+const nsec_fuzz_names = [_][]const u8{
+    "", ".", "a", "www.example.com", "*.example.com",
+    "a" ** 63 ++ ".example", // one label at the DNS 63-octet max
+    "a" ** 64 ++ ".example", // one label OVER the max
+    ("a." ** 130) ++ "example", // over max_labels (128) label count
+    "a..b", // empty interior label
+    ".a.b", // leading dot
+    "a.b.", // trailing dot (legal: root-terminated)
+    "\x00.example", // embedded NUL
+    "EXAMPLE.COM", // uppercase
+    "a" ** 300, // grossly over any real name, no dots at all
+};
+
+/// One seed per (owner, next, qname) triple drawn from `nsec_fuzz_names`
+/// (diagonal + a few off-diagonal combinations — not the full cross product,
+/// which would be `nsec_fuzz_names.len^3` entries for no added reach: each
+/// triple exercises the same `splitLabels`/`canonicalNameCmp` code paths
+/// regardless of which two fields happen to differ).
+const FuzzCorpus = struct {
+    // ONE flat buffer, not a per-field 2D array: `seedInto` frames must be
+    // byte-contiguous for `entries[i]` to be a single slice covering all
+    // three (owner, next, qname), and only a flat buffer with a running
+    // offset (mirrors `wireguard.ParserCorpus`, the repo's own multi-field
+    // fuzz-seed pattern) guarantees that. A `[N][row]u8` 2D array does NOT:
+    // each row is its own bounds-checked array, so slicing past one row's
+    // own length to reach the next is an out-of-bounds access, not a view
+    // into the next row — the first version of this harness had exactly
+    // that bug.
+    store: [nsec_fuzz_names.len * 3 * (4 + 512)]u8 = undefined,
+    used: usize = 0,
+    entries: [nsec_fuzz_names.len]([]const u8) = undefined,
+
+    fn build(self: *FuzzCorpus) []const []const u8 {
+        for (nsec_fuzz_names, 0..) |name, i| {
+            const owner = name;
+            // Off-diagonal: pair each name with its neighbour for next/qname,
+            // so a malformed value in one field meets a well-formed value in
+            // the others at least once, not just "all three bad together".
+            const next = nsec_fuzz_names[(i + 1) % nsec_fuzz_names.len];
+            const qname = nsec_fuzz_names[(i + 2) % nsec_fuzz_names.len];
+            const start = self.used;
+            const a = testkit.fuzz.seedInto(self.store[self.used..], owner);
+            self.used += a.len;
+            const b = testkit.fuzz.seedInto(self.store[self.used..], next);
+            self.used += b.len;
+            const c = testkit.fuzz.seedInto(self.store[self.used..], qname);
+            self.used += c.len;
+            self.entries[i] = self.store[start..self.used];
+        }
+        return &self.entries;
+    }
+};
+
+fn fuzzNsecProveDenial(_: void, smith: *std.testing.Smith) !void {
+    var owner_buf: [512]u8 = undefined;
+    var next_buf: [512]u8 = undefined;
+    var qname_buf: [512]u8 = undefined;
+    const owner_len: usize = smith.slice(&owner_buf);
+    const next_len: usize = smith.slice(&next_buf);
+    const qname_len: usize = smith.slice(&qname_buf);
+
+    const rec: NsecRecord = .{
+        .owner = owner_buf[0..owner_len],
+        .rdata = .{
+            .next_domain_name = next_buf[0..next_len],
+            .types = .{ .raw = "" }, // empty bitmap: F8 targets the NAME arithmetic, not the bitmap (that is rdata.zig's own fuzz coverage, audit F4)
+        },
+    };
+    const set: NsecSet = .{ .records = &[_]NsecRecord{rec} };
+    _ = proveDenial(qname_buf[0..qname_len], 1, set);
+}
+
+test "fuzz: proveDenial never panics on hostile owner/next-domain-name/qname text (audit F8)" {
+    var corpus: FuzzCorpus = .{};
+    try testing.fuzz({}, fuzzNsecProveDenial, .{ .corpus = corpus.build() });
+}
+
+test "corpus: every fuzz seed actually reaches splitLabels with non-empty text" {
+    // Same guard-measures-the-harness discipline as nsec3.zig's own corpus
+    // test: confirm the seeds draw REAL content, not the empty string every
+    // time (which would make the harness above walk nothing).
+    var corpus: FuzzCorpus = .{};
+    const entries = corpus.build();
+    var nonempty: usize = 0;
+    for (entries) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var owner_buf: [512]u8 = undefined;
+        var next_buf: [512]u8 = undefined;
+        var qname_buf: [512]u8 = undefined;
+        const owner_len: usize = smith.slice(&owner_buf);
+        const next_len: usize = smith.slice(&next_buf);
+        const qname_len: usize = smith.slice(&qname_buf);
+        if (owner_len != 0 or next_len != 0 or qname_len != 0) nonempty += 1;
+    }
+    // Only the very first seed name is "" for all three fields simultaneously
+    // (i == 0: owner="", next=nsec_fuzz_names[1]="."->non-empty actually, so
+    // every entry has at least one non-empty field); assert the corpus is not
+    // silently degenerate.
+    try testing.expectEqual(nsec_fuzz_names.len, nonempty);
 }
