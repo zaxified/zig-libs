@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F7 (MED):
+  verified the core defect (the fuzz harness's ranged first draw always
+  returning the corpus's own minimum, so it never actually corrupted a
+  signature) was already fixed 2026-09-07 (see that entry below). Added
+  the one piece F7 asked for that was still missing: a comment stating
+  plainly that random 64-octet draws can only ever reach `verify`'s FALSE
+  (reject) outcomes -- finding a valid signature by chance is exactly what
+  Schnorr's security rules out -- so the harness's TRUE (accept) coverage
+  stays with the KAT tests, not fuzzing, by construction rather than by
+  oversight.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F3/F10 (MED/LOW,
   docs only). F3: `verifyBatch`'s doc comment and `SPEC.md` claimed it
   "only forgoes part of the batching speedup" versus a real multi-scalar

@@ -269,6 +269,14 @@ test "KAT: hexAlloc helper decodes variable-length messages (sanity for the sign
 // corpus instead of a flip count the ordinary lane always drew as zero.
 // Under `--fuzz` this is strictly better: the fuzzer mutates real 64-octet
 // signatures rather than replaying one unmodified vector.
+//
+// A1 F7's deeper limit, stated plainly so nobody expects fuzzing to close
+// it: random 64-octet draws can find the REJECT path (out-of-range r/s,
+// wrong x(R)) but essentially never a valid signature by chance -- Schnorr
+// is secure precisely because that search space is infeasible. So this
+// harness, however good its corpus, only ever exercises `verify`'s FALSE
+// outcomes; the TRUE (accept) outcome is fuzz-unreachable by construction
+// and stays covered by the KAT tests above instead.
 
 /// `testkit.fuzz.seedHex`, aliased so the corpus reads as the signatures it
 /// is. A corpus entry is not the signature: `Smith.slice` reads a
