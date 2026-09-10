@@ -142,18 +142,37 @@ pub fn lookupReference(rules_: []const ClassifierRule, addr: [4]u8, default_clas
     var best: ?ClassifierRule = null;
     for (rules_) |rule| {
         if (!prefixMatches(rule.prefix, addr)) continue;
-        if (best == null or rule.prefix.prefix_len > best.?.prefix.prefix_len) best = rule;
+        // `>=`, not `>`: on a tie (two rules with the same prefix_len both
+        // match), the LATER rule in iteration order must win. This mirrors
+        // `map_update_elem` on the real LPM trie -- a duplicate
+        // `(addr, prefix_len)` key silently overwrites the earlier value, so
+        // the kernel's answer for a duplicate ruleset is always the last one
+        // loaded (see rules.zig's `DuplicatePrefix` doc comment and F4's
+        // measurement: ref returned the FIRST match (111) where the kernel
+        // trie returned the LAST (222) for the identical duplicate ruleset).
+        // `RuleSet.validate` rejects duplicates outright, so this only
+        // matters for a caller that bypasses validation -- but "matches the
+        // kernel" is still the correct answer for an oracle, not "matches
+        // whichever branch happened to run first".
+        if (best == null or rule.prefix.prefix_len >= best.?.prefix.prefix_len) best = rule;
     }
     return if (best) |b| b.class else default_class;
 }
 
 fn prefixMatches(prefix: Ipv4Prefix, addr: [4]u8) bool {
-    // Clamp to /32: an out-of-range prefix_len (> 32; `prefix_len` is u6 so a
-    // caller can pass up to 63) means "compare all 32 bits". Without the clamp
-    // `32 - prefix_len` underflows the u32 subtraction and panics — this is
-    // the userspace reference, callable on rules that never went through
-    // `RuleSet.validate` (which is the real gate that rejects prefix_len > 32).
-    const len = @min(@as(u32, prefix.prefix_len), 32);
+    // `prefix_len > 32` never matches -- it does NOT clamp to /32. Such a
+    // prefix is not representable by an IPv4 LPM key (`RuleSet.validate`
+    // rejects it with `InvalidPrefixLen`, and `populateRuleSet` therefore
+    // never loads it into the kernel map), so the kernel's trie can never
+    // return a hit for it either. Clamping used to treat it as an exact /32
+    // match instead, which made this reference answer for a rule that (by
+    // the module's own contract) does not exist in the kernel: measured as
+    // ref=7 vs kernel trie=0 for the same out-of-range rule (F4b). This is
+    // still the userspace reference, callable on rules that never went
+    // through `validate` -- so it must not panic (see the hostile test
+    // below), just correctly report "no match" instead of a wrong one.
+    if (prefix.prefix_len > 32) return false;
+    const len: u32 = prefix.prefix_len;
     if (len == 0) return true;
     const bits: u32 = std.mem.readInt(u32, &prefix.addr, .big);
     const a: u32 = std.mem.readInt(u32, &addr, .big);
@@ -278,24 +297,105 @@ test "hostile: RuleSet.validate never panics across a wide sweep of prefix_len/a
 }
 
 test "hostile: prefixMatches/lookupReference never panic on an out-of-range prefix_len" {
-    // prefix_len 33 pre-fix underflows `32 - prefix_len` (u32) → panic. It now
-    // clamps to /32 (compare all 32 bits): an exact match on the stored addr.
+    // prefix_len 33 pre-fix underflowed `32 - prefix_len` (u32) → panic, then
+    // (F4b) clamped to /32 and reported a match that does not exist in the
+    // kernel (`RuleSet.validate` rejects prefix_len > 32, so this rule can
+    // never reach the LPM trie). It must now report NO match at all, for
+    // every address including the address that used to "clamp-match" it.
     const rules = [_]ClassifierRule{
         .{ .prefix = .{ .addr = .{ 255, 255, 255, 255 }, .prefix_len = 33 }, .class = 7 },
     };
-    try testing.expectEqual(@as(u32, 7), lookupReference(&rules, .{ 255, 255, 255, 255 }, 0));
+    try testing.expectEqual(@as(u32, 0), lookupReference(&rules, .{ 255, 255, 255, 255 }, 0));
     try testing.expectEqual(@as(u32, 0), lookupReference(&rules, .{ 1, 2, 3, 4 }, 0));
 
     // Full out-of-spec sweep (33‥63) crossed with matching/non-matching
-    // addresses: no path panics.
+    // addresses: no path panics, and every one of them is a miss.
     var pl: u16 = 33;
     while (pl <= 63) : (pl += 1) {
         const rs = [_]ClassifierRule{
             .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = @intCast(pl) }, .class = 1 },
         };
-        _ = lookupReference(&rs, .{ 10, 0, 0, 0 }, 0);
-        _ = lookupReference(&rs, .{ 192, 168, 0, 1 }, 0);
+        try testing.expectEqual(@as(u32, 0), lookupReference(&rs, .{ 10, 0, 0, 0 }, 0));
+        try testing.expectEqual(@as(u32, 0), lookupReference(&rs, .{ 192, 168, 0, 1 }, 0));
     }
+}
+
+test "F4a: lookupReference ties on equal prefix_len resolve to the LAST-loaded rule, matching the kernel trie" {
+    // Two rules with the SAME (addr, prefix_len) -- RuleSet.validate rejects
+    // this as DuplicatePrefix, but lookupReference must still answer the way
+    // the kernel trie would for a caller that populated the map directly
+    // (map_update_elem lets the later write silently overwrite the earlier
+    // one, see rules.RuleSetError.DuplicatePrefix's doc comment). Measured
+    // pre-fix: ref picked the FIRST rule (111); the kernel trie picks the
+    // LAST (222) -- this is F4's tie-break mismatch, reproduced directly.
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 111 },
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 222 },
+    };
+    try testing.expectEqual(@as(u32, 222), lookupReference(&rules, .{ 10, 1, 2, 3 }, 0));
+
+    // Three-way tie: the last one in iteration order still wins.
+    const rules3 = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 2 },
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 3 },
+    };
+    try testing.expectEqual(@as(u32, 3), lookupReference(&rules3, .{ 10, 1, 2, 3 }, 0));
+
+    // A tie must NOT beat a genuinely longer (unique) prefix that also
+    // matches -- the `>=` change must not weaken the longest-prefix-wins
+    // invariant itself, only the equal-length tie-break.
+    const mixed = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 2 }, // ties the /8 above
+        .{ .prefix = .{ .addr = .{ 10, 1, 0, 0 }, .prefix_len = 16 }, .class = 9 }, // more specific
+    };
+    try testing.expectEqual(@as(u32, 9), lookupReference(&mixed, .{ 10, 1, 2, 3 }, 0));
+}
+
+test "F5: prefixMatches is exact at the prefix_len bit boundary in both directions" {
+    // A mutation that compares one bit too few/many is otherwise invisible
+    // to whole-octet-aligned test data (8/16/24/32) -- probe boundaries that
+    // fall INSIDE a byte too (1, 15, 31), on both sides of the boundary bit.
+    const boundaries = [_]u6{ 1, 7, 8, 15, 16, 23, 24, 31, 32 };
+    for (boundaries) |plen| {
+        const prefix: Ipv4Prefix = .{ .addr = .{ 0, 0, 0, 0 }, .prefix_len = plen };
+        // Flip only the bit exactly AT the boundary (the first host bit,
+        // i.e. bit index `plen` counting from the MSB, 0-based) -- every bit
+        // BEFORE it stays 0, matching the all-zero prefix.
+        if (plen < 32) {
+            var addr: [4]u8 = .{ 0, 0, 0, 0 };
+            const bit_from_msb: u5 = @intCast(plen);
+            const byte_i = bit_from_msb / 8;
+            const bit_in_byte: u3 = @intCast(7 - (bit_from_msb % 8));
+            addr[byte_i] |= @as(u8, 1) << bit_in_byte;
+            // The host bit is set but every prefix bit (0..plen) is still 0
+            // -- must still match (a "too many bits compared" mutation would
+            // reject this).
+            try testing.expect(prefixMatches(prefix, addr));
+        }
+        // Flip the LAST bit that IS part of the prefix (bit index plen-1) --
+        // must NOT match (a "too few bits compared" mutation would accept
+        // this).
+        if (plen > 0) {
+            var addr: [4]u8 = .{ 0, 0, 0, 0 };
+            const bit_from_msb: u5 = @intCast(plen - 1);
+            const byte_i = bit_from_msb / 8;
+            const bit_in_byte: u3 = @intCast(7 - (bit_from_msb % 8));
+            addr[byte_i] |= @as(u8, 1) << bit_in_byte;
+            try testing.expect(!prefixMatches(prefix, addr));
+        }
+    }
+}
+
+test "F5: isCanonical rejects a /31 with its one host bit set" {
+    // /31 has exactly one host bit (the LSB) -- a mutation treating /31 as
+    // "no host bits" (i.e. always canonical) would accept a non-canonical
+    // rule silently. Both parities of the LSB are checked so the test does
+    // not depend on which octet the mutation touches.
+    try testing.expect(isCanonical(.{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 31 })); // LSB 0: canonical
+    try testing.expect(!isCanonical(.{ .addr = .{ 10, 0, 0, 1 }, .prefix_len = 31 })); // LSB 1: host bit set
+    try testing.expect(!isCanonical(.{ .addr = .{ 255, 255, 255, 255 }, .prefix_len = 31 }));
 }
 
 test "hostile: LpmKey.toBytes never panics across the full prefix_len range" {
@@ -305,4 +405,73 @@ test "hostile: LpmKey.toBytes never panics across the full prefix_len range" {
         const key = LpmKey.fromPrefix(p);
         _ = key.toBytes();
     }
+}
+
+// ── F8: fuzz harnesses ──────────────────────────────────────────────────────
+//
+// F8 measured 0 `testing.fuzz` harnesses in a module that is a parser (the
+// generated eBPF bytecode's packet path, offline-unreachable without porting
+// an interpreter -- see the audit record's `repro/xdp-classifier/vm.zig`,
+// NOT ported here, still open) plus a rule-table validator (`RuleSet.validate`,
+// `lookupReference`/`prefixMatches`) -- entirely ordinary Zig, and exactly
+// what these two harnesses corpus-fuzz. The hand-rolled PRNG sweeps above
+// stay (they pin specific deterministic scenarios); these add coverage-guided
+// exploration on top, same role `testing.fuzz` plays in the other 168
+// modules that already have it.
+
+fn fuzzValidateNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [8]ClassifierRule = undefined;
+    const n = smith.index(buf.len + 1); // 0..8 rules
+    for (buf[0..n]) |*r| {
+        r.* = .{
+            .prefix = .{
+                .addr = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) },
+                .prefix_len = smith.value(u6), // full 0..63, including out-of-spec 33..63
+            },
+            .class = smith.value(u32),
+        };
+    }
+    const rs: RuleSet = .{ .rules = buf[0..n] };
+    // `usize` has no fixed bitsize (comptime error from Smith's weighting
+    // machinery) -- draw a fixed-width value and widen it instead.
+    const max_entries: usize = smith.valueRangeAtMost(u16, 0, 16);
+    _ = rs.validate(max_entries) catch {}; // any declared error or success; a panic is not
+}
+
+test "fuzz: RuleSet.validate never panics on any (rules, max_entries)" {
+    try std.testing.fuzz({}, fuzzValidateNeverPanics, .{});
+}
+
+fn fuzzLookupNeverPanics(_: void, smith: *std.testing.Smith) !void {
+    var buf: [8]ClassifierRule = undefined;
+    const n = smith.index(buf.len + 1);
+    for (buf[0..n]) |*r| {
+        r.* = .{
+            .prefix = .{
+                .addr = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) },
+                .prefix_len = smith.value(u6),
+            },
+            .class = smith.value(u32),
+        };
+    }
+    const query: [4]u8 = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) };
+    const default_class = smith.value(u32);
+
+    const got = lookupReference(buf[0..n], query, default_class);
+    // Invariant that must hold for EVERY input, not just the hand-picked
+    // scenarios above: the result is either the caller's default (no rule
+    // matched) or the class of one of the rules actually loaded -- never a
+    // value manufactured out of thin air.
+    var found_among_rules = false;
+    for (buf[0..n]) |r| {
+        if (r.class == got) {
+            found_among_rules = true;
+            break;
+        }
+    }
+    try testing.expect(got == default_class or found_among_rules);
+}
+
+test "fuzz: lookupReference never panics, and always returns default_class or a loaded rule's class" {
+    try std.testing.fuzz({}, fuzzLookupNeverPanics, .{});
 }
