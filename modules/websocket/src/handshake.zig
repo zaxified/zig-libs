@@ -655,3 +655,205 @@ test "writeRequest: positive control, ordinary fields still write correctly" {
     try testing.expect(std.mem.indexOf(u8, req, "Sec-WebSocket-Protocol: chat, superchat\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, req, "Origin: https://example.com\r\n") != null);
 }
+
+// ── fuzz: verifyResponse off the wire, client role, never panics ───────────
+//
+// A1/websocket.md F5's "second half": `handshake.zig` had ZERO fuzz
+// harnesses, on either side. `verifyResponse` is the client's ONLY defense
+// against a malicious or compromised server response — including the
+// accept-key check that RFC 6455 §4.1 point 9 calls the anti-cache-poisoning
+// / anti-cross-protocol check — so this is the higher-value direction of the
+// two (a server usually sits behind infrastructure that validates its own
+// inbound requests; a client dials whatever address it was given).
+//
+// Genuinely attacker-controlled input is the raw response BYTES, not just
+// the already-parsed `h1.ResponseHead` — so the harness fuzzes
+// `h1.ResponseHead.parse` and `verifyResponse` together, exactly the two
+// calls a real client makes back to back (see "client round trip" above).
+// `key`/`offered_protocols` are the CLIENT's own values, not attacker input,
+// so they stay fixed.
+
+const fuzz = @import("testkit").fuzz;
+
+/// Response blocks a **client** receives from its server, in the format
+/// `Smith.slice` reads (one call, never `smith.bytes` + a ranged length —
+/// see `frame.zig`'s fuzz harnesses for the measured reason that collapses
+/// outside `--fuzz`). `fixed_key`/`fixed_offered` below are the values the
+/// harness verifies every seed against — RFC 6455 §1.3's own worked example
+/// key, so `computeAcceptKey(fixed_key)` is a literal anyone can check
+/// against the spec rather than a value only this file knows.
+const response_seeds = [_][]const u8{
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), // valid, no subprotocol
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\n\r\n"), // valid, offered subprotocol selected
+    fuzz.seed("HTTP/1.1 400 Bad Request\r\n\r\n"), // UnexpectedStatus
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), // MissingUpgrade
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), // MissingConnection
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n"), // AcceptMismatch -- the anti-cache-poisoning check itself
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"), // DuplicateHeader
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"), // UnexpectedExtension
+    fuzz.seed("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: sneaky\r\n\r\n"), // UnexpectedSubprotocol
+    fuzz.seed("not even close to an http response\r\n\r\n"), // rejected by h1.ResponseHead.parse itself, verifyResponse never runs
+    fuzz.seed(""), // the empty body, deliberately -- also an h1 parse rejection
+};
+
+const fixed_key = "dGhlIHNhbXBsZSBub25jZQ==";
+const fixed_offered = [_][]const u8{"chat"};
+
+test "fuzz: verifyResponse never panics, client role (h1.ResponseHead.parse + verifyResponse together)" {
+    try testing.fuzz({}, fuzzVerifyResponseClient, .{ .corpus = &response_seeds });
+}
+
+fn fuzzVerifyResponseClient(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const head = h1.ResponseHead.parse(buf[0..len]) catch return;
+    _ = verifyResponse(head, fixed_key, &fixed_offered) catch return;
+}
+
+// ── fuzz: acceptHandshake off the wire, server role, never panics ──────────
+//
+// The other direction of the same gap: a server's FIRST look at a client is
+// an untrusted upgrade request. Smaller corpus than the client side above —
+// `acceptHandshake`'s checks are more numerous but each is a single `orelse`
+// off a header lookup, not a multi-field integrity computation like
+// `verifyResponse`'s accept-key check — but every named error variant still
+// gets its own seed, same discipline.
+
+/// Request blocks a **server** receives from a client, in the format
+/// `Smith.slice` reads.
+const request_seeds = [_][]const u8{
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"), // valid, no subprotocol
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: chat\r\n\r\n"), // valid, subprotocol negotiated
+    fuzz.seed("POST /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"), // NotGet
+    fuzz.seed("GET /chat HTTP/1.0\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"), // UnsupportedHttpVersion
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"), // MissingUpgrade
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"), // MissingConnection
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 12\r\n\r\n"), // UnsupportedVersion
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n"), // MissingKey
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: tooshort\r\nSec-WebSocket-Version: 13\r\n\r\n"), // InvalidKey
+    fuzz.seed("GET /chat HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"), // DuplicateHeader
+    fuzz.seed("not even close to an http request\r\n\r\n"), // rejected by h1.RequestHead.parse itself
+    fuzz.seed(""), // the empty body, deliberately
+};
+
+test "fuzz: acceptHandshake never panics, server role (h1.RequestHead.parse + acceptHandshake together)" {
+    try testing.fuzz({}, fuzzAcceptHandshakeServer, .{ .corpus = &request_seeds });
+}
+
+fn fuzzAcceptHandshakeServer(_: void, smith: *std.testing.Smith) !void {
+    var buf: [512]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    const head = h1.RequestHead.parse(buf[0..len]) catch return;
+    _ = acceptHandshake(head, .{ .protocols = &fixed_offered }) catch return;
+}
+
+test "corpus: every request seed reaches h1.RequestHead.parse, and acceptHandshake's own checks all fire" {
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var accepted_ok: usize = 0;
+    var not_get: usize = 0;
+    var unsupported_http_version: usize = 0;
+    var missing_upgrade: usize = 0;
+    var missing_connection: usize = 0;
+    var unsupported_version: usize = 0;
+    var missing_key: usize = 0;
+    var invalid_key: usize = 0;
+    var duplicate_header: usize = 0;
+
+    for (request_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        const head = h1.RequestHead.parse(buf[0..len]) catch continue;
+        parsed += 1;
+        const result = acceptHandshake(head, .{ .protocols = &fixed_offered }) catch |e| {
+            switch (e) {
+                error.NotGet => not_get += 1,
+                error.UnsupportedHttpVersion => unsupported_http_version += 1,
+                error.MissingUpgrade => missing_upgrade += 1,
+                error.MissingConnection => missing_connection += 1,
+                error.UnsupportedVersion => unsupported_version += 1,
+                error.MissingKey => missing_key += 1,
+                error.InvalidKey => invalid_key += 1,
+                error.DuplicateHeader => duplicate_header += 1,
+                else => {},
+            }
+            continue;
+        };
+        _ = result;
+        accepted_ok += 1;
+    }
+
+    try testing.expectEqual(request_seeds.len - 1, nonempty); // the empty body is a seed on purpose
+    try testing.expectEqual(@as(usize, 10), parsed); // all but the two malformed-input seeds
+    try testing.expectEqual(@as(usize, 2), accepted_ok); // seeds 0, 1
+    try testing.expectEqual(@as(usize, 1), not_get);
+    try testing.expectEqual(@as(usize, 1), unsupported_http_version);
+    try testing.expectEqual(@as(usize, 1), missing_upgrade);
+    try testing.expectEqual(@as(usize, 1), missing_connection);
+    try testing.expectEqual(@as(usize, 1), unsupported_version);
+    try testing.expectEqual(@as(usize, 1), missing_key);
+    try testing.expectEqual(@as(usize, 1), invalid_key);
+    try testing.expectEqual(@as(usize, 1), duplicate_header);
+}
+
+test "corpus: every response seed reaches h1.ResponseHead.parse, and verifyResponse's own checks all fire" {
+    // ⭐ Executable measurement, not an asserted comment — `frame.zig`'s reach
+    // tests are the precedent. `nonempty` catches a seed grown past the
+    // 512-octet buffer; `parsed` catches a seed that never got past
+    // `h1.ResponseHead.parse` at all (this harness's two malformed-input
+    // seeds are DELIBERATELY in that bucket, so `parsed < nonempty` here is
+    // the claim, not a bug); the per-error counters are the claim that
+    // `verifyResponse`'s OWN checks -- not just the HTTP layer beneath it --
+    // are what is being reached.
+    var nonempty: usize = 0;
+    var parsed: usize = 0;
+    var verified_ok: usize = 0;
+    var unexpected_status: usize = 0;
+    var missing_upgrade: usize = 0;
+    var missing_connection: usize = 0;
+    var accept_mismatch: usize = 0;
+    var duplicate_header: usize = 0;
+    var unexpected_extension: usize = 0;
+    var unexpected_subprotocol: usize = 0;
+
+    for (response_seeds) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [512]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        if (len != 0) nonempty += 1;
+
+        const head = h1.ResponseHead.parse(buf[0..len]) catch continue;
+        parsed += 1;
+        const result = verifyResponse(head, fixed_key, &fixed_offered) catch |e| {
+            switch (e) {
+                error.UnexpectedStatus => unexpected_status += 1,
+                error.MissingUpgrade => missing_upgrade += 1,
+                error.MissingConnection => missing_connection += 1,
+                error.AcceptMismatch => accept_mismatch += 1,
+                error.DuplicateHeader => duplicate_header += 1,
+                error.UnexpectedExtension => unexpected_extension += 1,
+                error.UnexpectedSubprotocol => unexpected_subprotocol += 1,
+                else => {},
+            }
+            continue;
+        };
+        _ = result;
+        verified_ok += 1;
+    }
+
+    // One short of the corpus length: the empty body is a seed on purpose
+    // (same convention as `frame.zig`'s `close_seeds`).
+    try testing.expectEqual(response_seeds.len - 1, nonempty);
+    try testing.expectEqual(@as(usize, 9), parsed); // all but the two malformed-input seeds
+    try testing.expectEqual(@as(usize, 2), verified_ok); // seeds 0, 1
+    try testing.expectEqual(@as(usize, 1), unexpected_status);
+    try testing.expectEqual(@as(usize, 1), missing_upgrade);
+    try testing.expectEqual(@as(usize, 1), missing_connection);
+    try testing.expectEqual(@as(usize, 1), accept_mismatch);
+    try testing.expectEqual(@as(usize, 1), duplicate_header);
+    try testing.expectEqual(@as(usize, 1), unexpected_extension);
+    try testing.expectEqual(@as(usize, 1), unexpected_subprotocol);
+}
