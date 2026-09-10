@@ -20,8 +20,13 @@
 //! LPM-shaped key instead of an exact-match one — see `src/classifier.zig`'s
 //! module doc for the full argument, including a `clang -O2 -target bpf`
 //! cross-check of the genuinely new (non-`ebpf`-derived) parse/bounds-check
-//! portion. Every test in this module runs and passes; nothing is gated
-//! behind a stub.
+//! portion. Every function here is real code, not a stub — but six tests
+//! (two real-load, four kernel-map round-trips) need `CAP_BPF`/root to reach
+//! a live kernel map or the in-kernel verifier and skip cleanly without it;
+//! see `README.md`'s "Tier verdict" section for exactly which six and why
+//! (F6: this comment used to claim "nothing is gated behind a stub", which
+//! conflated "no stub implementation" with "no privilege-gated test" — the
+//! former is true, the latter never was).
 //!
 //! Provenance: models the packet-classification stage of a LibreQoS-style
 //! edge shaper (subscriber IP/prefix -> traffic-class handle feeding a

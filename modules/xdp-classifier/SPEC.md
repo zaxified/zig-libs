@@ -221,6 +221,13 @@ BPF_MOD | BPF_K`) — is trivial scalar arithmetic, not a verifier-hard pattern.
 - **IPv6.** A second bounds-check-and-parse block (EtherType `0x86DD`, a
   40-byte fixed header, a 128-bit LPM key) following this module's existing
   pattern — additive, not a redesign.
+- **VLAN tags (802.1Q/802.1ad).** A tagged IPv4 frame is currently
+  unclassified in full (README "Scope (v1)", F9) — the EtherType check sees
+  `0x8100`/`0x88a8`, not `0x0800`, and falls straight to the default class.
+  A `vlan_depth` option (skip N 4-byte tag headers, each a fixed `ldx`+`jne`
+  pair, before the existing EtherType/IHL checks; the bounds-check width and
+  all downstream offsets shift by `4 * vlan_depth`) is additive to the
+  existing pattern, same shape as the IPv4-options/IPv6 extensions above.
 - **Variable-length IPv4 options.** Would need a DYNAMIC, packet-derived
   pointer offset (IHL nibble × 4, bounds-checked before use) — genuinely a
   step up in verifier-interaction complexity from anything in this module

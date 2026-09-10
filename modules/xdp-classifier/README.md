@@ -21,8 +21,15 @@ resolved class handle into a scratch map before returning `XDP_PASS`.
 ## Tier verdict: no Fable core
 
 **Fully implemented, nothing gated.** Every function in this module is real
-code; every test runs and passes (or skips only for the CAP_BPF/root-gated
-real-load checks). See `SPEC.md` for the full argument; the short version:
+code, not a stub. Every test runs and passes, or skips cleanly without
+`CAP_BPF`/root — that is six tests, not just the two real in-kernel-verifier
+loads: two `load:` tests hand a built program to the live verifier, and four
+more (`createLpmTrieMap`+`populateRule`, `createCpuMap`+`populateCpu`,
+`createScratchMap`+`readScratchClass`, `populateRuleSet`) are kernel-map
+round-trips that need a real map to exercise the key/value byte encodings
+(F6: an earlier version of this sentence undercounted these four as covered
+by "the real-load checks", which they are not — they never call
+`ebpf.load`). See `SPEC.md` for the full argument; the short version:
 
 Every verifier-hard PATTERN this program needs — `ctx->data`/`ctx->data_end`
 retyping, bounds-check dominance over a packet region, the map-lookup
@@ -54,6 +61,19 @@ about by analogy (see `src/classifier.zig`'s golden-test provenance comment).
   miss are all deliberately indistinguishable at the output (all four write
   the same configured default class) — see `src/classifier.zig`'s "Design
   note on the shared DEFAULT class".
+- **VLAN-tagged frames (802.1Q/802.1ad, EtherType `0x8100`/`0x88a8`) are not
+  classified.** They fall through the plain "non-IPv4 EtherType" path to the
+  default class, same as any other EtherType this program does not
+  recognize — there is no VLAN-tag skip, so a tagged IPv4 frame is
+  unclassified even though the IPv4 payload two EtherTypes deeper is exactly
+  what this module targets. Measured (F9): 802.1Q with VID 0/100/4095 and
+  802.1ad QinQ all resolve to the default class, while the identical
+  untagged IPv4 frame resolves to its rule's class. Worth naming explicitly
+  because, unlike IPv6 or IPv4-with-options (which each miss only PART of
+  the traffic), a deployment on a tagged link would see ALL of its traffic
+  fall to best-effort. A future `vlan_depth` option (skip N 4-byte tag
+  headers before the EtherType/IHL checks) is the natural additive
+  extension — not built here, see `SPEC.md`'s backlog.
 
 ## API
 
