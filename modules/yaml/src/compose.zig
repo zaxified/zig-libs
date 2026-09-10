@@ -1155,6 +1155,28 @@ test "a malformed document still fails as a parse error" {
     try testing.expectError(error.InvalidYaml, single("[\n"));
 }
 
+// F5 (A1/yaml.md): the suite had zero tests on any of the module's DoS
+// bounds other than the ones F1-F3 just fixed (`reject_duplicate_keys`,
+// `Options.max_depth`, `Options.max_nodes`). The alias table's exact-match
+// lookup was another: a mutation that added a "try one character shorter"
+// fallback would have resolved `*ab` to an anchor literally named `a` and
+// nothing would have noticed. (`scanner.zig`'s own `max_depth = 4096` flow/
+// block-nesting cap is covered by a scanner-level test in `scanner.zig`
+// instead of here -- composing a 4096-deep tree to reach it recurses
+// `composeNode` one Zig call frame per level and overflows Debug's stack
+// well before 4096, which is a real but SEPARATE, already-known class of
+// issue (see F3's `deepseq` note); a bare scanner loop has no such
+// recursion at all.)
+
+test "an alias name that is a superstring of a real anchor is still undefined (exact match, no prefix fallback)" {
+    // `&a` is a real anchor; `*ab` must NOT resolve to it. The anchor table
+    // is a `StringHashMapUnmanaged` keyed on the exact text, so this is
+    // already correct -- this test exists so a future change that adds any
+    // kind of fallback/prefix lookup (however well-intentioned) breaks
+    // loudly instead of silently resolving the wrong anchor.
+    try testing.expectError(error.UnknownAlias, single("- &a [1]\n- [ *ab ]\n"));
+}
+
 test "'---' as a mapping value, not at column 0, is plain content — not a document marker" {
     // YAML 1.2 §9.1.3: `c-directives-end`/document markers are recognized
     // only at the start of a line. Neither the yaml-test-suite ledger above

@@ -310,7 +310,23 @@ test "arbitrary input never panics" {
     // A parser that touches bytes it did not produce is held to a never-panic
     // threat model (CONVENTIONS.md §7.1). Short adversarial strings over the
     // full indicator alphabet, all outcomes acceptable except a crash.
-    const alphabet = "-?:,[]{}#&*!|>'\"%@` \tabc\n";
+    //
+    // The alphabet used to be pure ASCII indicators/letters -- structurally
+    // rich but blind to an entire class this module actually has (F4,
+    // A1/yaml.md): a single invalid-UTF-8 lead byte or a raw control
+    // character changes `charWidth`'s/the scanner's behavior in ways no
+    // ASCII byte can trigger. `compose.zig`'s two `testing.fuzz` harnesses
+    // stopped being alphabet-restricted already (`97583a0a`, an unrelated
+    // "Smith vacuity" fix that switched them to raw `smith.slice` reads as a
+    // side effect) -- this manual stand-in (not gated behind `--fuzz`, so it
+    // always runs) was the one place still leaving that byte space
+    // unreachable. Added: one byte from each invalid-UTF-8-lead-byte class
+    // F4 named (0x80 stray continuation, 0xC0/0xC1 always-overlong, 0xC3 a
+    // valid 2-byte lead, 0xE2 a valid 3-byte lead, 0xF0/0xF4 valid 4-byte
+    // leads, 0xF5/0xF8/0xFE/0xFF never valid) plus the three C0 controls
+    // F4's `c-printable` check named (NUL, DEL, ESC).
+    const alphabet = "-?:,[]{}#&*!|>'\"%@` \tabc\n" ++
+        "\x80\xC0\xC1\xC3\xE2\xF0\xF4\xF5\xF8\xFE\xFF\x00\x7F\x1B";
     var seed: u64 = 0x9E3779B97F4A7C15;
     var buf: [24]u8 = undefined;
     for (0..4000) |_| {

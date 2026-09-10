@@ -5,6 +5,32 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — A1 fix campaign, second-pass fix queue (0 consumers in this repo, P1
+  applies): test-only, no production behavior change except where noted. `scanner.zig`'s
+  OWN `max_depth = 4096` flow/block-nesting cap (a lower-level guard than the composer's
+  `Options.max_depth`, which F1-F3 already cover) had zero test coverage — added two
+  scanner-level tests (`scanner.zig`, bypass the composer entirely so there is no
+  per-level recursion to overflow Debug's stack) pinning the exact boundary for both flow
+  (`[[[...`) and block (`- \n  - \n...`) nesting; verified against the audit's own mutation
+  shape (the guard replaced with `if (false)`) that both catch it. Added a test that an
+  alias name which is a superstring of a real anchor (`*ab` when only `&a` is defined)
+  stays `error.UnknownAlias` — already correct (the anchor table is an exact-match
+  `StringHashMapUnmanaged`), but a mutation adding a "try one byte shorter" fallback
+  wasn't caught by anything before this (F5, partial — `R08`'s parser liveness invariant
+  and the block/flow-nesting `simple_key`/tab-indent survivors from the audit's mutation
+  table remain untested). `root.zig`'s "arbitrary input never panics" stand-in fuzzer
+  (not gated behind `--fuzz`, always runs) drew from a pure-ASCII indicator alphabet and
+  could never produce the invalid-UTF-8/control-byte class F4 needed — broadened it to
+  include one byte from each invalid-lead-byte class F4 named plus NUL/DEL/ESC; measured
+  0/4000 to 3729/4000 draws reaching that byte class (F8, partial — `compose.zig`'s two
+  `testing.fuzz` harnesses turned out to already be unrestricted, a side effect of an
+  unrelated Smith-vacuity fix, `97583a0a`, 2026-09-07, confirmed by diffing that commit's
+  parent; not something this pass did).
+  Open, deferred: F7 and F9 are user decisions per the audit's own §6 (points 4 and 6);
+  F5's remaining survivors (parser liveness invariant, simple-key length cap, tab-indent
+  state) need more test-writing time than this slot had. scripts/modtest yaml: 58/58,
+  Debug and ReleaseFast alike.
+
 - **2026-09-10** — A1 audit fix campaign, `A1/yaml.md` F1/F2/F3/F4/F6 (0 consumers in
   this repo, P1 applies). The default-on duplicate-key check (`Options.reject_duplicate_keys
   = true`) walked composed `Value`s with plain, unmemoized structural equality: an

@@ -1383,3 +1383,75 @@ pub const Scanner = struct {
         };
     }
 };
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+/// Drive a `Scanner` to completion (or its first error), never building a
+/// value tree -- unlike composing, this has NO per-level recursion (depth is
+/// tracked in flat counters: `indents.items.len`, `flow_level`), so it is
+/// safe to run right at `max_depth` in every build mode, including Debug.
+fn scanAll(arena: std.mem.Allocator, src: []const u8) Error!void {
+    var s = Scanner.init(arena, src);
+    while (true) {
+        const tok = try s.next();
+        if (tok.kind == .stream_end) return;
+    }
+}
+
+// F5 (A1/yaml.md): before this, nothing in the suite exercised `max_depth`
+// (4096) at all -- the composer's OWN, separate, lower `Options.max_depth`
+// (default 1024, see compose.zig) rejects any realistic input long before a
+// caller could reach this constant, so the boundary was invisible even to a
+// full compose. `scanAll` above reaches it directly.
+
+test "flow-nesting cap: max_depth levels of '[' scan clean, max_depth + 1 fails" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var at_bound: std.ArrayList(u8) = .empty;
+    for (0..max_depth) |_| try at_bound.append(gpa, '[');
+    try at_bound.append(gpa, '1');
+    for (0..max_depth) |_| try at_bound.append(gpa, ']');
+    try at_bound.append(gpa, '\n');
+    defer at_bound.deinit(gpa);
+    try scanAll(arena, at_bound.items);
+
+    var one_too_deep: std.ArrayList(u8) = .empty;
+    for (0..max_depth + 1) |_| try one_too_deep.append(gpa, '[');
+    try one_too_deep.append(gpa, '1');
+    for (0..max_depth + 1) |_| try one_too_deep.append(gpa, ']');
+    try one_too_deep.append(gpa, '\n');
+    defer one_too_deep.deinit(gpa);
+    try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_deep.items));
+}
+
+test "block-nesting cap: max_depth levels of '- ' scan clean, max_depth + 1 fails" {
+    const gpa = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var at_bound: std.ArrayList(u8) = .empty;
+    for (0..max_depth) |i| {
+        for (0..2 * i) |_| try at_bound.append(gpa, ' ');
+        try at_bound.appendSlice(gpa, "- ");
+        if (i + 1 == max_depth) try at_bound.append(gpa, 'x');
+        try at_bound.append(gpa, '\n');
+    }
+    defer at_bound.deinit(gpa);
+    try scanAll(arena, at_bound.items);
+
+    var one_too_deep: std.ArrayList(u8) = .empty;
+    for (0..max_depth + 1) |i| {
+        for (0..2 * i) |_| try one_too_deep.append(gpa, ' ');
+        try one_too_deep.appendSlice(gpa, "- ");
+        if (i + 1 == max_depth + 1) try one_too_deep.append(gpa, 'x');
+        try one_too_deep.append(gpa, '\n');
+    }
+    defer one_too_deep.deinit(gpa);
+    try testing.expectError(error.InvalidYaml, scanAll(arena, one_too_deep.items));
+}
