@@ -86,7 +86,15 @@ log="$log_dir/$module.log"
 # the same log and clobber each other's result -- measured 2026-09-10, an agent
 # lost a measurement twice that way and could not tell which run it was reading.
 # `flock -n` on the log makes the second one say so instead of racing.
-exec 9>>"$log.lock" 2>/dev/null || true
+# ⛔⛔ The braces are load-bearing. `exec 9>>"$log.lock" 2>/dev/null` does NOT
+# redirect stderr "for this exec" -- an `exec` with redirections and no command
+# applies them to THE SHELL, permanently. Written that way (as it was from
+# 2026-09-10 morning until it was caught that evening) every ⛔ this script
+# prints -- TIMED OUT, the byte budget, the stray sweep, this very lock message
+# -- went to /dev/null for the whole run. The tool's alarms were mute and its
+# exit codes were the only thing left saying anything. Wrapping in a group
+# scopes the redirect to the group and leaves the shell's own stderr alone.
+{ exec 9>>"$log.lock"; } 2>/dev/null || true
 if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
     echo "⛔ modtest $module is already running (log $log). Wait for it or use a different module." >&2
     exit 2
@@ -112,7 +120,88 @@ if [[ -z "${_ZL_MODTEST_INNER:-}" ]]; then
     exec "$SCRIPT_DIR/capped" nice -n "$NICE" "$0" "$module" "$@"
 fi
 
+# ⛔⛔ TWO separate holes, both measured 2026-09-10, both from one incident.
+#
+# (1) `timeout` kills the process it STARTED, and that is not the process that
+#     loops. A `yaml` test binary spawned by a lane in worktree `c` outlived its
+#     build by 2 h 52 min at 99.5% of one core, 532 MB RSS, zero bytes read or
+#     written -- the shape no memory cap and no byte budget can see. Its parent
+#     had been reaped, so it showed up reparented to `systemd --user`; and a
+#     `systemd-run --scope` lives as long as ANY task in it, so the scope never
+#     tore down either. The cap kept applying to a process nobody waited for.
+#
+# (2) Worse, and why a reaper AFTER the pipeline is not enough: the stray
+#     inherits the pipe's write end, so `head` never sees EOF and the pipeline
+#     never returns. Reproduced deliberately with a forked probe -- `zig test`
+#     was killed at the 120s limit, `head -c 256M` was still blocked 7 minutes
+#     later, and killing the stray by hand let the pipeline finish instantly.
+#     The wait itself has to be bounded, not just the command.
+#
+# So: a watchdog sweeps our own cgroup once the limit is past. Sweeping the
+# CGROUP rather than the process group is what makes it work regardless of who
+# reparented the stray.
+
+# Seconds from ZIGLIBS_MODTEST_TIMEOUT ("900s", "15m", or a bare number).
+timeout_seconds() {
+    local t="${1:-}" n unit
+    n="${t%[smhd]}"
+    unit="${t#$n}"
+    [[ "$n" =~ ^[0-9]+$ ]] || { echo 900; return; }
+    case "$unit" in
+        m) echo $((n * 60)) ;;
+        h) echo $((n * 3600)) ;;
+        d) echo $((n * 86400)) ;;
+        *) echo "$n" ;;
+    esac
+}
+
+# Kill every task in our own cgroup except the PIDs named. Returns the count.
+reap_cgroup() {
+    local -a keep=("$@")
+    local cg procs pid k skip
+    cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+    procs="/sys/fs/cgroup${cg}/cgroup.procs"
+    [[ -n "$cg" && -r "$procs" ]] || return 0
+
+    local -a strays=()
+    while read -r pid; do
+        [[ -z "$pid" ]] && continue
+        skip=
+        for k in "${keep[@]}"; do [[ "$pid" == "$k" ]] && skip=1 && break; done
+        [[ -n "$skip" ]] && continue
+        kill -0 "$pid" 2>/dev/null || continue
+        strays+=("$pid")
+    done < "$procs"
+    [[ ${#strays[@]} -eq 0 ]] && return 0
+
+    for pid in "${strays[@]}"; do
+        echo "   stray: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-100)" >&2
+    done
+    kill -TERM "${strays[@]}" 2>/dev/null
+    sleep 2
+    for pid in "${strays[@]}"; do
+        kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+    done
+    return "${#strays[@]}"
+}
+
 set -o pipefail
+
+# Watchdog: once the limit plus a grace period is past, sweep the cgroup. This
+# is what unblocks `head` when a stray is holding the pipe open -- see (2) above.
+limit_s=$(timeout_seconds "${ZIGLIBS_MODTEST_TIMEOUT:-$([[ "$mode" == file ]] && echo 120s || echo 900s)}")
+(
+    sleep $((limit_s + 30))
+    # ⚠ Mark BEFORE sweeping, not after. Killing the pipeline lets the main
+    # script race ahead and `kill` this watchdog during reap_cgroup's own
+    # TERM-then-KILL grace period, so a marker written afterwards never lands
+    # and the warning is silently lost -- measured while building this.
+    echo "swept" > "$log.swept"
+    echo "⛔ modtest $module: limit ${limit_s}s elapsed and the lane is still up — sweeping the cgroup." >&2
+    reap_cgroup "$$" "$BASHPID"
+) &
+watchdog=$!
+
 if [[ "$mode" == file ]]; then
     # One file, one binary, same cap and same byte budget, plus a wall-clock
     # limit -- a mutant that loops forever prints forever, and a byte budget
@@ -134,6 +223,27 @@ fi
 # not read as a green build.
 rc=$?
 
+# If the watchdog already fired, let it FINISH its own sweep rather than killing
+# it mid-flight -- otherwise its TERM-then-KILL grace `sleep` is still alive when
+# the second sweep runs and gets reported as a stray, which is noise on top of a
+# real warning.
+if [[ -f "$log.swept" ]]; then
+    wait "$watchdog" 2>/dev/null
+else
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+fi
+
+# Second sweep, for the ordinary case: the lane finished on its own but left
+# something behind. `head` has already exited here, so nothing is blocked --
+# this is purely about not leaking a spinning process onto the user's desktop.
+strays_found=0
+reap_cgroup "$$" || strays_found=$?
+
+swept=0
+if [[ -f "$log.swept" ]]; then swept=1; rm -f "$log.swept"; fi
+
+
 bytes=$(stat -c %s "$log" 2>/dev/null || echo 0)
 budget=$(numfmt --from=iec "$ZIGLIBS_MODTEST_LOG_MAX" 2>/dev/null || echo 0)
 
@@ -150,6 +260,15 @@ if [[ "$budget" != 0 && "$bytes" -ge "$budget" ]]; then
     echo "⛔ OUTPUT HIT THE ${ZIGLIBS_MODTEST_LOG_MAX} BUDGET — this lane writes without bound." >&2
     echo "   Do NOT re-run it through a pipe. Diagnose from the log head:" >&2
     echo "   head -c 4000 $log" >&2
+fi
+
+if [[ "$swept" == 1 ]]; then
+    echo "⛔ THE WATCHDOG HAD TO SWEEP — the lane outlived its ${limit_s}s limit and" >&2
+    echo "   something it spawned was still holding the output pipe open. A test" >&2
+    echo "   binary that survives its own build IS the finding; write it down." >&2
+elif [[ "$strays_found" != 0 ]]; then
+    echo "⛔ $strays_found STRAY PROCESS(ES) — the lane finished but left something running." >&2
+    echo "   Write it into the disposition; a runaway that survives its build is a defect." >&2
 fi
 
 tail -c 200000 "$log" | tail -n "$LINES"

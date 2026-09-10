@@ -311,6 +311,52 @@ The cap needs cgroup v2 with the `memory` controller delegated to the user
 manager (any modern systemd). It is probed for, not assumed, and degrades to a
 plain exec on macOS, non-systemd Linux and containers without delegation.
 
+### ⛔⛔ Two more holes in the same lane, found 2026-09-10 evening
+
+**A `timeout` bounds the process it started, not what that process spawned.**
+A `yaml` test binary outlived its build by **2 h 52 min** at 99.5% of one core,
+532 MB RSS, zero bytes read or written — the shape neither a memory cap nor a
+byte budget can see, because it neither allocates nor prints. Its parent had
+been reaped, so it showed up reparented to `systemd --user`; and since a
+`systemd-run --scope` lives as long as *any* task in it, the scope never tore
+down either. The cap went on applying to a process nobody was waiting for.
+
+**And a reaper that runs after the pipeline is not enough**, because the stray
+inherits the pipe's write end: `head` never sees EOF and the pipeline never
+returns. Reproduced deliberately with a forked probe — `zig test` was killed at
+its limit, `head -c 256M` was still blocked seven minutes later, and killing the
+stray by hand let the pipeline finish instantly. So `modtest` now runs a
+**watchdog** that sweeps its own cgroup once the limit plus a grace period is
+past. Sweeping the *cgroup* rather than the process group is what makes it work
+regardless of who reparented the stray.
+
+### ⛔⛔⛔ And the alarms had been mute all along
+
+The same evening, this line was found at the top of `modtest`:
+
+```bash
+exec 9>>"$log.lock" 2>/dev/null || true      # ⛔ WRONG
+```
+
+An `exec` with redirections and **no command** applies them to *the shell*, not
+to that one statement. So from the morning that `flock` was added until it was
+caught, **every `⛔` the script printed went to `/dev/null`** — the timeout
+warning, the byte-budget warning, the lock message, all of it. Exit codes were
+the only thing still speaking. The fix is a brace group, which scopes the
+redirect and leaves the shell's own stderr alone:
+
+```bash
+{ exec 9>>"$log.lock"; } 2>/dev/null || true
+```
+
+⭐ Worth generalising: a tool whose warnings are silently discarded looks exactly
+like a tool with nothing to warn about.
+
+Verified with the three checks this directory requires: a deployed runaway is
+contained (a probe that forks a child outliving the test — swept at the limit,
+loud warning, no survivor), a healthy lane is green (`l2disco` 64/64, exit 0),
+and a lane that runs nothing exits **1**, not 0.
+
 ## Optimization modes
 
 Compute-heavy modules (pairings, hash-based signatures, FHE, scrypt, RSA) build
