@@ -28,20 +28,32 @@
 //! `bip340.taggedHash("TapSighash", sigMsg(...))` with no separate
 //! epoch-prepending step.
 //!
-//! ## Scope: key-path only — annex and BIP342 tapscript deferred
+//! ## Scope: the common SigMsg, including the annex — BIP342 tapscript itself deferred
 //!
-//! `ext_flag` (part of `spend_type`) is always `0` (key-path spending) and
-//! an annex is never signaled (`spend_type` is always `0x00`). BIP341's
-//! script-path fields (`ext_flag = 1`, the leaf hash / `key_version` /
-//! `code_separator_position` a BIP342 tapscript signature additionally
-//! commits to) and annex support (`sha_annex`, needing the witness stack's
-//! last-item-starts-with-`0x50` detection rule) are real, self-contained
-//! extensions with their own committed fields — not a partial/half-built
-//! version of this function — and are out of scope for this pass: no
-//! published, official key-path-spending test vector exercises an annex
-//! (`bip341_kat_vectors.zig`'s source JSON has none), and tapscript
-//! (BIP342) is a distinct signature-hashing mode this module does not
-//! implement at all.
+//! `commonSigMsg`/`commonSigMsgWith` build BIP341's SigMsg through the
+//! SINGLE-output commitment for BOTH key-path (`spend_type` even, `ext_flag
+//! = 0`) and script-path (`ext_flag = 1`) callers — including the annex
+//! commitment (`sha_annex`, `CommonOptions.annex_hash`), which is emitted
+//! whenever the caller sets it, regardless of path. `sigMsg`/`sighash` below
+//! are the key-path convenience wrapper (`spend_type = 0`, no annex).
+//! `bitcoinscript` calls `commonSigMsg{,With}` directly for BIP342 tapscript
+//! spends, including ones that carry an annex, and appends its own
+//! `ext_flag = 1` fields (tapleaf hash / `key_version` /
+//! `code_separator_position`) on top.
+//!
+//! What this module does NOT implement: BIP342 tapscript's own
+//! signature-hashing mode (the tapleaf-hash machinery and the fields above)
+//! — that is a distinct, self-contained extension built one layer up, in
+//! `bitcoinscript`, not a partial/half-built version of this function.
+//!
+//! ⚠ Coverage gap, not a scope cut: no published, official key-path test
+//! vector exercises an annex (`bip341_kat_vectors.zig`'s source JSON has
+//! none), and this module's own tests never set `annex_hash`, so the annex
+//! wire layout below is reviewed rather than vector-anchored *here* —
+//! `bitcoinscript`'s `sighash_annex` case anchors it one level up. What IS
+//! checked in this module is `CommonOptions`'s internal consistency
+//! (`spend_type`'s annex bit vs. `annex_hash != null`,
+//! `error.SpendTypeAnnexMismatch`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -74,6 +86,12 @@ pub const Bip341Error = error{
     /// doc comment. Refused rather than silently mixing another
     /// transaction's cached commitment hashes into this one's sig message.
     PrecomputedMismatch,
+    /// `opts.spend_type` bit 0 (the annex-present bit) and
+    /// `opts.annex_hash != null` disagree. `CommonOptions.annex_hash`'s doc
+    /// comment says the caller is responsible for keeping the two in sync;
+    /// this makes that a checked contract instead of a silent one — see
+    /// finding X1, `A1/bitcointx.md`.
+    SpendTypeAnnexMismatch,
 } || Allocator.Error;
 
 pub fn validateHashType(hash_type: u8) Bip341Error!void {
@@ -159,6 +177,12 @@ fn shaScriptPubkeys(allocator: Allocator, spent_outputs: []const tx.TxOut) Alloc
     instrument.noteCommitmentHash();
     var tmp: std.ArrayList(u8) = .empty;
     defer tmp.deinit(allocator);
+    // B2: `script_pubkey` is variable-length, so (unlike `shaPrevouts`/
+    // `shaAmounts`/`shaSequences` above) the total isn't a fixed per-item
+    // constant -- sum it first so the append loop never reallocates.
+    var total: usize = 0;
+    for (spent_outputs) |o| total += tx.compactSizeLen(o.script_pubkey.len) + o.script_pubkey.len;
+    try tmp.ensureTotalCapacityPrecise(allocator, total);
     for (spent_outputs) |o| {
         try appendCompactSize(&tmp, allocator, o.script_pubkey.len);
         try tmp.appendSlice(allocator, o.script_pubkey);
@@ -179,6 +203,11 @@ fn shaOutputs(allocator: Allocator, transaction: tx.Transaction) Allocator.Error
     instrument.noteCommitmentHash();
     var tmp: std.ArrayList(u8) = .empty;
     defer tmp.deinit(allocator);
+    // B2: same reasoning as `shaScriptPubkeys` above -- sum the variable
+    // `script_pubkey` lengths first so the append loop never reallocates.
+    var total: usize = 0;
+    for (transaction.vout) |vout| total += 8 + tx.compactSizeLen(vout.script_pubkey.len) + vout.script_pubkey.len;
+    try tmp.ensureTotalCapacityPrecise(allocator, total);
     for (transaction.vout) |vout| {
         try appendI64LE(&tmp, allocator, vout.value);
         try appendCompactSize(&tmp, allocator, vout.script_pubkey.len);
@@ -290,6 +319,10 @@ fn buildCommonSigMsg(
     if (pre) |p| if (!p.matches(transaction, spent_outputs)) return error.PrecomputedMismatch;
     if (input_index >= transaction.vin.len) return error.InputIndexOutOfRange;
     if (spent_outputs.len != transaction.vin.len) return error.PrevoutsCountMismatch;
+    // X1: `spend_type`'s annex-present bit (bit 0) and `annex_hash` must
+    // agree — a caller that sets one without the other gets a SigMsg no
+    // verifier computes, silently, instead of an error.
+    if ((opts.spend_type & 1 != 0) != (opts.annex_hash != null)) return error.SpendTypeAnnexMismatch;
 
     const anyone_can_pay = (hash_type & SIGHASH_ANYONECANPAY) != 0;
     const base = hash_type & 0x03;
@@ -446,6 +479,7 @@ pub fn sighashWith(
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testutil = @import("testutil.zig");
 
 test "validateHashType accepts exactly the 7 BIP341 values, rejects everything else" {
     const valid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83 };
@@ -484,4 +518,128 @@ test "SIGHASH_SINGLE with no corresponding output is rejected outright (no legac
     const prevouts = [_]tx.TxOut{ .{ .value = 100, .script_pubkey = &.{} }, .{ .value = 200, .script_pubkey = &.{} } };
     try testing.expectError(error.MissingCorrespondingOutput, sigMsg(testing.allocator, t, 1, SIGHASH_SINGLE, &prevouts));
     _ = &t;
+}
+
+test "X1: CommonOptions.spend_type bit 0 and annex_hash presence must agree" {
+    // Without this check, `spend_type = 2` (ext_flag=1, no annex signaled)
+    // plus a non-null `annex_hash` silently emits a SigMsg with 32 extra
+    // bytes no verifier computes — see finding X1, `A1/bitcointx.md`.
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const prevouts = [_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }};
+    const annex: [32]u8 = [_]u8{0xcc} ** 32;
+
+    // Positive controls that MUST keep succeeding: consistent combinations.
+    {
+        const got = try commonSigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &prevouts, .{ .spend_type = 2, .annex_hash = null });
+        testing.allocator.free(got);
+    }
+    {
+        const got = try commonSigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &prevouts, .{ .spend_type = 3, .annex_hash = annex });
+        testing.allocator.free(got);
+    }
+
+    // The two inconsistent combinations must be rejected.
+    try testing.expectError(
+        error.SpendTypeAnnexMismatch,
+        commonSigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &prevouts, .{ .spend_type = 2, .annex_hash = annex }),
+    );
+    try testing.expectError(
+        error.SpendTypeAnnexMismatch,
+        commonSigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &prevouts, .{ .spend_type = 3, .annex_hash = null }),
+    );
+    _ = &t;
+}
+
+test "V2: spend_type is committed byte-for-byte -- key-path and script-path SigMsgs diverge" {
+    // Nothing in this module's OWN tests ever passed `spend_type != 0` before
+    // finding V2 (`A1/bitcointx.md`): wiring `opts.spend_type` to a hardcoded
+    // `0` left all 54 tests that existed at audit time green, and the
+    // key-path SigMsg would then be byte-for-byte identical to the
+    // tapscript-spend SigMsg for the same input -- exactly the domain
+    // separation `spend_type` exists in BIP341 to prevent. This test locates
+    // the one byte that must carry `spend_type` and pins it.
+    var t: tx.Transaction = .{
+        .version = 1,
+        .vin = @constCast(&[_]tx.TxIn{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0 }}),
+        .vout = @constCast(&[_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }}),
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+    const prevouts = [_]tx.TxOut{.{ .value = 100, .script_pubkey = &.{} }};
+
+    // Same transaction, same input, same hash type -- only `spend_type`
+    // differs: 0 (key-path) vs 2 (tapscript spend, no annex).
+    const key_path = try commonSigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &prevouts, .{ .spend_type = 0, .annex_hash = null });
+    defer testing.allocator.free(key_path);
+    const script_path = try commonSigMsg(testing.allocator, t, 0, SIGHASH_DEFAULT, &prevouts, .{ .spend_type = 2, .annex_hash = null });
+    defer testing.allocator.free(script_path);
+
+    // Neither carries an annex, so the two messages must be the same length
+    // -- and must NOT be the same bytes.
+    try testing.expectEqual(key_path.len, script_path.len);
+    try testing.expect(!std.mem.eql(u8, key_path, script_path));
+
+    // Exactly one byte differs, and it is `spend_type` itself, holding the
+    // value each caller passed.
+    var diffs: usize = 0;
+    var diff_at: usize = 0;
+    for (key_path, script_path, 0..) |a, b, i| {
+        if (a != b) {
+            diffs += 1;
+            diff_at = i;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), diffs);
+    try testing.expectEqual(@as(u8, 0), key_path[diff_at]);
+    try testing.expectEqual(@as(u8, 2), script_path[diff_at]);
+    _ = &t;
+}
+
+test "B2: shaOutputs/shaScriptPubkeys/shaAmounts/shaPrevouts/shaSequences don't reallocate growing many outputs" {
+    // `A1/bitcointx.md` finding B2: these five per-transaction commitment
+    // builders grew their `ArrayList`s by repeated `appendSlice` with no
+    // `ensureTotalCapacity` -- measured at 8 192 outputs, 24 allocations +
+    // 35 remaps on ONE `bip341.sighash` call. Reserving exact capacity up
+    // front (this file's `shaOutputs`/`shaScriptPubkeys`, and
+    // `sighash_bip143.zig`'s `hashOutputs`) should cut each builder to
+    // exactly one allocator round trip.
+    const n = 1024;
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
+
+    var vin_buf: [n]tx.TxIn = undefined;
+    var vout_buf: [n]tx.TxOut = undefined;
+    var spent_buf: [n]tx.TxOut = undefined;
+    for (0..n) |i| {
+        vin_buf[i] = .{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+        vout_buf[i] = .{ .value = 100, .script_pubkey = &spk };
+        spent_buf[i] = .{ .value = 100, .script_pubkey = &spk };
+    }
+    const t: tx.Transaction = .{
+        .version = 1,
+        .vin = vin_buf[0..],
+        .vout = vout_buf[0..],
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+
+    var counting: testutil.CountingAllocator = .{ .backing = testing.allocator };
+    _ = try sighash(counting.allocator(), t, 0, SIGHASH_DEFAULT, spent_buf[0..n]);
+    const total_ops = counting.allocs + counting.resizes + counting.remaps;
+
+    // 5 commitment builders + the outer SigMsg buffer: at most a handful of
+    // allocator round trips total for 1024 outputs/prevouts, not one per
+    // `appendSlice`-triggered growth step (O(log n) each without
+    // reservation).
+    // Measured: 30 ops (24 allocs + 6 remaps) before the reservation, 8
+    // (8 allocs, 0 resizes, 0 remaps) after.
+    try testing.expect(total_ops <= 10);
 }

@@ -108,6 +108,13 @@ fn hashOutputs(allocator: Allocator, transaction: tx.Transaction) Allocator.Erro
     instrument.noteCommitmentHash();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
+    // B2: unlike `hashPrevouts`/`hashSequence` above, each output's
+    // `script_pubkey` is variable-length, so the total isn't a fixed
+    // per-item constant -- sum it in one pass first (cheap: no allocation)
+    // so the append loop below never reallocates.
+    var total: usize = 0;
+    for (transaction.vout) |vout| total += 8 + tx.compactSizeLen(vout.script_pubkey.len) + vout.script_pubkey.len;
+    try buf.ensureTotalCapacityPrecise(allocator, total);
     for (transaction.vout) |vout| {
         try appendI64LE(&buf, allocator, vout.value);
         try appendCompactSize(&buf, allocator, vout.script_pubkey.len);
@@ -451,4 +458,35 @@ test "input_index out of range is a typed error (midstates and sighash)" {
     try testing.expectError(error.InputIndexOutOfRange, midstates(testing.allocator, t, 3, ALL));
     try testing.expectError(error.InputIndexOutOfRange, sighash(testing.allocator, t, 3, &.{}, 0, ALL));
     _ = &t;
+}
+
+test "B2: hashOutputs doesn't reallocate growing many outputs" {
+    // `A1/bitcointx.md` finding B2: `hashOutputs` was the one BIP143
+    // commitment builder left without a capacity reservation (unlike
+    // `hashPrevouts`/`hashSequence`, which F2 already covered).
+    const testutil = @import("testutil.zig");
+    const n = 1024;
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
+
+    var vin_buf: [1]tx.TxIn = .{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }};
+    var vout_buf: [n]tx.TxOut = undefined;
+    for (0..n) |i| vout_buf[i] = .{ .value = 100, .script_pubkey = &spk };
+    const t: tx.Transaction = .{
+        .version = 1,
+        .vin = vin_buf[0..],
+        .vout = vout_buf[0..],
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+
+    var counting: testutil.CountingAllocator = .{ .backing = testing.allocator };
+    _ = try sighash(counting.allocator(), t, 0, &.{}, 100, ALL);
+    const total_ops = counting.allocs + counting.resizes + counting.remaps;
+
+    // Measured: with `hashOutputs`'s reservation disabled (probe), this
+    // exceeds the threshold below; with it enabled, `hashOutputs` costs
+    // exactly one allocation (plus whatever the other, already-reserved
+    // midstate builders and the outer preimage buffer cost).
+    try testing.expect(total_ops <= 6);
 }

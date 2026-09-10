@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** `bip341.commonSigMsg`/`commonSigMsgWith` now
+  reject `CommonOptions` where `spend_type`'s annex bit and `annex_hash != null` disagree
+  (new `Bip341Error.SpendTypeAnnexMismatch`, additive to the error set) — previously this
+  silently built a SigMsg no verifier computes. Docs (`sighash_bip341.zig`, `root.zig`,
+  `SPEC.md`) now describe the annex commitment as implemented (it has been since before this
+  audit); they used to say the opposite. Internal only: `sighash_legacy.sighash`,
+  `bip143.hashOutputs`, and `bip341.shaOutputs`/`shaScriptPubkeys` now reserve exact preimage
+  capacity up front instead of growing an `ArrayList` by repeated `appendSlice` — output is
+  byte-identical, allocator round trips drop (measured at 8192 outputs: legacy 27→fewer,
+  bip143 30→fewer, bip341 59→fewer ops). `testutil.CountingAllocator` added for that
+  measurement. Test-only: four new tests pin `getOp`'s push-length boundaries (previously
+  untested — the vendored corpus has no push that reaches one) and one pins that
+  `spend_type` is committed byte-for-byte (previously nothing set it to non-zero).
+  A1/bitcointx.md findings V1, V2, X1, D1, B2 closed.
+
 - **2026-09-09** — Docs: `NOTICE` was wrong in three places, each the same kind of wrong —
   it described an older tree. It said 290 of `sighash.json`'s 500 rows were vendored behind
   an `OP_CODESEPARATOR` filter; **all 500 are vendored and there is no filter** (the

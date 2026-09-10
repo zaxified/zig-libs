@@ -163,6 +163,51 @@ fn appendScriptCode(buf: *std.ArrayList(u8), allocator: Allocator, script_code: 
     if (begin != script_code.len) try buf.appendSlice(allocator, script_code[begin..it]);
 }
 
+/// Upper bound on `sighash`'s preimage size, for `ensureTotalCapacity` (B2).
+/// Mirrors the append sequence below field for field; the one inexact term
+/// (`script_code.len` standing in for `appendScriptCode`'s actual,
+/// codeseparator-stripped output) can only overestimate.
+fn estimatePreimageCapacity(
+    transaction: tx.Transaction,
+    script_code: []const u8,
+    input_index: usize,
+    base: u32,
+    anyone_can_pay: bool,
+) usize {
+    var total: usize = 4; // version
+    if (anyone_can_pay) {
+        total += 1; // CompactSize(1)
+        total += 36; // txid + vout
+        total += tx.compactSizeLen(script_code.len) + script_code.len;
+        total += 4; // sequence
+    } else {
+        total += tx.compactSizeLen(transaction.vin.len);
+        for (transaction.vin, 0..) |_, i| {
+            total += 36; // txid + vout
+            total += if (i == input_index)
+                tx.compactSizeLen(script_code.len) + script_code.len
+            else
+                1; // CompactSize(0): other inputs' scriptSig is cleared
+            total += 4; // sequence
+        }
+    }
+    if (base == NONE) {
+        total += 1; // CompactSize(0)
+    } else if (base == SINGLE) {
+        total += tx.compactSizeLen(input_index + 1);
+        total += input_index * 9; // each null output: value(8) + CompactSize(0)
+        if (input_index < transaction.vout.len) {
+            const vout = transaction.vout[input_index];
+            total += 8 + tx.compactSizeLen(vout.script_pubkey.len) + vout.script_pubkey.len;
+        }
+    } else {
+        total += tx.compactSizeLen(transaction.vout.len);
+        for (transaction.vout) |vout| total += 8 + tx.compactSizeLen(vout.script_pubkey.len) + vout.script_pubkey.len;
+    }
+    total += 4 + 4; // locktime + hash_type
+    return total;
+}
+
 /// Bitcoin Core's `SignatureHash()`. `input_index` selects which input is
 /// being signed; `script_code` substitutes for that input's `scriptSig`
 /// (see module doc comment for what "scriptCode" means here and what's
@@ -183,6 +228,15 @@ pub fn sighash(
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
+    // B2: unlike the other two sighash algorithms, this preimage had NO
+    // capacity reservation at all despite serializing the whole transaction.
+    // `estimatePreimageCapacity` mirrors the append calls below; it may
+    // overestimate slightly (it bounds `appendScriptCode`'s output by
+    // `script_code.len`, which only shrinks when OP_CODESEPARATOR opcodes are
+    // stripped) but never underestimates in a way that would be wrong --
+    // `ensureTotalCapacity` is a hint, not a bound, so any gap just costs an
+    // extra grow, same as today.
+    try buf.ensureTotalCapacity(allocator, estimatePreimageCapacity(transaction, script_code, input_index, base, anyone_can_pay));
 
     try appendI32LE(&buf, allocator, transaction.version);
 
@@ -241,6 +295,7 @@ pub fn sighash(
 // ── tests ────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+const testutil = @import("testutil.zig");
 
 fn oneInOneOutTx(prevout_txid: [32]u8, out_value: i64) tx.Transaction {
     return .{
@@ -352,4 +407,93 @@ test "SerializeScriptCode: an empty scriptCode is a bare zero length" {
     const got = try serializedScriptCode(testing.allocator, &.{});
     defer testing.allocator.free(got);
     try testing.expectEqualSlices(u8, &[_]u8{0x00}, got);
+}
+
+// ── `getOp` push-length boundaries (audit finding V1) ────────────────────────
+//
+// The four tests below pin `getOp`'s four length checks directly. None of the
+// 500 vendored `sighash.json` rows contain a push that reaches exactly one of
+// these boundaries (the corpus is real but blind to this axis — see
+// `A1/bitcointx.md` V1), so a flipped `<` / `<=` on any of these four lines
+// passes the whole suite today. Each expected value below is Core's
+// `GetScriptOp`/`SerializeScriptCode` output for the given scriptCode,
+// independently cross-checked with a Python transliteration of `getOp` run
+// over the same 500-row corpus (0 divergences) — see
+// `~/CML/20260901-zig-libs-audit/A1/repro/bitcointx/getop_probe.py`.
+
+test "getOp boundary: OP_PUSHDATA4 (opcode == 0x4e) still takes the push branch" {
+    // `<push4 len=1: 0xab> OP_1`. Mutating `opcode <= 0x4e` to `< 0x4e` drops
+    // the 0x4e opcode out of the push branch entirely, so the parser
+    // misreads the rest of the script and the 0xab payload byte gets
+    // stripped as if it were OP_CODESEPARATOR.
+    const script = [_]u8{ 0x4e, 0x01, 0x00, 0x00, 0x00, 0xab, 0x51 };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(
+        u8,
+        &[_]u8{ 0x07, 0x4e, 0x01, 0x00, 0x00, 0x00, 0xab, 0x51 },
+        got,
+    );
+}
+
+test "getOp boundary: OP_PUSHDATA1 (opcode == 0x4c) reads its explicit length byte" {
+    // `OP_PUSHDATA1 len=1: 0xab, OP_1`. Mutating `opcode < 0x4c` to
+    // `opcode <= 0x4c` makes 0x4c fall into the direct-length branch
+    // (`size = opcode = 0x4c = 76`) instead of reading the explicit length
+    // byte that follows it — the walk then fails length-checking against
+    // the 3 remaining bytes and truncates after the opcode alone.
+    const script = [_]u8{ 0x4c, 0x01, 0xab, 0x51 };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x04, 0x4c, 0x01, 0xab, 0x51 }, got);
+}
+
+test "getOp boundary: a push whose payload exactly fills the remaining script decodes" {
+    // `<push 1 byte: 0xab>`, nothing after it. Mutating the payload bounds
+    // check from `remaining < size` to `remaining <= size` rejects a push
+    // that exactly fills the rest of the script (a legal, common shape),
+    // truncating the walk one byte early.
+    const script = [_]u8{ 0x01, 0xab };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x02, 0x01, 0xab }, got);
+}
+
+test "getOp boundary: OP_PUSHDATA2 (opcode == 0x4d) reads both of its length bytes" {
+    // `OP_PUSHDATA2 len=0x0000` — the two length bytes exactly fill the
+    // remaining script. Mutating `remaining < 2` to `remaining <= 2` rejects
+    // this exact-fit case and truncates after the opcode alone.
+    const script = [_]u8{ 0x4d, 0x00, 0x00 };
+    const got = try serializedScriptCode(testing.allocator, &script);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x03, 0x4d, 0x00, 0x00 }, got);
+}
+
+test "B2: sighash's preimage buffer doesn't reallocate growing many outputs" {
+    // `A1/bitcointx.md` finding B2: unlike `bip143.sighash`/`bip341.sighash`,
+    // this preimage builder had NO capacity reservation at all despite
+    // serializing the whole transaction. Measured before
+    // `estimatePreimageCapacity` existed and after, at 1024 outputs.
+    const n = 1024;
+    const spk = [_]u8{ 0x76, 0xa9, 0x14 } ++ [_]u8{0x42} ** 20 ++ [_]u8{ 0x88, 0xac }; // 25-byte P2PKH
+
+    var vin_buf: [1]tx.TxIn = .{.{ .prevout = .{ .txid = [_]u8{0} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff }};
+    var vout_buf: [n]tx.TxOut = undefined;
+    for (0..n) |i| vout_buf[i] = .{ .value = 100, .script_pubkey = &spk };
+    const t: tx.Transaction = .{
+        .version = 1,
+        .vin = vin_buf[0..],
+        .vout = vout_buf[0..],
+        .witness = &.{},
+        .locktime = 0,
+        .has_witness = false,
+    };
+
+    var counting: testutil.CountingAllocator = .{ .backing = testing.allocator };
+    _ = try sighash(counting.allocator(), t, 0, &.{}, hashtype.ALL);
+    const total_ops = counting.allocs + counting.resizes + counting.remaps;
+
+    // Measured: 12 ops (9 allocs + 3 remaps) before the reservation, 1
+    // (a single alloc) after, for 1024 outputs.
+    try testing.expect(total_ops <= 3);
 }

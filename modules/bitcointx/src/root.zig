@@ -14,9 +14,11 @@
 //!   model).
 //! - `sighash_legacy.zig` — pre-segwit `SignatureHash()`.
 //! - `sighash_bip143.zig` — segwit-v0 sighash (BIP143).
-//! - `sighash_bip341.zig` — taproot key-path sighash (BIP341); tapscript
-//!   (BIP342) and annex support are explicitly out of scope (its own doc
-//!   comment explains why).
+//! - `sighash_bip341.zig` — taproot key-path sighash (BIP341), including the
+//!   annex commitment (`CommonOptions.annex_hash`); BIP342 tapscript's own
+//!   signing mode is out of scope (its own doc comment explains why —
+//!   `bitcoinscript` builds that layer on top of this module's common
+//!   `SigMsg`, annex included).
 //! - `hashtype.zig` — the shared `ALL`/`NONE`/`SINGLE`/`ANYONECANPAY` bit
 //!   layout `sighash_legacy`/`sighash_bip143` both use (BIP341 has its own
 //!   stricter single-byte encoding, defined in `sighash_bip341.zig`).

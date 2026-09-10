@@ -76,26 +76,31 @@ parameter is caller-supplied (typically the spent output's `scriptPubKey`, or a 
   **no** scope cut relative to its spec — `script_code` is hashed exactly as given, matching
   BIP143 precisely.
 
-## Deferred: BIP342 tapscript and the annex (structural note, not half-built)
+## Deferred: BIP342 tapscript (structural note, not half-built)
 
-`sighash_bip341.zig` implements **only** taproot key-path spending (`ext_flag = 0`, `spend_type`
-always `0x00` — never signals an annex). Deliberately out of scope, not attempted:
+`sighash_bip341.zig` implements taproot key-path spending in full (`buildCommonSigMsg`), and the
+annex commitment is part of that: `CommonOptions.spend_type`/`annex_hash` let a caller signal an
+annex and `sha_annex` is emitted into `SigMsg` per BIP341 (`sighash_bip341.zig:354`). `bitcoinscript`
+uses this directly for real BIP342 (tapscript) spends that carry an annex
+(`tapscript.zig:275-279`). Deliberately out of scope, not attempted:
 
 - **BIP342 tapscript signature hashing** — a distinct signing mode (`ext_flag = 1`) that
   additionally commits to the tapleaf hash, `key_version`, and `codeseparator_position`. This is
   not "the same function with one more field": it requires the tapscript leaf-hash machinery
-  (`TapLeaf` tagged hashing over a script + leaf version) this module does not build.
-- **The annex** — BIP341's optional witness-stack trailer (present when the witness has ≥2 items
-  and the last one starts with `0x50`), which commits `sha_annex` into `SigMsg` and sets
-  `spend_type`'s low bit. Detecting and hashing it is a small, self-contained extension; it is
-  omitted because (a) it is meaningless without a companion Fable pass encompassing tapscript (an
-  annex-carrying key-path spend is valid but rare, and testing it properly needs a real vector),
-  and (b) the official `bip-0341/wallet-test-vectors.json` `keyPathSpending` fixture this module's
-  KATs are pinned against contains **no** annex case (confirmed: zero occurrences of `"annex"` in
-  the source JSON) — so there is no official byte-exact vector to build or verify it against in
-  this pass.
+  (`TapLeaf` tagged hashing over a script + leaf version) this module does not build. `bitcoinscript`
+  builds that layer itself, on top of `commonSigMsg`/`commonSigMsgWith` (see that module's docs).
 
-Both are real, independent follow-on units of work, not corners cut inside what's already built.
+⚠ **Coverage gap, not a scope cut:** the annex path above has no byte-exact test *in this module*
+with `annex_hash != null` — the official `bip-0341/wallet-test-vectors.json` `keyPathSpending`
+fixture this module's KATs are pinned against contains **no** annex case (confirmed: zero
+occurrences of `"annex"` in the source JSON), and this module's own tests never set `annex_hash`.
+`CommonOptions`'s two fields are cross-checked for internal consistency
+(`error.SpendTypeAnnexMismatch`, finding X1), but the wire layout of the annex commitment itself is
+reviewed rather than vector-anchored here. `bitcoinscript`'s `sighash_annex` case anchors it one
+level up.
+
+This is a real, independent follow-on unit of work (getting an official script-path/annex vector
+into this module, or building one), not a corner cut inside what's already built.
 
 ## Verification
 
