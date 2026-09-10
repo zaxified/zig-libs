@@ -1585,6 +1585,21 @@ test "not-wf: mismatched end tag" {
     try testing.expectError(error.MismatchedTag, parse(testing.allocator, "<a></b>", .{}));
 }
 
+test "not-wf: end tag matching local name but not prefix is still a mismatch (F9 M27)" {
+    // XML §3 EndTag matches the STag by the full (possibly-prefixed) name,
+    // never by local name alone -- `parseEndTag` compares both `.prefix` and
+    // `.local`. A mutation limiting that comparison to `.local` survived
+    // audit A1/xml.md's mutation sweep untested (F9 M27); this pins it.
+    try testing.expectError(
+        error.MismatchedTag,
+        parse(testing.allocator, "<p:a xmlns:p=\"urn:p\"></a>", .{}),
+    );
+    try testing.expectError(
+        error.MismatchedTag,
+        parse(testing.allocator, "<a xmlns:p=\"urn:p\"></p:a>", .{}),
+    );
+}
+
 test "not-wf: unclosed element" {
     try testing.expectError(error.UnclosedElement, parse(testing.allocator, "<a><b></b>", .{}));
 }
@@ -1595,6 +1610,83 @@ test "not-wf: bad nesting overlap" {
 
 test "not-wf: duplicate attribute" {
     try testing.expectError(error.DuplicateAttribute, parse(testing.allocator, "<a x=\"1\" x=\"2\"/>", .{}));
+}
+
+test "not-wf: literal ']]>' in character data is forbidden (XML sec2.4, F9 M15)" {
+    // `parseText`'s guard against a bare "]]>" outside a CDATA section
+    // survived audit A1/xml.md's mutation sweep untested (F9 M15); this pins
+    // it, at the start of the text run and after other content.
+    try testing.expectError(error.MalformedCData, parse(testing.allocator, "<a>]]></a>", .{}));
+    try testing.expectError(error.MalformedCData, parse(testing.allocator, "<a>x]]>y</a>", .{}));
+    // The same three bytes ARE legal once actually inside a CDATA section's
+    // own delimiters -- this is not a blanket ban on the substring.
+    var doc = try parse(testing.allocator, "<a><![CDATA[x]]]]><![CDATA[>y]]></a>", .{});
+    defer doc.deinit();
+}
+
+test "not-wf: a Name longer than max_name_len is rejected at the boundary (F9 M19)" {
+    // `parseNameRaw`'s length guard survived audit A1/xml.md's mutation sweep
+    // untested (F9 M19, "max_name_len doubled and no test noticed"). Pin
+    // both sides of the boundary, not just "some long name fails".
+    const gpa = testing.allocator;
+    const opts: Options = .{ .max_name_len = 8 };
+    var ok_buf: [1 + 8]u8 = undefined;
+    ok_buf[0] = '<';
+    @memset(ok_buf[1..9], 'a');
+    var ok_src: [11]u8 = undefined;
+    @memcpy(ok_src[0..9], &ok_buf);
+    ok_src[9] = '/';
+    ok_src[10] = '>';
+    var ok = try parse(gpa, &ok_src, opts); // exactly 8 bytes: at the limit
+    defer ok.deinit();
+    try testing.expectEqualStrings("aaaaaaaa", ok.root.local);
+
+    var over_buf: [1 + 9]u8 = undefined;
+    over_buf[0] = '<';
+    @memset(over_buf[1..10], 'a');
+    var over_src: [12]u8 = undefined;
+    @memcpy(over_src[0..10], &over_buf);
+    over_src[10] = '/';
+    over_src[11] = '>';
+    try testing.expectError(error.NameTooLong, parse(gpa, &over_src, opts)); // 9 bytes: one over
+}
+
+test "wf: a reserved PI target is reserved in every ASCII case, not just lowercase (F9 M24)" {
+    // `parsePi` compares the target with `asciiEqualIgnoreCase(target, "xml")`,
+    // not a case-sensitive `eql` -- audit A1/xml.md's F9 filed this as M24, a
+    // surviving mutation ("`<?XML ?>` would pass"), but the case-insensitive
+    // compare was already there in the module's first commit (c4dafb09); the
+    // gap was in test coverage, not in the parser. Pin every case combination
+    // XML Namespaces reserves, and confirm a target that merely STARTS WITH
+    // "xml" (not equal to it) is unaffected -- see F7 for that boundary.
+    //
+    // Placed AFTER the root start tag, not before it: an exact-case
+    // "<?xml" at byte 0 of the document is the XML declaration
+    // (`parseXmlDecl`, a different code path with its own grammar), not a
+    // ordinary PI, so testing the lowercase form at document start would
+    // exercise the wrong function entirely.
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "xml", "xmL", "xMl", "xML", "Xml", "XmL", "XMl", "XML" }) |t| {
+        var src_buf: [32]u8 = undefined;
+        const src = try std.fmt.bufPrint(&src_buf, "<a><?{s} d?></a>", .{t});
+        try testing.expectError(error.MalformedPI, parse(gpa, src, .{}));
+    }
+    var doc = try parse(gpa, "<a><?xmlfoo d?></a>", .{}); // NOT reserved: not equal to "xml"
+    defer doc.deinit();
+}
+
+test "wf: an element may carry more than one distinct ID-typed attribute (F9 M03)" {
+    // `registerIds` loops over every attribute and registers each ID-typed
+    // one it finds -- it does not stop after the first. Audit A1/xml.md's F9
+    // filed a surviving mutation (M03, "register only the first ID attribute
+    // on an element") as untested; this pins that BOTH `xml:id` and a
+    // configured `id_attr_names` entry on the SAME element resolve
+    // independently, with different values.
+    const gpa = testing.allocator;
+    var doc = try parse(gpa, "<a xml:id=\"p\" ID=\"q\"><b/></a>", .{});
+    defer doc.deinit();
+    try testing.expectEqual(doc.root, doc.getElementById("p").?);
+    try testing.expectEqual(doc.root, doc.getElementById("q").?);
 }
 
 test "not-wf: missing whitespace between attributes (XML 1.0 sec3.1: STag ::= '<' Name (S Attribute)* S? '>')" {
