@@ -83,13 +83,45 @@ pub const Info = struct {
     version: []const u8,
     /// Optional `info.description` (omitted when null).
     description: ?[]const u8 = null,
+    /// Optional per-route filter: return `false` to omit a route from the
+    /// generated document entirely (FastAPI's `include_in_schema=False`,
+    /// utoipa's opt-in `#[utoipa::path(...)]`) — audit finding openapi-F11.
+    /// `null` (default) includes every registered route, the pre-fix
+    /// behavior. An excluded route's metadata is never even UTF-8-checked
+    /// or written, so it also cannot trigger `error.InvalidUtf8` or
+    /// `error.PathCollision` against a route that IS included.
+    include: ?*const fn (router.Route) bool = null,
 };
 
 pub const BuildError = error{
     OutOfMemory,
     /// A `RouteDoc.request_schema` is not valid JSON.
     InvalidRequestSchema,
-};
+    /// Route/document metadata (`Info` field, `RouteDoc` field, or a route
+    /// pattern) is not valid UTF-8 (audit finding openapi-F4). JSON text
+    /// MUST be valid UTF-8 (RFC 8259 §8.1); `std.json.Stringify.write`
+    /// does not enforce that for `[]const u8` — it silently switches a
+    /// non-UTF-8 string to a JSON array of byte values instead, and via
+    /// `objectField` (used for path/parameter/response-code keys, which
+    /// skip that switch entirely) invalid bytes go out raw, unescaped, and
+    /// unparseable. Checked up front, before any output is written, so a
+    /// bad byte anywhere fails the whole build atomically rather than
+    /// emitting a partial document.
+    InvalidUtf8,
+    /// Two different routes convert to the same `(path, method)` --
+    /// e.g. `/f/:p` and `/f/*p` both become `/f/{p}`, or a literal
+    /// `/f/{p}` collides with `/f/:p` (audit finding openapi-F5).
+    /// `router` accepts both as distinct, independently dispatchable
+    /// routes (different trie edge types), so silently keeping only the
+    /// first (the pre-fix "first registration wins" rule, still correct
+    /// for a genuinely duplicate key -- see F3/F6) would make a real,
+    /// reachable route disappear from the document without a trace.
+    PathCollision,
+    /// This module's own generated JSON failed to parse back (F9's
+    /// self-check, below) -- would mean a bug in the generator itself,
+    /// not a caller input problem; surfaced rather than served.
+    SelfCheckMalformed,
+} || ConformanceError;
 
 // ── the generator ───────────────────────────────────────────────────────────
 
@@ -99,15 +131,30 @@ pub const Generator = struct {
     /// Build the document as owned JSON text (minified, deterministic).
     /// Caller frees with `gpa`. The Router must be done registering routes
     /// (a built Router is immutable, so this is safe from any thread).
+    ///
+    /// Runs this module's OWN `validateOpenApi31` on its OWN output before
+    /// returning (audit finding openapi-F9): the checker already existed
+    /// and already catches exactly the defects `write` cannot rule out by
+    /// construction alone (F4's non-UTF-8-turned-array is caught up front
+    /// instead, but an empty `info.title`/`info.version`, say, was not),
+    /// yet used to run only in this module's own tests, never on a real
+    /// document before it reached a client. Costs one extra parse of the
+    /// whole document -- paid once per `Endpoint`'s lifetime, since F1's
+    /// fix already caches the build outcome (success or failure) after the
+    /// first call.
     pub fn build(gpa: Allocator, r: *const router.Router, info: Info) BuildError![]u8 {
         var out: Writer.Allocating = .init(gpa);
         defer out.deinit();
         write(gpa, r, info, &out.writer) catch |err| switch (err) {
             // The allocating writer fails only on allocation failure.
             error.WriteFailed => return error.OutOfMemory,
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidRequestSchema => return error.InvalidRequestSchema,
+            else => |e| return e,
         };
+        const json = out.writer.buffered();
+        const parsed = std.json.parseFromSlice(std.json.Value, gpa, json, .{}) catch
+            return error.SelfCheckMalformed;
+        defer parsed.deinit();
+        try validateOpenApi31(parsed.value);
         return out.toOwnedSlice();
     }
 
@@ -119,7 +166,40 @@ pub const Generator = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const rs = r.routes();
+        // F4 (A1/openapi.md): every byte this function is about to hand to
+        // `std.json.Stringify` must be valid UTF-8 BEFORE any output is
+        // written -- checked here, atomically, rather than discovered
+        // mid-document (a `[]const u8` field silently becomes a JSON array
+        // of byte values instead of a string; an `objectField` key goes out
+        // raw and unescaped, producing text `std.json` itself refuses to
+        // re-parse).
+        try checkUtf8(info.title);
+        try checkUtf8(info.version);
+        if (info.description) |d| try checkUtf8(d);
+
+        // F11 (A1/openapi.md): `info.include` filters BEFORE anything else
+        // touches a route -- an excluded route's metadata is never
+        // UTF-8-checked, converted, or written, so it cannot trigger
+        // `error.InvalidUtf8`/`error.PathCollision` against a route that
+        // IS included, and it never appears in the document at all.
+        const rs: []const router.Route = if (info.include) |shouldInclude| blk: {
+            var kept: std.ArrayList(router.Route) = .empty;
+            for (r.routes()) |rt| {
+                if (shouldInclude(rt)) try kept.append(arena, rt);
+            }
+            break :blk kept.items;
+        } else r.routes();
+        for (rs) |rt| {
+            try checkUtf8(rt.pattern); // covers the converted path too --
+            // `convertPattern` only rewrites `:`/`*`/`{`/`}`, all ASCII
+            if (rt.doc) |d| {
+                if (d.summary) |s| try checkUtf8(s);
+                if (d.description) |s| try checkUtf8(s);
+                for (d.tags) |t| try checkUtf8(t);
+                for (d.responses) |resp| try checkUtf8(resp.description);
+            }
+        }
+
         // Converted (templated) path per route, index-aligned with `rs`.
         const converted = try arena.alloc([]const u8, rs.len);
         for (converted, rs) |*slot, rt| slot.* = try convertPattern(arena, rt.pattern);
@@ -164,17 +244,29 @@ pub const Generator = struct {
             try jw.objectField(path);
             try jw.beginObject();
             // Methods in http.Method declaration order — deterministic
-            // regardless of registration order; first registration wins on
-            // a (method, path) collision. `group` already holds only the
-            // routes at THIS path (registration order), so this inner scan
-            // is bounded by that path's own route count, not by all routes.
+            // regardless of registration order. `group` already holds only
+            // the routes at THIS path (registration order), so this inner
+            // scan is bounded by that path's own route count, not by all
+            // routes. F5 (A1/openapi.md): TWO DIFFERENT routes converting
+            // to the same (path, method) -- e.g. `/f/:p` and `/f/*p`, both
+            // `router`-legal, both independently dispatchable, both
+            // becoming `/f/{p}` here -- used to silently keep only the
+            // first and drop the other from the document entirely. That is
+            // different from a genuinely duplicate key (F3/F6, where
+            // "first wins" is correct because there is only ONE underlying
+            // route/value); here it is `error.PathCollision`, not a silent
+            // merge.
             inline for (@typeInfo(http.Method).@"enum".fields) |f| {
                 const method: http.Method = @enumFromInt(f.value);
+                var match: ?usize = null;
                 for (group.items) |i| {
                     if (rs[i].method == method) {
-                        try writeOperation(&jw, arena, rs[i]);
-                        break;
+                        if (match != null) return error.PathCollision;
+                        match = i;
                     }
+                }
+                if (match) |i| {
+                    try writeOperation(&jw, arena, rs[i], path);
                 }
             }
             try jw.endObject();
@@ -183,6 +275,11 @@ pub const Generator = struct {
         try jw.endObject();
     }
 };
+
+/// F4 (A1/openapi.md): JSON text MUST be valid UTF-8 (RFC 8259 §8.1).
+fn checkUtf8(s: []const u8) BuildError!void {
+    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+}
 
 /// `:param` / `*wild` segments → `{param}` / `{wild}` OpenAPI templates;
 /// static segments pass through byte-for-byte.
@@ -205,8 +302,13 @@ fn convertPattern(arena: Allocator, pattern: []const u8) Allocator.Error![]const
 }
 
 /// One `"<method>": {operation}` member, FastAPI key order: tags, summary,
-/// description, parameters, requestBody, responses, deprecated.
-fn writeOperation(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (BuildError || Writer.Error)!void {
+/// description, operationId, parameters, requestBody, responses, deprecated.
+fn writeOperation(
+    jw: *std.json.Stringify,
+    arena: Allocator,
+    rt: router.Route,
+    converted_path: []const u8,
+) (BuildError || Writer.Error)!void {
     try jw.objectField(@tagName(rt.method)); // OpenAPI method keys are lowercase
     try jw.beginObject();
     if (rt.doc) |d| {
@@ -223,6 +325,7 @@ fn writeOperation(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (
             try jw.write(s);
         }
     }
+    try writeOperationId(jw, arena, rt.method, converted_path);
     try writePathParameters(jw, rt.pattern);
     if (rt.doc) |d| {
         if (d.request_schema) |schema_text| {
@@ -296,15 +399,50 @@ fn writeOperation(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (
     try jw.endObject();
 }
 
+/// Deterministic `operationId` (audit finding openapi-F13): lowercase
+/// method + `_` + the converted path's segments joined by `_`, with a
+/// templated segment's `{`/`}` stripped (keeping the capture's own name).
+/// `/users/{id}` + GET -> `get_users_id`; root `/` + GET -> `get` (no
+/// segments to append). Unique across one document BY CONSTRUCTION: this
+/// is textually `(method, converted_path)`, and F5's `error.PathCollision`
+/// already guarantees that pair cannot repeat. `operationId` is optional
+/// in OpenAPI 3.1, but omitting it (the pre-fix behavior, justified only
+/// as "no stable naming source in a fn-pointer table") gave up a real one
+/// most generators rely on: without it, SDK generators invent method
+/// names themselves, and those names are not stable across regenerations.
+fn writeOperationId(
+    jw: *std.json.Stringify,
+    arena: Allocator,
+    method: http.Method,
+    converted_path: []const u8,
+) (BuildError || Writer.Error)!void {
+    var id: std.ArrayList(u8) = .empty;
+    try id.appendSlice(arena, @tagName(method));
+    var it = std.mem.splitScalar(u8, converted_path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        try id.append(arena, '_');
+        if (seg.len >= 2 and seg[0] == '{' and seg[seg.len - 1] == '}') {
+            try id.appendSlice(arena, seg[1 .. seg.len - 1]);
+        } else {
+            try id.appendSlice(arena, seg);
+        }
+    }
+    try jw.objectField("operationId");
+    try jw.write(id.items);
+}
+
 /// `parameters` for every `:param`/`*wild` in the pattern — path params
 /// are always `required: true` with a string schema (raw path bytes).
 ///
-/// A pattern that captures the same name twice (`/:id/.../:id`; `router`
-/// accepts this — it is a footgun there, `params.get` returns the first
-/// value) would otherwise emit a duplicate `(name, in)` pair, which OAS
-/// 3.1 §4.8.10 explicitly forbids ("The list MUST NOT include duplicated
-/// parameters."). A capped array of seen names (path segments are bounded
-/// in practice; router patterns are short) dedupes without allocating.
+/// A pattern that captures the same name twice (`/:id/.../:id`) would
+/// otherwise emit a duplicate `(name, in)` pair, which OAS 3.1 §4.8.10
+/// explicitly forbids ("The list MUST NOT include duplicated
+/// parameters."). `router` itself now refuses to register such a pattern
+/// (audit finding router-F8, closing this module's own Š2 seam), so no
+/// live caller can reach this anymore — the capped array of seen names
+/// below (path segments are bounded in practice; router patterns are
+/// short) stays as defense in depth, deduping without allocating.
 fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Error!void {
     var it = std.mem.splitScalar(u8, pattern, '/');
     var any = false;
@@ -355,10 +493,19 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Erro
 ///
 /// The document is generated **once**, lazily, on the first request that
 /// needs it — register the middleware router-level *before* the routes
-/// (chi's rule); the spec still reflects everything registered by the time
-/// the first request arrives. A built `router.Router` is immutable while
-/// serving (`router/SPEC.md` §Concurrency), so a document generated once
-/// stays correct for the Endpoint's whole lifetime — caching it removes the
+/// (chi's rule). **All registration (`add`/`addDoc`/`group`) must finish
+/// before the Router is handed to `http.Server`/any concurrent dispatch —
+/// same precondition `Generator.build` itself documents, and the same
+/// "building is single-owner" phase `router/SPEC.md` §Concurrency already
+/// requires** (audit finding openapi-F10): `r.routes()` is read once,
+/// unsynchronized, on whichever thread's request happens to trigger the
+/// build, so a route registered concurrently with that read — not merely
+/// *before* it in wall-clock time, but genuinely racing it — is a data
+/// race on `Router`'s own backing slice, not something this module (or
+/// `router`) makes safe. Once registration has fully completed and dispatch
+/// begins, though, `router.Router` is immutable for the rest of its life
+/// (`router/SPEC.md` §Concurrency), so a document generated once stays
+/// correct for the Endpoint's whole lifetime — caching it removes the
 /// per-request re-walk-and-re-parse cost with no invalidation to get wrong.
 /// A build that FAILS (an invalid `RouteDoc.request_schema`) caches too —
 /// it fails identically every time, so there is nothing to gain by paying
@@ -806,18 +953,19 @@ test "generate: golden OpenAPI 3.1 document for a known route set" {
     try testing.expectEqualStrings("{\"openapi\":\"3.1.0\"," ++
         "\"info\":{\"title\":\"Test API\",\"version\":\"1.2.3\",\"description\":\"A test.\"}," ++
         "\"paths\":{" ++
-        "\"/health\":{\"get\":{\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
+        "\"/health\":{\"get\":{\"operationId\":\"get_health\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
         "\"/users/{id}\":{" ++
         "\"get\":{\"tags\":[\"users\"],\"summary\":\"Fetch a user\",\"description\":\"Returns one user by id.\"," ++
+        "\"operationId\":\"get_users_id\"," ++
         "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
         "\"responses\":{\"200\":{\"description\":\"The user\"},\"404\":{\"description\":\"No such user\"}}}," ++
-        "\"delete\":{" ++
+        "\"delete\":{\"operationId\":\"delete_users_id\"," ++
         "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
         "\"responses\":{\"200\":{\"description\":\"Successful Response\"}},\"deprecated\":true}}," ++
-        "\"/users\":{\"post\":{\"summary\":\"Create a user\"," ++
+        "\"/users\":{\"post\":{\"summary\":\"Create a user\",\"operationId\":\"post_users\"," ++
         "\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"required\":[\"name\"]}}},\"required\":true}," ++
         "\"responses\":{\"201\":{\"description\":\"Created\"}}}}," ++
-        "\"/static/{path}\":{\"get\":{" ++
+        "\"/static/{path}\":{\"get\":{\"operationId\":\"get_static_path\"," ++
         "\"parameters\":[{\"name\":\"path\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
         "\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}" ++
         "}}", json);
@@ -858,29 +1006,59 @@ test "generate: method grouping is deterministic (enum order, not registration o
     // ...but emitted in http.Method declaration order: get before post.
     try testing.expectEqualStrings("{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"}," ++
         "\"paths\":{\"/thing\":{" ++
-        "\"get\":{\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}," ++
-        "\"post\":{\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}" ++
+        "\"get\":{\"operationId\":\"get_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}," ++
+        "\"post\":{\"operationId\":\"post_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}" ++
         "}}}", json);
 }
 
-test "generate: colliding (method, path) from two different patterns — first registration wins, no duplicate key" {
+test "generate: colliding (method, path) from two different patterns is a build error, not a silent drop (F5)" {
     // "/users/:id" and the literal "/users/{id}" both convert to the same
-    // OpenAPI path template. Per the module doc, the first registration
-    // wins and the method is emitted exactly once (a duplicate JSON key
-    // would otherwise be produced).
+    // OpenAPI path template, and both are legal, independently
+    // dispatchable `router` routes. Before the F5 fix, the module silently
+    // kept only the FIRST registration and dropped the second's
+    // `RouteDoc` (and, for a param/wildcard pair, the second's entire
+    // documented operation) from the document without a trace. That is a
+    // different situation from a genuinely duplicate key (F3: two
+    // `RouteDoc.Response`s sharing a status code, one underlying route --
+    // "first wins" there is correct because there is only ONE value to
+    // pick from), so it is now `error.PathCollision` instead.
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     try r.addDoc(.get, "/users/:id", hOk, .{ .summary = "First" });
     try r.addDoc(.get, "/users/{id}", hOk, .{ .summary = "Second" });
 
+    try testing.expectError(
+        error.PathCollision,
+        Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
+    );
+}
+
+test "generate: /f/:p and /f/*p collide too (F5) — audit's own repro" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/f/:p", hOk, .{ .summary = "param" });
+    try r.addDoc(.get, "/f/*p", hOk, .{ .summary = "wildcard" });
+
+    try testing.expectError(
+        error.PathCollision,
+        Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
+    );
+}
+
+test "generate: same converted path, DIFFERENT methods, is NOT a collision (F5 does not over-fire)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/f/:p", hOk, .{ .summary = "read" });
+    try r.addDoc(.post, "/f/*p", hOk, .{ .summary = "write" });
+
     const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
     defer testing.allocator.free(json);
-
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    const path_item = parsed.value.object.get("paths").?.object.get("/users/{id}").?.object;
-    try testing.expectEqual(@as(usize, 1), path_item.count()); // one "get" key, not merged twice
-    try testing.expectEqualStrings("First", path_item.get("get").?.object.get("summary").?.string);
+    const path_item = parsed.value.object.get("paths").?.object.get("/f/{p}").?.object;
+    try testing.expectEqual(@as(usize, 2), path_item.count()); // "get" AND "post", both present
+    try testing.expectEqualStrings("read", path_item.get("get").?.object.get("summary").?.string);
+    try testing.expectEqualStrings("write", path_item.get("post").?.object.get("summary").?.string);
 }
 
 test "generate: malformed request_schema → error.InvalidRequestSchema" {
@@ -893,53 +1071,181 @@ test "generate: malformed request_schema → error.InvalidRequestSchema" {
     );
 }
 
+fn excludeInternal(rt: router.Route) bool {
+    return !std.mem.startsWith(u8, rt.pattern, "/internal");
+}
+test "generate: Info.include filters a route out of the document entirely (F11)" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/public", hOk);
+    try r.get("/internal/rotate-key", hOk);
+
+    // Without a filter: both routes appear (pre-fix, and still the default).
+    {
+        const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+        defer testing.allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const paths = parsed.value.object.get("paths").?.object;
+        try testing.expect(paths.get("/public") != null);
+        try testing.expect(paths.get("/internal/rotate-key") != null);
+    }
+    // With a filter: the excluded route is gone, not merely marked.
+    {
+        const json = try Generator.build(testing.allocator, &r, .{
+            .title = "T",
+            .version = "1",
+            .include = excludeInternal,
+        });
+        defer testing.allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const paths = parsed.value.object.get("paths").?.object;
+        try testing.expect(paths.get("/public") != null);
+        try testing.expect(paths.get("/internal/rotate-key") == null);
+        try testing.expectEqual(@as(usize, 1), paths.count());
+    }
+}
+
+test "generate: non-UTF-8 metadata is rejected, not silently turned into a JSON array (F4)" {
+    // Before this fix: `std.json.Stringify.write([]const u8)` does not
+    // validate UTF-8 -- it switches a non-UTF-8 slice from a JSON string
+    // to a JSON array of byte values instead, silently, contradicting a
+    // PASS-log claim ("route metadata cannot break the document
+    // structure") this audit round falsified. JSON text MUST be valid
+    // UTF-8 (RFC 8259 §8.1).
+    const bad = "Acme\xffAPI";
+    try testing.expect(!std.unicode.utf8ValidateSlice(bad)); // the fixture is genuinely invalid
+
+    {
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.get("/x", hOk);
+        try testing.expectError(
+            error.InvalidUtf8,
+            Generator.build(testing.allocator, &r, .{ .title = bad, .version = "1" }),
+        );
+    }
+    {
+        // Route metadata (not just Info), and the pattern/path itself.
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.addDoc(.get, "/x", hOk, .{ .summary = bad });
+        try testing.expectError(
+            error.InvalidUtf8,
+            Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
+        );
+    }
+    {
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.addDoc(.get, "/bad" ++ "\xff" ++ "seg", hOk, .{});
+        try testing.expectError(
+            error.InvalidUtf8,
+            Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }),
+        );
+    }
+    // Valid UTF-8 (including non-ASCII) keeps working.
+    {
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.get("/x", hOk);
+        const json = try Generator.build(testing.allocator, &r, .{ .title = "Acmé API", .version = "1" });
+        defer testing.allocator.free(json);
+        try testing.expect(std.unicode.utf8ValidateSlice(json));
+    }
+}
+
+test "generate: Generator.build now runs its own validateOpenApi31 on its own output (F9), closing F12 (empty title) as a side effect" {
+    // F9: the checker existed and already caught this class of defect
+    // (`MissingInfoTitle`) in this module's own tests, but `build` never
+    // ran it on a real document before handing it to a caller. F12 (empty
+    // `info.title`/`version` silently emitted) is a strict subset of F9 --
+    // wiring the checker in closes both with one fix, verified here.
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/x", hOk);
+    try testing.expectError(
+        error.MissingInfoTitle,
+        Generator.build(testing.allocator, &r, .{ .title = "", .version = "1" }),
+    );
+    try testing.expectError(
+        error.MissingInfoVersion,
+        Generator.build(testing.allocator, &r, .{ .title = "T", .version = "" }),
+    );
+    // A well-formed document still builds and still passes the checker
+    // (proving the self-check isn't just rejecting everything).
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+}
+
 // ── external anchor: independently validated by `openapi_spec_validator` ───
 //
 // The structural checker above (`validateOpenApi31`) and the adopted OAI
 // example prove this module accepts a real document and that its own hand-
 // written rules fire — neither proves a real, schema-driven OpenAPI 3.1
 // validator agrees. `openapi_spec_validator` (the JSON-Schema-backed
-// reference implementation) was run ONCE, offline, in a throwaway venv
-// (`~/.cache/zig-libs-openapi`), against two documents:
+// reference implementation, `/usr/bin/openapi-spec-validator`, installed by
+// the user 2026-09-11 for exactly this — Q6, `QUESTIONS-ROUND-2.md`) was run
+// offline against four documents:
 //
 //   1. The exact JSON this module's own `Generator.build` produces for the
 //      route set in "generate: golden OpenAPI 3.1 document for a known
-//      route set" below (reproduced verbatim as `own_generated_document`).
-//      `openapi_spec_validator.validate()` raised no exception — a real,
-//      independent, schema-based validator confirms this module's own
-//      output is a genuinely valid OpenAPI 3.1 document, not merely
-//      "well-formed JSON that satisfies our own checker".
+//      route set" below (reproduced verbatim as `own_generated_document`,
+//      RE-VERIFIED 2026-09-11 after openapi-F13 added `operationId`):
+//      `openapi-spec-validator --schema 3.1 own_generated_document.json` ->
+//      `OK`, exit 0 — a real, independent, schema-based validator confirms
+//      this module's own output, `operationId` included, is a genuinely
+//      valid OpenAPI 3.1 document, not merely "well-formed JSON that
+//      satisfies our own checker".
 //   2. A deliberately invalid document, `response_missing_description`,
 //      missing the (real, OAS-required) `description` on a response object.
 //      `openapi_spec_validator` rejected it: `OpenAPIValidationError:
 //      'description' is a required property` (2026-08-01, verbatim) — the
 //      SAME reason this module's own `validateOpenApi31` already reports as
 //      `error.MissingResponseDescription`, confirmed against the real spec
-//      rather than assumed. This is the negative direction the governing
-//      task asked for: an anchor with teeth in both directions.
+//      rather than assumed.
+//   3. openapi-F13 (2026-09-11): a document with two operations sharing one
+//      `operationId` (OAS 3.1 §4.8.10: "operationId... MUST be unique among
+//      all operations described in the API") — `openapi_spec_validator`
+//      REJECTED it: `Operation ID 'dupe' for 'get' in '/b' is not unique`,
+//      exit 1. This is the property `writeOperationId`'s doc comment claims
+//      "by construction" (`operationId` is textually `(method,
+//      converted_path)`, and F5's `error.PathCollision` already guarantees
+//      that pair cannot repeat in one document) — independently confirmed
+//      to be a real, checked constraint, not an assumed one.
+//   4. The SAME golden document with `operationId` REMOVED from one
+//      operation, everything else unchanged — `openapi_spec_validator`
+//      still accepts it (`operationId` is optional per OAS 3.1), confirming
+//      #1's PASS is not an artifact of every operation having one.
 //
-// **No disagreement was found** for either document. Per the governing
-// rule, the tool was run once and its verdict frozen; this test does not
-// shell out or open a socket. No `/NOTICE` entry: `openapi_spec_validator`
-// is used purely as a black-box validating oracle (root NOTICE §0, the
-// relationship already recorded for `protobuf`/`syslog`/`opcua`/
+// **No disagreement was found** for any of the four. Per the governing
+// rule, the tool is run offline and its verdict frozen in this comment;
+// the committed tests do not shell out or open a socket. No `/NOTICE`
+// entry: `openapi_spec_validator` is used purely as a black-box validating
+// oracle (root NOTICE §0, the relationship already recorded for
+// `protobuf`/`syslog`/`opcua`/
 // `wireguard`/`xmlsec1`) — the module's existing NOTICE for the adopted OAI
 // example document is unrelated and unaffected.
 const own_generated_document = "{\"openapi\":\"3.1.0\"," ++
     "\"info\":{\"title\":\"Test API\",\"version\":\"1.2.3\",\"description\":\"A test.\"}," ++
     "\"paths\":{" ++
-    "\"/health\":{\"get\":{\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
+    "\"/health\":{\"get\":{\"operationId\":\"get_health\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
     "\"/users/{id}\":{" ++
     "\"get\":{\"tags\":[\"users\"],\"summary\":\"Fetch a user\",\"description\":\"Returns one user by id.\"," ++
+    "\"operationId\":\"get_users_id\"," ++
     "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
     "\"responses\":{\"200\":{\"description\":\"The user\"},\"404\":{\"description\":\"No such user\"}}}," ++
-    "\"delete\":{" ++
+    "\"delete\":{\"operationId\":\"delete_users_id\"," ++
     "\"parameters\":[{\"name\":\"id\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
     "\"responses\":{\"200\":{\"description\":\"Successful Response\"}},\"deprecated\":true}}," ++
-    "\"/users\":{\"post\":{\"summary\":\"Create a user\"," ++
+    "\"/users\":{\"post\":{\"summary\":\"Create a user\",\"operationId\":\"post_users\"," ++
     "\"requestBody\":{\"content\":{\"application/json\":{\"schema\":{\"type\":\"object\",\"required\":[\"name\"]}}},\"required\":true}," ++
     "\"responses\":{\"201\":{\"description\":\"Created\"}}}}," ++
-    "\"/static/{path}\":{\"get\":{" ++
+    "\"/static/{path}\":{\"get\":{\"operationId\":\"get_static_path\"," ++
     "\"parameters\":[{\"name\":\"path\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}]," ++
     "\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}" ++
     "}}";
@@ -1265,22 +1571,46 @@ fn benchBuildNs(gpa: Allocator, n: usize) !u64 {
     return dt;
 }
 
-test "generate: duplicate path-parameter name in one pattern dedupes instead of violating OAS uniqueness (F6)" {
-    // `router` accepts a pattern that captures the same name twice (it is a
-    // footgun there — `params.get` returns the first value — not a build
-    // error); openapi must not turn that into a document OAS 3.1 §4.8.10
-    // forbids: "The list MUST NOT include duplicated parameters."
+test "router: an empty pattern segment (\"//x\") is now rejected outright, so it can never reach openapi's paths object (F13, half of it)" {
+    // Half of openapi-F13 was "`//x` passes as a key in `paths`" -- that
+    // was `router`'s own gap (audit finding router-F11: an empty segment
+    // anywhere but a single trailing one used to be silently accepted
+    // into the trie), not something `openapi` could filter after the
+    // fact without inventing its own pattern-syntax opinion. Closed at
+    // the source: `router.add("//x", ...)` itself now refuses to
+    // register, so `Router.routes()` can never contain such a pattern for
+    // this module to convert into a `paths` key.
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
-    try r.get("/a/:id/b/:id", hOk);
-    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
-    defer testing.allocator.free(json);
+    try testing.expectError(error.InvalidPattern, r.get("//x", hOk));
+}
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+test "router: a repeated capture name is now rejected outright, not just deduped downstream (router F8 closes Š2)" {
+    // `router`'s own audit finding F8 (A1/router.md) closes the seam this
+    // test used to exercise from the openapi side: `/a/:id/b/:id` used to
+    // be ACCEPTED by `router` (a footgun there — `params.get` silently
+    // returned only the first value) and it was `openapi`'s job to not
+    // turn that into a document violating OAS 3.1 §4.8.10 ("The list MUST
+    // NOT include duplicated parameters."). Now `router.add` itself
+    // refuses the pattern at registration time, so this module's own
+    // `writePathParameters` dedup (kept below as defense in depth) is no
+    // longer reachable through any live caller.
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try testing.expectError(error.DuplicateParamName, r.get("/a/:id/b/:id", hOk));
+}
+
+test "generate: writePathParameters dedupes a repeated capture name (F6) — defense in depth, unreachable via router since router-F8" {
+    var buf: [512]u8 = undefined;
+    var aw: Writer = .fixed(&buf);
+    var jw: std.json.Stringify = .{ .writer = &aw, .options = .{} };
+    try jw.beginObject();
+    try writePathParameters(&jw, "/a/:id/b/:id");
+    try jw.endObject();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.buffered(), .{});
     defer parsed.deinit();
-    try validateOpenApi31(parsed.value);
-    const params = parsed.value.object.get("paths").?.object.get("/a/{id}/b/{id}").?.object
-        .get("get").?.object.get("parameters").?.array;
+    const params = parsed.value.object.get("parameters").?.array;
     try testing.expectEqual(@as(usize, 1), params.items.len);
     try testing.expectEqualStrings("id", params.items[0].object.get("name").?.string);
 }
