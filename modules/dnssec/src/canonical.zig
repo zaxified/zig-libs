@@ -63,6 +63,21 @@ pub fn buildSignedData(gpa: std.mem.Allocator, rrset: []const dns.Record, rrsig:
     for (rrset) |r| {
         if (r.ty != ty or r.class != class) return error.InconsistentRrset;
         if (!std.ascii.eqlIgnoreCase(stripDot(r.name), stripDot(owner_name))) return error.InconsistentRrset;
+        // Audit F7: `dns` decodes a name to dotted TEXT without escaping a
+        // literal `.` inside one label, so three DIFFERENT wire owner names
+        // (3 labels / 1 label / 2 labels, all containing dots) can decode to
+        // the SAME text "a.b.c" -- the text check above alone would accept
+        // any of them as this RRset's owner. `r.labels` (populated by
+        // `dns.decode`, empty for a hand-built `Record` whose structure is
+        // simply unknown here -- e.g. `chain.zig`'s synthetic DNSKEY
+        // records, or a test fixture) is the wire ground truth: when
+        // present, it must count the same as the text's OWN dot-count, or
+        // this record's text is not a faithful rendering of its wire name
+        // and this function refuses to sign over an ambiguity it cannot
+        // resolve. A `Record` with `labels.len == 0` skips this (nothing to
+        // cross-check), same as before this fix -- no behavior change for
+        // any caller that does not populate it.
+        if (r.labels.len != 0 and labelCount(stripDot(r.name)) != r.labels.len) return error.InconsistentRrset;
     }
 
     // Scratch arena for the per-RR canonical buffers we sort before emitting.
@@ -221,4 +236,84 @@ fn canonicalRdata(gpa: std.mem.Allocator, r: dns.Record) BuildSignedDataError![]
 fn appendCanonicalName(list: *std.ArrayList(u8), gpa: std.mem.Allocator, name: []const u8) BuildSignedDataError!void {
     var buf: [wire.max_canonical_wire_len]u8 = undefined;
     try list.appendSlice(gpa, try wire.encodeCanonicalName(name, &buf));
+}
+
+// ── tests ───────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn testARecord(name: []const u8, labels: []const []const u8) dns.Record {
+    return .{
+        .name = name,
+        .ty = .a,
+        .class = .in,
+        .ttl = 60,
+        .data = .{ .a = .{ 1, 2, 3, 4 } },
+        .labels = labels,
+    };
+}
+
+const zero_rrsig: rdata.Rrsig = .{
+    .type_covered = 1, // A
+    .algorithm = 0,
+    .labels = 3,
+    .original_ttl = 60,
+    .expiration = 0,
+    .inception = 0,
+    .key_tag = 0,
+    .signer_name = "a.b.c",
+    .signature = "",
+};
+
+test "buildSignedData: F7 -- one collapsed text, three different wire label structures, each refused against its own owner text" {
+    // The audit's exact collision: "\x01a\x01b\x01c\x00" (3 labels),
+    // "\x05a.b.c\x00" (1 label), "\x03a.b\x01c\x00" (2 labels) all decode to
+    // the dotted text "a.b.c" -- but only the FIRST is a faithful rendering
+    // of it (labelCount("a.b.c") == 3). The other two must be refused on
+    // their own, standalone, one-record "RRset": the ambiguity is in the
+    // record itself, not only in mixing it with a sibling.
+    const one_label = [_][]const u8{"a.b.c"};
+    const two_labels = [_][]const u8{ "a.b", "c" };
+    const three_labels = [_][]const u8{ "a", "b", "c" };
+
+    const rr_1 = [_]dns.Record{testARecord("a.b.c", &one_label)};
+    try testing.expectError(error.InconsistentRrset, buildSignedData(testing.allocator, &rr_1, zero_rrsig, "a.b.c"));
+
+    const rr_2 = [_]dns.Record{testARecord("a.b.c", &two_labels)};
+    try testing.expectError(error.InconsistentRrset, buildSignedData(testing.allocator, &rr_2, zero_rrsig, "a.b.c"));
+
+    // The TRUE 3-label rendering is accepted on its own (positive control --
+    // this guard must reject the ambiguous cases WITHOUT rejecting the one
+    // legitimate record that has no ambiguity at all).
+    const rr_3 = [_]dns.Record{testARecord("a.b.c", &three_labels)};
+    const signed = try buildSignedData(testing.allocator, &rr_3, zero_rrsig, "a.b.c");
+    testing.allocator.free(signed);
+}
+
+test "buildSignedData: F7 -- mixing the true record with an ambiguous one in the same RRset is refused" {
+    const three_labels = [_][]const u8{ "a", "b", "c" };
+    const one_label = [_][]const u8{"a.b.c"};
+    const mixed = [_]dns.Record{
+        testARecord("a.b.c", &three_labels),
+        testARecord("a.b.c", &one_label),
+    };
+    try testing.expectError(error.InconsistentRrset, buildSignedData(testing.allocator, &mixed, zero_rrsig, "a.b.c"));
+}
+
+test "buildSignedData: F7 -- a Record with unpopulated labels (hand-built, e.g. chain.zig's synthetic DNSKEY set) is unaffected" {
+    // `labels.len == 0` means "structure unknown here", not "root name" --
+    // the new guard must skip it entirely, exactly reproducing pre-fix
+    // behavior for every caller that never populates `.labels`.
+    const empty: []const []const u8 = &.{};
+    const rr = [_]dns.Record{testARecord("a.b.c", empty)};
+    const signed = try buildSignedData(testing.allocator, &rr, zero_rrsig, "a.b.c");
+    defer testing.allocator.free(signed);
+    // Same bytes as the genuinely-3-label case above: the guard changes
+    // nothing about the OUTPUT for unpopulated `labels`, only whether an
+    // ambiguous populated one is refused.
+    const three_labels = [_][]const u8{ "a", "b", "c" };
+    const rr_true = [_]dns.Record{testARecord("a.b.c", &three_labels)};
+    const signed_true = try buildSignedData(testing.allocator, &rr_true, zero_rrsig, "a.b.c");
+    defer testing.allocator.free(signed_true);
+    try testing.expectEqualSlices(u8, signed_true, signed);
 }

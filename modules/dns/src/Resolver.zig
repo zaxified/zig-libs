@@ -62,6 +62,16 @@ pub const DohMethod = enum {
     get,
 };
 
+/// `Options.timeout_ms`'s own struct default (audit F10): when the caller
+/// leaves `timeout_ms` at exactly this value AND resolv.conf is in play (no
+/// explicit `Options.servers`), `effectiveTimeoutMs` honors resolv.conf's
+/// `options timeout:` instead. Named so the struct default and that
+/// comparison can never drift apart into two unverifiable copies of the same
+/// number ([[feedback_n_copies_of_one_invariant_is_one_unverifiable_guard]]).
+pub const default_timeout_ms: u32 = 5000;
+/// `Options.attempts`'s own struct default; see `default_timeout_ms`.
+pub const default_attempts: u8 = 2;
+
 pub const Options = struct {
     /// Explicit DNS servers; empty = read /etc/resolv.conf (falling back to
     /// localhost like Go when that is missing/empty).
@@ -75,10 +85,16 @@ pub const Options = struct {
     doh_tls: http.Client.TlsOptions = .{},
     transport: Transport = .auto,
     /// Per-attempt budget; 0 = no timeout. Enforced natively on UDP receive;
-    /// see the module comment for the TCP/DoH connect caveat.
-    timeout_ms: u32 = 5000,
-    /// UDP retry rounds over the server list (min 1).
-    attempts: u8 = 2,
+    /// see the module comment for the TCP/DoH connect caveat. Left at its
+    /// struct default (`default_timeout_ms`), this is overridden by
+    /// resolv.conf's `options timeout:` when resolv.conf is in play (audit
+    /// F10) — see `effectiveTimeoutMs`. An explicit non-default value here
+    /// always wins, on the classic UDP/TCP path; DoH's `total_timeout_ms` is
+    /// set once at `init` from this field and never revisited.
+    timeout_ms: u32 = default_timeout_ms,
+    /// UDP retry rounds over the server list (min 1). Same resolv.conf
+    /// fallback as `timeout_ms`, via `options attempts:` (audit F10).
+    attempts: u8 = default_attempts,
     /// Consult /etc/hosts in `lookupIp`/`reverse` before querying.
     use_hosts: bool = true,
     /// Apply the resolv.conf search list / ndots in `resolve`/`lookupIp`.
@@ -101,6 +117,11 @@ pub const Error = error{
     /// that is 7 minutes for a name that resolves nowhere. Callers that need
     /// a bound on the CALL set `timeout_ms`/`attempts` small, or pass a name
     /// with a trailing dot (no search-list expansion), or shorten `servers`.
+    /// ⚠ An administrator who tightens `options timeout:`/`attempts:` in
+    /// resolv.conf specifically to bound this IS honored (audit F10, when
+    /// `Options` is left at its own struct defaults and no explicit
+    /// `Options.servers` bypasses resolv.conf) — the "5 s, 2 attempts" above
+    /// is the fallback, not a promise resolv.conf can't shorten.
     Timeout,
     /// Socket-level failure (bind/send/connect/read).
     NetworkFailed,
@@ -365,7 +386,7 @@ pub fn query(r: *Resolver, name: []const u8, ty: message.Type) Error!message.Mes
 
     var last_err: ?Error = null;
     var attempt: u8 = 0;
-    while (attempt < @max(1, r.options.attempts)) : (attempt += 1) {
+    while (attempt < @max(1, r.effectiveAttempts())) : (attempt += 1) {
         for (servers) |server| {
             // A fresh transaction id for EVERY datagram sent. One id per
             // `query` meant a retry re-used an id an off-path attacker may
@@ -505,10 +526,47 @@ fn toNetAddress(ip: netaddr.Ip, port: u16) net.IpAddress {
 }
 
 fn attemptDeadline(r: *Resolver) std.Io.Timeout {
-    const ms = r.options.timeout_ms;
+    const ms = r.effectiveTimeoutMs();
     if (ms == 0) return .none;
     const t: std.Io.Timeout = .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .awake } };
     return t.toDeadline(r.io);
+}
+
+// F10 (audit): `config.ResolvConf.timeout_s`/`.attempts` used to be parsed,
+// capped and tested (`parseResolvConf: glibc option caps`) and then simply
+// never read anywhere outside `config.zig` -- `Options.timeout_ms`/
+// `.attempts` always won, silently, even when an administrator had set
+// `options timeout:1 attempts:1` specifically to bound the F5 amplification
+// (7 minutes at the shipped defaults). Q8 (round 2, 2026-09-11): a "safe
+// default plus an escape hatch" choice between two equally-valid semantics,
+// decided here rather than left to the user, because it is a design
+// preference with no norm behind it, not a security defect with one right
+// answer. Chosen: HONOR resolv.conf when the caller left `Options` at its
+// own struct default -- an administrator's explicit, deliberately tightened
+// resolv.conf value is the shorter of "silently ignored" and "silently
+// obeyed", and obeying it is what glibc and Go (the two resolvers this
+// module already claims to mirror) both do. The escape hatch is any
+// explicit `Options.timeout_ms`/`.attempts` value: it always wins, on the
+// classic UDP/TCP path (DoH's timeout is set once at `init`, from the same
+// field, before resolv.conf is ever read -- untouched by this). The
+// documented cost, unchanged from the original finding: a caller who
+// explicitly writes `.timeout_ms = 5000` (the struct default's own value)
+// is indistinguishable from one who left it unset, so that one caller's
+// explicit choice is what yields to resolv.conf instead of overriding it --
+// no `Options` field can tell "left alone" apart from "chosen to match the
+// default" without becoming `?u32`, itself a breaking type change.
+fn effectiveTimeoutMs(r: *Resolver) u32 {
+    if (r.options.timeout_ms == default_timeout_ms) {
+        if (r.conf) |c| return @as(u32, c.timeout_s) * 1000;
+    }
+    return r.options.timeout_ms;
+}
+
+fn effectiveAttempts(r: *Resolver) u8 {
+    if (r.options.attempts == default_attempts) {
+        if (r.conf) |c| return c.attempts;
+    }
+    return r.options.attempts;
 }
 
 /// `attemptDeadline` as the absolute timestamp `runBounded` takes; null when
@@ -1120,6 +1178,89 @@ test "jsonQueryUrl: the name is validated like the wire path and percent-encoded
     try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", "a..b", .a));
     try testing.expectError(error.BadName, jsonQueryUrl(gpa, "https://x.test/r", "a" ** 64 ++ ".test", .a));
     try testing.expectError(error.NameTooLong, jsonQueryUrl(gpa, "https://x.test/r", ("abcdefg." ** 32) ++ "x", .a));
+}
+
+test "effectiveTimeoutMs/effectiveAttempts: resolv.conf wins only when Options was left at its own default (audit F10)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // No conf loaded at all (r.conf == null): the struct default, unchanged.
+    var no_conf = Resolver.init(io, testing.allocator, .{});
+    defer no_conf.deinit();
+    try testing.expectEqual(default_timeout_ms, no_conf.effectiveTimeoutMs());
+    try testing.expectEqual(default_attempts, no_conf.effectiveAttempts());
+
+    // Conf present, tighter than the struct default, Options left alone:
+    // resolv.conf wins.
+    var tight = Resolver.init(io, testing.allocator, .{});
+    defer tight.deinit();
+    tight.conf = .{ .timeout_s = 1, .attempts = 1 };
+    try testing.expectEqual(@as(u32, 1000), tight.effectiveTimeoutMs());
+    try testing.expectEqual(@as(u8, 1), tight.effectiveAttempts());
+
+    // Conf present, but the caller set an explicit (non-default) value:
+    // the caller's choice wins, resolv.conf is not consulted.
+    var explicit = Resolver.init(io, testing.allocator, .{ .timeout_ms = 777, .attempts = 4 });
+    defer explicit.deinit();
+    explicit.conf = .{ .timeout_s = 1, .attempts = 1 };
+    try testing.expectEqual(@as(u32, 777), explicit.effectiveTimeoutMs());
+    try testing.expectEqual(@as(u8, 4), explicit.effectiveAttempts());
+
+    // Conf present with values that happen to equal the defaults (the
+    // ordinary case: resolv.conf has no `options` line at all, so
+    // `parseResolvConf` returns glibc's own 5/2) -- indistinguishable from
+    // "no override", correctly a no-op either way.
+    var same_as_default = Resolver.init(io, testing.allocator, .{});
+    defer same_as_default.deinit();
+    same_as_default.conf = .{ .timeout_s = 5, .attempts = 2 };
+    try testing.expectEqual(default_timeout_ms, same_as_default.effectiveTimeoutMs());
+    try testing.expectEqual(default_attempts, same_as_default.effectiveAttempts());
+}
+
+test "query: Options left at default honors resolv.conf's tightened timeout/attempts end to end (audit F10)" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // A bound-but-silent UDP "server": the datagram lands in the kernel's
+    // socket receive queue and nothing ever answers it -- no ICMP
+    // port-unreachable (which a send to a genuinely closed port would
+    // trigger and short-circuit this test before the timeout logic ever
+    // ran), no background thread needed, just a real bind.
+    const addr: net.IpAddress = .{ .ip4 = .loopback(0) };
+    const sock = addr.bind(io, .{ .mode = .dgram }) catch return error.SkipZigTest;
+    defer sock.close(io);
+    const port = sock.address.ip4.port;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [256]u8 = undefined;
+    const conf_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/resolv.conf", .{&tmp.sub_path});
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = conf_path,
+        .data = "nameserver 127.0.0.1\noptions timeout:1 attempts:1\n",
+    });
+
+    // `Options` left at its OWN struct defaults throughout -- no
+    // `.timeout_ms`/`.attempts` set here at all, which is the entire point:
+    // this reproduces the finding's exact administrator scenario, not a
+    // caller who already knew to tighten the API directly.
+    var r = Resolver.init(io, testing.allocator, .{
+        .port = port,
+        .use_search = false,
+        .resolv_conf_path = conf_path,
+    });
+    defer r.deinit();
+
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Timeout, r.query("example.com", .a));
+    const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+    // resolv.conf's 1 attempt x 1000 ms, not Options' own 2 x 5000 ms: well
+    // under half of even the single-attempt resolv.conf budget's own bound
+    // rules out the old 10 s (2 x 5000 ms) shape, with headroom for a busy
+    // machine.
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
 }
 
 test "serverList falls back to default_servers when resolv.conf is missing/empty" {

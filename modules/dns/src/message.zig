@@ -19,7 +19,15 @@
 //! no panics, no hangs, no unbounded allocation.
 //!
 //! Decoded names are dotted ASCII text without the trailing root dot (root is
-//! the empty string); no `\DDD` escape handling (labels are raw bytes).
+//! the empty string); no `\DDD` escape handling (labels are raw bytes) — a
+//! label containing a literal `.` byte is indistinguishable in that text
+//! from a label boundary, so three different wire names can decode to one
+//! identical dotted string (audit F7). `Record.labels` (NOT `Question.name`,
+//! which stays text-only) carries the actual wire label boundaries alongside
+//! the text, as slices into that same `Record.name` buffer, specifically so
+//! a consumer that needs the true label count or an unambiguous per-label
+//! comparison — `dnssec`, RFC 4034 §3.1.3's wildcard/owner-name logic — does
+//! not have to (and must not) reconstruct it by counting dots.
 //! Allocation model: `decode` builds the whole `Message`
 //! behind a single arena owned by the message (free with `Message.deinit`);
 //! `encodeQuery` writes into a caller-provided buffer, no allocation.
@@ -92,6 +100,12 @@ pub const header_len = 12;
 /// (miekg/dns caps at 10; real answers use 1–3).
 pub const max_pointer_jumps = 16;
 
+/// Upper bound on labels in a decoded name: the smallest possible label is
+/// one octet plus its length byte, so `max_name_text_len` text octets (=
+/// `max_name_text_len` wire octets minus separators) admit at most this many
+/// before the root terminator. Used to size `Record.labels` (audit F7).
+pub const max_labels = (max_name_text_len + 1) / 2;
+
 /// Wire size that always fits any `encodeQuery` output:
 /// header + name + type/class + OPT record.
 pub const max_query_len = header_len + (max_name_text_len + 2) + 4 + 11;
@@ -124,6 +138,16 @@ pub const Record = struct {
     class: Class,
     ttl: u32,
     data: Data,
+    /// The owner name's actual wire label boundaries, leftmost first, as
+    /// slices INTO `name` (so `std.mem.join(alloc, ".", labels)` reproduces
+    /// `name` byte-for-byte when no label contains a literal `.`, and
+    /// disagrees with it — correctly — when one does). Root name = `&.{}`.
+    /// Populated by `decode` for every record's owner name (audit F7); a
+    /// `Record` built by hand (a test fixture, or `dnssec.chain.zig`'s
+    /// synthetic DNSKEY records) defaults to `&.{}` regardless of `name`,
+    /// which callers must treat as "unknown structure", not "root name" —
+    /// see `dnssec.canonical.buildSignedData`'s use of it for the pattern.
+    labels: []const []const u8 = &.{},
 
     pub const Data = union(enum) {
         a: [4]u8,
@@ -384,11 +408,33 @@ const Decoder = struct {
 
     fn takeName(d: *Decoder, arena: std.mem.Allocator) DecodeError![]const u8 {
         var buf: [max_name_text_len]u8 = undefined;
-        const res = try readNameText(d.bytes, d.pos, &buf);
+        const res = try readNameText(d.bytes, d.pos, &buf, null);
         d.pos = res.next_pos;
         return arena.dupe(u8, buf[0..res.text_len]);
     }
+
+    /// Like `takeName`, but also returns the true wire label boundaries
+    /// (audit F7) — used only for a `Record`'s owner name, the one place
+    /// `dnssec` needs unambiguous structure rather than a dotted string.
+    /// `Question.name` and RDATA-embedded names (`takeRdataName`) stay
+    /// text-only: nothing downstream reads their label structure.
+    fn takeOwnerName(d: *Decoder, arena: std.mem.Allocator) DecodeError!struct {
+        name: []const u8,
+        labels: []const []const u8,
+    } {
+        var buf: [max_name_text_len]u8 = undefined;
+        var spans: [max_labels]LabelSpan = undefined;
+        const res = try readNameText(d.bytes, d.pos, &buf, &spans);
+        d.pos = res.next_pos;
+        const name = try arena.dupe(u8, buf[0..res.text_len]);
+        const labels = try arena.alloc([]const u8, res.label_count);
+        for (labels, spans[0..res.label_count]) |*l, sp| l.* = name[sp.start..][0..sp.len];
+        return .{ .name = name, .labels = labels };
+    }
 };
+
+/// One decoded label's byte range within `readNameText`'s `out` buffer.
+const LabelSpan = struct { start: usize, len: usize };
 
 const NameResult = struct {
     /// Length of the decoded text placed in the output buffer.
@@ -396,16 +442,23 @@ const NameResult = struct {
     /// Position right after the name's in-place bytes (after the first
     /// pointer when compressed).
     next_pos: usize,
+    /// Number of labels written to `label_spans` (0 when the caller passed
+    /// `null`, or for the root name either way).
+    label_count: usize = 0,
 };
 
 /// Decode one (possibly compressed) name starting at `bytes[start]` into
 /// `out` as dotted text. Bounded: pointers must aim strictly backwards, the
 /// text is capped at 253 chars and pointer follows at `max_pointer_jumps`.
-fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8) DecodeError!NameResult {
+/// When `label_spans` is non-null, also records each label's byte range
+/// within `out` (audit F7) — capped at `max_labels`, which the length bound
+/// on `out` already makes unreachable in practice (see `max_labels`'s doc).
+fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8, label_spans: ?*[max_labels]LabelSpan) DecodeError!NameResult {
     var pos = start;
     var resume_pos: ?usize = null;
     var out_len: usize = 0;
     var jumps: usize = 0;
+    var label_count: usize = 0;
     while (true) {
         if (pos >= bytes.len) return error.Truncated;
         const b = bytes[pos];
@@ -420,12 +473,17 @@ fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8) De
                 const label = bytes[pos + 1 ..][0..len];
                 const sep: usize = @intFromBool(out_len != 0);
                 if (out_len + sep + label.len > max_name_text_len) return error.NameTooLong;
+                const label_start = out_len + sep;
                 if (sep != 0) {
                     out[out_len] = '.';
                     out_len += 1;
                 }
                 @memcpy(out[out_len..][0..label.len], label);
                 out_len += label.len;
+                if (label_spans) |spans| {
+                    if (label_count < max_labels) spans[label_count] = .{ .start = label_start, .len = label.len };
+                    label_count += 1;
+                }
                 pos += 1 + len;
             },
             0xc0 => {
@@ -443,7 +501,7 @@ fn readNameText(bytes: []const u8, start: usize, out: *[max_name_text_len]u8) De
             else => return error.BadLabel, // 0b01/0b10: reserved label types
         }
     }
-    return .{ .text_len = out_len, .next_pos = resume_pos orelse pos };
+    return .{ .text_len = out_len, .next_pos = resume_pos orelse pos, .label_count = label_count };
 }
 
 /// Smallest possible wire encodings, used to sanity-check section counts
@@ -471,7 +529,8 @@ fn takeRecords(d: *Decoder, arena: std.mem.Allocator, count: u16) DecodeError![]
 }
 
 fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
-    const name = try d.takeName(arena);
+    const owner = try d.takeOwnerName(arena);
+    const name = owner.name;
     const ty: Type = @enumFromInt(try d.takeInt(u16));
     const class_raw = try d.takeInt(u16);
     const ttl = try d.takeInt(u32);
@@ -565,6 +624,7 @@ fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
         .class = @enumFromInt(class_raw),
         .ttl = ttl,
         .data = data,
+        .labels = owner.labels,
     };
 }
 
@@ -572,7 +632,7 @@ fn takeRecord(d: *Decoder, arena: std.mem.Allocator) DecodeError!Record {
 /// message, but the name's own bytes must not run past the RDATA window.
 fn takeRdataName(d: *Decoder, arena: std.mem.Allocator, rdata_end: usize) DecodeError![]const u8 {
     var buf: [max_name_text_len]u8 = undefined;
-    const res = try readNameText(d.bytes, d.pos, &buf);
+    const res = try readNameText(d.bytes, d.pos, &buf, null);
     if (res.next_pos > rdata_end) return error.BadRecord;
     d.pos = res.next_pos;
     return arena.dupe(u8, buf[0..res.text_len]);
@@ -701,6 +761,50 @@ test "decode: response with compression pointers and a CNAME chain" {
     try testing.expectEqual(Type.aaaa, a3.ty);
     try testing.expectEqual(@as(u8, 0x26), a3.data.aaaa[0]);
     try testing.expectEqual(@as(u8, 0x46), a3.data.aaaa[15]);
+}
+
+test "decode: Record.labels carries the wire structure text collapses (audit F7)" {
+    // Three DIFFERENT wire owner names, chosen so all three decode to the
+    // IDENTICAL dotted text "a.b.c" -- the exact collision the audit
+    // demonstrated (repro/dns/seam.zig). Same length (7 bytes) so the rest
+    // of each record lines up; TYPE=A, CLASS=IN, TTL=60, RDLENGTH=4.
+    const rest = "\x00\x01" ++ "\x00\x01" ++ "\x00\x00\x00\x3c" ++ "\x00\x04" ++ "\x01\x02\x03\x04";
+    const resp = "\x00\x01" ++ "\x81\x80" ++
+        "\x00\x01\x00\x03\x00\x00\x00\x00" ++ // 1 question, 3 answers
+        "\x00" ++ "\x00\x01" ++ "\x00\x01" ++ // question: root A IN
+        "\x01a\x01b\x01c\x00" ++ rest ++ // 3 labels: "a" "b" "c"
+        "\x05a.b.c\x00" ++ rest ++ // 1 label: "a.b.c" (literal dots)
+        "\x03a.b\x01c\x00" ++ rest; // 2 labels: "a.b" "c"
+
+    var msg = try decode(testing.allocator, resp);
+    defer msg.deinit();
+    try testing.expectEqual(@as(usize, 3), msg.answers.len);
+
+    // All three collapse to the same text -- this is the bug surface, not
+    // itself the fix: `dns` still returns bytes, not an opinion.
+    for (msg.answers) |r| try testing.expectEqualStrings("a.b.c", r.name);
+
+    // But the true wire structure disagrees, and IS recoverable per record.
+    const r0 = msg.answers[0];
+    try testing.expectEqual(@as(usize, 3), r0.labels.len);
+    try testing.expectEqualStrings("a", r0.labels[0]);
+    try testing.expectEqualStrings("b", r0.labels[1]);
+    try testing.expectEqualStrings("c", r0.labels[2]);
+
+    const r1 = msg.answers[1];
+    try testing.expectEqual(@as(usize, 1), r1.labels.len);
+    try testing.expectEqualStrings("a.b.c", r1.labels[0]); // one label, containing literal dots
+
+    const r2 = msg.answers[2];
+    try testing.expectEqual(@as(usize, 2), r2.labels.len);
+    try testing.expectEqualStrings("a.b", r2.labels[0]);
+    try testing.expectEqualStrings("c", r2.labels[1]);
+
+    // Each label is a slice INTO that record's own `.name`, not a fresh
+    // allocation -- joining them with '.' reproduces `.name` byte for byte
+    // exactly when (and only when) no label contains a literal '.'.
+    try testing.expect(r0.labels[0].ptr == r0.name.ptr);
+    try testing.expect(r0.labels[2].ptr == r0.name.ptr + 4);
 }
 
 test "decode: MX/TXT/NS/unknown answers, SOA authority, OPT additional" {

@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-12** — **A1 fix campaign round 2, fixer slot `c`: F7, F10 closed (Q7).**
+  - **F7 — additive:** `Record` gains `labels: []const []const u8 = &.{}`, the owner name's
+    actual wire label boundaries as slices into `Record.name`, populated by `decode` for every
+    record. Closes the audit's demonstrated collision: `\x01a\x01b\x01c\x00` (3 labels),
+    `\x05a.b.c\x00` (1 label) and `\x03a.b\x01c\x00` (2 labels) all decode to the identical text
+    `"a.b.c"`, but now carry `.labels` of length 3, 1 and 2 respectively — recoverable structure
+    a consumer that needs true label counts (the sole consumer, `dnssec`) no longer has to guess
+    at by counting dots. `Question.name` and RDATA-embedded names (CNAME/NS/PTR/MX/SOA/SRV
+    targets) stay text-only — nothing reads their label structure, so nothing pays for it.
+    New test "decode: Record.labels carries the wire structure text collapses (audit F7)"
+    reproduces the exact three-record collision. RED (label-span write mutated to a no-op):
+    compile succeeds, run crashes (`index out of bounds`, reading the never-initialized span
+    buffer) — a legitimate failure, not a compile error. GREEN: `scripts/modtest dns`: 67/67
+    (base 64; +2 F10's own tests below, +1 this one).
+  - **F10 — BEHAVIOURAL, not breaking:** `config.ResolvConf.timeout_s`/`.attempts` were parsed,
+    capped and tested but never read outside `config.zig` — an administrator's
+    `options timeout:1 attempts:1`, written specifically to bound the F5 amplification (7
+    minutes at the shipped defaults), was silently ignored. Q8 (round 2): chosen — honor
+    resolv.conf when `Options.timeout_ms`/`.attempts` are left at their own struct defaults
+    (now named `default_timeout_ms`/`default_attempts`) AND resolv.conf is in play (no explicit
+    `Options.servers`); an explicit non-default value always wins. New
+    `effectiveTimeoutMs`/`effectiveAttempts`, wired into `attemptDeadline` and `query`'s attempt
+    loop — the one seam both the UDP receive bound and the TCP `runBounded` cancel already went
+    through, so DoH (whose `total_timeout_ms` is set once at `init`, before resolv.conf is ever
+    read) is deliberately untouched. RED: unit test on the two helpers, mutated to ignore `conf`
+    entirely — `expected 1000, found 5000`; end-to-end test (a real bound-but-silent loopback
+    UDP socket plus a resolv.conf fixture with `timeout:1 attempts:1`) — elapsed time exceeded
+    the 5 s bound (old shape: 2 attempts × 5000 ms = 10 s). GREEN: both pass, `scripts/modtest
+    dns`: 67/67, Debug and ReleaseFast.
+
 - **2026-09-10** — **A1 fix campaign, F13.** A UDP reply bigger than the resolver's receive buffer
   used to be decoded truncated instead of retried over TCP whenever the server sent it without
   setting the TC bit — a real server does set TC when it knows a reply will not fit, but nothing

@@ -37,7 +37,11 @@ itself owns that check.
 Decoded names are dotted text without the trailing root dot and with no `\DDD` escape handling —
 labels are raw bytes, so a label containing `.` is indistinguishable from two labels in the text
 form and `writeName` is not its inverse; callers displaying them must escape, and callers that
-need wire structure (label counts — `dnssec` does) must not take it from the text. Out of scope:
+need wire structure (label counts — `dnssec` does) must not take it from the text — use
+`Record.labels` instead (audit F7, closed 2026-09-12): the owner name's actual label boundaries,
+as slices into `Record.name`, populated by `decode` for every record (root = `&.{}`; `&.{}` also
+on a hand-built `Record` that never set it, which callers must read as "structure unknown", not
+"root"). `Question.name` stays text-only — nothing reads a question's label structure. Out of scope:
 DNSSEC validation. **Timeouts:** `timeout_ms` bounds every UDP attempt (`receiveTimeout`) and
 every TCP attempt end to end — connect, write and both reads — by running the exchange on its own
 task and canceling it at the deadline (`runBounded`; std 0.16.0 has no per-read deadline on a
@@ -74,11 +78,18 @@ public resolvers when the network is up** — they skip via `error.SkipZigTest` 
 A gate run on a connected machine is therefore not offline.
 
 ## Backlog / deferred
-- resolv.conf `options timeout:`/`attempts:` are parsed and capped but never read
-  (`Options.timeout_ms`/`attempts` win unconditionally) — a decision on whether to honour or drop them.
+- ✅ **Closed 2026-09-12 (audit F10):** resolv.conf `options timeout:`/`attempts:` are now
+  honored by `Resolver.effectiveTimeoutMs`/`.effectiveAttempts` when the caller leaves
+  `Options.timeout_ms`/`.attempts` at their own struct defaults (`default_timeout_ms`/
+  `default_attempts`) AND resolv.conf is in play (no explicit `Options.servers`). An explicit,
+  non-default `Options` value still always wins on the classic UDP/TCP path. Known, accepted
+  cost: a caller who explicitly sets `.timeout_ms = 5000` (the default's own value) is
+  indistinguishable from one who left it unset, so that one case still yields to resolv.conf.
 - A per-CALL deadline for `resolve`/`lookupIp` (today the budget is per attempt per server).
-- The text name form collapses distinct wire names (see Threat model); a structured name type
-  would be an API change.
+- ✅ **Closed 2026-09-12 (audit F7):** the text name form collapses distinct wire names (see
+  Threat model), but a structured name type is no longer only hypothetical — `Record.labels`
+  gives a consumer that needs true label boundaries a way to get them without an API-breaking
+  change to `Record.name` itself.
 
 ## Status
 `extract+gap · any (RFC 6724 result order is Linux-only) · client · blocking` · deps: `netaddr`,

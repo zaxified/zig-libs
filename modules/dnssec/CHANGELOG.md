@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-12** — **BEHAVIOURAL, not breaking: `dns` audit F7 consumer fix
+  (round 2, Q7).** `canonical.buildSignedData`'s per-record consistency
+  check compared only `Record.name` TEXT against `owner_name`, so three
+  wire-different owner names that `dns` decodes to the identical text (a
+  label containing a literal `.` collapses with a label boundary) would all
+  pass as "this RRset's owner" — the exact collision the sibling audit
+  demonstrated. Now also checks the new `dns.Record.labels` (audit F7, the
+  wire ground truth) against the text's own dot-count when `.labels` is
+  populated (i.e. the record came from `dns.decode`, not a hand-built
+  fixture, which defaults it to `&.{}` and is unaffected — including this
+  module's own `chain.zig` synthetic DNSKEY records and `root.zig`/
+  `oracle_test.zig` test fixtures, none of which set it): a mismatch means
+  the text is not a faithful rendering of the wire name, and the function
+  now refuses to sign over that ambiguity (`error.InconsistentRrset`) rather
+  than treat two differently-structured records as the same owner.
+  `signedOwnerName`'s wildcard label-count logic is untouched — it is
+  self-correcting once every record that matters has passed this new check,
+  because a matching text and a matching label-count together pin the true
+  count without touching `lastLabels`/`labelCount`'s own dot-based
+  arithmetic. Three new tests in `canonical.zig`: the two ambiguous
+  standalone renderings refused, the one true 3-label rendering accepted
+  (positive control), the two mixed into one RRset refused, and an
+  unpopulated-`labels` record producing byte-identical output to before
+  this fix. RED (guard mutated to `if (false and ...)`): 2 pass, 2 fail —
+  both "refused" tests instead sign the ambiguous input. GREEN:
+  `scripts/modtest dnssec`: 97/97 (was 94), Debug and ReleaseFast.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `validate` now rejects an
   RRset whose `rrsig.signer_name` is not the owner name's zone or an
   ancestor of it (RFC 4035 §5.3.1, audit A1 F1) and whose `rrsig.labels`
