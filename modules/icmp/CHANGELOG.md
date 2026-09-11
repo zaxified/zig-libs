@@ -5,6 +5,82 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **A1 fix campaign round 2: six findings closed. BEHAVIOURAL
+  and API changes — see below.**
+
+  - **F1/F12-m30 (HIGH, API change): `Socket.sendMany` guarded two
+    fixed-size stack arrays with `std.debug.assert`.** `ReleaseFast`/
+    `ReleaseSmall` compile asserts out; measured 2026-09-05 with 64 packets
+    against `batch_max = 16`: Debug/ReleaseSafe panicked (SIGABRT),
+    ReleaseFast wrote past both arrays (SIGSEGV, no diagnostic). Same class
+    this module already closed twice for `recvBatch` and
+    `writeEchoRequest`. `sendMany` now returns `error{TooManyPackets}!usize`
+    instead of asserting. **Breaking**: callers of `sendMany` now handle an
+    error instead of relying on the precondition. The only caller in this
+    repo, `Pinger.dispatchDue`, never builds a batch bigger than
+    `batch_max` (its own collect loop bounds it), so this is a no-op there
+    in practice — updated to `try` the call.
+  - **F3/F10 (HIGH, BEHAVIOURAL): a sustained flood on the socket kept
+    `step()` from ever returning.** `drainReplies`'s per-family loop had no
+    cap on `recvBatch` calls; under continuous inbound traffic it never hit
+    the "short batch" exit. Measured 2026-09-05 (`perf flood2`, six
+    concurrent flooders): a 200ms-budget `run()` took 1500.9-9046.5ms
+    (7.5x-45x) across six runs; a quiet run and post-flood recovery both
+    held 200.7-200.9ms. Reproduced far more severely in-tree with a
+    4-thread `sendmmsg` flood: `step()` spun at ~494% CPU and did not
+    return within a 900s hard timeout. Fixed with a bounded per-`step()`
+    packet budget (`max_batches_per_drain = 64` batches, i.e. 1024 packets
+    per family) — nothing is dropped, only deferred to the next `step()`
+    call, since the kernel socket buffer holds the backlog and the socket
+    stays reported-readable. **F10** (the retry chain's total worst-case
+    duration, `timeout_ns * (backoff_factor^(retries+1) - 1) /
+    (backoff_factor - 1)`, e.g. 4067ms for the *default* `Config{}`) is a
+    DIFFERENT mechanism — entirely determined by caller-chosen `retries`/
+    `backoff_factor`, not by anything an adversary or environment can
+    inflate — so it is closed by documenting the worst-case formula on
+    `Config.retries` rather than by capping a value the caller set on
+    purpose.
+  - **F5 (MED, BEHAVIOURAL): `Stats.icmp_errors` was structurally always 0
+    on the default (DGRAM) socket path.** The kernel never puts an ICMP
+    error about a ping DGRAM socket's own probe on its normal receive
+    queue — only on the socket error queue, and only once `IP_RECVERR`/
+    `IPV6_RECVERR` is set (verified live: a forged Time Exceeded produced
+    nothing on a normal `recvmsg` but appeared on `MSG_ERRQUEUE`
+    immediately once the option was set, complete with the quoted echo
+    header as payload and the quoted destination as the reported address).
+    `Socket.open` now always sets the option, and a new `Socket.recvErr`
+    plus `Pinger.drainErrQueue` correlate error-queue entries by quoted
+    ident/seq (and, when `check_source` is on, quoted destination) exactly
+    like the RAW path's `.icmp_error` branch already did. Fixes `pathmtu`'s
+    dependency on this stat's hint branch on its default (`.auto`) socket
+    mode as a side effect.
+  - **F6 (MED, BEHAVIOURAL): a RAW socket's echo identifier was the process
+    id.** `@intCast(linux.getpid() & 0xffff)` is this module's own
+    correlation token on the RAW path (the kernel never uses it to demux
+    raw traffic), not a secret — but a PID is about as guessable as a
+    token gets (measured: 299/299 consecutive idents on a busy host differ
+    from a neighboring process's by exactly 1). Now drawn from the kernel
+    CSPRNG (`getrandom(2)`, since `std.crypto.random` does not exist in
+    0.16), with the old PID-derived value only as a fallback if the
+    syscall itself is refused. The DGRAM path is unaffected — the kernel
+    picks that identifier, not this module.
+  - **F8 (MED, BEHAVIOURAL): `check_source` defaulted to `false`.**
+    `ident`+`seq` are the only correlation key without it, and neither is a
+    secret (`seq` is a plain per-target counter by design; even a random
+    `ident`, F6 above, is just 16 bits with no rate limit on wrong
+    guesses). Measured live 2026-09-05: with the guard off, a single reply
+    forged with a neighboring target's ident/seq marked that OTHER target
+    alive — a monitoring tool watching many targets can least afford one
+    spoofable host vouching for every other host in the same run. Default
+    changed to `true`; set `false` explicitly to restore the old
+    fping-compatible default.
+
+  `scripts/modtest icmp`: 67/70 (3 skip) without privilege, **70/70** under
+  `unshare --user --map-root-user --net` (Debug/ReleaseSafe/ReleaseFast).
+  Consumers: `scripts/modtest traceroute` 33/33 under `unshare` (32/33, 1
+  skip, without), `scripts/modtest pathmtu` 35/35 either way — neither
+  needed a source change, both only rebuilt against `Socket.zig`.
+
 - **2026-09-10 (2)** — A1 fix campaign, F12 (LOW), mutation-table coverage —
   16 of the 22 surviving mutations now killed (17 new tests: 7 in `echo.zig`,
   1 in `Socket.zig`, 9 in `pinger.zig`), no behavior change:

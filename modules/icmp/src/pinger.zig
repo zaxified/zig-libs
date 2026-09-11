@@ -53,15 +53,32 @@ pub const Config = struct {
     /// Probes per target in .count mode.
     count: u16 = 1,
     /// Extra attempts after a timeout in .alive mode (fping -r, default 3).
+    ///
+    /// A1 F10: this is per-*retry*, not per-target-total. Against a silent
+    /// target, `.alive` mode's worst case is `timeout_ns * (backoff_factor
+    /// ^ (retries + 1) - 1) / (backoff_factor - 1)` (a geometric series --
+    /// each retry's own timeout is the previous one times `backoff_factor`).
+    /// Measured 2026-09-05: the *default* `Config{}` (`retries=3,
+    /// timeout_ns=500ms, backoff_factor=1.5`) already blocks 4067ms, 8.1x
+    /// `timeout_ns` alone; `retries=10` at the same timeout reaches 85579ms.
+    /// This is deliberate backoff, entirely determined by values the caller
+    /// chose (unlike A1 F3, nothing external can make it worse), so it is
+    /// documented here rather than capped: capping it would silently
+    /// override a `retries`/`backoff_factor` combination the caller set on
+    /// purpose. `run()` still has no deadline/cancel of its own beyond
+    /// `stop()` — budget for the worst case above, or call `stop()` from
+    /// another thread/signal handler.
     retries: u16 = 3,
     /// Minimum gap between any two transmitted packets (fping -i, global
     /// pacing — the primary anti-netstorm control).
     interval_ns: u64 = 10 * std.time.ns_per_ms,
     /// Minimum gap between two probes to the same target (fping -p).
     perhost_interval_ns: u64 = 1000 * std.time.ns_per_ms,
-    /// Reply timeout for a single probe (fping -t).
+    /// Reply timeout for a single probe (fping -t). See `retries`' doc
+    /// comment (A1 F10) for the worst-case total across retries.
     timeout_ns: u64 = 500 * std.time.ns_per_ms,
     /// Timeout multiplier applied on each retry in .alive mode (fping -B).
+    /// See `retries`' doc comment (A1 F10).
     backoff_factor: f32 = 1.5,
     /// Random extra delay in [0, jitter_ns) added to each target's first
     /// probe, spreading load across the cycle. 0 = off.
@@ -82,7 +99,20 @@ pub const Config = struct {
     /// (fping --check-source). Also discards an ICMP error whose quoted
     /// destination differs from the target (A1 F2) -- ident+seq alone name
     /// a *slot*, not which target the error is actually about.
-    check_source: bool = false,
+    ///
+    /// A1 F8: default changed from `false` to `true`. `ident`+`seq` are the
+    /// only correlation key otherwise, and neither is a secret an attacker
+    /// needs to guess right: `seq` is a plain per-target counter by design
+    /// (`seqmap`'s own doc comment), and even a *random* `ident` (A1 F6) is
+    /// just 16 bits with no rate limit on wrong guesses. Measured live
+    /// 2026-09-05 with the guard off: a single reply forged with a
+    /// neighboring target's ident/seq marked that OTHER target alive
+    /// (`te_wrongdst_raw`-style cross-target confusion) -- exactly the
+    /// failure mode a monitoring tool watching many targets can least
+    /// afford, since one compromised/spoofable host then vouches for every
+    /// other host in the same run. Set `false` explicitly to restore the
+    /// old fping-compatible default.
+    check_source: bool = true,
     socket_mode: Socket.Mode = .auto,
     /// SO_RCVBUF for the ICMP sockets.
     recv_buf_size: u32 = 1 << 20,
@@ -314,6 +344,14 @@ pub const RunError = error{
     /// the slab so this cannot happen; reported for the same reason as
     /// `SendBufferTooSmall` — an assert compiles out of the release modes.
     RecvSlabTooSmall,
+    /// A1 F1/m30: `sendMany` was handed more packets than `Socket.batch_max`
+    /// (or a mismatched addrs/packets length). `dispatchDue`'s own collect
+    /// loop never builds a batch bigger than `Socket.batch_max`, so this
+    /// cannot actually happen through the public `Pinger` API today — it is
+    /// propagated rather than asserted for the same reason every other
+    /// caller-controlled-length guard in this module is: an assert is the
+    /// one guard that disappears in the build mode that ships.
+    TooManyPackets,
 } || Socket.OpenError;
 
 pub const Pinger = struct {
@@ -632,7 +670,7 @@ pub const Pinger = struct {
                     addrs[i] = self.targets.items[ev.target].addr.sockaddrPtr();
                     packets[i] = self.sendSlot(i);
                 }
-                accepted = sock.sendMany(addrs[0..n], t0.addr.sockaddrLen(), packets[0..n]);
+                accepted = try sock.sendMany(addrs[0..n], t0.addr.sockaddrLen(), packets[0..n]);
             }
             for (events[0..n], seqs[0..n], 0..) |ev, seq, i| {
                 if (i < accepted) {
@@ -893,7 +931,27 @@ pub const Pinger = struct {
         _ = linux.ppoll(fds.ptr, fds.len, &ts, null);
     }
 
-    /// Read and process every already-received reply (non-blocking).
+    /// A1 F3/F10: upper bound on `recvBatch` calls per family, per
+    /// `drainReplies` call (i.e. per `step()`). Without this, a socket kept
+    /// full by a sustained inbound flood makes `recvBatch` keep returning
+    /// full batches forever, and the `while (true)` loop below never
+    /// reaches its "short batch => drained" exit -- so `step()` never
+    /// returns, and every OTHER thing it is responsible for (sending due
+    /// probes, firing timeouts, letting `run()`'s caller observe `stop()`)
+    /// stops happening too. Measured 2026-09-05 (`perf flood2`, six
+    /// concurrent flooders on the loopback RAW socket): `run()` budgeted at
+    /// 200ms took 1500.9-9046.5ms across six runs (7.5x-45x), while a quiet
+    /// run and a post-flood recovery run both held at 200.7-200.9ms.
+    /// `batch_max` (16) * this is the worst case packets handled inline per
+    /// family per `step()`; nothing is dropped by hitting the cap, only
+    /// deferred to the very next `drainReplies` call -- the kernel socket
+    /// buffer (`Options.recv_buf_size`, 1 MiB default) holds the rest, and
+    /// `pollFds`/`waitReadable` will report the socket readable again
+    /// immediately since it is still full.
+    const max_batches_per_drain = 64;
+
+    /// Read and process every already-received reply (non-blocking), up to
+    /// the per-family budget above.
     fn drainReplies(self: *Pinger) RunError!void {
         // One realtime/monotonic pair converts kernel receive timestamps
         // (CLOCK_REALTIME) to the engine's monotonic clock.
@@ -907,6 +965,7 @@ pub const Pinger = struct {
             };
             if (maybe_sock != null) {
                 const sock = self.socketFor(fam);
+                var batches: usize = 0;
                 while (true) {
                     const infos = sock.recvBatch(&self.recv_batch) catch
                         return error.RecvSlabTooSmall;
@@ -918,10 +977,43 @@ pub const Pinger = struct {
                             mono_now;
                         self.handleReply(fam, info, recv_mono);
                     }
-                    // A short batch means the socket is drained.
-                    if (infos.len < Socket.batch_max) break;
+                    batches += 1;
+                    // A short batch means the socket is drained; hitting the
+                    // budget means it probably is not, but step() must
+                    // return control anyway (see doc comment above).
+                    if (infos.len < Socket.batch_max or batches >= max_batches_per_drain) break;
                 }
+                self.drainErrQueue(fam, sock);
             }
+        }
+    }
+
+    /// A1 F5: read the socket error queue (`IP_RECVERR`/`IPV6_RECVERR`,
+    /// which `Socket.open` now always sets) for ICMP errors about our own
+    /// probes -- on the DGRAM path this is the ONLY way they are ever
+    /// delivered (verified live: `errq2.py` under `unshare`, a forged Time
+    /// Exceeded produced nothing on a normal `recvmsg` but appeared on
+    /// `MSG_ERRQUEUE` immediately, with the quoted echo header as payload
+    /// and the quoted destination as the reported address). Correlates the
+    /// same way the RAW path's `.icmp_error` branch in `handleReply` does:
+    /// by the quoted ident against this socket's own, then by `seq` against
+    /// `seqmap`, then (if `check_source`) by the reported address against
+    /// the resolved target. Bounded by the same per-`step()` budget as
+    /// `drainReplies`, for the same reason.
+    fn drainErrQueue(self: *Pinger, fam: echo.Family, sock: *const Socket) void {
+        var n: usize = 0;
+        while (n < Socket.batch_max * max_batches_per_drain) : (n += 1) {
+            var one: [512]u8 = undefined;
+            const info = sock.recvErr(&one) orelse break;
+            if (info.packet.len < echo.echo_header_len) continue;
+            const ident = std.mem.readInt(u16, info.packet[4..6], .big);
+            const seq = std.mem.readInt(u16, info.packet[6..8], .big);
+            if (ident != sock.ident) continue;
+            const entry = self.seqmap.fetch(seq) orelse continue;
+            const t = &self.targets.items[entry.target];
+            if (t.addr.family() != fam) continue;
+            if (self.cfg.check_source and !sourceMatches(info.src, t.addr)) continue;
+            t.stats.icmp_errors += 1;
         }
     }
 };
@@ -1289,7 +1381,12 @@ test "A1 F12 m2/m3/m31: a RAW socket's ident check compares the WHOLE 16 bits, n
     // (all other bits matching) catches all three: whichever subset of bits
     // a weakened comparison actually checks, at least one of the 16 flips
     // touches a bit outside that subset and would wrongly be accepted.
-    var p = try Pinger.init(std.testing.allocator, .{});
+    // check_source: false -- this test isolates the ident check; the
+    // crafted RecvInfo below carries no source address (A1 F8 changed the
+    // default to true, which would otherwise reject every reply here on
+    // the unrelated source-address guard before the ident check is even
+    // reached).
+    var p = try Pinger.init(std.testing.allocator, .{ .check_source = false });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1");
     p.sock4 = .{ .fd = -1, .family = .v4, .kind = .raw, .ident = 0x1234 };
@@ -1371,7 +1468,9 @@ test "A1 F12 m5: a reply arriving on the wrong address family's socket does not 
     // space SHARED across both sockets (comment above `SeqMap`), so nothing
     // else stops an event on the wrong family's socket from matching a
     // live entry by seq number alone.
-    var p = try Pinger.init(std.testing.allocator, .{});
+    // check_source: false -- isolates the family check (A1 F8 changed the
+    // default; see the m2/m3/m31 test above for why).
+    var p = try Pinger.init(std.testing.allocator, .{ .check_source = false });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1"); // a v4 target
     p.sock6 = .{ .fd = -1, .family = .v6, .kind = .dgram, .ident = 0x1234 };
@@ -1439,7 +1538,9 @@ test "A1 F12 m17: a second reply to an already-answered probe counts as a duplic
     // `if (entry.answered) { t.stats.duplicates += 1; ...; return; }` --
     // without it a replayed/duplicated reply on the wire would resolve the
     // probe (and decrement pending/inflight) a second time.
-    var p = try Pinger.init(std.testing.allocator, .{});
+    // check_source: false -- isolates duplicate detection (A1 F8 changed
+    // the default; see the m2/m3/m31 test above for why).
+    var p = try Pinger.init(std.testing.allocator, .{ .check_source = false });
     defer p.deinit();
     const id = try p.addTarget("192.0.2.1");
     p.sock4 = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 0x1234 };
@@ -1530,6 +1631,161 @@ test "A1 F12 m24: a timeout scheduled in the future does not fire early" {
     try std.testing.expectEqual(@as(u32, 1), p.inflight);
     try std.testing.expectEqual(@as(u32, 1), p.targets.items[id].pending);
     try std.testing.expect(p.seqmap.fetch(seq) != null);
+}
+
+/// `std.Thread.sleep` does not exist in 0.16; a direct `nanosleep(2)` is the
+/// dependency-free replacement, matching this file's existing raw-syscall
+/// style (`monoNow`/`realNow` above).
+fn sleepMs(ms: u64) void {
+    var ts: linux.timespec = .{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&ts, null);
+}
+
+// ── tests: A1 F3/F5 (need a real ICMP socket; skip without access) ──────────
+
+test "A1 F3: step() returns promptly even while its socket is being flooded" {
+    // `drainReplies`'s per-family loop used to have no cap on how many
+    // `recvBatch` calls it would make -- under a sustained flood it never
+    // reached the "short batch => drained" exit, so `step()` (and therefore
+    // `run()`'s own timing loop) never got control back. Measured live
+    // 2026-09-05 (`perf flood2`, six concurrent flooders on the loopback RAW
+    // socket): a 200ms-budget `run()` took 1500.9-9046.5ms (7.5x-45x) across
+    // six runs, while a quiet run and a post-flood recovery run both held
+    // 200.7-200.9ms.
+    var p = try Pinger.init(std.testing.allocator, .{ .socket_mode = .raw });
+    defer p.deinit();
+    _ = try p.addTarget("127.0.0.1");
+    p.prepare() catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+
+    // Several RAW sockets flood loopback as fast as the kernel accepts
+    // sends, each batching Socket.batch_max packets per sendmmsg call
+    // (single-packet sendto() per iteration turned out far too slow to
+    // outrun recvmmsg's own drain rate and never reproduced the bug this
+    // guards). RAW sockets see every ICMP packet on the host (Socket.zig's
+    // own doc comment on the .raw branch of handleReply), so this reaches
+    // `p.sock4` without needing an actual round trip through anything.
+    const flood_threads = 4;
+    var flood_socks: [flood_threads]Socket = undefined;
+    var opened: usize = 0;
+    defer for (flood_socks[0..opened]) |*s| s.close();
+    for (0..flood_threads) |i| {
+        flood_socks[i] = Socket.open(.v4, .raw, .{}) catch |err| switch (err) {
+            error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+            else => return err,
+        };
+        opened += 1;
+    }
+
+    var stop = std.atomic.Value(bool).init(false);
+    const Flooder = struct {
+        fn run(s: *const Socket, halt: *std.atomic.Value(bool)) void {
+            var dst: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+            const dst_ptr: *const linux.sockaddr = @ptrCast(&dst);
+            var pkt: [echo.echo_header_len]u8 = @splat(0);
+            pkt[0] = echo.v4.echo_request;
+            var addrs: [Socket.batch_max]*const linux.sockaddr = undefined;
+            var pkts: [Socket.batch_max][]const u8 = undefined;
+            for (0..Socket.batch_max) |i| {
+                addrs[i] = dst_ptr;
+                pkts[i] = &pkt;
+            }
+            while (!halt.load(.monotonic)) {
+                _ = s.sendMany(&addrs, @sizeOf(linux.sockaddr.in), &pkts) catch 0;
+            }
+        }
+    };
+    var threads: [flood_threads]std.Thread = undefined;
+    for (0..flood_threads) |i|
+        threads[i] = try std.Thread.spawn(.{}, Flooder.run, .{ &flood_socks[i], &stop });
+    defer {
+        stop.store(true, .monotonic);
+        for (threads) |t| t.join();
+    }
+    // Let the flood actually build up a backlog in the socket buffer before
+    // measuring -- otherwise step() might race ahead of it.
+    sleepMs(100);
+
+    const t0 = monoNow();
+    _ = try p.step();
+    const elapsed_ms = @divTrunc(monoNow() - t0, std.time.ns_per_ms);
+
+    // Budget: max_batches_per_drain (64) * Socket.batch_max (16) packets
+    // handled inline per family, plus the error-queue drain -- thousands of
+    // packets of local CPU work, comfortably under a second, and nowhere
+    // near the flood's measured RED range (1500-9046ms).
+    try std.testing.expect(elapsed_ms < 1000);
+}
+
+test "A1 F5: the socket error queue delivers ICMP errors for a DGRAM ping socket's own probes" {
+    // On the (default, preferred) DGRAM path the kernel never puts an ICMP
+    // error about our own probe on the normal receive queue -- it can only
+    // be read back via IP_RECVERR + MSG_ERRQUEUE. Verified live under
+    // `unshare` (`errq2.py`): a forged Time Exceeded quoting a DGRAM
+    // socket's own ident/seq produced NOTHING on a normal recvmsg, but
+    // appeared on the error queue immediately once IP_RECVERR was set --
+    // with the quoted echo header as payload and the quoted destination as
+    // the reported address.
+    var p = try Pinger.init(std.testing.allocator, .{});
+    defer p.deinit();
+    const id = try p.addTarget("10.9.9.77");
+    p.prepare() catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    const sock4 = &(p.sock4.?);
+    // This test is specifically about the DGRAM path (A1 F5's "always 0"
+    // claim does not apply to RAW, which already saw ICMP errors before
+    // this fix). Environments where .auto fell back to RAW skip it.
+    if (sock4.kind != .dgram) return error.SkipZigTest;
+
+    var injector = Socket.open(.v4, .raw, .{}) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer injector.close();
+
+    const seq = try p.seqmap.add(id, 0, monoNow());
+
+    // A forged ICMP Time Exceeded, quoting our own DGRAM socket's ident and
+    // this probe's seq, with the quoted destination set to the real target
+    // -- exactly what a real router's reply to this probe would carry.
+    var pkt: [echo.echo_header_len + 20 + echo.echo_header_len]u8 = @splat(0);
+    pkt[0] = echo.v4.time_exceeded;
+    pkt[8] = 0x45; // quoted IHL = 5
+    pkt[8 + 8] = 64; // quoted TTL
+    pkt[8 + 9] = 1; // quoted protocol = IPPROTO_ICMP -- required for the
+    // kernel to match this quoted packet back to an ICMP (ping) socket at
+    // all; without it the error queue never sees it, regardless of ident.
+    pkt[8 + 12] = 127; // quoted source = 127.0.0.1 (our own local address)
+    pkt[8 + 13] = 0;
+    pkt[8 + 14] = 0;
+    pkt[8 + 15] = 1;
+    const target_bytes: [4]u8 = switch (p.targetAddr(id)) {
+        .v4 => |a| @bitCast(a.addr),
+        .v6 => unreachable,
+    };
+    @memcpy(pkt[8 + 16 ..][0..4], &target_bytes); // quoted destination
+    const orig = pkt[8 + 20 ..];
+    orig[0] = echo.v4.echo_request;
+    std.mem.writeInt(u16, orig[4..6], sock4.ident, .big);
+    std.mem.writeInt(u16, orig[6..8], seq, .big);
+    std.mem.writeInt(u16, pkt[2..4], echo.checksum(&pkt), .big);
+
+    var dst_sa: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast([4]u8{ 127, 0, 0, 1 }) };
+    try injector.sendTo(@ptrCast(&dst_sa), @sizeOf(linux.sockaddr.in), &pkt);
+
+    // Give the kernel a moment to route the injected packet and queue the
+    // error before draining.
+    sleepMs(50);
+
+    try p.drainReplies(); // exercises drainErrQueue (A1 F5) internally
+    try std.testing.expectEqual(@as(u32, 1), p.stats(id).icmp_errors);
 }
 
 // ── tests: integration (loopback; skipped without ICMP socket access) ───────

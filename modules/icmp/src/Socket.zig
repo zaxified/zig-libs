@@ -158,6 +158,15 @@ pub fn open(family: Family, mode: Mode, opts: Options) OpenError!Socket {
         .v4 => {
             setOptInt(fd, linux.SOL.IP, linux.IP.RECVTTL, 1);
             setOptInt(fd, linux.SOL.IP, linux.IP.RECVTOS, 1);
+            // A1 F5: on a SOCK_DGRAM ping socket the kernel does not put ICMP
+            // errors (Time Exceeded, Destination Unreachable) about our own
+            // probes on the normal receive queue -- it can only be read back
+            // via the socket error queue, and only once IP_RECVERR is set.
+            // Without this, `Stats.icmp_errors` is structurally always 0 on
+            // the (default, preferred) DGRAM path, no matter what arrives.
+            // Errors ignored: the fallback is simply "no error queue data",
+            // which is the status quo this line replaces.
+            setOptInt(fd, linux.SOL.IP, linux.IP.RECVERR, 1);
             if (opts.ttl) |v| setOptInt(fd, linux.SOL.IP, linux.IP.TTL, @as(u32, v));
             if (opts.tos) |v| setOptInt(fd, linux.SOL.IP, linux.IP.TOS, @as(u32, v));
             if (opts.dont_fragment)
@@ -166,6 +175,8 @@ pub fn open(family: Family, mode: Mode, opts: Options) OpenError!Socket {
         .v6 => {
             setOptInt(fd, linux.SOL.IPV6, linux.IPV6.RECVHOPLIMIT, 1);
             setOptInt(fd, linux.SOL.IPV6, linux.IPV6.RECVTCLASS, 1);
+            // A1 F5, IPv6 half of the same fix.
+            setOptInt(fd, linux.SOL.IPV6, linux.IPV6.RECVERR, 1);
             if (opts.ttl) |v| setOptInt(fd, linux.SOL.IPV6, linux.IPV6.UNICAST_HOPS, @as(u32, v));
             if (opts.tos) |v| setOptInt(fd, linux.SOL.IPV6, linux.IPV6.TCLASS, @as(u32, v));
             if (opts.dont_fragment)
@@ -197,9 +208,32 @@ pub fn open(family: Family, mode: Mode, opts: Options) OpenError!Socket {
         self.ident = try self.boundIdent();
     }
 
-    if (kind == .raw) self.ident = @intCast(linux.getpid() & 0xffff);
+    // A1 F6: was `@intCast(linux.getpid() & 0xffff)`. On the DGRAM path the
+    // kernel picks the identifier (it is the socket's ephemeral "port"), so
+    // this module has no say there -- but on the RAW path this value is
+    // purely this module's own correlation token (the kernel never uses it
+    // to demux a raw socket's traffic), and a PID is the opposite of
+    // unguessable: an off-path attacker sharing the host sees 299/299
+    // consecutive PIDs differ by exactly 1 (measured 2026-09-05). Getting it
+    // from the kernel CSPRNG closes that; `randomIdent` falls back to the
+    // old PID-derived value only if the syscall itself is refused, so this
+    // can only get *more* random than before, never less.
+    if (kind == .raw) self.ident = randomIdent();
 
     return self;
+}
+
+/// A 16-bit identifier from the kernel CSPRNG (`getrandom(2)`), with a
+/// PID-derived fallback for the vanishingly unlikely case the syscall is
+/// refused (e.g. a seccomp filter without GRND_NONBLOCK allowed). `std.crypto
+/// .random` does not exist in 0.16; `getrandom` is the direct, dependency-free
+/// route to the same kernel entropy pool.
+fn randomIdent() u16 {
+    var buf: [2]u8 = undefined;
+    const rc = linux.getrandom(&buf, buf.len, 0);
+    if (linux.errno(rc) == .SUCCESS and rc == buf.len)
+        return std.mem.readInt(u16, &buf, .little);
+    return @intCast(linux.getpid() & 0xffff);
 }
 
 pub fn close(self: *Socket) void {
@@ -307,13 +341,24 @@ pub const batch_max = 16;
 /// Returns how many packets the kernel accepted; the caller retries the
 /// remainder via sendTo, which reports an accurate per-packet errno
 /// (sendmmsg stops at the first failure without saying why).
+///
+/// `error.TooManyPackets` when `addrs.len != packets.len` or either exceeds
+/// `batch_max`. This was `std.debug.assert`, which `ReleaseFast`/
+/// `ReleaseSmall` compile out (`if (!ok) unreachable`) -- and the two fixed
+/// `[batch_max]` stack arrays below are then indexed with a caller-chosen
+/// length the type system cannot relate to their size. A1 F1/m30: measured
+/// 2026-09-05 with 64 packets against `batch_max = 16` -- Debug/ReleaseSafe
+/// panicked (SIGABRT), ReleaseFast wrote past both stack arrays (SIGSEGV,
+/// no diagnostic at all). Same class this module already closed twice
+/// (`recvBatch` -> `error.SlabTooSmall`, `writeEchoRequest` ->
+/// `error.BufferTooSmall`) -- this was the one instance of it left.
 pub fn sendMany(
     self: *const Socket,
     addrs: []const *const linux.sockaddr,
     addr_len: linux.socklen_t,
     packets: []const []const u8,
-) usize {
-    std.debug.assert(addrs.len == packets.len and packets.len <= batch_max);
+) error{TooManyPackets}!usize {
+    if (addrs.len != packets.len or packets.len > batch_max) return error.TooManyPackets;
     var control: [64]u8 align(@alignOf(linux.cmsghdr)) = @splat(0);
     const control_len: usize = if (self.oiface_index != 0) self.buildPktinfo(&control) else 0;
 
@@ -375,6 +420,93 @@ fn parseSrc(storage: *const [@sizeOf(linux.sockaddr.in6)]u8, namelen: linux.sock
         return .{ .v6 = @bitCast(storage[0..@sizeOf(linux.sockaddr.in6)].*) };
     }
     return .none;
+}
+
+/// `struct sock_extended_err` (linux/errqueue.h). Not in std's linux
+/// bindings; the layout is stable kernel UAPI, reproduced here directly.
+/// Followed in the same cmsg by an offender `sockaddr_in`/`sockaddr_in6`,
+/// which the kernel also mirrors into `recvmsg`'s `msg_name` -- read that
+/// through the existing `parseSrc` instead of re-parsing it here.
+const sock_extended_err = extern struct {
+    ee_errno: u32,
+    ee_origin: u8,
+    ee_type: u8,
+    ee_code: u8,
+    ee_pad: u8,
+    ee_info: u32,
+    ee_data: u32,
+};
+
+/// One entry read back from the socket error queue (A1 F5).
+pub const ErrInfo = struct {
+    /// The kernel's quoted copy of the ICMP message this error is about --
+    /// for a ping socket this is our own echo request header (ident at
+    /// [4..6], seq at [6..8], same layout `echo.writeEchoRequest` wrote),
+    /// recovered from the ICMP error's quoted headers even though this
+    /// socket never itself retains a copy of what it sent.
+    packet: []u8,
+    /// ICMP type/code of the error (e.g. `echo.v4.time_exceeded`).
+    err_type: u8,
+    err_code: u8,
+    /// The address IP_RECVERR/IPV6_RECVERR reports the error is about.
+    /// Mirrors `RecvInfo.src`'s SrcAddr shape so `sourceMatches` (pinger.zig)
+    /// works unchanged on it.
+    src: RecvInfo.SrcAddr = .none,
+};
+
+/// Read one entry from the socket error queue (`MSG_ERRQUEUE`), non-blocking.
+/// Requires `IP_RECVERR`/`IPV6_RECVERR`, which `open` always sets. Returns
+/// null when the queue is empty (EAGAIN) or on transient errors -- same
+/// convention as `recvMsg`.
+///
+/// A1 F5: on the DGRAM ("ping") path the kernel does not deliver ICMP
+/// errors about our own probes through the normal receive queue at all --
+/// verified live (`errq.py`/`errq2.py` under `unshare`): a forged Time
+/// Exceeded quoting a DGRAM socket's ident/seq produced nothing on a normal
+/// `recvmsg`, but appeared immediately on `MSG_ERRQUEUE` once `IP_RECVERR`
+/// was set, complete with the quoted echo header as `msg_iov` payload and
+/// the quoted destination address as `msg_name` -- both usable exactly like
+/// the RAW path's `.icmp_error` variant.
+pub fn recvErr(self: *const Socket, buf: []u8) ?ErrInfo {
+    var src_storage: [@sizeOf(linux.sockaddr.in6)]u8 align(8) = @splat(0);
+    var control: [256]u8 align(@alignOf(linux.cmsghdr)) = undefined;
+    var iov: std.posix.iovec = .{ .base = buf.ptr, .len = buf.len };
+    var msg: linux.msghdr = .{
+        .name = @ptrCast(&src_storage),
+        .namelen = src_storage.len,
+        .iov = @ptrCast(&iov),
+        .iovlen = 1,
+        .control = &control,
+        .controllen = control.len,
+        .flags = 0,
+    };
+
+    const rc = linux.recvmsg(self.fd, &msg, linux.MSG.ERRQUEUE);
+    if (linux.errno(rc) != .SUCCESS) return null;
+
+    var info: ErrInfo = .{ .packet = buf[0..rc], .err_type = 0, .err_code = 0 };
+    info.src = parseSrc(&src_storage, msg.namelen);
+
+    const hdr_len = @sizeOf(linux.cmsghdr);
+    const cmsg_align = @alignOf(linux.cmsghdr);
+    var off: usize = 0;
+    const ctl = control[0..msg.controllen];
+    while (off + hdr_len <= ctl.len) {
+        const cmsg: *const linux.cmsghdr = @ptrCast(@alignCast(ctl.ptr + off));
+        if (cmsg.len < hdr_len or off + cmsg.len > ctl.len) break;
+        const data = ctl[off + hdr_len .. off + cmsg.len];
+
+        const is_recverr = (cmsg.level == linux.SOL.IP and cmsg.type == linux.IP.RECVERR) or
+            (cmsg.level == linux.SOL.IPV6 and cmsg.type == linux.IPV6.RECVERR);
+        if (is_recverr and data.len >= @sizeOf(sock_extended_err)) {
+            const ee: *const sock_extended_err = @ptrCast(@alignCast(data.ptr));
+            info.err_type = ee.ee_type;
+            info.err_code = ee.ee_code;
+        }
+
+        off += std.mem.alignForward(usize, cmsg.len, cmsg_align);
+    }
+    return info;
 }
 
 /// Reusable storage for batched receives: one packet slab of batch_max
@@ -487,4 +619,65 @@ test "recvBatch rejects an undersized slab instead of letting the kernel write p
     var short: [batch_max * slot_size - 1]u8 = undefined;
     var b: RecvBatch = .{ .slab = &short, .slot_size = slot_size };
     try std.testing.expectError(error.SlabTooSmall, sock.recvBatch(&b));
+}
+
+test "A1 F1/m30: sendMany reports too many packets as an error, not an assert" {
+    // fd -1 is never reached: the length check runs before any iovs/msgs
+    // are built or any syscall is made -- the whole point, mirroring
+    // `recvBatch`'s slab check above. The OLD code
+    // (`std.debug.assert(addrs.len == packets.len and packets.len <=
+    // batch_max)`) panicked in Debug/ReleaseSafe and, measured 2026-09-05,
+    // SIGSEGV'd in ReleaseFast by indexing the two fixed `[batch_max]`
+    // stack arrays with `packets.len` (64) past their real size (16).
+    const sock: Socket = .{ .fd = -1, .family = .v4, .kind = .dgram, .ident = 1 };
+
+    var addr: linux.sockaddr.in = .{ .port = 0, .addr = 0 };
+    const addr_ptr: *const linux.sockaddr = @ptrCast(&addr);
+    var addrs: [batch_max + 1]*const linux.sockaddr = undefined;
+    var pkts: [batch_max + 1][]const u8 = undefined;
+    const one_packet = "x";
+    for (0..addrs.len) |i| {
+        addrs[i] = addr_ptr;
+        pkts[i] = one_packet;
+    }
+    try std.testing.expectError(
+        error.TooManyPackets,
+        sock.sendMany(&addrs, @sizeOf(linux.sockaddr.in), &pkts),
+    );
+
+    // Mismatched lengths, still within batch_max -- the second half of the
+    // old assert's condition.
+    try std.testing.expectError(
+        error.TooManyPackets,
+        sock.sendMany(addrs[0..2], @sizeOf(linux.sockaddr.in), pkts[0..1]),
+    );
+
+    // Positive control: exactly batch_max, matching lengths -- must reach
+    // the syscall, which then fails on the bogus fd (not TooManyPackets).
+    // The point here is which error comes back, not a successful send.
+    const result = sock.sendMany(addrs[0..batch_max], @sizeOf(linux.sockaddr.in), pkts[0..batch_max]);
+    try std.testing.expectEqual(@as(usize, 0), try result);
+}
+
+test "A1 F6: a RAW socket's ident is drawn from the kernel CSPRNG, not the process id" {
+    // Old code: `self.ident = @intCast(linux.getpid() & 0xffff)`. Two RAW
+    // sockets opened back-to-back by this SAME test process share a PID, so
+    // under the old code they would get the IDENTICAL ident -- the whole
+    // problem (measured live 2026-09-05: 299/299 consecutive idents on a
+    // busy host differ from a neighboring process's by exactly 1, because
+    // it is really just the PID). A real 16-bit CSPRNG draw makes two
+    // sockets collide with probability 1/65536; this test accepts that
+    // vanishingly small flake rather than mocking the syscall.
+    var s1 = Socket.open(.v4, .raw, .{}) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer s1.close();
+    var s2 = Socket.open(.v4, .raw, .{}) catch |err| switch (err) {
+        error.PermissionDenied, error.AddressFamilyUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    defer s2.close();
+
+    try std.testing.expect(s1.ident != s2.ident);
 }
