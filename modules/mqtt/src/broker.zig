@@ -54,9 +54,10 @@
 //! Deliberately deferred (documented, not built): QoS 2 (an inbound QoS 2
 //! PUBLISH is a protocol violation that tears the connection down), persistent
 //! / offline sessions (clean-session only), DUP retransmit of an unacked
-//! outbound QoS 1 publish, Will / LWT, MQTT 5.0, and TLS (terminate it in front
-//! and hand `TcpServer` the plaintext, or drive the socket-free core over a TLS
-//! stream yourself).
+//! outbound QoS 1 publish, MQTT 5.0, and TLS (terminate it in front and hand
+//! `TcpServer` the plaintext, or drive the socket-free core over a TLS stream
+//! yourself). ⭐ Will / LWT was on this list until 2026-09-11 and is now built
+//! (3.1.2.5, 3.14.4), as is `publish` — a message the server itself originates.
 //!
 //! Provenance: clean-room from the OASIS MQTT 3.1.1 specification;
 //! mosquitto/Paho referenced for behavior only, no source consulted or copied.
@@ -832,7 +833,7 @@ pub const Broker = struct {
             b.allocator.free(wt);
             if (wp) |p| b.allocator.free(p);
         }
-        b.fanout(conn, .{
+        b.fanout(.{
             .topic = wt,
             .payload = if (wp) |p| p else &.{},
             .qos = conn.will_qos,
@@ -840,6 +841,60 @@ pub const Broker = struct {
         }) catch {
             _ = b.will_failures.fetchAdd(1, .monotonic);
         };
+    }
+
+    /// Publish from the server itself, with no client behind it.
+    ///
+    /// The broker could previously only *relay*: every byte it sent to a client
+    /// originated in some other client's PUBLISH. That leaves out the whole
+    /// class of servers that have something of their own to say — a bridge
+    /// injecting the other side's traffic, a gateway answering a device's
+    /// configuration request, a `$SYS` topic, a test fixture seeding a retained
+    /// value. Those are ordinary MQTT: the spec describes the Server as a
+    /// sender of Application Messages (3.3), and nowhere requires that one
+    /// arrived from a Client first. Nothing else in this module could do it,
+    /// because `Connection.lockedWrite` is private and deliberately stays so.
+    ///
+    /// The message takes exactly the path a client's publish takes: retained
+    /// store first (3.3.1.3 — an empty payload clears), then fan-out to every
+    /// matching subscription at `min(qos, granted)`, one copy per connection.
+    /// A subscriber that fails is contained to itself, as always.
+    ///
+    /// Two deliberate differences from `handlePublish`, both because there is
+    /// no client here to be one:
+    ///
+    ///  - **No ACL call.** `aclAllows` answers "may *this connection* publish
+    ///    here", and the server is not a connection. A server that wants to
+    ///    police its own messages does so before calling this.
+    ///  - **The tap does not fire.** `Config.onPublishFn` observes what the
+    ///    broker *accepted from its clients*; a server-originated message is
+    ///    the caller's own action, which the caller already knows about.
+    ///    Feeding it back would make a bridge echo itself.
+    ///
+    /// `topic_name` is validated as a publish topic (4.7.1: no wildcards, no
+    /// U+0000, non-empty) — the same rule an inbound PUBLISH is held to, so a
+    /// server cannot put on the wire what it would reject off it. QoS 2 is
+    /// refused for the same reason the inbound path refuses it: the broker's
+    /// exactly-once machinery is deferred, and pretending otherwise would
+    /// silently downgrade a delivery the caller asked to be exactly-once.
+    ///
+    /// ⚠ The parameter is `topic_name`, not `topic`, only because `topic` is
+    /// this file's name for the topic module.
+    pub fn publish(
+        b: *Broker,
+        topic_name: []const u8,
+        payload: []const u8,
+        qos: QoS,
+        retain: bool,
+    ) Error!void {
+        if (qos == .exactly_once) return error.ProtocolViolation;
+        topic.validateName(topic_name) catch return error.ProtocolViolation;
+        try b.fanout(.{
+            .topic = topic_name,
+            .payload = payload,
+            .qos = qos,
+            .retain = retain,
+        });
     }
 
     /// Buffer bytes received from this connection's client (any framing).
@@ -1227,7 +1282,7 @@ pub const Broker = struct {
             if (b.config.onPublishFn) |tap| {
                 tap(b.config.publish_ctx, pub_pkt.topic, pub_pkt.payload, pub_pkt.qos, pub_pkt.retain);
             }
-            try b.fanout(conn, pub_pkt);
+            try b.fanout(pub_pkt);
         }
 
         // Acknowledge an inbound QoS 1 publish (QoS 0: nothing).
@@ -1243,8 +1298,7 @@ pub const Broker = struct {
     /// targets from the index (FIX A); it is released before any socket write.
     /// A per-subscriber delivery failure is contained to that subscriber and
     /// never propagates to the publisher (FIX B).
-    fn fanout(b: *Broker, conn: *Connection, pub_pkt: packet.Publish) Error!void {
-        _ = conn;
+    fn fanout(b: *Broker, pub_pkt: packet.Publish) Error!void {
         var targets: std.ArrayListUnmanaged(Target) = .empty;
         defer targets.deinit(b.allocator);
 
@@ -3169,4 +3223,132 @@ test "a will topic containing a wildcard is a protocol violation" {
     // would send the client hunting through its client id.
     try testing.expectError(error.ProtocolViolation, b.process(conn, 0));
     b.remove(conn);
+}
+
+// ── server-originated publish ──────────────────────────────────────────────
+//
+// The shape that motivated this: a gateway device subscribes to
+// `sn/{SN}/clock/conf`, publishes `sn/{SN}/clock/init`, and then waits for the
+// server to answer. Until `Broker.publish` existed there was no way to answer
+// at all — `Connection.lockedWrite` is private, and every other path into the
+// wire starts from a client's PUBLISH.
+
+test "the server can publish with no client behind it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const device = try connectClient(&b, &tt, "EWG6", 15, 0);
+    try feedSubscribe(&b, device, 1, &.{.{ .filter = "sn/1/clock/conf", .qos = .at_most_once }});
+    _ = try tt.next(); // SUBACK
+
+    try b.publish("sn/1/clock/conf", "{\"time\":1757563402}", .at_most_once, false);
+
+    const got = (try tt.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqualStrings("sn/1/clock/conf", got.publish.topic);
+    try testing.expectEqualStrings("{\"time\":1757563402}", got.publish.payload);
+    try testing.expectEqual(QoS.at_most_once, got.publish.qos);
+
+    b.remove(device);
+}
+
+test "a server publish reaches only subscribers, and honours their granted QoS" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var sub_tt: TestTransport = .{};
+    const sub = try connectClient(&b, &sub_tt, "sub", 0, 0);
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "sn/+/clock/conf", .qos = .at_least_once }});
+    _ = try sub_tt.next(); // SUBACK
+
+    // Connected, but subscribed to something else: it must hear nothing. A
+    // server publish that went straight down every socket would be a different
+    // (and wrong) feature.
+    var other_tt: TestTransport = .{};
+    const other = try connectClient(&b, &other_tt, "other", 0, 0);
+    try feedSubscribe(&b, other, 1, &.{.{ .filter = "sn/1/data", .qos = .at_most_once }});
+    _ = try other_tt.next(); // SUBACK
+
+    try b.publish("sn/1/clock/conf", "now", .at_least_once, false);
+
+    const got = (try sub_tt.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqual(QoS.at_least_once, got.publish.qos);
+    try testing.expect(got.publish.packet_id != 0);
+    try testing.expectEqual(@as(?packet.Packet, null), try other_tt.next());
+
+    b.remove(sub);
+    b.remove(other);
+}
+
+test "a server publish can retain, and a later subscriber gets it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    // Nobody is connected at all when this is published.
+    try b.publish("sn/1/collector/conf", "{}", .at_most_once, true);
+
+    var tt: TestTransport = .{};
+    const late = try connectClient(&b, &tt, "late", 0, 0);
+    try feedSubscribe(&b, late, 7, &.{.{ .filter = "sn/1/collector/conf", .qos = .at_most_once }});
+    _ = try tt.next(); // SUBACK
+    const got = (try tt.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqualStrings("{}", got.publish.payload);
+
+    // And an empty payload clears it again (3.3.1.3), from the server side too.
+    try b.publish("sn/1/collector/conf", "", .at_most_once, true);
+    var tt2: TestTransport = .{};
+    const later = try connectClient(&b, &tt2, "later", 0, 0);
+    try feedSubscribe(&b, later, 8, &.{.{ .filter = "sn/1/collector/conf", .qos = .at_most_once }});
+    _ = try tt2.next(); // SUBACK
+    try testing.expectEqual(@as(?packet.Packet, null), try tt2.next());
+
+    b.remove(late);
+    b.remove(later);
+}
+
+test "the server is held to the same topic rules as its clients" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    // A wildcard is a *filter*, never a publish topic (4.7.1). A server that
+    // could publish to one would deliver to subscribers of topics that do not
+    // exist, and the message could never be republished by a client.
+    try testing.expectError(error.ProtocolViolation, b.publish("sn/+/clock/conf", "x", .at_most_once, false));
+    try testing.expectError(error.ProtocolViolation, b.publish("sn/#", "x", .at_most_once, false));
+    try testing.expectError(error.ProtocolViolation, b.publish("", "x", .at_most_once, false));
+    try testing.expectError(error.ProtocolViolation, b.publish("a/\x00/b", "x", .at_most_once, false));
+
+    // QoS 2 is refused rather than quietly downgraded: the broker's
+    // exactly-once machinery is deferred, and a silent downgrade would be a
+    // delivery guarantee the caller thinks it has.
+    try testing.expectError(error.ProtocolViolation, b.publish("sn/1/clock/conf", "x", .exactly_once, false));
+}
+
+test "the tap does not observe the server's own publishes" {
+    // Otherwise a bridge built on this would echo itself: it taps to learn what
+    // to forward, and forwarding is what it does with `publish`.
+    var rec: TapRecorder = .{};
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const c = try connectClient(&b, &tt, "c", 0, 0);
+    try feedSubscribe(&b, c, 1, &.{.{ .filter = "sn/1/#", .qos = .at_most_once }});
+    _ = try tt.next(); // SUBACK
+
+    // A client publish IS observed...
+    _ = try feedPublish(&b, c, .{ .topic = "sn/1/data", .payload = "from the client" });
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+
+    // ...the server's own is not.
+    try b.publish("sn/1/clock/conf", "from the server", .at_most_once, false);
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+
+    b.remove(c);
 }

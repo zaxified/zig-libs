@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **`Broker.publish`: the server can originate a message.** Until now the broker
+  could only relay — every byte it put on a wire came from some other client's PUBLISH — and
+  `Connection.lockedWrite` is private, so a consumer had no way to say anything of its own at all.
+  That leaves out every server that *has* something to say: a bridge injecting the other side's
+  traffic, a gateway answering a device's configuration request, a `$SYS` topic, a fixture seeding
+  a retained value. The spec describes the Server as a sender of Application Messages (3.3) and
+  nowhere requires that one arrived from a Client first. The message takes the client path exactly:
+  retained store (3.3.1.3, empty payload clears), then fan-out at `min(qos, granted)`, one copy per
+  connection, a failed subscriber contained to itself. Two deliberate differences, both because
+  there is no client here to be one: **no ACL call** (`aclAllows` answers "may *this connection*
+  publish here"), and **the tap does not fire** — `onPublishFn` observes what the broker accepted
+  *from its clients*, and feeding a server's own message back would make a bridge echo itself.
+  Held to the same topic rules as an inbound PUBLISH (4.7.1: no wildcards, no U+0000, non-empty),
+  and QoS 2 is refused rather than silently downgraded. `fanout` lost its publisher parameter,
+  which it had never read. Driven by the first outside consumer (`energomonitor`'s egw-proxy): its
+  gateway subscribes to `sn/{SN}/clock/conf` and then waits, and without a clock it publishes no
+  measurements at all. Measured RED → GREEN: five mutations — tap fired, topic unvalidated, QoS 2
+  admitted, retain dropped, granted QoS ignored — each kill exactly the test that names them.
+
 - **2026-09-11** — **Will / LWT is implemented in the broker**, closing what SPEC.md carried as
   deliberately deferred first-cut scope (3.1.2.5, 3.1.3.3, 3.14.4). The will registered at CONNECT
   is kept as owned copies — the decoded slices point into the receive buffer and the next packet

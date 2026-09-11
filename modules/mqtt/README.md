@@ -48,6 +48,14 @@ transport-agnostic client and a broker, all fully offline-testable.
     in tests. `broker.TcpServer` is an optional `std.Io.net` accept loop
     (thread-per-connection); tests never listen or dial.
 
+    `Broker.publish(topic, payload, qos, retain)` is the server's own voice:
+    a message with no client behind it, taking the same retained-store and
+    fan-out path a client's PUBLISH takes. It is what a bridge, a `$SYS` topic
+    or a gateway answering a device's configuration request needs; everything
+    else in this module can only relay. It makes **no ACL call** and does
+    **not** fire `onPublishFn` — neither has a connection to be about, and a
+    tap that saw the server's own messages would make a bridge echo itself.
+
     **Broker scope (3.1.1, production-hardened):** CONNECT/CONNACK (protocol
     name+level validated, client-id assigned — empty → server-generated — or
     rejected, session take-over on a duplicate client-id which also shuts the
