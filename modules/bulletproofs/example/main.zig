@@ -58,7 +58,7 @@ pub fn main() !void {
     const v_commitment = bulletproofs.commit(gens, scalarOf(amount), gamma);
 
     var prover_transcript: bulletproofs.Transcript = .init(bulletproofs.rangeproof_domain);
-    const proof = bulletproofs.prove(gpa, gens, &prover_transcript, amount, gamma) catch |err| switch (err) {
+    const proof = bulletproofs.prove(gpa, gens, &prover_transcript, &amount, gamma) catch |err| switch (err) {
         error.OutOfMemory => return err,
         // A wallet that lets a user type an amount wider than the ledger's
         // range must report that as a user-facing refusal, not a crash — so

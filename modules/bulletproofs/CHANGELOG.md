@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **API CHANGE:** `prove`'s secret witness parameter changes
+  from `v: u64` to `v: *const u64` (audit finding B12). The old by-value
+  parameter left a copy on the caller-owned argument-passing stack slot that
+  `prove`'s own `secureZero` calls (already covering `v_bytes` and every
+  other witness-derived scratch buffer) could not reach; `prove` also now
+  reads `v.*` into a local it owns exactly once and `secureZero`s that
+  local, rather than dereferencing the pointer 64 times across the
+  bit-decomposition loop (measured: doing so gave the optimizer room to
+  spill the value to an equally uncleaned second copy). `Q3` of
+  `QUESTIONS-ROUND-2.md`: a signature change forced by a measured leak is
+  free on a module with zero consumers in this repository (confirmed:
+  `rg -n '"bulletproofs"' build.zig` names only the module's own entry, and
+  no `example-apps/*/build.zig` references it). ⚠ **Not fully closed**: a
+  dead-stack scan (`src/stackprobe_test.zig`) still measures 1 residual copy
+  of `v` after both changes above, traced to a second materialization of
+  `v_bytes` around the `commit(gens, v_bytes, gamma)` call that the same
+  `secureZero` does not reach — see `A1/bulletproofs.md` B12 and the probe's
+  doc comment. All call sites in this module (`kat_test.zig`,
+  `ctgrind_harness.zig`, `example/main.zig`) and the README snippet are
+  updated to pass `v` by pointer.
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** the last three stale claims from audit finding B11 are corrected, all verified against the tree rather than taken from the record. `NOTICE` said **"Status: scaffold"** with `ipa.proveIpa`/`rangeproof.prove` described as `@panic("TODO(fable/core): …")` stubs — there is not one such stub left and `gate.core_implemented` is `true`; it also said `meta.deps = .{}` when it is `.{"ct25519"}`. `SPEC.md` listed a "Pippenger/windowed `multiScalarMul`" as out of scope, but `scalarvec.multiScalarMulVartime` exists and `ipa.verifyIpa` uses it (deliberately variable-time: its inputs are the public proof and public generators; a windowed CONSTANT-time MSM, which the prover would need, is what is still absent). ⭐ The other two B11 rows — README and SPEC "Caveats" claiming the prover is "Not constant-time" — were already fixed on 2026-09-09 by the ctgrind pass, so they are left alone; an audit record is always older than the tree. ⚠ The "scaffold" wording is corrected in place with a note saying it stood long after it was true: a status line that under-reports is the same defect as one that over-reports, and this module had one of each at the same time.
 
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added (A1 audit finding R2; the tier-A ctgrind queue, 28 modules). Measured ReleaseFast under valgrind, in-file contexts: **rangeproof 0 / ipa 0**. Every target has an untainted control row and a no-`-fvalgrind` trap row, both 0, so the numbers are real taint propagation rather than a silent no-op. **Zero in-file contexts in both targets** — nothing in `rangeproof.zig`, `ipa.zig`, `scalarvec.zig`, `generators.zig`, `transcript.zig`, or the `ct25519` delegate. ⭐ This is why `SPEC.md`'s and `README.md`'s "Not constant-time" caveat was rewritten in the same commit: it described a `catch continue` that audit finding F2 removed, and which now survives only in comments about the shape it replaced. The staleness ran in the unusual direction — the code improved and the documentation advertised a side channel the module no longer has. ⚠ `prove` draws its own blinding internally via `getrandom(2)`; the harness cannot taint that without editing the module, so it is outside this measurement and the SPEC says so.

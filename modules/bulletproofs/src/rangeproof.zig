@@ -354,21 +354,37 @@ pub const ProveError = error{
 /// 10-step construction. `v`'s range guard is checked first — see
 /// `ProveError.ValueOutOfRange`'s doc comment.
 ///
-/// `v` is a plain `u64` (this scaffold does not support `n > 64` — every
-/// realistic Bulletproofs range width, 8/16/32/64, fits; a wider-`v`
-/// variant would need a bignum witness type and is out of scope here, see
-/// SPEC.md).
+/// `v` is taken **by pointer** (audit finding B12): a `u64` witness passed
+/// by value leaves an uncleared copy in the caller's argument-passing slot
+/// that this function has no way to reach, even though every other secret
+/// derived from it (`v_bytes`, the bit-decomposition vectors) is
+/// `secureZero`'d before return. Taking `*const u64` means the only copy is
+/// the caller's own storage, which the caller controls. (this scaffold does
+/// not support `n > 64` — every realistic Bulletproofs range width,
+/// 8/16/32/64, fits; a wider-`v` variant would need a bignum witness type
+/// and is out of scope here, see SPEC.md).
 pub fn prove(
     allocator: std.mem.Allocator,
     gens: Generators,
     transcript: *Transcript,
-    v: u64,
+    v: *const u64,
     gamma: [32]u8,
 ) ProveError!RangeProof {
     if (gens.n < 64) {
         const limit = @as(u64, 1) << @intCast(gens.n);
-        if (v >= limit) return error.ValueOutOfRange;
+        if (v.* >= limit) return error.ValueOutOfRange;
     }
+
+    // Read the secret witness through the pointer exactly once, into a
+    // local this function owns and can clean up. Repeatedly dereferencing
+    // `v.*` across the 64-iteration bit-decomposition loop below gave the
+    // optimizer room to spill the value to its own uncontrolled stack slot
+    // (measured: `stackprobe_test.zig`'s B12 probe still found 1 copy with
+    // `v` taken by pointer but dereferenced in the loop) -- reading it once
+    // here and `secureZero`ing this copy closes that, the same pattern
+    // already used below for every other witness-derived scratch buffer.
+    var v_val: u64 = v.*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&v_val));
 
     const n = gens.n;
     // The IPA reduction needs a nonzero power-of-two n. A Generators set
@@ -393,7 +409,7 @@ pub fn prove(
     const a_r = try scratch.alloc([32]u8, n);
     defer std.crypto.secureZero(u8, std.mem.sliceAsBytes(a_r));
     for (a_l, a_r, 0..) |*al, *ar, i| {
-        const bit: u8 = if (i < 64) @truncate((v >> @intCast(i)) & 1) else 0;
+        const bit: u8 = if (i < 64) @truncate((v_val >> @intCast(i)) & 1) else 0;
         al.* = scalarvec.zero;
         al.*[0] = bit;
         ar.* = scalar.sub(al.*, scalarvec.one);
@@ -434,7 +450,7 @@ pub fn prove(
     transcript.appendU64("n", n);
     var v_bytes = scalarvec.zero;
     defer std.crypto.secureZero(u8, &v_bytes);
-    std.mem.writeInt(u64, v_bytes[0..8], v, .little);
+    std.mem.writeInt(u64, v_bytes[0..8], v_val, .little);
     const v_point = commit(gens, v_bytes, gamma);
     transcript.appendPoint("V", v_point);
     transcript.appendPoint("A", a_commit);
@@ -844,8 +860,8 @@ test "prove: rejects v >= 2^n at construction, without touching the stub" {
     const gens = try Generators.init(std.testing.allocator, 4); // n = 4, values must be < 16
     defer gens.deinit(std.testing.allocator);
     var t = Transcript.init("bulletproofs/range-proof/v1");
-    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, 16, scalarvec.zero));
-    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, 255, scalarvec.zero));
+    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, &@as(u64, 16), scalarvec.zero));
+    try std.testing.expectError(error.ValueOutOfRange, prove(std.testing.allocator, gens, &t, &@as(u64, 255), scalarvec.zero));
 }
 
 test "prove: n=64 construction-time guard is skipped, and the boundary values it would have to handle actually verify (audit B6)" {
@@ -878,7 +894,7 @@ test "prove: n=64 construction-time guard is skipped, and the boundary values it
         const commitment = commit(gens, v_bytes, gamma);
 
         var prove_t = Transcript.init(transcript_domain);
-        const proof = try prove(std.testing.allocator, gens, &prove_t, v, gamma);
+        const proof = try prove(std.testing.allocator, gens, &prove_t, &v, gamma);
         defer proof.deinit(std.testing.allocator);
 
         var verify_t = Transcript.init(transcript_domain);

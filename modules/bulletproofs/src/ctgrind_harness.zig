@@ -235,7 +235,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const v = std.mem.readInt(u64, &v_bytes, .little);
 
             var t = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
-            const proof = try bulletproofs.prove(allocator, gens, &t, v, gamma);
+            const proof = try bulletproofs.prove(allocator, gens, &t, &v, gamma);
             defer proof.deinit(allocator);
 
             // Propagation witness: downstream of both v and gamma.
