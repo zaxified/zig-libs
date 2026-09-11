@@ -26,12 +26,38 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   backtracking (an endpoint-less static prefix falls back to a param sibling). Raw byte matching —
   no percent-decoding, no case folding; `:param` never matches empty, `*wildcard` must be last and
   captures the remainder (possibly `""`).
+- **Method precedence (`method_precedence`, default `.backtrack`):** when more than one candidate
+  produces the same path shape and they serve different methods, the matcher keeps trying siblings
+  (static, then `:param`, then `*wildcard`, at every level) until one serves the request's method,
+  instead of committing to the first candidate with ANY endpoint (audit finding router-F5 — before
+  this, registering `POST /users/new` could silently turn a working `GET /users/new` — served by
+  `GET /users/:id` — into a 405, because `new` (static) matches before `:id` (param) regardless of
+  method). `Allow` on a genuine 405 is the union of every candidate the search actually visited
+  (RFC 9110 §15.5.6: the header must list every method the *target resource* — the path, not one
+  particular trie node — supports), tracked via a per-node method bitset (`Node.allow_bits`) unioned
+  at request time; `min_reach` still prunes subtrees that cannot reach ANY endpoint, but not by
+  method, so an adversarial table (`Node.min_reach`'s own doc comment, audit finding router-F4) can
+  make a 405 visit every same-shaped candidate. `method_precedence = .first_match` restores the pre-2026-09-11 behavior (and its
+  performance characteristics) verbatim, including that a root wildcard never backtracks into a
+  node some OTHER method already claimed — see README's two worked examples.
+- **Registration-time pattern validation:** a pattern must not reuse the same `:name`/`*name`
+  capture at two different positions (`error.DuplicateParamName` — audit finding router-F8; before
+  this, `/:a/:a` was accepted and `params.get("a")` silently returned only the first value forever)
+  and must not contain an empty segment anywhere but a single trailing one (`error.InvalidPattern`
+  — audit finding router-F11; before this, `//evil.example/x` was accepted, and a trailing-slash
+  redirect under it emitted a protocol-relative `Location` a browser reads as
+  `http://evil.example/x`, an open redirect). A single trailing empty segment — `/x/` — is still the
+  documented, distinct trailing-slash route.
 - **Documented edge policies:** HEAD auto-routes to GET when no explicit HEAD exists; 405 sets
   `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs;
   trailing slash is `.redirect` (default: 301 GET/HEAD, 308 otherwise, query preserved) or `.strict`
   (404) — `/x` and `/x/` are always independently registrable; auto-`OPTIONS` is opt-in.
 - **Concurrency:** building (`add`/`use`/`group`) is single-owner; a built `Router` is immutable —
-  reentrant.
+  reentrant. `Ctx.params` is a pointer into the dispatching call's own stack frame (audit finding
+  router-F6, alongside halving `max_params` 16 → 8 — together these roughly halve the per-dispatch
+  stack cost of `Params`/`Ctx`), valid strictly for that call, same as the `[]const u8` values it
+  hands out; `tryRedirect` is `noinline` so its 4 KiB `Location` buffer is no longer part of every
+  dispatch's stack frame regardless of whether a redirect is ever attempted.
 
 ## Threat model / out of scope
 

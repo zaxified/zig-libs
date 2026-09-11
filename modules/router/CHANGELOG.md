@@ -5,6 +5,50 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **BEHAVIOURAL + API change (user-approved, Q7/Q8 — `QUESTIONS-ROUND-2.md`),
+  changes observable behavior for all 18 in-repo consumers** — A1/router.md F5, F6, F8, F11 closed.
+  - **F5 (405/method precedence, HIGH-adjacent footgun):** new `method_precedence` (default
+    `.backtrack`) makes the matcher keep trying sibling candidates — static, then `:param`, then
+    `*wildcard` — until one serves the request's method, instead of committing to the first
+    candidate with ANY endpoint regardless of method. Before this, registering `POST /users/new`
+    could silently turn a working `GET /users/new` (served by `GET /users/:id`) into a 405, with
+    nothing in that diff mentioning `/users/:id`. RFC 9110 §15.5.6 also required a 405's `Allow` to
+    list every method the target *path*, not one trie node, supports — `Allow` is now the union of
+    every candidate the search actually visited, via a new per-node method bitset
+    (`Node.allow_bits`). `method_precedence = .first_match` restores the exact old behavior and its
+    performance characteristics, including that a root `*wildcard` OPTIONS route never backtracks
+    into a node some other method already claimed. Measured RED (`.first_match` default) → GREEN
+    (`.backtrack` default): the audit's own repro (`GET /users/:id` + `POST /users/new`) went from
+    405 to 200 for `GET /users/new`; 2 permanent regression tests fail under the reverted default,
+    pass under the fixed one.
+  - **F6 (stack footprint, no behavior change beyond the type/cap below):** `Ctx.params` is now
+    `*const Params` (was a 520 B-`@sizeOf` value, copied twice per dispatch — once into the local
+    that built it, once into `Ctx`); `max_params` is now 8, not 16 (no in-repo pattern or consumer
+    ever used more than 2), shrinking `Params` itself from 520 B to 264 B. `tryRedirect` is now
+    `noinline`, so its 4 KiB `Location` scratch buffer is no longer part of every dispatch's stack
+    frame regardless of whether a redirect is ever attempted (audit measured this costing the SAME
+    ~13 KiB whether or not a request redirects, or even whether `trailing_slash == .strict`).
+    Measured: `@sizeOf(Ctx)` 576 B → 64 B, `@sizeOf(Params)` 520 B → 264 B (comptime facts, old
+    values from a literal reconstruction of the pre-fix layout). One in-repo consumer needed a
+    one-line fix: `modules/validate`'s `PathParams` middleware passed `&ctx.params` (now already a
+    pointer) to `validateParams`.
+  - **F8 (open param-name footgun):** `add`/`addDoc` now reject a pattern that reuses one
+    `:name`/`*name` capture twice (`/:a/:a`) with `error.DuplicateParamName`. Before this such a
+    pattern was accepted and `params.get("a")` silently returned only the first value forever — a
+    typo (`/:id/:id` instead of `/:id/:sub_id`) that would otherwise never surface. Closes
+    `modules/openapi`'s own Š2 seam (`A1/openapi.md`): its `writePathParameters` dedup, added to
+    keep a duplicate-named pattern from producing a document OAS 3.1 §4.8.10 forbids, is no longer
+    reachable through any live `router.add` caller (kept as defense in depth, now unit-tested
+    directly instead of through `Router`).
+  - **F11 (open redirect footgun):** `add`/`addDoc` now reject a pattern containing an empty
+    segment anywhere but a single trailing one (`error.InvalidPattern` — `//evil.example/x`, `/a//b`
+    are now refused; `/x/`, one trailing empty segment, is still the documented distinct
+    trailing-slash route). Before this, a leading/interior empty segment was silently accepted into
+    the trie, and a trailing-slash redirect for a path under it emitted a protocol-relative
+    `Location` (`//evil.example/x`) a browser reads as `http://evil.example/x`.
+  - All 18 in-repo consumers re-verified unchanged (`scripts/modtest <m>`), `example-apps/http-service`
+    checked by hand (registers no pattern these two new `AddError` variants would reject, and its
+    only `ctx.params` use is `.get(...)`, unaffected by the pointer type) — pending `check-examples`.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (performance fix):** A1/router.md F4 closed.
   `matchRecDepth`'s backtracking search used to cost O(#nodes reachable within the query's
   length) rather than O(query length) — a route table with the same static segment name

@@ -81,41 +81,71 @@ OpenAPI 3.1 document.
 | Topic | Behavior |
 |---|---|
 | Precedence | static > `:param` > `*wildcard` per segment, with chi-style backtracking (an endpoint-less static prefix falls back to a param sibling) |
-| Params | `:param` never matches an empty segment; `*wildcard` must be the last segment and captures the remainder without the leading slash (may be `""`) |
+| Params | `:param` never matches an empty segment; `*wildcard` must be the last segment and captures the remainder without the leading slash (may be `""`); a pattern must not reuse one capture name twice (`error.DuplicateParamName`) or contain an empty segment other than a single trailing one (`error.InvalidPattern`) |
 | Matching | raw bytes — no percent-decoding, no case folding |
 | Middleware | outer→inner = registration order: router `use` → group → nested group → handler; chains are frozen into routes at add time, so `use` after any route ⇒ `error.RoutesAlreadyRegistered`; a fallback (404/405/auto-OPTIONS/redirect — see below) runs the chain of whichever group's prefix the request path falls under, router-level `use` alone when it falls under none — a `group("/api").use(requireAuth)` gate sees every response for `/api`, not only the ones a route actually served |
-| 404 / 405 | overridable `not_found` / `method_not_allowed` handlers; on 405 the router sets `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs |
+| 404 / 405 | overridable `not_found` / `method_not_allowed` handlers; on 405 the router sets `Allow` (registered methods in `http.Method` order, HEAD implied by GET) before the handler runs. `Allow` lists every method the *path shape* supports (RFC 9110 §15.5.6), not just whichever candidate the matcher tried first — see `method_precedence` below |
+| Method precedence | `method_precedence` (default `.backtrack`): when more than one registered pattern can produce the same path shape and they serve different methods, the matcher keeps trying siblings (static, then `:param`, then `*wildcard`) until one serves the request's method, instead of committing to the first one with ANY endpoint. `.first_match` restores the old (pre-2026-09-11) shadowing behavior verbatim — see the worked example below |
 | HEAD | auto-routes to GET when no explicit HEAD route (the `ResponseWriter` suppresses the body and keeps GET framing) |
 | Trailing slash | `.redirect` (default, httprouter): 301 for GET/HEAD, 308 otherwise, toward the slash variant that has the route, query preserved, run through the matched path's middleware chain (a gate registered there can deny it) — `.strict` (chi): 404. `/x` and `/x/` are always registrable as two distinct routes |
 | Path normalization | `normalize_path`, see below. Default `.remove_dot_segments`: normalizes the target itself now, so it holds for a caller driving `Router` directly too, not only behind `http.Server` |
 | Auto OPTIONS | `auto_options` (default off), see the worked example below |
 | Errors | handler/middleware errors propagate to `http.Server` → clean 500 when nothing was sent |
 
+## Method precedence — a worked example
+
+Registering an unrelated route for a *different* method used to be able to
+silently break dispatch for an *existing* route on a path shape it never
+touched:
+
+```zig
+try r.get("/users/:id", getUser);
+try r.post("/users/new", createUser); // added later, unrelated to getUser
+
+// GET /users/new -> getUser(id="new"), exactly as before POST was added
+// GET /users/7    -> getUser(id="7")
+// POST /users/new -> createUser
+// DELETE /users/new -> 405, Allow: GET, HEAD, POST (union of BOTH candidates
+//                       this path shape could have reached)
+```
+
+Before this (`method_precedence = .first_match`, still available):
+`matchRec` found `/users/new` via its static child ("new"), which already
+had a POST endpoint — so it returned that node immediately, *without ever
+looking at the request's method*, and `GET /users/new` turned into a 405
+the moment the unrelated `POST /users/new` route was registered, with
+nothing in that diff mentioning `/users/:id` at all (audit finding
+router-F5). The default now keeps trying `:id` (and, if that also doesn't
+serve the method, `*wildcard`) until one does.
+
+Cost: `.backtrack` can visit more of the trie on a genuine method miss than
+`.first_match` ever did (the incremental `min_reach` bound still prunes
+subtrees that cannot reach ANY endpoint, but it cannot prune by method) —
+set `method_precedence = .first_match` to keep the old, cheaper,
+shadowing-prone behavior if that trade-off matters more than the footgun.
+
 ## Auto OPTIONS — a worked precedence example
 
 `auto_options` (default `false`) answers an `OPTIONS` request `204 No Content`
 with `Allow` set, but only on a path that already has *other* routes and no
-explicit `OPTIONS` handler. It is **not** a catch-all, and a root wildcard
-registered for `OPTIONS` is not one either — both share the same precedence
-rule above the table (static > param > wildcard, with backtracking only
-when the matched node has *no* endpoint at all, for any method). Concretely:
+explicit `OPTIONS` handler. Under the default `.backtrack` precedence, a root
+wildcard registered for `OPTIONS` behaves like any other sibling candidate —
+it IS tried once a more specific route turns out not to serve `OPTIONS`:
 
 ```zig
 try r.get("/thing", getThing);
-try r.options("/*catchall", corsPreflight); // meant as "catch every OPTIONS"
+try r.options("/*catchall", corsPreflight); // "catch every OPTIONS"
 
-// OPTIONS /thing       -> 405 (Allow: GET, HEAD) — corsPreflight NEVER runs
+// OPTIONS /thing       -> corsPreflight runs (backtracks past /thing's GET-only node)
 // OPTIONS /nope/at/all -> corsPreflight runs (no other route exists there)
 ```
 
-Why: `matchRec` finds `/thing` via its static child, which already has a GET
-endpoint — so it returns that node immediately, *without ever looking at the
-request's method*. Backtracking to the wildcard sibling only happens when
-the matched node has no endpoint for *any* method, and `/thing` has one
-(GET). So a root `OPTIONS /*path` route never intercepts `OPTIONS` on a path
-that has other methods registered — set `auto_options = true` (or register
-an explicit `OPTIONS` route per path) instead of relying on a wildcard
-catch-all for CORS-style preflight handling.
+Under `method_precedence = .first_match` (the pre-2026-09-11 behavior), the
+first line above answers 405 instead: `matchRec` finds `/thing` via its
+static child, which already has a GET endpoint, and returns that node
+immediately without ever looking at the request's method — the wildcard
+sibling is never tried. Pick whichever precedence matches your intent
+explicitly rather than relying on which one happens to be the default.
 
 ## Path normalization (`normalize_path`)
 

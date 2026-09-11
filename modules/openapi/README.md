@@ -41,8 +41,13 @@ var docs: openapi.Endpoint = .{
 };
 try r.use(docs.middleware());          // middleware BEFORE routes (chi rule);
                                        // the spec is built ONCE, lazily, on the
-                                       // first request — register every
-                                       // documented route before that first hit
+                                       // first request — finish ALL registration
+                                       // (this and every other route) before the
+                                       // Router starts serving ANY request, not
+                                       // just before the first /openapi.json hit:
+                                       // `Router.routes()` is read unsynchronized,
+                                       // so a route added concurrently with that
+                                       // read races it (audit finding openapi-F10)
 try r.get("/health", health);          // undocumented → minimal operation
 try r.addDoc(.post, "/users", createUser, .{
     .summary = "Create a user",
@@ -66,8 +71,12 @@ defer gpa.free(json);
 | Determinism | paths in first-registration order; methods per path in `http.Method` declaration order; fixed key order; minified |
 | Path params | always `required: true`, `schema: {type: "string"}` (router captures raw path bytes); a `*wildcard` becomes a plain `{param}` (OpenAPI has no cross-segment template — FastAPI's `:path` compromise) |
 | `RouteDoc` | surfaces `summary`/`description`/`tags`/`requestBody`/`responses`/`deprecated`; `request_schema` is JSON-validated and re-emitted normalized under `requestBody.content."application/json".schema` (malformed → `error.InvalidRequestSchema`) |
+| `operationId` | deterministic: lowercase method + `_` + the converted path's segments joined by `_` (`GET /users/{id}` → `get_users_id`); unique by construction (see `error.PathCollision` below) |
 | Undocumented routes | minimal operation with default `responses: {"200": {"description": "Successful Response"}}` (FastAPI's default) |
-| Not emitted | the implicit HEAD→GET auto-route, 404/405 fallbacks, `operationId` (optional; no stable naming source in a fn-pointer table) |
+| Excluding a route | `Info.include: ?*const fn (router.Route) bool` — return `false` to omit a route from the document entirely (FastAPI's `include_in_schema=False`); `null` (default) includes everything |
+| Not emitted | the implicit HEAD→GET auto-route, 404/405 fallbacks |
+| Self-check | `Generator.build` parses its own output back and runs `validateOpenApi31` on it before returning — a malformed document is a `BuildError`, never served |
+| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, plus every `ConformanceError` variant (the self-check above) |
 
 **Endpoint** is an *intercepting* `router.Middleware` (the
 `metrics.Endpoint` pattern — `router.Handler` is a stateless fn pointer and
