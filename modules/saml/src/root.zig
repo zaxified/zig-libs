@@ -525,6 +525,20 @@ pub const ConsumeError = error{
     /// `Config.sp_entity_id` is not in an `<AudienceRestriction>` (or none
     /// present — fail closed).
     AudienceMismatch,
+    /// The assertion's `<Conditions>` carried a `<saml:Condition>` extension
+    /// element (an xsi:type this implementation does not evaluate). SAMLCore
+    /// §2.5.1.1 rule 3, verbatim: "If any sub-element or attribute of the
+    /// <Conditions> element cannot be evaluated, or if an element is
+    /// encountered that is not understood, then the validity of the
+    /// assertion cannot be determined and is considered to be
+    /// Indeterminate." Rule 3 continues (§2.5.1.1, unnumbered paragraph
+    /// after the four rules): "An assertion that is determined to be
+    /// Invalid or Indeterminate MUST be rejected by a relying party" — so
+    /// Indeterminate is a hard reject here, not a downgrade to Valid-minus-
+    /// one-condition. A1 audit F13, closed 2026-09-11 (Q1: fail-closed
+    /// per the norm, no consumer in this repo to preserve compatibility
+    /// for).
+    ConditionNotUnderstood,
     /// The assertion has no `<Subject>`/`<NameID>` to authenticate.
     SubjectMissing,
     /// No acceptable `<SubjectConfirmation>` (see the more specific Recipient /
@@ -1033,11 +1047,25 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
         one_time_use = childEl(cond, saml_ns, "OneTimeUse") != null;
 
         // Multiple <AudienceRestriction> are ANDed; SP must be in EVERY one.
+        //
+        // A bare `<saml:Condition>` (the extensibility element, SAMLCore
+        // §2.5.1.3 — abstract type, a concrete instance identifies its real
+        // condition type via xsi:type) used to fall through the `else` arm
+        // silently. SAMLCore §2.5.1.1 rule 3 requires the OPPOSITE: an
+        // element under <Conditions> that is not understood makes the
+        // assertion's condition validity Indeterminate, and Indeterminate
+        // "MUST be rejected by a relying party" — fail-OPEN against a
+        // restriction the IdP deliberately attached is exactly backwards
+        // (A1 audit F13). This module implements no extension condition
+        // types, so every `<Condition>` it sees is, by construction, one it
+        // does not understand.
         var saw_restriction = false;
         for (cond.children) |c| switch (c.content) {
             .element => |el| if (isEl(el, saml_ns, "AudienceRestriction")) {
                 saw_restriction = true;
                 if (!audienceContains(el, config.sp_entity_id, alloc)) return error.AudienceMismatch;
+            } else if (isEl(el, saml_ns, "Condition")) {
+                return error.ConditionNotUnderstood;
             },
             else => {},
         };

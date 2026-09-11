@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign round 2 (`QUESTIONS-ROUND-2.md` Q1/Q5,
+  audit `A1/saml.md`). BEHAVIOURAL:
+  - **F13 (MED)**: a `<saml:Condition>` extension element under
+    `<Conditions>` used to be silently ignored. SAMLCore §2.5.1.1 rule 3
+    says an unrecognized `<Conditions>` sub-element makes condition
+    validity Indeterminate, which MUST be rejected — this module
+    implements no extension condition types, so it now rejects with the
+    new `error.ConditionNotUnderstood` (additive to `ConsumeError`) as
+    soon as one is seen, before Audience/time checks finish. No consumer
+    in this repository (Q1: follow the norm even where it newly rejects
+    input the module previously accepted).
+  - **Not a fix**: the open question "does sender-vouches under `.either`
+    shortcut a later Bearer confirmation's checks" is closed as **not a
+    defect**. SAMLCore §2.4.1 states plainly that when more than one
+    `<SubjectConfirmation>` is present, satisfying any ONE is sufficient —
+    the module's existing first-valid-wins behavior is exactly what the
+    norm specifies. No code change; a citation and a regression test
+    (`test_eidas.zig`) were added to keep this from being re-raised as a
+    suspected bug.
 - **2026-09-10** — A1 audit: `Version` was written as `"2.0"` on every message this module
   emits but never read back on the way in — a `<Response>` or `<Assertion>` with `Version`
   missing or `"1.1"`/anything else was processed identically to a real SAML 2.0 message.

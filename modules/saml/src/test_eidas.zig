@@ -188,6 +188,68 @@ test "M12 teeth: Bearer confirmation with NO InResponseTo is rejected when allow
     try testing.expectError(error.InResponseToMismatch, saml.consumeResponseXml(alloc, s.xml, cfg));
 }
 
+// ── A1 audit F13: <Conditions> must reject what it does not understand ──────
+
+const conditions_with_unknown_condition =
+    "<saml:Conditions NotBefore=\"2024-06-01T11:59:00Z\" NotOnOrAfter=\"2024-06-01T12:05:00Z\">" ++
+    "<saml:AudienceRestriction><saml:Audience>https://sp.example.org/metadata</saml:Audience></saml:AudienceRestriction>" ++
+    "<saml:Condition xsi:type=\"ext:SomeVendorCondition\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:ext=\"urn:example:ext\"/>" ++
+    "</saml:Conditions>";
+
+test "F13 teeth: an unrecognized <saml:Condition> makes Conditions Indeterminate -> hard reject" {
+    // SAMLCore SS2.5.1.1 rule 3, verbatim: "If any sub-element or attribute
+    // of the <Conditions> element cannot be evaluated, or if an element is
+    // encountered that is not understood, then the validity of the
+    // assertion cannot be determined and is considered to be
+    // Indeterminate." And: "An assertion that is determined to be Invalid
+    // or Indeterminate MUST be rejected by a relying party." This module
+    // implements no <Condition> extension types, so every <Condition> it
+    // sees is -- by construction -- one it does not understand; it used to
+    // silently ignore it (fail OPEN against a restriction the IdP
+    // deliberately attached) instead of rejecting. The AudienceRestriction
+    // in this fixture is otherwise perfectly valid, isolating this one
+    // guard: without the fix, this assertion would be ACCEPTED.
+    const alloc = testing.allocator;
+    var s = try mint(alloc, bearer_confirmation, conditions_with_unknown_condition, "");
+    defer s.deinit(alloc);
+    try testing.expectError(error.ConditionNotUnderstood, saml.consumeResponseXml(alloc, s.xml, baseConfig(s.key)));
+}
+
+// ── SAMLCore SS2.4.1 <SubjectConfirmation>: OR semantics, verbatim in spec ──
+
+const sv_confirmation_then_bad_bearer =
+    sv_confirmation ++
+    "<saml:SubjectConfirmation Method=\"urn:oasis:names:tc:SAML:2.0:cm:bearer\">" ++
+    "<saml:SubjectConfirmationData NotOnOrAfter=\"2024-06-01T12:05:00Z\" Recipient=\"https://evil.example.org/acs\" InResponseTo=\"req-9988776655\"/>" ++
+    "</saml:SubjectConfirmation>";
+
+test "SAMLCore 2.4.1: a later INVALID SubjectConfirmation does not undo an earlier valid one under .either" {
+    // A1 audit A1/saml.md raised this as an open question ("sender-vouches
+    // under .either shortcuts Bearer checks") -- resolved by reading the
+    // actual normative text rather than guessing, per QUESTIONS-ROUND-2.md
+    // Q5 ("where the norm isn't silent, follow it"). SAMLCore SS2.4.1,
+    // <Subject> element, <SubjectConfirmation> [Zero or More], verbatim:
+    // "If more than one subject confirmation is provided, then satisfying
+    // ANY ONE of them is sufficient to confirm the subject for the purpose
+    // of applying the assertion." That is unconditional OR across the
+    // whole set -- it does not say "the first one, PROVIDED every other
+    // present confirmation also succeeds". This fixture carries a
+    // genuinely valid sender-vouches confirmation FIRST and a Bearer
+    // confirmation with a wrong Recipient SECOND; per the norm this MUST
+    // still be accepted, and returning early on the first fully-valid
+    // confirmation (this module's existing behaviour) is exactly that --
+    // not a defect.
+    const alloc = testing.allocator;
+    var s = try mint(alloc, sv_confirmation_then_bad_bearer, conditions_valid, "");
+    defer s.deinit(alloc);
+
+    var cfg = baseConfig(s.key);
+    cfg.subject_confirmation = .either;
+    var res = try saml.consumeResponseXml(alloc, s.xml, cfg);
+    defer res.deinit();
+    try testing.expectEqualStrings("alice@example.org", res.name_id);
+}
+
 // ── Level of Assurance ───────────────────────────────────────────────────────
 
 test "LoA: returned high meets required substantial -> accepted" {
