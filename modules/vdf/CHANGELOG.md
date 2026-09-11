@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (test-only):** A1/vdf.md F3 closed. Added two
+  tests using a real, independently-verified 9-base Arnault-class strong pseudoprime
+  (`3825123056546413051 = 149491 * 747451 * 34233211`, fools bases 2,3,5,7,11,13,17,19,23
+  simultaneously — verified against a from-scratch Python oracle, not taken from a citation):
+  (1) confirms the production `deterministicWitnessRandom` + `mr_rounds=64` correctly rejects
+  it (much stronger anchor than the existing OEIS A001262 base-2-only list); (2) pins the
+  audit's own "witness hard-wired to base 2 -> GREEN" mutation finding as a standing
+  regression test via a `FixedWitness` `std.Random` (no production code change — `isProbablePrime`
+  already takes `random: std.Random`). Measured RED (test 1's witness source swapped for a
+  fixed one) -> GREEN: 48/49 -> 49/49.
 - **2026-09-10** — A1 fix campaign, non-breaking (F6/F7/F8/F5/F10; F3/F4 left open):
   - **F8 (LOW):** `group.montPowPublic` no longer underflows on an empty
     exponent — a `usize` `exp_be.len - 1` that panicked in Debug/ReleaseSafe

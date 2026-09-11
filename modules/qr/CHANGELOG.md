@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **DOC FIX (SPEC.md only, no code change):** A1/qr.md's open "post-Forney"
+  item resolved by explanation + measurement rather than by finding an adversarial RS input.
+  The post-Forney syndrome re-check cannot catch a genuine Berlekamp-Massey miscorrection to a
+  different valid codeword -- that scenario, by construction of Forney's formula from the same
+  key equation Berlekamp-Massey and Chien already satisfied, always has zero syndromes.
+  `SPEC.md` said otherwise; corrected. What the re-check DOES catch, measured directly by
+  mutating the magnitude formula alone (Berlekamp-Massey/Chien left untouched): an
+  implementation bug in the Forney/Chien arithmetic chain -- the mutation made the very next
+  ordinary correction test fail at this exact line. `scripts/modtest qr`: 41/41 unaffected
+  (source unchanged); `scripts/modtest qrscan`: 30/30.
 - **2026-09-10** — **A1 fix campaign, F5 and F8.** Neither is a defect in the encoder or
   decoder's output, both are missing anchors.
 

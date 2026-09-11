@@ -947,6 +947,94 @@ test "isProbablePrime: strong pseudoprimes to base 2 are rejected — the witnes
     try testing.expect(isProbablePrime(p, prng.random()));
 }
 
+// F3 (A1/vdf.md): the existing anchor above uses OEIS A001262 (strong
+// pseudoprimes to base 2 alone, all < 10^5) -- a MUCH weaker adversary than
+// what the finding actually asked for ("an Arnault pseudoprime"). Below is a
+// real, independently-verified one: 3825123056546413051 = 149491 x 747451 x
+// 34233211 is a documented strong pseudoprime to EVERY ONE of the first nine
+// prime bases (2,3,5,7,11,13,17,19,23) simultaneously -- not fabricated for
+// this test: verified here against a from-scratch Python oracle (trial
+// factorization + the standard n-1=d*2^s strong-witness check per base,
+// independent of this file's own algorithm), not taken on faith from a
+// citation. `deterministicWitnessRandom`'s FULL 62-bit-range draw makes
+// actually landing on one of these 9 small fooling bases by chance
+// vanishingly unlikely (~25/2^62) -- consistent with the original audit's
+// own honest "could not construct a self-referential exploit, density out
+// of reach" conclusion, which this does not overturn. What it DOES add:
+// (1) a real measurement that the CURRENT production scheme (64 rounds,
+// witnesses from the full range) rejects this much stronger adversary, not
+// just the weak base-2-only list; (2) a permanent regression test for the
+// audit's OTHER live-but-unpinned finding -- "witness hard-wired to base 2
+// lets Fermat pseudoprimes through, and today's suite cannot see that
+// mutation" -- pinned here with a real number instead of left as an ad hoc
+// probe result.
+const arnault_class_pseudoprime: u64 = 3825123056546413051; // = 149491 * 747451 * 34233211
+
+/// A `std.Random` that always yields the same fixed witness value, however
+/// many bytes/rounds are drawn — models "witness diversity failed" (a
+/// hardcoded base, or a PRNG that degenerated to a constant), independent of
+/// `mr_rounds`'s actual value: repeating one non-detecting witness 64 times
+/// catches nothing MORE than repeating it once would.
+const FixedWitness = struct {
+    value: u64,
+
+    fn fill(ptr: *anyopaque, buf: []u8) void {
+        const self: *const FixedWitness = @ptrCast(@alignCast(ptr));
+        @memset(buf, 0);
+        var v = self.value;
+        var i = buf.len;
+        while (i > 0 and v != 0) {
+            i -= 1;
+            buf[i] = @truncate(v);
+            v >>= 8;
+        }
+    }
+
+    fn random(self: *const FixedWitness) std.Random {
+        return .{ .ptr = @constCast(self), .fillFn = fill };
+    }
+};
+
+test "isProbablePrime: a real 9-base Arnault-class pseudoprime is still rejected by the production witness stream" {
+    // Confirms the CURRENT scheme (deterministicWitnessRandom, mr_rounds=64)
+    // against an adversary far stronger than OEIS A001262 above: not just a
+    // base-2 pseudoprime, but one that fools all nine of the smallest prime
+    // bases at once.
+    const pm = try PrimeModulus.fromPrimitive(u64, arnault_class_pseudoprime);
+    var n_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &n_bytes, arnault_class_pseudoprime, .big);
+    var prng = deterministicWitnessRandom(&n_bytes);
+    try testing.expect(!isProbablePrime(pm, prng.random()));
+}
+
+test "isProbablePrime: a witness fixed to any base this number fools calls it prime — the mutation last session's suite could not see" {
+    // A1/vdf.md's own mutation ladder found "witness hard-wired to base 2 ->
+    // GREEN" but left it as a one-off probe result, not a standing test.
+    // Pinned here with a real, verified pseudoprime: EVERY one of the first
+    // nine prime bases individually fools it (not just base 2), so this is
+    // strictly stronger than what the ladder tried.
+    const witnesses = [_]u64{ 2, 3, 5, 7, 11, 13, 17, 19, 23 };
+    for (witnesses) |w| {
+        const pm = try PrimeModulus.fromPrimitive(u64, arnault_class_pseudoprime);
+        var fixed: FixedWitness = .{ .value = w };
+        // Full mr_rounds=64 on purpose: repeating the same non-detecting
+        // witness 64 times catches nothing a single round would not, which
+        // is exactly the point -- round COUNT alone is not what soundness
+        // rests on, witness DIVERSITY is, and that assumption is invisible
+        // to every test that only ever draws from a real random stream.
+        try testing.expect(isProbablePrime(pm, fixed.random()));
+    }
+
+    // Positive control: `FixedWitness` is not a stub that always answers
+    // "prime" regardless of input — an ORDINARY composite (not built to
+    // fool base 2) is still correctly rejected under the same fixed-witness
+    // source, so the `true` results above are about THIS number, not about
+    // `FixedWitness` being broken.
+    const ordinary_composite = try PrimeModulus.fromPrimitive(u64, 15); // 3 * 5, not a base-2 SPSP
+    var fixed2: FixedWitness = .{ .value = 2 };
+    try testing.expect(!isProbablePrime(ordinary_composite, fixed2.random()));
+}
+
 test "isProbablePrime: the round count is the repo-wide 64 (a tripwire, not a proof of strength)" {
     // What this CAN see: a round count lowered by a refactor. What it
     // CANNOT: whether 64 random witnesses are enough — that is the

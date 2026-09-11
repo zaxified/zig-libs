@@ -125,6 +125,11 @@ test {
     _ = @import("rules.zig");
     _ = @import("maps.zig");
     _ = @import("classifier.zig");
+    // F8 (A1/xdp-classifier.md): the offline packet-path interpreter +
+    // differential fuzz harness, not part of the public API (verification
+    // instrument only, see vm.zig's own doc comment) so it needs this
+    // explicit pull-in same as the three above.
+    _ = @import("vm.zig");
 }
 
 test "smoke: module imports and re-exports resolve" {

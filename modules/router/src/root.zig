@@ -654,7 +654,23 @@ pub const Router = struct {
         var node: *Node = &r.root;
         var nparams: usize = 0;
         var rest: ?[]const u8 = pattern[1..];
+        // F4 (A1/router.md): every node visited on the way down, in order —
+        // NOT including the final endpoint node itself — so `min_reach` can
+        // be updated bottom-up once the route's total length is known
+        // (`ancestors_len`, i.e. how many segments this pattern has).
+        // `max_path_segments` already bounds pattern depth (`error` below is
+        // unreachable in practice since a pattern longer than that could
+        // never `dispatch` a match anyway, but the array is sized to it for
+        // an honest bound rather than an assumed one).
+        var ancestors: [max_path_segments]*Node = undefined;
+        var ancestors_len: usize = 0;
+        var total_segments: u32 = 0;
         while (rest) |cur| {
+            if (ancestors_len < ancestors.len) {
+                ancestors[ancestors_len] = node;
+                ancestors_len += 1;
+            }
+            total_segments += 1;
             var seg = cur;
             var next: ?[]const u8 = null;
             if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
@@ -710,6 +726,19 @@ pub const Router = struct {
         if (node.endpoints[idx] != null) return error.DuplicateRoute;
         node.endpoints[idx] = .{ .handler = h, .chain = chain, .pattern = pattern };
         try r.rebuildAllow(node);
+
+        // F4 (A1/router.md): this endpoint is `total_segments` segments deep;
+        // `node` itself needs 0 more to reach it, and each recorded ancestor
+        // needs one more per step back toward the root. `@min` because a
+        // shared ancestor may already have a SHORTER route through some
+        // other branch — only ever shrinks, so insertion order never matters.
+        node.min_reach = @min(node.min_reach, 0);
+        var i: usize = ancestors_len;
+        while (i > 0) {
+            i -= 1;
+            const distance = total_segments - @as(u32, @intCast(i));
+            ancestors[i].min_reach = @min(ancestors[i].min_reach, distance);
+        }
     }
 
     comptime {
@@ -891,6 +920,30 @@ const Node = struct {
     endpoints: [method_count]?Endpoint = @splat(null),
     /// Precomputed Allow header value (non-empty iff any endpoint).
     allow: []const u8 = "",
+    /// Fewest ADDITIONAL segments a query needs, from this node, to reach any
+    /// endpoint in this node's subtree (0 once `hasEndpoint()`). Maintained
+    /// incrementally by `insert` (a route can only ever shrink an ancestor's
+    /// value, never grow it, so `@min` on every insert along the new route's
+    /// path keeps it correct without a separate rebuild pass). `maxInt` for a
+    /// node no successful `insert` has reached yet — never observed by
+    /// `matchRecDepth` in practice, since a node only exists because some
+    /// `insert` walked through it, and that same call finalizes this field
+    /// before returning (see `insert`'s bottom-up update).
+    ///
+    /// F4 (A1/router.md): `matchRecDepth`'s backtracking search is
+    /// O(#nodes reachable at the query's own length), which a route table
+    /// with the same static segment name repeated at many depths plus a
+    /// `:param` sibling at each one can blow up to O(k²) — measured 64,000
+    /// node visits / 3.98 ms for k=250 routes, an adversarial table a
+    /// prior session's memoization attempt could NOT fix (measured 20-25x
+    /// SLOWER: the adversarial construction's param subtrees are disjoint,
+    /// so no node is ever revisited — there is no redundant work to cache).
+    /// This field lets `matchRecDepth` reject a subtree in O(1) BEFORE
+    /// descending into it whenever the query's remaining segment count
+    /// cannot possibly reach ANY endpoint under it — sound (never rejects a
+    /// subtree that could still match) because it is a strictly NECESSARY
+    /// condition, not a guess.
+    min_reach: u32 = std.math.maxInt(u32),
 
     const Edge = struct { name: []const u8, node: *Node };
 
@@ -925,7 +978,23 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// depth = segment count, bounded by this module's own `max_path_segments`
 /// (see `matchRecDepth`) — not by whatever caps the path upstream.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
-    return matchRecDepth(node, rest, extra, params, 0);
+    return matchRecDepth(node, rest, extra, params, 0, segmentsRemaining(rest, extra));
+}
+
+/// Total segment count `rest`/`extra` still represent — computed ONCE per
+/// top-level `matchRec` call (not per recursion level, which would turn an
+/// O(1)-per-level count into an O(depth) rescan and reintroduce an O(depth²)
+/// cost of its own). `matchRecDepth` threads the result down, decrementing
+/// by exactly one per segment consumed (see its own doc comment, F4).
+fn segmentsRemaining(rest: ?[]const u8, extra: bool) u32 {
+    var n: u32 = if (extra) 1 else 0;
+    if (rest) |r| {
+        n += 1;
+        for (r) |c| {
+            if (c == '/') n += 1;
+        }
+    }
+    return n;
 }
 
 fn matchRecDepth(
@@ -934,13 +1003,18 @@ fn matchRecDepth(
     extra: bool,
     params: *Params,
     depth: u32,
+    remaining: u32,
 ) ?*const Node {
     // Router-owned recursion bound (see `max_path_segments`). A path this deep
     // cannot match a registered pattern, so refusing it costs nothing and the
     // frame count stops depending on the transport's path cap.
     if (depth > max_path_segments) return null;
     const r = rest orelse {
-        if (extra) return matchRecDepth(node, "", false, params, depth + 1);
+        // The virtual "" segment `extra` appends has not been consumed yet
+        // here -- `segmentsRemaining` already counted it, so `remaining` is
+        // passed through UNCHANGED; it is decremented below, the same as any
+        // other segment, once this call re-enters with `rest = ""`.
+        if (extra) return matchRecDepth(node, "", false, params, depth + 1, remaining);
         return if (node.hasEndpoint()) node else null;
     };
     var seg = r;
@@ -949,14 +1023,22 @@ fn matchRecDepth(
         seg = r[0..i];
         next = r[i + 1 ..];
     }
+    // F4 (A1/router.md): `seg` is about to be consumed, so every subtree
+    // reached from here has exactly `remaining - 1` segments left to work
+    // with -- computed once, shared by the static AND param checks below.
+    const remaining_after_seg = remaining - 1;
     if (node.static.get(seg)) |child| {
-        if (matchRecDepth(child, next, extra, params, depth + 1)) |n| return n;
+        if (child.min_reach <= remaining_after_seg) {
+            if (matchRecDepth(child, next, extra, params, depth + 1, remaining_after_seg)) |n| return n;
+        }
     }
     if (seg.len != 0) if (node.param) |p| {
-        const saved = params.len;
-        params.push(p.name, seg);
-        if (matchRecDepth(p.node, next, extra, params, depth + 1)) |n| return n;
-        params.len = saved;
+        if (p.node.min_reach <= remaining_after_seg) {
+            const saved = params.len;
+            params.push(p.name, seg);
+            if (matchRecDepth(p.node, next, extra, params, depth + 1, remaining_after_seg)) |n| return n;
+            params.len = saved;
+        }
     };
     if (node.wildcard) |wc| {
         if (wc.node.hasEndpoint()) {
@@ -2169,4 +2251,75 @@ test "match depth is bounded by the router, not by whatever caps the path upstre
     // The value itself, pinned — every assertion above is written in terms of
     // `max_path_segments`, so this is what stops the constant drifting.
     try testing.expectEqual(@as(usize, 256), max_path_segments);
+}
+
+fn processCpuNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "F4: a route table with the same static segment repeated at every depth plus a :param sibling matches in bounded time" {
+    // A1/router.md F4: `matchRecDepth`'s backtracking search cost used to be
+    // O(#nodes reachable within the query's own length) rather than O(query
+    // length) -- a route table with the same static segment name repeated at
+    // many depths, each with a `:param` sibling, is the adversarial shape:
+    // measured (audit + this campaign's own re-measurement) at ~64,000 node
+    // visits / ~2 ms CPU time for k=250 such routes probed with a
+    // (k+1)-segment path. A prior fix attempt this same day (memoizing
+    // visited nodes within one `matchRec` call) measured 20-25x SLOWER, not
+    // faster -- this construction's `:param` subtrees are disjoint, so
+    // backtracking never revisits a node and there is nothing to cache.
+    //
+    // Fixed instead by `Node.min_reach` (see its doc comment): every route
+    // in THIS construction has the exact same total length (`k+2` segments:
+    // `i` "a"s + one param + `(k-i)` "a"s + "end"), while the probe path has
+    // `k+1` -- one short of every single route -- so the fix rejects the
+    // ENTIRE table at the first descent from the root, before visiting
+    // anything.
+    const gpa = testing.allocator;
+    var r = Router.init(gpa);
+    defer r.deinit();
+
+    const k = 250;
+    var pat_buf: [4096]u8 = undefined;
+    for (0..k) |i| {
+        var w: Writer = .fixed(&pat_buf);
+        for (0..i) |_| w.writeAll("/a") catch unreachable;
+        w.writeAll("/:p") catch unreachable;
+        for (0..(k - i)) |_| w.writeAll("/a") catch unreachable;
+        w.writeAll("/end") catch unreachable;
+        try r.get(w.buffered(), hRoot);
+    }
+
+    var probe: std.ArrayList(u8) = .empty;
+    defer probe.deinit(gpa);
+    for (0..(k + 1)) |_| try probe.appendSlice(gpa, "/a");
+
+    // No match exists (every route ends in "/end", the probe never does) --
+    // this measures the cost of correctly REJECTING an adversarial path, not
+    // finding one.
+    var params: Params = .{};
+    try testing.expectEqual(@as(?*const Node, null), matchRec(&r.root, probe.items[1..], false, &params));
+
+    // Process CPU time, not wall time -- immune to a concurrent peer
+    // session's load on this machine (the audit's own measurement
+    // technique for this exact construction), averaged over reps so a
+    // single scheduling hiccup cannot flip the result.
+    const reps = 20;
+    const start = processCpuNs();
+    for (0..reps) |_| {
+        params.len = 0;
+        _ = matchRec(&r.root, probe.items[1..], false, &params);
+    }
+    const avg_ns = (processCpuNs() - start) / reps;
+
+    // Pre-fix this measured ~2,000,000 ns/call at k=250 (audit: ~4,000,000
+    // for the ~2x-costlier default `.redirect` trailing-slash path this
+    // test does not exercise). A 200 us ceiling is ~10x a fast machine's
+    // actual post-fix cost (single-digit microseconds) and ~10x below the
+    // pre-fix cost, wide enough to absorb ordinary noise while still
+    // catching a regression back to the O(k^2) shape.
+    errdefer std.debug.print("F4 probe: avg {d} ns/call over {d} reps (k={d})\n", .{ avg_ns, reps, k });
+    try testing.expect(avg_ns < 200_000);
 }

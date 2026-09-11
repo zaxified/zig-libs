@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** `Socket.dump`'s retry-attempt-cap and
+  `reply_type` filter (A1/tc.md F6) now have permanent tests. `dump()` was split into a thin
+  wrapper (unchanged, still calls `self.nl`) and a private `dumpVia(transport: anytype, ...)`
+  with the identical body, following the same `transport: anytype` idiom `netlink`'s own
+  `dumpOver`/`collectDumpPass` already use — this lets a scripted fixture drive the
+  `NLM_F_DUMP_INTR` restart path and a foreign-type record without a real socket or root.
+  Production path re-verified byte-for-byte unchanged before any test was added.
 - **2026-09-10** — **BEHAVIOURAL, not breaking (mop-up pass):** three more `A1/tc.md`
   findings closed (F3, F4, F9); F6/F10/F12
   remain open (F10 deliberately, deferred to the campaign's perf pass; F12 needs a user

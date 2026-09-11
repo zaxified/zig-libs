@@ -616,27 +616,48 @@ pub const Socket = struct {
         parent: ?Handle,
         comptime mode: ParentMatch,
     ) DumpError![]T {
+        return dumpVia(&self.nl, self.gpa, T, parseFn, msg_type, reply_type, ifindex, parent, mode);
+    }
+
+    /// The dump engine's actual body, generic over `transport` (F6, A1/tc.md):
+    /// production passes `&self.nl` (a `*netlink.Socket`, which already
+    /// offers exactly this shape); tests pass a scripted fixture so the
+    /// retry-attempt cap and the `reply_type` filter can be exercised
+    /// without a real socket, a network namespace or root. `transport` must
+    /// offer `nextSeq() u32`, `send(bytes) !void`, `recvDatagram() ![]const
+    /// u8` and a `portid` field/value.
+    fn dumpVia(
+        transport: anytype,
+        gpa: std.mem.Allocator,
+        comptime T: type,
+        comptime parseFn: fn ([]const u8) codec.Error!T,
+        msg_type: u16,
+        reply_type: u16,
+        ifindex: u32,
+        parent: ?Handle,
+        comptime mode: ParentMatch,
+    ) DumpError![]T {
         var attempt: usize = 0;
         retry: while (true) {
             attempt += 1;
-            const seq = self.nl.nextSeq();
+            const seq = transport.nextSeq();
             const req = try message.buildDump(
-                self.gpa,
+                gpa,
                 seq,
                 msg_type,
                 ifindex,
                 parent orelse Handle.unspec,
             );
-            defer self.gpa.free(req);
-            try self.nl.send(req);
+            defer gpa.free(req);
+            try transport.send(req);
 
             var out: std.ArrayList(T) = .empty;
-            errdefer out.deinit(self.gpa);
+            errdefer out.deinit(gpa);
             while (true) {
-                const dgram = try self.nl.recvDatagram();
+                const dgram = try transport.recvDatagram();
                 var it: codec.MessageIterator = .{ .buf = dgram };
                 while (it.next() catch return error.MalformedReply) |m| {
-                    switch (netlink.classifyDumpMessage(m, self.nl.portid, seq)) {
+                    switch (netlink.classifyDumpMessage(m, transport.portid, seq)) {
                         .skip => {},
                         .restart => {
                             // See the matching comment in `actions()` above:
@@ -647,12 +668,12 @@ pub const Socket = struct {
                             // `ArrayList.deinit` sets the receiver to
                             // `undefined` (F1 in A1/tc.md).
                             if (attempt < max_dump_attempts) {
-                                out.deinit(self.gpa);
+                                out.deinit(gpa);
                                 continue :retry;
                             }
                             return error.InconsistentDump;
                         },
-                        .done => return out.toOwnedSlice(self.gpa),
+                        .done => return out.toOwnedSlice(gpa),
                         .failed => |code| return netlink.writeErrorFromCode(code),
                         .overrun => return error.SystemResources,
                         .malformed => return error.MalformedReply,
@@ -663,7 +684,7 @@ pub const Socket = struct {
                             if (parent) |p| {
                                 if (!parentMatches(mode, p, item.parent, item.handle)) continue;
                             }
-                            try out.append(self.gpa, item);
+                            try out.append(gpa, item);
                         },
                     }
                 }
@@ -1602,6 +1623,118 @@ test "integration (netns/root): the kernel's extended ACK reaches lastErrorMessa
     // Kernels since 4.12 attach a reason string; older ones legitimately do
     // not, so only its shape is asserted.
     try testing.expect(sock.lastErrorMessage().len < 256);
+}
+
+// ── F6: a scripted transport for the dump engine ────────────────────────────
+//
+// `Socket.dump`'s retry-attempt cap and its `reply_type` filter (A1/tc.md
+// F6) had no test: exercising them for real needs a kernel that keeps
+// answering `NLM_F_DUMP_INTR` on demand, or a foreign-type record mixed into
+// a real dump — neither is reachable through `openOrSkip`'s live socket.
+// `dumpVia` being generic over `transport: anytype` (same idiom `netlink`'s
+// own `dumpOver`/`collectDumpPass` already use, with their own
+// `ScriptedTransport` fixture) means the retry loop can be driven by a
+// fixture instead, with no real socket and no privilege.
+const F6Step = union(enum) {
+    /// One `NLM_F_DUMP_INTR` message — triggers `.restart`.
+    restart,
+    /// `NLMSG_DONE` — ends the dump.
+    done,
+    /// A dump record of `msg_type` carrying a minimal, valid `tcmsg` (just
+    /// `ifindex`; no `TCA_*` attributes needed for `qdisc.parseQdisc`).
+    record: struct { msg_type: u16, ifindex: u32 },
+};
+
+const F6ScriptedTransport = struct {
+    gpa: std.mem.Allocator,
+    portid: u32,
+    seq: u32 = 0,
+    steps: []const F6Step,
+    i: usize = 0,
+    buf: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *F6ScriptedTransport) void {
+        self.buf.deinit(self.gpa);
+    }
+
+    fn nextSeq(self: *F6ScriptedTransport) u32 {
+        self.seq += 1;
+        return self.seq;
+    }
+
+    fn send(self: *F6ScriptedTransport, _: []const u8) DumpError!void {
+        _ = self;
+    }
+
+    fn recvDatagram(self: *F6ScriptedTransport) DumpError![]const u8 {
+        // Exhausting the script is a bug in the test, not the mutation under
+        // test — fail loudly rather than let the retry loop spin.
+        if (self.i >= self.steps.len) @panic("F6ScriptedTransport: script exhausted");
+        const step = self.steps[self.i];
+        self.i += 1;
+        self.buf.clearRetainingCapacity();
+        switch (step) {
+            .restart => {
+                const h = codec.appendHeader(self.gpa, &self.buf, codec.NLMSG_DONE, codec.NLM_F_DUMP_INTR, self.seq, self.portid) catch return error.SystemResources;
+                codec.finishHeader(&self.buf, h);
+            },
+            .done => {
+                const h = codec.appendHeader(self.gpa, &self.buf, codec.NLMSG_DONE, 0, self.seq, self.portid) catch return error.SystemResources;
+                codec.finishHeader(&self.buf, h);
+            },
+            .record => |r| {
+                const h = codec.appendHeader(self.gpa, &self.buf, r.msg_type, 0, self.seq, self.portid) catch return error.SystemResources;
+                var payload: [qdisc.tcmsg_len]u8 = @splat(0);
+                std.mem.writeInt(i32, payload[4..8], @bitCast(r.ifindex), native_endian);
+                codec.appendPadded(self.gpa, &self.buf, &payload) catch return error.SystemResources;
+                codec.finishHeader(&self.buf, h);
+            },
+        }
+        return self.buf.items;
+    }
+};
+
+test "F6: the dump engine tolerates exactly `max_dump_attempts` restarts, not one more" {
+    // Default max_dump_attempts = 4: three NLM_F_DUMP_INTR restarts, then a
+    // real record + NLMSG_DONE on the fourth attempt must still succeed.
+    const gpa = testing.allocator;
+    var t: F6ScriptedTransport = .{
+        .gpa = gpa,
+        .portid = 77,
+        .steps = &.{
+            .restart,
+            .restart,
+            .restart,
+            .{ .record = .{ .msg_type = RTM_NEWQDISC, .ifindex = 5 } },
+            .done,
+        },
+    };
+    defer t.deinit();
+    const items = try Socket.dumpVia(&t, gpa, Qdisc, qdisc.parseQdisc, RTM_GETQDISC, RTM_NEWQDISC, 5, null, .exact);
+    defer gpa.free(items);
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expectEqual(@as(u32, 5), items[0].ifindex);
+}
+
+test "F6: a dump record whose type does not match reply_type is excluded" {
+    // A record typed RTM_NEWTCLASS arrives mixed into an RTM_GETQDISC dump
+    // (e.g. a confused kernel path, or a future reply_type bug) — the
+    // `rec.type != reply_type` guard must drop it, not fold it into results
+    // that are supposed to be one type of object.
+    const gpa = testing.allocator;
+    var t: F6ScriptedTransport = .{
+        .gpa = gpa,
+        .portid = 77,
+        .steps = &.{
+            .{ .record = .{ .msg_type = RTM_NEWTCLASS, .ifindex = 5 } }, // wrong type
+            .{ .record = .{ .msg_type = RTM_NEWQDISC, .ifindex = 5 } }, // right type
+            .done,
+        },
+    };
+    defer t.deinit();
+    const items = try Socket.dumpVia(&t, gpa, Qdisc, qdisc.parseQdisc, RTM_GETQDISC, RTM_NEWQDISC, 5, null, .exact);
+    defer gpa.free(items);
+    try testing.expectEqual(@as(usize, 1), items.len);
 }
 
 test {

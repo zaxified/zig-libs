@@ -301,9 +301,27 @@ fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, o
 }
 
 /// Parse a montint big-endian result (slot-width, value `< m`) back into an
-/// `Fe` canonical mod `m`. Leading zero octets are stripped first.
+/// `Fe` canonical mod `m`.
+///
+/// paillier F4 (A1/paillier.md): this used to run `res` through
+/// `stripLeadingZeros` first -- a data-dependent scan over a secret-derived
+/// value (`x_p`/`x_q` in the CRT path), 2 of the audit's 106 ctgrind
+/// contexts. It was never load-bearing: `Fe`'s backing `Uint(max_bits)` is
+/// ONE comptime type shared by every modulus this module uses (`n`, `n_sq`,
+/// `p_sq`, `q_sq`), so `Fe.fromBytes`'s length gate
+/// (`std.crypto.ff.Uint.fromBytes`) checks `res.len` against the GLOBAL
+/// `Fe.encoded_bytes = max_bits/8`, never against `m`'s own (possibly
+/// narrower) width -- and `res.len` is always `M.encoded_bytes` from a
+/// `montint.Modint` slot capped at `mont_max_limbs` (`(max_bits+63)/64`),
+/// which by construction never exceeds `max_bits/8` bytes. `Uint.fromBytes`
+/// also always returns a value with `limbs_len == max_limbs_count` (its
+/// `Self.zero` starting point) regardless of how many bytes were supplied,
+/// so `Modulus.shrink`'s "limbs beyond m's own width must be zero" check
+/// sees the identical value whether `res` carries leading zero bytes or
+/// not. Passing `res` unstripped therefore parses to the exact same `Fe`,
+/// just without the value-dependent scan.
 fn feFromMontBytes(m: Modulus, res: []const u8) Fe {
-    return Fe.fromBytes(m, stripLeadingZeros(res), .big) catch unreachable; // value < m
+    return Fe.fromBytes(m, res, .big) catch unreachable; // value < m, res.len <= Fe.encoded_bytes always
 }
 
 /// `base^exp mod m` (secret exponent, constant-time), returning an `Fe`
@@ -314,6 +332,70 @@ fn montModexpSecret(mp: *const MontParams, m: Modulus, base: Fe, exp_be: []const
     var out: [modulus_sq_bytes]u8 = undefined;
     const res = montPowSecret(mp, &base_be, exp_be, &out);
     return feFromMontBytes(m, res);
+}
+
+/// `a*b mod m` (both operands secret, constant-time in value), returning an
+/// `Fe` canonical mod `m`.
+///
+/// paillier F2 (A1/paillier.md): `decrypt`'s last line used to be
+/// `sk.n.mul(l_fe, sk.mu)` -- `std.crypto.ff.Modulus.mul`, a standard-
+/// library function. Passing a 512-byte secret `Fe` BY VALUE into it makes a
+/// parameter-passing copy inside `Modulus.mul`'s OWN call frame, an address
+/// this module has no way to reach and zero -- measured (revert-and-
+/// remeasure against `probe_stack.zig`) as the one secret copy `decrypt`'s
+/// own zeroization still left on the stack after everything else was fixed.
+/// Same class of problem `bn254`'s `Fr.toBytes` hit calling into
+/// `std.crypto.ff` for a value-dependent step (that one a branch, this one a
+/// copy) and fixed the same way: never hand the sensitive step to a
+/// standard-library function whose internals this module cannot reach.
+/// `montint`'s own arithmetic is what `decrypt`'s other secret operations
+/// already route through and this module's own ctgrind harness has measured
+/// as branchless (`montint frames anywhere in stack: 0` residual beyond the
+/// documented L-division/CRT surface, see F3/F4) -- so doing the multiply
+/// here, entirely in stack this function owns, needs no new barrier, only
+/// the same `secureZero` discipline `montPowSecret` already uses for a
+/// secret exponent.
+fn montMulSecret(mp: *const MontParams, m: Modulus, a_ptr: *const Fe, b_ptr: *const Fe) Fe {
+    // `a_ptr`/`b_ptr`: callers pass a POINTER, not a value -- a `Fe` is
+    // 512 B, too large for register passing, so a by-value parameter here
+    // would cost an ABI-level copy at every call site (the caller's own
+    // frame, not this function's), exactly the kind of copy this fix cannot
+    // reach. A pointer costs one register; `.*` below is this function's
+    // OWN single copy, made once, addressable, and zeroed on every exit.
+    var a = a_ptr.*;
+    var b = b_ptr.*;
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&a));
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&b));
+
+    var a_be: [modulus_sq_bytes]u8 = undefined;
+    a.toBytes(&a_be, .big) catch unreachable;
+    defer std.crypto.secureZero(u8, &a_be);
+    var b_be: [modulus_sq_bytes]u8 = undefined;
+    b.toBytes(&b_be, .big) catch unreachable;
+    defer std.crypto.secureZero(u8, &b_be);
+
+    comptime var s: usize = mont_min_limbs;
+    inline while (s <= mont_max_limbs) : (s += mont_step) {
+        if (s == mp.L) {
+            const M = montint.Modint(s * 64);
+            const mod = montView(s, mp);
+            var av = beToLimbs(s, &a_be);
+            defer std.crypto.secureZero(u64, &av);
+            var bv = beToLimbs(s, &b_be);
+            defer std.crypto.secureZero(u64, &bv);
+            const a_mont = mod.toMontgomery(&av);
+            const b_mont = mod.toMontgomery(&bv);
+            var r_mont = mod.montMul(&a_mont, &b_mont);
+            defer std.crypto.secureZero(u64, &r_mont);
+            var r = mod.fromMontgomery(&r_mont);
+            defer std.crypto.secureZero(u64, &r);
+            var out_buf: [modulus_sq_bytes]u8 = undefined;
+            defer std.crypto.secureZero(u8, &out_buf);
+            mod.toBytesBE(&r, out_buf[0..M.encoded_bytes]);
+            return feFromMontBytes(m, out_buf[0..M.encoded_bytes]);
+        }
+    }
+    unreachable;
 }
 
 /// `base^exp mod m` (public exponent, variable-time in `exp`), returning an
@@ -521,6 +603,10 @@ pub const SecretKey = struct {
     /// (`c^λ mod n²`), used when `crt` is `null` (e.g. keys loaded via
     /// `fromBytes`, which carries no factors).
     n_sq_mont: MontParams,
+    /// Precomputed montint constants for `n` — `decrypt`'s final `L(x)*mu
+    /// mod n` multiply (paillier F2). PUBLIC, like `n`/`n_sq`/`n_sq_mont`
+    /// themselves (derived from `n` alone) — untouched by `deinit`.
+    n_mont: MontParams,
     /// CRT decryption parameters (the factors `p`,`q` and everything derived
     /// from them). Present for keys built by `fromPrimes`/`generate`; `null`
     /// for keys parsed from `n`/`lambda`/`mu` alone (`fromBytes`), which then
@@ -560,6 +646,7 @@ pub const SecretKey = struct {
             .lambda = lambda,
             .mu = mu,
             .n_sq_mont = montParamsFromModulus(n_sq),
+            .n_mont = montParamsFromModulus(n),
             .crt = null,
         };
     }
@@ -833,6 +920,7 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8) !KeyPair {
     const p_sq_fe = Fe.fromBytes(n_sq, stripLeadingZeros(&psq_buf), .big) catch return error.InvalidPrimes;
 
     const n_sq_mont = montParamsFromModulus(n_sq);
+    const n_mont = montParamsFromModulus(n);
 
     return .{
         .public = .{ .n = n, .n_sq = n_sq, .g = g, .n_sq_mont = n_sq_mont },
@@ -842,6 +930,7 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8) !KeyPair {
             .lambda = lambda,
             .mu = mu,
             .n_sq_mont = n_sq_mont,
+            .n_mont = n_mont,
             .crt = .{
                 .p_sq_mont = montParamsFromModulus(p_sq),
                 .q_sq_mont = montParamsFromModulus(q_sq),
@@ -1364,8 +1453,9 @@ pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
     // — fresh construction against sk.n per the Fe construction contract.
     const l_fe = Fe.fromBytes(sk.n, &l_buf, .big) catch return error.InvalidCiphertext;
 
-    // m = L(x) * mu mod n.
-    return sk.n.mul(l_fe, sk.mu);
+    // m = L(x) * mu mod n. Routed through montint (paillier F2), not
+    // std.crypto.ff.Modulus.mul -- see montMulSecret's doc comment.
+    return montMulSecret(&sk.n_mont, sk.n, &l_fe, &sk.mu);
 }
 
 // ── homomorphic ops (the whole point of this module) ─────────────────────
@@ -2611,18 +2701,28 @@ fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
 // pointer parameters and zeroing every remaining secret copy this module's
 // own code controls (see `decrypt`, `decryptNonCrtX`, `montPowSecret`).
 //
-// This regression test is that same probe, kept in-tree. It confirms 0 for
-// every pattern the fix targets — EXCEPT `mu`, where exactly 1 full copy
-// remains: traced (by reverting the fix locally and re-measuring, not by
-// inspection) to `decrypt`'s last line, `sk.n.mul(l_fe, sk.mu)` — passing a
-// secret `Fe` (512 B, too large for register passing) by value into
-// `std.crypto.ff.Modulus.mul`. That parameter-passing copy is made inside a
-// standard-library call this module does not control and has no address to
-// zero; giving `mul` a local copy of `mu` to pass instead (tried, measured)
-// made no difference; the copy lives on `mul`'s side of the call, not this
-// function's. Left OPEN in `A1/paillier.md` F2's disposition rather than
-// closed — the test pins the current count (1) so a future regression
-// (finding MORE than the known residual) still fails loudly.
+// This regression test is that same probe, kept in-tree. It originally
+// confirmed 0 for every pattern the fix targeted EXCEPT `mu`, where exactly
+// 1 full copy remained: traced (by reverting the fix locally and
+// re-measuring, not by inspection) to `decrypt`'s last line,
+// `sk.n.mul(l_fe, sk.mu)` — passing a secret `Fe` (512 B, too large for
+// register passing) by value into `std.crypto.ff.Modulus.mul`, whose own
+// parameter-passing copy this module had no address to zero.
+//
+// ✅ CLOSED 2026-09-11 (paillier F2): `montMulSecret` routes the multiply
+// through `montint` instead, and — the part that took a second round to
+// find — takes its operands by POINTER, not by value. Passing `sk.mu`
+// (still 512 B) by value into `montMulSecret` itself reproduced the exact
+// same class of unreachable copy, just relocated to the CALL SITE (an
+// ABI-level temporary in `decrypt`'s own frame that neither `decrypt`'s nor
+// `montMulSecret`'s own zeroing could name) — measured directly: switching
+// `montMulSecret`'s parameters from `Fe` to `*const Fe` took the probe's
+// count from 1 to 0, nothing else changed. The general lesson (confirmed
+// twice now, once by `bn254`'s `Fr.toBytes` for a branch and once here for
+// a copy): a secret value that is ever passed BY VALUE anywhere on its path
+// leaves a copy at that call's boundary that the caller cannot reach —
+// pointers all the way down, or the copy has to be findable and zeroed at
+// the exact frame it lands on.
 const stack_probe_region = 1 << 20; // 1 MiB
 
 noinline fn stackProbePaint(pat: u8) void {
@@ -2653,7 +2753,7 @@ fn stackProbeCount(hay: []const u8, needle: []const u8) usize {
     return n;
 }
 
-test "decrypt: no secret full-value copy survives on the dead stack, except the known std.crypto.ff mu residual (paillier F2, ReleaseFast only)" {
+test "decrypt: no secret full-value copy survives on the dead stack (paillier F2, ReleaseFast only)" {
     if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest; // undefined poisoning (ReleaseSafe/Debug) defeats this probe
     var prng = std.Random.DefaultPrng.init(0x57ac4);
     const random = prng.random();
@@ -2690,7 +2790,7 @@ test "decrypt: no secret full-value copy survives on the dead stack, except the 
     const pats = [_]Pattern{
         .{ .name = "lambda (limb image)", .bytes = &lam_raw, .allow = 0 },
         .{ .name = "lambda (big-endian)", .bytes = std.mem.trimStart(u8, &lam_be, "\x00"), .allow = 0 },
-        .{ .name = "mu (limb image)", .bytes = &mu_raw, .allow = 1 }, // known std.crypto.ff residual, see comment above
+        .{ .name = "mu (limb image)", .bytes = &mu_raw, .allow = 0 }, // F2 CLOSED 2026-09-11 -- see the comment block above
         .{ .name = "mu (big-endian)", .bytes = std.mem.trimStart(u8, &mu_be, "\x00"), .allow = 0 },
         .{ .name = "dp (CRT exponent)", .bytes = std.mem.trimStart(u8, &dp, "\x00"), .allow = 0 },
         .{ .name = "dq (CRT exponent)", .bytes = std.mem.trimStart(u8, &dq, "\x00"), .allow = 0 },

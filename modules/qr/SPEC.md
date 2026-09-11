@@ -42,10 +42,36 @@ on inputs neither test covers.
 
 **A correction that satisfies the locator is still re-checked.** After Forney
 applies the magnitudes, the syndromes are recomputed and a non-zero result
-returns `Uncorrectable`. Berlekamp-Massey can converge on a locator that
-"corrects" a block into different wrong data when the error count exceeds
-capability; without the re-check that comes back as a confident wrong message,
-which is the single worst outcome this module could produce.
+returns `Uncorrectable`.
+
+⚠ **Corrected 2026-09-11 (A1/qr.md, the audit's open "post-Forney" item):**
+the paragraph used to say this re-check exists because Berlekamp-Massey can
+converge on a locator that "corrects" a block into different wrong data when
+the error count exceeds capability. That miscorrection SHAPE is real (it is
+the classical failure mode of a bounded-distance decoder past its guaranteed
+radius), but it is not what this re-check catches: when Berlekamp-Massey's
+key equation and Chien's root count agree (`l` roots for a degree-`l`
+locator, `rsDecode`'s own `count != l` guard just above), Forney's formula is
+*algebraically derived* to zero every syndrome of the corrected word — that
+identity holds regardless of whether the locator names the block's TRUE
+error positions or a different, equally self-consistent (but wrong) set. A
+genuine miscorrection to another valid codeword is therefore invisible to a
+syndrome check by construction, not just in practice; the audit's own
+3.4-million-block adversarial sweep and this session's own attempt both
+independently found zero inputs that trip this line, which is consistent
+with — not merely unlucky against — that argument.
+
+What the re-check DOES catch, measured directly: an inconsistency introduced
+anywhere between the key equation and the applied correction — i.e. a coding
+BUG in this file, not an adversarial QR symbol. Mutating the magnitude
+formula alone (`gf.mul(num, gf.inverse(den))` → `gf.mul(num, den)`, leaving
+Berlekamp-Massey and Chien untouched and therefore still self-consistent)
+made the re-check fire on the FIRST ordinary correction test that exercises
+it, exactly at this line. That is real, load-bearing protection — defense in
+depth against a regression in the Forney/Chien arithmetic above, the same
+role a re-derived invariant check plays anywhere else in this codebase — it
+is just not a defense against an adversarially chosen RS error pattern, and
+naming it as one overstated what a syndrome check can see.
 
 **Rendering is bolted on, not built in.** `writeSvg` and `writeTerminal` live in
 `render.zig`; the codec does not call them and has no pixel format in it. They
