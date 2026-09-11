@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **BREAKING:** `chain`'s `x` parameter is now `*const [n]u8`
+  instead of `[n]u8` by value (A1 audit F3 partial mitigation — removes one of
+  `chain`'s two stack copies of the WOTS+ chain value; measured RED->RED, the
+  finding stays open since `wotsSkGen`/`wotsSign`'s own whole-array copies
+  dominate the residue, not this one). Any external caller passing `chain` a
+  value directly now needs `&value` instead.
 - **2026-09-07** — Test-only, no production change: `fuzzVerify` had never looked at a
   signature's content. It opened `smith.bytes(&sig_buf)` and then drew
   `smith.valueRangeAtMost(u16, 0, signature_length)`; a ranged `Smith` draw returns the
