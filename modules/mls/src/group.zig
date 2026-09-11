@@ -61,25 +61,35 @@
 //!     signature on every `LeafNode` it installs. It does not check
 //!     lifetimes, credential acceptability, or capability/extension
 //!     support.
-//!   * **Atomicity.** A Commit that fails a check after the tree has been
-//!     mutated leaves the `Group` unusable, and it says so: the object is
-//!     marked poisoned and every later call returns
-//!     `error.GroupPoisoned`. Real rollback means processing into a copy of
-//!     the tree, which is a memory-model change, not a bug fix — noted in
-//!     `SPEC.md`'s Backlog rather than half-done here.
 //!
-//! **Memory model: one arena for retained state, the caller's allocator for
+//! **Atomicity: a Commit is adopted whole, or not at all.** `processCommit`
+//! and `createCommit` run every step that writes group state against a
+//! WORKING COPY (`fork`) and swap it in only after the last step that can
+//! fail (`adopt`). A refusal at any point — a check, a missing PSK, a failed
+//! allocation — leaves the object exactly as it was, able to take the next
+//! Commit or the same one again. It matters most where the sender is
+//! nobody: an external Commit is signed with a key it carries itself, so a
+//! stranger holding a published `GroupInfo` reaches §12.4.2's last bullet —
+//! and until 2026-09-11 one such message left the group unusable for every
+//! member that received it (`error.GroupPoisoned`, since removed).
+//!
+//! **Memory model: arenas for retained state, the caller's allocator for
 //! scratch.** This module's decoders alias their input buffers (see
 //! `tree.zig`'s convention: "aliased bytes must outlive the tree"), and a
 //! group's ratchet tree accumulates leaves aliasing a DIFFERENT buffer per
 //! epoch — the Welcome's `GroupInfo`, then each Commit's `UpdatePath`, then
 //! each Add proposal's `KeyPackage`. Deep-copying every `LeafNode` would
 //! mean a second, parallel implementation of `tree.zig`'s whole decode
-//! layer. So `Group` owns an arena, copies each message it retains state
-//! from into it, and decodes from that copy; group state is retained
-//! wholesale and dropped wholesale by `deinit`, which is also how MLS
-//! itself treats it. Verification scratch (transcript inputs, TBS buffers,
-//! resolutions) uses `gpa` and is freed immediately.
+//! layer. So `Group` copies each message it retains state from into an
+//! arena and decodes from that copy, and group state is dropped wholesale
+//! by `deinit`, which is also how MLS itself treats it. Three kinds of
+//! arena: `arena`, for what the group was created from; `epoch_arenas`, one
+//! per adopted Commit, holding what that Commit contributed; `tree_arena`,
+//! owning the current tree's containers and replaced by every Commit. A
+//! refused Commit's arenas are released instead of joining them, and every
+//! arena wipes its memory on release (`WipingArena`), because group state
+//! carries key material. Verification scratch (transcript inputs, TBS
+//! buffers, resolutions) uses `gpa` and is freed immediately.
 //!
 //! Model: RFC 9420 §12.2, §12.3, §12.4.2, and the receiving half of
 //! §12.4.3.1. Anchored end-to-end against the official
@@ -103,9 +113,6 @@ const treemath = @import("treemath.zig");
 const welcome_mod = @import("welcome.zig");
 
 pub const Error = error{
-    /// A previous `processCommit` failed after mutating the tree. See this
-    /// file's doc comment on atomicity.
-    GroupPoisoned,
     /// The message was a `PrivateMessage`. Encrypted handshake messages
     /// need the §9 secret tree driven per epoch, which this object does not
     /// own — a scope boundary, not a decode failure.
@@ -185,8 +192,9 @@ pub const Error = error{
     /// bullet has nothing to check against. A removed member therefore
     /// cannot reach the new epoch at all — no implementation can.
     ///
-    /// The group object is left AT THE PREVIOUS EPOCH and unpoisoned, which
-    /// is exactly the state the note's parenthesis describes: still able to
+    /// The group object is left AT THE PREVIOUS EPOCH, untouched — as every
+    /// refused Commit leaves it — which is exactly the state the note's
+    /// parenthesis describes: still able to
     /// decrypt late messages from the epoch that just ended, and — because
     /// the caller now knows — obliged to stop sending and to drop the state
     /// promptly. `Group` cannot enforce either of those; the deletion is the
@@ -313,19 +321,126 @@ pub const Policy = struct {
     check_key_uniqueness: bool = true,
 };
 
+/// An arena whose memory is wiped on its way back to the allocator beneath
+/// it. Every arena a `Group` owns is one of these, because group state
+/// carries key material — decrypted path secrets, pending Updates' private
+/// keys, secrets inside decoded structures — and an arena hands its memory
+/// back in whole chunks, with no chance to single a secret out.
+///
+/// It is also what makes a REFUSED Commit leave nothing behind: the Commit's
+/// working state lives in arenas of its own (`Group.fork`), and releasing
+/// them on the refusal path wipes every byte the Commit derived.
+///
+/// Heap-allocated so the arena's child allocator — which points at `wiper`
+/// — stays valid when the owning `Group` value is moved.
+const WipingArena = struct {
+    wiper: Wiper,
+    arena: std.heap.ArenaAllocator,
+
+    fn create(gpa: std.mem.Allocator) !*WipingArena {
+        const self = try gpa.create(WipingArena);
+        self.wiper = .{ .child = gpa };
+        self.arena = .init(self.wiper.allocator());
+        return self;
+    }
+
+    fn destroy(self: *WipingArena, gpa: std.mem.Allocator) void {
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+
+    fn allocator(self: *WipingArena) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    /// The arena's child: forwards to `child`, and zeroes every byte on its
+    /// way back.
+    const Wiper = struct {
+        child: std.mem.Allocator,
+
+        fn allocator(self: *Wiper) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *Wiper = @ptrCast(@alignCast(ctx));
+            return self.child.rawAlloc(len, alignment, ra);
+        }
+
+        /// Growing in place gives nothing back, so it is forwarded.
+        /// Shrinking in place would hand a tail back without passing it
+        /// through `free`, so it is refused; the arena then allocates afresh
+        /// and returns the old chunk through `free`, wiped.
+        fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *Wiper = @ptrCast(@alignCast(ctx));
+            if (new_len < memory.len) return false;
+            return self.child.rawResize(memory, alignment, new_len, ra);
+        }
+
+        /// A remap may MOVE the buffer and release the old location without
+        /// a `free`, so there is none: the caller falls back to
+        /// allocate-copy-free, and the old buffer is wiped on the way out.
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *Wiper = @ptrCast(@alignCast(ctx));
+            std.crypto.secureZero(u8, memory);
+            self.child.rawFree(memory, alignment, ra);
+        }
+    };
+};
+
+/// A copy of `t` whose CONTAINERS — the node array, each leaf's lists, each
+/// parent's `unmerged_leaves`, i.e. exactly what `RatchetTree.deinit` would
+/// free — are fresh allocations from `allocator`, while every byte field
+/// still aliases the buffer it aliased before.
+///
+/// That split is what a Commit's tree edits need, and no more: `blank`
+/// deinits the node it replaces, `addLeaf` swaps an `unmerged_leaves` for a
+/// longer one, a growth or a truncation `realloc`s the node array. Every one
+/// of them writes or frees a CONTAINER, and now does it to the copy; none
+/// writes through a byte field, they only ever replace one. `allocator` must
+/// be an arena released as a whole — a partial copy is not unwound.
+fn cloneTree(allocator: std.mem.Allocator, t: *const tree.RatchetTree) !tree.RatchetTree {
+    const nodes = try allocator.alloc(?tree.Node, t.nodes.len);
+    for (t.nodes, nodes) |src, *dst| {
+        dst.* = if (src) |n| switch (n) {
+            .leaf => |l| .{ .leaf = try dupLeafNode(allocator, l) },
+            .parent => |p| blk: {
+                var q = p;
+                q.unmerged_leaves = try allocator.dupe(u32, p.unmerged_leaves);
+                break :blk .{ .parent = q };
+            },
+        } else null;
+    }
+    return .{ .allocator = allocator, .nodes = nodes };
+}
+
 pub fn Group(comptime S: type) type {
     return struct {
         const Self = @This();
 
-        /// Scratch allocator, also the owner of `arena`.
+        /// Scratch allocator, also the owner of every arena below.
         gpa: std.mem.Allocator,
-        /// Retained, wire-aliased group state — see this file's doc comment.
-        /// Heap-allocated so `arena.allocator()` stays valid when a `Group`
-        /// value is moved (returned from `fromWelcome`, stored in a struct).
-        arena: *std.heap.ArenaAllocator,
-
-        /// Set once a `processCommit` has failed after mutating the tree.
-        poisoned: bool = false,
+        /// Retained, wire-aliased state from the group's CREATION — the
+        /// founder's KeyPackage, the Welcome, the GroupInfo — plus what
+        /// `updateLeaf` builds. See this file's doc comment. Heap-allocated
+        /// so `arena.allocator()` stays valid when a `Group` value is moved
+        /// (returned from `fromWelcome`, stored in a struct).
+        arena: *WipingArena,
+        /// One arena per ADOPTED Commit: the message copy the tree's new
+        /// leaves alias, the decoded structures, the path secrets it handed
+        /// down. Retained until `deinit`, like `arena` (see `SPEC.md`'s
+        /// Backlog on growth with session length).
+        epoch_arenas: std.ArrayList(*WipingArena) = .empty,
+        /// Owner of `ratchet_tree`'s containers — the node array and the
+        /// lists `RatchetTree.deinit` would free — since the last adopted
+        /// Commit, or `null` while they are still in `arena`. Every Commit
+        /// builds its tree in a fresh one (`fork`) and `adopt` releases the
+        /// previous one, so the tree costs one copy, not one per epoch.
+        tree_arena: ?*WipingArena = null,
 
         policy: Policy = .{},
 
@@ -401,8 +516,13 @@ pub fn Group(comptime S: type) type {
         pub const ResumptionEntry = struct { epoch: u64, secret: [S.Nh]u8 };
 
         pub fn deinit(self: *Self) void {
-            self.arena.deinit();
-            self.gpa.destroy(self.arena);
+            const gpa = self.gpa;
+            for (self.epoch_arenas.items) |a| a.destroy(gpa);
+            self.epoch_arenas.deinit(gpa);
+            if (self.tree_arena) |t| t.destroy(gpa);
+            self.arena.destroy(gpa);
+            self.secrets.wipe();
+            std.crypto.secureZero(u8, &self.my_encryption_priv);
             self.* = undefined;
         }
 
@@ -439,8 +559,106 @@ pub fn Group(comptime S: type) type {
             return self.ratchet_tree.nLeaves();
         }
 
-        fn check(self: *const Self) !void {
-            if (self.poisoned) return error.GroupPoisoned;
+        // ── the Commit transaction ────────────────────────────────────────
+
+        /// The working copy one Commit is built on. `fork` makes it,
+        /// `reserveAdoption` and `adopt` swap it in, and `discard` — on every
+        /// exit — releases whatever was not adopted.
+        const Fork = struct {
+            /// The group as it will be if the Commit completes.
+            state: Self,
+            /// Owner of `state.ratchet_tree`'s containers.
+            tree: *WipingArena,
+            adopted: bool = false,
+
+            /// A refused Commit's working tree is released (wiped, like
+            /// every arena here); an adopted one has been handed to the
+            /// group. Either way this stack copy of the epoch secrets and of
+            /// the leaf private key is zeroed: after a refusal it is the only
+            /// copy of secrets nobody may keep, after an adoption it is a
+            /// duplicate of what the group now holds.
+            fn discard(f: *Fork) void {
+                if (!f.adopted) f.tree.destroy(f.state.gpa);
+                f.state.secrets.wipe();
+                std.crypto.secureZero(u8, &f.state.my_encryption_priv);
+            }
+        };
+
+        /// A working copy of this group for one Commit to write into. The
+        /// struct is copied by value, and two parts deeper, because the
+        /// Commit's steps edit them IN PLACE:
+        ///
+        ///   * the ratchet tree's containers (`cloneTree`), into an arena of
+        ///     their own that becomes `tree_arena` on adoption;
+        ///   * `my_path_secrets`, which `adoptPathSecrets` edits in place —
+        ///     into `msgs`, the Commit's own arena.
+        ///
+        /// `resumption_history` is appended to, and `reserveAdoption` does
+        /// that without touching the live buffer. Everything else is either
+        /// replaced wholesale by the adopt step (the §8.1 fields, the
+        /// transcript hashes, the secrets, the leaf private key) or only read
+        /// before it (`pending_updates`, `policy`, the arenas).
+        fn fork(self: *const Self, msgs: std.mem.Allocator) !Fork {
+            const tree_arena = try WipingArena.create(self.gpa);
+            errdefer tree_arena.destroy(self.gpa);
+            var state = self.*;
+            state.ratchet_tree = try cloneTree(tree_arena.allocator(), &self.ratchet_tree);
+            state.my_path_secrets = .empty;
+            try state.my_path_secrets.appendSlice(msgs, self.my_path_secrets.items);
+            return .{ .state = state, .tree = tree_arena };
+        }
+
+        /// The last fallible step of a Commit: the two allocations `adopt`
+        /// needs — room for this epoch in `epoch_arenas`, and room for one
+        /// more entry in the working copy's `resumption_history`.
+        ///
+        /// The history is never grown IN PLACE. With spare capacity, `adopt`
+        /// writes the entry past the live length, where the live object never
+        /// reads; without it, the working copy moves to a fresh buffer in
+        /// `msgs`. `ArrayList.append` would `realloc` the shared buffer
+        /// instead — and a realloc that has to move paints the old buffer
+        /// `undefined` in safe builds: the LIVE object's buffer, before the
+        /// Commit is known to have succeeded.
+        fn reserveAdoption(self: *Self, f: *Fork, msgs: std.mem.Allocator) !void {
+            const h = &f.state.resumption_history;
+            if (h.items.len == h.capacity) {
+                const buf = try msgs.alloc(ResumptionEntry, @max(8, 2 * h.capacity));
+                @memcpy(buf[0..h.items.len], h.items);
+                h.* = .{ .items = buf[0..h.items.len], .capacity = buf.len };
+            }
+            try self.epoch_arenas.ensureUnusedCapacity(self.gpa, 1);
+        }
+
+        /// Swaps a finished working copy in. Cannot fail — `reserveAdoption`
+        /// made the only allocations it needs — so a Commit is adopted whole
+        /// or not at all. `msgs` is the Commit's own arena; it joins
+        /// `epoch_arenas`.
+        fn adopt(self: *Self, f: *Fork, msgs: *WipingArena) void {
+            const gpa = self.gpa;
+            const next = &f.state;
+            next.resumption_history.appendAssumeCapacity(.{ .epoch = next.epoch, .secret = next.secrets.resumption_psk });
+            // Pending Updates are epoch-scoped: §12.1 binds a proposal to the
+            // epoch it was sent in, so any that this Commit did not apply can
+            // never be applied, and their private keys are dead — wiped here
+            // rather than merely forgotten.
+            for (next.pending_updates.items) |*p| std.crypto.secureZero(u8, &p.encryption_priv);
+            next.pending_updates.clearRetainingCapacity();
+            next.epoch_arenas = self.epoch_arenas;
+            next.epoch_arenas.appendAssumeCapacity(msgs);
+            next.tree_arena = f.tree;
+
+            const old_tree = self.tree_arena;
+            const old_history = self.resumption_history.items;
+            self.* = next.*;
+            f.adopted = true;
+
+            // What the previous epoch held that nothing reads any more: its
+            // tree containers, and — if the history moved — the superseded
+            // copy of every remembered resumption PSK.
+            if (old_history.ptr != self.resumption_history.items.ptr) {
+                for (old_history) |*e| std.crypto.secureZero(u8, &e.secret);
+            }
+            if (old_tree) |t| t.destroy(gpa);
         }
 
         // ── §11: creating a group ─────────────────────────────────────────
@@ -493,10 +711,8 @@ pub fn Group(comptime S: type) type {
         /// §8.2's `confirmed_transcript_hash_[0]` is the ZERO-LENGTH string,
         /// not a zero-filled digest; see the `confirmed_len` field.
         pub fn create(gpa: std.mem.Allocator, params: CreateParams) !Self {
-            const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
-            errdefer gpa.destroy(arena_ptr);
-            arena_ptr.* = .init(gpa);
-            errdefer arena_ptr.deinit();
+            const arena_ptr = try WipingArena.create(gpa);
+            errdefer arena_ptr.destroy(gpa);
             const arena = arena_ptr.allocator();
 
             // The tree keeps this leaf, so decode it from an arena-owned copy.
@@ -635,10 +851,8 @@ pub fn Group(comptime S: type) type {
         /// caller: verify the tree hash, verify the parent-hash chain, and
         /// find this client's own leaf.
         pub fn fromWelcome(gpa: std.mem.Allocator, params: WelcomeParams) !Self {
-            const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
-            errdefer gpa.destroy(arena_ptr);
-            arena_ptr.* = .init(gpa);
-            errdefer arena_ptr.deinit();
+            const arena_ptr = try WipingArena.create(gpa);
+            errdefer arena_ptr.destroy(gpa);
             const arena = arena_ptr.allocator();
 
             // ── our own KeyPackage: the ref that selects our slot, and the
@@ -888,12 +1102,19 @@ pub fn Group(comptime S: type) type {
         ///   * §12.3's last-but-one bullet substitutes §8.3's `init_secret`
         ///     for the previous epoch's.
         pub fn processCommit(self: *Self, params: CommitParams) !void {
-            try self.check();
-            const arena = self.arena.allocator();
             const gpa = self.gpa;
+            // Everything this Commit allocates goes here, from the copy of
+            // the message on. It joins the group's retained state only if
+            // the Commit is adopted; a refusal at any step — a failed check,
+            // a missing PSK, a failed allocation — releases it, wiped (by
+            // bullet 8 it holds decrypted path secrets).
+            const msgs = try WipingArena.create(gpa);
+            var adopted = false;
+            defer if (!adopted) msgs.destroy(gpa);
+            const arena = msgs.allocator();
 
             // The Commit's UpdatePath contributes a LeafNode the tree keeps,
-            // so the tree must alias a buffer the group owns.
+            // so the tree must alias a buffer the group will own.
             const msg_copy = try arena.dupe(u8, params.commit_msg);
             var reader = codec.Reader.init(msg_copy);
             const msg = try framing.MLSMessage.decode(arena, &reader);
@@ -981,9 +1202,10 @@ pub fn Group(comptime S: type) type {
             //   * the tree is still the one this client belongs to, so the
             //     answer does not depend on whether §7.7's truncation is
             //     about to drop this client's own leaf out of the array;
-            //   * the poison flag is not yet set, so the previous epoch's
-            //     state survives for the "short time to decrypt late
-            //     messages" the same note allows.
+            //   * nothing has been written yet — and a refusal writes
+            //     nothing anyway — so the previous epoch's state survives
+            //     for the "short time to decrypt late messages" the same
+            //     note allows.
             //
             // Deliberately AFTER §12.2's validation: a removed member is
             // still a conformant peer and must not report a malformed
@@ -993,8 +1215,15 @@ pub fn Group(comptime S: type) type {
                 else => {},
             };
 
-            // From here on the tree is mutated; any failure poisons.
-            self.poisoned = true;
+            // Bullets 5-13 write group state, so from here on they write a
+            // WORKING COPY (`fork`), and `self` is untouched until `adopt`
+            // swaps the finished copy in — the one step after which the
+            // Commit counts as processed. The copy is made HERE, after every
+            // check that needs no mutation, so a message refused by its
+            // signature, its membership tag or §12.2 costs no copy at all.
+            var txn = try self.fork(arena);
+            defer txn.discard();
+            const w = &txn.state;
 
             // Bullets 5-6 (§12.3): apply the proposals, in §12.3's order,
             // and resolve the PSKs they name. No caller-supplied resumption
@@ -1002,10 +1231,11 @@ pub fn Group(comptime S: type) type {
             // is a member and has its own history, and letting the receiving
             // application hand in resumption secrets would let it agree with
             // a sender's forged PSK instead of catching it.
-            var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks, &.{});
+            var applied = try w.applyProposals(arena, gpa, resolved, params.external_psks, &.{});
             defer applied.deinit(gpa);
             const new_extensions = applied.extensions;
-            const psk_secret = applied.psk_secret;
+            var psk_secret = applied.psk_secret;
+            defer std.crypto.secureZero(u8, &psk_secret);
 
             // Bullet 7: path presence.
             if (applied.needs_path and commit.path == null) return error.PathRequired;
@@ -1017,17 +1247,18 @@ pub fn Group(comptime S: type) type {
             // sender lands in — and BEFORE anything reads the committer's
             // index. See `tree.RatchetTree.assignBlankLeaf`.
             const committer: u32 = if (external)
-                @intCast(try self.ratchet_tree.assignBlankLeaf())
+                @intCast(try w.ratchet_tree.assignBlankLeaf())
             else
                 member_committer;
 
             // Bullet 8: validate and apply the path.
             var commit_secret = keyschedule.zeroSecret(S);
+            defer std.crypto.secureZero(u8, &commit_secret);
             var derived: []const treekem.PathSecretEntry = &.{};
             if (commit.path) |path| {
                 // §7.3 via §12.4.2: source MUST be `commit`.
                 if (path.leaf_node.leaf_node_source != .commit) return error.InvalidUpdatePath;
-                try verifyLeafSignature(S, gpa, path.leaf_node, .commit, self.group_id, committer);
+                try verifyLeafSignature(S, gpa, path.leaf_node, .commit, w.group_id, committer);
 
                 // The committer's encryption key must actually change —
                 // read BEFORE the merge replaces the leaf. An external
@@ -1036,28 +1267,28 @@ pub fn Group(comptime S: type) type {
                 // "different from the committer's current leaf node" has no
                 // subject and is vacuous rather than skipped.
                 if (!external) {
-                    const cur = self.ratchet_tree.nodes[committer * 2] orelse return error.UnknownMember;
+                    const cur = w.ratchet_tree.nodes[committer * 2] orelse return error.UnknownMember;
                     if (std.mem.eql(u8, cur.leaf.encryption_key, path.leaf_node.encryption_key))
                         return error.InvalidUpdatePath;
                 }
                 // No public key in the UpdatePath may already appear in the
                 // tree (a committer replaying another node's key would make
                 // the path secrets decryptable by its owner).
-                try rejectReusedPathKeys(&self.ratchet_tree, path);
+                try rejectReusedPathKeys(&w.ratchet_tree, path);
 
-                try treekem.applyUpdatePath(arena, &self.ratchet_tree, committer, path);
+                try treekem.applyUpdatePath(arena, &w.ratchet_tree, committer, path);
 
                 // The PROVISIONAL GroupContext: new epoch, new tree hash,
                 // OLD confirmed_transcript_hash. See this file's doc
                 // comment — this is the step that is easy to get wrong and
                 // impossible to notice without a vector.
-                const merged_tree_hash = try treehash.rootHash(S, gpa, &self.ratchet_tree);
+                const merged_tree_hash = try treehash.rootHash(S, gpa, &w.ratchet_tree);
                 const provisional: keyschedule.GroupContext = .{
                     .cipher_suite = S.id,
-                    .group_id = self.group_id,
-                    .epoch = self.epoch + 1,
+                    .group_id = w.group_id,
+                    .epoch = w.epoch + 1,
                     .tree_hash = &merged_tree_hash,
-                    .confirmed_transcript_hash = self.confirmed_transcript_hash[0..self.confirmed_len],
+                    .confirmed_transcript_hash = w.confirmed_transcript_hash[0..w.confirmed_len],
                     .extensions = new_extensions,
                 };
                 const provisional_bytes = try provisional.encodeAlloc(gpa);
@@ -1071,11 +1302,11 @@ pub fn Group(comptime S: type) type {
                 const processed = try treekem.processUpdatePath(
                     S,
                     arena,
-                    &self.ratchet_tree,
+                    &w.ratchet_tree,
                     .{
-                        .leaf_index = self.my_leaf_index,
-                        .encryption_priv = &self.my_encryption_priv,
-                        .known_path_secrets = self.my_path_secrets.items,
+                        .leaf_index = w.my_leaf_index,
+                        .encryption_priv = &w.my_encryption_priv,
+                        .known_path_secrets = w.my_path_secrets.items,
                     },
                     committer,
                     path,
@@ -1088,15 +1319,15 @@ pub fn Group(comptime S: type) type {
             }
 
             // Bullet 9: advance both transcript hashes over this Commit.
-            const hashes = try transcript.advance(S, gpa, &self.interim_transcript_hash, ac);
+            const hashes = try transcript.advance(S, gpa, &w.interim_transcript_hash, ac);
 
             // …and build the FINAL GroupContext, which differs from the
             // provisional one in exactly one field.
-            const new_tree_hash = try treehash.rootHash(S, gpa, &self.ratchet_tree);
+            const new_tree_hash = try treehash.rootHash(S, gpa, &w.ratchet_tree);
             const new_gc: keyschedule.GroupContext = .{
                 .cipher_suite = S.id,
-                .group_id = self.group_id,
-                .epoch = self.epoch + 1,
+                .group_id = w.group_id,
+                .epoch = w.epoch + 1,
                 .tree_hash = &new_tree_hash,
                 .confirmed_transcript_hash = &hashes.confirmed,
                 .extensions = new_extensions,
@@ -1111,12 +1342,13 @@ pub fn Group(comptime S: type) type {
             // epoch's value. That is what lets a stranger — who by
             // definition does not have `init_secret_[n-1]` — land in the
             // same epoch as everyone else.
-            const init_secret = if (applied.external_init) |kem|
-                try self.externalInitSecret(kem)
+            var init_secret = if (applied.external_init) |kem|
+                try w.externalInitSecret(kem)
             else
-                self.secrets.init_secret;
+                w.secrets.init_secret;
+            defer std.crypto.secureZero(u8, &init_secret);
 
-            const secrets = try keyschedule.deriveEpoch(
+            var secrets = try keyschedule.deriveEpoch(
                 S,
                 gpa,
                 init_secret,
@@ -1124,6 +1356,7 @@ pub fn Group(comptime S: type) type {
                 psk_secret,
                 new_gc_bytes,
             );
+            defer secrets.wipe();
 
             // Bullet 12: the confirmation tag proves the committer derived
             // the same epoch. Everything above this line is unauthenticated
@@ -1140,12 +1373,12 @@ pub fn Group(comptime S: type) type {
             // invalid according to Section 7.3." The per-leaf half ran as
             // each leaf was installed; this is the half that only the
             // finished tree can answer.
-            try self.checkKeyUniqueness();
+            try w.checkKeyUniqueness();
 
             // Bullet 13: adopt.
-            self.epoch += 1;
-            self.tree_hash = new_tree_hash;
-            self.confirmed_transcript_hash = hashes.confirmed;
+            w.epoch += 1;
+            w.tree_hash = new_tree_hash;
+            w.confirmed_transcript_hash = hashes.confirmed;
             // ⭐ The LENGTH travels with the hash. `commitInner` maintains
             // this (its own adopt block does the same) and every entry point
             // sets it, but this block did not — so a group whose
@@ -1158,17 +1391,15 @@ pub fn Group(comptime S: type) type {
             // it checks or produces is computed over different bytes than the
             // rest of the group uses. Silent, permanent, single-member
             // desync.
-            self.confirmed_len = hashes.confirmed.len;
-            self.interim_transcript_hash = hashes.interim;
-            self.extensions = new_extensions;
-            self.secrets = secrets;
-            // Pending Updates are epoch-scoped: §12.1 binds a proposal to
-            // the epoch it was sent in, so any that this Commit did not
-            // apply can never be applied and their private keys are dead.
-            self.pending_updates.clearRetainingCapacity();
-            try self.adoptPathSecrets(arena, derived);
-            try self.resumption_history.append(arena, .{ .epoch = self.epoch, .secret = secrets.resumption_psk });
-            self.poisoned = false;
+            w.confirmed_len = hashes.confirmed.len;
+            w.interim_transcript_hash = hashes.interim;
+            w.extensions = new_extensions;
+            w.secrets = secrets;
+            try w.adoptPathSecrets(arena, derived);
+            // The last step that can fail; `adopt` cannot.
+            try self.reserveAdoption(&txn, arena);
+            self.adopt(&txn, msgs);
+            adopted = true;
         }
 
         /// RFC 9420 §8.3's RECEIVING half, wired to this epoch: recover the
@@ -1210,7 +1441,6 @@ pub fn Group(comptime S: type) type {
         /// `.by_reference` arm and a receiver's `CommitParams.proposal_msgs`
         /// both take.
         pub fn createProposal(self: *const Self, allocator: std.mem.Allocator, params: ProposeParams) ![]u8 {
-            try self.check();
             const gpa = self.gpa;
             const gc = try self.groupContextAlloc(gpa);
             defer gpa.free(gc);
@@ -1259,7 +1489,6 @@ pub fn Group(comptime S: type) type {
         /// own arena, so the returned leaf stays valid for as long as the
         /// group does and needs no `deinit`.
         pub fn updateLeaf(self: *Self, params: UpdateLeafParams) !tree.LeafNode {
-            try self.check();
             const arena = self.arena.allocator();
             const current = try self.ownLeaf();
             const new_pub = params.encryption_key_pair.public_key;
@@ -1377,8 +1606,9 @@ pub fn Group(comptime S: type) type {
         ///
         /// On success the group has advanced one epoch: a committer applies
         /// its own Commit, and the whole point is that it lands in the state
-        /// its receivers will land in. On failure the object is poisoned,
-        /// exactly as `processCommit` documents.
+        /// its receivers will land in. On failure the group is exactly as it
+        /// was — the same transaction `processCommit` runs, see this file's
+        /// doc comment on atomicity.
         ///
         /// **Three orderings inside are load-bearing, and two of them are
         /// the same ones §12.4.2 gets wrong-able:**
@@ -1445,9 +1675,14 @@ pub fn Group(comptime S: type) type {
             params: CreateCommitParams,
             mode: CommitMode,
         ) !Created {
-            try self.check();
-            const arena = self.arena.allocator();
             const gpa = self.gpa;
+            // Same arrangement as `processCommit`: this Commit's retained
+            // allocations — the copied proposals, the staged path and its
+            // secrets — join the group only if the Commit is adopted.
+            const msgs = try WipingArena.create(gpa);
+            var adopted = false;
+            defer if (!adopted) msgs.destroy(gpa);
+            const arena = msgs.allocator();
             const external = mode == .external;
 
             const old_gc = try self.groupContextAlloc(gpa);
@@ -1489,11 +1724,15 @@ pub fn Group(comptime S: type) type {
                 }
             }
 
-            // From here on the tree is mutated; any failure poisons.
-            self.poisoned = true;
+            // From here on the steps write group state — into a working
+            // copy, exactly as in `processCommit`; `self` is untouched until
+            // `adopt`.
+            var txn = try self.fork(arena);
+            defer txn.discard();
+            const w = &txn.state;
 
             // ── §12.4.1 bullet 3 (§12.3): apply the proposals.
-            var applied = try self.applyProposals(arena, gpa, resolved, params.external_psks, switch (mode) {
+            var applied = try w.applyProposals(arena, gpa, resolved, params.external_psks, switch (mode) {
                 .external => |e| e.resumption_psks,
                 .member => &.{},
             });
@@ -1505,7 +1744,7 @@ pub fn Group(comptime S: type) type {
             // same point of the same sequence — after §12.3's application,
             // before the path — because that is the only way two parties
             // that never exchange the index arrive at the same one.
-            if (external) self.my_leaf_index = @intCast(try self.ratchet_tree.assignBlankLeaf());
+            if (external) w.my_leaf_index = @intCast(try w.ratchet_tree.assignBlankLeaf());
 
             // ── §12.4.1 bullets 4-5: the path.
             //
@@ -1517,14 +1756,15 @@ pub fn Group(comptime S: type) type {
             // happens to look at them. An external committer has no old leaf
             // to lose; its content comes from the KeyPackage it published.
             const base_leaf = switch (mode) {
-                .member => try dupLeafNode(arena, try self.ownLeaf()),
+                .member => try dupLeafNode(arena, try w.ownLeaf()),
                 .external => |e| e.leaf,
             };
 
             var commit: content.Commit = .{ .proposals = por, .path = null };
             var commit_secret = keyschedule.zeroSecret(S);
+            defer std.crypto.secureZero(u8, &commit_secret);
             var staged: ?treekem.Staged(S) = null;
-            var new_leaf_priv = self.my_encryption_priv;
+            var new_leaf_priv = w.my_encryption_priv;
 
             // §12.4.3.2: "External Commits MUST contain a path field (and is
             // therefore a 'full' Commit)." `applied.needs_path` is already
@@ -1541,8 +1781,8 @@ pub fn Group(comptime S: type) type {
                 try params.io.randomSecure(&path_secret_0);
                 const leaf_kp = S.Kem.generateKeyPair(params.io);
 
-                const st = try treekem.stageUpdatePath(S, arena, &self.ratchet_tree, self.my_leaf_index, .{
-                    .group_id = self.group_id,
+                const st = try treekem.stageUpdatePath(S, arena, &w.ratchet_tree, w.my_leaf_index, .{
+                    .group_id = w.group_id,
                     .signature_key_pair = params.signature_key_pair,
                     .leaf_key_pair = leaf_kp,
                     .path_secret_0 = path_secret_0,
@@ -1561,13 +1801,13 @@ pub fn Group(comptime S: type) type {
                 // transcript hash. Identical to the one `processCommit`
                 // rebuilds; if the two ever disagreed, every receiver would
                 // fail to open the ciphertexts sealed here.
-                const merged_tree_hash = try treehash.rootHash(S, gpa, &self.ratchet_tree);
+                const merged_tree_hash = try treehash.rootHash(S, gpa, &w.ratchet_tree);
                 const provisional: keyschedule.GroupContext = .{
                     .cipher_suite = S.id,
-                    .group_id = self.group_id,
-                    .epoch = self.epoch + 1,
+                    .group_id = w.group_id,
+                    .epoch = w.epoch + 1,
                     .tree_hash = &merged_tree_hash,
-                    .confirmed_transcript_hash = self.confirmed_transcript_hash[0..self.confirmed_len],
+                    .confirmed_transcript_hash = w.confirmed_transcript_hash[0..w.confirmed_len],
                     .extensions = applied.extensions,
                 };
                 const provisional_bytes = try provisional.encodeAlloc(gpa);
@@ -1577,7 +1817,7 @@ pub fn Group(comptime S: type) type {
                     S,
                     gpa,
                     params.io,
-                    &self.ratchet_tree,
+                    &w.ratchet_tree,
                     st,
                     provisional_bytes,
                     applied.added_leaves,
@@ -1595,9 +1835,9 @@ pub fn Group(comptime S: type) type {
             // GroupContext in the TBS for it, so an external Commit is
             // bound to this group and this epoch exactly as a member's is.
             const fc: framing.FramedContent = .{
-                .group_id = self.group_id,
-                .epoch = self.epoch,
-                .sender = if (external) .new_member_commit else .{ .member = self.my_leaf_index },
+                .group_id = w.group_id,
+                .epoch = w.epoch,
+                .sender = if (external) .new_member_commit else .{ .member = w.my_leaf_index },
                 .authenticated_data = params.authenticated_data,
                 .body = .{ .commit = commit },
             };
@@ -1613,13 +1853,13 @@ pub fn Group(comptime S: type) type {
                 .content = fc,
                 .auth = .{ .signature = &sig_bytes, .confirmation_tag = null },
             };
-            const confirmed = try transcript.confirmedTranscriptHash(S, gpa, &self.interim_transcript_hash, ac);
+            const confirmed = try transcript.confirmedTranscriptHash(S, gpa, &w.interim_transcript_hash, ac);
 
-            const new_tree_hash = try treehash.rootHash(S, gpa, &self.ratchet_tree);
+            const new_tree_hash = try treehash.rootHash(S, gpa, &w.ratchet_tree);
             const new_gc: keyschedule.GroupContext = .{
                 .cipher_suite = S.id,
-                .group_id = self.group_id,
-                .epoch = self.epoch + 1,
+                .group_id = w.group_id,
+                .epoch = w.epoch + 1,
                 .tree_hash = &new_tree_hash,
                 .confirmed_transcript_hash = &confirmed,
                 .extensions = applied.extensions,
@@ -1633,11 +1873,12 @@ pub fn Group(comptime S: type) type {
             // does not recover it from the proposal — it IS the party that
             // chose it. Same value, opposite half of the exchange; the
             // `confirmation_tag` below is what proves the two agree.
-            const init_secret = switch (mode) {
-                .member => self.secrets.init_secret,
+            var init_secret = switch (mode) {
+                .member => w.secrets.init_secret,
                 .external => |e| e.init_secret,
             };
-            const secrets = try keyschedule.deriveEpoch(
+            defer std.crypto.secureZero(u8, &init_secret);
+            var secrets = try keyschedule.deriveEpoch(
                 S,
                 gpa,
                 init_secret,
@@ -1645,6 +1886,7 @@ pub fn Group(comptime S: type) type {
                 applied.psk_secret,
                 new_gc_bytes,
             );
+            defer secrets.wipe();
             const tag = keyschedule.confirmationTag(S, secrets.confirmation_key, &confirmed);
             ac.auth.confirmation_tag = &tag;
             const interim = try transcript.interimTranscriptHash(S, &confirmed, &tag);
@@ -1666,7 +1908,7 @@ pub fn Group(comptime S: type) type {
             const mtag: ?[S.Nm]u8 = if (external)
                 null
             else
-                try framing.membershipTag(S, gpa, self.secrets.membership_key, fc, ac.auth, old_gc);
+                try framing.membershipTag(S, gpa, w.secrets.membership_key, fc, ac.auth, old_gc);
             const commit_msg: framing.MLSMessage = .{
                 .public_message = .{
                     .content = fc,
@@ -1683,7 +1925,7 @@ pub fn Group(comptime S: type) type {
             var tree_ext_bytes: ?[]u8 = null;
             defer if (tree_ext_bytes) |b| gpa.free(b);
             if (params.include_ratchet_tree) {
-                tree_ext_bytes = try self.ratchet_tree.encode(gpa);
+                tree_ext_bytes = try w.ratchet_tree.encode(gpa);
                 try gi_exts.append(gpa, .{
                     .extension_type = welcome_mod.extension_type_ratchet_tree,
                     .extension_data = tree_ext_bytes.?,
@@ -1695,11 +1937,11 @@ pub fn Group(comptime S: type) type {
                 // `HPKEPublicKey` field, i.e. an `opaque<V>` — so the
                 // extension body is length-prefixed, not a bare key.
                 const ext_kp = keyschedule.externalKeyPair(S, secrets.external_secret);
-                var w = codec.Writer.init(&ext_pub_buf);
-                try w.writeVector(&ext_kp.public_key);
+                var ext_w = codec.Writer.init(&ext_pub_buf);
+                try ext_w.writeVector(&ext_kp.public_key);
                 try gi_exts.append(gpa, .{
                     .extension_type = welcome_mod.extension_type_external_pub,
-                    .extension_data = w.finish(),
+                    .extension_data = ext_w.finish(),
                 });
             }
             try gi_exts.appendSlice(gpa, params.group_info_extensions);
@@ -1708,7 +1950,7 @@ pub fn Group(comptime S: type) type {
                 .group_context = new_gc,
                 .extensions = gi_exts.items,
                 .confirmation_tag = &tag,
-                .signer = self.my_leaf_index,
+                .signer = w.my_leaf_index,
                 .signature = &.{},
             };
             const gi_sig = try gi.sign(S, gpa, params.signature_key_pair);
@@ -1720,7 +1962,7 @@ pub fn Group(comptime S: type) type {
 
             // ── §12.4.1: "For each new member in the group ..." — the
             // Welcome.
-            const welcome_bytes = if (applied.added.len == 0) null else try self.buildWelcome(
+            const welcome_bytes = if (applied.added.len == 0) null else try w.buildWelcome(
                 allocator,
                 params.io,
                 gi,
@@ -1728,9 +1970,9 @@ pub fn Group(comptime S: type) type {
                 applied,
                 staged,
             );
-            errdefer if (welcome_bytes) |w| allocator.free(w);
+            errdefer if (welcome_bytes) |wb| allocator.free(wb);
 
-            try self.checkKeyUniqueness();
+            try w.checkKeyUniqueness();
 
             // ── adopt. Same list as `processCommit`'s last bullet, plus the
             // two pieces only a committer holds: its new leaf private key
@@ -1743,21 +1985,19 @@ pub fn Group(comptime S: type) type {
                     slot.* = .{ .node = n.node, .path_secret = try arena.dupe(u8, &n.path_secret) };
                 }
             }
-            self.epoch += 1;
-            self.tree_hash = new_tree_hash;
-            self.confirmed_transcript_hash = confirmed;
-            self.confirmed_len = S.Hash.digest_length;
-            self.interim_transcript_hash = interim;
-            self.extensions = applied.extensions;
-            self.secrets = secrets;
-            self.my_encryption_priv = new_leaf_priv;
-            // Pending Updates are epoch-scoped: §12.1 binds a proposal to
-            // the epoch it was sent in, so any that this Commit did not
-            // apply can never be applied and their private keys are dead.
-            self.pending_updates.clearRetainingCapacity();
-            try self.adoptPathSecrets(arena, derived);
-            try self.resumption_history.append(arena, .{ .epoch = self.epoch, .secret = secrets.resumption_psk });
-            self.poisoned = false;
+            w.epoch += 1;
+            w.tree_hash = new_tree_hash;
+            w.confirmed_transcript_hash = confirmed;
+            w.confirmed_len = S.Hash.digest_length;
+            w.interim_transcript_hash = interim;
+            w.extensions = applied.extensions;
+            w.secrets = secrets;
+            w.my_encryption_priv = new_leaf_priv;
+            try w.adoptPathSecrets(arena, derived);
+            // The last step that can fail; `adopt` cannot.
+            try self.reserveAdoption(&txn, arena);
+            self.adopt(&txn, msgs);
+            adopted = true;
 
             return .{ .commit = commit_bytes, .welcome = welcome_bytes, .group_info = group_info_bytes };
         }
@@ -1895,10 +2135,8 @@ pub fn Group(comptime S: type) type {
             allocator: std.mem.Allocator,
             params: ExternalJoinParams,
         ) !ExternalJoin {
-            const arena_ptr = try gpa.create(std.heap.ArenaAllocator);
-            errdefer gpa.destroy(arena_ptr);
-            arena_ptr.* = .init(gpa);
-            errdefer arena_ptr.deinit();
+            const arena_ptr = try WipingArena.create(gpa);
+            errdefer arena_ptr.destroy(gpa);
             const arena = arena_ptr.allocator();
 
             // §8.4: a resumption PSK IS the named epoch's `resumption_psk`,
@@ -2112,7 +2350,14 @@ pub fn Group(comptime S: type) type {
                 const init_key: S.Kem.PublicKey = member.key_package.init_key[0..S.Kem.Npk].*;
 
                 const ct = try welcome_mod.encryptGroupSecrets(S, gpa, io, init_key, egi, gs_bytes);
-                slot.* = .{ .new_member = try gpa.dupe(u8, &ref), .encrypted_group_secrets = ct };
+                // Not in `slots` until the assignment below completes, so the
+                // `defer` above cannot reach it yet.
+                errdefer {
+                    gpa.free(ct.kem_output);
+                    gpa.free(ct.ciphertext);
+                }
+                const new_member = try gpa.dupe(u8, &ref);
+                slot.* = .{ .new_member = new_member, .encrypted_group_secrets = ct };
                 built += 1;
             }
 
@@ -2279,6 +2524,7 @@ pub fn Group(comptime S: type) type {
                 gpa.free(self.added);
                 gpa.free(self.added_leaves);
                 gpa.free(self.psk_ids);
+                std.crypto.secureZero(u8, &self.psk_secret);
                 self.* = undefined;
             }
         };
@@ -2502,10 +2748,9 @@ pub fn Group(comptime S: type) type {
                     // §12.2's first bullet: "it contains an individual
                     // proposal that is invalid as specified in Section
                     // 12.1". §12.1.3's condition is the one below. Run here,
-                    // BEFORE the poison flag is set, so a Commit refused for
-                    // it does not also destroy the group — the same reason
-                    // the Add KeyPackage checks were hoisted out of
-                    // `applyProposals` into `commitInner`'s pre-mutation
+                    // BEFORE the working copy is made, so a Commit refused
+                    // for it costs no tree copy — the same reason the Add
+                    // KeyPackage checks sit in `commitInner`'s pre-mutation
                     // phase. It stays enforced in `applyProposals` as well;
                     // see the note there.
                     //
@@ -3681,11 +3926,10 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
         try testing.expectEqual(@as(usize, 4), a.treeSize()); // no truncation
 
         try testing.expectError(error.RemovedFromGroup, c_grp.processCommit(.{ .commit_msg = c.commit }));
-        // Not poisoned, not advanced, and byte-for-byte the state carol had
+        // Not advanced, and byte-for-byte the state carol had
         // before she read the message: §12.4.2's note lets her keep it "for
         // a short time to decrypt late messages in the previous epoch", and
         // she cannot do that out of a group this library has declared dead.
-        try testing.expect(!c_grp.poisoned);
         try testing.expectEqual(@as(u64, 1), c_grp.epoch);
         try testing.expectEqualSlices(u8, &carol_before, &c_grp.epochAuthenticator());
         try testing.expectEqual(@as(usize, 4), c_grp.treeSize());
@@ -3711,7 +3955,6 @@ test "§12.4.2's closing note: the member a Commit REMOVES learns exactly that, 
         try testing.expectEqual(@as(usize, 2), a.treeSize());
 
         try testing.expectError(error.RemovedFromGroup, d_grp.processCommit(.{ .commit_msg = c.commit }));
-        try testing.expect(!d_grp.poisoned);
         try testing.expectEqual(@as(u64, 2), d_grp.epoch);
         try testing.expectEqualSlices(u8, &dave_before, &d_grp.epochAuthenticator());
         // Dave's OWN copy of the tree never shrank — the Commit was refused
@@ -3832,11 +4075,9 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
         .signature_key_pair = alice.sig,
         .proposals = &.{.{ .by_value = .{ .remove = 1 } }},
     }));
-    // Refused at §12.2, BEFORE the tree was touched — so the sender's own
-    // group survives its own mistake. (`applyProposals` enforces the same
-    // condition, but reaching it would mean reaching it past the poison
-    // flag.)
-    try testing.expect(!a.poisoned);
+    // Refused at §12.2, BEFORE any working copy was made — the sender's own
+    // group survives its own mistake either way. (`applyProposals` enforces
+    // the same condition, on the working copy.)
     try testing.expectEqual(@as(u64, 2), a.epoch);
 
     // Past the end of the tree: the case the old bounds test did catch, kept
@@ -3875,7 +4116,6 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
             .{ .by_value = .{ .remove = 2 } },
         },
     }));
-    try testing.expect(!a.poisoned);
     try testing.expectEqual(@as(u64, 2), a.epoch);
 
     // ── The RECEIVING half. A conformant sender will not build the list
@@ -3902,10 +4142,9 @@ test "§12.1.3: a Remove naming a leaf that is BLANK but still in bounds is refu
         });
         defer gpa.free(bad);
         try testing.expectError(error.UnknownMember, c_grp.processCommit(.{ .commit_msg = bad }));
-        // Refused at bullet 4, so carol is not poisoned and can still follow
-        // the REAL Commit — which is what makes the refusal a rejection of
-        // the message rather than a denial of service against the receiver.
-        try testing.expect(!c_grp.poisoned);
+        // Refused at bullet 4, and carol can still follow the REAL Commit —
+        // which is what makes the refusal a rejection of the message rather
+        // than a denial of service against the receiver.
         try testing.expectEqual(@as(u64, 2), c_grp.epoch);
 
         try c_grp.processCommit(.{ .commit_msg = c.commit });
@@ -4401,9 +4640,9 @@ test "§12.2: createCommit refuses the proposal lists a receiver would reject" {
         .signature_key_pair = alice.sig,
         .proposals = &.{.{ .by_value = .{ .external_init = &[_]u8{0xaa} ** 32 } }},
     }));
-    // All three refusals happened BEFORE the tree was touched, so the
-    // group is still usable — the poison flag is set only once mutation
-    // begins.
+    // All three refusals happened before the tree was touched, and the
+    // group is still usable — as it is after a later refusal too, see the
+    // "transactional:" tests.
     try testing.expectEqual(@as(u64, 0), a.epoch);
     const ok = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
     defer ok.deinit(gpa);
@@ -4450,8 +4689,8 @@ test "§12.4.1: a tampered Commit is rejected by the receiver, so the round trip
     bad[bad.len / 2] ^= 0x01;
     try testing.expectError(error.MacMismatch, b.processCommit(.{ .commit_msg = bad }));
     // The failure came from the membership tag, i.e. §12.4.2's second
-    // bullet, before anything was applied — but the object is poisoned
-    // only if the tree was already touched, and it was not.
+    // bullet, before anything was applied; the receiver has not advanced
+    // and still takes the genuine Commit.
     try testing.expectEqual(@as(u64, 1), b.epoch);
     try b.processCommit(.{ .commit_msg = c.commit });
     try expectSameEpoch(&a, &b);
@@ -4872,9 +5111,8 @@ test "§12.2: an external Commit's proposal list is a WHITELIST, and a receiver 
         defer gpa.free(bad);
         try testing.expectError(c.want, a.processCommit(.{ .commit_msg = bad }));
         // Every one of these is refused at §12.4.2's bullet 4, before the
-        // tree is touched — so the group is not poisoned and still works.
+        // tree is touched — so the group is unchanged and still works.
         try testing.expectEqual(@as(u64, 1), a.epoch);
-        try testing.expect(!a.poisoned);
     }
 
     // §12.4.3.2's "MUST NOT include any proposals by reference". A
@@ -5047,7 +5285,6 @@ test "§12.4.3.2: an external Commit with no path is refused by its OWN rule, no
         .commit_msg = pathless,
     }));
     // Refused before anything was mutated: the group is untouched.
-    try testing.expect(!a.poisoned);
     try testing.expectEqual(@as(u64, 1), a.epoch);
 }
 
@@ -5386,18 +5623,18 @@ test "§8.4: a resumption PreSharedKeyID naming ANOTHER group does not resolve t
     // Alice must NOT. Her history is her own group's; nothing in it answers
     // to `psk_group_id = "some-other-group"`, however well the epoch number
     // lines up.
+    const before = try stateDigest(&a);
     try testing.expectError(error.PskNotAvailable, a.processCommit(.{
         .commit_msg = joined.messages.commit,
     }));
     try testing.expectEqual(@as(u64, 1), a.epoch);
     // PSK resolution happens inside §12.3's application step, i.e. after the
-    // tree may already have been touched — so the refusal poisons rather
-    // than rewinds. That is this module's documented atomicity, pinned here
-    // because it is what stops the next assertion from being written against
-    // a group that quietly carried on. The receiver-side epoch component of
-    // the same lookup is pinned directly in the positional-resolution test
-    // below, where it needs no second group to observe.
-    try testing.expect(a.poisoned);
+    // tree may already have been touched — so what leaves alice exactly where
+    // she was is the transaction, not the ordering, and that is pinned here
+    // rather than assumed. The receiver-side epoch component of the same
+    // lookup is pinned directly in the positional-resolution test below,
+    // where it needs no second group to observe.
+    try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
 }
 
 test "§8.4: a caller-supplied resumption PSK matches on the WHOLE PreSharedKeyID triple, usage included" {
@@ -5597,7 +5834,6 @@ test "§12.1.4: a PreSharedKey proposal with usage reinit or branch is invalid, 
     defer gpa.free(forged);
     try testing.expectError(error.ResumptionPskUsageNotAllowed, a.processCommit(.{ .commit_msg = forged }));
     // Refused before anything was mutated.
-    try testing.expect(!a.poisoned);
     try testing.expectEqual(@as(u64, 1), a.epoch);
 }
 
@@ -5953,4 +6189,651 @@ test "§12.4.3.1: a joiner refuses a group whose GroupContext declares a version
         .key_package_msg = dave.kp_msg,
         .signature_key_pair = dave.sig,
     }));
+}
+
+// ── Transactional Commits ──────────────────────────────────────────────
+//
+// `processCommit` and `createCommit` either apply a Commit completely or
+// leave the group exactly as it was. Pinned as a STATE property rather than
+// as "the next call still works": `stateDigest` hashes every field a Commit
+// can write, so a refusal that left any of them touched fails here even if
+// the damage would only surface epochs later.
+
+/// SHA-256 over every piece of group state a Commit may write — the §8.1
+/// context fields, both transcript hashes, every epoch secret, this member's
+/// private keys and path secrets, the remembered resumption PSKs, the pending
+/// Updates, and the encoded ratchet tree. Equal digests mean the group is
+/// bit-for-bit where it was.
+fn stateDigest(g: *const Group(TestSuite)) ![32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(std.mem.asBytes(&g.epoch));
+    h.update(&g.tree_hash);
+    h.update(std.mem.asBytes(&g.confirmed_len));
+    h.update(g.confirmed_transcript_hash[0..g.confirmed_len]);
+    h.update(&g.interim_transcript_hash);
+    h.update(std.mem.asBytes(&g.secrets));
+    h.update(std.mem.asBytes(&g.my_leaf_index));
+    h.update(&g.my_encryption_priv);
+    for (g.extensions) |e| {
+        h.update(std.mem.asBytes(&e.extension_type));
+        h.update(e.extension_data);
+    }
+    for (g.my_path_secrets.items) |e| {
+        h.update(std.mem.asBytes(&e.node));
+        h.update(e.path_secret);
+    }
+    for (g.resumption_history.items) |e| {
+        h.update(std.mem.asBytes(&e.epoch));
+        h.update(&e.secret);
+    }
+    for (g.pending_updates.items) |p| {
+        h.update(p.encryption_key);
+        h.update(&p.encryption_priv);
+    }
+    const t = try g.ratchet_tree.encode(testing.allocator);
+    defer testing.allocator.free(t);
+    h.update(t);
+    var out: [32]u8 = undefined;
+    h.final(&out);
+    return out;
+}
+
+/// `expectSameEpoch` without the diagnostic print — for the sweeps below,
+/// which COUNT disagreements instead of stopping at the first.
+fn sameEpoch(a: *const Group(TestSuite), b: *const Group(TestSuite)) bool {
+    return a.epoch == b.epoch and
+        std.mem.eql(u8, &a.tree_hash, &b.tree_hash) and
+        std.mem.eql(u8, &a.confirmed_transcript_hash, &b.confirmed_transcript_hash) and
+        std.mem.eql(u8, &a.epochAuthenticator(), &b.epochAuthenticator());
+}
+
+test "transactional: a stranger's external Commit refused at the confirmation tag leaves every member's group as it was" {
+    // The attack the transaction exists for. An external Commit is signed
+    // with a key carried INSIDE it (§6.1's `new_member_commit` bullet), so
+    // a stranger with nothing but the published GroupInfo passes every check
+    // up to §12.4.2's bullet 12 — and by then §12.3 has run and the path has
+    // been merged. Before the transaction, that one message poisoned the
+    // group for every member that received it, permanently.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 101);
+    const bob = try TestClient.init(aa, "bob", 102);
+    const dave = try TestClient.init(aa, "dave", 103);
+    const erin = try TestClient.init(aa, "erin", 104);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "txn-external",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    // The GroupInfo alice publishes for external joins — public by design.
+    const published_gi = blk: {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .include_external_pub = true });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit });
+        break :blk try gpa.dupe(u8, c.group_info);
+    };
+    defer gpa.free(published_gi);
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    defer joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    // A genuine ExternalInit for this epoch's `external_pub` — but erin's,
+    // not the one dave's key schedule consumed.
+    var other = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = published_gi,
+        .key_package_msg = erin.kp_msg,
+        .signature_key_pair = erin.sig,
+    });
+    defer other.group.deinit();
+    defer other.messages.deinit(gpa);
+    const other_init: content.ProposalOrRef = blk: {
+        var r = codec.Reader.init(other.messages.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        break :blk msg.public_message.content.body.commit.proposals[0];
+    };
+
+    const old_gc = try a.groupContextAlloc(gpa);
+    defer gpa.free(old_gc);
+    const forged = try resignExternalCommit(gpa, aa, joined.messages.commit, dave.sig, old_gc, &.{other_init});
+    defer gpa.free(forged);
+
+    const a_before = try stateDigest(&a);
+    const b_before = try stateDigest(&b);
+    try testing.expectError(error.MacMismatch, a.processCommit(.{ .commit_msg = forged }));
+    try testing.expectError(error.MacMismatch, b.processCommit(.{ .commit_msg = forged }));
+    try testing.expectEqualSlices(u8, &a_before, &(try stateDigest(&a)));
+    try testing.expectEqualSlices(u8, &b_before, &(try stateDigest(&b)));
+
+    // Positive control: the genuine Commit is accepted by both, and all
+    // three parties land in one epoch.
+    try a.processCommit(.{ .commit_msg = joined.messages.commit });
+    try b.processCommit(.{ .commit_msg = joined.messages.commit });
+    try expectSameEpoch(&a, &joined.group);
+    try expectSameEpoch(&b, &joined.group);
+    {
+        const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+        defer c.deinit(gpa);
+        try b.processCommit(.{ .commit_msg = c.commit });
+        try joined.group.processCommit(.{ .commit_msg = c.commit });
+        try expectSameEpoch(&a, &b);
+        try expectSameEpoch(&a, &joined.group);
+    }
+}
+
+test "transactional: a createCommit refused after §12.3 touched the tree leaves the committer as it was" {
+    // PSK availability is answered inside §12.3's application step, AFTER
+    // the Add in the same list has already been placed in the tree.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 111);
+    const bob = try TestClient.init(aa, "bob", 112);
+    const carol = try TestClient.init(aa, "carol", 113);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "txn-create",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    const psks = [_]ExternalPsk{.{ .psk_id = "txn-psk", .psk = "txn pre-shared key material" }};
+    const psk_id: keyschedule.PreSharedKeyId = .{
+        .id = .{ .external = "txn-psk" },
+        .psk_nonce = &[_]u8{0x3c} ** TestSuite.Nh,
+    };
+    const list = [_]Group(TestSuite).CommitSource{
+        .{ .by_value = .{ .add = carol.kp } },
+        .{ .by_value = .{ .psk = psk_id } },
+    };
+
+    const before = try stateDigest(&a);
+    try testing.expectError(error.PskNotAvailable, a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &list,
+    }));
+    try testing.expectEqualSlices(u8, &before, &(try stateDigest(&a)));
+
+    // Positive control: the same list with the PSK supplied goes through,
+    // and both the existing member and the new one land where alice did.
+    const c = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &list,
+        .external_psks = &psks,
+    });
+    defer c.deinit(gpa);
+    try b.processCommit(.{ .commit_msg = c.commit, .external_psks = &psks });
+    try expectSameEpoch(&a, &b);
+    var cg = try carol.join(gpa, c.welcome.?, &psks);
+    defer cg.deinit();
+    try expectSameEpoch(&a, &cg);
+}
+
+test "transactional: a member's Commit refused after §12.3 leaves the receiver as it was, and the same Commit is accepted once the PSK arrives" {
+    // The member path. The Commit is authentic — signed, membership-tagged,
+    // from a real member — and the receiver simply does not hold the PSK it
+    // names YET. That is a condition the application can cure; a poisoned
+    // group could never take the Commit again.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 121);
+    const bob = try TestClient.init(aa, "bob", 122);
+    const carol = try TestClient.init(aa, "carol", 123);
+    const dave = try TestClient.init(aa, "dave", 124);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "txn-member",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{
+                .{ .by_value = .{ .add = bob.kp } },
+                .{ .by_value = .{ .add = carol.kp } },
+            },
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(gpa, c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    const psks = [_]ExternalPsk{.{ .psk_id = "late-psk", .psk = "arrives after the Commit does" }};
+    const psk_id: keyschedule.PreSharedKeyId = .{
+        .id = .{ .external = "late-psk" },
+        .psk_nonce = &[_]u8{0x4d} ** TestSuite.Nh,
+    };
+    const c = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{
+            .{ .by_value = .{ .add = dave.kp } },
+            .{ .by_value = .{ .psk = psk_id } },
+        },
+        .external_psks = &psks,
+    });
+    defer c.deinit(gpa);
+
+    const before = try stateDigest(&b);
+    try testing.expectError(error.PskNotAvailable, b.processCommit(.{ .commit_msg = c.commit }));
+    try testing.expectEqualSlices(u8, &before, &(try stateDigest(&b)));
+
+    // The PSK arrives; the very same bytes are now accepted.
+    try b.processCommit(.{ .commit_msg = c.commit, .external_psks = &psks });
+    try expectSameEpoch(&a, &b);
+}
+
+/// What one allocation-failure sweep saw.
+const Sweep = struct {
+    /// Failure points the call reached (runs that ended in an induced
+    /// allocation failure, or absorbed one).
+    points: usize = 0,
+    /// …of which left the object's state different from before the call.
+    changed: usize = 0,
+    /// …of which left an object that could not then complete the same
+    /// operation and agree with the reference.
+    unusable: usize = 0,
+};
+
+/// Fails the n-th allocation of ONE `processCommit`, for n = 0, 1, 2, …
+/// until a run completes with no failure induced. Every run is against a
+/// FRESH receiver — joined from `welcome`, brought up to date with `lead_in`
+/// — so each failure point is judged on its own, and one damaged object
+/// cannot hide every later point behind the same refusal.
+fn sweepProcessCommit(
+    joiner: TestClient,
+    welcome: []const u8,
+    lead_in: []const []const u8,
+    target: []const u8,
+    reference: *const Group(TestSuite),
+) !Sweep {
+    var s: Sweep = .{};
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        var g = try joiner.join(failing.allocator(), welcome, &.{});
+        defer g.deinit();
+        for (lead_in) |m| try g.processCommit(.{ .commit_msg = m });
+        const before = try stateDigest(&g);
+
+        failing.fail_index = failing.alloc_index + n;
+        const outcome = g.processCommit(.{ .commit_msg = target });
+        failing.fail_index = std.math.maxInt(usize);
+
+        if (outcome) |_| {
+            if (!failing.has_induced_failure) {
+                try expectSameEpoch(reference, &g);
+                return s;
+            }
+            s.points += 1;
+            if (!sameEpoch(reference, &g)) s.unusable += 1;
+        } else |err| {
+            if (!failing.has_induced_failure) return err;
+            s.points += 1;
+            if (!std.mem.eql(u8, &before, &(try stateDigest(&g)))) s.changed += 1;
+            if (g.processCommit(.{ .commit_msg = target })) |_| {
+                if (!sameEpoch(reference, &g)) s.unusable += 1;
+            } else |_| s.unusable += 1;
+        }
+    }
+}
+
+test "transactional: an allocation failure at ANY point of processCommit leaves a member's group as it was" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 131);
+    const bob = try TestClient.init(aa, "bob", 132);
+    const carol = try TestClient.init(aa, "carol", 133);
+    const dave = try TestClient.init(aa, "dave", 134);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "txn-oom-member",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const c1 = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{
+            .{ .by_value = .{ .add = bob.kp } },
+            .{ .by_value = .{ .add = carol.kp } },
+        },
+    });
+    defer c1.deinit(gpa);
+    // The target touches every mutating step a member Commit has: §12.3's
+    // Add, §7.5's merge and decryption, the key schedule, adoption.
+    const c2 = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = dave.kp } }},
+    });
+    defer c2.deinit(gpa);
+
+    const s = try sweepProcessCommit(bob, c1.welcome.?, &.{}, c2.commit, &a);
+    try testing.expect(s.points >= 10);
+    try testing.expectEqual(@as(usize, 0), s.changed);
+    try testing.expectEqual(@as(usize, 0), s.unusable);
+}
+
+test "transactional: an allocation failure at ANY point of processCommit on an EXTERNAL Commit leaves the member as it was" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 141);
+    const bob = try TestClient.init(aa, "bob", 142);
+    const dave = try TestClient.init(aa, "dave", 143);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "txn-oom-external",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    const c1 = try a.createCommit(gpa, .{
+        .io = io,
+        .signature_key_pair = alice.sig,
+        .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+    });
+    defer c1.deinit(gpa);
+    const c2 = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig, .include_external_pub = true });
+    defer c2.deinit(gpa);
+
+    var joined = try Group(TestSuite).joinByExternalCommit(gpa, gpa, .{
+        .io = io,
+        .group_info_msg = c2.group_info,
+        .key_package_msg = dave.kp_msg,
+        .signature_key_pair = dave.sig,
+    });
+    defer joined.group.deinit();
+    defer joined.messages.deinit(gpa);
+
+    const s = try sweepProcessCommit(bob, c1.welcome.?, &.{c2.commit}, joined.messages.commit, &joined.group);
+    try testing.expect(s.points >= 10);
+    try testing.expectEqual(@as(usize, 0), s.changed);
+    try testing.expectEqual(@as(usize, 0), s.unusable);
+}
+
+test "transactional: an allocation failure at ANY point of createCommit leaves the committer as it was" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const alice = try TestClient.init(aa, "alice", 151);
+    const bob = try TestClient.init(aa, "bob", 152);
+    const carol = try TestClient.init(aa, "carol", 153);
+    const dave = try TestClient.init(aa, "dave", 154);
+    const target = [_]Group(TestSuite).CommitSource{.{ .by_value = .{ .add = dave.kp } }};
+
+    var s: Sweep = .{};
+    var n: usize = 0;
+    while (true) : (n += 1) {
+        // The committer's allocator fails, for its own state AND for the
+        // three messages it returns; the receiver's never does.
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+        const fa = failing.allocator();
+        var a = try Group(TestSuite).create(fa, .{
+            .io = io,
+            .group_id = "txn-oom-create",
+            .key_package_msg = alice.kp_msg,
+            .encryption_priv = alice.enc_priv,
+        });
+        defer a.deinit();
+        var b = blk: {
+            const c = try a.createCommit(fa, .{
+                .io = io,
+                .signature_key_pair = alice.sig,
+                .proposals = &.{
+                    .{ .by_value = .{ .add = bob.kp } },
+                    .{ .by_value = .{ .add = carol.kp } },
+                },
+            });
+            defer c.deinit(fa);
+            break :blk try bob.join(testing.allocator, c.welcome.?, &.{});
+        };
+        defer b.deinit();
+        const before = try stateDigest(&a);
+
+        failing.fail_index = failing.alloc_index + n;
+        const outcome = a.createCommit(fa, .{ .io = io, .signature_key_pair = alice.sig, .proposals = &target });
+        failing.fail_index = std.math.maxInt(usize);
+
+        if (outcome) |c| {
+            defer c.deinit(fa);
+            try b.processCommit(.{ .commit_msg = c.commit });
+            if (!failing.has_induced_failure) {
+                try expectSameEpoch(&a, &b);
+                break;
+            }
+            s.points += 1;
+            if (!sameEpoch(&a, &b)) s.unusable += 1;
+        } else |err| {
+            if (!failing.has_induced_failure) return err;
+            s.points += 1;
+            if (!std.mem.eql(u8, &before, &(try stateDigest(&a)))) s.changed += 1;
+            const again = a.createCommit(fa, .{ .io = io, .signature_key_pair = alice.sig, .proposals = &target }) catch {
+                s.unusable += 1;
+                continue;
+            };
+            defer again.deinit(fa);
+            if (b.processCommit(.{ .commit_msg = again.commit })) |_| {
+                if (!sameEpoch(&a, &b)) s.unusable += 1;
+            } else |_| s.unusable += 1;
+        }
+    }
+    try testing.expect(s.points >= 10);
+    try testing.expectEqual(@as(usize, 0), s.changed);
+    try testing.expectEqual(@as(usize, 0), s.unusable);
+}
+
+/// A pass-through allocator that answers one question about key material:
+/// is `needle` still in any LIVE buffer, and was it in any buffer handed
+/// back unwiped? Only raw releases are visible to it — `Allocator.free`
+/// paints a buffer `undefined` before its `rawFree` runs in Debug — which is
+/// exactly the path an arena returns its chunks by.
+const SecretScan = struct {
+    child: std.mem.Allocator,
+    needle: []const u8 = &.{},
+    live: std.ArrayList([]u8) = .empty,
+    released_holding_needle: usize = 0,
+
+    fn allocator(self: *SecretScan) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn deinit(self: *SecretScan) void {
+        self.live.deinit(testing.allocator);
+    }
+    fn holds(self: *const SecretScan, buf: []const u8) bool {
+        return self.needle.len > 0 and std.mem.indexOf(u8, buf, self.needle) != null;
+    }
+    fn liveHoldingNeedle(self: *const SecretScan) usize {
+        var n: usize = 0;
+        for (self.live.items) |buf| {
+            if (self.holds(buf)) n += 1;
+        }
+        return n;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *SecretScan = @ptrCast(@alignCast(ctx));
+        const p = self.child.rawAlloc(len, alignment, ra) orelse return null;
+        self.live.append(testing.allocator, p[0..len]) catch {
+            self.child.rawFree(p[0..len], alignment, ra);
+            return null;
+        };
+        return p;
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *SecretScan = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ra)) return false;
+        for (self.live.items) |*buf| if (buf.ptr == memory.ptr) {
+            buf.* = buf.ptr[0..new_len];
+            break;
+        };
+        return true;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const self: *SecretScan = @ptrCast(@alignCast(ctx));
+        if (self.holds(memory)) self.released_holding_needle += 1;
+        for (self.live.items, 0..) |buf, i| if (buf.ptr == memory.ptr) {
+            _ = self.live.swapRemove(i);
+            break;
+        };
+        self.child.rawFree(memory, alignment, ra);
+    }
+};
+
+test "transactional: a Commit refused at the confirmation tag leaves no copy of the path secret it decrypted" {
+    // The discarded working state carried key material — here, the path
+    // secret the receiver decrypted from the committer's UpdatePath before
+    // bullet 12 refused the Commit. It must not survive the refusal, neither
+    // in memory the group still holds nor in memory it gave back.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var scan: SecretScan = .{ .child = testing.allocator };
+    defer scan.deinit();
+
+    const alice = try TestClient.init(aa, "alice", 161);
+    const bob = try TestClient.init(aa, "bob", 162);
+
+    var a = try Group(TestSuite).create(gpa, .{
+        .io = io,
+        .group_id = "txn-wipe",
+        .key_package_msg = alice.kp_msg,
+        .encryption_priv = alice.enc_priv,
+    });
+    defer a.deinit();
+    var b = blk: {
+        const c = try a.createCommit(gpa, .{
+            .io = io,
+            .signature_key_pair = alice.sig,
+            .proposals = &.{.{ .by_value = .{ .add = bob.kp } }},
+        });
+        defer c.deinit(gpa);
+        break :blk try bob.join(scan.allocator(), c.welcome.?, &.{});
+    };
+    defer b.deinit();
+
+    const old_gc = try b.groupContextAlloc(gpa);
+    defer gpa.free(old_gc);
+    const c = try a.createCommit(gpa, .{ .io = io, .signature_key_pair = alice.sig });
+    defer c.deinit(gpa);
+
+    // Two leaves: alice's filtered direct path is the root, node 1, and that
+    // is the ciphertext bob opens.
+    const needle = for (a.my_path_secrets.items) |e| {
+        if (e.node == 1) break try aa.dupe(u8, e.path_secret);
+    } else return error.TestUnexpectedResult;
+
+    // The same Commit with one bit of its confirmation tag flipped, the
+    // membership tag recomputed so bullet 2 still passes: what a member
+    // whose key schedule diverged would send. The signature does not cover
+    // the tag, so it stays valid.
+    const forged = blk: {
+        var r = codec.Reader.init(c.commit);
+        const msg = try framing.MLSMessage.decode(aa, &r);
+        var pm = msg.public_message;
+        const tag = try aa.dupe(u8, pm.auth.confirmation_tag.?);
+        tag[0] ^= 0x01;
+        pm.auth.confirmation_tag = tag;
+        const mtag = try framing.membershipTag(TestSuite, gpa, b.secrets.membership_key, pm.content, pm.auth, old_gc);
+        pm.membership_tag = &mtag;
+        const out: framing.MLSMessage = .{ .public_message = pm };
+        break :blk try out.encodeAlloc(aa);
+    };
+
+    scan.needle = needle;
+    try testing.expectEqual(@as(usize, 0), scan.liveHoldingNeedle());
+    const before = try stateDigest(&b);
+    try testing.expectError(error.MacMismatch, b.processCommit(.{ .commit_msg = forged }));
+    try testing.expectEqualSlices(u8, &before, &(try stateDigest(&b)));
+    const live_after_refusal = scan.liveHoldingNeedle();
+    const released_after_refusal = scan.released_holding_needle;
+    try testing.expectEqual(@as(usize, 0), live_after_refusal);
+    try testing.expectEqual(@as(usize, 0), released_after_refusal);
+
+    // Positive control — the scan is not blind: once bob ACCEPTS the genuine
+    // Commit he keeps that path secret, and the scan finds it.
+    try b.processCommit(.{ .commit_msg = c.commit });
+    try expectSameEpoch(&a, &b);
+    try testing.expect(scan.liveHoldingNeedle() >= 1);
 }

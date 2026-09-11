@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **BREAKING + BEHAVIOURAL.** `Group.processCommit` and `Group.createCommit` are
+  transactional: a Commit is adopted whole or not at all, and a refusal at any step leaves the
+  group exactly as it was. Until now a failure after the tree had been mutated set a poison
+  flag and every later call returned `error.GroupPoisoned` — and an unauthenticated stranger
+  could trigger that for every member with one message: an external Commit is signed with a key
+  it carries itself, so one with a foreign `ExternalInit` passes every check up to the
+  confirmation tag, by which time the tree has been merged. Both paths now build the new epoch
+  on a working copy (`fork`: the tree's containers in an arena of their own, its byte fields
+  still aliased) and swap it in after the last fallible step. **API:** `error.GroupPoisoned`
+  and the `poisoned` field are removed; nothing in the repository referenced either,
+  `example-apps/mls-chat` included. Measured with allocation-failure sweeps, one fresh object
+  per failure point: the group was left changed at 24 of 34 points (member Commit), 19 of 26
+  (external Commit) and 53 of 64 (`createCommit`); now at 0 of 40, 0 of 31 and 0 of 68. A
+  member that lacks a PSK can take the same Commit again once the PSK arrives. Every arena the
+  group owns now wipes its memory on release, so a refused Commit leaves no copy of the path
+  secret it decrypted (1 live copies → 0). The sweeps also found 17 leaked
+  allocations on `createCommit`'s failure paths (`treekem.sealUpdatePath`, `buildWelcome`),
+  fixed here. Cost: in the measured shape a receiver's retained memory grows by ~5.2 KB per
+  epoch instead of ~2.8 KB (per-Commit arena slack) — see `SPEC.md`'s Backlog.
+
 - **2026-09-08** — `treemath.zig`'s port of RFC 9420 Appendix C now carries the IETF
   Trust's own copyright notice instead of resting on the merger doctrine. The file has always
   said openly that it translates the RFC's Python listing line for line; what changed is what

@@ -523,16 +523,22 @@ application", defaulting ON).
 
 **What it refuses, by name.** `error.PrivateHandshakeNotSupported` — a
 Commit or proposal framed as a `PrivateMessage`; driving the §9 secret tree
-per epoch is not this object's job. `error.GroupPoisoned` — a previous
-`processCommit` failed after the tree was already mutated, so the object is
-unusable rather than silently half-applied.
+per epoch is not this object's job.
+
+**A refused Commit changes nothing.** `processCommit` and `createCommit`
+build the new epoch on a working copy and swap it in only once nothing can
+fail any more, so an error from either — a failed check, a PSK the caller
+has not supplied yet, an allocation failure — leaves the group exactly as
+it was, ready for the next Commit or for the same one again. Whatever the
+refused Commit derived, decrypted path secrets included, is wiped as it is
+released.
 
 `error.RemovedFromGroup` is the one that is not a refusal: the Commit is
 valid and it removes THIS client. §12.4.2's closing note asks a removed
 member to stop sending and to "promptly delete its group state and secret
 tree" — not to advance an epoch, which it could not do in any case, since
 no `UpdatePath` ciphertext is addressed to the leaf §12.3 just blanked. The
-group is left at the previous epoch and unpoisoned, so the same note's "keep
+group is left at the previous epoch, untouched, so the same note's "keep
 the secret tree for a short time to decrypt late messages" stays open to the
 caller; `deinit` is the caller's to call, and should be soon.
 
@@ -612,10 +618,10 @@ field of a Commit MUST be populated"). `omit_path_when_allowed = true` asks
 for §12.4's "partial" Commit — honoured only when the list covers at least
 one proposal and none of them is a path-required type.
 
-**What it refuses:** the same `error.GroupPoisoned` contract as
-`processCommit` — but every §12.2 refusal and every Add's KeyPackage
-signature check happens BEFORE the tree is touched, so a rejected proposal
-list leaves the group usable.
+**What it refuses:** anything `processCommit` would, under the same
+contract — a refused `createCommit` leaves the group exactly as it was.
+Every §12.2 refusal and every Add's KeyPackage signature check still runs
+before the working copy is made, so those cost no copy.
 
 RFC 9420 §8.3's external initialization lives in `keyschedule.zig`, since it
 is a key-schedule entry point rather than group state:
