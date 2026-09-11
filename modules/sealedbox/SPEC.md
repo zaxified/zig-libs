@@ -56,6 +56,47 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   seal/open path beyond what `std.crypto` provides (that path is `std.crypto.nacl.SealedBox`
   verbatim), and the full `crypto_box` (authenticated two-party) API.
 
+### Known limitations: two secrets `std.crypto` leaves outside this module's control (H2, M4)
+
+Both of the following were measured (audit findings H2, M4) and are real: the module's own
+`seal`/`open` do everything they can with the material they own (`seal`'s one `secureZero` on
+`ekp.secret_key` is the one copy this module directly holds and can wipe). What remains is
+inside the Zig standard library this module calls, not inside `modules/sealedbox/`, and the
+resolution — precedent set by the user's decision on `ecvrf` E4, the same class of finding —
+is **(b): document as a known limitation, here, with the exact location the secret remains.
+No report to Zig upstream, no vendored copy of the affected `std` code** (vendoring would
+reintroduce exactly the "no bespoke crypto" risk this module's own design section rules out,
+and turn one small, well-reviewed `std` file into a fork this repository would have to track
+against every future Zig release).
+
+- **H2 — dead-stack copies of secret key material after `seal`/`open` return**, inside
+  `std.crypto.nacl.SealedBox`'s own dependencies: `X25519.KeyPair.generate`'s `random_seed`
+  (the raw ephemeral secret), `Curve25519.clampedMul`'s scratch scalar `t` (the CLAMPED
+  ephemeral secret during `seal`, and the recipient's own clamped long-term secret during
+  `open`), and `Box.createSharedSecret`'s derived XSalsa20 key — none of these are wiped by
+  `std`, and none are reachable from `modules/sealedbox/src/root.zig` to wipe on their behalf
+  (they live in stack frames `std`'s own functions own, several calls below this module's
+  code, and return before this module's `seal`/`open` do). Measured twice independently
+  (`A1/sealedbox.md` H2: an instrumented-`std` probe that reads the exact stack addresses
+  those functions used, and a second, uninstrumented raw dead-stack scan that agrees with
+  it) — both find the ephemeral secret (raw and clamped), the recipient's clamped long-term
+  secret after `open`, and the derived shared key, all still present after the call returns.
+- **M4 — the only barrier against a zero shared secret is a single `std` check, shared by 19
+  modules in this repository.** `X25519.scalarmult`'s `if (x2.isZero()) return
+  error.IdentityElement;` lives at `lib/std/crypto/25519/curve25519.zig` in the Zig
+  toolchain's own standard library — **not a file in `zig-libs`** at all, so there is nothing
+  in `modules/sealedbox/` (or in `modules/ct25519/`, or in any of the other 17 modules that
+  use X25519/Curve25519 the same way) that could be changed to add a second, independent
+  check. For `crypto_box_seal` itself this is not exploitable (an attacker who can seal
+  arbitrary plaintext gains nothing from a degenerate shared secret they chose themselves),
+  but it means the small-order-point rejection this module's behaviour depends on for other
+  callers is a property of the *installed compiler*, not of this repository, and would need
+  to be re-verified against any future Zig release that touches this file.
+
+These are the same two secrets `ecvrf` E4 named for the identical reason (both point back
+into `std.crypto.ecc.Edwards25519`/`Curve25519` internals this repository does not own);
+closing E4 as "document, don't chase" applies here without modification.
+
 ## Verification
 
 RFC 7748-cross-checked X25519 KATs, end-to-end serialize→deserialize→seal→open, tamper/forgery

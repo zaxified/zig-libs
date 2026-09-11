@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** `SPEC.md`
+  gains a "Known limitations" section documenting audit findings H2 and
+  M4 by exact location instead of leaving them open. Both point into the
+  Zig standard library this module calls (`std.crypto.nacl.SealedBox`'s
+  dependencies for H2's dead-stack secret copies; `lib/std/crypto/25519/
+  curve25519.zig`'s single `IdentityElement` check, shared by 19 modules
+  in this repository, for M4), not into `modules/sealedbox/`. Resolution
+  follows the precedent the user set for the identical class of finding
+  on `ecvrf` E4 (variant (b): document with the exact location, no
+  upstream report, no vendored copy — vendoring would reintroduce the
+  "no bespoke crypto" risk `SPEC.md`'s own design section rules out and
+  turn a small `std` file into a fork this repository would have to
+  track against every Zig release). Neither finding's underlying
+  behaviour changed; `grep -c "curve25519.zig\|H2 —\|M4 —\|Known limitations"
+  SPEC.md` is 0 before this entry, 4 after.
+
 - **2026-09-10** — A1 fix campaign, audit findings H1/M2/L2/L5/L6/L7 (0 consumers in the repo, `DECISIONS.md` P1/P4). ⏸ Root-cause note: every edit below that touches `src/root.zig` (L2, L6) invalidates the `scripts/ctgrind-expected.tsv` source-digest pin for this module (the digest is a hash over `root.zig` alone, since `src_digest` only hashes files that are both named by `PATTERN` and present in `src/`) and is **deferred for `--update-digests` re-pin at the end of the campaign**; the test-only and doc-only changes (H1, M2, L5, L3, L7, M5) touch `kat_test.zig`/`example/`/`SPEC.md` and do NOT move that digest.
   - **H1 (HIGH):** the AEAD tag check this module relies on (`std.crypto.timing_safe.eql` in std) had no test distinguishing a full 16-byte comparison from a weakened prefix comparison — measured 2026-09-09, every truncation from 1 to 15 bytes survived the suite (20/20 forgeries accepted under a 1-byte check). `kat_test.zig` gains a deterministic ladder test (N = 1/2/4/8): a tag built to match a real one in its first N bytes and provably differ at byte N is asserted to still be rejected. **NO CONSUMER-VISIBLE CHANGE** (test-only); does not touch `root.zig`.
   - **M2 (MEDIUM), second half:** `seal` had no fuzz harness at all (the first half — `fuzzOpen` drawing a zero length via a ranged `Smith` call — was already fixed 2026-09-07, before this audit's finding was written down). `kat_test.zig` gains `fuzzSeal`, fuzzing plaintext content/length through `seal` -> `open` round-trip. **NO CONSUMER-VISIBLE CHANGE**; does not touch `root.zig`.
