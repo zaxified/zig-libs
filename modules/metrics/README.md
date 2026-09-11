@@ -55,8 +55,8 @@ var ep = metrics.Endpoint{ .registry = &reg }; // .path defaults to "/metrics"
 
 var r = router.Router.init(gpa);
 defer r.deinit();
-try r.use(ep.middleware()); // outermost: scrapes are not counted as traffic
-try r.use(rm.middleware());
+try r.use(rm.middleware()); // default order (audit F12): scrapes ARE counted
+try r.use(ep.middleware()); // swap the two lines to opt out and keep scrapes uncounted instead
 try r.get("/api/thing", handler);
 ```
 

@@ -94,12 +94,21 @@ in src/root.zig.
 
 **Fuzz exemption:** EMIT-ONLY
 
-Produces the Prometheus text exposition format; it never parses it. Its three
-byte-accepting public functions (`Registry.counter`/`gauge`/`histogram`) take
-metric NAME, HELP and label strings that our own callers author in Zig source —
-there is no path from a socket to any of them. The router middleware it ships
-observes already-parsed `http.Request` values. Overturn this exemption the moment
-a scrape PARSER lands.
+Produces the Prometheus text exposition format and, via `AccessLog`, two
+log-line formats; it never parses any of them. Its three byte-accepting
+public functions (`Registry.counter`/`gauge`/`histogram`) take metric NAME,
+HELP and label strings that our own callers author in Zig source — there is
+no path from a socket to any of them. `AccessLog.log`/`onRequest` do see wire
+bytes (`entry.path`, unvalidated by HTTP/2 the way HTTP/1.1 validates it —
+audit F3) but only to EMIT them: writing is not parsing, and there is no
+decode failure this module could have on that path, only an escaping
+obligation, which it now meets (a byte outside valid UTF-8 becomes U+FFFD;
+control bytes get their `\uXXXX`/`\xHH` escape). Corrected 2026-09-12: this
+exemption previously also said "the router middleware it ships observes
+already-parsed `http.Request` values", which audit F3 disproved for h2's
+`:path` — the exemption survives on the EMIT-ONLY argument above, not on that
+sentence, which added nothing this argument does not already cover. Overturn
+this exemption the moment a scrape or access-log PARSER lands.
 
 ## Anchoring
 

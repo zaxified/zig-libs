@@ -122,18 +122,16 @@ fn monotonicNowNs(_: ?*anyopaque) u64 {
 
 // ── labels ──────────────────────────────────────────────────────────────────
 
-/// One label pair. Values are intended to be UTF-8 (escaped at exposition:
-/// `\`, `"` and newline) but this is not validated or enforced — a value
-/// containing invalid UTF-8 or unescaped control bytes is written through
-/// unchanged, and the resulting exposition can then be invalid UTF-8 despite
-/// the `charset=utf-8` `Content-Type` (see the module's audit, F6). Values
-/// are populated by this module's own callers (`@tagName`/status-class
-/// strings, or whatever the application passes to `counter`/`gauge`/
-/// `histogram`), never parsed from a request, so treat "UTF-8" here as a
-/// caller contract, not a guarantee this module checks. Names must match
-/// `[a-zA-Z_][a-zA-Z0-9_]*` and not start with `__` (reserved by
-/// Prometheus). Keep the *set of values* small and fixed — see the
-/// cardinality footgun in the module doc.
+/// One label pair. Values must be valid UTF-8 — checked at registration
+/// (`RegisterError.InvalidUtf8`; closes the module's audit F6, where an
+/// unvalidated value could make the exposition invalid UTF-8 despite its
+/// own `charset=utf-8` `Content-Type`). Values are escaped at exposition
+/// (`\`, `"` and newline). Names must match `[a-zA-Z_][a-zA-Z0-9_]*`, not
+/// start with `__` (reserved by Prometheus), and not be `le` or `quantile`
+/// (reserved for a histogram's own bucket bound / a summary's own quantile
+/// — `RegisterError.ReservedLabelName`, any instrument kind; audit F13).
+/// Keep the *set of values* small and fixed — see the cardinality footgun
+/// in the module doc.
 pub const Label = struct {
     name: []const u8,
     value: []const u8,
@@ -265,9 +263,31 @@ pub const RegisterError = error{
     OutOfMemory,
     /// Metric name must match `[a-zA-Z_:][a-zA-Z0-9_:]*`.
     InvalidName,
-    /// Label name must match `[a-zA-Z_][a-zA-Z0-9_]*`, not start with the
-    /// reserved `__`, and not be `le` on a histogram.
+    /// Label name must match `[a-zA-Z_][a-zA-Z0-9_]*` and not start with
+    /// the reserved `__`. (`le`/`quantile` are rejected too, but as
+    /// `ReservedLabelName`, not this.)
     InvalidLabelName,
+    /// The label name `le` (reserved for a histogram's own bucket bound) or
+    /// `quantile` (reserved for a summary, which this module does not
+    /// implement) was passed as a caller-supplied label — on ANY
+    /// instrument kind, matching client_golang's reserved-name check
+    /// (audit F13: previously only rejected on histograms, which let a
+    /// counter or gauge register a `le` label that then collided with a
+    /// same-named histogram's own bucket samples — see F5).
+    ReservedLabelName,
+    /// A label value or the HELP text is not valid UTF-8 (audit F6): the
+    /// exposition format's `Content-Type` promises `charset=utf-8`, so this
+    /// is checked once here rather than emitting bytes that break that
+    /// promise on every scrape.
+    InvalidUtf8,
+    /// This family's derived sample names (a histogram's `<name>_bucket`/
+    /// `_sum`/`_count`) collide with an existing family's name, or a new
+    /// family's name collides with an existing histogram's derived names,
+    /// in either registration order (audit F5). Prometheus's text-format
+    /// parser rejects the WHOLE scrape on a duplicate (name, labels) sample
+    /// or a repeated `# TYPE` line, so one misnamed counter can blind
+    /// monitoring for every family in the registry, not just itself.
+    NameCollision,
     /// Buckets must be finite and strictly increasing (deviation:
     /// client_golang silently strips a trailing `+Inf` and panics on
     /// unsorted input; we surface an error).
@@ -371,11 +391,15 @@ pub const Registry = struct {
 
     fn getOrRegister(r: *Registry, name: []const u8, help: []const u8, kind: Kind, labels: []const Label, buckets: []const f64) RegisterError!*Child {
         if (!validMetricName(name)) return error.InvalidName;
+        if (!std.unicode.utf8ValidateSlice(help)) return error.InvalidUtf8;
         if (labels.len > max_labels) return error.TooManyLabels;
         for (labels) |l| {
             if (!validLabelName(l.name)) return error.InvalidLabelName;
-            // `le` is the histogram bucket label — user labels must not collide.
-            if (kind == .histogram and std.mem.eql(u8, l.name, "le")) return error.InvalidLabelName;
+            // `le`/`quantile` are reserved on every kind (F13) — see
+            // `RegisterError.ReservedLabelName`.
+            if (std.mem.eql(u8, l.name, "le") or std.mem.eql(u8, l.name, "quantile"))
+                return error.ReservedLabelName;
+            if (!std.unicode.utf8ValidateSlice(l.value)) return error.InvalidUtf8;
         }
         if (kind == .histogram) {
             for (buckets, 0..) |b, i| {
@@ -389,6 +413,7 @@ pub const Registry = struct {
         defer r.lock.unlock();
 
         const fam = if (r.family_index.get(name)) |f| f else blk: {
+            try r.checkSuffixCollisionLocked(name, kind);
             const f = try a.create(Family);
             f.* = .{
                 .name = try a.dupe(u8, name),
@@ -441,6 +466,39 @@ pub const Registry = struct {
         };
         try fam.children.append(a, c);
         return c;
+    }
+
+    /// F5: reject a family whose derived sample names would collide with an
+    /// existing family, in either direction — a new histogram named `h`
+    /// when `h_bucket`/`h_sum`/`h_count` already exists as its own family,
+    /// or a new family literally named `h_bucket` (etc.) when `h` already
+    /// exists as a histogram. Must run under `r.lock`, and only for a
+    /// `name` not already in `family_index` — an existing family's own
+    /// get-or-register re-lookup cannot newly collide with itself.
+    ///
+    /// Metric names longer than the scratch buffer skip the "new histogram
+    /// vs. existing derived name" half of the check (the other half, "new
+    /// name vs. existing histogram", has no such limit — it slices `name`
+    /// itself, not a formatted copy). Prometheus/client_golang metric names
+    /// are conventionally well under this; the alternative is an
+    /// allocation on every histogram registration to guard a case this
+    /// module has never seen.
+    fn checkSuffixCollisionLocked(r: *Registry, name: []const u8, kind: Kind) RegisterError!void {
+        const suffixes = [_][]const u8{ "_bucket", "_sum", "_count" };
+        if (kind == .histogram) {
+            var buf: [256]u8 = undefined;
+            for (suffixes) |suf| {
+                const derived = std.fmt.bufPrint(&buf, "{s}{s}", .{ name, suf }) catch continue;
+                if (r.family_index.contains(derived)) return error.NameCollision;
+            }
+        }
+        for (suffixes) |suf| {
+            if (!std.mem.endsWith(u8, name, suf)) continue;
+            const base = name[0 .. name.len - suf.len];
+            if (r.family_index.get(base)) |f| {
+                if (f.kind == .histogram) return error.NameCollision;
+            }
+        }
     }
 
     // ── exposition ──────────────────────────────────────────────────────
@@ -632,9 +690,14 @@ fn validLabelName(s: []const u8) bool {
 /// pointer — it cannot close over the Registry (`Registry.respond` covers
 /// the write-your-own-handler case).
 ///
-/// Register it router-level *before* `RequestMetrics.middleware` so scrapes
-/// are not counted as traffic (or after, if you want them counted). The
-/// Endpoint must outlive the Router, at a stable address.
+/// Register it router-level *after* `RequestMetrics.middleware` (the safe
+/// default, audit F12/R3): a scrape then gets measured like any other
+/// request, so a flood of scrapes — otherwise the one kind of traffic that
+/// leaves no trace in `http_requests_total` or `http_requests_in_flight`,
+/// see the module's audit F2/F8 — is at least visible. Register it *before*
+/// only as a deliberate opt-out: uncounted scrapes, in exchange for
+/// request-rate numbers the scrape interval cannot skew. The Endpoint must
+/// outlive the Router, at a stable address.
 pub const Endpoint = struct {
     registry: *Registry,
     /// Byte-exact request path to intercept (router raw-matching rules).
@@ -737,30 +800,49 @@ pub const RequestMetrics = struct {
         on_request_ctx: ?*anyopaque = null,
     };
 
-    /// Validates the metric names and registers the in-flight gauge up
-    /// front (so misconfiguration fails here, not mid-request). The
-    /// Registry must outlive the returned value; the returned value must
-    /// sit at a stable address before `middleware()` is registered.
+    /// Validates the metric names and registers the in-flight gauge, the
+    /// request counter and the latency histogram families up front (so
+    /// misconfiguration — including a name collision with a family the
+    /// application already registered, audit F9 — fails here, not
+    /// mid-request, silently and forever). The Registry must outlive the
+    /// returned value; the returned value must sit at a stable address
+    /// before `middleware()` is registered.
     pub fn init(registry: *Registry, options: Options) RegisterError!RequestMetrics {
-        // Surface name/bucket problems now: touch each family once with a
-        // throwaway series that real traffic will also use... except the
-        // gauge, which is unlabeled and *is* the real series.
+        // Surface name/bucket problems now: touch each family once with the
+        // exact label set real traffic uses for the common case (a
+        // successful GET), so real traffic's first `counterFor`/
+        // `histogramFor` call just gets back this same series (see
+        // `getOrRegister`'s get-or-register semantics) rather than adding a
+        // distinct one — the in-flight gauge is the same idea, one step
+        // further: unlabeled, so the touch series *is* the real series.
         if (!validMetricName(options.counter_name)) return error.InvalidName;
         if (!validMetricName(options.histogram_name)) return error.InvalidName;
         for (options.buckets, 0..) |b, i| {
             if (!std.math.isFinite(b)) return error.InvalidBuckets;
             if (i > 0 and b <= options.buckets[i - 1]) return error.InvalidBuckets;
         }
+        const in_flight = try registry.gauge(options.in_flight_name, options.in_flight_help, &.{});
+        _ = try registry.counter(options.counter_name, options.counter_help, &.{
+            .{ .name = "method", .value = @tagName(http.Method.get) },
+            .{ .name = "code", .value = classLabel(2) },
+        });
+        _ = try registry.histogram(options.histogram_name, options.histogram_help, &.{
+            .{ .name = "method", .value = @tagName(http.Method.get) },
+        }, options.buckets);
         return .{
             .registry = registry,
             .options = options,
-            .in_flight = try registry.gauge(options.in_flight_name, options.in_flight_help, &.{}),
+            .in_flight = in_flight,
         };
     }
 
     /// The `router.Middleware` (`state` = this RequestMetrics). Register it
-    /// router-level, before routes (chi's rule), typically *after* the
-    /// `Endpoint` middleware so scrapes go unrecorded.
+    /// router-level, before routes (chi's rule), and — by default —
+    /// *before* the `Endpoint` middleware, so a scrape is measured like any
+    /// other request instead of being the one kind of traffic telemetry
+    /// never sees (audit F12/R3). Register it after `Endpoint` only when
+    /// you have deliberately chosen scrape-noise-free request-rate numbers
+    /// over that visibility.
     pub fn middleware(m: *RequestMetrics) router.Middleware {
         return .{ .state = m, .run = requestRun };
     }
@@ -900,15 +982,16 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
 /// buffers). The writer is flushed after each line so records reach the sink
 /// promptly; pass a buffered `writer` if you would rather batch and flush
 /// yourself with `synchronized = false`. Writer errors are swallowed — an
-/// access log must never fail the request that produced it — and odd bytes
-/// in path/method never panic. That is weaker than "escaped": the JSON
-/// writer escapes `"`, `\` and control bytes 0x00-0x1F/0x7F (valid-JSON
-/// guarantee) but passes 0x80-0xFF through raw, and `path` is unvalidated
-/// bytes from the request line — HTTP/2 does not bound them the way HTTP/1.1
-/// does (see the module's audit, F3). A path containing such a byte
-/// (reachable, not just theoretical) produces a `.json` line that is no
-/// longer valid UTF-8/JSON, though still a complete, well-formed line with
-/// no injected structure (the quote/backslash escaping still holds).
+/// access log must never fail the request that produced it. `path` is
+/// unvalidated bytes from the request line — HTTP/2 does not bound them to
+/// printable ASCII the way HTTP/1.1 does — but neither writer panics on
+/// them, and neither can produce an injection (quote/backslash escaping
+/// holds either way): the JSON writer escapes `"`, `\` and control bytes
+/// 0x00-0x1F, and replaces any byte that is not part of a valid UTF-8
+/// sequence with U+FFFD, one byte at a time, so its output is always valid
+/// JSON and valid UTF-8 (closes the module's audit F3 — PROBE H no longer
+/// reproduces); the CLF writer additionally escapes DEL (0x7F) as `\xHH`
+/// and passes 0x80-0xFF through raw (CLF carries no UTF-8 promise to keep).
 pub const AccessLog = struct {
     writer: *std.Io.Writer,
     options: Options,
@@ -981,21 +1064,47 @@ pub const AccessLog = struct {
 };
 
 /// Write `s` as a double-quoted JSON string, escaping the characters JSON
-/// requires (`"`, `\`, and control bytes). Bytes ≥ 0x20 pass through verbatim,
-/// so invalid UTF-8 can never trigger a decode panic.
+/// requires (`"`, `\`, and control bytes 0x00-0x1F). Bytes >= 0x20 that
+/// belong to a valid UTF-8 sequence pass through verbatim; a byte that does
+/// not (F3 in the module's audit -- reachable in `entry.path` via h2, which
+/// does not bound `:path` to printable ASCII the way h1 does) is replaced
+/// with U+FFFD, one byte at a time, so a single bad byte cannot
+/// desynchronize the rest of the string. RFC 9110's obs-text allows
+/// 0x80-0xFF in a field value, so `http` is right not to reject it -- this
+/// module is where "always valid JSON, always valid UTF-8" has to hold.
 fn writeJsonString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
     try w.writeByte('"');
-    for (s) |c| switch (c) {
-        '"' => try w.writeAll("\\\""),
-        '\\' => try w.writeAll("\\\\"),
-        0x08 => try w.writeAll("\\b"),
-        0x09 => try w.writeAll("\\t"),
-        0x0A => try w.writeAll("\\n"),
-        0x0C => try w.writeAll("\\f"),
-        0x0D => try w.writeAll("\\r"),
-        0x00...0x07, 0x0B, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
-        else => try w.writeByte(c),
-    };
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => try w.writeAll("\\\""),
+                '\\' => try w.writeAll("\\\\"),
+                0x08 => try w.writeAll("\\b"),
+                0x09 => try w.writeAll("\\t"),
+                0x0A => try w.writeAll("\\n"),
+                0x0C => try w.writeAll("\\f"),
+                0x0D => try w.writeAll("\\r"),
+                0x00...0x07, 0x0B, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{c}),
+                else => try w.writeByte(c),
+            }
+            i += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(c) catch {
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        try w.writeAll(s[i .. i + seq_len]);
+        i += seq_len;
+    }
     try w.writeByte('"');
 }
 
@@ -1095,8 +1204,16 @@ test "registration: validation and mismatch errors" {
     // Label names.
     try testing.expectError(error.InvalidLabelName, reg.counter("a_total", "x", &.{.{ .name = "__res", .value = "v" }}));
     try testing.expectError(error.InvalidLabelName, reg.counter("a_total", "x", &.{.{ .name = "0bad", .value = "v" }}));
-    try testing.expectError(error.InvalidLabelName, reg.histogram("h1", "x", &.{.{ .name = "le", .value = "v" }}, &.{}));
-    _ = try reg.counter("a_total", "x", &.{.{ .name = "le", .value = "v" }}); // `le` fine on counters
+    try testing.expectError(error.ReservedLabelName, reg.histogram("h1", "x", &.{.{ .name = "le", .value = "v" }}, &.{}));
+    // F13: `le`/`quantile` are reserved on EVERY instrument kind now, not
+    // just histograms/summaries — client_golang reserves both regardless of
+    // kind, and this module's own bucket `le` / (unimplemented) summary
+    // `quantile` never flow through this caller-supplied label path, so
+    // there is no legitimate use of either name here. Previously `le` was
+    // accepted on a counter, which is the exact mechanism F5's collision
+    // (`<h>_bucket{le=...}`) needed.
+    try testing.expectError(error.ReservedLabelName, reg.counter("a_total", "x", &.{.{ .name = "le", .value = "v" }}));
+    try testing.expectError(error.ReservedLabelName, reg.gauge("a_gauge", "x", &.{.{ .name = "quantile", .value = "0.5" }}));
 
     // Too many labels.
     const many: [max_labels + 1]Label = @splat(.{ .name = "l", .value = "v" });
@@ -1126,6 +1243,56 @@ test "registration: validation and mismatch errors" {
     // this one can only pass if the full name is compared.
     _ = try reg.counter("d_total", "help", &.{.{ .name = "method", .value = "a" }});
     try testing.expectError(error.LabelMismatch, reg.counter("d_total", "help", &.{.{ .name = "mangle", .value = "a" }}));
+}
+
+// F5 in the module's audit (PROBE B): a histogram's derived sample names
+// (`<name>_bucket`/`_sum`/`_count`) are not reserved against a *different*
+// family taking the same name. Two samples with the identical (name,
+// labels) tuple and different values -- or a `# TYPE` line that
+// contradicts an earlier one for the same name -- make Prometheus reject
+// the whole scrape, so one misnamed counter blinds monitoring for every
+// other family in the registry. client_golang has `checkSuffixCollisions`
+// for exactly this; this module had nothing.
+test "registration: a histogram's derived names collide with another family, both directions (F5)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    _ = try reg.histogram("job_seconds", "Job latency.", &.{}, &.{ 0.5, 1 });
+    try testing.expectError(error.NameCollision, reg.counter("job_seconds_bucket", "Unrelated counter.", &.{}));
+    try testing.expectError(error.NameCollision, reg.counter("job_seconds_sum", "x", &.{}));
+    try testing.expectError(error.NameCollision, reg.counter("job_seconds_count", "x", &.{}));
+    // Getting the SAME histogram again is not a collision with itself.
+    _ = try reg.histogram("job_seconds", "Job latency.", &.{}, &.{ 0.5, 1 });
+
+    // The other direction: the plain name arrives first, the histogram
+    // whose derived name would collide with it arrives second.
+    _ = try reg.counter("other_bucket", "x", &.{});
+    try testing.expectError(error.NameCollision, reg.histogram("other", "x", &.{}, &.{}));
+    // A non-histogram family named `<x>_bucket` does not collide with a
+    // SAME-KIND family `<x>` -- only a histogram's reserved suffixes do.
+    _ = try reg.counter("plain", "x", &.{});
+    _ = try reg.counter("plain_bucket", "x", &.{});
+}
+
+// F6 in the module's audit (PROBE A): `Content-Type` promises
+// `charset=utf-8`, but neither a label value nor HELP text was ever
+// checked, so a caller-supplied byte outside UTF-8 (or a raw control byte)
+// went to the wire unescaped and made the exposition invalid UTF-8 despite
+// its own header. Checked once at registration, which is cheaper than
+// checking it on every scrape (per-scrape checking was the audit's other
+// option, rejected as more expensive for a caller-time defect).
+test "registration: invalid UTF-8 in a label value or HELP text is rejected (F6)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    try testing.expectError(error.InvalidUtf8, reg.counter("a_total", "x", &.{.{ .name = "l", .value = "a\xffb" }}));
+    try testing.expectError(error.InvalidUtf8, reg.counter("a_total", "x", &.{.{ .name = "l", .value = "a\x80b" }}));
+    try testing.expectError(error.InvalidUtf8, reg.counter("b_total", "bad\xffhelp", &.{}));
+    // Valid multi-byte UTF-8 ("café") and plain control bytes that ARE
+    // valid UTF-8 (a literal NUL) both still register -- this rejects
+    // invalid BYTES, not the wider set of "bytes F6 also worried about".
+    _ = try reg.counter("c_total", "valid utf8: caf\xc3\xa9", &.{});
+    _ = try reg.counter("d_total", "x", &.{.{ .name = "l", .value = "a\x00b" }});
 }
 
 test "registration copies its inputs (stack temporaries are safe)" {
@@ -1786,7 +1953,7 @@ test "middleware: counts by method + status class, times with the injected clock
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
     r.state = &rm;
-    try r.use(ep.middleware()); // outermost: scrapes are NOT recorded
+    try r.use(ep.middleware()); // opt-out order (F12): scrapes NOT recorded
     try r.use(rm.middleware());
     try r.get("/ok", hInFlightProbe);
     try r.post("/ok", hCreated);
@@ -1826,10 +1993,47 @@ test "middleware: counts by method + status class, times with the injected clock
     try expectBodyLine(got, "http_request_duration_seconds_count{method=\"get\"} 5");
     try expectBodyLine(got, "http_request_duration_seconds_count{method=\"post\"} 1");
     try expectBodyLine(got, "http_request_duration_seconds_count{method=\"put\"} 1");
-    // In-flight is back at zero — and the scrape itself was not counted
-    // (the whole http_requests_total family sums to 7).
+    // In-flight is back at zero — and, in this opt-out order (F12), the
+    // scrape itself was not counted (the whole http_requests_total family
+    // sums to 7, not 8).
     try expectBodyLine(got, "http_requests_in_flight 0");
     try testing.expect(std.mem.indexOf(u8, bodyOf(got), "/metrics") == null);
+}
+
+// F12/R3 in the module's audit: the safe DEFAULT order (`RequestMetrics`
+// registered before `Endpoint`, now the recommendation on both doc
+// comments above) counts a scrape like any other request — the mirror
+// image of the "opt-out order" test above, which put `Endpoint` first and
+// got an UNcounted scrape. A flood of scrapes (audit F2/F8) is otherwise
+// the one kind of traffic that leaves zero trace in `http_requests_total`
+// or `http_requests_in_flight`.
+test "middleware: registering RequestMetrics before Endpoint counts the scrape (F12 default)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+    var rm = try RequestMetrics.init(&reg, .{});
+    var ep: Endpoint = .{ .registry = &reg };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.use(rm.middleware()); // default order (F12): scrapes ARE recorded
+    try r.use(ep.middleware());
+    try r.get("/ok", hOk);
+
+    var buf: [8192]u8 = undefined;
+    try expectStatus(runWire(&r, wire("GET", "/ok"), &buf), "200");
+
+    // A scrape's own count is recorded only after its response is fully
+    // written (the `defer` in `requestRun` runs after `next.run` returns),
+    // so the FIRST scrape's body still reflects just the one prior "/ok"
+    // request -- it cannot see itself.
+    const scrape1 = runWire(&r, wire("GET", "/metrics"), &buf);
+    try expectBodyLine(scrape1, "http_requests_total{method=\"get\",code=\"2xx\"} 1");
+
+    // A SECOND scrape now sees the first scrape's own increment -- proof
+    // that, in this order, a scrape is traffic like any other, not the
+    // blind spot F12 describes.
+    const scrape2 = runWire(&r, wire("GET", "/metrics"), &buf);
+    try expectBodyLine(scrape2, "http_requests_total{method=\"get\",code=\"2xx\"} 2");
 }
 
 test "middleware: a status outside 100-599 falls into the 'other' class" {
@@ -1932,6 +2136,35 @@ test "middleware: custom names and buckets" {
     // Bad configuration fails at init, not mid-request.
     try testing.expectError(error.InvalidName, RequestMetrics.init(&reg, .{ .counter_name = "no way" }));
     try testing.expectError(error.InvalidBuckets, RequestMetrics.init(&reg, .{ .buckets = &.{ 2, 1 } }));
+}
+
+// F9 in the module's audit (PROBE J): the doc comment on `init` has always
+// promised "misconfiguration fails here, not mid-request", but `init` only
+// ever touched the in-flight gauge — never the counter or histogram
+// families it is actually about. If the application registers
+// `http_requests_total` itself first (the most common metric name in the
+// whole Prometheus ecosystem), with a different type, help or label set,
+// `init` returned OK, requests kept being served 200, and the request
+// counter silently and permanently never appeared — no error, no log line,
+// nowhere. The latency histogram (different family name) kept working,
+// so a dashboard would show real latency with a zero request rate: it
+// reads as "no traffic", not "broken metrics".
+test "middleware: init fails when the request counter's name collides with an app-registered family (F9)" {
+    var reg = Registry.init(testing.allocator);
+    defer reg.deinit();
+
+    // The application registered its own "http_requests_total" first, as
+    // a gauge instead of a counter — same shape as PROBE J.
+    _ = try reg.gauge("http_requests_total", "some app metric", &.{});
+
+    try testing.expectError(error.WrongType, RequestMetrics.init(&reg, .{}));
+
+    // Same idea, but the histogram family this time — a different (but
+    // equally real) way `init` used to let a collision through unnoticed.
+    var reg2 = Registry.init(testing.allocator);
+    defer reg2.deinit();
+    _ = try reg2.gauge("http_request_duration_seconds", "some app metric", &.{});
+    try testing.expectError(error.WrongType, RequestMetrics.init(&reg2, .{}));
 }
 
 const HookCapture = struct {
@@ -2092,7 +2325,7 @@ test "integration: request middleware + /metrics endpoint over loopback" {
 
     var r = router.Router.init(testing.allocator);
     defer r.deinit();
-    try r.use(ep.middleware()); // scrapes not counted
+    try r.use(ep.middleware()); // opt-out order (F12): scrapes not counted
     try r.use(rm.middleware());
     try r.get("/ok", hOk);
     try r.post("/ok", hCreated);
@@ -2194,6 +2427,50 @@ test "AccessLog: json format writes one object per request; specials escaped" {
     try testing.expectEqualStrings(
         "{\"method\":\"GET\",\"path\":\"/api/\\\"weird\\\"\\tpath\"," ++
             "\"status\":200,\"duration_ns\":1500,\"bytes\":1234}\n",
+        w.buffered(),
+    );
+}
+
+// F3 in the module's audit: h2 does not bound `:path` to printable ASCII
+// the way h1's `MalformedHead` guard does (`h1.zig:438` vs.
+// `h2_server.zig:1416-1419`), so a byte that is not part of any valid UTF-8
+// sequence is reachable in `entry.path` from the wire (PROBE H measured
+// this end to end: a raw 0xFF made the whole access-log line fail both
+// `std.unicode.utf8ValidateSlice` and `std.json`'s parse). RFC 9110's
+// obs-text explicitly allows 0x80-0xFF in a field value, so the fix belongs
+// on this side -- the module turning bytes into JSON -- not in `http`.
+test "AccessLog: json format replaces an invalid UTF-8 byte with U+FFFD, one byte at a time (F3)" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json });
+
+    access.log(.{ .method = .get, .path = "/a\xffb", .status = 404, .duration_ns = 1, .bytes = 0 });
+
+    const got = w.buffered();
+    try testing.expectEqualStrings(
+        "{\"method\":\"GET\",\"path\":\"/a\u{FFFD}b\"," ++
+            "\"status\":404,\"duration_ns\":1,\"bytes\":0}\n",
+        got,
+    );
+    try testing.expect(std.unicode.utf8ValidateSlice(got));
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, got, .{});
+    defer parsed.deinit();
+}
+
+// A valid multi-byte UTF-8 sequence (unlike a lone invalid byte, above)
+// must pass through unchanged -- the fix decodes one sequence at a time
+// rather than rejecting every byte >= 0x80, which would mangle any
+// legitimately non-ASCII path.
+test "AccessLog: json format passes a valid multi-byte UTF-8 sequence through unchanged" {
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var access = AccessLog.init(&w, .{ .format = .json });
+
+    access.log(.{ .method = .get, .path = "/caf\xc3\xa9", .status = 200, .duration_ns = 1, .bytes = 0 }); // "café"
+
+    try testing.expectEqualStrings(
+        "{\"method\":\"GET\",\"path\":\"/caf\xc3\xa9\"," ++
+            "\"status\":200,\"duration_ns\":1,\"bytes\":0}\n",
         w.buffered(),
     );
 }
