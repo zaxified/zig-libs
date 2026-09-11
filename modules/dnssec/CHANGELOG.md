@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-12** — **BEHAVIOURAL, not breaking: F3 closed (round 2, Q6).**
+  `nsec.proveDenial` and `nsec3.proveDenial` returned two DIFFERENT verdicts
+  for the identical protocol state: an unsigned delegation (NS in the
+  bitmap, no SOA, no DS), queried for DS. `nsec.zig` returned `.insecure`
+  (its own comment: "the NSEC counterpart of the NSEC3 Opt-Out downgrade");
+  `nsec3.zig`'s direct-match branch had no equivalent check and always fell
+  through to `.no_data`. Decided by consulting a second implementation as
+  `DECISIONS.md` §2 required, unblocked by round-2 Q6 (`unbound-host`
+  installed 2026-09-11): a real zone with exactly this bitmap shape at a
+  real delegation point (`ldns-keygen`/`ldns-signzone -n`, served over
+  loopback via `ldns-testns`, `unbound-host -C` pointed at it with a
+  `stub-zone` and a `trust-anchor` matching the generated key — recipe in
+  `nsec3.zig`'s new test and module doc comment; not committed, built in
+  `.zig-cache/probe/dnssec-f3/`) makes unbound's own validator log
+  `NSEC3s for the referral proved no DS.` / `Verified that unsigned
+  response is INSECURE` — confirming `nsec.zig`'s `.insecure` is the
+  correct verdict and `nsec3.zig`'s `.no_data` was the one to fix.
+  `nsec3.proveDenial`'s direct-match branch gained the exact mirror of
+  `nsec.zig`'s check (`qtype == ds_type and NS present and SOA absent and
+  DS absent -> .insecure`), gated so a NODATA query for any OTHER type at
+  the same bitmap still returns the ordinary `.no_data` (positive control
+  in the new test). Measured: mutant (`if (false and ...)`) ->
+  `expected .insecure, found .no_data`. Restored -> `scripts/modtest
+  dnssec`: 98/98 (was 97), Debug and ReleaseFast. 0 consumers in the repo
+  (re-verified against `example-apps/` too) — P1 applies, no downstream
+  fix needed.
+
 - **2026-09-12** — **BEHAVIOURAL, not breaking: `dns` audit F7 consumer fix
   (round 2, Q7).** `canonical.buildSignedData`'s per-record consistency
   check compared only `Record.name` TEXT against `owner_name`, so three
