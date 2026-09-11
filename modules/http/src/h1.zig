@@ -38,6 +38,14 @@ const Line = struct {
     /// separately from `bytes` because a caller may pass no destination at
     /// all and still need to recognise the end of a header section.
     blank: bool,
+    /// Total bytes this line occupied on the wire, INCLUDING any dropped
+    /// for overflowing `dest` (unlike `bytes.len`, which is clamped to
+    /// `dest`). A caller that needs to bound how much wire a line class can
+    /// cost — even one it passes an empty or tiny `dest` to discard into —
+    /// reads this, not `bytes.len` (A1 http F5: the chunked trailer section
+    /// used `dest.len == 0` for discarded lines, so nothing about `bytes`
+    /// could have bounded it).
+    raw_len: usize,
 };
 
 /// Read one `\n`-terminated line into `dest`, scanning what has arrived and
@@ -57,6 +65,16 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
     var len: usize = 0;
     var overflow = false;
     var blank = true;
+    // Raw byte count of the line seen so far, INCLUDING bytes dropped for
+    // being past `dest`'s capacity (`len` is clamped to `dest.len` and
+    // cannot tell a two-byte line from a longer one when `dest` is empty —
+    // exactly the case `body_crlf`/`trailers` call with below). A genuine
+    // terminator is `\r\n`, i.e. raw_len == 2; anything else composed only
+    // of `\r`/`\n` bytes (a bare `\n`, or `\r\r\n`, …) is a malformed line
+    // that must NOT be mistaken for the terminator (A1 http F4: a bare LF
+    // silently ended the head / the chunk trailer / the post-chunk CRLF,
+    // letting a smuggled second message ride along as if it were body).
+    var raw_len: usize = 0;
     while (true) {
         const avail = r.peekGreedy(1) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
@@ -64,6 +82,7 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
         };
         const nl = std.mem.indexOfScalar(u8, avail, '\n');
         const take = if (nl) |i| i + 1 else avail.len;
+        raw_len += take;
         // Only worth scanning while it could still be blank, which is only
         // ever the terminator line and the first byte settles it.
         if (blank) for (avail[0..take]) |b| {
@@ -77,7 +96,7 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
         len += n;
         if (n < take) overflow = true;
         r.toss(take);
-        if (nl != null) return .{ .bytes = dest[0..len], .overflow = overflow, .blank = blank };
+        if (nl != null) return .{ .bytes = dest[0..len], .overflow = overflow, .blank = blank and raw_len == 2, .raw_len = raw_len };
     }
 }
 
@@ -585,8 +604,29 @@ pub const ChunkedReader = struct {
     /// meaningful: a chunk size is at most 16 hex digits, so everything the
     /// parse depends on is in the first 17 bytes.
     line_buf: [32]u8 = undefined,
+    /// Total wire bytes spent on the trailer section so far (every line,
+    /// captured or dropped — see `raw_len`). Checked against
+    /// `max_trailer_bytes` on every trailer line.
+    trailer_bytes_seen: u64 = 0,
+    /// Cap on the trailer section's total wire bytes — length of any one
+    /// line AND the number of lines, since each costs at least the 2 bytes
+    /// of its CRLF (A1 http F5). Unlike `trailer_buf`, this is enforced even
+    /// when trailers are not being captured at all (`trailer_buf.len == 0`,
+    /// the default): before this field existed, a discarded trailer section
+    /// had literally nothing bounding it but the connection's read timeout —
+    /// `max_body_bytes` on the body proper does not apply, because trailer
+    /// bytes are consumed inside this decoder's own read loop and never
+    /// cross the `Reader` interface `RequestBody.Capped` counts against.
+    max_trailer_bytes: u64 = default_max_trailer_bytes,
 
-    pub const FailReason = enum { malformed_chunk, truncated_body };
+    /// 32 KiB: generous for real trailers (a checksum, a signature, a
+    /// handful of `Trailer`-advertised fields) and small next to any body
+    /// cap worth having, so it changes nothing for a well-behaved peer while
+    /// giving an attacker a bounded amount of free parsing instead of an
+    /// unbounded one.
+    pub const default_max_trailer_bytes: u64 = 32 * 1024;
+
+    pub const FailReason = enum { malformed_chunk, truncated_body, trailer_too_large };
 
     const State = union(enum) {
         chunk_header,
@@ -641,15 +681,25 @@ pub const ChunkedReader = struct {
             switch (c.state) {
                 .done => return error.EndOfStream,
                 .chunk_header => {
-                    // ⭐ Truncation at `line_buf` cannot change the verdict.
-                    // A chunk size is at most 16 hex digits, so a ';' that
-                    // ends a valid size sits at index 16 or less -- well
-                    // inside the buffer. A line long enough to be cut here
-                    // therefore either carries its ';' in the kept prefix,
-                    // and parses to the same size, or carries none, and is
-                    // rejected for a size text over 16 digits. Both are what
-                    // the whole line would have produced.
-                    const line = trimLineEnd((try c.takeLineRaw(&c.line_buf)).bytes);
+                    // Overflow here cannot change the verdict either way: a
+                    // chunk size is at most 16 hex digits, so a ';' that ends
+                    // a valid size sits at index 16 or less -- well inside
+                    // `line_buf` -- and a line long enough to overflow it
+                    // already fails the size-length check below. Rejecting
+                    // it directly just skips the detour.
+                    const raw_line = try c.takeLineRaw(&c.line_buf);
+                    if (raw_line.overflow) return c.fail(.malformed_chunk);
+                    // RFC 9112 §4.1's chunk grammar is `chunk-size CRLF`, and
+                    // this decoder does not take the §2.2 leniency for a bare
+                    // LF here any more than `RequestHead.parse` does for a
+                    // header line (A1 http F4): `"5\nhello\n0\n\n"` used to
+                    // decode clean because `trimLineEnd` strips a trailing
+                    // `\n` with or without a preceding `\r`. A line that does
+                    // not end in exactly `\r\n` is malformed.
+                    const raw = raw_line.bytes;
+                    if (raw.len < 2 or raw[raw.len - 2] != '\r' or raw[raw.len - 1] != '\n')
+                        return c.fail(.malformed_chunk);
+                    const line = raw[0 .. raw.len - 2];
                     // "<hex-size>[;extensions]"
                     const size_text = if (std.mem.indexOfScalar(u8, line, ';')) |i| line[0..i] else line;
                     if (size_text.len == 0 or size_text.len > 16) return c.fail(.malformed_chunk);
@@ -684,6 +734,17 @@ pub const ChunkedReader = struct {
                     // line is bounded by the space left in it and not by the
                     // reader's buffer.
                     const line = try c.takeLineRaw(c.trailer_buf[c.trailer_len..]);
+                    // A1 http F5: `max_body_bytes` never saw these bytes —
+                    // they never cross `Capped`'s outer `Reader` interface,
+                    // they are consumed right here — so neither one oversize
+                    // line nor an unbounded NUMBER of small ones cost
+                    // anything before this. `raw_len` (not `bytes.len`)
+                    // counts a dropped-for-overflow line's full wire cost
+                    // too, so a discarding caller (`trailer_buf.len == 0`,
+                    // the common case) is bounded exactly like a capturing
+                    // one.
+                    c.trailer_bytes_seen += line.raw_len;
+                    if (c.trailer_bytes_seen > c.max_trailer_bytes) return c.fail(.trailer_too_large);
                     if (line.blank) {
                         c.state = .done;
                     } else if (c.trailer_buf.len != 0) {
@@ -1318,6 +1379,31 @@ test "ChunkedReader rejects malformed and truncated input" {
     }
 }
 
+test "ChunkedReader: bare LF anywhere in chunk framing is rejected, not silently accepted (A1 http F4)" {
+    // RFC 9112 §4.1's grammar is `chunk-size CRLF` / chunk-data `CRLF` /
+    // trailer-section `CRLF`, and this decoder does not take the §2.2
+    // leniency in any of the three slots, matching `RequestHead.parse`'s
+    // own strictness. Audit repro `"5\nhello\n0\n\n"` used to decode clean
+    // to "hello" because `trimLineEnd`/the old loose `.blank` accepted a
+    // bare LF at every one of these positions.
+    const cases = [_]struct { wire: []const u8, reason: ChunkedReader.FailReason }{
+        .{ .wire = "5\nhello\r\n0\r\n\r\n", .reason = .malformed_chunk }, // bare LF ends the chunk-size line
+        .{ .wire = "5\r\nhello\n0\r\n\r\n", .reason = .malformed_chunk }, // bare LF as the post-chunk-data terminator
+        .{ .wire = "5\r\nhello\r\n0\r\n\n", .reason = .truncated_body }, // bare LF offered as the trailer terminator: not recognized, decoder wants a real one
+    };
+    for (cases) |case| {
+        var src: Reader = .fixed(case.wire);
+        var cbuf: [64]u8 = undefined;
+        var cr: ChunkedReader = .init(&src, &cbuf);
+        var out: [256]u8 = undefined;
+        var w: Writer = .fixed(&out);
+        try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+        try testing.expectEqual(case.reason, cr.fail_reason.?);
+    }
+    // All-CRLF control still decodes.
+    try expectChunkedDecode("5\r\nhello\r\n0\r\n\r\n", "hello");
+}
+
 test "ChunkedReader: chunk-size at exactly the 16 hex-digit cap still decodes (F9 boundary)" {
     // Positive control for the guard above: 16 digits is the documented
     // ceiling, not one past it, and must not be rejected as collateral.
@@ -1356,6 +1442,47 @@ test "ChunkedReader: trailer capture overflow is flagged, body still decodes" {
     try testing.expectEqualStrings("abc", w.buffered());
     try testing.expect(cr.trailers_overflow);
     try testing.expect(cr.trailer("x-big") == null); // dropped, not truncated-in
+}
+
+test "ChunkedReader: the trailer section is bounded, in both a single line's length and the number of lines (A1 http F5)" {
+    // Before `max_trailer_bytes` existed, NOTHING bounded the trailer
+    // section once it was being discarded (`trailer_buf.len == 0`, the
+    // common case for a caller that does not want trailers at all):
+    // `trailers_overflow` only fires when a buffer was supplied and is too
+    // small, and even then the excess is still drained off the wire one
+    // line at a time, unbounded. The audit's two shapes: one line far
+    // larger than any real trailer, and many small lines that individually
+    // look harmless.
+    const one_huge_line = "3\r\nabc\r\n0\r\nX-Big: " ++ ("z" ** 40_000) ++ "\r\n\r\n";
+    const many_small_lines = "3\r\nabc\r\n0\r\n" ++ ("A: 1\r\n" ** 6_000) ++ "\r\n";
+    for ([_][]const u8{ one_huge_line, many_small_lines }) |wire| {
+        // Discarding (no trailer_buf) — the shape that previously had no
+        // bound at all.
+        {
+            var src: Reader = .fixed(wire);
+            var cbuf: [64]u8 = undefined;
+            var cr: ChunkedReader = .init(&src, &cbuf);
+            var out: [64]u8 = undefined;
+            var w: Writer = .fixed(&out);
+            try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+            try testing.expectEqual(ChunkedReader.FailReason.trailer_too_large, cr.fail_reason.?);
+        }
+        // Capturing into a buffer big enough that `trailers_overflow` alone
+        // would never have caught this — the cap is on wire bytes consumed,
+        // not on what fits the capture buffer.
+        {
+            var src: Reader = .fixed(wire);
+            var cbuf: [64]u8 = undefined;
+            var tbuf: [64 * 1024]u8 = undefined;
+            var cr: ChunkedReader = .initCapturingTrailers(&src, &cbuf, &tbuf);
+            var out: [64]u8 = undefined;
+            var w: Writer = .fixed(&out);
+            try testing.expectError(error.ReadFailed, cr.reader.streamRemaining(&w));
+            try testing.expectEqual(ChunkedReader.FailReason.trailer_too_large, cr.fail_reason.?);
+        }
+    }
+    // Positive control: a real, modestly sized trailer section is unaffected.
+    try expectChunkedDecode("3\r\nabc\r\n0\r\nX-Checksum: deadbeef\r\n\r\n", "abc");
 }
 
 test "ContentLengthReader yields exactly n bytes" {

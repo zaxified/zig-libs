@@ -223,25 +223,34 @@ pub const RequestOptions = struct {
     /// redirects). For streaming uploads use `requestStreaming`.
     body: ?[]const u8 = null,
     follow_redirects: bool = true,
-    /// The destination gate for redirects (A1 G5): consulted with the URL
-    /// being left and the resolved `Location` before any dial to the
-    /// latter; `false` ends the request with `error.RedirectRefused`
-    /// (nothing was sent to the refused host). This is where a consumer
-    /// that lets a user supply a URL keeps a 3xx from walking it onto a
-    /// loopback, link-local or RFC 1918 address, or off an allow-list of
+    /// The destination gate, consulted before any dial (A1 G5; extended
+    /// 2026-09-11 to cover the FIRST dial too — see `RedirectFilter.allow`).
+    /// `false` ends the request with `error.RedirectRefused` (nothing was
+    /// sent to the refused host). This is where a consumer that lets a user
+    /// supply a URL keeps it — or a 3xx it answers with — from walking onto
+    /// a loopback, link-local or RFC 1918 address, or off an allow-list of
     /// hosts — without turning `follow_redirects` off and re-implementing
-    /// the chain. `null` = every redirect within `Options.max_redirects` is
-    /// followed, as before: **a consumer that follows redirects across
-    /// origins without setting this has no destination gate** (a recorded
-    /// default, see SPEC.md — credentials are stripped on such a hop,
-    /// destinations are not judged). The first hop is the caller's own URL
-    /// and is not gated here.
+    /// the chain. `null` = every destination, first hop and every redirect
+    /// within `Options.max_redirects`, is dialed unexamined, as before:
+    /// **a consumer that does not set this has no destination gate at all**
+    /// (a recorded default, see SPEC.md — credentials are stripped on a
+    /// cross-origin redirect hop, destinations are not judged).
     redirect_filter: ?RedirectFilter = null,
 };
 
 pub const RedirectFilter = struct {
     ctx: ?*anyopaque = null,
-    /// `from` is the URL that answered 3xx, `to` the resolved target.
+    /// Consulted before every dial this request makes. `from` is the URL
+    /// that produced `to`: the URL that answered 3xx for a redirect hop, or
+    /// — for the very first dial, no redirect involved — `to` itself
+    /// (`from == to` is how a filter distinguishes "this is the caller's
+    /// own destination" from "this is where a redirect wants to send you").
+    /// A filter that only cares about judging redirects, matching this
+    /// seam's original shape, can open by checking whether `from` and `to`
+    /// are the same value (a plain field-by-field comparison, or comparing
+    /// whatever request-scoped identity the caller already tracks) and
+    /// returning `true` early when they are — on the first-dial call they
+    /// are always identical, never merely equal-looking.
     allow: *const fn (ctx: ?*anyopaque, from: http.Url, to: http.Url) bool,
 };
 
@@ -370,6 +379,15 @@ fn requestInner(c: *Client, method: http.Method, url_text: []const u8, options: 
 
     var url = try http.Url.parse(url_text);
     try validateHeaders(options.headers);
+    // A1 G5 (extended 2026-09-11): the caller's OWN destination is gated
+    // too, not just a redirect target — before this, `redirect_filter`
+    // covered only hop-to-hop, so a consumer that lets a user supply the
+    // request URL directly (no redirect involved at all) had no gate on it.
+    // `from == to` here is how a filter tells the first dial apart from an
+    // actual redirect hop (see `RedirectFilter.allow`'s doc).
+    if (options.redirect_filter) |f| {
+        if (!f.allow(f.ctx, url, url)) return error.RedirectRefused;
+    }
     // Slices in `original_url` point into `url_text` (caller-owned, valid for
     // the whole call), so keeping this copy around stays valid even after
     // `url` itself gets reassigned to a redirect target below.
@@ -514,6 +532,10 @@ fn requestInnerPlain(c: *Client, method: http.Method, url_text: []const u8, opti
     var url = try http.Url.parse(url_text);
     if (url.scheme != .http) return error.UnsupportedScheme;
     try validateHeaders(options.headers);
+    // A1 G5 (extended 2026-09-11) — see `requestInner`'s identical gate.
+    if (options.redirect_filter) |f| {
+        if (!f.allow(f.ctx, url, url)) return error.RedirectRefused;
+    }
     const original_url = url;
     var current_method = method;
     var current_body = options.body;
@@ -3631,6 +3653,12 @@ const RecordingFilter = struct {
     to_host_buf: [64]u8 = undefined,
     to_host_len: usize = 0,
     verdict: bool,
+    /// When true, also refuse the FIRST dial (`from == to`) — exercises the
+    /// 2026-09-11 extension of A1 G5. Default false: the scenarios that use
+    /// that default are specifically about redirect-hop gating, so the
+    /// first dial is let through regardless of `verdict`, same as before
+    /// that extension.
+    refuse_first: bool = false,
 
     fn allow(ctx: ?*anyopaque, from: http.Url, to: http.Url) bool {
         const self: *RecordingFilter = @ptrCast(@alignCast(ctx.?));
@@ -3638,6 +3666,12 @@ const RecordingFilter = struct {
         self.from_port = from.port;
         self.to_host_len = @min(to.host.len, self.to_host_buf.len);
         @memcpy(self.to_host_buf[0..self.to_host_len], to.host[0..self.to_host_len]);
+        // The first-dial call passes the exact same `Url` value for both
+        // parameters (see `RedirectFilter.allow`'s doc) — a genuine redirect
+        // hop's `to` is a freshly parsed `Location`, a different value even
+        // when it happens to name the same host.
+        const is_first_dial = from.host.ptr == to.host.ptr and from.port == to.port;
+        if (is_first_dial) return !self.refuse_first;
         return self.verdict;
     }
 };
@@ -3673,21 +3707,59 @@ test "request/requestPlain: redirect_filter gates the destination before any dia
     const filter: RedirectFilter = .{ .ctx = &rec, .allow = RecordingFilter.allow };
     try testing.expectError(error.RedirectRefused, client.request(.get, url, .{ .redirect_filter = filter }));
     try testing.expectEqual(@as(usize, 1), client.dialCount());
-    try testing.expectEqual(@as(usize, 1), rec.calls);
+    // 2 calls, not 1: the first-dial gate (A1 G5, extended 2026-09-11) fires
+    // once for the original request (allowed — `refuse_first` defaults
+    // false) and once more for the redirect hop (refused — `verdict`).
+    try testing.expectEqual(@as(usize, 2), rec.calls);
     try testing.expectEqual(port, rec.from_port);
     try testing.expectEqualStrings("127.0.0.1", rec.to_host_buf[0..rec.to_host_len]);
+    // `refuseAllRedirects` ignores `from`/`to` entirely and always says no —
+    // so with the first dial now gated too, it refuses THAT, not just the
+    // redirect: zero new dials, where before this extension it would have
+    // been exactly one (the original request always got through; only the
+    // redirect target was judged).
     try testing.expectError(error.RedirectRefused, client.requestPlain(.get, url, .{ .redirect_filter = .{ .allow = refuseAllRedirects } }));
-    try testing.expectEqual(@as(usize, 2), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), client.dialCount());
 
     // Positive control: the same filter saying yes lets the hop happen — the
     // second dial is attempted (and refused by the kernel, port 1).
     rec = .{ .verdict = true };
     try testing.expectError(error.ConnectFailed, client.request(.get, url, .{ .redirect_filter = filter }));
+    try testing.expectEqual(@as(usize, 2), rec.calls); // first dial + redirect hop
+    // (`dialCount` counts connections that came up, not attempts — the
+    // refused connect to port 1 does not add to it, so this is just the ONE
+    // new successful dial since the count after the previous scenario (1):
+    // the ConnectFailed above is the evidence that the hop was attempted.)
+    try testing.expectEqual(@as(usize, 2), client.dialCount());
+}
+
+test "request: redirect_filter also gates the very FIRST dial, no redirect involved (A1 G5 extension, 2026-09-11)" {
+    // Before this, the doc said outright: "The first hop is the caller's
+    // own URL and is not gated here" — a consumer that lets a user supply
+    // the request URL directly had no gate on THAT, only on where a 3xx
+    // might later send it. `refuse_first` makes the filter say no to the
+    // original destination itself.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var client = Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    defer client.deinit();
+
+    var rec: RecordingFilter = .{ .verdict = true, .refuse_first = true };
+    const filter: RedirectFilter = .{ .ctx = &rec, .allow = RecordingFilter.allow };
+    // Port 1 is unbindable — a dial would fail loudly (`ConnectFailed`), so
+    // reaching `RedirectRefused` instead is proof no dial was attempted at
+    // all, not merely that one failed for an unrelated reason.
+    try testing.expectError(error.RedirectRefused, client.request(.get, "http://127.0.0.1:1/", .{ .redirect_filter = filter }));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
     try testing.expectEqual(@as(usize, 1), rec.calls);
-    // (`dialCount` counts connections that came up, so the refused connect
-    // to port 1 leaves it at 3 — the ConnectFailed above is the evidence
-    // that the hop was attempted.)
-    try testing.expectEqual(@as(usize, 3), client.dialCount());
+    try testing.expectEqualStrings("127.0.0.1", rec.to_host_buf[0..rec.to_host_len]);
+
+    // requestPlain goes through the identical gate in `requestInnerPlain`.
+    rec = .{ .verdict = true, .refuse_first = true };
+    try testing.expectError(error.RedirectRefused, client.requestPlain(.get, "http://127.0.0.1:1/", .{ .redirect_filter = filter }));
+    try testing.expectEqual(@as(usize, 0), client.dialCount());
+    try testing.expectEqual(@as(usize, 1), rec.calls);
 }
 
 fn redirectToPortOneHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {

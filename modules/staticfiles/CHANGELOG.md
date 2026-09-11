@@ -5,6 +5,54 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** (3) — A1 fix campaign round 2, F5/F13/F17. BEHAVIOURAL (all three).
+  - **F5 (round-2 Q8):** `ETag` is now **weak** (`W/` prefix) by default —
+    `Options.strong_etag = true` reverts to the pre-fix strong form. `mtime`'s one-second
+    granularity meant a same-second, same-size edit left the old strong tag unchanged despite
+    RFC 9110 §8.8.1, and a strong tag authorizes `If-Range` to splice bytes from two file
+    versions into one response. Weak closes that outright — `ifRangeAllows` rejects a weak
+    validator, falling back to a full 200 — at the cost that `If-Range`-conditioned byte-range
+    RESUME never succeeds for any client under the new default. RED (default reverted to
+    always-strong): 38/41 (3 fail) → GREEN 41/41.
+  - **F13 (round-2 Q5, per RFC 9110):** a single path segment over the filesystem's `NAME_MAX`
+    fell into `mapOpenError`'s `else` branch → 500, read by the client as a server fault for
+    input it supplied. Now → 404: no file of that name can exist, the same fact every other
+    "missing name" case here already answers 404 to (RFC 9110's 414 is about a URI longer than
+    THIS SERVER is willing to interpret, which the `http`-layer request-line/header budgets
+    already cover one level up — not about a segment too long for the filesystem). RED: 41/42
+    (1 fail) → GREEN 42/42.
+  - **F17 (round-2 Q8):** a directory URL missing its trailing slash (`GET /sub`) now redirects
+    301 to the canonical slash-terminated form (`Options.redirect_to_trailing_slash`, default
+    true) before anything is resolved further — matching Go `net/http` `FileServer` / nginx, the
+    module's own stated reference model. Without this, `/sub` and `/sub/` silently served the
+    identical content under two different URLs, and any relative link/asset inside that page
+    resolved against whichever one the browser's address bar showed. Query string is preserved
+    across the redirect; a plain file is never redirected; `redirect_to_trailing_slash = false`
+    keeps the pre-fix dual serving. RED (redirect disabled): 41/43 (2 fail) → GREEN 43/43.
+  - Three existing tests that happened to request bare directory URLs
+    (`serveDirectory: a listing that cannot be labelled text/html…`, `serve: directory request
+    serves index.html`, `serve: a directory-listing request opens its target directory once…`)
+    updated to request the canonical slash-terminated form where they were testing something
+    OTHER than F17 itself.
+- **2026-09-11 (2)** — A1 fix campaign round 2, F6 (cross-module with `http`, one commit —
+  round-2 Q4). BEHAVIOURAL. Two related defects at the `http` compression seam, both only
+  reachable when the embedding `Server` has `Options.compression` set:
+  - A byte-range response (206) could still be gzip-compressed: `Content-Range` describes
+    offsets into the IDENTITY body, and the wire body was the gzip bytes of that range —
+    a client or intermediary reassembling ranges would write compressed bytes at identity
+    offsets. Fixed in `http` (`ResponseWriter.shouldCompress` now excludes 206
+    unconditionally), not here — `staticfiles` has no way to know whether `http` is about
+    to compress a response it hands back.
+  - The identity and gzip representations of the same file shared one strong `ETag`
+    (`buildETag`'s `size+mtime`), when RFC 9110 §8.8.3 requires a validator that
+    distinguishes representations. Fixed in `http`: a strong `ETag` on a response `http`
+    is about to gzip now reaches the wire prefixed `W/` — `staticfiles`' own stored/returned
+    value, and the identity-negotiated wire value, are unchanged.
+  - `runRequest`'s shared test harness now wires `.compression`+a gzip scratch buffer
+    (previously absent, so no staticfiles test could ever exercise compression at all);
+    the standalone `sendFile`-vs-`serve` byte-identity comparison test picked up the same
+    options for the same reason. Two new tests here mirror the two `http`-side ones.
+  - RED (both `http`-side mechanisms disabled): 38 pass / 2 fail / 40 → GREEN 40/40.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** a directory-listing request
   (no index file, `directory_listing = true`) now resolves its target
   directory once instead of twice (A1 F11 — the old `serve`/`serveDirectory`

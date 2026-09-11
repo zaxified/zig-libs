@@ -1469,6 +1469,12 @@ pub const Connection = struct {
                 }
             },
             .goaway => |g| {
+                // Same no-progress accounting as every sibling frame arm
+                // (PING twelve lines up, SETTINGS, PRIORITY, …): a peer can
+                // stream GOAWAY frames indefinitely, each parsed and
+                // appended as an event, and none of that is progress on
+                // the connection. Confirmed A1 http F16 2026-09-11.
+                try c.noteUnproductive();
                 c.goaway_recv = g.last_stream_id;
                 try events.append(c.gpa, .{ .goaway = .{
                     .last_stream_id = g.last_stream_id,
@@ -2937,6 +2943,20 @@ test "connection: a real download's WINDOW_UPDATE stream is NOT a flood — repl
     // The second grant of each pair had no freshly-spent credit behind it,
     // so the budget sits at 1, not 0 — and never accumulates.
     try testing.expectEqual(@as(u32, 1), conn.unproductive_frames);
+}
+
+test "connection: GOAWAY flood → ENHANCE_YOUR_CALM (A1 http F16)" {
+    // The .goaway arm parsed and appended an event without ever charging
+    // `noteUnproductive`, unlike every sibling frame type (.ping twelve
+    // lines above it, .settings, .priority, empty .data, …). A peer could
+    // stream GOAWAY frames past any no-progress budget for free.
+    const gpa = testing.allocator;
+    var conn = try testServerWith(.{ .max_unproductive_frames = 4 });
+    defer conn.deinit();
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    for (0..8) |_| try encodeGoaway(gpa, &wire, 0, .no_error, "");
+    try expectViolation(&conn, wire.items, error.EnhanceYourCalm, .connection);
 }
 
 // ── fuzz: HTTP/2 frame parse + connection recv, never panic ────────────────
