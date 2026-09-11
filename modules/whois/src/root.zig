@@ -209,16 +209,59 @@ pub fn parseServerRef(text: []const u8) ?Referral {
         return null; // rwhois://, http://, … — not RFC 3912
     }
     if (std.mem.indexOfScalar(u8, s, '/')) |i| s = s[0..i]; // trailing "/" or path
-    var host = s;
+
+    // Audit F10: an IPv6 literal has colons OF ITS OWN, so "split on the
+    // first `:`" (below) mistakes part of the address for a port
+    // separator — `::1` becomes host `""` (rejected) and a bracketed
+    // `[::1]:43` fails the plain charset check outright on `[`. Two v6
+    // shapes, RFC 3986 §3.2.2's own syntax for "IPv6 literal with an
+    // optional port":
+    var host: []const u8 = undefined;
     var port: u16 = default_port;
-    if (std.mem.indexOfScalar(u8, s, ':')) |i| {
-        host = s[0..i];
-        port = std.fmt.parseInt(u16, s[i + 1 ..], 10) catch return null;
-        if (port == 0) return null;
+    var is_v6 = false;
+    if (s.len > 0 and s[0] == '[') {
+        // `[host]` or `[host]:port` — the ONLY unambiguous way to combine
+        // an IPv6 literal with a port, so a `:` after the `]` is always a
+        // port separator here, never part of the address.
+        const close = std.mem.indexOfScalar(u8, s, ']') orelse return null;
+        host = s[1..close];
+        is_v6 = true;
+        const rest = s[close + 1 ..];
+        if (rest.len > 0) {
+            if (rest[0] != ':') return null;
+            port = std.fmt.parseInt(u16, rest[1..], 10) catch return null;
+            if (port == 0) return null;
+        }
+    } else if (std.mem.count(u8, s, ":") > 1) {
+        // Bare, bracket-less IPv6 literal: more than one colon means this
+        // cannot be a "host:port" pair (a port adds exactly one colon), so
+        // the whole string is the host and there is no explicit port —
+        // exactly the shape a referral line writes a v6-only WHOIS server
+        // in without brackets (`refer: 2001:db8::43`, not a URL).
+        host = s;
+        is_v6 = true;
+    } else {
+        host = s;
+        if (std.mem.indexOfScalar(u8, s, ':')) |i| {
+            host = s[0..i];
+            port = std.fmt.parseInt(u16, s[i + 1 ..], 10) catch return null;
+            if (port == 0) return null;
+        }
     }
+
     if (host.len == 0 or host.len > max_host_len) return null;
-    for (host) |c| {
-        if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_')) return null;
+    if (is_v6) {
+        // Hex digits, `:`, and `.` (v4-mapped/v4-compatible forms like
+        // `::ffff:192.0.2.1`) — no structural validation beyond charset,
+        // same posture as the v4/hostname branch below (deliberately
+        // looser than what `TcpTransport` can dial, audit F15).
+        for (host) |c| {
+            if (!(std.ascii.isHex(c) or c == ':' or c == '.')) return null;
+        }
+    } else {
+        for (host) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_')) return null;
+        }
     }
     return .{ .host = host, .port = port };
 }
@@ -842,6 +885,46 @@ test "parseServerRef: whois:// URL form, ports, rejects other schemes/garbage" {
     try testing.expect(parseServerRef("no spaces allowed") == null);
     try testing.expect(parseServerRef("") == null);
     try testing.expect(parseServerRef("x" ** (max_host_len + 1)) == null);
+}
+
+test "parseServerRef: IPv6 referrals — bracketed with/without a port, and bare without one (audit F10)" {
+    // Before the fix, ALL THREE of these were rejected: `::1` split on its
+    // FIRST colon (host "" -> null), and both bracketed forms failed the
+    // plain alnum/./-/_ charset check on `[`/`]` outright.
+    const bare = parseServerRef("::1").?;
+    try testing.expectEqualStrings("::1", bare.host);
+    try testing.expectEqual(default_port, bare.port);
+
+    const bracketed_no_port = parseServerRef("[2001:db8::43]").?;
+    try testing.expectEqualStrings("2001:db8::43", bracketed_no_port.host);
+    try testing.expectEqual(default_port, bracketed_no_port.port);
+
+    const bracketed_port = parseServerRef("[2001:db8::43]:4343").?;
+    try testing.expectEqualStrings("2001:db8::43", bracketed_port.host);
+    try testing.expectEqual(@as(u16, 4343), bracketed_port.port);
+
+    // whois:// URL form with a bracketed v6 host (RFC 3986 §3.2.2).
+    const url_form = parseServerRef("whois://[fe80::1]:43/").?;
+    try testing.expectEqualStrings("fe80::1", url_form.host);
+    try testing.expectEqual(@as(u16, 43), url_form.port);
+
+    // A v4-mapped literal still needs to pass the (now hex/:/. -based) v6
+    // charset check.
+    const v4_mapped = parseServerRef("[::ffff:192.0.2.1]").?;
+    try testing.expectEqualStrings("::ffff:192.0.2.1", v4_mapped.host);
+
+    // Malformed brackets and non-hex junk inside them are still rejected.
+    try testing.expect(parseServerRef("[::1") == null); // no closing ']'
+    try testing.expect(parseServerRef("[::1]:notaport") == null);
+    try testing.expect(parseServerRef("[::1]x") == null); // junk right after ']'
+    try testing.expect(parseServerRef("[not-hex-at-all]") == null);
+
+    // Regression: `isSpecialUseHost` already recognized these v6 shapes
+    // as text (existing test above) — this is the other half, proving a
+    // referral CAN actually reach it now instead of dying in
+    // `parseServerRef` first.
+    try testing.expect(isSpecialUseHost(bare.host));
+    try testing.expect(isSpecialUseHost(bracketed_no_port.host));
 }
 
 test "parseServerRef: the scheme guard is what rejects '://', not the slash truncation after it (audit F11)" {
