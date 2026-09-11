@@ -13,7 +13,15 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 - **P2** `encryptOaep`/`decryptOaep` (RSAES-OAEP, RFC 8017 §7.1, MGF1, constant-time decode) plus
   the decoupled-hash variant `encryptOaepH`/`decryptOaepH` (label/digest hash and MGF1 hash may
   differ per RFC 8017 §7.1 — e.g. XML-Encryption `rsa-oaep` with digest=SHA-256, MGF1=SHA-1); the
-  coupled forms delegate to the decoupled ones with both hashes equal.
+  coupled forms delegate to the decoupled ones with both hashes equal. **`decryptOaepHNoFail`**
+  (added 2026-09-11, A1 fix campaign, `xmlenc` F3 OAEP arm) is a non-erroring twin of
+  `decryptOaepHBlinded` for a caller that must implement RFC 8017 §7.2.2's classic
+  Bleichenbacher-style countermeasure ("always run the same downstream work regardless of
+  unwrap success") at the OAEP layer, not just PKCS#1 v1.5: a padding failure is reported as
+  `.ok = false` plus the raw RSADP output for the caller's own decoy derivation, never an early
+  `error`. Every existing entry point (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`,
+  `decryptOaepHBlinded`) is unchanged — additive only, per `QUESTIONS-ROUND-2.md` Q4 ("aditivní
+  nová funkce v `rsa`, dnešní API se nemění").
 - **P3** `signPss`/`verifyPss` (RSASSA-PSS, RFC 8017 §8.1, branch-clean verify).
 - **P4a** DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`, `SecretKey.fromDer`/`fromPkcs8`/
   `fromPem`, cleartext PEM only).

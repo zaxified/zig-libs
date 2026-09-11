@@ -129,20 +129,33 @@ from the content size, which is their input.
 content algorithm's key length (`Unwrapped` in `root.zig`) and the content is
 decrypted either way; the answer is the validity mask, not what the content
 decryption happened to do. The decoy is derived from secret material — the raw
-RSA block for PKCS#1 v1.5, the KEK for AES-KW — because a predictable decoy
-would let the peer craft content that authenticates under it and read the bit
-back out of the success/failure answer. The content key-length check moved into
-the unwrap's mask for the same reason. ⛔ **OAEP still returns early.** The decoy
-needs secret material and the only secret on that path lives inside
-`rsa.decryptOaepH`, which reports failure as an error; closing it means either a
-second modular exponentiation (a louder difference than the one being closed) or
-a change to the `rsa` module's surface. Recorded, not fixed.
+RSA block for PKCS#1 v1.5 and now OAEP, the KEK for AES-KW — because a
+predictable decoy would let the peer craft content that authenticates under it
+and read the bit back out of the success/failure answer. The content
+key-length check moved into the unwrap's mask for the same reason.
+
+✅ **OAEP fixed 2026-09-11 (A1 fix campaign round 2, `QUESTIONS-ROUND-2.md`
+Q4, one commit with `rsa`).** The blocker this section used to describe —
+closing it needed either a second, drifting OAEP-decode implementation
+inside `xmlenc`, or a change to `rsa`'s surface — is resolved by the
+latter, additively: `rsa.decryptOaepHNoFail` shares `decryptOaepHBlinded`'s
+exact RSADP + branch-free MGF1/lHash/separator-scan decode and the same
+want-length fold, but reports a padding failure as `{.ok = false, .raw =
+<the RSADP output>}` instead of an `error`. `rsaOaepUnwrap` now derives its
+decoy from `.raw` with the SAME `decoyCek` helper the PKCS#1 v1.5 arm
+already uses, so all three key-transport algorithms (`rsa-oaep`,
+`rsa-oaep-mgf1p`, `rsa-1_5`) share one decoy-derivation function and reach
+`decryptData`'s downstream AES pass unconditionally. Every existing `rsa`
+OAEP entry point (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`,
+`decryptOaepHBlinded`) is unchanged.
 
 What follows is the older, narrower analysis, which remains accurate about
-`rsaPkcs1v15Unwrap`'s own arithmetic — the one place in this module that makes a
-secret-dependent decision of its own. (GCM tag comparison is std's; AES-KW
-integrity uses `std.crypto.timing_safe.eql`; OAEP is delegated to
-`rsa.decryptOaepH`; algorithm-URI comparisons are over public strings.)
+`rsaPkcs1v15Unwrap`'s own arithmetic — the one place in this module that makes
+a secret-dependent decision of its own with its own hand-written masking
+(OAEP's equivalent masking now lives in `rsa.decryptOaepHNoFail`, reused
+rather than duplicated). (GCM tag comparison is std's; AES-KW integrity uses
+`std.crypto.timing_safe.eql`; algorithm-URI comparisons are over public
+strings.)
 
 **What the code does.**
 

@@ -1307,6 +1307,132 @@ pub fn decryptOaepHBlinded(sk: SecretKey, comptime LabelHash: type, comptime Mgf
     return out[0..msg_len];
 }
 
+/// All-ones iff `a == b`, all-zeros otherwise. Branch-free — same bit trick
+/// as `ctEqByte` above, widened to `usize` so a data-dependent LENGTH (not
+/// just a data-dependent byte) can be compared without branching on it.
+fn ctEqMaskUsize(a: usize, b: usize) usize {
+    const bits = @bitSizeOf(usize);
+    const d = a ^ b;
+    const nonzero = (d | (0 -% d)) >> (bits - 1);
+    return nonzero -% 1;
+}
+
+/// Result of `decryptOaepHNoFail`. Unlike `decryptOaepH`/`decryptOaepHBlinded`,
+/// a padding failure is not an `error` — see that function's doc comment for
+/// why, and `xmlenc`'s `rsaOaepUnwrap` for the caller that needs this shape.
+pub const OaepUnwrapResult = struct {
+    /// The recovered `want`-byte OAEP message when `ok` — otherwise
+    /// unspecified content (NOT a decoy; `msg.len` is 0). A caller that
+    /// needs an unpredictable-to-the-peer decoy on `!ok` derives its own
+    /// from `raw`, the same division of labor the RSAES-PKCS1-v1.5 path
+    /// already has between `rsa.rsadpCrt` (raw block) and the caller's own
+    /// decoy derivation.
+    msg: []const u8,
+    /// The raw RSADP output, `c^d mod n`, always `k` bytes (`k` = the
+    /// modulus byte length) regardless of `ok` — secret material the peer
+    /// cannot compute, suitable as decoy-derivation input.
+    raw: []const u8,
+    ok: bool,
+};
+
+/// Decoupled-hash RSAES-OAEP decrypt that reports a padding failure as data,
+/// not as an early `error` return — the constant-time counterpart to
+/// `decryptOaepHBlinded` for callers that must not let OAEP-unwrap success or
+/// failure become an externally observable TIMING signal on its own.
+///
+/// `decryptOaepHBlinded`'s `if (valid != 1) return error.DecryptionError`
+/// is exactly right for a caller that has nothing further to do either way
+/// (13 in-repo consumers do; this function changes nothing about their
+/// behavior). It is exactly WRONG for a caller like XML-Encryption's
+/// `rsa-oaep` key transport, which RFC 8017 §7.2.2's classic countermeasure
+/// (originally stated for PKCS#1 v1.5, and applied here to OAEP for the same
+/// reason) requires to run the SAME amount of downstream work — decrypting
+/// the symmetric content — whether or not the key unwrap actually succeeded,
+/// so that "the RSA step failed" and "the RSA step succeeded but the AEAD
+/// tag didn't verify" are indistinguishable from outside. An early `error`
+/// return defeats that at the call site: the caller either duplicates this
+/// function's OAEP-decode cryptography to build its own non-erroring
+/// variant (a second, drifting copy of decoding logic no one wants), or it
+/// cannot implement the countermeasure at all. This function is the
+/// alternative: additive to the module's public surface, and every existing
+/// entry point (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`,
+/// `decryptOaepHBlinded`) keeps its exact current signature and behavior.
+///
+/// `want` (the expected message length, e.g. a content-encryption key's
+/// byte length) is folded into the SAME branch-free validity determination
+/// as the padding itself — checking it separately, one call frame up, would
+/// reopen exactly the oracle this function exists to close (measured for
+/// the analogous PKCS#1 v1.5 case: 97% classifier accuracy when the length
+/// check was one frame removed from the padding check). `raw_out` must be
+/// at least `k` bytes (the modulus byte length); `out` at least `want`
+/// bytes.
+pub fn decryptOaepHNoFail(
+    sk: SecretKey,
+    comptime LabelHash: type,
+    comptime MgfHash: type,
+    blinding: Blinding,
+    ct: []const u8,
+    label: []const u8,
+    want: usize,
+    out: []u8,
+    raw_out: []u8,
+) DecryptOaepError!OaepUnwrapResult {
+    const h_len = LabelHash.digest_length;
+    const k = byteLen(sk.n.bits());
+    // §7.1.2 step 1 and this function's own buffer preconditions are all
+    // PUBLIC data (ciphertext length, modulus size, `want` from a public
+    // algorithm URI, caller-supplied buffer sizes) — an early return here
+    // discloses nothing an observer could not already compute themselves.
+    if (ct.len != k or k < 2 * h_len + 2) return error.DecryptionError;
+    if (raw_out.len < k) return error.BufferTooSmall;
+    const max_msg_len = k - 2 * h_len - 2;
+    if (want > max_msg_len or out.len < want) return error.BufferTooSmall;
+
+    var em_buf: [max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, em_buf[0..k]);
+    const em = em_buf[0..k];
+    // c >= n is public (the ciphertext is public), same reasoning as
+    // `decryptOaepHBlinded`'s identical early return.
+    privateOpCrt(sk, ct, em, blinding) catch return error.DecryptionError;
+    // Preserve the raw block past this function's own `defer`-scheduled
+    // zeroing, for the caller's decoy derivation.
+    @memcpy(raw_out[0..k], em);
+
+    const seed = em[1..][0..h_len];
+    const db = em[1 + h_len .. k];
+    mgf1Xor(MgfHash, db, seed);
+    mgf1Xor(MgfHash, seed, db);
+
+    var lhash: [h_len]u8 = undefined;
+    LabelHash.hash(label, &lhash, .{});
+    const y_ok = ctEqByte(em[0], 0x00);
+    const lhash_ok: u8 = @intFromBool(std.crypto.timing_safe.eql([h_len]u8, lhash, db[0..h_len].*));
+
+    var looking: u8 = 1;
+    var invalid: u8 = 0;
+    var sep_idx: usize = 0;
+    var i: usize = h_len;
+    while (i < db.len) : (i += 1) {
+        const is_one = ctEqByte(db[i], 0x01);
+        const is_zero = ctEqByte(db[i], 0x00);
+        sep_idx = ctSelect(looking & is_one, i, sep_idx);
+        looking &= is_one ^ 1;
+        invalid |= looking & (is_zero ^ 1);
+    }
+    const found_sep = looking ^ 1;
+    // When no separator was found `sep_idx` stayed 0 and this is a bogus
+    // value — never read unless `found_sep` (folded into `valid` below).
+    const msg_len = db.len - sep_idx - 1;
+    const len_ok: u8 = @truncate(ctEqMaskUsize(msg_len, want) & 1);
+    const valid: u8 = y_ok & lhash_ok & (invalid ^ 1) & found_sep & len_ok;
+
+    if (valid == 1) {
+        @memcpy(out[0..msg_len], db[sep_idx + 1 ..][0..msg_len]);
+        return .{ .msg = out[0..msg_len], .raw = raw_out[0..k], .ok = true };
+    }
+    return .{ .msg = out[0..0], .raw = raw_out[0..k], .ok = false };
+}
+
 // ── P3: RSASSA-PSS (RFC 8017 §8.1) ───────────────────────────────────────────
 //
 // PSS operates on emBits = modBits - 1 bits (§8.1.1 step 2), so the encoded
@@ -3132,6 +3258,83 @@ test "decryptOaep matches OpenSSL known answers (SHA-256, SHA-1, labeled)" {
 
     const mlab = try decryptOaep(sk, sha2.Sha256, &kat2048_oaep.ct_sha256_label, kat2048_oaep.label, &out);
     try testing.expectEqualStrings(kat2048_oaep.msg, mlab);
+}
+
+test "decryptOaepHNoFail: valid ciphertext -> ok=true, matches decryptOaep's KAT" {
+    const sk = try kat2048.secretKey();
+    const sha2 = std.crypto.hash.sha2;
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+
+    const want = kat2048_oaep.msg.len;
+    const r = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", want, &out, &raw);
+    try testing.expect(r.ok);
+    try testing.expectEqualStrings(kat2048_oaep.msg, r.msg);
+    try testing.expectEqual(@as(usize, 256), r.raw.len); // k for the 2048-bit key
+}
+
+test "decryptOaepHNoFail: padding failure -> ok=false, no error, raw still populated" {
+    const sk = try kat2048.secretKey();
+    const sha2 = std.crypto.hash.sha2;
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+
+    // A single flipped byte in a valid ciphertext corrupts the RSA private
+    // op's output enough that OAEP padding cannot validate -- exactly the
+    // "attacker-crafted garbage" shape rsaOaepUnwrap must tolerate without
+    // erroring.
+    var corrupt = kat2048_oaep.ct_sha256;
+    corrupt[100] ^= 0x01;
+    const r = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &corrupt, "", kat2048_oaep.msg.len, &out, &raw);
+    try testing.expect(!r.ok);
+    try testing.expectEqual(@as(usize, 0), r.msg.len);
+    // `raw` is populated either way -- it is the caller's decoy-derivation
+    // input, not conditional on validity.
+    try testing.expect(!std.mem.allEqual(u8, r.raw, 0));
+
+    // Wrong label: same padding-failure shape, same non-error contract.
+    const r2 = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "wrong-label", kat2048_oaep.msg.len, &out, &raw);
+    try testing.expect(!r2.ok);
+}
+
+test "decryptOaepHNoFail: want-length mismatch is folded into validity, not a separate check" {
+    // A perfectly valid ciphertext whose recovered message length does NOT
+    // equal the caller's `want` must report ok=false, exactly like a
+    // corrupted padding -- see the doc comment on why this is folded into
+    // the SAME branch-free decision rather than compared by the caller
+    // after the fact (the 97%-accuracy PKCS#1 v1.5 precedent this mirrors).
+    const sk = try kat2048.secretKey();
+    const sha2 = std.crypto.hash.sha2;
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+
+    const r = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len + 1, &out, &raw);
+    try testing.expect(!r.ok);
+
+    const r2 = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len - 1, &out, &raw);
+    try testing.expect(!r2.ok);
+
+    // The exact length still succeeds (sanity: this isn't just "always false").
+    const r3 = try decryptOaepHNoFail(sk, sha2.Sha256, sha2.Sha256, .none, &kat2048_oaep.ct_sha256, "", kat2048_oaep.msg.len, &out, &raw);
+    try testing.expect(r3.ok);
+}
+
+test "decryptOaepHNoFail: decoupled hash (LabelHash != MgfHash) round-trips too" {
+    const sk = try kat2048.secretKey();
+    const pk = try kat2048.publicKey();
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const Sha1 = std.crypto.hash.Sha1;
+    var prng = std.Random.DefaultPrng.init(0x6f6165705f68e); // deterministic: tests only
+    const random = prng.random();
+    var ct: [max_modulus_len]u8 = undefined;
+    var out: [max_modulus_len]u8 = undefined;
+    var raw: [max_modulus_len]u8 = undefined;
+
+    const msg = "decoupled hash, no-fail variant";
+    const c = try encryptOaepH(pk, Sha256, Sha1, random, msg, "xmlenc-label", &ct);
+    const r = try decryptOaepHNoFail(sk, Sha256, Sha1, .none, c, "xmlenc-label", msg.len, &out, &raw);
+    try testing.expect(r.ok);
+    try testing.expectEqualStrings(msg, r.msg);
 }
 
 test "encryptOaep/decryptOaep round-trip (hashes x labels x message lengths)" {
