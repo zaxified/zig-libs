@@ -453,7 +453,24 @@ pub const Socket = struct {
     /// every frame). CLOEXEC is always set. Returns `error.AccessDenied`
     /// without `CAP_NET_RAW`.
     pub fn open(ethertype: u16, opts: Options) OpenError!Socket {
-        const proto: u32 = std.mem.nativeToBig(u16, ethertype);
+        // Audit F10: `socket(2)`'s `protocol` argument makes the kernel
+        // start queuing matching frames from EVERY interface immediately —
+        // and when `opts.iface` narrows to one interface, that narrowing
+        // only happens later, in `bindPacket` below. In between, this
+        // socket receives real inbound traffic from other interfaces
+        // despite being requested for exactly one; reproduced with a
+        // genuinely inbound (`PACKET_OTHERHOST`) frame from a second,
+        // unrelated segment landing on a socket bound to a different one.
+        //
+        // When an interface IS requested, open with protocol 0 instead —
+        // the kernel matches nothing at all, so nothing can be queued
+        // before the bind — and let `bindPacket`'s own `sll.protocol`
+        // field set the real protocol ATOMICALLY with the interface bind
+        // (one syscall does both). When no interface is requested (the
+        // deliberate "capture on every interface" use, `opts.iface ==
+        // null`), there is no later bind to combine with, so the protocol
+        // is set immediately as before — this path is unchanged.
+        const proto: u32 = if (opts.iface != null) 0 else std.mem.nativeToBig(u16, ethertype);
         var typ: u32 = linux.SOCK.RAW | linux.SOCK.CLOEXEC;
         if (opts.nonblocking) typ |= linux.SOCK.NONBLOCK;
 
@@ -1669,6 +1686,94 @@ test "loopback round-trip: inject a frame, capture it back (needs CAP_NET_RAW + 
         }
     }
     return error.SkipZigTest; // couldn't observe it within the window
+}
+
+test "A1 F10: the pre-bind window now matches nothing (protocol 0), and bindPacket restores delivery atomically (needs CAP_NET_RAW + netns)" {
+    // F10: `Socket.open` used to create the socket with the REAL ethertype
+    // as its protocol, so the kernel started queuing matching frames from
+    // EVERY interface immediately -- before `bindPacket` (further down in
+    // `open`) narrowed it to one interface. Reproduced by the audit with a
+    // genuinely inbound (PACKET_OTHERHOST) frame from an unrelated second
+    // segment landing on a socket bound elsewhere.
+    //
+    // This test demonstrates the fix's actual mechanism directly, without
+    // needing a second interface or a timing race: a socket opened with
+    // protocol 0 (what `open` now does whenever `opts.iface` is set, BEFORE
+    // `bindPacket` runs) matches NOTHING -- not even a frame whose
+    // ethertype this test itself controls, on the SAME interface it will
+    // later bind to. Then the SAME socket, after `bindPacket` sets the real
+    // protocol atomically with the interface bind, receives normally. If
+    // protocol-0-before-bind did not actually block delivery, the first
+    // half below would find the frame; it does not.
+    const lo = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+
+    // Manually replicates the pre-bind half of `Socket.open`'s NEW code
+    // path (protocol 0, no bind yet) -- `open` itself only exposes the
+    // combined socket+bind operation, so the intermediate state can't be
+    // observed through the public API alone.
+    const rc = linux.socket(linux.AF.PACKET, linux.SOCK.RAW | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest; // no CAP_NET_RAW
+    const fd: i32 = @intCast(rc);
+    var cap = Socket{ .fd = fd };
+    defer cap.close();
+    setRcvTimeout(fd, 200) catch return error.SkipZigTest;
+
+    var inj = Socket.openInject(lo) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer inj.close();
+    const dst = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+
+    // Before bind: protocol 0 must match nothing, even our own ethertype
+    // on our own interface.
+    inj.send(lo, dst, test_ethertype, "f10-before-bind") catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    var buf: [2048]u8 = undefined;
+    var leaked_before_bind = false;
+    {
+        var tries: usize = 0;
+        while (tries < 4) : (tries += 1) {
+            const frame = cap.recv(&buf) catch |e| switch (e) {
+                error.WouldBlock, error.Interrupted => break,
+                else => return e,
+            };
+            const eth = EthHeader.parse(frame.bytes) orelse continue;
+            if (eth.ethertype != test_ethertype) continue;
+            if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], "f10-before-bind") != null) {
+                leaked_before_bind = true;
+                break;
+            }
+        }
+    }
+    try testing.expect(!leaked_before_bind);
+
+    // The fix's atomic step: interface AND protocol set together, one
+    // syscall -- exactly `Socket.open`'s own call when `opts.iface` is set.
+    bindPacket(fd, lo, test_ethertype) catch return error.SkipZigTest;
+
+    inj.send(lo, dst, test_ethertype, "f10-after-bind") catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    var seen_after_bind = false;
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const frame = cap.recv(&buf) catch |e| switch (e) {
+            error.WouldBlock, error.Interrupted => break,
+            else => return e,
+        };
+        const eth = EthHeader.parse(frame.bytes) orelse continue;
+        if (eth.ethertype != test_ethertype) continue;
+        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], "f10-after-bind") != null) {
+            seen_after_bind = true;
+            break;
+        }
+    }
+    if (!seen_after_bind) return error.SkipZigTest; // couldn't observe it within the window
 }
 
 test "F4: setFilter after open() leaks a frame queued in the window; Options.filter does not (needs CAP_NET_RAW + netns)" {
