@@ -29,7 +29,11 @@
 //! - **405 Allow:** when the path matches but the method has no handler,
 //!   the router sets `Allow` (registered methods in `http.Method` order;
 //!   HEAD implied by GET) *before* invoking the 405 handler, so overrides
-//!   inherit it.
+//!   inherit it. RFC 9110 §15.5.6 requires this `Allow` to list every
+//!   method the target resource — the path, not one particular trie node —
+//!   supports. See `method_precedence` (default `.backtrack`) for how that
+//!   set is computed when more than one registered pattern has the same
+//!   shape (audit finding router-F5).
 //! - **Auto OPTIONS:** opt-in via `auto_options` (default off). When on and
 //!   an `OPTIONS` request hits a path that has routes but *no* explicit
 //!   OPTIONS handler, the router answers `204 No Content` with the same
@@ -88,8 +92,13 @@ pub const meta = .{
 const Allocator = std.mem.Allocator;
 
 /// Upper bound of `:param` + `*wildcard` captures in a single pattern
-/// (enforced at `add` time, so matching never overflows).
-pub const max_params = 16;
+/// (enforced at `add` time, so matching never overflows). 8, not 16 (audit
+/// finding router-F6): no in-repo pattern (or consumer) has ever used more
+/// than 2, and `Params.entries`' `Entry` is two slices (32 B), so this alone
+/// halves `@sizeOf(Params)` from 520 B to 264 B -- paid on every `dispatch`
+/// stack frame, twice (once for the local, once copied into `Ctx` before
+/// this fix -- see `Ctx.params`).
+pub const max_params = 8;
 
 /// Upper bound on the number of path segments `matchRec` will descend through.
 /// A path with more segments than this cannot match anything and is refused as
@@ -116,6 +125,37 @@ pub const max_path_segments = 256;
 const normalize_buf_len = 2048;
 
 const method_count = @typeInfo(http.Method).@"enum".fields.len;
+
+/// One bit per `http.Method`, used to accumulate the union of methods a
+/// path shape supports across every candidate `matchRecDepth` visits (audit
+/// finding router-F5) -- HEAD-implied-by-GET is applied once, at format
+/// time (`writeAllow`), not baked into the stored bits, so union stays a
+/// plain bitwise OR.
+const AllowSet = std.bit_set.IntegerBitSet(method_count);
+
+fn methodBits(node: *const Node) AllowSet {
+    var bits: AllowSet = .initEmpty();
+    for (node.endpoints, 0..) |ep, i| {
+        if (ep != null) bits.set(i);
+    }
+    return bits;
+}
+
+/// Format `bits` (HEAD implied by GET) into `buf`, `http.Method`-ordered,
+/// comma-separated -- the same layout `rebuildAllow` always produced, now
+/// shared with the request-time merged Allow (`dispatch`, `.backtrack`).
+fn writeAllow(buf: []u8, bits: AllowSet) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    const has_get = bits.isSet(@intFromEnum(http.Method.get));
+    inline for (@typeInfo(http.Method).@"enum".fields, 0..) |f, i| {
+        const m: http.Method = @enumFromInt(f.value);
+        if (bits.isSet(i) or (m == .head and has_get)) {
+            if (w.end != 0) w.writeAll(", ") catch unreachable;
+            w.writeAll(comptime m.token()) catch unreachable;
+        }
+    }
+    return w.buffered();
+}
 
 // ── the per-request vocabulary ──────────────────────────────────────────────
 
@@ -148,8 +188,14 @@ pub const Params = struct {
 pub const Ctx = struct {
     req: *http.Server.Request,
     res: *http.Server.ResponseWriter,
-    /// Params of the matched route (empty for the 404 handler).
-    params: Params,
+    /// Params of the matched route (empty for the 404 handler). A pointer
+    /// into `dispatch`'s own stack frame, not a copy (audit finding
+    /// router-F6 -- `Params` used to live TWICE on every dispatch's stack,
+    /// once here and once in the local that built it, ~520 B each before
+    /// `max_params` also dropped 16 -> 8): valid strictly for the handler
+    /// call, exactly like the `[]const u8` values it hands out, so the
+    /// existing "never retain past the call" rule already covers it.
+    params: *const Params,
     /// `Router.state` passthrough — the application's shared state. (When
     /// served through `handler()`, `req.context` is the Router itself, so
     /// app state travels here instead.)
@@ -211,6 +257,36 @@ pub const TrailingSlash = enum {
     strict,
 };
 
+/// How `dispatch` resolves a path shape that more than one registered
+/// pattern can produce, when the candidates disagree on which HTTP methods
+/// they serve (audit finding router-F5). RFC 9110 §15.5.6 requires a 405's
+/// `Allow` to list every method the *target resource* supports, but is
+/// silent on whether the matcher should keep searching past a candidate
+/// that has an endpoint for some OTHER method -- both readings below are
+/// spec-compliant; `Allow` is always the union of every candidate visited
+/// either way.
+pub const MethodPrecedence = enum {
+    /// Keep trying sibling candidates (static, then `:param`, then
+    /// `*wildcard`, at every level) until one has the requested method or
+    /// none are left -- chi semantics, and this module's `model_after`.
+    /// Safe default: the alternative lets a route added anywhere else in
+    /// the tree silently take over dispatch for a method an existing,
+    /// unrelated route already served (e.g. registering `POST /users/new`
+    /// turns a working `GET /users/new` -- served today by `GET
+    /// /users/:id` -- into a 405, with nothing in the diff that touched
+    /// `/users/:id` saying so). Costs more when a miss is deep: `min_reach`
+    /// still prunes subtrees that cannot reach ANY endpoint, but it cannot
+    /// prune by method, so an adversarial table (see `A1/router.md` F4) can
+    /// make a 405 visit every same-shaped candidate before giving up.
+    backtrack,
+    /// Commit to the first candidate with ANY registered method, exactly
+    /// like this module before the F5 fix (httprouter semantics): once a
+    /// node has an endpoint for some method, its siblings are never tried,
+    /// even for a method that node doesn't serve. Cheaper — matching never
+    /// explores past the first hit — at the cost of the shadowing above.
+    first_match,
+};
+
 /// How `dispatch` treats `req.path` relative to `req.target`. `http.Server`
 /// runs RFC 3986 §5.2.4 dot-segment removal on `req.path` unconditionally
 /// and silently before this module (or any handler) ever sees the request —
@@ -252,13 +328,25 @@ pub const NormalizePath = enum {
 pub const AddError = error{
     OutOfMemory,
     /// Pattern must start with '/'; `:`/`*` only introduce whole segments;
-    /// `*wildcard` must be the last segment.
+    /// `*wildcard` must be the last segment; a `/`-separated segment must
+    /// not be empty other than a single trailing one (audit finding
+    /// router-F11 — `//evil.example/x` used to be accepted, and a
+    /// trailing-slash redirect for a path under it emitted a
+    /// protocol-relative `Location` a browser reads as `http://evil.example/x`;
+    /// `/x/` itself, one trailing empty segment, is still a valid, distinct
+    /// route, per the module doc).
     InvalidPattern,
     /// This (method, pattern) already has a handler.
     DuplicateRoute,
     /// A different param/wildcard name is already registered at this
     /// position (e.g. `/u/:id` vs `/u/:name`).
     ParamNameConflict,
+    /// The same `:name`/`*name` capture name is used more than once in one
+    /// pattern (e.g. `/:a/:a`) — audit finding router-F8. Before this,
+    /// such a pattern was accepted and `params.get("a")` silently returned
+    /// only the FIRST value; a handler reading the second capture under
+    /// its own name got the first one's value instead.
+    DuplicateParamName,
     /// More than `max_params` captures in one pattern.
     TooManyParams,
 };
@@ -342,6 +430,11 @@ pub const Router = struct {
     /// today's behavior exactly: `http.Server` already ran the rewrite
     /// before `dispatch` is ever called, and this posture just trusts it.
     normalize_path: NormalizePath = .remove_dot_segments,
+    /// See `MethodPrecedence`. Default `.backtrack` changes observable
+    /// behavior from this module's previous releases (audit finding
+    /// router-F5) — set `.first_match` to keep the old shadowing behavior
+    /// verbatim, including its performance characteristics.
+    method_precedence: MethodPrecedence = .backtrack,
     routes_added: bool = false,
     /// Registered routes in registration order (see `routes`).
     route_list: std.ArrayList(Route),
@@ -469,28 +562,53 @@ pub const Router = struct {
         }
 
         var params: Params = .{};
-        if (matchRec(&r.root, req.path[1..], false, &params)) |node| {
-            if (endpointFor(node, req.method)) |ep| {
-                var ctx: Ctx = .{
-                    .req = req,
-                    .res = rw,
-                    .params = params,
-                    .state = r.state,
-                    .matched_pattern = ep.pattern,
-                };
-                const next: Next = .{ .chain = ep.chain, .endpoint = ep.handler };
-                return next.run(&ctx);
-            }
+        // `matched`/`miss_allow` unify the two `MethodPrecedence` postures
+        // below into one shared tail (audit finding router-F5): whichever
+        // posture ran, `matched` means "run this endpoint", a non-empty
+        // `miss_allow` means "path shape exists, method doesn't" (405 /
+        // auto-OPTIONS), and neither means a genuine 404 (try the
+        // trailing-slash redirect, then `not_found`).
+        var matched: ?Endpoint = null;
+        var miss_allow_buf: [64]u8 = undefined;
+        var miss_allow: ?[]const u8 = null;
+        switch (r.method_precedence) {
+            .first_match => if (matchRec(&r.root, req.path[1..], false, &params)) |node| {
+                if (endpointFor(node, req.method)) |ep|
+                    matched = ep
+                else
+                    miss_allow = node.allow;
+            },
+            .backtrack => {
+                var allow_bits: AllowSet = .initEmpty();
+                if (matchRecMethod(&r.root, req.path[1..], &params, req.method, &allow_bits)) |node|
+                    matched = endpointFor(node, req.method).? // guaranteed: see matchRecDepth
+                else if (allow_bits.count() != 0)
+                    miss_allow = writeAllow(&miss_allow_buf, allow_bits);
+            },
+        }
+
+        if (matched) |ep| {
+            var ctx: Ctx = .{
+                .req = req,
+                .res = rw,
+                .params = &params,
+                .state = r.state,
+                .matched_pattern = ep.pattern,
+            };
+            const next: Next = .{ .chain = ep.chain, .endpoint = ep.handler };
+            return next.run(&ctx);
+        }
+        if (miss_allow) |allow| {
             // Path exists, method doesn't: 405 (or auto-204 for OPTIONS).
             // Allow goes on first so an overridden handler inherits it.
-            try rw.setHeader("Allow", node.allow);
+            try rw.setHeader("Allow", allow);
             // No explicit OPTIONS endpoint reached endpointFor above, so when
             // auto_options is on we synthesize a 204 here instead of a 405.
             const endpoint = if (r.auto_options and req.method == .options)
                 defaultAutoOptions
             else
                 r.method_not_allowed;
-            var ctx: Ctx = .{ .req = req, .res = rw, .params = params, .state = r.state };
+            var ctx: Ctx = .{ .req = req, .res = rw, .params = &params, .state = r.state };
             const next: Next = .{ .chain = r.fallbackChain(req.path), .endpoint = endpoint };
             return next.run(&ctx);
         }
@@ -502,7 +620,8 @@ pub const Router = struct {
     }
 
     fn runFallback(r: *Router, req: *http.Server.Request, rw: *http.Server.ResponseWriter, h: Handler) anyerror!void {
-        var ctx: Ctx = .{ .req = req, .res = rw, .params = .{}, .state = r.state };
+        var empty_params: Params = .{};
+        var ctx: Ctx = .{ .req = req, .res = rw, .params = &empty_params, .state = r.state };
         const next: Next = .{ .chain = r.fallbackChain(req.path), .endpoint = h };
         return next.run(&ctx);
     }
@@ -543,7 +662,15 @@ pub const Router = struct {
     /// difference) and answer 301 (GET/HEAD) / 308 with a Location
     /// preserving the query. Paths beyond the fixed buffer just fall
     /// through to 404.
-    fn tryRedirect(r: *Router, req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!bool {
+    /// `noinline` (audit finding router-F6): `loc_buf` below is 4 KiB and
+    /// used to cost dispatch's OWN stack frame that much even when
+    /// `trailing_slash == .strict` (this function never called) or a
+    /// request matches on the first try (`dispatch` returns before ever
+    /// reaching the call site) — LLVM sizes a frame for every path an
+    /// inlined callee could take, not the one a given request takes. A
+    /// real function call only pays for `loc_buf` on the stack while this
+    /// function is actually running.
+    noinline fn tryRedirect(r: *Router, req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!bool {
         const path = req.path;
         var probe: Params = .{};
         var loc_buf: [4096]u8 = undefined;
@@ -570,7 +697,7 @@ pub const Router = struct {
         // frame dies — safe to let `loc_buf`/`redirect` live only here:
         // `next.run` below completes synchronously, entirely inside this
         // call, before either goes out of scope.
-        var ctx: Ctx = .{ .req = req, .res = rw, .params = probe, .state = r.state, ._redirect = &redirect };
+        var ctx: Ctx = .{ .req = req, .res = rw, .params = &probe, .state = r.state, ._redirect = &redirect };
         const next: Next = .{ .chain = r.fallbackChain(path), .endpoint = answerRedirect };
         try next.run(&ctx);
         return true;
@@ -665,6 +792,15 @@ pub const Router = struct {
         var ancestors: [max_path_segments]*Node = undefined;
         var ancestors_len: usize = 0;
         var total_segments: u32 = 0;
+        // F8 (A1/router.md): capture names seen so far in THIS pattern.
+        // Independent of trie structure -- unlike `ParamNameConflict`
+        // below, which only fires when the SAME position was already
+        // registered under a DIFFERENT name by some earlier route,
+        // `/:a/:a` reuses one name at two DIFFERENT positions, and nothing
+        // about the trie catches that; `params.get` would just return the
+        // first value silently forever.
+        var seen_names: [max_params][]const u8 = undefined;
+        var seen_names_len: usize = 0;
         while (rest) |cur| {
             if (ancestors_len < ancestors.len) {
                 ancestors[ancestors_len] = node;
@@ -681,8 +817,13 @@ pub const Router = struct {
                 const name = seg[1..];
                 if (name.len == 0 or next != null) return error.InvalidPattern;
                 if (std.mem.indexOfAny(u8, name, ":*") != null) return error.InvalidPattern;
+                for (seen_names[0..seen_names_len]) |s| {
+                    if (std.mem.eql(u8, s, name)) return error.DuplicateParamName;
+                }
                 nparams += 1;
                 if (nparams > max_params) return error.TooManyParams;
+                seen_names[seen_names_len] = name;
+                seen_names_len += 1;
                 if (node.wildcard) |wc| {
                     if (!std.mem.eql(u8, wc.name, name)) return error.ParamNameConflict;
                     node = wc.node;
@@ -697,8 +838,13 @@ pub const Router = struct {
                 const name = seg[1..];
                 if (name.len == 0) return error.InvalidPattern;
                 if (std.mem.indexOfAny(u8, name, ":*") != null) return error.InvalidPattern;
+                for (seen_names[0..seen_names_len]) |s| {
+                    if (std.mem.eql(u8, s, name)) return error.DuplicateParamName;
+                }
                 nparams += 1;
                 if (nparams > max_params) return error.TooManyParams;
+                seen_names[seen_names_len] = name;
+                seen_names_len += 1;
                 if (node.param) |p| {
                     if (!std.mem.eql(u8, p.name, name)) return error.ParamNameConflict;
                     node = p.node;
@@ -710,6 +856,16 @@ pub const Router = struct {
                 }
                 rest = next;
             } else {
+                // F11 (A1/router.md): an empty segment is legal ONLY as the
+                // final one -- a trailing slash, e.g. `/x/`, is a real,
+                // distinct route per the module doc ("a trailing slash is
+                // a normal (empty) static segment"). A LEADING or INTERIOR
+                // empty segment (`//x`, `/a//b`) used to be silently
+                // accepted into the trie; dispatching it later made
+                // `tryRedirect` emit a protocol-relative `Location`
+                // (`//evil.example/x`), which a browser reads as
+                // `http://evil.example/x` -- an open redirect.
+                if (seg.len == 0 and next != null) return error.InvalidPattern;
                 if (std.mem.indexOfAny(u8, seg, ":*") != null) return error.InvalidPattern;
                 if (node.static.get(seg)) |child| {
                     node = child;
@@ -760,20 +916,16 @@ pub const Router = struct {
         ));
     }
 
-    /// Recompute the node's `Allow` value: registered methods in
-    /// `http.Method` order, HEAD implied by GET.
+    /// Recompute the node's `Allow` value and its bitset twin (`allow`:
+    /// registered methods in `http.Method` order, HEAD implied by GET;
+    /// `allow_bits`: the same set of methods, raw -- `dispatch`'s
+    /// `.backtrack` posture unions these across candidates at request
+    /// time, audit finding router-F5, where a single precomputed string
+    /// can't be merged).
     fn rebuildAllow(r: *Router, node: *Node) error{OutOfMemory}!void {
+        node.allow_bits = methodBits(node);
         var buf: [64]u8 = undefined;
-        var w: std.Io.Writer = .fixed(&buf);
-        const has_get = node.endpoints[@intFromEnum(http.Method.get)] != null;
-        inline for (@typeInfo(http.Method).@"enum".fields, 0..) |f, i| {
-            const m: http.Method = @enumFromInt(f.value);
-            if (node.endpoints[i] != null or (m == .head and has_get)) {
-                if (w.end != 0) w.writeAll(", ") catch unreachable;
-                w.writeAll(comptime m.token()) catch unreachable;
-            }
-        }
-        node.allow = try r.arena.allocator().dupe(u8, w.buffered());
+        node.allow = try r.arena.allocator().dupe(u8, writeAllow(&buf, node.allow_bits));
     }
 };
 
@@ -920,6 +1072,8 @@ const Node = struct {
     endpoints: [method_count]?Endpoint = @splat(null),
     /// Precomputed Allow header value (non-empty iff any endpoint).
     allow: []const u8 = "",
+    /// `allow`'s bitset twin -- see `rebuildAllow`.
+    allow_bits: AllowSet = .initEmpty(),
     /// Fewest ADDITIONAL segments a query needs, from this node, to reach any
     /// endpoint in this node's subtree (0 once `hasEndpoint()`). Maintained
     /// incrementally by `insert` (a route can only ever shrink an ancestor's
@@ -972,13 +1126,31 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// then the param child (non-empty segments only), then the wildcard —
 /// each only counts when the remainder also matches a node that has at
 /// least one endpoint (so an endpoint-less static prefix falls back to a
-/// param sibling). `rest` is the remaining path after the leading '/';
-/// null = all segments consumed. `extra` appends one virtual "" segment
-/// (used to probe `path ++ "/"` without building the string). Recursion
-/// depth = segment count, bounded by this module's own `max_path_segments`
-/// (see `matchRecDepth`) — not by whatever caps the path upstream.
+/// param sibling), REGARDLESS of which HTTP method that endpoint is for
+/// (`MethodPrecedence.first_match` semantics — `dispatch` checks the
+/// method itself afterward). `rest` is the remaining path after the
+/// leading '/'; null = all segments consumed. `extra` appends one virtual
+/// "" segment (used to probe `path ++ "/"` without building the string).
+/// Recursion depth = segment count, bounded by this module's own
+/// `max_path_segments` (see `matchRecDepth`) — not by whatever caps the
+/// path upstream.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
-    return matchRecDepth(node, rest, extra, params, 0, segmentsRemaining(rest, extra));
+    var unused_allow: AllowSet = .initEmpty();
+    return matchRecDepth(node, rest, extra, params, 0, segmentsRemaining(rest, extra), null, &unused_allow);
+}
+
+/// `matchRec`'s `MethodPrecedence.backtrack` twin (audit finding
+/// router-F5): a candidate only counts as a match when it serves `method`
+/// specifically; every candidate that matches the path SHAPE but not
+/// `method` instead unions its node's `allow_bits` into `allow` and lets
+/// the search keep going — static, then `:param`, then `*wildcard`, at
+/// every level — so a route registered elsewhere in the tree can no
+/// longer silently shadow an existing route for a method it doesn't even
+/// serve. A null return with `allow.count() != 0` means "the path shape
+/// exists, just not for this method" (405/auto-OPTIONS); empty means a
+/// genuine 404.
+fn matchRecMethod(node: *const Node, rest: ?[]const u8, params: *Params, method: http.Method, allow: *AllowSet) ?*const Node {
+    return matchRecDepth(node, rest, false, params, 0, segmentsRemaining(rest, false), method, allow);
 }
 
 /// Total segment count `rest`/`extra` still represent — computed ONCE per
@@ -1004,6 +1176,15 @@ fn matchRecDepth(
     params: *Params,
     depth: u32,
     remaining: u32,
+    // null = `MethodPrecedence.first_match`: a candidate matches as soon as
+    // it has ANY endpoint (`matchRec`'s historical contract, still used by
+    // `tryRedirect`'s own path-shape probe, which checks the method itself
+    // afterward either way). Non-null = `.backtrack` (audit finding
+    // router-F5): a candidate matches only when it serves THIS method;
+    // every candidate that matches the shape but not the method instead
+    // unions its `allow_bits` into `allow` and the search keeps going.
+    method: ?http.Method,
+    allow: *AllowSet,
 ) ?*const Node {
     // Router-owned recursion bound (see `max_path_segments`). A path this deep
     // cannot match a registered pattern, so refusing it costs nothing and the
@@ -1014,7 +1195,12 @@ fn matchRecDepth(
         // here -- `segmentsRemaining` already counted it, so `remaining` is
         // passed through UNCHANGED; it is decremented below, the same as any
         // other segment, once this call re-enters with `rest = ""`.
-        if (extra) return matchRecDepth(node, "", false, params, depth + 1, remaining);
+        if (extra) return matchRecDepth(node, "", false, params, depth + 1, remaining, method, allow);
+        if (method) |m| {
+            if (endpointFor(node, m) != null) return node;
+            if (node.hasEndpoint()) allow.setUnion(node.allow_bits);
+            return null;
+        }
         return if (node.hasEndpoint()) node else null;
     };
     var seg = r;
@@ -1029,19 +1215,25 @@ fn matchRecDepth(
     const remaining_after_seg = remaining - 1;
     if (node.static.get(seg)) |child| {
         if (child.min_reach <= remaining_after_seg) {
-            if (matchRecDepth(child, next, extra, params, depth + 1, remaining_after_seg)) |n| return n;
+            if (matchRecDepth(child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
         }
     }
     if (seg.len != 0) if (node.param) |p| {
         if (p.node.min_reach <= remaining_after_seg) {
             const saved = params.len;
             params.push(p.name, seg);
-            if (matchRecDepth(p.node, next, extra, params, depth + 1, remaining_after_seg)) |n| return n;
+            if (matchRecDepth(p.node, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
             params.len = saved;
         }
     };
     if (node.wildcard) |wc| {
-        if (wc.node.hasEndpoint()) {
+        if (method) |m| {
+            if (endpointFor(wc.node, m) != null) {
+                params.push(wc.name, r);
+                return wc.node;
+            }
+            if (wc.node.hasEndpoint()) allow.setUnion(wc.node.allow_bits);
+        } else if (wc.node.hasEndpoint()) {
             params.push(wc.name, r);
             return wc.node;
         }
@@ -1594,14 +1786,15 @@ test "documented: reject_non_canonical does not decode percent-encoding, so %2e%
     try testing.expectEqualStrings("raw:%2e%2e/other", bodyOf(got));
 }
 
-test "documented: a root OPTIONS wildcard does NOT catch OPTIONS on a path with other methods registered" {
-    // No backtracking on a method miss (finding worked out in README's
-    // "Auto OPTIONS" section): matchRec commits to the "/thing" node — it
-    // already has a GET endpoint — before dispatch even looks at the
-    // request's method, so the OPTIONS-only wildcard sibling below is never
-    // tried for this path.
+test "documented: MethodPrecedence.first_match — a root OPTIONS wildcard does NOT catch OPTIONS on a path with other methods registered" {
+    // .first_match reproduces this module's pre-F5 behavior exactly:
+    // matchRec commits to the "/thing" node — it already has a GET
+    // endpoint — before dispatch even looks at the request's method, so
+    // the OPTIONS-only wildcard sibling below is never tried for this
+    // path. See the `.backtrack` (default) twin below for the F5 fix.
     var r = Router.init(testing.allocator);
     defer r.deinit();
+    r.method_precedence = .first_match;
     try r.get("/thing", hHello);
     try r.options("/*catchall", hCreated); // a "catch every OPTIONS" attempt
 
@@ -1616,6 +1809,60 @@ test "documented: a root OPTIONS wildcard does NOT catch OPTIONS on a path with 
     const got2 = runWire(&r, wire("OPTIONS", "/nope/at/all"), &buf);
     try expectStatus(got2, "201");
     try testing.expectEqualStrings("created", bodyOf(got2));
+}
+
+test "MethodPrecedence.backtrack (default): the same table now DOES fall through to the wildcard (F5)" {
+    // Same fixture as the .first_match test above. Under the new default,
+    // a "/thing" node with a GET endpoint but no OPTIONS is no longer a
+    // dead end for OPTIONS: the search backtracks past it to the
+    // OPTIONS-only wildcard, which DOES serve this method.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try testing.expectEqual(MethodPrecedence.backtrack, r.method_precedence); // the default
+    try r.get("/thing", hHello);
+    try r.options("/*catchall", hCreated);
+
+    var buf: [1024]u8 = undefined;
+    const got = runWire(&r, wire("OPTIONS", "/thing"), &buf);
+    try expectStatus(got, "201");
+    try testing.expectEqualStrings("created", bodyOf(got));
+}
+
+test "F5: a static sibling for one method no longer shadows a working :param route for another" {
+    // The audit's own repro: `GET /users/:id` works; registering an
+    // unrelated `POST /users/new` elsewhere used to turn `GET /users/new`
+    // into a 405, purely because `new` (static) matches before `:id`
+    // (param) and the OLD matcher stopped at the first node with ANY
+    // endpoint, regardless of method.
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    try r.get("/users/:id", hUser);
+    try r.post("/users/new", hCreated);
+
+    var buf: [1024]u8 = undefined;
+    // Still works before AND after the unrelated POST route exists.
+    try testing.expectEqualStrings("user=new", bodyOf(runWire(&r, wire("GET", "/users/new"), &buf)));
+    try testing.expectEqualStrings("user=other", bodyOf(runWire(&r, wire("GET", "/users/other"), &buf)));
+    // The static route's own method still works and still wins over :id.
+    const posted = runWire(&r, wire("POST", "/users/new"), &buf);
+    try expectStatus(posted, "201");
+    try testing.expectEqualStrings("created", bodyOf(posted));
+    // A method neither candidate serves is a genuine 405, Allow the union
+    // of BOTH candidates the request's path shape could have reached
+    // (RFC 9110 §15.5.6 — router-F5's other half): GET/HEAD from `:id`,
+    // POST from the static sibling.
+    const del = runWire(&r, wire("DELETE", "/users/new"), &buf);
+    try expectStatus(del, "405");
+    try expectHeaderLine(del, "Allow: GET, HEAD, POST");
+    // .first_match keeps the OLD shadowing behavior verbatim.
+    var legacy = Router.init(testing.allocator);
+    defer legacy.deinit();
+    legacy.method_precedence = .first_match;
+    try legacy.get("/users/:id", hUser);
+    try legacy.post("/users/new", hCreated);
+    const shadowed = runWire(&legacy, wire("GET", "/users/new"), &buf);
+    try expectStatus(shadowed, "405");
+    try expectHeaderLine(shadowed, "Allow: POST");
 }
 
 test "middleware: outer→inner deterministic order, recorded via ctx.state" {
@@ -1967,7 +2214,41 @@ test "add: pattern validation, duplicates, param conflicts, caps" {
     try r.get("/w/*rest", hW);
     try testing.expectError(error.ParamNameConflict, r.get("/w/*tail", hHello));
 
-    try testing.expectError(error.TooManyParams, r.get("/:p" ** (max_params + 1), hHello));
+    // Unique names, comptime-generated: max_params + 1 = the cap PLUS one,
+    // never colliding with the DuplicateParamName check below (F8), whose
+    // own test wants a REPEATED name specifically.
+    {
+        comptime var pattern: []const u8 = "";
+        inline for (0..max_params + 1) |i| pattern = pattern ++ std.fmt.comptimePrint("/:p{d}", .{i});
+        try testing.expectError(error.TooManyParams, r.get(pattern, hHello));
+    }
+}
+
+test "add: duplicate capture name in one pattern is rejected (F8)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    // The exact audit repro: `/:a/:a` -- two DIFFERENT positions, same
+    // name. `params.get("a")` would silently return only the first value.
+    try testing.expectError(error.DuplicateParamName, r.get("/:a/:a", hHello));
+    try testing.expectError(error.DuplicateParamName, r.get("/x/:id/y/:id", hHello));
+    try testing.expectError(error.DuplicateParamName, r.get("/x/:id/*id", hHello)); // mixed :/*
+    // Distinct names at distinct positions: fine (not the same defect).
+    try r.get("/x/:id/y/:sub_id", hHello);
+}
+
+test "add: an empty pattern segment is rejected unless it is the trailing one (F11)" {
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    // Leading and interior empty segments used to be silently accepted,
+    // and a trailing-slash redirect under one emitted a protocol-relative
+    // `Location` (`//evil.example/x`) -- an open redirect.
+    try testing.expectError(error.InvalidPattern, r.get("//evil.example/x", hHello));
+    try testing.expectError(error.InvalidPattern, r.get("/a//b", hHello));
+    try testing.expectError(error.InvalidPattern, r.get("//", hHello));
+    // A SINGLE trailing empty segment is the documented, distinct
+    // trailing-slash route and must keep working.
+    try r.get("/x/", hHello);
+    try r.get("/", hRoot);
 }
 
 // ── tests: route enumeration + matched pattern ──────────────────────────────

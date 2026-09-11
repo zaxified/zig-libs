@@ -1579,7 +1579,10 @@ pub const PathParams = struct {
 
     fn runParams(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
         const v: *const PathParams = @ptrCast(@alignCast(state.?));
-        var report = try validateParams(v.gpa, &ctx.params, v.schema);
+        // `router` F6 (A1/router.md): `ctx.params` is already `*const
+        // router.Params` now, not a value -- no `&` needed (that used to
+        // take `&Params`, now it would take `*const *const Params`).
+        var report = try validateParams(v.gpa, ctx.params, v.schema);
         defer report.deinit();
         if (!report.ok()) return respondInvalid(ctx.res, report.errors); // no next
         try next.run(ctx);
@@ -3065,7 +3068,10 @@ test "stacked Query + Body middleware: both getters work via the slot chain" {
 test "getters return null when no validate middleware ran" {
     var req: http.Server.Request = undefined;
     var res: http.Server.ResponseWriter = undefined;
-    var ctx: router.Ctx = .{ .req = &req, .res = &res, .params = .{}, .state = null };
+    // `router` F6 (A1/router.md): `Ctx.params` is now `*const router.Params`,
+    // not a value -- needs an addressable local.
+    var empty_params: router.Params = .{};
+    var ctx: router.Ctx = .{ .req = &req, .res = &res, .params = &empty_params, .state = null };
     try testing.expectEqual(@as(?*const ValidatedBody, null), bodyValue(&ctx));
     try testing.expectEqual(@as(?*const ValidatedQuery, null), queryValues(&ctx));
     try testing.expectEqual(@as(?*const Widget, null), TypedThing.get(&ctx));
