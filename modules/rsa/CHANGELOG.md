@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **Additive: new `decryptOaepHNoFail`** (A1 fix campaign
+  round 2, `QUESTIONS-ROUND-2.md` Q4, cross-module with `xmlenc` F3's OAEP
+  arm — one commit, both modules). Every existing OAEP entry point
+  (`decryptOaep`, `decryptOaepBlinded`, `decryptOaepH`, `decryptOaepHBlinded`)
+  keeps its exact current signature and behavior; this is a new function
+  alongside them, not a change to any of the 13 in-repo consumers. It shares
+  `decryptOaepHBlinded`'s RSADP + branch-free MGF1/lHash/separator-scan
+  decode, folds the caller's expected message length into the SAME
+  branch-free validity mask (rather than leaving it a post-hoc check, which
+  would reopen a length-based oracle — the same reasoning `rsaPkcs1v15Unwrap`
+  already documents for its own `want` fold), and reports a padding failure
+  as `{.ok = false, .raw = <the RSADP output>}` instead of an early `error`,
+  so a caller building a Bleichenbacher-style decoy-CEK countermeasure (RFC
+  8017 §7.2.2's classic construction, until now only expressible for PKCS#1
+  v1.5 in this module) can do so for OAEP without re-implementing OAEP's
+  padding-decode cryptography itself. ⏸ **ODLOŽENO NA KONEC KAMPANĚ —
+  vyžaduje re-pin ctgrind řádku** (`scripts/ctgrind-expected.tsv` rows `rsa
+  ReleaseFast crt`/`noncrt`): this edit touches `src/root.zig`, one of the
+  files the digest covers, so the pin goes red until the coordinator
+  re-measures and re-pins at campaign end — not a defect, the digest doing
+  its job. `scripts/modtest rsa`: 85/86 (Debug/ReleaseSafe, 1 unrelated
+  skip), 85/86 (ReleaseFast).
+
 - **2026-09-09** — **NO CONSUMER-VISIBLE CHANGE:** `src/ctgrind_harness.zig` is added, tainting the CRT private parameters (`p`, `q`, `dp`, `dq`, `qinv` and their Montgomery params) through `rsadpCrt`, and `d` through `rsadp`. Measured ReleaseFast: **213 in-file contexts for `crt`, 2 for `noncrt`**, untainted control 0 and no-`-fvalgrind` trap 0 in every row. ⭐ About 104 of the 213 are not this module's arithmetic at all but `std.crypto.ff` — `Modulus.reduce`'s length-dependent `memcpy` (86) and `Fe.shrink`'s leading-zero strip (29) — reached from `reduceWide` and `Fe.fromBytes`. `SPEC.md:64` says "never branches on secret data", under "Threat model / out of scope", while `SPEC.md:59` already speaks of "a residual leak in the constant-time claim" that blinding exists to decorrelate; this row is the first instrument for either sentence, not a refutation of them. ⚠ Four contexts (`montPowSecret`, `if (s == mp.L)`) are likely a granularity artifact — `L` is a limb count fixed by key SIZE, not by `p`/`q`'s value — and were left tainted and written down rather than carved out.
 
 - **2026-09-08** — **Docs: the "no per-operation setup cost is paid" claim now

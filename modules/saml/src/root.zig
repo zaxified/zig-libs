@@ -525,6 +525,20 @@ pub const ConsumeError = error{
     /// `Config.sp_entity_id` is not in an `<AudienceRestriction>` (or none
     /// present — fail closed).
     AudienceMismatch,
+    /// The assertion's `<Conditions>` carried a `<saml:Condition>` extension
+    /// element (an xsi:type this implementation does not evaluate). SAMLCore
+    /// §2.5.1.1 rule 3, verbatim: "If any sub-element or attribute of the
+    /// <Conditions> element cannot be evaluated, or if an element is
+    /// encountered that is not understood, then the validity of the
+    /// assertion cannot be determined and is considered to be
+    /// Indeterminate." Rule 3 continues (§2.5.1.1, unnumbered paragraph
+    /// after the four rules): "An assertion that is determined to be
+    /// Invalid or Indeterminate MUST be rejected by a relying party" — so
+    /// Indeterminate is a hard reject here, not a downgrade to Valid-minus-
+    /// one-condition. A1 audit F13, closed 2026-09-11 (Q1: fail-closed
+    /// per the norm, no consumer in this repo to preserve compatibility
+    /// for).
+    ConditionNotUnderstood,
     /// The assertion has no `<Subject>`/`<NameID>` to authenticate.
     SubjectMissing,
     /// No acceptable `<SubjectConfirmation>` (see the more specific Recipient /
@@ -733,7 +747,7 @@ fn verifyCovering(
             var res = xmldsig.verify(alloc, doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(doc, &res, asrt, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, doc, &res, asrt, config.id_attr)) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
         }
@@ -746,7 +760,7 @@ fn verifyCovering(
             var res = xmldsig.verify(alloc, doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
             if (asrt.parent != root) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
@@ -876,7 +890,7 @@ fn verifyCoveringDecrypted(
             var res = xmldsig.verify(alloc, inner_doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(inner_doc, &res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, inner_doc, &res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
         }
@@ -889,7 +903,7 @@ fn verifyCoveringDecrypted(
             var res = xmldsig.verify(alloc, outer_doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(outer_doc, &res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, outer_doc, &res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
             if (enc.parent != outer_root) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
@@ -977,13 +991,13 @@ fn decryptWrappedElement(
 /// one same-document `#id` Reference whose id resolves (through the SAML ID
 /// index) to `target` by pointer identity. Empty / external / multi-reference
 /// signatures fail closed.
-fn signedTargetMatches(doc: *const xml.Document, res: *const xmldsig.Result, target: *const xml.Element, id_attr: []const u8) bool {
+fn signedTargetMatches(alloc: std.mem.Allocator, doc: *const xml.Document, res: *const xmldsig.Result, target: *const xml.Element, id_attr: []const u8) std.mem.Allocator.Error!bool {
     if (res.references.len != 1) return false;
     const uri = res.references[0].uri;
     if (uri.len == 0 or uri[0] != '#') return false;
     const id = uri[1..];
     if (id.len == 0) return false;
-    const resolved = doc.findByAttr("", id_attr, id) orelse return false;
+    const resolved = (try doc.findByAttr(alloc, "", id_attr, id)) orelse return false;
     return resolved == target;
 }
 
@@ -1033,11 +1047,25 @@ fn buildResult(alloc: std.mem.Allocator, asrt: *const xml.Element, config: Confi
         one_time_use = childEl(cond, saml_ns, "OneTimeUse") != null;
 
         // Multiple <AudienceRestriction> are ANDed; SP must be in EVERY one.
+        //
+        // A bare `<saml:Condition>` (the extensibility element, SAMLCore
+        // §2.5.1.3 — abstract type, a concrete instance identifies its real
+        // condition type via xsi:type) used to fall through the `else` arm
+        // silently. SAMLCore §2.5.1.1 rule 3 requires the OPPOSITE: an
+        // element under <Conditions> that is not understood makes the
+        // assertion's condition validity Indeterminate, and Indeterminate
+        // "MUST be rejected by a relying party" — fail-OPEN against a
+        // restriction the IdP deliberately attached is exactly backwards
+        // (A1 audit F13). This module implements no extension condition
+        // types, so every `<Condition>` it sees is, by construction, one it
+        // does not understand.
         var saw_restriction = false;
         for (cond.children) |c| switch (c.content) {
             .element => |el| if (isEl(el, saml_ns, "AudienceRestriction")) {
                 saw_restriction = true;
                 if (!audienceContains(el, config.sp_entity_id, alloc)) return error.AudienceMismatch;
+            } else if (isEl(el, saml_ns, "Condition")) {
+                return error.ConditionNotUnderstood;
             },
             else => {},
         };
@@ -2553,7 +2581,7 @@ pub fn consumeLogoutRequestXml(
             var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
         .redirect_verified => {},
     }
@@ -2732,7 +2760,7 @@ pub fn consumeLogoutResponseXml(
             var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
         .redirect_verified => {},
     }
@@ -3018,7 +3046,7 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
     defer res.deinit(alloc);
     if (!res.valid) return error.SignatureInvalid;
-    if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+    if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
 
     const status = childEl(root, samlp_ns, "Status") orelse return error.MalformedSoap;
     const status_code_el = childEl(status, samlp_ns, "StatusCode") orelse return error.MalformedSoap;

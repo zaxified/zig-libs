@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign round 2 (`QUESTIONS-ROUND-2.md` Q4,
+  cross-module with `rsa` — one commit, both modules). **F3's OAEP arm,
+  closed.** `rsaOaepUnwrap` used to `try rsa.decryptOaepH(...)`: a failed
+  OAEP unwrap returned `error.DecryptionError` immediately, before
+  `decryptData`'s downstream AES-GCM/CBC pass over the content ciphertext
+  ever ran — the same caller-scope timing asymmetry the 2026-09-03 fix
+  closed for PKCS#1 v1.5 and AES-KW (measured then: 97.0% classifier
+  accuracy over a 3 MiB CBC ciphertext), left open for OAEP because closing
+  it needed either a second OAEP-decode implementation inside this module
+  or a new entry point in `rsa`. New `rsa.decryptOaepHNoFail` (additive;
+  every existing `rsa` OAEP function keeps its signature and behavior)
+  reports a padding failure as data (`.ok = false` plus the raw RSADP
+  output) instead of an early `error`; `rsaOaepUnwrap` now builds a decoy
+  CEK from that raw output with the SAME `decoyCek` helper the PKCS#1 v1.5
+  arm already used, so all three RSA/AES-KW key-transport algorithms share
+  one decoy-derivation path and `decryptData` always reaches its AES pass.
+  See `SPEC.md` "Constant-time posture" for the full before/after. No public
+  API change in this module (`rsaOaepUnwrap` was already private).
+  `scripts/modtest xmlenc`: 43/45 (Debug/ReleaseSafe, 2 unrelated skips),
+  45/45 (ReleaseFast).
+
 - **2026-09-10** — A1 fix campaign. Verified against the TREE, not the
   2026-09-03 audit ledger text (which is now stale on one of its two
   "recorded, not fixed" items):

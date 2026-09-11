@@ -277,13 +277,34 @@ also surfaced verbatim in `AuthnResult.authn_context_class_ref`.
   → `AssertionNotYetValid` / `AssertionExpired`. `<AudienceRestriction>` must
   name `sp_entity_id` (multiple restrictions are ANDed; fail-closed if none) →
   `AudienceMismatch`. `<OneTimeUse>` presence is flagged (`AuthnResult.one_time_use`).
+  **A `<saml:Condition>` extension element is a hard reject**
+  (`error.ConditionNotUnderstood`, A1 audit F13, closed 2026-09-11): this
+  module implements no extension condition types, and SAMLCore §2.5.1.1
+  rule 3 is explicit that an unrecognized `<Conditions>` sub-element makes
+  the assertion's condition validity Indeterminate, which "MUST be
+  rejected by a relying party" — the same fate as Invalid, not a
+  downgrade to "valid minus one condition". BEHAVIOURAL: an assertion
+  carrying a `<saml:Condition>` this module previously accepted (silently
+  ignoring the condition) is now rejected. No consumer of this module
+  exists in this repository (Q1: follow the norm even where it tightens
+  today's accepted input).
 - **`<SubjectConfirmation>`** (see the two sections above for the method policy):
   Bearer (Web SSO default) requires `Recipient` == `acs_url` (`RecipientMismatch`),
   `NotOnOrAfter` enforced, and `InResponseTo` == `expected_in_response_to` (or
   absent only when `allow_idp_initiated`) → `InResponseToMismatch`. Holder-of-Key
   requires the presented-key match instead of `Recipient`. The subject is confirmed
   if at least one permitted-method confirmation fully validates; otherwise the most
-  specific reason is returned.
+  specific reason is returned. **This is intentional OR semantics, not a
+  short-circuit bug**: SAMLCore §2.4.1 (`<Subject>` element), verbatim on
+  `<SubjectConfirmation>` [Zero or More]: "If more than one subject
+  confirmation is provided, then satisfying any one of them is sufficient
+  to confirm the subject for the purpose of applying the assertion." A
+  later, invalid `<SubjectConfirmation>` (e.g. a Bearer confirmation with
+  a wrong `Recipient`) present alongside an earlier valid one (e.g.
+  sender-vouches under `.either`) does not and must not undo the earlier
+  success — investigated as an open audit question, closed 2026-09-11 as
+  NOT A DEFECT once the actual spec text was read (`QUESTIONS-ROUND-2.md`
+  Q5: "where the norm isn't silent, follow it").
 - **Assertion `<Issuer>`: REQUIRED, and it must equal `idp_entity_id`** →
   `IssuerMissing` / `IssuerMismatch`. See the next section for why absence is an
   error rather than a skipped check.

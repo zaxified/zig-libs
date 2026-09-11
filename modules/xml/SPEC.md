@@ -148,43 +148,49 @@ outside the root.
 - **No external resource access of any kind** — by construction, not by config.
 - **Canonicalization / signing themselves** — that is the `xmldsig` layer; this
   module only guarantees the infoset it needs.
-- **`isNameStartByte` accepts the full non-ASCII byte range (`>= 0x80`)
-  leniently, not the XML `NameStartChar` production.** Four measured
-  divergences from libxml2/expat, all in the ACCEPT direction (this parser
-  takes documents both reference implementations reject): a bare NameChar
-  used to start a name (U+00B7), a combining character starting a name
-  (U+0300), and two non-Name characters mid-name (U+00D7). A document that
-  round-trips through this parser and a stricter one can therefore disagree
-  on well-formedness (audit `A1/xml.md` F4, open).
-- **Line-ending normalization (XML §2.11, `\r\n`/`\r` → `\n`) applies to text
-  and attribute values only**, not to comment or PI content, even though
-  those also fall under the Char production §2.11 governs. A document
-  containing a raw CR inside a comment or PI canonicalizes to a different
-  byte sequence than libxml2 produces for the same input (audit `A1/xml.md`
-  F3, open — relevant to `xmldsig`'s `#WithComments` C14N mode, which a
-  document itself selects).
-- **Byte sequences inside a Name are not validated as UTF-8.**
-  `isNameStartByte`/`isNameByte` classify by raw byte value; a name can
-  therefore contain a byte sequence that is not valid UTF-8 at all (as
-  opposed to the leniency above, which is about valid-but-out-of-grammar
-  Unicode). Text and attribute VALUES are UTF-8-validated; names are not
-  (audit `A1/xml.md` F9 sub-finding "M16", open).
-- **A PI target reserved as `xml` (any ASCII case) is only checked as such
-  by `parsePi`, not consistently by `parseXmlDecl`.** `parseXmlDecl`
-  requires whitespace immediately after an exact-case `<?xml` at byte 0 of
-  the document or returns `MalformedPI`; the same construct anywhere else
-  (including `<?xml-stylesheet ...?>`, a W3C-recommended PI) reaches
-  `parsePi` instead, which only reserves the exact target `xml` — so
-  `<?xml-stylesheet href="a.xsl"?><a/>` is rejected at byte 0 and accepted
-  one byte later (audit `A1/xml.md` F7, open, LOW — fails closed).
-- **`DoctypePolicy.ignore`'s "skip the DOCTYPE without parsing it" does not
-  track quote state inside the external `SYSTEM`/`PUBLIC` literals** (only
-  inside an internal subset's `[ ... ]`), so a literal `>` inside a quoted
-  external identifier ends the skip early and the rest of the declaration
-  is parsed as document content, typically failing closed with
-  `TrailingContent` rather than being skipped as promised (audit
-  `A1/xml.md` F10, open, LOW — fails closed, and `.ignore` is not the
-  default policy).
+
+## BEHAVIOURAL (2026-09-11, A1 fix campaign round 2, `QUESTIONS-ROUND-2.md` Q5)
+
+Five divergences from XML 1.0 / libxml2 / expat, previously listed above as
+deliberate scope limits, are now closed by matching the norm exactly (Q5: "the
+newer/more precise norm wins" — XML 1.0 §2.11/§7 and libxml2/expat agree with
+each other here, only this module diverged, so per Q5 rule 1 there is no
+compatibility switch: the norm and the reference implementations already
+agree, only the module needed to change).
+
+- **Line-ending normalization (§2.11) now applies inside comment and PI
+  content too**, not just text/attribute values (former F3). A document with
+  a raw CR inside a `<!--comment-->` or `<?pi?>` now canonicalizes
+  byte-for-byte identically to libxml2/expat instead of one byte off. Verified black-box
+  against `xmllint --c14n` (audit `A1/xml.md` F3, closed).
+- **Name characters are validated against the real Unicode
+  `NameStartChar`/`NameChar` grammar**, decoded from UTF-8, instead of
+  accepting any byte `>= 0x80` (former F4) or trusting the whole-document
+  `utf8ValidateSlice` check as the only thing standing between a name and
+  malformed UTF-8 (former F9 sub-finding "M16" — both close via the same
+  rewrite of `parseNameRaw`). U+00B7 alone at the start of a name, a bare
+  combining character starting a name, and non-Name characters mid-name are
+  now rejected, matching libxml2/expat exactly (verified black-box). This is
+  BEHAVIOURAL: a small number of previously-accepted non-ASCII-but-out-of-
+  grammar names are now `error.InvalidName`.
+- **A PI target starting with `xml` (e.g. `xml-stylesheet`, `xmlfoo`) is now
+  treated identically at byte 0 of the document and everywhere else** (former
+  F7). Only the EXACT target `xml` (any ASCII case) is reserved, per XML 1.0
+  §7 — not every name that merely starts with those three letters. Verified
+  black-box: `<?xml-stylesheet href="a.xsl"?><a/>` now parses, matching
+  xmllint and Python's expat.
+- **`DoctypePolicy.ignore`'s DOCTYPE skip now tracks quote state for the
+  WHOLE declaration**, not just inside an internal subset's `[ ... ]`
+  (former F10), so a literal `>` inside a `SYSTEM`/`PUBLIC` external
+  identifier literal no longer ends the skip early. Verified black-box
+  against xmllint/expat.
+- **`Document.findByAttr` no longer recurses on the machine stack**
+  (former "F5-zbytek"). Same fix and same shape as `Element.textContent`
+  (F5, closed 2026-09-10): an explicit heap stack, bounded by the allocator
+  instead of `ulimit -s`. **API change**: `findByAttr` now takes an
+  `std.mem.Allocator` and returns `std.mem.Allocator.Error!?*Element`
+  instead of `?*Element`. All three in-repo callers (`xmldsig`,
+  `saml`, `netconf`) were updated in the same commit.
 
 ## Validation
 

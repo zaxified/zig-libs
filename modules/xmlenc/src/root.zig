@@ -351,17 +351,10 @@ fn unwrapCek(
     defer alloc.free(wrapped);
 
     if (eq(alg, alg_rsa_oaep_mgf1p)) {
-        // ⛔ OAEP still returns early on a decode failure — see SPEC.md
-        // §"Constant-time posture". The decoy needs secret material, and the
-        // only secret this path holds is inside `rsa.decryptOaepH`, which
-        // reports failure as an error and keeps its intermediate block; giving
-        // OAEP the same treatment means either a second modular exponentiation
-        // (a louder difference than the one being closed) or a change to the
-        // `rsa` module's surface. Recorded, not fixed.
-        return .{ .cek = try rsaOaepUnwrap(sk, .{ .digest = .sha1, .mgf = .sha1 }, enc_key, wrapped, out), .ok = true };
+        return try rsaOaepUnwrap(sk, .{ .digest = .sha1, .mgf = .sha1 }, enc_key, wrapped, out, want);
     } else if (eq(alg, alg_rsa_oaep)) {
         const h = try oaepHashFromMethod(method);
-        return .{ .cek = try rsaOaepUnwrap(sk, h, enc_key, wrapped, out), .ok = true };
+        return try rsaOaepUnwrap(sk, h, enc_key, wrapped, out, want);
     } else if (eq(alg, alg_rsa_15)) {
         if (!options.allow_weak_rsa15) return error.WeakRsa15NotAllowed;
         return try rsaPkcs1v15Unwrap(sk, wrapped, out, want);
@@ -407,36 +400,64 @@ fn oaepHashFromMethod(method: *const xml.Element) Error!OaepHashes {
     return .{ .digest = digest, .mgf = mgf };
 }
 
+/// RSAES-OAEP key unwrap (RFC 8017 §7.1.2 / xenc11 `rsa-oaep`,
+/// `rsa-oaep-mgf1p`). Same Bleichenbacher-class decoy-CEK countermeasure as
+/// `rsaPkcs1v15Unwrap` below, now that `rsa.decryptOaepHNoFail` (A1 audit,
+/// xmlenc F3 OAEP arm × rsa, closed 2026-09-11) makes it possible without
+/// duplicating OAEP's padding-decode cryptography here: a padding failure is
+/// data (`.ok = false` and a `want`-length decoy derived from the raw RSADP
+/// block), never an early `error` return, so the caller (`unwrapKey`'s
+/// caller) always reaches the downstream AES-GCM/CBC pass over the content
+/// ciphertext, exactly as it already does for the RSA-1_5 and AES-KW arms.
 fn rsaOaepUnwrap(
     sk: rsa.SecretKey,
     hashes: OaepHashes,
     enc_key: *const xml.Element,
     wrapped: []const u8,
     out: *[64]u8,
-) Error![]const u8 {
+    want: usize,
+) Error!Unwrapped {
+    if (want == 0 or want > out.len) return error.DecryptionError; // public: from the content algorithm URI
     // OAEPparams (the OAEP label L) is optional; empty when absent.
     var label_buf: [256]u8 = undefined;
     var label: []const u8 = "";
     if (childEl(childEl(enc_key, xenc_ns, "EncryptionMethod").?, xenc_ns, "OAEPparams")) |op| {
         label = try readBase64Text(op, &label_buf);
     }
-    // The CEK is at most 32 bytes; the OAEP max-message bound depends on k and
-    // the hash, so give decryptOaepH a generous buffer and copy the result out.
+    // The CEK is at most 32 bytes; the OAEP max-message bound depends on k
+    // and the hash, so give decryptOaepHNoFail a generous message buffer.
     var msg_buf: [rsa.max_modulus_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &msg_buf);
-    const msg = switch (hashes.digest) {
+    var raw_buf: [rsa.max_modulus_len]u8 = undefined;
+    defer std.crypto.secureZero(u8, &raw_buf);
+    const r = switch (hashes.digest) {
         .sha1 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepH(sk, Sha1, Sha1, wrapped, label, &msg_buf),
-            .sha256 => rsa.decryptOaepH(sk, Sha1, Sha256, wrapped, label, &msg_buf),
+            .sha1 => rsa.decryptOaepHNoFail(sk, Sha1, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha256 => rsa.decryptOaepHNoFail(sk, Sha1, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
         },
         .sha256 => switch (hashes.mgf) {
-            .sha1 => rsa.decryptOaepH(sk, Sha256, Sha1, wrapped, label, &msg_buf),
-            .sha256 => rsa.decryptOaepH(sk, Sha256, Sha256, wrapped, label, &msg_buf),
+            .sha1 => rsa.decryptOaepHNoFail(sk, Sha256, Sha1, .none, wrapped, label, want, &msg_buf, &raw_buf),
+            .sha256 => rsa.decryptOaepHNoFail(sk, Sha256, Sha256, .none, wrapped, label, want, &msg_buf, &raw_buf),
         },
-    } catch return error.DecryptionError;
-    if (msg.len == 0 or msg.len > out.len) return error.DecryptionError;
-    @memcpy(out[0..msg.len], msg);
-    return out[0..msg.len];
+    } catch |e| switch (e) {
+        // BufferTooSmall is a structural/public-data precondition (`want` vs
+        // this function's own fixed-size buffers) -- not a padding-decode
+        // outcome, so an early error here is not an oracle.
+        error.BufferTooSmall => return error.DecryptionError,
+        // The one remaining `error.DecryptionError` case inside
+        // `decryptOaepHNoFail` is `ct.len != k`, ALSO public (the wrapped
+        // key's own length vs the modulus, both known before any secret
+        // operation runs).
+        error.DecryptionError => return error.DecryptionError,
+    };
+    if (!r.ok) {
+        // See `rsaPkcs1v15Unwrap`'s identical comment: `r.raw` is c^d mod n,
+        // which the peer cannot compute, so a decoy derived from it cannot be
+        // predicted or crafted around.
+        return .{ .cek = decoyCek(r.raw, want, out), .ok = false };
+    }
+    @memcpy(out[0..r.msg.len], r.msg);
+    return .{ .cek = out[0..r.msg.len], .ok = true };
 }
 
 /// RSAES-PKCS#1 v1.5 decryption (RFC 8017 §7.2.2). Gated behind
@@ -1182,6 +1203,103 @@ test "TEETH (F3): the decoy is unpredictable and input-bound, not a constant" {
     var zero: [32]u8 = @splat(0);
     try testing.expect(!std.mem.eql(u8, un_a.cek, &zero));
     // Two different rejected blocks must not decoy to the same key.
+    try testing.expect(!std.mem.eql(u8, un_a.cek, un_b.cek));
+}
+
+// ── OAEP arm of F3 (xmlenc × rsa, A1 audit, closed 2026-09-11) ──────────────
+
+/// A minimal `<xenc:EncryptedKey>` carrying only the `EncryptionMethod`
+/// `rsaOaepUnwrap` reads (for OAEPparams, which is absent here -- empty
+/// label, matching the encrypt calls below). Caller owns the returned
+/// `Document` (`deinit()`); `.root` is the `enc_key` argument.
+fn oaepEncKeyEl() !xml.Document {
+    return xml.parse(testing.allocator, "<xenc:EncryptedKey xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\">" ++
+        "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep\"/>" ++
+        "</xenc:EncryptedKey>", .{});
+}
+
+// The v1.5 tests above are the pattern this mirrors for `rsa-oaep`/
+// `rsa-oaep-mgf1p`: `rsaOaepUnwrap` used to `try rsa.decryptOaepH(...)`, an
+// early `error` return on ANY OAEP padding failure that skipped the caller's
+// downstream AES pass entirely -- the identical caller-scope asymmetry the
+// v1.5 fix closed, left open here because closing it needed either a second
+// OAEP-decode implementation duplicated into `xmlenc` or a new, non-erroring
+// entry point in `rsa` (`decryptOaepHNoFail`, added in the same commit as
+// these tests). 1024-bit key: SHA-256 OAEP needs k >= 2*32+2 = 66 bytes,
+// so the 512-bit key the v1.5 tests use (k=64) is one byte too small.
+
+test "TEETH (F3 OAEP arm): a failed OAEP key unwrap still decrypts the content, so both outcomes cost the same" {
+    var kp = try v15TestKey(1024);
+    defer kp.secret_key.deinit();
+    var prng = std.Random.DefaultPrng.init(0x0A_E9_0A_E9);
+    const random = prng.random();
+    var ct_buf: [rsa.max_modulus_len]u8 = undefined;
+    var out: [64]u8 = @splat(0xAA);
+    const hashes = OaepHashes{ .digest = .sha256, .mgf = .sha256 };
+    var doc = try oaepEncKeyEl();
+    defer doc.deinit();
+    const enc_key = doc.root;
+
+    for ([_]usize{ 16, 32 }) |want| {
+        // A genuinely valid OAEP ciphertext for the WRONG-length message: a
+        // conforming block whose message is not the content algorithm's key
+        // length is the same third-arm oracle the v1.5 test names, and OAEP
+        // must fold it into the same validity mask too (not a separate check).
+        const other: usize = if (want == 32) 16 else 32;
+        var msg_buf: [32]u8 = @splat(0x5A);
+        const ct_wrong_len = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, msg_buf[0..other], "", &ct_buf);
+        const un1 = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_wrong_len, &out, want);
+        try testing.expect(!un1.ok);
+        try testing.expectEqual(want, un1.cek.len);
+
+        // A structurally corrupted ciphertext (one flipped byte -> the RSA
+        // private op recovers garbage, OAEP padding cannot validate).
+        var ct_corrupt = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, msg_buf[0..want], "", &ct_buf);
+        ct_corrupt[ct_corrupt.len / 2] ^= 0x01;
+        const un2 = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_corrupt, &out, want);
+        try testing.expect(!un2.ok);
+        try testing.expectEqual(want, un2.cek.len);
+
+        // Control: a genuinely valid ciphertext of the right length succeeds.
+        const ct_good = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, msg_buf[0..want], "", &ct_buf);
+        const un3 = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_good, &out, want);
+        try testing.expect(un3.ok);
+        try testing.expectEqualSlices(u8, msg_buf[0..want], un3.cek);
+    }
+}
+
+test "TEETH (F3 OAEP arm): the decoy is unpredictable and input-bound, not a constant" {
+    var kp = try v15TestKey(1024);
+    defer kp.secret_key.deinit();
+    var prng = std.Random.DefaultPrng.init(0x0A_E9_0A_EA);
+    const random = prng.random();
+    var ct_buf_a: [rsa.max_modulus_len]u8 = undefined;
+    var ct_buf_b: [rsa.max_modulus_len]u8 = undefined;
+    var out_a: [64]u8 = undefined;
+    var out_b: [64]u8 = undefined;
+    const hashes = OaepHashes{ .digest = .sha256, .mgf = .sha256 };
+    var doc = try oaepEncKeyEl();
+    defer doc.deinit();
+    const enc_key = doc.root;
+
+    var msg_buf: [32]u8 = @splat(0x5A);
+    const ct_a = try rsa.encryptOaepH(kp.public_key, Sha256, Sha256, random, &msg_buf, "", &ct_buf_a);
+    @memcpy(ct_buf_b[0..ct_a.len], ct_a);
+    ct_buf_b[ct_a.len / 2] ^= 0x01; // one bit of an otherwise-identical ciphertext
+    const ct_b = ct_buf_b[0..ct_a.len];
+
+    // ct_a would decrypt VALIDLY as-is, so corrupt it too -- both compared
+    // decoys must come from REJECTED unwraps.
+    var ct_a_bad_buf: [rsa.max_modulus_len]u8 = undefined;
+    @memcpy(ct_a_bad_buf[0..ct_a.len], ct_a);
+    ct_a_bad_buf[ct_a.len / 3] ^= 0x01;
+    const un_a = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_a_bad_buf[0..ct_a.len], &out_a, 32);
+    const un_b = try rsaOaepUnwrap(kp.secret_key, hashes, enc_key, ct_b, &out_b, 32);
+    try testing.expect(!un_a.ok and !un_b.ok);
+
+    var zero: [32]u8 = @splat(0);
+    try testing.expect(!std.mem.eql(u8, un_a.cek, &zero));
+    // Two different rejected ciphertexts must not decoy to the same key.
     try testing.expect(!std.mem.eql(u8, un_a.cek, un_b.cek));
 }
 

@@ -364,20 +364,40 @@ pub const Document = struct {
     /// the parser's `DuplicateId` guard) MUST enforce uniqueness itself before
     /// trusting the result — see `xmldsig`'s own `resolveReference`, which
     /// does exactly that and does not rely on this function for it.
-    pub fn findByAttr(self: *const Document, uri: []const u8, local: []const u8, value: []const u8) ?*Element {
-        return findByAttrRec(self.root, uri, local, value);
-    }
-
-    fn findByAttrRec(el: *Element, uri: []const u8, local: []const u8, value: []const u8) ?*Element {
-        if (el.attr(uri, local)) |v| {
-            if (std.mem.eql(u8, v, value)) return el;
+    ///
+    /// Takes an allocator (F5-zbytek, audit A1/xml.md): this walk used to
+    /// recurse on the machine stack, one frame per nesting level, and
+    /// SIGSEGV'd well inside `Options.max_depth`'s range (same defect class as
+    /// `textContent`, fixed earlier as F5). It now walks an explicit heap
+    /// stack of "remaining siblings at this level" — same shape as
+    /// `textContent` — bounded by the allocator, not by `ulimit -s`. Breaking
+    /// change for the three in-repo callers (`xmldsig`, `saml`, `netconf`);
+    /// fixed in the same commit.
+    pub fn findByAttr(self: *const Document, alloc: std.mem.Allocator, uri: []const u8, local: []const u8, value: []const u8) std.mem.Allocator.Error!?*Element {
+        if (self.root.attr(uri, local)) |v| {
+            if (std.mem.eql(u8, v, value)) return self.root;
         }
-        for (el.children) |c| switch (c.content) {
-            .element => |child| {
-                if (findByAttrRec(child, uri, local, value)) |found| return found;
-            },
-            else => {},
-        };
+        var stack: std.ArrayList([]const Child) = .empty;
+        defer stack.deinit(alloc);
+        try stack.append(alloc, self.root.children);
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            if (top.len == 0) {
+                _ = stack.pop();
+                continue;
+            }
+            const c = top.*[0];
+            top.* = top.*[1..];
+            switch (c.content) {
+                .element => |el| {
+                    if (el.attr(uri, local)) |v| {
+                        if (std.mem.eql(u8, v, value)) return el;
+                    }
+                    try stack.append(alloc, el.children);
+                },
+                else => {},
+            }
+        }
         return null;
     }
 };
@@ -641,10 +661,20 @@ const Parser = struct {
     // Only valid at byte 0 (after BOM): `<?xml version="1.0" ...?>`.
     fn parseXmlDecl(self: *Parser, version: *[]const u8, encoding: *[]const u8, standalone: *?bool) ParseError!void {
         if (!self.starts("<?xml")) return;
-        // Must be followed by whitespace to be the declaration (vs a PI target
-        // like "xmlfoo"). A real "<?xml" PI target is reserved anyway.
+        // Must be followed by whitespace to be the DECLARATION. If it isn't,
+        // "<?xml" is just the start of some OTHER PI target -- "xmlfoo" or
+        // the W3C-recommended "xml-stylesheet" -- and this function consumes
+        // nothing at all, leaving the ordinary parseMarkup -> parsePi path to
+        // pick it up. XML 1.0 §7 reserves the target name "xml" (any ASCII
+        // case) EXACTLY, not every name that merely starts with those three
+        // letters -- libxml2 and expat both agree (audit A1/xml.md F7). The
+        // degenerate exact-target case ("<?xml?>", "<?xml ?>" with no
+        // VersionInfo) still ends up rejected: parsePi's own
+        // `asciiEqualIgnoreCase(target, "xml")` check catches it once the
+        // ordinary PI path reaches it, since this function returned early
+        // without consuming anything.
         const after = self.i + 5;
-        if (after >= self.src.len or !isWs(self.src[after])) return error.MalformedPI;
+        if (after >= self.src.len or !isWs(self.src[after])) return;
         self.i = after;
         self.skipWs();
 
@@ -775,9 +805,28 @@ const Parser = struct {
         // .ignore: skip the whole declaration without ever parsing entity decls
         // or touching an external subset. Balances a `[ internal subset ]`.
         self.i += "<!DOCTYPE".len;
+        // Quote state is tracked for the ENTIRE declaration, not just inside
+        // `[ ... ]` -- a `>` inside a quoted SYSTEM/PUBLIC literal in the
+        // EXTERNAL part (e.g. `SYSTEM "a>b"`) used to end the skip early,
+        // same class of bug as the internal-subset one below (audit
+        // A1/xml.md F10). Once `quote` is set here we can only be looking at
+        // that literal's own bytes, so `[`/`>`/comments inside it are never
+        // misread as document structure.
+        var quote: ?u8 = null;
         while (!self.eof()) {
             const c = self.src[self.i];
-            if (c == '[') {
+            if (quote) |q| {
+                if (c == q) quote = null;
+                self.i += 1;
+            } else if (c == '"' or c == '\'') {
+                quote = c;
+                self.i += 1;
+            } else if (c == '<' and self.starts("<!--")) {
+                self.i += "<!--".len;
+                while (!self.eof() and !self.starts("-->")) self.i += 1;
+                if (self.eof()) return error.UnexpectedEof;
+                self.i += "-->".len;
+            } else if (c == '[') {
                 self.i += 1;
                 // A `]` inside a quoted literal (EntityValue/AttValue/
                 // ExternalID literal, e.g. `<!ENTITY rsqb "]">`) or inside a
@@ -788,14 +837,14 @@ const Parser = struct {
                 // entity value literally containing "]" or "]]"). Track
                 // quote state and skip comments wholesale so only an
                 // unquoted, uncommented `]` ends the subset.
-                var quote: ?u8 = null;
+                var isubset_quote: ?u8 = null;
                 while (!self.eof()) {
                     const cc = self.src[self.i];
-                    if (quote) |q| {
-                        if (cc == q) quote = null;
+                    if (isubset_quote) |q| {
+                        if (cc == q) isubset_quote = null;
                         self.i += 1;
                     } else if (cc == '"' or cc == '\'') {
-                        quote = cc;
+                        isubset_quote = cc;
                         self.i += 1;
                     } else if (cc == '<' and self.starts("<!--")) {
                         self.i += "<!--".len;
@@ -831,8 +880,9 @@ const Parser = struct {
                 if (self.src[self.i + 2] != '>') return error.MalformedComment;
                 const body = self.src[body_start..self.i];
                 try self.validateChars(body);
+                const normalized = try normalizeLineEndings(self.a, body);
                 self.i += 3; // -->
-                return .{ .content = .{ .comment = body }, .span = .{ .start = start, .end = self.i } };
+                return .{ .content = .{ .comment = normalized }, .span = .{ .start = start, .end = self.i } };
             }
         }
         return error.MalformedComment;
@@ -860,8 +910,9 @@ const Parser = struct {
             const ds = self.i;
             while (self.i + 1 < self.src.len and !(self.src[self.i] == '?' and self.src[self.i + 1] == '>')) self.i += 1;
             if (self.i + 1 >= self.src.len) return error.MalformedPI;
-            data = self.src[ds..self.i];
-            try self.validateChars(data);
+            const raw_data = self.src[ds..self.i];
+            try self.validateChars(raw_data);
+            data = try normalizeLineEndings(self.a, raw_data);
         }
         if (!self.starts("?>")) return error.MalformedPI;
         self.i += 2;
@@ -1242,10 +1293,41 @@ const Parser = struct {
 
     fn parseNameRaw(self: *Parser) ParseError![]const u8 {
         const start = self.i;
-        const first = self.peek() orelse return error.UnexpectedEof;
-        if (!isNameStartByte(first)) return error.InvalidName;
-        self.i += 1;
-        while (self.i < self.src.len and isNameByte(self.src[self.i])) self.i += 1;
+        {
+            const c0 = self.peek() orelse return error.UnexpectedEof;
+            if (c0 < 0x80) {
+                if (!isNameStartChar(c0)) return error.InvalidName;
+                self.i += 1;
+            } else {
+                // Decode rather than accept any byte >= 0x80 as-is: the source
+                // was already checked as well-formed UTF-8 as a WHOLE (see
+                // `parseCounted`'s `utf8ValidateSlice`), but that is a single
+                // point of enforcement this function used to depend on
+                // entirely without any decode of its own (audit A1/xml.md F9
+                // sub-finding M16) -- and, independently of well-formedness,
+                // a validly-encoded non-ASCII codepoint still has to fall
+                // inside the real NameStartChar ranges, not just be "some
+                // byte >= 0x80" (audit A1/xml.md F4).
+                const len = std.unicode.utf8ByteSequenceLength(c0) catch return error.InvalidName;
+                if (self.i + len > self.src.len) return error.InvalidName;
+                const cp = std.unicode.utf8Decode(self.src[self.i .. self.i + len]) catch return error.InvalidName;
+                if (!isNameStartChar(cp)) return error.InvalidName;
+                self.i += len;
+            }
+        }
+        while (self.i < self.src.len) {
+            const c = self.src[self.i];
+            if (c < 0x80) {
+                if (!isNameChar(c)) break;
+                self.i += 1;
+            } else {
+                const len = std.unicode.utf8ByteSequenceLength(c) catch break;
+                if (self.i + len > self.src.len) break;
+                const cp = std.unicode.utf8Decode(self.src[self.i .. self.i + len]) catch break;
+                if (!isNameChar(cp)) break;
+                self.i += len;
+            }
+        }
         const name = self.src[start..self.i];
         if (name.len > self.opts.max_name_len) return error.NameTooLong;
         return name;
@@ -1294,6 +1376,35 @@ const Parser = struct {
         return out.toOwnedSlice(self.a);
     }
 
+    /// XML 1.0 §2.11: a conforming processor MUST behave as if every literal
+    /// "\r\n" and every remaining literal "\r" in the entity were replaced by
+    /// a single "\n", BEFORE any other processing. `parseText`/`parseAttrValue`
+    /// already normalize inline as they scan; comment and PI bodies used to
+    /// carry a raw "\r" straight through (audit A1/xml.md F3) -- reachable
+    /// downstream through xmldsig's inclusive-with-comments C14N, which reads
+    /// straight from these fields and so produced a canonical form one byte
+    /// off from libxml2 for any document with a CR inside a comment or PI.
+    /// Allocates only when the body actually contains a `\r`, so the common
+    /// case (none) still returns the original slice unchanged.
+    fn normalizeLineEndings(a: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
+        if (std.mem.indexOfScalar(u8, s, '\r') == null) return s;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        var idx: usize = 0;
+        while (idx < s.len) {
+            const c = s[idx];
+            if (c == '\r') {
+                try out.append(a, '\n');
+                idx += 1;
+                if (idx < s.len and s[idx] == '\n') idx += 1;
+            } else {
+                try out.append(a, c);
+                idx += 1;
+            }
+        }
+        return out.toOwnedSlice(a);
+    }
+
     fn validateChars(self: *Parser, s: []const u8) ParseError!void {
         _ = self;
         // Reject control chars other than tab/LF/CR, and Unicode
@@ -1322,14 +1433,30 @@ fn isWs(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\r' or c == '\n';
 }
 
-fn isNameStartByte(c: u8) bool {
-    // ASCII NameStartChar plus any UTF-8 lead/continuation byte (>= 0x80). This
-    // accepts the full non-ASCII Name range leniently; ASCII rules are exact.
-    return (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_' or c == ':' or c >= 0x80;
+/// XML 1.0 (5th ed.) NameStartChar production, verbatim:
+///   ":" | [A-Z] | "_" | [a-z] | [#xC0-#xD6] | [#xD8-#xF6] | [#xF8-#x2FF] |
+///   [#x370-#x37D] | [#x37F-#x1FFF] | [#x200C-#x200D] | [#x2070-#x218F] |
+///   [#x2C00-#x2FEF] | [#x3001-#xD7FF] | [#xF900-#xFDCF] | [#xFDF0-#xFFFD] |
+///   [#x10000-#xEFFFF]
+/// Takes a decoded codepoint, not a raw byte -- see `parseNameRaw`, which
+/// used to accept ANY byte >= 0x80 here without decoding at all (audit
+/// A1/xml.md F4, F9 sub-finding M16).
+fn isNameStartChar(cp: u32) bool {
+    return switch (cp) {
+        ':', 'A'...'Z', '_', 'a'...'z' => true,
+        0xC0...0xD6, 0xD8...0xF6, 0xF8...0x2FF, 0x370...0x37D, 0x37F...0x1FFF, 0x200C...0x200D, 0x2070...0x218F, 0x2C00...0x2FEF, 0x3001...0xD7FF, 0xF900...0xFDCF, 0xFDF0...0xFFFD, 0x10000...0xEFFFF => true,
+        else => false,
+    };
 }
 
-fn isNameByte(c: u8) bool {
-    return isNameStartByte(c) or (c >= '0' and c <= '9') or c == '-' or c == '.';
+/// NameChar ::= NameStartChar | "-" | "." | [0-9] | #xB7 | [#x0300-#x036F] |
+/// [#x203F-#x2040]
+fn isNameChar(cp: u32) bool {
+    if (isNameStartChar(cp)) return true;
+    return switch (cp) {
+        '-', '.', '0'...'9', 0xB7, 0x300...0x36F, 0x203F, 0x2040 => true,
+        else => false,
+    };
 }
 
 fn hexVal(c: u8) ?u32 {
@@ -1512,7 +1639,7 @@ test "getElementById + findByAttr" {
     defer doc.deinit();
     try testing.expectEqualStrings("a", doc.getElementById("assertion-1").?.local);
     try testing.expectEqualStrings("b", doc.getElementById("inner").?.local); // xml:id
-    try testing.expectEqualStrings("a", doc.findByAttr("", "ID", "assertion-1").?.local);
+    try testing.expectEqualStrings("a", (try doc.findByAttr(testing.allocator, "", "ID", "assertion-1")).?.local);
     try testing.expect(doc.getElementById("nope") == null);
 }
 
@@ -1860,6 +1987,107 @@ test "doctype=.ignore: internal subset skip is quote- and comment-aware" {
     const bracket_in_comment = "<!DOCTYPE doc [<!-- ] --><!ELEMENT doc (#PCDATA)>]><doc/>";
     var ok = try parse(testing.allocator, bracket_in_comment, .{ .doctype = .ignore });
     defer ok.deinit();
+}
+
+test "not-wf: line-ending normalization (XML 2.11) applies inside comments and PIs too" {
+    // XML 1.0 2.11: an XML processor MUST normalize every literal "\r\n" and
+    // every remaining literal "\r" to a single "\n", applied to the entire
+    // entity before any other processing -- not just to text and attribute
+    // values. `parseText`/`parseAttrValue` already did this; comment and PI
+    // content did not, so xmldsig's inclusive-with-comments C14N produced a
+    // canonical form one byte off from libxml2/expat for any document with a
+    // raw CR inside a comment or PI (audit A1/xml.md F3).
+    var doc = try parse(testing.allocator, "<a><!--x\r\ny--><?t x\r\ny?></a>", .{});
+    defer doc.deinit();
+    const kids = doc.root.children;
+    try testing.expectEqualStrings("x\ny", kids[0].content.comment);
+    try testing.expectEqualStrings("x\ny", kids[1].content.pi.data);
+
+    // Lone \r (no following \n) normalizes too.
+    var doc2 = try parse(testing.allocator, "<a><!--x\ry--></a>", .{});
+    defer doc2.deinit();
+    try testing.expectEqualStrings("x\ny", doc2.root.children[0].content.comment);
+
+    // No CR at all: unaffected (and, structurally, must not now require an
+    // allocation it didn't need before -- same slice bytes either way).
+    var doc3 = try parse(testing.allocator, "<a><!--xy--></a>", .{});
+    defer doc3.deinit();
+    try testing.expectEqualStrings("xy", doc3.root.children[0].content.comment);
+}
+
+test "wf/not-wf: Name characters follow the actual XML NameStartChar/NameChar grammar, not >= 0x80" {
+    // `isNameStartByte` used to accept ANY byte >= 0x80 as a name-start byte
+    // without decoding UTF-8 or checking it against the real Unicode
+    // NameStartChar production -- so this parser accepted four measured
+    // shapes that both libxml2 and Python's expat reject (audit A1/xml.md
+    // F4), and, independently, never validated that a non-ASCII byte
+    // sequence inside a name was even well-formed UTF-8 in the first place
+    // (audit A1/xml.md F9 sub-finding M16) -- both close via the same
+    // decode-based rewrite of parseNameRaw.
+    //
+    // U+00B7 MIDDLE DOT is NameChar but never NameStartChar.
+    try testing.expectError(error.InvalidName, parse(testing.allocator, "<\u{B7}a/>", .{}));
+    // U+0300 COMBINING GRAVE ACCENT is NameChar (combining diacritic range)
+    // but never NameStartChar.
+    try testing.expectError(error.InvalidName, parse(testing.allocator, "<\u{0300}a/>", .{}));
+    // U+00D7 MULTIPLICATION SIGN is not a Name character at all, start or
+    // not -- it just ends the name one byte earlier than a byte-range check
+    // would, so the SPECIFIC error varies with what the grammar expects
+    // next (element name vs. attribute name), but both must still reject.
+    if (parse(testing.allocator, "<a\u{D7}b/>", .{})) |doc| {
+        var d = doc;
+        d.deinit();
+        return error.TestUnexpectedSuccess;
+    } else |_| {}
+    if (parse(testing.allocator, "<a b\u{D7}c=\"1\"/>", .{})) |doc| {
+        var d = doc;
+        d.deinit();
+        return error.TestUnexpectedSuccess;
+    } else |_| {}
+    // The valid boundary must still be accepted: U+00B7 mid-name (NameChar,
+    // just not NameStartChar) and a real non-ASCII NameStartChar (U+00C0).
+    var mid = try parse(testing.allocator, "<a\u{B7}b/>", .{});
+    defer mid.deinit();
+    var start = try parse(testing.allocator, "<\u{C0}b/>", .{});
+    defer start.deinit();
+}
+
+test "not-wf: a PI target starting with 'xml' is treated identically at byte 0 and later" {
+    // `parseXmlDecl` used to require whitespace immediately after an exact
+    // byte-0 "<?xml", and errored MalformedPI otherwise -- even when what
+    // followed was a DIFFERENT, non-reserved PI target like
+    // "xml-stylesheet" or "xmlfoo". `parsePi` elsewhere only reserves the
+    // EXACT target "xml" (any ASCII case), so the same construct one byte
+    // later in the same document was accepted. libxml2 and expat agree with
+    // the permissive reading (audit A1/xml.md F7): only the exact name
+    // "xml" is reserved, not every name that merely starts with it.
+    var byte0 = try parse(testing.allocator, "<?xml-stylesheet href=\"a.xsl\"?><a/>", .{});
+    defer byte0.deinit();
+    var byte0b = try parse(testing.allocator, "<?xmlfoo bar?><a/>", .{});
+    defer byte0b.deinit();
+    // The exact reserved name is still rejected at byte 0 too (this is the
+    // XMLDecl-without-VersionInfo degenerate case, not a real declaration).
+    try testing.expectError(error.MalformedPI, parse(testing.allocator, "<?xml?><a/>", .{}));
+    // And a REAL XML declaration at byte 0 is unaffected.
+    var decl = try parse(testing.allocator, "<?xml version=\"1.0\"?><a/>", .{});
+    defer decl.deinit();
+}
+
+test "doctype=.ignore: quote state is tracked outside the internal subset too" {
+    // parseDoctype's ".ignore" skip tracked quotes/comments only inside a
+    // `[ ... ]` internal subset; a literal '>' inside a SYSTEM/PUBLIC
+    // literal in the EXTERNAL part ended the skip early and the rest of the
+    // declaration was mis-parsed as document content (typically
+    // TrailingContent) instead of being skipped whole, as `.ignore`
+    // promises (audit A1/xml.md F10). libxml2/expat both skip past it.
+    const sys_quote = "<!DOCTYPE r SYSTEM \"a>b\"><r/>";
+    var doc = try parse(testing.allocator, sys_quote, .{ .doctype = .ignore });
+    defer doc.deinit();
+    const pub_quote = "<!DOCTYPE r PUBLIC \"-//x>y//EN\" \"a>b\"><r/>";
+    var doc2 = try parse(testing.allocator, pub_quote, .{ .doctype = .ignore });
+    defer doc2.deinit();
+    // A genuinely truncated/unterminated literal still fails, just later.
+    try testing.expectError(error.UnexpectedEof, parse(testing.allocator, "<!DOCTYPE r SYSTEM \"a", .{ .doctype = .ignore }));
 }
 
 test "wf control: default-namespace undeclaration IS allowed" {
@@ -2234,6 +2462,35 @@ test "hardening: Element.textContent does not recurse on the machine stack (F5)"
     const txt = try doc.root.textContent(gpa);
     defer gpa.free(txt);
     try testing.expectEqualStrings("leaf", txt);
+}
+
+test "hardening: Document.findByAttr does not recurse on the machine stack (F5-zbytek)" {
+    // `findByAttrRec` had the identical recursion shape as `textContent`
+    // above (one native-recursion frame per nesting level) and the same fix:
+    // an explicit heap stack. `xmldsig`'s own `c14n.zig` test raises
+    // `max_depth` to 4008 with a comment claiming it is "safe for `xml`" --
+    // true for `parse` itself, and now finally true for this read API too
+    // (audit A1/xml.md F5-zbytek). Depth picked two orders of magnitude past
+    // the default `max_depth` (256), same rationale as the textContent guard
+    // above: cheap enough to run on every `modtest xml`, well past where the
+    // old recursive body crashed.
+    const gpa = testing.allocator;
+    const depth = 10_000;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    for (0..depth) |_| try buf.appendSlice(gpa, "<e>");
+    try buf.appendSlice(gpa, "<leaf target=\"here\"/>");
+    for (0..depth) |_| try buf.appendSlice(gpa, "</e>");
+
+    var doc = try parse(gpa, buf.items, .{ .max_depth = depth + 4 });
+    defer doc.deinit();
+    const found = try doc.findByAttr(gpa, "", "target", "here");
+    try testing.expect(found != null);
+    try testing.expectEqualStrings("leaf", found.?.local);
+    // Negative control: a value that is not present anywhere must still
+    // walk the whole tree and come back null, not short-circuit.
+    const miss = try doc.findByAttr(gpa, "", "target", "not-here");
+    try testing.expect(miss == null);
 }
 
 test "behaviour: resolveNs answers exactly what the parent-axis walk answers" {

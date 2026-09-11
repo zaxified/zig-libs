@@ -459,7 +459,7 @@ fn validateReference(
     const uri = ref_el.attr("", "URI") orelse return error.MalformedSignature;
 
     // Resolve the reference to exactly one in-document element.
-    const target = try resolveReference(doc, uri, options);
+    const target = try resolveReference(arena, doc, uri, options);
 
     // Walk the transform chain in order.
     var mode: c14n.Mode = .inclusive; // XML-DSig default when a node-set needs serializing
@@ -548,7 +548,7 @@ fn validateReference(
     };
 }
 
-fn resolveReference(doc: *const xml.Document, uri: []const u8, options: Options) VerifyError!*xml.Element {
+fn resolveReference(alloc: std.mem.Allocator, doc: *const xml.Document, uri: []const u8, options: Options) VerifyError!*xml.Element {
     if (uri.len == 0) return doc.root; // same-document, whole document
     if (uri[0] != '#') return error.UriNotResolved; // external references unsupported
     const id = uri[1..];
@@ -563,7 +563,7 @@ fn resolveReference(doc: *const xml.Document, uri: []const u8, options: Options)
         // elements may carry the same id, "the element we digested" and "the
         // element they read" are free to be different elements. Enforce here what
         // `UriNotResolved` already promises — *exactly one*.
-        const hit = doc.findByAttr("", name, id) orelse return error.UriNotResolved;
+        const hit = (try doc.findByAttr(alloc, "", name, id)) orelse return error.UriNotResolved;
         if (try countByAttr(doc.root, name, id, 0) != 1) return error.UriNotResolved;
         return hit;
     }
