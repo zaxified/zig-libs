@@ -15,6 +15,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   regression test via a `FixedWitness` `std.Random` (no production code change — `isProbablePrime`
   already takes `random: std.Random`). Measured RED (test 1's witness source swapped for a
   fixed one) -> GREEN: 48/49 -> 49/49.
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** `hashToPrime` now sieves
+  candidates against small primes (3..257) before running Miller-Rabin on
+  them (A1 F4 — `verify`'s cost is 58-96% `hashToPrime`, and most rejected
+  candidates were divisible by a small prime). `l`'s value for any given
+  `(N, x, y, T)` is unchanged, verified by a differential test against the
+  pre-fix algorithm; measured ~1.7x faster in ReleaseFast.
 - **2026-09-10** — A1 fix campaign, non-breaking (F6/F7/F8/F5/F10; F3/F4 left open):
   - **F8 (LOW):** `group.montPowPublic` no longer underflows on an empty
     exponent — a `usize` `exp_be.len - 1` that panicked in Debug/ReleaseSafe
