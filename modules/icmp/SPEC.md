@@ -23,8 +23,15 @@ RFC 792/4443/1071. See this module's own `NOTICE` — a provenance record, not a
 Raw/DGRAM ICMP sockets need CAP_NET_RAW or a permissive `ping_group_range`; the module does not
 acquire privilege, only uses what it is given. It does **not authenticate replies** — a reply is
 matched to a live probe by echo ident + sequence via `seqmap`, so a spoofed reply with a guessed id
-resolves as genuine (correlation, not authentication). ICMP errors (unreachable, time exceeded) are
-counted but the probe still resolves via timeout. **`addTarget`/`addTargetAddr`/`addTargetIp`
+resolves as genuine (correlation, not authentication); this is unchanged by A1 F6 making a RAW
+socket's own ident a CSPRNG draw instead of the process id — harder to guess from off-host, but
+still not a secret an authenticated protocol would rely on. `Config.check_source` (default `true`
+since A1 F8) closes the specific failure mode of one target's forged reply resolving a DIFFERENT
+target (cross-target confusion) by additionally requiring the reply's source address to match the
+probed target; it is a correlation aid, not authentication, and does nothing against an attacker
+who can also spoof the source address. ICMP errors (unreachable, time exceeded) are counted — on
+both the RAW and (A1 F5) DGRAM socket paths — but the probe still resolves via timeout, matching
+fping. **`addTarget`/`addTargetAddr`/`addTargetIp`
 validate nothing about the destination** (audit A1 F14) — a multicast, broadcast, loopback, or
 unspecified address is accepted and probed exactly like any other. The kernel itself refuses to
 send to multicast/broadcast without `SO_BROADCAST` (which this module never sets), so the classic
