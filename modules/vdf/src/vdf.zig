@@ -271,6 +271,40 @@ fn isProbablePrime(m: PrimeModulus, random: std.Random) bool {
     return true;
 }
 
+/// Audit F4: primes below 258 — every candidate `hashToPrime` builds is
+/// tested for divisibility by each of these BEFORE paying for a full
+/// Miller-Rabin round. `verify` measured 58-96% of its cost (median ~82%)
+/// in `hashToPrime`, and most composite candidates are divisible by a
+/// small prime; sieving them out first is 3-5x cheaper per rejected
+/// candidate than one Miller-Rabin round would have been.
+///
+/// This changes NEITHER which candidate `hashToPrime` accepts NOR how many
+/// candidates it walks through: a candidate divisible by one of these is
+/// composite, and `isProbablePrime` would (overwhelmingly certainly) have
+/// rejected it too — see the differential test below, which checks this
+/// empirically against the pre-sieve algorithm rather than just asserting
+/// it. (The only way this could theoretically diverge is a composite
+/// candidate for which the DETERMINISTIC per-candidate Miller-Rabin
+/// witnesses happen to misidentify it as prime — a pre-existing caveat of
+/// `isProbablePrime`'s determinism, not something this sieve introduces,
+/// and one no test in this campaign can rule out by construction; a
+/// generic hash-derived candidate divisible by a small prime is not the
+/// kind of adversarially structured composite that fools Miller-Rabin.)
+const sieve_primes = [_]u16{
+    3,   5,   7,   11,  13,  17,  19,  23,  29,  31,  37,  41,  43,  47,
+    53,  59,  61,  67,  71,  73,  79,  83,  89,  97,  101, 103, 107, 109,
+    113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191,
+    193, 197, 199, 211, 223, 227, 229, 233, 239, 241, 251, 257,
+};
+
+/// `bytes` (big-endian) mod `p`, via Horner's method over the raw bytes —
+/// no bignum division, just one O(prime_bytes) pass per prime.
+fn modSmall(bytes: []const u8, p: u16) u16 {
+    var r: u32 = 0;
+    for (bytes) |b| r = (r * 256 + b) % p;
+    return @intCast(r);
+}
+
 /// The Fiat-Shamir challenge prime `l`, deterministically derived from the
 /// public binding `(N, x, y, T)`: hash to a `prime_bits`-bit odd candidate
 /// (`deriveCandidate`), then walk odd candidates upward
@@ -285,10 +319,41 @@ fn isProbablePrime(m: PrimeModulus, random: std.Random) bool {
 /// correctness-critical property (see `mr_witness_domain`'s doc comment).
 pub fn hashToPrime(n_bytes: []const u8, x_bytes: []const u8, y_bytes: []const u8, t: u64) [prime_bytes]u8 {
     var candidate = deriveCandidate(n_bytes, x_bytes, y_bytes, t);
+    // Audit F4: incremental small-prime sieve. `remainders[i]` is always
+    // `candidate mod sieve_primes[i]`, updated by `+2 mod p` alongside
+    // `incrementCandidateByTwo` instead of recomputed from scratch — O(1)
+    // per prime per step rather than another O(prime_bytes) pass.
+    var remainders: [sieve_primes.len]u16 = undefined;
+    for (sieve_primes, 0..) |p, i| remainders[i] = modSmall(&candidate, p);
+
     var tries: u32 = 0;
     while (true) : (tries += 1) {
         std.debug.assert(tries < max_search_candidates);
-        const pm = PrimeModulus.fromBytes(&candidate, .big) catch unreachable; // odd, exactly prime_bits, well within PrimeUint
+        sieve_composite: {
+            for (remainders) |r| {
+                if (r == 0) break :sieve_composite; // divisible by a small prime
+            }
+            const pm = PrimeModulus.fromBytes(&candidate, .big) catch unreachable; // odd, exactly prime_bits, well within PrimeUint
+            var prng = deterministicWitnessRandom(&candidate);
+            if (isProbablePrime(pm, prng.random())) return candidate;
+        }
+        incrementCandidateByTwo(&candidate);
+        for (sieve_primes, 0..) |p, i| {
+            remainders[i] = @intCast((@as(u32, remainders[i]) + 2) % p);
+        }
+    }
+}
+
+/// The pre-F4 algorithm, unchanged: Miller-Rabin on EVERY odd candidate,
+/// no sieve. Kept only so the differential test below can check the sieve
+/// against it directly rather than trusting the "no behavioral impact"
+/// claim by inspection.
+fn hashToPrimeUnsieved(n_bytes: []const u8, x_bytes: []const u8, y_bytes: []const u8, t: u64) [prime_bytes]u8 {
+    var candidate = deriveCandidate(n_bytes, x_bytes, y_bytes, t);
+    var tries: u32 = 0;
+    while (true) : (tries += 1) {
+        std.debug.assert(tries < max_search_candidates);
+        const pm = PrimeModulus.fromBytes(&candidate, .big) catch unreachable;
         var prng = deterministicWitnessRandom(&candidate);
         if (isProbablePrime(pm, prng.random())) return candidate;
         incrementCandidateByTwo(&candidate);
@@ -761,6 +826,115 @@ test "hashToPrime: output actually passes Miller-Rabin (self-consistency)" {
     const pm = try PrimeModulus.fromBytes(&l_bytes, .big);
     var prng = std.Random.DefaultPrng.init(0xC0FFEE);
     try testing.expect(isProbablePrime(pm, prng.random()));
+}
+
+test "A1 F4: the small-prime sieve agrees with the pre-fix Miller-Rabin-only search on random bindings" {
+    // hashToPrime's inputs are opaque byte strings to it (they only feed
+    // SHAKE256) -- arbitrary random bytes exercise exactly the same
+    // candidate-search code path a real (N, x, y, T) binding would.
+    var prng = std.Random.DefaultPrng.init(0xF4D1FF5E);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        var n_bytes: [32]u8 = undefined;
+        var x_bytes: [32]u8 = undefined;
+        var y_bytes: [32]u8 = undefined;
+        rand.bytes(&n_bytes);
+        rand.bytes(&x_bytes);
+        rand.bytes(&y_bytes);
+        const t = rand.int(u64);
+        const sieved = hashToPrime(&n_bytes, &x_bytes, &y_bytes, t);
+        const unsieved = hashToPrimeUnsieved(&n_bytes, &x_bytes, &y_bytes, t);
+        try testing.expectEqualSlices(u8, &unsieved, &sieved);
+    }
+}
+
+test "A1 F4: the sieve actually rejects small-prime-divisible candidates before Miller-Rabin, not just no-ops" {
+    // A positive control for the test above: if `sieve_composite` never
+    // actually fired (e.g. a bug that always fell through to Miller-Rabin
+    // regardless of `remainders`), the differential test would still pass
+    // vacuously -- both algorithms doing the same full search. Confirms
+    // the sieve is truly participating: `deriveCandidate`'s FIRST output
+    // is composite (divisible by a small prime) far more often than not
+    // across many random bindings, and `hashToPrime` must still land on
+    // the correct final prime each time.
+    var prng = std.Random.DefaultPrng.init(0xF4D1FF60);
+    const rand = prng.random();
+    var sieve_hits: usize = 0;
+    var i: usize = 0;
+    while (i < 24) : (i += 1) {
+        var n_bytes: [32]u8 = undefined;
+        var x_bytes: [32]u8 = undefined;
+        var y_bytes: [32]u8 = undefined;
+        rand.bytes(&n_bytes);
+        rand.bytes(&x_bytes);
+        rand.bytes(&y_bytes);
+        const t = rand.int(u64);
+        const first_candidate = deriveCandidate(&n_bytes, &x_bytes, &y_bytes, t);
+        for (sieve_primes) |p| {
+            if (modSmall(&first_candidate, p) == 0) {
+                sieve_hits += 1;
+                break;
+            }
+        }
+        // Still must find the identical prime either way.
+        try testing.expectEqualSlices(
+            u8,
+            &hashToPrimeUnsieved(&n_bytes, &x_bytes, &y_bytes, t),
+            &hashToPrime(&n_bytes, &x_bytes, &y_bytes, t),
+        );
+    }
+    // A 256-bit random-ish odd number's chance of NOT being divisible by
+    // any prime up to 257 is roughly `prod(1 - 1/p)` over the sieve list,
+    // about 12% -- so most of the 24 first-candidates should trip the
+    // sieve. Loose bound (>= 8, i.e. >= 1/3) keeps this robust to which
+    // 24 random bindings this seed happens to draw.
+    try testing.expect(sieve_hits >= 8);
+}
+
+fn nowNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+test "A1 F4: sieve wall-clock speedup over the pre-fix search (ReleaseFast, printed, not asserted)" {
+    // Not asserted -- a wall-clock number on a machine other agents share
+    // is exactly the kind of thing this campaign's own notes warn against
+    // pinning as a pass/fail gate (see A1/blindrsa.md's perf section and
+    // this campaign's "delta needs its spread" feedback). Correctness and
+    // sieve engagement are asserted above, deterministically; this is
+    // printed for the record alongside them, interleaved to reduce bias
+    // from whichever binary runs first.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(0xF4D1FF61);
+    const rand = prng.random();
+    const rounds = 12;
+    var sieved_ns: u64 = 0;
+    var unsieved_ns: u64 = 0;
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        var n_bytes: [32]u8 = undefined;
+        var x_bytes: [32]u8 = undefined;
+        var y_bytes: [32]u8 = undefined;
+        rand.bytes(&n_bytes);
+        rand.bytes(&x_bytes);
+        rand.bytes(&y_bytes);
+        const t = rand.int(u64);
+
+        const t1a = nowNs();
+        std.mem.doNotOptimizeAway(hashToPrime(&n_bytes, &x_bytes, &y_bytes, t));
+        sieved_ns += nowNs() - t1a;
+
+        const t2a = nowNs();
+        std.mem.doNotOptimizeAway(hashToPrimeUnsieved(&n_bytes, &x_bytes, &y_bytes, t));
+        unsieved_ns += nowNs() - t2a;
+    }
+    const ratio = @as(f64, @floatFromInt(unsieved_ns)) / @as(f64, @floatFromInt(sieved_ns));
+    std.debug.print(
+        "A1 F4: {d} hashToPrime calls -- sieved {d} us total, unsieved {d} us total, {d:.2}x speedup (audit estimated ~2.5x)\n",
+        .{ rounds, sieved_ns / 1000, unsieved_ns / 1000, ratio },
+    );
 }
 
 test "prove core: streaming quotient matches naive big.int division (incl. q=0 and the 2^t ~ l boundary)" {

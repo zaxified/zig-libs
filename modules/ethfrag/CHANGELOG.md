@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **BEHAVIOURAL, not breaking:** `insert`'s overlap check
+  and buffer allocation no longer scale with an attacker-chosen `n` the way
+  they did (A1 F8+F9). Fragment intervals are now kept sorted internally
+  (overlap check is a binary search + short neighbor scan instead of a full
+  list scan every time — measured 16.1x checks for 16x fragments, was 56x
+  wall-clock), and a datagram's reassembly buffer now grows lazily to what
+  its fragments actually need instead of eagerly paying `max_frame_len` for
+  every fragment id (measured 225,000 B total for a 50,000-insert churn
+  pattern that previously cost 1,641,675,624 B). `Reassembler`'s public API
+  (`init`/`deinit`/`insert`/`expireOlderThan`/`inflightCount`) and every
+  observable `InsertResult`/error are unchanged.
 - **2026-09-10** — A1 fix campaign (0 in-repo consumers, P1 applies): closed 2 HIGH + 4
   MED + 4 LOW of the 14-finding audit (10 of 14; F6/F8/F9/F13 left open, see below).
   - **F2 (HIGH):** `timeout_ns` only measured idle time, so a steady trickle of

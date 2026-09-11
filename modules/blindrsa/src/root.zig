@@ -1142,6 +1142,30 @@ noinline fn deadStackRunBlind(pk: rsa.PublicKey, random: std.Random, ctx: *Conte
     _ = blind(pk, std.crypto.hash.sha2.Sha384, &kat.a1.prepared_msg, &kat.a1.salt, random, ctx, &bm) catch unreachable;
 }
 
+// A1 B6 isolation probes (2026-09-11): does `Fe.fromBytes` ALONE leak, with
+// no subsequent multiply/modexp, and does bypassing its internal
+// `shrink`/`rejectNonCanonical` calls (the bn254 fix's exact target class --
+// masked-conditional-subtract without a `blackBox` barrier) change anything?
+// See the isolation test below for what this ruled out.
+noinline fn deadStackRunFromBytesOnly(pk: rsa.PublicKey) void {
+    const fe = rsa.Fe.fromBytes(pk.n, &kat.r, .big) catch unreachable;
+    std.mem.doNotOptimizeAway(&fe);
+}
+
+/// Bypasses `Fe.fromBytes`'s internal `shrink`/`rejectNonCanonical` calls
+/// entirely: builds the `Uint` via `rsa.Uint.fromBytes` (a plain shift-and-OR
+/// byte loop, no data-dependent branch) and constructs the `Fe` struct
+/// literal directly -- `r` is already known canonical (`sampleFe`'s
+/// rejection sampling guarantees `r < n`), so `shrink`/`reject` would be
+/// no-ops on the real path anyway. If `shrink`'s masked conditional-subtract
+/// (the SAME function bn254's B6 precedent found unguarded) were the leak
+/// source, this would close it.
+noinline fn deadStackRunUintFromBytesOnly() void {
+    const v = rsa.Uint.fromBytes(&kat.r, .big) catch unreachable;
+    const fe = rsa.Fe{ .v = v, .montgomery = false };
+    std.mem.doNotOptimizeAway(&fe);
+}
+
 noinline fn deadStackScan(needle: []const u8, base: [*]const u8, len: usize) usize {
     var hits: usize = 0;
     var i: usize = 0;
@@ -1233,4 +1257,63 @@ test "B9: blind()'s r_bytes buffer (the byte-level secureZero) does not survive 
     // "measured as ineffective, checked off anyway" the campaign brief
     // warns against. This is the anchor B9 was missing for its second half;
     // it does not close B9, it gives it real, measured evidence.
+}
+
+test "A1 B6: isolating fromBytes rules out shrink/rejectNonCanonical as the leak source (still open, new evidence)" {
+    // Tried the bn254 B6 precedent directly: bn254's own B6 finding was
+    // `Fr.toBytes` calling `std.crypto.ff.Modulus.fromMontgomery`, whose
+    // internal `shrink`/`montgomeryMul` masked conditional-subtract has no
+    // `blackBox` barrier in this build -- fixed there by never calling that
+    // function at all (hand-rolled CIOS instead), closing 3 of 9 contexts.
+    //
+    // blindrsa's B6 (the earlier isolation test above, "B9: blind()'s
+    // r_bytes...") already showed the SAME 2-hit leak survives EVERY
+    // struct-level secureZero blindrsa's own code can add, so it must be
+    // INSIDE std.crypto.ff somewhere. bn254's exact fix targets `fromBytes`'s
+    // sibling function `fromMontgomery`; the natural next question is
+    // whether `fromBytes` has the SAME class of defect (its own `shrink` +
+    // `rejectNonCanonical` calls).
+    //
+    // Measured here: it does NOT. `deadStackRunFromBytesOnly` (calls
+    // `Fe.fromBytes` exactly once, nothing else) reproduces the identical
+    // 2 hits with NO multiply/modexp involved at all -- the leak does not
+    // need `Modulus.mul`'s Montgomery scratch, contrary to what the
+    // 2026-09-10 dispozice guessed. `deadStackRunUintFromBytesOnly` goes
+    // further: it bypasses `shrink`/`rejectNonCanonical` ENTIRELY (builds
+    // the `Uint` via the plain byte-loop `Uint.fromBytes`, no data-dependent
+    // branch, then constructs the `Fe` struct literal directly) -- STILL
+    // 2 hits, byte-identical. That rules out the bn254 fix's exact
+    // mechanism (an unguarded masked-conditional-subtract in a named
+    // function this code calls): there is no such call left in this path,
+    // and the leak persists anyway. The residue is a transient copy from
+    // constructing/returning the value itself -- the same "no guaranteed
+    // stack-scrub on frame reuse" class as `zig_std_crypto_leaves_key_schedules_on_stack`,
+    // not a specific missing barrier the bn254 technique can remove.
+    //
+    // B6 stays OPEN. Not asserted to 0 (false) or to 2 (pins a known leak
+    // as accepted) -- printed for the record, same discipline as the other
+    // B6/B9 anchors in this file.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const pk = try kat.publicKey();
+    var rev: [512]u8 = undefined;
+    for (kat.r, 0..) |c, idx| rev[511 - idx] = c;
+    const le = rev[0..32];
+    const window: usize = 512 * 1024;
+
+    var anchor1: usize = 0;
+    const stack_top1: [*]const u8 = @ptrCast(&anchor1);
+    anchor1 = 1;
+    deadStackRunFromBytesOnly(pk);
+    const hits_fe_fromBytes = deadStackScan(le, stack_top1 - window, window);
+
+    var anchor2: usize = 0;
+    const stack_top2: [*]const u8 = @ptrCast(&anchor2);
+    anchor2 = 1;
+    deadStackRunUintFromBytesOnly();
+    const hits_uint_fromBytes = deadStackScan(le, stack_top2 - window, window);
+
+    std.debug.print(
+        "A1 B6 isolation: Fe.fromBytes (w/ shrink+reject) = {d} hits; Uint.fromBytes + hand Fe{{}} literal (bypasses shrink+reject) = {d} hits -- bn254's fix mechanism does not apply here\n",
+        .{ hits_fe_fromBytes, hits_uint_fromBytes },
+    );
 }

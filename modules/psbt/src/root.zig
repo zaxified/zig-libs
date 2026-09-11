@@ -1006,6 +1006,16 @@ fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
     var psbt = parse(allocator, buf.items) catch return;
     defer psbt.deinit(allocator);
 
+    // Audit F6 (round-trip half): SPEC.md's own headline guarantee is
+    // "`parse` -> `serialize` round-trip byte-exact for ANY validly-shaped
+    // PSBT" -- the reachability half of this harness (buildFuzzPsbt +
+    // Cursor) was fixed 2026-09-07 (see the corpus test below), but nothing
+    // fuzzed this specific claim: every fuzz-generated PSBT that parses
+    // must serialize back to EXACTLY the bytes it was parsed from.
+    const reser = try serialize(allocator, psbt);
+    defer allocator.free(reser);
+    if (!std.mem.eql(u8, reser, buf.items)) return error.RoundTripNotByteExact;
+
     // `decodeWitnessStack` driven directly as well: it is public, it is
     // documented as untrusted-input, and reaching it only through a PSBT that
     // parses would leave most of its own error paths behind a second gate.
