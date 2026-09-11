@@ -99,8 +99,31 @@ fn normalize(s0: u256, carry: u1) [4]u64 {
 ///
 /// Each fold replaces the value by `(low 256 bits) + c·(high bits)`; the high
 /// part shrinks by ~223 bits per fold, so four folds provably reach `< 2^256`
-/// (bounds: `<2^290 → <2^257 → <2^256+c → <2^256`), after which `normalize`
-/// finishes the canonicalisation.
+/// (loose per-fold bounds: `<2^290 → <2^257 → <2^256+c → <2^256`), after
+/// which `normalize` finishes the canonicalisation.
+///
+/// A1 audit F7 (2026-09-11): the 4th fold is provably **dead code** for
+/// every input this function is ever actually called with, not merely
+/// untested. Both callers (`mulPortable`/`sqPortable`) only ever feed a
+/// product of two CANONICAL field elements (`< p = 2^256 - 2^32 - 977`), so
+/// `wide < p^2`. Computing the EXACT (not sampled) maximum of one fold step
+/// `f(x) = (x mod 2^256) + c·(x div 2^256)` over an input range `[0, N)` —
+/// the max is always at `x = N-1` itself or at the end of the preceding
+/// full "band" `(k-1)·2^256 + (2^256-1)`, since `f` is increasing within a
+/// band and the per-band maxima increase with the band index — and
+/// chaining that exact bound through three folds starting from
+/// `N_0 = (p-1)^2` gives, after fold 3, a maximum of EXACTLY `2^256 - 1`:
+/// strictly less than `2^256`. Since this is an upper bound on the true
+/// (achievable) maximum, `x >> 256` is `0` after three folds for every
+/// valid input — the 4th fold's `(x & mask) + C * (x >> 256)` always
+/// degenerates to the identity `x + C·0 = x`. This is a proof, not a
+/// mutation-survival observation: the audit's own randomized/adversarial
+/// search (1,000,000 random canonical products + a 40,000-pair adversarial
+/// sweep + the full `oracle_test.zig` edge matrix) found 0 hits, matching.
+/// The 4th fold is kept anyway as an explicit safety margin against the
+/// loose bound above (defense in depth, not a live path) — removing it
+/// would touch this module's pinned ctgrind fingerprint for no measured
+/// benefit.
 fn reduceWide(wide: u512) [4]u64 {
     const C: u512 = c_fold;
     const mask: u512 = (@as(u512, 1) << 256) - 1;
@@ -314,6 +337,63 @@ const StdFe = std.crypto.ecc.Secp256k1.Fe;
 
 test "field prime matches std.crypto.ecc.Secp256k1.Fe.field_order" {
     try std.testing.expectEqual(@as(u256, StdFe.field_order), field_order);
+}
+
+// A1 audit F7: the 4th Solinas fold in `reduceWide` had no test exercising
+// it (mutating it away, or the whole `inline for (0..4)` down to `0..3`,
+// left the suite 100% green) -- and the audit's own randomized/adversarial
+// search never reached it either. This is a proof, permanently re-checked,
+// that "no reach found" is not a gap in the search: the 4th fold is
+// mathematically UNREACHABLE for any input `reduceWide` is ever actually
+// called with, and this test would fail if that ever stopped being true
+// (e.g. `field_order`/`c_fold` were ever changed).
+test "A1 F7: the 4th Solinas fold is mathematically dead code, not merely untested (exact bound, not sampled)" {
+    const mask: u512 = (@as(u512, 1) << 256) - 1;
+    const C: u512 = c_fold;
+
+    // The EXACT (not sampled) maximum of one fold step
+    // `f(x) = (x mod 2^256) + c*(x div 2^256)` over `x` in `[0, n)`.
+    // `f` is increasing within each 2^256-wide "band" (constant high part,
+    // increasing low part) and the per-band maxima `(2^256-1) + c*hi`
+    // increase with the band index `hi`, so the true global max over any
+    // prefix range is always one of exactly two candidates: the range's own
+    // top element, or the end of the immediately preceding FULL band.
+    const maxFoldOutput = struct {
+        fn call(n: u512) u512 {
+            const x = n - 1;
+            const hi = x >> 256;
+            const lo = x & mask;
+            const f_top = lo + C * hi;
+            if (hi >= 1) {
+                const f_prev_full_band = mask + C * (hi - 1);
+                return @max(f_top, f_prev_full_band);
+            }
+            return f_top;
+        }
+    }.call;
+
+    // `reduceWide` is only ever fed `a*b` for canonical field elements
+    // `a, b <= p - 1`, so the true maximum possible input is `(p-1)^2`
+    // (inclusive) -- pass `(p-1)^2 + 1` as the exclusive upper bound.
+    const p: u512 = field_order;
+    const n0_exclusive: u512 = (p - 1) * (p - 1) + 1;
+
+    const m1 = maxFoldOutput(n0_exclusive);
+    const m2 = maxFoldOutput(m1 + 1);
+    const m3 = maxFoldOutput(m2 + 1);
+
+    // This is an upper bound on the TRUE achievable maximum after 3 real
+    // folds (each stage widens the range to the full `[0, m_{k-1}]`, a
+    // superset of what 3 real folds can actually produce) -- so if even
+    // this loose bound stays under 2^256, the real post-fold-3 value does
+    // too, for every possible input. Computed value: exactly `2^256 - 1`.
+    try std.testing.expect(m3 < (@as(u512, 1) << 256));
+    try std.testing.expectEqual(mask, m3); // == 2^256 - 1, right at the edge
+
+    // And the 4th fold on that exact worst case is the identity (hi == 0
+    // going in, so nothing changes) -- the loop's 4th iteration never has
+    // any effect to verify against, for any real input.
+    try std.testing.expectEqual(m3, maxFoldOutput(m3 + 1));
 }
 
 test "fromBytes/toBytes round-trip + rejects non-canonical (>= p)" {
