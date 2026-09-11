@@ -682,21 +682,33 @@ pub const Broker = struct {
     subscriptions_total: usize = 0,
     retained: std.ArrayList(Retained) = .empty,
     next_auto_id: u64 = 0,
+    // ⛔ These four are `usize`, not `u64`, and that is a portability
+    // requirement rather than a preference. A 32-bit target has no 64-bit
+    // atomic read-modify-write without libatomic, so `@atomicRmw` on a `u64`
+    // is a *compile* error there: `expected 32-bit integer type or smaller`.
+    // With `u64` this broker did not build for `arm-linux-musleabi` at all —
+    // found by the first consumer that cross-compiled it (energomonitor's
+    // egw-proxy, for a MikroTik router), because every gate in this repo builds
+    // native x86-64 and the whole file looked fine there. `usize` is exactly
+    // "the widest this platform can increment atomically". Wrapping is not a
+    // concern for any of them: they count failures and truncations, and 2^32 of
+    // those is a broker that stopped being interesting long before.
+    //
     /// Count of PUBLISH fan-outs truncated at `Config.max_fanout_matches` — the
     /// observable signal that the fan-out envelope was hit (an operator's cue to
     /// investigate an amplifying client or raise the cap).
-    fanout_truncations: std.atomic.Value(u64) = .init(0),
+    fanout_truncations: std.atomic.Value(usize) = .init(0),
     /// Count of SUBSCRIBEs whose retained walk was truncated at
     /// `Config.max_retained_deliveries` / `max_retained_bytes`.
-    retained_truncations: std.atomic.Value(u64) = .init(0),
+    retained_truncations: std.atomic.Value(usize) = .init(0),
     /// Count of QoS 1 messages dropped because a subscriber's in-flight pool
     /// was full — i.e. that subscriber has stopped answering PUBACKs.
-    qos1_drops: std.atomic.Value(u64) = .init(0),
+    qos1_drops: std.atomic.Value(usize) = .init(0),
     /// Count of Wills that could not be delivered. The teardown path has no
     /// caller to return an error to, so the failure is counted instead of
     /// disappearing: a non-zero value means subscribers were not told about a
     /// client that vanished.
-    will_failures: std.atomic.Value(u64) = .init(0),
+    will_failures: std.atomic.Value(usize) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -2614,7 +2626,11 @@ const StressCtl = struct {
     connect_attempts: std.atomic.Value(usize) = .init(0),
     probe_ok: std.atomic.Value(usize) = .init(0),
     probe_stalls: std.atomic.Value(usize) = .init(0),
-    probe_max_ms: std.atomic.Value(u64) = .init(0),
+    // ⛔ `u32`, for the same reason as the broker's own counters: a 32-bit
+    // target has no 64-bit atomic, and `check-portable` compiles this test
+    // binary for one. A probe latency is milliseconds inside a 90-second stress
+    // run; the ceiling here is 49 days.
+    probe_max_ms: std.atomic.Value(u32) = .init(0),
 };
 
 fn stressNapMs(ms: u64) void {
@@ -2885,7 +2901,7 @@ fn stressProbe(ctl: *StressCtl) void {
         if (c.sendConnect("liveness-probe")) |_| {
             if (c.waitFor(ctl, .connack, 2000)) stalled = false;
         } else |_| {}
-        const dt: u64 = @intCast(@max(0, milliTimestamp() - t0));
+        const dt: u32 = @intCast(@min(@as(i64, std.math.maxInt(u32)), @max(0, milliTimestamp() - t0)));
         // Publish the running max latency (compare-and-swap loop).
         var cur = ctl.probe_max_ms.load(.monotonic);
         while (dt > cur) {

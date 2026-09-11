@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — ⛔ **The broker did not compile for a 32-bit target at all**, and nothing here
+  could see it. Four counters (`fanout_truncations`, `retained_truncations`, `qos1_drops`,
+  `will_failures`) were `std.atomic.Value(u64)`, and a 32-bit target has no 64-bit atomic
+  read-modify-write without libatomic — so `@atomicRmw` on one is a *compile* error,
+  `expected 32-bit integer type or smaller`. They are `usize` now: exactly "the widest this
+  platform can increment atomically", and wrapping is not a concern for counters of failures and
+  truncations. The stress harness's `probe_max_ms` went the same way, to `u32`. Found by the first
+  consumer to cross-compile this module (energomonitor's egw-proxy, ARMv7 in a MikroTik container),
+  not by any gate: every lane in this repo builds native x86-64, where the whole file looks fine.
+  ⭐ So the module now **declares `.linux32`** (mips32 soft-float, big-endian) in `meta.targets`,
+  which puts `portable-mqtt-linux32` — the test binary *and* the forcing root that references every
+  non-generic public declaration — between that class of defect and the next consumer. Measured:
+  restoring any one of the four counters to `u64` turns that gate red, each on its own.
+  ⚠ A first attempt at a guard was a `zig build-obj` of the module root for ARM; it passed with the
+  defect restored, because an object build of a root nothing references analyses no bodies — the
+  blind spot `check-portable`'s own design comment already names. The repo's instrument was right
+  and a second one was not needed.
+
 - **2026-09-11** — **`Broker.publish`: the server can originate a message.** Until now the broker
   could only relay — every byte it put on a wire came from some other client's PUBLISH — and
   `Connection.lockedWrite` is private, so a consumer had no way to say anything of its own at all.
