@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1/rawsock.md F12's two-gate mutation
+  runner (`A1/repro/rawsock/mut/mutate.py`, host `zig test` lane + `unshare -rn` netns lane,
+  36 mutations) ported into `modules/rawsock/tools/mutate.py` per CONVENTIONS.md #9 (a
+  foreign-toolchain instrument belongs beside the module it checks, not in the audit tree).
+  Mutation table and classification logic byte-identical to the original; 3 of 36 patterns
+  had drifted from source changes since the audit (F13's `setRcvTimeout` error-checking, a
+  variable rename, F4's filter-ordering change) and were updated to the current shape with
+  the same mutation intent, then re-verified against the tree (36/36 patterns match, no
+  accidental no-ops). Not executed this session (raw `zig test`/`unshare` calls are outside
+  this campaign's modtest-only gate) -- F12 itself stays open until someone runs it and adds
+  permanent tests for the surviving mutations.
 - **2026-09-10** — A1 fix campaign, second-pass fix queue (no consumers in-repo, P1
   applies): three more of the audit's sixteen findings closed (fourteen of sixteen total).
   **New, additive:** `Socket.open`'s `Options.filter` — a classic-BPF program attached as
