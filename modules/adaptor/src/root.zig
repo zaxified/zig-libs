@@ -295,7 +295,33 @@ pub fn preSign(
     io: std.Io,
 ) PreSignError!PreSignature {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
+    const computed = try computeUnverified(secret_key, msg, aux_rand, adaptor_point);
+    try selfCheck(computed.pubkey, msg, adaptor_point, computed.presig);
+    return computed.presig;
+}
 
+/// A1 F5 (MED, bip340 sibling): the mandatory step-9 self-check below
+/// existed and worked, but was black-box untestable for the same reason
+/// `bip340.sign`'s step 10 was (see that module's own A1 F5 disposition) —
+/// `preSign` has no seam to inject a corrupted equation from outside, so a
+/// permanent test could only exercise "step 9 catches a fault" by either
+/// duplicating this function's arithmetic (a copy, not a check — see
+/// `feedback_a_test_that_reimplements_the_code_cannot_fail`) or adding
+/// public API. Neither is done. `preSign` (public, unchanged signature) is
+/// now a thin two-call composition of two file-private helpers:
+/// `computeUnverified` (steps 1-8, no self-check) and `selfCheck` (step 9,
+/// i.e. the exact call `preSign` itself makes). The regression test right
+/// after `selfCheck` below calls both directly, corrupts the genuinely
+/// computed pre-signature bytes, and confirms `selfCheck` — the real
+/// artifact, not a reimplementation — rejects it. Both helpers stay
+/// non-`pub`: only this file (and its own tests) can reach them, so
+/// nothing outside this module can skip step 9.
+fn computeUnverified(
+    secret_key: bip340.SecretKey,
+    msg: []const u8,
+    aux_rand: [32]u8,
+    adaptor_point: AdaptorPoint,
+) PreSignError!struct { presig: PreSignature, pubkey: bip340.XOnlyPublicKey } {
     // Step 1: even-y-normalized effective scalar d + x-only public key —
     // exactly bip340.sign's own steps 1-2, INCLUDING its scrub-on-return
     // discipline (audit A1 F3: this doc comment already claimed "exactly
@@ -370,14 +396,23 @@ pub fn preSign(
     const d = Scalar.fromBytes(d_bytes, .big) catch return error.InvalidSecretKey;
     const s_prime = k.add(e.mul(d));
 
-    // Step 9: mandatory self-verification before returning (fail closed).
     const presig = PreSignature{
         .r = rx,
         .s_prime = s_prime.toBytes(.big),
         .needs_negation = needs_negation,
     };
-    if (!preVerify(kp.public, msg, adaptor_point, presig)) return error.PreSignatureVerificationFailed;
-    return presig;
+    return .{ .presig = presig, .pubkey = kp.public };
+}
+
+/// Step 9: mandatory self-verification, exactly as `preSign` calls it —
+/// the seam `computeUnverified`'s doc comment (A1 F5) describes.
+fn selfCheck(
+    pubkey: bip340.XOnlyPublicKey,
+    msg: []const u8,
+    adaptor_point: AdaptorPoint,
+    presig: PreSignature,
+) PreSignError!void {
+    if (!preVerify(pubkey, msg, adaptor_point, presig)) return error.PreSignatureVerificationFailed;
 }
 
 /// Schnorr **PreVerify**: verifies a pre-signature was correctly produced
@@ -720,4 +755,40 @@ test "audit F1: AdaptorPoint.fromSecret rejects adaptor_secret >= n (matches ada
     n_minus_1[31] -= 1;
     _ = try AdaptorPoint.fromSecret(n_minus_1); // canonical (< n), still accepted
     try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(n_bytes)); // == n, identity, unchanged behaviour
+}
+
+test "A1 F5: preSign's step-9 self-check rejects a corrupted pre-signature, via the real function preSign() itself calls" {
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
+    const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x07};
+    const adaptor_point = try AdaptorPoint.fromSecret(t_bytes);
+    const msg = "A1 F5 adaptor regression";
+    const aux_rand = [_]u8{0xCD} ** 32;
+
+    // Sanity: the honest computation passes its own self-check, and the
+    // seam agrees with `preSign`'s own output byte-for-byte.
+    const honest = try computeUnverified(sk, msg, aux_rand, adaptor_point);
+    try selfCheck(honest.pubkey, msg, adaptor_point, honest.presig);
+    const via_presign = try preSign(sk, msg, aux_rand, adaptor_point, undefined);
+    try std.testing.expectEqualSlices(u8, &honest.presig.r, &via_presign.r);
+    try std.testing.expectEqualSlices(u8, &honest.presig.s_prime, &via_presign.s_prime);
+    try std.testing.expectEqual(honest.presig.needs_negation, via_presign.needs_negation);
+
+    // Corrupt the freshly computed `s_prime` the way a fault in step 8's
+    // arithmetic would -- flip the low bit of the last byte. `selfCheck`
+    // is the exact function `preSign` calls for step 9; this feeds the
+    // real artifact a genuinely corrupted input, not a reimplementation
+    // of "is this pre-signature valid".
+    var corrupted_s = honest.presig;
+    corrupted_s.s_prime[31] ^= 0x01;
+    try std.testing.expectError(error.PreSignatureVerificationFailed, selfCheck(honest.pubkey, msg, adaptor_point, corrupted_s));
+
+    // And corrupting `r` (step 6's output) is caught too.
+    var corrupted_r = honest.presig;
+    corrupted_r.r[0] ^= 0x01;
+    try std.testing.expectError(error.PreSignatureVerificationFailed, selfCheck(honest.pubkey, msg, adaptor_point, corrupted_r));
+
+    // And flipping `needs_negation` alone (step 6's parity bit) is caught.
+    var corrupted_parity = honest.presig;
+    corrupted_parity.needs_negation = !corrupted_parity.needs_negation;
+    try std.testing.expectError(error.PreSignatureVerificationFailed, selfCheck(honest.pubkey, msg, adaptor_point, corrupted_parity));
 }

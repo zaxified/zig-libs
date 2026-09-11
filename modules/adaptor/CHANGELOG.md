@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F5 (MED): the
+  mandatory step-9 self-check (fault-injection guard, sibling to
+  `bip340.sign`'s step 10) had no way to be regression-tested without
+  either duplicating `preSign`'s arithmetic in a test or adding public API.
+  `preSign` (signature unchanged) is now a thin wrapper over two new
+  file-private helpers, `computeUnverified` (steps 1-8) and `selfCheck`
+  (step 9) — a permanent test corrupts a genuinely computed pre-signature's
+  `r`, `s_prime`, and `needs_negation` and confirms `selfCheck`, the exact
+  function `preSign` calls, rejects each. Residual gap, disclosed rather
+  than hidden (same as `bip340`'s F5): this tests the check's own
+  correctness, not whether `preSign`'s three-line body still calls it.
 - **2026-09-10** — A1 fix campaign, remaining findings (module still has zero
   in-repo consumers — P1 applies). **BREAKING for `AdaptorPoint.fromSecret`
   callers passing `adaptor_secret >= n`:** F1, that value used to alias to
