@@ -216,7 +216,7 @@ test "protocol one: encrypt is zero-IV AES-256-CBC; decrypt round-trips" {
 test "protocol one: authenticate/verify, tamper and wrong-length rejection" {
     const key = One.kdf(hx(v.rfc5903_p256.girx));
     const msg = "ctap2 pinUvAuthToken payload";
-    const sig = One.authenticate(&key, msg);
+    const sig = try One.authenticate(&key, msg);
     try t.expectEqual(@as(usize, 16), sig.len);
     // It is the truncated full HMAC.
     var full: [32]u8 = undefined;
@@ -249,7 +249,7 @@ test "protocol one: authenticate/verify, tamper and wrong-length rejection" {
     // bytes), not just the 32-byte shared secret — CTAP 2.1's per-command
     // authenticate(pinUvAuthToken, clientDataHash) shape.
     const token16: [16]u8 = @splat(0x5a);
-    const sig_token = One.authenticate(&token16, msg);
+    const sig_token = try One.authenticate(&token16, msg);
     try t.expect(One.verify(&token16, msg, &sig_token));
     try t.expect(!One.verify(&key, msg, &sig_token));
 }
@@ -261,10 +261,22 @@ test "protocol one: tampered ciphertext fails MAC verification" {
     const msg = "0123456789abcdef0123456789abcdef";
     var ct: [32]u8 = undefined;
     try One.encrypt(key, &ct, msg);
-    const sig = One.authenticate(&key, &ct);
+    const sig = try One.authenticate(&key, &ct);
     try t.expect(One.verify(&key, &ct, &sig));
     ct[7] ^= 0x40;
     try t.expect(!One.verify(&key, &ct, &sig));
+}
+
+test "protocol one: an empty key is rejected, not silently authenticated (audit finding L2)" {
+    const msg = "ctap2 pinUvAuthToken payload";
+    try t.expectError(error.EmptyKey, One.authenticate(&[_]u8{}, msg));
+    // verify must fail closed on the same input, not propagate the error
+    // or (worse) treat "no key" as "any signature over this message is
+    // valid" -- a fixed 16-byte value stands in for an attacker-supplied
+    // signature; before the fix, `One.authenticate("")` silently produced
+    // a real HMAC over the all-zero key, which `verify` then accepted.
+    const some_sig: [16]u8 = @splat(0xAB);
+    try t.expect(!One.verify(&[_]u8{}, msg, &some_sig));
 }
 
 // ── pinUvAuthProtocol Two ──────────────────────────────────────────────────
@@ -355,25 +367,25 @@ test "protocol two: wrong-length inputs are typed errors, no panic" {
 test "protocol two: authenticate/verify, tamper and wrong-length rejection" {
     const key = Two.kdf(hx(v.rfc5903_p256.girx));
     const msg = "ctap2 clientPin command payload";
-    const sig = Two.authenticate(&key, msg);
+    const sig = Two.authenticate(key[0..32], msg);
     try t.expectEqual(@as(usize, 32), sig.len);
     // Full HMAC under the HMAC-key half only.
     var expected: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&expected, msg, key[0..32]);
     try t.expectEqualSlices(u8, &expected, &sig);
-    try t.expect(Two.verify(&key, msg, &sig));
+    try t.expect(Two.verify(key[0..32], msg, &sig));
     // Same byte-position ladder as protocol One's H1 fix above, kept
     // symmetric so a future truncated compare on either protocol shows up
     // the same way (tamper a byte outside a narrowed prefix).
     for (0..Two.signature_length) |i| {
         var bad_sig = sig;
         bad_sig[i] ^= 0x01;
-        try t.expect(!Two.verify(&key, msg, &bad_sig));
+        try t.expect(!Two.verify(key[0..32], msg, &bad_sig));
     }
-    try t.expect(!Two.verify(&key, "ctap2 clientPin command payloae", &sig));
+    try t.expect(!Two.verify(key[0..32], "ctap2 clientPin command payloae", &sig));
     // Wrong-length signatures fail closed (incl. protocol-one-style 16).
-    try t.expect(!Two.verify(&key, msg, sig[0..16]));
-    try t.expect(!Two.verify(&key, msg, ""));
+    try t.expect(!Two.verify(key[0..32], msg, sig[0..16]));
+    try t.expect(!Two.verify(key[0..32], msg, ""));
     // pinUvAuthParam also keys directly off a 32-byte pinUvAuthToken (not
     // the 64-byte shared secret) — CTAP 2.1's per-command
     // authenticate(pinUvAuthToken, clientDataHash) shape. A 32-byte token
@@ -381,7 +393,7 @@ test "protocol two: authenticate/verify, tamper and wrong-length rejection" {
     const token32: [32]u8 = @splat(0xa5);
     const sig_token = Two.authenticate(&token32, msg);
     try t.expect(Two.verify(&token32, msg, &sig_token));
-    try t.expect(!Two.verify(&key, msg, &sig_token));
+    try t.expect(!Two.verify(key[0..32], msg, &sig_token));
 }
 
 test "protocol two: tampered ciphertext (incl. IV) fails MAC verification" {
@@ -389,13 +401,13 @@ test "protocol two: tampered ciphertext (incl. IV) fails MAC verification" {
     const msg = "0123456789abcdef0123456789abcdef";
     var ct: [48]u8 = undefined;
     try Two.encrypt(key, @splat(0x3c), &ct, msg);
-    const sig = Two.authenticate(&key, &ct);
-    try t.expect(Two.verify(&key, &ct, &sig));
+    const sig = Two.authenticate(key[0..32], &ct);
+    try t.expect(Two.verify(key[0..32], &ct, &sig));
     ct[0] ^= 0x01; // tamper the IV
-    try t.expect(!Two.verify(&key, &ct, &sig));
+    try t.expect(!Two.verify(key[0..32], &ct, &sig));
     ct[0] ^= 0x01;
     ct[47] ^= 0x80; // tamper the last ciphertext byte
-    try t.expect(!Two.verify(&key, &ct, &sig));
+    try t.expect(!Two.verify(key[0..32], &ct, &sig));
 }
 
 // ── dispatch ───────────────────────────────────────────────────────────────
@@ -405,11 +417,21 @@ test "Impl(): comptime dispatch maps the wire enum to the namespaces" {
     try t.expectEqual(Two, ctap2pin.Impl(.two));
     try t.expectEqual(@as(u8, 1), @intFromEnum(ctap2pin.Protocol.one));
     try t.expectEqual(@as(u8, 2), @intFromEnum(ctap2pin.Protocol.two));
-    // The generic path works for both protocols.
+    // The generic path works for both protocols. `authenticate`'s return
+    // type and `verify`'s key type genuinely differ between the two (One:
+    // fallible []const u8 key -- audit L2; Two: infallible *const [32]u8
+    // key -- audit H2), so this branches on the comptime protocol instead
+    // of calling both the same way.
     inline for (.{ .one, .two }) |p| {
         const P = ctap2pin.Impl(p);
         const enc = try P.encapsulate(i_priv, gr);
-        const sig = P.authenticate(&enc.shared_secret, "m");
-        try t.expect(P.verify(&enc.shared_secret, "m", &sig));
+        if (p == .one) {
+            const sig = try P.authenticate(&enc.shared_secret, "m");
+            try t.expect(P.verify(&enc.shared_secret, "m", &sig));
+        } else {
+            const key = enc.shared_secret[0..32];
+            const sig = P.authenticate(key, "m");
+            try t.expect(P.verify(key, "m", &sig));
+        }
     }
 }

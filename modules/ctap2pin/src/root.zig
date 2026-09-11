@@ -286,6 +286,15 @@ pub const One = struct {
         try Aes256Cbc.decrypt(dst, ciphertext, key, @splat(0));
     }
 
+    /// `authenticate`/`verify`'s only failure: `key.len == 0` (audit
+    /// finding L2). CTAP2 never defines an authenticate/verify key of
+    /// length 0 — every real key here is either the shared secret or a
+    /// `pinUvAuthToken`, both nonempty by construction — so an empty key
+    /// can only reach this from a caller bug (an uninitialized/zero-length
+    /// buffer passed through), and the old code silently produced (and
+    /// accepted) a real-looking MAC for it instead of surfacing that bug.
+    pub const AuthenticateError = error{EmptyKey};
+
     /// §6.5.7 `authenticate(key, message)`: the first 16 bytes of
     /// `HMAC-SHA-256(key, message)`. `key` is generic per the spec's
     /// `authenticate` abstract operation: CTAP2 calls this both with the
@@ -294,18 +303,20 @@ pub const One = struct {
     /// per-request `pinUvAuthParam`, keyed by the token obtained from
     /// `getPinToken` — CTAP 2.1 §6.5.7 note under `getPinToken`) — the two
     /// keys differ in length, so this cannot be typed as `SharedSecret`.
-    pub fn authenticate(key: []const u8, message: []const u8) [signature_length]u8 {
+    pub fn authenticate(key: []const u8, message: []const u8) AuthenticateError![signature_length]u8 {
+        if (key.len == 0) return error.EmptyKey;
         var mac: [HmacSha256.mac_length]u8 = undefined;
         HmacSha256.create(&mac, message, key);
         return mac[0..signature_length].*;
     }
 
     /// §6.5.7 `verify(key, message, signature)`: recompute and compare in
-    /// constant time. Fail-closed: a wrong-length signature is `false`.
+    /// constant time. Fail-closed: a wrong-length signature, OR an empty
+    /// key (audit finding L2 — `authenticate`'s only failure), is `false`.
     /// `key`: see `authenticate` — shared secret or `pinUvAuthToken`.
     pub fn verify(key: []const u8, message: []const u8, signature: []const u8) bool {
         if (signature.len != signature_length) return false;
-        const expected = authenticate(key, message);
+        const expected = authenticate(key, message) catch return false;
         return std.crypto.timing_safe.eql([signature_length]u8, expected, signature[0..signature_length].*);
     }
 };
@@ -388,24 +399,29 @@ pub const Two = struct {
     }
 
     /// §6.5.8 `authenticate(key, message)`: the full 32-byte
-    /// `HMAC-SHA-256(hmacKey, message)`. `key` is generic per the spec's
-    /// `authenticate` abstract operation, and must be at least 32 bytes:
-    /// pass the 64-byte shared secret (`hmacKey` is its first 32 bytes,
-    /// `key[0..32]` below) for `setPin`/`getPinToken`'s `pinUvAuthParam`, or
-    /// pass a 32-byte `pinUvAuthToken` directly (already exactly `hmacKey`
-    /// length, so `key[0..32]` is the whole token unchanged) for every later
-    /// command's per-request `pinUvAuthParam` — CTAP 2.1 §6.5.7 note under
-    /// `getPinToken`.
-    pub fn authenticate(key: []const u8, message: []const u8) [signature_length]u8 {
+    /// `HMAC-SHA-256(hmacKey, message)`. `key` is `*const [32]u8` (audit
+    /// finding H2 — it used to be `[]const u8`, sliced to `key[0..32]`
+    /// with NO length check: a shorter buffer panicked in Debug/ReleaseSafe
+    /// and silently read past its end in ReleaseFast, keying the HMAC with
+    /// whatever adjacent memory happened to follow it). Pass the leading 32
+    /// bytes of the 64-byte shared secret (`hmacKey`, e.g.
+    /// `shared_secret[0..32]`) for `setPin`/`getPinToken`'s
+    /// `pinUvAuthParam`, or pass a 32-byte `pinUvAuthToken` directly
+    /// (already exactly `hmacKey` length) for every later command's
+    /// per-request `pinUvAuthParam` — CTAP 2.1 §6.5.7 note under
+    /// `getPinToken`. The compiler now rejects a wrong-length key at the
+    /// call site instead of this function reading past a short one.
+    pub fn authenticate(key: *const [32]u8, message: []const u8) [signature_length]u8 {
         var mac: [signature_length]u8 = undefined;
-        HmacSha256.create(&mac, message, key[0..32]);
+        HmacSha256.create(&mac, message, key);
         return mac;
     }
 
     /// §6.5.8 `verify(key, message, signature)`: recompute and compare in
     /// constant time. Fail-closed: a wrong-length signature is `false`.
-    /// `key`: see `authenticate` — shared secret or `pinUvAuthToken`.
-    pub fn verify(key: []const u8, message: []const u8, signature: []const u8) bool {
+    /// `key`: see `authenticate` — shared secret half or `pinUvAuthToken`,
+    /// exactly 32 bytes (audit finding H2).
+    pub fn verify(key: *const [32]u8, message: []const u8, signature: []const u8) bool {
         if (signature.len != signature_length) return false;
         const expected = authenticate(key, message);
         return std.crypto.timing_safe.eql([signature_length]u8, expected, signature[0..signature_length].*);

@@ -97,7 +97,16 @@ fn runProtocol(comptime protocol: ctap2pin.Protocol, auth_scalar: [32]u8, platfo
     // ── command authentication: platform signs, authenticator verifies ──
     // A synthetic clientDataHash-shaped message, not a real WebAuthn hash.
     const client_data_hash = [_]u8{0x99} ** 32;
-    const pin_uv_auth_param = Impl.authenticate(&token, &client_data_hash);
+    // `One.authenticate` is fallible (audit finding L2: rejects an empty
+    // key) and `Two.authenticate` is not (audit finding H2: the key is now
+    // `*const [32]u8`, a compile-time-enforced length, so there is nothing
+    // left to reject at runtime) -- genuinely different return types, not
+    // just different call syntax, so this branches on the comptime
+    // `protocol` the same way the encrypt/decrypt call above already does.
+    const pin_uv_auth_param = if (protocol == .one)
+        try Impl.authenticate(&token, &client_data_hash)
+    else
+        Impl.authenticate(&token, &client_data_hash);
     if (!Impl.verify(&token, &client_data_hash, &pin_uv_auth_param)) return error.VerifyFailed;
     std.debug.print("protocol {s}: pinUvAuthParam computed by the platform verifies under the authenticator's copy of the token\n", .{@tagName(protocol)});
 

@@ -120,13 +120,13 @@ test "oracle: protocol One pinUvAuthParam reproduces fido2, both keying shapes" 
     const secret = One.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
     const token = hx(o.v1.pin_uv_token);
     // setPin/getPinToken shape: authenticate(sharedSecret, pinHashEnc).
-    const sig_shared = One.authenticate(&secret, &hx(o.v1.pin_hash_enc));
+    const sig_shared = try One.authenticate(&secret, &hx(o.v1.pin_hash_enc));
     try t.expectEqualSlices(u8, &hx(o.v1.pin_uv_param_over_pin_hash_enc), &sig_shared);
     try t.expect(One.verify(&secret, &hx(o.v1.pin_hash_enc), &sig_shared));
     // command shape: authenticate(pinUvAuthToken, clientDataHash) — this is
     // exactly the call the previous `SharedSecret`-typed signature could not
     // express for protocol Two (see root.zig's authenticate/verify docs).
-    const sig_token = One.authenticate(&token, &client_data_hash);
+    const sig_token = try One.authenticate(&token, &client_data_hash);
     try t.expectEqualSlices(u8, &hx(o.v1.pin_uv_param_over_client_data_hash), &sig_token);
     try t.expect(One.verify(&token, &client_data_hash, &sig_token));
 }
@@ -134,9 +134,9 @@ test "oracle: protocol One pinUvAuthParam reproduces fido2, both keying shapes" 
 test "oracle: protocol Two pinUvAuthParam reproduces fido2, both keying shapes" {
     const secret = Two.kdf(try ctap2pin.ecdhZ(platform_scalar, auth_pub));
     const token = hx(o.v2.pin_uv_token);
-    const sig_shared = Two.authenticate(&secret, &hx(o.v2.pin_hash_enc));
+    const sig_shared = Two.authenticate(secret[0..32], &hx(o.v2.pin_hash_enc));
     try t.expectEqualSlices(u8, &hx(o.v2.pin_uv_param_over_pin_hash_enc), &sig_shared);
-    try t.expect(Two.verify(&secret, &hx(o.v2.pin_hash_enc), &sig_shared));
+    try t.expect(Two.verify(secret[0..32], &hx(o.v2.pin_hash_enc), &sig_shared));
     // The 32-byte pinUvAuthToken as key — categorically impossible to pass
     // through the old `key: SharedSecret` ([64]u8) signature.
     const sig_token = Two.authenticate(&token, &client_data_hash);
