@@ -101,13 +101,20 @@ pub const XOnlyPublicKey = struct {
 /// an already x-only 32-byte key — the point encoding several Lightning
 /// specs use interchangeably (e.g. BOLT#12's `invreq_payer_id (33)` /
 /// `invoice_node_id (33)`, both verified x-only per BIP340's forced-even-y
-/// convention, so the parity prefix byte is simply dropped rather than
-/// consulted). Purely structural: it does not validate that the extracted
-/// 32 bytes are a valid curve x-coordinate — feed the result to
+/// convention, so the parity prefix byte is not consulted for SIGN, only
+/// checked to be a real SEC1 marker — `0x02`/`0x03` — before being dropped).
+/// A1 audit F11 (2026-09-11): the 33-byte branch used to accept ANY leading
+/// byte (`0x04`, `0x00`, anything), so a structurally-invalid SEC1 point
+/// would silently pass through as if it were a real one. Still purely
+/// structural beyond that one check: it does not validate that the
+/// extracted 32 bytes are a valid curve x-coordinate — feed the result to
 /// `XOnlyPublicKey.fromBytes` for that.
-pub fn xonlyBytesOf(point: []const u8) error{BadPointLength}![32]u8 {
+pub fn xonlyBytesOf(point: []const u8) error{ BadPointLength, BadPointPrefix }![32]u8 {
     return switch (point.len) {
-        33 => point[1..33].*,
+        33 => if (point[0] != 0x02 and point[0] != 0x03)
+            error.BadPointPrefix
+        else
+            point[1..33].*,
         32 => point[0..32].*,
         else => error.BadPointLength,
     };
@@ -293,7 +300,29 @@ pub const SignError = error{
 /// does not consume `io`.
 pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
+    const computed = try computeUnverified(secret_key, msg, aux_rand);
+    try selfCheck(computed.pubkey, msg, computed.sig);
+    return computed.sig;
+}
 
+/// A1 F5 (MED): the mandatory step-10 self-check below existed and worked,
+/// but was black-box untestable -- `sign` takes only a `SecretKey`, always
+/// recomputes a consistent `KeyPair` internally, and has no seam to inject
+/// a corrupted equation from outside, so no permanent test could exercise
+/// the "step 10 catches a fault" property without either (a) duplicating
+/// `sign`'s own arithmetic in the test (a copy, not a check -- see
+/// `feedback_a_test_that_reimplements_the_code_cannot_fail`) or (b) a new
+/// PUBLIC API surface on a module with 7 consumers. Neither was taken.
+/// Instead, `sign` (public, unchanged signature) is now a thin two-call
+/// composition of two file-private helpers below: `computeUnverified` (the
+/// spec's steps 1-9, no self-check) and `selfCheck` (step 10, i.e. the
+/// exact call `sign` itself makes). The regression test right below calls
+/// both directly, corrupts the real computed signature bytes the same way
+/// the audit's own mutation did (M14b: `s = k + e*d + 1`), and confirms
+/// `selfCheck` -- the genuine artifact, not a reimplementation -- rejects
+/// it. Both helpers stay non-`pub`: only this file (and its own tests) can
+/// reach them, so nothing outside this module can skip step 10.
+fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError!struct { sig: [64]u8, pubkey: XOnlyPublicKey } {
     // Steps 1-2: even-y-normalized effective scalar d + x-only public key.
     var kp = try KeyPair.fromSecretKey(secret_key);
     defer kp.deinit();
@@ -347,10 +376,14 @@ pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io
     sig[0..32].* = rx;
     sig[32..64].* = s.toBytes(.big);
 
-    // Step 10: mandatory self-verification before returning.
+    return .{ .sig = sig, .pubkey = kp.public };
+}
+
+/// Step 10: BIP340's mandatory self-check, exactly as `sign` calls it —
+/// the seam `computeUnverified`'s doc comment (A1 F5) describes.
+fn selfCheck(pubkey: XOnlyPublicKey, msg: []const u8, sig: [64]u8) SignError!void {
     const parsed = Signature.fromBytes(sig) catch return error.SignatureVerificationFailed;
-    if (!verify(kp.public, msg, parsed)) return error.SignatureVerificationFailed;
-    return sig;
+    if (!verify(pubkey, msg, parsed)) return error.SignatureVerificationFailed;
 }
 
 /// BIP340 §"Verification". Returns `false` on every failure path — it
@@ -452,8 +485,18 @@ pub const BatchItem = struct {
 /// identity contributes nothing and the item is skipped — NOT a failure:
 /// the equation, not any per-item property, decides.
 pub fn verifyBatch(items: []const BatchItem, io: std.Io) bool {
-    // Empty batch: the equation degenerates to 0*G == identity on both
-    // sides — vacuously true (matches "all zero signatures are valid").
+    // Empty batch: A1 audit F9 (LOW, round-2 Q5 -- "which normative source
+    // wins" resolves to "follow the algorithm as written"). BIP340
+    // §"Batch Verification" does not discuss u=0 in prose, but its
+    // algorithm is unambiguous about it: "For i = 1..u: <checks that can
+    // fail>" is a loop that runs zero times when u=0, so no check can ever
+    // fail, and the final step -- "Return success iff no failure occurred
+    // before reaching this point" -- returns success. This is not merely
+    // "our equation happens to degenerate to 0*G == identity"; it is the
+    // spec's own literal definition of BatchVerify applied to u=0, so
+    // `true` here is spec-mandated, not a permissive design choice this
+    // module made on its own. (The equation below independently agrees:
+    // it degenerates to 0*G == identity on both sides.)
     var lhs_scalar = Scalar.zero; // sum_i a_i * s_i (mod n)
     var rhs = Secp256k1.identityElement;
     for (items, 0..) |item, i| {
@@ -555,6 +598,11 @@ test "xonlyBytesOf: 33-byte compressed drops the prefix, 32-byte passes through,
     const from33 = try xonlyBytesOf(&compressed);
     try std.testing.expectEqualSlices(u8, compressed[1..33], &from33);
 
+    var compressed03 = compressed;
+    compressed03[0] = 0x03;
+    const from33_03 = try xonlyBytesOf(&compressed03);
+    try std.testing.expectEqualSlices(u8, compressed[1..33], &from33_03);
+
     const from32 = try xonlyBytesOf(compressed[1..33]);
     try std.testing.expectEqualSlices(u8, compressed[1..33], &from32);
 
@@ -563,6 +611,48 @@ test "xonlyBytesOf: 33-byte compressed drops the prefix, 32-byte passes through,
     too_long[0..33].* = compressed;
     too_long[33] = 0x00;
     try std.testing.expectError(error.BadPointLength, xonlyBytesOf(&too_long));
+}
+
+test "xonlyBytesOf: A1 F11 -- a 33-byte input with a non-SEC1 prefix is rejected, not silently accepted" {
+    var bad: [33]u8 = undefined;
+    for (bad[1..33], 0..) |*b, i| b.* = @intCast(i);
+    for ([_]u8{ 0x00, 0x01, 0x04, 0x06, 0x07, 0xff }) |prefix| {
+        bad[0] = prefix;
+        try std.testing.expectError(error.BadPointPrefix, xonlyBytesOf(&bad));
+    }
+    // Sanity: the only two SEC1 markers still pass, unaffected.
+    bad[0] = 0x02;
+    _ = try xonlyBytesOf(&bad);
+    bad[0] = 0x03;
+    _ = try xonlyBytesOf(&bad);
+}
+
+test "A1 F5: sign's step-10 self-check rejects a corrupted signature, via the real function sign() itself calls" {
+    const sk = try SecretKey.fromBytes([_]u8{0x11} ** 32);
+    const msg = "A1 F5 regression";
+    const aux_rand = [_]u8{0xAB} ** 32;
+
+    // Sanity: the honest computation passes its own self-check, and the
+    // seam agrees with `sign`'s own output byte-for-byte.
+    var honest = try computeUnverified(sk, msg, aux_rand);
+    try selfCheck(honest.pubkey, msg, honest.sig);
+    const via_sign = try sign(sk, msg, aux_rand, undefined);
+    try std.testing.expectEqualSlices(u8, &via_sign, &honest.sig);
+
+    // Corrupt the freshly computed `s` the way a fault in step 9's
+    // arithmetic would (audit mutation M14b: `s = k + e*d + 1` instead of
+    // `s = k + e*d`) -- flip the low bit of the last byte. `selfCheck` is
+    // the exact function `sign` calls for step 10; this is not a
+    // reimplementation of "is this signature valid", it is the genuine
+    // artifact fed a genuinely corrupted input.
+    var corrupted = honest;
+    corrupted.sig[63] ^= 0x01;
+    try std.testing.expectError(error.SignatureVerificationFailed, selfCheck(corrupted.pubkey, msg, corrupted.sig));
+
+    // And corrupting `R` (the first 32 bytes) instead of `s` is caught too.
+    var corrupted_r = honest;
+    corrupted_r.sig[0] ^= 0x01;
+    try std.testing.expectError(error.SignatureVerificationFailed, selfCheck(corrupted_r.pubkey, msg, corrupted_r.sig));
 }
 
 test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — ⛔ `InvoiceRequest.verify`/`Invoice.verify` used to call
+  `bip340.xonlyBytesOf(...) catch unreachable` on `invreq_payer_id`/
+  `invoice_node_id`, both decoded straight from the wire (BOLT#12 TLV types
+  88/176) with only a length check. `bip340` (A1 F11, same commit) now
+  rejects a 33-byte point whose leading byte is not `0x02`/`0x03`, which
+  would have turned this `unreachable` into a reachable panic on a
+  malformed/malicious payload — measured directly (temporarily reverting
+  just these two call sites reproduced `thread panic: attempt to unwrap
+  error: BadPointPrefix`, a process crash). Both call sites now propagate
+  `error.InvalidPublicKey` (already part of `VerifyError`) instead, so a
+  bad prefix fails `verify()` closed rather than crashing the process.
 - **2026-09-10** — ⛔ `bech32_raw.stripContinuation`'s 2026-08-08 neighbour-charset check (audit
   F6) required both sides of a BOLT#12 `+` to be `1`/`b`/`i`/`o`-excluding bech32-alphabet
   members — but `1`/`b`/`i`/`o` are exactly the letters/separator a human-readable prefix
