@@ -71,10 +71,24 @@ transport-agnostic client and a broker, all fully offline-testable.
     disconnect never writes to freed memory, and containing any per-subscriber
     delivery failure to that subscriber (never the publisher).
 
+    **Will / LWT** (3.1.2.5, 3.14.4): the will registered at CONNECT is kept
+    (owned copies — the decoded slices point into the receive buffer), published
+    on *any* ungraceful end — dead socket, protocol violation, keep-alive
+    expiry, session take-over — and discarded on a clean DISCONNECT. A will
+    topic carrying a wildcard is refused as a protocol violation rather than a
+    CONNACK code, since none of 3.2.2.3's codes describes it. Undeliverable
+    wills are counted by `willFailures()` rather than lost silently.
+
+    **Observing traffic:** `Config.onPublishFn` is called for every PUBLISH the
+    broker accepts, before fan-out, with the topic and payload. It exists
+    because `authorizeFn` cannot serve — `AclRequest` carries no payload — and
+    because the alternative is registering a loopback subscriber and re-decoding
+    the broker's own output. Null by default; it never affects routing.
+
     **Deliberately deferred (documented, not built):** QoS 2
     (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
     down), persistent / offline sessions (clean-session only), DUP retransmit
-    of an unacked outbound publish, Will / LWT, MQTT 5.0, and TLS (terminate in
+    of an unacked outbound publish, MQTT 5.0, and TLS (terminate in
     front and hand `TcpServer` plaintext, or drive the socket-free core over a
     TLS stream).
 

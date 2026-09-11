@@ -214,6 +214,16 @@ pub const Connection = struct {
     /// the trie index references these connections by pointer + granted QoS.
     subs: std.ArrayListUnmanaged([]u8) = .empty,
 
+    /// The Will registered at CONNECT (spec 3.1.2.5), owned copies — the
+    /// decoded slices point into `rx_buf`, which the next packet overwrites.
+    /// Null means either none was registered or a clean DISCONNECT has already
+    /// discarded it (spec 3.14.4), which is exactly the test for "did this
+    /// connection end gracefully".
+    will_topic: ?[]u8 = null,
+    will_payload: ?[]u8 = null,
+    will_qos: QoS = .at_most_once,
+    will_retain: bool = false,
+
     /// Fan-out liveness (FIX A). Incremented under `Broker.mutex` by a fan-out
     /// reader that is about to write to this connection, decremented lock-free
     /// when the write completes. `remove()` unlinks the connection under the
@@ -620,6 +630,33 @@ pub const Config = struct {
     /// still PUBACKed (QoS 1) so it stays well-behaved.
     authorizeFn: ?*const fn (ctx: ?*anyopaque, req: AclRequest) bool = null,
     acl_ctx: ?*anyopaque = null,
+
+    /// Optional observer of every PUBLISH the broker accepts. Null = nothing is
+    /// observed and nothing changes; this hook has no effect on routing.
+    ///
+    /// It exists because `authorizeFn` cannot serve: `AclRequest` carries the
+    /// topic but not the payload, and returns a verdict rather than observing.
+    /// A bridge, a recorder or a protocol proxy needs the message itself, and
+    /// without this the only way to obtain it is to register a loopback
+    /// subscriber and re-decode the broker's own output.
+    ///
+    /// Called after the ACL verdict and **before** fan-out, so an observer sees
+    /// exactly what the broker accepted whether or not delivery to subscribers
+    /// then succeeds. A denied publish is not observed — the hook reports what
+    /// the broker took, not what a client attempted.
+    ///
+    /// ⚠ `topic` and `payload` point into the publishing connection's receive
+    /// buffer and are valid **only for the duration of the call**. An observer
+    /// that keeps them must copy. It runs on the publisher's own thread with no
+    /// broker lock held, so it must not call back into the broker.
+    onPublishFn: ?*const fn (
+        ctx: ?*anyopaque,
+        topic: []const u8,
+        payload: []const u8,
+        qos: QoS,
+        retain: bool,
+    ) void = null,
+    publish_ctx: ?*anyopaque = null,
 };
 
 /// One retained message snapshotted (owned dups) under the global lock for
@@ -654,6 +691,11 @@ pub const Broker = struct {
     /// Count of QoS 1 messages dropped because a subscriber's in-flight pool
     /// was full — i.e. that subscriber has stopped answering PUBACKs.
     qos1_drops: std.atomic.Value(u64) = .init(0),
+    /// Count of Wills that could not be delivered. The teardown path has no
+    /// caller to return an error to, so the failure is counted instead of
+    /// disappearing: a non-zero value means subscribers were not told about a
+    /// client that vanished.
+    will_failures: std.atomic.Value(u64) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -697,6 +739,12 @@ pub const Broker = struct {
         return b.qos1_drops.load(.monotonic);
     }
 
+    /// How many Wills failed to be delivered on an ungraceful disconnect.
+    /// Non-zero means a client vanished and its subscribers were not told.
+    pub fn willFailures(b: *const Broker) u64 {
+        return b.will_failures.load(.monotonic);
+    }
+
     /// Register a new connection over `transport`; returns an owned pointer
     /// (freed by `remove`). Allocates the connection's rx/tx buffers.
     pub fn accept(b: *Broker, transport: Transport) Error!*Connection {
@@ -721,6 +769,16 @@ pub const Broker = struct {
     /// in-flight fan-out writers to release their references (FIX A), then free
     /// its memory. Idempotent w.r.t. subscriptions.
     pub fn remove(b: *Broker, conn: *Connection) void {
+        // The Will, if this connection still has one (spec 3.1.2.5): every way
+        // of arriving here except a DISCONNECT is an ungraceful end — a dead
+        // socket, a protocol violation, a keep-alive expiry, a session
+        // take-over. `handle` drops the will on a clean DISCONNECT, so whatever
+        // survives to here is by definition unannounced.
+        //
+        // Done before the lock below, not inside it: `publishWill` fans out and
+        // `fanout` takes `b.mutex` itself, which is a spinlock and not
+        // reentrant.
+        b.publishWill(conn);
         {
             b.mutex.lock();
             defer b.mutex.unlock();
@@ -739,11 +797,49 @@ pub const Broker = struct {
     }
 
     fn freeConnection(b: *Broker, conn: *Connection) void {
+        b.dropWill(conn);
         for (conn.subs.items) |f| b.allocator.free(f);
         conn.subs.deinit(b.allocator);
         b.allocator.free(conn.rx_buf);
         b.allocator.free(conn.tx_buf);
         b.allocator.destroy(conn);
+    }
+
+    /// Forget this connection's Will without publishing it: a clean DISCONNECT,
+    /// or the final free after it has already been published. Idempotent.
+    fn dropWill(b: *Broker, conn: *Connection) void {
+        if (conn.will_topic) |t| b.allocator.free(t);
+        if (conn.will_payload) |p| b.allocator.free(p);
+        conn.will_topic = null;
+        conn.will_payload = null;
+    }
+
+    /// Publish the Will, once, and forget it. A failure is contained and
+    /// counted rather than propagated: this runs on a teardown path that has no
+    /// one to report to, and a connection must be freed whether or not its last
+    /// message reached anybody.
+    fn publishWill(b: *Broker, conn: *Connection) void {
+        const wt = conn.will_topic orelse return;
+        // Topic and payload are set together in `handleConnect`, but the two
+        // fields are separately optional, so the payload is unwrapped rather
+        // than assumed — an empty will message is legal (spec 3.1.3.3).
+        const wp = conn.will_payload;
+        // Detach first: `fanout` must not be able to see a will that is already
+        // being delivered, and the free below must not race the delivery.
+        conn.will_topic = null;
+        conn.will_payload = null;
+        defer {
+            b.allocator.free(wt);
+            if (wp) |p| b.allocator.free(p);
+        }
+        b.fanout(conn, .{
+            .topic = wt,
+            .payload = if (wp) |p| p else &.{},
+            .qos = conn.will_qos,
+            .retain = conn.will_retain,
+        }) catch {
+            _ = b.will_failures.fetchAdd(1, .monotonic);
+        };
     }
 
     /// Buffer bytes received from this connection's client (any framing).
@@ -819,6 +915,11 @@ pub const Broker = struct {
                     return .keep;
                 },
                 .disconnect => {
+                    // A DISCONNECT is the client saying this was deliberate, so
+                    // the Will is discarded and never published (spec 3.14.4).
+                    // Dropping it here is also what makes "a will is still set"
+                    // the test `remove` uses for an ungraceful end.
+                    b.dropWill(conn);
                     // Clean session: routing state is dropped on disconnect.
                     b.mutex.lock();
                     b.dropSubscriptions(conn);
@@ -893,6 +994,28 @@ pub const Broker = struct {
                 }));
                 return .close;
             }
+        }
+
+        // Will (spec 3.1.2.5–3.1.3.3), taken AFTER authentication so a refused
+        // CONNECT registers nothing. Copied because `c.will`'s slices point into
+        // this connection's receive buffer and the next packet overwrites them.
+        // A will topic must be a valid topic NAME (no wildcards, spec 3.1.3.2);
+        // the codec does not check that, and admitting one would let a client
+        // register a message that can never be routed.
+        if (c.will) |w| {
+            // ⛔ A protocol violation, not a CONNACK: §3.2.2.3's return codes are
+            // all about the client's identity or authorization, and answering
+            // `identifier_rejected` here would send a client hunting through its
+            // client id for a fault that is in its will topic. §3.1.4-1 wants
+            // the connection closed for a CONNECT that fails validation.
+            topic.validateName(w.topic) catch return error.ProtocolViolation;
+            const wt = try b.allocator.dupe(u8, w.topic);
+            errdefer b.allocator.free(wt);
+            const wp = try b.allocator.dupe(u8, w.message);
+            conn.will_topic = wt;
+            conn.will_payload = wp;
+            conn.will_qos = w.qos;
+            conn.will_retain = w.retain;
         }
 
         // Session take-over: a live connection with the same client-id is
@@ -1099,6 +1222,11 @@ pub const Broker = struct {
         // ACL (FIX D): a denied PUBLISH is silently dropped — not retained, not
         // fanned out — but still PUBACKed so the publisher stays well-behaved.
         if (b.aclAllows(conn, pub_pkt.topic, .publish)) {
+            // Observer before delivery: what the broker accepted is a fact even
+            // if fan-out then fails, and `fanout` can return an error.
+            if (b.config.onPublishFn) |tap| {
+                tap(b.config.publish_ctx, pub_pkt.topic, pub_pkt.payload, pub_pkt.qos, pub_pkt.retain);
+            }
             try b.fanout(conn, pub_pkt);
         }
 
@@ -2834,4 +2962,211 @@ test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback
     try testing.expect(ctl.probe_stalls.load(.monotonic) == 0); // accept never stalled behind fan-out
     try testing.expect(ctl.probe_ok.load(.monotonic) > 0); // the probe actually ran
     try testing.expect(ctl.delivered.load(.monotonic) > 0); // fan-out actually happened
+}
+
+// ── the publish tap ─────────────────────────────────────────────────────────
+// Each of these asserts BOTH directions: a check that only ever fires is
+// indistinguishable from a check that always fires.
+
+const TapRecorder = struct {
+    calls: usize = 0,
+    topic: [64]u8 = undefined,
+    topic_len: usize = 0,
+    payload: [64]u8 = undefined,
+    payload_len: usize = 0,
+    qos: QoS = .at_most_once,
+    retain: bool = false,
+
+    fn onPublish(ctx: ?*anyopaque, t: []const u8, pl: []const u8, q: QoS, r: bool) void {
+        const self: *TapRecorder = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        @memcpy(self.topic[0..t.len], t);
+        self.topic_len = t.len;
+        @memcpy(self.payload[0..pl.len], pl);
+        self.payload_len = pl.len;
+        self.qos = q;
+        self.retain = r;
+    }
+
+    fn seenTopic(self: *const TapRecorder) []const u8 {
+        return self.topic[0..self.topic_len];
+    }
+
+    fn seenPayload(self: *const TapRecorder) []const u8 {
+        return self.payload[0..self.payload_len];
+    }
+};
+
+test "publish tap observes what the broker accepted" {
+    var rec: TapRecorder = .{};
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+    // Nobody is subscribed: the tap must not depend on there being a subscriber,
+    // which is the whole difference between it and a loopback subscription.
+    _ = try feedPublish(&b, conn, .{
+        .topic = "sn/1/data",
+        .payload = "{\"t\":1}",
+        .qos = .at_least_once,
+        .packet_id = 7,
+        .retain = true,
+    });
+
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqualStrings("sn/1/data", rec.seenTopic());
+    try testing.expectEqualStrings("{\"t\":1}", rec.seenPayload());
+    try testing.expectEqual(QoS.at_least_once, rec.qos);
+    try testing.expect(rec.retain);
+
+    b.remove(conn);
+}
+
+test "publish tap does not observe what the ACL refused" {
+    const Acl = struct {
+        fn deny(_: ?*anyopaque, _: AclRequest) bool {
+            return false;
+        }
+    };
+    var rec: TapRecorder = .{};
+    var b = Broker.init(testing.allocator, .{
+        .authorizeFn = Acl.deny,
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+    _ = try feedPublish(&b, conn, .{
+        .topic = "sn/1/data",
+        .payload = "x",
+        .qos = .at_least_once,
+        .packet_id = 9,
+    });
+
+    // Not observed — the hook reports what the broker took, not what a client
+    // attempted — but the publisher is still acknowledged, as before.
+    try testing.expectEqual(@as(usize, 0), rec.calls);
+    const ack = (try tt.next()).?;
+    try testing.expect(ack == .puback);
+    try testing.expectEqual(@as(u16, 9), ack.puback);
+
+    b.remove(conn);
+}
+
+// ── Will / LWT (spec 3.1.2.5, 3.1.3.3, 3.14.4) ──────────────────────────────
+
+/// CONNECT carrying a will, driven through the broker like `connectClient`.
+fn connectWithWill(b: *Broker, tt: *TestTransport, client_id: []const u8, w: packet.Will) !*Connection {
+    const conn = try b.accept(tt.transport());
+    var buf: [256]u8 = undefined;
+    const bytes = try packet.encodeConnect(&buf, .{ .client_id = client_id, .will = w });
+    try b.feed(conn, bytes);
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
+    const p = (try tt.next()).?;
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, p.connack.return_code);
+    return conn;
+}
+
+test "will is published to subscribers when the connection is lost" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var watcher_tt: TestTransport = .{};
+    const watcher = try connectClient(&b, &watcher_tt, "watcher", 0, 0);
+    try feedSubscribe(&b, watcher, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+    _ = try watcher_tt.next(); // SUBACK
+
+    var dying_tt: TestTransport = .{};
+    const dying = try connectWithWill(&b, &dying_tt, "dying", .{
+        .topic = "sn/1/status",
+        .message = "disconnected",
+    });
+
+    // No DISCONNECT: the socket simply goes. This is the case the gateway
+    // presents when it is unplugged, and the one the spec exists for.
+    b.remove(dying);
+
+    const got = (try watcher_tt.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqualStrings("sn/1/status", got.publish.topic);
+    try testing.expectEqualStrings("disconnected", got.publish.payload);
+    try testing.expectEqual(@as(u64, 0), b.willFailures());
+
+    b.remove(watcher);
+}
+
+test "a clean DISCONNECT discards the will" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var watcher_tt: TestTransport = .{};
+    const watcher = try connectClient(&b, &watcher_tt, "watcher", 0, 0);
+    try feedSubscribe(&b, watcher, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+    _ = try watcher_tt.next(); // SUBACK
+
+    var leaving_tt: TestTransport = .{};
+    const leaving = try connectWithWill(&b, &leaving_tt, "leaving", .{
+        .topic = "sn/1/status",
+        .message = "disconnected",
+    });
+
+    var dbuf: [2]u8 = undefined;
+    try b.feed(leaving, try packet.encodeDisconnect(&dbuf));
+    try testing.expectEqual(Disposition.close, try b.process(leaving, 1));
+    b.remove(leaving);
+
+    // Nothing arrived: saying goodbye is exactly what a will is not for.
+    try testing.expectEqual(@as(?packet.Packet, null), try watcher_tt.next());
+
+    b.remove(watcher);
+}
+
+test "a retained will outlives the connection that set it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var dying_tt: TestTransport = .{};
+    const dying = try connectWithWill(&b, &dying_tt, "dying", .{
+        .topic = "sn/1/status",
+        .message = "disconnected",
+        .retain = true,
+    });
+    b.remove(dying);
+
+    // A subscriber arriving afterwards still learns the client is gone.
+    var late_tt: TestTransport = .{};
+    const late = try connectClient(&b, &late_tt, "late", 0, 0);
+    try feedSubscribe(&b, late, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+    _ = try late_tt.next(); // SUBACK
+    const got = (try late_tt.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqualStrings("disconnected", got.publish.payload);
+    try testing.expect(got.publish.retain);
+
+    b.remove(late);
+}
+
+test "a will topic containing a wildcard is a protocol violation" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const conn = try b.accept(tt.transport());
+    var buf: [256]u8 = undefined;
+    const bytes = try packet.encodeConnect(&buf, .{
+        .client_id = "bad",
+        .will = .{ .topic = "sn/+/status", .message = "x" },
+    });
+    try b.feed(conn, bytes);
+    // A will nobody could ever be routed is refused outright, and NOT as a
+    // CONNACK return code: none of them describes this, and the closest one
+    // would send the client hunting through its client id.
+    try testing.expectError(error.ProtocolViolation, b.process(conn, 0));
+    b.remove(conn);
 }

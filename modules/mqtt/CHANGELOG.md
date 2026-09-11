@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **Will / LWT is implemented in the broker**, closing what SPEC.md carried as
+  deliberately deferred first-cut scope (3.1.2.5, 3.1.3.3, 3.14.4). The will registered at CONNECT
+  is kept as owned copies — the decoded slices point into the receive buffer and the next packet
+  overwrites them — published on *any* ungraceful end (dead socket, protocol violation, keep-alive
+  expiry, session take-over) and discarded on a clean DISCONNECT, which is what makes "a will is
+  still set" the test for an unannounced end. A will topic carrying a wildcard is refused as a
+  protocol violation rather than a CONNACK code: none of 3.2.2.3's codes describes it, and the
+  nearest one would send a client hunting through its client id for a fault in its will topic.
+  An undeliverable will is counted by the new `willFailures()` rather than lost silently — the
+  teardown path has no caller to return an error to. Driven by the first outside consumer
+  (`energomonitor`'s egw-proxy), whose device sets a will and whose proxy must replay it upstream.
+  Measured RED → GREEN: four separate mutations (no publish on loss, no discard on DISCONNECT,
+  no topic validation) each kill exactly the test that names them.
+
+- **2026-09-11** — `Config.onPublishFn`: an optional observer of every PUBLISH the broker accepts,
+  called after the ACL verdict and before fan-out. Null by default; it cannot affect routing.
+  `authorizeFn` could not serve — `AclRequest` carries the topic but not the payload, and returns a
+  verdict rather than observing — so the only way to obtain a message was to register a loopback
+  subscriber and re-decode the broker's own output, which costs a connection's buffers and reads
+  as a puzzle. The topic and payload slices are valid only for the duration of the call.
+  Measured RED → GREEN, and the refused-publish direction is asserted too: a publish the ACL
+  denied is not observed, while the publisher is still PUBACKed as before.
+
 - **2026-09-10** — The over-long-username gap recorded below (2026-09-03) is fixed: `handleConnect`
   now refuses a CONNECT whose username exceeds `max_username` (256 B) with CONNACK
   `bad_username_or_password` and closes, instead of silently leaving `has_username` false. P1

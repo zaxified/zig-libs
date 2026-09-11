@@ -48,7 +48,9 @@ to typed errors, never panics (fuzzed both directions). Out of scope: MQTT 5.0; 
 persistence / offline-message replay (buffering across reconnects, the caller's job); client-side
 QoS 2 and DUP retransmit and Will/LWT are implemented, but the **broker's** first-cut deliberately
 omits QoS 2 (an inbound QoS 2 PUBLISH is a protocol violation that tears the connection down),
-persistent/offline sessions, DUP retransmit of an unacked outbound publish, and Will/LWT.
+persistent/offline sessions, and DUP retransmit of an unacked outbound publish. **Will/LWT is no
+longer deferred** (2026-09-11): the broker keeps the will from CONNECT, publishes it on any
+ungraceful end and discards it on a clean DISCONNECT (3.1.2.5, 3.14.4).
 
 ## Broker: production-hardened
 The broker was a functional first cut hardened against the trivial DoS/resource-exhaustion vectors
@@ -108,8 +110,8 @@ limitations have now been fixed:
   allow-all (backward compatible).
 
 Residual deferred scope (documented, not bugs): **QoS 2** (an inbound QoS 2 PUBLISH is a protocol
-violation that tears the connection down), persistent/offline sessions (clean-session only), DUP
-retransmit of an unacked outbound QoS 1 publish, and Will/LWT. TLS is out of scope by design
+violation that tears the connection down), persistent/offline sessions (clean-session only), and DUP
+retransmit of an unacked outbound QoS 1 publish. TLS is out of scope by design
 (terminate in front, or drive the socket-free core over a TLS stream). The concurrency hardening
 targets the thread-per-connection `TcpServer`; the offline core remains single-owner per connection
 and fully socket-free for testing.
@@ -183,7 +185,7 @@ use-after-free in the reference-counted teardown). No race, deadlock, or UAF was
 confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred
-Broker: QoS 2, persistent/offline sessions, DUP retransmit of unacked outbound publishes, Will/LWT,
+Broker: QoS 2, persistent/offline sessions, DUP retransmit of unacked outbound publishes,
 TLS, MQTT 5.0 (all documented deferrals, not bugs). The four architectural limitations of the first
 cut — O(conns×subs) fan-out under a global lock held across I/O, publisher-killing per-subscriber
 delivery failures, take-over socket leak, and missing auth/ACL — are now fixed (trie index +
