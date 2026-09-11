@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — Consumer-side follow-up to the `netsim` A1 fix campaign
+  (F2): `netsim.RunOutcome` gained a `.cap_exceeded` variant carrying
+  exactly the condition `runToConvergence` used to re-derive by hand
+  (`result.events_processed >= case.max_events_cap`) because that was the
+  only signal `netsim` exposed. Simplified to read the new field
+  (`result.outcome == .cap_exceeded`) instead of recomputing it — no change
+  to `isis-sim`'s own `Outcome` enum or observable behaviour.
+  `scripts/modtest isis-sim`: 21/21.
+
 - **2026-09-03** — Drift re-audit. **`.event_cap_exceeded` was unreachable from the
   suite and its precedence was pinned by nothing.** `Outcome` documents it and
   `.not_quiescent` as different diagnoses — a runaway versus mere under-convergence —

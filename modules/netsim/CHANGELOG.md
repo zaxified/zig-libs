@@ -5,6 +5,66 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign (fixer slot `c`), netsim F2, F3, F4
+  (last gap), F6, F8. **BEHAVIOURAL and API-breaking**, user-approved
+  (Q7/Q8): all 7 in-repo consumers (`raft`, `df-elect`, `loopfree-reconv`,
+  `liveness-hyst`, `loopix`, `fleetsim`, `isis-sim`) fixed in this same
+  commit.
+
+  **F3** (`Protocol.resetFn`, HIGH): was `?*const fn(...) void = null`,
+  documented "optional but recommended" — but `build` constructs a fresh
+  `Sim` on every call while `case.protocol.ctx` is the SAME pointer every
+  time, so a protocol without a reset leaks state across runs. Measured:
+  one `Case`, three `replay`s, no `resetFn` → fingerprints
+  `1573edbee379c84c`/`449c13c4c38d15d6`/`223351334e2663c3`, outcomes
+  `ok`→`violated`→`violated`; the same `Case` WITH a `resetFn` gives the
+  same fingerprint all three times. Now mandatory. All 7 consumers already
+  supplied one; `raft`'s one internal `resetFn.?(...)` call updated to drop
+  the now-invalid optional unwrap.
+
+  **F2** (`RunOutcome`, HIGH): `.ok` meant two different things — "finished"
+  and "hit `Case.max_events_cap`" — with nothing in `RunResult` to tell
+  them apart. Measured: a live-locked protocol (reschedules itself at the
+  same tick forever) with `max_events_cap = 10_000` returned `outcome =
+  .ok, events_processed = 10_000, violation = null`, identical in shape to
+  a clean finish. New `RunOutcome.cap_exceeded`, returned directly instead
+  of falling through to `.ok`. `isis-sim` used to re-derive the identical
+  condition itself (`events_processed >= case.max_events_cap`); simplified
+  to read the new field.
+
+  **F4** (last gap, HIGH): the cap-vs-`.ok` indistinguishability this item
+  was blocked on is F2 above — closed by the same fix; new test asserts a
+  clean finish and a cap-cutoff produce different `RunOutcome` tags.
+
+  **F6** (MED): `ddmin`'s only loop guard was `while (current.len >= 2)`, so
+  it never tested the empty subset — a protocol broken regardless of any
+  fault (the checker trips on a clean `replay(case, &.{})`) got handed a
+  misleading "minimal" reproducer blaming an arbitrary single surviving
+  fault. `ddmin` now tests `keeps(&.{})` once up front and returns the
+  empty set immediately if that alone reproduces. This is exactly the shape
+  of `raft`'s `BrokenRaft` and `df-elect`'s `BrokenAlwaysDf` positive
+  controls (both documented to fire "on a clean run with no injected
+  faults") — their own shrink tests updated from `res.after >= 1` to
+  `res.after == 0` in this same commit; both were RED (raft's `if
+  (res.before >= 1) try testing.expect(res.after >= 1)` and df-elect's bare
+  `try testing.expect(res.after >= 1)`) before this fix, GREEN after.
+
+  **F8** (MED): a hook (`onStart`/`onMessage`/`onTimer`) that returned an
+  error instead of tripping the invariant `check` used to propagate raw out
+  of `drive` — `findFailing` treated that as fatal (`try sim.run(...)` with
+  no `catch`, killing the whole seed sweep), while `shrink`'s `Ctx.keeps`
+  read the identical shape of failure as "not reproduced" (`catch return
+  false`). New `Sim.hookErr` captures it uniformly as a `RunResult`
+  violation (same representation `checkInvariant` already uses for a
+  failed invariant), so both call sites now handle it correctly with zero
+  changes of their own. Two errors stay raw-propagated on purpose
+  (`Sim.isEngineSignal`): `OutOfMemory` (nothing about the protocol to
+  report) and `LiveBytesExceeded` (audit F11's own deliberate,
+  already-tested resource-cap signal — a direct caller handles it itself,
+  it is not a correctness finding).
+
+  `scripts/modtest netsim`: 49/49 (Debug and ReleaseFast).
+
 - **2026-09-11** — A1 fix campaign, netsim F15 (**NO CONSUMER-VISIBLE
   CHANGE** — internal-only, `severed()` is private): `severed()` did two
   `std.mem.indexOfScalar` scans of each active partition's cut list, for

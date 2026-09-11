@@ -580,8 +580,15 @@ test "shrink: a fuzzed failing schedule against BrokenAlwaysDf minimizes to a st
 
     var res = try netsim.shrinkTrace(gpa, &failing);
     defer res.deinit();
-    try testing.expect(res.after >= 1);
     try testing.expect(res.after <= res.before);
+    // netsim audit F6: `BrokenAlwaysDf` breaks from its own BUM-flooding
+    // traffic alone — the "positive control" test above already proves it
+    // trips with a completely empty trace (`netsim.replay(gpa, case, &.{},
+    // null)`). The true minimal reproducer is therefore the EMPTY fault
+    // set, and netsim's shrinker now finds exactly that instead of a
+    // pre-fix floor of >= 1 blaming an arbitrary surviving fault. This used
+    // to read `try testing.expect(res.after >= 1);`.
+    try testing.expectEqual(@as(usize, 0), res.after);
 
     const r = try netsim.replay(gpa, failing.case, res.trace.events, null);
     try testing.expectEqual(netsim.RunOutcome.violated, r.outcome);

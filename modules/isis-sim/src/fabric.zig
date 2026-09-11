@@ -720,7 +720,13 @@ pub const Fabric = struct {
 
         const result = try netsim.replay(self.gpa, case, trace.items, null);
         if (result.outcome == .violated) return .safety_violated;
-        if (result.events_processed >= case.max_events_cap) return .event_cap_exceeded;
+        // netsim audit F2: the engine itself now distinguishes "hit the
+        // event-count backstop" from a clean finish (`RunOutcome
+        // .cap_exceeded`, previously indistinguishable from `.ok`) — this
+        // used to re-derive the identical condition by hand
+        // (`result.events_processed >= case.max_events_cap`) because that
+        // was the only signal available.
+        if (result.outcome == .cap_exceeded) return .event_cap_exceeded;
         if (!self.allQuiescent()) return .not_quiescent;
         return .converged;
     }

@@ -143,8 +143,24 @@ pub const Protocol = struct {
     checkFn: ?*const fn (ctx: *anyopaque, sim: *const Sim) anyerror!void = null,
     /// Clear all per-node state to its t=0 baseline. Called at the start of
     /// every drive so a ctx can be reused across many replays (the shrinker
-    /// re-runs the same ctx thousands of times). Optional but recommended.
-    resetFn: ?*const fn (ctx: *anyopaque) void = null,
+    /// re-runs the same ctx thousands of times).
+    ///
+    /// audit F3 (HIGH): this used to be `?*const fn (...) void = null`,
+    /// documented as "Optional but recommended" -- but `build` constructs a
+    /// fresh `Sim` on every call while `case.protocol.ctx` is the SAME
+    /// pointer every time, so a protocol without a reset silently leaks
+    /// state across runs (measured: one `Case`, three `replay`s, no
+    /// `resetFn` -> fingerprints `1573edbee379c84c` / `449c13c4c38d15d6` /
+    /// `223351334e2663c3`, outcomes `ok` -> `violated` -> `violated`, while
+    /// the SAME case WITH a `resetFn` gives the same fingerprint all three
+    /// times). Determinism is this module's headline guarantee, and a
+    /// missing reset is exactly the kind of mistake a shrinker running the
+    /// same ctx thousands of times turns into a false "minimal" reproducer.
+    /// All 7 in-repo consumers already supply one, so making it mandatory
+    /// costs them nothing; a caller with genuinely no per-node state to
+    /// clear supplies a no-op function, which is one line and puts the
+    /// "no reset needed" decision in the diff instead of in an omission.
+    resetFn: *const fn (ctx: *anyopaque) void,
 };
 
 /// Build a fresh topology and (optionally) any initial state. Called with an
@@ -170,7 +186,21 @@ pub const Case = struct {
     max_live_bytes: ?usize = null,
 };
 
-pub const RunOutcome = enum { ok, violated };
+/// audit F2 (HIGH): `.ok` used to mean two different things -- "the run
+/// finished (queue drained or `until` reached)" and "the run hit
+/// `Case.max_events_cap` and was cut off" -- and `RunResult` had no field to
+/// tell them apart. `Case.max_events_cap`'s own doc calls it a backstop
+/// against "a mis-specified invariant... spinning forever on a live-locked
+/// protocol", but a caller reading `.ok` cannot distinguish that from a
+/// protocol that legitimately ran to completion: measured with a protocol
+/// whose `onTimer` reschedules itself at the same tick forever (a live-lock)
+/// and `max_events_cap = 10_000` -- `outcome = .ok`, `events_processed =
+/// 10_000`, `violation = null`, identical in shape to a clean finish.
+/// `isis-sim` already worked around this by re-deriving the same condition
+/// itself (`events_processed >= case.max_events_cap`) outside the engine;
+/// `.cap_exceeded` moves that check to where the authoritative state already
+/// lives, for isis-sim and the other 6 consumers alike.
+pub const RunOutcome = enum { ok, violated, cap_exceeded };
 
 pub const Violation = struct {
     err: anyerror,
@@ -562,7 +592,7 @@ pub const Sim = struct {
                     return;
                 }
                 self.append(.{ .tag = .deliver, .a = d.from, .b = d.to, .c = @intCast(d.payload.len) });
-                try self.protocol.onMessageFn(self.protocol.ctx, self, d.to, d.from, d.payload);
+                self.protocol.onMessageFn(self.protocol.ctx, self, d.to, d.from, d.payload) catch |e| try self.hookErr(e);
             },
             .timer => |t| {
                 if (self.nodes.items[t.node].crashed) return;
@@ -570,9 +600,48 @@ pub const Sim = struct {
                 // contract of `setTimer`), including sentinels near maxInt(u64),
                 // and the log field only needs a lossless, deterministic image.
                 self.append(.{ .tag = .timer, .a = t.node, .b = @bitCast(t.timer_id) });
-                if (self.protocol.onTimerFn) |f| try f(self.protocol.ctx, self, t.node, t.timer_id);
+                if (self.protocol.onTimerFn) |f| f(self.protocol.ctx, self, t.node, t.timer_id) catch |e| try self.hookErr(e);
             },
             .fault => |fk| try self.applyFault(fk),
+        }
+    }
+
+    /// Errors that stay a distinct, raw-propagated Zig error instead of
+    /// being folded into a `RunResult.violation` by `hookErr` below -- each
+    /// is a deliberate, already-designed engine signal a direct caller of
+    /// `replay`/`run` handles explicitly, not a protocol-correctness
+    /// finding for `findFailing`/`shrink` to report:
+    ///   - `OutOfMemory`: genuine allocator exhaustion; there is nothing
+    ///     about the PROTOCOL to report.
+    ///   - `LiveBytesExceeded` (audit F11): the run hit the resource cap the
+    ///     caller configured via `Sim.max_live_bytes` on purpose, to be told
+    ///     "this run grew too large" -- not "the protocol is broken".
+    fn isEngineSignal(e: anyerror) bool {
+        return e == error.OutOfMemory or e == error.LiveBytesExceeded;
+    }
+
+    /// audit F8 (MED): a hook (`onStart`/`onMessage`/`onTimer`) that returns
+    /// an error instead of tripping the invariant `check` used to propagate
+    /// raw out of `drive` -- and the two callers that matter disagreed about
+    /// what that meant. `findFailing` let it kill the WHOLE seed sweep via
+    /// `try sim.run(...)` (measured: a protocol that throws
+    /// `error.ProtocolBlewUp` on its third message makes `findFailing`
+    /// propagate that error with no seed, no trace, nothing to reproduce).
+    /// `shrink`'s `Ctx.keeps` caught the identical shape of failure and
+    /// silently read it as "not reproduced" (`catch return false`) -- so the
+    /// one case that needs a reproducer most (the protocol crashing outright
+    /// rather than failing an invariant) got the least support from either
+    /// half of the harness. Capturing it HERE, uniformly, as a violation
+    /// (same representation `checkInvariant` already uses) means BOTH
+    /// `findFailing` (checks `outcome == .violated`) and `Ctx.keeps` (checks
+    /// `outcome == .violated and violation.?.err == target`) already handle
+    /// it correctly with no changes of their own -- the ambiguity was never
+    /// really in shrink.zig, it was in what `drive` handed both of them.
+    fn hookErr(self: *Sim, e: anyerror) anyerror!void {
+        if (isEngineSignal(e)) return e;
+        if (self.violation == null) {
+            self.violation = .{ .err = e, .time = self.now, .events_processed = self.events_processed };
+            self.append(.{ .tag = .violation, .a = self.now_as_i64() });
         }
     }
 
@@ -617,7 +686,7 @@ pub const Sim = struct {
                 if (r.node >= self.nodes.items.len) return error.UnknownNode;
                 self.nodes.items[r.node].crashed = false;
                 self.append(.{ .tag = .restart, .a = r.node });
-                if (self.protocol.onStartFn) |f| try f(self.protocol.ctx, self, r.node);
+                if (self.protocol.onStartFn) |f| f(self.protocol.ctx, self, r.node) catch |e| try self.hookErr(e);
             },
             .clock_jump => |j| {
                 if (j.node >= self.nodes.items.len) return error.UnknownNode;
@@ -663,13 +732,15 @@ pub const Sim = struct {
     }
 
     fn drive(self: *Sim) anyerror!RunOutcome {
-        if (self.protocol.resetFn) |reset| reset(self.protocol.ctx);
+        // audit F3: no longer optional -- see `Protocol.resetFn`'s doc.
+        self.protocol.resetFn(self.protocol.ctx);
 
         // Bootstrap: start every non-crashed node at t=0.
         if (self.protocol.onStartFn) |f| {
             var i: NodeId = 0;
             while (i < self.nodes.items.len) : (i += 1) {
-                if (!self.nodes.items[i].crashed) try f(self.protocol.ctx, self, i);
+                if (!self.nodes.items[i].crashed) f(self.protocol.ctx, self, i) catch |e| try self.hookErr(e);
+                if (self.violation != null) break; // audit F8: don't keep bootstrapping past a captured crash
             }
         }
         self.append(.{ .tag = .start, .a = @intCast(self.nodes.items.len) });
@@ -678,7 +749,10 @@ pub const Sim = struct {
 
         while (self.queue.peekTime()) |t| {
             if (t > self.until) break;
-            if (self.events_processed >= self.max_events_cap) break;
+            // audit F2: report the cap distinctly instead of falling through
+            // to the same `.ok` a clean finish returns below -- see
+            // `RunOutcome.cap_exceeded`'s doc.
+            if (self.events_processed >= self.max_events_cap) return .cap_exceeded;
             const ev = self.queue.pop();
             self.now = ev.time;
             try self.apply(ev);
@@ -780,6 +854,11 @@ pub fn run(gpa: Allocator, case: Case, fault_cfg: fault.Config) anyerror!GenResu
 
 const testing = std.testing;
 
+/// audit F3: `Protocol.resetFn` is mandatory now. Every test fixture below
+/// that has no per-node state worth clearing (each builds a fresh `Sim`/ctx
+/// per test and drives it once) uses this instead of hand-rolling a no-op.
+fn noReset(_: *anyopaque) void {}
+
 test "drive: an event scheduled exactly at `until` is still processed (inclusive boundary)" {
     const gpa = testing.allocator;
     var log = Log{};
@@ -806,6 +885,7 @@ test "drive: an event scheduled exactly at `until` is still processed (inclusive
         .ctx = &fired,
         .onMessageFn = Hooks.onMessage,
         .onTimerFn = Hooks.onTimer,
+        .resetFn = noReset,
     };
 
     var sim = Sim.init(gpa, 1, protocol, &log, 100, 1000);
@@ -842,6 +922,7 @@ test "drive: an event scheduled AFTER `until` is never processed (audit F4 teeth
         .ctx = &fired,
         .onMessageFn = Hooks.onMessage,
         .onTimerFn = Hooks.onTimer,
+        .resetFn = noReset,
     };
 
     var sim = Sim.init(gpa, 1, protocol, &log, 100, 1000);
@@ -879,6 +960,7 @@ test "drive: max_events_cap actually backstops a live-locked protocol (audit F4 
         .ctx = &fired,
         .onMessageFn = Hooks.onMessage,
         .onTimerFn = Hooks.onTimer,
+        .resetFn = noReset,
     };
 
     // `until` set absurdly high so only the cap, not the clock, can stop this.
@@ -888,9 +970,56 @@ test "drive: max_events_cap actually backstops a live-locked protocol (audit F4 
     try sim.setTimer(0, 0, 0);
     const outcome = try sim.drive();
 
-    try testing.expectEqual(RunOutcome.ok, outcome);
+    // audit F2: hitting the cap is no longer reported as `.ok` — see the
+    // dedicated distinguishability test right below for the RED this
+    // guards against.
+    try testing.expectEqual(RunOutcome.cap_exceeded, outcome);
     try testing.expectEqual(@as(u64, 50), sim.events_processed);
     try testing.expectEqual(@as(usize, 50), fired);
+}
+
+test "drive: hitting max_events_cap is DISTINGUISHABLE from a clean finish (audit F2/F4 last gap)" {
+    // Before F2, both a live-locked protocol cut off by the cap and a
+    // protocol that legitimately ran out of events returned the identical
+    // `.ok` with no signal telling them apart — `RunResult` had nowhere to
+    // put one. This is the test the earlier F4 pass could not write yet
+    // (it could only show the cap backstop FIRES, not that its outcome is
+    // told apart from success): a positive control (finishes cleanly, well
+    // under the cap) and the live-locked case side by side.
+    const gpa = testing.allocator;
+
+    const OneShot = struct {
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    };
+    var log1 = Log{};
+    defer log1.deinit(gpa);
+    var clean_sim = Sim.init(gpa, 1, .{ .ctx = undefined, .onMessageFn = OneShot.onMessage, .resetFn = noReset }, &log1, 1_000_000, 50);
+    defer clean_sim.deinit();
+    _ = try clean_sim.addNode(.{});
+    // No timers armed at all: the queue drains immediately, nowhere near
+    // the cap of 50 -- a genuinely clean finish.
+    const clean_outcome = try clean_sim.drive();
+    try testing.expectEqual(RunOutcome.ok, clean_outcome);
+    try testing.expect(clean_sim.events_processed < 50);
+
+    const LiveLock = struct {
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+        fn onTimer(_: *anyopaque, s: *Sim, node: NodeId, _: u64) anyerror!void {
+            try s.setTimer(node, 0, 0); // reschedule at the SAME tick: live-lock
+        }
+    };
+    var log2 = Log{};
+    defer log2.deinit(gpa);
+    var lock_sim = Sim.init(gpa, 1, .{ .ctx = undefined, .onMessageFn = LiveLock.onMessage, .onTimerFn = LiveLock.onTimer, .resetFn = noReset }, &log2, 1_000_000, 50);
+    defer lock_sim.deinit();
+    _ = try lock_sim.addNode(.{});
+    try lock_sim.setTimer(0, 0, 0);
+    const lock_outcome = try lock_sim.drive();
+    try testing.expectEqual(RunOutcome.cap_exceeded, lock_outcome);
+    try testing.expectEqual(@as(u64, 50), lock_sim.events_processed);
+
+    // The whole point of F2: these two MUST NOT collapse to the same tag.
+    try testing.expect(clean_outcome != lock_outcome);
 }
 
 test "applyFault: an out-of-range node id is rejected, not indexed unchecked (audit F1)" {
@@ -901,7 +1030,7 @@ test "applyFault: an out-of-range node id is rejected, not indexed unchecked (au
         fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
     };
     var unused: usize = 0;
-    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onMessageFn = Noop.onMessage }, &log, 100, 1000);
+    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onMessageFn = Noop.onMessage, .resetFn = noReset }, &log, 100, 1000);
     defer sim.deinit();
     _ = try sim.addNode(.{});
     _ = try sim.addNode(.{});
@@ -917,6 +1046,76 @@ test "applyFault: an out-of-range node id is rejected, not indexed unchecked (au
     try testing.expect(sim.nodes.items[2].crashed);
     try sim.applyFault(.{ .clock_jump = .{ .node = 1, .delta = 7 } });
     try testing.expectEqual(@as(i64, 7), sim.nodes.items[1].clock_offset);
+}
+
+test "drive: a hook error is captured as a violation instead of propagating raw (audit F8)" {
+    // Before F8, a hook (`onMessage` here) that returns an error instead of
+    // failing the invariant `check` propagated raw out of `drive` — which
+    // `findFailing` treated as fatal (kills the whole seed sweep) and
+    // `shrink`'s `Ctx.keeps` treated as "not reproduced" (see shrink.zig's
+    // dedicated end-to-end test for that half). This is the engine-level
+    // guarantee both of those rely on: the SAME hook error, seen directly
+    // through `drive`, comes back as `.violated` with the error attached —
+    // not a propagated Zig error.
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+    var calls: usize = 0;
+
+    const Crashy = struct {
+        fn onMessage(ctx: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+            if (n.* == 3) return error.ProtocolBlewUp; // audit's own repro shape: "after the 3rd message"
+        }
+    };
+    var sim = Sim.init(gpa, 1, .{ .ctx = &calls, .onMessageFn = Crashy.onMessage, .resetFn = noReset }, &log, 1000, 1000);
+    defer sim.deinit();
+    const a = try sim.addNode(.{});
+    const b = try sim.addNode(.{});
+    try sim.addLink(a, b, .{ .latency = 1 });
+    try sim.send(a, b, "1");
+    try sim.send(a, b, "2");
+    try sim.send(a, b, "3");
+    try sim.send(a, b, "4");
+
+    // RED (pre-F8 shape): this used to be `try sim.drive()` propagating
+    // `error.ProtocolBlewUp` straight out, so `expectError` was the only
+    // assertion that could even be written here. GREEN: `drive` returns
+    // normally with the error captured.
+    const outcome = try sim.drive();
+    try testing.expectEqual(RunOutcome.violated, outcome);
+    try testing.expectEqual(error.ProtocolBlewUp, sim.violation.?.err);
+    try testing.expectEqual(@as(usize, 3), calls); // the 4th send never got a chance to run
+}
+
+test "drive: OutOfMemory and LiveBytesExceeded stay raw-propagated, NOT folded into a violation (audit F8 exceptions)" {
+    // The exemption in `Sim.isEngineSignal`: these two are deliberate engine
+    // signals a direct caller handles itself (already-tested contracts —
+    // audit F11's own test expects `LiveBytesExceeded` to propagate through
+    // `replay`), not protocol-correctness findings for `findFailing`/
+    // `shrink` to report. Positive control for the F8 fix above: it must
+    // NOT swallow every hook error, just the ones that are actual bugs.
+    const gpa = testing.allocator;
+    var log = Log{};
+    defer log.deinit(gpa);
+
+    const CapBreaker = struct {
+        fn onStart(_: *anyopaque, s: *Sim, node: NodeId) anyerror!void {
+            if (node == 0) try s.send(0, 1, "0123456789"); // 10 bytes, cap is 3
+        }
+        fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    };
+    var unused: usize = 0;
+    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onStartFn = CapBreaker.onStart, .onMessageFn = CapBreaker.onMessage, .resetFn = noReset }, &log, 100, 1000);
+    defer sim.deinit();
+    _ = try sim.addNode(.{});
+    _ = try sim.addNode(.{});
+    try sim.addBiLink(0, 1, .{});
+    sim.max_live_bytes = 3;
+
+    try testing.expectError(error.LiveBytesExceeded, sim.drive());
+    try testing.expectEqual(@as(?Violation, null), sim.violation); // NOT captured as a violation
 }
 
 test "event heap: pops in (time, seq) order" {
@@ -961,6 +1160,7 @@ test "adjacency index stays in agreement with the link list" {
         .ctx = &unused,
         .onMessageFn = Noop.onMessage,
         .onTimerFn = Noop.onTimer,
+        .resetFn = noReset,
     }, &log, 100, 1000);
     defer sim.deinit();
 
@@ -1031,7 +1231,7 @@ test "addLink: a _permille field above 1000 is rejected, not silently saturated 
         fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
     };
     var unused: usize = 0;
-    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onMessageFn = Noop.onMessage }, &log, 100, 1000);
+    var sim = Sim.init(gpa, 1, .{ .ctx = &unused, .onMessageFn = Noop.onMessage, .resetFn = noReset }, &log, 100, 1000);
     defer sim.deinit();
     const a = try sim.addNode(.{});
     const b = try sim.addNode(.{});
@@ -1067,7 +1267,7 @@ fn statNoopSim(gpa: Allocator, log: *Log, seed: u64) Sim {
     const Noop = struct {
         fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
     };
-    return Sim.init(gpa, seed, .{ .ctx = undefined, .onMessageFn = Noop.onMessage }, log, 1_000_000, 1_000_000);
+    return Sim.init(gpa, seed, .{ .ctx = undefined, .onMessageFn = Noop.onMessage, .resetFn = noReset }, log, 1_000_000, 1_000_000);
 }
 
 test "F4 teeth: loss_permille actually drops messages at roughly the configured rate" {
@@ -1255,7 +1455,7 @@ test "build: Case.max_live_bytes reaches the Sim it builds (audit F11)" {
     const case = Case{
         .seed = 1,
         .scenario = scenario,
-        .protocol = .{ .ctx = &unused, .onStartFn = OneShotSender.onStart, .onMessageFn = OneShotSender.onMessage },
+        .protocol = .{ .ctx = &unused, .onStartFn = OneShotSender.onStart, .onMessageFn = OneShotSender.onMessage, .resetFn = noReset },
         .until = 100,
         .max_live_bytes = 3, // "hello" is 5 bytes -- too small on purpose
     };
@@ -1265,7 +1465,7 @@ test "build: Case.max_live_bytes reaches the Sim it builds (audit F11)" {
     const roomy_case = Case{
         .seed = 1,
         .scenario = scenario,
-        .protocol = .{ .ctx = &unused, .onStartFn = OneShotSender.onStart, .onMessageFn = OneShotSender.onMessage },
+        .protocol = .{ .ctx = &unused, .onStartFn = OneShotSender.onStart, .onMessageFn = OneShotSender.onMessage, .resetFn = noReset },
         .until = 100,
         .max_live_bytes = 1000,
     };

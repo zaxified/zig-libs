@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — Consumer-side follow-up to the `netsim` A1 fix campaign
+  (F2/F3/F6): `netsim.Protocol.resetFn` is mandatory now, so
+  `StepDownProbe.reset`'s `inner.resetFn.?(inner.ctx)` no longer compiles
+  (`resetFn` is not an optional to unwrap) — dropped the `.?`. And
+  `BrokenRaft` fires unconditionally, with no injected fault (documented:
+  "Fires on a clean run with no injected faults"), so `netsim`'s shrinker
+  now correctly reduces its counterexample to the EMPTY fault set instead
+  of a pre-fix floor of `>= 1` — the "shrink" test's assertion updated from
+  `if (res.before >= 1) try testing.expect(res.after >= 1);` to
+  `try testing.expectEqual(@as(usize, 0), res.after);`. No behavioural
+  change to `raft` itself. `scripts/modtest raft`: 61/61.
+
 - **2026-09-07** — **All five wire-decoder fuzz harnesses were replaying an EMPTY
   slice, and the lying-count frame they exist for had never been built.**
 
