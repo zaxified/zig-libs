@@ -148,6 +148,37 @@ pub const Options = struct {
     mime_overrides: []const MimeOverride = &.{},
     /// `Content-Type` when the extension matches nothing.
     default_mime: []const u8 = "application/octet-stream",
+    /// Emit `ETag` as a STRONG validator (`"<size:hex>-<mtime_seconds:hex>"`,
+    /// no `W/` prefix) instead of the default weak one. Default false (A1
+    /// F5, round-2 Q8 — safe default + opt-in for the exception): the tag's
+    /// granularity is one SECOND of `mtime`, so a same-second, same-size
+    /// edit (an atomic `rename` over a file of identical length — a config
+    /// flip, a redeployed `.json` with one boolean changed) does not change
+    /// the strong tag despite RFC 9110 §8.8.1 requiring a strong validator
+    /// to change on every representation edit, and a strong tag authorizes
+    /// `If-Range` to splice bytes from two file versions into one response
+    /// (see SPEC.md). A weak tag closes both: `ifRangeAllows` rejects a weak
+    /// validator outright (falls back to a full 200, never a spliced 206),
+    /// and `If-None-Match`'s weak comparison is exactly as forgiving as
+    /// before. **The cost:** `If-Range`-conditioned byte-range RESUME never
+    /// succeeds for any client (weak validators cannot authorize a range
+    /// response at all, RFC 9110 §13.1.5) — set this to `true` only when
+    /// resumable downloads matter more than the same-second edit gap, and
+    /// preferably alongside a deploy process that does not do same-size
+    /// same-second in-place edits.
+    strong_etag: bool = false,
+    /// Redirect (301) a directory URL missing its trailing slash to the
+    /// slash-terminated form, matching Go `net/http` `FileServer` — the
+    /// model this module names itself after — and nginx. Default true (A1
+    /// F17, round-2 Q8 — safe default + opt-out): without this, `/sub` and
+    /// `/sub/` silently serve the identical `sub/index.html` under two
+    /// different URLs, and any relative link/asset INSIDE that page (e.g.
+    /// `<link href="style.css">`) resolves against whichever one the
+    /// browser's address bar shows — correct only from `/sub/`, one
+    /// directory too high from `/sub`. Set false to keep the pre-fix dual
+    /// serving (e.g. a caller with its own, different rules for bare vs.
+    /// slash-terminated directory URLs upstream of this handler).
+    redirect_to_trailing_slash: bool = true,
 };
 
 // ── MIME table ───────────────────────────────────────────────────────────────
@@ -539,6 +570,16 @@ fn isSymlinkComponent(parent: Dir, io: Io, seg: []const u8) bool {
 fn mapOpenError(e: anyerror) error{ NotFound, Forbidden, IoError } {
     return switch (e) {
         error.FileNotFound, error.NotDir => error.NotFound,
+        // A1 F13 (round-2 Q5): a single path segment over `NAME_MAX` fell
+        // into `else` -> 500, read by the client as a server fault, when it
+        // is entirely client-supplied input. RFC 9110 §15.5.15's 414 is
+        // about a target URI longer than THIS SERVER is willing to
+        // interpret — the request line / header budgets (`max_header_bytes`
+        // etc.) already answer that one level up, before this handler ever
+        // runs; a segment too long for the FILESYSTEM to hold is a
+        // different fact; no file of that name can exist, so it is exactly
+        // what every other "this name cannot exist" case here maps to.
+        error.NameTooLong => error.NotFound,
         // O_NOFOLLOW on a symlink, or a resolve-beneath / permission refusal:
         // treat as forbidden rather than leak existence.
         error.SymLinkLoop, error.AccessDenied, error.PermissionDenied => error.Forbidden,
@@ -585,13 +626,32 @@ pub const Handler = struct {
             return;
         }
 
-        var resolved = h.resolveForServe(req.path) catch |e| switch (e) {
+        var via_directory = false;
+        var resolved = h.resolveForServe(req.path, &via_directory) catch |e| switch (e) {
             error.Traversal, error.DotfileForbidden, error.InvalidByte, error.Forbidden => return sendStatus(rw, 403),
             error.Malformed => return sendStatus(rw, 400),
             error.TooLong => return sendStatus(rw, 414),
             error.NotFound => return sendStatus(rw, 404),
             error.IoError => return sendStatus(rw, 500),
         };
+        // A1 F17 (round-2 Q8): a directory route reached by a URL missing
+        // its trailing slash is canonicalized with a redirect BEFORE
+        // anything is served at the bare URL — matching Go `net/http`
+        // `FileServer` / nginx, and avoiding the "relative links inside the
+        // page resolve one directory too high" class of bug a silent dual
+        // serve invites.
+        if (via_directory and h.options.redirect_to_trailing_slash and
+            (req.path.len == 0 or req.path[req.path.len - 1] != '/'))
+        {
+            switch (resolved) {
+                .opened => |*opened| opened.close(h.io),
+                .dir_listing => |dh| {
+                    var dirhandle = dh;
+                    if (dirhandle.owned) dirhandle.dir.close(h.io);
+                },
+            }
+            return redirectTrailingSlash(req, rw);
+        }
         switch (resolved) {
             .opened => |*opened| {
                 defer opened.close(h.io);
@@ -626,7 +686,7 @@ pub const Handler = struct {
         // below, not the response.
         var etag_buf: [etag_max]u8 = undefined;
         var lastmod_buf: [http.Server.http_date_len]u8 = undefined;
-        const etag = buildETag(&etag_buf, total, mtime_s);
+        const etag = buildETag(&etag_buf, total, mtime_s, !h.options.strong_etag);
 
         // Validators first, so a 304/412 short-circuit carries ETag +
         // Last-Modified + Cache-Control (and nothing representation-specific).
@@ -790,12 +850,21 @@ pub const Handler = struct {
     /// policy — the public `resolveFile`/`openWithinRoot` are untouched,
     /// byte-for-byte, and keep their documented `Opened-or-error.IsDir`
     /// contract for any caller that still wants it.
-    fn resolveForServe(h: *const Handler, raw_path: []const u8) (SanitizeError || ServeResolveError)!ServeResolve {
+    /// `via_directory.*` is set to whether the resolution went through a
+    /// DIRECTORY route (root, or a leaf that turned out to be a directory)
+    /// as opposed to a plain leaf file — `serve` uses it to decide whether
+    /// a missing trailing slash needs a redirect first (A1 F17). Always
+    /// set, on every return path including errors.
+    fn resolveForServe(h: *const Handler, raw_path: []const u8, via_directory: *bool) (SanitizeError || ServeResolveError)!ServeResolve {
+        via_directory.* = false;
         var buf: [max_path_bytes]u8 = undefined;
         const rel = try sanitizePath(raw_path, &buf, .{ .allow_dotfiles = h.options.serve_dotfiles });
         const follow = h.options.follow_symlinks;
 
-        if (rel.len == 0) return openIndexOrListing(h.root, h.root, h.io, h.options, false);
+        if (rel.len == 0) {
+            via_directory.* = true;
+            return openIndexOrListing(h.root, h.root, h.io, h.options, false);
+        }
 
         const last_slash = mem.lastIndexOfScalar(u8, rel, '/');
         const dir_part: []const u8 = if (last_slash) |s| rel[0..s] else "";
@@ -831,6 +900,7 @@ pub const Handler = struct {
             .resolve_beneath = true,
         }) catch |e| switch (e) {
             error.IsDir => {
+                via_directory.* = true;
                 // The leaf IS a directory: open it ONCE, with `.iterate`
                 // (unlike `openWithinRoot`'s own copy of this branch, which
                 // never needs to list it), and either find an index inside
@@ -900,23 +970,27 @@ pub fn httpHandler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) a
 
 // ── response helpers ─────────────────────────────────────────────────────────
 
-/// A strong `ETag` from size + mtime: `"<size:x>-<mtime:x>"`, written into
-/// `buf` (the caller's — `setHeader` copies at call time, so `buf` only has
-/// to outlive the calls made with the returned slice, not the response).
-/// Cheap (no file read) and changes on any content edit that moves size or
-/// mtime. Documented alternative (content hash) is intentionally not the
-/// default — see SPEC.md.
-/// Widest `"{x}-{x}"` this can produce: two quotes, a separator, and two u64s
+/// An `ETag` from size + mtime: `"<size:x>-<mtime:x>"`, weak (`W/` prefix)
+/// unless `weak` is false, written into `buf` (the caller's — `setHeader`
+/// copies at call time, so `buf` only has to outlive the calls made with the
+/// returned slice, not the response). Cheap (no file read) and changes on
+/// any content edit that moves size or mtime. Documented alternative
+/// (content hash) is intentionally not the default — see SPEC.md.
+/// Widest this can produce: `W/` plus two quotes, a separator, and two u64s
 /// at 16 hex digits each. DERIVED rather than picked, because `bufPrint`'s
 /// failure here is `catch unreachable` — a buffer one byte short would not be
 /// an error, it would be a crash on the first large file. It was a bare 48
 /// until 2026-08-12, which happened to be enough; shrinking it to 24 broke no
 /// test, since nothing exercised a size or mtime big enough to need the room.
-const etag_max = 2 + 1 + 2 * 16;
+/// +2 for `W/` (A1 F5, round-2 Q8) on top of that same 24.
+const etag_max = 2 + 2 + 1 + 2 * 16;
 
-fn buildETag(buf: *[etag_max]u8, size: u64, mtime_s: i64) []const u8 {
+fn buildETag(buf: *[etag_max]u8, size: u64, mtime_s: i64, weak: bool) []const u8 {
     const m: u64 = if (mtime_s < 0) 0 else @intCast(mtime_s);
-    return std.fmt.bufPrint(buf, "\"{x}-{x}\"", .{ size, m }) catch unreachable;
+    return if (weak)
+        std.fmt.bufPrint(buf, "W/\"{x}-{x}\"", .{ size, m }) catch unreachable
+    else
+        std.fmt.bufPrint(buf, "\"{x}-{x}\"", .{ size, m }) catch unreachable;
 }
 
 /// Content-Length is both consumed immediately by `setHeader` (parsed into an
@@ -949,6 +1023,24 @@ fn setContentLength(rw: *http.Server.ResponseWriter, n: u64) void {
 /// Set a bare status with an empty body (no representation headers).
 fn sendStatus(rw: *http.Server.ResponseWriter, status: u16) Writer.Error!void {
     rw.setStatus(status);
+    setContentLength(rw, 0);
+}
+
+/// A1 F17: 301 to `req.path` + `/` (+ `?` + query, if any) — the directory
+/// route's canonical, slash-terminated URL. `req.path`/`req.query` are
+/// already bounded (by `max_path_bytes` and the `http` request-line/header
+/// caps respectively), so the fixed buffer below is sized generously rather
+/// than derived; on the astronomically unlikely overflow this answers 500
+/// rather than send a truncated `Location` a client would follow to the
+/// wrong place.
+fn redirectTrailingSlash(req: *http.Server.Request, rw: *http.Server.ResponseWriter) Writer.Error!void {
+    var buf: [max_path_bytes + 1 + max_path_bytes]u8 = undefined;
+    const location = (if (req.query.len != 0)
+        std.fmt.bufPrint(&buf, "{s}/?{s}", .{ req.path, req.query })
+    else
+        std.fmt.bufPrint(&buf, "{s}/", .{req.path})) catch return failUnsafeResponse(rw);
+    rw.setStatus(301);
+    rw.setHeader("Location", location) catch return failUnsafeResponse(rw);
     setContentLength(rw, 0);
 }
 
@@ -1448,7 +1540,7 @@ test "serve: a 304 whose ETag cannot be written is not sent as a 304" {
     var out: [8192]u8 = undefined;
     const ok = runVia(tablePressureHandler, &h, wire, &out);
     try testing.expectEqual(@as(u16, 304), statusOf(ok));
-    try testing.expect(mem.indexOf(u8, ok, "ETag: \"") != null);
+    try testing.expect(mem.indexOf(u8, ok, "ETag: W/\"") != null); // weak by default, A1 F5
     try testing.expect(mem.indexOf(u8, ok, "hello world") == null);
 
     // Now with the header table spent and `Content-Type` already in it, so
@@ -1557,7 +1649,10 @@ test "serveDirectory: a listing that cannot be labelled text/html answers 500, n
     var fx = try Fixture.init();
     defer fx.deinit();
     var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true });
-    const wire = "GET /sub HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    // Trailing slash: this test is about `serveDirectory`'s sniffing-safety
+    // escalation, not about F17's redirect, so the request already names
+    // the canonical directory URL.
+    const wire = "GET /sub/ HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
 
     // Positive control: the listing this handler would otherwise emit.
     var out: [8192]u8 = undefined;
@@ -1597,7 +1692,9 @@ test "serve: 200 with correct Content-Type, ETag, Last-Modified, body" {
     const resp = get(&h, "/hello.txt", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
     try testing.expect(mem.indexOf(u8, resp, "Content-Type: text/plain; charset=utf-8\r\n") != null);
-    try testing.expect(mem.indexOf(u8, resp, "ETag: \"") != null);
+    // Weak by default since A1 F5 (round-2 Q8) — see the dedicated F5 tests
+    // for why; this test is just checking an ETag is present at all.
+    try testing.expect(mem.indexOf(u8, resp, "ETag: W/\"") != null);
     try testing.expect(mem.indexOf(u8, resp, "Last-Modified: ") != null);
     try testing.expect(mem.indexOf(u8, resp, "Accept-Ranges: bytes\r\n") != null);
     // A1 F18: nosniff alongside the correct Content-Type — defense in
@@ -1669,18 +1766,70 @@ test "serve: directory request serves index.html" {
     // its comment claimed a 404 that the code never sends — `serveDirectory`
     // answers 403 for "no index, listing off" (confirmed against SPEC.md
     // and against `serveDirectory`'s own `sendStatus(rw, 403)`), not 404.
-    for ([_][]const u8{ "/", "/sub", "/sub/" }) |p| {
+    //
+    // A1 F17: "/sub" (no trailing slash) no longer reaches the SAME
+    // resolution as "/sub/" — it is a directory route missing its slash, so
+    // it redirects before `serveDirectory` (or an index lookup) ever runs.
+    // "/" is the one path with no non-slash form to begin with.
+    for ([_][]const u8{ "/", "/sub/" }) |p| {
         const resp = get(&h, p, &out);
         if (mem.eql(u8, p, "/")) {
             // "/" has an index → served.
             try testing.expectEqual(@as(u16, 200), statusOf(resp));
             try testing.expect(mem.endsWith(u8, resp, "<h1>home</h1>"));
         } else {
-            // "/sub" and "/sub/" have no index and listing is off → 403,
-            // per SPEC.md and `serveDirectory`'s `directory_listing` gate.
+            // "/sub/" has no index and listing is off → 403, per SPEC.md
+            // and `serveDirectory`'s `directory_listing` gate.
             try testing.expectEqual(@as(u16, 403), statusOf(resp));
         }
     }
+
+    const bare = get(&h, "/sub", &out);
+    try testing.expectEqual(@as(u16, 301), statusOf(bare));
+    try testing.expect(mem.indexOf(u8, bare, "Location: /sub/\r\n") != null);
+}
+
+test "serve: a directory URL missing its trailing slash redirects to the canonical one (A1 F17)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var out: [4096]u8 = undefined;
+
+    // `sub/dir` has no index.html in the fixture — same shape as the other
+    // test above, redirect first either way. What THIS test adds: the
+    // query string, the opt-out, and that a plain file is never touched.
+    var h = Handler.init(testing.io, fx.root, .{});
+    const bare = get(&h, "/sub/dir", &out);
+    try testing.expectEqual(@as(u16, 301), statusOf(bare));
+    try testing.expect(mem.indexOf(u8, bare, "Location: /sub/dir/\r\n") != null);
+    try testing.expect(mem.indexOf(u8, bare, "nested") == null); // no body served yet
+
+    // Query string survives the redirect.
+    const with_query = get(&h, "/sub/dir?x=1", &out);
+    try testing.expectEqual(@as(u16, 301), statusOf(with_query));
+    try testing.expect(mem.indexOf(u8, with_query, "Location: /sub/dir/?x=1\r\n") != null);
+
+    // The canonical form reaches the SAME outcome the bare form would have
+    // reached anyway (403: no index, listing off) — this is a redirect to
+    // the equivalent resolution, not a status change. Own buffer: held
+    // alongside `bare_off` below for the byte-identity comparison.
+    var out_slash: [4096]u8 = undefined;
+    const slash = get(&h, "/sub/dir/", &out_slash);
+    try testing.expectEqual(@as(u16, 403), statusOf(slash));
+
+    // Opt-out (`redirect_to_trailing_slash = false`): the pre-fix dual
+    // serve is available for a caller that needs it — same 403 as the
+    // canonical form above, reached WITHOUT a redirect this time.
+    var h_off = Handler.init(testing.io, fx.root, .{ .redirect_to_trailing_slash = false });
+    var out_off: [4096]u8 = undefined;
+    const bare_off = get(&h_off, "/sub/dir", &out_off);
+    try testing.expectEqual(@as(u16, 403), statusOf(bare_off));
+    try testing.expect(mem.indexOf(u8, bare_off, "Location:") == null);
+    try testing.expectEqualStrings(slash, bare_off); // same content, no redirect either way
+
+    // A plain FILE (never a directory route) is never redirected, whatever
+    // its name looks like.
+    const file_resp = get(&h, "/hello.txt", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(file_resp));
 }
 
 test "serve: nested path (positive control) is served" {
@@ -1800,7 +1949,9 @@ test "serve: a directory-listing request opens its target directory once, not tw
     var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true });
     test_f11_leaf_dir_opens = 0;
     var out: [8192]u8 = undefined;
-    const resp = get(&h, "/sub/dir", &out);
+    // Trailing slash: this test measures `resolveForServe`'s open count,
+    // not F17's redirect — a bare "/sub/dir" would redirect first.
+    const resp = get(&h, "/sub/dir/", &out);
     try testing.expectEqual(@as(u16, 200), statusOf(resp));
     try testing.expect(mem.indexOf(u8, resp, "<li>file.txt</li>") != null);
     try testing.expectEqual(@as(usize, 1), test_f11_leaf_dir_opens);
@@ -2019,6 +2170,32 @@ test "serve: 304 on matching If-None-Match / If-Modified-Since" {
     try testing.expectEqual(@as(u16, 304), statusOf(runRequest(&h, ims, &out2)));
 }
 
+test "serve: a path segment over NAME_MAX answers 404, not 500 (A1 F13)" {
+    // `mapOpenError`'s `else` branch used to catch `error.NameTooLong` and
+    // map it to `IoError` -> 500, read by the client as a server fault for
+    // input it supplied. No file of a name this long can ever exist on the
+    // filesystem, so this is the exact same fact every `FileNotFound` case
+    // here already answers 404 to.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var wire_buf: [1024]u8 = undefined;
+    const too_long_name = "A" ** 300; // NAME_MAX is 255 on Linux
+    const wire = std.fmt.bufPrint(&wire_buf, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{too_long_name}) catch unreachable;
+    var out: [1024]u8 = undefined;
+    const resp = runRequest(&h, wire, &out);
+    try testing.expectEqual(@as(u16, 404), statusOf(resp));
+
+    // Positive control: a name just inside the limit that genuinely does
+    // not exist also answers 404 — proves this is the SAME code path, not
+    // a special case for "too long" alone.
+    var wire_buf2: [1024]u8 = undefined;
+    const ok_len_name = "B" ** 254;
+    const wire2 = std.fmt.bufPrint(&wire_buf2, "GET /{s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{ok_len_name}) catch unreachable;
+    const resp2 = runRequest(&h, wire2, &out);
+    try testing.expectEqual(@as(u16, 404), statusOf(resp2));
+}
+
 test "serve: 206 + Content-Range on a range, 416 on unsatisfiable" {
     var fx = try Fixture.init();
     defer fx.deinit();
@@ -2062,7 +2239,11 @@ test "serve: a 206 range response is never gzip-compressed, even with Accept-Enc
 test "serve: ETag reaches the wire weak when the response is actually gzip-compressed (A1 http/staticfiles F6)" {
     var fx = try Fixture.init();
     defer fx.deinit();
-    var h = Handler.init(testing.io, fx.root, .{});
+    // `strong_etag = true`: this test is specifically about `http`'s gzip
+    // seam turning a STRONG tag weak on the wire (F6) — a baseline that is
+    // already weak by F5's own default would not distinguish "F6 weakened
+    // it" from "F5's default already made it weak".
+    var h = Handler.init(testing.io, fx.root, .{ .strong_etag = true });
     var out: [4096]u8 = undefined;
 
     const plain = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
@@ -2384,7 +2565,13 @@ test "interop (starlette oracle) DIVERGES: a Range with an unrecognized unit is 
 test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, a current one keeps the 206" {
     var fx = try Fixture.init();
     defer fx.deinit();
-    var h = Handler.init(testing.io, fx.root, .{});
+    // A1 F5 (round-2 Q8) made the DEFAULT `ETag` weak, and a weak validator
+    // can never authorize `If-Range` (that is the whole point of F5's fix —
+    // see the dedicated test below). This test is about `ifRangeAllows`'s
+    // mechanism specifically — stale-vs-current, strong-vs-weak — so it
+    // opts into `strong_etag` to keep a validator strength that CAN
+    // authorize a range, same as before F5 existed as a choice at all.
+    var h = Handler.init(testing.io, fx.root, .{ .strong_etag = true });
     var out: [4096]u8 = undefined;
     var wire: [512]u8 = undefined;
 
@@ -2426,6 +2613,33 @@ test "If-Range (RFC 9110 §13.1.5): a stale validator falls back to a full 200, 
     try testing.expect(mem.endsWith(u8, no_range, "hello world"));
 }
 
+test "serve: with the DEFAULT weak ETag, If-Range never authorizes a range — not even with the current, served tag (A1 F5)" {
+    // The direct behavioral proof of F5's fix, as distinct from the test
+    // above (which deliberately opts INTO `strong_etag` to keep testing
+    // `ifRangeAllows`'s own stale/current logic). Under the default this
+    // is the exact splice risk F5 closes: a same-second, same-size edit
+    // would keep the OLD strong tag unchanged, so a resuming client's
+    // `If-Range` would splice bytes from two file versions. Weak means
+    // `If-Range` can never authorize a 206 at all, regardless of staleness.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{}); // strong_etag defaults false
+    var out: [4096]u8 = undefined;
+    var wire: [512]u8 = undefined;
+
+    const first = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    const etag = extractHeader(first, "ETag: ") orelse return error.NoETag;
+    try testing.expect(mem.startsWith(u8, etag, "W/\""));
+
+    const req = std.fmt.bufPrint(&wire, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=0-4\r\n" ++
+        "If-Range: {s}\r\nConnection: close\r\n\r\n", .{etag}) catch unreachable;
+    var buf: [4096]u8 = undefined;
+    const resp = runRequest(&h, req, &buf);
+    // Falls back to a full 200, not the 206 the pre-F5 strong default gave.
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.endsWith(u8, resp, "hello world"));
+}
+
 test "buildETag / setContentLength: the widest possible values still fit" {
     // The buffers behind both are sized by derivation and their overflow path
     // is `catch unreachable`, so being wrong is a crash rather than an error.
@@ -2433,9 +2647,15 @@ test "buildETag / setContentLength: the widest possible values still fit" {
     // test, because every fixture used small sizes and recent mtimes. These
     // two calls are the widest inputs the types admit.
     var etag_buf: [etag_max]u8 = undefined;
-    const widest = buildETag(&etag_buf, std.math.maxInt(u64), std.math.maxInt(i64));
-    try std.testing.expectEqualStrings("\"ffffffffffffffff-7fffffffffffffff\"", widest);
-    try std.testing.expect(widest.len <= etag_max);
+    const widest_strong = buildETag(&etag_buf, std.math.maxInt(u64), std.math.maxInt(i64), false);
+    try std.testing.expectEqualStrings("\"ffffffffffffffff-7fffffffffffffff\"", widest_strong);
+    try std.testing.expect(widest_strong.len <= etag_max);
+    // The weak form (the default, A1 F5) is two bytes wider still — the one
+    // that actually determines `etag_max`.
+    var etag_buf2: [etag_max]u8 = undefined;
+    const widest_weak = buildETag(&etag_buf2, std.math.maxInt(u64), std.math.maxInt(i64), true);
+    try std.testing.expectEqualStrings("W/\"ffffffffffffffff-7fffffffffffffff\"", widest_weak);
+    try std.testing.expect(widest_weak.len <= etag_max);
 
     var clen_buf: [20]u8 = undefined;
     const n = try std.fmt.bufPrint(&clen_buf, "{d}", .{@as(u64, std.math.maxInt(u64))});

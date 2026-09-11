@@ -9,7 +9,7 @@ The two make-or-break invariants:
 1. **Containment.** A served file is *always* inside the configured root. No request — under any
    percent-encoding, path separator, `..` sequence, NUL byte or symlink — ever reads a byte
    outside it.
-2. **No panics.** Every failure maps to an HTTP status (400/403/404/405/414/416/500); only a
+2. **No panics.** Every failure maps to an HTTP status (301/400/403/404/405/414/416/500); only a
    genuine response-write failure propagates (so the server can close the connection).
 
 ## 1. Path-traversal threat model
@@ -101,10 +101,20 @@ Go's `net/http` `FileServer` and nginx make, not a gap specific to this module).
 ### Validators
 
 - **`Last-Modified`**: the file's mtime (`stat.mtime`), formatted as an IMF-fixdate.
-- **`ETag`**: a **strong** tag `"<size:hex>-<mtime_seconds:hex>"`. This is the cheap default — no
-  file read, and it changes on any edit that moves the size or mtime. A content hash (strong
-  against mtime-only touches, at the cost of reading the file) is the documented alternative; it is
-  intentionally not the default because it turns every conditional GET into a full read.
+- **`ETag`**: `"<size:hex>-<mtime_seconds:hex>"`, **weak** (`W/` prefix) by default since A1 F5
+  (round-2 Q8, 2026-09-11) — `Options.strong_etag = true` reverts to the pre-fix strong form. Weak
+  is the safe choice: `mtime`'s granularity is one SECOND, so a same-second, same-size edit (an
+  atomic `rename` over a file of identical length) leaves a STRONG tag unchanged despite RFC 9110
+  §8.8.1 requiring a strong validator to change on every representation edit — and a strong tag
+  authorizes `If-Range` to splice bytes from two file versions into one response (RFC 9110
+  §13.1.5). A weak tag cannot authorize `If-Range` at all, closing the splice outright; the cost is
+  that byte-range RESUME never succeeds for any client, since a weak validator can never authorize
+  a range response either. `Options.strong_etag` exists for an operator who needs resume and either
+  accepts that gap or does not do same-size same-second in-place edits. Computing the tag is cheap
+  either way — no file read — and it changes on any edit that moves the size or mtime. A content
+  hash (strong against same-second, same-size touches too, at the cost of reading the file) is the
+  documented alternative to `strong_etag`; it is intentionally not offered because it turns every
+  conditional GET into a full read.
 
 Both computed header values live in plain locals, not threadlocal scratch: the response writer's
 `setHeader` copies the bytes into its own storage at call time (`http`'s `putHeader` → `dupe`), so
@@ -138,10 +148,19 @@ writes no body.
 
 ### Directory handling
 
-A directory request resolves to `Options.index` (`index.html`). With no index: **403** by default,
-or an HTML listing when `directory_listing = true`. Listing entry names are HTML-escaped
-(`& < > " '`) so a crafted filename cannot inject markup; dotfile entries are skipped unless
-`serve_dotfiles` is set.
+A URL naming a directory but missing its trailing slash is redirected **301** to the
+slash-terminated form first (`Options.redirect_to_trailing_slash`, default true — A1 F17,
+round-2 Q8), matching Go `net/http` `FileServer` / nginx: `GET /sub` → `301 Location: /sub/`, query
+string preserved. Without this, `/sub` and `/sub/` silently served the identical content under two
+different URLs, and a relative link/asset inside that page resolves against whichever one the
+browser's address bar shows — correct only from the slash-terminated form. Set
+`redirect_to_trailing_slash = false` to keep the pre-fix dual serving. A plain file is never
+redirected regardless of its name.
+
+Past that redirect, a directory request resolves to `Options.index` (`index.html`). With no index:
+**403** by default, or an HTML listing when `directory_listing = true`. Listing entry names are
+HTML-escaped (`& < > " '`) so a crafted filename cannot inject markup; dotfile entries are skipped
+unless `serve_dotfiles` is set.
 
 ### Cache-Control
 
@@ -153,10 +172,11 @@ or an HTML listing when `directory_listing = true`. Listing entry names are HTML
 | Condition | Status |
 |---|---|
 | Non-GET/HEAD method | 405 (+ `Allow: GET, HEAD`) |
+| Directory URL missing its trailing slash (A1 F17, default on) | 301 (+ `Location`) |
 | Traversal / dotfile / backslash-or-NUL / forbidden (symlink, non-regular file, escape) | 403 |
 | Malformed percent-encoding | 400 |
 | Decoded path too long | 414 |
-| Missing file/directory | 404 |
+| Missing file/directory, or a single path segment over the filesystem's `NAME_MAX` (A1 F13, round-2 Q5: no file of that name can exist, same fact as any other missing name) | 404 |
 | Unsatisfiable range | 416 |
 | Real I/O / filesystem failure | 500 |
 | 304 / 412 | per conditional evaluation |
