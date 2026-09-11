@@ -536,7 +536,7 @@ fn isSymlinkComponent(parent: Dir, io: Io, seg: []const u8) bool {
     return st.kind == .sym_link;
 }
 
-fn mapOpenError(e: anyerror) ResolveError {
+fn mapOpenError(e: anyerror) error{ NotFound, Forbidden, IoError } {
     return switch (e) {
         error.FileNotFound, error.NotDir => error.NotFound,
         // O_NOFOLLOW on a symlink, or a resolve-beneath / permission refusal:
@@ -585,16 +585,24 @@ pub const Handler = struct {
             return;
         }
 
-        var opened = resolveFile(h.root, h.io, req.path, h.options) catch |e| switch (e) {
+        var resolved = h.resolveForServe(req.path) catch |e| switch (e) {
             error.Traversal, error.DotfileForbidden, error.InvalidByte, error.Forbidden => return sendStatus(rw, 403),
             error.Malformed => return sendStatus(rw, 400),
             error.TooLong => return sendStatus(rw, 414),
             error.NotFound => return sendStatus(rw, 404),
-            error.IsDir => return h.serveDirectory(req, rw),
             error.IoError => return sendStatus(rw, 500),
         };
-        defer opened.close(h.io);
-        return h.sendFile(req, rw, &opened);
+        switch (resolved) {
+            .opened => |*opened| {
+                defer opened.close(h.io);
+                return h.sendFile(req, rw, opened);
+            },
+            .dir_listing => |dh| {
+                var dirhandle = dh;
+                defer if (dirhandle.owned) dirhandle.dir.close(h.io);
+                return h.serveDirectory(req, rw, dirhandle);
+            },
+        }
     }
 
     /// Emit the representation headers + body (or 304/412/206/416) for an
@@ -724,19 +732,10 @@ pub const Handler = struct {
     }
 
     /// A directory with no index file: list it (opt-in, HTML-escaped) or 403.
-    fn serveDirectory(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter) Writer.Error!void {
+    /// `dh` is ALREADY the resolved, already-open directory handle from
+    /// `resolveForServe` (A1 F11) — this no longer re-walks the path itself.
+    fn serveDirectory(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, dh: DirHandle) Writer.Error!void {
         if (!h.options.directory_listing) return sendStatus(rw, 403);
-
-        // Re-walk to the directory (the resolve pass opened it only to look for
-        // an index). Same one-component-at-a-time, no-follow discipline.
-        var dh = h.openDirWithinRoot(req.path) catch |e| switch (e) {
-            error.Traversal, error.DotfileForbidden, error.InvalidByte, error.Forbidden => return sendStatus(rw, 403),
-            error.Malformed => return sendStatus(rw, 400),
-            error.TooLong => return sendStatus(rw, 414),
-            error.NotFound, error.IsDir => return sendStatus(rw, 404),
-            error.IoError => return sendStatus(rw, 500),
-        };
-        defer if (dh.owned) dh.dir.close(h.io);
 
         rw.setStatus(200);
         // NOT best-effort, for the same reason as the file path above: this
@@ -761,43 +760,133 @@ pub const Handler = struct {
 
     const DirHandle = struct { dir: Dir, owned: bool };
 
-    /// Walk the sanitized `raw_path` as directories (every component, no-follow
-    /// by default), returning the target directory handle. `owned` is false
-    /// only for the root itself (which the handler owns and must not close).
-    fn openDirWithinRoot(h: *const Handler, raw_path: []const u8) (SanitizeError || ResolveError)!DirHandle {
+    /// What one resolve pass through `serve` can produce: either a regular
+    /// file ready to send, or an already-open directory (no index) ready to
+    /// list. See `resolveForServe`.
+    const ServeResolve = union(enum) {
+        opened: Opened,
+        dir_listing: DirHandle,
+    };
+
+    /// The error set `resolveForServe`/`openIndexOrListing` can actually
+    /// return — `ResolveError` minus `IsDir`: that case is consumed
+    /// internally and turned into `ServeResolve.dir_listing` instead of
+    /// being propagated as an error `serve` would have to re-resolve for.
+    const ServeResolveError = error{ Forbidden, NotFound, IoError };
+
+    /// Single resolve pass used by `serve` (A1 F11). The PUBLIC
+    /// `resolveFile`/`openWithinRoot` fold "directory with no index" into
+    /// `error.IsDir` and leave it to the caller to open the directory AGAIN
+    /// to list it — which is exactly what `serve`/`serveDirectory` used to
+    /// do, via a full second sanitize-and-walk from `h.root`. That is a
+    /// TOCTOU shape (a component's identity can change between the two
+    /// walks) and doubles the `openat` cost of every directory-listing
+    /// request. This does the SAME sanitization, the SAME one-component-at-
+    /// a-time no-follow walk and the SAME containment checks as
+    /// `openWithinRoot`'s own leaf-is-directory branch, but keeps the
+    /// already-open directory handle and hands it straight back for
+    /// listing instead of closing it and making `serveDirectory` re-walk.
+    /// It is an internal refactor of that one branch, not a new resolution
+    /// policy — the public `resolveFile`/`openWithinRoot` are untouched,
+    /// byte-for-byte, and keep their documented `Opened-or-error.IsDir`
+    /// contract for any caller that still wants it.
+    fn resolveForServe(h: *const Handler, raw_path: []const u8) (SanitizeError || ServeResolveError)!ServeResolve {
         var buf: [max_path_bytes]u8 = undefined;
         const rel = try sanitizePath(raw_path, &buf, .{ .allow_dotfiles = h.options.serve_dotfiles });
-        if (rel.len == 0) return .{ .dir = h.root, .owned = false };
+        const follow = h.options.follow_symlinks;
+
+        if (rel.len == 0) return openIndexOrListing(h.root, h.root, h.io, h.options, false);
+
+        const last_slash = mem.lastIndexOfScalar(u8, rel, '/');
+        const dir_part: []const u8 = if (last_slash) |s| rel[0..s] else "";
+        const leaf: []const u8 = if (last_slash) |s| rel[s + 1 ..] else rel;
 
         var parent: Dir = h.root;
-        var owned = false;
-        errdefer if (owned) parent.close(h.io);
-        var it = mem.splitScalar(u8, rel, '/');
-        while (it.next()) |seg| {
-            const next = parent.openDir(h.io, seg, .{
-                .follow_symlinks = h.options.follow_symlinks,
-                .access_sub_paths = true,
-                .iterate = true,
-            }) catch |e| {
-                // A1 F16, same shape as `openWithinRoot`'s walk.
-                if (!h.options.follow_symlinks and isSymlinkComponent(parent, h.io, seg))
-                    return error.Forbidden;
-                return mapOpenError(e);
-            };
-            if (owned) parent.close(h.io);
-            parent = next;
-            owned = true;
+        var parent_owned = false;
+        defer if (parent_owned) parent.close(h.io);
+
+        if (dir_part.len != 0) {
+            var it = mem.splitScalar(u8, dir_part, '/');
+            while (it.next()) |seg| {
+                // Same layer-2 hardening as `openWithinRoot` (A1 F3).
+                if (mem.eql(u8, seg, "..")) return error.Forbidden;
+                const next = parent.openDir(h.io, seg, .{
+                    .follow_symlinks = follow,
+                    .access_sub_paths = true,
+                }) catch |e| {
+                    if (!follow and isSymlinkComponent(parent, h.io, seg)) return error.Forbidden;
+                    return mapOpenError(e);
+                };
+                if (parent_owned) parent.close(h.io);
+                parent = next;
+                parent_owned = true;
+            }
         }
-        // A1 F1 (directory-listing shape): the walk above may have crossed
-        // a symlinked component when `follow_symlinks` is on, landing
-        // `parent` outside `root` even though every `openDir` call
-        // individually "succeeded". Verify containment before handing back
-        // a directory this handler is about to list. `errdefer` above
-        // closes `parent` on this error return.
-        if (h.options.follow_symlinks and owned) {
-            verifyContainedDir(h.root, h.io, parent) catch return error.Forbidden;
+
+        if (mem.eql(u8, leaf, "..")) return error.Forbidden;
+
+        const file = parent.openFile(h.io, leaf, .{
+            .follow_symlinks = follow,
+            .allow_directory = false,
+            .resolve_beneath = true,
+        }) catch |e| switch (e) {
+            error.IsDir => {
+                // The leaf IS a directory: open it ONCE, with `.iterate`
+                // (unlike `openWithinRoot`'s own copy of this branch, which
+                // never needs to list it), and either find an index inside
+                // it or keep it open for `serveDirectory`.
+                var d = parent.openDir(h.io, leaf, .{
+                    .follow_symlinks = follow,
+                    .access_sub_paths = true,
+                    .iterate = true,
+                }) catch |de| return mapOpenError(de);
+                test_f11_leaf_dir_opens += 1; // A1 F11 measurement
+                if (follow) {
+                    verifyContainedDir(h.root, h.io, d) catch {
+                        d.close(h.io);
+                        return error.Forbidden;
+                    };
+                }
+                return openIndexOrListing(d, h.root, h.io, h.options, true);
+            },
+            else => return mapOpenError(e),
+        };
+
+        var f = file;
+        const st = f.stat(h.io) catch {
+            f.close(h.io);
+            return error.IoError;
+        };
+        if (st.kind != .file) {
+            f.close(h.io);
+            return error.Forbidden;
         }
-        return .{ .dir = parent, .owned = owned };
+        if (follow) verifyContained(h.root, h.io, &f) catch {
+            f.close(h.io);
+            return error.Forbidden;
+        };
+        var o: Opened = .{ .file = f, .stat = st };
+        o.setMimeName(leaf);
+        return .{ .opened = o };
+    }
+
+    /// Try `dir`'s configured index file; on success, `dir` was only a
+    /// means to find it (close it if we own it). On `error.IsDir` (no
+    /// index configured, missing, or itself a directory), keep `dir` open
+    /// and hand it back as the directory to list instead of closing it —
+    /// this is the step that removes F11's second `openat` walk.
+    fn openIndexOrListing(dir_in: Dir, root: Dir, io: Io, opts: Options, dir_owned: bool) ServeResolveError!ServeResolve {
+        var dir = dir_in;
+        if (openIndex(dir, root, io, opts)) |opened| {
+            if (dir_owned) dir.close(io);
+            return .{ .opened = opened };
+        } else |e| switch (e) {
+            error.IsDir => return .{ .dir_listing = .{ .dir = dir, .owned = dir_owned } },
+            else => |e2| {
+                if (dir_owned) dir.close(io);
+                return e2;
+            },
+        }
     }
 };
 
@@ -1224,6 +1313,12 @@ fn statusOf(resp: []const u8) u16 {
     if (resp.len < 12) return 0;
     return std.fmt.parseInt(u16, resp[9..12], 10) catch 0;
 }
+
+/// A1 F11: counts how many times `resolveForServe` opens the REQUEST'S OWN
+/// target directory (the leaf-is-directory branch) during one `serve` call
+/// — the specific "doubled `openat`" F11 measured. Test-only instrumentation,
+/// same pattern as `test_leave_bytes`/`test_fill_table` below.
+var test_f11_leaf_dir_opens: usize = 0;
 
 /// A middleware that spends the response writer's 4 KiB header copy store
 /// before `staticfiles` gets to compose anything — one header sized so that
@@ -1667,6 +1762,28 @@ test "serve: a FIFO in the root is refused (403), not opened and blocked on (A1 
     // Positive control: an actual regular file next to it still serves 200
     // — the FIFO fixture did not disturb ordinary resolution.
     try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/hello.txt", &out)));
+}
+
+test "serve: a directory-listing request opens its target directory once, not twice (A1 F11)" {
+    // F11: `serveDirectory` used to re-walk the whole path from `h.root`
+    // via a second, independent `openDirWithinRoot`, because `resolveFile`'s
+    // own walk only opened the target directory to look for an index and
+    // then closed it before returning `error.IsDir`. That is a TOCTOU shape
+    // (the two walks can observe different filesystem state) as well as a
+    // doubled `openat` cost on every listing request. `resolveForServe` now
+    // does one walk and hands the already-open directory straight to
+    // `serveDirectory`. `test_f11_leaf_dir_opens` counts specifically the
+    // "open the request's own target directory" call, which is the one
+    // F11 found duplicated.
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{ .directory_listing = true });
+    test_f11_leaf_dir_opens = 0;
+    var out: [8192]u8 = undefined;
+    const resp = get(&h, "/sub/dir", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(resp));
+    try testing.expect(mem.indexOf(u8, resp, "<li>file.txt</li>") != null);
+    try testing.expectEqual(@as(usize, 1), test_f11_leaf_dir_opens);
 }
 
 test "serve: TRAVERSAL TEETH — every vector refused, secret never read" {

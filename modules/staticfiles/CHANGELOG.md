@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** a directory-listing request
+  (no index file, `directory_listing = true`) now resolves its target
+  directory once instead of twice (A1 F11 — the old `serve`/`serveDirectory`
+  split re-walked the whole path from the root a second time via a now-removed
+  `openDirWithinRoot`, a TOCTOU shape plus a doubled `openat` cost). The
+  public `resolveFile`/`openWithinRoot` contract, and every observable
+  status/body, is unchanged.
 - **2026-09-10** — A1 audit fix campaign (`staticfiles` has zero in-repo consumers, so input
   hardening/tightening needed no sign-off; see `DECISIONS.md` P1). Three HIGH findings, all
   containment/memory-safety, plus follow-on MED/LOW test and doc gaps:
