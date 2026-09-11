@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (performance fix):** A1/router.md F4 closed.
+  `matchRecDepth`'s backtracking search used to cost O(#nodes reachable within the query's
+  length) rather than O(query length) — a route table with the same static segment name
+  repeated at many depths, each with a `:param` sibling, is quadratic in table size (measured:
+  ~2.01 ms/call for a 250-route adversarial table, reproducing the audit's own ~2 ms figure). A
+  same-day memoization attempt measured 20-25x SLOWER (that construction's `:param` subtrees
+  are disjoint, so backtracking never revisits a node — nothing to cache). Fixed instead with
+  `Node.min_reach`: an admissible, incrementally-maintained lower bound on how many more
+  segments a query needs from a given node to reach any endpoint in its subtree, checked in
+  O(1) before descending into a child. Measured RED (bound removed) -> GREEN (bound restored):
+  2,011,872 ns/call -> 296 ns/call on the audit's exact construction, ~6,800x. All 46 existing
+  tests unchanged (`Node` is a private type; the check is a strictly necessary condition, so it
+  can never reject a reachable match) plus 1 new permanent regression test. All 18 in-repo
+  consumers re-verified unchanged (`scripts/modtest <m>` on each).
 - **2026-09-10** — **BEHAVIOURAL, security-relevant fix (user-approved, changes observable behavior
   for all 18 in-repo consumers)** — 404, 405, auto-`OPTIONS`, `.reject_non_canonical`'s 400, and the
   trailing-slash redirect now run the middleware chain of whichever `group()`'s prefix the request
