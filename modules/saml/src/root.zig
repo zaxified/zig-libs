@@ -733,7 +733,7 @@ fn verifyCovering(
             var res = xmldsig.verify(alloc, doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(doc, &res, asrt, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, doc, &res, asrt, config.id_attr)) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
         }
@@ -746,7 +746,7 @@ fn verifyCovering(
             var res = xmldsig.verify(alloc, doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
             if (asrt.parent != root) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
@@ -876,7 +876,7 @@ fn verifyCoveringDecrypted(
             var res = xmldsig.verify(alloc, inner_doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(inner_doc, &res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, inner_doc, &res, inner_root, config.id_attr)) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
         }
@@ -889,7 +889,7 @@ fn verifyCoveringDecrypted(
             var res = xmldsig.verify(alloc, outer_doc, sig, opts) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(outer_doc, &res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, outer_doc, &res, outer_root, config.id_attr)) return error.SignatureWrappingDetected;
             if (enc.parent != outer_root) return error.SignatureWrappingDetected;
             moveCert(alloc, &res, cert_out);
             return true;
@@ -977,13 +977,13 @@ fn decryptWrappedElement(
 /// one same-document `#id` Reference whose id resolves (through the SAML ID
 /// index) to `target` by pointer identity. Empty / external / multi-reference
 /// signatures fail closed.
-fn signedTargetMatches(doc: *const xml.Document, res: *const xmldsig.Result, target: *const xml.Element, id_attr: []const u8) bool {
+fn signedTargetMatches(alloc: std.mem.Allocator, doc: *const xml.Document, res: *const xmldsig.Result, target: *const xml.Element, id_attr: []const u8) std.mem.Allocator.Error!bool {
     if (res.references.len != 1) return false;
     const uri = res.references[0].uri;
     if (uri.len == 0 or uri[0] != '#') return false;
     const id = uri[1..];
     if (id.len == 0) return false;
-    const resolved = doc.findByAttr("", id_attr, id) orelse return false;
+    const resolved = (try doc.findByAttr(alloc, "", id_attr, id)) orelse return false;
     return resolved == target;
 }
 
@@ -2553,7 +2553,7 @@ pub fn consumeLogoutRequestXml(
             var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
         .redirect_verified => {},
     }
@@ -2732,7 +2732,7 @@ pub fn consumeLogoutResponseXml(
             var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
             defer res.deinit(alloc);
             if (!res.valid) return error.SignatureInvalid;
-            if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+            if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
         },
         .redirect_verified => {},
     }
@@ -3018,7 +3018,7 @@ pub fn consumeArtifactResponseSoap(alloc: std.mem.Allocator, soap_xml: []const u
     var res = xmldsig.verify(alloc, &doc, sig, sigOptsFor(config.idp_key, config.allow_weak_sha1, config.id_attr)) catch return error.SignatureInvalid;
     defer res.deinit(alloc);
     if (!res.valid) return error.SignatureInvalid;
-    if (!signedTargetMatches(&doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
+    if (!try signedTargetMatches(alloc, &doc, &res, root, config.id_attr)) return error.SignatureWrappingDetected;
 
     const status = childEl(root, samlp_ns, "Status") orelse return error.MalformedSoap;
     const status_code_el = childEl(status, samlp_ns, "StatusCode") orelse return error.MalformedSoap;

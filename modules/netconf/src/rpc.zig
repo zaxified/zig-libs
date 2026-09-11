@@ -804,7 +804,7 @@ test "edit-config carries default-operation / test-option / error-option and the
     // And the operation attribute really resolves to the base namespace.
     var doc = try xml.parse(gpa, got, .{ .doctype = .reject });
     defer doc.deinit();
-    const iface = doc.findByAttr(base_ns, "operation", "delete") orelse return error.TestExpectedEqual;
+    const iface = (try doc.findByAttr(gpa, base_ns, "operation", "delete")) orelse return error.TestExpectedEqual;
     try testing.expectEqualStrings("interface", iface.local);
 }
 

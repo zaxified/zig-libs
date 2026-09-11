@@ -5,6 +5,47 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign round 2 (`QUESTIONS-ROUND-2.md` Q5/Q7,
+  audit `A1/xml.md`, five findings closed). BEHAVIOURAL — see SPEC.md's new
+  "BEHAVIOURAL" section for the full rationale:
+  - **F3 (MED)**: line-ending normalization (XML 1.0 §2.11) now applies
+    inside comment and PI content, not just text/attribute values. A
+    document with a raw CR inside a comment or PI now canonicalizes
+    byte-for-byte identically to `xmllint --c14n` instead of one byte off
+    (verified black-box). BEHAVIOURAL for such documents' canonical form.
+  - **F4 (MED) and F9 sub-finding "M16" (LOW)**: `parseNameRaw` now decodes
+    UTF-8 and checks every name character against the real Unicode
+    `NameStartChar`/`NameChar` production, instead of accepting any byte
+    `>= 0x80` and never decoding a name's bytes independently of the
+    whole-document UTF-8 check. Four measured accept-direction divergences
+    from libxml2/expat (U+00B7 or U+0300 starting a name, U+00D7 mid-name)
+    are now rejected, verified black-box against `xmllint`/Python's expat.
+    BEHAVIOURAL: some previously-accepted non-ASCII-but-out-of-grammar names
+    are now `error.InvalidName`.
+  - **F7 (LOW)**: a PI target starting with `xml` (`xml-stylesheet`,
+    `xmlfoo`, …) is now accepted identically at byte 0 of the document and
+    everywhere else — only the exact target `xml` (any ASCII case) is
+    reserved per XML 1.0 §7. `parseXmlDecl` no longer errors on a
+    non-declaration `<?xml...` prefix; it now falls through to the ordinary
+    PI path. Verified black-box against `xmllint`/expat. BEHAVIOURAL: a
+    document with a `<?xml-stylesheet?>`-shaped PI at byte 0 is now accepted
+    instead of rejected.
+  - **F10 (LOW)**: `DoctypePolicy.ignore`'s DOCTYPE skip now tracks quote
+    state for the whole declaration, not only inside an internal subset's
+    `[...]`, so a literal `>` inside a `SYSTEM`/`PUBLIC` external identifier
+    literal no longer ends the skip early. Verified black-box. BEHAVIOURAL
+    for `.ignore` (not the default policy) with such a document.
+  - **"F5-zbytek" (MED, the second half of the earlier F5)**:
+    `Document.findByAttr` no longer recurses on the machine stack — same
+    fix and shape as `Element.textContent` (F5, 2026-09-10): an explicit
+    heap stack. Measured (ReleaseFast): the old recursive body succeeded at
+    depth 500,000 and SIGSEGV'd at depth 700,000; the new body succeeds past
+    2,000,000. **API change**: `findByAttr` now takes an
+    `std.mem.Allocator` and returns `std.mem.Allocator.Error!?*Element`
+    instead of `?*Element`. All three in-repo callers were fixed in the same
+    commit: `xmldsig.resolveReference`, `saml.signedTargetMatches` (7 call
+    sites), `netconf`'s `rpc.zig` test.
+
 - **2026-09-10** — A1 fix campaign (audit `A1/xml.md`, five findings closed):
   - **F1 (HIGH)**: `Element.inScopeNamespaces` was O(k^2) in the number of
     in-scope namespace declarations (rescanned everything collected so far
