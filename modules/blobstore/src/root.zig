@@ -1510,6 +1510,68 @@ test "F3: gc refuses stale_after_ns=0 instead of silently disarming the live-ing
     try std.Io.Dir.cwd().access(io, live_temp2.tmp, .{});
 }
 
+test "SUSPICION: gc reaps a live-but-silent put's temp under the DEFAULT stale_after_ns" {
+    // A1/blobstore.md's open suspicion (F3's dispositon left it unconfirmed):
+    // does `gc` collect a genuinely in-flight `put` (not abandoned crash
+    // debris) once its source has stalled past `stale_after_ns`? A real
+    // 10-minute-plus stall is not something a test suite should wait for, so
+    // this backdates the temp's ON-DISK mtime instead of touching any
+    // production code or injecting a fake clock into `Store` -- the same
+    // observable state a real 11-minutes-silent writer would leave behind.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    // A `put` that has streamed SOME bytes already (a real slow upload would
+    // have) and then stalled -- the temp is not abandoned, its writer (in
+    // this scenario) is just waiting on a slow source.
+    var tbuf: [768]u8 = undefined;
+    const live_temp = try store.casCreateTemp("slow-upload-still-streaming", &tbuf);
+    {
+        var wbuf: [64]u8 = undefined;
+        var fw = live_temp.file.writer(io, &wbuf);
+        try fw.interface.writeAll("partial content from a stalled reader");
+        try fw.interface.flush();
+        live_temp.file.close(io);
+    }
+    try std.Io.Dir.cwd().access(io, live_temp.tmp, .{}); // CONTROL: it exists
+
+    // Backdate mtime to just past the DEFAULT stale_after_ns (10 minutes) --
+    // the file has not been WRITTEN to in that long, which is exactly what
+    // `reapStaleIngestTemps` measures; nothing else about the "put" changed.
+    const old_ts = std.Io.Timestamp.now(io, .real).subDuration(.fromNanoseconds(11 * std.time.ns_per_min));
+    try std.Io.Dir.cwd().setTimestamps(io, live_temp.tmp, .{ .modify_timestamp = .{ .new = old_ts } });
+
+    // Internal negative control, same `gc` pass: a SECOND ingest temp,
+    // freshly created (mtime untouched), sits alongside the backdated one --
+    // if `gc` removed both, the result below would say nothing about mtime
+    // discrimination specifically.
+    var tbuf2: [768]u8 = undefined;
+    const fresh_temp = try store.casCreateTemp("just-started-streaming-too", &tbuf2);
+    fresh_temp.file.close(io);
+
+    // `gc` with the DEFAULT options -- nothing exotic, what any caller gets
+    // by not overriding `GcOptions`.
+    const stats = try store.gc(gpa, &.{}, .{});
+    try std.Io.Dir.cwd().access(io, fresh_temp.tmp, .{}); // CONTROL: the fresh one survived
+
+    // CONFIRMED, not refuted: the sweep has no liveness signal beyond mtime
+    // (no open-fd check, no lock on the temp itself), so a slow-but-alive
+    // ingest is indistinguishable from abandoned crash debris once it has
+    // been quiet for `stale_after_ns`. This is not a bug in
+    // `reapStaleIngestTemps` -- it does exactly what its own doc comment
+    // says -- it is confirmation that the DEFAULT 10-minute threshold offers
+    // no protection against a source that stalls that long. Left as a
+    // confirmed-but-unfixed finding: whether to raise the default, add a
+    // liveness check, or document the risk and leave it is a policy
+    // decision, not a mechanical correctness fix.
+    try t.expectEqual(@as(u64, 1), stats.temps_removed);
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, live_temp.tmp, .{}));
+}
+
 test "F5: an oversized refcount sidecar is never misread as a truncated smaller number" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

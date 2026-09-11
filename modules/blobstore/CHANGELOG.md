@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (test-only):** confirmed by measurement
+  (A1/blobstore.md's open "PODEZŘENÍ") that `gc`'s DEFAULT `stale_after_ns` (10 minutes)
+  offers no protection against a `put` whose source stalls that long — `reapStaleIngestTemps`
+  has no liveness signal beyond mtime, so a slow-but-alive ingest is indistinguishable from
+  abandoned crash debris once quiet for 10+ minutes. New test backdates a temp's on-disk
+  mtime (`std.Io.Dir.setTimestamps`) instead of waiting or injecting a fake clock — no
+  production code changed. Left open as a question for the user (raise the default? add a
+  liveness check? document and accept?) rather than a code fix — see the audit record's
+  2026-09-11 disposition.
 - **2026-09-10** — **Three A1 findings, no consumer in the repo (P1: hardening
   free).** `gc(.{ .stale_after_ns = 0 })` now returns `error.StaleAfterTooSmall`
   instead of silently disarming the only guard that keeps a sweep from
