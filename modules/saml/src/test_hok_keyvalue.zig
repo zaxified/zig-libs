@@ -88,6 +88,32 @@ fn rsaKeyValueConfirmation(alloc: std.mem.Allocator, pk: rsa.PublicKey) ![]u8 {
         "</saml:SubjectConfirmationData></saml:SubjectConfirmation>", .{ hok_method, ds_ns_decl, mod_b64, exp_b64 });
 }
 
+/// Same as `rsaKeyValueConfirmation`, but with caller-supplied attributes
+/// (e.g. `NotOnOrAfter="..."` / `Recipient="..."`) added to the opening
+/// `<saml:SubjectConfirmationData>` tag -- A1 audit F9 M23/M24: HoK's own
+/// `NotOnOrAfter`/`Recipient` checks (SPEC.md: "when present they are still
+/// honored") had no test with them PRESENT AND VIOLATED, only absent. Every
+/// existing HoK test omits them entirely, so a mutation deleting either
+/// check inside `validateHolderOfKeyData` would pass 100% green.
+fn rsaKeyValueConfirmationWithScdAttrs(alloc: std.mem.Allocator, pk: rsa.PublicKey, scd_attrs: []const u8) ![]u8 {
+    var n_buf: [rsa.max_modulus_len]u8 = undefined;
+    const n_len = (pk.n.bits() + 7) / 8;
+    try pk.n.toBytes(n_buf[0..n_len], .big);
+    var e_buf: [rsa.max_modulus_len]u8 = undefined;
+    try pk.e.toBytes(&e_buf, .big);
+
+    const mod_b64 = try b64(alloc, n_buf[0..n_len]);
+    defer alloc.free(mod_b64);
+    const exp_b64 = try b64(alloc, stripLeadingZeros(&e_buf));
+    defer alloc.free(exp_b64);
+
+    return std.fmt.allocPrint(alloc, "<saml:SubjectConfirmation Method=\"{s}\"><saml:SubjectConfirmationData {s}>" ++
+        "<ds:KeyInfo xmlns:ds=\"{s}\"><ds:KeyValue><ds:RSAKeyValue>" ++
+        "<ds:Modulus>{s}</ds:Modulus><ds:Exponent>{s}</ds:Exponent>" ++
+        "</ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo>" ++
+        "</saml:SubjectConfirmationData></saml:SubjectConfirmation>", .{ hok_method, scd_attrs, ds_ns_decl, mod_b64, exp_b64 });
+}
+
 /// Build a HoK confirmation carrying an `<dsig11:ECKeyValue>` for `sec1`.
 fn ecKeyValueConfirmation(alloc: std.mem.Allocator, sec1: []const u8) ![]u8 {
     const pt_b64 = try b64(alloc, sec1);
@@ -156,6 +182,50 @@ test "HoK KeyValue: RSAKeyValue not matching presented rsa key -> HolderOfKeyMis
     cfg.subject_confirmation = .holder_of_key;
     cfg.presented_holder_key = .{ .rsa = other.public_key };
     try testing.expectError(error.HolderOfKeyMismatch, saml.consumeResponseXml(alloc, s.xml, cfg));
+}
+
+// ── A1 audit F9 (M23/M24): HoK's own NotOnOrAfter/Recipient, present and
+//    VIOLATED, had no regression test. Both confirmations below carry a KEY
+//    that WOULD match (so a mutant that deletes the time/recipient check but
+//    leaves the key check intact is caught by the time/recipient assertion,
+//    not accidentally by an unrelated key mismatch). ────────────────────────
+
+test "M23 teeth: HoK SubjectConfirmationData's own NotOnOrAfter, present and expired, is honoured (-> AssertionExpired)" {
+    const alloc = testing.allocator;
+    var probe = try sign.signAssertion(alloc, 0x4B37E4, fx.idp_entity_id, "_probe", "2024-06-01T12:00:00Z", "<saml:Subject></saml:Subject>");
+    const pk = probe.key.rsa;
+    probe.deinit(alloc);
+
+    // fx.t_valid corresponds to 2024-06-01T12:00:00Z; this NotOnOrAfter is
+    // well before it -- the confirmation is otherwise a PERFECT key match.
+    const conf = try rsaKeyValueConfirmationWithScdAttrs(alloc, pk, "NotOnOrAfter=\"2024-01-01T00:00:00Z\"");
+    defer alloc.free(conf);
+    var s = try mintResponse(alloc, conf);
+    defer s.deinit(alloc);
+
+    var cfg = baseConfig(s.key);
+    cfg.subject_confirmation = .holder_of_key;
+    cfg.presented_holder_key = .{ .rsa = s.key.rsa };
+    try testing.expectError(error.AssertionExpired, saml.consumeResponseXml(alloc, s.xml, cfg));
+}
+
+test "M24 teeth: HoK SubjectConfirmationData's own Recipient, present and wrong, is honoured (-> RecipientMismatch)" {
+    const alloc = testing.allocator;
+    var probe = try sign.signAssertion(alloc, 0x4B37E4, fx.idp_entity_id, "_probe", "2024-06-01T12:00:00Z", "<saml:Subject></saml:Subject>");
+    const pk = probe.key.rsa;
+    probe.deinit(alloc);
+
+    // A Recipient naming a DIFFERENT ACS -- again a PERFECT key match
+    // otherwise, so only the Recipient check can be what rejects this.
+    const conf = try rsaKeyValueConfirmationWithScdAttrs(alloc, pk, "Recipient=\"https://evil.example.org/acs\"");
+    defer alloc.free(conf);
+    var s = try mintResponse(alloc, conf);
+    defer s.deinit(alloc);
+
+    var cfg = baseConfig(s.key);
+    cfg.subject_confirmation = .holder_of_key;
+    cfg.presented_holder_key = .{ .rsa = s.key.rsa };
+    try testing.expectError(error.RecipientMismatch, saml.consumeResponseXml(alloc, s.xml, cfg));
 }
 
 test "HoK KeyValue: ECKeyValue matching presented sec1 point -> accepted" {
