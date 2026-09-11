@@ -215,14 +215,14 @@ test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {
         const a = field.Fe.fromBytes(ab, .big) catch continue;
         const b = field.Fe.fromBytes(bb, .big) catch continue;
 
-        const want_mul = field.mulPortable(a.limbs, b.limbs);
+        const want_mul = field.mulPortable(a._limbs, b._limbs);
         var got_mul: [4]u64 = undefined;
-        fast_core.fieldMul(&got_mul, &a.limbs, &b.limbs);
+        fast_core.fieldMul(&got_mul, &a._limbs, &b._limbs);
         try std.testing.expectEqualSlices(u64, &want_mul, &got_mul);
 
-        const want_sq = field.sqPortable(a.limbs);
+        const want_sq = field.sqPortable(a._limbs);
         var got_sq: [4]u64 = undefined;
-        fast_core.fieldSq(&got_sq, &a.limbs);
+        fast_core.fieldSq(&got_sq, &a._limbs);
         try std.testing.expectEqualSlices(u64, &want_sq, &got_sq);
     }
 }

@@ -295,7 +295,56 @@ pub fn preSign(
     io: std.Io,
 ) PreSignError!PreSignature {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
+    return preSignImpl(secret_key, msg, aux_rand, adaptor_point, computeUnverified);
+}
 
+/// The (steps 1-8, no self-check) result `computeUnverified` — or a test's
+/// deliberately-corrupted stand-in — hands to `preSignImpl`.
+const ComputeResult = struct { presig: PreSignature, pubkey: bip340.XOnlyPublicKey };
+
+/// A1 F5, round-2 follow-up (2026-09-11): the first version of this seam
+/// (bip340 sibling, same fix, same session) split `preSign` into
+/// `computeUnverified` + a standalone `selfCheck`, and a test called both
+/// directly — but that only proved `selfCheck` can reject a bad
+/// pre-signature; it said nothing about whether `preSign`'s own body still
+/// CALLS it. Measured: deleting `preSign`'s `try selfCheck(...)` line left
+/// every test green (`feedback_n_copies_of_one_invariant_is_one_
+/// unverifiable_guard` — the guard and the thing verifying it were two
+/// separate, independently-deletable places). See `bip340.zig`'s `signImpl`
+/// for the full writeup; same fix here.
+///
+/// `preSignImpl` takes the steps-1-8 computation as a parameter and
+/// unconditionally runs the step-9 self-check against whatever that
+/// parameter returns. `preSign` (public, unchanged signature) is a
+/// one-line call into `preSignImpl` with the real computation
+/// (`computeUnverified`); a permanent test calls `preSignImpl` with a
+/// deliberately corrupted computation and confirms THIS function — not a
+/// copy of its logic — rejects it. Measured three ways in the fix commit's
+/// dispozice (`A1/adaptor.md`): today's tree (GREEN), the self-check CALL
+/// deleted from `preSignImpl` (RED), and the self-check's own verdict
+/// ignored (RED) — plus a positive control (an honest computation still
+/// succeeds).
+fn preSignImpl(
+    secret_key: bip340.SecretKey,
+    msg: []const u8,
+    aux_rand: [32]u8,
+    adaptor_point: AdaptorPoint,
+    compute: *const fn (bip340.SecretKey, []const u8, [32]u8, AdaptorPoint) PreSignError!ComputeResult,
+) PreSignError!PreSignature {
+    const computed = try compute(secret_key, msg, aux_rand, adaptor_point);
+    if (!preVerify(computed.pubkey, msg, adaptor_point, computed.presig)) return error.PreSignatureVerificationFailed;
+    return computed.presig;
+}
+
+/// Steps 1-8 of `preSign` (no self-check) — the real computation
+/// `preSignImpl` runs in production, and the honest baseline the F5 test's
+/// corrupted stand-in derives from.
+fn computeUnverified(
+    secret_key: bip340.SecretKey,
+    msg: []const u8,
+    aux_rand: [32]u8,
+    adaptor_point: AdaptorPoint,
+) PreSignError!ComputeResult {
     // Step 1: even-y-normalized effective scalar d + x-only public key —
     // exactly bip340.sign's own steps 1-2, INCLUDING its scrub-on-return
     // discipline (audit A1 F3: this doc comment already claimed "exactly
@@ -370,14 +419,12 @@ pub fn preSign(
     const d = Scalar.fromBytes(d_bytes, .big) catch return error.InvalidSecretKey;
     const s_prime = k.add(e.mul(d));
 
-    // Step 9: mandatory self-verification before returning (fail closed).
     const presig = PreSignature{
         .r = rx,
         .s_prime = s_prime.toBytes(.big),
         .needs_negation = needs_negation,
     };
-    if (!preVerify(kp.public, msg, adaptor_point, presig)) return error.PreSignatureVerificationFailed;
-    return presig;
+    return .{ .presig = presig, .pubkey = kp.public };
 }
 
 /// Schnorr **PreVerify**: verifies a pre-signature was correctly produced
@@ -720,4 +767,55 @@ test "audit F1: AdaptorPoint.fromSecret rejects adaptor_secret >= n (matches ada
     n_minus_1[31] -= 1;
     _ = try AdaptorPoint.fromSecret(n_minus_1); // canonical (< n), still accepted
     try std.testing.expectError(error.InvalidAdaptorPoint, AdaptorPoint.fromSecret(n_bytes)); // == n, identity, unchanged behaviour
+}
+
+test "A1 F5 (round-2 follow-up): preSignImpl enforces step 9 on the REAL production path, not just in a standalone check function" {
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x42} ** 32);
+    const t_bytes = [_]u8{0x01} ** 31 ++ [_]u8{0x07};
+    const adaptor_point = try AdaptorPoint.fromSecret(t_bytes);
+    const msg = "A1 F5 adaptor regression";
+    const aux_rand = [_]u8{0xCD} ** 32;
+
+    // Positive control: preSignImpl with the real computation is exactly
+    // what preSign() does -- same fields, no regression from the seam.
+    const honest = try preSignImpl(sk, msg, aux_rand, adaptor_point, computeUnverified);
+    const via_presign = try preSign(sk, msg, aux_rand, adaptor_point, undefined);
+    try std.testing.expectEqualSlices(u8, &honest.r, &via_presign.r);
+    try std.testing.expectEqualSlices(u8, &honest.s_prime, &via_presign.s_prime);
+    try std.testing.expectEqual(honest.needs_negation, via_presign.needs_negation);
+
+    // The actual regression: inject the fault INTO THE COMPUTE STEP
+    // itself, and call preSignImpl -- the exact function preSign() calls,
+    // not a copy of its logic -- with that corrupting compute function. If
+    // step 9 is deleted or defeated inside preSignImpl, THIS is what turns
+    // red: the corrupted pre-signature would be returned as `ok(...)`
+    // instead of erroring.
+    const corruptS = struct {
+        fn call(k: bip340.SecretKey, m: []const u8, a: [32]u8, t: AdaptorPoint) PreSignError!ComputeResult {
+            var r = try computeUnverified(k, m, a, t);
+            r.presig.s_prime[31] ^= 0x01; // flip a bit of s_prime -- step 8's output
+            return r;
+        }
+    }.call;
+    try std.testing.expectError(error.PreSignatureVerificationFailed, preSignImpl(sk, msg, aux_rand, adaptor_point, corruptS));
+
+    // Same for a fault in r (step 6's output).
+    const corruptR = struct {
+        fn call(k: bip340.SecretKey, m: []const u8, a: [32]u8, t: AdaptorPoint) PreSignError!ComputeResult {
+            var r = try computeUnverified(k, m, a, t);
+            r.presig.r[0] ^= 0x01;
+            return r;
+        }
+    }.call;
+    try std.testing.expectError(error.PreSignatureVerificationFailed, preSignImpl(sk, msg, aux_rand, adaptor_point, corruptR));
+
+    // Same for flipping needs_negation alone (step 6's parity bit).
+    const corruptParity = struct {
+        fn call(k: bip340.SecretKey, m: []const u8, a: [32]u8, t: AdaptorPoint) PreSignError!ComputeResult {
+            var r = try computeUnverified(k, m, a, t);
+            r.presig.needs_negation = !r.presig.needs_negation;
+            return r;
+        }
+    }.call;
+    try std.testing.expectError(error.PreSignatureVerificationFailed, preSignImpl(sk, msg, aux_rand, adaptor_point, corruptParity));
 }

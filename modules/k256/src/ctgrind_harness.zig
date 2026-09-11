@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             raw[31] = 0; // top little-endian byte: value < 2^248 < p, no comparison needed
             taintIf(tainted, &raw);
             const r = reloadVolatile(32, &raw);
-            const a = Fe{ .limbs = .{
+            const a = Fe{ ._limbs = .{
                 std.mem.readInt(u64, r[0..8], .little),
                 std.mem.readInt(u64, r[8..16], .little),
                 std.mem.readInt(u64, r[16..24], .little),

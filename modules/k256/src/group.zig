@@ -642,7 +642,7 @@ inline fn blackBox(x: u64) u64 {
 /// Masked limb blend: `dst = (dst & ~mask) | (src & mask)`. `mask` is 0 or all
 /// ones (laundered by `blackBox`).
 inline fn blendLimbs(dst: *field.Fe, src: field.Fe, mask: u64) void {
-    for (&dst.limbs, src.limbs) |*d, s| d.* = (s & mask) | (d.* & ~mask);
+    for (&dst._limbs, src._limbs) |*d, s| d.* = (s & mask) | (d.* & ~mask);
 }
 
 /// A point in affine coordinates.

@@ -190,7 +190,9 @@ test "batch: all valid vectors accept; corrupting any single item rejects the wh
     for (items.items) |item| try std.testing.expect(bip340.verify(item.pubkey, item.msg, item.sig));
     try std.testing.expect(bip340.verifyBatch(items.items, io));
 
-    // The empty batch is vacuously valid.
+    // A1 F9: the empty batch returns true because BIP340's own
+    // BatchVerify algorithm defines it that way (see the doc comment on
+    // `verifyBatch`), not merely because the equation happens to degenerate.
     try std.testing.expect(bip340.verifyBatch(items.items[0..0], io));
 
     // Corrupt each item's s (flip one bit) — the whole batch must reject.

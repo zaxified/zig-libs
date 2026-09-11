@@ -421,7 +421,15 @@ pub const InvoiceRequest = struct {
     pub fn verify(self: InvoiceRequest, allocator: Allocator) (VerifyError || error{ MissingSignature, MissingPayerId })!bool {
         const sig = self.signature orelse return error.MissingSignature;
         const payer = self.invreq_payer_id orelse return error.MissingPayerId;
-        const xonly = bip340.xonlyBytesOf(&payer) catch unreachable; // fixed 33 bytes
+        // A1 F11 x lninvoice (round-2 Q4): `xonlyBytesOf` now rejects a
+        // 33-byte input whose leading byte is not a real SEC1 marker
+        // (0x02/0x03) instead of silently dropping it -- `invreq_payer_id`
+        // is drawn straight from the wire (BOLT#12 TLV type 88), so this
+        // `catch unreachable` would have become a reachable panic on a
+        // malformed payload the moment bip340 was tightened. Fails closed
+        // instead, with the same error `lift`/`fromBytes` already use for
+        // "this is not a valid public key encoding".
+        const xonly = bip340.xonlyBytesOf(&payer) catch return error.InvalidPublicKey;
         return verifyMerkle(allocator, self.raw, invoice_request_sig_tag, xonly, sig);
     }
 };
@@ -613,7 +621,8 @@ pub const Invoice = struct {
     pub fn verify(self: Invoice, allocator: Allocator) (VerifyError || error{ MissingSignature, MissingNodeId })!bool {
         const sig = self.signature orelse return error.MissingSignature;
         const node = self.invoice_node_id orelse return error.MissingNodeId;
-        const xonly = bip340.xonlyBytesOf(&node) catch unreachable; // fixed 33 bytes
+        // Same reasoning as InvoiceRequest.verify above (A1 F11 x lninvoice).
+        const xonly = bip340.xonlyBytesOf(&node) catch return error.InvalidPublicKey;
         return verifyMerkle(allocator, self.raw, invoice_sig_tag, xonly, sig);
     }
 };
@@ -1332,6 +1341,46 @@ test "BOLT#12 round-trip: build+sign+decode+verify an invoice_request" {
     other[1..33].* = kp2.public.x;
     ir.invreq_payer_id = other;
     try testing.expect(!try ir.verify(allocator));
+}
+
+test "A1 F11 x lninvoice (round-2 Q4): a payer_id with a non-SEC1 prefix from the wire FAILS verify(), it does not panic" {
+    const allocator = testing.allocator;
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const sk = try bip340.SecretKey.fromBytes([_]u8{0x11} ** 32);
+    const kp = try bip340.KeyPair.fromSecretKey(sk);
+    var payer_id: [33]u8 = undefined;
+    payer_id[0] = 0x02;
+    payer_id[1..33].* = kp.public.x;
+
+    const metadata = [_]u8{0xab} ** 8;
+    const records = [_]lnwire.RawRecord{
+        .{ .type = IREQ_METADATA, .value = &metadata },
+        .{ .type = TYPE_CURRENCY, .value = "EUR" },
+        .{ .type = TYPE_AMOUNT, .value = &.{0x64} },
+        .{ .type = INVREQ_PAYER_ID, .value = &payer_id },
+    };
+    const lnr = try encodeSignedInvoiceRequest(allocator, &records, sk, [_]u8{0} ** 32, io);
+    defer allocator.free(lnr);
+
+    var ir = try decodeInvoiceRequest(allocator, lnr);
+    defer ir.deinit(allocator);
+    try testing.expect(try ir.verify(allocator)); // sanity: the honest payload verifies
+
+    // Tamper the decoded payer_id's SEC1 prefix byte -- this is what a
+    // malicious (or merely buggy) counterparty could put on the wire in
+    // BOLT#12 TLV type 88; length is unaffected (still exactly 33 bytes),
+    // so no decode-time guard catches it. Before this fix, bip340's
+    // tightened `xonlyBytesOf` (A1 F11) combined with lninvoice's old
+    // `catch unreachable` would have turned this into a crash instead of a
+    // rejection -- verified separately in this session by temporarily
+    // reverting just the two call sites and observing the panic.
+    for ([_]u8{ 0x00, 0x01, 0x04, 0x06, 0x07, 0xff }) |bad_prefix| {
+        ir.invreq_payer_id.?[0] = bad_prefix;
+        try std.testing.expectError(error.InvalidPublicKey, ir.verify(allocator));
+    }
 }
 
 test "BOLT#12 round-trip: build+sign+decode+verify an invoice" {

@@ -151,19 +151,34 @@ pub fn sqPortable(a: [4]u64) [4]u64 {
 
 /// A secp256k1 base-field element: four full 2^64 little-endian limbs, always
 /// canonical (`value < p`) between operations.
+///
+/// A1 audit F8 (2026-09-11): the backing limbs used to be a plain public
+/// field (`limbs`), so anything could construct `Fe{ .limbs = raw }` and skip
+/// every canonicalizing constructor below — and `isZero`/`isOdd`/`toBytes`
+/// would then silently report the wrong answer for that value (e.g.
+/// `Fe{ .limbs = toLimbs(field_order) }.isZero()` was `false`, not `true`).
+/// Renamed to `_limbs` so the field no longer reads as an ordinary public
+/// member. ⚠ This is a NAMING convention, not a language guarantee — Zig has
+/// no field-level access control (confirmed: an unmarked field is reachable
+/// by field-literal syntax from any file that names the type), so `_limbs`
+/// does not make construction impossible, only unidiomatic and clearly
+/// against the grain. The actual guarantee is structural: every constructor
+/// in this file (`fromBytes`, `fromInt`, `add`, `sub`, `mul`, `sq`, `zero`,
+/// `one`) already produces a canonical value; there is no reason for any
+/// caller, inside this module or out, to ever write `_limbs` directly.
 pub const Fe = struct {
-    limbs: [4]u64,
+    _limbs: [4]u64,
 
     pub const encoded_length = 32;
 
-    pub const zero = Fe{ .limbs = .{ 0, 0, 0, 0 } };
-    pub const one = Fe{ .limbs = .{ 1, 0, 0, 0 } };
+    pub const zero = Fe{ ._limbs = .{ 0, 0, 0, 0 } };
+    pub const one = Fe{ ._limbs = .{ 1, 0, 0, 0 } };
 
     /// The field prime as an integer type, for parity with std's `Fe.IntRepr`.
     pub const IntRepr = u256;
 
     inline fn value(fe: Fe) u256 {
-        return toU256(fe.limbs);
+        return toU256(fe._limbs);
     }
 
     /// Swap the byte order of a 32-byte encoded element.
@@ -183,7 +198,7 @@ pub const Fe = struct {
     pub fn fromBytes(s: [encoded_length]u8, endian: std.builtin.Endian) NonCanonicalError!Fe {
         const v = std.mem.readInt(u256, &s, endian);
         if (v >= field_order) return error.NonCanonical;
-        return .{ .limbs = fromU256(v) };
+        return .{ ._limbs = fromU256(v) };
     }
 
     /// Pack a field element.
@@ -196,7 +211,7 @@ pub const Fe = struct {
     /// Create a field element from a comptime integer `< p`.
     pub fn fromInt(comptime x: u256) NonCanonicalError!Fe {
         if (x >= field_order) return error.NonCanonical;
-        return .{ .limbs = fromU256(x) };
+        return .{ ._limbs = fromU256(x) };
     }
 
     /// Return the element as an integer.
@@ -205,11 +220,11 @@ pub const Fe = struct {
     }
 
     pub fn isZero(fe: Fe) bool {
-        return (fe.limbs[0] | fe.limbs[1] | fe.limbs[2] | fe.limbs[3]) == 0;
+        return (fe._limbs[0] | fe._limbs[1] | fe._limbs[2] | fe._limbs[3]) == 0;
     }
 
     pub fn isOdd(fe: Fe) bool {
-        return (fe.limbs[0] & 1) != 0;
+        return (fe._limbs[0] & 1) != 0;
     }
 
     pub fn equivalent(a: Fe, b: Fe) bool {
@@ -228,7 +243,7 @@ pub const Fe = struct {
     /// the barrier note above.
     pub fn cMov(fe: *Fe, a: Fe, c: u1) void {
         const mask: u64 = @as(u64, 0) -% @as(u64, blackBox(@as(u64, c)));
-        for (&fe.limbs, a.limbs) |*w, aw| {
+        for (&fe._limbs, a._limbs) |*w, aw| {
             w.* = (aw & mask) | (w.* & ~mask);
         }
     }
@@ -236,7 +251,7 @@ pub const Fe = struct {
     /// `(a + b) mod p`, constant-time.
     pub fn add(a: Fe, b: Fe) Fe {
         const s = @addWithOverflow(a.value(), b.value());
-        return .{ .limbs = normalize(s[0], s[1]) };
+        return .{ ._limbs = normalize(s[0], s[1]) };
     }
 
     /// `2a mod p`.
@@ -252,7 +267,7 @@ pub const Fe = struct {
         // become a data-dependent branch (see the barrier note above).
         const mask: u256 = @as(u256, 0) -% @as(u256, blackBox(@as(u64, d[1])));
         const v = d[0] +% (field_order & mask);
-        return .{ .limbs = fromU256(v) };
+        return .{ ._limbs = fromU256(v) };
     }
 
     /// `-a mod p`.
@@ -269,20 +284,20 @@ pub const Fe = struct {
     pub fn mul(a: Fe, b: Fe) Fe {
         if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
-            fast_core.fieldMul(&z, &a.limbs, &b.limbs);
-            return .{ .limbs = z };
+            fast_core.fieldMul(&z, &a._limbs, &b._limbs);
+            return .{ ._limbs = z };
         }
-        return .{ .limbs = mulPortable(a.limbs, b.limbs) };
+        return .{ ._limbs = mulPortable(a._limbs, b._limbs) };
     }
 
     /// `a² mod p`. Dispatches like `mul` (same comptime/asm split).
     pub fn sq(a: Fe) Fe {
         if (field_asm_active and !@inComptime()) {
             var z: [4]u64 = undefined;
-            fast_core.fieldSq(&z, &a.limbs);
-            return .{ .limbs = z };
+            fast_core.fieldSq(&z, &a._limbs);
+            return .{ ._limbs = z };
         }
-        return .{ .limbs = sqPortable(a.limbs) };
+        return .{ ._limbs = sqPortable(a._limbs) };
     }
 
     /// `a` squared `n` times.

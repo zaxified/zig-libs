@@ -5,6 +5,39 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **BREAKING:** `xonlyBytesOf`'s 33-byte branch now rejects
+  an input whose leading byte is not a real SEC1 marker (`0x02`/`0x03`)
+  with the new error `error.BadPointPrefix`, instead of silently accepting
+  any prefix byte (`0x04`, `0x00`, anything) and dropping it unexamined
+  (audit F11, LOW). This module has one in-repo caller of the function,
+  `lninvoice`'s `InvoiceRequest.verify`/`Invoice.verify` — both moved off
+  `catch unreachable` in the same commit (round-2 Q4: a one-sided fix here
+  would have turned lninvoice's silent acceptance of a malformed BOLT#12
+  `invreq_payer_id`/`invoice_node_id` into a process panic on wire data).
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F9 (LOW):
+  `verifyBatch(&.{}, io) == true` was flagged as an open question ("vacuous
+  truth or fail-closed?"). Resolved by reading BIP340 §"Batch Verification"
+  itself: its algorithm is a loop "for i = 1..u" that runs zero times when
+  u=0, so no check can ever fail, and "return success iff no failure
+  occurred" returns success — the spec's own literal definition, not a
+  permissive choice this module made. Doc comment on `verifyBatch` and the
+  existing empty-batch test now cite this instead of just asserting
+  "vacuously true"; no code changed.
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F5 (MED): the
+  mandatory step-10 self-check (fault-injection guard) had no way to be
+  regression-tested without either duplicating `sign`'s arithmetic in a
+  test or adding public API. First attempt split `sign` into
+  `computeUnverified` + a standalone `selfCheck` called separately by the
+  test — but that only proved `selfCheck` can reject a bad signature, not
+  that `sign`'s body still calls it (deleting that call left every test
+  green). Fixed by moving the seam onto the production path itself: `sign`
+  is now a one-line call into file-private `signImpl`, which takes the
+  steps-1-9 computation as a parameter and unconditionally self-checks
+  whatever it returns. A permanent test calls `signImpl` with a
+  deliberately corrupted computation and confirms this exact function —
+  not a copy of it — rejects it; because the check now lives on the one
+  path both production and the test go through, deleting or defeating it
+  is caught (measured: both mutations turn the test red).
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F7 (MED):
   verified the core defect (the fuzz harness's ranged first draw always
   returning the corpus's own minimum, so it never actually corrupted a
