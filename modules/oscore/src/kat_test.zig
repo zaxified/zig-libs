@@ -245,17 +245,21 @@ test "computeNonce reproduces Appendix C.4/C.5/C.6/C.8's message-vector nonce, b
 // ── buildAad ─────────────────────────────────────────────────────────────
 
 test "buildAad reproduces every Appendix C.4-C.8 AAD field, byte-exact" {
-    const allocator = std.testing.allocator;
     var kid_buf: [16]u8 = undefined;
     var piv_buf: [16]u8 = undefined;
     var expect_buf: [32]u8 = undefined;
+    var aad_buf: [64]u8 = undefined;
 
     for (v.message_vectors) |vec| {
-        const got = try oscore.buildAad(allocator, .{
+        const params = oscore.AadParams{
             .request_kid = hexBytes(&kid_buf, vec.request_kid),
             .request_piv = hexBytes(&piv_buf, vec.request_piv),
-        });
-        defer allocator.free(got);
+        };
+        // F13's own claim, pinned: buildAadLen matches what buildAad
+        // actually writes (an assert inside buildAad already checks this
+        // on every call; this is the same property from the outside).
+        try std.testing.expectEqual(oscore.buildAadLen(params), hexBytes(&expect_buf, vec.aad).len);
+        const got = try oscore.buildAad(&aad_buf, params);
         try std.testing.expectEqualSlices(u8, hexBytes(&expect_buf, vec.aad), got);
     }
 }
@@ -604,8 +608,8 @@ test "F2: unprotect refuses a request_nonce_source.partial_iv beyond max_partial
     var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
     const aad = requestAad(&pair.client, &piv_buf, &.{});
     const nonce = try oscore.computeNonce(pair.server.common.common_iv, pair.server.recipient.id, 0);
-    const full_aad = try oscore.buildAad(allocator, aad);
-    defer allocator.free(full_aad);
+    var aad_buf: [oscore.max_aad_len]u8 = undefined;
+    const full_aad = try oscore.buildAad(&aad_buf, aad);
     const response_plaintext = "\x45\xffok";
     var response: [response_plaintext.len + oscore.tag_length]u8 = undefined;
     std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(response[0..response_plaintext.len], response[response_plaintext.len..], response_plaintext, full_aad, nonce, pair.server.sender.key);
@@ -815,8 +819,8 @@ test "F4/F11: a response reusing the request's nonce is opened with request_nonc
 
     // Server response: request nonce = (recipient id "c1", piv 0), no own PIV.
     const nonce = try oscore.computeNonce(pair.server.common.common_iv, pair.server.recipient.id, req.option.partial_iv.?);
-    const full_aad = try oscore.buildAad(allocator, req_aad);
-    defer allocator.free(full_aad);
+    var aad_buf: [oscore.max_aad_len]u8 = undefined;
+    const full_aad = try oscore.buildAad(&aad_buf, req_aad);
     const resp_pt = "\x45\xffr";
     var resp: [resp_pt.len + oscore.tag_length]u8 = undefined;
     std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(resp[0..resp_pt.len], resp[resp_pt.len..], resp_pt, full_aad, nonce, pair.server.sender.key);
@@ -957,5 +961,132 @@ test "F15: unprotected_message/protected_message stop being dead KAT fields" {
             const opt_start = marker_pos - option_value.len;
             try std.testing.expectEqualSlices(u8, option_value, protected[opt_start..marker_pos]);
         }
+    }
+}
+
+// ── F13: buildAad no longer allocates ───────────────────────────────────
+
+/// Wraps a backing allocator and counts calls to `.alloc` only (not
+/// `.resize`/`.remap`/`.free`) — the same thing the audit finding counted
+/// ("5 allocations per message": two growable `ArrayList`s plus their
+/// `toOwnedSlice` calls, plus the ciphertext buffer). Everything else
+/// passes straight through to the backing allocator, so this can wrap
+/// `std.testing.allocator` and still catch leaks/double-frees normally.
+const CountingAllocator = struct {
+    backing: std.mem.Allocator,
+    count: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.count += 1;
+        return self.backing.vtable.alloc(self.backing.ptr, len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.resize(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.vtable.remap(self.backing.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.vtable.free(self.backing.ptr, memory, alignment, ret_addr);
+    }
+};
+
+test "F13: protect makes exactly 1 allocation per message (the ciphertext buffer), not 5" {
+    var counting = CountingAllocator{ .backing = std.testing.allocator };
+    const allocator = counting.allocator();
+
+    var pair = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const aad = requestAad(&pair.client, &piv_buf, &.{});
+
+    counting.count = 0; // deriveContext above allocates too; only protect's own count matters
+    const protected = try oscore.protect(allocator, &pair.client, "0123456789abcdef", aad, true, null);
+    defer allocator.free(protected.ciphertext);
+    // Before the fix (buildAad composing two allocator-based ArrayList
+    // sub-encoders): 5 -- encodeAadArray's ArrayList growth + its
+    // toOwnedSlice, encodeEncStructure's ArrayList growth + its
+    // toOwnedSlice, and the ciphertext buffer. After: just the ciphertext.
+    try std.testing.expectEqual(@as(usize, 1), counting.count);
+
+    counting.count = 0;
+    const opened = try oscore.unprotect(allocator, &pair.server, protected.option, protected.ciphertext, aad, null, true);
+    defer allocator.free(opened);
+    // unprotect's own single allocation is the returned plaintext buffer.
+    try std.testing.expectEqual(@as(usize, 1), counting.count);
+}
+
+/// CPU time of the calling process/thread (`CLOCK_PROCESS_CPUTIME_ID`) in
+/// nanoseconds -- not wall clock, since this suite may share the machine
+/// with other agents (same convention `A1/oscore.md`'s original audit
+/// used). `std.time.Timer` does not exist in this toolchain's std, and
+/// `std.c.clock_gettime` needs libc linked (this module's test target
+/// does not) -- `std.os.linux.clock_gettime` is the direct syscall, no
+/// libc required.
+fn cpuTimeNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.PROCESS_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+test "F13 (perf, diagnostic): protect/unprotect vs. the bare AEAD, 16-byte payload, 3 rounds" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+
+    // `std.heap.smp_allocator`, NOT `std.testing.allocator` -- this
+    // module's own audit note (A1/oscore.md SS F13) records a benchmark
+    // that first came out two orders of magnitude too slow because its
+    // allocator was `page_allocator` (every alloc an `mmap`); the testing
+    // allocator's leak-tracking bookkeeping is a smaller version of the
+    // same trap, and dominates a per-message cost this small.
+    const allocator = std.heap.smp_allocator;
+    var pair = try Pair.init(allocator);
+    var piv_buf: [oscore.OscoreOption.max_partial_iv_bytes]u8 = undefined;
+    const plaintext = "0123456789abcdef"; // 16 bytes, the audit's own size
+    const iters = 20_000;
+
+    var round: usize = 0;
+    while (round < 3) : (round += 1) {
+        const aad = requestAad(&pair.client, &piv_buf, &.{});
+
+        const protect_start = cpuTimeNs();
+        var i: usize = 0;
+        while (i < iters) : (i += 1) {
+            const protected = try oscore.protect(allocator, &pair.client, plaintext, aad, true, null);
+            allocator.free(protected.ciphertext);
+        }
+        const protect_ns = cpuTimeNs() - protect_start;
+
+        // Bare AEAD over the same plaintext length, same key, for
+        // comparison -- no OSCORE framing at all.
+        var out: [plaintext.len + oscore.tag_length]u8 = undefined;
+        const nonce = try oscore.computeNonce(pair.client.common.common_iv, pair.client.sender.id, 0);
+        const bare_start = cpuTimeNs();
+        i = 0;
+        while (i < iters) : (i += 1) {
+            std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(out[0..plaintext.len], out[plaintext.len..], plaintext, "", nonce, pair.client.sender.key);
+            std.mem.doNotOptimizeAway(&out);
+        }
+        const bare_ns = cpuTimeNs() - bare_start;
+
+        const protect_per_op = @as(f64, @floatFromInt(protect_ns)) / iters;
+        const bare_per_op = @as(f64, @floatFromInt(bare_ns)) / iters;
+        std.debug.print(
+            "F13 perf round {d}: protect {d:.1} ns/op, bare AEAD {d:.1} ns/op, overhead {d:.1}%\n",
+            .{ round, protect_per_op, bare_per_op, (protect_per_op / bare_per_op - 1.0) * 100.0 },
+        );
     }
 }
