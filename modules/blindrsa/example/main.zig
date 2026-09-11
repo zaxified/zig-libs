@@ -80,12 +80,9 @@ pub fn main() !void {
     const msg1 = "anonymous-token request #1";
     var prep_buf1: [blindrsa.randomizer_len + msg1.len]u8 = undefined;
     const prepared1 = try blindrsa.prepareRandomize(msg1, random, &prep_buf1);
-    var salt1: [Sha384.digest_length]u8 = undefined;
-    random.bytes(&salt1);
-
     var ctx1: blindrsa.Context = undefined;
     var blinded_buf1: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded1 = try blindrsa.blind(kp.public_key, Sha384, prepared1, &salt1, random, &ctx1, &blinded_buf1);
+    const blinded1 = try blindrsa.blind(kp.public_key, Sha384, prepared1, Sha384.digest_length, random, &ctx1, &blinded_buf1);
 
     // Server/issuer: signs the opaque blinded integer, never seeing
     // `prepared1` or `msg1` at all.
@@ -97,7 +94,7 @@ pub fn main() !void {
     const sig1 = try blindrsa.finalize(kp.public_key, Sha384, blind_sig1, &ctx1, &sig_buf1);
     // A relying party who only has (pk, prepared_msg, sig) can check it
     // independently of the client/issuer exchange that produced it.
-    try blindrsa.verify(kp.public_key, Sha384, prepared1, sig1, salt1.len);
+    try blindrsa.verify(kp.public_key, Sha384, prepared1, sig1, Sha384.digest_length);
     std.debug.print("request 1 (PSS-Randomized): token issued and verifies\n", .{});
 
     // ── request 2: same variant, SECOND independent session ─────────────
@@ -106,12 +103,9 @@ pub fn main() !void {
     const msg2 = "anonymous-token request #2";
     var prep_buf2: [blindrsa.randomizer_len + msg2.len]u8 = undefined;
     const prepared2 = try blindrsa.prepareRandomize(msg2, random, &prep_buf2);
-    var salt2: [Sha384.digest_length]u8 = undefined;
-    random.bytes(&salt2);
-
     var ctx2: blindrsa.Context = undefined;
     var blinded_buf2: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded2 = try blindrsa.blind(kp.public_key, Sha384, prepared2, &salt2, random, &ctx2, &blinded_buf2);
+    const blinded2 = try blindrsa.blind(kp.public_key, Sha384, prepared2, Sha384.digest_length, random, &ctx2, &blinded_buf2);
     must(!std.mem.eql(u8, blinded1, blinded2), @src());
 
     var blind_sig_buf2: [blindrsa.max_modulus_len]u8 = undefined;
@@ -119,7 +113,7 @@ pub fn main() !void {
 
     var sig_buf2: [blindrsa.max_modulus_len]u8 = undefined;
     const sig2 = try blindrsa.finalize(kp.public_key, Sha384, blind_sig2, &ctx2, &sig_buf2);
-    try blindrsa.verify(kp.public_key, Sha384, prepared2, sig2, salt2.len);
+    try blindrsa.verify(kp.public_key, Sha384, prepared2, sig2, Sha384.digest_length);
     must(!std.mem.eql(u8, sig1, sig2), @src());
     std.debug.print("request 2 (PSS-Randomized): independent token, distinct from request 1\n", .{});
 
@@ -129,11 +123,9 @@ pub fn main() !void {
     // different messages" by comparing blinded_msg bytes.
     var prep_buf1b: [blindrsa.randomizer_len + msg1.len]u8 = undefined;
     const prepared1b = try blindrsa.prepareRandomize(msg1, random, &prep_buf1b);
-    var salt1b: [Sha384.digest_length]u8 = undefined;
-    random.bytes(&salt1b);
     var ctx1b: blindrsa.Context = undefined;
     var blinded_buf1b: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded1b = try blindrsa.blind(kp.public_key, Sha384, prepared1b, &salt1b, random, &ctx1b, &blinded_buf1b);
+    const blinded1b = try blindrsa.blind(kp.public_key, Sha384, prepared1b, Sha384.digest_length, random, &ctx1b, &blinded_buf1b);
     must(!std.mem.eql(u8, blinded1, blinded1b), @src());
     std.debug.print("re-blinding the same underlying message: unrelated blinded_msg (unlinkability)\n", .{});
 
@@ -146,7 +138,7 @@ pub fn main() !void {
     const prepared3 = blindrsa.prepareIdentity(msg3);
     var ctx3: blindrsa.Context = undefined;
     var blinded_buf3: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded3 = try blindrsa.blind(kp_psszero.public_key, Sha384, prepared3, &.{}, random, &ctx3, &blinded_buf3);
+    const blinded3 = try blindrsa.blind(kp_psszero.public_key, Sha384, prepared3, 0, random, &ctx3, &blinded_buf3);
 
     var blind_sig_buf3: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig3 = try blindrsa.blindSign(kp_psszero.secret_key, kp_psszero.public_key, random, blinded3, &blind_sig_buf3);
@@ -220,7 +212,7 @@ pub fn main() !void {
 
     var ctx_rigged: blindrsa.Context = undefined;
     var blinded_buf_rigged: [blindrsa.max_modulus_len]u8 = undefined;
-    if (blindrsa.blind(kp.public_key, Sha384, prepared1, &salt1, rigged_random, &ctx_rigged, &blinded_buf_rigged)) |_| {
+    if (blindrsa.blind(kp.public_key, Sha384, prepared1, Sha384.digest_length, rigged_random, &ctx_rigged, &blinded_buf_rigged)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidBlindingFactor => std.debug.print("RNG rigged to a factor of n: InvalidBlindingFactor (expected)\n", .{}),

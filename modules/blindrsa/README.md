@@ -46,10 +46,12 @@ const prepared_msg = blindrsa.prepareRandomize(msg, random, &prep_buf);
 // or: const prepared_msg = blindrsa.prepareIdentity(msg);
 
 // 1. Blind (client): encode + blind prepared_msg against the server's
-//    public key. `salt` is 48 random bytes for -PSS, empty for -PSSZERO.
+//    public key. `blind` draws its own salt from `random` — pass
+//    Sha384.digest_length (48) for -PSS, 0 for -PSSZERO (RFC 9474 SS7.4
+//    SHOULD NOT let the caller supply the salt directly).
 var ctx: blindrsa.Context = undefined;
 var blinded_buf: [blindrsa.max_modulus_len]u8 = undefined;
-const blinded_msg = try blindrsa.blind(pk, Sha384, prepared_msg, salt, random, &ctx, &blinded_buf);
+const blinded_msg = try blindrsa.blind(pk, Sha384, prepared_msg, Sha384.digest_length, random, &ctx, &blinded_buf);
 
 // 2. BlindSign (server): sign the OPAQUE blinded_msg — never sees
 //    prepared_msg. `random` feeds the RFC 9474 §7.2 private-op blinding
@@ -62,8 +64,9 @@ const blind_sig = try blindrsa.blindSign(sk, pk, random, blinded_msg, &blind_sig
 var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
 const sig = try blindrsa.finalize(pk, Sha384, blind_sig, &ctx, &sig_buf);
 
-// 4. Verify (anyone): plain RSASSA-PSS-VERIFY over prepared_msg.
-try blindrsa.verify(pk, Sha384, prepared_msg, sig, salt.len);
+// 4. Verify (anyone): plain RSASSA-PSS-VERIFY over prepared_msg. salt_len
+//    must be the SAME value passed to `blind` above.
+try blindrsa.verify(pk, Sha384, prepared_msg, sig, Sha384.digest_length);
 ```
 
 `sig` verifies against `prepared_msg` under the server's ORDINARY RSA

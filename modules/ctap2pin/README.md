@@ -69,17 +69,22 @@ try ctap2pin.Two.encrypt(secret, fresh_iv, ct[0..pt.len + 16], pt);
 try ctap2pin.Two.decrypt(secret, pt2[0..try ctap2pin.Two.decryptedLength(ct.len)], ct);
 ```
 
-**Authenticate / verify** (verify is constant-time, fail-closed). `key` is
-generic (`[]const u8`), not the fixed-size shared secret: CTAP2 calls
+**Authenticate / verify** (verify is constant-time, fail-closed). CTAP2 calls
 `authenticate`/`verify` both with the shared secret (`setPin`/`getPinToken`'s
-`pinUvAuthParam`) and with the shorter `pinUvAuthToken` obtained from
-`getPinToken` (every later command's per-request `pinUvAuthParam`) — the two
-keys differ in length, so a fixed `SharedSecret` type cannot express both:
+`pinUvAuthParam`) and with a `pinUvAuthToken` obtained from `getPinToken`
+(every later command's per-request `pinUvAuthParam`) — the two keys differ
+in length, so a fixed `SharedSecret` type cannot express both. Protocol
+One's `key` is `[]const u8` (16- or 32-byte token, or its 32-byte shared
+secret) and rejects an empty key with `error.EmptyKey` (audit finding L2).
+Protocol Two's `key` is `*const [32]u8` (audit finding H2 — it used to be
+an unchecked `[]const u8` sliced to 32 bytes internally): pass the leading
+32 bytes of its 64-byte shared secret, or a 32-byte `pinUvAuthToken`
+directly.
 
 ```zig
-const sig1 = ctap2pin.One.authenticate(&secret, msg); // [16]u8 (truncated HMAC); or &pin_uv_token
-const sig2 = ctap2pin.Two.authenticate(&secret, msg); // [32]u8 (full HMAC, hmacKey half); or &pin_uv_token
-if (!ctap2pin.Two.verify(&secret, msg, sig)) return error.PinAuthInvalid;
+const sig1 = try ctap2pin.One.authenticate(&secret, msg); // [16]u8 (truncated HMAC); or &pin_uv_token
+const sig2 = ctap2pin.Two.authenticate(secret[0..32], msg); // [32]u8 (full HMAC, hmacKey half); or &pin_uv_token
+if (!ctap2pin.Two.verify(secret[0..32], msg, sig)) return error.PinAuthInvalid;
 ```
 
 **Raw CBC** (the std-gap primitive, usable on its own):

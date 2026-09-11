@@ -56,8 +56,8 @@ noinline fn transaction() !void {
     var ct2: [32]u8 = undefined;
     try c.Two.encrypt(e2.shared_secret, @splat(0x3c), &ct2, &pin_hash);
 
-    const p1 = c.One.authenticate(&e1.shared_secret, &ct1);
-    const p2 = c.Two.authenticate(&e2.shared_secret, &ct2);
+    const p1 = try c.One.authenticate(&e1.shared_secret, &ct1);
+    const p2 = c.Two.authenticate(e2.shared_secret[0..32], &ct2);
     std.mem.doNotOptimizeAway(&ct1);
     std.mem.doNotOptimizeAway(&ct2);
     std.mem.doNotOptimizeAway(&p1);

@@ -131,8 +131,8 @@ pub fn main() !void {
     const nonce1_resp = try oscore.computeNonce(server_ctx.common.common_iv, server_ctx.recipient.id, decoded_option1.partial_iv.?);
     // §5.4: request_kid/request_piv are the ORIGINAL REQUEST's, even when
     // protecting the response.
-    const full_aad1_resp = try oscore.buildAad(gpa, aad1_server);
-    defer gpa.free(full_aad1_resp);
+    var aad_buf1: [oscore.max_aad_len]u8 = undefined;
+    const full_aad1_resp = try oscore.buildAad(&aad_buf1, aad1_server);
     const ciphertext1_resp = try gpa.alloc(u8, response1_plaintext.len + oscore.tag_length);
     defer gpa.free(ciphertext1_resp);
     std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(

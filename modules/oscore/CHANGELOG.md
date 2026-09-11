@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **API CHANGE:** `buildAad` takes a caller-supplied
+  `dst: []u8` buffer instead of an `allocator`, and returns
+  `error.BufferTooSmall` rather than an `Allocator.Error` (audit finding
+  F13). The old version composed two allocator-based sub-encoders
+  (`encodeAadArray`, `encodeEncStructure`, each doing its own growable
+  `ArrayList` plus a `toOwnedSlice`) for an AAD that, in every real RFC
+  8613 Appendix C vector, is under 40 bytes — measured at +150% over the
+  bare AEAD for a 16-byte payload, almost entirely allocator overhead.
+  `buildAad` now writes CBOR bytes directly into `dst`; a new
+  `buildAadLen(params)` reports the exact size needed. `protect`/
+  `unprotect` gain a new error, `AadTooLarge`, and use a fixed-size stack
+  buffer (`max_aad_len`, 192 bytes — covers `id_piv_field_width`-bounded
+  (7 B) kid/piv plus up to 128 B of Class I CoAP options; every Appendix
+  C vector has none) instead of allocating one. `encodeAadArray`/
+  `encodeEncStructure` themselves are UNCHANGED (still allocator-based,
+  still `kat_test.zig`'s own direct byte-exact KAT target) — `buildAad`
+  encodes the same bytes by a different, allocation-free route, checked
+  against the same Appendix C.4-C.8 vectors independently.
+  `QUESTIONS-ROUND-2.md` Q3: a signature change forced by a measured
+  cost, free on a module with zero consumers in this repository
+  (confirmed: `rg -n '"oscore"' build.zig` names only the module's own
+  entry). Measured: a counting-allocator test shows `protect`/
+  `unprotect` now make exactly 1 allocation per message (the ciphertext/
+  plaintext buffer) instead of 5; a CPU-time A/B against the bare AEAD
+  (16-byte payload, 3 rounds, `CLOCK_PROCESS_CPUTIME_ID`) shows `protect`
+  dropping from ~563-613 ns/op (the module's own earlier F13 measurement)
+  to ~250-290 ns/op — roughly half, consistent with "4 of 5 allocations
+  removed, each contributing comparable cost" — though the *percentage*
+  overhead over the bare AEAD stays in a similar 110-160% range, because
+  that baseline is itself only ~110 ns for 16 bytes, small enough that
+  even the one remaining allocation is a comparable fraction of it.
+
 - **2026-09-08** — `SPEC.md`'s constant-time sentence has an instrument behind it now:
   `src/ctgrind_harness.zig`, driven by `scripts/ctgrind.sh`. The module was outside that
   table while making an explicit constant-time claim (audit F8). ReleaseFast: `derive` 0

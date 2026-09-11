@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **API CHANGE:** `Two.authenticate`/`Two.verify`'s `key`
+  parameter changes from `[]const u8` to `*const [32]u8` (audit finding
+  H2). The old signature sliced `key[0..32]` with NO length check —
+  a caller passing a shorter buffer panicked in Debug/ReleaseSafe
+  (`index out of bounds`) and, in ReleaseFast, silently HMAC'd whatever
+  memory happened to follow the buffer instead. `Two` is one of exactly
+  two protocol versions this module implements and its key is always
+  either the leading 32 bytes of a 64-byte shared secret or a 32-byte
+  `pinUvAuthToken`, so the length is always known at every real call
+  site — the compiler now enforces it instead of a runtime slice.
+  `One.authenticate`/`One.verify` keep `[]const u8` (a real 16- or
+  32-byte `pinUvAuthToken` is genuinely variable-length there), but
+  `One.authenticate` gains a new failure, `error.EmptyKey` (audit
+  finding L2): `authenticate("")` used to silently produce a real HMAC
+  under an empty key, and `verify` accepted it as a valid signature.
+  `Q3` of `QUESTIONS-ROUND-2.md`: both changes are signature changes
+  forced by a measured defect on a module with zero consumers in this
+  repository (confirmed: `rg -n '"ctap2pin"' build.zig` names only the
+  module's own entry, and no `example-apps/*/build.zig` references it).
+  Measured: H2's guarantee is now a compile error, not a runtime check
+  — feeding `Two.authenticate` a `[16]u8` no longer builds at all. L2:
+  a new test drives `One.authenticate`/`verify` with an empty key both
+  ways; a mutation that disabled the new guard turned it `RED` (a real
+  HMAC came back instead of `error.EmptyKey`); reverting gave `GREEN`.
+  All in-module call sites updated (`kat_test.zig`, `ctgrind_harness.zig`,
+  `stackprobe_test.zig`, `pin_protocol_oracle_test.zig`,
+  `example/main.zig`, `README.md`).
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `PublicKey.toPoint` now rejects the
   point at infinity, `(0, 1)` — P-256's affine encoding of the identity element, which
   `fromAffineCoordinates` used to accept by name (`on_curve | is_identity`), so a caller

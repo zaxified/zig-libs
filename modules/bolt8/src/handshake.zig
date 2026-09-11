@@ -203,7 +203,16 @@ pub const Initiator = struct {
     /// rather than a silent share reuse.
     state: State = .start,
 
-    pub const State = enum { start, awaiting_act2, ready_act3, done };
+    /// `.failed`: audit finding F5 — a failed act used to leave `state`
+    /// wherever it was mid-act (the field is only advanced on SUCCESS),
+    /// so a caller could re-invoke the same act (or, worse, the next one)
+    /// against a `SymmetricState` that had already partially advanced.
+    /// Every act function now `errdefer`s into `.failed` on ANY error
+    /// return, and every act still checks its OWN expected state first —
+    /// `.failed` matches none of them, so every subsequent act call
+    /// (including a retry of the one that just failed) returns
+    /// `error.WrongState` instead of running.
+    pub const State = enum { start, awaiting_act2, ready_act3, done, failed };
 
     /// Zero the key material this object directly owns: the long-term
     /// static private key, the ephemeral private key (if one was drawn),
@@ -274,6 +283,7 @@ pub const Initiator = struct {
 
     fn act1(self: *Initiator, e: dh.KeyPair) HandshakeError!act.Act1 {
         if (self.state != .start) return error.WrongState;
+        errdefer self.state = .failed;
         self.ephemeral = e;
         self.ss.mixHash(&e.public_key);
         const es = try dh.dh(e.secret_key, self.rs_pub);
@@ -301,6 +311,7 @@ pub const Initiator = struct {
     /// 6. `h = SHA256(h || c)` — automatic, inside `decryptAndHash`.
     pub fn readAct2(self: *Initiator, msg: act.Act2) HandshakeError!void {
         if (self.state != .awaiting_act2) return error.WrongState;
+        errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
         const ee = try dh.dh(self.ephemeral.?.secret_key, msg.e_pub);
         self.ss.mixKey(&ee);
@@ -343,6 +354,7 @@ pub const Initiator = struct {
     /// 8. `rck = sck = ck` — `HandshakeResult.ck = ss.ck` (see step 6).
     pub fn genAct3(self: *Initiator) HandshakeError!struct { msg: act.Act3, result: HandshakeResult } {
         if (self.state != .ready_act3) return error.WrongState;
+        errdefer self.state = .failed;
         // Step 1: encrypt the local static key at nonce 1 — `ss` is STILL
         // keyed with temp_k2 from readAct2 (no mixKey between the acts;
         // see the doc comment's nonce-continuity warning).
@@ -386,7 +398,12 @@ pub const Responder = struct {
     /// Act ordering — see `Initiator.state`.
     state: State = .start,
 
-    pub const State = enum { start, ready_act2, awaiting_act3, done };
+    /// See `Initiator.State`'s doc comment for `.failed` — same shape,
+    /// including `readAct3`'s extra care to clear `rs_pub` back to `null`
+    /// on failure (see `readAct3`'s own `errdefer` below): that field is
+    /// otherwise set BEFORE the act's final decrypt can still fail, which
+    /// is exactly the audit finding F5 half that isn't about `state`.
+    pub const State = enum { start, ready_act2, awaiting_act3, done, failed };
 
     /// See `Initiator.deinit` — same fields, same caveat about dead-stack
     /// copies from `readAct1`/`act2`/`readAct3`'s own by-value locals.
@@ -430,6 +447,7 @@ pub const Responder = struct {
     /// 7. `h = SHA256(h || c)` — automatic.
     pub fn readAct1(self: *Responder, msg: act.Act1) HandshakeError!void {
         if (self.state != .start) return error.WrongState;
+        errdefer self.state = .failed;
         self.ss.mixHash(&msg.e_pub);
         const es = try dh.dh(self.ls.secret_key, msg.e_pub);
         self.ss.mixKey(&es);
@@ -467,6 +485,7 @@ pub const Responder = struct {
 
     fn act2(self: *Responder, e: dh.KeyPair) HandshakeError!act.Act2 {
         if (self.state != .ready_act2) return error.WrongState;
+        errdefer self.state = .failed;
         self.ephemeral = e;
         self.ss.mixHash(&e.public_key);
         const ee = try dh.dh(e.secret_key, self.re_pub.?);
@@ -517,6 +536,7 @@ pub const Responder = struct {
     ///     step 6 relies on).
     pub fn readAct3(self: *Responder, msg: act.Act3) HandshakeError!HandshakeResult {
         if (self.state != .awaiting_act3) return error.WrongState;
+        errdefer self.state = .failed;
         // Step 3: decrypt the initiator's static key at nonce 1 — `ss` is
         // STILL keyed with temp_k2 from genAct2 (nonce-continuity, see the
         // doc comment).
@@ -528,6 +548,13 @@ pub const Responder = struct {
         // "act3 bad rs test"); only a VALIDATED key is stored.
         const se = try dh.dh(self.ephemeral.?.secret_key, rs);
         self.rs_pub = rs;
+        // Audit finding F5: `rs_pub` above is set from a VALIDATED key, but
+        // the handshake can still fail below (the final `decryptAndHash` —
+        // step 7, the MAC over the whole transcript). Until that succeeds
+        // too, the peer has not actually authenticated as `rs`, so a
+        // failure past this point must not leave `rs_pub` looking like it
+        // did.
+        errdefer self.rs_pub = null;
         self.ss.mixKey(&se);
         var empty: [0]u8 = undefined;
         try self.ss.decryptAndHash(&msg.t, &empty);

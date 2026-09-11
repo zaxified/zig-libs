@@ -50,7 +50,7 @@ test "completeness: prove/verify accepts several in-range values, n=8" {
         const commitment = bulletproofs.commit(gens, v_bytes, gamma);
 
         var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
-        const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, v, gamma);
+        const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, &v, gamma);
         defer proof.deinit(std.testing.allocator);
 
         var verify_t = Transcript.init(bulletproofs.rangeproof_domain);
@@ -103,7 +103,7 @@ test "soundness: prove rejects v >= 2^n through the public API, without panickin
     var t = Transcript.init(bulletproofs.rangeproof_domain);
     try std.testing.expectError(
         error.ValueOutOfRange,
-        bulletproofs.prove(std.testing.allocator, gens, &t, 256, scalarvec.zero),
+        bulletproofs.prove(std.testing.allocator, gens, &t, &@as(u64, 256), scalarvec.zero),
     );
 }
 
@@ -121,7 +121,7 @@ test "soundness: tampering any proof field is rejected" {
     const commitment = bulletproofs.commit(gens, v_bytes, gamma);
 
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
-    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, v, gamma);
+    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, &v, gamma);
     defer proof.deinit(std.testing.allocator);
 
     // Sanity: the untampered proof verifies.
@@ -244,11 +244,11 @@ test "zero-knowledge: two proofs of the identical witness are not bit-identical"
     const gamma = [_]u8{42} ++ [_]u8{0} ** 31;
 
     var t1 = Transcript.init(bulletproofs.rangeproof_domain);
-    const p1 = try bulletproofs.prove(std.testing.allocator, gens, &t1, v, gamma);
+    const p1 = try bulletproofs.prove(std.testing.allocator, gens, &t1, &v, gamma);
     defer p1.deinit(std.testing.allocator);
 
     var t2 = Transcript.init(bulletproofs.rangeproof_domain);
-    const p2 = try bulletproofs.prove(std.testing.allocator, gens, &t2, v, gamma);
+    const p2 = try bulletproofs.prove(std.testing.allocator, gens, &t2, &v, gamma);
     defer p2.deinit(std.testing.allocator);
 
     // Both must independently verify (positive control: a broken runner
@@ -284,7 +284,7 @@ test "soundness: a proof for V is rejected against a different commitment V'" {
 
     const gamma1 = [_]u8{5} ++ [_]u8{0} ** 31;
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
-    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, 50, gamma1);
+    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, &@as(u64, 50), gamma1);
     defer proof.deinit(std.testing.allocator);
 
     const gamma2 = [_]u8{6} ++ [_]u8{0} ** 31;
@@ -309,7 +309,7 @@ test "soundness: verifying with a differently-sized Generators set is rejected" 
     const commitment = bulletproofs.commit(gens8, v_bytes, gamma);
 
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
-    const proof = try bulletproofs.prove(std.testing.allocator, gens8, &prove_t, 50, gamma);
+    const proof = try bulletproofs.prove(std.testing.allocator, gens8, &prove_t, &@as(u64, 50), gamma);
     defer proof.deinit(std.testing.allocator);
 
     // Verifying the n=8 proof against the n=16 generator set must not
@@ -341,7 +341,7 @@ test "soundness: random forgeries of L_0 are never accepted (discriminating powe
     const commitment = bulletproofs.commit(gens, [_]u8{@truncate(v)} ++ [_]u8{0} ** 31, gamma);
 
     var prove_t = Transcript.init(bulletproofs.rangeproof_domain);
-    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, v, gamma);
+    const proof = try bulletproofs.prove(std.testing.allocator, gens, &prove_t, &v, gamma);
     defer proof.deinit(std.testing.allocator);
 
     // Positive control: the untampered proof must verify, or the loop below

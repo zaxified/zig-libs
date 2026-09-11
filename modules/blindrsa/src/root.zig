@@ -404,19 +404,32 @@ pub const BlindError = PssEncodeError || error{
     /// check on the `toBytes` write) out, turning that into an
     /// out-of-bounds write in the build that ships.
     OutputTooSmall,
+    /// `salt_len` was neither `0` (PSSZERO) nor `Hash.digest_length` (PSS)
+    /// — the only two values RFC 9474 §5 defines. Audit finding B16: this
+    /// guards the buffer `blind` draws the salt into, sized
+    /// `Hash.digest_length`.
+    InvalidSaltLength,
 };
 
 /// RFC 9474 §4 **Blind** (client): encodes `prepared_msg` via
 /// `pssEncode`, then blinds the resulting integer against `pk` so the
-/// server can sign it without learning `prepared_msg`. `salt` is
-/// caller-supplied (`salt.len == 0` selects PSSZERO, `salt.len ==
-/// Hash.digest_length` selects plain PSS); a real client draws it fresh
-/// from `random` before calling. `random` MUST be cryptographically
-/// secure — both the blinding factor `r`'s secrecy/uniformity (the entire
-/// unlinkability argument) and the Euclid-masking inside `maskedInvert`
-/// depend on it. On success, writes the modulus-length blinded message
-/// into `blinded_msg_out` and fills `ctx_out` with everything `finalize`
-/// needs later.
+/// server can sign it without learning `prepared_msg`. `salt_len == 0`
+/// selects the PSSZERO variants, `salt_len == Hash.digest_length` (48 for
+/// SHA-384) selects plain PSS (RFC 9474 §5) — `blind` draws the salt
+/// itself, `salt_len` bytes from `random`, rather than taking it as a
+/// parameter (audit finding B16: RFC 9474 §7.4 "implementations SHOULD NOT
+/// allow clients to provide these values directly" — a maliciously chosen
+/// salt is visible in the final signature and can carry the client's
+/// identity, e.g. its own IP address per the RFC's example, without the
+/// client detecting it, which defeats unlinkability, the entire point of
+/// this module). Determinism for the RFC 9474 Appendix A KATs (whose fixed
+/// `r` this function cannot take) lives in `blindWithFactor`, which keeps
+/// the `salt` parameter for exactly that reason. `random` MUST be
+/// cryptographically secure — the salt, the blinding factor `r`'s
+/// secrecy/uniformity (the entire unlinkability argument), and the
+/// Euclid-masking inside `maskedInvert` all depend on it. On success,
+/// writes the modulus-length blinded message into `blinded_msg_out` and
+/// fills `ctx_out` with everything `finalize` needs later.
 ///
 /// Construction (RFC 9474 §4 Blind): steps 5-6 here (sample `r` uniform
 /// in `[1, n)` by rejection, `inv = r⁻¹ mod n` via the masked
@@ -426,11 +439,17 @@ pub fn blind(
     pk: rsa.PublicKey,
     comptime Hash: type,
     prepared_msg: []const u8,
-    salt: []const u8,
+    salt_len: usize,
     random: std.Random,
     ctx_out: *Context,
     blinded_msg_out: []u8,
 ) BlindError![]u8 {
+    if (salt_len != 0 and salt_len != Hash.digest_length) return error.InvalidSaltLength;
+    var salt_buf: [Hash.digest_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &salt_buf);
+    const salt = salt_buf[0..salt_len];
+    random.bytes(salt);
+
     // Steps 5-6: sample r ∈ [1, n) uniformly; invert it (masked — r is
     // secret and the Euclid loop is variable-time). A non-invertible r
     // (gcd(r, n) != 1 — probability ~2⁻²⁰⁴⁷, or evidence n is malformed)
@@ -1139,7 +1158,7 @@ const DeadStackFixedRandom = struct {
 
 noinline fn deadStackRunBlind(pk: rsa.PublicKey, random: std.Random, ctx: *Context) void {
     var bm: [max_modulus_len]u8 = undefined;
-    _ = blind(pk, std.crypto.hash.sha2.Sha384, &kat.a1.prepared_msg, &kat.a1.salt, random, ctx, &bm) catch unreachable;
+    _ = blind(pk, std.crypto.hash.sha2.Sha384, &kat.a1.prepared_msg, kat.a1.salt.len, random, ctx, &bm) catch unreachable;
 }
 
 // A1 B6 isolation probes (2026-09-11): does `Fe.fromBytes` ALONE leak, with

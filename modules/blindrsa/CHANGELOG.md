@@ -5,6 +5,39 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **API CHANGE:** `blind`'s `salt: []const u8` parameter
+  becomes `salt_len: usize` (audit finding B16). RFC 9474 §7.4: "these
+  values [the PSS salt and the blinding factor] SHOULD NOT [be provided
+  by the client directly] ... a malicious client could use this mechanism
+  to embed identifying information", giving `blind` the ability to reveal
+  which client made a request through the final signature — the exact
+  unlinkability property this module exists to provide. `blind` now draws
+  the salt itself, `salt_len` bytes from the `random` parameter it already
+  required (`salt_len == 0` selects PSSZERO, `salt_len ==
+  Hash.digest_length` selects PSS, matching the existing `Context.salt_len`
+  convention); any other length is `error.InvalidSaltLength`.
+  `QUESTIONS-ROUND-2.md` Q3: the coordinator's ruling on this exact
+  finding — the user asked for "library generates the salt, caller may
+  override with its own", but RFC 9474 §7.4 names the salt specifically
+  (PSS salt is visible in the final signature and unlinkability is this
+  module's entire purpose, unlike a message the client already controls),
+  so the caller-override half is not implemented; determinism for tests
+  goes through `blindWithFactor`, which **keeps** its `salt: []const u8`
+  parameter so RFC 9474 Appendix A's KATs still reproduce bit-for-bit.
+  Measured: all existing Appendix A.1-A.4 KATs stay byte-exact (they use
+  `blindWithFactor`, untouched); a new test
+  ("two calls ... draw different salts") shows two `blind` calls with the
+  same input but different RNG state produce different `blinded_msg` when
+  everything else about the RNG stream is held identical, and the same
+  output when the salt is (with a mutation — `RED` before, `GREEN` after —
+  confirming the test actually depends on this). `src/ctgrind_harness.zig`
+  updated: `blind` now draws the salt BEFORE sampling `r`, so its
+  `BlindRandom` test double discriminates the tainted `r` draw by LENGTH
+  (the modulus length) rather than by "the first `fill` call" — the salt's
+  `Hash.digest_length`/`0`-byte draw can never collide with that. All call
+  sites in this module (`kat_test.zig`, `example/main.zig`, `README.md`)
+  updated to pass `salt_len`.
+
 - **2026-09-10** — A1 fix campaign, continued: B12 closed, B6/B9 measured honestly.
   `isCoprime` is split into a thin wrapper and an allocator-parameterized
   `isCoprimeAlloc` (both private; no public API change) purely so a test can inject a

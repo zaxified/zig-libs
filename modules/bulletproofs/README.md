@@ -47,7 +47,7 @@ const gamma = ...; // caller-supplied random blinding scalar
 const commitment = bulletproofs.commit(gens, v_as_scalar_bytes, gamma);
 
 var prove_transcript = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);
-const proof = try bulletproofs.prove(allocator, gens, &prove_transcript, v, gamma);
+const proof = try bulletproofs.prove(allocator, gens, &prove_transcript, &v, gamma);
 defer proof.deinit(allocator);
 
 var verify_transcript = bulletproofs.Transcript.init(bulletproofs.rangeproof_domain);

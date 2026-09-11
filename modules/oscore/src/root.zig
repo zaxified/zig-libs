@@ -569,31 +569,126 @@ pub fn encodeEncStructure(allocator: std.mem.Allocator, external_aad: []const u8
     return list.toOwnedSlice(allocator);
 }
 
-pub const BuildAadError = std.mem.Allocator.Error;
+pub const BuildAadError = error{
+    /// `dst` is not big enough to hold the encoded AAD. Call
+    /// `buildAadLen(params)` first to size a buffer exactly, or pass a
+    /// buffer at least `buildAadLen(params)` bytes long.
+    BufferTooSmall,
+};
+
+fn cborHeadLen(arg: u64) usize {
+    if (arg < 24) return 1;
+    if (arg <= 0xFF) return 2;
+    if (arg <= 0xFFFF) return 3;
+    if (arg <= 0xFFFFFFFF) return 5;
+    return 9;
+}
+
+/// Write a CBOR head (major type + argument) at `dst[i.*..]`, advancing
+/// `i.*` by however many bytes it took — the buffer-writing twin of
+/// `cborHead` above (same encoding, `error.BufferTooSmall` instead of
+/// `Allocator.Error` when `dst` runs out).
+fn cborHeadInto(dst: []u8, i: *usize, major: u3, arg: u64) BuildAadError!void {
+    const mt: u8 = @as(u8, major) << 5;
+    const len = cborHeadLen(arg);
+    if (dst.len - i.* < len) return error.BufferTooSmall;
+    switch (len) {
+        1 => dst[i.*] = mt | @as(u8, @intCast(arg)),
+        2 => {
+            dst[i.*] = mt | 24;
+            dst[i.* + 1] = @intCast(arg);
+        },
+        3 => {
+            dst[i.*] = mt | 25;
+            std.mem.writeInt(u16, dst[i.* + 1 ..][0..2], @intCast(arg), .big);
+        },
+        5 => {
+            dst[i.*] = mt | 26;
+            std.mem.writeInt(u32, dst[i.* + 1 ..][0..4], @intCast(arg), .big);
+        },
+        else => {
+            dst[i.*] = mt | 27;
+            std.mem.writeInt(u64, dst[i.* + 1 ..][0..8], arg, .big);
+        },
+    }
+    i.* += len;
+}
+
+fn cborBstrInto(dst: []u8, i: *usize, bytes: []const u8) BuildAadError!void {
+    try cborHeadInto(dst, i, 2, bytes.len);
+    if (dst.len - i.* < bytes.len) return error.BufferTooSmall;
+    @memcpy(dst[i.*..][0..bytes.len], bytes);
+    i.* += bytes.len;
+}
+
+/// The exact size of `encodeAadArray(params)`'s output (RFC 8613 §5.4's
+/// `aad_array`) — the piece `buildAadLen` wraps as `Enc_structure`'s
+/// `external_aad` bstr.
+fn aadArrayLen(params: AadParams) usize {
+    return 1 // array header, 5 elements
+    + cborHeadLen(params.oscore_version) + 1 // algorithms array header (1 element)
+    + cborHeadLen(@as(u64, @intCast(@intFromEnum(params.algorithm)))) + cborHeadLen(params.request_kid.len) + params.request_kid.len + cborHeadLen(params.request_piv.len) + params.request_piv.len + cborHeadLen(params.options.len) + params.options.len;
+}
+
+/// The exact number of bytes `buildAad(dst, params)` writes — size a
+/// buffer with this (or `max_aad_len` for a fixed-size stack buffer that
+/// covers any realistic `options` length; see its doc comment) before
+/// calling `buildAad`.
+pub fn buildAadLen(params: AadParams) usize {
+    const external_aad_len = aadArrayLen(params);
+    return 1 // Enc_structure array header, 3 elements
+    + 1 + 8 // "Encrypt0" text string header (always 1 byte, len 8 < 24) + bytes
+    + 1 // empty "protected" bstr header (len 0 < 24)
+    + cborHeadLen(external_aad_len) + external_aad_len;
+}
 
 /// RFC 8613 §5.4's full AAD: `AAD = Enc_structure = ["Encrypt0", h'',
-/// external_aad]` where `external_aad` is `encodeAadArray(params)`.
+/// external_aad]` where `external_aad` is `encodeAadArray(params)`,
+/// written directly into caller-supplied `dst` — no allocation (audit
+/// finding F13: the old `encodeAadArray`/`encodeEncStructure`-composing
+/// version allocated twice per sub-call — growable `ArrayList` plus
+/// `toOwnedSlice` each — for a message whose AAD, in every real Appendix C
+/// vector, is under 40 bytes; measured at +150% over the bare AEAD for a
+/// 16-byte payload, almost all of it allocator overhead, not encoding
+/// work). `encodeAadArray`/`encodeEncStructure` above are UNCHANGED and
+/// still the ones `kat_test.zig` pins byte-exact against Appendix
+/// C.4-C.8's `aad_array`/`AAD` fields directly; this function encodes the
+/// same bytes by a different, allocation-free route (also covered by its
+/// own direct KAT assertion).
 ///
-/// Construction (both sub-steps are ALREADY REAL — see each's own doc
-/// comment — this is their composition):
-/// 1. `aad_array = encodeAadArray(allocator, params)`.
-/// 2. `return encodeEncStructure(allocator, aad_array)` (freeing
-///    `aad_array` after, since only the wrapped result is returned).
-///
-/// Kept as its own named core (rather than inlined into `protect`/
-/// `unprotect`, and despite being a two-line composition of functions
-/// that are already real) because the task brief that scaffolded this
-/// module lists §5.4's AAD assembly as one of the four KAT-critical
-/// crypto-adjacent pieces — key derivation, the nonce, the AAD, and the
-/// AEAD seal/open — so `kat_test.zig` gates its correctness on its OWN
-/// direct byte-exact assertion (Appendix C.4-C.8's `AAD` field) rather
-/// than only checking it transitively through a passing `protect`/
-/// `unprotect` round trip.
-pub fn buildAad(allocator: std.mem.Allocator, params: AadParams) BuildAadError![]u8 {
-    const aad_array = try encodeAadArray(allocator, params);
-    defer allocator.free(aad_array);
-    return encodeEncStructure(allocator, aad_array);
+/// Returns `error.BufferTooSmall` if `dst.len < buildAadLen(params)`,
+/// rather than writing a truncated AAD.
+pub fn buildAad(dst: []u8, params: AadParams) BuildAadError![]u8 {
+    const total = buildAadLen(params);
+    if (dst.len < total) return error.BufferTooSmall;
+    var i: usize = 0;
+    try cborHeadInto(dst, &i, 4, 3); // Enc_structure: array of 3
+    try cborHeadInto(dst, &i, 3, 8); // "Encrypt0" text string
+    @memcpy(dst[i..][0..8], "Encrypt0");
+    i += 8;
+    try cborBstrInto(dst, &i, &.{}); // protected header: always empty
+    try cborHeadInto(dst, &i, 2, aadArrayLen(params)); // external_aad bstr header
+    // aad_array, written straight into the same buffer as external_aad's payload.
+    try cborHeadInto(dst, &i, 4, 5); // array of 5
+    try cborHeadInto(dst, &i, 0, params.oscore_version);
+    try cborHeadInto(dst, &i, 4, 1); // algorithms: array of 1
+    try cborHeadInto(dst, &i, 0, @as(u64, @intCast(@intFromEnum(params.algorithm))));
+    try cborBstrInto(dst, &i, params.request_kid);
+    try cborBstrInto(dst, &i, params.request_piv);
+    try cborBstrInto(dst, &i, params.options);
+    std.debug.assert(i == total);
+    return dst[0..i];
 }
+
+/// Headroom for `buildAad`'s scratch buffer inside `protect`/`unprotect`:
+/// covers the largest realistic `aad_array` — CBOR overhead, an
+/// `id_piv_field_width`-bounded (7 B) `request_kid`/`request_piv`, and up
+/// to 128 bytes of Class I CoAP options (every RFC 8613 Appendix C vector
+/// has none at all; `kat_test.zig` pins those byte-exact). A deployment
+/// whose Class I options routinely exceed this should call `buildAad`
+/// directly with its own larger buffer instead of going through
+/// `protect`/`unprotect`.
+pub const max_aad_len: usize = 192;
 
 // ── §6.1 compressed COSE option value — REAL codec ──────────────────────
 
@@ -978,6 +1073,9 @@ pub const ProtectError = error{
     /// algorithm can safely generate and MUST be re-established (§7.2.1)
     /// before protecting another message.
     SequenceNumberExhausted,
+    /// The AAD (`aad.options`, almost always) does not fit in
+    /// `max_aad_len` bytes — see `buildAad`'s doc comment (F13).
+    AadTooLarge,
 };
 
 /// The result of `protect`: the compressed COSE option value to carry in
@@ -1029,17 +1127,18 @@ pub const Protected = struct {
 ///    (`error.SequenceNumberExhausted`) if `piv > max_partial_iv`.
 /// 2. `nonce = computeNonce(ctx.common.common_iv, ctx.sender.id, piv)`
 ///    (propagates `error.IdTooLong`).
-/// 3. `full_aad = buildAad(allocator, aad)`.
+/// 3. `full_aad = buildAad(&aad_buf, aad)` (audit finding F13: into a
+///    fixed-size stack buffer, `error.AadTooLarge` if it does not fit —
+///    no allocation, unlike the rest of this function).
 /// 4. `ciphertext`: allocate `plaintext.len + tag_length` bytes;
 ///    `std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(ciphertext[0..plaintext.len],
 ///    ciphertext[plaintext.len..][0..tag_length], plaintext, full_aad,
 ///    nonce, ctx.sender.key)` — this module's target AEAD (see the
 ///    module doc comment's std-recon finding); tag appended after the
 ///    ciphertext (COSE's own convention, RFC 8152 §5.2).
-/// 5. Free `full_aad`.
-/// 6. `ctx.sender.sequence_number += 1` (only after a successful
+/// 5. `ctx.sender.sequence_number += 1` (only after a successful
 ///    encrypt — a failure before this point must not burn a nonce).
-/// 7. Build the `OscoreOption`: `.partial_iv = piv`, `.kid = if
+/// 6. Build the `OscoreOption`: `.partial_iv = piv`, `.kid = if
 ///    (include_kid) ctx.sender.id else null`, `.kid_context =
 ///    kid_context`.
 pub fn protect(
@@ -1062,8 +1161,8 @@ pub fn protect(
         error.PartialIvTooLarge => return error.SequenceNumberExhausted,
     };
 
-    const full_aad = try buildAad(allocator, aad);
-    defer allocator.free(full_aad);
+    var aad_buf: [max_aad_len]u8 = undefined;
+    const full_aad = buildAad(&aad_buf, aad) catch return error.AadTooLarge;
 
     const ciphertext = try allocator.alloc(u8, plaintext.len + tag_length);
     std.crypto.aead.aes_ccm.Aes128Ccm8.encrypt(
@@ -1109,6 +1208,8 @@ pub const UnprotectError = error{
     /// The AEAD tag did not verify
     /// (`std.crypto.errors.AuthenticationError`).
     AuthenticationFailed,
+    /// See `ProtectError.AadTooLarge` (F13) — same buffer, same cause.
+    AadTooLarge,
 };
 
 /// Verifies + decrypts an OSCORE-protected message back to its §5.3
@@ -1152,7 +1253,9 @@ pub const UnprotectError = error{
 ///    step 5 succeeds (see `ReplayWindow.update`'s own doc comment: never
 ///    record an unverified sequence number as seen).
 /// 3. `nonce = computeNonce(ctx.common.common_iv, id_piv, piv)`.
-/// 4. `full_aad = buildAad(allocator, aad)`.
+/// 4. `full_aad = buildAad(&aad_buf, aad)` (audit finding F13: fixed-size
+///    stack buffer, `error.AadTooLarge` if it does not fit — no
+///    allocation, same as `protect`).
 /// 5. Split `ciphertext` into `body = ciphertext[0..ciphertext.len -
 ///    tag_length]` / `tag = ciphertext[ciphertext.len - tag_length..]`;
 ///    `plaintext`: allocate `body.len` bytes;
@@ -1160,10 +1263,9 @@ pub const UnprotectError = error{
 ///    full_aad, nonce, ctx.recipient.key)`; map
 ///    `error.AuthenticationFailed` through unchanged (same error name,
 ///    both sets define it).
-/// 6. Free `full_aad`.
-/// 7. If `is_request` and step 5 succeeded:
+/// 6. If `is_request` and step 5 succeeded:
 ///    `ctx.recipient.replay_window.update(piv)`.
-/// 8. Return `plaintext`.
+/// 7. Return `plaintext`.
 pub fn unprotect(
     allocator: std.mem.Allocator,
     ctx: *SecurityContext,
@@ -1199,8 +1301,8 @@ pub fn unprotect(
     const nonce = try computeNonce(ctx.common.common_iv, id_piv, piv);
 
     // Step 4: AAD.
-    const full_aad = try buildAad(allocator, aad);
-    defer allocator.free(full_aad);
+    var aad_buf: [max_aad_len]u8 = undefined;
+    const full_aad = buildAad(&aad_buf, aad) catch return error.AadTooLarge;
 
     // Step 5: split ciphertext-then-tag, then AEAD-open. A payload too
     // short to even carry a tag cannot possibly authenticate — fail

@@ -274,7 +274,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var key_one = deriveBytes(16, "ctgrind-ctap2pin-harness-token-one-v1");
             taintIf(tainted, &key_one);
             const k1 = reloadVolatile(16, &key_one);
-            const sig1 = ctap2pin.One.authenticate(&k1, msg);
+            const sig1 = try ctap2pin.One.authenticate(&k1, msg);
             const ok1 = ctap2pin.One.verify(&k1, msg, &sig1);
 
             var key_two = deriveBytes(32, "ctgrind-ctap2pin-harness-token-two-v1");

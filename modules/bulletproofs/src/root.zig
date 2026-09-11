@@ -165,10 +165,12 @@ pub const Ristretto255 = std.crypto.ecc.Ristretto255;
 // is imported explicitly below since nothing else references it.
 
 const kat_test = @import("kat_test.zig");
+const stackprobe_test = @import("stackprobe_test.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = kat_test;
+    _ = stackprobe_test;
 }
 
 test "meta.model_after names Bulletproofs + Ristretto255" {
