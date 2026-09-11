@@ -5,6 +5,54 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-12** — A1 fix campaign round 2, decision Q1 (this module's only
+  in-repo consumers are `modules/metrics/example` and
+  `example-apps/http-service`, which the burndown's "konz." column does not
+  see — treated as "no consumer", so the norm wins even where it rejects
+  input accepted today):
+  - **BEHAVIOURAL:** F3 — `AccessLog`'s JSON writer now guarantees valid
+    JSON *and* valid UTF-8 for any input bytes. HTTP/2 does not bound
+    `:path` to printable ASCII the way HTTP/1.1 does (`h1.zig:438` vs.
+    `h2_server.zig:1416-1419`), so a byte outside UTF-8 was reachable in
+    `entry.path` from the wire and produced a `.json` line `std.json`
+    rejected, falsifying the module's own repository-wide fuzz exemption
+    ("there is no path from a socket" to a byte-accepting function — true
+    of `Registry.counter`/`gauge`/`histogram`, false of this path). Fixed
+    at the writer, not in `http`: RFC 9110's obs-text permits 0x80-0xFF in
+    a field value, so `http` is right not to reject it. A byte that is not
+    part of a valid UTF-8 sequence is now replaced with U+FFFD, one byte at
+    a time; a valid multi-byte sequence still passes through unchanged.
+  - **BEHAVIOURAL, new `RegisterError` variants:** F5 — a histogram's
+    derived sample names (`<name>_bucket`/`_sum`/`_count`) are now reserved
+    against a different family taking the same name, in either
+    registration order (`RegisterError.NameCollision`) — previously two
+    same-named, different-valued samples could reach the same exposition,
+    which Prometheus's scrape parser rejects outright, blinding every
+    other family too. F6 — a label value or HELP text that is not valid
+    UTF-8 is now rejected at registration (`RegisterError.InvalidUtf8`)
+    instead of reaching the wire and breaking the exposition's own
+    `charset=utf-8` promise. F13 — `le` and `quantile` are now reserved
+    label names on every instrument kind, not just histograms
+    (`RegisterError.ReservedLabelName`); previously `le` was accepted on a
+    counter or gauge, which is exactly the mechanism F5's collision needed.
+  - **BEHAVIOURAL:** F9 — `RequestMetrics.init` now touches the request
+    counter and latency histogram families, as its own doc comment already
+    promised, not just the in-flight gauge. A name collision with a family
+    the application registered first now fails at `init`, matching the
+    documented "misconfiguration fails here, not mid-request" — before
+    this fix, such a collision returned success and silently, permanently
+    disabled the request counter or histogram, with no error anywhere.
+  - **Documentation, no behavior forced:** F12/R3 — the recommended
+    middleware order around `/metrics` flips: register `RequestMetrics`
+    before `Endpoint` by default, so a scrape is measured like any other
+    request (closes the one blind spot a scrape flood otherwise leaves in
+    telemetry, see F2/F8 below). Registering `Endpoint` first remains a
+    fully supported, explicit opt-out (uncounted scrapes, request-rate
+    numbers the scrape interval cannot skew) and stays covered by its own
+    tests.
+
+  scripts/modtest metrics: 38/38 (Debug; was 32/32 before this batch).
+
 - **2026-09-11** — A1 fix campaign, F15's last three mutations (M29, M31,
   M32) get regression coverage (test-only, no production behavior change).
   A prior pass left these open, reasoning that proving `writeText`/
