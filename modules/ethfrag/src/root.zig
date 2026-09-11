@@ -306,6 +306,27 @@ pub const InsertError = Header.DecodeError || error{
     TableFull,
 } || Allocator.Error;
 
+/// Order `offset` against `item.offset`, for `std.sort.lowerBound` over a
+/// `[]Interval` sorted by offset (Audit F9).
+fn intervalOffsetOrder(offset: u16, item: Reassembler.Interval) std.math.Order {
+    return std.math.order(offset, item.offset);
+}
+
+/// Does `[offset, offset+length)` overlap `iv`? Includes the F1/A21
+/// zero-length-duplicate special case (see the call site's comment).
+/// Counts each call in `test_f9_overlap_checks` — a timing-free measure of
+/// how much overlap-check work one `insert` does (see the campaign's F9
+/// test), incremented unconditionally since the cost of a `usize` add is
+/// immaterial next to the comparisons/branches around it.
+fn intervalOverlaps(offset: u16, length: u16, end: usize, iv: Reassembler.Interval) bool {
+    test_f9_overlap_checks += 1;
+    if (length == 0 and iv.length == 0 and iv.offset == offset) return true;
+    const iv_end = @as(usize, iv.offset) + @as(usize, iv.length);
+    return @as(usize, offset) < iv_end and end > @as(usize, iv.offset);
+}
+var test_f9_overlap_checks: usize = 0;
+var test_f8_bytes_allocated: usize = 0;
+
 /// Bounded, stateful reassembler for `fragment()`'s wire format. The free
 /// functions above are reentrant; a `Reassembler` instance itself is
 /// single-owner — one caller drives `insert`/`expireOlderThan` at a time.
@@ -317,7 +338,18 @@ pub const Reassembler = struct {
     const Interval = struct { offset: u16, length: u16 };
 
     const Entry = struct {
-        buf: []u8, // len == config.max_frame_len
+        // Audit F8: `buf.len` starts at whatever the datagram's FIRST
+        // fragment actually needs (not `config.max_frame_len`) and grows
+        // via `ensureCapacity` only as far as later fragments require —
+        // measured 3648x amplification came from allocating and
+        // immediately freeing the full `max_frame_len` buffer for every
+        // fragment id, even a 9-byte one.
+        buf: []u8,
+        // Audit F9: kept SORTED by `offset` (see `insert`'s use of
+        // `std.sort.lowerBound` + `ArrayListUnmanaged.insert`), so the
+        // overlap check only ever looks at the immediate neighbors of the
+        // insertion point instead of scanning every previously accepted
+        // interval on every fragment.
         intervals: std.ArrayListUnmanaged(Interval) = .empty,
         covered: usize = 0,
         total_len: ?usize = null,
@@ -327,6 +359,19 @@ pub const Reassembler = struct {
         fn deinit(self: *Entry, allocator: Allocator) void {
             allocator.free(self.buf);
             self.intervals.deinit(allocator);
+        }
+
+        /// Grow `buf` to at least `needed` bytes, amortized (doubling,
+        /// capped at `max_frame_len`) — a no-op if it is already that big.
+        /// `Allocator.realloc` preserves the existing bytes up to the
+        /// smaller of the old/new lengths, so already-written fragment
+        /// data survives a grow.
+        fn ensureCapacity(self: *Entry, allocator: Allocator, needed: usize, cap: usize) Allocator.Error!void {
+            if (self.buf.len >= needed) return;
+            const doubled = self.buf.len * 2;
+            const new_len = @min(cap, @max(needed, doubled));
+            self.buf = try allocator.realloc(self.buf, new_len);
+            test_f8_bytes_allocated += new_len; // A1 F8 measurement
         }
     };
 
@@ -455,10 +500,15 @@ pub const Reassembler = struct {
 
         const gop = try self.entries.getOrPut(self.allocator, hdr.frag_id);
         if (!gop.found_existing) {
-            const buf = self.allocator.alloc(u8, self.config.max_frame_len) catch |err| {
+            // Audit F8: size the buffer to what THIS fragment needs, not
+            // to `config.max_frame_len` — `ensureCapacity` grows it later
+            // if a bigger fragment for the same id arrives.
+            const initial_len: usize = if (hdr.length > 0) frag_end else 0;
+            const buf = self.allocator.alloc(u8, initial_len) catch |err| {
                 _ = self.entries.remove(hdr.frag_id); // undo the getOrPut slot
                 return err;
             };
+            test_f8_bytes_allocated += initial_len; // A1 F8 measurement
             gop.value_ptr.* = .{ .buf = buf, .last_seen_ns = now_ns, .created_ns = now_ns };
         }
         const entry = gop.value_ptr;
@@ -508,32 +558,67 @@ pub const Reassembler = struct {
 
         // RFC 5722 §3: any overlap with a previously accepted byte range
         // (including an exact duplicate) drops the whole datagram.
-        for (entry.intervals.items) |iv| {
-            // Audit F1 (A21): the general half-open `[offset, offset+length)`
-            // overlap test below degenerates to the empty set whenever BOTH
-            // sides have zero length — an empty range never intersects
-            // anything, including an identical empty range at the same
-            // offset — so a `more=false, length=0` fragment (the one
-            // legitimate use: closing an all-empty frame) could be resent
-            // and accepted a second time under the SAME id. `more=true`
-            // zero-length fragments are already rejected outright above
-            // (`EmptyNonFinalFragment`), so only the `more=false` case can
-            // still reach here; this closes it without touching length > 0
-            // behaviour at all (an exact non-zero-length duplicate already
-            // self-overlaps under the ordinary test just below).
-            if (hdr.length == 0 and iv.length == 0 and iv.offset == hdr.offset) {
-                self.dropEntry(hdr.frag_id);
-                return error.OverlappingFragment;
-            }
-            const iv_end = @as(usize, iv.offset) + @as(usize, iv.length);
-            if (@as(usize, hdr.offset) < iv_end and frag_end > @as(usize, iv.offset)) {
+        //
+        // Audit F9: `entry.intervals` is kept sorted by `offset` (the
+        // `.insert` below, replacing the old unconditional `.append`), so
+        // accepted intervals are pairwise disjoint AND in offset order —
+        // an interval overlapping ANYTHING must overlap either the
+        // immediate PREDECESSOR (largest offset < hdr.offset) or one of a
+        // short run of SUCCESSORS whose own offset starts before this
+        // fragment ends. A non-zero-length successor in that run always
+        // overlaps and is caught on the very first one checked; only
+        // zero-length ties (the F1/A21 shape below) can make the run
+        // longer than one, and at most one zero-length AND one non-zero
+        // interval can ever share the same offset (a second attempt at
+        // either is itself rejected as an overlap). This replaces an
+        // unconditional scan of every previously accepted interval on
+        // every fragment (O(n) per insert, O(n²) per datagram) with a
+        // binary search plus a check bounded by what can actually be near
+        // `hdr.offset`.
+        const idx = std.sort.lowerBound(Interval, entry.intervals.items, hdr.offset, intervalOffsetOrder);
+
+        // Audit F1 (A21): the general half-open `[offset, offset+length)`
+        // overlap test degenerates to the empty set whenever BOTH sides
+        // have zero length — an empty range never intersects anything,
+        // including an identical empty range at the same offset — so a
+        // `more=false, length=0` fragment (the one legitimate use: closing
+        // an all-empty frame) could be resent and accepted a second time
+        // under the SAME id. `more=true` zero-length fragments are already
+        // rejected outright above (`EmptyNonFinalFragment`), so only the
+        // `more=false` case can still reach here; `intervalOverlaps` closes
+        // it without touching length > 0 behaviour at all (an exact
+        // non-zero-length duplicate already self-overlaps under the
+        // ordinary test).
+        if (idx > 0 and intervalOverlaps(hdr.offset, hdr.length, frag_end, entry.intervals.items[idx - 1])) {
+            self.dropEntry(hdr.frag_id);
+            return error.OverlappingFragment;
+        }
+        // `<=`, not `<`: a zero-length new fragment has `frag_end ==
+        // hdr.offset`, and an existing zero-length interval at that exact
+        // offset sorts at `idx` itself (not `idx - 1`) since lowerBound's
+        // `>=` comparison places offset TIES at or after `idx` — so the
+        // A21 same-offset-zero-length duplicate must still be in range
+        // here. A real (non-zero-length) neighbor landing exactly at
+        // `frag_end` is harmless to include: `intervalOverlaps` correctly
+        // says "no" for two ranges that only touch at an endpoint.
+        var succ = idx;
+        while (succ < entry.intervals.items.len and
+            @as(usize, entry.intervals.items[succ].offset) <= frag_end) : (succ += 1)
+        {
+            if (intervalOverlaps(hdr.offset, hdr.length, frag_end, entry.intervals.items[succ])) {
                 self.dropEntry(hdr.frag_id);
                 return error.OverlappingFragment;
             }
         }
 
-        if (hdr.length > 0) @memcpy(entry.buf[hdr.offset..frag_end], payload);
-        entry.intervals.append(self.allocator, .{ .offset = hdr.offset, .length = hdr.length }) catch |err| {
+        if (hdr.length > 0) {
+            entry.ensureCapacity(self.allocator, frag_end, self.config.max_frame_len) catch |err| {
+                self.dropEntry(hdr.frag_id);
+                return err;
+            };
+            @memcpy(entry.buf[hdr.offset..frag_end], payload);
+        }
+        entry.intervals.insert(self.allocator, idx, .{ .offset = hdr.offset, .length = hdr.length }) catch |err| {
             self.dropEntry(hdr.frag_id);
             return err;
         };
@@ -906,6 +991,83 @@ test "tiny-fragment flood is bounded by max_fragments_per_datagram" {
     buf[header_len] = 'x';
     try testing.expectError(error.TooManyFragments, r.insert(&buf, 4));
     try testing.expectEqual(@as(usize, 0), r.inflightCount());
+}
+
+test "A1 F9: overlap-check work grows near-linearithmically with fragment count, not quadratically" {
+    // Audit's own scaling shape: n=256 vs n=4096 (16x), all fragments
+    // valid, non-overlapping, densely packed -- exactly what made the OLD
+    // unconditional full-interval-list scan cost n^2/2 comparisons per
+    // datagram (measured 56x wall-clock for this same 16x growth).
+    // `test_f9_overlap_checks` counts every call to `intervalOverlaps`,
+    // which is now bounded by a binary search plus a short neighbor run
+    // instead of the whole list -- a timing-free, deterministic proxy for
+    // the work `insert` does, immune to machine noise.
+    const Case = struct { n: u16, checks: usize };
+    var cases: [2]Case = .{ .{ .n = 256, .checks = 0 }, .{ .n = 4096, .checks = 0 } };
+    for (&cases) |*c| {
+        var r = Reassembler.init(testing.allocator, .{
+            .max_inflight = 1,
+            .max_fragments_per_datagram = @as(usize, c.n) + 1,
+            .max_frame_len = @as(usize, c.n) + 1,
+            .timeout_ns = 1_000_000_000,
+        });
+        defer r.deinit();
+        test_f9_overlap_checks = 0;
+        var offset: u16 = 0;
+        var i: u16 = 0;
+        while (i < c.n) : (i += 1) {
+            var buf: [header_len + 1]u8 = undefined;
+            (Header{ .frag_id = 1, .offset = offset, .length = 1, .more = true }).encode(buf[0..header_len]);
+            buf[header_len] = 'x';
+            _ = try r.insert(&buf, i);
+            offset += 1;
+        }
+        c.checks = test_f9_overlap_checks;
+    }
+    const ratio_n = @as(f64, @floatFromInt(cases[1].n)) / @as(f64, @floatFromInt(cases[0].n));
+    const ratio_checks = @as(f64, @floatFromInt(cases[1].checks)) / @as(f64, @floatFromInt(cases[0].checks));
+    std.debug.print(
+        "A1 F9: n={d}->{d} ({d:.0}x fragments) overlap checks {d}->{d} ({d:.1}x) -- audit's OLD unbounded scan measured 56x WALL-CLOCK for this same 16x growth\n",
+        .{ cases[0].n, cases[1].n, ratio_n, cases[0].checks, cases[1].checks, ratio_checks },
+    );
+    // A true O(n^2) scan gives ratio_checks ~= ratio_n^2 (256x for 16x).
+    // This must land far below that -- 4x the LINEAR ratio is generous
+    // slack and still cleanly separates "still quadratic" from "fixed".
+    try testing.expect(ratio_checks < ratio_n * 4.0);
+}
+
+test "A1 F8: repeated overlap-drop churn allocates the fragment's OWN size, not max_frame_len" {
+    // Audit's own churn shape: the same tiny fragment inserted repeatedly
+    // under one frag_id, every other insert an exact duplicate -> dropped
+    // as OverlappingFragment -> the entry is torn down and rebuilt fresh
+    // on the next insert. Measured (churn.zig, `A1/ethfrag.md` F8):
+    // 450,000 B of wire traffic (50,000 x 9 B) forced 1,641,675,624 B of
+    // allocate-then-immediately-free churn, because every entry ate the
+    // full `max_frame_len` (65535 B) regardless of the fragment's own
+    // 9-byte size -- a 3648x amplification.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 1_000_000_000 });
+    defer r.deinit();
+
+    var buf: [header_len + 9]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 9, .more = true }).encode(buf[0..header_len]);
+    @memset(buf[header_len..], 0xAB);
+
+    test_f8_bytes_allocated = 0;
+    const inserts = 50_000;
+    var i: usize = 0;
+    while (i < inserts) : (i += 1) {
+        _ = r.insert(&buf, @intCast(i)) catch {}; // every other call is the duplicate -> OverlappingFragment
+    }
+    std.debug.print(
+        "A1 F8: {d} inserts of a 9 B fragment (churn) allocated {d} B total -- audit measured 1,641,675,624 B for the same 50,000-insert shape before this fix\n",
+        .{ inserts, test_f8_bytes_allocated },
+    );
+    // Each create-or-recreate needs exactly 9 bytes; the OLD code needed
+    // 65535 for every single one (450,000 B total requested here would
+    // have become ~3.3 GB). Generous slack (20 B/insert) still separates
+    // "sized to the fragment" from "sized to max_frame_len" by 3 orders
+    // of magnitude.
+    try testing.expect(test_f8_bytes_allocated < inserts * 20);
 }
 
 test "resource-cap exhaustion: max_inflight bounds concurrent datagrams" {
