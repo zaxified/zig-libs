@@ -263,9 +263,35 @@ pub fn chainStep(x: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [n]u8 {
 
 /// chain (§3.1.2, Algorithm 2, iteratively): F iterated `steps` times on X,
 /// at hash addresses start .. start+steps-1. Requires start + steps <= w-1.
-pub fn chain(x: [n]u8, start: u32, steps: u32, pub_seed: *const [n]u8, adrs: *Adrs) [n]u8 {
+///
+/// A1 audit F3 (2026-09-11): `x` is `*const [n]u8`, not `[n]u8` by value —
+/// an attempted partial mitigation of the dead-stack WOTS+ leak the audit
+/// measured (55/67 chain values recoverable in ReleaseFast). This removes
+/// ONE of the two copies `chain` used to make of the caller's value (the
+/// by-value parameter itself); the other (the mutable `tmp` this loop
+/// iterates on) is unavoidable — `chain` must hold a live, updatable copy
+/// to iterate `chainStep` on.
+///
+/// ⚠ **Measured RED → RED, not RED → GREEN.** A dedicated stack-scan test
+/// (`root.zig`, `A1 F3: chain's parameter-copy fix measured...`) found
+/// **67/67 leaf-0 chain-start values recoverable both before and after**
+/// this change — identical count. The dominant source is NOT `chain`'s own
+/// parameter copy: `wotsSkGen` returns a `[wots_len][n]u8` array holding
+/// ALL raw chain-start secrets at once (before any chaining happens), and
+/// `wotsSign` copies that whole array again into its own `sig` local — two
+/// much larger, longer-lived array-wide copies that `chain`'s narrower
+/// per-call parameter never dominated in the first place. This function's
+/// own fix is kept (real hygiene, matches the pattern used elsewhere in
+/// this codebase for secret `Fe`/array parameters), but the WOTS+ F3
+/// finding stays open on the strength of an honest RED→RED, not this
+/// change. Zig also has no guaranteed stack-scrub on frame return/reuse
+/// (`zig_std_crypto_leaves_key_schedules_on_stack`, the same unsolved
+/// class `std.crypto` has for its own key schedules), so even a full fix
+/// of `wotsSkGen`/`wotsSign`'s array copies would not by itself guarantee
+/// zero recoverable copies.
+pub fn chain(x: *const [n]u8, start: u32, steps: u32, pub_seed: *const [n]u8, adrs: *Adrs) [n]u8 {
     std.debug.assert(start + steps <= w - 1);
-    var tmp = x;
+    var tmp = x.*;
     var i = start;
     while (i < start + steps) : (i += 1) {
         adrs.setHashAddress(i);
@@ -307,7 +333,7 @@ pub fn wotsPkGen(sk_seed: *const [n]u8, pub_seed: *const [n]u8, adrs: *Adrs) [wo
     var pk = wotsSkGen(sk_seed, pub_seed, adrs);
     for (&pk, 0..) |*node, i| {
         adrs.setChainAddress(@intCast(i));
-        node.* = chain(node.*, 0, w - 1, pub_seed, adrs);
+        node.* = chain(node, 0, w - 1, pub_seed, adrs);
     }
     return pk;
 }
@@ -340,7 +366,7 @@ pub fn wotsSign(msg: *const [n]u8, sk_seed: *const [n]u8, pub_seed: *const [n]u8
     var sig = wotsSkGen(sk_seed, pub_seed, adrs);
     for (&sig, digits, 0..) |*node, d, i| {
         adrs.setChainAddress(@intCast(i));
-        node.* = chain(node.*, 0, d, pub_seed, adrs);
+        node.* = chain(node, 0, d, pub_seed, adrs);
     }
     return sig;
 }
@@ -352,7 +378,7 @@ pub fn wotsPkFromSig(sig: *const [wots_len][n]u8, msg: *const [n]u8, pub_seed: *
     var pk: [wots_len][n]u8 = undefined;
     for (&pk, sig, digits, 0..) |*node, sig_node, d, i| {
         adrs.setChainAddress(@intCast(i));
-        node.* = chain(sig_node, d, w - 1 - d, pub_seed, adrs);
+        node.* = chain(&sig_node, d, w - 1 - d, pub_seed, adrs);
     }
     return pk;
 }
@@ -1249,6 +1275,116 @@ test "SecretKey.zeroize wipes the seeds and leaves the public state alone" {
     try std.testing.expectEqualSlices(u8, &[_]u8{0} ** n, &kp.sk.sk_prf);
     try std.testing.expectEqualSlices(u8, &root_before, &kp.sk.root);
     try std.testing.expectEqual(@as(u32, 7), kp.sk.idx); // a zeroed idx would look fresh
+}
+
+// A1 F3: `chain`'s doc comment above describes the mitigation (a `*const
+// [n]u8` parameter instead of a by-value one) as PARTIAL -- this is the
+// permanent re-check of that claim, using the audit's own recipe
+// ("Measured after zeroize() by scanning a fresh 512 KiB stack frame").
+//
+// The seeds are fixed, comptime-computed `const` arrays (module scope, so
+// they live in .rodata, never on any stack) so that the ONLY place
+// `sk_seed`/leaf-0's chain-start values are ever held as a LIVE runtime
+// local is INSIDE `deadStackSignAndZeroize`'s own frame -- the thing being
+// measured. Earlier drafts of this test kept the keypair alive as a local
+// in the TEST function itself (to hand it to the deep call and to derive
+// the needles), and that measured 67/67 regardless of any fix: the test's
+// own still-live local was what the scan was finding, not a genuine
+// post-return residue. `deadStackSignAndZeroize` now builds its own
+// `KeyPair` from the const seeds with `TestX.keyGen`, entirely inside its
+// own frame; the needles are derived separately, from the same consts, via
+// `wotsSkGen` called directly at file scope into another const -- also
+// never a live stack local of the test function.
+const f3_sk_seed: [n]u8 = blk: {
+    var s: [n]u8 = undefined;
+    for (&s, 0..) |*b, i| b.* = @truncate(i + 3);
+    break :blk s;
+};
+const f3_sk_prf: [n]u8 = blk: {
+    var s: [n]u8 = undefined;
+    for (&s, 0..) |*b, i| b.* = @truncate(i + 103);
+    break :blk s;
+};
+const f3_pub_seed: [n]u8 = blk: {
+    var s: [n]u8 = undefined;
+    for (&s, 0..) |*b, i| b.* = @truncate(i + 203);
+    break :blk s;
+};
+// Leaf 0's wots_len chain-start secret values, reproduced independently
+// from the same consts `deadStackSignAndZeroize` derives its `sk_seed`
+// from -- a module-scope `var` (.bss, never a stack local of the test
+// function), computed at runtime by its own `noinline` helper (not
+// comptime: `wotsSkGen` runs SHA-256 67 times, well beyond a reasonable
+// comptime branch budget).
+var f3_needles: [wots_len][n]u8 = undefined;
+
+noinline fn computeF3Needles() void {
+    var adrs = Adrs{};
+    adrs.setType(Adrs.type_ots);
+    adrs.setOtsAddress(0);
+    f3_needles = wotsSkGen(&f3_sk_seed, &f3_pub_seed, &adrs);
+}
+
+// `TestX.keyGen` itself processes EVERY leaf's WOTS+ key pair (bdsInit
+// builds the whole authentication tree, leaf 0 included) to derive the
+// public root -- so it independently touches leaf 0's own chain-start
+// values too, before `sign` ever runs. Without clearing that residue
+// first, the scan below measured keyGen's footprint, not sign()'s: 67/67
+// regardless of any fix to `chain`. This overwrites the same stack depth
+// keyGen just used with non-matching bytes before the part actually being
+// measured runs, the same way a dead-stack probe's own earlier setup calls
+// must not leak into what a later measurement attributes to the callee
+// under test.
+noinline fn clobberStackFromKeyGen() void {
+    var buf: [128 * 1024]u8 = undefined;
+    for (&buf, 0..) |*b, i| b.* = @truncate(i ^ 0xA5);
+    std.mem.doNotOptimizeAway(&buf);
+}
+
+noinline fn deadStackSignAndZeroize(out: *[TestX.signature_length]u8) void {
+    var kp = TestX.keyGen(f3_sk_seed, f3_sk_prf, f3_pub_seed);
+    clobberStackFromKeyGen();
+    TestX.sign(&kp.sk, out, "dead stack probe message") catch unreachable;
+    kp.sk.zeroize();
+}
+
+noinline fn deadStackScanXmss(needle: []const u8, base: [*]const u8, len: usize) usize {
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= len) : (i += 1) {
+        if (std.mem.eql(u8, base[i..][0..needle.len], needle)) hits += 1;
+    }
+    return hits;
+}
+
+test "A1 F3: chain's parameter-copy fix measured against the audit's own dead-stack recipe (baseline 55/67 in ReleaseFast)" {
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    computeF3Needles();
+
+    var sig: [TestX.signature_length]u8 = undefined;
+    var anchor: usize = 0;
+    const stack_top: [*]const u8 = @ptrCast(&anchor);
+    anchor = 1;
+    deadStackSignAndZeroize(&sig);
+    const window: usize = 512 * 1024;
+    const base = stack_top - window;
+
+    var hits: usize = 0;
+    for (f3_needles) |needle| {
+        if (deadStackScanXmss(&needle, base, window) > 0) hits += 1;
+    }
+    std.debug.print(
+        "A1 F3 dead-stack scan, {d} KiB below sign()+zeroize()'s frame: {d}/{d} leaf-0 WOTS+ chain-start values recoverable\n",
+        .{ window / 1024, hits, f3_needles.len },
+    );
+    // NOT asserted to 0 -- chain()'s parameter-copy fix is a documented
+    // PARTIAL mitigation (removes one of chain's two copies of the value;
+    // the mutable `tmp` it iterates on, and every chainStep/hashF internal
+    // temporary, are untouched). Printed for the record, same discipline
+    // as blindrsa's B6/B9 dead-stack anchors: asserting a number here
+    // would either lie (asserting 0, which this fix does not achieve) or
+    // pin an open finding as an accepted constant (asserting 55). Compare
+    // this session's actual measured before/after in A1/xmss.md.
 }
 
 test "fuzz: PublicKey.fromBytes never panics on arbitrary bytes" {
