@@ -517,11 +517,9 @@ test "blind/blindWithFactor: a blinded_msg_out one byte short of the modulus len
     );
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x51} ** 32);
-    var salt: [Sha384.digest_length]u8 = undefined;
-    csprng.random().bytes(&salt);
     try testing.expectError(
         error.OutputTooSmall,
-        blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, &salt, csprng.random(), &ctx, too_small),
+        blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, csprng.random(), &ctx, too_small),
     );
 
     // Exact size still works.
@@ -563,6 +561,84 @@ test "finalize: an out buffer one byte short of ctx.modulus_len is an error, not
     _ = try blindrsa.finalize(pk, Sha384, &kat.a1.blind_sig, &ctx, exact_buf[0..ctx.modulus_len]);
 }
 
+// ── B16: blind() draws its OWN salt, not the caller's ───────────────────
+
+// `std.Random` that hands out a caller-fixed `head` on the FIRST `fill`
+// call whose length matches it (`blind`'s own salt draw — audit finding
+// B16, see `root.zig`'s `blind` doc comment) and real, but SEEDED-hence-
+// reproducible, bytes from a `ChaCha` CSPRNG on every other call (`r`'s
+// draw, `maskedInvert`'s masking scalar, any redraw). Same length-based
+// discriminator as `ctgrind_harness.zig`'s `BlindRandom`: `head.len` here
+// is always `Sha384.digest_length` (48), which can never collide with a
+// modulus-length draw.
+const FixedHeadRandom = struct {
+    head: []const u8,
+    used_head: bool = false,
+    csprng: std.Random.ChaCha,
+
+    fn init(head: []const u8, rng_seed: [32]u8) FixedHeadRandom {
+        return .{ .head = head, .csprng = std.Random.ChaCha.init(rng_seed) };
+    }
+
+    fn fill(self: *FixedHeadRandom, buf: []u8) void {
+        if (!self.used_head and buf.len == self.head.len) {
+            self.used_head = true;
+            @memcpy(buf, self.head);
+            return;
+        }
+        self.csprng.random().bytes(buf);
+    }
+};
+
+test "blind: two calls with the same input but different RNG state draw different salts (audit finding B16)" {
+    const pk = try kat.publicKey();
+    const shared_seed = [_]u8{0x77} ** 32; // SAME seed both times: r, u, and any redraw are identical across the two calls below.
+
+    // Control: SAME head (salt) + SAME seed => byte-identical blinded_msg.
+    // Establishes that this harness's only source of difference between
+    // two runs is the head, before trusting a "differs" result below.
+    {
+        const head: [Sha384.digest_length]u8 = @splat(0x01);
+        var rnd_a = FixedHeadRandom.init(&head, shared_seed);
+        var rnd_b = FixedHeadRandom.init(&head, shared_seed);
+        const random_a = std.Random.init(&rnd_a, FixedHeadRandom.fill);
+        const random_b = std.Random.init(&rnd_b, FixedHeadRandom.fill);
+
+        var ctx_a: blindrsa.Context = undefined;
+        var out_a: [blindrsa.max_modulus_len]u8 = undefined;
+        const blinded_a = try blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, random_a, &ctx_a, &out_a);
+
+        var ctx_b: blindrsa.Context = undefined;
+        var out_b: [blindrsa.max_modulus_len]u8 = undefined;
+        const blinded_b = try blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, random_b, &ctx_b, &out_b);
+
+        try testing.expect(std.mem.eql(u8, blinded_a, blinded_b));
+    }
+
+    // The actual claim: DIFFERENT head (salt), SAME seed for everything
+    // after it (so r and every masking draw are unchanged) => different
+    // blinded_msg. The only thing that could have changed the output is
+    // the salt `blind` drew for itself.
+    {
+        const head1: [Sha384.digest_length]u8 = @splat(0x01);
+        const head2: [Sha384.digest_length]u8 = @splat(0x02);
+        var rnd1 = FixedHeadRandom.init(&head1, shared_seed);
+        var rnd2 = FixedHeadRandom.init(&head2, shared_seed);
+        const random1 = std.Random.init(&rnd1, FixedHeadRandom.fill);
+        const random2 = std.Random.init(&rnd2, FixedHeadRandom.fill);
+
+        var ctx1: blindrsa.Context = undefined;
+        var out1: [blindrsa.max_modulus_len]u8 = undefined;
+        const blinded1 = try blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, random1, &ctx1, &out1);
+
+        var ctx2: blindrsa.Context = undefined;
+        var out2: [blindrsa.max_modulus_len]u8 = undefined;
+        const blinded2 = try blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, Sha384.digest_length, random2, &ctx2, &out2);
+
+        try testing.expect(!std.mem.eql(u8, blinded1, blinded2));
+    }
+}
+
 // ── random-path round-trips ─────────────────────────────────────────────
 
 test "random-r blind -> blindSign -> finalize -> verify round-trip over the RFC 4096-bit key (both PSS and PSSZERO)" {
@@ -572,13 +648,9 @@ test "random-r blind -> blindSign -> finalize -> verify round-trip over the RFC 
     const pk = try kat.publicKey();
 
     inline for ([_]usize{ Sha384.digest_length, 0 }) |salt_len| {
-        var salt_buf: [Sha384.digest_length]u8 = undefined;
-        random.bytes(&salt_buf);
-        const salt = salt_buf[0..salt_len];
-
         var ctx: blindrsa.Context = undefined;
         var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
-        const blinded = try blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, salt, random, &ctx, &blinded_msg);
+        const blinded = try blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, salt_len, random, &ctx, &blinded_msg);
         // A fresh random r must NOT reproduce the RFC's blinded_msg
         // (that would mean r wasn't actually random).
         try testing.expect(!std.mem.eql(u8, &kat.a1.blinded_msg, blinded));
@@ -605,12 +677,9 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
     var prep_buf: [blindrsa.randomizer_len + msg.len]u8 = undefined;
     const prepared_msg = try blindrsa.prepareRandomize(msg, random, &prep_buf);
 
-    var salt: [Sha384.digest_length]u8 = undefined;
-    random.bytes(&salt);
-
     var ctx: blindrsa.Context = undefined;
     var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded = try blindrsa.blind(kp.public_key, Sha384, prepared_msg, &salt, random, &ctx, &blinded_msg);
+    const blinded = try blindrsa.blind(kp.public_key, Sha384, prepared_msg, Sha384.digest_length, random, &ctx, &blinded_msg);
 
     var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig = try blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded, &blind_sig_buf);
@@ -618,7 +687,7 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
     var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const sig = try blindrsa.finalize(kp.public_key, Sha384, blind_sig, &ctx, &sig_buf);
 
-    try blindrsa.verify(kp.public_key, Sha384, prepared_msg, sig, salt.len);
+    try blindrsa.verify(kp.public_key, Sha384, prepared_msg, sig, Sha384.digest_length);
 
     // Tamper the SAME session's blind_sig: finalize must fail closed.
     var tampered: [blindrsa.max_modulus_len]u8 = undefined;
@@ -650,22 +719,20 @@ test "B8: separate keys per encoding option round-trip independently (RFC 9474 S
 
     // -PSS-Randomized under kp_pss.
     const msg_pss = "SS6.2 demo: PSS-Randomized request";
-    var salt: [Sha384.digest_length]u8 = undefined;
-    random.bytes(&salt);
     var ctx_pss: blindrsa.Context = undefined;
     var blinded_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded_pss = try blindrsa.blind(kp_pss.public_key, Sha384, msg_pss, &salt, random, &ctx_pss, &blinded_pss_buf);
+    const blinded_pss = try blindrsa.blind(kp_pss.public_key, Sha384, msg_pss, Sha384.digest_length, random, &ctx_pss, &blinded_pss_buf);
     var blind_sig_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig_pss = try blindrsa.blindSign(kp_pss.secret_key, kp_pss.public_key, random, blinded_pss, &blind_sig_pss_buf);
     var sig_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const sig_pss = try blindrsa.finalize(kp_pss.public_key, Sha384, blind_sig_pss, &ctx_pss, &sig_pss_buf);
-    try blindrsa.verify(kp_pss.public_key, Sha384, msg_pss, sig_pss, salt.len);
+    try blindrsa.verify(kp_pss.public_key, Sha384, msg_pss, sig_pss, Sha384.digest_length);
 
     // -PSSZERO-Deterministic under the SEPARATE kp_psszero.
     const msg_zero = blindrsa.prepareIdentity("SS6.2 demo: PSSZERO-Deterministic request");
     var ctx_zero: blindrsa.Context = undefined;
     var blinded_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blinded_zero = try blindrsa.blind(kp_psszero.public_key, Sha384, msg_zero, &.{}, random, &ctx_zero, &blinded_zero_buf);
+    const blinded_zero = try blindrsa.blind(kp_psszero.public_key, Sha384, msg_zero, 0, random, &ctx_zero, &blinded_zero_buf);
     var blind_sig_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blind_sig_zero = try blindrsa.blindSign(kp_psszero.secret_key, kp_psszero.public_key, random, blinded_zero, &blind_sig_zero_buf);
     var sig_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
@@ -673,7 +740,7 @@ test "B8: separate keys per encoding option round-trip independently (RFC 9474 S
     try blindrsa.verify(kp_psszero.public_key, Sha384, msg_zero, sig_zero, 0);
 
     // Cross-check: a token from ONE key must not verify under the OTHER.
-    try testing.expectError(error.SignatureVerificationFailed, blindrsa.verify(kp_psszero.public_key, Sha384, msg_pss, sig_pss, salt.len));
+    try testing.expectError(error.SignatureVerificationFailed, blindrsa.verify(kp_psszero.public_key, Sha384, msg_pss, sig_pss, Sha384.digest_length));
 }
 
 // A rigged `std.Random` that always returns `p` (a prime factor of the RFC
@@ -708,7 +775,7 @@ test "blind gives up and reports InvalidBlindingFactor rather than proceed with 
     var blinded_msg: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.InvalidBlindingFactor,
-        blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, &kat.a1.salt, random, &ctx, &blinded_msg),
+        blindrsa.blind(pk, Sha384, &kat.a1.prepared_msg, kat.a1.salt.len, random, &ctx, &blinded_msg),
     );
 }
 

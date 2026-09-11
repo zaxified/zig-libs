@@ -61,18 +61,22 @@
 //! keeping a pre-taint copy). `blind`'s blinding factor `r` is sampled
 //! INSIDE `blind` itself (`sampleFe(pk.n, random)`, private, not reachable
 //! from outside the module) — there is no struct field to taint after the
-//! fact. Instead, `BlindRandom` below is a `std.Random` whose first `fill`
-//! call (the ONE `random.bytes()` draw `sampleFe` makes to produce `r`, for
-//! this fixed KAT modulus and the RFC's own `r` — see below) writes the
-//! fixed bytes and then, in the tainted mode, immediately marks them
-//! undefined — so the memory `r` is read from is *born* tainted rather than
-//! tainted after a window where an untainted copy could exist. Every
-//! SUBSEQUENT `fill` call (the masking secret `u` inside `maskedInvert`,
-//! redraws, and `.sign`'s server-side blinding factor `b`) is served from a
-//! separate deterministic CSPRNG stream that is never tainted. This also
-//! means `.blind` needs no `reloadVolatile`: there is no pre-taint copy to
-//! guard against, because the call dispatches through the `std.Random`
-//! vtable (a real indirect call) before the bytes exist at all.
+//! fact. Instead, `BlindRandom` below is a `std.Random` whose `fill` call
+//! (the ONE `random.bytes()` draw `sampleFe` makes to produce `r`, for this
+//! fixed KAT modulus and the RFC's own `r` — see below) writes the fixed
+//! bytes and then, in the tainted mode, immediately marks them undefined —
+//! so the memory `r` is read from is *born* tainted rather than tainted
+//! after a window where an untainted copy could exist. Every OTHER `fill`
+//! call (`blind`'s own salt draw, now made before `r` is sampled — audit
+//! finding B16 — the masking secret `u` inside `maskedInvert`, redraws, and
+//! `.sign`'s server-side blinding factor `b`) is served from a separate
+//! deterministic CSPRNG stream that is never tainted; `BlindRandom`
+//! distinguishes the `r` draw from the others by LENGTH
+//! (`r_bytes.len` == the modulus length, never the salt's `Hash
+//! .digest_length`/`0`), not by call order. This also means `.blind` needs
+//! no `reloadVolatile`: there is no pre-taint copy to guard against,
+//! because the call dispatches through the `std.Random` vtable (a real
+//! indirect call) before the bytes exist at all.
 //!
 //! `.sign` DOES taint an existing struct (`rsa.SecretKey`, built from the
 //! module's own KAT) after construction, exactly like `rsa`'s `crt` target
@@ -89,8 +93,8 @@
 //! `pub` (unlike `rsa`'s `kat2048`, which is not `pub` and had to be
 //! duplicated by that harness). `kat.r` is a valid blinding factor for
 //! `kat.n` (RFC-published-derived, cross-checked in `kat_vectors.zig`'s own
-//! doc comment), so feeding it as `BlindRandom`'s first draw is accepted by
-//! `sampleFe`'s rejection loop on the very first attempt — no retry, so
+//! doc comment), so feeding it on the modulus-length-sized draw is accepted
+//! by `sampleFe`'s rejection loop on the very first attempt — no retry, so
 //! exactly one `fill` call carries the taint.
 //!
 //! ## The two traps (see `ct25519`'s or `rsa`'s harness)
@@ -169,15 +173,20 @@ fn reloadVolatile(comptime T: type, s: *const T) T {
     return out;
 }
 
-/// `std.Random` that hands out the CLIENT's blinding factor `r` on its
-/// FIRST `fill` call (from the fixed KAT bytes, tainted iff `r_taint ==
-/// .yes` — see "Why `.blind` taints at the SOURCE" above), and real
-/// deterministic-but-never-tainted bytes from a `ChaCha` CSPRNG on every
-/// call after that (the masking secret `u` inside `maskedInvert`, any
-/// redraw, and — for `.sign` — the server's own blinding factor `b`). This
-/// is the ONE controlled variable in `.blind`'s measurement: everything the
-/// masked-inversion pipeline touches besides `r` comes from a real,
-/// untainted random stream.
+/// `std.Random` that hands out the CLIENT's blinding factor `r` on the
+/// FIRST `fill` call WHOSE LENGTH MATCHES `r_bytes.len` (from the fixed KAT
+/// bytes, tainted iff `r_taint == .yes` — see "Why `.blind` taints at the
+/// SOURCE" above), and real deterministic-but-never-tainted bytes from a
+/// `ChaCha` CSPRNG on every other call (audit finding B16: `blind` now
+/// draws its own PSS salt from `random` BEFORE sampling `r` — `Hash
+/// .digest_length` or `0` bytes, never `r_bytes.len`, so length alone still
+/// discriminates the salt draw, `sampleFe`'s `r` draw, the masking secret
+/// `u` inside `maskedInvert`, any redraw, and — for `.sign` — the server's
+/// own blinding factor `b`). This is the ONE controlled variable in
+/// `.blind`'s measurement: everything the masked-inversion pipeline touches
+/// besides `r` comes from a real, untainted random stream — including the
+/// salt, which is public in the final signature and was never the secret
+/// this harness measures.
 const BlindRandom = struct {
     r_bytes: []const u8,
     r_taint: Taint,
@@ -189,9 +198,8 @@ const BlindRandom = struct {
     }
 
     fn fill(self: *BlindRandom, buf: []u8) void {
-        if (!self.used_r) {
+        if (!self.used_r and buf.len == self.r_bytes.len) {
             self.used_r = true;
-            std.debug.assert(buf.len == self.r_bytes.len); // sampleFe draws exactly modulus_len bytes
             @memcpy(buf, self.r_bytes);
             taintBytes(self.r_taint, buf);
             return;
@@ -226,7 +234,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 pk,
                 std.crypto.hash.sha2.Sha384,
                 &kat.a1.prepared_msg,
-                &kat.a1.salt,
+                kat.a1.salt.len,
                 random,
                 &ctx,
                 &blinded_msg,
