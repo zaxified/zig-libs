@@ -244,6 +244,35 @@ pub const Connection = struct {
         return if (c.has_username) c.username_buf[0..c.username_len] else null;
     }
 
+    /// The keep-alive this client asked for, in seconds. 0 disables the
+    /// mechanism (spec 3.1.2.10).
+    ///
+    /// For a bridge this is not a curiosity: a session that mirrors a client
+    /// onward should ask its own upstream for the same interval, or the two
+    /// halves of one logical connection time out on different schedules.
+    pub fn keepAlive(c: *const Connection) u16 {
+        return c.keep_alive_s;
+    }
+
+    /// The Will this connection registered, or null — either none was sent, or
+    /// a clean DISCONNECT has already discarded it (spec 3.14.4), which is
+    /// exactly the test for "did this connection end gracefully".
+    ///
+    /// ⛔ The slices are the broker's owned copies and live only as long as the
+    /// connection does. A bridge that replays a Will onto its own upstream must
+    /// copy them, because `remove` frees them — and a mirror that omits the
+    /// Will leaves the far side believing the client is online for ever, which
+    /// is the whole reason this is reachable at all.
+    pub fn willOpt(c: *const Connection) ?packet.Will {
+        const t = c.will_topic orelse return null;
+        return .{
+            .topic = t,
+            .message = c.will_payload orelse &.{},
+            .qos = c.will_qos,
+            .retain = c.will_retain,
+        };
+    }
+
     fn setClientId(c: *Connection, id: []const u8) error{ClientIdTooLong}!void {
         if (id.len > c.client_id_buf.len) return error.ClientIdTooLong;
         @memcpy(c.client_id_buf[0..id.len], id);
@@ -3367,4 +3396,61 @@ test "the tap does not observe the server's own publishes" {
     try testing.expectEqual(@as(usize, 1), rec.calls);
 
     b.remove(c);
+}
+
+test "a bridge can read the keep-alive and the Will it has to replay" {
+    // Both are things a mirroring consumer needs and could otherwise only get
+    // by reaching into fields: the keep-alive so the two halves of one logical
+    // connection time out on the same schedule, and the Will because a mirror
+    // that omits it leaves the far side believing the client is online for ever.
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const conn = try b.accept(tt.transport());
+    var buf: [256]u8 = undefined;
+    const bytes = try packet.encodeConnect(&buf, .{
+        .client_id = "EWG6",
+        .keep_alive_s = 15,
+        .will = .{ .topic = "sn/1/status", .message = "disconnected", .retain = true },
+    });
+    try b.feed(conn, bytes);
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
+    _ = try tt.next(); // CONNACK
+
+    try testing.expectEqual(@as(u16, 15), conn.keepAlive());
+    const w = conn.willOpt().?;
+    try testing.expectEqualStrings("sn/1/status", w.topic);
+    try testing.expectEqualStrings("disconnected", w.message);
+    try testing.expect(w.retain);
+    try testing.expectEqual(QoS.at_most_once, w.qos);
+
+    b.remove(conn);
+}
+
+test "willOpt is null for a connection that registered none" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "plain", 30, 0);
+    try testing.expectEqual(@as(?packet.Will, null), conn.willOpt());
+    try testing.expectEqual(@as(u16, 30), conn.keepAlive());
+    b.remove(conn);
+}
+
+test "⛔ willOpt goes null after a clean DISCONNECT — it is the gracefulness test" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var tt: TestTransport = .{};
+    const conn = try connectWithWill(&b, &tt, "bye", .{
+        .topic = "sn/1/status",
+        .message = "disconnected",
+    });
+    try testing.expect(conn.willOpt() != null);
+
+    var buf: [8]u8 = undefined;
+    try b.feed(conn, try packet.encodeDisconnect(&buf));
+    try testing.expectEqual(Disposition.close, try b.process(conn, 0));
+    try testing.expectEqual(@as(?packet.Will, null), conn.willOpt());
+    b.remove(conn);
 }

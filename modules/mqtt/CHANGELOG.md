@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — `Connection.keepAlive()` and `Connection.willOpt()`. Both are things a *bridging*
+  consumer needs and could previously only get by reaching into fields: the keep-alive so the two
+  halves of one logical connection do not time out on different schedules, and the Will because a
+  mirror that omits it leaves the far side believing the client is online for ever. `willOpt`
+  returning null is also the gracefulness test the Will machinery already relies on internally — it
+  is null after a clean DISCONNECT (3.14.4) — so exposing it hands consumers the same signal rather
+  than a second, weaker one. ⚠ The slices are the broker's owned copies and die with the connection;
+  a consumer that replays them must copy. ⭐ The password is deliberately NOT added to `Connection`:
+  a consumer that must authenticate onward as the client already receives it in `AuthRequest`, and
+  holding every client's secret for the lifetime of its session to save that is a poor trade.
+  Measured RED → GREEN with three mutations.
+
 - **2026-09-11** — ⛔ **The broker did not compile for a 32-bit target at all**, and nothing here
   could see it. Four counters (`fanout_truncations`, `retained_truncations`, `qos1_drops`,
   `will_failures`) were `std.atomic.Value(u64)`, and a 32-bit target has no 64-bit atomic

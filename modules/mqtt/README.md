@@ -48,6 +48,12 @@ transport-agnostic client and a broker, all fully offline-testable.
     in tests. `broker.TcpServer` is an optional `std.Io.net` accept loop
     (thread-per-connection); tests never listen or dial.
 
+    `Connection.clientId()` / `usernameOpt()` / `keepAlive()` / `willOpt()` are
+    what a bridge reads off a session it is mirroring; the password is not among
+    them on purpose — a consumer that needs it already receives it in
+    `AuthRequest`, and keeping every client's secret alive for the whole session
+    to save that lookup is a poor trade.
+
     `Broker.publish(topic, payload, qos, retain)` is the server's own voice:
     a message with no client behind it, taking the same retained-store and
     fan-out path a client's PUBLISH takes. It is what a bridge, a `$SYS` topic
