@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **API CHANGE:** `Initiator.State`/`Responder.State` gain
+  a new member, `.failed` (audit finding F5). Every act function
+  (`act1`/`readAct2`/`genAct3` on `Initiator`, `readAct1`/`act2`/`readAct3`
+  on `Responder`) now `errdefer`s `self.state = .failed` after its own
+  state-guard check, so a failed act kills the object instead of leaving
+  `state` wherever it was mid-act: before this, a rejected message left
+  the object looking untouched (still `.awaiting_act2`/`.awaiting_act3`),
+  re-enterable over a `SymmetricState` that had already partially
+  advanced (the transcript hash had moved, the cipher key may have been
+  re-seeded), and a retry of the SAME bad message, or the genuine one
+  that would have worked, ran against that half-mutated state instead of
+  being rejected outright. Every act already checks its own expected
+  state first, and `.failed` matches none of them, so this needs no new
+  error variant — the existing `error.WrongState` now covers it. Also:
+  `Responder.readAct3` sets `rs_pub` (the peer's static key, recovered
+  from a validated point) BEFORE its own final integrity check (the tag
+  over the whole transcript) can still fail — an `errdefer self.rs_pub =
+  null` added right after the assignment clears it back out on that
+  failure, since until the final check passes the peer has not actually
+  authenticated as that key. `QUESTIONS-ROUND-2.md` Q3: this module has
+  zero consumers in this repository, and this specific instance of the
+  question (a plain enum, not an error set) is the one the coordinator's
+  own worked example in the fixer brief cites. Measured: two new tests
+  (RFC vectors, existing `act2_bad_mac`/`act3_bad_tag`) drive a real
+  handshake failure on each side and check both `state == .failed` and
+  (on the responder) `rs_pub == null` afterward, plus that neither a
+  retry of the failed message nor the genuine one that would have
+  succeeded is accepted; removing either new `errdefer` turns the
+  matching test `RED` (confirmed for both).
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking, plus one BREAKING and one additive
   field:** A1 fix campaign, 11 of 12 open findings (F1-F4, F6-F9, F11-F13; F5 needs a
   user decision, left open). **BREAKING:** `Act1`/`Act2`/`Act3.fromBytes` now reject a

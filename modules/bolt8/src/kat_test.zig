@@ -132,6 +132,45 @@ test "KAT: 'transport-responder act3 bad MAC test' — readAct3 must fail closed
     try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
 }
 
+// ── F5: a failed act kills the object, not just the one call ───────────────
+
+test "F5: readAct3 failing on the t field does NOT leave rs_pub set, and re-entering any act returns WrongState" {
+    var responder = try responderAfterAct2();
+    try testing.expectEqual(handshake.Responder.State.awaiting_act3, responder.state);
+    // Same vector as the KAT test above: `c` (carrying rs) decrypts fine —
+    // rs_pub gets set from a VALIDATED key — and only the final tag over
+    // the whole transcript fails.
+    try testing.expectError(error.DecryptionFailed, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
+    // Before the fix: rs_pub stayed set to the peer's (unauthenticated,
+    // since the handshake never actually completed) static key, and
+    // `state` stayed `.awaiting_act3` -- re-enterable over a
+    // half-mutated SymmetricState.
+    try testing.expectEqual(@as(?[33]u8, null), responder.rs_pub);
+    try testing.expectEqual(handshake.Responder.State.failed, responder.state);
+    // The object is dead now, not just "still waiting": neither a retry of
+    // the failed act nor the genuine one that would have worked is let
+    // through.
+    try testing.expectError(error.WrongState, responder.readAct3(try act.Act3.fromBytes(kv.act3_bad_tag)));
+    try testing.expectError(error.WrongState, responder.readAct3(try act.Act3.fromBytes(kv.act3_bytes)));
+}
+
+test "F5: readAct2 failing kills the initiator too, even though the transcript already moved" {
+    var initiator = try initiatorAfterAct1();
+    const h_before = initiator.ss.h;
+    try testing.expectError(error.DecryptionFailed, initiator.readAct2(try act.Act2.fromBytes(kv.act2_bad_mac)));
+    // The transcript hash moved (mixHash(&msg.e_pub) ran unconditionally
+    // before the MAC check) even though the message was rejected -- that
+    // part is inherent to the protocol shape, not the bug. The bug was that
+    // `state` used to stay `.awaiting_act2` afterward, so the object looked
+    // untouched from the outside.
+    try testing.expect(!std.mem.eql(u8, &h_before, &initiator.ss.h));
+    try testing.expectEqual(handshake.Initiator.State.failed, initiator.state);
+    // Neither a retry of the bad message nor the genuine Act Two that
+    // would have worked is let through anymore.
+    try testing.expectError(error.WrongState, initiator.readAct2(try act.Act2.fromBytes(kv.act2_bad_mac)));
+    try testing.expectError(error.WrongState, initiator.readAct2(try act.Act2.fromBytes(kv.act2_bytes)));
+}
+
 test "KAT: 'transport-responder act1 bad key serialization test' — readAct1 must reject a malformed e.pub prefix" {
     // Audit finding F4 (2026-09-05): of BOLT#8's 16 named test vectors, this
     // was the one embedded nowhere and exercised nowhere. The module
