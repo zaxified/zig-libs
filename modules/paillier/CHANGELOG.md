@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** `feFromMontBytes` no longer runs the CRT
+  path's secret-derived modexp output through `stripLeadingZeros` before constructing the
+  canonical `Fe` (A1/paillier.md F4, ~0.113% of a decrypt's instructions were this
+  data-dependent scan). The strip was never load-bearing: `Fe`'s backing `Uint(max_bits)`
+  is one comptime type shared across every modulus this module uses, so `Fe.fromBytes`'s
+  length gate checks against the global `max_bits/8`, never against the specific modulus's
+  own width, and the montint slot `res` comes from never exceeds that bound. Same output
+  value either way; `scripts/modtest paillier` unchanged in all three lanes (38/39, 38/39,
+  39/39). Ctgrind re-pin (`paillier` has a row in `ctgrind-expected.tsv`) deferred to the
+  campaign's end-of-run pass.
 - **2026-09-10** — `decrypt`'s doc comment claimed the L-function division's
   timing leak was "accepted, harmless" because `threshold_ecdsa`'s MtA masks
   the decrypted plaintext with a uniform `beta'` drawn via

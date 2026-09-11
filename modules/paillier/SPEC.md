@@ -79,14 +79,18 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   is a decision for the fix queue, not a doc update.
 - **CRT decrypt's own variable-time surface, beyond the L-division below.** The Garner
   recombination itself (`decryptCrtX`) is branchless `ff` field arithmetic (`ct.eql`/
-  `cmov`/`shiftIn`), but `feFromMontBytes`'s `stripLeadingZeros` call — used to turn each
-  CRT half's raw modexp output (`x_p`/`x_q`, both secret-derived) back into a canonical
-  `Fe` — is a `while` loop whose iteration count depends on the number of leading zero
-  bytes in that secret-derived value. Measured (wave-3 audit, ctgrind + callgrind):
-  ~0.113% of a decrypt's instructions are data-dependent this way, dwarfed by the
-  L-division below; recorded as a known residual, not fixed (a fixed-width `Fe`
-  construction that skips the strip would need a `std.crypto.ff` entry point this module
-  doesn't have).
+  `cmov`/`shiftIn`). `feFromMontBytes` — which turns each CRT half's raw modexp output
+  (`x_p`/`x_q`, both secret-derived) back into a canonical `Fe` — used to run that value
+  through `stripLeadingZeros` first, a `while` loop whose iteration count depended on the
+  secret-derived value's leading zero bytes; measured (wave-3 audit, ctgrind + callgrind)
+  at ~0.113% of a decrypt's instructions. **Fixed (2026-09-11, F4):** the strip was never
+  load-bearing — `Fe`'s backing `Uint(max_bits)` is one comptime type shared by `n`,
+  `n_sq`, `p_sq` and `q_sq`, so `Fe.fromBytes`'s length gate checks the caller's byte slice
+  against the *global* `Fe.encoded_bytes = max_bits/8`, never against the specific modulus
+  `m`'s own (narrower) width, and `res.len` (a `montint.Modint` slot capped at
+  `mont_max_limbs`) never exceeds that global bound regardless of which modulus produced
+  it. `feFromMontBytes` now passes `res` straight to `Fe.fromBytes`, removing the
+  data-dependent scan entirely.
 - `encrypt`'s `r^n` term uses `montint` too (the same `pk.n_sq_mont` params `mulPlaintext`
   now shares), sized to the public modulus `n`'s width; the base `r` may be secret
   (semantic security depends on it, see below) and the ladder does not branch on it.

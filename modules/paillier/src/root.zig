@@ -301,9 +301,27 @@ fn montPowPublic(mp: *const MontParams, base_be: []const u8, e_be: []const u8, o
 }
 
 /// Parse a montint big-endian result (slot-width, value `< m`) back into an
-/// `Fe` canonical mod `m`. Leading zero octets are stripped first.
+/// `Fe` canonical mod `m`.
+///
+/// paillier F4 (A1/paillier.md): this used to run `res` through
+/// `stripLeadingZeros` first -- a data-dependent scan over a secret-derived
+/// value (`x_p`/`x_q` in the CRT path), 2 of the audit's 106 ctgrind
+/// contexts. It was never load-bearing: `Fe`'s backing `Uint(max_bits)` is
+/// ONE comptime type shared by every modulus this module uses (`n`, `n_sq`,
+/// `p_sq`, `q_sq`), so `Fe.fromBytes`'s length gate
+/// (`std.crypto.ff.Uint.fromBytes`) checks `res.len` against the GLOBAL
+/// `Fe.encoded_bytes = max_bits/8`, never against `m`'s own (possibly
+/// narrower) width -- and `res.len` is always `M.encoded_bytes` from a
+/// `montint.Modint` slot capped at `mont_max_limbs` (`(max_bits+63)/64`),
+/// which by construction never exceeds `max_bits/8` bytes. `Uint.fromBytes`
+/// also always returns a value with `limbs_len == max_limbs_count` (its
+/// `Self.zero` starting point) regardless of how many bytes were supplied,
+/// so `Modulus.shrink`'s "limbs beyond m's own width must be zero" check
+/// sees the identical value whether `res` carries leading zero bytes or
+/// not. Passing `res` unstripped therefore parses to the exact same `Fe`,
+/// just without the value-dependent scan.
 fn feFromMontBytes(m: Modulus, res: []const u8) Fe {
-    return Fe.fromBytes(m, stripLeadingZeros(res), .big) catch unreachable; // value < m
+    return Fe.fromBytes(m, res, .big) catch unreachable; // value < m, res.len <= Fe.encoded_bytes always
 }
 
 /// `base^exp mod m` (secret exponent, constant-time), returning an `Fe`
