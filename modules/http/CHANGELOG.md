@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-12** — A1 fix campaign round 2, fixer slot `c`, `netaddr` F8 (Q2-B):
+  `netaddr.parseHostPort`'s port field now rejects a leading zero
+  (`host:0080` -> null, was port 80), closing an asymmetry with the octet and
+  bits fields the same audit found in `parseIp4`/`parsePrefix`. `Url.parse`'s
+  own duplicate `parsePort` (the bracketed `[v6]:port` authority form only —
+  the non-bracketed form already goes through `netaddr.parseHostPort`) is
+  tightened the same way in the same commit, so the two authority-parsing
+  paths agree again; without this, `http://[::1]:0080/` would have kept
+  parsing while `http://host:0080/` started rejecting. **BEHAVIOURAL, not
+  breaking:** no test in this module used a leading-zero port. RED (mutated
+  the new `if` back out): new test fails, 2/2 -> 0/2 on the bracketed form.
+  GREEN: full suite unaffected by the `parsePort` change (no existing
+  fixture used one).
+
 - **2026-09-11** — A1 fix campaign round 2, fixer slot `a`: six findings, all BEHAVIOURAL
   (hardening applied directly, no opt-in switch — round-2 user decision Q2-B/Q7).
   - **F16** — the h2 `.goaway` frame arm never called `noteUnproductive()`, unlike every
