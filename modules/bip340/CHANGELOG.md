@@ -26,14 +26,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F5 (MED): the
   mandatory step-10 self-check (fault-injection guard) had no way to be
   regression-tested without either duplicating `sign`'s arithmetic in a
-  test or adding public API. `sign` (signature unchanged) is now a thin
-  wrapper over two new file-private helpers, `computeUnverified` (steps
-  1-9) and `selfCheck` (step 10) — a permanent test corrupts a genuinely
-  computed signature's bytes and confirms `selfCheck`, the exact function
-  `sign` calls, rejects it. Residual gap, disclosed rather than hidden: this
-  tests the check's own correctness, not whether `sign`'s three-line body
-  still calls it — that wiring isn't independently unit-testable without a
-  fault-injection hook this module intentionally does not expose.
+  test or adding public API. First attempt split `sign` into
+  `computeUnverified` + a standalone `selfCheck` called separately by the
+  test — but that only proved `selfCheck` can reject a bad signature, not
+  that `sign`'s body still calls it (deleting that call left every test
+  green). Fixed by moving the seam onto the production path itself: `sign`
+  is now a one-line call into file-private `signImpl`, which takes the
+  steps-1-9 computation as a parameter and unconditionally self-checks
+  whatever it returns. A permanent test calls `signImpl` with a
+  deliberately corrupted computation and confirms this exact function —
+  not a copy of it — rejects it; because the check now lives on the one
+  path both production and the test go through, deleting or defeating it
+  is caught (measured: both mutations turn the test red).
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F7 (MED):
   verified the core defect (the fuzz harness's ranged first draw always
   returning the corpus's own minimum, so it never actually corrupted a

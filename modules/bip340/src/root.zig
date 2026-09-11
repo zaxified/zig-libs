@@ -300,29 +300,54 @@ pub const SignError = error{
 /// does not consume `io`.
 pub fn sign(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8, io: std.Io) SignError![64]u8 {
     _ = io; // deterministic once aux_rand is in hand (see doc comment)
-    const computed = try computeUnverified(secret_key, msg, aux_rand);
-    try selfCheck(computed.pubkey, msg, computed.sig);
+    return signImpl(secret_key, msg, aux_rand, computeUnverified);
+}
+
+/// The (steps 1-9, no self-check) result `computeUnverified` — or a test's
+/// deliberately-corrupted stand-in — hands to `signImpl`.
+const ComputeResult = struct { sig: [64]u8, pubkey: XOnlyPublicKey };
+
+/// A1 F5, round-2 follow-up (2026-09-11): the first version of this seam
+/// split `sign` into `computeUnverified` + a standalone `selfCheck`, and a
+/// test called both directly — but that only proved `selfCheck` can reject
+/// a bad signature; it said nothing about whether `sign`'s own body still
+/// CALLS it. Measured: deleting `sign`'s `try selfCheck(...)` line left
+/// every test green (`feedback_n_copies_of_one_invariant_is_one_
+/// unverifiable_guard` — the guard and the thing verifying it were two
+/// separate, independently-deletable places).
+///
+/// Fixed by moving the seam to where the fault can be injected BEFORE the
+/// check runs, on the production code path itself: `signImpl` takes the
+/// steps-1-9 computation as a parameter and unconditionally runs the
+/// step-10 self-check against whatever that parameter returns. `sign`
+/// (public, unchanged signature) is a one-line call into `signImpl` with
+/// the real computation (`computeUnverified`); a permanent test calls
+/// `signImpl` with a deliberately corrupted computation and confirms THIS
+/// function — not a copy of its logic (`feedback_a_test_that_
+/// reimplements_the_code_cannot_fail`) — rejects it. Because the check now
+/// lives on the one path both production and the test go through, deleting
+/// it (or defeating it) is caught: the corrupted-input test starts
+/// returning the corrupted signature instead of an error. Measured three
+/// ways in the fix commit's dispozice (`A1/bip340.md`): today's tree
+/// (GREEN), the self-check CALL deleted from `signImpl` (RED), and the
+/// self-check's own verdict ignored/short-circuited (RED) — plus a
+/// positive control (an honest computation still succeeds).
+fn signImpl(
+    secret_key: SecretKey,
+    msg: []const u8,
+    aux_rand: [32]u8,
+    compute: *const fn (SecretKey, []const u8, [32]u8) SignError!ComputeResult,
+) SignError![64]u8 {
+    const computed = try compute(secret_key, msg, aux_rand);
+    const parsed = Signature.fromBytes(computed.sig) catch return error.SignatureVerificationFailed;
+    if (!verify(computed.pubkey, msg, parsed)) return error.SignatureVerificationFailed;
     return computed.sig;
 }
 
-/// A1 F5 (MED): the mandatory step-10 self-check below existed and worked,
-/// but was black-box untestable -- `sign` takes only a `SecretKey`, always
-/// recomputes a consistent `KeyPair` internally, and has no seam to inject
-/// a corrupted equation from outside, so no permanent test could exercise
-/// the "step 10 catches a fault" property without either (a) duplicating
-/// `sign`'s own arithmetic in the test (a copy, not a check -- see
-/// `feedback_a_test_that_reimplements_the_code_cannot_fail`) or (b) a new
-/// PUBLIC API surface on a module with 7 consumers. Neither was taken.
-/// Instead, `sign` (public, unchanged signature) is now a thin two-call
-/// composition of two file-private helpers below: `computeUnverified` (the
-/// spec's steps 1-9, no self-check) and `selfCheck` (step 10, i.e. the
-/// exact call `sign` itself makes). The regression test right below calls
-/// both directly, corrupts the real computed signature bytes the same way
-/// the audit's own mutation did (M14b: `s = k + e*d + 1`), and confirms
-/// `selfCheck` -- the genuine artifact, not a reimplementation -- rejects
-/// it. Both helpers stay non-`pub`: only this file (and its own tests) can
-/// reach them, so nothing outside this module can skip step 10.
-fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError!struct { sig: [64]u8, pubkey: XOnlyPublicKey } {
+/// Steps 1-9 of `sign` (no self-check) — the real computation `signImpl`
+/// runs in production, and the honest baseline the F5 test's corrupted
+/// stand-in derives from.
+fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError!ComputeResult {
     // Steps 1-2: even-y-normalized effective scalar d + x-only public key.
     var kp = try KeyPair.fromSecretKey(secret_key);
     defer kp.deinit();
@@ -377,13 +402,6 @@ fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) S
     sig[32..64].* = s.toBytes(.big);
 
     return .{ .sig = sig, .pubkey = kp.public };
-}
-
-/// Step 10: BIP340's mandatory self-check, exactly as `sign` calls it —
-/// the seam `computeUnverified`'s doc comment (A1 F5) describes.
-fn selfCheck(pubkey: XOnlyPublicKey, msg: []const u8, sig: [64]u8) SignError!void {
-    const parsed = Signature.fromBytes(sig) catch return error.SignatureVerificationFailed;
-    if (!verify(pubkey, msg, parsed)) return error.SignatureVerificationFailed;
 }
 
 /// BIP340 §"Verification". Returns `false` on every failure path — it
@@ -627,32 +645,41 @@ test "xonlyBytesOf: A1 F11 -- a 33-byte input with a non-SEC1 prefix is rejected
     _ = try xonlyBytesOf(&bad);
 }
 
-test "A1 F5: sign's step-10 self-check rejects a corrupted signature, via the real function sign() itself calls" {
+test "A1 F5 (round-2 follow-up): signImpl enforces step 10 on the REAL production path, not just in a standalone check function" {
     const sk = try SecretKey.fromBytes([_]u8{0x11} ** 32);
     const msg = "A1 F5 regression";
     const aux_rand = [_]u8{0xAB} ** 32;
 
-    // Sanity: the honest computation passes its own self-check, and the
-    // seam agrees with `sign`'s own output byte-for-byte.
-    var honest = try computeUnverified(sk, msg, aux_rand);
-    try selfCheck(honest.pubkey, msg, honest.sig);
+    // Positive control: signImpl with the real computation is exactly what
+    // sign() does -- same bytes, no regression from the seam.
+    const honest = try signImpl(sk, msg, aux_rand, computeUnverified);
     const via_sign = try sign(sk, msg, aux_rand, undefined);
-    try std.testing.expectEqualSlices(u8, &via_sign, &honest.sig);
+    try std.testing.expectEqualSlices(u8, &honest, &via_sign);
 
-    // Corrupt the freshly computed `s` the way a fault in step 9's
-    // arithmetic would (audit mutation M14b: `s = k + e*d + 1` instead of
-    // `s = k + e*d`) -- flip the low bit of the last byte. `selfCheck` is
-    // the exact function `sign` calls for step 10; this is not a
-    // reimplementation of "is this signature valid", it is the genuine
-    // artifact fed a genuinely corrupted input.
-    var corrupted = honest;
-    corrupted.sig[63] ^= 0x01;
-    try std.testing.expectError(error.SignatureVerificationFailed, selfCheck(corrupted.pubkey, msg, corrupted.sig));
+    // The actual regression: inject the fault INTO THE COMPUTE STEP itself
+    // (audit mutation M14b's effect: a corrupted `s`), and call signImpl --
+    // the exact function sign() calls, not a copy of its logic -- with
+    // that corrupting compute function. If step 10 is deleted or defeated
+    // inside signImpl, THIS is what turns red: the corrupted signature
+    // would be returned as `ok(...)` instead of erroring.
+    const corruptS = struct {
+        fn call(k: SecretKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
+            var r = try computeUnverified(k, m, a);
+            r.sig[63] ^= 0x01; // flip a bit of s -- the M14b-shaped fault
+            return r;
+        }
+    }.call;
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(sk, msg, aux_rand, corruptS));
 
-    // And corrupting `R` (the first 32 bytes) instead of `s` is caught too.
-    var corrupted_r = honest;
-    corrupted_r.sig[0] ^= 0x01;
-    try std.testing.expectError(error.SignatureVerificationFailed, selfCheck(corrupted_r.pubkey, msg, corrupted_r.sig));
+    // Same for a fault in R (the first 32 bytes, step 5-6's output).
+    const corruptR = struct {
+        fn call(k: SecretKey, m: []const u8, a: [32]u8) SignError!ComputeResult {
+            var r = try computeUnverified(k, m, a);
+            r.sig[0] ^= 0x01;
+            return r;
+        }
+    }.call;
+    try std.testing.expectError(error.SignatureVerificationFailed, signImpl(sk, msg, aux_rand, corruptR));
 }
 
 test "SecretKey.fromBytes REJECTS the all-zero scalar (d == 0 is not in [1, n-1])" {
