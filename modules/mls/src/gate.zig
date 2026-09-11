@@ -59,15 +59,16 @@
 //! and lives in `keyschedule.zig`, and so now is the Commit creation it
 //! also needs). There is no half-built code behind a switch anywhere.
 //!
-//! **The two boundaries Parts 7-8 state as named refusals rather than
-//! silence** are worth knowing about, because a caller meets them at
-//! runtime: `group.Error.PrivateHandshakeNotSupported` (a Commit or
-//! proposal framed as a `PrivateMessage` — the §9 secret tree exists but
-//! this object does not drive it per epoch) and `group.Error.GroupPoisoned`
-//! (a Commit that failed after the tree was already mutated leaves the
-//! object unusable rather than silently half-applied; `createCommit` is
-//! non-atomic on exactly the same terms). Neither is a gate: they are
-//! permanent, documented properties of what these parts own.
+//! **The one boundary Parts 7-8 state as a named refusal rather than
+//! silence** is worth knowing about, because a caller meets it at runtime:
+//! `group.Error.PrivateHandshakeNotSupported` (a Commit or proposal framed
+//! as a `PrivateMessage` — the §9 secret tree exists but this object does
+//! not drive it per epoch). It is not a gate: it is a permanent, documented
+//! property of what these parts own. There used to be a second one,
+//! `group.Error.GroupPoisoned` — a Commit that failed after the tree was
+//! mutated left the object unusable, and `createCommit` was non-atomic on
+//! the same terms. Both Commit paths are transactional since 2026-09-11
+//! and the error is gone; see `group.zig`'s doc comment on atomicity.
 //!
 //! Note that Part 5's one named refusal,
 //! `error.WireFormatNotInThisPart`, is GONE: Part 6 supplied the

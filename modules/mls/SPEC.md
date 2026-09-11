@@ -941,8 +941,9 @@ complete client, and the gaps are named rather than implied:
   lifetimes, credential acceptability or capability support.
 - **No external Commits (§12.4.3.2)** — at the time of Part 7. Built in
   Part 9; see there.
-- **Not atomic.** A failure after the tree is mutated poisons the object
-  (`error.GroupPoisoned`) instead of rolling back. Backlog.
+- **Not atomic — at the time of Part 7.** A failure after the tree was
+  mutated poisoned the object (`error.GroupPoisoned`) instead of rolling
+  back. Transactional since 2026-09-11; see the Backlog entry.
 
 Two §12.2 rules are explicitly application-defined by the RFC ("multiple Add
 proposals that ... represent the same client according to the application,
@@ -1210,12 +1211,11 @@ builds it, in both directions at once, for exactly that reason.
 
 - **No `PrivateMessage` handshakes**, in either direction. Unchanged from
   Part 7: `error.PrivateHandshakeNotSupported`.
-- **`createCommit` is not atomic**, on exactly the terms `processCommit` is
-  not: a failure after the tree has been mutated poisons the object. The
-  refusals that CAN be made cheaply happen first, though — the whole §12.2
-  validation and every Add's KeyPackage signature are checked before
-  `self.poisoned` is set, so the common rejection cases leave a usable
-  group, and a test pins that.
+- **`createCommit` was not atomic** at the time of Part 8, on exactly the
+  terms `processCommit` was not. Transactional since 2026-09-11 (Backlog).
+  The cheap refusals still happen first — the whole §12.2 validation and
+  every Add's KeyPackage signature are checked before the working copy is
+  made — so the common rejection cases cost no tree copy.
 - **No committer-chosen leaf content.** §7.5 allows a Commit to change the
   committer's credential, capabilities or extensions ("The application MAY
   specify other changes to the leaf node"); `createCommit` carries the
@@ -1245,8 +1245,7 @@ builds it, in both directions at once, for exactly that reason.
   `DecryptionFailed` and produces no member.
 - **`createCommit` refuses the lists a receiver would reject** — a Remove of
   the committer, two Adds with the same signature key, an inline
-  ExternalInit — and the group is still usable afterwards, which is what
-  distinguishes a pre-mutation refusal from a poisoned object.
+  ExternalInit — and the group is still usable afterwards.
 - **The zero-ciphertext `UpdatePathNode` is tested, not assumed away.** A
   one-member group adding a second member produces an `UpdatePath` whose one
   node carries NO ciphertexts, because its only copath child is the leaf
@@ -1489,7 +1488,7 @@ the choice, and no vector exercises it.
   (`MissingExternalInit`), two (`MultipleExternalInit`), two Removes
   (`MultipleRemoveInExternalCommit`), plus a by-reference proposal that
   resolves correctly and is still refused
-  (`ProposalByReferenceInExternalCommit`). Each leaves the group unpoisoned
+  (`ProposalByReferenceInExternalCommit`). Each leaves the group unchanged
   and at its old epoch, and the unspoiled Commit is then accepted — which
   is what makes the refusals about the list and not about the fixture.
 - **Both halves of "no `membership_tag`" are checked.** On the wire, a tag
@@ -1658,21 +1657,44 @@ the choice, and no vector exercises it.
   Part 7's group object did NOT make the lookup internal, because it does
   not drive the §9 secret tree per epoch — see
   `group.Error.PrivateHandshakeNotSupported`. Revisit together with that.
-- **`group.processCommit` is not atomic.** A Commit that fails a check
-  after the tree has been mutated leaves the object poisoned
-  (`error.GroupPoisoned`) rather than rolled back. Real rollback means
-  processing into a COPY of the ratchet tree and swapping on success, which
-  is a memory-model change rather than a bug fix: the tree's byte fields
-  alias the arena, so a copy needs either a deep clone or a second arena.
-  The current behaviour fails closed and says so, which is why this is a
-  backlog item and not a defect.
-- **`group.Group`'s arena grows monotonically with session length.** Every
-  Commit whose `UpdatePath` or Add contributes a `LeafNode` is copied into
-  the group's arena and never freed, because the tree aliases those bytes
-  (`tree.zig`'s stated convention). For the 200-Commit vector this is a few
-  megabytes and irrelevant; for a long-lived group it is a leak in all but
-  name. The fix is the same one the atomicity item needs — owning leaf
-  bytes rather than aliasing them — so do both together.
+- **`processCommit`/`createCommit` atomicity — DONE 2026-09-11.** It was
+  not "a backlog item and not a defect", as this entry used to say: an
+  external Commit is signed with a key it carries itself, so a stranger
+  holding a published `GroupInfo` reached §12.4.2's confirmation-tag
+  bullet, and the `error.GroupPoisoned` it left behind disabled the group
+  for every member that received the message, with `deinit` as the only
+  way out. Both Commit paths now build a WORKING COPY (`Group.fork`) and
+  swap it in only after the last fallible step (`reserveAdoption`, then the
+  infallible `adopt`); `error.GroupPoisoned` and `Group.poisoned` are gone.
+  The copy did NOT need the deep clone this entry predicted. What a
+  Commit's tree edits write or free is the tree's CONTAINERS — the node
+  array, the leaf lists, `unmerged_leaves` — never its byte fields, so
+  `cloneTree` copies exactly those into an arena of their own (the
+  "second arena" option) and the bytes stay aliased. Measured by
+  allocation-failure sweeps with one fresh object per failure point:
+  member `processCommit` — 34 points, 24 left the group changed, 28 left
+  it unable to take the same Commit — now 40 points, 0 and 0; external
+  `processCommit` 26/19/21 → 31/0/0; `createCommit` 64/53/57 → 68/0/0.
+  Every arena the group owns wipes its memory on release, so a refused
+  Commit also leaves no copy of the path secret it decrypted (scanned:
+  1 live copies → 0). The sweeps also found 17 leaked
+  allocations on `createCommit`'s failure paths — `treekem.sealUpdatePath`
+  released only its outer array, `buildWelcome` lost a ciphertext when the
+  `dupe` after it failed — fixed in the same change.
+- **`group.Group`'s retained state grows monotonically with session
+  length.** Every adopted Commit keeps its own arena (`epoch_arenas`) —
+  the message copy the tree's new leaves alias, and what was decoded from
+  it — until `deinit`, because the tree aliases those bytes (`tree.zig`'s
+  stated convention). A REFUSED Commit keeps nothing since 2026-09-11.
+  Measured on a receiver in an eight-member group taking Update-only
+  Commits: about 2.8 KB per epoch with the one shared arena this module
+  had until 2026-09-11, about 5.2 KB per epoch with an arena per Commit
+  (21.7 KB at epoch 1, 335 KB at epoch 61). The difference is each small
+  arena's own unused tail: `std.heap.ArenaAllocator` grows every new chunk
+  to half again the previous one plus the request. For the 200-Commit
+  vector this is irrelevant; for a long-lived group it is a leak in all but
+  name. The fix is still owning leaf bytes rather than aliasing them, which
+  would let an epoch's arena go once nothing in the tree points into it.
 - **`hpke` does not export the HPKE `suite_id`.** `Context.exportSecret`
   takes one as a parameter, but `schedule.suiteIdOf` is private, so
   `keyschedule.hpkeSuiteId` restates the `Aead` -> `aead_id` mapping in

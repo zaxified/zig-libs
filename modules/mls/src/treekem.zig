@@ -1054,8 +1054,8 @@ pub fn StageParams(comptime S: type) type {
 ///      encryption key, the parent hash from step 3 — and sign it.
 ///
 /// `t` is MUTATED into the post-merge state, so a caller that must not lose
-/// the old tree on failure has to work on a copy (`group.zig` documents the
-/// same non-atomicity for `processCommit`). Allocations made here are
+/// the old tree on failure has to work on a copy — which is what `group.zig`
+/// does (`Group.fork`). Allocations made here are
 /// adopted by the tree without being owned by it (`ParentNode.deinit` frees
 /// only `unmerged_leaves`), so pass an ARENA — the same contract
 /// `applyUpdatePath` states.
@@ -1224,14 +1224,34 @@ pub fn sealUpdatePath(
     defer allocator.free(scratch);
 
     const out = try allocator.alloc(UpdatePathNode, staged.nodes.len);
-    errdefer allocator.free(out);
+    // `done` slots are complete and own their ciphertexts, so a failure in a
+    // LATER slot has to release those too — not only the outer array.
+    var done: usize = 0;
+    errdefer {
+        for (out[0..done]) |node| {
+            for (node.encrypted_path_secret) |ct| {
+                allocator.free(ct.kem_output);
+                allocator.free(ct.ciphertext);
+            }
+            allocator.free(node.encrypted_path_secret);
+        }
+        allocator.free(out);
+    }
 
     for (staged.nodes, out) |n, *slot| {
         const res = try resolutionExcluding(allocator, t, n.copath_child, added_this_commit);
         defer allocator.free(res);
 
         const cts = try allocator.alloc(HPKECiphertext, res.len);
-        errdefer allocator.free(cts);
+        // Likewise for the ciphertexts already built in THIS slot.
+        var filled: usize = 0;
+        errdefer {
+            for (cts[0..filled]) |ct| {
+                allocator.free(ct.kem_output);
+                allocator.free(ct.ciphertext);
+            }
+            allocator.free(cts);
+        }
         for (res, cts) |r, *ct| {
             const pk_bytes = switch (t.nodes[r] orelse return error.Malformed) {
                 .leaf => |l| l.encryption_key,
@@ -1253,8 +1273,10 @@ pub fn sealUpdatePath(
                 scratch,
             ) catch return error.Malformed;
             ct.* = .{ .kem_output = try allocator.dupe(u8, &enc), .ciphertext = ciphertext };
+            filled += 1;
         }
         slot.* = .{ .encryption_key = n.public_key, .encrypted_path_secret = cts };
+        done += 1;
     }
     return .{ .leaf_node = staged.leaf_node, .nodes = out };
 }
