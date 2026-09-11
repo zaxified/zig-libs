@@ -8,7 +8,14 @@
 //! Also here (`proveDenial`): the closest-encloser / next-closer
 //! denial-of-existence proof (RFC 4035 §5.4, RFC 5155 §8) — deciding, from a
 //! set of NSEC3 records, whether they prove a name's non-existence (NXDOMAIN),
-//! a no-data condition, or a wildcard, including Opt-Out (§8.9). Reuses the
+//! a no-data condition, an insecure (unsigned) delegation, or a wildcard,
+//! including Opt-Out (§8.9). A direct NSEC3 match on a DS query whose bitmap
+//! has NS but neither SOA nor DS is the exact-match counterpart of Opt-Out:
+//! an unsigned delegation, not an ordinary same-zone NODATA — the same
+//! distinction `nsec.zig`'s `proveDenial` makes (audit F3, confirmed
+//! black-box against `unbound-host` 2026-09-12: an `ldns-signzone`-signed
+//! zone with this exact bitmap shape at a real delegation point makes
+//! unbound log "Verified that unsigned response is INSECURE"). Reuses the
 //! iterated hash above. Cross-checked against real NSEC3-signed zones
 //! (`ldns-signzone -n`, incl. an Opt-Out variant), each independently
 //! verified with `ldns-verify-zone`; see `oracle_test.zig`.
@@ -163,6 +170,9 @@ pub const Nsec3Set = struct {
 };
 
 const cname_type: u16 = 5;
+const ns_type: u16 = 2;
+const soa_type: u16 = 6;
+const ds_type: u16 = 43;
 
 /// Prove (or disprove) denial of existence for `qname`/`qtype` against the
 /// NSEC3 records covering the zone (RFC 5155 §8). `qname` is dotted text
@@ -229,6 +239,19 @@ pub fn proveDenial(qname: []const u8, qtype: u16, nsec3_set: Nsec3Set, salt: []c
     // denial it can support is NODATA (queried type + CNAME both absent).
     if (matchDecoded(decoded, qname, salt, iterations)) |m| {
         if (m.types.contains(qtype) or m.types.contains(cname_type)) return .bogus;
+        // Audit F3 (dnssec, confirmed black-box against unbound-host
+        // 2026-09-12: a synthetic zone with exactly this bitmap shape at a
+        // real delegation point makes unbound log "Verified that unsigned
+        // response is INSECURE", not a plain nodata verdict): an NSEC3 with
+        // NS in the bitmap but no SOA and no DS at the QUERIED name proves
+        // the child zone is an unsigned (opt-out-style) delegation, not a
+        // normal same-zone NODATA — the NSEC3 counterpart of `nsec.zig`'s
+        // identical check (`ns_type`/`soa_type`/`ds_type` mirror that file's
+        // private constants exactly). Before this fix, the two sibling
+        // proveDenial functions returned two DIFFERENT verdicts for the
+        // identical protocol state.
+        if (qtype == ds_type and m.types.contains(ns_type) and
+            !m.types.contains(soa_type) and !m.types.contains(ds_type)) return .insecure;
         return .no_data;
     }
 
@@ -585,6 +608,46 @@ test "proveDenial: over-cap NSEC3 record count is refused even when a real proof
         DenialResult.bogus,
         proveDenial("www.example", 1, .{ .records = &records }, "", 0),
     );
+}
+
+test "proveDenial NSEC3: insecure delegation -- DS NODATA with NS set, no SOA, no DS (audit F3)" {
+    // The exact protocol state the audit found `nsec.zig` and `nsec3.zig`
+    // disagreeing on: an NSEC3 that MATCHES the queried name exactly (an
+    // unsigned delegation point, not a gap) whose bitmap has NS but neither
+    // SOA nor DS. Confirmed black-box against `unbound-host` 2026-09-12
+    // (round 2, Q6): a synthetic zone with this exact bitmap shape at a real
+    // delegation point (`.zig-cache/probe/dnssec-f3/`, not committed --
+    // `ldns-signzone`-signed, served over loopback via `ldns-testns`) made
+    // unbound log "NSEC3s for the referral proved no DS." / "Verified that
+    // unsigned response is INSECURE" -- the ground truth this test pins.
+    const salt = "";
+    const iters: u16 = 0;
+    var label_buf: [64]u8 = undefined;
+    const label = ownerLabel("child.example", salt, iters, &label_buf);
+
+    // Bitmap: NS (type 2) only -- window 0, length 1, bit 2 set (0x20).
+    const ns_only_raw = [_]u8{ 0, 1, 0x20 };
+    const ns_only_types = try rdata.parseTypeBitMap(&ns_only_raw);
+
+    const set: Nsec3Set = .{
+        .records = &[_]Nsec3Record{.{
+            .owner_hash_label = label,
+            .rdata = .{
+                .hash_algorithm = hash_algorithm_sha1,
+                .flags = 0,
+                .iterations = iters,
+                .salt = salt,
+                .next_hashed_owner_name = &[_]u8{0xff} ** sha1_digest_len, // irrelevant to a direct match
+                .types = ns_only_types,
+            },
+        }},
+    };
+    try testing.expectEqual(DenialResult.insecure, proveDenial("child.example", ds_type, set, salt, iters));
+
+    // Positive control: the SAME bitmap answers a NODATA query for a type
+    // that is not the DS-at-a-cut special case (e.g. TXT) as an ordinary
+    // `.no_data`, not `.insecure` -- the new branch is qtype-gated.
+    try testing.expectEqual(DenialResult.no_data, proveDenial("child.example", 16, set, salt, iters));
 }
 
 // ── fuzz: NSEC3 owner-hash label decode, never panics ───────────────────────

@@ -349,18 +349,21 @@ pub fn parseHostPort(text: []const u8) ?HostPort {
     return .{ .host = text[0..colon], .port = port };
 }
 
-// F8 (audit 2026-09-04): unlike `parseIp4`'s octets and `parsePrefix`'s bits
-// field, this deliberately keeps accepting a leading zero ("host:080" reads
-// as port 80). Fixing the asymmetry would mean rejecting input this function
-// has always accepted, in a function 20 modules reach through
-// `parseHostPort` -- an observable-behavior change, so it needs the
-// coordinator/user to sign off, not a fixer's own call (unlike the octet and
-// bits fields, there is also no ambiguous *value* here: "0080" always means
-// decimal 80, never octal, so there is no parse-confusion bug to fix, only
-// the inconsistency). Left as is; pinned by the test below so the choice is
-// visible and a future change to this is deliberate, not a stray edit.
+// F8 (audit 2026-09-04, tightened per user decision Q2-B 2026-09-11):
+// `parsePort` used to keep accepting a leading zero ("host:080" read as port
+// 80), unlike every other numeric field in this module (`parseIp4`'s octets,
+// `parsePrefix`'s bits). There is no ambiguous *value* here -- "0080" always
+// means decimal 80, never octal -- so this was never a parse-confusion bug,
+// only an inconsistency. The user decided to close it directly rather than
+// gate it behind a switch: any single digit ("0"..."9") is still accepted
+// (that is not a *leading* zero), but two or more digits starting with '0'
+// are now rejected, matching `parseIp4`/`parsePrefix`. This is an observable
+// behavior change across `parseHostPort`'s ~20 direct consumers; the ones
+// that actually reach `parsePort`/`parseHostPort` (`http`, `bacnet`, `probe`)
+// were checked in the same batch -- none had a leading-zero port fixture.
 fn parsePort(text: []const u8) ?u16 {
     if (text.len == 0 or text.len > 5) return null;
+    if (text.len > 1 and text[0] == '0') return null; // leading zero, len >= 2
     var v: u32 = 0;
     for (text) |c| {
         if (c < '0' or c > '9') return null;
@@ -1195,20 +1198,22 @@ test "parseHostPort" {
     for (bad) |t| try testing.expect(parseHostPort(t) == null);
 }
 
-// F8 (audit 2026-09-04): `parsePort` keeps a leading zero, unlike every
-// other numeric field in this module (`parseIp4`'s octets, `parsePrefix`'s
-// bits). Pinned rather than "fixed" -- see the comment on `parsePort` for
-// why: it is 20 consumers' worth of observable-behavior change to close,
-// not a fixer's call, and there is no value-confusion bug underneath it
-// ("0080" is decimal 80, never octal). This test exists so a future change
-// to that asymmetry is a deliberate edit that touches this line, not a
-// side effect nobody notices.
-test "F8: parsePort's leading zero is accepted, deliberately, unlike other numeric fields" {
-    const hp = parseHostPort("host:0080").?;
-    try testing.expectEqual(@as(u16, 80), hp.port);
-    const hp2 = parseHostPort("host:00000").?;
-    try testing.expectEqual(@as(u16, 0), hp2.port);
-    // Contrast: the sibling numeric fields reject the same shape.
+// F8 (audit 2026-09-04, closed per user decision Q2-B 2026-09-11):
+// `parsePort` used to keep a leading zero, unlike every other numeric field
+// in this module (`parseIp4`'s octets, `parsePrefix`'s bits). Now rejected
+// the same way. This test used to pin acceptance; it is flipped here to pin
+// rejection, so a future regression back to the old asymmetry is a
+// deliberate edit that touches this line, not a side effect nobody notices.
+test "F8: parsePort's leading zero is rejected, like other numeric fields" {
+    try testing.expectEqual(@as(?HostPort, null), parseHostPort("host:0080"));
+    try testing.expectEqual(@as(?HostPort, null), parseHostPort("host:00000"));
+    try testing.expectEqual(@as(?HostPort, null), parseHostPort("host:00"));
+    // A single digit is not a *leading* zero: "0" itself must still parse.
+    const hp = parseHostPort("host:0").?;
+    try testing.expectEqual(@as(u16, 0), hp.port);
+    const hp2 = parseHostPort("host:80").?;
+    try testing.expectEqual(@as(u16, 80), hp2.port);
+    // Contrast: the sibling numeric fields reject the same shape, as before.
     try testing.expectEqual(@as(?[4]u8, null), parseIp4("01.2.3.4"));
     try testing.expectEqual(@as(?Prefix, null), parsePrefix("10.0.0.0/08"));
 }

@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-12** — **BEHAVIOURAL, not breaking:** `parsePort` (and therefore
+  `parseHostPort`) now rejects a leading zero (`host:0080`, `host:00` — but a
+  bare `"0"` still parses as port 0), closing the F8 asymmetry the 2026-09-10
+  entry below left pinned-not-fixed. Decided directly by the user (round 2,
+  Q2-B: harden `netaddr` consumers-and-all rather than gate behind a switch),
+  not a fixer's own call, because `parseHostPort` has ~20 direct dependents.
+  Checked every module that actually reaches `parsePort`/`parseHostPort`
+  (`http`, `bacnet`, `probe` — the rest only depend on other `netaddr` API):
+  none has a leading-zero port fixture, and each module's own `modtest` lane
+  stayed green. `http`'s own duplicate `parsePort` (used only for the
+  bracketed-`[v6]:port` authority form) was tightened the same way in the
+  same commit, so the two authority-parsing paths inside `http.Url.parse`
+  agree again.
+
 - **2026-09-10** — **A1 fix campaign: F2, F4, F6, F8 closed** (four of the five
   items the 2026-09-04 pass recorded but did not fix; the SSRF item stays with
   `rdap`/`whois`, not this module).

@@ -306,8 +306,14 @@ pub const Url = struct {
     }
 };
 
+// Kept in sync with `netaddr.parsePort` (audit F8, closed 2026-09-12): a
+// leading zero is rejected the same way here as it is on the non-bracketed
+// `host:port` authority form four lines above, which goes through
+// `netaddr.parseHostPort`. Without this, `http://[::1]:0080/` and
+// `http://host:0080/` would disagree on whether "0080" is a valid port.
 fn parsePort(text: []const u8) ?u16 {
     if (text.len == 0 or text.len > 5) return null;
+    if (text.len > 1 and text[0] == '0') return null; // leading zero, len >= 2
     var v: u32 = 0;
     for (text) |c| {
         if (c < '0' or c > '9') return null;
@@ -567,6 +573,19 @@ test "Url.parse: rejects malformed input" {
     try testing.expectError(error.BadUrl, Url.parse("http://[not-v6]/"));
     try testing.expectError(error.BadUrl, Url.parse("http://[::1]8080/"));
     try testing.expectError(error.BadUrl, Url.parse("http://2001:db8::1/")); // v6 needs brackets
+}
+
+// audit netaddr F8, closed 2026-09-12: a leading zero on the port used to
+// parse (as decimal, e.g. "0080" -> 80) on both authority forms. Now
+// rejected on both, so the bracketed and non-bracketed paths agree.
+test "Url.parse: a leading zero on the port is rejected on both authority forms" {
+    try testing.expectError(error.BadUrl, Url.parse("http://host:0080/"));
+    try testing.expectError(error.BadUrl, Url.parse("http://[::1]:0080/"));
+    // A bare "0" is not a *leading* zero -- still valid on both forms.
+    const a = try Url.parse("http://host:0/");
+    try testing.expectEqual(@as(u16, 0), a.port);
+    const b = try Url.parse("http://[::1]:0/");
+    try testing.expectEqual(@as(u16, 0), b.port);
 }
 
 test "Url.parse: whitespace, control bytes and non-ASCII are not URL bytes (RFC 3986 §2)" {

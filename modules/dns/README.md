@@ -73,7 +73,10 @@ defer decoded.deinit();
 ## Behavior notes
 
 - Decoded names are dotted text **without** the trailing root dot (root = "");
-  no `\DDD` escape handling — labels are raw bytes.
+  no `\DDD` escape handling — labels are raw bytes. A consumer that needs the
+  true label boundaries (not text dot-counting) reads `Record.labels`
+  (audit F7) — slices into `Record.name`, populated for every decoded
+  record; empty on a hand-built `Record` that never set it.
 - `resolve` returns the last response even on NXDOMAIN/empty — inspect
   `Message.rcode()`; `lookupIp` returns an empty slice when nothing resolves.
 - EDNS(0) advertises a 1232-byte UDP payload by default (DNS flag day 2020);
