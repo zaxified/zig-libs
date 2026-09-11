@@ -804,7 +804,13 @@ test "shrink: a fuzzed failing schedule against BrokenRaft minimizes to a still-
     var res = try netsim.shrinkTrace(gpa, &failing);
     defer res.deinit();
     try testing.expect(res.after <= res.before);
-    if (res.before >= 1) try testing.expect(res.after >= 1);
+    // netsim audit F6: `BrokenRaft` fires "on a clean run with no injected
+    // faults" (see its own doc comment above) — the true minimal reproducer
+    // is the EMPTY fault set, and netsim's shrinker now finds exactly that
+    // instead of a pre-fix floor of >= 1 that blamed an arbitrary surviving
+    // fault. This used to read `if (res.before >= 1) try
+    // testing.expect(res.after >= 1);`.
+    try testing.expectEqual(@as(usize, 0), res.after);
 
     const r = try netsim.replay(gpa, failing.case, res.trace.events, null);
     try testing.expectEqual(netsim.RunOutcome.violated, r.outcome);
@@ -1076,7 +1082,9 @@ const StepDownProbe = struct {
     fn reset(ctx: *anyopaque) void {
         const self = cast(ctx);
         const inner = self.srv.protocol();
-        inner.resetFn.?(inner.ctx);
+        // audit F3 (netsim): `Protocol.resetFn` is mandatory now, so this is
+        // no longer optional to unwrap.
+        inner.resetFn(inner.ctx);
         self.injected = false;
         self.was_leader = false;
         self.term_before = 0;

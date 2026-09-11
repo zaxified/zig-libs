@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — Consumer-side follow-up to the `netsim` A1 fix campaign
+  (F6): `BrokenAlwaysDf` fires from its own BUM-flooding traffic alone,
+  with no injected fault (the "positive control" test already proves it
+  trips on a completely empty trace), so `netsim`'s shrinker now correctly
+  reduces its counterexample to the EMPTY fault set instead of a pre-fix
+  floor of `>= 1` — the "shrink" test's assertion updated from
+  `try testing.expect(res.after >= 1);` to
+  `try testing.expectEqual(@as(usize, 0), res.after);`. No behavioural
+  change to `df-elect` itself. `scripts/modtest df-elect`: 37/37.
+
 - **2026-09-07** — Fuzz reach: neither `fuzzTagOf` nor `fuzzFrames` ever reached its
   decoder. Both opened `smith.bytes(&buf)` and then drew the length with
   `smith.valueRangeAtMost`; `bytes` consumes `@min(buf.len, in.len)` octets and a ranged

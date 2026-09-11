@@ -229,8 +229,13 @@ const PingPong = struct {
     resend_period: ?Time = null,
 
     fn protocol(self: *PingPong) Protocol {
-        return .{ .ctx = self, .onStartFn = onStart, .onMessageFn = onMessage, .onTimerFn = onTimer };
+        return .{ .ctx = self, .onStartFn = onStart, .onMessageFn = onMessage, .onTimerFn = onTimer, .resetFn = reset };
     }
+
+    // audit F3: `resetFn` is mandatory now. `PingPong` had none because
+    // every one of its own tests builds a fresh instance per `replay` call
+    // — a no-op is correct, not a gap, but it must be spelled out.
+    fn reset(_: *anyopaque) void {}
 
     fn cast(ctx: *anyopaque) *PingPong {
         return @ptrCast(@alignCast(ctx));
@@ -461,6 +466,7 @@ fn f9RingScenario(sim: *Sim) anyerror!void {
 
 const F9NoopProtocol = struct {
     fn onMessage(_: *anyopaque, _: *Sim, _: NodeId, _: NodeId, _: []const u8) anyerror!void {}
+    fn reset(_: *anyopaque) void {}
 };
 
 fn floodScenario(sim: *Sim) anyerror!void {
@@ -654,7 +660,7 @@ test "perf: run() builds the topology once, not twice (audit F9)" {
     const case = Case{
         .seed = 1,
         .scenario = f9RingScenario,
-        .protocol = .{ .ctx = &unused, .onMessageFn = F9NoopProtocol.onMessage },
+        .protocol = .{ .ctx = &unused, .onMessageFn = F9NoopProtocol.onMessage, .resetFn = F9NoopProtocol.reset },
         .until = 2000,
     };
     const fault_cfg = fault_mod.Config{ .horizon = 1000 };
