@@ -102,7 +102,7 @@ test "bench (opt-in via K256_BENCH)" {
         var i: usize = 0;
         while (i < smul_iters) : (i += 1) {
             const r = Secp256k1.basePoint.mul(sb, .big) catch continue;
-            sink ^= r.x.limbs[0];
+            sink ^= r.x._limbs[0];
         }
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
@@ -115,7 +115,7 @@ test "bench (opt-in via K256_BENCH)" {
         i = 0;
         while (i < smul_iters) : (i += 1) {
             const r = Secp256k1.combMulBase(sb, .big) catch continue;
-            sink ^= r.x.limbs[0];
+            sink ^= r.x._limbs[0];
         }
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
@@ -145,7 +145,7 @@ test "bench (opt-in via K256_BENCH)" {
         var i: usize = 0;
         while (i < smul_iters) : (i += 1) {
             const r = p.mulPublic(s2, .big) catch continue;
-            sink ^= r.x.limbs[0];
+            sink ^= r.x._limbs[0];
         }
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
@@ -156,7 +156,7 @@ test "bench (opt-in via K256_BENCH)" {
         i = 0;
         while (i < smul_iters) : (i += 1) {
             const r = p.mulPublicDoubleAdd(s2, .big) catch continue;
-            sink ^= r.x.limbs[0];
+            sink ^= r.x._limbs[0];
         }
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
@@ -261,7 +261,7 @@ test "bench (opt-in via K256_BENCH)" {
         i = 0;
         while (i < sig_iters) : (i += 1) {
             const q = ecdsa_recover.recoverPubkey(ec_hash, ec_sig.r, ec_sig.s, ec_sig.recid) catch continue;
-            sink ^= q.x.limbs[0];
+            sink ^= q.x._limbs[0];
         }
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);

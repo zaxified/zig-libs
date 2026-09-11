@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — **BREAKING:** `Fe`'s backing field renamed `limbs` ->
+  `_limbs` (audit F8, LOW). The old name was a plain public struct member,
+  so any code could construct `Fe{ .limbs = raw }` and bypass every
+  canonicalizing constructor (`fromBytes`, `fromInt`, arithmetic ops),
+  silently violating `Fe`'s own documented invariant ("always canonical
+  between operations") — measured: `isZero()`/`isOdd()` gave the wrong
+  answer for a raw, non-canonical value. Zig has no field-level privacy, so
+  this is the same leading-underscore "internal, don't construct directly"
+  convention already used elsewhere in this repo, not a compiler-enforced
+  guarantee — but it does mean any code (in or out of this repo) spelling
+  `Fe{ .limbs = ... }` will now fail to compile. No in-repo consumer of the
+  11 that depend on this module ever touched the field directly (verified
+  by grep, before and after); all 11 re-run green.
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** added Wycheproof ECDSA
   secp256k1/SHA-256 verification vectors (audit G3, MED) — this module
   shipped zero ECDSA test vectors of its own (only BIP340 Schnorr vectors).
