@@ -1612,6 +1612,63 @@ test "serve: dotfile refused by default, served when opted in" {
     try testing.expect(mem.endsWith(u8, resp, "SECRET=1"));
 }
 
+// A1 F8: "only ever serve regular files" (root.zig:443/475) had no test —
+// the fixture never had a non-regular file, so mutation M13 (deleting the
+// `st.kind != .file` check) passed 30/30 green. The reason the ORIGINAL
+// audit and the first fixer pass both left this alone: `open()` on a FIFO
+// for reading, in the default blocking mode `openFile` uses, blocks on the
+// open() syscall itself until a writer attaches — with no writer, forever,
+// on a shared machine other agents are using.
+//
+// The fix is not to touch `openFile` (production code has no business
+// opening things O_NONBLOCK) but to make sure a writer is ALREADY attached
+// before the module's blocking open ever runs, by holding both a
+// non-blocking reader AND a non-blocking writer fd open on the FIFO for the
+// lifetime of the test:
+//   1. mknodat the FIFO (skip the test if unsupported, e.g. non-Linux CI).
+//   2. open it O_RDONLY|O_NONBLOCK — this succeeds immediately even with no
+//      writer (that is the whole point of O_NONBLOCK on the read side).
+//   3. open it O_WRONLY|O_NONBLOCK — now succeeds immediately too, because
+//      step 2's reader is already attached (no ENXIO).
+// With both ends held, the module's own default-blocking `openFile` call
+// in step 4 never actually blocks: at least one writer is present the
+// instant it asks, which is the only thing a blocking reader-open waits
+// for. No thread, no timing, no risk of hanging the shared box.
+const linux = std.os.linux;
+
+fn openFifoBothEndsNonblocking(dir: Dir, name: [:0]const u8) !struct { r: linux.fd_t, w: linux.fd_t } {
+    const mknod_rc = linux.mknodat(dir.handle, name, linux.S.IFIFO | 0o644, 0);
+    if (linux.errno(mknod_rc) != .SUCCESS) return error.SkipZigTest;
+    const r_rc = linux.openat(dir.handle, name, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, 0);
+    if (linux.errno(r_rc) != .SUCCESS) return error.SkipZigTest;
+    const r_fd: linux.fd_t = @intCast(r_rc);
+    errdefer _ = linux.close(r_fd);
+    const w_rc = linux.openat(dir.handle, name, .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0);
+    if (linux.errno(w_rc) != .SUCCESS) return error.SkipZigTest;
+    const w_fd: linux.fd_t = @intCast(w_rc);
+    return .{ .r = r_fd, .w = w_fd };
+}
+
+test "serve: a FIFO in the root is refused (403), not opened and blocked on (A1 F8, audit mutation M13)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    const ends = try openFifoBothEndsNonblocking(fx.root, "afifo");
+    defer {
+        _ = linux.close(ends.r);
+        _ = linux.close(ends.w);
+    }
+
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    // The real, un-mutated regular-file check: the module's own blocking
+    // `openFile` runs here and must not hang (see the fixture helper above
+    // for why it cannot), and the FIFO must never be handed to a client.
+    try testing.expectEqual(@as(u16, 403), statusOf(get(&h, "/afifo", &out)));
+    // Positive control: an actual regular file next to it still serves 200
+    // — the FIFO fixture did not disturb ordinary resolution.
+    try testing.expectEqual(@as(u16, 200), statusOf(get(&h, "/hello.txt", &out)));
+}
+
 test "serve: TRAVERSAL TEETH — every vector refused, secret never read" {
     var fx = try Fixture.init();
     defer fx.deinit();
