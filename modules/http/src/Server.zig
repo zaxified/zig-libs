@@ -2956,6 +2956,18 @@ pub const ResponseWriter = struct {
         if (!rw.accept_gzip) return false;
         if (rw.http1_0) return false;
         if (rw.noBody()) return false;
+        // A1 http/staticfiles F6: 206 describes a byte range of the
+        // IDENTITY representation (`Content-Range: bytes a-b/total`, where
+        // `total` is the plain length); re-encoding that range's bytes as
+        // gzip and calling the result "bytes a-b" is simply wrong — a
+        // client or intermediary that reassembles ranges writes compressed
+        // bytes at identity offsets. nginx and Apache both exclude 206 from
+        // their gzip filters for exactly this reason; neither this module
+        // nor `staticfiles` did, and neither alone can fix it (the defect
+        // is split across both scopes: this module builds the Content-
+        // Range header wrong here, `staticfiles` is the only caller that
+        // ever produces a 206 through this path).
+        if (rw.status == 206) return false;
         if (known_len) |n| {
             if (n < cfg.min_size) return false;
         }
@@ -3028,6 +3040,21 @@ pub const ResponseWriter = struct {
             if (std.ascii.eqlIgnoreCase(hd.name, "vary") and
                 (h1.tokenListContains(hd.value, "accept-encoding") or
                     h1.tokenListContains(hd.value, "*"))) vary_covered = true;
+            // A1 http/staticfiles F6: RFC 9110 §8.8.3 ties an ETag to the
+            // SELECTED REPRESENTATION, and gzip vs. identity are two
+            // different representations of the same resource — a strong
+            // tag that does not change between them is wrong for BOTH (a
+            // strong `If-Match`/`If-Range` on one is authorized to treat
+            // the other as byte-identical, which it is not). Weakened only
+            // on the WIRE, only when this response is actually being
+            // gzipped; the handler's own stored value (and what it reads
+            // back) is untouched.
+            if (rw.content_encoding_gzip and std.ascii.eqlIgnoreCase(hd.name, "etag") and
+                !std.mem.startsWith(u8, hd.value, "W/"))
+            {
+                try out.print("{s}: W/{s}\r\n", .{ hd.name, hd.value });
+                continue;
+            }
             try out.print("{s}: {s}\r\n", .{ hd.name, hd.value });
         }
         if (!saw_date) if (rw.date) |d| try out.print("Date: {s}\r\n", .{d});
@@ -3467,6 +3494,27 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
     } else if (std.mem.eql(u8, req.path, "/bin")) {
         // Big but not a compressible type.
         try rw.setHeader("Content-Type", "application/octet-stream");
+        try rw.writeAll(json_body);
+    } else if (std.mem.eql(u8, req.path, "/range206")) {
+        // A1 http/staticfiles F6: a 206 with a compressible content-type —
+        // must never be compressed, whatever `Content-Range` says about it.
+        // `small_json` (not `json_body`): stays inside the response buffer,
+        // so an uncompressed answer gets an exact Content-Length and this
+        // test does not also have to account for chunked framing.
+        rw.setStatus(206);
+        var cr_buf: [32]u8 = undefined;
+        try rw.setHeader("Content-Range", try std.fmt.bufPrint(&cr_buf, "bytes 0-{d}/{d}", .{ small_json.len - 1, small_json.len }));
+        try rw.setHeader("Content-Type", "application/json");
+        try rw.setHeader("ETag", "\"strong-tag\"");
+        try rw.writeAll(small_json);
+    } else if (std.mem.eql(u8, req.path, "/etagjson")) {
+        // A1 http/staticfiles F6: a strong ETag on a response that DOES get
+        // compressed must reach the wire weak — the gzip bytes are not the
+        // identity bytes the strong tag was computed over. `json_body`
+        // (not `small_json`): must actually cross `gz_on.min_size` to
+        // compress at all.
+        try rw.setHeader("ETag", "\"strong-tag\"");
+        try rw.setHeader("Content-Type", "application/json");
         try rw.writeAll(json_body);
     } else if (std.mem.eql(u8, req.path, "/pregz")) {
         // Pretend pre-compressed content: must pass through untouched.
@@ -4633,6 +4681,46 @@ test "serveStream gzip: fully buffered body compresses too" {
     var out_buf: [4096]u8 = undefined;
     const got = runStreamWith(.{ .compression = gz_on }, null, "GET /json HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
     try expectGzipResponse(got, small_json);
+}
+
+test "serveStream gzip: a 206 is never compressed, whatever Content-Range says (A1 http/staticfiles F6)" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /range206 HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    var r: Reader = .fixed(got);
+    var head_buf: [1024]u8 = undefined;
+    const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+    try testing.expectEqual(@as(u16, 206), res.status);
+    try testing.expect(res.header("content-encoding") == null);
+    // The identity ETag is untouched too — nothing here is a different
+    // representation from what the strong tag was computed over.
+    try testing.expectEqualStrings("\"strong-tag\"", res.header("etag").?);
+    // Content-Range describes the IDENTITY body, and since nothing was
+    // compressed, Content-Length framing (not chunked) proves the bytes on
+    // the wire really are the plain ones the handler wrote.
+    try testing.expectEqual(@as(?u64, small_json.len), res.content_length);
+    try testing.expect(std.mem.endsWith(u8, got, small_json));
+    // Positive control: the SAME content-type/body at 200 does compress —
+    // this is specifically about status 206, not about the route.
+    const identity_ok = runStreamWith(.{ .compression = gz_on }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    try expectGzipResponse(identity_ok, json_body);
+}
+
+test "serveStream gzip: a strong ETag reaches the wire weak when the response is actually compressed (A1 http/staticfiles F6)" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on }, null, "GET /etagjson HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out_buf);
+    var r: Reader = .fixed(got);
+    var head_buf: [1024]u8 = undefined;
+    const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+    try testing.expectEqualStrings("gzip", res.header("content-encoding").?);
+    try testing.expectEqualStrings("W/\"strong-tag\"", res.header("etag").?);
+
+    // Positive control: no Accept-Encoding -> identity body -> the SAME
+    // handler-set value reaches the wire strong, untouched.
+    const identity = runStreamWith(.{ .compression = gz_on }, null, "GET /etagjson HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    var r2: Reader = .fixed(identity);
+    const res2 = try h1.ResponseHead.parse(try h1.readHead(&r2, &head_buf));
+    try testing.expect(res2.header("content-encoding") == null);
+    try testing.expectEqualStrings("\"strong-tag\"", res2.header("etag").?);
 }
 
 test "serveStream gzip: no Accept-Encoding → identity, Vary still set" {

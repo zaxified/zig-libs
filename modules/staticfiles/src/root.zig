@@ -1289,15 +1289,27 @@ fn runRequest(handler: *Handler, wire: []const u8, out_buf: []u8) []const u8 {
     var request_body_buf: [256]u8 = undefined;
     var response_body_buf: [256]u8 = undefined;
     var chunk_buf: [512]u8 = undefined;
+    // A1 http/staticfiles F6: negotiable but inert for every EXISTING test
+    // here — none send `Accept-Encoding`, and `shouldCompress` requires it
+    // before looking at anything else. `min_size = 1` (well under
+    // `gzip.Compression`'s 1024 default) so the F6 regression tests below
+    // can trigger it off the fixture's own tiny files — including a 5-byte
+    // RANGE body — instead of needing a dedicated large one. The scratch
+    // memory is what actually gates it
+    // (`Server.zig`: "compression stays off without it") — `.compression`
+    // alone in `StreamOptions` is not enough.
+    var gzip_scratch: http.Server.GzipScratch = undefined;
     http.Server.serveStream(.{
         .handler = httpHandler,
         .context = handler,
         .server_name = "test",
+        .compression = .{ .min_size = 1 },
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
         .response_body = &response_body_buf,
         .chunk = &chunk_buf,
+        .gzip = &gzip_scratch,
     });
     return out.buffered();
 }
@@ -1621,15 +1633,23 @@ test "sendFile: serving an already-resolved Opened is byte-identical to the reso
     var request_body_buf: [256]u8 = undefined;
     var response_body_buf: [256]u8 = undefined;
     var chunk_buf: [512]u8 = undefined;
+    // Same `.compression`/`.gzip` scratch as `runRequest` (which `get()`
+    // above goes through) — otherwise this comparison would differ by the
+    // `Vary: Accept-Encoding` line compression adds to EVERY response, an
+    // artifact of the two call sites' options rather than of `sendFile`
+    // actually behaving differently from `serve`.
+    var gzip_scratch: http.Server.GzipScratch = undefined;
     http.Server.serveStream(.{
         .handler = resolvedSendFileHandler,
         .context = &h,
         .server_name = "test",
+        .compression = .{ .min_size = 1 },
     }, &in, &out, .{
         .head = &head_buf,
         .request_body = &request_body_buf,
         .response_body = &response_body_buf,
         .chunk = &chunk_buf,
+        .gzip = &gzip_scratch,
     });
     const via_sendfile = out.buffered();
 
@@ -2014,6 +2034,57 @@ test "serve: 206 + Content-Range on a range, 416 on unsatisfiable" {
     const r416 = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nRange: bytes=50-60\r\nConnection: close\r\n\r\n", &out);
     try testing.expectEqual(@as(u16, 416), statusOf(r416));
     try testing.expect(mem.indexOf(u8, r416, "Content-Range: bytes */11\r\n") != null);
+}
+
+test "serve: a 206 range response is never gzip-compressed, even with Accept-Encoding (A1 http/staticfiles F6)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+    const r206 = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nRange: bytes=0-4\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 206), statusOf(r206));
+    // Before the `http`-side fix, this exact combination answered 206 with
+    // `Content-Encoding: gzip` and a `Content-Range` describing offsets
+    // into the IDENTITY body while the bytes on the wire were compressed.
+    try testing.expect(mem.indexOf(u8, r206, "Content-Encoding") == null);
+    try testing.expect(mem.indexOf(u8, r206, "Content-Range: bytes 0-4/11\r\n") != null);
+    try testing.expect(mem.indexOf(u8, r206, "Content-Length: 5\r\n") != null);
+    try testing.expect(mem.endsWith(u8, r206, "hello"));
+
+    // Positive control: the SAME file, same negotiation, no Range -> 200
+    // DOES compress (proves the exclusion is about the status, not about
+    // `hello.txt` somehow being ineligible).
+    const identity_ok = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(identity_ok));
+    try testing.expect(mem.indexOf(u8, identity_ok, "Content-Encoding: gzip\r\n") != null);
+}
+
+test "serve: ETag reaches the wire weak when the response is actually gzip-compressed (A1 http/staticfiles F6)" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var h = Handler.init(testing.io, fx.root, .{});
+    var out: [4096]u8 = undefined;
+
+    const plain = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out);
+    try testing.expectEqual(@as(u16, 200), statusOf(plain));
+    try testing.expect(mem.indexOf(u8, plain, "Content-Encoding") == null);
+    const strong_needle = "ETag: \"";
+    const strong_at = mem.indexOf(u8, plain, strong_needle).?;
+    // Every strong ETag `buildETag` emits starts right after `ETag: `, with
+    // no `W/` — confirms the baseline before comparing the gzipped case.
+    try testing.expectEqualStrings("ETag: \"", plain[strong_at .. strong_at + strong_needle.len]);
+
+    var out2: [4096]u8 = undefined;
+    const gzipped = runRequest(&h, "GET /hello.txt HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n", &out2);
+    try testing.expectEqual(@as(u16, 200), statusOf(gzipped));
+    try testing.expect(mem.indexOf(u8, gzipped, "Content-Encoding: gzip\r\n") != null);
+    try testing.expect(mem.indexOf(u8, gzipped, "ETag: W/\"") != null);
+    // Same underlying tag value on both, only the wire strength differs.
+    const plain_tag_end = mem.indexOf(u8, plain[strong_at..], "\r\n").? + strong_at;
+    const plain_tag = plain[strong_at + "ETag: ".len .. plain_tag_end];
+    const gzip_tag_at = mem.indexOf(u8, gzipped, "ETag: W/").? + "ETag: W/".len;
+    const gzip_tag_end = mem.indexOf(u8, gzipped[gzip_tag_at..], "\r\n").? + gzip_tag_at;
+    try testing.expectEqualStrings(plain_tag, gzipped[gzip_tag_at..gzip_tag_end]);
 }
 
 test "serve: multi-range request falls back to a full 200, not a 206/416" {

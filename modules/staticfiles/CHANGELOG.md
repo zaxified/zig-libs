@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11 (2)** — A1 fix campaign round 2, F6 (cross-module with `http`, one commit —
+  round-2 Q4). BEHAVIOURAL. Two related defects at the `http` compression seam, both only
+  reachable when the embedding `Server` has `Options.compression` set:
+  - A byte-range response (206) could still be gzip-compressed: `Content-Range` describes
+    offsets into the IDENTITY body, and the wire body was the gzip bytes of that range —
+    a client or intermediary reassembling ranges would write compressed bytes at identity
+    offsets. Fixed in `http` (`ResponseWriter.shouldCompress` now excludes 206
+    unconditionally), not here — `staticfiles` has no way to know whether `http` is about
+    to compress a response it hands back.
+  - The identity and gzip representations of the same file shared one strong `ETag`
+    (`buildETag`'s `size+mtime`), when RFC 9110 §8.8.3 requires a validator that
+    distinguishes representations. Fixed in `http`: a strong `ETag` on a response `http`
+    is about to gzip now reaches the wire prefixed `W/` — `staticfiles`' own stored/returned
+    value, and the identity-negotiated wire value, are unchanged.
+  - `runRequest`'s shared test harness now wires `.compression`+a gzip scratch buffer
+    (previously absent, so no staticfiles test could ever exercise compression at all);
+    the standalone `sendFile`-vs-`serve` byte-identity comparison test picked up the same
+    options for the same reason. Two new tests here mirror the two `http`-side ones.
+  - RED (both `http`-side mechanisms disabled): 38 pass / 2 fail / 40 → GREEN 40/40.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** a directory-listing request
   (no index file, `directory_listing = true`) now resolves its target
   directory once instead of twice (A1 F11 — the old `serve`/`serveDirectory`
