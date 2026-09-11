@@ -204,8 +204,17 @@ pub const Options = struct {
     /// the h2 shape of the h1 431).
     max_header_bytes: usize = 16 * 1024,
     /// Request body cap (h1 `max_body_bytes` parity): a body crossing it
-    /// answers 413 and the connection closes. null = unlimited — this
-    /// struct is the low-level, socket-free codec layer (parity with
+    /// answers 413 and its stream closes. **Enforced CONNECTION-WIDE, not
+    /// per stream** (A1 http F2 — a body that is buffered at all, i.e. not
+    /// `stream_request`, counts against `s.totalBufferedBodyBytes()` for
+    /// the whole connection, not just its own stream): with h2
+    /// multiplexing, `Limits.max_concurrent_streams` bodies can be buffered
+    /// at once, and a per-stream-only cap let one connection hold that many
+    /// times `max_body_bytes` at once (150 MB at the shipped defaults of
+    /// 100 streams × 1 MiB) — the connection-wide total is what actually
+    /// matches an h1 connection's single-body-at-a-time memory shape for
+    /// the SAME configured number. null = unlimited — this struct is the
+    /// low-level, socket-free codec layer (parity with
     /// `Server.StreamOptions`, which defaults the same field to null for
     /// the same reason: a plain-codec/BYO-TLS caller composing this
     /// directly should not be silently capped). A `Server`-owned h2c
@@ -1142,7 +1151,19 @@ const Session = struct {
         s.grantJob(d.stream_id, d.data.len);
         if (job.over_cap or job.dispatched) return; // shedding / already handed over
         if (s.opts.max_body_bytes) |max| {
-            if (job.body.items.len + d.data.len > max) {
+            // A1 http F2: this used to compare only `job`'s OWN bytes to
+            // `max`, so the cap was per-STREAM — with
+            // `Limits.max_concurrent_streams` buffered bodies live on one
+            // connection at once, a single h2c connection could hold
+            // `max_concurrent_streams * max_body_bytes` (150 MB at the
+            // shipped defaults of 100 streams × 1 MiB), against an h1
+            // connection's single ~46 KiB slab for the SAME `max_body_bytes`
+            // value. Checking the CONNECTION-WIDE total instead restores
+            // the doc's claim that this one number bounds memory the same
+            // way on both protocols. Subsumes the old per-job comparison
+            // (the total can only be >= any one job's own bytes), so that
+            // check is gone rather than kept alongside a stricter one.
+            if (s.totalBufferedBodyBytes() + d.data.len > max) {
                 job.over_cap = true;
                 return;
             }
@@ -1150,6 +1171,23 @@ const Session = struct {
         job.body.appendSlice(s.gpa, d.data) catch {
             job.over_cap = true; // overloaded: shed like an over-limit body
         };
+    }
+
+    /// Sum of buffered (non-streaming) request-body bytes across every job
+    /// on this connection right now (A1 http F2) — computed fresh rather
+    /// than kept as a running counter, because a `Job` leaves `s.jobs`
+    /// through several paths (served to completion, evicted for capacity,
+    /// reset-and-reaped) and a counter would need every one of them to
+    /// remember to decrement it by exactly the right amount; summing the
+    /// buffers themselves cannot drift. `Limits.max_concurrent_streams`
+    /// bounds how many jobs there ever are (100 by default), so this is
+    /// cheap relative to the DATA frame that triggers it.
+    fn totalBufferedBodyBytes(s: *const Session) usize {
+        var total: usize = 0;
+        for (s.jobs.values()) |*job| {
+            if (!job.streaming) total += job.body.items.len;
+        }
+        return total;
     }
 
     /// Return `n` octets of `id`'s outstanding credit (§6.9): the connection
@@ -3237,6 +3275,33 @@ test "h2c serve: request body over max_body_bytes → 413, connection closes (of
     try testing.expectEqual(@as(u16, 200), peer2.resp(sid2).status);
     try testing.expectEqualStrings("drained 8", peer2.resp(sid2).body.items);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer2.goaway);
+}
+
+test "h2c serve: max_body_bytes is enforced CONNECTION-WIDE, not per stream (A1 http F2)" {
+    // Before this fix, `onData` compared only the RECEIVING job's own bytes
+    // to `max_body_bytes`, so with `Limits.max_concurrent_streams` streams
+    // each individually under the cap, a connection could buffer that many
+    // TIMES the cap at once. Two streams, 5 bytes each, cap 8: neither
+    // stream's own total ever crosses 8, but the connection-wide total
+    // (10) does the moment the second stream's chunk arrives.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+
+    try peer.conn.sendPreface(&peer.wire);
+    const sid1 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
+    try peer.conn.sendData(&peer.wire, sid1, "x" ** 5, false); // 5 bytes, not yet complete
+    const sid2 = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
+    try peer.conn.sendData(&peer.wire, sid2, "y" ** 5, true); // 5 alone, but 5+5 > 8 connection-wide
+    try peer.conn.sendData(&peer.wire, sid1, "", true); // complete stream 1 at exactly its own 5 bytes
+
+    var out_buf: [2048]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler, .max_body_bytes = 8 }, &out_buf);
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid1).status);
+    try testing.expectEqualStrings("drained 5", peer.resp(sid1).body.items);
+    try testing.expectEqual(@as(u16, 413), peer.resp(sid2).status);
+    try testing.expect(peer.resp(sid2).end);
 }
 
 test "h2c serve: stream error → RST_STREAM, connection keeps serving (offline)" {

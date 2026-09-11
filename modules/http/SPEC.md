@@ -153,7 +153,12 @@ Hardened for direct internet exposure (no reverse proxy required):
   resets on every successful write — it drops a peer that stops reading outright, but not one that
   keeps draining a response a trickle at a time (RUDY-style slow-read); see `TimeoutWriter`'s doc
   comment. Size caps (413/431/414); per-connection request-count cap; inbound gzip is
-  zip-bomb-capped (`max_decompressed_request_bytes` → 413).
+  zip-bomb-capped (`max_decompressed_request_bytes` → 413). A chunked request's trailer section is
+  bounded too — `h1.ChunkedReader.max_trailer_bytes` (32 KiB default), charged against BOTH one
+  line's length and the number of lines, whether the trailers are captured or discarded (A1 http
+  F5, 2026-09-11 — before that `max_body_bytes` covered decoded body bytes only; the trailer
+  section, discarded or not, was consumed inside the decoder's own read loop with nothing bounding
+  it but the connection's read timeout).
 - **HTTP/2 DoS:** rapid-reset (CVE-2023-44487), CONTINUATION-flood (CVE-2024-27316),
   MAX_CONCURRENT_STREAMS, control-frame flood budgets, total-streams-per-conn cap — all
   configurable, safe by default (so `enable_h2c` is hardened out of the box), and the shipped
@@ -166,7 +171,17 @@ Hardened for direct internet exposure (no reverse proxy required):
   with RST_STREAM(REFUSED_STREAM) rather than a queue. Rapid-reset stays a *budget* rather than a
   consequence of one-handler-at-a-time: a cancellation after dispatch is charged exactly like one
   before it. **Not covered:** per-user connection-rate limiting — that belongs on the accept path
-  (`Options.on_connect`), not in the h2 loop.
+  (`Options.on_connect`), not in the h2 loop. GOAWAY is charged against the no-progress budget the
+  same as every sibling frame type (A1 http F16, 2026-09-11 — before that a peer could stream
+  GOAWAY frames past `max_unproductive_frames` for free). `Options.max_body_bytes` is enforced
+  CONNECTION-WIDE on h2, not per stream (A1 http F2, 2026-09-11 — before that
+  `Limits.max_concurrent_streams` buffered bodies each up to the cap gave one connection
+  `max_concurrent_streams × max_body_bytes` at once, 150 MB at the shipped defaults). An
+  `enable_h2c` connection also gets an absolute lifetime cap, `Options.max_h2c_connection_ms`
+  (default 4 h, armed once at connection start): `request_timeout_ms` is deliberately h1-only, so
+  before this a connection kept "productive" by the protocol layer's own accounting — one stream
+  fed an occasional single byte, which resets every no-progress and per-stall budget in its path —
+  ran unbounded (A1 http F7).
 - **Header injection:** outbound header names/values reject CR/LF/NUL (response-splitting guard).
 - **Redirect hops (client):** on an origin change the client drops `Authorization`, `Cookie` and
   `Proxy-Authorization` and replaces a caller-supplied `Host` with the hop's authority (A1 G3/G4,

@@ -316,6 +316,21 @@ pub const Options = struct {
     /// `read_timeout_ms` alone cannot give. Response writing and handler
     /// compute time are not counted. 0 = no deadline.
     request_timeout_ms: u32 = 60_000,
+    /// Absolute lifetime cap for an `enable_h2c` connection; 0 = no cap.
+    /// `request_timeout_ms` is deliberately h1-only (its doc says so) — a
+    /// multiplexed h2 connection has no single "request" to time, and
+    /// re-arming it per-stream would let one that never fully idles run
+    /// forever. That is exactly the gap this closes (A1 http F7): a peer
+    /// that keeps exactly one stream fed with occasional single-byte DATA
+    /// frames stays "productive" for every protocol-layer budget
+    /// (`Limits.max_unproductive_frames` resets on any non-empty DATA) while
+    /// paying for `Options.max_body_bytes` of server memory indefinitely.
+    /// Armed once, at connection start, and never re-armed — a legitimate
+    /// long-lived connection simply reconnects after a graceful close
+    /// instead of running unbounded. Ignored on the HTTP/1.1 path, where
+    /// `request_timeout_ms` already bounds every request and keep-alive
+    /// idle period.
+    max_h2c_connection_ms: u32 = 4 * std.time.ms_per_hour,
     /// Max time a single write may stall because the peer stopped reading
     /// (slow-read attack): the socket is polled for writability before
     /// every write; 0 = no timeout.
@@ -344,14 +359,25 @@ pub const Options = struct {
     /// shape): an over-limit declared Content-Length is refused before the
     /// handler runs; a chunked body is capped while streaming — the
     /// handler's body reader fails once decoded bytes cross the limit, and
-    /// the connection closes. Bodies are never buffered either way; this
-    /// cap protects handlers that buffer and bounds bandwidth, not server
-    /// memory. **null = unlimited — set this for any route that accepts
+    /// the connection closes. On h1 this bounds bandwidth, not server
+    /// memory: the body is never buffered, only streamed through the fixed
+    /// per-connection slab. **On h2 (`enable_h2c`) it bounds memory
+    /// directly, because the default (non-`stream_request`) surface DOES
+    /// buffer the body until END_STREAM** (A1 http F2 — this comment used
+    /// to claim "bodies are never buffered either way", which was true only
+    /// for h1). **null = unlimited — set this for any route that accepts
     /// real uploads**, or every body over 1 MiB gets a 413 (see README
     /// "Direct-internet posture"). Applies to `enable_h2c` requests too:
     /// `connMain` forwards this exact value into `h2_server.Options` when
-    /// dispatching an h2 connection, so a `Server`-based consumer is
-    /// hardened identically on both protocols by default — the lower-level
+    /// dispatching an h2 connection, and it is enforced there **for the
+    /// buffered total across the whole connection, not per stream**
+    /// (`Session.totalBufferedBodyBytes`) — with h2 multiplexing,
+    /// `Limits.max_concurrent_streams` bodies can be buffered at once, and
+    /// checking each one against this cap independently let one
+    /// connection hold `max_concurrent_streams` times as much (150 MB at
+    /// the shipped defaults) as this field's name promises. With the
+    /// connection-wide total, a `Server`-based consumer really is hardened
+    /// identically on both protocols by default — the lower-level
     /// `h2_server.Options.max_body_bytes` (like `StreamOptions.max_body_bytes`)
     /// defaults to null only because that struct is the permissive
     /// composable-codec layer this one wraps, not because h2 is
@@ -964,12 +990,15 @@ fn connMain(s: *Server, stream: net.Stream) void {
     // h2c (opt-in): a connection that opens with the HTTP/2 client preface
     // is served as HTTP/2 with the same handler; anything else falls
     // through to the HTTP/1.1 loop below with nothing consumed. The stall
-    // timeout guards the peek; the whole-request deadline stays h1-only
-    // (it has no natural shape on a multiplexed connection).
+    // timeout guards the peek; the whole-REQUEST deadline stays h1-only
+    // (it has no natural shape on a multiplexed connection) — but the
+    // connection as a whole still gets an absolute lifetime cap, armed once
+    // below (A1 http F7).
     if (o.enable_h2c) {
         const is_h2 = detectH2Preface(&tr.reader) catch return; // stalled/reset: drop
         if (is_h2) {
             served = true;
+            tr.armConnection(o.max_h2c_connection_ms);
             h2s.serve(s.gpa, .{
                 .handler = o.handler,
                 .context = o.context,
@@ -1089,6 +1118,11 @@ const TimeoutReader = struct {
     request_timeout_ms: u32,
     /// Monotonic whole-request deadline; 0 = unarmed.
     deadline_ns: u64 = 0,
+    /// Monotonic absolute connection-lifetime deadline (A1 http F7); 0 =
+    /// unarmed. Independent of `deadline_ns`: h1 arms only the request
+    /// deadline (re-armed every request), `enable_h2c` arms only this one
+    /// (once, at connection start) — see `armConnection`.
+    conn_deadline_ns: u64 = 0,
     reader: Reader,
     timed_out: bool = false,
     canceled: bool = false,
@@ -1114,6 +1148,27 @@ const TimeoutReader = struct {
     fn armRequest(t: *TimeoutReader) void {
         if (!have_poll_timeouts or t.request_timeout_ms == 0) return;
         t.deadline_ns = monotonicNowNs() + @as(u64, t.request_timeout_ms) * std.time.ns_per_ms;
+    }
+
+    /// Start the absolute connection-lifetime deadline (A1 http F7). Unlike
+    /// `armRequest`, this is meant to be called exactly ONCE, at connection
+    /// start — arming it per-request (there is no "request" on a
+    /// multiplexed h2 connection to hang it on anyway) would let a
+    /// perpetually-productive-enough peer push it out forever.
+    fn armConnection(t: *TimeoutReader, max_connection_ms: u32) void {
+        if (!have_poll_timeouts or max_connection_ms == 0) return;
+        t.conn_deadline_ns = monotonicNowNs() + @as(u64, max_connection_ms) * std.time.ns_per_ms;
+    }
+
+    /// The earlier of the two deadlines that are currently armed, or 0 if
+    /// neither is. In practice exactly one of `deadline_ns`/`conn_deadline_ns`
+    /// is ever nonzero on a given connection (h1 arms only the first,
+    /// `enable_h2c` only the second) — `@min` is future-proofing, not load
+    /// bearing today.
+    fn earliestDeadlineNs(t: *const TimeoutReader) u64 {
+        if (t.deadline_ns == 0) return t.conn_deadline_ns;
+        if (t.conn_deadline_ns == 0) return t.deadline_ns;
+        return @min(t.deadline_ns, t.conn_deadline_ns);
     }
 
     /// `Io.checkCancel` *acknowledges* the request — it reports a pending
@@ -1142,18 +1197,19 @@ const TimeoutReader = struct {
     fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
         const t: *TimeoutReader = @alignCast(@fieldParentPtr("reader", r));
         const in = &t.src.interface;
+        const deadline_ns = t.earliestDeadlineNs();
         if (have_poll_timeouts and in.bufferedLen() == 0 and
-            (t.timeout_ms != 0 or t.deadline_ns != 0))
+            (t.timeout_ms != 0 or deadline_ns != 0))
         {
             var wait_ms: u64 = if (t.timeout_ms != 0) t.timeout_ms else std.math.maxInt(i32);
-            if (t.deadline_ns != 0) {
+            if (deadline_ns != 0) {
                 const now = monotonicNowNs();
-                if (now >= t.deadline_ns) {
+                if (now >= deadline_ns) {
                     t.timed_out = true;
                     return error.ReadFailed;
                 }
                 // Round up so we never poll(0)-spin just before the deadline.
-                wait_ms = @min(wait_ms, (t.deadline_ns - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
+                wait_ms = @min(wait_ms, (deadline_ns - now + std.time.ns_per_ms - 1) / std.time.ns_per_ms);
             }
             var fds = [_]std.posix.pollfd{.{
                 .fd = t.handle,
@@ -3749,6 +3805,29 @@ test "serveStream: bare-LF in the request head → 400, connection closes (smugg
     try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 OK\r\n"));
 }
 
+test "serveStream: a bare LF cannot stand in for the head-terminating CRLF and smuggle a pipelined request through (A1 http F4)" {
+    // Distinct from the test above: that one puts the bare LF INSIDE a head
+    // line, which `RequestHead.parse`'s own `stripCrlf` already rejected
+    // before this fix. This one puts it where the FIRST request's head
+    // would otherwise end validly (CRLF-terminated request line and header,
+    // both fine) and asks whether a bare LF can serve as the terminating
+    // blank line in place of a real one — the shape the audit's F16-adjacent
+    // repro used: `takeLineInto`'s old `.blank` test accepted any
+    // all-CR/-LF line, so `readHead` handed back a "complete" head one line
+    // short, and the rest of the wire (a second, fully legitimate request)
+    // was served as if the peer had pipelined it — 2 hits, 2×200. With the
+    // terminator now required to be exactly `\r\n`, the bare LF is read on
+    // as more head instead, and the embedded second request-line fails
+    // `parseHeaderLine` (no colon) → the whole thing is one malformed head.
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(&hits, "GET /hello HTTP/1.1\r\nHost: t\r\n\n" ++
+        "GET /admin HTTP/1.1\r\nHost: internal\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1"));
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
+}
+
 test "serveStream: protocol rejections (505, 501, 400s, 431)" {
     var out_buf: [4096]u8 = undefined;
     try testing.expect(std.mem.startsWith(u8, runStream(null, "GET / HTTP/2.0\r\n\r\n", &out_buf), "HTTP/1.1 505 HTTP Version Not Supported\r\n"));
@@ -5327,6 +5406,75 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
     const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
     try testing.expect(elapsed_ms < 800);
+}
+
+test "integration: an enable_h2c connection kept 'productive' forever still ends at max_h2c_connection_ms (A1 http F7)" {
+    // `request_timeout_ms` is h1-only by design; before `max_h2c_connection_ms`
+    // existed, NOTHING bounded an h2c connection's total lifetime. The audit's
+    // shape: a peer that periodically does something the protocol layer counts
+    // as progress (any PING resets `noteUnproductive`'s budget same as a real
+    // stream would) keeps every existing guard from firing while paying for
+    // server resources indefinitely. PINGs here are individually 40 ms apart —
+    // 125x under `read_timeout_ms` — so only the new absolute cap can be what
+    // ends this.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var server = init(io, testing.allocator, .{
+        .handler = testHandler,
+        .enable_h2c = true,
+        .read_timeout_ms = 5_000,
+        .max_h2c_connection_ms = 150,
+    });
+    defer server.deinit();
+    server.bind() catch |err| {
+        std.debug.print("loopback bind failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    const thread = try std.Thread.spawn(.{}, serveWrap, .{&server});
+    defer thread.join();
+    defer server.shutdown();
+
+    const stream = server.boundAddress().connect(io, .{ .mode = .stream }) catch |err| {
+        std.debug.print("loopback connect failed ({s}), skipping\n", .{@errorName(err)});
+        return error.SkipZigTest;
+    };
+    defer stream.close(io);
+    var rbuf: [256]u8 = undefined;
+    var wbuf: [256]u8 = undefined;
+    var sr = stream.reader(io, &rbuf);
+    var sw = stream.writer(io, &wbuf);
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(testing.allocator);
+    try wire.appendSlice(testing.allocator, h2.preface);
+    try h2.encodeSettings(testing.allocator, &wire, .{});
+    try sw.interface.writeAll(wire.items);
+    try sw.interface.flush();
+
+    const started_ns = monotonicNowNs();
+    var rounds: usize = 0;
+    while (rounds < 20) : (rounds += 1) {
+        try sleepMs(io, 40);
+        wire.clearRetainingCapacity();
+        h2.encodePing(testing.allocator, &wire, .{0} ** 8, false) catch break;
+        sw.interface.writeAll(wire.items) catch break; // server may have hung up
+        sw.interface.flush() catch break;
+    }
+    // Whatever the server sent back (SETTINGS ack, PING acks, a final
+    // GOAWAY) does not matter -- what matters is that reading eventually
+    // hits EndOfStream, and roughly when. 20 rounds at 40 ms is 800 ms of
+    // wire time; if only `read_timeout_ms` (5 s) bounded this, the loop
+    // above would run to completion having sent every PING. 1 s sits
+    // comfortably above the 150 ms connection cap and comfortably below
+    // both `read_timeout_ms` and the 800 ms the round-trip loop itself
+    // takes.
+    while (true) {
+        _ = sr.interface.take(1) catch break; // EndOfStream or ReadFailed: connection is down
+    }
+    const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
+    try testing.expect(elapsed_ms < 1_000);
 }
 
 // ── tests (in-process integration — Phase 2.1 hardening) ────────────────────

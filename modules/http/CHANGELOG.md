@@ -5,6 +5,71 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-11** — A1 fix campaign round 2, fixer slot `a`: six findings, all BEHAVIOURAL
+  (hardening applied directly, no opt-in switch — round-2 user decision Q2-B/Q7).
+  - **F16** — the h2 `.goaway` frame arm never called `noteUnproductive()`, unlike every
+    sibling frame type (`.ping` twelve lines above it): a peer could stream GOAWAY frames
+    past `max_unproductive_frames` for free on `h2.Connection` (the doc'd server itself
+    was unaffected — the first GOAWAY already starts graceful shutdown there). One call
+    added, same shape as `.ping`. RED (mutated back out): 523/527 (1 fail, new test) →
+    GREEN 524/527.
+  - **F4** — a bare LF (no preceding CR) was silently accepted as the head-terminating
+    blank line, the post-chunk-data CRLF, and the chunk-size line's terminator — despite
+    SPEC and doc comments claiming bare LF is rejected everywhere. `takeLineInto`'s
+    `.blank` now requires the terminator to be exactly `\r\n` (not just "all `\r`/`\n`
+    bytes"), and the chunk-size line is checked for a literal trailing `\r\n` instead of
+    `trimLineEnd`'s lenient strip. A request smuggled behind a bare-LF "terminator" is now
+    read on as more head and fails `parseHeaderLine` (400), rather than ending the head
+    early and serving the tail as a second request. RED: 524/529 (2 fail) → GREEN 526/529.
+  - **F5** — `max_body_bytes` bounded decoded body bytes but not the chunked trailer
+    section at all: neither one line's length nor the number of lines, whether trailers
+    were captured or discarded (they are consumed inside `ChunkedReader`'s own read loop,
+    never crossing the `Reader` interface `RequestBody.Capped` counts against). New
+    `ChunkedReader.max_trailer_bytes` (default 32 KiB), charged on every trailer line's
+    full wire cost (`Line.raw_len`, which — unlike `bytes.len` — counts bytes dropped for
+    overflowing an empty/small `dest` too) via new `FailReason.trailer_too_large`. RED:
+    526/530 (1 fail) → GREEN 527/530.
+  - **F7** — an `enable_h2c` connection had NO overall lifetime cap: `request_timeout_ms`
+    is deliberately h1-only (no single "request" to hang it on for a multiplexed
+    connection), so a peer that kept exactly one stream "productive" with occasional
+    single-byte DATA frames — which resets every per-stall and no-progress budget in its
+    path — could hold the connection (and its `max_body_bytes` of buffered memory) open
+    indefinitely. New `Server.Options.max_h2c_connection_ms` (default 4 h), armed ONCE at
+    connection start via `TimeoutReader.armConnection` (independent of, and checked
+    alongside, the existing per-request `deadline_ns`). RED: 527/531 (1 fail) → GREEN
+    528/531.
+  - **F2** — `max_body_bytes` on h2 was enforced PER STREAM, not per connection: with
+    `Limits.max_concurrent_streams` (100 default) buffered bodies live on one connection
+    at once, a per-stream-only cap let one h2c connection hold up to
+    `max_concurrent_streams × max_body_bytes` at once (150 MB at the shipped defaults),
+    against an h1 connection's single ~46 KiB slab for the identical configured number —
+    exactly what the doc claimed could not happen ("hardened identically on both
+    protocols"). `onData` now checks the connection-wide buffered total
+    (`Session.totalBufferedBodyBytes`, summed fresh from the jobs map rather than kept as
+    a counter that every job-removal path would need to remember to decrement) instead of
+    just the receiving job's own bytes; the now-subsumed per-job comparison is gone.
+    Two doc corrections that were themselves wrong before this fix: h1's `max_body_bytes`
+    doc claimed "bodies are never buffered either way" (h2's default surface DOES buffer
+    until END_STREAM), and h2_server's claimed a plain per-body cap achieved parity with
+    h1 (it didn't, until now). RED: 528/532 (1 fail, `expected 413, found 200`) → GREEN
+    529/532.
+  - **G5** — the redirect destination gate (`RequestOptions.redirect_filter`, added
+    2026-09-06) covered only hop-to-hop: its own doc said outright "the first hop is the
+    caller's own URL and is not gated here". A consumer that lets a user supply the
+    request URL directly had no gate on THAT, only on where a later 3xx might send it.
+    `requestInner`/`requestInnerPlain` now consult the filter once more, before the very
+    first dial, with `from == to` (the same `Url` value passed for both) as the signal a
+    filter uses to tell "this is the original destination" apart from "this is where a
+    redirect wants to send you". Changes the observable call count and refusal behavior of
+    an already-shipped opt-in (round-2 Q7: allowed when the change closes a real gate, no
+    consumer in this repo sets `redirect_filter` yet). RED: 528/533 (2 fail) → GREEN
+    530/533.
+  - Consumer sweep: representative sample of `http`'s 27 in-repo dependents —
+    `router`, `metrics`, `grpc`, `rdap`, `websocket`, `llmclient`, `ocspcache`, `jwt`,
+    `aaa-gate` — each `scripts/modtest <m>` green; none touch `redirect_filter`,
+    `ChunkedReader.FailReason`, or send malformed bare-LF/oversize-trailer traffic, so a
+    full 27-module sweep was not run (this batch is pure hardening + additive fields/enum
+    members, not a signature or default-value change any of them could observe).
 - **2026-09-10** (4) — A1 fix campaign, fourth wave on `http`, five findings:
   - **G7 remainder** — `negotiateLanguage`/`negotiateEncoding` had the identical
     O(tags/codings × header length) shape `negotiate` was fixed for last wave, flagged
