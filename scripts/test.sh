@@ -1356,8 +1356,18 @@ cmd_changed() {
     # Named, not merely counted: a reader who sees "0 to test" after editing ten
     # files needs to be told the files were prose, or the next thing they do is
     # distrust the narrowing.
-    if [[ $trigger_docs -eq 1 ]]; then
-        echo "  docs only:  ${docs_only# } — not built or tested (they cannot change what compiles);"
+    # ⛔ A module that changed BOTH prose and code lands in `docs_only` *and* in
+    # `seeds`, and printing it here said "not built or tested" about a module the
+    # very next line lists as tested. Measured 2026-09-11 on an mqtt change that
+    # touched broker.zig, README.md and SPEC.md together. The narrowing was
+    # right; the sentence about it was false, which is worse than merely noisy —
+    # this gate's whole job is to be believed about what it skipped.
+    local docs_pure=" " dname
+    for dname in $docs_only; do
+        case " ${valid_seeds[*]} " in *" $dname "*) ;; *) docs_pure="$docs_pure$dname " ;; esac
+    done
+    if [[ $trigger_docs -eq 1 && -n "${docs_pure// /}" ]]; then
+        echo "  docs only:  ${docs_pure# } — not built or tested (they cannot change what compiles);"
         echo "              the gates that read them still run below."
     fi
     [[ ${#valid_seeds[@]} -gt 0 ]] && echo "  changed:    ${valid_seeds[*]}"
