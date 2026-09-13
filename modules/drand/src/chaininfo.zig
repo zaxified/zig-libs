@@ -38,6 +38,7 @@
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
+const json_uint = @import("json_uint.zig");
 
 const g2 = bls12_381.g2;
 
@@ -202,12 +203,14 @@ pub fn computeChainHash(info: *const ChainInfo) [32]u8 {
 // The raw JSON shape drand's `/info` emits. `ignore_unknown_fields`
 // tolerates forward-compatible additions; every field this module needs
 // is required (a missing one → `std.json`'s `error.MissingField` →
-// `MalformedJson`). Numbers are taken as `u64`; an overflow becomes
-// `error.Overflow` → `NumberOutOfRange`.
+// `MalformedJson`). Numbers are `json_uint.Uint64`, read as Go's
+// `encoding/json` reads an integer field (audit F7): an integer token only,
+// so a string, exponent, fraction or u64 overflow is `MalformedJson`.
+// A `period` that fits u64 but not u32 is `NumberOutOfRange`.
 const InfoJson = struct {
     public_key: []const u8,
-    period: u64,
-    genesis_time: u64,
+    period: json_uint.Uint64,
+    genesis_time: json_uint.Uint64,
     hash: []const u8,
     groupHash: []const u8,
     schemeID: []const u8,
@@ -239,6 +242,7 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
 
     const raw = std.json.parseFromSliceLeaky(InfoJson, arena, bytes, .{
         .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .use_last, // Go keeps the last equal key
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedJson,
@@ -272,9 +276,9 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
     }
 
     // No chain has period 0; refusing it here keeps `expectedRound` total.
-    if (raw.period == 0) return error.InvalidPeriod;
+    if (raw.period.value == 0) return error.InvalidPeriod;
     // The chain hash must fit in drand's u32 period field to be derivable.
-    if (raw.period > std.math.maxInt(u32)) return error.NumberOutOfRange;
+    if (raw.period.value > std.math.maxInt(u32)) return error.NumberOutOfRange;
 
     // Beacon ID label.
     var beacon_id_buf: [max_beacon_id_bytes]u8 = [_]u8{0} ** max_beacon_id_bytes;
@@ -289,8 +293,8 @@ pub fn parseInfo(gpa: std.mem.Allocator, bytes: []const u8) ParseError!ChainInfo
 
     const info: ChainInfo = .{
         .scheme = scheme,
-        .period_seconds = raw.period,
-        .genesis_time = raw.genesis_time,
+        .period_seconds = raw.period.value,
+        .genesis_time = raw.genesis_time.value,
         .chain_hash = chain_hash,
         .group_hash = group_hash,
         .pubkey_bytes = pubkey_bytes,
@@ -498,6 +502,21 @@ test "parseInfo: missing field → MalformedJson" {
 test "parseInfo: trailing garbage → MalformedJson" {
     const bad = quicknet_info_json ++ " trailing";
     try testing.expectError(error.MalformedJson, parseInfo(testing.allocator, bad));
+}
+
+test "parseInfo: integer fields are read as drand's Go reference reads them (audit F7)" {
+    const head = "{\"public_key\":\"83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a\",";
+    const tail = "\"hash\":\"52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971\",\"groupHash\":\"f477d5c89f21a17c863a7f937c6a6d15859414d2be09cd448d4279af331c5d3e\",\"schemeID\":\"bls-unchained-g1-rfc9380\"}";
+    try testing.expectError(error.MalformedJson, parseInfo(testing.allocator, head ++ "\"period\":\"3\",\"genesis_time\":1," ++ tail));
+    try testing.expectError(error.MalformedJson, parseInfo(testing.allocator, head ++ "\"period\":3,\"genesis_time\":1e0," ++ tail));
+    // Go keeps the last of two equal keys. On the genuine document the chain
+    // hash tells which one was kept: the real `period` last parses, a forged
+    // one last breaks the hash.
+    const real_last = "{\"period\":30," ++ quicknet_info_json[1..];
+    const info = try parseInfo(testing.allocator, real_last);
+    try testing.expectEqual(@as(u64, 3), info.period_seconds);
+    const forged_last = quicknet_info_json[0 .. quicknet_info_json.len - 1] ++ ",\"period\":30}";
+    try testing.expectError(error.ChainHashMismatch, parseInfo(testing.allocator, forged_last));
 }
 
 test "parseInfo: huge period number → NumberOutOfRange" {

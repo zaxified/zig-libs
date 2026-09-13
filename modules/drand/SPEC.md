@@ -154,8 +154,16 @@ stop) feeding crafted bytes:
   deserialization. Found by the wave-2 audit (W2-32).
 - **Wrong signature / wrong round / wrong chain key** → the pairing
   equation fails → `InvalidSignature`. Never a silent false-accept.
+- **JSON read as drand's Go reference reads it** (A1 audit F7). Integer
+  fields (`round`, `period`, `genesis_time`) take only an integer number
+  token: a string (`"1000"`), an exponent (`1e3`), a fraction (`1000.0`)
+  or a minus sign is `MalformedJson`, as Go's `encoding/json` refuses them
+  for a `uint64`. Of two equal keys the LAST is kept, as in Go. Deliberately
+  stricter than Go: `null` (Go reads round 0), a key in another case (Go
+  folds case) and bytes after the document (Go's `Decoder` stops at the
+  first value) are all `MalformedJson`. `src/json_uint.zig`.
 - **Number overflow** (`period`/`genesis_time` past `u64`) →
-  `MalformedJson` (std.json's `error.Overflow`); a `period` past `u32`
+  `MalformedJson`; a `period` past `u32`
   → `NumberOutOfRange` (drand hashes it as 32 bits), `period == 0` →
   `InvalidPeriod` (no chain has one, and it would be a division by zero in
   `expectedRound` — SIGFPE in ReleaseFast before the guard existed).

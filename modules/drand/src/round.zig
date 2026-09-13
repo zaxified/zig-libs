@@ -49,6 +49,7 @@
 
 const std = @import("std");
 const bls12_381 = @import("bls12_381");
+const json_uint = @import("json_uint.zig");
 
 const g1 = bls12_381.g1;
 
@@ -121,7 +122,7 @@ pub const Round = struct {
 };
 
 const RoundJson = struct {
-    round: u64,
+    round: json_uint.Uint64,
     signature: []const u8,
     randomness: ?[]const u8 = null,
     previous_signature: ?[]const u8 = null,
@@ -144,8 +145,11 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // `use_last` and `json_uint.Uint64` read the document as drand's Go
+    // reference does (audit F7); see `json_uint.zig`.
     const raw = std.json.parseFromSliceLeaky(RoundJson, arena, bytes, .{
         .ignore_unknown_fields = true,
+        .duplicate_field_behavior = .use_last,
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MalformedJson,
@@ -184,7 +188,7 @@ pub fn parseRound(gpa: std.mem.Allocator, bytes: []const u8) RoundParseError!Rou
     }
 
     return .{
-        .round = raw.round,
+        .round = raw.round.value,
         .sig_bytes = sig_bytes,
         .sig_len = sig_len,
         .sig_g1 = sig_g1,
@@ -247,6 +251,21 @@ test "parseRound: genuine quicknet round 1000 decodes to a typed Round with a G1
     try testing.expect(r.sig_g1 != null);
     try testing.expect(r.randomness != null);
     try testing.expect(r.previous_signature == null);
+}
+
+test "parseRound: the round number is read as drand's Go reference reads it (audit F7)" {
+    const sig = "\"signature\":\"b44679b9a59af2ec876b1a6b1ad52ea9b1615fc3982b19576350f93447cb1125e342b73a8dd2bacbe47e4b6b63ed5e39\"";
+    // Go's `uint64` refuses a string and an exponent; this parser used to
+    // accept both, and verified the string form as round 1000.
+    try testing.expectError(error.MalformedJson, parseRound(testing.allocator, "{\"round\":\"1000\"," ++ sig ++ "}"));
+    try testing.expectError(error.MalformedJson, parseRound(testing.allocator, "{\"round\":1e3," ++ sig ++ "}"));
+    try testing.expectError(error.MalformedJson, parseRound(testing.allocator, "{\"round\":1000.0," ++ sig ++ "}"));
+    // Go keeps the last of two equal keys; this parser used to refuse the
+    // document. Both orders, so the test cannot pass by keeping the first.
+    const last_1000 = try parseRound(testing.allocator, "{\"round\":1001,\"round\":1000," ++ sig ++ "}");
+    try testing.expectEqual(@as(u64, 1000), last_1000.round);
+    const last_1001 = try parseRound(testing.allocator, "{\"round\":1000,\"round\":1001," ++ sig ++ "}");
+    try testing.expectEqual(@as(u64, 1001), last_1001.round);
 }
 
 test "parseRound: decoded G1 signature is in the subgroup" {

@@ -85,6 +85,7 @@ test {
     _ = chaininfo;
     _ = round;
     _ = verify;
+    _ = @import("json_uint.zig");
 }
 
 test "meta.deps is exactly {bls12_381, tlock}" {

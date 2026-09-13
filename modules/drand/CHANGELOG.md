@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 finding F7, the JSON parsers now agree with
+  drand's Go reference (`encoding/json` into `uint64`, `common.Beacon`/`client.RandomData`).
+  `parseRound` accepted `{"round":"1000",…}` and verified it as round 1000, and accepted
+  `{"round":1e3,…}`; Go refuses both. It refused a duplicate `round` key, which Go accepts
+  keeping the last. Integer fields in `parseRound` and `parseInfo` are now read by the new
+  `json_uint.Uint64` (integer token only), and both parsers keep the last of two equal keys.
+  A string, exponent, fraction or negative number is `MalformedJson`. `null`, a key in
+  another case and trailing bytes stay refused, stricter than Go (see `SPEC.md`).
+  `scripts/modtest drand`: 61/61 (was 57/57), Debug and ReleaseFast;
+  `example-apps/timecapsule` builds against the tree.
+
 - **2026-09-10** — A1 fix campaign, 3 of 6 remaining findings closed (test
   quality only — this module has a real consumer, `example-apps/timecapsule`,
   confirmed against `build.zig`'s `example_apps` table, not only
