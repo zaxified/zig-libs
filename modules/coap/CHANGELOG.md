@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — A1 finding "notification volume" (RFC 7641 §7 MUST). Additive API:
+  `observe.Registry.notificationType(token, resource, now_ms)` tells the push path whether the
+  next notification must be confirmable, and `Registry.acknowledged(token, resource, now_ms)`
+  reports an ACK. New `Registry.max_non_between_acks` (default 5, libcoap's `COAP_OBS_MAX_NON`;
+  `null` = off, for authenticated clients only) and the §4.5 24-hour confirmable rule
+  (`observe.max_con_interval_ms`). `Registry.Entry` gains `non_since_ack` and `last_ack_ms`;
+  existing calls behave as before.
+
 - **2026-09-07** — **`fuzzParse` replayed an EMPTY datagram for every input it was
   ever given, and had no corpus at all.**
 

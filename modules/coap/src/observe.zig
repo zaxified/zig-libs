@@ -28,6 +28,11 @@
 //! CON notification is driven by a `reliability.Retransmit` like any other CON.
 //! If it exhausts retransmission (`.timed_out`) or the peer answers with a Reset,
 //! the subscription is dead: the caller calls `Registry.cancel(token, resource)`.
+//! Which type a notification goes out as is not the caller's free choice:
+//! RFC 7641 §7 requires non-confirmable notifications to be interspersed with
+//! confirmable ones, and §4.5 a confirmable one at least every 24 hours. The
+//! push path asks `Registry.notificationType` before each notification and
+//! reports each ACK with `Registry.acknowledged`.
 //! (An RST correlates by message id, so the caller maps the notification's id
 //! back to its `(token, resource)` — a few lines in its own loop.)
 //!
@@ -116,6 +121,20 @@ pub fn isNewerAt(old: u24, old_ms: u64, new: u24, now_ms: u64) bool {
 /// number greater than MAX_LATENCY" (RFC 7252 §4.8.2).
 pub const reordering_window_ms: u64 = 128_000;
 
+/// RFC 7641 §4.5: "A server that transmits notifications mostly in
+/// non-confirmable messages MUST send a notification in a confirmable message
+/// instead of a non-confirmable message at least every 24 hours."
+pub const max_con_interval_ms: u64 = 24 * 60 * 60 * 1000;
+
+/// How many notifications `Registry.notificationType` lets go out
+/// non-confirmable before it demands a confirmable one, by default. RFC 7641
+/// §7 requires the limit ("Without client authentication, a server therefore
+/// MUST strictly limit the number of notifications that it sends between
+/// receiving acknowledgements … any notifications sent in non-confirmable
+/// messages MUST be interspersed with confirmable messages") but names no
+/// number; 5 is libcoap's `COAP_OBS_MAX_NON`.
+pub const default_max_non_between_acks: u32 = 5;
+
 /// Encode an Observe sequence as its option value: a 0..3-byte minimal
 /// big-endian uint (0 → empty), like the CoAP uint format (RFC 7641 §2 uses the
 /// §3.2 uint representation).
@@ -187,6 +206,14 @@ pub const Registry = struct {
     /// one admitted peer can occupy, so it can't monopolize (and thereby evict)
     /// the shared FIFO even once admitted.
     max_per_source: usize = 0,
+    /// RFC 7641 §7's notification budget, consulted by `notificationType`: how
+    /// many notifications may go out non-confirmable between two
+    /// acknowledgements from the client. On by default
+    /// (`default_max_non_between_acks`); `0` makes every notification
+    /// confirmable. `null` switches the budget off — §7 scopes the MUST to a
+    /// server "without client authentication", so only do that for clients the
+    /// caller has authenticated (DTLS). The 24-hour rule applies either way.
+    max_non_between_acks: ?u32 = default_max_non_between_acks,
 
     pub const Entry = struct {
         token_buf: [coap.max_token_len]u8 = undefined,
@@ -202,6 +229,12 @@ pub const Registry = struct {
         /// when registered via the plain `register` primitive, which does not
         /// take one). Used only by `tryRegister`'s per-source cap.
         source_id: u64 = 0,
+        /// Notifications `notificationType` has let go out non-confirmable
+        /// since the client last acknowledged one (`acknowledged`).
+        non_since_ack: u32 = 0,
+        /// When the client last confirmed its interest: the registration, or
+        /// the last `acknowledged` call. Drives §4.5's 24-hour rule.
+        last_ack_ms: u64 = 0,
 
         pub fn token(e: *const Entry) []const u8 {
             return e.token_buf[0..e.token_len];
@@ -292,6 +325,7 @@ pub const Registry = struct {
         slot.last_seq = seq;
         slot.last_ms = now_ms;
         slot.source_id = source_id;
+        slot.last_ack_ms = now_ms;
         return slot;
     }
 
@@ -306,6 +340,38 @@ pub const Registry = struct {
             return .accepted;
         }
         return .stale;
+    }
+
+    /// The message type the server's push path MUST use for the next
+    /// notification on `(tok, resource)` — RFC 7641 §7 and §4.5. Returns null
+    /// when there is no such subscription.
+    ///
+    /// `.confirmable` once `max_non_between_acks` notifications have gone out
+    /// non-confirmable since the client last acknowledged one, or once
+    /// `max_con_interval_ms` has passed since it last did; it keeps returning
+    /// `.confirmable` until the caller reports an ACK via `acknowledged`.
+    /// Otherwise `.non_confirmable`, and the call counts that notification
+    /// against the budget — so call it once per notification actually sent.
+    /// A CON notification that times out or draws a Reset still ends the
+    /// subscription through `cancel` (module doc comment).
+    pub fn notificationType(self: *Registry, tok: []const u8, resource: u64, now_ms: u64) ?coap.Type {
+        const e = self.find(tok, resource) orelse return null;
+        if (now_ms -| e.last_ack_ms >= max_con_interval_ms) return .confirmable;
+        if (self.max_non_between_acks) |max| {
+            if (e.non_since_ack >= max) return .confirmable;
+        }
+        e.non_since_ack +|= 1;
+        return .non_confirmable;
+    }
+
+    /// The client acknowledged a confirmable notification on `(tok, resource)`
+    /// — its interest is confirmed, so the §7 budget and the §4.5 clock start
+    /// over. Returns whether such a subscription exists.
+    pub fn acknowledged(self: *Registry, tok: []const u8, resource: u64, now_ms: u64) bool {
+        const e = self.find(tok, resource) orelse return false;
+        e.non_since_ack = 0;
+        e.last_ack_ms = now_ms;
+        return true;
     }
 
     /// Cancel a subscription — a client Observe:1 (deregister) GET, or a
@@ -585,6 +651,46 @@ test "Registry.tryRegister: per-source cap bounds one source's share without evi
     // A different, uncapped source can still register freely.
     try testing.expect(reg.tryRegister(2, "d", 4, 0, t0) != null);
     try testing.expectEqual(@as(usize, 3), reg.count());
+}
+
+test "TEETH: RFC 7641 §7 — non-confirmable notifications are interspersed with confirmable ones" {
+    var store: [2]Registry.Entry = undefined;
+    var reg = Registry.init(&store);
+    try testing.expectEqual(@as(?u32, 5), reg.max_non_between_acks); // on by default
+    _ = reg.register("t", 1, 0, t0);
+
+    for (0..5) |_| try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, t0).?);
+    // Budget spent: confirmable, and it STAYS confirmable until an ACK arrives.
+    try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
+    try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
+
+    try testing.expect(reg.acknowledged("t", 1, t0));
+    try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, t0).?);
+
+    // Zero means every notification is confirmable.
+    reg.max_non_between_acks = 0;
+    try testing.expect(reg.acknowledged("t", 1, t0));
+    try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, t0).?);
+
+    try testing.expect(reg.notificationType("absent", 1, t0) == null);
+    try testing.expect(!reg.acknowledged("absent", 1, t0));
+}
+
+test "TEETH: RFC 7641 §4.5 — a confirmable notification at least every 24 hours, budget off or not" {
+    var store: [1]Registry.Entry = undefined;
+    var reg = Registry.init(&store);
+    reg.max_non_between_acks = null; // an authenticated client: no §7 budget
+    // Not zero: an entry whose registration time was never stamped would read
+    // as more than a day old and fail the first assertion.
+    const start: u64 = 25 * 60 * 60 * 1000;
+    _ = reg.register("t", 1, 0, start);
+
+    for (0..1000) |_| {
+        try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, start + max_con_interval_ms - 1).?);
+    }
+    try testing.expectEqual(coap.Type.confirmable, reg.notificationType("t", 1, start + max_con_interval_ms).?);
+    try testing.expect(reg.acknowledged("t", 1, start + max_con_interval_ms));
+    try testing.expectEqual(coap.Type.non_confirmable, reg.notificationType("t", 1, start + max_con_interval_ms + 1).?);
 }
 
 test "C7 end-to-end: observe register → notifications → freshness → cancel" {

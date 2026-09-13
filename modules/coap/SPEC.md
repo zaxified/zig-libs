@@ -35,8 +35,9 @@ renegotiation mid-transfer** are deliberately deferred (the assembler tolerates 
 block size, and rejects a mid-transfer SZX change with a typed error rather than mis-assembling).
 
 Four items are attacker-triggerable **on an unauthenticated, connectionless UDP transport**. The
-first two are **bounded (admission hook + DTLS seam)**; the last two are **NOT bounded here**, and
-saying so is the point — the 2026-09-03 drift audit found this section enumerating two items and
+first two are **bounded (admission hook + DTLS seam)**, the third is **NOT bounded here**, and the
+fourth is bounded by a per-subscription budget the push path consults (since 2026-09-13; before
+that it was recorded as unbounded). Saying so is the point — the 2026-09-03 drift audit found this section enumerating two items and
 calling them addressed, which reads as though the UDP surface had been enumerated. It had not:
 
 1. **Message-ID dedup window** (§4.5, `reliability.Dedup`) — caller-storage-bounded; an attacker who
@@ -67,18 +68,23 @@ calling them addressed, which reads as though the UDP surface had been enumerate
    round trip before a large response, or compares response size to request size. A deployment on
    an untrusted network gets that from the DTLS seam (a handshake the spoofer cannot complete), not
    from this layer.
-4. **Observe notification volume** (RFC 7641 §7) — **not bounded by this module.** §7 is a MUST:
-   "Without client authentication, a server therefore MUST strictly limit the number of
-   notifications that it sends between receiving acknowledgements that confirm the actual interest
-   of the client in the data; i.e., any notifications sent in non-confirmable messages MUST be
-   interspersed with confirmable messages." `Registry`'s two admission controls — `admit_fn` and
-   `max_per_source` — both bound the same quantity, **how many rows of the table one source
-   occupies**. Neither bounds what a registration costs, which is the stream of notifications that
-   follows it, unbounded in time. `Registry.Entry` carries no unacknowledged-notification counter
-   and no last-acknowledged timestamp, so a caller cannot implement the MUST on top of this API
-   either; it would have to keep that state itself. ⛔ **Recorded and not fixed** in the 2026-09-03
-   audit: the fix is a per-entry unacked budget plus a CON-interspersal point in the push path, and
-   it changes `Entry` and the caller's loop together. Note also §7's closing sentence — "an attacker
+4. **Observe notification volume** (RFC 7641 §7) — **bounded per subscription, on by default.**
+   §7 is a MUST: "Without client authentication, a server therefore MUST strictly limit the number
+   of notifications that it sends between receiving acknowledgements that confirm the actual
+   interest of the client in the data; i.e., any notifications sent in non-confirmable messages
+   MUST be interspersed with confirmable messages." `Registry`'s two admission controls —
+   `admit_fn` and `max_per_source` — bound **how many rows of the table one source occupies**, not
+   what a registration costs, which is the stream of notifications that follows it. That stream is
+   now bounded by `Registry.Entry.non_since_ack` + `last_ack_ms` and the push-path decision point
+   `Registry.notificationType`: after `max_non_between_acks` non-confirmable notifications
+   (default 5, libcoap's `COAP_OBS_MAX_NON` — §7 names no number) it returns `.confirmable` and
+   keeps doing so until the caller reports an ACK through `Registry.acknowledged`; it also returns
+   `.confirmable` once 24 hours have passed since the last one (§4.5, independent of the budget).
+   `max_non_between_acks = null` switches the budget off, which §7 permits only for an
+   authenticated client. The module still never sends anything: a caller that ignores
+   `notificationType` is not bounded, which is why the push-path contract is in `observe.zig`'s
+   module doc comment. Recorded as unbounded by the 2026-09-03 audit, fixed 2026-09-13 (A1).
+   Note also §7's closing sentence — "an attacker
    may still spoof the acknowledgements if the confirmable messages are sufficiently predictable" —
    which is why `client.Client.init` now documents its token seed as a CSPRNG requirement.
 

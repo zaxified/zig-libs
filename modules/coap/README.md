@@ -139,6 +139,13 @@ server pushes a notification on each change (C7):
   no fresh request. A CON notification that exhausts `reliability.Retransmit`
   (`.timed_out`) or is answered with a Reset cancels the subscription (caller
   loop glue; `reliability.zig` is untouched).
+- **Notification budget (`Registry.notificationType`, `acknowledged`)** — RFC
+  7641 §7: without client authentication, non-confirmable notifications MUST
+  be interspersed with confirmable ones. Ask `notificationType` before each
+  notification: after `max_non_between_acks` NONs (default 5) it answers
+  `.confirmable` until you report the client's ACK with `acknowledged`, and it
+  also forces a CON every 24 hours (§4.5). `max_non_between_acks = null` turns
+  the budget off — only for an authenticated (DTLS) client.
 - **Admission (`Registry.tryRegister`, `AdmitFn`)** — on plain UDP, anyone can
   send an Observe registration, and unconditional FIFO eviction lets an
   attacker evict legitimate subscribers by registering enough new ones. Use
