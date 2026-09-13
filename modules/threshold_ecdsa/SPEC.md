@@ -349,9 +349,14 @@ here:
   validator rejects any tuple whose proof fails via `verifyWellFormed`,
   closing exactly the residuosity gap the Jacobi floor cannot. The
   structural validation (`AuxParams.validate`) remains the always-enforced
-  cheap floor beneath it, not a replacement; a malicious-secure per-party-aux
-  deployment now runs `verifyWellFormed` on every received tuple IN ADDITION
-  to `validate`.
+  cheap floor beneath it, not a replacement. **`verifyWellFormed(aux, proof,
+  random)` runs `validate` itself before the proofs (audit F10, 2026-09-14)**:
+  it used to leave `validate` — and with it the `Ñ > q⁷` floor — to the caller
+  by doc comment, although Πprm/Πmod hold over any small modulus (tested: an
+  honest 128-bit tuple with its honest proof passes both proofs and is refused
+  as `error.InvalidAuxParams`; a real 2048-bit safe-prime tuple is accepted).
+  A malicious-secure per-party-aux deployment runs `verifyWellFormed` on every
+  received tuple; nothing else is needed.
 - **(F2) The "closed the unbounded-`β'` freedom" claim is size-conditional**
   and only holds at `N > q⁷` — now enforced (see the Bob's-proof bounds
   section above).

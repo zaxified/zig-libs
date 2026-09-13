@@ -172,7 +172,8 @@ round-message types, and the `identifyAbortCulprit` stub).
   **Closes audit F1's residual gap** (`AuxParams.validate`'s Jacobi check is
   necessary but not sufficient for quadratic residuosity): a crafted 3-prime
   `n_tilde` or an `h2 ∉ ⟨h1⟩` pair that both PASS `validate` are now REJECTED
-  by `verifyWellFormed` — see `SPEC.md`'s "Πprm / Πmod" section. (Independent
+  by `verifyWellFormed(aux, proof, random)`, which also runs `validate`
+  (including the `Ñ > q⁷` floor) itself — see `SPEC.md`'s "Πprm / Πmod" section. (Independent
   cryptographic review of the Fiat-Shamir instantiation before production
   MPC-custody use is still warranted, per the standing review debt below.)
 - Independent cryptographic review of `zkproofs.zig`'s Phase-2c

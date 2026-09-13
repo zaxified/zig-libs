@@ -1225,7 +1225,12 @@ pub const WellFormedProof = struct {
     mod: ModProof,
 };
 
-pub const VerifyError = error{InvalidWellFormedProof};
+pub const VerifyError = error{
+    InvalidWellFormedProof,
+    /// `AuxParams.validate` refused the tuple (structural floor, including
+    /// `Ñ > q⁷`) — checked by `verifyWellFormed` itself (audit F10).
+    InvalidAuxParams,
+};
 
 /// Generator-side: produce BOTH proofs-of-correct-generation for `aux`,
 /// using the retained trapdoor (`root.generateAuxParamsWithTrapdoor`).
@@ -1241,13 +1246,25 @@ pub fn proveWellFormed(
     };
 }
 
-/// Validator-side: verify BOTH proofs-of-correct-generation for a
-/// RECEIVED `aux` tuple. Call this IN ADDITION TO (after)
-/// `aux.validate(random)` — `validate` is the cheap always-enforced
-/// structural floor (audit F1's necessary-but-not-sufficient Jacobi
-/// check); this is the full fix. Fail-closed: either proof's rejection
-/// rejects the WHOLE tuple.
-pub fn verifyWellFormed(aux: root.AuxParams, proof: WellFormedProof) VerifyError!void {
+/// Validator-side: decide whether a RECEIVED `aux` tuple can be trusted —
+/// `aux.validate(random)` (the structural floor, including `Ñ > q⁷`) and
+/// then BOTH proofs-of-correct-generation. Fail-closed: any refusal rejects
+/// the WHOLE tuple. `random` feeds `validate`'s Miller-Rabin and MUST be a
+/// real CSPRNG.
+///
+/// Audit F10: this used to verify only the two proofs and leave `validate`
+/// to the caller by doc comment ("call this IN ADDITION TO `validate`") —
+/// yet it is the one function whose job is to make a received tuple
+/// trustworthy, and Πprm/Πmod hold over a toy modulus far below the floor
+/// (tested: an honest 128-bit tuple with its honest proof).
+pub fn verifyWellFormed(aux: root.AuxParams, proof: WellFormedProof, random: std.Random) VerifyError!void {
+    aux.validate(random) catch return error.InvalidAuxParams;
+    try verifyProofs(aux, proof);
+}
+
+/// The two proofs alone, without `validate` — for the proof tests, which
+/// run over tuples too small to pass the floor.
+fn verifyProofs(aux: root.AuxParams, proof: WellFormedProof) error{InvalidWellFormedProof}!void {
     if (!Piprm.verify(aux, proof.prm)) return error.InvalidWellFormedProof;
     if (!Pimod.verify(aux, proof.mod)) return error.InvalidWellFormedProof;
 }
@@ -1509,7 +1526,7 @@ test "Πprm+Πmod completeness: honest generateAuxParamsWithTrapdoor -> proveWel
     defer gen.trapdoor.deinit(allocator);
 
     const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
-    try verifyWellFormed(gen.params, proof);
+    try verifyProofs(gen.params, proof);
 }
 
 // ── tamper (GATED — needs a valid proof to tamper) ──────────────────────
@@ -1526,7 +1543,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
     defer gen.trapdoor.deinit(allocator);
 
     const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
-    try verifyWellFormed(gen.params, proof); // sanity: the honest proof accepts
+    try verifyProofs(gen.params, proof); // sanity: the honest proof accepts
 
     const nt = gen.params.n_tilde;
 
@@ -1537,7 +1554,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         tampered.mod.w.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
         tampered.mod.w = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
-        try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered));
+        try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πmod's entries[0].x.
     {
@@ -1546,7 +1563,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         tampered.mod.entries[0].x.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
         tampered.mod.entries[0].x = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
-        try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered));
+        try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πmod's entries[0].z.
     {
@@ -1555,7 +1572,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         tampered.mod.entries[0].z.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
         tampered.mod.entries[0].z = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
-        try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered));
+        try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πprm's entries[0].a_commit.
     {
@@ -1564,7 +1581,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         tampered.prm.entries[0].a_commit.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
         tampered.prm.entries[0].a_commit = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
-        try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered));
+        try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
     // Flip Πprm's entries[0].z.
     {
@@ -1573,7 +1590,7 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
         tampered.prm.entries[0].z.toBytes(&buf, .big) catch unreachable;
         buf[buf.len - 1] ^= 0x01;
         tampered.prm.entries[0].z = root.AuxFe.fromBytes(nt, stripLeadingZeros(&buf), .big) catch unreachable;
-        try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered));
+        try testing.expectError(error.InvalidWellFormedProof, verifyProofs(gen.params, tampered));
     }
 }
 
@@ -1584,6 +1601,90 @@ test "tamper: flipping a byte of w/x_i/z_i(mod)/A_i/z_i(prm) causes verifyWellFo
 //    (fixed-size `entries` arrays), so the fixture is just the same toy
 //    8-bit `n_tilde` `root.zig`'s own `toyAuxParams`/this file's decoder
 //    fixture in `zkproofs.zig` both use — no Paillier key needed here. ──
+
+// ── audit F10: verifyWellFormed enforces validate itself ────────────────
+
+/// Two 1024-bit SAFE primes for a real ring-Pedersen tuple above the `q⁷`
+/// floor, generated once with `openssl prime -generate -safe -bits 1024`
+/// and checked independently (`p` and `(p-1)/2` prime, `p ≡ 3 mod 4`,
+/// distinct, product 2048 bits). Searching for safe primes this size in a
+/// test takes minutes; the tuple built from them below is what the test
+/// needs, not the search.
+const floor_p_hex = "e8b9d6a3adc7c356c8dc34ffac5c310c26f00d339da9d4d29a3242df890a8b3cb99621e9a5d9b7b2a2dda75cc47080dfa428ff071f2903bdf7e1cf9b63a6703a1faba133533045cd2d586c96f58ce9dddcc758f0eed9a26dd4f39d63ea6e95d1d602ac84de4a4b6cf3282aaf63499c03e8516bdd687f9edef9bfb59e406f7f27";
+const floor_q_hex = "d8b302a58e7c2892e3da8d73f56ebae0e4500b2ba96ec204744bf9a36457c881cd250e64f64324d8449678f54d11525a7ddaa66e3d883bcee543e5fba24ca57e227b630d1ef07860a60234f364b0b63877b3082d45c03fb69c86d38ee4f5754069e3d4c88d268ccb2f8185f2627ab4020fda8ab65951980adcc4843dc244a52f";
+
+/// `(Ñ = p̃·q̃, h1 = r², h2 = h1^λ)` with its trapdoor, the shape
+/// `root.generateAuxParamsWithTrapdoor` produces, from the fixed primes.
+/// `λ` is a random 256-bit value: any `λ ∈ [1, p'·q')` is honest, and
+/// `p'·q' ≈ 2^2046`.
+fn floorAuxWithTrapdoor(allocator: std.mem.Allocator, random: std.Random) !root.AuxParamsWithTrapdoor {
+    const p = try allocator.alloc(u8, floor_p_hex.len / 2);
+    errdefer allocator.free(p);
+    _ = try std.fmt.hexToBytes(p, floor_p_hex);
+    const q = try allocator.alloc(u8, floor_q_hex.len / 2);
+    errdefer allocator.free(q);
+    _ = try std.fmt.hexToBytes(q, floor_q_hex);
+
+    var bp = try bigFromBytes(allocator, p);
+    defer bp.deinit();
+    var bq = try bigFromBytes(allocator, q);
+    defer bq.deinit();
+    var bn = try newBig(allocator);
+    defer bn.deinit();
+    try bn.mul(&bp, &bq);
+    var n_buf: [root.aux_modulus_bytes]u8 = undefined;
+    bn.toConst().writeTwosComplement(&n_buf, .big);
+    const n_tilde = try root.AuxModulus.fromBytes(stripLeadingZeros(&n_buf), .big);
+
+    const h1 = n_tilde.sq(sampleNonzeroLtModulus(n_tilde, random));
+    var lam: [32]u8 = undefined;
+    random.bytes(&lam);
+    lam[0] |= 0x80;
+    const lambda = try root.AuxFe.fromBytes(n_tilde, &lam, .big);
+    const h2 = try n_tilde.pow(h1, lambda);
+    return .{
+        .params = .{ .n_tilde = n_tilde, .h1 = h1, .h2 = h2 },
+        .trapdoor = .{ .p = p, .q = q, .lambda = lambda },
+    };
+}
+
+test "F10: an honest proof over a tuple below the q⁷ floor passes the proofs but verifyWellFormed refuses the tuple" {
+    if (!gate.aux_proofs_core_implemented) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xF10_0001);
+    const random = prng.random();
+
+    const gen = try root.generateAuxParamsWithTrapdoor(allocator, random, 128);
+    defer gen.trapdoor.deinit(allocator);
+    const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
+
+    try verifyProofs(gen.params, proof); // Πprm and Πmod both hold …
+    try testing.expectError(error.InvalidAuxParams, gen.params.validate(random)); // … over a tuple validate refuses
+    try testing.expectError(error.InvalidAuxParams, verifyWellFormed(gen.params, proof, random));
+}
+
+test "F10: verifyWellFormed accepts an honest tuple above the q⁷ floor, and still refuses a tampered proof for it" {
+    // 2048-bit Πprm/Πmod: skipped only in Debug, like zkproofs.zig's 2048-bit
+    // fixtures (this module is `heavy`, so the default lane is ReleaseSafe).
+    if (@import("builtin").mode == .Debug) return error.SkipZigTest;
+    if (!gate.aux_proofs_core_implemented) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xF10_0002);
+    const random = prng.random();
+
+    const gen = try floorAuxWithTrapdoor(allocator, random);
+    defer gen.trapdoor.deinit(allocator);
+    try gen.params.validate(random); // the fixture itself clears the floor
+    const proof = try proveWellFormed(allocator, gen.params, gen.trapdoor, random);
+    try verifyWellFormed(gen.params, proof, random);
+
+    var tampered = proof;
+    var buf: [root.aux_modulus_bytes]u8 = undefined;
+    tampered.prm.entries[0].z.toBytes(&buf, .big) catch unreachable;
+    buf[buf.len - 1] ^= 0x01;
+    tampered.prm.entries[0].z = root.AuxFe.fromBytes(gen.params.n_tilde, stripLeadingZeros(&buf), .big) catch unreachable;
+    try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered, random));
+}
 
 fn toyNTilde() root.AuxModulus {
     return root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;

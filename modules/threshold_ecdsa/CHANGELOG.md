@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BREAKING (signature):** audit F10, round-2 decision Q7. `aux_proofs.verifyWellFormed`
+  verified Πprm and Πmod only and left `AuxParams.validate` — the structural floor, including
+  `Ñ > q⁷` — to the caller by doc comment, although it is the function that makes a received tuple
+  trustworthy and both proofs hold over a toy modulus. It is now `verifyWellFormed(aux, proof,
+  random)`: `validate(random)` first, then both proofs; `VerifyError` gains `InvalidAuxParams`.
+  No caller outside this module's tests. New tests: an honest 128-bit tuple with its honest proof is
+  refused (`InvalidAuxParams`) although both proofs hold; a real 2048-bit safe-prime tuple (fixed
+  primes, generated once with OpenSSL and checked) is accepted, and a tampered proof for it refused.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** adds fuzz harnesses for
   the last 5 of the 12 originally-unfuzzed public `fromBytes*` entry points
   (audit F8, closed): `RangeProof`/`MtaProof`/`MtaProofWc`.`fromBytesAlloc`
