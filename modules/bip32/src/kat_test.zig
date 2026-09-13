@@ -25,18 +25,18 @@ fn runBip32Vector(v: bip32_vectors.TestVector) !void {
     defer master.deinit();
 
     var buf: [bip32.max_serialized_len]u8 = undefined;
-    try testing.expectEqualStrings(v.master_xprv, try bip32.serializePriv(master, &buf));
+    try testing.expectEqualStrings(v.master_xprv, try bip32.serializePriv(master, .mainnet, &buf));
     const master_pub = try bip32.neuter(master);
-    try testing.expectEqualStrings(v.master_xpub, try bip32.serializePub(master_pub, &buf));
+    try testing.expectEqualStrings(v.master_xpub, try bip32.serializePub(master_pub, .mainnet, &buf));
 
     var cur = master;
     for (v.chain) |step| {
         var child = try bip32.ckdPriv(cur, step.index);
         defer child.deinit();
 
-        try testing.expectEqualStrings(step.xprv, try bip32.serializePriv(child, &buf));
+        try testing.expectEqualStrings(step.xprv, try bip32.serializePriv(child, .mainnet, &buf));
         const child_pub = try bip32.neuter(child);
-        try testing.expectEqualStrings(step.xpub, try bip32.serializePub(child_pub, &buf));
+        try testing.expectEqualStrings(step.xpub, try bip32.serializePub(child_pub, .mainnet, &buf));
 
         // Public-only derivation must agree wherever the step is NOT
         // hardened (CKDpub is only defined for normal children).
@@ -69,11 +69,46 @@ test "BIP-32 official Test Vector 4 — leading-zero retention at a different de
 
 test "BIP-32 official Test Vector 5 — every invalid extended key is rejected" {
     for (bip32_vectors.invalid_vector_5) |s| {
-        if (bip32.parseExtended(s)) |_| {
+        if (bip32.parseExtended(s, .mainnet)) |_| {
             std.debug.print("expected rejection, got success for: {s}\n", .{s});
             try testing.expect(false);
         } else |_| {}
     }
+}
+
+test "BIP-32 Test Vector 1 master on TESTNET — tprv/tpub byte-exact, and each network refuses the other's key" {
+    // BIP-32 publishes vectors for mainnet only. These two strings were made
+    // OUTSIDE this module (2026-09-13): Test Vector 1's official master
+    // xprv/xpub, Base58Check-decoded by an independent Python implementation
+    // (checksum verified, mainnet strings re-encoded identically), version
+    // bytes replaced with BIP-32's testnet 0x04358394 / 0x043587CF, re-encoded.
+    const tprv = "tprv8ZgxMBicQKsPeDgjzdC36fs6bMjGApWDNLR9erAXMs5skhMv36j9MV5ecvfavji5khqjWaWSFhN3YcCUUdiKH6isR4Pwy3U5y5egddBr16m";
+    const tpub = "tpubD6NzVbkrYhZ4XgiXtGrdW5XDAPFCL9h7we1vwNCpn8tGbBcgfVYjXyhWo4E1xkh56hjod1RhGjxbaTLV3X4FyWuejifB9jusQ46QzG87VKp";
+
+    const v = bip32_vectors.test_vector_1;
+    var seed_buf: [64]u8 = undefined;
+    const n = v.seed_hex.len / 2;
+    _ = try std.fmt.hexToBytes(seed_buf[0..n], v.seed_hex);
+    var master = try bip32.masterFromSeed(seed_buf[0..n]);
+    defer master.deinit();
+    const master_pub = try bip32.neuter(master);
+
+    var buf: [bip32.max_serialized_len]u8 = undefined;
+    try testing.expectEqualStrings(tprv, try bip32.serializePriv(master, .testnet, &buf));
+    try testing.expectEqualStrings(tpub, try bip32.serializePub(master_pub, .testnet, &buf));
+
+    const p = try bip32.parseExtended(tprv, .testnet);
+    try testing.expect(p == .private);
+    try testing.expectEqualSlices(u8, &master.privkey, &p.private.privkey);
+    const q = try bip32.parseExtended(tpub, .testnet);
+    try testing.expect(q == .public);
+    try testing.expectEqualSlices(u8, &master_pub.pubkey, &q.public.pubkey);
+
+    // A real key from the other network is refused by name, both ways.
+    try testing.expectError(error.WrongNetwork, bip32.parseExtended(tprv, .mainnet));
+    try testing.expectError(error.WrongNetwork, bip32.parseExtended(tpub, .mainnet));
+    try testing.expectError(error.WrongNetwork, bip32.parseExtended(v.master_xprv, .testnet));
+    try testing.expectError(error.WrongNetwork, bip32.parseExtended(v.master_xpub, .testnet));
 }
 
 test "BIP-39 official Trezor test vectors — entropy/mnemonic/seed/master-xprv all byte-exact" {
@@ -107,7 +142,7 @@ test "BIP-39 official Trezor test vectors — entropy/mnemonic/seed/master-xprv 
         // seed -> BIP-32 master xprv, byte-exact (the BIP-39<->BIP-32 seam).
         var master = try bip32.masterFromSeed(&seed_buf);
         defer master.deinit();
-        try testing.expectEqualStrings(v.master_xprv, try bip32.serializePriv(master, &xprv_buf));
+        try testing.expectEqualStrings(v.master_xprv, try bip32.serializePriv(master, .mainnet, &xprv_buf));
     }
 }
 

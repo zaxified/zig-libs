@@ -155,11 +155,15 @@ secp256k1; see [README.md](README.md) for purpose and API.
   pre-normalize it themselves. Multi-language wordlists (BIP-39 defines ten)
   are out of scope entirely — English only.
 - **`parsePath` is not a BIP-44 purpose-field validator** — see above.
-- **No xprv/xpub testnet version bytes** — only the mainnet constants
-  (`0x0488ADE4`/`0x0488B21E`) are wired up; `parseExtended` rejects anything
-  else (including testnet's `tprv`/`tpub`) as `error.UnknownVersion`. Adding
-  a network parameter is a natural, low-risk follow-up if a testnet consumer
-  appears.
+- **Network is explicit** (A1 L7, 2026-09-13): `serializePriv`/`serializePub`
+  /`parseExtended` take a `Network` (`.mainnet` = `0x0488ADE4`/`0x0488B21E`,
+  `.testnet` = `0x04358394`/`0x043587CF`, BIP-32 § "Serialization format").
+  Before, serialization always wrote mainnet bytes, whatever the key was for.
+  `parseExtended` accepts only the requested network; the other network's
+  version bytes are `error.WrongNetwork`, anything else `error.UnknownVersion`.
+  BIP-32 has no testnet vectors, so the testnet KAT is Test Vector 1's master
+  re-encoded with testnet version bytes by an independent Python Base58Check
+  implementation (see `kat_test.zig`).
 
 ## Verification
 

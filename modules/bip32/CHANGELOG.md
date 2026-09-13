@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BREAKING:** A1 finding L7. `serializePriv(k, network, out)`,
+  `serializePub(k, network, out)` and `parseExtended(s, network)` take a new `Network`
+  (`.mainnet` / `.testnet`); serialization always wrote mainnet version bytes before.
+  `parseExtended` refuses the other network's key with the new `error.WrongNetwork` (a
+  `tpub` given to a mainnet parse used to be `error.UnknownVersion`). New constants
+  `version_testnet_priv`/`version_testnet_pub`. Testnet KAT: Test Vector 1's master
+  re-encoded with testnet version bytes by an independent Python implementation.
+
 - **2026-09-10** — A1 fix campaign: closed 19 of the 21 findings from the 2026-09-06
   audit (`H1`-`H5`, `M1`-`M5`, `M7`-`M9`, `L1`-`L6`), each with a RED-before/GREEN-after
   `scripts/modtest bip32` run. Highlights:

@@ -91,7 +91,7 @@ pub fn main() !void {
     defer receive_key.deinit();
 
     var xprv_buf: [bip32.max_serialized_len]u8 = undefined;
-    const xprv = try bip32.serializePriv(receive_key, &xprv_buf);
+    const xprv = try bip32.serializePriv(receive_key, .mainnet, &xprv_buf);
     // ACTUALLY RUN: the from-spec Python re-implementation (see file doc
     // comment), sanity-checked against BIP-32 Test Vector 1 first.
     const expected_xprv = "xprvA44AZhTuxqQYC15kQX4LrXdNFZaMZMaHXdgMS76DnTR4dASrhsrr7RscrS6UatP3v7oXTu8RvjPwQYzZPyNyoUD9uahvacPajSmyMyx7a59";
@@ -100,7 +100,7 @@ pub fn main() !void {
 
     const receive_pub = try bip32.neuter(receive_key);
     var xpub_buf: [bip32.max_serialized_len]u8 = undefined;
-    const xpub = try bip32.serializePub(receive_pub, &xpub_buf);
+    const xpub = try bip32.serializePub(receive_pub, .mainnet, &xpub_buf);
     const expected_xpub = "xpub6H3WyCzooCxqQVADWYbMDfa6obQqxpJ8trbxEVVqLnx3Vxn1FRB6fEC6hjtXLJ6Djp7fkwxT1Qd1GgXLahjtcN8eSV4e94u8Jt3PCwEfGe8";
     must(std.mem.eql(u8, xpub, expected_xpub), @src());
     std.debug.print("receive xpub: {s}\n", .{xpub});
@@ -108,12 +108,12 @@ pub fn main() !void {
     // Round-trip both through the untrusted-text parser a wallet uses when
     // IMPORTING a key a user pasted in.
     {
-        const parsed = try bip32.parseExtended(xprv);
+        const parsed = try bip32.parseExtended(xprv, .mainnet);
         must(parsed == .private, @src());
         must(std.mem.eql(u8, &parsed.private.privkey, &receive_key.privkey), @src());
     }
     {
-        const parsed = try bip32.parseExtended(xpub);
+        const parsed = try bip32.parseExtended(xpub, .mainnet);
         must(parsed == .public, @src());
         must(std.mem.eql(u8, &parsed.public.pubkey, &receive_pub.pubkey), @src());
     }
@@ -246,7 +246,7 @@ pub fn main() !void {
             if (c != last) break c;
         } else unreachable;
 
-        if (bip32.parseExtended(typo[0..xprv.len])) |_| {
+        if (bip32.parseExtended(typo[0..xprv.len], .mainnet)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
             error.ChecksumMismatch => std.debug.print("xprv checksum typo: ChecksumMismatch (expected)\n", .{}),
@@ -254,10 +254,10 @@ pub fn main() !void {
         }
     }
 
-    // (7) A real extended key from the WRONG network: this module only
-    // knows the mainnet version bytes, so a testnet `tpub` (version
-    // 0x043587CF, the well-known BIP-32 testnet-public constant) must be
-    // rejected by version, not silently accepted as if it were mainnet.
+    // (7) A real extended key from the WRONG network: this wallet asks for
+    // mainnet, so a testnet `tpub` (version 0x043587CF, BIP-32's
+    // testnet-public constant) must be refused by version, not silently
+    // accepted as if it were mainnet.
     {
         var payload: [bip32.serialized_payload_len]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], 0x043587CF, .big); // testnet tpub
@@ -270,10 +270,10 @@ pub fn main() !void {
         var addr_buf: [bip32.max_serialized_len]u8 = undefined;
         const fake_tpub = try bech32.base58.checkEncode(&payload, &addr_buf);
 
-        if (bip32.parseExtended(fake_tpub)) |_| {
+        if (bip32.parseExtended(fake_tpub, .mainnet)) |_| {
             return error.UnexpectedAccept;
         } else |err| switch (err) {
-            error.UnknownVersion => std.debug.print("testnet tpub pasted into mainnet parser: UnknownVersion (expected)\n", .{}),
+            error.WrongNetwork => std.debug.print("testnet tpub pasted into mainnet parser: WrongNetwork (expected)\n", .{}),
             else => return err,
         }
     }

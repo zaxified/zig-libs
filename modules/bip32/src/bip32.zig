@@ -5,7 +5,7 @@
 //! `masterFromSeed` (HMAC-SHA512(key="Bitcoin seed", data=seed) → master
 //! privkey + chain code), `ckdPriv`/`ckdPub` (hardened + normal child
 //! derivation), `serializePriv`/`serializePub`/`parseExtended` (the
-//! xprv/xpub Base58Check wire format, mainnet version bytes), and
+//! xprv/xpub or tprv/tpub Base58Check wire format), and
 //! `parsePath`/`derivePath` (`m/44'/0'/0'/0/0`-style path strings).
 //!
 //! Handles SECRET key material, under CONVENTIONS §2.1. Every stack buffer
@@ -36,6 +36,41 @@ const Secp256k1 = k256.Secp256k1;
 pub const version_mainnet_priv: u32 = 0x0488ADE4;
 /// Mainnet extended-public-key version bytes (`xpub...`).
 pub const version_mainnet_pub: u32 = 0x0488B21E;
+/// Testnet extended-private-key version bytes (`tprv...`).
+pub const version_testnet_priv: u32 = 0x04358394;
+/// Testnet extended-public-key version bytes (`tpub...`).
+pub const version_testnet_pub: u32 = 0x043587CF;
+
+/// Which network's version bytes an extended key carries — BIP-32 §
+/// "Serialization format" defines exactly these two pairs. Serialization
+/// writes the chosen network's bytes; `parseExtended` accepts only the chosen
+/// network and names the other one as `error.WrongNetwork`, so a `tpub`
+/// pasted into a mainnet wallet is refused rather than read as mainnet.
+pub const Network = enum {
+    mainnet,
+    testnet,
+
+    pub fn privVersion(n: Network) u32 {
+        return switch (n) {
+            .mainnet => version_mainnet_priv,
+            .testnet => version_testnet_priv,
+        };
+    }
+
+    pub fn pubVersion(n: Network) u32 {
+        return switch (n) {
+            .mainnet => version_mainnet_pub,
+            .testnet => version_testnet_pub,
+        };
+    }
+
+    fn other(n: Network) Network {
+        return switch (n) {
+            .mainnet => .testnet,
+            .testnet => .mainnet,
+        };
+    }
+};
 
 /// Child indices `>= hardened_offset` (2^31) are hardened derivation.
 pub const hardened_offset: u32 = 0x8000_0000;
@@ -309,20 +344,22 @@ fn writeHeader(payload: *[serialized_payload_len]u8, version: u32, depth: u8, pa
     @memcpy(payload[13..45], &chain_code);
 }
 
-/// Serialize an extended private key as `xprv...` (Base58Check).
-pub fn serializePriv(k: ExtendedPrivKey, out: []u8) bech32.base58.Error![]const u8 {
+/// Serialize an extended private key as `xprv...` (mainnet) or `tprv...`
+/// (testnet), Base58Check.
+pub fn serializePriv(k: ExtendedPrivKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
     var payload: [serialized_payload_len]u8 = undefined;
     defer std.crypto.secureZero(u8, &payload); // carries the secret privkey
-    writeHeader(&payload, version_mainnet_priv, k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
+    writeHeader(&payload, network.privVersion(), k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
     payload[45] = 0x00;
     @memcpy(payload[46..78], &k.privkey);
     return bech32.base58.checkEncode(&payload, out);
 }
 
-/// Serialize an extended public key as `xpub...` (Base58Check).
-pub fn serializePub(k: ExtendedPubKey, out: []u8) bech32.base58.Error![]const u8 {
+/// Serialize an extended public key as `xpub...` (mainnet) or `tpub...`
+/// (testnet), Base58Check.
+pub fn serializePub(k: ExtendedPubKey, network: Network, out: []u8) bech32.base58.Error![]const u8 {
     var payload: [serialized_payload_len]u8 = undefined;
-    writeHeader(&payload, version_mainnet_pub, k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
+    writeHeader(&payload, network.pubVersion(), k.depth, k.parent_fingerprint, k.child_number, k.chain_code);
     @memcpy(payload[45..78], &k.pubkey);
     return bech32.base58.checkEncode(&payload, out);
 }
@@ -330,8 +367,12 @@ pub fn serializePub(k: ExtendedPubKey, out: []u8) bech32.base58.Error![]const u8
 pub const ParseError = bech32.base58.CheckError || error{
     /// Decoded payload isn't exactly 78 bytes.
     InvalidLength,
-    /// Version bytes aren't the mainnet xprv/xpub constants.
+    /// Version bytes belong to neither network's xprv/xpub constants.
     UnknownVersion,
+    /// Version bytes are the OTHER network's (e.g. a `tpub` parsed as
+    /// mainnet) — a real key, refused because the caller asked for a
+    /// different network.
+    WrongNetwork,
     /// xprv version but the key byte isn't the `0x00` private-key marker.
     InvalidPrivateKeyMarker,
     /// The private scalar is 0 or `>= n` (BIP-32's `1..n-1` range).
@@ -353,8 +394,9 @@ pub const ParsedKey = union(enum) {
 /// every BIP-32 test-vector-5 invalid case (version/key-type mismatch, bad
 /// key prefix, off-curve pubkey, out-of-range privkey, zero-depth invariant
 /// violation, bad checksum, unknown version) is a distinct typed error, not
-/// a best-effort partial parse.
-pub fn parseExtended(s: []const u8) ParseError!ParsedKey {
+/// a best-effort partial parse. Only `network`'s version bytes are accepted;
+/// the other network's are `error.WrongNetwork`.
+pub fn parseExtended(s: []const u8, network: Network) ParseError!ParsedKey {
     var buf: [bech32.base58.max_payload_len]u8 = undefined;
     // CONVENTIONS §2.1 Z1: for an xprv, `buf` holds the decoded private
     // scalar. The `defer` is registered *before* the fallible decode and
@@ -379,41 +421,46 @@ pub fn parseExtended(s: []const u8) ParseError!ParsedKey {
         if (child_number != 0) return error.ZeroDepthNonZeroIndex;
     }
 
-    switch (version) {
-        version_mainnet_priv => {
-            if (payload[45] != 0x00) return error.InvalidPrivateKeyMarker;
-            var priv: [32]u8 = undefined;
-            defer std.crypto.secureZero(u8, &priv);
-            @memcpy(&priv, payload[46..78]);
-            const canonical = blk: {
-                Secp256k1.scalar.rejectNonCanonical(priv, .big) catch break :blk false;
-                break :blk true;
-            };
-            if (!canonical or std.mem.allEqual(u8, &priv, 0)) {
-                return error.PrivateKeyOutOfRange;
-            }
-            return .{ .private = .{
-                .depth = depth,
-                .parent_fingerprint = parent_fp,
-                .child_number = child_number,
-                .chain_code = chain_code,
-                .privkey = priv,
-            } };
-        },
-        version_mainnet_pub => {
-            var pk: [33]u8 = undefined;
-            @memcpy(&pk, payload[45..78]);
-            _ = Secp256k1.fromSec1(&pk) catch return error.InvalidPublicKey;
-            return .{ .public = .{
-                .depth = depth,
-                .parent_fingerprint = parent_fp,
-                .child_number = child_number,
-                .chain_code = chain_code,
-                .pubkey = pk,
-            } };
-        },
-        else => return error.UnknownVersion,
+    const other = network.other();
+    const is_private = if (version == network.privVersion())
+        true
+    else if (version == network.pubVersion())
+        false
+    else if (version == other.privVersion() or version == other.pubVersion())
+        return error.WrongNetwork
+    else
+        return error.UnknownVersion;
+
+    if (is_private) {
+        if (payload[45] != 0x00) return error.InvalidPrivateKeyMarker;
+        var priv: [32]u8 = undefined;
+        defer std.crypto.secureZero(u8, &priv);
+        @memcpy(&priv, payload[46..78]);
+        const canonical = blk: {
+            Secp256k1.scalar.rejectNonCanonical(priv, .big) catch break :blk false;
+            break :blk true;
+        };
+        if (!canonical or std.mem.allEqual(u8, &priv, 0)) {
+            return error.PrivateKeyOutOfRange;
+        }
+        return .{ .private = .{
+            .depth = depth,
+            .parent_fingerprint = parent_fp,
+            .child_number = child_number,
+            .chain_code = chain_code,
+            .privkey = priv,
+        } };
     }
+    var pk: [33]u8 = undefined;
+    @memcpy(&pk, payload[45..78]);
+    _ = Secp256k1.fromSec1(&pk) catch return error.InvalidPublicKey;
+    return .{ .public = .{
+        .depth = depth,
+        .parent_fingerprint = parent_fp,
+        .child_number = child_number,
+        .chain_code = chain_code,
+        .pubkey = pk,
+    } };
 }
 
 // ── derivation-path parsing (`m/44'/0'/0'/0/0`) ─────────────────────────
@@ -499,18 +546,18 @@ test "masterFromSeed + serializePriv/serializePub round-trip via parseExtended" 
     defer master.deinit();
 
     var priv_buf: [max_serialized_len]u8 = undefined;
-    const xprv = try serializePriv(master, &priv_buf);
+    const xprv = try serializePriv(master, .mainnet, &priv_buf);
 
     const pub_key = try neuter(master);
     var pub_buf: [max_serialized_len]u8 = undefined;
-    const xpub = try serializePub(pub_key, &pub_buf);
+    const xpub = try serializePub(pub_key, .mainnet, &pub_buf);
 
-    const parsed_priv = try parseExtended(xprv);
+    const parsed_priv = try parseExtended(xprv, .mainnet);
     try testing.expect(parsed_priv == .private);
     try testing.expectEqualSlices(u8, &master.privkey, &parsed_priv.private.privkey);
     try testing.expectEqualSlices(u8, &master.chain_code, &parsed_priv.private.chain_code);
 
-    const parsed_pub = try parseExtended(xpub);
+    const parsed_pub = try parseExtended(xpub, .mainnet);
     try testing.expect(parsed_pub == .public);
     try testing.expectEqualSlices(u8, &pub_key.pubkey, &parsed_pub.public.pubkey);
 }
@@ -636,11 +683,11 @@ test "parseExtended rejects private keys beyond n: a ladder, not just n and 0 (H
             .privkey = priv,
         };
         var buf: [max_serialized_len]u8 = undefined;
-        const xprv = try serializePriv(forged, &buf);
+        const xprv = try serializePriv(forged, .mainnet, &buf);
         if (c.want_error) {
-            try testing.expectError(error.PrivateKeyOutOfRange, parseExtended(xprv));
+            try testing.expectError(error.PrivateKeyOutOfRange, parseExtended(xprv, .mainnet));
         } else {
-            const parsed = try parseExtended(xprv);
+            const parsed = try parseExtended(xprv, .mainnet);
             try testing.expect(parsed == .private);
         }
     }
@@ -720,7 +767,7 @@ test "parseExtended rejects non-78-byte payloads regardless of checksum validity
         var payload: [plen]u8 = [_]u8{0} ** plen;
         if (plen >= 4) std.mem.writeInt(u32, payload[0..4], version_mainnet_priv, .big);
         const s = try bech32.base58.checkEncode(&payload, &enc_buf);
-        try testing.expectError(error.InvalidLength, parseExtended(s));
+        try testing.expectError(error.InvalidLength, parseExtended(s, .mainnet));
     }
     // Positive control: the real length still parses (any other test already
     // covers this; repeated here so this test alone proves 78 is special).
@@ -728,8 +775,8 @@ test "parseExtended rejects non-78-byte payloads regardless of checksum validity
     var master = try masterFromSeed(&seed);
     defer master.deinit();
     var buf: [max_serialized_len]u8 = undefined;
-    const xprv = try serializePriv(master, &buf);
-    const parsed = try parseExtended(xprv);
+    const xprv = try serializePriv(master, .mainnet, &buf);
+    const parsed = try parseExtended(xprv, .mainnet);
     try testing.expect(parsed == .private);
 }
 
@@ -809,6 +856,7 @@ test "derivePath matches manual chained ckdPriv" {
 test "parseExtended rejects a bad-length / bad-checksum string" {
     try testing.expectError(error.ChecksumMismatch, parseExtended(
         "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHL",
+        .mainnet,
     ));
 }
 
@@ -844,17 +892,17 @@ const XKeyCorpus = struct {
         defer master.deinit();
 
         var priv_buf: [max_serialized_len]u8 = undefined;
-        const xprv = try serializePriv(master, &priv_buf);
+        const xprv = try serializePriv(master, .mainnet, &priv_buf);
         const pub_key = try neuter(master);
         var pub_buf: [max_serialized_len]u8 = undefined;
-        const xpub = try serializePub(pub_key, &pub_buf);
+        const xpub = try serializePub(pub_key, .mainnet, &pub_buf);
 
         // A derived child, so the depth/child-number/fingerprint fields are
         // non-zero on at least one seed rather than all-zero everywhere.
         var child = try ckdPriv(master, hardened_offset + 44);
         defer child.deinit();
         var child_buf: [max_serialized_len]u8 = undefined;
-        const child_xprv = try serializePriv(child, &child_buf);
+        const child_xprv = try serializePriv(child, .mainnet, &child_buf);
 
         var mutant: [xkey_fuzz_buf_len]u8 = undefined;
 
@@ -900,7 +948,7 @@ fn fuzzParseExtended(_: void, smith: *std.testing.Smith) !void {
     // 0 keys parsed before, 7 of 8 non-empty (one seed IS the empty string)
     // and 3 parsed after.**
     const len: usize = smith.slice(&buf);
-    _ = parseExtended(buf[0..len]) catch return;
+    _ = parseExtended(buf[0..len], .mainnet) catch return;
 }
 
 test "corpus: every xkey seed reaches parseExtended, and the parsed count is pinned" {
@@ -923,7 +971,7 @@ test "corpus: every xkey seed reaches parseExtended, and the parsed count is pin
         var buf: [xkey_fuzz_buf_len]u8 = undefined;
         const len: usize = smith.slice(&buf);
         if (len != 0) nonempty += 1;
-        if (parseExtended(buf[0..len])) |k| {
+        if (parseExtended(buf[0..len], .mainnet)) |k| {
             switch (k) {
                 .private => |p| {
                     var m = p;

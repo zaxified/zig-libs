@@ -34,6 +34,9 @@ const bip32_impl = @import("bip32.zig");
 
 pub const version_mainnet_priv = bip32_impl.version_mainnet_priv;
 pub const version_mainnet_pub = bip32_impl.version_mainnet_pub;
+pub const version_testnet_priv = bip32_impl.version_testnet_priv;
+pub const version_testnet_pub = bip32_impl.version_testnet_pub;
+pub const Network = bip32_impl.Network;
 pub const hardened_offset = bip32_impl.hardened_offset;
 pub const serialized_payload_len = bip32_impl.serialized_payload_len;
 pub const max_serialized_len = bip32_impl.max_serialized_len;

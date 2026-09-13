@@ -68,16 +68,18 @@ var derived = try bip32.derivePath(master, path);
 defer derived.deinit();
 ```
 
-**Serialization (xprv/xpub, mainnet):**
+**Serialization (xprv/xpub on `.mainnet`, tprv/tpub on `.testnet`):**
 
 ```zig
 var out: [bip32.max_serialized_len]u8 = undefined;
-const xprv = try bip32.serializePriv(master, &out);
+const xprv = try bip32.serializePriv(master, .mainnet, &out);
 
 const pub_key = try bip32.neuter(master);
-const xpub = try bip32.serializePub(pub_key, &out);
+const xpub = try bip32.serializePub(pub_key, .mainnet, &out);
 
-const parsed = try bip32.parseExtended(xprv); // ParsedKey union(enum) { private, public }
+// ParsedKey union(enum) { private, public }; a key from the other network is
+// error.WrongNetwork, never silently read as this one.
+const parsed = try bip32.parseExtended(xprv, .mainnet);
 switch (parsed) {
     .private => |k| { /* ExtendedPrivKey */ },
     .public => |k| { /* ExtendedPubKey */ },
