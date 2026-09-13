@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 finding LOW#1. The middleware no longer stores a session it
+  created for the current request unless the handler called `setData`, the new `Session.keep()`,
+  or `Manager.regenerate`; such a request gets no `Set-Cookie`. Before, every cookieless request
+  stored a session, so anonymous traffic filled the bounded `RamcacheStore` and evicted logged-in
+  users. Pre-auth pages that need the cookie (a `Csrf`-protected login form) must call `keep()`.
+  New `Options.persist_untouched_sessions` (default `false`) restores the old behaviour.
+
 - **2026-09-10** — A1 finding LOW#2 (documentation, no code change): documented and pinned
   with an end-to-end test that the `__Host-` cookie-name prefix (OWASP Session Management
   Cheat Sheet) is already adoptable through the existing `Options.cookie_name`/

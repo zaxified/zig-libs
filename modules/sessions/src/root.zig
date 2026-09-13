@@ -360,6 +360,10 @@ pub const Session = struct {
     /// middleware's post-handler step is auditable and can't accidentally
     /// regress into re-saving under a stale id if it's ever refactored.
     regenerated: bool = false,
+    /// Set by `setData` and `keep()` — the handler wants this session to
+    /// exist. A new session nobody marked is not persisted at the end of the
+    /// request (see `Options.persist_untouched_sessions`).
+    kept: bool = false,
 
     /// The hex-encoded session id (borrows this session's buffer).
     pub fn id(s: *const Session) []const u8 {
@@ -377,6 +381,15 @@ pub const Session = struct {
         if (bytes.len > s.data_buf.len) return error.Overflow;
         @memcpy(s.data_buf[0..bytes.len], bytes);
         s.data_len = bytes.len;
+        s.kept = true;
+    }
+
+    /// Persist this session at the end of the request even though the handler
+    /// wrote no data — e.g. a login-form page that needs the session cookie so
+    /// `Csrf` can issue a token bound to it. Without this (or `setData`), a
+    /// session created for this request is dropped and no cookie is issued.
+    pub fn keep(s: *Session) void {
+        s.kept = true;
     }
 
     /// Mark the session for destruction (logout): the middleware evicts it
@@ -426,6 +439,12 @@ pub const Options = struct {
     /// Explicit escape hatch: when true, omit `Secure` even though `secure`
     /// asks for it — the documented dev-only opt-out.
     allow_insecure_cookie: bool = false,
+    /// When false (default), the middleware does not persist a session it
+    /// created for this request unless the handler called `setData`, `keep`
+    /// or `Manager.regenerate` — so cookieless traffic cannot fill a bounded
+    /// store and evict live sessions. True restores "every request that
+    /// arrives without a session gets one stored and a cookie issued".
+    persist_untouched_sessions: bool = false,
 };
 
 /// The session manager: immutable config + the middleware over a `Store`.
@@ -444,6 +463,7 @@ pub const Manager = struct {
     cookie_domain: ?[]const u8,
     same_site: cookies.SameSite,
     secure: bool,
+    persist_untouched_sessions: bool,
 
     /// Build a manager. `gpa` is used only for the short-lived decode copies
     /// `Store.get` hands back (the store owns its own storage).
@@ -482,6 +502,7 @@ pub const Manager = struct {
             .cookie_domain = options.cookie_domain,
             .same_site = options.same_site,
             .secure = options.secure and !options.allow_insecure_cookie,
+            .persist_untouched_sessions = options.persist_untouched_sessions,
         };
     }
 
@@ -725,8 +746,15 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // deleted from the store — this save can only persist the new record
     // and issue the cookie for the new id, which is required (nothing else
     // does it) and never touches the old, dead id.
+    //
+    // A session created for this request that the handler never marked
+    // (`setData`/`keep`/`regenerate`) is dropped: storing one per cookieless
+    // request lets anonymous traffic fill a bounded store and evict the live
+    // sessions of other users (A1 sessions LOW#1).
     if (s.revoked) {
         m.destroy(ctx.res, s.id());
+    } else if (s.is_new and !s.kept and !s.regenerated and !m.persist_untouched_sessions) {
+        // nothing to persist, no cookie to issue
     } else {
         m.save(ctx.res, &s);
     }
@@ -773,12 +801,13 @@ const Env = struct {
     fn deinit(e: *Env) void {
         e.cache.deinit();
     }
-    fn manager(e: *Env, opts: struct { idle: i64 = 0, absolute: i64 = 0 }) !Manager {
+    fn manager(e: *Env, opts: struct { idle: i64 = 0, absolute: i64 = 0, persist_untouched: bool = false }) !Manager {
         return try Manager.init(testing.allocator, e.store.store(), .{
             .io = testing.io, // real CSPRNG-backed test Io
             .clock = e.clk.clock(),
             .idle_timeout_ns = opts.idle,
             .absolute_timeout_ns = opts.absolute,
+            .persist_untouched_sessions = opts.persist_untouched,
         });
     }
 };
@@ -1151,7 +1180,7 @@ test "__Host- prefixed cookie name: the OWASP hardening measure the config surfa
 
 const App = struct {
     manager: *Manager,
-    action: enum { touch, write_big, revoke, regenerate } = .touch,
+    action: enum { touch, write_big, revoke, regenerate, read_only, keep } = .touch,
 };
 
 fn hSession(ctx: *router.Ctx) anyerror!void {
@@ -1176,6 +1205,11 @@ fn hSession(ctx: *router.Ctx) anyerror!void {
             app.manager.regenerate(s);
             try s.setData("uid=42"); // data set AFTER rotation must survive the final save
             try ctx.res.writeAll(s.id()); // echo the NEW id
+        },
+        .read_only => try ctx.res.writeAll(s.id()),
+        .keep => {
+            s.keep();
+            try ctx.res.writeAll(s.id());
         },
     }
 }
@@ -1256,6 +1290,99 @@ test "middleware: fresh request gets a hardened Set-Cookie; round-trips" {
     defer testing.allocator.free(reqline);
     const second = runWire(&r, reqline, &out2, &rbody2);
     try testing.expectEqualStrings(id, bodyOf(second));
+}
+
+fn getWithCookie(r: *router.Router, id: ?[]const u8, out: []u8, rbody: []u8) []const u8 {
+    var req_buf: [256]u8 = undefined;
+    const req = if (id) |sid|
+        std.fmt.bufPrint(&req_buf, "GET / HTTP/1.1\r\nHost: t\r\nCookie: session={s}\r\nConnection: close\r\n\r\n", .{sid}) catch unreachable
+    else
+        "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+    return runWire(r, req, out, rbody);
+}
+
+// A1 sessions LOW#1: every cookieless request used to create AND store a
+// session, so anonymous traffic filled the bounded default store and evicted
+// the sessions of logged-in users.
+test "middleware: anonymous requests that write nothing are not stored and cannot evict a live session" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{});
+    var app = App{ .manager = &m };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+
+    // A logged-in user: the handler writes, so the session is stored.
+    app.action = .touch;
+    const first = getWithCookie(&r, null, &out, &rbody);
+    var id_buf: [64]u8 = undefined;
+    const id = id_buf[0..cookieId(headerValue(first, "Set-Cookie").?).len];
+    @memcpy(id, cookieId(headerValue(first, "Set-Cookie").?));
+
+    // An anonymous request that writes nothing: no cookie, nothing stored.
+    app.action = .read_only;
+    const anon = getWithCookie(&r, null, &out, &rbody);
+    try testing.expect(headerValue(anon, "Set-Cookie") == null);
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.absent, m.lookup(bodyOf(anon), &l));
+
+    // More cookieless requests than the store holds entries (`newCache`: 256).
+    for (0..300) |_| _ = getWithCookie(&r, null, &out, &rbody);
+
+    // The logged-in session is still there.
+    const again = getWithCookie(&r, id, &out, &rbody);
+    try testing.expectEqualStrings(id, bodyOf(again));
+}
+
+test "middleware: keep() persists a session the handler wrote nothing into" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{});
+    var app = App{ .manager = &m, .action = .keep };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = getWithCookie(&r, null, &out, &rbody);
+    const id = cookieId(headerValue(got, "Set-Cookie").?);
+    try testing.expectEqualStrings(id, bodyOf(got));
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
+}
+
+test "middleware: persist_untouched_sessions restores storing every new session" {
+    var env = Env.init();
+    env.wire();
+    defer env.deinit();
+    var m = try env.manager(.{ .persist_untouched = true });
+    var app = App{ .manager = &m, .action = .read_only };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(m.middleware());
+    try r.get("/", hSession);
+
+    var out: [4096]u8 = undefined;
+    var rbody: [1024]u8 = undefined;
+    const got = getWithCookie(&r, null, &out, &rbody);
+    const id = cookieId(headerValue(got, "Set-Cookie").?);
+    var l: Session = .{};
+    try testing.expectEqual(Manager.LoadResult.loaded, m.lookup(id, &l));
 }
 
 test "middleware: revoke expires the cookie and evicts the session" {

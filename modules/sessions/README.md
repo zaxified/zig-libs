@@ -31,7 +31,12 @@ evicting one past its idle or absolute timeout) or **creates** a fresh one,
 attaches the `*Session` to `ctx.data` (the slot `router` reserves —
 `sessionOf(ctx)` reads it back, the `aaa-gate` identity pattern), runs the
 handler, then **saves**: it re-encodes the session into the store and stamps a
-refreshed `Set-Cookie` (rolling idle expiry). A handler calls `session.revoke()`
+refreshed `Set-Cookie` (rolling idle expiry). A session created for this request
+is saved only if the handler wrote to it (`setData`), called `session.keep()` or
+`manager.regenerate(session)` — otherwise nothing is stored and no cookie is
+issued, so cookieless traffic cannot evict other users' sessions from a bounded
+store (`Options.persist_untouched_sessions = true` turns that off). A login-form
+page protected by `Csrf` calls `keep()`. A handler calls `session.revoke()`
 to log out — the middleware then **destroys** the session (evicts it and expires
 the cookie with `Max-Age=-1`). After a privilege change (login), call
 `Manager.regenerate` — a new id is minted, the data carried over, the old id

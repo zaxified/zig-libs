@@ -17,6 +17,14 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `router` reserves — the `aaa-gate` identity pattern; `sessionOf(ctx)` reads it back), run the
   handler, then save: re-encode into the store and stamp a refreshed `Set-Cookie` (rolling idle
   expiry).
+  **A session created for this request is saved only if the handler marked it** — `setData`,
+  `Session.keep()` or `Manager.regenerate` (A1 finding LOW#1, 2026-09-13). Otherwise nothing is
+  stored and no cookie is issued: storing one session per cookieless request let anonymous traffic
+  fill the bounded default `RamcacheStore` and evict the sessions of logged-in users (forced logout
+  of others). A pre-auth page that needs the cookie — a login form protected by `Csrf`, whose
+  middleware issues a token only once the request carries a session cookie — calls `keep()`.
+  `Options.persist_untouched_sessions = true` restores storing every new session; with it, store
+  capacity under anonymous load is the caller's problem again.
 - **Session-fixation defense — `Manager.regenerate`:** after a privilege change (login), a new id
   is minted, the session data carried over, and the **old id is killed in the store** before the
   new cookie is issued — an attacker who fixed a pre-auth session id cannot ride it into an
@@ -126,14 +134,16 @@ implementation's scheduling model from here), only documented.
 
 ## Verification
 
-22 offline tests (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
+34 offline tests in `scripts/modtest sessions` (Debug + `-Doptimize=ReleaseFast`), `zig fmt --check modules/sessions`. Session
 core (10): create→save→load round-trip, forged id → absent, idle-expiry evict, absolute-cap expiry,
 regenerate (old id dead / data carried), **cross-request race — stale save cannot resurrect a
 concurrently destroyed session**, **cross-request race — stale save cannot resurrect a concurrently
 regenerated (rotated) id (and the new id persists)**, **single-owner save succeeds + bumps the
 generation, a second concurrent stale save no-ops (first-writer-wins)**, `min_id_bytes` floor
-accepted at floor/default/ceiling, insecure escape hatch. Middleware (5): hardened Set-Cookie +
-cookie round-trip, revoke
+accepted at floor/default/ceiling, insecure escape hatch. Middleware (8): hardened Set-Cookie +
+cookie round-trip, **anonymous requests that write nothing store nothing and 300 of them (store
+cap 256) do not evict a logged-in session**, `keep()` persists an unwritten session,
+`persist_untouched_sessions` restores storing every new session, revoke
 expires+evicts, same-request revoke does not get resurrected by the trailing save, same-request
 regenerate persists only the new id (old id stays dead, post-rotation data survives),
 small-buffer early-flush (no cookie-buffer corruption). CSRF (6): token/verify round-trip + tamper,

@@ -94,7 +94,10 @@ pub const Csrf = struct {
 
     /// A `router.Middleware` enforcing the guard. Place it after the sessions
     /// middleware (it reads the session cookie); the Csrf must outlive the
-    /// Router, at a stable address.
+    /// Router, at a stable address. A token is issued only once the request
+    /// carries a session cookie, and the sessions middleware issues one only
+    /// for a session the handler marked — a pre-auth form page calls
+    /// `Session.keep()` so its visitor gets a cookie, then a token.
     pub fn middleware(c: *const Csrf) router.Middleware {
         return .{ .state = @constCast(c), .run = middlewareRun };
     }
