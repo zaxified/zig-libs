@@ -99,7 +99,25 @@ reports *itself* Down is silent.
   object.
 - `start(now)` resets to `down`, returns the first IIH immediately (so the
   handshake does not wait a full interval) and schedules the next one at
-  `now + hello_interval`.
+  `now + hello_interval`. Over a live adjacency it reports the drop as `stop()`
+  does: `transition`, and `adjacency_down = stopped` from `up` (A1 audit F7).
+- **Triggered hello** (A1 audit F12, `Config.triggered_hello`, default on):
+  every `rxHello` that changes state also returns `send_hello` with the new
+  state, as FRR sends a triggered IIH on each state change. At most one per
+  received IIH; the periodic schedule is not moved.
+- **Neighbour fields absent** (A1 audit F5, `Config.accept_without_neighbor_fields`,
+  default off): RFC 5303 §3.2 b) runs the table on the received state alone when
+  the neighbour block is absent or incomplete ("the procedure works properly if
+  neither field is ever included"). Opted in, such a 240 counts as *echoed* in
+  the table above. Off, it caps at `initializing`: without the echo nothing
+  proves the peer heard this circuit. An IIH with no 240 at all is unaffected.
+- **Local Circuit ID change** (A1 audit F14, `Config.detect_circuit_id_change`,
+  default on): at `initializing` or `up`, an IIH from the recorded neighbour
+  whose Local Circuit ID differs from the one it was accepted with deletes the
+  adjacency → `down` (`adjacency_down = circuit_id_changed` from `up`), nothing
+  recorded from the PDU. The link now ends on another interface of the
+  neighbour; without TLV 240 nothing else notices. No reference to follow: FRR
+  marks ISO 10589 §8.2.5.2 c) "comparing circuit IDs" as "FIXME - Missing parts".
 - `tick` also emits a `send_hello` whenever `now ≥ next_hello_due`, rescheduling
   by `hello_interval`. Hold-expiry and a due hello can occur in the same `tick`.
 
@@ -174,6 +192,13 @@ Implemented (cheap, and they gate adjacency formation):
   across more than one #1 TLV; `rxHelloBytes` walks the whole stream and
   consults every instance (up to 8; beyond that, fail closed rather than open —
   A1 audit F8), not just the first `findFirst` would have returned.
+
+- **Holding time too short** — `rx.holding_time < Config.min_neighbor_holding_time`
+  → `rejected = .holding_time_too_short`, before any mutation (A1 audit F13). A
+  hold of 0 took the adjacency Up and expired it at the same instant. Neither
+  RFC 5303 nor FRR has a floor, so this is local policy: the default 1 refuses
+  only 0, a caller may raise it, 0 disables it. A shorter hold than before
+  (31 → 3) stays legal — a neighbour may reconfigure.
 
 Malformed input is a typed **error** (not a soft reject) from `rxHelloBytes`:
 a bad common header / P2P body surfaces `isis`'s `pdu.DecodeError`

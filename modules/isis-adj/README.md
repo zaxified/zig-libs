@@ -70,10 +70,13 @@ whose independent fields tell the caller what to do:
 - `transition` — the `{from, to}` state change, if any.
 - `adjacency_up` — entered Up this call; the upper layer may start using the link.
 - `adjacency_down` — left Up this call, with a `DownReason` (`hold_expired`,
-  `stopped`, `neighbor_restarted`).
+  `stopped` — also `start` over an Up adjacency —, `neighbor_restarted`,
+  `circuit_id_changed`).
 - `send_hello` — emit a P2P IIH built from the enclosed `HelloFields` now (the
   FSM returns *fields*, not bytes, so it never owns a buffer — hand them to
-  `buildHello`, or build the PDU yourself).
+  `buildHello`, or build the PDU yourself). Besides `start` and `tick`'s
+  cadence, `rxHello` returns one whenever it changes state
+  (`Config.triggered_hello`, default on), so the handshake converges on events.
 - `rejected` — a received IIH was ignored, with a `RejectReason` (see below); no
   state change.
 
@@ -89,7 +92,13 @@ while the adjacency is Up** (`.other_neighbor` — at Initializing a candidate i
 simply replaced); a **TLV 240 neighbour block naming someone else** or our
 system on another circuit (`.neighbor_mismatch`, RFC 5303 §3.2 discard); and a
 **neighbour claiming Up while we are Down** (`.neighbor_up_while_down`, the RFC
-5303 table's "Neighbor restarted" cell). Malformed bytes, a malformed TLV 240,
+5303 table's "Neighbor restarted" cell); and a **`holding_time` below
+`Config.min_neighbor_holding_time`** (`.holding_time_too_short`, default refuses
+only 0). An accepted IIH from the recorded neighbour with a **different Local
+Circuit ID** deletes the adjacency (`Config.detect_circuit_id_change`, default
+on). A peer whose TLV 240 never carries neighbour fields stays Initializing
+unless `Config.accept_without_neighbor_fields` opts into RFC 5303 §3.2 b).
+Malformed bytes, a malformed TLV 240,
 or any malformed TLV anywhere in the stream are typed *errors* from
 `rxHelloBytes` that leave the FSM state untouched. Details and the reasoning
 behind each rule: `SPEC.md` §5.

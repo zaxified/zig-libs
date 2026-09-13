@@ -62,11 +62,16 @@ pub const State = enum {
 pub const DownReason = enum {
     /// The neighbour's hold timer expired (no IIH within holding-time).
     hold_expired,
-    /// The local circuit was administratively stopped (`stop`).
+    /// The local circuit was administratively stopped (`stop`), or restarted
+    /// by `start` while the adjacency was Up.
     stopped,
     /// The neighbour restarted / withdrew its confirmation of us (a received
     /// IIH that no longer echoes us, dropping Up → Initializing).
     neighbor_restarted,
+    /// The recorded neighbour sent an IIH with a different Local Circuit ID
+    /// (ISO 10589 §9.7): the link now ends on another of its interfaces. The
+    /// adjacency is deleted. See `Config.detect_circuit_id_change`.
+    circuit_id_changed,
 };
 
 /// Why a received IIH was ignored without changing state (a soft reject — not a
@@ -135,6 +140,11 @@ pub const RejectReason = enum {
     /// `.level1_2` circuit is left to still form its L2 component, so this
     /// check applies only to pure `.level1` circuits — see `SPEC.md` §5).
     area_mismatch,
+    /// The IIH's `holding_time` is below `Config.min_neighbor_holding_time`.
+    /// A hold of 0 took the adjacency Up and expired it at the same instant
+    /// (A1 audit F13). Neither RFC 5303 nor FRR sets a floor; this is a local
+    /// policy with a default that refuses only 0.
+    holding_time_too_short,
 };
 
 pub const Transition = struct { from: State, to: State };
@@ -182,6 +192,33 @@ pub const Config = struct {
     /// off to prove the three-way guard has teeth (without the guard the
     /// half-open case would wrongly reach Up).
     three_way_required: bool = true,
+    /// RFC 5303 §3.2 b) backward compatibility (A1 audit F5). The RFC runs its
+    /// three-way table on the received state alone when the neighbour's TLV
+    /// 240 carries no (complete) neighbour block: "the procedure works
+    /// properly if neither field is ever included". With this `true` such a
+    /// peer reaching Initializing takes us Up. Default `false`: without the
+    /// echo nothing proves the peer heard THIS circuit, so the ceiling stays
+    /// Initializing. A block naming someone else is discarded either way.
+    accept_without_neighbor_fields: bool = false,
+    /// Return `send_hello` from `rxHello` whenever it changes state, so the
+    /// handshake converges on events instead of waiting for `hello_interval`
+    /// (A1 audit F12; FRR sends a triggered IIH on every state change). At
+    /// most one hello per received IIH, never more. The periodic schedule is
+    /// not moved. `false` restores cadence-only hellos.
+    triggered_hello: bool = true,
+    /// The smallest neighbour `holding_time` accepted; below it the IIH is
+    /// `rejected = .holding_time_too_short` (A1 audit F13). Default 1 refuses
+    /// only 0, which expired the adjacency in the instant it formed. 0
+    /// disables the check.
+    min_neighbor_holding_time: u16 = 1,
+    /// Delete the adjacency when the recorded neighbour's IIH carries a
+    /// different Local Circuit ID than the one it was formed with (A1 audit
+    /// F14): the link was moved to another interface. For a peer without TLV
+    /// 240 this is the only sign of it. Reported as a transition to Down and,
+    /// from Up, `adjacency_down = .circuit_id_changed`. FRR leaves this step of
+    /// ISO 10589 §8.2.5.2 c) unimplemented ("FIXME - Missing parts"); `false`
+    /// matches it.
+    detect_circuit_id_change: bool = true,
 };
 
 /// Everything needed to build an outgoing P2P IIH, returned by the FSM so it
@@ -266,6 +303,9 @@ pub const Adjacency = struct {
     /// fill the neighbour block in *our* outgoing 240). Absent if the neighbour
     /// sent no 240.
     neighbor_ext_circuit_id: ?u32 = null,
+    /// The neighbour's 1-octet Local Circuit ID from the IIH it was accepted
+    /// with; compared by `Config.detect_circuit_id_change`.
+    neighbor_local_circuit_id: ?u8 = null,
 
     /// Absolute deadline (in `now` units) past which the neighbour is considered
     /// gone. Refreshed to `now + neighbour.holding_time` on every accepted IIH.
@@ -292,14 +332,23 @@ pub const Adjacency = struct {
     /// Bring the circuit up. Resets to Down (no neighbour heard yet), primes the
     /// hello timer to fire immediately, and returns an `Effect` carrying that
     /// first IIH so the handshake starts without waiting a full interval.
+    /// Called on a live adjacency it reports the drop the way `stop` does
+    /// (`transition`, and `adjacency_down = .stopped` from Up; A1 audit F7).
     pub fn start(self: *Adjacency, now: Time) Effect {
+        const prev = self.state;
         self.started = true;
         self.state = .down;
         self.neighbor_system_id = null;
         self.neighbor_ext_circuit_id = null;
+        self.neighbor_local_circuit_id = null;
         self.hold_deadline = 0;
         self.next_hello_due = now + self.cfg.hello_interval;
-        return .{ .send_hello = self.helloFields() };
+        var eff: Effect = .{ .send_hello = self.helloFields() };
+        if (prev != .down) {
+            eff.transition = .{ .from = prev, .to = .down };
+            if (prev == .up) eff.adjacency_down = .stopped;
+        }
+        return eff;
     }
 
     /// Administratively tear the circuit down. If it was Up, reports
@@ -310,6 +359,7 @@ pub const Adjacency = struct {
         self.state = .down;
         self.neighbor_system_id = null;
         self.neighbor_ext_circuit_id = null;
+        self.neighbor_local_circuit_id = null;
         var eff: Effect = .{};
         if (prev != .down) {
             eff.transition = .{ .from = prev, .to = .down };
@@ -355,6 +405,7 @@ pub const Adjacency = struct {
             self.state = .down;
             self.neighbor_system_id = null;
             self.neighbor_ext_circuit_id = null;
+            self.neighbor_local_circuit_id = null;
             eff.transition = .{ .from = prev, .to = .down };
             if (prev == .up) eff.adjacency_down = .hold_expired;
         }
@@ -442,6 +493,11 @@ pub const Adjacency = struct {
         if (rx.max_area_addresses != self.effectiveMaxAreaAddresses()) {
             return .{ .rejected = .max_area_mismatch };
         }
+        // Audit F13: a hold of 0 formed the adjacency and expired it in the
+        // same instant. Local policy, see `Config.min_neighbor_holding_time`.
+        if (rx.holding_time < self.cfg.min_neighbor_holding_time) {
+            return .{ .rejected = .holding_time_too_short };
+        }
         // Area-address matching (ISO 10589 §8.2.2/§7.2.4): required only for a
         // Level 1 adjacency. `.level1_2` is left unchecked here because this
         // FSM tracks one combined state per circuit rather than split L1/L2
@@ -492,10 +548,33 @@ pub const Adjacency = struct {
                 if (tw.state == .up) return .{ .rejected = .neighbor_up_while_down };
             }
         }
+        // Audit F14: the recorded neighbour now speaks from another Local
+        // Circuit ID, so the link ends on a different interface of it. The
+        // adjacency formed on the old one is deleted; the next hello from the
+        // new interface starts over from Down.
+        if (self.cfg.detect_circuit_id_change and self.state != .down) {
+            if (self.neighbor_system_id) |sid| {
+                if (self.neighbor_local_circuit_id) |old| {
+                    if (std.mem.eql(u8, &sid, &rx.source_id) and old != rx.local_circuit_id) {
+                        const prev = self.state;
+                        self.state = .down;
+                        self.neighbor_system_id = null;
+                        self.neighbor_ext_circuit_id = null;
+                        self.neighbor_local_circuit_id = null;
+                        self.hold_deadline = 0;
+                        var eff: Effect = .{ .transition = .{ .from = prev, .to = .down } };
+                        if (prev == .up) eff.adjacency_down = .circuit_id_changed;
+                        if (self.cfg.triggered_hello) eff.send_hello = self.helloFields();
+                        return eff;
+                    }
+                }
+            }
+        }
 
         // ── accepted: refresh hold + record the neighbour ───────────────────
         self.hold_deadline = now + @as(Time, rx.holding_time);
         self.neighbor_system_id = rx.source_id;
+        self.neighbor_local_circuit_id = rx.local_circuit_id;
         // Unconditional, not just when a 240 is present: an accepted IIH that
         // carries no TLV 240 at all means the neighbour has stopped (or never
         // started) speaking RFC 5303, so any previously recorded extended
@@ -527,8 +606,14 @@ pub const Adjacency = struct {
         // claims Down is mid-reset — hold at Initializing, don't race it to Up).
         const neighbor_past_down = if (rx.three_way) |tw| tw.state != .down else true;
 
+        // Audit F5, opt-in: RFC 5303 §3.2 b) runs the table on the received
+        // state when the neighbour fields are absent. A block naming anyone
+        // else never gets here (discarded above), so any 240 that did is
+        // either the echo or carries no complete block.
+        const confirmed = echoed or (self.cfg.accept_without_neighbor_fields and rx.three_way != null);
+
         const new_state: State = if (self.cfg.three_way_required)
-            (if (echoed and neighbor_past_down) .up else .initializing)
+            (if (confirmed and neighbor_past_down) .up else .initializing)
         else
             // Pre-5303 two-way fallback / positive control: trust a single
             // accepted hello. This is the DELIBERATELY WEAKER rule.
@@ -543,7 +628,11 @@ pub const Adjacency = struct {
         // failing (the OTHER way `applyState` can leave Up, still reported
         // below) — it is the peer TELLING us to reinitialize, silently.
         const initialize_action = if (rx.three_way) |tw| tw.state == .down else false;
-        return self.applyState(new_state, now, initialize_action);
+        var eff = self.applyState(new_state, now, initialize_action);
+        // Audit F12: tell the neighbour about the new state now, not at the
+        // next `hello_interval`.
+        if (self.cfg.triggered_hello and eff.transition != null) eff.send_hello = self.helloFields();
+        return eff;
     }
 
     fn applyState(self: *Adjacency, new_state: State, now: Time, initialize_action: bool) Effect {
@@ -968,6 +1057,156 @@ test "a neighbour not echoing us holds us at Initializing (three-way guard)" {
     const hf = adj.helloFields();
     try testing.expect(hf.three_way.neighbor != null);
     try testing.expectEqual(sys_b, hf.three_way.neighbor.?.system_id);
+}
+
+fn rxFrom(src: SystemId, lcid: u8, hold: u16, tw: ?ThreeWayTlv) RxHello {
+    return .{ .source_id = src, .holding_time = hold, .circuit_type = .level1_2, .local_circuit_id = lcid, .three_way = tw };
+}
+
+const echo_init: ThreeWayTlv = .{
+    .state = .initializing,
+    .extended_local_circuit_id = 0xB1,
+    .neighbor = .{ .system_id = sys_a, .extended_local_circuit_id = 0xA1 },
+};
+
+fn upAdjacency(cfg: Config) !Adjacency {
+    var adj = Adjacency.init(cfg);
+    _ = adj.start(0);
+    _ = adj.rxHello(rxFrom(sys_b, 1, 30, echo_init), 1);
+    try testing.expectEqual(State.up, adj.currentState());
+    return adj;
+}
+
+test "audit F5: a 240 without neighbour fields stays Initializing by default, goes Up by the RFC 5303 table when opted in" {
+    const bare_init: ThreeWayTlv = .{ .state = .initializing, .extended_local_circuit_id = 0xB1 };
+    const bare_down: ThreeWayTlv = .{ .state = .down, .extended_local_circuit_id = 0xB1 };
+
+    var strict = Adjacency.init(cfgA());
+    _ = strict.start(0);
+    for (0..6) |i| _ = strict.rxHello(rxFrom(sys_b, 1, 30, bare_init), 1 + i);
+    try testing.expectEqual(State.initializing, strict.currentState());
+
+    var cfg = cfgA();
+    cfg.accept_without_neighbor_fields = true;
+    // Table (Down, Initializing) = Up.
+    var legacy = Adjacency.init(cfg);
+    _ = legacy.start(0);
+    const e = legacy.rxHello(rxFrom(sys_b, 1, 30, bare_init), 1);
+    try testing.expectEqual(State.up, legacy.currentState());
+    try testing.expect(e.adjacency_up);
+    // Table (Up, Down) = Initialize.
+    _ = legacy.rxHello(rxFrom(sys_b, 1, 30, bare_down), 2);
+    try testing.expectEqual(State.initializing, legacy.currentState());
+    // The switch does not reach an IIH without any 240 (option absent).
+    var no_240 = Adjacency.init(cfg);
+    _ = no_240.start(0);
+    _ = no_240.rxHello(rxFrom(sys_b, 1, 30, null), 1);
+    try testing.expectEqual(State.initializing, no_240.currentState());
+    // Nor a block naming someone else: still discarded.
+    var foreign = Adjacency.init(cfg);
+    _ = foreign.start(0);
+    const f = foreign.rxHello(rxFrom(sys_b, 1, 30, .{
+        .state = .initializing,
+        .extended_local_circuit_id = 0xB1,
+        .neighbor = .{ .system_id = sys_b, .extended_local_circuit_id = 0xA1 },
+    }), 1);
+    try testing.expectEqual(RejectReason.neighbor_mismatch, f.rejected.?);
+}
+
+test "audit F7: start() over an Up adjacency reports the drop like stop()" {
+    var adj = try upAdjacency(cfgA());
+    const e = adj.start(5);
+    try testing.expectEqual(Transition{ .from = .up, .to = .down }, e.transition.?);
+    try testing.expectEqual(DownReason.stopped, e.adjacency_down.?);
+    try testing.expect(e.send_hello != null);
+    try testing.expectEqual(State.down, adj.currentState());
+    // From Initializing: a transition, no adjacency_down.
+    var init_adj = Adjacency.init(cfgA());
+    _ = init_adj.start(0);
+    _ = init_adj.rxHello(rxFrom(sys_b, 1, 30, null), 1);
+    const e2 = init_adj.start(5);
+    try testing.expectEqual(Transition{ .from = .initializing, .to = .down }, e2.transition.?);
+    try testing.expect(e2.adjacency_down == null);
+}
+
+test "audit F12: a state change in rxHello triggers a hello carrying the new state; no change, no hello" {
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const e1 = adj.rxHello(rxFrom(sys_b, 1, 30, .{ .state = .down, .extended_local_circuit_id = 0xB1 }), 1);
+    try testing.expectEqual(ThreeWayState.initializing, e1.send_hello.?.three_way.state);
+    try testing.expectEqual(sys_b, e1.send_hello.?.three_way.neighbor.?.system_id);
+    const e2 = adj.rxHello(rxFrom(sys_b, 1, 30, .{ .state = .down, .extended_local_circuit_id = 0xB1 }), 2);
+    try testing.expect(e2.transition == null);
+    try testing.expect(e2.send_hello == null);
+    const e3 = adj.rxHello(rxFrom(sys_b, 1, 30, echo_init), 3);
+    try testing.expectEqual(ThreeWayState.up, e3.send_hello.?.three_way.state);
+
+    var cfg = cfgA();
+    cfg.triggered_hello = false;
+    var quiet = Adjacency.init(cfg);
+    _ = quiet.start(0);
+    const q = quiet.rxHello(rxFrom(sys_b, 1, 30, echo_init), 1);
+    try testing.expect(q.transition != null);
+    try testing.expect(q.send_hello == null);
+}
+
+test "audit F13: a holding_time of 0 is rejected by default; 1 is accepted; the floor is configurable" {
+    var adj = Adjacency.init(cfgA());
+    _ = adj.start(0);
+    const e = adj.rxHello(rxFrom(sys_b, 1, 0, echo_init), 1);
+    try testing.expectEqual(RejectReason.holding_time_too_short, e.rejected.?);
+    try testing.expectEqual(State.down, adj.currentState());
+    _ = adj.rxHello(rxFrom(sys_b, 1, 1, echo_init), 1);
+    try testing.expectEqual(State.up, adj.currentState());
+
+    var cfg = cfgA();
+    cfg.min_neighbor_holding_time = 0;
+    var off = Adjacency.init(cfg);
+    _ = off.start(0);
+    _ = off.rxHello(rxFrom(sys_b, 1, 0, echo_init), 1);
+    try testing.expectEqual(State.up, off.currentState());
+    cfg.min_neighbor_holding_time = 10;
+    var floor = Adjacency.init(cfg);
+    _ = floor.start(0);
+    try testing.expectEqual(RejectReason.holding_time_too_short, floor.rxHello(rxFrom(sys_b, 1, 9, echo_init), 1).rejected.?);
+    _ = floor.rxHello(rxFrom(sys_b, 1, 10, echo_init), 1);
+    try testing.expectEqual(State.up, floor.currentState());
+}
+
+test "audit F14: the neighbour's Local Circuit ID changing deletes the adjacency; unchanged or opted out, it stays" {
+    var adj = try upAdjacency(cfgA());
+    const same = adj.rxHello(rxFrom(sys_b, 1, 30, echo_init), 2);
+    try testing.expect(same.transition == null);
+    try testing.expectEqual(State.up, adj.currentState());
+
+    const moved = adj.rxHello(rxFrom(sys_b, 2, 30, echo_init), 3);
+    try testing.expectEqual(Transition{ .from = .up, .to = .down }, moved.transition.?);
+    try testing.expectEqual(DownReason.circuit_id_changed, moved.adjacency_down.?);
+    try testing.expectEqual(State.down, adj.currentState());
+    try testing.expect(adj.neighbor_system_id == null);
+    // Our next hello says Down with no neighbour block.
+    try testing.expectEqual(ThreeWayState.down, moved.send_hello.?.three_way.state);
+    try testing.expect(moved.send_hello.?.three_way.neighbor == null);
+    // Nothing is left to expire.
+    try testing.expect(adj.tick(100).adjacency_down == null);
+
+    // Only the RECORDED neighbour is compared: at Initializing another system
+    // on another circuit id replaces the candidate (F2 semantics), it does
+    // not delete anything.
+    const sys_c: SystemId = .{ 0, 0, 0, 0, 0, 0xC };
+    var cand = Adjacency.init(cfgA());
+    _ = cand.start(0);
+    _ = cand.rxHello(rxFrom(sys_b, 1, 30, null), 1);
+    const other = cand.rxHello(rxFrom(sys_c, 2, 30, null), 2);
+    try testing.expect(other.transition == null);
+    try testing.expectEqual(State.initializing, cand.currentState());
+    try testing.expectEqual(sys_c, cand.neighbor_system_id.?);
+
+    var cfg = cfgA();
+    cfg.detect_circuit_id_change = false;
+    var off = try upAdjacency(cfg);
+    _ = off.rxHello(rxFrom(sys_b, 2, 30, echo_init), 3);
+    try testing.expectEqual(State.up, off.currentState());
 }
 
 test "a neighbour that echoes us (and is past Down) brings us Up" {

@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BREAKING:** A1 findings F5, F7, F12, F13, F14 (round-2 decision:
+  safe default plus a switch). New `RejectReason.holding_time_too_short` and
+  `DownReason.circuit_id_changed` break an exhaustive `switch`; no in-repo consumer.
+  F7: `start()` over a live adjacency now reports `transition`, and
+  `adjacency_down = .stopped` from Up; it used to drop it silently.
+  F12: `rxHello` returns `send_hello` on every state change
+  (`Config.triggered_hello`, default on), as FRR's triggered IIH.
+  F13: a neighbour `holding_time` below `Config.min_neighbor_holding_time` (default 1,
+  so only 0) is rejected; 0 used to form and expire the adjacency in one instant.
+  F14: the recorded neighbour's IIH with another Local Circuit ID deletes the adjacency
+  (`Config.detect_circuit_id_change`, default on).
+  F5: `Config.accept_without_neighbor_fields` (default off) runs RFC 5303 §3.2 b)'s
+  table for a peer whose TLV 240 carries no neighbour fields; off keeps the
+  Initializing ceiling.
+
 - **2026-09-10** — A1 fix campaign, three of the remaining MED/LOW findings (module
   still has zero in-repo consumers, verified against `build.zig`'s `example_apps`
   table too — P1 applies without reservation). Additive only, no `RejectReason` /
