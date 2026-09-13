@@ -183,7 +183,9 @@ fn buildSession(allocator: std.mem.Allocator, io: std.Io) !struct { alice: ratch
 
     const alice_out = try x3dh.initiateUnverified(allocator, alice_ik, bundle, "", io);
     defer alice_out.message.deinit(allocator);
-    const bob_agr = try x3dh.respond(bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try x3dh.respond(allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
+    defer allocator.free(bob_out.plaintext);
+    const bob_agr = bob_out.agreement;
 
     const alice = try ratchet.State.initAlice(
         alice_out.agreement.shared_secret,

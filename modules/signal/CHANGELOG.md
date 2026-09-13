@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BREAKING** (API and wire): A1 finding F6. X3DH and PQXDH now perform
+  the spec's initial-message step. `initiate`/`initiateUnverified` take `initial_plaintext`
+  (was an opaque `initial_ciphertext`) and send it sealed with ChaCha20-Poly1305 under
+  `HKDF-Expand(SK, "zig-libs/signal/initial-message/v1")` with the full `AD` as associated
+  data (`ciphertext ‖ 16-byte tag`). `respond` (`x3dh` and `pqxdh`) now takes an allocator,
+  returns `RespondOutput{ agreement, plaintext }`, and fails with
+  `error.InitialMessageAuthenticationFailed` after zeroing `SK` when the initial message
+  does not open ("Bob aborts the protocol and deletes SK"). Before, `respond` succeeded
+  whatever the message carried, so PQXDH's `Encode(PQPKB)` term in `AD` authenticated
+  nothing. No consumer in the repository.
+
 - **2026-09-10** — **Documentation only.** A1 fix campaign: re-verified the module against
   its audit record (`A1/signal.md`) before touching anything. Five of the seven open
   findings (F1 HIGH, F2/F3 MED, F4/F5 LOW) turned out to already be fixed by `f79415fd`

@@ -51,6 +51,21 @@ libsignal known-answer vector pinned against BOTH XEdDSA variants; see
   because `X25519.scalarmult(a_priv, b_pub) == X25519.scalarmult(b_priv,
   a_pub)` (ordinary DH commutativity) — there is no separate "Bob's KDF"
   code path to accidentally drift from Alice's.
+- **The initial ciphertext is sealed and opened here** (A1 `signal` F6,
+  2026-09-13). Both specs require it: Alice encrypts the initial message "with
+  some AEAD encryption scheme using AD as associated data and using an
+  encryption key which is either SK or the output from some cryptographic PRF
+  keyed by SK", and Bob, if it "fails to decrypt, aborts the protocol and
+  deletes SK". `initiate` seals `initial_plaintext` with ChaCha20-Poly1305
+  under `HKDF-Expand(SK, "zig-libs/signal/initial-message/v1")` (32-byte key +
+  12-byte nonce; `SK` is the ratchet's first root key, so it is never a cipher
+  key itself, and each `SK` seals exactly one message) with the handshake's
+  FULL `AD`; `respond` opens it, zeroes `SK` and returns
+  `error.InitialMessageAuthenticationFailed` when it does not authenticate.
+  Before, `initiate` took an opaque ciphertext before `SK` existed — no caller
+  could satisfy the spec — and `respond` succeeded whatever the message carried,
+  so PQXDH's `Encode(PQPKB)` term authenticated nothing. Shared code:
+  `initial_message.zig`, used by `x3dh.zig` and `pqxdh.zig`.
 - **`PreKeyBundle`/`InitialMessage` codecs** (`x3dh.zig`): plain
   fixed-header byte layouts (169 bytes / 77-byte-header +
   variable-length ciphertext) — REAL, no crypto judgment beyond `has_opk`
@@ -291,13 +306,16 @@ exact bytes and that nonce isn't published).
   Encode(PQPKB)`. The third term is required because an ML-KEM ciphertext
   does not commit to the public key it was produced under — omit it and an
   attacker who can substitute Bob's published KEM prekey does so without the
-  authenticated data changing. It binds where the key is used (the initial
-  message); the ratchet keeps X3DH's 64 bytes, because 1568 extra bytes per
-  message would protect a key that no longer participates.
+  authenticated data changing. It binds where the key is used — the initial
+  message, which `initiate` seals and `respond` opens under all 1632 bytes (a
+  test pins that the 64-byte prefix alone does NOT open it); the ratchet keeps
+  X3DH's 64 bytes, because 1568 extra bytes per message would protect a key
+  that no longer participates.
 - **Implicit rejection is not an error path.** Decapsulating a ciphertext
   under the wrong ML-KEM secret key SUCCEEDS and returns a shared secret;
   that is FIPS 203's design. So a substituted KEM prekey shows up as a
-  mismatched `SK` and a failing first AEAD, never as a `decaps` error. The
+  mismatched `SK` and `respond` returning `error.InitialMessageAuthenticationFailed`
+  (the initial message does not open), never as a `decaps` error. The
   absence of an error here is deliberate and tested, so it does not read as a
   missing check.
 - **Not claimed**: byte-compatibility with Signal's own servers. Like

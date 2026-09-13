@@ -7,9 +7,10 @@
 //! The interesting part for a first-time consumer is the seam between the two
 //! halves. PQXDH's associated data is 1632 bytes — it binds Bob's ML-KEM
 //! prekey, because ML-KEM's ciphertext does not commit to the public key it
-//! was made under — while the Double Ratchet's is 64. `ratchetAssociatedData`
-//! is the documented bridge; passing the full value would not compile, which
-//! is the point.
+//! was made under — while the Double Ratchet's is 64. The 1632 bytes are used
+//! inside `pqInitiate`/`pqRespond`, which seal and open the initial message
+//! under them; `ratchetAssociatedData` is the documented bridge to the ratchet,
+//! and passing the full value there would not compile, which is the point.
 
 const std = @import("std");
 const signal = @import("signal");
@@ -87,7 +88,11 @@ pub fn main() !void {
     std.debug.print("sent {d} B of ciphertext under a PQ-derived root key\n", .{msg.ciphertext.len});
 
     // ── Bob, back online: reconstruct the same secret and read it ─────────
-    const bob_agreement = try signal.pqRespond(bob_ik, bob_spk, .{ .key_pair = bob_opk_kp, .id = 7 }, bob_kem, opened.message);
+    // `pqRespond` also opens the initial message under SK and the full AD, and
+    // refuses the whole handshake (zeroing SK) if it does not authenticate.
+    const bob_opened = try signal.pqRespond(gpa, bob_ik, bob_spk, .{ .key_pair = bob_opk_kp, .id = 7 }, bob_kem, opened.message);
+    defer gpa.free(bob_opened.plaintext);
+    const bob_agreement = bob_opened.agreement;
     // `timing_safe.eql`, not `std.mem.eql` — both operands are local here, so
     // there is no oracle to leak to, but this file is the reference wiring a
     // consumer copies, and comparing secret material in variable time is not

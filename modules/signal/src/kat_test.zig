@@ -77,11 +77,62 @@ test "X3DH: initiateUnverified <-> respond agree on SK/AD, WITH a one-time preke
     const alice_out = try x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "hello bob", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
-    const bob_agreement = try x3dh.respond(bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
+    defer std.testing.allocator.free(bob_out.plaintext);
 
-    try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_agreement.shared_secret);
-    try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_agreement.associated_data);
-    try std.testing.expectEqualSlices(u8, "hello bob", alice_out.message.ciphertext);
+    try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_out.agreement.shared_secret);
+    try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_out.agreement.associated_data);
+    try std.testing.expectEqualStrings("hello bob", bob_out.plaintext);
+    // What travels is the sealed form, not the plaintext.
+    try std.testing.expectEqual("hello bob".len + 16, alice_out.message.ciphertext.len);
+    try std.testing.expect(!std.mem.eql(u8, "hello bob", alice_out.message.ciphertext[0.."hello bob".len]));
+}
+
+test "X3DH initial message: respond refuses a flipped, truncated or empty initial ciphertext" {
+    // Spec § "Receiving the initial message": "If the initial ciphertext fails
+    // to decrypt, then Bob aborts the protocol and deletes SK."
+    var threaded = testIo();
+    defer threaded.deinit();
+    const io = threaded.io();
+    const alloc = std.testing.allocator;
+
+    const alice_ik = X25519.KeyPair.generate(io);
+    const bob_ik = X25519.KeyPair.generate(io);
+    const bob_spk = x3dh.SignedPreKey{ .key_pair = X25519.KeyPair.generate(io), .signature = dummySignature(), .id = 7 };
+    const bob_opk = x3dh.OneTimePreKey{ .key_pair = X25519.KeyPair.generate(io), .id = 42 };
+    const bundle = x3dh.PreKeyBundle{
+        .identity_key = bob_ik.public_key,
+        .signed_prekey = bob_spk.key_pair.public_key,
+        .signed_prekey_id = bob_spk.id,
+        .signed_prekey_signature = bob_spk.signature,
+        .one_time_prekey = bob_opk.key_pair.public_key,
+        .one_time_prekey_id = bob_opk.id,
+    };
+
+    const alice_out = try x3dh.initiateUnverified(alloc, alice_ik, bundle, "hello bob", io);
+    defer alice_out.message.deinit(alloc);
+    const ct = alice_out.message.ciphertext;
+
+    var buf: [64]u8 = undefined;
+    var m = alice_out.message;
+
+    // One flipped bit: in the body, on the first tag byte, on the last one.
+    for ([_]usize{ 0, ct.len - 16, ct.len - 1 }) |i| {
+        @memcpy(buf[0..ct.len], ct);
+        buf[i] ^= 0x01;
+        m.ciphertext = buf[0..ct.len];
+        try std.testing.expectError(error.InitialMessageAuthenticationFailed, x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, m));
+    }
+    // Truncated by 1, 2, 4, 8 bytes, and down to nothing.
+    for ([_]usize{ 1, 2, 4, 8, ct.len }) |n| {
+        m.ciphertext = ct[0 .. ct.len - n];
+        try std.testing.expectError(error.InitialMessageAuthenticationFailed, x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, m));
+    }
+
+    // Positive control: the untouched message opens.
+    const ok = try x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, alice_out.message);
+    defer alloc.free(ok.plaintext);
+    try std.testing.expectEqualStrings("hello bob", ok.plaintext);
 }
 
 test "X3DH: initiateUnverified <-> respond agree on SK/AD, WITHOUT a one-time prekey (bundle exhausted)" {
@@ -109,13 +160,15 @@ test "X3DH: initiateUnverified <-> respond agree on SK/AD, WITHOUT a one-time pr
 
     try std.testing.expect(alice_out.message.one_time_prekey_id == null);
 
-    const bob_agreement = try x3dh.respond(bob_ik, bob_spk, null, alice_out.message);
+    const bob_out = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, null, alice_out.message);
+    defer std.testing.allocator.free(bob_out.plaintext);
 
-    try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_agreement.shared_secret);
-    try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_agreement.associated_data);
+    try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_out.agreement.shared_secret);
+    try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_out.agreement.associated_data);
+    try std.testing.expectEqualStrings("no opk today", bob_out.plaintext);
 }
 
-test "X3DH: a DIFFERENT bob_ik makes the agreement disagree (sanity check the test isn't vacuous)" {
+test "X3DH: a DIFFERENT bob_ik derives a different SK and cannot open the initial message" {
     var threaded = testIo();
     defer threaded.deinit();
     const io = threaded.io();
@@ -136,9 +189,16 @@ test "X3DH: a DIFFERENT bob_ik makes the agreement disagree (sanity check the te
     const alice_out = try x3dh.initiateUnverified(std.testing.allocator, alice_ik, bundle, "msg", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
-    // wrong_ik responds instead of the real bob_ik -> DH2 differs -> SK differs.
-    const wrong_agreement = try x3dh.respond(wrong_ik, bob_spk, null, alice_out.message);
-    try std.testing.expect(!std.mem.eql(u8, &alice_out.agreement.shared_secret, &wrong_agreement.shared_secret));
+    // wrong_ik responds instead of the real bob_ik -> DH2 differs -> SK differs
+    // (and AD's second term too) -> the initial message does not open.
+    try std.testing.expectError(
+        error.InitialMessageAuthenticationFailed,
+        x3dh.respond(std.testing.allocator, wrong_ik, bob_spk, null, alice_out.message),
+    );
+    // Positive control: the real bob_ik opens it.
+    const right = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, null, alice_out.message);
+    defer std.testing.allocator.free(right.plaintext);
+    try std.testing.expectEqualStrings("msg", right.plaintext);
 }
 
 test "X3DH: a low-order (identity-inducing) bob signed-prekey makes initiateUnverified fail closed" {
@@ -586,9 +646,11 @@ test "X3DH end-to-end: generateSignedPreKey -> initiate (verifies XEdDSA) -> res
     const alice_out = try x3dh.initiate(std.testing.allocator, alice_ik, bundle, "first ratchet msg", io);
     defer alice_out.message.deinit(std.testing.allocator);
 
-    const bob_agreement = try x3dh.respond(bob_ik, bob_spk, bob_opk, alice_out.message);
-    try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_agreement.shared_secret);
-    try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_agreement.associated_data);
+    const bob_out = try x3dh.respond(std.testing.allocator, bob_ik, bob_spk, bob_opk, alice_out.message);
+    defer std.testing.allocator.free(bob_out.plaintext);
+    try std.testing.expectEqualSlices(u8, &alice_out.agreement.shared_secret, &bob_out.agreement.shared_secret);
+    try std.testing.expectEqualSlices(u8, &alice_out.agreement.associated_data, &bob_out.agreement.associated_data);
+    try std.testing.expectEqualStrings("first ratchet msg", bob_out.plaintext);
 }
 
 test "X3DH.initiate fail-closes on a tampered signed-prekey signature AND on a substituted signed prekey" {

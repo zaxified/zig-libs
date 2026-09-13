@@ -61,13 +61,16 @@
 //! "a post-X3DH protocol" for actually encrypting messages; Signal's own
 //! choice — and this arc's Part 2, implemented and COMPLETE in the sibling
 //! `ratchet.zig` — is the Double Ratchet, seeded with `SK` as its initial
-//! root key. `InitialMessage.ciphertext` here is therefore an OPAQUE,
-//! caller-supplied byte slice — this module carries it, but does not
-//! produce or interpret it (no AEAD is invoked by this file at all). See
-//! `../README.md`'s "Part 2" section and `ratchet.zig`'s own module doc
-//! comment.
+//! root key. The spec's own initial ciphertext IS produced here, though:
+//! `initiate` seals the caller's `initial_plaintext` under a key derived from
+//! `SK` with `AD` as associated data, and `respond` opens it and fails with
+//! `error.InitialMessageAuthenticationFailed` (after zeroing `SK`) when it does
+//! not authenticate — spec § "Receiving the initial message": "Bob aborts the
+//! protocol and deletes SK". See `initial_message.zig`, `../README.md`'s
+//! "Part 2" section and `ratchet.zig`'s own module doc comment.
 
 const std = @import("std");
+const initial_message = @import("initial_message.zig");
 const xeddsa = @import("xeddsa.zig");
 const entropy = @import("entropy");
 const X25519 = std.crypto.dh.X25519;
@@ -237,9 +240,9 @@ pub const PreKeyBundle = struct {
 
 /// What Alice sends Bob to complete the handshake (spec § "Sending the
 /// initial message"): her identity + ephemeral public keys, which of
-/// Bob's (signed / one-time) prekeys she used, and an opaque initial
-/// ciphertext (see this file's module doc comment's "Part 2 boundary" —
-/// this module neither produces nor interprets that ciphertext).
+/// Bob's (signed / one-time) prekeys she used, and the initial ciphertext
+/// (`initial_plaintext` sealed under `SK` with `AD` — `ciphertext ‖ tag`,
+/// see `initial_message.zig`).
 pub const InitialMessage = struct {
     identity_key: [key_length]u8,
     ephemeral_key: [key_length]u8,
@@ -396,13 +399,14 @@ pub const InitiateOutput = struct {
 ///    and `DH4 = DH(EKA, OPKB)` iff `bob_bundle.one_time_prekey` is set.
 /// 3. `SK = KDF(F || DH1 || DH2 || DH3 [|| DH4])` (`deriveSharedSecret`).
 /// 4. `AD = Encode(IKA) || Encode(IKB)` (`associatedData`).
-/// 5. Package `(IKA_pub, EKA_pub, SPKB's id, OPKB's id if used,
-///    initial_ciphertext)` into the `InitialMessage` Alice sends Bob.
+/// 5. Seal `initial_plaintext` under a key derived from `SK`, with `AD` as
+///    associated data, and package `(IKA_pub, EKA_pub, SPKB's id, OPKB's id
+///    if used, that ciphertext)` into the `InitialMessage` Alice sends Bob.
 pub fn initiateUnverified(
     allocator: std.mem.Allocator,
     alice_ik: IdentityKey,
     bob_bundle: PreKeyBundle,
-    initial_ciphertext: []const u8,
+    initial_plaintext: []const u8,
     io: std.Io,
 ) (AgreementError || std.mem.Allocator.Error)!InitiateOutput {
     // `EKA` is single-use and feeds three of the four DHs — it is the only
@@ -421,7 +425,7 @@ pub fn initiateUnverified(
     const shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4);
     const ad = associatedData(alice_ik.public_key, bob_bundle.identity_key);
 
-    const ciphertext_owned = try allocator.dupe(u8, initial_ciphertext);
+    const ciphertext_owned = try initial_message.seal(allocator, shared_secret, &ad, initial_plaintext);
     return .{
         .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
         .message = .{
@@ -442,13 +446,21 @@ pub fn initiate(
     allocator: std.mem.Allocator,
     alice_ik: IdentityKey,
     bob_bundle: PreKeyBundle,
-    initial_ciphertext: []const u8,
+    initial_plaintext: []const u8,
     io: std.Io,
 ) (InitiateError || std.mem.Allocator.Error)!InitiateOutput {
     if (!xeddsa.verify(bob_bundle.identity_key, &bob_bundle.signed_prekey, bob_bundle.signed_prekey_signature))
         return error.SignedPreKeyVerificationFailed;
-    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_ciphertext, io);
+    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_plaintext, io);
 }
+
+pub const RespondError = AgreementError || initial_message.OpenError;
+
+pub const RespondOutput = struct {
+    agreement: Agreement,
+    /// The initial message's plaintext. Caller owns it (`allocator.free`).
+    plaintext: []u8,
+};
 
 /// Bob's side of X3DH (spec § "Receiving the initial message" steps
 /// 1-2): recomputes the SAME four DHs from Bob's own private material +
@@ -465,12 +477,18 @@ pub fn initiate(
 /// (it only uses whichever of the two `?` values it is given — see
 /// `SPEC.md` for the id-mismatch caveat a production integration must
 /// check).
+///
+/// Then spec § "Receiving the initial message" step 3: open the initial
+/// ciphertext under `SK` and `AD`. If it does not authenticate, `SK` is zeroed
+/// and `error.InitialMessageAuthenticationFailed` returned — no `Agreement`
+/// escapes a handshake whose first message did not verify.
 pub fn respond(
+    allocator: std.mem.Allocator,
     bob_ik: IdentityKey,
     bob_spk: SignedPreKey,
     bob_opk: ?OneTimePreKey,
     alice_initial: InitialMessage,
-) AgreementError!Agreement {
+) RespondError!RespondOutput {
     const dh1 = try dh(bob_spk.key_pair.secret_key, alice_initial.identity_key);
     const dh2 = try dh(bob_ik.secret_key, alice_initial.ephemeral_key);
     const dh3 = try dh(bob_spk.key_pair.secret_key, alice_initial.ephemeral_key);
@@ -479,9 +497,16 @@ pub fn respond(
     else
         null;
 
-    const shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4);
+    var shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4);
     const ad = associatedData(alice_initial.identity_key, bob_ik.public_key);
-    return .{ .shared_secret = shared_secret, .associated_data = ad };
+    const plaintext = initial_message.open(allocator, shared_secret, &ad, alice_initial.ciphertext) catch |err| {
+        std.crypto.secureZero(u8, &shared_secret);
+        return err;
+    };
+    return .{
+        .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
+        .plaintext = plaintext,
+    };
 }
 
 /// Generates a fresh `SignedPreKey`: a new X25519 keypair plus Bob's

@@ -690,7 +690,9 @@ fn seedSession(io: std.Io) !struct { alice: State, bob: State } {
 
     const alice_out = try x3dh.initiateUnverified(alloc, alice_ik, bundle, "", io);
     defer alice_out.message.deinit(alloc);
-    const bob_agr = try x3dh.respond(bob_ik, bob_spk, bob_opk, alice_out.message);
+    const bob_out = try x3dh.respond(alloc, bob_ik, bob_spk, bob_opk, alice_out.message);
+    defer alloc.free(bob_out.plaintext);
+    const bob_agr = bob_out.agreement;
 
     try testing.expectEqualSlices(
         u8,

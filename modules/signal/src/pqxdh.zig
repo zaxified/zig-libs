@@ -49,6 +49,7 @@
 
 const std = @import("std");
 const entropy = @import("entropy");
+const initial_message = @import("initial_message.zig");
 const x3dh = @import("x3dh.zig");
 const xeddsa = @import("xeddsa.zig");
 const X25519 = std.crypto.dh.X25519;
@@ -163,8 +164,9 @@ pub const InitialMessage = struct {
     one_time_prekey_id: ?u32,
     kem_prekey_id: u32,
     kem_ciphertext: [kem_ciphertext_length]u8,
-    /// Opaque, caller-supplied — this file carries it and never interprets
-    /// it, exactly as `x3dh.InitialMessage.ciphertext` does.
+    /// The initial ciphertext: `initial_plaintext` sealed under `SK` with the
+    /// full 1632-byte `AD` (`ciphertext ‖ tag`, see `initial_message.zig`).
+    /// This is where `Encode(PQPKB)` in `AD` is actually authenticated.
     ciphertext: []const u8,
 
     /// Frees `ciphertext`, which `initiate` allocated. The same shape as
@@ -262,7 +264,7 @@ pub fn initiateUnverified(
     allocator: std.mem.Allocator,
     alice_ik: IdentityKey,
     bob_bundle: PreKeyBundle,
-    initial_ciphertext: []const u8,
+    initial_plaintext: []const u8,
     io: std.Io,
 ) (InitiateError || std.mem.Allocator.Error)!InitiateOutput {
     const ek = x3dh.generateKeyPair(io);
@@ -288,7 +290,7 @@ pub fn initiateUnverified(
     const shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4, enc.shared_secret);
     const ad = associatedData(alice_ik.public_key, bob_bundle.identity_key, bob_bundle.kem_prekey);
 
-    const ciphertext_owned = try allocator.dupe(u8, initial_ciphertext);
+    const ciphertext_owned = try initial_message.seal(allocator, shared_secret, &ad, initial_plaintext);
     return .{
         .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
         .message = .{
@@ -309,17 +311,23 @@ pub fn initiate(
     allocator: std.mem.Allocator,
     alice_ik: IdentityKey,
     bob_bundle: PreKeyBundle,
-    initial_ciphertext: []const u8,
+    initial_plaintext: []const u8,
     io: std.Io,
 ) (InitiateError || std.mem.Allocator.Error)!InitiateOutput {
     if (!xeddsa.verify(bob_bundle.identity_key, &bob_bundle.signed_prekey, bob_bundle.signed_prekey_signature))
         return error.SignedPreKeyVerificationFailed;
     if (!xeddsa.verify(bob_bundle.identity_key, &bob_bundle.kem_prekey, bob_bundle.kem_prekey_signature))
         return error.KemPreKeyVerificationFailed;
-    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_ciphertext, io);
+    return initiateUnverified(allocator, alice_ik, bob_bundle, initial_plaintext, io);
 }
 
-pub const RespondError = AgreementError || error{
+pub const RespondOutput = struct {
+    agreement: Agreement,
+    /// The initial message's plaintext. Caller owns it (`allocator.free`).
+    plaintext: []u8,
+};
+
+pub const RespondError = AgreementError || initial_message.OpenError || error{
     /// **Currently unreachable, and a caller must not read it as validation.**
     /// FIPS 203's implicit rejection means decapsulation has no failure mode:
     /// `std`'s `decaps` returns unconditionally on both its branches, `cmov`ing
@@ -329,9 +337,9 @@ pub const RespondError = AgreementError || error{
     ///
     /// The arm is kept rather than deleted so a future `std` that does gain an
     /// error has somewhere to land. What detects a substituted ciphertext is
-    /// not this error but the mismatched `SK`, which surfaces as an AEAD
-    /// failure in whatever the caller encrypts under it — `respond` succeeding
-    /// says nothing about the ciphertext being genuine.
+    /// not this error but the mismatched `SK`, which surfaces from `respond`
+    /// itself as `error.InitialMessageAuthenticationFailed` when the initial
+    /// ciphertext does not open.
     KemDecapsulationFailed,
 };
 
@@ -342,13 +350,19 @@ pub const RespondError = AgreementError || error{
 /// `bob_kem` must be the prekey whose id is `alice_initial.kem_prekey_id`, and
 /// `bob_opk` must be present exactly when `alice_initial.one_time_prekey_id`
 /// is — the same caller-side lookup contract `x3dh.respond` documents.
+///
+/// Then the initial ciphertext is opened under `SK` and the full `AD`; if it
+/// does not authenticate, `SK` is zeroed and
+/// `error.InitialMessageAuthenticationFailed` returned (spec: "Bob aborts the
+/// protocol and deletes SK").
 pub fn respond(
+    allocator: std.mem.Allocator,
     bob_ik: IdentityKey,
     bob_spk: SignedPreKey,
     bob_opk: ?OneTimePreKey,
     bob_kem: KemPreKey,
     alice_initial: InitialMessage,
-) RespondError!Agreement {
+) RespondError!RespondOutput {
     const dh1 = try dh(bob_spk.key_pair.secret_key, alice_initial.identity_key);
     const dh2 = try dh(bob_ik.secret_key, alice_initial.ephemeral_key);
     const dh3 = try dh(bob_spk.key_pair.secret_key, alice_initial.ephemeral_key);
@@ -360,13 +374,20 @@ pub fn respond(
     const ss = bob_kem.key_pair.secret_key.decaps(&alice_initial.kem_ciphertext) catch
         return error.KemDecapsulationFailed;
 
-    const shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4, ss);
+    var shared_secret = deriveSharedSecret(dh1, dh2, dh3, dh4, ss);
     const ad = associatedData(
         alice_initial.identity_key,
         bob_ik.public_key,
         bob_kem.key_pair.public_key.toBytes(),
     );
-    return .{ .shared_secret = shared_secret, .associated_data = ad };
+    const plaintext = initial_message.open(allocator, shared_secret, &ad, alice_initial.ciphertext) catch |err| {
+        std.crypto.secureZero(u8, &shared_secret);
+        return err;
+    };
+    return .{
+        .agreement = .{ .shared_secret = shared_secret, .associated_data = ad },
+        .plaintext = plaintext,
+    };
 }
 
 /// A fresh ML-KEM keypair drawn from this module's fail-closed entropy source.
@@ -522,11 +543,24 @@ test "end to end: Alice initiates, Bob responds, both land on the same SK and AD
     const out = try initiate(testing.allocator, alice_ik, bundle, "hello", io);
     defer testing.allocator.free(out.message.ciphertext);
 
-    const bob = try respond(bob_ik, spk, opk, kem, out.message);
-    try testing.expectEqualSlices(u8, &out.agreement.shared_secret, &bob.shared_secret);
-    try testing.expectEqualSlices(u8, &out.agreement.associated_data, &bob.associated_data);
+    const bob = try respond(testing.allocator, bob_ik, spk, opk, kem, out.message);
+    defer testing.allocator.free(bob.plaintext);
+    try testing.expectEqualSlices(u8, &out.agreement.shared_secret, &bob.agreement.shared_secret);
+    try testing.expectEqualSlices(u8, &out.agreement.associated_data, &bob.agreement.associated_data);
+    try testing.expectEqualStrings("hello", bob.plaintext);
     try testing.expectEqual(kem.id, out.message.kem_prekey_id);
     try testing.expectEqual(@as(?u32, opk.id), out.message.one_time_prekey_id);
+
+    // The initial ciphertext is bound to the WHOLE 1632-byte AD, not to the
+    // 64-byte ratchet prefix: `Encode(PQPKB)` is authenticated here or nowhere.
+    // Opening under the prefix alone must fail; under the full AD it must not.
+    try testing.expectError(
+        error.InitialMessageAuthenticationFailed,
+        initial_message.open(testing.allocator, out.agreement.shared_secret, out.agreement.associated_data[0..x3dh.associated_data_length], out.message.ciphertext),
+    );
+    const full = try initial_message.open(testing.allocator, out.agreement.shared_secret, &out.agreement.associated_data, out.message.ciphertext);
+    defer testing.allocator.free(full);
+    try testing.expectEqualStrings("hello", full);
 }
 
 test "fail-closed: a tampered KEM prekey signature is refused, and names WHICH key failed" {
@@ -568,12 +602,12 @@ test "fail-closed: a tampered KEM prekey signature is refused, and names WHICH k
     );
 }
 
-test "a substituted KEM prekey yields a DIFFERENT SK, which is how the swap is caught" {
+test "a substituted KEM prekey yields a DIFFERENT SK, and respond refuses the initial message" {
     // ML-KEM has implicit rejection: decapsulating under the wrong secret key
     // succeeds and returns *a* shared secret. So the defence is not an error
-    // from `decaps` -- it is that the resulting SK differs, and the first AEAD
-    // under it fails. Worth a test precisely because the absence of an error
-    // here looks like a missing check.
+    // from `decaps` -- it is that the resulting SK differs, and the initial
+    // message does not open under it. Worth a test precisely because the
+    // absence of a `decaps` error here looks like a missing check.
     var threaded: std.Io.Threaded = .init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -600,8 +634,15 @@ test "a substituted KEM prekey yields a DIFFERENT SK, which is how the swap is c
     const out = try initiate(testing.allocator, alice_ik, bundle, "hello", io);
     defer testing.allocator.free(out.message.ciphertext);
 
-    const wrong = try respond(bob_ik, spk, null, other_kem, out.message);
-    try testing.expect(!std.mem.eql(u8, &out.agreement.shared_secret, &wrong.shared_secret));
+    try testing.expectError(
+        error.InitialMessageAuthenticationFailed,
+        respond(testing.allocator, bob_ik, spk, null, other_kem, out.message),
+    );
+
+    // Positive control: the right KEM prekey opens the same message.
+    const right = try respond(testing.allocator, bob_ik, spk, null, kem, out.message);
+    defer testing.allocator.free(right.plaintext);
+    try testing.expectEqualStrings("hello", right.plaintext);
 }
 
 // ── the entropy seam (audit 2026-09-01) ──────────────────────────────────────

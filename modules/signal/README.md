@@ -77,14 +77,18 @@ const bundle = signal.PreKeyBundle{
 
 // Alice fetches `bundle`, then initiates.
 const alice_ik = signal.x3dh.generateKeyPair(io);
-const out = try signal.initiate(allocator, alice_ik, bundle, initial_plaintext_or_ciphertext, io);
+const out = try signal.initiate(allocator, alice_ik, bundle, initial_plaintext, io);
 defer out.message.deinit(allocator);
 // out.agreement.shared_secret / out.agreement.associated_data feed Part 2 (Double Ratchet).
-// out.message is what Alice sends Bob over the wire (out.message.toBytes(allocator)).
+// out.message is what Alice sends Bob over the wire (out.message.toBytes(allocator));
+// its ciphertext is initial_plaintext sealed under SK with AD.
 
 // Bob, on receiving out.message:
-const agreement = try signal.respond(bob_ik, bob_spk, bob_opk, out.message);
-// agreement.shared_secret == out.agreement.shared_secret
+const opened = try signal.respond(allocator, bob_ik, bob_spk, bob_opk, out.message);
+defer allocator.free(opened.plaintext);
+// opened.agreement.shared_secret == out.agreement.shared_secret
+// error.InitialMessageAuthenticationFailed: the initial message did not open,
+// SK has been zeroed and the handshake must be abandoned.
 ```
 
 `signal.initiateUnverified` is the same agreement WITHOUT the XEdDSA
