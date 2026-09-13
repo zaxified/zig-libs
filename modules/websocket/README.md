@@ -40,7 +40,9 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
 - **`frame`** — `Opcode` (continuation/text/binary/close/ping/pong), `Frame`, `Role` (`.server` /
   `.client` — which masking direction to enforce on parse), `parseFrame(buf, role,
   max_frame_size) FrameError!ParseResult` (streaming: `.frame`, `.need_more`, or a typed error —
-  never blocks or panics on a truncated buffer), `writeFrame(w, WriteOptions)`. `mask_key: ?[4]u8`
+  never blocks or panics on a truncated buffer), `writeFrame(w, WriteOptions) WriteError!void`
+  (refuses a fragmented or over-125-byte control frame with the same error names the parser uses,
+  before writing anything). `mask_key: ?[4]u8`
   on `WriteOptions` is the entire masking decision — null = unmasked, a key = masked with that
   key. Helpers: `applyMask`, `pongFor(ping_payload, mask_key)`, `encodeCloseBody`/
   `decodeCloseBody`, `closeCode(err) u16` (maps any error from this module to its RFC close code).

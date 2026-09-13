@@ -257,15 +257,29 @@ pub const WriteOptions = struct {
     mask_key: ?[4]u8 = null,
 };
 
-/// Serialize one frame to `w`. Asserts the control-frame invariants
-/// (`fin == true`, `payload.len <= 125`) with `std.debug.assert` — those
-/// are caller (programmer) errors, not wire-input errors, since the
-/// caller constructs `opts` itself (contrast `parseFrame`, which validates
-/// untrusted bytes and never asserts).
-pub fn writeFrame(w: *std.Io.Writer, opts: WriteOptions) std.Io.Writer.Error!void {
+/// What `writeFrame` can fail with: the writer's own error, or a control
+/// frame (close/ping/pong) that RFC 6455 §5.5 forbids — the same two
+/// variants, with the same meaning, `parseFrame` reports when such a frame
+/// arrives.
+pub const WriteError = std.Io.Writer.Error || error{
+    /// A control frame with `fin == false`: control frames MUST NOT be
+    /// fragmented (§5.5).
+    FragmentedControlFrame,
+    /// A control frame with a payload over 125 bytes (§5.5).
+    ControlFrameTooLarge,
+};
+
+/// Serialize one frame to `w`. A control frame that breaks §5.5 (`fin`
+/// unset, or more than 125 payload bytes) is refused before a byte is
+/// written. A1 F6: these used to be `std.debug.assert`s — no check at all
+/// in ReleaseFast, where a 200-byte ping went out as a frame this module's
+/// own parser rejects, and a process-killing panic in Debug/ReleaseSafe.
+/// "The caller builds `opts`" did not hold: `pongFor` builds them from a
+/// received payload.
+pub fn writeFrame(w: *std.Io.Writer, opts: WriteOptions) WriteError!void {
     if (opts.opcode.isControl()) {
-        std.debug.assert(opts.fin);
-        std.debug.assert(opts.payload.len <= 125);
+        if (!opts.fin) return error.FragmentedControlFrame;
+        if (opts.payload.len > 125) return error.ControlFrameTooLarge;
     }
 
     var b0: u8 = @intFromEnum(opts.opcode);
@@ -315,7 +329,9 @@ pub fn writeFrame(w: *std.Io.Writer, opts: WriteOptions) std.Io.Writer.Error!voi
 /// §5.5.3: "A Pong frame sent in response to a Ping frame must have
 /// identical 'Application data' as found in the message body of the Ping
 /// frame being replied to." Caller still supplies `mask_key` (server:
-/// null, client: a fresh key).
+/// null, client: a fresh key). No bound of its own: a payload over 125
+/// bytes (which `parseFrame` never yields for a ping) makes `writeFrame`
+/// return `error.ControlFrameTooLarge`.
 pub fn pongFor(ping_payload: []const u8, mask_key: ?[4]u8) WriteOptions {
     return .{ .opcode = .pong, .payload = ping_payload, .mask_key = mask_key };
 }
@@ -604,6 +620,32 @@ test "applyMask matches an independent byte-at-a-time oracle across the word/tai
     var got = payload;
     applyMask(&got, key);
     try testing.expectEqualSlices(u8, &want, &got);
+}
+
+test "write: a control frame RFC 6455 §5.5 forbids is refused before any byte is written (A1 F6)" {
+    var buf: [512]u8 = undefined;
+    var big = [_]u8{0xAA} ** 200;
+
+    // The audit's 200-byte ping (went out as `89 7e 00 c8` in ReleaseFast).
+    var out: std.Io.Writer = .fixed(&buf);
+    try std.testing.expectError(error.ControlFrameTooLarge, writeFrame(&out, .{ .opcode = .ping, .payload = &big }));
+    try std.testing.expectEqual(@as(usize, 0), out.end);
+    // `pongFor` passes a received payload straight through.
+    try std.testing.expectError(error.ControlFrameTooLarge, writeFrame(&out, pongFor(&big, null)));
+    try std.testing.expectError(error.ControlFrameTooLarge, writeFrame(&out, .{ .opcode = .close, .payload = big[0..126] }));
+    try std.testing.expectEqual(@as(usize, 0), out.end);
+
+    // A close with FIN unset (went out as `08 00`).
+    try std.testing.expectError(error.FragmentedControlFrame, writeFrame(&out, .{ .opcode = .close, .fin = false, .payload = "" }));
+    try std.testing.expectError(error.FragmentedControlFrame, writeFrame(&out, .{ .opcode = .ping, .fin = false, .payload = "x" }));
+    try std.testing.expectEqual(@as(usize, 0), out.end);
+
+    // Controls: the limits themselves are fine, and data frames have neither.
+    try writeFrame(&out, .{ .opcode = .ping, .payload = big[0..125] });
+    try writeFrame(&out, .{ .opcode = .binary, .fin = false, .payload = &big });
+    const res = try parseFrame(out.buffered(), .client, 4096);
+    try std.testing.expectEqual(Opcode.ping, res.frame.opcode);
+    try std.testing.expectEqual(@as(usize, 125), res.frame.payload.len);
 }
 
 test "positive control: valid masked frame with max control payload (125) is accepted" {

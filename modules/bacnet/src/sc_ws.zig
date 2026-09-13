@@ -194,12 +194,17 @@ pub fn writeMessage(
     payload: []const u8,
     mask_key: ?[4]u8,
 ) std.Io.Writer.Error!void {
-    try websocket.frame.writeFrame(w, .{
+    websocket.frame.writeFrame(w, .{
         .opcode = .binary,
         .fin = true,
         .payload = payload,
         .mask_key = mask_key,
-    });
+    }) catch |err| switch (err) {
+        error.WriteFailed => return error.WriteFailed,
+        // `writeFrame` refuses only control frames that break RFC 6455
+        // §5.5; this is always one complete binary frame.
+        error.FragmentedControlFrame, error.ControlFrameTooLarge => unreachable,
+    };
 }
 
 /// One inbound event, already narrowed to what BACnet/SC cares about.

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BREAKING (error set):** A1 F6, round-2 decision Q7 (API change allowed, consumer
+  fixed in the same batch). `writeFrame` guarded the control-frame invariants (`fin`, payload ≤ 125)
+  with `std.debug.assert`: in ReleaseFast a 200-byte ping went out as `89 7e 00 c8`, which this
+  module's own parser rejects, and in Debug/ReleaseSafe the same call panicked the process — while
+  `pongFor` builds `WriteOptions` from a received payload. `writeFrame` now returns the new
+  `frame.WriteError` (`std.Io.Writer.Error || error{FragmentedControlFrame, ControlFrameTooLarge}`)
+  and refuses such a frame before writing a byte. Consumer `bacnet` (`sc_ws.writeMessage`, always
+  one binary frame) keeps its signature and maps the two new variants to `unreachable`.
+
 - **2026-09-11** — A1 fix campaign, F5's second half (test-only, no
   production behavior change): `connection.zig` and `handshake.zig` had zero
   fuzz harnesses, and the `.client` role had none anywhere in the module, so

@@ -29,7 +29,12 @@ parser: `buf` is mutable because a masked payload is unmasked **in-place**, so `
 always aliases plaintext application data regardless of whether the wire frame was masked. Three
 possible outcomes: a decoded `Frame`, `.need_more` (the buffer doesn't yet hold a complete frame —
 not an error, the normal "read more and retry" signal for a streaming transport), or a typed
-`FrameError`. `writeFrame` is the inverse, serializing to a `std.Io.Writer`; masking on the write
+`FrameError`. `writeFrame` is the inverse, serializing to a `std.Io.Writer`. It returns
+`WriteError` — the writer's error, or `FragmentedControlFrame`/`ControlFrameTooLarge` for a
+control frame §5.5 forbids, refused before a byte is written (A1 F6, 2026-09-14: these were
+`std.debug.assert`s, so ReleaseFast wrote a 200-byte ping this module's own parser rejects, and
+Debug/ReleaseSafe panicked; `pongFor` feeds `writeFrame` a received payload, so "the caller builds
+`opts`" never made them programmer-only errors). Masking on the write
 side is never inferred — the caller passes `mask_key: ?[4]u8` explicitly (null = unmasked, a key =
 masked-with-that-key), which is also what makes the RFC §5.7 vectors byte-exact-reproducible in
 tests (the masking key in those vectors is fixed, not random).
