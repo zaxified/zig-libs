@@ -81,8 +81,9 @@ pub const Verdict = enum {
     reject_stale_timestamp,
     /// `t` is ahead of local time by more than the configured skew.
     reject_future_timestamp,
-    /// Nothing was accepted for longer than `max_idle_ns`; the stream must be
-    /// re-established (`reset`) rather than silently resumed.
+    /// Nothing was accepted within the previous frame's `timeAllowedtoLive`
+    /// (plus `tal_slack_ms`), or for longer than `max_idle_ns`; the stream
+    /// must be re-established (`reset`) rather than silently resumed.
     reject_idle_gap,
     /// Sampled Values only: `smpCnt` did not advance within the forward window.
     reject_sample_out_of_window,
@@ -113,6 +114,12 @@ pub const GooseIdentity = struct {
     /// `t` — the entry time of the last state change, in nanoseconds since
     /// the UTC epoch (IEC 61850's `UtcTime` converted by the caller).
     t_ns: u64,
+    /// `timeAllowedtoLive` — the publisher's promise that the next frame
+    /// follows within this many milliseconds. Required, not defaulted: it is
+    /// the only thing that bounds the heartbeat path, where `t` legitimately
+    /// stays old (A1 finding N3 — with nothing bounding it, 500 of 500
+    /// day-old captured heartbeats were accepted under default options).
+    time_allowed_to_live_ms: u32,
     /// `t`'s quality bits, straight off `UtcTime` (IEC 61850-7-2 §6.2.2.4):
     /// `clockFailure` / `clockNotSynchronized`. Default false (healthy) so a
     /// caller that does not populate them sees the exact same behavior as
@@ -135,11 +142,17 @@ pub const GooseOptions = struct {
     /// How far `t` may lead local time before the frame is rejected.
     /// Non-zero because subscriber and publisher clocks differ.
     max_skew_ns: u64 = 500 * ns_per_ms,
-    /// Longest silence after which the guard refuses to resume without an
-    /// explicit `reset`. 0 disables the check. A GOOSE publisher retransmits
-    /// at least every `TAL` (typically <= 5 s), so a long silence means the
-    /// subscriber lost the stream and can no longer reason about ordering.
+    /// An additional, fixed cap on silence, on top of `timeAllowedtoLive`.
+    /// 0 disables this cap (not the TAL check).
     max_idle_ns: u64 = 0,
+    /// Reject a frame arriving later than the previous accepted frame's
+    /// `timeAllowedtoLive` plus `tal_slack_ms` (`reject_idle_gap`). On by
+    /// default: the publisher promised the next frame by then, so a later one
+    /// means the stream was lost — the same rule `iec61850.subscriber` applies.
+    /// Turning it off leaves heartbeats bounded only by `max_idle_ns`.
+    enforce_time_allowed_to_live: bool = true,
+    /// Jitter allowance added to `timeAllowedtoLive`, in milliseconds.
+    tal_slack_ms: u32 = 0,
     /// Require `sqNum == 0` on a state change (IEC 61850-8-1's rule).
     require_sqnum_reset: bool = true,
     /// Require `t` to be unchanged while `stNum` is unchanged.
@@ -167,6 +180,8 @@ pub const GooseGuard = struct {
         t_ns: u64,
         /// Local time at which the last accepted frame arrived.
         last_seen_ns: u64,
+        /// The `timeAllowedtoLive` that frame promised.
+        tal_ms: u32,
     };
 
     pub fn init(options: GooseOptions) GooseGuard {
@@ -199,6 +214,13 @@ pub const GooseGuard = struct {
             return .accept_first;
         };
 
+        // The PREVIOUS frame's promise decides, not this one's: a replayed or
+        // forged frame must not be able to excuse its own lateness.
+        if (o.enforce_time_allowed_to_live and
+            now_ns -| prev.last_seen_ns > (@as(u64, prev.tal_ms) + o.tal_slack_ms) * ns_per_ms)
+        {
+            return .reject_idle_gap;
+        }
         if (o.max_idle_ns != 0 and now_ns -| prev.last_seen_ns > o.max_idle_ns) {
             return .reject_idle_gap;
         }
@@ -233,6 +255,7 @@ pub const GooseGuard = struct {
                 .sq_num = id.sq_num,
                 .t_ns = id.t_ns,
                 .last_seen_ns = now_ns,
+                .tal_ms = id.time_allowed_to_live_ms,
             };
         }
         return v;
@@ -325,53 +348,55 @@ pub const SvGuard = struct {
 const testing = std.testing;
 
 const t0: u64 = 1_600_000_000 * ns_per_s;
+/// An hour: out of the way of every test that is not about `timeAllowedtoLive`.
+const test_tal_ms: u32 = 3_600_000;
 
 test "GOOSE: a healthy stream — one event then heartbeats" {
     var g: GooseGuard = .init(.{});
-    try testing.expectEqual(Verdict.accept_first, g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0));
+    try testing.expectEqual(Verdict.accept_first, g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0));
     var i: u32 = 1;
     var now = t0;
     while (i < 20) : (i += 1) {
         now += ns_per_s;
         try testing.expectEqual(
             Verdict.accept_in_sequence,
-            g.accept(.{ .st_num = 5, .sq_num = i, .t_ns = t0 }, now),
+            g.accept(.{ .st_num = 5, .sq_num = i, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, now),
         );
     }
     // A new event: stNum up, sqNum back to 0, fresh t.
     now += ns_per_s;
     try testing.expectEqual(
         Verdict.accept_new_state,
-        g.accept(.{ .st_num = 6, .sq_num = 0, .t_ns = now }, now),
+        g.accept(.{ .st_num = 6, .sq_num = 0, .t_ns = now, .time_allowed_to_live_ms = test_tal_ms }, now),
     );
 }
 
 test "GOOSE: a replayed frame is rejected" {
     var g: GooseGuard = .init(.{});
-    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0);
-    _ = g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 }, t0 + ns_per_s);
-    _ = g.accept(.{ .st_num = 5, .sq_num = 2, .t_ns = t0 }, t0 + 2 * ns_per_s);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_s);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 2, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 2 * ns_per_s);
 
     // Exact duplicate of the frame just accepted.
     try testing.expectEqual(
         Verdict.reject_replay_sequence,
-        g.accept(.{ .st_num = 5, .sq_num = 2, .t_ns = t0 }, t0 + 3 * ns_per_s),
+        g.accept(.{ .st_num = 5, .sq_num = 2, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 3 * ns_per_s),
     );
     // An older retransmission of the same state.
     try testing.expectEqual(
         Verdict.reject_replay_sequence,
-        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 }, t0 + 3 * ns_per_s),
+        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 3 * ns_per_s),
     );
     // An older state entirely.
     try testing.expectEqual(
         Verdict.reject_replay_state,
-        g.accept(.{ .st_num = 4, .sq_num = 0, .t_ns = t0 }, t0 + 3 * ns_per_s),
+        g.accept(.{ .st_num = 4, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 3 * ns_per_s),
     );
     // ...and the guard's state was not disturbed by any of the rejections.
     try testing.expectEqual(@as(u32, 2), g.state.?.sq_num);
     try testing.expectEqual(
         Verdict.accept_in_sequence,
-        g.accept(.{ .st_num = 5, .sq_num = 3, .t_ns = t0 }, t0 + 4 * ns_per_s),
+        g.accept(.{ .st_num = 5, .sq_num = 3, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 4 * ns_per_s),
     );
 }
 
@@ -383,56 +408,56 @@ test "GOOSE: the status-number flooding attack is rejected once it rewinds" {
     // the genuine stream's now-stale numbers so the operator sees the fault
     // rather than a silent switchover.
     var g: GooseGuard = .init(.{});
-    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     try testing.expectEqual(
         Verdict.accept_new_state,
-        g.accept(.{ .st_num = 1000, .sq_num = 0, .t_ns = t0 }, t0 + ns_per_ms),
+        g.accept(.{ .st_num = 1000, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_ms),
     );
     try testing.expectEqual(
         Verdict.reject_replay_state,
-        g.accept(.{ .st_num = 6, .sq_num = 0, .t_ns = t0 }, t0 + 2 * ns_per_ms),
+        g.accept(.{ .st_num = 6, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 2 * ns_per_ms),
     );
 }
 
 test "GOOSE: a state change must restart sqNum" {
     var g: GooseGuard = .init(.{});
-    _ = g.accept(.{ .st_num = 5, .sq_num = 7, .t_ns = t0 }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 7, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     try testing.expectEqual(
         Verdict.reject_sqnum_not_reset,
-        g.accept(.{ .st_num = 6, .sq_num = 8, .t_ns = t0 }, t0 + ns_per_ms),
+        g.accept(.{ .st_num = 6, .sq_num = 8, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_ms),
     );
     // The same frame is accepted when the rule is switched off.
     var lax: GooseGuard = .init(.{ .require_sqnum_reset = false });
-    _ = lax.accept(.{ .st_num = 5, .sq_num = 7, .t_ns = t0 }, t0);
+    _ = lax.accept(.{ .st_num = 5, .sq_num = 7, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     try testing.expectEqual(
         Verdict.accept_new_state,
-        lax.accept(.{ .st_num = 6, .sq_num = 8, .t_ns = t0 }, t0 + ns_per_ms),
+        lax.accept(.{ .st_num = 6, .sq_num = 8, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_ms),
     );
 }
 
 test "GOOSE: t may not move while stNum stands still" {
     var g: GooseGuard = .init(.{});
-    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     try testing.expectEqual(
         Verdict.reject_timestamp_changed,
-        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 + ns_per_s }, t0 + ns_per_s),
+        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 + ns_per_s, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_s),
     );
 }
 
 test "GOOSE: heartbeats with an old t are accepted; a stale state change is not" {
     var g: GooseGuard = .init(.{ .max_state_age_ns = 2 * ns_per_s });
-    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
 
     // An hour of heartbeats carrying the original (now very old) t: healthy.
     const much_later = t0 + 3600 * ns_per_s;
     try testing.expectEqual(
         Verdict.accept_in_sequence,
-        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 }, much_later),
+        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, much_later),
     );
     // A *state change* carrying that same old t is stale.
     try testing.expectEqual(
         Verdict.reject_stale_timestamp,
-        g.accept(.{ .st_num = 6, .sq_num = 0, .t_ns = t0 }, much_later + ns_per_ms),
+        g.accept(.{ .st_num = 6, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, much_later + ns_per_ms),
     );
 }
 
@@ -440,13 +465,13 @@ test "GOOSE: a timestamp from the future is rejected, including on the first fra
     var g: GooseGuard = .init(.{ .max_skew_ns = 100 * ns_per_ms });
     try testing.expectEqual(
         Verdict.reject_future_timestamp,
-        g.accept(.{ .st_num = 1, .sq_num = 0, .t_ns = t0 + ns_per_s }, t0),
+        g.accept(.{ .st_num = 1, .sq_num = 0, .t_ns = t0 + ns_per_s, .time_allowed_to_live_ms = test_tal_ms }, t0),
     );
     try testing.expect(g.state == null);
     // Inside the skew allowance it is fine.
     try testing.expectEqual(
         Verdict.accept_first,
-        g.accept(.{ .st_num = 1, .sq_num = 0, .t_ns = t0 + 50 * ns_per_ms }, t0),
+        g.accept(.{ .st_num = 1, .sq_num = 0, .t_ns = t0 + 50 * ns_per_ms, .time_allowed_to_live_ms = test_tal_ms }, t0),
     );
 }
 
@@ -454,47 +479,90 @@ test "GOOSE: the first frame must itself be fresh" {
     var g: GooseGuard = .init(.{ .max_state_age_ns = ns_per_s });
     try testing.expectEqual(
         Verdict.reject_stale_timestamp,
-        g.accept(.{ .st_num = 1, .sq_num = 0, .t_ns = t0 }, t0 + 10 * ns_per_s),
+        g.accept(.{ .st_num = 1, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + 10 * ns_per_s),
     );
 }
 
 test "GOOSE: counter wrap is accepted, a rewind is not" {
     var g: GooseGuard = .init(.{});
     const max = std.math.maxInt(u32);
-    _ = g.accept(.{ .st_num = 5, .sq_num = max, .t_ns = t0 }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = max, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     // IEC 61850-8-1 wraps sqNum to 1, not 0.
     try testing.expectEqual(
         Verdict.accept_in_sequence,
-        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 }, t0 + ns_per_ms),
+        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_ms),
     );
     // Strict ordering refuses the same wrap.
     var strict: GooseGuard = .init(.{ .allow_sqnum_wrap = false });
-    _ = strict.accept(.{ .st_num = 5, .sq_num = max, .t_ns = t0 }, t0);
+    _ = strict.accept(.{ .st_num = 5, .sq_num = max, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     try testing.expectEqual(
         Verdict.reject_replay_sequence,
-        strict.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 }, t0 + ns_per_ms),
+        strict.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_ms),
     );
     // A rewind past the halfway point is a replay under both settings.
     var g2: GooseGuard = .init(.{});
-    _ = g2.accept(.{ .st_num = 5, .sq_num = 100, .t_ns = t0 }, t0);
+    _ = g2.accept(.{ .st_num = 5, .sq_num = 100, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     try testing.expectEqual(
         Verdict.reject_replay_sequence,
-        g2.accept(.{ .st_num = 5, .sq_num = 99, .t_ns = t0 }, t0 + ns_per_ms),
+        g2.accept(.{ .st_num = 5, .sq_num = 99, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0 + ns_per_ms),
     );
+}
+
+test "GOOSE: default options refuse day-old captured heartbeats — timeAllowedtoLive bounds the heartbeat path (A1 N3)" {
+    // The audit's scenario: the subscriber saw stNum 5 and its heartbeats with
+    // TAL 2 s, the publisher vanished, and a day later the capture is replayed
+    // bit for bit, so every tag still verifies. Before, all 500 were
+    // `accept_in_sequence` under default options.
+    var g: GooseGuard = .init(.{});
+    const tal: u32 = 2000;
+    try testing.expectEqual(Verdict.accept_first, g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = tal }, t0));
+    try testing.expectEqual(Verdict.accept_in_sequence, g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = tal }, t0 + ns_per_s));
+
+    const day_later = t0 + 86_400 * ns_per_s;
+    var accepted: usize = 0;
+    var sq: u32 = 2;
+    while (sq < 502) : (sq += 1) {
+        // A replayed or forged frame may promise any TAL; the previous frame's promise decides.
+        const late: GooseIdentity = .{ .st_num = 5, .sq_num = sq, .t_ns = t0, .time_allowed_to_live_ms = std.math.maxInt(u32) };
+        if (g.accept(late, day_later + sq).accepted()) accepted += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), accepted);
+    try testing.expectEqual(Verdict.reject_idle_gap, g.check(.{ .st_num = 5, .sq_num = 2, .t_ns = t0, .time_allowed_to_live_ms = tal }, day_later));
+}
+
+test "GOOSE: the TAL boundary, the slack, and the switch that turns the check off" {
+    const tal: u32 = 2000;
+    const first: GooseIdentity = .{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = tal };
+    const next: GooseIdentity = .{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = tal };
+
+    var g: GooseGuard = .init(.{});
+    _ = g.accept(first, t0);
+    try testing.expectEqual(Verdict.accept_in_sequence, g.check(next, t0 + 2000 * ns_per_ms)); // exactly TAL
+    try testing.expectEqual(Verdict.reject_idle_gap, g.check(next, t0 + 2000 * ns_per_ms + 1));
+
+    var s: GooseGuard = .init(.{ .tal_slack_ms = 500 });
+    _ = s.accept(first, t0);
+    try testing.expectEqual(Verdict.accept_in_sequence, s.check(next, t0 + 2500 * ns_per_ms));
+    try testing.expectEqual(Verdict.reject_idle_gap, s.check(next, t0 + 2500 * ns_per_ms + 1));
+
+    // Off: the day-old heartbeat is accepted again — the pre-N3 behaviour.
+    var off: GooseGuard = .init(.{ .enforce_time_allowed_to_live = false });
+    _ = off.accept(first, t0);
+    try testing.expectEqual(Verdict.accept_in_sequence, off.check(next, t0 + 86_400 * ns_per_s));
 }
 
 test "GOOSE: a silent gap forces an explicit resynchronisation" {
     var g: GooseGuard = .init(.{ .max_idle_ns = 5 * ns_per_s });
-    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0);
+    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
     const later = t0 + 60 * ns_per_s;
     try testing.expectEqual(
         Verdict.reject_idle_gap,
-        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0 }, later),
+        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, later),
     );
     g.reset();
     try testing.expectEqual(
         Verdict.accept_first,
-        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = later }, later),
+        g.accept(.{ .st_num = 5, .sq_num = 1, .t_ns = later, .time_allowed_to_live_ms = test_tal_ms }, later),
     );
 }
 
@@ -502,7 +570,7 @@ test "GOOSE: clock-quality bits are ignored by default, matching pre-N4 behavior
     var g: GooseGuard = .init(.{});
     try testing.expectEqual(
         Verdict.accept_first,
-        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .clock_failure = true, .clock_not_synchronized = true }, t0),
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms, .clock_failure = true, .clock_not_synchronized = true }, t0),
     );
 }
 
@@ -513,23 +581,23 @@ test "GOOSE: require_synchronised rejects a publisher reporting clock trouble, s
     // the entire freshness argument in this file rests on `t`.
     try testing.expectEqual(
         Verdict.reject_not_synchronised,
-        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .clock_failure = true }, t0),
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms, .clock_failure = true }, t0),
     );
     try testing.expectEqual(
         Verdict.reject_not_synchronised,
-        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .clock_not_synchronized = true }, t0),
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms, .clock_not_synchronized = true }, t0),
     );
     // A healthy clock still gets through.
     try testing.expectEqual(
         Verdict.accept_first,
-        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0),
+        g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0),
     );
 }
 
 test "GOOSE: check is pure — repeated calls never change the verdict" {
     var g: GooseGuard = .init(.{});
-    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0 }, t0);
-    const id: GooseIdentity = .{ .st_num = 5, .sq_num = 1, .t_ns = t0 };
+    _ = g.accept(.{ .st_num = 5, .sq_num = 0, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms }, t0);
+    const id: GooseIdentity = .{ .st_num = 5, .sq_num = 1, .t_ns = t0, .time_allowed_to_live_ms = test_tal_ms };
     for (0..5) |_| try testing.expectEqual(Verdict.accept_in_sequence, g.check(id, t0 + ns_per_s));
     try testing.expectEqual(@as(u32, 0), g.state.?.sq_num);
     _ = g.accept(id, t0 + ns_per_s);
@@ -644,6 +712,7 @@ fn fuzzGoose(_: void, smith: *std.testing.Smith) !void {
             .st_num = drawBelow(smith, 9),
             .sq_num = drawBelow(smith, 9),
             .t_ns = now -| drawBelow(smith, 1001),
+            .time_allowed_to_live_ms = test_tal_ms,
         };
         const before = g.state;
         const v = g.accept(id, now);

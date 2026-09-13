@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BREAKING:** A1 finding N3. `replay.GooseIdentity` gains the required
+  `time_allowed_to_live_ms`, and `GooseGuard` now rejects a frame arriving later than the
+  previous accepted frame's `timeAllowedtoLive` (`reject_idle_gap`) — the heartbeat path had no
+  time bound under default options (`max_idle_ns = 0`), and 500 of 500 day-old captured
+  heartbeats were accepted. New `GooseOptions.enforce_time_allowed_to_live` (default `true`) and
+  `tal_slack_ms` (default 0), mirroring `iec61850.subscriber`'s TAL rule; `max_idle_ns` stays as
+  an extra cap.
+
 - **2026-09-13** — A1 finding N1 (cross-module, fixed in `iec61850` in the same commit). The
   sibling's GOOSE decoder silently accepted a frame this module secured and dropped the
   extension. New `src/iec61850_seam_test.zig` runs `iec61850.goose.Frame.decode`/

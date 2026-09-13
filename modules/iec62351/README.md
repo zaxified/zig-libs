@@ -176,6 +176,7 @@ const verdict = guard.accept(.{
     .st_num = pdu.st_num,
     .sq_num = pdu.sq_num,
     .t_ns   = t_ns_from_utc_time(pdu.t), // your own UtcTime -> u64 ns conversion; see below
+    .time_allowed_to_live_ms = pdu.time_allowed_to_live_ms, // bounds the heartbeat path
 }, now_ns);            // <- you supply the clock
 
 if (!verdict.accepted()) {
@@ -191,6 +192,12 @@ Two behaviours worth knowing before you tune the options: GOOSE `t` is the
 time of the last *state change*, so its age is only checked when `stNum`
 advances (a heartbeat legitimately carries an hour-old `t`); and both counters
 wrap, so ordering uses RFC 1982 serial arithmetic unless you turn that off.
+What bounds the heartbeat path instead is `timeAllowedtoLive`:
+`GooseIdentity.time_allowed_to_live_ms` is required, and a frame arriving later
+than the PREVIOUS accepted frame's TAL (plus `GooseOptions.tal_slack_ms`) is
+`reject_idle_gap` — so a day-old capture replayed bit for bit is refused.
+`enforce_time_allowed_to_live = false` turns that off; `max_idle_ns` is an
+extra fixed cap on top.
 
 ## IEC 62351-4 — MMS/ACSE authentication
 
@@ -305,6 +312,7 @@ if (!guard.accept(.{
     .st_num = pdu.st_num,
     .sq_num = pdu.sq_num,
     .t_ns = t_ns,
+    .time_allowed_to_live_ms = pdu.time_allowed_to_live_ms,
     // `UtcTime`'s own quality bits, straight through to `GooseOptions.require_synchronised`.
     .clock_failure = pdu.t.clock_failure,
     .clock_not_synchronized = pdu.t.clock_not_synchronized,
