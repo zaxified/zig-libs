@@ -22,9 +22,10 @@ the design and the nonce/AAD byte layouts.
 **CoAP-agnostic by design**: this module has no build dependency on the
 sibling `coap` module and never parses or builds a CoAP message itself —
 `protect`/`unprotect` operate on the RFC 8613 §5.3 plaintext and §5.4
-options as opaque caller-supplied bytes. The intended integration is
-`coap` (RFC 7252 message codec, already in this repository) assembling
-those bytes and calling into `oscore` as its object-security layer.
+options as opaque caller-supplied bytes. Nothing in this repository calls
+it yet — in particular the sibling `coap` codec does not depend on `oscore`
+— so extracting those bytes from a CoAP message and calling `protect`/
+`unprotect` is the caller's integration to write.
 
 | File | Contents |
 |---|---|

@@ -37,11 +37,11 @@ it is anchored.
 - **CoAP-agnostic by design**: `meta.deps = .{}` — no build dependency on
   the sibling `coap` module, and `protect`/`unprotect` never parse or
   build a CoAP message themselves. They operate on the §5.3 "plaintext"
-  and §5.4 "options" as opaque caller-supplied byte strings. The intended
-  integration is `coap` (RFC 7252 message codec, already in this
-  repository) assembling those byte strings and wiring `oscore` in as its
-  object-security layer — deliberately NOT built in this pass, to keep
-  the crypto core testable and reviewable in isolation.
+  and §5.4 "options" as opaque caller-supplied byte strings. **No module
+  in this repository calls it** — the sibling `coap` codec does not depend
+  on `oscore`, and no seam between the two is built (A1 F16, 2026-09-13:
+  the earlier wording promised that integration as if it existed). A
+  consumer writes that wiring itself.
 - **Exchange tracking is the caller's job**: matching a response back to
   the request that generated it (needed for §5.2's "reuse the request's
   nonce" majority case) is NOT this module's concern — `unprotect`'s
@@ -199,8 +199,8 @@ always correct.
 
 - **This module supplies no transport, no exchange tracking, and no CoAP
   parsing.** It is a pure crypto/codec core over caller-supplied byte
-  strings; a consumer (the sibling `coap` module, or any other CoAP
-  stack) is responsible for extracting the §5.3 plaintext and §5.4
+  strings; a consumer (a CoAP stack — the sibling `coap` module does not
+  do this today) is responsible for extracting the §5.3 plaintext and §5.4
   options from a real CoAP message, tracking which response belongs to
   which request, and calling `protect`/`unprotect` with the right
   parameters. A caller that gets the request/response nonce-reuse

@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **Documentation only.** A1 finding F16: `README.md` and `SPEC.md` described
+  the `coap` → `oscore` integration as the intended wiring "already in this repository". No
+  module depends on `oscore` and no such seam exists; both now say so and leave the wiring to
+  the consumer.
+
 - **2026-09-11** — **API CHANGE:** `buildAad` takes a caller-supplied
   `dst: []u8` buffer instead of an `allocator`, and returns
   `error.BufferTooSmall` rather than an `Allocator.Error` (audit finding
