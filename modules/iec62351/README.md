@@ -15,6 +15,15 @@ this module secures them; **neither depends on the other**. A capture from
 Wireshark, a frame from a vendor stack and a PDU from `iec61850` all go through
 the same entry points.
 
+On the receive side, authenticate first: `iec61850.goose.Frame.decode` refuses
+a frame carrying a security extension (`error.SecurityExtensionPresent`), and
+`Frame.decodeSecured` hands back `pdu` and `extension` separately for a caller
+that runs `goose.verify` on the same octets before trusting the PDU. A
+subscriber that requires authentication must also refuse a frame whose
+extension is missing — stripping it is the obvious attack. The seam is tested
+against the sibling's real decoder (`src/iec61850_seam_test.zig`, a test-only
+dependency).
+
 Provenance: clean-room from public descriptions of IEC 62351-3/-4/-6, whose
 text is paywalled — `SPEC.md` states field by field what is grounded and what
 is modelled. Primitives come from `std.crypto` (HMAC-SHA-256, AES-GCM/GMAC,

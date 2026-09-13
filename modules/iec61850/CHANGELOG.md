@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 finding `iec62351` N1 (cross-module, one commit with
+  `iec62351`). `goose.Frame.decode` took `Length - 8` octets as the PDU, so a frame secured under
+  IEC 62351-6 decoded with the security extension glued onto the PDU, and `Pdu.decode` — which did
+  not require exact consumption — returned its stNum/sqNum with no sign that authentication
+  existed. The PDU now ends at its own BER length; `Frame.decode` refuses trailing octets inside
+  `Length` with `error.SecurityExtensionPresent`, the new `Frame.decodeSecured` returns them as
+  `Frame.extension`, and `Pdu.decode` refuses octets after the element (`error.TrailingOctets`).
+
 - **2026-09-10** — ⛔⛔ **`Server.associated` was a bare `bool` shared by every
   multiplexed peer, so a peer that had sent no `CR`, no CONNECT SPDU and no
   AARQ reached `handleMms` the instant its first frame arrived, as long as

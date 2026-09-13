@@ -155,7 +155,11 @@ for the ride.
   the BER PDU (`gocbRef`, `timeAllowedtoLive`, `datSet`, `goID`, `t`, `stNum`,
   `sqNum`, `test`, `confRev`, `ndsCom`, `numDatSetEntries`, `allData`). The
   `Length` field counts from the APPID, so Ethernet padding is ignored rather
-  than parsed; `numDatSetEntries` **must** agree with `allData`.
+  than parsed; `numDatSetEntries` **must** agree with `allData`. The PDU ends
+  where its own BER length says: octets `Length` covers after it are an IEC
+  62351-6 security extension, which `Frame.decode` refuses
+  (`error.SecurityExtensionPresent`) and `Frame.decodeSecured` returns as
+  `extension` — verify it with `iec62351` before trusting `pdu`.
 - **`publisher`** — the retransmission engine: on a state change `stNum`
   increments, `sqNum` resets, and the frame goes out immediately, then again on
   a **backoff ladder** (4, 8, 16 … up to a 1 s heartbeat), with

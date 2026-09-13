@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — A1 finding N1 (cross-module, fixed in `iec61850` in the same commit). The
+  sibling's GOOSE decoder silently accepted a frame this module secured and dropped the
+  extension. New `src/iec61850_seam_test.zig` runs `iec61850.goose.Frame.decode`/
+  `decodeSecured`/`Pdu.decode` on a frame built by `goose.build` (`iec61850` added as a
+  test-only dependency). README states the receive-side order.
+
 - **2026-09-10** — A1 fix campaign, audit findings N2/N4/N5/N6/N7/N8/N9/N10/N11 (0 consumers in the repo, `DECISIONS.md` P1/P4).
   - **N2 (HIGH): BEHAVIOURAL, not breaking.** `SessionDescription`'s four most consequential booleans (`secure_renegotiation`, `mutual_authentication`, `chain_validated`, `revocation_checked`) no longer default to `true` — they are now required fields. A minimal construction used to silently claim all four; now the compiler requires an explicit answer, every time.
   - **N4 (MEDIUM):** `GooseIdentity` gains `clock_failure`/`clock_not_synchronized` (default `false`, matching pre-existing behavior) and `GooseOptions` gains `require_synchronised` (default `false`), symmetric to `SvOptions.require_synchronised`. Off by default: **NO CONSUMER-VISIBLE CHANGE** unless a caller opts in.

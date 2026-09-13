@@ -104,4 +104,5 @@ test {
     _ = @import("test_keys.zig");
     _ = @import("vectors_test.zig");
     _ = @import("goose_capture_test.zig");
+    _ = @import("iec61850_seam_test.zig");
 }

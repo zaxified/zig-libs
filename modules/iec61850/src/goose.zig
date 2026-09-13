@@ -25,6 +25,12 @@
 //!   it is the publisher promising the next frame within that many
 //!   milliseconds. A subscriber that ignores it cannot tell a healthy quiet
 //!   publisher from a dead one.
+//! * **Under IEC 62351-6, `Length` also covers a security extension after the
+//!   PDU.** The PDU's own BER length is therefore what says where it ends.
+//!   `Frame.decode` refuses a frame with such trailing octets
+//!   (`error.SecurityExtensionPresent`) because this module cannot verify
+//!   them; `Frame.decodeSecured` splits `pdu` from `extension` for a caller
+//!   that authenticates with the sibling `iec62351` first (A1 `iec62351` N1).
 
 const std = @import("std");
 const ber = @import("ber.zig");
@@ -52,6 +58,13 @@ pub const Error = mmsdata.Error || error{
     /// last-wins, a subscriber and any first-wins peer/IDS disagree on
     /// `stNum`/`sqNum` — the replay-detection fields — from the same bytes.
     DuplicateField,
+    /// `Length` covers octets after the end of `goosePdu` — the shape of an
+    /// IEC 62351-6 security extension. `Frame.decode` cannot verify it, so it
+    /// refuses rather than hand back a PDU whose authentication nobody
+    /// checked; `Frame.decodeSecured` returns the two parts separately.
+    SecurityExtensionPresent,
+    /// `Pdu.decode` was given octets after the `goosePdu` element.
+    TrailingOctets,
 };
 
 pub const ether_type: u16 = 0x88B8;
@@ -98,12 +111,31 @@ pub const Frame = struct {
     appid: u16,
     reserved1: u16 = 0,
     reserved2: u16 = 0,
-    /// The BER-encoded `goosePdu`, exactly `Length - 8` octets.
+    /// The BER-encoded `goosePdu`, exactly the element's own length.
     pdu: []const u8,
+    /// Octets `Length` covers after `pdu` — an IEC 62351-6 security
+    /// extension. Always empty from `decode`; only `decodeSecured` fills it.
+    extension: []const u8 = &.{},
     /// Octets the frame occupied, excluding any Ethernet padding beyond it.
     total_len: usize,
 
+    /// Decodes a plain IEC 61850-8-1 frame. A frame whose `Length` covers
+    /// octets after the PDU is `error.SecurityExtensionPresent`.
     pub fn decode(bytes: []const u8) Error!Frame {
+        return decodeImpl(bytes, false);
+    }
+
+    /// `decode` for a frame that may carry an IEC 62351-6 security extension:
+    /// `pdu` is exactly the `goosePdu` element and the octets after it are
+    /// `extension`. Nothing here verifies them — authenticate the same octets
+    /// with `iec62351.goose.verify` before trusting `pdu`. An attacker can also
+    /// strip the extension and fix `Length`, so a subscriber that requires
+    /// authentication must refuse an EMPTY `extension` too.
+    pub fn decodeSecured(bytes: []const u8) Error!Frame {
+        return decodeImpl(bytes, true);
+    }
+
+    fn decodeImpl(bytes: []const u8, allow_extension: bool) Error!Frame {
         if (bytes.len < 14) return error.ShortFrame;
         var f = Frame{
             .dst = bytes[0..6].*,
@@ -132,7 +164,15 @@ pub const Frame = struct {
         // Trailing octets are Ethernet padding and are ignored; too few is a
         // truncated or lying frame.
         if (bytes.len < off + header_len + pdu_len) return error.LengthMismatch;
-        f.pdu = bytes[off + header_len ..][0..pdu_len];
+        const payload = bytes[off + header_len ..][0..pdu_len];
+        // `Length` counted the PDU and, under IEC 62351-6, a security extension
+        // after it. It used to be taken as the PDU whole, so an authenticated
+        // frame decoded with the extension glued onto the PDU and its stNum/
+        // sqNum were read without a word about authentication (A1 iec62351 N1).
+        const apdu_len = (try ber.decode(payload)).total_len;
+        f.pdu = payload[0..apdu_len];
+        f.extension = payload[apdu_len..];
+        if (f.extension.len != 0 and !allow_extension) return error.SecurityExtensionPresent;
         f.total_len = off + header_len + pdu_len;
         return f;
     }
@@ -214,6 +254,8 @@ pub const Pdu = struct {
 
     pub fn decode(bytes: []const u8) Error!Pdu {
         const outer = try ber.expect(bytes, tag_goose_pdu);
+        // Exactly one element: octets after it are not part of this PDU.
+        if (outer.total_len != bytes.len) return error.TrailingOctets;
         var p = Pdu{
             .gocb_ref = &.{},
             .time_allowed_to_live_ms = 0,
@@ -465,6 +507,32 @@ test "Ethernet padding past the announced length is ignored, not parsed" {
     _ = try Pdu.decode(f.pdu);
 }
 
+test "a frame whose Length covers an IEC 62351-6 extension is refused by decode and split by decodeSecured" {
+    var buf: [512]u8 = undefined;
+    const plain = try Frame.decode(unhex(captured_frame_hex, &buf));
+    // The same PDU followed by 31 extension octets, `Length` covering both —
+    // the shape `iec62351.goose.build` puts on the wire.
+    var body: [512]u8 = undefined;
+    @memcpy(body[0..plain.pdu.len], plain.pdu);
+    const ext = [_]u8{ 0x30, 0x1d } ++ [_]u8{0xaa} ** 29;
+    @memcpy(body[plain.pdu.len..][0..ext.len], &ext);
+    const pdu_and_ext = body[0 .. plain.pdu.len + ext.len];
+    var fbuf: [600]u8 = undefined;
+    const secured = try plain.encode(pdu_and_ext, &fbuf);
+
+    try testing.expectError(error.SecurityExtensionPresent, Frame.decode(secured));
+    const f = try Frame.decodeSecured(secured);
+    try testing.expectEqualSlices(u8, plain.pdu, f.pdu);
+    try testing.expectEqualSlices(u8, &ext, f.extension);
+    try testing.expectEqual(secured.len, f.total_len);
+    _ = try Pdu.decode(f.pdu);
+    // The old reading — PDU and extension as one slice — the PDU decoder refuses too.
+    try testing.expectError(error.TrailingOctets, Pdu.decode(pdu_and_ext));
+    // Positive control: a plain frame has no extension from either entry point.
+    var buf2: [512]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), (try Frame.decodeSecured(unhex(captured_frame_hex, &buf2))).extension.len);
+}
+
 test "a Length field that disagrees with the frame is refused" {
     var buf: [512]u8 = undefined;
     const bytes = unhex(captured_frame_hex, &buf);
@@ -476,10 +544,11 @@ test "a Length field that disagrees with the frame is refused" {
     bytes[16] = 0;
     bytes[17] = 4;
     try testing.expectError(error.LengthMismatch, Frame.decode(bytes));
-    // A Length shorter than the PDU truncates it, and BER then refuses.
+    // A Length shorter than the PDU truncates it, and BER refuses. Since the
+    // PDU's end is read from its own BER length (A1 iec62351 N1), that refusal
+    // comes from `Frame.decode` itself rather than from a later `Pdu.decode`.
     bytes[17] = 20;
-    const f = try Frame.decode(bytes);
-    try testing.expectError(error.Overrun, Pdu.decode(f.pdu));
+    try testing.expectError(error.Overrun, Frame.decode(bytes));
 }
 
 test "an allData count contradicting the entries is refused" {
