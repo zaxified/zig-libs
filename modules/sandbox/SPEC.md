@@ -56,7 +56,7 @@ citation lives here:
   valid on any arch — and a test names its content (and, on x86-64, that exactly one spelling is
   dropped), because that filter also swallows a misspelling silently: syscall 262 is `newfstatat` in
   some tables and `fstatat64` in std's x86-64 table, and only the former was listed, so C code's
-  `stat(2)` died of SIGSYS under a list whose author had allowed it. Audit S11 (2026-09-13): 12
+  `stat(2)` died of SIGSYS under a list whose author had allowed it. Audit S11 (2026-09-14): 12
   calls a runtime makes unasked were added (`rseq`, `set_robust_list`, `getdents64`, `epoll_pwait2`,
   `clock_getres`, `sched_getaffinity`, `getrusage`, `uname`, `sysinfo`, `close_range`, `faccessat2`,
   `rt_sigtimedwait`), each checked to touch only the caller's own state, an fd it holds, or

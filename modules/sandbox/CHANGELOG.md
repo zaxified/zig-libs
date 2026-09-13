@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-13** — **BEHAVIOURAL (allows more):** audit S11, by the owner's decision to extend
+- **2026-09-14** — **BEHAVIOURAL (allows more):** audit S11, by the owner's decision to extend
   `seccomp.default_allowlist`. A process under the default filter died of SIGSYS on calls its libc
   or runtime makes unasked. Added, each checked to grant nothing beyond the process's own state or
   an fd it already holds: `rseq`, `set_robust_list`, `getdents64`, `epoll_pwait2`, `clock_getres`,
