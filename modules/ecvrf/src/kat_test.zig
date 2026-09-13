@@ -70,7 +70,6 @@ test "KAT: SK -> PK (publicKey) matches RFC 9381 Appendix B.3 for every example"
 }
 
 test "KAT: encodeToCurve(PK, alpha) -> H matches RFC 9381 Appendix B.3, including the published ctr" {
-    const Edwards25519 = std.crypto.ecc.Edwards25519;
     const Sha512 = std.crypto.hash.sha2.Sha512;
     const gpa = std.testing.allocator;
     for (v.vectors) |vec| {
@@ -96,7 +95,7 @@ test "KAT: encodeToCurve(PK, alpha) -> H matches RFC 9381 Appendix B.3, includin
             st.update(&[_]u8{0x00});
             var hash_string: [64]u8 = undefined;
             st.final(&hash_string);
-            const candidate = Edwards25519.fromBytes(hash_string[0..32].*) catch continue;
+            const candidate = ecvrf.stringToPoint(hash_string[0..32].*) catch continue;
             try std.testing.expectError(error.IdentityElement, candidate.clearCofactor().rejectIdentity());
         }
         {
@@ -109,7 +108,7 @@ test "KAT: encodeToCurve(PK, alpha) -> H matches RFC 9381 Appendix B.3, includin
             st.update(&[_]u8{0x00});
             var hash_string: [64]u8 = undefined;
             st.final(&hash_string);
-            const candidate = try Edwards25519.fromBytes(hash_string[0..32].*);
+            const candidate = try ecvrf.stringToPoint(hash_string[0..32].*);
             const h_point = candidate.clearCofactor();
             try h_point.rejectIdentity();
             try std.testing.expectEqualSlices(u8, &want_h, &h_point.toBytes());
@@ -339,6 +338,92 @@ test "negative: decodeProof rejects a Gamma that is not a valid point encoding; 
     try std.testing.expectError(error.InvalidProof, ecvrf.decodeProof(pi));
     try std.testing.expectError(error.InvalidProof, ecvrf.proofToHash(pi));
     try std.testing.expectError(error.InvalidProof, ecvrf.verify(pk, alpha, pi));
+}
+
+/// `y + p` for a small `y`: the second, non-canonical 32-byte string for
+/// the point whose canonical encoding has `y` in its low byte and zeros
+/// above (only `y < 19` has one, since `y + p < 2^255`).
+fn plusP(y: u8, sign: u1) [32]u8 {
+    var out = [_]u8{0xff} ** 32;
+    out[0] = 0xed + y;
+    out[31] = 0x7f | (@as(u8, sign) << 7);
+    return out;
+}
+
+test "negative: RFC 8032 §5.1.3 strict decoding refuses a non-canonical Gamma, and a canonical one still decodes (E14)" {
+    const vec = v.vectors[0];
+    const pk = try hex32(vec.pk);
+    const alpha = "";
+    var pi = try hex80(vec.pi);
+
+    // Control: the identity, canonically encoded, IS a valid Gamma encoding
+    // (decode_proof does not ask for a low-order check), so a rejection
+    // below is about the bytes, not the point.
+    const identity = [_]u8{1} ++ [_]u8{0} ** 31;
+    pi[0..32].* = identity;
+    _ = try ecvrf.decodeProof(pi);
+
+    // The same point spelled `y = p + 1`: std's `fromBytes` reduces it to 1.
+    pi[0..32].* = plusP(1, 0);
+    try std.testing.expect(if (std.crypto.ecc.Edwards25519.fromBytes(pi[0..32].*)) |_| true else |_| false);
+    try std.testing.expectError(error.InvalidProof, ecvrf.decodeProof(pi));
+    try std.testing.expectError(error.InvalidProof, ecvrf.proofToHash(pi));
+    try std.testing.expectError(error.InvalidProof, ecvrf.verify(pk, alpha, pi));
+
+    // The same point with its sign bit set, although x = 0.
+    var signed = identity;
+    signed[31] = 0x80;
+    pi[0..32].* = signed;
+    try std.testing.expect(if (std.crypto.ecc.Edwards25519.fromBytes(signed)) |_| true else |_| false);
+    try std.testing.expectError(error.InvalidProof, ecvrf.decodeProof(pi));
+    try std.testing.expectError(error.InvalidEncoding, ecvrf.stringToPoint(signed));
+}
+
+test "negative: a public key spelled y + p is refused although std decodes it to a valid, prime-order key (E16)" {
+    const Edwards25519 = std.crypto.ecc.Edwards25519;
+    // A point with a small canonical `y` that is not low-order: the only
+    // kind with a non-canonical twin, found by search rather than assumed.
+    var found: ?u8 = null;
+    var y: u8 = 2;
+    while (y < 19) : (y += 1) {
+        var canon = [_]u8{0} ** 32;
+        canon[0] = y;
+        const p = Edwards25519.fromBytes(canon) catch continue;
+        p.clearCofactor().rejectIdentity() catch continue;
+        found = y;
+        break;
+    }
+    const small_y = found orelse return error.NoSmallYKeyFound;
+    var canon = [_]u8{0} ** 32;
+    canon[0] = small_y;
+
+    _ = try ecvrf.validateKey(canon); // control: the canonical spelling is a valid key
+    const twin = plusP(small_y, 0);
+    const std_point = try Edwards25519.fromBytes(twin); // std takes the twin …
+    try std.testing.expectEqualSlices(u8, &canon, &std_point.toBytes()); // … as the same point
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.validateKey(twin));
+    try std.testing.expectError(error.InvalidPublicKey, ecvrf.verify(twin, "", try hex80(v.vectors[0].pi)));
+}
+
+test "KeyPair: public key and proofs match publicKey/prove byte for byte on every RFC 9381 vector (E10)" {
+    const gpa = std.testing.allocator;
+    for (v.vectors) |vec| {
+        const sk = try hex32(vec.sk);
+        const alpha = try hexAlloc(gpa, vec.alpha);
+        defer gpa.free(alpha);
+        const kp = ecvrf.KeyPair.fromSecretKey(sk);
+        try std.testing.expectEqualSlices(u8, &(try hex32(vec.pk)), &kp.public_key);
+        try std.testing.expectEqualSlices(u8, &(try hex80(vec.pi)), &kp.prove(alpha));
+    }
+}
+
+test "KeyPair: a public_key filled in by hand makes proofs no key verifies (E10)" {
+    const a = ecvrf.KeyPair.fromSecretKey(try hex32(v.vectors[0].sk));
+    const b = ecvrf.KeyPair.fromSecretKey(try hex32(v.vectors[1].sk));
+    const lying: ecvrf.KeyPair = .{ .secret_key = a.secret_key, .public_key = b.public_key };
+    const pi = lying.prove("input");
+    try std.testing.expectError(error.InvalidProof, ecvrf.verify(a.public_key, "input", pi));
+    try std.testing.expectError(error.InvalidProof, ecvrf.verify(b.public_key, "input", pi));
 }
 
 test "negative: decodeProof rejects non-canonical s (s >= group order)" {

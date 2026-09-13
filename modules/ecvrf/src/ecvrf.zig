@@ -55,12 +55,12 @@
 //! caller's `PublicKey` bytes to a point, then re-encodes
 //! (`y_point.toBytes()`) before using it as `encode_to_curve_salt` AND as
 //! `ECVRF_challenge_generation`'s `P1` — matching what `prove` does with
-//! its freshly-derived `Y = x*B`. For every canonically-encoded public
-//! key (the only kind `ECVRF_validate_key`/`Edwards25519.fromBytes`
-//! accept as VALID in the first place) this is a no-op, so it does not
-//! affect any KAT vector; it only matters for the theoretical edge case
-//! of a non-canonical-but-decodable input, where re-encoding is the
-//! spec-faithful choice over trusting the caller's raw bytes.
+//! its freshly-derived `Y = x*B`. The same holds for `Gamma` (A1 E14).
+//! Because `string_to_point` decodes strictly (`stringToPoint`, RFC 8032
+//! §5.1.3 — `Edwards25519.fromBytes` alone would take a non-canonical `y`
+//! or a stray sign bit), a non-canonical key or `Gamma` is rejected before
+//! it gets here, so the re-encoding is always the caller's own bytes and
+//! neither a key nor a proof has a second valid spelling (A1 E16).
 //!
 //! **`ECVRF_challenge_generation` hashes FIVE points, not four** — a
 //! detail easy to miss skimming the surrounding prose: `ECVRF_
@@ -179,7 +179,12 @@ const ExpandedSecretKey = struct { x: [32]u8, prefix: [32]u8 };
 
 fn expandSecretKey(sk: SecretKey) ExpandedSecretKey {
     var h: [64]u8 = undefined;
-    Sha512.hash(&sk, &h, .{});
+    // Not `Sha512.hash`: its state keeps `sk` in the block buffer on a frame
+    // nothing wipes. Hashing through a local state lets us wipe it (A1 E4).
+    var st = Sha512.init(.{});
+    st.update(&sk);
+    st.final(&h);
+    std.crypto.secureZero(u8, std.mem.asBytes(&st));
     defer std.crypto.secureZero(u8, &h);
     var x: [32]u8 = h[0..32].*;
     scalar.clamp(&x);
@@ -233,7 +238,8 @@ pub fn encodeToCurve(pk_string: PublicKey, alpha_string: []const u8) PublicKey {
         var hash_string: [64]u8 = undefined;
         st.final(&hash_string);
 
-        const candidate = Edwards25519.fromBytes(hash_string[0..32].*) catch continue;
+        // interpret_hash_value_as_a_point = string_to_point (§5.5), strict.
+        const candidate = stringToPoint(hash_string[0..32].*) catch continue;
         const h = candidate.clearCofactor(); // cofactor = 8 for edwards25519
         h.rejectIdentity() catch continue;
         return h.toBytes();
@@ -247,11 +253,24 @@ pub fn encodeToCurve(pk_string: PublicKey, alpha_string: []const u8) PublicKey {
 /// q") — exposed separately from `nonceGeneration` so callers/tests can
 /// pin it against RFC 9381 Appendix B.3's published `k_string` values.
 pub fn nonceGenerationString(sk: SecretKey, h_string: PublicKey) [64]u8 {
+    return nonceStringFrom(&sk, h_string);
+}
+
+/// `nonceGenerationString` over a borrowed seed, so `prove` does not hand
+/// its caller's secret over by value once more (A1 E4).
+fn nonceStringFrom(sk: *const SecretKey, h_string: PublicKey) [64]u8 {
     var hashed_sk: [64]u8 = undefined;
-    Sha512.hash(&sk, &hashed_sk, .{});
+    // Local hash states, wiped after use: each holds secret input in its
+    // block buffer (`sk`, then the prefix), which `Sha512.hash` would leave
+    // on a dead frame (A1 E4).
+    var sk_st = Sha512.init(.{});
+    sk_st.update(sk);
+    sk_st.final(&hashed_sk);
+    std.crypto.secureZero(u8, std.mem.asBytes(&sk_st));
     defer std.crypto.secureZero(u8, &hashed_sk);
 
     var st = Sha512.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&st));
     st.update(hashed_sk[32..64]); // truncated_hashed_sk_string
     st.update(&h_string);
     var k_string: [64]u8 = undefined;
@@ -298,9 +317,26 @@ fn padChallenge(c: [c_len]u8) scalar.CompressedScalar {
     return out;
 }
 
+/// RFC 9381 §5.5 `string_to_point`, which is RFC 8032 §5.1.3 decoding —
+/// strictly. `Edwards25519.fromBytes` accepts two things §5.1.3 refuses,
+/// each a second 32-byte string for a point that already has one: a `y` in
+/// `[p, 2^255)`, which it reduces mod `p` ("If the resulting value is >= p,
+/// decoding fails"), and sign bit 1 on a point whose `x` is 0 ("If x = 0,
+/// and x_0 = 1, decoding fails"). A1 E14/E16: with both refused, every
+/// point this module decodes re-encodes to the very bytes it came from, so
+/// `point_to_string(Gamma)` and `PK_string` are the caller's bytes and no
+/// proof or key has a second spelling.
+pub fn stringToPoint(s: [32]u8) error{InvalidEncoding}!Edwards25519 {
+    Edwards25519.rejectNonCanonical(s) catch return error.InvalidEncoding;
+    const p = Edwards25519.fromBytes(s) catch return error.InvalidEncoding;
+    if (s[31] >> 7 == 1 and p.x.isZero()) return error.InvalidEncoding;
+    return p;
+}
+
 /// RFC 9381 §5.4.4 `ECVRF_decode_proof`: split `pi_string` into `(Gamma,
 /// c, s)` and reject a structurally invalid proof — `Gamma` not a valid
-/// curve-point encoding, or `s >= q` (non-canonical scalar). Does NOT
+/// curve-point encoding under RFC 8032 §5.1.3's strict rules (see
+/// `stringToPoint`), or `s >= q` (non-canonical scalar). Does NOT
 /// reject a `Gamma` in a low-order subgroup (the RFC does not ask for
 /// that check here; `ECVRF_verify`'s challenge comparison is what makes
 /// a forged low-order `Gamma` fail in practice).
@@ -310,7 +346,7 @@ pub fn decodeProof(pi: Proof) Error!DecodedProof {
     const gamma_string = pi[0..pt_len].*;
     const c = pi[pt_len..][0..c_len].*;
     const s = pi[pt_len + c_len ..][0..q_len].*;
-    _ = Edwards25519.fromBytes(gamma_string) catch return error.InvalidProof;
+    _ = stringToPoint(gamma_string) catch return error.InvalidProof;
     scalar.rejectNonCanonical(s) catch return error.InvalidProof;
     return .{ .gamma = gamma_string, .c = c, .s = s };
 }
@@ -323,14 +359,15 @@ pub fn decodeProof(pi: Proof) Error!DecodedProof {
 /// permits substituting). Returns the decoded point on success so
 /// callers do not need to re-decode `PK_string`.
 pub fn validateKey(pk_string: PublicKey) Error!Edwards25519 {
-    const y = Edwards25519.fromBytes(pk_string) catch return error.InvalidPublicKey;
+    const y = stringToPoint(pk_string) catch return error.InvalidPublicKey;
     y.clearCofactor().rejectIdentity() catch return error.InvalidPublicKey;
     return y;
 }
 
 /// RFC 9381 §5.1 `ECVRF_prove(SK, alpha_string)`. `encode_to_curve_salt`
 /// is not passed separately — this ciphersuite fixes it to `PK_string`
-/// (§5.5), derived internally from `SK`.
+/// (§5.5), derived internally from `SK`. A caller proving many inputs
+/// under one key should use `KeyPair.prove`, which does not recompute `Y`.
 pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
     var exp = expandSecretKey(sk);
     defer std.crypto.secureZero(u8, &exp.x);
@@ -339,9 +376,39 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
     // Step 1: x, Y = x*B. `ct25519.mulBase` (constant-time, no error union)
     // — `x` is the VRF secret scalar; see the module doc comment for why
     // std's `mul` is not usable on a secret here.
-    const y_point = ct25519.mulBase(exp.x);
-    const y_string = y_point.toBytes();
+    return proveExpanded(&sk, &exp, ct25519.mulBase(exp.x).toBytes(), alpha_string);
+}
 
+/// A secret key with its public key derived once (A1 E10). `prove` spends
+/// about a fifth of its time recomputing `Y = x*B` (measured 21.4 %); a
+/// `KeyPair` pays that in `fromSecretKey` and proves without it.
+///
+/// Build it with `fromSecretKey`, never by filling the fields: a
+/// `public_key` that is not `publicKey(secret_key)` makes every proof one
+/// that no key verifies (the challenge binds the wrong `Y`, so `U = s*B -
+/// c*Y` misses), a safe failure but a useless one. `secret_key` is the
+/// caller's secret; wipe the `KeyPair` when done with it.
+pub const KeyPair = struct {
+    secret_key: SecretKey,
+    public_key: PublicKey,
+
+    pub fn fromSecretKey(sk: SecretKey) KeyPair {
+        return .{ .secret_key = sk, .public_key = publicKey(sk) };
+    }
+
+    /// `ECVRF_prove` under this key pair; the same 80 bytes `prove` returns.
+    pub fn prove(kp: *const KeyPair, alpha_string: []const u8) Proof {
+        var exp = expandSecretKey(kp.secret_key);
+        defer std.crypto.secureZero(u8, &exp.x);
+        defer std.crypto.secureZero(u8, &exp.prefix);
+        return proveExpanded(&kp.secret_key, &exp, kp.public_key, alpha_string);
+    }
+};
+
+/// `ECVRF_prove` steps 2-8, given step 1's `x` and `PK_string`. `sk` and
+/// `exp` come by pointer: passed by value, `sk` left one more copy of the
+/// seed on the dead stack (measured by `zeroize_probe_test.zig`, A1 E4).
+fn proveExpanded(sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: PublicKey, alpha_string: []const u8) Proof {
     // Step 2-3: H = encode_to_curve(PK_string, alpha), h_string = point_to_string(H).
     const h_string = encodeToCurve(y_string, alpha_string);
     // encode_to_curve always returns a canonical toBytes() encoding of a
@@ -358,7 +425,9 @@ pub fn prove(sk: SecretKey, alpha_string: []const u8) Proof {
     const gamma_string = gamma_point.toBytes();
 
     // Step 5: k = nonce_generation(SK, h_string).
-    var k = nonceGeneration(sk, h_string);
+    var k_string = nonceStringFrom(sk, h_string);
+    defer std.crypto.secureZero(u8, &k_string);
+    var k = scalar.reduce64(k_string);
     // A1 E4: the secret nonce was never zeroed — unlike `exp.x`/`exp.prefix`
     // just above, nothing wiped this function's own copy of `k` once it was
     // no longer needed. `s = k + c*x mod q` makes a leaked `k` equivalent to
@@ -455,8 +524,10 @@ pub fn verify(pk_string: PublicKey, alpha_string: []const u8, pi: Proof) Error!O
     const v_point = Edwards25519.mulDoubleBasePublic(h_point, d.s, gamma_point.neg(), c_scalar) catch
         return error.InvalidProof;
 
-    // Step 10: c' = challenge_generation(Y, H, Gamma, U, V).
-    const c_prime = challengeGeneration(y_string, h_string, d.gamma, u_point.toBytes(), v_point.toBytes());
+    // Step 10: c' = challenge_generation(Y, H, Gamma, U, V), with
+    // point_to_string(Gamma) as the RFC writes it (A1 E14). Since
+    // `decodeProof` decodes strictly, this is byte-for-byte `d.gamma`.
+    const c_prime = challengeGeneration(y_string, h_string, gamma_point.toBytes(), u_point.toBytes(), v_point.toBytes());
 
     // Step 11: accept iff c == c'.
     if (!std.crypto.timing_safe.eql([c_len]u8, c_prime, d.c)) return error.InvalidProof;

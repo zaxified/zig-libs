@@ -70,12 +70,21 @@ real — see "Implementation notes" below.
   decodes the caller's `PublicKey` bytes to a point and re-encodes
   (`y_point.toBytes()`) before using that as BOTH `encode_to_curve_salt`
   and `ECVRF_challenge_generation`'s `P1`, exactly mirroring what `prove`
-  does with its freshly-derived `Y = x*B`. For every canonically-encoded
-  key (the only kind `validateKey`/`Edwards25519.fromBytes` accept as
-  valid to begin with) this is a no-op and does not affect any vector;
-  it only matters for a hypothetical non-canonical-but-decodable input,
-  where re-encoding is the RFC-literal choice over trusting raw caller
-  bytes.
+  does with its freshly-derived `Y = x*B`; `verify` hashes
+  `point_to_string(Gamma)` the same way (A1 E14).
+- **`string_to_point` is RFC 8032 §5.1.3, strictly (A1 E14/E16,
+  2026-09-14).** `Edwards25519.fromBytes` alone accepts a `y` in
+  `[p, 2^255)` (reducing it) and sign bit 1 on a point with `x = 0` —
+  §5.1.3 says decoding fails for both. `stringToPoint` refuses them and is
+  used for `Gamma` (`decodeProof`), the public key (`validateKey`) and the
+  TAI candidate (`encodeToCurve`'s `interpret_hash_value_as_a_point`). A
+  decoded point therefore re-encodes to exactly its input bytes, so the
+  re-encodings above never differ from the caller's bytes and neither a key
+  nor a proof has a second valid spelling. Tested with `y = p + 1`, a set
+  sign bit on the identity, and a prime-order key with small `y` next to its
+  `y + p` twin — each accepted by std's `fromBytes`, each refused here. The
+  TAI use cannot be tested black-box (a hash landing in `[p, 2^255)` has
+  probability ~2^-251 per candidate).
 - **`validate_key` is always TRUE.** RFC 9381 §5.3 lets an implementation
   support only one of `validate_key ∈ {TRUE, FALSE}`, as long as it
   documents which. This module supports only TRUE — `verify` always runs
@@ -209,7 +218,32 @@ real — see "Implementation notes" below.
   `defer` — best-effort hygiene against process-memory scraping, not a
   guarantee against a determined local attacker (no memory locking /
   `mlock`, matching this repository's other secret-scalar-handling
-  modules, e.g. `xeddsa.zig`).
+  modules, e.g. `xeddsa.zig`). **Known limitation (A1 E4, owner's decision
+  2026-09-11: document, do not patch std):** secret copies still survive on
+  the dead stack after `prove`. `src/zeroize_probe_test.zig`, ReleaseFast, 5
+  rounds each: before 2026-09-14 `x=3 k=1 sk=0`; after `prove` moved its
+  steps into `proveExpanded` (secrets passed by pointer) and the SHA-512
+  states that absorb `sk` and the prefix are wiped (`Sha512.hash` left them
+  on an unwiped frame), `x=0 k=1 sk=1`. The counts follow frame layout, not
+  just the code — passing `sk` by pointer alone measured `sk=2`. What remains
+  sits in code this module does not control (`std`'s scalar arithmetic and
+  hash internals take their inputs by value and do not wipe their frames),
+  and EACH remaining copy recovers the key: `sk` directly, `k` with the
+  published proof (`x = (s - k) / c mod q`). A process whose dead stack an
+  attacker can read should not rely on this hygiene. ⚠ The probe's own
+  `sentinels_left` counter read "untouched" (24576/24576) on both trees while
+  it still found the copies above, so treat the numbers as an A/B on one
+  instrument, not as absolute counts.
+- **`KeyPair` (A1 E10, 2026-09-14).** `prove(sk, alpha)` spends about a
+  fifth of its time recomputing `Y = x*B`. `KeyPair.fromSecretKey(sk)` derives
+  `Y` once and `KeyPair.prove` skips it: measured ReleaseFast, 5 rounds of
+  2000, median 228 380 ns/op for `prove` vs 176 229 ns/op for `KeyPair.prove`
+  (−22.8 %; taken before the E4 hash-state wipes above were added, which
+  both paths share), byte-identical proofs on every RFC 9381 vector. A `KeyPair` whose
+  `public_key` was filled in by hand rather than derived produces proofs no
+  key verifies (tested) — a safe failure. The other half of the audit's E10,
+  a precomputed base table in `ct25519` (shared with four modules), belongs
+  to the campaign's performance pass.
 - **A degenerate secret scalar or nonce (probability ~2^-252) does NOT
   panic.** *(Corrected 2026-09-10, A1 E11: this bullet used to claim
   `publicKey`/`prove` `@panic` if the clamped secret scalar or derived

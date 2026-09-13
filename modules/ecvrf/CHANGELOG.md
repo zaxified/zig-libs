@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL + NEW API:** A1 E14, E16, E10 (KeyPair half), E4 (documented).
+  E14/E16: `string_to_point` now decodes strictly per RFC 8032 §5.1.3 (new `stringToPoint`):
+  a `Gamma` or public key with `y >= p`, or with a sign bit on a point whose `x` is 0, is refused
+  (`error.InvalidProof` / `error.InvalidPublicKey`); `std`'s `fromBytes` had accepted both as a
+  second spelling of an existing point. Used for the TAI candidate too. `verify` hashes
+  `point_to_string(Gamma)` as RFC 9381 §5.3 step 10 writes it — byte-identical to the input after
+  strict decoding, so honest proofs verify exactly as before.
+  E10: new `KeyPair.fromSecretKey` / `KeyPair.prove` derive the public key once; measured
+  ReleaseFast median 228 380 → 176 229 ns per proof (−22.8 %), same bytes on every RFC 9381 vector.
+  The precomputed-base half of E10 (`ct25519`) is left to the campaign's performance pass.
+  E4: `prove`'s secrets now reach its steps by pointer and the SHA-512 states that absorb `sk` and
+  the prefix are wiped; the dead-stack probe (ReleaseFast) went from `x=3 k=1 sk=0` to
+  `x=0 k=1 sk=1`. The remainder lives in `std` and is documented in SPEC as a known limitation
+  (owner's decision: no std patch); every remaining copy still recovers the key.
+
 - **2026-09-10** — **NO CONSUMER-VISIBLE CHANGE:** `verify`'s last step used
   to call `proofToHash(pi)`, which re-decoded `pi` (re-checking `s`'s
   canonicity and re-parsing `Gamma`'s point encoding) purely to reach the
