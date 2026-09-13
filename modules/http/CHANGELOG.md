@@ -84,7 +84,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     `ChunkedReader.FailReason`, or send malformed bare-LF/oversize-trailer traffic, so a
     full 27-module sweep was not run (this batch is pure hardening + additive fields/enum
     members, not a signature or default-value change any of them could observe).
-- **2026-09-10** (4) — A1 fix campaign, fourth wave on `http`, five findings:
+- **2026-09-10** — A1 fix campaign, fourth wave on `http`, five findings:
   - **G7 remainder** — `negotiateLanguage`/`negotiateEncoding` had the identical
     O(tags/codings × header length) shape `negotiate` was fixed for last wave, flagged
     then as "not touched this session". Same fix, same shape:
@@ -136,7 +136,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `scripts/modtest http -Doptimize=ReleaseSafe`: 523/526;
   `HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast`: 518/518 (benches unlocked).
 
-- **2026-09-10** (3) — A1 fix campaign, third wave on `http`: `conneg.negotiate` (G7),
+- **2026-09-10** — A1 fix campaign, third wave on `http`: `conneg.negotiate` (G7),
   performance only, no observable change. It used to re-walk the WHOLE `Accept` header once
   PER offer, so one call cost O(offers × header length) — measured by the audit at
   ~550-598 µs/call for an 8-offer server against a 1000-range header (~550× a 1-range
@@ -155,7 +155,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   and `negotiateEncoding` have the identical shape (flagged by the audit as such) and were
   NOT touched this session — same fix applies, left for a future pass.
 
-- **2026-09-10 (2)** — A1 fix campaign, second wave on `http`: three shipped resource-limit
+- **2026-09-10** — A1 fix campaign, second wave on `http`: three shipped resource-limit
   defaults had their VALUE pinned by a test for the first time (G8) — `range.default_max_ranges`
   (16), `multipart.Limits.max_parts` (1000) and `.max_header_bytes` (16 KiB), and
   `Client.Options.max_redirects` (10). Each had its enforcement MECHANISM already tested with an

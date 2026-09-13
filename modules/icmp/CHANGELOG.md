@@ -81,7 +81,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   skip, without), `scripts/modtest pathmtu` 35/35 either way — neither
   needed a source change, both only rebuilt against `Socket.zig`.
 
-- **2026-09-10 (2)** — A1 fix campaign, F12 (LOW), mutation-table coverage —
+- **2026-09-10** — A1 fix campaign, F12 (LOW), mutation-table coverage —
   16 of the 22 surviving mutations now killed (17 new tests: 7 in `echo.zig`,
   1 in `Socket.zig`, 9 in `pinger.zig`), no behavior change:
   - **echo.zig** (m8, m15, m16, m18, m26, m27): each of the length-boundary

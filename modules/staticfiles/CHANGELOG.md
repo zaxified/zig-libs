@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-11** (3) — A1 fix campaign round 2, F5/F13/F17. BEHAVIOURAL (all three).
+- **2026-09-11** — A1 fix campaign round 2, F5/F13/F17. BEHAVIOURAL (all three).
   - **F5 (round-2 Q8):** `ETag` is now **weak** (`W/` prefix) by default —
     `Options.strong_etag = true` reverts to the pre-fix strong form. `mtime`'s one-second
     granularity meant a same-second, same-size edit left the old strong tag unchanged despite
@@ -34,7 +34,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     serves index.html`, `serve: a directory-listing request opens its target directory once…`)
     updated to request the canonical slash-terminated form where they were testing something
     OTHER than F17 itself.
-- **2026-09-11 (2)** — A1 fix campaign round 2, F6 (cross-module with `http`, one commit —
+- **2026-09-11** — A1 fix campaign round 2, F6 (cross-module with `http`, one commit —
   round-2 Q4). BEHAVIOURAL. Two related defects at the `http` compression seam, both only
   reachable when the embedding `Server` has `Options.compression` set:
   - A byte-range response (206) could still be gzip-compressed: `Content-Range` describes

@@ -20,7 +20,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   rejected, matching the tolerance `readCode` already gives an unknown `[CODE]`.
   `scripts/modtest imap`: 153/154 (was 146/147), Debug and ReleaseFast.
 
-- **2026-09-10** (2) — **BEHAVIOURAL, not breaking:** A1 fix campaign, F9 (partial: the
+- **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, F9 (partial: the
   `FETCH BODY[...]` section half). `fetch.isSectionChar` was `ch != ']'`, so
   `BODY[A\r\nB]`/`BODY[A\x00B]` parsed and handed the caller a section string with an
   embedded CR/LF/NUL — a value the module's own encoder (`command.checkSection`) has never
