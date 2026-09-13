@@ -78,14 +78,23 @@ pub fn main() !void {
     if (lpm_lookups != 2) return error.WrongLookupCallCount; // LPM lookup + scratch-map lookup
     std.debug.print("buildClassifierProgram: {d} instructions, ends in exit, 2 map lookups\n", .{insns.len});
 
-    const steer_insns = try xdp.buildCpumapSteerProgram(.{ .lpm_map_fd = 10, .cpumap_fd = 12, .cpu_count = 4 });
+    const steer_insns = try xdp.buildCpumapSteerProgram(.{ .lpm_map_fd = 10, .cpumap_fd = 12, .cpu_count = 4, .cpumap_max_entries = 4 });
     if (steer_insns.len == 0) return error.EmptyProgram;
     std.debug.print("buildCpumapSteerProgram: {d} instructions built\n", .{steer_insns.len});
 
-    if (xdp.buildCpumapSteerProgram(.{ .lpm_map_fd = 10, .cpumap_fd = 12, .cpu_count = 0 })) |_| {
+    if (xdp.buildCpumapSteerProgram(.{ .lpm_map_fd = 10, .cpumap_fd = 12, .cpu_count = 0, .cpumap_max_entries = 0 })) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidCpuCount => std.debug.print("buildCpumapSteerProgram(cpu_count=0): InvalidCpuCount (expected)\n", .{}),
+        error.CpuCountExceedsCpumap => return err,
+    }
+
+    // A cpu_count past the CPUMAP would drop matched traffic; the build refuses it.
+    if (xdp.buildCpumapSteerProgram(.{ .lpm_map_fd = 10, .cpumap_fd = 12, .cpu_count = 64, .cpumap_max_entries = 4 })) |_| {
+        return error.UnexpectedAccept;
+    } else |err| switch (err) {
+        error.CpuCountExceedsCpumap => std.debug.print("buildCpumapSteerProgram(cpu_count=64, 4-slot CPUMAP): CpuCountExceedsCpumap (expected)\n", .{}),
+        error.InvalidCpuCount => return err,
     }
 
     // ── 3. LIVE, real kernel, no privilege needed for THIS negative case ──

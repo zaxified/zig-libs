@@ -328,6 +328,15 @@ pub const CpumapSteerOptions = struct {
     /// slot is a runtime redirect miss that falls back to `redirect_flags`
     /// (see below), not a verifier problem.
     cpumap_fd: linux.fd_t,
+    /// The CPUMAP's `max_entries` (what `maps.createCpuMap` was given).
+    /// Required: the program reduces the class `% cpu_count`, and that index
+    /// is inside the map only when `cpu_count <= cpumap_max_entries`. With a
+    /// larger `cpu_count` a MATCHED packet whose CPU falls past the map is
+    /// `XDP_ABORTED` under the default `redirect_flags`, while LPM misses pass
+    /// — customer traffic dropped, foreign traffic let through (A1 F2).
+    /// `buildCpumapSteerProgram` refuses that as
+    /// `SteerBuildError.CpuCountExceedsCpumap`.
+    cpumap_max_entries: u32,
     /// Number of CPUs the ruleset's class handles are reduced onto. The target
     /// CPU is `class % cpu_count` (see the CPU-selection note). Must be
     /// non-zero — a 0 divisor is both a build error here and a verifier
@@ -344,15 +353,18 @@ pub const CpumapSteerOptions = struct {
     /// with the redirect-fallback-action feature (>= 5.15), a caller may set
     /// this to `XDP_PASS` (2) so a redirect into an unpopulated CPUMAP slot
     /// returns XDP_PASS instead of XDP_ABORTED; this program never depends on
-    /// that (it reduces the key with `% cpu_count` so the index is always in
-    /// range, and a fully populated map has no miss), it is exposed only so a
-    /// defensive caller can opt in.
+    /// that (it reduces the key with `% cpu_count`, which the build refuses to
+    /// let exceed `cpumap_max_entries`, so a fully populated map has no miss),
+    /// it is exposed only so a defensive caller can opt in.
     redirect_flags: u32 = 0,
 };
 
 pub const SteerBuildError = error{
     /// `cpu_count == 0` — see `CpumapSteerOptions.cpu_count`.
     InvalidCpuCount,
+    /// `cpu_count > cpumap_max_entries` — see
+    /// `CpumapSteerOptions.cpumap_max_entries`.
+    CpuCountExceedsCpumap,
 };
 
 /// Build the redirect-to-CPUMAP steering program.
@@ -387,6 +399,7 @@ pub const SteerBuildError = error{
 /// classifier and a steer program at once.
 pub fn buildCpumapSteerProgram(opts: CpumapSteerOptions) SteerBuildError![]const Insn {
     if (opts.cpu_count == 0) return SteerBuildError.InvalidCpuCount;
+    if (opts.cpu_count > opts.cpumap_max_entries) return SteerBuildError.CpuCountExceedsCpumap;
 
     const R = Insn.Reg;
     const key_off = opts.key_field.offset();
@@ -795,6 +808,7 @@ test "golden: buildCpumapSteerProgram matches the hand-derived sequence" {
         .lpm_map_fd = golden_steer_lpm_fd,
         .cpumap_fd = golden_steer_cpumap_fd,
         .cpu_count = 4,
+        .cpumap_max_entries = 4,
         .key_field = .src,
         .redirect_flags = 0,
     });
@@ -850,7 +864,7 @@ fn steerLooksWellFormed(insns: []const Insn) bool {
 }
 
 test "structural: steer program is well-formed (redirect_map + cpumap pseudo-fd + mod key)" {
-    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8 });
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8, .cpumap_max_entries = 8 });
     try testing.expect(steerLooksWellFormed(insns));
 
     // The redirect call references the cpumap fd (9), not the lpm fd (7): find
@@ -873,7 +887,7 @@ test "structural: steer program is well-formed (redirect_map + cpumap pseudo-fd 
 }
 
 test "structural: every non-hit path falls back to a single trailing XDP_PASS" {
-    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8 });
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8, .cpumap_max_entries = 8 });
 
     // Exactly two exits: the redirect-tail exit and the PASS-tail exit.
     var exits: usize = 0;
@@ -905,7 +919,7 @@ test "structural: every non-hit path falls back to a single trailing XDP_PASS" {
 }
 
 test "buildCpumapSteerProgram: key_field = .dst reads offsets 30-33" {
-    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 3, .cpumap_fd = 4, .cpu_count = 2, .key_field = .dst });
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = 3, .cpumap_fd = 4, .cpu_count = 2, .cpumap_max_entries = 2, .key_field = .dst });
     var byte_reads_from_packet: usize = 0;
     for (insns) |ins| {
         if (ins.code == 0x71 and ins.src == 1 and ins.dst == 5) {
@@ -916,11 +930,23 @@ test "buildCpumapSteerProgram: key_field = .dst reads offsets 30-33" {
     try testing.expectEqual(@as(usize, 4), byte_reads_from_packet);
 }
 
+test "buildCpumapSteerProgram: a cpu_count past the CPUMAP is a build error, not dropped customer traffic (A1 F2)" {
+    // The audit measured the program this used to build: a 4-slot CPUMAP with
+    // cpu_count = 64, class 40 -> CPU 40 -> XDP_ABORTED (the MATCHED packet
+    // dropped) while an LPM miss passed.
+    try testing.expectError(SteerBuildError.CpuCountExceedsCpumap, buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 64, .cpumap_max_entries = 4 }));
+    try testing.expectError(SteerBuildError.CpuCountExceedsCpumap, buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 5, .cpumap_max_entries = 4 }));
+    // Equal and smaller build: every reduced index is inside the map.
+    _ = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 4, .cpumap_max_entries = 4 });
+    _ = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 4, .cpumap_max_entries = 8 });
+}
+
 test "buildCpumapSteerProgram: cpu_count = 0 is a build error, not a div-by-zero program" {
     try testing.expectError(SteerBuildError.InvalidCpuCount, buildCpumapSteerProgram(.{
         .lpm_map_fd = 3,
         .cpumap_fd = 4,
         .cpu_count = 0,
+        .cpumap_max_entries = 0,
     }));
 }
 
@@ -929,7 +955,7 @@ test "positive control: a steer stream with the wrong redirect helper id is reje
     // program, corrupt ONLY the redirect helper id (51 -> map_lookup_elem 1),
     // and confirm steerLooksWellFormed flips from true to false. This is the
     // permanent guard that the well-formedness predicate is not vacuous.
-    const good = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8 });
+    const good = try buildCpumapSteerProgram(.{ .lpm_map_fd = 7, .cpumap_fd = 9, .cpu_count = 8, .cpumap_max_entries = 8 });
     try testing.expect(steerLooksWellFormed(good));
 
     var broken: [64]Insn = undefined;
@@ -958,7 +984,7 @@ test "load: buildCpumapSteerProgram passes the in-kernel verifier (needs CAP_BPF
     };
     defer _ = linux.close(cpumap_fd);
 
-    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = lpm_fd, .cpumap_fd = cpumap_fd, .cpu_count = 4 });
+    const insns = try buildCpumapSteerProgram(.{ .lpm_map_fd = lpm_fd, .cpumap_fd = cpumap_fd, .cpu_count = 4, .cpumap_max_entries = 4 });
     const prog: ebpf.Program = .{ .prog_type = .xdp, .insns = insns };
     // Loaded under "GPL": bpf_redirect_map is not a GPL-only helper on current
     // kernels, but claiming GPL removes any gpl-only-helper ambiguity for the

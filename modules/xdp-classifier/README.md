@@ -143,6 +143,7 @@ const steer = try xdp_classifier.buildCpumapSteerProgram(.{
     .lpm_map_fd = lpm_fd,
     .cpumap_fd = cpumap_fd,
     .cpu_count = ncpu,
+    .cpumap_max_entries = ncpu, // what createCpuMap was given; cpu_count may not exceed it
     .key_field = .src,
 });
 const steer_prog: ebpf.Program = .{ .prog_type = .xdp, .insns = steer };
@@ -166,10 +167,13 @@ defer std.os.linux.close(steer_fd);
   `src/maps.zig`'s doc comment for the UAPI citation.
 - **Fallback = `XDP_PASS`.** Any parse/bounds failure or LPM miss returns
   `XDP_PASS` (the packet continues up the normal stack); on a hit the program
-  returns the `bpf_redirect_map` result (`XDP_REDIRECT` on success). Because the
-  key is reduced `% cpu_count`, the redirect index is always in range for a
-  fully populated CPUMAP; `redirect_flags` defaults to 0 and may be set to
-  `XDP_PASS` on kernels ≥ 5.15 for a fallback action on an unpopulated slot.
+  returns the `bpf_redirect_map` result (`XDP_REDIRECT` on success). The key is
+  reduced `% cpu_count`, and `cpumap_max_entries` (required) must be at least
+  `cpu_count` — the build refuses otherwise (`error.CpuCountExceedsCpumap`),
+  because a CPU index past the map turns a MATCHED packet into `XDP_ABORTED`.
+  With that, the redirect index is always in range for a fully populated
+  CPUMAP; `redirect_flags` defaults to 0 and may be set to `XDP_PASS` on
+  kernels ≥ 5.15 for a fallback action on an unpopulated slot.
 - **Privilege:** creating/populating the CPUMAP and loading the program need
   `CAP_BPF`/root, same as the classifier — the offline golden/structural tests
   need no privilege; the map round-trip and verifier-load tests skip cleanly

@@ -171,8 +171,12 @@ BPF_MOD | BPF_K`) — is trivial scalar arithmetic, not a verifier-hard pattern.
   always uses 8 so `populateCpu` can carry the optional per-CPU program.
 - **Fallback.** Any parse/bounds failure or LPM miss returns `XDP_PASS` (packet
   continues up the stack); a hit returns the `bpf_redirect_map` result. The
-  `% cpu_count` reduction keeps the redirect index in range, so a fully
-  populated CPUMAP never misses; `redirect_flags` (default 0) may be set to
+  `% cpu_count` reduction keeps the redirect index in `[0, cpu_count)`, which is
+  the CPUMAP's range only when `cpu_count <= max_entries` — so
+  `CpumapSteerOptions.cpumap_max_entries` is required and a larger `cpu_count`
+  is refused at build (`CpuCountExceedsCpumap`, A1 F2; before, a matched packet
+  past the map was `XDP_ABORTED` while LPM misses passed). A fully populated
+  CPUMAP of at least `cpu_count` slots therefore never misses; `redirect_flags` (default 0) may be set to
   `XDP_PASS` on kernels with the redirect-fallback-action feature (≥ 5.15) for a
   defensive fallback on an unpopulated slot — the program never depends on it.
 

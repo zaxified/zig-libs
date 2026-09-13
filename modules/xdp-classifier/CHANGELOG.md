@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BREAKING:** A1 finding F2. `CpumapSteerOptions` gains the required
+  `cpumap_max_entries`, and `buildCpumapSteerProgram` returns the new
+  `SteerBuildError.CpuCountExceedsCpumap` when `cpu_count > cpumap_max_entries`. Nothing tied
+  `cpu_count` to the CPUMAP's size: a 4-slot map with `cpu_count = 64` built fine and dropped
+  matched customer traffic (`XDP_ABORTED`) while LPM misses passed. `redirect_flags` keeps its
+  default of 0.
+
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** F8's packet path is now
   covered (A1/xdp-classifier.md). Ported the audit's offline BPF interpreter
   (`A1/repro/xdp-classifier/vm.zig`) into `src/vm.zig` per CONVENTIONS.md §9
