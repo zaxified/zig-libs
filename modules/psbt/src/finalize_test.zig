@@ -49,6 +49,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
 const bitcoinscript = @import("bitcoinscript");
+const ripemd160 = @import("ripemd160");
 const psbt = @import("root.zig");
 const vectors = @import("kat_vectors.zig");
 
@@ -346,6 +347,184 @@ test "finalize: SIGHASH_TYPE mismatch is rejected (BIP174's own sighash-type enf
     // and the (mismatched) PARTIAL_SIG is left in place, not cleared.
     try testing.expect(ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS) == null);
     try testing.expect(ps.inputs[0].findKeyed(psbt.input_key.PARTIAL_SIG, &pubkey) != null);
+}
+
+test "finalize: a PARTIAL_SIG under some other key, ordered first, no longer shadows the right one (A1 F7)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x55} ** 32);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const decoy_kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x56} ** 32);
+    const decoy_pub = decoy_kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+
+    var script_pubkey: [22]u8 = undefined;
+    script_pubkey[0] = 0x00;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &pkh);
+    var script_code: [25]u8 = undefined;
+    script_code[0] = 0x76;
+    script_code[1] = 0xa9;
+    script_code[2] = 0x14;
+    @memcpy(script_code[3..23], &pkh);
+    script_code[23] = 0x88;
+    script_code[24] = 0xac;
+
+    const unsigned = try buildUnsignedTx(a, 900);
+    const credit_value: i64 = 5000;
+    const sighash = try bitcointx.bip143.sighash(a, unsigned, 0, &script_code, credit_value, SIGHASH_ALL);
+    const sig_ht = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(sighash, null)), 0x01);
+    // A genuine signature over the same digest, under the wrong key.
+    const decoy_ht = try derSigWithHashtype(a, normalizeLowS(try decoy_kp.signPrehashed(sighash, null)), 0x01);
+    const witness_utxo_value = try buildWitnessUtxoValue(a, credit_value, &script_pubkey);
+
+    var input_records = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &decoy_pub, .value = decoy_ht }, // first
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig_ht },
+    };
+    var input_maps = [_]psbt.Map{.{ .records = &input_records }};
+    const ps = try wrapPsbt(a, unsigned, &input_maps);
+
+    const results = try psbt.finalize(a, ps, .{});
+    try testing.expect(results[0] == null);
+    const fw = ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTWITNESS).?;
+    const expected_enc = try psbt.encodeWitnessStack(a, &[_][]const u8{ sig_ht, &pubkey });
+    try testing.expectEqualSlices(u8, expected_enc, fw.value);
+}
+
+test "finalize: an invalid signature for an earlier multisig key no longer blocks two valid later ones (A1 F7)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const kp1 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x71} ** 32);
+    const kp2 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x72} ** 32);
+    const kp3 = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x73} ** 32);
+    const pub1 = kp1.public_key.toCompressedSec1();
+    const pub2 = kp2.public_key.toCompressedSec1();
+    const pub3 = kp3.public_key.toCompressedSec1();
+
+    var redeem_buf: std.ArrayList(u8) = .empty;
+    try redeem_buf.append(a, 0x52); // OP_2
+    for ([_][]const u8{ &pub1, &pub2, &pub3 }) |p| {
+        try redeem_buf.append(a, @intCast(p.len));
+        try redeem_buf.appendSlice(a, p);
+    }
+    try redeem_buf.append(a, 0x53); // OP_3
+    try redeem_buf.append(a, 0xae); // OP_CHECKMULTISIG
+    const redeem = redeem_buf.items;
+
+    // Not `hash160Of`: a 105-byte 2-of-3 script is past a one-byte direct
+    // push (max 75), so that helper's `<len><data> OP_HASH160` would misread
+    // the length byte as an opcode.
+    var redeem_hash: [20]u8 = undefined;
+    ripemd160.hash160(redeem, &redeem_hash);
+    var script_pubkey: [23]u8 = undefined;
+    script_pubkey[0] = 0xa9;
+    script_pubkey[1] = 0x14;
+    @memcpy(script_pubkey[2..22], &redeem_hash);
+    script_pubkey[22] = 0x87;
+
+    const unsigned = try buildUnsignedTx(a, 900);
+    const sighash = try bitcointx.legacy.sighash(a, unsigned, 0, redeem, SIGHASH_ALL);
+    // Key 1's signature is well-formed but over some other digest.
+    const bad1 = try derSigWithHashtype(a, normalizeLowS(try kp1.signPrehashed([_]u8{0x42} ** 32, null)), 0x01);
+    const sig2 = try derSigWithHashtype(a, normalizeLowS(try kp2.signPrehashed(sighash, null)), 0x01);
+    const sig3 = try derSigWithHashtype(a, normalizeLowS(try kp3.signPrehashed(sighash, null)), 0x01);
+    const witness_utxo_value = try buildWitnessUtxoValue(a, 100_000, &script_pubkey);
+
+    var input_records = [_]psbt.Record{
+        .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = witness_utxo_value },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pub1, .value = bad1 },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pub2, .value = sig2 },
+        .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pub3, .value = sig3 },
+        .{ .keytype = psbt.input_key.REDEEM_SCRIPT, .keydata = &.{}, .value = redeem },
+    };
+    var input_maps = [_]psbt.Map{.{ .records = &input_records }};
+    const ps = try wrapPsbt(a, unsigned, &input_maps);
+
+    const results = try psbt.finalize(a, ps, .{});
+    try testing.expect(results[0] == null);
+
+    var expected: std.ArrayList(u8) = .empty;
+    try expected.append(a, 0x00); // CHECKMULTISIG dummy
+    for ([_][]const u8{ sig2, sig3 }) |push| {
+        try expected.append(a, @intCast(push.len));
+        try expected.appendSlice(a, push);
+    }
+    try expected.append(a, 0x4c); // OP_PUSHDATA1: the 105-byte script is past a direct push
+    try expected.append(a, @intCast(redeem.len));
+    try expected.appendSlice(a, redeem);
+    try testing.expectEqualSlices(u8, expected.items, ps.inputs[0].find(psbt.input_key.FINAL_SCRIPTSIG).?.value);
+}
+
+test "finalize: a legacy SIGHASH_SINGLE signature with no output at its index is refused by name unless allowed (A1 F4)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const kp = try EcdsaSecp256k1Sha256.KeyPair.generateDeterministic([_]u8{0x81} ** 32);
+    const pubkey = kp.public_key.toCompressedSec1();
+    const pkh = try hash160Of(a, &pubkey);
+    var script_pubkey: [25]u8 = undefined;
+    script_pubkey[0] = 0x76;
+    script_pubkey[1] = 0xa9;
+    script_pubkey[2] = 0x14;
+    @memcpy(script_pubkey[3..23], &pkh);
+    script_pubkey[23] = 0x88;
+    script_pubkey[24] = 0xac;
+
+    // Two inputs, ONE output: input 1 has no output at its index.
+    const vin = try a.alloc(bitcointx.TxIn, 2);
+    vin[0] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 0 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    vin[1] = .{ .prevout = .{ .txid = [_]u8{0xee} ** 32, .vout = 1 }, .script_sig = &.{}, .sequence = 0xffffffff };
+    const vout = try a.alloc(bitcointx.TxOut, 1);
+    vout[0] = .{ .value = 900, .script_pubkey = &.{} };
+    const unsigned: bitcointx.Transaction = .{ .version = 2, .vin = vin, .vout = vout, .witness = &.{}, .locktime = 0, .has_witness = false };
+
+    const SINGLE: u32 = 0x03;
+    const digest0 = try bitcointx.legacy.sighash(a, unsigned, 0, &script_pubkey, SINGLE);
+    const digest1 = try bitcointx.legacy.sighash(a, unsigned, 1, &script_pubkey, SINGLE);
+    try testing.expectEqualSlices(u8, &bitcointx.legacy.sighash_single_bug, &digest1); // the bug, not a real digest
+    const sig0 = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(digest0, null)), 0x03);
+    const sig1 = try derSigWithHashtype(a, normalizeLowS(try kp.signPrehashed(digest1, null)), 0x03);
+    const utxo = try buildWitnessUtxoValue(a, 100_000, &script_pubkey);
+
+    // Default: input 0 (SINGLE with a matching output) finalizes, input 1 is refused.
+    {
+        var r0 = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = utxo },
+            .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig0 },
+        };
+        var r1 = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = utxo },
+            .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig1 },
+        };
+        var maps = [_]psbt.Map{ .{ .records = &r0 }, .{ .records = &r1 } };
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps, .{});
+        try testing.expect(results[0] == null);
+        try expectInputError(results, 1, error.SighashSingleBug);
+        try testing.expect(ps.inputs[1].find(psbt.input_key.FINAL_SCRIPTSIG) == null);
+    }
+    // Opt-in: exactly what consensus accepts.
+    {
+        var r1 = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = utxo },
+            .{ .keytype = psbt.input_key.PARTIAL_SIG, .keydata = &pubkey, .value = sig1 },
+        };
+        var r0 = [_]psbt.Record{
+            .{ .keytype = psbt.input_key.WITNESS_UTXO, .keydata = &.{}, .value = utxo },
+        };
+        var maps = [_]psbt.Map{ .{ .records = &r0 }, .{ .records = &r1 } };
+        const ps = try wrapPsbt(a, unsigned, &maps);
+        const results = try psbt.finalize(a, ps, .{ .allow_sighash_single_bug = true });
+        try testing.expect(results[1] == null);
+        try testing.expect(ps.inputs[1].find(psbt.input_key.FINAL_SCRIPTSIG) != null);
+    }
 }
 
 // ── C: real P2SH 2-of-2 multisig (self-authored, real legacy sighash) ──

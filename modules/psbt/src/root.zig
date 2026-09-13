@@ -68,7 +68,7 @@ pub const meta = .{
     .role = .codec,
     .concurrency = .reentrant, // no shared/global state; every call is over caller-owned values
     .model_after = "BIP174 (Partially Signed Bitcoin Transaction Format v0, bitcoin/bips)",
-    .deps = .{ "bitcointx", "bitcoinscript" },
+    .deps = .{ "bitcointx", "bitcoinscript", "ripemd160" },
 };
 
 // ── magic ────────────────────────────────────────────────────────────────
@@ -694,10 +694,11 @@ test {
     _ = @import("regtest_kat_test.zig");
 }
 
-test "meta.deps names bitcointx and bitcoinscript" {
-    try testing.expectEqual(@as(usize, 2), meta.deps.len);
+test "meta.deps names bitcointx, bitcoinscript and ripemd160" {
+    try testing.expectEqual(@as(usize, 3), meta.deps.len);
     try testing.expect(std.mem.eql(u8, meta.deps[0], "bitcointx"));
     try testing.expect(std.mem.eql(u8, meta.deps[1], "bitcoinscript"));
+    try testing.expect(std.mem.eql(u8, meta.deps[2], "ripemd160"));
 }
 
 test "rejects a buffer shorter than the magic" {

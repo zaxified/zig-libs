@@ -137,7 +137,10 @@ reads out of bounds on malformed/truncated/adversarial input.
 non-Script roles were deferred pending a Script interpreter; `bitcoinscript` now exists, so that
 blocker is gone for these two. `finalize` assembles `FINAL_SCRIPTSIG`/`FINAL_SCRIPTWITNESS` for the
 standard spend types (P2PKH, P2WPKH, P2SH-P2WPKH, bare/P2SH/P2WSH/P2SH-P2WSH multisig, P2TR
-key-path), verifying every candidate through `bitcoinscript.verifyScript` before accepting it and
+key-path), choosing single-key signatures by key hash and pre-verifying each multisig signature
+on its own (A1 F7; at most one ECDSA check per script key), refusing a legacy signature that hits
+the SIGHASH_SINGLE bug unless `FinalizeOptions.allow_sighash_single_bug` (A1 F4,
+`error.SighashSingleBug`), verifying every candidate through `bitcoinscript.verifyScript` before accepting it and
 clearing the now-consumed input fields per BIP174 §"Input Finalizer"; `extract` splices finalized
 inputs into a network-ready `bitcointx.Transaction`. Because `finalize` consumes the UTXO fields, it
 also **binds** them to the input first: a `PSBT_IN_NON_WITNESS_UTXO` must hash to

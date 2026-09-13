@@ -69,6 +69,24 @@
 //! left to `verifyScript` to interpret; this module does not additionally
 //! cross-check it against `PSBT_IN_SIGHASH_TYPE`.
 //!
+//! ## Which signature is used (A1 F7)
+//!
+//! For P2PKH/P2WPKH the `PARTIAL_SIG` is chosen by KEY — its pubkey must hash
+//! to the output's key hash — not by map position, so a signature under some
+//! other key cannot shadow the right one. For multisig, each script key's
+//! signature is verified on its own before it is taken, so an invalid one for
+//! an earlier key is skipped in favour of valid later ones (at most one ECDSA
+//! verification per script key, the bound CHECKMULTISIG itself has).
+//!
+//! ## The legacy SIGHASH_SINGLE bug (A1 F4)
+//!
+//! A legacy SIGHASH_SINGLE signature on an input with no output at its index
+//! signs the constant `uint256(1)`; consensus accepts it, and it is valid for
+//! any transaction that hits the same bug under the same key. `finalize`
+//! refuses to assemble such an input (`error.SighashSingleBug`) unless
+//! `FinalizeOptions.allow_sighash_single_bug`. An input that arrives already
+//! finalized is only re-verified, not inspected for this.
+//!
 //! ## Taproot needs every input's UTXO
 //!
 //! BIP341's sighash commits to every input's spent output, not just the one
@@ -82,6 +100,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bitcointx = @import("bitcointx");
 const bitcoinscript = @import("bitcoinscript");
+const ripemd160 = @import("ripemd160");
 const psbt = @import("root.zig");
 
 // ── script template recognition ─────────────────────────────────────────
@@ -214,29 +233,74 @@ fn sighashMatches(sig_value: []const u8, expected: ?u32) bool {
     return sig_value[sig_value.len - 1] == @as(u8, @truncate(exp));
 }
 
-fn findMatchingPartialSig(m: psbt.Map, expected_sighash: ?u32) ?psbt.Record {
+/// The `PARTIAL_SIG` for the one key a P2PKH/P2WPKH output commits to: the
+/// record's pubkey (its keydata) must hash to `pubkey_hash`, and its hash-type
+/// byte must match `expected_sighash`.
+///
+/// A1 F7: this used to take the FIRST sighash-eligible record. `combine`
+/// orders records by raw key bytes, so "first" was decided by pubkey bytes,
+/// and a stale or foreign signature under another key sorted ahead of the
+/// right one made the input unfinalizable. A PSBT map carries at most one
+/// record per key (`parse` refuses duplicates), so filtering by key finds at
+/// most one candidate — no verification per record, nothing to amplify.
+fn findMatchingPartialSig(m: psbt.Map, expected_sighash: ?u32, pubkey_hash: []const u8) ?psbt.Record {
     for (m.records) |r| {
-        if (r.keytype == psbt.input_key.PARTIAL_SIG and sighashMatches(r.value, expected_sighash)) return r;
+        if (r.keytype != psbt.input_key.PARTIAL_SIG or !sighashMatches(r.value, expected_sighash)) continue;
+        var h: [20]u8 = undefined;
+        ripemd160.hash160(r.keydata, &h);
+        if (std.mem.eql(u8, &h, pubkey_hash)) return r;
     }
     return null;
 }
 
-/// Walks `ms.pubkeys[0..ms.n]` in order, taking the first `ms.m` that have a
-/// matching (and sighash-eligible) `PARTIAL_SIG` — CHECKMULTISIG's own
-/// pubkey-order matching algorithm accepts any such subsequence, and this is
-/// the canonical "greedy, in order" choice real wallets make too. `null` if
-/// fewer than `ms.m` are available.
-fn collectMultisigSigs(m: psbt.Map, ms: MultisigShape, expected_sighash: ?u32, out: *[max_multisig_keys][]const u8) ?void {
+/// A legacy signature with base hash type SIGHASH_SINGLE, on an input that
+/// has no output at its own index, signs the constant `uint256(1)`
+/// (`bitcointx.legacy.sighash_single_bug`) rather than anything about this
+/// transaction. Consensus accepts it — and the signature is then valid for
+/// ANY transaction that hits the same bug under the same key (A1 F4).
+fn hitsSighashSingleBug(sig: []const u8, ctx: bitcoinscript.TxContext) bool {
+    if (sig.len == 0) return false;
+    const base: u32 = sig[sig.len - 1] & 0x1f;
+    return base == bitcointx.legacy.SINGLE and ctx.input_index >= ctx.tx.vout.len;
+}
+
+/// Walks `ms.pubkeys[0..ms.n]` in order, taking the first `ms.m` whose
+/// `PARTIAL_SIG` is sighash-eligible AND verifies on its own under
+/// `script_code` — CHECKMULTISIG's own pubkey-order matching accepts any such
+/// subsequence. `error.InsufficientSignatures` if fewer than `ms.m` qualify.
+///
+/// A1 F7: a present-but-invalid signature for an earlier key used to be taken
+/// anyway, so the input failed even with enough valid signatures for later
+/// keys on hand. The pre-check is one ECDSA verification per script key, at
+/// most `ms.n <= 16` — the bound CHECKMULTISIG itself has, so no new
+/// amplification. A legacy signature hitting the SIGHASH_SINGLE bug is
+/// refused by name unless `allow_single_bug` (A1 F4).
+fn collectMultisigSigs(
+    allocator: Allocator,
+    m: psbt.Map,
+    ms: MultisigShape,
+    script_code: []const u8,
+    ctx: bitcoinscript.TxContext,
+    sig_version: bitcoinscript.SigVersion,
+    expected_sighash: ?u32,
+    allow_single_bug: bool,
+    out: *[max_multisig_keys][]const u8,
+) InputFinalizeError!void {
     var found: u8 = 0;
     for (ms.pubkeys[0..ms.n]) |pk| {
         if (found == ms.m) break;
         const sig_rec = m.findKeyed(psbt.input_key.PARTIAL_SIG, pk) orelse continue;
         if (!sighashMatches(sig_rec.value, expected_sighash)) continue;
+        const valid = bitcoinscript.sigcheck.checkEcdsaSig(allocator, sig_rec.value, pk, script_code, ctx, sig_version, bitcoinscript.ScriptFlags.standard) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => false,
+        };
+        if (!valid) continue;
+        if (sig_version == .base and !allow_single_bug and hitsSighashSingleBug(sig_rec.value, ctx)) return error.SighashSingleBug;
         out[found] = sig_rec.value;
         found += 1;
     }
-    if (found < ms.m) return null;
-    return {};
+    if (found < ms.m) return error.InsufficientSignatures;
 }
 
 /// `redeem_push`, if given, is appended as a trailing push after the
@@ -248,10 +312,12 @@ fn buildMultisigScriptSig(
     ms_script: []const u8,
     expected_sighash: ?u32,
     redeem_push: ?[]const u8,
+    ctx: bitcoinscript.TxContext,
+    allow_single_bug: bool,
 ) InputFinalizeError![]u8 {
     const ms = parseMultisig(ms_script) orelse return error.NonStandardScript;
     var sigs: [max_multisig_keys][]const u8 = undefined;
-    _ = collectMultisigSigs(m, ms, expected_sighash, &sigs) orelse return error.InsufficientSignatures;
+    try collectMultisigSigs(allocator, m, ms, ms_script, ctx, .base, expected_sighash, allow_single_bug, &sigs);
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try appendPush(&buf, allocator, &.{}); // CHECKMULTISIG off-by-one dummy (BIP147: must be empty)
@@ -265,10 +331,12 @@ fn buildMultisigWitness(
     m: psbt.Map,
     witness_script: []const u8,
     expected_sighash: ?u32,
+    ctx: bitcoinscript.TxContext,
 ) InputFinalizeError![][]const u8 {
     const ms = parseMultisig(witness_script) orelse return error.NonStandardScript;
     var sigs: [max_multisig_keys][]const u8 = undefined;
-    _ = collectMultisigSigs(m, ms, expected_sighash, &sigs) orelse return error.InsufficientSignatures;
+    // BIP143 has no SIGHASH_SINGLE bug, so the flag is irrelevant here.
+    try collectMultisigSigs(allocator, m, ms, witness_script, ctx, .witness_v0, expected_sighash, true, &sigs);
     var items: std.ArrayList([]const u8) = .empty;
     errdefer items.deinit(allocator);
     try items.append(allocator, &.{}); // dummy: a raw empty witness item, no script push needed
@@ -283,16 +351,17 @@ fn finalizeWitnessProgram(
     wp: WitnessProgram,
     expected_sighash: ?u32,
     all_utxos_resolved: bool,
+    ctx: bitcoinscript.TxContext,
 ) InputFinalizeError![][]const u8 {
     if (wp.version == 0 and wp.program.len == 20) {
-        // Native/P2SH-wrapped P2WPKH.
-        const sig_rec = findMatchingPartialSig(m, expected_sighash) orelse return error.MissingSignature;
+        // Native/P2SH-wrapped P2WPKH: the program IS the key hash.
+        const sig_rec = findMatchingPartialSig(m, expected_sighash, wp.program) orelse return error.MissingSignature;
         return try allocator.dupe([]const u8, &[_][]const u8{ sig_rec.value, sig_rec.keydata });
     }
     if (wp.version == 0 and wp.program.len == 32) {
         // Native/P2SH-wrapped P2WSH multisig.
         const ws = m.find(psbt.input_key.WITNESS_SCRIPT) orelse return error.NonStandardScript;
-        return try buildMultisigWitness(allocator, m, ws.value, expected_sighash);
+        return try buildMultisigWitness(allocator, m, ws.value, expected_sighash, ctx);
     }
     if (wp.version == 1 and wp.program.len == 32) {
         // P2TR key-path.
@@ -506,6 +575,12 @@ pub const InputFinalizeError = error{
     MissingTaprootSignature,
     /// A multisig script needs more matching signatures than are present.
     InsufficientSignatures,
+    /// A legacy signature this input would be assembled from is SIGHASH_SINGLE
+    /// on an input with no output at its index: it signs the constant
+    /// `uint256(1)`, so it is valid for any transaction that hits the same bug
+    /// under the same key. Consensus accepts it; `finalize` refuses it unless
+    /// `FinalizeOptions.allow_sighash_single_bug` (A1 F4).
+    SighashSingleBug,
 } || psbt.WitnessUtxoError || bitcointx.tx.DeserializeError || bitcoinscript.VerifyError || UtxoBindingError || WitnessStackError || Allocator.Error;
 
 /// Options for `finalize`. Struct-of-defaults so existing call sites take
@@ -521,6 +596,13 @@ pub const FinalizeOptions = struct {
     /// `AmountOutOfRange` (checked unconditionally, regardless of this flag)
     /// already closes.
     require_non_witness_utxo: bool = false,
+    /// Accept a legacy signature that hits the SIGHASH_SINGLE bug
+    /// (`error.SighashSingleBug`). Off by default: consensus accepts such a
+    /// signature, but it commits to nothing about the transaction and can be
+    /// replayed wherever the bug recurs under the same key, so a finalizer
+    /// that verifies before accepting says so instead of passing it silently.
+    /// Turn it on only to finalize exactly what the network would accept.
+    allow_sighash_single_bug: bool = false,
 };
 
 fn finalizeOneInput(
@@ -533,6 +615,7 @@ fn finalizeOneInput(
     all_resolved: bool,
     precomputed: ?bitcointx.PrecomputedTransactionData,
     index: usize,
+    options: FinalizeOptions,
 ) InputFinalizeError!void {
     const m = ps.inputs[index];
     const already_sig = m.find(psbt.input_key.FINAL_SCRIPTSIG);
@@ -580,37 +663,41 @@ fn finalizeOneInput(
     var final_script_sig: ?[]const u8 = null;
     var final_witness: ?[][]const u8 = null;
 
-    if (isP2pkh(script_pubkey)) {
-        const sig_rec = findMatchingPartialSig(m, expected_sighash) orelse return error.MissingSignature;
-        final_script_sig = try buildP2pkhScriptSig(allocator, sig_rec.value, sig_rec.keydata);
-    } else if (parseWitnessProgram(script_pubkey)) |wp| {
-        final_witness = try finalizeWitnessProgram(allocator, m, wp, expected_sighash, all_resolved);
-    } else if (isP2sh(script_pubkey)) {
-        const rs = m.find(psbt.input_key.REDEEM_SCRIPT) orelse return error.NonStandardScript;
-        const redeem = rs.value;
-        if (parseWitnessProgram(redeem)) |rwp| {
-            final_witness = try finalizeWitnessProgram(allocator, m, rwp, expected_sighash, all_resolved);
-            final_script_sig = try buildSinglePush(allocator, redeem);
-        } else if (parseMultisig(redeem) != null) {
-            final_script_sig = try buildMultisigScriptSig(allocator, m, redeem, expected_sighash, redeem);
-        } else {
-            return error.NonStandardScript;
-        }
-    } else if (parseMultisig(script_pubkey) != null) {
-        final_script_sig = try buildMultisigScriptSig(allocator, m, script_pubkey, expected_sighash, null);
-    } else {
-        return error.NonStandardScript;
-    }
-
     // The per-transaction sighash cache was built ONCE by `finalize`, so
     // verifying this input costs O(1) commitment hashes, not a fresh
     // O(vin.len) set per CHECKSIG — BIP143/BIP341's whole point (A1 P1).
+    // Built before assembly: the multisig signature pre-check uses it too.
     const ctx: bitcoinscript.TxContext = .{
         .tx = utx,
         .input_index = index,
         .spent_outputs = spent,
         .precomputed = precomputed,
     };
+    const allow_single_bug = options.allow_sighash_single_bug;
+
+    if (isP2pkh(script_pubkey)) {
+        const sig_rec = findMatchingPartialSig(m, expected_sighash, script_pubkey[3..23]) orelse return error.MissingSignature;
+        if (!allow_single_bug and hitsSighashSingleBug(sig_rec.value, ctx)) return error.SighashSingleBug;
+        final_script_sig = try buildP2pkhScriptSig(allocator, sig_rec.value, sig_rec.keydata);
+    } else if (parseWitnessProgram(script_pubkey)) |wp| {
+        final_witness = try finalizeWitnessProgram(allocator, m, wp, expected_sighash, all_resolved, ctx);
+    } else if (isP2sh(script_pubkey)) {
+        const rs = m.find(psbt.input_key.REDEEM_SCRIPT) orelse return error.NonStandardScript;
+        const redeem = rs.value;
+        if (parseWitnessProgram(redeem)) |rwp| {
+            final_witness = try finalizeWitnessProgram(allocator, m, rwp, expected_sighash, all_resolved, ctx);
+            final_script_sig = try buildSinglePush(allocator, redeem);
+        } else if (parseMultisig(redeem) != null) {
+            final_script_sig = try buildMultisigScriptSig(allocator, m, redeem, expected_sighash, redeem, ctx, allow_single_bug);
+        } else {
+            return error.NonStandardScript;
+        }
+    } else if (parseMultisig(script_pubkey) != null) {
+        final_script_sig = try buildMultisigScriptSig(allocator, m, script_pubkey, expected_sighash, null, ctx, allow_single_bug);
+    } else {
+        return error.NonStandardScript;
+    }
+
     try bitcoinscript.verifyScript(
         allocator,
         final_script_sig orelse &.{},
@@ -695,7 +782,7 @@ pub fn finalize(allocator: Allocator, ps: psbt.Psbt, options: FinalizeOptions) F
 
     const results = try allocator.alloc(?InputFinalizeError, n);
     for (0..n) |i| {
-        results[i] = if (finalizeOneInput(allocator, ps, utx, spent, resolved, binding_err, all_resolved, precomputed, i)) |_| null else |e| e;
+        results[i] = if (finalizeOneInput(allocator, ps, utx, spent, resolved, binding_err, all_resolved, precomputed, i, options)) |_| null else |e| e;
     }
     return results;
 }

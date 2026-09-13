@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 findings F4 and F7. `finalize` now refuses to assemble a
+  legacy input from a SIGHASH_SINGLE signature with no output at the input's index — it signs
+  the constant `uint256(1)` and is replayable wherever the bug recurs under the same key — with
+  the new `InputFinalizeError.SighashSingleBug`; `FinalizeOptions.allow_sighash_single_bug`
+  (default `false`) restores consensus behaviour. P2PKH/P2WPKH now pick the `PARTIAL_SIG` whose
+  pubkey hashes to the output's key hash instead of the first sighash-eligible record, so a
+  signature under another key no longer makes the input unfinalizable; multisig pre-verifies
+  each key's signature (at most one ECDSA check per script key) and skips invalid ones. New
+  build dependency: `ripemd160` (hash160; already a transitive one).
+
 - **2026-09-10** — A1 fix campaign, 8 of 11 open findings closed (F1, F2, F3, F5, F8, F9,
   F10, F11; F4, F6, F7 remain open -- see the audit record's disposition for why).
   - ⛔⛔ **F1 (HIGH):** `finalize` never checked the spent output's amount at all -- a
