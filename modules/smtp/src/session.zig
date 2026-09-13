@@ -91,6 +91,11 @@ pub const Options = struct {
     /// Ceiling on recipients per transaction — a bound on what one call can
     /// make us allocate and send.
     max_recipients: usize = 1000,
+    /// How the body's line endings are sent (`data.Options`). The default
+    /// rewrites a lone LF or CR to CRLF — RFC 5321 §2.3.8 forbids sending
+    /// them bare. `.newline = .strict` refuses such a body instead, for bytes
+    /// that must reach the server unchanged (a message signed elsewhere).
+    data: data_mod.Options = .{},
 };
 
 pub const Envelope = struct {
@@ -99,7 +104,11 @@ pub const Envelope = struct {
     from: ?[]const u8,
     to: []const []const u8,
     /// The message, already composed (see `message.render`). The session
-    /// dot-stuffs it; do not pre-stuff.
+    /// dot-stuffs it; do not pre-stuff. Lone LF/CR line endings are rewritten
+    /// to CRLF unless `Options.data.newline = .strict`, which refuses them —
+    /// use that for bytes that must not change (A1 F6: a DKIM signature over
+    /// LF endings silently broke). `SIZE=` announces the size after that
+    /// handling (RFC 1870 §3), not `body.len`.
     body: []const u8,
     /// The body contains octets above 127 and needs RFC 6152 8BITMIME.
     eight_bit: bool = false,
@@ -585,7 +594,12 @@ pub const Session = struct {
         if (env.to.len > self.opts.max_recipients) return error.TooManyRecipients;
         if (env.eight_bit and self.esmtp and !self.caps.eightbitmime) return error.EightBitNotSupported;
         if (env.smtputf8 and !self.caps.smtputf8) return error.SmtpUtf8NotSupported;
-        if (self.caps.sizeExceeded(env.body.len)) return error.MessageTooLarge;
+        // The size of what goes on the wire, not of the slice handed in: LF
+        // endings grow to CRLF (A1 F6 — 100 000 B of LF text was announced
+        // as SIZE=100000 and sent as 102 000, past a 100 000 limit). Also the
+        // point where `.strict` refuses a bare LF/CR, before MAIL FROM.
+        const size = try data_mod.messageSize(env.body, self.opts.data);
+        if (self.caps.sizeExceeded(size)) return error.MessageTooLarge;
 
         // Validate every path BEFORE a single byte goes out: a rejected
         // recipient discovered halfway leaves the server holding a half-built
@@ -649,7 +663,12 @@ pub const Session = struct {
     fn mailParams(self: *const Session, env: Envelope) command.MailParams {
         if (!self.esmtp) return .{};
         return .{
-            .size = if (self.opts.announce_size and self.caps.size_advertised) env.body.len else null,
+            // `beginTransaction` already ran `messageSize` on this body with
+            // these options, so it cannot fail here.
+            .size = if (self.opts.announce_size and self.caps.size_advertised)
+                data_mod.messageSize(env.body, self.opts.data) catch unreachable
+            else
+                null,
             .body = if (env.eight_bit and self.caps.eightbitmime) .eight_bit_mime else null,
             .smtputf8 = env.smtputf8 and self.caps.smtputf8,
         };
@@ -1349,6 +1368,42 @@ test "a message larger than the advertised SIZE is refused before MAIL FROM" {
         .to = &.{"b@example.net"},
         .body = "much longer than ten octets",
     }));
+}
+
+test "SIZE counts the body as sent, not as given; strict refuses a bare LF up front (A1 F6)" {
+    const gpa = testing.allocator;
+    {
+        // 10 bytes of LF text is 15 on the wire: over a SIZE 10 server.
+        var s: Session = .init(gpa, .{ .tls = .disabled });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", "250-x\r\n250 SIZE 10\r\n" } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try testing.expectError(error.MessageTooLarge, s.beginTransaction(.{
+            .from = "a@example.com",
+            .to = &.{"b@example.net"},
+            .body = "a\nb\nc\nd\ne\n",
+        }));
+    }
+    {
+        // SIZE= announces the CRLF size.
+        var s: Session = .init(gpa, .{ .tls = .disabled });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_plain } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x\ny\n" });
+        const st = try s.next();
+        try testing.expectEqualStrings("MAIL FROM:<a@example.com> SIZE=6\r\n", st.send);
+    }
+    {
+        var s: Session = .init(gpa, .{ .tls = .disabled, .data = .{ .newline = .strict } });
+        defer s.deinit();
+        var sc: Script = .{ .gpa = gpa, .replies = &.{ "220 ready\r\n", ehlo_plain } };
+        defer sc.deinit();
+        try sc.run(&s);
+        try testing.expectError(error.BareLineFeed, s.beginTransaction(.{ .from = "a@example.com", .to = &.{"b@example.net"}, .body = "x\ny\n" }));
+    }
 }
 
 test "the null reverse-path used by bounces" {

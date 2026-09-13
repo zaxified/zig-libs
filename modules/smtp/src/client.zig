@@ -260,7 +260,7 @@ pub const Client = struct {
     /// never copied whole into another buffer.
     fn writeBody(self: *Client, body: []const u8) ClientError!void {
         var w: std.Io.Writer = .fixed(self.body_buf);
-        var st: data_mod.Stuffer = .init(.{});
+        var st: data_mod.Stuffer = .init(self.opts.session.data);
         const chunk = self.opts.body_chunk;
         var i: usize = 0;
         while (i < body.len) : (i += chunk) {

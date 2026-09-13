@@ -13,8 +13,9 @@
 //! Two things are deliberately strict:
 //!
 //! * The terminator is **only** `CRLF.CRLF`. A bare `LF.LF` (or `CR.CR`) does
-//!   not end the data, and by default a bare LF anywhere in a received stream
-//!   is `error.BareLineFeed`. Disagreement between an MTA that accepts `LF.LF`
+//!   not end the data — not even with `UnstuffOptions.allow_bare_lf`, which
+//!   only stops a bare LF from being an error — and by default a bare LF
+//!   anywhere in a received stream is `error.BareLineFeed`. Disagreement between an MTA that accepts `LF.LF`
 //!   and one that does not is exactly the 2023 "SMTP smuggling" flaw, which let
 //!   an attacker inject a whole second message into an authenticated session.
 //! * §4.5.3.1.6 caps a text line at 1000 octets including CRLF. Enforced, both
@@ -150,6 +151,38 @@ pub fn stuffAlloc(gpa: std.mem.Allocator, body: []const u8, opts: Options) (Stuf
     return aw.toOwnedSlice();
 }
 
+/// RFC 1870 §3's size of `body` as `Stuffer` sends it: octets including CRLF
+/// pairs after `opts.newline` handling, excluding doubled dots and the
+/// terminating `.CRLF`. A body not ending in a line break counts the CRLF
+/// `finish` adds. `.strict` refuses a lone LF or CR here, as `Stuffer` would.
+pub fn messageSize(body: []const u8, opts: Options) StuffError!u64 {
+    var n: u64 = 0;
+    var at_line_start = true;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            '\r' => {
+                if (i + 1 < body.len and body[i + 1] == '\n') {
+                    i += 1;
+                } else if (opts.newline == .strict) return error.BareCarriageReturn;
+                n += 2;
+                at_line_start = true;
+            },
+            '\n' => {
+                if (opts.newline == .strict) return error.BareLineFeed;
+                n += 2;
+                at_line_start = true;
+            },
+            else => {
+                n += 1;
+                at_line_start = false;
+            },
+        }
+    }
+    if (!at_line_start) n += 2;
+    return n;
+}
+
 // ── receive side ───────────────────────────────────────────────────────────
 
 pub const UnstuffError = error{
@@ -168,7 +201,9 @@ pub const UnstuffError = error{
 pub const UnstuffOptions = struct {
     max_line: usize = 998,
     max_body: usize = 64 * 1024 * 1024,
-    /// Off by default — see the file comment on SMTP smuggling.
+    /// Off by default — see the file comment on SMTP smuggling. On, a bare LF
+    /// ends a line of DATA instead of being `error.BareLineFeed`; it never
+    /// takes part in the terminator, which stays `CRLF "." CRLF`.
     allow_bare_lf: bool = false,
 };
 
@@ -183,6 +218,9 @@ pub const Unstuffer = struct {
     line: std.ArrayList(u8) = .empty,
     pending_cr: bool = false,
     done: bool = false,
+    /// The line before the current one ended in CRLF. True at the start: the
+    /// stream begins after the CRLF of the 354 exchange.
+    prev_crlf: bool = true,
 
     pub fn init(gpa: std.mem.Allocator, opts: UnstuffOptions) Unstuffer {
         return .{ .gpa = gpa, .opts = opts };
@@ -201,14 +239,14 @@ pub const Unstuffer = struct {
             if (self.pending_cr) {
                 self.pending_cr = false;
                 if (c != '\n') return error.BareCarriageReturn;
-                try self.endLine();
+                try self.endLine(true);
                 continue;
             }
             switch (c) {
                 '\r' => self.pending_cr = true,
                 '\n' => {
                     if (!self.opts.allow_bare_lf) return error.BareLineFeed;
-                    try self.endLine();
+                    try self.endLine(false);
                 },
                 else => {
                     if (self.line.items.len >= self.opts.max_line) return error.LineTooLong;
@@ -219,9 +257,16 @@ pub const Unstuffer = struct {
         return self.done;
     }
 
-    fn endLine(self: *Unstuffer) UnstuffError!void {
+    /// `crlf`: this line ended in CRLF rather than a tolerated bare LF.
+    fn endLine(self: *Unstuffer, crlf: bool) UnstuffError!void {
         const l = self.line.items;
-        if (l.len == 1 and l[0] == '.') {
+        const prev_crlf = self.prev_crlf;
+        self.prev_crlf = crlf;
+        // RFC 5321 §4.1.1.4: the terminator is CRLF "." CRLF — both breaks
+        // CRLF. A "." line with a bare LF on either side is data, so
+        // `\n.\n`, `\n.\r\n` and `\r\n.\n` cannot end the stream even with
+        // `allow_bare_lf` (CVE-2023-51764, A1 F2).
+        if (l.len == 1 and l[0] == '.' and crlf and prev_crlf) {
             self.done = true;
             self.line.clearRetainingCapacity();
             return;
@@ -396,6 +441,35 @@ test "SMTP smuggling: only CRLF.CRLF terminates the data" {
 
     // A lone CR inside the received stream is a framing lie.
     try testing.expectError(error.BareCarriageReturn, unstuffAlloc(gpa, "a\rb\r\n.\r\n", .{}));
+
+    // A1 F2 — WITH bare-LF tolerance on, the three CVE-2023-51764 spellings
+    // still do not end the data: the smuggled command stays inside the body
+    // instead of being handed back as the start of a second transaction.
+    for ([_][]const u8{ "\n.\n", "\n.\r\n", "\r\n.\n" }) |term| {
+        var t: Unstuffer = .init(gpa, .{ .allow_bare_lf = true });
+        defer t.deinit();
+        const smuggle = try std.mem.concat(gpa, u8, &.{ "a", term, "MAIL FROM:<evil@x.test>\r\n" });
+        defer gpa.free(smuggle);
+        try testing.expect(!try t.feed(smuggle));
+        try testing.expect(try t.feed(".\r\n"));
+        try testing.expect(std.mem.indexOf(u8, t.bytes(), "MAIL FROM:<evil@x.test>\r\n") != null);
+    }
+}
+
+test "messageSize is RFC 1870's size of what Stuffer sends (A1 F6)" {
+    try testing.expectEqual(@as(u64, 20), try messageSize("Subject: t\r\n\r\nline\r\n", .{}));
+    // LF endings are sent as CRLF: 17 bytes given, 20 on the wire.
+    try testing.expectEqual(@as(u64, 20), try messageSize("Subject: t\n\nline\n", .{}));
+    try testing.expectEqual(@as(u64, 6), try messageSize("a\rb", .{})); // lone CR, then the final CRLF
+    try testing.expectEqual(@as(u64, 0), try messageSize("", .{}));
+    try testing.expectError(error.BareLineFeed, messageSize("a\nb", .{ .newline = .strict }));
+    try testing.expectError(error.BareCarriageReturn, messageSize("a\rb", .{ .newline = .strict }));
+    // It agrees with the bytes Stuffer actually writes, minus doubled dots and ".\r\n".
+    const gpa = testing.allocator;
+    const body = "x\n.y\r\nz";
+    const wire = try stuffAlloc(gpa, body, .{});
+    defer gpa.free(wire);
+    try testing.expectEqual(@as(u64, wire.len - 1 - 3), try messageSize(body, .{})); // one doubled dot, ".\r\n"
 }
 
 test "malformed dot-stuffing on receive: a lone '.' line ends it, '..' is data" {

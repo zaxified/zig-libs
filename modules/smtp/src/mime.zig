@@ -299,6 +299,36 @@ pub fn writeRawHeader(w: *std.Io.Writer, name: []const u8, value: []const u8, op
     try f.finishLine();
 }
 
+/// Writes `name ":" value CRLF` with `value` exactly as given — no whitespace
+/// collapsing, no folding of its own — for bytes that are already final (a
+/// DKIM signature under `simple` canonicalization, RFC 6376 §3.4.1). `value`
+/// may be pre-folded, but only as RFC 5322 §2.2.3 folding: CRLF directly
+/// followed by SP or HTAB. Any other CR, LF, or a NUL is
+/// `error.ControlCharacterInHeader` (injection); a physical line over
+/// `opts.max_line` is `error.LineTooLong`.
+pub fn writeVerbatimHeader(w: *std.Io.Writer, name: []const u8, value: []const u8, opts: Options) HeaderError!void {
+    if (!validHeaderName(name)) return error.InvalidHeaderName;
+    var line_len: usize = name.len + 1;
+    var i: usize = 0;
+    while (i < value.len) : (i += 1) {
+        const c = value[i];
+        if (c == 0 or c == '\n') return error.ControlCharacterInHeader;
+        if (c == '\r') {
+            if (i + 2 >= value.len or value[i + 1] != '\n' or (value[i + 2] != ' ' and value[i + 2] != '\t'))
+                return error.ControlCharacterInHeader;
+            i += 1; // the LF; the WSP starts the next line
+            line_len = 0;
+            continue;
+        }
+        line_len += 1;
+        if (line_len > opts.max_line) return error.LineTooLong;
+    }
+    try w.writeAll(name);
+    try w.writeAll(":");
+    try w.writeAll(value);
+    try w.writeAll("\r\n");
+}
+
 /// One mailbox: an addr-spec plus an optional display name.
 pub const Address = struct {
     name: ?[]const u8 = null,

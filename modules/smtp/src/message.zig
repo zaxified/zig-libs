@@ -117,12 +117,17 @@ pub const Part = union(enum) {
 };
 
 /// A caller-supplied header. `raw` values are folded but never encoded, for a
-/// value the caller has already structured (`List-Unsubscribe`, a DKIM
-/// signature produced elsewhere, …).
+/// value the caller has already structured (`List-Unsubscribe`, …) — folding
+/// collapses runs of whitespace and re-breaks long values. `verbatim` values
+/// are written exactly as given after `name:`, for bytes that must not change:
+/// a DKIM signature produced elsewhere, whose `simple` canonicalization breaks
+/// under any whitespace change (A1 F8). A verbatim value may be pre-folded, but
+/// only as CRLF followed by SP or HTAB, and every line must fit the line limit.
 pub const Header = struct {
     name: []const u8,
     value: []const u8,
     raw: bool = false,
+    verbatim: bool = false,
 };
 
 pub const Message = struct {
@@ -281,7 +286,9 @@ pub fn render(
     mime.writeUnstructured(w, "Subject", msg.subject, opts.mime) catch |e| return wrap(e);
 
     for (msg.headers) |h| {
-        if (h.raw) {
+        if (h.verbatim) {
+            mime.writeVerbatimHeader(w, h.name, h.value, opts.mime) catch |e| return wrap(e);
+        } else if (h.raw) {
             mime.writeRawHeader(w, h.name, h.value, opts.mime) catch |e| return wrap(e);
         } else {
             mime.writeUnstructured(w, h.name, h.value, opts.mime) catch |e| return wrap(e);
@@ -921,6 +928,59 @@ test "F4: MIME parameter injection through subtype, charset or content_type" {
         const out = try render(gpa, m, prng.random(), .{});
         gpa.free(out);
     }
+}
+
+test "a verbatim header keeps its bytes; raw still folds; injection and long lines are refused (A1 F8)" {
+    const gpa = testing.allocator;
+    const sig = "v=1; a=rsa-sha256;  c=simple/simple;\td=example.com;\r\n\tb=AbC";
+    var prng = fixedRandom(1);
+    const doc = try render(gpa, .{
+        .from = .{ .addr = "a@example.com" },
+        .date = epoch_2026,
+        .message_id = "id@example.com",
+        .headers = &.{.{ .name = "DKIM-Signature", .value = sig, .verbatim = true }},
+        .body = .{ .text = .{ .body = "hi\r\n" } },
+    }, prng.random(), .{});
+    defer gpa.free(doc);
+    try testing.expect(std.mem.indexOf(u8, doc, "\r\nDKIM-Signature:" ++ sig ++ "\r\n") != null);
+
+    // Positive control: the same value as `raw` is folded and its whitespace collapsed.
+    var prng2 = fixedRandom(1);
+    const folded = try render(gpa, .{
+        .from = .{ .addr = "a@example.com" },
+        .date = epoch_2026,
+        .message_id = "id@example.com",
+        .headers = &.{.{ .name = "DKIM-Signature", .value = "v=1;  c=simple/simple;", .raw = true }},
+        .body = .{ .text = .{ .body = "hi\r\n" } },
+    }, prng2.random(), .{});
+    defer gpa.free(folded);
+    try testing.expect(std.mem.indexOf(u8, folded, "v=1;  c=") == null);
+
+    const bad = [_][]const u8{
+        "v=1\r\nBcc: victim@example.net", // CRLF not followed by WSP: injection
+        "v=1\nb=x", // bare LF
+        "v=1\rb=x", // bare CR
+        "v=1\x00", // NUL
+    };
+    for (bad) |v| {
+        var p = fixedRandom(1);
+        try testing.expectError(error.ControlCharacterInHeader, render(gpa, .{
+            .from = .{ .addr = "a@example.com" },
+            .date = epoch_2026,
+            .message_id = "id@example.com",
+            .headers = &.{.{ .name = "X-V", .value = v, .verbatim = true }},
+            .body = .{ .text = .{ .body = "hi\r\n" } },
+        }, p.random(), .{}));
+    }
+    var p = fixedRandom(1);
+    const long = [_]u8{'b'} ** 1000;
+    try testing.expectError(error.LineTooLong, render(gpa, .{
+        .from = .{ .addr = "a@example.com" },
+        .date = epoch_2026,
+        .message_id = "id@example.com",
+        .headers = &.{.{ .name = "X-V", .value = &long, .verbatim = true }},
+        .body = .{ .text = .{ .body = "hi\r\n" } },
+    }, p.random(), .{}));
 }
 
 test "Bcc never reaches the message unless the caller asks" {

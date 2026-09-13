@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 findings F2, F6, F8.
+  F2 (Q1): with `UnstuffOptions.allow_bare_lf = true`, a `.` line with a bare LF on either side
+  ended the DATA stream — CVE-2023-51764 SMTP smuggling. The terminator is now only
+  `CRLF "." CRLF` in every mode; tolerance only stops a bare LF from being an error.
+  F6 (Q5): `SIZE=` and the SIZE check used `body.len` while LF endings were sent as CRLF
+  (RFC 1870 §3 counts CRLF pairs); both now use the new `data.messageSize`. New
+  `session.Options.data` (reachable from `Client` through `ClientOptions.session`) lets a caller
+  choose `.newline = .strict`, which refuses a bare LF/CR in `beginTransaction` instead of
+  rewriting the bytes.
+  F8 (Q8): new `message.Header.verbatim` (and `mime.writeVerbatimHeader`) writes a value exactly
+  as given — pre-folded only as CRLF + SP/HTAB, lines within the limit — for a DKIM signature
+  produced elsewhere; `raw` keeps folding, and its doc no longer claims the DKIM case.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `render` now rejects a `RenderOptions.
   max_depth` above 512 with `error.DepthExceeded` (previously unbounded — a caller-set
   value above ~16,384 segfaulted rather than returning an error), and `Text.subtype`/

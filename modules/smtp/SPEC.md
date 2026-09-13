@@ -115,7 +115,7 @@ Both directions are strict about line endings, and that strictness is the point:
 | Input | Verdict |
 |---|---|
 | `CRLF.CRLF` | terminates the data |
-| `LF.LF` / `CR.CR` | does **not** terminate; a bare LF is `error.BareLineFeed` by default |
+| `LF.LF` / `CR.CR` | does **not** terminate, even with `allow_bare_lf` (A1 F2); a bare LF is `error.BareLineFeed` by default |
 | a CR not followed by LF | `error.BareCarriageReturn` |
 | a line over 998 octets (§4.5.3.1.6) | `error.LineTooLong`, on send and on receive |
 | data after the terminator | `error.DataAfterTerminator` |
@@ -352,7 +352,7 @@ CONVENTIONS.md §5 also puts outside NOTICE's scope.
 
 Honest list of what this module does **not** do:
 
-* **DKIM signing / verification (RFC 6376), ARC, SPF, DMARC.** A `raw` header lets a caller
+* **DKIM signing / verification (RFC 6376), ARC, SPF, DMARC.** A `verbatim` header (`Header.verbatim`, A1 F8; `raw` folds and would break DKIM `simple`) lets a caller
   attach a signature produced elsewhere; nothing here canonicalises or signs. DKIM's
   relaxed/simple body canonicalisation plus key management is a module of its own.
 * **DSN (RFC 3461).** The capability is parsed and the null reverse-path `<>` that bounces
