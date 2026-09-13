@@ -11,15 +11,29 @@ escapes (everything between them, `\t`/`\n`/`\r` included, is literal); double q
 as TRUE escapes, and a backslash before any OTHER character (including `n`/`t`/`r`) just drops the
 backslash and yields that character verbatim — UCI text has no backslash escape that PRODUCES a
 control byte, but `\t`/`\n`/`\r` can still appear literally, unescaped, inside either kind of quote
-(audit A1 U6, `uci_validate_text`, util.c:96 — the only three sub-0x20 bytes real `uci` allows in a
+(audit A1 U6, measured against the real binary — the only three sub-0x20 bytes real `uci` allows in a
 value, written back raw, not via an escape); bare words end at whitespace; adjacent segments of one
 token concatenate (`'a'"b"c` → `abc`). Audit A1 U5: a quote (either kind) MAY span physical lines —
-real `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187) keeps reading via `uci_getln`
+the real `uci` binary keeps reading
 until the matching quote closes, and the value keeps the real `\n` byte at each line break crossed;
 only running out of input with a quote still open is `error.UnterminatedQuote` (previously: any quote
 left open at the end of the line it started on, which rejected the ENTIRE file for a legitimate
-multi-line value — a certificate, an SSH key, a LuCI banner). Outside a quote the grammar is still
-exactly one physical line: a bare word, `#`, and the statement keyword never cross a `\n`. `#` starts
+multi-line value — a certificate, an SSH key, a LuCI banner). Outside a quote a statement is one
+physical line, except where a backslash continues it. **Statement grammar, all measured against the
+real binary run as a black box and replayed from `src/testdata/grammar_capture.txt` (130 probes,
+`tools/capture-grammar.sh`; audit A1 U8/U9/U10/U19, 2026-09-13):** outside quotes a backslash takes
+the next byte literally (`a\ b` is one word, `a\#b` is `a#b`), a backslash before LF or CRLF continues
+the word on the next line and adds nothing, and one at end of input adds nothing; inside double
+quotes a backslash before a line break adds nothing too (`"a\<LF>b"` is `ab`). `;` separates
+statements on one line, with a quirk the module reproduces: after a word that had a quote or an
+escape the `;` is a separator (`option a '1';option b 2` sets both), but inside a word of plain bytes
+it ends the word and discards the rest of the line, as `#` does (`option a 1;option b 2` sets `a`
+only). A `;` where a section name or value would start is an empty argument, not a separator
+(`option a ;b` has too many arguments); where a type, key or package name would start it is
+`MissingArgument`; a separator followed by nothing, or by another `;`, is `BadKeyword`. Keywords are
+`config`/`option`/`list`/`package` or `c`/`o`/`l`/`p`, and a quoted or escaped keyword is
+`BadKeyword`. A `package <name>` line is checked (one valid name) and ignored — the package is named
+by its file, so `Package.name` is only ever set by the caller, for `serialize`'s header. `#` starts
 a comment at the start of a token, OR anywhere inside a bare (unquoted) run — either way it truncates
 the token AND discards the rest of the line, matching real `uci` (audit A1 U4, measured against the
 real binary: `a#b` unquoted is `a`, not `a#b` — this SPEC previously claimed the opposite as "the
@@ -27,11 +41,13 @@ format", which the real binary disproved); `#` inside quotes stays literal. CRLF
 quote only — the CRLF tolerance is a statement-grammar convenience, not part of a quoted value's
 content). Repeated-key semantics: a repeated `option` under one key overwrites
 (last wins, matching `uci set`); `list` entries accumulate in order; mixing `option` and `list` under
-one key → `error.MixedOptionList`, and an `option`/`list` line with no value → `error.MissingArgument`
-— **both are this module's OWN additional strictness, not real UCI semantics** (audit A1 U11/U12):
-real `uci` merges a mixed option/list under one key (whichever kind appears LAST for that key wins,
-discarding the earlier kind) and loads a valueless `option` by simply dropping it, rather than
-rejecting the whole file either way. Section/option names real `uci` never accepts are rejected too
+one key → `error.MixedOptionList` — **this module's OWN additional strictness, not real UCI
+semantics** (audit A1 U11): real `uci` merges a mixed option/list under one key (whichever kind
+appears LAST for that key wins, discarding the earlier kind) rather than rejecting the whole file.
+An empty or missing value follows real `uci` (audit A1 U10, which supersedes the U12 rejection):
+`option k ''` and `option k` set nothing and leave an earlier value alone, `list k ''` and `list k`
+add an empty element; `serialize` refuses a hand-built single option with an empty value
+(`UnserializableValue`), since it could not be read back. Section/option names real `uci` never accepts are rejected too
 (audit A1 U7, `error.InvalidName`; not enforced on an option KEY when *writing* — see
 `SerializeError.InvalidName` in `root.zig`): section/option names must be alphanumeric or `_` (not
 even `-`); section types are looser (alphanumeric/`_` or any other printable, non-space ASCII byte).
@@ -73,6 +89,14 @@ config carrying a NAMED, an ANONYMOUS and a second NAMED section of one type —
 labels the anonymous section `@t[1]` in its own `uci show` output, so the ordering is corroborated
 from a second direction. Clean-room from the documented OpenWRT UCI file format, with the real
 binary used purely as a black-box oracle (root `NOTICE` §0).
+
+**Provenance check (audit A1 U17, 2026-09-13).** Earlier fix passes cited libuci source files and
+line numbers in comments here and in `root.zig`, which contradicted the clean-room statement above.
+libuci is LGPL-2.1. A reviewer who read libuci's source, kept apart from whoever edits this module,
+compared the two region by region (tokenizer, name validators, serializer quoting, section lookup,
+`nth`) and reported only verdicts: no ported logic, the matches are observable behaviour of the
+format. The citations were replaced by the black-box measurements they stood for, and the grammar
+fixed the same day (U8/U9/U10/U19) was written from `uci` runs alone.
 
 ## Threat model / out of scope
 Not security-sensitive; the hardening is denial-of-service and crash resistance on hostile config
@@ -163,7 +187,7 @@ quoting/bare-word styles.
    Fixed in the parser and serializer. ⚠ **Correction (audit A1 U6, after this SPEC entry was
    written):** the serializer fix above over-corrected — it rejected `\n`/`\t`/`\r` outright as
    `error.UnserializableValue`, on the reasoning that "no escape produces them" implied "they can't be
-   represented". That conflates two different claims: real `uci_validate_text` (util.c:96) DOES allow
+   represented". That conflates two different claims: the real binary DOES accept
    those three sub-0x20 bytes in a value, it just never needs a backslash escape for them — they're
    written back literally, raw, inside the quotes. The serializer now does the same. `\n` in
    particular is representable end to end only because a quote may now span physical lines (U5,
@@ -172,8 +196,8 @@ quoting/bare-word styles.
 3. **Audit A1 U5 (found in the follow-up fix campaign, not the original audit pass):** the parser
    used to be line-oriented — one statement, one physical line, full stop — so a quoted value that
    didn't close before the line ended was `error.UnterminatedQuote`, rejecting the WHOLE file. Real
-   `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187) instead keeps reading further
-   lines via `uci_getln` until the quote closes; the value keeps the real `\n` byte at each line break.
+   `uci` instead keeps reading further lines until the quote closes (measured); the value keeps the
+   real `\n` byte at each line break.
    A value with an embedded newline is not exotic here — a certificate, an SSH key, a LuCI banner —
    and the old behavior failed on the entire package for one such value, not just that option. Fixed
    by rewriting the tokenizer from line-oriented to byte-oriented: outside a quote, the statement
@@ -185,7 +209,8 @@ quoting/bare-word styles.
    commit for the RED→GREEN numbers.
 2. Real `uci export` prints a bare, unquoted `package <name>` header when the name is
    identifier-safe (`package testcfg`, not `package 'testcfg'`). Fixed (`serialize` now treats the
-   package name like a section-type word).
+   package name like a section-type word). Since audit A1 U19 (2026-09-13) that name comes from the
+   caller: `parse` checks a `package` line and ignores it, as real `uci` does when loading a file.
 
 **One style-only difference found and deliberately NOT changed:** a value containing a literal `'`
 is double-quoted by this module (`"a'b"`); real `uci` instead splices single-quoted segments the
@@ -216,7 +241,7 @@ question for the user. Four findings closed this way:
    at the start of a token. The real binary disproves it: `#` anywhere in a bare (unquoted) run
    truncates the token AND discards the rest of the line. Fixed in `nextToken`; the SPEC line above is
    corrected, not just the code.
-4. **U7 — no name/type/key validation.** Real uci's own validator (`uci_validate_str`) never accepted
+4. **U7 — no name/type/key validation.** The real uci binary never accepted
    most of the 15 hand-written probes this module did (hyphens/dots/spaces/non-ASCII in a name or
    type, hyphens/dots in a key) — dangerous on the WRITE path especially, since `serialize` could
    produce a file real uci refuses to load back, breaking the whole package, not just one section.
@@ -256,6 +281,6 @@ src/root.zig.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** src/root.zig:1110+ asserts against verbatim `uci export` / `uci show` stdout captured from a real uci binary, which is what surfaced two symmetric escape bugs a round trip could not see; the rest of the parse/serialise surface is hand-authored
+**What the tests actually contain.** src/root.zig:1110+ asserts against verbatim `uci export` / `uci show` stdout captured from a real uci binary, which is what surfaced two symmetric escape bugs a round trip could not see; `src/testdata/grammar_capture.txt` (130 probe files, `tools/capture-grammar.sh`) pins the statement grammar — backslash, `;`, empty values, `package` — against the same binary's `uci show`; the rest of the parse/serialise surface is hand-authored
 
 **How it got there.** The anchoring work landed. DONE 463e443: real uci; TWO symmetric escape bugs a round trip could never see

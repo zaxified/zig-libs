@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** audit A1 U8, U9, U10, U19 (round-2 decision: read the file as
+  the real `uci` binary does, established by RUNNING it, never by reading libuci) and U17
+  (provenance). Every rule below is replayed from `src/testdata/grammar_capture.txt`, 130 probe
+  files captured with the new `tools/capture-grammar.sh`.
+  U8: a backslash outside quotes takes the next byte literally (`a\ b` was `TooManyArguments`, is now
+  `a b`) or, before a line break, continues the word; inside double quotes a backslash before a line
+  break now adds nothing (`"a\<LF>b"` is `ab`, was `a<LF>b` — the old test asserted the unmeasured
+  guess).
+  U9: `;` separates statements on a line. After a word with a quote or escape it is a separator;
+  inside a plain word it drops the rest of the line, as real `uci` does. Keywords also accept
+  `c`/`o`/`l`/`p`; a quoted keyword is `BadKeyword`.
+  U10: `option k ''` and a valueless `option k` set nothing (was: an option with value `""`, and
+  `MissingArgument` — U12's rejection is superseded); `list k` adds an empty element. `serialize`
+  refuses an empty single value with `UnserializableValue`.
+  U19: a `package` line is validated and ignored; `parse` no longer sets `Package.name`, which is now
+  the caller's header for `serialize`, and `serialize` refuses an invalid one (`InvalidName`).
+  U17: comments citing libuci source lines (earlier entries below keep theirs as history) were
+  replaced by measurements after a separate reviewer found no ported logic.
+  `scripts/modtest uci`: 53/53 (was 52), Debug and ReleaseFast.
+
 - **2026-09-11** — Audit A1 U5/U6 (HIGH): the tokenizer was rewritten from line-oriented to
   byte-oriented. Real `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187) lets a quote
   span physical lines via `uci_getln`; this module used to reject the WHOLE FILE

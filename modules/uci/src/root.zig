@@ -24,10 +24,9 @@
 //! control byte, confirmed against a real `uci` binary — see SPEC.md);
 //! bare words end at whitespace.
 //! Adjacent segments of one token concatenate (`'a'"b"c` -> `abc`). Audit A1
-//! U5: a quote (either kind) MAY span physical lines -- real `uci`
-//! (`parse_single_quote`/`parse_double_quote`, file.c:157,187) keeps reading
-//! following lines via `uci_getln` until the matching quote closes, and the
-//! value keeps the real `\n` byte at each line break it crossed; only
+//! U5: a quote (either kind) MAY span physical lines -- the real `uci`
+//! binary keeps reading following lines until the matching quote closes,
+//! and the value keeps the real `\n` byte at each line break it crossed; only
 //! end-of-file inside an open quote is `error.UnterminatedQuote`. Everything
 //! OUTSIDE a quote is still exactly one physical line: a bare word, `#`, and
 //! the statement keyword never cross a `\n`. `#` starts a comment at the
@@ -44,10 +43,19 @@
 //! `list` entries under one key accumulate in order; mixing `option` and
 //! `list` under the same key is rejected as `error.MixedOptionList`.
 //!
+//! Statements: `;` separates statements on one line, a backslash outside
+//! quotes escapes the next byte or continues the line, an empty or missing
+//! `option` value sets nothing, and a `package` line is checked and ignored
+//! (audit A1 U8/U9/U10/U19 -- see `Parser.readWord` and `parseLine`).
+//!
 //! Provenance: clean-room from the documented OpenWRT UCI file format, with
 //! the real `uci` binary used purely as a black-box oracle (root `NOTICE`
-//! §0). Every behavioural claim about addressing is MEASURED against that
-//! binary and replayed from a frozen transcript.
+//! §0). Every behavioural claim is MEASURED against that binary and replayed
+//! from a frozen transcript. Audit A1 U17 (2026-09-13): earlier fix passes
+//! had cited libuci source lines in comments. A reviewer reading libuci
+//! source, separate from the author of this module, compared the two and
+//! found no ported logic, only matching observable behaviour; the citations
+//! were replaced by the measurements they describe.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -112,10 +120,14 @@ pub const ParseError = error{
     /// A1 U5: a quote may span physical lines, so this is no longer raised
     /// at the end of the line it opened on -- only at true end of file).
     UnterminatedQuote,
-    /// Line starts with a token other than `config`/`option`/`list`/`package`.
+    /// A statement starts with something other than `config`/`option`/
+    /// `list`/`package` or their one-letter forms `c`/`o`/`l`/`p` (a quoted
+    /// or escaped keyword included), or a `;` separator has no statement
+    /// after it.
     BadKeyword,
-    /// A keyword is missing a required argument (e.g. bare `config`,
-    /// `option key` with no value).
+    /// A keyword is missing a required argument: the section type, the
+    /// option key, the package name. A missing VALUE is not an error (audit
+    /// A1 U10): `option key` sets nothing, `list key` adds an empty element.
     MissingArgument,
     /// Extra tokens after a complete statement.
     TooManyArguments,
@@ -135,9 +147,8 @@ pub const ParseError = error{
     /// rejects ALL duplicate-name collisions (same type or not) rather than
     /// silently returning the wrong side.
     DuplicateSection,
-    /// Audit A1 U7: a section name, section type, or option key uses a
-    /// character real `uci`'s own validator (`uci_validate_str`, util.c)
-    /// never allows there -- anything other than alphanumeric/`_` for a
+    /// Audit A1 U7: a section name, section type, option key or package
+    /// name uses a character the real `uci` binary refuses there (measured) -- anything other than alphanumeric/`_` for a
     /// name/key, or non-printable/space for a type. Zero-length names/keys
     /// are NOT covered by this check (see the comment on `validNameChars`):
     /// `config ''`/`option '' v` stay accepted, a deliberately-tested shape
@@ -152,13 +163,15 @@ pub const ParseError = error{
 
 pub const SerializeError = error{
     /// A value contains a control character below 0x20 that is neither
-    /// `\t`, `\n`, nor `\r` -- those three are the ONLY sub-0x20 bytes real
-    /// `uci`'s own validator (`uci_validate_text`, util.c:96) allows in a
-    /// value, and it writes them back literally (unescaped, inside quotes),
+    /// `\t`, `\n`, nor `\r` -- those three are the ONLY sub-0x20 bytes the
+    /// real `uci` binary accepts in a value (measured), and it writes them
+    /// back literally (unescaped, inside quotes),
     /// not via a backslash escape -- there is no backslash escape that
     /// produces a control byte at all (audit A1 U6; see the parser's
     /// double-quote comment). Any OTHER control byte genuinely cannot be
-    /// represented in UCI text and is rejected here.
+    /// represented in UCI text and is rejected here. Also a `.single`
+    /// option whose value is empty: `option k ''` sets nothing when read
+    /// back (audit A1 U10), so it cannot be written.
     UnserializableValue,
     /// Audit A1 U7 (write side): a section name or section type uses a
     /// character real `uci` would refuse to load — see `ParseError.InvalidName`.
@@ -239,8 +252,10 @@ pub const Section = struct {
 };
 
 pub const Package = struct {
-    /// From an optional `package <name>` line; null when absent (the usual
-    /// case — the package is implicitly the file).
+    /// The package name `serialize` writes as a `package <name>` header;
+    /// null writes none. Set by the CALLER -- `parse` never fills it (audit
+    /// A1 U19): real `uci` names a package after its file and ignores a
+    /// `package` line inside it, so the line is validated and dropped.
     name: ?[]const u8 = null,
     sections: []const Section = &.{},
     arena_state: std.heap.ArenaAllocator.State = .{},
@@ -348,8 +363,8 @@ fn optStrEql(a: ?[]const u8, b: ?[]const u8) bool {
 
 // ── name validation (audit A1 U7) ───────────────────────────────────────────
 //
-// Real `uci`'s `uci_validate_str` (util.c:71) is called on three fields, with
-// two different character classes, and is the reason 15/15 hand-written
+// The real `uci` binary checks three fields, with two different character
+// classes (measured black-box), and that is the reason 15/15 hand-written
 // probes with an unusual section name/type/key were `MODULE-ACCEPTS-
 // LIBUCI-REJECTS` before this fix -- both on the READ path (this module
 // called a file "fine" that a real device's `uci_load` rejects outright) and,
@@ -412,7 +427,6 @@ pub fn parseDiag(gpa: Allocator, bytes: []const u8, diag: ?*Diagnostics) ParseEr
     };
 
     return .{
-        .name = p.pkg_name,
         .sections = p.finished,
         .arena_state = arena_impl.state,
     };
@@ -451,7 +465,6 @@ const Parser = struct {
     /// at the last line that actually had content (typically the statement
     /// that is wrong), not at an empty line past end of file.
     line_no: usize = 1,
-    pkg_name: ?[]const u8 = null,
     sections: std.ArrayList(Section) = .empty,
     current: ?SecBuild = null,
     finished: []Section = &.{},
@@ -534,9 +547,9 @@ const Parser = struct {
     /// Consume one raw byte of QUOTED content. Audit A1 U5/U6: unlike
     /// `bump`, this does NOT fold a `\r\n` pair -- every byte the file
     /// actually has, `\r` included, becomes part of the value verbatim,
-    /// matching `uci_getln` (file.c:41), which just keeps reading raw bytes
-    /// rather than translating line endings the way the *statement* grammar
-    /// does. Still bumps `line_no` (and checks the next line's length) on a
+    /// as the real `uci` binary does (measured: a quoted value keeps a CR
+    /// byte), rather than translating line endings the way the *statement*
+    /// grammar does. Still bumps `line_no` (and checks the next line's length) on a
     /// `\n` that has more input after it.
     fn quoteByte(p: *Parser) ParseError!u8 {
         const c = p.bytes[p.pos];
@@ -552,22 +565,141 @@ const Parser = struct {
         while (!p.atLineEnd()) p.pos += 1;
     }
 
+    /// One physical line: zero or more statements separated by `;`.
+    ///
+    /// Audit A1 U9. Every rule here is measured against the real `uci`
+    /// binary run as a black box (`tools/capture-grammar.sh`, replayed by the
+    /// "real uci grammar capture" test): `a 'b' ; c` and `a 'b';c` are two
+    /// statements, a blank or comment after a separator is fine, and a
+    /// separator with nothing after it (`option a 1 ;`) fails the load.
     fn parseLine(p: *Parser) ParseError!void {
-        const kw = (try p.nextToken()) orelse return; // blank or comment line
+        var after_separator = false;
+        while (true) {
+            p.skipBlank();
+            if (p.atLineEnd()) {
+                if (after_separator) return error.BadKeyword;
+                return;
+            }
+            switch (p.bytes[p.pos]) {
+                '#' => {
+                    p.skipToEndOfLine();
+                    return;
+                },
+                ';' => return error.BadKeyword,
+                else => {},
+            }
+            try p.parseStatement();
+            if (!try p.endStatement()) return;
+            after_separator = true;
+        }
+    }
 
-        if (std.mem.eql(u8, kw, "config")) {
-            const sec_type = (try p.nextToken()) orelse return error.MissingArgument;
+    fn skipBlank(p: *Parser) void {
+        while (p.pos < p.bytes.len and (p.bytes[p.pos] == ' ' or p.bytes[p.pos] == '\t')) p.pos += 1;
+    }
+
+    /// A word the statement cannot do without: a section type, an option
+    /// key, a package name. Absent, or a `;` where it would start, is
+    /// `MissingArgument`.
+    fn requiredArg(p: *Parser) ParseError![]const u8 {
+        p.skipBlank();
+        if (p.atLineEnd() or p.bytes[p.pos] == '#' or p.bytes[p.pos] == ';') return error.MissingArgument;
+        return (try p.readWord()).text;
+    }
+
+    /// A word the statement may go without: a section name, a value. Absent
+    /// reads as "". A `;` where it would start is consumed and also reads as
+    /// "" WITHOUT ending the statement (measured: `option a ;` loads,
+    /// `option a ;b` has too many arguments).
+    fn optionalArg(p: *Parser) ParseError![]const u8 {
+        p.skipBlank();
+        if (p.atLineEnd()) return "";
+        switch (p.bytes[p.pos]) {
+            '#' => {
+                p.skipToEndOfLine();
+                return "";
+            },
+            ';' => {
+                p.pos += 1;
+                return "";
+            },
+            else => return (try p.readWord()).text,
+        }
+    }
+
+    /// After a complete statement: the line ends, a comment starts, or a `;`
+    /// separates another statement on the same line (returns true).
+    fn endStatement(p: *Parser) ParseError!bool {
+        p.skipBlank();
+        if (p.atLineEnd()) return false;
+        switch (p.bytes[p.pos]) {
+            '#' => {
+                p.skipToEndOfLine();
+                return false;
+            },
+            ';' => {
+                p.pos += 1;
+                return true;
+            },
+            else => return error.TooManyArguments,
+        }
+    }
+
+    const Keyword = enum { config, option, list, package };
+
+    /// The statement keyword. Real `uci` also takes the one-letter forms and
+    /// refuses a quoted or escaped keyword (measured).
+    fn keywordOf(w: Word) ?Keyword {
+        if (w.special) return null;
+        const map = [_]struct { []const u8, []const u8, Keyword }{
+            .{ "config", "c", .config },
+            .{ "option", "o", .option },
+            .{ "list", "l", .list },
+            .{ "package", "p", .package },
+        };
+        for (map) |m| {
+            if (std.mem.eql(u8, w.text, m[0]) or std.mem.eql(u8, w.text, m[1])) return m[2];
+        }
+        return null;
+    }
+
+    fn parseStatement(p: *Parser) ParseError!void {
+        const kw = keywordOf(try p.readWord()) orelse return error.BadKeyword;
+        switch (kw) {
+            .config => try p.parseConfig(),
+            .option => try p.parseOption(.single),
+            .list => try p.parseOption(.list),
+            .package => {
+                // Audit A1 U19: real `uci` loading a config file checks this
+                // line and then ignores it -- the package is named by the
+                // file (measured: `package other` in file `pk` exports as
+                // `package pk`). So the name is validated and dropped.
+                const name = try p.requiredArg();
+                if (!validNameChars(name)) return error.InvalidName;
+            },
+        }
+    }
+
+    fn parseOption(p: *Parser, kind: Option.Kind) ParseError!void {
+        if (p.current == null) return error.OptionOutsideSection;
+        const key = try p.requiredArg();
+        // Audit A1 U7: option key must match real uci's name rule.
+        // Zero-length keys (`option '' v`) are exempted -- see
+        // `validNameChars`'s doc comment (audit A1 U18).
+        if (!validNameChars(key)) return error.InvalidName;
+        try p.addOption(key, try p.optionalArg(), kind);
+    }
+
+    fn parseConfig(p: *Parser) ParseError!void {
+        {
+            const sec_type = try p.requiredArg();
             // Audit A1 U7: section type must match real uci's (looser) name
-            // rule. Zero-length is never produced here (nextToken returns
-            // null, not "", at end of line -- MissingArgument already
-            // covers that), so no empty-string carve-out is needed for the
-            // type specifically; `config ''` below is the name case.
+            // rule.
             if (!validTypeChars(sec_type)) return error.InvalidName;
-            const name_tok = try p.nextToken();
-            if (try p.nextToken() != null) return error.TooManyArguments;
+            const name_tok = try p.optionalArg();
             try p.flushSection();
-            // An empty quoted name ('') is treated as anonymous.
-            const name: ?[]const u8 = if (name_tok) |n| (if (n.len > 0) n else null) else null;
+            // An empty name ('' or absent) is anonymous.
+            const name: ?[]const u8 = if (name_tok.len > 0) name_tok else null;
             // Audit A1 U7: a non-empty name must match real uci's name rule.
             if (name) |n| {
                 if (!validNameChars(n)) return error.InvalidName;
@@ -588,38 +720,34 @@ const Parser = struct {
                 }
             }
             p.current = .{ .section_type = sec_type, .name = name, .options = .empty, .index = .empty };
-        } else if (std.mem.eql(u8, kw, "option") or std.mem.eql(u8, kw, "list")) {
-            if (p.current == null) return error.OptionOutsideSection;
-            const key = (try p.nextToken()) orelse return error.MissingArgument;
-            // Audit A1 U7: option key must match real uci's name rule.
-            // Zero-length keys (`option '' v`) are exempted -- see
-            // `validNameChars`'s doc comment (audit A1 U18).
-            if (!validNameChars(key)) return error.InvalidName;
-            const value = (try p.nextToken()) orelse return error.MissingArgument;
-            if (try p.nextToken() != null) return error.TooManyArguments;
-            const kind: Option.Kind = if (kw[0] == 'o') .single else .list;
-            try p.addOption(key, value, kind);
-        } else if (std.mem.eql(u8, kw, "package")) {
-            const name = (try p.nextToken()) orelse return error.MissingArgument;
-            if (try p.nextToken() != null) return error.TooManyArguments;
-            p.pkg_name = name; // last one wins
-        } else {
-            return error.BadKeyword;
         }
     }
 
-    /// Read one whitespace-delimited token starting at the parser's cursor,
-    /// resolving quotes and escapes. Returns null at end of line, at a
-    /// comment, or at end of input.
-    fn nextToken(p: *Parser) ParseError!?[]const u8 {
-        while (p.pos < p.bytes.len and (p.bytes[p.pos] == ' ' or p.bytes[p.pos] == '\t')) p.pos += 1;
-        if (p.atLineEnd()) return null;
-        if (p.bytes[p.pos] == '#') {
-            p.skipToEndOfLine();
-            return null;
-        }
+    const Word = struct {
+        text: []const u8,
+        /// The word had a quoted segment or a backslash escape.
+        special: bool,
+    };
 
+    /// Read one word at the cursor, which the caller has placed on a byte
+    /// that is not blank, not a line end, not `#` and not `;`. Resolves
+    /// quotes and escapes; stops at whitespace, a comment, a `;` or the end
+    /// of the line.
+    ///
+    /// Two rules measured against the real `uci` binary, not documented
+    /// anywhere else:
+    ///   - Audit A1 U8: outside quotes a backslash takes the next byte
+    ///     literally (`a\ b` is one word `a b`, `a\#b` is `a#b`). A backslash
+    ///     before a line break continues the word on the next line and adds
+    ///     nothing; a backslash at end of input adds nothing.
+    ///   - Audit A1 U9: an unquoted `;` ends the word. If the word had a
+    ///     quote or an escape, the `;` is left for `endStatement` as a
+    ///     statement separator; in a word of plain bytes it discards the rest
+    ///     of the line, as `#` does (`option a 1;option b 2` loads `a` only,
+    ///     `option a '1';option b 2` loads both).
+    fn readWord(p: *Parser) ParseError!Word {
         var buf: std.ArrayList(u8) = .empty;
+        var special = false;
         outer: while (!p.atLineEnd()) {
             const c = p.bytes[p.pos];
             if (c == ' ' or c == '\t') break;
@@ -628,6 +756,7 @@ const Parser = struct {
                     // Single quotes: no escapes, everything literal. Audit
                     // A1 U5: the closing `'` may be on a later physical
                     // line; only running out of input unclosed is an error.
+                    special = true;
                     p.pos += 1;
                     while (true) {
                         if (p.pos >= p.bytes.len) return error.UnterminatedQuote;
@@ -637,69 +766,77 @@ const Parser = struct {
                     }
                 },
                 '"' => {
+                    special = true;
                     p.pos += 1;
-                    var closed = false;
-                    while (p.pos < p.bytes.len) {
+                    while (true) {
+                        if (p.pos >= p.bytes.len) return error.UnterminatedQuote;
                         const d = try p.quoteByte();
-                        if (d == '"') {
-                            closed = true;
-                            break;
-                        }
-                        if (d == '\\') {
-                            if (p.pos >= p.bytes.len) return error.UnterminatedQuote;
-                            // A backslash always just escapes-and-drops: the
-                            // following character is kept verbatim, whatever
-                            // it is -- including a real `\n` where a quote
-                            // continues onto the next physical line (audit
-                            // A1 U5). Verified against the real `uci` binary
-                            // (see SPEC.md's "real uci capture" section):
-                            // `\n`/`\t`/`\r` are NOT special-cased to
-                            // control bytes there either — `"a\nb"` round-
-                            // trips through real `uci export` as the
-                            // literal text `anb`, backslash dropped, 'n'
-                            // kept as-is, same as any other `\<char>`. UCI
-                            // text has no escape that produces an actual
-                            // control byte.
-                            const e = try p.quoteByte();
-                            try buf.append(p.arena, e);
-                        } else {
+                        if (d == '"') break;
+                        if (d != '\\') {
                             try buf.append(p.arena, d);
+                            continue;
                         }
+                        if (p.pos >= p.bytes.len) return error.UnterminatedQuote;
+                        // A backslash keeps the next byte verbatim, whatever
+                        // it is: `\n`/`\t`/`\r` are NOT control-byte escapes
+                        // (`"a\nb"` is `anb`), so UCI text has no escape that
+                        // produces a control byte. A backslash before a line
+                        // break (LF or CRLF) adds nothing and the value goes
+                        // on (`"a\<LF>b"` is `ab`). Measured against the real
+                        // `uci` binary.
+                        if (p.bytes[p.pos] == '\r' and p.pos + 1 < p.bytes.len and p.bytes[p.pos + 1] == '\n') {
+                            _ = try p.quoteByte();
+                        }
+                        const e = try p.quoteByte();
+                        if (e != '\n') try buf.append(p.arena, e);
                     }
-                    if (!closed) return error.UnterminatedQuote;
+                },
+                '\\' => {
+                    special = true;
+                    p.pos += 1;
+                    if (p.pos >= p.bytes.len) break;
+                    if (p.atLineEnd()) {
+                        _ = try p.bump(); // continuation: the word goes on
+                        continue;
+                    }
+                    try buf.append(p.arena, p.bytes[p.pos]);
+                    p.pos += 1;
                 },
                 '#' => {
                     p.skipToEndOfLine();
                     break :outer;
                 },
+                ';' => {
+                    if (!special) p.skipToEndOfLine();
+                    break :outer;
+                },
                 else => {
-                    // Bare run: up to whitespace, a quote (concatenation),
-                    // '#', or end of line -- a bare word never spans lines.
-                    // Audit A1 U4: real `uci` (`parse_str`, file.c:206)
-                    // treats '#' ANYWHERE in a bare run as comment-start, not
-                    // just at the start of a token -- it truncates the
-                    // current token there and discards the rest of the
-                    // *line* (not just the token) as a comment. '#' inside a
-                    // quoted segment is unaffected -- real uci's quote
-                    // scanners never reach this branch at all.
+                    // Bare run: up to whitespace, a quote (concatenation), a
+                    // backslash, '#', ';', or end of line. Audit A1 U4
+                    // (measured against the real `uci` binary): '#' ANYWHERE
+                    // in a bare run starts a comment -- it truncates the
+                    // current word and discards the rest of the *line*.
+                    // Inside a quoted segment '#' is literal.
                     const start = p.pos;
                     while (!p.atLineEnd()) {
-                        const d = p.bytes[p.pos];
-                        if (d == ' ' or d == '\t' or d == '\'' or d == '"' or d == '#') break;
-                        p.pos += 1;
+                        switch (p.bytes[p.pos]) {
+                            ' ', '\t', '\'', '"', '#', ';', '\\' => break,
+                            else => p.pos += 1,
+                        }
                     }
                     try buf.appendSlice(p.arena, p.bytes[start..p.pos]);
-                    if (!p.atLineEnd() and p.bytes[p.pos] == '#') {
-                        p.skipToEndOfLine(); // discard the rest of the line too
-                        break :outer;
-                    }
                 },
             }
         }
-        return try buf.toOwnedSlice(p.arena);
+        return .{ .text = try buf.toOwnedSlice(p.arena), .special = special };
     }
 
     fn addOption(p: *Parser, key: []const u8, value: []const u8, kind: Option.Kind) ParseError!void {
+        // Audit A1 U10: an empty value on `option` sets nothing -- no option
+        // is created and an existing one is left as it was (measured: `option
+        // v 'x'` then `option v ''` loads `v='x'`). On `list` it is a real,
+        // empty element.
+        if (kind == .single and value.len == 0) return;
         const cur = &p.current.?;
         if (cur.index.get(key)) |idx| {
             const ob = &cur.options.items[idx];
@@ -763,6 +900,7 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
     errdefer out.deinit(gpa);
 
     if (pkg.name) |n| {
+        if (!validNameChars(n)) return error.InvalidName;
         try out.appendSlice(gpa, "package ");
         // Bare when identifier-safe, matching real `uci export`'s own
         // rendering (verified: it prints `package testcfg`, not
@@ -793,6 +931,7 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
                 .list => "list",
             };
             for (opt.values) |v| {
+                if (opt.kind == .single and v.len == 0) return error.UnserializableValue;
                 try out.append(gpa, '\t');
                 try out.appendSlice(gpa, kw);
                 try out.append(gpa, ' ');
@@ -821,8 +960,8 @@ fn writeWord(gpa: Allocator, out: *std.ArrayList(u8), word: []const u8) Serializ
     return writeValue(gpa, out, word);
 }
 
-/// Audit A1 U6: `\t`/`\n`/`\r` are the ONLY sub-0x20 bytes real `uci`
-/// permits in a value (`uci_validate_text`, util.c:96) and it writes them
+/// Audit A1 U6: `\t`/`\n`/`\r` are the ONLY sub-0x20 bytes the real `uci`
+/// binary accepts in a value (measured) and it writes them
 /// back LITERALLY, not via a backslash escape -- there is no backslash
 /// escape that produces a control byte at all (see the parser's
 /// double-quote comment). This module previously treated ALL sub-0x20 bytes
@@ -912,7 +1051,9 @@ test "golden: parse network config model" {
     var pkg = try parse(gpa, golden_network);
     defer pkg.deinit(gpa);
 
-    try testing.expectEqualStrings("network", pkg.name.?);
+    // Audit A1 U19: the file's `package 'network'` line is checked and
+    // ignored, as real `uci` does -- the package is named by its file.
+    try testing.expect(pkg.name == null);
     try testing.expectEqual(@as(usize, 3), pkg.sections.len);
 
     const lan = &pkg.sections[0];
@@ -986,7 +1127,7 @@ test "single quotes take no escapes" {
 test "bare words and mid-word hash" {
     // Audit A1 U4: real `uci` truncates a bare word AND discards the rest of
     // the line at a mid-word '#' (measured against the real binary; see the
-    // comment in `nextToken`'s bare-word branch). `option b a#b` therefore
+    // comment in `readWord`'s bare-word branch). `option b a#b` therefore
     // yields the *option* `b` with a value of `a`, not `a#b` -- and the `c`
     // that would otherwise follow on the same line never becomes its own
     // option because everything past `#` is gone.
@@ -1005,13 +1146,12 @@ test "bare words and mid-word hash" {
     try testing.expectEqualStrings("a", pkg2.sections[0].get("v").?);
 
     // A mid-word '#' inside a KEY truncates the key too and discards the
-    // rest of the line -- so the value token that would follow is gone,
-    // which is `error.MissingArgument`, not a key literally named "a#b".
-    var diag: Diagnostics = .{};
-    try testing.expectError(
-        error.MissingArgument,
-        parseDiag(gpa, "config t\n\toption a#b v\n", &diag),
-    );
+    // rest of the line -- so the value that would follow is gone. A missing
+    // value sets nothing (audit A1 U10), so the section has no option at
+    // all, and certainly not one literally named "a#b".
+    var pkg3 = try parse(gpa, "config t\n\toption a#b v\n");
+    defer pkg3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), pkg3.sections[0].options.len);
 }
 
 test "token concatenation of quoted segments" {
@@ -1112,12 +1252,40 @@ test "empty file and comment-only file" {
     try testing.expectEqual(@as(usize, 0), comments.sections.len);
 }
 
-test "empty quoted value" {
+test "audit A1 U10: an empty or missing option value sets nothing; an empty list value is an element" {
     const gpa = testing.allocator;
-    var pkg = try parse(gpa, "config t\n\toption empty ''\n");
+    // Measured against the real `uci` binary: `option v ''`, `option v ""`
+    // and `option v` load no option, and do not clear an earlier value.
+    var pkg = try parse(gpa, "config t\n\toption empty ''\n\toption dq \"\"\n\toption none\n\toption kept 'x'\n\toption kept ''\n");
     defer pkg.deinit(gpa);
-    try testing.expectEqualStrings("", pkg.sections[0].get("empty").?);
-    try expectRoundTrip("config t\n\toption empty ''\n");
+    try testing.expect(pkg.sections[0].get("empty") == null);
+    try testing.expect(pkg.sections[0].get("dq") == null);
+    try testing.expect(pkg.sections[0].get("none") == null);
+    try testing.expectEqualStrings("x", pkg.sections[0].get("kept").?);
+    try testing.expectEqual(@as(usize, 1), pkg.sections[0].options.len);
+
+    // `list l ''` and `list l` are real, empty elements.
+    var pkg2 = try parse(gpa, "config t\n\tlist l 'a'\n\tlist l ''\n\tlist l\n");
+    defer pkg2.deinit(gpa);
+    const l = pkg2.sections[0].getList("l");
+    try testing.expectEqual(@as(usize, 3), l.len);
+    try testing.expectEqualStrings("", l[1]);
+    try testing.expectEqualStrings("", l[2]);
+    try expectRoundTrip("config t\n\tlist l 'a'\n\tlist l ''\n");
+
+    // The empty value is a no-op before any option/list check: it does not
+    // trip MixedOptionList on an existing list.
+    var pkg3 = try parse(gpa, "config t\n\tlist l 'a'\n\toption l ''\n");
+    defer pkg3.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), pkg3.sections[0].getList("l").len);
+
+    // A hand-built empty single value cannot be written: it would read back
+    // as no option.
+    const vals = [_][]const u8{""};
+    const opts = [_]Option{.{ .key = "k", .kind = .single, .values = &vals }};
+    const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
+    const hand: Package = .{ .sections = &secs };
+    try testing.expectError(error.UnserializableValue, serialize(gpa, &hand));
 }
 
 test "serializer quoting choices" {
@@ -1158,9 +1326,9 @@ test "serializer rejects unescapable control chars" {
 }
 
 test "serializer WRITES \\n \\t \\r literally, unescaped -- audit A1 U6, supersedes the old rejection" {
-    // Audit A1 U6: real `uci_validate_text` (util.c:96) explicitly allows
-    // `\t`/`\n`/`\r` in a value -- the ONLY three sub-0x20 bytes it allows
-    // -- and real `uci export` writes them back raw, inside quotes, no
+    // Audit A1 U6: the real `uci` binary accepts `\t`/`\n`/`\r` in a value
+    // -- the ONLY three sub-0x20 bytes it accepts (measured) -- and real
+    // `uci export` writes them back raw, inside quotes, no
     // escape at all. The module previously rejected all three as
     // `error.UnserializableValue`, having conflated "no BACKSLASH escape
     // produces a control byte" (true) with "no control byte can be
@@ -1210,11 +1378,10 @@ test "error: unterminated double quote with line number" {
 }
 
 test "audit A1 U5: a quoted value may span physical lines, matching real uci" {
-    // Real `uci` (`parse_single_quote`/`parse_double_quote`, file.c:157,187)
-    // keeps reading via `uci_getln` when a quote hits end of line without
-    // closing -- it does not error until end of FILE. The value keeps the
-    // real `\n` byte at every line break it crossed (file.c:41). This is
-    // the audit's own end-to-end example (single- and double-quoted).
+    // The real `uci` binary keeps reading when a quote hits end of line
+    // without closing -- it does not error until end of FILE. The value
+    // keeps the real `\n` byte at every line break it crossed (measured).
+    // This is the audit's own end-to-end example (single- and double-quoted).
     const gpa = testing.allocator;
     var pkg = try parse(
         gpa,
@@ -1224,14 +1391,16 @@ test "audit A1 U5: a quoted value may span physical lines, matching real uci" {
     try testing.expectEqualStrings("a\tb", pkg.sections[0].get("tabbed").?);
     try testing.expectEqualStrings("line1\nline2", pkg.sections[0].get("multi").?);
 
-    // Double-quoted values span lines too, including through an escape that
-    // straddles the line break.
+    // Double-quoted values span lines too. A backslash right before the
+    // line break is a continuation and adds nothing: this test used to
+    // expect "line1\nline2" here, which the real binary disproves
+    // (`"a\<LF>b"` loads as `ab`; audit A1 U8, 2026-09-13).
     var pkg2 = try parse(
         gpa,
         "config t\n\toption v \"line1\\\nline2\"\n\toption w \"a\nb\"\n",
     );
     defer pkg2.deinit(gpa);
-    try testing.expectEqualStrings("line1\nline2", pkg2.sections[0].get("v").?);
+    try testing.expectEqualStrings("line1line2", pkg2.sections[0].get("v").?);
     try testing.expectEqualStrings("a\nb", pkg2.sections[0].get("w").?);
 
     // A statement AFTER a multi-line quote is still parsed correctly --
@@ -1285,9 +1454,13 @@ test "error: missing argument" {
     var diag: Diagnostics = .{};
     try testing.expectError(error.MissingArgument, parseDiag(gpa, "config\n", &diag));
     try testing.expectEqual(@as(usize, 1), diag.line);
-    try testing.expectError(error.MissingArgument, parseDiag(gpa, "config s\n\toption k\n", &diag));
+    try testing.expectError(error.MissingArgument, parseDiag(gpa, "config s\n\toption\n", &diag));
     try testing.expectEqual(@as(usize, 2), diag.line);
     try testing.expectError(error.MissingArgument, parseDiag(gpa, "package\n", &diag));
+    // A `;` where a required word would start (measured: "insufficient
+    // arguments").
+    try testing.expectError(error.MissingArgument, parseDiag(gpa, "config s\n\toption ;a b\n", &diag));
+    // A missing VALUE is not an error (audit A1 U10): see the U10 test.
 }
 
 test "error: too many arguments" {
@@ -1373,11 +1546,25 @@ test "crlf input" {
     try testing.expectEqualStrings("b", pkg.sections[0].get("a").?);
 }
 
-test "package keyword and header serialization" {
+test "audit A1 U19: a package line is checked and ignored; the header comes from the caller" {
     const gpa = testing.allocator;
     var pkg = try parse(gpa, "package dhcp\n\nconfig dnsmasq\n\toption domain 'lan'\n");
     defer pkg.deinit(gpa);
-    try testing.expectEqualStrings("dhcp", pkg.name.?);
+    // Measured: `package other` in file `pk` exports as `package pk`.
+    try testing.expect(pkg.name == null);
+    const bare = try serialize(gpa, &pkg);
+    defer gpa.free(bare);
+    try testing.expectEqualStrings("config dnsmasq\n\toption domain 'lan'\n", bare);
+
+    // Checked all the same: a missing, extra or invalid name fails the load.
+    try testing.expectError(error.MissingArgument, parse(gpa, "package\n"));
+    try testing.expectError(error.TooManyArguments, parse(gpa, "package a b\n"));
+    try testing.expectError(error.InvalidName, parse(gpa, "package 'weird name'\n"));
+    try testing.expectError(error.InvalidName, parse(gpa, "package a-b\n"));
+    var quoted = try parse(gpa, "package 'ok'\nconfig t\n");
+    quoted.deinit(gpa);
+
+    pkg.name = "dhcp";
     const text = try serialize(gpa, &pkg);
     defer gpa.free(text);
     // Bare, unquoted — matches real `uci export`'s own rendering (see the
@@ -1390,17 +1577,14 @@ test "package keyword and header serialization" {
     try expectRoundTrip(text);
 }
 
-test "package name needing quotes still gets them (not identifier-safe)" {
+test "serialize refuses a package name real uci would not load" {
+    // Audit A1 U19: `package 'weird name'` used to be accepted and written
+    // back quoted. The real binary refuses it ("invalid character in name
+    // field"), so a header carrying it would break the file on a device.
     const gpa = testing.allocator;
-    var pkg = try parse(gpa, "package 'weird name'\n\nconfig t\n\toption a 'b'\n");
-    defer pkg.deinit(gpa);
-    const text = try serialize(gpa, &pkg);
-    defer gpa.free(text);
-    try testing.expectEqualStrings(
-        "package 'weird name'\n\nconfig t\n\toption a 'b'\n",
-        text,
-    );
-    try expectRoundTrip(text);
+    const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &.{} }};
+    const pkg: Package = .{ .name = "weird name", .sections = &secs };
+    try testing.expectError(error.InvalidName, serialize(gpa, &pkg));
 }
 
 test "quoted type round-trips when it needs quoting but is still a valid name" {
@@ -1417,8 +1601,8 @@ test "quoted type round-trips when it needs quoting but is still a valid name" {
 }
 
 test "invalid section type, name, and option key are rejected" {
-    // Regression for audit A1 U7: real `uci`'s own validator
-    // (`uci_validate_str`, util.c) restricts section/option NAMEs to
+    // Regression for audit A1 U7: the real `uci` binary (measured)
+    // restricts section/option NAMEs to
     // alphanumeric + `_`, and section TYPEs to printable ASCII (33-126,
     // still excluding space). Before this fix all 15/15 hand-written probes
     // with such a name/type/key were `MODULE-ACCEPTS-LIBUCI-REJECTS`; this
@@ -1771,7 +1955,9 @@ test "corpus: every config seed reaches parse, and the model built is pinned" {
     try testing.expectEqual(parse_seeds.len - 1, nonempty); // the deliberate empty seed
     try testing.expectEqual(@as(usize, 10), accepted);
     try testing.expectEqual(@as(usize, 48), sections);
-    try testing.expectEqual(@as(usize, 47), values);
+    // 47 until 2026-09-13: the `option v ''` seed now sets nothing (audit A1
+    // U10), so it contributes no value.
+    try testing.expectEqual(@as(usize, 46), values);
 }
 
 /// Fill `buf` from the script and return the slice — including bytes below
@@ -1878,7 +2064,9 @@ const RoundTripBuild = struct {
                 const kind: Option.Kind = if (c.byte() & 1 == 1) .single else .list;
                 const n_values: usize = if (kind == .single) 1 else c.ranged(1, 3);
                 for (0..n_values) |vi| {
-                    self.value_slices[si][oi][vi] = fuzzToken(c, &self.val_bufs[si][oi][vi], 0);
+                    // A single option needs a non-empty value: `option k ''`
+                    // sets nothing (audit A1 U10) and cannot be serialized.
+                    self.value_slices[si][oi][vi] = fuzzToken(c, &self.val_bufs[si][oi][vi], if (kind == .single) 1 else 0);
                 }
                 self.options[si][oi] = .{ .key = key, .kind = kind, .values = self.value_slices[si][oi][0..n_values] };
             }
@@ -1921,10 +2109,16 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
     };
     defer reparsed.deinit(gpa);
 
-    if (!pkg.eql(&reparsed)) {
+    // `parse` never fills `name` (audit A1 U19): the header is written from
+    // the caller's value and ignored on the way back, so compare without it
+    // and hand it back before reserializing.
+    var expected = pkg;
+    expected.name = null;
+    if (!expected.eql(&reparsed)) {
         std.debug.print("uci fuzz: round-trip mismatch\ninput text:\n{s}\n", .{s1});
         return error.RoundTripMismatch;
     }
+    reparsed.name = pkg.name;
 
     const s2 = try serialize(gpa, &reparsed);
     defer gpa.free(s2);
@@ -2179,7 +2373,111 @@ test "real uci capture: our serialize() reproduces real `uci export`'s canonical
     // equal model (the governing invariant `serialize` promises).
     var reparsed = try parse(gpa, text);
     defer reparsed.deinit(gpa);
+    // The header is ignored on the way back (audit A1 U19).
+    try testing.expect(reparsed.name == null);
+    reparsed.name = pkg.name;
     try testing.expect(pkg.eql(&reparsed));
+}
+
+// ── real uci grammar capture (audit A1 U8/U9/U10/U19) ───────────────────────
+//
+// `testdata/grammar_capture.txt` is the real `uci` binary's verdict on 130
+// small config files, taken with `tools/capture-grammar.sh` (black box: the
+// binary is run, its source is not read). It pins the statement grammar this
+// module used to get wrong: a backslash outside quotes (U8), `;` between
+// statements (U9), empty values (U10), the `package` line (U19) and the
+// one-letter keywords.
+
+const grammar_capture = @embedFile("testdata/grammar_capture.txt");
+
+/// `uci show` of a package loaded from a file named `p`: a line per section
+/// (`p.<name>=<type>`, or `p.@<type>[<n>]=<type>` for an anonymous one, `n`
+/// counting every earlier section of that type) and a line per option, each
+/// value single-quoted with `'` spelled `'\''`, list values space-separated.
+fn renderShow(gpa: Allocator, pkg: *const Package) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var ref: std.ArrayList(u8) = .empty;
+    defer ref.deinit(gpa);
+    for (pkg.sections, 0..) |*s, i| {
+        ref.clearRetainingCapacity();
+        if (s.name) |n| {
+            try ref.appendSlice(gpa, n);
+        } else {
+            var idx: usize = 0;
+            for (pkg.sections[0..i]) |*prev| {
+                if (std.mem.eql(u8, prev.type, s.type)) idx += 1;
+            }
+            try ref.print(gpa, "@{s}[{d}]", .{ s.type, idx });
+        }
+        try out.print(gpa, "p.{s}={s}\n", .{ ref.items, s.type });
+        for (s.options) |o| {
+            try out.print(gpa, "p.{s}.{s}=", .{ ref.items, o.key });
+            for (o.values, 0..) |v, vi| {
+                if (vi != 0) try out.append(gpa, ' ');
+                try out.append(gpa, '\'');
+                for (v) |c| {
+                    if (c == '\'') try out.appendSlice(gpa, "'\\''") else try out.append(gpa, c);
+                }
+                try out.append(gpa, '\'');
+            }
+            try out.append(gpa, '\n');
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn hexAlloc(gpa: Allocator, hex: []const u8) ![]u8 {
+    const buf = try gpa.alloc(u8, hex.len / 2);
+    errdefer gpa.free(buf);
+    _ = try std.fmt.hexToBytes(buf, hex);
+    return buf;
+}
+
+test "real uci grammar capture: each probe loads or is refused as the real binary does, into the same model (audit A1 U8/U9/U10/U19)" {
+    const gpa = testing.allocator;
+    var records: usize = 0;
+    var refused: usize = 0;
+    var mismatches: usize = 0;
+    var lines = std.mem.tokenizeScalar(u8, grammar_capture, '\n');
+    while (lines.next()) |line| {
+        if (line[0] == '#') continue;
+        try testing.expect(std.mem.startsWith(u8, line, "in "));
+        const input = try hexAlloc(gpa, line[3..]);
+        defer gpa.free(input);
+        const verdict = lines.next() orelse return error.TestUnexpectedResult;
+        records += 1;
+
+        if (std.mem.eql(u8, verdict, "err")) {
+            refused += 1;
+            if (parse(gpa, input)) |ok| {
+                var pkg = ok;
+                pkg.deinit(gpa);
+                std.debug.print("uci capture: real uci refuses, module loads: {x}\n", .{input});
+                mismatches += 1;
+            } else |_| {}
+            continue;
+        }
+        try testing.expect(std.mem.startsWith(u8, verdict, "out "));
+        const want = try hexAlloc(gpa, verdict[4..]);
+        defer gpa.free(want);
+        var pkg = parse(gpa, input) catch |err| {
+            std.debug.print("uci capture: real uci loads, module refuses ({t}): {x}\n", .{ err, input });
+            mismatches += 1;
+            continue;
+        };
+        defer pkg.deinit(gpa);
+        const got = try renderShow(gpa, &pkg);
+        defer gpa.free(got);
+        if (!std.mem.eql(u8, want, got)) {
+            std.debug.print("uci capture: model differs for {x}\nreal:\n{s}module:\n{s}\n", .{ input, want, got });
+            mismatches += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), mismatches);
+    // A capture that parses to nothing passes the loop above vacuously.
+    try testing.expectEqual(@as(usize, 130), records);
+    try testing.expectEqual(@as(usize, 47), refused);
 }
 
 // Second capture: one option per escape sequence, isolating exactly which

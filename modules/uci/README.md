@@ -71,7 +71,18 @@ _ = pkg.eql(&other);
 
 ## Format coverage / semantics
 
-- Named and anonymous sections; optional `package <name>` header line.
+- Named and anonymous sections. A `package <name>` line is checked (one valid
+  name) and ignored, as real `uci` does when loading a file (audit A1 U19):
+  `parse` never sets `Package.name`; set it yourself to get a header from
+  `serialize`.
+- Statements, measured against the real `uci` binary and replayed from
+  `src/testdata/grammar_capture.txt` (audit A1 U8/U9): keywords `config`/
+  `option`/`list`/`package` or `c`/`o`/`l`/`p`; outside quotes a backslash
+  takes the next byte literally, or continues the line before a line break;
+  `;` separates statements on one line — except inside a word of plain bytes,
+  where it ends the word and drops the rest of the line like `#` does
+  (`option a 1;option b 2` sets only `a`, `option a '1';option b 2` sets
+  both). Details in SPEC.md.
 - Single quotes: no escapes — everything between them, `\t`/`\n`/`\r`
   included, is literal. Double quotes: `\" \' \\` are true escapes; a
   backslash before ANY OTHER character (including `n`/`t`/`r`) drops the
@@ -87,10 +98,9 @@ _ = pkg.eql(&other);
   containing a real newline — a certificate, an SSH key, a multi-line LuCI
   form field — is accepted and round-trips as a multi-line quoted literal,
   e.g. `option multi 'line1` + newline + `line2'`, matching real `uci`
-  (`uci_getln`, file.c:41). Only running out of input with a quote still
-  open is `error.UnterminatedQuote`. Everything OUTSIDE a quote is still
-  exactly one physical line — a bare word, `#`, and the statement keyword
-  never cross a `\n`.
+  (measured). Only running out of input with a quote still open is
+  `error.UnterminatedQuote`. Outside a quote only a backslash continues a
+  statement onto the next line.
 - Comments: `#` to end of line at the start of a token, OR anywhere inside a
   bare (unquoted) run — either way it truncates the token and discards the
   rest of the *line*, matching real `uci` (audit A1 U4: `a#b` unquoted is
@@ -98,12 +108,12 @@ _ = pkg.eql(&other);
   only; not part of a quoted value's own content).
 - Repeated `option` under one key: last wins. `list` accumulates in order.
   Mixing `option`/`list` under one key is rejected here as
-  `error.MixedOptionList`, and an `option`/`list` with no value as
-  `error.MissingArgument` — both are this module's OWN additional
-  strictness, not real UCI semantics (audit A1 U11/U12): real `uci` merges a
-  mixed option/list (last kind for that key wins) and loads a file with a
-  valueless `option` by simply dropping it, rather than rejecting the whole
-  file either way.
+  `error.MixedOptionList` — this module's OWN additional strictness, not
+  real UCI semantics (audit A1 U11): real `uci` merges a mixed option/list
+  (last kind for that key wins) rather than rejecting the whole file. An
+  empty or missing value does what real `uci` does (audit A1 U10): `option
+  k ''` / `option k` set nothing and keep an earlier value, `list k ''` /
+  `list k` add an empty element.
 - Section/option names must be alphanumeric or `_` (not even `-`); section
   types allow any other printable, non-space ASCII byte too. Real `uci`'s own
   validator draws the same line, on both the read AND write path — a name it
