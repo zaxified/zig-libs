@@ -716,8 +716,8 @@ pub const Broker = struct {
     // atomic read-modify-write without libatomic, so `@atomicRmw` on a `u64`
     // is a *compile* error there: `expected 32-bit integer type or smaller`.
     // With `u64` this broker did not build for `arm-linux-musleabi` at all —
-    // found by the first consumer that cross-compiled it (energomonitor's
-    // egw-proxy, for a MikroTik router), because every gate in this repo builds
+    // found by the first consumer that cross-compiled it (a store-and-forward
+    // proxy built for an ARMv7 router), because every gate in this repo builds
     // native x86-64 and the whole file looked fine there. `usize` is exactly
     // "the widest this platform can increment atomically". Wrapping is not a
     // concern for any of them: they count failures and truncations, and 2^32 of
@@ -3283,7 +3283,7 @@ test "the server can publish with no client behind it" {
     defer b.deinit();
 
     var tt: TestTransport = .{};
-    const device = try connectClient(&b, &tt, "EWG6", 15, 0);
+    const device = try connectClient(&b, &tt, "gw-device", 15, 0);
     try feedSubscribe(&b, device, 1, &.{.{ .filter = "sn/1/clock/conf", .qos = .at_most_once }});
     _ = try tt.next(); // SUBACK
 
@@ -3410,7 +3410,7 @@ test "a bridge can read the keep-alive and the Will it has to replay" {
     const conn = try b.accept(tt.transport());
     var buf: [256]u8 = undefined;
     const bytes = try packet.encodeConnect(&buf, .{
-        .client_id = "EWG6",
+        .client_id = "gw-device",
         .keep_alive_s = 15,
         .will = .{ .topic = "sn/1/status", .message = "disconnected", .retain = true },
     });

@@ -24,7 +24,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `expected 32-bit integer type or smaller`. They are `usize` now: exactly "the widest this
   platform can increment atomically", and wrapping is not a concern for counters of failures and
   truncations. The stress harness's `probe_max_ms` went the same way, to `u32`. Found by the first
-  consumer to cross-compile this module (energomonitor's egw-proxy, ARMv7 in a MikroTik container),
+  consumer to cross-compile this module (a store-and-forward proxy, ARMv7 in a router container),
   not by any gate: every lane in this repo builds native x86-64, where the whole file looks fine.
   ⭐ So the module now **declares `.linux32`** (mips32 soft-float, big-endian) in `meta.targets`,
   which puts `portable-mqtt-linux32` — the test binary *and* the forcing root that references every
@@ -49,9 +49,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   *from its clients*, and feeding a server's own message back would make a bridge echo itself.
   Held to the same topic rules as an inbound PUBLISH (4.7.1: no wildcards, no U+0000, non-empty),
   and QoS 2 is refused rather than silently downgraded. `fanout` lost its publisher parameter,
-  which it had never read. Driven by the first outside consumer (`energomonitor`'s egw-proxy): its
-  gateway subscribes to `sn/{SN}/clock/conf` and then waits, and without a clock it publishes no
-  measurements at all. Measured RED → GREEN: five mutations — tap fired, topic unvalidated, QoS 2
+  which it had never read. Driven by the first outside consumer (a store-and-forward proxy): the
+  device behind it subscribes to its clock configuration topic and then waits, and without a clock
+  it publishes no measurements at all. Measured RED → GREEN: five mutations — tap fired, topic unvalidated, QoS 2
   admitted, retain dropped, granted QoS ignored — each kill exactly the test that names them.
 
 - **2026-09-11** — **Will / LWT is implemented in the broker**, closing what SPEC.md carried as
@@ -64,7 +64,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   nearest one would send a client hunting through its client id for a fault in its will topic.
   An undeliverable will is counted by the new `willFailures()` rather than lost silently — the
   teardown path has no caller to return an error to. Driven by the first outside consumer
-  (`energomonitor`'s egw-proxy), whose device sets a will and whose proxy must replay it upstream.
+  (a store-and-forward proxy), whose device sets a will and whose proxy must replay it upstream.
   Measured RED → GREEN: four separate mutations (no publish on loss, no discard on DISCONNECT,
   no topic validation) each kill exactly the test that names them.
 

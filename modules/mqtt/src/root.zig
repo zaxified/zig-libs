@@ -44,7 +44,7 @@ pub const meta = .{
     .platform_note = "any",
     // ⭐ `.linux32` declared 2026-09-11, and it is a claim that was measured,
     // not assumed. The first consumer to cross-compile this module for a
-    // 32-bit machine (energomonitor's egw-proxy, ARMv7 in a router container)
+    // 32-bit machine (a store-and-forward proxy, ARMv7 in a router container)
     // found the broker did not build there **at all**: four counters were
     // `std.atomic.Value(u64)`, and a 32-bit target has no 64-bit atomic
     // read-modify-write without libatomic, so `@atomicRmw` on one is a compile
