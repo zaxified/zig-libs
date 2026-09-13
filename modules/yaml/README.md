@@ -75,7 +75,8 @@ An alias **shares** the anchored node rather than copying it, so `Value`'s
 collection slices are genuinely shared and the result is a DAG. That is also the
 defence against the "billion laughs" expansion bomb: an input that would expand
 to 2^n nodes composes into n. `Options.max_nodes` and `Options.max_depth` bound
-the rest.
+the rest, and `Options.max_heap_bytes` (default 64 MiB, `null` = off) bounds the
+bytes a document may cost — small YAML can amplify over 100× in memory.
 
 **A cyclic alias — one naming an ancestor — is rejected** with
 `error.AliasCycle`, though YAML 1.2 permits it. The reasoning is in

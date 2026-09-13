@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 findings F7 and F9. F7: an escaped UTF-16 surrogate pair
+  (`"\uD83D\uDE00"`) now decodes to the one astral character it spells, as in JSON (YAML 1.2
+  is a strict superset of JSON, §1.2; RFC 8259 §7); a lone or mismatched surrogate is still
+  refused. F9: new `ComposeOptions.max_heap_bytes` (default 64 MiB, `null` = no budget) bounds
+  the bytes composing may request, reported as `error.HeapBudgetExceeded` — `max_nodes` bounded
+  nodes while small documents amplified up to 119× in memory. A document that composed before
+  and needs more than 64 MiB now fails unless the caller raises or disables the budget.
+
 - **2026-09-11** — A1 fix campaign, F5 remainder + F8 closed (0 consumers in this
   repo, P1/P4 apply; test-only, no production behavior change). F5 (A1/yaml.md):
   the audit named ten surviving mutations against the module's DoS bounds; three

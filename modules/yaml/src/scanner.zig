@@ -1284,6 +1284,25 @@ pub const Scanner = struct {
             cp = cp * 16 + h;
             self.skip();
         }
+        // YAML 1.2 is "a strict superset of JSON" (§1.2), and JSON writes an
+        // astral character as an escaped UTF-16 surrogate pair (RFC 8259 §7),
+        // so a `\u` high surrogate followed by a `\u` low surrogate is one
+        // character (A1 F7). A surrogate on its own is still refused below.
+        if (c == 'u' and cp >= 0xD800 and cp <= 0xDBFF and self.at(0) == '\\' and self.at(1) == 'u') {
+            var lo: u32 = 0;
+            var ok = true;
+            for (0..4) |i| {
+                const h = hexVal(self.at(2 + i)) orelse {
+                    ok = false;
+                    break;
+                };
+                lo = lo * 16 + h;
+            }
+            if (ok and lo >= 0xDC00 and lo <= 0xDFFF) {
+                for (0..6) |_| self.skip();
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+            }
+        }
         if ((cp >= 0xD800 and cp <= 0xDFFF) or cp > 0x10FFFF)
             return self.fail("found invalid Unicode character escape code");
         var buf: [4]u8 = undefined;

@@ -155,6 +155,23 @@ fn expectReject(source: []const u8) !void {
     return error.TestExpectedRejection;
 }
 
+test "an escaped UTF-16 surrogate pair is one astral character; a surrogate alone is still refused (A1 F7)" {
+    const pair = try dumpEvents(testing.allocator, "k: \"\\uD83D\\uDE00\"\n");
+    defer testing.allocator.free(pair);
+    try testing.expect(std.mem.indexOf(u8, pair, "=VAL \"\u{1F600}\n") != null);
+    // Positive control: the 32-bit spelling of the same character agrees.
+    const wide = try dumpEvents(testing.allocator, "k: \"\\U0001F600\"\n");
+    defer testing.allocator.free(wide);
+    try testing.expectEqualStrings(wide, pair);
+
+    try expectReject("k: \"\\uD83D\"\n"); // lone high
+    try expectReject("k: \"\\uDE00\"\n"); // lone low
+    try expectReject("k: \"\\uDE00\\uD83D\"\n"); // reversed
+    try expectReject("k: \"\\uD83D\\u0041\"\n"); // high + non-surrogate
+    try expectReject("k: \"\\uD83Dx\"\n"); // high + plain character
+    try expectReject("k: \"\\uD83D\\U0000DE00\"\n"); // a pair is two \u escapes, as in JSON
+}
+
 test "block mapping" {
     try expectEvents("a: 1\nb: 2\n",
         \\+STR

@@ -375,12 +375,14 @@ consumer needing bignums has the exact text and can parse it itself.
   `Scanner.fetchStreamStart`) rather than silently misread as content — see the
   duplicate-key-check note in §8 below for why "not detected" used to be worse
   than it sounds. Actually decoding the other encodings is still not done.
-- **`Options.max_nodes` bounds nodes on the wire; it does not bound the heap
-  amplification a small wire causes** (A1/yaml.md F9: 64 000 sequence items,
-  500 890 B on the wire, peaked at 59.6 MB live — 119×; the default
-  `max_nodes = 10_000_000` lets roughly half a gigabyte of heap build before it
-  fires). Capping bytes rather than nodes would need a running byte estimate
-  per `Value`, which this composer does not keep.
+- **`Options.max_nodes` bounds nodes; `Options.max_heap_bytes` bounds bytes**
+  (A1/yaml.md F9: 64 000 sequence items, 500 890 B on the wire, peaked at
+  59.6 MB live — 119×; `max_nodes = 10_000_000` alone let roughly half a
+  gigabyte of heap build before it fired). `composeAllLeaky` wraps the
+  allocator in a counter that refuses past `max_heap_bytes` (default 64 MiB,
+  `null` = off) and reports `error.HeapBudgetExceeded`. It counts bytes
+  requested through the allocator — for an arena, what the parse and the tree
+  asked for, not the arena's own page overhead.
 
 ## Anchoring
 

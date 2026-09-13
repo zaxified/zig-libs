@@ -303,6 +303,8 @@ pub const Error = parser.Error || error{
     TooDeep,
     /// `Options.reject_duplicate_keys` is set and a mapping repeated a key.
     DuplicateKey,
+    /// Composing needed more than `Options.max_heap_bytes`.
+    HeapBudgetExceeded,
 };
 
 pub const Options = struct {
@@ -349,6 +351,77 @@ pub const Options = struct {
     /// with a producer that emits them on purpose) than have the parse fail
     /// out from under it.
     reject_duplicate_keys: bool = true,
+    /// Most bytes the parse and the composed tree may request from the
+    /// allocator; `error.HeapBudgetExceeded` past it. `null` means no budget.
+    ///
+    /// A1 F9: `max_nodes` bounds nodes, but the risk is bytes — a 500 890-byte
+    /// sequence peaked at 59.6 MB live (119×), and the default `max_nodes`
+    /// let roughly half a gigabyte build before firing. 64 MiB by default
+    /// (safe default, `null` as the opt-out): a document within it at the
+    /// worst measured amplification is still over half a megabyte of YAML.
+    max_heap_bytes: ?usize = 64 * 1024 * 1024,
+};
+
+/// Counts the bytes requested through it and refuses past `limit`, so
+/// `composeAllLeaky` can bound what a document costs in memory rather than
+/// in nodes (`Options.max_heap_bytes`, A1 F9).
+const Budget = struct {
+    child: std.mem.Allocator,
+    limit: usize,
+    used: usize = 0,
+    exceeded: bool = false,
+
+    fn allocator(self: *Budget) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn reserve(self: *Budget, n: usize) bool {
+        if (n > self.limit -| self.used) {
+            self.exceeded = true;
+            return false;
+        }
+        self.used += n;
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        if (!self.reserve(len)) return null;
+        return self.child.rawAlloc(len, a, ra) orelse {
+            self.used -= len;
+            return null;
+        };
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        const grow = new_len -| buf.len;
+        if (grow > 0 and !self.reserve(grow)) return false;
+        if (!self.child.rawResize(buf, a, new_len, ra)) {
+            self.used -= grow;
+            return false;
+        }
+        self.used -= buf.len -| new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        const grow = new_len -| buf.len;
+        if (grow > 0 and !self.reserve(grow)) return null;
+        const p = self.child.rawRemap(buf, a, new_len, ra) orelse {
+            self.used -= grow;
+            return null;
+        };
+        self.used -= buf.len -| new_len;
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *Budget = @ptrCast(@alignCast(ctx));
+        self.used -|= buf.len;
+        self.child.rawFree(buf, a, ra);
+    }
 };
 
 /// Hard ceiling this module enforces on `Options.max_depth`, regardless of
@@ -407,11 +480,19 @@ pub fn composeAll(gpa: std.mem.Allocator, source: []const u8, options: Options) 
 /// As `composeAll`, but allocating everything from `alloc` and freeing nothing.
 /// Pass an arena you already own. Mirrors `std.json.parseFromSliceLeaky`.
 pub fn composeAllLeaky(alloc: std.mem.Allocator, source: []const u8, options: Options) Error![]const Value {
-    var p = parser.Parser.init(alloc, source);
+    var budget: Budget = .{ .child = alloc, .limit = options.max_heap_bytes orelse 0 };
+    const a = if (options.max_heap_bytes != null) budget.allocator() else alloc;
+
+    var p = parser.Parser.init(a, source);
     defer p.deinit();
 
-    var c: Composer = .{ .alloc = alloc, .p = &p, .options = options };
-    return c.run();
+    var c: Composer = .{ .alloc = a, .p = &p, .options = options };
+    return c.run() catch |e| {
+        // An allocation the budget refused surfaces as whatever the failing
+        // layer made of it; name the real cause.
+        if (budget.exceeded) return error.HeapBudgetExceeded;
+        return e;
+    };
 }
 
 /// Compose a stream that must hold exactly one document, and return its root.
@@ -1405,6 +1486,32 @@ fn fuzzComposeNeverPanics(_: void, smith: *testing.Smith) !void {
     const source = buf[0..n];
     var result = composeAll(testing.allocator, source, composeOptionsFrom(source)) catch return;
     defer result.deinit();
+}
+
+test "Options.max_heap_bytes bounds what a small document costs in bytes, not just in nodes (A1 F9)" {
+    const gpa = testing.allocator;
+    // The finding was about the DEFAULT letting ~half a gigabyte build.
+    try testing.expectEqual(@as(?usize, 64 * 1024 * 1024), (Options{}).max_heap_bytes);
+    // The audit's worst shape: a block sequence of tiny items (~119x on the wire).
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(gpa);
+    for (0..20_000) |_| try src.appendSlice(gpa, "- a\n");
+
+    // 20 000 nodes is nothing to `max_nodes`; 1 MiB of heap is not enough.
+    try testing.expectError(error.HeapBudgetExceeded, composeAll(gpa, src.items, .{ .max_heap_bytes = 1 << 20 }));
+
+    // The same document under a generous budget, and with the budget switched off.
+    const ok = try composeAll(gpa, src.items, .{ .max_heap_bytes = 256 << 20 });
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 20_000), ok.documents[0].sequence.len);
+    const off = try composeAll(gpa, src.items, .{ .max_heap_bytes = null });
+    defer off.deinit();
+    try testing.expectEqual(@as(usize, 20_000), off.documents[0].sequence.len);
+
+    // And the leaky entry point is bounded too.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try testing.expectError(error.HeapBudgetExceeded, composeAllLeaky(arena.allocator(), src.items, .{ .max_heap_bytes = 1 << 20 }));
 }
 
 test "corpus: every document reaches composeAll, and the counts are pinned" {
