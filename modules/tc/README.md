@@ -106,6 +106,7 @@ try sock.del(ifi);
 |---|---|
 | `Socket.open(gpa)` / `.close()` | one `NETLINK_ROUTE` socket per thread/loop; reads `/proc/net/psched` for the rate arithmetic |
 | `Socket.openWithPsched(gpa, ps)` | same, with an explicit `Psched` calibration |
+| `.setRecvTimeout(ms)` | bound each receive (`open` sets `default_recv_timeout_ms`, 10 s; 0 = block forever); a timeout fails the request with `error.RecvFailed` |
 | `.qdiscAdd/.qdiscReplace/.qdiscChange(QdiscTarget, QdiscSpec)` | `tc qdisc add` / `replace` / `change` |
 | `.qdiscDel(QdiscTarget)` | `tc qdisc del` |
 | `.qdiscs(ifindex) ![]Qdisc` | `RTM_GETQDISC` dump, scoped to the interface |

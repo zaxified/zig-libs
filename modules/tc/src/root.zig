@@ -251,6 +251,15 @@ pub const GetError = DumpError; // v1 alias
 
 const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
 
+/// How long one receive may block before the request fails with
+/// `error.RecvFailed`, set by `Socket.open` (A1 F12). Without it a reply that
+/// never comes — the kernel's answer filtered as not ours, a lost datagram —
+/// blocked the dump loop forever. The kernel answers a tc request within
+/// milliseconds even under load; ten seconds leaves room for a busy rtnl lock.
+/// It bounds each receive, not a whole dump, so a large table streaming in
+/// is never cut off. `Socket.setRecvTimeout` changes it, 0 blocks forever.
+pub const default_recv_timeout_ms: u32 = 10_000;
+
 /// A blocking tc client over one `NETLINK_ROUTE` socket. One instance per
 /// thread/loop; no shared state.
 pub const Socket = struct {
@@ -273,13 +282,22 @@ pub const Socket = struct {
     pub fn openWithPsched(gpa: std.mem.Allocator, ps: Psched) OpenError!Socket {
         if (comptime builtin.os.tag != .linux)
             @compileError("tc.Socket is Linux-only (AF_NETLINK raw syscalls)");
-        const nl = try netlink.Socket.open(gpa);
+        var nl = try netlink.Socket.open(gpa);
+        errdefer nl.close();
+        try nl.setRecvTimeout(default_recv_timeout_ms);
         return .{ .gpa = gpa, .nl = nl, .psched = ps };
     }
 
     pub fn close(self: *Socket) void {
         self.nl.close();
         self.* = undefined;
+    }
+
+    /// Bound how long one receive may block (`SO_RCVTIMEO`); 0 blocks
+    /// forever. `open` sets `default_recv_timeout_ms`. A timeout fails the
+    /// request in progress with `error.RecvFailed`.
+    pub fn setRecvTimeout(self: *Socket, millis: u32) error{Unexpected}!void {
+        return self.nl.setRecvTimeout(millis);
     }
 
     /// The kernel's reason for the last failed write, from the extended ACK
@@ -1150,6 +1168,31 @@ fn skipInitUserns(comptime what: []const u8) error{SkipZigTest} {
 fn openOrSkip() !Socket {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     return Socket.open(testing.allocator) catch return skip("tc.Socket.open");
+}
+
+fn recvTimeoutMs(sock: *const Socket) !u64 {
+    var tv: linux.timeval = undefined;
+    var len: linux.socklen_t = @sizeOf(linux.timeval);
+    const rc = linux.getsockopt(sock.nl.handle(), linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&tv), &len);
+    if (linux.errno(rc) != .SUCCESS) return error.GetsockoptFailed;
+    return @as(u64, @intCast(tv.sec)) * 1000 + @as(u64, @intCast(tv.usec)) / 1000;
+}
+
+test "F12: open bounds each receive by default_recv_timeout_ms, setRecvTimeout changes it, and a reply that never comes fails instead of blocking" {
+    // 0 would mean "block forever", the defect itself.
+    try testing.expect(default_recv_timeout_ms != 0);
+    var sock = try openOrSkip();
+    defer sock.close();
+    try testing.expectEqual(@as(u64, default_recv_timeout_ms), try recvTimeoutMs(&sock));
+
+    try sock.setRecvTimeout(50);
+    // Read back BEFORE receiving: a broken setter must fail here, not hang below.
+    try testing.expectEqual(@as(u64, 50), try recvTimeoutMs(&sock));
+    // Nothing was sent, so nothing will arrive.
+    try testing.expectError(error.RecvFailed, sock.nl.recvDatagram());
+
+    try sock.setRecvTimeout(0);
+    try testing.expectEqual(@as(u64, 0), try recvTimeoutMs(&sock));
 }
 
 /// The ifindex of `lo`, via the sibling netlink module — brought admin-up on

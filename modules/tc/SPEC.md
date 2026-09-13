@@ -316,6 +316,18 @@ in the request, so scoping is client-side, mirroring iproute2's own printers:
   `Filter.classid()` returns null for those; callers that only want real filters should
   skip them (the live test does).
 
+### Every receive has a deadline
+
+`Socket.open` sets `SO_RCVTIMEO` to `default_recv_timeout_ms` (10 s) on the netlink
+socket (A1 F12, 2026-09-14). The dump loops end only on `NLMSG_DONE`, an error, or the
+restart cap; a datagram that is not ours (`(portid, seq)` mismatch) is skipped and the loop
+reads again, so a reply that never arrived used to block `recvDatagram` forever — the
+failure `actionGet`'s own comment records from an earlier type-matching bug. Now that
+receive fails the request with `error.RecvFailed`. The bound is per receive, not per dump:
+a large table that keeps streaming is never cut off, only silence is. `Socket.setRecvTimeout`
+changes it; 0 restores blocking forever. A test reads the value back from the fd and shows a
+50 ms deadline releasing a receive nothing will answer.
+
 ## Threat / permission model
 
 Every `RTM_NEW*`/`RTM_DEL*` needs **CAP_NET_ADMIN**; a non-privileged caller gets

@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL:** A1 F12 (round-2 decision: safe default plus a switch).
+  A dump or request whose reply never came blocked in `recvDatagram` forever: the dump loops end
+  only on `NLMSG_DONE`, an error or the restart cap, and nothing set `SO_RCVTIMEO`.
+  `Socket.open`/`openWithPsched` now bound each receive by the new `default_recv_timeout_ms`
+  (10 s); a timeout fails the request with `error.RecvFailed` (already in `RequestError`, no
+  error-set change). Per receive, not per dump, so a long table is never cut off. New
+  `Socket.setRecvTimeout(ms)` changes it, 0 blocks forever.
+
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** `Socket.dump`'s retry-attempt-cap and
   `reply_type` filter (A1/tc.md F6) now have permanent tests. `dump()` was split into a thin
   wrapper (unchanged, still calls `self.nl`) and a private `dumpVia(transport: anytype, ...)`
