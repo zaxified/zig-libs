@@ -60,6 +60,13 @@ runs back to back, no unpaired surrogate, no CR/LF inside a run. That matters
 because mailbox names are compared as byte strings — a second spelling of one
 name is a bug waiting to happen, not a tolerance.
 
+What the decoder does **not** refuse is a control character spelled inside a
+base64 run — CR, LF and NUL included. RFC 9051 §5.1 does not forbid them in
+mailbox names (they "are best avoided"; servers "MAY refuse to create" them),
+and go-imap accepts them too. So a decoded name can carry a line break: never
+paste one into a log line, a header or a command unframed. The encoder frames
+it when it goes back out.
+
 ## The wire grammar
 
 `wire.Decoder` reads RFC 9051 §9 primitives from a `std.Io.Reader` — atoms,

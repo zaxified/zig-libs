@@ -39,7 +39,7 @@ pub const Return = struct {
     all: bool = false,
     count: bool = false,
 
-    fn any(r: Return) bool {
+    pub fn any(r: Return) bool {
         return r.min or r.max or r.all or r.count;
     }
 };

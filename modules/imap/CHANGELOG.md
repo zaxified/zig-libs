@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL:** A1 findings F1, F5, F9 (UTF-7 half).
+  F1: `Client.searchMessages` took any `* SEARCH`/`* ESEARCH` as its answer — the ESEARCH
+  correlator was parsed and never compared. It now refuses, with the new
+  `error.SearchResponseMismatch`, an ESEARCH naming another tag (RFC 4466 §2.6.2), a second
+  result, a rev1 `* SEARCH` to a search with RETURN options, and a RETURN search that gets no
+  ESEARCH (RFC 4731 §3.1: "MUST return a single ESEARCH"). An ESEARCH without a correlator goes
+  to the unilateral observer instead of becoming the result.
+  F5: `fetchMessages`/`searchMessages` parsed every line straight into the caller's allocator,
+  so uncollected untagged traffic accumulated there (18 MB on the wire kept 21 MB) and skipped
+  `readLine`'s per-line depth reset. Both now read through `readLine` and deep-copy only the
+  results into `out_gpa`.
+  F9 (UTF-7 half): documented, not changed — a decoded mailbox name may contain control
+  characters, which RFC 9051 §5.1 does not forbid.
+
 - **2026-09-11** — **NEW, not breaking:** A1 fix campaign, F6 -- `LIST`/`LSUB`/`STATUS`
   had no parser at all. `wire.expectMailbox` (the UTF-7 decoder + `INBOX` canonicaliser a
   mailbox NAME needs) had zero production callers; `client.zig` had no `list`/`lsub`/

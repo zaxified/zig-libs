@@ -47,6 +47,13 @@ pub const EncodeError = error{ InvalidUtf8, OutOfMemory };
 
 /// Decode a mailbox name from modified UTF-7 into UTF-8. Raw UTF-8 in the
 /// input is passed through unchanged, which is what RFC 9051 servers send.
+///
+/// A decoded name may contain control characters, CR, LF and NUL included (a
+/// base64 run can spell them). That is not refused: RFC 9051 §5.1 only says
+/// they "are best avoided" and that servers "MAY refuse to create" such
+/// names, and the go-imap decoder this is ported from accepts them. Never
+/// interpolate a decoded name into a line-oriented context unframed;
+/// `command.Encoder.mailbox` frames it (A1 F9).
 pub fn decodeAlloc(gpa: Allocator, src: []const u8) DecodeError![]u8 {
     if (!std.unicode.utf8ValidateSlice(src)) return error.InvalidUtf8;
 

@@ -38,6 +38,39 @@ const listmod = @import("list.zig");
 const response = @import("response.zig");
 const wire = @import("wire.zig");
 
+/// Deep copy of a parsed value into `gpa`: every slice and pointer the parser
+/// allocated from the per-line arena is copied; scalars are copied by value.
+/// This is what lets `fetchMessages`/`searchMessages` parse every line in the
+/// arena and keep only what they return (A1 F5).
+fn dupeDeep(comptime T: type, gpa: Allocator, v: T) Allocator.Error!T {
+    switch (@typeInfo(T)) {
+        .pointer => |p| switch (p.size) {
+            .slice => {
+                if (p.child == u8) return gpa.dupe(u8, v);
+                const out = try gpa.alloc(p.child, v.len);
+                for (v, 0..) |e, i| out[i] = try dupeDeep(p.child, gpa, e);
+                return out;
+            },
+            .one => {
+                const out = try gpa.create(p.child);
+                out.* = try dupeDeep(p.child, gpa, v.*);
+                return out;
+            },
+            else => @compileError("dupeDeep: unsupported pointer type " ++ @typeName(T)),
+        },
+        .optional => |o| return if (v) |x| try dupeDeep(o.child, gpa, x) else null,
+        .@"struct" => |s| {
+            var out: T = v;
+            inline for (s.fields) |f| @field(out, f.name) = try dupeDeep(f.type, gpa, @field(v, f.name));
+            return out;
+        },
+        .@"union" => switch (v) {
+            inline else => |payload, tag| return @unionInit(T, @tagName(tag), try dupeDeep(@TypeOf(payload), gpa, payload)),
+        },
+        else => return v,
+    }
+}
+
 pub const Error = response.Error || command.Error || error{
     /// A command that only makes sense with a mailbox selected.
     NoMailbox,
@@ -47,6 +80,11 @@ pub const Error = response.Error || command.Error || error{
     BadState,
     /// A tagged response arrived carrying a tag we never sent.
     UnknownTag,
+    /// A SEARCH answer that does not belong to this command: an ESEARCH whose
+    /// correlator names another tag (RFC 4466 §2.6.2), a second result, a
+    /// rev1 `* SEARCH` to a search with RETURN options, or no ESEARCH at all
+    /// for one (RFC 4731 §3.1: such a search "MUST return a single ESEARCH").
+    SearchResponseMismatch,
     /// The server answered the command with NO or BAD.
     CommandFailed,
     /// The server ended the session with an untagged BYE.
@@ -574,7 +612,9 @@ pub const Client = struct {
     /// Results are allocated from `out_gpa` rather than the session's arena
     /// because a FETCH spans many response lines and the arena is reset on
     /// each one. Hand it an arena of your own and free it when done with the
-    /// messages.
+    /// messages. Every line is still parsed in the per-line arena; only the
+    /// `* n FETCH` data is copied into `out_gpa`, so untagged traffic the
+    /// command does not collect never lands there (A1 F5).
     pub fn fetchMessages(
         c: *Client,
         out_gpa: Allocator,
@@ -594,9 +634,12 @@ pub const Client = struct {
         errdefer out.deinit(out_gpa);
 
         while (true) {
-            // Collected data must outlive the line it arrived on.
-            c.rd.d.gpa = out_gpa;
-            const resp = c.rd.next() catch |e| return e;
+            // Parsed in the per-line arena (which `readLine` also uses to
+            // reset a leaked list depth); collected data is copied out, since
+            // it must outlive the line it arrived on. Parsing straight into
+            // `out_gpa` kept every untagged noise line there too: 18 MB on the
+            // wire, 21 MB in the caller's allocator, 0 messages (A1 F5).
+            const resp = try c.readLine();
             switch (resp) {
                 .continuation => return error.NoContinuation,
                 .tagged => |t| {
@@ -606,7 +649,7 @@ pub const Client = struct {
                     return out.toOwnedSlice(out_gpa);
                 },
                 .data => |d| switch (d) {
-                    .fetch => |m| try out.append(out_gpa, m),
+                    .fetch => |m| try out.append(out_gpa, try dupeDeep(fetchmod.Message, out_gpa, m)),
                     else => try c.handleData(d),
                 },
             }
@@ -630,20 +673,44 @@ pub const Client = struct {
         searchmod.encode(&c.enc, tag, by_uid, ret, crit) catch |e| return c.unmask(e);
         c.enc.w.flush() catch return error.WriteFailed;
 
+        // A1 F1: the ESEARCH correlator used to be parsed and never compared —
+        // `(TAG "T99") COUNT 999` answered command T2, and a later rev1
+        // `* SEARCH` overwrote a correctly correlated result.
+        const want_esearch = ret.any();
         var result: searchmod.Result = .{};
+        var answered = false;
         while (true) {
-            c.rd.d.gpa = out_gpa;
-            const resp = try c.rd.next();
+            // Per-line arena, results copied out — see `fetchMessages` (A1 F5).
+            const resp = try c.readLine();
             switch (resp) {
                 .continuation => return error.NoContinuation,
                 .tagged => |t| {
                     if (!std.mem.eql(u8, t.tag, tag)) return error.UnknownTag;
                     try c.absorbCode(t.status.code);
                     if (t.status.type != .ok) return error.CommandFailed;
+                    // RFC 4731 §3.1: with RETURN options the server "MUST
+                    // return a single ESEARCH response".
+                    if (want_esearch and !answered) return error.SearchResponseMismatch;
                     return result;
                 },
                 .data => |d| switch (d) {
-                    .search, .esearch => |r| result = r,
+                    .esearch => |r| {
+                        // RFC 4466 §2.6.2: without a correlator the response
+                        // "was not caused by a particular IMAP command"; with
+                        // one, it "contains the tag of the command".
+                        const corr = r.tag orelse {
+                            try c.handleData(d);
+                            continue;
+                        };
+                        if (answered or !std.mem.eql(u8, corr, tag)) return error.SearchResponseMismatch;
+                        result = try dupeDeep(searchmod.Result, out_gpa, r);
+                        answered = true;
+                    },
+                    .search => |r| {
+                        if (want_esearch or answered) return error.SearchResponseMismatch;
+                        result = try dupeDeep(searchmod.Result, out_gpa, r);
+                        answered = true;
+                    },
                     else => try c.handleData(d),
                 },
             }
@@ -1372,6 +1439,74 @@ test "SEARCH accepts both reply shapes" {
             "T3 UID SEARCH RETURN (COUNT) LARGER 1000\r\n",
         p.sent(),
     );
+}
+
+test "ESEARCH belongs to its own command: a foreign or empty correlator, a second result, or a rev1 SEARCH after RETURN is refused (A1 F1)" {
+    const cases = [_][]const u8{
+        "* ESEARCH (TAG \"T99\") COUNT 999\r\nT2 OK done\r\n",
+        "* ESEARCH (TAG \"\") COUNT 7\r\nT2 OK done\r\n",
+        "* ESEARCH (TAG \"T2\") COUNT 3\r\n* ESEARCH (TAG \"T99\") COUNT 999\r\nT2 OK done\r\n",
+        "* ESEARCH (TAG \"T2\") COUNT 3\r\n* ESEARCH (TAG \"T2\") COUNT 999\r\nT2 OK done\r\n", // a second, correctly correlated result
+        "* ESEARCH (TAG \"T2\") COUNT 3\r\n* SEARCH 9 9 9\r\nT2 OK done\r\n",
+        "* SEARCH 9 9 9\r\nT2 OK done\r\n", // rev1 shape for a RETURN search
+        "T2 OK done\r\n", // RETURN search answered with no ESEARCH at all
+    };
+    inline for (cases) |case| {
+        var p: Peer = undefined;
+        p.init("* PREAUTH ok\r\nT1 OK [READ-WRITE] SELECT completed\r\n" ++ case);
+        var c = p.client(.{});
+        defer c.deinit();
+        _ = try c.greet();
+        _ = try c.select("INBOX", false);
+        var out = std.heap.ArenaAllocator.init(testing.allocator);
+        defer out.deinit();
+        try testing.expectError(error.SearchResponseMismatch, c.searchMessages(out.allocator(), false, .{ .count = true }, &.{ .larger = 1 }));
+    }
+
+    // Positive control: an uncorrelated ESEARCH is not this command's answer;
+    // the correlated one is.
+    var p: Peer = undefined;
+    p.init("* PREAUTH ok\r\nT1 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* ESEARCH COUNT 5\r\n* ESEARCH (TAG \"T2\") COUNT 3\r\nT2 OK done\r\n");
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.select("INBOX", false);
+    var out = std.heap.ArenaAllocator.init(testing.allocator);
+    defer out.deinit();
+    const r = try c.searchMessages(out.allocator(), false, .{ .count = true }, &.{ .larger = 1 });
+    try testing.expectEqual(@as(u32, 3), r.count.?);
+}
+
+test "untagged noise during FETCH and SEARCH is parsed in the per-line arena, not in the caller's allocator (A1 F5)" {
+    const gpa = testing.allocator;
+    var script: std.ArrayList(u8) = .empty;
+    defer script.deinit(gpa);
+    try script.appendSlice(gpa, "* PREAUTH ok\r\nT1 OK [READ-WRITE] SELECT completed\r\n");
+    const noise = "* NOISE " ++ "x" ** 900 ++ "\r\n";
+    for (0..2000) |_| try script.appendSlice(gpa, noise);
+    try script.appendSlice(gpa, "* 12 FETCH (UID 7 FLAGS (\\Seen))\r\nT2 OK FETCH completed\r\n");
+    for (0..2000) |_| try script.appendSlice(gpa, noise);
+    try script.appendSlice(gpa, "* ESEARCH (TAG \"T3\") COUNT 1\r\nT3 OK SEARCH completed\r\n");
+
+    var p: Peer = undefined;
+    p.init(script.items);
+    var c = p.client(.{});
+    defer c.deinit();
+    _ = try c.greet();
+    _ = try c.select("INBOX", false);
+
+    var counting = std.testing.FailingAllocator.init(gpa, .{});
+    var out = std.heap.ArenaAllocator.init(counting.allocator());
+    defer out.deinit();
+    const msgs = try c.fetchMessages(out.allocator(), "12", false, .{ .uid = true, .flags = true });
+    try testing.expectEqual(@as(usize, 1), msgs.len);
+    try testing.expectEqual(@as(u32, 7), msgs[0].uid().?);
+    try testing.expectEqualStrings("\\Seen", msgs[0].items[1].flags[0]);
+    const r = try c.searchMessages(out.allocator(), false, .{ .count = true }, &.{ .larger = 1 });
+    try testing.expectEqual(@as(u32, 1), r.count.?);
+    // 4000 noise lines are ~3.6 MB on the wire; none of it may reach `out`.
+    try testing.expect(counting.allocated_bytes < 64 * 1024);
 }
 
 test "IDLE: wait for the continuation, take data, then DONE" {
