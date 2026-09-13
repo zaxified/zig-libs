@@ -56,7 +56,14 @@ citation lives here:
   valid on any arch — and a test names its content (and, on x86-64, that exactly one spelling is
   dropped), because that filter also swallows a misspelling silently: syscall 262 is `newfstatat` in
   some tables and `fstatat64` in std's x86-64 table, and only the former was listed, so C code's
-  `stat(2)` died of SIGSYS under a list whose author had allowed it. `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
+  `stat(2)` died of SIGSYS under a list whose author had allowed it. Audit S11 (2026-09-13): 12
+  calls a runtime makes unasked were added (`rseq`, `set_robust_list`, `getdents64`, `epoll_pwait2`,
+  `clock_getres`, `sched_getaffinity`, `getrusage`, `uname`, `sysinfo`, `close_range`, `faccessat2`,
+  `rt_sigtimedwait`), each checked to touch only the caller's own state, an fd it holds, or
+  information `newfstatat`/`statx` already expose; a test runs all 12 under the installed default
+  filter. `prlimit64` and `setrlimit` were listed by the audit and stay OUT: both raise soft limits
+  the `limit*` helpers lowered, and `prlimit64` acts on other same-uid processes — a new grant (the
+  same test pins that the default filter kills them). `sock_filter` is asserted 8 bytes; `landlock_path_beneath_attr` asserted 12
   (packed u64+s32) so the byte layout matches the kernel's `copy_from_user`.
 - **The W^X preset (`seccomp.buildWx`/`buildDefaultWx`) adds argument-checked blocks, not a
   different filter shape.** For each of `{mmap, mprotect, pkey_mprotect}` present in the allow-list,

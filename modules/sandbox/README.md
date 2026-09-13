@@ -124,7 +124,13 @@ the same code degrades cleanly across kernels.
 server's hot loop (read/write/recvfrom/sendto/epoll/accept/close/futex/mmap/
 timers/getrandom/…), resolved to the target arch at comptime. It is a
 **starting point** — profile your binary (`strace -f -c`) and trim or extend it.
-Too tight bricks the process; too loose defeats the sandbox. The filter always
+Too tight bricks the process; too loose defeats the sandbox. It also carries the
+calls a libc or language runtime makes on its own (`rseq`, `set_robust_list`,
+`getdents64`, `uname`, `close_range`, … — audit S11), each checked to grant
+nothing beyond the process's own state. `prlimit64` and `setrlimit` are left
+out on purpose: they let sandboxed code undo limits set before the filter, and
+`prlimit64` reaches other processes. A binary that needs `getrlimit` adds
+`prlimit64` itself. The filter always
 guards `seccomp_data.arch` first so a syscall entered through a foreign ABI's
 entry point can't alias an allowed number: on x86-64 the i386 `int $0x80`
 entry's nr 39 is `mkdir`, while x86-64's nr 39 is `getpid`. (x32 is stopped

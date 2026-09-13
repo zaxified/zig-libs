@@ -815,6 +815,26 @@ pub const seccomp = struct {
         "getpid",          "gettid",       "getuid",          "getgid",
         "geteuid",         "getegid",      "exit",            "exit_group",
         "tgkill",
+        // Audit S11: calls a libc or language runtime makes on its own, which
+        // killed a process under this list. Each checked for grant: none
+        // reaches beyond the process's own state or an fd it already holds.
+        "rseq", // registers the calling thread's restartable-sequence area
+        "set_robust_list", // the calling thread's robust-futex list head
+        "getdents64", // reads a directory fd already held; opens nothing
+        "epoll_pwait2", // epoll_pwait with a timespec timeout
+        "clock_getres",
+        "sched_getaffinity", // read-only
+        "getrusage", // self/children/thread usage, read-only
+        "uname", // discloses the kernel release; grants nothing
+        "sysinfo", // discloses RAM/uptime/load; grants nothing
+        "close_range", // closes (or marks CLOEXEC) the caller's own fds
+        "faccessat2", // path probe; `newfstatat`/`statx` above already reveal as much
+        "rt_sigtimedwait", // waits for the caller's own pending signals
+        // Deliberately NOT added although the audit listed them: `prlimit64`
+        // sets limits of OTHER same-uid processes too, and both it and
+        // `setrlimit` let sandboxed code raise a soft limit this module's
+        // `limit*` helpers lowered before the filter went on. That is a new
+        // grant; a binary that needs getrlimit adds `prlimit64` itself.
     };
 
     /// The default network-server allow-list, resolved to concrete `linux.SYS`
@@ -1087,9 +1107,11 @@ test "seccomp default allow-list: named CONTENT, and no silent drop by @hasField
     // be deleted with the suite green, and `newfstatat` — spelled `fstatat64`
     // in std's x86-64 table — was silently filtered out, so C code's stat(2)
     // died of SIGSYS under a list whose author had allowed it.
-    const must_have = [_]linux.SYS{ .read, .write, .close, .epoll_wait, .accept4, .futex, .mmap, .exit_group, .rt_sigreturn, .getrandom };
+    const must_have = [_]linux.SYS{ .read, .write, .close, .epoll_wait, .accept4, .futex, .mmap, .exit_group, .rt_sigreturn, .getrandom } ++ s11_added;
     for (must_have) |s| try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, s));
-    const must_not = [_]linux.SYS{ .execve, .fork, .clone, .ptrace, .mount, .openat, .socket, .connect, .ioctl, .prctl, .seccomp, .setuid };
+    // `prlimit64`/`setrlimit`: audit S11 listed them, and they stay out on
+    // purpose (see `default_names`).
+    const must_not = [_]linux.SYS{ .execve, .fork, .clone, .ptrace, .mount, .openat, .socket, .connect, .ioctl, .prctl, .seccomp, .setuid, .prlimit64, .setrlimit };
     for (must_not) |s| try testing.expect(!seccomp.containsSyscall(seccomp.default_allowlist, s));
     if (builtin.cpu.arch == .x86_64) {
         // stat-by-path (262) is present under std's spelling …
@@ -1276,6 +1298,68 @@ test "seccomp KILL_PROCESS: denied syscall kills the child; control survives" {
 
     const control = try runInChild(childSeccompControl);
     try testing.expect(control.exitedWith(7));
+}
+
+/// Audit S11: the syscalls added to `default_names`.
+const s11_added = [_]linux.SYS{
+    .rseq,      .set_robust_list, .getdents64, .epoll_pwait2, .clock_getres, .sched_getaffinity,
+    .getrusage, .uname,           .sysinfo,    .close_range,  .faccessat2,   .rt_sigtimedwait,
+};
+
+var g_default_prog: []const SockFilter = &.{};
+
+/// Every S11 syscall under the default filter, with arguments that make it
+/// fail harmlessly (a bad fd, a null pointer, an empty range). The result is
+/// ignored: only reaching `exit(0)` instead of SIGSYS matters.
+fn childDefaultAllowsS11() void {
+    noNewPrivs() catch linux.exit(101);
+    seccomp.install(g_default_prog) catch linux.exit(102);
+    const bad_fd: usize = @bitCast(@as(isize, -1));
+    _ = linux.syscall4(.rseq, 0, 0, 0, 0);
+    _ = linux.syscall2(.set_robust_list, 0, 0);
+    _ = linux.syscall3(.getdents64, bad_fd, 0, 0);
+    _ = linux.syscall6(.epoll_pwait2, bad_fd, 0, 0, 0, 0, 0);
+    _ = linux.syscall2(.clock_getres, 0, 0);
+    _ = linux.syscall3(.sched_getaffinity, 0, 0, 0);
+    _ = linux.syscall2(.getrusage, 0, 0);
+    _ = linux.syscall1(.uname, 0);
+    _ = linux.syscall1(.sysinfo, 0);
+    _ = linux.syscall3(.close_range, 0xFFFF_FF00, 0xFFFF_FFFF, 0);
+    _ = linux.syscall4(.faccessat2, bad_fd, 0, 0, 0);
+    _ = linux.syscall4(.rt_sigtimedwait, 0, 0, 0, 8);
+    linux.exit(0);
+}
+
+fn childDefaultPrlimit() void {
+    noNewPrivs() catch linux.exit(101);
+    seccomp.install(g_default_prog) catch linux.exit(102);
+    _ = linux.syscall4(.prlimit64, 0, 7, 0, 0); // read-only query, still refused
+    linux.exit(0);
+}
+
+fn childDefaultSetrlimit() void {
+    noNewPrivs() catch linux.exit(101);
+    seccomp.install(g_default_prog) catch linux.exit(102);
+    _ = linux.syscall2(.setrlimit, 7, 0);
+    linux.exit(0);
+}
+
+test "seccomp default allow-list, installed: the S11 runtime syscalls run, prlimit64/setrlimit are killed (audit S11)" {
+    try requireSeccompFilter();
+    g_default_prog = try seccomp.buildDefault(testing.allocator, .kill_process);
+    defer testing.allocator.free(g_default_prog);
+
+    const allowed = try runInChild(childDefaultAllowsS11);
+    try testing.expect(allowed.exitedWith(0));
+
+    // The same program kills a call it does not list, so the pass above is
+    // not a filter that allows everything.
+    for ([_]*const fn () void{ childDefaultPrlimit, childDefaultSetrlimit }) |child| {
+        const killed = try runInChild(child);
+        try testing.expect(!killed.exitedWith(101));
+        try testing.expect(!killed.exitedWith(102));
+        try testing.expect(killed.killedBy(.SYS));
+    }
 }
 
 test "seccomp ERRNO: denied syscall returns -EPERM instead of dying" {

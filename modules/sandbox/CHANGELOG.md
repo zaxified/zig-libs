@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-13** — **BEHAVIOURAL (allows more):** audit S11, by the owner's decision to extend
+  `seccomp.default_allowlist`. A process under the default filter died of SIGSYS on calls its libc
+  or runtime makes unasked. Added, each checked to grant nothing beyond the process's own state or
+  an fd it already holds: `rseq`, `set_robust_list`, `getdents64`, `epoll_pwait2`, `clock_getres`,
+  `sched_getaffinity`, `getrusage`, `uname`, `sysinfo`, `close_range`, `faccessat2`,
+  `rt_sigtimedwait`. (`fstatat64`, the audit's 15th, came with S8.) NOT added: `prlimit64` and
+  `setrlimit` — they let sandboxed code raise limits lowered before the filter, and `prlimit64`
+  reaches other same-uid processes. New test runs all 12 in a child under the installed default
+  filter and pins that `prlimit64`/`setrlimit` are killed; the content test names both sets.
+  `scripts/modtest sandbox`: 30 pass, 2 root-gated skips (was 29 + 2).
+
 - **2026-09-10** — A1 fix campaign, two of the five remaining LOW findings
   closed (zero consumers, confirmed against `build.zig`'s `example_apps`
   table as well as `module-graph` — P1 applies without qualification).
