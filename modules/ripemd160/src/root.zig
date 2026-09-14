@@ -222,8 +222,8 @@ pub const Ripemd160 = struct {
         var ddd: u32 = d.h[3];
         var ee: u32 = d.h[4];
 
-        var j: usize = 0;
-        while (j < 80) : (j += 1) {
+        @setEvalBranchQuota(20000);
+        inline for (0..80) |j| {
             const group: u3 = @intCast(j / 16);
 
             // Left line.
