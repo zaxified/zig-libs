@@ -91,6 +91,30 @@ pub const Options = struct {
     limits: framing.Limits = .{},
     /// What we advertise in our `<hello>`.
     capabilities: []const []const u8 = &capabilities.default_client_capabilities,
+    /// Refuse, locally and before sending anything, an operation whose RFC
+    /// requires a capability the peer never advertised in its `<hello>`:
+    /// `lock`/`unlock`/`getConfig`/`copyConfig`/`deleteConfig`/`editConfig`
+    /// against `.candidate` need `:candidate` (§8.3), the same group against
+    /// `.startup` need `:startup` (§8.7), `.url` needs `:url` (§8.8),
+    /// `commit(.{.confirmed = true})` needs `:confirmed-commit` (§8.4),
+    /// `validate` needs `:validate` (§8.6), and `createSubscription` needs
+    /// RFC 5277 §3.1's `:notification`. Before this existed, the ten
+    /// booleans `capabilities.Capabilities` parses out of the peer's
+    /// `<hello>` were read by nothing in this module: they were "parsed,
+    /// stored, never compared" (2026-09-10 audit, `A1/netconf.md` N8) — a
+    /// server that never advertised `:candidate` still got a
+    /// `lock(.candidate)` sent at it, and the only sign anything was wrong
+    /// was whatever `<rpc-error>` it chose to send back over the wire.
+    ///
+    /// Default `true`: RFC 6241 doesn't forbid trying anyway (§7.1 leaves
+    /// "what the server does with an unadvertised operation" to the
+    /// server), so this is a design choice between two legitimate
+    /// behaviours, not a normative requirement — but some NETCONF servers
+    /// are known to implement an operation without advertising the
+    /// capability that is supposed to announce it, so the check is a
+    /// switch, not a hardcoded refusal: set `check_capabilities = false` to
+    /// fall back to "try it, let the peer's `<rpc-error>` say no".
+    check_capabilities: bool = true,
     /// Bytes per `pumpOnce` read.
     read_buffer_size: usize = 64 * 1024,
     /// Refuse to queue more than this many unread notifications; beyond it a
@@ -144,6 +168,10 @@ pub const SessionError = error{
     /// `Options.max_idle_reads` consecutive calls without ever completing a
     /// message. See `Options.max_idle_reads`.
     IdleTimeout,
+    /// `Options.check_capabilities` is `true` (the default) and the peer's
+    /// `<hello>` never advertised the capability an operation requires. See
+    /// `Options.check_capabilities`.
+    CapabilityNotAdvertised,
 } || TransportError || framing.FramerError || framing.WriteError ||
     capabilities.HelloError || reply_mod.ParseError || reply_mod.CheckError ||
     reply_mod.NotificationError ||
@@ -307,10 +335,78 @@ pub const Client = struct {
 
     // ── requests ───────────────────────────────────────────────────────────
 
+    /// The capability (if any) `Datastore` requires as a `<source>`/`<target>`.
+    fn datastoreCapability(d: rpc_mod.Datastore) ?[]const u8 {
+        return switch (d) {
+            .running => null,
+            .candidate => capabilities.cap_candidate,
+            .startup => capabilities.cap_startup,
+            .url => capabilities.cap_url,
+        };
+    }
+
+    /// The capability (if any) a `ConfigSource` requires. `.config` (an
+    /// inline body) needs nothing beyond the operation's own capability, if
+    /// it has one.
+    fn configSourceCapability(s: rpc_mod.ConfigSource) ?[]const u8 {
+        return switch (s) {
+            .running, .config => null,
+            .candidate => capabilities.cap_candidate,
+            .startup => capabilities.cap_startup,
+            .url => capabilities.cap_url,
+        };
+    }
+
+    /// `Options.check_capabilities`'s enforcement point: called once per
+    /// `send`, before anything goes on the wire. See the option's doc
+    /// comment for the RFC citations behind each case. Checks up to two
+    /// capabilities per call (an operation naming both a target/source
+    /// datastore AND having its own gating capability, e.g. `validate`
+    /// against `.candidate`) and fails closed on the first one missing.
+    fn checkCapability(self: *Client, rpc: rpc_mod.Rpc) SessionError!void {
+        if (!self.opts.check_capabilities) return;
+        // `send` only runs in `.established`, which is only reached after
+        // `hello()` has stored the server's hello -- this is never null in
+        // practice, not a silent fallthrough.
+        const server = self.serverCapabilities() orelse return;
+        var needed: [2]?[]const u8 = .{ null, null };
+        switch (rpc) {
+            .get_config => |g| needed[0] = datastoreCapability(g.source),
+            .edit_config => |e| {
+                needed[0] = datastoreCapability(e.target);
+                needed[1] = switch (e.payload) {
+                    .config => null,
+                    .url => capabilities.cap_url,
+                };
+            },
+            .copy_config => |c| {
+                needed[0] = datastoreCapability(c.target);
+                needed[1] = configSourceCapability(c.source);
+            },
+            .delete_config => |d| needed[0] = datastoreCapability(d),
+            .lock => |d| needed[0] = datastoreCapability(d),
+            .unlock => |d| needed[0] = datastoreCapability(d),
+            .commit => |c| if (c.confirmed) {
+                needed[0] = capabilities.cap_confirmed_commit;
+            },
+            .validate => |s| {
+                needed[0] = capabilities.cap_validate;
+                needed[1] = configSourceCapability(s);
+            },
+            .create_subscription => needed[0] = capabilities.cap_notification,
+            .get, .discard_changes, .close_session, .kill_session, .raw => {},
+        }
+        for (needed) |maybe_cap| {
+            const cap = maybe_cap orelse continue;
+            if (!server.has(cap)) return error.CapabilityNotAdvertised;
+        }
+    }
+
     /// Serialise and send `rpc` with a freshly allocated `message-id`, which is
     /// returned so a pipelining caller can correlate later.
     pub fn send(self: *Client, rpc: rpc_mod.Rpc) SessionError!u64 {
         if (self.state != .established) return error.InvalidState;
+        try self.checkCapability(rpc);
         const id = self.next_id;
         self.next_id += 1;
         const payload = try rpc_mod.buildRpc(self.gpa, id, rpc);
@@ -783,12 +879,23 @@ const FakePeer = struct {
     }
 };
 
-fn helloWith(gpa: std.mem.Allocator, peer_caps: []const []const u8, drip: usize) !struct { peer: *FakePeer, client: *Client } {
+const PeerAndClient = struct { peer: *FakePeer, client: *Client };
+
+fn helloWith(gpa: std.mem.Allocator, peer_caps: []const []const u8, drip: usize) !PeerAndClient {
+    return helloWithOpts(gpa, peer_caps, drip, .{});
+}
+
+fn helloWithOpts(
+    gpa: std.mem.Allocator,
+    peer_caps: []const []const u8,
+    drip: usize,
+    opts: Options,
+) !PeerAndClient {
     const peer = try gpa.create(FakePeer);
     peer.* = FakePeer.init(gpa, peer_caps);
     peer.drip = drip;
     const client = try gpa.create(Client);
-    client.* = try Client.init(gpa, peer.transport(), .{});
+    client.* = try Client.init(gpa, peer.transport(), opts);
     return .{ .peer = peer, .client = client };
 }
 
@@ -1097,7 +1204,20 @@ test "close-session ends the session" {
 
 test "the full operation surface round-trips against the fake peer" {
     const gpa = testing.allocator;
-    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    // This test is about the wire encoding of every `Rpc` variant, not about
+    // `Options.check_capabilities` -- the peer advertises every capability
+    // the operation list below needs so the two concerns stay separate (see
+    // the dedicated "check_capabilities" tests further down for the gating
+    // behaviour itself).
+    const h = try helloWith(gpa, &.{
+        capabilities.cap_base_1_0,
+        capabilities.cap_base_1_1,
+        capabilities.cap_candidate,
+        capabilities.cap_startup,
+        capabilities.cap_confirmed_commit,
+        capabilities.cap_validate,
+        capabilities.cap_notification,
+    }, 0);
     defer destroy(gpa, h.peer, h.client);
     try h.client.hello();
 
@@ -1116,6 +1236,73 @@ test "the full operation surface round-trips against the fake peer" {
         .{ .raw = "<get-schema xmlns=\"urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring\"/>" },
     };
     for (ops) |op| {
+        var r = try h.client.call(op);
+        defer r.deinit();
+        try testing.expect(!r.hasErrors());
+    }
+}
+
+test "check_capabilities (default true) refuses locally an operation the peer never advertised" {
+    const gpa = testing.allocator;
+    // Only the two base versions -- none of :candidate, :startup, :url,
+    // :confirmed-commit, :validate, :notification.
+    const h = try helloWith(gpa, &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 }, 0);
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    // One representative per RFC 6241/5277 clause named in
+    // `Options.check_capabilities`'s doc comment (§8.3, §8.7, §8.8, §8.4,
+    // §8.6, RFC 5277 §3.1). None of these ever reach the fake peer: the
+    // refusal is local, so `FakePeer.answer` (which does not itself check
+    // capabilities -- see `handle`/`answer` above) never gets a chance to
+    // answer wrong.
+    const cases = [_]rpc_mod.Rpc{
+        .{ .get_config = .{ .source = .candidate } }, // :candidate via source
+        .{ .edit_config = .{ .target = .startup, .payload = .{ .config = "<x/>" } } }, // :startup via target
+        .{ .edit_config = .{ .target = .running, .payload = .{ .url = "file:///x" } } }, // :url via payload
+        .{ .copy_config = .{ .target = .running, .source = .startup } }, // :startup via source
+        .{ .delete_config = .candidate }, // :candidate via Datastore
+        .{ .lock = .candidate },
+        .{ .unlock = .candidate },
+        .{ .commit = .{ .confirmed = true } }, // :confirmed-commit
+        .{ .validate = .running }, // :validate, unconditional on the op itself
+        .{ .create_subscription = .{} }, // RFC 5277 §3.1 :notification
+    };
+    for (cases) |op| {
+        try testing.expectError(error.CapabilityNotAdvertised, h.client.call(op));
+    }
+    // The control: an operation naming no gated datastore/feature at all
+    // must NOT be refused by the same client/peer pair.
+    var r = try h.client.call(.{ .get = .{} });
+    r.deinit();
+}
+
+test "check_capabilities = false falls back to letting the peer answer" {
+    const gpa = testing.allocator;
+    // Same bare peer as above (no :candidate/:startup/:confirmed-commit/
+    // :validate/:notification advertised), but the client opts out of the
+    // local check.
+    const h = try helloWithOpts(
+        gpa,
+        &.{ capabilities.cap_base_1_0, capabilities.cap_base_1_1 },
+        0,
+        .{ .check_capabilities = false },
+    );
+    defer destroy(gpa, h.peer, h.client);
+    try h.client.hello();
+
+    const cases = [_]rpc_mod.Rpc{
+        .{ .get_config = .{ .source = .candidate } },
+        .{ .commit = .{ .confirmed = true } },
+        .{ .validate = .running },
+        .{ .create_subscription = .{} },
+    };
+    for (cases) |op| {
+        // FakePeer.answer does not implement its own capability policing --
+        // it answers <ok/> (or <data/> for get-config) unconditionally, so
+        // with the check off the request reaches it and succeeds, exactly
+        // the RFC 6241 §7.1 "try it, let the peer decide" behaviour the
+        // switch restores.
         var r = try h.client.call(op);
         defer r.deinit();
         try testing.expect(!r.hasErrors());

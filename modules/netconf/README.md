@@ -142,6 +142,20 @@ no timeout of its own to blame (2026-09-10 audit, `A1/netconf.md` N2). `Options.
 correctly-implemented `Transport.read`, which returns 0 only after an actual bounded wait,
 would need thousands of real wait cycles to ever reach it.
 
+### Capability checking
+
+RFC 6241/5277 gate several operations behind a capability the peer must advertise in its
+`<hello>`: `:candidate` (§8.3) for anything naming `.candidate` as a source/target,
+`:startup` (§8.7) for `.startup`, `:url` (§8.8) for a `Datastore.url`/`EditPayload.url`,
+`:confirmed-commit` (§8.4) for `commit(.{.confirmed = true})`, `:validate` (§8.6) for
+`validate`, and RFC 5277 §3.1's `:notification` for `createSubscription`. By default (
+`Options.check_capabilities = true`) `Client.send` checks the peer's parsed `<hello>`
+(`Client.serverCapabilities()`) against this list before writing anything to the wire, and
+fails locally with `error.CapabilityNotAdvertised` rather than round-tripping to find out
+from an `<rpc-error>`. Some NETCONF servers implement an operation without advertising the
+capability that announces it; for those, construct the `Client` with
+`.check_capabilities = false` to fall back to "try it, let the peer decide".
+
 ## API
 
 ### Client
