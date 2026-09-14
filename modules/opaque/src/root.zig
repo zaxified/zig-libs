@@ -676,7 +676,8 @@ pub fn createRegistrationRequest(
     return .{ .blinded_message = blinded.toBytes() };
 }
 
-pub const CreateRegistrationResponseError = error{ InvalidMessage, DeriveKeyPairFailed, InvalidSecretKey };
+/// No `InvalidSecretKey`: `voprf.blindEvaluate` returns no error (A1/opaque.md L2).
+pub const CreateRegistrationResponseError = error{ InvalidMessage, DeriveKeyPairFailed };
 
 /// §5.2.2 `CreateRegistrationResponse`: derive the per-client OPRF key
 /// from `oprf_seed` + `credential_identifier` and evaluate the blinded
@@ -757,7 +758,9 @@ pub const ServerLoginState = struct {
     session_key: [Nx]u8,
 };
 
-pub const GenerateKE1Error = error{ InvalidInput, InvalidBlind, DeriveKeyPairFailed };
+/// No `InvalidBlind`: `voprf.blind` only returns `InvalidInput`; the blind is
+/// first used, and can first fail, in `generateKE3` (A1/opaque.md L2).
+pub const GenerateKE1Error = error{ InvalidInput, DeriveKeyPairFailed };
 
 pub const GenerateKE1Result = struct {
     ke1: KE1,
@@ -792,7 +795,8 @@ pub fn generateKE1(
     } };
 }
 
-pub const GenerateKE2Error = error{ InvalidMessage, InvalidPublicKey, DeriveKeyPairFailed, InvalidSecretKey, IdentityTooLong };
+/// No `InvalidSecretKey`: `voprf.blindEvaluate` returns no error (A1/opaque.md L2).
+pub const GenerateKE2Error = error{ InvalidMessage, InvalidPublicKey, DeriveKeyPairFailed, IdentityTooLong };
 
 pub const GenerateKE2Result = struct {
     ke2: KE2,
@@ -1112,6 +1116,28 @@ test "diffieHellman REPORTS NOTHING about a degenerate private key (ct25519)" {
     const k = voprf.scalarFromWideBytes([_]u8{0x3c} ** 64);
     const want = try point.p.mul(k);
     try std.testing.expectEqualSlices(u8, &want.toBytes(), &(try diffieHellman(k, peer)));
+}
+
+test "public error sets name no variant their function cannot return (L2)" {
+    // The compiler enforces the other direction: a path that returned a
+    // removed variant would no longer build against the narrowed set.
+    inline for (.{
+        .{ CreateRegistrationResponseError, "InvalidSecretKey" },
+        .{ GenerateKE2Error, "InvalidSecretKey" },
+        .{ GenerateKE1Error, "InvalidBlind" },
+    }) |case| {
+        for (@typeInfo(case[0]).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, case[1]));
+        }
+    }
+    // Control: `InvalidBlind` stays where `voprf.finalize` can return it.
+    inline for (.{ FinalizeRegistrationError, GenerateKE3Error }) |set| {
+        var found = false;
+        for (@typeInfo(set).error_set.?) |e| {
+            if (std.mem.eql(u8, e.name, "InvalidBlind")) found = true;
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "wire sizes match RFC 9807 §6.1 (ristretto255-SHA-512)" {

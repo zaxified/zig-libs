@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BREAKING (error sets narrowed):** audit L2, round-2 decision Q3 (signature
+  change allowed, no consumers). Three public error sets named variants their functions can never
+  return, so a caller's exhaustive `switch` had to handle them: `InvalidSecretKey` in
+  `CreateRegistrationResponseError` and `GenerateKE2Error` (`voprf.blindEvaluate` returns no
+  error) and `InvalidBlind` in `GenerateKE1Error` (`voprf.blind` returns only `InvalidInput`).
+  All three are removed. `InvalidBlind` stays in `FinalizeRegistrationError` and
+  `GenerateKE3Error`, where `voprf.finalize` can return it. A test pins the narrowed sets; the
+  compiler now refuses any future path that would return a removed variant.
+
 - **2026-09-11** — A1 fix campaign: `A1/opaque.md` L4 (0 consumers, P1
   applies; test-only, no production code, wire format or API change).
   - **L4**: the AKE transcript's seven-piece preamble (context,
