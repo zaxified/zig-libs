@@ -3,8 +3,8 @@
 RFC 9807 OPAQUE aPAKE, **ristretto255-SHA-512 configuration with the
 3DH key exchange only** (OPRF: ristretto255-SHA512 / RFC 9497
 modeOPRF via the sibling `voprf` module, KDF: HKDF-SHA-512, MAC:
-HMAC-SHA-512, Hash: SHA-512, KSF: pluggable (`Ksf`, default Identity —
-see below), Group: ristretto255).
+HMAC-SHA-512, Hash: SHA-512, KSF: pluggable (`Ksf`, mandatory — no
+default, see below), Group: ristretto255).
 Status: **complete** — registration + login/AKE implemented and
 KAT-validated byte-exact against RFC 9807 Appendix C.1.1 and C.1.2
 (see `src/kat_test.zig`).
@@ -84,34 +84,37 @@ a collision-resistant hash qualifies, §10.6) and shrinks the record.
 A wrong password produces a different `auth_key`/keypair, so the
 timing-safe `auth_tag` check fails closed as `error.EnvelopeRecovery`.
 
-## KSF — pluggable, default Identity (audit finding M6)
+## KSF — pluggable, MANDATORY, no default (audit finding M6)
 
 RFC 9807 §7: the KSF "is determined by the application" — collision
 resistance is the only hard requirement, and Appendix C's own test
 vectors use `Stretch(msg) = msg` ("Identity") purely so the KATs are
 reproducible, NOT as a production recommendation. §7's three
 configurations RECOMMENDED absent an application-specific profile all
-use a real KSF (two Argon2id, one scrypt) — a client-side cost knob
-against offline attacks after server compromise (§10.8), not a
-protocol change; swapping it changes no wire format but invalidates
-existing registrations (users must re-register, §8).
+use a real KSF (two Argon2id, one scrypt) — skipping stretching
+entirely means an offline dictionary attack on a leaked
+`RegistrationRecord` costs one OPRF evaluation per guess. Swapping the
+KSF changes no wire format but invalidates existing registrations
+(users must re-register, §8).
 
 `Ksf` (`root.zig`) is a context-pointer callback
 (`stretchFn(ctx, in: [Nh]u8, out: *[Nh]u8) error{KsfFailed}!void`),
-threaded through `finalizeRegistrationRequest`/`generateKE3` via a
-trailing `KsfOptions{ ksf: Ksf = .identity }`. This module stays
+a plain **required** parameter on `finalizeRegistrationRequest` and
+`generateKE3` — no default, no options-struct wrapper (one field with
+no legitimate default value doesn't earn a wrapper). This module stays
 `Allocator`/`Io`-free (API discipline below) — a real KSF like
 Argon2id needs both (`std.crypto.pwhash.argon2.kdf`'s signature takes
 an `Allocator` and a `std.Io`), so it lives on the CALLER's side of
-`ctx`, not inside this module. `.identity` stays the default: this
-module cannot default to a concrete real KSF without acquiring that
-dependency itself, and picking one implementation to hardcode would be
-a policy choice belonging to the deployment, not the library. See
-`kat_test.zig`'s `Argon2Ksf` for a worked example (used by two tests:
-a real Argon2id round-trip that still agrees on both sides and
-demonstrably changes `session_key`/`export_key`, and one proving
-`error.KsfFailed` propagates from a failing KSF rather than being
-swallowed).
+`ctx`, not inside this module — and precisely because it can't default
+to a real one without acquiring that dependency, it doesn't default to
+anything: a caller reaching for `Ksf.identity` outside a test has to
+write that name, not get it by omission (`.{}` does not compile — see
+`Ksf.identity`'s doc comment and `A1/opaque.md`'s M6 dispozice for the
+compile-error proof). See `kat_test.zig`'s `Argon2Ksf` for a worked
+example (used by two tests: a real Argon2id round-trip that still
+agrees on both sides and demonstrably changes
+`session_key`/`export_key`, and one proving `error.KsfFailed`
+propagates from a failing KSF rather than being swallowed).
 
 ## Login: 3DH AKE (§6.4)
 
@@ -181,7 +184,7 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
   ciphersuite `voprf` does not build.
 - ~~**Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs
   to the consumer; seam documented above.~~ **Now pluggable, 2026-09-15**
-  (A1/opaque.md M6): `Ksf`/`KsfOptions`, see above — the CONCRETE
+  (A1/opaque.md M6): `Ksf`, see above — the CONCRETE
   algorithm/parameter choice is still the consumer's, this module never
   picks one, but the seam is now a public callback instead of "edit
   `randomizedPassword`".

@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BREAKING (API):** M6 follow-up, same day. The `KsfOptions{ ksf: Ksf =
+  .identity }` wrapper below shipped with a default, which is exactly the weakness M6 is about:
+  a caller passing `.{}` gets Identity silently. Q8's "safe default" rule applies here too —
+  there is no safe *value* default (a real KSF needs an `Allocator`/`Io` this module refuses to
+  acquire, so the only concrete default this module could pick is the insecure one), so the fix
+  is no default at all. `finalizeRegistrationRequest`/`generateKE3` now take a plain **required**
+  `ksf: Ksf` (the one-field `KsfOptions` wrapper added nothing once there's no default — removed
+  rather than kept as pointless indirection). `.{}` at a call site is now a **compile error**
+  ("missing struct field: stretchFn" at the call site, not inside `Ksf`) — verified with a probe
+  (`.zig-cache/probe/`, `scripts/modtest --file`) run against both the previous commit (compiles,
+  1/1) and this one (fails to compile, same needle both times: `\.zig:\d+:\d+: error:`). Every
+  call site now passes `.identity` explicitly (`kat_test.zig`, `example/main.zig`, two internal
+  `root.zig` test helpers) — `Ksf.identity`'s doc comment is now explicit that it exists for RFC
+  9807 Appendix C reproduction only, never for a real registration.
+
 - **2026-09-15** — **NEW, additive (trailing options parameter):** audit M6, round-2 Q5 framing
   (norm wins: RFC 9807 §7 leaves the KSF to "the application" and only recommends Identity for
   Appendix C reproducibility, not production — see `SPEC.md`). Added `Ksf` (a context-pointer

@@ -53,7 +53,7 @@ fn registerFromVector(v: kat.RealVector) !opaque_pake.FinalizeRegistrationResult
         response,
         identitiesOf(v),
         v.envelope_nonce,
-        .{},
+        .identity,
     );
     return finalized;
 }
@@ -103,7 +103,7 @@ test "login: KE1, KE2, KE3, session_key, export_key match C.1.1 + C.1.2 on both 
         );
         try testing.expectEqualSlices(u8, &v.ke2, &server.ke2.toBytes());
 
-        const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{});
+        const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
         try testing.expectEqualSlices(u8, &v.ke3, &finished.ke3.toBytes());
         // (3) client-side outputs match the vector...
         try testing.expectEqualSlices(u8, &v.session_key, &finished.session_key);
@@ -139,7 +139,7 @@ test "tampered KE2 server_mac fails closed on the client (ServerAuthentication)"
     tampered.auth_response.server_mac[0] ^= 0x01;
     try testing.expectError(
         error.ServerAuthentication,
-        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, tampered, .{}),
+        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, tampered, .identity),
     );
 }
 
@@ -160,7 +160,7 @@ test "tampered KE3 client_mac fails closed on the server (ClientAuthentication)"
         v.server_nonce,
         v.server_keyshare_seed,
     );
-    const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{});
+    const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
     var tampered = finished.ke3;
     tampered.client_mac[tampered.client_mac.len - 1] ^= 0x80;
     try testing.expectError(error.ClientAuthentication, opaque_pake.serverFinish(server.state, tampered));
@@ -190,7 +190,7 @@ test "wrong password fails closed on the client (EnvelopeRecovery)" {
     );
     try testing.expectError(
         error.EnvelopeRecovery,
-        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{}),
+        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity),
     );
 }
 
@@ -216,7 +216,7 @@ test "mismatched identities fail closed on the client (EnvelopeRecovery)" {
     );
     try testing.expectError(
         error.EnvelopeRecovery,
-        opaque_pake.generateKE3(client.state, wrong_identities, v.context, server.ke2, .{}),
+        opaque_pake.generateKE3(client.state, wrong_identities, v.context, server.ke2, .identity),
     );
 }
 
@@ -274,7 +274,7 @@ test "identity-element server_public_keyshare in KE2 is rejected (InvalidPublicK
 
     try testing.expectError(
         error.InvalidPublicKey,
-        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, poisoned_ke2, .{}),
+        opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, poisoned_ke2, .identity),
     );
 }
 
@@ -312,7 +312,7 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
         response,
         identities,
         [_]u8{0x11} ** 32, // envelope_nonce,
-        .{},
+        .identity,
     );
 
     // Login.
@@ -335,7 +335,7 @@ test "fresh end-to-end registration + login agree on session_key and export_key"
         [_]u8{0x55} ** 32, // server_nonce
         [_]u8{0x66} ** 32, // server_keyshare_seed
     );
-    const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2, .{});
+    const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2, .identity);
     const server_session_key = try opaque_pake.serverFinish(server.state, finished.ke3);
 
     // Both sides agree on the session key; the login-recovered
@@ -421,7 +421,7 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         response,
         identities,
         [_]u8{0x11} ** 32,
-        .{ .ksf = argon2.ksf() },
+        argon2.ksf(),
     );
 
     const client = try opaque_pake.generateKE1(
@@ -444,7 +444,7 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
         [_]u8{0x66} ** 32,
     );
     // Matching Argon2id on both sides: still a normal, successful login.
-    const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2, .{ .ksf = argon2.ksf() });
+    const finished = try opaque_pake.generateKE3(client.state, identities, context, server.ke2, argon2.ksf());
     const server_session_key = try opaque_pake.serverFinish(server.state, finished.ke3);
     try testing.expectEqualSlices(u8, &finished.session_key, &server_session_key);
     try testing.expectEqualSlices(u8, &registered.export_key, &finished.export_key);
@@ -474,7 +474,7 @@ test "M6: a real KSF (Argon2id) changes session_key/export_key, and matching KSF
     );
     try testing.expectError(
         error.EnvelopeRecovery,
-        opaque_pake.generateKE3(wrong_client.state, identities, context, wrong_server.ke2, .{}), // .identity, not argon2
+        opaque_pake.generateKE3(wrong_client.state, identities, context, wrong_server.ke2, .identity), // .identity, not argon2
     );
 }
 
@@ -507,7 +507,7 @@ test "M6: a failing KSF propagates error.KsfFailed, not silently swallowed or pa
             response,
             identities,
             [_]u8{0x11} ** 32,
-            .{ .ksf = argon2.ksf() },
+            argon2.ksf(),
         ),
     );
 }
@@ -555,7 +555,7 @@ test "H1: every byte of the envelope auth_tag is checked, not just some" {
         );
         try testing.expectError(
             error.EnvelopeRecovery,
-            opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{}),
+            opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity),
         );
     }
     // Positive control: the untampered record still logs in.
@@ -573,7 +573,7 @@ test "H1: every byte of the envelope auth_tag is checked, not just some" {
         v.server_nonce,
         v.server_keyshare_seed,
     );
-    _ = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{});
+    _ = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
 }
 
 test "H1: every byte of KE2's server_mac is checked, not just byte 0" {
@@ -599,11 +599,11 @@ test "H1: every byte of KE2's server_mac is checked, not just byte 0" {
         tampered.auth_response.server_mac[i] ^= 0x01;
         try testing.expectError(
             error.ServerAuthentication,
-            opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, tampered, .{}),
+            opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, tampered, .identity),
         );
     }
     // Positive control: the untampered KE2 still completes.
-    _ = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{});
+    _ = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
 }
 
 test "H1: every byte of KE3's client_mac is checked, not just the last byte" {
@@ -623,7 +623,7 @@ test "H1: every byte of KE3's client_mac is checked, not just the last byte" {
         v.server_nonce,
         v.server_keyshare_seed,
     );
-    const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .{});
+    const finished = try opaque_pake.generateKE3(client.state, identitiesOf(v), v.context, server.ke2, .identity);
     var i: usize = 0;
     while (i < opaque_pake.Nm) : (i += 1) {
         var tampered = finished.ke3;
@@ -718,7 +718,7 @@ test "M2: an identity/context past 0xffff bytes is a typed error, not a panic or
             opaque_pake.RegistrationResponse.fromBytes(v.registration_response),
             .{ .client = oversized_buf, .server = null },
             v.envelope_nonce,
-            .{},
+            .identity,
         ),
     );
 

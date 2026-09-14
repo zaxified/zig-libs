@@ -102,7 +102,7 @@ pub fn main() !void {
         reg_response,
         identities,
         bytes32("alice envelope nonce"),
-        .{},
+        .identity,
     );
     // What the server stores, per client — server never saw the password.
     const db_record = reg_finalized.record;
@@ -129,7 +129,7 @@ pub fn main() !void {
         bytes32("server login-1 server nonce"),
         bytes32("server login-1 keyshare seed"),
     );
-    const ke3_res_1 = try opq.generateKE3(ke1_res_1.state, identities, context, ke2_res_1.ke2, .{});
+    const ke3_res_1 = try opq.generateKE3(ke1_res_1.state, identities, context, ke2_res_1.ke2, .identity);
     // The export_key is a client-only value, re-derived (not transmitted)
     // — it must match what registration produced, every successful login.
     must(std.mem.eql(u8, &export_key_registration, &ke3_res_1.export_key), @src());
@@ -161,7 +161,7 @@ pub fn main() !void {
         bytes32("server login-2 server nonce"),
         bytes32("server login-2 keyshare seed"),
     );
-    const ke3_res_2 = try opq.generateKE3(ke1_res_2.state, identities, context, ke2_res_2.ke2, .{});
+    const ke3_res_2 = try opq.generateKE3(ke1_res_2.state, identities, context, ke2_res_2.ke2, .identity);
     must(std.mem.eql(u8, &export_key_registration, &ke3_res_2.export_key), @src());
     const session_key_server_2 = try opq.serverFinish(ke2_res_2.state, ke3_res_2.ke3);
     must(std.mem.eql(u8, &ke3_res_2.session_key, &session_key_server_2), @src());
@@ -194,7 +194,7 @@ pub fn main() !void {
         bytes32("server wrong-password server nonce"),
         bytes32("server wrong-password keyshare seed"),
     );
-    if (opq.generateKE3(ke1_res_w.state, identities, context, ke2_res_w.ke2, .{})) |_| {
+    if (opq.generateKE3(ke1_res_w.state, identities, context, ke2_res_w.ke2, .identity)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.EnvelopeRecovery => std.debug.print("wrong password: EnvelopeRecovery (expected)\n", .{}),
@@ -222,7 +222,7 @@ pub fn main() !void {
         bytes32("server login-3 keyshare seed"),
     );
     ke2_res_3.ke2.auth_response.server_mac[0] ^= 0x01;
-    if (opq.generateKE3(ke1_res_3.state, identities, context, ke2_res_3.ke2, .{})) |_| {
+    if (opq.generateKE3(ke1_res_3.state, identities, context, ke2_res_3.ke2, .identity)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.ServerAuthentication => std.debug.print("tampered server_mac: ServerAuthentication (expected)\n", .{}),
@@ -249,7 +249,7 @@ pub fn main() !void {
         bytes32("server login-4 server nonce"),
         bytes32("server login-4 keyshare seed"),
     );
-    var ke3_res_4 = try opq.generateKE3(ke1_res_4.state, identities, context, ke2_res_4.ke2, .{});
+    var ke3_res_4 = try opq.generateKE3(ke1_res_4.state, identities, context, ke2_res_4.ke2, .identity);
     ke3_res_4.ke3.client_mac[0] ^= 0x01;
     if (opq.serverFinish(ke2_res_4.state, ke3_res_4.ke3)) |_| {
         return error.UnexpectedAccept;
