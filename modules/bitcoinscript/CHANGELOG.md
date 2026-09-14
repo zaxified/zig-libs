@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **Internal only, no behaviour change:** `sigcheck.zig`'s private
+  `reduceToScalar` + `ecdsaVerifyDigest` (a byte-for-byte copy of
+  `k256.sign.ecdsaVerify`'s arithmetic, minus the internal SHA-256, because
+  Bitcoin's OP_CHECKSIG digest is already-hashed) are gone. `checkEcdsaSig`
+  now calls the new `k256.sign.ecdsaVerifyPrehashed` (A1 `k256` G4, perf
+  pass, round-2 decision Q4, both sides one commit) instead of carrying its
+  own copy of the verify core — a future fix to that arithmetic (e.g. a
+  Wycheproof-anchored `r`/`s ≥ n` guard, `k256` G3) now only has to be made
+  once. `scripts/modtest bitcoinscript`: 91/91 before and after, Debug and
+  ReleaseFast.
+
 - **2026-09-09** — Docs: `NOTICE` named ONE vendored corpus; the module has **five**, and one
   of them comes from a repository the file had never heard of. Added:
   `src/script_tests_witness_vectors.zig` (the 107 witness-bearing rows of Core's

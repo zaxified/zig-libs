@@ -16,11 +16,15 @@
 //! directly into the ECDSA math — no further hashing. Calling
 //! `k256.sign.ecdsaVerify(pk, &sighash, sig)` would hash that digest a
 //! *third* time (`SHA256(SHA256(SHA256(preimage)))`), silently verifying
-//! against the wrong value. `ecdsaVerifyDigest` below is
-//! `k256.sign.ecdsaVerify`'s exact arithmetic with that extra hash
-//! removed — verifying `sig` directly against a caller-supplied 32-byte
-//! digest, which is what every consensus signature scheme (Bitcoin's
-//! included) actually wants at this layer.
+//! against the wrong value. **`k256.sign.ecdsaVerifyPrehashed`** (A1 `k256`
+//! G4, perf pass, round-2 decision Q4) is `ecdsaVerify`'s exact arithmetic
+//! with that extra hash removed — verifying `sig` directly against a
+//! caller-supplied 32-byte digest, which is what every consensus signature
+//! scheme (Bitcoin's included) actually wants at this layer. This file used
+//! to carry its own copy of that arithmetic (`reduceToScalar` +
+//! `ecdsaVerifyDigest`); it now calls the shared function instead, so a fix
+//! to the verify core (e.g. a Wycheproof-anchored `r`/`s ≥ n` guard) only
+//! has to be made once.
 //!
 //! Taproot key-path spending (Schnorr/BIP340 over the BIP341 sighash) does
 //! NOT go through this file — it has no scriptCode/CHECKSIG opcode at all;
@@ -202,39 +206,6 @@ pub fn checkPubkeyEncoding(pubkey: []const u8, sig_version: SigVersion, flags: S
 
 pub const CheckSigError = SigCheckError || bitcointx.legacy.LegacyError || bitcointx.bip143.Bip143Error;
 
-/// `int(bytes32) mod n` — same reduction `k256.sign` uses internally.
-fn reduceToScalar(bytes32: [32]u8) k256.Scalar {
-    var wide = [_]u8{0} ** 48;
-    wide[16..48].* = bytes32;
-    return k256.Scalar.fromBytes48(wide, .big);
-}
-
-/// ECDSA/secp256k1 verification against an already-computed 32-byte digest
-/// (module doc comment: "Why not `k256.sign.ecdsaVerify`"). Variable-time
-/// (every input is public — the pubkey, the digest, and the signature all
-/// come from the script/transaction being verified, never a secret).
-fn ecdsaVerifyDigest(pubkey_sec1: []const u8, digest: [32]u8, sig_rs: [64]u8) bool {
-    const Q = k256.Secp256k1.fromSec1(pubkey_sec1) catch return false;
-    const r = k256.Scalar.fromBytes(sig_rs[0..32].*, .big) catch return false;
-    const s = k256.Scalar.fromBytes(sig_rs[32..64].*, .big) catch return false;
-    if (r.isZero() or s.isZero()) return false;
-
-    const e = reduceToScalar(digest);
-    const sinv = s.invert();
-    const uu1 = e.mul(sinv);
-    const uu2 = r.mul(sinv);
-
-    const R = k256.Secp256k1.mulDoubleBasePublic(
-        k256.Secp256k1.basePoint,
-        uu1.toBytes(.big),
-        Q,
-        uu2.toBytes(.big),
-        .big,
-    ) catch return false;
-    const v = reduceToScalar(R.affineCoordinates().x.toBytes(.big));
-    return v.equivalent(r);
-}
-
 /// Verifies one ECDSA signature+pubkey pair over the sighash of `ctx`'s
 /// input, using `script_code` (the already-CODESEPARATOR-trimmed subScript
 /// — see `interpreter.zig`) and `sig_version` to select the legacy vs.
@@ -298,7 +269,7 @@ pub fn checkEcdsaSig(
     var sig_rs: [64]u8 = undefined;
     sig_rs[0..32].* = rs.r;
     sig_rs[32..64].* = rs.s;
-    return ecdsaVerifyDigest(pubkey, sighash, sig_rs);
+    return k256.sign.ecdsaVerifyPrehashed(pubkey, sighash, sig_rs);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

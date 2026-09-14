@@ -80,6 +80,19 @@ an external reference — the KATs above already pin that — it checks the
 buffer arithmetic (`update`'s partial-fill / full-block / remainder logic)
 the KATs' one-shot calls can't exercise.
 
+## Performance
+
+`compress`'s 80-round double-line schedule is `inline for (0..80)` (fully
+unrolled at compile time), not a runtime `while` loop over the round tables.
+Measured A/B, same process, ReleaseFast, 8 KiB input, 5 interleaved rounds
+each side (fix campaign, 2026-09-15): runtime loop 98–113 MiB/s, unrolled
+340–362 MiB/s — **≈3.0–3.7× faster**, bit-for-bit identical output (checked
+against two independently constructed chaining-state inputs). This roughly
+matches an earlier audit estimate (2026-09-04) of 3.0–3.2×; the range here is
+wider because the measuring machine was shared with concurrent agent work
+(see the fix campaign's own measurement notes), not because the two
+implementations diverge.
+
 ## Backlog / deferred
 
 None open.

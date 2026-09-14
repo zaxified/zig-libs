@@ -141,14 +141,32 @@ pub fn bip340Verify(pubkey_xonly: [32]u8, msg: []const u8, sig: [64]u8) bool {
 /// Bitcoin (BIP62 rule 5 / BIP146) make that the default; we do not, because
 /// this function's contract is "agree with std".
 pub fn ecdsaVerify(pubkey_sec1: []const u8, msg: []const u8, sig_rs: [64]u8) bool {
+    var h: [32]u8 = undefined;
+    Sha256.hash(msg, &h, .{});
+    return ecdsaVerifyPrehashed(pubkey_sec1, h, sig_rs);
+}
+
+/// `ecdsaVerify`'s exact arithmetic, minus the internal `SHA256(msg)` step —
+/// verifies `sig_rs` against an already-computed 32-byte digest. For a caller
+/// that has its OWN hash of the signed data already in hand (a Bitcoin
+/// sighash is itself `SHA256(SHA256(preimage))`, computed by the consensus
+/// serialization layer, not by this module) and must not hash it again:
+/// `ecdsaVerify(pk, msg, sig)` would compute `SHA256(msg)` where `msg` here
+/// would have to be the digest itself, silently verifying against
+/// `SHA256(digest)` instead of `digest` — a third hash the signer never
+/// applied. Variable-time, same as `ecdsaVerify` (every input — pubkey,
+/// digest, signature — is public in every known caller).
+///
+/// Added so `bitcoinscript`'s script-level ECDSA check (BIP66/legacy +
+/// segwit v0 `OP_CHECKSIG`) can share this arithmetic instead of carrying a
+/// second copy (A1 `k256` G4, perf pass, round-2 decision Q4).
+pub fn ecdsaVerifyPrehashed(pubkey_sec1: []const u8, digest: [32]u8, sig_rs: [64]u8) bool {
     const Q = Secp256k1.fromSec1(pubkey_sec1) catch return false;
     const r = Scalar.fromBytes(sig_rs[0..32].*, .big) catch return false;
     const s = Scalar.fromBytes(sig_rs[32..64].*, .big) catch return false;
     if (r.isZero() or s.isZero()) return false;
 
-    var h: [32]u8 = undefined;
-    Sha256.hash(msg, &h, .{});
-    const e = reduceToScalar(h);
+    const e = reduceToScalar(digest);
 
     const sinv = s.invert();
     const uu1 = e.mul(sinv);

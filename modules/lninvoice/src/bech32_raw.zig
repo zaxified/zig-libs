@@ -5,11 +5,13 @@
 //! address as Bech32, as specified in BIP-0173 (also without the character
 //! limit)"), so the `bech32` module's `encode`/`decode` — which enforce that
 //! ceiling via fixed ~90-byte stack buffers — cannot be reused for invoices.
-//! This file reimplements BIP173's BCH checksum + charset mapping (the same
-//! public algorithm `bech32`'s own `bech32.zig` implements, just over
-//! allocator-owned buffers instead of a capped stack buffer) so an invoice of
-//! arbitrary length can be decoded/encoded; `bech32.charset` itself (the
-//! 32-symbol alphabet, already `pub`) is reused rather than redeclared.
+//! **The BCH checksum math and charset mapping are `bech32`'s own exported
+//! `polymod`/`charValue`/`toLower`/`hrpExpandInto` (M6, `A1/bech32.md`,
+//! 2026-09-15) — this file no longer carries a second copy of them.** What
+//! genuinely differs, and stays here, is the HRP/data split: `splitHrp`
+//! deliberately omits `bech32.decode`'s `sep > max_hrp_len` (83) check,
+//! because BOLT#11/#12 have no such cap, and the allocator-owned buffer
+//! sizing throughout.
 //!
 //! Also provides a **checksum-less** variant (`decodeNoChecksum`/
 //! `encodeNoChecksum`) for BOLT#12: offers/invoice_requests/invoices are
@@ -27,46 +29,18 @@ const bech32 = @import("bech32");
 /// declared in exactly one place in the repo.
 pub const charset = bech32.charset;
 
-const gen = [5]u32{ 0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3 };
 /// BOLT#11 invoices always checksum as plain bech32 (BIP173 constant `1`),
 /// never bech32m — there is no witness-version-style variant selection here.
 const bech32_const: u32 = 1;
 
-fn polymod(values: []const u5) u32 {
-    var chk: u32 = 1;
-    for (values) |v| {
-        const b: u32 = chk >> 25;
-        chk = ((chk & 0x1ffffff) << 5) ^ @as(u32, v);
-        if (b & 1 != 0) chk ^= gen[0];
-        if (b & 2 != 0) chk ^= gen[1];
-        if (b & 4 != 0) chk ^= gen[2];
-        if (b & 8 != 0) chk ^= gen[3];
-        if (b & 16 != 0) chk ^= gen[4];
-    }
-    return chk;
-}
-
-const charset_rev: [256]i8 = blk: {
-    var t: [256]i8 = [_]i8{-1} ** 256;
-    for (charset, 0..) |c, i| t[c] = @intCast(i);
-    break :blk t;
-};
-
-fn charValue(c: u8) ?u5 {
-    const v = charset_rev[c];
-    if (v < 0) return null;
-    return @intCast(v);
-}
-
-fn toLower(c: u8) u8 {
-    return if (c >= 'A' and c <= 'Z') c + 32 else c;
-}
+const polymod = bech32.polymod;
+const charValue = bech32.charValue;
+const toLower = bech32.toLower;
 
 fn hrpExpand(allocator: Allocator, hrp: []const u8) Allocator.Error![]u5 {
     const out = try allocator.alloc(u5, 2 * hrp.len + 1);
-    for (hrp, 0..) |c, i| out[i] = @intCast(c >> 5);
-    out[hrp.len] = 0;
-    for (hrp, 0..) |c, i| out[hrp.len + 1 + i] = @intCast(c & 31);
+    const n = bech32.hrpExpandInto(hrp, out);
+    std.debug.assert(n == out.len);
     return out;
 }
 

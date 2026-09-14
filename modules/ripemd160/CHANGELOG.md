@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **A1 fix campaign, perf pass: `compress`'s 80-round schedule
+  unrolled at compile time (`inline for` instead of a runtime `while`
+  loop).** Measured A/B, same process, ReleaseFast, 8 KiB input, 5
+  interleaved rounds per side: **≈3.0–3.7× faster** (98–113 → 340–362
+  MiB/s), bit-for-bit identical digests (checked against two independent
+  chaining-state inputs, plus the existing 13-test suite unchanged in both
+  Debug and ReleaseFast). No behavioural or API change. See `SPEC.md` §
+  Performance and `A1/ripemd160.md` disposition for the numbers.
+
 - **2026-09-10** — **A1 fix campaign: 4 gaps closed, all test-and-doc, no digest
   changed.** (1) A KAT for message length 56 (mod 64) — the first length that
   forces a *second* padding block, the sibling boundary of the existing

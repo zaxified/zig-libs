@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **API addition, no consumer-visible behaviour change:** `polymod`,
+  `charValue`, `toLower` and `hrpExpandInto` (the BCH-checksum/charset primitives underneath
+  `encode`/`decode`, already length-generic — plain slices, no internal cap) are now `pub` and
+  re-exported through `root.zig`. A1 M6 (perf pass, round-2 decision Q4, `bech32` M6 ×
+  `lninvoice`): `lninvoice`'s allocator-owned BOLT#11/#12 codec had its own byte-for-byte copy of
+  these four (54 non-comment lines), a drift risk the audit flagged — `DataTooShort`'s bound had
+  already drifted once (an unanchored guard in the copy vs. a vector-anchored one here).
+  `lninvoice/src/bech32_raw.zig` now imports and reuses them; its own `splitHrp` (which
+  deliberately omits `decode`'s 83-byte HRP-length cap — BOLT#11/#12 have none) is unchanged.
+  Mutation check: a one-bit change to `polymod`'s `gen[0]` constant here turns 19/91 `lninvoice`
+  tests red (`bech32raw.decode`'s checksum check), confirming the shared function is genuinely on
+  `lninvoice`'s production path, not a dead alias.
+
 - **2026-09-14** — **NO CONSUMER-VISIBLE CHANGE:** audit A1 L5, round-2 decision Q5 (by the norm).
   BIP173's own list of 10 invalid segwit addresses was left out of the corpus without a word; SPEC
   only justified dropping BIP173's VALID list (superseded by BIP350). Now pinned as

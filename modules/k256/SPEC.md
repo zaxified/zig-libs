@@ -398,6 +398,25 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
    `std.crypto.ecc.Secp256k1` references are comments and one test oracle
    (`sphinx/src/kat_test.zig:28`).
 6. Side-channel review of the CT paths (inverse, GLV sign handling).
+7. **Variable-base constant-time multiply (`Secp256k1.mul`, the ECDH path)
+   is still the plain always-double-and-add ladder — no windowing.**
+   Measured (fix campaign perf pass, 2026-09-15, ReleaseFast, 5 interleaved
+   A/B rounds against `std.crypto.ecc.Secp256k1`, same process): k256
+   ~197 µs/op vs std ~252–309 µs/op, **only ~1.26–1.57× faster** — in the
+   same ballpark as the audit's 2026-09-04 figure (1.37–1.38×), while the
+   fixed-base comb (#3) and the GLV variable-base paths (#2) are 3.5–8×
+   faster. The gap is algorithmic (a full point add on every one of 256
+   bits vs. a windowed multiply), not a coding inefficiency, and it is the
+   ONE curve operation `sphinx` (per-hop ECDH) and `bolt8` (Noise ECDH)
+   actually call with a secret scalar. **Deliberately left unimplemented
+   this pass**: a runtime-built windowed table over an arbitrary (not
+   fixed) point needs its own CT-gather construction (unlike #3's
+   comptime-built table) and would be a new algorithm under this repo's
+   "no bespoke crypto without proof" doctrine — bit-exact KAT, a
+   randomized differential, a `ctgrind` target, AND a `ctgrind` run are
+   all required before it ships, and `scripts/ctgrind.sh` was out of
+   scope for this pass (foreground-only, no full-repo tooling). See
+   `A1/k256.md` F5 disposition.
 
 ## Anchoring
 

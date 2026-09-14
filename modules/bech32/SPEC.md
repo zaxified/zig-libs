@@ -136,6 +136,13 @@ no-overflow case described above.
 - **Non-Bitcoin bech32 consumers** (Lightning invoices' bech32 layer, other chains' bech32m
   address formats) can reuse `bech32.encode`/`decode` directly today; no dedicated wrapper is
   built since no concrete consumer inside this repo has asked for one yet.
+- **Length-uncapped callers can't use `encode`/`decode` themselves** (both enforce BIP173's
+  90-character total ceiling via fixed stack buffers), but `polymod`, `charValue`, `toLower` and
+  `hrpExpandInto` — the BCH-checksum/charset primitives underneath them — are already
+  length-generic (plain slices, no internal cap) and are `pub`, exported through `root.zig`, for
+  exactly this case. `lninvoice`'s allocator-owned BOLT#11/#12 codec (`bech32_raw.zig`) uses them
+  instead of carrying its own copy (M6, `A1/bech32.md`, 2026-09-15) — see that module's SPEC for
+  what still has to differ (the HRP length cap, buffer ownership).
 
 ## Status
 

@@ -38,13 +38,21 @@ const charset_rev: [256]i8 = blk: {
     break :blk t;
 };
 
-fn charValue(c: u8) ?u5 {
+/// `charset`'s inverse: the 5-bit value a bech32 data-part byte encodes, or
+/// `null` if `c` is not in `charset` at all. Public so a length-uncapped
+/// caller (`lninvoice`'s BOLT#11/#12 codec, which cannot reuse `decode`/
+/// `encode` because they enforce BIP173's 90-char ceiling via fixed stack
+/// buffers) can share this table instead of redeclaring it — see M6 in
+/// `A1/bech32.md`.
+pub fn charValue(c: u8) ?u5 {
     const v = charset_rev[c];
     if (v < 0) return null;
     return @intCast(v);
 }
 
-fn toLower(c: u8) u8 {
+/// ASCII-lowercases one byte; non-letters pass through unchanged. Public for
+/// the same length-uncapped-caller reason as `charValue`.
+pub fn toLower(c: u8) u8 {
     return if (c >= 'A' and c <= 'Z') c + 32 else c;
 }
 
@@ -68,7 +76,14 @@ const max_combined = 2 * max_hrp_len + 1 + (max_len - 2);
 
 const gen = [5]u32{ 0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3 };
 
-fn polymod(values: []const u5) u32 {
+/// The BCH checksum's core recurrence (BIP173 "Checksum"). Already
+/// length-generic — `values` is a plain slice, not a fixed-size internal
+/// buffer — so it is the one piece of `createChecksum`/`detectEncoding`
+/// that a length-uncapped caller genuinely needs verbatim, not just a
+/// same-shaped copy of. Public for `lninvoice`'s BOLT#11/#12 codec (M6 in
+/// `A1/bech32.md`): the two must never drift against each other on the one
+/// piece of math a bech32-family checksum actually is.
+pub fn polymod(values: []const u5) u32 {
     var chk: u32 = 1;
     for (values) |v| {
         const b: u32 = chk >> 25;
@@ -86,7 +101,10 @@ fn polymod(values: []const u5) u32 {
 /// then the low 5 bits of each HRP byte — case-sensitive (encodes whether
 /// each byte was upper/lowercase), which is why checksum verification is
 /// always done against the *lowered* string (BIP173 "Uppercase/lowercase").
-fn hrpExpandInto(hrp: []const u8, out: []u5) usize {
+/// Already length-generic (writes into a caller-sized `out`, no internal
+/// cap), so it is public for the same length-uncapped-caller reason as
+/// `polymod` — see M6 in `A1/bech32.md`.
+pub fn hrpExpandInto(hrp: []const u8, out: []u5) usize {
     for (hrp, 0..) |c, i| out[i] = @intCast(c >> 5);
     out[hrp.len] = 0;
     for (hrp, 0..) |c, i| out[hrp.len + 1 + i] = @intCast(c & 31);
