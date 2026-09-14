@@ -5,6 +5,37 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BREAKING (API):** M6 follow-up, same day. The `KsfOptions{ ksf: Ksf =
+  .identity }` wrapper below shipped with a default, which is exactly the weakness M6 is about:
+  a caller passing `.{}` gets Identity silently. Q8's "safe default" rule applies here too —
+  there is no safe *value* default (a real KSF needs an `Allocator`/`Io` this module refuses to
+  acquire, so the only concrete default this module could pick is the insecure one), so the fix
+  is no default at all. `finalizeRegistrationRequest`/`generateKE3` now take a plain **required**
+  `ksf: Ksf` (the one-field `KsfOptions` wrapper added nothing once there's no default — removed
+  rather than kept as pointless indirection). `.{}` at a call site is now a **compile error**
+  ("missing struct field: stretchFn" at the call site, not inside `Ksf`) — verified with a probe
+  (`.zig-cache/probe/`, `scripts/modtest --file`) run against both the previous commit (compiles,
+  1/1) and this one (fails to compile, same needle both times: `\.zig:\d+:\d+: error:`). Every
+  call site now passes `.identity` explicitly (`kat_test.zig`, `example/main.zig`, two internal
+  `root.zig` test helpers) — `Ksf.identity`'s doc comment is now explicit that it exists for RFC
+  9807 Appendix C reproduction only, never for a real registration.
+
+- **2026-09-15** — **NEW, additive (trailing options parameter):** audit M6, round-2 Q5 framing
+  (norm wins: RFC 9807 §7 leaves the KSF to "the application" and only recommends Identity for
+  Appendix C reproducibility, not production — see `SPEC.md`). Added `Ksf` (a context-pointer
+  callback, `stretchFn(ctx, in, out) error{KsfFailed}!void`) and `KsfOptions{ ksf: Ksf = .identity
+  }`, a new trailing parameter on `finalizeRegistrationRequest` and `generateKE3` (0 consumers,
+  P1/P3 apply — this **is** a signature change, `.{}` at every call site reproduces prior
+  behavior exactly). `FinalizeRegistrationError`/`GenerateKE3Error` gain `KsfFailed`, additive.
+  This module still has no `Allocator`/`Io` dependency anywhere — a real KSF like Argon2id needs
+  both (`std.crypto.pwhash.argon2.kdf`'s own signature), so it lives on the caller's side of
+  `Ksf.ctx`, never inside this module. Two new tests (`kat_test.zig`, `Argon2Ksf`) plug in a real
+  `std.crypto.pwhash.argon2` KSF: one shows matching Argon2id on both sides still logs in and
+  agrees, and that the derived `session_key`/`export_key` differ from the Identity-KSF baseline
+  with everything else held fixed (the seam is live, not dead code) — and that a MISMATCHED KSF
+  between registration and login fails exactly like a wrong password (`EnvelopeRecovery`, not a
+  new failure mode); the other proves a failing KSF surfaces as `error.KsfFailed`, not swallowed.
+
 - **2026-09-14** — **BREAKING (error sets narrowed):** audit L2, round-2 decision Q3 (signature
   change allowed, no consumers). Three public error sets named variants their functions can never
   return, so a caller's exhaustive `switch` had to handle them: `InvalidSecretKey` in

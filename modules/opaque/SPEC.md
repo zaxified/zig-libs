@@ -3,7 +3,8 @@
 RFC 9807 OPAQUE aPAKE, **ristretto255-SHA-512 configuration with the
 3DH key exchange only** (OPRF: ristretto255-SHA512 / RFC 9497
 modeOPRF via the sibling `voprf` module, KDF: HKDF-SHA-512, MAC:
-HMAC-SHA-512, Hash: SHA-512, KSF: Identity, Group: ristretto255).
+HMAC-SHA-512, Hash: SHA-512, KSF: pluggable (`Ksf`, mandatory — no
+default, see below), Group: ristretto255).
 Status: **complete** — registration + login/AKE implemented and
 KAT-validated byte-exact against RFC 9807 Appendix C.1.1 and C.1.2
 (see `src/kat_test.zig`).
@@ -83,16 +84,37 @@ a collision-resistant hash qualifies, §10.6) and shrinks the record.
 A wrong password produces a different `auth_key`/keypair, so the
 timing-safe `auth_tag` check fails closed as `error.EnvelopeRecovery`.
 
-## KSF = Identity — deliberate, and where the seam is
+## KSF — pluggable, MANDATORY, no default (audit finding M6)
 
-`Stretch(msg) = msg`, the configuration RFC 9807's own Appendix C test
-vectors use — chosen so the KATs are reproducible. The RFC's
-RECOMMENDED production configuration uses Argon2id here (§7); that is
-a client-side cost knob against offline attacks after server
-compromise (§10.8), not a protocol change. The single seam is
-`randomizedPassword` in `root.zig` (the second `extract.update` is the
-stretched copy); swapping in a real KSF changes no wire format but
-invalidates existing registrations (users must re-register, §8).
+RFC 9807 §7: the KSF "is determined by the application" — collision
+resistance is the only hard requirement, and Appendix C's own test
+vectors use `Stretch(msg) = msg` ("Identity") purely so the KATs are
+reproducible, NOT as a production recommendation. §7's three
+configurations RECOMMENDED absent an application-specific profile all
+use a real KSF (two Argon2id, one scrypt) — skipping stretching
+entirely means an offline dictionary attack on a leaked
+`RegistrationRecord` costs one OPRF evaluation per guess. Swapping the
+KSF changes no wire format but invalidates existing registrations
+(users must re-register, §8).
+
+`Ksf` (`root.zig`) is a context-pointer callback
+(`stretchFn(ctx, in: [Nh]u8, out: *[Nh]u8) error{KsfFailed}!void`),
+a plain **required** parameter on `finalizeRegistrationRequest` and
+`generateKE3` — no default, no options-struct wrapper (one field with
+no legitimate default value doesn't earn a wrapper). This module stays
+`Allocator`/`Io`-free (API discipline below) — a real KSF like
+Argon2id needs both (`std.crypto.pwhash.argon2.kdf`'s signature takes
+an `Allocator` and a `std.Io`), so it lives on the CALLER's side of
+`ctx`, not inside this module — and precisely because it can't default
+to a real one without acquiring that dependency, it doesn't default to
+anything: a caller reaching for `Ksf.identity` outside a test has to
+write that name, not get it by omission (`.{}` does not compile — see
+`Ksf.identity`'s doc comment and `A1/opaque.md`'s M6 dispozice for the
+compile-error proof). See `kat_test.zig`'s `Argon2Ksf` for a worked
+example (used by two tests: a real Argon2id round-trip that still
+agrees on both sides and demonstrably changes
+`session_key`/`export_key`, and one proving `error.KsfFailed`
+propagates from a failing KSF rather than being swallowed).
 
 ## Login: 3DH AKE (§6.4)
 
@@ -137,7 +159,10 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
   Callers MUST supply fresh CSPRNG output for each of them in
   production (blinds via `scalarFromWideBytes`).
 - **No allocation, no I/O**; all state is in caller-held value types
-  (`ClientLoginState` borrows only the password slice).
+  (`ClientLoginState` borrows only the password slice). A real `Ksf`
+  the caller plugs in (e.g. Argon2id) may itself allocate/use `Io`
+  internally — that dependency lives entirely on the caller's side of
+  the `Ksf.ctx` pointer, this module never sees it.
 - Public-key/OPRF-element inputs are validated on deserialization
   (canonical ristretto255 + identity rejection via `voprf.Element`,
   §10.7). §6.4.1.1's "the DH shared secret MUST NOT be the identity"
@@ -157,8 +182,12 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
 - **Other groups/suites** (C.1.3-C.1.6: curve25519, P-256): no
   consumer here needs them; P-256 would drag in a different OPRF
   ciphersuite `voprf` does not build.
-- **Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs to
-  the consumer; seam documented above. std has Argon2id when wanted.
+- ~~**Non-Identity KSFs** (Argon2id/scrypt): parameter policy belongs
+  to the consumer; seam documented above.~~ **Now pluggable, 2026-09-15**
+  (A1/opaque.md M6): `Ksf`, see above — the CONCRETE
+  algorithm/parameter choice is still the consumer's, this module never
+  picks one, but the seam is now a public callback instead of "edit
+  `randomizedPassword`".
 - ~~**The "Fake" credential flow KATs** (C.2): the fake-record response
   is a server policy using the same `generateKE2` code path; nothing
   new to pin.~~ **Incorrect, fixed 2026-09-10** (A1/opaque.md L3): C.2.1

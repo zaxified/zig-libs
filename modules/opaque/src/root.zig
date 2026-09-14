@@ -2,7 +2,8 @@
 //! opaque — the OPAQUE augmented password-authenticated key exchange
 //! (aPAKE) per RFC 9807, **ristretto255-SHA-512 configuration only**
 //! (OPRF: ristretto255-SHA512 per RFC 9497, KDF: HKDF-SHA-512, MAC:
-//! HMAC-SHA-512, Hash: SHA-512, KSF: Identity, Group: ristretto255)
+//! HMAC-SHA-512, Hash: SHA-512, KSF: pluggable, default Identity (`Ksf`
+//! below), Group: ristretto255)
 //! with the **3DH** key exchange (§6.4). A client registers a password
 //! with a server such that the server never learns the password (not
 //! even at registration) and stores only a `RegistrationRecord`; on
@@ -41,9 +42,20 @@
 //!   re-derived from `randomized_password` via `Expand(...,
 //!   envelope_nonce || "PrivateKey")` → `DeriveDiffieHellmanKeyPair`
 //!   (§4.1.1), and the tag binds it to `server_public_key` and both
-//!   identities. KSF = Identity (`Stretch(msg) = msg`), the choice the
-//!   RFC's own test vectors use; the seam for a real KSF is
-//!   `randomizedPassword` below.
+//!   identities. `Stretch` in `randomized_password` is a pluggable
+//!   `Ksf` (audit finding M6): RFC 9807 §7 says the KSF "is determined
+//!   by the application" (collision resistance is the only hard
+//!   requirement) and its own Appendix C test vectors use Identity
+//!   (`Stretch(msg) = msg`) purely for reproducibility — §7's three
+//!   RECOMMENDED-absent-an-application-profile configurations all use a
+//!   real KSF (two Argon2id, one scrypt). `finalizeRegistrationRequest`/
+//!   `generateKE3` therefore take `ksf: Ksf` with NO default (this
+//!   module has no `Allocator`/`Io` dependency anywhere else and stays
+//!   that way — a real KSF like Argon2id needs both, so it lives on
+//!   the CALLER's side of the `Ksf` callback, not inside this module,
+//!   and it cannot pick a secure one for you): every caller states its
+//!   choice explicitly, `Ksf.identity` included. See `Ksf`'s doc
+//!   comment.
 //! - **Registration (§5)**: blinded OPRF round + `Store` → the
 //!   `RegistrationRecord` (`client_public_key`, `masking_key`,
 //!   `envelope`).
@@ -143,7 +155,7 @@ pub const meta = .{
     .platform = .any,
     .role = .util, // pure computation — no I/O, no allocation, no RNG
     .concurrency = .reentrant, // no globals; all state is caller-held values
-    .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 configuration, 3DH AKE, internal-keying Envelope (§4.1), KSF = Identity; OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
+    .model_after = "RFC 9807 (\"The OPAQUE Augmented Password-Authenticated Key Exchange (aPAKE) Protocol\"), ristretto255-SHA-512 configuration, 3DH AKE, internal-keying Envelope (§4.1), KSF = pluggable (default Identity, see Ksf); OPRF layer = the sibling voprf module (RFC 9497 modeOPRF); std supplies HKDF-SHA-512 / HMAC-SHA-512 / SHA-512 / Ristretto255",
     .deps = .{ "voprf", "ct25519" },
 };
 
@@ -525,22 +537,64 @@ fn diffieHellman(private_key: [Nsk]u8, public_key: [Npk]u8) error{InvalidPublicK
     return ct25519.mulRistretto(point.p, private_key).toBytes();
 }
 
+/// A pluggable Key Stretching Function (RFC 9807 §7 `KSF`). RFC 9807
+/// leaves the concrete algorithm to "the application" — this module
+/// never picks one for you (see module doc comment for why: no
+/// `Allocator`/`Io` dependency anywhere in this module, and a real KSF
+/// like Argon2id needs both) and has no default: every caller of
+/// `finalizeRegistrationRequest`/`generateKE3` must pass one
+/// explicitly. `ctx` lets a real implementation close over whatever it
+/// needs (allocator, `Io`, parameters) without this module knowing its
+/// shape.
+pub const Ksf = struct {
+    ctx: ?*anyopaque = null,
+    /// `in` is `oprf_output` (`Nh` bytes); must write exactly `Nh`
+    /// stretched bytes to `out`. A real KSF can fail (allocation
+    /// failure, misconfigured parameters, ...): `error.KsfFailed` is
+    /// the only variant this module's public error sets add for it —
+    /// distinguish specific causes on the caller's side of `ctx`.
+    stretchFn: *const fn (ctx: ?*anyopaque, in: [Nh]u8, out: *[Nh]u8) error{KsfFailed}!void,
+
+    /// `Stretch(msg) = msg` — what RFC 9807 Appendix C's own test
+    /// vectors use, and ONLY what they use: reproducing those KATs (or
+    /// a test built the same way) is the one legitimate reason to pass
+    /// this. RFC 9807 §7 never recommends it for a deployment — its
+    /// three configurations RECOMMENDED absent an application-specific
+    /// profile all use a real KSF (two Argon2id, one scrypt), because
+    /// skipping stretching entirely means an offline dictionary attack
+    /// on a leaked `RegistrationRecord` costs one OPRF evaluation per
+    /// guess. There being no default on `finalizeRegistrationRequest`/
+    /// `generateKE3` is deliberate: passing `.identity` outside a test
+    /// must be a decision the caller's source visibly makes, not
+    /// something that happens by omission.
+    pub const identity: Ksf = .{ .stretchFn = identityStretch };
+    fn identityStretch(_: ?*anyopaque, in: [Nh]u8, out: *[Nh]u8) error{KsfFailed}!void {
+        out.* = in;
+    }
+
+    fn stretch(self: Ksf, in: [Nh]u8) error{KsfFailed}![Nh]u8 {
+        var out: [Nh]u8 = undefined;
+        try self.stretchFn(self.ctx, in, &out);
+        return out;
+    }
+};
+
 /// §5.2.3/§6.3.2.3's `randomized_password` = `Extract("",
-/// oprf_output || Stretch(oprf_output))` with KSF = Identity
-/// (`Stretch(msg) = msg`, the RFC test-vector configuration — a
-/// production deployment wanting Argon2id would replace the second
-/// `update` here and nothing else).
+/// oprf_output || Stretch(oprf_output))`, `Stretch` = `ksf`.
 fn randomizedPassword(
     password: []const u8,
     blind: [Ns]u8,
     evaluated_message: [Noe]u8,
-) error{ InvalidMessage, InvalidBlind }![Nx]u8 {
+    ksf: Ksf,
+) (error{ InvalidMessage, InvalidBlind } || error{KsfFailed})![Nx]u8 {
     const evaluated = voprf.Element.fromBytes(evaluated_message) catch return error.InvalidMessage;
     var oprf_output = try voprf.finalize(password, blind, evaluated);
     defer std.crypto.secureZero(u8, &oprf_output);
+    var stretched = try ksf.stretch(oprf_output);
+    defer std.crypto.secureZero(u8, &stretched);
     var extract = HkdfSha512.extractInit("");
     extract.update(&oprf_output);
-    extract.update(&oprf_output); // stretched_oprf_output (Identity KSF)
+    extract.update(&stretched);
     var prk: [Nx]u8 = undefined;
     extract.final(&prk);
     return prk;
@@ -700,7 +754,7 @@ pub fn createRegistrationResponse(
     };
 }
 
-pub const FinalizeRegistrationError = error{ InvalidMessage, InvalidBlind, DeriveKeyPairFailed, IdentityTooLong };
+pub const FinalizeRegistrationError = error{ InvalidMessage, InvalidBlind, DeriveKeyPairFailed, IdentityTooLong, KsfFailed };
 
 pub const FinalizeRegistrationResult = struct {
     /// The `RegistrationRecord` to send to the server (§5.1
@@ -712,19 +766,22 @@ pub const FinalizeRegistrationResult = struct {
 };
 
 /// §5.2.3 `FinalizeRegistrationRequest`: unblind + finalize the OPRF
-/// (via `voprf.finalize`), stretch (Identity KSF) and extract
-/// `randomized_password`, then §4.1.2 `Store` with the caller-supplied
-/// `envelope_nonce` (the RFC samples it inside `Store`; fresh random
-/// per registration). `identities` must match what logins will use.
+/// (via `voprf.finalize`), stretch (`ksf` — see `Ksf`'s doc comment;
+/// pass `Ksf.identity` ONLY to reproduce an RFC 9807 Appendix C KAT,
+/// never for a real registration) and extract `randomized_password`,
+/// then §4.1.2 `Store` with the caller-supplied `envelope_nonce` (the
+/// RFC samples it inside `Store`; fresh random per registration).
+/// `identities` must match what logins will use.
 pub fn finalizeRegistrationRequest(
     password: []const u8,
     blind: [Ns]u8,
     response: RegistrationResponse,
     identities: Identities,
     envelope_nonce: [Nn]u8,
+    ksf: Ksf,
 ) FinalizeRegistrationError!FinalizeRegistrationResult {
     try checkIdentities(identities, "");
-    var rp = try randomizedPassword(password, blind, response.evaluated_message);
+    var rp = try randomizedPassword(password, blind, response.evaluated_message, ksf);
     defer std.crypto.secureZero(u8, &rp);
     const stored = try store(&rp, response.server_public_key, identities, envelope_nonce);
     return .{
@@ -890,6 +947,7 @@ pub const GenerateKE3Error = error{
     EnvelopeRecovery,
     ServerAuthentication,
     IdentityTooLong,
+    KsfFailed,
 };
 
 pub const GenerateKE3Result = struct {
@@ -907,17 +965,22 @@ pub const GenerateKE3Result = struct {
 /// envelope (wrong password ⇒ `error.EnvelopeRecovery`, fail closed),
 /// run the client side of 3DH, verify the server's transcript MAC
 /// timing-safe (mismatch ⇒ `error.ServerAuthentication`, fail closed),
-/// and only then produce KE3 + `session_key` + `export_key`.
+/// and only then produce KE3 + `session_key` + `export_key`. Must use
+/// the same `ksf` as the `finalizeRegistrationRequest` call that
+/// created this account (a mismatched KSF fails closed via
+/// `EnvelopeRecovery`, same as a wrong password —
+/// `randomized_password` differs either way).
 /// `identities` and `context` must match the server's.
 pub fn generateKE3(
     state: ClientLoginState,
     identities: Identities,
     context: []const u8,
     ke2: KE2,
+    ksf: Ksf,
 ) GenerateKE3Error!GenerateKE3Result {
     try checkIdentities(identities, context);
     // §6.3.2.3 RecoverCredentials.
-    var rp = try randomizedPassword(state.password, state.blind, ke2.credential_response.evaluated_message);
+    var rp = try randomizedPassword(state.password, state.blind, ke2.credential_response.evaluated_message, ksf);
     defer std.crypto.secureZero(u8, &rp);
     var masking_key: [Nh]u8 = undefined;
     defer std.crypto.secureZero(u8, &masking_key);
@@ -1275,7 +1338,7 @@ fn fuzzGenerateKE3OnHostileKE2(_: void, smith: *std.testing.Smith) !void {
     var buf: [KE2.encoded_length]u8 = undefined;
     smith.bytes(&buf);
     const ke2 = KE2.fromBytes(buf);
-    if (generateKE3(login.state, .{}, v.context, ke2)) |r| {
+    if (generateKE3(login.state, .{}, v.context, ke2, .identity)) |r| {
         std.mem.doNotOptimizeAway(&r);
     } else |_| {}
 }
@@ -1341,7 +1404,7 @@ test "M4: generateKE3 rejects a non-canonical server_public_keyshare in a hostil
     ke2.auth_response.server_public_keyshare = [_]u8{0xFF} ** 32;
     try std.testing.expectError(
         error.InvalidPublicKey,
-        generateKE3(login.state, .{}, v.context, ke2),
+        generateKE3(login.state, .{}, v.context, ke2, .identity),
     );
 }
 
@@ -1465,7 +1528,7 @@ test "audit L4: an independent §6.3.3 preamble construction reproduces C.1.1/C.
         // Reused (not the disputed logic): unmask + recover the envelope,
         // exactly what `generateKE3` itself does, to get a real
         // client_private_key for dh3.
-        var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message);
+        var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message, .identity);
         defer std.crypto.secureZero(u8, &rp);
         var masking_key: [Nh]u8 = undefined;
         defer std.crypto.secureZero(u8, &masking_key);
@@ -1518,7 +1581,7 @@ test "audit L4: the independent preamble construction is NOT a silent no-op -- d
     const v = kat_vectors.real_1;
     const login = try generateKE1(v.password, v.blind_login, v.client_nonce, v.client_keyshare_seed);
     const ke2 = KE2.fromBytes(v.ke2);
-    var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message);
+    var rp = try randomizedPassword(v.password, v.blind_login, ke2.credential_response.evaluated_message, .identity);
     defer std.crypto.secureZero(u8, &rp);
     var masking_key: [Nh]u8 = undefined;
     defer std.crypto.secureZero(u8, &masking_key);

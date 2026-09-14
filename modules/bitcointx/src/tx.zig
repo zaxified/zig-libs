@@ -27,6 +27,26 @@
 //! itself force a large allocation: the very first out-of-bounds item read
 //! fails closed with `error.Truncated`.
 //!
+//! That per-stack bound is a *local* one: it only sees the bytes from the
+//! current offset to the end of the buffer, which is generous for `vin`/
+//! `vout` (their wire-minimum size, 41/9 bytes, already sits within ~3x of
+//! the struct each produces, 56/24 bytes) but wrong for witness items. A
+//! witness item's wire-minimum size is 1 byte (an empty item is legal and
+//! just as cheap to *encode* as it is expensive to *store*: `[]const u8` is
+//! 16 bytes), and a transaction's *own* witness stacks routinely sit right
+//! at the tail of the buffer with almost nothing local left after them (a
+//! 4-byte locktime). A local, wire-based bound therefore can't distinguish
+//! "one genuine item near the end of a small transaction" from "as many
+//! 1-byte items as the *whole* message can hold": both look the same from
+//! where the item count is read. Left uncapped the second shape is a real
+//! amplification (audit finding M1: 4 MB of wire -> 85 MB peak live, a
+//! single witness stack of near-empty items). `deserializePartial` instead
+//! tracks a per-*transaction* item budget (`bytes.len / @sizeOf([]const
+//! u8)`, i.e. what the whole message could afford at 16 bytes/item),
+//! shared and decremented across every witness stack the transaction
+//! decodes — cumulative, so splitting the same attack across many small
+//! witness stacks on many inputs doesn't reopen it.
+//!
 //! ## Scope
 //!
 //! No Bitcoin Script interpretation: `scriptSig`/`scriptPubKey`/witness
@@ -287,10 +307,21 @@ fn decodeTxOut(bytes: []const u8, offset: *usize) DecodeError!TxOut {
     return .{ .value = value, .script_pubkey = script_pubkey };
 }
 
-fn decodeWitness(allocator: Allocator, bytes: []const u8, offset: *usize) DeserializeError!Witness {
+fn decodeWitness(allocator: Allocator, bytes: []const u8, offset: *usize, item_budget: *u64) DeserializeError!Witness {
     // Every witness item is at least 1 byte (its own CompactSize length
-    // prefix, possibly encoding a zero-length item) -- min_per_item = 1.
+    // prefix, possibly encoding a zero-length item) -- min_per_item = 1 for
+    // the ordinary local wire-truncation bound (module doc comment).
     const count = try readCount(bytes, offset, 1);
+    // `item_budget` is the per-TRANSACTION memory allowance (module doc
+    // comment): `@sizeOf([]const u8)` bytes per item, shared and
+    // decremented across every witness stack this transaction decodes.
+    // Bounds-checked here, before any allocation for this stack, same
+    // fail-fast shape as the wire-based check just above -- and this is
+    // what actually closes M1: the wire-based bound alone lets a single
+    // stack near the end of a small buffer claim as many near-empty items
+    // as the WHOLE message can encode.
+    if (count > item_budget.*) return error.TooManyItems;
+    item_budget.* -= count;
     var items: std.ArrayList([]const u8) = .empty;
     errdefer items.deinit(allocator);
     var i: u64 = 0;
@@ -350,8 +381,12 @@ pub fn deserializePartial(allocator: Allocator, bytes: []const u8) DeserializeEr
         witness.deinit(allocator);
     }
     if (has_witness) {
+        // Per-transaction memory budget for witness items (M1, decodeWitness
+        // doc comment): what the WHOLE message could afford at
+        // `@sizeOf([]const u8)` bytes/item, shared across every stack below.
+        var item_budget: u64 = bytes.len / @sizeOf([]const u8);
         var i: u64 = 0;
-        while (i < vin.items.len) : (i += 1) try witness.append(allocator, try decodeWitness(allocator, bytes, &offset));
+        while (i < vin.items.len) : (i += 1) try witness.append(allocator, try decodeWitness(allocator, bytes, &offset, &item_budget));
 
         // BIP144: the marker/flag says "witness data follows", so there
         // must actually BE some -- Core's `UnserializeTransaction` throws
@@ -569,7 +604,12 @@ test "legacy tx: deserialize -> serialize is byte-exact (self-consistency round-
 
 fn buildMinimalSegwitTx(allocator: Allocator) Allocator.Error![]u8 {
     // 1-in-1-out segwit tx: marker/flag, 1 vin, 1 vout, one 2-item witness
-    // stack on the sole input, locktime=0. Self-authored, round-trip only.
+    // stack (signature-and-pubkey-sized, like a real P2WPKH spend) on the
+    // sole input, locktime=0. Self-authored, round-trip only. Item sizes
+    // are deliberately realistic, not `{1,2,3}`/empty: with a memory-aware
+    // `min_per_item` on the witness count (audit finding M1), a witness
+    // whose declared item count isn't backed by enough remaining wire bytes
+    // is `error.TooManyItems`, same as a real P2WPKH witness always is.
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try appendI32LE(&buf, allocator, 2);
@@ -583,11 +623,13 @@ fn buildMinimalSegwitTx(allocator: Allocator) Allocator.Error![]u8 {
     try appendCompactSize(&buf, allocator, 1);
     try appendI64LE(&buf, allocator, 1234567);
     try appendCompactSize(&buf, allocator, 0);
-    // witness: 1 input, 2 items
+    // witness: 1 input, 2 items -- a 71-byte DER signature and a 33-byte
+    // compressed pubkey, the shapes a real P2WPKH witness carries.
     try appendCompactSize(&buf, allocator, 2);
-    try appendCompactSize(&buf, allocator, 3);
-    try buf.appendSlice(allocator, &[_]u8{ 1, 2, 3 });
-    try appendCompactSize(&buf, allocator, 0);
+    try appendCompactSize(&buf, allocator, 71);
+    try buf.appendSlice(allocator, &([_]u8{0xab} ** 71));
+    try appendCompactSize(&buf, allocator, 33);
+    try buf.appendSlice(allocator, &([_]u8{0xcd} ** 33));
     try appendU32LE(&buf, allocator, 0);
     return buf.toOwnedSlice(allocator);
 }
@@ -763,6 +805,38 @@ test "hostile: vout count claiming more outputs than remain fails closed with To
     try appendCompactSize(&buf, allocator, 0); // empty scriptSig
     try appendU32LE(&buf, allocator, 0xffffffff);
     try appendCompactSize(&buf, allocator, 0xffffffff); // hostile vout count
+    try testing.expectError(error.TooManyItems, deserialize(allocator, buf.items));
+}
+
+test "hostile: witness item count amplifying wire bytes into live memory 16x fails closed with TooManyItems (M1)" {
+    // Every witness item is legally as small as 1 wire byte (an empty
+    // item's own zero-length CompactSize prefix) but costs
+    // `@sizeOf([]const u8)` = 16 bytes once parsed into `Witness.items`.
+    // Before the fix (`min_per_item = 1` on the witness count), this
+    // exact wire form decoded cleanly: 50 items x 1 wire byte each, for
+    // 50 x 16 = 800 bytes of live memory out of ~54 bytes of wire (audit
+    // finding M1, measured on a larger transaction as 16x-22x, 4 MB -> 85
+    // MB peak live). The fail-fast bound now rejects it before any of
+    // those 50 items is even read.
+    const allocator = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try appendI32LE(&buf, allocator, 2);
+    try buf.append(allocator, 0x00);
+    try buf.append(allocator, 0x01);
+    try appendCompactSize(&buf, allocator, 1); // vin count = 1
+    try buf.appendSlice(allocator, &([_]u8{0xaa} ** 32));
+    try appendU32LE(&buf, allocator, 0);
+    try appendCompactSize(&buf, allocator, 0); // empty scriptSig
+    try appendU32LE(&buf, allocator, 0xffffffff);
+    try appendCompactSize(&buf, allocator, 1); // vout count = 1
+    try appendI64LE(&buf, allocator, 1234567);
+    try appendCompactSize(&buf, allocator, 0); // empty scriptPubKey
+    // witness: 1 input, 50 items, each an empty (zero-length) item --
+    // 1 wire byte per item, 16 bytes of live memory per item.
+    try appendCompactSize(&buf, allocator, 50);
+    for (0..50) |_| try appendCompactSize(&buf, allocator, 0);
+    try appendU32LE(&buf, allocator, 0);
     try testing.expectError(error.TooManyItems, deserialize(allocator, buf.items));
 }
 
