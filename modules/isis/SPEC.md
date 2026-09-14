@@ -23,7 +23,7 @@ SPF, and the SPB tree computation are separate consumer modules built on top.
 | 1 | Length Indicator | length of the **fixed** header (common + type-specific): 20 (P2P IIH), 27 (LAN IIH / LSP), 33 (CSNP), 17 (PSNP). Not the total PDU length. |
 | 2 | Version / Protocol ID Extension | constant `1` |
 | 3 | ID Length | `0 ⇒ 6`, `255 ⇒ 0`, else literal. Normalized to `id_length` |
-| 4 | R R R + PDU Type (low 5 bits) | reserved bits rejected if set |
+| 4 | R R R + PDU Type (low 5 bits) | reserved bits transmitted as zero, ignored on receipt |
 | 5 | Version | constant `1` |
 | 6 | Reserved | carried verbatim (soft field) |
 | 7 | Maximum Area Addresses | `0 ⇒ 3` |
@@ -114,8 +114,13 @@ attacker who can inject frames). The central hazard of a TLV codec is an
 - **Body length lies caught.** A PDU-Length below the fixed header or beyond the
   buffer is `BadPduLength`; a Length-Indicator below 8 is `BadLengthIndicator`;
   an SPB Num-of-Trees or I-SID run exceeding the sub-TLV value is `BadLength`.
-- **No reserved-field smuggling in the header:** the 3 reserved PDU-type bits
-  are rejected, not masked.
+- **Reserved fields follow ISO/IEC 10589:2002.** Reserved bits are transmitted
+  as zero and ignored on receipt (the 3 high PDU-type bits, the 6 high
+  Circuit Type bits). An IIH whose Circuit Type is the reserved value 0 is
+  refused whole (`ReservedCircuitType`) — "if specified the entire PDU shall be
+  ignored" — and `CircuitType` has no member a builder could emit it with.
+  RFC 1142 carries the same sentences; the module used to reject the reserved
+  PDU-type bits and accept Circuit Type 0, against both.
 
 **Not an authentication boundary.** The Authentication TLV (#10) and IS-IS
 crypto-auth (RFC 5304/5310) are **not** implemented — this codec neither

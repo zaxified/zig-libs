@@ -51,6 +51,9 @@ pub const DecodeError = header.DecodeError || error{
     /// anyway: `checksum.compute`'s bound is ITS invariant, not this file's, and
     /// a `catch unreachable` here would be the same absent guard one frame up.
     ChecksumFieldOutOfRange,
+    /// An IIH's Circuit Type is the reserved value 0; ISO/IEC 10589 §9.5/§9.7:
+    /// "if specified the entire PDU shall be ignored".
+    ReservedCircuitType,
 };
 
 pub const BuildError = tlv.BuildError;
@@ -95,13 +98,23 @@ fn buildableTlvRegion(buf: []u8, fixed_len: usize) []u8 {
     return buf[fixed_len..@min(buf.len, max_pdu_len)];
 }
 
-/// The circuit-type field low 2 bits (ISO 10589): which levels this circuit runs.
+/// The circuit-type field low 2 bits (ISO/IEC 10589 §9.5, §9.7): which levels
+/// this circuit runs. The value 0 is reserved — "if specified the entire PDU
+/// shall be ignored" — so it has no member: a decoder refuses it
+/// (`error.ReservedCircuitType`) and a builder cannot emit it.
 pub const CircuitType = enum(u2) {
-    reserved0 = 0,
     level1 = 1,
     level2 = 2,
     level1_2 = 3,
 };
+
+/// Reads the IIH Reserved/Circuit Type octet. The six high bits are Reserved
+/// ("transmitted as zero, ignored on receipt"); the low two name the levels.
+fn decodeCircuitType(octet: u8) DecodeError!CircuitType {
+    const levels: u2 = @intCast(octet & 0x03);
+    if (levels == 0) return error.ReservedCircuitType;
+    return @enumFromInt(levels);
+}
 
 // ── IIH: LAN Hello (types 15/16) ─────────────────────────────────────────────
 
@@ -126,7 +139,7 @@ pub const LanHello = struct {
         const region = try tlvRegion(bytes, lan_iih_fixed_len, 17);
         return .{
             .header = h,
-            .circuit_type = @enumFromInt(@as(u2, @intCast(bytes[8] & 0x03))),
+            .circuit_type = try decodeCircuitType(bytes[8]),
             .source_id = bytes[9..15].*,
             .holding_time = std.mem.readInt(u16, bytes[15..17], .big),
             .pdu_length = std.mem.readInt(u16, bytes[17..19], .big),
@@ -201,7 +214,7 @@ pub const P2pHello = struct {
         const region = try tlvRegion(bytes, p2p_iih_fixed_len, 17);
         return .{
             .header = h,
-            .circuit_type = @enumFromInt(@as(u2, @intCast(bytes[8] & 0x03))),
+            .circuit_type = try decodeCircuitType(bytes[8]),
             .source_id = bytes[9..15].*,
             .holding_time = std.mem.readInt(u16, bytes[15..17], .big),
             .pdu_length = std.mem.readInt(u16, bytes[17..19], .big),
@@ -632,6 +645,36 @@ test "LAN IIH round-trips source-id, priority, LAN-id" {
     try testing.expectEqual(@as(u8, 0x02), p.lan_id[6]);
     var si = tlvs.SnpaIterator.init((try tlv.findFirst(p.tlv_bytes, tlvs.code.is_neighbours_iih)).?);
     try testing.expectEqual(m1, (try si.next()).?);
+}
+
+test "IIH Circuit Type 0 refuses the whole PDU; the six high reserved bits are ignored" {
+    var lan_buf: [64]u8 = undefined;
+    var lb = try LanHelloBuilder.init(&lan_buf, .{
+        .source_id = .{ 0, 0, 0, 0, 0, 1 },
+        .holding_time = 27,
+        .lan_id = .{ 0, 0, 0, 0, 0, 1, 1 },
+    });
+    const lan = lb.finish();
+    var p2p_buf: [64]u8 = undefined;
+    var pb = try P2pHelloBuilder.init(&p2p_buf, .{ .source_id = .{ 0, 0, 0, 0, 0, 2 }, .holding_time = 30 });
+    const p2p = pb.finish();
+
+    // Low two bits zero, whatever the high bits carry.
+    for ([_]u8{ 0x00, 0x04, 0xFC }) |octet| {
+        lan_buf[8] = octet;
+        p2p_buf[8] = octet;
+        try testing.expectError(error.ReservedCircuitType, LanHello.decode(lan));
+        try testing.expectError(error.ReservedCircuitType, P2pHello.decode(p2p));
+    }
+    // Control: the same frames decode once the low bits name a level, and set
+    // high bits do not change which level.
+    for ([_]u8{ 0x01, 0x02, 0x03, 0xFD, 0xFE, 0xFF }) |octet| {
+        lan_buf[8] = octet;
+        p2p_buf[8] = octet;
+        const levels: u2 = @intCast(octet & 0x03);
+        try testing.expectEqual(levels, @intFromEnum((try LanHello.decode(lan)).circuit_type));
+        try testing.expectEqual(levels, @intFromEnum((try P2pHello.decode(p2p)).circuit_type));
+    }
 }
 
 test "LSP flags octet packs/unpacks and body round-trips" {

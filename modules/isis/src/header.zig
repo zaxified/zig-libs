@@ -32,9 +32,10 @@
 //!   convention is `0 => 6` (the default, MAC-sized id SPB uses) and
 //!   `255 => 0`; `1..8` carry the value literally. `decode` normalizes this to
 //!   `id_length` (0 is reported as 6).
-//! - **PDU Type** (byte 4, low 5 bits): the message kind (`PduType`); the top 3
-//!   bits are reserved and MUST be zero — `decode` rejects a nonzero reserved
-//!   field rather than masking it.
+//! - **PDU Type** (byte 4, low 5 bits): the message kind (`PduType`). Bits 6-8
+//!   are Reserved, "transmitted as 0 and ignored on receipt" (ISO/IEC 10589
+//!   §9.5-§9.9; RFC 1142 has the same sentence): `encode` writes zero, `decode`
+//!   masks them away and accepts the PDU.
 //! - **Version** (byte 5): constant `1` (a second version byte, per ISO 10589).
 //! - **Reserved** (byte 6): MUST be zero on transmit; carried, not rejected, on
 //!   receive (a legacy soft field).
@@ -124,24 +125,21 @@ pub const DecodeError = error{
     BadDiscriminator,
     /// Byte 2 or byte 5 is not protocol version 1.
     BadVersion,
-    /// A reserved bit in the PDU-type octet (top 3 bits) was set.
-    ReservedBitSet,
     /// The Length Indicator is smaller than the common header (8) — a header
     /// that cannot even describe its own common part.
     BadLengthIndicator,
 };
 
 /// Parses the 8-byte common header from the front of `bytes`. Validates the two
-/// version constants, the discriminator, the reserved PDU-type bits, and that
-/// the Length Indicator is self-consistent with the buffer. Reads nothing past
+/// version constants, the discriminator, and that the Length Indicator is
+/// self-consistent with the buffer; ignores the reserved PDU-type bits. Reads nothing past
 /// byte 7 and allocates nothing.
 pub fn decode(bytes: []const u8) DecodeError!CommonHeader {
     if (bytes.len < common_header_len) return error.Truncated;
     if (bytes[0] != discriminator) return error.BadDiscriminator;
     if (bytes[2] != version) return error.BadVersion;
     const raw_id_len = bytes[3];
-    // Top 3 bits of byte 4 are reserved and must be zero (not masked away).
-    if (bytes[4] & 0xE0 != 0) return error.ReservedBitSet;
+    // Bits 6-8 of byte 4 are Reserved: ignored on receipt, so masked away.
     const pdu_type: PduType = @enumFromInt(@as(u5, @intCast(bytes[4] & 0x1F)));
     if (bytes[5] != version) return error.BadVersion;
     const length_indicator = bytes[1];
@@ -202,10 +200,22 @@ test "id-length and max-area-addresses zero shorthands normalize" {
     try testing.expectEqual(@as(u8, 3), h.max_area_addresses); // 0 => 3
 }
 
-test "reserved PDU-type bits are rejected, not masked" {
-    var wire = [_]u8{ 0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03 };
-    wire[4] = 0x20 | 0x11; // set a reserved bit above the 5-bit type
-    try testing.expectError(error.ReservedBitSet, decode(&wire));
+test "reserved PDU-type bits are ignored on receipt and transmitted as zero" {
+    const wire = [_]u8{ 0x83, 0x14, 0x01, 0x06, 0x11, 0x01, 0x00, 0x03 };
+    const clean = try decode(&wire);
+    try testing.expectEqual(PduType.p2p_iih, clean.pdu_type);
+    // Each reserved bit alone, and all three: the same header as the clean one.
+    for ([_]u8{ 0x20, 0x40, 0x80, 0xE0 }) |r| {
+        var set = wire;
+        set[4] = r | 0x11;
+        try testing.expectEqual(clean, try decode(&set));
+    }
+    // Re-encoding what was decoded writes the reserved bits back as zero.
+    var all = wire;
+    all[4] = 0xE0 | 0x11;
+    var out: [common_header_len]u8 = undefined;
+    try encode(try decode(&all), &out);
+    try testing.expectEqualSlices(u8, &wire, &out);
 }
 
 test "bad discriminator / version / length-indicator rejected" {

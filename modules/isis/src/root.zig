@@ -314,8 +314,14 @@ fn biasToModeledPdu(buf: []u8, len: usize, cur: *testkit.fuzz.Cursor) bool {
     buf[1] = s.fixed_len; // Length Indicator — an equality, not a bound
     buf[2] = header.version;
     buf[3] = 6; // ID Length
-    buf[4] = s.type_byte; // top 3 bits clear, so no ReservedBitSet
+    buf[4] = s.type_byte; // reserved top 3 bits clear, as transmitted
     buf[5] = header.version;
+    // An IIH with Circuit Type 0 is refused whole (ISO/IEC 10589 §9.5/§9.7), so
+    // name a level; the six reserved high bits stay whatever was drawn. The raw
+    // arm still carries Circuit Type 0 to the refusal.
+    if (@as(header.PduType, @enumFromInt(@as(u5, @intCast(s.type_byte)))).isHello()) {
+        if (buf[8] & 0x03 == 0) buf[8] |= 0x01;
+    }
     // PDU Length must land in [fixed_len, len]; a random u16 essentially never
     // does, which is the single load-bearing field the old bias omitted.
     const pdu_len: u16 = @intCast(cur.ranged(s.fixed_len, @intCast(len)));
@@ -348,6 +354,8 @@ const decode_seeds = [_][]const u8{
     seed("DEADBEEF99"), // not an IS-IS PDU at all: the discriminator bail-out
     seed("83"), // one octet: shorter than the common header
     seed("831401061101000303000000000001001E0025"), // an IIH header with the TLV region cut off
+    seed("831401063101000303000000000001001E0025018101CC0104034900010606001B213C9DF8"), // the first seed with a reserved PDU-type bit set: ignored, decodes
+    seed("831401061101000300000000000001001E0025018101CC0104034900010606001B213C9DF8"), // the first seed with Circuit Type 0: the whole PDU refused
     seed(""), // the empty buffer
 };
 
@@ -444,9 +452,9 @@ test "corpus: every seed reaches the decoder, and the counts are pinned" {
         }
     }
     try std.testing.expectEqual(decode_seeds.len - 1, nonempty); // the empty seed is deliberate
-    try std.testing.expectEqual(@as(usize, 9), decoded);
-    try std.testing.expectEqual(@as(usize, 211), tlv_bytes);
-    try std.testing.expectEqual(@as(usize, 9), biased_stamped);
+    try std.testing.expectEqual(@as(usize, 10), decoded);
+    try std.testing.expectEqual(@as(usize, 228), tlv_bytes);
+    try std.testing.expectEqual(@as(usize, 11), biased_stamped);
 }
 
 test "TEETH: the fuzz bias actually reaches a decoded PDU body" {
