@@ -194,6 +194,59 @@ pub const Options = struct {
     /// only ever touches the bytes it hands back, never the pool that carries
     /// them — so this is the invariant's own positive control.
     leak_slot: bool = false,
+    /// When nonzero, an extra `TickProbe` device is added to the fleet, ticking
+    /// every this many simulated ms (`Fleet.addNode`'s own `tick_period_ms`).
+    /// It is NOT one of the `device_count` devices the master polls (it gets
+    /// no netsim node, no link, and the master's per-device loop in `onTimer`
+    /// never addresses it) — the only way its due ticks are ever drained is a
+    /// `pump(sim)` call, and the only `pump(sim)` call that does not depend on
+    /// some OTHER device's request/reply actually crossing the (possibly
+    /// faulty) network is the standalone one at the top of `onTimer`. 0
+    /// (default) adds no such device — every existing scenario/test is
+    /// unaffected. See `probeTicks`.
+    tick_probe_period_ms: netsim.Time = 0,
+};
+
+/// A minimal device whose only trait is having a `.tick` (`Node.hasTick()`
+/// true) — everything else `Vopr` ships (`adapters.Modbus`, `BrokenDevice`)
+/// has none, so nothing before this could exercise the standalone
+/// `try self.pump(sim);` at the top of `onTimer` against a device whose fleet
+/// state advances on the CLOCK rather than only in response to a request
+/// (2026-09 A1 audit, `fleetsim` F-G item 2). `deliver` never runs in
+/// practice (see `Options.tick_probe_period_ms`); `tick` counts its own
+/// firings, which is all a teeth test needs to observe — it emits no frame
+/// (`null`), so it never touches the master's reply validation at all.
+const TickProbe = struct {
+    ticks: usize = 0,
+    period_ms: Time,
+
+    fn node(self: *TickProbe) Node {
+        return .{
+            .ctx = self,
+            .protocol = .custom,
+            .framing = .opaque_whole,
+            .vtable = &.{ .deliver = deliverFn, .tick = tickFn, .nextDeadline = deadlineFn },
+        };
+    }
+
+    fn cast(ctx: *anyopaque) *TickProbe {
+        return @ptrCast(@alignCast(ctx));
+    }
+
+    fn deliverFn(ctx: *anyopaque, bytes: []const u8, out: []u8, now_ms: Time) NodeError!?[]const u8 {
+        _ = .{ ctx, bytes, out, now_ms };
+        return null; // unreachable in practice -- this device is never addressed on the network.
+    }
+
+    fn tickFn(ctx: *anyopaque, out: []u8, now_ms: Time) NodeError!?[]const u8 {
+        _ = .{ out, now_ms };
+        cast(ctx).ticks += 1;
+        return null; // no unsolicited wire traffic -- only the clock matters here.
+    }
+
+    fn deadlineFn(ctx: *anyopaque, now_ms: Time) ?Time {
+        return now_ms + cast(ctx).period_ms;
+    }
 };
 
 /// A fleet of `device_count` Modbus devices polled by one master, wired up as a
@@ -219,6 +272,10 @@ pub fn Vopr(comptime device_count: usize) type {
         regs: [device_count]ScaledRegister = undefined,
         sinks: [device_count][1]Sink = undefined,
         signals: [device_count]Signal = undefined,
+        /// See `Options.tick_probe_period_ms`. Present (defaulting `.ticks =
+        /// 0`, `.period_ms = 0`) whether or not it is enabled — only actually
+        /// added to `self.fleet` when the option is nonzero.
+        tick_probe: TickProbe = .{ .period_ms = 0 },
 
         // Master-side bookkeeping.
         /// Highest transaction id issued to each device. Ids are dense and
@@ -480,11 +537,26 @@ pub fn Vopr(comptime device_count: usize) type {
                 try self.fleet.addSignal(&self.signals[i]);
             }
 
+            if (self.opts.tick_probe_period_ms != 0) {
+                self.tick_probe = .{ .period_ms = self.opts.tick_probe_period_ms };
+                _ = try self.fleet.addNode(.{
+                    .node = self.tick_probe.node(),
+                    .tag = device_count,
+                    .tick_period_ms = self.opts.tick_probe_period_ms,
+                });
+            }
+
             self.issued = @splat(0);
             self.replies = @splat(0);
             self.polls = 0;
             self.gen = 0;
             self.violation = null;
+        }
+
+        /// How many times the `Options.tick_probe_period_ms` device's `.tick`
+        /// has fired (0 if the option is unset). See its doc comment.
+        pub fn probeTicks(self: *const Self) usize {
+            return self.tick_probe.ticks;
         }
 
         /// Total replies the master accepted, across every device.
@@ -887,4 +959,39 @@ test "vopr: a byte count that disagrees with the read size trips MalformedReply"
     h.onReply(1, &payload);
     const v = h.violation orelse return error.NoViolationReported;
     try testing.expectEqual(Violation.MalformedReply, v);
+}
+
+test "vopr: the standalone pump() at the top of onTimer keeps a device's own clock running through a silent network" {
+    // F-G item 2: `try self.pump(sim);` at the top of `onTimer`, BEFORE any
+    // new requests go out. The one device type in this harness with a
+    // `.tick` (`TickProbe`, `Options.tick_probe_period_ms`) is not one of the
+    // devices the master polls -- it gets no netsim node or link at all, so
+    // NOTHING ever calls `onMessage` for it, and the only path left that can
+    // ever call `pump(sim)` (and so `Fleet.advance`, and so drain its due
+    // ticks) is this standalone call. Sever the (only) real device's link so
+    // that ALSO never fires `onMessage` -- the master's own poll-timer chain
+    // is independent of the network (proven separately, the crash+restart
+    // test above), so `onTimer` keeps firing every `poll_period` regardless,
+    // but with the link down there is no OTHER source of a `pump(sim)` call
+    // for the whole run. Whatever the probe's tick count is at the end is
+    // therefore ENTIRELY this one line's doing.
+    const gpa = testing.allocator;
+    const V1 = Vopr(1);
+    var h = V1.init(gpa, .{ .fleet_seed = 7, .tick_probe_period_ms = 5 });
+    defer h.deinit();
+
+    const trace = [_]netsim.FaultEvent{
+        .{ .time = 0, .kind = .{ .link_down = .{ .a = master, .b = V1.devNode(0) } } },
+    };
+    const r = try netsim.replay(gpa, h.case(0, 200), &trace, null);
+    try testing.expectEqual(netsim.RunOutcome.ok, r.outcome);
+
+    // The device never received a single poll (the link out is down), so the
+    // request/reply machinery contributed nothing.
+    try testing.expectEqual(@as(u32, 0), h.totalReplies());
+
+    // ~200ms / 5ms period worth of ticks, drained purely by the standalone
+    // pump() riding the master's independent poll-timer chain (poll_period =
+    // 20ms), not by anything network-shaped.
+    try testing.expect(h.probeTicks() >= 30);
 }

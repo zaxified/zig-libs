@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — A1 fix campaign, F-G item 2 (`vopr.zig`). **Additive, no
+  behavioural change** for any existing caller: `Vopr.Options` gained
+  `tick_probe_period_ms` (default 0, off) and a new `TickProbe` device type
+  — the harness's first device with a `.tick`, so it can finally exercise
+  the standalone `pump(sim)` at the top of `onTimer` against a device whose
+  fleet state advances on the clock rather than only on a request. New
+  `Vopr.probeTicks()` reads the probe's own tick count. Measured RED (with
+  the standalone `pump(sim)` neutralized) -> GREEN: severing the link to
+  the harness's one real device (so the request/reply path contributes
+  nothing) leaves the probe's tick count at 0 for the whole 200ms run under
+  the mutant; the fix drains ~40 ticks off the master's independent
+  poll-timer chain alone. `scripts/modtest fleetsim`: 94/102 (8 unrelated
+  skips).
 - **2026-09-10** — A1 fix campaign, oracle-audit follow-up (zero consumers,
   confirmed against `build.zig`'s `example_apps` table as well as
   `module-graph` — P1 applies without qualification). Four of the seven
