@@ -103,6 +103,26 @@ test "EncryptedID: present but no sp_decrypt_key -> EncryptedIdUnsupported" {
     );
 }
 
+test "M19 teeth: decrypted EncryptedID plaintext that is not a NameID -> IdDecryptionFailed" {
+    // Type confusion on decrypted content (2026-09 A1 audit F9/M19): nothing
+    // fed the decrypt path a plaintext that decrypts CLEANLY (so the RSA-OAEP
+    // unwrap + AES-GCM tag both check out) but recovers the WRONG element --
+    // here an `<saml:Issuer>` instead of `<saml:NameID>`. The guard is
+    // `root.zig`'s `if (!isEl(dec.doc.root, saml_ns, "NameID"))` right after
+    // `decryptWrappedElement` returns; this is the only test that ever makes
+    // it fire instead of just reading true by inspection.
+    const alloc = testing.allocator;
+    const sp = try enc.makeSpKey(0x5A11_E0DE);
+    const wrong_type = "<saml:Issuer xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\">https://evil.example.org/saml</saml:Issuer>";
+    const enc_id = try enc.encryptedWrapper(alloc, sp.public_key, "EncryptedID", wrong_type);
+    defer alloc.free(enc_id);
+    var signed = try mintResponse(alloc, enc_id, "");
+    defer signed.deinit(alloc);
+    var cfg = baseConfig(fx.t_valid, signed.key);
+    cfg.sp_decrypt_key = sp.secret_key;
+    try testing.expectError(error.IdDecryptionFailed, saml.consumeResponseXml(alloc, signed.xml, cfg));
+}
+
 test "EncryptedID: wrong SP key -> IdDecryptionFailed (generic)" {
     const alloc = testing.allocator;
     const sp = try enc.makeSpKey(0x5A11_E0DE);

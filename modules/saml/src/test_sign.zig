@@ -75,6 +75,18 @@ pub fn signAssertionWithoutIssuer(
     return signAssertionMaybeIssuer(alloc, seed, null, id, issue_instant, after_issuer);
 }
 
+/// `<ds:SignedInfo>`'s body common to every mint helper in this file: one
+/// enveloped-signature + exclusive-C14N reference at `#{id}`, digest slot
+/// left as `{s}` for the caller's `std.fmt.allocPrint`.
+const signed_info_inner =
+    "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+    "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
+    "<ds:Reference URI=\"#{s}\"><ds:Transforms>" ++
+    "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>" ++
+    "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
+    "</ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
+    "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference>";
+
 fn signAssertionMaybeIssuer(
     alloc: std.mem.Allocator,
     seed: u64,
@@ -83,20 +95,6 @@ fn signAssertionMaybeIssuer(
     issue_instant: []const u8,
     after_issuer: []const u8,
 ) !Signed {
-    var prng = std.Random.DefaultPrng.init(seed);
-    // 1024-bit is ample for RSA-SHA256 enveloped signing (min modulus ~62 bytes)
-    // and keeps deterministic keygen fast across the many minted-fixture tests.
-    const kp = try rsa.generate(prng.random(), 1024, 65537);
-
-    const signed_info_inner =
-        "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
-        "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>" ++
-        "<ds:Reference URI=\"#{s}\"><ds:Transforms>" ++
-        "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>" ++
-        "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>" ++
-        "</ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>" ++
-        "<ds:DigestValue>{s}</ds:DigestValue></ds:Reference>";
-
     // Assemble the assertion with a placeholder digest + empty SignatureValue.
     // The whole `<ds:Signature>` is omitted when the reference digest is taken,
     // so the placeholder never affects it.
@@ -113,7 +111,60 @@ fn signAssertionMaybeIssuer(
         "{s}</saml:Assertion>", .{ saml_ns, id, issue_instant, issuer_xml, ds_ns, id, digest_placeholder, after_issuer });
     defer alloc.free(assembled);
 
-    // Pass 1 — reference digest over the assertion with the Signature omitted.
+    return signAssembled(alloc, seed, assembled);
+}
+
+const samlp_ns = "urn:oasis:names:tc:SAML:2.0:protocol";
+
+/// Mint a **Response-level** enveloped signature: `<ds:Signature>` is a direct
+/// child of `<samlp:Response>` itself (not the assertion), its `#{response_id}`
+/// reference covers the whole Response (minus the Signature element, per the
+/// enveloped-signature transform) — exactly the shape `verifyCovering`'s
+/// branch 2 (`config.signature_policy != .assertion`) looks for. `assertion_xml`
+/// is placed after `<samlp:Status>` UNSIGNED (no `<ds:Signature>` of its own),
+/// so branch 1 (assertion-signed) never has anything to find and this
+/// genuinely exercises the Response-level path, not a fallback from it.
+pub fn signResponse(
+    alloc: std.mem.Allocator,
+    seed: u64,
+    response_id: []const u8,
+    issue_instant: []const u8,
+    destination: []const u8,
+    in_response_to: []const u8,
+    issuer: []const u8,
+    assertion_xml: []const u8,
+) !Signed {
+    const assembled = try std.fmt.allocPrint(alloc, "<samlp:Response xmlns:samlp=\"{s}\" xmlns:saml=\"{s}\" ID=\"{s}\" Version=\"2.0\" " ++
+        "IssueInstant=\"{s}\" Destination=\"{s}\" InResponseTo=\"{s}\">" ++
+        "<saml:Issuer>{s}</saml:Issuer>" ++
+        "<ds:Signature xmlns:ds=\"{s}\"><ds:SignedInfo>" ++ signed_info_inner ++ "</ds:SignedInfo>" ++
+        "<ds:SignatureValue></ds:SignatureValue></ds:Signature>" ++
+        "<samlp:Status><samlp:StatusCode Value=\"urn:oasis:names:tc:SAML:2.0:status:Success\"/></samlp:Status>" ++
+        "{s}</samlp:Response>", .{
+        samlp_ns, saml_ns, response_id, issue_instant,      destination,   in_response_to,
+        issuer,   ds_ns,   response_id, digest_placeholder, assertion_xml,
+    });
+    defer alloc.free(assembled);
+
+    return signAssembled(alloc, seed, assembled);
+}
+
+/// The digest+sign math shared by every mint helper above: `assembled` must
+/// already contain exactly one `<ds:Signature>` (direct child of whichever
+/// element the enveloped signature is meant to cover) with `digest_placeholder`
+/// as its `<ds:DigestValue>` text and an empty `<ds:SignatureValue>`. Two
+/// passes: (1) canonicalize the DOCUMENT ROOT with the whole `<ds:Signature>`
+/// omitted, for the reference digest (this is what makes the signature
+/// "enveloped" — it covers everything BUT itself, whatever the root is); (2)
+/// splice the real digest in, canonicalize `<ds:SignedInfo>` in its real tree
+/// context, and RSA-sign that.
+fn signAssembled(alloc: std.mem.Allocator, seed: u64, assembled: []const u8) !Signed {
+    var prng = std.Random.DefaultPrng.init(seed);
+    // 1024-bit is ample for RSA-SHA256 enveloped signing (min modulus ~62 bytes)
+    // and keeps deterministic keygen fast across the many minted-fixture tests.
+    const kp = try rsa.generate(prng.random(), 1024, 65537);
+
+    // Pass 1 — reference digest over the document with the Signature omitted.
     var doc1 = try xml.parse(alloc, assembled, .{ .id_attr_names = &.{"ID"} });
     defer doc1.deinit();
     const sig1 = findByLocal(doc1.root, ds_ns, "Signature").?;

@@ -3213,6 +3213,7 @@ test {
     _ = @import("test_artifact.zig");
     _ = @import("test_issuer.zig");
     _ = @import("test_multins.zig");
+    _ = @import("test_response_sig.zig");
 }
 
 const testing = std.testing;
@@ -3640,6 +3641,147 @@ test "TEETH: the signature options really do refuse a second reference" {
     try testing.expectEqual(@as(usize, 1), opts.max_references);
     // And the module's own rule it exists to match.
     try testing.expectEqual(@as([]const u8, "ID"), opts.id_attr);
+}
+
+test "M02 teeth: signedTargetMatches itself refuses zero or multiple references" {
+    // `signedTargetMatches`'s own doc comment claims "Empty / external /
+    // multi-reference signatures fail closed" -- SPEC.md repeats it -- and the
+    // test right above this one shows WHY nothing in this module can hand it
+    // more than one reference today: `sigOptsFor` always caps `xmldsig` at
+    // `max_references = 1`, so a real two-reference `<ds:Signature>` never
+    // gets past `xmldsig.verify` (`error.TooManyReferences`) to reach here at
+    // all (2026-09 A1 audit F9/M02 -- the earlier read of this finding as
+    // needing a minted two-reference DOCUMENT was itself stale: F11, closed
+    // 2026-09-06, had already added that cap for an unrelated reason).
+    //
+    // A claim like "fails closed" has to hold on the function's own terms,
+    // not only because of a sibling module's cap it happens to compose with
+    // today -- so this calls `signedTargetMatches` directly with synthetic
+    // `xmldsig.Result`s, the only way left to reach the `references.len != 1`
+    // branch at all. The mutation this catches: `!= 1` weakened to `< 1`
+    // would let a fabricated (or, if the sibling cap were ever loosened,
+    // real) 2-reference result whose FIRST reference legitimately resolves to
+    // the target slip through as `true`.
+    const alloc = testing.allocator;
+    const fx = @import("fixtures.zig");
+    var doc = try xml.parse(alloc, fx.signed_response, untrustedXmlOptions());
+    defer doc.deinit();
+    const asrt = (try doc.findByAttr(alloc, "", "ID", fx.assertion_id)).?;
+
+    const result_shape = struct {
+        fn withRefs(refs: []xmldsig.RefResult) xmldsig.Result {
+            return .{
+                .valid = true,
+                .references = refs,
+                .signature_method_uri = "",
+                .canonicalization_method_uri = "",
+                .x509_cert_der = null,
+            };
+        }
+    };
+
+    // Positive control: exactly one reference, correctly pointed -> true.
+    var one = [_]xmldsig.RefResult{.{ .uri = "#" ++ fx.assertion_id, .digest_valid = true }};
+    var res1 = result_shape.withRefs(&one);
+    try testing.expect(try signedTargetMatches(alloc, &doc, &res1, asrt, "ID"));
+
+    // Zero references -> false (nothing to resolve).
+    var zero = [_]xmldsig.RefResult{};
+    var res0 = result_shape.withRefs(&zero);
+    try testing.expect(!try signedTargetMatches(alloc, &doc, &res0, asrt, "ID"));
+
+    // Two references, BOTH correctly pointed at the real target -- the shape
+    // that would slip through if the check only looked at reference [0].
+    var two = [_]xmldsig.RefResult{
+        .{ .uri = "#" ++ fx.assertion_id, .digest_valid = true },
+        .{ .uri = "#" ++ fx.assertion_id, .digest_valid = true },
+    };
+    var res2 = result_shape.withRefs(&two);
+    try testing.expect(!try signedTargetMatches(alloc, &doc, &res2, asrt, "ID"));
+}
+
+const FindDeep = struct {
+    fn byLocal(el: *const xml.Element, uri: []const u8, local: []const u8) ?*xml.Element {
+        for (el.children) |c| switch (c.content) {
+            .element => |child| {
+                if (isEl(child, uri, local)) return child;
+                if (byLocal(child, uri, local)) |f| return f;
+            },
+            else => {},
+        };
+        return null;
+    }
+};
+
+test "M31 teeth: verifyCoveringDecrypted refuses an EncryptedAssertion that is not a direct child of the signed Response" {
+    // `verifyCoveringDecrypted`'s doc comment claims the Response-level branch
+    // "does NOT weaken the wrapping defense" specifically because of
+    // `if (enc.parent != outer_root)`. Nothing exercised that claim (2026-09
+    // A1 audit F9/M31).
+    //
+    // Same shape as the M02 test above: in the module's one caller
+    // (`consumeResponseXml` -> `processEncryptedAssertion`), `enc` is found
+    // by scanning `root`'s DIRECT children, so `enc.parent == outer_root`
+    // holds BY CONSTRUCTION every time that path runs -- the mismatch this
+    // check guards against cannot arise through it today (2026-09-14 audit
+    // triage flagged this exact reachability question for `saml` F9's last
+    // five items; this is the answer for M31). Testing the function's own
+    // contract directly is what is left, and it is a real defense-in-depth
+    // property: a future refactor that resolves `enc` by #id instead of by
+    // direct-child position would reintroduce exactly this wrapping shape.
+    //
+    // `enc`'s content does not matter for this branch (it decrypts nothing --
+    // `signature_policy = .response` skips the inner, assertion-level branch
+    // entirely), only its tree POSITION, so the ciphertext is a placeholder.
+    const alloc = testing.allocator;
+    const fx = @import("fixtures.zig");
+    const sign = @import("test_sign.zig");
+
+    const enc_placeholder = "<saml:EncryptedAssertion xmlns:saml=\"" ++ saml_ns ++ "\">" ++
+        "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\">" ++
+        "<xenc:CipherData><xenc:CipherValue>AAAA</xenc:CipherValue></xenc:CipherData>" ++
+        "</xenc:EncryptedData></saml:EncryptedAssertion>";
+    const wrapped = "<wrapper>" ++ enc_placeholder ++ "</wrapper>";
+
+    var signed = try sign.signResponse(alloc, 0xB31, "_m31resp", "2024-06-01T12:00:00Z", fx.acs_url, fx.request_id, fx.idp_entity_id, wrapped);
+    defer signed.deinit(alloc);
+
+    var outer_doc = try xml.parse(alloc, signed.xml, untrustedXmlOptions());
+    defer outer_doc.deinit();
+    const outer_root = outer_doc.root;
+    const enc_el = FindDeep.byLocal(outer_root, saml_ns, "EncryptedAssertion").?;
+    try testing.expect(enc_el.parent != outer_root); // sanity: genuinely buried, not a direct child
+
+    // The Response-level signature genuinely verifies and genuinely resolves
+    // to `outer_root` by id -- this is not a SignatureInvalid/wrapping-by-id
+    // case, only a wrapping-by-position one.
+    {
+        var doc2 = try xml.parse(alloc, signed.xml, untrustedXmlOptions());
+        defer doc2.deinit();
+        const sig = childEl(doc2.root, xmldsig.ds_ns, "Signature").?;
+        var res = try xmldsig.verify(alloc, &doc2, sig, sigOptsFor(signed.key, false, "ID"));
+        defer res.deinit(alloc);
+        try testing.expect(res.valid);
+        try testing.expect(try signedTargetMatches(alloc, &doc2, &res, doc2.root, "ID"));
+    }
+
+    var inner_placeholder = try xml.parse(alloc, "<x/>", untrustedXmlOptions());
+    defer inner_placeholder.deinit();
+
+    const cfg: Config = .{
+        .idp_entity_id = fx.idp_entity_id,
+        .idp_key = signed.key,
+        .sp_entity_id = fx.sp_entity_id,
+        .acs_url = fx.acs_url,
+        .now_unix = fx.t_valid,
+        .expected_in_response_to = fx.request_id,
+        .signature_policy = .response,
+    };
+    var cert_out: ?[]u8 = null;
+    try testing.expectError(
+        error.SignatureWrappingDetected,
+        verifyCoveringDecrypted(alloc, &inner_placeholder, &outer_doc, outer_root, enc_el, cfg, &cert_out),
+    );
 }
 
 test "TEETH: every untrusted parse in this file goes through an options helper" {

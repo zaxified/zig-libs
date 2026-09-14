@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BEHAVIOURAL, not breaking (default on, switch to opt out):**
+  `Client.send` now checks, before writing anything to the wire, that the peer's `<hello>`
+  actually advertised the capability an operation requires — `lock`/`unlock`/`getConfig`/
+  `copyConfig`/`deleteConfig`/`editConfig` against `.candidate` need `:candidate` (RFC 6241
+  §8.3), the same group against `.startup` need `:startup` (§8.7), a `Datastore.url`/
+  `EditPayload.url` needs `:url` (§8.8), `commit(.{.confirmed = true})` needs
+  `:confirmed-commit` (§8.4), `validate` needs `:validate` (§8.6), and `createSubscription`
+  needs `:notification` (RFC 5277 §3.1). A missing capability now fails locally with the new
+  `error.CapabilityNotAdvertised` instead of a round trip to find out from the peer's
+  `<rpc-error>`. Ten of the twelve booleans `capabilities.Capabilities` parses out of a
+  `<hello>` were read by nothing in the module before this (2026-09-10 audit,
+  `A1/netconf.md` N8). New `Options.check_capabilities` (default `true`) is the escape
+  hatch for a server that implements an operation without advertising the capability that
+  is supposed to announce it — set it `false` to fall back to the previous "try it, let the
+  peer decide" behaviour.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `parseHello`/`parseReply`/`parseNotification`
   now reject XML with more than 65536 elements (`error.TooManyElements`) instead of inheriting
   `xml`'s own 1<<20 default — closes a 132x wire-to-memory amplification. `Options.max_idle_reads`
