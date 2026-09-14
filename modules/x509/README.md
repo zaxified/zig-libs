@@ -156,6 +156,18 @@ const cert = try x509.safe.safeCertificate(peer_cert_der, &scratch);
 const parsed = try cert.parse(); // total: a hostile cert is a typed error, never a crash
 ```
 
+The default bound, `max_certificate_len` (8192), fits RSA, EC, Ed25519 and
+ML-DSA certificates but no SLH-DSA one. A caller that accepts SLH-DSA
+certificates raises it per call and sizes the scratch from the input:
+
+```zig
+const scratch = try gpa.alloc(u8, peer_cert_der.len + x509.safe.parse_slack);
+defer gpa.free(scratch);
+const cert = try x509.safe.safeCertificateOpts(peer_cert_der, scratch, .{
+    .max_len = x509.safe.max_pq_certificate_len,
+});
+```
+
 ## `x509.spkiOf` — name a certificate's public key, safely
 
 When all you need from an untrusted certificate is *which key it names* — a

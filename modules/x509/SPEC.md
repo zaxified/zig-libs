@@ -94,7 +94,11 @@ ReleaseFast; `30 82` (truncated length) segfaults in ReleaseFast.
   copy into caller scratch, zero-pad by `safe.parse_slack` (64), and return a
   `std.crypto.Certificate` safe to `parse`. `safe.max_certificate_len` (8192)
   bounds the input so a caller can size `[max_certificate_len + parse_slack]u8`
-  on the stack.
+  on the stack. That default covers RSA/EC/Ed25519/ML-DSA but no SLH-DSA
+  certificate (a 128s-signed leaf is already 8 224 B, a 256f self-signed one
+  ~50 kB). `safe.safeCertificateOpts(der, scratch, .{ .max_len = … })` raises
+  it per call; `safe.max_pq_certificate_len` (65536) covers every FIPS 205 set.
+  The safe default stays for callers that never see PQ certificates.
 - `safe.spkiOf(certificate_der)` (lifted as `x509.spkiOf`) — the certificate's
   `SubjectPublicKeyInfo`, extracted without `std.crypto.Certificate.parse` at
   all. See the section below.

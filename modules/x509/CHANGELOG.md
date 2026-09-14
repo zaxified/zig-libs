@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **ADDITIVE:** audit X3, round-2 decision Q8 (safe default plus a switch).
+  `safe.safeCertificate` refuses anything over `max_certificate_len` = 8192 whatever scratch the
+  caller passes, and its doc justified the number with a 4096-bit RSA certificate — while 12 of
+  this module's 28 fixtures, every SLH-DSA certificate but the 128s roots and intermediates, are
+  over it (8 224 B for a 128s-signed leaf up to 50 193 B for a 256f self-signed one). The default
+  stays: seven consumers size a stack scratch from it. New `safe.safeCertificateOpts(der, scratch,
+  .{ .max_len })` raises the bound per call, and `safe.max_pq_certificate_len` = 65536 covers every
+  FIPS 205 set. `safeCertificate` is now that call with the defaults; no behaviour changes for an
+  existing caller. The doc comment says what 8192 does and does not cover.
+
 - **2026-09-08** — **Docs: say why the PKCS#1 v1.5 path calls `std.crypto`
   rather than this repository's `rsa`.** It reads backwards — `rsa` verifies the
   same signature in 36 us against std's 388 us — but path validation builds a

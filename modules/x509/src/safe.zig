@@ -110,10 +110,21 @@ comptime {
 /// business inspecting. Matches the bound the `opcua` guard used.
 pub const max_depth: u8 = 32;
 
-/// Largest certificate `safeCertificate` will look at. A 4096-bit RSA
-/// application certificate is ~1.6 kB, so this is generous; the point of a
-/// bound at all is that a caller can size a fixed scratch buffer for the parse.
+/// Largest certificate `safeCertificate` will look at by default, so a caller
+/// can size a fixed scratch buffer — typically on the stack — for the parse.
+///
+/// It covers RSA, EC, Ed25519 and ML-DSA certificates. It does NOT cover
+/// SLH-DSA: even a 128s-signed leaf is over it (8 224 B in this module's
+/// fixtures), and the largest set, 256f, makes a ~50 kB self-signed
+/// certificate. That is a deliberate default for the stack budget of callers
+/// that never see post-quantum certificates, not an oversight; a caller that
+/// does raises the bound per call with `safeCertificateOpts`.
 pub const max_certificate_len: usize = 8192;
+
+/// A bound large enough for every FIPS 205 SLH-DSA parameter set, for
+/// `SafeCertificateOptions.max_len`. The largest fixture here, a self-signed
+/// SLH-DSA-SHAKE-256f certificate, is 50 193 B.
+pub const max_pq_certificate_len: usize = 65536;
 
 /// Zero bytes `safeCertificate` appends behind the certificate so std's
 /// boundary probes read empty TLVs out of the padding rather than off the end
@@ -381,7 +392,8 @@ fn requireStdDescentPoints(bytes: []const u8, certificate: Header) Error!void {
 }
 
 pub const SafeCertificateError = Error || error{
-    /// The certificate is larger than `max_certificate_len`.
+    /// The certificate is larger than the bound: `max_certificate_len`, or
+    /// `SafeCertificateOptions.max_len` for `safeCertificateOpts`.
     TooLarge,
     /// `scratch` is smaller than `certificate_der.len + parse_slack`.
     ScratchTooSmall,
@@ -401,8 +413,22 @@ pub const SafeCertificateError = Error || error{
 /// See this file's and `SPEC.md`'s discussion for why validation alone is not
 /// enough and the padding is required.
 pub fn safeCertificate(certificate_der: []const u8, scratch: []u8) SafeCertificateError!Certificate {
+    return safeCertificateOpts(certificate_der, scratch, .{});
+}
+
+/// What `safeCertificateOpts` may differ in from `safeCertificate`.
+pub const SafeCertificateOptions = struct {
+    /// Largest certificate accepted. The default is `safeCertificate`'s own;
+    /// pass `max_pq_certificate_len` to accept SLH-DSA certificates. `scratch`
+    /// must still be at least `certificate_der.len + parse_slack`.
+    max_len: usize = max_certificate_len,
+};
+
+/// `safeCertificate` with a caller-chosen size bound. Every other check is
+/// the same.
+pub fn safeCertificateOpts(certificate_der: []const u8, scratch: []u8, opts: SafeCertificateOptions) SafeCertificateError!Certificate {
     if (certificate_der.len == 0) return error.Empty;
-    if (certificate_der.len > max_certificate_len) return error.TooLarge;
+    if (certificate_der.len > opts.max_len) return error.TooLarge;
     if (scratch.len < certificate_der.len + parse_slack) return error.ScratchTooSmall;
     try validateCertificate(certificate_der);
     // Well-formedness is not enough on its own: std descends into an element's
@@ -655,6 +681,47 @@ test "safeCertificate: guard length and scratch preconditions" {
     var scratch: [max_certificate_len + parse_slack]u8 = undefined;
     const huge = [_]u8{0x30} ** (max_certificate_len + 1);
     try testing.expectError(error.TooLarge, safeCertificate(&huge, &scratch));
+}
+
+test "safeCertificate refuses the SLH-DSA certificates over the default bound; safeCertificateOpts admits them (X3)" {
+    // Every fixture in this module over `max_certificate_len` — twelve of 28.
+    const large = [_][]const u8{
+        @embedFile("data/leaf_slh_sha2_128s.der"),
+        @embedFile("data/leaf_slh_shake_128s.der"),
+        @embedFile("data/slh_self_sha2_128f.der"),
+        @embedFile("data/slh_self_sha2_192s.der"),
+        @embedFile("data/slh_self_sha2_192f.der"),
+        @embedFile("data/slh_self_sha2_256s.der"),
+        @embedFile("data/slh_self_sha2_256f.der"),
+        @embedFile("data/slh_self_shake_128f.der"),
+        @embedFile("data/slh_self_shake_192s.der"),
+        @embedFile("data/slh_self_shake_192f.der"),
+        @embedFile("data/slh_self_shake_256s.der"),
+        @embedFile("data/slh_self_shake_256f.der"),
+    };
+    const pq: SafeCertificateOptions = .{ .max_len = max_pq_certificate_len };
+    var stack_scratch: [max_certificate_len + parse_slack]u8 = undefined;
+    for (large) |der| {
+        try testing.expect(der.len > max_certificate_len and der.len <= max_pq_certificate_len);
+        const scratch = try testing.allocator.alloc(u8, der.len + parse_slack);
+        defer testing.allocator.free(scratch);
+
+        // The default refuses it even with a scratch big enough: the bound
+        // refuses, not the buffer.
+        try testing.expectError(error.TooLarge, safeCertificate(der, scratch));
+        try testing.expectError(error.TooLarge, safeCertificateOpts(der, scratch, .{}));
+
+        // Raised, it passes every other check and comes back zero-padded.
+        const cert = try safeCertificateOpts(der, scratch, pq);
+        try testing.expectEqual(der.len + parse_slack, cert.buffer.len);
+        try testing.expectEqualSlices(u8, der, cert.buffer[0..der.len]);
+        try testing.expect(std.mem.allEqual(u8, cert.buffer[der.len..], 0));
+
+        // The raised bound is exact, and the scratch precondition still holds.
+        _ = try safeCertificateOpts(der, scratch, .{ .max_len = der.len });
+        try testing.expectError(error.TooLarge, safeCertificateOpts(der, scratch, .{ .max_len = der.len - 1 }));
+        try testing.expectError(error.ScratchTooSmall, safeCertificateOpts(der, &stack_scratch, pq));
+    }
 }
 
 test "hostile: every prefix of a real certificate is a typed error, never a panic" {
