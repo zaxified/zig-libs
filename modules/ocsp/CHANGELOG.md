@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL (refuses more):** audit `x509` X5, handed over from this module's
+  F1 and handed back: the certificate is parsed here, not in `x509`. A delegated response whose
+  embedded responder certificate had its outer `signatureAlgorithm` NULL parameters (`05 00`)
+  rewritten still verified `good` — all 16 single-bit flips of the two octets. Those octets sit
+  outside the issuer's signature. `parseCert` now requires the outer `AlgorithmIdentifier` to be
+  byte-identical to `tbsCertificate.signature` (RFC 5280 §4.1.1.2), refusing with
+  `error.Malformed`. The single-bit sweep test and the `verify` fuzz harness both dropped their
+  exemption for the embedded certificates, which had blamed `x509`; the sweep measured 16
+  survivors before the fix.
+
 - **2026-09-07** — **Test-only, two harnesses.** (a) `fuzzParseResponse` drew
   `smith.bytes(&buf)` and then `smith.valueRangeAtMost(u16, 0, buf.len)`;
   `bytes` consumes `@min(buf.len, in.len)` octets, so the ranged draw found

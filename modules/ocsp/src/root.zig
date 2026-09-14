@@ -355,6 +355,14 @@ fn parseCert(bytes: []const u8) Malformed!CertView {
     // Outer signatureAlgorithm + signatureValue (siblings of tbsCertificate).
     const outer_alg = try el(bytes, tbs.slice.end);
     try wantTag(outer_alg, TAG_SEQUENCE);
+    // RFC 5280 §4.1.1.2: signatureAlgorithm "MUST contain the same algorithm
+    // identifier as the signature field in the sequence tbsCertificate". Only
+    // the inner copy is under the issuer's signature, so the outer one is held
+    // to it byte for byte. Unchecked, the outer copy's `05 00` NULL parameters
+    // were free: all 16 single-bit flips of the two octets left a delegated
+    // response verifying `good`.
+    if (!std.mem.eql(u8, tlvOf(bytes, serial.slice.end, sig_alg_seq), tlvOf(bytes, tbs.slice.end, outer_alg)))
+        return error.Malformed;
     const outer_oid = try el(bytes, outer_alg.slice.start);
     try wantTag(outer_oid, TAG_OID);
     const sig_val = try el(bytes, outer_alg.slice.end);

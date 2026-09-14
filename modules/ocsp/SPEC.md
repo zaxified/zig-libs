@@ -100,6 +100,11 @@ Consequences:
   (its extension-walk can panic on hostile DER under Zig 0.16). It walks
   certificate structure itself (`parseCert`) with the same bounded reader, and
   decodes the ECDSA `SEQUENCE { r, s }` itself rather than via a std parser.
+- `parseCert` requires an embedded certificate's outer `signatureAlgorithm` to
+  be byte-identical to the `signature` field inside `tbsCertificate`
+  (RFC 5280 §4.1.1.2). Only the inner copy is under the issuer's signature;
+  without the check the outer copy's NULL parameters could be rewritten and a
+  delegated response still verified `good`.
 - The outer `OCSPResponse` SEQUENCE must consume the whole buffer — **trailing
   garbage is rejected**. All context tags are matched on the raw identifier
   octet (the idiom x509 itself uses). A malformed-input fuzz batch asserts *no

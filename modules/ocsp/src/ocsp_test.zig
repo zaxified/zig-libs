@@ -1382,11 +1382,6 @@ const VerifyFuzzCtx = struct {
     response: []const u8,
     issuer: []const u8,
     subject: []const u8,
-    /// Half-open range of `response` occupied by the embedded certificates.
-    /// Damage inside it is excluded from the "must not verify" assertion — see
-    /// `fuzzVerify`'s note.
-    certs_start: usize,
-    certs_end: usize,
 };
 
 test "fuzz: verify's certificate and delegate parsers on damaged input" {
@@ -1437,14 +1432,10 @@ test "fuzz: verify's certificate and delegate parsers on damaged input" {
     try testing.expect(control.status == .good);
     try testing.expect(control.delegated);
 
-    const certs_slice = (try ocsp.parseResponse(resp_der)).basic.?.certs orelse
-        return error.FixtureHasNoCerts;
     const ctx = VerifyFuzzCtx{
         .response = resp_der,
         .issuer = fx.issuer_der,
         .subject = fx.subject_der,
-        .certs_start = @intFromPtr(certs_slice.ptr) - @intFromPtr(resp_der.ptr),
-        .certs_end = (@intFromPtr(certs_slice.ptr) - @intFromPtr(resp_der.ptr)) + certs_slice.len,
     };
     try verifyCorpusGuard(&ctx);
     try testing.fuzz(&ctx, fuzzVerify, .{ .corpus = &verify_seeds });
@@ -1548,35 +1539,19 @@ fn fuzzVerify(ctx: *const VerifyFuzzCtx, smith: *std.testing.Smith) !void {
         if (verdict.status != .good) return error.UndamagedFixtureNotGood;
         if (!verdict.delegated) return error.UndamagedFixtureNotDelegated;
     }
-    // Every octet of this response OUTSIDE the certificates it embeds is either
-    // inside the signed `tbsResponseData`, inside the signature over it, or in
-    // the wrapper that names the two — so altering any of them must stop it
-    // verifying.
+    // Every octet of this response is inside the signed `tbsResponseData`,
+    // inside the signature over it, inside a certificate the issuer signed, or
+    // in a wrapper this module's parser holds to exactly one encoding — so
+    // altering any of them must stop it verifying.
     //
-    // ⚠ The exclusion is real and measured, not a hedge. A single-bit sweep
-    // over the whole response found 14 offsets that still verified `good`; ten
-    // were this module's (container lengths never checked for closure, the
-    // signatureAlgorithm's NULL parameters, the signature BIT STRING's
-    // unused-bits octet) and are fixed. The remaining ones are the NULL
-    // parameters inside the DELEGATE CERTIFICATE, parsed by
-    // `x509`/`std.crypto.Certificate` — a real malleability, in another
-    // module's code, recorded rather than hidden. Asserting over the whole
-    // response would make this harness permanently red for someone else's
-    // defect; asserting over nothing is what it did before. This asserts over
-    // exactly what this module is answerable for, and
-    // `TEETH: no byte of a response OUTSIDE its embedded certificates ...`
-    // pins the same boundary deterministically.
-    if (response_damaged and !damageOnlyInside(ctx, resp)) return error.DamagedResponseAccepted;
-}
-
-/// True iff every octet where `damaged` differs from the pristine response
-/// lies inside the embedded-certificate range.
-fn damageOnlyInside(ctx: *const VerifyFuzzCtx, damaged: []const u8) bool {
-    for (damaged, ctx.response, 0..) |a, b, i| {
-        if (a == b) continue;
-        if (i < ctx.certs_start or i >= ctx.certs_end) return false;
-    }
-    return true;
+    // ⚠ This assertion used to exempt the embedded certificates. A single-bit
+    // sweep had left the delegate certificate's outer signatureAlgorithm NULL
+    // parameters malleable, and the exemption blamed `x509`. Wrong owner: the
+    // certificate is parsed by this module's own `parseCert`, which now holds
+    // the outer AlgorithmIdentifier to the signed inner one (RFC 5280
+    // §4.1.1.2). `TEETH: no byte of a response ...` pins the same claim
+    // deterministically.
+    if (response_damaged) return error.DamagedResponseAccepted;
 }
 
 /// ⭐ The lesson this module already paid for, made permanent. `fuzzVerify`'s
@@ -1663,7 +1638,7 @@ fn spkiOf(cert: []const u8) ![]const u8 {
     return cert[spki_start..spki.slice.end];
 }
 
-test "TEETH: no byte of a response OUTSIDE its embedded certificates can be altered undetected" {
+test "TEETH: no byte of a response, its embedded delegate certificate included, can be altered undetected" {
     // `verify`'s own fuzz harness asserts "a response altered anywhere must not
     // verify". That assertion was DEAD: the damage mode also randomized
     // `now_unix`, so the freshness check rejected almost every damaged input
@@ -1683,15 +1658,15 @@ test "TEETH: no byte of a response OUTSIDE its embedded certificates can be alte
     //                             own signatureAlgorithm, never read
     //   243                       the signature BIT STRING's unused-bits octet,
     //                             which DER requires to be zero, never read
-    //   714,715                   the same NULL parameters inside the embedded
-    //                             DELEGATE CERTIFICATE
+    //   714,715                   the same NULL parameters in the embedded
+    //                             DELEGATE CERTIFICATE's outer signatureAlgorithm
+    //                             (all 8 bits of both: 16 flips)
     //
-    // The first three classes are this module's and are fixed. The last is not:
-    // certificate bodies are parsed by `x509`/`std.crypto.Certificate`, and the
-    // fix belongs there. This test therefore pins the exact boundary — nothing
-    // outside the certificate blob is malleable — so a regression in what was
-    // fixed goes red, and closing the `x509` half will also go red and can then
-    // tighten this to zero.
+    // The first three classes were fixed first. The last was exempted here for
+    // a while as `x509`'s, which it was not: `parseCert` in this module reads
+    // the certificate, and now requires its outer AlgorithmIdentifier to equal
+    // the signed one (RFC 5280 §4.1.1.2). With the exemption gone, restoring any
+    // of the four gaps turns this red.
     const gpa = testing.allocator;
     var fx = try makeRsaFixture(gpa);
     defer fx.deinit(gpa);
@@ -1720,12 +1695,9 @@ test "TEETH: no byte of a response OUTSIDE its embedded certificates can be alte
     });
     defer gpa.free(resp_der);
 
-    // Where the embedded certificates start, taken from the parse rather than
-    // hardcoded, so the boundary follows the fixture.
+    // The sweep covers the embedded delegate certificate too, so it must be there.
     const parsed_ok = try ocsp.parseResponse(resp_der);
-    const certs = parsed_ok.basic.?.certs orelse return error.FixtureHasNoCerts;
-    const certs_start = @intFromPtr(certs.ptr) - @intFromPtr(resp_der.ptr);
-    const certs_end = certs_start + certs.len;
+    _ = parsed_ok.basic.?.certs orelse return error.FixtureHasNoCerts;
 
     // Positive control first: the undamaged fixture verifies, so a run of zero
     // survivors below cannot be "nothing verifies any more".
@@ -1746,7 +1718,6 @@ test "TEETH: no byte of a response OUTSIDE its embedded certificates can be alte
             const parsed = ocsp.parseResponse(buf) catch continue;
             const verdict = ocsp.verify(parsed, fx.issuer_der, fx.subject_der, defaultOpts()) catch continue;
             if (verdict.status != .good) continue;
-            if (off >= certs_start and off < certs_end) continue; // the x509 half
             outside_survivors += 1;
             if (outside_survivors <= 20) {
                 std.debug.print("malleable at offset {d} bit {d}: byte {x:0>2}  ctx {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{
