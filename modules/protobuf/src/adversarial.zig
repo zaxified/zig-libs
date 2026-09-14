@@ -123,6 +123,73 @@ test "hostile: the classic nesting bomb — a few KiB, thousands of levels" {
     try testing.expectError(error.DepthExceeded, pb.decode(ct.Chain, gpa, bomb, .{ .max_depth = 255 }));
 }
 
+// ── the third headline case: memory unbounded by wire length ───────────────
+
+/// `k` parallel copies of the same singular `Chain.next` submessage, nested
+/// `d` levels deep, each innermost copy carrying an unknown `leaf`-byte
+/// field. `MergeBuf` concatenates the `k` occurrences at *every* level (the
+/// spec's merge rule for a repeated singular-message field, `decode.zig`'s
+/// `MergeBuf`), so the arena bytes needed to decode this scale with `k * d`
+/// while the wire bytes scale with `k + d`. This is a scaled-down version of
+/// wave-3 audit finding `protobuf` F1's production-scale repro (there:
+/// k=5468, d=63, leaf=512 -> 3.68 MiB wire, 501.4 MiB decode arena, 136x).
+fn mergeBomb(gpa: std.mem.Allocator, k: usize, d: usize, leaf: usize) ![]u8 {
+    var inner: std.ArrayList(u8) = .empty;
+    defer inner.deinit(gpa);
+    {
+        var hdr: [11]u8 = undefined;
+        var e = pb.wire.Emitter.init(&hdr);
+        e.tag(99, .len); // unknown field, preserved as opaque bytes
+        e.varint(leaf);
+        try inner.appendSlice(gpa, hdr[0..e.pos]);
+        try inner.appendNTimes(gpa, 'x', leaf);
+    }
+    var chain: std.ArrayList(u8) = .empty;
+    defer chain.deinit(gpa);
+    try chain.appendSlice(gpa, inner.items);
+    for (0..d) |_| {
+        var hdr: [11]u8 = undefined;
+        var e = pb.wire.Emitter.init(&hdr);
+        e.tag(2, .len);
+        e.varint(chain.items.len);
+        var next: std.ArrayList(u8) = .empty;
+        try next.appendSlice(gpa, hdr[0..e.pos]);
+        try next.appendSlice(gpa, chain.items);
+        chain.deinit(gpa);
+        chain = next;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    for (0..k) |_| try out.appendSlice(gpa, chain.items);
+    return out.toOwnedSlice(gpa);
+}
+
+test "hostile: singular-message merge amplification is capped by max_arena_bytes (F1)" {
+    const gpa = testing.allocator;
+    const bomb = try mergeBomb(gpa, 40, 10, 16);
+    defer gpa.free(bomb);
+    try testing.expect(bomb.len < 2048); // a couple KiB of wire...
+    // ...is refused under a budget it cannot fit (unbounded amplification
+    // made unprofitable, regardless of how the attacker shapes k and d).
+    try testing.expectError(error.OutOfMemory, pb.decode(ct.Chain, gpa, bomb, .{ .max_arena_bytes = 8192 }));
+    // The very same bytes decode fine under a budget that fits them —
+    // proving the refusal above is the cap doing work, not the message
+    // being malformed some other way.
+    {
+        var d = try pb.decode(ct.Chain, gpa, bomb, .{});
+        defer d.deinit();
+    }
+}
+
+test "hostile: an honest single-occurrence chain fits the same tight budget the bomb fails (F1 control)" {
+    const gpa = testing.allocator;
+    // Same depth as the bomb above (10), but one occurrence per level, so
+    // MergeBuf never concatenates anything — no amplification to bound.
+    const honest = try nestedChain(gpa, 10);
+    defer gpa.free(honest);
+    var d = try pb.decode(ct.Chain, gpa, honest, .{ .max_arena_bytes = 8192 });
+    defer d.deinit();
+}
+
 test "hostile: encoding a value deeper than max_depth is refused, not overflowed" {
     // The encoder recurses too, and a boxed chain built at runtime can be
     // arbitrarily deep. Build 12 levels and cap at 4.

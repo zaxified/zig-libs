@@ -782,8 +782,11 @@ pub fn Methods(comptime Req: type, comptime Rep: type) type {
         pub const Stream = struct {
             call: *Call,
             /// Decode options for received messages (nesting cap, unknown
-            /// fields). The default already refuses a hostile nesting depth.
-            decode_options: pb.DecodeOptions = .{},
+            /// fields, arena memory cap). The default already refuses a
+            /// hostile nesting depth, and bounds decode memory at
+            /// `frame.default_decode_arena_bytes` (audit finding `protobuf`
+            /// F1).
+            decode_options: pb.DecodeOptions = .{ .max_arena_bytes = frame.default_decode_arena_bytes },
 
             /// The next request message, or null at the end of the request
             /// side. The result owns an arena; `deinit` it.

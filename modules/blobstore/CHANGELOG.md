@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BEHAVIOURAL: `GcOptions.stale_after_ns` default raised 10 min → 24 h**
+  (round-2 decision Q8: safe default + switch for the exception, applied to the 2026-09-11
+  finding below). The sweep's only liveness signal is mtime, so any default is a guess about
+  how long a legitimate ingest can stay silent; a safe guess errs toward not deleting live
+  data. `Store.default_stale_after_ns` names the new value; a caller whose ingest workload
+  reliably finishes fast and wants the old tight reclaim sets `stale_after_ns` explicitly
+  (`10 * std.time.ns_per_min` reproduces the previous default exactly). Three tests replace
+  the old open-question test: the new default no longer reaps an 11-minute-silent live temp,
+  an explicit shorter `stale_after_ns` (the switch) still reaps that same temp, and the new
+  default still reclaims a temp genuinely older than 24h — so `gc` keeps working, not just
+  stops reaping. No consumers in the repo (`gc`'s only caller is the module's own test suite);
+  `default_stale_after_ns` is a new public constant, additive.
+
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (test-only):** confirmed by measurement
   (A1/blobstore.md's open "PODEZŘENÍ") that `gc`'s DEFAULT `stale_after_ns` (10 minutes)
   offers no protection against a `put` whose source stalls that long — `reapStaleIngestTemps`

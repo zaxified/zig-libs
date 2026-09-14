@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BEHAVIOURAL (new memory cap, on by default):** audit F1, round-2 decision
+  Q4. Declared length and nesting depth were both bounded, but arena memory was not: a
+  singular/optional message field that recurs many (`k`) times at many (`d`) levels of nesting
+  is merged by concatenation (`decode.zig`'s `MergeBuf`), and that concatenation compounds with
+  depth. Measured: a legal message 3.68 MiB on the wire (well under gRPC's own 4 MiB default
+  `max_recv_message_size`) drove the decode arena to 501.4 MiB — 136×, scaling with `max_depth`.
+  New `DecodeOptions.max_arena_bytes` (default 64 MiB, `default_max_arena_bytes`) bounds total
+  bytes the decode arena may be granted; exceeding it surfaces as `error.OutOfMemory`, same as a
+  real allocator exhaustion. A message that needed more than 64 MiB of arena to decode — legal
+  but implausible outside this attack shape — now fails where it used to succeed. `grpc`
+  (the only in-repo consumer) sets its own default to `frame.default_decode_arena_bytes` (8×
+  `max_recv_message_size`, currently 32 MiB) on both the client (`Stream.receive`) and server
+  (`Methods(..).Stream.receive`) sides, closing the gap end to end rather than leaving it opt-in.
+  See `grpc`'s own changelog for that half. New regression test (`adversarial.zig`): a
+  scaled-down version of the same shape (k=40, d=10, 16-byte leaf, <2 KiB wire) must fail under
+  an 8 KiB budget while the identical bytes decode fine under the module default, and an honest
+  single-occurrence chain of the same depth must fit the same tight budget — proof the guard
+  targets amplification, not size.
+
 - **2026-09-14** — **BEHAVIOURAL (aborts where it used to corrupt):** audit F8, round-2 decision
   Q2-B. The two-pass encoder's safety net — every `Emitter.byte`/`bytes` fits, and `encodeInto`/
   `encodeAlloc` filled the buffer exactly — was four `std.debug.assert`s. They do not exist in

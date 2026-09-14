@@ -161,8 +161,10 @@ pub fn Stream(comptime Req: type, comptime Rep: type) type {
 
         call: Call,
         /// Decode options for received messages (nesting cap, unknown-field
-        /// policy). The default already refuses a hostile nesting depth.
-        decode_options: protobuf.DecodeOptions = .{},
+        /// policy, arena memory cap). The default already refuses a hostile
+        /// nesting depth, and bounds decode memory at
+        /// `frame.default_decode_arena_bytes` (audit finding `protobuf` F1).
+        decode_options: protobuf.DecodeOptions = .{ .max_arena_bytes = frame_mod.default_decode_arena_bytes },
 
         /// Open the stream and send the request head.
         pub fn start(ch: *Channel, path: []const u8, opts: CallOptions) Error!Self {

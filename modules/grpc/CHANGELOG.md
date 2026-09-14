@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BEHAVIOURAL (new memory cap on receive, on by default):** audit `protobuf`
+  F1, round-2 decision Q4 (cross-module, fixed together with `protobuf` in one commit). Both
+  `Stream(Req, Rep).receive` (client) and `Methods(Req, Rep).Stream.receive` (server) used to
+  call `pb.decode` with bare `protobuf.DecodeOptions{}` — no bound on decode-arena memory, only
+  on wire length (`max_recv_message_size`, checked by `frame.Deframer` before `pb.decode` is
+  even reached). `protobuf` measured a legal message 3.68 MiB on the wire, well inside this
+  module's own 4 MiB default `max_recv_message_size`, driving `pb.decode`'s arena to 501.4 MiB.
+  Both `decode_options` defaults now set `.max_arena_bytes = frame.default_decode_arena_bytes`
+  (new constant, 8× `default_max_recv_message_size` = 32 MiB): generous for any realistic
+  decode, but small enough that the F1 shape hits it at a small fraction of the wire-size limit.
+  A caller that already overrides `decode_options` gets the new default too unless it also
+  overrides `max_arena_bytes`, same as any other option field. `scripts/modtest protobuf` and
+  `scripts/modtest grpc` both green, unchanged pass counts — the new coverage lives in
+  `protobuf`'s own regression test, since the cap is enforced there; this side changes only the
+  default value two call sites pass in.
+
 - **2026-09-07** — Fuzz reach: all three harnesses ran on a single fixed input, and one of
   them never called the code it names. `adversarial.fuzzDeframerNeverPanics` and
   `fuzzFieldValuesNeverPanic` opened with `smith.bytes(&buf)` followed by a ranged length
