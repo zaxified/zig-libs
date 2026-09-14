@@ -241,11 +241,20 @@ pub const Cursor = struct {
     }
 };
 
+/// The message every size/emit disagreement aborts with. It is a real
+/// `@panic`, not `std.debug.assert` (audit F8): an assert does not exist in
+/// ReleaseFast or ReleaseSmall, where the same disagreement wrote past the
+/// buffer and died with SIGSEGV.
+pub const size_mismatch_message =
+    "protobuf: the encoder's sizing pass and emit pass disagree — this is a bug " ++
+    "in the encoder, not in the message; nothing was written past the buffer.";
+
 /// Append-only write cursor over a caller-sized buffer.
 ///
-/// The buffer is sized by `encodedSize` in a first pass; every `put` asserts
-/// it fits, and the encoder asserts the buffer was filled exactly. A
-/// size/emit disagreement is therefore a loud failure, not silent corruption.
+/// The buffer is sized by `encodedSize` in a first pass; every `put` checks
+/// it fits, and the encoder checks the buffer was filled exactly. A
+/// size/emit disagreement is therefore a loud failure in every build mode,
+/// not silent corruption.
 pub const Emitter = struct {
     out: []u8,
     pos: usize = 0,
@@ -255,13 +264,13 @@ pub const Emitter = struct {
     }
 
     pub fn byte(self: *Emitter, b: u8) void {
-        std.debug.assert(self.pos < self.out.len);
+        if (self.pos >= self.out.len) @panic(size_mismatch_message);
         self.out[self.pos] = b;
         self.pos += 1;
     }
 
     pub fn bytes(self: *Emitter, b: []const u8) void {
-        std.debug.assert(self.out.len - self.pos >= b.len);
+        if (self.out.len - self.pos < b.len) @panic(size_mismatch_message);
         @memcpy(self.out[self.pos..][0..b.len], b);
         self.pos += b.len;
     }
@@ -424,4 +433,60 @@ test "cursor: skipValue returns exactly the bytes of the value" {
     // Length-delimited whose length overruns: refused.
     var c3 = Cursor.init(&.{ 0x7f, 'a' });
     try testing.expectError(error.Truncated, c3.skipValue(.len));
+}
+
+// F8: `Emitter.byte`/`bytes` used `std.debug.assert`, which does not exist in
+// ReleaseFast or ReleaseSmall — measured there, a size/emit disagreement wrote
+// past the buffer and died with SIGSEGV. The child below overflows a one-byte
+// emitter with guard bytes behind it; without the check it exits normally
+// having overwritten the guard.
+test "Emitter aborts with its own message on overflow, in every build mode (F8)" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    for ([_]bool{ false, true }) |use_bytes| {
+        var fds: [2]i32 = undefined;
+        if (std.os.linux.pipe2(&fds, .{}) != 0) return error.SkipZigTest;
+        const rc = std.os.linux.fork();
+        const pid: isize = @bitCast(rc);
+        if (pid < 0) return error.SkipZigTest;
+        if (pid == 0) {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.dup3(fds[1], 2, 0);
+            var guarded: [4]u8 = @splat(0xaa);
+            var e = Emitter.init(guarded[0..1]);
+            if (use_bytes) {
+                e.bytes("xy");
+            } else {
+                e.byte(1);
+                e.byte(2);
+            }
+            // 71: returned with the guard intact; 72: returned having overwritten it.
+            std.os.linux.exit(if (guarded[1] == 0xaa) 71 else 72);
+        }
+        _ = std.os.linux.close(fds[1]);
+
+        var msg: [4096]u8 = undefined;
+        var msg_len: usize = 0;
+        while (msg_len < msg.len) {
+            const n = std.os.linux.read(fds[0], msg[msg_len..].ptr, msg.len - msg_len);
+            const got: isize = @bitCast(n);
+            if (got <= 0) break;
+            msg_len += @intCast(got);
+        }
+        _ = std.os.linux.close(fds[0]);
+
+        var status: u32 = 0;
+        _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+        const sig = status & 0x7f;
+        const exit_code = (status >> 8) & 0xff;
+        if (sig != 6) {
+            std.debug.print("\nEmitter overflow ({s}): signal {d}, exit {d}, not SIGABRT\n", .{
+                if (use_bytes) "bytes" else "byte", sig, exit_code,
+            });
+            return error.TestUnexpectedResult;
+        }
+        const needle = size_mismatch_message[0..40];
+        try testing.expect(std.mem.indexOf(u8, msg[0..msg_len], needle) != null);
+    }
 }

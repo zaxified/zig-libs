@@ -49,8 +49,8 @@ pub fn encodeInto(buf: []u8, value: anytype, options: Options) (Error || error{N
     if (buf.len < size) return error.NoSpaceLeft;
     var e = wire.Emitter.init(buf[0..size]);
     try emitMessage(@TypeOf(value), value, &e, options, 0);
-    // Pass one and pass two must agree to the byte.
-    std.debug.assert(e.pos == size);
+    // Pass one and pass two must agree to the byte, in every build mode (F8).
+    if (e.pos != size) @panic(wire.size_mismatch_message);
     return size;
 }
 
@@ -65,7 +65,7 @@ pub fn encodeAlloc(
     errdefer gpa.free(buf);
     var e = wire.Emitter.init(buf);
     try emitMessage(@TypeOf(value), value, &e, options, 0);
-    std.debug.assert(e.pos == size);
+    if (e.pos != size) @panic(wire.size_mismatch_message);
     return buf;
 }
 

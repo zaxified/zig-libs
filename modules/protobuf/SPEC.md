@@ -75,9 +75,16 @@ per nesting level and would make an allocation-free `encodeInto` impossible. `en
 public because a gRPC framer needs exactly that number.
 
 The failure mode of two passes is that they disagree. It is made loud: the buffer is sized from
-pass one and pass two asserts it filled it **exactly**, so any divergence aborts in the first test
-that runs rather than emitting a truncated message. (Mutation M6 below confirms the assertion
-fires.)
+pass one, every emitter write checks it fits, and pass two checks it filled the buffer
+**exactly**, so any divergence aborts in the first test that runs rather than emitting a truncated
+message. (Mutation M6 below confirms the check fires.)
+
+The checks are real `@panic`s (`wire.size_mismatch_message`), not `std.debug.assert`s — audit F8,
+2026-09-14. An assert does not exist in ReleaseFast/ReleaseSmall, where the same disagreement wrote
+past the buffer and died with SIGSEGV. Measured cost of the per-write check, ReleaseFast, a
+`Repeated` message with 1 024 varints and three strings, three runs of seven rounds each: best
+round 8 207–8 260 ns/op before, 8 327–8 359 ns/op after — about 1–2 %, inside the run-to-run
+spread (up to 6 % between runs).
 
 ## Threat model
 

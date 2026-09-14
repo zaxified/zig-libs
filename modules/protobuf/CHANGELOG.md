@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL (aborts where it used to corrupt):** audit F8, round-2 decision
+  Q2-B. The two-pass encoder's safety net — every `Emitter.byte`/`bytes` fits, and `encodeInto`/
+  `encodeAlloc` filled the buffer exactly — was four `std.debug.assert`s. They do not exist in
+  ReleaseFast or ReleaseSmall, where a size/emit disagreement wrote past the buffer and died with
+  SIGSEGV. They are now `@panic(wire.size_mismatch_message)` in every build mode. No signature
+  changes; no disagreement is known in the unedited encoder, so correct messages encode exactly
+  as before. Measured cost (ReleaseFast, 1 024 varints + 3 strings, best of 7 rounds × 3 runs):
+  8 207–8 260 → 8 327–8 359 ns/op, about 1–2 %. New test: a forked child overflowing a one-byte
+  `Emitter` through `byte` and through `bytes` must abort with that message.
+
 - **2026-09-11** — A1 fix campaign (F14, partial). **No consumer-visible
   change.** The main decode fuzz harness (`decode.zig`'s
   `fuzz: decode never panics or leaks...`) could only ever select 4 of the
