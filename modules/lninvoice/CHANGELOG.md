@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **Internal only, no behaviour change:** `bech32_raw.zig`'s own copies of the
+  BCH-checksum generator, `charValue`, `toLower` and HRP expansion (54 non-comment lines,
+  byte-for-byte the same algorithm as `bech32`'s) are gone — it now imports `bech32.polymod`/
+  `charValue`/`toLower`/`hrpExpandInto` (A1 `bech32` M6, perf pass, round-2 decision Q4). The
+  allocator-owned, length-uncapped shape (BOLT#11/#12 waive BIP173's 90-char ceiling) and
+  `splitHrp` (no HRP-length cap, unlike `bech32.decode`) are unchanged. `scripts/modtest
+  lninvoice`: 91/91 before and after.
+
 - **2026-09-11** — ⛔ `InvoiceRequest.verify`/`Invoice.verify` used to call
   `bip340.xonlyBytesOf(...) catch unreachable` on `invreq_payer_id`/
   `invoice_node_id`, both decoded straight from the wire (BOLT#12 TLV types

@@ -73,6 +73,17 @@ pub const Bech32String = bech32_impl.Bech32String;
 /// Encodes `hrp` + 5-bit `data` with a fresh checksum for `encoding`.
 pub const encode = bech32_impl.encode;
 
+// The BCH-checksum/charset primitives underneath `encode`/`decode`, already
+// length-generic (no internal fixed-size buffer) — exported so a
+// length-uncapped caller (`lninvoice`'s BOLT#11/#12 codec, which cannot use
+// `decode`/`encode` themselves because those enforce BIP173's 90-char total
+// ceiling) can share this math instead of carrying its own copy. M6,
+// `A1/bech32.md`.
+pub const polymod = bech32_impl.polymod;
+pub const charValue = bech32_impl.charValue;
+pub const toLower = bech32_impl.toLower;
+pub const hrpExpandInto = bech32_impl.hrpExpandInto;
+
 // ── Segwit addresses (BIP141 consensus rules over bech32/bech32m) ──────────
 
 pub const min_program_len = segwit_impl.min_program_len;
