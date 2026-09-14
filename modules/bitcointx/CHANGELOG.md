@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **BEHAVIOURAL, not breaking:** audit M1, round-2 decision Q2-B (module with
+  consumers, hardened directly, no opt-out switch; consumers fixed in the same batch).
+  `deserialize`/`deserializePartial` bounded a witness stack's declared item count only against
+  the bytes locally remaining (min 1 wire byte/item — a witness item's own zero-length
+  CompactSize prefix). But an item costs `@sizeOf([]const u8)` = 16 bytes once parsed, so a
+  hostile count could amplify wire bytes into live memory 16x-22x (measured: 4 MB of wire -> 85
+  MB peak live, 4 MB is `btcp2p.MAX_PAYLOAD_LENGTH`). Now also bounded by a per-transaction
+  memory budget (`bytes.len / @sizeOf([]const u8)`, shared and decremented across every witness
+  stack the transaction decodes — cumulative, so splitting the same shape across many small
+  witness stacks on many inputs doesn't reopen it): `error.TooManyItems`, no new error variant.
+  Measured on the audit's own 1,048,576 B hostile row (pre-fix: 16,797,912 B peak live, 16.02x):
+  now rejected after 312 B of allocator budget. Every real transaction this module is tested
+  against — Bitcoin Core's `tx_valid.json`/`tx_invalid.json` (213 rows), the BIP143/BIP341
+  published vectors, block 170 — still decodes byte-exact; only a witness stack whose declared
+  item count isn't backed by a memory-proportionate share of the transaction's own wire bytes is
+  newly rejected. `bitcoinscript`/`btcp2p`/`psbt` (the three consumers) unaffected: no code
+  changes needed, `scripts/modtest` green on all three.
+
 - **2026-09-14** — **BREAKING (error sets widened):** audit M3, round-2 decision Q7 (API change
   with consumers, fixed in the same batch). `serializeSegwit` asserted
   `tx.witness.len == tx.vin.len`. In ReleaseFast the optimizer took the equality as given: a

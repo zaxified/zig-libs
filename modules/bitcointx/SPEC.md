@@ -135,7 +135,13 @@ this caught" below).
 - **Hostile input** — `tx.zig`'s own tests: truncated at every stage (before the version field,
   mid-input), a `vin`/`vout` count claiming far more items than remain (`error.TooManyItems`, no
   allocation-by-hostile-count), a non-minimally-encoded CompactSize, an unrecognized segwit flag
-  byte, and trailing bytes after a complete transaction — every one a typed error.
+  byte, and trailing bytes after a complete transaction — every one a typed error. A witness
+  item count is bounded twice: locally (min 1 wire byte/item, same shape as `vin`/`vout`) and
+  against a per-transaction memory budget (`bytes.len / @sizeOf([]const u8)`, shared and
+  decremented across every witness stack the transaction decodes) — a witness item costs as
+  little as 1 wire byte but `@sizeOf([]const u8)` = 16 bytes once parsed, and the local bound
+  alone let a hostile count amplify wire bytes into live memory 16x-22x (audit finding M1,
+  measured: 4 MB of wire -> 85 MB peak live).
 
 ### Pitfalls this caught
 
