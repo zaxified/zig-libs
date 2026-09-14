@@ -33,9 +33,9 @@
 //!   `255 => 0`; `1..8` carry the value literally. `decode` normalizes this to
 //!   `id_length` (0 is reported as 6).
 //! - **PDU Type** (byte 4, low 5 bits): the message kind (`PduType`). Bits 6-8
-//!   are Reserved, "transmitted as 0 and ignored on receipt" (ISO/IEC 10589
-//!   §9.5-§9.9; RFC 1142 has the same sentence): `encode` writes zero, `decode`
-//!   masks them away and accepts the PDU.
+//!   are Reserved, "transmitted as 0 and ignored on receipt" (RFC 1142
+//!   §9.5-§9.9): `encode` writes zero, `decode` masks them away and accepts the
+//!   PDU. See SPEC.md "Reserved fields" for which norm this follows.
 //! - **Version** (byte 5): constant `1` (a second version byte, per ISO 10589).
 //! - **Reserved** (byte 6): MUST be zero on transmit; carried, not rejected, on
 //!   receive (a legacy soft field).

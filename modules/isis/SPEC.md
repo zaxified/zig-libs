@@ -119,8 +119,10 @@ attacker who can inject frames). The central hazard of a TLV codec is an
   Circuit Type bits). An IIH whose Circuit Type is the reserved value 0 is
   refused whole (`ReservedCircuitType`) — "if specified the entire PDU shall be
   ignored" — and `CircuitType` has no member a builder could emit it with.
-  RFC 1142 carries the same sentences; the module used to reject the reserved
-  PDU-type bits and accept Circuit Type 0, against both.
+  The quoted sentences are RFC 1142's (§9.1, §9.5-§9.9), the IETF republication
+  of the ISO draft; the ISO/IEC 10589:2002 text itself has not been checked
+  against them. The module used to reject the reserved PDU-type bits and accept
+  Circuit Type 0, against that text.
 
 **Not an authentication boundary.** The Authentication TLV (#10) and IS-IS
 crypto-auth (RFC 5304/5310) are **not** implemented — this codec neither

@@ -51,7 +51,7 @@ pub const DecodeError = header.DecodeError || error{
     /// anyway: `checksum.compute`'s bound is ITS invariant, not this file's, and
     /// a `catch unreachable` here would be the same absent guard one frame up.
     ChecksumFieldOutOfRange,
-    /// An IIH's Circuit Type is the reserved value 0; ISO/IEC 10589 §9.5/§9.7:
+    /// An IIH's Circuit Type is the reserved value 0; RFC 1142 §9.5-§9.7:
     /// "if specified the entire PDU shall be ignored".
     ReservedCircuitType,
 };
@@ -98,9 +98,9 @@ fn buildableTlvRegion(buf: []u8, fixed_len: usize) []u8 {
     return buf[fixed_len..@min(buf.len, max_pdu_len)];
 }
 
-/// The circuit-type field low 2 bits (ISO/IEC 10589 §9.5, §9.7): which levels
-/// this circuit runs. The value 0 is reserved — "if specified the entire PDU
-/// shall be ignored" — so it has no member: a decoder refuses it
+/// The circuit-type field low 2 bits: which levels this circuit runs. The value
+/// 0 is reserved — "if specified the entire PDU shall be ignored" (RFC 1142
+/// §9.5-§9.7; SPEC.md "Reserved fields") — so it has no member: a decoder refuses it
 /// (`error.ReservedCircuitType`) and a builder cannot emit it.
 pub const CircuitType = enum(u2) {
     level1 = 1,

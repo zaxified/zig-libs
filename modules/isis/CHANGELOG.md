@@ -7,12 +7,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-14** — **BREAKING (error set, enum) + BEHAVIOURAL:** audit F2/F3, round-2 decision Q5
   (the newer norm wins; ISO/IEC 10589:2002, no switch). Two reserved-field rules the codec had
-  backwards, against the norm and against RFC 1142's identical wording:
+  backwards against RFC 1142 §9.5-§9.9 (the ISO/IEC 10589:2002 text itself was not checked):
   - **F2, accepts more:** `header.decode` rejected a set reserved PDU-type bit (bits 6-8 of octet
     4) with `error.ReservedBitSet`. They are "transmitted as 0 and ignored on receipt": now masked,
     and `ReservedBitSet` is gone from `header.DecodeError` (no caller named it).
   - **F3, refuses more:** `LanHello.decode`/`P2pHello.decode` accepted Circuit Type 0 as
-    `.reserved0`. The norm: "if specified the entire PDU shall be ignored". Now
+    `.reserved0`. RFC 1142: "if specified the entire PDU shall be ignored". Now
     `error.ReservedCircuitType`, and `CircuitType` loses `.reserved0`, so a builder cannot emit
     one either. The six high bits of that octet stay ignored.
   Consumers `isis-adj`, `isis-dis`, `isis-flood`, `isis-lsdb`, `isis-sim`, `isis-spf` never named

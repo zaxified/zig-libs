@@ -316,7 +316,7 @@ fn biasToModeledPdu(buf: []u8, len: usize, cur: *testkit.fuzz.Cursor) bool {
     buf[3] = 6; // ID Length
     buf[4] = s.type_byte; // reserved top 3 bits clear, as transmitted
     buf[5] = header.version;
-    // An IIH with Circuit Type 0 is refused whole (ISO/IEC 10589 §9.5/§9.7), so
+    // An IIH with Circuit Type 0 is refused whole (RFC 1142 §9.5-§9.7), so
     // name a level; the six reserved high bits stay whatever was drawn. The raw
     // arm still carries Circuit Type 0 to the refusal.
     if (@as(header.PduType, @enumFromInt(@as(u5, @intCast(s.type_byte)))).isHello()) {
