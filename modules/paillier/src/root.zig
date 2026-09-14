@@ -762,10 +762,21 @@ fn bigModInverse(gpa: std.mem.Allocator, x: *const BigInt, m: *const BigInt) !Bi
 
 /// Derive a `KeyPair` from two prime factors `p`, `q` (raw big-endian
 /// bytes), for deterministic/reproducible construction (KATs, testing) —
-/// mirrors `rsa.SecretKey.fromPrimes`. `p`/`q` are trusted to be prime (no
-/// primality test here; that is `generate`'s job) — the derivation's own
-/// self-checks (L-exactness, mu invertibility) catch many composites, but
-/// NOT all: a key derived from composite factors decrypts garbage.
+/// mirrors `rsa.SecretKey.fromPrimes`.
+///
+/// The factors are CHECKED, not trusted (audit F7, 2026-09-14):
+///   - each must be prime — exact trial division up to 32 bits, otherwise a
+///     sieve plus 64-round Miller-Rabin whose witnesses come from a CSPRNG
+///     keyed by the factor itself (no `random` parameter needed; a composite
+///     built to pass has ~4^-64 odds per attempt). The derivation's own
+///     self-checks (L-exactness, mu invertibility) catch random composites
+///     but accepted 24 of 32 base-2 strong pseudoprime pairings, and such a
+///     key silently decrypts some plaintexts wrong.
+///   - `|p − q| > 2^(nlen/2 − 100)` (FIPS 186-5 §A.1.3) when `nlen/2 > 100`;
+///     closer factors fall to Fermat's method in a handful of steps.
+///     `generate` enforces this itself with `topBitsMatch`; a caller of this
+///     function had nothing.
+/// Both refusals are `error.InvalidPrimes`.
 ///
 /// A SECOND, independent precondition beyond primality: `gcd(n, phi(n)) = 1`
 /// (equivalently `gcd(lambda, n) = 1`), which `generate`'s same-length
@@ -791,13 +802,19 @@ fn bigModInverse(gpa: std.mem.Allocator, x: *const BigInt, m: *const BigInt) !Bi
 ///      `g^lambda mod n²` uses constant-time `pow`, never `powPublic` —
 ///      `lambda` is factorization-equivalent secret material.
 pub fn fromPrimes(p_bytes: []const u8, q_bytes: []const u8) FromPrimesError!KeyPair {
-    return fromPrimesImpl(p_bytes, q_bytes) catch |err| switch (err) {
+    return fromPrimesImpl(p_bytes, q_bytes, .checked) catch |err| switch (err) {
         error.Overflow => error.Overflow,
         else => error.InvalidPrimes,
     };
 }
 
-fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8) !KeyPair {
+/// `.checked`: a caller's factors — primality and closeness are verified.
+/// `.generated`: `generate`'s own factors, which already passed 64-round
+/// Miller-Rabin and `topBitsMatch` in its search; checking again would only
+/// repeat the most expensive part of key generation.
+const FactorOrigin = enum { checked, generated };
+
+fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8, comptime origin: FactorOrigin) !KeyPair {
     const pb = stripLeadingZeros(p_bytes_in);
     const qb = stripLeadingZeros(q_bytes_in);
     if (pb.len == 0 or qb.len == 0) return error.InvalidPrimes;
@@ -824,6 +841,12 @@ fn fromPrimesImpl(p_bytes_in: []const u8, q_bytes_in: []const u8) !KeyPair {
     var bn = try newBig(gpa);
     try bn.mul(&bp, &bq);
     if (bn.bitCountAbs() > modulus_bits) return error.Overflow;
+    // The factor checks run after the size cap: an oversized product stays
+    // `Overflow`, and Miller-Rabin is never spent on it.
+    if (origin == .checked) {
+        if (!factorIsPrime(pb) or !factorIsPrime(qb)) return error.InvalidPrimes;
+        if (try factorsTooClose(gpa, &bp, &bq, bn.bitCountAbs())) return error.InvalidPrimes;
+    }
     var n_buf: [modulus_bytes]u8 = undefined;
     bn.toConst().writeTwosComplement(&n_buf, .big);
     const n = Modulus.fromBytes(&n_buf, .big) catch return error.InvalidPrimes; // rejects even n
@@ -1124,6 +1147,53 @@ fn topBitsMatch(p: []const u8, q: []const u8) bool {
     return (p[12] ^ q[12]) & 0xf0 == 0; // + 4 more = 100 bits
 }
 
+/// Primality of a caller-supplied factor (stripped big-endian, >= 3) for
+/// `fromPrimes` (audit F7 m7). Up to 32 bits: exact trial division —
+/// `isProbablePrime` needs `m >= 5` and its witness range `[2, m-2]` is
+/// empty for `m = 3`. Above: the `generatePrime` sieve, then Miller-Rabin
+/// with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the factor, so
+/// the result is deterministic without a `random` parameter while a
+/// composite chosen to pass would still have to beat 64 unpredictable
+/// rounds (4^-64 per attempt).
+fn factorIsPrime(bytes: []const u8) bool {
+    if (bytes.len <= 4) {
+        const v = std.mem.readVarInt(u32, bytes, .big);
+        if (v < 2) return false;
+        if (v % 2 == 0) return v == 2;
+        var d: u32 = 3;
+        while (d <= v / d) : (d += 2) {
+            if (v % d == 0) return false;
+        }
+        return true;
+    }
+    for (sieve_primes) |sp| {
+        if (bytesMod(bytes, sp) == 0) return false;
+    }
+    const m = Modulus.fromBytes(bytes, .big) catch return false; // even → not prime
+    var seed: [32]u8 = undefined;
+    defer std.crypto.secureZero(u8, &seed);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("zig-libs/paillier/fromPrimes/miller-rabin/v1");
+    h.update(bytes);
+    h.final(&seed);
+    var csprng = std.Random.DefaultCsprng.init(seed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&csprng)); // keyed by a secret factor
+    return isProbablePrime(m, csprng.random());
+}
+
+/// FIPS 186-5 §A.1.3: `|p − q|` must exceed `2^(nlen/2 − 100)` (audit F7
+/// m8). Not defined for `nlen/2 <= 100`, where nothing is refused.
+fn factorsTooClose(gpa: std.mem.Allocator, bp: *const BigInt, bq: *const BigInt, n_bits: usize) !bool {
+    if (n_bits / 2 <= 100) return false;
+    var diff = try newBig(gpa);
+    try diff.sub(bp, bq);
+    diff.abs();
+    var bound = try newBig(gpa);
+    try bound.set(1);
+    try bound.shiftLeft(&bound, n_bits / 2 - 100);
+    return diff.order(bound) != .gt;
+}
+
 /// Floor `generate` enforces on `bits` — mirrors `rsa`'s 512-bit minimum
 /// (any real deployment uses `modulus_bits`; the floor only guards against
 /// sizes the prime search above cannot honor).
@@ -1160,7 +1230,7 @@ pub fn generate(random: std.Random, bits: usize) GenerateError!KeyPair {
         // prime) and tripped its L-exactness/invertibility self-checks —
         // restart the search instead of surfacing an error for an input the
         // caller never chose (mirrors `rsa.generate`).
-        return fromPrimes(p_bytes, q_bytes) catch continue;
+        return fromPrimesImpl(p_bytes, q_bytes, .generated) catch continue;
     }
 }
 
@@ -1744,9 +1814,12 @@ test "isProbablePrime rejects known base-2 strong pseudoprimes at the real mr_ro
     }
 }
 
-test "fromPrimes' structural self-check alone does NOT catch a base-2 strong pseudoprime (F7 m7, the gap m64-round isProbablePrime guards against)" {
+test "fromPrimes refuses a base-2 strong pseudoprime that the derivation's structural self-check alone accepts (F7 m7)" {
     const pb = std.mem.toBytes(std.mem.nativeToBig(u32, @as(u32, 2047))); // 23 * 89, composite
-    const kp = try fromPrimes(&pb, &kat_q); // ACCEPTED -- this is the finding, not a bug to fix here
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&pb, &kat_q));
+    // Control: without the primality check (generate's internal path) the
+    // same factors still derive a key — so the refusal above is that check.
+    const kp = try fromPrimesImpl(&pb, &kat_q, .generated);
     try testing.expectEqual(@as(usize, 16), kp.public.n.bits());
 
     // And the resulting "key" is silently wrong for some plaintexts, same
@@ -1767,7 +1840,7 @@ test "fromPrimes' structural self-check alone does NOT catch a base-2 strong pse
     try testing.expectEqual(@as(usize, 2), mismatches); // m=4 and m=16, pinned
 }
 
-test "fromPrimes has no closeness defense: two Fermat-factorably-close primes are accepted (F7 m8, confirmed not refuted)" {
+test "fromPrimes refuses two Fermat-factorably-close primes, which the derivation alone accepts (F7 m8)" {
     // Two DISTINCT, genuinely prime, adjacent-ish 128-bit values found by
     // linear search from a fixed seed (deterministic: the search AND every
     // isProbablePrime witness draw both come from the same seeded prng).
@@ -1811,8 +1884,51 @@ test "fromPrimes has no closeness defense: two Fermat-factorably-close primes ar
     try testing.expect(gap_steps < 10_000); // a magnitude 2^28 below the 100-bit closeness threshold at this size
     try testing.expect(topBitsMatch(&p_bytes, &q_bytes)); // exactly what generate()'s call site checks before accepting q
 
-    const kp = try fromPrimes(&p_bytes, &q_bytes); // ACCEPTED -- the finding: nothing else in the module refuses this
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&p_bytes, &q_bytes));
+    // Control: the unchecked derivation still accepts them, so the refusal is
+    // the closeness check (both factors are prime — isProbablePrime said so).
+    const kp = try fromPrimesImpl(&p_bytes, &q_bytes, .generated);
     try testing.expectEqual(@as(usize, half_bytes * 2 * 8), kp.public.n.bits());
+}
+
+test "fromPrimes checks every factor: 32 pseudoprime pairings, composites, tiny primes, and a far-apart prime pair (F7)" {
+    // All 16 base-2 strong pseudoprimes paired with kat_q, both orders — the
+    // audit measured 24 of these 32 accepted before the check.
+    const pseudoprimes_base2 = [_]u32{ 2047, 3277, 4033, 4681, 8321, 15841, 29341, 42799, 49141, 52633, 65281, 74665, 80581, 85489, 88357, 90751 };
+    for (pseudoprimes_base2) |pp| {
+        const pb = std.mem.toBytes(std.mem.nativeToBig(u32, pp));
+        try testing.expectError(error.InvalidPrimes, fromPrimes(&pb, &kat_q));
+        try testing.expectError(error.InvalidPrimes, fromPrimes(&kat_q, &pb));
+    }
+    // The audit's `p = 9` (composite), `q = 5`.
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&[_]u8{9}, &[_]u8{5}));
+    // Every value above is <= 32 bits, i.e. the exact trial-division path.
+    // Composites above 32 bits reach the keyed Miller-Rabin: the square of a
+    // prime past the sieve, and 3825123056546413051 = 149491·747451·34233211,
+    // a strong pseudoprime to every prime base 2..23 (fixed small bases pass it).
+    const square = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 1000003) * 1000003));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&square, &kat_q));
+    const spsp_2_to_23 = std.mem.toBytes(std.mem.nativeToBig(u64, @as(u64, 3825123056546413051)));
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&spsp_2_to_23, &kat_q));
+    // p = 3 used to be the one value `isProbablePrime` cannot take (empty
+    // witness range); the small-factor path answers it.
+    _ = fromPrimes(&[_]u8{3}, &[_]u8{11}) catch {};
+
+    // Controls: primes still pass — the toy KAT pair, and two 128-bit primes
+    // from independent seeds (far apart, so closeness does not apply).
+    _ = try fromPrimes(&kat_p, &kat_q);
+    var pair: [2][16]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xFA2A_0001);
+    const random = prng.random();
+    for (&pair, 0..) |*out, i| {
+        while (true) {
+            random.bytes(out);
+            out[0] = if (i == 0) 0xc0 | (out[0] & 0x1f) else 0xe0 | (out[0] & 0x1f); // different top bits
+            out[15] |= 1;
+            if (isProbablePrime(Modulus.fromBytes(out, .big) catch unreachable, random)) break;
+        }
+    }
+    _ = try fromPrimes(&pair[0], &pair[1]);
 }
 
 // F7's fifth named mutation, `m14` (delete `n_bytes.len > modulus_bytes`

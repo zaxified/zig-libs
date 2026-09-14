@@ -60,7 +60,7 @@ worth pinning for anyone re-deriving the vectors.
 ```zig
 const paillier = @import("paillier");
 
-const kp = try paillier.fromPrimes(p_bytes, q_bytes); // deterministic (KAT/testing)
+const kp = try paillier.fromPrimes(p_bytes, q_bytes); // deterministic (KAT/testing); checks primality + FIPS 186-5 closeness
 // const kp = try paillier.generate(random, paillier.modulus_bits); // random
 
 const pk: paillier.PublicKey = kp.public;   // n, n_sq (=n²), g

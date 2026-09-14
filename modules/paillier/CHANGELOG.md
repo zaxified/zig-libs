@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL (refuses more):** audit F7 `m7`/`m8`, round-2 decision Q1/Q2-B
+  (tighten, consumers checked in the same batch). `fromPrimes` trusted its factors. Its structural
+  self-check accepted 24 of 32 base-2 strong-pseudoprime pairings (a `2047 × 17` key decrypts 2 of
+  20 plaintexts wrong) and any two close primes (two 128-bit primes 122 apart — Fermat-factorable).
+  Now each factor must be prime (exact up to 32 bits; above, sieve + 64-round Miller-Rabin with
+  witnesses keyed by SHA-256 of the factor, so no `random` parameter) and `|p − q|` must exceed
+  `2^(nlen/2 − 100)` (FIPS 186-5 §A.1.3) when `nlen/2 > 100`. Refusal is `error.InvalidPrimes`;
+  `Overflow` still wins for an oversized product. `generate` takes an internal path that skips the
+  repeat. No signature change; the two tests that pinned the old acceptance now pin the refusal,
+  with the unchecked derivation as control.
+
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** `decrypt`'s F2 HIGH finding (A1/paillier.md)
   fully closed. The last remaining secret-key stack residual — one full copy of `mu`
   surviving `decrypt` + `SecretKey.deinit()` — is gone. `decrypt`'s final `L(x)*mu mod n`

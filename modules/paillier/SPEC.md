@@ -136,10 +136,17 @@ silently assumed.
   ≤ 2⁻¹²⁸ worst-case acceptance error per prime; FIPS 186-5 §A.1.3 top-100-bits closeness
   guard against Fermat factorization — all inherited from `rsa`'s search). A weak or
   attacker-influenced `random` breaks everything; the API takes `std.Random` and trusts it.
-- **`fromPrimes` trusts its factors.** It runs no primality test (that is `generate`'s
-  job); its self-checks (odd `n`, L-exactness of `g^λ`, invertibility of `μ`) reject many
-  composites but NOT all — a key derived from composite factors silently decrypts garbage
-  for most plaintexts. Deterministic construction is for KATs/round-tripping stored keys.
+- **`fromPrimes` checks its factors (audit F7, 2026-09-14).** It used to trust them: the
+  derivation's self-checks (odd `n`, L-exactness of `g^λ`, invertibility of `μ`) reject random
+  composites but accepted 24 of 32 base-2 strong-pseudoprime pairings, and such a key silently
+  decrypts some plaintexts wrong (`2047 × 17`: 2 of 20). Now each factor must be prime —
+  exact trial division up to 32 bits, above that the prime-search sieve plus 64-round
+  Miller-Rabin with witnesses from a ChaCha CSPRNG keyed by SHA-256 of the factor (deterministic,
+  no `random` parameter; a composite built to pass still faces 4⁻⁶⁴ per attempt) — and
+  `|p − q| > 2^(nlen/2 − 100)` (FIPS 186-5 §A.1.3) whenever `nlen/2 > 100`, the closeness rule
+  `generate` enforces with `topBitsMatch`. Both refusals are `error.InvalidPrimes`; an oversized
+  product is still `Overflow`, checked first. `generate` skips the repeat (its factors already
+  passed both). Deterministic construction remains for KATs/round-tripping stored keys.
 - **`fromPrimes` also requires `gcd(n, φ(n)) = 1`** (equivalently `gcd(λ, n) = 1`), a
   second precondition independent of primality — `generate`'s same-length prime search
   satisfies it by construction, but a caller-supplied genuinely-prime pair can violate it
