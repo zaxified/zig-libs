@@ -859,12 +859,25 @@ pub const Store = struct {
         temps_removed: u64 = 0,
     };
 
+    /// Default `GcOptions.stale_after_ns` — see that field's doc for why 24
+    /// hours, not the tighter value an earlier version of this module used.
+    pub const default_stale_after_ns: u64 = 24 * std.time.ns_per_hour;
+
     pub const GcOptions = struct {
         /// Only reap an ingest temp whose mtime is at least this old, so `gc`
         /// never races a slow-but-live `put` that is still streaming into its
-        /// temp on another process/thread. Default 10 minutes: generous for
-        /// any single blob ingest, tight enough to actually reclaim crash
-        /// debris in routine maintenance sweeps.
+        /// temp on another process/thread.
+        ///
+        /// Default 24 hours (`default_stale_after_ns`). The sweep's only
+        /// liveness signal is mtime — no open-fd check, no lock on the temp
+        /// itself (A1 blobstore, confirmed by measurement: a `put` backdated
+        /// 11 minutes with no other change is indistinguishable from crash
+        /// debris and was reaped under the old 10-minute default). A safe
+        /// default has to outlast any plausible single-ingest stall, not
+        /// just a typical one, so it errs generous: a caller whose ingest
+        /// workload reliably finishes in minutes and wants tighter routine
+        /// reclaim sets a shorter value explicitly (the previous default,
+        /// `10 * std.time.ns_per_min`, is still exactly as fast as before).
         ///
         /// MUST be nonzero: `reapStaleIngestTemps`'s age check is
         /// `age_ns < stale_after_ns`, and `age_ns` is never negative for an
@@ -874,7 +887,7 @@ pub const Store = struct {
         /// eligible for deletion on the very next `gc` (A1 F3). `gc` refuses
         /// `stale_after_ns == 0` with `error.StaleAfterTooSmall` rather than
         /// silently running with the guard off.
-        stale_after_ns: u64 = 10 * std.time.ns_per_min,
+        stale_after_ns: u64 = default_stale_after_ns,
     };
 
     /// Reachability sweep and the *only* path that physically reclaims CAS
@@ -1503,33 +1516,28 @@ test "F3: gc refuses stale_after_ns=0 instead of silently disarming the live-ing
     try t.expectError(error.StaleAfterTooSmall, store.gc(gpa, &.{}, .{ .stale_after_ns = 0 }));
     try std.Io.Dir.cwd().access(io, live_temp2.tmp, .{}); // still there
 
-    // Positive control: the DEFAULT options (10 minutes) are accepted and
-    // correctly leave a temp this young untouched.
+    // Positive control: the DEFAULT options are accepted and correctly leave
+    // a temp this young untouched.
     const stats = try store.gc(gpa, &.{}, .{});
     try t.expectEqual(@as(u64, 0), stats.temps_removed);
     try std.Io.Dir.cwd().access(io, live_temp2.tmp, .{});
 }
 
-test "SUSPICION: gc reaps a live-but-silent put's temp under the DEFAULT stale_after_ns" {
-    // A1/blobstore.md's open suspicion (F3's dispositon left it unconfirmed):
-    // does `gc` collect a genuinely in-flight `put` (not abandoned crash
-    // debris) once its source has stalled past `stale_after_ns`? A real
-    // 10-minute-plus stall is not something a test suite should wait for, so
-    // this backdates the temp's ON-DISK mtime instead of touching any
-    // production code or injecting a fake clock into `Store` -- the same
-    // observable state a real 11-minutes-silent writer would leave behind.
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var base_buf: [256]u8 = undefined;
-    const store = try testStore(&tmp, &base_buf);
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-
-    // A `put` that has streamed SOME bytes already (a real slow upload would
-    // have) and then stalled -- the temp is not abandoned, its writer (in
-    // this scenario) is just waiting on a slow source.
-    var tbuf: [768]u8 = undefined;
-    const live_temp = try store.casCreateTemp("slow-upload-still-streaming", &tbuf);
+/// Shared setup for the three F_Q8 tests below: an ingest temp that has
+/// streamed some bytes (a real slow upload would have) and then stalled, its
+/// mtime backdated by `age` -- the same on-disk state a real `age`-silent
+/// writer leaves, produced without waiting or without injecting a fake clock
+/// into `Store`. A second, freshly-created temp rides along untouched as an
+/// internal negative control: if `gc` ever removed both, the caller's
+/// assertion on `fresh_temp` surviving would say so.
+///
+/// `tbuf`/`tbuf2` are the caller's scratch buffers, not this function's: a
+/// `Temp.tmp` path slices into whichever buffer `casCreateTemp` was given,
+/// so those buffers must outlive the returned `Temp`s -- exactly why they
+/// are parameters here rather than locals that would go out of scope with
+/// this function's stack frame the moment it returned.
+fn liveTempAged(store: Store, io: std.Io, age: u64, tbuf: []u8, tbuf2: []u8) !struct { live: Temp, fresh: Temp } {
+    const live_temp = try store.casCreateTemp("slow-upload-still-streaming", tbuf);
     {
         var wbuf: [64]u8 = undefined;
         var fw = live_temp.file.writer(io, &wbuf);
@@ -1539,37 +1547,81 @@ test "SUSPICION: gc reaps a live-but-silent put's temp under the DEFAULT stale_a
     }
     try std.Io.Dir.cwd().access(io, live_temp.tmp, .{}); // CONTROL: it exists
 
-    // Backdate mtime to just past the DEFAULT stale_after_ns (10 minutes) --
-    // the file has not been WRITTEN to in that long, which is exactly what
-    // `reapStaleIngestTemps` measures; nothing else about the "put" changed.
-    const old_ts = std.Io.Timestamp.now(io, .real).subDuration(.fromNanoseconds(11 * std.time.ns_per_min));
+    const old_ts = std.Io.Timestamp.now(io, .real).subDuration(.fromNanoseconds(age));
     try std.Io.Dir.cwd().setTimestamps(io, live_temp.tmp, .{ .modify_timestamp = .{ .new = old_ts } });
 
-    // Internal negative control, same `gc` pass: a SECOND ingest temp,
-    // freshly created (mtime untouched), sits alongside the backdated one --
-    // if `gc` removed both, the result below would say nothing about mtime
-    // discrimination specifically.
-    var tbuf2: [768]u8 = undefined;
-    const fresh_temp = try store.casCreateTemp("just-started-streaming-too", &tbuf2);
+    const fresh_temp = try store.casCreateTemp("just-started-streaming-too", tbuf2);
     fresh_temp.file.close(io);
+    return .{ .live = live_temp, .fresh = fresh_temp };
+}
+
+test "F_Q8: gc's new default (24h) no longer reaps an 11-minute-silent live put" {
+    // A1/blobstore.md's open suspicion, now resolved by policy (round-2
+    // decision Q8: safe default + switch for the exception). Under the OLD
+    // 10-minute default this same setup was CONFIRMED to reap a genuinely
+    // live, merely slow, put (see git history) -- the sweep's only liveness
+    // signal is mtime, so a slow-but-alive ingest was indistinguishable from
+    // abandoned crash debris once quiet for `stale_after_ns`. The new
+    // default (`Store.default_stale_after_ns`, 24h) must not reap it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tbuf: [768]u8 = undefined;
+    var tbuf2: [768]u8 = undefined;
+    const fx = try liveTempAged(store, io, 11 * std.time.ns_per_min, &tbuf, &tbuf2);
 
     // `gc` with the DEFAULT options -- nothing exotic, what any caller gets
     // by not overriding `GcOptions`.
     const stats = try store.gc(gpa, &.{}, .{});
-    try std.Io.Dir.cwd().access(io, fresh_temp.tmp, .{}); // CONTROL: the fresh one survived
+    try t.expectEqual(@as(u64, 0), stats.temps_removed);
+    try std.Io.Dir.cwd().access(io, fx.live.tmp, .{}); // still there: the safe default protected it
+    try std.Io.Dir.cwd().access(io, fx.fresh.tmp, .{}); // and the untouched control too
+}
 
-    // CONFIRMED, not refuted: the sweep has no liveness signal beyond mtime
-    // (no open-fd check, no lock on the temp itself), so a slow-but-alive
-    // ingest is indistinguishable from abandoned crash debris once it has
-    // been quiet for `stale_after_ns`. This is not a bug in
-    // `reapStaleIngestTemps` -- it does exactly what its own doc comment
-    // says -- it is confirmation that the DEFAULT 10-minute threshold offers
-    // no protection against a source that stalls that long. Left as a
-    // confirmed-but-unfixed finding: whether to raise the default, add a
-    // liveness check, or document the risk and leave it is a policy
-    // decision, not a mechanical correctness fix.
+test "F_Q8: an explicit shorter stale_after_ns (the switch) still reaps the same 11-minute-silent temp" {
+    // The safe default is not a removal of capability: a caller that knows
+    // its own ingest workload finishes fast and wants the old tight reclaim
+    // dials `stale_after_ns` down explicitly -- exactly the value this
+    // module used to default to.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tbuf: [768]u8 = undefined;
+    var tbuf2: [768]u8 = undefined;
+    const fx = try liveTempAged(store, io, 11 * std.time.ns_per_min, &tbuf, &tbuf2);
+
+    const stats = try store.gc(gpa, &.{}, .{ .stale_after_ns = 10 * std.time.ns_per_min });
     try t.expectEqual(@as(u64, 1), stats.temps_removed);
-    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, live_temp.tmp, .{}));
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, fx.live.tmp, .{}));
+    try std.Io.Dir.cwd().access(io, fx.fresh.tmp, .{}); // negative control: untouched, still fresh
+}
+
+test "F_Q8: gc's new default still reclaims debris that is actually abandoned" {
+    // The safe default must not turn `gc` into a permanent no-op: crash
+    // debris genuinely older than the new 24h threshold is still reaped.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [256]u8 = undefined;
+    const store = try testStore(&tmp, &base_buf);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tbuf: [768]u8 = undefined;
+    var tbuf2: [768]u8 = undefined;
+    const fx = try liveTempAged(store, io, 25 * std.time.ns_per_hour, &tbuf, &tbuf2);
+
+    const stats = try store.gc(gpa, &.{}, .{});
+    try t.expectEqual(@as(u64, 1), stats.temps_removed);
+    try t.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, fx.live.tmp, .{}));
+    try std.Io.Dir.cwd().access(io, fx.fresh.tmp, .{});
 }
 
 test "F5: an oversized refcount sidecar is never misread as a truncated smaller number" {
