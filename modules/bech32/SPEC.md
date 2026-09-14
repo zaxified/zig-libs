@@ -84,6 +84,13 @@ base58/base58check (P2PKH/P2SH/WIF). Usage: see ./README.md. Attribution/provena
   internally consistent with the variant rule this module enforces (same v0 addresses,
   corrected checksums for the v1+ ones).
 
+- **BIP173's own "invalid segwit addresses" list IS used** (`invalid_segwit_bip173`, 10 vectors,
+  audit A1 L5, 2026-09-14). Nothing there is superseded: an address BIP173 calls invalid is still
+  invalid under BIP350, so the reason for dropping the valid list does not apply. Three entries
+  (`bc1rw5uspcuh`, `bc10w508…`, `bc1zw508…` — witness versions 3, 15, 2 with a plain-bech32
+  checksum) are rejected as `InvalidVariant` rather than the BIP173 reason (program length,
+  padding): BIP350's variant rule is checked first. Two entries also sit in BIP350's list.
+
 - Reentrant, no shared state, no heap allocation. `deps`: `ripemd160` (`hash160` for the
   P2PKH/P2WPKH helpers) + `std.crypto.hash.sha2.Sha256` (base58check's double-SHA256).
 

@@ -156,3 +156,32 @@ pub const invalid_segwit = [_]InvalidSegwitVector{
     .{ .hrp = "tb", .address = "tb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vpggkg4j", .err = error.InvalidPadding },
     .{ .hrp = "bc", .address = "bc1gmk9yu", .err = error.EmptyDataSection },
 };
+
+/// BIP173's own "invalid segwit addresses" list (10 vectors, audit A1 L5):
+/// every address stays invalid under BIP350, so unlike BIP173's VALID list
+/// (see SPEC.md) nothing in it is superseded. Extracted by script from
+/// `bip-0173.mediawiki` (`bitcoin/bips` master, 2026-09-14), not typed.
+///
+/// `hrp` is the network the vector is checked against: the address's own,
+/// except `tc1…`, whose point is a wrong HRP. Each `err` was derived by a
+/// separate Python classification (charset, case, checksum constant,
+/// witness version, 8-bit program length, padding) against the BIP's
+/// stated reason, then ordered by `decodeSegwit`'s documented checks. Three
+/// entries do not report the BIP173 reason: `bc1rw5uspcuh` (v3),
+/// `bc10w508…` (v15) and `bc1zw508…` (v2) carry a plain-bech32 checksum,
+/// which BIP350 makes invalid for any witness version above 0, and that
+/// rule is checked before program length and padding — so they are
+/// `InvalidVariant`. `BC1QR508…98GJ9P` and `bc1gmk9yu` also appear in
+/// BIP350's list above.
+pub const invalid_segwit_bip173 = [_]InvalidSegwitVector{
+    .{ .hrp = "bc", .address = "tc1qw508d6qejxtdg4y5r3zarvary0c5xw7kg3g4ty", .err = error.InvalidHrp },
+    .{ .hrp = "bc", .address = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t5", .err = error.InvalidChecksum },
+    .{ .hrp = "bc", .address = "BC13W508D6QEJXTDG4Y5R3ZARVARY0C5XW7KN40WF2", .err = error.InvalidWitnessVersion },
+    .{ .hrp = "bc", .address = "bc1rw5uspcuh", .err = error.InvalidVariant },
+    .{ .hrp = "bc", .address = "bc10w508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kw5rljs90", .err = error.InvalidVariant },
+    .{ .hrp = "bc", .address = "BC1QR508D6QEJXTDG4Y5R3ZARVARYV98GJ9P", .err = error.InvalidProgramLength },
+    .{ .hrp = "tb", .address = "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sL5k7", .err = error.MixedCase },
+    .{ .hrp = "bc", .address = "bc1zw508d6qejxtdg4y5r3zarvaryvqyzf3du", .err = error.InvalidVariant },
+    .{ .hrp = "tb", .address = "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3pjxtptv", .err = error.InvalidPadding },
+    .{ .hrp = "bc", .address = "bc1gmk9yu", .err = error.EmptyDataSection },
+};

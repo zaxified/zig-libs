@@ -103,7 +103,22 @@ test "BIP350: official invalid segwit vectors each rejected with the documented 
     }
 }
 
+test "BIP173: its own invalid segwit vectors each rejected with the derived typed error (A1 L5)" {
+    for (kat_vectors.invalid_segwit_bip173) |v| {
+        _ = segwit.decodeSegwit(v.hrp, v.address) catch |err| {
+            if (err != v.err) {
+                std.debug.print("vector {s}: expected {} got {}\n", .{ v.address, v.err, err });
+                return error.WrongErrorForVector;
+            }
+            continue;
+        };
+        std.debug.print("vector {s}: expected {} but decodeSegwit succeeded\n", .{ v.address, v.err });
+        return error.VectorUnexpectedlyDecoded;
+    }
+}
+
 test "vector counts match the official BIP173/BIP350 appendices" {
+    try testing.expectEqual(@as(usize, 10), kat_vectors.invalid_segwit_bip173.len);
     try testing.expectEqual(@as(usize, 7), kat_vectors.valid_bech32.len);
     try testing.expectEqual(@as(usize, 12), kat_vectors.invalid_bech32.len);
     try testing.expectEqual(@as(usize, 7), kat_vectors.valid_bech32m.len);

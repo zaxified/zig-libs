@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **NO CONSUMER-VISIBLE CHANGE:** audit A1 L5, round-2 decision Q5 (by the norm).
+  BIP173's own list of 10 invalid segwit addresses was left out of the corpus without a word; SPEC
+  only justified dropping BIP173's VALID list (superseded by BIP350). Now pinned as
+  `kat_vectors.invalid_segwit_bip173` and asserted address by address. Expected errors were derived
+  by an independent Python classification against the BIP's reasons; three are `InvalidVariant`
+  (v1+ with a plain-bech32 checksum, rejected by BIP350's rule before the BIP173 reason). The module
+  already rejected all 10; this adds the coverage (three more `InvalidVariant`, one more
+  `InvalidChecksum` path).
+
 - **2026-09-08** — **All three fuzz corpora were being read four octets short, so not one
   published test vector in them had ever been decoded.** A `std.testing.fuzz` corpus entry is
   not the frame: `Smith.slice` reads a little-endian `u32` length before the bytes, and all
