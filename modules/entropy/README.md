@@ -52,7 +52,8 @@ on cancellation — the draw runs with cancellation blocked
 what std itself does around its own `randomSecure` call, so a cancel aimed at
 the calling task is observed once `fill` returns instead of killing the process.
 The price is that `io` must implement `swapCancelProtection`: every real
-`std.Io` does, but `std.Io.failing` does not.
+`std.Io` does, but `std.Io.failing` does not, and `fill` aborts on it with
+`entropy.unsupported_io_message` rather than call its `unreachable` slot.
 
 ## Which one to call
 

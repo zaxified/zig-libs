@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL (aborts earlier, with its own message):** audit F1, round-2
+  decision Q8. `fill` called `swapCancelProtection` unconditionally; on `std.Io.failing`, whose
+  slot is std's `unreachableSwapCancelProtection`, that is undefined behaviour. Measured on the
+  new test before the fix: Debug panicked with std's "reached unreachable code", ReleaseFast
+  died with SIGSEGV. `fill` now compares the slot with `std.Io.unreachableSwapCancelProtection`
+  first and panics with the new `unsupported_io_message`, in every build mode. It recognises
+  that one std-defined slot, not a list of good backends, so no real `Io` changes behaviour and
+  there is no switch. No consumer in the repo hands `fill` `std.Io.failing`.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `fill`'s `error.Canceled`
   arm is a real `@panic` with its own message now, not `unreachable` (audit
   finding F3). `unreachable` was correct against a conforming `Io`, but

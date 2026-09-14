@@ -100,15 +100,15 @@
 //! source. The alternative on that same path is not "cancel promptly", it is
 //! "abort the process", which is strictly worse.
 //!
-//! One consequence worth knowing: `fill` now calls `swapCancelProtection` on
-//! the `std.Io` it is handed, so it requires an implementation that supports
-//! it. `std.Io.failing` does **not** — every cancellation slot on it is
-//! `unreachable` — so `fill(std.Io.failing, buf)` panics with "reached
-//! unreachable code" from inside std rather than with `unavailable_message`.
-//! That `Io` simulates a machine with no `Io` operations at all and a draw on
-//! it was already fatal; the loss is the diagnostic text, on a path no
-//! production consumer takes. `std.Io.Threaded`, `Evented`, `Uring` and
-//! `Dispatch` all implement the slot.
+//! One consequence worth knowing: `fill` calls `swapCancelProtection` on the
+//! `std.Io` it is handed, so it requires an implementation that supports it.
+//! `std.Io.failing` does **not** — its slot is std's
+//! `unreachableSwapCancelProtection`, and calling that is undefined behaviour:
+//! Debug panicked inside std, ReleaseFast took SIGSEGV (audit finding F1). So
+//! `fill` compares the slot against that function first and aborts with
+//! `unsupported_io_message` instead, in every build mode. Nothing a real
+//! backend does changes: `std.Io.Threaded`, `Evented`, `Uring` and `Dispatch`
+//! all implement the slot themselves.
 //!
 //! ## Why there is no `fillOrError`
 //!
@@ -183,6 +183,18 @@ pub const canceled_contract_violation_message =
     "Dispatch). NO secret was produced; this process aborted rather than trust " ++
     "a draw that ran while it should have been uncancelable.";
 
+/// The message `fill` aborts with, before touching the `Io`, when the given
+/// `std.Io`'s `swapCancelProtection` slot is std's
+/// `unreachableSwapCancelProtection` — the slot `std.Io.failing` carries.
+/// Calling that slot is undefined behaviour inside std (audit finding F1):
+/// Debug panicked with std's "reached unreachable code", ReleaseFast took
+/// SIGSEGV or ran on past it. So `fill` recognises the slot and refuses first.
+pub const unsupported_io_message =
+    "entropy.fill: the given std.Io cannot block cancellation — its " ++
+    "swapCancelProtection slot is std.Io.unreachableSwapCancelProtection, as on " ++
+    "std.Io.failing — and fill never draws a secret that a cancel could cut short. " ++
+    "NO secret was produced; this process aborted before calling that slot.";
+
 /// Fail-closed entropy for secret-bearing material. Fills `buf` from
 /// `std.Io.randomSecure`, or aborts the process.
 ///
@@ -210,8 +222,10 @@ pub const canceled_contract_violation_message =
 ///
 /// Cancellation is blocked across the draw, so a cancel aimed at the calling
 /// task is observed after `fill` returns rather than aborting the process. That
-/// means `io` must implement `swapCancelProtection`; `std.Io.failing` does not.
-/// See the module doc comment for both halves of that trade.
+/// means `io` must implement `swapCancelProtection`; on `std.Io.failing`, or
+/// any `Io` carrying its `unreachableSwapCancelProtection` slot, `fill` aborts
+/// with `unsupported_io_message`. See the module doc comment for both halves of
+/// that trade.
 pub fn fill(io: std.Io, buf: []u8) void {
     // A half-drawn secret is not a thing we can hand back, and `fill` has no
     // error channel to report a cancellation on. Blocking cancellation for the
@@ -219,6 +233,14 @@ pub fn fill(io: std.Io, buf: []u8) void {
     // (`std.Io.Threaded.randomMainThread`) and is the documented use of this
     // API. It is what makes `error.Canceled` below not expected to fire
     // against a conforming `Io`.
+    //
+    // F1: the slot must exist to be called. std's `unreachableSwapCancelProtection`
+    // (what `std.Io.failing` carries) is undefined behaviour to call — measured
+    // SIGSEGV in ReleaseFast — so it is refused by name, before the call. This
+    // is a check for that one std-defined slot, not an allowlist: every real
+    // backend implements its own.
+    if (io.vtable.swapCancelProtection == &std.Io.unreachableSwapCancelProtection)
+        @panic(unsupported_io_message);
     const prev = io.swapCancelProtection(.blocked);
     defer _ = io.swapCancelProtection(prev);
 
@@ -650,6 +672,84 @@ test "fill ABORTS with an honest message when randomSecure violates the blocked-
             .{printed},
         );
         return error.TestUnexpectedResult;
+    }
+}
+
+/// A real backend's vtable with ONLY the cancellation slot replaced by std's
+/// `unreachableSwapCancelProtection` — the slot `std.Io.failing` carries. It
+/// is not `std.Io.failing` itself, so a check that compares whole vtables
+/// instead of the slot does not recognise it.
+const NoCancelProtectionIo = struct {
+    vtable: std.Io.VTable = undefined,
+
+    fn io(self: *NoCancelProtectionIo, base: std.Io) std.Io {
+        self.vtable = base.vtable.*;
+        self.vtable.swapCancelProtection = std.Io.unreachableSwapCancelProtection;
+        return .{ .userdata = base.userdata, .vtable = &self.vtable };
+    }
+};
+
+// F1: on an `Io` whose `swapCancelProtection` slot is std's
+// `unreachableSwapCancelProtection`, `fill` used to call that slot — undefined
+// behaviour inside std. Measured before this test existed: Debug and
+// ReleaseSafe panicked with std's "reached unreachable code", ReleaseFast and
+// ReleaseSmall took SIGSEGV or ran on. `fill` now recognises the slot and
+// panics with its own message before calling it, in every build mode.
+test "fill ABORTS with its own message, before calling it, on an Io whose cancel-protection slot is unreachable (F1)" {
+    const builtin = @import("builtin");
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var copied: NoCancelProtectionIo = .{};
+    const cases = [_]std.Io{ std.Io.failing, copied.io(threaded.io()) };
+
+    for (cases) |io| {
+        var fds: [2]i32 = undefined;
+        if (std.os.linux.pipe2(&fds, .{}) != 0) return error.SkipZigTest;
+
+        const rc = std.os.linux.fork();
+        const pid: isize = @bitCast(rc);
+        if (pid < 0) return error.SkipZigTest;
+        if (pid == 0) {
+            _ = std.os.linux.close(fds[0]);
+            _ = std.os.linux.dup3(fds[1], 2, 0);
+            var buf: [32]u8 = @splat(0xa5);
+            fill(io, &buf);
+            // 71: `fill` RETURNED on an Io it cannot block cancellation on.
+            std.os.linux.exit(71);
+        }
+        _ = std.os.linux.close(fds[1]);
+
+        var msg: [4096]u8 = undefined;
+        var msg_len: usize = 0;
+        while (msg_len < msg.len) {
+            const n = std.os.linux.read(fds[0], msg[msg_len..].ptr, msg.len - msg_len);
+            const got: isize = @bitCast(n);
+            if (got <= 0) break;
+            msg_len += @intCast(got);
+        }
+        _ = std.os.linux.close(fds[0]);
+
+        var status: u32 = 0;
+        _ = std.os.linux.wait4(@intCast(pid), &status, 0, null);
+        const sig = status & 0x7f;
+        const exit_code = (status >> 8) & 0xff;
+        const printed = msg[0..msg_len];
+
+        if (sig == 0 and exit_code == 71) {
+            std.debug.print("\nfill() RETURNED on an Io without cancel protection\n", .{});
+            return error.TestUnexpectedResult;
+        }
+        if (sig != 6) {
+            std.debug.print("\nfill() died with signal {d}, not SIGABRT. It printed:\n{s}\n", .{ sig, printed });
+            return error.TestUnexpectedResult;
+        }
+        const needle = unsupported_io_message[0..@min(unsupported_io_message.len, 40)];
+        if (std.mem.indexOf(u8, printed, needle) == null) {
+            std.debug.print("\nfill() aborted, but not with `unsupported_io_message`. It printed:\n{s}\n", .{printed});
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

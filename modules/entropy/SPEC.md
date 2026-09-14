@@ -88,6 +88,14 @@ Two costs, neither hidden:
   process".
 - **`fill` now requires an `std.Io` that implements `swapCancelProtection`.**
   `std.Io.failing` does not — every cancellation slot on it is `unreachable`.
+  **Since 2026-09-14 (F1) `fill` refuses it rather than calling it:** before the
+  swap it compares the slot with `std.Io.unreachableSwapCancelProtection` and
+  aborts with `unsupported_io_message`, in every build mode. Measured before
+  the check, on the new test: Debug printed std's "reached unreachable code",
+  ReleaseFast died with SIGSEGV. It is a check for that one std-defined slot,
+  not an allowlist of backends; no switch, since no caller has a reason to
+  call a slot that is undefined behaviour to call. The note below is the
+  history.
 
   ⚠ **Corrected 2026-09-04: "panics with 'reached
   unreachable code'" is a Debug-only outcome, and the sentence that followed it
