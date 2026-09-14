@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **API addition, no behaviour change:** new `sign.ecdsaVerifyPrehashed(pubkey_sec1,
+  digest, sig_rs)` — `ecdsaVerify`'s exact arithmetic, factored out to take an
+  already-computed 32-byte digest instead of hashing a message internally.
+  `ecdsaVerify` itself is now `Sha256.hash(msg)` + a call to this. A1 G4 (perf
+  pass, round-2 decision Q4, `k256` G4 × `bitcoinscript`, both sides one
+  commit): `bitcoinscript/src/sigcheck.zig` carried a byte-for-byte copy of
+  this exact arithmetic (its own `reduceToScalar` + `ecdsaVerifyDigest`)
+  because Bitcoin's OP_CHECKSIG digest is already-hashed and calling
+  `ecdsaVerify` on it would hash a third time. It now calls
+  `k256.sign.ecdsaVerifyPrehashed` instead — a fix to the verify core (e.g.
+  a future Wycheproof-anchored `r`/`s ≥ n` guard, G3) no longer has to be
+  made in two places.
 - **2026-09-11** — **BREAKING:** `Fe`'s backing field renamed `limbs` ->
   `_limbs` (audit F8, LOW). The old name was a plain public struct member,
   so any code could construct `Fe{ .limbs = raw }` and bypass every
