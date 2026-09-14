@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BREAKING (error set widened):** `serializeBlock` returns
+  `bitcointx.SerializeError` instead of `Allocator.Error`, following `bitcointx` audit M3: a
+  hand-built `Block.txns` entry declaring `has_witness` without one witness stack per input is now
+  `error.WitnessCountMismatch` rather than a ReleaseFast SIGSEGV or a silently truncated block.
+
 - **2026-09-08** — **The two `--fuzz` aids in `fuzzDecodeBlock` and `fuzzDecodeMessage` still
   had not run once in the ordinary lane.** Both are knobs drawn AFTER the byte draw, and
   `Smith.slice` leaves the seed exhausted, so `smith.value(bool)` returned its weight minimum:

@@ -90,6 +90,7 @@ pub const deserializePartial = tx.deserializePartial;
 pub const serialize = tx.serialize;
 pub const serializeLegacy = tx.serializeLegacy;
 pub const serializeSegwit = tx.serializeSegwit;
+pub const SerializeError = tx.SerializeError;
 pub const encodeCompactSize = tx.encodeCompactSize;
 pub const decodeCompactSize = tx.decodeCompactSize;
 pub const compactSizeLen = tx.compactSizeLen;

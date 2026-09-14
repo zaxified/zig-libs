@@ -80,7 +80,9 @@ pub fn decodeBlock(allocator: Allocator, bytes: []const u8) DecodeError!Block {
     return .{ .header = header, .txns = try txns.toOwnedSlice(allocator) };
 }
 
-pub fn serializeBlock(allocator: Allocator, blk: Block) Allocator.Error![]u8 {
+/// `error.WitnessCountMismatch` when a hand-built `txns` entry declares
+/// `has_witness` without one witness stack per input (`bitcointx.serialize`).
+pub fn serializeBlock(allocator: Allocator, blk: Block) bitcointx.SerializeError![]u8 {
     var w: Writer = .{};
     defer w.deinit(allocator);
     try blk.header.encode(&w, allocator);

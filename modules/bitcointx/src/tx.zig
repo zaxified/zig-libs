@@ -145,7 +145,8 @@ pub const Witness = struct {
 ///
 /// Invariant when `has_witness == true`: `witness.len == vin.len` (one
 /// stack per input, wire-mandated by BIP144 — `deserialize` always
-/// maintains this; `serializeSegwit` asserts it). When `has_witness ==
+/// maintains this; `serializeSegwit` refuses a value that breaks it with
+/// `error.WitnessCountMismatch`). When `has_witness ==
 /// false`, `witness.len == 0`.
 pub const Transaction = struct {
     version: i32,
@@ -195,7 +196,7 @@ pub const Transaction = struct {
 
     /// `sha256d` of the full segwit serialization (BIP141: "wtxid"). For a
     /// transaction with no witness data, `wtxid == txid` per BIP141.
-    pub fn wtxid(self: Transaction, allocator: Allocator) Allocator.Error![32]u8 {
+    pub fn wtxid(self: Transaction, allocator: Allocator) SerializeError![32]u8 {
         if (!self.hasWitnessData()) return self.txid(allocator);
         const ser = try serializeSegwit(allocator, self);
         defer allocator.free(ser);
@@ -452,14 +453,22 @@ pub fn serializeLegacy(allocator: Allocator, tx: Transaction) Allocator.Error![]
     return buf.toOwnedSlice(allocator);
 }
 
+pub const SerializeError = Allocator.Error || error{
+    /// A segwit serialization needs exactly one witness stack per input, and
+    /// `tx.witness.len != tx.vin.len`. A decoded transaction always holds it;
+    /// a hand-built one (`Transaction` is public, and so is `btcp2p.Block.txns`)
+    /// may not.
+    WitnessCountMismatch,
+};
+
 /// The BIP144 segwit serialization (marker `0x00` + flag `0x01` + a
 /// witness stack per input) -- the form `Transaction.wtxid` hashes.
-/// Asserts `tx.witness.len == tx.vin.len` (see `Transaction`'s doc
-/// comment); that invariant is a caller-construction contract, not
-/// untrusted-input territory (this function serializes an already-typed
-/// `Transaction`, not raw bytes).
-pub fn serializeSegwit(allocator: Allocator, tx: Transaction) Allocator.Error![]u8 {
-    std.debug.assert(tx.witness.len == tx.vin.len);
+/// Refuses `tx.witness.len != tx.vin.len` with `error.WitnessCountMismatch`.
+/// This used to be a `std.debug.assert` (audit M3): in ReleaseFast the
+/// optimizer took the equality as given, and a mismatched hand-built value
+/// serialized silently truncated or died with SIGSEGV.
+pub fn serializeSegwit(allocator: Allocator, tx: Transaction) SerializeError![]u8 {
+    if (tx.witness.len != tx.vin.len) return error.WitnessCountMismatch;
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try appendI32LE(&buf, allocator, tx.version);
@@ -483,7 +492,7 @@ pub fn serializeSegwit(allocator: Allocator, tx: Transaction) Allocator.Error![]
 /// Dispatches to `serializeSegwit` or `serializeLegacy` per
 /// `tx.has_witness` -- the "round-trip" form matching whatever wire shape
 /// `tx` was parsed from (or is declared to represent).
-pub fn serialize(allocator: Allocator, tx: Transaction) Allocator.Error![]u8 {
+pub fn serialize(allocator: Allocator, tx: Transaction) SerializeError![]u8 {
     return if (tx.has_witness) serializeSegwit(allocator, tx) else serializeLegacy(allocator, tx);
 }
 
@@ -645,6 +654,51 @@ test "F3 regression: wtxid() honors actual witness content, not just the has_wit
     const the_txid = try tx.txid(allocator);
     const the_wtxid = try tx.wtxid(allocator);
     try testing.expectEqualSlices(u8, &the_txid, &the_wtxid);
+}
+
+// M3: the witness-count invariant used to be a `std.debug.assert`. Measured
+// in ReleaseFast before the fix: 1 input / 0 stacks through `serialize` died
+// with SIGSEGV, 1 input / 3 stacks serialized one stack and exited 0.
+test "serializeSegwit refuses a witness count that does not match the inputs (M3)" {
+    const allocator = testing.allocator;
+    var vin1 = [_]TxIn{.{
+        .prevout = .{ .txid = [_]u8{0xaa} ** 32, .vout = 0 },
+        .script_sig = &.{},
+        .sequence = 0xffffffff,
+    }};
+    var vin2 = [_]TxIn{ vin1[0], vin1[0] };
+    var vout = [_]TxOut{.{ .value = 1234567, .script_pubkey = &.{} }};
+    var item = [_][]const u8{&[_]u8{0x51}};
+    var no_stacks = [_]Witness{};
+    var one_stack = [_]Witness{.{ .items = &item }};
+    var three_stacks = [_]Witness{ .{ .items = &item }, .{ .items = &item }, .{ .items = &item } };
+    const matched: Transaction = .{
+        .version = 2,
+        .vin = &vin1,
+        .vout = &vout,
+        .witness = &one_stack,
+        .locktime = 0,
+        .has_witness = true,
+    };
+
+    // Control: one stack per input serializes and hashes.
+    const ok = try serialize(allocator, matched);
+    allocator.free(ok);
+    _ = try matched.wtxid(allocator);
+
+    var none = matched;
+    none.witness = &no_stacks;
+    try testing.expectError(error.WitnessCountMismatch, serialize(allocator, none));
+
+    var extra = matched;
+    extra.witness = &three_stacks;
+    try testing.expectError(error.WitnessCountMismatch, serialize(allocator, extra));
+    try testing.expectError(error.WitnessCountMismatch, serializeSegwit(allocator, extra));
+    try testing.expectError(error.WitnessCountMismatch, extra.wtxid(allocator));
+
+    var short = matched;
+    short.vin = &vin2;
+    try testing.expectError(error.WitnessCountMismatch, short.wtxid(allocator));
 }
 
 test "segwit tx: deserialize -> serialize is byte-exact, and txid != wtxid" {

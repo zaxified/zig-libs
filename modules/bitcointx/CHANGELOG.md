@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BREAKING (error sets widened):** audit M3, round-2 decision Q7 (API change
+  with consumers, fixed in the same batch). `serializeSegwit` asserted
+  `tx.witness.len == tx.vin.len`. In ReleaseFast the optimizer took the equality as given: a
+  hand-built transaction with 1 input and 0 witness stacks died with SIGSEGV through the public
+  `serialize`, and 1 input with 3 stacks serialized silently truncated. `Transaction` is public
+  and `btcp2p.Block.txns` hands it to `serialize`. Now `error.WitnessCountMismatch`, in every build
+  mode. `serializeSegwit`, `serialize` and `Transaction.wtxid` return the new `SerializeError`
+  (`Allocator.Error || error{WitnessCountMismatch}`), re-exported at the root. A decoded
+  transaction always holds the invariant, so nothing that went through `deserialize` changes.
+
 - **2026-09-10** — **NEW, additive:** `legacy.sighashForSigning` — same algorithm as
   `legacy.sighash`, for a SIGNER rather than a verifier: returns
   `error.SighashSingleBugNoCorrespondingOutput` instead of the SIGHASH_SINGLE bug's fixed

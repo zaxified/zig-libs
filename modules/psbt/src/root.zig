@@ -175,7 +175,8 @@ pub const Psbt = struct {
     /// module hands back (from `parse` or `combine`) is guaranteed to have
     /// this record — constructing a `Psbt` any other way and calling this
     /// is a caller-construction contract, not untrusted-input territory
-    /// (mirrors `bitcointx.serializeSegwit`'s witness-length assert).
+    /// (a missing record is `unreachable` here; `bitcointx.serializeSegwit`
+    /// refuses its analogous witness-count mismatch with a typed error).
     pub fn unsignedTx(self: Psbt, allocator: Allocator) bitcointx.tx.DeserializeError!bitcointx.Transaction {
         const r = self.global.find(global_key.UNSIGNED_TX) orelse unreachable;
         return bitcointx.deserialize(allocator, r.value);
