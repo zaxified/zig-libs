@@ -366,3 +366,24 @@ test "teeth: decrypted assertion with signature Reference repointed to a decoy -
     cfg.sp_decrypt_key = kp.secret_key;
     try testing.expectError(error.SignatureInvalid, saml.consumeResponseXml(alloc, enc_resp, cfg));
 }
+
+test "M20 teeth: decrypted EncryptedAssertion plaintext that is not an Assertion -> NoAssertion" {
+    // Same type-confusion shape as M19, one level up: the ciphertext decrypts
+    // cleanly (RSA-OAEP unwrap + AES-GCM tag both check out -- nothing here
+    // exercises `AssertionDecryptionFailed`) but the recovered ROOT is not
+    // `<saml:Assertion>`. The guard is `processEncryptedAssertion`'s
+    // `if (!isEl(asrt, saml_ns, "Assertion")) return error.NoAssertion;`
+    // right after the plaintext is re-parsed -- untested before this, same as
+    // M19's sibling check on the EncryptedID path.
+    const alloc = testing.allocator;
+    const kp = try makeSpKey(0x5A11_E0DE);
+    const not_an_assertion = "<saml:Issuer xmlns:saml=\"" ++ saml_ns ++ "\">https://evil.example.org/saml</saml:Issuer>";
+    const enc_xml = try encryptedAssertionXml(alloc, kp.public_key, not_an_assertion);
+    defer alloc.free(enc_xml);
+    const enc_resp = try responseWithEncrypted(alloc, enc_xml);
+    defer alloc.free(enc_resp);
+
+    var cfg = baseConfig(fx.t_valid);
+    cfg.sp_decrypt_key = kp.secret_key;
+    try testing.expectError(error.NoAssertion, saml.consumeResponseXml(alloc, enc_resp, cfg));
+}

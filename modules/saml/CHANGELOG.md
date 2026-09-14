@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — A1 fix campaign, F9 (audit `A1/saml.md`). **Test-only, no
+  behavioural change**: the five remaining untested live guards out of F9's
+  eleven all got regression tests — M02 (`signedTargetMatches` refuses zero
+  or multiple `<ds:Reference>`s), M19/M20 (a decrypted `<saml:EncryptedID>`/
+  `<saml:EncryptedAssertion>` whose plaintext is well-formed XML but the
+  wrong element type), M28 (a structurally valid but cryptographically
+  invalid Response-level signature), M31 (the Response-level XSW pin refuses
+  an `<saml:EncryptedAssertion>` that is not a direct child of the signed
+  Response). M02 and M31 are exercised as direct unit tests of
+  `signedTargetMatches`/`verifyCoveringDecrypted` rather than end-to-end
+  documents: `sigOptsFor`'s `max_references = 1` (F11, closed 2026-09-06)
+  already stops a real multi-reference document from reaching
+  `signedTargetMatches` with more than one reference, and the module's one
+  `EncryptedAssertion` caller always passes a genuinely-direct child, so
+  neither mismatch arises through today's single call graph — both guards
+  are exercised on their own stated contract instead, which a future
+  refactor could still violate. F9 closed: 11 of 11 live guards now carry a
+  regression test.
 - **2026-09-11** — A1 fix campaign round 2 (`QUESTIONS-ROUND-2.md` Q1/Q5,
   audit `A1/saml.md`). BEHAVIOURAL:
   - **F13 (MED)**: a `<saml:Condition>` extension element under
