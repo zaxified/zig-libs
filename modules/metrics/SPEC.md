@@ -13,8 +13,11 @@ semantics + the Prometheus text exposition format 0.0.4 — see NOTICE. Thread-s
 are single atomics (`.monotonic`, no cross-instrument ordering needed); registration lookups
 (name→family via a hash index, O(1) regardless of registry size) and `Histogram.observe` take a
 documented spinlock (`std.atomic.Mutex` + `spinLoopHint`) with string-compare-sized critical
-sections; `writeText` holds the lock for the whole scrape, so a large registry or concurrent
-scrapers make that lock hot (no cache — see the module's audit, F2, open).
+sections; `writeText` holds the lock only to snapshot the family/children pointers
+(O(number of families)) and formats from that snapshot with the lock released, so
+formatting a large registry no longer blocks concurrent registrations or other
+scrapers (no cache, so the O(series) formatting cost itself is still paid on every
+scrape — see the module's audit, F2, fixed 2026-09-15).
 `RequestMetrics` middleware (request counter by method+status-class, latency histogram, in-flight
 gauge, optional `on_request` access-log hook) wraps `next` so 404/405/429/503 short-circuits are
 measured; series-creation OOM skips recording but never fails the request. Exposition deviations

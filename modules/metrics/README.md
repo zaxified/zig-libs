@@ -24,9 +24,13 @@ no source copied.
   not a linear scan) and `Histogram.observe` take a documented spinlock
   (`std.atomic.Mutex` + `spinLoopHint`, the std SmpAllocator pattern — Zig
   0.16 std has no io-less blocking mutex) with string-compare-sized critical
-  sections. `writeText` holds the registry lock for the whole scrape, so a
-  large registry or concurrent scrapers make that lock hot (see the
-  module's audit, F2) — this is not amortized by a cache. The middleware's
+  sections. `writeText` holds the registry lock only long enough to
+  snapshot the family/children pointers (O(number of families)), then
+  formats from that snapshot with the lock released, so a large registry's
+  formatting cost is not paid while blocking concurrent registrations or
+  other scrapers (module's audit F2, fixed 2026-09-15) — this is not
+  amortized by a cache, so the O(series) formatting work itself is still
+  paid on every scrape. The middleware's
   **default** (`.status = .class`) steady-state hot path is lock-free
   (atomic per-method/class caches); `.status = .code` always takes the
   (now O(1), previously linear-in-registry-size) locked registry lookup —
