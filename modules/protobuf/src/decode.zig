@@ -32,6 +32,11 @@ const Kind = schema.Kind;
 const Unknown = schema.Unknown;
 const Cursor = wire.Cursor;
 
+/// Default `Options.max_arena_bytes`. Generous relative to any realistic
+/// single decode — see the doc comment on the field for why a finite
+/// default exists at all.
+pub const default_max_arena_bytes: usize = 64 * 1024 * 1024;
+
 pub const Options = struct {
     /// Maximum embedded-message nesting. The input controls the depth, so
     /// this is a hard cap, not a hint. protoc's own limit is 100.
@@ -49,6 +54,20 @@ pub const Options = struct {
     /// it (or dropping it, if the message declares no `Unknown` sink).
     /// For a strict receiver that must not forward what it cannot check.
     reject_unknown_fields: bool = false,
+    /// Hard cap on total bytes the decode arena may grow to. Declared
+    /// lengths and nesting depth are both bounded (see the module threat
+    /// model), but neither bounds *memory*: a singular/optional message
+    /// field that appears many times at many levels of nesting is merged
+    /// by concatenation (`MergeBuf`), and that concatenation compounds with
+    /// depth. Wave-3 audit finding `protobuf` F1 measured a legal message
+    /// that is 3.68 MiB on the wire (well inside gRPC's own 4 MiB default
+    /// `max_recv_message_size`) driving the arena to 501.4 MiB — a 136×
+    /// amplification, scaling with `max_depth`. This cap makes that
+    /// unprofitable regardless of shape: once the arena has granted this
+    /// many bytes, further allocation fails with `error.OutOfMemory`, the
+    /// same outcome a real allocator exhaustion produces. Set higher (or
+    /// `maxInt(usize)`) for a caller that has its own accounting instead.
+    max_arena_bytes: usize = default_max_arena_bytes,
 };
 
 pub const Error = wire.Error || error{
@@ -91,10 +110,69 @@ pub fn decode(
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
 
+    var capped: CappedAllocator = .{ .child = arena.allocator(), .remaining = options.max_arena_bytes };
     var cur = Cursor.init(input);
-    const value = try decodeMessage(T, arena.allocator(), &cur, options, 0);
+    const value = try decodeMessage(T, capped.allocator(), &cur, options, 0);
     return .{ .value = value, .arena = arena };
 }
+
+/// An allocator that grants at most `remaining` bytes over its lifetime,
+/// then fails every further request the way any exhausted allocator does
+/// (`null` from the vtable, surfacing as `error.OutOfMemory` to callers).
+/// Backs `Options.max_arena_bytes` (see F1 in the module's audit history).
+///
+/// It counts total bytes ever granted, not live-minus-freed bytes. That is
+/// deliberately the *stronger* of the two bounds: `decode` never frees
+/// anything before `Decoded.deinit` tears down the whole arena, so "total
+/// granted" already tracks peak live closely, and counting grants also caps
+/// the amplifying churn itself (e.g. `MergeBuf`'s `ArrayList` regrowing and
+/// abandoning its old buffer in the arena) rather than only its residue.
+const CappedAllocator = struct {
+    child: std.mem.Allocator,
+    remaining: usize,
+
+    fn allocator(self: *CappedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    /// Deduct `n` bytes from the remaining budget, or refuse if that would
+    /// go negative.
+    fn take(self: *CappedAllocator, n: usize) bool {
+        if (n > self.remaining) return false;
+        self.remaining -= n;
+        return true;
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.take(len)) return null;
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.take(new_len - memory.len)) return false;
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !self.take(new_len - memory.len)) return null;
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CappedAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
 
 // ── the per-message loop ────────────────────────────────────────────────────
 

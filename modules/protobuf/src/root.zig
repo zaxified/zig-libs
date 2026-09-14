@@ -93,6 +93,7 @@ pub const encodeAlloc = encode_mod.encodeAlloc;
 // ── decode ──────────────────────────────────────────────────────────────────
 
 pub const DecodeOptions = decode_mod.Options;
+pub const default_max_arena_bytes = decode_mod.default_max_arena_bytes;
 pub const DecodeError = decode_mod.Error;
 pub const Decoded = decode_mod.Decoded;
 /// Decode `input` as message `T`; the result owns an arena, freed by

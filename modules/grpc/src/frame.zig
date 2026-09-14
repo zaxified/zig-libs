@@ -47,6 +47,20 @@ pub const header_len = 5;
 /// gRPC's own default receive limit, and therefore ours: 4 MiB.
 pub const default_max_recv_message_size: u32 = 4 * 1024 * 1024;
 
+/// Default `protobuf.DecodeOptions.max_arena_bytes` for a message received
+/// on this transport. `max_recv_message_size` bounds the *wire* bytes a
+/// frame may claim; it says nothing about how large `protobuf.decode` may
+/// grow while turning those bytes into a value — wave-3 audit finding
+/// `protobuf` F1 measured a legal message, 3.68 MiB on the wire (well under
+/// the 4 MiB default above), driving the decode arena to 501.4 MiB: a 136×
+/// amplification from a singular/optional message field merged by
+/// concatenation at every level of nesting (see `protobuf`'s SPEC.md,
+/// Threat model §5). Multiplying the wire limit by 8 here closes that gap
+/// early — a message shaped like F1's would exceed this cap at a small
+/// fraction of `max_recv_message_size` on the wire — while leaving headroom
+/// no realistic (non-adversarial) message needs.
+pub const default_decode_arena_bytes: usize = @as(usize, default_max_recv_message_size) * 8;
+
 pub const Error = error{
     /// A declared message length exceeds `max_recv_message_size`. Surfaced
     /// to callers as the gRPC status `RESOURCE_EXHAUSTED`, which is what

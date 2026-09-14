@@ -88,7 +88,7 @@ spread (up to 6 % between runs).
 
 ## Threat model
 
-Everything the decoder touches came from someone else. Two bounds are load-bearing.
+Everything the decoder touches came from someone else. Three bounds are load-bearing.
 
 ### 1. A declared length is not evidence
 
@@ -164,6 +164,38 @@ promises text. `bytes` is deliberately untouched — that is the kind for arbitr
 reference accepts `0xff` there. **Asymmetry to know about:** the *encoder* does not validate, so a
 caller who puts invalid UTF-8 into a `.string` field of a value it encodes will emit bytes the
 reference rejects. The check is on the untrusted side, which is the side the threat model is about.
+
+### 5. Declared length and nesting depth do not bound memory
+
+Bullets 1 and 2 above stop a hostile *length* and a hostile *depth*. Neither stops a hostile
+*shape*: rule 3's merge semantics require every occurrence of a singular/optional message field to
+be concatenated before decoding (`decode.zig`'s `MergeBuf`), and that concatenation happens again at
+every level a submessage is nested. A message with `k` parallel occurrences of the same field at
+each of `d` levels needs wire bytes proportional to `k + d` but arena bytes proportional to `k * d`
+— wave-3 audit finding `protobuf` F1 measured a *legal* 3.68 MiB message (comfortably under gRPC's
+own 4 MiB default `max_recv_message_size`) driving the decode arena to 501.4 MiB, **136×**, and the
+ratio scales with `max_depth`.
+
+`DecodeOptions.max_arena_bytes` (default `default_max_arena_bytes`, 64 MiB) closes this the same way
+`max_depth` closes rule 2: a hard total on bytes the decode arena may be granted, checked on every
+allocation through a wrapping `CappedAllocator` (not just in `MergeBuf`, so it also covers the
+smaller, non-merge amplification the audit measured — packed scalars and empty repeated
+submessages/strings widening 20–55× just from Zig's in-memory representation being wider than the
+wire form). Exceeding it surfaces as `error.OutOfMemory`, indistinguishable from a real allocator
+exhaustion — deliberately: a caller that already handles OOM handles this. `grpc`, the one in-repo
+consumer, does not leave this at the bare default: both `Stream.receive` (client) and
+`Methods(..).Stream.receive` (server) set `.max_arena_bytes = frame.default_decode_arena_bytes` (8×
+`max_recv_message_size`), so the memory bound tracks the wire bound it already advertises rather than
+existing as a separate number an operator has to think about.
+
+Honesty about precision: the cap bounds bytes *requested from the arena*, not the arena's own
+backing allocation, which grows in geometrically-sized chunks and can therefore ask its parent
+allocator for somewhat more than the logical total once a chunk boundary is crossed mid-request —
+measured at roughly 1.5–1.6× in the reproduction above (a 64 MiB logical cap stopped an unbounded
+attack at ~101 MiB of real backing memory, not exactly 64 MiB). That overhead is itself bounded (an
+arena's growth strategy cannot compound the way unmerged nesting depth did before this fix), so the
+result is still O(cap), not O(input) — the property that matters is that a small wire message can no
+longer trade a small amount of attacker effort for an unbounded amount of memory.
 
 ### Smaller hardening
 
