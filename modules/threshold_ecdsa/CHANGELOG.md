@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **NO CONSUMER-VISIBLE CHANGE:** `paillier.PublicKey.fromBytes` and
+  `SecretKey.fromBytes` now refuse an `n` below 512 bits (paillier audit F8). `PartyPublicKeys` and
+  the keygen-output loader inherit that refusal for a toy key on the wire. The audit F3 (a) test
+  built its 8-bit key through `fromBytes`; it now takes it from `fromPrimes` and swaps `Γ` in by
+  hand. Nothing else here loads a key that small.
+
 - **2026-09-14** — **BREAKING (signature):** audit F10, round-2 decision Q7. `aux_proofs.verifyWellFormed`
   verified Πprm and Πmod only and left `AuxParams.validate` — the structural floor, including
   `Ñ > q⁷` — to the caller by doc comment, although it is the function that makes a received tuple

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-14** — **BEHAVIOURAL (refuses more):** audit F8, user decision (floor on the byte
+  loaders only). `PublicKey.fromBytes` accepted any odd `n` that fit `modulus_bytes` — a prime
+  `n = 3`, a 4-bit `n = 15`. It and `SecretKey.fromBytes` now refuse an `n` shorter than the new
+  `pub const min_modulus_bits = 512` (`rsa`'s `PublicKey.fromBytes` floor; leading zero octets do
+  not count), with `error.InvalidPublicKey`/`error.InvalidPrivateKey`. `fromPrimes` keeps no floor
+  (its factors are now checked, and the 11 × 17 KAT stays); `generate` is unchanged. The tests that
+  load the toy key through the byte loaders use the floor-free internal parser. Consumers:
+  `threshold_ecdsa` loads keys of `min_generate_bits` or more; one of its tests built a toy key
+  through `fromBytes` and now uses `fromPrimes`.
+
 - **2026-09-14** — **BEHAVIOURAL (refuses more):** audit F7 `m7`/`m8`, round-2 decision Q1/Q2-B
   (tighten, consumers checked in the same batch). `fromPrimes` trusted its factors. Its structural
   self-check accepted 24 of 32 base-2 strong-pseudoprime pairings (a `2047 × 17` key decrypts 2 of

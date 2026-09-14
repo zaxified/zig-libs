@@ -97,7 +97,5 @@ all — see SPEC.md).
 
 ## Backlog
 
-- Minimum-key-size floor on `PublicKey.fromBytes`/`SecretKey.fromBytes`
-  (see SPEC.md "Backlog / deferred").
 - Phase 2 (separate later module): the GG20/CMP zero-knowledge proofs and
   MtA protocol layered on top of this core PKE.

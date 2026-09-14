@@ -2631,10 +2631,13 @@ test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the check
 test "audit F3 (a): the FS challenge binds the Paillier generator Γ, not just N" {
     // One n, three public keys: the standard Γ = n+1 = 188, the SAME Γ
     // supplied explicitly (control — must hash identically), and Γ = 4.
-    const n_bytes = [_]u8{187};
-    const pk_std = paillier.PublicKey.fromBytes(&n_bytes, null) catch unreachable;
-    const pk_same = paillier.PublicKey.fromBytes(&n_bytes, &[_]u8{188}) catch unreachable;
-    const pk_alt = paillier.PublicKey.fromBytes(&n_bytes, &[_]u8{4}) catch unreachable;
+    // `PublicKey.fromBytes` refuses an n below `paillier.min_modulus_bits`, so
+    // the toy key comes from `fromPrimes` and Γ is swapped in by hand.
+    const pk_std = (paillier.fromPrimes(&[_]u8{11}, &[_]u8{17}) catch unreachable).public;
+    var pk_same = pk_std;
+    pk_same.g = paillier.Fe.fromBytes(pk_std.n_sq, &[_]u8{188}, .big) catch unreachable;
+    var pk_alt = pk_std;
+    pk_alt.g = paillier.Fe.fromBytes(pk_std.n_sq, &[_]u8{4}, .big) catch unreachable;
 
     const aux = auxFromBytes(187, 4, 16);
     // One fixed ciphertext/commitment set, reused verbatim across all three

@@ -487,6 +487,16 @@ fn standardGenerator(n_bytes: []const u8, n_sq: Modulus) !Fe {
 
 // ── PublicKey ─────────────────────────────────────────────────────────────
 
+/// Smallest `n` `PublicKey.fromBytes`/`SecretKey.fromBytes` accept, in bits —
+/// the same floor as `rsa`'s `PublicKey.fromBytes` and this module's own
+/// `min_generate_bits`. A loaded key is untrusted input; `fromPrimes` has no
+/// floor, because its caller chose the factors (the KATs use 11 × 17).
+pub const min_modulus_bits = 512;
+
+/// Whether a byte loader applies `min_modulus_bits`. Only the tests in this
+/// file pass `.unchecked`, to parse the hand-verified 8-bit KAT key.
+const ModulusFloor = enum { enforced, unchecked };
+
 /// Paillier public key: `n` (the RSA-like composite modulus), `n_sq` (= n²,
 /// precomputed since every ciphertext operation needs it), and `g` (the
 /// generator; the standard variant `g = n+1` unless the key was built with an
@@ -507,15 +517,17 @@ pub const PublicKey = struct {
     /// never trusted from an external source. If `g_bytes` is `null`, the
     /// standard variant `g = n+1` is used. This is pure parsing/derivation of
     /// an *already-chosen* `n` — it does NOT generate or validate that `n` is
-    /// a product of two primes (that is `generate`/`fromPrimes`'s job).
+    /// a product of two primes (that is `generate`/`fromPrimes`'s job). An `n`
+    /// shorter than `min_modulus_bits` is refused.
     pub fn fromBytes(n_bytes: []const u8, g_bytes: ?[]const u8) FromBytesError!PublicKey {
-        return fromBytesImpl(n_bytes, g_bytes) catch error.InvalidPublicKey;
+        return fromBytesImpl(n_bytes, g_bytes, .enforced) catch error.InvalidPublicKey;
     }
 
-    fn fromBytesImpl(n_bytes_in: []const u8, g_bytes: ?[]const u8) !PublicKey {
+    fn fromBytesImpl(n_bytes_in: []const u8, g_bytes: ?[]const u8, comptime floor: ModulusFloor) !PublicKey {
         const n_bytes = stripLeadingZeros(n_bytes_in);
         if (n_bytes.len == 0 or n_bytes.len > modulus_bytes) return error.InvalidPublicKey;
         const n = Modulus.fromBytes(n_bytes, .big) catch return error.InvalidPublicKey;
+        if (floor == .enforced and n.bits() < min_modulus_bits) return error.InvalidPublicKey;
 
         const n_sq = squareModulus(n_bytes) catch return error.InvalidPublicKey;
 
@@ -621,15 +633,16 @@ pub const SecretKey = struct {
     /// loading one from storage). This does NOT derive `lambda`/`mu` from
     /// primes — that is `fromPrimes`'s job; this is pure mechanical parsing
     /// plus the same mechanical `n_sq = n*n` re-derivation
-    /// `PublicKey.fromBytes` does.
+    /// `PublicKey.fromBytes` does, and the same `min_modulus_bits` floor.
     pub fn fromBytes(n_bytes: []const u8, lambda_bytes: []const u8, mu_bytes: []const u8) FromBytesError!SecretKey {
-        return fromBytesImpl(n_bytes, lambda_bytes, mu_bytes) catch error.InvalidPrivateKey;
+        return fromBytesImpl(n_bytes, lambda_bytes, mu_bytes, .enforced) catch error.InvalidPrivateKey;
     }
 
-    fn fromBytesImpl(n_bytes_in: []const u8, lambda_bytes_in: []const u8, mu_bytes_in: []const u8) !SecretKey {
+    fn fromBytesImpl(n_bytes_in: []const u8, lambda_bytes_in: []const u8, mu_bytes_in: []const u8, comptime floor: ModulusFloor) !SecretKey {
         const n_bytes = stripLeadingZeros(n_bytes_in);
         if (n_bytes.len == 0 or n_bytes.len > modulus_bytes) return error.InvalidPrivateKey;
         const n = Modulus.fromBytes(n_bytes, .big) catch return error.InvalidPrivateKey;
+        if (floor == .enforced and n.bits() < min_modulus_bits) return error.InvalidPrivateKey;
         const n_sq = squareModulus(n_bytes) catch return error.InvalidPrivateKey;
 
         const lambda_bytes = stripLeadingZeros(lambda_bytes_in);
@@ -1606,7 +1619,8 @@ const testing = std.testing;
 // (python-paillier) 1.5.0's `PaillierPublicKey`/`PaillierPrivateKey`
 // (`raw_encrypt`/`raw_decrypt` with an explicit `r_value`, same `g = n+1`
 // standard variant) — see NOTICE for the recomputation this was checked
-// against.
+// against. The public byte loaders refuse it (`min_modulus_bits`), so the
+// tests load it through `fromBytesImpl(…, .unchecked)`.
 const kat_p = [_]u8{11};
 const kat_q = [_]u8{17};
 const kat_n = [_]u8{187};
@@ -1615,7 +1629,7 @@ const kat_g = [_]u8{188};
 const kat_mu = [_]u8{180};
 
 test "PublicKey.fromBytes derives n_sq and the standard generator g=n+1" {
-    const pk = try PublicKey.fromBytes(&kat_n, null);
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
     try testing.expectEqual(@as(u32, 187), try pk.n.v.toPrimitive(u32));
     try testing.expectEqual(@as(u32, 34969), try pk.n_sq.v.toPrimitive(u32));
     try testing.expectEqual(@as(u32, 188), try pk.g.toPrimitive(u32));
@@ -1633,12 +1647,12 @@ test "PublicKey.fromBytes accepts an explicit g" {
     // g need not be n+1 in general (a caller-supplied generator is
     // permitted by the API even though this module only ever *derives*
     // the standard variant); use g=2 here just to exercise the branch.
-    const pk = try PublicKey.fromBytes(&kat_n, &[_]u8{2});
+    const pk = try PublicKey.fromBytesImpl(&kat_n, &[_]u8{2}, .unchecked);
     try testing.expectEqual(@as(u32, 2), try pk.g.toPrimitive(u32));
 }
 
 test "SecretKey.fromBytes round-trips n/lambda/mu" {
-    const sk = try SecretKey.fromBytes(&kat_n, &kat_lambda, &kat_mu);
+    const sk = try SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &kat_mu, .unchecked);
     try testing.expectEqual(@as(u32, 187), try sk.n.v.toPrimitive(u32));
     try testing.expectEqual(@as(u32, 34969), try sk.n_sq.v.toPrimitive(u32));
     try testing.expectEqual(@as(u32, 80), try sk.lambda.toPrimitive(u32));
@@ -1654,7 +1668,7 @@ test "SecretKey.fromBytes round-trips n/lambda/mu" {
 }
 
 test "SecretKey.deinit zeroes lambda/mu (no-crt key, e.g. loaded via fromBytes)" {
-    var sk = try SecretKey.fromBytes(&kat_n, &kat_lambda, &kat_mu);
+    var sk = try SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &kat_mu, .unchecked);
     try testing.expect(sk.crt == null);
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&sk.lambda), 0)); // present before wipe
     try testing.expect(!std.mem.allEqual(u8, std.mem.asBytes(&sk.mu), 0));
@@ -1685,7 +1699,7 @@ test "SecretKey.deinit zeroes lambda/mu/crt (fromPrimes key, factorization-beari
 }
 
 test "Ciphertext bytes round-trip" {
-    const pk = try PublicKey.fromBytes(&kat_n, null);
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
     // c=28686 = E(0, r=3) under this key (see the round-trip test below
     // for the full vector table + phe cross-check).
     const c_bytes = [_]u8{ 0x70, 0x0e }; // 28686
@@ -1706,8 +1720,35 @@ test "n_sq derivation matches a from-scratch big.int square (sanity, no phe need
     while (i < 2) : (i += 1) acc *= n;
     _ = &n;
     try testing.expectEqual(@as(u64, 34969), acc);
-    const pk = try PublicKey.fromBytes(&kat_n, null);
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
     try testing.expectEqual(acc, try pk.n_sq.v.toPrimitive(u64));
+}
+
+test "fromBytes refuses an n below min_modulus_bits; the floor-free parser is the control (F8)" {
+    // 2^511 + 1: 512 bits, the narrowest n accepted.
+    var at_floor = [_]u8{0} ** 64;
+    at_floor[0] = 0x80;
+    at_floor[63] = 0x01;
+    // 2^511 - 1: 511 bits.
+    var below_floor = [_]u8{0xff} ** 64;
+    below_floor[0] = 0x7f;
+    // The same 511-bit n behind leading zero octets: the floor counts bits, not bytes.
+    var below_padded = [_]u8{0} ** 72;
+    @memcpy(below_padded[8..], &below_floor);
+    const one = [_]u8{1};
+
+    try testing.expectEqual(@as(usize, 512), (try PublicKey.fromBytes(&at_floor, null)).n.bits());
+    try testing.expectEqual(@as(usize, 512), (try SecretKey.fromBytes(&at_floor, &one, &one)).n.bits());
+
+    // Below the floor, then the toy KAT modulus, a prime n and a 4-bit n.
+    for ([_][]const u8{ &below_floor, &below_padded, &kat_n, &[_]u8{3}, &[_]u8{15} }) |n| {
+        try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(n, null));
+        try testing.expectError(error.InvalidPublicKey, PublicKey.fromBytes(n, &[_]u8{2}));
+        try testing.expectError(error.InvalidPrivateKey, SecretKey.fromBytes(n, &one, &one));
+        // The same bytes parse without the floor, so the floor is what refused them.
+        _ = try PublicKey.fromBytesImpl(n, null, .unchecked);
+        _ = try SecretKey.fromBytesImpl(n, &one, &one, .unchecked);
+    }
 }
 
 // ── crypto-core tests ─────────────────────────────────────────────────────
@@ -2162,8 +2203,8 @@ test "decrypt via non-CRT fallback (fromBytes key, no factors) matches phe vecto
     // single-modulus `c^λ mod n²` montint path instead of CRT. The same phe-
     // cross-checked toy vectors as the CRT round-trip above must still decrypt,
     // anchoring the non-CRT montint modexp externally.
-    const pk = try PublicKey.fromBytes(&kat_n, null);
-    const sk = try SecretKey.fromBytes(&kat_n, &kat_lambda, &kat_mu);
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
+    const sk = try SecretKey.fromBytesImpl(&kat_n, &kat_lambda, &kat_mu, .unchecked);
     try testing.expect(sk.crt == null); // fallback path is what's under test
     const Vector = struct { m: u32, r: u32 };
     const vectors = [_]Vector{ .{ .m = 0, .r = 3 }, .{ .m = 1, .r = 5 }, .{ .m = 42, .r = 7 }, .{ .m = 186, .r = 13 } };
@@ -2519,9 +2560,9 @@ const Corpus = struct {
         self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ padded, "" });
         p += 1; // stripLeadingZeros
         self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &kat_n, "" });
-        p += 1; // the toy KAT modulus
+        p += 1; // the toy KAT modulus, refused by `min_modulus_bits`
         self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &kat_n, &kat_g });
-        p += 1; // toy, explicit g
+        p += 1; // toy, explicit g, refused by the floor before g is read
         self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ real_n, &self.ff });
         p += 1; // g far above n², refused
         self.pub_entries[p] = seedFields(&self.pub_store[p], &.{ &[_]u8{0} ** 8, "" });
@@ -2547,7 +2588,7 @@ const Corpus = struct {
         self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ padded, &self.lambda, &self.mu });
         s += 1; // stripLeadingZeros on n
         self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ &kat_n, &kat_lambda, &kat_mu });
-        s += 1; // the toy KAT triple
+        s += 1; // the toy KAT triple, refused by `min_modulus_bits`
         self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ real_n, &self.lambda, &self.ff });
         s += 1; // mu far above n, non-canonical
         self.sec_entries[s] = seedFields(&self.sec_store[s], &.{ real_n, &self.ff, &self.mu });
@@ -2642,8 +2683,8 @@ test "corpus: the PublicKey seeds reach the parser, and the counts are pinned" {
         if (g_bytes != null) explicit_g += 1;
     }
     try testing.expectEqual(corpus.public_seeds().len - 1, nonempty);
-    try testing.expectEqual(@as(usize, 10), accepted);
-    try testing.expectEqual(@as(usize, 2), explicit_g);
+    try testing.expectEqual(@as(usize, 8), accepted);
+    try testing.expectEqual(@as(usize, 1), explicit_g);
 }
 
 test "fuzz: SecretKey.fromBytes never panics on arbitrary bytes" {
@@ -2697,8 +2738,8 @@ test "corpus: the SecretKey seeds reach the parser, and the counts are pinned" {
     // Two seeds carry an empty `n`: the one that is empty only in `n`, and the
     // all-empty seed this target used to run for ever.
     try testing.expectEqual(corpus.secret_seeds().len - 2, nonempty);
-    try testing.expectEqual(@as(usize, 6), accepted);
-    try testing.expectEqual(@as(usize, 4), n_widths);
+    try testing.expectEqual(@as(usize, 5), accepted);
+    try testing.expectEqual(@as(usize, 3), n_widths);
 }
 
 test "fuzz: Ciphertext.fromBytes never panics on arbitrary bytes" {
@@ -2711,7 +2752,7 @@ fn fuzzCiphertextFromBytes(_: void, smith: *std.testing.Smith) !void {
     // A real (small, toy) key so `pk.n_sq` is a valid modulus context --
     // the point here is fuzzing the ciphertext bytes, not the key parse
     // (already covered by `fuzzPublicKeyFromBytes` above).
-    const pk = PublicKey.fromBytes(&kat_n, null) catch unreachable;
+    const pk = PublicKey.fromBytesImpl(&kat_n, null, .unchecked) catch unreachable;
 
     var buf: [modulus_sq_bytes + 16]u8 = undefined;
     const bytes = fuzzedFieldBytes(smith, &buf);
@@ -2725,7 +2766,7 @@ test "corpus: the Ciphertext seeds reach the parser, and the counts are pinned" 
     // cannot produce.
     var corpus: Corpus = .{};
     try corpus.build();
-    const pk = try PublicKey.fromBytes(&kat_n, null);
+    const pk = try PublicKey.fromBytesImpl(&kat_n, null, .unchecked);
     var nonempty: usize = 0;
     var accepted: usize = 0;
     var nonzero: usize = 0;
@@ -2775,7 +2816,8 @@ fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
     try testing.expect(kp.secret.crt != null);
 
     // An independent decrypt path to the SAME n/λ/µ: round-tripped through
-    // `fromBytes` (which never sets `crt`), not a hand-copied struct. Full-
+    // the byte parser (which never sets `crt`; `.unchecked`, because the toy
+    // key is below `min_modulus_bits`), not a hand-copied struct. Full-
     // width buffers passed straight through, same shape as "CRT and non-CRT
     // decrypt agree at a real 512-bit key size" above (NOT a `[0..n_len]`
     // slice taken AFTER a full-width `toBytes` call -- that reads the
@@ -2787,7 +2829,7 @@ fn fuzzDecryptPathsAgree(_: void, smith: *std.testing.Smith) !void {
     kp.secret.nToBytes(&n_b) catch unreachable;
     kp.secret.lambdaToBytes(&lam_b) catch unreachable;
     kp.secret.muToBytes(&mu_b) catch unreachable;
-    const sk_noncrt = SecretKey.fromBytes(&n_b, &lam_b, &mu_b) catch unreachable;
+    const sk_noncrt = SecretKey.fromBytesImpl(&n_b, &lam_b, &mu_b, .unchecked) catch unreachable;
     std.debug.assert(sk_noncrt.crt == null);
 
     var buf: [modulus_sq_bytes + 16]u8 = undefined;

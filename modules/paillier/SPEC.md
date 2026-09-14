@@ -34,9 +34,11 @@ module is designed and sized for — comparable to this repo's `rsa` module's de
 key size. `max_bits = 4096` is the ceiling the fixed-width `Uint`/`Modulus`/`Fe` types
 (`std.crypto.ff.Uint(max_bits)` etc.) are sized to, since every `n²`-modulus value needs
 double `n`'s width. `generate`/`fromPrimes` are not hard-capped to exactly 2048 bits (they
-accept any `p`,`q` whose product fits `max_bits`, e.g. much smaller ones for KATs) — no
-minimum-key-size floor is enforced yet (unlike `rsa`'s 512-bit floor on `PublicKey.fromBytes`);
-see "Backlog" below.
+accept any `p`,`q` whose product fits `max_bits`, e.g. much smaller ones for KATs).
+`PublicKey.fromBytes`/`SecretKey.fromBytes` refuse an `n` shorter than
+`min_modulus_bits = 512` (the same floor as `rsa`'s `PublicKey.fromBytes`): a loaded key is
+untrusted input. `fromPrimes` has no floor — its caller chose the factors, and it checks them
+(primality, FIPS 186-5 closeness) — and `generate` enforces `min_generate_bits = 512`.
 
 **The `std.crypto.ff` Fe-widening trap (the single most important integration note for the
 implementer).** `Modulus.shrink` — which every `Fe` construction/Montgomery conversion calls
@@ -217,9 +219,6 @@ The correctness anchors, in order of strength:
 
 ## Backlog / deferred
 
-- No minimum-key-size floor is enforced on `PublicKey.fromBytes`/`SecretKey.fromBytes`
-  (unlike `rsa`'s 512-bit floor; `generate` does enforce `min_generate_bits = 512`) —
-  consider adding one before any production use.
 - Constant-time exact division for `decrypt`'s L-function (see the timing caveat above) —
   only if a consumer's threat model ever needs it.
 - Phase 2 (separate later module, depends on this one): proof of correct encryption, range
