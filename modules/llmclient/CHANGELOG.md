@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `create` and `EventIterator.next` body-read cancel tests canceled after a fixed
+  sleep. Both now cancel once the client is inside the socket read under test (`ReadCueIo`, a
+  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
+  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
+  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking — the remaining 16 A1 findings (F6-F8,
   F11-F14, F16-F24), all closed.** A stream event whose `event:` name disagrees with its
   JSON `"type"` is now `error.MalformedResponse` (F6) instead of silently dispatching on
