@@ -329,7 +329,13 @@ pub fn deriveKeyPair(comptime mode: Mode, seed: [32]u8, info: []const u8) Derive
         const counter_byte = [1]u8{@intCast(counter)};
         const sk = hashToScalarDst(&.{ &seed, &info_len, info, &counter_byte }, dst);
         // skS == 0 → retry (this zero test is the RFC's own loop condition).
-        if (std.mem.allEqual(u8, &sk, 0)) continue;
+        // `sk` is SECRET (the derived key itself): `std.mem.allEqual` compiles
+        // to a per-byte compare-and-branch-out loop (A1 N-CT1), an early exit
+        // whose timing reveals the index of the first nonzero byte. Compare
+        // against zero with `std.crypto.timing_safe.eql` instead — an
+        // OR-accumulation with a single branch on the final verdict, not on
+        // any individual byte.
+        if (std.crypto.timing_safe.eql([Ns]u8, sk, [_]u8{0} ** Ns)) continue;
         // SECRET scalar: `ct25519.mulRistrettoBase`, not std's `mul` (see
         // the Security notes). The `catch continue` this replaces was a
         // second branch on `sk` on top of the RFC's own zero test.
