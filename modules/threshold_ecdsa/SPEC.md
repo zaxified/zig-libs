@@ -869,6 +869,32 @@ produces a signature step 6 accepts. *Why the code cannot settle it:* same
 "quantifies over all provers" reason as A1. (The culprit-NAMING half is a
 scope cut, not an audit question — see the Phase 2d section.)
 
+## Signing cost and the parallel pair phase (audit F6, 2026-09-16)
+
+GG20's "one-round" online signing is one round of messages, not one unit of
+work: Phase 3 runs an MtA and an MtAwc for each of the `t(t−1)` ordered
+pairs, each with 2048-bit Paillier and ring-Pedersen proofs. Measured
+(ReleaseFast, i7-7920HQ 4C/8T, 5 interleaved reps each, shared machine at
+load 1.3–4.7; min / median / max, ms):
+
+| `t` | sequential (`signWithShares`) | 4 threads | 8 threads |
+|---|---|---|---|
+| 2 | 1094 / 1109 / 1122 | 544 / 587 / 602 | 541 / 570 / 578 |
+| 3 | 3186 / 3275 / 3359 | 1136 / 1347 / 1445 | 821 / 865 / 873 |
+| 4 | 6607 / 6683 / 7479 | 1642 / 1774 / 2260 | 1507 / 1612 / 3171 |
+
+`signWithSharesOptions(…, .{ .pair_threads = n })` is the opt-in parallel
+path; the default stays sequential. Its sharing discipline is the design, not
+a detail: the pair computation only READS `k`/`γ`/`w`; the accumulators
+`δ_i`/`σ_i` — which every party touches from `2(t−1)` pairs, and which a naive
+thread-per-pair loop would race on — are summed on the caller's thread after
+all workers join. Each pair has its own slot in a preallocated job array, its
+own ChaCha CSPRNG seeded from `random` before any worker starts, and each
+thread its own fixed scratch allocator, so the caller's `allocator` is never
+touched from a worker. Results are independent of the thread count (test:
+per-pair shares bit-identical for 1 vs 4 threads; the signature identical to
+`signWithShares` from the same PRNG state).
+
 ## Backlog / deferred
 
 - Phase 2c: independent cryptographic review of `zkproofs.zig`'s implemented

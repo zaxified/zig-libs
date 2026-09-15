@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **ADDITIVE:** audit F6. `signing.signWithSharesOptions(allocator, shares, message,
+  random, options)` with `SignOptions{ .pair_threads, .pair_scratch_bytes }` runs Phase 3's
+  `t(t−1)` ordered-pair MtA/MtAwc conversions on OS threads. Each pair gets its own ChaCha seed
+  drawn from `random` up front, each thread owns a disjoint scratch slice and writes only its own
+  result slot, and `δ_i`/`σ_i` are summed on the caller's thread after the join — no shared mutable
+  state between threads. `signWithShares` is unchanged (it calls the new function with defaults:
+  sequential, same randomness order). Measured, ReleaseFast, 5 interleaved reps, median sequential
+  → 8 threads: `t=2` 1109 → 570 ms, `t=3` 3275 → 865 ms, `t=4` 6683 → 1612 ms.
+
 - **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** audit F4(b)/(c). Two input guards could be
   deleted with the suite green, because every existing reject test also broke a per-round equation.
   New tests build proofs whose every round holds: Πmod over the non-Blum `Ñ = 187 = 11·17` with a
