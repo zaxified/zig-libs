@@ -566,6 +566,34 @@ pub fn verify(
     v: Ristretto255,
     proof: RangeProof,
 ) bool {
+    return verifyTraced(gens, transcript, v, proof, null);
+}
+
+/// What `verify` computed on its way to a verdict, recorded only when a
+/// caller asks for it. It exists for `verify_b8_diff_test.zig`, which holds
+/// the pre-B8 verifier as a reference and requires the points below to be
+/// BYTE-IDENTICAL between the two on every input, forged ones included — a
+/// stronger seam than comparing the boolean, which two broken verifiers can
+/// agree on.
+pub const VerifyTrace = struct {
+    /// Check 1 (the `t_hat` relation) passed and the IPA check ran.
+    reached_ipa: bool = false,
+    /// Canonical encoding of the IPA statement point `P`.
+    p: [32]u8 = scalarvec.zero,
+    /// Canonical encodings of the IPA's final equation sides.
+    ipa_lhs: [32]u8 = scalarvec.zero,
+    ipa_rhs: [32]u8 = scalarvec.zero,
+};
+
+/// The body of `verify`. `trace` is written to, never read, so the verdict
+/// cannot depend on it.
+pub fn verifyTraced(
+    gens: Generators,
+    transcript: *Transcript,
+    v: Ristretto255,
+    proof: RangeProof,
+    trace: ?*VerifyTrace,
+) bool {
     const n = gens.n;
     if (n == 0 or !std.math.isPowerOfTwo(n)) return false;
     if (gens.g_vec.len != n or gens.h_vec.len != n) return false;
@@ -627,17 +655,29 @@ pub fn verify(
     const w = transcript.challengeScalar("w");
     const q = mulOrIdentity(gens.g, w);
 
-    // Check 2 — the IPA. Rescaled generators h'_i = y^{-i}*H_i, and the
-    // IPA statement point (paper eq. (66)-(67), completed with the -mu*H
+    // Check 2 — the IPA, over the rescaled generators h'_i = y^{-i}*H_i and
+    // the IPA statement point (paper eq. (66)-(67), completed with the -mu*H
     // blinding removal and the +t_hat*Q inner-product binding so it
     // matches proveIpa's `P = <l,G> + <r,H'> + <l,r>*Q` form exactly):
     //   P = A + x*S - z*<1,G> - mu*H
     //       + sum_i (z*y^i + z^2*2^i)*h'_i + t_hat*Q
+    //
+    // ⭐ Audit finding B8: h' is NEVER materialised. Building it cost n
+    // constant-time ladders — 63 % of verify at n=64 — over data with no
+    // secret in it. Both places h' enters are MSMs, so y^{-i} moves into the
+    // coefficient instead: ((z*y^i + z^2*2^i) * y^{-i}) * H_i here, and
+    // `ipa.equationSides`'s `h_scale` there. That is the identity
+    // (c*s)*H == c*(s*H), exact in a prime-order group for every scalar —
+    // including y == 0 (`invert(0) == 0`), which is why the coefficient is
+    // the old one times y^{-i} rather than the "simplified"
+    // z + z^2*2^i*y^{-i}: that form is NOT equal to it when y == 0.
+    // `verify_b8_diff_test.zig` pins P and both IPA equation sides
+    // byte-for-byte against the pre-B8 verifier kept there.
     const y_inv = invertScalar(y);
-    const h_prime = scratch.alloc(Ristretto255, n) catch return false;
-    defer scratch.free(h_prime);
-    // Per-index coefficients (z*y^i + z^2*2^i) of the h'_i term, collected so
-    // the sum can go through the vartime Pippenger MSM below.
+    // y_inv_pows[i] = y^{-i}: the implicit scale of h'_i, handed to the IPA.
+    const y_inv_pows = scratch.alloc([32]u8, n) catch return false;
+    defer scratch.free(y_inv_pows);
+    // Per-index coefficients of H_i in the h_term MSM below.
     const h_scalars = scratch.alloc([32]u8, n) catch return false;
     defer scratch.free(h_scalars);
 
@@ -646,9 +686,10 @@ pub fn verify(
         var y_inv_pow = scalarvec.one;
         var y_pow = scalarvec.one;
         var two_pow = scalarvec.one;
-        for (h_prime, h_scalars, gens.h_vec, gens.g_vec) |*o, *c_out, hp, gp| {
-            o.* = mulOrIdentity(hp, y_inv_pow);
-            c_out.* = scalar.mulAdd(z2, two_pow, scalar.mul(z, y_pow));
+        for (y_inv_pows, h_scalars, gens.g_vec) |*s_out, *c_out, gp| {
+            s_out.* = y_inv_pow;
+            const c = scalar.mulAdd(z2, two_pow, scalar.mul(z, y_pow));
+            c_out.* = scalar.mul(c, y_inv_pow);
             // sum_g accumulates the all-ones combination of the g generators
             // (a plain point sum, not a weighted MSM), so it stays a fold.
             sum_g = sum_g.add(gp);
@@ -657,9 +698,10 @@ pub fn verify(
             two_pow = scalar.add(two_pow, two_pow);
         }
     }
-    // h_term = sum_i (z*y^i + z^2*2^i) * h'_i — over PUBLIC verifier data
-    // (challenges + public generators), so the vartime Pippenger MSM applies.
-    const h_term = scalarvec.multiScalarMulVartime(h_scalars, h_prime) catch return false;
+    // h_term = sum_i ((z*y^i + z^2*2^i) * y^{-i}) * H_i — over PUBLIC verifier
+    // data (challenges + public generators), so the vartime Pippenger MSM
+    // applies.
+    const h_term = scalarvec.multiScalarMulVartime(h_scalars, gens.h_vec) catch return false;
 
     const p = proof.a
         .add(mulOrIdentity(proof.s, x))
@@ -668,7 +710,14 @@ pub fn verify(
         .add(h_term)
         .add(mulOrIdentity(q, proof.t_hat));
 
-    return ipa.verifyIpa(transcript, gens.g_vec, h_prime, q, p, proof.ipa);
+    const sides = ipa.equationSides(transcript, gens.g_vec, gens.h_vec, y_inv_pows, q, p, proof.ipa) orelse return false;
+    if (trace) |t| {
+        t.reached_ipa = true;
+        t.p = p.toBytes();
+        t.ipa_lhs = sides.lhs.toBytes();
+        t.ipa_rhs = sides.rhs.toBytes();
+    }
+    return sides.lhs.equivalent(sides.rhs);
 }
 
 // ── tests (commit + deltaYZ + codec + construction-time guard — REAL, ungated) ──

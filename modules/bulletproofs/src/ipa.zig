@@ -350,10 +350,44 @@ pub fn verifyIpa(
     p: Ristretto255,
     proof: InnerProductProof,
 ) bool {
+    const sides = equationSides(transcript, g_vec, h_vec, null, q, p, proof) orelse return false;
+    return sides.lhs.equivalent(sides.rhs);
+}
+
+/// The two sides of `verifyIpa`'s final equation, exactly as computed. The
+/// proof is accepted iff `lhs.equivalent(rhs)`.
+pub const EquationSides = struct {
+    lhs: Ristretto255,
+    rhs: Ristretto255,
+};
+
+/// The body of `verifyIpa`, generalised by one optional argument (audit
+/// finding B8). With `h_scale == null` it is `verifyIpa` itself. With
+/// `h_scale` set, it verifies against the IMPLICIT generators
+/// `h'_i = h_scale[i] * h_vec[i]` without ever materialising them: the only
+/// place `h_vec` enters is the final MSM, where each coefficient `c_i` is
+/// replaced by `c_i * h_scale[i]` — the identity `(c*s)*H == c*(s*H)`, which
+/// is exact in Ristretto255's prime-order group for EVERY scalar, zero
+/// included. `rangeproof.verify` passes `h_scale[i] = y^{-i}` this way instead
+/// of `n` constant-time ladders building `h'` (measured 63 % of its time at
+/// n=64; there is nothing secret in `y` or `H_i`).
+///
+/// Returns `null` on a structural mismatch or scratch-allocation failure —
+/// both are rejections. Public-data path: variable-time by design.
+pub fn equationSides(
+    transcript: *Transcript,
+    g_vec: []const Ristretto255,
+    h_vec: []const Ristretto255,
+    h_scale: ?[]const [32]u8,
+    q: Ristretto255,
+    p: Ristretto255,
+    proof: InnerProductProof,
+) ?EquationSides {
     const n = g_vec.len;
-    if (h_vec.len != n or n == 0 or !std.math.isPowerOfTwo(n)) return false;
+    if (h_vec.len != n or n == 0 or !std.math.isPowerOfTwo(n)) return null;
+    if (h_scale) |hs| if (hs.len != n) return null;
     const rounds: usize = std.math.log2_int(usize, n);
-    if (proof.l_vec.len != rounds or proof.r_vec.len != rounds) return false;
+    if (proof.l_vec.len != rounds or proof.r_vec.len != rounds) return null;
 
     // `rounds <= 63` always (n fits in a usize), so a fixed stack array
     // keeps this verifier allocation-free (its signature has no
@@ -391,15 +425,15 @@ pub fn verifyIpa(
     // witness scalars and stay constant-time; see `proveIpa`.)
     //
     // The verifier has no allocator by signature, so this scratch comes from
-    // the page allocator and every failure — including OOM — returns false
-    // (fail-closed), never panics; all of it is public, so no constant-time
+    // the page allocator and every failure — including OOM — returns null,
+    // i.e. rejects (fail-closed), never panics; all of it is public, so no constant-time
     // concern applies (matching `rangeproof.verify`).
     const alloc = std.heap.page_allocator; // global-alloc-ok: verifier is allocator-less by signature; scratch only, fail-closed on OOM (see doc comment above)
 
     var allinv = scalarvec.one;
     for (0..rounds) |j| allinv = scalar.mul(allinv, u_inv[j]);
 
-    const s = alloc.alloc([32]u8, n) catch return false;
+    const s = alloc.alloc([32]u8, n) catch return null;
     defer alloc.free(s);
     s[0] = allinv;
     for (1..n) |i| {
@@ -412,19 +446,22 @@ pub fn verifyIpa(
 
     // lhs = <a*s, G> + <b*s^{-1}, H> + (a*b)*Q as one (2n+1)-term MSM.
     const terms = 2 * n + 1;
-    const msm_scalars = alloc.alloc([32]u8, terms) catch return false;
+    const msm_scalars = alloc.alloc([32]u8, terms) catch return null;
     defer alloc.free(msm_scalars);
-    const msm_points = alloc.alloc(Ristretto255, terms) catch return false;
+    const msm_points = alloc.alloc(Ristretto255, terms) catch return null;
     defer alloc.free(msm_points);
     for (0..n) |i| {
         msm_scalars[i] = scalar.mul(proof.a, s[i]);
         msm_points[i] = g_vec[i];
-        msm_scalars[n + i] = scalar.mul(proof.b, s[n - 1 - i]);
+        const b_s = scalar.mul(proof.b, s[n - 1 - i]);
+        // B8: the implicit generator h'_i = h_scale[i]*H_i enters as a
+        // coefficient factor on the unscaled H_i (see this function's doc).
+        msm_scalars[n + i] = if (h_scale) |hs| scalar.mul(b_s, hs[i]) else b_s;
         msm_points[n + i] = h_vec[i];
     }
     msm_scalars[2 * n] = scalar.mul(proof.a, proof.b);
     msm_points[2 * n] = q;
-    const lhs = scalarvec.multiScalarMulVartime(msm_scalars, msm_points) catch return false;
+    const lhs = scalarvec.multiScalarMulVartime(msm_scalars, msm_points) catch return null;
 
     // rhs = P + sum_j (u_j^2 * L_j + u_j^{-2} * R_j) — only 2*rounds terms
     // (logarithmic in n), so a plain accumulation is already cheap.
@@ -434,7 +471,7 @@ pub fn verifyIpa(
         rhs = rhs.add(mulOrIdentity(proof.r_vec[j], scalar.mul(u_inv[j], u_inv[j])));
     }
 
-    return lhs.equivalent(rhs);
+    return .{ .lhs = lhs, .rhs = rhs };
 }
 
 // ── tests (codec + mechanical preconditions — REAL, ungated) ───────────────

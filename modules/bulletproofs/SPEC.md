@@ -113,6 +113,68 @@ generator sets) — a mixup here would silently break every downstream
 check since the range proof's `t_hat` relation (paper eq. (72))
 specifically ties `V` to `gens.g`/`gens.h`, not the vectors.
 
+### B8 — the verifier never materialises `h'` (a P5 algorithm change)
+
+`verify` used to build `h'_i = y^{-i}*H_i` with `n` constant-time ladders
+(63 % of its time at n=64 in the 2026-09-05 audit profile) and pass `h'` to
+`verifyIpa`. `h'` enters exactly two places, both MSMs, so `y^{-i}` now
+moves into the coefficient: `((z*y^i + z^2*2^i) * y^{-i}) * H_i` in
+`verify`'s own `h_term`, and `c_i * h_scale[i]` in `ipa.equationSides`'s
+final MSM. The justification is one identity, `(c*s)*H == c*(s*H)`, exact in
+Ristretto255's prime-order group for every scalar. ⚠ The coefficient is
+deliberately the old one times `y^{-i}`, not the "simplified"
+`z + z^2*2^i*y^{-i}`: with `invert(0) == 0` the two differ at `y == 0`, so
+only the unsimplified form makes the new verifier equal to the old one on
+EVERY input. `prove` is not changed and cannot be changed this way: its `h'`
+feeds the recursive IPA fold as real points.
+
+Because a mistake here would accept forgeries rather than slow anything
+down, the change was made under `DECISIONS.md` P5. The four items it asks for:
+
+1. **Bit-identical to the previous implementation.**
+   `src/verify_b8_diff_test.zig` keeps the pre-B8 `verify`/`verifyIpa`
+   verbatim and requires the canonical bytes of `P` and of both IPA
+   equation sides to match, not just the verdict. That covers honest proofs
+   at n = 1, 2, 4, 8, 16, 32, 64 (Debug stops at 16) and every forgery
+   class: a single-bit flip (0x01, 0x80) at every byte of every wire field;
+   `+2^(8k)` at every byte position of every scalar field; point fields
+   shifted by public generators; each `L_i`/`R_i` perturbed, `L_i<->R_i`
+   swapped, rounds reordered, whole vectors exchanged, a round dropped, an
+   extra round added; seven wrong commitments; generator sets of twice and
+   half the width; an all-identity proof; a cheating prover that forces
+   `t_hat` for an out-of-range `v`, so it passes check 1 and only the IPA
+   can refuse it; and the same points in an E[4]-shifted internal
+   representation, which must still be ACCEPTED.
+2. **Randomized differential.** Seeded random forgeries (wire flips,
+   point/scalar perturbations, point swaps): 200 per width at n = 2, 8, 32,
+   64 in optimized builds, 30 at n = 4 in Debug. Plus an IPA-level
+   differential over arbitrary `h_scale` vectors: geometric, `y = 0`, fully
+   random, and half zeros. Half of those cases are honest proofs, which must
+   be accepted.
+3. **ctgrind.** Not applicable to the changed code: `verify` consumes only
+   public data, and `ctgrind_harness.zig` deliberately does not taint it.
+   No function on the prove path changed. The `rangeproof`/`ipa` rows in
+   `scripts/ctgrind-expected.tsv` fingerprint whole files, so they need a
+   re-pin. That re-pin happens at the end of the fix campaign.
+4. **The number.** A/B against the previous verifier in one process,
+   ReleaseFast, CPU time, 9 interleaved rounds, median µs per verify:
+   n=8 2394 → 2048 (1.17×); n=32 4950 → 3305 (1.50×); n=64 7887 → 4720
+   (**1.67×**). The paired per-round ratio never fell below 1.12, 1.45 and
+   1.44. The audit estimated ~2.7× at n=64; the measured gain is smaller,
+   and the remaining verify time has not been broken down. Why the gain
+   outweighs the risk: the old code spent its time on work that protected
+   nothing, and the new code is held to the old code byte for byte. Ten
+   mutants of the new code all turn the differential RED:
+   - `y^{-i}` omitted, in either MSM or at the call site;
+   - `y^{i}` used instead;
+   - the index shifted by one, in either MSM;
+   - one MSM term dropped, in either MSM;
+   - the sign flipped, in either MSM.
+   A correct rewrite of the same coefficient stays GREEN. The simplified
+   `y == 0`-divergent form also stays GREEN: `y` is a transcript hash
+   output, so the suite cannot reach `y == 0`. That is the reason the code
+   does not rely on it.
+
 ## Generators (`generators.zig`) — NUMS derivation
 
 `SHA-512(domain || label || suffix) -> Ristretto255.fromUniform`. See

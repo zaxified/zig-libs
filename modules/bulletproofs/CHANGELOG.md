@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (verifier performance):**
+  audit finding B8. `verify` no longer materialises the rescaled generators
+  `h'_i = y^{-i}*H_i` — `n` constant-time ladders over data with no secret in
+  it. `y^{-i}` is folded into the coefficients of the two MSMs `h'` fed
+  instead (`(c*s)*H == c*(s*H)`, exact in the prime-order group for every
+  scalar, zero included). Measured A/B against the previous verifier, same
+  process, ReleaseFast, CPU time, 9 interleaved rounds, median µs per
+  verify: n=8 2394 → 2048 (1.17×), n=32 4950 → 3305 (1.50×), n=64 7887 →
+  4720 (**1.67×**); the paired per-round ratio never fell below 1.12, 1.45
+  and 1.44 respectively. `prove` is untouched (its `h'` feeds the recursive
+  IPA fold as real points). `verify`'s and `verifyIpa`'s signatures and
+  verdicts are unchanged; new internal decls, not re-exported from `root.zig`:
+  `ipa.equationSides`/`ipa.EquationSides` (`verifyIpa`'s body with an
+  optional per-index H scale) and `rangeproof.verifyTraced`/`VerifyTrace`.
+  The previous verifier is kept verbatim in `src/verify_b8_diff_test.zig`,
+  which requires `P` and both IPA equation sides to be byte-identical between
+  the two on honest proofs at n=1..64 and on every forgery class listed
+  there; see SPEC.md "B8".
+
 - **2026-09-11** — **API CHANGE:** `prove`'s secret witness parameter changes
   from `v: u64` to `v: *const u64` (audit finding B12). The old by-value
   parameter left a copy on the caller-owned argument-passing stack slot that
