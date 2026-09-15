@@ -1828,12 +1828,24 @@ fn eintrHandler(_: tl.SIG) callconv(.c) void {
     _ = eintr_seen.fetchAdd(1, .monotonic);
 }
 
-/// Interrupt one specific thread every 10 ms for `duration_ms`, then stop by
-/// itself. Self-terminating on purpose: a storm that ran until the probe
-/// returned could never fail a connector that never returns.
-fn eintrStorm(tgid: tl.pid_t, tid: tl.pid_t, duration_ms: u64) void {
-    const deadline = monoNs() + duration_ms * std.time.ns_per_ms;
-    while (monoNs() < deadline) {
+/// Interrupt one specific thread every 10 ms until `done` is set AND at
+/// least `min_signals` have landed — not for a fixed wall-clock duration.
+/// A fixed duration decouples "signals delivered" from how much CPU this
+/// thread actually gets: under contention (the full gate runs 217 modules
+/// in parallel) this thread can be scheduled so rarely that a fixed window
+/// produces far fewer than `min_signals` even though nothing is broken.
+/// `done` must not be set before the operation under test has returned, so
+/// the storm is guaranteed to still be live for its whole duration.
+/// `hang_guard_ns` is a hang guard only (a healthy run finishes in a few
+/// hundred ms), never the pass/fail measure — self-terminating on purpose,
+/// since a storm that ran until the probe itself returned could never fail
+/// a connector that never returns.
+fn eintrStorm(tgid: tl.pid_t, tid: tl.pid_t, done: *const std.atomic.Value(bool), min_signals: u32) void {
+    const start = monoNs();
+    const hang_guard_ns: u64 = 10 * std.time.ns_per_s;
+    while ((!done.load(.acquire) or eintr_seen.load(.acquire) < min_signals) and
+        monoNs() -| start < hang_guard_ns)
+    {
         _ = tl.tgkill(tgid, tid, .URG);
         sleepMs(10);
     }
@@ -1860,7 +1872,8 @@ test "live: a signal storm interrupts poll without extending the budget" {
     defer std.posix.sigaction(.URG, &saved, null);
 
     eintr_seen.store(0, .release);
-    const storm = try std.Thread.spawn(.{}, eintrStorm, .{ tl.getpid(), tl.gettid(), 600 });
+    var connect_done: std.atomic.Value(bool) = .init(false);
+    const storm = try std.Thread.spawn(.{}, eintrStorm, .{ tl.getpid(), tl.gettid(), &connect_done, 5 });
     defer storm.join();
 
     var pc: PosixConnector = .{ .resolve = .literal_only };
@@ -1869,15 +1882,23 @@ test "live: a signal storm interrupts poll without extending the budget" {
     const t0 = monoNs();
     const out = pc.connector().connect(t, 200 * std.time.ns_per_ms);
     const el = monoNs() -| t0;
+    // Only now may the storm stop on account of `done` — it must have been
+    // live for the entire connect() call above, or the interruption this
+    // test exists to exercise might never have overlapped it.
+    connect_done.store(true, .release);
 
     // Without this the test asserts nothing: if no signal ever landed, the
     // "budget was not extended" claim is about a code path that never ran.
     try testing.expect(eintr_seen.load(.acquire) >= 5);
     try testing.expectEqual(Status.timeout, out.status);
     try testing.expect(el >= 190 * std.time.ns_per_ms);
-    // The storm lasts 600 ms. A connector that restarted its budget on each
-    // interruption could not return before ~800 ms; recomputing the remainder
-    // returns at ~200 ms.
+    // The storm is guaranteed to still be interrupting every ~10 ms for as
+    // long as connect() is blocked (it only learns connect() has returned
+    // afterwards). A connector that recomputes the remaining budget on each
+    // EINTR returns close to the original ~200 ms regardless; one that
+    // restarts its full budget instead would never see a gap long enough to
+    // return and would only be released once the storm's own hang guard
+    // ends — nowhere near 500 ms.
     try testing.expect(el < 500 * std.time.ns_per_ms);
 }
 
