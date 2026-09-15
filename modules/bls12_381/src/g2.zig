@@ -22,6 +22,32 @@ pub const Fp = fp.Fp;
 pub const Fp2 = fp2mod.Fp2;
 pub const Fr = scalarmod.Fr;
 
+/// `|x|`, the BLS12-381 seed magnitude — owned by `pairing.zig`.
+const bls_x_abs: u64 = @import("pairing.zig").bls_x_abs;
+comptime {
+    std.debug.assert(bls_x_abs >> 63 == 1); // mulByAbsXPublic starts at bit 62
+}
+
+const p_minus_1_over_3: [48]u8 = fp.pExponentBytes(-1, 3);
+const p_minus_1_over_2: [48]u8 = fp.pExponentBytes(-1, 2);
+
+/// `ξ^{-(p-1)/3}` and `ξ^{-(p-1)/2}`, `ξ = 1 + u` — the coefficients of
+/// `ψ` (`Jacobian.endomorphismPsi`). Derived at COMPTIME from the tower's
+/// own non-residue and the comptime-derived exponents, never
+/// transcribed (same discipline as `fp6.zig`'s Frobenius γ). Pinned by
+/// the "ψ acts as [x] on G2" test and by `χ(ψ) = ψ² − [t]ψ + [p] = 0`
+/// on points OUTSIDE the subgroup.
+const psi_coeff_x: Fp2 = blk: {
+    @setEvalBranchQuota(100_000_000);
+    const xi = Fp2.one.mulByNonresidue();
+    break :blk xi.pow(&p_minus_1_over_3).inv() catch unreachable;
+};
+const psi_coeff_y: Fp2 = blk: {
+    @setEvalBranchQuota(100_000_000);
+    const xi = Fp2.one.mulByNonresidue();
+    break :blk xi.pow(&p_minus_1_over_2).inv() catch unreachable;
+};
+
 /// The twist curve equation constant: `E': y^2 = x^3 + b'`, `b' =
 /// 4(1+u) = 4 + 4u ∈ Fp2`. REAL: `Fp.fromInt` is pure `std.crypto.ff`
 /// delegation (see `fp.zig`); no `Fp2.mul` needed since `4*(1+u) =
@@ -250,20 +276,73 @@ pub const Jacobian = struct {
         return self.y.square().eql(rhs);
     }
 
-    /// Subgroup check for `G2`. Same pitfall/reasoning as `g1.zig`'s
-    /// `Jacobian.subgroupCheck` — the simple, always-correct form is
-    /// `scalarMul(self, r).isIdentity()`; `G2`'s fast path uses the
-    /// UNTWIST-FROBENIUS-TWIST endomorphism (a different, `G2`-specific
-    /// technique from `G1`'s — see Bowe's "Faster Subgroup Checks for
-    /// BLS12-381", cited in `NOTICE`) — again, a genuine algorithm
-    /// choice deferred past Part 1's scaffolding scope; implement the
-    /// simple form first.
+    /// Subgroup check for `G2`: `true` iff this point is ON THE TWIST and
+    /// in the order-`r` subgroup. Same pitfall/reasoning as `g1.zig`'s
+    /// `Jacobian.subgroupCheck`; the identity passes.
+    ///
+    /// Construction (2026-09-15, A1 `drand` F4): `ψ(P) == [x]P`, `ψ` the
+    /// untwist-Frobenius-twist endomorphism — Scott, ePrint 2021/1130 §4
+    /// ("the endomorphism test becomes simply a matter of confirming that
+    /// ψ(Q) = uQ"), whose proof El Housni–Guillevic–Piellard (ePrint
+    /// 2022/352 §4.2) show is incomplete and repair in §4.3,
+    /// Proposition 5: "For the BLS12 family, if r = r(u) is prime and
+    /// Q ∈ E′(Fq2), ψ(Q) = [u]Q =⇒ Q ∈ E′(Fq2)[r]." (their Proposition 1
+    /// needs `ψ` to act as `u` on `E′(Fq2)[r]` and `gcd(χ(u), c2) = 1`,
+    /// `χ = X² − tX + q`; both re-checked for THIS curve by the tests
+    /// below). The premise `Q ∈ E′(Fq2)` is why the twist equation is
+    /// checked first. Cost: one multiplication by the 64-bit `|x|`
+    /// instead of one by the 255-bit `r`; `x` is negative, so `[x]P =
+    /// -[|x|]P`. The old `[r]P == O` form is kept as
+    /// `subgroupCheckByOrder`, the test-only reference. Timing: see
+    /// `g1.zig` — only the identity early-outs and the bits of the public
+    /// constant `|x|` steer control flow.
     pub fn subgroupCheck(self: Jacobian) bool {
-        // The simple, always-correct form: [r]P == O (r is not a
-        // canonical Fr value — goes through scalarMulBytes).
-        // TODO: the untwist-Frobenius-twist fast path (Bowe — see
-        // NOTICE) is a deferred optimization, per SPEC.md's Backlog.
+        if (!self.isOnCurve()) return false;
+        return eqlPoints(endomorphismPsi(self), mulByAbsXPublic(self).negate());
+    }
+
+    /// The pre-2026-09-15 check, `[r]P == O` via the constant-time
+    /// ladder — the test-only reference (see `g1.zig`'s twin).
+    fn subgroupCheckByOrder(self: Jacobian) bool {
         return scalarMulBytes(self, &scalarmod.r_bytes).isIdentity();
+    }
+
+    /// `ψ = twist⁻¹ ∘ Frobenius ∘ twist`. With `E′: y² = x³ + 4ξ`, `ξ =
+    /// 1 + u`, untwisting is `(x, y) ↦ (x/w², y/w³)`, `w⁶ = ξ` (the tower's
+    /// `w² = v`, `v³ = ξ`), so ψ(x, y) = (x^p·ξ^{-(p-1)/3}, y^p·ξ^{-(p-1)/2}).
+    /// On Jacobian coordinates Frobenius (a field automorphism) goes onto
+    /// `Z` too, and on `Fp2` Frobenius is conjugation.
+    fn endomorphismPsi(p: Jacobian) Jacobian {
+        return .{
+            .x = p.x.frobenius().mul(psi_coeff_x),
+            .y = p.y.frobenius().mul(psi_coeff_y),
+            .z = p.z.frobenius(),
+        };
+    }
+
+    /// `[|x|]P`, variable-time ONLY in the fixed public constant `|x|` —
+    /// see `g1.zig`'s `mulByAbsXPublic` (identical, over `Fp2`).
+    fn mulByAbsXPublic(p: Jacobian) Jacobian {
+        var acc = p; // the leading 1 of |x| (bit 63)
+        var bit: u6 = 62;
+        while (true) : (bit -= 1) {
+            acc = acc.double();
+            if ((bls_x_abs >> bit) & 1 == 1) acc = acc.add(p);
+            if (bit == 0) break;
+        }
+        return acc;
+    }
+
+    /// Projective equality — see `g1.zig`'s `eqlPoints`.
+    fn eqlPoints(a: Jacobian, other: Jacobian) bool {
+        const a_inf = a.isIdentity();
+        const b_inf = other.isIdentity();
+        if (a_inf or b_inf) return a_inf and b_inf;
+        const z1z1 = a.z.square();
+        const z2z2 = other.z.square();
+        const x_eq = a.x.mul(z2z2).eql(other.x.mul(z1z1));
+        const y_eq = a.y.mul(z2z2).mul(other.z).eql(other.y.mul(z1z1).mul(a.z));
+        return x_eq and y_eq;
     }
 
     /// Multiplies by the cofactor `h2` (`cofactor_bytes`, 64 bytes) —
@@ -603,4 +682,205 @@ test "G2 uncompressed round-trip through Jacobian arithmetic" {
     const back = try fromBytesUncompressed(bytes);
     try std.testing.expect(back.x.eql(g5.x));
     try std.testing.expect(back.y.eql(g5.y));
+}
+
+// ── F4 fast subgroup check: preconditions, ψ, differential ───────────────
+//
+// Same structure as `g1.zig`'s F4 block: the proposition's conditions are
+// re-derived from this file's constants, `ψ` and `mulByAbsXPublic` are
+// pinned against independent computations, and the fast check is held
+// against `[r]P == O` on points the reference itself classifies.
+
+fn beInt(comptime bytes: []const u8) comptime_int {
+    comptime var v: comptime_int = 0;
+    for (bytes) |byte| v = v * 256 + @as(comptime_int, byte);
+    return v;
+}
+
+fn beBytes(comptime n: usize, comptime v: comptime_int) [n]u8 {
+    return comptime blk: {
+        var out: [n]u8 = undefined;
+        var rest: comptime_int = v;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            out[i] = @intCast(@mod(rest, 256));
+            rest = @divFloor(rest, 256);
+        }
+        if (rest != 0) @compileError("beBytes: value does not fit");
+        break :blk out;
+    };
+}
+
+fn gcdInt(comptime lhs: comptime_int, comptime rhs: comptime_int) comptime_int {
+    var x = lhs;
+    var y = rhs;
+    while (y != 0) {
+        const t = @mod(x, y);
+        x = y;
+        y = t;
+    }
+    return x;
+}
+
+const seed_u: comptime_int = -@as(comptime_int, bls_x_abs);
+const p_int_t: comptime_int = beInt(&fp.p_bytes);
+const r_int_t: comptime_int = beInt(&scalarmod.r_bytes);
+const h2_int_t: comptime_int = beInt(&cofactor_bytes);
+
+test "F4 subgroup G2: EHGP 2022/352 Proposition 5 preconditions hold for this curve" {
+    const u = seed_u;
+    try std.testing.expect(r_int_t == u * u * u * u - u * u + 1);
+    try std.testing.expect(3 * (p_int_t - u) == (u - 1) * (u - 1) * r_int_t);
+    // EHGP Example 2's c2(x) at this seed is exactly this file's cofactor
+    // (an independent cross-check of the corrected h2, too).
+    const c2_num = u * u * u * u * u * u * u * u - 4 * u * u * u * u * u * u * u + 5 * u * u * u * u * u * u -
+        4 * u * u * u * u + 6 * u * u * u - 4 * u * u - 4 * u + 13;
+    try std.testing.expect(@mod(c2_num, 9) == 0);
+    try std.testing.expect(@divExact(c2_num, 9) == h2_int_t);
+    // χ = X² − tX + p, t = u + 1: χ(u) = p − u. Proposition 1's condition
+    // gcd(χ(u), c2) = 1, and r ∤ h2 so E′(Fp2)[r] is the order-r group G2.
+    const t = u + 1;
+    const chi_u = u * u - t * u + p_int_t;
+    try std.testing.expect(chi_u == p_int_t - u);
+    try std.testing.expect(gcdInt(chi_u, h2_int_t) == 1);
+    try std.testing.expect(@mod(h2_int_t, r_int_t) != 0);
+}
+
+fn randomTwistPoint(rng: std.Random) Jacobian {
+    while (true) {
+        var buf: [Fp.encoded_bytes]u8 = undefined;
+        rng.bytes(&buf);
+        buf[0] &= 0x1f;
+        const c0 = Fp.fromBytes(buf) catch continue;
+        rng.bytes(&buf);
+        buf[0] &= 0x1f;
+        const c1 = Fp.fromBytes(buf) catch continue;
+        const x: Fp2 = .{ .c0 = c0, .c1 = c1 };
+        const y = x.square().mul(x).add(b).sqrt() orelse continue;
+        return Jacobian.fromAffine(.{ .x = x, .y = y });
+    }
+}
+
+test "F4 subgroup G2: ψ acts as [x] on G2, satisfies χ(ψ) = 0 everywhere, [|x|] matches the ladder" {
+    const g = jacGen();
+    const x_abs = beBytes(8, bls_x_abs);
+    try expectSamePoint(Jacobian.mulByAbsXPublic(g), g.scalarMulBytes(&x_abs));
+    // x < 0: [x]G = -[|x|]G.
+    try expectSamePoint(Jacobian.endomorphismPsi(g), g.scalarMulBytes(&x_abs).negate());
+
+    // χ(ψ) = ψ² − [t]ψ + [p] = 0 holds on ALL of E′(Fp2), not just on G2 —
+    // checked on points outside the subgroup, which is where wrong ψ
+    // coefficients could not hide behind the eigenvalue. t = u + 1 =
+    // −(|x| − 1), so −[t]ψ(Q) = [|x| − 1]ψ(Q).
+    var prng = std.Random.DefaultPrng.init(0xf4_c41_2026_0915);
+    const rng = prng.random();
+    const x_abs_minus_1 = beBytes(8, bls_x_abs - 1);
+    for (0..3) |_| {
+        const q = randomTwistPoint(rng);
+        try std.testing.expect(!q.subgroupCheckByOrder());
+        const psi_q = Jacobian.endomorphismPsi(q);
+        try std.testing.expect(psi_q.isOnCurve());
+        const sum = Jacobian.endomorphismPsi(psi_q)
+            .add(psi_q.scalarMulBytes(&x_abs_minus_1))
+            .add(q.scalarMulBytes(&fp.p_bytes));
+        try std.testing.expect(sum.isIdentity());
+    }
+}
+
+test "F4 subgroup G2: an off-twist isomorphic image of a member — old [r]P == O accepts, subgroupCheck refuses" {
+    // (x, y) ↦ (a²x, a³y) with a ∈ Fp maps E′ onto y² = x³ + a⁶·b′. For
+    // a ∈ Fp, a^p = a, so the map commutes with ψ as well as with the
+    // group law: the image of a G2 member satisfies ψ(P) = [x]P and has
+    // order r, yet is not on E′. Only the curve-equation premise refuses
+    // it — see g1.zig's twin.
+    const two: Fp2 = .{ .c0 = try Fp.fromInt(u8, 2), .c1 = Fp.zero };
+    var k: [32]u8 = @splat(0);
+    k[31] = 0x2b;
+    const m = jacGen().scalarMulBytes(&k);
+    const img: Jacobian = .{ .x = m.x.mul(two.square()), .y = m.y.mul(two.square().mul(two)), .z = m.z };
+    try std.testing.expect(!img.isOnCurve());
+    try std.testing.expect(img.subgroupCheckByOrder());
+    try std.testing.expect(Jacobian.eqlPoints(Jacobian.endomorphismPsi(img), Jacobian.mulByAbsXPublic(img).negate()));
+    try std.testing.expect(!img.subgroupCheck());
+}
+
+fn expectMembership(p: Jacobian, member: bool) !void {
+    try std.testing.expectEqual(member, p.subgroupCheckByOrder());
+    try std.testing.expectEqual(member, p.subgroupCheck());
+}
+
+test "F4 subgroup G2: fast check == [r]P == O on members, non-members and off-twist points" {
+    var prng = std.Random.DefaultPrng.init(0xf4_5b9_2026_0916);
+    const rng = prng.random();
+    var members: usize = 0;
+    var outsiders: usize = 0;
+
+    try expectMembership(Jacobian.identity, true);
+    try expectMembership(jacGen(), true);
+    members += 2;
+    for (0..8) |_| {
+        var k: [32]u8 = undefined;
+        rng.bytes(&k);
+        try expectMembership(jacGen().scalarMulBytes(&k), true);
+        members += 1;
+    }
+    for (0..2) |_| {
+        try expectMembership(randomTwistPoint(rng).clearCofactor(), true);
+        members += 1;
+    }
+
+    for (0..24) |_| {
+        try expectMembership(randomTwistPoint(rng), false);
+        outsiders += 1;
+    }
+    for (0..4) |_| {
+        const t = randomTwistPoint(rng).scalarMulBytes(&scalarmod.r_bytes);
+        try std.testing.expect(!t.isIdentity());
+        try expectMembership(t, false);
+        var k: [32]u8 = undefined;
+        rng.bytes(&k);
+        try expectMembership(jacGen().scalarMulBytes(&k).add(t), false);
+        outsiders += 2;
+    }
+    const small_primes = [_]comptime_int{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
+    var small_orders: usize = 0;
+    inline for (small_primes) |l| {
+        if (comptime @mod(h2_int_t, l) == 0) {
+            // l-primary part, then down to order exactly l — see g1.zig's
+            // twin for why [#E′/l]R alone can be O for every R (13² and
+            // 23² both divide h2).
+            const k = comptime blk: {
+                var m: comptime_int = h2_int_t * r_int_t;
+                while (@mod(m, l) == 0) m = @divExact(m, l);
+                break :blk beBytes(112, m);
+            };
+            const l_bytes = comptime beBytes(1, l);
+            var t = Jacobian.identity;
+            var tries: usize = 0;
+            while (t.isIdentity()) : (tries += 1) {
+                try std.testing.expect(tries < 8);
+                t = randomTwistPoint(rng).scalarMulBytes(&k);
+            }
+            while (!t.scalarMulBytes(&l_bytes).isIdentity()) t = t.scalarMulBytes(&l_bytes);
+            try std.testing.expect(!t.isIdentity());
+            try expectMembership(t, false);
+            try expectMembership(t.add(jacGen()), false);
+            outsiders += 2;
+            small_orders += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), small_orders); // 13 and 23
+
+    var off_curve: usize = 0;
+    while (off_curve < 4) {
+        const p = randomTwistPoint(rng);
+        const bad: Jacobian = .{ .x = p.x.add(Fp2.one), .y = p.y, .z = p.z };
+        if (bad.isOnCurve()) continue;
+        try expectMembership(bad, false);
+        off_curve += 1;
+    }
+
+    try std.testing.expectEqual(@as(usize, 12), members);
+    try std.testing.expectEqual(@as(usize, 36), outsiders);
 }

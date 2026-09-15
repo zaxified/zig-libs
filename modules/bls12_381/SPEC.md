@@ -443,11 +443,14 @@ see "Part 6 design" below.
     per-call re-validation cost minutes per test binary for zero added
     assurance). The cache is a write-once atomic pointer (lock-free; a
     first-load race means redundant validation, never a wrong result).
-  - **First-load validation is parallelized and uses the variable-time
-    subgroup check for `G1`** (`parseAndValidateEmbeddedSetup` +
-    `subgroupCheckVartime`): setup points are PUBLIC (threat model
-    below), so the constant-time double-and-add-ALWAYS engine's ~3x
-    overhead buys nothing; the per-point checks are independent and fan
+  - **First-load validation is parallelized** (`parseAndValidateEmbeddedSetup`):
+    setup points are PUBLIC (threat model below). Until 2026-09-15 the
+    `G1` points used the variable-time `[r]P == O` check
+    (`subgroupCheckVartime`, ~3x faster than the constant-time `[r]P`
+    ladder); since then they use `g1.Jacobian.subgroupCheck`, the
+    endomorphism test, which is faster than both ("Subgroup checks"
+    below), and `subgroupCheckVartime` is kept only as a test
+    reference. The per-point checks are independent and fan
     out across CPU cores (`std.Thread.spawn`, serial fallback if
     spawning fails). The 65 `G2` points ride on worker 0 with the
     existing constant-time check (not worth a `G2` vartime twin).
@@ -613,7 +616,10 @@ see "Part 6 design" below.
   BLS verify) folds the subgroup check into its own point-parsing
   entry point, or requires callers to call it explicitly, is that
   part's own design decision — Part 1 only guarantees the primitive
-  (`subgroupCheck`, currently a stub) exists and is documented.
+  (`subgroupCheck`) exists and is documented. Since 2026-09-15
+  `subgroupCheck` also checks the curve equation itself (the premise of
+  the membership theorem it implements — see "Subgroup checks" below),
+  so it is `true` exactly for members of `G1`/`G2`.
 - **Constant-time choices (as implemented).**
   - `Fp`/`Fr` `add`/`sub`/`neg`/`mul`/`square` delegate to
     `std.crypto.ff` — constant-time by construction.
@@ -650,6 +656,40 @@ see "Part 6 design" below.
   public points, decompression) do not need — and some do not get —
   constant time; a faster public-scalar `scalarMul` variant is a
   possible later addition if a hot public-input call site appears.
+- **Subgroup checks — endomorphism tests, not `[r]P == O` (2026-09-15,
+  A1 `drand` F4; a new algorithm under DECISIONS P5).**
+  `g1.Jacobian.subgroupCheck` is `isOnCurve(P) ∧ φ(P) == [−x²]P`,
+  `φ(x, y) = (βx, y)`; `g2.Jacobian.subgroupCheck` is `isOnCurve(P) ∧
+  ψ(P) == [x]P`, `ψ` untwist-Frobenius-twist. Source: Scott, ePrint
+  2021/1130 §6/§4, with the proof repaired by El Housni–Guillevic–
+  Piellard, ePrint 2022/352 §4.3 Propositions 4 and 5 ("if Q ∈ E(Fp),
+  φ(Q) = [−u²]Q ⟹ Q ∈ E(Fp)[r]"; "if r = r(u) is prime and Q ∈
+  E′(Fq2), ψ(Q) = [u]Q ⟹ Q ∈ E′(Fq2)[r]"). The gcd conditions behind
+  them (`gcd(h1, r) = 1`; `gcd(p − x, h2) = 1`, `r ∤ h2`) and the
+  family polynomials at this seed are re-derived from the module's own
+  constants by the "F4 subgroup" tests, and the eigenvalue (which cube
+  root `β`, the sign of `x`, the `ψ` coefficients) is pinned on the
+  generators and, for `ψ`, by `ψ² − [t]ψ + [p] = 0` on non-members.
+  Why it is worth a new algorithm: ReleaseFast, 7 interleaved reps,
+  process CPU time, one run: `G1` **0.774 → 0.123 ms** (min–max
+  0.694–0.791 → 0.109–0.126), `G2` **2.41 → 0.175 ms** (2.15–2.46 →
+  0.156–0.181); `drand.verifyRoundPoints` 10.34 → 9.72 ms median
+  (ranges overlap, but lower in 7/7 paired reps by 0.51–0.90 ms, the
+  size of the saved `G1` check). The multiplication by `|x|`
+  (`mulByAbsXPublic`) branches only on the bits of that fixed public
+  constant; the point arithmetic is the same complete branchless
+  `double`/`add`, and `scalarMulBytes` (the secret-scalar engine) is
+  unchanged. The old `[r]P == O` form survives as the private
+  test-only reference `subgroupCheckByOrder`, which every differential
+  test holds the fast check against: members (identity, generators,
+  random multiples, cleared cofactors), random curve/twist points,
+  `[r]R` torsion alone and added to members, points of order exactly
+  3 and 11 (`G1`) and 13 and 23 (`G2`), off-curve points, RFC 9380's
+  published pre-`clear_cofactor` `Q0/Q1` (outside) and final `P`
+  (inside), and 60 live drand quicknet signatures plus the chain key
+  (probe, not in the suite). No ctgrind target: the inputs are public,
+  and the ctgrind rows over `g1.zig`/`g2.zig` need a re-pin only
+  because those files' digests changed.
 - **The pairing is VARIABLE-TIME — deliberately.** Pairings operate on
   PUBLIC inputs (public keys, signatures, commitments — every
   BLS/KZG-style consumer verifies public data with them); the Miller
@@ -694,8 +734,9 @@ see "Part 6 design" below.
   anticipates (EIP-4844 blob transactions are broadcast in full; a
   trusted-setup ceremony's own points are published) — there is no
   secret-scalar path through `kzg.zig` analogous to Part 4's `sk`/
-  `sign`/`popProve`. AS IMPLEMENTED: `g1Msm` and the trusted-setup
-  subgroup validation run on dedicated variable-time `G1` arithmetic
+  `sign`/`popProve`. AS IMPLEMENTED: `g1Msm` runs on dedicated
+  variable-time `G1` arithmetic (the trusted-setup subgroup validation
+  did too until 2026-09-15; it now uses `g1.Jacobian.subgroupCheck`)
   (`jacAddVartime`/`jacMixedAddVartime`/`jacScalarMulVartime`,
   `kzg.zig` — branchy twins of `g1.zig`'s constant-time formulas,
   pinned equal by tests); the FFT, barycentric evaluation, batch
@@ -1015,10 +1056,10 @@ panics, Debug AND ReleaseFast.
    free) Miller-loop point steps belong to the same future performance
    pass (the affine steps cost one `Fp2.inv` each — fine for
    verification workloads, the only current consumers).
-2. **The fast subgroup-check / cofactor-clearing paths** (Bowe's
-   untwist-Frobenius-twist technique, cited in `NOTICE`) — the simple,
-   always-correct `scalarMul`-by-order/cofactor forms are implemented;
-   the fast paths are marked `TODO` at their call sites.
+2. **The fast cofactor-clearing path** (Bowe's untwist-Frobenius-twist
+   technique, cited in `NOTICE`) — `clearCofactor` is still the simple
+   `scalarMul`-by-cofactor form. The fast SUBGROUP CHECKS are done
+   (2026-09-15, see "Subgroup checks" in the threat model).
 3. **Performance**: persistent Montgomery storage for
    `Fp`/`Fr` (currently canonical-at-rest — see the convention note in
    `fp.zig`), caching the `Fp6`/`Fp12` Frobenius coefficients (currently

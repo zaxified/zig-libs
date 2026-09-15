@@ -108,10 +108,22 @@ third-party SOURCE was ported into this module):
    not a license requirement.
 7. **Bowe, "Faster Subgroup Checks for BLS12-381"** (Cryptology ePrint
    2019/814) — the untwist-Frobenius-twist subgroup-check/cofactor-
-   clearing technique named (not implemented) in `g1.zig`/`g2.zig`'s
-   `subgroupCheck`/`clearCofactor` doc comments as the eventual
-   fast-path alternative to the simple `scalarMul`-by-order/cofactor
-   forms actually implemented (the always-correct first version).
+   clearing technique; still the named (not implemented) fast path for
+   `clearCofactor`. The SUBGROUP CHECKS (2026-09-15) follow the two
+   papers below instead, because Bowe's own proof is the tautological
+   one both of them point out.
+   - **Scott, "A note on group membership tests for G1, G2 and GT on
+     BLS pairing-friendly curves"** (Cryptology ePrint 2021/1130) — §6
+     (`G1`: `φ(P) = (βx, y) = −u²P`) and §4 (`G2`: `ψ(Q) = uQ`), the
+     tests `g1.zig`/`g2.zig`'s `subgroupCheck` implement.
+   - **El Housni, Guillevic, Piellard, "Co-factor clearing and subgroup
+     membership testing on pairing-friendly curves"** (Cryptology ePrint
+     2022/352) — §4.2 shows Scott's `G2` argument is incomplete; §4.3
+     Propositions 4 (`G1`) and 5 (`G2`) are the statements relied on,
+     with the gcd conditions of Propositions 1/2 re-checked for this
+     curve's own constants by the "F4 subgroup" tests. Both are public
+     academic papers — cited for attribution and as the correctness
+     source; no code was consulted.
 8. **Adj & Rodriguez-Henriquez, "Square root computation over even
    extension fields"** (Cryptology ePrint 2012/685, Algorithm 9) — the
    "complex method" square root over `Fp2` for `p ≡ 3 (mod 4)` base

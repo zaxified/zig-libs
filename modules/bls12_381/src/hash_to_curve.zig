@@ -1163,6 +1163,58 @@ test "hashToCurveG2: RFC 9380 Appendix J.10.1 final P, all 5 messages" {
     }
 }
 
+// -- F4 subgroup check, EXTERNAL anchor: RFC 9380's published
+//   map_to_curve outputs Q0/Q1 are on-curve points taken BEFORE
+//   clear_cofactor (so, with overwhelming probability, outside G1/G2),
+//   and its final P are inside. Built straight from the RFC's hex, not
+//   from this module's own map. The reference `[r]P == O` confirms each
+//   classification before the fast `subgroupCheck` is asked.
+
+test "F4 subgroup: RFC 9380 Q0/Q1 (off G1/G2) and final P (in G1/G2) — fast check == [r]P == O" {
+    const r_bytes = @import("scalar.zig").r_bytes;
+    var outside: usize = 0;
+    var inside: usize = 0;
+    for (g1_j91_map_vectors) |mv| {
+        for ([_][2][]const u8{ .{ mv.q0x, mv.q0y }, .{ mv.q1x, mv.q1y } }) |xy| {
+            const p = g1.Jacobian.fromAffine(.{ .x = try Fp.fromBytes(hexN(48, xy[0])), .y = try Fp.fromBytes(hexN(48, xy[1])) });
+            try std.testing.expect(p.isOnCurve());
+            try std.testing.expect(!p.scalarMulBytes(&r_bytes).isIdentity());
+            try std.testing.expect(!p.subgroupCheck());
+            outside += 1;
+        }
+    }
+    for (g1_j91_curve_vectors) |cv| {
+        const p = g1.Jacobian.fromAffine(.{ .x = try Fp.fromBytes(hexN(48, cv.px)), .y = try Fp.fromBytes(hexN(48, cv.py)) });
+        try std.testing.expect(p.scalarMulBytes(&r_bytes).isIdentity());
+        try std.testing.expect(p.subgroupCheck());
+        inside += 1;
+    }
+    for (g2_j101_map_vectors) |mv| {
+        const pts = [_]g2.Affine{
+            .{ .x = try fp2FromHexPair(mv.q0x_c0, mv.q0x_c1), .y = try fp2FromHexPair(mv.q0y_c0, mv.q0y_c1) },
+            .{ .x = try fp2FromHexPair(mv.q1x_c0, mv.q1x_c1), .y = try fp2FromHexPair(mv.q1y_c0, mv.q1y_c1) },
+        };
+        for (pts) |a| {
+            const p = g2.Jacobian.fromAffine(a);
+            try std.testing.expect(p.isOnCurve());
+            try std.testing.expect(!p.scalarMulBytes(&r_bytes).isIdentity());
+            try std.testing.expect(!p.subgroupCheck());
+            outside += 1;
+        }
+    }
+    for (g2_j101_curve_vectors) |cv| {
+        const p = g2.Jacobian.fromAffine(.{
+            .x = try fp2FromHexPair(cv.px_c0, cv.px_c1),
+            .y = try fp2FromHexPair(cv.py_c0, cv.py_c1),
+        });
+        try std.testing.expect(p.scalarMulBytes(&r_bytes).isIdentity());
+        try std.testing.expect(p.subgroupCheck());
+        inside += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 20), outside);
+    try std.testing.expectEqual(@as(usize, 10), inside);
+}
+
 // -- Property tests: every hash/encode output must be on-curve AND in
 //   the order-r subgroup (RFC 9380 §3's output contract), for messages
 //   the RFC publishes no vectors for.

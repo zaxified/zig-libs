@@ -22,6 +22,29 @@ const scalarmod = @import("scalar.zig");
 pub const Fp = fp.Fp;
 pub const Fr = scalarmod.Fr;
 
+/// `|x|`, the BLS12-381 seed magnitude (`x = -0xd201000000010000`) —
+/// one definition, owned by `pairing.zig`'s Miller loop.
+const bls_x_abs: u64 = @import("pairing.zig").bls_x_abs;
+comptime {
+    std.debug.assert(bls_x_abs >> 63 == 1); // mulByAbsXPublic starts at bit 62
+}
+
+/// `β`, the primitive cube root of unity in `Fp` for which the GLV map
+/// `φ(x, y) = (βx, y)` acts on `G1` as multiplication by `λ = -x²`
+/// (the OTHER root, `β²`, acts as `λ² = x² - 1`). Derived at comptime,
+/// never transcribed: `2^((p-1)/3)` (`p ≡ 1 mod 3`, exact division
+/// enforced by `pExponentBytes`) — `2` is a cubic non-residue, which
+/// the `!= 1` guard below enforces. Which of the two roots is the right
+/// one is pinned by the "φ acts as [-x²] on G1" test below — the
+/// generator test, since `G1` is cyclic.
+const endomorphism_beta: Fp = blk: {
+    @setEvalBranchQuota(50_000_000);
+    const two = Fp.fromInt(u8, 2) catch unreachable;
+    const root = two.pow(fp.pExponentBytes(-1, 3));
+    if (root.eql(Fp.one)) @compileError("bls12_381: 2 is a cube mod p; pick another base for β");
+    break :blk root;
+};
+
 /// The curve equation constant: `E: y^2 = x^3 + b`, `b = 4`. REAL:
 /// `Fp.fromInt` is pure `std.crypto.ff` delegation (see `fp.zig`).
 pub const b: Fp = Fp.fromInt(u8, 4) catch @compileError("bls12_381: bad G1 b constant");
@@ -290,32 +313,91 @@ pub const Jacobian = struct {
         return self.y.square().eql(rhs);
     }
 
-    /// `true` iff this point is in the order-`r` SUBGROUP `G1` (not
-    /// merely on the curve `E(Fp)`, which has a much larger order
-    /// `r * h1` — see `cofactor_bytes`). THE classic BLS pitfall this
-    /// module's `SPEC.md` centers its threat model on: skipping this
-    /// check on an externally-supplied point lets an attacker submit a
-    /// small-subgroup point and force a degenerate/predictable pairing
-    /// result (a real, exploited class of bug in early BLS
-    /// implementations). Construction: the SIMPLE, always-correct
-    /// approach is `scalarMul(self, r).isIdentity()` (one full
-    /// scalar-mul by the 255-bit group order); a faster
-    /// endomorphism-based check exists for `G1` too (BLS12 curves admit
-    /// an efficient endomorphism-based subgroup test — see the curve's
-    /// defining `z` parameter and e.g. Bowe's "Faster Subgroup Checks
-    /// for BLS12-381" or the certified implementations cited in
-    /// `NOTICE`) but is a genuine algorithm choice, not mechanical —
-    /// implement the simple `scalarMul`-by-`r` version FIRST and treat
-    /// the fast path as a follow-up optimization, not a Part-1
-    /// scaffolding concern.
+    /// `true` iff this point is ON THE CURVE and in the order-`r`
+    /// SUBGROUP `G1` (not merely on `E(Fp)`, which has a much larger
+    /// order `r * h1` — see `cofactor_bytes`). THE classic BLS pitfall
+    /// this module's `SPEC.md` centers its threat model on: skipping
+    /// this check on an externally-supplied point lets an attacker
+    /// submit a small-subgroup point and force a degenerate/predictable
+    /// pairing result (a real, exploited class of bug in early BLS
+    /// implementations). The identity passes (it is in `G1`).
+    ///
+    /// Construction (2026-09-15, A1 `drand` F4): the GLV-endomorphism
+    /// membership test `φ(P) == [-x²]P`, `φ(x, y) = (βx, y)`, `x` the
+    /// BLS seed — Scott, "A note on group membership tests for G1, G2
+    /// and GT on BLS pairing-friendly curves" (ePrint 2021/1130) §6, with
+    /// the corrected proof in El Housni–Guillevic–Piellard, "Co-factor
+    /// clearing and subgroup membership testing on pairing-friendly
+    /// curves" (ePrint 2022/352) §4.3, Proposition 4: "For the BLS12
+    /// family, if Q ∈ E(Fp), φ(Q) = [−u²]Q =⇒ Q ∈ E(Fp)[r]." (their
+    /// Proposition 2 needs `φ` to act as `λ = −u²` on `E(Fp)[r]` and
+    /// `gcd(χ(λ), c1) = 1`; both are re-checked for THIS curve by the
+    /// tests below, not taken on trust). The premise `Q ∈ E(Fp)` is why
+    /// the curve equation is checked first. Cost: two multiplications
+    /// by the 64-bit `|x|` instead of one by the 255-bit `r`; the old
+    /// `[r]P == O` form is kept as `subgroupCheckByOrder`, the test-only
+    /// reference every differential test compares against.
+    ///
+    /// Timing: the only data-dependent control flow is the identity
+    /// early-out in `isOnCurve`/`eqlPoints` and the bit pattern of the
+    /// fixed public constant `|x|` — nothing depends on the point's
+    /// coordinates beyond "is it the identity". The inputs of this
+    /// check are public points in every caller (keys, signatures,
+    /// proofs, setup points).
     pub fn subgroupCheck(self: Jacobian) bool {
-        // The simple, always-correct form: [r]P == O. Note r itself is
-        // NOT a canonical Fr value, so this goes through
-        // scalarMulBytes, not scalarMul.
-        // TODO: the faster endomorphism-based check (Bowe, "Faster
-        // Subgroup Checks for BLS12-381" — see NOTICE) is a deferred
-        // optimization, per SPEC.md's Backlog.
+        if (!self.isOnCurve()) return false;
+        // x is negative, but [x²] = [|x|]∘[|x|], so the sign drops out.
+        const x2p = mulByAbsXPublic(mulByAbsXPublic(self));
+        return eqlPoints(endomorphismPhi(self), x2p.negate());
+    }
+
+    /// The pre-2026-09-15 subgroup check, `[r]P == O` via the
+    /// constant-time 255-bit ladder. Kept ONLY as the reference the
+    /// differential tests hold `subgroupCheck` against (it is the
+    /// definition of the subgroup, so it needs no cited theorem); no
+    /// production caller.
+    fn subgroupCheckByOrder(self: Jacobian) bool {
         return scalarMulBytes(self, &scalarmod.r_bytes).isIdentity();
+    }
+
+    /// `φ(X, Y, Z) = (βX, Y, Z)` — the GLV endomorphism of `y² = x³ + b`
+    /// (`β` a primitive cube root of unity in `Fp`, `endomorphism_beta`),
+    /// written on Jacobian coordinates: affine `x = X/Z²` scales by `β`
+    /// exactly when `X` does.
+    fn endomorphismPhi(p: Jacobian) Jacobian {
+        return .{ .x = p.x.mul(endomorphism_beta), .y = p.y, .z = p.z };
+    }
+
+    /// `[|x|]P` for the BLS seed magnitude `|x| = 0xd201000000010000`
+    /// (`pairing.bls_x_abs`). Variable-time ONLY in that fixed public
+    /// constant (six set bits: an `add` on those, a `double` on every
+    /// bit); the point arithmetic itself is the same complete,
+    /// branchless `double`/`add`, so a point of small order hitting a
+    /// degenerate case (`acc == ±P`) is handled. Not a general scalar
+    /// multiplication and never used with a secret scalar — the
+    /// secret-scalar engine is `scalarMulBytes`, unchanged.
+    fn mulByAbsXPublic(p: Jacobian) Jacobian {
+        var acc = p; // the leading 1 of |x| (bit 63)
+        var bit: u6 = 62;
+        while (true) : (bit -= 1) {
+            acc = acc.double();
+            if ((bls_x_abs >> bit) & 1 == 1) acc = acc.add(p);
+            if (bit == 0) break;
+        }
+        return acc;
+    }
+
+    /// Projective equality: `X1·Z2² == X2·Z1²` and `Y1·Z2³ == Y2·Z1³`,
+    /// the identity equal only to itself.
+    fn eqlPoints(a: Jacobian, other: Jacobian) bool {
+        const a_inf = a.isIdentity();
+        const b_inf = other.isIdentity();
+        if (a_inf or b_inf) return a_inf and b_inf;
+        const z1z1 = a.z.square();
+        const z2z2 = other.z.square();
+        const x_eq = a.x.mul(z2z2).eql(other.x.mul(z1z1));
+        const y_eq = a.y.mul(z2z2).mul(other.z).eql(other.y.mul(z1z1).mul(a.z));
+        return x_eq and y_eq;
     }
 
     /// Multiplies an arbitrary `E(Fp)` point by the cofactor `h1`
@@ -710,4 +792,213 @@ test "G1 uncompressed round-trip through Jacobian arithmetic" {
     const back = try fromBytesUncompressed(bytes);
     try std.testing.expect(back.x.eql(g5.x));
     try std.testing.expect(back.y.eql(g5.y));
+}
+
+// ── F4 fast subgroup check: preconditions, endomorphism, differential ────
+//
+// `subgroupCheck` is `φ(P) == [-x²]P` (see its doc comment). These tests
+// (1) re-derive, from this file's own constants, the two conditions the
+// cited proposition needs, (2) pin `β` and `mulByAbsXPublic` against the
+// constant-time ladder, and (3) hold the fast check against the
+// definition `[r]P == O` (`subgroupCheckByOrder`) on points in AND out of
+// the subgroup — every out-of-subgroup point is confirmed out by the
+// reference first, so no classification is assumed.
+
+fn beInt(comptime bytes: []const u8) comptime_int {
+    comptime var v: comptime_int = 0;
+    for (bytes) |byte| v = v * 256 + @as(comptime_int, byte);
+    return v;
+}
+
+fn beBytes(comptime n: usize, comptime v: comptime_int) [n]u8 {
+    return comptime blk: {
+        var out: [n]u8 = undefined;
+        var rest: comptime_int = v;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            out[i] = @intCast(@mod(rest, 256));
+            rest = @divFloor(rest, 256);
+        }
+        if (rest != 0) @compileError("beBytes: value does not fit");
+        break :blk out;
+    };
+}
+
+fn gcdInt(comptime lhs: comptime_int, comptime rhs: comptime_int) comptime_int {
+    var x = lhs;
+    var y = rhs;
+    while (y != 0) {
+        const t = @mod(x, y);
+        x = y;
+        y = t;
+    }
+    return x;
+}
+
+const seed_u: comptime_int = -@as(comptime_int, bls_x_abs);
+const p_int_t: comptime_int = beInt(&fp.p_bytes);
+const r_int_t: comptime_int = beInt(&scalarmod.r_bytes);
+const h1_int_t: comptime_int = beInt(&cofactor_bytes);
+
+test "F4 subgroup G1: EHGP 2022/352 Proposition 4 preconditions hold for this curve" {
+    const u = seed_u;
+    // The BLS12 family polynomials at this seed (EHGP Example 2): the
+    // module's p, r and h1 are exactly q(u), r(u), c1(u).
+    try std.testing.expect(r_int_t == u * u * u * u - u * u + 1);
+    try std.testing.expect(3 * h1_int_t == (u - 1) * (u - 1));
+    try std.testing.expect(3 * (p_int_t - u) == (u - 1) * (u - 1) * r_int_t);
+    // #E(Fp) = p + 1 - t, t = u + 1, and it is h1 * r.
+    try std.testing.expect(h1_int_t * r_int_t == p_int_t + 1 - (u + 1));
+    // χ = X² + X + 1, λ = -u²: χ(λ) = u⁴ - u² + 1 = r, so the gcd
+    // condition of Proposition 2 is gcd(h1, r) = 1 — and r does not
+    // divide h1, so E(Fp)[r] is exactly the order-r group G1.
+    const lambda = -(u * u);
+    try std.testing.expect(lambda * lambda + lambda + 1 == r_int_t);
+    try std.testing.expect(gcdInt(h1_int_t, r_int_t) == 1);
+    // β is a PRIMITIVE cube root of unity: β² + β + 1 = 0 (so β ≠ 1).
+    try std.testing.expect(endomorphism_beta.square().add(endomorphism_beta).add(Fp.one).isZero());
+}
+
+test "F4 subgroup G1: φ acts as [-x²] on G1 (pins β) and [|x|] matches the constant-time ladder" {
+    const g = jacGen();
+    const x_abs = beBytes(8, bls_x_abs);
+    const x_abs_int: comptime_int = bls_x_abs;
+    const x_sq = comptime beBytes(16, x_abs_int * x_abs_int);
+    try expectSamePoint(Jacobian.mulByAbsXPublic(g), g.scalarMulBytes(&x_abs));
+    try expectSamePoint(Jacobian.endomorphismPhi(g), g.scalarMulBytes(&x_sq).negate());
+    // G1 is cyclic, so the eigenvalue fixed on the generator holds for
+    // every member; the other root β² would give λ² = x² - 1 instead.
+    const other_root = comptime beBytes(16, x_abs_int * x_abs_int - 1);
+    try std.testing.expect(!Jacobian.eqlPoints(Jacobian.endomorphismPhi(g), g.scalarMulBytes(&other_root)));
+}
+
+test "F4 subgroup G1: an off-curve isomorphic image of a member — old [r]P == O accepts, subgroupCheck refuses" {
+    // (x, y) ↦ (a²x, a³y), a ∈ Fp, is an isomorphism onto y² = x³ + a⁶·b.
+    // It commutes with the group law AND with φ (β scales x only), so the
+    // image of a G1 member has order r and satisfies φ(P) = [−x²]P on its
+    // own curve: the endomorphism equation alone cannot see that it is off
+    // E. Only the curve-equation premise does — the definition-only
+    // reference does not either, which is why this is the one input class
+    // where the fast check is deliberately STRICTER than [r]P == O.
+    const two = try Fp.fromInt(u8, 2);
+    var k: [32]u8 = @splat(0);
+    k[31] = 0x2b;
+    const m = jacGen().scalarMulBytes(&k);
+    const img: Jacobian = .{ .x = m.x.mul(two.square()), .y = m.y.mul(two.square().mul(two)), .z = m.z };
+    try std.testing.expect(!img.isOnCurve());
+    try std.testing.expect(img.subgroupCheckByOrder());
+    const x2p = Jacobian.mulByAbsXPublic(Jacobian.mulByAbsXPublic(img));
+    try std.testing.expect(Jacobian.eqlPoints(Jacobian.endomorphismPhi(img), x2p.negate()));
+    try std.testing.expect(!img.subgroupCheck());
+}
+
+fn randomCurvePoint(rng: std.Random) Jacobian {
+    while (true) {
+        var buf: [Fp.encoded_bytes]u8 = undefined;
+        rng.bytes(&buf);
+        buf[0] &= 0x1f;
+        const x = Fp.fromBytes(buf) catch continue;
+        const y = x.square().mul(x).add(b).sqrt() orelse continue;
+        return Jacobian.fromAffine(.{ .x = x, .y = y });
+    }
+}
+
+fn expectMembership(p: Jacobian, member: bool) !void {
+    // The reference decides what the point IS; the fast check must agree.
+    try std.testing.expectEqual(member, p.subgroupCheckByOrder());
+    try std.testing.expectEqual(member, p.subgroupCheck());
+}
+
+test "F4 subgroup G1: fast check == [r]P == O on members, non-members and off-curve points" {
+    var prng = std.Random.DefaultPrng.init(0xf4_5b9_2026_0915);
+    const rng = prng.random();
+    var members: usize = 0;
+    var outsiders: usize = 0;
+
+    // Members: identity, generator, random multiples, cleared cofactors.
+    try expectMembership(Jacobian.identity, true);
+    try expectMembership(jacGen(), true);
+    members += 2;
+    for (0..12) |_| {
+        var k: [32]u8 = undefined;
+        rng.bytes(&k);
+        try expectMembership(jacGen().scalarMulBytes(&k), true);
+        members += 1;
+    }
+    for (0..4) |_| {
+        try expectMembership(randomCurvePoint(rng).clearCofactor(), true);
+        members += 1;
+    }
+
+    // Non-members: random curve points (no cofactor clearing) — each one
+    // confirmed outside by the reference inside expectMembership.
+    for (0..40) |_| {
+        try expectMembership(randomCurvePoint(rng), false);
+        outsiders += 1;
+    }
+    // Pure cofactor-torsion T = [r]R, and member + T (the malleation shape).
+    for (0..8) |_| {
+        const t = randomCurvePoint(rng).scalarMulBytes(&scalarmod.r_bytes);
+        try std.testing.expect(!t.isIdentity());
+        try expectMembership(t, false);
+        var k: [32]u8 = undefined;
+        rng.bytes(&k);
+        try expectMembership(jacGen().scalarMulBytes(&k).add(t), false);
+        outsiders += 2;
+    }
+    // Small-order points: for every prime l < 100 dividing h1, a point of
+    // order exactly l, alone and added to the generator. Built from the
+    // l-PRIMARY part, [#E/l^v]R (v = l's multiplicity in #E), then
+    // multiplied by l until the next step would be O. ⚠ [#E/l]R is NOT
+    // enough: 11² | h1, and when that part is Z/11 × Z/11 the group
+    // exponent lacks one factor 11, so [#E/11]R = O for EVERY R (a first
+    // draft of this test looped forever on exactly that).
+    const small_primes = [_]comptime_int{ 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97 };
+    var small_orders: usize = 0;
+    inline for (small_primes) |l| {
+        if (comptime @mod(h1_int_t, l) == 0) {
+            const k = comptime blk: {
+                var m: comptime_int = h1_int_t * r_int_t;
+                while (@mod(m, l) == 0) m = @divExact(m, l);
+                break :blk beBytes(64, m);
+            };
+            const l_bytes = comptime beBytes(1, l);
+            var t = Jacobian.identity;
+            var tries: usize = 0;
+            while (t.isIdentity()) : (tries += 1) {
+                try std.testing.expect(tries < 8);
+                t = randomCurvePoint(rng).scalarMulBytes(&k);
+            }
+            while (!t.scalarMulBytes(&l_bytes).isIdentity()) t = t.scalarMulBytes(&l_bytes);
+            try std.testing.expect(!t.isIdentity());
+            try expectMembership(t, false);
+            try expectMembership(t.add(jacGen()), false);
+            outsiders += 2;
+            small_orders += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), small_orders); // h1 = 3 · 11² · (larger primes)²
+    // The order-3 point (0, 2): x = 0 is the fixed line of φ itself.
+    const two = try Fp.fromInt(u8, 2);
+    try expectMembership(Jacobian.fromAffine(.{ .x = Fp.zero, .y = two }), false);
+    outsiders += 1;
+
+    // Off-curve points: both refuse (the fast check by its curve-equation
+    // premise, the reference because [r]P lands nowhere near O).
+    var off_curve: usize = 0;
+    while (off_curve < 8) {
+        const p = randomCurvePoint(rng);
+        const bad: Jacobian = .{ .x = p.x.add(Fp.one), .y = p.y, .z = p.z };
+        if (bad.isOnCurve()) continue;
+        try expectMembership(bad, false);
+        off_curve += 1;
+    }
+    var bad_gen = jacGen().scalarMulBytes(&beBytes(1, 7));
+    bad_gen.y = bad_gen.y.add(Fp.one);
+    try std.testing.expect(!bad_gen.isOnCurve());
+    try expectMembership(bad_gen, false);
+
+    try std.testing.expectEqual(@as(usize, 18), members);
+    try std.testing.expectEqual(@as(usize, 61), outsiders);
 }

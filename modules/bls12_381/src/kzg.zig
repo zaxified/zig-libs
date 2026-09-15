@@ -335,11 +335,11 @@ fn jacScalarMulVartime(p: g1.Jacobian, s: []const u8) g1.Jacobian {
     return acc;
 }
 
-/// Variable-time `[r]P == O` subgroup check — `g1.Jacobian.subgroupCheck`'s
-/// public-data twin (~3x faster: no double-and-add-ALWAYS, no per-bit
-/// `ctSelect`), used for validating the embedded trusted setup's 8192
-/// PUBLIC `G1` points. Equivalence with the constant-time check is
-/// pinned by this file's own tests.
+/// Variable-time `[r]P == O` subgroup check. It WAS the trusted-setup
+/// loader's `G1` check (~3x faster than the old constant-time `[r]P`
+/// form); since 2026-09-15 `g1.Jacobian.subgroupCheck` is an endomorphism
+/// test that is faster still, so the loader uses that, and this stays
+/// only as an independent reference the tests below compare it with.
 fn subgroupCheckVartime(p: g1.Jacobian) bool {
     return jacScalarMulVartime(p, &scalar.r_bytes).isIdentity();
 }
@@ -357,16 +357,16 @@ fn parseLineCount(line_opt: ?[]const u8) KzgError!usize {
 /// (exact-width check), `g1.fromBytesCompressed` (on-curve check), then
 /// a subgroup check (REQUIRED — a trusted-setup file is untrusted input
 /// until validated; see `KzgError.PointNotInSubgroup`'s doc comment).
-/// The subgroup check is `subgroupCheckVartime` — setup points are
-/// PUBLIC data (see the variable-time section comment above), and this
-/// is the loader's dominant cost across 8192 `G1` points.
+/// The subgroup check is `g1.Jacobian.subgroupCheck` (the endomorphism
+/// test) — the loader's dominant cost across 8192 `G1` points, and the
+/// fastest check this module has.
 fn parseG1Line(line_raw: []const u8) KzgError!g1.Affine {
     const line = trimLine(line_raw);
     if (line.len != 2 * g1.compressed_bytes) return error.MalformedTrustedSetup;
     var bytes: [g1.compressed_bytes]u8 = undefined;
     _ = std.fmt.hexToBytes(&bytes, line) catch return error.MalformedTrustedSetup;
     const affine = g1.fromBytesCompressed(bytes) catch return error.MalformedTrustedSetup;
-    if (!subgroupCheckVartime(g1.Jacobian.fromAffine(affine))) return error.PointNotInSubgroup;
+    if (!g1.Jacobian.fromAffine(affine).subgroupCheck()) return error.PointNotInSubgroup;
     return affine;
 }
 
@@ -504,8 +504,8 @@ fn dupeSetup(allocator: std.mem.Allocator, src: *const TrustedSetup) KzgError!Tr
 /// `TrustedSetup.deinit`.
 ///
 /// Cost/caching note: the full validation — all `2*FIELD_ELEMENTS_PER_BLOB
-/// + NUM_G2_POINTS` = 8257 points subgroup-checked (one `[r]P` scalar
-/// multiplication each) — runs ONCE per process and is memoized
+/// + NUM_G2_POINTS` = 8257 points subgroup-checked (one endomorphism
+/// subgroup check each) — runs ONCE per process and is memoized
 /// (`validated_setup_cache`); every subsequent call deep-copies the
 /// already-validated points into the caller's allocator. Memoization is
 /// semantically transparent because the input is a compile-time-constant
@@ -513,9 +513,9 @@ fn dupeSetup(allocator: std.mem.Allocator, src: *const TrustedSetup) KzgError!Tr
 /// ever skips validation, it just isn't re-validated per call (the
 /// scaffold's original per-call re-validation cost minutes per test
 /// binary for zero added assurance). The first load's per-point checks
-/// are additionally fanned out across CPU cores and use the
-/// variable-time subgroup check for the PUBLIC `G1` setup points (see
-/// `subgroupCheckVartime`).
+/// are additionally fanned out across CPU cores; the `G1` setup points
+/// go through `g1.Jacobian.subgroupCheck` (the endomorphism test, see
+/// `parseG1Line`).
 pub fn loadTrustedSetup(allocator: std.mem.Allocator) KzgError!TrustedSetup {
     if (validated_setup_cache.load(.acquire)) |cached| return dupeSetup(allocator, cached);
 
