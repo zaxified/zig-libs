@@ -54,6 +54,19 @@
 //! untainted first; the verdict is declassified before the harness branches
 //! on it (accept/reject is public).
 //!
+//! ⭐ The gate that DOES catch it is `scripts/check-ct-compare.py`, which pins
+//! `modules/ecvrf/src/ecvrf.zig` at one `timing_safe` comparison and zero
+//! plain `std.mem` ones. Measured on that mutation 2026-09-16: the module's
+//! own suite is 31/31 green in both release modes, this harness's counts do
+//! not move, and that gate fails naming the file and the direction (1 → 0 on
+//! the left, 0 → 1 on the right). ctgrind's own red there is the SOURCE
+//! DIGEST, which trips on any edit to the file — a comment included — so it
+//! says "re-read this", not "the comparison changed".
+//!
+//! ⚠ What neither gate does: the pin is a count per FILE, so it cannot see
+//! WHICH values are compared. Swapping the compare while adding a
+//! `timing_safe` call elsewhere in the same file keeps the count at one.
+//!
 //! ## The traps
 //!
 //! 1. Without `-fvalgrind` every row reads 0 regardless

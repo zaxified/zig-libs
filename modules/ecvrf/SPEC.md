@@ -164,6 +164,14 @@ real — see "Implementation notes" below.
   lines, because both forms end in one branch on a tainted equality at the
   same call site and memcheck counts contexts by address.
 
+  **That swap is caught by `scripts/check-ct-compare.py` instead** (A1 E15),
+  which pins this file at one `timing_safe` comparison and zero plain
+  `std.mem` ones and runs in every lane that touches the module. Measured
+  2026-09-16 on exactly that mutation: the suite is 31/31 green in ReleaseFast
+  and ReleaseSafe, both ctgrind rows keep their counts, and only that gate
+  goes red — naming the file and the direction. ⚠ It counts per file, so it
+  holds the DECISION in place, not the choice of operands.
+
   **Teeth, measured 2026-08-11 on the one-shot-`prove` harness.** Re-creating the historical defect —
   pointing `prove`'s three secret-scalar multiplications back at
   `std.crypto.ecc.Edwards25519`'s ladder, whose trailing

@@ -172,7 +172,11 @@ declare -A TARGETS=(
     # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
     # the target taints the public `alpha` to list its input-dependent
     # branches. It does NOT catch E15's `timing_safe.eql` -> `mem.eql`
-    # mutation (measured, same count); see the harness doc comment.
+    # mutation (measured, same count); see the harness doc comment. The gate
+    # that does is `scripts/check-ct-compare.py`, which pins the count of
+    # constant-time comparisons per file — measured on that mutation, it is
+    # the ONLY one of suite/ctgrind counts/pin that goes red for a reason
+    # about the comparison.
     [ecvrf]="prove verify"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"

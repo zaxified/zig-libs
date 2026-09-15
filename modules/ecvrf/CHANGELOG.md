@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — documentation only, no code and no gate data changed (A1 E15
+  closed). The audit recorded that nothing anywhere caught replacing `verify`'s
+  `std.crypto.timing_safe.eql` with `std.mem.eql` — true when it was written
+  (2026-09-06), and untrue three days later, when `scripts/check-ct-compare.py`
+  was added with a row for this file. Measured on that mutation: the suite is
+  31/31 green in both release modes, both ctgrind rows keep every count
+  (`prove` 2/0/2/0, `verify` 7/7/0/0), and `check-ct-compare` fails naming the
+  file and the direction. SPEC.md and the harness now say which gate holds this
+  decision, and what it does not do: the pin is a count per file, so it cannot
+  see which values are compared.
+
 - **2026-09-15** — ctgrind harness only, no library code changed (A1 E15 and the
   `prove` 3 → 5 re-pin question). `prove` now taints the secret key alone: it derives the key
   pair with `KeyPair.fromSecretKey`, declassifies the published `Y`, and proves with
