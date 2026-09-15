@@ -117,9 +117,16 @@ pub fn mnemonicToEntropy(mnemonic: []const u8, out: []u8) Error![]const u8 {
     @memset(out[0..ent_bytes], 0);
     var bit: usize = 0;
     while (bit < ent_bits) : (bit += 1) {
-        if (wordBit(idxs[bit / 11], bit % 11) == 1) {
-            out[bit / 8] |= @as(u8, 1) << @intCast(7 - (bit % 8));
-        }
+        // No `if`: `wordIndex`'s constant-time rewrite (M6-CT) makes
+        // `idxs` genuinely secret-dependent data (previously it was
+        // control-flow-derived from the old binary search and carried no
+        // taint under this repo's memcheck-based ctgrind harness — an
+        // artifact of the tool, not a real guarantee). Branching on
+        // `wordBit`'s result here would turn that into a NEW
+        // secret-dependent branch; ORing in the bit value directly
+        // (0 or 1, shifted into place) writes the same byte with no
+        // conditional at all.
+        out[bit / 8] |= @as(u8, wordBit(idxs[bit / 11], bit % 11)) << @intCast(7 - (bit % 8));
     }
 
     var checksum: [32]u8 = undefined;
@@ -210,19 +217,55 @@ fn wordBit(word_idx: u11, n: usize) u1 {
     return @truncate(word_idx >> @intCast(10 - n));
 }
 
-/// Binary search `wordlist.english` (sorted, verified in `kat_test.zig`).
+/// Longest `wordlist.english` entry (verified in `kat_test.zig`'s sort/
+/// uniqueness check).
+const max_word_len = 8;
+
+/// Constant-time wordlist lookup (audit finding `bip32` M6-CT). This used
+/// to be a binary search (`std.mem.order` against `wordlist.english[mid]`)
+/// — `lo`/`hi`, and therefore which candidate got compared and which half
+/// of the table the search descended into, were a direct function of the
+/// SECRET word, i.e. a textbook cache/branch-timing channel over which
+/// mnemonic word this was (audit `bip32.md` M6, ctgrind: 2 branch
+/// addresses on `w`'s bytes). This scans all `wordlist.count` (2048)
+/// entries unconditionally — no early exit — and mask-selects the result
+/// with the same `0 -% @intFromBool(cond)` idiom `ed448`'s
+/// `ctSelectPoint`/`Fe.ctSelect` use for their own secret-indexed table
+/// lookups: every per-candidate comparison feeds only a bitwise AND/OR
+/// merge, never a branch or a division/modulo. The one exception is the
+/// final "did ANY of the 2048 entries match" check below: that's this
+/// function's own found/not-found verdict, which the caller learns from
+/// the return value regardless of timing — same "verdict is public, the
+/// path to it is not" posture as the checksum-compare fix (M9).
 fn wordIndex(w: []const u8) ?u11 {
-    var lo: usize = 0;
-    var hi: usize = wordlist.count;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        switch (std.mem.order(u8, wordlist.english[mid], w)) {
-            .eq => return @intCast(mid),
-            .lt => lo = mid + 1,
-            .gt => hi = mid,
-        }
+    // `w` copied once into a fixed, zero-padded buffer so every candidate
+    // is compared against the same `max_word_len` bytes. Bounding the copy
+    // at `max_word_len` cannot misclassify a too-long `w` as a match: any
+    // real wordlist entry has `word.len <= max_word_len`, so `cond` below
+    // is false for a truncated `w` on the `word.len == w.len` term alone.
+    var wbuf = [_]u8{0} ** max_word_len;
+    const copy_len = @min(w.len, max_word_len);
+    @memcpy(wbuf[0..copy_len], w[0..copy_len]);
+
+    var found_mask: u32 = 0;
+    var result: u32 = 0;
+    for (wordlist.english, 0..) |word, i| {
+        var diff: u8 = 0;
+        for (word, 0..) |b, j| diff |= b ^ wbuf[j];
+        const cond = word.len == w.len and diff == 0;
+        // `@as(u32, 0)`, not bare `0`: without the explicit cast Zig
+        // resolves `-%` in `@intFromBool`'s `u1` (peer-typed to the
+        // narrower runtime operand, not the `u32` the result is assigned
+        // to), so `cond=true` wrapped to `1`, not `0xFFFF_FFFF` — every
+        // match then only masked in bit 0 of `i`, corrupting every even
+        // index's lookup. `ed448`'s `Fe.ctSelect` casts for the same
+        // reason.
+        const mask: u32 = @as(u32, 0) -% @intFromBool(cond);
+        found_mask |= mask;
+        result |= mask & @as(u32, @intCast(i));
     }
-    return null;
+    if (found_mask == 0) return null;
+    return @intCast(result);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────

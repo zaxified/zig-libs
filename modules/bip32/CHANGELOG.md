@@ -5,6 +5,26 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** A1 finding M6-CT. `bip39.zig`'s `wordIndex`
+  (BIP-39 wordlist lookup) was a binary search that branched and indexed
+  `wordlist.english[mid]` directly on the secret mnemonic word at every step — a cache/
+  branch-timing channel over which word was typed (the `mnemonic` ctgrind row's 2
+  `bip39.zig:219` contexts). Rewritten as a full 2048-entry linear scan with a branchless
+  `0 -% @intFromBool(cond)` mask-select (the idiom `ed448`'s `ctSelectPoint`/`Fe.ctSelect` use),
+  no early exit, no division/modulo on secret data. `mnemonicToEntropy`'s entropy-bit-assembly
+  loop was also made branchless in the same change, since `wordIndex`'s result is now genuinely
+  secret-DATA (not, as before, control-flow-derived and accidentally untainted under this
+  repo's memcheck-based ctgrind tool). Net effect on the `mnemonic` ctgrind row: in-file stays
+  at 3, but composition changes from "2 addresses inside `wordIndex`'s own search" (the real
+  leak) to "1 `wordIndex` found/not-found verdict + 1 `mnemonicToEntropy` checksum verdict" (both
+  pre-existing return-value information, not new leaks — see `SPEC.md`). Positive control:
+  reverting `wordIndex` reproduces the old 3-in-file/0-witness split at the exact old lines.
+  Semantics/errors unchanged (`WordNotInList`/`InvalidChecksum` on the same inputs); all 41
+  tests including the official BIP-39 vectors still pass. Cost: linear scan is inherently
+  slower than binary search — measured (ReleaseFast, 7 interleaved rounds, CPU time) 12-word
+  `mnemonicToEntropy` ~1.37 µs → ~226.6 µs (~165×), 24-word ~2.48 µs → ~450.3 µs (~182×); this is
+  the price of constant time, not a regression.
+
 - **2026-09-16** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M6); no library code
   changed. Targets `master` (seed), `derive` (master scalar along `m/44'/0'/0'/0/0`), `seed`
   (mnemonic → PBKDF2) and `mnemonic` (mnemonic → entropy). In-file 1 / 5 / 0 / 3: the first two
