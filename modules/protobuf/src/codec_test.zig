@@ -659,7 +659,11 @@ fn fuzzEncodeIntoAgreesWithEncodeAlloc(_: void, smith: *std.testing.Smith) !void
     const gpa = testing.allocator;
 
     var inners_buf: [6]Inner = undefined;
-    const n_inners = smith.index(inners_buf.len + 1);
+    // `smith.index` is a ranged draw and this is the harness's FIRST draw --
+    // check-fuzz-reach R1: it reads the range minimum for all but 1 in 2^64
+    // seeds, collapsing every corpus entry to `n_inners == 0`. `value(u64)`
+    // has full-range weights (faithful to any seed byte), reduced by hand.
+    const n_inners: usize = @intCast(smith.value(u64) % (inners_buf.len + 1));
     for (inners_buf[0..n_inners]) |*it| {
         it.* = .{ .v = smith.value(i32), .note = if (smith.value(bool)) "x" else "" };
     }
