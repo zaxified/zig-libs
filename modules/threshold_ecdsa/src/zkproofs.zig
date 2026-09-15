@@ -334,8 +334,12 @@ fn mulBytes(a: []const u8, b: []const u8, out: []u8) void {
 /// response shape. `out.len` must be >= `max(e.len + x.len, addend.len) + 1`.
 /// Returns the full (zero-padded) `out`; callers strip. Variable-time in
 /// the operands' LENGTHS only (all call sites pass fixed-width buffers for
-/// the secret operands); the multiply itself touches every byte position
-/// unconditionally.
+/// the secret operands); the multiply AND the carry propagation touch every
+/// byte position unconditionally — the tail loop below runs a FIXED number
+/// of steps (`pos` is a function of `e.len`/`x.len`/`i`, all public per call
+/// site, never of `carry`) instead of stopping early once the secret-derived
+/// carry settles (A1 threshold_ecdsa R2, 2026-09-17: the early exit compiled
+/// to a `cmp $0x100`/`jb` over the tainted running sum).
 fn mulAddBytes(e: []const u8, x: []const u8, addend: []const u8, out: []u8) []u8 {
     std.debug.assert(out.len >= e.len + x.len + 1 and out.len >= addend.len + 1);
     @memset(out, 0);
@@ -352,8 +356,13 @@ fn mulAddBytes(e: []const u8, x: []const u8, addend: []const u8, out: []u8) []u8
             out[pos] = @truncate(cur);
             carry = cur >> 8;
         }
+        // Fixed-length carry propagation: walk every remaining byte down to
+        // `out[0]`, always — never branch on `carry != 0`. Once the secret
+        // carry has actually settled to 0 the remaining steps are additive
+        // no-ops (`out[pos] + 0`), so the result is bit-identical to the old
+        // early-exit version; only the trip count stops depending on data.
         var pos = out.len - 1 - (e.len - 1 - i) - x.len;
-        while (carry != 0) {
+        while (true) {
             const cur = @as(u32, out[pos]) + carry;
             out[pos] = @truncate(cur);
             carry = cur >> 8;
@@ -2879,6 +2888,113 @@ fn buildDecoderFixture() DecoderFixture {
     const kp = paillier.generate(random, paillier.min_generate_bits) catch unreachable;
     const n_tilde = root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
     return .{ .n_tilde = n_tilde, .alice_pk = kp.public };
+}
+
+/// Bit-for-bit copy of `mulAddBytes` AS IT WAS BEFORE the A1 R2 fix
+/// (2026-09-17): the carry-propagation tail exits as soon as `carry` hits
+/// zero, instead of walking every remaining byte unconditionally. Kept only
+/// here, in the test, as the "old" side of the differential below — the
+/// production function must never regain this shape.
+fn mulAddBytesEarlyExitRef(e: []const u8, x: []const u8, addend: []const u8, out: []u8) []u8 {
+    std.debug.assert(out.len >= e.len + x.len + 1 and out.len >= addend.len + 1);
+    @memset(out, 0);
+    @memcpy(out[out.len - addend.len ..], addend);
+    var i: usize = e.len;
+    while (i > 0) {
+        i -= 1;
+        var carry: u32 = 0;
+        var j: usize = x.len;
+        while (j > 0) {
+            j -= 1;
+            const pos = out.len - 1 - (e.len - 1 - i) - (x.len - 1 - j);
+            const cur = @as(u32, out[pos]) + @as(u32, e[i]) * @as(u32, x[j]) + carry;
+            out[pos] = @truncate(cur);
+            carry = cur >> 8;
+        }
+        var pos = out.len - 1 - (e.len - 1 - i) - x.len;
+        while (carry != 0) {
+            const cur = @as(u32, out[pos]) + carry;
+            out[pos] = @truncate(cur);
+            carry = cur >> 8;
+            if (pos == 0) break;
+            pos -= 1;
+        }
+    }
+    return out;
+}
+
+test "audit R2 (LOW): fixed-length mulAddBytes is bit-exact against the old early-exit shape (random + boundary cases)" {
+    // Random operand lengths/values, several trials.
+    var prng = std.Random.DefaultPrng.init(0x6d756c61646462); // "muladdb"
+    const random = prng.random();
+    var trial: usize = 0;
+    while (trial < 200) : (trial += 1) {
+        var e_buf: [8]u8 = undefined;
+        var x_buf: [8]u8 = undefined;
+        var addend_buf: [16]u8 = undefined;
+        const e_len = 1 + random.uintLessThan(usize, e_buf.len);
+        const x_len = 1 + random.uintLessThan(usize, x_buf.len);
+        const addend_len = random.uintLessThan(usize, addend_buf.len + 1);
+        random.bytes(e_buf[0..e_len]);
+        random.bytes(x_buf[0..x_len]);
+        random.bytes(addend_buf[0..addend_len]);
+        const out_len = @max(e_len + x_len, addend_len) + 1;
+        var out_old: [8 + 8 + 16 + 1]u8 = undefined;
+        var out_new: [8 + 8 + 16 + 1]u8 = undefined;
+        const got_old = mulAddBytesEarlyExitRef(e_buf[0..e_len], x_buf[0..x_len], addend_buf[0..addend_len], out_old[0..out_len]);
+        const got_new = mulAddBytes(e_buf[0..e_len], x_buf[0..x_len], addend_buf[0..addend_len], out_new[0..out_len]);
+        try testing.expectEqualSlices(u8, got_old, got_new);
+    }
+
+    // Boundary: every operand byte 0xFF — maximises per-digit carries.
+    {
+        const e = [_]u8{0xFF} ** 4;
+        const x = [_]u8{0xFF} ** 4;
+        const addend = [_]u8{0xFF} ** 9;
+        var out_old: [10]u8 = undefined;
+        var out_new: [10]u8 = undefined;
+        const got_old = mulAddBytesEarlyExitRef(&e, &x, &addend, &out_old);
+        const got_new = mulAddBytes(&e, &x, &addend, &out_new);
+        try testing.expectEqualSlices(u8, got_old, got_new);
+    }
+
+    // Boundary: carry propagates through the ENTIRE output width (addend is
+    // all 0xFF right up to out[0], so the tail loop must walk to pos == 0).
+    {
+        const e = [_]u8{1};
+        const x = [_]u8{1};
+        const addend = [_]u8{0xFF} ** 5;
+        var out_old: [6]u8 = undefined;
+        var out_new: [6]u8 = undefined;
+        const got_old = mulAddBytesEarlyExitRef(&e, &x, &addend, &out_old);
+        const got_new = mulAddBytes(&e, &x, &addend, &out_new);
+        try testing.expectEqualSlices(u8, got_old, got_new);
+        try testing.expectEqualSlices(u8, &[_]u8{ 1, 0, 0, 0, 0, 0 }, got_new);
+    }
+
+    // Boundary: zero-length `e` (outer loop never runs) and zero-length `x`
+    // (inner multiply loop never runs, carry starts and stays 0) — both
+    // exercise the tail loop with carry == 0 from the start.
+    {
+        const e = [_]u8{};
+        const x = [_]u8{0xAB};
+        const addend = [_]u8{0xCD};
+        var out_old: [2]u8 = undefined;
+        var out_new: [2]u8 = undefined;
+        const got_old = mulAddBytesEarlyExitRef(&e, &x, &addend, &out_old);
+        const got_new = mulAddBytes(&e, &x, &addend, &out_new);
+        try testing.expectEqualSlices(u8, got_old, got_new);
+    }
+    {
+        const e = [_]u8{0xAB};
+        const x = [_]u8{};
+        const addend = [_]u8{0xCD};
+        var out_old: [3]u8 = undefined;
+        var out_new: [3]u8 = undefined;
+        const got_old = mulAddBytesEarlyExitRef(&e, &x, &addend, &out_old);
+        const got_new = mulAddBytes(&e, &x, &addend, &out_new);
+        try testing.expectEqualSlices(u8, got_old, got_new);
+    }
 }
 
 test "fuzz: RangeProof.fromBytesAlloc never panics or over-allocates (audit F8)" {
