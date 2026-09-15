@@ -5,6 +5,41 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **BEHAVIOURAL (a case no real nonce reaches):**
+  `ecdsa_recover.sign` now derives `r = x(R) mod n`, as ECDSA and std's signer
+  do. It used `Scalar.fromBytes(x(R))`, which rejects `x ≥ n`, so a nonce with
+  `R.x` in `[n, p)` (probability ~2^-128) returned `error.InvalidNonce`
+  instead of a signature, and the recovery-id bit-1 line after it was dead
+  (A1 G7). Every signature with `R.x < n` — all of them in practice, the
+  BOLT#11 anchor included — is byte-identical. New tests pin recid bit 1 on
+  both sides: `recoverPubkey` on a genuine `R.x ≥ n` signature built from
+  public values and verified by std's ECDSA verifier (both parities, plus the
+  `r + n ≥ p` refusal), and `sign` through a comptime commitment parameter of
+  its inner function that the test uses to inject such an `R`.
+- **2026-09-16** — **PERFORMANCE, same results; API addition:** `Secp256k1.mul`
+  (constant-time, secret scalar, arbitrary point — the ECDH path of `sphinx`,
+  `bolt8`, `bolt3`, `frost`) is now a 65-window signed-digit multiply over a
+  per-call table of `(1..8)·P` instead of a 256-bit ladder (A1 F5, under
+  DECISIONS P5). Results are identical at the affine level, error for error;
+  the projective `(X:Y:Z)` of a returned point differs, which no in-repo
+  consumer reads. Interleaved A/B, ReleaseFast: **1.80× faster than the
+  ladder** (114.7 vs 203.6 µs median), **2.26× faster than std**. New public
+  names: `mulLadder` (the previous ladder, kept as the differential oracle),
+  `mulWithTable` and `varBaseTable`/`VarBaseTable` (the seam its positive
+  control uses). `combMulBaseWithTable`'s recoding and masked gather moved into
+  the shared `signedDigit`/`gatherSigned` helpers; its ctgrind row is
+  unchanged at 7/1.
+- **2026-09-16** — **NO API CHANGE, secret hygiene:** `ecdsa_recover.sign` now
+  zeroes 16 KiB of the stack its signing computation used before it returns
+  (A1 G2, MED). Measured with the new `src/stackprobe_test.zig` (ReleaseFast):
+  the RFC 6979 nonce survived on the dead stack six times per signature — `k`
+  big-endian ×1, the scalar field's Montgomery image of `k` ×3, of `k⁻¹` ×1,
+  of `d` ×1 — all compiler-made copies inside by-value callees that no named
+  `secureZero` can reach; nonce plus published signature is the private key.
+  After: 0 in every representation over 5 repeats, with the probe's positive
+  control still finding a parked nonce. The probe asserts that and runs in the
+  ReleaseFast lane (it skips in Debug and ReleaseSafe, where `undefined` is
+  filled and the scan is blind — its positive control is what showed that).
 - **2026-09-15** — **API addition, no behaviour change:** new `sign.ecdsaVerifyPrehashed(pubkey_sec1,
   digest, sig_rs)` — `ecdsaVerify`'s exact arithmetic, factored out to take an
   already-computed 32-byte digest instead of hashing a message internally.

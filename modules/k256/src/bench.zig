@@ -106,7 +106,7 @@ test "bench (opt-in via K256_BENCH)" {
         }
         var dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
-        std.debug.print("{s} scalarmul (CT G·s, ladder): {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
+        std.debug.print("{s} scalarmul (CT G·s, windowed mul): {d:>8} ns/op\n", .{ k256_label, dt / smul_iters });
 
         // The fixed-base comb: the fast CT base-point multiply the signing path
         // now uses (no doublings; comb_t table-gathered adds).
@@ -131,6 +131,65 @@ test "bench (opt-in via K256_BENCH)" {
         dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(sink);
         std.debug.print("std       scalarmul (CT G·s): {d:>8} ns/op\n", .{dt / smul_iters});
+    }
+
+    // ── A1/k256.md F5: CONSTANT-TIME variable-base multiply, interleaved A/B ──
+    // `mul` (windowed) vs `mulLadder` (the ladder it replaced) vs std's CT
+    // `mul`, on a random NON-base point — the ECDH shape; std's base-point
+    // path has a precomputed table and would flatter std. The three arms
+    // rotate their order every round so drift cannot land on one of them, and
+    // the ratios are taken per round (same instant) before min/median/max.
+    {
+        const rounds = 9;
+        const per: u64 = 1000;
+        var scal: [16][32]u8 = undefined;
+        for (&scal) |*s| rand.bytes(s);
+        var pb: [32]u8 = undefined;
+        rand.bytes(&pb);
+        const kp = Secp256k1.combMulBase(pb, .big) catch unreachable;
+        const enc = kp.toUncompressedSec1();
+        const sp = Std.fromSec1(&enc) catch unreachable;
+
+        var ns: [3][rounds]u64 = undefined;
+        var r: usize = 0;
+        while (r < rounds) : (r += 1) {
+            var slot: usize = 0;
+            while (slot < 3) : (slot += 1) {
+                const arm = (r + slot) % 3;
+                var sink: u64 = 0;
+                const t0 = nowNs();
+                var i: usize = 0;
+                while (i < per) : (i += 1) {
+                    const s = scal[i & 15];
+                    switch (arm) {
+                        0 => sink ^= (kp.mul(s, .big) catch continue).x._limbs[0],
+                        1 => sink ^= (kp.mulLadder(s, .big) catch continue).x._limbs[0],
+                        else => sink ^= (sp.mul(s, .big) catch continue).x.toBytes(.little)[0],
+                    }
+                }
+                ns[arm][r] = (nowNs() - t0) / per;
+                std.mem.doNotOptimizeAway(sink);
+            }
+        }
+
+        var ladder_x1000: [rounds]u64 = undefined;
+        var std_x1000: [rounds]u64 = undefined;
+        for (0..rounds) |j| {
+            ladder_x1000[j] = ns[1][j] * 1000 / ns[0][j];
+            std_x1000[j] = ns[2][j] * 1000 / ns[0][j];
+        }
+        std.debug.print("F5 A/B per-round ns/op [windowed, ladder, std]:", .{});
+        for (0..rounds) |j| std.debug.print(" [{d},{d},{d}]", .{ ns[0][j], ns[1][j], ns[2][j] });
+        std.debug.print("\n", .{});
+        const names = [_][]const u8{ "k256 mul (windowed CT)", "k256 mulLadder (old CT)", "std mul (CT, non-base)" };
+        for (&ns, names) |*row, name| {
+            std.mem.sort(u64, row, {}, std.sort.asc(u64));
+            std.debug.print("F5 A/B {s:<24}: median {d:>7} ns/op [min {d} .. max {d}], {d} rounds x {d}\n", .{ name, row[rounds / 2], row[0], row[rounds - 1], rounds, per });
+        }
+        std.mem.sort(u64, &ladder_x1000, {}, std.sort.asc(u64));
+        std.mem.sort(u64, &std_x1000, {}, std.sort.asc(u64));
+        std.debug.print("F5 A/B speedup vs ladder (x1000, per round): median {d} [min {d} .. max {d}]\n", .{ ladder_x1000[rounds / 2], ladder_x1000[0], ladder_x1000[rounds - 1] });
+        std.debug.print("F5 A/B speedup vs std    (x1000, per round): median {d} [min {d} .. max {d}]\n", .{ std_x1000[rounds / 2], std_x1000[0], std_x1000[rounds - 1] });
     }
 
     // ── variable-base PUBLIC multiply: GLV vs portable vs std ──
