@@ -30,6 +30,7 @@
 //! GLV paths are differentially pinned to (and the non-gated fallback).
 
 const std = @import("std");
+const builtin = @import("builtin");
 /// Test-only (`build.zig`'s `test_deps`, never `deps`): fuzz corpus framing.
 const gate = @import("gate.zig");
 const field = @import("field.zig");
@@ -789,11 +790,18 @@ test "base point + identity match std" {
     try std.testing.expectError(error.IdentityElement, Secp256k1.identityElement.rejectIdentity());
 }
 
+// Debug is unoptimized `std.basePoint.mul` (no comb table there, plain
+// double-and-add) times two point generations, dbl, add, mulPublic AND
+// mulDoubleBasePublic PER iteration -- full count timed out the full gate
+// (`k256` alone: 2m34s Debug, this one test ~65s of it). Random draws cut
+// in Debug; ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count.
+const random_scalars_iters: usize = if (builtin.mode == .Debug) 30 else 400;
+
 test "differential vs std: dbl/add/scalarmul on random scalars" {
     var prng = std.Random.DefaultPrng.init(0x60D_C0DE_11);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 400) : (i += 1) {
+    while (i < random_scalars_iters) : (i += 1) {
         var s1b: [32]u8 = undefined;
         var s2b: [32]u8 = undefined;
         rand.bytes(&s1b);
@@ -840,11 +848,13 @@ test "GLV endomorphism: (β·x, y) == λ·P (validates β and λ against the cur
     }
 }
 
+const recover_y_iters: usize = if (builtin.mode == .Debug) 400 else 1500;
+
 test "recoverY / lift_x matches std" {
     var prng = std.Random.DefaultPrng.init(0x11F7_0011);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 1500) : (i += 1) {
+    while (i < recover_y_iters) : (i += 1) {
         var xb: [32]u8 = undefined;
         rand.bytes(&xb);
         const kx = field.Fe.fromBytes(xb, .big) catch continue;

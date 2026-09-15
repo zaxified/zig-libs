@@ -343,7 +343,7 @@ hqc	ReleaseFast	decaps	1	2	1b33fe8f22ee9b7e	91caa495ae54247e
 hqc	ReleaseFast	keygen	1	4	1b33fe8f22ee9b7e	a20c02ff5f2e81ee
 hqc	ReleaseFast	encaps	1	0	1b33fe8f22ee9b7e	e91a390cf03fd6ad
 hqc	ReleaseFast	sampler	1	2	8eeeec94620e623e	b93fa60c89578576
-k256	ReleaseFast	field	1	0	1f3233094444a735	4f13cccddea81376
+k256	ReleaseFast	field	1	0	9cea496ddcd0b4a7	4f13cccddea81376
 # k256, re-pin 2026-09-17, after F5 (1ce3087e: signed-window variable-base
 # mul) and the re-audit fixes in ff305abc.
 #   mul 2 -> 1   7/1/6/0. The one context is `rejectIdentity` at
@@ -354,10 +354,10 @@ k256	ReleaseFast	field	1	0	1f3233094444a735	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	ee06c3be7e844408	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	ee06c3be7e844408	2ac21fe395f35487
-k256	ReleaseFast	sign	1	11	f8fa7e3812cebb09	bb06c2ed85209b8d
-k256	ReleaseFast	ecdsa	1	11	62fb76fb4a2cbd91	8ff4812d21149442
+k256	ReleaseFast	mul	1	1	aa15a26aec37681a	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	aa15a26aec37681a	2ac21fe395f35487
+k256	ReleaseFast	sign	1	11	444acbf5ff925138	bb06c2ed85209b8d
+k256	ReleaseFast	ecdsa	1	11	dbe5adeb0d2d5905	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
