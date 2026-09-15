@@ -241,11 +241,12 @@ def gate(src_root, cache, netns):
     return r.stdout + r.stderr, r.returncode
 
 
-# 2026-09-16 (F12 run): re-measured against the unmutated tree -- the
-# audit's original counts (16/2, 18/0) predate F4/F10/F13/F14's new tests
-# and the fuzz-reach corpus. Confirmed via m0_noop (comment-only, so its own
-# counts ARE today's baseline): host 28 pass/8 skip, netns 36 pass/0 skip.
-BASE = {"host": (28, 8), "netns": (36, 0)}
+# 2026-09-16 (F12 close-out): re-measured again after adding permanent
+# regression tests for 8 of the mutations this file's own first run (see
+# A1/rawsock.md dispozice) found surviving both gates. Confirmed via
+# m0_noop (comment-only, so its own counts ARE today's baseline):
+# host 29 pass/13 skip, netns 42 pass/0 skip.
+BASE = {"host": (29, 13), "netns": (42, 0)}
 
 print(f"{'MUTATION':<30} {'HOST LANE':<16} {'NETNS LANE':<16} DETAIL   [mode={MODE}]")
 tally = {}
