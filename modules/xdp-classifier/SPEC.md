@@ -92,7 +92,21 @@ and silent at the Zig-compile level). Two additions specific to this module:
   which would otherwise fail late (a kernel `E2BIG`/`EINVAL` from
   `map_update_elem`) or silently misbehave (two rules that differ only in
   don't-care bits look distinct in the Zig-side table but are
-  indistinguishable to the trie).
+  indistinguishable to the trie). `validate`'s duplicate check is O(n²)
+  (measured, A1/xdp-classifier.md F3: 256 rules → 0.023ms, 32768 → 322.5ms
+  in ReleaseFast, ratio ~4.0x per doubling); `validateSorted` does the same
+  check — byte-for-byte the same verdict on every input, including error
+  *precedence* when a table has both a duplicate and a structural defect —
+  in O(n log n) via a caller-supplied sort scratch buffer instead of the
+  all-pairs scan. Independently re-measured 2026-09-15 (interleaved A/B,
+  same process, worst case — no duplicates, no structural failure, so
+  neither function exits early): 256 rules 1.87ms → 28µs, 16384 rules
+  8.15s → 1.83ms, and the O(n²)-vs-O(n log n) shape holds throughout
+  (`validate`'s ~4.0x-per-doubling ratio unchanged; `validateSorted`'s
+  ratio ~1.8–2.3x per doubling, i.e. linearithmic, not linear — expected,
+  since it still sorts). Absolute numbers are this machine under
+  concurrent campaign load (see F3's measurement note); the *ratio*, not
+  the millisecond count, is what the doubling series demonstrates.
 - **The two key encodings (populate-time and runtime) must agree
   byte-for-byte.** `rules.LpmKey.toBytes` (used by `maps.populateRule`) and
   `classifier.buildClassifierProgram`'s in-program key construction (point 4

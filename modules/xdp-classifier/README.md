@@ -92,7 +92,7 @@ const rules = [_]xdp_classifier.ClassifierRule{
     .{ .prefix = .{ .addr = .{ 10, 1, 0, 0 }, .prefix_len = 16 }, .class = 2 },
 };
 const rule_set: xdp_classifier.RuleSet = .{ .rules = &rules };
-try rule_set.validate(1024);
+try rule_set.validate(1024); // small tables (this example); see below for large ones
 try xdp_classifier.populateRuleSet(lpm_fd, rule_set);
 
 // 3. Build the program (real, working — no Fable stub).
@@ -210,6 +210,16 @@ ruleset's intended behavior without a kernel).
   flow-keyed (rather than single-slot) output map, `bpf_xdp_adjust_meta`-based
   per-packet metadata handoff to a downstream `tc` classifier — see
   `SPEC.md`'s backlog for the reasoning behind each.
+- **`RuleSet.validate` vs. `RuleSet.validateSorted`.** `validate` is O(n²)
+  in the ruleset size (an all-pairs duplicate scan) and takes no memory
+  beyond the ruleset itself — fine for the handful-to-hundreds of rules in
+  the example above, or any table reloaded rarely relative to its size.
+  A LibreQoS-scale table (tens of thousands of subscriber prefixes,
+  reloaded on every subscriber change) should call `validateSorted`
+  instead: same verdict on every input (see `RuleSet`'s doc comments and
+  `A1/xdp-classifier.md` F3 for the measured cost of each), O(n log n),
+  and still allocation-free — the caller supplies the sort scratch memory
+  (one `usize` per rule) instead of the module allocating it.
 
 Provenance: clean-room from the public LibreQoS (**GPL-2.0**) architecture
 DESCRIPTION — the classify-then-shape split, where an XDP classification stage

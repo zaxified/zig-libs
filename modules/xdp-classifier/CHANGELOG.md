@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **ADDITIVE:** A1 finding F3. New `RuleSet.validateSorted(max_entries,
+  scratch: []usize)` — O(n log n) alternative to `RuleSet.validate`'s O(n²) all-pairs duplicate
+  scan (measured F3: 256 rules 0.023ms -> 32768 rules 322.5ms in ReleaseFast). Byte-for-byte the
+  same verdict as `validate` on every input, including error *precedence* on a table with both a
+  duplicate and a structural defect; still allocation-free (`scratch` is caller-supplied memory,
+  one `usize` per rule; new `RuleSetError.ScratchTooSmall` if it is undersized). `validate` itself
+  is unchanged, still the right choice for small/rarely-reloaded tables — see README "Design
+  notes" and SPEC.md's threat-model section for when to reach for which.
+
 - **2026-09-13** — **BREAKING:** A1 finding F2. `CpumapSteerOptions` gains the required
   `cpumap_max_entries`, and `buildCpumapSteerProgram` returns the new
   `SteerBuildError.CpuCountExceedsCpumap` when `cpu_count > cpumap_max_entries`. Nothing tied

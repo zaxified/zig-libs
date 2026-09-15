@@ -55,6 +55,10 @@ pub const RuleSetError = error{
     DuplicatePrefix,
     /// More rules than the target map's `max_entries` can hold.
     TooManyRules,
+    /// `validateSorted`'s caller-supplied `scratch` is shorter than
+    /// `rules.len` — it needs one `usize` slot per rule, see that
+    /// function's doc comment.
+    ScratchTooSmall,
 };
 
 /// A caller's full rule table, validated as a unit against the LPM map it
@@ -66,12 +70,22 @@ pub const RuleSet = struct {
     /// LPM trie itself assume. `max_entries` is the target map's capacity
     /// (see `maps.LpmMapSpec`). Pure, allocation-free, cannot panic on any
     /// input — see the hostile/fuzz test below.
+    ///
+    /// ⚠ **O(n²) in `rules.len`** — the duplicate check is a nested linear
+    /// scan (F3, `A1/xdp-classifier.md`: measured 256→0.023ms … 32768→322ms
+    /// in ReleaseFast, ratio ~4.0x per doubling, i.e. quadratic). That is
+    /// the price of staying allocation-free: `RuleSet.rules` is `[]const`
+    /// and this function takes no allocator and no scratch memory, so
+    /// there is nowhere to sort or hash into. Adequate for the module's
+    /// README example (hundreds of rules) and for anything reloaded rarely
+    /// relative to its size. A LibreQoS-scale table (tens of thousands of
+    /// rules, reloaded on every subscriber change — see README "Design
+    /// notes") should call `validateSorted` instead.
     pub fn validate(self: RuleSet, max_entries: usize) RuleSetError!void {
         if (self.rules.len > max_entries) return RuleSetError.TooManyRules;
 
         for (self.rules, 0..) |rule, i| {
-            if (rule.prefix.prefix_len > 32) return RuleSetError.InvalidPrefixLen;
-            if (!isCanonical(rule.prefix)) return RuleSetError.NonCanonicalPrefix;
+            try checkStructural(rule.prefix);
 
             var j: usize = 0;
             while (j < i) : (j += 1) {
@@ -84,7 +98,85 @@ pub const RuleSet = struct {
             }
         }
     }
+
+    /// Same checks as `validate` (byte-for-byte the same verdict on every
+    /// input — see the differential test below), but the duplicate check is
+    /// O(n log n): sort a caller-supplied index array by `(prefix_len,
+    /// addr)` (`std.sort.pdq`, O(log n) stack space, no allocator) and scan
+    /// it once for adjacent equal keys, instead of comparing every rule
+    /// against every earlier one.
+    ///
+    /// `scratch` is the caller's own memory — this function does not
+    /// allocate — and must hold at least `self.rules.len` `usize` slots
+    /// (`error.ScratchTooSmall` otherwise); the caller picks where that
+    /// memory comes from (a stack array sized to the target map's
+    /// `max_entries`, an arena, a reused buffer across reloads, …), keeping
+    /// `RuleSet` itself allocator-agnostic. `scratch`'s contents are
+    /// overwritten and left in sorted-index order; callers must not rely on
+    /// them after the call.
+    pub fn validateSorted(self: RuleSet, max_entries: usize, scratch: []usize) RuleSetError!void {
+        if (self.rules.len > max_entries) return RuleSetError.TooManyRules;
+        if (scratch.len < self.rules.len) return RuleSetError.ScratchTooSmall;
+
+        // Precedence must match `validate` bit-for-bit, not just agree on
+        // whether *some* error exists: `validate` walks the table once, and
+        // for each rule checks its OWN structure before ever comparing it
+        // against earlier rules. So a duplicate can only preempt a
+        // structural failure that comes AFTER it in the table -- never one
+        // at or before it, because `validate` would already have returned
+        // by the time it got there. Find the first structural failure
+        // first, then look for a duplicate only among the rules strictly
+        // before it: exactly the prefix of the table `validate` would ever
+        // have reached a duplicate-check on.
+        var first_bad: ?struct { index: usize, err: RuleSetError } = null;
+        for (self.rules, 0..) |rule, i| {
+            checkStructural(rule.prefix) catch |err| {
+                first_bad = .{ .index = i, .err = err };
+                break;
+            };
+        }
+        const limit = if (first_bad) |fb| fb.index else self.rules.len;
+
+        const idx = scratch[0..limit];
+        for (idx, 0..) |*slot, i| slot.* = i;
+        std.sort.pdq(usize, idx, self.rules, sortIndexLessThan);
+
+        var i: usize = 1;
+        while (i < idx.len) : (i += 1) {
+            const prev = self.rules[idx[i - 1]].prefix;
+            const cur = self.rules[idx[i]].prefix;
+            if (prev.prefix_len == cur.prefix_len and std.mem.eql(u8, &prev.addr, &cur.addr)) {
+                return RuleSetError.DuplicatePrefix;
+            }
+        }
+
+        if (first_bad) |fb| return fb.err;
+    }
 };
+
+/// The prefix_len/canonical half of `validate`'s per-rule check, factored
+/// out so `validate` and `validateSorted` share one implementation instead
+/// of two copies that could drift apart.
+fn checkStructural(prefix: Ipv4Prefix) RuleSetError!void {
+    if (prefix.prefix_len > 32) return RuleSetError.InvalidPrefixLen;
+    if (!isCanonical(prefix)) return RuleSetError.NonCanonicalPrefix;
+}
+
+/// `(prefix_len, addr)` packed into one `u64` so "same prefix_len, same
+/// addr" (the thing `validate`'s duplicate check tests) becomes "equal
+/// sort key" — and equal keys land adjacent after a sort, turning an O(n²)
+/// all-pairs scan into one O(n log n) sort plus an O(n) adjacent scan.
+/// `prefix_len` (0..32) is the more significant half so a full sort orders
+/// by prefix length first, matching how a human reads a rule table, though
+/// nothing here depends on that tie-break order.
+fn sortKey(prefix: Ipv4Prefix) u64 {
+    const addr_bits: u32 = std.mem.readInt(u32, &prefix.addr, .big);
+    return (@as(u64, prefix.prefix_len) << 32) | addr_bits;
+}
+
+fn sortIndexLessThan(rules: []const ClassifierRule, a: usize, b: usize) bool {
+    return sortKey(rules[a].prefix) < sortKey(rules[b].prefix);
+}
 
 /// True if every bit at or beyond `prefix.prefix_len` is zero. `prefix_len
 /// == 32` is trivially canonical (no host bits exist); `prefix_len == 0`
@@ -474,4 +566,138 @@ fn fuzzLookupNeverPanics(_: void, smith: *std.testing.Smith) !void {
 
 test "fuzz: lookupReference never panics, and always returns default_class or a loaded rule's class" {
     try std.testing.fuzz({}, fuzzLookupNeverPanics, .{});
+}
+
+// ── F3: validateSorted (O(n log n) alternative to validate's O(n²)) ────────
+
+test "validateSorted: accepts a well-formed small ruleset" {
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 10, 1, 0, 0 }, .prefix_len = 16 }, .class = 2 },
+        .{ .prefix = .{ .addr = .{ 0, 0, 0, 0 }, .prefix_len = 0 }, .class = 0 },
+    };
+    const rs: RuleSet = .{ .rules = &rules };
+    var scratch: [rules.len]usize = undefined;
+    try rs.validateSorted(64, &scratch);
+}
+
+test "validateSorted: rejects prefix_len > 32" {
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 33 }, .class = 1 },
+    };
+    const rs: RuleSet = .{ .rules = &rules };
+    var scratch: [rules.len]usize = undefined;
+    try testing.expectError(RuleSetError.InvalidPrefixLen, rs.validateSorted(64, &scratch));
+}
+
+test "validateSorted: rejects a non-canonical (host-bits-set) prefix" {
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 1 }, .prefix_len = 8 }, .class = 1 },
+    };
+    const rs: RuleSet = .{ .rules = &rules };
+    var scratch: [rules.len]usize = undefined;
+    try testing.expectError(RuleSetError.NonCanonicalPrefix, rs.validateSorted(64, &scratch));
+}
+
+test "validateSorted: rejects duplicate (addr, prefix_len) pairs, however far apart in the table" {
+    // Same F4-shaped duplicate as `validate`'s test, but with unrelated
+    // rules interleaved so a sort is actually load-bearing: the two
+    // duplicates are NOT adjacent in input order, only after sorting.
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 172, 16, 0, 0 }, .prefix_len = 12 }, .class = 3 },
+        .{ .prefix = .{ .addr = .{ 192, 168, 0, 0 }, .prefix_len = 16 }, .class = 4 },
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 2 },
+    };
+    const rs: RuleSet = .{ .rules = &rules };
+    var scratch: [rules.len]usize = undefined;
+    try testing.expectError(RuleSetError.DuplicatePrefix, rs.validateSorted(64, &scratch));
+}
+
+test "validateSorted: rejects more rules than the map's max_entries" {
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 11, 0, 0, 0 }, .prefix_len = 8 }, .class = 2 },
+    };
+    const rs: RuleSet = .{ .rules = &rules };
+    var scratch: [rules.len]usize = undefined;
+    try testing.expectError(RuleSetError.TooManyRules, rs.validateSorted(1, &scratch));
+}
+
+test "validateSorted: too-small scratch is rejected, not a silent out-of-bounds write" {
+    const rules = [_]ClassifierRule{
+        .{ .prefix = .{ .addr = .{ 10, 0, 0, 0 }, .prefix_len = 8 }, .class = 1 },
+        .{ .prefix = .{ .addr = .{ 11, 0, 0, 0 }, .prefix_len = 8 }, .class = 2 },
+    };
+    const rs: RuleSet = .{ .rules = &rules };
+    var scratch: [1]usize = undefined;
+    try testing.expectError(RuleSetError.ScratchTooSmall, rs.validateSorted(64, &scratch));
+}
+
+fn fuzzValidateSortedAgreesWithValidate(_: void, smith: *std.testing.Smith) !void {
+    // Differential test, not a reimplementation: both functions are called
+    // on the SAME input and their verdicts compared. A bug that made
+    // `validateSorted` agree with itself (e.g. a comparator that treats
+    // every pair as unequal, so the sort never detects a duplicate) would
+    // still show up here as a mismatch against `validate`'s independent
+    // O(n²) all-pairs scan -- the two implementations don't share any
+    // duplicate-detection code (see [[feedback_a_test_that_reimplements_the_code_cannot_fail]]).
+    var buf: [40]ClassifierRule = undefined;
+    const n = smith.index(buf.len + 1);
+    for (buf[0..n]) |*r| {
+        r.* = .{
+            .prefix = .{
+                .addr = .{ smith.value(u8), smith.value(u8), smith.value(u8), smith.value(u8) },
+                .prefix_len = smith.value(u6), // full 0..63, including out-of-spec 33..63
+            },
+            .class = smith.value(u32),
+        };
+    }
+    const rs: RuleSet = .{ .rules = buf[0..n] };
+    const max_entries: usize = smith.valueRangeAtMost(u16, 0, 48);
+
+    var scratch: [buf.len]usize = undefined;
+    const want = rs.validate(max_entries);
+    const got = rs.validateSorted(max_entries, scratch[0..n]);
+    try testing.expectEqual(want, got);
+}
+
+test "fuzz: validateSorted agrees with validate on every (rules, max_entries)" {
+    try std.testing.fuzz({}, fuzzValidateSortedAgreesWithValidate, .{});
+}
+
+test "F3: validateSorted agrees with validate across a deterministic sweep, including duplicate-heavy tables" {
+    // Non-fuzz (runs on every `zig build test`, not just `--fuzz`) sweep
+    // biased toward the case a naive sort-based dedup gets wrong: many
+    // rules colliding on a SMALL set of (prefix_len, addr) pairs, so ties
+    // land adjacent after sorting and the adjacent-scan must catch all of
+    // them, not just the first collision.
+    var prng = std.Random.DefaultPrng.init(0xF3F3);
+    const rand = prng.random();
+
+    var buf: [64]ClassifierRule = undefined;
+    var scratch: [buf.len]usize = undefined;
+    var n: usize = 0;
+    while (n <= buf.len) : (n += 1) {
+        var trial: usize = 0;
+        while (trial < 32) : (trial += 1) {
+            for (buf[0..n]) |*r| {
+                r.* = .{
+                    // Only 4 distinct addresses and 3 distinct prefix
+                    // lengths -- with n up to 64, duplicates are near-
+                    // guaranteed, and many of them.
+                    .prefix = .{
+                        .addr = .{ 10, 0, 0, rand.uintLessThan(u8, 4) },
+                        .prefix_len = @as(u6, 24) + rand.uintLessThan(u6, 3),
+                    },
+                    .class = rand.int(u32),
+                };
+            }
+            const rs: RuleSet = .{ .rules = buf[0..n] };
+            const max_entries = rand.uintLessThan(usize, 96);
+            const want = rs.validate(max_entries);
+            const got = rs.validateSorted(max_entries, scratch[0..n]);
+            try testing.expectEqual(want, got);
+        }
+    }
 }
