@@ -10,6 +10,7 @@
 #     scripts/ctgrind.sh --pattern 'root[.]zig' ecvrf
 #                                           # …re-attribute the in-file column
 #     scripts/ctgrind.sh --check            # compare against the expected table
+#     scripts/ctgrind.sh --self-test        # test the context classifier alone
 #     scripts/ctgrind.sh -j 4 --check       # …at 4 parallel runs instead of nproc
 #
 # Runs go through a pool one memcheck process wide per job (valgrind serialises
@@ -51,11 +52,21 @@
 #
 #   in-file    — the stack matches PATTERN: a branch in the code the claim is
 #                about. Pinned to an exact count in ctgrind-expected.tsv.
-#   witness    — the stack matches WITNESS and not PATTERN: the harness's own
-#                result formatting (`std.debug.print` is not constant-time by
-#                design, and a tainted byte reaching it is the propagation
-#                witness that makes an in-file zero mean "no branch found"
-#                rather than "the taint never arrived").
+#   witness    — the harness printing its own result, recognised by the SHAPE
+#                of the stack and not by a file name appearing somewhere in
+#                it: formatting/plumbing frames (WITNESS_CHAIN, each with a
+#                real source line) down to the harness frame, and nothing but
+#                harness and `start.zig` below that. `std.debug.print` is not
+#                constant-time by design, and a tainted byte reaching it is
+#                the propagation witness that makes an in-file zero mean "no
+#                branch found" rather than "the taint never arrived".
+#                ⛔ Until 2026-09-16 this bucket was "WITNESS matches anywhere
+#                in the paragraph", which silently swallowed any leak whose
+#                stack happened to carry a formatter frame — a `format`
+#                callback, or module code outside PATTERN that formats a
+#                secret. Nothing pins this bucket's COUNT, so a swallowed
+#                context cost nothing: A1 ct25519 C10, positive controls in
+#                the self-test below.
 #   unattr     — everything else. ALWAYS a `--check` failure, for every module,
 #                with no per-module opt-out: an unattributed context is either
 #                a leak the pattern cannot see or a pattern that has gone
@@ -500,6 +511,13 @@ declare -A PATTERN=(
     [threshold_ecdsa/betaprime]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
+# WITNESS_CHAIN — the files a witness's stack may consist of BETWEEN the
+# branch and the harness frame. Measured over the 2026-09-16 full run (378
+# rows): std's formatting path, plus the plumbing every `std.debug.print`
+# ends in — `memcpy` filling the writer buffer and `Threaded`/`Io`/`File`/
+# `linux` flushing it to the write syscall. Widen it only with a measured
+# log, the same rule WITNESS carries above.
+WITNESS_CHAIN='^(Writer[.]zig|Format[.]zig|fmt[.]zig|debug[.]zig|memcpy[.]zig|Threaded[.]zig|Io[.]zig|File[.]zig|linux[.]zig)$'
 declare -A LABEL=(
     [frost/commit]='frost round1Commit+k256'
     [frost/sign]='frost round2Sign+k256'
@@ -630,9 +648,338 @@ declare -A LABEL=(
     [bip32/mnemonic]='bip39 mnemonicToEntropy (wordIndex search)'
 )
 
+# ── measurement ────────────────────────────────────────────────────────────
+# Count valgrind ERROR blocks whose stack contains $2, treating the blank
+# "==pid==" separator lines memcheck prints between errors as paragraph
+# breaks. Counting BLOCKS (not lines) matters: a single context's stack often
+# names the target file on more than one frame (e.g. std's `pcMul16` AND its
+# `mul` wrapper both live in `edwards25519.zig`), so a plain `grep -c` over
+# lines double-counts relative to what "N contexts" means.
+count_contexts_in() {
+    local log="$1" pattern="$2"
+    classify_contexts "$log" "$pattern" count-in
+}
+
+# The fail-closed half of the same paragraph walk. An ERROR block is any
+# paragraph carrying at least one `at 0x…:` stack frame — a property of every
+# memcheck error report regardless of its kind, rather than a list of the
+# kinds we happen to know about, so a new memcheck error kind is classified
+# rather than ignored. Blocks are then bucketed in order: PATTERN wins,
+# WITNESS second, and whatever matches neither is UNATTRIBUTED.
+#
+# `mode` selects the output: count-in / count-witness / count-unattr /
+# show-unattr (the offending blocks themselves, for the failure message) /
+# count-launder and show-launder (see `guard_pattern` below).
+#
+# ── the `:0` class, and why this is a CHECK and not 101 pattern edits ───────
+#
+# A fully inlined callee gets its merged frame reported at `file.zig:0` — never
+# a real source line. Because PATTERN is tested against the whole paragraph and
+# BEFORE witness, such a frame can pull a paragraph into the in-file column that
+# belongs somewhere else: bolt3's `shachain` reported 2 where the honest count
+# was 0, and those two patterns carry a `root[.]zig:[1-9]` guard because of it.
+#
+# CTGRIND-OPEN-QUESTIONS.md left "review every bare-basename pattern" open, i.e.
+# the other 101. Measured 2026-09-09 over a full `--stacks` run, that sweep is
+# the wrong move: of 3696 in-file contexts, exactly TWO are in-file only by way
+# of a line-0 frame — `sphinx/process` (`process` at `core.zig:0`) and
+# `fss/eval` (`eval` at `dpf.zig:0`) — and BOTH are genuinely the module's own
+# code. Neither also matches witness. So guarding all 101 patterns would fix
+# nothing and break two rows, one of them by hiding fss's confirmed defect.
+#
+# What distinguishes bolt3's bad case from these two good ones is not the line-0
+# frame; it is that bolt3's paragraph ALSO matched WITNESS, so the module name
+# was not the only explanation on offer. That is checkable, so it is checked
+# here on every run instead of being carried as a manual review of 101 patterns
+# that today would be 101 unnecessary edits. Count is 0; a future inliner move
+# that makes it non-zero names the row and the block.
+guard_pattern() {
+    local alt out=""
+    local IFS='|'
+    for alt in $1; do
+        # An alternative that already constrains the line stays as written.
+        case "$alt" in
+            *:*) out="$out|$alt" ;;
+            *)   out="$out|$alt:[1-9]" ;;
+        esac
+    done
+    printf '%s' "${out#|}"
+}
+
+classify_contexts() {
+    local log="$1" pattern="$2" mode="$3"
+    local gpat; gpat="$(guard_pattern "$pattern")"
+    # Drop the harness's OWN stdout first: it is interleaved with memcheck's
+    # report, it lands inside an error paragraph, and a harness that happens
+    # to print a matching word would otherwise re-classify a real context.
+    # Only `==pid==` lines survive; the `==pid==`-only separators then become
+    # the paragraph breaks.
+    sed -E -e '/^==[0-9]+==/!d' -e 's/^==[0-9]+==[[:space:]]*$//' "$log" \
+        | awk -v RS='' -v pat="$pattern" -v gpat="$gpat" -v wit="$WITNESS" \
+              -v chain="$WITNESS_CHAIN" -v mode="$mode" '
+            # The witness SHAPE (A1 ct25519 C10), read innermost frame first:
+            #
+            #     [formatter/plumbing, each with a REAL line]+  [harness]+  [start.zig]*
+            #
+            # Anything else in that walk — a module frame, a frame with no source
+            # location, a formatter frame BELOW the harness (a `format` callback), a
+            # truncated stack with no harness frame at all — is not the harness printing
+            # its result, so it is not a propagation witness and lands in `unattr`.
+            function frame_file(l,    f) {
+                f = l
+                if (f ~ /:[0-9]+\)[[:space:]]*$/) { sub(/:[0-9]+\)[[:space:]]*$/, "", f); sub(/.*\(/, "", f); return f }
+                return "?"
+            }
+            function frame_line(l,    s) {
+                s = l
+                if (s ~ /:[0-9]+\)[[:space:]]*$/) { sub(/\)[[:space:]]*$/, "", s); sub(/.*:/, "", s); return s + 0 }
+                return -1
+            }
+            function frame_func(l,    s) {
+                s = l
+                sub(/^==[0-9]+==[[:space:]]+(at|by) 0x[0-9A-Fa-f]+:[[:space:]]*/, "", s)
+                sub(/[[:space:]]+\([^()]*\)[[:space:]]*$/, "", s)
+                return s
+            }
+            # ⛔ By FUNCTION name, not by file. A fully inlined `main` is reported at the
+            # merged frame of whatever was inlined into it: measured `main (root.zig:0)`
+            # in bolt3 and `ctgrind_harness.main (Threaded.zig:0)` in opaque on the same
+            # run. The file of a line-0 frame is not evidence; the name still is.
+            function is_harness(l,    fn) {
+                if (frame_file(l) == "ctgrind_harness.zig") return 1
+                fn = frame_func(l)
+                return (fn == "main" || fn ~ /^ctgrind_harness\./)
+            }
+            function is_witness(p,    nl, L, i, h, k) {
+                nl = split(p, L, "\n"); h = -1; k = 0
+                for (i = 1; i <= nl; i++) {
+                    if (L[i] !~ /==[0-9]+==[[:space:]]+(at|by) 0x[0-9A-Fa-f]+:/) continue
+                    if (h < 0) {
+                        if (is_harness(L[i])) h = k
+                        # A real line number is required of every plumbing frame: that is
+                        # what stops a module function that was inlined into the print,
+                        # and so reported at `SomeStdFile.zig:0`, from passing as std.
+                        else if (frame_file(L[i]) !~ chain || frame_line(L[i]) < 1) return 0
+                    } else if (!is_harness(L[i]) && frame_file(L[i]) != "start.zig") return 0
+                    k++
+                }
+                return h >= 1
+            }
+            BEGIN { in_c = 0; wit_c = 0; un_c = 0; ln0_c = 0 }
+            # not an error report (banner, HEAP SUMMARY, ERROR SUMMARY, …)
+            $0 !~ /==[0-9]+==[[:space:]]+at 0x[0-9A-Fa-f]+:/ { next }
+            {
+                if ($0 ~ pat) {
+                    in_c++
+                    # In-file ONLY through a frame with no line number, while a
+                    # witness frame is also present: the module name is not the
+                    # only account of this block, and the one that won is the
+                    # one that cannot be checked against a source line.
+                    if ($0 !~ gpat && $0 ~ wit) {
+                        ln0_c++
+                        if (mode == "show-launder") { printf "%s\n\n", $0 }
+                    }
+                }
+                else if (is_witness($0)) { wit_c++ }
+                else {
+                    un_c++
+                    if (mode == "show-unattr") { printf "%s\n\n", $0 }
+                }
+            }
+            END {
+                if (mode == "count-in")      print in_c + 0
+                if (mode == "count-witness") print wit_c + 0
+                if (mode == "count-unattr")  print un_c + 0
+                if (mode == "count-launder") print ln0_c + 0
+            }'
+}
+
+# ── the classifier's own test ──────────────────────────────────────────────
+# ⭐ Every number this script prints is computed by the paragraph walk above,
+# and that walk is text processing: it can be tested with no valgrind, no
+# build and no module, in milliseconds. So it is tested before every
+# measurement, and on its own with `--self-test`.
+#
+# The witness cases are shapes MEASURED on the 2026-09-16 full run (378 rows);
+# the unattributed ones are the leaks A1 ct25519 C10 showed the old rule
+# swallowed. A case that fails is a bug in classify_contexts, never in the
+# case: these paragraphs are copies of real memcheck output.
+ST_FAIL=0
+ST_CASES=0
+ST_VERBOSE=0
+st_case() { # st_case NAME BUCKET LAUNDER [PATTERN] <paragraph on stdin>
+    local name="$1" want="$2" want_ln="$3" pat="${4:-root[.]zig}" text b got report="" bad=""
+    text="$(cat)"
+    for b in in witness unattr launder; do
+        got="$(classify_contexts /dev/stdin "$pat" "count-$b" <<<"$text")"
+        report="$report $b=$got"
+        if [[ "$b" == launder ]]; then
+            [[ "$got" == "$want_ln" ]] || bad=1
+        elif [[ "$b" == "$want" ]]; then
+            [[ "$got" == 1 ]] || bad=1
+        else
+            [[ "$got" == 0 ]] || bad=1
+        fi
+    done
+    ST_CASES=$((ST_CASES + 1))
+    if [[ -n "$bad" ]]; then
+        ST_FAIL=$((ST_FAIL + 1))
+        printf 'ctgrind self-test FAILED: %-44s want %-7s got%s\n' "$name" "$want" "$report" >&2
+    elif [[ $ST_VERBOSE -eq 1 ]]; then
+        printf '  ok  %-44s %s\n' "$name" "$report"
+    fi
+}
+ctgrind_self_test() {
+    ST_FAIL=0; ST_CASES=0
+    # ── the shape that IS the propagation witness ──────────────────────────
+    st_case "W1 result print" witness 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: printValue__anon_26230 (Writer.zig:1111)
+==1==    by 0x2: print__anon_2403 (debug.zig:311)
+==1==    by 0x2: ctgrind_harness.main (ctgrind_harness.zig:162)
+==1==    by 0x3: callMain (start.zig:699)
+==1==    by 0x4: (below main) (start.zig:190)
+EOF
+    st_case "W2 print from a harness helper" witness 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: fmt.printInt (fmt.zig:40)
+==1==    by 0x2: print__anon_1 (debug.zig:311)
+==1==    by 0x2: ctgrind_harness.printElem (ctgrind_harness.zig:90)
+==1==    by 0x2: ctgrind_harness.main (ctgrind_harness.zig:160)
+==1==    by 0x3: callMain (start.zig:699)
+EOF
+    st_case "W3 harness stdout glued to the header line" witness 0 <<'EOF'
+nonce=3eba30af==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1813)
+==1==    by 0x2: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    # ⛔ A fully inlined `main` is reported at the merged frame's file, which is
+    # NOT the harness: measured `main (root.zig:0)` on bolt3 and
+    # `ctgrind_harness.main (Threaded.zig:0)` on opaque, same run. Keyed by
+    # function name both are the harness; keyed by file both would fail a
+    # green row. bolt3's pattern carries the `:[1-9]` guard, so root.zig:0
+    # does not win the paragraph (see guard_pattern).
+    st_case "W4 inlined main reported at root.zig:0" witness 0 'root[.]zig:[1-9]' <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: printValue__anon_26580 (Writer.zig:1122)
+==1==    by 0x2: debug.print__anon_2375 (debug.zig:311)
+==1==    by 0x3: main (root.zig:0)
+==1==    by 0x3: callMain (start.zig:699)
+==1==    by 0x4: (below main) (start.zig:190)
+EOF
+    st_case "W5 inlined main reported at Threaded.zig:0" witness 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: debug.print__anon_8297 (debug.zig:311)
+==1==    by 0x3: ctgrind_harness.main (Threaded.zig:0)
+==1==    by 0x3: callMain (start.zig:699)
+EOF
+    st_case "W6 stderr flush reaching the write syscall" witness 0 <<'EOF'
+==1== Syscall param writev(vector[0]) points to uninitialised byte(s)
+==1==    at 0x1: errno (linux.zig:594)
+==1==    by 0x1: Io.Threaded.fileWriteStreaming (Threaded.zig:10733)
+==1==    by 0x2: operate (Io.zig:453)
+==1==    by 0x2: writeStreaming (File.zig:614)
+==1==    by 0x2: Io.File.Writer.drain (Writer.zig:93)
+==1==    by 0x3: unlockStderr (debug.zig:293)
+==1==    by 0x3: print__anon_3431 (debug.zig:310)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:395)
+==1==    by 0x4: callMain (start.zig:699)
+EOF
+    st_case "W7 memcpy into the writer buffer" witness 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: copySmallLength (memcpy.zig:55)
+==1==    by 0x1: memcpy (memcpy.zig:42)
+==1==    by 0x2: write (Writer.zig:535)
+==1==    by 0x2: print__anon_1 (debug.zig:311)
+==1==    by 0x2: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    # ── what the old rule swallowed (A1 ct25519 C10) ───────────────────────
+    st_case "U1 format callback, the branch inside it" unattr 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: ctgrind_harness.main.Leaky.format (ctgrind_harness.zig:224)
+==1==    by 0x2: printValue__anon_9 (Writer.zig:1111)
+==1==    by 0x2: print__anon_2403 (debug.zig:311)
+==1==    by 0x2: ctgrind_harness.main (ctgrind_harness.zig:226)
+EOF
+    st_case "U2 formatter beneath a format callback" unattr 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: Io.Writer.writeByte (Writer.zig:600)
+==1==    by 0x2: ctgrind_harness.main.Leaky.format (ctgrind_harness.zig:224)
+==1==    by 0x2: printValue__anon_9 (Writer.zig:1111)
+==1==    by 0x2: print__anon_2403 (debug.zig:311)
+==1==    by 0x2: ctgrind_harness.main (ctgrind_harness.zig:226)
+EOF
+    st_case "U3 module file outside PATTERN formats a secret" unattr 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: fmt.bufPrint__anon_7 (fmt.zig:612)
+==1==    by 0x2: keylog.debugKey (keylog.zig:6)
+==1==    by 0x3: ctgrind_harness.openTarget (ctgrind_harness.zig:302)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:380)
+EOF
+    st_case "U4 truncated stack, no harness frame" unattr 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: printValue__anon_26230 (Writer.zig:1111)
+==1==    by 0x2: print__anon_2403 (debug.zig:311)
+EOF
+    st_case "U5 frame with no source location" unattr 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: ??? (in /tmp/ctgrind-hpke)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    st_case "U6 branch in the harness itself" unattr 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: ctgrind_harness.main (ctgrind_harness.zig:170)
+==1==    by 0x3: callMain (start.zig:699)
+EOF
+    st_case "U7 formatter below the harness frame" unattr 0 <<'EOF'
+==1== Use of uninitialised value of size 8
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: ctgrind_harness.cb (ctgrind_harness.zig:50)
+==1==    by 0x2: fmt.format__anon_3 (fmt.zig:100)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    # The other half of W4/W5: module code inlined into the print and reported
+    # at a std file's line 0 must NOT pass as plumbing, or the line-0 hole
+    # reopens on the witness side.
+    st_case "U8 module fn inlined, reported at Writer.zig:0" unattr 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: hexEncodeSecret (Writer.zig:0)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    # ── PATTERN still wins, and the launder guard still fires ──────────────
+    st_case "I1 module frame wins over the formatter" in 0 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: encodeSecretKeyHex (root.zig:179)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    st_case "L1 in-file only via a line-0 frame, witness present" in 1 <<'EOF'
+==1== Conditional jump or move depends on uninitialised value(s)
+==1==    at 0x1: Io.Writer.printHex (Writer.zig:1812)
+==1==    by 0x2: inlined (root.zig:0)
+==1==    by 0x3: ctgrind_harness.main (ctgrind_harness.zig:162)
+EOF
+    if [[ $ST_FAIL -ne 0 ]]; then
+        echo "ctgrind: the context classifier failed its own test ($ST_FAIL of $ST_CASES cases)." >&2
+        echo "     Every count below would be produced by a rule that no longer does what the header says." >&2
+        echo "     Fix classify_contexts — the cases are copies of real memcheck output, not expectations to edit." >&2
+        return 1
+    fi
+    [[ $ST_VERBOSE -eq 1 ]] && echo "ctgrind classifier self-test: $ST_CASES cases, all as documented"
+    return 0
+}
+
 # ── arguments ──────────────────────────────────────────────────────────────
 SHOW_STACKS=0
 DO_CHECK=0
+DO_SELF_TEST=0
 PATTERN_OVERRIDE=""
 DO_UPDATE_DIGESTS=0
 DO_UPDATE_OUTPUTS=0
@@ -644,6 +991,9 @@ MODULES=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --stacks) SHOW_STACKS=1; shift ;;
+        # The classifier's own test, without valgrind and without a build. It
+        # also runs before every measurement; this is how to run ONLY it.
+        --self-test) DO_SELF_TEST=1; ST_VERBOSE=1; shift ;;
         -j|--jobs) JOBS="${2:?-j needs a job count}"; shift 2 ;;
         --check) DO_CHECK=1; shift ;;
         # Rewrites ctgrind-expected.tsv's source-digest column WITHOUT running
@@ -765,6 +1115,11 @@ fi
 
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "ctgrind: -j needs a positive integer, got '$JOBS'" >&2; exit 2; }
 
+# ⛔ Before anything is built or measured: if the classifier no longer does
+# what this file says it does, every row below is a number about nothing.
+ctgrind_self_test || exit 2
+[[ $DO_SELF_TEST -eq 1 ]] && exit 0
+
 if ! command -v valgrind >/dev/null 2>&1; then
     echo "ctgrind: valgrind not found on PATH — install it or run this on a host that has it (no auto-install)." >&2
     exit 2
@@ -802,103 +1157,6 @@ for mode in "${BUILD_MODES[@]}"; do
             "${MODFLAGS[@]}" -p "$WORKDIR/$mode-$vg" >&2
     done
 done
-
-# ── measurement ────────────────────────────────────────────────────────────
-# Count valgrind ERROR blocks whose stack contains $2, treating the blank
-# "==pid==" separator lines memcheck prints between errors as paragraph
-# breaks. Counting BLOCKS (not lines) matters: a single context's stack often
-# names the target file on more than one frame (e.g. std's `pcMul16` AND its
-# `mul` wrapper both live in `edwards25519.zig`), so a plain `grep -c` over
-# lines double-counts relative to what "N contexts" means.
-count_contexts_in() {
-    local log="$1" pattern="$2"
-    classify_contexts "$log" "$pattern" count-in
-}
-
-# The fail-closed half of the same paragraph walk. An ERROR block is any
-# paragraph carrying at least one `at 0x…:` stack frame — a property of every
-# memcheck error report regardless of its kind, rather than a list of the
-# kinds we happen to know about, so a new memcheck error kind is classified
-# rather than ignored. Blocks are then bucketed in order: PATTERN wins,
-# WITNESS second, and whatever matches neither is UNATTRIBUTED.
-#
-# `mode` selects the output: count-in / count-witness / count-unattr /
-# show-unattr (the offending blocks themselves, for the failure message) /
-# count-launder and show-launder (see `guard_pattern` below).
-#
-# ── the `:0` class, and why this is a CHECK and not 101 pattern edits ───────
-#
-# A fully inlined callee gets its merged frame reported at `file.zig:0` — never
-# a real source line. Because PATTERN is tested against the whole paragraph and
-# BEFORE witness, such a frame can pull a paragraph into the in-file column that
-# belongs somewhere else: bolt3's `shachain` reported 2 where the honest count
-# was 0, and those two patterns carry a `root[.]zig:[1-9]` guard because of it.
-#
-# CTGRIND-OPEN-QUESTIONS.md left "review every bare-basename pattern" open, i.e.
-# the other 101. Measured 2026-09-09 over a full `--stacks` run, that sweep is
-# the wrong move: of 3696 in-file contexts, exactly TWO are in-file only by way
-# of a line-0 frame — `sphinx/process` (`process` at `core.zig:0`) and
-# `fss/eval` (`eval` at `dpf.zig:0`) — and BOTH are genuinely the module's own
-# code. Neither also matches witness. So guarding all 101 patterns would fix
-# nothing and break two rows, one of them by hiding fss's confirmed defect.
-#
-# What distinguishes bolt3's bad case from these two good ones is not the line-0
-# frame; it is that bolt3's paragraph ALSO matched WITNESS, so the module name
-# was not the only explanation on offer. That is checkable, so it is checked
-# here on every run instead of being carried as a manual review of 101 patterns
-# that today would be 101 unnecessary edits. Count is 0; a future inliner move
-# that makes it non-zero names the row and the block.
-guard_pattern() {
-    local alt out=""
-    local IFS='|'
-    for alt in $1; do
-        # An alternative that already constrains the line stays as written.
-        case "$alt" in
-            *:*) out="$out|$alt" ;;
-            *)   out="$out|$alt:[1-9]" ;;
-        esac
-    done
-    printf '%s' "${out#|}"
-}
-
-classify_contexts() {
-    local log="$1" pattern="$2" mode="$3"
-    local gpat; gpat="$(guard_pattern "$pattern")"
-    # Drop the harness's OWN stdout first: it is interleaved with memcheck's
-    # report, it lands inside an error paragraph, and a harness that happens
-    # to print a matching word would otherwise re-classify a real context.
-    # Only `==pid==` lines survive; the `==pid==`-only separators then become
-    # the paragraph breaks.
-    sed -E -e '/^==[0-9]+==/!d' -e 's/^==[0-9]+==[[:space:]]*$//' "$log" \
-        | awk -v RS='' -v pat="$pattern" -v gpat="$gpat" -v wit="$WITNESS" -v mode="$mode" '
-            BEGIN { in_c = 0; wit_c = 0; un_c = 0; ln0_c = 0 }
-            # not an error report (banner, HEAP SUMMARY, ERROR SUMMARY, …)
-            $0 !~ /==[0-9]+==[[:space:]]+at 0x[0-9A-Fa-f]+:/ { next }
-            {
-                if ($0 ~ pat) {
-                    in_c++
-                    # In-file ONLY through a frame with no line number, while a
-                    # witness frame is also present: the module name is not the
-                    # only account of this block, and the one that won is the
-                    # one that cannot be checked against a source line.
-                    if ($0 !~ gpat && $0 ~ wit) {
-                        ln0_c++
-                        if (mode == "show-launder") { printf "%s\n\n", $0 }
-                    }
-                }
-                else if ($0 ~ wit) { wit_c++ }
-                else {
-                    un_c++
-                    if (mode == "show-unattr") { printf "%s\n\n", $0 }
-                }
-            }
-            END {
-                if (mode == "count-in")      print in_c + 0
-                if (mode == "count-witness") print wit_c + 0
-                if (mode == "count-unattr")  print un_c + 0
-                if (mode == "count-launder") print ln0_c + 0
-            }'
-}
 
 # memcheck stops printing new contexts once it hits its limit and says so.
 # Past that point the printed blocks no longer account for the reported
@@ -1342,7 +1600,7 @@ while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog a
     fi
     # ── fail-closed: nothing is allowed to go uncounted ─────────────────────
     if [[ "$aun" != "0" ]]; then
-        echo "FAIL $am/$amode/$atarget (tainted=$ataint, -fvalgrind=$avg): $aun UNATTRIBUTED context(s) — matched neither the module pattern '$apat' nor the formatting witness. A context nobody can name is a leak until proven otherwise; do NOT close this by widening the pattern until you know what it is:" >&2
+        echo "FAIL $am/$amode/$atarget (tainted=$ataint, -fvalgrind=$avg): $aun UNATTRIBUTED context(s) — matched neither the module pattern '$apat' nor the SHAPE of the harness printing its result (formatting frames, each with a real source line, straight down to the harness frame -- see classify_contexts). A context nobody can name is a leak until proven otherwise; do NOT close this by widening the pattern until you know what it is:" >&2
         classify_contexts "$alog" "$apat" show-unattr >&2
         fail=1
     fi

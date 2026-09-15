@@ -143,6 +143,22 @@ directory.
   has no recipe — previously that case reported "no harness for module", which
   was the opposite of true.
 
+- **Tooling:** `ctgrind.sh`'s **`witness` bucket now has a shape instead of a
+  file list**, and the classifier has its own test. A context was filed as the
+  harness's propagation witness whenever a formatting file appeared *anywhere*
+  in its stack, and no column in `ctgrind-expected.tsv` pins that bucket's
+  count — so a leak reached through a formatter was absorbed with every pinned
+  number, both digests and the exit code unchanged. It must now BE the harness
+  printing its result: formatting and stderr-plumbing frames, each with a real
+  source line, down to the harness frame, and only harness or `start.zig`
+  below it. The harness frame is matched by function name, because a fully
+  inlined `main` is reported at some other file's line 0 (measured:
+  `root.zig:0` on bolt3, `Threaded.zig:0` on opaque). Re-classifying a
+  complete 378-row run moves nothing, so the change is only what it now
+  refuses. `scripts/ctgrind.sh --self-test` checks the rule against 17
+  recorded memcheck paragraphs without valgrind or a build, and every
+  measurement runs it first.
+
 - **Tooling:** the README module catalog is now **generated in full** —
   `zig build gen-catalog`, gated by `check-catalog-table`. Each row's
   description and Platform cell come from the module's own `meta.doc` /

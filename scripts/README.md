@@ -584,6 +584,33 @@ The `--pattern` flag exists so that an attribution written in a `SPEC.md`
 ("these three contexts are all in `encodeToCurve`", "none are in `ct25519`'s
 ladder") can be re-checked rather than believed.
 
+**The three buckets, and what makes one a witness.** Every context memcheck
+reports is filed as `in-file` (the stack names a file this row's PATTERN is
+about), `witness` (the harness printing its own result — the proof that the
+taint propagated at all), or `unattr` (anything else, always a `--check`
+failure). Until 2026-09-16 the middle bucket meant "a formatting file appears
+SOMEWHERE in the stack", and no column pins its count, so any leak whose stack
+happened to carry a formatter frame was swallowed with every number unchanged:
+a `format` callback, or module code outside PATTERN that hex-formats a secret.
+It is now the SHAPE of the stack — formatting and stderr-plumbing frames, each
+with a real source line, down to the harness frame, and nothing but harness and
+`start.zig` below it. Re-run over a full 378-row measurement it reclassifies
+nothing, so the change is what it catches, not what it moves.
+
+⚠ The harness frame is recognised by FUNCTION name, not by file. A fully
+inlined `main` is reported at the merged frame's file, which is some other
+file entirely: measured `main (root.zig:0)` on `bolt3` and
+`ctgrind_harness.main (Threaded.zig:0)` on `opaque` in the same run. For the
+same reason a plumbing frame is only accepted with a real line number — a
+module function inlined into the print and reported at `Writer.zig:0` is not
+std, and must not pass as std.
+
+`scripts/ctgrind.sh --self-test` runs that classifier against 17 recorded
+paragraphs (real memcheck output, no valgrind, no build, milliseconds), and
+every measurement runs it first. The rule that decides what every number here
+means is itself text processing, so it is cheap to test and expensive to leave
+untested.
+
 **A green `--check` does not mean every constant-time claim holds.** It means
 every recorded number still reads the way it read when it was taken. When a
 measurement finds a real DEFECT, the convention is to record the defective count
