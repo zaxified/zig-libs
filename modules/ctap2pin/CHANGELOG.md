@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** SPEC.md's
+  threat-model notes now document audit finding M3's remaining dead-stack
+  residue (`prk`, intermittently `hmacKey`) as a confirmed `std.crypto`
+  limitation, not an open leak in this module or measurement noise —
+  `std.crypto.hmac.Hmac.init` copies its key byte-for-byte into an
+  uncleared local `scratch` when `key.len <= block_length`, and
+  `HkdfSha256.expand` calls it with `prk` as the key on every output
+  half. This module's own `secureZero(&prk)` cannot reach a copy `std`
+  made in a deeper, already-retired frame.
+
 - **2026-09-11** — **API CHANGE:** `Two.authenticate`/`Two.verify`'s `key`
   parameter changes from `[]const u8` to `*const [32]u8` (audit finding
   H2). The old signature sliced `key[0..32]` with NO length check —
