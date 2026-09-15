@@ -421,6 +421,111 @@ test "F3: Secp256k1.mul(P, s) rejects s ≡ 0 (mod n), same as combMulBase" {
     try std.testing.expect(from_mul.equivalent(from_comb));
 }
 
+// ── A1/k256.md F5: the windowed constant-time `mul` (P5 evidence) ─────────
+//
+// `mul` stopped being the 256-bit ladder on 2026-09-16. The ladder stays as
+// `mulLadder`, and these two tests are what licenses the swap: every result
+// must equal the ladder's AND std's at the affine level, error for error, on
+// random scalars and on the shapes random scalars never produce (all-negative
+// digit strings, carries into the extra window, the raw range above `n`), over
+// base, random, negated, un-normalised projective and identity points. The
+// positive control shows that comparison can fail.
+
+fn stdOf(p: Secp256k1) !StdCurve {
+    const enc = p.toUncompressedSec1();
+    return StdCurve.fromSec1(&enc);
+}
+
+fn mulAgrees(p: Secp256k1, kb: [32]u8) !void {
+    const got = p.mul(kb, .big);
+    const sp = try stdOf(p);
+    if (p.mulLadder(kb, .big)) |want| {
+        const g = try got;
+        const ga = g.affineCoordinates();
+        const wa = want.affineCoordinates();
+        try std.testing.expectEqualSlices(u8, &wa.x.toBytes(.big), &ga.x.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &wa.y.toBytes(.big), &ga.y.toBytes(.big));
+        try eqAffineStd(g, try sp.mul(kb, .big));
+    } else |e| {
+        try std.testing.expectError(e, got);
+        try std.testing.expectError(e, sp.mul(kb, .big));
+    }
+}
+
+test "F5: windowed mul == mulLadder == std, random + edge scalars over base/random/projective/identity points" {
+    const scalar = @import("scalar.zig");
+    const n = scalar.field_order;
+    const ones: u256 = std.math.maxInt(u256) / 15; // 0x1111…1
+    const edges = [_]u256{
+        0, 1, 2,  3,  7,
+        8, 9, 15, 16, 17,
+        ones * 8, // every window 8: every digit negative, carry through all 64
+        ones * 7, // every window 7: largest non-negative digit everywhere
+        ones * 15, // 2^256−1: every window carries
+        (1 << 255),
+        (1 << 255) + 1,
+        (1 << 252),                (1 << 252) - 1, // top nibble boundary
+        n - 1,                     n,
+        n + 1,                     n + 2,
+        (n - 1) / 2,               scalar.lambda,
+        std.math.maxInt(u256) - 1, std.math.maxInt(u256) - 15,
+    };
+
+    var prng = std.Random.DefaultPrng.init(0xF5_0A1D_E120);
+    const rand = prng.random();
+    var rb: [32]u8 = undefined;
+    rand.bytes(&rb);
+    const r = try Secp256k1.combMulBase(rb, .big);
+    const points = [_]Secp256k1{
+        Secp256k1.basePoint,
+        Secp256k1.identityElement,
+        r, // projective, z ≠ 1
+        r.neg(),
+        r.add(Secp256k1.basePoint).dbl(), // un-normalised projective
+        try Secp256k1.fromAffineCoordinates(r.affineCoordinates()), // same point, z = 1
+    };
+    for (points) |p| {
+        for (edges) |e| try mulAgrees(p, beBytes(e));
+    }
+
+    // Random: a fresh random point and a raw 256-bit scalar each round.
+    const rounds: usize = if (@import("builtin").mode == .Debug) 48 else 1000;
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        rand.bytes(&rb);
+        const p = Secp256k1.combMulBase(rb, .big) catch continue;
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        try mulAgrees(p, kb);
+    }
+}
+
+test "F5 positive control: a corrupted per-point table DISAGREES with std (the differential has teeth)" {
+    var prng = std.Random.DefaultPrng.init(0xF5_BAD_7AB1E);
+    const rand = prng.random();
+    const rounds: usize = if (@import("builtin").mode == .Debug) 32 else 500;
+    var disagreements: usize = 0;
+    var i: usize = 0;
+    while (i < rounds) : (i += 1) {
+        var rb: [32]u8 = undefined;
+        rand.bytes(&rb);
+        const p = Secp256k1.combMulBase(rb, .big) catch continue;
+        var tab = p.varBaseTable();
+        tab[4] = Secp256k1.identityElement; // 5·P gone: any digit of magnitude 5 now adds nothing
+        var kb: [32]u8 = undefined;
+        rand.bytes(&kb);
+        const sp = (try stdOf(p)).mul(kb, .big) catch continue;
+        const kp = Secp256k1.mulWithTable(&tab, kb, .big) catch {
+            disagreements += 1;
+            continue;
+        };
+        if (!std.mem.eql(u8, &kp.affineCoordinates().x.toBytes(.big), &sp.affineCoordinates().x.toBytes(.big))) disagreements += 1;
+    }
+    // 65 digits, each of magnitude 5 with probability 1/8: a scalar avoids
+    // them all with probability (7/8)^64 ≈ 2e-4.
+    try std.testing.expect(disagreements * 10 > rounds * 9);
+}
+
 test "F9: Fe.rejectNonCanonical actually rejects >= p and accepts < p" {
     const Fe = field.Fe;
     const p = field.field_order;

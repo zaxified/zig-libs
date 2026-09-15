@@ -83,10 +83,17 @@ the whole group is byte-exact vs std at the point level.
 
 Scalar multiply variants:
 
-- **`mul`** — CONSTANT-TIME fixed 256-bit double-and-add with a branch-free `cMov`
-  bit select. For secret scalars (key derivation, signing nonce). No
-  secret-dependent branch, index, or early exit; the complete formulas make every
-  step exception-free.
+- **`mul`** — CONSTANT-TIME fixed-window multiply for a secret scalar on an
+  arbitrary point (ECDH: `sphinx`, `bolt8`, `bolt3`, `frost`). Since 2026-09-16
+  (A1 F5): the scalar is recoded into 65 signed base-16 digits in `[−8, 7]`, a
+  table `(1..8)·P` is built per call (1 doubling + 6 adds), and the result is
+  evaluated high window first — 4 doublings and 1 add per window instead of 1
+  doubling and 1 add per bit. The recoding (`signedDigit`) and the masked
+  table select (`gatherSigned`) are the very functions the fixed-base comb
+  runs; the table build and the loop depend on public counters only. No
+  secret-dependent branch, index, or early exit; the complete formulas make
+  every step exception-free. **`mulLadder`** keeps the previous 256-bit
+  double-and-add with a `cMov` bit select as the differential oracle.
 - **`mulPublic`** — VARIABLE-TIME single-base multiply for public scalars; the
   dispatch point for the gated GLV core. Portable fallback: plain vartime
   double-and-add.
@@ -137,8 +144,11 @@ GLV to the double-base `s·G − e·P` path.
   independent of the element value; the final reduce/normalise is a masked
   conditional subtract (no branch, no secret-dependent memory access). `invert`'s
   schedule depends only on the fixed public exponent.
-- **Group**: `mul` (secret scalars) is fixed 256-iteration double-and-add with a
-  `cMov` select — no branch on scalar bits. `mulPublic`/`mulDoubleBasePublic` are
+- **Group**: `mul` (secret scalars) is a fixed 65-window signed-digit multiply:
+  branch-free recoding, a masked linear scan over all eight table entries per
+  window (`blackBox`-laundered mask), a masked negation — no branch on scalar
+  bits and no secret-indexed load. `combMulBase` shares that recoding and
+  gather. `mulPublic`/`mulDoubleBasePublic` are
   explicitly VARIABLE-TIME and only for PUBLIC scalars (verification), matching
   std's `mulPublic`/`mulDoubleBasePublic` contract.
 - **Scalar**: inherited from std (constant-time fiat field), re-exported.
@@ -178,7 +188,7 @@ counting rule were added). Three bucket columns, not one, and they sum to
 | `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 6 | 0 | 99 |
 | `field` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `field` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `mul` | scalar | yes | **yes** | 8 | **2** | 6 | 0 | 99 |
+| `mul` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 *(windowed `mul`, 2026-09-16; the ladder read 8/2)* |
 | `mul` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `mul` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
 | `comb` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 |
@@ -197,12 +207,17 @@ public-exponent `powConst` together report **0** contexts in `field.zig` /
 `fast_core.zig`. That zero is readable only because the other three rows are
 non-zero: the taint demonstrably propagates through this module's arithmetic.
 
-**The 2 + 1 group contexts are `rejectIdentity`, not the ladder.** Located
-exactly (`--stacks`):
+**The 1 + 1 group contexts are `rejectIdentity`, not the multiply.** Located
+exactly (`--stacks`, 2026-09-16):
 
-- `group.zig:277` — `mul`'s trailing `try q.rejectIdentity()` (2 contexts: LLVM
-  splits the `z = 0` test from the affine-identity test);
-- `group.zig:346` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`.
+- `group.zig:328` — `mulWithTable`'s trailing `try acc.rejectIdentity()`, reached
+  from `mul` (`group.zig:285`). The 256-bit ladder it replaced read **2** here
+  (`group.zig:277`, LLVM split the `z = 0` test from the affine-identity test);
+  the windowed build reads 1 on the same source expression. That is the
+  compiler placing one test at one address, not a property of the module.
+- `group.zig:380` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`, reached
+  from `combMulBase` (`group.zig:359`). Unchanged at 1 after the recoding and
+  gather were factored into the helpers `mul` shares.
 
 Both branch on "did the whole multiplication land on the neutral element", i.e.
 `s ≡ 0 (mod n)` — one bit, once, after the ladder, not per scalar bit or per
@@ -211,7 +226,7 @@ is what makes `error.IdentityElement` reachable. **The per-bit `cMov` select and
 the per-window masked table gather report nothing**, which is the claim the
 `blackBox` barriers exist to hold.
 
-**The 11 `sign` contexts** are **two at `group.zig:346`** — one per
+**The 11 `sign` contexts** are **two at `group.zig:380`** (2026-09-16; `:346` before the recoding/gather helpers were factored out) — one per
 `combMulBase` call, inlined from `sign.zig:62` and `sign.zig:80` — plus nine
 input/output validations, all on lines that must branch by contract:
 
@@ -229,11 +244,12 @@ input/output validations, all on lines that must branch by contract:
 were "those two" from the bullets above — i.e. `mul`'s `group.zig:277` and
 `comb`'s `group.zig:346`. Measured: `bip340Sign` never calls `Secp256k1.mul`,
 so `group.zig:277` appears in the `mul` row only, and `sign`'s pair is
-`group.zig:346` twice. The count was right; the attribution was not.)
+`group.zig:346` twice. The count was right; the attribution was not. Line
+numbers in this note are the 2026-08-13 ones.)
 
 **The 10 `ecdsa` contexts** — `ecdsa_recover.sign`, RFC 6979 deterministic
 ECDSA, the module's other shipped secret path (in-repo consumer: `lninvoice`'s
-BOLT#11 signer). One is `group.zig:346` again; the rest are validations, with
+BOLT#11 signer). One is `group.zig:380` again; the rest are validations, with
 one exception that is called out because it is genuinely a branch on secret
 material:
 
@@ -247,7 +263,7 @@ material:
   because there is no rejection-free variant that still yields the RFC's exact
   nonce, and libsecp256k1's `nonce_function_rfc6979` branches on the same
   condition. Documented at the source, not silenced;
-- `group.zig:346` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
+- `group.zig:380` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
 - `ecdsa_recover.zig:133` (via `scalar.zig:87`) / `:134` — canonicality and
   `isZero` on `r`;
 - `ecdsa_recover.zig:136` — `s.isZero()`;
@@ -289,7 +305,8 @@ covered by this claim.
 | `blackBox` removed from `Fe.cMov` | `--check` **FAILS**. On the `field` row the leak appears as **1 unattributed** `Conditional jump` context (total 6 → 5, in-file still 0), stack `reloadVolatile (ctgrind_harness.zig:0)` ← `main` — memcheck attributes the inlined select to the harness file, so no k256 pattern matches it. `mul` 8/2 → 1/1, `comb` 7/1 → 8/2, `sign` 13/11 → 17/15. **Until 2026-08-13 the field row read 0/0 and the driver dropped that context silently**; that is why `unattr` exists (`scripts/ctgrind.sh`, "the SECOND trap"). |
 | `blackBox` removed from `normalize`'s three masks AND `Fe.sub`'s, `Fe.cMov`'s kept | `mul` 8/2 → **35/29**: 28 NEW contexts, all at `normalize (field.zig:83)` and `normalize (field.zig:91)` — the carry fold and the conditional subtract, branching on the secret. `normalize`'s barriers are load-bearing and this is the measurement that shows it. (Removing ALL barriers *including* `Fe.cMov`'s does NOT show this: the `cMov` leak resolves the taint first and these contexts never appear, which is the same "total can go down" effect noted below. A whole-file barrier kill is the WRONG control for a per-site question.) |
 | `blackBox` removed from `Fe.sub`'s mask ALONE | `mul` 8/2 → 7/1 and **no new context at `field.zig:229`/`:230`** — the count moved DOWN. `Fe.sub`'s barrier has **no demonstrated teeth** under this harness. It is kept as defence-in-depth against a compiler that would lower the masked add-back to a branch, not because one currently does; nothing here proves it is preventing anything. |
-| `q.cMov(added, bit)` → `if (bit == 1) q = added` | new context at `group.zig:275` |
+| `q.cMov(added, bit)` → `if (bit == 1) q = added` | new context at `group.zig:275` *(the 256-bit ladder, 2026-08-13; now `mulLadder`, which no target drives)* |
+| windowed `mul`: `if (mags[i] > 4) acc = acc.add(acc.neg()).add(acc)` inserted after each window's add — a branch on a secret digit that leaves the point unchanged, so every value test stays green | `mul` 7/1 → **8/2**, the new context `Conditional jump … uninitialised value(s)` **at the injected line** (`group.zig:327`), `rejectIdentity` moved to `:329`; all other rows unchanged (2026-09-16, A1 F5) |
 | masked comb gather → `g = tab[i][m-1]` | `comb` 1 → 4 contexts, including memcheck's "Use of uninitialised value of size 8" on the *address* — the b199192 secret-indexed-load signature |
 | branch on a byte of the secret scalar `d` in `bip340Sign` | `sign` 11 → 12, new context at the injected line |
 | `rfc6979Nonce` → constant `0x42`×32 | `zig build test-k256` **exit 1**, one failure: the BOLT#11 nonce anchor in `ecdsa_recover.zig`. Before that test existed (2026-08-13) the same mutation left all 34 tests green at **exit 0**, with the only red in the repository being the CONSUMER `lninvoice`. |
@@ -422,7 +439,41 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
    `std.crypto.ecc.Secp256k1` references are comments and one test oracle
    (`sphinx/src/kat_test.zig:28`).
 6. Side-channel review of the CT paths (inverse, GLV sign handling).
-7. **Variable-base constant-time multiply (`Secp256k1.mul`, the ECDH path)
+7. ~~Variable-base constant-time multiply is still the plain ladder.~~
+   **DONE 2026-09-16 (A1 F5), under DECISIONS P5** — `mul` is now the
+   fixed-window signed-digit multiply described under "Scalar multiply
+   variants". The four P5 proofs, all taken on the shipped code:
+   1. **Bit-exact against the previous implementation**: `oracle_test.zig`
+      "F5: windowed mul == mulLadder == std" — 26 edge scalars (0…17, every
+      window 8 / 7 / 15, 2^252±, 2^255±, `n−1`…`n+2`, `(n−1)/2`, `λ`,
+      `2^256−1`…) × 6 points (base, identity, random projective, its negation,
+      an un-normalised projective sum, the same point with `z = 1`), affine
+      bytes AND error agreement with `mulLadder` and with std. External KATs
+      through the new `mul`: the consumers' BOLT#4 (`sphinx`), BOLT#8
+      (`bolt8`) and BOLT#3 (`bolt3`) vectors, all green.
+   2. **Randomized differential**: 1 000 fresh (random point, raw 256-bit
+      scalar) pairs at ReleaseFast (48 in Debug), same three-way comparison.
+      Positive control: `mulWithTable` with one table entry replaced by the
+      identity must disagree with std on > 90 % of 500 inputs, and does.
+   3. **ctgrind**: the `mul` row reads **7 total / 1 in-file / 6 witness /
+      0 unattr** — the one in-file context is `mulWithTable`'s trailing
+      `rejectIdentity` (`group.zig:328`); nothing in the recoding, the table
+      build, the gather or the doubling loop. The ladder read 8/2 on the same
+      harness.
+   4. **Measured benefit** (interleaved A/B, ReleaseFast, random non-base
+      point, 9 rounds × 1 000 calls, arm order rotated per round, ratios per
+      round): windowed `mul` **114 747 ns/op** median [111 878 … 120 946],
+      `mulLadder` 203 645 [200 658 … 214 003], std's CT `mul` 257 958
+      [251 588 … 277 702]. **1.80× over the ladder** [1.66 … 1.84] and
+      **2.26× over std** [2.11 … 2.33], where the ladder was 1.27× std. This is
+      the one secret-scalar curve operation `sphinx` pays per onion hop and
+      `bolt8` per Noise handshake, and the new code is small: a table build
+      and a Horner loop over public counters, with both secret-touching steps
+      reused from the comb, which already carried its own ctgrind row and std
+      differential.
+
+   The 2026-09-15 record that motivated it, kept for history:
+   **Variable-base constant-time multiply (`Secp256k1.mul`, the ECDH path)
    is still the plain always-double-and-add ladder — no windowing.**
    Measured (fix campaign perf pass, 2026-09-15, ReleaseFast, 5 interleaved
    A/B rounds against `std.crypto.ecc.Secp256k1`, same process): k256

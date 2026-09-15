@@ -29,10 +29,13 @@
 //!   the part that matters most — it is the exact value whose laundering
 //!   through `blackBox` the doc comment says the "constant-time" scalar-mul
 //!   paths depend on.
-//! * `mul` — `Secp256k1.mul`, the CONSTANT-TIME variable-base fixed
-//!   256-iteration double-and-add (`group.zig:262`), with the scalar tainted.
+//! * `mul` — `Secp256k1.mul`, the CONSTANT-TIME variable-base multiply
+//!   (`group.zig`, `mul` → `mulWithTable`: since 2026-09-16 a 65-window
+//!   signed-digit multiply sharing the comb's recoding and masked gather; the
+//!   256-iteration ladder it replaced is `mulLadder`, which no target drives),
+//!   with the scalar tainted.
 //! * `comb` — `Secp256k1.combMulBase`, the fixed-base comb that the signing
-//!   path actually calls (`group.zig:281`), with the scalar tainted. Its
+//!   path actually calls (`group.zig`, `combMulBaseWithTable`), with the scalar tainted. Its
 //!   masked linear-scan table gather is the powMont-gather leak class this
 //!   repo tracks as montint `b199192`; a secret-indexed load would show up
 //!   here as memcheck's "Use of uninitialised value of size 8" on the address.
@@ -55,10 +58,11 @@
 //! both halves were wrong — `rejectIdentity` is INLINED, so its own line
 //! never appears, and the majority of `sign`'s contexts are not it):
 //!
-//!   * `group.zig:277` — `mul`'s trailing `try q.rejectIdentity()`, 2 contexts
-//!     (LLVM splits the `z == 0` test from the affine-identity test).
-//!   * `group.zig:346` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`,
-//!     1 context per call: once in `comb`, twice in `sign`.
+//!   * `group.zig:328` — `mulWithTable`'s trailing `try acc.rejectIdentity()`,
+//!     1 context (2026-09-16; the ladder it replaced read 2 at `group.zig:277`,
+//!     LLVM having split the `z == 0` test from the affine-identity test).
+//!   * `group.zig:380` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`,
+//!     1 context per call: once in `comb`, twice in `sign`, once in `ecdsa`.
 //!
 //! Either way the branch is on "did the whole scalar multiplication land on
 //! the neutral element", i.e. `s ≡ 0 (mod n)`. It is the same one-bit
@@ -80,7 +84,7 @@
 //! caller's private key, `:105` on the DRBG output, `:106` the RFC 6979 §3.2
 //! retry test (a real branch on the SECRET nonce candidate — probability
 //! ≈2^-127, documented at the source in `ecdsa_recover.zig` rather than
-//! silenced), `group.zig:346`, `:133`/`:134` on `r`, `:136` on `s`, `:143` on
+//! silenced), `group.zig:380`, `:133`/`:134` on `r`, `:136` on `s`, `:143` on
 //! `Ra.x >= n`, and `:152` on low-S. One of `ecdsa`'s five non-in-file
 //! contexts is memcheck's `Syscall param write(buf)` on the tainted output
 //! itself; it reaches `Io.Writer`, so the driver files it under the

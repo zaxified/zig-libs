@@ -14,8 +14,11 @@
 //! differential in `oracle_test.zig` pins it.
 //!
 //! Scalar multiplication:
-//!   * `mul` — CONSTANT-TIME fixed 256-bit double-and-add with a `cMov` bit
-//!     select (secret scalars: key derivation, signing nonce).
+//!   * `mul` — CONSTANT-TIME fixed-window (w = 4, signed digits) multiply over
+//!     a per-call table of the point's first eight multiples, built from the
+//!     comb's own constant-time digit recoding and masked gather (secret
+//!     scalars on an arbitrary point: ECDH). `mulLadder` keeps the previous
+//!     bit-by-bit `cMov` ladder as its differential oracle.
 //!   * `mulPublic` — VARIABLE-TIME single-base multiply for public scalars, the
 //!     dispatch point for the gated GLV core (`mulPublicGlv`, IMPLEMENTED);
 //!     portable fallback is a plain vartime double-and-add.
@@ -260,11 +263,77 @@ pub const Secp256k1 = struct {
         return std.mem.readInt(u256, &s_, endian);
     }
 
-    /// CONSTANT-TIME scalar multiply `s·p` for a possibly-SECRET scalar: a fixed
-    /// 256-bit double-and-add with a branch-free `cMov` bit select (the complete
-    /// formulas make every step exception-free). `error.IdentityElement` if the
-    /// result is the neutral element.
+    /// CONSTANT-TIME scalar multiply `s·p` for a possibly-SECRET scalar and an
+    /// arbitrary point — the ECDH path (`sphinx` per hop, `bolt8`'s Noise DH).
+    ///
+    /// Fixed-window signed-digit multiply (A1/k256.md F5): the scalar is
+    /// recoded into `comb_t` base-2^4 digits in `[−8, 7]` by `signedDigit`, a
+    /// table `(1..8)·p` is built once per call (`varBaseTable`), and the result
+    /// is evaluated high window first — four doublings and ONE add per window,
+    /// where the ladder paid one doubling and one add per BIT. Both
+    /// secret-touching pieces, the recoding and the masked table select
+    /// (`gatherSigned`), are the very code `combMulBaseWithTable` runs on the
+    /// signing path; the table build and the loop are driven by public
+    /// counters only. The complete formulas make every step exception-free,
+    /// identity entries and identity `p` included.
+    ///
+    /// Bit-exact at the affine level to `mulLadder`, the ladder this replaced,
+    /// and to std. `error.IdentityElement` if the result is the neutral element
+    /// (`s ≡ 0 (mod n)`, or `p` itself is the identity).
     pub fn mul(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        const tab = p.varBaseTable();
+        return mulWithTable(&tab, s_, endian);
+    }
+
+    /// The per-point table `mul` gathers from: `tab[j] = (j+1)·p`, projective.
+    /// `pub` so the positive-control test can corrupt one entry.
+    pub fn varBaseTable(p: Secp256k1) VarBaseTable {
+        var tab: VarBaseTable = undefined;
+        tab[0] = p;
+        tab[1] = p.dbl();
+        var j: usize = 2;
+        while (j < comb_teeth) : (j += 1) tab[j] = tab[j - 1].add(p);
+        return tab;
+    }
+
+    /// `mul` parameterised on the table, so `oracle_test.zig` can pass a
+    /// deliberately-corrupted one and prove the differential has teeth. Table
+    /// indices come only from the public window counter; the digit that picks
+    /// an entry is consumed by the masked scan in `gatherSigned`.
+    pub fn mulWithTable(tab: *const VarBaseTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        const k = scalarValue(s_, endian);
+        // The carry runs low → high, the evaluation high → low, so the digits
+        // are recoded first. They are the scalar in another form: zeroed on
+        // the way out, like every other secret-derived buffer on these paths.
+        var mags: [comb_t]u8 = undefined;
+        var negs: [comb_t]u8 = undefined;
+        defer std.crypto.secureZero(u8, &mags);
+        defer std.crypto.secureZero(u8, &negs);
+        var carry: u64 = 0;
+        for (&mags, &negs, 0..) |*m, *ng, i| {
+            const d = signedDigit(k, i, &carry);
+            m.* = @truncate(d.mag);
+            ng.* = @truncate(d.is_neg);
+        }
+
+        // The top window holds at most the final carry, so it starts the
+        // accumulator directly instead of doubling the identity four times.
+        var acc = gatherSigned(tab, mags[comb_t - 1], negs[comb_t - 1]);
+        var i: usize = comb_t - 1;
+        while (i > 0) {
+            i -= 1;
+            acc = acc.dbl().dbl().dbl().dbl();
+            acc = acc.add(gatherSigned(tab, mags[i], negs[i]));
+        }
+        try acc.rejectIdentity();
+        return acc;
+    }
+
+    /// The constant-time `mul` this module shipped until 2026-09-16: a fixed
+    /// 256-iteration double-and-add with a branch-free `cMov` bit select. Kept
+    /// as `mul`'s differential oracle (as `mulPublicDoubleAdd` is for the GLV
+    /// core); no production path calls it.
+    pub fn mulLadder(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         const s = scalarValue(s_, endian);
         var q = Secp256k1.identityElement;
         var i: usize = 256;
@@ -297,52 +366,16 @@ pub const Secp256k1 = struct {
     /// for any table. `pub` for that harness (cf. `mulPublicDoubleAdd`).
     pub fn combMulBaseWithTable(tab: *const CombTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         const k = scalarValue(s_, endian);
-        const half: u64 = 1 << (comb_w - 1); // 2^(w−1)
-        const twow: u64 = 1 << comb_w; // 2^w
-        const wmask: u64 = twow - 1;
-
         var acc = Secp256k1.identityElement;
-        // Signed-digit (Booth-style) recoding with a running carry, folded into
-        // the same loop that consumes the digits — fully branchless in `k`.
-        // Digit d_i ∈ [−2^(w−1), 2^(w−1)−1], so Σ d_i·2^(w·i) = k exactly and
-        // the magnitude |d_i| ∈ [0, 2^(w−1)] indexes the half-size table.
+        // Recoding and gather are shared with `mul` (see `signedDigit` and
+        // `gatherSigned` below for their constant-time contracts); here each
+        // window has its own table row, which already carries the `2^(w·i)`
+        // factor, so digits are consumed low → high with no doubling at all.
         var carry: u64 = 0;
         var i: usize = 0;
         while (i < comb_t) : (i += 1) {
-            const shift: usize = i * comb_w; // PUBLIC (loop-derived) shift
-            const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & wmask) else 0;
-            const x = wv + carry; // 0 .. 2^w
-            // is_neg ⟺ x ≥ 2^(w−1): then d = x − 2^w (< 0) and carry propagates.
-            // A `>=` compare lowers to setcc (data-independent), not a branch.
-            const is_neg: u64 = @intFromBool(x >= half);
-            carry = is_neg;
-            const negmask: u64 = 0 -% is_neg;
-            // |d| = is_neg ? (2^w − x) : x  — masked, no branch.
-            const m = ((twow - x) & negmask) | (x & ~negmask); // 0 .. 2^(w−1)
-
-            // CONSTANT-TIME gather of the table entry for magnitude `m`: a
-            // masked linear scan touching EVERY entry of window `i`. The
-            // per-entry select mask is laundered through `blackBox` so LLVM
-            // cannot recover "pick the entry where j+1 == m" and lower it to a
-            // secret-indexed jump table (`jmp *tbl(,%reg,8)`) — the exact
-            // powMont-gather leak class (montint b199192). `m == 0` (digit 0)
-            // matches no entry, leaving `g` the neutral element (adds nothing).
-            var g = Secp256k1.identityElement;
-            var j: usize = 0;
-            while (j < comb_teeth) : (j += 1) {
-                const match: u64 = @intFromBool(@as(u64, j + 1) == m);
-                const mask = blackBox(0 -% match);
-                blendLimbs(&g.x, tab[i][j].x, mask);
-                blendLimbs(&g.y, tab[i][j].y, mask);
-                blendLimbs(&g.z, tab[i][j].z, mask);
-            }
-            // Signed digit ⇒ conditional point negation via masked field-negate
-            // (compute −y unconditionally, select with a branch-free cMov).
-            var gneg = g;
-            gneg.y = g.y.neg();
-            g.cMov(gneg, @intCast(is_neg));
-
-            acc = acc.add(g);
+            const d = signedDigit(k, i, &carry);
+            acc = acc.add(gatherSigned(&tab[i], d.mag, d.is_neg));
         }
         try acc.rejectIdentity();
         return acc;
@@ -603,6 +636,57 @@ const comb_t: usize = (256 / comb_w) + 1; // 65
 
 /// The precomputed comb table type: `[window][magnitude−1]` projective points.
 pub const CombTable = [comb_t][comb_teeth]Secp256k1;
+
+/// `mul`'s per-call table: `[magnitude−1]` projective multiples of one point.
+pub const VarBaseTable = [comb_teeth]Secp256k1;
+
+const SignedDigit = struct { mag: u64, is_neg: u64 };
+
+/// Window `i` of `k` as a signed digit, consuming and updating the running
+/// `carry` — the Booth-style recoding both constant-time multiplies use.
+/// Digits `d_i ∈ [−2^(w−1), 2^(w−1)−1]` with `Σ d_i·2^(w·i) = k` exactly over
+/// `comb_t` windows (the extra window absorbs the final carry, so the whole raw
+/// range up to 2^256−1 is covered), and `mag = |d_i| ∈ [0, 2^(w−1)]` indexes a
+/// half-size table. Branch-free in `k`: the only condition is on the PUBLIC
+/// shift, and `x >= half` lowers to `setcc`, not a jump.
+inline fn signedDigit(k: u256, i: usize, carry: *u64) SignedDigit {
+    const half: u64 = 1 << (comb_w - 1); // 2^(w−1)
+    const twow: u64 = 1 << comb_w; // 2^w
+    const wmask: u64 = twow - 1;
+    const shift: usize = i * comb_w; // PUBLIC (loop-derived) shift
+    const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & wmask) else 0;
+    const x = wv + carry.*; // 0 .. 2^w
+    // is_neg ⟺ x ≥ 2^(w−1): then d = x − 2^w (< 0) and carry propagates.
+    const is_neg: u64 = @intFromBool(x >= half);
+    carry.* = is_neg;
+    const negmask: u64 = 0 -% is_neg;
+    // |d| = is_neg ? (2^w − x) : x  — masked, no branch.
+    const m = ((twow - x) & negmask) | (x & ~negmask); // 0 .. 2^(w−1)
+    return .{ .mag = m, .is_neg = is_neg };
+}
+
+/// CONSTANT-TIME `±row[mag−1]` (the neutral element for `mag == 0`): a masked
+/// linear scan touching EVERY entry of the row, then a masked negation. The
+/// per-entry select mask is laundered through `blackBox` so LLVM cannot
+/// recover "pick the entry where j+1 == mag" and lower it to a secret-indexed
+/// jump table (`jmp *tbl(,%reg,8)`) — the exact powMont-gather leak class
+/// (montint b199192). The negation computes `−y` unconditionally and selects
+/// with a branch-free `cMov`.
+inline fn gatherSigned(row: *const [comb_teeth]Secp256k1, mag: u64, is_neg: u64) Secp256k1 {
+    var g = Secp256k1.identityElement;
+    var j: usize = 0;
+    while (j < comb_teeth) : (j += 1) {
+        const match: u64 = @intFromBool(@as(u64, j + 1) == mag);
+        const mask = blackBox(0 -% match);
+        blendLimbs(&g.x, row[j].x, mask);
+        blendLimbs(&g.y, row[j].y, mask);
+        blendLimbs(&g.z, row[j].z, mask);
+    }
+    var gneg = g;
+    gneg.y = g.y.neg();
+    g.cMov(gneg, @truncate(is_neg));
+    return g;
+}
 
 /// Build the comb table at comptime. `tab[i][j] = (j+1)·2^(w·i)·G`, projective.
 fn buildCombTable() CombTable {
