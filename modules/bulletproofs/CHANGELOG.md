@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — Audit finding B12. Security fix, no API change: `prove` left
+  secrets on the dead stack that `secureZero` on its named locals could not
+  reach. Measured at ReleaseFast after `prove(n=64)` returned: `v_bytes` ×1 on
+  the audited tree; `v_bytes` ×1, `z²·γ` ×1 (with the public challenge `z`
+  that is the blinding factor, and with `V` the witness) and 6 of the 132
+  random blinding scalars on the tree before this change. `prove` now runs its
+  computation one frame down (`proveInner`) and zeroes 128 KiB of stack below
+  it before returning, on the error path too; the call tree reaches 46 856 B for
+  every `n` from 8 to 128. `stackprobe_test.zig` used to print one count for
+  `v`; it now asserts zero residue for `v`, `v_bytes`, `γ`, `z²·γ` and every
+  random scalar `prove` drew (recorded by a test-build-only hook in
+  `randomScalar`), beside a negative and a positive control.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (prover performance):** audit
   finding B9. The prover's constant-time MSMs (`A`, `S`, every IPA `L`/`R`)
   ran one full ladder per term; `multiScalarMul` now calls

@@ -220,8 +220,21 @@ fn randomScalar() [32]u8 {
     var wide: [64]u8 = undefined;
     defer std.crypto.secureZero(u8, &wide);
     fillRandom(&wide);
-    return scalar.reduce64(wide);
+    const out = scalar.reduce64(wide);
+    if (builtin.is_test and test_random_count < test_randoms.len) {
+        test_randoms[test_random_count] = out;
+        test_random_count += 1;
+    }
+    return out;
 }
+
+/// Test builds only: every scalar `randomScalar` returned since the last
+/// reset, so `stackprobe_test.zig` can look for the prover's random blinding
+/// secrets on the dead stack too — they are drawn from getrandom(2) and no
+/// test could know them otherwise. Zero-length and never written outside
+/// `zig build test`.
+pub var test_randoms: [if (builtin.is_test) 512 else 0][32]u8 = undefined;
+pub var test_random_count: usize = 0;
 
 /// `delta(y,z)` — Bulletproofs §4.1's verifier-side scalar correction
 /// term (paper eq. (39), single-value `m=1` case — this scaffold's
@@ -363,7 +376,53 @@ pub const ProveError = error{
 /// not support `n > 64` — every realistic Bulletproofs range width,
 /// 8/16/32/64, fits; a wider-`v` variant would need a bignum witness type
 /// and is out of scope here, see SPEC.md).
+///
+/// Zeroes the stack its computation used before returning, on the error
+/// path too (audit finding B12, see `burnStack`).
 pub fn prove(
+    allocator: std.mem.Allocator,
+    gens: Generators,
+    transcript: *Transcript,
+    v: *const u64,
+    gamma: [32]u8,
+) ProveError!RangeProof {
+    const result = proveInner(allocator, gens, transcript, v, gamma);
+    burnStack();
+    return result;
+}
+
+/// How much stack below `prove`'s frame is zeroed after the proof is built.
+///
+/// Audit finding B12. `secureZero` on named locals (`v_val`, `v_bytes`, the
+/// arena vectors) cannot reach the copies the optimizer and callees leave in
+/// dead frames. Measured at ReleaseFast with `stackprobe_test.zig`'s method
+/// after `prove(n=64)` returned: on the audited tree `v_bytes` ×1; on the
+/// tree before this burn `v_bytes` ×1, `z²·γ` ×1 (with the public `z` that is
+/// γ, and with `V` it is `v`) and 6 of the 132 random blinding scalars —
+/// `alpha`/`rho`/`tau1`/`tau2` with the public `mu`/`tau_x` give γ too. So the
+/// fix is on the region: the computation runs one frame down and this many
+/// bytes at that depth are zeroed before `prove` returns.
+///
+/// Sized from the probe's dirty depth: the call tree reaches 46 856 B for
+/// every `n` from 8 to 128 (a fixed-size frame, not one that grows with
+/// `n`), and 128 KiB covers it about 2.7 times. The probe asserts zero
+/// residue, so a call tree that outgrows the burn goes red there.
+const prove_stack_burn = 128 * 1024;
+
+/// Zero `prove_stack_burn` bytes at the depth `proveInner`'s frames
+/// occupied. `noinline` here is load-bearing, measured: made `inline`, this
+/// buffer lands in the caller's frame, above the region the proof used, and
+/// the probe finds blinding scalars again. `secureZero` writes through a
+/// volatile slice, so the dead store survives optimisation.
+noinline fn burnStack() void {
+    var buf: [prove_stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
+}
+
+/// Steps 1-10 of `prove`. `noinline` is a guard, not a measured necessity:
+/// dropping it left the probe green (the compiler does not inline a function
+/// this large today).
+noinline fn proveInner(
     allocator: std.mem.Allocator,
     gens: Generators,
     transcript: *Transcript,
