@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** A1/rawsock.md F12's last surviving
+  mutant (m33, `setPromisc(false)` never actually issuing `DROP_MEMBERSHIP`) gets a
+  permanent regression test. The prior measurement attempt checked the wrong kernel
+  observable (`IFF_PROMISC` via `SIOCGIFFLAGS`, which `dev_get_flags()` derives from
+  `dev->gflags` and which a `PACKET_MR_PROMISC` membership never touches, on any kernel,
+  in any namespace — not a privilege gap). The right one, `dev->promiscuity`
+  (`IFLA_PROMISCUITY` via `RTM_GETLINK`), moves under the standard `unshare -rn`-style
+  recipe this campaign already uses, no VM required. New test-only `ifacePromiscuity()`
+  helper (hand-rolled `RTM_GETLINK` query, same no-external-dependency style as the rest of
+  the module); `scripts/vm/run.sh` gets a `rawsock` `guest_setup` entry creating a `dummy`
+  device (`rstest0`) so the VM lane exercises a real netdevice, not just `lo`. F12 closed.
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1/rawsock.md F12's two-gate mutation
   runner (`A1/repro/rawsock/mut/mutate.py`, host `zig test` lane + `unshare -rn` netns lane,
   36 mutations) ported into `modules/rawsock/tools/mutate.py` per CONVENTIONS.md #9 (a
