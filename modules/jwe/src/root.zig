@@ -79,6 +79,7 @@
 //!   non-empty `aad_extra` to `encryptCompact` is `error.CompactSerializationNoAad`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const rsa = @import("rsa");
 
 pub const header = @import("header.zig");
@@ -1360,8 +1361,15 @@ test "TEETH: an attacker-chosen PBES2 work factor is REFUSED, not performed" {
     const gpa = std.testing.allocator;
     const password = "correct horse battery staple";
 
-    // A genuine PBES2 token at a sane iteration count.
-    const token = try encryptCompact(gpa, .@"PBES2-HS256+A128KW", .A128GCM, .{ .password = password }, "hi", "", seededForTest(), .{});
+    // A genuine PBES2 token at a sane iteration count. The count used to
+    // BUILD this token is not under test here (the tamper checks below
+    // rewrite `p2c` outright) -- only that encrypt/decrypt agree on
+    // whatever count they used, which holds at any value. Debug: the
+    // production default (600_000, OWASP PBKDF2-HMAC-SHA256 guidance) costs
+    // real seconds of unoptimized Debug SHA-256 per round trip here; scaled
+    // down for Debug only, full default kept outside Debug.
+    const initial_p2c: u32 = if (builtin.mode == .Debug) 1_000 else 600_000;
+    const token = try encryptCompact(gpa, .@"PBES2-HS256+A128KW", .A128GCM, .{ .password = password }, "hi", "", seededForTest(), .{ .pbes2_iterations = initial_p2c });
     defer gpa.free(token);
     const pt = try decryptCompact(gpa, .{ .password = password }, token, .{});
     defer gpa.free(pt);
@@ -1380,11 +1388,33 @@ test "TEETH: an attacker-chosen PBES2 work factor is REFUSED, not performed" {
 
     // At exactly the ceiling the token is accepted for processing (and then
     // fails on its own merits), so the bound is not off by one.
-    const at_ceiling = try rewriteP2c(gpa, token, default_max_p2c);
+    //
+    // Debug: this sub-case actually PERFORMS the full PBKDF2 derivation at
+    // the ceiling (that is the point -- proving "accepted, then fails on
+    // its own merits" rather than wrongly rejected) -- measured ~1us/round
+    // in the comment above is a ReleaseFast number; Debug's unoptimized
+    // SHA-256 is far slower, and this test ALONE was measured ~37s isolated
+    // at the real `default_max_p2c` (1,000,000 rounds), over the campaign's
+    // 10s budget and uncomfortably close to the full gate's 3-minute
+    // per-test timeout under load. The "over the ceiling, refused before
+    // derivation" case just above is untouched -- it is already cheap in
+    // every mode, since a refusal never runs the KDF, and it still checks
+    // against the REAL `default_max_p2c` (no override).
+    //
+    // What changes here is ONLY the boundary value this "not off by one"
+    // sub-case exercises: `max_p2c` is a public `DecryptOptions` field
+    // precisely so the ceiling is caller-configurable, and the
+    // over/at-ceiling comparison in the code under test does not special-
+    // case any particular magnitude -- so a smaller configured ceiling
+    // exercises the identical comparison logic. `default_max_p2c` itself
+    // (the production constant) is verified at its REAL value outside
+    // Debug, where the cost is negligible.
+    const at_ceiling_p2c: u32 = if (builtin.mode == .Debug) 20_000 else default_max_p2c;
+    const at_ceiling = try rewriteP2c(gpa, token, at_ceiling_p2c);
     defer gpa.free(at_ceiling);
     try std.testing.expectError(
         error.AuthenticationFailed,
-        decryptCompact(gpa, .{ .password = password }, at_ceiling, .{}),
+        decryptCompact(gpa, .{ .password = password }, at_ceiling, .{ .max_p2c = at_ceiling_p2c }),
     );
 }
 

@@ -20,6 +20,7 @@
 //! `property.zig`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const netsim = @import("netsim");
 const root = @import("root.zig");
 const trace = @import("trace.zig");
@@ -128,6 +129,16 @@ test "scoring: a continuously-degraded-but-usable link stays within the spurious
 
 // ── corpus: flapping link across a duty-cycle sweep ───────────────────────────
 
+// Debug: the sweep below replays 4 full simulated WEEKs (~17.5s isolated,
+// measured, over the campaign's 10s per-test budget) -- unlike the 30%-down
+// test above, this one asserts NO precise per-week budget (its own comment:
+// "the precise budget is asserted only for the documented 30% case above"),
+// so the simulated span is coverage breadth, not a pinned quantity. Shrunk
+// to 2 simulated days for Debug (still several duty-cycle periods per run);
+// the 30%-down and continuously-degraded tests above, whose assertions ARE
+// stated in per-WEEK units, are untouched in every mode.
+const sweep_until: Time = if (builtin.mode == .Debug) 2 * 24 * 60 * 60 * SEC else WEEK;
+
 test "scoring: the flapping corpus generator covers a duty-cycle sweep" {
     const gpa = testing.allocator;
     const period: Time = 10 * SEC;
@@ -138,9 +149,9 @@ test "scoring: the flapping corpus generator covers a duty-cycle sweep" {
         defer prober.deinit();
         const down_ticks = period * dp / 1000;
         const up_ticks = period - down_ticks;
-        const case = netsim.Case{ .seed = seed, .scenario = trace.cleanScenario, .protocol = prober.protocol(), .until = WEEK };
+        const case = netsim.Case{ .seed = seed, .scenario = trace.cleanScenario, .protocol = prober.protocol(), .until = sweep_until };
         seed += 1;
-        const fault_trace = try trace.dutyCycleTrace(gpa, up_ticks, down_ticks, WEEK);
+        const fault_trace = try trace.dutyCycleTrace(gpa, up_ticks, down_ticks, sweep_until);
         defer gpa.free(fault_trace);
         _ = try netsim.replay(gpa, case, fault_trace, null);
         // Exercises the corpus generator across the sweep; the precise budget is

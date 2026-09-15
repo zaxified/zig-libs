@@ -19,6 +19,7 @@
 //!      build", NOT a green light.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const fast_core = @import("fast_core.zig");
 const field = @import("field.zig");
@@ -29,13 +30,21 @@ const P256 = group.P256;
 const StdEcdsa = std.crypto.sign.ecdsa.EcdsaP256Sha256;
 const StdCurve = std.crypto.ecc.P256;
 
+// Debug: each draw does a std deterministic keygen + std sign + two p256
+// verifies -- measured ~21s for this test ALONE, isolated, over the
+// campaign's 10s per-test budget (`gate-all-2026091{d,e}.log` show
+// `p256`'s module lane running 4-9m under full-gate load; this and the
+// sibling ECDSA test below are part of that total). ReleaseFast/
+// ReleaseSafe/ReleaseSmall keep the full count.
+const ecdsa_verify_iters: usize = if (builtin.mode == .Debug) 80 else 200;
+
 test "ECDSA: p256 verifies every std-produced signature, rejects tampering" {
     var seed: [StdEcdsa.KeyPair.seed_length]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0xEC_D5A_9256);
     const rand = prng.random();
 
     var i: usize = 0;
-    while (i < 200) : (i += 1) {
+    while (i < ecdsa_verify_iters) : (i += 1) {
         rand.bytes(&seed);
         const kp = StdEcdsa.KeyPair.generateDeterministic(seed) catch continue;
 
@@ -62,13 +71,20 @@ test "ECDSA: p256 verifies every std-produced signature, rejects tampering" {
     }
 }
 
+// Debug: measured ~16s for this test ALONE, isolated -- over the campaign's
+// 10s per-test budget. `produced_min` below is scaled with it (was
+// `> 150` at 200 draws, i.e. >75%; the degenerate-k skip rate does not
+// depend on the draw count, so the same ratio applies at the smaller count).
+const ecdsa_sign_iters: usize = if (builtin.mode == .Debug) 100 else 200;
+const ecdsa_sign_produced_min: usize = if (builtin.mode == .Debug) 75 else 150;
+
 test "ECDSA: p256-produced signatures verify under BOTH p256 and std" {
     var prng = std.Random.DefaultPrng.init(0x516E_9256);
     const rand = prng.random();
 
     var produced: usize = 0;
     var i: usize = 0;
-    while (i < 200) : (i += 1) {
+    while (i < ecdsa_sign_iters) : (i += 1) {
         var sk: [32]u8 = undefined;
         var k: [32]u8 = undefined;
         var msg: [24]u8 = undefined;
@@ -89,7 +105,7 @@ test "ECDSA: p256-produced signatures verify under BOTH p256 and std" {
     }
     // Sanity: the random nonces almost never degenerate; make sure we actually
     // exercised the sign path rather than skipping everything.
-    try std.testing.expect(produced > 150);
+    try std.testing.expect(produced > ecdsa_sign_produced_min);
 }
 
 // ── gated Fable-core differentials (LIVE: both gates on; SKIP ≠ pass) ─────────
@@ -128,13 +144,23 @@ test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {
     }
 }
 
+// Debug: this is the single heaviest test in the module -- each draw calls
+// std's unoptimized Debug `basePoint.mul` (plain double-and-add, no comb
+// table there) on top of the module's own comb + portable-ladder paths.
+// Measured ~95s for this test ALONE, isolated (`scripts/modtest p256
+// -Dtest-filter="combMulBaseFast(k)"`), which is exactly why the full gate's
+// per-test 3-minute timeout also hit `p256` (same shape as the sibling
+// `group.zig` differential above and the k256 `oracle_test.comb` fix,
+// `14b2e983`). ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count.
+const comb_fast_std_iters: usize = if (builtin.mode == .Debug) 150 else 2000;
+
 test "GATED differential: group.combMulBaseFast(k)·G == portable ladder + std" {
     if (!gate.fast_scalarmul_implemented) return error.SkipZigTest; // core not filled (scaffold)
 
     var prng = std.Random.DefaultPrng.init(0xC0FB_9256);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 2000) : (i += 1) {
+    while (i < comb_fast_std_iters) : (i += 1) {
         var kb: [32]u8 = undefined;
         rand.bytes(&kb);
         if (P256.combMulBaseFast(kb, .big)) |kp| {
