@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `TcpTransport` cancel tests canceled after a fixed
+  sleep. They now cancel once the client is inside the socket read under test (`ReadCueIo`, a
+  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
+  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
+  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
+
 - **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** the audit F17 regression
   test now counts response lines scanned instead of timing `nextServer`
   (flaky under full-gate load, unrelated to any real defect). Adds two
