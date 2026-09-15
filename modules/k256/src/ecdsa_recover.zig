@@ -135,7 +135,49 @@ pub const Signature = struct { r: [32]u8, s: [32]u8, recid: u2 };
 /// RFC 6979 deterministic ECDSA sign over secp256k1/SHA-256, returning a
 /// compact recoverable signature. `hash32` is the message hash the caller
 /// already computed (e.g. BOLT#11: `SHA256(hrp || data-without-signature)`).
+///
+/// On return, the stack below this frame that the signing computation used
+/// has been overwritten with zeros (see `burnSignStack`).
 pub fn sign(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
+    const result = signInner(privkey, hash32);
+    burnSignStack();
+    return result;
+}
+
+/// How much stack below `sign`'s frame is zeroed after every signature.
+///
+/// A1/k256.md G2. Zeroing named locals is not enough and cannot be made
+/// enough from this file: after `signInner` returns, its callees' dead frames
+/// held the nonce `k` SIX times per signature (measured 2026-09-16 with
+/// `stackprobe_test.zig`, ReleaseFast: `k` big-endian ×1 — the ABI copy of
+/// the `combMulBase(k_bytes)` argument the 2026-09-11 disassembly found — the
+/// std scalar field's Montgomery image of `k` ×3, of `k⁻¹` ×1, and of `d` ×1),
+/// every one of them a compiler-made copy inside a by-value callee (`Scalar`'s
+/// `invert`/`mul`/`toBytes` are std's and take `Fe` by value) with no name the
+/// source could zero. Changing `combMulBase` to take a pointer would have
+/// removed one of the six. So the fix is on the region, not on the copies: the
+/// whole call tree runs one frame down, in `signInner`, and this many bytes of
+/// that region are zeroed before `sign` returns — whatever layout a future
+/// compiler picks for the frames in between.
+///
+/// The number is measured, not guessed: with the burn call removed, the probe
+/// reads the call tree dirtying 2 608 B below the call site (ReleaseFast,
+/// x86_64, 2026-09-16), and 16 KiB covers that about six times over. The probe
+/// asserts ZERO residue in every representation, so a call tree that outgrows
+/// the burn goes red there.
+const sign_stack_burn = 16 * 1024;
+
+/// Zero `sign_stack_burn` bytes starting at the depth `signInner`'s frame
+/// occupied. `noinline` on both functions is load-bearing: inlined, the
+/// signing frames would merge into `sign`'s own frame, ABOVE this buffer, and
+/// the burn would clear nothing that held a secret. `secureZero` writes
+/// through a volatile slice, so the dead store survives optimisation.
+noinline fn burnSignStack() void {
+    var buf: [sign_stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
+}
+
+noinline fn signInner(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
     const d = Scalar.fromBytes(privkey, .big) catch return error.InvalidPrivateKey;
     if (d.isZero()) return error.InvalidPrivateKey;
     const e = reduceToScalar(hash32);

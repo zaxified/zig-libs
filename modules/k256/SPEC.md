@@ -257,6 +257,30 @@ material:
 `recoverPubkey` is deliberately unmeasured: every one of its inputs is public,
 and it ends in the variable-time `mulDoubleBasePublic`.
 
+### Secret residue on the dead stack (`ecdsa_recover.sign`)
+
+Constant time says nothing about what a returned frame leaves behind. Measured
+2026-09-16 (A1 G2, `src/stackprobe_test.zig`, ReleaseFast): after
+`ecdsa_recover.sign` returned, its callees' dead frames held the RFC 6979
+nonce **six times per signature** — `k` big-endian ×1 (the ABI copy of the
+`combMulBase(k_bytes)` argument), the std scalar field's Montgomery image of
+`k` ×3, of `k⁻¹` ×1, and of `d` ×1 — although every named local was already
+`secureZero`ed. They are copies made inside by-value callees (std's
+`Scalar.invert`/`mul`/`toBytes` take the element by value), so no source-level
+zeroing can name them, and a pointer signature on `combMulBase` would have
+removed one of six. A nonce plus its published signature is the private key.
+
+So `sign` runs the computation in a `noinline` `signInner` and then zeroes
+`sign_stack_burn` = 16 KiB at that depth. With the burn call removed the call
+tree dirties 2 608 B; with it: **0 residues in all eight representations over
+5 repeats**, negative control 0, positive control (a nonce parked in a local)
+1. The probe asserts exactly that in the ReleaseFast lane. It SKIPS in Debug
+and ReleaseSafe, where `undefined` is filled and the scan cannot see a dead
+frame — measured: at ReleaseSafe its positive control read 0. The burn adds no
+branch: the `ecdsa` ctgrind row read 15/10/5/0 before and after, same source
+lines shifted by the inserted text. `bip340Sign` was not converted and is not
+covered by this claim.
+
 **The harnesses were shown to have teeth** (positive controls, each reverted and
 `cmp`-verified byte-identical afterwards):
 

@@ -86,6 +86,7 @@ test {
     _ = @import("wycheproof_kat_vectors.zig");
     _ = @import("wycheproof_bitcoin_vectors.zig");
     _ = @import("wycheproof_kat_test.zig");
+    _ = @import("stackprobe_test.zig");
 }
 
 test "meta.model_after names libsecp256k1 and the std oracle" {

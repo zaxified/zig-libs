@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO API CHANGE, secret hygiene:** `ecdsa_recover.sign` now
+  zeroes 16 KiB of the stack its signing computation used before it returns
+  (A1 G2, MED). Measured with the new `src/stackprobe_test.zig` (ReleaseFast):
+  the RFC 6979 nonce survived on the dead stack six times per signature — `k`
+  big-endian ×1, the scalar field's Montgomery image of `k` ×3, of `k⁻¹` ×1,
+  of `d` ×1 — all compiler-made copies inside by-value callees that no named
+  `secureZero` can reach; nonce plus published signature is the private key.
+  After: 0 in every representation over 5 repeats, with the probe's positive
+  control still finding a parked nonce. The probe asserts that and runs in the
+  ReleaseFast lane (it skips in Debug and ReleaseSafe, where `undefined` is
+  filled and the scan is blind — its positive control is what showed that).
 - **2026-09-15** — **API addition, no behaviour change:** new `sign.ecdsaVerifyPrehashed(pubkey_sec1,
   digest, sig_rs)` — `ecdsaVerify`'s exact arithmetic, factored out to take an
   already-computed 32-byte digest instead of hashing a message internally.
