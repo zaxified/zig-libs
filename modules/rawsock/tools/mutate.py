@@ -178,8 +178,24 @@ ALLPASS = re.compile(r"All (\d+) tests passed\.")
 MIXED = re.compile(r"(\d+) passed; (\d+) skipped; (\d+) failed\.")
 
 
+class Hung(Exception):
+    pass
+
+
 def run(cmd, cwd=None):
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=1200, cwd=cwd)
+    # 2026-09-16 (F12 run): m25 (the recv-timeout guard removed) genuinely
+    # HANGS the netns lane -- proof the guard is load-bearing, not a runner
+    # bug -- and an uncaught TimeoutExpired used to crash the whole sweep,
+    # losing every mutation after the one that hung. Report it as its own
+    # verdict instead.
+    # 90s, not 1200s: every real compile+run in this sweep finishes in 1-2s
+    # (small module, per-mutation --cache-dir but nothing here is a cold std
+    # build), so 90s is already generous headroom and turns a genuine hang
+    # into a ~1.5-minute wait instead of a 20-minute one.
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=90, cwd=cwd)
+    except subprocess.TimeoutExpired as e:
+        raise Hung(str(e)) from e
 
 
 def classify(out, rc, baseline):
@@ -209,9 +225,15 @@ def classify(out, rc, baseline):
 
 
 def gate(src_root, cache, netns):
-    cmd = ["zig", "test", "-O" + MODE, "--dep", "netaddr",
+    # 2026-09-16 (F12 run): root.zig now also imports `testkit` (fuzz seeds
+    # added after this tool was ported on 2026-09-11) -- `build.zig`'s
+    # `test_deps = &.{"testkit"}` wasn't wired here, so every mutation was
+    # NOBUILD ("no module named 'testkit' available within module 'root'")
+    # before either lane touched the mutated line at all.
+    cmd = ["zig", "test", "-O" + MODE, "--dep", "netaddr", "--dep", "testkit",
            "-Mroot=" + src_root,
            "-Mnetaddr=" + os.path.join(ROOT, "modules", "netaddr", "src", "root.zig"),
+           "-Mtestkit=" + os.path.join(ROOT, "modules", "testkit", "src", "root.zig"),
            "--cache-dir", cache]
     if netns:
         cmd = ["unshare", "-rn", "env", "TMPDIR=" + os.environ["TMPDIR"]] + cmd
@@ -219,7 +241,11 @@ def gate(src_root, cache, netns):
     return r.stdout + r.stderr, r.returncode
 
 
-BASE = {"host": (16, 2), "netns": (18, 0)}
+# 2026-09-16 (F12 run): re-measured against the unmutated tree -- the
+# audit's original counts (16/2, 18/0) predate F4/F10/F13/F14's new tests
+# and the fuzz-reach corpus. Confirmed via m0_noop (comment-only, so its own
+# counts ARE today's baseline): host 28 pass/8 skip, netns 36 pass/0 skip.
+BASE = {"host": (28, 8), "netns": (36, 0)}
 
 print(f"{'MUTATION':<30} {'HOST LANE':<16} {'NETNS LANE':<16} DETAIL   [mode={MODE}]")
 tally = {}
@@ -246,14 +272,24 @@ for name, nth, old, new in M:
         continue
     open(p, "w").write(s2)
 
-    host_out, host_rc = gate(p, os.path.join(d, "zc"), netns=False)
+    try:
+        host_out, host_rc = gate(p, os.path.join(d, "zc"), netns=False)
+    except Hung:
+        print(f"{name:<30} {'HANG(90s)':<16} {'':<16} host lane never returned", flush=True)
+        tally["HANG/-"] = tally.get("HANG/-", 0) + 1
+        continue
     open(os.path.join(d, "out-host.txt"), "w").write(host_out)
     hv, hd = classify(host_out, host_rc, BASE["host"])
 
     if hv == "NOBUILD":
         nv, nd = "NOBUILD", ""
     else:
-        ns_out, ns_rc = gate(p, os.path.join(d, "zc"), netns=True)
+        try:
+            ns_out, ns_rc = gate(p, os.path.join(d, "zc"), netns=True)
+        except Hung:
+            print(f"{name:<30} {hv:<16} {'HANG(90s)':<16} netns lane never returned -- the mutation is load-bearing", flush=True)
+            tally[f"{hv}/HANG"] = tally.get(f"{hv}/HANG", 0) + 1
+            continue
         open(os.path.join(d, "out-netns.txt"), "w").write(ns_out)
         nv, nd = classify(ns_out, ns_rc, BASE["netns"])
 
