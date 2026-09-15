@@ -322,13 +322,15 @@ pub const LoopTransport = struct {
 
 const testing = std.testing;
 
-const test_port_regression: u16 = 15683;
-
 const RegressionPeer = struct {
     got_first: bool = false,
     got_second: bool = false,
     first_len: usize = 0,
     second_len: usize = 0,
+    /// The ephemeral port the peer's listener got; written before `ready`.
+    /// It was a fixed 15683, which a parallel run, or another module's test
+    /// port in the same range, could hold first.
+    port: u16 = 0,
 };
 
 fn regressionSleepMs(ms: u64) void {
@@ -356,9 +358,10 @@ fn regressionPeer(res: *RegressionPeer, ready: *std.atomic.Value(bool)) void {
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const addr = std.Io.net.IpAddress.parse("127.0.0.1", test_port_regression) catch return;
+    const addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch return;
     var server = addr.listen(io, .{ .reuse_address = true }) catch return;
     defer server.socket.close(io);
+    res.port = server.socket.address.getPort();
     ready.store(true, .release);
 
     const conn = server.accept(io) catch return;
@@ -393,7 +396,9 @@ test "TcpTransport delivers write->read->write over a real socket (no env gate)"
     // Wait for the peer to be listening before dialling in.
     var spin: usize = 0;
     while (!ready.load(.acquire)) : (spin += 1) {
-        if (spin > 500) {
+        // 30 s: a watchdog. It was 1 s, which a loaded machine can spend
+        // just starting the peer thread.
+        if (spin > 15_000) {
             th.join();
             return error.PeerNeverListened;
         }
@@ -403,7 +408,7 @@ test "TcpTransport delivers write->read->write over a real socket (no env gate)"
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", test_port_regression);
+    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", res.port);
 
     var tt: TcpTransport = undefined;
     var tries: usize = 0;
