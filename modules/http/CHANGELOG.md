@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — A1 fix campaign, full-gate timeout disposition. Behavioural fix, no API
+  change: `putFile`/`putFilePlain` reported a cancelation that landed in the upload's
+  LOCAL file read (the upload alternates file reads with socket writes) as
+  `error.ReadFailed`, i.e. as a file-system failure; the real error was parked on the
+  `File.Reader`. Both now return `error.Canceled` for it (`fileReadFailure`, shared by
+  the two). Found once the cancel tests stopped relying on a 300 ms sleep: with the cue
+  moved to "the peer holds a request byte", 5/25 runs under CPU load were red, every one
+  with `fr.err = Canceled` and `sw.err = null`. A new test puts the cancel inside the file
+  read deterministically through an `Io` double; RED when either copy's arm is reverted.
+  Test harness: when a cancel landed before the dial, the cancel tests' peer threads
+  stayed blocked in `accept` and `join` hung — the 3-minute gate timeout in
+  `request: a canceled request-head write …`. Peers are now released with a throwaway
+  connection, and the head-write tests cancel on a received byte instead of a sleep.
+
 - **2026-09-16** — A1 fix campaign, F14 (h2 per-request arena), internal change, no API
   or wire change. `h2_server.serveJob` built a fresh `ArenaAllocator` on every request
   and freed it at the end: 7 allocations per request against h1's zero. A finished

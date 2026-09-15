@@ -874,17 +874,25 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
     var fr = file.reader(c.io, &fbuf);
     fr.interface.streamExact64(up.writer(), size) catch |err| {
         // `Reader.StreamError` is exactly `{ReadFailed, WriteFailed,
-        // EndOfStream}`. `ReadFailed`/`EndOfStream` here are the local file
-        // read (`fr`) and keep their existing mapping unchanged; `WriteFailed`
-        // is the network body write (`up.writer()`, draining into
-        // `up.conn`), and `Conn.writeFailure` is what recovers a
-        // cancelation from it instead of reporting a dead peer — the same
-        // collapse `readAllAlloc`/`getToFile` had on the read side. Must run
-        // BEFORE `abort()`: that destroys `up.conn`, and `writeFailure`
-        // needs it alive to read `conn.sw.err`.
+        // EndOfStream}`. `WriteFailed` is the network body write
+        // (`up.writer()`, draining into `up.conn`), and `Conn.writeFailure`
+        // is what recovers a cancelation from it instead of reporting a dead
+        // peer — the same collapse `readAllAlloc`/`getToFile` had on the read
+        // side. Must run BEFORE `abort()`: that destroys `up.conn`, and
+        // `writeFailure` needs it alive to read `conn.sw.err`.
+        //
+        // `ReadFailed` is the local file read (`fr`), and it can be a
+        // cancelation too: the upload alternates file reads with socket
+        // writes, so a cancel lands in either. `fr.err` carries it exactly as
+        // `conn.sw.err` does. Until 2026-09-17 this arm mapped it to plain
+        // `ReadFailed` — a canceled upload reported as a file-system failure;
+        // measured 5/25 under CPU load once the cancel test stopped relying
+        // on a sleep, every one with `fr.err = Canceled` and `sw.err = null`.
+        // `EndOfStream` (the file shrank under us) stays a read failure.
         const mapped: Error = switch (err) {
             error.WriteFailed => up.conn.writeFailure(),
-            error.ReadFailed, error.EndOfStream => error.ReadFailed,
+            error.ReadFailed => fileReadFailure(&fr),
+            error.EndOfStream => error.ReadFailed,
         };
         up.abort();
         return mapped;
@@ -892,6 +900,16 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
     var res = try up.finish();
     defer res.deinit();
     return res.status;
+}
+
+/// The local-file counterpart of `Conn.readFailure`: `std.Io.Reader` reports
+/// every failure of an upload's source file as bare `error.ReadFailed`, and
+/// the real error — including `error.Canceled` — is parked on the
+/// `File.Reader`. Shared by `putFile` and `putFilePlain` so the two copies
+/// cannot drift apart.
+fn fileReadFailure(fr: *const std.Io.File.Reader) Error {
+    if (fr.err) |e| if (e == error.Canceled) return error.Canceled;
+    return error.ReadFailed;
 }
 
 /// `putFile`'s plaintext-only twin (see `requestPlain`'s doc comment for why
@@ -908,11 +926,13 @@ pub fn putFilePlain(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []co
     var fbuf: [64 * 1024]u8 = undefined;
     var fr = file.reader(c.io, &fbuf);
     // See `putFile`'s identical catch for why `WriteFailed` alone routes
-    // through `Conn.writeFailure`, and why that must run before `abort()`.
+    // through `Conn.writeFailure`, why that must run before `abort()`, and
+    // why `ReadFailed` routes through `fileReadFailure`.
     fr.interface.streamExact64(up.writer(), size) catch |err| {
         const mapped: Error = switch (err) {
             error.WriteFailed => up.conn.writeFailure(),
-            error.ReadFailed, error.EndOfStream => error.ReadFailed,
+            error.ReadFailed => fileReadFailure(&fr),
+            error.EndOfStream => error.ReadFailed,
         };
         up.abort();
         return mapped;
@@ -2880,9 +2900,11 @@ const HeadThenSilentPeer = struct {
     io: std.Io,
     listener: *net.Server,
     stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
 
     fn run(p: *HeadThenSilentPeer) void {
         const s = p.listener.accept(p.io) catch return;
+        p.accepted.store(1, .release);
         defer s.close(p.io);
         var rbuf: [1024]u8 = undefined;
         var wbuf: [1024]u8 = undefined;
@@ -2898,7 +2920,43 @@ const HeadThenSilentPeer = struct {
         while (p.stop.load(.acquire) == 0)
             p.io.sleep(.fromMilliseconds(5), .awake) catch return;
     }
+
+    fn release(p: *HeadThenSilentPeer, port: u16) void {
+        releaseCancelPeer(p.io, &p.stop, &p.accepted, port);
+    }
 };
+
+/// Stop a cancel-test peer thread so it can be joined. A test that cancels a
+/// concurrent client call can cancel it BEFORE it dials: `Syscall.start`
+/// returns `error.Canceled` ahead of `connect`, so the client never reaches
+/// the listener, the peer stays blocked in `accept` — a plain thread no
+/// `stop` flag and no `std.Io` cancelation can reach — and the test's
+/// `defer peer_thread.join()` waits forever. Measured 2026-09-17: the full
+/// gate reported `request: a canceled request-head write …` as a 3-minute
+/// timeout, and a probe that moved the cancel ahead of the dial hung 4/4 with
+/// the peer thread in `inet_csk_accept`, the listener's accept queue empty
+/// and `fut.cancel` having already returned `Canceled`. So poke `accept` with
+/// one throwaway connection whenever it has not returned yet (the same fix
+/// `StallPeer.release` carries).
+fn releaseCancelPeer(io: std.Io, stop: *std.atomic.Value(u32), accepted: *std.atomic.Value(u32), port: u16) void {
+    stop.store(1, .release);
+    if (accepted.load(.acquire) != 0) return;
+    const addr = net.IpAddress.parse("127.0.0.1", port) catch return;
+    const s = addr.connect(io, .{ .mode = .stream }) catch return;
+    s.close(io);
+}
+
+/// Poll for a flag a peer thread sets. The deadline is a watchdog, never the
+/// synchronization: it turns a client that never reaches the peer into a red
+/// instead of a hang. Returns whether the flag was seen.
+fn awaitPeerFlag(io: std.Io, flag: *const std.atomic.Value(u32), watchdog_ms: i64) bool {
+    const start = testNowMs(io);
+    while (flag.load(.acquire) == 0) {
+        if (testNowMs(io) - start > watchdog_ms) return false;
+        io.sleep(.fromMilliseconds(1), .awake) catch return flag.load(.acquire) != 0;
+    }
+    return true;
+}
 
 fn readAllAllocOnce(res: *Response, gpa: std.mem.Allocator) Error![]u8 {
     return res.readAllAlloc(gpa, 64);
@@ -2920,7 +2978,7 @@ test "readAllAlloc: a canceled body read surfaces Canceled, not ReadFailed" {
     var peer: HeadThenSilentPeer = .{ .io = io, .listener = &listener };
     const peer_thread = try std.Thread.spawn(.{}, HeadThenSilentPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
     // Pooling off: a canceled connection must be destroyed, not recycled, and
     // that path is exercised elsewhere — keeping it out here isolates the one
@@ -2961,7 +3019,7 @@ test "getToFile: a canceled body read surfaces Canceled, not ReadFailed" {
     var peer: HeadThenSilentPeer = .{ .io = io, .listener = &listener };
     const peer_thread = try std.Thread.spawn(.{}, HeadThenSilentPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2985,16 +3043,43 @@ const SilentReadPeer = struct {
     io: std.Io,
     listener: *net.Server,
     stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+    /// Set once the first request byte has arrived (or the client hung up
+    /// before sending one). THIS, not a sleep, is when the tests below cancel.
+    /// A fixed sleep assumed the client dials and starts writing inside it;
+    /// under the full gate's load the 16 MiB header validation that precedes
+    /// the dial alone (~85 ms of CPU in Debug) can outlast a 300 ms window,
+    /// and a cancel that lands before the dial both hung the test (see
+    /// `releaseCancelPeer`) and would have passed by the wrong route —
+    /// `Canceled` from `connect`, with the head-write recovery under test
+    /// never reached. With a byte already here the client is past its dial
+    /// and inside the request write, which the payload is too big to finish
+    /// against this starved receiver.
+    receiving: std.atomic.Value(u32) = .init(0),
 
     fn run(p: *SilentReadPeer) void {
         const s = p.listener.accept(p.io) catch return;
+        p.accepted.store(1, .release);
         defer s.close(p.io);
         const small = std.mem.toBytes(@as(c_int, 2048));
         std.posix.setsockopt(s.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, &small) catch {};
+        var one: [1]u8 = undefined;
+        var sr = s.reader(p.io, &one);
+        _ = sr.interface.takeByte() catch {};
+        p.receiving.store(1, .release);
         while (p.stop.load(.acquire) == 0)
             p.io.sleep(.fromMilliseconds(5), .awake) catch return;
     }
+
+    fn release(p: *SilentReadPeer, port: u16) void {
+        releaseCancelPeer(p.io, &p.stop, &p.accepted, port);
+    }
 };
+
+/// How long a cancel test waits for its peer before giving up with a red.
+/// Only a watchdog — see `awaitPeerFlag`; well under the gate's 3-minute
+/// per-test limit so a regression reports as a failure, not a timeout.
+const cancel_peer_watchdog_ms = 60_000;
 
 fn putFileOnce(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8) Error!u16 {
     return c.putFile(url, dir, sub_path, .{});
@@ -3016,7 +3101,7 @@ test "putFile: a canceled body write surfaces Canceled, not WriteFailed" {
     var peer: SilentReadPeer = .{ .io = io, .listener = &listener };
     const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3040,10 +3125,105 @@ test "putFile: a canceled body write surfaces Canceled, not WriteFailed" {
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(putFileOnce, .{ &client, url, tmp.dir, "upload.bin" });
-    // Long enough that a 4 MiB body write against a starved receiver is
-    // certainly parked in the kernel, not merely still copying.
-    try io.sleep(.fromMilliseconds(300), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel once the peer holds a request byte (see `SilentReadPeer.receiving`):
+    // the client is then past its dial and inside the upload.
+    const reached = awaitPeerFlag(io, &peer.receiving, cancel_peer_watchdog_ms);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
+}
+
+/// An `Io` whose positional file read is nothing but a cancelation point that
+/// waits for its cancel — so a test can put the cancel INSIDE an upload's
+/// local file read deterministically, instead of hoping the scheduler lands it
+/// there (under load it did, 5/25, which is how `putFile`'s collapse of it
+/// into `ReadFailed` was found). Same shape as `NoEntropyIo`: the inner
+/// `userdata` is kept and exactly one slot is replaced, so every other slot
+/// stays correctly bound. The replacement calls the INNER `checkCancel` with
+/// that same `userdata`, which is precisely what the real read's
+/// `Syscall.start` would have consulted.
+const CancelInFileReadIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var inner_vtable: *const std.Io.VTable = undefined;
+    var entered: std.atomic.Value(u32) = .init(0);
+
+    fn init(inner: std.Io) CancelInFileReadIo {
+        inner_vtable = inner.vtable;
+        entered.store(0, .release);
+        var vt = inner.vtable.*;
+        vt.fileReadPositional = fileReadPositional;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const CancelInFileReadIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    fn fileReadPositional(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        _ = file;
+        _ = data;
+        _ = offset;
+        entered.store(1, .release);
+        while (true) {
+            try inner_vtable.checkCancel(userdata);
+            std.atomic.spinLoopHint();
+        }
+    }
+};
+
+fn putFileVia(comptime plain: bool) fn (*Client, []const u8, std.Io.Dir, []const u8) Error!u16 {
+    return struct {
+        fn call(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8) Error!u16 {
+            return if (plain) c.putFilePlain(url, dir, sub_path, .{}) else c.putFile(url, dir, sub_path, .{});
+        }
+    }.call;
+}
+
+test "putFile + putFilePlain: a cancel inside the local file read surfaces Canceled, not ReadFailed" {
+    inline for (.{ false, true }) |plain| {
+        var threaded = std.Io.Threaded.init(testing.allocator, .{});
+        defer threaded.deinit();
+        const real_io = threaded.io();
+
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var listener = addr.listen(real_io, .{}) catch |err| {
+            std.debug.print("file-read cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        defer listener.deinit(real_io);
+        const port = listener.socket.address.getPort();
+
+        var peer: SilentReadPeer = .{ .io = real_io, .listener = &listener };
+        const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
+        defer peer_thread.join();
+        defer peer.release(port);
+
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        {
+            var f = try tmp.dir.createFile(real_io, "upload.bin", .{});
+            defer f.close(real_io);
+            try f.writeStreamingAll(real_io, "0123456789abcdef");
+        }
+
+        var double: CancelInFileReadIo = .init(real_io);
+        var client = Client.init(double.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+        var fut = try real_io.concurrent(putFileVia(plain), .{ &client, url, tmp.dir, "upload.bin" });
+        const reached = awaitPeerFlag(real_io, &CancelInFileReadIo.entered, cancel_peer_watchdog_ms);
+        const result = fut.cancel(real_io);
+        if (!reached) std.debug.print("file-read cancel test (plain={}): the upload never reached its file read\n", .{plain});
+        try testing.expect(reached);
+        testing.expectError(error.Canceled, result) catch |e| {
+            std.debug.print("file-read cancel test (plain={}) failed\n", .{plain});
+            return e;
+        };
+    }
 }
 
 fn requestOnce(c: *Client, url: []const u8, options: RequestOptions) Error!Response {
@@ -3076,7 +3256,7 @@ test "request: a canceled request-head write surfaces Canceled, not WriteFailed"
     var peer: SilentReadPeer = .{ .io = io, .listener = &listener };
     const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
     // Well past the kernel's `tcp_wmem` autotuning ceiling (4 MiB on this
     // host, which a smaller padding was observed to fit under entirely
@@ -3099,10 +3279,13 @@ test "request: a canceled request-head write surfaces Canceled, not WriteFailed"
     const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
 
     var fut = try io.concurrent(requestOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
-    // Long enough that a 16 MiB head write against a starved receiver is
-    // certainly parked in the kernel, not merely still copying.
-    try io.sleep(.fromMilliseconds(300), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel once the peer holds a head byte (see `SilentReadPeer.receiving`),
+    // never after a fixed sleep: the cancel has to land in the head write,
+    // not ahead of the dial where it would pass without exercising it.
+    const reached = awaitPeerFlag(io, &peer.receiving, cancel_peer_watchdog_ms);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
 
 fn requestStreamingOnce(c: *Client, url: []const u8, options: RequestOptions) Error!Upload {
@@ -3133,7 +3316,7 @@ test "requestStreaming: a canceled request-head write surfaces Canceled, not Wri
     var peer: SilentReadPeer = .{ .io = io, .listener = &listener };
     const peer_thread = try std.Thread.spawn(.{}, SilentReadPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
     const padding = try testing.allocator.alloc(u8, 16 << 20);
     defer testing.allocator.free(padding);
@@ -3146,8 +3329,10 @@ test "requestStreaming: a canceled request-head write surfaces Canceled, not Wri
     const headers = [_]http.Header{.{ .name = "X-Pad", .value = padding }};
 
     var fut = try io.concurrent(requestStreamingOnce, .{ &client, url, RequestOptions{ .headers = &headers } });
-    try io.sleep(.fromMilliseconds(300), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    const reached = awaitPeerFlag(io, &peer.receiving, cancel_peer_watchdog_ms);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
 
 // ── tests (timeout enforcement) ─────────────────────────────────────────────
