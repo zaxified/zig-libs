@@ -26,6 +26,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ecdsa_recover = @import("ecdsa_recover.zig");
+const group = @import("group.zig");
 const scalarmod = @import("scalar.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
@@ -212,4 +213,80 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
     for (neg) |h| try std.testing.expectEqual(@as(usize, 0), h);
     try std.testing.expect(pos[0] >= 1); // the scan can see a parked nonce
     for (total) |h| try std.testing.expectEqual(@as(usize, 0), h);
+}
+
+// ── re-audit 2026-09-17 (A1 k256 R1): `Secp256k1.mul`, the ECDH path ─────────
+//
+// `mul` takes the SECRET scalar of `sphinx`'s per-hop DH and `bolt8`'s Noise
+// DH. After the windowed multiply (F5, `1ce3087e`) the dead stack held the
+// scalar's u256 (little-endian) image twice per call at ReleaseFast; the
+// ladder before it held it once. Same method as the G2 probe above, one needle
+// at a time, a point decoded at run time (not the comptime base point).
+
+noinline fn scanOne(needle: *const [32]u8) usize {
+    var buf: [WINDOW]u8 = undefined;
+    const p: [*]volatile u8 = @ptrCast(&buf);
+    var hits: usize = 0;
+    var i: usize = 0;
+    while (i + 32 <= WINDOW) : (i += 1) {
+        var j: usize = 0;
+        while (j < 32 and p[i + j] == needle[j]) : (j += 1) {}
+        if (j == 32) hits += 1;
+    }
+    std.mem.doNotOptimizeAway(&buf);
+    return hits;
+}
+
+/// Returns the projective result as is: a consumer that returns right after
+/// `mul` runs nothing that would overwrite its dead frames. (Encoding the
+/// point here first — a field inversion — happens to overwrite them, and the
+/// probe then reads 0 with or without the burn: measured 2026-09-17.)
+noinline fn callMul(p: group.Secp256k1, s: [32]u8) group.Secp256k1 {
+    return group.Secp256k1.mul(p, s, .big) catch unreachable;
+}
+
+test "STACKPROBE (A1 R1): no scalar residue on the dead stack after Secp256k1.mul" {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+
+    var seed: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("k256 stackprobe R1 point", &seed, .{});
+    const enc = (try group.Secp256k1.combMulBase(seed, .big)).toCompressedSec1();
+    var rt: [33]u8 = undefined;
+    for (&rt, &enc) |*o, *b| {
+        const vb: *const volatile u8 = b;
+        o.* = vb.*;
+    }
+    const p = try group.Secp256k1.fromSec1(&rt);
+
+    var s: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("k256 stackprobe R1 secret scalar", &s, .{});
+    s[0] &= 0x7f;
+    const s_le = le(s);
+
+    paint();
+    std.mem.doNotOptimizeAway(callInnocent(seed));
+    const neg = scanOne(&s) + scanOne(&s_le);
+    paint();
+    std.mem.doNotOptimizeAway(callLeaky(s_le));
+    const pos = scanOne(&s_le);
+
+    var be_hits: usize = 0;
+    var le_hits: usize = 0;
+    for (0..5) |_| {
+        paint();
+        std.mem.doNotOptimizeAway(callMul(p, s));
+        le_hits += scanOne(&s_le);
+        paint();
+        std.mem.doNotOptimizeAway(callMul(p, s));
+        be_hits += scanOne(&s);
+    }
+    paint();
+    std.mem.doNotOptimizeAway(callMul(p, s));
+    const depth = dirtyDepth();
+    std.debug.print("\n=== STACKPROBE k256 R1 mul ({t}) NEG={d} POS={d} BE={d} LE={d} (5 calls each), non-paint below the call {d} B ===\n", .{ builtin.mode, neg, pos, be_hits, le_hits, depth });
+
+    try std.testing.expectEqual(@as(usize, 0), neg);
+    try std.testing.expect(pos >= 1);
+    try std.testing.expectEqual(@as(usize, 0), be_hits);
+    try std.testing.expectEqual(@as(usize, 0), le_hits);
 }

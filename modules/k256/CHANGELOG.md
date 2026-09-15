@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO API CHANGE (secret hygiene), re-audit of F5:**
+  `Secp256k1.mul` — the constant-time ECDH multiply (`sphinx`, `bolt8`,
+  `bolt3`, `frost`) — left the u256 image of its SECRET scalar on the dead
+  stack twice per call at ReleaseFast after the windowed rewrite (the ladder
+  before it: once). The copies are compiler-made temporaries of the recoding,
+  not a named local: zeroing `k` itself changed nothing (measured). `mul` now
+  runs in a `noinline` `mulInner` and zeroes 16 KiB at that depth, the shape
+  `ecdsa_recover.sign` uses (G2). New probe in `src/stackprobe_test.zig`
+  ("A1 R1"): 10 copies over 5 calls before → 0 after; with the burn call
+  removed 10 again (the call tree dirties 2 744 B). Cost, interleaved A/B in
+  one process against the tree without the burn (ReleaseFast, 9 rounds × 1000):
+  127.5 vs 124.2 µs median, per-round ratio 1.025 [0.925 .. 1.058] — inside
+  the spread. The ctgrind harness's
+  `mul` target now multiplies a point decoded at run time instead of the
+  comptime base point, which let LLVM fold the per-call table (A1 R2).
 - **2026-09-16** — **BEHAVIOURAL (a case no real nonce reaches):**
   `ecdsa_recover.sign` now derives `r = x(R) mod n`, as ECDSA and std's signer
   do. It used `Scalar.fromBytes(x(R))`, which rejects `x ≥ n`, so a nonce with

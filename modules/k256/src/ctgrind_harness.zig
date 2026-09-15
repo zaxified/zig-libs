@@ -30,10 +30,12 @@
 //!   through `blackBox` the doc comment says the "constant-time" scalar-mul
 //!   paths depend on.
 //! * `mul` — `Secp256k1.mul`, the CONSTANT-TIME variable-base multiply
-//!   (`group.zig`, `mul` → `mulWithTable`: since 2026-09-16 a 65-window
-//!   signed-digit multiply sharing the comb's recoding and masked gather; the
-//!   256-iteration ladder it replaced is `mulLadder`, which no target drives),
-//!   with the scalar tainted.
+//!   (`group.zig`, `mul` → `mulInner` → `mulWithTable`: since 2026-09-16 a
+//!   65-window signed-digit multiply sharing the comb's recoding and masked
+//!   gather; the 256-iteration ladder it replaced is `mulLadder`, which no
+//!   target drives), with the scalar tainted, over a point decoded AT RUNTIME
+//!   (2026-09-17, A1 R2 — until then the comptime base point, whose per-call
+//!   table LLVM could fold: a different binary from the ECDH path).
 //! * `comb` — `Secp256k1.combMulBase`, the fixed-base comb that the signing
 //!   path actually calls (`group.zig`, `combMulBaseWithTable`), with the scalar tainted. Its
 //!   masked linear-scan table gather is the powMont-gather leak class this
@@ -58,10 +60,12 @@
 //! both halves were wrong — `rejectIdentity` is INLINED, so its own line
 //! never appears, and the majority of `sign`'s contexts are not it):
 //!
-//!   * `group.zig:328` — `mulWithTable`'s trailing `try acc.rejectIdentity()`,
-//!     1 context (2026-09-16; the ladder it replaced read 2 at `group.zig:277`,
-//!     LLVM having split the `z == 0` test from the affine-identity test).
-//!   * `group.zig:380` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`,
+//!   * `group.zig:347` — `mulWithTable`'s trailing `try acc.rejectIdentity()`,
+//!     1 context (2026-09-17, runtime point through `mulInner`; the same point
+//!     read 2 before `mulInner` existed, the base point 1; the ladder it
+//!     replaced read 2 at `group.zig:277`, LLVM having split the `z == 0` test
+//!     from the affine-identity test).
+//!   * `group.zig:399` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`,
 //!     1 context per call: once in `comb`, twice in `sign`, once in `ecdsa`.
 //!
 //! Either way the branch is on "did the whole scalar multiplication land on
@@ -84,7 +88,7 @@
 //! caller's private key, `:118` on the DRBG output, `:119` the RFC 6979 §3.2
 //! retry test (a real branch on the SECRET nonce candidate — probability
 //! ≈2^-127, documented at the source in `ecdsa_recover.zig` rather than
-//! silenced), `group.zig:380`, `:206` (two: `r = x(R) mod n` through
+//! silenced), `group.zig:399`, `:206` (two: `r = x(R) mod n` through
 //! `fromBytes48`) and `:207` on `r`, `:209` on `s`, `:217` on `Ra.x >= n`, and
 //! `:226` on low-S. One of `ecdsa`'s five non-in-file
 //! contexts is memcheck's `Syscall param write(buf)` on the tainted output
@@ -260,7 +264,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             taintIf(tainted, &k);
             const s = reloadVolatile(32, &k);
 
-            const q = try Secp256k1.mul(Secp256k1.basePoint, s, .big);
+            // A point decoded AT RUNTIME, not `Secp256k1.basePoint`: `mul`
+            // builds its (1..8)·p table per call, and a comptime-known `p`
+            // lets LLVM fold that table into constants — a different binary
+            // from the ECDH path (`sphinx`, `bolt8`) this target stands for.
+            // Measured 2026-09-17 before `mulInner` existed: the base point
+            // read 7/1, this point 8/2 (both in-file contexts the trailing
+            // `rejectIdentity`); a secret-digit branch injected into the
+            // window loop 9/3, at the injected line. Since `mulInner`: 7/1.
+            const p_enc = Secp256k1.basePoint.dbl().toCompressedSec1();
+            const p = try Secp256k1.fromSec1(&reloadVolatile(33, &p_enc));
+            const q = try Secp256k1.mul(p, s, .big);
 
             // Raw projective coordinates through `Fe.toBytes` (a branch-free
             // write of the limbs), NOT `affineCoordinates`: that runs

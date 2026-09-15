@@ -188,7 +188,7 @@ counting rule were added). Three bucket columns, not one, and they sum to
 | `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 6 | 0 | 99 |
 | `field` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `field` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `mul` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 *(windowed `mul`, 2026-09-16; the ladder read 8/2)* |
+| `mul` | scalar, point decoded at run time | yes | **yes** | 7 | **1** | 6 | 0 | 99 *(windowed `mul` via `mulInner` + burn, 2026-09-17; before `mulInner`: base point 7/1, runtime point 8/2; the ladder read 8/2)* |
 | `mul` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `mul` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
 | `comb` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 |
@@ -210,13 +210,15 @@ non-zero: the taint demonstrably propagates through this module's arithmetic.
 **The 1 + 1 group contexts are `rejectIdentity`, not the multiply.** Located
 exactly (`--stacks`, 2026-09-16):
 
-- `group.zig:328` — `mulWithTable`'s trailing `try acc.rejectIdentity()`, reached
-  from `mul` (`group.zig:285`). The 256-bit ladder it replaced read **2** here
-  (`group.zig:277`, LLVM split the `z = 0` test from the affine-identity test);
-  the windowed build reads 1 on the same source expression. That is the
-  compiler placing one test at one address, not a property of the module.
-- `group.zig:380` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`, reached
-  from `combMulBase` (`group.zig:359`). Unchanged at 1 after the recoding and
+- `group.zig:347` — `mulWithTable`'s trailing `try acc.rejectIdentity()`, reached
+  from `mul` → `mulInner` (`group.zig:284`/`:292`). The 256-bit ladder it replaced
+  read **2** here (`group.zig:277`, LLVM split the `z = 0` test from the
+  affine-identity test); the windowed build reads 1 or 2 on the same source
+  expression depending on inlining — measured 2026-09-17: base point 1; point
+  decoded at run time 2 before `mulInner` existed, 1 after. That is the compiler
+  placing one test at one or two addresses, not a property of the module.
+- `group.zig:399` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`, reached
+  from `combMulBase` (`group.zig:378`). Unchanged at 1 after the recoding and
   gather were factored into the helpers `mul` shares.
 
 Both branch on "did the whole multiplication land on the neutral element", i.e.
@@ -226,7 +228,7 @@ is what makes `error.IdentityElement` reachable. **The per-bit `cMov` select and
 the per-window masked table gather report nothing**, which is the claim the
 `blackBox` barriers exist to hold.
 
-**The 11 `sign` contexts** are **two at `group.zig:380`** (2026-09-16; `:346` before the recoding/gather helpers were factored out) — one per
+**The 11 `sign` contexts** are **two at `group.zig:399`** (2026-09-16; `:346` before the recoding/gather helpers were factored out) — one per
 `combMulBase` call, inlined from `sign.zig:62` and `sign.zig:80` — plus nine
 input/output validations, all on lines that must branch by contract:
 
@@ -249,7 +251,7 @@ numbers in this note are the 2026-08-13 ones.)
 
 **The 11 `ecdsa` contexts** (lines as of 2026-09-16) — `ecdsa_recover.sign`, RFC 6979 deterministic
 ECDSA, the module's other shipped secret path (in-repo consumer: `lninvoice`'s
-BOLT#11 signer). One is `group.zig:380` again; the rest are validations, with
+BOLT#11 signer). One is `group.zig:399` again; the rest are validations, with
 one exception that is called out because it is genuinely a branch on secret
 material:
 
@@ -263,7 +265,7 @@ material:
   because there is no rejection-free variant that still yields the RFC's exact
   nonce, and libsecp256k1's `nonce_function_rfc6979` branches on the same
   condition. Documented at the source, not silenced;
-- `group.zig:380` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
+- `group.zig:399` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
 - `ecdsa_recover.zig:206` (via `reduceToScalar` → `fromBytes48`, `scalar.zig:202`
   AND `:208` — **two** contexts) / `:207` — `r = x(R) mod n` and `r.isZero()`.
   Until 2026-09-16 (A1 G7) this was `Scalar.fromBytes(x(R))` — ONE context, and
@@ -301,6 +303,31 @@ frame — measured: at ReleaseSafe its positive control read 0. The burn adds no
 branch: the `ecdsa` ctgrind row read 15/10/5/0 before and after, same source
 lines shifted by the inserted text. `bip340Sign` was not converted and is not
 covered by this claim.
+
+**`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-17).** The windowed
+multiply (F5) left the u256 image of the SECRET scalar on the dead stack **twice
+per call** at ReleaseFast (the ladder before it: once; `combMulBase` after F5:
+0). Declaring `k` a `var` and `secureZero`ing it changed nothing — the copies are
+the compiler's temporaries of the recoding's wide shifts. So `mul` got the G2
+shape: `noinline` `mulInner`, then `mul_stack_burn` = 16 KiB zeroed at that
+depth. Probe "A1 R1" (point decoded at run time, the result returned unencoded so
+nothing overwrites the dead frames): **10 → 0** over 5 calls, negative control 0,
+positive control 1; wire mutant (burn call removed) **10**, with the call tree
+dirtying 2 744 B. ⚠ With the result encoded right after `mul` (a field
+inversion) the probe read 0 even without the burn — which copies survive
+depends on what the caller runs next, so the region burn, not the layout, is
+the fix. ReleaseSmall read 0 before and after. Cost, interleaved A/B in one
+process against the tree without the burn (ReleaseFast, 9 rounds × 1000 calls):
+127.5 vs 124.2 µs median, per-round ratio 1.025 [0.925 .. 1.058], inside the
+spread. The `mul` ctgrind row is unchanged by the burn (7/1/6/0).
+
+**The `mul` ctgrind target multiplies a point decoded at run time (A1 R2, same
+re-audit).** Until 2026-09-17 it used `Secp256k1.basePoint`; `mul` builds its
+table per call from `p`, so a comptime-known point is a different binary from
+the ECDH path it stands for. Measured on the pre-`mulInner` tree: base point
+7/1, runtime point **8/2** (the extra context is `rejectIdentity` split in two,
+not the loop), and the secret-digit branch of the F5 positive control on the
+runtime point **9/3**, new context at the injected line.
 
 **The harnesses were shown to have teeth** (positive controls, each reverted and
 `cmp`-verified byte-identical afterwards):
@@ -473,7 +500,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
       identity must disagree with std on > 90 % of 500 inputs, and does.
    3. **ctgrind**: the `mul` row reads **7 total / 1 in-file / 6 witness /
       0 unattr** — the one in-file context is `mulWithTable`'s trailing
-      `rejectIdentity` (`group.zig:328`); nothing in the recoding, the table
+      `rejectIdentity` (`group.zig:347`); nothing in the recoding, the table
       build, the gather or the doubling loop. The ladder read 8/2 on the same
       harness.
    4. **Measured benefit** (interleaved A/B, ReleaseFast, random non-base
