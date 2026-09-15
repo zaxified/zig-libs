@@ -103,7 +103,10 @@ fn reloadVolatile(s: *const [32]u8) [32]u8 {
 /// `ladder` — `mulRistretto` over a point decoded AT RUNTIME, so `precompute`
 ///   and `pcSelect` run over a runtime table (audit C4: the path `voprf`,
 ///   `opaque` and `bulletproofs` take, which no target measured).
-const Target = enum { ct25519, std_mul, comb, ladderbase, ladder };
+/// `msm` — `mulMultiRistretto` over 9 terms (one full chunk of 8 plus one),
+///   every scalar derived from the tainted secret, public runtime points
+///   (audit `bulletproofs` B9: the prove-side MSM).
+const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -112,6 +115,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "comb")) return .comb;
     if (std.mem.eql(u8, s, "ladderbase")) return .ladderbase;
     if (std.mem.eql(u8, s, "ladder")) return .ladder;
+    if (std.mem.eql(u8, s, "msm")) return .msm;
     return error.UnknownTarget;
 }
 
@@ -179,6 +183,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         },
         .ladder => {
             const q = ct25519.mulRistretto(var_point, sec);
+            out_bytes = q.toBytes();
+        },
+        .msm => {
+            var scalars: [9][32]u8 = undefined;
+            var points: [9]Ristretto255 = undefined;
+            var p = var_point;
+            for (&scalars, &points, 0..) |*sc, *pt, i| {
+                sc.* = sec;
+                sc.*[0] ^= @intCast(i); // still tainted: xor with a constant
+                pt.* = p;
+                p = .{ .p = p.p.dbl().add(var_point.p) }; // public, runtime
+            }
+            const q = ct25519.mulMultiRistretto(&scalars, &points);
             out_bytes = q.toBytes();
         },
         .std_mul => {

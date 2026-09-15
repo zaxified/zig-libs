@@ -347,6 +347,68 @@ pub fn mulRistrettoBase(s: [32]u8) Ristretto255 {
     return .{ .p = combMulBase(&sc) };
 }
 
+// ── constant-time multi-scalar multiplication (audit `bulletproofs` B9) ───
+//
+// `Σ s_i·P_i` for SECRET scalars over caller-validated points, by Straus's
+// interleaving (E. G. Straus, "Addition chains of vectors", Amer. Math.
+// Monthly 71, 1964) with the same fixed 4-bit window and the same `pcSelect`
+// as `mul`: every term gets its own 16-entry table, and all terms SHARE one
+// chain of doublings — per window, one `pcSelect`+add per term, then four
+// doublings for the whole group. That is the constant-time counterpart of
+// the bucket (Pippenger) method, which is not: bucket membership depends on
+// the scalar digits. It is the shape dalek's `MultiscalarMul` documents as
+// constant-time, implemented here from the description.
+//
+// Cost per term drops from 64 adds + 252 doublings + a 14-operation table to
+// 64 adds + 252/k doublings + the table, for chunks of k terms.
+//
+// Chunking: tables for `msm_chunk` terms live on the stack at once
+// (8 × 16 points ≈ 21.5 KiB), so the function needs no allocator; a longer
+// input is summed chunk by chunk. The chunk count and every loop bound depend
+// on `scalars.len` only — public. Nothing branches on a scalar or on a digit.
+
+/// Terms whose tables are held at once; a stack-size bound, not a tuning knob
+/// the result depends on (any value gives the same point).
+const msm_chunk = 8;
+
+/// `Σ scalars[i]·points[i]` over Ristretto255, **constant-time in every
+/// scalar** and total — the neutral element is a value. Each scalar is used
+/// as-is, all 256 bits, exactly as `mulRistretto` uses it, and the result is
+/// the same group element as the sum of the `mulRistretto` products.
+/// Points are not validated (module doc comment). `scalars.len` must equal
+/// `points.len`; a mismatch is a caller bug and panics — the lengths are
+/// public, but an error union here would be the shape this module refuses.
+pub fn mulMultiRistretto(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
+    if (scalars.len != points.len) @panic("ct25519.mulMultiRistretto: scalars.len != points.len");
+    var total = Edwards25519.identityElement;
+    var start: usize = 0;
+    while (start < scalars.len) {
+        const k = @min(msm_chunk, scalars.len - start);
+        total = total.add(strausChunk(scalars[start..][0..k], points[start..][0..k]));
+        start += k;
+    }
+    return .{ .p = total };
+}
+
+/// One Straus pass over at most `msm_chunk` terms.
+fn strausChunk(scalars: []const [32]u8, points: []const Ristretto255) Edwards25519 {
+    var tabs: [msm_chunk][16]Edwards25519 = undefined;
+    for (tabs[0..points.len], points) |*t, p| {
+        t.* = if (p.p.is_base) base_pc else precompute(p.p); // branch on a PUBLIC flag
+    }
+    var q = Edwards25519.identityElement;
+    var pos: usize = 252;
+    while (true) : (pos -= 4) {
+        for (tabs[0..scalars.len], scalars) |*t, *s| {
+            const slot: u4 = @truncate(s[pos >> 3] >> @as(u3, @truncate(pos)));
+            q = q.add(pcSelect(t, slot));
+        }
+        if (pos == 0) break;
+        q = q.dbl().dbl().dbl().dbl();
+    }
+    return q;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -674,6 +736,82 @@ test "C3 comb: the table holds (k+1)·16^(2j)·B and the carry point is 2^256·B
     // ristretto255's base point is Edwards25519's, which `mulRistrettoBase`
     // relies on when it calls the Edwards comb.
     try testing.expectEqualSlices(u8, &Edwards25519.basePoint.toBytes(), &Ristretto255.basePoint.p.toBytes());
+}
+
+// ── B9 MSM: P5 evidence 1 + 2 against the loop it replaces ───────────────
+// The reference is the sum of `mulRistretto` products — exactly what
+// `bulletproofs`' `multiScalarMul` computed before B9, one ladder per term.
+
+fn naiveMulMulti(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
+    var acc = Edwards25519.identityElement;
+    for (scalars, points) |s, p| acc = acc.add(mulRistretto(p, s).p);
+    return .{ .p = acc };
+}
+
+fn edgeScalar(i: usize) [32]u8 {
+    var s: [32]u8 = undefined;
+    const L: u256 = scalar.field_order;
+    const v: u256 = switch (i % 6) {
+        0 => 0,
+        1 => 1,
+        2 => L - 1,
+        3 => L,
+        4 => ~@as(u256, 0),
+        else => 0x8888888888888888888888888888888888888888888888888888888888888888,
+    };
+    std.mem.writeInt(u256, &s, v, .little);
+    return s;
+}
+
+test "B9 mulMultiRistretto: bit-exact vs the per-term ladder sum across every chunk boundary" {
+    const debug = @import("builtin").mode == .Debug;
+    const sizes = [_]usize{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 24, 33, 64 };
+    const trials: usize = if (debug) 2 else 40;
+    var prng = std.Random.DefaultPrng.init(0xB9_5_7A_05);
+    const random = prng.random();
+    var scalars: [64][32]u8 = undefined;
+    var points: [64]Ristretto255 = undefined;
+    var compared: usize = 0;
+    for (sizes) |n| {
+        if (debug and n > 17) continue;
+        for (0..trials) |trial| {
+            for (0..n) |i| {
+                // mix raw 256-bit, reduced and edge scalars
+                random.bytes(&scalars[i]);
+                if ((i + trial) % 3 == 1) scalars[i] = scalar.reduce(scalars[i]);
+                if ((i + trial) % 5 == 2) scalars[i] = edgeScalar(i + trial);
+                // mix random multiples, the flagged base point, a decoded (unflagged)
+                // base point and the identity
+                points[i] = switch ((i + 2 * trial) % 7) {
+                    0 => Ristretto255.basePoint,
+                    1 => .{ .p = Edwards25519.identityElement },
+                    2 => try Ristretto255.fromBytes(Ristretto255.basePoint.toBytes()),
+                    else => blk: {
+                        var k: [64]u8 = undefined;
+                        random.bytes(&k);
+                        break :blk .{ .p = mulBase(scalar.reduce64(k)) };
+                    },
+                };
+            }
+            const want = naiveMulMulti(scalars[0..n], points[0..n]);
+            const got = mulMultiRistretto(scalars[0..n], points[0..n]);
+            try testing.expectEqualSlices(u8, &want.toBytes(), &got.toBytes());
+            compared += 1;
+        }
+    }
+    try testing.expect(compared >= if (debug) 18 else 480);
+}
+
+test "B9 mulMultiRistretto: one term equals mulRistretto; zero terms are the identity; no error set" {
+    const zero = [_]u8{0} ** 32;
+    try testing.expectEqualSlices(u8, &zero, &mulMultiRistretto(&.{}, &.{}).toBytes());
+    const p = try Ristretto255.fromBytes(Ristretto255.basePoint.toBytes());
+    for (0..6) |i| {
+        const s = edgeScalar(i);
+        try testing.expectEqualSlices(u8, &mulRistretto(p, s).toBytes(), &mulMultiRistretto(&.{s}, &.{p}).toBytes());
+    }
+    const ret = @typeInfo(@TypeOf(mulMultiRistretto)).@"fn".return_type.?;
+    try testing.expect(@typeInfo(ret) != .error_union);
 }
 
 test "mul: is additively homomorphic in the scalar (fold-boundary sanity)" {

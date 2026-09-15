@@ -27,7 +27,11 @@ public scalar through std is that this module refuses to have the error
 union std's rejection would force on the caller, not raw speed.
 
 **API.** `mul(p, s)` / `mulBase(s)` on `Edwards25519`, `mulRistretto(p, s)` /
-`mulRistrettoBase(s)` on `Ristretto255`.
+`mulRistrettoBase(s)` on `Ristretto255`, and `mulMultiRistretto(scalars,
+points)` — `Σ s_i·P_i` for secret scalars by Straus's interleaving: one shared
+chain of doublings instead of one ladder per term, constant-time in every
+scalar, the same group element as summing `mulRistretto` (since 2026-09-16,
+audit `bulletproofs` B9; SPEC.md § B9).
 
 **`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder (since
 2026-09-16, audit C3).** The base point used to run the same 16-entry window

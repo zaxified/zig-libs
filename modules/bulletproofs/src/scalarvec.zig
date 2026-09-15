@@ -131,25 +131,24 @@ pub const mulCt = ct25519.mulRistretto;
 
 pub const MultiScalarMulError = error{LengthMismatch};
 
-/// `sum_i scalars_i * points_i` over Ristretto255 — a naive (non-Pippenger)
-/// weighted sum: one `mulCt` + `.add` per term, **constant-time**: every
-/// term costs exactly the same whatever its scalar is, including zero (a
-/// zero scalar contributes the neutral element, which is added like any
-/// other term rather than skipped). This is the MSM the PROVER uses, over
-/// secret witness/blinding scalars.
+/// `sum_i scalars_i * points_i` over Ristretto255, **constant-time in every
+/// scalar** — the MSM the PROVER uses, over secret witness/blinding scalars.
+/// Every term costs the same whatever its scalar is, including zero (a zero
+/// scalar contributes the neutral element as a value, never a skipped add).
 ///
-/// Performance note: this is the mechanical, obviously-correct version.
-/// The verifier's public-scalar MSMs use the windowed/bucket
-/// `multiScalarMulVartime` below instead; a faster CONSTANT-TIME MSM would
-/// have to keep the per-term cost scalar-independent, so the vartime
-/// bucket method is not a legal substitute here.
+/// Since B9 (2026-09-16) this is `ct25519.mulMultiRistretto`: Straus's
+/// interleaved fixed-window method, one shared chain of doublings for all
+/// terms instead of one full ladder per term — the same group element as the
+/// old `Σ mulCt(p_i, s_i)` loop (kept verbatim as the reference in the B9
+/// differential test below) at ~2.5× less work. The audit's F1 disposition
+/// called the naive loop "a documented by-design boundary, not a residual
+/// gap"; B9 showed the dilemma was false — constant time did not require one
+/// ladder per term, only a schedule that does not depend on the digits. The
+/// verifier's public-scalar MSMs still use the bucket `multiScalarMulVartime`
+/// below, which is NOT constant-time and must never see a secret.
 pub fn multiScalarMul(scalars: []const [32]u8, points: []const Ristretto255) MultiScalarMulError!Ristretto255 {
     if (scalars.len != points.len) return error.LengthMismatch;
-    var acc = identity_point;
-    for (scalars, points) |s, p| {
-        acc = acc.add(mulCt(p, s));
-    }
-    return acc;
+    return ct25519.mulMultiRistretto(scalars, points);
 }
 
 // ── Pippenger (vartime) multi-scalar multiplication ─────────────────────────
@@ -396,6 +395,52 @@ test "mulCt: signature carries no error set (no call site can branch on the scal
     // error union to `catch`. Assert that in the type system.
     const info = @typeInfo(@TypeOf(mulCt)).@"fn";
     try std.testing.expect(info.return_type.? == Ristretto255);
+}
+
+/// The pre-B9 `multiScalarMul` body, verbatim (`git show 74645800:modules/
+/// bulletproofs/src/scalarvec.zig`) — the reference B9 is held bit-exact to.
+fn multiScalarMulPreB9(scalars: []const [32]u8, points: []const Ristretto255) MultiScalarMulError!Ristretto255 {
+    if (scalars.len != points.len) return error.LengthMismatch;
+    var acc = identity_point;
+    for (scalars, points) |s, p| {
+        acc = acc.add(mulCt(p, s));
+    }
+    return acc;
+}
+
+test "B9 diff: multiScalarMul is bit-exact to the pre-B9 per-term loop" {
+    const debug = @import("builtin").mode == .Debug;
+    var prng = std.Random.DefaultPrng.init(0xB9_D1FF);
+    const random = prng.random();
+    const sizes = [_]usize{ 0, 1, 2, 3, 4, 7, 8, 9, 16, 17, 32, 33, 64, 65 };
+    const trials: usize = if (debug) 1 else 25;
+    var compared: usize = 0;
+    for (sizes) |n| {
+        if (debug and n > 17) continue;
+        const scalars = try std.testing.allocator.alloc([32]u8, n);
+        defer std.testing.allocator.free(scalars);
+        const points = try std.testing.allocator.alloc(Ristretto255, n);
+        defer std.testing.allocator.free(points);
+        for (0..trials) |_| {
+            for (scalars, points, 0..) |*s, *p, i| {
+                var wide: [64]u8 = undefined;
+                random.bytes(&wide);
+                s.* = switch (i % 4) {
+                    0 => zero, // a zero witness bit must still cost a full term
+                    1 => one,
+                    else => scalar.reduce64(wide),
+                };
+                random.bytes(&wide);
+                p.* = .{ .p = ct25519.mulBase(scalar.reduce64(wide)) };
+            }
+            const want = try multiScalarMulPreB9(scalars, points);
+            const got = try multiScalarMul(scalars, points);
+            try std.testing.expectEqualSlices(u8, &want.toBytes(), &got.toBytes());
+            compared += 1;
+        }
+    }
+    try std.testing.expect(compared >= if (debug) 9 else 350);
+    try std.testing.expectError(error.LengthMismatch, multiScalarMul(&.{ one, one }, &.{identity_point}));
 }
 
 test "multiScalarMul: 2*G + 3*basePoint.dbl() matches direct computation" {

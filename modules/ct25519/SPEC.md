@@ -164,6 +164,87 @@ to measure — which it now does, with a positive control that fires.
 `src/bench.zig` (`CT25519_BENCH=1 scripts/modtest ct25519
 -Doptimize=ReleaseFast`) re-runs the same pairs in-module (audit C9).
 
+## B9 — constant-time multi-scalar multiplication (a `DECISIONS.md` P5 addition)
+
+**Why.** `bulletproofs`' prover sums `Σ s_i·P_i` over SECRET witness and
+blinding scalars (`A`, `S`, every IPA round's `L`/`R`). It did that as one
+full `mulRistretto` per term — 252 doublings per term — and its SPEC called
+that "a documented by-design boundary" because the fast bucket (Pippenger)
+method branches on digits. Audit `bulletproofs` B9 measured the dilemma as
+false: dalek's constant-time `MultiscalarMul` is 2.45× the per-term loop at
+n = 64.
+
+**Technique and source.** Straus's interleaving (E. G. Straus, "Addition
+chains of vectors", Amer. Math. Monthly 71, 1964) with this module's own
+4-bit fixed window and `pcSelect`: every term keeps its 16-entry table, and
+all terms share ONE chain of doublings — per window, one `pcSelect`+add per
+term, then four doublings for the group. No digit decides whether an add
+happens or which bucket it lands in, which is what makes it constant-time
+where Pippenger is not. Implemented from that description.
+`mulMultiRistretto(scalars, points)`; terms are processed in chunks of
+`msm_chunk = 8` so the tables (≈ 21.5 KiB) live on the stack and no allocator
+is needed. Chunking changes nothing in the result (the chunk-size mutants
+below are green) and depends only on `scalars.len`, which is public. A length
+mismatch panics: an error union is the shape this module refuses, and
+`bulletproofs` checks the lengths before calling.
+
+**The four P5 pieces of evidence:**
+
+1. **Bit-exact against the loop it replaces.** The reference is the sum of
+   `mulRistretto` products, i.e. the pre-B9 `bulletproofs.multiScalarMul`,
+   compared on the canonical encoding at n = 0, 1, 2, 7, 8, 9, 15, 16, 17, 24,
+   33, 64 (every chunk boundary; Debug stops at 17) with raw 256-bit, reduced
+   and edge scalars (`0`, `1`, `L−1`, `L`, `2^256−1`, all-`0x88`) and the
+   flagged base point, an unflagged decoded base point, the identity and
+   random points; plus one term against `mulRistretto` for every edge scalar,
+   and zero terms against the identity. `bulletproofs`' own
+   `B9 diff` test holds its `multiScalarMul` to the verbatim pre-B9 body.
+2. **Randomized differential**, the same tests: 40 trials per size in
+   ReleaseFast (480 comparisons), 2 in Debug; `bulletproofs` 25 per size
+   (350) with zero and one witness scalars mixed in. **Teeth, measured**
+   (`-Dtest-filter=B9`, Debug, every mutant compiled, `N failed` read from
+   the build summary): every term reads the first table; three shared
+   doublings per window; the trailing partial chunk skipped; a chunk's result
+   overwriting the running total; every term on the base-point table; the
+   window nibble shifted one bit; and, in `bulletproofs`, the wire dropping
+   the last term — **7/7 RED**. Chunk sizes 5 and 1 (the latter is the
+   per-term ladder again) — **GREEN**, as they must be.
+3. **ctgrind target `msm`** — 9 terms (a full chunk plus one), every scalar
+   derived from the tainted secret, public runtime points. ReleaseFast:
+   **2 total / 0 in `root.zig` / 2 witness / 0 unattr**, untainted control
+   and no-`-fvalgrind` trap 0. **Positive control:** replacing the
+   `pcSelect` add with `if (slot != 0) q = q.add(t[slot])` → **2 in-file,
+   on the mutated line** (and its caller), every other target unchanged.
+   In `bulletproofs`' own gate the `rangeproof` (8 / 0 / 8 / 0) and `ipa`
+   (4 / 0 / 4 / 0) rows stay at 0 in-file with B9 in the prover, and `ipa`'s
+   pinned output digest still matches — the IPA transcript, which hashes
+   every `L`/`R`, is byte-identical.
+4. **This section**, with the A/B:
+
+   A/B ReleaseFast, one process, 9 interleaved rounds with alternating
+   order, CPU time, µs, median [min..max]; `bulletproofs` old = its sources
+   at `bf7997ce` (per-term MSM), new = the tree, both over this module; the
+   machine was shared (load 3.6–4.2), which is why the untouched `verify`
+   rides along as the control:
+
+   | operation | before | after | median | paired ratio |
+   |---|---|---|---|---|
+   | MSM, n = 64 (per-term `mulRistretto` sum vs `mulMultiRistretto`) | 3 429 [3 368..3 966] | 1 397 [1 368..1 430] | **2.45×** | 2.36..2.83 |
+   | `bulletproofs.prove`, n = 32 | 23 442 [23 214..29 028] | 15 672 [15 551..16 614] | **1.50×** | 1.40..1.85 |
+   | `bulletproofs.prove`, n = 64 | 47 342 [45 726..55 472] | 34 550 [30 090..37 233] | **1.37×** | 1.24..1.84 |
+   | `bulletproofs.verify`, n = 32 (unchanged — control) | 3 510 | 3 503 | 1.00× | 0.95..1.05 |
+   | `bulletproofs.verify`, n = 64 (unchanged — control) | 4 927 | 4 964 | 0.99× | 0.91..1.03 |
+
+   The MSM gain equals the audit's external measurement of dalek's
+   constant-time MSM (2.45× at n = 64). `prove` gains less because it also
+   does `n` generator rescalings (`h'`), the `L`/`R` inner products and
+   hashing, none of which B9 touches. For both `prove` widths the slowest new
+   round is faster than the fastest old one. Why the gain outweighs the new
+   code: one of the two prover hot paths drops by 2.45× without giving up
+   constant time — the property the old loop was kept for — and the new
+   primitive is ~40 lines that reuse `precompute`/`pcSelect` unchanged, held
+   byte-exact to the loop it replaces.
+
 ## Threat model / limits
 
 - **The claim.** `mul`/`mulBase`/`mulRistretto`/`mulRistrettoBase` execute
