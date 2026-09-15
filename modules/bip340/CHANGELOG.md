@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — A1 F2. Security fix, no API change: `sign` left the effective
+  signing scalar `d` and the nonce (`rand`, both `k` candidates) on the dead
+  stack — measured on the audited tree at ReleaseFast, `d` ×2 and the nonce
+  ×2-3 per signature, and the nonce next to the published `s` is the key.
+  Zeroing named locals could not reach these compiler-made copies. From
+  2026-09-11 the step-10 self-verify happened to overwrite the region, so the
+  residue stopped showing; a build with that call removed shows it again.
+  Steps 1-9 now run one frame down and 16 KiB of that region is zeroed before
+  their result is used (`computeAndBurn`, the same fix as `k256`'s
+  `ecdsa_recover.sign`). `stackprobe_test.zig` now asserts zero residue for
+  every secret in big-endian, little-endian and in-memory scalar form, for keys
+  of both parities, beside a negative and a positive control — once through
+  `sign` and once through `computeAndBurn` alone, where no `verify` can hide a
+  missing burn. It used to print one count for `d` only.
+
 - **2026-09-11** — **BREAKING:** `xonlyBytesOf`'s 33-byte branch now rejects
   an input whose leading byte is not a real SEC1 marker (`0x02`/`0x03`)
   with the new error `error.BadPointPrefix`, instead of silently accepting

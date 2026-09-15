@@ -338,16 +338,62 @@ fn signImpl(
     aux_rand: [32]u8,
     compute: *const fn (SecretKey, []const u8, [32]u8) SignError!ComputeResult,
 ) SignError![64]u8 {
-    const computed = try compute(secret_key, msg, aux_rand);
+    const computed = try computeAndBurn(secret_key, msg, aux_rand, compute);
     const parsed = Signature.fromBytes(computed.sig) catch return error.SignatureVerificationFailed;
     if (!verify(computed.pubkey, msg, parsed)) return error.SignatureVerificationFailed;
     return computed.sig;
 }
 
+/// Run steps 1-9, then zero the stack region they used before anything reads
+/// their result — on the error path too.
+///
+/// A1/bip340.md F2. Zeroing named locals is not enough: steps 1-9 leave the
+/// effective scalar `d` and the nonce in dead callee frames the source has no
+/// name for. Measured with `stackprobe_test.zig`'s method on the audited tree
+/// (`22e1aa5c`, ReleaseFast, 48 KiB below the call, four keys of both
+/// parities): `d` ×2, `rand` ×2-3, `k'` ×2-3, `n-k'` ×1-2 per signature —
+/// and the nonce next to the published `s` is the key. Since F5 (`6c6076e2`)
+/// the step-10 `verify` happened to overwrite that region, so the same probe
+/// read zero; with the `verify` call removed, today's tree shows the same
+/// residue again. The absence was a side effect of the next call's frames, not
+/// a property of signing. This makes it one: the computation runs one frame
+/// down (`computeUnverified` is `noinline`) and `sign_stack_burn` bytes at
+/// that depth are zeroed whatever layout a compiler picks for the frames in
+/// between. Same fix as `k256`'s `ecdsa_recover.sign` (A1 k256 G2).
+fn computeAndBurn(
+    secret_key: SecretKey,
+    msg: []const u8,
+    aux_rand: [32]u8,
+    compute: *const fn (SecretKey, []const u8, [32]u8) SignError!ComputeResult,
+) SignError!ComputeResult {
+    const result = compute(secret_key, msg, aux_rand);
+    burnSignStack();
+    return result;
+}
+
+/// How much stack below `computeAndBurn`'s frame is zeroed after steps 1-9.
+/// `stackprobe_test.zig` prints how deep the call tree dirties the stack and
+/// asserts zero residue in every representation it looks for, so a call tree
+/// that outgrows the burn goes red there.
+const sign_stack_burn = 16 * 1024;
+
+/// Zero `sign_stack_burn` bytes at the depth `compute`'s frame occupied.
+/// `noinline` here is load-bearing, measured: made `inline`, this buffer lands
+/// in the caller's frame, ABOVE the region the signing frames used, and the
+/// probe finds `d` and the nonce again. On `computeUnverified` it is a guard,
+/// not a measured necessity: `sign` reaches it through a function pointer the
+/// compiler does not inline today, and dropping the keyword left the probe
+/// green. `secureZero` writes through a volatile slice, so the dead store
+/// survives optimisation.
+noinline fn burnSignStack() void {
+    var buf: [sign_stack_burn]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
+}
+
 /// Steps 1-9 of `sign` (no self-check) — the real computation `signImpl`
 /// runs in production, and the honest baseline the F5 test's corrupted
-/// stand-in derives from.
-fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError!ComputeResult {
+/// stand-in derives from. `noinline`: see `burnSignStack`.
+noinline fn computeUnverified(secret_key: SecretKey, msg: []const u8, aux_rand: [32]u8) SignError!ComputeResult {
     // Steps 1-2: even-y-normalized effective scalar d + x-only public key.
     var kp = try KeyPair.fromSecretKey(secret_key);
     defer kp.deinit();
@@ -705,4 +751,18 @@ test "KeyPair.deinit zeroizes the effective signing scalar but leaves public unt
     kp.deinit();
     try std.testing.expectEqualSlices(u8, &zero, &kp.secret);
     try std.testing.expect(!std.mem.eql(u8, &kp.public.x, &zero));
+}
+
+noinline fn stackprobeComputeAndBurn(sk: SecretKey, aux: [32]u8) void {
+    const result = computeAndBurn(sk, @import("stackprobe_test.zig").msg, aux, computeUnverified) catch unreachable;
+    std.mem.doNotOptimizeAway(&result);
+}
+
+// A1 F2: `sign`'s own probe cannot see a missing burn, because the step-10
+// `verify` that follows `computeAndBurn` overwrites the same stack region —
+// that is exactly how the residue went unseen from 2026-09-11 on. This one
+// calls `computeAndBurn` with nothing after it, so the burn is the only thing
+// between steps 1-9 and the scan.
+test "STACKPROBE (A1 F2): computeAndBurn alone leaves no key or nonce residue on the dead stack" {
+    try @import("stackprobe_test.zig").expectNoResidue("computeAndBurn, no step-10 verify after it", stackprobeComputeAndBurn);
 }
