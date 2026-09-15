@@ -64,8 +64,10 @@ pub fn main() !void {
 
     // An out-of-range input index must be a nameable error, not a panic —
     // a validator handling attacker-controlled indices relies on this.
+    // `@panic`, not `unreachable`: this checks a value the library returned,
+    // and `unreachable` compiles to no check at all in ReleaseFast.
     if (bitcointx.legacy.sighash(gpa, transaction, 5, &[_]u8{0x51}, bitcointx.legacy.ALL)) |_| {
-        unreachable;
+        @panic("legacy.sighash accepted an out-of-range input index");
     } else |err| switch (err) {
         error.InputIndexOutOfRange => std.debug.print("out-of-range input index correctly rejected\n", .{}),
         error.OutOfMemory => return err,
