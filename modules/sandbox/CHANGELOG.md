@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** audit S13, S14 (remainder), S17, S18. Tests only,
+  and the root-gated ones now actually run: `scripts/vm/run.sh sandbox` (real root in a disposable
+  Debian 6.12.96 guest) gives 35 pass / 1 skip, and `--kernel-append lsm=apparmor` gives 29 / 7.
+  - S13/S14: the privilege-drop child now starts with a supplementary group and checks saved gid
+    and an empty group list. The bounding-set child reads the set back with `PR_CAPBSET_READ`
+    (with a positive precondition) and treats EPERM as a failure under root. Seven source mutants
+    (setuid-first, saved uid kept via `setresuid(u,u,0)`, `setgroups` skipped, bounding-set loop
+    emptied, each alone and with the read-back removed) all fail in the guest, each on its own exit
+    code.
+  - S17: `install`/`installTsync` are run in a child where a seccomp pre-filter makes `prctl`,
+    respectively `seccomp`, return EINVAL. Deleting either errno check fails the test on the host.
+  - S18: ENOSYS/EOPNOTSUPP are injected the same way into `landlock_create_ruleset`, covering
+    both copies of the mapping (`landlockAbiVersion` and `initHandling`). A kernel booted with
+    `lsm=apparmor` is also checked for `error.Disabled` with no injection.
+  - The rlimit test "cannot be raised back" failed as real root, because CAP_SYS_RESOURCE raises a
+    hard limit legitimately. The child now sheds its capabilities first, which is the non-privileged
+    property `setLimit` documents.
+
 - **2026-09-14** — **BEHAVIOURAL (allows more):** audit S11, by the owner's decision to extend
   `seccomp.default_allowlist`. A process under the default filter died of SIGSYS on calls its libc
   or runtime makes unasked. Added, each checked to grant nothing beyond the process's own state or

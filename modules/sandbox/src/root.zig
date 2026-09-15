@@ -1972,6 +1972,12 @@ fn childRlimitBites() void {
 }
 
 fn childRlimitCannotRaise() void {
+    // The property is "a NON-privileged process cannot raise it" (`setLimit`'s
+    // doc). Root holds CAP_SYS_RESOURCE, which raises a hard limit legitimately,
+    // so as root this test failed for the wrong reason — first seen when
+    // `scripts/vm/run.sh sandbox` ran it as real root (2026-09-15). Shed the
+    // capabilities first; the property under test is then the one documented.
+    if (linux.geteuid() == 0) clearCapabilities() catch linux.exit(72);
     limitOpenFiles(64) catch linux.exit(70); // lowers the hard limit to 64
     // A non-privileged process must NOT be able to raise the hard limit back up.
     setLimit(.NOFILE, 4096, 4096) catch linux.exit(0); // expected: EPERM → success
@@ -1980,10 +1986,10 @@ fn childRlimitCannotRaise() void {
 
 test "rlimit: RLIMIT_NOFILE is enforced and cannot be raised back" {
     const bites = try runInChild(childRlimitBites);
-    try testing.expect(bites.exitedWith(0));
+    try testing.expectEqual(@as(u32, 0), bites.status);
 
     const no_raise = try runInChild(childRlimitCannotRaise);
-    try testing.expect(no_raise.exitedWith(0));
+    try testing.expectEqual(@as(u32, 0), no_raise.status);
 }
 
 test "disableCoreDumps sets RLIMIT_CORE to zero in the child" {
@@ -2035,12 +2041,179 @@ test "limitAddressSpace sets RLIMIT_AS to the requested value" {
     try testing.expect(res.exitedWith(0));
 }
 
+// ── injected errnos: the typed failure branches a healthy kernel never takes ──
+//
+// Audit S17/S18. `install`/`installTsync` never failed, and `landlockAbiVersion`
+// never saw ENOSYS or EOPNOTSUPP, on any machine this suite ran on. So every
+// typed error branch was a mutant nobody could kill. A seccomp filter installed
+// in a child makes the REAL syscall return the chosen errno through the real
+// kernel entry path, and the code under test cannot tell that from a kernel that
+// refuses. The filters are installed with raw syscalls, not through the module,
+// so a broken `install` cannot break its own test's setup.
+//
+// The errno is not invented: EOPNOTSUPP is what a kernel booted without the
+// Landlock LSM returns. `scripts/vm/run.sh sandbox debian --kernel-append
+// lsm=apparmor` measures it with no injection at all (the
+// SANDBOX_EXPECT_LANDLOCK test below).
+
+fn rawNoNewPrivs() bool {
+    return linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) == .SUCCESS;
+}
+
+fn rawInstallPrctl(prog: []const SockFilter) bool {
+    const fprog = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
+    const rc = linux.prctl(@intFromEnum(linux.PR.SET_SECCOMP), linux.SECCOMP.MODE.FILTER, @intFromPtr(&fprog), 0, 0);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+fn rawInstallSeccomp(prog: []const SockFilter) bool {
+    const fprog = SockFprog{ .len = @intCast(prog.len), .filter = prog.ptr };
+    const rc = linux.syscall3(.seccomp, linux.SECCOMP.SET_MODE_FILTER, 0, @intFromPtr(&fprog));
+    return linux.errno(rc) == .SUCCESS;
+}
+
+/// Allow everything, except `nr`, which returns `-errno` without running.
+fn errnoOneSyscall(nr: linux.SYS, errno: E) [4]SockFilter {
+    return .{
+        bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.off_nr),
+        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@intFromEnum(nr)), 0, 1),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, @intFromEnum(errno))),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow),
+    };
+}
+
+/// Like `errnoOneSyscall(.landlock_create_ruleset, errno)`, but only for a real
+/// ruleset creation (`flags == 0`). The ABI-version query
+/// (`flags == LANDLOCK_CREATE_RULESET_VERSION`) still reaches the kernel, which
+/// is the only way to get past `initHandling`'s first line into its own copy of
+/// the errno mapping.
+fn errnoLandlockCreateOnly(errno: E) [6]SockFilter {
+    return .{
+        bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.off_nr),
+        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, @intCast(@intFromEnum(linux.SYS.landlock_create_ruleset)), 0, 3),
+        bpf.stmt(bpf.ld | bpf.w | bpf.abs, seccomp.arg2.lo),
+        bpf.jump(bpf.jmp | bpf.jeq | bpf.k, 0, 0, 1),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_errno | @as(u32, @intFromEnum(errno))),
+        bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow),
+    };
+}
+
+const allow_all_prog = [_]SockFilter{bpf.stmt(bpf.ret | bpf.k, seccomp.ret_allow)};
+
+/// Positive control: a refused syscall that `install`/`installTsync` do not
+/// make leaves both of them working, so the two failure children below fail
+/// for the syscall they target and not because a pre-filter exists at all.
+fn childInstallControl() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const pre = errnoOneSyscall(.getppid, .INVAL);
+    if (!rawInstallSeccomp(&pre)) linux.exit(102);
+    seccomp.install(&allow_all_prog) catch linux.exit(3);
+    seccomp.installTsync(&allow_all_prog) catch linux.exit(4);
+    linux.exit(0);
+}
+
+fn childInstallSeesPrctlFailure() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const pre = errnoOneSyscall(.prctl, .INVAL);
+    if (!rawInstallSeccomp(&pre)) linux.exit(102);
+    seccomp.install(&allow_all_prog) catch |e| switch (e) {
+        error.SeccompFailed => linux.exit(0),
+    };
+    linux.exit(1); // reported success for a prctl the kernel refused
+}
+
+fn childInstallTsyncSeesSeccompFailure() void {
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const pre = errnoOneSyscall(.seccomp, .INVAL);
+    if (!rawInstallPrctl(&pre)) linux.exit(102);
+    seccomp.installTsync(&allow_all_prog) catch |e| switch (e) {
+        error.SeccompFailed => linux.exit(0),
+        error.ThreadSyncFailed => linux.exit(2), // a plain -errno misread as a tid
+    };
+    linux.exit(1);
+}
+
+test "seccomp.install / installTsync: a syscall the kernel refuses surfaces as SeccompFailed, not success (audit S17)" {
+    try requireSeccompFilter();
+    // `status` rather than `exitedWith(0)`, so a failure prints which exit code.
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallControl)).status);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallSeesPrctlFailure)).status);
+    try testing.expectEqual(@as(u32, 0), (try runInChild(childInstallTsyncSeesSeccompFailure)).status);
+}
+
+var g_inj_errno: E = .NOSYS;
+
+fn injectedLandlockError() LandlockError {
+    return switch (g_inj_errno) {
+        .NOSYS => error.NotSupported,
+        .OPNOTSUPP => error.Disabled,
+        else => unreachable,
+    };
+}
+
+fn childLandlockVersionUnderErrno() void {
+    const want = injectedLandlockError();
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const pre = errnoOneSyscall(.landlock_create_ruleset, g_inj_errno);
+    if (!rawInstallPrctl(&pre)) linux.exit(102);
+    if (landlockAbiVersion()) |_| linux.exit(1) else |e| if (e != want) linux.exit(2);
+    if (Ruleset.init()) |_| linux.exit(3) else |e| if (e != want) linux.exit(4);
+    linux.exit(0);
+}
+
+fn childLandlockCreateUnderErrno() void {
+    const want = injectedLandlockError();
+    if (!rawNoNewPrivs()) linux.exit(101);
+    const pre = errnoLandlockCreateOnly(g_inj_errno);
+    if (!rawInstallPrctl(&pre)) linux.exit(102);
+    // The version query must still succeed, or this child tests nothing new.
+    _ = landlockAbiVersion() catch linux.exit(5);
+    if (Ruleset.init()) |_| linux.exit(3) else |e| if (e != want) linux.exit(4);
+    linux.exit(0);
+}
+
+test "landlock: ENOSYS / EOPNOTSUPP from the version query map to NotSupported / Disabled (audit S18)" {
+    try requireSeccompFilter();
+    for ([_]E{ .NOSYS, .OPNOTSUPP }) |errno| {
+        g_inj_errno = errno;
+        try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockVersionUnderErrno)).status);
+    }
+}
+
+test "landlock: ENOSYS / EOPNOTSUPP from the ruleset creation itself map the same way — initHandling's own copy (audit S18)" {
+    try requireSeccompFilter();
+    // Past the version query means a kernel whose Landlock actually answers.
+    _ = landlockAbiVersion() catch return error.SkipZigTest;
+    for ([_]E{ .NOSYS, .OPNOTSUPP }) |errno| {
+        g_inj_errno = errno;
+        try testing.expectEqual(@as(u32, 0), (try runInChild(childLandlockCreateUnderErrno)).status);
+    }
+}
+
+test "landlock: a kernel booted without the Landlock LSM reports error.Disabled, no injection (VM lane, audit S18)" {
+    // Set only by `scripts/vm/run.sh sandbox`'s guest setup, and only when the
+    // guest's active LSM list really lacks landlock. Everywhere else: skip.
+    const expect = testing.environ.getPosix("SANDBOX_EXPECT_LANDLOCK") orelse return error.SkipZigTest;
+    try testing.expectEqualStrings("disabled", expect);
+    try testing.expectError(error.Disabled, landlockAbiVersion());
+    try testing.expectError(error.Disabled, Ruleset.init());
+}
+
 // ── real: privilege drop (root-gated, skips cleanly) ─────────────────────────
+//
+// Run for real by `scripts/vm/run.sh sandbox` (disposable guest, real root).
+// Each exit code names one property, so a mutant's failure says which.
 
 const nobody_uid: linux.uid_t = 65534;
 const nobody_gid: linux.gid_t = 65534;
 
 fn childDropThenTryRegain() void {
+    // Precondition: hold a supplementary group. A root login shell can have
+    // none, and then a drop that skipped `setgroups` would be invisible (S14).
+    const extra = [_]linux.gid_t{4242};
+    if (linux.errno(linux.setgroups(extra.len, &extra)) != .SUCCESS) linux.exit(89);
+    if (linux.getgroups(0, null) != 1) linux.exit(88);
+
     dropPrivileges(.{ .uid = nobody_uid, .gid = nobody_gid }) catch linux.exit(90);
     if (linux.getuid() != nobody_uid) linux.exit(91);
     // gid too — the classic setuid-first hole leaves gid 0 behind while uid
@@ -2051,6 +2224,12 @@ fn childDropThenTryRegain() void {
     var suid: linux.uid_t = 0;
     _ = linux.getresuid(&ruid, &euid, &suid);
     if (suid != nobody_uid) linux.exit(94); // saved uid is the seteuid ladder back up
+    var rgid: linux.gid_t = 0;
+    var egid: linux.gid_t = 0;
+    var sgid: linux.gid_t = 0;
+    _ = linux.getresgid(&rgid, &egid, &sgid);
+    if (sgid != nobody_gid) linux.exit(97);
+    if (linux.getgroups(0, null) != 0) linux.exit(96); // group 4242 must be gone
     // Must not be able to climb back to uid 0.
     if (linux.errno(linux.setuid(0)) == .SUCCESS) linux.exit(92); // regained root!
     if (linux.errno(linux.setgid(0)) == .SUCCESS) linux.exit(95);
@@ -2060,21 +2239,38 @@ fn childDropThenTryRegain() void {
 test "privilege drop: child drops to nobody and cannot regain uid 0 (needs root)" {
     if (linux.geteuid() != 0) return error.SkipZigTest; // not privileged — nothing to drop
     const res = try runInChild(childDropThenTryRegain);
-    try testing.expect(res.exitedWith(0));
+    try testing.expectEqual(@as(u32, 0), res.status);
+}
+
+fn capBoundingSetHas(cap: usize) ?bool {
+    const rc = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+    return switch (linux.errno(rc)) {
+        .SUCCESS => rc != 0,
+        else => null, // EINVAL: past CAP_LAST_CAP
+    };
 }
 
 fn childDropBoundingSet() void {
-    dropCapabilityBoundingSet() catch |e| switch (e) {
-        error.PermissionDenied => linux.exit(0), // acceptable if we lack CAP_SETPCAP
-        else => linux.exit(95),
-    };
+    // Precondition: root starts with CAP_CHOWN (0) in its bounding set, or a
+    // drop that removes nothing would look the same as one that works.
+    if (capBoundingSetHas(0) != true) linux.exit(99);
+    // Root holds CAP_SETPCAP, so PermissionDenied here is a failure, not a skip.
+    dropCapabilityBoundingSet() catch linux.exit(95);
+    // Read the set back (audit S13, M25): a drop loop whose body did nothing
+    // still returned success, and the old test accepted that.
+    var cap: usize = 0;
+    while (cap < cap_probe_ceiling) : (cap += 1) {
+        const has = capBoundingSetHas(cap) orelse break;
+        if (has) linux.exit(96);
+    }
+    if (cap == 0) linux.exit(98);
     linux.exit(0);
 }
 
-test "capability bounding-set drop succeeds or cleanly reports EPERM (needs root)" {
+test "capability bounding-set drop empties the set, read back via PR_CAPBSET_READ (needs root)" {
     if (linux.geteuid() != 0) return error.SkipZigTest;
     const res = try runInChild(childDropBoundingSet);
-    try testing.expect(res.exitedWith(0));
+    try testing.expectEqual(@as(u32, 0), res.status);
 }
 
 // clearCapabilities zeros a set the calling process already holds (or lacks),

@@ -173,7 +173,12 @@ bites at the cap with EMFILE and cannot be raised back; `RLIMIT_CORE` read back 
 `SkipZigTest` otherwise: privilege drop (drops to `nobody`, asserts uid AND gid AND saved uid, and
 that `setuid(0)`/`setgid(0)` fail) and capability bounding-set drop — ⚠ in an unprivileged run
 these two are inert, so the setuid-before-setgid hole is NOT caught by the ordinary gate; a
-privileged lane is the only cure. Pure/logic tests cover the BPF program shape for `build` AND
+privileged lane is the only cure, and it exists: `scripts/vm/run.sh sandbox` runs the suite as real
+root in a disposable guest (2026-09-15: 35 pass, and seven drop/bounding-set mutants each fail
+there). The typed failure branches no healthy kernel takes (`install`/`installTsync` errno,
+Landlock ENOSYS/EOPNOTSUPP) are driven by a seccomp pre-filter that makes the real syscall return
+that errno, in every ordinary run. `run.sh sandbox debian --kernel-append lsm=apparmor` also checks
+`error.Disabled` against a kernel without the Landlock LSM. Pure/logic tests cover the BPF program shape for `build` AND
 `buildWx` (arch guard including its jump targets, per-syscall compare, W^X block layout, allow/deny
 leaves, descending `jt`), the default allow-list's named content, `Action.errno` bounds, struct ABI
 sizes, and the monotone Landlock access mask. Run:
