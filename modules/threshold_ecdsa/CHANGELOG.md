@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** A1 R1. The ctgrind harness
+  (`src/ctgrind_harness.zig`, never part of the library build) gains a `betaprime` target that
+  taints Bob's 160-byte MtA blind `β'`, and `scripts/ctgrind-expected.tsv` gains its row. No
+  library source changed. The row is RED on purpose: `zkproofs.mulAddBytes`'s carry tail
+  branches on secret-derived sums (A1 R2).
 - **2026-09-16** — **ADDITIVE:** audit F6. `signing.signWithSharesOptions(allocator, shares, message,
   random, options)` with `SignOptions{ .pair_threads, .pair_scratch_bytes }` runs Phase 3's
   `t(t−1)` ordered-pair MtA/MtAwc conversions on OS threads. Each pair gets its own ChaCha seed
