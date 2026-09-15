@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (prover performance):** audit
+  finding B9. The prover's constant-time MSMs (`A`, `S`, every IPA `L`/`R`)
+  ran one full ladder per term; `multiScalarMul` now calls
+  `ct25519.mulMultiRistretto`, Straus's interleaved window with the doublings
+  shared across terms — still constant-time in every scalar, zero included.
+  Same group element as the old loop, which is kept verbatim as the
+  reference of the new `B9 diff` test; the `ipa` ctgrind output digest is
+  unchanged. ReleaseFast A/B: `prove` n=64 47.3 → 34.6 ms (1.37×), n=32
+  23.4 → 15.7 ms (1.50×); `verify` (untouched) 0.99×/1.00×.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (verifier performance):**
   audit finding B8. `verify` no longer materialises the rescaled generators
   `h'_i = y^{-i}*H_i` — `n` constant-time ladders over data with no secret in

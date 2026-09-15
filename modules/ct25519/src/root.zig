@@ -190,13 +190,140 @@ pub fn mul(p: Edwards25519, s: [32]u8) Edwards25519 {
     return q;
 }
 
-/// `s * B` on Edwards25519 against the fixed base point — `mul` with the
-/// comptime table, spelled out so callers do not have to rely on
-/// `basePoint.is_base` being set.
+// ── fixed-base comb (audit C3, a DECISIONS.md P5 algorithm change) ────────
+//
+// `mul(basePoint, s)` spends 71 % of its time in 252 doublings (audit C3:
+// 34.4 of 48.2 µs), because the base point runs the same 16-entry window
+// ladder as an arbitrary point. `mulBase`/`mulRistrettoBase` instead use the
+// fixed-base comb of Bernstein, Duif, Lange, Schwabe and Yang, "High-speed
+// high-security signatures" (CHES 2011, J. Cryptogr. Eng. 2012) §4 — the
+// algorithm of ref10's `ge_scalarmult_base`, which libsodium ships as
+// `ge25519_scalarmult_base`:
+//
+//   * recode `s` into signed radix-16 digits `e[0..64]`, each in `[-8, 7]`,
+//     so `s = Σ e[i]·16^i + carry·16^64`;
+//   * `comb_table[j][k] = (k+1)·16^(2j)·B` for `j < 32`, `k < 8`;
+//   * `q = Σ_{i odd} e[i]·16^(i-1)·B`, then `q = 16·q` (4 doublings), then
+//     add `Σ_{i even} e[i]·16^i·B` — 64 additions and 4 doublings instead of
+//     64 additions and 252 doublings.
+//
+// ⚠ ONE DELIBERATE DIFFERENCE FROM ref10. ref10 requires `s[31] <= 127` (its
+// top digit absorbs the carry and must stay in `[-8, 8]`). This module's
+// contract is that **all 256 bits are read** (see `mul`), so the carry out of
+// digit 63 is kept as its own secret bit and one extra, always-performed add
+// selects between the identity and the constant `2^256·B` (`comb_carry`).
+//
+// Constant time: the digit loop runs 64 times whatever `s` is; the digit
+// recoding is shift/mask arithmetic; each table row is gathered by a
+// full-row `cMov` scan (the same mask shape as `pcSelect`) and the sign by a
+// `cMov` onto the negated coordinates; the carry add is unconditional.
+// Table indices are loop counters only. The source is not the evidence —
+// `ctgrind_harness.zig`'s `comb` target is (SPEC.md § "C3").
+
+const comb_rows = 32;
+const comb_teeth = 8;
+const CombTable = [comb_rows][comb_teeth]Edwards25519;
+
+/// `[j][k] = (k+1)·16^(2j)·B`, extended coordinates, folded at comptime —
+/// plus `2^256·B` for the recoding carry. 32·(7 multiples + 8 doublings to
+/// the next row) ≈ 480 point operations at comptime, the same shape as
+/// `k256`'s and `p256`'s `buildCombTable`.
+const comb = blk: {
+    @setEvalBranchQuota(100_000_000);
+    var tab: CombTable = undefined;
+    var row_base = Edwards25519.basePoint;
+    row_base.is_base = false;
+    for (0..comb_rows) |j| {
+        tab[j][0] = row_base;
+        for (1..comb_teeth) |k| {
+            const m = k + 1; // multiple held in tab[j][k]
+            tab[j][k] = if (m % 2 == 0) tab[j][m / 2 - 1].dbl() else tab[j][k - 1].add(row_base);
+        }
+        // next row: 256·row_base = 32·(8·row_base)
+        var nb = tab[j][comb_teeth - 1];
+        for (0..5) |_| nb = nb.dbl();
+        row_base = nb;
+    }
+    // After the last row `row_base` is 16^64·B = 2^256·B.
+    break :blk .{ .table = tab, .carry = row_base };
+};
+const comb_table: CombTable = comb.table;
+const comb_carry: Edwards25519 = comb.carry;
+
+/// Signed radix-16 recoding of the full 256-bit `s`: `e[i]` in `[-8, 7]`
+/// and the returned carry in `{0, 1}`, with `s = Σ e[i]·16^i + carry·16^64`.
+/// Branch-free: `x = nibble + carry` is in `0..16`, `(x + 8) >> 4` is 1
+/// exactly when `x >= 8`, and subtracting `16·carry` lands `x` in `[-8, 7]`.
+fn combRecode(s: *const [32]u8, e: *[64]i8) u8 {
+    var carry: u8 = 0;
+    for (e, 0..) |*d, i| {
+        const nibble: u8 = (s[i >> 1] >> @as(u3, @intCast(4 * (i & 1)))) & 15;
+        const x: u8 = nibble + carry; // 0..16
+        carry = (x + 8) >> 4;
+        d.* = @bitCast(x -% (carry << 4));
+    }
+    return carry;
+}
+
+/// `e·row[0]` for a signed digit `e` in `[-8, 8]`, touching every entry of
+/// the row: `|e|` selects by a full `cMov` scan (`|e| == 0` leaves the
+/// identity), then the sign selects `-x`/`-t` by `cMov`. ref10's
+/// `negative`/`babs`/`equal` shape.
+fn combSelect(row: *const [comb_teeth]Edwards25519, e: i8) Edwards25519 {
+    const eu: u8 = @bitCast(e);
+    const neg: u8 = eu >> 7; // 1 iff e < 0
+    const abs: u8 = eu -% ((0 -% neg) & (eu << 1)); // |e|, 0..8
+    var t = Edwards25519.identityElement;
+    comptime var k: u8 = 1;
+    inline while (k <= comb_teeth) : (k += 1) {
+        const c: u64 = ((@as(usize, abs ^ k) -% 1) >> 8) & 1;
+        const entry = &row[k - 1];
+        Fe.cMov(&t.x, entry.x, c);
+        Fe.cMov(&t.y, entry.y, c);
+        Fe.cMov(&t.z, entry.z, c);
+        Fe.cMov(&t.t, entry.t, c);
+    }
+    const minus_x = t.x.neg();
+    const minus_t = t.t.neg();
+    Fe.cMov(&t.x, minus_x, neg);
+    Fe.cMov(&t.t, minus_t, neg);
+    return t;
+}
+
+/// `s·B` by the fixed-base comb; see the section comment above. Every
+/// secret-derived buffer it owns is wiped before return.
+fn combMulBase(s: *const [32]u8) Edwards25519 {
+    var e: [64]i8 = undefined;
+    defer std.crypto.secureZero(i8, &e);
+    var carry = combRecode(s, &e);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&carry));
+
+    var q = Edwards25519.identityElement;
+    var i: usize = 1;
+    while (i < 64) : (i += 2) q = q.add(combSelect(&comb_table[i >> 1], e[i]));
+    q = q.dbl().dbl().dbl().dbl();
+    i = 0;
+    while (i < 64) : (i += 2) q = q.add(combSelect(&comb_table[i >> 1], e[i]));
+
+    var c = Edwards25519.identityElement;
+    const cm: u64 = carry;
+    Fe.cMov(&c.x, comb_carry.x, cm);
+    Fe.cMov(&c.y, comb_carry.y, cm);
+    Fe.cMov(&c.z, comb_carry.z, cm);
+    Fe.cMov(&c.t, comb_carry.t, cm);
+    return q.add(c);
+}
+
+/// `s * B` on Edwards25519 against the fixed base point, **constant-time in
+/// `s` and total** — the same result as `mul(Edwards25519.basePoint, s)` for
+/// every 256-bit `s` (all bits read, no reduction), computed with the
+/// fixed-base comb above instead of the window ladder (audit C3, ~3× faster;
+/// SPEC.md § "C3"). `mul(Edwards25519.basePoint, s)` deliberately stays on
+/// the ladder: it is the reference the comb is differentially tested against.
 pub fn mulBase(s: [32]u8) Edwards25519 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return mul(Edwards25519.basePoint, sc);
+    return combMulBase(&sc);
 }
 
 /// `s * p` over Ristretto255 — `mul` on the underlying Edwards25519 point.
@@ -211,17 +338,86 @@ pub fn mulRistretto(p: Ristretto255, s: [32]u8) Ristretto255 {
     return .{ .p = mul(p.p, sc) };
 }
 
-/// `s * B` over Ristretto255 against the ristretto255 base point.
+/// `s * B` over Ristretto255 against the ristretto255 base point — the
+/// fixed-base comb of `mulBase` (ristretto255's base point IS Edwards25519's,
+/// `Ristretto255.basePoint.p`; pinned by a test below).
 pub fn mulRistrettoBase(s: [32]u8) Ristretto255 {
     var sc = s;
     defer std.crypto.secureZero(u8, &sc);
-    return mulRistretto(Ristretto255.basePoint, sc);
+    return .{ .p = combMulBase(&sc) };
+}
+
+// ── constant-time multi-scalar multiplication (audit `bulletproofs` B9) ───
+//
+// `Σ s_i·P_i` for SECRET scalars over caller-validated points, by Straus's
+// interleaving (E. G. Straus, "Addition chains of vectors", Amer. Math.
+// Monthly 71, 1964) with the same fixed 4-bit window and the same `pcSelect`
+// as `mul`: every term gets its own 16-entry table, and all terms SHARE one
+// chain of doublings — per window, one `pcSelect`+add per term, then four
+// doublings for the whole group. That is the constant-time counterpart of
+// the bucket (Pippenger) method, which is not: bucket membership depends on
+// the scalar digits. It is the shape dalek's `MultiscalarMul` documents as
+// constant-time, implemented here from the description.
+//
+// Cost per term drops from 64 adds + 252 doublings + a 14-operation table to
+// 64 adds + 252/k doublings + the table, for chunks of k terms.
+//
+// Chunking: tables for `msm_chunk` terms live on the stack at once
+// (8 × 16 points ≈ 21.5 KiB), so the function needs no allocator; a longer
+// input is summed chunk by chunk. The chunk count and every loop bound depend
+// on `scalars.len` only — public. Nothing branches on a scalar or on a digit.
+
+/// Terms whose tables are held at once; a stack-size bound, not a tuning knob
+/// the result depends on (any value gives the same point).
+const msm_chunk = 8;
+
+/// `Σ scalars[i]·points[i]` over Ristretto255, **constant-time in every
+/// scalar** and total — the neutral element is a value. Each scalar is used
+/// as-is, all 256 bits, exactly as `mulRistretto` uses it, and the result is
+/// the same group element as the sum of the `mulRistretto` products.
+/// Points are not validated (module doc comment). `scalars.len` must equal
+/// `points.len`; a mismatch is a caller bug and panics — the lengths are
+/// public, but an error union here would be the shape this module refuses.
+pub fn mulMultiRistretto(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
+    if (scalars.len != points.len) @panic("ct25519.mulMultiRistretto: scalars.len != points.len");
+    var total = Edwards25519.identityElement;
+    var start: usize = 0;
+    while (start < scalars.len) {
+        const k = @min(msm_chunk, scalars.len - start);
+        total = total.add(strausChunk(scalars[start..][0..k], points[start..][0..k]));
+        start += k;
+    }
+    return .{ .p = total };
+}
+
+/// One Straus pass over at most `msm_chunk` terms.
+fn strausChunk(scalars: []const [32]u8, points: []const Ristretto255) Edwards25519 {
+    var tabs: [msm_chunk][16]Edwards25519 = undefined;
+    for (tabs[0..points.len], points) |*t, p| {
+        t.* = if (p.p.is_base) base_pc else precompute(p.p); // branch on a PUBLIC flag
+    }
+    var q = Edwards25519.identityElement;
+    var pos: usize = 252;
+    while (true) : (pos -= 4) {
+        for (tabs[0..scalars.len], scalars) |*t, *s| {
+            const slot: u4 = @truncate(s[pos >> 3] >> @as(u3, @truncate(pos)));
+            q = q.add(pcSelect(t, slot));
+        }
+        if (pos == 0) break;
+        q = q.dbl().dbl().dbl().dbl();
+    }
+    return q;
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 const scalar = Edwards25519.scalar;
+
+test {
+    // Opt-in micro-benchmark (audit C9); skips unless CT25519_BENCH is set.
+    _ = @import("bench.zig");
+}
 
 /// Deterministic scalars — this module has no RNG and its tests must be
 /// reproducible, so the "random" scalars are a SHA-512 stream reduced mod L.
@@ -410,6 +606,212 @@ test "mulBase/mulRistrettoBase take the comptime base table, and both table path
         const s = nthScalar(i +% 7_000);
         try testing.expectEqualSlices(u8, &mulBase(s).toBytes(), &mul(b, s).toBytes());
     }
+}
+
+// ── C3 comb: P5 evidence 1 + 2 (bit-exact KAT set and randomized
+// differential against the pre-C3 algorithm). The reference is
+// `mul(Edwards25519.basePoint, s)` / `mulRistretto(Ristretto255.basePoint, s)`:
+// that is, byte for byte, the ladder `mulBase`/`mulRistrettoBase` ran before
+// C3 (`git show 74645800:modules/ct25519/src/root.zig`), and it stays in the
+// module exactly so this comparison never loses its oracle. Every comparison
+// is on the canonical 32-byte encoding.
+
+fn expectCombMatchesLadder(s: [32]u8) !void {
+    try testing.expectEqualSlices(
+        u8,
+        &mul(Edwards25519.basePoint, s).toBytes(),
+        &mulBase(s).toBytes(),
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &mulRistretto(Ristretto255.basePoint, s).toBytes(),
+        &mulRistrettoBase(s).toBytes(),
+    );
+}
+
+test "C3 comb: every nibble value at every position vs the ladder (all 256 table entries, both signs, every carry)" {
+    // `v·16^pos` for pos 0..63, v 0..15. v in 1..7 selects `+tab[pos/2][v-1]`;
+    // v in 8..15 recodes to `-(16-v)` (magnitudes 8..1, the negative half)
+    // with a carry into pos+1 — or, at pos 63, into `comb_carry`. Odd `pos`
+    // go through the doubling pass, even ones do not. So this set reaches
+    // every entry of `comb_table` with both signs and the carry point.
+    var n: usize = 0;
+    for (0..64) |pos| {
+        for (0..16) |v| {
+            var s = [_]u8{0} ** 32;
+            s[pos >> 1] = @as(u8, @intCast(v)) << @as(u3, @intCast(4 * (pos & 1)));
+            try expectCombMatchesLadder(s);
+            n += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1024), n);
+}
+
+test "C3 comb: carry-chain and boundary scalars vs the ladder" {
+    var order: [32]u8 = undefined;
+    std.mem.writeInt(u256, &order, scalar.field_order, .little);
+    const L: u256 = scalar.field_order;
+    const ints = [_]u256{
+        0, 1, 2, 7, 8, 9, 15, 16, 17,
+        L - 1,          L,              L + 1,    2 * L,          ~L +% 1, // 2^256 - L
+        1 << 252,       (1 << 252) - 1, 1 << 253, (1 << 255) - 1, 1 << 255,
+        (1 << 255) + 1,
+        ~@as(u256, 0), // 2^256 - 1: all 64 digits carry
+        ~@as(u256, 0) - 1,
+        0x8888888888888888888888888888888888888888888888888888888888888888, // every digit -8, carry ripples through all 64
+        0x7777777777777777777777777777777777777777777777777777777777777777, // every digit +7, no carry
+        0x7878787878787878787878787878787878787878787878787878787878787878,
+        0x8787878787878787878787878787878787878787878787878787878787878787,
+        0xf0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0,
+        0x0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f,
+        0x8000000000000000000000000000000000000000000000000000000000000000,
+        0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff,
+        0x0000000000000000000000000000000000000000000000000000000000000008,
+        0x00000000000000000000000000000000ffffffffffffffffffffffffffffffff,
+        0xffffffffffffffffffffffffffffffff00000000000000000000000000000000,
+    };
+    for (ints) |x| {
+        var s: [32]u8 = undefined;
+        std.mem.writeInt(u256, &s, x, .little);
+        try expectCombMatchesLadder(s);
+    }
+    try testing.expectEqualSlices(u8, &order, &blk: {
+        var s: [32]u8 = undefined;
+        std.mem.writeInt(u256, &s, ints[10], .little);
+        break :blk s;
+    });
+}
+
+test "C3 comb: randomized differential vs the ladder (full 256-bit and reduced scalars)" {
+    // Debug is ~50x slower per multiply; the ReleaseFast lane carries the volume.
+    const count: usize = if (@import("builtin").mode == .Debug) 200 else 20_000;
+    var prng = std.Random.DefaultPrng.init(0xC3_C0_4B_25_51_9E);
+    const random = prng.random();
+    for (0..count) |i| {
+        var s: [32]u8 = undefined;
+        random.bytes(&s); // unreduced, all 256 bits live
+        if (i % 2 == 1) s = scalar.reduce(s);
+        try expectCombMatchesLadder(s);
+    }
+}
+
+test "C3 comb: the recoding reconstructs every 256-bit scalar, digits in [-8, 7]" {
+    // Isolates `combRecode` from the table: a recoding fault that happens to
+    // cancel in the point arithmetic still shows up here as an integer.
+    var prng = std.Random.DefaultPrng.init(0x5EC0DE);
+    const random = prng.random();
+    const fixed = [_]u256{ 0, ~@as(u256, 0), 0x8888888888888888888888888888888888888888888888888888888888888888 };
+    for (0..2000 + fixed.len) |i| {
+        var s: [32]u8 = undefined;
+        if (i < fixed.len) std.mem.writeInt(u256, &s, fixed[i], .little) else random.bytes(&s);
+        var e: [64]i8 = undefined;
+        const carry = combRecode(&s, &e);
+        try testing.expect(carry <= 1);
+        var acc: i512 = @as(i512, carry) << 256;
+        var k: usize = 64;
+        while (k > 0) {
+            k -= 1;
+            try testing.expect(e[k] >= -8 and e[k] <= 7);
+            acc += @as(i512, e[k]) << @as(u9, @intCast(4 * k));
+        }
+        try testing.expectEqual(@as(i512, std.mem.readInt(u256, &s, .little)), acc);
+    }
+}
+
+test "C3 comb: the table holds (k+1)·16^(2j)·B and the carry point is 2^256·B" {
+    // Independent of the comb's evaluation order: each entry against the
+    // ladder on the scalar it claims to be. 2^256·B has no 32-byte scalar, so
+    // it is checked as 16·(2^252·B), i.e. four doublings of a ladder result.
+    for (0..comb_rows) |j| {
+        for (0..comb_teeth) |k| {
+            var s = [_]u8{0} ** 32;
+            s[j] = @intCast(k + 1); // byte j = 16^(2j)
+            try testing.expectEqualSlices(u8, &mul(Edwards25519.basePoint, s).toBytes(), &comb_table[j][k].toBytes());
+        }
+    }
+    var s252 = [_]u8{0} ** 32;
+    s252[31] = 0x10;
+    const want = mul(Edwards25519.basePoint, s252).dbl().dbl().dbl().dbl();
+    try testing.expectEqualSlices(u8, &want.toBytes(), &comb_carry.toBytes());
+    // ristretto255's base point is Edwards25519's, which `mulRistrettoBase`
+    // relies on when it calls the Edwards comb.
+    try testing.expectEqualSlices(u8, &Edwards25519.basePoint.toBytes(), &Ristretto255.basePoint.p.toBytes());
+}
+
+// ── B9 MSM: P5 evidence 1 + 2 against the loop it replaces ───────────────
+// The reference is the sum of `mulRistretto` products — exactly what
+// `bulletproofs`' `multiScalarMul` computed before B9, one ladder per term.
+
+fn naiveMulMulti(scalars: []const [32]u8, points: []const Ristretto255) Ristretto255 {
+    var acc = Edwards25519.identityElement;
+    for (scalars, points) |s, p| acc = acc.add(mulRistretto(p, s).p);
+    return .{ .p = acc };
+}
+
+fn edgeScalar(i: usize) [32]u8 {
+    var s: [32]u8 = undefined;
+    const L: u256 = scalar.field_order;
+    const v: u256 = switch (i % 6) {
+        0 => 0,
+        1 => 1,
+        2 => L - 1,
+        3 => L,
+        4 => ~@as(u256, 0),
+        else => 0x8888888888888888888888888888888888888888888888888888888888888888,
+    };
+    std.mem.writeInt(u256, &s, v, .little);
+    return s;
+}
+
+test "B9 mulMultiRistretto: bit-exact vs the per-term ladder sum across every chunk boundary" {
+    const debug = @import("builtin").mode == .Debug;
+    const sizes = [_]usize{ 0, 1, 2, 7, 8, 9, 15, 16, 17, 24, 33, 64 };
+    const trials: usize = if (debug) 2 else 40;
+    var prng = std.Random.DefaultPrng.init(0xB9_5_7A_05);
+    const random = prng.random();
+    var scalars: [64][32]u8 = undefined;
+    var points: [64]Ristretto255 = undefined;
+    var compared: usize = 0;
+    for (sizes) |n| {
+        if (debug and n > 17) continue;
+        for (0..trials) |trial| {
+            for (0..n) |i| {
+                // mix raw 256-bit, reduced and edge scalars
+                random.bytes(&scalars[i]);
+                if ((i + trial) % 3 == 1) scalars[i] = scalar.reduce(scalars[i]);
+                if ((i + trial) % 5 == 2) scalars[i] = edgeScalar(i + trial);
+                // mix random multiples, the flagged base point, a decoded (unflagged)
+                // base point and the identity
+                points[i] = switch ((i + 2 * trial) % 7) {
+                    0 => Ristretto255.basePoint,
+                    1 => .{ .p = Edwards25519.identityElement },
+                    2 => try Ristretto255.fromBytes(Ristretto255.basePoint.toBytes()),
+                    else => blk: {
+                        var k: [64]u8 = undefined;
+                        random.bytes(&k);
+                        break :blk .{ .p = mulBase(scalar.reduce64(k)) };
+                    },
+                };
+            }
+            const want = naiveMulMulti(scalars[0..n], points[0..n]);
+            const got = mulMultiRistretto(scalars[0..n], points[0..n]);
+            try testing.expectEqualSlices(u8, &want.toBytes(), &got.toBytes());
+            compared += 1;
+        }
+    }
+    try testing.expect(compared >= if (debug) 18 else 480);
+}
+
+test "B9 mulMultiRistretto: one term equals mulRistretto; zero terms are the identity; no error set" {
+    const zero = [_]u8{0} ** 32;
+    try testing.expectEqualSlices(u8, &zero, &mulMultiRistretto(&.{}, &.{}).toBytes());
+    const p = try Ristretto255.fromBytes(Ristretto255.basePoint.toBytes());
+    for (0..6) |i| {
+        const s = edgeScalar(i);
+        try testing.expectEqualSlices(u8, &mulRistretto(p, s).toBytes(), &mulMultiRistretto(&.{s}, &.{p}).toBytes());
+    }
+    const ret = @typeInfo(@TypeOf(mulMultiRistretto)).@"fn".return_type.?;
+    try testing.expect(@typeInfo(ret) != .error_union);
 }
 
 test "mul: is additively homomorphic in the scalar (fold-boundary sanity)" {

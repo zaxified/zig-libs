@@ -175,6 +175,49 @@ down, the change was made under `DECISIONS.md` P5. The four items it asks for:
    output, so the suite cannot reach `y == 0`. That is the reason the code
    does not rely on it.
 
+### B9 — the prover's MSMs share their doublings (a P5 algorithm change)
+
+`scalarvec.multiScalarMul` — every prover MSM over secret scalars (`A`, `S`,
+each IPA round's `L`/`R`) — was one full constant-time ladder per term, and
+this module's audit disposition F1 called that "a documented by-design
+boundary, not a residual gap". It was not a boundary: constant time forbids
+a digit-dependent schedule, not shared doublings. Since 2026-09-16 the body is
+`ct25519.mulMultiRistretto`, Straus's interleaved fixed window, where all terms
+share one chain of doublings and every term still pays exactly one `pcSelect`
+and one add per window whatever its scalar (zero included). The length check
+stays here and still returns `error.LengthMismatch`. The primitive, its
+technique and its evidence live in `ct25519`'s `SPEC.md` § B9; this module's
+side of the four P5 items:
+
+1. **Bit-identical to the previous implementation.** `scalarvec.zig`'s
+   `B9 diff` test keeps the pre-B9 body verbatim (`multiScalarMulPreB9`) and
+   compares canonical bytes at n = 0, 1, 2, 3, 4, 7, 8, 9, 16, 17, 32, 33, 64,
+   65, with zero and one scalars mixed into every vector. End to end, the
+   `ipa` ctgrind row's pinned output digest — which depends on every `L`/`R`
+   through the transcript — is unchanged.
+2. **Randomized differential.** 25 random vectors per size in optimized
+   builds (≥ 350 comparisons), 1 in Debug.
+3. **ctgrind.** The `rangeproof` and `ipa` rows stay at 0 in-file
+   (8 / 0 / 8 / 0 and 4 / 0 / 4 / 0), controls and traps 0; `ct25519`'s new
+   `msm` target measures the primitive itself, with a positive control.
+   Both rows here fingerprint `scalarvec.zig`, so they need the end-of-campaign
+   re-pin (they already did, for B8).
+4. **The number.** A/B against this module's sources at `bf7997ce`, one
+   process, ReleaseFast, CPU time, 9 interleaved rounds, median µs:
+   `prove` n=32 23 442 → 15 672 (**1.50×**, paired 1.40..1.85); n=64
+   47 342 → 34 550 (**1.37×**, paired 1.24..1.84); the MSM alone at n=64
+   3 429 → 1 397 (2.45×); `verify`, which B9 does not touch, 1.00× and 0.99×
+   as the control on a shared machine. For both widths the slowest new
+   round beat the fastest old one. The rest of `prove` (the `h'` rescaling,
+   inner products, hashing) is unchanged, which is why the proof gains less
+   than the MSM. Why it outweighs the change: the prover's dominant cost
+   drops without giving up the constant time the old loop was kept for, and
+   `multiScalarMul` is held byte-exact to that loop. Seven mutants of the
+   primitive and its wiring all turn the differentials RED (every term on the
+   first table, three shared doublings, trailing chunk skipped, chunk result
+   overwriting the total, every term on the base table, window shifted one
+   bit, the wire dropping the last term); chunk sizes 5 and 1 stay GREEN.
+
 ## Generators (`generators.zig`) — NUMS derivation
 
 `SHA-512(domain || label || suffix) -> Ristretto255.fromUniform`. See

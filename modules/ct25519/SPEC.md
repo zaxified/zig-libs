@@ -9,10 +9,15 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
 ## Design
 
 - **Source of truth**: `std.crypto.ecc.Edwards25519`'s own constant-time
-  ladder. This module is not a new algorithm and must never become one — it
-  is std's `pcMul16` with exactly one thing removed. Anything else that
-  diverges from std is a bug in this module, and the differential tests exist
-  to say so.
+  ladder. `mul`/`mulRistretto` are not a new algorithm and must never become
+  one — they are std's `pcMul16` with exactly one thing removed. Anything else
+  that diverges from std is a bug in this module, and the differential tests
+  exist to say so.
+  ⚠ **One documented exception, since 2026-09-16:** `mulBase` and
+  `mulRistrettoBase` use a fixed-base comb instead of the ladder (audit C3),
+  admitted under `DECISIONS.md` P5 with the evidence in § "C3 — the base point
+  uses a fixed-base comb" below. `mul(Edwards25519.basePoint, s)` is still the
+  ladder, and it is the comb's reference.
 - **std recon (confirmed against `lib/std/crypto/25519/edwards25519.zig`,
   0.16.0)**:
   - `mul(p, s)` is `pc = if (p.is_base) basePointPc else precompute(p, 15)`
@@ -49,6 +54,196 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
   bits 252..255, so `mul(P, s)` is `s·P` for the full 256-bit integer `s`,
   not for `s mod L`. A caller that needs the reduced value reduces first
   (`scalar.reduce`/`reduce64`), exactly as it must for std.
+
+## C3 — the base point uses a fixed-base comb (a `DECISIONS.md` P5 change)
+
+**Why.** `mulBase` was `mul(basePoint, s)`: 64 window additions and **252
+doublings** over a 16-entry table, 71 % of its time in the doublings, 2.81×
+libsodium's base multiply (audit C3, 52.5 vs 18.7 µs). Five modules pay it —
+`ecvrf` (`publicKey`, the nonce commitment `k·B`), `signal` (XEdDSA key point
+and nonce), `voprf` (`skS·B`, POPRF tweak), `opaque` through `voprf`.
+
+**Technique and source.** The fixed-base comb of Bernstein, Duif, Lange,
+Schwabe, Yang, "High-speed high-security signatures" (J. Cryptogr. Eng. 2012)
+§4, i.e. ref10's `ge_scalarmult_base` and libsodium's
+`ge25519_scalarmult_base`, implemented from that description:
+
+- `s` is recoded into signed radix-16 digits `e[0..64]` in `[-8, 7]`
+  (`combRecode`: `x = nibble + carry`, `carry = (x + 8) >> 4`,
+  `e = x − 16·carry`), so `s = Σ e[i]·16^i + carry·16^64`;
+- `comb_table[j][k] = (k+1)·16^(2j)·B`, 32×8 points in extended coordinates,
+  folded at comptime from std's `add`/`dbl` (~480 operations);
+- `q = Σ_{i odd} e[i]·16^(i−1)·B`, four doublings, then `+ Σ_{i even}
+  e[i]·16^i·B`: **64 additions and 4 doublings**.
+- ⚠ **Deviation from ref10, deliberate.** ref10 requires `s[31] ≤ 127` so its
+  top digit can absorb the carry. This module reads all 256 bits (the `mul`
+  contract), so the carry out of digit 63 stays a secret bit and one extra,
+  always-performed add selects `2^256·B` (`comb_carry`) or the identity by
+  `cMov`.
+
+Constant-time shape: 64 digit iterations whatever `s` is; recoding by
+shift/mask; each row gathered by a full 8-entry `cMov` scan (the `pcSelect`
+mask) and the sign by `cMov` onto `−x`/`−t`; table indices are loop counters.
+That is the design, not the evidence — evidence 3 is.
+
+**The four P5 pieces of evidence** (all in-tree; numbers from 2026-09-16,
+zig 0.16.0, valgrind 3.26.0, x86_64):
+
+1. **Bit-exact KAT set against the previous implementation.** The reference is
+   `mul(Edwards25519.basePoint, s)` / `mulRistretto(Ristretto255.basePoint, s)`
+   — byte for byte the pre-C3 `mulBase`/`mulRistrettoBase` — compared on the
+   canonical encoding, both groups:
+   - every nibble value 0..15 at every position 0..63 (1 024 scalars): reaches
+     all 256 table entries with both signs, every carry, and the carry point;
+   - 33 boundary and carry-chain scalars (`0`, `L−1`, `L`, `L+1`, `2L`,
+     `2^256−L`, `2^252`, `2^255±1`, `2^256−1`, all-`0x88` where the carry
+     ripples through all 64 digits, all-`0x77`, alternating patterns, …);
+   - the RFC 8032 §7.1 public keys (existing external anchor) now run through
+     the comb;
+   - the table itself entry by entry against the ladder, and `comb_carry`
+     against `16·(2^252·B)`; the recoding against integer reconstruction of
+     2 003 scalars with the digit range asserted.
+2. **Randomized differential** against the same reference: 20 000 scalars in
+   the ReleaseFast lane (200 in Debug), half raw 256-bit, half reduced.
+   **Teeth, measured** (`-Dtest-filter=C3`, each mutant compiled, `N fail`
+   read from the run line): recoding digit range shifted (M1) — output
+   equivalent, since digits in `[-7, 8]` are still covered by the table, and
+   caught only by the recoding test, 1 fail; x not negated, t not negated,
+   3 doublings instead of 4, carry add dropped, odd pass reads the wrong row,
+   magnitude 8 never selected, wrong `|e|`, next table row ×128, odd/even
+   nibble swapped, carry bit never selects (M2–M11) — **3 or 4 fail each,
+   10/10 RED**; two correct rewrites (carry by compare, table by additions
+   only) **GREEN**.
+3. **ctgrind target.** `ctgrind_harness.zig` gained `comb` (`mulBase`),
+   `ladderbase` (`mul(basePoint, s)`, the pre-C3 path) and `ladder` (a point
+   decoded at run time, audit C4); `ct25519` (`mulRistrettoBase`) now also
+   measures the comb. ReleaseFast, `-fvalgrind`, tainted scalar:
+
+   | target | total | in `root.zig` | witness | unattr | printed result |
+   |---|---|---|---|---|---|
+   | `ct25519` (comb, ristretto) | 2 | **0** | 2 | 0 | `7a9899…5226`, digest unchanged from the pre-C3 pin |
+   | `comb` | 2 | **0** | 2 | 0 | `5c412d…3936` |
+   | `ladderbase` | 2 | **0** | 2 | 0 | `5c412d…3936` (= `comb`) |
+   | `ladder` (runtime table) | 2 | **0** | 2 | 0 | `7a9899…5226` (= `ct25519`) |
+   | `std` (negative control) | 3 | 1 in std | 2 | 0 | |
+
+   Untainted controls and no-`-fvalgrind` traps 0 on every target; both
+   witness contexts on every row are `Io.Writer.printHex` under the harness's
+   final print. **Positive controls on the comb** (mutated `root.zig`, then
+   restored and cmp-verified): a branch on the recoding carry →
+   `comb` and `ct25519` **3 / 1 in-file**, the new context at the mutated
+   line; a secret-indexed row read (`if (abs != 0) t = row[abs − 1]`) →
+   **8 / 6 in-file**. In both, `ladderbase` and `ladder` stay at 0 — the
+   targets localise.
+4. **This section**, with the A/B below and why the gain outweighs the new
+   code.
+
+**A/B, ReleaseFast** — one process, pre-C3 `root.zig` (`74645800`) against the
+tree, 9 interleaved rounds with alternating order, CPU time, µs/op, median
+[min..max]:
+
+| operation | before | after | median | paired ratio |
+|---|---|---|---|---|
+| `mulBase` | 56.3 [55.1..58.5] | 21.5 [20.6..22.5] | **2.62×** | 2.57..2.71 |
+| `mulRistrettoBase` | 55.8 [54.7..56.9] | 21.8 [21.4..22.2] | **2.56×** | 2.50..2.61 |
+| `mulRistretto`, runtime point (unchanged — control) | 58.3 [57.5..59.6] | 57.9 [57.0..58.6] | 1.01× | 0.99..1.03 |
+| `ecvrf` `KeyPair.prove` | 193.8 [189.4..233.1] | 160.3 [159.4..176.6] | **1.21×** | 1.10..1.46 |
+
+The control pair sitting at 1.01× says the machine did not drift across the
+run. `KeyPair.prove` does one base multiply (`k·B`); the rest is two ladder
+multiplies over `H` and hashing.
+
+**Why the gain outweighs the new code.** 2.6× on the one operation every
+secret-key derivation and every Schnorr-style nonce commitment in five modules
+performs, with no change to the contract (constant-time, total, all 256 bits,
+no error union, same result on every input) and the old algorithm kept in the
+module as a standing oracle. The cost is ~41 KiB of comptime-folded rodata, a
+recoding step with no std counterpart, and one more path the ctgrind gate has
+to measure — which it now does, with a positive control that fires.
+
+`src/bench.zig` (`CT25519_BENCH=1 scripts/modtest ct25519
+-Doptimize=ReleaseFast`) re-runs the same pairs in-module (audit C9).
+
+## B9 — constant-time multi-scalar multiplication (a `DECISIONS.md` P5 addition)
+
+**Why.** `bulletproofs`' prover sums `Σ s_i·P_i` over SECRET witness and
+blinding scalars (`A`, `S`, every IPA round's `L`/`R`). It did that as one
+full `mulRistretto` per term — 252 doublings per term — and its SPEC called
+that "a documented by-design boundary" because the fast bucket (Pippenger)
+method branches on digits. Audit `bulletproofs` B9 measured the dilemma as
+false: dalek's constant-time `MultiscalarMul` is 2.45× the per-term loop at
+n = 64.
+
+**Technique and source.** Straus's interleaving (E. G. Straus, "Addition
+chains of vectors", Amer. Math. Monthly 71, 1964) with this module's own
+4-bit fixed window and `pcSelect`: every term keeps its 16-entry table, and
+all terms share ONE chain of doublings — per window, one `pcSelect`+add per
+term, then four doublings for the group. No digit decides whether an add
+happens or which bucket it lands in, which is what makes it constant-time
+where Pippenger is not. Implemented from that description.
+`mulMultiRistretto(scalars, points)`; terms are processed in chunks of
+`msm_chunk = 8` so the tables (≈ 21.5 KiB) live on the stack and no allocator
+is needed. Chunking changes nothing in the result (the chunk-size mutants
+below are green) and depends only on `scalars.len`, which is public. A length
+mismatch panics: an error union is the shape this module refuses, and
+`bulletproofs` checks the lengths before calling.
+
+**The four P5 pieces of evidence:**
+
+1. **Bit-exact against the loop it replaces.** The reference is the sum of
+   `mulRistretto` products, i.e. the pre-B9 `bulletproofs.multiScalarMul`,
+   compared on the canonical encoding at n = 0, 1, 2, 7, 8, 9, 15, 16, 17, 24,
+   33, 64 (every chunk boundary; Debug stops at 17) with raw 256-bit, reduced
+   and edge scalars (`0`, `1`, `L−1`, `L`, `2^256−1`, all-`0x88`) and the
+   flagged base point, an unflagged decoded base point, the identity and
+   random points; plus one term against `mulRistretto` for every edge scalar,
+   and zero terms against the identity. `bulletproofs`' own
+   `B9 diff` test holds its `multiScalarMul` to the verbatim pre-B9 body.
+2. **Randomized differential**, the same tests: 40 trials per size in
+   ReleaseFast (480 comparisons), 2 in Debug; `bulletproofs` 25 per size
+   (350) with zero and one witness scalars mixed in. **Teeth, measured**
+   (`-Dtest-filter=B9`, Debug, every mutant compiled, `N failed` read from
+   the build summary): every term reads the first table; three shared
+   doublings per window; the trailing partial chunk skipped; a chunk's result
+   overwriting the running total; every term on the base-point table; the
+   window nibble shifted one bit; and, in `bulletproofs`, the wire dropping
+   the last term — **7/7 RED**. Chunk sizes 5 and 1 (the latter is the
+   per-term ladder again) — **GREEN**, as they must be.
+3. **ctgrind target `msm`** — 9 terms (a full chunk plus one), every scalar
+   derived from the tainted secret, public runtime points. ReleaseFast:
+   **2 total / 0 in `root.zig` / 2 witness / 0 unattr**, untainted control
+   and no-`-fvalgrind` trap 0. **Positive control:** replacing the
+   `pcSelect` add with `if (slot != 0) q = q.add(t[slot])` → **2 in-file,
+   on the mutated line** (and its caller), every other target unchanged.
+   In `bulletproofs`' own gate the `rangeproof` (8 / 0 / 8 / 0) and `ipa`
+   (4 / 0 / 4 / 0) rows stay at 0 in-file with B9 in the prover, and `ipa`'s
+   pinned output digest still matches — the IPA transcript, which hashes
+   every `L`/`R`, is byte-identical.
+4. **This section**, with the A/B:
+
+   A/B ReleaseFast, one process, 9 interleaved rounds with alternating
+   order, CPU time, µs, median [min..max]; `bulletproofs` old = its sources
+   at `bf7997ce` (per-term MSM), new = the tree, both over this module; the
+   machine was shared (load 3.6–4.2), which is why the untouched `verify`
+   rides along as the control:
+
+   | operation | before | after | median | paired ratio |
+   |---|---|---|---|---|
+   | MSM, n = 64 (per-term `mulRistretto` sum vs `mulMultiRistretto`) | 3 429 [3 368..3 966] | 1 397 [1 368..1 430] | **2.45×** | 2.36..2.83 |
+   | `bulletproofs.prove`, n = 32 | 23 442 [23 214..29 028] | 15 672 [15 551..16 614] | **1.50×** | 1.40..1.85 |
+   | `bulletproofs.prove`, n = 64 | 47 342 [45 726..55 472] | 34 550 [30 090..37 233] | **1.37×** | 1.24..1.84 |
+   | `bulletproofs.verify`, n = 32 (unchanged — control) | 3 510 | 3 503 | 1.00× | 0.95..1.05 |
+   | `bulletproofs.verify`, n = 64 (unchanged — control) | 4 927 | 4 964 | 0.99× | 0.91..1.03 |
+
+   The MSM gain equals the audit's external measurement of dalek's
+   constant-time MSM (2.45× at n = 64). `prove` gains less because it also
+   does `n` generator rescalings (`h'`), the `L`/`R` inner products and
+   hashing, none of which B9 touches. For both `prove` widths the slowest new
+   round is faster than the fastest old one. Why the gain outweighs the new
+   code: one of the two prover hot paths drops by 2.45× without giving up
+   constant time — the property the old loop was kept for — and the new
+   primitive is ~40 lines that reuse `precompute`/`pcSelect` unchanged, held
+   byte-exact to the loop it replaces.
 
 ## Threat model / limits
 
@@ -281,7 +476,10 @@ byte-identical on every input — while `scripts/ctgrind.sh ct25519` catches it
 reason the harness is documented here rather than treated as optional:
 **for this module the valgrind run is not a nicety, it is the only oracle
 for the property the module is named after.** Re-run it after any change to
-`mul`, `pcSelect` or `precompute`.
+`mul`, `pcSelect`, `precompute`, or the comb (`combRecode`, `combSelect`,
+`combMulBase`, the table). The table above predates C3 and covers the two
+original targets; the `comb`, `ladderbase` and `ladder` targets and their
+positive controls are in § "C3 — the base point uses a fixed-base comb".
 
 ## Anchoring
 

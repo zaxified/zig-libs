@@ -91,13 +91,50 @@ fn reloadVolatile(s: *const [32]u8) [32]u8 {
     return out;
 }
 
-const Target = enum { ct25519, std_mul };
+/// `ct25519` — `mulRistrettoBase` (since C3: the fixed-base comb, ristretto
+///   encoding). Kept under its old name so its pinned output digest still
+///   says "same point as before C3".
+/// `std` — std's `Ristretto255.mul`, the negative control.
+/// `comb` — `mulBase`, the fixed-base comb on Edwards25519 (audit C3), the
+///   entry point `ecvrf` and `signal` call.
+/// `ladderbase` — `mul(Edwards25519.basePoint, s)`: the window ladder over the
+///   comptime table, i.e. the pre-C3 `mulBase` that the comb replaced and is
+///   differentially tested against. Prints the same bytes as `comb`.
+/// `ladder` — `mulRistretto` over a point decoded AT RUNTIME, so `precompute`
+///   and `pcSelect` run over a runtime table (audit C4: the path `voprf`,
+///   `opaque` and `bulletproofs` take, which no target measured).
+/// `msm` — `mulMultiRistretto` over 9 terms (one full chunk of 8 plus one),
+///   every scalar derived from the tainted secret, public runtime points
+///   (audit `bulletproofs` B9: the prove-side MSM).
+const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "ct25519")) return .ct25519;
     if (std.mem.eql(u8, s, "std")) return .std_mul;
+    if (std.mem.eql(u8, s, "comb")) return .comb;
+    if (std.mem.eql(u8, s, "ladderbase")) return .ladderbase;
+    if (std.mem.eql(u8, s, "ladder")) return .ladder;
+    if (std.mem.eql(u8, s, "msm")) return .msm;
     return error.UnknownTarget;
+}
+
+/// RFC 9496 Appendix A.1: the encoding of the ristretto255 generator `B`.
+/// Public; read back through a volatile pointer so the decode happens at run
+/// time. A decoded point never carries std's `is_base` flag (checked below),
+/// so `mulRistretto` over it builds its 16-entry table with the runtime
+/// `precompute` — the C4 path — while computing the same product as
+/// `mulRistrettoBase`. The `ladder` row therefore prints the same `result=`
+/// as the `ct25519` row: a comb-versus-runtime-ladder cross-check for free.
+const base_encoding = [32]u8{
+    0xe2, 0xf2, 0xae, 0x0a, 0x6a, 0xbc, 0x4e, 0x71, 0xa8, 0x84, 0xa9, 0x61, 0xc5, 0x00, 0x51, 0x5f,
+    0x58, 0xe3, 0x0b, 0x6a, 0xa5, 0x82, 0xdd, 0x8d, 0xb6, 0xa6, 0x59, 0x45, 0xe0, 0x8d, 0x2d, 0x76,
+};
+
+fn runtimePoint() !Ristretto255 {
+    const p = try Ristretto255.fromBytes(reloadVolatile(&base_encoding));
+    if (p.p.is_base) return error.HarnessPointIsBase; // would measure the comptime table instead
+    return p;
 }
 
 fn parseTaint(s: []const u8) !Taint {
@@ -128,9 +165,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // paths share the same `mul` ladder, so exercising the base-point entry
     // point exercises the same code).
     var out_bytes: [32]u8 = undefined;
+    // Decoded before the switch so the public decode is not inside any
+    // measured arm's own work; only `.ladder` uses it.
+    const var_point = try runtimePoint();
     switch (target) {
         .ct25519 => {
             const q = ct25519.mulRistrettoBase(sec);
+            out_bytes = q.toBytes();
+        },
+        .comb => {
+            const q = ct25519.mulBase(sec);
+            out_bytes = q.toBytes();
+        },
+        .ladderbase => {
+            const q = ct25519.mul(ct25519.Edwards25519.basePoint, sec);
+            out_bytes = q.toBytes();
+        },
+        .ladder => {
+            const q = ct25519.mulRistretto(var_point, sec);
+            out_bytes = q.toBytes();
+        },
+        .msm => {
+            var scalars: [9][32]u8 = undefined;
+            var points: [9]Ristretto255 = undefined;
+            var p = var_point;
+            for (&scalars, &points, 0..) |*sc, *pt, i| {
+                sc.* = sec;
+                sc.*[0] ^= @intCast(i); // still tainted: xor with a constant
+                pt.* = p;
+                p = .{ .p = p.p.dbl().add(var_point.p) }; // public, runtime
+            }
+            const q = ct25519.mulMultiRistretto(&scalars, &points);
             out_bytes = q.toBytes();
         },
         .std_mul => {

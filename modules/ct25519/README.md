@@ -27,8 +27,28 @@ public scalar through std is that this module refuses to have the error
 union std's rejection would force on the caller, not raw speed.
 
 **API.** `mul(p, s)` / `mulBase(s)` on `Edwards25519`, `mulRistretto(p, s)` /
-`mulRistrettoBase(s)` on `Ristretto255`. The base-point table is folded at
-comptime, as std folds its own.
+`mulRistrettoBase(s)` on `Ristretto255`, and `mulMultiRistretto(scalars,
+points)` — `Σ s_i·P_i` for secret scalars by Straus's interleaving: one shared
+chain of doublings instead of one ladder per term, constant-time in every
+scalar, the same group element as summing `mulRistretto` (since 2026-09-16,
+audit `bulletproofs` B9; SPEC.md § B9).
+
+**`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder (since
+2026-09-16, audit C3).** The base point used to run the same 16-entry window
+ladder as any point, spending 71 % of its time in 252 doublings. It now uses
+the signed-radix-16 comb of Bernstein et al., "High-speed high-security
+signatures" §4 (ref10's `ge_scalarmult_base`): a comptime 32×8 table, 64
+additions and 4 doublings. It is still constant-time in `s`, still reads all
+256 bits and is still total — one extra always-performed add of `2^256·B`
+covers the recoding carry that ref10 avoids by requiring `s < 2^255`. This is
+a deliberate exception to "never a new algorithm", taken under
+`DECISIONS.md` P5 with its four pieces of evidence in [SPEC.md](SPEC.md) § C3.
+`mul(Edwards25519.basePoint, s)` stays on the ladder and is the reference the
+comb is tested against. Measured ReleaseFast A/B, same process, 9
+interleaved rounds: `mulBase` 56.3 → 21.5 µs (2.62×), `mulRistrettoBase`
+55.8 → 21.8 µs (2.56×), `ecvrf`'s `KeyPair.prove` 193.8 → 160.3 µs;
+`src/bench.zig` re-runs the pairs (`CT25519_BENCH=1 scripts/modtest ct25519
+-Doptimize=ReleaseFast`).
 
 **`s` is used as-is: all 256 bits are read, not just the low 253.** There is
 no clamping and no reduction mod the group order `L`, exactly like std's own
@@ -73,5 +93,9 @@ before trusting a green `zig build test-ct25519`.
 Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
 `std/crypto/25519/edwards25519.zig` (MIT, part of Zig itself) with the trailing
 identity rejection removed — the algorithm is the textbook 4-bit fixed-window
-scalar multiplication, no third-party source ported, so no `NOTICE` entry is
-required (root [`NOTICE`](../../NOTICE) §0).
+scalar multiplication. The fixed-base comb follows the published description
+in Bernstein, Duif, Lange, Schwabe, Yang, "High-speed high-security
+signatures" (J. Cryptogr. Eng. 2012) §4; its table is generated at comptime
+from std's point operations, not copied from any implementation's table. No
+third-party source ported, so no `NOTICE` entry is required (root
+[`NOTICE`](../../NOTICE) §0).
