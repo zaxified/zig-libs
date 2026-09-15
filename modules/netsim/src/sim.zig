@@ -25,6 +25,7 @@
 //! message-passing network.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const fault = @import("fault.zig");
 const Prng = @import("prng.zig").Prng;
@@ -84,6 +85,31 @@ pub const LogEntry = struct {
         violation,
     };
 };
+
+/// Test-only counter (audit F10 regression guard): how many `LogEntry`
+/// records have actually been stored via `Sim.append` since the last
+/// `resetLogEntriesStoredForTesting()`. A stopwatch is the wrong oracle for
+/// "did a disabled log actually stay empty" -- flaky under full-gate load,
+/// since a defect that makes the two arms cost the SAME (rather than one
+/// costing strictly less) can pass a loose `<=` timing check by luck. This
+/// counts the one thing `want_log` is actually supposed to gate: `Counter`
+/// is `void` outside a test build, so the increment compiles to nothing
+/// there (see `whois`'s `lines_scanned` / `bitcointx`'s `instrument.zig` for
+/// the same pattern elsewhere in this repo).
+const LogStoreCounter = if (builtin.is_test) usize else void;
+const log_store_counter_init: LogStoreCounter = if (builtin.is_test) 0 else {};
+var log_entries_stored_for_testing: LogStoreCounter = log_store_counter_init;
+
+/// Reset the log-store counter. Test builds only.
+pub fn resetLogEntriesStoredForTesting() void {
+    if (builtin.is_test) log_entries_stored_for_testing = 0;
+}
+
+/// Entries actually stored (past the `want_log` gate) since the last reset
+/// (always 0 outside a test build). Test builds only.
+pub fn logEntriesStoredForTesting() usize {
+    return if (builtin.is_test) log_entries_stored_for_testing else 0;
+}
 
 /// Ordered record of everything the engine did, plus a rolling fingerprint of
 /// it (the determinism witness: identical runs ⇒ identical fingerprint & log).
@@ -567,6 +593,7 @@ pub const Sim = struct {
         e.seq = self.nextSeq();
         self.fingerprint = foldFingerprint(self.fingerprint, e);
         if (!self.want_log) return; // audit F10: nothing will ever read this entry
+        if (builtin.is_test) log_entries_stored_for_testing += 1;
         // Best-effort: a log OOM must not corrupt the deterministic fingerprint,
         // which is already folded above.
         self.log.entries.append(self.gpa, e) catch {};

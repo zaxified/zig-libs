@@ -26,6 +26,7 @@
 //! consulted or copied.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const netaddr = @import("netaddr");
 
 pub const meta = .{
@@ -164,10 +165,43 @@ pub const Transport = struct {
 /// bytes is simply discarded as an unparseable referral, not acted on. A
 /// caller reading a field for anything beyond referral-chasing should
 /// validate the value itself.
+///
+/// `lines_scanned` (below) is a test-only counter incremented once per line
+/// this loop visits. A stopwatch is the wrong oracle for a "how many passes
+/// over the response" property — flaky under load (audit F17's original
+/// ns/byte ratio test) — so the regression test counts instead. Outside a
+/// test build `Counter` is `void` and `noteLineScanned` compiles to nothing.
+/// Test-only line-scan counter (audit F17 regression guard). Counts how many
+/// response lines `fieldValue`/`nextServer` visit in total: the defect F17
+/// caught was `nextServer` re-scanning the whole response once PER referral
+/// key (up to 4 full passes) instead of once total, so this is the quantity
+/// that actually distinguishes the two shapes — not wall-clock time, which
+/// is noisy under the load a full-suite gate runs under. `Counter` is `void`
+/// outside a test build, so `noteLineScanned` compiles to nothing there.
+const LineScanCounter = if (builtin.is_test) usize else void;
+const line_scan_counter_init: LineScanCounter = if (builtin.is_test) 0 else {};
+var lines_scanned: LineScanCounter = line_scan_counter_init;
+
+inline fn noteLineScanned() void {
+    if (builtin.is_test) lines_scanned += 1;
+}
+
+/// Reset the line-scan counter. Test builds only.
+pub fn resetLinesScannedForTesting() void {
+    if (builtin.is_test) lines_scanned = 0;
+}
+
+/// Current line-scan count since the last reset (always 0 outside a test
+/// build). Test builds only.
+pub fn linesScannedForTesting() usize {
+    return if (builtin.is_test) lines_scanned else 0;
+}
+
 pub fn fieldValue(response: []const u8, key: []const u8) ?[]const u8 {
     if (key.len == 0) return null;
     var lines = std.mem.splitScalar(u8, response, '\n');
     while (lines.next()) |raw| {
+        noteLineScanned();
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len <= key.len) continue;
         if (!std.ascii.startsWithIgnoreCase(line, key)) continue;
@@ -294,6 +328,7 @@ pub fn nextServer(response: []const u8) ?Referral {
     var values: [referral_keys.len]?[]const u8 = @splat(null);
     var lines = std.mem.splitScalar(u8, response, '\n');
     while (lines.next()) |raw| {
+        noteLineScanned();
         const line = std.mem.trim(u8, raw, " \t\r");
         for (referral_keys, 0..) |key, ki| {
             if (values[ki] != null) continue; // keep the FIRST occurrence, like fieldValue
@@ -1238,45 +1273,53 @@ test "Chain.append refuses past capacity, on its own (audit F8)" {
     try testing.expectEqual(@as(usize, Chain.capacity), chain.count);
 }
 
-test "nextServer: a reply with no referral costs about the same per byte as one that hits (audit F17)" {
+test "nextServer: a reply with no referral scans about the same lines/byte as one that hits (audit F17)" {
     // Before the single-pass rewrite, `nextServer` re-scanned the WHOLE
     // response once per `referral_keys` entry via `fieldValue`: a reply with
     // NO referral at all paid for all four passes, a reply that hits early
-    // (e.g. the third key) paid for three. Audited ratio (ReleaseFast):
-    // 0,635/0,62 ns/byte (no-referral, 4 passes) vs 0,284/0,279 (hits 3rd
-    // key), i.e. the no-referral shape cost ~2,2x the hit shape. A single
-    // pass that tests all four keys per line should cost about the SAME per
-    // byte either way, since both shapes now walk the text exactly once.
-    var threaded = std.Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const no_referral = ("% filler\n" ** 1600); // 14400 bytes, no referral anywhere
+    // (e.g. the third key) paid for fewer. A single pass that tests all four
+    // keys per line visits about the SAME number of lines either way, since
+    // both shapes now walk the text exactly once regardless of where (or
+    // whether) a key hits.
+    //
+    // This used to be a wall-clock ns/byte ratio test. Under the campaign's
+    // full-gate load it flaked (`ratio=2.48` against a `<1.6` ceiling on an
+    // otherwise-correct single-pass build; timing is not the quantity the
+    // audit finding was actually about, see
+    // feedback_measurement_traps/feedback_ratio_needs_one_instant). The
+    // defect is a PASS COUNT, not a duration, so it's counted directly via
+    // `lines_scanned` (line 168-ish, test-only, `builtin.is_test`-gated) --
+    // deterministic and load-independent by construction: no clock is read.
+    const no_referral = ("% filler\n" ** 1600); // no referral anywhere
     const realistic = ("% filler\n" ** 500) ++
         "Registrar WHOIS Server: whois.markmonitor.com\r\n" ++ // hits the 3rd key
-        ("% filler\n" ** 1100); // 14449 bytes
-    // Both scale the same way (linear in length, per `nextServer`'s own
-    // known-flat-cost tests elsewhere), so this only needs a rough size
-    // match, not an exact one -- both cost/byte numbers below normalize it.
-    std.debug.assert(realistic.len > no_referral.len / 2 and realistic.len < no_referral.len * 2);
+        ("% filler\n" ** 1100);
+    const lines_no_referral: f64 = @floatFromInt(std.mem.count(u8, no_referral, "\n") + 1);
+    const lines_realistic: f64 = @floatFromInt(std.mem.count(u8, realistic, "\n") + 1);
 
-    const iters = 300;
-    var results: [2]f64 = undefined;
-    inline for (.{ no_referral, realistic }, 0..) |text, idx| {
-        const start = std.Io.Clock.Timestamp.now(io, .awake);
-        var i: usize = 0;
-        while (i < iters) : (i += 1) std.mem.doNotOptimizeAway(nextServer(text));
-        const elapsed_ns = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
-        results[idx] = @as(f64, @floatFromInt(elapsed_ns)) / @as(f64, @floatFromInt(iters * text.len));
-    }
+    resetLinesScannedForTesting();
+    _ = nextServer(no_referral);
+    const scanned_no_referral: f64 = @floatFromInt(linesScannedForTesting());
+
+    resetLinesScannedForTesting();
+    _ = nextServer(realistic);
+    const scanned_realistic: f64 = @floatFromInt(linesScannedForTesting());
+
+    const per_line_no_referral = scanned_no_referral / lines_no_referral;
+    const per_line_realistic = scanned_realistic / lines_realistic;
+    const ratio = per_line_no_referral / per_line_realistic;
     std.debug.print(
-        "nextServer ns/byte: no-referral={d:.3} realistic={d:.3} ratio={d:.2}\n",
-        .{ results[0], results[1], results[0] / results[1] },
+        "nextServer lines-scanned/line: no-referral={d:.3} realistic={d:.3} ratio={d:.2}\n",
+        .{ per_line_no_referral, per_line_realistic, ratio },
     );
-    // The audited old code's ratio was ~2,2-2,3x. A generous 1,6x ceiling
-    // still fails on the old 4-pass shape and passes on the single-pass one
-    // without being a flaky bound on a shared, possibly loaded machine.
-    try testing.expect(results[0] / results[1] < 1.6);
+    // Fixed (single-pass) shape: each call visits every line exactly once
+    // regardless of match position, so both sides are ~1.0 and the ratio is
+    // ~1.0. The old per-key `fieldValue` shape visits ~4x the lines on a
+    // response with no referral (4 full misses) vs ~2.3x on one that hits
+    // the 3rd key (2 full misses + 1 partial hit) -- ratio ~1.7, over this
+    // ceiling. 1.6 is the same generous margin the original ratio test used,
+    // now against a count that cannot be perturbed by machine load.
+    try testing.expect(ratio < 1.6);
 }
 
 test "lookup: empty and garbage responses are clean terminals" {
