@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 F10 (performance pass). `htb`'s
+  `rate`/`ceil` and `tbf`'s `rate`/`peakrate`, plus `police`'s `rate`/`peakrate`, each built
+  two 256-entry rate tables even when both would come out byte-identical (the common
+  `tc ... rate X ceil X` invocation, and any `rate`/`ceil` pair that both clamp to the same
+  32-bit value). `calcRateTable`'s loop measured at ~98-100% of the whole request's build
+  cost (A1 audit), so the second call now copies the first table's bytes and spec fields
+  instead of recomputing them whenever the inputs that determine the table match. Same
+  output, same public API, ~47% faster to build a request on the reuse path and unchanged
+  on the path where `rate != ceil` (measured, see `A1/tc.md`'s F10 disposition).
+
 - **2026-09-14** — **BEHAVIOURAL:** A1 F12 (round-2 decision: safe default plus a switch).
   A dump or request whose reply never came blocked in `recvDatagram` forever: the dump loops end
   only on `NLMSG_DONE`, an error or the restart cap, and nothing set `SO_RCVTIMEO`.

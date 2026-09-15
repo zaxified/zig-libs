@@ -500,7 +500,22 @@ fn appendHtbClassOptions(
     // timings use the full 64-bit rate. Reproduced faithfully.
     ratespec.calcRateTable(ps, &rate_spec, &rtab, c.cell_log, c.mtu, c.linklayer, null);
     const buffer_ticks = ps.calcXmitTime(rate64, burst);
-    ratespec.calcRateTable(ps, &ceil_spec, &ctab, c.ccell_log, c.mtu, c.linklayer, null);
+    // F10: `calcRateTable`'s 256-entry loop is ~98-100% of this function's
+    // cost (A1 audit, measured), and its output depends only on the clamped
+    // rate it is fed plus the cell_log override -- both public config, mtu
+    // and linklayer already being shared with the rate table above. When
+    // `ceil`'s clamped rate and cell_log override match `rate`'s exactly
+    // (rate==ceil is the common `tc` invocation the goldens capture, and a
+    // >=2^32 rate/ceil pair that both clamp to the same ~0U also qualifies),
+    // the loop would recompute byte-identical output, so reuse it instead.
+    if (rate_spec.rate == ceil_spec.rate and c.cell_log == c.ccell_log) {
+        ctab = rtab;
+        ceil_spec.cell_align = rate_spec.cell_align;
+        ceil_spec.cell_log = rate_spec.cell_log;
+        ceil_spec.linklayer = rate_spec.linklayer;
+    } else {
+        ratespec.calcRateTable(ps, &ceil_spec, &ctab, c.ccell_log, c.mtu, c.linklayer, null);
+    }
     const cbuffer_ticks = ps.calcXmitTime(ceil64, cburst);
 
     if (rate64 >= (1 << 32)) try appendAttrU64(gpa, list, TCA_HTB.RATE64, rate64);
@@ -661,7 +676,16 @@ fn appendTbfOptions(
     var ptab: [ratespec.rate_table_entries]u32 = undefined;
     var mtu_ticks: u32 = 0;
     if (peak_spec.rate != 0) {
-        ratespec.calcRateTable(ps, &peak_spec, &ptab, t.pcell_log, t.mtu, t.linklayer, null);
+        // F10: same reuse as htb's rate/ceil pair above -- identical clamped
+        // rate and cell_log override means an identical table.
+        if (peak_spec.rate == rate_spec.rate and t.pcell_log == t.cell_log) {
+            ptab = rtab;
+            peak_spec.cell_align = rate_spec.cell_align;
+            peak_spec.cell_log = rate_spec.cell_log;
+            peak_spec.linklayer = rate_spec.linklayer;
+        } else {
+            ratespec.calcRateTable(ps, &peak_spec, &ptab, t.pcell_log, t.mtu, t.linklayer, null);
+        }
         mtu_ticks = ps.calcXmitTime(peak_spec.rate, t.mtu);
     }
 
