@@ -158,7 +158,11 @@ declare -A TARGETS=(
     [ct25519]="ct25519 std comb ladderbase ladder msm"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
-    [ecvrf]="prove"
+    # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
+    # the target taints the public `alpha` to list its input-dependent
+    # branches. It does NOT catch E15's `timing_safe.eql` -> `mem.eql`
+    # mutation (measured, same count); see the harness doc comment.
+    [ecvrf]="prove verify"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"
     [montint]="small portable asmcore"
@@ -320,6 +324,7 @@ declare -A PATTERN=(
     [ct25519/msm]='root[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
+    [ecvrf/verify]='ecvrf[.]zig'
     [ed448/full]='ed448[.]zig|field[.]zig|x448[.]zig|scalar[.]zig'
     [ed448/ladder]='ed448[.]zig|field[.]zig|scalar[.]zig'
     # k256's own sources. `fast_core.zig` is in the field/mul/comb/sign
@@ -527,7 +532,8 @@ declare -A LABEL=(
     [ct25519/ladder]='ct25519 ladder var'
     [ct25519/msm]='ct25519 straus msm'
     [decaf448/scalarmul]='decaf448+ed448'
-    [ecvrf/prove]='ecvrf.zig'
+    [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
+    [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'
     [ed448/full]='ed448 src'
     [ed448/ladder]='ed448 src'
     [k256/field]='k256 field+asm'
