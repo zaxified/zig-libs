@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — A1 fix campaign, G13. Behavioural fix, no API change: the rest of the
+  local file-system calls around a transfer reported a cancelation as a file-system
+  failure, the same collapse G12 fixed for `putFile`'s file read. `putFile`/`putFilePlain`
+  mapped a cancel in `openFile` or `stat` to `error.ReadFailed`; `getToFile` mapped one in
+  `createFile`, in the file write inside `streamRemaining` or in the final `flush` to
+  `error.WriteFailed`. All five now return `error.Canceled` (`fsFailure` for the calls that
+  return their error, `fileWriteFailure` for the error parked on the `File.Writer`). Two
+  new tests put the cancel inside each call deterministically through an `Io` double that
+  parks one file operation; each site reverted on its own turns its case red.
+
 - **2026-09-17** — A1 fix campaign, full-gate timeout disposition. Behavioural fix, no API
   change: `putFile`/`putFilePlain` reported a cancelation that landed in the upload's
   LOCAL file read (the upload alternates file reads with socket writes) as

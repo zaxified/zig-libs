@@ -836,38 +836,43 @@ pub fn getAlloc(c: *Client, gpa: std.mem.Allocator, url: []const u8, max_len: us
 
 /// GET `url` streaming the body straight to `dir/sub_path` (no full-body
 /// buffering). Returns bytes written; requires a 2xx status. File-system
-/// failures map to `error.WriteFailed`.
+/// failures map to `error.WriteFailed`; a cancelation that lands in one of
+/// them stays `error.Canceled`.
 pub fn getToFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8) Error!u64 {
     var res = try c.request(.get, url, .{});
     defer res.deinit();
     if (res.status < 200 or res.status >= 300) return error.UnexpectedStatus;
 
-    var file = dir.createFile(c.io, sub_path, .{ .truncate = true }) catch return error.WriteFailed;
+    var file = dir.createFile(c.io, sub_path, .{ .truncate = true }) catch |err|
+        return fsFailure(err, error.WriteFailed);
     defer file.close(c.io);
     var fbuf: [64 * 1024]u8 = undefined;
     var fw = file.writer(c.io, &fbuf);
     // `Reader.StreamRemainingError` is exactly `{ReadFailed, WriteFailed}`.
-    // `WriteFailed` here is the local file write (`fw`), which stays a
-    // plain failure; `ReadFailed` is the network body read, and
-    // `Conn.readFailure` is what recovers a cancelation from it instead of
-    // reporting a dead peer — see `readAllAlloc` right above, the same
-    // collapse this one had.
+    // `ReadFailed` is the network body read, and `Conn.readFailure` is what
+    // recovers a cancelation from it instead of reporting a dead peer — see
+    // `readAllAlloc` right above, the same collapse this one had.
+    // `WriteFailed` is the local file write (`fw`), and `fileWriteFailure`
+    // recovers a cancelation parked on `fw.err` the same way. Until
+    // 2026-09-15 this arm, the `flush` below and `createFile` above all
+    // reported a cancelation as a file-system failure (A1 G13).
     const n = res.reader().streamRemaining(&fw.interface) catch |err| switch (err) {
-        error.WriteFailed => return error.WriteFailed,
+        error.WriteFailed => return fileWriteFailure(&fw),
         error.ReadFailed => return res.conn.readFailure(),
     };
-    fw.interface.flush() catch return error.WriteFailed;
+    fw.interface.flush() catch return fileWriteFailure(&fw);
     return n;
 }
 
 /// PUT the contents of `dir/sub_path` to `url`, streamed with a
 /// Content-Length (never buffered whole). Returns the response status; the
 /// response body is discarded. File-system failures map to
-/// `error.ReadFailed`.
+/// `error.ReadFailed`; a cancelation that lands in one of them stays
+/// `error.Canceled`.
 pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8, options: RequestOptions) Error!u16 {
-    var file = dir.openFile(c.io, sub_path, .{}) catch return error.ReadFailed;
+    var file = dir.openFile(c.io, sub_path, .{}) catch |err| return fsFailure(err, error.ReadFailed);
     defer file.close(c.io);
-    const size = (file.stat(c.io) catch return error.ReadFailed).size;
+    const size = (file.stat(c.io) catch |err| return fsFailure(err, error.ReadFailed)).size;
 
     var up = try c.requestStreaming(.put, url, options, size);
     var fbuf: [64 * 1024]u8 = undefined;
@@ -912,15 +917,31 @@ fn fileReadFailure(fr: *const std.Io.File.Reader) Error {
     return error.ReadFailed;
 }
 
+/// `fileReadFailure`'s write-side twin, for `getToFile`'s download target:
+/// `std.Io.Writer` reports every failure of the file write as bare
+/// `error.WriteFailed`, and the real error is parked on the `File.Writer`.
+fn fileWriteFailure(fw: *const std.Io.File.Writer) Error {
+    if (fw.err) |e| if (e == error.Canceled) return error.Canceled;
+    return error.WriteFailed;
+}
+
+/// For a local file-system call that returns its error directly (open,
+/// create, stat): every one of those error sets carries `Io.Cancelable`, and
+/// a cancelation is not a file-system failure, so it stays `error.Canceled`;
+/// anything else becomes `fallback`.
+fn fsFailure(err: anyerror, fallback: Error) Error {
+    return if (err == error.Canceled) error.Canceled else fallback;
+}
+
 /// `putFile`'s plaintext-only twin (see `requestPlain`'s doc comment for why
 /// this is a separate decl): PUT `dir/sub_path` to `url` streamed with a
 /// Content-Length, `http://` only. `Upload.finish`/`Upload.abort` are shared
 /// with `putFile` — they operate on the already-dialed `*Conn` and name
 /// nothing from `tls`.
 pub fn putFilePlain(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u8, options: RequestOptions) Error!u16 {
-    var file = dir.openFile(c.io, sub_path, .{}) catch return error.ReadFailed;
+    var file = dir.openFile(c.io, sub_path, .{}) catch |err| return fsFailure(err, error.ReadFailed);
     defer file.close(c.io);
-    const size = (file.stat(c.io) catch return error.ReadFailed).size;
+    const size = (file.stat(c.io) catch |err| return fsFailure(err, error.ReadFailed)).size;
 
     var up = try c.requestStreamingPlain(.put, url, options, size);
     var fbuf: [64 * 1024]u8 = undefined;
@@ -3133,45 +3154,76 @@ test "putFile: a canceled body write surfaces Canceled, not WriteFailed" {
     try testing.expectError(error.Canceled, result);
 }
 
-/// An `Io` whose positional file read is nothing but a cancelation point that
-/// waits for its cancel — so a test can put the cancel INSIDE an upload's
-/// local file read deterministically, instead of hoping the scheduler lands it
-/// there (under load it did, 5/25, which is how `putFile`'s collapse of it
-/// into `ReadFailed` was found). Same shape as `NoEntropyIo`: the inner
-/// `userdata` is kept and exactly one slot is replaced, so every other slot
-/// stays correctly bound. The replacement calls the INNER `checkCancel` with
-/// that same `userdata`, which is precisely what the real read's
+/// The local file operation `CancelInFileIo` turns into a pure cancelation
+/// point.
+const FileOp = enum { open, create, stat, read, write };
+
+/// An `Io` in which ONE local file operation is nothing but a cancelation
+/// point that waits for its cancel — so a test can put the cancel INSIDE that
+/// operation deterministically, instead of hoping the scheduler lands it
+/// there (under load it did, 5/25, which is how `putFile`'s collapse of a
+/// canceled file read into `ReadFailed` was found, A1 G12; G13 is the same
+/// collapse in open/create/stat/write). Same shape as `NoEntropyIo`: the
+/// inner `userdata` is kept and exactly one slot is replaced, so every other
+/// slot stays correctly bound. The replacement calls the INNER `checkCancel`
+/// with that same `userdata`, which is precisely what the real call's
 /// `Syscall.start` would have consulted.
-const CancelInFileReadIo = struct {
-    vtable: std.Io.VTable,
-    userdata: ?*anyopaque,
+fn CancelInFileIo(comptime op: FileOp) type {
+    return struct {
+        vtable: std.Io.VTable,
+        userdata: ?*anyopaque,
 
-    var inner_vtable: *const std.Io.VTable = undefined;
-    var entered: std.atomic.Value(u32) = .init(0);
+        const Self = @This();
+        var inner_vtable: *const std.Io.VTable = undefined;
+        var entered: std.atomic.Value(u32) = .init(0);
 
-    fn init(inner: std.Io) CancelInFileReadIo {
-        inner_vtable = inner.vtable;
-        entered.store(0, .release);
-        var vt = inner.vtable.*;
-        vt.fileReadPositional = fileReadPositional;
-        return .{ .vtable = vt, .userdata = inner.userdata };
-    }
-
-    fn io(self: *const CancelInFileReadIo) std.Io {
-        return .{ .userdata = self.userdata, .vtable = &self.vtable };
-    }
-
-    fn fileReadPositional(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
-        _ = file;
-        _ = data;
-        _ = offset;
-        entered.store(1, .release);
-        while (true) {
-            try inner_vtable.checkCancel(userdata);
-            std.atomic.spinLoopHint();
+        fn init(inner: std.Io) Self {
+            inner_vtable = inner.vtable;
+            entered.store(0, .release);
+            var vt = inner.vtable.*;
+            switch (op) {
+                .open => vt.dirOpenFile = dirOpenFile,
+                .create => vt.dirCreateFile = dirCreateFile,
+                .stat => vt.fileStat = fileStat,
+                .read => vt.fileReadPositional = fileReadPositional,
+                .write => vt.fileWritePositional = fileWritePositional,
+            }
+            return .{ .vtable = vt, .userdata = inner.userdata };
         }
-    }
-};
+
+        fn io(self: *const Self) std.Io {
+            return .{ .userdata = self.userdata, .vtable = &self.vtable };
+        }
+
+        fn park(userdata: ?*anyopaque) std.Io.Cancelable!noreturn {
+            entered.store(1, .release);
+            while (true) {
+                try inner_vtable.checkCancel(userdata);
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        fn dirOpenFile(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            try park(userdata);
+        }
+
+        fn dirCreateFile(userdata: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.CreateFileOptions) std.Io.File.OpenError!std.Io.File {
+            try park(userdata);
+        }
+
+        fn fileStat(userdata: ?*anyopaque, _: std.Io.File) std.Io.File.StatError!std.Io.File.Stat {
+            try park(userdata);
+        }
+
+        fn fileReadPositional(userdata: ?*anyopaque, _: std.Io.File, _: []const []u8, _: u64) std.Io.File.ReadPositionalError!usize {
+            try park(userdata);
+        }
+
+        fn fileWritePositional(userdata: ?*anyopaque, _: std.Io.File, _: []const u8, _: []const []const u8, _: usize, _: u64) std.Io.File.WritePositionalError!usize {
+            try park(userdata);
+        }
+    };
+}
 
 fn putFileVia(comptime plain: bool) fn (*Client, []const u8, std.Io.Dir, []const u8) Error!u16 {
     return struct {
@@ -3208,19 +3260,144 @@ test "putFile + putFilePlain: a cancel inside the local file read surfaces Cance
             try f.writeStreamingAll(real_io, "0123456789abcdef");
         }
 
-        var double: CancelInFileReadIo = .init(real_io);
+        const Double = CancelInFileIo(.read);
+        var double: Double = .init(real_io);
         var client = Client.init(double.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
         defer client.deinit();
         var url_buf: [64]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
         var fut = try real_io.concurrent(putFileVia(plain), .{ &client, url, tmp.dir, "upload.bin" });
-        const reached = awaitPeerFlag(real_io, &CancelInFileReadIo.entered, cancel_peer_watchdog_ms);
+        const reached = awaitPeerFlag(real_io, &Double.entered, cancel_peer_watchdog_ms);
         const result = fut.cancel(real_io);
         if (!reached) std.debug.print("file-read cancel test (plain={}): the upload never reached its file read\n", .{plain});
         try testing.expect(reached);
         testing.expectError(error.Canceled, result) catch |e| {
             std.debug.print("file-read cancel test (plain={}) failed\n", .{plain});
+            return e;
+        };
+    }
+}
+
+// A1 G13: `putFile*` opens and stats the source file BEFORE dialing, so the
+// cancel lands before any request exists and no peer is needed. The URL's
+// port is never reached.
+test "putFile + putFilePlain: a cancel inside opening or stat-ing the local file surfaces Canceled, not ReadFailed" {
+    inline for (.{ FileOp.open, FileOp.stat }) |op| {
+        inline for (.{ false, true }) |plain| {
+            var threaded = std.Io.Threaded.init(testing.allocator, .{});
+            defer threaded.deinit();
+            const real_io = threaded.io();
+
+            var tmp = testing.tmpDir(.{});
+            defer tmp.cleanup();
+            {
+                var f = try tmp.dir.createFile(real_io, "upload.bin", .{});
+                defer f.close(real_io);
+                try f.writeStreamingAll(real_io, "0123456789abcdef");
+            }
+
+            const Double = CancelInFileIo(op);
+            var double: Double = .init(real_io);
+            var client = Client.init(double.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
+            defer client.deinit();
+
+            var fut = try real_io.concurrent(putFileVia(plain), .{ &client, "http://127.0.0.1:9/", tmp.dir, "upload.bin" });
+            const reached = awaitPeerFlag(real_io, &Double.entered, cancel_peer_watchdog_ms);
+            const result = fut.cancel(real_io);
+            if (!reached) std.debug.print("local file {t} cancel test (plain={}): the upload never reached it\n", .{ op, plain });
+            try testing.expect(reached);
+            testing.expectError(error.Canceled, result) catch |e| {
+                std.debug.print("local file {t} cancel test (plain={}) failed\n", .{ op, plain });
+                return e;
+            };
+        }
+    }
+}
+
+/// Answers one request with a 200 whose whole `Content-Length` body it sends,
+/// then holds the connection until released — so `getToFile` gets past its
+/// status check into its local file create and write.
+const HeadAndBodyPeer = struct {
+    io: std.Io,
+    listener: *net.Server,
+    body_len: usize,
+    stop: std.atomic.Value(u32) = .init(0),
+    accepted: std.atomic.Value(u32) = .init(0),
+
+    fn run(p: *HeadAndBodyPeer) void {
+        const s = p.listener.accept(p.io) catch return;
+        p.accepted.store(1, .release);
+        defer s.close(p.io);
+        var rbuf: [1024]u8 = undefined;
+        var wbuf: [4096]u8 = undefined;
+        var sr = s.reader(p.io, &rbuf);
+        var sw = s.writer(p.io, &wbuf);
+        var head_buf: [1024]u8 = undefined;
+        _ = h1.readHead(&sr.interface, &head_buf) catch {};
+        sw.interface.print("HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n", .{p.body_len}) catch {};
+        const chunk: [4096]u8 = @splat('x');
+        var left = p.body_len;
+        while (left != 0) {
+            const k = @min(left, chunk.len);
+            sw.interface.writeAll(chunk[0..k]) catch break;
+            left -= k;
+        }
+        sw.interface.flush() catch {};
+        while (p.stop.load(.acquire) == 0)
+            p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+
+    fn release(p: *HeadAndBodyPeer, port: u16) void {
+        releaseCancelPeer(p.io, &p.stop, &p.accepted, port);
+    }
+};
+
+// A1 G13. `body_len` picks which `getToFile` site the parked write is in: 5
+// bytes fit its 64 KiB file buffer, so the write happens in the final
+// `flush`; 100 KiB overruns it, so the write happens inside
+// `streamRemaining`.
+test "getToFile: a cancel inside creating, writing or flushing the local file surfaces Canceled, not WriteFailed" {
+    const cases = .{
+        .{ .op = FileOp.create, .body_len = 5, .site = "createFile" },
+        .{ .op = FileOp.write, .body_len = 100 * 1024, .site = "streamRemaining" },
+        .{ .op = FileOp.write, .body_len = 5, .site = "flush" },
+    };
+    inline for (cases) |case| {
+        var threaded = std.Io.Threaded.init(testing.allocator, .{});
+        defer threaded.deinit();
+        const real_io = threaded.io();
+
+        const addr = try net.IpAddress.parse("127.0.0.1", 0);
+        var listener = addr.listen(real_io, .{}) catch |err| {
+            std.debug.print("local file cancel test listen failed ({s}), skipping\n", .{@errorName(err)});
+            return error.SkipZigTest;
+        };
+        defer listener.deinit(real_io);
+        const port = listener.socket.address.getPort();
+
+        var peer: HeadAndBodyPeer = .{ .io = real_io, .listener = &listener, .body_len = case.body_len };
+        const peer_thread = try std.Thread.spawn(.{}, HeadAndBodyPeer.run, .{&peer});
+        defer peer_thread.join();
+        defer peer.release(port);
+
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const Double = CancelInFileIo(case.op);
+        var double: Double = .init(real_io);
+        var client = Client.init(double.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
+        defer client.deinit();
+        var url_buf: [64]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
+
+        var fut = try real_io.concurrent(getToFileOnce, .{ &client, url, tmp.dir, "out.bin" });
+        const reached = awaitPeerFlag(real_io, &Double.entered, cancel_peer_watchdog_ms);
+        const result = fut.cancel(real_io);
+        if (!reached) std.debug.print("local file cancel test ({s}): the download never reached it\n", .{case.site});
+        try testing.expect(reached);
+        testing.expectError(error.Canceled, result) catch |e| {
+            std.debug.print("local file cancel test ({s}) failed\n", .{case.site});
             return e;
         };
     }
