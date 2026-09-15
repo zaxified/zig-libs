@@ -402,16 +402,40 @@ bls12_381	ReleaseFast	g2_scalarmul	1	8	c58d13bebb766407	7f4e15a241002b3f
 bip340	ReleaseFast	sign	1	<=80	8e02608bab19f41e	0ce3274dc49157be
 blindrsa	ReleaseFast	blind	1	<=493	58e60e4a5009bbd9	4352055809b3f3c7
 blindrsa	ReleaseFast	sign	1	<=218	58e60e4a5009bbd9	4d5e3740a158032d
-threshold_ecdsa	ReleaseFast	share	1	<=273	5681d6e02a2e5abc	4a6777ac538b5e90
-threshold_ecdsa	ReleaseFast	nonce	1	<=400	5681d6e02a2e5abc	31f7e323b84fd8a7
-# ⛔ threshold_ecdsa betaprime — DEFECT, RED ON PURPOSE (A1 threshold_ecdsa R2).
+# A1 threshold_ecdsa R2 fix (2026-09-17, fixwt/a): `zkproofs.mulAddBytes`'s
+# carry-propagation tail no longer exits early on `carry != 0` (which compiled
+# to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig, was :356);
+# it now always walks every remaining byte down to `out[0]` (`pos`-driven, and
+# `pos` is a function of public `e.len`/`x.len`/`i` only). Differential test
+# (`audit R2 ... bit-exact against the old early-exit shape`) proves the two
+# shapes are bit-identical; the harness's own out_sha below is unchanged
+# across the fix, which is the same claim from the signing side. Positive
+# control: temporarily restoring `while (carry != 0)` put share/nonce/
+# betaprime back to EXACTLY their pre-fix counts (273/390/321), same command,
+# same tree otherwise. `grep -oE 'zkproofs\.zig:[0-9]+'` over the post-fix
+# `--stacks` log has no hit in [300,399) (the mulAddBytes/mulAddOwned/
+# mulBytes region) for any of the three targets.
+#
+# Both rows below carried R2's contexts (8 for share, 12 for nonce, per the
+# original R2 finding's per-target breakdown) inside bounds pinned before R2
+# was known (2026-09-09). Measured post-fix: share 269 total / 267 in-file
+# (was 273, -6) / 2 witness / 0 unattr; nonce 382 total / 378 in-file (was
+# 390, -12) / 4 witness / 0 unattr. ⚠ share's drop is -6, not -8 — not
+# independently re-derived here (only betaprime's 9 non-shared R2 locations
+# were disassembled one by one); the direction and the disassembly/`--stacks`
+# evidence above are what this pin rests on, not the exact arithmetic on this
+# row.
+threshold_ecdsa	ReleaseFast	share	1	<=267	3d94932979419650	4a6777ac538b5e90
+threshold_ecdsa	ReleaseFast	nonce	1	<=378	3d94932979419650	31f7e323b84fd8a7
+# ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-17 (was DEFECT, RED ON
+# PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-17 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
 #
-# Measured on the unmutated tree: 325 total / 321 in-file / 4 witness /
-# 0 unattributed, control 0, trap 0, `draws_160b=4`.
+# Measured on the R1 tree (pre-R2, unmutated otherwise): 325 total / 321
+# in-file / 4 witness / 0 unattributed, control 0, trap 0, `draws_160b=4`.
 #
-# Positive control: a `testb`/`je` on `β'[100]` added exactly 2 contexts, on
-# the inserted line, one per caller.
+# Positive control (R1): a `testb`/`je` on `β'[100]` added exactly 2 contexts,
+# on the inserted line, one per caller.
 #
 # Of the 321, nine locations reach β' and no other row. Every one was
 # disassembled, and none is a new leak class:
@@ -425,15 +449,15 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=400	5681d6e02a2e5abc	31f7e323b84fd8a7
 #   - Alice's verification of the PUBLIC t/t1 (2): over-taint from simulating
 #     both parties in one process.
 #
-# ⛔ What is NOT pinned: `zkproofs.mulAddBytes`'s carry tail, zkproofs.zig:356
-# `while (carry != 0)`, which compiles to `cmp $0x100` / `jb`. That is a real
-# branch on the secret-derived partial sums of `e·x + mask`, and it contradicts
-# the function's own doc ("the multiply itself touches every byte position
-# unconditionally"). It fires 8 times here, in s1/s2/t1/t2. The bound is
-# therefore 321 - 8, so this row stays RED until the carry propagation is
-# fixed-length. ⚠ The share (8) and nonce (12) rows carry the same contexts
-# inside bounds pinned before this was known.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=313	5681d6e02a2e5abc	0d9a7f3232367fc7
+# R2 (2026-09-17): the remaining 8 were `zkproofs.mulAddBytes`'s carry tail
+# (zkproofs.zig, was :356) branching on secret-derived partial sums of
+# `e·x + mask` — 321 - 8 = 313, matching the bound this row had carried since
+# R1 as the anticipated post-fix count. Measured post-fix (fixwt/a,
+# `mulAddBytes` now fixed-length): 317 total / 313 in-file / 4 witness /
+# 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
+# exactly. Positive control (R2): temporarily restoring the early exit put
+# this row back to EXACTLY 321 in-file, on the same tree, same command.
+threshold_ecdsa	ReleaseFast	betaprime	1	<=313	3d94932979419650	0d9a7f3232367fc7
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must

@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** A1 R2. `zkproofs.mulAddBytes` (private,
+  the `e*x + addend` Sigma-protocol response arithmetic behind s1/s2/t1/t2) had a
+  carry-propagation tail that exited as soon as `carry != 0` went false — a real branch on
+  secret-derived partial sums (`cmp $0x100`/`jb`), contradicting its own doc comment. Now the
+  tail always walks every remaining byte; the only branch left is on the public loop position.
+  Bit-exact with the old shape (differential test, 200 random trials + boundary cases; ctgrind
+  harness out_sha unchanged). `ctgrind-expected.tsv`: `share` `<=273`→`<=267`, `nonce`
+  `<=400`→`<=378`, `betaprime` `<=313` now holds for real (was the intentionally-red R2 marker).
 - **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** A1 R1. The ctgrind harness
   (`src/ctgrind_harness.zig`, never part of the library build) gains a `betaprime` target that
   taints Bob's 160-byte MtA blind `β'`, and `scripts/ctgrind-expected.tsv` gains its row. No
