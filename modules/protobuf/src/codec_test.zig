@@ -558,3 +558,125 @@ test "a 40-field message compiles and round-trips (28 was the old ceiling)" {
     try testing.expectEqual(@as(i32, 29), d.value.f28);
     try testing.expectEqual(@as(i32, 40), d.value.f39);
 }
+
+// ── F6: encodeAlloc's size cache agrees with encodeInto's recompute ────────
+//
+// A1/protobuf.md F6: `encodeAlloc` now sizes every submessage exactly once
+// (a `SizeTree` built alongside the sizing pass) instead of recomputing a
+// nested size on every level it is under. `encodeInto` still recomputes —
+// it has no allocator to cache with, and that is its whole point (see
+// encode.zig's module doc comment) — so the two functions are two
+// INDEPENDENT implementations of "how big is this submessage" that must
+// still agree byte-for-byte. That is the differential test below, not a
+// reimplementation of either (see
+// [[feedback_a_test_that_reimplements_the_code_cannot_fail]]).
+
+fn buildChain(nodes: []Chain, depth: usize) ?*const Chain {
+    if (depth == 0) return null;
+    var i: usize = depth;
+    while (i > 0) : (i -= 1) {
+        nodes[i - 1] = .{
+            .depth = @intCast(i),
+            .next = if (i < depth) &nodes[i] else null,
+        };
+    }
+    return &nodes[0];
+}
+
+fn expectEncodeIntoAgreesWithEncodeAlloc(gpa: std.mem.Allocator, value: anytype, options: pb.EncodeOptions) !void {
+    const size = try pb.encodedSize(value, options);
+    const into_buf = try gpa.alloc(u8, size);
+    defer gpa.free(into_buf);
+    const into_len = try pb.encodeInto(into_buf, value, options);
+    try testing.expectEqual(size, into_len);
+
+    const alloc_buf = try pb.encodeAlloc(gpa, value, options);
+    defer gpa.free(alloc_buf);
+
+    try testing.expectEqualSlices(u8, into_buf[0..into_len], alloc_buf);
+}
+
+test "F6: encodeInto and encodeAlloc agree bit-for-bit on a chain, across depths" {
+    const gpa = testing.allocator;
+    const depths = [_]usize{ 0, 1, 2, 3, 5, 8, 16, 32, 63, 64, 100, 150, 200, 254 };
+    var nodes: [254]Chain = undefined;
+    const options: pb.EncodeOptions = .{ .max_depth = 255 };
+    for (depths) |d| {
+        const root = buildChain(&nodes, d);
+        const value: Chain = if (root) |r| r.* else .{};
+        try expectEncodeIntoAgreesWithEncodeAlloc(gpa, value, options);
+    }
+}
+
+/// Deliberately NOT a chain: `a` is a leaf sibling that comes BEFORE `c`, a
+/// nested sibling, in field order — the shape that broke the first attempt
+/// at F6's cache (a flat, single-cursor list gives the wrong size to `a`
+/// once `c`'s own subtree has entries of its own; see encode.zig's module
+/// doc comment for why a real per-node child list is needed instead).
+const SiblingNest = struct {
+    a: ?Inner = null,
+    c: ?*const SiblingNest = null,
+
+    pub const pb_fields = .{
+        .a = Field{ .number = 1, .kind = .message },
+        .c = Field{ .number = 2, .kind = .message },
+    };
+};
+
+test "F6: encodeInto and encodeAlloc agree when a leaf sibling precedes a nested one" {
+    const gpa = testing.allocator;
+    const leaf3: SiblingNest = .{ .a = .{ .v = 3, .note = "d" } };
+    const leaf2: SiblingNest = .{ .a = .{ .v = 2, .note = "c" }, .c = &leaf3 };
+    const root: SiblingNest = .{ .a = .{ .v = 1, .note = "a" }, .c = &leaf2 };
+    try expectEncodeIntoAgreesWithEncodeAlloc(gpa, root, .{});
+
+    // A wider version: three levels, each with TWO leaf siblings ahead of
+    // the nested one, and the deepest level a repeated (array) sibling too
+    // -- exercises `.optional` and `.repeated` message-typed fields sharing
+    // one node's child list, in schema field order.
+    const Level = struct {
+        first: ?Inner = null,
+        second: ?Inner = null,
+        many: []const Inner = &.{},
+        deeper: ?*const @This() = null,
+
+        pub const pb_fields = .{
+            .first = Field{ .number = 1, .kind = .message },
+            .second = Field{ .number = 2, .kind = .message },
+            .many = Field{ .number = 3, .kind = .message },
+            .deeper = Field{ .number = 4, .kind = .message },
+        };
+    };
+    const many3 = [_]Inner{ .{ .v = 30 }, .{ .v = 31 }, .{ .v = 32 } };
+    const l3: Level = .{ .first = .{ .v = 300 }, .second = .{ .v = 301 }, .many = &many3 };
+    const many2 = [_]Inner{.{ .v = 20 }};
+    const l2: Level = .{ .first = .{ .v = 200 }, .many = &many2, .deeper = &l3 };
+    const l1: Level = .{ .second = .{ .v = 100 }, .deeper = &l2 };
+    try expectEncodeIntoAgreesWithEncodeAlloc(gpa, l1, .{});
+}
+
+fn fuzzEncodeIntoAgreesWithEncodeAlloc(_: void, smith: *std.testing.Smith) !void {
+    const gpa = testing.allocator;
+
+    var inners_buf: [6]Inner = undefined;
+    const n_inners = smith.index(inners_buf.len + 1);
+    for (inners_buf[0..n_inners]) |*it| {
+        it.* = .{ .v = smith.value(i32), .note = if (smith.value(bool)) "x" else "" };
+    }
+
+    const value: Repeated = .{
+        .nums = &.{ smith.value(i32), smith.value(i32) },
+        .unpacked = &.{smith.value(i32)},
+        .zz = &.{smith.value(i64)},
+        .fixed = &.{smith.value(u32)},
+        .flags = &.{ smith.value(bool), smith.value(bool) },
+        .colors = &.{@enumFromInt(smith.valueRangeAtMost(u2, 0, 2))},
+        .names = &.{if (smith.value(bool)) "abc" else ""},
+        .inners = inners_buf[0..n_inners],
+    };
+    try expectEncodeIntoAgreesWithEncodeAlloc(gpa, value, .{});
+}
+
+test "fuzz: encodeInto and encodeAlloc agree bit-for-bit on randomized Repeated values" {
+    try std.testing.fuzz({}, fuzzEncodeIntoAgreesWithEncodeAlloc, .{});
+}

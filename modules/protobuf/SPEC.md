@@ -313,9 +313,50 @@ wrong bytes. That is the concrete argument for anchoring on bytes and not on val
 - **`oneof`.** Would map naturally onto a Zig tagged union; the encoder/decoder hooks are small,
   but the presence interaction with implicit-presence scalars needs its own test surface.
 - **`Any`, well-known types, the canonical JSON mapping.** Each is a layer above the wire format.
-- **A per-message size cache.** Sizing recomputes nested sizes per level, so it is O(depth ×
-  fields) rather than O(fields). Upstream caches the size on the message object; a Zig equivalent
-  would need somewhere to put it, and the messages here are deliberately plain values.
+- ~~A per-message size cache.~~ **Implemented 2026-09-15 for `encodeAlloc`, as a HYBRID (F6,
+  A1/protobuf.md; first cut reviewed and rejected by the coordinator for regressing the common
+  case, see below).** `encodeInto` (the allocation-free path — see encode.zig's module doc
+  comment) is unchanged and still O(depth × fields): it has nowhere to put a cache without an
+  allocator, and staying allocator-free is the entire reason this module has two encode entry
+  points. `encodeAlloc`'s first (allocation-free) sizing pass now also tracks the deepest nesting
+  it actually saw, for free (`depth` is already threaded through every recursive call); only once
+  that reaches `size_cache_min_depth` (8, the measured wash point below) does a `SizeTree` get
+  built at all — one node per submessage, in a throwaway arena over its own `gpa`, freed before
+  the function returns — and consulted during emit instead of recomputing. Below the threshold,
+  emit recomputes exactly as it always did, so a typical shallow gRPC message (depth 1–4) pays
+  what it always paid: zero extra allocation, zero extra arena.
+
+  **First cut (no threshold, always cached) — rejected.** Measured (ReleaseFast, `smp_allocator`,
+  interleaved A/B, min of 25 reps): a self-recursive chain 255 levels deep dropped from 3.45ms to
+  118µs (29×); at the module's own `max_depth` default (64, also `grpc.Stream.sendInner`'s),
+  213µs → 31µs (6.9×). But for shallow messages (depth 1–4, the common case for most gRPC traffic
+  and the confirmed hot path) the cache's own arena/allocation overhead made `encodeAlloc`
+  measurably SLOWER than before: depth 1 818ns → 950ns, depth 2 1078ns → 1587ns, depth 4 1860ns →
+  2481ns (reproduced across separate runs, not noise) — crossing to a net win only around depth
+  8. The coordinator's call: fixing a pathological case (depth 64+) at a guaranteed cost on the
+  common case (depth 1–4) is a bad trade for a hot path.
+
+  **Hybrid — measured against all three states (before F6 = `646d54a5`, F6-only = `1e818b21`,
+  hybrid), ReleaseFast, `smp_allocator`, interleaved, min of 9 reps, reproduced across two
+  separate runs:**
+
+  | depth | before (min) | F6-only (min) | hybrid (min) | hybrid/before | hybrid/F6-only |
+  |---:|---:|---:|---:|---:|---:|
+  | 1 | 948–1068 ns | 983–1142 ns | 940–1036 ns | **0.97–0.99×** | 0.91–0.96× |
+  | 2 | 1204–1336 ns | 1632–1940 ns | 1204–1345 ns | **1.00–1.01×** | 0.69–0.74× |
+  | 4 | 2024–2051 ns | 2585–2642 ns | 2046–2072 ns | **1.01×** | 0.78–0.79× |
+  | 8 | 4871–4986 ns | 4533–4649 ns | 4945–5000 ns | **1.00–1.02×** | 1.08–1.09× |
+  | 16 | 15539–15926 ns | 8657–8875 ns | 10364–10579 ns | 0.66–0.67× | 1.19–1.20× |
+  | 64 | 215760–222394 ns | 31698–32451 ns | 38917–39297 ns | 0.18× | 1.21–1.23× |
+  | 255 | 3.49–3.92 ms | 123.9–140.7 µs | 152.4–156.7 µs | 0.04× | 1.11–1.23× |
+
+  Depths 1–4 land within a percent or two of `before` — the regression is gone, not just
+  shrunk — while 16/64/255 stay dramatically faster than `before` (5.5×–25×) and within ~10–23%
+  of `F6-only`'s pure-cache cost (the difference is the hybrid's extra O(depth) probing pass,
+  cheap next to what it decides). Depth 8 (the threshold) sits at parity either way, as expected
+  at a boundary chosen to be a wash. Threshold picked from these numbers, not guessed: the
+  crossover in the first-cut data sat between depth 4 and depth 16, and depth 8 was where old and
+  new were within noise of each other.
 - **Streaming decode.** The API takes a complete buffer. gRPC frames arrive length-prefixed, so
   the framing layer above this one is the natural place for that.
 
