@@ -281,8 +281,27 @@ pub const Secp256k1 = struct {
     /// and to std. `error.IdentityElement` if the result is the neutral element
     /// (`s ≡ 0 (mod n)`, or `p` itself is the identity).
     pub fn mul(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
+        const result = mulInner(p, s_, endian);
+        burnMulStack();
+        return result;
+    }
+
+    /// `mul`'s body, one frame down so `burnMulStack` can reach what it left.
+    noinline fn mulInner(p: Secp256k1, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!Secp256k1 {
         const tab = p.varBaseTable();
         return mulWithTable(&tab, s_, endian);
+    }
+
+    /// A1 k256 R1 (re-audit 2026-09-17). The windowed multiply left the u256
+    /// image of the SECRET scalar on the dead stack twice per call at
+    /// ReleaseFast (the ladder before it: once) — compiler-made copies of the
+    /// wide shifts in the recoding, not a named local: zeroing `k` itself
+    /// changed nothing (measured). As in `ecdsa_recover.sign` (G2), the fix is
+    /// on the region: zero `mul_stack_burn` bytes at `mulInner`'s depth.
+    /// `noinline` on both is load-bearing. Pinned by `stackprobe_test.zig`.
+    noinline fn burnMulStack() void {
+        var buf: [mul_stack_burn]u8 = undefined;
+        std.crypto.secureZero(u8, &buf);
     }
 
     /// The per-point table `mul` gathers from: `tab[j] = (j+1)·p`, projective.
@@ -639,6 +658,11 @@ pub const CombTable = [comb_t][comb_teeth]Secp256k1;
 
 /// `mul`'s per-call table: `[magnitude−1]` projective multiples of one point.
 pub const VarBaseTable = [comb_teeth]Secp256k1;
+
+/// Bytes `Secp256k1.burnMulStack` zeroes below `mul`'s frame after every call
+/// (A1 R1). Sized against the probe's measured call-tree depth, see
+/// `stackprobe_test.zig` "A1 R1".
+const mul_stack_burn = 16 * 1024;
 
 const SignedDigit = struct { mag: u64, is_neg: u64 };
 
