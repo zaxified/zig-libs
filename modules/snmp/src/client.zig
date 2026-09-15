@@ -565,8 +565,16 @@ test "UdpTransport: a canceled receive surfaces error.Canceled, not error.Transp
 
     var reply_buf: [max_message_len]u8 = undefined;
     var fut = try io.concurrent(exchangeOnce, .{ udp.transport(), "probe", &reply_buf });
-    // Long enough that the request has been sent and the reply receive is
-    // the one parked in the kernel (the peer never answers).
-    try io.sleep(.fromMilliseconds(200), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel once the request has ARRIVED at the peer: the send is done, so
+    // the only cancelation point left is the reply receive. After a fixed
+    // sleep, a loaded machine could cancel the send instead, and the test
+    // passed by the send's `Canceled` arm. The 60 s is a watchdog only.
+    var probe_buf: [64]u8 = undefined;
+    const arrived = if (peer_socket.receiveTimeout(io, &probe_buf, .{ .duration = .{
+        .raw = .fromMilliseconds(60_000),
+        .clock = .awake,
+    } })) |_| true else |_| false;
+    const result = fut.cancel(io);
+    try testing.expect(arrived);
+    try testing.expectError(error.Canceled, result);
 }
