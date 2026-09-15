@@ -69,8 +69,8 @@ pub fn main() !void {
     // Buffer sizing is the caller's job: `out` must be exactly
     // `msg.len + overhead` (48 bytes: 32-byte ephemeral pubkey + 16-byte
     // Poly1305 tag) -- get this wrong and `seal` returns `error.InvalidBufferSize`
-    // in EVERY build mode (see root.zig: the check is a real `if`, not
-    // `std.debug.assert`, precisely because ReleaseFast would otherwise compile
+    // in EVERY build mode (see root.zig: the check is a real `if`, not a
+    // debug-only assert, precisely because ReleaseFast would otherwise compile
     // the check out and turn a caller's sizing mistake into memory corruption
     // in exactly the build where nothing would have caught it). This comment
     // used to describe the old assert-based behavior after the code had

@@ -429,7 +429,12 @@ test "packet path: the emitted classifier program agrees with the independent re
 }
 
 fn fuzzPacketPathAgrees(_: void, smith: *std.testing.Smith) !void {
-    const kf: classifier.KeyField = if (smith.value(bool)) .src else .dst;
+    // check-fuzz-reach R1: `value(bool)` is the harness's FIRST draw, and
+    // only a u64-or-wider `value` draw has full-range weights -- a narrower
+    // one (bool included) is still weighted and collapses to the same
+    // outcome for nearly every seed, same as a ranged draw. Draw a full
+    // `u64` first and reduce it by hand instead.
+    const kf: classifier.KeyField = if (smith.value(u64) % 2 == 0) .dst else .src;
     const ref_kf: RefField = if (kf == .src) .src else .dst;
     const default_class = smith.value(u32);
     const lpm_fd: i32 = 10;

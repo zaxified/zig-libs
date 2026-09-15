@@ -5530,6 +5530,12 @@ fn f14Handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
 /// keeps O(one frame) of the bytes, so a 20 000-request run does not measure
 /// an ever-growing capture buffer.
 const F14Sink = struct {
+    /// Deliberately NOT the allocator whose calls `F14Count` is counting: the
+    /// sink's own buffering is infrastructure the bench needs to capture
+    /// output, not part of what "allocations per request" measures. Caller
+    /// supplies it (CONVENTIONS.md §1.2) instead of the sink reaching for a
+    /// process-global default.
+    alloc: Allocator,
     buf: std.ArrayList(u8) = .empty,
     scan: usize = 0,
     ends: std.atomic.Value(usize) = .init(0),
@@ -5540,16 +5546,14 @@ const F14Sink = struct {
     capture: bool = false,
     writer: Writer,
 
-    const page = std.heap.page_allocator;
-
-    fn init(buffer: []u8) !F14Sink {
-        var s: F14Sink = .{ .writer = .{ .vtable = &.{ .drain = drainFn }, .buffer = buffer } };
-        try s.buf.ensureTotalCapacity(page, 1 << 20);
+    fn init(alloc: Allocator, buffer: []u8) !F14Sink {
+        var s: F14Sink = .{ .alloc = alloc, .writer = .{ .vtable = &.{ .drain = drainFn }, .buffer = buffer } };
+        try s.buf.ensureTotalCapacity(alloc, 1 << 20);
         return s;
     }
 
     fn deinit(s: *F14Sink) void {
-        s.buf.deinit(page);
+        s.buf.deinit(s.alloc);
     }
 
     fn finished(s: *const F14Sink) usize {
@@ -5558,15 +5562,15 @@ const F14Sink = struct {
 
     fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
         const s: *F14Sink = @alignCast(@fieldParentPtr("writer", w));
-        s.buf.appendSlice(page, w.buffer[0..w.end]) catch return error.WriteFailed;
+        s.buf.appendSlice(s.alloc, w.buffer[0..w.end]) catch return error.WriteFailed;
         w.end = 0;
         var consumed: usize = 0;
         for (data[0 .. data.len - 1]) |d| {
-            s.buf.appendSlice(page, d) catch return error.WriteFailed;
+            s.buf.appendSlice(s.alloc, d) catch return error.WriteFailed;
             consumed += d.len;
         }
         const last = data[data.len - 1];
-        for (0..splat) |_| s.buf.appendSlice(page, last) catch return error.WriteFailed;
+        for (0..splat) |_| s.buf.appendSlice(s.alloc, last) catch return error.WriteFailed;
         consumed += last.len * splat;
         s.classify();
         return consumed;
@@ -5712,6 +5716,9 @@ const F14Count = struct {
 
 const F14Conn = struct {
     gpa: Allocator,
+    /// Infrastructure allocator for the response sink -- deliberately not
+    /// `gpa` when `gpa` is a counting wrapper (see `F14Sink.alloc`).
+    infra: Allocator,
     io: std.Io,
     load: *const F14Load,
     dispatcher: ?Dispatcher,
@@ -5721,7 +5728,7 @@ const F14Conn = struct {
     fn run(c: *F14Conn) void {
         var rbuf: [16 * 1024]u8 = undefined;
         var wbuf: [16 * 1024]u8 = undefined;
-        var sink = F14Sink.init(&wbuf) catch return;
+        var sink = F14Sink.init(c.infra, &wbuf) catch return;
         defer sink.deinit();
         var rd: F14Reader = .init(c.io, c.load, &sink, &rbuf);
         serveTuned(c.gpa, .{
@@ -5735,13 +5742,20 @@ const F14Conn = struct {
 
 /// One timed pass: `conns` connections at once, each on its own thread.
 /// Returns ns per request, or an error when any stream did not finish.
-fn f14Pass(gpa: Allocator, io: std.Io, load: *const F14Load, conns: usize, threaded: bool, reuse: bool) !u64 {
-    var pd: ?PoolDispatcher = if (threaded) try PoolDispatcher.init(std.heap.smp_allocator, io, 8, 256) else null;
+///
+/// `infra` backs the dispatcher pool and each connection's response sink --
+/// bench/harness plumbing that must stay OUT of whatever `gpa` counts (a
+/// plain testing.allocator when unused, `smp`/`page` in the bench proper).
+/// Caller-supplied per CONVENTIONS.md §1.2, in place of the two hardcoded
+/// process-global allocators this used to reach for directly.
+fn f14Pass(gpa: Allocator, infra: Allocator, io: std.Io, load: *const F14Load, conns: usize, threaded: bool, reuse: bool) !u64 {
+    var pd: ?PoolDispatcher = if (threaded) try PoolDispatcher.init(infra, io, 8, 256) else null;
     defer if (pd) |*d| d.deinit();
     var cs: [8]F14Conn = undefined;
     var ths: [8]std.Thread = undefined;
     for (cs[0..conns]) |*c| c.* = .{
         .gpa = gpa,
+        .infra = infra,
         .io = io,
         .load = load,
         .dispatcher = if (pd) |*d| d.iface(8) else null,
@@ -5802,7 +5816,7 @@ test "bench (opt-in via HTTP_BENCH_F14): h2 per-request arena cost" {
     // Allocation census, single connection, sequential, both arena policies.
     for ([_]bool{ false, true }) |reuse| {
         var cnt: F14Count = .{ .backing = smp };
-        _ = try f14Pass(cnt.allocator(), io, &b50, 1, false, reuse);
+        _ = try f14Pass(cnt.allocator(), page, io, &b50, 1, false, reuse);
         std.debug.print("F14 census h2 seq b50 reuse={}: {d} allocs / {d} req = {d:.2}/req\n", .{
             reuse, cnt.allocs.load(.acquire), n, @as(f64, @floatFromInt(cnt.allocs.load(.acquire))) / @as(f64, @floatFromInt(n)),
         });
@@ -5835,7 +5849,7 @@ test "bench (opt-in via HTTP_BENCH_F14): h2 per-request arena cost" {
         for (arms, 0..) |arm, a| {
             for ([_]bool{ false, true }, 0..) |reuse, k| {
                 ns[a][k][r] = if (arm.load) |l|
-                    try f14Pass(if (arm.dbg) dbg.allocator() else smp, io, l, arm.conns, arm.threaded, reuse)
+                    try f14Pass(if (arm.dbg) dbg.allocator() else smp, page, io, l, arm.conns, arm.threaded, reuse)
                 else
                     try f14H1Pass(io, h1wire.items, n, h1out);
             }
@@ -5874,7 +5888,7 @@ test "request arenas: a connection reuses them — fewer allocations per request
     var counts: [2]usize = undefined;
     for ([_]bool{ false, true }, &counts) |reuse, *count| {
         var cnt: F14Count = .{ .backing = gpa };
-        _ = try f14Pass(cnt.allocator(), io, &load, 1, false, reuse);
+        _ = try f14Pass(cnt.allocator(), gpa, io, &load, 1, false, reuse);
         count.* = cnt.allocs.load(.acquire);
     }
     // Measured 2026-09-16: 7 allocations per request with a fresh arena,
@@ -6061,7 +6075,7 @@ test "request arenas: many streams × connections, content-checked (F14)" {
                 .load = undefined,
                 .sink = undefined,
             };
-            c.sink = try F14Sink.init(&c.wbuf);
+            c.sink = try F14Sink.init(gpa, &c.wbuf);
             c.sink.capture = true;
             try c.stage();
         }

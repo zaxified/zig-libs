@@ -513,7 +513,11 @@ test "hostile: LpmKey.toBytes never panics across the full prefix_len range" {
 
 fn fuzzValidateNeverPanics(_: void, smith: *std.testing.Smith) !void {
     var buf: [8]ClassifierRule = undefined;
-    const n = smith.index(buf.len + 1); // 0..8 rules
+    // check-fuzz-reach R1: `index` is a ranged draw and this is the harness's
+    // FIRST draw, so it reads the range minimum for all but 1 in 2^64 seeds
+    // -- collapsing every corpus entry to `n == 0`. `value(u64)` has
+    // full-range weights (faithful to any seed byte), reduced by hand.
+    const n: usize = @intCast(smith.value(u64) % (buf.len + 1)); // 0..8 rules
     for (buf[0..n]) |*r| {
         r.* = .{
             .prefix = .{
@@ -536,7 +540,9 @@ test "fuzz: RuleSet.validate never panics on any (rules, max_entries)" {
 
 fn fuzzLookupNeverPanics(_: void, smith: *std.testing.Smith) !void {
     var buf: [8]ClassifierRule = undefined;
-    const n = smith.index(buf.len + 1);
+    // check-fuzz-reach R1: same fix as fuzzValidateNeverPanics above -- a
+    // ranged draw as the FIRST draw collapses every seed to `n == 0`.
+    const n: usize = @intCast(smith.value(u64) % (buf.len + 1));
     for (buf[0..n]) |*r| {
         r.* = .{
             .prefix = .{
@@ -643,7 +649,9 @@ fn fuzzValidateSortedAgreesWithValidate(_: void, smith: *std.testing.Smith) !voi
     // O(n²) all-pairs scan -- the two implementations don't share any
     // duplicate-detection code (see [[feedback_a_test_that_reimplements_the_code_cannot_fail]]).
     var buf: [40]ClassifierRule = undefined;
-    const n = smith.index(buf.len + 1);
+    // check-fuzz-reach R1: same fix as fuzzValidateNeverPanics above -- a
+    // ranged draw as the FIRST draw collapses every seed to `n == 0`.
+    const n: usize = @intCast(smith.value(u64) % (buf.len + 1));
     for (buf[0..n]) |*r| {
         r.* = .{
             .prefix = .{

@@ -230,6 +230,11 @@ fn printQueryError(err: sntp.QueryError, kiss: sntp.KissOfDeath) void {
             "discarded -- origin-timestamp anti-spoof check failed (reply did not echo the T1 we sent, RFC 4330 Sec 5): a spoofed or badly broken reply\n",
             .{},
         ),
+        error.ClockUnavailable => std.debug.print("local clock unavailable (clock_gettime failed)\n", .{}),
+        error.EntropyUnavailable => std.debug.print(
+            "could not source secure entropy for the anti-spoof origin-timestamp nonce\n",
+            .{},
+        ),
         else => |e| printDecodeError(e, kiss),
     }
 }
@@ -286,6 +291,14 @@ fn printDecodeError(err: sntp.DecodeError, kiss: sntp.KissOfDeath) void {
         ),
         error.InvalidVersion => std.debug.print(
             "discarded -- reply has VN=0 (RFC 4330 Sec 5 sanity check 4, per Errata 2263)\n",
+            .{},
+        ),
+        error.UnsynchronizedLeap => std.debug.print(
+            "discarded -- Leap Indicator says unsynchronized (LI=3, RFC 4330 Sec 4's own \"alarm condition\"): the server itself reports its clock is not synchronized\n",
+            .{},
+        ),
+        error.ReceiveTimestampUnset => std.debug.print(
+            "discarded -- Receive Timestamp is unset (RFC 4330 Sec 5 sanity check 4): the server hasn't set its own clock yet\n",
             .{},
         ),
         error.NotServerMode => std.debug.print("discarded -- reply is not in server mode\n", .{}),
