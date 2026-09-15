@@ -1166,6 +1166,22 @@ test "F12: parseReply rejects every oper value except 2 (reply), enumerated 0..1
     }
 }
 
+test "F12: parseReply requires the outer Ethernet EtherType to actually be ARP, not just its high byte (m7/m8)" {
+    // m7 deletes `frame[12..14] != eth_p.arp` outright; m8 weakens it to
+    // compare only the high byte. Nothing else in `parseReply` looks at
+    // this field — the RFC 826 checks below it (ar$hrd/ar$pro/ar$hln/
+    // ar$pln, F2 above) start at byte 14 — and every ARP-reply vector
+    // already in this suite carries the correct 0x0806, so neither
+    // mutation was ever exercised. 0x0801 shares ARP's high byte (0x08)
+    // with IPv4's 0x0800 too, defeating m8's weakened comparison as well
+    // as m7's deletion. Everything past byte 14 is the real-capture
+    // golden, untouched.
+    var f = arp_reply_frame;
+    std.mem.writeInt(u16, f[12..14], 0x0801, .big);
+    try testing.expectEqual(@as(?arp.Reply, null), arp.parseReply(&f));
+    try testing.expect(arp.parseReply(&arp_reply_frame) != null); // positive control, untouched golden
+}
+
 test "F16: ifaceIndexOn rejects an over-length interface name before any syscall" {
     // `m21`: deleting `name.len == 0 or name.len > 15` survived the test
     // gate in BOTH lanes and, in ReleaseFast, the module's own example
@@ -1599,6 +1615,40 @@ fn bringLoopbackUp() void {
     _ = linux.ioctl(fd, linux.SIOCSIFFLAGS, @intFromPtr(&req));
 }
 
+/// `Socket.recv`, bounded by an independent wall-clock deadline instead of
+/// trusting the caller's own `recv_timeout_ms` setup — a test-only safety
+/// net. `Socket.open`'s `SO_RCVTIMEO` guard (F13) is what normally turns a
+/// quiet socket's blocking `recv` into `error.WouldBlock`; with that guard
+/// broken (F12 m25 removes it outright) `recv` blocks forever, which would
+/// hang the whole test binary rather than fail one test. The real receive
+/// runs on a detached thread; THIS function's own deadline doesn't depend
+/// on the very timeout it exists to hold accountable. A watchdog timeout
+/// reports `error.RecvFailed` — every call site below already treats a
+/// non-WouldBlock/Interrupted `RecvError` as a hard test failure, so this
+/// makes a broken guard fail loudly instead of wedging the gate. See
+/// `A1/rawsock.md` F12.
+fn recvWatchdog(sock: Socket, buf: []u8, deadline_ms: u64) RecvError!Frame {
+    const Watch = struct {
+        sock: Socket,
+        buf: []u8,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        result: RecvError!Frame = undefined,
+        fn run(self: *@This()) void {
+            self.result = self.sock.recv(self.buf);
+            self.done.store(true, .release);
+        }
+    };
+    var w = Watch{ .sock = sock, .buf = buf };
+    const th = std.Thread.spawn(.{}, Watch.run, .{&w}) catch return sock.recv(buf);
+    th.detach();
+    var waited_ms: u64 = 0;
+    while (!w.done.load(.acquire) and waited_ms < deadline_ms) : (waited_ms += 20) {
+        _ = linux.nanosleep(&.{ .sec = 0, .nsec = 20_000_000 }, null);
+    }
+    if (!w.done.load(.acquire)) return error.RecvFailed; // the watchdog itself ran out, not the syscall
+    return w.result;
+}
+
 test "ipv4Addr / ipv4Netmask: real ioctl on `lo` (unprivileged — no CAP_NET_RAW needed)" {
     // Unlike the Socket.open tests below, ipv4Addr/ipv4Netmask (like hwaddr
     // and ifaceName) only need a throwaway AF_INET/SOCK_DGRAM socket for the
@@ -1642,6 +1692,59 @@ test "capture socket: open + setFilter + setPromisc (needs CAP_NET_RAW)" {
     try sock.setPromisc(lo, false);
 }
 
+test "F12: setFilter rejects an empty BPF program instead of attaching it (m20, needs CAP_NET_RAW)" {
+    // m20 deletes `prog.len == 0 or prog.len > maxInt(u16)` from
+    // `attachFilter`. Nothing in the suite ever called `setFilter` with an
+    // empty program, so the bound was never exercised in either lane.
+    var sock = Socket.open(test_ethertype, .{ .iface = "lo" }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer sock.close();
+    try testing.expectError(error.InvalidFilter, sock.setFilter(&[_]BpfInsn{}));
+    try sock.setFilter(&etherTypeFilter(test_ethertype)); // positive control: a real program still attaches
+}
+
+// F12 m33 (`setPromisc(false)` issuing ADD instead of DROP_MEMBERSHIP): no
+// permanent test below. Measured directly (ioctl SIOCGIFFLAGS, `/sys/class/
+// net/<if>/flags`, and `ip link show`, cross-checked against a real `dummy`
+// netdevice as well as `lo`): in this sandbox (nested user+net namespace),
+// `setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP/DROP_MEMBERSHIP,
+// PACKET_MR_PROMISC)` returns success but never visibly toggles
+// `IFF_PROMISC`, and a second DROP_MEMBERSHIP for an already-removed
+// membership also returns success rather than `EADDRNOTAVAIL` — both
+// channels the real (unmutated) code would need to distinguish itself from
+// m33 are no-ops here. `ip link set <if> promisc on` (netlink, a different
+// kernel path) DOES flip the flag, confirming the ioctl read path itself is
+// correct — the gap is specific to the `PACKET_MR_PROMISC` membership call
+// this sandbox. No reliable RED/GREEN could be produced; per
+// `FIXER-AGENT-BRIEF.md` a finding without a working measurement is not
+// checked off. m33 stays open. See `A1/rawsock.md` dispozice 2026-09-16.
+
+test "F12: openInject's interface bind is not load-bearing for send() (m35 — equivalent mutation, documented not tested)" {
+    // Measured directly: `send()`/`sendRaw()` specify `ifindex` explicitly
+    // in the `sockaddr_ll` passed to every `sendto(2)` call, and Linux
+    // honors that per-call destination regardless of whether the socket
+    // was ever `bind`-ed. A hand-built AF_PACKET DGRAM socket with NO bind
+    // at all (exactly what m35 leaves `openInject` producing) sends
+    // successfully here — the same outcome the real `openInject` (which
+    // does call `bindPacket`) produces. m35 is a genuine equivalent
+    // mutant, matching the audit's own original assessment; this test
+    // pins the measurement instead of leaving it as an unverified claim.
+    // See `A1/rawsock.md` F12.
+    const lo = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    const rc = linux.socket(linux.AF.PACKET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return error.SkipZigTest; // no CAP_NET_RAW
+    var unbound = Socket{ .fd = @intCast(rc) };
+    defer unbound.close();
+    const dst = [_]u8{ 0x02, 0, 0, 0, 0, 0x01 };
+    unbound.send(lo, dst, test_ethertype, "m35-unbound-send-still-works") catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+}
+
 test "loopback round-trip: inject a frame, capture it back (needs CAP_NET_RAW + netns)" {
     const lo = ifaceByName("lo") catch return error.SkipZigTest;
     // Bring `lo` up *before* binding the capture: a socket bound to a down
@@ -1673,7 +1776,7 @@ test "loopback round-trip: inject a frame, capture it back (needs CAP_NET_RAW + 
     var buf: [2048]u8 = undefined;
     var tries: usize = 0;
     while (tries < 8) : (tries += 1) {
-        const frame = cap.recv(&buf) catch |e| switch (e) {
+        const frame = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
             // No loopback traffic in this environment — env-limited, not a bug.
             error.WouldBlock, error.Interrupted => return error.SkipZigTest,
             else => return e,
@@ -1686,6 +1789,178 @@ test "loopback round-trip: inject a frame, capture it back (needs CAP_NET_RAW + 
         }
     }
     return error.SkipZigTest; // couldn't observe it within the window
+}
+
+test "F12: loopback capability is proven independently of open()'s bind and send()'s wire encoding, so a broken one FAILS instead of SKIPPING (m26/m27/m31, needs CAP_NET_RAW + netns)" {
+    // The "loopback round-trip" test above (and F10/F4's) already prove the
+    // mechanism works on an unmutated tree, but their own "didn't see it"
+    // branch is `return error.SkipZigTest` — meant for a genuinely
+    // loop-incapable environment, not for a broken module. m26 (`open`
+    // never binds the capture socket), m27 (`bindPacket` always binds
+    // protocol 0), and m31 (`bindPacket`'s protocol byte order corrupted)
+    // each make the capture socket receive nothing at all — and the
+    // existing tests' own SkipZigTest fallback quietly absorbs exactly
+    // that outcome as "environment can't loop back", leaving the gate
+    // green while coverage silently drops. See A1/rawsock.md F12.
+    //
+    // Phase 1 below establishes "this netns CAN loop a frame back" through
+    // a path independent of `Socket.open`/`bindPacket`/`Socket.send`
+    // (hand-inlined socket+bind, `Socket.sendRaw` + `Socket.recv` only —
+    // neither touched by any of the three mutations). Phase 2 repeats the
+    // same round trip through the public API; once phase 1 has already
+    // proven the environment works, a miss in phase 2 is the module's own
+    // fault and MUST fail, not skip.
+    const lo = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+
+    // ── Phase 1: environment control ──
+    const probe_proto = std.mem.nativeToBig(u16, eth_p.all);
+    const probe_rc = linux.socket(linux.AF.PACKET, linux.SOCK.RAW | linux.SOCK.CLOEXEC, probe_proto);
+    if (linux.errno(probe_rc) != .SUCCESS) return error.SkipZigTest; // no CAP_NET_RAW
+    var probe = Socket{ .fd = @intCast(probe_rc) };
+    defer probe.close();
+    setRcvTimeout(probe.fd, 300) catch return error.SkipZigTest;
+    var probe_sll = linux.sockaddr.ll{
+        .protocol = probe_proto,
+        .ifindex = lo,
+        .hatype = 0,
+        .pkttype = 0,
+        .halen = 0,
+        .addr = @splat(0),
+    };
+    if (linux.errno(linux.bind(probe.fd, @ptrCast(&probe_sll), @sizeOf(linux.sockaddr.ll))) != .SUCCESS)
+        return error.SkipZigTest;
+
+    const probe_marker = "rawsock-f12-env-control";
+    var probe_frame: [eth_hdr_len + probe_marker.len]u8 = undefined;
+    probe_frame[0..6].* = [_]u8{ 0x02, 0, 0, 0, 0, 0x01 };
+    probe_frame[6..12].* = [_]u8{ 0x02, 0, 0, 0, 0, 0x02 };
+    std.mem.writeInt(u16, probe_frame[12..14], test_ethertype, .big);
+    @memcpy(probe_frame[eth_hdr_len..], probe_marker);
+    probe.sendRaw(lo, &probe_frame) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    var env_ok = false;
+    {
+        var pbuf: [256]u8 = undefined;
+        var i: usize = 0;
+        while (i < 8) : (i += 1) {
+            const frame = probe.recv(&pbuf) catch break;
+            if (std.mem.indexOf(u8, frame.bytes, probe_marker) != null) {
+                env_ok = true;
+                break;
+            }
+        }
+    }
+    if (!env_ok) return error.SkipZigTest; // this netns genuinely can't loop a frame back
+
+    // ── Phase 2: same round trip, public API, must NOT skip on a miss ──
+    var cap = Socket.open(test_ethertype, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    var inj = Socket.openInject(lo) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer inj.close();
+    const marker = "rawsock-f12-seam-check";
+    const dst = [_]u8{ 0x02, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    inj.send(lo, dst, test_ethertype, marker) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    var found = false;
+    var buf: [2048]u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const frame = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
+            error.WouldBlock, error.Interrupted => break,
+            else => return e,
+        };
+        const eth = EthHeader.parse(frame.bytes) orelse continue;
+        if (eth.ethertype != test_ethertype) continue;
+        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], marker) != null) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "F12: send() writes the requested destination MAC into the outgoing frame (m30 — equivalent mutation, documented not tested)" {
+    // m30 sets `.halen = 0` in `send`'s sockaddr_ll while `.addr` still
+    // carries the caller's `dst_hwaddr` bytes. Measured directly (not
+    // assumed): on this kernel, over `lo`, a captured frame's destination
+    // is byte-identical whether `send` reports `halen = 6` or `halen = 0`
+    // — the kernel evidently uses `sll_addr` regardless of the length it
+    // was told, at least for this device/family combination. This test
+    // originally hypothesized a real difference (loopback's `eth_header`
+    // falling back to an all-zero destination when `sll_addr` is treated
+    // as absent); that hypothesis did not hold up against `mutate.py`
+    // (m30 still SURVIVED after this test was added). Confirms the
+    // original audit's own "equivalent mutant" classification
+    // (`probe cooseddst`) rather than contradicting it. Kept as a pinned
+    // measurement, not a claimed kill. See A1/rawsock.md F12.
+    const lo = ifaceByName("lo") catch return error.SkipZigTest;
+    bringLoopbackUp();
+    var cap = Socket.open(test_ethertype, .{ .iface = "lo", .recv_timeout_ms = 300 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    var inj = Socket.openInject(lo) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer inj.close();
+
+    const dst = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01 }; // deliberately non-zero
+    const marker = "rawsock-f12-halen-check";
+    inj.send(lo, dst, test_ethertype, marker) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest,
+        else => return e,
+    };
+
+    var buf: [2048]u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const frame = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
+            error.WouldBlock, error.Interrupted => return error.SkipZigTest,
+            else => return e,
+        };
+        const eth = EthHeader.parse(frame.bytes) orelse continue;
+        if (eth.ethertype != test_ethertype) continue;
+        if (std.mem.indexOf(u8, frame.bytes[eth_hdr_len..], marker) != null) {
+            try testing.expectEqual(dst, eth.dst);
+            return;
+        }
+    }
+    return error.SkipZigTest; // couldn't observe it within the window
+}
+
+test "F12: recv_timeout_ms actually bounds a blocking recv() (m25, needs CAP_NET_RAW + netns)" {
+    // m25 deletes the whole `setRcvTimeout` guard in `open` (F13's own
+    // fix). The socket then blocks in `recv` forever on a quiet interface
+    // instead of returning `error.WouldBlock` — which would hang the test
+    // binary, not just fail a check (measured: `mutate.py`'s netns lane
+    // never returned within a 90s subprocess timeout). `recvWatchdog`
+    // (used here and, since this finding, by every other blocking-recv
+    // test in this file) keeps that hang from reaching this test itself:
+    // it reports `error.RecvFailed` on ITS OWN deadline instead of the
+    // real `recv` ever returning. `expectError(WouldBlock, ...)` below
+    // fails on exactly that substitute error when the guard is missing —
+    // not just a generic "didn't work". See A1/rawsock.md F12.
+    bringLoopbackUp();
+    var cap = Socket.open(test_ethertype, .{ .iface = "lo", .recv_timeout_ms = 200 }) catch |e| switch (e) {
+        error.AccessDenied, error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer cap.close();
+    var buf: [128]u8 = undefined;
+    try testing.expectError(error.WouldBlock, recvWatchdog(cap, &buf, 2000));
 }
 
 test "A1 F10: the pre-bind window now matches nothing (protocol 0), and bindPacket restores delivery atomically (needs CAP_NET_RAW + netns)" {
@@ -1737,7 +2012,7 @@ test "A1 F10: the pre-bind window now matches nothing (protocol 0), and bindPack
     {
         var tries: usize = 0;
         while (tries < 4) : (tries += 1) {
-            const frame = cap.recv(&buf) catch |e| switch (e) {
+            const frame = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
                 error.WouldBlock, error.Interrupted => break,
                 else => return e,
             };
@@ -1762,7 +2037,7 @@ test "A1 F10: the pre-bind window now matches nothing (protocol 0), and bindPack
     var seen_after_bind = false;
     var tries: usize = 0;
     while (tries < 8) : (tries += 1) {
-        const frame = cap.recv(&buf) catch |e| switch (e) {
+        const frame = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
             error.WouldBlock, error.Interrupted => break,
             else => return e,
         };
@@ -1827,7 +2102,7 @@ test "F4: setFilter after open() leaks a frame queued in the window; Options.fil
         var saw_control = false;
         var tries: usize = 0;
         while (tries < 12 and !(saw_leak and saw_control)) : (tries += 1) {
-            const f = cap.recv(&buf) catch |e| switch (e) {
+            const f = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
                 error.WouldBlock, error.Interrupted => break,
                 else => return e,
             };
@@ -1873,7 +2148,7 @@ test "F4: setFilter after open() leaks a frame queued in the window; Options.fil
         var buf: [256]u8 = undefined;
         var tries: usize = 0;
         while (tries < 8) : (tries += 1) {
-            const f = cap.recv(&buf) catch |e| switch (e) {
+            const f = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
                 error.WouldBlock, error.Interrupted => break,
                 else => return e,
             };
@@ -1946,7 +2221,7 @@ test "F3 fix: an 802.1Q tag is stripped from bytes (skb_vlan_untag) before this 
     var buf: [256]u8 = undefined;
     var tries: usize = 0;
     while (tries < 8) : (tries += 1) {
-        const f = cap.recv(&buf) catch |e| switch (e) {
+        const f = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
             error.WouldBlock, error.Interrupted => return error.SkipZigTest,
             else => return e,
         };
@@ -2078,7 +2353,7 @@ test "F5 fix: Socket.stats() reports a real packet count (needs CAP_NET_RAW + ne
     var tries: usize = 0;
     var seen = false;
     while (tries < 8 and !seen) : (tries += 1) {
-        const frame = cap.recv(&buf) catch |e| switch (e) {
+        const frame = recvWatchdog(cap, &buf, 2000) catch |e| switch (e) {
             error.WouldBlock, error.Interrupted => break,
             else => return e,
         };
