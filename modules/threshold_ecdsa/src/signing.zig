@@ -486,9 +486,9 @@ fn runCheckedMtA(
     random: std.Random,
 ) SignError!struct { alpha: Scalar, beta: Scalar } {
     const alice_init = alice_range.init;
-    const bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
-    const beta_prime = bob_resp.beta.neg();
-    const mta_proof = try zkproofs.proveBobMta(allocator, bob_secret, beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, random);
+    var bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
+    defer std.crypto.secureZero(u8, &bob_resp.beta_prime);
+    const mta_proof = try zkproofs.proveBobMta(allocator, bob_secret, &bob_resp.beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, random);
     defer mta_proof.deinit(allocator);
 
     const alpha = try mta.mtaAliceFinalizeChecked(alice_init.c_a, bob_resp.c_b, mta_proof, alice_sk, alice_pk, alice_aux);
@@ -517,9 +517,9 @@ fn runCheckedMtAwc(
     random: std.Random,
 ) SignError!struct { alpha: Scalar, beta: Scalar } {
     const alice_init = alice_range.init;
-    const bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
-    const beta_prime = bob_resp.beta.neg();
-    const wc_proof = try zkproofs.proveBobMtaWc(allocator, bob_secret, beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point, random);
+    var bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
+    defer std.crypto.secureZero(u8, &bob_resp.beta_prime);
+    const wc_proof = try zkproofs.proveBobMtaWc(allocator, bob_secret, &bob_resp.beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point, random);
     defer wc_proof.deinit(allocator);
     if (!zkproofs.verifyBobMtaWc(wc_proof, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point)) return error.InvalidMtaProof;
 

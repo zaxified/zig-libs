@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **SECURITY + BREAKING (signature) + BEHAVIOURAL:** audit F5. MtA drew Bob's
+  blind `β'` from `Zq`, so the integer Alice decrypts, `α' = a·b + β'`, was `a·b` plus a blind
+  `q` times too small to hide it: Alice (who knows `a`) recovered Bob's `b` from `α'/a` in 4/4
+  semi-honest and 3/4 checked-path trials. In `signWithShares` `b` is `γ_j` and the
+  Lagrange-weighted key share `w_j`, so every signer learned every other signer's `w_j`.
+  `mtaBobResponse` now draws `β' ← Z_N` (GG18 §3); `mtaBobResponseChecked` draws `β' ← Z_{q⁵}`
+  (tss-lib `BobMid`), returns it as the new field `BobResponseChecked.beta_prime`, and refuses
+  `N <= q⁷` with the new `MtaError.PaillierModulusBelowFloor`. `zkproofs.proveBobMta`/
+  `proveBobMtaWc` take `beta_prime: *const [beta_prime_bytes]u8` instead of a `Scalar`; new public
+  `zkproofs.beta_prime_bytes` and `zkproofs.q5_bytes`. Signatures produced are unchanged in kind
+  (MtA randomness never reaches `r`/`s`). Two checked-path tests moved from 1024- to 2048-bit keys.
+
 - **2026-09-14** — **NO CONSUMER-VISIBLE CHANGE:** `paillier.PublicKey.fromBytes` and
   `SecretKey.fromBytes` now refuse an `n` below 512 bits (paillier audit F8). `PartyPublicKeys` and
   the keygen-output loader inherit that refusal for a toy key on the wire. The audit F3 (a) test

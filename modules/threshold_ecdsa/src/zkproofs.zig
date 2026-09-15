@@ -74,9 +74,10 @@
 //!     bounds `β' ∈ Z_{q⁵}` and checks `t1 <= q⁷` — this is the post-GG18
 //!     hardening that also bounds Bob's additive blind, closing the
 //!     unbounded-`β'` degree of freedom the Alpha-Rays class of attack
-//!     abuses. This module's checked-MtA wiring samples `β' ∈ Z_q`, well
-//!     inside `q⁵`, so honest proofs pass with slack; the bound is
-//!     strictly STRONGER than the paper's, never weaker). The wider
+//!     abuses. This module's checked-MtA wiring samples `β' ∈ Z_{q⁵}`,
+//!     exactly tss-lib's range (audit F5, 2026-09-16: it used to sample
+//!     `β' ∈ Z_q`, which passed the proof but let Alice recover `b` from
+//!     `α'/a`); the bound is strictly STRONGER than the paper's). The wider
 //!     `tau ∈ Z_{q³·N_tilde}` follows so `t2 = e·sigma + tau` remains
 //!     statistically hiding for `sigma ∈ Z_{q·N_tilde}`.
 //!
@@ -266,6 +267,16 @@ const q3_bytes = comptimeIntBytes(96, q_int * q_int * q_int);
 /// hardening; see the module doc comment — the GG18 paper itself leaves
 /// `y = β'` unbounded over `Z_N` and checks no `t1` bound).
 const q7_bytes = comptimeIntBytes(224, q_int * q_int * q_int * q_int * q_int * q_int * q_int);
+
+/// Width of Bob's MtA blind `β'` as the provers take it (big-endian).
+pub const beta_prime_bytes = 160;
+/// `q⁵` — the range Bob draws `β'` from (tss-lib `BobMid`/`BobMidWC`,
+/// `GetRandomPositiveInt(q5)`). Audit F5 (2026-09-16): `β'` used to be a
+/// `Zq` scalar, and a `~q` blind over `a·b ≈ q²` let Alice read `b` off her
+/// own decryption (`α'/a`). Over `q⁵`, `a·b` shifts the distribution by at most
+/// `q²/q⁵ = q⁻³`, and honest `t1 = e·β' + gamma < q⁶ + q⁷` still passes the
+/// `t1 <= q⁷` check except with probability `~1/q`.
+pub const q5_bytes = comptimeIntBytes(beta_prime_bytes, q_int * q_int * q_int * q_int * q_int);
 
 // ── byte-level big-integer helpers (schoolbook; no allocator) ────────────
 //
@@ -1467,10 +1478,14 @@ pub const MtaProof = struct {
 /// witness exists. `c_b` itself is passed explicitly (not re-derived
 /// internally) so the proof is guaranteed to bind to the SAME ciphertext
 /// the caller will actually send Alice.
+///
+/// `beta_prime` is Bob's blind as `mta.mtaBobResponseChecked` returns it
+/// (`BobResponseChecked.beta_prime`, big-endian, `< q⁵`) — the caller owns and
+/// zeroes it. Audit F5: this used to take a `Scalar`, i.e. a `Zq` blind.
 pub fn proveBobMta(
     allocator: std.mem.Allocator,
     b: Scalar,
-    beta_prime: Scalar,
+    beta_prime: *const [beta_prime_bytes]u8,
     r_b: paillier.Fe,
     c_a: paillier.Ciphertext,
     c_b: paillier.Ciphertext,
@@ -1481,9 +1496,7 @@ pub fn proveBobMta(
     try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var x_bytes = b.toBytes(.big);
     defer std.crypto.secureZero(u8, &x_bytes);
-    var y_bytes = beta_prime.toBytes(.big);
-    defer std.crypto.secureZero(u8, &y_bytes);
-    const out = try proveBobInner(allocator, &x_bytes, &y_bytes, r_b, c_a, c_b, alice_pk, verifier_aux, null, random);
+    const out = try proveBobInner(allocator, &x_bytes, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, null, random);
     return out.proof;
 }
 
@@ -1798,7 +1811,7 @@ pub const MtaProofWc = struct {
 pub fn proveBobMtaWc(
     allocator: std.mem.Allocator,
     b: Scalar,
-    beta_prime: Scalar,
+    beta_prime: *const [beta_prime_bytes]u8,
     r_b: paillier.Fe,
     c_a: paillier.Ciphertext,
     c_b: paillier.Ciphertext,
@@ -1810,9 +1823,7 @@ pub fn proveBobMtaWc(
     try validateReceivedParams(verifier_aux, alice_pk, random); // audit F1/F2, fail-closed
     var x_bytes = b.toBytes(.big);
     defer std.crypto.secureZero(u8, &x_bytes);
-    var y_bytes = beta_prime.toBytes(.big);
-    defer std.crypto.secureZero(u8, &y_bytes);
-    const out = try proveBobInner(allocator, &x_bytes, &y_bytes, r_b, c_a, c_b, alice_pk, verifier_aux, b_point, random);
+    const out = try proveBobInner(allocator, &x_bytes, beta_prime, r_b, c_a, c_b, alice_pk, verifier_aux, b_point, random);
     return .{ .base = out.proof, .u1_point = out.u1_point.? };
 }
 
@@ -2247,6 +2258,14 @@ test "GG18 A.1 reject (SECURITY-CRITICAL): tampered c_a and every mangled proof 
     try testing.expect(!verifyAliceRange(bad, c_a, pk, setup.aux));
 }
 
+/// A small test blind left-padded to the provers' `β'` width (value-identical
+/// to the 32-byte encoding `buildCb` folds into `c_b`).
+fn bpWide(s: Scalar) [beta_prime_bytes]u8 {
+    var out = [_]u8{0} ** beta_prime_bytes;
+    out[beta_prime_bytes - 32 ..].* = s.toBytes(.big);
+    return out;
+}
+
 test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertexts, and after a codec round-trip" {
     // Heavy: 2048-bit keygen. `threshold_ecdsa` is `heavy` in build.zig,
     // so the DEFAULT lane builds it at ReleaseSafe and DOES run this test;
@@ -2269,7 +2288,7 @@ test "GG18 A.3 honest accept: Bob's MtA proof over checked-MtA-shaped ciphertext
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
 
-    const proof = try proveBobMta(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, random);
+    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux));
 
@@ -2352,7 +2371,7 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
     const bp_bytes = beta_prime.toBytes(.big);
     const c_b = buildCb(pk, c_a, &b_bytes, &bp_bytes, r_b);
 
-    const proof = try proveBobMta(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, random);
+    const proof = try proveBobMta(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyBobMta(proof, c_a, c_b, pk, setup.aux)); // control
 
@@ -2364,12 +2383,12 @@ test "GG18 A.3 reject (SECURITY-CRITICAL): tampered c_b, wrong beta' witness, an
     // Wrong beta' witness: prover claims a beta' different from the one
     // actually folded into c_b (equations 4/5).
     const wrong_bp = scalarFromU64(0x4444);
-    const proof_wrong = try proveBobMta(allocator, b, wrong_bp, r_b, c_a, c_b, pk, setup.aux, random);
+    const proof_wrong = try proveBobMta(allocator, b, &bpWide(wrong_bp), r_b, c_a, c_b, pk, setup.aux, random);
     defer proof_wrong.deinit(allocator);
     try testing.expect(!verifyBobMta(proof_wrong, c_a, c_b, pk, setup.aux));
 
     // Wrong b witness too, for completeness (equations 3/5).
-    const proof_wrong_b = try proveBobMta(allocator, scalarFromU64(0x5555), beta_prime, r_b, c_a, c_b, pk, setup.aux, random);
+    const proof_wrong_b = try proveBobMta(allocator, scalarFromU64(0x5555), &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, random);
     defer proof_wrong_b.deinit(allocator);
     try testing.expect(!verifyBobMta(proof_wrong_b, c_a, c_b, pk, setup.aux));
 
@@ -2429,7 +2448,7 @@ test "GG18 A.2 MtAwc: honest accept; wrong B, tampered u1, and cross-protocol pr
     // B = b·G — the public point the proof must tie Bob's MtA input to.
     const b_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
 
-    const proof = try proveBobMtaWc(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, b_point, random);
+    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, b_point, random);
     defer proof.deinit(allocator);
     try testing.expect(verifyBobMtaWc(proof, c_a, c_b, pk, setup.aux, b_point));
 
@@ -2498,7 +2517,7 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     try testing.expect(!std.mem.eql(u8, &b_mismatch.toBytes(.big), &b.toBytes(.big)));
     const wrong_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b_mismatch.toBytes(.big), .big) catch unreachable) catch unreachable;
 
-    const proof = try proveBobMtaWc(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, wrong_point, random);
+    const proof = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, wrong_point, random);
     defer proof.deinit(allocator);
 
     // Equations 3-5 hold (same challenge on both sides, real Paillier
@@ -2509,7 +2528,7 @@ test "GG18 A.2 MtAwc check 6 in isolation: b does not match the agreed B, transc
     // that genuinely IS `b`'s discrete log passes — proves the rejection
     // above is about the b/B mismatch, not a broken predicate.
     const true_point = root.Element.fromPoint(root.Secp256k1.basePoint.mul(b.toBytes(.big), .big) catch unreachable) catch unreachable;
-    const proof_honest = try proveBobMtaWc(allocator, b, beta_prime, r_b, c_a, c_b, pk, setup.aux, true_point, random);
+    const proof_honest = try proveBobMtaWc(allocator, b, &bpWide(beta_prime), r_b, c_a, c_b, pk, setup.aux, true_point, random);
     defer proof_honest.deinit(allocator);
     try testing.expect(verifyBobMtaWc(proof_honest, c_a, c_b, pk, setup.aux, true_point));
 }
@@ -2559,7 +2578,7 @@ test "audit F1: proveAliceRange/proveBobMta fail-close on a crafted bad received
     const one_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 1) catch unreachable;
     const two_fe = paillier.Fe.fromPrimitive(u32, pk.n_sq, 2) catch unreachable;
     const c_dummy = paillier.encrypt(pk, one_fe, two_fe) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, b, bp, r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), random));
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, b, &bpWide(bp), r_b, c_dummy, c_dummy, pk, auxFromBytes(251, 2, 4), random));
 }
 
 test "audit F2: prove entry points fail-close on a sub-q⁷ modulus on the checked path" {
@@ -2711,7 +2730,7 @@ test "audit F3 (b): prove and verify entry points fail-close on a non-standard P
 
     // Bob's prover shares `validateReceivedParams`.
     const c_dummy_bad = paillier.encrypt(pk_bad, paillier.Fe.fromPrimitive(u32, pk_bad.n_sq, 1) catch unreachable, r_bad) catch unreachable;
-    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, a, a, r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, random));
+    try testing.expectError(error.InvalidAuxParams, proveBobMta(allocator, a, &bpWide(a), r_bad, c_dummy_bad, c_dummy_bad, pk_bad, good_aux, random));
 
     // Verify side (defense in depth): both verifiers reject outright.
     const dummy_range: RangeProof = .{

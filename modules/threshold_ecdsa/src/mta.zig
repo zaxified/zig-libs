@@ -23,7 +23,7 @@
 //!
 //! ```text
 //!   Alice → Bob :  c_A = Enc_A(a)                    (mtaAliceInit)
-//!   Bob:           β' ← Zq                           (fresh, uniform)
+//!   Bob:           β' ← Z_N  (checked path: Z_{q⁵})  (fresh, uniform)
 //!                  c_B = (b ⊙ c_A) ⊕ Enc_A(β')       (mtaBobResponse)
 //!                      = Enc_A(a·b + β')             (homomorphically)
 //!                  β  = −β' (mod q)
@@ -41,15 +41,18 @@
 //! is the load-bearing sign choice: `α` carries `+β'` (it decrypts
 //! `a·b + β'`), so `β` must carry `−β'` for the two to cancel.
 //!
+//! **The blind must dominate `a·b` (audit F5, 2026-09-16).** Alice decrypts
+//! the integer `α'` and knows `a`, so `β'` is the only thing hiding `b` from
+//! her. It used to be drawn from `Zq`: a `~q` blind over `a·b ≈ q²`, and
+//! `α'/a` gave `b` back. `mtaBobResponse` now draws `β'` from `Z_N` (GG18
+//! §3), `mtaBobResponseChecked` from `Z_{q⁵}` (tss-lib; the widest range the
+//! proof's `t1 <= q⁷` bound admits).
+//!
 //! **Z_N → Zq reduction:** `α' = Dec_A(c_B)` is a Paillier plaintext in
-//! `[0, N)` (N = Alice's Paillier modulus). Because `a, b < q` and `β' < q`,
-//! the integer `a·b + β' < q² + q`; as long as the Paillier modulus
-//! satisfies `N > q² + q` (true for any real 2048-bit Paillier key, and for
-//! the ≥1024-bit keys these tests use — see the range note below), the
-//! homomorphic sum never wraps mod N, so `α'` *is* the true integer
-//! `a·b + β'`. Alice reduces it into `Zq` with the curve's own wide
-//! reduction `Scalar.fromBytes64` (`α'` fits in 64 bytes since
-//! `a·b + β' < q² + q < 2^512`).
+//! `[0, N)` (N = Alice's Paillier modulus). On the checked path
+//! `a·b + β' < q² + q⁵ < N` (the `N > q⁷` floor), so `α'` is the true integer;
+//! on the semi-honest path it wraps with probability `< q²/N`. Alice reduces
+//! the full-width `α'` into `Zq` (`zkproofs.scalarFromWide`).
 //!
 //! ## Typing over `KeyShare`'s Paillier material
 //!
@@ -87,8 +90,9 @@
 //! constant-time `pow`/`mul` (Alice's secret exponent `lambda` never touches
 //! `powPublic`; see `paillier`'s own timing note), and `Scalar.neg`/
 //! `fromBytes64` are the curve's constant-time scalar-field ops. `β'` is
-//! sampled from CSPRNG bytes via `Scalar.fromBytes64`'s constant-time wide
-//! reduction. The one variable-time step is inside `paillier.decrypt`'s
+//! sampled from CSPRNG bytes by rejection (whether a draw is rejected is the
+//! discarded coin) and reduced mod `q` by `zkproofs.scalarFromWide`. The one
+//! variable-time step is inside `paillier.decrypt`'s
 //! `L`-function big-int division (a plaintext-derived value — see
 //! `paillier`'s SPEC timing note); that is inherited, not introduced here.
 
@@ -103,14 +107,18 @@ const zkproofs = @import("zkproofs.zig");
 /// exposes as `Scalar`.
 pub const Scalar = std.crypto.ecc.Secp256k1.scalar.Scalar;
 
-/// Errors MtA can surface, all inherited from the underlying `paillier`
-/// homomorphic-PKE ops (this module introduces no new failure mode of its
-/// own — every branch is either a `paillier` call or infallible curve
-/// arithmetic).
+/// Errors MtA can surface: the underlying `paillier` homomorphic-PKE ops,
+/// plus one precondition of the checked responder.
 pub const MtaError = paillier.EncryptError ||
     paillier.HomomorphicError ||
     paillier.DecryptError ||
-    std.crypto.ff.OverflowError;
+    std.crypto.ff.OverflowError ||
+    error{
+        /// `mtaBobResponseChecked`: Alice's Paillier `N` is not above `q⁷`
+        /// (`root.paillierNMeetsFloor`), so `a·b + β'` with `β' < q⁵` is not
+        /// guaranteed to stay below `N`.
+        PaillierModulusBelowFloor,
+    };
 
 /// Encode a `Zq` scalar as a Paillier plaintext `Fe` canonical mod `n_sq`
 /// (per `paillier`'s "Fe construction contract" — plaintexts/scalars used
@@ -160,39 +168,56 @@ pub const BobResponse = struct {
 };
 
 /// **Bob, round 2.** Given Alice's `c_A` and Alice's public key, Bob:
-///   1. samples a fresh uniform `β' ∈ Zq`;
+///   1. samples a fresh uniform `β' ∈ [1, N)` (GG18 §3: `β' ← Z_N`);
 ///   2. computes `c_B = (b ⊙ c_A) ⊕ Enc_A(β') = Enc_A(a·b + β')` via the
 ///      Paillier homomorphic ops (`mulPlaintext` then `addPlaintext`);
 ///   3. sets his additive share `β = −β' (mod q)`.
 ///
 /// Send `result.c_b` to Alice; keep `result.beta`.
 ///
-/// **Range precondition (semi-honest correctness):** requires Alice's
-/// Paillier modulus `N > q² + q` so `a·b + β'` never wraps mod N — trivially
-/// true for a real 2048-bit Paillier key (`q ≈ 2^256`, `q² ≈ 2^512 ≪ N`).
-/// A malicious Bob could pick `β'` out of range to attack Alice; the
-/// Phase-2c range proofs (TODO(2c)) are what forbid that.
+/// **Why `β'` spans `Z_N` (audit F5, 2026-09-16).** Alice decrypts the
+/// integer `α' = a·b + β'` and knows `a`. With `β' < q` (as this used to
+/// sample) `α'/a` IS `b` up to a few units — measured: Alice recovered `b` in
+/// 4 of 4 trials. Uniform over `Z_N`, `α'` carries no information about `b`.
+///
+/// **Range precondition (semi-honest correctness):** the sharing fails
+/// only when `a·b + β' ≥ N`, probability `< q²/N` (`< 2^-510` for a 1024-bit
+/// key). A malicious Bob could pick `β'` out of range to attack Alice; the
+/// checked path (`mtaBobResponseChecked` + `zkproofs`) is what forbids that.
 pub fn mtaBobResponse(
     b: Scalar,
     c_a: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     random: std.Random,
 ) MtaError!BobResponse {
-    const beta_prime = randomScalar(random);
+    const bp_fe = samplePaillierRandomness(alice_pk, random); // uniform in [1, N), canonical mod N²
 
     // c_B = Enc_A(a·b + β'): scale the encryption of a by the plaintext b,
     // then homomorphically add β'. (b = 0 is handled by mulPlaintext's k=0
-    // case → Enc(0); β' = 0 is the addPlaintext identity — both still yield
-    // a valid ciphertext that decrypts correctly.)
+    // case → Enc(0).)
     const b_fe = scalarToFe(b, alice_pk);
-    const bp_fe = scalarToFe(beta_prime, alice_pk);
     const c_ab = try paillier.mulPlaintext(alice_pk, c_a, b_fe);
     const c_b = try paillier.addPlaintext(alice_pk, c_ab, bp_fe);
 
     // β = −β' (mod q): the negation that makes α + β cancel β'.
-    const beta = beta_prime.neg();
+    var wide: [paillier.modulus_sq_bytes]u8 = undefined;
+    const nsq_len = (alice_pk.n_sq.bits() + 7) / 8;
+    defer std.crypto.secureZero(u8, wide[0..nsq_len]);
+    bp_fe.toBytes(wide[0..nsq_len], .big) catch unreachable; // n_sq-wide buffer
+    const beta = zkproofs.scalarFromWide(wide[0..nsq_len]).neg();
 
     return .{ .c_b = c_b, .beta = beta };
+}
+
+/// Uniform `β' ∈ [0, q⁵)` (tss-lib `BobMid`: `GetRandomPositiveInt(q5)`),
+/// big-endian, by rejection sampling — `q⁵`'s top byte is `0xff`, so a draw
+/// is rejected with probability `< 2^-120`.
+fn sampleBetaPrime(random: std.Random, out: *[zkproofs.beta_prime_bytes]u8) void {
+    comptime std.debug.assert(zkproofs.q5_bytes[0] == 0xff);
+    while (true) {
+        random.bytes(out);
+        if (std.mem.order(u8, out, &zkproofs.q5_bytes) == .lt) return;
+    }
 }
 
 /// **Alice, finalize.** Decrypt Bob's `c_B` with Alice's secret key and
@@ -326,6 +351,10 @@ pub const BobResponseChecked = struct {
     /// additive term — retain until `zkproofs.proveBobMta` has produced
     /// Bob's MtA proof, then zero it alongside `b`/`beta_prime`.
     r_b: paillier.Fe,
+    /// SECRET. Bob's blind `β' ∈ [0, q⁵)`, big-endian — the second witness
+    /// `zkproofs.proveBobMta`/`proveBobMtaWc` take. `beta` is `−β' mod q`,
+    /// which cannot stand in for it (audit F5). Zero it after proving.
+    beta_prime: [zkproofs.beta_prime_bytes]u8,
 };
 
 /// **Phase-2c Bob, round 2 — REAL plumbing, differs from `mtaBobResponse`
@@ -350,23 +379,33 @@ pub const BobResponseChecked = struct {
 /// `a·b + β'` — `mtaAliceFinalize`/`mtaAliceFinalizeChecked` accept
 /// either output identically — but only THIS version's `result.r_b` is a
 /// real witness for `zkproofs.proveBobMta`.
+///
+/// **`β' ∈ [0, q⁵)` (audit F5, 2026-09-16)** — tss-lib's range, the widest
+/// the `t1 <= q⁷` bound of Bob's proof admits with honest slack. It used to
+/// be a `Zq` scalar: Alice, who knows `a`, recovered Bob's `b` (`γ_j`, or the
+/// Lagrange-weighted key share `w_j` in MtAwc) from `α'/a` in 3 of 4 trials.
+/// Fails with `error.PaillierModulusBelowFloor` unless `N > q⁷`, the same
+/// floor the proofs enforce, so `a·b + β' < q² + q⁵` cannot wrap.
 pub fn mtaBobResponseChecked(
     b: Scalar,
     c_a: paillier.Ciphertext,
     alice_pk: paillier.PublicKey,
     random: std.Random,
 ) MtaError!BobResponseChecked {
-    const beta_prime = randomScalar(random);
+    if (!root.paillierNMeetsFloor(alice_pk)) return error.PaillierModulusBelowFloor;
+    var beta_prime: [zkproofs.beta_prime_bytes]u8 = undefined;
+    sampleBetaPrime(random, &beta_prime);
+    errdefer std.crypto.secureZero(u8, &beta_prime);
     const b_fe = scalarToFe(b, alice_pk);
-    const bp_fe = scalarToFe(beta_prime, alice_pk);
+    const bp_fe = paillier.Fe.fromBytes(alice_pk.n_sq, &beta_prime, .big) catch unreachable; // < q⁵ < N < N²
     const r_b = samplePaillierRandomness(alice_pk, random);
 
     const c_ab = try paillier.mulPlaintext(alice_pk, c_a, b_fe);
     const bp_enc = try paillier.encrypt(alice_pk, bp_fe, r_b);
     const c_b = paillier.addCiphertexts(alice_pk, c_ab, bp_enc);
 
-    const beta = beta_prime.neg();
-    return .{ .c_b = c_b, .beta = beta, .r_b = r_b };
+    const beta = zkproofs.scalarFromWide(&beta_prime).neg();
+    return .{ .c_b = c_b, .beta = beta, .r_b = r_b, .beta_prime = beta_prime };
 }
 
 /// Errors `mtaAliceFinalizeChecked` can surface beyond `MtaError`: a
@@ -565,8 +604,11 @@ test "MtA composes over real keygenTrustedDealer KeyShare Paillier material" {
 // dedicated accept/reject tests below.
 
 test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q), same as Phase 2b" {
+    // 2048-bit: `mtaBobResponseChecked` refuses N <= q⁷ (audit F5). Heavy
+    // lane is ReleaseSafe; skipped only under -Dstrict-debug.
+    if (builtin.mode == .Debug) return error.SkipZigTest;
     var kprng = std.Random.DefaultPrng.init(0x636865636b6564); // "checked"
-    const kp = try paillier.generate(kprng.random(), 1024);
+    const kp = try paillier.generate(kprng.random(), 2048);
 
     var prng = std.Random.DefaultPrng.init(0x636b645f72616e64); // "ckd_rand"
     const random = prng.random();
@@ -584,8 +626,9 @@ test "Phase 2c checked init/response compose correctly: α + β ≡ a·b (mod q)
 }
 
 test "Phase 2c: mtaBobResponseChecked's c_b differs byte-for-byte from mtaBobResponse's (fresh r_b changes the ciphertext, not the plaintext)" {
+    if (builtin.mode == .Debug) return error.SkipZigTest; // 2048-bit, see above
     var kprng = std.Random.DefaultPrng.init(0x64696666_6572); // "differ"
-    const kp = try paillier.generate(kprng.random(), 1024);
+    const kp = try paillier.generate(kprng.random(), 2048);
 
     var prng = std.Random.DefaultPrng.init(0x646966665f726e64); // "diff_rnd"
     const random = prng.random();
@@ -666,10 +709,10 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     defer alice_proof.deinit(testing.allocator);
     try testing.expect(zkproofs.verifyAliceRange(alice_proof, alice.c_a, kp.public, aux));
 
-    // Bob round 2 + his MtA proof (beta_prime = -beta mod q, the witness
+    // Bob round 2 + his MtA proof (beta_prime = the q⁵-range blind
     // mtaBobResponseChecked folded into c_b).
     const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
-    const beta_prime = bob.beta.neg();
+    const beta_prime = &bob.beta_prime;
     const bob_proof = try zkproofs.proveBobMta(testing.allocator, b, beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, random);
     defer bob_proof.deinit(testing.allocator);
 
@@ -687,4 +730,94 @@ test "Phase 2c end-to-end: mtaAliceInitChecked -> verifyAliceRange -> mtaBobResp
     const bad_proof = try zkproofs.proveBobMta(testing.allocator, b.add(Scalar.one), beta_prime, bob.r_b, alice.c_a, bob.c_b, kp.public, aux, random);
     defer bad_proof.deinit(testing.allocator);
     try testing.expectError(error.InvalidMtaProof, mtaAliceFinalizeChecked(alice.c_a, bob.c_b, bad_proof, kp.secret, kp.public, aux));
+}
+
+// ── audit F5 (2026-09-16): the plaintext Alice decrypts must hide Bob's b ──
+
+fn bigFromBytesTest(allocator: std.mem.Allocator, bytes: []const u8) !std.math.big.int.Managed {
+    var x = try std.math.big.int.Managed.initCapacity(allocator, bytes.len / @sizeOf(std.math.big.Limb) + 2);
+    errdefer x.deinit();
+    var m = x.toMutable();
+    m.readTwosComplement(bytes, bytes.len * 8, .big, .unsigned);
+    x.setMetadata(m.positive, m.len);
+    return x;
+}
+
+/// What any Alice can do with her OWN secret key: decrypt `c_B` to the integer
+/// `α' = a·b + β'`, divide by her own `a`, and test the few candidates next to
+/// the quotient against Bob's `b`. Returns whether one of them IS `b`.
+/// (Candidates are checked against the real `b` here; a real Alice checks them
+/// against the public point `B = b·G` or, for `γ_j`, the revealed `Γ_j`.)
+fn aliceRecoversBobsInput(
+    allocator: std.mem.Allocator,
+    c_b: paillier.Ciphertext,
+    sk: paillier.SecretKey,
+    a: Scalar,
+    b: Scalar,
+) !bool {
+    const plaintext = try paillier.decrypt(sk, c_b);
+    const n_len = sk.nByteLen();
+    var buf: [paillier.modulus_bytes]u8 = [_]u8{0} ** paillier.modulus_bytes;
+    try plaintext.toBytes(buf[0..n_len], .big);
+
+    var num = try bigFromBytesTest(allocator, buf[0..n_len]);
+    defer num.deinit();
+    var den = try bigFromBytesTest(allocator, &a.toBytes(.big));
+    defer den.deinit();
+    var want = try bigFromBytesTest(allocator, &b.toBytes(.big));
+    defer want.deinit();
+    var quot = try std.math.big.int.Managed.init(allocator);
+    defer quot.deinit();
+    var rem = try std.math.big.int.Managed.init(allocator);
+    defer rem.deinit();
+    try quot.divFloor(&rem, &num, &den);
+
+    // quot = b + floor(β'/a) when the blind is below a·b's scale.
+    var diff = try std.math.big.int.Managed.init(allocator);
+    defer diff.deinit();
+    try diff.sub(&quot, &want);
+    return diff.toConst().orderAgainstScalar(0) != .lt and diff.toConst().orderAgainstScalar(4) == .lt;
+}
+
+test "audit F5: Alice's own decryption of c_B must not reveal Bob's b (the β' blind must dominate a·b)" {
+    // GG18 §3 draws β' from Z_N and tss-lib/GG20 from Z_{q⁵}: in both, a·b < q²
+    // is a vanishing fraction of the blind. A β' < q cannot hide a·b ≈ q²:
+    // Alice, who knows a, reads b off α'/a.
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xF5_626c696e64); // "blind"
+    const random = prng.random();
+    const trials = 4;
+    var recovered = [2]usize{ 0, 0 };
+
+    // Semi-honest path (Phase 2b), 1024-bit key.
+    {
+        var kprng = std.Random.DefaultPrng.init(0xF5_0001);
+        const kp = try paillier.generate(kprng.random(), 1024);
+        for (0..trials) |_| {
+            const a = randomScalar(random);
+            const b = randomScalar(random);
+            const alice = try mtaAliceInit(a, kp.public, random);
+            const bob = try mtaBobResponse(b, alice.c_a, kp.public, random);
+            if (try aliceRecoversBobsInput(allocator, bob.c_b, kp.secret, a, b)) recovered[0] += 1;
+            // Positive control: the sharing itself still holds.
+            try expectAdditiveShare(a, b, try mtaAliceFinalize(bob.c_b, kp.secret), bob.beta);
+        }
+    }
+
+    // Checked path (Phase 2c, what signWithShares runs), 2048-bit key. Heavy
+    // lane is ReleaseSafe; skipped only under -Dstrict-debug.
+    if (builtin.mode != .Debug) {
+        var kprng = std.Random.DefaultPrng.init(0xF5_0002);
+        const kp = try paillier.generate(kprng.random(), 2048);
+        for (0..trials) |_| {
+            const a = randomScalar(random);
+            const b = randomScalar(random);
+            const alice = try mtaAliceInitChecked(a, kp.public, random);
+            const bob = try mtaBobResponseChecked(b, alice.c_a, kp.public, random);
+            if (try aliceRecoversBobsInput(allocator, bob.c_b, kp.secret, a, b)) recovered[1] += 1;
+            try expectAdditiveShare(a, b, try mtaAliceFinalize(bob.c_b, kp.secret), bob.beta);
+        }
+    }
+
+    try testing.expectEqualSlices(usize, &.{ 0, 0 }, &recovered);
 }

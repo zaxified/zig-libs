@@ -77,11 +77,23 @@ exercise the struct/codec.
 **β sign convention + Z_N→Zq reduction (MtA).** Bob's additive share is
 `β = −β' (mod q)` — the negation of the plaintext blinding `β'` he folds into
 `c_B = Enc_A(a·b + β')`; Alice's `α` decrypts `a·b + β'`, so the `±β'` cancel.
-Alice's decryption `α'` is a Paillier plaintext in `[0, N)`; since
-`a·b + β' < q² + q` and the protocol requires `N > q² + q` (satisfied by any
-real 2048-bit Paillier key, and by the ≥1024-bit keys the tests use), the
-homomorphic sum never wraps, so `α'` is the true integer `a·b + β' < 2^512`,
-reduced into Zq by the curve's constant-time `Scalar.fromBytes64`.
+Alice's decryption `α'` is a Paillier plaintext in `[0, N)`, reduced into Zq
+at full width.
+
+**The blind `β'` must dominate `a·b` (audit F5, fixed 2026-09-16).** Alice
+knows `a` and decrypts the integer `α' = a·b + β'`, so `β'` alone hides `b`.
+`β'` used to be a `Zq` scalar — a `~q` blind over `a·b ≈ q²` — and `α'/a`
+returned `b` to within a few units: measured, Alice recovered Bob's `b` in 4/4
+semi-honest and 3/4 checked-path trials (in signing, `b` is `γ_j` or the
+Lagrange-weighted key share `w_j`, so one signing session hands every signer
+every other signer's `w_j`, i.e. the group key). Now `mtaBobResponse` draws
+`β' ← Z_N` (GG18 §3) and `mtaBobResponseChecked` draws `β' ← Z_{q⁵}` (tss-lib
+`BobMid`/`BobMidWC`, `GetRandomPositiveInt(q5)`; the widest range Bob's
+`t1 <= q⁷` bound admits). `a·b` then moves the plaintext's distribution by at
+most `q²/N` resp. `q⁻³`. The checked responder refuses `N <= q⁷`
+(`error.PaillierModulusBelowFloor`), so `a·b + β' < q² + q⁵` cannot wrap;
+the semi-honest one wraps with probability `< q²/N`. Regression test:
+`mta.zig` "audit F5: Alice's own decryption of c_B must not reveal Bob's b".
 
 **MtA (`mtaAliceInit`/`mtaBobResponse`/`mtaAliceFinalize`) is SEMI-HONEST
 ONLY** — correct against passive adversaries, not secure against a malicious
@@ -232,7 +244,9 @@ and structurally cross-checked against bnb-chain/tss-lib's `crypto/mta`
     verifier checks `t1 <= q⁷`, which additionally BOUNDS Bob's additive
     blind `β'` — closing the unbounded-`β'` degree of freedom that the
     Alpha-Rays failure class abuses. This module's checked-MtA wiring samples
-    `β' ∈ Z_q` (well inside tss-lib's `q⁵`), so honest proofs pass with slack.
+    `β' ∈ Z_{q⁵}`, exactly tss-lib's range (audit F5: until 2026-09-16 it
+    sampled `β' ∈ Z_q`, which passed the proof and leaked `b` to Alice — see
+    "The blind `β'` must dominate `a·b`" above).
     **This "closing" is SIZE-CONDITIONAL (audit F2): the `t1 <= q⁷` bound only
     bites when the Paillier `N` (and ring-Pedersen `Ñ`) it lives over EXCEED
     `q⁷ ≈ 2^1792`. Below ~2048 bits the check is VACUOUS — a `<= q⁷` modulus
@@ -702,7 +716,7 @@ cannot show that no unabsorbed value matters.
 **A3 — Range-guarantee slack as actually used.** The paper concludes "the
 Verifier is convinced that `m ∈ [-q³, q³]`" from `s1 <= q³` with
 `alpha ∈ Z_{q³}`. This module's real callers feed `m ∈ Z_q` (`k_i`, the
-Lagrange-weighted `w_j`) and `β' ∈ Z_q` — far inside the bounds. *Property to
+Lagrange-weighted `w_j`) and `β' ∈ Z_{q⁵}` — inside the bounds. *Property to
 check:* that the honest completeness error stays at the paper's negligible
 `~1/q` with these inputs, and that the gap between "proved `≤ q³`" and
 "actually `< q`" does not leave an exploitable window when the same party
@@ -797,6 +811,18 @@ leakage estimation, or a proof that limb-count variance is bounded
 independent of the masked value), not another ctgrind context count. Track
 this the same way as this module's own F4(b)/(c): needs a specialist, not
 another fixer pass.
+
+**Update 2026-09-16 (audit F5, closed) — the question above was the wrong
+one.** The masked plaintext did not need a timing channel to leak: with
+`β' ∈ Zq`, Alice read `b` straight off `α'/a` (4/4 and 3/4 trials, see "The
+blind `β'` must dominate `a·b`"). With `β'` now drawn from `Z_N` / `Z_{q⁵}`,
+the plaintext is statistically independent of `k_i` and of `b` (distance
+`q²/N` resp. `q⁻³`), so no function of it — `divFloor`'s running time
+included — carries information about either. What `divFloor` still depends
+on is `λ`: `c^λ mod N² = 1 + (m·λ mod N)·N`, so `L(x) = m·λ mod N`, a
+function of Alice's long-term Paillier secret. That is `paillier`'s own
+constant-time question, measured by its `crt`/`noncrt` ctgrind rows, not a
+threshold-ECDSA one.
 
 **A6 — Protocol composition: Πprm/Πmod is not auto-exchanged online.**
 `aux_proofs.proveWellFormed`/`verifyWellFormed` close audit F1's residuosity

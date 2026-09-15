@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** comment in `decrypt` corrected
+  (threshold_ecdsa F5). It said the key never reaches the `divFloor` in `L(x)`; the quotient is
+  `m·λ mod n`, so it does. It also left open whether the `Zq`-masked MtA plaintext was exploitable;
+  that plaintext leaked `b` outright and `threshold_ecdsa` now draws `β'` from `Z_N` / `Z_{q⁵}`.
+
 - **2026-09-14** — **BEHAVIOURAL (refuses more):** audit F8, user decision (floor on the byte
   loaders only). `PublicKey.fromBytes` accepted any odd `n` that fit `modulus_bytes` — a prime
   `n = 3`, a 4-bit `n = 15`. It and `SecretKey.fromBytes` now refuse an `n` shorter than the new
