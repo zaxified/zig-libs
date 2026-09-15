@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — A1 fix campaign, F4 (performance, concurrency):
+  `AccessLog.log` with `synchronized = true` no longer holds its spinlock
+  across `writer.flush()`. Every other request thread used to spin for the
+  whole write syscall: into a plain file, 25.4 µs of CPU per line at 8
+  threads against 1.47 µs at one, and a slower sink scaled that up with it.
+  Concurrent calls now share the writer through a group commit: a line is
+  formatted under the lock into an inline pending batch; at most one call
+  (the flusher) touches `writer`, with the lock released, swapping each
+  batch out before writing it; a line too long for a batch is written whole
+  by its own caller once it owns the writer; and the flusher hands the role
+  to a caller waiting on a full batch, so no single request writes everyone
+  else's lines indefinitely. Lines are still never torn and keep per-thread
+  order; when no call is in flight every line has been written and flushed,
+  so there is still no `deinit`. Public API unchanged; `AccessLog` grows by
+  its two 4 KiB batch buffers. Measured (ReleaseFast, 7 interleaved reps,
+  file sink, CPU per line before/after per rep): 2 threads 3.35× (2.58–3.96),
+  4 threads 3.44× (3.23–4.01), 8 threads 3.02× (2.61–6.66), 1 thread 0.99×
+  (noise); with a 0.2 ms sink at 8 threads 17.9× (5.66–29.2).
 - **2026-09-12** — A1 fix campaign round 2, decision Q1 (this module's only
   in-repo consumers are `modules/metrics/example` and
   `example-apps/http-service`, which the burndown's "konz." column does not

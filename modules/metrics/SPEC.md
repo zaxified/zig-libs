@@ -18,6 +18,14 @@ sections; `writeText` holds the lock only to snapshot the family/children pointe
 formatting a large registry no longer blocks concurrent registrations or other
 scrapers (no cache, so the O(series) formatting cost itself is still paid on every
 scrape — see the module's audit, F2, fixed 2026-09-15).
+`AccessLog` (`synchronized = true`) never holds its lock across `writer` I/O (audit F4, fixed
+2026-09-16): lines are formatted under the lock into an inline batch, and a single flusher — one
+of the calling threads, never a background thread — swaps the batch out and writes/flushes it with
+the lock released. Invariants: a line enters the batch whole or not at all (a line longer than a
+batch is written whole by its caller as flusher, after the batch queued before it); per-thread line
+order is preserved; `flushing` is cleared only with an empty batch or a waiter present, so a
+non-empty batch always has a live call committed to writing it; with no call in flight the batch is
+empty, so there is no `deinit`. Writer errors are swallowed by whichever call was flusher.
 `RequestMetrics` middleware (request counter by method+status-class, latency histogram, in-flight
 gauge, optional `on_request` access-log hook) wraps `next` so 404/405/429/503 short-circuits are
 measured; series-creation OOM skips recording but never fails the request. Exposition deviations
