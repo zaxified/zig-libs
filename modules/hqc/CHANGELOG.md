@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** `gf2x.zig`'s internal `reduceProduct`
+  (the mod-`(X^n-1)` fold at the end of every ring multiply) now folds the extended
+  product a `u64` word at a time instead of one bit at a time (A1 M3). Bit-for-bit
+  equivalent (new differential test against the original algorithm, kept as a test-only
+  oracle) and ~15-17% faster per KEM operation on hqc-128 (measured, see `A1/hqc.md`'s
+  M3 disposition). Private function, no signature or behavior a caller can observe.
+
 - **2026-09-09** — **Constant-time fix (3/3): two more masks the compiler had undone.** `reedsolomon`'s `maskNonzero` (the reference's `-(int32_t)x >> 31` trick) and Berlekamp-Massey's `mask12` are laundered through an inline-asm barrier. Both were written branch-free and both were compiled back to branches — 3 measured contexts, at `computeErrorValues` (`x` = `err[i]`) and inside `computeElp`. The barrier sits INSIDE `maskNonzero` rather than at the two call sites that branch today, because `fss` showed one inline function compiling both ways in a single binary. ⭐ `decaps` in-file contexts **5 → 2**; these three cost nothing measurable (bench inside the previous spread), so the +7.3% recorded above is the `gf256` algorithm swap alone. ⭐⭐ **Everything now remaining, in every target, is `sampleFixedWeightRejection`** (`prng.zig:216` the rejection loop, `:223` the accept decision). ⛔ Deliberately NOT masked: the leak is the enclosing loop's trip count, so masking `:223` would remove the memcheck context and leave the timing signal — a prettier measurement of the same defect. Spec v5.0.0 §3.5 requires that sampler for keygen's `x`/`y`; see SPEC.md.
 
 - **2026-09-09** — **Constant-time fix (2/2).** `sampleFixedWeightBiased`'s duplicate-fixup pass blends under an arithmetic mask instead of `if (found) support[idx] = idx`. The scan was already early-exit-free, but the DECISION still branched on `found`, which is derived from the secret support — 3 measured contexts. Same value written, no branch taken. ⭐ With this and the `gf256` change, `encaps` reaches **0 in-file contexts** and `decaps` **14 → 5**. ⛔ The 5 that remain are by design, not oversight: 3 in `reedsolomon` (Berlekamp-Massey's discrepancy test, and `encode` on the re-encryption path) and 2 in `prng` — the rejection loop's trip count, which spec v5.0.0 §3.5 REQUIRES for keygen's `x`/`y`, and `decaps` re-derives `y` from `seed_dk` on every call because the spec fixes a seed-sized `dkKEM`. Sampling `y` the cheap way would produce a different key from the same seed and stop being HQC v5.0.0; it is recorded in SPEC.md rather than silently fixed.

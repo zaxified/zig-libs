@@ -280,10 +280,41 @@ pub fn Ring(comptime n: u32) type {
 
         /// Fold a full carryless product `acc` (bits [0, 2n-2]) mod
         /// (X^n - 1) into a canonical Elem: bit position p >= n maps to bit
-        /// (p - n) since X^n = 1 in this ring. Branch-free (bit extraction
-        /// + shift-back, no `if` on any secret bit value). Shared by both
-        /// the portable and the CLMUL multiply.
-        fn reduceProduct(acc: *[ext_words]u64) Elem {
+        /// (p - n) since X^n = 1 in this ring, i.e. the high half of `acc`
+        /// (bits [n, 2n-2]) gets XORed into the low half, shifted right by
+        /// `n` bits. This folds a whole `u64` word per loop step instead of
+        /// one bit (A1 audit finding M3: the bit-at-a-time version this
+        /// replaced cost 12-22% of every ring multiply). `n` is a public,
+        /// comptime parameter (never secret), and the shift amount and loop
+        /// trip count depend only on it — same control-flow shape as the
+        /// bit-loop it replaces, just wider per step, so no new
+        /// data-dependent branch or memory-access pattern is introduced (see
+        /// module doc's constant-time note; `reduceProductBitwiseRef` below
+        /// pins bit-for-bit equivalence with the original definition).
+        /// Shared by both the portable and the CLMUL multiply.
+        fn reduceProduct(acc: *const [ext_words]u64) Elem {
+            const word_shift = n / 64;
+            const bit_shift: u6 = @intCast(n % 64);
+            var out: Elem = undefined;
+            if (bit_shift == 0) {
+                for (0..words) |k| out[k] = acc[k] ^ acc[word_shift + k];
+            } else {
+                const inv_shift: u6 = @intCast(64 - @as(u32, bit_shift));
+                for (0..words) |k| {
+                    const idx = word_shift + k;
+                    out[k] = acc[k] ^ (acc[idx] >> bit_shift) ^ (acc[idx + 1] << inv_shift);
+                }
+            }
+            maskTop(&out);
+            return out;
+        }
+
+        /// Reference oracle for `reduceProduct`: the original bit-at-a-time
+        /// fold (audit M3's baseline), kept ONLY so the word-batched
+        /// production fold above can be pinned against the spec's literal
+        /// definition instead of against itself. Not on any production path.
+        fn reduceProductBitwiseRef(acc_in: [ext_words]u64) Elem {
+            var acc = acc_in;
             var p: u32 = n;
             while (p <= 2 * n - 2) : (p += 1) {
                 const bit = (acc[p / 64] >> @intCast(p % 64)) & 1;
@@ -434,6 +465,53 @@ test "hqc ring: CLMUL+Karatsuba multiply == schoolbook oracle (differential)" {
     try testClmulDifferential(R128, 101);
     try testClmulDifferential(R192, 102);
     try testClmulDifferential(R256, 103);
+}
+
+/// Differential (A1 finding M3): the word-batched `reduceProduct` must fold
+/// every extended accumulator identically to `reduceProductBitwiseRef`, the
+/// original bit-at-a-time definition. Random accumulators plus the two
+/// extremes (all-zero, every meaningful bit set) with bits beyond position
+/// 2n-2 forced to zero -- the invariant a real carryless product always
+/// satisfies (see `reduceProduct`'s own doc comment) and which the
+/// word-batched fold relies on to treat "the rest of the high half" as
+/// already-zero padding.
+fn testReduceProductDifferential(comptime R: type, seed: u64) !void {
+    const t = std.testing;
+    var rng = std.Random.DefaultPrng.init(seed);
+    const random = rng.random();
+    const ew = 2 * R.words;
+
+    const zeroAboveMeaningful = struct {
+        fn call(acc: *[ew]u64) void {
+            var p: u32 = 2 * R.bit_len - 1;
+            const total_bits = ew * 64;
+            while (p < total_bits) : (p += 1) {
+                acc[p / 64] &= ~(@as(u64, 1) << @intCast(p % 64));
+            }
+        }
+    }.call;
+
+    for (0..48) |_| {
+        var acc: [ew]u64 = undefined;
+        for (&acc) |*w| w.* = random.int(u64);
+        zeroAboveMeaningful(&acc);
+        const want = R.reduceProductBitwiseRef(acc);
+        const got = R.reduceProduct(&acc);
+        try t.expectEqualSlices(u64, &want, &got);
+    }
+
+    var full: [ew]u64 = [_]u64{~@as(u64, 0)} ** ew;
+    zeroAboveMeaningful(&full);
+    try t.expectEqualSlices(u64, &R.reduceProductBitwiseRef(full), &R.reduceProduct(&full));
+
+    const z: [ew]u64 = [_]u64{0} ** ew;
+    try t.expectEqualSlices(u64, &R.reduceProductBitwiseRef(z), &R.reduceProduct(&z));
+}
+
+test "hqc ring: word-batched reduceProduct == bit-at-a-time reference (M3 differential)" {
+    try testReduceProductDifferential(R128, 201);
+    try testReduceProductDifferential(R192, 202);
+    try testReduceProductDifferential(R256, 203);
 }
 
 test "hqc-128 ring: monomial wraparound (hand-verified X^i*X^j)" {
