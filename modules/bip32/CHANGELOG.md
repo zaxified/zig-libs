@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M6); no library code
+  changed. Targets `master` (seed), `derive` (master scalar along `m/44'/0'/0'/0/0`), `seed`
+  (mnemonic → PBKDF2) and `mnemonic` (mnemonic → entropy). In-file 1 / 5 / 0 / 3: the first two
+  are verdict branches of BIP-32's validity checks and `k256`'s documented `rejectIdentity`/
+  canonical checks; `mnemonic`'s 3 are the known non-constant-time word split and `wordIndex`
+  binary search (`SPEC.md`), now pinned so a change either way is visible.
+
 - **2026-09-13** — **BREAKING:** A1 finding L7. `serializePriv(k, network, out)`,
   `serializePub(k, network, out)` and `parseExtended(s, network)` take a new `Network`
   (`.mainnet` / `.testnet`); serialization always wrote mainnet version bytes before.

@@ -228,6 +228,7 @@ declare -A TARGETS=(
     # first, so nothing public on the wire is counted as secret
     # (see each harness's module doc comment).
     [opaque]="register login serverke2"
+    [bip32]="master derive seed mnemonic"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -273,6 +274,7 @@ declare -A MODES=(
     [sealedbox]="ReleaseFast"
     [pir]="ReleaseFast"
     [opaque]="ReleaseFast"
+    [bip32]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -486,6 +488,12 @@ declare -A PATTERN=(
     [opaque/register]='root[.]zig'
     [opaque/login]='root[.]zig'
     [opaque/serverke2]='root[.]zig'
+    # bip32's own files; k256/std frames count through their bip32.zig or
+    # bip39.zig callers (the whole paragraph is matched).
+    [bip32/master]='bip32[.]zig'
+    [bip32/derive]='bip32[.]zig'
+    [bip32/seed]='bip39[.]zig'
+    [bip32/mnemonic]='bip39[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -612,6 +620,10 @@ declare -A LABEL=(
     [opaque/register]='opaque client registration (password, blind)+voprf'
     [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
     [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'
+    [bip32/master]='bip32 masterFromSeed (seed)'
+    [bip32/derive]='bip32 derivePath (master scalar)+k256'
+    [bip32/seed]='bip39 mnemonicToSeed (PBKDF2)'
+    [bip32/mnemonic]='bip39 mnemonicToEntropy (wordIndex search)'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────
