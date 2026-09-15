@@ -52,6 +52,24 @@ purpose and API. Provenance: see [NOTICE](NOTICE).
 - `verify` truncation (Protocol One) still compares constant-time over
   the full 16 bytes; a 32-byte (full-HMAC) signature is rejected by
   length, not truncated.
+- **Known limitation (A1 M3):** `Two.kdf` zeroes its own local `prk`
+  (`defer std.crypto.secureZero(u8, &prk)`), but a dead-stack scan after a
+  by-the-book transaction still finds `prk` and (intermittently, depending
+  on how the compiler schedules the two `expand` calls) `hmacKey` residue.
+  Root cause, confirmed by reading `std.crypto.hmac.Hmac.init` (Zig
+  0.16.0's `lib/std/crypto/hmac.zig`, the function `HkdfSha256.expand`
+  calls once per output half): when `key.len <= block_length`, `init`
+  copies the key BYTE FOR BYTE into a local `scratch: [block_length]u8`
+  to build `i_key_pad`/`o_key_pad`, and never clears `scratch` — this is
+  `std`'s own generic HMAC, not code this module owns, and it is called
+  again with `prk` as the key on every `expand`. This module's `secureZero`
+  reaches its own `prk` variable; it cannot reach a copy `std.crypto.hmac`
+  made two frames deeper and never erased. Same class of gap as
+  `zig_std_crypto_leaves_key_schedules_on_stack` (CML memory) — vendoring
+  a scrubbing HMAC would fork a small, well-reviewed piece of `std` and
+  has to track every future Zig release, which this module's design
+  section rules out for the same reason `sealedbox` H2/M4 did. No fix in
+  this repository; documented here per the `ecvrf` E4 precedent.
 
 ## Validation
 
