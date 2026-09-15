@@ -223,6 +223,20 @@ guest_setup() {
                 'echo CPUS possible=$(cat /sys/devices/system/cpu/possible) online=$(cat /sys/devices/system/cpu/online) && ' \
                 'echo SETUP_OK || echo SETUP_FAIL; '
             ;;
+        rawsock)
+            # F12 m33 (A1/rawsock.md): does `setsockopt(PACKET_ADD_MEMBERSHIP/
+            # DROP_MEMBERSHIP, PACKET_MR_PROMISC)` actually toggle
+            # `IFF_PROMISC` under REAL root (not a nested user+net namespace,
+            # where it measurably does not — `unshare --user --map-root-user
+            # --net` returns success from the setsockopt but the flag never
+            # moves, on both `lo` and a real `dummy` device)? `rstest0` gives
+            # the module's own m33 test a genuine `dummy` netdevice to
+            # measure against, so the answer isn't confounded by `lo`'s
+            # loopback special-casing.
+            printf '%s' \
+                'modprobe dummy 2>/dev/null; ip link add rstest0 type dummy && ' \
+                'ip link set rstest0 up && echo SETUP_OK || echo SETUP_FAIL; '
+            ;;
         sandbox)
             # Root is the point here (its privilege-drop and bounding-set tests
             # skip everywhere else). The one environment switch: when the active

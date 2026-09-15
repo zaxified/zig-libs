@@ -1615,6 +1615,73 @@ fn bringLoopbackUp() void {
     _ = linux.ioctl(fd, linux.SIOCSIFFLAGS, @intFromPtr(&req));
 }
 
+// `IFF_PROMISC` (`if.h`, readable via `SIOCGIFFLAGS`) is measured (F12 m33,
+// `A1/rawsock.md`) to be the WRONG observable for a `PACKET_MR_PROMISC`
+// membership: `SIOCGIFFLAGS`/`dev_get_flags()` derives that bit from
+// `dev->gflags`, which only an explicit `RTM_SETLINK` (`ip link set promisc
+// on`) request sets — a `PACKET_ADD_MEMBERSHIP` membership never touches it,
+// on any kernel, in any namespace, privileged or not. `ifacePromiscuity`
+// below reads the field that actually moves.
+
+/// Read the kernel's own promiscuity refcount for `ifindex`
+/// (`RTM_GETLINK`'s `IFLA_PROMISCUITY` attribute, i.e. `dev->promiscuity` —
+/// what `ip -d link show <if>`'s `promiscuity N` line prints, and what
+/// `PACKET_ADD_MEMBERSHIP`/`DROP_MEMBERSHIP` with `PACKET_MR_PROMISC`
+/// actually increments/decrements). `null` on any netlink failure. No
+/// capability needed — `RTM_GETLINK` is a read. Test-only: it exists to
+/// make `setPromisc`'s real effect observable (F12 m33), which `Socket`'s
+/// own API has no need to expose.
+fn ifacePromiscuity(ifindex: i32) ?u32 {
+    const rc = linux.socket(linux.AF.NETLINK, linux.SOCK.RAW | linux.SOCK.CLOEXEC, linux.NETLINK.ROUTE);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: i32 = @intCast(rc);
+    defer _ = linux.close(fd);
+
+    const Req = extern struct {
+        hdr: linux.nlmsghdr,
+        ifi: linux.ifinfomsg,
+    };
+    var req: Req = .{
+        .hdr = .{
+            .len = @sizeOf(Req),
+            .type = .RTM_GETLINK,
+            .flags = linux.NLM_F_REQUEST,
+            .seq = 1,
+            .pid = 0,
+        },
+        .ifi = .{ .family = linux.AF.UNSPEC, .type = 0, .index = ifindex, .flags = 0, .change = 0 },
+    };
+    if (linux.errno(linux.sendto(fd, @ptrCast(&req), @sizeOf(Req), 0, null, 0)) != .SUCCESS) return null;
+
+    var buf: [4096]u8 = undefined;
+    const n = linux.recvfrom(fd, &buf, buf.len, 0, null, null);
+    if (linux.errno(n) != .SUCCESS) return null;
+    const len: usize = @intCast(n);
+    if (len < @sizeOf(linux.nlmsghdr) + @sizeOf(linux.ifinfomsg)) return null;
+
+    var hdr: linux.nlmsghdr = undefined;
+    @memcpy(std.mem.asBytes(&hdr), buf[0..@sizeOf(linux.nlmsghdr)]);
+    if (hdr.type == .ERROR) return null; // e.g. no such ifindex
+
+    // Walk the `rtattr` list that follows the fixed `ifinfomsg`, looking for
+    // IFLA_PROMISCUITY (a plain u32 payload). RTA_ALIGN is 4-byte, same as
+    // NLMSG_ALIGN.
+    var off: usize = @sizeOf(linux.nlmsghdr) + @sizeOf(linux.ifinfomsg);
+    while (off + @sizeOf(linux.rtattr) <= len) {
+        var attr: linux.rtattr = undefined;
+        @memcpy(std.mem.asBytes(&attr), buf[off..][0..@sizeOf(linux.rtattr)]);
+        const attr_len: usize = attr.len;
+        if (attr_len < @sizeOf(linux.rtattr) or off + attr_len > len) break;
+        if (attr.type.link == .PROMISCUITY) {
+            const val_off = off + @sizeOf(linux.rtattr);
+            if (val_off + 4 <= len) return std.mem.readInt(u32, buf[val_off..][0..4], .little);
+            return null;
+        }
+        off += std.mem.alignForward(usize, attr_len, 4);
+    }
+    return null;
+}
+
 /// `Socket.recv`, bounded by an independent wall-clock deadline instead of
 /// trusting the caller's own `recv_timeout_ms` setup — a test-only safety
 /// net. `Socket.open`'s `SO_RCVTIMEO` guard (F13) is what normally turns a
@@ -1705,21 +1772,60 @@ test "F12: setFilter rejects an empty BPF program instead of attaching it (m20, 
     try sock.setFilter(&etherTypeFilter(test_ethertype)); // positive control: a real program still attaches
 }
 
-// F12 m33 (`setPromisc(false)` issuing ADD instead of DROP_MEMBERSHIP): no
-// permanent test below. Measured directly (ioctl SIOCGIFFLAGS, `/sys/class/
-// net/<if>/flags`, and `ip link show`, cross-checked against a real `dummy`
-// netdevice as well as `lo`): in this sandbox (nested user+net namespace),
-// `setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP/DROP_MEMBERSHIP,
-// PACKET_MR_PROMISC)` returns success but never visibly toggles
-// `IFF_PROMISC`, and a second DROP_MEMBERSHIP for an already-removed
-// membership also returns success rather than `EADDRNOTAVAIL` — both
-// channels the real (unmutated) code would need to distinguish itself from
-// m33 are no-ops here. `ip link set <if> promisc on` (netlink, a different
-// kernel path) DOES flip the flag, confirming the ioctl read path itself is
-// correct — the gap is specific to the `PACKET_MR_PROMISC` membership call
-// this sandbox. No reliable RED/GREEN could be produced; per
-// `FIXER-AGENT-BRIEF.md` a finding without a working measurement is not
-// checked off. m33 stays open. See `A1/rawsock.md` dispozice 2026-09-16.
+test "F12 m33: setPromisc(false) actually drops PACKET_MR_PROMISC membership, where this environment can observe it" {
+    // `rstest0` is a real `dummy` netdevice — not `lo` — created and brought
+    // up by `scripts/vm/run.sh`'s rawsock `guest_setup`, present only under
+    // the VM lane (real root, no namespace). Every other lane (bare host,
+    // `unshare -rn`) has no `rstest0`, so this falls back to `lo` there,
+    // matching every other test in this file.
+    var iface_name: []const u8 = "rstest0";
+    const idx = ifaceByName(iface_name) catch idx: {
+        iface_name = "lo";
+        bringLoopbackUp();
+        break :idx ifaceByName("lo") catch return error.SkipZigTest;
+    };
+
+    var sock = Socket.open(test_ethertype, .{ .iface = iface_name }) catch |e| switch (e) {
+        error.AccessDenied => return error.SkipZigTest, // no CAP_NET_RAW
+        error.NoSuchInterface => return error.SkipZigTest,
+        else => return e,
+    };
+    defer sock.close();
+
+    const before = ifacePromiscuity(idx) orelse return error.SkipZigTest;
+
+    try sock.setPromisc(idx, true);
+    const after_add = ifacePromiscuity(idx) orelse return error.SkipZigTest;
+
+    if (after_add == before) {
+        // `setPromisc(idx, true)` returned success (no error above), but the
+        // kernel's own promiscuity refcount (`IFLA_PROMISCUITY`) never
+        // moved — this environment does not surface a `PACKET_MR_PROMISC`
+        // membership at all (unlike `IFF_PROMISC`/`SIOCGIFFLAGS`, which by
+        // kernel design — `dev_get_flags()` substitutes `dev->gflags`, set
+        // only by an explicit `RTM_SETLINK` request — NEVER reflects this
+        // membership on any kernel, in any namespace; measured directly,
+        // `A1/rawsock.md` F12 m33 2026-09-16: `IFLA_PROMISCUITY` moved to 1
+        // in the exact window `IFF_PROMISC` stayed 0).
+        //
+        // Detected live, at runtime, not by UID/capability/namespace type:
+        // if the "on" half has no observable effect here, the "off" half
+        // (what m33 actually breaks — issuing ADD when it should issue
+        // DROP) is indistinguishable from a no-op either, so asserting on
+        // it would be a fabricated PASS, not a measurement. Honest skip.
+        try sock.setPromisc(idx, false); // still exercised, just not asserted
+        return error.SkipZigTest;
+    }
+
+    // This environment DOES surface it — the real F12 m33 measurement.
+    try testing.expectEqual(@as(u32, 0), before); // clean baseline
+    try testing.expectEqual(before + 1, after_add); // ADD incremented it
+    try sock.setPromisc(idx, false);
+    const after_drop = ifacePromiscuity(idx) orelse return error.SkipZigTest;
+    // m33 replaces the DROP_MEMBERSHIP branch with another ADD_MEMBERSHIP —
+    // under the mutant this counts up to 2 instead of back down to 0.
+    try testing.expectEqual(before, after_drop);
+}
 
 test "F12: openInject's interface bind is not load-bearing for send() (m35 — equivalent mutation, documented not tested)" {
     // Measured directly: `send()`/`sendRaw()` specify `ifindex` explicitly
