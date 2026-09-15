@@ -1450,6 +1450,12 @@ test "a value is never freed or overwritten while it is being copied out" {
     // exclusion — there is no window to miss and no luck involved. Release the
     // lock before the copy and the probe simply takes it.
     const big_len = 128 * 1024;
+    // Comfortably above the `> 100` assertion below, so a normal (unloaded)
+    // run still leaves headroom and the loop still terminates in well under
+    // a second — readers verify hundreds of copies per millisecond once the
+    // cache is warm.
+    const verify_target: u32 = 500;
+    const writer_iter_cap: usize = 2_000_000;
 
     const Ctx = struct {
         sc: *Sharded,
@@ -1497,7 +1503,15 @@ test "a value is never freed or overwritten while it is being copied out" {
             defer testing.allocator.free(buf);
             var round: u8 = 1;
             var i: usize = 0;
-            while (i < 2000) : (i += 1) {
+            // Keep writing until the readers have actually verified enough
+            // copies — not for a fixed iteration count. A fixed count decouples
+            // termination from reader progress: under CPU contention the reader
+            // threads can be starved of scheduler time while this loop still
+            // runs to completion, so `verified` never climbs past the assertion
+            // below even though nothing is broken. `writer_iter_cap` is a hang
+            // guard only (1000x the iterations that suffice on an idle
+            // machine), never the pass/fail measure.
+            while (c.verified.load(.monotonic) < verify_target and i < writer_iter_cap) : (i += 1) {
                 @memset(buf, round);
                 round = if (round == 255) 1 else round + 1;
                 c.sc.put("hot", buf, 0, 0, 0); // frees the previous value
