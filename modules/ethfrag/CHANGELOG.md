@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the fuzz harness gained a
+  burst step kind so coverage-guided fuzzing reaches the
+  `max_fragments_per_datagram` guard (A1 F6; `TooManyFragments` was 0 in
+  200,151 runs, now reached), and the two exhaustion guards return through
+  private `noinline` markers so a fuzz run can measure them. `insert` returns
+  the same `error.TableFull` / `error.TooManyFragments` on the same inputs;
+  the public API is unchanged.
 - **2026-09-11** — **BEHAVIOURAL, not breaking:** `insert`'s overlap check
   and buffer allocation no longer scale with an attacker-chosen `n` the way
   they did (A1 F8+F9). Fragment intervals are now kept sorted internally

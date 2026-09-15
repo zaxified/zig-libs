@@ -464,6 +464,23 @@ pub const Reassembler = struct {
     /// Never publishes a partial frame: the only way to get `.complete` is
     /// for the accepted, non-overlapping fragments of a datagram to sum to
     /// exactly its established total length.
+    /// The two exhaustion guards return through these, so a fuzz run can say
+    /// whether a guard FIRED, not just whether its line was near a seen PC.
+    ///
+    /// ⛔ Measured 2026-09-15 (A1 F6): a coverage query on the line
+    /// `return error.TooManyFragments;` stayed HIT in a harness that cannot
+    /// reach that guard, because LLVM shares error-return blocks between paths.
+    /// A `noinline` function has an entry PC of its own, so
+    /// `ZIGLIBS_FUZZ_REACH=fn:guardTooManyFragments scripts/modtest ethfrag --fuzz`
+    /// is a real answer. Error path only, so the call costs nothing that matters.
+    noinline fn guardTableFull() error{TableFull} {
+        return error.TableFull;
+    }
+
+    noinline fn guardTooManyFragments() error{TooManyFragments} {
+        return error.TooManyFragments;
+    }
+
     pub fn insert(self: *Reassembler, wire_bytes: []const u8, now_ns: u64) InsertError!InsertResult {
         const hdr = try Header.decode(wire_bytes);
         const payload = wire_bytes[header_len..];
@@ -494,7 +511,7 @@ pub const Reassembler = struct {
         if (!self.entries.contains(hdr.frag_id) and self.entries.count() >= self.config.max_inflight) {
             _ = self.expireOlderThan(now_ns);
             if (!self.entries.contains(hdr.frag_id) and self.entries.count() >= self.config.max_inflight) {
-                return error.TableFull;
+                return guardTableFull();
             }
         }
 
@@ -516,7 +533,7 @@ pub const Reassembler = struct {
 
         if (entry.intervals.items.len >= self.config.max_fragments_per_datagram) {
             self.dropEntry(hdr.frag_id);
-            return error.TooManyFragments;
+            return guardTooManyFragments();
         }
 
         if (!hdr.more) {
@@ -1487,14 +1504,28 @@ const seed = tkfuzz.seedHex;
 ///
 ///     NN                        step count, 0..64
 ///     per step:
-///       TT TT                   time advance, `% 2001` ns
+///       TT TT                   time advance: `% 64` ns for a burst, else `% 2001` ns
 ///       BB                      bit 0: 1 = a structured fragment, 0 = raw bytes
+///                               bits 0+1 both set: a BURST fragment (see below)
 ///       structured: II OO OO LL MM PP   frag_id %8, offset, len %33, more, payload fill
+///       burst:      II SS LL PP         frag_id %8, offset = (SS %64)*8, len 1+LL%8, fill; more = 1
 ///       raw:        LL PP               length % 41, fill
 ///
 /// The reassembler's `timeout_ns` is 1000, so a time advance above that is
 /// what expires an in-flight datagram; `max_inflight` is 4, so five distinct
 /// `frag_id`s is what exercises the eviction path.
+///
+/// ⭐ Why the burst kind exists (A1 F6, measured 2026-09-15 through
+/// `scripts/modtest ethfrag --fuzz`): the `max_fragments_per_datagram` guard
+/// needs 16 accepted, pairwise-disjoint fragments of ONE id with no idle gap
+/// above `timeout_ns`. The structured kind draws `offset` as a full `u16`
+/// against a 512-octet frame and advances time by up to 2000 ns per step, so
+/// `guardTooManyFragments` was reached 0 times in 200 151 coverage-guided runs
+/// while `guardTableFull` was reached. A burst keeps the clock inside the
+/// timeout, puts every fragment inside the frame on an 8-octet grid (so two
+/// fragments overlap only when they pick the same slot), and never closes the
+/// datagram. The structured and raw kinds are unchanged: bytes `00`/`01` in
+/// `BB` read exactly as before, so every seed below keeps its meaning.
 const reassembler_seeds = [_][]const u8{
     // Two halves of one 32-octet datagram, same frag_id, no gap: completes.
     seed("02" ++ "0000" ++ "01" ++ "00" ++ "0000" ++ "10" ++ "01" ++ "AA" ++
@@ -1525,14 +1556,71 @@ const reassembler_seeds = [_][]const u8{
     // The maximum step count, alternating structured and raw.
     seed("40" ++ ("0001" ++ "01" ++ "00" ++ "0000" ++ "08" ++ "01" ++ "77" ++
         "0001" ++ "00" ++ "20" ++ "88") ** 8),
+    // ⭐ A burst of 17 fragments of one id, 1 ns apart, on slots 0..16 of the
+    // 8-octet grid: 16 are accepted disjoint, the 17th trips
+    // `max_fragments_per_datagram`. The only seed that reaches that guard.
+    seed("11" ++
+        "0001" ++ "03" ++ "00" ++ "00" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "01" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "02" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "03" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "04" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "05" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "06" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "07" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "08" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "09" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "0A" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "0B" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "0C" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "0D" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "0E" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "0F" ++ "07" ++ "AB" ++
+        "0001" ++ "03" ++ "00" ++ "10" ++ "07" ++ "AB"),
     seed(""), // 0 steps: the state machine's whole history until today
 };
 
 /// One step's worth of the script, applied to `r`. Shared with the corpus
 /// guard so the guard cannot drive a different state machine.
-fn fuzzReassemblerStep(r: *Reassembler, cur: *tkfuzz.Cursor, now: *u64) !?[]u8 {
-    now.* += cur.word() % 2001;
-    if (cur.byte() & 1 == 1) {
+/// How many times each exhaustion guard refused a fragment. Only the corpus
+/// guard reads it; the fuzz target passes `null`.
+const GuardTally = struct {
+    table_full: usize = 0,
+    too_many_fragments: usize = 0,
+
+    fn note(self: *GuardTally, err: InsertError) void {
+        if (err == error.TableFull) self.table_full += 1;
+        if (err == error.TooManyFragments) self.too_many_fragments += 1;
+    }
+};
+
+fn fuzzReassemblerStep(r: *Reassembler, cur: *tkfuzz.Cursor, now: *u64, tally: ?*GuardTally) !?[]u8 {
+    // The advance is READ before the kind byte, as it always was, and applied
+    // after it, so a seed written before the burst kind existed consumes the
+    // same octets in the same order.
+    const advance = cur.word();
+    const kind = cur.byte();
+    const burst = kind & 3 == 3;
+    now.* += if (burst) advance % 64 else advance % 2001;
+    if (burst) {
+        var wire: [header_len + 8]u8 = undefined;
+        const frag_id: u16 = @intCast(cur.ranged(0, 7));
+        const offset: u16 = @intCast(cur.ranged(0, 63) * 8);
+        const len: u16 = @intCast(cur.ranged(1, 8));
+        const fill = cur.byte();
+        const hdr: Header = .{ .frag_id = frag_id, .offset = offset, .length = len, .more = true };
+        hdr.encode(wire[0..header_len]);
+        @memset(wire[header_len..][0..len], fill);
+        const result = r.insert(wire[0 .. header_len + len], now.*) catch |err| {
+            if (tally) |t| t.note(err);
+            return null;
+        };
+        return switch (result) {
+            .incomplete => null,
+            .complete => |bytes| bytes,
+        };
+    }
+    if (kind & 1 == 1) {
         // A structurally valid-but-hostile fragment: small frag_id range
         // to force id collisions/overlaps, arbitrary offset/length/more/
         // payload.
@@ -1545,7 +1633,10 @@ fn fuzzReassemblerStep(r: *Reassembler, cur: *tkfuzz.Cursor, now: *u64) !?[]u8 {
         const hdr: Header = .{ .frag_id = frag_id, .offset = offset, .length = len, .more = more };
         hdr.encode(wire[0..header_len]);
         @memset(wire[header_len..][0..len], fill);
-        const result = r.insert(wire[0 .. header_len + len], now.*) catch return null;
+        const result = r.insert(wire[0 .. header_len + len], now.*) catch |err| {
+            if (tally) |t| t.note(err);
+            return null;
+        };
         return switch (result) {
             .incomplete => null,
             .complete => |bytes| bytes,
@@ -1557,7 +1648,10 @@ fn fuzzReassemblerStep(r: *Reassembler, cur: *tkfuzz.Cursor, now: *u64) !?[]u8 {
     const len: usize = cur.ranged(0, header_len + 32);
     const fill = cur.byte();
     @memset(raw[0..len], fill);
-    const result = r.insert(raw[0..len], now.*) catch return null;
+    const result = r.insert(raw[0..len], now.*) catch |err| {
+        if (tally) |t| t.note(err);
+        return null;
+    };
     return switch (result) {
         .incomplete => null,
         .complete => |bytes| bytes,
@@ -1592,7 +1686,7 @@ fn fuzzReassembler(_: void, smith: *std.testing.Smith) !void {
     const steps = cur.ranged(0, 64);
     var step: u32 = 0;
     while (step < steps) : (step += 1) {
-        if (try fuzzReassemblerStep(&r, &cur, &now)) |bytes| testing.allocator.free(bytes);
+        if (try fuzzReassemblerStep(&r, &cur, &now, null)) |bytes| testing.allocator.free(bytes);
         try testing.expect(r.inflightCount() <= max_inflight);
     }
 }
@@ -1608,6 +1702,7 @@ test "corpus: every script drives the reassembler, and the counts are pinned" {
     var steps_run: usize = 0;
     var completed: usize = 0;
     var peak_inflight: usize = 0;
+    var guards: GuardTally = .{};
     for (reassembler_seeds) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [1024]u8 = undefined;
@@ -1627,7 +1722,7 @@ test "corpus: every script drives the reassembler, and the counts are pinned" {
         var step: u32 = 0;
         while (step < steps) : (step += 1) {
             steps_run += 1;
-            if (try fuzzReassemblerStep(&r, &cur, &now)) |bytes| {
+            if (try fuzzReassemblerStep(&r, &cur, &now, &guards)) |bytes| {
                 completed += 1;
                 testing.allocator.free(bytes);
             }
@@ -1638,9 +1733,16 @@ test "corpus: every script drives the reassembler, and the counts are pinned" {
     // Measured 2026-09-07: with the step count drawn as a ranged value, 0
     // steps, 0 completions and a peak in-flight count of 0 — the loop body
     // had never executed. After:
-    try testing.expectEqual(@as(usize, 81), steps_run);
+    // 2026-09-15 (A1 F6): +17 steps from the burst seed; the older seeds'
+    // numbers are unchanged, which is the check that the burst kind did not
+    // change what an existing script means.
+    try testing.expectEqual(@as(usize, 81 + 17), steps_run);
     try testing.expectEqual(@as(usize, 3), completed);
     try testing.expectEqual(max_inflight, peak_inflight);
+    // Both exhaustion guards, by seed: the five-ids seed fills the table, the
+    // burst seed exceeds the per-datagram fragment cap.
+    try testing.expectEqual(@as(usize, 1), guards.table_full);
+    try testing.expectEqual(@as(usize, 1), guards.too_many_fragments);
 }
 
 test {
