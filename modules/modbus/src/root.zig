@@ -871,6 +871,48 @@ const testing = std.testing;
 // no `Canceled` variant. This test runs against a listener that accepts and
 // then never writes, so the read really is parked when the cancel arrives.
 
+/// A real `std.Io` whose only changed slot counts `netRead` entries, so a
+/// cancel test can cancel once the transport is INSIDE its reply read. With
+/// a fixed sleep instead, a loaded machine could cancel an earlier step, and
+/// the test passed by that route, not the read's. Earlier steps: connect and
+/// request write, whose `Canceled` arms are separate code.
+const ReadCueIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var inner_vtable: *const std.Io.VTable = undefined;
+    var reads: std.atomic.Value(u32) = .init(0);
+
+    fn init(inner: std.Io) ReadCueIo {
+        inner_vtable = inner.vtable;
+        reads.store(0, .release);
+        var vt = inner.vtable.*;
+        vt.netRead = netRead;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const ReadCueIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+        _ = reads.fetchAdd(1, .monotonic);
+        return inner_vtable.netRead(userdata, src, data);
+    }
+
+    /// Wait until the transport has entered its `n`-th socket read. The
+    /// deadline is a watchdog only: never getting there is a red, not a hang.
+    fn awaitReads(real_io: std.Io, n: u32) bool {
+        const start = std.Io.Clock.Timestamp.now(real_io, .awake);
+        while (reads.load(.acquire) < n) {
+            const waited = start.durationTo(std.Io.Clock.Timestamp.now(real_io, .awake)).raw.nanoseconds;
+            if (waited > 60 * std.time.ns_per_s) return false;
+            real_io.sleep(.fromMilliseconds(1), .awake) catch return reads.load(.acquire) >= n;
+        }
+        return true;
+    }
+};
+
 fn acceptOne(srv: *std.Io.net.Server, io: std.Io) std.Io.net.Server.AcceptError!std.Io.net.Stream {
     return srv.accept(io);
 }
@@ -904,10 +946,15 @@ test "a canceled exchange read surfaces Canceled, not TransportFailed" {
     defer peer.close(io);
 
     var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    var cue: ReadCueIo = .init(io);
+    t.io = cue.io();
     var fut = try io.concurrent(exchangeOnce, .{ &t, &.{ 0x00, 0x01 }, &reply_buf });
-    // Long enough that the read is certainly parked in the kernel.
-    try io.sleep(.fromMilliseconds(200), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel inside read #1, the MBAP header read; the request write ahead
+    // of it has its own `Canceled` arm and must not take this cancel.
+    const reached = ReadCueIo.awaitReads(io, 1);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
 
 // -- test (read timeout, audit E1) -------------------------------------------
@@ -999,12 +1046,19 @@ test "TcpTransport: timeout_ms = null (default) preserves today's unbounded beha
     defer peer.close(io);
 
     var reply_buf: [tcp.max_adu_len]u8 = undefined;
+    var cue: ReadCueIo = .init(io);
+    t.io = cue.io();
     var fut = try io.concurrent(exchangeOnce, .{ &t, &.{ 0x00, 0x01 }, &reply_buf });
-    // Well past `timeout_ms = 80` from the sibling test above -- if a
-    // default crept in, this would already have returned `error.Timeout`
-    // instead of still being parked when the cancel arrives.
-    try io.sleep(.fromMilliseconds(300), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // First the event: the exchange is inside its reply read. Then the
+    // window, which IS the assertion: 300 ms, well past `timeout_ms = 80`
+    // from the sibling test above -- if a default crept in, the read has
+    // returned `error.Timeout` by now instead of still being parked. A
+    // loaded machine only lengthens the window, so it cannot make this red.
+    const reached = ReadCueIo.awaitReads(io, 1);
+    io.sleep(.fromMilliseconds(300), .awake) catch {};
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
 
 // A scripted transport: records the request ADU, replies from a fixed
