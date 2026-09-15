@@ -71,8 +71,13 @@ inline fn clmul64(a: u64, b: u64) [2]u64 {
     return .{ rv[0], rv[1] };
 }
 
-/// Karatsuba base-case threshold (in u64 limbs): below this the product is
-/// the direct O(L²)-CLMUL schoolbook, above it the recursion splits.
+/// Karatsuba base-case threshold (in u64 limbs): at or below this the product
+/// is the direct O(L²)-CLMUL schoolbook, above it the recursion splits.
+/// A1 audit M4 (2026-09-16) timed 3, 4, 5, 6, 10, 12, 16, 20, 24 and 32
+/// against 8 on all three parameter sets: 5/6 were 1-3% faster on the
+/// multiply, which did not clear the noise at KEM level, and every other value
+/// was slower. So it stays 8. Any value gives the same product; only speed
+/// depends on it.
 const karatsuba_base = 8;
 
 /// Scratch words `clmulKar` needs for a length-`len` operand (comptime,
@@ -84,16 +89,40 @@ fn karScratch(comptime len: usize) usize {
 }
 
 /// GF(2)[X] schoolbook base multiply r[0..2L] = a[0..L] ⊗ b[0..L] with L²
-/// CLMULs, XOR-accumulating each 128-bit partial product into the two
-/// overlapping destination limbs. Fully overwrites `r`. L ≤ karatsuba_base.
-fn schoolbookClmul(r: []u64, a: []const u64, b: []const u64) void {
-    @memset(r, 0);
-    for (a, 0..) |ai, i| {
+/// CLMULs. `len` ≤ karatsuba_base.
+///
+/// Row by row with the high half of each 128-bit partial product carried
+/// into the next limb, so each row does ONE store per limb and nothing is
+/// zeroed first. Every word of `r` is ASSIGNED before it is read:
+///   * row 0 assigns r[0 .. len] (len+1 words);
+///   * row i ≥ 1 XORs into r[i .. i+len-1] — every one of those was assigned
+///     by an earlier row, since the highest index row i-1 reaches is
+///     (i-1)+len — and assigns r[i+len], which no earlier row reached;
+///   * rows 0..len-1 together therefore assign r[0 .. 2·len-1], all of `r`.
+/// This replaced `@memset(r, 0)` followed by two XOR-stores per partial
+/// product (A1 audit M4, 2026-09-16). The old form read back, on almost every
+/// product, a word that the memset or the previous product had just stored.
+/// The leaf's cost fell to about a third. `testKaratsubaLength` pre-fills `r`
+/// with junk, so a word this function stopped writing would show up.
+///
+/// `len` is comptime, so the loops have fixed trip counts. Nothing branches
+/// or indexes on operand values.
+fn schoolbookClmul(comptime len: usize, r: *[2 * len]u64, a: *const [len]u64, b: *const [len]u64) void {
+    var hi: u64 = 0;
+    for (b, 0..) |bj, j| {
+        const p = clmul64(a[0], bj);
+        r[j] = p[0] ^ hi;
+        hi = p[1];
+    }
+    r[len] = hi;
+    for (1..len) |i| {
+        hi = 0;
         for (b, 0..) |bj, j| {
-            const p = clmul64(ai, bj);
-            r[i + j] ^= p[0];
-            r[i + j + 1] ^= p[1];
+            const p = clmul64(a[i], bj);
+            r[i + j] ^= p[0] ^ hi;
+            hi = p[1];
         }
+        r[i + len] = hi;
     }
 }
 
@@ -101,50 +130,56 @@ fn schoolbookClmul(r: []u64, a: []const u64, b: []const u64) void {
 /// recursive Karatsuba (z0 = a_lo·b_lo, z2 = a_hi·b_hi, z1 = (a_lo+a_hi)·
 /// (b_lo+b_hi); mid = z1+z0+z2, all "+"=XOR in GF(2)), bottoming out at
 /// `schoolbookClmul`. Fully overwrites `r`; `scratch` must hold ≥
-/// karScratch(len) words. Control flow depends only on the public `len`.
-fn clmulKar(r: []u64, a: []const u64, b: []const u64, scratch: []u64) void {
-    const len = a.len;
-    if (len <= karatsuba_base) {
-        schoolbookClmul(r, a, b);
-        return;
+/// karScratch(len) words.
+///
+/// `len` is a COMPTIME parameter. A ring's limb count is comptime, so the
+/// whole recursion tree is too: each node length gets its own instantiation
+/// with fixed loop bounds, and the `k < hi_len` tests below fold away. The
+/// A1 M4 A/B measured this at a further 9-14% on every KEM operation, on top
+/// of the leaf rewrite. Nothing about the order of operations changes, and
+/// control flow still depends only on the public limb count.
+fn clmulKar(comptime len: usize, r: *[2 * len]u64, a: *const [len]u64, b: *const [len]u64, scratch: []u64) void {
+    if (comptime len <= karatsuba_base) {
+        schoolbookClmul(len, r, a, b);
+    } else {
+        const half = (len + 1) / 2;
+        const hi_len = len - half;
+        const a_lo = a[0..half];
+        const a_hi = a[half..len];
+        const b_lo = b[0..half];
+        const b_hi = b[half..len];
+
+        const sum_a = scratch[0..half];
+        const sum_b = scratch[half .. 2 * half];
+        const z1 = scratch[2 * half .. 4 * half];
+        const child = scratch[4 * half ..];
+
+        // sum_a = a_lo XOR a_hi, sum_b = b_lo XOR b_hi (a_hi/b_hi zero-extended
+        // to `half`, since hi_len ≤ half). All XOR — no carry in GF(2).
+        for (0..half) |k| {
+            sum_a[k] = a_lo[k] ^ (if (k < hi_len) a_hi[k] else 0);
+            sum_b[k] = b_lo[k] ^ (if (k < hi_len) b_hi[k] else 0);
+        }
+
+        // z0 → r[0 .. 2·half], z2 → r[2·half .. 2·len] (adjacent, disjoint);
+        // z1 → the scratch buffer. Children reuse the same tail `child` arena
+        // (they run sequentially). z1's inputs (sum_a/sum_b) and output (z1)
+        // are disjoint from `child`, so its recursion never clobbers them.
+        clmulKar(half, r[0 .. 2 * half], a_lo, b_lo, child);
+        clmulKar(hi_len, r[2 * half .. 2 * len], a_hi, b_hi, child);
+        clmulKar(half, z1, sum_a, sum_b, child);
+
+        // mid = z1 XOR z0 XOR z2, formed IN the z1 buffer while reading z0/z2
+        // out of `r` — a separate read-then-write phase so the subsequent fold
+        // into r[half..] cannot corrupt a z0/z2 limb still to be read.
+        for (0..2 * half) |k| {
+            z1[k] ^= r[k]; // z0
+            if (k < 2 * hi_len) z1[k] ^= r[2 * half + k]; // z2
+        }
+        // Fold mid into r at word offset `half` (each r[half+k] written once,
+        // no r read here — no overlap hazard with the phase above).
+        for (0..2 * half) |k| r[half + k] ^= z1[k];
     }
-    const half = (len + 1) / 2;
-    const hi_len = len - half;
-    const a_lo = a[0..half];
-    const a_hi = a[half..];
-    const b_lo = b[0..half];
-    const b_hi = b[half..];
-
-    const sum_a = scratch[0..half];
-    const sum_b = scratch[half .. 2 * half];
-    const z1 = scratch[2 * half .. 4 * half];
-    const child = scratch[4 * half ..];
-
-    // sum_a = a_lo XOR a_hi, sum_b = b_lo XOR b_hi (a_hi/b_hi zero-extended
-    // to `half`, since hi_len ≤ half). All XOR — no carry in GF(2).
-    for (0..half) |k| {
-        sum_a[k] = a_lo[k] ^ (if (k < hi_len) a_hi[k] else 0);
-        sum_b[k] = b_lo[k] ^ (if (k < hi_len) b_hi[k] else 0);
-    }
-
-    // z0 → r[0 .. 2·half], z2 → r[2·half .. 2·len] (adjacent, disjoint);
-    // z1 → the scratch buffer. Children reuse the same tail `child` arena
-    // (they run sequentially). z1's inputs (sum_a/sum_b) and output (z1)
-    // are disjoint from `child`, so its recursion never clobbers them.
-    clmulKar(r[0 .. 2 * half], a_lo, b_lo, child);
-    clmulKar(r[2 * half .. 2 * len], a_hi, b_hi, child);
-    clmulKar(z1, sum_a, sum_b, child);
-
-    // mid = z1 XOR z0 XOR z2, formed IN the z1 buffer while reading z0/z2
-    // out of `r` — a separate read-then-write phase so the subsequent fold
-    // into r[half..] cannot corrupt a z0/z2 limb still to be read.
-    for (0..2 * half) |k| {
-        z1[k] ^= r[k]; // z0
-        if (k < 2 * hi_len) z1[k] ^= r[2 * half + k]; // z2
-    }
-    // Fold mid into r at word offset `half` (each r[half+k] written once,
-    // no r read here — no overlap hazard with the phase above).
-    for (0..2 * half) |k| r[half + k] ^= z1[k];
 }
 
 /// The ring R = F2[X]/(X^n-1), specialized to one HQC parameter set's n.
@@ -350,7 +385,7 @@ pub fn Ring(comptime n: u32) type {
         pub fn mulClmul(a: Elem, b: Elem) Elem {
             var acc: [ext_words]u64 = undefined; // fully written by clmulKar
             var scratch: [scratch_words]u64 = undefined;
-            clmulKar(acc[0..], a[0..], b[0..], scratch[0..]);
+            clmulKar(words, &acc, &a, &b, &scratch);
             return reduceProduct(&acc);
         }
 
@@ -459,6 +494,80 @@ fn testClmulDifferential(comptime R: type, seed: u64) !void {
     var full: R.Elem = [_]u64{~@as(u64, 0)} ** R.words;
     R.maskTop(&full);
     try t.expectEqualSlices(u64, &R.mulPortable(full, full), &R.mulClmul(full, full));
+}
+
+/// Bit-at-a-time carryless limb product r = a ⊗ b (r.len == 2·a.len), test
+/// only. It shares nothing with the CLMUL or Karatsuba code, not even the limb
+/// layout of a partial product, so it can pin `clmulKar` at lengths no ring
+/// uses.
+fn clmulBitwiseRef(r: []u64, a: []const u64, b: []const u64) void {
+    @memset(r, 0);
+    for (0..a.len * 64) |i| {
+        if (((a[i / 64] >> @intCast(i % 64)) & 1) == 1) {
+            const ws = i / 64;
+            const bs: u6 = @intCast(i % 64);
+            for (b, 0..) |w, j| {
+                r[ws + j] ^= w << bs;
+                if (bs != 0) r[ws + j + 1] ^= w >> @intCast(64 - @as(u32, bs));
+            }
+        }
+    }
+}
+
+/// Differential (A1 finding M4): `clmulKar` at one comptime length against
+/// `clmulBitwiseRef`. The output buffer is pre-filled with random junk on
+/// every trial. The leaf no longer zeroes it, so any output word it stopped
+/// writing would keep that junk and fail. Scratch is re-randomised too.
+fn testKaratsubaLength(comptime len: usize, random: std.Random, trials: usize) !void {
+    if (comptime !clmul_supported) return;
+    const t = std.testing;
+    var a: [len]u64 = undefined;
+    var b: [len]u64 = undefined;
+    var want: [2 * len]u64 = undefined;
+    var got: [2 * len]u64 = undefined;
+    var scratch: [karScratch(len)]u64 = undefined;
+    for (0..trials) |trial| {
+        switch (trial) {
+            0 => {
+                @memset(&a, 0);
+                @memset(&b, 0);
+            },
+            1 => {
+                @memset(&a, ~@as(u64, 0));
+                @memset(&b, ~@as(u64, 0));
+            },
+            2 => {
+                @memset(&a, 0);
+                @memset(&b, 0);
+                a[len - 1] = 1 << 63;
+                b[len - 1] = 1 << 63;
+            },
+            3 => {
+                @memset(&a, 0x5555555555555555);
+                @memset(&b, 0xaaaaaaaaaaaaaaaa);
+            },
+            else => {
+                for (&a) |*w| w.* = random.int(u64);
+                for (&b) |*w| w.* = random.int(u64);
+            },
+        }
+        for (&got) |*w| w.* = random.int(u64);
+        for (&scratch) |*w| w.* = random.int(u64);
+        clmulKar(len, &got, &a, &b, &scratch);
+        clmulBitwiseRef(&want, &a, &b);
+        try t.expectEqualSlices(u64, &want, &got);
+    }
+}
+
+test "hqc ring: Karatsuba+CLMUL limb product == bit-at-a-time reference at every split shape (M4 differential)" {
+    var rng = std.Random.DefaultPrng.init(0x4d34);
+    const random = rng.random();
+    // 1..8 are bare leaves; 9..33 cover one and two levels of recursion,
+    // odd splits (hi_len < half) included; the three ring sizes are what ships.
+    inline for (1..34) |len| try testKaratsubaLength(len, random, 12);
+    try testKaratsubaLength(R128.words, random, 6);
+    try testKaratsubaLength(R192.words, random, 5);
+    try testKaratsubaLength(R256.words, random, 5);
 }
 
 test "hqc ring: CLMUL+Karatsuba multiply == schoolbook oracle (differential)" {

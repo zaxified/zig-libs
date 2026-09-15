@@ -100,7 +100,11 @@ below). See [README.md](README.md) for purpose and API.
     reference's own word-aligned Toom-Cook/Karatsuba + `pclmul` elementary
     multiply (§3.3, Table 2) — O(L^1.58) CLMULs instead of O(L²). This is
     what every KAT, benchmark and ctgrind measurement in this document
-    exercises.
+    exercises. Since A1 M4 (2026-09-16) the recursion is specialised on the
+    comptime limb count, and the base-case leaf carries each partial product's
+    high half into the next limb. It no longer zeroes its output and then
+    XOR-stores two limbs per product. Same products in the same order: the
+    change is bit-identical and measured at −48 to −60 % per KEM operation.
   - **`mulPortable`** — the schoolbook shift-and-mask-xor multiply this
     section used to describe as the only path. It is still here, as the
     fallback for non-x86_64/non-pclmul targets and, on this host, as the
