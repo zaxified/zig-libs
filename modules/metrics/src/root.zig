@@ -91,8 +91,9 @@ const Allocator = std.mem.Allocator;
 /// just adds syscall overhead on top of the same busy-wait: measured worse,
 /// not better, on both the concurrent-scrape and the slow-sink benchmarks
 /// (see the module's audit F2/F4 disposition for the numbers). Left as pure
-/// spin; F2/F4 stay open pending a fix that shrinks the critical section
-/// instead of changing how waiters wait.
+/// spin; F2 (2026-09-15) and F4 (2026-09-16) were instead fixed by shrinking
+/// the critical sections — `writeText` snapshots under the lock and formats
+/// outside it, `AccessLog.log` never holds the lock across writer I/O.
 fn lockSpin(m: *std.atomic.Mutex) void {
     while (!m.tryLock()) std.atomic.spinLoopHint();
 }
@@ -1010,17 +1011,44 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
 /// callers who want those must prepend/wrap their own. (A request-id field is
 /// not on `AccessEntry` today; when one lands it can be added here.)
 ///
-/// Thread-safety: the hook fires on each request task, so by default the
-/// writer is guarded with the module spinlock (`synchronized = true`) — the
-/// whole line is written under the lock, so lines from concurrent connections
-/// never interleave. Set `synchronized = false` only when the caller already
-/// serializes writes to `writer`.
+/// Thread-safety: the hook fires on each request task, so by default
+/// (`synchronized = true`) concurrent calls share `writer` through a group
+/// commit rather than a lock held across I/O (the module's audit, F4: the
+/// spinlock used to be held across `writer.flush()`, so every other request
+/// thread spun for the whole syscall — 25.4 µs of CPU per line at 8 threads
+/// against 1.47 µs at one, into a plain file). Now:
 ///
-/// Allocation-free: every line is streamed straight to `writer` (no temp
-/// buffers). The writer is flushed after each line so records reach the sink
-/// promptly; pass a buffered `writer` if you would rather batch and flush
-/// yourself with `synchronized = false`. Writer errors are swallowed — an
-/// access log must never fail the request that produced it. `path` is
+/// - each line is formatted under the spinlock straight into an inline
+///   pending batch (no syscall, no stack buffer, no allocation);
+/// - at most one caller at a time — the *flusher* — touches `writer`, and it
+///   does so with the spinlock released: it swaps the batch out, writes and
+///   flushes it, and repeats until the batch is empty, so concurrent callers
+///   only append;
+/// - a line is never split: it enters the batch whole or not at all, and a
+///   line too long for the batch is written whole by its own caller after it
+///   becomes the flusher. Lines from different calls interleave only at line
+///   boundaries; lines from one thread keep their call order;
+/// - when the batch is full, a caller waits (spinning, lock released) for the
+///   flusher to swap it out. The flusher hands the role to such a waiter after
+///   each batch, so under a sustained rate the sink cannot keep up with, no
+///   single request is left writing everyone else's lines indefinitely.
+///
+/// When no `log` call is in flight, every logged line has been handed to
+/// `writer.writeAll` and flushed — the batch is empty — so there is no
+/// `deinit` and nothing to drain before dropping an `AccessLog`. A call can
+/// return while its line is still in the batch, but only when another call is
+/// the flusher and is committed to writing it before it returns. Set
+/// `synchronized = false` only when the caller already serializes writes to
+/// `writer`; the batch is then unused and each call writes and flushes
+/// directly.
+///
+/// Allocation-free: the pending batch is inline in the struct. The writer is
+/// flushed after every batch, so records reach the sink promptly. Writer
+/// errors are swallowed — an access log must never fail the request that
+/// produced it; with batching, a failed write is swallowed by whichever call
+/// was the flusher, and the lines it carried are lost exactly as a single
+/// failed line was before (the error, if any, stays on the caller's writer,
+/// e.g. `std.Io.File.Writer.err`). `path` is
 /// unvalidated bytes from the request line — HTTP/2 does not bound them to
 /// printable ASCII the way HTTP/1.1 does — but neither writer panics on
 /// them, and neither can produce an injection (quote/backslash escaping
@@ -1034,6 +1062,23 @@ pub const AccessLog = struct {
     writer: *std.Io.Writer,
     options: Options,
     lock: std.atomic.Mutex = .unlocked,
+
+    // Group-commit state (see the doc comment above). Every field below is
+    // read and written only with `lock` held. `pending[pending_idx]` is the
+    // batch callers append to; the other buffer is the one the flusher may be
+    // writing with the lock released, which is why a swap (not a copy or a
+    // reset in place) is what hands a batch over.
+    pending: [2][pending_capacity]u8 = undefined,
+    pending_idx: u1 = 0,
+    pending_len: usize = 0,
+    /// Some call owns `writer` (is the flusher). Cleared only with the lock
+    /// held and either `pending_len == 0` or `waiters > 0`.
+    flushing: bool = false,
+    /// Calls whose line did not fit while another call was the flusher,
+    /// spinning with the lock released until they can append or take over.
+    waiters: u32 = 0,
+
+    const pending_capacity = 4096;
 
     pub const Format = enum {
         /// One JSON object per line (default).
@@ -1062,17 +1107,90 @@ pub const AccessLog = struct {
     }
 
     /// Format one entry as a line and write it. Best-effort: writer errors are
-    /// swallowed. Holds the spinlock across the whole line when `synchronized`.
+    /// swallowed. When `synchronized`, the spinlock is held only while the
+    /// line is formatted into the pending batch, never across `writer` I/O —
+    /// see the type's doc comment for the group commit.
     pub fn log(self: *AccessLog, entry: AccessEntry) void {
-        if (self.options.synchronized) lockSpin(&self.lock);
-        defer if (self.options.synchronized) self.lock.unlock();
-        self.writeLine(entry) catch {};
-        self.writer.flush() catch {};
+        if (!self.options.synchronized) {
+            writeLine(self.writer, self.options.format, entry) catch {};
+            self.writer.flush() catch {};
+            return;
+        }
+        lockSpin(&self.lock);
+        var waiting = false;
+        while (true) {
+            if (waiting) {
+                self.waiters -= 1;
+                waiting = false;
+            }
+            if (self.appendPending(entry)) {
+                // Someone else owns the writer and must write the batch
+                // (including this line) before it gives the role up.
+                if (self.flushing) return self.lock.unlock();
+                self.flushing = true;
+                self.writeBatch(); // this line is in it
+                return self.finishFlushing();
+            }
+            if (!self.flushing) {
+                // Too long for what is left of the batch (or for any batch).
+                // Take the writer: first everything queued before this call,
+                // then this line, whole, straight to the writer.
+                self.flushing = true;
+                self.writeBatch();
+                self.lock.unlock();
+                writeLine(self.writer, self.options.format, entry) catch {};
+                self.writer.flush() catch {};
+                lockSpin(&self.lock);
+                return self.finishFlushing();
+            }
+            // Batch full and a flusher is active: wait for it to swap the
+            // batch out or hand the role over. Never with the lock held.
+            self.waiters += 1;
+            waiting = true;
+            self.lock.unlock();
+            std.atomic.spinLoopHint();
+            lockSpin(&self.lock);
+        }
     }
 
-    fn writeLine(self: *AccessLog, entry: AccessEntry) std.Io.Writer.Error!void {
-        const w = self.writer;
-        switch (self.options.format) {
+    /// Format `entry` into the current batch. Lock held. On overflow the
+    /// partial bytes past `pending_len` are simply not committed.
+    fn appendPending(self: *AccessLog, entry: AccessEntry) bool {
+        var w: std.Io.Writer = .fixed(self.pending[self.pending_idx][self.pending_len..]);
+        writeLine(&w, self.options.format, entry) catch return false;
+        self.pending_len += w.end;
+        return true;
+    }
+
+    /// Flusher only, lock held on entry and on return: swap the batch out,
+    /// then write and flush it with the lock released. Appenders move on to
+    /// the other buffer, which nobody is writing.
+    fn writeBatch(self: *AccessLog) void {
+        std.debug.assert(self.flushing);
+        if (self.pending_len == 0) return;
+        const idx = self.pending_idx;
+        const len = self.pending_len;
+        self.pending_idx ^= 1;
+        self.pending_len = 0;
+        self.lock.unlock();
+        self.writer.writeAll(self.pending[idx][0..len]) catch {};
+        self.writer.flush() catch {};
+        lockSpin(&self.lock);
+    }
+
+    /// Flusher only, lock held on entry, released on return. Keeps writing
+    /// batches until none is left — or until a waiter exists, in which case
+    /// the role is handed over with lines still queued: a waiter re-checks
+    /// with the lock held and either appends while another call is flushing
+    /// or becomes the flusher itself, so a non-empty batch is never orphaned.
+    fn finishFlushing(self: *AccessLog) void {
+        while (self.pending_len != 0 and self.waiters == 0) self.writeBatch();
+        self.flushing = false;
+        self.lock.unlock();
+    }
+
+    fn writeLine(w: *std.Io.Writer, format: Format, entry: AccessEntry) std.Io.Writer.Error!void {
+        switch (format) {
             .json => {
                 try w.writeAll("{\"method\":");
                 try writeJsonString(w, entry.method.token());
@@ -2749,4 +2867,426 @@ test "F15/M32: AccessLog.log actually takes its lock when synchronized" {
     t.join();
     try testing.expect(done.load(.seq_cst));
     try testing.expect(std.mem.indexOf(u8, w.buffered(), "/m32") != null);
+}
+
+// ── F4 bench (opt-in): AccessLog under concurrency into a real file ────────
+//
+//   METRICS_BENCH_F4=1 LINES=80 scripts/modtest metrics -Doptimize=ReleaseFast -Dtest-filter=F4
+//
+// The sink is a buffered `std.Io.File.Writer` on a file under `.zig-cache/tmp`
+// (disk, not tmpfs), so every `flush()` is a real `pwritev`. Arms are
+// interleaved inside every rep; each pass re-reads the file and fails unless it
+// holds exactly threads × lines newline-terminated records.
+
+fn f4ClockNs(clock: std.os.linux.clockid_t) u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(clock, &ts);
+    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+}
+
+/// Arms: `spin_over_flush` is the pre-F4 `AccessLog.log`, verbatim (spinlock
+/// held across `writeLine` AND `writer.flush()`), kept here only as the
+/// bench's "before" arm; `group_commit` is the shipped `AccessLog.log`.
+const F4Arm = enum { spin_over_flush, group_commit };
+
+fn f4SpinOverFlush(self: *AccessLog, entry: AccessEntry) void {
+    lockSpin(&self.lock);
+    defer self.lock.unlock();
+    AccessLog.writeLine(self.writer, self.options.format, entry) catch {};
+    self.writer.flush() catch {};
+}
+
+/// The audit's BENCH E sink shape: every drain sleeps (so the time is a
+/// blocked syscall, not CPU) and counts the newlines it swallowed.
+const F4SlowSink = struct {
+    interface: std.Io.Writer,
+    delay_ns: u64,
+    newlines: usize = 0,
+
+    fn init(buf: []u8, delay_ns: u64) F4SlowSink {
+        return .{ .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buf }, .delay_ns = delay_ns };
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *F4SlowSink = @alignCast(@fieldParentPtr("interface", w));
+        self.newlines += std.mem.count(u8, w.buffered(), "\n");
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            self.newlines += std.mem.count(u8, d, "\n");
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        self.newlines += std.mem.count(u8, last, "\n") * splat;
+        n += last.len * splat;
+        const ts: std.os.linux.timespec = .{ .sec = 0, .nsec = @intCast(self.delay_ns) };
+        _ = std.os.linux.nanosleep(&ts, null);
+        return n;
+    }
+};
+
+const F4Sink = enum { file, slow_0_2ms };
+
+const F4Result = struct { cpu_ns: u64, wall_ns: u64 };
+
+fn f4Run(access: *AccessLog, arm: F4Arm, threads: usize, lines: usize) !F4Result {
+    const Worker = struct {
+        fn run(a: *AccessLog, which: F4Arm, id: usize, n: usize) void {
+            for (0..n) |i| {
+                const e: AccessEntry = .{
+                    .method = .get,
+                    .path = "/api/v1/tasks/1234567?expand=owner",
+                    .status = 200,
+                    .duration_ns = id * 1_000_000 + i,
+                    .bytes = 512,
+                };
+                switch (which) {
+                    .spin_over_flush => f4SpinOverFlush(a, e),
+                    .group_commit => a.log(e),
+                }
+            }
+        }
+    };
+    var pool: [8]std.Thread = undefined;
+    const c0 = f4ClockNs(.PROCESS_CPUTIME_ID);
+    const w0 = f4ClockNs(.MONOTONIC);
+    for (pool[0..threads], 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ access, arm, id, lines });
+    for (pool[0..threads]) |t| t.join();
+    const w1 = f4ClockNs(.MONOTONIC);
+    const c1 = f4ClockNs(.PROCESS_CPUTIME_ID);
+    return .{ .cpu_ns = c1 - c0, .wall_ns = w1 - w0 };
+}
+
+fn f4Pass(arm: F4Arm, sink: F4Sink, threads: usize, lines: usize) !F4Result {
+    var wbuf: [4096]u8 = undefined;
+    switch (sink) {
+        .file => {
+            const io = testing.io;
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const file = try tmp.dir.createFile(io, "f4.log", .{});
+            var fw = file.writer(io, &wbuf);
+            var access = AccessLog.init(&fw.interface, .{});
+            const res = try f4Run(&access, arm, threads, lines);
+            file.close(io);
+            const data = try tmp.dir.readFileAlloc(io, "f4.log", testing.allocator, .unlimited);
+            defer testing.allocator.free(data);
+            try testing.expectEqual(threads * lines, std.mem.count(u8, data, "\n"));
+            return res;
+        },
+        .slow_0_2ms => {
+            var s = F4SlowSink.init(&wbuf, 200_000);
+            var access = AccessLog.init(&s.interface, .{});
+            const res = try f4Run(&access, arm, threads, lines);
+            try testing.expectEqual(threads * lines, s.newlines + std.mem.count(u8, s.interface.buffered(), "\n"));
+            return res;
+        },
+    }
+}
+
+test "bench (opt-in via METRICS_BENCH_F4): F4 AccessLog.log cost under concurrency" {
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("METRICS_BENCH_F4") == null) return error.SkipZigTest;
+    const reps = 7;
+    const tcounts = [_]usize{ 1, 2, 4, 8 };
+    const arms = comptime std.enums.values(F4Arm);
+    const sinks = comptime std.enums.values(F4Sink);
+    var cpu: [sinks.len][tcounts.len][arms.len][reps]f64 = undefined;
+    var wall: [sinks.len][tcounts.len][arms.len][reps]f64 = undefined;
+    // Every (sink, threads, arm) cell once per rep, arms adjacent, so drift
+    // over the run lands on both arms of a pair alike.
+    for (0..reps) |r| {
+        for (sinks, 0..) |sink, si| {
+            const lines: usize = if (sink == .file) 5000 else 100;
+            for (tcounts, 0..) |tc, ti| {
+                for (arms, 0..) |arm, ai| {
+                    const res = try f4Pass(arm, sink, tc, lines);
+                    const total: f64 = @floatFromInt(tc * lines);
+                    cpu[si][ti][ai][r] = @as(f64, @floatFromInt(res.cpu_ns)) / total;
+                    wall[si][ti][ai][r] = @as(f64, @floatFromInt(res.wall_ns)) / total;
+                }
+            }
+        }
+    }
+    for (sinks, 0..) |sink, si| {
+        for (tcounts, 0..) |tc, ti| {
+            // Per-rep before/after ratio (one instant), then its spread.
+            var ratio: [reps]f64 = undefined;
+            for (0..reps) |r| ratio[r] = cpu[si][ti][0][r] / cpu[si][ti][1][r];
+            std.mem.sort(f64, &ratio, {}, std.sort.asc(f64));
+            for (arms, 0..) |arm, ai| {
+                var c = cpu[si][ti][ai];
+                var w = wall[si][ti][ai];
+                std.mem.sort(f64, &c, {}, std.sort.asc(f64));
+                std.mem.sort(f64, &w, {}, std.sort.asc(f64));
+                std.debug.print("F4 {t:<10} T={d} {t:<15} CPU ns/line {d:>8.0} {d:>8.0} {d:>8.0}  wall ns/line {d:>8.0} {d:>8.0} {d:>8.0}\n", .{
+                    sink, tc, arm, c[0], c[reps / 2], c[reps - 1], w[0], w[reps / 2], w[reps - 1],
+                });
+            }
+            std.debug.print("F4 {t:<10} T={d} CPU before/after per rep: min={d:.2} med={d:.2} max={d:.2}\n", .{
+                sink, tc, ratio[0], ratio[reps / 2], ratio[reps - 1],
+            });
+        }
+    }
+}
+
+// ── F4 regression tests: the group commit keeps lines whole, once, in order ──
+
+fn f4PollUntil(flag: *const std.atomic.Value(bool), timeout_ms: u64) bool {
+    var waited: u64 = 0;
+    while (!flag.load(.seq_cst)) : (waited += 1) {
+        if (waited >= timeout_ms) return false;
+        sleepMs(1);
+    }
+    return true;
+}
+
+fn f4AssertIdle(a: *AccessLog) !void {
+    lockSpin(&a.lock);
+    defer a.lock.unlock();
+    try testing.expectEqual(@as(usize, 0), a.pending_len);
+    try testing.expect(!a.flushing);
+    try testing.expectEqual(@as(u32, 0), a.waiters);
+}
+
+/// Deterministic per-(thread, seq) path: "/t<id>/s<seq>/" + padding. Every
+/// 37th line is longer than a whole batch (the owner path); the rest vary in
+/// length so batch boundaries fall at every offset.
+fn f4Path(buf: []u8, id: usize, seq: usize) []const u8 {
+    const head = std.fmt.bufPrint(buf, "/t{d}/s{d}/", .{ id, seq }) catch unreachable;
+    const pad: usize = if (seq % 37 == 5) AccessLog.pending_capacity + 300 else (id * 31 + seq * 7) % 180;
+    @memset(buf[head.len..][0..pad], 'a' + @as(u8, @intCast((id + seq) % 26)));
+    return buf[0 .. head.len + pad];
+}
+
+test "AccessLog F4: threads x lines into a real file -- every line whole, exactly once, in per-thread order" {
+    const io = testing.io;
+    const threads = 8;
+    const lines = 400;
+    const rounds: usize = if (std.testing.environ.getPosix("METRICS_F4_ROUNDS")) |s| std.fmt.parseInt(usize, s, 10) catch 3 else 3;
+
+    const Worker = struct {
+        fn run(a: *AccessLog, id: usize) void {
+            var pbuf: [AccessLog.pending_capacity + 512]u8 = undefined;
+            for (0..lines) |seq| a.log(.{
+                .method = .get,
+                .path = f4Path(&pbuf, id, seq),
+                .status = 200,
+                .duration_ns = id * 1_000_000 + seq,
+                .bytes = seq,
+            });
+        }
+    };
+    const Line = struct { method: []const u8, path: []const u8, status: u16, duration_ns: u64, bytes: u64 };
+
+    for (0..rounds) |_| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const file = try tmp.dir.createFile(io, "f4.log", .{});
+        // A small writer buffer, so `writeAll`/`flush` drain constantly: any
+        // two callers inside the writer at once show up as torn bytes.
+        var wbuf: [256]u8 = undefined;
+        var fw = file.writer(io, &wbuf);
+        var access = AccessLog.init(&fw.interface, .{});
+
+        var pool: [threads]std.Thread = undefined;
+        for (&pool, 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &access, id });
+        for (pool) |t| t.join();
+        try f4AssertIdle(&access);
+        file.close(io);
+
+        const data = try tmp.dir.readFileAlloc(io, "f4.log", testing.allocator, .unlimited);
+        defer testing.allocator.free(data);
+        try testing.expect(data.len > 0 and data[data.len - 1] == '\n');
+
+        var next_seq: [threads]usize = @splat(0);
+        var count: usize = 0;
+        var pbuf: [AccessLog.pending_capacity + 512]u8 = undefined;
+        var it = std.mem.splitScalar(u8, data[0 .. data.len - 1], '\n');
+        while (it.next()) |raw| {
+            count += 1;
+            const parsed = try std.json.parseFromSlice(Line, testing.allocator, raw, .{});
+            defer parsed.deinit();
+            const id = parsed.value.duration_ns / 1_000_000;
+            const seq = parsed.value.duration_ns % 1_000_000;
+            try testing.expect(id < threads);
+            // Exactly once and in call order per thread: the next line of
+            // thread `id` must be exactly the next sequence number.
+            try testing.expectEqual(next_seq[id], seq);
+            next_seq[id] += 1;
+            try testing.expectEqual(seq, parsed.value.bytes);
+            try testing.expectEqualStrings(f4Path(&pbuf, id, seq), parsed.value.path);
+        }
+        try testing.expectEqual(@as(usize, threads * lines), count);
+    }
+}
+
+test "AccessLog F4: a writer that always fails neither hangs callers nor leaves the batch owned" {
+    const Failing = struct {
+        interface: std.Io.Writer,
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            _ = w;
+            _ = data;
+            _ = splat;
+            return error.WriteFailed;
+        }
+    };
+    var wbuf: [64]u8 = undefined;
+    var sink: Failing = .{ .interface = .{ .vtable = &.{ .drain = Failing.drain }, .buffer = &wbuf } };
+    var access = AccessLog.init(&sink.interface, .{});
+
+    const threads = 4;
+    var done: [threads]std.atomic.Value(bool) = @splat(std.atomic.Value(bool).init(false));
+    const Worker = struct {
+        fn run(a: *AccessLog, id: usize, flag: *std.atomic.Value(bool)) void {
+            var pbuf: [AccessLog.pending_capacity + 512]u8 = undefined;
+            for (0..300) |seq| a.log(.{ .method = .post, .path = f4Path(&pbuf, id, seq), .status = 500, .duration_ns = 1, .bytes = null });
+            flag.store(true, .seq_cst);
+        }
+    };
+    var pool: [threads]std.Thread = undefined;
+    for (&pool, 0..) |*t, id| t.* = try std.Thread.spawn(.{}, Worker.run, .{ &access, id, &done[id] });
+    var all = true;
+    for (&done) |*d| all = all and f4PollUntil(d, 10_000);
+    try testing.expect(all); // a stuck `flushing` would spin every caller forever
+    for (pool) |t| t.join();
+    try f4AssertIdle(&access);
+}
+
+/// A sink with no buffer (every write is one drain) whose drains each need a
+/// permit from the test, so a test can park the flusher inside the write.
+const F4Gate = struct {
+    interface: std.Io.Writer,
+    drains: std.atomic.Value(u32) = .init(0),
+    permits: std.atomic.Value(u32) = .init(0),
+    newlines: std.atomic.Value(usize) = .init(0),
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *F4Gate = @alignCast(@fieldParentPtr("interface", w));
+        _ = self.drains.fetchAdd(1, .seq_cst);
+        while (true) {
+            const p = self.permits.load(.seq_cst);
+            if (p > 0 and self.permits.cmpxchgWeak(p, p - 1, .seq_cst, .seq_cst) == null) break;
+            sleepMs(1);
+        }
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            _ = self.newlines.fetchAdd(std.mem.count(u8, d, "\n"), .seq_cst);
+            n += d.len;
+        }
+        _ = self.newlines.fetchAdd(std.mem.count(u8, data[data.len - 1], "\n") * splat, .seq_cst);
+        return n + data[data.len - 1].len * splat;
+    }
+};
+
+test "AccessLog F4: a line appended while the flusher writes is written before the flusher returns" {
+    // The promptness half of the contract: a call may return with its line
+    // still queued only because an active flusher is committed to writing it.
+    // Park the flusher A in its first drain, append B's line (B returns at
+    // once), let A go: when A returns, B's line must be on the sink and the
+    // batch empty. Without the flusher's re-check B's line would sit in the
+    // batch until some later call happened to come along.
+    var gate: F4Gate = .{ .interface = .{ .vtable = &.{ .drain = F4Gate.drain }, .buffer = &.{} } };
+    var access = AccessLog.init(&gate.interface, .{});
+    const entry: AccessEntry = .{ .method = .get, .path = "/p", .status = 200, .duration_ns = 1, .bytes = 0 };
+
+    const Logger = struct {
+        fn run(a: *AccessLog, e: AccessEntry, flag: *std.atomic.Value(bool)) void {
+            a.log(e);
+            flag.store(true, .seq_cst);
+        }
+    };
+    var a_done = std.atomic.Value(bool).init(false);
+    var b_done = std.atomic.Value(bool).init(false);
+    const ta = try std.Thread.spawn(.{}, Logger.run, .{ &access, entry, &a_done });
+    while (gate.drains.load(.seq_cst) < 1) sleepMs(1);
+    const tb = try std.Thread.spawn(.{}, Logger.run, .{ &access, entry, &b_done });
+    const b_returned = f4PollUntil(&b_done, 2_000); // B only appends
+    gate.permits.store(1_000_000, .seq_cst);
+    ta.join();
+    tb.join();
+    try testing.expect(b_returned);
+    try testing.expectEqual(@as(usize, 2), gate.newlines.load(.seq_cst));
+    try f4AssertIdle(&access);
+}
+
+test "AccessLog F4: the flusher hands off to a waiter instead of writing everyone's lines forever" {
+    // A sink with no buffer (so every batch is one drain) whose drains each
+    // need a permit from the test. Thread A becomes the flusher and parks in
+    // its first drain; the test fills the batch; thread W arrives with a line
+    // that does not fit and waits. One permit later A must RETURN — with W's
+    // line and the fill still queued — rather than go on to write them.
+    const Gate = F4Gate;
+    var gate: Gate = .{ .interface = .{ .vtable = &.{ .drain = Gate.drain }, .buffer = &.{} } };
+    var access = AccessLog.init(&gate.interface, .{});
+    const entry: AccessEntry = .{ .method = .get, .path = "/fill", .status = 200, .duration_ns = 7, .bytes = 1 };
+
+    const Logger = struct {
+        fn run(a: *AccessLog, e: AccessEntry, flag: *std.atomic.Value(bool)) void {
+            a.log(e);
+            flag.store(true, .seq_cst);
+        }
+    };
+    var a_done = std.atomic.Value(bool).init(false);
+    var w_done = std.atomic.Value(bool).init(false);
+    const ta = try std.Thread.spawn(.{}, Logger.run, .{ &access, entry, &a_done });
+    while (gate.drains.load(.seq_cst) < 1) sleepMs(1);
+
+    var one: [256]u8 = undefined;
+    var ow: std.Io.Writer = .fixed(&one);
+    try AccessLog.writeLine(&ow, .json, entry);
+    const line_len = ow.end;
+    // Bounded lock acquisition: an implementation that holds the lock across
+    // writer I/O would park A inside the gated drain WITH the lock, and a
+    // plain `lockSpin` here would hang the suite instead of failing it.
+    const bounded = struct {
+        fn lock(m: *std.atomic.Mutex) bool {
+            for (0..2_000) |_| {
+                if (m.tryLock()) return true;
+                sleepMs(1);
+            }
+            return false;
+        }
+    };
+    var fills: usize = 0;
+    const filled = while (true) {
+        if (!bounded.lock(&access.lock)) break false;
+        const room = AccessLog.pending_capacity - access.pending_len;
+        access.lock.unlock();
+        if (room < line_len) break true;
+        access.log(entry); // A is the flusher: this only appends
+        fills += 1;
+    };
+    if (!filled) {
+        gate.permits.store(1_000_000, .seq_cst);
+        ta.join();
+        return error.TestUnexpectedResult; // lock held across the sink write
+    }
+
+    const tw = try std.Thread.spawn(.{}, Logger.run, .{ &access, entry, &w_done });
+    const saw_waiter = for (0..2_000) |_| {
+        if (!bounded.lock(&access.lock)) break false;
+        const waiting = access.waiters;
+        access.lock.unlock();
+        if (waiting == 1) break true;
+        sleepMs(1);
+    } else false;
+    if (!saw_waiter) {
+        gate.permits.store(1_000_000, .seq_cst);
+        ta.join();
+        tw.join();
+        return error.TestUnexpectedResult; // W never became a waiter
+    }
+
+    gate.permits.store(1, .seq_cst);
+    const handed_off = f4PollUntil(&a_done, 2_000);
+    const drains_when_a_returned = gate.drains.load(.seq_cst);
+
+    gate.permits.store(1_000_000, .seq_cst); // release everything before asserting
+    ta.join();
+    tw.join();
+    try testing.expect(handed_off);
+    try testing.expect(drains_when_a_returned <= 2); // A's one batch (+ W's, parked)
+    try testing.expect(w_done.load(.seq_cst));
+    try f4AssertIdle(&access);
+    try testing.expectEqual(fills + 2, gate.newlines.load(.seq_cst));
 }
