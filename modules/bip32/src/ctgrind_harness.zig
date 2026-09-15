@@ -18,9 +18,11 @@
 //! * `seed`     — the mnemonic through `mnemonic.mnemonicToSeed`
 //!   (PBKDF2-HMAC-SHA512, 2048 rounds).
 //! * `mnemonic` — the mnemonic through `mnemonic.mnemonicToEntropy` (word
-//!   split, wordlist lookup, checksum). SPEC.md already names this path as
-//!   NOT constant-time (`wordIndex` is a binary search over the wordlist); the
-//!   row records how much, so a change in either direction is visible.
+//!   split, wordlist lookup, checksum). SPEC.md still names the word SPLIT
+//!   (locating spaces in the raw text) as not constant-time; `wordIndex`
+//!   itself was rewritten from a binary search to a branchless linear scan
+//!   (finding M6-CT, 2026-09-16) — the row records how much either side
+//!   changes, so a regression in either direction is visible.
 //!
 //! ## Verdicts are declassified, payloads are not
 //!

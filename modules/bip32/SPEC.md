@@ -111,12 +111,14 @@ secp256k1; see [README.md](README.md) for purpose and API.
   Bitcoin/Lightning modules riding `k256`" used to suggest: `bip32.zig`'s own
   CKD control flow (the hardened-vs-normal branch on `index`) is public
   information anyway, so it costs nothing to leave unhardened — but
-  `bip39.zig`'s mnemonic path calls **no `k256` code at all**. Its
-  wordlist lookup (`wordIndex`, a binary search over the 2048-entry English
-  list) branches and indexes the table on the secret mnemonic word at every
-  step — audited 2026-09-06 at 601 valgrind/memcheck-flagged ERRORS on
-  `validateMnemonic` alone, none of which is covered by `k256`'s posture,
-  because none of it touches `k256`.
+  `bip39.zig`'s mnemonic path calls **no `k256` code at all**. `wordIndex`
+  (audit 2026-09-06: a binary search branching and indexing the table on the
+  secret mnemonic word at every step, 601 valgrind/memcheck-flagged ERRORS on
+  `validateMnemonic` alone) was rewritten 2026-09-16 (finding M6-CT) into a
+  full linear scan over all 2048 entries with a branchless masked select —
+  see the `mnemonic` row below. The word SPLIT (locating spaces in the raw
+  mnemonic text) is unchanged and still leaks word boundaries; see that row's
+  notes.
 
   **Measured by the ctgrind gate since 2026-09-16** (audit finding M6):
   `src/ctgrind_harness.zig`, `scripts/ctgrind.sh bip32`. zig 0.16.0, x86_64,
@@ -128,7 +130,7 @@ secp256k1; see [README.md](README.md) for purpose and API.
   | `master` — `masterFromSeed` | seed | 5 | 1 | 4 |
   | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 9 | 5 | 4 |
   | `seed` — `mnemonicToSeed` | mnemonic | 2 | **0** | 2 |
-  | `mnemonic` — `mnemonicToEntropy` | mnemonic | 3 | **3** | 0 |
+  | `mnemonic` — `mnemonicToEntropy` | mnemonic | 5 | **3** | 2 |
 
   - `master` 1 and `derive`'s `bip32.zig:275`: the `IL == 0` / child-key
     `== 0` tests (`std.mem.allEqual`), each compiled to one `vptest; je` —
@@ -140,18 +142,39 @@ secp256k1; see [README.md](README.md) for purpose and API.
     classes `k256`'s own rows already document. The contexts of all five
     derivation steps share these addresses.
   - `seed`: PBKDF2-HMAC-SHA512 over the mnemonic is branch-free.
-  - ⛔ `mnemonic` 3 is a **known defect, pinned rather than fixed**: the word
-    split (`std.mem.splitScalar` → `findScalarPos`, `bip39.zig:100`, leaks
-    word boundaries) and `wordIndex`'s binary search (`std.mem.order`,
-    `bip39.zig:219`, two addresses — the search path and the table index
-    depend on the word). The count is small only because memcheck reports
-    one context per ADDRESS; the 601 errors are per EXECUTION. The entropy
-    rebuilt from the indices carries no taint (it flows through control flow
-    alone), so the checksum comparison after it is not measured by this row.
+  - `mnemonic` 3 in-file, 2 witness (2026-09-16, finding M6-CT — `wordIndex`
+    rewritten from a binary search to a full 2048-entry linear scan with a
+    branchless `0 -% @intFromBool(cond)` mask-select, the same idiom
+    `ed448`'s `ctSelectPoint`/`Fe.ctSelect` use): the count did **not** drop
+    to 0 — it changed COMPOSITION. Before: `findScalarPos`
+    (`bip39.zig:100`, word split, unchanged) + `wordIndex`'s own binary
+    search (`std.mem.order`, old `bip39.zig:219`, 2 addresses — the search
+    PATH and which table entry got compared depended on the word: the actual
+    cache/branch-timing channel this finding named). After: `findScalarPos`
+    (unchanged, out of this finding's scope — see the paragraph above) +
+    `wordIndex`'s own found/not-found verdict (`bip39.zig:267`) +
+    `mnemonicToEntropy`'s checksum verdict (`bip39.zig:155`, M9). Both new
+    lines are `if` statements deciding the function's OWN return value
+    (`WordNotInList` / `InvalidChecksum` vs. success) — information the
+    caller already gets from the return value regardless of timing, same
+    "verdict is public, the path to it is not" class M9's own fix
+    established; `mnemonicToEntropy`'s entropy-bit-assembly loop
+    (`bip39.zig:129`) was rewritten branchless in the same change so `idxs`
+    — now genuinely secret-dependent DATA, where the old binary search's
+    result was accidentally clean under this memcheck-based tool (an
+    artifact of NOT tracking control-flow-only/implicit taint, not a real
+    guarantee) — does not open a NEW branch there. The 2 witness contexts
+    are the harness's own `entropy={x}` print (the declassification-free
+    propagation witness, expected). Positive control (2026-09-16, this fix):
+    reverting `wordIndex` to the old binary search reproduces the exact old
+    3 in-file / 0 witness split at the exact old lines (`bip39.zig:100`,
+    `:219`×2).
 
-  Positive control: one branch on a secret byte inserted into each target's
-  function adds exactly one context (1 → 2, 5 → 6, 0 → 1, 3 → 4), at the
-  inserted line.
+  Positive control (harness-level, 2026-09-16 creation): one branch on a
+  secret byte inserted into each target's function adds exactly one context
+  (`master` 1 → 2, `derive` 5 → 6, `seed` 0 → 1) — not re-verified for
+  `mnemonic` after the M6-CT rewrite above; that row's own before/after
+  revert (above) is its positive control instead.
 - **BIP-39 checksum comparison: constant iteration count, not a constant-time
   proof**: `mnemonicToEntropy` used to return `error.InvalidChecksum` as soon
   as it found a mismatching checksum bit, so the number of loop iterations
@@ -163,8 +186,12 @@ secp256k1; see [README.md](README.md) for purpose and API.
   accumulator and checks it once after the loop, so the loop always runs
   `cs_bits` iterations regardless of where a mismatch is. That closes the
   iteration-COUNT oracle this finding named; it is not by itself a proof
-  that the compiled code takes uniform time — that needs the same ctgrind
-  coverage the `wordIndex` note above is deferring.
+  that the compiled code takes uniform time. **Measured by the `mnemonic`
+  ctgrind row above since M6-CT (2026-09-16)**: the loop itself (a
+  bit-for-bit XOR-accumulate) is branch-free — flagged instead is the single
+  `if (mismatch != 0)` verdict after it (`bip39.zig:155`), which decides
+  `error.InvalidChecksum` vs. success, exactly the accept/reject bit this
+  comment already says the function is allowed to reveal.
 - **A watch-only `xpub` plus ONE leaked non-hardened child private key
   recovers the PARENT private key** — this is a property of BIP-32 itself,
   not an implementation defect (`k_parent = k_child − HMAC(chain_code,
