@@ -25,10 +25,16 @@
 //! obligations it carries (RATE = back off, DENY/RSTR = stop asking this
 //! server ever again), and the rest of the RFC 4330 §5 discard-rule family
 //! (bad stratum, an unset Transmit Timestamp). All of it is exercised below
-//! both live, against real public servers, and canned -- deliberately
-//! hand-built rejects, because provoking a real Kiss-o'-Death would mean
-//! abusing a public server's rate limit, which this demo will not do (see
-//! the discard-rule section below for exactly which path is which).
+//! canned -- deliberately hand-built rejects, because provoking a real
+//! Kiss-o'-Death would mean abusing a public server's rate limit, which this
+//! demo will not do -- and live against whichever servers the caller names
+//! (see the discard-rule section below for exactly which path is which).
+//!
+//! **No network unless asked:** run with no arguments -- which is how
+//! `zig build run-example-sntp` and the `run-examples` sweep run it -- the
+//! demo prints the canned discard rules and stops. It sends nothing to a
+//! third party the caller did not name: a live query needs a server address
+//! on the command line, or `--public` for the two built-in public servers.
 //!
 //! **Known bound, printed honestly below too:** this module's timestamp
 //! arithmetic is only correct inside NTP era 0, which ends 2036-02-07 --
@@ -38,7 +44,7 @@
 //! **No DNS:** `sntp`'s `build.zig` line carries no deps beyond std (no
 //! `dns` module), so this demo -- built the same way an outside consumer
 //! would build it -- accepts IPv4/IPv6 **literal** addresses only, never
-//! hostnames. The two default servers below are pinned literals for
+//! hostnames. The two `--public` servers below are pinned literals for
 //! well-known public stratum-1 services, the same ones this module's own
 //! README documents and (for time.google.com) the one its golden test's
 //! frozen reply was captured from.
@@ -56,13 +62,15 @@ const usage_text =
     \\NEVER sets the system clock.
     \\
     \\usage:
-    \\  sntp-demo [-t timeout_ms] [-p port] [server_ip ...]
+    \\  sntp-demo [-t timeout_ms] [-p port] [--public] [server_ip ...]
     \\  sntp-demo -h | --help
     \\
     \\  server_ip     literal IPv4 or IPv6 address (this module has no DNS
-    \\                dependency, so hostnames are not accepted). If none
-    \\                are given, queries two well-known public servers by
-    \\                their pinned literal IPs (see this module's README.md).
+    \\                dependency, so hostnames are not accepted).
+    \\  --public      also query two well-known public servers by their
+    \\                pinned literal IPs (see this module's README.md).
+    \\                With neither a server_ip nor --public, nothing is sent:
+    \\                only the canned discard-rule demo runs.
     \\  -t <ms>       receive timeout per server, in milliseconds (default 3000)
     \\  -p <port>     NTP port to use for every server (default 123)
     \\  -h, --help    this text
@@ -80,12 +88,12 @@ const banner_text =
 
 const NamedServer = struct { name: []const u8, ip: []const u8 };
 
-/// Pinned literal IPs, not hostnames -- see the "No DNS" note above.
-/// `time.google.com` is the same server the module's own golden test froze
-/// a real reply from (src/root.zig, "golden: real SNTP reply captured from
-/// time.google.com"); `time.cloudflare.com`'s address is the one already
-/// documented in this module's own README.md example.
-const default_servers = [_]NamedServer{
+/// Queried only with `--public`. Pinned literal IPs, not hostnames -- see
+/// the "No DNS" note above. `time.google.com` is the same server the module's
+/// own golden test froze a real reply from (src/root.zig, "golden: real SNTP
+/// reply captured from time.google.com"); `time.cloudflare.com`'s address is
+/// the one already documented in this module's own README.md example.
+const public_servers = [_]NamedServer{
     .{ .name = "time.google.com", .ip = "216.239.35.4" },
     .{ .name = "time.cloudflare.com", .ip = "162.159.200.1" },
 };
@@ -123,20 +131,26 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
 
     runDiscardDemos();
 
+    if (opts.servers.items.len == 0 and !opts.public) {
+        std.debug.print(
+            "\n-- no live query: name a server_ip, or pass --public for the built-in public servers --\n",
+            .{},
+        );
+        return 0;
+    }
+
     var ok: usize = 0;
     var attempted: usize = 0;
-    if (opts.servers.items.len == 0) {
-        std.debug.print("\n-- no server given; querying the built-in defaults --\n", .{});
-        for (default_servers) |s| {
+    std.debug.print("\n-- live queries --\n", .{});
+    if (opts.public) {
+        for (public_servers) |s| {
             attempted += 1;
             if (try runQuery(io, s.name, s.ip, opts.port, opts.timeout_ms)) ok += 1;
         }
-    } else {
-        std.debug.print("\n-- live queries --\n", .{});
-        for (opts.servers.items) |s| {
-            attempted += 1;
-            if (try runQuery(io, s, s, opts.port, opts.timeout_ms)) ok += 1;
-        }
+    }
+    for (opts.servers.items) |s| {
+        attempted += 1;
+        if (try runQuery(io, s, s, opts.port, opts.timeout_ms)) ok += 1;
     }
 
     std.debug.print("\n{d} of {d} server(s) answered with a usable, validated reply\n", .{ ok, attempted });
@@ -153,6 +167,9 @@ const Options = struct {
     timeout_ms: u32 = 3000,
     port: u16 = sntp.ntp_port,
     help: bool = false,
+    /// `--public`: query `public_servers` too. Off by default, so a bare run
+    /// contacts no third party.
+    public: bool = false,
 
     fn deinit(self: *Options, gpa: Allocator) void {
         self.servers.deinit(gpa);
@@ -166,6 +183,8 @@ fn parseArgs(gpa: Allocator, args: *std.process.Args.Iterator) !Options {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             opts.help = true;
+        } else if (std.mem.eql(u8, arg, "--public")) {
+            opts.public = true;
         } else if (std.mem.eql(u8, arg, "-t")) {
             const v = args.next() orelse return error.BadUsage;
             opts.timeout_ms = std.fmt.parseInt(u32, v, 10) catch return error.BadUsage;
