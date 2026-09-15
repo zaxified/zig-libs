@@ -5,17 +5,31 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-15** — **PERFORMANCE, no API/behaviour change:** audit F6. `encodeAlloc` sizes every
-  submessage exactly once (a `SizeTree` built in a throwaway arena over its own `gpa`) instead of
-  recomputing a nested submessage's size once per level of nesting it is under, which made
-  encoding a chain `depth` levels deep cost O(depth²). Measured (ReleaseFast, `smp_allocator`):
-  depth 255 3.45ms -> 118µs (29x), depth 64 (the module's and `grpc.Stream.sendInner`'s own
-  `max_depth` default) 213µs -> 31µs (6.9x). Trade-off, recorded honestly: for shallow messages
-  (depth 1-4) the cache's own allocation overhead makes `encodeAlloc` measurably slower than
-  before (hundreds of ns), crossing over to a net win around depth 8 — see SPEC.md "Not
-  implemented" for the full numbers. `encodeInto` (the allocation-free path) is byte-for-byte
-  unchanged, compiled identically to before; only `encodeAlloc`'s internals changed, no public
-  signature or wire output changed anywhere.
+- **2026-09-15** — **PERFORMANCE, no API/behaviour change:** audit F6, hybrid (coordinator review
+  rejected the first, unconditional cache — see below). `encodeAlloc`'s first, allocation-free
+  sizing pass now also tracks the deepest nesting seen (free — `depth` was already threaded
+  through every recursive call); only at/above `size_cache_min_depth` (8) does it build a
+  `SizeTree` (a throwaway arena over its own `gpa`) and consult it during emit instead of
+  recomputing a nested submessage's size once per level of nesting it is under — the cause of a
+  chain `depth` levels deep costing O(depth²) to encode. Below the threshold, emit recomputes
+  exactly as it always did: a typical shallow gRPC message (depth 1-4) now pays what it ALWAYS
+  paid, zero extra allocation. Measured against three states (before F6 `646d54a5`, F6-only
+  `1e818b21`, hybrid), ReleaseFast, `smp_allocator`, interleaved, reproduced across two runs:
+  depth 1-4 hybrid/before 0.97-1.01x (regression gone); depth 64 (the module's and
+  `grpc.Stream.sendInner`'s own `max_depth` default) 0.18x of before (222µs -> 39µs, 5.7x
+  faster), 1.2x of F6-only's pure-cache cost; depth 255 0.04x of before (3.9ms -> 153µs, 25x
+  faster), 1.1-1.2x of F6-only. Full table in SPEC.md "Not implemented". `encodeInto` (the
+  allocation-free path) is byte-for-byte unchanged, compiled identically to before F6 ever
+  existed; only `encodeAlloc`'s internals changed, no public signature or wire output changed
+  anywhere. A test-only path counter (`cache_path_calls_for_testing`) plus a dedicated test
+  confirm the threshold actually gates which path runs, not just that the bytes come out right —
+  bytes are identical either way by construction, so a byte-only test cannot see a mutant that
+  pins the threshold to 0 or to `maxInt(u8)`.
+
+  First cut (WITHDRAWN, not shipped): always building the `SizeTree`, unconditionally. Fixed the
+  same asymptotic cost but cost shallow messages hundreds of ns each (depth 1: 818ns -> 950ns,
+  depth 4: 1860ns -> 2481ns) — a bad trade for gRPC's actual traffic shape (mostly shallow), and
+  replaced by the hybrid above before this ever reached a release.
 
 - **2026-09-15** — **BEHAVIOURAL (new memory cap, on by default):** audit F1, round-2 decision
   Q4. Declared length and nesting depth were both bounded, but arena memory was not: a
