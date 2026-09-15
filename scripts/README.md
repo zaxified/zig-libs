@@ -297,6 +297,59 @@ Three things were wrong at once, and `modtest` closes all three:
       scripts/modtest yaml                     # zig build test-yaml
       scripts/modtest yaml -Doptimize=ReleaseFast
       scripts/modtest --file .zig-cache/probe/mutant.zig
+      scripts/modtest yaml --fuzz=200K         # coverage-guided fuzz, see below
+
+#### `--fuzz` — a fuzz run that cannot report "clean" over nothing
+
+`scripts/modtest <m> --fuzz[=N]` runs `zig build test-<m> --release=safe
+--fuzz=N` inside the same cap, byte budget, watchdog and cgroup sweep (default
+wall limit 600 s, one fuzz run per machine via a lock in `$XDG_RUNTIME_DIR`).
+The limited form never starts the web UI; bare `--fuzz` is rewritten to
+`--fuzz=$ZIGLIBS_FUZZ_ITERS` and `--webui`/`--watch` are refused. The verdict is
+built from evidence zig cannot misreport, because zig 0.16.0 **exits 0 when a
+fuzz test crashes** (see `fuzz-sweep.sh`):
+
+| verdict | exit | evidence |
+|---|---|---|
+| FINDING | 10 | `input saved to` in the log, or `.zig-cache/f/crash` changed; input copied to `.zig-cache/modtest/<m>.fuzz-crash` |
+| HANG | 124 | wall limit expired |
+| NEVER-FUZZED | 11 | no coverage map in `.zig-cache/v/` advanced |
+| FAILED | zig's | compile error / ordinary test failure |
+| INSTRUMENT | 14 | `fuzz-coverage.py` failed |
+| INCOMPLETE | 12 | runs < 90 % of harnesses × N |
+| REACH-MISS | 13 | a `ZIGLIBS_FUZZ_REACH` item was not executed |
+| clean | 0 | none of the above |
+
+Run counts come from the coverage map the fuzzed process writes, not from the
+FUZZING REPORT — that report prints one block per test *executable* and names
+only its first fuzz test, so a module with three harnesses looks like one ran.
+`scripts/fuzz-coverage.py` resolves the map's seen PCs with `addr2line -f -i`
+against the executable whose `__sancov_pcs1` section matches the map byte for
+byte, and prints per-file coverage for `modules/<m>/src/`.
+
+`ZIGLIBS_FUZZ_REACH` turns "the harness can get there" into a measured claim:
+`file.zig:LINE`, `file.zig:A-B` or `fn:NAME-SUBSTRING`, comma-separated, each
+reported HIT / MISS / NO-PC. ⚠ In ReleaseSafe a switch arm or a call line often
+has **no PC of its own** (NO-PC is "the instrument cannot see this line", not
+"not executed"); generic instantiations are told apart by function name, which
+Zig spells with the type, e.g. `fn:Decoded(conformance.Presence)`.
+⛔ And a HIT on a `return error.X;` line is **not** evidence that the return
+ran: LLVM shares error-return blocks, so the PC addr2line attributes to that
+line is also taken by other paths. Measured on `ethfrag` 2026-09-15 —
+`root.zig:519` (`return error.TooManyFragments`) stayed HIT in a mutant whose
+64-step script cannot reach the 1000-fragment cap. To measure a guard, route it
+through a `noinline` marker function in a temporary mutant and reach it by
+`fn:`; prove the instrument with a RED mutant where the guard cannot fire.
+
+Self-checked 2026-09-15: a netconf harness mutated to return
+`error.PlantedFuzzFinding` when `input[0] == 0xDE` → FINDING, exit 10 after
+77 562 runs, zig itself exited 0; `-Dtest-filter` selecting no fuzz test →
+NEVER-FUZZED, exit 11; a same-shaped `Decoded(conformance.Drops)` the protobuf
+harness never selects → MISS while its five selectable siblings HIT. ⚠ The
+first mutant hid its return behind THREE nested byte compares and was not found
+in 605 129 runs although the map shows the fuzzer reached the third compare —
+a limit of the 0.16 fuzzer's search, worth remembering before calling a deep
+path "fuzzed".
 
 ⛔ Probe files belong in `.zig-cache/probe/`, not in a scratch directory under
 `/tmp`: tmpfs is RAM, so a mutant that writes without bound fills memory whether

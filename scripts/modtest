@@ -7,6 +7,9 @@
 #     scripts/modtest --file probe.zig        # one-off `zig test FILE` (mutants)
 #     scripts/modtest --file probe.zig -OReleaseFast
 #     LINES=200 scripts/modtest yaml          # show more of the tail
+#     scripts/modtest yaml --fuzz             # coverage-guided fuzz, see FUZZ MODE
+#     scripts/modtest yaml --fuzz=200K        # ... with an explicit per-harness budget
+#     ZIGLIBS_FUZZ_REACH=decode.zig:611 scripts/modtest protobuf --fuzz=50K
 #
 # Why this exists, and why `scripts/capped zig build test-<m> | tail -20` is NOT
 # the same thing:
@@ -47,13 +50,80 @@
 #   NICE                 niceness                               (default 15)
 #   JOBS                 zig build -j                           (default 2)
 #   LINES                lines of tail printed on success       (default 40)
-#   ZIGLIBS_MODTEST_TIMEOUT   wall-clock limit: 900s for a lane, 120s for --file
+#   ZIGLIBS_MODTEST_TIMEOUT   wall-clock limit: 900s for a lane, 120s for --file,
+#                             600s for --fuzz
+#   ZIGLIBS_FUZZ_ITERS   per-harness budget for a bare --fuzz   (default 50000)
+#   ZIGLIBS_FUZZ_REACH   comma-separated `file.zig:LINE[-LINE]` that the fuzz run
+#                        must have EXECUTED; a miss fails the run (exit 13)
 #
 # The 4G default is deliberately lower than `capped`'s 12G: this runner is for
 # the fix campaign, where up to four agents run lanes at once on a desktop the
 # user is sitting at. 4 x 4G leaves the editor and browser their half of RAM.
 # A full `zig build test` across EVERY module peaks at 4.1 GiB, so 4G is ample
 # for one module and still an order of magnitude under a runaway.
+#
+# ── FUZZ MODE ──────────────────────────────────────────────────────────────────
+#
+#   scripts/modtest <m> --fuzz[=N[K|M|G]] [zig build args...]
+#
+# Runs `zig build test-<m> --release=safe --fuzz=N` under the same cap, byte
+# budget, watchdog and cgroup sweep as a lane, then gives a VERDICT that does not
+# rest on zig's exit code. Everything below was read out of the 0.16.0 build
+# runner and fuzzer, not assumed:
+#
+#   * `--fuzz=N` is LIMITED mode: N iterations PER FUZZ TEST (lib/fuzzer.zig
+#     keeps a per-test `limit`), one fuzzing process per test executable
+#     (Step/Run.zig: `.limit => 1`), and NO web server -- only bare `--fuzz`
+#     (forever) implies `--webui` (build_runner.zig). So a bare `--fuzz` given to
+#     modtest is turned into `--fuzz=$ZIGLIBS_FUZZ_ITERS`, never passed through,
+#     and `--webui`/`--watch` are refused: a run that never ends and opens a
+#     port is not a measurement.
+#   * `--release=safe` is added unless the caller names an optimize mode:
+#     fuzz-mode rebuilds do not compile in Debug for many modules on 0.16.0
+#     (`test_runner.zig:566`, `*builtin.StackTrace` vs `*debug.StackTrace`).
+#   * ⛔ zig EXITS 0 WHEN A FUZZ TEST CRASHES: build_runner.zig freezes
+#     `failure_count` before the fuzzer starts, and Fuzz.zig:fuzzWorkerRun
+#     swallows the MakeFailed. Measured and written up in scripts/fuzz-sweep.sh.
+#     So a crash is recognised from two signals, either of which is enough:
+#     Run.zig's `test '<name>' <term>; input saved to '.zig-cache/f/crash'`
+#     line, and `.zig-cache/f/crash` itself changing (stat before/after).
+#   * ⛔ The FUZZING REPORT prints one block per test EXECUTABLE and names only
+#     its FIRST fuzz test (`fuzz_tests.items[0]`), with `Runs` summed over all of
+#     them. A module with three harnesses therefore looks like one harness ran.
+#     The iteration count used here comes instead from the coverage map the
+#     fuzzed process itself updates, `.zig-cache/v/<pc digest>` -- snapshotted
+#     before and read after by scripts/fuzz-coverage.py -- which also survives a
+#     run that was killed before any report was printed.
+#   * The same map's seen-PC bits, resolved with `addr2line -i` against the
+#     executable whose `__sancov_pcs1` section IS that map's PC list, give
+#     per-source-file coverage for `modules/<m>/src/` and answer
+#     ZIGLIBS_FUZZ_REACH: "did the fuzzer execute this line", HIT/MISS/NO-PC.
+#   * A worker's stderr is only kept when it crashes (Run.zig merges it into
+#     the step result on a non-zero exit), so `std.debug.print` counters inside
+#     a harness never reach the log of a clean run. Reach is the replacement.
+#   * One fuzz run per MACHINE (flock on $XDG_RUNTIME_DIR/zig-libs-modtest-fuzz.lock):
+#     the user sits at this desktop, and two fuzzers on one corpus panic with
+#     "corpus ... in use by another fuzzer", which reads like a finding.
+#
+# Verdict and exit code (the ladder is ordered by what it can prove):
+#   FINDING        10  crash seen; input copied to .zig-cache/modtest/<m>.fuzz-crash
+#   HANG          124  the wall-clock limit expired
+#   NEVER-FUZZED   11  no coverage map advanced: zero iterations is not clean
+#   FAILED         rc  zig failed (compile error, ordinary test failure)
+#   INSTRUMENT     14  the coverage reader itself failed
+#   INCOMPLETE     12  fewer runs than 90% of harnesses x N
+#   REACH-MISS     13  a ZIGLIBS_FUZZ_REACH line was not executed (or has no PC)
+#   clean           0
+#
+# Self-checked when this mode was added (2026-09-15), details in scripts/README.md:
+# a netconf harness mutated to `return error.PlantedFuzzFinding` on
+# `input[0] == 0xDE` was FOUND after 77 562 runs (exit 10) while zig itself
+# exited 0; a `-Dtest-filter` that selects no fuzz test came back NEVER-FUZZED
+# (exit 11, 0 maps advanced); and `fn:Decoded(conformance.Drops)`, a same-shaped
+# instantiation the protobuf harness never selects, came back MISS while its
+# five selectable siblings came back HIT.
+# ⚠ ReleaseSafe gives many lines no PC of their own (a switch arm, a call):
+# reach them by `fn:` name, and read NO-PC as "cannot see", not "not run".
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,6 +131,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 if [[ $# -eq 0 ]]; then
     echo "usage: scripts/modtest MODULE [zig build args...]" >&2
+    echo "       scripts/modtest MODULE --fuzz[=N[K|M|G]] [zig build args...]" >&2
     echo "       scripts/modtest --file PATH.zig [zig test args...]" >&2
     exit 2
 fi
@@ -78,14 +149,53 @@ else
 fi
 shift
 
+# Split the caller's args into the fuzz request and what goes to zig. "$@" is
+# left untouched: the re-exec below hands it over verbatim and the inner run
+# parses it again.
+fuzz=""
+has_opt=0
+has_filter=0
+build_args=()
+for a in "$@"; do
+    case "$a" in
+        --fuzz)   fuzz="${ZIGLIBS_FUZZ_ITERS:-50000}" ;;
+        --fuzz=*) fuzz="${a#--fuzz=}" ;;
+        --webui|--webui=*|--watch)
+            echo "⛔ modtest refuses $a: it turns a bounded run into a server that never exits." >&2
+            exit 2 ;;
+        *)
+            [[ "$a" == -Doptimize=* || "$a" == --release* ]] && has_opt=1
+            [[ "$a" == -Dtest-filter=* ]] && has_filter=1
+            build_args+=("$a") ;;
+    esac
+done
+fuzz_iters=0
+if [[ -n "$fuzz" ]]; then
+    [[ "$mode" == lane ]] || { echo "⛔ --fuzz needs a build lane; \`zig test FILE\` cannot fuzz." >&2; exit 2; }
+    if [[ ! "$fuzz" =~ ^([1-9][0-9]*)([KMG]?)$ ]]; then
+        echo "⛔ --fuzz=$fuzz: expected a positive count, optionally suffixed K, M or G." >&2
+        exit 2
+    fi
+    case "${BASH_REMATCH[2]}" in
+        K) fuzz_iters=$((BASH_REMATCH[1] * 1000)) ;;
+        M) fuzz_iters=$((BASH_REMATCH[1] * 1000000)) ;;
+        G) fuzz_iters=$((BASH_REMATCH[1] * 1000000000)) ;;
+        *) fuzz_iters=${BASH_REMATCH[1]} ;;
+    esac
+    mode=fuzz
+fi
+
 log_dir="$REPO_ROOT/.zig-cache/modtest"
 mkdir -p "$log_dir"
 log="$log_dir/$module.log"
+[[ "$mode" == fuzz ]] && log="$log_dir/$module.fuzz.log"
 
 # ⛔ One lane per module at a time. Two concurrent runs of the same module write
 # the same log and clobber each other's result -- measured 2026-09-10, an agent
 # lost a measurement twice that way and could not tell which run it was reading.
-# `flock -n` on the log makes the second one say so instead of racing.
+# `flock -n` on the log makes the second one say so instead of racing. A fuzz
+# run takes the SAME per-module lock as a lane: both write the module's build
+# cache entries.
 # ⛔⛔ The braces are load-bearing. `exec 9>>"$log.lock" 2>/dev/null` does NOT
 # redirect stderr "for this exec" -- an `exec` with redirections and no command
 # applies them to THE SHELL, permanently. Written that way (as it was from
@@ -94,10 +204,18 @@ log="$log_dir/$module.log"
 # -- went to /dev/null for the whole run. The tool's alarms were mute and its
 # exit codes were the only thing left saying anything. Wrapping in a group
 # scopes the redirect to the group and leaves the shell's own stderr alone.
-{ exec 9>>"$log.lock"; } 2>/dev/null || true
+{ exec 9>>"$log_dir/$module.log.lock"; } 2>/dev/null || true
 if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
     echo "⛔ modtest $module is already running (log $log). Wait for it or use a different module." >&2
     exit 2
+fi
+if [[ "$mode" == fuzz ]]; then
+    fuzz_lock="${XDG_RUNTIME_DIR:-/tmp}/zig-libs-modtest-fuzz.lock"
+    { exec 8>>"$fuzz_lock"; } 2>/dev/null || true
+    if command -v flock >/dev/null 2>&1 && ! flock -n 8; then
+        echo "⛔ another \`modtest --fuzz\` is running on this machine (lock $fuzz_lock). One at a time." >&2
+        exit 2
+    fi
 fi
 
 : "${ZIGLIBS_MEM_MAX:=4G}"
@@ -139,7 +257,8 @@ fi
 #
 # So: a watchdog sweeps our own cgroup once the limit is past. Sweeping the
 # CGROUP rather than the process group is what makes it work regardless of who
-# reparented the stray.
+# reparented the stray. A fuzz run needs this more than a lane: the build runner
+# forks the fuzzing test process, which is exactly the child `timeout` misses.
 
 # Seconds from ZIGLIBS_MODTEST_TIMEOUT ("900s", "15m", or a bare number).
 timeout_seconds() {
@@ -187,9 +306,15 @@ reap_cgroup() {
 
 set -o pipefail
 
+case "$mode" in
+    file) timeout_spec="${ZIGLIBS_MODTEST_TIMEOUT:-120s}" ;;
+    fuzz) timeout_spec="${ZIGLIBS_MODTEST_TIMEOUT:-600s}" ;;
+    *)    timeout_spec="${ZIGLIBS_MODTEST_TIMEOUT:-900s}" ;;
+esac
+
 # Watchdog: once the limit plus a grace period is past, sweep the cgroup. This
 # is what unblocks `head` when a stray is holding the pipe open -- see (2) above.
-limit_s=$(timeout_seconds "${ZIGLIBS_MODTEST_TIMEOUT:-$([[ "$mode" == file ]] && echo 120s || echo 900s)}")
+limit_s=$(timeout_seconds "$timeout_spec")
 (
     sleep $((limit_s + 30))
     # ⚠ Mark BEFORE sweeping, not after. Killing the pipeline lets the main
@@ -201,6 +326,11 @@ limit_s=$(timeout_seconds "${ZIGLIBS_MODTEST_TIMEOUT:-$([[ "$mode" == file ]] &&
     reap_cgroup "$$" "$BASHPID"
 ) &
 watchdog=$!
+
+cache_dir="$REPO_ROOT/.zig-cache"
+crash_file="$cache_dir/f/crash"
+# nanosecond mtime + size + inode: no one-second window for a crash to hide in.
+crash_stamp() { stat -c '%y:%s:%i' "$crash_file" 2>/dev/null || echo none; }
 
 if [[ "$mode" == file ]]; then
     # One file, one binary, same cap and same byte budget, plus a wall-clock
@@ -220,8 +350,24 @@ if [[ "$mode" == file ]]; then
     for a in "$@"; do
         [[ "$a" == -Mroot=* ]] && probe_arg=() && break
     done
-    timeout "${ZIGLIBS_MODTEST_TIMEOUT:-120s}" \
+    timeout "$timeout_spec" \
         zig test ${probe_arg[@]+"${probe_arg[@]}"} "$@" 2>&1 \
+        | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
+elif [[ "$mode" == fuzz ]]; then
+    fuzz_py="$SCRIPT_DIR/fuzz-coverage.py"
+    snap="$log_dir/$module.fuzz-before.json"
+    kv="$log_dir/$module.fuzz.kv"
+    rm -f "$kv" "$log_dir/$module.fuzz-crash"
+    snap_rc=0
+    python3 "$fuzz_py" snapshot "$cache_dir" "$snap" || snap_rc=$?
+    crash_before=$(crash_stamp)
+    opt_args=()
+    [[ "$has_opt" == 0 ]] && opt_args=(--release=safe)
+    fuzz_start=$(date +%s)
+    timeout "$timeout_spec" \
+        zig build "test-$module" -j"$JOBS" --summary all \
+            ${opt_args[@]+"${opt_args[@]}"} ${build_args[@]+"${build_args[@]}"} \
+            --fuzz="$fuzz" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 else
     # Wall-clock limit on the lane too, not just on `--file`. Measured
@@ -229,7 +375,7 @@ else
     # flat 3.2 MB RSS for 53 minutes -- an infinite loop, which no memory cap
     # and no byte budget can see, because it neither allocates nor prints.
     # A lane that hits this is a finding, and the exit code says so (124).
-    timeout "${ZIGLIBS_MODTEST_TIMEOUT:-900s}" \
+    timeout "$timeout_spec" \
         zig build "test-$module" -j"$JOBS" --summary all "$@" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 fi
@@ -270,10 +416,83 @@ if [[ -f "$log.swept" ]]; then swept=1; rm -f "$log.swept"; fi
 bytes=$(stat -c %s "$log" 2>/dev/null || echo 0)
 budget=$(numfmt --from=iec "$ZIGLIBS_MODTEST_LOG_MAX" 2>/dev/null || echo 0)
 
-echo "── modtest $module ── exit $rc, log $log ($(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B)"
+final_rc=$rc
+fuzz_block=""
+if [[ "$mode" == fuzz ]]; then
+    # Read the maps only now: the sweep above has stopped anything that could
+    # still be writing to them.
+    summary="$log_dir/$module.fuzz.summary"
+    py_rc=$snap_rc
+    if [[ "$snap_rc" == 0 ]]; then
+        python3 "$fuzz_py" report "$cache_dir" "$snap" "$module" "$kv" "${ZIGLIBS_FUZZ_REACH:-}" \
+            > "$summary" 2>&1 || py_rc=$?
+    else
+        echo "⛔ coverage snapshot failed (exit $snap_rc) — no iteration count can be trusted" > "$summary"
+    fi
+    runs_delta=0 maps=0 reach_items=0 reach_miss=0
+    if [[ -f "$kv" ]]; then
+        while IFS='=' read -r k v; do
+            case "$k" in
+                runs_delta|maps|reach_items|reach_miss) [[ "$v" =~ ^[0-9]+$ ]] && printf -v "$k" '%s' "$v" ;;
+            esac
+        done < "$kv"
+    fi
+
+    # The number of harnesses the budget applies to. Comment-stripped, because
+    # this repo quotes `testing.fuzz(` in prose (scripts/fuzz-sweep.sh found the
+    # miscount). Under -Dtest-filter the selected subset is unknown, so the
+    # floor falls back to one harness -- weaker, and said so.
+    nh=$(find "$REPO_ROOT/modules/$module/src" -name '*.zig' -exec cat {} + 2>/dev/null \
+        | awk '{ c = $0; sub(/\/\/.*/, "", c) } c ~ /testing\.fuzz\(/ { n++ } END { print n + 0 }')
+    floor_h=$nh
+    [[ "$has_filter" == 1 || "$floor_h" -lt 1 ]] && floor_h=1
+    floor=$(( floor_h * fuzz_iters * 9 / 10 ))
+    report_runs=$(awk '/^Runs: /{ d += $4 - $2 } END { print d + 0 }' "$log" 2>/dev/null || echo 0)
+
+    strong=0 weak=0 crash_changed=0
+    [[ "$(crash_stamp)" != "$crash_before" ]] && crash_changed=1
+    grep -aqE "input saved to" "$log" 2>/dev/null && strong=1
+    (( crash_changed )) && strong=1
+    grep -aqE "error: test '|test process unexpectedly|terminated with signal|thread [0-9]+ panic|run test failure" \
+        "$log" 2>/dev/null && weak=1
+
+    if (( strong )) || { (( weak )) && [[ "$rc" == 0 ]]; }; then
+        verdict=FINDING; final_rc=10
+        (( crash_changed )) && cp "$crash_file" "$log_dir/$module.fuzz-crash"
+    elif [[ "$rc" == 124 ]]; then
+        verdict=HANG; final_rc=124
+    elif (( runs_delta <= 0 )); then
+        verdict=NEVER-FUZZED; final_rc=11
+    elif [[ "$rc" != 0 ]]; then
+        verdict=FAILED; final_rc=$rc
+    elif [[ "$py_rc" != 0 ]]; then
+        verdict=INSTRUMENT; final_rc=14
+    elif (( runs_delta < floor )); then
+        verdict=INCOMPLETE; final_rc=12
+    elif (( reach_miss > 0 )); then
+        verdict=REACH-MISS; final_rc=13
+    else
+        verdict=clean; final_rc=0
+    fi
+
+    fuzz_block="$(
+        echo "── fuzz $module ── VERDICT $verdict (exit $final_rc; zig exit $rc)"
+        echo "   budget --fuzz=$fuzz = $fuzz_iters/harness, $nh harness(es) in modules/$module/src$([[ "$has_filter" == 1 ]] && echo ', -Dtest-filter given: floor assumes 1')"
+        echo "   runs this run: $runs_delta from coverage maps ($maps map(s)), $report_runs from the zig report; floor $floor; wall $(( $(date +%s) - fuzz_start ))s of ${limit_s}s"
+        echo "   crash signals: 'input saved to'=$(grep -aqE 'input saved to' "$log" 2>/dev/null && echo yes || echo no), f/crash changed=$([[ $crash_changed == 1 ]] && echo yes || echo no), other failure text=$([[ $weak == 1 ]] && echo yes || echo no)"
+        [[ -f "$log_dir/$module.fuzz-crash" ]] && echo "   crashing input: $log_dir/$module.fuzz-crash ($(stat -c %s "$log_dir/$module.fuzz-crash") B)"
+        (( maps > 0 && report_runs > 0 && report_runs != runs_delta )) && \
+            echo "   ⚠ the zig report and the coverage maps disagree on the run count — something else wrote a map"
+        (( reach_items > 0 )) && echo "   reach: $reach_miss of $reach_items requested line(s) not executed"
+        cat "$summary" 2>/dev/null | head -c 20000
+    )"
+    printf '\n%s\n' "$fuzz_block" >> "$log"
+fi
+
+echo "── modtest $module ── exit $final_rc, log $log ($(numfmt --to=iec "$bytes" 2>/dev/null || echo "$bytes")B)"
 
 if [[ "$rc" == 124 ]]; then
-    echo "⛔ TIMED OUT after ${ZIGLIBS_MODTEST_TIMEOUT:-900s} — a lane that neither" >&2
+    echo "⛔ TIMED OUT after $timeout_spec — a lane that neither" >&2
     echo "   finishes nor allocates is an infinite loop, and that IS the finding." >&2
 fi
 
@@ -294,5 +513,13 @@ elif [[ "$strays_found" != 0 ]]; then
     echo "   Write it into the disposition; a runaway that survives its build is a defect." >&2
 fi
 
-tail -c 200000 "$log" | tail -n "$LINES"
-exit "$rc"
+if [[ "$mode" == fuzz ]]; then
+    # The zig tail first (the build summary, a compile error, the crash trace),
+    # then the verdict block last, where it is read. The block is appended to
+    # the log too, so cut the tail off before it rather than print it twice.
+    tail -c 200000 "$log" | awk -v stop="── fuzz $module ── VERDICT" 'index($0, stop) == 1 { exit } { print }' | tail -n "$LINES"
+    printf '%s\n' "$fuzz_block"
+else
+    tail -c 200000 "$log" | tail -n "$LINES"
+fi
+exit "$final_rc"
