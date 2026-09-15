@@ -260,6 +260,24 @@ const max_dump_attempts = 4; // NLM_F_DUMP_INTR restarts before giving up
 /// is never cut off. `Socket.setRecvTimeout` changes it, 0 blocks forever.
 pub const default_recv_timeout_ms: u32 = 10_000;
 
+/// `SO_RCVTIMEO`'s `getsockopt` read-back is not required to echo the exact
+/// value `setsockopt` was given: the kernel stores the timeout as a jiffy
+/// count and rounds UP to the next whole tick (`DIV_ROUND_UP`), so the
+/// value read back can exceed what was requested by up to one tick. The
+/// tick width is `1000 / CONFIG_HZ` ms and is a kernel build option, not a
+/// module or a caller decision — this host runs `CONFIG_HZ=1000` (1ms
+/// ticks, exact round-trip for whole milliseconds), but a `scripts/vm/`
+/// Debian guest measured 52ms back for a 50ms request (A1 tc.md F-VM1),
+/// consistent with a 4ms tick (`CONFIG_HZ=250`, a common distro default).
+/// Confirmed black-box on this host by requesting sub-millisecond values
+/// directly (`.zig-cache/probe/tc_f_vm1/probe.zig`): the read-back is
+/// always >= what was requested and always rounds up to the next 1000us
+/// step here, never down. 20ms comfortably covers even the coarsest
+/// mainstream tick (`CONFIG_HZ=100`, 10ms) while still catching a
+/// genuinely wrong value (e.g. a units bug sending ~500ms for a 50ms
+/// request).
+const recv_timeout_tick_slop_ms: u64 = 20;
+
 /// A blocking tc client over one `NETLINK_ROUTE` socket. One instance per
 /// thread/loop; no shared state.
 pub const Socket = struct {
@@ -1187,7 +1205,13 @@ test "F12: open bounds each receive by default_recv_timeout_ms, setRecvTimeout c
 
     try sock.setRecvTimeout(50);
     // Read back BEFORE receiving: a broken setter must fail here, not hang below.
-    try testing.expectEqual(@as(u64, 50), try recvTimeoutMs(&sock));
+    // Not an exact-equality check: see `recv_timeout_tick_slop_ms` (A1 F-VM1) --
+    // the kernel rounds the stored timeout up to its own tick granularity, so
+    // the value read back can be slightly more than 50 depending on the host's
+    // `CONFIG_HZ`, but it can never be less.
+    const got_ms = try recvTimeoutMs(&sock);
+    try testing.expect(got_ms >= 50);
+    try testing.expect(got_ms <= 50 + recv_timeout_tick_slop_ms);
     // Nothing was sent, so nothing will arrive.
     try testing.expectError(error.RecvFailed, sock.nl.recvDatagram());
 
