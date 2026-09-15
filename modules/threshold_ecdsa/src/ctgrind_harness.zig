@@ -82,13 +82,12 @@
 //!   then `provePoK`'s own internal Schnorr nonce for each party (Phase 2,
 //!   1 draw/party, assuming its `IdentityElement` retry never fires — it is
 //!   a q⁻¹-probability event and does not fire with the seed used here).
-//!   Every OTHER `random` draw in the run — `mta.zig`'s own `randomScalar`
-//!   (Bob's `beta_prime`, drawn TWICE per ordered pair via the SAME 48-byte
-//!   idiom: `mta.zig:181`/`:359`) and every Paillier/range-proof mask —
-//!   stays real. `TaintFirstN` below counts 48-byte draws in ARRIVAL order
-//!   and stops tainting once the budget is spent, rather than assuming a
-//!   fixed total call count, so `beta_prime`'s later 48-byte draws are
-//!   deliberately excluded, not accidentally missed. This is what actually
+//!   Every OTHER `random` draw in the run — Bob's `beta_prime` (a 160-byte
+//!   `q⁵`-range draw since audit F5, 2026-09-16; it was a 48-byte `Zq` draw
+//!   before) and every Paillier/range-proof mask — stays real. `TaintFirstN`
+//!   below counts 48-byte draws in ARRIVAL order and stops tainting once the
+//!   budget is spent, rather than assuming a fixed total call count, so no
+//!   later 48-byte draw is tainted by accident. This is what actually
 //!   exercises signing.zig:267 (the PoK nonce) and signing.zig:508 (`γ_i`
 //!   itself) with tainted input; `secret_share` stays real in this target.
 //!
@@ -250,9 +249,8 @@ fn randomScalar(random: std.Random) Scalar {
 /// against) — the memory is never observably defined outside this
 /// function. Draws of any OTHER length (Paillier/range-proof randomness,
 /// hundreds of bytes wide) are never counted against the budget and never
-/// tainted, so `mta.zig`'s own 48-byte `beta_prime` draws (Phase 3, AFTER
-/// the budget is spent for realistic `t`) are excluded by construction,
-/// not by luck.
+/// tainted, so later 48-byte draws (Phase 3, AFTER the budget is spent for
+/// realistic `t`) are excluded by construction, not by luck.
 const TaintFirstN = struct {
     inner: std.Random,
     taint_budget: usize,

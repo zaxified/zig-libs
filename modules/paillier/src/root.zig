@@ -1465,9 +1465,10 @@ pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
     // below, so allocation failures are impossible (`catch unreachable`).
     //
     // `divFloor` is variable-time in `x` (`paillier` F3 / `threshold_ecdsa`
-    // F5, wave-2 audit): this is a real timing leak on the decrypted
-    // plaintext `m = L(x)*mu mod n`, not on the secret key (`lambda`/`mu`/
-    // the CRT factors never reach this division).
+    // F5, wave-2 audit). Its quotient is `L(x) = m*lambda mod n` (since
+    // `c^lambda mod n² = 1 + (m*lambda mod n)*n`), so the timing is a function
+    // of the plaintext AND of `lambda` — the memcheck rows below confirm the
+    // key taint reaches it.
     //
     // ⚠ CORRECTED 2026-09-10 (threshold_ecdsa F5, third look): an earlier
     // version of this comment called the leak "accepted" on the theory that
@@ -1499,17 +1500,16 @@ pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
     // not inferred). So: the taint DOES reach the L-function division —
     // that half of the question is now answered, by this module's own
     // pinned gate (`scripts/ctgrind-expected.tsv` rows `paillier/crt`,
-    // `paillier/noncrt`), not a new probe. What remains open — and is
-    // NOT something either this file or that gate can answer — is
-    // `threshold_ecdsa/SPEC.md`'s A5 quantitative question: whether
-    // divFloor's limb-granularity timing on this partially-masked value is
-    // exploitable against `k_i` in practice, accumulated across the
-    // `O(t²)` MtA instances per signature and across sessions. That is a
-    // genuine side-channel/statistical question for a cryptographer, not a
-    // fixer pass — treat it the same as `threshold_ecdsa` audit items
-    // F4(b)/(c). Do not re-introduce a blanket "accepted, harmless"
-    // characterization here without re-deriving it against the actual
-    // `Zq`-sized mask.
+    // `paillier/noncrt`), not a new probe.
+    //
+    // ⚠ RESOLVED 2026-09-16 (threshold_ecdsa F5): the `Zq`-sized mask was
+    // worse than a timing question — Alice read Bob's `b` straight off the
+    // plaintext (`alpha'/a`). `threshold_ecdsa` now draws `beta'` from `Z_N`
+    // (semi-honest) / `Z_{q⁵}` (checked), so the plaintext reaching this
+    // line is statistically independent of `k_i` and `b`. What this
+    // division's timing can still reveal is about `lambda`, i.e. this
+    // module's own constant-time question, which the `crt`/`noncrt` rows
+    // measure.
     var scratch: [scratch_bytes]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&scratch);
     const gpa = fba.allocator();

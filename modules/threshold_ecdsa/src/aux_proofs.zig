@@ -1686,6 +1686,85 @@ test "F10: verifyWellFormed accepts an honest tuple above the q⁷ floor, and st
     try testing.expectError(error.InvalidWellFormedProof, verifyWellFormed(gen.params, tampered, random));
 }
 
+// ── audit F4(b)/(c) (2026-09-16): the two input guards no per-round
+//    equation stands in for. Each test builds a proof whose every round
+//    holds, so deleting the guard is the only way it can be accepted. ──
+
+/// Value of an `AuxFe` over the one-byte toy modulus.
+fn toyInt(fe: root.AuxFe) u64 {
+    var buf: [root.aux_modulus_bytes]u8 = undefined;
+    fe.toBytes(&buf, .big) catch unreachable;
+    return buf[buf.len - 1];
+}
+
+fn powModSmall(base: u64, exp: u64, m: u64) u64 {
+    var r: u64 = 1 % m;
+    var b = base % m;
+    var e = exp;
+    while (e > 0) : (e >>= 1) {
+        if (e & 1 == 1) r = r * b % m;
+        b = b * b % m;
+    }
+    return r;
+}
+
+test "audit F4(b): Pimod.verify's Jacobi guard alone refuses a non-unit w that forges a proof for a non-Blum modulus" {
+    // Ñ = 187 = 11·17 with 17 ≡ 1 (mod 4) is NOT Paillier-Blum, yet
+    // gcd(187, φ = 160) = 1, so every y has the Ñ-th root z = y^83 and the
+    // z-equation holds in every round. With w ≡ 0 (mod 17) and b_i = 1 the
+    // x-equation holds too: x ≡ 0 (mod 17), and mod 11 (≡ 3 mod 4) one of
+    // ±w·y is a square, and every square is a 4th power. A prover knowing
+    // the factors answers all 80 rounds; only `(w/Ñ) = −1` — which is 0 for
+    // a non-unit w — refuses it. CGGMP21 Fig.16 picks w with Jacobi −1.
+    const nt = toyModulus();
+    const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, 4), .h2 = toyFe(nt, 16) };
+    const n: u64 = 187;
+    const d: u64 = 83;
+    try testing.expectEqual(@as(u64, 1), (n * d) % 160);
+
+    for ([_]u8{ 0, 17 }) |w_val| {
+        const w = toyFe(nt, w_val);
+        const seed = deriveModSeed(aux, w);
+        var entries: [pi_mod_iterations]ModEntry = undefined;
+        for (&entries, 0..) |*e, idx| {
+            const y = toyInt(deriveModChallenge(nt, seed, @intCast(idx + 1)));
+            const wy = (@as(u64, w_val) * y) % n;
+            var found: ?ModEntry = null;
+            search: for ([_]bool{ false, true }) |a| {
+                const rhs = if (a) (n - wy) % n else wy;
+                var x: u64 = 0;
+                while (x < n) : (x += 1) {
+                    if (powModSmall(x, 4, n) == rhs) {
+                        found = .{ .x = toyFe(nt, @intCast(x)), .z = toyFe(nt, @intCast(powModSmall(y, d, n))), .a = a, .b = true };
+                        break :search;
+                    }
+                }
+            }
+            e.* = found orelse return error.TestFixtureHasNoFourthRoot;
+        }
+        try testing.expect(!Pimod.verify(aux, .{ .w = w, .entries = entries }));
+    }
+}
+
+test "audit F4(c): Piprm.verify's h in {0,1} guard alone refuses a degenerate tuple whose proof is otherwise honest" {
+    // h2 = t = 1 makes `t = s^λ` TRUE for λ = 0, so the honest prover
+    // (A_i = s^{a_i}, z_i = a_i) passes every round — and a Pedersen
+    // commitment h1^m·h2^ρ = h1^m under that tuple hides nothing. With
+    // h1 = h2 = 1 every round holds trivially. Jacobi (1/Ñ) = 1, so the
+    // coprimality half of step 1 lets both through; the `eql(one)` checks
+    // (CGGMP21 Fig.17's s, t ∈ Z_N^* with s, t ≠ 1) are the only refusal.
+    const nt = toyModulus();
+    for ([_][2]u8{ .{ 4, 1 }, .{ 1, 1 } }) |c| {
+        const aux: root.AuxParams = .{ .n_tilde = nt, .h1 = toyFe(nt, c[0]), .h2 = toyFe(nt, c[1]) };
+        var entries: [pi_prm_iterations]PrmEntry = undefined;
+        for (&entries, 0..) |*e, i| {
+            const a: u64 = 1 + (i * 37) % 150;
+            e.* = .{ .a_commit = toyFe(nt, @intCast(powModSmall(c[0], a, 187))), .z = toyFe(nt, @intCast(a)) };
+        }
+        try testing.expect(!Piprm.verify(aux, .{ .entries = entries }));
+    }
+}
+
 fn toyNTilde() root.AuxModulus {
     return root.AuxModulus.fromBytes(&[_]u8{187}, .big) catch unreachable;
 }

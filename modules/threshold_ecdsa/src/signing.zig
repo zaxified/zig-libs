@@ -486,9 +486,9 @@ fn runCheckedMtA(
     random: std.Random,
 ) SignError!struct { alpha: Scalar, beta: Scalar } {
     const alice_init = alice_range.init;
-    const bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
-    const beta_prime = bob_resp.beta.neg();
-    const mta_proof = try zkproofs.proveBobMta(allocator, bob_secret, beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, random);
+    var bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
+    defer std.crypto.secureZero(u8, &bob_resp.beta_prime);
+    const mta_proof = try zkproofs.proveBobMta(allocator, bob_secret, &bob_resp.beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, random);
     defer mta_proof.deinit(allocator);
 
     const alpha = try mta.mtaAliceFinalizeChecked(alice_init.c_a, bob_resp.c_b, mta_proof, alice_sk, alice_pk, alice_aux);
@@ -517,14 +517,136 @@ fn runCheckedMtAwc(
     random: std.Random,
 ) SignError!struct { alpha: Scalar, beta: Scalar } {
     const alice_init = alice_range.init;
-    const bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
-    const beta_prime = bob_resp.beta.neg();
-    const wc_proof = try zkproofs.proveBobMtaWc(allocator, bob_secret, beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point, random);
+    var bob_resp = try mta.mtaBobResponseChecked(bob_secret, alice_init.c_a, alice_pk, random);
+    defer std.crypto.secureZero(u8, &bob_resp.beta_prime);
+    const wc_proof = try zkproofs.proveBobMtaWc(allocator, bob_secret, &bob_resp.beta_prime, bob_resp.r_b, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point, random);
     defer wc_proof.deinit(allocator);
     if (!zkproofs.verifyBobMtaWc(wc_proof, alice_init.c_a, bob_resp.c_b, alice_pk, alice_aux, b_point)) return error.InvalidMtaProof;
 
     const alpha = try mta.mtaAliceFinalize(bob_resp.c_b, alice_sk);
     return .{ .alpha = alpha, .beta = bob_resp.beta };
+}
+
+// ── Phase 3 per-pair work (audit F6) ─────────────────────────────────────
+
+/// One ordered pair's two conversions: `α`/`β` of `k_i·γ_j` and of `k_i·w_j`.
+const PairShares = struct {
+    gamma_alpha: Scalar,
+    gamma_beta: Scalar,
+    x_alpha: Scalar,
+    x_beta: Scalar,
+};
+
+/// What every pair reads. Nothing here is written while pairs run.
+const PairCtx = struct {
+    shares: []const root.KeyShare,
+    indices: []const u32,
+    eph: []const Ephemeral,
+};
+
+/// Ordered pair `(ii, jj)`: Alice = party `ii` (her `k`), Bob = party `jj`
+/// (his `γ` and `w`). Reads `ctx` only; returns the four additive shares.
+fn computePair(
+    allocator: std.mem.Allocator,
+    ctx: PairCtx,
+    ii: usize,
+    jj: usize,
+    random: std.Random,
+) SignError!PairShares {
+    const ai_share = ctx.shares[ii];
+    const aj_share = ctx.shares[jj];
+    // Audit F2 (HIGH, 2026-09-10 fix): `KeyShare.fromBytesAlloc` does no
+    // cross-check that `public_keys` actually contains the share's OWN
+    // `index` -- a `KeyShare` that round-trips through the module's own
+    // codec but was assembled with a stripped/mismatched entry list used
+    // to reach here via `.get(index).?`, panicking in ReleaseSafe (SIGABRT)
+    // and undefined behavior in ReleaseFast. Fail closed instead, same as
+    // every other malformed-input guard in this function.
+    const ai_pubkeys = ai_share.public_keys.get(ai_share.index) orelse return error.InvalidParameters;
+    const alice_pk = ai_pubkeys.paillier_pk;
+    const alice_sk = ai_share.paillier_secret;
+    const alice_aux = ai_pubkeys.aux;
+    const bob_aux = (aj_share.public_keys.get(aj_share.index) orelse return error.InvalidParameters).aux;
+
+    // Audit F7 fix (2026-09-10): ONE `c_a = Enc(k_i)` + ONE range proof for
+    // this ordered pair, shared by both conversions below.
+    var alice_range = try aliceRangeProofOnce(allocator, ctx.eph[ii].k, alice_pk, bob_aux, random);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&alice_range));
+
+    const gamma_res = try runCheckedMtA(allocator, alice_range, ctx.eph[jj].gamma, alice_pk, alice_sk, alice_aux, random);
+
+    const xj_pt = aj_share.verifying_share.point() catch return error.IdentityPoint;
+    const lambda_j = lagrangeCoefficient(ctx.indices, aj_share.index);
+    const wj_pt = xj_pt.mul(lambda_j.toBytes(.big), .big) catch return error.IdentityPoint;
+    const w_point = Element.fromPoint(wj_pt) catch return error.IdentityPoint;
+
+    const x_res = try runCheckedMtAwc(allocator, alice_range, ctx.eph[jj].w, alice_pk, alice_sk, alice_aux, w_point, random);
+    return .{ .gamma_alpha = gamma_res.alpha, .gamma_beta = gamma_res.beta, .x_alpha = x_res.alpha, .x_beta = x_res.beta };
+}
+
+fn accumulatePair(eph: []Ephemeral, ii: usize, jj: usize, p: PairShares) void {
+    eph[ii].delta = eph[ii].delta.add(p.gamma_alpha);
+    eph[jj].delta = eph[jj].delta.add(p.gamma_beta);
+    eph[ii].sigma = eph[ii].sigma.add(p.x_alpha);
+    eph[jj].sigma = eph[jj].sigma.add(p.x_beta);
+}
+
+const max_pair_threads = 64;
+
+/// One pair's slot: inputs set by the caller's thread before any worker
+/// starts, `result` written by exactly one worker.
+const PairJob = struct {
+    ii: usize,
+    jj: usize,
+    seed: [std.Random.DefaultCsprng.secret_seed_length]u8,
+    result: SignError!PairShares,
+};
+
+/// Pair order `(0,1), (0,2), …, (t−1,t−2)` — the sequential loop's order —
+/// with one seed per pair drawn from `random` in that order.
+fn fillPairJobs(jobs: []PairJob, t: usize, random: std.Random) void {
+    var k: usize = 0;
+    for (0..t) |ii| {
+        for (0..t) |jj| {
+            if (ii == jj) continue;
+            jobs[k] = .{ .ii = ii, .jj = jj, .seed = undefined, .result = error.SigningAborted };
+            random.bytes(&jobs[k].seed);
+            k += 1;
+        }
+    }
+    std.debug.assert(k == jobs.len);
+}
+
+/// Worker `part` of `stride`: jobs `part, part+stride, …`, its own scratch.
+fn pairWorker(ctx: PairCtx, jobs: []PairJob, part: usize, stride: usize, scratch: []u8) void {
+    var fba = std.heap.FixedBufferAllocator.init(scratch);
+    var k = part;
+    while (k < jobs.len) : (k += stride) {
+        fba.reset();
+        var csprng = std.Random.DefaultCsprng.init(jobs[k].seed);
+        jobs[k].result = computePair(fba.allocator(), ctx, jobs[k].ii, jobs[k].jj, csprng.random());
+        std.crypto.secureZero(u8, std.mem.asBytes(&csprng));
+    }
+    std.crypto.secureZero(u8, scratch);
+}
+
+/// Run every job on `threads` workers, the caller's thread being worker 0.
+/// `scratch` is split evenly, one disjoint slice per worker.
+fn runPairJobs(ctx: PairCtx, jobs: []PairJob, scratch: []u8, threads: usize) void {
+    std.debug.assert(threads >= 1 and threads <= max_pair_threads and scratch.len % threads == 0);
+    const per = scratch.len / threads;
+    if (builtin.single_threaded) {
+        for (0..threads) |p| pairWorker(ctx, jobs, p, threads, scratch[p * per ..][0..per]);
+    } else {
+        var handles: [max_pair_threads]?std.Thread = @splat(null);
+        for (1..threads) |p| {
+            handles[p] = std.Thread.spawn(.{}, pairWorker, .{ ctx, jobs, p, threads, scratch[p * per ..][0..per] }) catch null;
+        }
+        pairWorker(ctx, jobs, 0, threads, scratch[0..per]);
+        for (1..threads) |p| {
+            if (handles[p]) |h| h.join() else pairWorker(ctx, jobs, p, threads, scratch[p * per ..][0..per]);
+        }
+    }
 }
 
 // ── the driver: signWithShares (REAL end to end) ─────────────────────────
@@ -559,6 +681,41 @@ pub fn signWithShares(
     shares: []const root.KeyShare,
     message: []const u8,
     random: std.Random,
+) SignError!Signature {
+    return signWithSharesOptions(allocator, shares, message, random, .{});
+}
+
+/// Phase-3 execution options for `signWithSharesOptions` (audit F6).
+pub const SignOptions = struct {
+    /// `null` (the default, what `signWithShares` uses): Phase 3's `t(t−1)`
+    /// ordered pairs run one after another on the caller's thread, drawing
+    /// from `random` directly.
+    ///
+    /// `n`: before any pair starts, the caller's thread draws one 32-byte
+    /// ChaCha seed per pair from `random`, in pair order; the pairs then run
+    /// on `min(n, t(t−1), 64)` threads, the caller's included. Each thread
+    /// owns a fixed slice of scratch (`pair_scratch_bytes`, carved from
+    /// `allocator` up front) and writes only its own pairs' result slots; the
+    /// per-party accumulators `δ_i`/`σ_i` are summed on the caller's thread
+    /// after every worker has joined. No mutable state is shared between
+    /// threads, and the result does not depend on `n`. A thread that cannot
+    /// be spawned has its pairs run on the caller's thread instead.
+    ///
+    /// The signature is identical to the default path's for the same
+    /// `random` (Phase 3 randomness never reaches `r`/`s`); `random` ends in a
+    /// different state.
+    pair_threads: ?usize = null,
+    /// Scratch per thread for a pair's proof buffers (reset per pair).
+    pair_scratch_bytes: usize = 256 * 1024,
+};
+
+/// `signWithShares` with explicit Phase-3 options — see `SignOptions`.
+pub fn signWithSharesOptions(
+    allocator: std.mem.Allocator,
+    shares: []const root.KeyShare,
+    message: []const u8,
+    random: std.Random,
+    options: SignOptions,
 ) SignError!Signature {
     const t = shares.len;
     if (t < 2) return error.InvalidParameters;
@@ -635,46 +792,28 @@ pub fn signWithShares(
     }
 
     // ── Phase 3: MtA (k·γ) + MtAwc (k·x) over every ordered pair ─────────
-    for (shares, 0..) |ai_share, ii| {
-        // Audit F2 (HIGH, 2026-09-10 fix): `KeyShare.fromBytesAlloc` does no
-        // cross-check that `public_keys` actually contains the share's OWN
-        // `index` -- a `KeyShare` that round-trips through the module's own
-        // codec but was assembled with a stripped/mismatched entry list used
-        // to reach here via `.get(index).?`, panicking in ReleaseSafe (SIGABRT)
-        // and undefined behavior in ReleaseFast (an unchecked `.?` on `null`
-        // is UB in unsafe modes, not a panic) -- neither of which is in the
-        // doc-promised `Signature | SigningAborted | Invalid*` outcome set.
-        // Fail closed instead, same as every other malformed-input guard in
-        // this function.
-        const ai_pubkeys = ai_share.public_keys.get(ai_share.index) orelse return error.InvalidParameters;
-        const alice_pk = ai_pubkeys.paillier_pk;
-        const alice_sk = ai_share.paillier_secret;
-        const alice_aux = ai_pubkeys.aux;
-
-        for (shares, 0..) |aj_share, jj| {
-            if (ii == jj) continue;
-            const bob_aux = (aj_share.public_keys.get(aj_share.index) orelse return error.InvalidParameters).aux;
-
-            // Audit F7 fix (2026-09-10): ONE `c_a = Enc(k_i)` + ONE range
-            // proof for this ordered pair, shared by both conversions below
-            // — `runCheckedMtA`/`runCheckedMtAwc` each used to build and
-            // verify their own independent copy of exactly this, against
-            // the same alice_secret/alice_pk/bob_aux.
-            var alice_range = try aliceRangeProofOnce(allocator, eph[ii].k, alice_pk, bob_aux, random);
-            defer std.crypto.secureZero(u8, std.mem.asBytes(&alice_range));
-
-            const gamma_res = try runCheckedMtA(allocator, alice_range, eph[jj].gamma, alice_pk, alice_sk, alice_aux, random);
-            eph[ii].delta = eph[ii].delta.add(gamma_res.alpha);
-            eph[jj].delta = eph[jj].delta.add(gamma_res.beta);
-
-            const xj_pt = aj_share.verifying_share.point() catch return error.IdentityPoint;
-            const lambda_j = lagrangeCoefficient(indices, aj_share.index);
-            const wj_pt = xj_pt.mul(lambda_j.toBytes(.big), .big) catch return error.IdentityPoint;
-            const w_point = Element.fromPoint(wj_pt) catch return error.IdentityPoint;
-
-            const x_res = try runCheckedMtAwc(allocator, alice_range, eph[jj].w, alice_pk, alice_sk, alice_aux, w_point, random);
-            eph[ii].sigma = eph[ii].sigma.add(x_res.alpha);
-            eph[jj].sigma = eph[jj].sigma.add(x_res.beta);
+    // Pairs only READ `k`/`γ`/`w`; the `δ`/`σ` accumulators are written on
+    // this thread only (audit F6: they are the state a naive per-pair thread
+    // would race on — each party appears in 2(t−1) pairs).
+    const ctx: PairCtx = .{ .shares = shares, .indices = indices, .eph = eph };
+    if (options.pair_threads) |requested| {
+        const jobs = try allocator.alloc(PairJob, t * (t - 1));
+        defer {
+            std.crypto.secureZero(u8, std.mem.sliceAsBytes(jobs));
+            allocator.free(jobs);
+        }
+        fillPairJobs(jobs, t, random);
+        const threads = @max(1, @min(requested, @min(jobs.len, max_pair_threads)));
+        const scratch = try allocator.alloc(u8, threads * options.pair_scratch_bytes);
+        defer allocator.free(scratch); // each worker zeroes its own slice
+        runPairJobs(ctx, jobs, scratch, threads);
+        for (jobs) |job| accumulatePair(eph, job.ii, job.jj, try job.result);
+    } else {
+        for (0..t) |ii| {
+            for (0..t) |jj| {
+                if (ii == jj) continue;
+                accumulatePair(eph, ii, jj, try computePair(allocator, ctx, ii, jj, random));
+            }
         }
     }
     for (eph) |*e| {
@@ -977,6 +1116,63 @@ test "signWithShares: fails closed, not panic/UB, when a KeyShare's own index is
     const subset = [_]root.KeyShare{ victim, kg.key_shares[1] };
 
     try testing.expectError(error.InvalidParameters, signWithShares(allocator, &subset, "m", random));
+}
+
+fn expectSamePairShares(a: PairShares, b: PairShares) !void {
+    try testing.expectEqualSlices(u8, &a.gamma_alpha.toBytes(.big), &b.gamma_alpha.toBytes(.big));
+    try testing.expectEqualSlices(u8, &a.gamma_beta.toBytes(.big), &b.gamma_beta.toBytes(.big));
+    try testing.expectEqualSlices(u8, &a.x_alpha.toBytes(.big), &b.x_alpha.toBytes(.big));
+    try testing.expectEqualSlices(u8, &a.x_beta.toBytes(.big), &b.x_beta.toBytes(.big));
+}
+
+test "audit F6: parallel pair phase — shares bit-identical for 1 vs 4 threads, signature identical to the sequential path" {
+    // Heavy: 2048-bit keygen, like every signing test here (skips only in Debug).
+    if (builtin.mode == .Debug) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var kprng = std.Random.DefaultPrng.init(0xF6_6b6579); // "key"
+    const kg = try testKeygen(allocator, kprng.random(), 3, 3);
+    defer kg.deinit(allocator);
+    const subset = kg.key_shares[0..3];
+
+    // (1) The executor `signWithSharesOptions` calls: same seeds, 1 thread
+    // vs 4 threads (6 pairs, so threads really overlap) → identical shares.
+    var eprng = std.Random.DefaultPrng.init(0xF6_657068); // "eph"
+    var indices: [3]u32 = undefined;
+    for (subset, 0..) |s, i| indices[i] = s.index;
+    var eph: [3]Ephemeral = undefined;
+    for (subset, 0..) |s, i| {
+        eph[i] = .{
+            .k = randomScalar(eprng.random()),
+            .gamma = randomScalar(eprng.random()),
+            .w = lagrangeCoefficient(&indices, s.index).mul(s.secret_share),
+            .big_gamma = undefined, // not read by Phase 3
+            .delta = Scalar.zero,
+            .sigma = Scalar.zero,
+        };
+    }
+    const ctx: PairCtx = .{ .shares = subset, .indices = &indices, .eph = &eph };
+    var runs: [2][6]PairJob = undefined;
+    for (&runs, [_]usize{ 1, 4 }) |*jobs, threads| {
+        var sprng = std.Random.DefaultPrng.init(0xF6_73656564); // "seed"
+        fillPairJobs(jobs, 3, sprng.random());
+        const scratch = try allocator.alloc(u8, threads * (SignOptions{}).pair_scratch_bytes);
+        defer allocator.free(scratch);
+        runPairJobs(ctx, jobs, scratch, threads);
+    }
+    for (runs[0], runs[1]) |one, four| try expectSamePairShares(try one.result, try four.result);
+
+    // (2) End to end from the same PRNG state: sequential, 1 thread, 4 threads.
+    const message = "audit F6";
+    var sigs: [3]Signature = undefined;
+    for (&sigs, [_]?usize{ null, 1, 4 }) |*sig, pair_threads| {
+        var prng = std.Random.DefaultPrng.init(0xF6_7369676e); // "sign"
+        sig.* = try signWithSharesOptions(allocator, subset, message, prng.random(), .{ .pair_threads = pair_threads });
+        try expectVerifies(kg.key_shares, message, sig.*);
+    }
+    for (sigs[1..]) |s| {
+        try testing.expectEqualSlices(u8, &sigs[0].r, &s.r);
+        try testing.expectEqualSlices(u8, &sigs[0].s, &s.s);
+    }
 }
 
 /// A `std.Random` that hands back `scripted[i]` (exactly `48` bytes each) for
