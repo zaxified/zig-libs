@@ -166,11 +166,13 @@ pub const Ristretto255 = std.crypto.ecc.Ristretto255;
 
 const kat_test = @import("kat_test.zig");
 const stackprobe_test = @import("stackprobe_test.zig");
+const verify_b8_diff_test = @import("verify_b8_diff_test.zig");
 
 test {
     std.testing.refAllDecls(@This());
     _ = kat_test;
     _ = stackprobe_test;
+    _ = verify_b8_diff_test;
 }
 
 test "meta.model_after names Bulletproofs + Ristretto255" {
