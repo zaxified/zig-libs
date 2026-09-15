@@ -114,14 +114,44 @@ secp256k1; see [README.md](README.md) for purpose and API.
   `bip39.zig`'s mnemonic path calls **no `k256` code at all**. Its
   wordlist lookup (`wordIndex`, a binary search over the 2048-entry English
   list) branches and indexes the table on the secret mnemonic word at every
-  step — audited 2026-09-06 at 601 valgrind/memcheck-flagged contexts on
+  step — audited 2026-09-06 at 601 valgrind/memcheck-flagged ERRORS on
   `validateMnemonic` alone, none of which is covered by `k256`'s posture,
-  because none of it touches `k256`. `bip32`/`bech32` are also not yet under
-  this repo's ctgrind gate at all (`scripts/ctgrind-expected.tsv` covers 8
-  other modules); adding coverage, and deciding whether `wordIndex` should
-  be made constant-time or the non-constant-time posture simply documented,
-  is deferred past this fix campaign — it needs the full ctgrind lane to
-  verify, not a modtest lane.
+  because none of it touches `k256`.
+
+  **Measured by the ctgrind gate since 2026-09-16** (audit finding M6):
+  `src/ctgrind_harness.zig`, `scripts/ctgrind.sh bip32`. zig 0.16.0, x86_64,
+  ReleaseFast; every untainted control and no-`-fvalgrind` trap is 0,
+  unattributed 0.
+
+  | target | tainted | total | in-file | witness |
+  |---|---|---|---|---|
+  | `master` — `masterFromSeed` | seed | 5 | 1 | 4 |
+  | `derive` — `derivePath` `m/44'/0'/0'/0/0` | master private scalar | 9 | 5 | 4 |
+  | `seed` — `mnemonicToSeed` | mnemonic | 2 | **0** | 2 |
+  | `mnemonic` — `mnemonicToEntropy` | mnemonic | 3 | **3** | 0 |
+
+  - `master` 1 and `derive`'s `bip32.zig:275`: the `IL == 0` / child-key
+    `== 0` tests (`std.mem.allEqual`), each compiled to one `vptest; je` —
+    a verdict of a check that fails with probability ~2^-127, not a branch
+    per byte (disassembly, 2026-09-16).
+  - `derive`'s other 4: `k256`'s `combMulBase` identity rejection on the
+    PARENT PUBLIC KEY (`group.zig:380`, 2 addresses) and std's canonicity
+    verdict on the scalars `scalar.add` parses (`common.zig:75`, 2) — the
+    classes `k256`'s own rows already document. The contexts of all five
+    derivation steps share these addresses.
+  - `seed`: PBKDF2-HMAC-SHA512 over the mnemonic is branch-free.
+  - ⛔ `mnemonic` 3 is a **known defect, pinned rather than fixed**: the word
+    split (`std.mem.splitScalar` → `findScalarPos`, `bip39.zig:100`, leaks
+    word boundaries) and `wordIndex`'s binary search (`std.mem.order`,
+    `bip39.zig:219`, two addresses — the search path and the table index
+    depend on the word). The count is small only because memcheck reports
+    one context per ADDRESS; the 601 errors are per EXECUTION. The entropy
+    rebuilt from the indices carries no taint (it flows through control flow
+    alone), so the checksum comparison after it is not measured by this row.
+
+  Positive control: one branch on a secret byte inserted into each target's
+  function adds exactly one context (1 → 2, 5 → 6, 0 → 1, 3 → 4), at the
+  inserted line.
 - **BIP-39 checksum comparison: constant iteration count, not a constant-time
   proof**: `mnemonicToEntropy` used to return `error.InvalidChecksum` as soon
   as it found a mismatching checksum bit, so the number of loop iterations

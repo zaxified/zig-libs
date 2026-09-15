@@ -158,7 +158,11 @@ declare -A TARGETS=(
     [ct25519]="ct25519 std comb ladderbase ladder msm"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
-    [ecvrf]="prove"
+    # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
+    # the target taints the public `alpha` to list its input-dependent
+    # branches. It does NOT catch E15's `timing_safe.eql` -> `mem.eql`
+    # mutation (measured, same count); see the harness doc comment.
+    [ecvrf]="prove verify"
     [ed448]="full ladder"
     [k256]="field mul comb sign ecdsa"
     [montint]="small portable asmcore"
@@ -219,6 +223,12 @@ declare -A TARGETS=(
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
+    # ── 2026-09-16: A1 opaque M5 and bip32 M6, first harnesses ─────────────
+    # Each target taints ONE party's secrets; the other party runs untainted
+    # first, so nothing public on the wire is counted as secret
+    # (see each harness's module doc comment).
+    [opaque]="register login serverke2"
+    [bip32]="master derive seed mnemonic"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -263,6 +273,8 @@ declare -A MODES=(
     [dkg]="ReleaseFast"
     [sealedbox]="ReleaseFast"
     [pir]="ReleaseFast"
+    [opaque]="ReleaseFast"
+    [bip32]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -320,6 +332,7 @@ declare -A PATTERN=(
     [ct25519/msm]='root[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
+    [ecvrf/verify]='ecvrf[.]zig'
     [ed448/full]='ed448[.]zig|field[.]zig|x448[.]zig|scalar[.]zig'
     [ed448/ladder]='ed448[.]zig|field[.]zig|scalar[.]zig'
     # k256's own sources. `fast_core.zig` is in the field/mul/comb/sign
@@ -466,6 +479,21 @@ declare -A PATTERN=(
     [sealedbox/b64enc]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/b64dec]='root[.]zig:[1-9]|base64[.]zig'
     [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    # ⚠ `root[.]zig` here is opaque's own file AND voprf's AND ct25519's (same
+    # basename, see the blindrsa note above). That is the intended column:
+    # opaque delegates its OPRF to voprf and its scalar multiplication to
+    # ct25519, so their constant-time property is opaque's for every byte of
+    # the password that flows through them. The source pin hashes only
+    # modules/opaque/src/root.zig.
+    [opaque/register]='root[.]zig'
+    [opaque/login]='root[.]zig'
+    [opaque/serverke2]='root[.]zig'
+    # bip32's own files; k256/std frames count through their bip32.zig or
+    # bip39.zig callers (the whole paragraph is matched).
+    [bip32/master]='bip32[.]zig'
+    [bip32/derive]='bip32[.]zig'
+    [bip32/seed]='bip39[.]zig'
+    [bip32/mnemonic]='bip39[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -527,7 +555,8 @@ declare -A LABEL=(
     [ct25519/ladder]='ct25519 ladder var'
     [ct25519/msm]='ct25519 straus msm'
     [decaf448/scalarmul]='decaf448+ed448'
-    [ecvrf/prove]='ecvrf.zig'
+    [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
+    [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'
     [ed448/full]='ed448 src'
     [ed448/ladder]='ed448 src'
     [k256/field]='k256 field+asm'
@@ -588,6 +617,13 @@ declare -A LABEL=(
     [sealedbox/hexdec]='sealedbox parseSecretKeyHex (CT; 1 = accept/reject)'
     [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 (CT, table-free)'
     [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT; 1 = accept/reject)'
+    [opaque/register]='opaque client registration (password, blind)+voprf'
+    [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
+    [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'
+    [bip32/master]='bip32 masterFromSeed (seed)'
+    [bip32/derive]='bip32 derivePath (master scalar)+k256'
+    [bip32/seed]='bip39 mnemonicToSeed (PBKDF2)'
+    [bip32/mnemonic]='bip39 mnemonicToEntropy (wordIndex search)'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────

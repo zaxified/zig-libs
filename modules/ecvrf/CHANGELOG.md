@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — ctgrind harness only, no library code changed (A1 E15 and the
+  `prove` 3 → 5 re-pin question). `prove` now taints the secret key alone: it derives the key
+  pair with `KeyPair.fromSecretKey`, declassifies the published `Y`, and proves with
+  `KeyPair.prove`. In-file contexts 5 → **0** (total 9 → 2, both the hex witness); the five were
+  branches on `H`, a public function of `Y` and `alpha`, counted only because the one-shot
+  `prove` gave no seam to declassify `Y`. Positive control: a branch on the nonce `k` → 1 at the
+  inserted line. New target `verify` (taints the public `alpha`, 7 in-file) is documentary: it
+  does not catch E15's `timing_safe.eql` → `std.mem.eql` mutation (7 / 7 either way).
+
 - **2026-09-14** — **BEHAVIOURAL + NEW API:** A1 E14, E16, E10 (KeyPair half), E4 (documented).
   E14/E16: `string_to_point` now decodes strictly per RFC 8032 §5.1.3 (new `stringToPoint`):
   a `Gamma` or public key with `y >= p`, or with a sign bit on a point whose `x` is 0, is refused

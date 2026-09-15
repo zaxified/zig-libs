@@ -120,58 +120,51 @@ real — see "Implementation notes" below.
   **Verified, not asserted**, and since 2026-08-11 by a **committed
   program** rather than by numbers taken once by hand:
   [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-  `scripts/ctgrind.sh ecvrf`. It marks the 32-byte secret key
-  `MAKE_MEM_UNDEFINED`, forces a volatile reload, and drives it through
-  `publicKey` + `prove`.
+  `scripts/ctgrind.sh ecvrf`. Target `prove` marks the 32-byte secret key
+  `MAKE_MEM_UNDEFINED`, forces a volatile reload, derives the key pair with
+  `KeyPair.fromSecretKey` (`x`, `Y = x*B`), DECLASSIFIES the published `Y`,
+  and proves with `KeyPair.prove` (`Gamma`, the nonce `k`, `k*B`, `k*H`, `s`).
 
-  **Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64,
-  ReleaseFast, 2026-08-11; `in-file` = memcheck CONTEXTS whose stack
-  names `ecvrf.zig`):
+  **Full control table** (zig 0.16.0, x86_64, ReleaseFast, 2026-09-16;
+  `in-file` = memcheck CONTEXTS whose stack names `ecvrf.zig`):
 
-  | `-fvalgrind` | sk tainted | total contexts | in `ecvrf.zig` | exit |
-  |---|---|---|---|---|
-  | yes | **yes** | 7 | **3** | 99 |
-  | yes | no | 0 | 0 | 0 *(control)* |
-  | **no** | yes | 0 | 0 | 0 *(trap)* |
+  | target | `-fvalgrind` | tainted | total | in-file | witness | unattr |
+  |---|---|---|---|---|---|---|
+  | `prove` | yes | **sk** | 2 | **0** | 2 | 0 |
+  | `prove` | yes | no | 0 | 0 | 0 | 0 *(control)* |
+  | `prove` | **no** | sk | 0 | 0 | 0 | 0 *(trap)* |
+  | `verify` | yes | `alpha` (public) | 7 | 7 | 0 | 0 |
 
-  **The number the dependency on `ct25519` is actually about is zero**:
-  `scripts/ctgrind.sh ecvrf --pattern 'ct25519|root[.]zig'` reports
-  **0** contexts in the constant-time ladder, for all five secret-scalar
-  multiplications `publicKey`/`prove` perform (`publicKey`'s one `mulBase`,
-  plus `prove`'s two `mulBase`/`mul` pairs for `Y`/`Gamma` and for `U`/`V` —
-  corrected 2026-09-10, A1 E12: this bullet previously said "nine", counted
-  from memory rather than from the call sites; `ecvrf.zig`'s own module doc
-  comment already said "five" and was right). The remaining 4 of the 7
-  total are inside the harness's own non-constant-time hex formatter —
-  the propagation witness that makes that zero mean "no branch found"
-  rather than "the taint never arrived".
+  **Zero branches on `x`, `prefix` or `k`**, including all five
+  secret-scalar multiplications in `ct25519`. The 2 remaining contexts are
+  the harness's hex formatter printing the proof — the propagation witness
+  that makes the zero mean "no branch found" rather than "the taint never
+  arrived". Positive control (2026-09-16): one branch on `k[0]` inserted
+  after the nonce is derived reports in-file **1**, at the inserted line.
 
-  The three `ecvrf.zig` contexts are branches on `Y`/`H`, not on a
-  secret. `Y` is the published public key and
-  `H = encode_to_curve(PK_string, alpha)` is recomputed by every
-  verifier from public inputs; they show up at all only because this
-  harness taints `sk`, from which `Y` is derived, and memcheck has no
-  notion of "public function of a secret". Their timing dependence on
-  `alpha` is the separate, RFC-acknowledged try-and-increment property
-  documented below. Located exactly (`--stacks`):
+  Before 2026-09-16 the harness called the one-shot `prove(sk, alpha)`,
+  which recomputes `Y` from `sk`, so nothing could declassify `Y` and every
+  branch on a function of `Y` was counted: 3 in-file (7 total), then **5**
+  (9 total) once `stringToPoint` became strict (A1 E14). The five, located
+  with `--stacks`: `encodeToCurve`'s candidate decode (`ecvrf.zig:330`,
+  `:331` inside std's `fromBytes`, `:332`), its identity check (`:244`), and
+  `proveExpanded`'s decode of `H` (`:417`). All five branch on
+  `H = encode_to_curve(PK_string, alpha)`, which every verifier recomputes
+  from public inputs; with `Y` declassified all five disappear and nothing
+  on the secret remains. `KeyPair.prove` and `prove` share `expandSecretKey`,
+  `mulBase` and `proveExpanded`; the only line of `prove` the target does not
+  execute is the one composing them.
 
-  - `ecvrf.zig:230` — `Edwards25519.fromBytes`'s validity branch inside
-    `encodeToCurve`'s try-and-increment loop;
-  - `ecvrf.zig:232` — that loop's `rejectIdentity() catch continue`;
-  - `ecvrf.zig:344` — `prove`'s own
-    `Edwards25519.fromBytes(h_string) catch unreachable`.
+  `verify` is **documentary, not a constant-time claim** — `verify` has no
+  secret (see the next bullet). Tainting `alpha` lists where its control flow
+  depends on its input: the same try-and-increment/decoding branches,
+  `mulDoubleBasePublic` (`edwards25519.zig:316` via `ecvrf.zig:524`) and the
+  `c == c'` verdict (`:533`). It does **not** detect replacing
+  `timing_safe.eql` with `std.mem.eql` at `:533`: measured, 7 / 7 at the same
+  lines, because both forms end in one branch on a tainted equality at the
+  same call site and memcheck counts contexts by address.
 
-  *(Corrected 2026-08-11: an earlier version of this bullet said all
-  three were "inside `encodeToCurve`". The third is in `prove` itself —
-  same conclusion, since it decodes the same public `H`, but the stated
-  location was wrong. It also claimed a re-run "with `Y` explicitly
-  declassified reports 0 errors / 0 contexts"; that run is not
-  reproducible from outside the module, because `prove` recomputes `Y`
-  internally from `sk`, so there is no seam at which a caller can
-  declassify it. The `--pattern` measurement above is what replaces it,
-  and it pins the stronger of the two claims.)*
-
-  **Teeth, measured 2026-08-11.** Re-creating the historical defect —
+  **Teeth, measured 2026-08-11 on the one-shot-`prove` harness.** Re-creating the historical defect —
   pointing `prove`'s three secret-scalar multiplications back at
   `std.crypto.ecc.Edwards25519`'s ladder, whose trailing
   `rejectIdentity` branches on a scalar-derived value — moves the table

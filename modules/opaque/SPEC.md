@@ -151,6 +151,58 @@ envelope (`EnvelopeRecovery` = wrong password) → 3DH → verify
 `client_mac` (`ClientAuthentication`) before releasing `session_key`.
 Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
 
+## Constant time (ctgrind, audit finding M5)
+
+`src/ctgrind_harness.zig`, run by `scripts/ctgrind.sh opaque`. Each target
+taints ONE party's secrets and runs the other party untainted first, so a value
+that reached the measured party over the wire is never counted as its secret.
+Inputs are RFC 9807 C.1.1, so the printed outputs are the published vector.
+zig 0.16.0, x86_64, ReleaseFast, 2026-09-16; every untainted control and
+no-`-fvalgrind` trap row is 0, unattributed 0 everywhere.
+
+| target | tainted | total | in-file | witness |
+|---|---|---|---|---|
+| `register` | password, blind | 10 | 4 | 6 |
+| `login` | password, blind, client keyshare seed | 19 | 11 | 8 |
+| `serverke2` | server private key, `oprf_seed`, server keyshare seed, `masking_key` | 6 | 2 | 4 |
+
+The pattern is `root[.]zig`, which is this module's file **and** `voprf`'s and
+`ct25519`'s: their constant-time property is this module's for every byte that
+flows through them. Every in-file context, read from `--stacks` and, where the
+source did not settle it, from the disassembly:
+
+- **Real branch on secret bytes — `voprf.deriveKeyPair`'s zero test**
+  (`voprf/src/root.zig:332`, `std.mem.allEqual(u8, &sk, 0)`). It compiles to a
+  per-byte early-exit chain (`test %dil,%dil; jne`, then `cmpb $0x0,…; jne`
+  for the next byte, …), so the exit point is the index of the first non-zero
+  byte of the derived secret key. One context in `register` (the client
+  long-term AKE key in `Store`), two in `login` (client keyshare, the
+  long-term key in `Recover`), both of `serverke2`'s (the per-client OPRF key,
+  the server keyshare). What leaks is small — whether leading bytes are zero,
+  an event of probability 1/256 per byte — but it is a branch on key bytes,
+  not a verdict. Recorded as a finding against `voprf`; not fixed here.
+- **Verdicts of checks that always pass, on secret-derived values** — one
+  branch each on the result, confirmed branchless before it in the
+  disassembly: `hashToGroup`'s identity rejection on `H(password)`
+  (`voprf :215`; `register`, `login`), `unblind`'s canonicity (`:272`, through
+  std's `rejectNonCanonical`) and zero test (`:549`, vectorised) on the blind
+  (two contexts; `register`, `login`).
+- **Verdicts that are public by protocol** — `Recover`'s envelope MAC check
+  (`root.zig:708`) and `generateKE3`'s server MAC check (`:1025`): success or
+  failure of a login is what the peer learns anyway.
+- **Public values tainted by construction** (`login` only) — the four
+  contexts of `diffieHellman`'s decode of `server_public_key` (std
+  `ristretto255.zig:38`, `:41`, `:70`; `voprf :255`). It is unmasked with a
+  password-derived pad, so memcheck sees it as secret, but it is the server's
+  public key and is decoded only after `Recover` has succeeded.
+
+No context's leaf frame lies in `ct25519`: the secret-scalar multiplications
+(`blind`, `blindEvaluate`, `unblind`, the key-pair derivations, the 3DH
+Diffie-Hellman steps) contribute nothing.
+Positive control: one branch on a secret byte inserted into
+`finalizeRegistrationRequest`, `generateKE3` and `generateKE2` adds exactly one
+context per target (4 → 5, 11 → 12, 2 → 3), at the inserted line.
+
 ## API discipline
 
 - **No internal RNG** (house rule, same as `voprf`): every blind,
