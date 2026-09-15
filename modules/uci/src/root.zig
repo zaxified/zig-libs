@@ -1644,6 +1644,15 @@ fn monotonicNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
+/// CPU time consumed by the calling thread only -- unlike `monotonicNs`, it
+/// does not advance while the thread is preempted, so a loaded machine does
+/// not inflate it.
+fn threadCpuNs() u64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.THREAD_CPUTIME_ID, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
 test "accessors distinguish prefix-related names, not just a shared prefix" {
     // Regression for audit A1 U13: a mutation campaign found four name
     // comparisons in the accessor layer (`Section.option`, `Parser.addOption`,
@@ -1742,18 +1751,24 @@ test "addOption is not quadratic in distinct keys per section" {
     // pre-fix at 11.05s for N=64000 (ReleaseFast), and a clean quadratic
     // pattern across 16000/32000/64000/128000/256000. `SecBuild.index`
     // (a key -> options-index hashmap, see `addOption`) makes the per-key
-    // lookup amortized O(1). This regression test uses N=16000/64000 (a 4x
-    // jump): a still-quadratic implementation would take ~16x longer for the
-    // 4x-larger input; a linear one takes ~4x longer. The bound below (8x)
-    // sits generously between the two so ordinary machine noise on a shared,
-    // loaded box cannot flip it, while a reintroduced O(N^2) scan still trips
-    // it by a wide margin.
+    // lookup amortized O(1).
+    //
+    // The guard compares N=4000 with N=32000 (an 8x jump): a linear
+    // implementation costs ~8x more, a quadratic one ~64x. The bound (24x)
+    // sits near the geometric middle, a ~3x margin on each side.
+    //
+    // It measures THREAD CPU time, not wall-clock, and keeps the minimum of
+    // three interleaved rounds. The wall-clock version (16000/64000, bound 8x)
+    // measured 4.1x alone and 8.12x inside `scripts/test.sh all` (attempt 7,
+    // 2026-09-15), where ~217 modules share the CPUs: a parse preempted
+    // mid-run is charged time it never spent computing. Thread CPU time does
+    // not count time off-CPU, and the minimum drops the rounds that cache
+    // contention inflated anyway.
     const gpa = testing.allocator;
-    const sizes = [_]usize{ 16000, 64000 };
-    var times_ns: [sizes.len]u64 = undefined;
-    for (sizes, 0..) |n, i| {
-        var input: std.ArrayList(u8) = .empty;
-        defer input.deinit(gpa);
+    const sizes = [_]usize{ 4000, 32000 };
+    var inputs: [sizes.len]std.ArrayList(u8) = @splat(.empty);
+    defer for (&inputs) |*input| input.deinit(gpa);
+    for (sizes, &inputs) |n, *input| {
         try input.appendSlice(gpa, "config t\n");
         var buf: [32]u8 = undefined;
         for (0..n) |k| {
@@ -1762,18 +1777,24 @@ test "addOption is not quadratic in distinct keys per section" {
             try input.appendSlice(gpa, key);
             try input.appendSlice(gpa, " v\n");
         }
-        const t0 = monotonicNs();
-        var pkg = try parse(gpa, input.items);
-        times_ns[i] = monotonicNs() - t0;
-        try testing.expectEqual(@as(usize, n), pkg.sections[0].options.len);
-        pkg.deinit(gpa);
     }
-    const ratio = @as(f64, @floatFromInt(times_ns[1])) / @as(f64, @floatFromInt(@max(times_ns[0], 1)));
+    var best_ns: [sizes.len]u64 = @splat(std.math.maxInt(u64));
+    for (0..3) |_| {
+        for (sizes, inputs, 0..) |n, input, i| {
+            const t0 = threadCpuNs();
+            var pkg = try parse(gpa, input.items);
+            const dt = threadCpuNs() - t0;
+            defer pkg.deinit(gpa);
+            try testing.expectEqual(n, pkg.sections[0].options.len);
+            best_ns[i] = @min(best_ns[i], dt);
+        }
+    }
+    const ratio = @as(f64, @floatFromInt(best_ns[1])) / @as(f64, @floatFromInt(@max(best_ns[0], 1)));
     std.debug.print(
-        "uci U2 perf regression: N=16000 took {d}ns, N=64000 took {d}ns, ratio={d:.2} (quadratic would be ~16x, linear ~4x; gate is <8x)\n",
-        .{ times_ns[0], times_ns[1], ratio },
+        "uci U2 perf regression: N=4000 took {d}ns, N=32000 took {d}ns (thread CPU, min of 3), ratio={d:.2} (quadratic would be ~64x, linear ~8x; gate is <24x)\n",
+        .{ best_ns[0], best_ns[1], ratio },
     );
-    try testing.expect(ratio < 8.0);
+    try testing.expect(ratio < 24.0);
 }
 
 test "duplicate named section is rejected" {
