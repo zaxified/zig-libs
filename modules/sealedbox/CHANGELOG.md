@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (test-only):** audit finding
+  L4. The property `wipe` exists for — that the optimiser cannot remove its
+  zeroing — had no test that could see it: `wipe: the encoded secret really is
+  gone` reads the buffer right after wiping it, which keeps even a plain
+  `@memset` alive, and the audit's mutant swapping `secureZero` for `@memset`
+  passed every test. New `stackprobe_test.zig` forces a buffer into memory by
+  volatile writes, wipes it, never reads it again and scans the dead stack
+  after return, beside a negative and a positive control. Measured at
+  ReleaseFast in the full test binary: `secureZero` 0/5, `@memset` 5/5, a no-op
+  5/5. Imported from `kat_test.zig`, so `root.zig` and its ctgrind digest do not
+  move.
+
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** `SPEC.md`
   gains a "Known limitations" section documenting audit findings H2 and
   M4 by exact location instead of leaving them open. Both point into the

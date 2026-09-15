@@ -10,6 +10,13 @@ const sealedbox = @import("root.zig");
 const SealedBox = std.crypto.nacl.SealedBox;
 const kat = @import("kat_vectors.zig");
 
+// Pulled in from here rather than from `root.zig`'s aggregator: every byte of
+// `root.zig` is in the ctgrind source digest of this module's four rows, and a
+// test-only import should not move it.
+test {
+    _ = @import("stackprobe_test.zig");
+}
+
 fn hexDecode32(comptime hex: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, hex) catch unreachable;
