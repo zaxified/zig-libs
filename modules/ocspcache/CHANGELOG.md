@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `httpFetch` cancel tests (connect/head wait, body wait) canceled after a fixed
+  sleep. They now cancel once the client is inside the socket read under test (`ReadCueIo`, a
+  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
+  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
+  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
+
 - **2026-09-10** — **BEHAVIOURAL, not breaking: a responder that answers a head and then
   sends no body no longer parks `refresh` forever (F2).** `httpFetch`'s response-BODY
   read had no deadline of its own — `Config.max_response_bytes` bounds SIZE, never TIME,

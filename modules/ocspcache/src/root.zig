@@ -1013,10 +1013,14 @@ const CancelTestPeer = struct {
     /// declaring a 5-byte body and then sends none of it, so the head read
     /// completes and the *body* read (`readAllAlloc`) is what blocks.
     send_head: bool,
+    /// Set once `accept` returned; `release` only has to wake a peer before that.
+    accepted: std.atomic.Value(u32) = .init(0),
 
     fn run(p: *CancelTestPeer) void {
         const s = p.listener.accept(p.io) catch return;
         defer s.close(p.io);
+        p.accepted.store(1, .release);
+        if (p.stop.load(.acquire) != 0) return; // woken by `release`
         if (p.send_head) {
             var wbuf: [256]u8 = undefined;
             var sw = s.writer(p.io, &wbuf);
@@ -1025,6 +1029,63 @@ const CancelTestPeer = struct {
         }
         while (p.stop.load(.acquire) == 0)
             p.io.sleep(.fromMilliseconds(5), .awake) catch return;
+    }
+
+    /// Wake the peer if it is still parked in `accept`. After a client that
+    /// never connected nothing else would, and `join` would wait forever.
+    /// Closing the listener does not wake it under `std.Io.Threaded`.
+    fn release(p: *@This(), port: u16) void {
+        p.stop.store(1, .release);
+        if (p.accepted.load(.acquire) != 0) return;
+        const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return;
+        const s = addr.connect(p.io, .{ .mode = .stream }) catch return;
+        s.close(p.io);
+    }
+};
+
+/// A real `std.Io` whose only changed slot counts `netRead` entries. A cancel
+/// test uses it to cancel once the client is INSIDE a given socket read, not
+/// after a sleep. The peer writes its whole head in one flush, so on loopback
+/// the head (or reply) is read #1 and the body read #2. With a sleep, a loaded
+/// machine could cancel an earlier step, which passes by the wrong route. It
+/// could also cancel before the connect: the peer then waits in `accept`
+/// forever, and so does `join`. That is the http full-gate hang of
+/// 2026-09-17, and the same shape as this module's peer.
+const ReadCueIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var inner_vtable: *const std.Io.VTable = undefined;
+    var reads: std.atomic.Value(u32) = .init(0);
+
+    fn init(inner: std.Io) ReadCueIo {
+        inner_vtable = inner.vtable;
+        reads.store(0, .release);
+        var vt = inner.vtable.*;
+        vt.netRead = netRead;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const ReadCueIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+        _ = reads.fetchAdd(1, .monotonic);
+        return inner_vtable.netRead(userdata, src, data);
+    }
+
+    /// Wait until the client has entered its `n`-th socket read. The deadline
+    /// is a watchdog only: a client that never gets there is a red, not a hang
+    /// (the gate's per-test limit is 3 minutes).
+    fn awaitReads(real_io: std.Io, n: u32) bool {
+        const start = std.Io.Clock.Timestamp.now(real_io, .awake);
+        while (reads.load(.acquire) < n) {
+            const waited = start.durationTo(std.Io.Clock.Timestamp.now(real_io, .awake)).raw.nanoseconds;
+            if (waited > 60 * std.time.ns_per_s) return false;
+            real_io.sleep(.fromMilliseconds(1), .awake) catch return reads.load(.acquire) >= n;
+        }
+        return true;
     }
 };
 
@@ -1154,9 +1215,10 @@ test "httpFetch: a canceled connect/head wait surfaces error.Canceled, not error
     var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = false };
     const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
-    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    var cue: ReadCueIo = .init(io);
+    var client = http.Client.init(cue.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     const transport = httpTransport(&client);
 
@@ -1164,9 +1226,12 @@ test "httpFetch: a canceled connect/head wait surfaces error.Canceled, not error
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024 } });
-    // Long enough that the connect/head wait is certainly parked.
-    try io.sleep(.fromMilliseconds(200), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel once the client is inside read #1, the head read (`ReadCueIo`):
+    // it has connected and written, so nothing earlier can take the cancel.
+    const reached = ReadCueIo.awaitReads(io, 1);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
 
 test "httpFetch: a canceled body wait surfaces error.Canceled, not error.TransportFailed" {
@@ -1185,9 +1250,10 @@ test "httpFetch: a canceled body wait surfaces error.Canceled, not error.Transpo
     var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = true };
     const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
-    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    var cue: ReadCueIo = .init(io);
+    var client = http.Client.init(cue.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     const transport = httpTransport(&client);
 
@@ -1195,10 +1261,11 @@ test "httpFetch: a canceled body wait surfaces error.Canceled, not error.Transpo
     const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{port});
 
     var fut = try io.concurrent(fetchOnce, .{ transport, testing.allocator, FetchRequest{ .url = url, .max_response_bytes = 1024 } });
-    // Long enough that the head has definitely arrived and the body read is
-    // the one parked in the kernel.
-    try io.sleep(.fromMilliseconds(200), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel once the client is inside read #2, the body read (`ReadCueIo`).
+    const reached = ReadCueIo.awaitReads(io, 2);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }
 
 test "httpFetch: body_timeout_ms self-terminates against a responder that sends a head and never a body (F2)" {
@@ -1223,9 +1290,10 @@ test "httpFetch: body_timeout_ms self-terminates against a responder that sends 
     var peer: CancelTestPeer = .{ .io = io, .listener = &listener, .send_head = true };
     const peer_thread = try std.Thread.spawn(.{}, CancelTestPeer.run, .{&peer});
     defer peer_thread.join();
-    defer peer.stop.store(1, .release);
+    defer peer.release(port);
 
-    var client = http.Client.init(io, testing.allocator, .{ .pool = .{ .enabled = false } });
+    var cue: ReadCueIo = .init(io);
+    var client = http.Client.init(cue.io(), testing.allocator, .{ .pool = .{ .enabled = false } });
     defer client.deinit();
     const transport = httpTransport(&client);
 
