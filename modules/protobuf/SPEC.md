@@ -313,9 +313,22 @@ wrong bytes. That is the concrete argument for anchoring on bytes and not on val
 - **`oneof`.** Would map naturally onto a Zig tagged union; the encoder/decoder hooks are small,
   but the presence interaction with implicit-presence scalars needs its own test surface.
 - **`Any`, well-known types, the canonical JSON mapping.** Each is a layer above the wire format.
-- **A per-message size cache.** Sizing recomputes nested sizes per level, so it is O(depth ×
-  fields) rather than O(fields). Upstream caches the size on the message object; a Zig equivalent
-  would need somewhere to put it, and the messages here are deliberately plain values.
+- ~~A per-message size cache.~~ **Implemented 2026-09-15 for `encodeAlloc` (F6, A1/protobuf.md).**
+  `encodeInto` (the allocation-free path — see encode.zig's module doc comment) is unchanged and
+  still O(depth × fields): it has nowhere to put a cache without an allocator, and staying
+  allocator-free is the entire reason this module has two encode entry points. `encodeAlloc` now
+  builds a `SizeTree` — one node per submessage, in a throwaway arena over its own `gpa`, freed
+  before the function returns — and the emit pass reads each submessage's size back from it
+  instead of recomputing. Measured (ReleaseFast, `smp_allocator`, interleaved A/B, min of 25
+  reps): a self-recursive chain 255 levels deep drops from 3.45ms to 118µs (29×); at the module's
+  own `max_depth` default (64, also `grpc.Stream.sendInner`'s), 213µs → 31µs (6.9×). The cache
+  is not free: for very shallow messages (depth 1–4, the common case for most schemas) the extra
+  arena/allocation overhead makes `encodeAlloc` measurably SLOWER than before — depth 1: 818ns →
+  950ns, depth 2: 1078ns → 1587ns, depth 4: 1860ns → 2481ns (reproduced across separate runs, not
+  noise) — crossing over to a net win around depth 8. In absolute terms this is a few hundred
+  nanoseconds against calls already in the low microseconds, and `encodeInto`'s hot path (used
+  wherever the caller doesn't need `encodeAlloc`'s convenience) pays nothing at all, but it is a
+  real, measured trade-off, not a pure win, and is recorded as one.
 - **Streaming decode.** The API takes a complete buffer. gRPC frames arrive length-prefixed, so
   the framing layer above this one is the natural place for that.
 

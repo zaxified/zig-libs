@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **PERFORMANCE, no API/behaviour change:** audit F6. `encodeAlloc` sizes every
+  submessage exactly once (a `SizeTree` built in a throwaway arena over its own `gpa`) instead of
+  recomputing a nested submessage's size once per level of nesting it is under, which made
+  encoding a chain `depth` levels deep cost O(depth²). Measured (ReleaseFast, `smp_allocator`):
+  depth 255 3.45ms -> 118µs (29x), depth 64 (the module's and `grpc.Stream.sendInner`'s own
+  `max_depth` default) 213µs -> 31µs (6.9x). Trade-off, recorded honestly: for shallow messages
+  (depth 1-4) the cache's own allocation overhead makes `encodeAlloc` measurably slower than
+  before (hundreds of ns), crossing over to a net win around depth 8 — see SPEC.md "Not
+  implemented" for the full numbers. `encodeInto` (the allocation-free path) is byte-for-byte
+  unchanged, compiled identically to before; only `encodeAlloc`'s internals changed, no public
+  signature or wire output changed anywhere.
+
 - **2026-09-15** — **BEHAVIOURAL (new memory cap, on by default):** audit F1, round-2 decision
   Q4. Declared length and nesting depth were both bounded, but arena memory was not: a
   singular/optional message field that recurs many (`k`) times at many (`d`) levels of nesting
