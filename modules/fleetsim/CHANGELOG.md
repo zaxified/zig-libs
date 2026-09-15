@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **BEHAVIOURAL, not breaking:** `serveUdp`, `serveTcp` and `serveTcpMulti`
+  return `error.Canceled` (already in `Error`) instead of `error.BindFailed` when a cancel lands
+  in the bind/listen that opens the socket. Before, a caller that canceled a session on its way up
+  was told the port was unavailable. Found by full-gate attempt 5: the `serveUdp` cancel test failed
+  `expected error.Canceled, found error.BindFailed`. Reproduced 3/3 by canceling before the bind.
+  A new test holds bind/listen in a cancelation wait. It fails on each of the three sites reverted
+  and passes after the fix. The socket tests also changed: none cancels after a sleep or binds a
+  pid-derived port any more. Each one binds port 0, learns the port from the listen under test
+  (`CueIo`) and cancels on an event.
+
 - **2026-09-15** — A1 F-C. **No consumer-visible change** (tests and a golden only). The S7
   negotiated-PDU mark was an echo: the device ceiling equalled python-snap7's own 480 proposal, so
   `@min(asked, ceiling)` was the identity. The live S7 device and the offline replay now cap at

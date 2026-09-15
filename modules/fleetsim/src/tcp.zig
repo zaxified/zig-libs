@@ -71,8 +71,8 @@ pub const Error = error{
     BindFailed,
     NoPeer,
     /// A blocking wait was canceled through the `std.Io` cancellation
-    /// protocol (`Future.cancel`) — an accept/read-readiness poll, or a UDP
-    /// `receiveTimeout`/`send`. Surfaced instead of an ordinary idle round
+    /// protocol (`Future.cancel`) — the bind/listen that opens the socket, an
+    /// accept/read-readiness poll, or a UDP `receiveTimeout`/`send`. Surfaced instead of an ordinary idle round
     /// (or a silently truncated flush) so a caller shutting a session down
     /// can tell its own cancellation from "nothing arrived yet".
     Canceled,
@@ -90,6 +90,16 @@ pub fn nowMs() u64 {
 /// again.
 fn checkCanceled(io: std.Io) error{Canceled}!void {
     io.checkCancel() catch return error.Canceled;
+}
+
+/// `IpAddress.ListenError` and `BindError` both end in `Io.Cancelable`: a
+/// cancel that lands before the socket exists is reported by the bind/listen
+/// call itself (its `Syscall.start`). All three entry points used to rename it
+/// `BindFailed`, telling a caller that canceled a session on its way up that
+/// the port was unavailable. Measured: full-gate attempt 5 (2026-09-17),
+/// `serveUdp` -> `expected error.Canceled, found error.BindFailed`.
+fn bindFailure(err: anyerror) error{ Canceled, BindFailed } {
+    return if (err == error.Canceled) error.Canceled else error.BindFailed;
 }
 
 /// Distinguish a canceled wait from a genuine read/write failure using the
@@ -179,7 +189,7 @@ pub fn serveTcp(
     address: std.Io.net.IpAddress,
     opts: Options,
 ) !Report {
-    var listener = address.listen(io, .{ .reuse_address = true }) catch return error.BindFailed;
+    var listener = address.listen(io, .{ .reuse_address = true }) catch |e| return bindFailure(e);
     defer listener.socket.close(io);
 
     var total = Report{};
@@ -420,8 +430,8 @@ pub fn serveTcpMulti(
     var bound: usize = 0;
     defer for (listeners[0..bound]) |*l| l.socket.close(io);
     while (bound < bindings.len) : (bound += 1) {
-        listeners[bound] = bindings[bound].address.listen(io, .{ .reuse_address = true }) catch
-            return error.BindFailed;
+        listeners[bound] = bindings[bound].address.listen(io, .{ .reuse_address = true }) catch |e|
+            return bindFailure(e);
     }
 
     const peers = try gpa.alloc(Peer, max_peers);
@@ -660,8 +670,8 @@ pub fn serveUdp(
     opts: Options,
 ) !Report {
     var report = Report{};
-    var socket = address.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch
-        return error.BindFailed;
+    var socket = address.bind(io, .{ .mode = .dgram, .allow_broadcast = true }) catch |e|
+        return bindFailure(e);
     defer socket.close(io);
     report.connected = true;
 
@@ -774,36 +784,176 @@ fn socketSkip(what: []const u8) anyerror {
     return error.SkipZigTest;
 }
 
-// ⚠ Derived from the pid, not fixed. With three constants here, two
-// `test-fleetsim` runs at once stole each other's connections: the winner of
-// the bind accepted the loser's clients too, so `peers_accepted` came back 1,
-// 3 or 4 instead of 2 and the run failed on an assertion that looks entirely
-// real. Measured during the 2026-09-01 audit -- two concurrent runs gave
-// `expected 2, found 1` and `expected 2, found 3`, and a LONE run failed too
-// while another lane was building. `scripts/test.sh` runs modules in parallel,
-// so this was a false RED waiting for a busy machine. The newer cancellation
-// tests in this file already bind port 0 for exactly this reason; these three
-// predate that. A pid-derived base keeps the ports stable within one run (the
-// client threads need to know them before the server binds) while making a
-// collision between two runs require the same pid.
-/// Runtime, not comptime: `getpid` is a syscall, and these three must differ
-/// between two processes rather than between two builds.
-fn testPortBase() u16 {
-    // Strided by 4, not 1. Two processes spawned together get CONSECUTIVE
-    // pids, so a stride of 1 makes run N's ports {b, b+1, b+2} overlap run
-    // N+1's {b+1, b+2, b+3} -- measured: the first version of this fix still
-    // failed two concurrent runs with `expected 2, found 3`. Four leaves a
-    // gap wider than the three ports each run takes.
-    return 15000 + @as(u16, @truncate(@as(u32, @bitCast(std.posix.system.getpid())) % 10000)) * 4;
+// ── CueIo: cancel and connect on EVENTS, never after a sleep or on a fixed port
+//
+// Full-gate attempt 5 (2026-09-17, every module lane in parallel) failed
+// `serveUdp: a canceled receive wait …` with `expected error.Canceled, found
+// error.BindFailed`. The test canceled after a fixed 100 ms sleep; under that
+// load the task had not bound its socket yet, the bind's own `Syscall.start`
+// reported the pending cancel, and `serveUdp` renamed it (`bindFailure` above
+// is the module half of the fix). Removing the sleep reproduces it every time.
+// The sleep was also the weaker half of every other cancellation test here: a
+// cancel that lands before the step a test names hits an earlier step, and a
+// test that then passes, passes by that route.
+//
+// The ports the socket tests used to share were derived from the pid: a
+// collision with a parallel run was unlikely, not impossible, and nothing kept
+// them off other modules' fixed ports in the same range (iec61850's 15684 was
+// the first of the three for pid % 10000 == 171).
+//
+// So every test below binds port 0 and learns the port from the listen the
+// code under test performed, through this double: a real `std.Io` whose slots
+// all delegate, with an observable event on the few a test waits for. The cues
+// are statics because a slot receives the inner `Threaded` userdata, not this
+// struct; the test runner runs one test at a time.
+const CueIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var inner_vtable: *const std.Io.VTable = undefined;
+    /// Hold `netBindIp`/`netListenIp` in a cancelation wait instead of binding,
+    /// asking exactly where the real call's `Syscall.start` would.
+    var stall_bind: bool = false;
+    /// After this many successful listens, wait for `go` before returning: a
+    /// test connects to the learnt port(s) before the loop's first round.
+    var hold_after_listens: u32 = 0;
+    var go: std.atomic.Value(u32) = .init(0);
+
+    var bind_entered: std.atomic.Value(u32) = .init(0);
+    var listens: std.atomic.Value(u32) = .init(0);
+    var ports: [2]std.atomic.Value(u32) = .{ .init(0), .init(0) };
+    var accept_entered: std.atomic.Value(u32) = .init(0);
+    var accepted: std.atomic.Value(u32) = .init(0);
+    var read_entered: std.atomic.Value(u32) = .init(0);
+    var receive_entered: std.atomic.Value(u32) = .init(0);
+
+    const Mode = struct {
+        stall_bind: bool = false,
+        hold_after_listens: u32 = 0,
+    };
+
+    fn init(inner: std.Io, mode: Mode) CueIo {
+        inner_vtable = inner.vtable;
+        stall_bind = mode.stall_bind;
+        hold_after_listens = mode.hold_after_listens;
+        const cues = [_]*std.atomic.Value(u32){ &go, &bind_entered, &listens, &ports[0], &ports[1], &accept_entered, &accepted, &read_entered, &receive_entered };
+        for (cues) |c| c.store(0, .release);
+        var vt = inner.vtable.*;
+        vt.netBindIp = netBindIp;
+        vt.netListenIp = netListenIp;
+        vt.netAccept = netAccept;
+        vt.netRead = netRead;
+        vt.batchAwaitConcurrent = batchAwaitConcurrent;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const CueIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    /// The port the `i`-th listen of the current test got.
+    fn port(i: usize) u16 {
+        return @intCast(ports[i].load(.acquire));
+    }
+
+    fn holdInCancelWait(userdata: ?*anyopaque) std.Io.Cancelable {
+        bind_entered.store(1, .release);
+        while (true) {
+            inner_vtable.checkCancel(userdata) catch |e| return e;
+            sleepMs(1);
+        }
+    }
+
+    fn netBindIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.BindOptions) std.Io.net.IpAddress.BindError!std.Io.net.Socket {
+        if (stall_bind) return holdInCancelWait(userdata);
+        return inner_vtable.netBindIp(userdata, address, options);
+    }
+
+    fn netListenIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ListenOptions) std.Io.net.IpAddress.ListenError!std.Io.net.Socket {
+        if (stall_bind) return holdInCancelWait(userdata);
+        const s = try inner_vtable.netListenIp(userdata, address, options);
+        const n = listens.load(.acquire);
+        // The port first, then the count a test waits on.
+        if (n < ports.len) ports[n].store(s.address.getPort(), .release);
+        listens.store(n + 1, .release);
+        if (hold_after_listens != 0 and n + 1 == hold_after_listens) {
+            while (go.load(.acquire) == 0) {
+                inner_vtable.checkCancel(userdata) catch |e| {
+                    inner_vtable.netClose(userdata, &.{s.handle});
+                    return e;
+                };
+                sleepMs(1);
+            }
+        }
+        return s;
+    }
+
+    fn netAccept(userdata: ?*anyopaque, server: std.Io.net.Socket.Handle, options: std.Io.net.Server.AcceptOptions) std.Io.net.Server.AcceptError!std.Io.net.Socket {
+        accept_entered.store(1, .release);
+        const s = try inner_vtable.netAccept(userdata, server, options);
+        _ = accepted.fetchAdd(1, .monotonic);
+        return s;
+    }
+
+    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+        _ = read_entered.fetchAdd(1, .monotonic);
+        return inner_vtable.netRead(userdata, src, data);
+    }
+
+    /// `Socket.receiveTimeout` is `io.operateTimeout`, which waits here.
+    fn batchAwaitConcurrent(userdata: ?*anyopaque, batch: *std.Io.Batch, timeout: std.Io.Timeout) std.Io.Batch.AwaitConcurrentError!void {
+        receive_entered.store(1, .release);
+        return inner_vtable.batchAwaitConcurrent(userdata, batch, timeout);
+    }
+};
+
+/// Only a watchdog, never the synchronization: it turns a task that never
+/// reaches the cued step into a RED instead of a hang, well inside the gate's
+/// 3-minute per-test limit.
+const cue_watchdog_ms = 60_000;
+
+fn awaitCue(flag: *const std.atomic.Value(u32), at_least: u32) bool {
+    const start = nowMs();
+    while (flag.load(.acquire) < at_least) {
+        if (nowMs() - start > cue_watchdog_ms) return false;
+        sleepMs(1);
+    }
+    return true;
 }
-fn testPortA() u16 {
-    return testPortBase();
+
+fn cancelQuietly(io: std.Io, fut: anytype) void {
+    if (fut.cancel(io)) |_| {} else |_| {}
 }
-fn testPortB() u16 {
-    return testPortBase() +% 1;
+
+/// Cancel `fut` and demand `error.Canceled` -- after checking that the cue was
+/// really reached, since a cancel that raced ahead of it tests another step.
+fn expectCanceledAt(io: std.Io, fut: anytype, reached: bool, what: []const u8) !void {
+    CueIo.go.store(1, .release);
+    const res = fut.cancel(io);
+    if (!reached) {
+        std.debug.print("{s}: the task never reached the cued step\n", .{what});
+        return error.TestUnexpectedResult;
+    }
+    if (res) |_| {
+        std.debug.print("{s}: expected error.Canceled, found a finished result\n", .{what});
+        return error.TestExpectedError;
+    } else |e| {
+        if (e != error.Canceled) {
+            std.debug.print("{s}: expected error.Canceled, found error.{t}\n", .{ what, e });
+            return error.TestUnexpectedError;
+        }
+    }
 }
-fn testPortSingle() u16 {
-    return testPortBase() +% 2;
+
+/// The task never reached its listen within the watchdog: release it and say
+/// why, skipping only when the environment genuinely could not bind.
+fn neverListened(io: std.Io, fut: anytype, what: []const u8) anyerror {
+    CueIo.go.store(1, .release);
+    if (fut.cancel(io)) |_| {} else |e| {
+        if (e == error.BindFailed) return socketSkip(what);
+    }
+    std.debug.print("{s}: the loop never reached listen\n", .{what});
+    return error.TestUnexpectedResult;
 }
 
 const ClientResult = struct {
@@ -898,41 +1048,53 @@ test "serveTcpMulti: two masters, two nodes, one thread, at the same time" {
     const ra = try modbus.tcp.encodeAdu(&req_a, 0x0001, 1, &.{ 0x03, 0, 0, 0, 4 });
     const rb = try modbus.tcp.encodeAdu(&req_b, 0x0002, 2, &.{ 0x03, 0, 0, 0, 4 });
 
-    var hold: std.atomic.Value(bool) = .init(true);
-    var ca = ClientResult{ .port = testPortA(), .request = ra, .rounds = 4, .hold = &hold };
-    var cb = ClientResult{ .port = testPortB(), .request = rb, .rounds = 4, .hold = &hold };
-
+    // Port 0 for both listeners, learnt from the listens themselves. The loop
+    // is held between its last listen and its first round, so both masters'
+    // connects land in the kernel backlog first: no retry, and no port range
+    // shared with a parallel run (see `CueIo`).
+    var cue: CueIo = .init(io, .{ .hold_after_listens = 2 });
     const bindings = [_]Binding{
-        .{ .node = node_a, .address = try std.Io.net.IpAddress.parse("127.0.0.1", testPortA()) },
-        .{ .node = node_b, .address = try std.Io.net.IpAddress.parse("127.0.0.1", testPortB()) },
+        .{ .node = node_a, .address = .{ .ip4 = .loopback(0) } },
+        .{ .node = node_b, .address = .{ .ip4 = .loopback(0) } },
     };
-
-    const ta = try std.Thread.spawn(.{}, testClient, .{&ca});
-    const tb = try std.Thread.spawn(.{}, testClient, .{&cb});
-
-    const report = serveTcpMulti(gpa, io, &f, &bindings, .{
+    var fut = try io.concurrent(serveTcpMulti, .{ gpa, cue.io(), &f, &bindings, MultiOptions{
         .idle_ms = 20,
         .run_ms = 4000,
         .max_peers = 4,
-    }) catch |e| {
-        hold.store(false, .release);
-        ta.join();
-        tb.join();
-        switch (e) {
-            // ⚠ `BindFailed` only. `NoPeer` used to skip here too, and that
-            // is a SERVER verdict, not an environment one: the client threads
-            // above did connect. Measured -- inverting `readable`'s readiness
-            // predicate (`n != 0` -> `n == 0`), i.e. breaking the central
-            // readiness decision, made this test print "cannot bind" and count
-            // GREEN. A broken server reported as an unavailable port is the
-            // skip-as-pass shape with a plausible cover story.
-            error.BindFailed => return socketSkip("serveTcpMulti cannot bind 127.0.0.1"),
-            else => return e,
-        }
+    } });
+    if (!awaitCue(&CueIo.listens, 2)) return neverListened(io, &fut, "serveTcpMulti cannot bind 127.0.0.1");
+
+    var hold: std.atomic.Value(bool) = .init(true);
+    var ca = ClientResult{ .port = CueIo.port(0), .request = ra, .rounds = 4, .hold = &hold };
+    var cb = ClientResult{ .port = CueIo.port(1), .request = rb, .rounds = 4, .hold = &hold };
+    const ta = std.Thread.spawn(.{}, testClient, .{&ca}) catch |e| {
+        CueIo.go.store(1, .release);
+        cancelQuietly(io, &fut);
+        return e;
     };
+    const tb = std.Thread.spawn(.{}, testClient, .{&cb}) catch |e| {
+        hold.store(false, .release);
+        CueIo.go.store(1, .release);
+        cancelQuietly(io, &fut);
+        ta.join();
+        return e;
+    };
+    CueIo.go.store(1, .release);
+    const result = fut.await(io);
     hold.store(false, .release);
     ta.join();
     tb.join();
+    const report = result catch |e| switch (e) {
+        // ⚠ `BindFailed` only. `NoPeer` used to skip here too, and that
+        // is a SERVER verdict, not an environment one: the client threads
+        // above did connect. Measured -- inverting `readable`'s readiness
+        // predicate (`n != 0` -> `n == 0`), i.e. breaking the central
+        // readiness decision, made this test print "cannot bind" and count
+        // GREEN. A broken server reported as an unavailable port is the
+        // skip-as-pass shape with a plausible cover story.
+        error.BindFailed => return socketSkip("serveTcpMulti cannot bind 127.0.0.1"),
+        else => return e,
+    };
 
     // Both masters were connected at the same time, on the same thread …
     try testing.expectEqual(@as(usize, 2), report.peers_accepted);
@@ -1003,26 +1165,33 @@ test "serveTcp: one master round-trips over a real socket (no env gate)" {
     var req: [12]u8 = undefined;
     const request = try modbus.tcp.encodeAdu(&req, 0x0001, 1, &.{ 0x03, 0, 0, 0, 4 });
 
-    var hold: std.atomic.Value(bool) = .init(true);
-    var c = ClientResult{ .port = testPortSingle(), .request = request, .rounds = 4, .hold = &hold };
-    const th = try std.Thread.spawn(.{}, testClient, .{&c});
-
-    const addr = try std.Io.net.IpAddress.parse("127.0.0.1", testPortSingle());
-    const report = serveTcp(gpa, io, &f, node, addr, .{
+    // Port 0, learnt from `serveTcp`'s own listen; the master connects into the
+    // backlog while `CueIo` holds the loop before its first accept.
+    var cue: CueIo = .init(io, .{ .hold_after_listens = 1 });
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var fut = try io.concurrent(serveTcp, .{ gpa, cue.io(), &f, node, addr, Options{
         .idle_ms = 20,
         .run_ms = 4000,
         .max_frames = 4,
-    }) catch |e| {
-        hold.store(false, .release);
-        th.join();
-        switch (e) {
-            // `BindFailed` only -- see the note on the sibling test above.
-            error.BindFailed => return socketSkip("serveTcp cannot bind 127.0.0.1"),
-            else => return e,
-        }
+    } });
+    if (!awaitCue(&CueIo.listens, 1)) return neverListened(io, &fut, "serveTcp cannot bind 127.0.0.1");
+
+    var hold: std.atomic.Value(bool) = .init(true);
+    var c = ClientResult{ .port = CueIo.port(0), .request = request, .rounds = 4, .hold = &hold };
+    const th = std.Thread.spawn(.{}, testClient, .{&c}) catch |e| {
+        CueIo.go.store(1, .release);
+        cancelQuietly(io, &fut);
+        return e;
     };
+    CueIo.go.store(1, .release);
+    const result = fut.await(io);
     hold.store(false, .release);
     th.join();
+    const report = result catch |e| switch (e) {
+        // `BindFailed` only -- see the note on the sibling test above.
+        error.BindFailed => return socketSkip("serveTcp cannot bind 127.0.0.1"),
+        else => return e,
+    };
 
     // The master connected, all four requests were read, and all four replies
     // were written back and received — write → read → write, four times.
@@ -1092,9 +1261,11 @@ test "serveTcpOn: a canceled idle-read wait surfaces Canceled, not an idle round
     // inside it. It exists so that if cancellation recovery were ever broken
     // again, this test would fail fast instead of hanging the suite — the
     // loop is otherwise unbounded (`Options.run_ms` defaults to 0, "forever").
-    var fut = try io.concurrent(serveTcpOnConcrete, .{ gpa, io, &f, node, &listener, Options{ .idle_ms = 600, .run_ms = 3000 } });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    var cue: CueIo = .init(io, .{});
+    var fut = try io.concurrent(serveTcpOnConcrete, .{ gpa, cue.io(), &f, node, &listener, Options{ .idle_ms = 600, .run_ms = 3000 } });
+    // Cancel once the accept has RETURNED: earlier, the cancel lands in the
+    // accept and the test passes by that route, not the idle-read wait's.
+    try expectCanceledAt(io, &fut, awaitCue(&CueIo.accepted, 1), "serveTcpOn idle read");
 }
 
 test "serveTcpMulti: a canceled readiness wait surfaces Canceled, not an idle round" {
@@ -1114,14 +1285,11 @@ test "serveTcpMulti: a canceled readiness wait surfaces Canceled, not an idle ro
 
     // See the `run_ms` note in the `serveTcpOn` test above: a safety net, not
     // part of the path under test.
-    var fut = try io.concurrent(serveTcpMulti, .{ gpa, io, &f, &bindings, MultiOptions{ .idle_ms = 600, .run_ms = 3000 } });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    _ = fut.cancel(io) catch |e| switch (e) {
-        error.Canceled => return,
-        error.BindFailed => return socketSkip("loopback bind failed"),
-        else => return e,
-    };
-    return error.TestUnexpectedResult;
+    var cue: CueIo = .init(io, .{});
+    var fut = try io.concurrent(serveTcpMulti, .{ gpa, cue.io(), &f, &bindings, MultiOptions{ .idle_ms = 600, .run_ms = 3000 } });
+    // Cancel once the listen has returned. Earlier, the cancel landed in the
+    // listen itself, came back as `BindFailed`, and this test SKIPPED it.
+    try expectCanceledAt(io, &fut, awaitCue(&CueIo.listens, 1), "serveTcpMulti readiness wait");
 }
 
 test "serveUdp: a canceled receive wait surfaces Canceled, not an idle round" {
@@ -1142,9 +1310,42 @@ test "serveUdp: a canceled receive wait surfaces Canceled, not an idle round" {
     // `run_ms` is a safety net only, same reasoning as the TCP cancellation
     // tests above: the loop is otherwise unbounded, and a broken cancel path
     // must fail fast rather than hang the suite.
-    var fut = try io.concurrent(serveUdp, .{ gpa, io, &f, @as(NodeId, 0), addr, Options{ .idle_ms = 600, .run_ms = 3000 } });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    var cue: CueIo = .init(io, .{});
+    var fut = try io.concurrent(serveUdp, .{ gpa, cue.io(), &f, @as(NodeId, 0), addr, Options{ .idle_ms = 600, .run_ms = 3000 } });
+    // Cancel once the loop is inside its receive wait, not after a sleep: a
+    // cancel that lands earlier hits the bind (full-gate attempt 5).
+    try expectCanceledAt(io, &fut, awaitCue(&CueIo.receive_entered, 1), "serveUdp receive");
+}
+
+test "serveUdp, serveTcp, serveTcpMulti: a cancel inside bind/listen surfaces Canceled, not BindFailed" {
+    // Full-gate attempt 5 as a deterministic test: `CueIo` holds the bind or
+    // listen in a cancelation wait, where its `Syscall.start` asks, so the
+    // cancel lands there every time rather than when a loaded machine says.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var f = try Fleet.init(gpa, .{ .seed = 98 });
+    defer f.deinit();
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    const bindings = [_]Binding{.{ .node = 0, .address = addr }};
+    const opts: Options = .{ .idle_ms = 50, .run_ms = 3000 };
+    {
+        var cue: CueIo = .init(io, .{ .stall_bind = true });
+        var fut = try io.concurrent(serveUdp, .{ gpa, cue.io(), &f, @as(NodeId, 0), addr, opts });
+        try expectCanceledAt(io, &fut, awaitCue(&CueIo.bind_entered, 1), "serveUdp bind");
+    }
+    {
+        var cue: CueIo = .init(io, .{ .stall_bind = true });
+        var fut = try io.concurrent(serveTcp, .{ gpa, cue.io(), &f, @as(NodeId, 0), addr, opts });
+        try expectCanceledAt(io, &fut, awaitCue(&CueIo.bind_entered, 1), "serveTcp listen");
+    }
+    {
+        var cue: CueIo = .init(io, .{ .stall_bind = true });
+        var fut = try io.concurrent(serveTcpMulti, .{ gpa, cue.io(), &f, &bindings, MultiOptions{ .idle_ms = 50, .run_ms = 3000 } });
+        try expectCanceledAt(io, &fut, awaitCue(&CueIo.bind_entered, 1), "serveTcpMulti listen");
+    }
 }
 
 // ── the TCP data-transfer read/write fold ───────────────────────────────────
@@ -1185,43 +1386,23 @@ test "readData: a canceled blocking read surfaces Canceled, not 0" {
     var accepted = listener.accept(io) catch return socketSkip("loopback accept failed");
     defer accepted.close(io);
 
+    var cue: CueIo = .init(io, .{});
     var rbuf: [64]u8 = undefined;
-    var reader = accepted.reader(io, &rbuf);
+    var reader = accepted.reader(cue.io(), &rbuf);
     var buf: [64]u8 = undefined;
 
     // Nothing is ever written to `accepted`, and the reader's own buffer
-    // starts empty, so the read genuinely parks in `io.vtable.netRead`.
+    // starts empty, so the read genuinely parks in `io.vtable.netRead` -- and
+    // the cancel waits until the read has entered it.
     var fut = try io.concurrent(readOnce, .{ &reader, &buf });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    try expectCanceledAt(io, &fut, awaitCue(&CueIo.read_entered, 1), "readData");
 }
 
 // ── audit 2026-09-01: the real-socket surface, held by nothing ─────────────
 
-/// A peer that connects, stays silent, and does not hang up. Two of the tests
-/// below need one; both used to pass with the loop wedged.
-const SilentPeer = struct {
-    port: u16,
-    hold_ms: u64,
-    connected: std.atomic.Value(bool) = .init(false),
-
-    fn run(self: *SilentPeer) void {
-        // `testing.allocator`, not `page_allocator`: the repo's
-        // check-global-alloc gate forbids reaching for a process-global
-        // allocator outside a test block, and the sibling `testClient`
-        // above already does it this way.
-        var t: std.Io.Threaded = .init(testing.allocator, .{});
-        defer t.deinit();
-        const io = t.io();
-        const a = std.Io.net.IpAddress.parse("127.0.0.1", self.port) catch return;
-        var c = a.connect(io, .{ .mode = .stream }) catch return;
-        self.connected.store(true, .release);
-        sleepMs(self.hold_ms);
-        c.close(io);
-    }
-};
-
-// `nowMs` and `sleepMs` already exist above; reused here.
+// The silent peer both tests below need is a plain connect from the test
+// thread into the backlog of a listen `CueIo` holds -- no thread, no port
+// guess, and nothing that can lose a race to `listen`.
 
 test "serveTcpMulti: one silent peer must not hold the loop past its own deadline" {
     // The readiness set `fds` is built from the peers active BEFORE the accept
@@ -1249,34 +1430,44 @@ test "serveTcpMulti: one silent peer must not hold the loop past its own deadlin
     defer f.deinit();
     const node = try f.addNode(.{ .node = slave.node(), .tag = 1 });
 
-    const port = testPortA();
+    // The peer used to be a thread dialling a pid-derived port with no retry:
+    // one that lost the race to `listen` was refused, and the test passed with
+    // no silent peer ever accepted. The wall-clock bound (1500 ms against
+    // run_ms = 600) was a second race of its own on a loaded machine.
+    var cue: CueIo = .init(io, .{ .hold_after_listens = 1 });
     const bindings = [_]Binding{
-        .{ .node = node, .address = try std.Io.net.IpAddress.parse("127.0.0.1", port) },
+        .{ .node = node, .address = .{ .ip4 = .loopback(0) } },
     };
-
-    var peer: SilentPeer = .{ .port = port, .hold_ms = 2500 };
-    const th = try std.Thread.spawn(.{}, SilentPeer.run, .{&peer});
-    defer th.join();
-
-    const t0 = nowMs();
-    const report = serveTcpMulti(gpa, io, &f, &bindings, .{
-        .run_ms = 600,
-        .idle_ms = 50,
-    }) catch |e| switch (e) {
-        error.BindFailed => return socketSkip("cannot bind 127.0.0.1"),
-        else => return e,
+    const Run = struct {
+        fn go(io2: std.Io, gpa2: std.mem.Allocator, f2: *Fleet, b: []const Binding, done: *std.atomic.Value(u32)) !MultiReport {
+            defer done.store(1, .release);
+            return serveTcpMulti(gpa2, io2, f2, b, .{ .run_ms = 2000, .idle_ms = 50 });
+        }
     };
-    const wall = nowMs() - t0;
+    var done: std.atomic.Value(u32) = .init(0);
+    var fut = try io.concurrent(Run.go, .{ cue.io(), gpa, &f, bindings[0..], &done });
+    if (!awaitCue(&CueIo.listens, 1)) return neverListened(io, &fut, "cannot bind 127.0.0.1");
 
-    // Generous: the point is 600 vs 2500+, not a tight timing assertion.
-    if (wall > 1500) {
-        std.debug.print(
-            "serveTcpMulti ran {d}ms against run_ms=600 -- a silent peer is holding the loop\n",
-            .{wall},
-        );
+    const peer_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(CueIo.port(0)) };
+    var peer = peer_addr.connect(io, .{ .mode = .stream }) catch |e| {
+        CueIo.go.store(1, .release);
+        cancelQuietly(io, &fut);
+        return e;
+    };
+    CueIo.go.store(1, .release);
+
+    // The loop must come back by its own `run_ms` while the peer is still
+    // connected. If it does not, closing the peer is what releases it -- which
+    // is the defect, so it is reported rather than waited out.
+    const on_its_own = awaitCue(&done, 1);
+    peer.close(io);
+    const report = try fut.await(io);
+    if (!on_its_own) {
+        std.debug.print("serveTcpMulti outlived run_ms=2000 until its silent peer hung up\n", .{});
         return error.DeadlineIgnored;
     }
-    _ = report;
+    // Not vacuous: the silent peer really was in the readiness set.
+    try testing.expectEqual(@as(usize, 1), report.peers_accepted);
 }
 
 test "serveTcpOn: a canceled accept surfaces Canceled, not NoPeer" {
@@ -1303,11 +1494,11 @@ test "serveTcpOn: a canceled accept surfaces Canceled, not NoPeer" {
             return serveTcpOn(gpa2, io2, f2, 0, l, .{ .run_ms = 5000, .idle_ms = 50 });
         }
     };
-    // Nobody ever connects, so the accept below is parked when the cancel lands.
-    var fut = try io.concurrent(Run.go, .{ io, gpa, &f, &listener });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    const res = fut.cancel(io);
-    try testing.expectError(error.Canceled, res);
+    // Nobody ever connects. Cancel once the task is inside `accept`, not after
+    // a sleep a loaded machine can outlast.
+    var cue: CueIo = .init(io, .{});
+    var fut = try io.concurrent(Run.go, .{ cue.io(), gpa, &f, &listener });
+    try expectCanceledAt(io, &fut, awaitCue(&CueIo.accept_entered, 1), "serveTcpOn accept");
 }
 
 /// How many descriptors this process holds. Used to catch a leak that no
@@ -1344,9 +1535,9 @@ test "serveTcpMulti: a canceled loop closes the peers it accepted" {
     defer f.deinit();
     const node = try f.addNode(.{ .node = slave.node(), .tag = 1 });
 
-    const port = testPortB();
+    var cue: CueIo = .init(io, .{ .hold_after_listens = 1 });
     const bindings = [_]Binding{
-        .{ .node = node, .address = try std.Io.net.IpAddress.parse("127.0.0.1", port) },
+        .{ .node = node, .address = .{ .ip4 = .loopback(0) } },
     };
 
     const Run = struct {
@@ -1361,29 +1552,23 @@ test "serveTcpMulti: a canceled loop closes the peers it accepted" {
     };
 
     const before = openFdCount();
-    var fut = try io.concurrent(Run.go, .{ io, gpa, &f, bindings[0..] });
+    var fut = try io.concurrent(Run.go, .{ cue.io(), gpa, &f, bindings[0..] });
+    if (!awaitCue(&CueIo.listens, 1)) return neverListened(io, &fut, "cannot bind 127.0.0.1");
 
-    var peer: SilentPeer = .{ .port = port, .hold_ms = 4000 };
-    const th = try std.Thread.spawn(.{}, SilentPeer.run, .{&peer});
-
-    // Wait for the peer to be connected AND accepted, so there is a descriptor
-    // to leak when the cancel lands.
-    var waited: u64 = 0;
-    while (waited < 2000 and !peer.connected.load(.acquire)) : (waited += 20) sleepMs(20);
-    sleepMs(150);
-
-    const res = fut.cancel(io);
-    th.join();
-
-    if (res) |_| {
-        // The loop finished on its own (bind failed, or the peer never
-        // arrived): nothing to assert about a cancel that did not happen.
-        return socketSkip("the cancel raced the loop's own exit");
-    } else |e| switch (e) {
-        error.Canceled => {},
-        error.BindFailed => return socketSkip("cannot bind 127.0.0.1"),
-        else => return e,
-    }
+    // A master that connects and says nothing, queued before the loop's first
+    // round. The cancel waits until the loop HOLDS the accepted descriptor --
+    // the one a missing `defer` leaks. It used to be a sleep, and a cancel that
+    // beat the accept was skipped as "the cancel raced the loop's own exit".
+    const peer_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(CueIo.port(0)) };
+    var peer = peer_addr.connect(io, .{ .mode = .stream }) catch |e| {
+        CueIo.go.store(1, .release);
+        cancelQuietly(io, &fut);
+        return e;
+    };
+    CueIo.go.store(1, .release);
+    const verdict = expectCanceledAt(io, &fut, awaitCue(&CueIo.accepted, 1), "serveTcpMulti canceled with a peer");
+    peer.close(io);
+    try verdict;
 
     const after = openFdCount();
     if (after > before) {
