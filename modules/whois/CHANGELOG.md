@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** the audit F17 regression
+  test now counts response lines scanned instead of timing `nextServer`
+  (flaky under full-gate load, unrelated to any real defect). Adds two
+  test-only functions, `resetLinesScannedForTesting`/
+  `linesScannedForTesting`, and a `builtin.is_test`-gated counter incremented
+  once per line visited by `fieldValue`/`nextServer`'s scan loops; the
+  counter is zero-sized and the increment compiles to nothing outside a test
+  build, so referral-chasing behaviour is unchanged.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** `TcpTransport` gains
   `timeout_ms: ?u32 = null` (default `null` preserves today's unbounded
   behaviour) and `TransportError` gains `Timeout`. Bounds the whole
