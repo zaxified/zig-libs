@@ -76,10 +76,12 @@
 //! evidence. The magics, the operation and failure counts, the pass bits and
 //! the status/error codes are literals; for the status codes the
 //! discrimination lives in the frozen response bytes anyway, so those are
-//! redundant rather than weak. **One literal is genuinely an echo** and is
-//! marked where it appears — the S7 negotiated PDU length (`db2[8]`) is a
-//! number the master itself proposed, against a device ceiling that happens to
-//! equal it, so `@min` is the identity and that mark grades nothing.
+//! redundant rather than weak. The S7 negotiated PDU length (`db2[8]`) used
+//! to be the one genuine echo — the master's own proposal against a device
+//! ceiling equal to it, so `@min` was the identity and the mark graded
+//! nothing (audit F-C). Since 2026-09-15 the session is recorded against a
+//! ceiling of 240, below the master's 480, and the mark grades the
+//! negotiation.
 //!
 //! Concretely: a device whose register encoder was byte-swapped would have made
 //! pymodbus read 28416, 56832, … instead of 111, 222, …, so the sum in exchange
@@ -705,6 +707,10 @@ const s7_int: i16 = -1234;
 const s7_dint: i32 = 100_000;
 const s7_db1_from = 16;
 const s7_db1_len = 32;
+/// The device's PDU ceiling, below the 480 python-snap7 proposes, so the
+/// negotiation has to choose (audit F-C). Same value as the live test's
+/// `s7_verdict.device_pdu_ceiling`, which this session was recorded against.
+const s7_device_pdu_ceiling: u16 = 240;
 
 const s7_session = [_]Step{
     .{
@@ -731,7 +737,7 @@ const s7_session = [_]Step{
         .response = &.{
             0x03, 0x00, 0x00, 0x1B, 0x02, 0xF0, 0x80, 0x32, 0x03, 0x00,
             0x00, 0x00, 0x01, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0xF0,
-            0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0xE0,
+            0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0xF0, // device's ceiling 240, not the asked 480
         },
     },
     .{
@@ -838,8 +844,8 @@ const s7_session = [_]Step{
             0x00, 0x00, 0x04, 0x01, 0x20, 0x00, 0x00, 0xF1, 0x57, 0x00,
             0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
             0xF0, 0x00, 0x00, 0x00, 0xD7, 0x00, 0x01, 0x8B, 0x72, 0x00,
-            0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x01,
-            0xE0,
+            0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+            0xF0, // DB2.DBD32: the PDU length the client learned, 240
         },
         .response = &.{
             0x03, 0x00, 0x00, 0x16, 0x02, 0xF0, 0x80, 0x32, 0x03, 0x00,
@@ -879,7 +885,7 @@ test "anchor: replay a real python-snap7 3.1.0 client's recorded session offline
         .{ .area = .db, .db_number = 2, .bytes = &db2 },
         .{ .area = .db, .db_number = 3, .bytes = &db3 },
     };
-    var plc = adapters.S7comm.init(.{}, &areas);
+    var plc = adapters.S7comm.init(.{ .max_pdu_length = s7_device_pdu_ceiling }, &areas);
     try replay(plc.node(), &s7_session, "python-snap7");
 
     const slot = struct {
@@ -902,15 +908,14 @@ test "anchor: replay a real python-snap7 3.1.0 client's recorded session offline
     // pass either check alone.
     try testing.expectEqual(@as(u32, 0x0A), slot(&db2, 6));
     try testing.expectEqual(@as(u32, 0x05), slot(&db2, 7));
-    // ⚠ NOT a negotiation result, despite the name. The recorded request
-    // proposes pdu_length = 0x01E0 = 480 and the device's own ceiling is also
-    // 480, so `@min` is the identity and this is a verbatim echo of the
-    // master's own number — measured 2026-09-01: replacing the device's
-    // `@min(asked, ceiling)` with `asked` left the whole suite green. A
-    // responder with no PDU ceiling at all passes this mark. Making it grade
-    // something needs the live fixture re-recorded with the device's ceiling
-    // BELOW the master's proposal, which is a VM-lane change, not a literal.
-    try testing.expectEqual(@as(u32, 480), slot(&db2, 8)); // echo, see above
+    // The negotiated PDU length, as the CLIENT learned it. The recorded
+    // request proposes pdu_length = 0x01E0 = 480; the device's ceiling is
+    // 240, so only a responder that really takes `@min(asked, ceiling)`
+    // answers 0x00F0 and gets this mark back. Until 2026-09-15 the ceiling
+    // was also 480, `@min` was the identity, and this literal was a verbatim
+    // echo of the master's own number (audit F-C: replacing `@min` with
+    // `asked` left the whole suite green). Re-recorded in the VM lane.
+    try testing.expectEqual(@as(u32, s7_device_pdu_ceiling), slot(&db2, 8));
     try testing.expectEqual(@as(u32, 1), slot(&db2, 9)); // the pass mark
 }
 
