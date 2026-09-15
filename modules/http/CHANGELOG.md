@@ -5,6 +5,28 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — A1 fix campaign, F14 (h2 per-request arena), internal change, no API
+  or wire change. `h2_server.serveJob` built a fresh `ArenaAllocator` on every request
+  and freed it at the end: 7 allocations per request against h1's zero. A finished
+  request now hands its arena back, reset, to its own connection
+  (`Session.spare_arenas`, at most 8, each trimmed to 32 KiB) and the next request takes
+  it. ⛔ Deliberately NOT one arena per connection: with `Options.dispatcher` up to eight
+  requests of one connection run on different threads, and a reset by the first to
+  finish frees the others' memory. An arena is owned by exactly one `serveJob` from
+  checkout to check-in (its last `defer`, where it used to be freed), so error, cancel
+  and detach paths return it the same way. Measured (ReleaseFast, 20 000 GETs, 9
+  interleaved A/B reps): 7.00 → 4.00 allocations per request; behind
+  `DebugAllocator(.{})` 56 101 → 3 401 ns/req median (16.5×, per-rep ratio ≥ 15.7);
+  behind `smp_allocator` within noise (median 1.01–1.08, per-rep minimum 0.87–1.01,
+  h1 control 0.65–1.32). Cost: an idle connection keeps ~22 KiB per spare (one arena
+  of a small request measured 22 860 B). New tests: allocation count (RED when spares
+  are never kept), retention bounds (RED on `.retain_capacity`), and a content-checked
+  4 connections × 240 streams × dispatcher run with error and RST paths, 25 rounds
+  green in Debug, ReleaseSafe and ReleaseFast; RED on "one shared arena, reset after
+  each request" (double free + SEGV), "arena returned before the response ends"
+  (SEGV in `Framer.push`) and "pool without the lock" (SEGV in `Session.deinit`).
+  Bench: `HTTP_BENCH_F14=1 scripts/modtest http -Doptimize=ReleaseFast -Dtest-filter=F14`.
+
 - **2026-09-12** — A1 fix campaign round 2, fixer slot `c`, `netaddr` F8 (Q2-B):
   `netaddr.parseHostPort`'s port field now rejects a leading zero
   (`host:0080` -> null, was port 80), closing an asymmetry with the octet and
