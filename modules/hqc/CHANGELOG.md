@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE, every KEM operation roughly twice as fast:** the
+  CLMUL ring multiply in `gf2x.zig` (A1 M4). The Karatsuba base-case leaf carries each partial
+  product's high limb into the next word, one store per limb per row. It used to `@memset` its
+  output and then XOR-store two limbs per product. The recursion is now specialised on the
+  comptime limb count. Same partial products in the same order, bit-identical: a new limb-level
+  differential runs against a bit-at-a-time reference at every length 1..33 and at the three ring
+  sizes, with the output pre-filled with junk. Measured in one binary, 9 interleaved rounds,
+  ReleaseFast: hqc-128 keypair/encaps/decaps −52/−55/−49 %, hqc-192 −55/−59/−57 %, hqc-256
+  −60/−60/−58 %. Timed and NOT taken: other `karatsuba_base` values (−1 to −5 %, inside the
+  noise) and an xmm-accumulated leaf (−33 to −49 % on its own, but 2-4 % slower than the carry
+  leaf once the zeroing is gone). Control flow still depends only on public, comptime lengths.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** new opt-in profiling workload in `bench.zig`
   (`HQC_PROFILE=1`, skipped otherwise), for A1 M4. keypair, encaps and decaps each loop 4000 times
   inside their own `noinline` wrapper, so a sampling profile can attribute time per operation
