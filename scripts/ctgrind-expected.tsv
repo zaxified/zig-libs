@@ -584,10 +584,10 @@ aescbc	ReleaseFast	xmlenc	1	1	e007b2ab5512efa3	c4046968725e140d
 # pin is the whole gate, which is why the guard-stripping fix that gave bolt3
 # its pin back matters here too -- a row with NO-OWN-SRC and an unchanged count
 # would have let the barrier be deleted in silence.
-sealedbox	ReleaseFast	hexenc	1	0	f850e17e794046fc	677e9993da327f0d
-sealedbox	ReleaseFast	hexdec	1	1	f850e17e794046fc	1c8749621d19a09b
-sealedbox	ReleaseFast	b64enc	1	0	f850e17e794046fc	ec1bc04ea2ea3ff7
-sealedbox	ReleaseFast	b64dec	1	1	f850e17e794046fc	1c8749621d19a09b
+sealedbox	ReleaseFast	hexenc	1	0	9b2bc6d6cbb1256f	677e9993da327f0d
+sealedbox	ReleaseFast	hexdec	1	1	9b2bc6d6cbb1256f	1c8749621d19a09b
+sealedbox	ReleaseFast	b64enc	1	0	9b2bc6d6cbb1256f	ec1bc04ea2ea3ff7
+sealedbox	ReleaseFast	b64dec	1	1	9b2bc6d6cbb1256f	1c8749621d19a09b
 # ── pir: the query index, and the client's check ───────────────────────────
 # A1 `pir.md` M2 -- the module's central claim had never been machine-checked,
 # and its sibling `fss` exposed a REAL defect the day it entered the gate.
