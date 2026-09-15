@@ -55,6 +55,13 @@ fi
 shift
 
 PLATFORM=""
+# --kernel-append TOKEN: extra kernel command-line text for this boot (debian
+# only). boot-debian.exp edits grub.cfg inside the -snapshot overlay and reboots
+# once; the guest then has to prove the token is in /proc/cmdline
+# (KERNEL_APPEND_OK below). One token without whitespace, so it stays quote-free
+# on its way through expect and the guest shell. First user: sandbox's
+# `lsm=apparmor` run, which boots the same kernel with Landlock left out.
+KERNEL_APPEND=""
 # Repeatable: `zig test --test-filter` is documented as "skip tests that do not
 # match ANY filter", so several of them are a union, not an intersection. That
 # is what lets one guest boot drive several protocols' live tests in sequence.
@@ -63,9 +70,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         openwrt|debian) PLATFORM="$1"; shift ;;
         --test-filter) TEST_FILTERS+=("$2"); shift 2 ;;
+        --kernel-append) KERNEL_APPEND="$2"; shift 2 ;;
         *) echo "run.sh: unrecognized argument '$1'" >&2; exit 1 ;;
     esac
 done
+if [[ -n "$KERNEL_APPEND" && ! "$KERNEL_APPEND" =~ ^[A-Za-z0-9_.,=:/-]+$ ]]; then
+    echo "run.sh: --kernel-append takes one token of [A-Za-z0-9_.,=:/-], got '$KERNEL_APPEND'" >&2
+    exit 1
+fi
 
 # ── routing table ────────────────────────────────────────────────────────
 # Verified empirically (2026-07-28), not assumed:
@@ -106,6 +118,9 @@ route_platform() {
         # cgroup link) skip on any normal host. Debian only — OpenWRT's
         # kernel has no BPF tooling.
         ebpf) echo debian ;;
+        # xdp-classifier: execution-verified 2026-09-15, 59/59 with zero
+        # skips, on the CPU topology guest_smp gives it (see there).
+        xdp-classifier) echo debian ;;
         *) echo debian ;;
     esac
 }
@@ -197,6 +212,28 @@ guest_setup() {
                 setup+="nohup $(fleetsim_master_run "$m") 127.0.0.1 $(fleetsim_master_port "$m") $FLEETSIM_MASTER_WAIT > /tmp/fm-$m.log 2>&1 & "
             done
             printf '%s' "$setup"
+            ;;
+        xdp-classifier)
+            # Its F1 anchor only discriminates when possible != online CPUs
+            # (see guest_smp). Refuse to call the setup good without that gap:
+            # a guest that lost `maxcpus` would leave an online-sized buffer
+            # model passing, silently.
+            printf '%s' \
+                'test $(cat /sys/devices/system/cpu/possible) != $(cat /sys/devices/system/cpu/online) && ' \
+                'echo CPUS possible=$(cat /sys/devices/system/cpu/possible) online=$(cat /sys/devices/system/cpu/online) && ' \
+                'echo SETUP_OK || echo SETUP_FAIL; '
+            ;;
+        sandbox)
+            # Root is the point here (its privilege-drop and bounding-set tests
+            # skip everywhere else). The one environment switch: when the active
+            # LSM list lacks landlock — a `--kernel-append lsm=...` boot — tell
+            # the suite, so its S18 test asserts error.Disabled against the real
+            # kernel instead of skipping. Unreadable list = SETUP_FAIL, never a
+            # guess.
+            printf '%s' \
+                'test -r /sys/kernel/security/lsm && echo LSM=$(cat /sys/kernel/security/lsm) && ' \
+                '{ grep -qw landlock /sys/kernel/security/lsm || export SANDBOX_EXPECT_LANDLOCK=disabled; } && ' \
+                'echo SANDBOX_EXPECT_LANDLOCK=$SANDBOX_EXPECT_LANDLOCK && echo SETUP_OK || echo SETUP_FAIL; '
             ;;
         *) printf '' ;;
     esac
@@ -322,6 +359,27 @@ guest_after() {
             done
             printf '%s' "$after"
             ;;
+        hqc)
+            # The profile: one record per KEM operation (keypair is the main
+            # run, see guest_run_prefix), then a symbol report for each and a
+            # source-line report for decaps.
+            #  * `perf --no-pager` and stdin from /dev/null: on the serial tty
+            #    `perf report --stdio` otherwise starts `less`, which swallowed
+            #    the rest of the batch AND the poweroff (first run, 737 s).
+            #  * the srcline pass resolves DWARF per sample and is bounded.
+            #  * PCLMUL_INSNS_IN_BINARY > 0: the CLMUL path was built, not the
+            #    portable one (a baseline -mcpu build has none).
+            #  * `evlist`: vPMU `cycles` vs perf's cpu-clock fallback.
+            #  * the final marker is split (DO""NE) so the tty's echo of this
+            #    very command line cannot satisfy guest_require.
+            printf '%s' \
+                'echo PCLMUL_INSNS_IN_BINARY=$(objdump -d /tmp/runme | grep -ci pclmul); ' \
+                'for op in encaps decaps; do HQC_PROFILE=$op perf record -F 999 -o /tmp/p-$op.data -- /tmp/runme; done; ' \
+                'echo ===PERF_EVLIST===; perf --no-pager evlist -i /tmp/p-decaps.data </dev/null; ' \
+                'for op in keypair encaps decaps; do echo ===PERF_SYM_$op===; perf --no-pager report -i /tmp/p-$op.data --stdio --no-children --sort sym --percent-limit 0.5 </dev/null; done; ' \
+                'echo ===PERF_SRCLINE_decaps===; timeout 180 perf --no-pager report -i /tmp/p-decaps.data --stdio --no-children --sort srcline --percent-limit 1 </dev/null; echo SRCLINE_RC=$?; ' \
+                'echo PERF_REPORT_DO""NE; '
+            ;;
         *) printf '' ;;
     esac
 }
@@ -363,6 +421,7 @@ guest_require() {
                 fleetsim_master_marker "$m"
             done
             ;;
+        hqc) echo PERF_REPORT_DONE ;;
         *) printf '' ;;
     esac
 }
@@ -372,7 +431,65 @@ guest_require() {
 guest_mem() {
     case "$1" in
         fleetsim) echo 1536 ;;
+        # perf report resolving source lines through DWARF is the big user.
+        hqc) echo 1536 ;;
         *) echo 512 ;;
+    esac
+}
+
+# QEMU `-smp` value (boot-debian.exp's sixth argument). One vCPU unless a
+# module's anchor depends on the CPU topology itself.
+#
+#   xdp-classifier -> 2,maxcpus=4: two CPUs online, four POSSIBLE. A per-CPU
+#                     BPF map transfers round_up(value_size,8) x possible CPUs,
+#                     and a caller sizing from online CPUs under-allocates by
+#                     exactly that difference (audit F1). On a guest where the
+#                     two counts agree, that mistake is invisible.
+guest_smp() {
+    case "$1" in
+        xdp-classifier) echo 2,maxcpus=4 ;;
+        *) echo 1 ;;
+    esac
+}
+
+# Build mode of the guest binary. Debug, as `zig test` itself defaults to,
+# unless the module's lane exists to measure optimised code.
+#
+#   hqc -> ReleaseFast. Its lane is a sampling profile (audit M4), and a Debug
+#          profile ranks safety checks, not the ring multiply.
+guest_optimize() {
+    case "$1" in
+        hqc) echo ReleaseFast ;;
+        *) echo Debug ;;
+    esac
+}
+
+# `-mcpu` for the cross-compile; empty = the target triple's baseline CPU.
+#
+#   hqc -> native. Its fast multiply is comptime-gated on `pclmul`, which the
+#          x86_64 baseline lacks, so a baseline build would profile the portable
+#          schoolbook path instead. The guest runs `-cpu host`, so "native" is
+#          the CPU the binary actually executes on.
+guest_mcpu() {
+    case "$1" in
+        hqc) echo native ;;
+        *) printf '' ;;
+    esac
+}
+
+# Prepended to the test binary's command line in the guest. Quote-free, like
+# guest_setup.
+#
+#   hqc -> the opt-in profile workload for keypair, under `perf record`
+#          (encaps and decaps get their own records in guest_after). The exit
+#          code still reaches GUEST_EXIT: perf returns its child's. -F 999, not
+#          more: every sample is a VM exit through the vPMU, and at 2999 Hz the
+#          guest kernel throttled itself ten times ("perf: interrupt took too
+#          long") and the workload ran ~8x slower than on the host.
+guest_run_prefix() {
+    case "$1" in
+        hqc) printf '%s' 'HQC_PROFILE=keypair perf record -F 999 -o /tmp/p-keypair.data -- ' ;;
+        *) printf '' ;;
     esac
 }
 
@@ -386,6 +503,8 @@ guest_cmd_timeout() {
         # compile of the DNP3 driver, plus the rest of the filtered suite.
         # 1200 leaves headroom over the ~450 s that costs.
         fleetsim) echo 1200 ;;
+        # ~4 s of workload, then perf resolving every sample's source line.
+        hqc) echo 600 ;;
         *) echo 90 ;;
     esac
 }
@@ -407,6 +526,8 @@ guest_default_filter() {
                 fleetsim_master_filter "$m"
             done
             ;;
+        # hqc's lane is the M4 profile, not the suite: the rest runs on the host.
+        hqc) echo 'profile workload for perf' ;;
         *) printf '' ;;
     esac
 }
@@ -424,6 +545,10 @@ case "$PLATFORM" in
     debian) TARGET_TRIPLE="x86_64-linux-gnu" ;;
     *) echo "run.sh: unknown platform '$PLATFORM' (openwrt|debian)" >&2; exit 1 ;;
 esac
+if [[ -n "$KERNEL_APPEND" && "$PLATFORM" != debian ]]; then
+    echo "run.sh: --kernel-append is implemented for debian only (boot-debian.exp)" >&2
+    exit 1
+fi
 
 IMAGES_DIR="$SCRIPT_DIR/images"
 WORK_DIR="$SCRIPT_DIR/work"
@@ -529,6 +654,15 @@ echo "vm: dependency closure: ${CLOSURE[*]}"
 # the FIRST `-M` must be the module under test — that's what "the main
 # module" means to `zig test`). Verified on a 2-level chain (wireguard ->
 # genetlink -> netlink) before relying on it here.
+# `-O` and `-mcpu` are PER-MODULE options: each binds to the `-M` that follows
+# it. Appended after the modules, `-O ReleaseFast` bound to nothing and the
+# guest ran a 15 MB Debug binary (2026-09-15, caught by its safety-panic
+# strings and a 7x slower workload). So they are repeated in front of EVERY
+# `-M`, dependencies included.
+MODE_ARGS=(-O "$(guest_optimize "$MODULE")")
+_mcpu="$(guest_mcpu "$MODULE")"
+[[ -n "$_mcpu" ]] && MODE_ARGS+=(-mcpu "$_mcpu")
+
 ZIG_ARGS=()
 for m in "${CLOSURE[@]}"; do
     d="$(deps_of "$m")"
@@ -536,7 +670,7 @@ for m in "${CLOSURE[@]}"; do
         [[ -z "$dep" ]] && continue
         ZIG_ARGS+=(--dep "$dep")
     done
-    ZIG_ARGS+=("-M${m}=modules/${m}/src/root.zig")
+    ZIG_ARGS+=("${MODE_ARGS[@]}" "-M${m}=modules/${m}/src/root.zig")
 done
 
 BIN="$WORK_DIR/${MODULE}-${PLATFORM}-test"
@@ -615,8 +749,10 @@ case "$PLATFORM" in
         ;;
     debian)
         HASH='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'  # throwaway VM-only password "zigvm" — ephemeral -snapshot guest, no host port exposed
-        RUNCMD="${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
-        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" >"$VMLOG" 2>&1
+        KCHECK=""
+        [[ -n "$KERNEL_APPEND" ]] && KCHECK="grep -qwF -- $KERNEL_APPEND /proc/cmdline && echo KERNEL_APPEND_OK || echo KERNEL_APPEND_FAIL; "
+        RUNCMD="${KCHECK}${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; $(guest_run_prefix "$MODULE")/tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
+        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" "$(guest_smp "$MODULE")" "$KERNEL_APPEND" >"$VMLOG" 2>&1
         ;;
 esac
 t1=$(date +%s)
@@ -637,6 +773,13 @@ echo "vm: wall time $((t1 - t0))s (full log: $VMLOG)"
 # pipeline and no early-exit hazard.
 if ! grep -q "FETCH_OK\|TFTP_OK\|WGET_OK" <<< "$GUEST_OUT"; then
     echo "run.sh: FAIL — binary transfer into the guest never succeeded" >&2
+    exit 1
+fi
+
+# A requested kernel command line that did not reach the kernel would run the
+# suite on the ordinary boot, where the tests that need it skip.
+if [[ -n "$KERNEL_APPEND" ]] && ! grep -q "KERNEL_APPEND_OK" <<< "$GUEST_OUT"; then
+    echo "run.sh: FAIL — '$KERNEL_APPEND' is not in the guest's /proc/cmdline" >&2
     exit 1
 fi
 

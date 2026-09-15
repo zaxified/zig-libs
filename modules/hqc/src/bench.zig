@@ -100,3 +100,64 @@ test "bench (opt-in via HQC_BENCH)" {
         \\
     , .{ reps, kg, en, de });
 }
+
+// Workload for a sampling profile (audit M4). Off by default; opt in with
+// `HQC_PROFILE`. `scripts/vm/run.sh hqc` builds it ReleaseFast for the host
+// CPU and runs it under `perf record` as root in a disposable guest, because
+// the dev host's `perf_event_paranoid=4` refuses perf to users.
+//
+// Each operation loops inside its own `noinline` wrapper. ReleaseFast inlines
+// everything beneath them, so without the wrappers a flat profile could not
+// tell keypair from encaps from decaps; `perf report --sort sym,srcline` then
+// splits each wrapper by source line. Iteration counts are sized for a few
+// thousand samples per operation at a few kHz, not for timing — use the
+// `HQC_BENCH` test above for numbers to compare.
+//
+// `HQC_PROFILE=keypair|encaps|decaps` runs that one operation, so each gets a
+// `perf record` of its own and nothing needs a call graph to split them; any
+// other value runs all three.
+test "profile workload for perf (opt-in via HQC_PROFILE)" {
+    if (@import("builtin").target.os.tag == .windows) return error.SkipZigTest;
+    const sel = std.testing.environ.getPosix("HQC_PROFILE") orelse return error.SkipZigTest;
+    const only = for ([_][]const u8{ "keypair", "encaps", "decaps" }) |name| {
+        if (std.mem.eql(u8, sel, name)) break name;
+    } else null;
+
+    const Kem = root.Hqc128;
+    const P = struct {
+        var ek: Kem.EncapsKey = undefined;
+        var dk: Kem.DecapsKey = undefined;
+        var ct: Kem.Ciphertext = undefined;
+        var sd: [32]u8 = [_]u8{0x5a} ** 32;
+        var cn: [Kem.coins_bytes]u8 = [_]u8{0xa5} ** Kem.coins_bytes;
+
+        noinline fn profKeypair(n: usize) void {
+            for (0..n) |_| std.mem.doNotOptimizeAway(Kem.keypair(&sd).ek[0]);
+        }
+        noinline fn profEncaps(n: usize) void {
+            for (0..n) |_| std.mem.doNotOptimizeAway(Kem.encaps(ek, &cn).ct[0]);
+        }
+        noinline fn profDecaps(n: usize) void {
+            for (0..n) |_| std.mem.doNotOptimizeAway(Kem.decaps(dk, ct)[0]);
+        }
+    };
+    const kp = Kem.keypair(&P.sd);
+    P.ek = kp.ek;
+    P.dk = kp.dk;
+    P.ct = Kem.encaps(kp.ek, &P.cn).ct;
+
+    const n = 4000;
+    const ops = [_]struct { name: []const u8, run: *const fn (usize) void }{
+        .{ .name = "keypair", .run = P.profKeypair },
+        .{ .name = "encaps", .run = P.profEncaps },
+        .{ .name = "decaps", .run = P.profDecaps },
+    };
+    for (ops) |op| {
+        if (only) |o| if (!std.mem.eql(u8, o, op.name)) continue;
+        const t0 = nowNs();
+        op.run(n);
+        // Under `perf record` this includes the sampling overhead, which in a
+        // KVM guest is large; it is a sanity check, not a benchmark.
+        std.debug.print("\nhqc-128 profile workload: {s} x{d}, {d} ns/op\n", .{ op.name, n, (nowNs() - t0) / n });
+    }
+}

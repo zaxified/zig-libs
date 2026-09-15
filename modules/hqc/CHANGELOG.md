@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** new opt-in profiling workload in `bench.zig`
+  (`HQC_PROFILE=1`, skipped otherwise), for A1 M4. keypair, encaps and decaps each loop 4000 times
+  inside their own `noinline` wrapper, so a sampling profile can attribute time per operation
+  even though ReleaseFast inlines everything beneath. It is driven by `scripts/vm/run.sh hqc`:
+  ReleaseFast, `-mcpu native` (so the `pclmul` path is the one profiled), under `perf record` as
+  root in the guest. Not in any ctgrind pattern.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** `gf2x.zig`'s internal `reduceProduct`
   (the mod-`(X^n-1)` fold at the end of every ring multiply) now folds the extended
   product a `u64` word at a time instead of one bit at a time (A1 M3). Bit-for-bit

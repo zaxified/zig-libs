@@ -110,6 +110,9 @@ real test binaries in them (not by reading docs):
 | `conntrack` | openwrt | execution-verified (28 tests) |
 | `ebpf` | debian | execution-verified, **137/137**. Six live attach tests (kprobe, uprobe, tracepoint, raw tracepoint, cgroup link) need `CAP_BPF` + `CAP_PERFMON` and skip on any normal host; OpenWRT's kernel has no BPF tooling at all, so this one is debian-only |
 | `fleetsim` | debian | execution-verified. **Not a privilege gap — a *counterpart* gap** (see below): **seven** real masters drive seven simulated devices in one boot — pymodbus 3.14.0 (Modbus), pycomm3 1.2.16 (EtherNet/IP), bacpypes3 0.0.106 (BACnet), python-snap7 3.1.0 (S7comm), asyncua 2.0.1 (OPC UA), c104 2.2.1 (IEC 60870-5-104), opendnp3 3.1.2 (DNP3, built from source) — each grading what it decoded and commanding its marks back into the device. ~5m20s (the live tests run one after another, each holding its socket for a 60 s budget) |
+| `xdp-classifier` | debian | execution-verified 2026-09-15, **59/59, zero skips** (Debian 6.12.96). Boots as `-smp 2,maxcpus=4` (`guest_smp` in `run.sh`) because its per-CPU map anchor only discriminates when possible CPUs (0-3) outnumber online ones (0-1); `guest_setup` refuses SETUP_OK without that gap. Measured: the pre-fix 4-byte scratch buffer segfaults the suite (GUEST_EXIT=134), and sizing from online CPUs fails the anchor with `expected 16, found 32` |
+| `sandbox` | debian | execution-verified 2026-09-15, **35/36, one skip** (the test below that needs the second boot). The privilege-drop and bounding-set tests need root and skip everywhere else. `scripts/vm/run.sh sandbox debian --kernel-append lsm=apparmor` boots the same kernel with Landlock left out of the LSM list (`boot-debian.exp` edits grub.cfg inside the snapshot overlay and reboots once, and the guest must show the token in `/proc/cmdline`): 29 pass, 7 skip, and the no-injection `error.Disabled` test runs |
+| `hqc` | debian | execution-verified 2026-09-15. **A profile lane, not the suite:** builds only the opt-in `HQC_PROFILE` workload, ReleaseFast with `-mcpu native` (`guest_optimize`/`guest_mcpu`), runs it under `perf record -F 999` once per KEM operation, and prints per-symbol reports plus a decaps source-line report. The rest of the suite runs on the host. Needs the recipe with `linux-perf`. Two traps found on the way: `perf report` on the serial tty opens a pager that swallows the batch (hence `--no-pager </dev/null`), and `-O` placed after the `-M` flags silently built Debug (hence `-O`/`-mcpu` before every `-M`). Wall time 27 s |
 | everything else | debian (default) | most NETNS_MODULES don't need this lane at all — `unshare -rn` already covers them (see `scripts/test.sh`'s own `NETNS_MODULES` comment); route here only for isolation, not privilege |
 
 Override with `scripts/vm/run.sh <module> openwrt|debian` when the default
@@ -232,6 +235,7 @@ cls_u32 cls_flower sch_fq_codel ifb veth`.
 |---|---|---|
 | `iproute2`, `ethtool` | yes | declares the guarantee explicitly rather than assuming it (apt makes it a no-op) |
 | `kmod`, `bpftool` | **no** (verified: absent on stock) | future eBPF/module-probing test needs |
+| `linux-perf` | **no** | `scripts/vm/run.sh hqc` profiles the ReleaseFast KEM under `perf record` as root in the guest; the dev host's `perf_event_paranoid=4` refuses perf to users. Measurement-time only |
 | `python3`, `python3-pip` | pip: **no** | the interpreter and installer for `VM_DEBIAN_PIP`; every SCADA master `fleetsim`'s live lane needs is a pip-only library |
 
 ### Debian pip list (`VM_DEBIAN_PIP`)
@@ -351,6 +355,24 @@ command line instead of read from it, so no module needs any VM-specific
 plumbing. If the module isn't in `route_platform`'s table it defaults to
 Debian; add a row there once you know which platform actually serves it
 (and whether that's execution-verified or a guess — say which).
+
+When a module's anchor needs more than "the suite, as root", `run.sh` has
+per-module tables beside the routing table. Every one of them defaults to
+today's behaviour, and each exists because a measurement needed it:
+
+| Table | Default | Why it exists (first user) |
+|---|---|---|
+| `guest_smp` | `1` | `xdp-classifier`: `2,maxcpus=4`, because a per-CPU map bug only shows when possible CPUs outnumber online ones |
+| `guest_optimize` | `Debug` | `hqc`: `ReleaseFast`, because a Debug profile ranks safety checks |
+| `guest_mcpu` | baseline | `hqc`: `native`, because its fast multiply is comptime-gated on `pclmul`, which the x86_64 baseline lacks |
+| `guest_run_prefix` | empty | `hqc`: `perf record` around the binary |
+| `guest_setup` / `guest_after` / `guest_require` | empty | `fleetsim` counterparts, `sandbox`'s LSM probe, `hqc`'s perf report |
+
+`--kernel-append TOKEN` (debian only) is a per-RUN switch, not a table:
+`boot-debian.exp` appends the token to grub.cfg inside the `-snapshot` overlay
+and reboots once in the same qemu process, and the guest must show the token
+in `/proc/cmdline` or the run fails. First user: `sandbox`,
+`--kernel-append lsm=apparmor`, which boots the same kernel without Landlock.
 
 ## How a run works
 

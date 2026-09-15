@@ -412,6 +412,15 @@ one of the seven.
   (0x04 = STOP)** at t=15 s. Our side:
   `live fleetsim S7comm: peers=1 frames_in=31 frames_out=30 delivered=31 replied=30 pdu=480 cpu_status=stop`
 
+  *Re-recorded 2026-09-15 (audit F-C).* With the device ceiling equal to the
+  client's proposal, `@min(asked, ceiling)` was the identity and the DB2.DBD32
+  mark echoed the client's own 480. The live device now caps at **240**. The
+  client still asks for 480 and learns 240:
+  `live fleetsim S7comm: peers=1 frames_in=11 frames_out=10 delivered=11 replied=10 connected=false pdu=240 cpu_status=stop`,
+  verdict `pdu=240 pass=1`. The frozen session in `src/master_goldens.zig`
+  differs from the old one in exactly those two places: the setup response and
+  the verdict write.
+
   *Oracle defect worth recording:* python-snap7 3.1.0's own `get_cpu_state()`
   does **not** issue an SZL read — `build_cpu_state_request` sends a one-byte
   parameter `0x04` with the source comment "Use READ_AREA function for

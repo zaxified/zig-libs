@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — A1 F-C. **No consumer-visible change** (tests and a golden only). The S7
+  negotiated-PDU mark was an echo: the device ceiling equalled python-snap7's own 480 proposal, so
+  `@min(asked, ceiling)` was the identity. The live S7 device and the offline replay now cap at
+  **240**. The live test asserts both the device's negotiated length and the client's DB2.DBD32 mark
+  against that constant, not against the device's own variable. The python-snap7 3.1.0 session was
+  re-recorded in `scripts/vm/run.sh fleetsim` (Debian 6.12.96, `FLEETSIM_MASTERS=s7`, 79 s). It
+  differs from the old golden in exactly two places: the setup response PDU (0x01E0 → 0x00F0) and
+  the verdict write's mark. Measured with `s7comm`'s `@min` replaced by `asked`:
+  - pre-fix tree: 94/102, green (the mutant survived);
+  - new tree: 93 pass / 1 fail (the golden replay);
+  - live: `expected 240, found 480`.
+  With the ceiling kept internally but the wire echoing the ask, the client itself reported
+  `pdu=480`, and the live test failed on that mark.
+
 - **2026-09-15** — A1 fix campaign, F-G item 2 (`vopr.zig`). **Additive, no
   behavioural change** for any existing caller: `Vopr.Options` gained
   `tick_probe_period_ms` (default 0, off) and a new `TickProbe` device type

@@ -1632,7 +1632,8 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
         .{ .area = .db, .db_number = 2, .bytes = &db2 },
         .{ .area = .db, .db_number = 3, .bytes = &db3 },
     };
-    var plc = S7Node.init(.{}, &areas);
+    // PDU ceiling BELOW python-snap7's own proposal — see `s7_verdict`.
+    var plc = S7Node.init(.{ .max_pdu_length = s7_verdict.device_pdu_ceiling }, &areas);
     const id = try f.addNode(.{ .node = plc.node(), .tag = 3 });
 
     // A sine drives DB1.DBD8 as a big-endian REAL, so a client watching that
@@ -1672,7 +1673,11 @@ test "live: a real S7 client drives a simulated CPU, and sees it go to STOP" {
     try testing.expect(st.replied > 0);
     try testing.expectEqual(s7comm.CpuStatus.stop, plc.responder.config.cpu_status);
     // …and the part that grades what the client DECODED. See `s7_verdict`.
-    try s7_verdict.expectAllPassed(&db2, plc.responder.pdu_length);
+    // The device side of the negotiation, against the fixture — not against
+    // the device's own variable, which a responder without a ceiling would
+    // agree with just as happily.
+    try testing.expectEqual(s7_verdict.device_pdu_ceiling, plc.responder.pdu_length);
+    try s7_verdict.expectAllPassed(&db2);
 }
 
 /// The contract between `scripts/vm/guests/fleetsim-s7-master.py` and the live
@@ -1709,6 +1714,13 @@ const s7_verdict = struct {
     /// bound, `0x05 Invalid address` for a read that runs past one that is.
     const no_such_block: u32 = 0x0A;
     const invalid_address: u32 = 0x05;
+    /// The live device's PDU ceiling, deliberately BELOW the 480 python-snap7
+    /// proposes. With the two equal (as until 2026-09-15), `@min(asked,
+    /// ceiling)` was the identity, the client's DB2.DBD32 mark was a verbatim
+    /// echo of its own proposal, and a responder with no ceiling at all passed
+    /// (audit F-C, measured 2026-09-01). Below it, only a device that actually
+    /// negotiates reports 240.
+    const device_pdu_ceiling: u16 = 240;
 
     fn db1Sum() u32 {
         var s: u32 = 0;
@@ -1720,7 +1732,7 @@ const s7_verdict = struct {
         return std.mem.readInt(u32, db[i * 4 ..][0..4], .big);
     }
 
-    fn expectAllPassed(db2: []const u8, pdu_length: u16) !void {
+    fn expectAllPassed(db2: []const u8) !void {
         if (slot(db2, 0) != magic) {
             std.debug.print(
                 "live fleetsim S7comm: no verdict block (DB2.DBD0=0x{X:0>8}, want 0x{X:0>8}) —" ++
@@ -1750,8 +1762,9 @@ const s7_verdict = struct {
         try testing.expectEqual(invalid_address, slot(db2, 7));
         // The PDU length is the DEVICE's choice, learned by the client during
         // the S7 setup-communication negotiation — so this grades the
-        // negotiation, not a data read.
-        try testing.expectEqual(@as(u32, pdu_length), slot(db2, 8));
+        // negotiation, not a data read. Against the fixture's ceiling, which
+        // sits below the client's own proposal, so it cannot be an echo.
+        try testing.expectEqual(@as(u32, device_pdu_ceiling), slot(db2, 8));
         // Written last and written either way: 0 is a real client saying, over
         // the wire, that it was here and is not satisfied.
         try testing.expectEqual(@as(u32, 1), slot(db2, 9));

@@ -507,6 +507,46 @@ test "createScratchMap + readScratchClass round-trip (needs CAP_BPF/root)" {
     for (all) |slot| try testing.expectEqual(@as(u32, 42), slot);
 }
 
+// ⭐ The anchor the unprivileged test below cannot be: it checks the module's
+// transfer-length arithmetic against ITSELF, so a wrong model (online instead of
+// possible CPUs, a stride without the round-up) would agree with itself and pass.
+// This one hands the real kernel a canary-filled buffer far larger than any sane
+// transfer and counts how far the kernel actually wrote — the same measurement
+// that established F1 in the first place, now kept next to the code it checks.
+//
+// Discriminating only on a machine where possible != online CPUs.
+// `scripts/vm/run.sh xdp-classifier` boots its guest as `-smp 2,maxcpus=4`
+// (online 0-1, possible 0-3) and refuses to report SETUP_OK without that gap,
+// so an online-sized model writes 16 bytes against the kernel's 32 there.
+test "a scratch lookup moves exactly scratchTransferLen() bytes, measured against the kernel (needs CAP_BPF/root)" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const scratch_fd = createScratchMap() catch |e| switch (e) {
+        error.PermissionDenied => return error.SkipZigTest,
+        else => return e,
+    };
+    defer _ = linux.close(scratch_fd);
+
+    // Zero padding in every stride, so every byte the kernel moves differs
+    // from the canary — including the last slot's padding.
+    try writeScratchClassAll(testing.allocator, scratch_fd, 42);
+
+    const canary: u8 = 0xAA;
+    const raw = try testing.allocator.alloc(u8, 1 << 16);
+    defer testing.allocator.free(raw);
+    @memset(raw, canary);
+    try BPF.map_lookup_elem(scratch_fd, &scratch_key_bytes, raw);
+
+    var extent: usize = 0;
+    for (raw, 0..) |b, i| {
+        if (b != canary) extent = i + 1;
+    }
+
+    try testing.expectEqual(try scratchTransferLen(), extent);
+    // And the fixed stack buffer `readScratchClass` hands the kernel holds it.
+    try testing.expect(@as(usize, scratch_max_stack_cpus) * scratch_percpu_stride >= extent);
+}
+
 test "scratch transfer length is the kernel's per-CPU arithmetic, not the value size" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     // ⭐ Runs WITHOUT root, unlike every other test on this path -- which is the
