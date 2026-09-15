@@ -2157,7 +2157,7 @@ fn nowNsMonotonic() u64 {
 }
 
 fn timeParseLegacyMaps(count: usize) !u64 {
-    const pa = std.heap.page_allocator;
+    const pa = std.heap.page_allocator; // global-alloc-ok: timing probe (D5), not a leak check -- testing.allocator's per-call bookkeeping would itself dominate the measurement at small `count`
     var image = try buildSyntheticLegacyMapsImage(pa, count);
     defer image.deinit();
 
