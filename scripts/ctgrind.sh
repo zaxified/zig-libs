@@ -181,10 +181,12 @@ declare -A TARGETS=(
     [bip340]="sign"
     [blindrsa]="blind sign"
     # ⚠ COST: each threshold_ecdsa row runs the full t=n=2 GG20 protocol with
-    # two real 2048-bit Paillier keys -- ~5 s native, 2-9 MINUTES under
-    # memcheck. Six rows. It is by far the heaviest entry in this table; know
+    # two real 2048-bit Paillier keys -- ~5 s native, ~3 MINUTES under
+    # memcheck. Nine rows. It is by far the heaviest entry in this table; know
     # that before putting `--check` on a timer.
-    [threshold_ecdsa]="share nonce"
+    # `betaprime` added 2026-09-17 (A1 threshold_ecdsa R1): since F5, Bob's MtA
+    # blind β' is a 160-byte draw that `nonce` never tainted.
+    [threshold_ecdsa]="share nonce betaprime"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────
     [bulletproofs]="rangeproof ipa"
     [paillier]="crt noncrt mul addm"
@@ -495,6 +497,7 @@ declare -A PATTERN=(
     [bip32/seed]='bip39[.]zig'
     [bip32/mnemonic]='bip39[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
+    [threshold_ecdsa/betaprime]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
 declare -A LABEL=(
@@ -526,6 +529,7 @@ declare -A LABEL=(
     [blindrsa/sign]='blindrsa blindSign (sk)+rsa+std ff'
     [threshold_ecdsa/share]='thr_ecdsa share x_i+paillier'
     [threshold_ecdsa/nonce]='thr_ecdsa nonce k_i/gamma+paillier'
+    [threshold_ecdsa/betaprime]='thr_ecdsa MtA blind beta_prime (q^5)+paillier'
     [p256/comb]='p256 combMulBase'
     [p256/sign]='p256 sign+std ecdsa'
     [rsa/crt]='rsa CRT p/q+std ff'
