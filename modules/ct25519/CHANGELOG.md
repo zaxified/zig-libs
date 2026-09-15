@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — **New `mulMultiRistretto`: constant-time `Σ s_i·P_i` by
+- **2026-09-15** — **New `mulMultiRistretto`: constant-time `Σ s_i·P_i` by
   Straus's interleaving (audit `bulletproofs` B9).** Additive API. All terms
   share one chain of doublings; every term pays one `pcSelect` and one add per
   window whatever its scalar, so it stays constant-time where the bucket
@@ -19,7 +19,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   n = 64 47.3 → 34.6 ms (1.37×), n = 32 1.50×; untouched `verify` 1.00×/0.99×.
   Its only caller is `bulletproofs`' prover.
 
-- **2026-09-16** — **`mulBase`/`mulRistrettoBase` use a fixed-base comb:
+- **2026-09-15** — **`mulBase`/`mulRistrettoBase` use a fixed-base comb:
   2.62× / 2.56× faster, same results (audit C3, C4, C9).** The base point ran
   the same 16-entry window ladder as any point, 252 doublings per multiply.
   It now runs the signed-radix-16 comb of Bernstein et al. 2012 §4 (ref10's

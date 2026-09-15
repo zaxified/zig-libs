@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — A1 fix campaign, F4 (performance, concurrency):
+- **2026-09-15** — A1 fix campaign, F4 (performance, concurrency):
   `AccessLog.log` with `synchronized = true` no longer holds its spinlock
   across `writer.flush()`. Every other request thread used to spin for the
   whole write syscall: into a plain file, 25.4 µs of CPU per line at 8

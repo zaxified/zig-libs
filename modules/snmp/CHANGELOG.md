@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `UdpTransport` cancel test
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `UdpTransport` cancel test
   canceled after a fixed 200 ms sleep. On a loaded machine that could land in the send instead,
   and the test then passed by the send's `Canceled` arm. It now cancels once the request has
   arrived at the peer socket, so only the reply receive is left to cancel.

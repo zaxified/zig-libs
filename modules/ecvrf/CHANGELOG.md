@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — ctgrind harness only, no library code changed (A1 E15 and the
+- **2026-09-15** — ctgrind harness only, no library code changed (A1 E15 and the
   `prove` 3 → 5 re-pin question). `prove` now taints the secret key alone: it derives the key
   pair with `KeyPair.fromSecretKey`, declassifies the published `Y`, and proves with
   `KeyPair.prove`. In-file contexts 5 → **0** (total 9 → 2, both the hex witness); the five were

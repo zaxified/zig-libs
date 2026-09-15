@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-17** — **BEHAVIOURAL, not breaking:** `serveUdp`, `serveTcp` and `serveTcpMulti`
+- **2026-09-15** — **BEHAVIOURAL, not breaking:** `serveUdp`, `serveTcp` and `serveTcpMulti`
   return `error.Canceled` (already in `Error`) instead of `error.BindFailed` when a cancel lands
   in the bind/listen that opens the socket. Before, a caller that canceled a session on its way up
   was told the port was unavailable. Found by full-gate attempt 5: the `serveUdp` cancel test failed

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** SPEC.md's
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** SPEC.md's
   threat-model notes now document audit finding M3's remaining dead-stack
   residue (`prk`, intermittently `hmacKey`) as a confirmed `std.crypto`
   limitation, not an open leak in this module or measurement noise —

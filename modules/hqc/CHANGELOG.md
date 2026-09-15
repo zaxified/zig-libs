@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE, every KEM operation roughly twice as fast:** the
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE, every KEM operation roughly twice as fast:** the
   CLMUL ring multiply in `gf2x.zig` (A1 M4). The Karatsuba base-case leaf carries each partial
   product's high limb into the next word, one store per limb per row. It used to `@memset` its
   output and then XOR-store two limbs per product. The recursion is now specialised on the

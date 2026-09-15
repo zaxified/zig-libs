@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (prover performance):** audit
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (prover performance):** audit
   finding B9. The prover's constant-time MSMs (`A`, `S`, every IPA `L`/`R`)
   ran one full ladder per term; `multiScalarMul` now calls
   `ct25519.mulMultiRistretto`, Straus's interleaved window with the doublings

@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `create` and `EventIterator.next` body-read cancel tests canceled after a fixed
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `create` and `EventIterator.next` body-read cancel tests canceled after a fixed
   sleep. Both now cancel once the client is inside the socket read under test (`ReadCueIo`, a
   `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
   before `join`. On a loaded full gate the sleep could land the cancel before the connect. The

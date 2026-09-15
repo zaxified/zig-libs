@@ -15,7 +15,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   new tests put the cancel inside each call deterministically through an `Io` double that
   parks one file operation; each site reverted on its own turns its case red.
 
-- **2026-09-17** — A1 fix campaign, full-gate timeout disposition. Behavioural fix, no API
+- **2026-09-15** — A1 fix campaign, full-gate timeout disposition. Behavioural fix, no API
   change: `putFile`/`putFilePlain` reported a cancelation that landed in the upload's
   LOCAL file read (the upload alternates file reads with socket writes) as
   `error.ReadFailed`, i.e. as a file-system failure; the real error was parked on the
@@ -29,7 +29,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `request: a canceled request-head write …`. Peers are now released with a throwaway
   connection, and the head-write tests cancel on a received byte instead of a sleep.
 
-- **2026-09-16** — A1 fix campaign, F14 (h2 per-request arena), internal change, no API
+- **2026-09-15** — A1 fix campaign, F14 (h2 per-request arena), internal change, no API
   or wire change. `h2_server.serveJob` built a fresh `ArenaAllocator` on every request
   and freed it at the end: 7 allocations per request against h1's zero. A finished
   request now hands its arena back, reset, to its own connection

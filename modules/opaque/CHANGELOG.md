@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M5); no library code
+- **2026-09-15** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M5); no library code
   changed. Targets `register` (client: password, blind), `login` (client: password, blind,
   keyshare seed) and `serverke2` (server: private key, `oprf_seed`, keyshare seed,
   `masking_key`), one party's secrets each, over the RFC 9807 C.1.1 vector. In-file 4 / 11 / 2;

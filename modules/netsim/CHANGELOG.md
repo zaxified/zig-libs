@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** the audit F10 regression
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** the audit F10 regression
   test now counts log entries actually stored instead of timing `replay`
   (a wall-clock `<=` guard that turned out not to reliably catch the audited
   defect at all -- see the fix commit). Adds two test-only functions,

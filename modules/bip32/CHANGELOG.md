@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** A1 finding M6-CT. `bip39.zig`'s `wordIndex`
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 finding M6-CT. `bip39.zig`'s `wordIndex`
   (BIP-39 wordlist lookup) was a binary search that branched and indexed
   `wordlist.english[mid]` directly on the secret mnemonic word at every step — a cache/
   branch-timing channel over which word was typed (the `mnemonic` ctgrind row's 2
@@ -25,7 +25,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `mnemonicToEntropy` ~1.37 µs → ~226.6 µs (~165×), 24-word ~2.48 µs → ~450.3 µs (~182×); this is
   the price of constant time, not a regression.
 
-- **2026-09-16** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M6); no library code
+- **2026-09-15** — First ctgrind harness, `src/ctgrind_harness.zig` (A1 M6); no library code
   changed. Targets `master` (seed), `derive` (master scalar along `m/44'/0'/0'/0/0`), `seed`
   (mnemonic → PBKDF2) and `mnemonic` (mnemonic → entropy). In-file 1 / 5 / 0 / 3: the first two
   are verdict branches of BIP-32's validity checks and `k256`'s documented `rejectIdentity`/

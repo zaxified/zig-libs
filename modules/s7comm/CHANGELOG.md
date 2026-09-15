@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The F2 test ("a peer that sends
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The F2 test ("a peer that sends
   the header and then goes silent") slept a fixed 2000 ms and then canceled. On a loaded machine
   a correct read could still be on its way back, a false red. The test now waits for the read to
   return on its own, with a 20 s watchdog.

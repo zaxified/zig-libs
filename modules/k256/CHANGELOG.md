@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-17** — **NO API CHANGE (secret hygiene), re-audit of F5:**
+- **2026-09-15** — **NO API CHANGE (secret hygiene), re-audit of F5:**
   `Secp256k1.mul` — the constant-time ECDH multiply (`sphinx`, `bolt8`,
   `bolt3`, `frost`) — left the u256 image of its SECRET scalar on the dead
   stack twice per call at ReleaseFast after the windowed rewrite (the ladder
@@ -20,7 +20,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   the spread. The ctgrind harness's
   `mul` target now multiplies a point decoded at run time instead of the
   comptime base point, which let LLVM fold the per-call table (A1 R2).
-- **2026-09-16** — **BEHAVIOURAL (a case no real nonce reaches):**
+- **2026-09-15** — **BEHAVIOURAL (a case no real nonce reaches):**
   `ecdsa_recover.sign` now derives `r = x(R) mod n`, as ECDSA and std's signer
   do. It used `Scalar.fromBytes(x(R))`, which rejects `x ≥ n`, so a nonce with
   `R.x` in `[n, p)` (probability ~2^-128) returned `error.InvalidNonce`
@@ -31,7 +31,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   public values and verified by std's ECDSA verifier (both parities, plus the
   `r + n ≥ p` refusal), and `sign` through a comptime commitment parameter of
   its inner function that the test uses to inject such an `R`.
-- **2026-09-16** — **PERFORMANCE, same results; API addition:** `Secp256k1.mul`
+- **2026-09-15** — **PERFORMANCE, same results; API addition:** `Secp256k1.mul`
   (constant-time, secret scalar, arbitrary point — the ECDH path of `sphinx`,
   `bolt8`, `bolt3`, `frost`) is now a 65-window signed-digit multiply over a
   per-call table of `(1..8)·P` instead of a 256-bit ladder (A1 F5, under
@@ -44,7 +44,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   control uses). `combMulBaseWithTable`'s recoding and masked gather moved into
   the shared `signedDigit`/`gatherSigned` helpers; its ctgrind row is
   unchanged at 7/1.
-- **2026-09-16** — **NO API CHANGE, secret hygiene:** `ecdsa_recover.sign` now
+- **2026-09-15** — **NO API CHANGE, secret hygiene:** `ecdsa_recover.sign` now
   zeroes 16 KiB of the stack its signing computation used before it returns
   (A1 G2, MED). Measured with the new `src/stackprobe_test.zig` (ReleaseFast):
   the RFC 6979 nonce survived on the dead stack six times per signature — `k`

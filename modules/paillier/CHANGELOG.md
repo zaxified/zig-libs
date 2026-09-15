@@ -5,7 +5,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
-- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** comment in `decrypt` corrected
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** comment in `decrypt` corrected
   (threshold_ecdsa F5). It said the key never reaches the `divFloor` in `L(x)`; the quotient is
   `m·λ mod n`, so it does. It also left open whether the `Zq`-masked MtA plaintext was exploitable;
   that plaintext leaked `b` outright and `threshold_ecdsa` now draws `β'` from `Z_N` / `Z_{q⁵}`.
