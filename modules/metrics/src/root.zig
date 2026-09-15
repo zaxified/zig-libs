@@ -49,10 +49,13 @@
 //! Registration (family/child lookup) and `Histogram.observe` take a
 //! spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std SmpAllocator
 //! pattern — Zig 0.16 std has no io-less blocking mutex); critical sections
-//! are a few string compares / adds. `writeText` holds the registry lock for
-//! the whole write so racing registrations spin briefly during a scrape —
-//! registration is get-or-register, so steady-state request paths only
-//! *read* under the lock-free caches and never register.
+//! are a few string compares / adds. `writeText` holds the registry lock
+//! only long enough to snapshot the family/children pointers (O(number of
+//! families), not O(series)) and formats from that snapshot with the lock
+//! released — registering a new family/child never has to wait for a
+//! scrape's formatting to finish (audit F2, fixed 2026-09-15). Registration
+//! is get-or-register, so steady-state request paths only *read* under the
+//! lock-free caches and never register.
 
 const std = @import("std");
 const router = @import("router");
@@ -503,6 +506,13 @@ pub const Registry = struct {
 
     // ── exposition ──────────────────────────────────────────────────────
 
+    /// One family's identity plus a snapshot of its children list, taken
+    /// under `r.lock` and then formatted without it (see `writeText`).
+    const FamilySnapshot = struct {
+        fam: *Family,
+        children: []const *Child,
+    };
+
     /// Write the whole registry in the Prometheus text exposition format
     /// (version 0.0.4): per family `# HELP` (escaped) + `# TYPE`, then each
     /// series in registration order — counters/gauges as one sample,
@@ -511,10 +521,11 @@ pub const Registry = struct {
     /// sorts families by name and series by label values; we emit
     /// registration order (equally deterministic, no sort allocation —
     /// Prometheus does not require sorted input). Holds the registry lock
-    /// for the duration (see module doc).
+    /// only to snapshot family/children pointers, not for the formatting
+    /// itself (see the F2 comment inside).
     pub fn writeText(r: *Registry, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        // Format the whole exposition into memory while holding the lock (no
-        // socket I/O), then flush to the caller's writer OUTSIDE the lock, so a
+        // Format the whole exposition into memory (no socket I/O), then
+        // flush to the caller's writer OUTSIDE the lock, so a
         // slow/stalling scraper cannot stall first-touch series registration on
         // request threads (which contend for the same lock). An allocation
         // failure surfaces through the Allocating writer as `WriteFailed`.
@@ -531,29 +542,56 @@ pub const Registry = struct {
         ) catch .init(r.arena.child_allocator);
         defer buf.deinit();
         const bw = &buf.writer;
-        {
+
+        // F2: hold `r.lock` only long enough to copy the family/children
+        // SLICE HEADERS (pointer + length; O(number of families) word
+        // copies), then format from that snapshot with the lock released.
+        // `families`/`family_index`/each family's `children` are
+        // append-only over the arena (registration never removes or frees
+        // a Child/Family, and `ArenaAllocator` never frees on grow
+        // either), so a snapshot taken here just may miss a series
+        // registered after this instant -- the same race a scrape already
+        // has against registration, lock or no lock. What the lock
+        // protects is the pair of memory words `ArrayList.append` writes
+        // (`items.ptr`, `items.len`) from being read torn while another
+        // thread is mid-append; it is not needed to read a Counter/Gauge
+        // (lock-free/atomic, see their doc comments) or a Histogram
+        // (guarded by its OWN per-instrument `h.lock` in `writeHistogram`,
+        // independent of `r.lock`) once the pointer is in hand. Formatting
+        // used to run inside this same critical section: measured at 3.7x
+        // the CPU under 8 concurrent scrapers, and the registry's own wall
+        // clock got worse under load because `lockSpin` never yields
+        // (audit F2; re-measured in this A/B, see commit message).
+        const snapshot: []const FamilySnapshot = blk: {
             lockSpin(&r.lock);
             defer r.lock.unlock();
-            for (r.families.items) |fam| {
-                try bw.print("# HELP {s} ", .{fam.name});
-                try writeEscaped(bw, fam.help, .help);
-                try bw.print("\n# TYPE {s} {t}\n", .{ fam.name, fam.kind });
-                for (fam.children.items) |c| {
-                    switch (c.data) {
-                        .counter => |*ctr| {
-                            try bw.writeAll(fam.name);
-                            try writeLabels(bw, fam.label_names, c.label_values, null);
-                            try bw.print(" {d}\n", .{ctr.value()});
-                        },
-                        .gauge => |*g| {
-                            try bw.writeAll(fam.name);
-                            try writeLabels(bw, fam.label_names, c.label_values, null);
-                            try bw.writeByte(' ');
-                            try writeFloat(bw, g.value());
-                            try bw.writeByte('\n');
-                        },
-                        .histogram => |*h| try writeHistogram(bw, fam, c, h),
-                    }
+            const out = r.arena.child_allocator.alloc(FamilySnapshot, r.families.items.len) catch
+                return error.WriteFailed;
+            for (r.families.items, out) |fam, *slot| slot.* = .{ .fam = fam, .children = fam.children.items };
+            break :blk out;
+        };
+        defer r.arena.child_allocator.free(snapshot);
+
+        for (snapshot) |entry| {
+            const fam = entry.fam;
+            try bw.print("# HELP {s} ", .{fam.name});
+            try writeEscaped(bw, fam.help, .help);
+            try bw.print("\n# TYPE {s} {t}\n", .{ fam.name, fam.kind });
+            for (entry.children) |c| {
+                switch (c.data) {
+                    .counter => |*ctr| {
+                        try bw.writeAll(fam.name);
+                        try writeLabels(bw, fam.label_names, c.label_values, null);
+                        try bw.print(" {d}\n", .{ctr.value()});
+                    },
+                    .gauge => |*g| {
+                        try bw.writeAll(fam.name);
+                        try writeLabels(bw, fam.label_names, c.label_values, null);
+                        try bw.writeByte(' ');
+                        try writeFloat(bw, g.value());
+                        try bw.writeByte('\n');
+                    },
+                    .histogram => |*h| try writeHistogram(bw, fam, c, h),
                 }
             }
         }

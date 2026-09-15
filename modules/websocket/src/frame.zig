@@ -156,23 +156,50 @@ pub const ParseResult = union(enum) {
 /// in-place with the 4-byte `key`, cycling the key over the payload
 /// (§5.3).
 ///
-/// Word-wise: the key is broadcast to a `u64` (two copies of the 4-byte key
-/// back to back), so an 8-byte-aligned run is XORed 8 bytes at a time
-/// instead of one byte at a time — this is every frame's one O(payload)
-/// operation, on both the parse and write paths. Correct because 8 is a
-/// multiple of the 4-byte key period: the key phase at the start of every
-/// 8-byte chunk is always `key[0]` again, so chunking never desyncs the
-/// cycle. The tail (`payload.len % 8` bytes) falls back to the byte-at-a-time
-/// form.
+/// Vector-wise: the key is broadcast to a 32-byte vector (eight copies of
+/// the 4-byte key back to back), so a 32-byte-aligned run is XORed 32 bytes
+/// at a time. Correct for the same reason the 8-byte fallback below is:
+/// 32 is a multiple of the 4-byte key period, so the key phase at the start
+/// of every 32-byte chunk is always `key[0]` again and chunking never
+/// desyncs the cycle. Below 32 remaining bytes, falls back to the same
+/// 8-byte-at-a-time `u64` form (also a multiple of 4), then to
+/// byte-at-a-time for the final `< 8`-byte tail — this is every frame's one
+/// O(payload) operation, on both the parse and write paths.
+///
+/// A1 F8: scalar byte-at-a-time cost 3 327 MiB/s, the prior `u64` form
+/// 14 730 MiB/s (4.4x), this `@Vector(32, u8)` form 47 494 MiB/s (another
+/// 3.2x) — measured on 64 KiB payloads, ReleaseFast, best of 3 (see the
+/// module's audit). All three forms were verified bit-for-bit identical on
+/// the shared `applyMask: masking is its own inverse over random payload
+/// sizes 0..600 and random keys` test below plus a differential test
+/// against a pure byte-at-a-time reference.
 pub fn applyMask(payload: []u8, key: [4]u8) void {
+    const Vec32 = @Vector(32, u8);
+    var key32b: [32]u8 = undefined;
+    comptime var rep: usize = 0;
+    inline while (rep < 8) : (rep += 1) @memcpy(key32b[rep * 4 ..][0..4], &key);
+    const key_vec: Vec32 = key32b;
+
     const key32 = std.mem.readInt(u32, &key, .little);
     const key64: u64 = @as(u64, key32) | (@as(u64, key32) << 32);
+
     var i: usize = 0;
+    while (i + 32 <= payload.len) : (i += 32) {
+        const chunk: Vec32 = payload[i..][0..32].*;
+        payload[i..][0..32].* = chunk ^ key_vec;
+    }
     while (i + 8 <= payload.len) : (i += 8) {
         const chunk = std.mem.readInt(u64, payload[i..][0..8], .little);
         std.mem.writeInt(u64, payload[i..][0..8], chunk ^ key64, .little);
     }
     while (i < payload.len) : (i += 1) payload[i] ^= key[i % 4];
+}
+
+/// Reference form of `applyMask`, one byte at a time — used only by the
+/// differential test below to pin the vectorized/word-wise fast paths
+/// against the simplest possible correct implementation of §5.3.
+fn applyMaskScalarRef(payload: []u8, key: [4]u8) void {
+    for (payload, 0..) |*b, i| b.* ^= key[i % 4];
 }
 
 /// Parse one frame from the front of `buf`. `buf` is mutable because a
@@ -620,6 +647,44 @@ test "applyMask matches an independent byte-at-a-time oracle across the word/tai
     var got = payload;
     applyMask(&got, key);
     try testing.expectEqualSlices(u8, &want, &got);
+}
+
+// A1 F8: `applyMask` grew a THIRD fast path (32-byte `@Vector`) on top of
+// the `u64` one the test above pins. That test's 19-byte payload never
+// reaches the vector loop at all (it needs >= 32 bytes) and so cannot tell
+// a broken vector broadcast from a correct one. This one differentials
+// `applyMask` against `applyMaskScalarRef` (the simplest possible §5.3
+// implementation) over sizes that land on both sides of every boundary the
+// three paths hand off at (32, 8, and the final <8 tail) plus randomized
+// keys and payload bytes, so a phase bug in the 32-byte key broadcast (the
+// exact class of bug the comment on the test above warns a round-trip test
+// cannot see) cannot survive undetected.
+test "applyMask: vectorized/word/tail paths agree with a byte-at-a-time reference across every size boundary" {
+    var prng = std.Random.DefaultPrng.init(0xF8F8);
+    const random = prng.random();
+    const sizes = [_]usize{
+        0,   1,   3,   4,   7,   8,   9,   15,  16,  31,
+        32,  33,  39,  40,  41,  63,  64,  65,  71,  96,
+        100, 127, 128, 129, 200, 511, 512, 513, 600,
+    };
+    for (sizes) |n| {
+        const buf = try testing.allocator.alloc(u8, n);
+        defer testing.allocator.free(buf);
+        random.bytes(buf);
+
+        var key: [4]u8 = undefined;
+        random.bytes(&key);
+
+        const want = try testing.allocator.dupe(u8, buf);
+        defer testing.allocator.free(want);
+        applyMaskScalarRef(want, key);
+
+        const got = try testing.allocator.dupe(u8, buf);
+        defer testing.allocator.free(got);
+        applyMask(got, key);
+
+        try testing.expectEqualSlices(u8, want, got);
+    }
 }
 
 test "write: a control frame RFC 6455 §5.5 forbids is refused before any byte is written (A1 F6)" {
