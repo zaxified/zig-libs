@@ -98,3 +98,100 @@ test "STACKPROBE (A1 L4): wipe's zeroing survives the optimiser on a buffer noth
     try std.testing.expect(pos >= 1); // the scan can see an unwiped buffer
     try std.testing.expectEqual(@as(usize, 0), wiped);
 }
+
+// ── the secret-key codecs `wipe`'s doc comment tells callers to wipe after ──
+//
+// Wiping the caller's buffer only helps if the codec left no copy of its own
+// (audit A1 L8). In value-in/value-out form, with the result wiped at once,
+// `encodeSecretKeyBase64` left the raw key twice and the base64 text once per
+// call (ReleaseFast), and the two parsers left the decoded key once (base64)
+// and three times (hex) per call in this full test binary — though not in a
+// stand-alone or a filtered one, because it depended on inlining. They now
+// write into caller buffers from `noinline` codecs whose stack is zeroed.
+// `encodeSecretKeyHex` and `keyPairFromSecretKey` measured clean. This checks
+// all of them, each result wiped the moment it is available.
+
+var codec_sk: [sb.secret_length]u8 = undefined;
+var codec_b64: [sb.base64_sk_len]u8 = undefined;
+var codec_hex: [sb.hex_sk_len]u8 = undefined;
+
+noinline fn encodeB64AndWipe() void {
+    var text: [sb.base64_sk_len]u8 = undefined;
+    sb.encodeSecretKeyBase64(&text, &codec_sk);
+    sb.wipe(&text);
+}
+
+noinline fn encodeHexAndWipe() void {
+    var text = sb.encodeSecretKeyHex(codec_sk);
+    sb.wipe(&text);
+}
+
+noinline fn parseB64AndWipe() void {
+    var key: [sb.secret_length]u8 = undefined;
+    sb.parseSecretKeyBase64(&key, &codec_b64) catch unreachable;
+    sb.wipe(&key);
+}
+
+noinline fn parseHexAndWipe() void {
+    var key: [sb.secret_length]u8 = undefined;
+    sb.parseSecretKeyHex(&key, &codec_hex) catch unreachable;
+    sb.wipe(&key);
+}
+
+noinline fn keyPairAndWipe() void {
+    var kp = sb.keyPairFromSecretKey(codec_sk) catch unreachable;
+    sb.wipe(&kp.secret_key);
+}
+
+/// Positive control for this test: parks the raw key in a local and returns.
+noinline fn parkKey() void {
+    var local: [512]u8 = undefined;
+    @memset(&local, 0);
+    local[100..132].* = codec_sk;
+    std.mem.doNotOptimizeAway(&local);
+}
+
+test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the key on the dead stack" {
+    if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
+    for (&codec_sk, 0..) |*b, i| b.* = @truncate(i * 13 + 5);
+    sb.encodeSecretKeyBase64(&codec_b64, &codec_sk);
+    codec_hex = sb.encodeSecretKeyHex(codec_sk);
+
+    paint();
+    callInnocent();
+    const neg = scan(&codec_sk) + scan(&codec_b64) + scan(&codec_hex);
+    paint();
+    parkKey();
+    const pos = scan(&codec_sk);
+    std.debug.print("\n=== STACKPROBE sealedbox L4 codecs ({t}): NEG={d} POS(key parked)={d} ===\n", .{ builtin.mode, neg, pos });
+    try std.testing.expectEqual(@as(usize, 0), neg);
+    try std.testing.expect(pos >= 1);
+
+    const calls = [_]struct { name: []const u8, f: *const fn () void }{
+        .{ .name = "encodeSecretKeyBase64", .f = encodeB64AndWipe },
+        .{ .name = "encodeSecretKeyHex", .f = encodeHexAndWipe },
+        .{ .name = "parseSecretKeyBase64", .f = parseB64AndWipe },
+        .{ .name = "parseSecretKeyHex", .f = parseHexAndWipe },
+        .{ .name = "keyPairFromSecretKey", .f = keyPairAndWipe },
+    };
+    var total: usize = 0;
+    for (calls) |call| {
+        var key: usize = 0;
+        var b64: usize = 0;
+        var hex: usize = 0;
+        for (0..5) |_| {
+            paint();
+            call.f();
+            key += scan(&codec_sk);
+            paint();
+            call.f();
+            b64 += scan(&codec_b64);
+            paint();
+            call.f();
+            hex += scan(&codec_hex);
+        }
+        std.debug.print("  {s:<24} key={d}/5 base64 text={d}/5 hex text={d}/5\n", .{ call.name, key, b64, hex });
+        total += key + b64 + hex;
+    }
+    try std.testing.expectEqual(@as(usize, 0), total);
+}

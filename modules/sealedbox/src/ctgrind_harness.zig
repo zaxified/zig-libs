@@ -155,7 +155,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var sk = secretKeyBytes();
             if (tainted) std.valgrind.memcheck.makeMemUndefined(&sk);
             const key = reloadVolatile(secret_length, &sk);
-            const text = root.encodeSecretKeyBase64(key);
+            var text: [root.base64_sk_len]u8 = undefined;
+            root.encodeSecretKeyBase64(&text, &key);
             std.debug.print("ctgrind_result={x}\n", .{text});
         },
         // ⚠ For the two parsers the encode runs BEFORE the taint: the subject
@@ -165,14 +166,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var text = root.encodeSecretKeyHex(secretKeyBytes());
             if (tainted) std.valgrind.memcheck.makeMemUndefined(&text);
             const input = reloadVolatile(root.hex_sk_len, &text);
-            const key = try root.parseSecretKeyHex(&input);
+            var key: [secret_length]u8 = undefined;
+            try root.parseSecretKeyHex(&key, &input);
             std.debug.print("ctgrind_result={x}\n", .{key});
         },
         .b64dec => {
-            var text = root.encodeSecretKeyBase64(secretKeyBytes());
+            var text: [root.base64_sk_len]u8 = undefined;
+            root.encodeSecretKeyBase64(&text, &secretKeyBytes());
             if (tainted) std.valgrind.memcheck.makeMemUndefined(&text);
             const input = reloadVolatile(root.base64_sk_len, &text);
-            const key = try root.parseSecretKeyBase64(&input);
+            var key: [secret_length]u8 = undefined;
+            try root.parseSecretKeyBase64(&key, &input);
             std.debug.print("ctgrind_result={x}\n", .{key});
         },
     }

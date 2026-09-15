@@ -32,8 +32,9 @@ const pt2 = try sb.openAlloc(gpa, ct2, kp);                 defer gpa.free(pt2);
 
 // key text (base64 / hex). The ENCODED secret is the buffer people forget:
 // it is 44 or 64 bytes of ordinary-looking text sitting in your frame.
-var sk_text = sb.encodeSecretKeyBase64(kp.secret_key);
+var sk_text: [sb.base64_sk_len]u8 = undefined;
 defer sb.wipe(&sk_text);   // std.crypto.secureZero; a plain @memset may be elided
+sb.encodeSecretKeyBase64(&sk_text, &kp.secret_key);
 ```
 
 `overhead` is 48 bytes (32-byte ephemeral pubkey + 16-byte Poly1305 tag).

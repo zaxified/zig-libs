@@ -164,11 +164,12 @@ pub const KeyEncodingError = error{ InvalidLength, InvalidKeyEncoding };
 /// secret material and is found by whoever is holding that material.
 ///
 /// The buffer most often forgotten is not the 32-byte scalar but the ENCODED
-/// secret: `encodeSecretKeyBase64` returns 44 bytes and `encodeSecretKeyHex`
-/// 64, and those live in the caller's frame looking like ordinary text.
+/// secret: `encodeSecretKeyBase64` writes 44 bytes and `encodeSecretKeyHex`
+/// returns 64, and those live in the caller's frame looking like ordinary text.
 ///
-///     var text = sealedbox.encodeSecretKeyBase64(sk);
+///     var text: [sealedbox.base64_sk_len]u8 = undefined;
 ///     defer sealedbox.wipe(&text);
+///     sealedbox.encodeSecretKeyBase64(&text, &sk);
 ///
 /// This is hygiene, not a defense against an attacker who can already read
 /// your process memory at the moment the secret is live.
@@ -198,18 +199,37 @@ pub fn parsePublicKeyHex(text: []const u8) KeyEncodingError![public_length]u8 {
     return parseKeyHex(text);
 }
 
-/// Encode a secret key as standard base64 (44 chars). **SECRET material** —
-/// the output grants full decryption capability; store/transmit accordingly,
-/// and `wipe` the returned buffer when done with it.
-pub fn encodeSecretKeyBase64(sk: [secret_length]u8) [base64_sk_len]u8 {
-    return encodeSecretKeyBase64Ct(sk);
+/// Encode a secret key as standard base64 (44 chars) into `out`. **SECRET
+/// material** — the output grants full decryption capability; store/transmit
+/// accordingly, and `wipe` `out` when done with it.
+///
+/// Pointers in, no value out (audit A1 L8). Measured at ReleaseFast, the result
+/// wiped the moment it came back: the old value-in/value-out form left the raw
+/// key on the dead stack twice per call and the base64 text once — one key copy
+/// was the argument copy a caller makes, the rest sat in frames between the
+/// encoder and its caller, where no `wipe` of the caller's buffer reaches.
+/// Writing into `out` is what removed it; the `noinline` encoder and the stack
+/// burn after it are guards — dropping either left the probe at zero in the
+/// measured binary. `stackprobe_test.zig` asserts nothing is left.
+pub fn encodeSecretKeyBase64(out: *[base64_sk_len]u8, sk: *const [secret_length]u8) void {
+    encodeSecretKeyBase64Ct(out, sk);
+    burnCodecStack();
 }
 
-/// Parse a base64-encoded secret key (**SECRET material**). Same strict rules
-/// as `parsePublicKeyBase64`. Returns the raw X25519 scalar; rebuild a usable
-/// keypair with `keyPairFromSecretKey`.
-pub fn parseSecretKeyBase64(text: []const u8) KeyEncodingError![secret_length]u8 {
-    return parseSecretKeyBase64Ct(text);
+/// Parse a base64-encoded secret key (**SECRET material**) into `out`. Same
+/// strict rules as `parsePublicKeyBase64`. `out` receives the raw X25519
+/// scalar — rebuild a usable keypair with `keyPairFromSecretKey` — and is
+/// zeroed on any error.
+///
+/// Audit A1 L8: returned by value, the decoded key stayed on the dead stack
+/// once per call in the module's full test binary and not in a filtered one —
+/// whether the copy survived depended on inlining. Written into `out`, it does
+/// not; the `noinline` decoder and the stack burn are guards (dropping either
+/// left the probe at zero in the measured binary).
+pub fn parseSecretKeyBase64(out: *[secret_length]u8, text: []const u8) KeyEncodingError!void {
+    const result = parseSecretKeyBase64Ct(out, text);
+    burnCodecStack();
+    return result;
 }
 
 /// Encode a secret key as lowercase hex (64 chars). **SECRET material** —
@@ -218,10 +238,28 @@ pub fn encodeSecretKeyHex(sk: [secret_length]u8) [hex_sk_len]u8 {
     return encodeSecretKeyHexCt(sk);
 }
 
-/// Parse a hex-encoded secret key (**SECRET material**). Same strict rules as
-/// `parsePublicKeyHex`.
-pub fn parseSecretKeyHex(text: []const u8) KeyEncodingError![secret_length]u8 {
-    return parseSecretKeyHexCt(text);
+/// Parse a hex-encoded secret key (**SECRET material**) into `out`. Same strict
+/// rules as `parsePublicKeyHex`; `out` is zeroed on any error.
+///
+/// Audit A1 L8: returned by value, the decoded key stayed on the dead stack
+/// three times per call in the module's full test binary. Written into `out`,
+/// it does not; the `noinline` decoder and the stack burn are guards (dropping
+/// either left the probe at zero in the measured binary).
+pub fn parseSecretKeyHex(out: *[secret_length]u8, text: []const u8) KeyEncodingError!void {
+    const result = parseSecretKeyHexCt(out, text);
+    burnCodecStack();
+    return result;
+}
+
+/// Zero the stack the secret-key codecs used, at their depth (audit A1 L8). A
+/// guard, not a measured necessity: with the codecs writing into caller
+/// buffers, removing this call or the codecs' `noinline` left
+/// `stackprobe_test.zig` at zero. It keeps whatever a codec's frames may hold
+/// in a future build off the dead stack. `secureZero` writes through a volatile
+/// slice, so the dead store survives optimisation.
+noinline fn burnCodecStack() void {
+    var buf: [1024]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
 }
 
 /// Recompute the public key from a stored secret key (X25519 base-point
@@ -360,8 +398,7 @@ inline fn ctHexNibble(c: u16) u16 {
 
 /// Constant-time base64 encode of SECRET key material. 32 bytes -> 44 chars
 /// (standard alphabet, one `=` of padding, since 32 = 3*10 + 2).
-fn encodeSecretKeyBase64Ct(key: [secret_length]u8) [base64_sk_len]u8 {
-    var out: [base64_sk_len]u8 = undefined;
+noinline fn encodeSecretKeyBase64Ct(out: *[base64_sk_len]u8, key: *const [secret_length]u8) void {
     var i: usize = 0;
     var o: usize = 0;
     // 10 full 3-byte groups -> 40 chars.
@@ -383,7 +420,6 @@ fn encodeSecretKeyBase64Ct(key: [secret_length]u8) [base64_sk_len]u8 {
     out[o + 1] = ctB64Char(((b0 & 0x03) << 4) | (b1 >> 4));
     out[o + 2] = ctB64Char((b1 & 0x0f) << 2);
     out[o + 3] = '=';
-    return out;
 }
 
 /// Constant-time base64 decode of SECRET key material. Strict: exactly 44
@@ -392,8 +428,11 @@ fn encodeSecretKeyBase64Ct(key: [secret_length]u8) [base64_sk_len]u8 {
 /// ⛔ Every character is decoded before anything is rejected: an early return
 /// on the first bad character would leak WHERE the text went wrong, which is
 /// the padding-oracle shape one layer up.
-fn parseSecretKeyBase64Ct(text: []const u8) KeyEncodingError![secret_length]u8 {
-    if (text.len != base64_sk_len) return error.InvalidLength;
+noinline fn parseSecretKeyBase64Ct(out: *[secret_length]u8, text: []const u8) KeyEncodingError!void {
+    if (text.len != base64_sk_len) {
+        std.crypto.secureZero(u8, out);
+        return error.InvalidLength;
+    }
 
     var invalid: u16 = 0;
     var vals: [base64_sk_len]u16 = undefined;
@@ -405,7 +444,6 @@ fn parseSecretKeyBase64Ct(text: []const u8) KeyEncodingError![secret_length]u8 {
     // Padding is structural, not secret: the last character must be '='.
     invalid |= ctEq(text[base64_sk_len - 1], '=') & 0x100 ^ 0x100;
 
-    var out: [secret_length]u8 = undefined;
     var i: usize = 0;
     var o: usize = 0;
     while (o + 3 <= secret_length) : (o += 3) {
@@ -424,10 +462,9 @@ fn parseSecretKeyBase64Ct(text: []const u8) KeyEncodingError![secret_length]u8 {
     invalid |= ctEq(@as(u16, @truncate(acc)) & 0xff, 0) & 0x100 ^ 0x100;
 
     if (invalid != 0) {
-        std.crypto.secureZero(u8, &out);
+        std.crypto.secureZero(u8, out);
         return error.InvalidKeyEncoding;
     }
-    return out;
 }
 
 /// Constant-time lowercase-hex encode of SECRET key material.
@@ -443,22 +480,23 @@ fn encodeSecretKeyHexCt(key: [secret_length]u8) [hex_sk_len]u8 {
 /// Constant-time hex decode of SECRET key material. Either case, exactly 64
 /// digits, and — like the base64 parser — every digit is decoded before any
 /// rejection.
-fn parseSecretKeyHexCt(text: []const u8) KeyEncodingError![secret_length]u8 {
-    if (text.len != hex_sk_len) return error.InvalidLength;
+noinline fn parseSecretKeyHexCt(out: *[secret_length]u8, text: []const u8) KeyEncodingError!void {
+    if (text.len != hex_sk_len) {
+        std.crypto.secureZero(u8, out);
+        return error.InvalidLength;
+    }
 
     var invalid: u16 = 0;
-    var out: [secret_length]u8 = undefined;
-    for (&out, 0..) |*b, i| {
+    for (out, 0..) |*b, i| {
         const hi = ctHexNibble(text[2 * i]);
         const lo = ctHexNibble(text[2 * i + 1]);
         invalid |= (hi | lo) & 0x100;
         b.* = @truncate(((hi & 0x0f) << 4) | (lo & 0x0f));
     }
     if (invalid != 0) {
-        std.crypto.secureZero(u8, &out);
+        std.crypto.secureZero(u8, out);
         return error.InvalidKeyEncoding;
     }
-    return out;
 }
 
 fn encodeKeyBase64(key: [32]u8) [base64_pk_len]u8 {
@@ -492,6 +530,26 @@ fn parseKeyHex(text: []const u8) KeyEncodingError![32]u8 {
 // a submodule's tests into the test binary — this reference does.
 test {
     _ = @import("kat_test.zig");
+}
+
+// Value-returning shims for the tests below, which compare keys and texts
+// inline. The public secret-key codecs write into caller buffers (audit A1 L8).
+fn testEncodeSecretKeyBase64(sk: [secret_length]u8) [base64_sk_len]u8 {
+    var text: [base64_sk_len]u8 = undefined;
+    encodeSecretKeyBase64(&text, &sk);
+    return text;
+}
+
+fn testParseSecretKeyBase64(text: []const u8) KeyEncodingError![secret_length]u8 {
+    var key: [secret_length]u8 = undefined;
+    try parseSecretKeyBase64(&key, text);
+    return key;
+}
+
+fn testParseSecretKeyHex(text: []const u8) KeyEncodingError![secret_length]u8 {
+    var key: [secret_length]u8 = undefined;
+    try parseSecretKeyHex(&key, text);
+    return key;
 }
 
 // A wrong `out` size used to be `std.debug.assert`, which ReleaseFast removes
@@ -634,9 +692,9 @@ test "KAT: a key whose base64 uses BOTH `+` and `/` — the two alphabet slots n
 
     // Secret path — this module's own constant-time codec, which must agree
     // character for character on exactly these two slots.
-    const sec_b64 = encodeSecretKeyBase64(key);
+    const sec_b64 = testEncodeSecretKeyBase64(key);
     try std.testing.expectEqualStrings(expected, &sec_b64);
-    try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyBase64(expected)));
+    try std.testing.expectEqualSlices(u8, &key, &(try testParseSecretKeyBase64(expected)));
 
     // ⛔ And the url-safe spelling of the SAME key must be rejected by both,
     // which is what makes this a test of the alphabet rather than of a string:
@@ -649,7 +707,7 @@ test "KAT: a key whose base64 uses BOTH `+` and `/` — the two alphabet slots n
         else => c.*,
     };
     try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&urlsafe));
-    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&urlsafe));
+    try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyBase64(&urlsafe));
 }
 
 test "KAT: public key base64 + hex, exact strings and decode-back" {
@@ -681,15 +739,15 @@ test "KAT: secret key (RFC 7748 Alice) base64 + hex + public recompute" {
     // RFC 7748 §6.1 Alice's secret and public key.
     const sk_hex = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
     const pk_hex = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
-    const sk = try parseSecretKeyHex(sk_hex);
+    const sk = try testParseSecretKeyHex(sk_hex);
 
-    const b64 = encodeSecretKeyBase64(sk);
+    const b64 = testEncodeSecretKeyBase64(sk);
     try std.testing.expectEqualStrings("dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=", &b64);
-    try std.testing.expectEqual(sk, try parseSecretKeyBase64(&b64));
+    try std.testing.expectEqual(sk, try testParseSecretKeyBase64(&b64));
 
     const hex = encodeSecretKeyHex(sk);
     try std.testing.expectEqualStrings(sk_hex, &hex);
-    try std.testing.expectEqual(sk, try parseSecretKeyHex(&hex));
+    try std.testing.expectEqual(sk, try testParseSecretKeyHex(&hex));
 
     // secret → public rebuild matches the RFC vector
     const pk = try publicFromSecret(sk);
@@ -708,15 +766,15 @@ test "round-trip: generated keys survive text serialization; rebuilt keypair ope
     try std.testing.expectEqual(kp.public_key, try parsePublicKeyHex(&encodePublicKeyHex(kp.public_key)));
 
     // secret key: base64 + hex round-trip
-    try std.testing.expectEqual(kp.secret_key, try parseSecretKeyBase64(&encodeSecretKeyBase64(kp.secret_key)));
-    try std.testing.expectEqual(kp.secret_key, try parseSecretKeyHex(&encodeSecretKeyHex(kp.secret_key)));
+    try std.testing.expectEqual(kp.secret_key, try testParseSecretKeyBase64(&testEncodeSecretKeyBase64(kp.secret_key)));
+    try std.testing.expectEqual(kp.secret_key, try testParseSecretKeyHex(&encodeSecretKeyHex(kp.secret_key)));
 
     // end-to-end: serialize both keys → parse back → seal to parsed public key
     // → open with a keypair rebuilt from the stored secret
     const pk_stored = encodePublicKeyBase64(kp.public_key);
     const sk_stored = encodeSecretKeyHex(kp.secret_key);
     const pk_back = try parsePublicKeyBase64(&pk_stored);
-    const kp_back = try keyPairFromSecretKey(try parseSecretKeyHex(&sk_stored));
+    const kp_back = try keyPairFromSecretKey(try testParseSecretKeyHex(&sk_stored));
     try std.testing.expectEqual(kp.public_key, kp_back.public_key);
 
     const msg = "keys came from a config file";
@@ -754,10 +812,10 @@ test "malformed key text: typed errors, no panic" {
     try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyHex(" " ++ good_hex[1..]));
 
     // secret parsers share the code path — spot-check both error kinds
-    try std.testing.expectError(error.InvalidLength, parseSecretKeyBase64("short"));
-    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64("*" ++ good_b64[1..]));
-    try std.testing.expectError(error.InvalidLength, parseSecretKeyHex("abc"));
-    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyHex("g" ++ good_hex[1..]));
+    try std.testing.expectError(error.InvalidLength, testParseSecretKeyBase64("short"));
+    try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyBase64("*" ++ good_b64[1..]));
+    try std.testing.expectError(error.InvalidLength, testParseSecretKeyHex("abc"));
+    try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyHex("g" ++ good_hex[1..]));
 }
 
 test "constant-time codecs: EXHAUSTIVE agreement with std over every input byte" {
@@ -814,7 +872,7 @@ test "constant-time codecs: agree with the std-backed public path on 512 keys" {
             b.* = @truncate(seed >> 33);
         }
 
-        const ct_b64 = encodeSecretKeyBase64(key);
+        const ct_b64 = testEncodeSecretKeyBase64(key);
         const std_b64 = encodePublicKeyBase64(key);
         try std.testing.expectEqualStrings(&std_b64, &ct_b64);
 
@@ -822,50 +880,50 @@ test "constant-time codecs: agree with the std-backed public path on 512 keys" {
         const std_hex = encodePublicKeyHex(key);
         try std.testing.expectEqualStrings(&std_hex, &ct_hex);
 
-        try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyBase64(&ct_b64)));
-        try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyHex(&ct_hex)));
+        try std.testing.expectEqualSlices(u8, &key, &(try testParseSecretKeyBase64(&ct_b64)));
+        try std.testing.expectEqualSlices(u8, &key, &(try testParseSecretKeyHex(&ct_hex)));
         // Uppercase hex is accepted by both parsers.
         var upper = ct_hex;
         for (&upper) |*c| c.* = std.ascii.toUpper(c.*);
-        try std.testing.expectEqualSlices(u8, &key, &(try parseSecretKeyHex(&upper)));
+        try std.testing.expectEqualSlices(u8, &key, &(try testParseSecretKeyHex(&upper)));
     }
 }
 
 test "constant-time parsers reject exactly what the std-backed ones reject" {
     var key: [secret_length]u8 = undefined;
     for (&key, 0..) |*b, i| b.* = @intCast(i);
-    const b64 = encodeSecretKeyBase64(key);
+    const b64 = testEncodeSecretKeyBase64(key);
     const hex = encodeSecretKeyHex(key);
 
     // A bad character in EVERY position, checked against the public parser.
     for (0..b64.len) |i| {
         var bad = b64;
         bad[i] = if (bad[i] == '*') '#' else '*';
-        try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&bad));
+        try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyBase64(&bad));
         try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&bad));
     }
     for (0..hex.len) |i| {
         var bad = hex;
         bad[i] = 'z';
-        try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyHex(&bad));
+        try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyHex(&bad));
         try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyHex(&bad));
     }
 
     // Length is structural, not secret, so it stays a distinct error.
-    try std.testing.expectError(error.InvalidLength, parseSecretKeyBase64(b64[0 .. b64.len - 1]));
-    try std.testing.expectError(error.InvalidLength, parseSecretKeyHex(hex[0 .. hex.len - 1]));
+    try std.testing.expectError(error.InvalidLength, testParseSecretKeyBase64(b64[0 .. b64.len - 1]));
+    try std.testing.expectError(error.InvalidLength, testParseSecretKeyHex(hex[0 .. hex.len - 1]));
 
     // Padding must be present and last.
     var nopad = b64;
     nopad[b64.len - 1] = 'A';
-    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&nopad));
+    try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyBase64(&nopad));
 
     // ⛔ Non-canonical final group: the last 6-bit value carries 2 bits that
     // MUST be zero. Without this check two distinct texts decode to one key,
     // which is a malleable key encoding (RFC 4648 §3.5).
     var noncanon = b64;
     noncanon[b64.len - 2] = ctB64Char(ctB64Index(noncanon[b64.len - 2]) | 1);
-    try std.testing.expectError(error.InvalidKeyEncoding, parseSecretKeyBase64(&noncanon));
+    try std.testing.expectError(error.InvalidKeyEncoding, testParseSecretKeyBase64(&noncanon));
     try std.testing.expectError(error.InvalidKeyEncoding, parsePublicKeyBase64(&noncanon));
 }
 
@@ -873,14 +931,14 @@ test "wipe: the encoded secret really is gone from the buffer" {
     // Round-trips first, so the test cannot pass by wiping something that was
     // never a secret in the first place.
     const sk = [_]u8{0xA5} ** secret_length;
-    var text = encodeSecretKeyBase64(sk);
-    try std.testing.expectEqual(sk, try parseSecretKeyBase64(&text));
+    var text = testEncodeSecretKeyBase64(sk);
+    try std.testing.expectEqual(sk, try testParseSecretKeyBase64(&text));
 
     wipe(&text);
     for (text) |c| try std.testing.expectEqual(@as(u8, 0), c);
 
     var hex_text = encodeSecretKeyHex(sk);
-    try std.testing.expectEqual(sk, try parseSecretKeyHex(&hex_text));
+    try std.testing.expectEqual(sk, try testParseSecretKeyHex(&hex_text));
     wipe(&hex_text);
     for (hex_text) |c| try std.testing.expectEqual(@as(u8, 0), c);
 

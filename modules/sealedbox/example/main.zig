@@ -135,7 +135,8 @@ pub fn main() !void {
     must(std.mem.eql(u8, &kp.public_key, &pk_back), @src());
 
     var sk_text = sealedbox.encodeSecretKeyHex(kp.secret_key);
-    const sk_back = try sealedbox.parseSecretKeyHex(&sk_text);
+    var sk_back: [sealedbox.secret_length]u8 = undefined;
+    try sealedbox.parseSecretKeyHex(&sk_back, &sk_text);
     must(std.mem.eql(u8, &kp.secret_key, &sk_back), @src());
     sealedbox.wipe(&sk_text); // hygiene: this is throwaway key material, but the API is the point
     for (sk_text) |c| must(c == 0, @src());

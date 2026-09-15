@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **BREAKING:** the secret-key text codecs that measured a
+  leak write into caller buffers (audit A1 L8, a measured defect on a module
+  with no consumer — the QUESTIONS-ROUND-2 Q3 rule).
+  `encodeSecretKeyBase64(out: *[44]u8, sk: *const [32]u8) void`,
+  `parseSecretKeyBase64(out: *[32]u8, text) !void` and
+  `parseSecretKeyHex(out: *[32]u8, text) !void`; a parser zeroes `out` on any
+  error. Measured at ReleaseFast with every result wiped the moment it was
+  available: the value-in/value-out encoder left the raw key on the dead stack
+  twice per call and the base64 text once (one key copy was the caller's
+  argument copy), and the parsers left the decoded key once and three times per
+  call in the module's full test binary — not in a filtered or a stand-alone
+  one, because it depended on inlining. So the pattern `wipe` documents erased
+  none of it. Writing through the pointer is what removed it; each codec also
+  runs `noinline` and is followed by a 1 KiB stack burn, as guards — removing
+  either left the probe at zero in the measured binary. `encodeSecretKeyHex` and
+  `keyPairFromSecretKey` measured clean and are unchanged.
+  `stackprobe_test.zig` gains a test asserting that every secret-key codec
+  leaves neither the text nor the key behind.
+
 - **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE (test-only):** audit finding
   L4. The property `wipe` exists for — that the optimiser cannot remove its
   zeroing — had no test that could see it: `wipe: the encoded secret really is
