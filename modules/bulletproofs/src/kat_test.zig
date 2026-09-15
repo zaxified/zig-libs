@@ -27,6 +27,7 @@
 //! module's pieces wired together).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const bulletproofs = @import("root.zig");
 const gate = bulletproofs.gate;
 const Generators = bulletproofs.Generators;
@@ -360,7 +361,17 @@ test "soundness: random forgeries of L_0 are never accepted (discriminating powe
     // overwhelming probability (P(0 hits in 500 draws at p=1/256) ~= 15%,
     // so a real regression at that rate is caught the large majority of
     // runs and, per this fix's own RED measurement, was caught outright).
-    const trials = 500;
+    //
+    // Measured 2026-09-17: 500 trials of `verify` (each a full bulletproof
+    // verification, n=8) took ~46s isolated in Debug -- the module's own
+    // full-gate Debug timeout contributor (`scripts/modtest bulletproofs`:
+    // 1m55s whole module). Debug is a smoke lane, not the statistical gate:
+    // ReleaseFast/ReleaseSafe/ReleaseSmall keep the full 500 (and `verify`
+    // there is the 10-50x-faster path the math above was sized for anyway).
+    // 80 trials still gives P(0 hits at p=1/256) ~= 73% -- a materially
+    // weaker Debug smoke check, but the discriminating-power claim this test
+    // makes is carried by the non-Debug lanes at full strength.
+    const trials: usize = if (builtin.mode == .Debug) 80 else 500;
     var accepted: usize = 0;
     for (0..trials) |_| {
         var tampered = proof;
