@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO CONSUMER-VISIBLE CHANGE:** audit F4(b)/(c). Two input guards could be
+  deleted with the suite green, because every existing reject test also broke a per-round equation.
+  New tests build proofs whose every round holds: Πmod over the non-Blum `Ñ = 187 = 11·17` with a
+  non-unit `w` (0 and 17), refused only by `Pimod.verify`'s `(w/Ñ) = −1` check; Πprm over the
+  degenerate tuples `(h1, h2) = (4, 1)` and `(1, 1)` with the honest `λ = 0` proof, refused only by
+  `Piprm.verify`'s `h ∉ {0, 1}` check.
+
 - **2026-09-16** — **SECURITY + BREAKING (signature) + BEHAVIOURAL:** audit F5. MtA drew Bob's
   blind `β'` from `Zq`, so the integer Alice decrypts, `α' = a·b + β'`, was `a·b` plus a blind
   `q` times too small to hide it: Alice (who knows `a`) recovered Bob's `b` from `α'/a` in 4/4
