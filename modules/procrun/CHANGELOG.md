@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** `zig build check-portable`
+  caught `.windows` compiling for the first time in this Zig version:
+  `drainLoop`'s deadline wait referenced `std.posix.POLL.IN`, which lowers to
+  `ws2_32.POLL` on Windows and does not exist there (a std gap), and
+  `monoNowNs` called `std.posix.system.clock_gettime`, which on Windows is
+  `extern "c"` and fails to compile without linking libc (this repo's policy
+  is libc only for `sqlite`). `pollReady` now has a real Windows branch
+  (`PeekNamedPipe`-based, since a pipe HANDLE has no `poll`-equivalent
+  readiness wait) and `monoNowNs` a `QueryPerformanceCounter`-based one, same
+  raw-kernel32-extern idiom `sleepNs` already used on this platform. No
+  behavior change on POSIX; the deadline-bounded read path was previously
+  unreachable on Windows only because it could not compile there at all.
 - **2026-09-10** — **BEHAVIOURAL, not breaking:** A1 fix campaign, six findings
   from the 2026-09-04 audit. `runTimeout` is now actually bounded by roughly
   its own `timeout_ns` (plus a small fixed grace): before, it waited on the

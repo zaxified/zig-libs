@@ -670,7 +670,12 @@ fn drainLoop(d: Drainer) void {
             // `poll` call to cover the whole wait — `remainingMs` is what
             // actually enforces the deadline, `poll`'s timeout is only how
             // long a single round is willing to sleep.
-            if (!pollReady(d.file.handle, std.posix.POLL.IN, ms)) continue;
+            // `std.posix.POLL.IN` does not even NAME-RESOLVE on Windows in
+            // this Zig version (`ws2_32.POLL` is missing -- see `pollReady`)
+            // -- comptime-branch the reference itself away, not just its
+            // runtime use; `pollReadyWindows` ignores `events` regardless.
+            const poll_in = if (builtin.os.tag == .windows) 0 else std.posix.POLL.IN;
+            if (!pollReady(d.file.handle, poll_in, ms)) continue;
         }
         const n = d.file.readStreaming(d.io, &.{rbuf[0..]}) catch return;
         if (n == 0) return;
@@ -951,9 +956,38 @@ fn killerLoop(j: KillJob) void {
 }
 
 fn monoNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    switch (builtin.os.tag) {
+        // `std.posix.system` is `std.c` on Windows (see `posix.zig`'s
+        // `use_libc`), and `std.c.clock_gettime` is `extern "c"` -- calling
+        // it here without linking libc is a hard compile error ("dependency
+        // on libc must be explicitly specified"), not a link-time surprise.
+        // This repo's policy is libc only for `sqlite` (CONVENTIONS.md), so
+        // the fix is a native Windows monotonic clock, not a libc link flag.
+        // `QueryPerformanceCounter`/`Frequency` is the documented Win32
+        // monotonic-clock pair; same raw-kernel32-extern idiom `sleepNs`
+        // already uses on this platform.
+        .windows => {
+            const win = std.os.windows;
+            const K = struct {
+                extern "kernel32" fn QueryPerformanceCounter(out: *i64) callconv(.winapi) win.BOOL;
+                extern "kernel32" fn QueryPerformanceFrequency(out: *i64) callconv(.winapi) win.BOOL;
+            };
+            var freq: i64 = 1;
+            _ = K.QueryPerformanceFrequency(&freq);
+            if (freq <= 0) freq = 1;
+            var count: i64 = 0;
+            _ = K.QueryPerformanceCounter(&count);
+            const whole_s = @divTrunc(count, freq);
+            const rem_ticks = @rem(count, freq);
+            return @as(u64, @intCast(whole_s)) * std.time.ns_per_s +
+                @as(u64, @intCast(@divTrunc(rem_ticks * std.time.ns_per_s, freq)));
+        },
+        else => {
+            var ts: std.posix.timespec = undefined;
+            _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        },
+    }
 }
 
 /// Nanoseconds remaining until `deadline_ns` (an absolute `monoNowNs()`
@@ -974,10 +1008,52 @@ fn remainingMs(deadline_ns: u64) i32 {
 /// itself (as opposed to a timeout) is reported as "ready" — the caller's
 /// next `read`/`write` then hits the same condition directly and surfaces
 /// its own, more specific error, rather than this helper swallowing it.
+///
+/// POSIX only: `std.posix.poll` on Windows lowers to `ws2_32.POLL`, which
+/// this Zig version's `std.c` does not define (`ws2_32.zig` has no `POLL`
+/// member) -- a std gap, not something this module can route around by
+/// linking anything. `pollReadyWindows` below is the real Windows path.
 fn pollReady(fd: std.posix.fd_t, events: i16, timeout_ms: i32) bool {
+    if (builtin.os.tag == .windows) return pollReadyWindows(fd, timeout_ms);
     var fds = [1]std.posix.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
     const n = std.posix.poll(&fds, timeout_ms) catch return true;
     return n > 0;
+}
+
+/// Windows has no readiness wait for an anonymous pipe HANDLE the way
+/// `poll(2)` has for a POSIX fd -- `WaitForSingleObject` on a pipe read end
+/// does not mean "readable" the way it does for an event or process handle.
+/// `PeekNamedPipe` is the documented way to ask "are bytes available right
+/// now" without blocking, so this polls it at a coarse interval instead of
+/// getting a real wakeup -- exactly the same "true/false, bounded by
+/// timeout_ms" contract `pollReady`'s POSIX branch has, just busier. A
+/// `PeekNamedPipe` failure (broken pipe, closed handle, ...) is reported as
+/// "ready" for the same reason a `poll` failure is above: the caller's own
+/// next read surfaces the real error.
+fn pollReadyWindows(handle: std.posix.fd_t, timeout_ms: i32) bool {
+    const win = std.os.windows;
+    const K = struct {
+        extern "kernel32" fn PeekNamedPipe(
+            hNamedPipe: win.HANDLE,
+            lpBuffer: ?*anyopaque,
+            nBufferSize: win.DWORD,
+            lpBytesRead: ?*win.DWORD,
+            lpTotalBytesAvail: ?*win.DWORD,
+            lpBytesLeftThisMessage: ?*win.DWORD,
+        ) callconv(.winapi) win.BOOL;
+    };
+    const poll_interval_ms: i32 = 20;
+    var waited_ms: i32 = 0;
+    while (true) {
+        var avail: win.DWORD = 0;
+        const ok = K.PeekNamedPipe(handle, null, 0, null, &avail, null);
+        if (!ok.toBool()) return true;
+        if (avail > 0) return true;
+        if (timeout_ms >= 0 and waited_ms >= timeout_ms) return false;
+        const step_ms: i32 = if (timeout_ms >= 0) @min(poll_interval_ms, timeout_ms - waited_ms) else poll_interval_ms;
+        sleepNs(@as(u64, @intCast(step_ms)) * std.time.ns_per_ms);
+        waited_ms += step_ms;
+    }
 }
 
 fn sleepNs(ns: u64) void {
