@@ -80,12 +80,13 @@
 //! `scalar.zig`, which re-exports std's field verbatim). `--pattern` is how
 //! that attribution gets re-checked instead of believed.
 //!
-//! `ecdsa`'s 10 are the same shape: `ecdsa_recover.zig:126`/`:127` on the
-//! caller's private key, `:105` on the DRBG output, `:106` the RFC 6979 §3.2
+//! `ecdsa`'s 11 (2026-09-16) are the same shape: `ecdsa_recover.zig:189`/`:190` on the
+//! caller's private key, `:118` on the DRBG output, `:119` the RFC 6979 §3.2
 //! retry test (a real branch on the SECRET nonce candidate — probability
 //! ≈2^-127, documented at the source in `ecdsa_recover.zig` rather than
-//! silenced), `group.zig:380`, `:133`/`:134` on `r`, `:136` on `s`, `:143` on
-//! `Ra.x >= n`, and `:152` on low-S. One of `ecdsa`'s five non-in-file
+//! silenced), `group.zig:380`, `:206` (two: `r = x(R) mod n` through
+//! `fromBytes48`) and `:207` on `r`, `:209` on `s`, `:217` on `Ra.x >= n`, and
+//! `:226` on low-S. One of `ecdsa`'s five non-in-file
 //! contexts is memcheck's `Syscall param write(buf)` on the tainted output
 //! itself; it reaches `Io.Writer`, so the driver files it under the
 //! formatting witness rather than dropping it.

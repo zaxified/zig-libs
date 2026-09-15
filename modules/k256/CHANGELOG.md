@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **BEHAVIOURAL (a case no real nonce reaches):**
+  `ecdsa_recover.sign` now derives `r = x(R) mod n`, as ECDSA and std's signer
+  do. It used `Scalar.fromBytes(x(R))`, which rejects `x ≥ n`, so a nonce with
+  `R.x` in `[n, p)` (probability ~2^-128) returned `error.InvalidNonce`
+  instead of a signature, and the recovery-id bit-1 line after it was dead
+  (A1 G7). Every signature with `R.x < n` — all of them in practice, the
+  BOLT#11 anchor included — is byte-identical. New tests pin recid bit 1 on
+  both sides: `recoverPubkey` on a genuine `R.x ≥ n` signature built from
+  public values and verified by std's ECDSA verifier (both parities, plus the
+  `r + n ≥ p` refusal), and `sign` through a comptime commitment parameter of
+  its inner function that the test uses to inject such an `R`.
 - **2026-09-16** — **PERFORMANCE, same results; API addition:** `Secp256k1.mul`
   (constant-time, secret scalar, arbitrary point — the ECDH path of `sphinx`,
   `bolt8`, `bolt3`, `frost`) is now a 65-window signed-digit multiply over a

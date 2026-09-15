@@ -197,7 +197,7 @@ counting rule were added). Three bucket columns, not one, and they sum to
 | `sign` | 32-byte secret key | yes | **yes** | 13 | **11** | 2 | 0 | 99 |
 | `sign` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `sign` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `ecdsa` | 32-byte private key | yes | **yes** | 15 | **10** | 5 | 0 | 99 |
+| `ecdsa` | 32-byte private key | yes | **yes** | 16 | **11** | 5 | 0 | 99 *(2026-09-16, `r = x(R) mod n`; 15/10 before, see below)* |
 | `ecdsa` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `ecdsa` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
 
@@ -247,28 +247,33 @@ so `group.zig:277` appears in the `mul` row only, and `sign`'s pair is
 `group.zig:346` twice. The count was right; the attribution was not. Line
 numbers in this note are the 2026-08-13 ones.)
 
-**The 10 `ecdsa` contexts** — `ecdsa_recover.sign`, RFC 6979 deterministic
+**The 11 `ecdsa` contexts** (lines as of 2026-09-16) — `ecdsa_recover.sign`, RFC 6979 deterministic
 ECDSA, the module's other shipped secret path (in-repo consumer: `lninvoice`'s
 BOLT#11 signer). One is `group.zig:380` again; the rest are validations, with
 one exception that is called out because it is genuinely a branch on secret
 material:
 
-- `ecdsa_recover.zig:126` (via `scalar.zig:87`) / `:127` — canonicality and
+- `ecdsa_recover.zig:189` (via `scalar.zig:87`) / `:190` — canonicality and
   `isZero` on the caller's private key;
-- `ecdsa_recover.zig:105` (via `scalar.zig:87`) — canonicality of the DRBG
+- `ecdsa_recover.zig:118` (via `scalar.zig:87`) — canonicality of the DRBG
   output, inside `rfc6979Nonce`;
-- **`ecdsa_recover.zig:106` — `if (!cand.isZero())`, the RFC 6979 §3.2 retry
+- **`ecdsa_recover.zig:119` — `if (!cand.isZero())`, the RFC 6979 §3.2 retry
   test, a branch on the SECRET nonce candidate.** Retry probability ≈ 2^-127
   (the rejected set `[n, 2^256) ∪ {0}` has size < 2^129 out of 2^256); kept
   because there is no rejection-free variant that still yields the RFC's exact
   nonce, and libsecp256k1's `nonce_function_rfc6979` branches on the same
   condition. Documented at the source, not silenced;
 - `group.zig:380` — `combMulBaseWithTable`'s `rejectIdentity` on `k·G`;
-- `ecdsa_recover.zig:133` (via `scalar.zig:87`) / `:134` — canonicality and
-  `isZero` on `r`;
-- `ecdsa_recover.zig:136` — `s.isZero()`;
-- `ecdsa_recover.zig:143` — `Ra.x.toInt() >= n`, the recid bit-1 case;
-- `ecdsa_recover.zig:152` — `isLowS(s)`, the BIP-62 canonicalisation.
+- `ecdsa_recover.zig:206` (via `reduceToScalar` → `fromBytes48`, `scalar.zig:202`
+  AND `:208` — **two** contexts) / `:207` — `r = x(R) mod n` and `r.isZero()`.
+  Until 2026-09-16 (A1 G7) this was `Scalar.fromBytes(x(R))` — ONE context, and
+  a check that REJECTED `x(R) ≥ n` with `error.InvalidNonce` instead of reducing,
+  which is what the extra context replaced. Both new ones are `fromBytes48`'s
+  canonicality checks on 24-byte chunks padded to 32 bytes: the value is
+  < 2^192 < n, so they cannot fire, and they run on `r`, which is published;
+- `ecdsa_recover.zig:209` — `s.isZero()`;
+- `ecdsa_recover.zig:217` — `Ra.x.toInt() >= n`, the recid bit-1 case;
+- `ecdsa_recover.zig:226` — `isLowS(s)`, the BIP-62 canonicalisation.
 
 `recoverPubkey` is deliberately unmeasured: every one of its inputs is public,
 and it ends in the variable-time `mulDoubleBasePublic`.
@@ -363,6 +368,17 @@ bounded. The GLV decomposition and the endomorphism constants ARE k256's own.
   artifact, not an RFC 6979 one** — RFC 6979 Appendix A.2 publishes vectors for
   DSA and the NIST curves only (A.2.5, P-256, is what `p256` transcribes); it
   has no secp256k1 section.
+- **Recovery-id bit 1, `R.x ≥ n`** (`ecdsa_recover.zig`, A1 G7, 2026-09-16): no
+  signer reaches it (probability ~2^-128), so the vectors are built instead of
+  searched for. For an on-curve `R` with `x = n + t`, `Q = r⁻¹·(s·R − e·G)` with
+  `r = x − n` makes `(r, s)` a valid signature under `Q`; std computes `Q` and
+  std's ECDSA verifier accepts the signature before k256 is consulted.
+  `recoverPubkey` must return exactly `Q` with bit 1 set (both parities), must
+  not with it clear, and must refuse `r = p − n`. On the signing side a comptime
+  commitment parameter of `signInner` lets the test hand the real signing code
+  such an `R`: `recid` bit 1 must be set, `r = x − n`, and recovery must land on
+  std's point for that parity. That test found `sign` rejecting `x(R) ≥ n` with
+  `error.InvalidNonce` instead of reducing it — fixed to `r = x(R) mod n`.
 - **Broken positive control** (`kat_test.zig`): a Solinas fold with `c = 2^32 +
   976` (off by one) disagrees with std on >400/500 random inputs — proving the
   reduction constant is load-bearing and the equality checks have teeth.

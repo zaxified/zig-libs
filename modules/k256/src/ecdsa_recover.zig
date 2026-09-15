@@ -38,6 +38,7 @@ const fieldmod = @import("field.zig");
 const sign_mod = @import("sign.zig");
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+const IdentityElementError = std.crypto.errors.IdentityElementError;
 const Secp256k1 = group.Secp256k1;
 const Fe = fieldmod.Fe;
 const Scalar = scalarmod.Scalar;
@@ -139,10 +140,17 @@ pub const Signature = struct { r: [32]u8, s: [32]u8, recid: u2 };
 /// On return, the stack below this frame that the signing computation used
 /// has been overwritten with zeros (see `burnSignStack`).
 pub fn sign(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
-    const result = signInner(privkey, hash32);
+    const result = signInner(privkey, hash32, Secp256k1.combMulBase);
     burnSignStack();
     return result;
 }
+
+/// The nonce commitment `R = k·G`. A parameter of `signInner` only so a test
+/// can hand the REAL signing code an `R` whose x-coordinate is ≥ n — the
+/// recovery-id bit 1 case (A1/k256.md G7), which a genuine nonce reaches with
+/// probability ~2^-128. Production passes `Secp256k1.combMulBase`, and only
+/// production calls `sign`.
+const CommitFn = fn ([32]u8, std.builtin.Endian) IdentityElementError!Secp256k1;
 
 /// How much stack below `sign`'s frame is zeroed after every signature.
 ///
@@ -177,7 +185,7 @@ noinline fn burnSignStack() void {
     std.crypto.secureZero(u8, &buf);
 }
 
-noinline fn signInner(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
+noinline fn signInner(privkey: [32]u8, hash32: [32]u8, comptime commit: CommitFn) SignError!Signature {
     const d = Scalar.fromBytes(privkey, .big) catch return error.InvalidPrivateKey;
     if (d.isZero()) return error.InvalidPrivateKey;
     const e = reduceToScalar(hash32);
@@ -186,18 +194,26 @@ noinline fn signInner(privkey: [32]u8, hash32: [32]u8) SignError!Signature {
     defer std.crypto.secureZero(u8, std.mem.asBytes(&k));
     var k_bytes = k.toBytes(.big);
     defer std.crypto.secureZero(u8, &k_bytes);
-    const R = Secp256k1.combMulBase(k_bytes, .big) catch return error.InvalidNonce;
+    const R = commit(k_bytes, .big) catch return error.InvalidNonce;
     const Ra = R.affineCoordinates();
-    const r = Scalar.fromBytes(Ra.x.toBytes(.big), .big) catch return error.InvalidNonce;
+    // ECDSA (SEC 1 §4.1.3) defines r = x(R) mod n, and std's signer and
+    // libsecp256k1 both reduce. A1/k256.md G7: this line used to be
+    // `Scalar.fromBytes(x(R))`, which REJECTS x ≥ n — so a nonce whose R.x
+    // landed in [n, p) made `sign` return error.InvalidNonce instead of a
+    // signature, and the recid bit-1 line below could never execute. Measured
+    // through the seam test at the bottom of this file before the change:
+    // "signInner returned error.InvalidNonce for R.x >= n".
+    const r = reduceToScalar(Ra.x.toBytes(.big));
     if (r.isZero()) return error.InvalidNonce;
     const s = k.invert().mul(e.add(r.mul(d)));
     if (s.isZero()) return error.InvalidNonce;
 
     var recid: u2 = if (Ra.y.isOdd()) 1 else 0;
     // bit 1: whether R.x (a field element, < p) needed reduction mod the
-    // (slightly smaller) group order n to produce `r` — astronomically
-    // unlikely for a random R, but handled for correctness (mirrors
-    // `recoverPubkey`'s symmetric handling of the same bit).
+    // (slightly smaller) group order n to produce `r` — probability ~2^-128
+    // for a real nonce, and reachable only since `r` is reduced above rather
+    // than rejected (G7). Pinned by the seam test at the bottom of this file;
+    // mirrors `recoverPubkey`'s handling of the same bit.
     if (Ra.x.toInt() >= scalarmod.field_order) recid |= 2;
 
     // Low-S canonicalization (BIP-62 style): RFC 6979 alone doesn't decide
@@ -232,9 +248,10 @@ pub fn recoverPubkey(hash32: [32]u8, r: [32]u8, s: [32]u8, recid: u2) RecoverErr
     const s_scalar = Scalar.fromBytes(s, .big) catch return error.InvalidScalar;
     if (s_scalar.isZero()) return error.InvalidScalar;
 
-    // u512 headroom: `r` can be up to just under `p` (~2^256), and adding
-    // the group order `n` (~2^256) for the (essentially never taken,
-    // recid-bit-1) x-overflow case would overflow a plain u256.
+    // u512 headroom: `r` passed `Scalar.fromBytes`, so it is < n, and the
+    // recid-bit-1 case reconstructs `x = r + n`, which can reach 2n − 1 > 2^256.
+    // Only `x < p` survives the check below, i.e. `r < p − n` (~2^128.6).
+    // Exercised by the G7 tests at the bottom of this file.
     var x_wide: u512 = std.mem.readInt(u256, &r, .big);
     if (recid & 2 != 0) {
         x_wide += scalarmod.field_order;
@@ -424,6 +441,129 @@ test "RFC 6979 nonce anchor: BOLT#11's own worked example signs to its published
     //     green under a nonce mutation. Only (b) has teeth there.
     const recovered = try recoverPubkey(spec_hash, spec_r, spec_s, spec_recid);
     try testing.expectEqualSlices(u8, &spec_node_id, &recovered.toCompressedSec1());
+}
+
+// ── A1/k256.md G7: recovery-id bit 1, `R.x ≥ n` ─────────────────────────────
+//
+// No signer will ever produce this case (a nonce lands `R.x` in `[n, p)` with
+// probability ~2^-128), and none is needed to test it. Recovery
+// `Q = r⁻¹·(s·R − e·G)` is defined for ANY on-curve `R`, and the `(r, s)` it
+// recovers from is then a VALID signature under `Q`: verification computes
+// `u1·G + u2·Q = e·s⁻¹·G + r·s⁻¹·r⁻¹·(s·R − e·G) = R`, whose x reduces to `r`.
+// So the vectors below are built from public values only, and std's ECDSA
+// verifier — code that shares nothing with this file's recovery — is the
+// oracle that each one is a genuine signature before k256 is asked about it.
+
+const StdCurve = std.crypto.ecc.Secp256k1;
+const StdEcdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
+
+/// The first `x = n + t` (`t ≥ 1`) that is a curve x-coordinate, lifted by std.
+fn highXPoint() !struct { x: u256, p: StdCurve } {
+    var t: u256 = 1;
+    while (t < 1024) : (t += 1) {
+        const x = scalarmod.field_order + t;
+        var xb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &xb, x, .big);
+        const xf = try StdCurve.Fe.fromBytes(xb, .big);
+        const y = StdCurve.recoverY(xf, false) catch continue;
+        return .{ .x = x, .p = try StdCurve.fromAffineCoordinates(.{ .x = xf, .y = y }) };
+    }
+    return error.NoHighX;
+}
+
+fn beInt(b: [32]u8) u256 {
+    return std.mem.readInt(u256, &b, .big);
+}
+
+fn beOf(v: u256) [32]u8 {
+    var b: [32]u8 = undefined;
+    std.mem.writeInt(u256, &b, v, .big);
+    return b;
+}
+
+/// std's `r⁻¹·(s·R − e·G)` — what a correct recovery must return.
+fn stdRecover(hash: [32]u8, r: [32]u8, s: [32]u8, R: StdCurve) !StdCurve {
+    const r_inv = (try Scalar.fromBytes(r, .big)).invert();
+    const e = reduceToScalar(hash);
+    const u_r = (try Scalar.fromBytes(s, .big)).mul(r_inv);
+    const u_g = e.neg().mul(r_inv);
+    return StdCurve.mulDoubleBasePublic(R, u_r.toBytes(.big), StdCurve.basePoint, u_g.toBytes(.big), .big);
+}
+
+test "G7: recoverPubkey honours recid bit 1 on a genuine signature whose R.x >= n (std-verified vector)" {
+    const n = scalarmod.field_order;
+    const hp = try highXPoint();
+    const r = beOf(hp.x - n);
+    const s = beOf(0x5eed_0f_a1_a1_07_6e_b1_7e_0e);
+    const msg = "A1 k256 G7: recovery id bit 1";
+    var hash: [32]u8 = undefined;
+    Sha256.hash(msg, &hash, .{});
+    var sig_rs: [64]u8 = undefined;
+    sig_rs[0..32].* = r;
+    sig_rs[32..64].* = s;
+
+    // Both parities of R: the lifted point has even y, its negation odd y.
+    for ([_]StdCurve{ hp.p, hp.p.neg() }) |R| {
+        const parity: u2 = @intFromBool(R.affineCoordinates().y.isOdd());
+        const q = try stdRecover(hash, r, s, R);
+        const q_sec1 = q.toUncompressedSec1();
+
+        // The oracle: std accepts (r, s) under q as a real ECDSA signature.
+        try (StdEcdsa.Signature.fromBytes(sig_rs)).verifyPrehashed(hash, try StdEcdsa.PublicKey.fromSec1(&q_sec1));
+        try testing.expect(sign_mod.ecdsaVerify(&q_sec1, msg, sig_rs));
+
+        // k256 recovers exactly q with bit 1 set…
+        const got = try recoverPubkey(hash, r, s, 2 | parity);
+        try testing.expectEqualSlices(u8, &q_sec1, &got.toUncompressedSec1());
+
+        // …and something else (or nothing) with bit 1 clear: then R would be
+        // lifted from x = r, a different point.
+        if (recoverPubkey(hash, r, s, parity)) |wrong| {
+            try testing.expect(!std.mem.eql(u8, &q_sec1, &wrong.toUncompressedSec1()));
+        } else |_| {}
+    }
+
+    // The upper bound: r + n must stay below p, so r = p − n is refused.
+    const p = fieldmod.field_order;
+    try testing.expectError(error.InvalidScalar, recoverPubkey(hash, beOf(p - n), s, 2));
+}
+
+test "G7: sign sets recid bit 1 and reduces r when R.x >= n (R injected through the signing seam)" {
+    const n = scalarmod.field_order;
+    const hp = try highXPoint();
+    const enc = hp.p.toUncompressedSec1();
+    const Injected = struct {
+        var point: Secp256k1 = undefined;
+        fn commit(_: [32]u8, _: std.builtin.Endian) IdentityElementError!Secp256k1 {
+            return point;
+        }
+    };
+    Injected.point = try Secp256k1.fromSec1(&enc);
+
+    var privkey: [32]u8 = undefined;
+    for (&privkey, 0..) |*b, i| b.* = @intCast(0x21 +% i);
+    const hash = beOf(0x6b_32_35_36_47_37);
+
+    const sig = signInner(privkey, hash, Injected.commit) catch |err| {
+        std.debug.print("G7 sign seam: signInner returned error.{t} for R.x >= n\n", .{err});
+        return err;
+    };
+    try testing.expect(sig.recid & 2 != 0);
+    try testing.expectEqual(hp.x - n, beInt(sig.r));
+
+    // The signature is not valid under the key (R is not k·G), but its recid
+    // must still name the R it was made with: recovery through k256 lands on
+    // std's `r⁻¹·(s·R' − e·G)` for the R' of that parity — which catches a
+    // low-S flip that forgets to flip the parity bit along with `s`.
+    const R_sel = if ((sig.recid & 1) == @intFromBool(hp.p.affineCoordinates().y.isOdd())) hp.p else hp.p.neg();
+    const want = try stdRecover(hash, sig.r, sig.s, R_sel);
+    const got = try recoverPubkey(hash, sig.r, sig.s, sig.recid);
+    try testing.expectEqualSlices(u8, &want.toUncompressedSec1(), &got.toUncompressedSec1());
+
+    // Positive control on the seam: the production commitment on the same key
+    // and hash gives an ordinary signature, recid bit 1 clear.
+    const real = try sign(privkey, hash);
+    try testing.expect(real.recid & 2 == 0);
 }
 
 test "isLowS: half-order boundary" {
