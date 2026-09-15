@@ -197,7 +197,7 @@ const module_list = [_]Module{
     .{ .name = "smtp", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "imap", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .live = true },
     .{ .name = "iec61850", .libs = &.{"net"}, .deps = &.{"xml"}, .test_deps = &.{"testkit"} },
-    .{ .name = "iec62351", .libs = &.{}, .deps = &.{ "x509", "rsa" }, .test_deps = &.{ "testkit", "iec61850" } },
+    .{ .name = "iec62351", .libs = &.{"net"}, .deps = &.{ "x509", "rsa" }, .test_deps = &.{ "testkit", "iec61850" } },
     .{ .name = "s7comm", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "enip", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "bacnet", .libs = &.{"net"}, .deps = &.{ "netaddr", "websocket" }, .test_deps = &.{"testkit"} },

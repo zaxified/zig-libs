@@ -233,10 +233,11 @@ independent correctness signal beyond the byte-exact numbers.
 
 ## Anchoring
 
-**Anchor grade:** class B · oracle REDERIVED + EXTERNAL
+**Anchor grade:** class B · oracle MIXED
 
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
-- **Oracle REDERIVED + EXTERNAL** — `kat_vectors.zig` is an in-house oracle
+- **Oracle MIXED** — REDERIVED for one vector set, EXTERNAL for another — the
+  evidence below names which. `kat_vectors.zig` is an in-house oracle
   re-deriving the answer by a different route (catches implementation typos;
   does NOT catch a shared misreading of the spec). `interop_vectors.zig`
   closes that gap: twelve pre-signatures ORIGINATED by an independent
