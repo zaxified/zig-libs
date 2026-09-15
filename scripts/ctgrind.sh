@@ -1214,8 +1214,7 @@ while IFS=$'\t' read -r em emode etarget etotal_min ein_file esrc eout; do
     IFS=$'\t' read -r _ _ _ _ _ total in_file _ _ _ _ rowlog _ <<<"$line"
     # `N` pins an exact count; `>=N` / `<=N` pin only the direction. Exact is
     # for the numbers a SPEC.md states as a fact about the module (ed448's
-    # three `Fe.invert` validations, ecvrf's three try-and-increment
-    # branches, and every claimed zero). A bound is for counts that a
+    # three `Fe.invert` validations, and every claimed zero). A bound is for counts that a
     # compiler or std change legitimately moves — the ReleaseSafe/Debug
     # overflow-check floods, and std's own `rejectIdentity` context that
     # ct25519's negative control depends on merely EXISTING.
