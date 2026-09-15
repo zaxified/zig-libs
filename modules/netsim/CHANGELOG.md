@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** the audit F10 regression
+  test now counts log entries actually stored instead of timing `replay`
+  (a wall-clock `<=` guard that turned out not to reliably catch the audited
+  defect at all -- see the fix commit). Adds two test-only functions,
+  `resetLogEntriesStoredForTesting`/`logEntriesStoredForTesting`, and a
+  `builtin.is_test`-gated counter ticked once per `LogEntry` that reaches
+  `Sim.append`'s storage; zero-sized and a no-op outside a test build, so
+  `replay`/`Sim` behaviour is unchanged.
 - **2026-09-11** — A1 fix campaign (fixer slot `c`), netsim F2, F3, F4
   (last gap), F6, F8. **BEHAVIOURAL and API-breaking**, user-approved
   (Q7/Q8): all 7 in-repo consumers (`raft`, `df-elect`, `loopfree-reconv`,
