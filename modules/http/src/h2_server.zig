@@ -532,6 +532,16 @@ fn connOptions(opts: Options) h2.Connection.Options {
 }
 
 pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
+    serveTuned(gpa, opts, in, out, .{});
+}
+
+/// Internal knobs that are not product surface: tests and benches only.
+const Tuning = struct {
+    /// See `Session.reuse_arenas`.
+    reuse_arenas: bool = true,
+};
+
+fn serveTuned(gpa: Allocator, opts: Options, in: *Reader, out: *Writer, tuning: Tuning) void {
     var s: Session = .{
         .gpa = gpa,
         .opts = opts,
@@ -539,6 +549,7 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
         .out = out,
         .threaded = opts.dispatcher != null,
         .conn = .init(gpa, .server, connOptions(opts)),
+        .reuse_arenas = tuning.reuse_arenas,
     };
     defer s.deinit();
     s.run();
@@ -665,7 +676,7 @@ const Session = struct {
     /// worker thread: `conn` (HPACK encoder *and* decoder, both flow-control
     /// windows, the stream table), `wire`, `out`, `events`, `jobs` (the map
     /// *and* every `Job` in it), `req_index`, `peer_goaway`, `inflight`,
-    /// `closing`.
+    /// `closing`, `spare_arenas`/`spare_arena_count`.
     ///
     /// `std.atomic.Mutex` + yield-spin rather than a blocking mutex: Zig
     /// 0.16 std has no `std.Thread.Mutex`/`Condition`/`Futex`, and the
@@ -699,6 +710,79 @@ const Session = struct {
     /// keep waiting for a peer nobody is reading from any more.
     gone: std.atomic.Value(bool) = .init(false),
 
+    // ── request arenas (F14) ───────────────────────────────────────────────
+
+    /// Arenas of finished requests, reset and kept for the next `serveJob`
+    /// on this connection. Under `mu`, like everything a worker can reach.
+    ///
+    /// ⭐ **Ownership rule — an arena belongs to exactly one `serveJob` call
+    /// from `takeArena` to `giveArena`, and to nobody while it sits here.**
+    /// Nothing is ever allocated from a spare, and a spare is never reset by
+    /// anyone but the call that is giving it back — so no two threads ever
+    /// touch one arena, and the pool itself is two fields behind the lock
+    /// every worker already takes several times per request.
+    ///
+    /// ⛔ The obvious fix — ONE arena per connection, `reset` after each
+    /// request — is a cross-thread use-after-free with `Options.dispatcher`:
+    /// up to `max_concurrent_handlers` requests of one connection are inside
+    /// `serveJob` at once, on different threads, and a reset by the first to
+    /// finish frees what the others are still writing. Three independent
+    /// reviews reached that before this was written; the concurrency test
+    /// "request arenas: many streams × connections" is RED on that mutant.
+    ///
+    /// Why the check-in point is safe: every pointer into a request's arena
+    /// (`Request.path`/`header_block`/`trailer_block`, `ResponseWriter`'s
+    /// body buffer, `Framer`, `StreamBody`) lives in `serveJob`'s own frame,
+    /// and `giveArena` runs as that frame's last `defer` — the exact point
+    /// where the arena used to be `deinit`ed. Nothing outlives it: a detached
+    /// response (`detachJob`) flushes the framer before returning for that
+    /// reason, the dispatcher path ignores detach, and a handler that errors,
+    /// is canceled mid-read, or loses its connection (`gone`) still returns
+    /// through the same `defer`. The arena goes back reset, never half-used.
+    spare_arenas: [max_spare_arenas]std.heap.ArenaAllocator.State = undefined,
+    spare_arena_count: u8 = 0,
+    /// Test seam (see `Tuning`): false = a fresh arena per request, the
+    /// shape before F14, so a bench can run both arms in one binary.
+    reuse_arenas: bool = true,
+
+    /// At most this many spares per connection. Sequential mode never needs
+    /// more than one; a dispatcher at its default per-connection cap (8)
+    /// never more than eight. Beyond it an arena is simply freed.
+    const max_spare_arenas = 8;
+
+    /// What a spare may keep, in bytes. Bounds the idle memory of one
+    /// connection at `max_spare_arenas × arena_retain_bytes` whatever one
+    /// request allocated (a large `response_buffer_size`, a big trailer
+    /// block): the rest goes back to `gpa` at check-in, as it did before.
+    const arena_retain_bytes = 32 * 1024;
+
+    fn takeArena(s: *Session) std.heap.ArenaAllocator {
+        s.lock();
+        defer s.unlock();
+        if (s.spare_arena_count == 0) return .init(s.gpa);
+        s.spare_arena_count -= 1;
+        return s.spare_arenas[s.spare_arena_count].promote(s.gpa);
+    }
+
+    /// **The caller must be the `serveJob` that took `arena`, at its very
+    /// end** — see `spare_arenas` for why that is the only safe point.
+    fn giveArena(s: *Session, arena: *std.heap.ArenaAllocator) void {
+        // Reset while the arena is still exclusively ours, outside the lock:
+        // `ArenaAllocator.reset` is not thread-safe, and it does not need to
+        // be — no other thread can hold this arena yet.
+        if (s.reuse_arenas and arena.reset(.{ .retain_with_limit = arena_retain_bytes })) {
+            s.lock();
+            const kept = s.spare_arena_count < max_spare_arenas;
+            if (kept) {
+                s.spare_arenas[s.spare_arena_count] = arena.state;
+                s.spare_arena_count += 1;
+            }
+            s.unlock();
+            if (kept) return;
+        }
+        arena.deinit();
+    }
+
     /// Take `mu` (no-op on the sequential path). Yield-spin: this lock is
     /// held across blocking writes, so a plain `spinLoopHint` spin could
     /// starve the holder on a busy core — same reasoning, same shape as
@@ -727,6 +811,9 @@ const Session = struct {
     }
 
     fn deinit(s: *Session) void {
+        // Every `giveArena` has run: `run` returns only once `inflight` is 0,
+        // and a worker gives its arena back before it decrements `inflight`.
+        for (s.spare_arenas[0..s.spare_arena_count]) |st| st.promote(s.gpa).deinit();
         for (s.jobs.values()) |*job| job.deinit(s.gpa);
         s.jobs.deinit(s.gpa);
         s.events.deinit(s.gpa); // always drained by processEvents
@@ -1412,8 +1499,11 @@ const Session = struct {
             return .close;
         }
 
-        var arena_state = std.heap.ArenaAllocator.init(s.gpa);
-        defer arena_state.deinit();
+        // F14: a reused arena, owned by this call alone until the `defer`
+        // below — which must stay the frame's first `defer` (so it runs
+        // last) and is the whole lifetime argument; see `spare_arenas`.
+        var arena_state = s.takeArena();
+        defer s.giveArena(&arena_state);
         const arena = arena_state.allocator();
 
         // ── §8.3 pseudo-headers + §8.2 header validity ──────────────────
@@ -5416,4 +5506,575 @@ test "dispatcher: the connection window bounds two concurrent senders (§6.9.1)"
     // The connection window really was the binding constraint: more octets
     // were delivered than it ever held at once.
     try testing.expect(fw.data_bytes.load(.acquire) > fc_grant);
+}
+
+// ── F14: what the per-request arena costs (opt-in bench) ────────────────────
+//
+// `~/CML/20260901-zig-libs-audit/A1/http.md` F14. Opt-in and optimized-only,
+// same shape as the G7 benches in `conneg.zig`: a wall-clock number in the
+// default gate, beside other lanes, is a flaky test waiting to happen. Run:
+//   HTTP_BENCH_F14=1 LINES=200 scripts/modtest http -Doptimize=ReleaseFast -Dtest-filter=F14
+//
+// Every arm is checked for COMPLETION (one END_STREAM per request, zero
+// RST_STREAM) before its time counts: a server that refuses streams is fast.
+
+const f14_big_body: [16 * 1024]u8 = @splat('b');
+
+fn f14Handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    if (std.mem.eql(u8, req.path, "/big")) return rw.writeAll(&f14_big_body);
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.writeAll("hello");
+}
+
+/// Server output sink: counts finished and reset streams as frames go by and
+/// keeps O(one frame) of the bytes, so a 20 000-request run does not measure
+/// an ever-growing capture buffer.
+const F14Sink = struct {
+    buf: std.ArrayList(u8) = .empty,
+    scan: usize = 0,
+    ends: std.atomic.Value(usize) = .init(0),
+    rsts: std.atomic.Value(usize) = .init(0),
+    data_bytes: std.atomic.Value(usize) = .init(0),
+    /// Keep every byte (for a `TestPeer` to decode afterwards) instead of
+    /// compacting after each scan.
+    capture: bool = false,
+    writer: Writer,
+
+    const page = std.heap.page_allocator;
+
+    fn init(buffer: []u8) !F14Sink {
+        var s: F14Sink = .{ .writer = .{ .vtable = &.{ .drain = drainFn }, .buffer = buffer } };
+        try s.buf.ensureTotalCapacity(page, 1 << 20);
+        return s;
+    }
+
+    fn deinit(s: *F14Sink) void {
+        s.buf.deinit(page);
+    }
+
+    fn finished(s: *const F14Sink) usize {
+        return s.ends.load(.acquire) + s.rsts.load(.acquire);
+    }
+
+    fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const s: *F14Sink = @alignCast(@fieldParentPtr("writer", w));
+        s.buf.appendSlice(page, w.buffer[0..w.end]) catch return error.WriteFailed;
+        w.end = 0;
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            s.buf.appendSlice(page, d) catch return error.WriteFailed;
+            consumed += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| s.buf.appendSlice(page, last) catch return error.WriteFailed;
+        consumed += last.len * splat;
+        s.classify();
+        return consumed;
+    }
+
+    fn classify(s: *F14Sink) void {
+        while (s.buf.items.len - s.scan >= 9) {
+            const h = s.buf.items[s.scan..][0..9];
+            const len = (@as(usize, h[0]) << 16) | (@as(usize, h[1]) << 8) | h[2];
+            if (s.buf.items.len - s.scan < 9 + len) break;
+            switch (h[3]) {
+                0x0 => {
+                    _ = s.data_bytes.fetchAdd(len, .acq_rel);
+                    if (h[4] & 0x1 != 0) _ = s.ends.fetchAdd(1, .acq_rel);
+                },
+                0x1 => if (h[4] & 0x1 != 0) {
+                    _ = s.ends.fetchAdd(1, .acq_rel);
+                },
+                0x3 => _ = s.rsts.fetchAdd(1, .acq_rel),
+                else => {},
+            }
+            s.scan += 9 + len;
+        }
+        if (s.capture) return;
+        const rest = s.buf.items.len - s.scan;
+        std.mem.copyForwards(u8, s.buf.items[0..rest], s.buf.items[s.scan..]);
+        s.buf.shrinkRetainingCapacity(rest);
+        s.scan = 0;
+    }
+};
+
+/// Client wire for `n` GETs, cut into batches: the reader releases batch k+1
+/// only once every stream of batch k has finished — the shape of a client
+/// that keeps `batch` requests in flight, and the reason no stream is ever
+/// refused for `max_concurrent_streams`.
+const F14Load = struct {
+    wire: []u8,
+    cuts: []Cut,
+    n: usize,
+
+    const Cut = struct { end: usize, streams: usize };
+
+    fn init(gpa: Allocator, n: usize, batch: usize, path: []const u8) !F14Load {
+        var wire: std.ArrayList(u8) = .empty;
+        errdefer wire.deinit(gpa);
+        var cuts: std.ArrayList(Cut) = .empty;
+        errdefer cuts.deinit(gpa);
+        try wire.appendSlice(gpa, h2.preface);
+        try h2.encodeSettings(gpa, &wire, .{ .initial_window_size = h2.max_window_size });
+        try h2.encodeWindowUpdate(gpa, &wire, 0, @intCast(h2.max_window_size - h2.default_initial_window_size));
+        var enc: hpack.Encoder = .init(gpa, .{});
+        defer enc.deinit();
+        var block: std.ArrayList(u8) = .empty;
+        defer block.deinit(gpa);
+        var id: u31 = 1;
+        for (0..n) |i| {
+            block.clearRetainingCapacity();
+            try enc.encodeBlock(&fieldsFor("GET", path), &block);
+            try h2.encodeHeaders(gpa, &wire, id, block.items, .{ .end_headers = true, .end_stream = true });
+            id += 2;
+            if ((i + 1) % batch == 0 or i + 1 == n)
+                try cuts.append(gpa, .{ .end = wire.items.len, .streams = i + 1 });
+        }
+        return .{ .wire = try wire.toOwnedSlice(gpa), .cuts = try cuts.toOwnedSlice(gpa), .n = n };
+    }
+
+    fn deinit(l: *F14Load, gpa: Allocator) void {
+        gpa.free(l.wire);
+        gpa.free(l.cuts);
+    }
+};
+
+const F14Reader = struct {
+    io: std.Io,
+    load: *const F14Load,
+    sink: *const F14Sink,
+    idx: usize = 0,
+    pos: usize = 0,
+    reader: Reader,
+
+    fn init(io: std.Io, load: *const F14Load, sink: *const F14Sink, buffer: []u8) F14Reader {
+        return .{
+            .io = io,
+            .load = load,
+            .sink = sink,
+            .reader = .{ .vtable = &.{ .stream = streamFn }, .buffer = buffer, .seek = 0, .end = 0 },
+        };
+    }
+
+    fn waitFinished(fr: *F14Reader, n: usize) error{ReadFailed}!void {
+        const deadline = nowNs(fr.io) + @as(i96, gate_timeout_ms) * std.time.ns_per_ms;
+        while (fr.sink.finished() < n) {
+            if (nowNs(fr.io) >= deadline) return error.ReadFailed;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+    }
+
+    fn streamFn(r: *Reader, w: *Writer, limit: std.Io.Limit) Reader.StreamError!usize {
+        const fr: *F14Reader = @alignCast(@fieldParentPtr("reader", r));
+        const cuts = fr.load.cuts;
+        if (fr.idx == cuts.len) {
+            // Hold EOF back until the last batch is answered: EOF ends the
+            // connection task, and undispatched streams would die with it.
+            try fr.waitFinished(fr.load.n);
+            return error.EndOfStream;
+        }
+        const start = if (fr.idx == 0) 0 else cuts[fr.idx - 1].end;
+        if (fr.pos == start and fr.idx != 0) try fr.waitFinished(cuts[fr.idx - 1].streams);
+        const src = limit.sliceConst(fr.load.wire[fr.pos..cuts[fr.idx].end]);
+        try w.writeAll(src);
+        fr.pos += src.len;
+        if (fr.pos == cuts[fr.idx].end) fr.idx += 1;
+        return src.len;
+    }
+};
+
+/// Allocation census over any backing allocator.
+const F14Count = struct {
+    backing: Allocator,
+    allocs: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(c: *F14Count) Allocator {
+        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const c: *F14Count = @ptrCast(@alignCast(ctx));
+        _ = c.allocs.fetchAdd(1, .monotonic);
+        return c.backing.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const c: *F14Count = @ptrCast(@alignCast(ctx));
+        return c.backing.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const c: *F14Count = @ptrCast(@alignCast(ctx));
+        return c.backing.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const c: *F14Count = @ptrCast(@alignCast(ctx));
+        c.backing.rawFree(m, a, ra);
+    }
+};
+
+const F14Conn = struct {
+    gpa: Allocator,
+    io: std.Io,
+    load: *const F14Load,
+    dispatcher: ?Dispatcher,
+    reuse: bool,
+    ok: bool = false,
+
+    fn run(c: *F14Conn) void {
+        var rbuf: [16 * 1024]u8 = undefined;
+        var wbuf: [16 * 1024]u8 = undefined;
+        var sink = F14Sink.init(&wbuf) catch return;
+        defer sink.deinit();
+        var rd: F14Reader = .init(c.io, c.load, &sink, &rbuf);
+        serveTuned(c.gpa, .{
+            .handler = f14Handler,
+            .dispatcher = c.dispatcher,
+            .limits = .{ .max_streams_per_connection = 1 << 30 },
+        }, &rd.reader, &sink.writer, .{ .reuse_arenas = c.reuse });
+        c.ok = sink.ends.load(.acquire) == c.load.n and sink.rsts.load(.acquire) == 0;
+    }
+};
+
+/// One timed pass: `conns` connections at once, each on its own thread.
+/// Returns ns per request, or an error when any stream did not finish.
+fn f14Pass(gpa: Allocator, io: std.Io, load: *const F14Load, conns: usize, threaded: bool, reuse: bool) !u64 {
+    var pd: ?PoolDispatcher = if (threaded) try PoolDispatcher.init(std.heap.smp_allocator, io, 8, 256) else null;
+    defer if (pd) |*d| d.deinit();
+    var cs: [8]F14Conn = undefined;
+    var ths: [8]std.Thread = undefined;
+    for (cs[0..conns]) |*c| c.* = .{
+        .gpa = gpa,
+        .io = io,
+        .load = load,
+        .dispatcher = if (pd) |*d| d.iface(8) else null,
+        .reuse = reuse,
+    };
+    const t0 = nowNs(io);
+    if (conns == 1) {
+        cs[0].run();
+    } else {
+        for (cs[0..conns], ths[0..conns]) |*c, *t| t.* = try std.Thread.spawn(.{}, F14Conn.run, .{c});
+        for (ths[0..conns]) |t| t.join();
+    }
+    const t1 = nowNs(io);
+    for (cs[0..conns]) |c| if (!c.ok) return error.F14Incomplete;
+    return @intCast(@divTrunc(t1 - t0, @as(i96, @intCast(load.n * conns))));
+}
+
+fn f14H1Pass(io: std.Io, wire: []const u8, n: usize, out_buf: []u8) !u64 {
+    var head_buf: [16 * 1024]u8 = undefined;
+    var rq_buf: [4096]u8 = undefined;
+    var rs_buf: [4096]u8 = undefined;
+    var ck_buf: [512]u8 = undefined;
+    var tr_buf: [1024]u8 = undefined;
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    const t0 = nowNs(io);
+    Server.serveStream(.{ .handler = f14Handler }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &rq_buf,
+        .response_body = &rs_buf,
+        .chunk = &ck_buf,
+        .trailers = &tr_buf,
+    });
+    const t1 = nowNs(io);
+    if (std.mem.count(u8, out.buffered(), "HTTP/1.1 200 OK\r\n") != n) return error.F14Incomplete;
+    return @intCast(@divTrunc(t1 - t0, @as(i96, @intCast(n))));
+}
+
+test "bench (opt-in via HTTP_BENCH_F14): h2 per-request arena cost" {
+    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_F14") == null) return error.SkipZigTest;
+    const page = std.heap.page_allocator;
+    const smp = std.heap.smp_allocator;
+    var threaded_io = std.Io.Threaded.init(page, .{});
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    const n: usize = 20_000;
+    var lock1 = try F14Load.init(page, n, 1, "/hello");
+    defer lock1.deinit(page);
+    var b50 = try F14Load.init(page, n, 50, "/hello");
+    defer b50.deinit(page);
+    var big = try F14Load.init(page, 4_000, 50, "/big");
+    defer big.deinit(page);
+
+    var dbg: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = dbg.deinit();
+
+    // Allocation census, single connection, sequential, both arena policies.
+    for ([_]bool{ false, true }) |reuse| {
+        var cnt: F14Count = .{ .backing = smp };
+        _ = try f14Pass(cnt.allocator(), io, &b50, 1, false, reuse);
+        std.debug.print("F14 census h2 seq b50 reuse={}: {d} allocs / {d} req = {d:.2}/req\n", .{
+            reuse, cnt.allocs.load(.acquire), n, @as(f64, @floatFromInt(cnt.allocs.load(.acquire))) / @as(f64, @floatFromInt(n)),
+        });
+    }
+
+    var h1wire: std.ArrayList(u8) = .empty;
+    defer h1wire.deinit(page);
+    for (0..n) |_| try h1wire.appendSlice(page, "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    const h1out = try page.alloc(u8, 32 << 20);
+    defer page.free(h1out);
+
+    // A/B pairs, interleaved inside every rep (fresh arena per request vs
+    // reused), so drift over the run lands on both arms alike. Each pair's
+    // ratio is taken per rep — one instant — and its spread printed.
+    const Arm = struct { name: []const u8, load: ?*const F14Load, conns: usize, threaded: bool, dbg: bool };
+    const arms = [_]Arm{
+        .{ .name = "h2 seq  lockstep  smp 1c", .load = &lock1, .conns = 1, .threaded = false, .dbg = false },
+        .{ .name = "h2 seq  b50       smp 1c", .load = &b50, .conns = 1, .threaded = false, .dbg = false },
+        .{ .name = "h2 disp b50       smp 1c", .load = &b50, .conns = 1, .threaded = true, .dbg = false },
+        .{ .name = "h2 seq  b50       smp 4c", .load = &b50, .conns = 4, .threaded = false, .dbg = false },
+        .{ .name = "h2 disp b50       smp 4c", .load = &b50, .conns = 4, .threaded = true, .dbg = false },
+        .{ .name = "h2 seq  b50       dbg 1c", .load = &b50, .conns = 1, .threaded = false, .dbg = true },
+        .{ .name = "h2 seq  16KiB b50 smp 1c", .load = &big, .conns = 1, .threaded = false, .dbg = false },
+        .{ .name = "h1 pipelined      --- 1c", .load = null, .conns = 1, .threaded = false, .dbg = false },
+    };
+    const reps = 9;
+    var ns: [arms.len][2][reps]u64 = undefined;
+    var ratio: [arms.len][reps]f64 = undefined;
+    for (0..reps) |r| {
+        for (arms, 0..) |arm, a| {
+            for ([_]bool{ false, true }, 0..) |reuse, k| {
+                ns[a][k][r] = if (arm.load) |l|
+                    try f14Pass(if (arm.dbg) dbg.allocator() else smp, io, l, arm.conns, arm.threaded, reuse)
+                else
+                    try f14H1Pass(io, h1wire.items, n, h1out);
+            }
+            ratio[a][r] = @as(f64, @floatFromInt(ns[a][0][r])) / @as(f64, @floatFromInt(ns[a][1][r]));
+        }
+    }
+    for (arms, 0..) |arm, a| {
+        for (0..2) |k| std.mem.sort(u64, &ns[a][k], {}, std.sort.asc(u64));
+        std.mem.sort(f64, &ratio[a], {}, std.sort.asc(f64));
+        std.debug.print("F14 {s}: fresh min {d} med {d} max {d} | reuse min {d} med {d} max {d} | fresh/reuse per rep min {d:.3} med {d:.3} max {d:.3}\n", .{
+            arm.name,
+            ns[a][0][0],
+            ns[a][0][reps / 2],
+            ns[a][0][reps - 1],
+            ns[a][1][0],
+            ns[a][1][reps / 2],
+            ns[a][1][reps - 1],
+            ratio[a][0],
+            ratio[a][reps / 2],
+            ratio[a][reps - 1],
+        });
+    }
+}
+
+// ── request arenas (F14): the reuse, its bounds, and real concurrency ───────
+
+test "request arenas: a connection reuses them — fewer allocations per request (F14)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const n = 64;
+    var load = try F14Load.init(gpa, n, 1, "/hello");
+    defer load.deinit(gpa);
+    var counts: [2]usize = undefined;
+    for ([_]bool{ false, true }, &counts) |reuse, *count| {
+        var cnt: F14Count = .{ .backing = gpa };
+        _ = try f14Pass(cnt.allocator(), io, &load, 1, false, reuse);
+        count.* = cnt.allocs.load(.acquire);
+    }
+    // Measured 2026-09-16: 7 allocations per request with a fresh arena,
+    // 4 with a reused one — the three arena nodes one request grows. Two per
+    // request (the first request still grows its arena) is the floor that
+    // tells "reused" from "freed and allocated again".
+    try testing.expect(counts[0] >= counts[1] + 2 * (n - 1));
+}
+
+test "request arenas: a spare keeps at most arena_retain_bytes, a connection at most max_spare_arenas (F14)" {
+    const gpa = testing.allocator;
+    var in: Reader = .fixed("");
+    var out_buf: [16]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    const opts: Options = .{ .handler = testHandler };
+    var s: Session = .{ .gpa = gpa, .opts = opts, .in = &in, .out = &out, .conn = .init(gpa, .server, connOptions(opts)) };
+    defer s.deinit();
+
+    // One request that allocated far past the cap (a large
+    // `response_buffer_size` does exactly this): it is kept, but trimmed.
+    {
+        var a = s.takeArena();
+        _ = try a.allocator().alloc(u8, 1 << 20);
+        s.giveArena(&a);
+    }
+    try testing.expectEqual(@as(u8, 1), s.spare_arena_count);
+    const kept = s.spare_arenas[0].promote(gpa);
+    try testing.expect(kept.queryCapacity() > 0);
+    try testing.expect(kept.queryCapacity() <= Session.arena_retain_bytes);
+
+    // More requests in flight at once than the pool holds: the extras are
+    // freed on the way back, not kept (the leak check is what proves freed).
+    var many: [Session.max_spare_arenas + 3]std.heap.ArenaAllocator = undefined;
+    for (&many) |*a| {
+        a.* = s.takeArena();
+        _ = try a.allocator().alloc(u8, 100);
+    }
+    for (&many) |*a| s.giveArena(a);
+    try testing.expectEqual(@as(u8, Session.max_spare_arenas), s.spare_arena_count);
+}
+
+// The concurrency test the ownership rule in `Session.spare_arenas` stands
+// on. Four connections at once, each multiplexing 240 streams into a shared
+// pool of 8 workers, 8 handlers per connection in flight. Every byte that
+// comes back is checked against what THAT stream should have produced, and
+// the request's arena is in the path of all of it: the tag echoed from
+// `Request.header` (the synthesized header block), the 1.5 KiB bodies (held
+// in the arena's `ResponseWriter` buffer until the handler returns), the
+// 9 KiB ones (through the framer's arena lists). A handler yields after
+// every 512 B so that workers interleave inside `serveJob`, which is where a
+// shared or early-reset arena would hand one stream's bytes to another.
+// Error paths are in the mix: a planned failure before any byte (500), and
+// one after the head is on the wire (RST_STREAM) — both return their arena
+// through the same `defer`, and the stream after them must still be intact.
+//
+// `HTTP_ARENA_ROUNDS=N` repeats it (default 3 in the gate).
+
+const arena_conns = 4;
+const arena_streams = 240;
+const arena_batch = 24;
+
+fn arenaTag(buf: *[16]u8, conn: usize, k: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "t{d}-{d}", .{ conn, k }) catch unreachable;
+}
+
+fn arenaBodyLen(k: usize) usize {
+    return if (k % 2 == 0) 1500 + k % 97 else 9000 + k % 113;
+}
+
+const ArenaOutcome = enum { ok, status500, reset };
+
+fn arenaOutcome(k: usize) ArenaOutcome {
+    if (k % 11 == 5) return .status500;
+    if (k % 13 == 7) return .reset;
+    return .ok;
+}
+
+fn arenaHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    const tag = req.header("x-tag") orelse return error.TagMissing;
+    const k = std.fmt.parseInt(usize, req.path["/a/".len..], 10) catch return error.BadPath;
+    const outcome = arenaOutcome(k);
+    if (outcome == .status500) return error.PlannedFailure;
+    try rw.setHeader("x-tag", tag);
+    // > `response_buffer_size`: the head is on the wire when it fails.
+    const stop = if (outcome == .reset) 6000 else arenaBodyLen(k);
+    var chunk: [512]u8 = undefined;
+    var sent: usize = 0;
+    while (sent < stop) {
+        const m = @min(chunk.len, stop - sent);
+        for (chunk[0..m], sent..) |*b, i| b.* = tag[i % tag.len];
+        try rw.writeAll(chunk[0..m]);
+        sent += m;
+        std.Thread.yield() catch {};
+    }
+    if (outcome == .reset) return error.PlannedFailure;
+}
+
+const ArenaConn = struct {
+    gpa: Allocator,
+    io: std.Io,
+    idx: usize,
+    dispatcher: Dispatcher,
+    peer: TestPeer,
+    load: F14Load,
+    sink: F14Sink,
+    wbuf: [16 * 1024]u8 = undefined,
+    sids: [arena_streams]u31 = undefined,
+
+    fn stage(c: *ArenaConn) !void {
+        try c.peer.conn.sendPreface(&c.peer.wire);
+        try c.peer.conn.sendWindowUpdate(&c.peer.wire, 0, @intCast(h2.max_window_size - h2.default_initial_window_size));
+        var cuts: std.ArrayList(F14Load.Cut) = .empty;
+        defer cuts.deinit(c.gpa);
+        for (0..arena_streams) |k| {
+            var tag_buf: [16]u8 = undefined;
+            var path_buf: [16]u8 = undefined;
+            const fields = [_]hpack.Field{
+                .{ .name = ":method", .value = "GET" },
+                .{ .name = ":scheme", .value = "http" },
+                .{ .name = ":path", .value = std.fmt.bufPrint(&path_buf, "/a/{d}", .{k}) catch unreachable },
+                .{ .name = ":authority", .value = "t" },
+                .{ .name = "x-tag", .value = arenaTag(&tag_buf, c.idx, k) },
+            };
+            c.sids[k] = try c.peer.conn.startStream(&c.peer.wire, &fields, true);
+            if ((k + 1) % arena_batch == 0 or k + 1 == arena_streams)
+                try cuts.append(c.gpa, .{ .end = c.peer.wire.items.len, .streams = k + 1 });
+        }
+        c.load = .{ .wire = try c.gpa.dupe(u8, c.peer.wire.items), .cuts = try cuts.toOwnedSlice(c.gpa), .n = arena_streams };
+        c.peer.wire.clearRetainingCapacity();
+    }
+
+    fn run(c: *ArenaConn) void {
+        var rbuf: [16 * 1024]u8 = undefined;
+        var rd: F14Reader = .init(c.io, &c.load, &c.sink, &rbuf);
+        serve(c.gpa, .{ .handler = arenaHandler, .dispatcher = c.dispatcher }, &rd.reader, &c.sink.writer);
+    }
+
+    fn verify(c: *ArenaConn) !void {
+        try c.peer.feed(c.sink.buf.items);
+        try testing.expectEqual(@as(?h2.ErrorCode, null), c.peer.goaway);
+        for (c.sids, 0..) |sid, k| {
+            const r = c.peer.resps.getPtr(sid) orelse return error.StreamLost;
+            var tag_buf: [16]u8 = undefined;
+            const tag = arenaTag(&tag_buf, c.idx, k);
+            switch (arenaOutcome(k)) {
+                .status500 => {
+                    try testing.expectEqual(@as(u16, 500), r.status);
+                    try testing.expect(r.end);
+                },
+                .reset => try testing.expectEqual(@as(?h2.ErrorCode, .internal_error), r.rst),
+                .ok => {
+                    try testing.expectEqual(@as(u16, 200), r.status);
+                    try testing.expectEqual(@as(?h2.ErrorCode, null), r.rst);
+                    try testing.expect(r.end);
+                    try testing.expectEqualStrings(tag, r.header("x-tag") orelse return error.TagLost);
+                    try testing.expectEqual(arenaBodyLen(k), r.body.items.len);
+                    for (r.body.items, 0..) |b, i| if (b != tag[i % tag.len]) return error.BodyCorrupted;
+                },
+            }
+        }
+    }
+};
+
+test "request arenas: many streams × connections, content-checked (F14)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const rounds_env = std.testing.environ.getPosix("HTTP_ARENA_ROUNDS");
+    const rounds: usize = if (rounds_env) |v| std.fmt.parseInt(usize, v, 10) catch 3 else 3;
+    var pd = try PoolDispatcher.init(gpa, io, 8, 64);
+    defer pd.deinit();
+
+    for (0..rounds) |_| {
+        var conns: [arena_conns]ArenaConn = undefined;
+        for (&conns, 0..) |*c, i| {
+            c.* = .{
+                .gpa = gpa,
+                .io = io,
+                .idx = i,
+                .dispatcher = pd.iface(8),
+                .peer = .init(gpa, .{ .initial_window_size = 1 << 24 }),
+                .load = undefined,
+                .sink = undefined,
+            };
+            c.sink = try F14Sink.init(&c.wbuf);
+            c.sink.capture = true;
+            try c.stage();
+        }
+        defer for (&conns) |*c| {
+            c.load.deinit(gpa);
+            c.sink.deinit();
+            c.peer.deinit();
+        };
+        var ths: [arena_conns]std.Thread = undefined;
+        for (&conns, &ths) |*c, *t| t.* = try std.Thread.spawn(.{}, ArenaConn.run, .{c});
+        for (ths) |t| t.join();
+        for (&conns) |*c| try c.verify();
+    }
+    if (rounds_env != null)
+        std.debug.print("F14 arena concurrency: {d} rounds x {d} conns x {d} streams, every response content-checked\n", .{ rounds, arena_conns, arena_streams });
 }

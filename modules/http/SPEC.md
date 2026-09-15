@@ -28,7 +28,17 @@ peer needs to send the END_STREAM the dispatch waits for → deadlock above the 
 is bounded by `max_body_bytes` instead), streaming bodies on *consumption* (same policy and argument
 as `h2_client.readBody` — unread octets then cannot exceed the advertised window). Discarded octets
 are always credited to the connection window immediately (§6.9.1), and a handler that answers
-without reading is retired with RST_STREAM(NO_ERROR) per §8.1. `setHeader` stores the value slice **without copying** —
+without reading is retired with RST_STREAM(NO_ERROR) per §8.1. **Request arenas (F14):** an h2
+request's scratch (the synthesized header block, the `ResponseWriter` buffer, the framer's lists)
+comes from an arena that the finished request hands back, reset, to its own connection
+(`Session.spare_arenas`, at most 8, each trimmed to 32 KiB) — owned by exactly one `serveJob` call
+from checkout to check-in, never by the connection as a whole, because with `Options.dispatcher` up
+to eight requests of one connection run on different threads and a per-connection arena reset by the
+first to finish would free the others' memory. Check-in is `serveJob`'s last `defer`, the point the
+arena used to be freed, so error, cancel and detach paths return it the same way. Measured
+(ReleaseFast, 20 000 GETs, A/B interleaved): 7 → 4 allocations per request; behind
+`DebugAllocator(.{})` 56 101 → 3 401 ns/req (16.5×); behind `smp_allocator` within noise. Cost: an
+idle connection keeps one ~22 KiB spare per handler it has run at once. `setHeader` stores the value slice **without copying** —
 dynamic header values need caller-stable memory (documented per-helper). BYO-TLS seam:
 `serveStream` / `connectH2Over` + ALPN run h2/h1 over a caller-terminated (TLS) stream — TLS
 termination is out of this module. **Reverse proxy (`proxy`):** forwards over HTTP/1.1 (streaming)
