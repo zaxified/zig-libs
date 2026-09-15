@@ -317,6 +317,23 @@ fn readOnce(t: *TcpTransport, buf: []u8) TransportError!usize {
     return t.transport().read(buf);
 }
 
+/// `readOnce`, plus a flag set when the read has returned on its own.
+fn readOnceFlagged(t: *TcpTransport, buf: []u8, done: *std.atomic.Value(u32)) TransportError!usize {
+    defer done.store(1, .release);
+    return t.transport().read(buf);
+}
+
+/// Poll a completion flag. The deadline is a watchdog, never the assertion.
+fn awaitDone(io: std.Io, done: *const std.atomic.Value(u32), watchdog_ms: i64) bool {
+    const start = std.Io.Clock.Timestamp.now(io, .awake);
+    while (done.load(.acquire) == 0) {
+        const waited = start.durationTo(std.Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+        if (waited > watchdog_ms * std.time.ns_per_ms) return false;
+        io.sleep(.fromMilliseconds(5), .awake) catch return done.load(.acquire) != 0;
+    }
+    return true;
+}
+
 /// A connected `TcpTransport` plus the accepted peer that will stay silent.
 const SilentPeer = struct {
     tt: TcpTransport,
@@ -407,14 +424,17 @@ test "a peer that sends the header and then goes silent does not hang the body r
     _ = std.os.linux.write(fixture.peer.socket.handle, &header, header.len);
 
     var buf: [4096]u8 = undefined;
-    var fut = try io.concurrent(readOnce, .{ &fixture.tt, &buf });
-    // Safety net, not the assertion: before the fix, the body read had no
-    // timeout at all and blocked forever on this exact peer shape (F2). Give
-    // it a bound of ~7x the 300 ms read timeout, then force the issue with
-    // `cancel` so a regression fails this test instead of hanging the whole
-    // suite. With the fix, `readFn` has already returned `error.ReadFailed`
-    // on its own well before this fires, so `cancel` finds nothing left to
-    // cancel and just hands back that same result.
-    try io.sleep(.fromMilliseconds(2000), .awake);
-    try testing.expectError(error.ReadFailed, fut.cancel(io));
+    var done: std.atomic.Value(u32) = .init(0);
+    var fut = try io.concurrent(readOnceFlagged, .{ &fixture.tt, &buf, &done });
+    // Wait for the read to come back BY ITSELF with `error.ReadFailed`.
+    // Before the fix the body read had no timeout at all and blocked
+    // forever on this exact peer shape (F2); then the 20 s watchdog expires,
+    // `cancel` answers `Canceled`, and the test is red instead of hanging
+    // the suite. This used to be a fixed 2000 ms sleep. A loaded machine
+    // can outlast that with a CORRECT read still on its way back, which
+    // was a false red.
+    const returned = awaitDone(io, &done, 20_000);
+    const result = fut.cancel(io);
+    if (!returned) std.debug.print("F2: the body read was still parked 20 s past its 300 ms bound\n", .{});
+    try testing.expectError(error.ReadFailed, result);
 }

@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The write→read→write regression
+  test bound the fixed port 15684; its peer now binds port 0 and publishes the port it got. The F-B
+  test ("one octet does not park the read") slept a fixed 1200 ms and then canceled. On a loaded
+  machine a correct read could still be on its way back, a false red. The test now waits for the
+  read to return on its own, with a 20 s watchdog.
+
 - **2026-09-13** — **BEHAVIOURAL:** A1 finding `iec62351` N1 (cross-module, one commit with
   `iec62351`). `goose.Frame.decode` took `Length - 8` octets as the PDU, so a frame secured under
   IEC 62351-6 decoded with the security extension glued onto the PDU, and `Pdu.decode` — which did

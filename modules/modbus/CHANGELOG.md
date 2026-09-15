@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The two `TcpTransport` cancel tests
+  canceled after a fixed sleep. On a loaded machine that could land in the request write instead,
+  and the test then passed by that arm. Both now cancel once the exchange is inside its reply read
+  (`ReadCueIo`, a `std.Io` double that counts `netRead` entries). The `timeout_ms = null` test keeps
+  its 300 ms window after that event, because the window is what it asserts.
+
 - **2026-09-10** — **A1 fix campaign, E1/E2 (examples backlog).** `TcpTransport` had no
   read deadline anywhere: `exchangeFn` ran `readSliceAll` straight through
   `std.Io.net.Stream.Reader` with nothing bounding it, so a peer that legitimately stays

@@ -1608,6 +1608,48 @@ test "query: a UDP reply the kernel truncated falls back to TCP even without TC 
 // its own), so the read genuinely parks in `takeInt`, waiting for a response
 // length prefix that never arrives.
 
+/// A real `std.Io` whose only changed slot counts `netRead` entries, so a
+/// cancel test can cancel once the transport is INSIDE its reply read. With
+/// a fixed sleep instead, a loaded machine could cancel an earlier step, and
+/// the test passed by that route, not the read's. Earlier steps: connect and
+/// request write, whose `Canceled` arms are separate code.
+const ReadCueIo = struct {
+    vtable: std.Io.VTable,
+    userdata: ?*anyopaque,
+
+    var inner_vtable: *const std.Io.VTable = undefined;
+    var reads: std.atomic.Value(u32) = .init(0);
+
+    fn init(inner: std.Io) ReadCueIo {
+        inner_vtable = inner.vtable;
+        reads.store(0, .release);
+        var vt = inner.vtable.*;
+        vt.netRead = netRead;
+        return .{ .vtable = vt, .userdata = inner.userdata };
+    }
+
+    fn io(self: *const ReadCueIo) std.Io {
+        return .{ .userdata = self.userdata, .vtable = &self.vtable };
+    }
+
+    fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
+        _ = reads.fetchAdd(1, .monotonic);
+        return inner_vtable.netRead(userdata, src, data);
+    }
+
+    /// Wait until the transport has entered its `n`-th socket read. The
+    /// deadline is a watchdog only: never getting there is a red, not a hang.
+    fn awaitReads(real_io: std.Io, n: u32) bool {
+        const start = std.Io.Clock.Timestamp.now(real_io, .awake);
+        while (reads.load(.acquire) < n) {
+            const waited = start.durationTo(std.Io.Clock.Timestamp.now(real_io, .awake)).raw.nanoseconds;
+            if (waited > 60 * std.time.ns_per_s) return false;
+            real_io.sleep(.fromMilliseconds(1), .awake) catch return reads.load(.acquire) >= n;
+        }
+        return true;
+    }
+};
+
 test "tcpExchange: a canceled blocking read surfaces Canceled, not NetworkFailed" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -1623,14 +1665,26 @@ test "tcpExchange: a canceled blocking read surfaces Canceled, not NetworkFailed
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.socket.close(io);
 
-    var r = Resolver.init(io, testing.allocator, .{
+    var cue: ReadCueIo = .init(io);
+    // `timeout_ms = 0`: unbounded, so `tcpExchange` calls `tcpExchangeInner`
+    // directly. With the default, `runBounded` wraps it and answers a cancel
+    // with its OWN `Canceled`. Measured: the length read's arm mutated to
+    // `return error.NetworkFailed` stayed green, so the test named for the
+    // read was guarding `runBounded` instead.
+    var r = Resolver.init(cue.io(), testing.allocator, .{
         .port = listener.socket.address.ip4.port,
         .transport = .tcp,
+        .timeout_ms = 0,
     });
     defer r.deinit();
 
     var packet = [_]u8{ 0, 1, 2, 3 };
     var fut = try io.concurrent(Resolver.tcpExchange, .{ &r, netaddr.parseIp("127.0.0.1").?, &packet });
-    try io.sleep(.fromMilliseconds(100), .awake);
-    try testing.expectError(error.Canceled, fut.cancel(io));
+    // Cancel inside read #1, the length read. The connect lands in the
+    // listener's backlog and the query in the kernel's send buffer, so
+    // nothing else ever parks.
+    const reached = ReadCueIo.awaitReads(io, 1);
+    const result = fut.cancel(io);
+    try testing.expect(reached);
+    try testing.expectError(error.Canceled, result);
 }

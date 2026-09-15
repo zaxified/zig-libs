@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `tcpExchange` cancel test
+  canceled after a fixed 100 ms sleep. On a loaded machine that could land in the connect instead,
+  and the test then passed by a different `Canceled` arm. It now cancels once the transport is
+  inside its length read (`ReadCueIo`, a `std.Io` double that counts `netRead` entries). It also runs
+  unbounded (`timeout_ms = 0`): with the default, `runBounded` answered the cancel itself, and a
+  mutated length-read arm stayed green.
+
 - **2026-09-12** — **A1 fix campaign round 2, fixer slot `c`: F7, F10 closed (Q7).**
   - **F7 — additive:** `Record` gains `labels: []const []const u8 = &.{}`, the owner name's
     actual wire label boundaries as slices into `Record.name`, populated by `decode` for every

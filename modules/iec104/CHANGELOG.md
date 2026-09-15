@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The write→read→write regression
+  test bound the fixed port 15683; its peer now binds port 0 and publishes the port it got. Its
+  1 s listen wait became a 30 s watchdog.
+
 - **2026-09-10** — **A1 fix campaign, F8/F9 (test teeth).** F8: the wrap-replay golden test
   called `state.Connection.tick` for its side effects (`_ = c.tick(now);`) and skipped every
   `tx` row in `wrap_table` outright (`if (g.dir != .rx) continue`), so the N(R) this module
