@@ -106,6 +106,9 @@ route_platform() {
         # cgroup link) skip on any normal host. Debian only — OpenWRT's
         # kernel has no BPF tooling.
         ebpf) echo debian ;;
+        # xdp-classifier: execution-verified 2026-09-15, 59/59 with zero
+        # skips, on the CPU topology guest_smp gives it (see there).
+        xdp-classifier) echo debian ;;
         *) echo debian ;;
     esac
 }
@@ -197,6 +200,16 @@ guest_setup() {
                 setup+="nohup $(fleetsim_master_run "$m") 127.0.0.1 $(fleetsim_master_port "$m") $FLEETSIM_MASTER_WAIT > /tmp/fm-$m.log 2>&1 & "
             done
             printf '%s' "$setup"
+            ;;
+        xdp-classifier)
+            # Its F1 anchor only discriminates when possible != online CPUs
+            # (see guest_smp). Refuse to call the setup good without that gap:
+            # a guest that lost `maxcpus` would leave an online-sized buffer
+            # model passing, silently.
+            printf '%s' \
+                'test $(cat /sys/devices/system/cpu/possible) != $(cat /sys/devices/system/cpu/online) && ' \
+                'echo CPUS possible=$(cat /sys/devices/system/cpu/possible) online=$(cat /sys/devices/system/cpu/online) && ' \
+                'echo SETUP_OK || echo SETUP_FAIL; '
             ;;
         *) printf '' ;;
     esac
@@ -373,6 +386,21 @@ guest_mem() {
     case "$1" in
         fleetsim) echo 1536 ;;
         *) echo 512 ;;
+    esac
+}
+
+# QEMU `-smp` value (boot-debian.exp's sixth argument). One vCPU unless a
+# module's anchor depends on the CPU topology itself.
+#
+#   xdp-classifier -> 2,maxcpus=4: two CPUs online, four POSSIBLE. A per-CPU
+#                     BPF map transfers round_up(value_size,8) x possible CPUs,
+#                     and a caller sizing from online CPUs under-allocates by
+#                     exactly that difference (audit F1). On a guest where the
+#                     two counts agree, that mistake is invisible.
+guest_smp() {
+    case "$1" in
+        xdp-classifier) echo 2,maxcpus=4 ;;
+        *) echo 1 ;;
     esac
 }
 
@@ -616,7 +644,7 @@ case "$PLATFORM" in
     debian)
         HASH='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'  # throwaway VM-only password "zigvm" — ephemeral -snapshot guest, no host port exposed
         RUNCMD="${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
-        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" >"$VMLOG" 2>&1
+        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" "$(guest_smp "$MODULE")" >"$VMLOG" 2>&1
         ;;
 esac
 t1=$(date +%s)
