@@ -205,7 +205,7 @@ pub fn main() !void {
             "Socket.open(AF_PACKET): AccessDenied (expected -- no CAP_NET_RAW on this host)\n",
             .{},
         ),
-        error.NoSuchInterface, error.BindFailed, error.SocketFailed, error.TimeoutFailed, error.RcvBufFailed => return err,
+        error.NoSuchInterface, error.BindFailed, error.SocketFailed, error.TimeoutFailed, error.RcvBufFailed, error.FilterSetupFailed => return err,
     }
 
     std.debug.print("OK: all rawsock example checks passed\n", .{});

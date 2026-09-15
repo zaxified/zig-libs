@@ -309,6 +309,13 @@ fn runLookup(transport: whois.Transport, query: []const u8) bool {
             );
             return false;
         },
+        error.Timeout => {
+            std.debug.print(
+                "whois-demo: {s} did not reply in time -- no network access, exiting cleanly\n",
+                .{whois.iana_root},
+            );
+            return false;
+        },
         // Distinct from TransportFailed on purpose: the query was abandoned
         // by whoever asked for it, so retrying it against another server --
         // which is exactly what a referral chase would otherwise do -- is
