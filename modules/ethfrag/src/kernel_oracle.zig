@@ -64,11 +64,20 @@
 //! ```sh
 //! unshare --user --map-root-user --net -- bash -c '
 //!   ip link set lo up
-//!   python3 capture.py   # hand-rolled raw-socket sender + UDP listener
+//!   python3 modules/ethfrag/tools/capture.py --print <scenario>
 //! '
 //! ```
-//! (`capture.py` is not part of this repository -- a throwaway harness,
-//! not shipped code; the bytes and verdicts it produced are frozen below.)
+//! **F13 (`A1/ethfrag.md`), closed 2026-09-15:** `capture.py` is now
+//! `modules/ethfrag/tools/capture.py` (`CONVENTIONS.md` Sec.9 -- a foreign
+//! toolchain, so `tools/`, never `src/`) -- it used to not be part of this
+//! repository (a throwaway harness, not shipped code); the bytes and
+//! verdicts it produced, original and new, are frozen below. It also grew a
+//! `--verify` mode that re-captures every scenario LIVE and checks it
+//! against a recorded expectation, with `--corrupt-offset`/`--corrupt-expect`
+//! flags that prove it actually fails on a wrong answer (see that file's
+//! module doc comment and `A1/ethfrag.md`'s F13 disposition for RED→GREEN
+//! evidence). One new adversarial capture was added with it:
+//! `zero_length_final_duplicate`, see its own comment on `captures` below.
 //!
 //! ## A methodology bug this capture surfaced in ITSELF (worth recording)
 //! The first capture pass reused one fragment id across every scenario run
@@ -98,6 +107,16 @@
 //!     harmless retransmission, distinct from `overlap_same_content`'s
 //!     content-consistent-but-differently-sliced fragment, which it drops
 //!     exactly like a conflicting overlap.
+//!   - `zero_length_final_duplicate` (IPv4 only, added 2026-09-15 for F13):
+//!     never delivered, reproduced across 4 separate captures with fresh
+//!     idents. This is NOT the same divergence shape as `duplicate` above --
+//!     a SINGLE, non-duplicated zero-length closing fragment already times
+//!     out (see `modules/ethfrag/tools/capture.py`'s
+//!     `_zero_length_duplicate_scenario` doc comment), so the kernel's
+//!     "tolerates an exact resend" behavior specifically does not extend to
+//!     a fragment with no payload bytes. IPv6 was not captured for this
+//!     scenario (documented gap, not a silent drop -- IPv6's raw-header
+//!     send path needs more care than this session's budget covered).
 //!
 //! **This module intentionally diverges from the kernel on `duplicate`**:
 //! `Reassembler.insert` drops the whole datagram on ANY overlap, including
@@ -305,6 +324,49 @@ const captures = [_]Capture{
         .verdict_delivered = false,
         .full_dgram_hex = "ca42ca410028e3200f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8",
     },
+    .{
+        // Audit F13's highest-value gap: none of the 12 captures above cover
+        // any adversarial shape (all four accept-side comparisons are the
+        // same "one clean datagram in three pieces" shape). This is the
+        // shape F13 named specifically: a zero-length FINAL fragment (the
+        // A21 case in `A1/ethfrag.md`'s attack table -- `ethfrag`'s F1 fix
+        // rejects a byte-identical repeat of it as `OverlappingFragment`),
+        // captured for real via `modules/ethfrag/tools/capture.py
+        // --print zero_length_final_duplicate` under `unshare --user
+        // --map-root-user --net`, reproduced across 4 separate runs with
+        // fresh IPv4 idents each time.
+        //
+        // Unlike the `duplicate` scenario above (a real kernel tolerates an
+        // exact resend of a NON-empty fragment), the kernel here never
+        // completes reassembly at all -- not even once, with or without the
+        // duplicate. A single non-duplicated zero-length closer already
+        // times out (see `_zero_length_duplicate_scenario`'s doc comment in
+        // `capture.py`): `ip_defrag` treats a fragment with no payload
+        // bytes as contributing nothing towards completion. So this is a
+        // MATCH, not a third divergence family: the real kernel's silent
+        // non-completion and `ethfrag`'s explicit `OverlappingFragment`
+        // both land in "never delivered" -- same bucket as `overlap` above.
+        //
+        // Fragments are sent in send order [zero closer, zero closer
+        // (duplicate), full data] rather than [full data, zero, zero]: IPv4
+        // reassembly is offset-keyed, not sequence-keyed, so the kernel's
+        // verdict does not depend on this order (both orders were captured
+        // and agreed) -- but THIS order is what makes the replay below
+        // actually exercise `ethfrag`'s F1 rule 2 (the second zero-length
+        // closer is rejected as an exact duplicate BEFORE `total_len` is
+        // ever satisfied by real bytes), instead of racing to an unrelated
+        // completion on the first closer alone.
+        .name = "zero_length_final_duplicate",
+        .v6 = false,
+        .ident = 0xd61e,
+        .packets_hex = &.{
+            "45000014d61e00024011a6b67f0000017f000001",
+            "45000014d61e00024011a6b67f0000017f000001",
+            "45000024d61e2000401186a87f0000017f000001ca42cc7900105dfe4041424344454647",
+        },
+        .verdict_delivered = false,
+        .full_dgram_hex = "ca42cc7900105dfe4041424344454647",
+    },
 };
 
 // ── replay: real IP-level fragment shapes, re-encoded into OUR wire format ──
@@ -434,19 +496,22 @@ test "kernel oracle: our Reassembler's verdict vs the real Linux kernel's IPv4/I
             }
         }
     }
-    // 6 scenarios × {IPv4, IPv6} = 12 kernel-oracle-anchored comparisons: 10
-    // matches (in_order, out_of_order, missing_middle, overlap,
-    // overlap_same_content -- ×2 families) + 2 documented divergences
-    // (duplicate ×2 families). This module's own resource-bound policies
-    // (max_inflight/max_fragments_per_datagram/timeout_ns) and wire-format-
-    // specific rejections (InvalidHeader/LengthMismatch/TableFull/
+    // 6 scenarios × {IPv4, IPv6} = 12 kernel-oracle-anchored comparisons
+    // (in_order, out_of_order, missing_middle, overlap, overlap_same_content
+    // -- ×2 families -- + 2 documented divergences from duplicate ×2
+    // families), PLUS one adversarial IPv4-only comparison added for F13
+    // (`A1/ethfrag.md`): zero_length_final_duplicate, captured via
+    // `modules/ethfrag/tools/capture.py`. 11 matches + 2 divergences = 13.
+    // This module's own resource-bound policies (max_inflight/
+    // max_fragments_per_datagram/timeout_ns) and wire-format-specific
+    // rejections (InvalidHeader/LengthMismatch/TableFull/
     // ProtocolViolation) have no kernel equivalent and are intentionally
     // NOT covered here (see this file's module doc comment) -- they are
     // covered by root.zig's self-contained adversarial tests instead.
     try testing.expectEqual(@as(usize, 2), divergences_seen);
-    try testing.expectEqual(@as(usize, 10), matches_seen);
+    try testing.expectEqual(@as(usize, 11), matches_seen);
 }
 
 test "count canary: kernel-oracle-anchored captures on file" {
-    try testing.expectEqual(@as(usize, 12), captures.len);
+    try testing.expectEqual(@as(usize, 13), captures.len);
 }
