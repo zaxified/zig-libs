@@ -49,8 +49,20 @@ if {$cmd_timeout eq ""} { set cmd_timeout 90 }
 # protocol failure.
 set vcpus [lindex $argv 5]
 if {$vcpus eq ""} { set vcpus 1 }
+# Extra kernel command-line text — one token, no whitespace (run.sh enforces
+# that). Empty = boot exactly as the image does. Non-empty: after the first
+# login the batch appends it to every `linux` line of /boot/grub/grub.cfg, and
+# the guest reboots once, INSIDE this same qemu process. That is why
+# `-no-reboot` is dropped for this mode: with it, the reboot would end qemu,
+# and -snapshot would discard the edit with it. The overlay lives as long as
+# the process does, so the second boot sees the edited grub.cfg and the image
+# on disk is still never written. run.sh checks /proc/cmdline in the guest
+# afterwards, so an edit that did not take cannot pass for one that did.
+set kappend [lindex $argv 6]
+set reboot_flag [list -no-reboot]
+if {$kappend ne ""} { set reboot_flag [list] }
 
-spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -smp $vcpus -m $mem -no-reboot -nographic -snapshot \
+spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -smp $vcpus -m $mem {*}$reboot_flag -nographic -snapshot \
     -drive file=$img,format=qcow2,if=virtio \
     -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
     -fw_cfg name=opt/io.systemd.credentials/passwd.hashed-password.root,string=$hash \
@@ -62,28 +74,45 @@ spawn qemu-system-x86_64 -machine accel=kvm:tcg -cpu host -smp $vcpus -m $mem -n
 # and of agetty's own 60s LOGIN_TIMEOUT occasionally firing under host load
 # (observed on a loaded dev box; the retry just re-types "root" — cheap and
 # correct either way).
-set login_tries 0
-expect {
-    -re {login: $} {}
-    "Press any key to proceed" { send "\r"; exp_continue }
-    -re {Please enter[^\r\n]*} { send "\r"; exp_continue }
-    "timed out after" {
-        incr login_tries
-        if {$login_tries > 3} { puts "\nFAIL: agetty login timed out repeatedly"; exit 1 }
-        exp_continue
+proc login_as_root {} {
+    global spawn_id
+    set login_tries 0
+    expect {
+        -re {login: $} {}
+        "Press any key to proceed" { send "\r"; exp_continue }
+        -re {Please enter[^\r\n]*} { send "\r"; exp_continue }
+        "timed out after" {
+            incr login_tries
+            if {$login_tries > 3} { puts "\nFAIL: agetty login timed out repeatedly"; exit 1 }
+            exp_continue
+        }
+        timeout { puts "\nTIMEOUT waiting for login prompt"; exit 1 }
     }
-    timeout { puts "\nTIMEOUT waiting for login prompt"; exit 1 }
+    send "root\r"
+    expect {
+        -re {[Pp]assword:} {}
+        "timed out after" { send "\r"; exp_continue }
+        timeout { puts "\nTIMEOUT waiting for password prompt"; exit 1 }
+    }
+    send "zigvm\r"
+    expect {
+        -re {[#\$] $} {}
+        timeout { puts "\nTIMEOUT waiting for shell after login"; exit 1 }
+    }
 }
-send "root\r"
-expect {
-    -re {[Pp]assword:} {}
-    "timed out after" { send "\r"; exp_continue }
-    timeout { puts "\nTIMEOUT waiting for password prompt"; exit 1 }
-}
-send "zigvm\r"
-expect {
-    -re {[#\$] $} {}
-    timeout { puts "\nTIMEOUT waiting for shell after login"; exit 1 }
+login_as_root
+
+if {$kappend ne ""} {
+    # Same split-marker trick as the command batch below: the echo of this
+    # line shows GRUB_"EDITED", only the command's own output says GRUB_EDITED.
+    send "sed -i '/^\\s*linux\\s/ s|\$| $kappend|' /boot/grub/grub.cfg && grep -q -- '$kappend' /boot/grub/grub.cfg && echo GRUB_\"EDITED\" && reboot\r"
+    expect {
+        "GRUB_EDITED" {}
+        timeout { puts "\nTIMEOUT editing grub.cfg for the kernel command line"; exit 1 }
+    }
+    set timeout 180
+    login_as_root
+    set timeout 90
 }
 
 # The end marker is sent SPLIT — `===VM_CMD_"END"===` — and the shell strips

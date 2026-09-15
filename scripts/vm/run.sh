@@ -55,6 +55,13 @@ fi
 shift
 
 PLATFORM=""
+# --kernel-append TOKEN: extra kernel command-line text for this boot (debian
+# only). boot-debian.exp edits grub.cfg inside the -snapshot overlay and reboots
+# once; the guest then has to prove the token is in /proc/cmdline
+# (KERNEL_APPEND_OK below). One token without whitespace, so it stays quote-free
+# on its way through expect and the guest shell. First user: sandbox's
+# `lsm=apparmor` run, which boots the same kernel with Landlock left out.
+KERNEL_APPEND=""
 # Repeatable: `zig test --test-filter` is documented as "skip tests that do not
 # match ANY filter", so several of them are a union, not an intersection. That
 # is what lets one guest boot drive several protocols' live tests in sequence.
@@ -63,9 +70,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         openwrt|debian) PLATFORM="$1"; shift ;;
         --test-filter) TEST_FILTERS+=("$2"); shift 2 ;;
+        --kernel-append) KERNEL_APPEND="$2"; shift 2 ;;
         *) echo "run.sh: unrecognized argument '$1'" >&2; exit 1 ;;
     esac
 done
+if [[ -n "$KERNEL_APPEND" && ! "$KERNEL_APPEND" =~ ^[A-Za-z0-9_.,=:/-]+$ ]]; then
+    echo "run.sh: --kernel-append takes one token of [A-Za-z0-9_.,=:/-], got '$KERNEL_APPEND'" >&2
+    exit 1
+fi
 
 # ── routing table ────────────────────────────────────────────────────────
 # Verified empirically (2026-07-28), not assumed:
@@ -210,6 +222,18 @@ guest_setup() {
                 'test $(cat /sys/devices/system/cpu/possible) != $(cat /sys/devices/system/cpu/online) && ' \
                 'echo CPUS possible=$(cat /sys/devices/system/cpu/possible) online=$(cat /sys/devices/system/cpu/online) && ' \
                 'echo SETUP_OK || echo SETUP_FAIL; '
+            ;;
+        sandbox)
+            # Root is the point here (its privilege-drop and bounding-set tests
+            # skip everywhere else). The one environment switch: when the active
+            # LSM list lacks landlock — a `--kernel-append lsm=...` boot — tell
+            # the suite, so its S18 test asserts error.Disabled against the real
+            # kernel instead of skipping. Unreadable list = SETUP_FAIL, never a
+            # guess.
+            printf '%s' \
+                'test -r /sys/kernel/security/lsm && echo LSM=$(cat /sys/kernel/security/lsm) && ' \
+                '{ grep -qw landlock /sys/kernel/security/lsm || export SANDBOX_EXPECT_LANDLOCK=disabled; } && ' \
+                'echo SANDBOX_EXPECT_LANDLOCK=$SANDBOX_EXPECT_LANDLOCK && echo SETUP_OK || echo SETUP_FAIL; '
             ;;
         *) printf '' ;;
     esac
@@ -452,6 +476,10 @@ case "$PLATFORM" in
     debian) TARGET_TRIPLE="x86_64-linux-gnu" ;;
     *) echo "run.sh: unknown platform '$PLATFORM' (openwrt|debian)" >&2; exit 1 ;;
 esac
+if [[ -n "$KERNEL_APPEND" && "$PLATFORM" != debian ]]; then
+    echo "run.sh: --kernel-append is implemented for debian only (boot-debian.exp)" >&2
+    exit 1
+fi
 
 IMAGES_DIR="$SCRIPT_DIR/images"
 WORK_DIR="$SCRIPT_DIR/work"
@@ -643,8 +671,10 @@ case "$PLATFORM" in
         ;;
     debian)
         HASH='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'  # throwaway VM-only password "zigvm" — ephemeral -snapshot guest, no host port exposed
-        RUNCMD="${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
-        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" "$(guest_smp "$MODULE")" >"$VMLOG" 2>&1
+        KCHECK=""
+        [[ -n "$KERNEL_APPEND" ]] && KCHECK="grep -qwF -- $KERNEL_APPEND /proc/cmdline && echo KERNEL_APPEND_OK || echo KERNEL_APPEND_FAIL; "
+        RUNCMD="${KCHECK}${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
+        expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" "$(guest_smp "$MODULE")" "$KERNEL_APPEND" >"$VMLOG" 2>&1
         ;;
 esac
 t1=$(date +%s)
@@ -665,6 +695,13 @@ echo "vm: wall time $((t1 - t0))s (full log: $VMLOG)"
 # pipeline and no early-exit hazard.
 if ! grep -q "FETCH_OK\|TFTP_OK\|WGET_OK" <<< "$GUEST_OUT"; then
     echo "run.sh: FAIL — binary transfer into the guest never succeeded" >&2
+    exit 1
+fi
+
+# A requested kernel command line that did not reach the kernel would run the
+# suite on the ordinary boot, where the tests that need it skip.
+if [[ -n "$KERNEL_APPEND" ]] && ! grep -q "KERNEL_APPEND_OK" <<< "$GUEST_OUT"; then
+    echo "run.sh: FAIL — '$KERNEL_APPEND' is not in the guest's /proc/cmdline" >&2
     exit 1
 fi
 
