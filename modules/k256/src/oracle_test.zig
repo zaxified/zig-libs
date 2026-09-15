@@ -27,13 +27,20 @@ const sign = @import("sign.zig");
 const Secp256k1 = group.Secp256k1;
 const Ecdsa = std.crypto.sign.ecdsa.EcdsaSecp256k1Sha256;
 
+// Debug is std's unoptimized signer/verifier (KeyPair.generateDeterministic +
+// sign, each an uncached basePoint.mul) times four k256 verifies per round --
+// full count adds materially to the full-gate Debug timeout budget (see
+// group.zig's `random_scalars_iters`). Random draws cut in Debug; other modes
+// keep the full count.
+const ecdsa_oracle_iters: usize = if (builtin.mode == .Debug) 40 else 200;
+
 test "ECDSA: k256 verifies every std-produced signature, rejects tampering" {
     var seed: [Ecdsa.KeyPair.seed_length]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0xEC_D5A_0011);
     const rand = prng.random();
 
     var i: usize = 0;
-    while (i < 200) : (i += 1) {
+    while (i < ecdsa_oracle_iters) : (i += 1) {
         rand.bytes(&seed);
         const kp = Ecdsa.KeyPair.generateDeterministic(seed) catch continue;
 
@@ -78,10 +85,15 @@ test "ECDSA malleability: std's own signatures come in both S forms; only low-S 
     var prng = std.Random.DefaultPrng.init(0x10_5A_9917);
     const rand = prng.random();
 
+    // Debug is std's unoptimized signer (see `ecdsa_oracle_iters` above) --
+    // cut in Debug, full count elsewhere. Both S-orientations still land
+    // well before this shrinks to statistically flaky territory.
+    const malleability_iters: usize = if (builtin.mode == .Debug) 20 else 100;
+
     var std_was_low: usize = 0;
     var std_was_high: usize = 0;
     var i: usize = 0;
-    while (i < 100) : (i += 1) {
+    while (i < malleability_iters) : (i += 1) {
         rand.bytes(&seed);
         const kp = Ecdsa.KeyPair.generateDeterministic(seed) catch continue;
         var msg: [40]u8 = undefined;
@@ -144,7 +156,12 @@ fn eqAffineStd(k: Secp256k1, s: StdCurve) !void {
 // in every mode -- this is a coverage TRIM, not a coverage DROP, and the
 // mutant check at the end of this file (comb positive control) still runs
 // the same 500 draws in both modes since it doesn't touch std's slow path.
-const comb_random_iters: usize = if (builtin.mode == .Debug) 300 else 4000;
+// 300 (the previous cut, `14b2e983`) still ran ~9s isolated -- material
+// against the module's own <40s-in-Debug budget (k256, audit A1 2026-09-17
+// attempt 6, `group.test.differential` timed the full gate out separately;
+// fixing that alone left this test as the next-largest contributor). Cut
+// further; every named edge scalar below is unconditional in all modes.
+const comb_random_iters: usize = if (builtin.mode == .Debug) 50 else 4000;
 
 test "comb: combMulBase(k)·G == std.basePoint.mul(k), random + edges" {
     var prng = std.Random.DefaultPrng.init(0xC0FB_0A5E_11);
@@ -196,11 +213,17 @@ test "comb positive control: a corrupted table DISAGREES with std (harness has t
     var bad = group.comb_table;
     for (&bad[10]) |*e| e.* = Secp256k1.identityElement;
 
+    // Same std-mul cost as `comb_random_iters` above (~30ms/draw in Debug):
+    // 500 draws ran ~15s isolated. Cut in Debug; the ~15/16 expected
+    // disagreement rate needs only a modest sample to stay far from flaky.
+    const rounds: usize = if (builtin.mode == .Debug) 50 else 500;
+    const min_disagreements = rounds - rounds / 5; // > 80%, expected ~93.75%
+
     var prng = std.Random.DefaultPrng.init(0xBADC_0FFE_10);
     const rand = prng.random();
     var disagreements: usize = 0;
     var i: usize = 0;
-    while (i < 500) : (i += 1) {
+    while (i < rounds) : (i += 1) {
         var kb: [32]u8 = undefined;
         rand.bytes(&kb);
         const sp = StdCurve.basePoint.mul(kb, .big) catch continue;
@@ -209,7 +232,7 @@ test "comb positive control: a corrupted table DISAGREES with std (harness has t
         const sa = sp.affineCoordinates();
         if (!std.mem.eql(u8, &ka.x.toBytes(.big), &sa.x.toBytes(.big))) disagreements += 1;
     }
-    try std.testing.expect(disagreements > 400);
+    try std.testing.expect(disagreements > min_disagreements);
 }
 
 // ── gated Fable-core differentials (SKIP ≠ pass) ─────────────────────────────
@@ -218,10 +241,14 @@ test "GATED differential: fast_core.fieldMul/fieldSq == portable Solinas" {
     if (!gate.field_asm_implemented) return error.SkipZigTest; // core not filled
     if (!fast_core.supported) return error.SkipZigTest; // non-amd64 target
 
+    // amd64 fast_core is implemented, so this actually runs (not skipped) --
+    // Debug margin for the module's <40s budget, full count elsewhere.
+    const fast_core_iters: usize = if (builtin.mode == .Debug) 800 else 5000;
+
     var prng = std.Random.DefaultPrng.init(0xA5_F1E1D_01);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 5000) : (i += 1) {
+    while (i < fast_core_iters) : (i += 1) {
         var ab: [32]u8 = undefined;
         var bb: [32]u8 = undefined;
         rand.bytes(&ab);

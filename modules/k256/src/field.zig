@@ -451,11 +451,17 @@ fn randFe(rand: std.Random) struct { k: Fe, s: StdFe } {
     }
 }
 
+// Debug's std.crypto.ecc.Secp256k1.Fe path is unoptimized like the group-level
+// differentials elsewhere in this module (see group.zig's
+// `random_scalars_iters`) -- cut in Debug, full count elsewhere.
+const field_diff_iters: usize = if (builtin.mode == .Debug) 500 else 4000;
+const sqrt_diff_iters: usize = if (builtin.mode == .Debug) 300 else 2000;
+
 test "differential vs std.Fe: mul/sq/add/sub/neg/invert on random inputs" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_F1E1D);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 4000) : (i += 1) {
+    while (i < field_diff_iters) : (i += 1) {
         const a = randFe(rand);
         const b = randFe(rand);
 
@@ -472,7 +478,7 @@ test "differential vs std.Fe: sqrt agrees on residues and non-residues" {
     var prng = std.Random.DefaultPrng.init(0x5417_5417);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 2000) : (i += 1) {
+    while (i < sqrt_diff_iters) : (i += 1) {
         const a = randFe(rand);
         // Only compare where std says it's a square; both must then produce a
         // root of the same square (roots may differ by sign, so compare x²).
