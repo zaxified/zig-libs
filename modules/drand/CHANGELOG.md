@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — **NO API CHANGE, faster:** A1 finding F4, together with `bls12_381`'s endomorphism-based subgroup checks (same commit). The `G1` signature check in `parseRound` and `verifyRoundPoints` now costs ~0.12 ms instead of 0.77 ms, and the `G2` key check in `parseInfo` ~0.17 ms instead of 2.41 ms (ReleaseFast, 7 interleaved reps); `verifyRoundPoints` 10.34 → 9.72 ms median. All 60 live quicknet rounds of the audit corpus still verify, and the W2-32 malleated signature is still refused. `verify.zig`'s cost comment updated to the new numbers.
+
 - **2026-09-13** — **BEHAVIOURAL:** A1 finding F7, the JSON parsers now agree with
   drand's Go reference (`encoding/json` into `uint64`, `common.Beacon`/`client.RandomData`).
   `parseRound` accepted `{"round":"1000",…}` and verified it as round 1000, and accepted
