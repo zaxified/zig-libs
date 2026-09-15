@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-15** — A1 F3. Security fix, no API change: WOTS+ chain values
+  survived on the dead stack after `keyGen` and `sign` — measured at
+  ReleaseFast, `keyGen` left 49, `sign` 47 per call at leaf 0 and 49 after a
+  jump to leaf 5 (identical on the audited tree), and a leaf's chain values
+  forge a message at that leaf's index. The 2026-09-11 `chain` pointer change
+  alone changed none of it. `keyGen`, `sign` and `buildAuth` now run their
+  computation one frame down and zero 32 KiB of stack below it before
+  returning (`burnStack`; the call trees reach ~10 KiB at h=4 and h=10). The
+  dead-stack test used to print one count for leaf 0's chain starts; it now
+  asserts zero residue for every chain value of every leaf and both secret
+  seeds, beside a negative and a positive control, after `keyGen`, after
+  `sign` at leaf 0 and after `sign` with a traversal rebuild to leaf 5. The raw
+  WOTS+ primitives (`wotsSkGen`, `wotsSign`, `wotsPkGen`, `genLeaf`, `chain`)
+  do not burn.
+
 - **2026-09-11** — **BREAKING:** `chain`'s `x` parameter is now `*const [n]u8`
   instead of `[n]u8` by value (A1 audit F3 partial mitigation — removes one of
   `chain`'s two stack copies of the WOTS+ chain value; measured RED->RED, the

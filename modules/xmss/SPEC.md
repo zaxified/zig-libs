@@ -180,15 +180,19 @@ the auto-resync still reproduces the from-scratch auth path byte-exactly.
 - **No allocation, no I/O:** all buffers are fixed-size (largest: `BdsState`
   itself, 2544 B at h=20 — bigger than the 67x32 B WOTS+ arrays this line used
   to name as the largest).
-- **`zeroize` does not reach the last signature's WOTS+ one-time private key.**
-  `chain` takes its input by value, so copies live in callee frames the
-  function cannot address. Measured after `zeroize()` by scanning a fresh
-  512 KiB frame: 0 of 67 recoverable in Debug, **55 of 67 in ReleaseFast**.
-  Possession of leaf *k*'s WOTS+ private key permits forging an arbitrary
-  message at index *k*, so a spent index is not harmless. Closing it needs a
-  stack scrub at frame recycling — the same unsolved problem `std.crypto` has
-  with its own key schedules. Reachable only with a memory-disclosure
-  primitive, so it is stated rather than mitigated.
+- **`keyGen`, `sign` and `buildAuth` zero the stack their computation used.**
+  WOTS+ chain values — of the leaf just signed, and of every leaf `keyGen` or a
+  traversal step computes — used to survive on the dead stack in callee frames
+  no name reaches. Possession of leaf *k*'s chain values permits forging a
+  message at index *k*, so neither a spent nor an unused index is harmless.
+  Measured at ReleaseFast before the fix (A1 F3): `keyGen` left 49 chain
+  values, `sign` 47 per call at leaf 0 and 49 after a jump to leaf 5 — the
+  same on the audited tree. Each entry point now runs its computation one
+  frame down and zeroes 32 KiB below it (the call trees reach ~10 KiB at h=4
+  and h=10); a test asserts zero residue beside a negative and a positive
+  control. `zeroize` still wipes only the two seeds. The raw WOTS+ primitives
+  (`wotsSkGen`, `wotsSign`, `wotsPkGen`, `genLeaf`, `chain`) do not burn: a
+  caller using them directly owns that stack.
 - **Bare `SecretKey` is not thread-safe, and since the BDS rewrite the hazard
   is memory-unsafety, not just index reuse.** Two racing `sign` calls drive
   `bds.stackoffset` to 0 while `stackusage > 0`; `stackoffset - 1` underflows a
