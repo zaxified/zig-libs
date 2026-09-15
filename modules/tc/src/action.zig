@@ -730,8 +730,19 @@ fn appendPoliceOptions(
     // their last table entry is 7, not the 8 the clamped rate would give.
     ratespec.calcRateTable(ps, &rate_spec, &rtab, p.cell_log, p.mtu, p.linklayer, p.rate);
     const burst_ticks = ps.calcXmitTime(p.rate, p.burst);
-    if (p.peakrate != 0)
-        ratespec.calcRateTable(ps, &peak_spec, &ptab, p.pcell_log, p.mtu, p.linklayer, p.peakrate);
+    if (p.peakrate != 0) {
+        // F10: unlike htb/tbf, police feeds calcRateTable the *unclamped*
+        // rate via rate_override (see the note above), so the reuse
+        // condition compares those raw values, not rate_spec/peak_spec.
+        if (p.peakrate == p.rate and p.pcell_log == p.cell_log) {
+            ptab = rtab;
+            peak_spec.cell_align = rate_spec.cell_align;
+            peak_spec.cell_log = rate_spec.cell_log;
+            peak_spec.linklayer = rate_spec.linklayer;
+        } else {
+            ratespec.calcRateTable(ps, &peak_spec, &ptab, p.pcell_log, p.mtu, p.linklayer, p.peakrate);
+        }
+    }
 
     var tbf: [tc_police_len]u8 = @splat(0);
     std.mem.writeInt(u32, tbf[0..4], p.index, native_endian);

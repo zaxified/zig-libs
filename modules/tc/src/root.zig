@@ -1790,4 +1790,5 @@ test {
     _ = action;
     _ = message;
     _ = @import("goldens.zig");
+    _ = @import("bench.zig");
 }
