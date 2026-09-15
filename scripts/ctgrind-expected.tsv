@@ -462,7 +462,7 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=313	3d94932979419650	0d9a7f3232367fc7
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must
 # still be printed -- so "the harness never called the module" is still caught.
-bulletproofs	ReleaseFast	rangeproof	1	0	9e903b00e26f4372	RANDOMIZED
+bulletproofs	ReleaseFast	rangeproof	1	0	3e0167b9b68ce90f	RANDOMIZED
 bulletproofs	ReleaseFast	ipa	1	0	dd382e4324993825	2368a5d0e07e2233
 paillier	ReleaseFast	crt	1	<=331	8121b95486f955cf	0435e5d4ba4d462a
 paillier	ReleaseFast	noncrt	1	<=141	8121b95486f955cf	0435e5d4ba4d462a
