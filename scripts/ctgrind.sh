@@ -151,7 +151,11 @@ declare -A TARGETS=(
     [chachapoly]="poly1305 aead"
     [hqc]="decaps keygen encaps sampler"
     [oscore]="derive protect unprotect"
-    [ct25519]="ct25519 std"
+    # `comb` (C3's fixed-base comb via `mulBase`), `ladderbase` (the pre-C3
+    # window ladder over the comptime table, still reachable as
+    # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
+    # `precompute` table) added 2026-09-16; see modules/ct25519/SPEC.md § C3.
+    [ct25519]="ct25519 std comb ladderbase ladder"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
     [ecvrf]="prove"
@@ -310,6 +314,9 @@ declare -A PATTERN=(
     [bn254/scalarmul]='g1[.]zig|fp[.]zig|scalar[.]zig'
     [ct25519/ct25519]='root[.]zig'
     [ct25519/std]='edwards25519[.]zig|ristretto255[.]zig|curve25519[.]zig'
+    [ct25519/comb]='root[.]zig'
+    [ct25519/ladderbase]='root[.]zig'
+    [ct25519/ladder]='root[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
     [ed448/full]='ed448[.]zig|field[.]zig|x448[.]zig|scalar[.]zig'
@@ -514,6 +521,9 @@ declare -A LABEL=(
     [chachapoly/aead]='aead: root+std'
     [ct25519/ct25519]='ct25519/root.zig'
     [ct25519/std]='std 25519'
+    [ct25519/comb]='ct25519 mulBase comb'
+    [ct25519/ladderbase]='ct25519 ladder B'
+    [ct25519/ladder]='ct25519 ladder var'
     [decaf448/scalarmul]='decaf448+ed448'
     [ecvrf/prove]='ecvrf.zig'
     [ed448/full]='ed448 src'

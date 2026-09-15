@@ -9,10 +9,15 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
 ## Design
 
 - **Source of truth**: `std.crypto.ecc.Edwards25519`'s own constant-time
-  ladder. This module is not a new algorithm and must never become one — it
-  is std's `pcMul16` with exactly one thing removed. Anything else that
-  diverges from std is a bug in this module, and the differential tests exist
-  to say so.
+  ladder. `mul`/`mulRistretto` are not a new algorithm and must never become
+  one — they are std's `pcMul16` with exactly one thing removed. Anything else
+  that diverges from std is a bug in this module, and the differential tests
+  exist to say so.
+  ⚠ **One documented exception, since 2026-09-16:** `mulBase` and
+  `mulRistrettoBase` use a fixed-base comb instead of the ladder (audit C3),
+  admitted under `DECISIONS.md` P5 with the evidence in § "C3 — the base point
+  uses a fixed-base comb" below. `mul(Edwards25519.basePoint, s)` is still the
+  ladder, and it is the comb's reference.
 - **std recon (confirmed against `lib/std/crypto/25519/edwards25519.zig`,
   0.16.0)**:
   - `mul(p, s)` is `pc = if (p.is_base) basePointPc else precompute(p, 15)`
@@ -49,6 +54,115 @@ Provenance: clean-room re-derivation of the fixed-window ladder in Zig's own
   bits 252..255, so `mul(P, s)` is `s·P` for the full 256-bit integer `s`,
   not for `s mod L`. A caller that needs the reduced value reduces first
   (`scalar.reduce`/`reduce64`), exactly as it must for std.
+
+## C3 — the base point uses a fixed-base comb (a `DECISIONS.md` P5 change)
+
+**Why.** `mulBase` was `mul(basePoint, s)`: 64 window additions and **252
+doublings** over a 16-entry table, 71 % of its time in the doublings, 2.81×
+libsodium's base multiply (audit C3, 52.5 vs 18.7 µs). Five modules pay it —
+`ecvrf` (`publicKey`, the nonce commitment `k·B`), `signal` (XEdDSA key point
+and nonce), `voprf` (`skS·B`, POPRF tweak), `opaque` through `voprf`.
+
+**Technique and source.** The fixed-base comb of Bernstein, Duif, Lange,
+Schwabe, Yang, "High-speed high-security signatures" (J. Cryptogr. Eng. 2012)
+§4, i.e. ref10's `ge_scalarmult_base` and libsodium's
+`ge25519_scalarmult_base`, implemented from that description:
+
+- `s` is recoded into signed radix-16 digits `e[0..64]` in `[-8, 7]`
+  (`combRecode`: `x = nibble + carry`, `carry = (x + 8) >> 4`,
+  `e = x − 16·carry`), so `s = Σ e[i]·16^i + carry·16^64`;
+- `comb_table[j][k] = (k+1)·16^(2j)·B`, 32×8 points in extended coordinates,
+  folded at comptime from std's `add`/`dbl` (~480 operations);
+- `q = Σ_{i odd} e[i]·16^(i−1)·B`, four doublings, then `+ Σ_{i even}
+  e[i]·16^i·B`: **64 additions and 4 doublings**.
+- ⚠ **Deviation from ref10, deliberate.** ref10 requires `s[31] ≤ 127` so its
+  top digit can absorb the carry. This module reads all 256 bits (the `mul`
+  contract), so the carry out of digit 63 stays a secret bit and one extra,
+  always-performed add selects `2^256·B` (`comb_carry`) or the identity by
+  `cMov`.
+
+Constant-time shape: 64 digit iterations whatever `s` is; recoding by
+shift/mask; each row gathered by a full 8-entry `cMov` scan (the `pcSelect`
+mask) and the sign by `cMov` onto `−x`/`−t`; table indices are loop counters.
+That is the design, not the evidence — evidence 3 is.
+
+**The four P5 pieces of evidence** (all in-tree; numbers from 2026-09-16,
+zig 0.16.0, valgrind 3.26.0, x86_64):
+
+1. **Bit-exact KAT set against the previous implementation.** The reference is
+   `mul(Edwards25519.basePoint, s)` / `mulRistretto(Ristretto255.basePoint, s)`
+   — byte for byte the pre-C3 `mulBase`/`mulRistrettoBase` — compared on the
+   canonical encoding, both groups:
+   - every nibble value 0..15 at every position 0..63 (1 024 scalars): reaches
+     all 256 table entries with both signs, every carry, and the carry point;
+   - 33 boundary and carry-chain scalars (`0`, `L−1`, `L`, `L+1`, `2L`,
+     `2^256−L`, `2^252`, `2^255±1`, `2^256−1`, all-`0x88` where the carry
+     ripples through all 64 digits, all-`0x77`, alternating patterns, …);
+   - the RFC 8032 §7.1 public keys (existing external anchor) now run through
+     the comb;
+   - the table itself entry by entry against the ladder, and `comb_carry`
+     against `16·(2^252·B)`; the recoding against integer reconstruction of
+     2 003 scalars with the digit range asserted.
+2. **Randomized differential** against the same reference: 20 000 scalars in
+   the ReleaseFast lane (200 in Debug), half raw 256-bit, half reduced.
+   **Teeth, measured** (`-Dtest-filter=C3`, each mutant compiled, `N fail`
+   read from the run line): recoding digit range shifted (M1) — output
+   equivalent, since digits in `[-7, 8]` are still covered by the table, and
+   caught only by the recoding test, 1 fail; x not negated, t not negated,
+   3 doublings instead of 4, carry add dropped, odd pass reads the wrong row,
+   magnitude 8 never selected, wrong `|e|`, next table row ×128, odd/even
+   nibble swapped, carry bit never selects (M2–M11) — **3 or 4 fail each,
+   10/10 RED**; two correct rewrites (carry by compare, table by additions
+   only) **GREEN**.
+3. **ctgrind target.** `ctgrind_harness.zig` gained `comb` (`mulBase`),
+   `ladderbase` (`mul(basePoint, s)`, the pre-C3 path) and `ladder` (a point
+   decoded at run time, audit C4); `ct25519` (`mulRistrettoBase`) now also
+   measures the comb. ReleaseFast, `-fvalgrind`, tainted scalar:
+
+   | target | total | in `root.zig` | witness | unattr | printed result |
+   |---|---|---|---|---|---|
+   | `ct25519` (comb, ristretto) | 2 | **0** | 2 | 0 | `7a9899…5226`, digest unchanged from the pre-C3 pin |
+   | `comb` | 2 | **0** | 2 | 0 | `5c412d…3936` |
+   | `ladderbase` | 2 | **0** | 2 | 0 | `5c412d…3936` (= `comb`) |
+   | `ladder` (runtime table) | 2 | **0** | 2 | 0 | `7a9899…5226` (= `ct25519`) |
+   | `std` (negative control) | 3 | 1 in std | 2 | 0 | |
+
+   Untainted controls and no-`-fvalgrind` traps 0 on every target; both
+   witness contexts on every row are `Io.Writer.printHex` under the harness's
+   final print. **Positive controls on the comb** (mutated `root.zig`, then
+   restored and cmp-verified): a branch on the recoding carry →
+   `comb` and `ct25519` **3 / 1 in-file**, the new context at the mutated
+   line; a secret-indexed row read (`if (abs != 0) t = row[abs − 1]`) →
+   **8 / 6 in-file**. In both, `ladderbase` and `ladder` stay at 0 — the
+   targets localise.
+4. **This section**, with the A/B below and why the gain outweighs the new
+   code.
+
+**A/B, ReleaseFast** — one process, pre-C3 `root.zig` (`74645800`) against the
+tree, 9 interleaved rounds with alternating order, CPU time, µs/op, median
+[min..max]:
+
+| operation | before | after | median | paired ratio |
+|---|---|---|---|---|
+| `mulBase` | 56.3 [55.1..58.5] | 21.5 [20.6..22.5] | **2.62×** | 2.57..2.71 |
+| `mulRistrettoBase` | 55.8 [54.7..56.9] | 21.8 [21.4..22.2] | **2.56×** | 2.50..2.61 |
+| `mulRistretto`, runtime point (unchanged — control) | 58.3 [57.5..59.6] | 57.9 [57.0..58.6] | 1.01× | 0.99..1.03 |
+| `ecvrf` `KeyPair.prove` | 193.8 [189.4..233.1] | 160.3 [159.4..176.6] | **1.21×** | 1.10..1.46 |
+
+The control pair sitting at 1.01× says the machine did not drift across the
+run. `KeyPair.prove` does one base multiply (`k·B`); the rest is two ladder
+multiplies over `H` and hashing.
+
+**Why the gain outweighs the new code.** 2.6× on the one operation every
+secret-key derivation and every Schnorr-style nonce commitment in five modules
+performs, with no change to the contract (constant-time, total, all 256 bits,
+no error union, same result on every input) and the old algorithm kept in the
+module as a standing oracle. The cost is ~41 KiB of comptime-folded rodata, a
+recoding step with no std counterpart, and one more path the ctgrind gate has
+to measure — which it now does, with a positive control that fires.
+
+`src/bench.zig` (`CT25519_BENCH=1 scripts/modtest ct25519
+-Doptimize=ReleaseFast`) re-runs the same pairs in-module (audit C9).
 
 ## Threat model / limits
 
@@ -281,7 +395,10 @@ byte-identical on every input — while `scripts/ctgrind.sh ct25519` catches it
 reason the harness is documented here rather than treated as optional:
 **for this module the valgrind run is not a nicety, it is the only oracle
 for the property the module is named after.** Re-run it after any change to
-`mul`, `pcSelect` or `precompute`.
+`mul`, `pcSelect`, `precompute`, or the comb (`combRecode`, `combSelect`,
+`combMulBase`, the table). The table above predates C3 and covers the two
+original targets; the `comb`, `ladderbase` and `ladder` targets and their
+positive controls are in § "C3 — the base point uses a fixed-base comb".
 
 ## Anchoring
 
