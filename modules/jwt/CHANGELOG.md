@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only. The `HttpFetcher` body-read cancel test canceled after a fixed
+  sleep. It now cancel once the client is inside the socket read under test (`ReadCueIo`, a
+  `std.Io` double that counts `netRead` entries), and the peer is released from `accept`
+  before `join`. On a loaded full gate the sleep could land the cancel before the connect. The
+  peer thread then waited in `accept` forever, the shape that hung `http` in full-gate attempt 3.
+
 - **2026-09-09** — Licensing: added `NOTICE` (kind `third-party attribution`). No code
   changed. `src/rfc9964_vectors.zig` reproduces RFC 9964 Appendix A.1's JOSE examples
   verbatim, which the module's `Provenance:` statement never mentioned — it lists the
