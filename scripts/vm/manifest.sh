@@ -202,6 +202,11 @@ VM_DEBIAN_PACKAGES=(
     wpasupplicant
     hostapd
     strace
+    # hqc's performance profile (audit M4, `scripts/vm/run.sh hqc`): `perf
+    # record` as root inside the guest, because the dev host's
+    # perf_event_paranoid=4 refuses perf to users. Measurement-time only, like
+    # strace: nothing committed needs this image to build or pass.
+    linux-perf
     # fleetsim's live lane needs a real third-party SCADA master to point at a
     # simulated device. Every one of them is a Python library (see
     # VM_DEBIAN_PIP below), so the interpreter and pip come from apt and the

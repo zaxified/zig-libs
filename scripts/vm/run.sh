@@ -359,6 +359,27 @@ guest_after() {
             done
             printf '%s' "$after"
             ;;
+        hqc)
+            # The profile: one record per KEM operation (keypair is the main
+            # run, see guest_run_prefix), then a symbol report for each and a
+            # source-line report for decaps.
+            #  * `perf --no-pager` and stdin from /dev/null: on the serial tty
+            #    `perf report --stdio` otherwise starts `less`, which swallowed
+            #    the rest of the batch AND the poweroff (first run, 737 s).
+            #  * the srcline pass resolves DWARF per sample and is bounded.
+            #  * PCLMUL_INSNS_IN_BINARY > 0: the CLMUL path was built, not the
+            #    portable one (a baseline -mcpu build has none).
+            #  * `evlist`: vPMU `cycles` vs perf's cpu-clock fallback.
+            #  * the final marker is split (DO""NE) so the tty's echo of this
+            #    very command line cannot satisfy guest_require.
+            printf '%s' \
+                'echo PCLMUL_INSNS_IN_BINARY=$(objdump -d /tmp/runme | grep -ci pclmul); ' \
+                'for op in encaps decaps; do HQC_PROFILE=$op perf record -F 999 -o /tmp/p-$op.data -- /tmp/runme; done; ' \
+                'echo ===PERF_EVLIST===; perf --no-pager evlist -i /tmp/p-decaps.data </dev/null; ' \
+                'for op in keypair encaps decaps; do echo ===PERF_SYM_$op===; perf --no-pager report -i /tmp/p-$op.data --stdio --no-children --sort sym --percent-limit 0.5 </dev/null; done; ' \
+                'echo ===PERF_SRCLINE_decaps===; timeout 180 perf --no-pager report -i /tmp/p-decaps.data --stdio --no-children --sort srcline --percent-limit 1 </dev/null; echo SRCLINE_RC=$?; ' \
+                'echo PERF_REPORT_DO""NE; '
+            ;;
         *) printf '' ;;
     esac
 }
@@ -400,6 +421,7 @@ guest_require() {
                 fleetsim_master_marker "$m"
             done
             ;;
+        hqc) echo PERF_REPORT_DONE ;;
         *) printf '' ;;
     esac
 }
@@ -409,6 +431,8 @@ guest_require() {
 guest_mem() {
     case "$1" in
         fleetsim) echo 1536 ;;
+        # perf report resolving source lines through DWARF is the big user.
+        hqc) echo 1536 ;;
         *) echo 512 ;;
     esac
 }
@@ -428,6 +452,47 @@ guest_smp() {
     esac
 }
 
+# Build mode of the guest binary. Debug, as `zig test` itself defaults to,
+# unless the module's lane exists to measure optimised code.
+#
+#   hqc -> ReleaseFast. Its lane is a sampling profile (audit M4), and a Debug
+#          profile ranks safety checks, not the ring multiply.
+guest_optimize() {
+    case "$1" in
+        hqc) echo ReleaseFast ;;
+        *) echo Debug ;;
+    esac
+}
+
+# `-mcpu` for the cross-compile; empty = the target triple's baseline CPU.
+#
+#   hqc -> native. Its fast multiply is comptime-gated on `pclmul`, which the
+#          x86_64 baseline lacks, so a baseline build would profile the portable
+#          schoolbook path instead. The guest runs `-cpu host`, so "native" is
+#          the CPU the binary actually executes on.
+guest_mcpu() {
+    case "$1" in
+        hqc) echo native ;;
+        *) printf '' ;;
+    esac
+}
+
+# Prepended to the test binary's command line in the guest. Quote-free, like
+# guest_setup.
+#
+#   hqc -> the opt-in profile workload for keypair, under `perf record`
+#          (encaps and decaps get their own records in guest_after). The exit
+#          code still reaches GUEST_EXIT: perf returns its child's. -F 999, not
+#          more: every sample is a VM exit through the vPMU, and at 2999 Hz the
+#          guest kernel throttled itself ten times ("perf: interrupt took too
+#          long") and the workload ran ~8x slower than on the host.
+guest_run_prefix() {
+    case "$1" in
+        hqc) printf '%s' 'HQC_PROFILE=keypair perf record -F 999 -o /tmp/p-keypair.data -- ' ;;
+        *) printf '' ;;
+    esac
+}
+
 # Seconds boot-debian.exp will wait for the command batch. The default 90 is
 # sized for a suite that runs in seconds; fleetsim's live tests each hold a
 # socket open for a 60s budget by design.
@@ -438,6 +503,8 @@ guest_cmd_timeout() {
         # compile of the DNP3 driver, plus the rest of the filtered suite.
         # 1200 leaves headroom over the ~450 s that costs.
         fleetsim) echo 1200 ;;
+        # ~4 s of workload, then perf resolving every sample's source line.
+        hqc) echo 600 ;;
         *) echo 90 ;;
     esac
 }
@@ -459,6 +526,8 @@ guest_default_filter() {
                 fleetsim_master_filter "$m"
             done
             ;;
+        # hqc's lane is the M4 profile, not the suite: the rest runs on the host.
+        hqc) echo 'profile workload for perf' ;;
         *) printf '' ;;
     esac
 }
@@ -585,6 +654,15 @@ echo "vm: dependency closure: ${CLOSURE[*]}"
 # the FIRST `-M` must be the module under test — that's what "the main
 # module" means to `zig test`). Verified on a 2-level chain (wireguard ->
 # genetlink -> netlink) before relying on it here.
+# `-O` and `-mcpu` are PER-MODULE options: each binds to the `-M` that follows
+# it. Appended after the modules, `-O ReleaseFast` bound to nothing and the
+# guest ran a 15 MB Debug binary (2026-09-15, caught by its safety-panic
+# strings and a 7x slower workload). So they are repeated in front of EVERY
+# `-M`, dependencies included.
+MODE_ARGS=(-O "$(guest_optimize "$MODULE")")
+_mcpu="$(guest_mcpu "$MODULE")"
+[[ -n "$_mcpu" ]] && MODE_ARGS+=(-mcpu "$_mcpu")
+
 ZIG_ARGS=()
 for m in "${CLOSURE[@]}"; do
     d="$(deps_of "$m")"
@@ -592,7 +670,7 @@ for m in "${CLOSURE[@]}"; do
         [[ -z "$dep" ]] && continue
         ZIG_ARGS+=(--dep "$dep")
     done
-    ZIG_ARGS+=("-M${m}=modules/${m}/src/root.zig")
+    ZIG_ARGS+=("${MODE_ARGS[@]}" "-M${m}=modules/${m}/src/root.zig")
 done
 
 BIN="$WORK_DIR/${MODULE}-${PLATFORM}-test"
@@ -673,7 +751,7 @@ case "$PLATFORM" in
         HASH='$6$ziglibsvm$2WcZuPUB4TEmGwA.07rEyxkoXl.TTGBAGJBnUjWbJhfpEFQiFc08SdtJACCJGetmUIy5MIbNfFN/Zy.euXHIC1'  # throwaway VM-only password "zigvm" — ephemeral -snapshot guest, no host port exposed
         KCHECK=""
         [[ -n "$KERNEL_APPEND" ]] && KCHECK="grep -qwF -- $KERNEL_APPEND /proc/cmdline && echo KERNEL_APPEND_OK || echo KERNEL_APPEND_FAIL; "
-        RUNCMD="${KCHECK}${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; /tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
+        RUNCMD="${KCHECK}${SETUP}curl -fsS http://10.0.2.2:$HTTP_PORT/$BIN_NAME -o /tmp/$BIN_NAME && echo FETCH_OK || echo FETCH_FAIL; chmod +x /tmp/$BIN_NAME; $(guest_run_prefix "$MODULE")/tmp/$BIN_NAME; RC=\$?; ${AFTER}echo GUEST_EXIT=\$RC"
         expect "$SCRIPT_DIR/boot-debian.exp" "$IMG" "$HASH" "$(guest_mem "$MODULE")" "$RUNCMD" "$(guest_cmd_timeout "$MODULE")" "$(guest_smp "$MODULE")" "$KERNEL_APPEND" >"$VMLOG" 2>&1
         ;;
 esac
