@@ -461,11 +461,19 @@ fn randFe(rand: std.Random) struct { k: Fe, s: StdFe } {
     }
 }
 
+// Debug: measured ~12s for this test ALONE, isolated (`scripts/modtest p256
+// -Dtest-filter="mul/sq/add/sub/neg/invert"`), just over the campaign's 10s
+// per-test budget -- audit A1, 2026-09-17 full-gate attempts. Field ops here
+// are cheap relative to a full point multiply, so a modest trim suffices;
+// ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count (they are not the
+// problem).
+const field_diff_iters: usize = if (builtin.mode == .Debug) 2000 else 4000;
+
 test "differential vs std.Fe: mul/sq/add/sub/neg/invert on random inputs" {
     var prng = std.Random.DefaultPrng.init(0xC0FFEE_9256D);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 4000) : (i += 1) {
+    while (i < field_diff_iters) : (i += 1) {
         const a = randFe(rand);
         const b = randFe(rand);
 

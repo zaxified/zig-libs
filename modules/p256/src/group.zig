@@ -29,6 +29,7 @@
 //!     Vartime (all inputs public); byte-exact vs the plain ladder + std.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const field = @import("field.zig");
 const scalarmod = @import("scalar.zig");
@@ -794,11 +795,22 @@ test "wNAF: the top of the scalar range recodes without wrapping" {
     }
 }
 
+// Debug: this test (7 std-touching point ops per draw: two basePoint muls,
+// dbl, add, CT mul, mulPublic, mulDoubleBasePublic) hit the full gate's
+// per-test 3-minute timeout (`gate-all-20260917e.log:118-143`,
+// "timed out after 3m0.938ms"). Isolated under this session's own machine
+// load, the unscaled 400-iteration loop alone measured ~90s -- std's
+// unoptimized Debug `basePoint.mul` (plain double-and-add, no comb table
+// there) is the cost, not a bug in the code under test (same shape as the
+// k256 `oracle_test.comb` fix, `14b2e983`). ReleaseFast/ReleaseSafe/
+// ReleaseSmall keep the full count -- they are fast enough already.
+const group_diff_iters: usize = if (builtin.mode == .Debug) 30 else 400;
+
 test "differential vs std: dbl/add/scalarmul/combMulBase on random scalars" {
     var prng = std.Random.DefaultPrng.init(0x60D_C0DE_9256);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 400) : (i += 1) {
+    while (i < group_diff_iters) : (i += 1) {
         var s1b: [32]u8 = undefined;
         var s2b: [32]u8 = undefined;
         rand.bytes(&s1b);
@@ -848,11 +860,19 @@ test "recoverY / lift_x matches std (a = −3 curve equation)" {
     }
 }
 
+// Debug: measured ~16s for this test ALONE, isolated -- each draw is a
+// std.basePoint.mul plus module combMulBase, over the campaign's 10s
+// per-test budget. Fixed-vector coverage of the SEC1 decode paths (identity/
+// compressed/uncompressed/malformed) lives separately in "corpus: every
+// SEC1 seed reaches fromSec1" below, unconditionally in every mode -- this
+// only trims the random-sample count.
+const sec1_roundtrip_iters: usize = if (builtin.mode == .Debug) 100 else 300;
+
 test "SEC1 round-trip (compressed + uncompressed) matches std" {
     var prng = std.Random.DefaultPrng.init(0x5EC1_9256);
     const rand = prng.random();
     var i: usize = 0;
-    while (i < 300) : (i += 1) {
+    while (i < sec1_roundtrip_iters) : (i += 1) {
         var sb: [32]u8 = undefined;
         rand.bytes(&sb);
         const kp = P256.combMulBase(sb, .big) catch continue;
