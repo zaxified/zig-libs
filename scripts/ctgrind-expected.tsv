@@ -370,8 +370,8 @@ k256	ReleaseFast	ecdsa	1	11	62fb76fb4a2cbd91	8ff4812d21149442
 montint	ReleaseFast	small	1	0	045eb3a8ac23bebb	4e9f8c0b1ac8efe3
 montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
 montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
-p256	ReleaseFast	comb	1	1	ce6df2820f2d9b31	9d70061e0f0133d9
-p256	ReleaseFast	sign	1	<=9	4cffcaece7902b39	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	101bc1fec53c9fa9	9d70061e0f0133d9
+p256	ReleaseFast	sign	1	<=9	61142e54bd8f31ab	af4baed5c5134f3f
 rsa	ReleaseFast	crt	1	<=213	39900744cef42863	d4057b00f9df7b56
 rsa	ReleaseFast	noncrt	1	2	39900744cef42863	d4057b00f9df7b56
 slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
@@ -493,8 +493,8 @@ spake2plus	ReleaseFast	proverstart	1	7	98d3a68346d3d767	5b3e4131495365d6
 spake2plus	ReleaseFast	verifierstart	1	7	98d3a68346d3d767	ce61814fc8e1b2b7
 spake2plus	ReleaseFast	proverfinish	1	12	98d3a68346d3d767	5cdf0fe20429a208
 spake2plus	ReleaseFast	verifierfinish	1	10	98d3a68346d3d767	dbdff43379a90cf5
-bbs	ReleaseFast	sign	1	<=47	506b6aabd93a15a7	a147c158e7c878af
-bbs	ReleaseFast	proofgen	1	<=134	506b6aabd93a15a7	61ed4182d62a0b91
+bbs	ReleaseFast	sign	1	<=47	f40744df871005b9	a147c158e7c878af
+bbs	ReleaseFast	proofgen	1	<=134	f40744df871005b9	61ed4182d62a0b91
 coconut	ReleaseFast	authority_sign	1	<=69	04e312f73ccbddb6	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	3	a6281f1d04b2a243	af24664cb307a403
 coconut	ReleaseFast	user_show	1	<=51	04e312f73ccbddb6	c75d6d631d2311f7
