@@ -223,6 +223,11 @@ declare -A TARGETS=(
     # A1 `pir.md` M2: the module's central claim was never machine-checked, and
     # its sibling `fss` exposed a real defect the day IT entered the gate.
     [pir]="query reconstruct"
+    # ── 2026-09-16: A1 opaque M5 and bip32 M6, first harnesses ─────────────
+    # Each target taints ONE party's secrets; the other party runs untainted
+    # first, so nothing public on the wire is counted as secret
+    # (see each harness's module doc comment).
+    [opaque]="register login serverke2"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -267,6 +272,7 @@ declare -A MODES=(
     [dkg]="ReleaseFast"
     [sealedbox]="ReleaseFast"
     [pir]="ReleaseFast"
+    [opaque]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -471,6 +477,15 @@ declare -A PATTERN=(
     [sealedbox/b64enc]='root[.]zig:[1-9]|base64[.]zig'
     [sealedbox/b64dec]='root[.]zig:[1-9]|base64[.]zig'
     [adaptor/extract]='root[.]zig|common[.]zig|group[.]zig|field[.]zig|fast_core[.]zig'
+    # ⚠ `root[.]zig` here is opaque's own file AND voprf's AND ct25519's (same
+    # basename, see the blindrsa note above). That is the intended column:
+    # opaque delegates its OPRF to voprf and its scalar multiplication to
+    # ct25519, so their constant-time property is opaque's for every byte of
+    # the password that flows through them. The source pin hashes only
+    # modules/opaque/src/root.zig.
+    [opaque/register]='root[.]zig'
+    [opaque/login]='root[.]zig'
+    [opaque/serverke2]='root[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
 WITNESS='Writer[.]zig|Format[.]zig|fmt[.]zig'
@@ -594,6 +609,9 @@ declare -A LABEL=(
     [sealedbox/hexdec]='sealedbox parseSecretKeyHex (CT; 1 = accept/reject)'
     [sealedbox/b64enc]='sealedbox encodeSecretKeyBase64 (CT, table-free)'
     [sealedbox/b64dec]='sealedbox parseSecretKeyBase64 (CT; 1 = accept/reject)'
+    [opaque/register]='opaque client registration (password, blind)+voprf'
+    [opaque/login]='opaque client KE1+KE3 (password, blind, keyshare)+voprf'
+    [opaque/serverke2]='opaque server KE2 (sk, oprf_seed, keyshare, masking_key)'
 )
 
 # ── arguments ──────────────────────────────────────────────────────────────
