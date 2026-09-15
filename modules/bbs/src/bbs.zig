@@ -42,6 +42,7 @@
 //! `&calculateRandomScalars(3 + U, io)`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cs = @import("ciphersuite.zig");
 const keys = @import("keys.zig");
 const gate = @import("gate.zig");
@@ -1371,7 +1372,19 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
 
     // L = 0, 1, 2 (the brief's mandated minimum), straddling msm_crossover
     // (== 2, see its doc comment) on both sides, and well past it.
-    const ls = [_]usize{ 0, 1, 2, 3, 4, 8, 16, 64, 300 };
+    //
+    // Debug: measured ~32s for this test ALONE, isolated (dominated by
+    // L=300's createGenerators + three separate MSM computations) --
+    // over the campaign's 10s per-test budget (audit A1, 2026-09-17 gate
+    // survey). The large L values (16, 64, 300) are extended coverage past
+    // the crossover, not the brief's mandated minimum (0, 1, 2) or the
+    // "well past it" boundary (8 already clears msm_crossover == 2 by 4x) --
+    // trimmed in Debug only, full set kept in ReleaseFast/ReleaseSafe/
+    // ReleaseSmall.
+    const ls: []const usize = if (builtin.mode == .Debug)
+        &[_]usize{ 0, 1, 2, 3, 4, 8 }
+    else
+        &[_]usize{ 0, 1, 2, 3, 4, 8, 16, 64, 300 };
 
     for (ls) |l| {
         const generators = try cs.createGenerators(allocator, l + 1);
@@ -1421,7 +1434,16 @@ test "F4 oracle: proofVerify's ProofVerifyInit — MSM form matches the original
     // total = R (disclosed) + U (undisclosed); cover R/U = 0 and a spread
     // straddling msm_crossover (== 2) for each of the two MSM calls (d_j
     // has R+2 terms, t_j has U+3).
-    const totals = [_]usize{ 0, 1, 2, 3, 8, 300 };
+    //
+    // Debug: measured ~17s for this test ALONE, isolated -- same shape as
+    // the sibling F4 oracle test above (dominated by total=300's
+    // createGenerators + msmPublic calls). 8 already clears msm_crossover
+    // == 2 by 4x, so trimming just the 300 case keeps every crossover-
+    // straddling point; full set kept outside Debug.
+    const totals: []const usize = if (builtin.mode == .Debug)
+        &[_]usize{ 0, 1, 2, 3, 8 }
+    else
+        &[_]usize{ 0, 1, 2, 3, 8, 300 };
 
     for (totals) |total| {
         const generators = try cs.createGenerators(allocator, total + 1);
