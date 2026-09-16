@@ -13,14 +13,27 @@ broken and every other row is meaningless.
 ⚠ EACH MUTATION GETS ITS OWN `--cache-dir`. A shared cache handed back a stale
 binary and produced 18 false PASSes in an earlier session.
 
-⚠ IT EDITS THE TRACKED TREE IN PLACE and restores with `git checkout --` in a
-`finally`, refusing to start unless `modules/drand` is pristine. A SIGKILL
-between the write and the restore leaves a mutated file behind; recover with
-`git checkout -- modules/drand`. See `README.md` here for why this was not
-converted to the safer scratch-copy shape that `modules/hqc/tools/mutate.py`
-uses.
+⚠ IT MUTATES A SEPARATE `git worktree`, NEVER THE TRACKED TREE (2026-09-16).
+Every edit lands in a detached checkout under `.zig-cache/drand-mutate/wt`, so
+a SIGKILL, an OOM kill or a power loss mid-run cannot leave a mutated file in
+the tree you work in. Until that date this patched `modules/drand/src` in place
+and relied on `git checkout --` in a `finally`, which is enough for a normal
+exit and a Ctrl-C and not enough for anything else.
 
-WHAT IT NEEDS. A `zig` on PATH and a clean `modules/drand`.
+⚠ IT STILL RUNS `zig build test-drand`, AND THAT IS THE POINT. The module's
+dependency closure is bls12_381 -> entropy and tlock -> bls12_381 + entropy,
+plus testkit for tests; a hand-assembled `-M` module graph would have to
+restate all of it and would silently rot when it changes. `whois`'s runner was
+migrated with exactly one dep missing and every row read RED, no-op control
+included, because nothing could build. Driving the real build system inside a
+throwaway checkout keeps the deps correct by construction AND the tree safe.
+
+The worktree is created on first use and left in place (72 MB, inside the
+droppable cache). Remove it with:
+
+    git worktree remove --force .zig-cache/drand-mutate/wt
+
+WHAT IT NEEDS. A `zig` on PATH, and a repository `git worktree` can check out.
 
     python3 mutate.py            # all 22
     python3 mutate.py M09 M10    # only these
@@ -33,8 +46,11 @@ import os, subprocess, sys, shutil, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-SRC = os.path.join(ROOT, "modules/drand/src")
 CACHE = os.path.join(ROOT, ".zig-cache/drand-mutate")
+# The detached checkout everything happens in. `SRC` deliberately points INSIDE
+# it: nothing in this file may name a path under the tracked tree.
+WT = os.path.join(CACHE, "wt")
+SRC = os.path.join(WT, "modules/drand/src")
 
 # (id, file, kind, old, new, description)
 MUTATIONS = [
@@ -171,7 +187,7 @@ def run(mid, path, old, new, desc):
         p = subprocess.run(
             ["zig", "build", "test-drand", "-Doptimize=ReleaseFast",
              "--summary", "all", "--cache-dir", cd],
-            cwd=ROOT, capture_output=True, text=True, timeout=1800)
+            cwd=WT, capture_output=True, text=True, timeout=1800)
         dt = time.time() - t0
         out = (p.stdout + p.stderr)
         # A mutation that fails to COMPILE is not a killed mutation -- see
@@ -193,16 +209,42 @@ def run(mid, path, old, new, desc):
                 break
         return (mid, path, desc, verdict, f"{summary} | {first_err} | {dt:.0f}s")
     finally:
-        subprocess.run(["git", "checkout", "--", "modules/drand/src/" + path], cwd=ROOT)
+        # Restore inside the WORKTREE. Even if this never runs, the tracked
+        # tree is untouched -- that is the whole reason the worktree exists.
+        subprocess.run(["git", "-C", WT, "checkout", "--",
+                        "modules/drand/src/" + path])
+
+
+def ensure_worktree():
+    """A detached checkout of HEAD to mutate, created once and reused.
+
+    Detached on purpose: a named branch here would show up in `git branch` and
+    invite someone to commit to it.
+    """
+    os.makedirs(CACHE, exist_ok=True)
+    if not os.path.isdir(os.path.join(WT, ".git")) and not os.path.isfile(os.path.join(WT, ".git")):
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                              capture_output=True, text=True).stdout.strip()
+        r = subprocess.run(["git", "worktree", "add", "--detach", WT, head],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            print("REFUSING: could not create the worktree:\n" + r.stdout + r.stderr)
+            sys.exit(1)
+    # It must be pristine, for the same reason the tracked tree had to be
+    # before: a leftover edit would be attributed to whichever row runs next.
+    d = subprocess.run(["git", "-C", WT, "status", "--porcelain", "--", "modules/drand"],
+                       capture_output=True, text=True).stdout.strip()
+    if d:
+        print("REFUSING: the worktree's modules/drand is not pristine:\n" + d)
+        print(f"  restore it with: git -C {WT} checkout -- modules/drand")
+        sys.exit(1)
+    print(f"worktree: {WT}\n"
+          f"  (the tracked tree is never written to; remove with "
+          f"`git worktree remove --force {os.path.relpath(WT, ROOT)}`)\n")
 
 
 def main():
-    os.makedirs(CACHE, exist_ok=True)
-    d = subprocess.run(["git", "status", "--porcelain", "--", "modules/drand"],
-                       cwd=ROOT, capture_output=True, text=True).stdout.strip()
-    if d:
-        print("REFUSING: modules/drand is not pristine:\n" + d)
-        sys.exit(1)
+    ensure_worktree()
     only = sys.argv[1:]
     rows = []
     for m in MUTATIONS:

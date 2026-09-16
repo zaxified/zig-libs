@@ -13,21 +13,28 @@ can actually be obtained.
 It is kept rather than folded into `mutate.py` because it is the evidence that
 M10's row was measured rather than assumed.
 
-WHAT IT NEEDS. A `zig` on PATH and a pristine `modules/drand`.
+WHAT IT NEEDS. A `zig` on PATH, and a repository `git worktree` can check out.
 
     python3 mutate_m10.py
 
-⚠ Like `mutate.py`, it edits the tracked tree and restores in a `finally`; see
-`README.md` here for the hazard and the recovery command.
+⚠ Like `mutate.py`, it mutates the DETACHED WORKTREE under
+`.zig-cache/drand-mutate/wt` and never the tracked tree (2026-09-16). It reuses
+that file's `ensure_worktree()` rather than restating it, so the rule has one
+implementation instead of two that can drift apart. Until that date both of
+these patched `modules/drand/src` in place and leaned on a `finally`.
 
 WHAT IT PRODUCES. One verdict line — SURVIVED or CAUGHT — plus the suite's own
 summary line and the first error, if any.
 """
 import os, subprocess, sys, time
 
+# One implementation of the worktree rule, not two. Importing `mutate` is
+# side-effect free: its `main()` sits under `if __name__ == "__main__"`.
+from mutate import WT, ensure_worktree
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-F = os.path.join(ROOT, "modules/drand/src/verify.zig")
+F = os.path.join(WT, "modules/drand/src/verify.zig")
 
 OLD = """    if (round.randomness) |claimed| {
         var digest: [32]u8 = undefined;
@@ -40,11 +47,7 @@ NEW = """    if (round.randomness) |claimed| {
     }
 """
 
-d = subprocess.run(["git", "status", "--porcelain", "--", "modules/drand"],
-                   cwd=ROOT, capture_output=True, text=True).stdout.strip()
-if d:
-    print("REFUSING: modules/drand not pristine:\n" + d)
-    sys.exit(1)
+ensure_worktree()
 
 s = open(F).read()
 if s.count(OLD) != 1:
@@ -59,7 +62,7 @@ try:
     p = subprocess.run(["zig", "build", "test-drand", "-Doptimize=ReleaseFast",
                         "--summary", "all", "--cache-dir",
                         os.path.join(ROOT, ".zig-cache/drand-mutate/M10b")],
-                       cwd=ROOT, capture_output=True, text=True, timeout=1800)
+                       cwd=WT, capture_output=True, text=True, timeout=1800)
     out = p.stdout + p.stderr
     survived = p.returncode == 0
     print("M10b verdict:", "SURVIVED" if survived else "CAUGHT",
@@ -73,6 +76,7 @@ try:
     # the exit code too, so a scripted run cannot read this as a pass.
     rc = 1 if survived else 0
 finally:
-    subprocess.run(["git", "checkout", "--", "modules/drand/src/verify.zig"], cwd=ROOT)
+    # Restore inside the WORKTREE; the tracked tree was never written to.
+    subprocess.run(["git", "-C", WT, "checkout", "--", "modules/drand/src/verify.zig"])
 
 sys.exit(rc)

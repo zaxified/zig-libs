@@ -42,17 +42,31 @@ means re-reading `expectedRound` and naming the current site; loosening the
 match until it sticks would produce a mutant that is neither the original nor
 the intended edit.
 
-## ⚠ `mutate.py` edits the tracked tree
+## The mutation runners mutate a separate worktree, not the tracked tree
 
-It patches `modules/drand/src/*.zig` in place and restores with
-`git checkout --` in a `finally`, refusing to start unless the module is
-pristine. That is enough for a normal run and for a `Ctrl-C`, and **not** enough
-for a SIGKILL, an OOM kill or a power loss: those leave a mutated file in the
-working tree. If it ever exits without restoring, `git checkout -- modules/drand`
-puts it back.
+Both `mutate.py` and `mutate_m10.py`: every edit lands in a **detached
+`git worktree`** under `.zig-cache/drand-mutate/wt`, created on first use and
+reused. `mutate_m10.py` imports `ensure_worktree()` from `mutate.py` rather than
+restating it, so there is one implementation of this rule and not two that can
+drift apart. A SIGKILL, an OOM
+kill or a power loss mid-run therefore cannot leave a mutated file in the tree
+you work in. Remove the checkout with:
 
-The safer shape is to copy the sources to a scratch tree and build there — see
-`modules/hqc/tools/mutate.py` and `modules/k256/tools/`. This one was not
-converted because the conversion cannot be validated without re-running all 22
-mutations, and an unvalidated rewrite of a mutation runner is worse than a
-documented hazard.
+    git worktree remove --force .zig-cache/drand-mutate/wt
+
+Until 2026-09-16 this patched `modules/drand/src/*.zig` **in place**, restoring
+with `git checkout --` in a `finally` — enough for a normal exit and a `Ctrl-C`,
+not enough for anything that skips the `finally`. The conversion was deferred
+then on the grounds that it could not be validated without re-running all 22
+mutations; what changed is the shape of the fix, not the standard of evidence.
+
+⚠ **It still runs `zig build test-drand`, and that is deliberate.** The obvious
+"scratch tree" conversion — copy `src/` somewhere and drive `zig test` with a
+hand-written `-M` module graph, as `hqc` and `whois` do — would have to restate
+this module's whole dependency closure (`bls12_381 → entropy`,
+`tlock → bls12_381 + entropy`, plus `testkit` for tests) and would rot silently
+when it changes. That is not hypothetical: `whois`'s runner was migrated with
+exactly one dep missing, so **every** build failed and every row read RED, the
+no-op control included. Driving the real build system inside a throwaway
+checkout keeps the dependency set correct by construction *and* the tree safe,
+which neither of the two obvious options does on its own.
