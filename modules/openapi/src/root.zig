@@ -1471,7 +1471,12 @@ test "endpoint: a malformed request_schema fails once, then a CACHED error on ev
     const first = c1 - c0;
     const second = c2 - c1;
     const third = c3 - c2;
-    std.debug.print("\n[F1] {d} routes, first={d}ns second={d}ns third={d}ns\n", .{ n, first, second, third });
+    // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
+    // (scripts/test-lib.sh), so the number is opt-in; the assertions below run
+    // either way.
+    if (std.process.Environ.getPosix(std.testing.environ, "OPENAPI_VERBOSE") != null) {
+        std.debug.print("\n[F1] {d} routes, first={d}ns second={d}ns third={d}ns\n", .{ n, first, second, third });
+    }
     // Before the fix (`if (e.cached == null) e.cached = try Generator.build(...)`),
     // the error branch never populated `e.cached`, so EVERY call re-walked
     // the whole route table — measured in A1/openapi.md F1 as 173-191ms per

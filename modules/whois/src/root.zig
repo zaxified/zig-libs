@@ -1308,10 +1308,15 @@ test "nextServer: a reply with no referral scans about the same lines/byte as on
     const per_line_no_referral = scanned_no_referral / lines_no_referral;
     const per_line_realistic = scanned_realistic / lines_realistic;
     const ratio = per_line_no_referral / per_line_realistic;
-    std.debug.print(
-        "nextServer lines-scanned/line: no-referral={d:.3} realistic={d:.3} ratio={d:.2}\n",
-        .{ per_line_no_referral, per_line_realistic, ratio },
-    );
+    // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
+    // (scripts/test-lib.sh), so the number is opt-in; the assertion below runs
+    // either way.
+    if (std.process.Environ.getPosix(std.testing.environ, "WHOIS_VERBOSE") != null) {
+        std.debug.print(
+            "nextServer lines-scanned/line: no-referral={d:.3} realistic={d:.3} ratio={d:.2}\n",
+            .{ per_line_no_referral, per_line_realistic, ratio },
+        );
+    }
     // Fixed (single-pass) shape: each call visits every line exactly once
     // regardless of match position, so both sides are ~1.0 and the ratio is
     // ~1.0. The old per-key `fieldValue` shape visits ~4x the lines on a

@@ -643,10 +643,15 @@ test "replay(log_out=null) stores no log entries (audit F10)" {
     const stored_when_enabled = sim_mod.logEntriesStoredForTesting();
     try testing.expect(stored_when_enabled > 10);
 
-    std.debug.print(
-        "F10: entries stored, log disabled={d} log enabled={d}\n",
-        .{ stored_when_disabled, stored_when_enabled },
-    );
+    // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
+    // (scripts/test-lib.sh), so the number is opt-in; the assertions above run
+    // either way.
+    if (std.process.Environ.getPosix(std.testing.environ, "NETSIM_VERBOSE") != null) {
+        std.debug.print(
+            "F10: entries stored, log disabled={d} log enabled={d}\n",
+            .{ stored_when_disabled, stored_when_enabled },
+        );
+    }
 }
 
 test "perf: run() builds the topology once, not twice (audit F9)" {
@@ -697,10 +702,12 @@ test "perf: run() builds the topology once, not twice (audit F9)" {
         one_build_ns += nowNs() - t1;
     }
 
-    std.debug.print(
-        "F9 perf: two_build={d}ns one_build={d}ns ({d} iters, {d}-node ring)\n",
-        .{ two_build_ns, one_build_ns, iters, F9_RING_N },
-    );
+    if (std.process.Environ.getPosix(std.testing.environ, "NETSIM_VERBOSE") != null) {
+        std.debug.print(
+            "F9 perf: two_build={d}ns one_build={d}ns ({d} iters, {d}-node ring)\n",
+            .{ two_build_ns, one_build_ns, iters, F9_RING_N },
+        );
+    }
     try testing.expect(one_build_ns <= two_build_ns);
 }
 

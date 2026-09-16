@@ -1790,10 +1790,15 @@ test "addOption is not quadratic in distinct keys per section" {
         }
     }
     const ratio = @as(f64, @floatFromInt(best_ns[1])) / @as(f64, @floatFromInt(@max(best_ns[0], 1)));
-    std.debug.print(
-        "uci U2 perf regression: N=4000 took {d}ns, N=32000 took {d}ns (thread CPU, min of 3), ratio={d:.2} (quadratic would be ~64x, linear ~8x; gate is <24x)\n",
-        .{ best_ns[0], best_ns[1], ratio },
-    );
+    // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
+    // (scripts/test-lib.sh), so the number is opt-in; the assertion below runs
+    // either way.
+    if (std.process.Environ.getPosix(std.testing.environ, "UCI_VERBOSE") != null) {
+        std.debug.print(
+            "uci U2 perf regression: N=4000 took {d}ns, N=32000 took {d}ns (thread CPU, min of 3), ratio={d:.2} (quadratic would be ~64x, linear ~8x; gate is <24x)\n",
+            .{ best_ns[0], best_ns[1], ratio },
+        );
+    }
     try testing.expect(ratio < 24.0);
 }
 

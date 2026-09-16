@@ -1043,10 +1043,15 @@ test "A1 F9: overlap-check work grows near-linearithmically with fragment count,
     }
     const ratio_n = @as(f64, @floatFromInt(cases[1].n)) / @as(f64, @floatFromInt(cases[0].n));
     const ratio_checks = @as(f64, @floatFromInt(cases[1].checks)) / @as(f64, @floatFromInt(cases[0].checks));
-    std.debug.print(
-        "A1 F9: n={d}->{d} ({d:.0}x fragments) overlap checks {d}->{d} ({d:.1}x) -- audit's OLD unbounded scan measured 56x WALL-CLOCK for this same 16x growth\n",
-        .{ cases[0].n, cases[1].n, ratio_n, cases[0].checks, cases[1].checks, ratio_checks },
-    );
+    // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
+    // (scripts/test-lib.sh), so the number is opt-in; the assertion below runs
+    // either way.
+    if (std.process.Environ.getPosix(std.testing.environ, "ETHFRAG_VERBOSE") != null) {
+        std.debug.print(
+            "A1 F9: n={d}->{d} ({d:.0}x fragments) overlap checks {d}->{d} ({d:.1}x) -- audit's OLD unbounded scan measured 56x WALL-CLOCK for this same 16x growth\n",
+            .{ cases[0].n, cases[1].n, ratio_n, cases[0].checks, cases[1].checks, ratio_checks },
+        );
+    }
     // A true O(n^2) scan gives ratio_checks ~= ratio_n^2 (256x for 16x).
     // This must land far below that -- 4x the LINEAR ratio is generous
     // slack and still cleanly separates "still quadratic" from "fixed".
@@ -1075,10 +1080,12 @@ test "A1 F8: repeated overlap-drop churn allocates the fragment's OWN size, not 
     while (i < inserts) : (i += 1) {
         _ = r.insert(&buf, @intCast(i)) catch {}; // every other call is the duplicate -> OverlappingFragment
     }
-    std.debug.print(
-        "A1 F8: {d} inserts of a 9 B fragment (churn) allocated {d} B total -- audit measured 1,641,675,624 B for the same 50,000-insert shape before this fix\n",
-        .{ inserts, test_f8_bytes_allocated },
-    );
+    if (std.process.Environ.getPosix(std.testing.environ, "ETHFRAG_VERBOSE") != null) {
+        std.debug.print(
+            "A1 F8: {d} inserts of a 9 B fragment (churn) allocated {d} B total -- audit measured 1,641,675,624 B for the same 50,000-insert shape before this fix\n",
+            .{ inserts, test_f8_bytes_allocated },
+        );
+    }
     // Each create-or-recreate needs exactly 9 bytes; the OLD code needed
     // 65535 for every single one (450,000 B total requested here would
     // have become ~3.3 GB). Generous slack (20 B/insert) still separates
