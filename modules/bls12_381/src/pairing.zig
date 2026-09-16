@@ -21,8 +21,9 @@
 //!      function's doc comment for the standard easy/hard split.
 //!
 //! **Status: implemented** (Part-2 crypto-core pass, 2026-07-14).
-//! `multiMillerLoop` is the real optimal-ate loop (affine D-type-twist
-//! line evaluation, shared accumulator, allocation-free batching);
+//! `multiMillerLoop` is the real optimal-ate loop (inversion-free
+//! Jacobian D-type-twist line evaluation since 2026-09-16 — see
+//! `TwistPoint`; shared accumulator, allocation-free batching);
 //! `finalExpHardPart` is the real Hayashida-Hayasaka-Teruya exact-`d`
 //! cyclotomic chain (see its doc comment for why the FCKRH `3d` chain
 //! was NOT used); the easy part was already real from the scaffold.
@@ -44,7 +45,10 @@
 //! Hayashida, Hayasaka, Teruya, "Efficient Final Exponentiation via
 //! Cyclotomic Structure" (ePrint 2020/875 — the exact hard-part
 //! identity `finalExpHardPart` implements); Costello-Lange-Naehrig
-//! (PKC 2010 — the D-type-twist line evaluation); `zkcrypto/bls12_381`
+//! (PKC 2010 — the D-type-twist line evaluation; the Jacobian,
+//! inversion-free form of those lines is this file's own algebra over
+//! them, derived in `doublingStep`/`additionStep` and checked against
+//! the affine version it replaced, not transcribed from a source); `zkcrypto/bls12_381`
 //! and `supranational/blst` remain UNREAD reference implementations
 //! (per `NOTICE`); the output is pinned bit-for-bit against the IETF
 //! pairing-friendly-curves draft's official optimal-ate test vector,
@@ -178,13 +182,23 @@ pub const PairingPair = struct {
 /// fold — the standard optimization (every serious pairing
 /// implementation applies it) is that a freshly-computed line value
 /// `l_i` is SPARSE (3 of its 6 `Fp2` coefficients nonzero — the "014"
-/// shape `lineEval` documents), so `f.mul(l_i)` could use a dedicated
+/// shape `lineValue` documents), so `f.mul(l_i)` could use a dedicated
 /// sparse-multiplication routine (far cheaper than `Fp12.mul`'s general
 /// 3x `Fp6.mul` Karatsuba) instead of promoting `l_i` to a dense
 /// `Fp12`. Deferred follow-up optimization, not a correctness issue —
 /// same "correct-simple first, fast-path later" policy `g1.zig`/
 /// `g2.zig`'s `subgroupCheck`/`clearCofactor` apply to their own
 /// deferred Bowe fast paths (`SPEC.md` Backlog).
+///
+/// ⚠ Measured before assuming it is the big one (2026-09-16,
+/// ReleaseFast, `drand`'s 2-pair beacon check): dense `Fp12.mul` is
+/// 7.7 µs and the walk makes ~137 of them = 1.06 ms, plus 63 squarings
+/// at 5.7 µs = 0.36 ms. A sparse multiply saves a fraction of the
+/// former — worth roughly 0.3 ms of a then-10.01 ms verification. The
+/// INVERSIONS the affine point steps used to pay were worth 5.82 ms
+/// (see `TwistPoint`), twenty times more, and `SPEC.md` Backlog 1 had
+/// them the other way round: sparse multiplication as the headline,
+/// projective steps as a trailing clause. Fixed there too.
 ///
 /// Special case handled explicitly (not merely falling out of the
 /// formulas above): a pair with `p.infinity` or `q.infinity` contributes
@@ -221,17 +235,23 @@ pub fn multiMillerLoop(pairs: []const PairingPair) Fp12 {
 /// covering every realistic multi-pairing call in one batch.
 const miller_batch_max = 8;
 
-/// A mutable affine point on the sextic twist `E'(Fp2)` — the per-pair
-/// accumulator `T_i` the Miller loop's doubling/addition steps advance.
-/// Affine (not Jacobian) is DELIBERATE for the correctness-first
-/// baseline: the chord/tangent slope `λ` the line function needs is
-/// explicit in affine form, at the cost of one `Fp2.inv` per step
-/// (see `doublingStep`/`additionStep` for the non-degeneracy argument
-/// that makes those inversions total).
-const TwistPoint = struct {
-    x: Fp2,
-    y: Fp2,
-};
+/// The per-pair accumulator `T_i` the Miller loop's doubling/addition
+/// steps advance: `g2.Jacobian` (`x = X/Z²`, `y = Y/Z³`) — this module's
+/// own audited, complete group law (`g2.zig`), NOT a second copy of it.
+///
+/// It was AFFINE until 2026-09-16, which made the chord/tangent slope
+/// `λ` explicit at the cost of one `Fp2.inv` per step per pair. Measured
+/// (ReleaseFast, process CPU time, 7 interleaved reps, `drand`'s 2-pair
+/// beacon check): `Fp2.inv` 42.8 µs x 136 inversions per verification
+/// (126 doubling + 10 addition steps) = 5.82 ms of a 10.01 ms
+/// verification — 78 % of the Miller loop, 58 % of the whole check.
+/// `Fp.inv` is Fermat's `a^(p-2)`, a full 381-bit exponentiation, so an
+/// inversion costs two orders of magnitude more than the handful of
+/// `Fp2` multiplications the projective line evaluation spends instead.
+/// The Jacobian form pays NO inversion at all; see `doublingStep` for
+/// why its line values, which differ from the affine ones by a nonzero
+/// `Fp2` factor, give the SAME pairing.
+const TwistPoint = g2.Jacobian;
 
 /// One shared-accumulator Miller walk over `|x|`'s bits for up to
 /// `miller_batch_max` pairs — the doc-comment construction of
@@ -247,7 +267,7 @@ fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
     var live = [_]bool{false} ** miller_batch_max;
     for (pairs, 0..) |pair, j| {
         live[j] = !(pair.p.infinity or pair.q.infinity);
-        if (live[j]) ts[j] = .{ .x = pair.q.x, .y = pair.q.y };
+        if (live[j]) ts[j] = TwistPoint.fromAffine(pair.q);
     }
 
     var f = Fp12.one;
@@ -291,59 +311,116 @@ fn millerLoopBatch(pairs: []const PairingPair) Fp12 {
 /// "014" shape; promoted dense here, see `multiMillerLoop`'s TODO).
 /// `x_P, y_P ∈ Fp` embed as `Fp2` elements with zero `u` component, so
 /// the two products with `λ` are componentwise `Fp.mul`s.
-fn lineEval(lambda: Fp2, x_ref: Fp2, y_ref: Fp2, p: g1.Affine) Fp12 {
-    const c00 = lambda.mul(x_ref).sub(y_ref);
-    const c01 = Fp2{
-        .c0 = lambda.c0.mul(p.x).neg(),
-        .c1 = lambda.c1.mul(p.x).neg(),
-    };
-    const c11 = Fp2{ .c0 = p.y, .c1 = Fp.zero };
+///
+/// ⭐ The callers pass those three coefficients ALREADY MULTIPLIED
+/// THROUGH by a nonzero `Fp2` factor — whatever their Jacobian `T`
+/// makes convenient, so that no step needs `λ` itself and therefore no
+/// step needs an inversion. That is harmless for exactly the reason the
+/// `w^3` factor above is, in a stronger form: the easy part of the final
+/// exponentiation raises to `p^6 − 1`, and `Frobenius^6` fixes `Fp6` —
+/// hence `Fp2` — ELEMENTWISE, so `c^(p^6−1) = 1` for EVERY `c ∈ Fp6*`.
+/// Squaring and multiplying the accumulator only ever raise such a
+/// factor to a power, which stays in `Fp2*`. Pinned by the test "an Fp2
+/// factor on a line value does not change the pairing"; the whole
+/// construction is pinned by the byte-exact `e(G1, G2)` KAT below, which
+/// did NOT move when the steps went projective (2026-09-16).
+fn lineValue(c00: Fp2, c01: Fp2, c11: Fp2) Fp12 {
     return .{
         .c0 = .{ .c0 = c00, .c1 = c01, .c2 = Fp2.zero },
         .c1 = .{ .c0 = Fp2.zero, .c1 = c11, .c2 = Fp2.zero },
     };
 }
 
-/// Miller doubling step: tangent line to `T` on `E'(Fp2)` evaluated at
-/// `p` (via `lineEval`), then `T <- 2T` (affine chord-tangent).
+/// `a * s` for `s ∈ Fp` embedded in `Fp2` with a zero `u` component:
+/// two `Fp.mul`s, not the five a general `Fp2.mul` would spend.
+fn mulByFp(a: Fp2, s: Fp) Fp2 {
+    return .{ .c0 = a.c0.mul(s), .c1 = a.c1.mul(s) };
+}
+
+/// Miller doubling step: the tangent line to `T` evaluated at `p`, then
+/// `T <- 2T` — INVERSION-FREE, `T` in Jacobian coordinates.
 ///
-/// The `catch unreachable` on `(2y)^-1`: an on-twist point never has
-/// `y == 0` — `#E'(Fp2) = r * h2` with both factors ODD, so the twist
-/// has no 2-torsion, and every intermediate `T` stays on the twist by
+/// Derivation (this file's own algebra over `lineValue`'s affine line,
+/// not transcribed from a source — the check that it is right is the
+/// KAT and the bilinearity suite, which an arithmetic slip anywhere
+/// here fails): with `x = X/Z²`, `y = Y/Z³` the affine slope is
+/// `λ = 3x²/(2y) = 3X²/(2YZ)`, so multiplying the affine line THROUGH
+/// by the nonzero factor `2YZ³ ∈ Fp2` clears every denominator:
+/// ```
+/// l' = (3X³ − 2Y²) + (−3X²Z² x_P) w² + (2YZ³ y_P) w³
+/// ```
+/// Cost: 3 `Fp2` squarings + 4 `Fp2` multiplications + 2 componentwise
+/// `Fp` scalings, against ONE `Fp2.inv` (42.8 µs — `Fp.inv` is Fermat's
+/// `a^(p-2)`) for the affine form this replaced. See `TwistPoint`.
+///
+/// `T <- 2T` is `g2.Jacobian.double`: this module's audited, complete
+/// group law, never a second copy of it.
+///
+/// The affine form's `catch unreachable` on `(2y)^-1` asserted `y != 0`
+/// — the same condition that keeps the scale factor `2YZ³` nonzero, so
+/// it stays as an `assert`: a checked build still traps rather than
+/// folding a degenerate line into `f`. The argument is unchanged:
+/// `#E'(Fp2) = r * h2` with both factors ODD, so the twist has no
+/// 2-torsion, and every intermediate `T` stays on the twist by
 /// construction. (A caller feeding a hand-crafted OFF-CURVE `q` voids
 /// this — `pairing`'s inputs are on-curve by every decode path's
 /// `isOnCurve` check, and subgroup membership at trust boundaries is
 /// already the module-wide caller obligation, `SPEC.md`.)
 fn doublingStep(t: *TwistPoint, p: g1.Affine) Fp12 {
+    std.debug.assert(!t.y.isZero() and !t.z.isZero());
     const xx = t.x.square();
+    const yy = t.y.square();
+    const zz = t.z.square();
     const three_xx = xx.add(xx).add(xx);
-    const two_y = t.y.add(t.y);
-    const lambda = three_xx.mul(two_y.inv() catch unreachable);
-    const line = lineEval(lambda, t.x, t.y, p);
-    const x3 = lambda.square().sub(t.x).sub(t.x);
-    const y3 = lambda.mul(t.x.sub(x3)).sub(t.y);
-    t.* = .{ .x = x3, .y = y3 };
-    return line;
+    const y_z3 = t.y.mul(zz.mul(t.z));
+    const two_y_z3 = y_z3.add(y_z3);
+
+    const c00 = three_xx.mul(t.x).sub(yy.add(yy));
+    const c01 = mulByFp(three_xx.mul(zz), p.x).neg();
+    const c11 = mulByFp(two_y_z3, p.y);
+
+    t.* = t.double();
+    return lineValue(c00, c01, c11);
 }
 
-/// Miller addition step: chord line through `T` and the FIXED original
-/// `q` evaluated at `p`, then `T <- T + Q`.
+/// Miller addition step: the chord line through `T` and the FIXED
+/// original `q` evaluated at `p`, then `T <- T + Q` — INVERSION-FREE,
+/// `T` in Jacobian coordinates.
 ///
-/// The `catch unreachable` on `(x_T - x_Q)^-1`: it fails only for
-/// `T == ±Q`, i.e. `[m ∓ 1]Q == O` for the walk's intermediate scalar
-/// `m` (`2 <= m < |x| < 2^64`). For subgroup points (`ord(Q) = r >
-/// 2^254`) that is impossible; only an on-curve-but-NON-subgroup `q`
-/// of small order could trigger it — the same class of input the
-/// module-wide subgroup-check obligation (`SPEC.md`'s threat model)
-/// already excludes at trust boundaries, and a panic (not a silently
-/// wrong pairing) is the failure mode if violated.
+/// Derivation (same algebra as `doublingStep`): with
+/// `h = x_Q Z² − X` and `r = y_Q Z³ − Y` — the two standard mixed-
+/// addition intermediates — the affine slope is
+/// `λ = (y_T − y_Q)/(x_T − x_Q) = r/(Z h)`, so multiplying the affine
+/// line (whose reference point is `Q`) THROUGH by `Z h ∈ Fp2` gives
+/// ```
+/// l' = (r x_Q − y_Q Z h) + (−r x_P) w² + (Z h y_P) w³
+/// ```
+/// `T <- T + Q` is `g2.Jacobian.add`, whose `ctSelect` arms already
+/// handle `T == ±Q` and either operand at infinity.
+///
+/// The affine form's `catch unreachable` on `(x_T - x_Q)^-1` asserted
+/// `h != 0` — the same condition that keeps the scale factor `Z h`
+/// nonzero, so it stays as an `assert`. The argument is unchanged: it
+/// fails only for `T == ±Q`, i.e. `[m ∓ 1]Q == O` for the walk's
+/// intermediate scalar `m` (`2 <= m < |x| < 2^64`). For subgroup points
+/// (`ord(Q) = r > 2^254`) that is impossible; only an on-curve-but-NON-
+/// subgroup `q` of small order could trigger it — the same class of
+/// input the module-wide subgroup-check obligation (`SPEC.md`'s threat
+/// model) already excludes at trust boundaries, and a trap (not a
+/// silently wrong pairing) is the failure mode if violated.
 fn additionStep(t: *TwistPoint, q: g2.Affine, p: g1.Affine) Fp12 {
-    const lambda = t.y.sub(q.y).mul(t.x.sub(q.x).inv() catch unreachable);
-    const line = lineEval(lambda, q.x, q.y, p);
-    const x3 = lambda.square().sub(t.x).sub(q.x);
-    const y3 = lambda.mul(t.x.sub(x3)).sub(t.y);
-    t.* = .{ .x = x3, .y = y3 };
-    return line;
+    const zz = t.z.square();
+    const h = q.x.mul(zz).sub(t.x);
+    const r = q.y.mul(zz).mul(t.z).sub(t.y);
+    std.debug.assert(!h.isZero());
+    const z_h = t.z.mul(h);
+
+    const c00 = r.mul(q.x).sub(q.y.mul(z_h));
+    const c01 = mulByFp(r, p.x).neg();
+    const c11 = mulByFp(z_h, p.y);
+
+    t.* = t.add(TwistPoint.fromAffine(q));
+    return lineValue(c00, c01, c11);
 }
 
 /// The single-pair Miller loop `e`'s FIRST stage computes for `(p, q)` —
@@ -700,6 +777,138 @@ test "pairing with either input at infinity is 1 (and skips the line math)" {
         .{ .p = g1.Affine.generator, .q = g2.Affine.identity },
         .{ .p = g1.Affine.identity, .q = g2.Affine.generator },
     }));
+}
+
+// ── the AFFINE Miller loop, kept as a test-only reference ───────────────
+//
+// This is the implementation the module shipped until 2026-09-16, when
+// `doublingStep`/`additionStep` went Jacobian to stop paying an `Fp2.inv`
+// per step (see `TwistPoint`). It is retained here, and ONLY here, as the
+// differential oracle for that change — the same role `g2.zig` gives
+// `subgroupCheckByOrder`. It is not a re-derivation of the new formulas
+// (a test that recomputes what it checks cannot fail): it is the OLD
+// algorithm, computing `λ` explicitly with an inversion.
+
+const AffineTwistPoint = struct { x: Fp2, y: Fp2 };
+
+fn lineEvalAffineRef(lambda: Fp2, x_ref: Fp2, y_ref: Fp2, p: g1.Affine) Fp12 {
+    const c00 = lambda.mul(x_ref).sub(y_ref);
+    const c01 = Fp2{
+        .c0 = lambda.c0.mul(p.x).neg(),
+        .c1 = lambda.c1.mul(p.x).neg(),
+    };
+    const c11 = Fp2{ .c0 = p.y, .c1 = Fp.zero };
+    return .{
+        .c0 = .{ .c0 = c00, .c1 = c01, .c2 = Fp2.zero },
+        .c1 = .{ .c0 = Fp2.zero, .c1 = c11, .c2 = Fp2.zero },
+    };
+}
+
+fn doublingStepAffineRef(t: *AffineTwistPoint, p: g1.Affine) Fp12 {
+    const xx = t.x.square();
+    const three_xx = xx.add(xx).add(xx);
+    const two_y = t.y.add(t.y);
+    const lambda = three_xx.mul(two_y.inv() catch unreachable);
+    const line = lineEvalAffineRef(lambda, t.x, t.y, p);
+    const x3 = lambda.square().sub(t.x).sub(t.x);
+    const y3 = lambda.mul(t.x.sub(x3)).sub(t.y);
+    t.* = .{ .x = x3, .y = y3 };
+    return line;
+}
+
+fn additionStepAffineRef(t: *AffineTwistPoint, q: g2.Affine, p: g1.Affine) Fp12 {
+    const lambda = t.y.sub(q.y).mul(t.x.sub(q.x).inv() catch unreachable);
+    const line = lineEvalAffineRef(lambda, q.x, q.y, p);
+    const x3 = lambda.square().sub(t.x).sub(q.x);
+    const y3 = lambda.mul(t.x.sub(x3)).sub(t.y);
+    t.* = .{ .x = x3, .y = y3 };
+    return line;
+}
+
+/// The single-pair `multiMillerLoop` as it was before the change.
+fn millerLoopAffineRef(p: g1.Affine, q: g2.Affine) Fp12 {
+    if (p.infinity or q.infinity) return Fp12.one;
+    var t: AffineTwistPoint = .{ .x = q.x, .y = q.y };
+    var f = Fp12.one;
+    var bit: u6 = 62;
+    while (true) : (bit -= 1) {
+        f = f.square();
+        f = f.mul(doublingStepAffineRef(&t, p));
+        if ((bls_x_abs >> bit) & 1 == 1) f = f.mul(additionStepAffineRef(&t, q, p));
+        if (bit == 0) break;
+    }
+    return f.conjugate();
+}
+
+test "differential: the projective Miller loop pairs identically to the affine one" {
+    // Randomized, but with a FIXED seed so a failure is reproducible.
+    var prng = std.Random.DefaultPrng.init(0x1eaf5eed);
+    const rand = prng.random();
+
+    for (0..12) |_| {
+        // 31-byte scalars are always below r (~2^255), so both points are
+        // genuine subgroup elements — the inputs the pairing is defined on.
+        var a: [31]u8 = undefined;
+        var b: [31]u8 = undefined;
+        rand.bytes(&a);
+        rand.bytes(&b);
+        const p = g1Gen().scalarMulBytes(&a).toAffine();
+        const q = g2Gen().scalarMulBytes(&b).toAffine();
+        if (p.infinity or q.infinity) continue;
+
+        // The RAW Miller values differ by the Fp2 scale factors the
+        // projective steps introduce -- that is the whole point, and the
+        // test above proves the final exponentiation kills them. What must
+        // agree is the PAIRING.
+        const want = finalExponentiation(millerLoopAffineRef(p, q));
+        try std.testing.expect(pairing(p, q).eql(want));
+    }
+}
+
+test "an Fp2 factor on a line value does not change the pairing" {
+    // THE LEMMA the inversion-free Miller steps rest on: `doublingStep`
+    // and `additionStep` hand `lineValue` coefficients multiplied through
+    // by a nonzero `Fp2` scale (`2YZ³` and `Z·h` respectively), because
+    // that is what clears the denominators `λ` would otherwise need an
+    // inversion for. It is free because the final exponentiation's easy
+    // part raises to `p^6 − 1` and `Frobenius^6` fixes `Fp6` — hence
+    // `Fp2` — elementwise, so `c^(p^6−1) = 1` for every `c ∈ Fp6*`.
+    const p = g1.Affine.generator;
+    const q = g2.Affine.generator;
+    const base = pairing(p, q);
+    const raw = millerLoop(p, q);
+
+    // A real, non-trivial Fp2 element (the G2 generator's x), embedded in
+    // Fp12 the way `lineValue` embeds its own coefficients.
+    const scale = Fp12{
+        .c0 = .{ .c0 = q.x, .c1 = Fp2.zero, .c2 = Fp2.zero },
+        .c1 = .{ .c0 = Fp2.zero, .c1 = Fp2.zero, .c2 = Fp2.zero },
+    };
+    try std.testing.expect(!scale.isZero());
+    try std.testing.expect(finalExponentiation(raw.mul(scale)).eql(base));
+    // The accumulator SQUARES what it has folded in, so powers of such a
+    // factor have to be free too, not just one copy of it.
+    try std.testing.expect(finalExponentiation(raw.mul(scale).mul(scale)).eql(base));
+
+    // The argument is really about all of Fp6, not just the Fp2 slot.
+    const wider = Fp12{
+        .c0 = raw.c0,
+        .c1 = .{ .c0 = Fp2.zero, .c1 = Fp2.zero, .c2 = Fp2.zero },
+    };
+    try std.testing.expect(!wider.isZero());
+    try std.testing.expect(finalExponentiation(raw.mul(wider)).eql(base));
+
+    // CONTROL, so this test cannot pass for the trivial reason that the
+    // final exponentiation collapses everything: squaring the raw value
+    // DOES change the pairing (to `base^2`, which differs from `base`
+    // because `e(G1, G2) != 1` — the non-degeneracy test above).
+    //
+    // ⚠ A factor with a `w`-component is NOT a valid control here, which
+    // is the mistake this line replaced: `(c·w)^(p^6−1) = −1` for
+    // `c ∈ Fp2`, and `p^2 + 1` is EVEN, so the easy part kills that too —
+    // exactly the argument `lineValue`'s doc comment already makes for
+    // the twisted-image evaluation's own `w^3` factor.
+    try std.testing.expect(!finalExponentiation(raw.mul(raw)).eql(base));
 }
 
 fn hexBytes(comptime n: usize, comptime hex: *const [2 * n:0]u8) [n]u8 {

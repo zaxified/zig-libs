@@ -690,17 +690,41 @@ see "Part 6 design" below.
   (probe, not in the suite). No ctgrind target: the inputs are public,
   and the ctgrind rows over `g1.zig`/`g2.zig` need a re-pin only
   because those files' digests changed.
+- **Inversion-free Miller loop — Jacobian point steps (2026-09-16, A1
+  `drand` F4).** The doubling/addition steps keep the accumulator `T` in
+  `g2.Jacobian` and multiply each line value through by the factor that
+  clears its denominators (`2YZ³` for the tangent, `Z·h` for the chord),
+  instead of forming the slope `λ` — which needed one `Fp2.inv` per step
+  per pair. `Fp.inv` is Fermat's `a^(p-2)`, a 381-bit exponentiation, so
+  those inversions were the dominant cost of a pairing: measured on
+  `drand`'s 2-pair beacon check (ReleaseFast, process CPU time), 136 of
+  them at 42.8 µs = **5.82 ms of a 10.01 ms verification**.
+  The scale factors are free because the final exponentiation's easy part
+  raises to `p^6 − 1` and `Frobenius^6` fixes `Fp6` — hence `Fp2` —
+  elementwise, so `c^(p^6−1) = 1` for every `c ∈ Fp6*`; this is the same
+  argument the D-type twisted-image evaluation's `w^3` factor already
+  rested on, and the test "an Fp2 factor on a line value does not change
+  the pairing" pins it with a control. Point arithmetic is NOT re-derived
+  here: `T <- 2T` and `T <- T + Q` are `g2.Jacobian.double`/`add`.
+  Evidence: the byte-exact `e(G1, G2)` KAT is unmoved, and a randomized
+  differential (12 random point pairs) agrees with the retained affine
+  reference `millerLoopAffineRef`. **7 interleaved paired reps, both arms
+  in one binary: `multiMillerLoop` 6.92 → 1.94 ms, `drand`'s beacon
+  verification 9.27 → 4.28 ms, faster in 7/7 with non-overlapping
+  ranges.** ⚠ RAW Miller values changed (by that `Fp2` factor) — they are
+  not a wire format and no consumer may pin them; only the
+  final-exponentiated pairing is a value.
 - **The pairing is VARIABLE-TIME — deliberately.** Pairings operate on
   PUBLIC inputs (public keys, signatures, commitments — every
   BLS/KZG-style consumer verifies public data with them); the Miller
-  loop's affine steps branch and invert on input-derived values, the
+  loop's steps branch on input-derived values, the
   final exponentiation's exponents are fixed public curve constants,
   and no constant-time contortion is attempted or needed. Do NOT feed
   the pairing secret points without revisiting this (no known scheme
   does). The pairing also assumes SUBGROUP inputs for its internal
-  non-degeneracy arguments (the affine steps' `catch unreachable`
-  inversions): an on-curve but small-order non-subgroup point could
-  panic mid-loop — a loud failure, not a silent wrong value, and
+  non-degeneracy arguments (the steps' asserts — `catch unreachable`
+  inversions until 2026-09-16): an on-curve but small-order non-subgroup
+  point could trap mid-loop — a loud failure, not a silent wrong value, and
   exactly the input class the module-wide subgroup-check obligation
   already excludes at trust boundaries.
 - **Hash-to-curve is VARIABLE-TIME — deliberately, same reasoning as the
@@ -952,7 +976,7 @@ derived Frobenius coefficients, branchless point arithmetic, the fixed
 G2 cofactor) and "Verification" for the test inventory.
 
 **Part 2 COMPLETE (crypto-core pass, 2026-07-14).** `multiMillerLoop`
-(optimal ate, affine D-type-twist line evaluation, allocation-free
+(optimal ate, inversion-free Jacobian D-type-twist line evaluation, allocation-free
 batched multi-pairing), `finalExpHardPart` (Hayashida–Hayasaka–Teruya
 exact-`d` cyclotomic chain), `Fp12.cyclotomicSquare` (Granger–Scott)
 and `Fp12.frobeniusMap` (naive repeated Frobenius) are all real and
@@ -1048,14 +1072,24 @@ panics, Debug AND ReleaseFast.
 
 1. **The Miller-loop sparse-multiplication optimization** — a freshly
    computed line value is structurally sparse (3 nonzero `Fp2`
-   coefficients out of 6 — the "014" shape `lineEval` documents); the
+   coefficients out of 6 — the "014" shape `lineValue` documents); the
    implemented baseline promotes it to a dense `Fp12` and uses the
    general `mul`, correctness-first; a dedicated sparse-multiply is a
    real, well-known follow-up optimization (`multiMillerLoop`'s own
-   `TODO` note), not a correctness prerequisite. Projective (inversion-
-   free) Miller-loop point steps belong to the same future performance
-   pass (the affine steps cost one `Fp2.inv` each — fine for
-   verification workloads, the only current consumers).
+   `TODO` note), not a correctness prerequisite.
+
+   ⚠ **This entry used to lead with the sparse multiply and mention
+   inversion-free point steps as a trailing clause ("fine for
+   verification workloads"). Measured 2026-09-16, that ordering was
+   backwards by a factor of twenty**, which is why the projective steps
+   are now DONE (see "Inversion-free Miller loop" in the threat model
+   above) and this item is what actually remains. On `drand`'s 2-pair
+   beacon check, ReleaseFast, process CPU time: the affine steps' 136
+   `Fp2.inv` calls cost 42.8 µs each = **5.82 ms** of a 10.01 ms
+   verification, while the ~137 dense `Fp12.mul` folds cost 7.7 µs each
+   = 1.06 ms, of which a sparse multiply saves a fraction — call it
+   **0.3 ms**. The lesson is the general one: a deferred-optimization
+   note is a guess until someone measures the pieces.
 2. **The fast cofactor-clearing path** (Bowe's untwist-Frobenius-twist
    technique, cited in `NOTICE`) — `clearCofactor` is still the simple
    `scalarMul`-by-cofactor form. The fast SUBGROUP CHECKS are done

@@ -105,9 +105,12 @@ pub fn verifyRoundPoints(pubkey: g2.Affine, round: u64, sig: g1.Affine) bool {
     // elsewhere must run `g2.Jacobian.fromAffine(pk).subgroupCheck()`
     // itself. Since `bls12_381`'s endomorphism-based subgroup checks
     // (2026-09-15, A1 F4) the G2 check costs ~0.17 ms and this G1 one
-    // ~0.12 ms (were 3.25 ms and 0.96 ms under `[r]P == O`); skipping the
-    // key check is now a ~2 % saving on a ~9.7 ms verification, kept only
-    // because the parser has already validated that point.
+    // ~0.12 ms (were 3.25 ms and 0.96 ms under `[r]P == O`), and since
+    // its inversion-free Miller loop (2026-09-16, same finding) the whole
+    // verification is ~4.3 ms rather than ~9.7 ms — so skipping the key
+    // check would now save ~4 %, not ~2 %. It is kept anyway, because the
+    // parser has already validated that point; what changed is that the
+    // argument for keeping it got cheaper to make, not weaker.
     // Found by the wave-2 audit (W2-32).
     if (!g1.Jacobian.fromAffine(sig).subgroupCheck()) return false;
 

@@ -5,6 +5,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **NO API CHANGE, faster:** A1 finding F4, together with `bls12_381`'s inversion-free Miller loop (same commit). `verifyRoundPoints` **9.27 → 4.28 ms** (ReleaseFast, process CPU time, 7 interleaved paired reps with both arms in ONE binary; new faster in 7/7, ranges 9.24–9.44 vs 4.17–4.51 — no overlap). All 60 live quicknet rounds of the audit corpus verify under both arms and agree. What the remaining 4.28 ms is made of, measured separately (same method, a different run — so composition, not a subtraction of the numbers above): Miller loop 2.32 ms, final exponentiation 1.74 ms, `h1` hash-to-curve 0.79 ms, `G1` subgroup check 0.13 ms. F4's original claim was a 5.6× gap against drand's own Go client (13.70 vs 2.44 ms CPU, 2026-09-07); this module has not re-run the Go arm, so no new ratio is quoted here — only the measured change to our own side.
+
 - **2026-09-15** — **NO API CHANGE, faster:** A1 finding F4, together with `bls12_381`'s endomorphism-based subgroup checks (same commit). The `G1` signature check in `parseRound` and `verifyRoundPoints` now costs ~0.12 ms instead of 0.77 ms, and the `G2` key check in `parseInfo` ~0.17 ms instead of 2.41 ms (ReleaseFast, 7 interleaved reps); `verifyRoundPoints` 10.34 → 9.72 ms median. All 60 live quicknet rounds of the audit corpus still verify, and the W2-32 malleated signature is still refused. `verify.zig`'s cost comment updated to the new numbers.
 
 - **2026-09-13** — **BEHAVIOURAL:** A1 finding F7, the JSON parsers now agree with
