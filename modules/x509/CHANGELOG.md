@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — documentation only: the PKCS#1 v1.5 dispatch numbers are
+  re-measured on today's tree (audit X2). `rsa.PublicKey.fromDer` is 453 µs
+  against the 352 µs threshold that would make switching worth it, and a
+  2-link RSA chain verifies in 726 µs. The dispatch is unchanged; the comment
+  in `chain.zig` and SPEC.md now carry a number from this tree instead of one
+  from 2026-09-08.
+
 - **2026-09-14** — **ADDITIVE:** audit X3, round-2 decision Q8 (safe default plus a switch).
   `safe.safeCertificate` refuses anything over `max_certificate_len` = 8192 whatever scratch the
   caller passes, and its doc justified the number with a 4096-bit RSA certificate — while 12 of

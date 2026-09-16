@@ -115,7 +115,7 @@ same host is the reference (`openssl speed`).
 | operation | this module | OpenSSL | ratio |
 |---|---:|---:|---:|
 | RSA-2048 `verifyPkcs1v15`, key already built | **36 µs** | 17.4 µs | **2.1×** |
-| `PublicKey.fromDer` (builds the key) | **~500 µs** | — | — |
+| `PublicKey.fromDer` (builds the key) | **~500 µs** (re-measured 2026-09-16: **453 µs**) | — | — |
 
 **The modexp is fine and needs no work.** 2.1× OpenSSL on portable Zig without assembly
 is a good number, and it is recorded here so a future audit does not start optimising

@@ -216,7 +216,7 @@ reference. **A chain verification is its signatures and nothing else.**
 
 | | µs |
 |---|---:|
-| `verifyChain`, 2 links, RSA PKCS#1 v1.5 | ~810 |
+| `verifyChain`, 2 links, RSA PKCS#1 v1.5 | ~810 (re-measured 2026-09-16: **726**) |
 | same chain with the first link's signature broken (one verify, then stop) | ~400 |
 | **difference — one RSA-2048 verification** | **~405** |
 | `verifyChain`, RSA-PSS | ~1230 |
@@ -243,8 +243,10 @@ therefore per link, cold:
 | `rsa.PublicKey.fromDer` + `rsa.verifyPkcs1v15` | **~535** |
 
 **Switching would make this module slower.** `rsa.PublicKey.fromDer` has to fall below
-**352 µs** first; it is at ~500 µs, and the `montint` R² ladder that landed the same day
-took it from 813 µs to there without reaching the threshold. The two remaining routes and
+**352 µs** first; the `montint` R² ladder took it from 813 µs to ~500 µs without reaching
+the threshold. **Re-measured 2026-09-16** (min of 25, ReleaseFast): `fromDer` **453 µs**,
+so a switched link would cost ~489 µs against std's 388 — the gap has narrowed by roughly
+a tenth of the way to the threshold and the answer is unchanged. The two remaining routes and
 the reason neither was taken are in `modules/rsa/SPEC.md` § "Performance posture".
 
 So today's choice is a **decision, not an oversight**: revisit it when `fromDer` drops
