@@ -28,6 +28,20 @@ that changes without a human reading the diff is a vector nobody checked.
 | `fetch.py` | What does the live network currently serve? | Fixtures for the vectors above, from two chains and ~60 rounds. |
 | `gen_vectors.py` | — | Formats what `fetch.py` captured as Zig literals. |
 
+## ⚠ One anchor is stale (M16)
+
+Measured 2026-09-16 against the current sources: **22 of 23 anchors still match
+exactly once; M16 no longer matches at all.** It named `expectedRound`'s
+`return (now_unix - info.genesis_time) / info.period_seconds + 1;` in
+`verify.zig`, and that text is gone.
+
+The runner does not fail open on it — a non-matching anchor is reported as
+`PATCH-MISS`, and an anchor matching more than once as `AMBIGUOUS(n)`, neither
+of which is a verdict. So the row is **missing**, not passing. Re-deriving it
+means re-reading `expectedRound` and naming the current site; loosening the
+match until it sticks would produce a mutant that is neither the original nor
+the intended edit.
+
 ## ⚠ `mutate.py` edits the tracked tree
 
 It patches `modules/drand/src/*.zig` in place and restores with

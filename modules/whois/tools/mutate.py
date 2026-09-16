@@ -63,10 +63,17 @@ def restore():
 
 
 def run_suite():
+    # ⚠ `testkit` is a TEST dep of this module (build.zig: `.test_deps =
+    # &{"testkit"}`), and `src/root.zig` names it from its fuzz seeds. Omitting
+    # it does not fail one row -- it fails EVERY build with "no module named
+    # 'testkit'", so every row reads RED and the no-op control goes RED too.
+    # Measured 2026-09-16: that is exactly what this runner did, because it was
+    # committed without ever being run.
     r = subprocess.run(
-        ["zig", "test", "--dep", "netaddr",
+        ["zig", "test", "--dep", "netaddr", "--dep", "testkit",
          "-Mroot=" + str(MOD / "root.zig"),
          "-Mnetaddr=" + str(NET),
+         "-Mtestkit=" + str(REPO / "modules" / "testkit" / "src" / "root.zig"),
          "--cache-dir", str(WORK / "zc")],
         capture_output=True, text=True, timeout=600,
     )
