@@ -231,6 +231,28 @@ scalar-times-point-on-`G1`, both already-existing `bls12_381`
 primitives). No new cryptographic construction, no new field/group/
 pairing math, and no unresolved hard problem remain in this module.
 
+## Constant-time measurement (ctgrind)
+
+Three targets run under memcheck with one party's secret tainted; the counts
+are pinned in `scripts/ctgrind-expected.tsv`.
+
+| target | tainted | in-file contexts | read at |
+|---|---|---|---|
+| `extract` | `msk` | 3 | unchanged since first pinned; not re-read in the 2026-09-16 pass |
+| `decrypt` | `d_id` (the pairing plus the FO consistency check) | 7 | `ibe.zig`'s `decrypt` (`:474`, `:497`), above the pairing substrate (`pairing.zig:223,270,278,283,432`) |
+| `fp12pow` | `sigma`, `message` | 2 | `ibe.zig:236` |
+
+⛔ Not a constant-time claim about the pairing — `bls12_381/src/pairing.zig`
+makes none. What is pinned is this module's own `fp12Pow` (audit F4, the same
+windowed construction `tlock` uses) and the shape of `decrypt` around it.
+
+⚠ **`decrypt` re-pinned 2026-09-16**, from 14. Nothing here changed: the
+sibling's Miller loop stopped paying an `Fp2` inversion per step
+(`bls12_381` `32e751ad`), so the branches those inversions carried are gone.
+`extract` and `fp12pow` stayed green throughout. Checked explicitly that the
+fall is not a harness that stopped reaching the module — `decrypt` still prints
+a real recovered plaintext.
+
 ## Out of scope
 
 - Arbitrary-length payload encryption. `Ciphertext`'s `V`/`W` are fixed

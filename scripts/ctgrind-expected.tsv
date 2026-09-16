@@ -354,10 +354,10 @@ k256	ReleaseFast	field	1	0	9cea496ddcd0b4a7	4f13cccddea81376
 #                base point, which let LLVM fold `mul`'s per-call table (not
 #                the ECDH binary).
 #   ecdsa 10 -> 11   16/11/5/0 (G7 19a05328, `sign` handles R.x >= n).
-k256	ReleaseFast	mul	1	1	aa15a26aec37681a	2e85d4bddb851304
-k256	ReleaseFast	comb	1	1	aa15a26aec37681a	2ac21fe395f35487
-k256	ReleaseFast	sign	1	11	444acbf5ff925138	bb06c2ed85209b8d
-k256	ReleaseFast	ecdsa	1	11	dbe5adeb0d2d5905	8ff4812d21149442
+k256	ReleaseFast	mul	1	1	9fcd738bb165a0e6	2e85d4bddb851304
+k256	ReleaseFast	comb	1	1	9fcd738bb165a0e6	2ac21fe395f35487
+k256	ReleaseFast	sign	1	11	854fbd1bdf3d7050	bb06c2ed85209b8d
+k256	ReleaseFast	ecdsa	1	11	de35a6b6fdf0588c	8ff4812d21149442
 # montint — all three dispatch sizes clean, no residual. `small` (L=4) and
 # `portable` (L=16) were DEFECT rows at 7 and 5 when the harness was added:
 # ReleaseFast lowered `condSubTop`'s masked select, and `sub`'s masked add-back,
@@ -370,8 +370,8 @@ k256	ReleaseFast	ecdsa	1	11	dbe5adeb0d2d5905	8ff4812d21149442
 montint	ReleaseFast	small	1	0	045eb3a8ac23bebb	4e9f8c0b1ac8efe3
 montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
 montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
-p256	ReleaseFast	comb	1	1	101bc1fec53c9fa9	9d70061e0f0133d9
-p256	ReleaseFast	sign	1	<=9	61142e54bd8f31ab	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	aefd5530fd6443f0	9d70061e0f0133d9
+p256	ReleaseFast	sign	1	<=9	a9c8d581ee749255	af4baed5c5134f3f
 rsa	ReleaseFast	crt	1	<=213	cd9d282d526ba2de	d4057b00f9df7b56
 rsa	ReleaseFast	noncrt	1	2	cd9d282d526ba2de	d4057b00f9df7b56
 slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
@@ -425,8 +425,8 @@ blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # were disassembled one by one); the direction and the disassembly/`--stacks`
 # evidence above are what this pin rests on, not the exact arithmetic on this
 # row.
-threshold_ecdsa	ReleaseFast	share	1	<=267	3d94932979419650	4a6777ac538b5e90
-threshold_ecdsa	ReleaseFast	nonce	1	<=378	3d94932979419650	31f7e323b84fd8a7
+threshold_ecdsa	ReleaseFast	share	1	<=267	e932a70c2bfffc2e	4a6777ac538b5e90
+threshold_ecdsa	ReleaseFast	nonce	1	<=378	e932a70c2bfffc2e	31f7e323b84fd8a7
 # ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
 # Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
@@ -457,7 +457,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=378	3d94932979419650	31f7e323b84fd8a7
 # 0 unattributed, control 0, trap 0 — in-file matches the anticipated number
 # exactly. Positive control (R2): temporarily restoring the early exit put
 # this row back to EXACTLY 321 in-file, on the same tree, same command.
-threshold_ecdsa	ReleaseFast	betaprime	1	<=313	3d94932979419650	0d9a7f3232367fc7
+threshold_ecdsa	ReleaseFast	betaprime	1	<=313	e932a70c2bfffc2e	0d9a7f3232367fc7
 # Output cannot repeat: `prove` draws alpha, s_l/s_r, rho and tau1/tau2 from
 # getrandom(2), because a range proof that is not randomised is not a range
 # proof. RANDOMIZED keeps the half of the pin that still works -- a value must
@@ -468,10 +468,25 @@ paillier	ReleaseFast	crt	1	<=331	8121b95486f955cf	0435e5d4ba4d462a
 paillier	ReleaseFast	noncrt	1	<=141	8121b95486f955cf	0435e5d4ba4d462a
 paillier	ReleaseFast	mul	1	<=12	8121b95486f955cf	b2221403ad3dad41
 paillier	ReleaseFast	addm	1	<=10	8121b95486f955cf	526f0de009c0cbfb
-tlock	ReleaseFast	fp12pow	1	8	4ddb26ab436730a6	b904bd817d356db7
-tlock	ReleaseFast	decrypt	1	11	4ddb26ab436730a6	3a939f7ff5b39d03
+# tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
+# tlock fp12pow 8 -> 2, tlock decrypt 11 -> 3, ibe decrypt 14 -> 7. The counts
+# FELL because the Miller loop stopped inverting -- 32e751ad dropped
+# `two_y.inv()` and `t.x.sub(q.x).inv()` from the per-step line evaluation, so
+# those branches went with them. The remainder was read stack by stack before
+# this re-pin: tlock fp12pow = tlock.zig:358,361, the module's OWN windowed Gt
+# ladder (audit F3), NOT the pairing; tlock decrypt = tlock.zig:406,430,432;
+# ibe decrypt = ibe.zig:474,497 over the pairing substrate (pairing.zig:223,
+# 270,278,283,432), which makes no constant-time claim of its own.
+#
+# ⛔ Checked explicitly, because a count that only falls looks identical either
+# way: both harnesses still print a real plaintext (`message=5a5a..` for tlock,
+# `abab..` for ibe), so this is NOT the "the harness stopped reaching the
+# module" failure the seventh column exists to catch. `ibe extract` and `ibe
+# fp12pow` were green throughout and are left untouched.
+tlock	ReleaseFast	fp12pow	1	2	4ddb26ab436730a6	b904bd817d356db7
+tlock	ReleaseFast	decrypt	1	3	4ddb26ab436730a6	3a939f7ff5b39d03
 ibe	ReleaseFast	extract	1	3	35d0138e95b4dcf1	686f0732e74c5ef7
-ibe	ReleaseFast	decrypt	1	14	99a9b799453f052c	fb52b6c55cc51706
+ibe	ReleaseFast	decrypt	1	7	99a9b799453f052c	fb52b6c55cc51706
 ibe	ReleaseFast	fp12pow	1	2	35d0138e95b4dcf1	d2e187260f9f18a2
 frost	ReleaseFast	commit	1	8	cf6d181343529b92	94a2e96655c4ce21
 frost	ReleaseFast	sign	1	5	cf6d181343529b92	8484bd50690a78db
@@ -493,8 +508,8 @@ spake2plus	ReleaseFast	proverstart	1	7	98d3a68346d3d767	5b3e4131495365d6
 spake2plus	ReleaseFast	verifierstart	1	7	98d3a68346d3d767	ce61814fc8e1b2b7
 spake2plus	ReleaseFast	proverfinish	1	12	98d3a68346d3d767	5cdf0fe20429a208
 spake2plus	ReleaseFast	verifierfinish	1	10	98d3a68346d3d767	dbdff43379a90cf5
-bbs	ReleaseFast	sign	1	<=47	f40744df871005b9	a147c158e7c878af
-bbs	ReleaseFast	proofgen	1	<=134	f40744df871005b9	61ed4182d62a0b91
+bbs	ReleaseFast	sign	1	<=47	d86719a46eb0093c	a147c158e7c878af
+bbs	ReleaseFast	proofgen	1	<=134	d86719a46eb0093c	61ed4182d62a0b91
 coconut	ReleaseFast	authority_sign	1	<=69	04e312f73ccbddb6	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	3	a6281f1d04b2a243	af24664cb307a403
 coconut	ReleaseFast	user_show	1	<=51	04e312f73ccbddb6	c75d6d631d2311f7

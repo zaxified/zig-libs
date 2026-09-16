@@ -162,6 +162,29 @@ interop vector proved the flag right, in an unexpected place:
 - **`fp12Pow` law (ungated, done)**: `base^0/base^1`, exponent
   additivity, and the bilinearity cross-check `e(P,Q)^r == e(rP,Q)`.
 
+## Constant-time measurement (ctgrind)
+
+Two targets run under memcheck with the secret tainted; their context counts
+are pinned in `scripts/ctgrind-expected.tsv`.
+
+| target | tainted | in-file contexts | read at |
+|---|---|---|---|
+| `fp12pow` | `sigma`, `message` (hence `r = H3(sigma, message)`) | 2 | `tlock.zig:358`, `tlock.zig:361` |
+| `decrypt` | the round signature handed to `pairing.pairing` | 3 | `tlock.zig:406`, `:430`, `:432` |
+
+⛔ These numbers are **not** a constant-time claim about the pairing.
+`bls12_381/src/pairing.zig` makes none, and `decrypt`'s contexts sit on top of
+that substrate. What the pins hold in place is this module's OWN posture: the
+windowed `Gt` ladder of "option 1" above (audit F3) scans its table without a
+data-dependent skip, and going back to one would move `fp12pow` off 2.
+
+⚠ **Re-pinned 2026-09-16** — `fp12pow` was 8, `decrypt` was 11. Nothing in this
+module changed. The sibling's Miller loop stopped inverting once per step
+(`bls12_381` `32e751ad` dropped `two_y.inv()` and `t.x.sub(q.x).inv()` from the
+line evaluation), so those branches vanished from underneath. A count that only
+falls looks the same as a harness that stopped reaching the module, so that was
+checked separately: the run still prints a real recovered plaintext.
+
 ## Out of scope
 
 - The hybrid `age`-envelope layer (`filippo.io/age` stanzas, armored

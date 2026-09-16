@@ -1386,17 +1386,45 @@ echo
 out_digest() {
     local log="$1"
     [[ -f "$log" ]] || { echo "NO-LOG"; return; }
-    local vals
+    local vals clean
+    # ⛔ The log is not only the harness's output: memcheck writes its reports
+    # to the same stream, and it does so WHILE a print is in flight. Measured
+    # 2026-09-16 on tlock/fp12pow: valgrind's block landed INSIDE the `ct=`
+    # line (`Writer.printHex` -> `ctgrind_harness.zig:281`), so a 256-digit
+    # value arrived as a head, the report, then the tail on its own line. The
+    # unanchored fallback below matched the HEAD and hashed that, and the row
+    # failed as "the harness's printed result changed" while the value was
+    # bit-identical -- the worst failure this pin has, because it accuses the
+    # module of a change the module did not make. Deterministic, not flaky:
+    # three runs produced the same wrong digest. Reconstruct before matching.
+    #
+    # The continuation rule is a heuristic: a line of bare hex digits directly
+    # after a `name=` line is treated as the rest of that value. A harness that
+    # deliberately prints a bare hex line would be glued onto the value above
+    # it -- none does today, and such a line cannot be pinned on its own anyway
+    # (both patterns require the `name=`), so the trade is a wrong digest for
+    # an unpinnable line against a wrong digest for every torn one.
+    # ⛔ DELETE valgrind's own lines, do not blank them. Measured 2026-09-16:
+    # blanking left an empty line between the value's head and its tail, and an
+    # empty line matches neither rule below, so the flush rule fired and the
+    # tail arrived with nothing to attach to -- the reconstruction silently did
+    # nothing and the row still failed on the truncated head.
+    clean="$(sed -E '/^==[0-9]+==/d; s/==[0-9]+==.*$//' "$log" | awk '
+        /^[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\])?=/ { if (buf != "") print buf; buf = $0; next }
+        /^[0-9a-f]+$/ && buf != ""               { buf = buf $0; next }
+                                                 { if (buf != "") { print buf; buf = "" } print }
+        END                                      { if (buf != "") print buf }
+    ')"
     # Preferred: the value the harness declared as its result. 8 hex digits = 4
     # bytes, which is the narrowest real output here (fss's share).
-    vals="$(grep -aoE 'ctgrind_result(\[[0-9]+\])?=[0-9a-f]{8,}' "$log" || true)"
+    vals="$(printf '%s\n' "$clean" | grep -aoE 'ctgrind_result(\[[0-9]+\])?=[0-9a-f]{8,}' || true)"
     if [[ -z "$vals" ]]; then
         # Fallback, unanchored on purpose: k256's ecdsa target prints three
         # values on ONE line (`r={x} s={x} recid={d}`), and an anchored match
         # silently found nothing there — the pin reported NO-OUTPUT, which is
         # the right failure but the wrong reason. `recid=3` and `L=32` stay
         # excluded by the 32-digit floor, `valgrind_support=true` is not hex.
-        vals="$(grep -aoE '[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\])?=[0-9a-f]{32,}' "$log" || true)"
+        vals="$(printf '%s\n' "$clean" | grep -aoE '[A-Za-z_][A-Za-z0-9_]*(\[[0-9]+\])?=[0-9a-f]{32,}' || true)"
     fi
     if [[ -z "$vals" ]]; then echo "NO-OUTPUT"; return; fi
     printf '%s\n' "$vals" | sha256sum | cut -c1-16
