@@ -128,3 +128,72 @@ to move what is worth keeping to where it belongs (an instrument to
 `modules/<name>/tools/`, a record to the audit notes) and then drop the rest.
 EOF
 fi
+
+# ── other build and dependency trees ────────────────────────────────────────
+#
+# `.zig-cache` is not the only directory that grows quietly. A cargo `target/`,
+# a `node_modules/`, a Python venv or a `zig-out/` costs the same disk and is
+# just as invisible until something fills up. They are listed here rather than
+# analysed, because unlike `.zig-cache` their contents are not ours to classify:
+# every one of them is rebuilt by its own toolchain.
+#
+# ⚠ THIS PASS PRUNES AND THE ONE ABOVE DOES NOT, and the difference is
+# deliberate. A `node_modules` inside a `node_modules` is part of its parent and
+# counting it twice would inflate the total; a `.zig-cache` inside another one is
+# a separate cache that a separate build wrote.
+echo
+echo "=== other build / dependency trees ==="
+
+# name              marker that proves what it is ("" = the name is enough)
+SIGNATURES=(
+  "zig-out:"                    # zig install output
+  "zig-pkg:"                    # fetched zig packages
+  "node_modules:"               # npm / bun / yarn / pnpm
+  "target:../Cargo.toml"        # cargo — `target` alone is far too common a word
+  "build:CMakeCache.txt"        # cmake — likewise
+  ".venv:pyvenv.cfg"            # python venv
+  "venv:pyvenv.cfg"
+  "__pycache__:"                # python bytecode
+  "vendor:../go.mod"            # go vendored deps
+  "go-build:"                   # go build cache
+  ".gradle:"
+  ".m2:"
+)
+
+# Collected into a variable rather than piped straight into `sort`, because a
+# pipeline runs in a subshell and the running total computed there is lost at
+# the far end of it — which would print a list with no sum, the weaker half of
+# the answer this script exists to give.
+others="$(
+  for sig in "${SIGNATURES[@]}"; do
+    name="${sig%%:*}"; marker="${sig#*:}"
+    while IFS= read -r d; do
+      [ -d "$d" ] || continue
+      if [ -n "$marker" ]; then
+        case "$marker" in
+          ../*) [ -e "$(dirname "$d")/${marker#../}" ] || continue ;;
+          *)    [ -e "$d/$marker" ] || continue ;;
+        esac
+      fi
+      size="$(du -sb "$d" 2>/dev/null | cut -f1)"
+      [ -n "$size" ] || continue
+      printf '%s\t%s\n' "$size" "$d"
+    done < <(find "${roots[@]}" -type d -name "$name" -prune 2>/dev/null)
+  done | sort -rn
+)"
+
+if [ -z "$others" ]; then
+  echo "  none found"
+else
+  printf '%s\n' "$others" | head -25 | while IFS=$'\t' read -r s p; do
+    [ -n "$p" ] && printf '  %10s  %s\n' "$(human "$s")" "$p"
+  done
+  n_other="$(printf '%s\n' "$others" | wc -l)"
+  other_total="$(printf '%s\n' "$others" | awk -F'\t' '{t+=$1} END{print t+0}')"
+  echo
+  printf '  %d tree(s), %s total' "$n_other" "$(human "$other_total")"
+  [ "$n_other" -gt 25 ] && printf ' (largest 25 shown)'
+  printf '\n'
+  echo "  each is rebuilt by its own toolchain, so each is droppable — but only"
+  echo "  that toolchain's own command puts it back, and some of them need the network"
+fi
