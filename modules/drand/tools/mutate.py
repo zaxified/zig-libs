@@ -222,9 +222,9 @@ def ensure_worktree():
     invite someone to commit to it.
     """
     os.makedirs(CACHE, exist_ok=True)
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
+                          capture_output=True, text=True).stdout.strip()
     if not os.path.isdir(os.path.join(WT, ".git")) and not os.path.isfile(os.path.join(WT, ".git")):
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
-                              capture_output=True, text=True).stdout.strip()
         r = subprocess.run(["git", "worktree", "add", "--detach", WT, head],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
@@ -238,7 +238,23 @@ def ensure_worktree():
         print("REFUSING: the worktree's modules/drand is not pristine:\n" + d)
         print(f"  restore it with: git -C {WT} checkout -- modules/drand")
         sys.exit(1)
-    print(f"worktree: {WT}\n"
+    # ⚠ A REUSED WORKTREE GOES STALE, and that is the very defect this whole
+    # migration exists to remove. `worktree add` runs once; without the move
+    # below the checkout stays pinned at whatever HEAD was on the day it was
+    # created, and every later run mutates a module one or more commits behind
+    # the tree it claims to report on -- an instrument keeping its own copy,
+    # which rots. Re-pointing it is cheap; being silently wrong is not.
+    at = subprocess.run(["git", "-C", WT, "rev-parse", "HEAD"],
+                        capture_output=True, text=True).stdout.strip()
+    if at != head:
+        r = subprocess.run(["git", "-C", WT, "checkout", "--detach", head],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"REFUSING: the worktree sits at {at[:8]} and could not be moved "
+                  f"to {head[:8]}:\n" + r.stdout + r.stderr)
+            sys.exit(1)
+        print(f"worktree advanced {at[:8]} -> {head[:8]}")
+    print(f"worktree: {WT}  (at {head[:8]})\n"
           f"  (the tracked tree is never written to; remove with "
           f"`git worktree remove --force {os.path.relpath(WT, ROOT)}`)\n")
 

@@ -46,9 +46,17 @@ the intended edit.
 
 Both `mutate.py` and `mutate_m10.py`: every edit lands in a **detached
 `git worktree`** under `.zig-cache/drand-mutate/wt`, created on first use and
-reused. `mutate_m10.py` imports `ensure_worktree()` from `mutate.py` rather than
-restating it, so there is one implementation of this rule and not two that can
-drift apart. A SIGKILL, an OOM
+then **re-pointed at the current `HEAD` on every run**. `mutate_m10.py` imports
+`ensure_worktree()` from `mutate.py` rather than restating it, so there is one
+implementation of this rule and not two that can drift apart.
+
+⚠ The re-pointing is not housekeeping. A worktree created once and merely
+*reused* stays pinned at whatever `HEAD` was that day, so every later run
+mutates a module some commits behind the tree it reports on — an instrument
+keeping its own copy, which is the exact defect `CONVENTIONS.md` §9 exists to
+prevent and which this conversion nearly reintroduced in a new form. It is
+caught here: the runner refuses if the checkout is dirty, and otherwise moves
+it, printing `worktree advanced <old> -> <new>`. A SIGKILL, an OOM
 kill or a power loss mid-run therefore cannot leave a mutated file in the tree
 you work in. Remove the checkout with:
 
