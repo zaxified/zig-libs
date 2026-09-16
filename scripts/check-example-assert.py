@@ -80,7 +80,6 @@ disappears.
 * It does not run anything. An example that compiles, is gated by this, and is
   still never executed in any lane is a gap in `scripts/test.sh`, not here.
 """
-import subprocess
 import sys
 from pathlib import Path
 
@@ -125,9 +124,17 @@ def main() -> int:
     # A gate whose subject has vanished should say so rather than pass quietly:
     # if `modules/*/example/` ever stops being where examples live, the zero
     # above is about an empty set, not about a clean tree.
-    n_helpers = subprocess.run(
-        ["rg", "-l", "-e", r"fn must\(ok: bool, src: std\.builtin\.SourceLocation\)",
-         str(root / "modules")], capture_output=True, text=True).stdout.split()
+    # Plain Python, for the reason spelled out in check-skip-as-pass.py: `rg` is
+    # not on the GitHub runner, and this call had the same latent crash. Narrowed
+    # to `*.zig` on purpose -- the helper is Zig source, and a walk that does not
+    # read .gitignore should not wander into build output the way a bare `rg`
+    # over the directory would have.
+    helper_sig = "fn must(ok: bool, src: std.builtin.SourceLocation)"
+    n_helpers = [
+        p
+        for p in (root / "modules").rglob("*.zig")
+        if helper_sig in p.read_text(errors="replace")
+    ]
     print(f"check-example-assert: {len(examples)} example sources, no `{NEEDLE}`; "
           f"{len(n_helpers)} carry the surviving-check helper")
     return 0

@@ -43,7 +43,6 @@ convention gives it. It also does not look at `example/` code, where "skipped"
 in a message usually describes the DATA, not the test.
 """
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -71,9 +70,20 @@ def blocks(lines, start_re):
 
 
 def main() -> int:
-    out = subprocess.run(
-        ["rg", "-l", "verboseSkip", "modules"], capture_output=True, text=True
-    ).stdout.split()
+    # Plain Python instead of shelling out to `rg`. A gate that dies with a
+    # traceback because a tool is missing reports FAIL for a reason that says
+    # nothing about the tree -- and that is exactly what happened: on the GitHub
+    # runner, which has no ripgrep, `rg -l verboseSkip modules` raised
+    # FileNotFoundError (2026-09-16). It went unnoticed because this gate landed
+    # 2026-09-04, after the last green CI run on 2026-09-02, so it had never once
+    # run there. The scan is only a pre-filter over files this script opens
+    # anyway, so doing it here costs one walk and removes an undeclared
+    # dependency from a gate that has to work on any fresh checkout.
+    out = [
+        str(p)
+        for p in sorted(Path("modules").rglob("*.zig"))
+        if "verboseSkip" in p.read_text(errors="replace")
+    ]
     files = [f for f in out if f.endswith(".zig") and "/example/" not in f and "/testkit/" not in f]
 
     hits = []
