@@ -17,6 +17,8 @@ formatting as the module itself, and does not look at `mutate.py` at all.
 | `probe_injection.zig` | Can a caller-supplied byte become a new **line** on the wire — through an h1 header, a URL, or an h2 field that HPACK framed by length? | The subject is the bytes that leave the process, so the observer has to be a real peer on a real socket; the h2 cases need a front server and a backend alive on their own threads at once. A unit test can assert what a writer *returns*, not what a peer *received*. |
 | `probe_redirect_credentials.zig` | Which caller-pinned headers survive a **cross-origin redirect hop**? | Needs two listeners and a real 302 chain between them. What is being observed is hop **two**, which does not exist inside a single-call test. |
 | `probe_limits.zig` | What do the parsers **cost**, and are the documented bounds real? | Every answer is a measurement. A threshold pinned in a test would be a benchmark pinned to one machine; this prints numbers for a human to compare and asserts nothing about them. |
+| `probe_framing.zig` | Which line endings terminate a head or a chunk, and is the **trailer section** bounded? | F1–F3 are tables: the interesting output is the whole grid of spellings against outcomes, which is how one row standing out becomes visible. F3 also allocates an 8 MB wire, which no unit test should do. |
+| `probe_fuzz_shape.zig` | Given a real seed, how many bytes does a fuzz harness actually hand its parser? | A harness fed zero bytes **passes** — no assertion it makes about its own subject can see the defect. Only instrumentation across shapes shows it. |
 | `mutate.py` | Would the suite **notice** if a shipped guard were deleted? | Most of what makes this module safe to expose is a constant or a single refusal, and a functional test passes just as well with the limit at 2^40. The question is not "does it work" but "would anyone notice if it stopped". |
 
 ## Running them
@@ -67,6 +69,22 @@ loopback / link-local / RFC1918 targets.
 - `bufpool` under 2000 concurrent checkouts: 2000 allocations, 8 192 000 B live.
   `max_idle_slabs=8` bounds the **idle** list, not the checked-out set — after
   releasing all 2000 the idle list is back to 8 and the other 1992 were freed.
+
+**`probe_framing`.** Exit 0. The canonical `CRLF CRLF` head parses and leaves the
+next request unread; all three non-canonical terminators refuse. Every bare-LF
+chunk spelling is `malformed_chunk`, while a leading-zero size, a 16-digit size
+and chunk extensions are accepted (h1 caps the size line at 16 hex digits, so
+17 digits is refused). F3: against a trailer section of **8 200 005 B** behind a
+5-byte body, the 5 bytes are delivered and the trailer is refused at **32 800 B
+seen** against the 32 768 B `max_trailer_bytes` — with trailers **not** being
+captured, which is the default and was the hole. F4 prints the `isValidHost`
+table and asserts nothing.
+
+**`probe_fuzz_shape`.** Exit 0, and it reproduces the finding rather than
+describing it. Over five seeds, the superseded opening hands the parser **0 B
+from every one**; the shipped `smith.slice` opening hands it the whole frame
+(55/52/55/40/29 B). Drawing the length first — the change one would reach for
+first — also yields 0 B, which is why the fix had to be `slice`.
 
 **`mutate.py`.** All 16 rows (14 mutations + 2 controls) were dry-run against the
 live sources: every anchor matches **exactly once**, and every replacement

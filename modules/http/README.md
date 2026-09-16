@@ -689,8 +689,13 @@ loopback origin↔proxy↔client integration test).
   field; it is the regression detector for the request-smuggling fix, and exits
   non-zero if an injection reaches the peer or a control does not.
   `probe_redirect_credentials.zig` — which caller-pinned headers survive a
-  cross-origin redirect hop, observed on hop two. `probe_limits.zig` — parser
-  robustness sweep plus the `conneg`, `Range` and `bufpool` cost measurements.
-  `mutate.py` — deletes one shipped guard at a time from a copy of `src/` and
-  reports whether the suite notices. See `tools/README.md` for what each answers
-  and why it is not a unit test.
+  cross-origin redirect hop, observed on hop two. `probe_framing.zig` — which
+  blank-line and chunk-framing spellings are accepted, and whether the trailer
+  section is bounded; it is the regression detector for the bare-LF and
+  unbounded-trailer fixes. `probe_limits.zig` — parser robustness sweep plus the
+  `conneg`, `Range` and `bufpool` cost measurements.
+  `probe_fuzz_shape.zig` — how many bytes of a seed a fuzz harness actually
+  hands its parser, across the superseded and shipped openings (needs no module
+  graph: `zig test probe_fuzz_shape.zig`). `mutate.py` — deletes one shipped
+  guard at a time from a copy of `src/` and reports whether the suite notices.
+  See `tools/README.md` for what each answers and why it is not a unit test.
