@@ -101,9 +101,20 @@ if "$BIN" open --key mallory.sk --in msg.tc --out x "${OFFLINE[@]}" --round-file
     fail "a different recipient key opened the capsule"
 fi
 
-# (d) one flipped ciphertext byte.
+# (d) one flipped ciphertext byte. XOR the byte with 0xff — do NOT write a
+# constant. Writing 0x00 tampers with nothing whenever the byte is ALREADY zero,
+# and offset 100 is capsule header (37) + envelope offset 63, which lands inside
+# `tlock_ct`'s compressed G2 point, i.e. a uniformly random byte: measured 3
+# zeros in 512 seals (~1/256). CI run 35113866039 drew one of them and this case
+# reported "a tampered capsule was opened" for a capsule nobody had tampered
+# with; the same check had passed 35 runs before it. `tlock`'s own KAT tamper
+# already used the right idiom (`ct.v[0] ^= 0xff`, kat_test.zig).
+# The `cmp` below is the part that matters most: it asserts the tamper HAPPENED,
+# so this can never again silently degrade into a test that changes nothing.
 cp msg.tc bad.tc
-printf '\x00' | dd of=bad.tc bs=1 seek=100 conv=notrunc 2>/dev/null
+orig="$(dd if=bad.tc bs=1 skip=100 count=1 2>/dev/null | od -An -tu1 | tr -d ' ')"
+printf "$(printf '\\x%02x' $((orig ^ 0xff)))" | dd of=bad.tc bs=1 seek=100 conv=notrunc 2>/dev/null
+cmp -s msg.tc bad.tc && fail "the tamper wrote nothing — byte 100 is unchanged, so the refusal below would prove nothing"
 if "$BIN" open --key alice.sk --in bad.tc --out x "${OFFLINE[@]}" --round-file round1000.json >/dev/null 2>&1; then
     fail "a tampered capsule was opened"
 fi
