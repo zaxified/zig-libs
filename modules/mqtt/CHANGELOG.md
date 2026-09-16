@@ -36,6 +36,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `publishRemaining` (16 fail, blunt because the helper is shared with the encoder — which is the
   point of sharing it), and the Will moved back before the lock (1 fail). `scripts/modtest mqtt`
   **95/96** (1 skip) in Debug and ReleaseFast, `zig build portable-mqtt-linux32` OK.
+  **Also corrected, from the same audit:** `Config.onPublishFn`'s doc comment said the tap "must not
+  call back into the broker". Nothing enforces that, and it ruled out the one call a bridge wants.
+  Measured: `Broker.publish` from inside the tap works — the tap holds no lock, and it cannot recurse
+  because `Broker.publish` deliberately does not fire the tap. The comment now says what was measured
+  and keeps the one prohibition that is real: re-entering the same connection's `feed`/`process`,
+  which is single-owner and is the thread the tap is already on.
 
 - **2026-09-11** — `Connection.keepAlive()` and `Connection.willOpt()`. Both are things a *bridging*
   consumer needs and could previously only get by reaching into fields: the keep-alive so the two

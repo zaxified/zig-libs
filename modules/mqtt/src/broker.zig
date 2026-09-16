@@ -682,8 +682,18 @@ pub const Config = struct {
     ///
     /// ⚠ `topic` and `payload` point into the publishing connection's receive
     /// buffer and are valid **only for the duration of the call**. An observer
-    /// that keeps them must copy. It runs on the publisher's own thread with no
-    /// broker lock held, so it must not call back into the broker.
+    /// that keeps them must copy.
+    ///
+    /// It runs on the publisher's own thread with **no broker lock held**. This
+    /// used to say flatly that it "must not call back into the broker" — which
+    /// was stricter than anything here enforces, and ruled out the one call a
+    /// bridge actually wants. Measured 2026-09-16 (A1 mqtt drift audit):
+    /// `Broker.publish` from inside the tap works. It takes the registry lock
+    /// itself and finds it free, and it cannot recurse, because `Broker.publish`
+    /// deliberately does not fire this tap. What is still forbidden is
+    /// re-entering the SAME connection's packet processing (`feed`/`process` on
+    /// the publisher) — that path is single-owner by design, and it is the
+    /// thread you are already on.
     onPublishFn: ?*const fn (
         ctx: ?*anyopaque,
         topic: []const u8,
