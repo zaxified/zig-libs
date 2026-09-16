@@ -18,6 +18,13 @@ const kat = @import("kat_vectors.zig");
 const rsa = @import("rsa");
 const Sha384 = std.crypto.hash.sha2.Sha384;
 
+// Pulled in from here rather than from `root.zig`'s aggregator: every byte of
+// `root.zig` is in the ctgrind source digest of this module's two rows, and a
+// test-only import should not move it.
+test {
+    _ = @import("stackprobe_test.zig");
+}
+
 // ── REAL: pssEncode byte-exact against RFC 9474 Appendix A ─────────────
 
 test "pssEncode reproduces RFC 9474 Appendix A.1 encoded_msg byte-exact (RSABSSA-SHA384-PSS-Randomized)" {

@@ -435,6 +435,38 @@ pub const BlindError = PssEncodeError || error{
 /// in `[1, n)` by rejection, `inv = r⁻¹ mod n` via the masked
 /// extended-Euclid inverse), steps 1-4 and 7-9 in `blindCore` (shared
 /// with `blindWithFactor`).
+/// A1 B6/B9: the secrets that survive `blind()` are not copies this module
+/// holds. Every `Fe` and byte buffer on the path is `secureZero`'d already,
+/// and the residue stayed at the same count — it lives in `std.crypto.ff`'s
+/// own internals (Montgomery scratch, byte<->limb conversion) and in
+/// `std.math.big`'s Euclid temporaries, which no `secureZero` this module
+/// can write reaches. So the stack those callees used is zeroed wholesale
+/// instead, the technique `bip340` (F2), `xmss` (F3) and `bulletproofs`
+/// (B12) close the same class with.
+///
+/// Sized from the deepest frame on the path: `feInvert` alone puts a 128 KiB
+/// Euclid arena on its own frame, and `maskedInvert` can call it under
+/// `blind`'s own frames, so 256 KiB covers the tree with room. The probe
+/// asserts zero residue, so a call tree that outgrows this goes red there.
+const blind_stack_burn = 256 * 1024;
+
+/// `blindSign` reaches deeper than `blind`: its CRT private op runs inside
+/// `rsa`, and the probe measured 335 424 B of dirty stack below the call
+/// where `blind` leaves 207 632 B. Measured consequence of getting this
+/// wrong: at 256 KiB the key's prime factors `p` and `q` were still readable
+/// (2 hits each) below the burn.
+const sign_stack_burn = 512 * 1024;
+
+/// Zero `blind_stack_burn` bytes at the depth the blinding computation's
+/// frames occupied. `noinline` is load-bearing in the sibling modules that
+/// use this pattern: inlined, the buffer lands in the CALLER's frame, above
+/// the region the computation used, and the probe finds the secret again.
+/// `secureZero` writes through a volatile slice, so the dead store survives.
+noinline fn burnStack(comptime bytes: usize) void {
+    var buf: [bytes]u8 = undefined;
+    std.crypto.secureZero(u8, &buf);
+}
+
 pub fn blind(
     pk: rsa.PublicKey,
     comptime Hash: type,
@@ -444,6 +476,9 @@ pub fn blind(
     ctx_out: *Context,
     blinded_msg_out: []u8,
 ) BlindError![]u8 {
+    // Runs LAST (defers unwind in reverse), i.e. after every secureZero
+    // below has wiped what it owns. See burnStack.
+    defer burnStack(blind_stack_burn);
     if (salt_len != 0 and salt_len != Hash.digest_length) return error.InvalidSaltLength;
     var salt_buf: [Hash.digest_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &salt_buf);
@@ -641,6 +676,10 @@ pub fn blindSign(
     blinded_msg: []const u8,
     out: []u8,
 ) BlindSignError![]u8 {
+    // Same reason as `blind`: the secrets that survive are inside
+    // `std.crypto.ff` and `std.math.big`, not in copies this module holds.
+    // Runs last, after every secureZero below. See burnStack.
+    defer burnStack(sign_stack_burn);
     std.debug.assert(pk.n.v.eql(sk.n.v)); // pk must be sk's public half
     const modulus_len = byteLen(sk.n.bits());
     if (out.len < modulus_len) return error.OutputTooSmall;
@@ -1126,213 +1165,3 @@ test "B2: sampleFe rejects a zero draw and retries rather than returning it (aud
 // ── B6/B9 anchor: secret Fe values (and the byte buffers already wiped)
 // do not survive on the stack after blind() returns ───────────────────────
 //
-// Audit's own `probe deadstack` (A1/repro/blindrsa/probe.zig, a standalone
-// build-exe binary) found: r's big-endian byte buffer (`r_bytes` in
-// `blindCore`, already `secureZero`'d) = 0 hits -- a working negative
-// control -- while r in `ff.Fe` LIMB order (little-endian, never wiped by
-// anything) = 2 hits in the 512 KiB below `blind()`'s frame. The `Fe`
-// copies of `r`/`r_inv` (blind/blindCore) and `u`/`v`/`v_inv`
-// (maskedInvert) were never zeroed as STRUCTURED values -- only their
-// byte-buffer serializations were (B6). And nothing pinned that any of the
-// EXISTING byte-buffer wipes (`r_bytes`, `feInvert`'s Euclid scratch arena)
-// actually take effect rather than being silently compiled away (B9).
-//
-// This reproduces the audit's technique INSIDE `zig build test-<m>` (a
-// FixedRandom pins r, so both the sampled r AND maskedInvert's masking
-// scalar u collapse to the same known bit pattern) instead of as a
-// separate build-exe probe, so it runs under `scripts/modtest` like every
-// other test in this campaign. ReleaseFast-only: stack layout in Debug is
-// not what the audit measured, and register/spill allocation this fine-
-// grained is not something a Debug build's frame shape reflects at all.
-const DeadStackFixedRandom = struct {
-    val: []const u8,
-    fn fill(self: *const @This(), buf: []u8) void {
-        @memset(buf, 0);
-        if (buf.len >= self.val.len) {
-            @memcpy(buf[buf.len - self.val.len ..], self.val);
-        } else {
-            @memcpy(buf, self.val[self.val.len - buf.len ..]);
-        }
-    }
-};
-
-noinline fn deadStackRunBlind(pk: rsa.PublicKey, random: std.Random, ctx: *Context) void {
-    var bm: [max_modulus_len]u8 = undefined;
-    _ = blind(pk, std.crypto.hash.sha2.Sha384, &kat.a1.prepared_msg, kat.a1.salt.len, random, ctx, &bm) catch unreachable;
-}
-
-// A1 B6 isolation probes (2026-09-11): does `Fe.fromBytes` ALONE leak, with
-// no subsequent multiply/modexp, and does bypassing its internal
-// `shrink`/`rejectNonCanonical` calls (the bn254 fix's exact target class --
-// masked-conditional-subtract without a `blackBox` barrier) change anything?
-// See the isolation test below for what this ruled out.
-noinline fn deadStackRunFromBytesOnly(pk: rsa.PublicKey) void {
-    const fe = rsa.Fe.fromBytes(pk.n, &kat.r, .big) catch unreachable;
-    std.mem.doNotOptimizeAway(&fe);
-}
-
-/// Bypasses `Fe.fromBytes`'s internal `shrink`/`rejectNonCanonical` calls
-/// entirely: builds the `Uint` via `rsa.Uint.fromBytes` (a plain shift-and-OR
-/// byte loop, no data-dependent branch) and constructs the `Fe` struct
-/// literal directly -- `r` is already known canonical (`sampleFe`'s
-/// rejection sampling guarantees `r < n`), so `shrink`/`reject` would be
-/// no-ops on the real path anyway. If `shrink`'s masked conditional-subtract
-/// (the SAME function bn254's B6 precedent found unguarded) were the leak
-/// source, this would close it.
-noinline fn deadStackRunUintFromBytesOnly() void {
-    const v = rsa.Uint.fromBytes(&kat.r, .big) catch unreachable;
-    const fe = rsa.Fe{ .v = v, .montgomery = false };
-    std.mem.doNotOptimizeAway(&fe);
-}
-
-noinline fn deadStackScan(needle: []const u8, base: [*]const u8, len: usize) usize {
-    var hits: usize = 0;
-    var i: usize = 0;
-    while (i + needle.len <= len) : (i += 1) {
-        if (std.mem.eql(u8, base[i..][0..needle.len], needle)) hits += 1;
-    }
-    return hits;
-}
-
-// ⚠ 2026-09-10 fix-campaign measurement (fixwt/a, see A1/blindrsa.md
-// Dispozice for the full writeup): `blindCore`/`maskedInvert`/`blind` were
-// changed to `secureZero` their `r`/`r_inv`/`u`/`v`/`v_inv`/`b`/`b_inv` Fe
-// STRUCT copies, not just the byte-buffer serializations that were already
-// wiped. Measured RED (before that change): this scan found 2 hits for r in
-// ff.Fe limb order. Measured again AFTER the change: still 2 hits, byte-for-
-// byte identical count. The leak survives wiping every Fe our own code
-// holds, which means it lives inside `std.crypto.ff`'s own internals (a
-// Montgomery-multiplication or byte<->limb-conversion scratch temporary),
-// not in a copy `blindrsa` controls — the same class of trap as
-// `zig_std_crypto_leaves_key_schedules_on_stack` (project memory). B6
-// therefore stays OPEN; only the `hits_be` half below (which the B6 fix did
-// not touch, and which was already true before it) is asserted as a real
-// B9 anchor for the `r_bytes` buffer wipe. `hits_le` is printed for the
-// record but NOT asserted -- asserting 0 would misrepresent an unresolved
-// finding as fixed, and asserting the current (leaking) count would pin a
-// known leak as the expected/accepted shape. Neither is honest here.
-test "B9: blind()'s r_bytes buffer (the byte-level secureZero) does not survive on the stack after return" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
-    const pk = try kat.publicKey();
-    var fixed = DeadStackFixedRandom{ .val = &kat.r };
-    const random = std.Random.init(&fixed, DeadStackFixedRandom.fill);
-    var ctx: Context = undefined;
-
-    var anchor: usize = 0;
-    const stack_top: [*]const u8 = @ptrCast(&anchor);
-    anchor = 1;
-    deadStackRunBlind(pk, random, &ctx);
-    const window: usize = 512 * 1024;
-    const base = stack_top - window;
-
-    // needle A: r big-endian -- the r_bytes buffer blindCore explicitly
-    // secureZero's. Negative control: must stay 0 hits regardless of this
-    // test's own B6 fix (it was already wiped before this test existed).
-    const be = kat.r[0..32];
-    // needle B: r as ff.Fe stores it -- little-endian u64 limbs, i.e. the
-    // full byte-reversal of the big-endian value. THIS is what B6 found
-    // unwiped.
-    var rev: [512]u8 = undefined;
-    for (kat.r, 0..) |c, idx| rev[511 - idx] = c;
-    const le = rev[0..32];
-
-    const hits_be = deadStackScan(be, base, window);
-    // NOT asserted -- see the comment above this test (B6 stays open).
-    const hits_le = deadStackScan(le, base, window);
-
-    // needle C/D: the OTHER half of B9 that never had an anchor -- the
-    // masked value `v` that maskedInvert actually feeds into feInvert's
-    // variable-time Euclid arena (`scratch` in `feInvert`), as opposed to
-    // `r` itself, which never reaches that arena directly. Under this
-    // test's DeadStackFixedRandom (every draw returns the SAME bytes,
-    // `kat.r`), `sampleFe`'s first accepted draw is `r` itself, so
-    // `maskedInvert`'s mask `u` is ALSO `kat.r` (same fixed source) and
-    // `v = r * u mod n = r^2 mod n` is fully computable here -- no need to
-    // instrument the module to know what value to search for.
-    const pk_n = pk.n;
-    const r_fe = rsa.Fe.fromBytes(pk_n, &kat.r, .big) catch unreachable;
-    const v_fe = pk_n.mul(r_fe, r_fe);
-    var v_bytes: [max_modulus_len]u8 = undefined;
-    v_fe.toBytes(&v_bytes, .big) catch unreachable;
-    const v_be = v_bytes[0..32];
-    var v_rev: [max_modulus_len]u8 = undefined;
-    for (v_bytes, 0..) |c, idx| v_rev[v_bytes.len - 1 - idx] = c;
-    const v_le = v_rev[0..32];
-
-    const hits_v_be = deadStackScan(v_be, base, window);
-    const hits_v_le = deadStackScan(v_le, base, window);
-    std.debug.print(
-        "B9/B6 dead-stack scan, {d} KiB below blind()'s frame: r big-endian (r_bytes, wiped -- ASSERTED) = {d} hits, r ff.Fe limb order (std.crypto.ff internal, NOT asserted, B6 open) = {d} hits, v=r^2 mod n big-endian (feInvert's x_bytes + Euclid scratch arena + x_param, NOT asserted -- see below) = {d} hits, v ff.Fe/big.int limb order (NOT asserted, same B6-class leak) = {d} hits\n",
-        .{ window / 1024, hits_be, hits_le, hits_v_be, hits_v_le },
-    );
-    try std.testing.expectEqual(@as(usize, 0), hits_be);
-    // B9 anchor for the Euclidean arena, but NOT a closing one: this needle
-    // found 2 hits even AFTER adding feInvert's own `x_param` struct-level
-    // wipe (see feInvert above) on top of the pre-existing `x_bytes`/
-    // `scratch` byte-level wipes -- RED before that fix, RED after it,
-    // identical count. Same class as B6 (a std.crypto.ff-internal copy this
-    // module's own secureZero calls cannot reach), just for `v` instead of
-    // `r`. NOT asserted -- asserting 0 here would be exactly the dishonest
-    // "measured as ineffective, checked off anyway" the campaign brief
-    // warns against. This is the anchor B9 was missing for its second half;
-    // it does not close B9, it gives it real, measured evidence.
-}
-
-test "A1 B6: isolating fromBytes rules out shrink/rejectNonCanonical as the leak source (still open, new evidence)" {
-    // Tried the bn254 B6 precedent directly: bn254's own B6 finding was
-    // `Fr.toBytes` calling `std.crypto.ff.Modulus.fromMontgomery`, whose
-    // internal `shrink`/`montgomeryMul` masked conditional-subtract has no
-    // `blackBox` barrier in this build -- fixed there by never calling that
-    // function at all (hand-rolled CIOS instead), closing 3 of 9 contexts.
-    //
-    // blindrsa's B6 (the earlier isolation test above, "B9: blind()'s
-    // r_bytes...") already showed the SAME 2-hit leak survives EVERY
-    // struct-level secureZero blindrsa's own code can add, so it must be
-    // INSIDE std.crypto.ff somewhere. bn254's exact fix targets `fromBytes`'s
-    // sibling function `fromMontgomery`; the natural next question is
-    // whether `fromBytes` has the SAME class of defect (its own `shrink` +
-    // `rejectNonCanonical` calls).
-    //
-    // Measured here: it does NOT. `deadStackRunFromBytesOnly` (calls
-    // `Fe.fromBytes` exactly once, nothing else) reproduces the identical
-    // 2 hits with NO multiply/modexp involved at all -- the leak does not
-    // need `Modulus.mul`'s Montgomery scratch, contrary to what the
-    // 2026-09-10 dispozice guessed. `deadStackRunUintFromBytesOnly` goes
-    // further: it bypasses `shrink`/`rejectNonCanonical` ENTIRELY (builds
-    // the `Uint` via the plain byte-loop `Uint.fromBytes`, no data-dependent
-    // branch, then constructs the `Fe` struct literal directly) -- STILL
-    // 2 hits, byte-identical. That rules out the bn254 fix's exact
-    // mechanism (an unguarded masked-conditional-subtract in a named
-    // function this code calls): there is no such call left in this path,
-    // and the leak persists anyway. The residue is a transient copy from
-    // constructing/returning the value itself -- the same "no guaranteed
-    // stack-scrub on frame reuse" class as `zig_std_crypto_leaves_key_schedules_on_stack`,
-    // not a specific missing barrier the bn254 technique can remove.
-    //
-    // B6 stays OPEN. Not asserted to 0 (false) or to 2 (pins a known leak
-    // as accepted) -- printed for the record, same discipline as the other
-    // B6/B9 anchors in this file.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
-    const pk = try kat.publicKey();
-    var rev: [512]u8 = undefined;
-    for (kat.r, 0..) |c, idx| rev[511 - idx] = c;
-    const le = rev[0..32];
-    const window: usize = 512 * 1024;
-
-    var anchor1: usize = 0;
-    const stack_top1: [*]const u8 = @ptrCast(&anchor1);
-    anchor1 = 1;
-    deadStackRunFromBytesOnly(pk);
-    const hits_fe_fromBytes = deadStackScan(le, stack_top1 - window, window);
-
-    var anchor2: usize = 0;
-    const stack_top2: [*]const u8 = @ptrCast(&anchor2);
-    anchor2 = 1;
-    deadStackRunUintFromBytesOnly();
-    const hits_uint_fromBytes = deadStackScan(le, stack_top2 - window, window);
-
-    std.debug.print(
-        "A1 B6 isolation: Fe.fromBytes (w/ shrink+reject) = {d} hits; Uint.fromBytes + hand Fe{{}} literal (bypasses shrink+reject) = {d} hits -- bn254's fix mechanism does not apply here\n",
-        .{ hits_fe_fromBytes, hits_uint_fromBytes },
-    );
-}

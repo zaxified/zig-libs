@@ -195,7 +195,33 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   `blindWithFactor` KAT seam inverts its input directly (documented on
   the function; production clients use `blind`). Secret byte buffers
   (`r`, `x = r^e`, `b`, Euclid scratch arenas) are wiped with
-  `std.crypto.secureZero` on scope exit. Exponentiation by the PUBLIC
+  `std.crypto.secureZero` on scope exit.
+  **And that is not enough on its own** (audit B6/B9): the copies that
+  survive a call are not ones this module holds. `std.crypto.ff` keeps
+  Montgomery and byte↔limb temporaries of its own, and `std.math.big`'s
+  Euclid arena holds more, so `blind` and `blindSign` additionally ZERO THE
+  STACK their callees used, in a `noinline` helper that runs after every
+  other wipe (`blind_stack_burn` 256 KiB, `sign_stack_burn` 512 KiB; the
+  probe measured 207 632 B and 335 424 B of dirty stack below those calls).
+  `src/stackprobe_test.zig` asserts the result with a NEGATIVE and a
+  POSITIVE control in the same binary; measured, removing either burn brings
+  the blinding factor back (`r` and `b`, 1 hit each), and so does making the
+  helper inlinable — the burn then lands in the caller's frame, above the
+  region the computation used. The individual `secureZero` calls stay as
+  defence in depth, but they are no longer separately observable: the burn
+  covers the same bytes, so deleting any one of them leaves the probe green.
+  ⚠ **What the burn cannot reach: the caller's own copy.** `blindSign` takes
+  `rsa.SecretKey` BY VALUE, as does `rsa`'s `rsasp1`/`privateOpCrt`
+  underneath it, and a callee cannot wipe a parameter slot that lives in its
+  caller's frame. Measured on this probe: the prime factors `p` and `q`
+  remain readable there (2 hits each) with the burn and without it, at the
+  same offsets, and a control that only copies the key by value and does
+  nothing else leaves 1 each. Closing that needs the key passed by pointer
+  through both APIs, which is an API change and is recorded, not done.
+  Cost of the burns, ReleaseFast, min of 15: `blind` 2096 µs vs 1959 µs
+  without (+7 %), `blindSign` 9084 µs vs 9283 µs (within noise beside a
+  4096-bit CRT exponentiation). `secureZero` writes bytewise through a
+  volatile slice, which is what the 256 KiB costs. Exponentiation by the PUBLIC
   `e` uses `rsa.rsavp1`'s `powPublic` (variable-time in `e` only —
   constant-time with respect to the secret base, per `ff`'s contract).
   `verify`/`pssEncode` handle only PUBLIC data (mirrors

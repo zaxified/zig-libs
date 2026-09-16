@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — `blind` and `blindSign` now zero the stack their callees
+  used (audit B6 and B9). Every `Fe` and byte buffer on the secret path was
+  already `secureZero`'d and the residue did not move: what survives is
+  inside `std.crypto.ff`'s Montgomery/limb temporaries and `std.math.big`'s
+  Euclid arena, which no wipe written here can reach. A `noinline` burn
+  (256 KiB for `blind`, 512 KiB for `blindSign`, sized from 207 632 B and
+  335 424 B of measured dirty stack) runs after every other wipe.
+  `src/stackprobe_test.zig` is the anchor B9 asked for: it snapshots the dead
+  window to the heap before building any needle — the previous in-`root.zig`
+  probe scanned the live stack and counted its own needle buffers — and
+  asserts zero for the blinding factor in both encodings and for the masked
+  `v = r²` the Euclid loop chews on, next to a NEGATIVE and a POSITIVE
+  control. Measured: removing either burn brings the factor back, and so does
+  dropping `noinline`. No behaviour and no API changed; cost is +7 % on
+  `blind` and below noise on `blindSign`.
+  ⚠ Not fixed, and now measured: `blindSign` takes `rsa.SecretKey` by value,
+  so the key's prime factors stay readable in the CALLER's frame (2 hits for
+  `p` and `q`, burn or no burn). A callee cannot wipe its caller's parameter
+  slot; passing the key by pointer would be an API change across `blindrsa`
+  and `rsa`.
+
 - **2026-09-11** — **API CHANGE:** `blind`'s `salt: []const u8` parameter
   becomes `salt_len: usize` (audit finding B16). RFC 9474 §7.4: "these
   values [the PSS salt and the blinding factor] SHOULD NOT [be provided

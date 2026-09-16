@@ -400,8 +400,8 @@ bls12_381	ReleaseFast	g2_scalarmul	1	8	c58d13bebb766407	7f4e15a241002b3f
 #                `paillier.decrypt` (A5 class), which F5's wider plaintext
 #                reaches (A1 threshold_ecdsa, re-audit 2026-09-17).
 bip340	ReleaseFast	sign	1	<=80	aa70b949dabd149a	0ce3274dc49157be
-blindrsa	ReleaseFast	blind	1	<=493	58e60e4a5009bbd9	4352055809b3f3c7
-blindrsa	ReleaseFast	sign	1	<=218	58e60e4a5009bbd9	4d5e3740a158032d
+blindrsa	ReleaseFast	blind	1	<=493	4924c0445c1f0c3c	4352055809b3f3c7
+blindrsa	ReleaseFast	sign	1	<=218	4924c0445c1f0c3c	4d5e3740a158032d
 # A1 threshold_ecdsa R2 fix (2026-09-17, fixwt/a): `zkproofs.mulAddBytes`'s
 # carry-propagation tail no longer exits early on `carry != 0` (which compiled
 # to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig, was :356);
