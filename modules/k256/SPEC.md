@@ -188,7 +188,7 @@ counting rule were added). Three bucket columns, not one, and they sum to
 | `field` | element + `cMov` select bit | yes | **yes** | 6 | **0** | 6 | 0 | 99 |
 | `field` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `field` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
-| `mul` | scalar, point decoded at run time | yes | **yes** | 7 | **1** | 6 | 0 | 99 *(windowed `mul` via `mulInner` + burn, 2026-09-17; before `mulInner`: base point 7/1, runtime point 8/2; the ladder read 8/2)* |
+| `mul` | scalar, point decoded at run time | yes | **yes** | 7 | **1** | 6 | 0 | 99 *(windowed `mul` via `mulInner` + burn, 2026-09-15; before `mulInner`: base point 7/1, runtime point 8/2; the ladder read 8/2)* |
 | `mul` | — | yes | no | 0 | 0 | 0 | 0 | 0 *(control)* |
 | `mul` | — | **no** | yes | 0 | 0 | 0 | 0 | 0 *(trap)* |
 | `comb` | scalar | yes | **yes** | 7 | **1** | 6 | 0 | 99 |
@@ -214,7 +214,7 @@ exactly (`--stacks`, 2026-09-16):
   from `mul` → `mulInner` (`group.zig:284`/`:292`). The 256-bit ladder it replaced
   read **2** here (`group.zig:277`, LLVM split the `z = 0` test from the
   affine-identity test); the windowed build reads 1 or 2 on the same source
-  expression depending on inlining — measured 2026-09-17: base point 1; point
+  expression depending on inlining — measured 2026-09-15: base point 1; point
   decoded at run time 2 before `mulInner` existed, 1 after. That is the compiler
   placing one test at one or two addresses, not a property of the module.
 - `group.zig:399` — `combMulBaseWithTable`'s `try acc.rejectIdentity()`, reached
@@ -304,7 +304,7 @@ branch: the `ecdsa` ctgrind row read 15/10/5/0 before and after, same source
 lines shifted by the inserted text. `bip340Sign` was not converted and is not
 covered by this claim.
 
-**`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-17).** The windowed
+**`Secp256k1.mul`, the ECDH path (A1 R1, re-audit 2026-09-15).** The windowed
 multiply (F5) left the u256 image of the SECRET scalar on the dead stack **twice
 per call** at ReleaseFast (the ladder before it: once; `combMulBase` after F5:
 0). Declaring `k` a `var` and `secureZero`ing it changed nothing — the copies are
@@ -322,7 +322,7 @@ process against the tree without the burn (ReleaseFast, 9 rounds × 1000 calls):
 spread. The `mul` ctgrind row is unchanged by the burn (7/1/6/0).
 
 **The `mul` ctgrind target multiplies a point decoded at run time (A1 R2, same
-re-audit).** Until 2026-09-17 it used `Secp256k1.basePoint`; `mul` builds its
+re-audit).** Until 2026-09-15 it used `Secp256k1.basePoint`; `mul` builds its
 table per call from `p`, so a comptime-known point is a different binary from
 the ECDH path it stands for. Measured on the pre-`mulInner` tree: base point
 7/1, runtime point **8/2** (the extra context is `rejectIdentity` split in two,

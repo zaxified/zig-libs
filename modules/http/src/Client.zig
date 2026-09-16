@@ -889,7 +889,7 @@ pub fn putFile(c: *Client, url: []const u8, dir: std.Io.Dir, sub_path: []const u
         // `ReadFailed` is the local file read (`fr`), and it can be a
         // cancelation too: the upload alternates file reads with socket
         // writes, so a cancel lands in either. `fr.err` carries it exactly as
-        // `conn.sw.err` does. Until 2026-09-17 this arm mapped it to plain
+        // `conn.sw.err` does. Until 2026-09-15 this arm mapped it to plain
         // `ReadFailed` — a canceled upload reported as a file-system failure;
         // measured 5/25 under CPU load once the cancel test stopped relying
         // on a sleep, every one with `fr.err = Canceled` and `sw.err = null`.
@@ -2952,7 +2952,7 @@ const HeadThenSilentPeer = struct {
 /// returns `error.Canceled` ahead of `connect`, so the client never reaches
 /// the listener, the peer stays blocked in `accept` — a plain thread no
 /// `stop` flag and no `std.Io` cancelation can reach — and the test's
-/// `defer peer_thread.join()` waits forever. Measured 2026-09-17: the full
+/// `defer peer_thread.join()` waits forever. Measured 2026-09-15: the full
 /// gate reported `request: a canceled request-head write …` as a 3-minute
 /// timeout, and a probe that moved the cancel ahead of the dial hung 4/4 with
 /// the peer thread in `inet_csk_accept`, the listener's accept queue empty

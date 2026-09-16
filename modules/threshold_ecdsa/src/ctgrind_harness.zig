@@ -69,7 +69,7 @@
 //!
 //! ## The three targets
 //!
-//! (`betaprime` was added 2026-09-17; it is described after `nonce`.)
+//! (`betaprime` was added 2026-09-15; it is described after `nonce`.)
 //!
 //! * `share` — taints ONLY `secret_share` (`x_i`, "the signing share" —
 //!   `KeyShare`'s own doc comment's term) on every `KeyShare` passed to
@@ -92,7 +92,7 @@
 //!   later 48-byte draw is tainted by accident. This is what actually
 //!   exercises signing.zig:267 (the PoK nonce) and signing.zig:508 (`γ_i`
 //!   itself) with tainted input; `secret_share` stays real in this target.
-//! * `betaprime` (A1 threshold_ecdsa R1, 2026-09-17) — taints every
+//! * `betaprime` (A1 threshold_ecdsa R1, 2026-09-15) — taints every
 //!   160-byte draw, which on this path is exactly Bob's MtA blind
 //!   `β' ∈ [0, q⁵)`. There are `2·t(t−1)` = 4 of them: one MtA and one MtAwc
 //!   per ordered pair. It is the only target that reaches the rejection
@@ -292,7 +292,7 @@ const TaintFirstN = struct {
 /// (`mta.sampleBetaPrime`). `TaintFirstN` counts only 48-byte draws, so no
 /// row measured it: not the rejection sampler's `std.mem.order`, not
 /// `β = −β' mod q` (Bob's additive share), not `proveBobInner`'s arithmetic
-/// over `β'` (re-audit 2026-09-17, R1). This wrapper taints EVERY draw of
+/// over `β'` (re-audit 2026-09-15, R1). This wrapper taints EVERY draw of
 /// exactly that width, and nothing else. On the sequential `signWithShares`
 /// path that width is unambiguous: scalars are 48 bytes, the proof masks are
 /// `q³` (96), `q⁷` (224) or `q·Ñ`-wide, and Paillier randomness is `|N|`.

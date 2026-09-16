@@ -362,7 +362,7 @@ test "soundness: random forgeries of L_0 are never accepted (discriminating powe
     // so a real regression at that rate is caught the large majority of
     // runs and, per this fix's own RED measurement, was caught outright).
     //
-    // Measured 2026-09-17: 500 trials of `verify` (each a full bulletproof
+    // Measured 2026-09-15: 500 trials of `verify` (each a full bulletproof
     // verification, n=8) took ~46s isolated in Debug -- the module's own
     // full-gate Debug timeout contributor (`scripts/modtest bulletproofs`:
     // 1m55s whole module). Debug is a smoke lane, not the statistical gate:

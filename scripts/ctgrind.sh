@@ -199,7 +199,7 @@ declare -A TARGETS=(
     # two real 2048-bit Paillier keys -- ~5 s native, ~3 MINUTES under
     # memcheck. Nine rows. It is by far the heaviest entry in this table; know
     # that before putting `--check` on a timer.
-    # `betaprime` added 2026-09-17 (A1 threshold_ecdsa R1): since F5, Bob's MtA
+    # `betaprime` added 2026-09-15 (A1 threshold_ecdsa R1): since F5, Bob's MtA
     # blind β' is a 160-byte draw that `nonce` never tainted.
     [threshold_ecdsa]="share nonce betaprime"
     # ── round 3, 2026-09-09 ────────────────────────────────────────────────

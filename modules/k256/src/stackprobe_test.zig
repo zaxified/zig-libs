@@ -215,7 +215,7 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
     for (total) |h| try std.testing.expectEqual(@as(usize, 0), h);
 }
 
-// ── re-audit 2026-09-17 (A1 k256 R1): `Secp256k1.mul`, the ECDH path ─────────
+// ── re-audit 2026-09-15 (A1 k256 R1): `Secp256k1.mul`, the ECDH path ─────────
 //
 // `mul` takes the SECRET scalar of `sphinx`'s per-hop DH and `bolt8`'s Noise
 // DH. After the windowed multiply (F5, `1ce3087e`) the dead stack held the
@@ -240,7 +240,7 @@ noinline fn scanOne(needle: *const [32]u8) usize {
 /// Returns the projective result as is: a consumer that returns right after
 /// `mul` runs nothing that would overwrite its dead frames. (Encoding the
 /// point here first — a field inversion — happens to overwrite them, and the
-/// probe then reads 0 with or without the burn: measured 2026-09-17.)
+/// probe then reads 0 with or without the burn: measured 2026-09-15.)
 noinline fn callMul(p: group.Secp256k1, s: [32]u8) group.Secp256k1 {
     return group.Secp256k1.mul(p, s, .big) catch unreachable;
 }

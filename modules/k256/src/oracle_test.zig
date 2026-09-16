@@ -150,14 +150,14 @@ fn eqAffineStd(k: Secp256k1, s: StdCurve) !void {
 // double-and-add) times 4000 draws: measured ~2m9s for this test ALONE under
 // full-gate-level machine load (`nproc`=8, load average ~165 from other
 // concurrent test lanes) -- close enough to a 3-minute per-test budget that
-// the full gate timed it out (audit A1, 2026-09-17 attempt 4). ReleaseFast
+// the full gate timed it out (audit A1, 2026-09-15 attempt 4). ReleaseFast
 // has no such problem (comb + std's own optimized path, both fast), so only
 // Debug's random-draw count is cut; every named edge scalar below still runs
 // in every mode -- this is a coverage TRIM, not a coverage DROP, and the
 // mutant check at the end of this file (comb positive control) still runs
 // the same 500 draws in both modes since it doesn't touch std's slow path.
 // 300 (the previous cut, `14b2e983`) still ran ~9s isolated -- material
-// against the module's own <40s-in-Debug budget (k256, audit A1 2026-09-17
+// against the module's own <40s-in-Debug budget (k256, audit A1 2026-09-15
 // attempt 6, `group.test.differential` timed the full gate out separately;
 // fixing that alone left this test as the next-largest contributor). Cut
 // further; every named edge scalar below is unconditional in all modes.

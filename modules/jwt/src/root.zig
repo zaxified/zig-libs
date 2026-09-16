@@ -6202,7 +6202,7 @@ const FetchCancelPeer = struct {
 /// machine could cancel an earlier step, which passes by the wrong route. It
 /// could also cancel before the connect: the peer then waits in `accept`
 /// forever, and so does `join`. That is the http full-gate hang of
-/// 2026-09-17, and the same shape as this module's peer.
+/// 2026-09-15, and the same shape as this module's peer.
 const ReadCueIo = struct {
     vtable: std.Io.VTable,
     userdata: ?*anyopaque,

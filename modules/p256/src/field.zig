@@ -463,7 +463,7 @@ fn randFe(rand: std.Random) struct { k: Fe, s: StdFe } {
 
 // Debug: measured ~12s for this test ALONE, isolated (`scripts/modtest p256
 // -Dtest-filter="mul/sq/add/sub/neg/invert"`), just over the campaign's 10s
-// per-test budget -- audit A1, 2026-09-17 full-gate attempts. Field ops here
+// per-test budget -- audit A1, 2026-09-15 full-gate attempts. Field ops here
 // are cheap relative to a full point multiply, so a modest trim suffices;
 // ReleaseFast/ReleaseSafe/ReleaseSmall keep the full count (they are not the
 // problem).

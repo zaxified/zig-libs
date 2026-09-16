@@ -142,7 +142,7 @@ bolt8	ReleaseFast	keygen	1	3	133f64b49f95282f	d7a8d7540234ad3e
 bolt8	ReleaseFast	act3	1	6	2d54eabc5fe940df	f60e20889f25f0aa
 bolt8	ReleaseFast	transport	1	3	cb5d5d200f748105	859416d386f56f8a
 bn254	ReleaseFast	field	1	1	27af92a0c130f0a6	831aa25b5c3d2f05
-# bn254 scalarmul 5 -> 2 (re-pin 2026-09-17): `3cda42bf`/`b80e3cce` made
+# bn254 scalarmul 5 -> 2 (re-pin 2026-09-15): `3cda42bf`/`b80e3cce` made
 # `Fr.toBytes` reduce with bn254's own CIOS behind a `blackBox` barrier instead
 # of `std.crypto.ff`'s `fromMontgomery`; exactly the three contexts attributed
 # to std's ff went (9 -> 6 total), output byte-identical.
@@ -225,7 +225,7 @@ oscore	ReleaseFast	unprotect	1	1	71a979efe6e701d2	ed85db89e3d7e9fd
 # single-context pin this module deliberately does not have.
 ct25519	ReleaseFast	ct25519	1	0	3af4421d3df4cd83	4e5e08fafcda58f8
 ct25519	ReleaseFast	std	1	>=1	NO-OWN-SRC	4e5e08fafcda58f8
-# ct25519 targets added 2026-09-16, first pinned 2026-09-17 (A1 ct25519 C3/C4,
+# ct25519 targets added 2026-09-16, first pinned 2026-09-15 (A1 ct25519 C3/C4,
 # bulletproofs B9). All four claim zero in-file contexts, 2 witness each
 # (`printHex` of the result). Their positive controls are recorded in
 # A1/ct25519.md: `pc[slot]` for `pcSelect` puts `ladder`/`ladderbase` at 6/6
@@ -344,7 +344,7 @@ hqc	ReleaseFast	keygen	1	4	1b33fe8f22ee9b7e	a20c02ff5f2e81ee
 hqc	ReleaseFast	encaps	1	0	1b33fe8f22ee9b7e	e91a390cf03fd6ad
 hqc	ReleaseFast	sampler	1	2	8eeeec94620e623e	b93fa60c89578576
 k256	ReleaseFast	field	1	0	9cea496ddcd0b4a7	4f13cccddea81376
-# k256, re-pin 2026-09-17, after F5 (1ce3087e: signed-window variable-base
+# k256, re-pin 2026-09-15, after F5 (1ce3087e: signed-window variable-base
 # mul) and the re-audit fixes in ff305abc.
 #   mul 2 -> 1   7/1/6/0. The one context is `rejectIdentity` at
 #                group.zig:347. ⚠ "1" is an inlining outcome, not a module
@@ -380,7 +380,7 @@ falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
 bls12_381	ReleaseFast	field	1	1	397efcbf4800ff52	c1e8a3c184eada53
 bls12_381	ReleaseFast	g1_scalarmul	1	5	899d68d0a1824f0e	b53b0d7808e48c1c
 bls12_381	ReleaseFast	g2_scalarmul	1	8	c58d13bebb766407	7f4e15a241002b3f
-# Re-pin 2026-09-17. Every moved bound below was diffed context-by-context
+# Re-pin 2026-09-15. Every moved bound below was diffed context-by-context
 # against a --stacks run of the tree at 0c0ef527:
 #   bip340 sign 79 -> 80   The F5 seam (f3c75612) moved sign's body into
 #                signImpl/computeUnverified, keeping every old context under
@@ -398,11 +398,11 @@ bls12_381	ReleaseFast	g2_scalarmul	1	8	c58d13bebb766407	7f4e15a241002b3f
 #   threshold_ecdsa share 127 -> 273   The 127 was stale long before F5: the
 #                tree before 9cc2c425 already read 272. The +1 is
 #                `paillier.decrypt` (A5 class), which F5's wider plaintext
-#                reaches (A1 threshold_ecdsa, re-audit 2026-09-17).
+#                reaches (A1 threshold_ecdsa, re-audit 2026-09-15).
 bip340	ReleaseFast	sign	1	<=80	aa70b949dabd149a	0ce3274dc49157be
 blindrsa	ReleaseFast	blind	1	<=493	ec3c73bfc9e557df	4352055809b3f3c7
 blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
-# A1 threshold_ecdsa R2 fix (2026-09-17, fixwt/a): `zkproofs.mulAddBytes`'s
+# A1 threshold_ecdsa R2 fix (2026-09-15, fixwt/a): `zkproofs.mulAddBytes`'s
 # carry-propagation tail no longer exits early on `carry != 0` (which compiled
 # to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig, was :356);
 # it now always walks every remaining byte down to `out[0]` (`pos`-driven, and
@@ -427,9 +427,9 @@ blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # row.
 threshold_ecdsa	ReleaseFast	share	1	<=267	3d94932979419650	4a6777ac538b5e90
 threshold_ecdsa	ReleaseFast	nonce	1	<=378	3d94932979419650	31f7e323b84fd8a7
-# ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-17 (was DEFECT, RED ON
+# ✅ threshold_ecdsa betaprime — R2 FIXED 2026-09-15 (was DEFECT, RED ON
 # PURPOSE, see git history of this comment for the pre-fix analysis).
-# Added 2026-09-17 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
+# Added 2026-09-15 for R1: nothing tainted Bob's 160-byte MtA blind β' before.
 #
 # Measured on the R1 tree (pre-R2, unmutated otherwise): 325 total / 321
 # in-file / 4 witness / 0 unattributed, control 0, trap 0, `draws_160b=4`.
@@ -449,7 +449,7 @@ threshold_ecdsa	ReleaseFast	nonce	1	<=378	3d94932979419650	31f7e323b84fd8a7
 #   - Alice's verification of the PUBLIC t/t1 (2): over-taint from simulating
 #     both parties in one process.
 #
-# R2 (2026-09-17): the remaining 8 were `zkproofs.mulAddBytes`'s carry tail
+# R2 (2026-09-15): the remaining 8 were `zkproofs.mulAddBytes`'s carry tail
 # (zkproofs.zig, was :356) branching on secret-derived partial sums of
 # `e·x + mask` — 321 - 8 = 313, matching the bound this row had carried since
 # R1 as the anticipated post-fix count. Measured post-fix (fixwt/a,
@@ -476,7 +476,7 @@ ibe	ReleaseFast	fp12pow	1	2	35d0138e95b4dcf1	d2e187260f9f18a2
 frost	ReleaseFast	commit	1	8	cf6d181343529b92	94a2e96655c4ce21
 frost	ReleaseFast	sign	1	5	cf6d181343529b92	8484bd50690a78db
 musig2	ReleaseFast	sign	1	<=101	a4d62ba84a4d5c2f	2a2f275cd0c5c7c5
-# taproot secret 10 -> 9 (re-pin 2026-09-17). The row was already stale at
+# taproot secret 10 -> 9 (re-pin 2026-09-15). The row was already stale at
 # 0c0ef527: a --stacks run of that tree reads 9, with the SAME context set as
 # today. The source pin never moved, so the drop came from a dependency before
 # that commit. The nine are bip340's scalar canonicality/`isZero` checks
@@ -507,7 +507,7 @@ hpke	ReleaseFast	p384_authdecap	1	4	ceef922c5fee3703	2741ac2ff5069767
 hpke	ReleaseFast	open	1	1	cd2271d9a14497cf	59883c70dcd08ee6
 signal	ReleaseFast	sign	1	1	cce965f3aeb59837	b2a0053066d93a75
 signal	ReleaseFast	ratchet	1	2	9e8bc13ebe2fbdb4	92ab00fad0ce5c41
-# sphinx construct 10 -> 8 (re-pin 2026-09-17): its two ECDH `k256.mul` calls
+# sphinx construct 10 -> 8 (re-pin 2026-09-15): its two ECDH `k256.mul` calls
 # (core.zig:124/:152) read 2 contexts each on the old ladder and 1 each now --
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
 # The rest are unchanged: comb `rejectIdentity` x2, std scalar canonicality x2,
@@ -610,7 +610,7 @@ sealedbox	ReleaseFast	b64dec	1	1	9b2bc6d6cbb1256f	1c8749621d19a09b
 pir	ReleaseFast	query	1	1	52e6bf4c59a631f9	0dba0d89ed6fb4ab
 pir	ReleaseFast	reconstruct	1	1	d3e3564c69a176d3	b6ecd96f96e9b339
 # ── opaque and bip32: first harnesses, 2026-09-16 (A1 opaque M5, bip32 M6) ──
-# First pinned 2026-09-17. Each target taints ONE party's secrets, and the
+# First pinned 2026-09-15. Each target taints ONE party's secrets, and the
 # other party runs untainted first, so nothing public on the wire counts as
 # secret. The non-zeros are itemised in each module's SPEC.md § constant time.
 # ⚠ opaque's source pin hashes only modules/opaque/src/root.zig, while the

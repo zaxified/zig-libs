@@ -34,7 +34,7 @@
 //!   65-window signed-digit multiply sharing the comb's recoding and masked
 //!   gather; the 256-iteration ladder it replaced is `mulLadder`, which no
 //!   target drives), with the scalar tainted, over a point decoded AT RUNTIME
-//!   (2026-09-17, A1 R2 — until then the comptime base point, whose per-call
+//!   (2026-09-15, A1 R2 — until then the comptime base point, whose per-call
 //!   table LLVM could fold: a different binary from the ECDH path).
 //! * `comb` — `Secp256k1.combMulBase`, the fixed-base comb that the signing
 //!   path actually calls (`group.zig`, `combMulBaseWithTable`), with the scalar tainted. Its
@@ -61,7 +61,7 @@
 //! never appears, and the majority of `sign`'s contexts are not it):
 //!
 //!   * `group.zig:347` — `mulWithTable`'s trailing `try acc.rejectIdentity()`,
-//!     1 context (2026-09-17, runtime point through `mulInner`; the same point
+//!     1 context (2026-09-15, runtime point through `mulInner`; the same point
 //!     read 2 before `mulInner` existed, the base point 1; the ladder it
 //!     replaced read 2 at `group.zig:277`, LLVM having split the `z == 0` test
 //!     from the affine-identity test).
@@ -268,7 +268,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // builds its (1..8)·p table per call, and a comptime-known `p`
             // lets LLVM fold that table into constants — a different binary
             // from the ECDH path (`sphinx`, `bolt8`) this target stands for.
-            // Measured 2026-09-17 before `mulInner` existed: the base point
+            // Measured 2026-09-15 before `mulInner` existed: the base point
             // read 7/1, this point 8/2 (both in-file contexts the trailing
             // `rejectIdentity`); a secret-digit branch injected into the
             // window loop 9/3, at the injected line. Since `mulInner`: 7/1.

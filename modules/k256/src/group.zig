@@ -293,7 +293,7 @@ pub const Secp256k1 = struct {
         return mulWithTable(&tab, s_, endian);
     }
 
-    /// A1 k256 R1 (re-audit 2026-09-17). The windowed multiply left the u256
+    /// A1 k256 R1 (re-audit 2026-09-15). The windowed multiply left the u256
     /// image of the SECRET scalar on the dead stack twice per call at
     /// ReleaseFast (the ladder before it: once) — compiler-made copies of the
     /// wide shifts in the recoding, not a named local: zeroing `k` itself

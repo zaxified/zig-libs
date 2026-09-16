@@ -96,7 +96,7 @@ fn checkCanceled(io: std.Io) error{Canceled}!void {
 /// cancel that lands before the socket exists is reported by the bind/listen
 /// call itself (its `Syscall.start`). All three entry points used to rename it
 /// `BindFailed`, telling a caller that canceled a session on its way up that
-/// the port was unavailable. Measured: full-gate attempt 5 (2026-09-17),
+/// the port was unavailable. Measured: full-gate attempt 5 (2026-09-15),
 /// `serveUdp` -> `expected error.Canceled, found error.BindFailed`.
 fn bindFailure(err: anyerror) error{ Canceled, BindFailed } {
     return if (err == error.Canceled) error.Canceled else error.BindFailed;
@@ -786,7 +786,7 @@ fn socketSkip(what: []const u8) anyerror {
 
 // ── CueIo: cancel and connect on EVENTS, never after a sleep or on a fixed port
 //
-// Full-gate attempt 5 (2026-09-17, every module lane in parallel) failed
+// Full-gate attempt 5 (2026-09-15, every module lane in parallel) failed
 // `serveUdp: a canceled receive wait …` with `expected error.Canceled, found
 // error.BindFailed`. The test canceled after a fixed 100 ms sleep; under that
 // load the task had not bound its socket yet, the bind's own `Syscall.start`

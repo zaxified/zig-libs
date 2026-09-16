@@ -338,7 +338,7 @@ fn mulBytes(a: []const u8, b: []const u8, out: []u8) void {
 /// byte position unconditionally — the tail loop below runs a FIXED number
 /// of steps (`pos` is a function of `e.len`/`x.len`/`i`, all public per call
 /// site, never of `carry`) instead of stopping early once the secret-derived
-/// carry settles (A1 threshold_ecdsa R2, 2026-09-17: the early exit compiled
+/// carry settles (A1 threshold_ecdsa R2, 2026-09-15: the early exit compiled
 /// to a `cmp $0x100`/`jb` over the tainted running sum).
 fn mulAddBytes(e: []const u8, x: []const u8, addend: []const u8, out: []u8) []u8 {
     std.debug.assert(out.len >= e.len + x.len + 1 and out.len >= addend.len + 1);
@@ -2891,7 +2891,7 @@ fn buildDecoderFixture() DecoderFixture {
 }
 
 /// Bit-for-bit copy of `mulAddBytes` AS IT WAS BEFORE the A1 R2 fix
-/// (2026-09-17): the carry-propagation tail exits as soon as `carry` hits
+/// (2026-09-15): the carry-propagation tail exits as soon as `carry` hits
 /// zero, instead of walking every remaining byte unconditionally. Kept only
 /// here, in the test, as the "old" side of the differential below — the
 /// production function must never regain this shape.

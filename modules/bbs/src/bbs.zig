@@ -1375,7 +1375,7 @@ test "F4 oracle: computeB (sequential) == msmLoop == msmPippenger == computeBPub
     //
     // Debug: measured ~32s for this test ALONE, isolated (dominated by
     // L=300's createGenerators + three separate MSM computations) --
-    // over the campaign's 10s per-test budget (audit A1, 2026-09-17 gate
+    // over the campaign's 10s per-test budget (audit A1, 2026-09-15 gate
     // survey). The large L values (16, 64, 300) are extended coverage past
     // the crossover, not the brief's mandated minimum (0, 1, 2) or the
     // "well past it" boundary (8 already clears msm_crossover == 2 by 4x) --
