@@ -128,12 +128,12 @@ test "blindSign reproduces RFC 9474 Appendix A.1 blind_sig byte-exact (SS7.2 int
     const pk = try kat.publicKey();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x11} ** 32);
     var out: [blindrsa.max_modulus_len]u8 = undefined;
-    const got = try blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, &out);
+    const got = try blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a1.blinded_msg, &out);
     try testing.expectEqualSlices(u8, &kat.a1.blind_sig, got);
     // Different internal blinding randomness, identical output.
     var csprng2 = std.Random.DefaultCsprng.init([_]u8{0x55} ** 32);
     var out2: [blindrsa.max_modulus_len]u8 = undefined;
-    const got2 = try blindrsa.blindSign(sk, pk, csprng2.random(), &kat.a1.blinded_msg, &out2);
+    const got2 = try blindrsa.blindSign(&sk, pk, csprng2.random(), &kat.a1.blinded_msg, &out2);
     try testing.expectEqualSlices(u8, &kat.a1.blind_sig, got2);
 }
 
@@ -142,7 +142,7 @@ test "blindSign reproduces RFC 9474 Appendix A.4 blind_sig byte-exact" {
     const pk = try kat.publicKey();
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x12} ** 32);
     var out: [blindrsa.max_modulus_len]u8 = undefined;
-    const got = try blindrsa.blindSign(sk, pk, csprng.random(), &kat.a4.blinded_msg, &out);
+    const got = try blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a4.blinded_msg, &out);
     try testing.expectEqualSlices(u8, &kat.a4.blind_sig, got);
 }
 
@@ -173,7 +173,7 @@ test "B14: RFC 9474 Appendix A.2 (PSSZERO-Randomized) reproduces every published
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x23} ** 32);
     var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig = try blindrsa.blindSign(sk, pk, csprng.random(), blinded, &blind_sig_buf);
+    const blind_sig = try blindrsa.blindSign(&sk, pk, csprng.random(), blinded, &blind_sig_buf);
     try testing.expectEqualSlices(u8, &kat.a2.blind_sig, blind_sig);
 
     var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
@@ -198,7 +198,7 @@ test "B14: RFC 9474 Appendix A.3 (PSS-Deterministic) reproduces every published 
 
     var csprng = std.Random.DefaultCsprng.init([_]u8{0x24} ** 32);
     var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig = try blindrsa.blindSign(sk, pk, csprng.random(), blinded, &blind_sig_buf);
+    const blind_sig = try blindrsa.blindSign(&sk, pk, csprng.random(), blinded, &blind_sig_buf);
     try testing.expectEqualSlices(u8, &kat.a3.blind_sig, blind_sig);
 
     var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
@@ -226,7 +226,7 @@ test "B1: blindSign surfaces a CRT fault (Bellcore/BDL) as SigningFailure instea
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.SigningFailure,
-        blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, &out),
+        blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a1.blinded_msg, &out),
     );
 }
 
@@ -251,7 +251,7 @@ test "B3: blindSign's own mandatory self-check rejects a pk with the wrong e, in
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.SigningFailure,
-        blindrsa.blindSign(sk, wrong_pk, csprng.random(), &kat.a1.blinded_msg, &out),
+        blindrsa.blindSign(&sk, wrong_pk, csprng.random(), &kat.a1.blinded_msg, &out),
     );
 }
 
@@ -281,7 +281,7 @@ test "B18: even with the pk.n == sk.n assert compiled away (ReleaseFast), a pk w
     var out: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.SigningFailure,
-        blindrsa.blindSign(sk, wrong_pk, csprng.random(), &kat.a1.blinded_msg, &out),
+        blindrsa.blindSign(&sk, wrong_pk, csprng.random(), &kat.a1.blinded_msg, &out),
     );
 }
 
@@ -293,17 +293,17 @@ test "blindSign rejects a wrong-length or out-of-range blinded_msg (RFC 9474 SS4
     // Wrong length (one byte short).
     try testing.expectError(
         error.InvalidBlindedMessage,
-        blindrsa.blindSign(sk, pk, csprng.random(), kat.a1.blinded_msg[1..], &out),
+        blindrsa.blindSign(&sk, pk, csprng.random(), kat.a1.blinded_msg[1..], &out),
     );
     // Right length, but OS2IP(value) >= n (n itself, then all-0xff).
     try testing.expectError(
         error.InvalidBlindedMessage,
-        blindrsa.blindSign(sk, pk, csprng.random(), &kat.n, &out),
+        blindrsa.blindSign(&sk, pk, csprng.random(), &kat.n, &out),
     );
     const too_big = [_]u8{0xff} ** kat.n.len;
     try testing.expectError(
         error.InvalidBlindedMessage,
-        blindrsa.blindSign(sk, pk, csprng.random(), &too_big, &out),
+        blindrsa.blindSign(&sk, pk, csprng.random(), &too_big, &out),
     );
 }
 
@@ -543,11 +543,11 @@ test "blindSign: an out buffer one byte short of the modulus length is an error,
     var too_small_buf: [blindrsa.max_modulus_len]u8 = undefined;
     try testing.expectError(
         error.OutputTooSmall,
-        blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, too_small_buf[0 .. modulus_len - 1]),
+        blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a1.blinded_msg, too_small_buf[0 .. modulus_len - 1]),
     );
 
     var exact_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    _ = try blindrsa.blindSign(sk, pk, csprng.random(), &kat.a1.blinded_msg, exact_buf[0..modulus_len]);
+    _ = try blindrsa.blindSign(&sk, pk, csprng.random(), &kat.a1.blinded_msg, exact_buf[0..modulus_len]);
 }
 
 test "finalize: an out buffer one byte short of ctx.modulus_len is an error, not an assert" {
@@ -663,7 +663,7 @@ test "random-r blind -> blindSign -> finalize -> verify round-trip over the RFC 
         try testing.expect(!std.mem.eql(u8, &kat.a1.blinded_msg, blinded));
 
         var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
-        const blind_sig = try blindrsa.blindSign(sk, pk, random, blinded, &blind_sig_buf);
+        const blind_sig = try blindrsa.blindSign(&sk, pk, random, blinded, &blind_sig_buf);
 
         var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
         const sig = try blindrsa.finalize(pk, Sha384, blind_sig, &ctx, &sig_buf);
@@ -689,7 +689,7 @@ test "full round-trip: fresh rsa.generate() keypair, blind -> blindSign -> final
     const blinded = try blindrsa.blind(kp.public_key, Sha384, prepared_msg, Sha384.digest_length, random, &ctx, &blinded_msg);
 
     var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig = try blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded, &blind_sig_buf);
+    const blind_sig = try blindrsa.blindSign(&kp.secret_key, kp.public_key, random, blinded, &blind_sig_buf);
 
     var sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const sig = try blindrsa.finalize(kp.public_key, Sha384, blind_sig, &ctx, &sig_buf);
@@ -730,7 +730,7 @@ test "B8: separate keys per encoding option round-trip independently (RFC 9474 S
     var blinded_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blinded_pss = try blindrsa.blind(kp_pss.public_key, Sha384, msg_pss, Sha384.digest_length, random, &ctx_pss, &blinded_pss_buf);
     var blind_sig_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig_pss = try blindrsa.blindSign(kp_pss.secret_key, kp_pss.public_key, random, blinded_pss, &blind_sig_pss_buf);
+    const blind_sig_pss = try blindrsa.blindSign(&kp_pss.secret_key, kp_pss.public_key, random, blinded_pss, &blind_sig_pss_buf);
     var sig_pss_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const sig_pss = try blindrsa.finalize(kp_pss.public_key, Sha384, blind_sig_pss, &ctx_pss, &sig_pss_buf);
     try blindrsa.verify(kp_pss.public_key, Sha384, msg_pss, sig_pss, Sha384.digest_length);
@@ -741,7 +741,7 @@ test "B8: separate keys per encoding option round-trip independently (RFC 9474 S
     var blinded_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const blinded_zero = try blindrsa.blind(kp_psszero.public_key, Sha384, msg_zero, 0, random, &ctx_zero, &blinded_zero_buf);
     var blind_sig_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig_zero = try blindrsa.blindSign(kp_psszero.secret_key, kp_psszero.public_key, random, blinded_zero, &blind_sig_zero_buf);
+    const blind_sig_zero = try blindrsa.blindSign(&kp_psszero.secret_key, kp_psszero.public_key, random, blinded_zero, &blind_sig_zero_buf);
     var sig_zero_buf: [blindrsa.max_modulus_len]u8 = undefined;
     const sig_zero = try blindrsa.finalize(kp_psszero.public_key, Sha384, blind_sig_zero, &ctx_zero, &sig_zero_buf);
     try blindrsa.verify(kp_psszero.public_key, Sha384, msg_zero, sig_zero, 0);

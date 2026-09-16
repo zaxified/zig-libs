@@ -81,7 +81,7 @@ noinline fn runBlind() void {
 noinline fn runSign() void {
     var fixed = DeadStackFixedRandom{ .val = &kat.r };
     const random = std.Random.init(&fixed, DeadStackFixedRandom.fill);
-    _ = brsa.blindSign(sk, pk, random, &kat.a1.blinded_msg, &signed) catch unreachable;
+    _ = brsa.blindSign(&sk, pk, random, &kat.a1.blinded_msg, &signed) catch unreachable;
 }
 
 /// Control for the key needles: makes the SAME by-value copy of `sk` the
@@ -240,8 +240,6 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
         const hits_v_le = count(v_le[0..32]);
         const hits_p = count(kat.p[0..32]) + count(p_rev[0..32]);
         const hits_q = count(kat.q[0..32]) + count(q_rev[0..32]);
-        // `p`/`q` reach the stack through `rsa`'s CRT op, not through this
-        // module's own code -- measured at 2 each below a 256 KiB burn.
         var ob: [256]u8 = undefined;
         std.debug.print("  blindSign #{d}: b big-endian={d} b limbs={d} v=b^2 big-endian={d} v limbs={d}; key p={d} q={d}; p limb hits at {s}; dirty below the call {d} B (burn starts at {d})\n", .{
             round,        hits_b_be,                hits_b_le, hits_v_be,
@@ -253,5 +251,13 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
         try std.testing.expectEqual(@as(usize, 0), hits_b_le);
         try std.testing.expectEqual(@as(usize, 0), hits_v_be);
         try std.testing.expectEqual(@as(usize, 0), hits_v_le);
+        // B20: the key's prime factors. These were 2 hits each while
+        // `blindSign` took `rsa.SecretKey` BY VALUE -- an ABI copy made in
+        // the CALLER's frame, which no burn in the callee can reach. The
+        // key-copy control above is their positive control: it still finds
+        // 1 each, so a zero here is the call being clean, not the scan
+        // going blind.
+        try std.testing.expectEqual(@as(usize, 0), hits_p);
+        try std.testing.expectEqual(@as(usize, 0), hits_q);
     }
 }

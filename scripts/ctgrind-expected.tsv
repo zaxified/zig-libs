@@ -372,8 +372,8 @@ montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
 montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
 p256	ReleaseFast	comb	1	1	101bc1fec53c9fa9	9d70061e0f0133d9
 p256	ReleaseFast	sign	1	<=9	61142e54bd8f31ab	af4baed5c5134f3f
-rsa	ReleaseFast	crt	1	<=213	39900744cef42863	d4057b00f9df7b56
-rsa	ReleaseFast	noncrt	1	2	39900744cef42863	d4057b00f9df7b56
+rsa	ReleaseFast	crt	1	<=213	cd9d282d526ba2de	d4057b00f9df7b56
+rsa	ReleaseFast	noncrt	1	2	cd9d282d526ba2de	d4057b00f9df7b56
 slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
 slhdsa	ReleaseFast	prf	1	8	6848022d967ef676	e0fdde7f5c62a2d6
 falcon	ReleaseFast	sign	1	<=133	d6b62d587b79541c	3f5a6dbb61a76d9d
@@ -400,8 +400,8 @@ bls12_381	ReleaseFast	g2_scalarmul	1	8	c58d13bebb766407	7f4e15a241002b3f
 #                `paillier.decrypt` (A5 class), which F5's wider plaintext
 #                reaches (A1 threshold_ecdsa, re-audit 2026-09-17).
 bip340	ReleaseFast	sign	1	<=80	aa70b949dabd149a	0ce3274dc49157be
-blindrsa	ReleaseFast	blind	1	<=493	4924c0445c1f0c3c	4352055809b3f3c7
-blindrsa	ReleaseFast	sign	1	<=218	4924c0445c1f0c3c	4d5e3740a158032d
+blindrsa	ReleaseFast	blind	1	<=493	ec3c73bfc9e557df	4352055809b3f3c7
+blindrsa	ReleaseFast	sign	1	<=218	ec3c73bfc9e557df	4d5e3740a158032d
 # A1 threshold_ecdsa R2 fix (2026-09-17, fixwt/a): `zkproofs.mulAddBytes`'s
 # carry-propagation tail no longer exits early on `carry != 0` (which compiled
 # to `cmp $0x100`/`jb` over the tainted running sum, zkproofs.zig, was :356);

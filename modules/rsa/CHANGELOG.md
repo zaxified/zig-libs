@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **additive API:** `rsadpPtr`, `rsadpCrtPtr`,
+  `rsadpCrtBlindedPtr` and `rsasp1Ptr` take the secret key as
+  `*const SecretKey`. Every existing signature is untouched, so no consumer
+  changes (DECISIONS.md P3). Why they exist: passing a `SecretKey` by value
+  makes an ABI copy at the CALL SITE, in the caller's frame, which no zeroing
+  on either side can reach. `blindrsa`'s dead-stack probe measured it — `p`
+  and `q` readable after `blindSign`, 2 hits each, unaffected by a 512 KiB
+  stack burn because the copy lives above the callee's frames — and 0 through
+  the pointer form. Internally `privateOp`/`privateOpCrt` now forward to
+  pointer-taking twins, and `makeBlinding` takes the key by pointer too, so
+  the key crosses no by-value boundary on the CRT path.
+
 - **2026-09-11** — **Additive: new `decryptOaepHNoFail`** (A1 fix campaign
   round 2, `QUESTIONS-ROUND-2.md` Q4, cross-module with `xmlenc` F3's OAEP
   arm — one commit, both modules). Every existing OAEP entry point

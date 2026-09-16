@@ -87,7 +87,7 @@ pub fn main() !void {
     // Server/issuer: signs the opaque blinded integer, never seeing
     // `prepared1` or `msg1` at all.
     var blind_sig_buf1: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig1 = try blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded1, &blind_sig_buf1);
+    const blind_sig1 = try blindrsa.blindSign(&kp.secret_key, kp.public_key, random, blinded1, &blind_sig_buf1);
 
     // Client: unblind + the mandatory trailing verify, fused in `finalize`.
     var sig_buf1: [blindrsa.max_modulus_len]u8 = undefined;
@@ -109,7 +109,7 @@ pub fn main() !void {
     must(!std.mem.eql(u8, blinded1, blinded2), @src());
 
     var blind_sig_buf2: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig2 = try blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded2, &blind_sig_buf2);
+    const blind_sig2 = try blindrsa.blindSign(&kp.secret_key, kp.public_key, random, blinded2, &blind_sig_buf2);
 
     var sig_buf2: [blindrsa.max_modulus_len]u8 = undefined;
     const sig2 = try blindrsa.finalize(kp.public_key, Sha384, blind_sig2, &ctx2, &sig_buf2);
@@ -141,7 +141,7 @@ pub fn main() !void {
     const blinded3 = try blindrsa.blind(kp_psszero.public_key, Sha384, prepared3, 0, random, &ctx3, &blinded_buf3);
 
     var blind_sig_buf3: [blindrsa.max_modulus_len]u8 = undefined;
-    const blind_sig3 = try blindrsa.blindSign(kp_psszero.secret_key, kp_psszero.public_key, random, blinded3, &blind_sig_buf3);
+    const blind_sig3 = try blindrsa.blindSign(&kp_psszero.secret_key, kp_psszero.public_key, random, blinded3, &blind_sig_buf3);
 
     var sig_buf3: [blindrsa.max_modulus_len]u8 = undefined;
     const sig3 = try blindrsa.finalize(kp_psszero.public_key, Sha384, blind_sig3, &ctx3, &sig_buf3);
@@ -177,7 +177,7 @@ pub fn main() !void {
     // (3) A blinded_msg of the wrong length reaching the SERVER's own
     // entry point — the real untrusted-input shape blindSign meets.
     var out_bad_blinded: [blindrsa.max_modulus_len]u8 = undefined;
-    if (blindrsa.blindSign(kp.secret_key, kp.public_key, random, blinded1[0 .. blinded1.len - 1], &out_bad_blinded)) |_| {
+    if (blindrsa.blindSign(&kp.secret_key, kp.public_key, random, blinded1[0 .. blinded1.len - 1], &out_bad_blinded)) |_| {
         return error.UnexpectedAccept;
     } else |err| switch (err) {
         error.InvalidBlindedMessage => std.debug.print("truncated blinded_msg at the server: InvalidBlindedMessage (expected)\n", .{}),

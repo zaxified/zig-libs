@@ -210,14 +210,17 @@ feeds `blindSign`'s §7.2 blinding factor and `maskedInvert`'s masks.
   region the computation used. The individual `secureZero` calls stay as
   defence in depth, but they are no longer separately observable: the burn
   covers the same bytes, so deleting any one of them leaves the probe green.
-  ⚠ **What the burn cannot reach: the caller's own copy.** `blindSign` takes
-  `rsa.SecretKey` BY VALUE, as does `rsa`'s `rsasp1`/`privateOpCrt`
-  underneath it, and a callee cannot wipe a parameter slot that lives in its
-  caller's frame. Measured on this probe: the prime factors `p` and `q`
-  remain readable there (2 hits each) with the burn and without it, at the
-  same offsets, and a control that only copies the key by value and does
-  nothing else leaves 1 each. Closing that needs the key passed by pointer
-  through both APIs, which is an API change and is recorded, not done.
+  ⚠ **What a burn cannot reach is the caller's own copy — so the key is not
+  copied at all.** A by-value `rsa.SecretKey` argument is copied by the ABI at
+  the CALL SITE, in the caller's frame, where neither side can zero it.
+  Measured (audit B20): while `blindSign` took the key by value and passed it
+  on to `rsa.rsasp1` the same way, the prime factors `p` and `q` were readable
+  after the call, 2 hits each, with the burn and without it, at the same
+  offsets. `blindSign` now takes `*const rsa.SecretKey` and calls
+  `rsa.rsasp1Ptr`, so no copy is made on either boundary: the same probe reads
+  0 for both, while its key-copy control (a call that only copies the key and
+  returns) still finds 1 each, so the zero is the call being clean rather than
+  the scan going blind. Restoring either half brings them back.
   Cost of the burns, ReleaseFast, min of 15: `blind` 2096 µs vs 1959 µs
   without (+7 %), `blindSign` 9084 µs vs 9283 µs (within noise beside a
   4096-bit CRT exponentiation). `secureZero` writes bytewise through a

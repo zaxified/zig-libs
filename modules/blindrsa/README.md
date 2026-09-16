@@ -57,7 +57,7 @@ const blinded_msg = try blindrsa.blind(pk, Sha384, prepared_msg, Sha384.digest_l
 //    prepared_msg. `random` feeds the RFC 9474 §7.2 private-op blinding
 //    (side-channel hardening; the output is deterministic regardless).
 var blind_sig_buf: [blindrsa.max_modulus_len]u8 = undefined;
-const blind_sig = try blindrsa.blindSign(sk, pk, random, blinded_msg, &blind_sig_buf);
+const blind_sig = try blindrsa.blindSign(&sk, pk, random, blinded_msg, &blind_sig_buf);
 
 // 3. Finalize (client): unblind, then verify before trusting the result
 //    (fail-closed — never returns an unverified signature).

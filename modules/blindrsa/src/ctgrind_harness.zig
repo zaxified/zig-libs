@@ -268,7 +268,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // region (it is just KAT bytes here, not derived from anything
             // tainted).
             var out: [blindrsa.max_modulus_len]u8 = undefined;
-            const sig = try blindrsa.blindSign(sk_reloaded, pk, random, &kat.a1.blinded_msg, &out);
+            const sig = try blindrsa.blindSign(&sk_reloaded, pk, random, &kat.a1.blinded_msg, &out);
 
             // Propagation proof: the blind signature is derived from the
             // tainted sk via rsasp1 + the §7.2 unblind multiply.

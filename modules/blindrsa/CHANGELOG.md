@@ -20,11 +20,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   control. Measured: removing either burn brings the factor back, and so does
   dropping `noinline`. No behaviour and no API changed; cost is +7 % on
   `blind` and below noise on `blindSign`.
-  ⚠ Not fixed, and now measured: `blindSign` takes `rsa.SecretKey` by value,
-  so the key's prime factors stay readable in the CALLER's frame (2 hits for
-  `p` and `q`, burn or no burn). A callee cannot wipe its caller's parameter
-  slot; passing the key by pointer would be an API change across `blindrsa`
-  and `rsa`.
+- **2026-09-16** — **API CHANGE:** `blindSign`'s first parameter is now
+  `*const rsa.SecretKey` instead of `rsa.SecretKey` (audit B20). A by-value
+  key is copied by the ABI at the CALL SITE, in the caller's frame, which no
+  zeroing and no stack burn in the callee can reach: the probe read the prime
+  factors `p` and `q` after every `blindSign`, 2 hits each. The call into
+  `rsa` is now `rsasp1Ptr` for the same reason, so the key crosses no
+  by-value boundary. Measured: both needles 0, while the probe's key-copy
+  control still finds 1 each; putting either half back brings them back.
+  Free under the campaign's Q3 ruling (a measured defect forcing a signature
+  change in a module with no consumers) — `blindrsa` has none in zig-libs.
+  Callers pass `&sk`.
 
 - **2026-09-11** — **API CHANGE:** `blind`'s `salt: []const u8` parameter
   becomes `salt_len: usize` (audit finding B16). RFC 9474 §7.4: "these

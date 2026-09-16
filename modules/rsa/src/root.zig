@@ -749,6 +749,10 @@ fn publicOp(pk: PublicKey, in: []const u8, out: []u8) PrimitiveError!void {
 }
 
 fn privateOp(sk: SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
+    return privateOpPtr(&sk, in, out);
+}
+
+fn privateOpPtr(sk: *const SecretKey, in: []const u8, out: []u8) PrimitiveError!void {
     const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
     // Secret exponent -> constant-time montint modexp; d is validated non-zero
     // by `fromPrimes`. (Non-CRT form; `rsadpCrt` is the fast default path.)
@@ -815,7 +819,7 @@ const BlindingFactors = struct { c_blinded: Fe, r_inv: Fe };
 /// and on `r` (a secret-independent random value), so the variable-time inverse
 /// and the `r^e` public modexp leak nothing about the private exponent. `rng`
 /// MUST be cryptographically secure — a predictable `r` voids the masking.
-fn makeBlinding(sk: SecretKey, c: Fe, rng: std.Random) BlindingFactors {
+fn makeBlinding(sk: *const SecretKey, c: Fe, rng: std.Random) BlindingFactors {
     const n_len = byteLen(sk.n.bits());
     var n_be: [max_modulus_len]u8 = undefined;
     sk.n.toBytes(n_be[0..n_len], .big) catch unreachable;
@@ -861,7 +865,15 @@ fn invModN(n_be: []const u8, r_be: []const u8, out: *[max_modulus_len]u8) ?[]con
     return out[0..];
 }
 
+/// By-value form, kept for the existing public API. ⚠ The copy it makes lives
+/// in the CALLER's frame, where nothing this module runs can zero it (audit
+/// `blindrsa` B20, and `paillier` F2 before it) — a caller that cares reaches
+/// for the `*Ptr` entry points instead.
 fn privateOpCrt(sk: SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
+    return privateOpCrtPtr(&sk, in, out, blinding);
+}
+
+fn privateOpCrtPtr(sk: *const SecretKey, in: []const u8, out: []u8, blinding: Blinding) PrimitiveError!void {
     const c = Fe.fromBytes(sk.n, in, .big) catch return error.MessageRepresentativeOutOfRange;
 
     // F2 (base blinding): with `.csprng`, run the CRT op on c' = c·r^e mod n
@@ -975,6 +987,46 @@ pub fn rsadpCrtBlinded(comptime modulus_len: usize, c: [modulus_len]u8, sk: Secr
 /// The real implementation should route through `rsadpCrt` for performance.
 pub fn rsasp1(comptime modulus_len: usize, m: [modulus_len]u8, sk: SecretKey) PrimitiveError![modulus_len]u8 {
     return rsadpCrt(modulus_len, m, sk);
+}
+
+// ── the same three primitives, with the key BY POINTER ──────────────────────
+//
+// ⛔ WHY THEY EXIST, measured twice. Passing a `SecretKey` by value makes an
+// ABI-level copy AT THE CALL SITE, i.e. in the caller's own frame. Neither
+// side can zero it: the caller does not know where the ABI put it, and the
+// callee's zeroing only reaches its own copy. `paillier` F2 hit this exact
+// wall (a 512 B `Fe` crossing into `std.crypto.ff`) and closed it by taking
+// pointers; `blindrsa`'s probe then measured the same thing one layer up —
+// `p` and `q` readable in the caller's frame after `blindSign`, with a stack
+// burn and without it, at the same offsets.
+//
+// These are ADDITIVE: every existing signature is untouched, so this costs no
+// consumer anything (zig-libs DECISIONS.md P3).
+
+/// `rsadp` with the key by pointer — see the note above.
+pub fn rsadpPtr(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    comptime std.debug.assert(modulus_len <= max_modulus_len);
+    var out: [modulus_len]u8 = undefined;
+    try privateOpPtr(sk, &c, &out);
+    return out;
+}
+
+/// `rsadpCrt` with the key by pointer — see the note above.
+pub fn rsadpCrtPtr(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    return rsadpCrtBlindedPtr(modulus_len, c, sk, .none);
+}
+
+/// `rsadpCrtBlinded` with the key by pointer — see the note above.
+pub fn rsadpCrtBlindedPtr(comptime modulus_len: usize, c: [modulus_len]u8, sk: *const SecretKey, blinding: Blinding) PrimitiveError![modulus_len]u8 {
+    comptime std.debug.assert(modulus_len <= max_modulus_len);
+    var out: [modulus_len]u8 = undefined;
+    try privateOpCrtPtr(sk, &c, &out, blinding);
+    return out;
+}
+
+/// `rsasp1` with the key by pointer — see the note above.
+pub fn rsasp1Ptr(comptime modulus_len: usize, m: [modulus_len]u8, sk: *const SecretKey) PrimitiveError![modulus_len]u8 {
+    return rsadpCrtPtr(modulus_len, m, sk);
 }
 
 // ── P1: EMSA-PKCS1-v1_5 sign / verify (RFC 8017 §8.2, §9.2) ─────────────────

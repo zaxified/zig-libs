@@ -23,6 +23,20 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   `decryptOaepHBlinded`) is unchanged — additive only, per `QUESTIONS-ROUND-2.md` Q4 ("aditivní
   nová funkce v `rsa`, dnešní API se nemění").
 - **P3** `signPss`/`verifyPss` (RSASSA-PSS, RFC 8017 §8.1, branch-clean verify).
+- **Secret-key entry points come in two shapes, and the pointer one is not
+  decoration.** `rsadp`/`rsadpCrt`/`rsadpCrtBlinded`/`rsasp1` take a
+  `SecretKey` BY VALUE; `rsadpPtr`/`rsadpCrtPtr`/`rsadpCrtBlindedPtr`/
+  `rsasp1Ptr` take `*const SecretKey` and are otherwise identical. A by-value
+  argument is copied by the ABI **at the call site**, i.e. into the CALLER's
+  own frame, where neither side can zero it: the callee does not know the
+  address, and the caller does not know the layout. Measured by `blindrsa`'s
+  dead-stack probe (audit B20): with `blindSign` calling `rsasp1` by value the
+  prime factors `p` and `q` were readable after the call, 2 hits each, and a
+  stack burn made no difference because the copy sits ABOVE the callee's
+  frames; through `rsasp1Ptr` the same probe reads 0. `paillier` F2 hit the
+  identical wall one layer down and closed it the same way. Prefer the `*Ptr`
+  forms wherever the key is long-lived.
+
 - **P4a** DER/PEM key parsing (`PublicKey.fromDer`/`fromPem`, `SecretKey.fromDer`/`fromPkcs8`/
   `fromPem`, cleartext PEM only).
 - **P4b** OpenSSH `PROTOCOL.key` private-key parsing (`fromOpenSSH`: unencrypted and
