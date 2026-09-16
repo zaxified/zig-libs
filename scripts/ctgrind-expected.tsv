@@ -464,8 +464,8 @@ threshold_ecdsa	ReleaseFast	betaprime	1	<=313	e932a70c2bfffc2e	0d9a7f3232367fc7
 # still be printed -- so "the harness never called the module" is still caught.
 bulletproofs	ReleaseFast	rangeproof	1	0	3e0167b9b68ce90f	RANDOMIZED
 bulletproofs	ReleaseFast	ipa	1	0	dd382e4324993825	2368a5d0e07e2233
-paillier	ReleaseFast	crt	1	<=331	8121b95486f955cf	0435e5d4ba4d462a
-paillier	ReleaseFast	noncrt	1	<=141	8121b95486f955cf	0435e5d4ba4d462a
+paillier	ReleaseFast	crt	1	<=331	8121b95486f955cf	ca16fc01b4ebb44c
+paillier	ReleaseFast	noncrt	1	<=141	8121b95486f955cf	ca16fc01b4ebb44c
 paillier	ReleaseFast	mul	1	<=12	8121b95486f955cf	b2221403ad3dad41
 paillier	ReleaseFast	addm	1	<=10	8121b95486f955cf	526f0de009c0cbfb
 # tlock/ibe re-pinned 2026-09-16, after 32e751ad (inversion-free Miller loop):
@@ -500,7 +500,7 @@ musig2	ReleaseFast	sign	1	<=101	a4d62ba84a4d5c2f	2a2f275cd0c5c7c5
 # canonicality on taproot's own root.zig:274/281.
 taproot	ReleaseFast	secret	1	9	9a99856cbd266475	966e0c7b70c18936
 adaptor	ReleaseFast	presign	1	<=90	ec23485c29a9e90b	d3d7ee2d921fc316
-adaptor	ReleaseFast	adapt	1	2	ec23485c29a9e90b	66cea32f3753dee0
+adaptor	ReleaseFast	adapt	1	2	ec23485c29a9e90b	6e42ff967657d98e
 adaptor	ReleaseFast	extract	1	3	ec23485c29a9e90b	76dc1be38fd7746f
 spake2plus	ReleaseFast	w0w1	1	4	98d3a68346d3d767	5530136493ed4097
 spake2plus	ReleaseFast	computel	1	3	98d3a68346d3d767	37d06a2f53487905
@@ -508,8 +508,8 @@ spake2plus	ReleaseFast	proverstart	1	7	98d3a68346d3d767	5b3e4131495365d6
 spake2plus	ReleaseFast	verifierstart	1	7	98d3a68346d3d767	ce61814fc8e1b2b7
 spake2plus	ReleaseFast	proverfinish	1	12	98d3a68346d3d767	5cdf0fe20429a208
 spake2plus	ReleaseFast	verifierfinish	1	10	98d3a68346d3d767	dbdff43379a90cf5
-bbs	ReleaseFast	sign	1	<=47	d86719a46eb0093c	a147c158e7c878af
-bbs	ReleaseFast	proofgen	1	<=134	d86719a46eb0093c	61ed4182d62a0b91
+bbs	ReleaseFast	sign	1	<=47	d86719a46eb0093c	2f5b06d6bd92ab96
+bbs	ReleaseFast	proofgen	1	<=134	d86719a46eb0093c	01535db4bf6b0ff6
 coconut	ReleaseFast	authority_sign	1	<=69	04e312f73ccbddb6	3492f1201b641f09
 coconut	ReleaseFast	user_issue	1	3	a6281f1d04b2a243	af24664cb307a403
 coconut	ReleaseFast	user_show	1	<=51	04e312f73ccbddb6	c75d6d631d2311f7
@@ -527,7 +527,7 @@ signal	ReleaseFast	ratchet	1	2	9e8bc13ebe2fbdb4	92ab00fad0ce5c41
 # `rejectIdentity` at group.zig:347 via `mulInner`, exactly k256/mul's 2 -> 1.
 # The rest are unchanged: comb `rejectIdentity` x2, std scalar canonicality x2,
 # std `cmovznzU64` x2.
-sphinx	ReleaseFast	construct	1	8	e6f03464d0ef9fbd	bcc017806cc2a5dd
+sphinx	ReleaseFast	construct	1	8	e6f03464d0ef9fbd	cb364f94f78ea089
 sphinx	ReleaseFast	process	1	<=43	e6f03464d0ef9fbd	e7c50d755f64b027
 bolt3	ReleaseFast	derive	1	7	d4906365cc4de792	c0fc92c5fbd8fb55
 bolt3	ReleaseFast	revocation	1	10	d4906365cc4de792	bc9bf12a55a312c4
@@ -638,7 +638,7 @@ opaque	ReleaseFast	serverke2	1	2	e450b1638d83989c	4ef279b842b3cb55
 # bip32 mnemonic 3 is the M6-CT tree (8c2f1aa4, constant-time `wordIndex`).
 # The three are the mnemonic split plus two accept/reject verdicts, not the
 # word search.
-bip32	ReleaseFast	master	1	1	da144758a15f2f06	9f1dc01629af6413
-bip32	ReleaseFast	derive	1	5	da144758a15f2f06	5fd3576c9577a7c5
+bip32	ReleaseFast	master	1	1	da144758a15f2f06	7e14466ed98567fa
+bip32	ReleaseFast	derive	1	5	da144758a15f2f06	8b410bdbd3955f08
 bip32	ReleaseFast	seed	1	0	008c60b09bb381e3	9e74b23db4ad7bdc
 bip32	ReleaseFast	mnemonic	1	3	008c60b09bb381e3	d42db8cf9cdc2200
