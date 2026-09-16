@@ -5,6 +5,38 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-16** — **BEHAVIOURAL (refuses one input it used to accept) + bug fix:** the A1 drift
+  audit of everything that landed after `7888f3f5`, findings M1 and M2. Both were demonstrated
+  with a probe before anything was changed.
+  **M1 (MED): `Broker.publish` had no outbound size bound.** Every subscriber's `tx_buf` is sized
+  from `max_packet_size`, and an inbound PUBLISH can never exceed it because `rx_buf` is exactly
+  that size — so the client path could not overflow a delivery, and nothing bounded a
+  server-originated one. Measured at `max_packet_size = 64`: a 200-byte `publish` **returned
+  success to the caller** while every matching subscriber was disconnected with its socket closed,
+  because `deliverLocked` fails with `BufferTooSmall` and `fanout` contains that as a
+  per-subscriber failure. ⛔ With `retain` it outlived the call — the message sat in the retained
+  store as a permanent trap and killed each *later* subscriber at SUBSCRIBE, where retained
+  delivery is a `try`, not containment. `publish` now measures the packet with the new
+  `packet.publishWireLen` and refuses `error.PayloadTooLarge` past `max_packet_size`, which is the
+  same limit the receiving side is held to — and what this function's own doc comment already
+  claimed about topics: a server cannot put on the wire what it would reject off it. The
+  remaining-length arithmetic was factored into one `publishRemaining`, so the check cannot drift
+  away from the encoder it predicts.
+  **M2 (LOW): the dying client was written its own Will.** `remove()` published the Will *before*
+  the lock that drops the connection's subscriptions and marks it `.disconnected`, so `fanout`
+  still counted it as a live subscriber. Measured: a client subscribed to its own will topic
+  received it, on a socket about to be freed. The Will is now published after that block. It still
+  cannot go *inside* it — `fanout` takes the same non-reentrant spinlock — which is why the
+  ordering existed at all.
+  Four regressions added (oversize refused and subscriber untouched · the `retain` arm leaves no
+  trap · a publish that exactly fills `max_packet_size` is still delivered, one byte more is not ·
+  the bound follows QoS, since QoS 1 carries a packet id and is two bytes tighter · the dying
+  client hears nothing while a bystander still hears the Will). Mutants, each RED: the bound
+  disabled (3 fail), off by one `>=` (2 fail — both exact-fit tests), the QoS term dropped from
+  `publishRemaining` (16 fail, blunt because the helper is shared with the encoder — which is the
+  point of sharing it), and the Will moved back before the lock (1 fail). `scripts/modtest mqtt`
+  **95/96** (1 skip) in Debug and ReleaseFast, `zig build portable-mqtt-linux32` OK.
+
 - **2026-09-11** — `Connection.keepAlive()` and `Connection.willOpt()`. Both are things a *bridging*
   consumer needs and could previously only get by reaching into fields: the keep-alive so the two
   halves of one logical connection do not time out on different schedules, and the Will because a

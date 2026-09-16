@@ -144,6 +144,11 @@ pub const Error = error{
     TooManySubscriptions,
     /// `accept` refused a new connection: `Config.max_connections` reached.
     ConnectionLimitReached,
+    /// `Broker.publish` was handed a message whose PUBLISH would not fit
+    /// `Config.max_packet_size` — the same limit an inbound packet is held to
+    /// (A1 mqtt M1). Refused here rather than discovered per subscriber,
+    /// where a re-encode failure disconnects that subscriber instead.
+    PayloadTooLarge,
     OutOfMemory,
 } || packet.DecodeError || packet.EncodeError;
 
@@ -811,16 +816,6 @@ pub const Broker = struct {
     /// in-flight fan-out writers to release their references (FIX A), then free
     /// its memory. Idempotent w.r.t. subscriptions.
     pub fn remove(b: *Broker, conn: *Connection) void {
-        // The Will, if this connection still has one (spec 3.1.2.5): every way
-        // of arriving here except a DISCONNECT is an ungraceful end — a dead
-        // socket, a protocol violation, a keep-alive expiry, a session
-        // take-over. `handle` drops the will on a clean DISCONNECT, so whatever
-        // survives to here is by definition unannounced.
-        //
-        // Done before the lock below, not inside it: `publishWill` fans out and
-        // `fanout` takes `b.mutex` itself, which is a spinlock and not
-        // reentrant.
-        b.publishWill(conn);
         {
             b.mutex.lock();
             defer b.mutex.unlock();
@@ -830,6 +825,22 @@ pub const Broker = struct {
             }
             conn.state = .disconnected;
         }
+        // The Will, if this connection still has one (spec 3.1.2.5): every way
+        // of arriving here except a DISCONNECT is an ungraceful end — a dead
+        // socket, a protocol violation, a keep-alive expiry, a session
+        // take-over. `handle` drops the will on a clean DISCONNECT, so whatever
+        // survives to here is by definition unannounced.
+        //
+        // NOT inside the lock above: `publishWill` fans out, and `fanout` takes
+        // `b.mutex` itself, which is a spinlock and not reentrant.
+        //
+        // And AFTER that block, not before it (A1 mqtt M2): until this
+        // connection is out of the subscription index and off `.connected`,
+        // `fanout` still counts it as a live subscriber and writes the Will
+        // back to the very client whose death it announces. Measured: a client
+        // subscribed to its own will topic was written its own Will, on a
+        // socket about to be freed.
+        b.publishWill(conn);
         // Unlinked under the lock above (and dropped from the index), so no new
         // fan-out reference can be taken. Drain the outstanding ones before we
         // free the connection's memory — a concurrent PUBLISH mid-write must
@@ -930,6 +941,32 @@ pub const Broker = struct {
     ) Error!void {
         if (qos == .exactly_once) return error.ProtocolViolation;
         topic.validateName(topic_name) catch return error.ProtocolViolation;
+
+        // A1 mqtt M1. Every subscriber's `tx_buf` is sized from
+        // `max_packet_size`, and an INBOUND publish can never exceed it
+        // because `rx_buf` is exactly that size — so the client path could not
+        // overflow a delivery, and nothing here bounded one. The failure mode
+        // was silent and wholesale: `deliverLocked` returns `BufferTooSmall`,
+        // `fanout` contains it as a per-subscriber failure, and EVERY matching
+        // subscriber is disconnected while this call still returns success.
+        // With `retain` it outlived the call — the message sat in the retained
+        // store and killed each later subscriber at SUBSCRIBE, where retained
+        // delivery is a `try`, not per-subscriber containment.
+        //
+        // So the sender is held to the receiver's limit, which is exactly what
+        // this function's doc comment already claims about topics: a server
+        // cannot put on the wire what it would reject off it.
+        // `publishWireLen` sizes the packet-id field from `qos` alone — the id
+        // VALUE never affects the size — and delivery is at `min(qos, granted)`,
+        // never above `qos`, so a subscriber's copy can never be larger than
+        // what this measures.
+        const wire = packet.publishWireLen(.{
+            .topic = topic_name,
+            .payload = payload,
+            .qos = qos,
+        }) catch return error.PayloadTooLarge;
+        if (wire > b.config.max_packet_size) return error.PayloadTooLarge;
+
         try b.fanout(.{
             .topic = topic_name,
             .payload = payload,
@@ -3453,4 +3490,127 @@ test "⛔ willOpt goes null after a clean DISCONNECT — it is the gracefulness 
     try testing.expectEqual(Disposition.close, try b.process(conn, 0));
     try testing.expectEqual(@as(?packet.Will, null), conn.willOpt());
     b.remove(conn);
+}
+
+test "A1 M1: an oversized server publish is refused, not paid for by every subscriber" {
+    // Before the fix `publish` returned success and `fanout` then disconnected
+    // EVERY matching subscriber, because `deliverLocked` could not encode into
+    // a `tx_buf` sized from `max_packet_size`. The caller was told nothing.
+    const cfg = Config{ .max_packet_size = 64 };
+    var b = Broker.init(testing.allocator, cfg);
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_most_once }});
+    _ = (try ts.next()).?; // SUBACK
+
+    var payload: [200]u8 = undefined;
+    @memset(&payload, 'z');
+
+    try testing.expectError(error.PayloadTooLarge, b.publish("t", &payload, .at_most_once, false));
+    // The subscriber is untouched: still connected, socket open, nothing written.
+    try testing.expectEqual(Connection.State.connected, s.state);
+    try testing.expect(!ts.closed);
+    try testing.expectEqual(@as(?packet.Packet, null), try ts.next());
+
+    // ⛔ The `retain` arm was the worse one: the message used to sit in the
+    // retained store and kill each LATER subscriber at SUBSCRIBE, where
+    // retained delivery is a `try` rather than per-subscriber containment.
+    try testing.expectError(error.PayloadTooLarge, b.publish("t", &payload, .at_most_once, true));
+    var ts2 = TestTransport{};
+    const s2 = try connectClient(&b, &ts2, "S2", 60, 0);
+    try feedSubscribe(&b, s2, 1, &.{.{ .filter = "t", .qos = .at_most_once }});
+    const suback = (try ts2.next()).?; // survives its own SUBSCRIBE
+    try testing.expect(suback == .suback);
+    try testing.expectEqual(@as(?packet.Packet, null), try ts2.next()); // nothing retained
+
+    b.remove(s);
+    b.remove(s2);
+}
+
+test "A1 M1: a server publish that exactly fills max_packet_size is still delivered" {
+    // The bound must not over-reject. QoS 0: header(1) + remaining-length(1) +
+    // topic(2+1) + payload(59) = 64 = max_packet_size, and one byte more is
+    // refused — so the limit is the receiver's limit, not a conservative guess.
+    const cfg = Config{ .max_packet_size = 64 };
+    var b = Broker.init(testing.allocator, cfg);
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_most_once }});
+    _ = (try ts.next()).?; // SUBACK
+
+    var payload: [59]u8 = undefined;
+    @memset(&payload, 'z');
+    try b.publish("t", &payload, .at_most_once, false);
+    const got = (try ts.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqualSlices(u8, &payload, got.publish.payload);
+    try testing.expectEqual(Connection.State.connected, s.state);
+
+    var over: [60]u8 = undefined;
+    @memset(&over, 'z');
+    try testing.expectError(error.PayloadTooLarge, b.publish("t", &over, .at_most_once, false));
+
+    b.remove(s);
+}
+
+test "A1 M2: the dying client is not written its own Will; other subscribers are" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    // The doomed client subscribes to its own will topic...
+    var dying_tt: TestTransport = .{};
+    const dying = try connectWithWill(&b, &dying_tt, "dying", .{ .topic = "sn/1/status", .message = "gone" });
+    try feedSubscribe(&b, dying, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+    _ = (try dying_tt.next()).?; // SUBACK
+
+    // ...and so does a bystander, who must still hear it.
+    var other_tt: TestTransport = .{};
+    const other = try connectClient(&b, &other_tt, "other", 0, 0);
+    try feedSubscribe(&b, other, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+    _ = (try other_tt.next()).?; // SUBACK
+
+    b.remove(dying); // ungraceful end: no DISCONNECT
+
+    const heard = (try other_tt.next()).?;
+    try testing.expect(heard == .publish);
+    try testing.expectEqualStrings("sn/1/status", heard.publish.topic);
+    try testing.expectEqualStrings("gone", heard.publish.payload);
+    // The client whose death it announces was written nothing at all.
+    try testing.expectEqual(@as(?packet.Packet, null), try dying_tt.next());
+
+    b.remove(other);
+}
+
+test "A1 M1: the bound follows QoS — a QoS1 server publish is two bytes tighter" {
+    // The wire size of a PUBLISH depends on `qos` (QoS > 0 carries a packet
+    // id), so a bound measured at QoS 0 would let a QoS 1 message through two
+    // bytes over the limit. QoS 1: header(1) + remaining-length(1) + topic(2+1)
+    // + id(2) + payload(57) = 64 = max_packet_size — the same arithmetic the
+    // "FIX B: a max-size QoS1 publish" test pins from the inbound side.
+    const cfg = Config{ .max_packet_size = 64 };
+    var b = Broker.init(testing.allocator, cfg);
+    defer b.deinit();
+    var ts = TestTransport{};
+    const s = try connectClient(&b, &ts, "S", 60, 0);
+    try feedSubscribe(&b, s, 1, &.{.{ .filter = "t", .qos = .at_least_once }});
+    _ = (try ts.next()).?; // SUBACK
+
+    var fits: [57]u8 = undefined;
+    @memset(&fits, 'z');
+    try b.publish("t", &fits, .at_least_once, false);
+    const got = (try ts.next()).?;
+    try testing.expect(got == .publish);
+    try testing.expectEqual(packet.QoS.at_least_once, got.publish.qos);
+    try testing.expectEqualSlices(u8, &fits, got.publish.payload);
+
+    // 58 bytes is 65 on the wire at QoS 1 — refused, though it would have fit
+    // at QoS 0.
+    var over: [58]u8 = undefined;
+    @memset(&over, 'z');
+    try testing.expectError(error.PayloadTooLarge, b.publish("t", &over, .at_least_once, false));
+    try testing.expectEqual(Connection.State.connected, s.state);
+
+    b.remove(s);
 }

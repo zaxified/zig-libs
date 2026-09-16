@@ -391,12 +391,35 @@ pub fn encodeConnack(buf: []u8, c: Connack) EncodeError![]const u8 {
     return cur.done();
 }
 
+/// The remaining-length field a PUBLISH for `p` carries — the ONE place that
+/// arithmetic lives, so a caller that needs the size BEFORE it has a buffer
+/// (`publishWireLen`) cannot drift away from the encoder that produces it.
+fn publishRemaining(p: Publish) u64 {
+    var remaining: u64 = 2 + @as(u64, p.topic.len) + p.payload.len;
+    if (p.qos != .at_most_once) remaining += 2;
+    return remaining;
+}
+
+/// Wire size of the PUBLISH `encodePublish` would produce for `p`, without
+/// encoding it (and without needing a buffer that size).
+///
+/// Exists so a SENDER can hold its own message to the same limit a receiver
+/// holds an inbound one to, before handing it to a fan-out that has no way to
+/// report a per-subscriber encode failure back to it — `broker.zig`'s
+/// `Broker.publish` (A1 mqtt M1). `error.PacketTooLarge` if the message
+/// cannot be expressed as a PUBLISH at all.
+pub fn publishWireLen(p: Publish) EncodeError!usize {
+    const rl = try checkedRemaining(publishRemaining(p));
+    var tmp: [4]u8 = undefined;
+    const n = try encodeRemainingLength(&tmp, rl);
+    return 1 + n + rl;
+}
+
 /// Encode PUBLISH (spec 3.3). QoS > 0 requires a nonzero `packet_id`;
 /// the DUP flag is cleared for QoS 0 (spec 3.3.1.1).
 pub fn encodePublish(buf: []u8, p: Publish) EncodeError![]const u8 {
     if (p.qos != .at_most_once and p.packet_id == 0) return error.InvalidPacketId;
-    var remaining: u64 = 2 + @as(u64, p.topic.len) + p.payload.len;
-    if (p.qos != .at_most_once) remaining += 2;
+    const remaining = publishRemaining(p);
 
     var flags: u4 = @as(u4, @intFromEnum(p.qos)) << 1;
     if (p.dup and p.qos != .at_most_once) flags |= 0x8;

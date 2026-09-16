@@ -50,9 +50,16 @@ QoS 2 and DUP retransmit and Will/LWT are implemented, but the **broker's** firs
 omits QoS 2 (an inbound QoS 2 PUBLISH is a protocol violation that tears the connection down),
 persistent/offline sessions, and DUP retransmit of an unacked outbound publish. **Will/LWT is no
 longer deferred** (2026-09-11): the broker keeps the will from CONNECT, publishes it on any
-ungraceful end and discards it on a clean DISCONNECT (3.1.2.5, 3.14.4). `Broker.publish`
-(2026-09-11) lets the server originate a message with no client behind it — same retained-store and
-fan-out path, but no ACL call and no `onPublishFn` tap, since neither has a connection to be about.
+ungraceful end and discards it on a clean DISCONNECT (3.1.2.5, 3.14.4). The publish happens *after*
+the connection has left the subscription index (2026-09-16, A1 M2), so the dying client is not
+written its own Will; it still cannot happen under the registry lock, which `fanout` takes itself.
+`Broker.publish` (2026-09-11) lets the server originate a message with no client behind it — same
+retained-store and fan-out path, but no ACL call and no `onPublishFn` tap, since neither has a
+connection to be about. It is held to `max_packet_size` like a receiver (2026-09-16, A1 M1): an
+inbound PUBLISH cannot exceed that bound because `rx_buf` is exactly that size, and a
+server-originated one that did used to return SUCCESS while disconnecting every matching
+subscriber — and, with `retain`, kill every later subscriber at SUBSCRIBE. It now refuses
+`error.PayloadTooLarge`.
 
 ## Broker: production-hardened
 The broker was a functional first cut hardened against the trivial DoS/resource-exhaustion vectors
