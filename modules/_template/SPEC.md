@@ -46,6 +46,12 @@ Where the expected values in the tests come from. Distinguish, in these words:
   a typo; does **not** catch a shared misreading of the spec.
 - **Self** — we wrote the expected values from our own reading.
 
+⚠ An external anchor is produced by an INSTRUMENT, and that instrument is part
+of the module: it lives in `src/` if it is pure Zig, in `modules/<name>/tools/`
+if it needs a foreign toolchain (`CONVENTIONS.md` §9), and never in a scratch
+directory. An anchor whose producer cannot be re-run is a number nobody can
+check — name the file here.
+
 ⚠ Never record a design reference ("we looked at how X does it") as an anchor.
 State the grade in the machine-checked form `check-catalog` reads:
 

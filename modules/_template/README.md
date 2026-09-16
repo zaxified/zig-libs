@@ -61,6 +61,24 @@ live in §2–§8.
 10. **Third-party material** — a *studied* design reference gets an entry in the
    root `NOTICE`; *ported* source puts its terms in `modules/<name>/NOTICE`
    instead, never in the root file.
+10a. **Anything you build to CHECK this module lives here too** (`CONVENTIONS.md`
+   §9) — a mutation runner, an oracle that recomputes the answer another way, a
+   hostile stand-in peer, a capture script, a benchmark. Pure-Zig instruments go
+   in `src/`; one that needs a **foreign toolchain** (a C compiler, a Python, a
+   container, a system library) goes in `modules/<name>/tools/`, never in `src/`,
+   because a module must stay standalone Zig. Give each a header saying what it
+   answers, what it needs and what it produces, and say in `tools/README.md` why
+   *that* instrument rather than a test.
+   ⛔ **Not in `.zig-cache/`, and not pasted into an audit document.** That
+   directory is documented as deletable at any moment, so an instrument parked
+   there is outside every gate, is never rebuilt, and is the first thing deleted
+   when a disk fills up. Measured 2026-09-16: 11.2 GB of audit working trees had
+   accumulated there, carrying ~137 instruments nothing in the tree referenced.
+   A foreign reference implementation is **driven, not vendored**: keep the clone
+   recipe (URL, tag, build commands) in `tools/README.md` and the checkout itself
+   somewhere disposable — see `modules/hqc/tools/` for the worked example, and
+   `modules/uci/tools/capture-grammar.sh` for one whose reference is copyleft and
+   may therefore be run but never read.
 11. **Run it** — `zig build test-<name>`, then `zig build test` (or
    `scripts/test.sh changed`), green in **Debug and ReleaseFast**, and
    `zig fmt --check modules/<name>` clean. Once per clone:
