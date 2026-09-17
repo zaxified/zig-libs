@@ -81,7 +81,9 @@
 //!   the synchronous `on_audit` hook on every single denial — and the
 //!   churn evicts other clients' pending `suppressed` counts. Set
 //!   `Options.throttle_key` (or front the server with a proxy) if the
-//!   sink must be bounded against that. SPEC.md states this; the summary
+//!   sink must be bounded against that — `KeyFn` is handed a scratch
+//!   buffer precisely so the peer-only policy can be written without a
+//!   shared buffer, and `formatPeerKey` renders the address for it. SPEC.md states this; the summary
 //!   here used to claim the opposite ("an unauthenticated flood cannot
 //!   flood the audit sink").
 //!   Keys follow the
@@ -305,9 +307,25 @@ pub const AuditFn = *const fn (ctx: ?*anyopaque, entry: AuditEntry) void;
 /// Custom throttle-key extraction (overrides the forwarded-IP chain).
 /// Must return a key valid for the duration of the call (the store copies
 /// what it keeps).
+///
+/// `buf` is scratch owned by the calling thread, for a key that has to be
+/// FORMATTED rather than borrowed from the request. It exists because the
+/// obvious safe policy — key by the socket peer and ignore forwarded headers
+/// — needs somewhere to render the address, and the alternatives are all
+/// wrong: `router.Ctx` carries no allocator or scratch, a buffer owned by the
+/// `KeyFn` itself is shared across the server's per-connection threads, and a
+/// slice of a stack local does not outlive the callback. Without it this
+/// module documented a mitigation no caller could implement race-free
+/// (reported by a consumer, 2026-09-17). Returning a slice that borrows the
+/// request (`ctx.req.path`, a header value) is still fine — ignore `buf` then.
+///
+///     fn peerOnly(_: ?*anyopaque, c: *router.Ctx, buf: *[client_key_len_max]u8) []const u8 {
+///         const peer = c.req.peerAddress() orelse return "(no-client-ip)";
+///         return formatPeerKey(peer, buf);
+///     }
 pub const KeyFn = struct {
     ctx: ?*anyopaque = null,
-    keyFor: *const fn (?*anyopaque, *router.Ctx) []const u8,
+    keyFor: *const fn (?*anyopaque, *router.Ctx, *[client_key_len_max]u8) []const u8,
 };
 
 /// Route exemption: a predicate over the request (same shape as `KeyFn`).
@@ -965,6 +983,12 @@ fn clampKey(v: []const u8, buf: *[client_key_len_max]u8) []const u8 {
 /// Format a peer IP as a stable key: dotted quad for IPv4 (including
 /// IPv4-mapped IPv6, unmapped), full uncompressed hex groups for IPv6
 /// (RFC 5952 compression is irrelevant for a map key — determinism is).
+///
+/// Public as `formatPeerKey` because `KeyFn`'s whole reason for existing is
+/// the peer-only policy, and a caller writing that callback would otherwise
+/// re-derive the IPv4-mapped-IPv6 unification by hand.
+pub const formatPeerKey = formatPeerIp;
+
 fn formatPeerIp(peer: std.Io.net.IpAddress, buf: *[client_key_len_max]u8) []const u8 {
     switch (peer) {
         .ip4 => |a| return formatV4(a.bytes, buf),
@@ -1077,7 +1101,7 @@ fn authedEntry(ctx: *router.Ctx, ident: *const Identity, status: u16) AuditEntry
 fn auditDenied(g: *Gate, ctx: *router.Ctx) void {
     if (g.on_audit == null) return; // no sink — nothing to protect either
     var key_buf: [client_key_len_max]u8 = undefined;
-    const key = if (g.throttle_key) |k| k.keyFor(k.ctx, ctx) else clientKey(ctx.req, &key_buf);
+    const key = if (g.throttle_key) |k| k.keyFor(k.ctx, ctx, &key_buf) else clientKey(ctx.req, &key_buf);
     const folded = g.deniedDecision(key) orelse return; // coalesced
     g.emit(.{
         .method = ctx.req.method,
@@ -1283,6 +1307,100 @@ test "throttle: coalesces one key within the window, folds the suppressed count 
     try testing.expectEqual(@as(?u64, 2), g.deniedDecision("1.2.3.4"));
     // Counter reset after an admitted entry.
     try testing.expectEqual(@as(?u64, null), g.deniedDecision("1.2.3.4"));
+}
+
+/// A `throttle_key` that goes straight to the socket peer and ignores every
+/// forwarded header — the policy the module doc recommends for a service that
+/// nothing proxies. It is written here to prove the recommendation can be
+/// FOLLOWED: before the scratch buffer existed, `keyFor` had nowhere to render
+/// the address, and the alternatives were a buffer shared across the server's
+/// per-connection threads or a slice of a dead stack frame.
+fn peerOnlyKey(_: ?*anyopaque, ctx: *router.Ctx, buf: *[client_key_len_max]u8) []const u8 {
+    if (ctx.req.peerAddress()) |peer| return formatPeerKey(peer, buf);
+    return fallback_key;
+}
+
+test "throttle_key: a peer-keyed extractor coalesces denials a rotating X-Forwarded-For would split" {
+    // Reproduces a consumer's measurement (2026-09-17, a service reachable
+    // directly with nothing in front of it): with the default forwarded-IP
+    // chain, a client rotating a FORGED X-Forwarded-For lands a fresh key per
+    // denial, so every one of them reaches the synchronous `on_audit` hook and
+    // the coalescing the module advertises does nothing. They reported 20
+    // denials arriving as 19 records.
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 203, 0, 113, 7 }, .port = 40001 } };
+    // Comptime tuple: `wire` builds the request at comptime, and `inline for`
+    // keeps each header line comptime-known.
+    const forged = .{
+        "X-Forwarded-For: 10.0.0.1\r\n",
+        "X-Forwarded-For: 10.0.0.2\r\n",
+        "X-Forwarded-For: 10.0.0.3\r\n",
+    };
+
+    // Default key: the forged header picks the key, so nothing coalesces.
+    {
+        var sink: Sink = .{};
+        var g = try Gate.init(testing.allocator, .{
+            .token = "s3cr3t",
+            .protect = .all,
+            .on_audit = Sink.hook,
+            .on_audit_ctx = &sink,
+            .throttle_window_ms = 60_000,
+        });
+        defer g.deinit();
+        var gr = try GatedRouter.init(&g, &sink);
+        defer gr.deinit();
+        var buf: [1024]u8 = undefined;
+        inline for (forged) |h| {
+            _ = runWirePeer(&gr.r, wire("GET", "/t", h), &buf, peer);
+        }
+        try testing.expectEqual(@as(usize, 3), sink.len);
+    }
+
+    // Peer-keyed: same three requests, same forged headers, one record.
+    {
+        var sink: Sink = .{};
+        var g = try Gate.init(testing.allocator, .{
+            .token = "s3cr3t",
+            .protect = .all,
+            .on_audit = Sink.hook,
+            .on_audit_ctx = &sink,
+            .throttle_window_ms = 60_000,
+            .throttle_key = .{ .keyFor = peerOnlyKey },
+        });
+        defer g.deinit();
+        var gr = try GatedRouter.init(&g, &sink);
+        defer gr.deinit();
+        var buf: [1024]u8 = undefined;
+        inline for (forged) |h| {
+            _ = runWirePeer(&gr.r, wire("GET", "/t", h), &buf, peer);
+        }
+        try testing.expectEqual(@as(usize, 1), sink.len);
+        // ⭐ And it is the SUPPRESSED count that carries the other two, not a
+        // silent drop: the gate still knows how many denials it folded.
+        try testing.expectEqual(@as(u64, 0), sink.recs[0].suppressed);
+    }
+
+    // ⭐ A different peer is still a different key -- the extractor coarsens
+    // nothing it should not. Without this, `return "one-key"` would pass.
+    {
+        var sink: Sink = .{};
+        var g = try Gate.init(testing.allocator, .{
+            .token = "s3cr3t",
+            .protect = .all,
+            .on_audit = Sink.hook,
+            .on_audit_ctx = &sink,
+            .throttle_window_ms = 60_000,
+            .throttle_key = .{ .keyFor = peerOnlyKey },
+        });
+        defer g.deinit();
+        var gr = try GatedRouter.init(&g, &sink);
+        defer gr.deinit();
+        var buf: [1024]u8 = undefined;
+        const other: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 198, 51, 100, 9 }, .port = 40002 } };
+        _ = runWirePeer(&gr.r, wire("GET", "/t", forged[0]), &buf, peer);
+        _ = runWirePeer(&gr.r, wire("GET", "/t", forged[0]), &buf, other);
+        try testing.expectEqual(@as(usize, 2), sink.len);
+    }
 }
 
 test "throttle: window 0 disables coalescing and keeps no state" {

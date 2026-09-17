@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — ⚠ **BREAKING (`KeyFn`):** `keyFor` takes a third parameter,
+  `*[client_key_len_max]u8` of caller-owned scratch, and `formatPeerKey` is
+  public.
+  - The module doc told a directly-reachable service to set
+    `Options.throttle_key` if the audit sink must be bounded against a client
+    rotating a forged `X-Forwarded-For`. That extractor has to RENDER the peer
+    address, and it had nowhere to put it: `router.Ctx` carries no allocator or
+    scratch, a buffer owned by the `KeyFn` is shared across the server's
+    per-connection threads, and a stack local does not outlive the callback.
+    The mitigation was therefore only reachable via a `threadlocal` — correct
+    only while one OS thread serves a connection end to end, which is a
+    property of a particular server, not of this API. The buffer already
+    existed at the call site and simply was not passed down.
+  - Reported by a consumer running this gate on a directly-reachable service:
+    20 denials with a rotating forged header produced 19 audit records against
+    1 with a fixed one.
+  - `throttle_key` had no test at all. It has one now, and it is the
+    consumer's measurement: the same three denials with three forged headers
+    give three records on the default key and one on a peer-keyed extractor,
+    while two distinct peers still give two.
+
 - **2026-09-10** — A1 audit disposition. Two open findings closed, both refuted
   against the tree (the underlying bugs were real but already fixed by the
   2026-09-01 middleware audit, `91d2744d`, outside this campaign):

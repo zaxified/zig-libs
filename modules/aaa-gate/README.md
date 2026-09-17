@@ -236,7 +236,11 @@ header values out of your request type remains yours.
   the server is directly reachable, forged forwarding headers let a
   client pick its own throttle key (per-client coalescing, not a
   bypass); use `Options.throttle_key` to go straight to the peer, or
-  strip those headers at the edge.
+  strip those headers at the edge. `KeyFn` is handed a
+  `*[client_key_len_max]u8` scratch buffer to render the address into and
+  `formatPeerKey` does the rendering, so that extractor needs no storage of
+  its own — before 2026-09-17 it had nowhere to write, which made this
+  recommendation one a caller could not follow race-free.
 
 ## Verification
 

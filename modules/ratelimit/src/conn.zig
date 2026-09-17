@@ -272,7 +272,7 @@ fn userCfg(options: Options, u: User) TokenBucket.Config {
     };
 }
 
-fn unusedKeyFor(_: ?*anyopaque, _: *@import("router").Ctx) []const u8 {
+fn unusedKeyFor(_: ?*anyopaque, _: *@import("router").Ctx, _: *[@import("root.zig").peer_key_len_max]u8) []const u8 {
     @panic("ConnectionLimiter's inner Limiter is connection-keyed; it is not router middleware");
 }
 

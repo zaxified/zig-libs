@@ -474,15 +474,18 @@ fn accessLogRun(_: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!vo
 // peer only.
 // ─────────────────────────────────────────────────────────────────────────────
 
-threadlocal var ratelimit_key_buf: [netaddr.max_ip_text_len]u8 = undefined;
-
-fn peerOnlyKey(_: ?*anyopaque, ctx: *router.Ctx) []const u8 {
+// `buf` is the limiter's own per-call scratch, so this needs no storage of its
+// own. It used to hold a `threadlocal` buffer instead -- correct only as long
+// as one OS thread serves a connection end to end, which is a property of the
+// server this app happens to run, not of the API. `KeyFn` handing the buffer
+// down (2026-09-17) is what removed the need to know that.
+fn peerOnlyKey(_: ?*anyopaque, ctx: *router.Ctx, buf: *[ratelimit.peer_key_len_max]u8) []const u8 {
     const peer = ctx.req.peerAddress() orelse return ratelimit.fallback_key;
     const ip: netaddr.Ip = switch (peer) {
         .ip4 => |a| .{ .v4 = a.bytes },
         .ip6 => |a| .{ .v6 = a.bytes },
     };
-    return netaddr.formatIp(ip.unmap(), &ratelimit_key_buf);
+    return netaddr.formatIp(ip.unmap(), buf);
 }
 
 fn auditLog(_: ?*anyopaque, entry: aaa_gate.AuditEntry) void {

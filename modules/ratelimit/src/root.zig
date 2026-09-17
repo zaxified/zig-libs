@@ -51,7 +51,8 @@
 //! choosing their own bucket (a per-client limiter, not an unkeyed
 //! bypass). If you are *not* behind a proxy that always sets XFF, use a
 //! `KeySource.custom` extractor that goes straight to
-//! `req.peerAddress()`, or strip those headers at the edge.
+//! `req.peerAddress()`, or strip those headers at the edge. The extractor
+//! is handed a scratch buffer for exactly this — see `KeyFn`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -219,7 +220,17 @@ pub const KeyFn = struct {
     ctx: ?*anyopaque = null,
     /// Must return a key valid for the duration of the call (the store
     /// copies what it keeps).
-    keyFor: *const fn (?*anyopaque, *router.Ctx) []const u8,
+    ///
+    /// `buf` is scratch owned by the calling thread, for a key that has to
+    /// be FORMATTED rather than borrowed from the request — which is what
+    /// the module doc's own advice ("go straight to `req.peerAddress()`")
+    /// requires. Without it that advice could not be followed race-free:
+    /// `router.Ctx` carries no allocator or scratch, a buffer owned by the
+    /// `KeyFn` is shared across the server's per-connection threads, and a
+    /// slice of a stack local does not outlive the callback. A key borrowed
+    /// from the request (a header value, `ctx.req.path`) ignores `buf`.
+    /// Reported by a consumer of the sibling `aaa-gate`, 2026-09-17.
+    keyFor: *const fn (?*anyopaque, *router.Ctx, *[peer_key_len_max]u8) []const u8,
 };
 
 /// What identifies a client for the middleware (the pure `Limiter.allow`
@@ -475,7 +486,7 @@ fn keyOf(l: *const Limiter, ctx: *router.Ctx, peer_buf: *[peer_key_len_max]u8) [
             }
             return clientKey(ctx.req, peer_buf);
         },
-        .custom => |k| return k.keyFor(k.ctx, ctx),
+        .custom => |k| return k.keyFor(k.ctx, ctx, peer_buf),
     }
 }
 
@@ -1121,7 +1132,7 @@ test "middleware: API-key header as the key, with forwarded-IP fallback" {
     try expectStatus(runWire(&rl.r, wire("X-Forwarded-For: 4.4.4.4\r\n"), &buf), "429");
 }
 
-fn keyByPath(_: ?*anyopaque, ctx: *router.Ctx) []const u8 {
+fn keyByPath(_: ?*anyopaque, ctx: *router.Ctx, _: *[peer_key_len_max]u8) []const u8 {
     return ctx.req.path;
 }
 

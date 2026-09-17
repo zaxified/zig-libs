@@ -100,7 +100,10 @@ address** when the server faces the internet directly. Resolution order
 still yields a per-client bucket (it is a key, not a bypass), but if you are
 *not* behind a proxy that always sets XFF, prefer a `KeySource.custom`
 extractor that goes straight to `req.peerAddress()`, or strip those headers
-at the edge. If you chain *multiple* trusted proxies, the rightmost entry is
+at the edge. The extractor is handed a `*[peer_key_len_max]u8` scratch buffer
+to render the address into, so it needs no storage of its own — before that
+(2026-09-17) this advice pushed callers toward a `threadlocal` or a buffer
+shared across the server's connection threads. If you chain *multiple* trusted proxies, the rightmost entry is
 your outermost proxy's peer, not the client — supply a `KeySource.custom`
 extractor that walks the chain past your own hops.
 

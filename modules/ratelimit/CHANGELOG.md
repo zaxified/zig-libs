@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — ⚠ **BREAKING (`KeyFn`):** `keyFor` takes a third parameter,
+  `*[peer_key_len_max]u8` of caller-owned scratch. Same defect as the sibling
+  `aaa-gate`, found while fixing that one: this module's doc has always said
+  that a directly-reachable deployment should "use a `KeySource.custom`
+  extractor that goes straight to `req.peerAddress()`", and that extractor had
+  nowhere to render the address. The buffer already existed at the `.custom`
+  call site and was not passed down. `example-apps/http-service` followed the
+  advice with a `threadlocal` buffer, which this change lets it drop.
+
 - **2026-09-09** — Docs: `src/xrate_vectors.zig` had no `SPDX-License-Identifier`. It was the
   one file where that mattered — a corpus captured from an external project, with the one
   line that says whose terms apply to the FILE missing. Added, and `zig build check-catalog`
