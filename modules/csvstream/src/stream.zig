@@ -17,11 +17,13 @@ const line = @import("line.zig");
 pub const LineSlice = line.LineSlice;
 pub const LineIterator = line.LineIterator;
 
-/// Default target chunk size (10 MiB), and the floor for a single record's
-/// size cap. The buffer may grow above the target for a long record, but never
-/// past `max_record_len` (see `ChunkReader.max_record_len`): a newline-free
-/// input is rejected with `error.RecordTooLong` rather than buffering the whole
-/// file.
+/// Default target chunk size (10 MiB), used when the caller asks for 0. It is
+/// NOT a floor for anything: the 10 MiB floor this used to place under
+/// `max_record_len` was removed as F5 (see `ChunkReader.initMax`), so a caller
+/// asking for small chunks gets a small record cap too. The buffer may grow
+/// above the target for a long record, but never past `max_record_len` (see
+/// `ChunkReader.max_record_len`): a newline-free input is rejected with
+/// `error.RecordTooLong` rather than buffering the whole file.
 pub const default_chunk_size: usize = 10 * 1024 * 1024;
 
 /// Returns the index of the LAST '\n' in `bytes`, or null if there is none.
@@ -60,8 +62,9 @@ pub const ChunkReader = struct {
     /// Hard cap on a single record (bytes accumulated with no '\n'). A
     /// newline-free input would otherwise grow `buffer` to the whole file size
     /// (memory DoS); once the buffer reaches this without a record boundary, a
-    /// non-EOF read errors with `error.RecordTooLong`. Set to at least the
-    /// target chunk size (and never below the 10 MiB default).
+    /// non-EOF read errors with `error.RecordTooLong`. Resolves to the target
+    /// chunk size when the caller passes 0 — there is NO 10 MiB floor under it
+    /// any more; that floor was F5 and `initMax` below says why it went.
     max_record_len: usize,
 
     pub fn init(io: std.Io, alloc: std.mem.Allocator, file: std.Io.File, chunk_size: usize) !ChunkReader {
@@ -294,10 +297,11 @@ test "ChunkReader: chunk_size 0 falls back to default_chunk_size, not a zero-len
     try t.expectEqualStrings(body, c0);
 }
 
-test "ChunkReader: max_record_len floor tracks a configured chunk_size larger than the default" {
-    // max_record_len = @max(resolved_chunk, default_chunk_size); every other
-    // test uses a chunk_size well below the 10 MiB default, so the branch
-    // where the CONFIGURED size wins the max (not the default) was dead.
+test "ChunkReader: max_record_len follows a configured chunk_size larger than the default" {
+    // Pins the ABOVE-default direction: a caller asking for more than 10 MiB
+    // of chunk gets that as its record cap, not the default. The below-default
+    // direction (F5: a small chunk_size must yield a small cap, no 10 MiB
+    // floor) is pinned by the `initMax` test further down.
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(t.io, .{ .sub_path = "in.csv", .data = "x\n" });
@@ -320,7 +324,7 @@ test "ChunkReader: a newline-free record past max_record_len is rejected, not bu
     defer f.close(t.io);
     var cr = try ChunkReader.init(t.io, t.allocator, f, 4);
     defer cr.deinit();
-    cr.max_record_len = 8; // shrink the cap for a cheap test (production floor is 10 MiB)
+    cr.max_record_len = 8; // shrink the cap for a cheap test
     try t.expectError(error.RecordTooLong, cr.nextChunk());
 }
 
