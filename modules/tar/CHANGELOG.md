@@ -48,7 +48,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-01** — Security audit: **`Writer` refuses a numeric header field that does
   not fit instead of silently truncating it** (new `WriteError.FieldOutOfRange`). The
   8-byte octal fields hold 21 bits, so uid/gid `2097152` was being written as
-  `"0000000"` — root — and `mode`/`mtime` truncated the same way. GNU tar 1.35
+  `"0000000"` — root — and `mode` truncated the same way. (This entry used to name
+  `mtime` alongside them; `mtime` is the 12-byte field at `block[136..148]`, 33 bits,
+  and `writeHeader` has always checked it against `max_octal_12`. Reading it as an
+  8-byte field would mean a truncation at 1970-01-25, which never existed. Corrected
+  2026-09-17 after a consumer checked whether its restore path could hit it.) GNU tar 1.35
   refuses the identical value ("value 2097152 out of uid_t range 0..2097151") rather
   than writing it. Reachable wherever high ids exist: userns/`subuid` mappings,
   idmap ranges, `overflowuid`. `packDir` stays best-effort as documented — it skips

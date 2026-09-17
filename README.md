@@ -91,12 +91,30 @@ zig fetch --save "git+https://github.com/zaxified/zig-libs?ref=2026-08-15#84332a
 },
 ```
 
-Pin a tag or commit, never a branch. Both halves are enforced, not conventions: a `?ref=`
-naming a branch is rejected outright (*url field is missing an explicit ref*), and a url
-naming a commit but carrying no `hash` is too (*dependency is missing hash field*). There is
-no floating "latest" to opt into — upstream movement can only ever arrive as a deliberate
-re-run of the command above, which is what makes a bump reviewable. `CHANGELOG.md` says what
-each release changed.
+Pin a tag or commit, never a branch.
+
+⚠ **`?ref=` is an annotation, not a pin.** Zig's fetcher ignores the query string entirely
+and reads only the `#` fragment. Measured 2026-09-17 against this repo: `?ref=2026-09-02`,
+`?ref=no-such-ref-xyz`, and no ref at all all resolve to the *same* thing — the tip of the
+default branch — and none of them errors. Only `#2026-09-02` resolves to the tag, and a
+fragment naming nothing (`#no-such-ref-xyz`) fails loudly with *ref not found*. The tag name
+in the query is there for the next human to read; drop the fragment while keeping it and you
+get an untagged commit that looks pinned. (`?ref=` is a Nix flake convention. It is easy to
+reach for, and it fails silently here.)
+
+Two things are enforced mechanically, and neither is the one that sounds most reassuring:
+
+- **The url must carry a fragment** — `?ref=2026-09-02` with no `#` is rejected (*url field
+  is missing an explicit ref*). But `?ref=main` is rejected for exactly the same reason: the
+  check asks whether a fragment exists, not whether the ref names a tag. A branch in the
+  **fragment** (`#main`) is accepted without complaint.
+- **A url naming a commit must carry a `hash`** (*dependency is missing hash field*).
+
+So the `hash` is what actually holds the pin. It is content-addressed, which means a ref that
+moves under you fails the build rather than silently changing it — that, not the ref syntax,
+is why there is no floating "latest" to opt into. Upstream movement can only arrive as a
+deliberate re-run of the command above, which is what makes a bump reviewable.
+`CHANGELOG.md` says what each release changed.
 
 **4. `--fork`, on top of any of the above** — build against a live checkout without touching
 the manifest. Useful when you are changing a module and its consumer together, and the
