@@ -386,11 +386,13 @@ test "an attribute value inherits the object walk's remaining depth budget, not 
 
 /// Two attributes, each an array of `.null` (0 octets/element, so the wire
 /// cost of naming N elements is the same VLQ regardless of N) of `count1`
-/// and `count2` elements respectively.
-fn buildTwoNullArrayAttrs(out: []u8, count1: u32, count2: u32) ![]u8 {
+/// and `count2` elements respectively. With `nest_second`, the second one
+/// sits in an object nested inside the first one's.
+fn buildTwoNullArrayAttrs(out: []u8, count1: u32, count2: u32, nest_second: bool) ![]u8 {
     var w: usize = 0;
     w += (try beginObject(0, 1, out[w..])).len;
     for ([_]u32{ count1, count2 }, 1..) |count, attr_id| {
+        if (nest_second and attr_id == 2) w += (try beginObject(0, 2, out[w..])).len;
         w += (try beginAttribute(@intCast(attr_id), out[w..])).len;
         out[w] = value.flag_array;
         w += 1;
@@ -398,6 +400,7 @@ fn buildTwoNullArrayAttrs(out: []u8, count1: u32, count2: u32) ![]u8 {
         w += 1;
         w += (try value.putVarUint(count, out[w..])).len;
     }
+    if (nest_second) w += (try endObject(out[w..])).len;
     w += (try endObject(out[w..])).len;
     return out[0..w];
 }
@@ -417,13 +420,28 @@ test "F6: many small requests cannot each buy a fresh max_elements of CPU" {
     // Positive control: split exactly at the shared budget -- must still
     // succeed, proving the fix didn't just lower the per-array cap.
     const half = value.max_walk_budget / 2;
-    const ok = try buildTwoNullArrayAttrs(&buf, half, half);
+    const ok = try buildTwoNullArrayAttrs(&buf, half, half, false);
     _ = try objectLen(ok);
 
     // One element over the shared budget, split across two attributes that
     // are each individually far under `max_elements`.
     var buf2: [64]u8 = undefined;
-    const over = try buildTwoNullArrayAttrs(&buf2, half, half + 1);
+    const over = try buildTwoNullArrayAttrs(&buf2, half, half + 1, false);
+    try testing.expectError(error.WalkBudgetExceeded, objectLen(over));
+}
+
+test "F6: the element budget is shared with nested objects, not refilled per object (A1 F15)" {
+    // Same split as above, but the second attribute lives one object deeper:
+    // `walkObject` must hand the nested walk the SAME budget. A fresh one per
+    // object lets a peer buy `max_walk_budget` iterations per 18 octets of
+    // nesting.
+    var buf: [64]u8 = undefined;
+    const half = value.max_walk_budget / 2;
+    const ok = try buildTwoNullArrayAttrs(&buf, half, half, true);
+    try testing.expectEqual(ok.len, try objectLen(ok));
+
+    var buf2: [64]u8 = undefined;
+    const over = try buildTwoNullArrayAttrs(&buf2, half, half + 1, true);
     try testing.expectError(error.WalkBudgetExceeded, objectLen(over));
 }
 
