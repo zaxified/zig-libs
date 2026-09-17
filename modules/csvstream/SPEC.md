@@ -103,3 +103,9 @@ in src/root.zig.
 **What the tests actually contain.** src/csv_spectrum_test.zig drives the reader through the vendored maxogden/csv-spectrum corpus (src/testdata/csv-spectrum), 8 of 12 pairs asserted and 4 declared out of scope, one of which is broken upstream; writer.zig and the coerce/header layers are self-tested
 
 **How it got there.** The anchoring work landed. DONE 9ca8ed7: csv-spectrum 8/12 asserted, 1 fixture is itself broken upstream
+
+**Independent differential (`tools/`):** Python's `csv.reader` and Go's `encoding/csv`
+disagree with each other and with this module over 146 hostile vectors — 104/146
+three-way agree; of the 42 other rows, 41 are this module's own documented RFC 4180
+deviations (trailing-delimiter empty field, Go-`LazyQuotes`-style quote handling, `\n`-only
+record termination) and one is the empty input, where Go reports `EOF`. See `tools/README.md` for the measured breakdown.
