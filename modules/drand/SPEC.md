@@ -240,3 +240,8 @@ Go source) and reused here.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** quicknet KAT is live-fetched public drand network data, same pins tlock uses
+
+**Independent differential (`tools/`):** `go/main.go` (drand's own Go `crypto`/`kyber`
+client, fetched not vendored) and this module's own `parseInfo`/`parseRound`/`verifyRound`
+(`verify_driver.zig`) agree exactly over live-fetched rounds — 60/60 quicknet + 5/5
+quicknet-t, both sides, 0 rejections — see `tools/README.md` for the measured run.
