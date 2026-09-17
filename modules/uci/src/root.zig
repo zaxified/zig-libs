@@ -2018,16 +2018,40 @@ test "corpus: every config seed reaches parse, and the model built is pinned" {
     try testing.expectEqual(@as(usize, 46), values);
 }
 
-/// Fill `buf` from the script and return the slice — including bytes below
-/// 0x20, which `serialize` legitimately rejects with
-/// `error.UnserializableValue` (UCI text has no escape producing a control
-/// byte, `\n`/`\t`/`\r` included — see the parser's double-quote comment);
-/// the caller is expected to propagate that as an early, no-bug return.
+/// Fill `buf` from the script and return the slice (a value). A control
+/// byte `serialize` refuses (`isEscapelessControl`) is shifted into the
+/// printable range, except NUL: the scripts are short and cycle, so their
+/// small counts would otherwise land in nearly every value, and every
+/// package would end as `error.UnserializableValue` before the comparison
+/// (audit A1 U24). NUL keeps that documented refusal reachable; the caller
+/// treats it as an early, no-bug return.
 fn fuzzToken(c: *testkitFuzz.Cursor, buf: []u8, min_len: usize) []const u8 {
     const len: usize = @max(min_len, c.ranged(0, @intCast(buf.len)));
-    for (buf[0..len]) |*b| b.* = c.byte();
+    for (buf[0..len]) |*b| {
+        const v = c.byte();
+        b.* = if (v != 0 and isEscapelessControl(v)) v + 0x40 else v;
+    }
     return buf[0..len];
 }
+
+/// Like `fuzzToken`, but every byte is mapped into `alphabet`. Types, names
+/// and keys come from here: raw bytes fail the name validator (audit A1 U7)
+/// on almost every draw, and a harness whose packages all die in
+/// `serialize` never reaches the comparison (audit A1 U24).
+fn fuzzNameToken(c: *testkitFuzz.Cursor, buf: []u8, min_len: usize, alphabet: []const u8) []const u8 {
+    const len: usize = @max(min_len, c.ranged(0, @intCast(buf.len)));
+    for (buf[0..len]) |*b| b.* = alphabet[c.byte() % alphabet.len];
+    return buf[0..len];
+}
+
+/// What `validNameChars` accepts.
+const name_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
+/// What `validTypeChars` accepts: printable, non-space ASCII.
+const type_alphabet = blk: {
+    var a: [126 - 33 + 1]u8 = undefined;
+    for (&a, 33..) |*b, v| b.* = v;
+    break :blk a;
+};
 
 const testkitFuzz = @import("testkit").fuzz;
 
@@ -2059,7 +2083,13 @@ test "corpus: every round-trip script builds a package, and the sections built a
     // run, so a guard counting successful round trips would have read 1 of 1.
     var built: usize = 0;
     var sections: usize = 0;
+    var anonymous: usize = 0;
     var values: usize = 0;
+    // What reached `eql`. Until 2026-09-17 every non-empty package died in
+    // `serialize` with `InvalidName` and nothing was compared (audit A1 U24).
+    var compared: usize = 0;
+    var compared_sections: usize = 0;
+    var compared_anonymous: usize = 0;
     for (roundtrip_scripts) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [64]u8 = undefined;
@@ -2069,14 +2099,29 @@ test "corpus: every round-trip script builds a package, and the sections built a
         const pkg = b.make(&c);
         built += 1;
         sections += pkg.sections.len;
-        for (pkg.sections) |s| for (s.options) |o| {
-            values += o.values.len;
-        };
+        for (pkg.sections) |s| {
+            if (s.anonymous) anonymous += 1;
+            for (s.options) |o| values += o.values.len;
+        }
+        if (try roundTripOne(pkg)) {
+            compared += 1;
+            compared_sections += pkg.sections.len;
+            for (pkg.sections) |s| if (s.anonymous) {
+                compared_anonymous += 1;
+            };
+        }
     }
     // Measured 2026-09-07. Before: 1 round, 0 sections, 0 options, 0 values.
     try testing.expectEqual(roundtrip_scripts.len, built);
     try testing.expectEqual(@as(usize, 13), sections);
     try testing.expectEqual(@as(usize, 25), values);
+    try testing.expectEqual(@as(usize, 4), anonymous);
+    // Measured 2026-09-17: every script but the NUL one reaches `eql`, and
+    // anonymous sections are among what is compared (the A1 U23 mutant, an
+    // unnamed section built as `.anonymous = false`, fails here).
+    try testing.expectEqual(roundtrip_scripts.len - 1, compared);
+    try testing.expectEqual(@as(usize, 11), compared_sections);
+    try testing.expectEqual(@as(usize, 3), compared_anonymous);
 }
 
 /// The generator's scratch, lifted out of the harness body so the corpus
@@ -2094,11 +2139,11 @@ const RoundTripBuild = struct {
     sections: [3]Section = undefined,
 
     fn make(self: *RoundTripBuild, c: *testkitFuzz.Cursor) Package {
-        const pkg_name: ?[]const u8 = if (c.byte() & 1 == 1) fuzzToken(c, &self.pkg_name_buf, 1) else null;
+        const pkg_name: ?[]const u8 = if (c.byte() & 1 == 1) fuzzNameToken(c, &self.pkg_name_buf, 1, name_alphabet) else null;
 
         const n_sections = c.ranged(0, 3);
         for (0..n_sections) |si| {
-            const sec_type = fuzzToken(c, &self.type_bufs[si], 1);
+            const sec_type = fuzzNameToken(c, &self.type_bufs[si], 1, &type_alphabet);
             const has_name = c.byte() & 1 == 1;
             // min_len 1, not 0: the parser collapses an explicit empty-quoted
             // section name to anonymous (`name = null`, see `parseLine`'s
@@ -2106,11 +2151,16 @@ const RoundTripBuild = struct {
             // shape `parse` can never itself produce, so it is deliberately
             // excluded here rather than hitting a spurious round-trip
             // mismatch.
-            const sec_name: ?[]const u8 = if (has_name) fuzzToken(c, &self.name_bufs[si], 1) else null;
+            const sec_name: ?[]const u8 = if (has_name) fuzzNameToken(c, &self.name_bufs[si], 1, name_alphabet) else null;
+            // Distinct names, for the same reason as the distinct keys below:
+            // `parse` refuses a second block reusing a name
+            // (`DuplicateSection`, audit A1 U1). `serialize` does not refuse
+            // to write one — audit A1 U25, open.
+            if (has_name) self.name_bufs[si][0] = 'a' + @as(u8, @intCast(si));
 
             const n_opts = c.ranged(0, 3);
             for (0..n_opts) |oi| {
-                const key = fuzzToken(c, &self.key_bufs[si][oi], 1);
+                const key = fuzzNameToken(c, &self.key_bufs[si][oi], 1, name_alphabet);
                 // Force distinct keys within one section: a real parse can
                 // never produce two Option entries sharing a key (repeated
                 // `option` overwrites; `list`/`option` mixed under one key is
@@ -2148,16 +2198,21 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
     const n: usize = smith.slice(&script);
     var c = testkitFuzz.Cursor{ .bytes = script[0..n] };
     var b: RoundTripBuild = undefined;
-    const pkg = b.make(&c);
+    _ = try roundTripOne(b.make(&c));
+}
 
+/// Serialize, re-parse, compare, reserialize. Returns whether the package got
+/// as far as the comparison — false only for a documented `serialize`
+/// refusal, which the corpus guard counts so that a generator producing
+/// nothing but refusals cannot pass for a working harness (audit A1 U24).
+fn roundTripOne(pkg: Package) !bool {
     const gpa = testing.allocator;
     const s1 = serialize(gpa, &pkg) catch |err| switch (err) {
-        // A generated value containing an unescapable control byte, or a
-        // generated type/name using a character real uci's own name
-        // validator (audit A1 U7) rejects — both documented rejections, not
-        // round-trip questions. `fuzzToken` draws raw random bytes for
-        // every field including type/name/key, so this is common, not rare.
-        error.UnserializableValue, error.InvalidName, error.OutOfMemory => return,
+        // A generated value containing an unescapable control byte — a
+        // documented rejection, not a round-trip question. `InvalidName`
+        // stays listed for `--fuzz` inputs, but the generator draws names
+        // from the validator's own alphabet, so the corpus never hits it.
+        error.UnserializableValue, error.InvalidName, error.OutOfMemory => return false,
     };
     defer gpa.free(s1);
 
@@ -2181,6 +2236,7 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
     const s2 = try serialize(gpa, &reparsed);
     defer gpa.free(s2);
     try testing.expectEqualStrings(s1, s2);
+    return true;
 }
 
 // ── real uci capture (OpenWRT 25.12.4 VM lane) ──────────────────────────────
