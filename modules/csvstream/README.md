@@ -35,6 +35,23 @@ while (it.next()) |rec| {
 }
 ```
 
+A record with more fields than `fbuf` holds is `error.FieldBufferTooSmall` —
+never a short row. A caller whose own contract is to keep processing malformed
+input can opt out per call site, and takes on the composed failure described in
+`OverflowPolicy.truncate` (a header and its rows truncated to the same width
+agree on an arity neither of them has):
+
+```zig
+const fields = try csv.splitFieldsOpts(
+    rec.bytes, &fbuf, ',', '"', alloc,
+    .{ .on_overflow = .truncate },
+);
+// `csv.countFields(rec.bytes, ',', '"')` still gives the TRUE width, which is
+// how a `.truncate` caller learns that truncation happened.
+```
+
+`StreamReader.nextFieldsOpts` takes the same options one layer up.
+
 ### Streaming — file → records with absolute offsets, bounded memory
 
 ```zig

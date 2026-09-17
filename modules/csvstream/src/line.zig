@@ -9,6 +9,33 @@
 
 const std = @import("std");
 
+/// What `splitFieldsOpts` does when the record has more fields than `buf` holds.
+pub const OverflowPolicy = enum {
+    /// Refuse with `error.FieldBufferTooSmall`. The default, and what
+    /// `splitFields` always does — see F2 in this module's CHANGELOG for why
+    /// silently dropping the surplus is a defect rather than leniency.
+    @"error",
+    /// Fill `buf`, return it, and drop the surplus fields. For a caller whose
+    /// own contract is to keep processing malformed input rather than refuse
+    /// it (a converter fed third-party files, say).
+    ///
+    /// ⚠ **The caller takes on F2's composed failure, F3.** When a header and
+    /// its rows are split with the SAME buffer, both truncate to the same
+    /// width, so `validateArity` reports a match and `Header.len()` returns
+    /// the truncated count as if it were the true one — the file's real shape
+    /// is gone and nothing downstream can tell. A `.truncate` caller must
+    /// handle that itself: `countFields` gives the true count for a record
+    /// independent of any buffer, and sizing the header's buffer one slot
+    /// wider than the rows' makes an over-wide header detectable.
+    truncate,
+};
+
+/// Caller policy for `splitFieldsOpts`. Passed as a literal the branch is
+/// comptime-known and folds away, so a call site pays nothing for the choice.
+pub const SplitOptions = struct {
+    on_overflow: OverflowPolicy = .@"error",
+};
+
 /// Splits one CSV line into its constituent fields.
 ///
 /// `delimiter` is the field separator (typically ',').
@@ -19,8 +46,23 @@ const std = @import("std");
 /// Fills `buf` with slices that point directly into `line` when no unescaping
 /// is needed, or into alloc-owned copies for fields containing an escaped quote.
 /// Returns a sub-slice of `buf` containing only the fields found on the line.
-/// `buf` must be large enough to hold all fields; extra capacity is ignored.
+/// `buf` must be large enough to hold all fields — a record with more fields
+/// than `buf` holds is `error.FieldBufferTooSmall`, never a short row. Use
+/// `splitFieldsOpts` to choose truncation instead; extra capacity is ignored.
 pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8, alloc: std.mem.Allocator) ![][]const u8 {
+    return splitFieldsOpts(line, buf, delimiter, quote, alloc, .{});
+}
+
+/// `splitFields` with the caller's overflow policy — see `SplitOptions`.
+/// Identical in every other respect; `splitFields` is this with the default.
+pub fn splitFieldsOpts(
+    line: []const u8,
+    buf: [][]const u8,
+    delimiter: u8,
+    quote: u8,
+    alloc: std.mem.Allocator,
+    opts: SplitOptions,
+) ![][]const u8 {
     var count: usize = 0;
     var pos: usize = 0;
     // Fields that needed unescaping are alloc-owned. On an error partway
@@ -96,8 +138,17 @@ pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8
     // same width, so `validateArity` reported a match and `Header.len()`
     // returned the truncated column count as if it were the true one. The
     // signature always had an error channel; nothing used it
-    // (W2 re-audit 2026-09-02, `csvstream` F2).
-    if (count == buf.len and pos < line.len) return error.FieldBufferTooSmall;
+    // (W2 re-audit 2026-09-02, `csvstream` F2). Refusing stays the DEFAULT;
+    // `.truncate` is that old behaviour back, but only where a caller asked
+    // for it in as many words and took F3 on (see `OverflowPolicy.truncate`).
+    if (count == buf.len and pos < line.len and opts.on_overflow == .@"error") {
+        return error.FieldBufferTooSmall;
+    }
+    // Falling through on `.truncate` is what makes the surplus safe to drop:
+    // the `errdefer` above frees the alloc-owned (escaped-quote) fields, and
+    // it runs only on an error return. A caller that today ignores
+    // `FieldBufferTooSmall` and reads `buf` anyway gets those slots freed
+    // under it, with no way to tell which slots they were.
     return buf[0..count];
 }
 
@@ -757,6 +808,69 @@ test "a record with more fields than the buffer holds is an error, not a short r
         error.FieldBufferTooSmall,
         splitFields("user,note,role,extra", &hbuf, ',', '"', a),
     );
+}
+
+test "splitFieldsOpts: .truncate fills the buffer, drops the surplus, and does NOT free what it returns" {
+    // ⭐ The seam. Escaped-quote fields are alloc-owned and the `errdefer`
+    // frees them -- which is exactly why "ignore FieldBufferTooSmall and read
+    // buf anyway" was never a workaround: those slots come back freed, with
+    // no way to tell which ones they were. `.truncate` returns through the
+    // SUCCESS path, so the errdefer must not run at all.
+    const gpa = std.testing.allocator;
+    const wide = "\"a\"\"b\",c,d,e";
+    // The true width is still knowable after truncation -- this is how a
+    // `.truncate` caller detects that it happened (see `OverflowPolicy`).
+    try std.testing.expectEqual(@as(usize, 4), countFields(wide, ',', '"'));
+
+    var buf: [2][]const u8 = undefined;
+    const got = try splitFieldsOpts(wide, &buf, ',', '"', gpa, .{ .on_overflow = .truncate });
+    try std.testing.expectEqual(@as(usize, 2), got.len);
+    // Not just the count: the CONTENT of the owned slot survived, unescaped.
+    try std.testing.expectEqualStrings("a\"b", got[0]);
+    try std.testing.expectEqualStrings("c", got[1]);
+
+    // Exact accounting, enforced by `testing.allocator`: freeing the owned
+    // slot here is a double free if the split already freed it, and a leak if
+    // nobody does. Borrowed slots point into `wide` and must not be freed.
+    for (got) |fld| {
+        const borrowed = @intFromPtr(fld.ptr) >= @intFromPtr(wide.ptr) and
+            @intFromPtr(fld.ptr) < @intFromPtr(wide.ptr) + wide.len;
+        if (!borrowed) gpa.free(fld);
+    }
+}
+
+test "splitFieldsOpts: the DEFAULT policy is refusal, so `.{}` is byte-for-byte splitFields" {
+    // The F2 audit result is what an uninformed caller keeps getting. A
+    // mutation of the field's default flips this test, which a test that only
+    // ever passed `.truncate` explicitly would not notice.
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectEqual(OverflowPolicy.@"error", (SplitOptions{}).on_overflow);
+
+    const wide = "c1,c2,c3,c4,c5";
+    var small: [2][]const u8 = undefined;
+    try std.testing.expectError(
+        error.FieldBufferTooSmall,
+        splitFieldsOpts(wide, &small, ',', '"', a, .{}),
+    );
+    try std.testing.expectError(
+        error.FieldBufferTooSmall,
+        splitFieldsOpts(wide, &small, ',', '"', a, .{ .on_overflow = .@"error" }),
+    );
+
+    // ⭐ And `.truncate` is not a no-op guard that happens to agree: on a
+    // record that FITS, both policies return the same fields, so the option
+    // only ever speaks to the overflow case.
+    var exact: [5][]const u8 = undefined;
+    const strict = try splitFieldsOpts(wide, &exact, ',', '"', a, .{});
+    try std.testing.expectEqual(@as(usize, 5), strict.len);
+    var exact2: [5][]const u8 = undefined;
+    const lenient = try splitFieldsOpts(wide, &exact2, ',', '"', a, .{ .on_overflow = .truncate });
+    try std.testing.expectEqual(@as(usize, 5), lenient.len);
+    for (strict, lenient) |x, y| try std.testing.expectEqualStrings(x, y);
 }
 
 test "a failed split frees the fields it had already allocated" {

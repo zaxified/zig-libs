@@ -33,6 +33,14 @@ a `third-party attribution` file, which is where the obligation lives.
   `delimiter`/`quote` (`Options.delimiter`, new), so a caller that wants split fields (not just raw
   record bytes) no longer repeats the delimiter at every call site. `next()` itself is unchanged and
   still delimiter-agnostic.
+- **Field-buffer overflow is the caller's policy, refusal by default.** A record wider than the
+  field buffer is `error.FieldBufferTooSmall` (F2: dropping the surplus in silence is a defect, not
+  leniency). `splitFieldsOpts`/`nextFieldsOpts` let a caller choose `.truncate` instead — per call,
+  not per reader and not per build, because one binary generally wants to hear about an over-wide
+  header and not about over-wide rows. `.truncate` hands the caller F3, the composed failure: a
+  header and its rows split with the same buffer truncate to the same width, so `validateArity`
+  reports a match and `Header.len()` returns a count the file does not have. `countFields` gives the
+  true width independent of any buffer and is how a `.truncate` caller detects the case.
 - **BOM handling:** `StreamReader.next()` detects and strips a leading UTF-8 BOM (`utf8_bom`) on the
   very first chunk only; the first record's `byte_offset` starts right after the BOM, not at 0. The
   standalone `stripBom` helper covers in-memory callers driving `LineIterator` directly.

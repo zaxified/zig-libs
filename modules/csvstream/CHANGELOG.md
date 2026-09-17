@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — `splitFields`'s field-buffer overflow behaviour is now the
+  caller's choice. Additive: `splitFields`/`nextFields` keep today's signatures
+  and today's behaviour, and the F2 refusal stays what an uninformed caller
+  gets.
+  - New `splitFieldsOpts` and `StreamReader.nextFieldsOpts` take
+    `SplitOptions{ .on_overflow }`, where `OverflowPolicy` is `.@"error"`
+    (default, unchanged) or `.truncate` (fill the buffer, drop the surplus).
+    Passed as a literal the branch folds away.
+  - Per CALL, not per reader and not a build option: a converter generally
+    wants to hear about an over-wide HEADER and not about over-wide rows, and
+    those are two call sites in one binary. No module under `modules/*/src/`
+    consumes build options; `StreamReader.Options` is the precedent for caller
+    policy, and `init`/`initMax` for an additive variant.
+  - ⚠ A `.truncate` caller takes on F3, the composed failure: a header and its
+    rows split with the same buffer truncate to the same width, so
+    `validateArity` reports a match and `Header.len()` returns a count the file
+    does not have. `countFields` gives the true width and is how the case is
+    detected. Documented on the enum member itself.
+  - The `errdefer` that frees alloc-owned (escaped-quote) fields runs only on
+    an error return, so `.truncate` returns them intact — which is also why
+    "ignore `FieldBufferTooSmall` and read the buffer anyway" was never a
+    workaround: those slots come back freed and the caller cannot tell which.
+    Pinned by a test that frees the owned slot itself, so `testing.allocator`
+    fails on a double free as well as on a leak.
+  - Requested by a downstream consumer whose contract is template-strict,
+    data-lenient: a malformed template is a hard failure, malformed input data
+    must still convert.
+
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/csv_spectrum_vectors.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

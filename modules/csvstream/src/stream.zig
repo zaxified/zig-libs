@@ -250,8 +250,23 @@ pub const StreamReader = struct {
     /// the same borrow contract as `next()`'s `LineSlice.bytes` therefore
     /// applies transitively to the returned field slices.
     pub fn nextFields(self: *StreamReader, buf: [][]const u8, alloc: std.mem.Allocator) !?[][]const u8 {
+        return self.nextFieldsOpts(buf, alloc, .{});
+    }
+
+    /// `nextFields` with the caller's overflow policy — the same choice
+    /// `splitFieldsOpts` offers, one layer up, so a `StreamReader` caller is
+    /// not forced back down to the in-memory API to express it. Per call, not
+    /// per reader: a caller splitting a header and its rows with one reader
+    /// generally wants to hear about an over-wide header and not about
+    /// over-wide rows. See `line.OverflowPolicy` before choosing `.truncate`.
+    pub fn nextFieldsOpts(
+        self: *StreamReader,
+        buf: [][]const u8,
+        alloc: std.mem.Allocator,
+        opts: line.SplitOptions,
+    ) !?[][]const u8 {
         const rec = (try self.next()) orelse return null;
-        return try line.splitFields(rec.bytes, buf, self.delimiter, self.quote, alloc);
+        return try line.splitFieldsOpts(rec.bytes, buf, self.delimiter, self.quote, alloc, opts);
     }
 };
 
@@ -515,6 +530,40 @@ test "StreamReader.nextFields: configured delimiter splits fields without the ca
     try t.expectEqualStrings("bob", r3[0]);
     try t.expectEqualStrings("25", r3[1]);
     try t.expect((try sr.nextFields(&buf, t.allocator)) == null);
+}
+
+test "StreamReader.nextFieldsOpts: the policy is per CALL, so one reader can be strict on the header and lenient on the rows" {
+    // The shape the option exists for: a converter whose contract is
+    // template-strict, data-lenient. The header is split with one slot MORE
+    // than the rows and the refusing policy, so an over-wide header is
+    // detectable; the rows truncate to the addressable width and keep going.
+    // A reader-level or build-level switch could not express both in one
+    // binary -- hence per call.
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "c1,c2,c3\na,b,c\nd,e,f\n";
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "wide.csv", .data = body });
+    var f = try tmp.dir.openFile(t.io, "wide.csv", .{});
+    defer f.close(t.io);
+    var sr = try StreamReader.init(t.io, t.allocator, f, .{});
+    defer sr.deinit();
+
+    // Header: 2 addressable columns, so a 3-slot buffer lets the surplus show
+    // up as a length the caller can warn about instead of an error.
+    var hbuf: [3][]const u8 = undefined;
+    const hdr = (try sr.nextFieldsOpts(&hbuf, t.allocator, .{})).?;
+    try t.expectEqual(@as(usize, 3), hdr.len);
+
+    // Rows: capped at the 2 columns anything downstream can name.
+    var rbuf: [2][]const u8 = undefined;
+    const r1 = (try sr.nextFieldsOpts(&rbuf, t.allocator, .{ .on_overflow = .truncate })).?;
+    try t.expectEqual(@as(usize, 2), r1.len);
+    try t.expectEqualStrings("a", r1[0]);
+    try t.expectEqualStrings("b", r1[1]);
+
+    // ⭐ And the SAME reader refuses on the very next record when the caller
+    // asks it to -- proving the choice rides the call, not the reader.
+    try t.expectError(error.FieldBufferTooSmall, sr.nextFieldsOpts(&rbuf, t.allocator, .{}));
 }
 
 test "StreamReader.nextFields: default delimiter still splits on comma (non-breaking default)" {

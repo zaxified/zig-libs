@@ -53,6 +53,16 @@ pub const LineIterator = line.LineIterator;
 /// which are allocated from the passed allocator.
 pub const splitFields = line.splitFields;
 
+/// `splitFields` with the caller's overflow policy (refuse, the default, or
+/// truncate). See `OverflowPolicy` before choosing `.truncate`.
+pub const splitFieldsOpts = line.splitFieldsOpts;
+
+/// What `splitFieldsOpts` does with a record wider than the field buffer.
+pub const OverflowPolicy = line.OverflowPolicy;
+
+/// Caller policy for `splitFieldsOpts`.
+pub const SplitOptions = line.SplitOptions;
+
 // ── Streaming layer (file → records with absolute offsets) ────────────────────
 
 /// Reads a file in record-aligned chunks with bounded memory; yields absolute
