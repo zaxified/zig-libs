@@ -324,7 +324,15 @@ identical numbers, which is what a UAPI contract is supposed to do and worth
 having checked rather than assumed. Architectures the toolchain cannot target
 are not guessed at; they get `family = .none` (see above).
 
-**One family is additionally live-verified, and only one.** Where both
+**Additionally live-verified under `qemu-user`, beyond the host's own architecture.**
+`tools/arch_probe.zig` + [`tools/qemu-runtime-oracle.sh`](./tools/qemu-runtime-oracle.sh)
+cross-compile a driver over this module's public API and run it for real
+under `qemu-<arch>` against real files, diffed field-for-field against the
+host's own `stat(1)` on the same files (measured 2026-09-17: `OK=60
+MISMATCH=0` across `x86_64`/`aarch64`/`arm`/`riscv64`/`mips`, both backends).
+See [`tools/README.md`](./tools/README.md).
+
+**One family is additionally live-verified on this host alone, without qemu.** Where both
 backends exist, `statx` *is* an independent oracle for the per-architecture
 struct: its buffer has a fixed layout and cannot be misaligned in the same way
 a wrong `@offsetOf` is. `stat.zig`'s "both backends agree, field for field"
