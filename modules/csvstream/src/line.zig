@@ -65,12 +65,26 @@ pub fn splitFieldsOpts(
 ) ![][]const u8 {
     var count: usize = 0;
     var pos: usize = 0;
-    // Fields that needed unescaping are alloc-owned. On an error partway
-    // through, the caller never receives the slice, so without this they were
-    // simply unreachable (W2 re-audit 2026-09-02, `csvstream` F7).
-    var owned: [64]usize = undefined;
-    var owned_n: usize = 0;
-    errdefer for (owned[0..owned_n]) |i| alloc.free(buf[i]);
+    // Fields that needed unescaping are alloc-owned; every other field borrows
+    // `line`. On an error partway through, the caller never receives the
+    // slice, so without this the copies made so far were simply unreachable
+    // (W2 re-audit 2026-09-02, `csvstream` F7).
+    //
+    // WHICH slots are copies is asked of the ADDRESS, not of a side list. That
+    // list used to be a fixed `[64]usize`, and the 65th copy onwards was made
+    // but never recorded, so this errdefer freed 64 of them and left the rest
+    // unreachable — measured 2026-09-17 on a record of 15,000 escaped fields
+    // split into a 4,096-slot buffer: 4,096 copies, 64 freed, 40,324,032 bytes
+    // stranded per call, on the module's own default (refusing) policy.
+    // Asking the address has no ceiling to exceed and allocates nothing, which
+    // is what this path needs — it runs when an allocation has just failed.
+    errdefer for (buf[0..count]) |f| {
+        // A zero-length field is skipped rather than classified: an empty
+        // borrowed field at end-of-record has the one-past-the-end address,
+        // which no range test can attribute. `Allocator.free` is a no-op at
+        // length 0 either way, so nothing is stranded by skipping it.
+        if (f.len != 0 and !borrowsFrom(f, line)) alloc.free(f);
+    };
     // Loop condition: pos <= line.len (one past end) lets the outer while
     // reach the `if (pos == line.len) break` sentinel for the trailing-field
     // case, avoiding a separate post-loop append.
@@ -117,10 +131,6 @@ pub fn splitFieldsOpts(
             // allocation in the common case).
             if (has_escaped_quote) {
                 buf[count] = try unescapeQuotes(raw, quote, alloc);
-                if (owned_n < owned.len) {
-                    owned[owned_n] = count;
-                    owned_n += 1;
-                }
             } else {
                 buf[count] = raw;
             }
@@ -289,6 +299,16 @@ pub fn stripBom(bytes: []const u8) []const u8 {
 
 /// Returns a copy of `s` with every doubled quote char replaced by a single one.
 /// The returned slice is allocated with `alloc`.
+/// Does `f` point into `line`? A field `splitFieldsOpts` did not unescape is a
+/// sub-slice of `line` by construction; an unescaped copy is a separate
+/// allocation and therefore cannot be. This is what lets the error path tell
+/// the two apart with nothing remembered and nothing allocated.
+fn borrowsFrom(f: []const u8, line: []const u8) bool {
+    const p = @intFromPtr(f.ptr);
+    const start = @intFromPtr(line.ptr);
+    return p >= start and p < start + line.len;
+}
+
 fn unescapeQuotes(s: []const u8, quote: u8, alloc: std.mem.Allocator) ![]u8 {
     var out = std.array_list.Managed(u8).init(alloc);
     // `toOwnedSlice` can allocate too, so a failure anywhere after the
@@ -886,4 +906,102 @@ test "a failed split frees the fields it had already allocated" {
         splitFields("\"a\"\"a\",\"b\"\"b\"", &buf, ',', '"', a),
     );
     try std.testing.expectEqual(failing.allocations, failing.deallocations);
+}
+
+/// Builds a record of `n` fields that every one need unescaping (`"a""a"`), so
+/// the split allocates exactly once per field. Shared by the two tests below,
+/// which differ only in HOW the split is made to fail.
+fn escapedRecord(alloc: std.mem.Allocator, n: usize) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    for (0..n) |i| {
+        if (i > 0) try out.append(',');
+        try out.appendSlice("\"a\"\"a\"");
+    }
+    return out.toOwnedSlice();
+}
+
+test "a failed split frees ALL the fields it allocated, past any fixed bookkeeping size" {
+    // ⭐ The test above pins the same invariant at TWO fields, and that is why
+    // it kept passing while the invariant did not hold: the errdefer used to
+    // consult a fixed `[64]usize` of copied-slot indices, so it freed the
+    // first 64 copies and left every later one unreachable. Two is under 64.
+    // 200 is not.
+    const gpa = std.testing.allocator;
+    const rec = try escapedRecord(gpa, 200);
+    defer gpa.free(rec);
+    try std.testing.expectEqual(@as(usize, 200), countFields(rec, ',', '"'));
+
+    // Fail an allocation well past the old ceiling, so the copies already made
+    // span both sides of it.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 150 });
+    const a = failing.allocator();
+    const buf = try gpa.alloc([]const u8, 256);
+    defer gpa.free(buf);
+    try std.testing.expectError(error.OutOfMemory, splitFields(rec, buf, ',', '"', a));
+
+    // Bytes, not just counts: a partial cleanup shows up here as a positive
+    // remainder even when the allocation/free COUNTS happen to line up.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+}
+
+test "the overflow refusal frees the fields it allocated, however many there were" {
+    // The reachable half of the same defect, and the one that needs no
+    // allocation failure at all: a record WIDER than the field buffer is
+    // refused after the buffer has been filled with copies. Measured before
+    // the fix on 15,000 fields into a 4,096-slot buffer: 4,096 copies made,
+    // 64 freed, 40,324,032 bytes stranded on one call — attacker-shaped, since
+    // the field count is chosen by the input file.
+    const gpa = std.testing.allocator;
+    const rec = try escapedRecord(gpa, 200);
+    defer gpa.free(rec);
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    const a = failing.allocator();
+    const buf = try gpa.alloc([]const u8, 100); // < 200, and > 64
+    defer gpa.free(buf);
+    try std.testing.expectError(error.FieldBufferTooSmall, splitFields(rec, buf, ',', '"', a));
+
+    // Bytes first: a partial cleanup leaves a positive remainder here even
+    // when the counts happen to line up.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    // And the test is not vacuous: every one of the 100 filled slots was a
+    // copy, so the cleanup had at least that many to find. (`unescapeQuotes`
+    // allocates more than once per field; the count is not pinned exactly,
+    // because that is its business and not this invariant's.)
+    try std.testing.expect(failing.allocations >= 100);
+}
+
+test "the cleanup frees only the copies, never a field borrowed from the record" {
+    // The other way this can go wrong: freeing a slice that points into the
+    // caller's record. Mixing borrowed and copied fields means the cleanup has
+    // to tell them apart correctly in BOTH directions -- a test made only of
+    // escaped fields would pass an errdefer that freed everything in `buf`.
+    const gpa = std.testing.allocator;
+    var out = std.array_list.Managed(u8).init(gpa);
+    defer out.deinit();
+    // 400 alternating fields into a 200-slot buffer, so 100 of the filled
+    // slots are copies -- past the old 64-entry ceiling in this direction too.
+    for (0..400) |i| {
+        if (i > 0) try out.append(',');
+        // Alternating: even fields borrow, odd fields are copied.
+        try out.appendSlice(if (i % 2 == 0) "plain" else "\"a\"\"a\"");
+    }
+
+    var failing = std.testing.FailingAllocator.init(gpa, .{});
+    const a = failing.allocator();
+    const buf = try gpa.alloc([]const u8, 200);
+    defer gpa.free(buf);
+    try std.testing.expectError(error.FieldBufferTooSmall, splitFields(out.items, buf, ',', '"', a));
+
+    // Half of the 200 filled slots were copies; the other half point into
+    // `out.items` and must be left alone. An errdefer that freed the whole
+    // buffer indiscriminately would hand `testing.allocator` a pointer it
+    // never issued, which it reports as an invalid free — so THAT direction is
+    // enforced by the allocator, and this is the other one: nothing stranded.
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    try std.testing.expectEqual(failing.allocations, failing.deallocations);
+    try std.testing.expect(failing.allocations >= 100);
 }

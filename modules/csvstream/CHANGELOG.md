@@ -5,6 +5,34 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — ⚠ **Memory leak on the error path, attacker-reachable.** The
+  F7 cleanup (2026-09-02) recorded which `buf` slots held unescaped copies in a
+  fixed `[64]usize`, under an `if (owned_n < owned.len)` guard. The 65th copy
+  onwards was allocated and never recorded, so the `errdefer` freed 64 of them
+  and stranded the rest — unreachable, since the caller never receives the
+  slice on an error return.
+  - The reachable shape needs no allocation failure: a record with more fields
+    than the field buffer holds fills the buffer with copies and is then
+    refused. The field count comes from the input file. Measured on 15,000
+    fields of 10 KB each, each containing a doubled quote, split into a
+    4,096-slot buffer: **4,096 copies made, 64 freed, 40,324,032 bytes stranded
+    on a single call**, on the default (refusing) policy.
+  - Fixed by asking the ADDRESS instead of keeping a list: a field that was not
+    unescaped is a sub-slice of the record by construction, an unescaped copy
+    is a separate allocation and cannot be. No ceiling to exceed, and nothing
+    allocated in a path that runs when an allocation has just failed.
+  - The existing regression test pinned this invariant at TWO escaped fields,
+    which is why it kept passing. The new ones use 200 and 400, and all three
+    go red against the old code (measured: 3 of 3 fail, 83 leaks). One of them
+    is the other direction — mixing borrowed and copied fields, so a cleanup
+    that freed the whole buffer indiscriminately hands `testing.allocator` a
+    pointer it never issued.
+  - Note for callers on the SUCCESS path: `StreamReader`/`ChunkReader` bound a
+    single record at `max_record_len` (10 MiB by default), so the front door
+    refuses this shape with `error.RecordTooLong` before `splitFields` sees it.
+    The leak was reachable through the in-memory API, where the caller already
+    holds the bytes.
+
 - **2026-09-17** — `splitFields`'s field-buffer overflow behaviour is now the
   caller's choice. Additive: `splitFields`/`nextFields` keep today's signatures
   and today's behaviour, and the F2 refusal stays what an uninformed caller
