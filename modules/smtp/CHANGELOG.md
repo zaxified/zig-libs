@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** tests only (audit F13, F14). The amortized
+  `reply.Parser.compact` is pinned by a byte count instead of the opt-in wall-clock bench, and
+  `Session.wipeOut` zeroing the command buffer by a scan of its spare capacity after AUTH
+  (ReleaseFast; safe modes poison cleared bytes themselves).
+
 - **2026-09-13** — **BEHAVIOURAL:** A1 findings F2, F6, F8.
   F2 (Q1): with `UnstuffOptions.allow_bare_lf = true`, a `.` line with a bare LF on either side
   ended the DATA stream — CVE-2023-51764 SMTP smuggling. The terminator is now only

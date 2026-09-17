@@ -1146,6 +1146,49 @@ test "AUTH is refused on a plaintext link unless the caller opts in" {
     try testing.expect(std.mem.indexOf(u8, sc.sent.items, "AUTH") == null);
 }
 
+test "the command buffer's spare capacity holds no AUTH line once AUTH succeeds (A1 F14)" {
+    // `wipeOut` zeroes `self.out` before clearing it; in ReleaseFast
+    // `clearRetainingCapacity` alone keeps every byte, so the base64
+    // credentials would sit in the buffer until a longer command happened to
+    // overwrite them. The F5 probe below watches the stack, not this heap
+    // buffer. Debug and ReleaseSafe poison the cleared bytes (`@memset` to
+    // `undefined`) and hide the leak, so the test skips wherever its own
+    // control cannot see one.
+    const gpa = testing.allocator;
+    {
+        var control: std.ArrayList(u8) = .empty;
+        defer control.deinit(gpa);
+        try control.appendSlice(gpa, "AUTH PLAIN control\r\n");
+        control.clearRetainingCapacity();
+        if (std.mem.indexOf(u8, control.allocatedSlice(), "AUTH") == null) return error.SkipZigTest;
+    }
+
+    var s: Session = .init(gpa, .{
+        .tls = .disabled,
+        .allow_plaintext_auth = true,
+        .credentials = .{ .username = "user@example.com", .password = "s3cret-F14" },
+    });
+    defer s.deinit();
+    var sc: Script = .{ .gpa = gpa, .replies = &.{
+        "220 ready\r\n",
+        "250-mail.example.com Hello\r\n250 AUTH PLAIN\r\n",
+        "235 2.7.0 ok\r\n",
+    } };
+    defer sc.deinit();
+    try sc.run(&s);
+    try testing.expect(s.authenticated);
+
+    var ir_buf: [128]u8 = undefined;
+    const ir = try auth_mod.plainResponse(&ir_buf, "", "user@example.com", "s3cret-F14");
+    // Control: the credentials did go through this buffer.
+    try testing.expect(std.mem.indexOf(u8, sc.sent.items, ir) != null);
+    try testing.expectEqual(@as(usize, 0), s.out.items.len);
+    const spare = s.out.allocatedSlice();
+    try testing.expect(spare.len >= ir.len);
+    try testing.expect(std.mem.indexOf(u8, spare, ir) == null);
+    try testing.expect(std.mem.indexOf(u8, spare, "AUTH") == null);
+}
+
 // ── F5: credential zeroization, verified on the artifact ────────────────────
 //
 // `secureZero` calls exist (`auth.plainResponse` `defer`s one over its base64

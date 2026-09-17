@@ -536,6 +536,37 @@ test "pending input is bounded" {
     try testing.expectError(error.PendingTooLarge, p.feed("2" ** 32));
 }
 
+test "one large feed moves at most as many bytes as it holds (amortized compact, A1 F13)" {
+    // The deterministic half of the F1 bench below: count the bytes `compact`
+    // shifts while one feed of many replies is drained. With the halving rule
+    // the total stays within the input size; compacting after every line
+    // moves the remainder each time, O(lines^2).
+    const gpa = testing.allocator;
+    const one = "250 x\r\n";
+    const lines = 1024;
+    var p: Parser = .init(gpa, .{ .max_pending = 1 << 20 }, .{});
+    defer p.deinit();
+    try p.feed(one ** lines);
+
+    var moved: usize = 0;
+    var compactions: usize = 0;
+    var replies: usize = 0;
+    while (try p.next()) |r| {
+        try testing.expectEqual(@as(u16, 250), r.code);
+        replies += 1;
+        // `next` returns after one single-line reply and compacts at most
+        // once per line, so a zero cursor means it compacted just now and
+        // what is left in `pending` is exactly what it moved.
+        if (p.cursor == 0) {
+            compactions += 1;
+            moved += p.pending.items.len;
+        }
+    }
+    try testing.expectEqual(@as(usize, lines), replies);
+    try testing.expect(moved <= one.len * lines);
+    try testing.expect(compactions <= 2 * std.math.log2_int(usize, lines) + 2);
+}
+
 fn nowNsF1(_: void) u64 {
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
