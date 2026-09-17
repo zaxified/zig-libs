@@ -118,3 +118,5 @@ is required (root [`NOTICE`](../../NOTICE) §0). DATA: none. `src/golden.zig` is
 - **Oracle n/a** — class C/D carries no anchor debt, so there is no oracle grade to give.
 
 **What the tests actually contain.** in-process test-utility layer over std.testing, no wire/crypto
+
+**Reference-class check anyway:** `modules/testkit/tools/README.md` — even a class-C decision benefits from a second opinion; `hex.into`/`.alloc` match a from-scratch strict RFC 4648 decoder on all 16 276 exhaustive short inputs (0 diffs), and disagree with Python's own `bytes.fromhex` only on its whitespace leniency (255/16 276, all in the stricter direction).
