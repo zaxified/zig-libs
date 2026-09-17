@@ -155,6 +155,17 @@ fn expectReject(source: []const u8) !void {
     return error.TestExpectedRejection;
 }
 
+test "invalid UTF-8 and control bytes that libyaml refuses are refused (A1 F11)" {
+    // Inputs from the libyaml differential (`tools/volume.py`), each of which
+    // this module used to compose.
+    try expectReject("%TAG !e! tag:example.com,2000:app/\n---\n!e!foo \"\x80bar\"\n");
+    try expectReject("  [1\t,\r 2,\xff3]  \n  ");
+    try expectReject("YAML 1.2 foo\nH--\x00");
+    try expectReject("&a: key: &a valuYe\nfoo:\n \x80 *a\r\n");
+    const ok = try dumpEvents(testing.allocator, "k: \"\xC3\xA9\"\n");
+    testing.allocator.free(ok);
+}
+
 test "an escaped UTF-16 surrogate pair is one astral character; a surrogate alone is still refused (A1 F7)" {
     const pair = try dumpEvents(testing.allocator, "k: \"\\uD83D\\uDE00\"\n");
     defer testing.allocator.free(pair);

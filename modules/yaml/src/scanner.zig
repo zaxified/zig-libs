@@ -195,11 +195,9 @@ pub const Scanner = struct {
         // as width 4 anyway swallowed up to three trailing bytes that were not
         // part of any encoded character, structural or not (A1/yaml.md F4:
         // one 0xF5-0xFF byte silently consumed a following `:` or `\n` and
-        // changed the shape of the document). This scanner still does not
-        // validate UTF-8 (SPEC.md: byte-transparent, composer's job) — an
-        // invalid byte still passes through unchanged — but it now consumes
-        // exactly one byte for it, like every other invalid lead byte above,
-        // instead of a wrong, larger count.
+        // changed the shape of the document). Since F11 (2026-09-17) an
+        // invalid byte never gets this far: `fetchStreamStart` rejects the
+        // whole stream first. The one-byte width stays as the safe answer.
         if (b < 0xF5) return 4;
         return 1;
     }
@@ -636,6 +634,13 @@ pub const Scanner = struct {
             // it changes no UTF-8 document's outcome.
             return self.fail("UTF-16/UTF-32 BOM: only UTF-8 input is supported");
         }
+        // YAML 1.2 §5.2: the stream is UTF-8; §5.1: it holds only `c-printable`
+        // characters. Checked once, over the whole input, before the first
+        // token (A1/yaml.md F11): the scanner below stays byte-transparent and
+        // relies on this, so an invalid byte can no longer reach a scalar.
+        if (firstInvalidChar(self.src)) |bad| {
+            return self.failAt(bad.msg, markOf(self.src, bad.index));
+        }
         const m = self.mark();
         try self.enqueue(.{ .kind = .stream_start, .start = m, .end = m });
     }
@@ -649,6 +654,58 @@ pub const Scanner = struct {
         if (src.len >= 2 and src[0] == 0xFE and src[1] == 0xFF) return true;
         if (src.len >= 2 and src[0] == 0xFF and src[1] == 0xFE) return true;
         return false;
+    }
+
+    const InvalidChar = struct { index: usize, msg: []const u8 };
+
+    /// The first byte of `src` that does not start a YAML 1.2 `c-printable`
+    /// character in valid UTF-8, or null. `c-printable` (§5.1) is tab, LF,
+    /// CR, x20-x7E, NEL x85, xA0-xD7FF, xE000-xFFFD and x10000-x10FFFF:
+    /// no C0 control but those three, no DEL, no C1 control but NEL, no
+    /// surrogate (which `utf8Decode` already refuses), no xFFFE/xFFFF.
+    fn firstInvalidChar(src: []const u8) ?InvalidChar {
+        const not_utf8 = "invalid UTF-8: a YAML stream must be UTF-8 (YAML 1.2 §5.2)";
+        const not_printable = "non-printable character: YAML 1.2 §5.1 allows only c-printable characters";
+        var i: usize = 0;
+        while (i < src.len) {
+            const b = src[i];
+            if (b < 0x80) {
+                if ((b < 0x20 and b != '\t' and b != '\n' and b != '\r') or b == 0x7F)
+                    return .{ .index = i, .msg = not_printable };
+                i += 1;
+                continue;
+            }
+            const n = std.unicode.utf8ByteSequenceLength(b) catch return .{ .index = i, .msg = not_utf8 };
+            if (n > src.len - i) return .{ .index = i, .msg = not_utf8 };
+            const cp = std.unicode.utf8Decode(src[i..][0..n]) catch return .{ .index = i, .msg = not_utf8 };
+            const printable = cp == 0x85 or
+                (cp >= 0xA0 and cp <= 0xD7FF) or
+                (cp >= 0xE000 and cp <= 0xFFFD) or
+                cp >= 0x10000;
+            if (!printable) return .{ .index = i, .msg = not_printable };
+            i += n;
+        }
+        return null;
+    }
+
+    /// Line and column of byte `index`, counted the way `skip`/`skipLine`
+    /// count them. Only called with the index `firstInvalidChar` returned, so
+    /// everything before it is valid UTF-8 and `charWidth` is exact there.
+    fn markOf(src: []const u8, index: usize) Mark {
+        var m: Mark = .{ .index = index };
+        // A leading BOM is consumed without a column, as in `fetchStreamStart`.
+        var i: usize = if (std.mem.startsWith(u8, src, "\xEF\xBB\xBF") and index >= 3) 3 else 0;
+        while (i < index) {
+            if (src[i] == '\r' or src[i] == '\n') {
+                i += if (src[i] == '\r' and i + 1 < index and src[i + 1] == '\n') 2 else 1;
+                m.line += 1;
+                m.column = 0;
+            } else {
+                i += charWidth(src[i]);
+                m.column += 1;
+            }
+        }
+        return m;
     }
 
     fn fetchStreamEnd(self: *Self) Error!void {
@@ -1554,4 +1611,68 @@ test "a tab is never indentation, but it is still legal separation" {
     // Same rule through the explicit-key indicator: the tab is what would
     // indent the nested mapping `key:` opens.
     try testing.expectError(error.InvalidYaml, scanAll(arena, "?\tkey:\n"));
+}
+
+test "F11 (A1/yaml.md): the stream must be UTF-8 made of c-printable characters" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Every c-printable class, at both ends of each range, plus a BOM.
+    const allowed = [_][]const u8{
+        "\t",        "\r\n ",      "~",
+        "\u{85}",    "\u{A0}",     "\u{D7FF}",
+        "\u{E000}",  "\u{FFFD}",   "\u{FEFF}",
+        "\u{10000}", "\u{10FFFF}", "\xC3\xA9",
+    };
+    for (allowed) |c| {
+        const src = try std.mem.concat(arena, u8, &.{ "k: \"", c, "\"\n" });
+        scanAll(arena, src) catch |err| {
+            std.debug.print("F11: refused an allowed character {x}\n", .{c});
+            return err;
+        };
+    }
+
+    const refused = [_]struct { bytes: []const u8, utf8: bool }{
+        .{ .bytes = "\x00", .utf8 = true }, // C0
+        .{ .bytes = "\x1B", .utf8 = true },
+        .{ .bytes = "\x7F", .utf8 = true }, // DEL
+        .{ .bytes = "\u{80}", .utf8 = true }, // C1, below NEL
+        .{ .bytes = "\u{9F}", .utf8 = true }, // C1, above NEL
+        .{ .bytes = "\u{FFFE}", .utf8 = true },
+        .{ .bytes = "\u{FFFF}", .utf8 = true },
+        .{ .bytes = "\x80", .utf8 = false }, // stray continuation byte
+        .{ .bytes = "\xC0\x80", .utf8 = false }, // overlong NUL
+        .{ .bytes = "\xED\xA0\x80", .utf8 = false }, // surrogate U+D800
+        .{ .bytes = "\xE2\x82", .utf8 = false }, // truncated at end of input
+        .{ .bytes = "\xF5\x80\x80\x80", .utf8 = false }, // above U+10FFFF
+        .{ .bytes = "\xFF", .utf8 = false },
+    };
+    for (refused) |c| {
+        const src = try std.mem.concat(arena, u8, &.{ "k: ", c.bytes });
+        var s = Scanner.init(arena, src);
+        const got = s.next();
+        testing.expectError(error.InvalidYaml, got) catch |err| {
+            std.debug.print("F11: accepted {x}\n", .{c.bytes});
+            return err;
+        };
+        const want = if (c.utf8) "non-printable" else "invalid UTF-8";
+        try testing.expect(std.mem.startsWith(u8, s.problem, want));
+        try testing.expectEqual(Mark{ .index = 3, .line = 0, .column = 3 }, s.problem_mark);
+    }
+
+    // The mark counts lines over CRLF and columns in characters, not bytes.
+    {
+        var s = Scanner.init(arena, "a: \xC3\xA9\r\nb: x\x00\n");
+        try testing.expectError(error.InvalidYaml, s.next());
+        try testing.expectEqual(Mark{ .index = 11, .line = 1, .column = 4 }, s.problem_mark);
+    }
+    // A leading BOM takes no column, as when it is skipped for real.
+    {
+        var s = Scanner.init(arena, "\xEF\xBB\xBF\x01");
+        try testing.expectError(error.InvalidYaml, s.next());
+        try testing.expectEqual(Mark{ .index = 3, .line = 0, .column = 0 }, s.problem_mark);
+    }
+    // An escape may still PRODUCE a control character: only the text is checked.
+    try scanAll(arena, "k: \"\\0\\x1b\\t\"\n");
 }

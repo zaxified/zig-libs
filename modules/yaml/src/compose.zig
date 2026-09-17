@@ -1158,19 +1158,19 @@ test "F3 (A1/yaml.md): the duplicate-key check does not stack-overflow on a synt
     try testing.expectError(error.TooDeep, compose(gpa, src.items, .{}));
 }
 
-test "F4 (A1/yaml.md): an invalid UTF-8 lead byte (0xF5-0xFF) does not swallow the next three bytes" {
+test "F4/F11 (A1/yaml.md): an invalid UTF-8 lead byte (0xF5-0xFF) fails the stream instead of reshaping it" {
     // `scanner.charWidth` used to treat every byte >= 0xF0 as a 4-byte UTF-8
     // lead, including 0xF5-0xFF, which can never start a valid sequence
     // (RFC 3629 §3 caps valid 4-byte leads at 0xF4). One such byte before a
     // `:` silently ate the colon, the following space, and the value's first
     // byte, collapsing `k\xff: v\n` into a single scalar instead of a
-    // one-pair mapping. This layer still does not VALIDATE UTF-8 (SPEC.md:
-    // byte-transparent, validation is the composer's job, still open --
-    // A1/yaml.md F4 decision item 2) -- the invalid byte still passes
-    // through unchanged, just no longer at the cost of its neighbours.
-    const r = try compose(testing.allocator, "k\xff: v\n", .{});
+    // one-pair mapping (F4). The F4 fix stopped the swallowing but still let
+    // the byte through into the key; since F11 the scanner refuses any
+    // stream that is not UTF-8 before its first token.
+    try testing.expectError(error.InvalidYaml, compose(testing.allocator, "k\xff: v\n", .{}));
+    // Control: the same shape with a valid character composes.
+    const r = try compose(testing.allocator, "k\xc3\xa9: v\n", .{});
     defer r.deinit();
-    try testing.expect(r.root == .mapping);
     try testing.expectEqual(@as(usize, 1), r.root.mapping.len);
     try testing.expectEqualStrings("v", r.root.mapping[0].value.string);
 }

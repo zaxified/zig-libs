@@ -47,18 +47,17 @@ with the module), the rest (`leaf_str_vs_str`, `pyyaml_dup`, `binary_tag_1.1`,
 each) are documented 1.1-vs-1.2 core-schema differences (`SPEC.md` §6/§8). No bucket
 here is new evidence of a module defect.
 
-**Measured 2026-09-17, `volume.py` (200 000 mutated documents vs libyaml):**
-`AGREE=166905 (83.45%)`, `zig_accepts_libyaml_rejects=21434` (libyaml is 1.1 and
+**Measured 2026-09-17, `volume.py` (200 000 mutated documents vs libyaml), after
+audit F11 (the scanner now rejects invalid UTF-8 and non-`c-printable` characters):**
+`AGREE=174979 (87.49%)`, `zig_accepts_libyaml_rejects=21407` (libyaml is 1.1 and
 stricter in places not audited item-by-item — same caveat the original audit
-recorded), `zig_accepts__libyaml_charset_reject=8047` (invalid UTF-8 and control bytes
-YAML 1.2 §5.1 forbids too: this module does not validate either — `SPEC.md` §4 says the
-scanner is byte-transparent and the composer validates, but the composer does not; an
-open gap, not fixed here), `libyaml_accepts_zig_rejects=3336`, `zig_accepts__libyaml_dupkey=278`.
-⚠ The audit run of 2026-09-05 recorded `166958` agreements / `7994` charset-reject on
-the same seed (`20260905`). The mutation stream is deterministic (the seed files are
-sorted by content), so the difference comes from what changed since: the module
-(`charWidth` now consumes one byte for 0xF5-0xFF, 2026-09-10) and possibly the
-suite checkout. Not bisected.
+recorded), `libyaml_accepts_zig_rejects=3336`, `zig_accepts__libyaml_dupkey=277`,
+`zig_accepts__libyaml_charset_reject=1` — and that one is a misfiled unknown-tag
+error (`volume.py` buckets on the word "invalid"), not a character. Before F11 the
+same run gave `AGREE=166905 (83.45%)` with `8047` in the charset bucket; the
+2026-09-05 audit run gave `166958` / `7994` (the difference to 166905 was not
+bisected; the mutation stream is deterministic, so it came from module or suite
+changes in between).
 
 **Licences, verified at the installed package's own metadata:**
 PyYAML 6.0.3 is MIT (`pip show pyyaml` → `License: MIT`); libyaml is Expat

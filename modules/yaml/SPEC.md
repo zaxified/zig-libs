@@ -142,8 +142,12 @@ loop, never allocate without bound on arbitrary input** (CONVENTIONS.md §7.1).
 - *Panics on malformed UTF-8* — the cursor advances by a computed character
   width and clamps to `src.len`; a stray continuation byte consumes one byte.
   Scalar text is passed through as bytes and never decoded, so no case can index
-  past the end. Invalid UTF-8 is **not** rejected: this layer is byte-transparent
-  and validation belongs to the composer.
+  past the end. That is safe because the stream is validated first:
+  `fetchStreamStart` rejects any input that is not UTF-8 (§5.2) or holds a
+  character outside `c-printable` (§5.1) with `error.InvalidYaml`, before the
+  first token (A1/yaml.md F11, 2026-09-17; before that invalid bytes were
+  composed into scalars). Escapes may still produce such characters inside a
+  double-quoted scalar; only the text itself is checked.
 - *Nesting exhaustion* — bounded by `max_depth` (§2), and independently by the
   composer's own `Options.max_depth`, which also keeps `composeNode`'s recursion
   off the end of the stack. ⚠ A1/yaml.md F10 (fixed 2026-09-10): the second

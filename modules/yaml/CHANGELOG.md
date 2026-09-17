@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **BEHAVIOURAL (refuses more):** audit A1 F11, user decision. The scanner now
+  rejects, with `error.InvalidYaml` and a `problem_mark` at the offending byte, any stream that is
+  not valid UTF-8 (YAML 1.2 §5.2) or contains a character outside `c-printable` (§5.1: C0
+  controls other than tab/LF/CR, DEL, C1 controls other than NEL, U+FFFE/U+FFFF). Before, such
+  bytes were composed into scalars as they stood — the F4 fix of 2026-09-10 only stopped them
+  from swallowing their neighbours. Escapes in double-quoted scalars (`"\0"`, `"\x1b"`) are
+  unaffected. The yaml-test-suite ledger is unchanged; against libyaml over 200 000 mutated
+  documents, accept/reject agreement rose from 83.45 % to 87.49 %.
+
 - **2026-09-13** — **BEHAVIOURAL:** A1 findings F7 and F9. F7: an escaped UTF-16 surrogate pair
   (`"\uD83D\uDE00"`) now decodes to the one astral character it spells, as in JSON (YAML 1.2
   is a strict superset of JSON, §1.2; RFC 8259 §7); a lone or mismatched surrogate is still
