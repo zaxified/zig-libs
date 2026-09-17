@@ -357,3 +357,5 @@ sub-tag-length payloads, and the Appendix B.1 restart procedures.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** RFC 8613 Appendix C official vectors (key derivation + protected-message C.4-C.8)
+
+**Independent re-derivation:** `modules/oscore/tools/README.md` — a third-party crypto stack (python `cryptography`) recomputes every Appendix C field from scratch; 73/73 agree.
