@@ -401,4 +401,9 @@ of the cached share.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
-**What the tests actually contain.** official BOLT#8 Appendix A Transport Test Vectors (NOTICE)
+**What the tests actually contain.** official BOLT#8 Appendix A Transport Test Vectors (NOTICE),
+plus an independent interop anchor: `tools/peer.zig` paired against lnd's own `brontide`
+(fetched fresh by `tools/fetch-oracle.sh`, never vendored) completes the full handshake and a
+1100-message bidirectional transport exchange in both roles, and this module fails closed with
+`error.DecryptionFailed` against two forged-handshake wire attacks — see `tools/README.md` for the
+measured run.
