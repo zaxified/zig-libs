@@ -2,6 +2,11 @@
 
 Two things live here, and they answer different questions.
 
+Only two kinds of instrument are kept here (`CONVENTIONS.md` §9): recipes for data the
+tests pin, and oracles that drive a foreign implementation through the public API or
+wire format. The audit's mutation runners and per-finding probes were deleted on
+2026-09-17; what they found is pinned by tests in `src/` or filed as open findings.
+
 **`interop.zig` + `reference.py`** (already present) freeze the reference
 implementation's output into `../src/testdata/` so the module's own tests can
 replay it without a Python. That is the ANCHOR, taken once.
@@ -43,14 +48,9 @@ silently stops comparing what you think it compares.
 | `camp2.py` | Do we agree on ~120 hand-built pathologies? | Non-minimal varints, field 0, wire types 3–7, 4 GiB length claims, packed/unpacked confusion, overlong UTF-8, 200-deep nesting. Hand-written because a random generator does not produce these. |
 | `camp4.py` | Do we agree on randomly corrupted messages? | Decision parity under mutation — the shape a hostile input actually has. |
 | `camp5.py` | — | The long run: well-formed plus mutated, every divergence bucketed by CAUSE, including the ones known to be artifacts of the oracle. |
-| `mutate.py` | Would the suite notice if a guard were removed? | 32 mutations with two positive controls. See its header for the six anchors that have gone stale. |
-| `mkn.py` | Where does comptime codec construction stop scaling? | A consumer with a large generated schema is the first to hit the branch quota, and the error reads like their fault. |
 
 ## ⚠ Known, and deliberate
 
-- **Six of `mutate.py`'s anchors no longer match** the current sources (V1–V4,
-  D3/D4). They report PATCH-FAILED, which is the honest outcome: a patch that
-  did not land is a missing row, not a verdict.
 - **The campaigns differ in whether a divergence is a failure, and deliberately
   so.** `camp1.py` exits non-zero on any divergence: its inputs are the
   reference's own output, so there is no artifact class and no room for a
@@ -59,6 +59,3 @@ silently stops comparing what you think it compares.
   fields the reference reports as unknown because the tag was non-minimal), and
   failing on those would cry wolf every run. Read its buckets instead. `camp2.py`
   and `camp4.py` sit between the two — see their headers.
-- **The audit's mutation base tree was not brought along.** It had drifted 339
-  lines from `decode.zig` and 320 from `encode.zig` and still carried
-  `reference_interop.zig`; `mutate.py` now copies from `../src` at run time.

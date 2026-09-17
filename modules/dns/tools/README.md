@@ -1,10 +1,15 @@
 # `dns` verification instruments
 
-Six instruments in three groups. Two are wired into `zig build`; four are run by
+Five instruments. Two are wired into `zig build`; three are run by
 hand. They live here rather than in `src/` because each needs something
 `zig build test-dns` must not require — a foreign toolchain (dnspython), a real
 socket and a second schedulable thread, or the live internet
 (`CONVENTIONS.md` §9).
+
+Only two kinds of instrument are kept here (`CONVENTIONS.md` §9): recipes for data the
+tests pin, and oracles that drive a foreign implementation through the public API or
+wire format. The audit's mutation runners and per-finding probes were deleted on
+2026-09-17; what they found is pinned by tests in `src/` or filed as open findings.
 
 Figures below were measured on 2026-09-16 against the tree as it stands.
 
@@ -67,7 +72,7 @@ semantically. Of the 2 538: **1 620 are dnspython `FormError` and 833
 inspected were each a name inside the RDATA of a type this module stores as
 RAW, i.e. the same scope difference. The other direction (130) is 121
 `BadRecord` — this module being deliberately stricter about RDATA overrunning
-RDLENGTH, which mutation M8 covers.
+RDLENGTH.
 
 So the useful question is not *do they differ* but *did the difference move*.
 The counts are pinned against a fingerprinted corpus (SHA-256 in the script);
@@ -78,58 +83,3 @@ do not widen the check.
 Demonstrated 2026-09-16 that each branch works: pinned corpus → exit 0; a
 truncated probe output → exit 2 naming the misalignment; an unpinned corpus →
 reported, exit 0.
-
-## Would the suite notice if a guard were removed?
-
-    modules/dns/tools/mutate.py             # the whole table
-    modules/dns/tools/mutate.py M1 M3       # only those rows
-    modules/dns/tools/mutate.py --controls  # only the two positive controls
-
-Eight mutations and two controls over `message.zig`, each copying the live
-`message.zig` **and** `goldens.zig` into a per-process scratch tree.
-
-Measured: **10 rows, 9 RED, 1 GREEN, 0 BROKEN, 0 anchor problems** — the single
-GREEN is the `PC-ok` control. Every one of the eight real mutations is caught:
-the pointer-jump budget, the 253-char name cap, forward pointers, both
-allocation-amplification pre-checks, reserved label types, the CAA empty tag,
-and the rdata-overruns-RDLENGTH check. This suite has no unnoticed guard.
-
-⚠ **The command line is the part that rots, and only running catches it.** The
-shell runner this replaces did `zig test mut.zig` with no `--dep` at all —
-correct when written, and wrong now that `message.zig` imports `testkit` at file
-scope and `goldens.zig` relatively. Measured: it fails with
-`goldens.zig: FileNotFound` before a single mutation is judged, so **every row
-would have read RED, the positive control included** — a table that looks
-exactly like a suite which catches everything. Anchors do not catch this: all
-nine still matched their site exactly once. `whois`'s runner shipped with the
-same defect, which is why `PC-ok` exists and why `BROKEN` is a verdict distinct
-from `RED`.
-
-⚠ `PC-bad` must fail at **runtime**, not in the compiler. A control that can
-only fail while compiling proves the mutation landed and proves nothing about
-whether the test binary ran and its assertions were evaluated.
-
-## What was deliberately not brought over
-
-The audit left 15 instruments in `.zig-cache/audit-dns/` (303 MB, mostly build
-output). Four became the tools above; the rest were dropped with a reason:
-
-- `probe_fuzz.zig` — spent. It measured the `Smith.bytes` + ranged-draw trap
-  that fed the fuzz harness an empty packet; the fix is in `src/message.zig`
-  (one `smith.slice` call) with the measurement recorded beside it.
-- `seam.zig`, `labelcount.py` — the `dns` → `dnssec` seam they found is closed
-  and **enforced in code**: `dnssec/canonical.zig:80` compares `r.labels.len`
-  against `labelCount(text)` and refuses `InconsistentRrset`.
-- `names.zig`, `names_oracle.py` — audit F7 (three wire names decode to one
-  dotted string) is closed as a *documented contract*: `message.zig`'s header
-  states it outright and `Record.labels` carries the true wire boundaries so a
-  consumer must not count dots. The accept/reject half is subsumed by the
-  dnspython differential above.
-- `amp.zig` — allocation amplification is pinned by two live tests
-  (`adversarial counts cannot force large allocations`, and `hostile
-  ANCOUNT/QDCOUNT are refused BEFORE the section is allocated — measured, not
-  inferred`).
-- `msg.zig`, `mut.zig`, `mut_m4.zig`, `mut_m8.zig`, `survivors.zig` — snapshots
-  of the module 181 lines behind it, and the probe that imported two of them.
-- `run.sh`, `stub.py`, `driver.zig`, `httpstub.py`, the audit's own `build.zig`
-  — superseded by `interop.zig`, which is in the gate.

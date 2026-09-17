@@ -1,9 +1,14 @@
 # `hqc` verification instruments
 
-Four instruments that check this module against the **C reference implementation**,
-plus the mutation runner that checks the test suite itself. They live here and not in
+Three instruments that check this module against the **C reference implementation**.
+They live here and not in
 `src/` because every one of them needs a foreign toolchain — a C compiler, CMake, a
 Python — which a module must never require (`CONVENTIONS.md` §9).
+
+Only two kinds of instrument are kept here (`CONVENTIONS.md` §9): recipes for data the
+tests pin, and oracles that drive a foreign implementation through the public API or
+wire format. The audit's mutation runners and per-finding probes were deleted on
+2026-09-17; what they found is pinned by tests in `src/` or filed as open findings.
 
 None of them is wired into `zig build`. They are run by hand, and each prints what it
 found; the repository-side claims they support are in `NOTICE`, `SPEC.md` and
@@ -38,8 +43,3 @@ in this module and is not one.
 | `compare_kat.py` | Are the vectors pinned in `src/kat_vectors_kem.zig` the official NIST `.rsp` bytes? | A Zig test can only compare our vectors with themselves. This reads the reference's own `.rsp` files, which the module does not ship. |
 | `oracle_hqc.c` | Given a seed, what does the **C reference** produce? | A differential oracle. Our tests replay frozen vectors; this recomputes the answer on the other implementation, including for seeds no KAT covers. |
 | `oracle.sh` | — | Builds `oracle_hqc.c` for all three parameter sets in both lanes (`ref`, `avx256`), so the two reference lanes can also be compared against each other. |
-| `bench.sh` | What does the reference cost, on this machine, in the same units? | Comparing our numbers to published ones compares two machines. This builds the reference here. |
-| `mutate.py` | Would this module's own suite notice if the code were wrong? | Tests prove the code passes; only mutation shows the suite can fail. Carries positive controls that MUST be killed. |
-
-`bench_hqc.c` is the benchmark body `bench.sh` compiles; it is our own code and does not
-appear in the table because it is not run directly.

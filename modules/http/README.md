@@ -683,19 +683,3 @@ loopback origin↔proxy↔client integration test).
 - Live client tests (auto-skipped without network): `GET
   https://example.com` over TLS returns 200 + body; an `http://` request
   completes.
-- **Hand-run instruments (`tools/`, not wired into `zig build`):**
-  `probe_injection.zig` — a real loopback peer records what actually leaves the
-  process when a caller byte carries CR/LF through an h1 header, a URL, or an h2
-  field; it is the regression detector for the request-smuggling fix, and exits
-  non-zero if an injection reaches the peer or a control does not.
-  `probe_redirect_credentials.zig` — which caller-pinned headers survive a
-  cross-origin redirect hop, observed on hop two. `probe_framing.zig` — which
-  blank-line and chunk-framing spellings are accepted, and whether the trailer
-  section is bounded; it is the regression detector for the bare-LF and
-  unbounded-trailer fixes. `probe_limits.zig` — parser robustness sweep plus the
-  `conneg`, `Range` and `bufpool` cost measurements.
-  `probe_fuzz_shape.zig` — how many bytes of a seed a fuzz harness actually
-  hands its parser, across the superseded and shipped openings (needs no module
-  graph: `zig test probe_fuzz_shape.zig`). `mutate.py` — deletes one shipped
-  guard at a time from a copy of `src/` and reports whether the suite notices.
-  See `tools/README.md` for what each answers and why it is not a unit test.
