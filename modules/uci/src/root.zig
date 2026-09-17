@@ -1723,6 +1723,38 @@ test "isBareSafe boundary: a key containing a quote character must not be writte
     try testing.expectError(error.InvalidName, parse(gpa, text));
 }
 
+test "isBareSafe boundary: a key containing a comment or word separator is quoted" {
+    // Audit A1 U21/U22: widening `isBareSafe` by `#` or by a space left the
+    // suite green. Written bare, `a#b` would start a comment and `a b` would
+    // split into two tokens.
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "a#b", "a b" }) |key| {
+        const opts = [_]Option{.{ .key = key, .kind = .single, .values = &.{"v"} }};
+        const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
+        const pkg: Package = .{ .sections = &secs };
+        const text = try serialize(gpa, &pkg);
+        defer gpa.free(text);
+        const quoted = try std.fmt.allocPrint(gpa, "\toption '{s}' ", .{key});
+        defer gpa.free(quoted);
+        try testing.expect(std.mem.indexOf(u8, text, quoted) != null);
+    }
+}
+
+test "serializer refuses every control byte except tab, newline and carriage return" {
+    // Audit A1 U20: widening `isEscapelessControl` by 0x0b left the suite
+    // green, because the only refusal test used 0x01. Pin the whole range.
+    const gpa = testing.allocator;
+    var c: u8 = 0;
+    while (c < 0x20) : (c += 1) {
+        if (c == '\t' or c == '\n' or c == '\r') continue;
+        const value = [_]u8{ 'a', c, 'b' };
+        const opts = [_]Option{.{ .key = "k", .kind = .single, .values = &.{&value} }};
+        const secs = [_]Section{.{ .type = "t", .name = null, .anonymous = true, .options = &opts }};
+        const pkg: Package = .{ .sections = &secs };
+        try testing.expectError(error.UnserializableValue, serialize(gpa, &pkg));
+    }
+}
+
 test "writeWord's empty-word path round-trips an empty type and an empty key" {
     // Regression for audit A1 U18: `writeWord`'s empty-input branch (falls
     // through to `writeValue`, producing `''`) had no test; a mutation that
