@@ -1,0 +1,37 @@
+iec104 — provenance note
+========================
+
+A record only. Nothing in this file imposes a redistribution condition beyond
+zig-libs' own MIT license (see the repository `LICENSE`). The one third party
+named below is strongly copyleft; it is named with its licence precisely
+because the argument for why nothing is owed has to be checkable.
+
+Original work
+-------------
+
+The module is this repository's own implementation of IEC 60870-5-104, a
+public IEC standard.
+
+Test oracle: c104 (GPL-3.0-or-later)
+------------------------------------
+
+`src/goldens.zig` freezes wire traffic between a c104 2.2.1 controlling station
+and a c104 controlled station (Martin Unkel, Fraunhofer FIT; a pybind11 binding
+over lib60870-C, both **GPL-3.0**), recorded through a TCP proxy. The scripts
+that took those captures and drive this module's outstation with a real c104
+master live in `tools/` (`global_ca_capture.py`, `global_ca_capture2.py`,
+`live_global_ca_master.py`). They are this repository's own files (MIT).
+
+c104 is used as a black box only. It is installed in a throwaway virtualenv by
+whoever runs those scripts; it is never vendored, never a build dependency,
+never linked into anything this repository builds, and no committed test
+imports or runs it — `zig build test-iec104` replays the frozen bytes. No part
+of c104 or lib60870-C — source, header, binary or documentation text — is
+copied, translated or redistributed here, and its source was not read. What is
+committed is the octet stream of a conversation between separate processes
+speaking a public standard, plus c104's own textual decode of those octets.
+The GPL attaches to c104's own work, and none of c104's own work is here.
+
+This is the same posture, and the same reasoning, as
+`modules/fleetsim/NOTICE` for its c104 master
+(`scripts/vm/guests/fleetsim-iec104-master.py`).

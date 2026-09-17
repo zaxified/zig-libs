@@ -47,6 +47,14 @@ reproduced here as its terms require:
     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
     DEALINGS IN THE SOFTWARE.
 
+The exact script `tools/interop.zig` and the files above call
+`reference_params.sage` is HorizenLabs' `poseidon2_rust_params.sage`
+(https://github.com/HorizenLabs/poseidon2, file last changed in commit
+`bb476b9ca38198cf5092487283c8b8c5d4317c4e`; repository licensed MIT OR
+Apache-2.0), SHA-256
+`c301c6d074b58cc27f117f59971f405a16c57d10e6140f1025643fa25ba75223`, verified
+byte-identical on 2026-09-17. It is not vendored here; fetch it from there.
+
 `tools/subspace_trail.py` is a SECOND port of the same acceptance checks, on
 sympy, written to cross-check the Zig one; it is this repository's own file
 (MIT) and reproduces no sage source verbatim, but it is derived from the same
