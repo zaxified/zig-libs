@@ -191,3 +191,5 @@ within ~1.3x either way.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 
 **What the tests actually contain.** libsodium C lib called via FFI to compute expected ciphertexts (kat_vectors.zig)
+
+**Bidirectional differential:** `modules/sealedbox/tools/README.md` — `driver.zig` + `diff_pynacl.py` drive the real `seal`/`open` API against PyNaCl in both directions, 2000 cases each way; 6000/6000 agree.
