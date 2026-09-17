@@ -713,6 +713,22 @@ test "U32Key helpers place matches at the right IPv4 offsets" {
     try testing.expectEqualSlices(u8, &.{ 0x00, 0x06, 0x00, 0x00 }, &proto.val);
 }
 
+test "parseU32Options: a selector with more keys than U32Wire holds fills it and stops" {
+    // Audit A1 tc F13: removing the `keys_len < keys.len` bound left the
+    // suite green, while a selector with more than 8 keys then writes past
+    // `keys` (a panic in safe modes, silent corruption in ReleaseFast).
+    const gpa = testing.allocator;
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(gpa);
+    var keys: [40]U32Key = undefined;
+    for (&keys, 0..) |*k, i| k.* = U32Key.ipv4Dst(.{ 10, 0, 0, @intCast(i) }, 32);
+    try appendU32Options(.{ .keys = &keys }, gpa, &list, test_ps);
+    const uw = try parseU32Options(list.items);
+    try testing.expectEqual(@as(u8, 40), uw.nkeys);
+    try testing.expectEqual(@as(u8, uw.keys.len), uw.keys_len);
+    try testing.expectEqual(@as(u8, 7), uw.keys[7].val[3]);
+}
+
 test "prefixMask6 builds IPv6 masks bit-exactly" {
     try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 4 ++ [_]u8{0} ** 12), &prefixMask6(32));
     try testing.expectEqualSlices(u8, &([_]u8{0xff} ** 16), &prefixMask6(128));
