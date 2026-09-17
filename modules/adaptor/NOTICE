@@ -89,12 +89,11 @@ External interop vectors (captured, not copied)
   crate:    secp256kfun 0.12.1   (license 0BSD, pulled transitively)
   repo:     https://github.com/LLFourn/secp256kfun
   captured: 2026-08-09, rustc 1.93.1
-  command:  cargo run --release --manifest-path ~/.cache/zig-libs-adaptor/Cargo.toml \
+  command:  cargo run --release --manifest-path modules/adaptor/tools/vectors/Cargo.toml \
               > modules/adaptor/src/interop_vectors.zig
 
-The generator (a ~300-line Rust program kept OUTSIDE this repository, under
-`~/.cache/zig-libs-adaptor/`, exactly like the other modules' live
-counterparts) links the published crates and records the values they compute
+The generator (a ~300-line Rust program of our own, `tools/vectors/`; the
+crates it links are fetched by cargo and never vendored) links the published crates and records the values they compute
 at run time. No secp256kfun/schnorr_fun source is copied or translated into
 this repository, and `build.zig.zon` gains no dependency: the captured bytes
 are permanent, so `zig build test-adaptor` runs fully offline with the Rust

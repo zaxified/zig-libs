@@ -287,8 +287,8 @@ and are recorded as such instead of being dropped:
   close frame; python's reader simply waits for the 2^63 bytes). No majority verdict was
   manufactured for these; the three answers are recorded and *this module's* answer is pinned.
 
-**Offline and non-skipping.** The capture scripts live outside the repository in
-`~/.cache/zig-libs-websocket/`; `build.zig.zon` stays empty. All three implementations can be
+**Offline and non-skipping.** The capture scripts live in `tools/`
+(never built or run by a test); `build.zig.zon` stays empty. All three implementations can be
 deleted and the tests are unchanged — they never skip. Licence reasoning is in this module's
 `NOTICE`.
 

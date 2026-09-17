@@ -1,0 +1,9 @@
+[package]
+name = "adaptor_vectors"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hex = "0.4"
+schnorr_fun = { version = "0.13.0", features = ["serde"] }
+sha2 = "0.10"

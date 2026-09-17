@@ -13,7 +13,7 @@
 //! * Licence:    BSD-3-Clause (The Go Authors). Nothing from it is copied or
 //!               translated into this repo -- the package was *run* and its
 //!               outputs recorded, so no foreign condition attaches here.
-//! * Driver:     `~/.cache/zig-libs-ratelimit/xrate/main.go` (outside the repo;
+//! * Driver:     `modules/ratelimit/tools/xrate/main.go` (outside the repo;
 //!               zig-libs keeps zero external dependencies and no `go` reference
 //!               under `modules/`).
 //! * Command:    `go run . > modules/ratelimit/src/xrate_vectors.zig`

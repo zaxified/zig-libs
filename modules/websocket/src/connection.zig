@@ -435,8 +435,8 @@ test "external anchor: Autobahn|Testsuite's frozen UTF-8 stress-test corpus (Mar
 // executed and their behaviour recorded. It is an oracle that can disagree
 // with us, and on its first run it did — see `close_code_1012`/`1013`.
 //
-// Frozen 2026-08-09 by ~/.cache/zig-libs-websocket/{cases,oracle_python,
-// emit_zig}.py + a Go harness. These tests run offline and never skip; all
+// Frozen 2026-08-09 by tools/{cases,oracle_python,report,emit_zig}.py +
+// tools/oracle_go_main.go. These tests run offline and never skip; all
 // three implementations can be deleted and nothing here changes. Licences are
 // all permissive and nothing is copied, translated or redistributed from any
 // of them — what is frozen is observed numeric behaviour on a public wire

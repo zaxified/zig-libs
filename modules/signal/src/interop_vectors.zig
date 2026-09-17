@@ -45,9 +45,9 @@
 //!   commit:   857c4dc ("Remove require_pq_ratio from protocol and bridge.")
 //!   crate:    libsignal-protocol 0.1.0 (workspace member `rust/protocol`)
 //!   captured: 2026-08-09, rustc 1.93.1
-//!   method:   a local-only `#[cfg(test)] mod zig_libs_dump` appended to
+//!   method:   `tools/libsignal_dump.rs` (a `#[cfg(test)] mod zig_libs_dump`) appended to
 //!             `rust/protocol/src/ratchet/keys.rs` in a throwaway checkout
-//!             under `~/.cache/zig-libs-signal/`, driving libsignal's OWN
+//!             kept outside this repository, driving libsignal's OWN
 //!             `ChainKey`/`RootKey` (both `pub(crate)`, hence the in-crate
 //!             driver) over fixed inputs and printing the results:
 //!   command:  PROTOC=<cargo-vendored protoc> \

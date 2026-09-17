@@ -19,7 +19,7 @@
 //!               copied or translated into this repo -- it was built, *run*,
 //!               and its outputs recorded, so no foreign condition attaches
 //!               here and the root `NOTICE` is unaffected.
-//! * Driver:     `~/.cache/zig-libs-spake2plus/capture_w0w1.cc` (outside the
+//! * Driver:     `modules/spake2plus/tools/capture_w0w1.cc` (outside the
 //!               repo; zig-libs keeps zero external dependencies).
 //! * Command:    `c++ -std=c++17 -O1 -o capture_w0w1 capture_w0w1.cc \`
 //!               `  -I boringssl -I boringssl/include \`

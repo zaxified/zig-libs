@@ -96,8 +96,8 @@ suite green and are caught only by these vectors.
 
 Provenance and licence for those bytes: signalapp/libsignal at commit
 `857c4dc`, crate `libsignal-protocol` 0.1.0, captured 2026-08-09 by
-appending a local-only `#[cfg(test)]` driver to a throwaway checkout under
-`~/.cache/zig-libs-signal/` (libsignal's `ChainKey`/`RootKey` are
+appending our own `#[cfg(test)]` driver (`tools/libsignal_dump.rs`, MIT) to a
+throwaway checkout kept outside this repository (libsignal's `ChainKey`/`RootKey` are
 `pub(crate)`) and printing the results — see `src/interop_vectors.zig` for
 the exact command. libsignal is **AGPL-3.0**. No libsignal source is copied,
 translated or vendored into this repository, `build.zig.zon` gains no

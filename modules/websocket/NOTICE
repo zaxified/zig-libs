@@ -57,9 +57,8 @@ corpus requires it:
     fields are numeric close codes and accept/reject outcomes those three
     programs emitted on a socket in response. Observed numeric behaviour of a
     public wire specification is not a copyrightable expression of theirs.
-  * That statement is true of what was actually done: the capture scripts live
-    outside the repository in `~/.cache/zig-libs-websocket/` and read no
-    upstream source file; the Go harness only dials a loopback socket and
+  * That statement is true of what was actually done: the capture scripts (now in
+    `tools/`, our own code) read no upstream source file; the Go harness only dials a loopback socket and
     records the bytes that come back.
 
 The three implementations are build- and test-time absent. These tests run
