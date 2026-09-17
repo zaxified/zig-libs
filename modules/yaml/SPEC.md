@@ -394,3 +394,9 @@ consumer needing bignums has the exact text and can parse it itself.
 **What the tests actually contain.** yaml-test-suite EXTERNAL 402/402 events + 279/279 json; int/float resolution also test-suite covered (VERIFIED 2026-08-01)
 
 **How it got there.** The anchoring work landed. VERIFIED 2026-08-01: survey was WRONG, all 402 cases already execute; teeth-checked
+
+**Differential anchor against PyYAML/libyaml (adopted 2026-09-17):** `tools/ydump.zig` +
+`tools/compare.py`/`volume.py` diff this module's `composeAll` against PyYAML 6.0.3 (over
+the yaml-test-suite corpus) and against libyaml (`CSafeLoader`, 200 000 mutated documents).
+Both are 1.1 parsers so most divergence is expected-and-bucketed, not a module defect — see
+`tools/README.md` for the measured breakdown and how to re-run it.
