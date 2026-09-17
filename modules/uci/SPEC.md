@@ -52,12 +52,14 @@ add an empty element; `serialize` refuses a hand-built single option with an emp
 `SerializeError.InvalidName` in `root.zig`): section/option names must be alphanumeric or `_` (not
 even `-`); section types are looser (alphanumeric/`_` or any other printable, non-space ASCII byte).
 A zero-length name/type/key is exempt from that check (see U7's fix commit) — `config ''`/`option ''
-v` producing a literal empty type/key stays accepted, per the deviation noted below. Two `config`
-blocks sharing a name are rejected outright as `error.DuplicateSection` (audit A1 U1) rather than
-silently building two `Section`s and answering every accessor from the FIRST one's values: real `uci`
-either merges same-type duplicates (last option value wins) or rejects a same-name/different-type
-collision, and this module's `[]Section` model cannot represent the merge, so it rejects both shapes
-rather than silently disagreeing with the device about which value is live.
+v` producing a literal empty type/key stays accepted, per the deviation noted below. A `config`
+block reusing the name of an earlier section of the same type continues that section, measured
+against the real `uci` binary (audit A1 U1/U25, `tools/capture-grammar.sh`): its lines apply as if
+they followed the first block (a repeated option replaces, a list appends, `option`/`list` mixed under
+one key is still `MixedOptionList`), and the section keeps its first position. The same name with a
+different type is `error.DuplicateSection`, as in real `uci`'s default strict mode (`uci -S` would
+retype the section; not followed). `serialize` refuses two sections sharing a name with
+`error.DuplicateSection`: the text would read back as one merged section.
 Never-panic, line-numbered errors: malformed input yields a typed `ParseError` (`UnterminatedQuote`,
 `BadKeyword`, `MissingArgument`, `TooManyArguments`, `OptionOutsideSection`, `MixedOptionList`,
 `DuplicateSection`, `InvalidName`, `MemoryLimitExceeded`, …); `parseDiag` fills a 1-based
@@ -230,7 +232,8 @@ question for the user. Four findings closed this way:
    the LAST. The model can't represent real uci's merge, so both a same-type collision (which real
    uci merges) and a same-name/different-type collision (which real uci's strict mode already
    rejects) now fail closed as `error.DuplicateSection`, rather than one implementation of "the
-   config" silently disagreeing with the other about which value is live.
+   config" silently disagreeing with the other about which value is live. *Superseded 2026-09-17
+   (audit A1 U25):* the same-type case now merges, as measured on the real binary; see above.
 2. **U3 — the 16 MiB input cap didn't bound the built MODEL.** Measured 22x-41.5x live-byte
    amplification on a legal, `max_input_len`-sized input (up to 371 MB RSS from 16.6 MB of text). A
    ratio-of-input-size cap was tried and rejected: the worst measured shape amplifies close enough to

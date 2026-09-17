@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — **BEHAVIOURAL (accepts more; `SerializeError` grows):** audit A1 U25, user
+  decision (behave as real `uci`). A `config` block reusing the name of an earlier section of the
+  same type now continues that section instead of failing with `DuplicateSection`: a repeated
+  option replaces, a list goes on, the section keeps its first position, so `sections.len` can be
+  smaller than the number of `config` lines. The same name with another type is still
+  `DuplicateSection` (real `uci`'s default strict mode). `serialize` returns the new
+  `SerializeError.DuplicateSection` for two sections sharing a name — an exhaustive `switch` over
+  `SerializeError` must handle it. Measured on the real binary; `tools/capture-grammar.sh` gained
+  eight probes.
+
 - **2026-09-17** — **NO CONSUMER-VISIBLE CHANGE:** test only (audit U23, U24). The round-trip
   harness draws types, names and keys from the validators' alphabets and keeps values printable,
   so its corpus now reaches the comparison (5 of 6 scripts, was 0 of 5 non-empty); the corpus

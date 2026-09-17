@@ -22,10 +22,12 @@
 # `show` rendering of the parsed model.
 #
 # Audit A1 U8 (backslash outside quotes), U9 (`;`), U10 (empty values), U19
-# (`package` line), plus keyword forms. Two measured divergences are left out
-# on purpose, because the module keeps its own stricter rule there (audit
+# (`package` line), U25 (a repeated section name), plus keyword forms. Two
+# measured divergences are left out on purpose, because the module keeps its
+# own stricter rule there (audit
 # A1 U11): `list l ''` then `option l 'x'`, and `option v 'x'` then
-# `list v ''`, both of which real uci merges and this module refuses.
+# `list v ''`, both of which real uci merges and this module refuses -- the
+# same holds when the two lines sit in two blocks of one merged section (U25).
 
 set -euo pipefail
 
@@ -171,6 +173,15 @@ probes=(
   "${S}'option' a b\n"
   "${S}option\n"
   "config\n"
+  # U25: a config block reusing a section name
+  "config t 'a'\n\toption x '1'\n\nconfig t 'a'\n\toption x '2'\n"
+  "config t 'a'\n\toption x '1'\n\toption y 'keep'\n\nconfig t 'a'\n\toption x '2'\n\toption z 'new'\n"
+  "config t 'a'\n\tlist l '1'\n\tlist l '2'\n\nconfig t 'a'\n\tlist l '3'\n"
+  "config t 'a'\n\toption x '1'\n\nconfig t 'b'\n\toption x 'b'\n\nconfig u\n\toption x 'anon'\n\nconfig t 'a'\n\toption x '2'\n"
+  "config t 'a'\n\toption x '1'\n\nconfig u 'a'\n\toption x '2'\n"
+  "config t 'a'\n\toption x '1'\n\nconfig t 'a'\n"
+  "config t 'a'\n\toption x '1'\n\nconfig t 'a'\n\toption x '2'\n\nconfig t 'a'\n\toption y '3'\n"
+  "config t\n\toption x '1'\n\nconfig t\n\toption x '2'\n"
 )
 
 echo "# Real \`uci show\` of each probe file \`p\`: \`in\` = file bytes (hex),"

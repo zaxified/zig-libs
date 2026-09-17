@@ -120,11 +120,13 @@ _ = pkg.eql(&other);
   would refuse to load is rejected here too (audit A1 U7, `error.InvalidName`;
   not enforced on an option key when *writing*, see the source for why). A
   zero-length name/type/key is the one exception (see below).
-- Two `config` blocks sharing a name are rejected as `error.DuplicateSection`
-  regardless of whether they share a type (audit A1 U1) — this module's
-  `[]Section` model cannot represent real `uci`'s same-type merge (last
-  option value wins), so rather than silently answering every accessor from
-  the FIRST block's now-stale values, it refuses the file.
+- A `config` block reusing the name of an earlier section of the same type
+  continues that section, as real `uci` does (audit A1 U1/U25, measured): a
+  repeated option replaces, a list goes on, options only the first block had
+  stay, and the section keeps its first position. The same name with a
+  different type is `error.DuplicateSection`, as in real `uci`'s default
+  strict mode. `serialize` refuses a `Package` with two sections sharing a
+  name (`error.DuplicateSection`), since the text would read back as one.
 - Canonical output: optional `package <name>` header (bare when
   identifier-safe, quoted otherwise — matches real `uci export`'s own
   rendering), blank line between section blocks, tab-indented options, values

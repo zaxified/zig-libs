@@ -42,6 +42,9 @@
 //! the same key overwrites (last wins, matching UCI CLI set semantics);
 //! `list` entries under one key accumulate in order; mixing `option` and
 //! `list` under the same key is rejected as `error.MixedOptionList`.
+//! A later `config` block with the name AND type of an earlier section
+//! continues that section under the same rules (audit A1 U25, measured);
+//! the same name with another type is `error.DuplicateSection`.
 //!
 //! Statements: `;` separates statements on one line, a backslash outside
 //! quotes escapes the next byte or continues the line, an empty or missing
@@ -133,19 +136,14 @@ pub const ParseError = error{
     TooManyArguments,
     /// `option`/`list` before any `config` section.
     OptionOutsideSection,
-    /// `option` and `list` mixed under the same key in one section.
+    /// `option` and `list` mixed under the same key in one section --
+    /// including across two `config` blocks of one merged section (audit A1
+    /// U11/U25; real `uci` converts between the two instead).
     MixedOptionList,
-    /// Audit A1 U1: two `config` sections share a name. Real `uci` either
-    /// merges same-type duplicates (last option value wins, `sections.len`
-    /// unaffected) or rejects a same-name/different-type collision outright
-    /// under `UCI_FLAG_STRICT` -- this module's `[]Section` model cannot
-    /// represent the merge (it always allocates a new `Section`, so
-    /// `sections.len` would silently disagree with real `uci`'s count and
-    /// the first-written values, not the winning ones, would answer every
-    /// accessor query). Rather than accept a file whose two implementations
-    /// of "the config" disagree about which value is live, this module
-    /// rejects ALL duplicate-name collisions (same type or not) rather than
-    /// silently returning the wrong side.
+    /// Audit A1 U1/U25: a `config` block reuses the name of an earlier
+    /// section of a DIFFERENT type. Measured: real `uci` refuses this in its
+    /// default strict mode. A block reusing the name with the SAME type is
+    /// not an error: it continues the earlier section (see `parseConfig`).
     DuplicateSection,
     /// Audit A1 U7: a section name, section type, option key or package
     /// name uses a character the real `uci` binary refuses there (measured) -- anything other than alphanumeric/`_` for a
@@ -180,6 +178,10 @@ pub const SerializeError = error{
     /// A1 U14), and a directly-constructed `Package` (bypassing `parse`,
     /// which does enforce this for keys) is allowed to carry one.
     InvalidName,
+    /// Audit A1 U25: two sections share a name. `parse` reads such text as
+    /// ONE section (the blocks merge, as in real `uci`), so writing it would
+    /// hand back a different package. A `Package` from `parse` never has one.
+    DuplicateSection,
     OutOfMemory,
 };
 
@@ -465,8 +467,14 @@ const Parser = struct {
     /// at the last line that actually had content (typically the statement
     /// that is wrong), not at an empty line past end of file.
     line_no: usize = 1,
-    sections: std.ArrayList(Section) = .empty,
-    current: ?SecBuild = null,
+    /// Every section in file order (first occurrence), still open: a later
+    /// `config` block reusing a name continues the earlier one (audit A1
+    /// U25), so none is final before the input ends.
+    builds: std.ArrayList(SecBuild) = .empty,
+    /// Named section -> index into `builds`.
+    by_name: std.StringHashMapUnmanaged(usize) = .empty,
+    /// Index into `builds` of the section `option`/`list` lines go to.
+    current: ?usize = null,
     finished: []Section = &.{},
     /// Audit A1 U3: sections + options + values built so far, combined. See
     /// `max_total_items` and `checkMemoryLimit`.
@@ -481,8 +489,7 @@ const Parser = struct {
             try p.parseLine();
             try p.consumeLineEnd();
         }
-        try p.flushSection();
-        p.finished = try p.sections.toOwnedSlice(p.arena);
+        try p.finish();
     }
 
     /// Audit A1 U3: abort once the model has grown past `max_total_items`
@@ -697,29 +704,33 @@ const Parser = struct {
             // rule.
             if (!validTypeChars(sec_type)) return error.InvalidName;
             const name_tok = try p.optionalArg();
-            try p.flushSection();
             // An empty name ('' or absent) is anonymous.
             const name: ?[]const u8 = if (name_tok.len > 0) name_tok else null;
             // Audit A1 U7: a non-empty name must match real uci's name rule.
             if (name) |n| {
                 if (!validNameChars(n)) return error.InvalidName;
             }
-            // Audit A1 U1: real uci indexes section names in one namespace
-            // per package and either merges (same type) or rejects (mixed
-            // type) a second `config` block reusing an already-seen name.
-            // This module's `[]Section` model can't represent the merge (it
-            // always builds a new `Section`), so rather than silently
-            // answering every accessor from the FIRST block's values (what
-            // the device does not do -- it uses the LAST) it rejects any
-            // name collision, same type or not.
+            // Audit A1 U1/U25, measured against the real `uci` binary: a
+            // second `config` block reusing a name of the SAME type reopens
+            // the earlier section -- its lines continue that section exactly
+            // as if they had followed it (a repeated option replaces, a list
+            // appends), and the section keeps its first position. A DIFFERENT
+            // type is a parse error in real uci's default strict mode, and
+            // stays `DuplicateSection` here. (`uci -S` would retype the
+            // section instead; nothing here follows the non-strict mode.)
             if (name) |n| {
-                for (p.sections.items) |*s| {
-                    if (s.name) |sn| {
-                        if (std.mem.eql(u8, sn, n)) return error.DuplicateSection;
-                    }
+                if (p.by_name.get(n)) |idx| {
+                    if (!std.mem.eql(u8, p.builds.items[idx].section_type, sec_type)) return error.DuplicateSection;
+                    p.current = idx;
+                    return;
                 }
             }
-            p.current = .{ .section_type = sec_type, .name = name, .options = .empty, .index = .empty };
+            const idx = p.builds.items.len;
+            try p.builds.append(p.arena, .{ .section_type = sec_type, .name = name, .options = .empty, .index = .empty });
+            if (name) |n| try p.by_name.put(p.arena, n, idx);
+            p.current = idx;
+            p.total_items += 1; // one new section
+            try p.checkMemoryLimit();
         }
     }
 
@@ -837,7 +848,7 @@ const Parser = struct {
         // v 'x'` then `option v ''` loads `v='x'`). On `list` it is a real,
         // empty element.
         if (kind == .single and value.len == 0) return;
-        const cur = &p.current.?;
+        const cur = &p.builds.items[p.current.?];
         if (cur.index.get(key)) |idx| {
             const ob = &cur.options.items[idx];
             if (ob.kind != kind) return error.MixedOptionList;
@@ -866,25 +877,26 @@ const Parser = struct {
         try p.checkMemoryLimit();
     }
 
-    fn flushSection(p: *Parser) ParseError!void {
-        const sec = p.current orelse return;
-        const options = try p.arena.alloc(Option, sec.options.items.len);
-        for (sec.options.items, options) |*ob, *o| {
-            o.* = .{
-                .key = ob.key,
-                .kind = ob.kind,
-                .values = try ob.values.toOwnedSlice(p.arena),
+    fn finish(p: *Parser) ParseError!void {
+        const sections = try p.arena.alloc(Section, p.builds.items.len);
+        for (p.builds.items, sections) |*sec, *out| {
+            const options = try p.arena.alloc(Option, sec.options.items.len);
+            for (sec.options.items, options) |*ob, *o| {
+                o.* = .{
+                    .key = ob.key,
+                    .kind = ob.kind,
+                    .values = try ob.values.toOwnedSlice(p.arena),
+                };
+            }
+            out.* = .{
+                .type = sec.section_type,
+                .name = sec.name,
+                .anonymous = sec.name == null,
+                .options = options,
             };
         }
-        try p.sections.append(p.arena, .{
-            .type = sec.section_type,
-            .name = sec.name,
-            .anonymous = sec.name == null,
-            .options = options,
-        });
         p.current = null;
-        p.total_items += 1; // one new section
-        try p.checkMemoryLimit();
+        p.finished = sections;
     }
 };
 
@@ -908,6 +920,8 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
         try writeWord(gpa, &out, n);
         try out.append(gpa, '\n');
     }
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(gpa);
     for (pkg.sections, 0..) |*sec, i| {
         // Audit A1 U7 (write side): a section type/name real `uci` could
         // never have parsed must not be written -- see `ParseError.InvalidName`'s
@@ -916,6 +930,7 @@ pub fn serialize(gpa: Allocator, pkg: *const Package) SerializeError![]u8 {
         if (!validTypeChars(sec.type)) return error.InvalidName;
         if (sec.name) |n| {
             if (!validNameChars(n)) return error.InvalidName;
+            if ((try names.getOrPut(gpa, n)).found_existing) return error.DuplicateSection;
         }
         if (i != 0 or pkg.name != null) try out.append(gpa, '\n');
         try out.appendSlice(gpa, "config ");
@@ -1834,44 +1849,89 @@ test "addOption is not quadratic in distinct keys per section" {
     try testing.expect(ratio < 24.0);
 }
 
-test "duplicate named section is rejected" {
-    // Regression for audit A1 U1: real `uci` merges a same-type duplicate
-    // section name (last option value wins; `sections.len` unaffected) and
-    // rejects a same-name/different-type collision outright. This module's
-    // `[]Section` model cannot represent the merge (see
-    // `ParseError.DuplicateSection`'s doc comment), so instead of silently
-    // building two `Section`s and answering every accessor from the FIRST
-    // one's (stale) values -- what this module did before this fix, and the
-    // exact shape of the audit's reproduction -- it now rejects any name
-    // collision, same type or not.
+test "a repeated named section continues the first one; another type is DuplicateSection" {
+    // Audit A1 U1, then U25 (2026-09-17). Values measured with the real `uci`
+    // binary (`show`); `grammar_capture.txt` replays the same files.
     const gpa = testing.allocator;
-    var diag: Diagnostics = .{};
 
-    // Same type, same name: real uci merges (last wins, `proto=none`); this
-    // module rejects rather than silently keeping the FIRST value
-    // (`proto=static`), which is what the pre-fix audit reproduction showed.
+    // The audit's reproduction: the device uses `none`. Before U1 this
+    // module built two sections and answered `static`; between U1 and U25
+    // it refused the file.
+    {
+        var pkg = try parse(gpa, "config interface 'lan'\n\toption proto 'static'\n\nconfig interface 'lan'\n\toption proto 'none'\n");
+        defer pkg.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), pkg.sections.len);
+        try testing.expectEqualStrings("none", pkg.section("interface", "lan").?.get("proto").?);
+    }
+    // Options only the first block has stay; the section keeps the position
+    // of its first block, ahead of a section and an anonymous one between.
+    {
+        var pkg = try parse(gpa, "config t 'a'\n\toption x '1'\n\toption y 'keep'\n\n" ++
+            "config t 'b'\n\toption x 'b'\n\nconfig u\n\toption x 'anon'\n\n" ++
+            "config t 'a'\n\toption x '2'\n\toption z 'new'\n\nconfig t 'a'\n");
+        defer pkg.deinit(gpa);
+        try testing.expectEqual(@as(usize, 3), pkg.sections.len);
+        const a = pkg.sections[0];
+        try testing.expectEqualStrings("a", a.name.?);
+        try testing.expectEqual(@as(usize, 3), a.options.len);
+        try testing.expectEqualStrings("x", a.options[0].key);
+        try testing.expectEqualStrings("2", a.options[0].values[0]);
+        try testing.expectEqualStrings("y", a.options[1].key);
+        try testing.expectEqualStrings("keep", a.options[1].values[0]);
+        try testing.expectEqualStrings("z", a.options[2].key);
+        try testing.expectEqualStrings("b", pkg.sections[1].name.?);
+        try testing.expect(pkg.sections[2].anonymous);
+    }
+    // A list goes on across blocks.
+    {
+        var pkg = try parse(gpa, "config t 'a'\n\tlist l '1'\n\tlist l '2'\n\nconfig t 'a'\n\tlist l '3'\n");
+        defer pkg.deinit(gpa);
+        const l = pkg.sections[0].options[0];
+        try testing.expectEqual(Option.Kind.list, l.kind);
+        try testing.expectEqual(@as(usize, 3), l.values.len);
+        try testing.expectEqualStrings("3", l.values[2]);
+    }
+    // Real uci turns `option` + `list` under one key into a list, and a
+    // later `option` replaces a list. This module refuses the mix within one
+    // block (audit A1 U11), and a merged block is the same section.
+    try testing.expectError(error.MixedOptionList, parse(gpa, "config t 'a'\n\toption l '1'\n\nconfig t 'a'\n\tlist l '3'\n"));
+    try testing.expectError(error.MixedOptionList, parse(gpa, "config t 'a'\n\tlist l '1'\n\nconfig t 'a'\n\toption l '3'\n"));
+
+    // Same name, other type: real uci's default strict mode refuses the file
+    // ("section of different type overwrites prior section with same name").
+    var diag: Diagnostics = .{};
     try testing.expectError(
         error.DuplicateSection,
-        parseDiag(
-            gpa,
-            "config interface 'lan'\n\toption proto 'static'\n\nconfig interface 'lan'\n\toption proto 'none'\n",
-            &diag,
-        ),
+        parseDiag(gpa, "config interface 'lan'\n\toption x '1'\n\nconfig rule 'lan'\n\toption x '2'\n", &diag),
     );
     try testing.expectEqual(@as(usize, 4), diag.line);
 
-    // Different type, same name: real uci's own strict mode rejects this
-    // too ("section of different type overwrites prior section with same
-    // name") -- this module accepted it before this fix.
-    try testing.expectError(
-        error.DuplicateSection,
-        parseDiag(gpa, "config interface 'lan'\n\nconfig rule 'lan'\n", &diag),
-    );
+    // Anonymous sections never merge.
+    var anon = try parse(gpa, "config rule\n\nconfig rule\n");
+    defer anon.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), anon.sections.len);
+}
 
-    // Positive control: distinct names in the same file are unaffected.
-    var pkg = try parse(gpa, "config interface 'lan'\n\nconfig interface 'wan'\n");
-    defer pkg.deinit(gpa);
-    try testing.expectEqual(@as(usize, 2), pkg.sections.len);
+test "serialize refuses two sections sharing a name (A1 U25)" {
+    // `parse` would read the text back as ONE merged section.
+    const gpa = testing.allocator;
+    const opts1 = [_]Option{.{ .key = "x", .kind = .single, .values = &.{"1"} }};
+    const opts2 = [_]Option{.{ .key = "x", .kind = .single, .values = &.{"2"} }};
+    var secs = [_]Section{
+        .{ .type = "t", .name = "a", .anonymous = false, .options = &opts1 },
+        .{ .type = "t", .name = null, .anonymous = true, .options = &opts1 },
+        .{ .type = "t", .name = "a", .anonymous = false, .options = &opts2 },
+    };
+    const pkg: Package = .{ .sections = &secs };
+    try testing.expectError(error.DuplicateSection, serialize(gpa, &pkg));
+
+    // Control: a distinct name serializes.
+    secs[2].name = "b";
+    const text = try serialize(gpa, &pkg);
+    defer gpa.free(text);
+    var back = try parse(gpa, text);
+    defer back.deinit(gpa);
+    try testing.expectEqual(@as(usize, 3), back.sections.len);
 }
 
 test "total item cap: boundary is exact, one section many options" {
@@ -2090,6 +2150,9 @@ test "corpus: every round-trip script builds a package, and the sections built a
     var compared: usize = 0;
     var compared_sections: usize = 0;
     var compared_anonymous: usize = 0;
+    // Packages whose generated names collide: `serialize` must refuse them
+    // (audit A1 U25), since `parse` would merge the blocks.
+    var refused_duplicate: usize = 0;
     for (roundtrip_scripts) |sd| {
         var smith: std.testing.Smith = .{ .in = sd };
         var script: [64]u8 = undefined;
@@ -2103,12 +2166,16 @@ test "corpus: every round-trip script builds a package, and the sections built a
             if (s.anonymous) anonymous += 1;
             for (s.options) |o| values += o.values.len;
         }
-        if (try roundTripOne(pkg)) {
-            compared += 1;
-            compared_sections += pkg.sections.len;
-            for (pkg.sections) |s| if (s.anonymous) {
-                compared_anonymous += 1;
-            };
+        switch (try roundTripOne(pkg)) {
+            .compared => {
+                compared += 1;
+                compared_sections += pkg.sections.len;
+                for (pkg.sections) |s| if (s.anonymous) {
+                    compared_anonymous += 1;
+                };
+            },
+            .refused_duplicate => refused_duplicate += 1,
+            .refused_value, .refused_name => {},
         }
     }
     // Measured 2026-09-07. Before: 1 round, 0 sections, 0 options, 0 values.
@@ -2116,12 +2183,14 @@ test "corpus: every round-trip script builds a package, and the sections built a
     try testing.expectEqual(@as(usize, 13), sections);
     try testing.expectEqual(@as(usize, 25), values);
     try testing.expectEqual(@as(usize, 4), anonymous);
-    // Measured 2026-09-17: every script but the NUL one reaches `eql`, and
-    // anonymous sections are among what is compared (the A1 U23 mutant, an
-    // unnamed section built as `.anonymous = false`, fails here).
-    try testing.expectEqual(roundtrip_scripts.len - 1, compared);
-    try testing.expectEqual(@as(usize, 11), compared_sections);
+    // Measured 2026-09-17: the NUL script is refused for its value, two
+    // scripts for colliding names, the rest reach `eql` -- anonymous
+    // sections among them (the A1 U23 mutant, an unnamed section built as
+    // `.anonymous = false`, fails here).
+    try testing.expectEqual(@as(usize, 3), compared);
+    try testing.expectEqual(@as(usize, 6), compared_sections);
     try testing.expectEqual(@as(usize, 3), compared_anonymous);
+    try testing.expectEqual(@as(usize, 2), refused_duplicate);
 }
 
 /// The generator's scratch, lifted out of the harness body so the corpus
@@ -2152,11 +2221,6 @@ const RoundTripBuild = struct {
             // excluded here rather than hitting a spurious round-trip
             // mismatch.
             const sec_name: ?[]const u8 = if (has_name) fuzzNameToken(c, &self.name_bufs[si], 1, name_alphabet) else null;
-            // Distinct names, for the same reason as the distinct keys below:
-            // `parse` refuses a second block reusing a name
-            // (`DuplicateSection`, audit A1 U1). `serialize` does not refuse
-            // to write one — audit A1 U25, open.
-            if (has_name) self.name_bufs[si][0] = 'a' + @as(u8, @intCast(si));
 
             const n_opts = c.ranged(0, 3);
             for (0..n_opts) |oi| {
@@ -2201,18 +2265,24 @@ fn fuzzRoundTrip(_: void, smith: *std.testing.Smith) !void {
     _ = try roundTripOne(b.make(&c));
 }
 
-/// Serialize, re-parse, compare, reserialize. Returns whether the package got
-/// as far as the comparison — false only for a documented `serialize`
-/// refusal, which the corpus guard counts so that a generator producing
-/// nothing but refusals cannot pass for a working harness (audit A1 U24).
-fn roundTripOne(pkg: Package) !bool {
+const RoundTrip = enum { compared, refused_value, refused_duplicate, refused_name };
+
+/// Serialize, re-parse, compare, reserialize. Returns how far the package
+/// got: the comparison, or a documented `serialize` refusal. The corpus guard
+/// counts both, so that a generator producing nothing but refusals cannot
+/// pass for a working harness (audit A1 U24).
+fn roundTripOne(pkg: Package) !RoundTrip {
     const gpa = testing.allocator;
     const s1 = serialize(gpa, &pkg) catch |err| switch (err) {
-        // A generated value containing an unescapable control byte — a
-        // documented rejection, not a round-trip question. `InvalidName`
-        // stays listed for `--fuzz` inputs, but the generator draws names
-        // from the validator's own alphabet, so the corpus never hits it.
-        error.UnserializableValue, error.InvalidName, error.OutOfMemory => return false,
+        // Documented rejections, not round-trip questions: a value with an
+        // unescapable control byte, or two sections sharing a name (which
+        // `parse` would merge, audit A1 U25). `InvalidName` stays listed for
+        // `--fuzz` inputs, but the generator draws names from the
+        // validators' alphabets, so the corpus never hits it.
+        error.UnserializableValue => return .refused_value,
+        error.DuplicateSection => return .refused_duplicate,
+        error.InvalidName => return .refused_name,
+        error.OutOfMemory => return error.OutOfMemory,
     };
     defer gpa.free(s1);
 
@@ -2236,7 +2306,7 @@ fn roundTripOne(pkg: Package) !bool {
     const s2 = try serialize(gpa, &reparsed);
     defer gpa.free(s2);
     try testing.expectEqualStrings(s1, s2);
-    return true;
+    return .compared;
 }
 
 // ── real uci capture (OpenWRT 25.12.4 VM lane) ──────────────────────────────
@@ -2493,14 +2563,14 @@ test "real uci capture: our serialize() reproduces real `uci export`'s canonical
     try testing.expect(pkg.eql(&reparsed));
 }
 
-// ── real uci grammar capture (audit A1 U8/U9/U10/U19) ───────────────────────
+// ── real uci grammar capture (audit A1 U8/U9/U10/U19/U25) ──────────────────
 //
-// `testdata/grammar_capture.txt` is the real `uci` binary's verdict on 130
+// `testdata/grammar_capture.txt` is the real `uci` binary's verdict on 138
 // small config files, taken with `tools/capture-grammar.sh` (black box: the
 // binary is run, its source is not read). It pins the statement grammar this
 // module used to get wrong: a backslash outside quotes (U8), `;` between
-// statements (U9), empty values (U10), the `package` line (U19) and the
-// one-letter keywords.
+// statements (U9), empty values (U10), the `package` line (U19), a repeated
+// section name (U25) and the one-letter keywords.
 
 const grammar_capture = @embedFile("testdata/grammar_capture.txt");
 
@@ -2548,7 +2618,7 @@ fn hexAlloc(gpa: Allocator, hex: []const u8) ![]u8 {
     return buf;
 }
 
-test "real uci grammar capture: each probe loads or is refused as the real binary does, into the same model (audit A1 U8/U9/U10/U19)" {
+test "real uci grammar capture: each probe loads or is refused as the real binary does, into the same model (audit A1 U8/U9/U10/U19/U25)" {
     const gpa = testing.allocator;
     var records: usize = 0;
     var refused: usize = 0;
@@ -2590,8 +2660,8 @@ test "real uci grammar capture: each probe loads or is refused as the real binar
     }
     try testing.expectEqual(@as(usize, 0), mismatches);
     // A capture that parses to nothing passes the loop above vacuously.
-    try testing.expectEqual(@as(usize, 130), records);
-    try testing.expectEqual(@as(usize, 47), refused);
+    try testing.expectEqual(@as(usize, 138), records);
+    try testing.expectEqual(@as(usize, 48), refused);
 }
 
 // Second capture: one option per escape sequence, isolating exactly which
