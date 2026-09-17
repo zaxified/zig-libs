@@ -194,6 +194,13 @@ const MAX_PATH_DEPTH: u32 = 64;
 /// already had one silent-truncation bug (the depth cap quietly dropping deep
 /// matches while the README promised "every `name` anywhere"). A caller that
 /// legitimately wants more sets `ShapeSpec.max_matches`.
+///
+/// ⚠ **It bounds the ANSWER, not the WORK.** The counter advances only where a
+/// match is recorded, so a path whose FINAL name never occurs matches nothing,
+/// the cap cannot fire, and `recursiveFind` still visits every value in the
+/// document. `MAX_PATH_DEPTH` keeps that walk from compounding per level, which
+/// leaves its cost a function of the document's SIZE — the caller's to bound
+/// when it accepts untrusted input, not something this cap does for it.
 pub const MAX_MATCHES: usize = 1 << 16;
 
 const CmpOp = enum { eq, ne, lt, le, gt, ge };

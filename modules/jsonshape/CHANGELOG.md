@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — Docs only, no behaviour change: corrected the SCOPE claimed
+  for `MAX_MATCHES`. It bounds the RESULT, not the traversal. The counter
+  advances only where a match is recorded, so a path whose final name never
+  occurs matches nothing, the cap cannot fire, and `recursiveFind` still walks
+  the whole document — its cost is then a function of the document's size,
+  which a caller accepting untrusted input has to bound itself. The doc comment
+  and README read as though the cap bounded both. Reported by a downstream
+  consumer, which also re-confirmed that the headline case is genuinely closed:
+  the 163,831 B branching document under the fixed 6-byte path `..a..a` now
+  returns `error.TooManyMatches`.
+
 - **2026-09-03** — Drift re-audit (710 lines since the last one, i.e. most of the
   module). ⚠ **BREAKING:** `Error` gained `TooManyMatches` and `ShapeSpec` gained
   `max_matches`.

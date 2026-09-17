@@ -86,6 +86,10 @@ honoring the column's declared `ColumnType`, including JSON's
   match that is a large array becomes that many rows while the match counter
   reads 1. Exceeding it is `error.TooManyMatches`, a **refusal**: a truncated
   projection is a wrong answer that looks like a right one.
+  ⚠ That cap bounds the **result, not the traversal**: a path whose final name
+  never occurs records no match, so the cap cannot fire and the descent still
+  walks the whole document. Its cost is then a function of the document's size,
+  which a caller accepting untrusted input still has to bound itself.
 - **Arena-scoped strings.** Text cells parsed from JSON strings borrow the
   parse tree living in the caller's allocator (normally an arena) — free
   everything at once via that arena, same memory model as `dataset` itself.
