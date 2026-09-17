@@ -501,20 +501,47 @@ pub const HistogramSpec = struct {
 
 /// Equal-width histogram → Dataset {bin_lo, bin_hi, count} (exact port of the
 /// client `histogram`: span = (max−min) || 1, last-bin inclusive clamp).
+///
+/// A row is binned only if its value is FINITE. NaN and ±inf are excluded from
+/// both the range scan and the counting pass: an infinity has no bucket it
+/// belongs in, and an infinite bound makes `span` infinite, which turns every
+/// edge AND every bin index into NaN. Measured 2026-09-17 on `{-inf, 5, 1}`,
+/// 5 bins: every edge printed `-nan` and all THREE rows landed in bucket 0 —
+/// identical under Debug, ReleaseSafe and ReleaseFast, none of them panicking.
+/// That is the same silent-misbinning defect the 2026-09-10 NaN exclusion
+/// closed, reached through the other non-finite value.
+///
+/// With NO finite row the result is an EMPTY dataset, not `bins` rows. There is
+/// no range, so there are no buckets: the previous code emitted `lo` unchanged
+/// at `+inf`, i.e. `bins` rows of `inf`-to-`inf` (`null`-to-`null` once
+/// `dataset.toJson` has mapped them), a successful-looking answer to a question
+/// with no answer — the shape `xirr` raises `error.EmptyWindow` for. A Dataset
+/// can express "nothing" without an error, so this returns zero rows instead of
+/// widening `Error` for every caller. Reachable from this module's own
+/// `annualize`, which is NaN for a position down more than 100%: an all-NaN
+/// column used to describe twelve null-to-null bins.
 pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Dataset {
     const vi = try mustIndex(d, spec.value_col);
     var lo: f64 = std.math.inf(f64);
     var hi: f64 = -std.math.inf(f64);
     for (d.rows) |r| {
         const v = r[vi].asFloat() orelse continue;
-        // NaN survives `asFloat()` (it IS a float) and would otherwise
-        // silently widen nothing (`@min`/`@max` with NaN pick the other
-        // operand here, so this loop was already NaN-safe) — excluded here
-        // too so both loops agree on which rows exist.
-        if (std.math.isNan(v)) continue;
+        // NaN and ±inf survive `asFloat()` (they ARE floats) and neither can
+        // widen a usable range: `@min`/`@max` with NaN pick the other operand,
+        // and an infinite bound gives an infinite `span`. Excluded here so
+        // this loop and the counting loop agree on which rows exist.
+        if (!std.math.isFinite(v)) continue;
         lo = @min(lo, v);
         hi = @max(hi, v);
     }
+    const cols = try a.alloc(Column, 3);
+    cols[0] = .{ .name = "bin_lo", .type = .float };
+    cols[1] = .{ .name = "bin_hi", .type = .float };
+    cols[2] = .{ .name = "count", .type = .int };
+    // Nothing finite: `lo`/`hi` are still their `+inf`/`-inf` seeds, which is
+    // the one state where the seeds cross. No range means no buckets — see the
+    // doc comment for why that is zero rows rather than `bins` `inf` edges.
+    if (lo > hi) return .{ .columns = cols, .rows = &.{} };
     const bins = @max(spec.bins, 1);
     const span = if (hi > lo) hi - lo else 1;
     const counts = try a.alloc(u64, bins);
@@ -523,19 +550,17 @@ pub fn histogram(a: std.mem.Allocator, d: Dataset, spec: HistogramSpec) Error!Da
     for (d.rows) |r| {
         const v = r[vi].asFloat() orelse continue;
         // Without this, `@intFromFloat(@floor(NaN))` landed in the `b < 0`
-        // clamp below and NaN was silently counted in bucket 0 —
-        // indistinguishable from a genuine minimum-value row. Reachable
-        // from this module's own `annualize`, NaN for a >100% drawdown.
-        if (std.math.isNan(v)) continue;
+        // clamp below and the row was silently counted in bucket 0 —
+        // indistinguishable from a genuine minimum-value row. NaN reaches
+        // here from this module's own `annualize` (>100% drawdown); ±inf
+        // reaches the SAME clamp by making `(v - lo) / span` NaN for every
+        // row, finite ones included.
+        if (!std.math.isFinite(v)) continue;
         var b: i64 = @intFromFloat(@floor((v - lo) / span * @as(f64, @floatFromInt(bins))));
         if (b >= @as(i64, @intCast(bins))) b = @intCast(bins - 1);
         if (b < 0) b = 0;
         counts[@intCast(b)] += 1;
     }
-    const cols = try a.alloc(Column, 3);
-    cols[0] = .{ .name = "bin_lo", .type = .float };
-    cols[1] = .{ .name = "bin_hi", .type = .float };
-    cols[2] = .{ .name = "count", .type = .int };
     const rows = try a.alloc([]const Value, bins);
     for (0..bins) |i| {
         const fi: f64 = @floatFromInt(i);
@@ -2159,6 +2184,84 @@ test "histogram excludes NaN rows instead of silently binning them at 0" {
     // Only the three finite rows land in a bucket -- the NaN row is
     // excluded entirely, not silently folded into bucket 0.
     try testing.expectEqual(@as(i64, 3), total);
+}
+
+test "histogram: an infinite value is excluded, not NaN-ing every edge and every index" {
+    // Same shape as the NaN finding above, reached through the OTHER
+    // non-finite value, which the 2026-09-10 fix left in. A single -inf row
+    // made `span` infinite, so `(v - lo) / span` was NaN for EVERY row --
+    // finite ones included -- and all of them fell through the `b < 0` clamp
+    // into bucket 0 while every emitted edge printed `-nan`. Measured
+    // identical in Debug, ReleaseSafe and ReleaseFast: no mode panicked, so
+    // nothing but a test stood between this and a wrong chart.
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "v", .type = .float }};
+    const rows = [_][]const Value{
+        &.{.{ .float = -std.math.inf(f64) }}, &.{.{ .float = 5 }}, &.{.{ .float = 1 }},
+    };
+    const h = try histogram(f.a(), .{ .columns = &cols, .rows = &rows }, .{ .value_col = "v", .bins = 5 });
+    try testing.expectEqual(@as(usize, 5), h.rows.len);
+    // Every edge is a real number -- the range is [1, 5], set by the finite
+    // rows alone.
+    try testing.expectEqual(@as(f64, 1), h.cell(0, "bin_lo").?.float);
+    try testing.expectEqual(@as(f64, 5), h.cell(4, "bin_hi").?.float);
+    for (0..h.rows.len) |i| {
+        try testing.expect(std.math.isFinite(h.cell(i, "bin_lo").?.float));
+        try testing.expect(std.math.isFinite(h.cell(i, "bin_hi").?.float));
+    }
+    // ⭐ The seam: the two finite rows land in DIFFERENT buckets. A regression
+    // that lets the infinity back in puts all three in bucket 0, and a total
+    // of 2 alone would not catch that.
+    try testing.expectEqual(@as(i64, 1), h.cell(0, "count").?.int);
+    try testing.expectEqual(@as(i64, 1), h.cell(4, "count").?.int);
+    var total: i64 = 0;
+    for (0..h.rows.len) |i| total += h.cell(i, "count").?.int;
+    try testing.expectEqual(@as(i64, 2), total);
+}
+
+test "histogram: no finite row is ZERO bins, not `bins` rows of inf-to-inf" {
+    // Reported by a downstream consumer, 2026-09-17. `lo`/`hi` kept their
+    // +inf/-inf seeds when every row was skipped, `span` fell back to 1, and
+    // each edge came out `lo + span*i/bins` = +inf. `dataset.toJson` maps
+    // infinity to null, so a caller received a SUCCESSFUL dataset describing
+    // twelve bins from null to null -- the "non-answer that looks like an
+    // answer" shape `xirr` raises `error.EmptyWindow` for, one function over.
+    var f = Fix.init();
+    defer f.deinit();
+    const cols = [_]Column{.{ .name = "v", .type = .float }};
+
+    const empty = [_][]const Value{};
+    const h0 = try histogram(f.a(), .{ .columns = &cols, .rows = &empty }, .{ .value_col = "v", .bins = 3 });
+    try testing.expectEqual(@as(usize, 0), h0.rows.len);
+    // The COLUMNS still stand: a caller building a chart off the schema gets
+    // an empty series, not a missing one.
+    try testing.expectEqual(@as(usize, 3), h0.columns.len);
+    try testing.expectEqualStrings("bin_lo", h0.columns[0].name);
+
+    // The all-NaN column is the reachable case: `annualize` is NaN for a
+    // position down more than 100%, so a portfolio of those alone lands here.
+    const nans = [_][]const Value{
+        &.{.{ .float = std.math.nan(f64) }}, &.{.{ .float = std.math.nan(f64) }},
+    };
+    const h1 = try histogram(f.a(), .{ .columns = &cols, .rows = &nans }, .{ .value_col = "v", .bins = 3 });
+    try testing.expectEqual(@as(usize, 0), h1.rows.len);
+
+    // An all-infinity column is the same non-answer for the same reason.
+    const infs = [_][]const Value{
+        &.{.{ .float = std.math.inf(f64) }}, &.{.{ .float = -std.math.inf(f64) }},
+    };
+    const h2 = try histogram(f.a(), .{ .columns = &cols, .rows = &infs }, .{ .value_col = "v", .bins = 3 });
+    try testing.expectEqual(@as(usize, 0), h2.rows.len);
+
+    // ⭐ One finite row is NOT the empty case -- it has a range (a degenerate
+    // one, span falls back to 1) and must still produce its bins. Without
+    // this, "return zero rows whenever the data look thin" would pass.
+    const one = [_][]const Value{&.{.{ .float = 7 }}};
+    const h3 = try histogram(f.a(), .{ .columns = &cols, .rows = &one }, .{ .value_col = "v", .bins = 3 });
+    try testing.expectEqual(@as(usize, 3), h3.rows.len);
+    try testing.expectEqual(@as(f64, 7), h3.cell(0, "bin_lo").?.float);
+    try testing.expectEqual(@as(i64, 1), h3.cell(0, "count").?.int);
 }
 
 test "quantile: unsorted-slice wrapper sorts a COPY and matches quantileSorted (mutation guard)" {

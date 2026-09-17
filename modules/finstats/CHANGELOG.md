@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-17** — `histogram`: two non-answers that looked like answers, both
+  reported by a downstream consumer auditing the new pin. ⚠ **Behaviour change**
+  (no `Error` widening, so nothing needs recompiling).
+  - With **no finite row** — an empty dataset, or a column that is all NaN —
+    `lo`/`hi` kept their `+inf`/`-inf` seeds, `span` fell back to 1, and every
+    emitted edge was `lo + span*i/bins`, i.e. `+inf`. Since `dataset.toJson`
+    maps infinity to `null`, a caller received a SUCCESSFUL dataset describing
+    `bins` bins from null to null with zero counts. Now returns an empty
+    dataset — columns intact, zero rows — because with no range there are no
+    buckets. This is the shape `xirr` raises `error.EmptyWindow` for; a Dataset
+    can express "nothing" without an error, so no new error variant. The
+    all-NaN case is reachable from this module's own `annualize`, which is NaN
+    for a position down more than 100% — the same function cited as motivation
+    when NaN binning was fixed on 2026-09-10.
+  - **±inf rows are now excluded too**, not just NaN. That 2026-09-10 fix
+    skipped NaN in both passes but left infinity in, and an infinite bound
+    makes `span` infinite, so `(v - lo) / span` was NaN for **every** row —
+    finite ones included — and all of them fell through the `b < 0` clamp into
+    bucket 0 while every edge read `-nan`. Measured on `{-inf, 5, 1}`: all
+    three rows in bucket 0, identical in Debug, ReleaseSafe and ReleaseFast,
+    no mode panicking. Same silent-misbinning defect, reached through the
+    other non-finite value.
+
 - **2026-09-10** — A1 audit close-out, 3 findings. (1) `monteCarlo`'s
   scratch-buffer leak on a mid-loop allocation failure was already fixed by
   `91d2744d` (2026-09-01) — verified structurally (the `defer` now runs
