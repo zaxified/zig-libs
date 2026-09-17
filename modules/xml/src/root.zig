@@ -2015,6 +2015,15 @@ test "not-wf: line-ending normalization (XML 2.11) applies inside comments and P
     try testing.expectEqualStrings("xy", doc3.root.children[0].content.comment);
 }
 
+test "not-wf: line-ending normalization (XML 2.11) in character data" {
+    // The test above pins the comment and PI paths F3 added; this pins the
+    // original one in `parseText`, which nothing held (audit A1/xml.md F11:
+    // deleting it left the whole suite green).
+    var doc = try parse(testing.allocator, "<a>x\r\ny\rz</a>", .{});
+    defer doc.deinit();
+    try testing.expectEqualStrings("x\ny\nz", doc.root.children[0].content.text);
+}
+
 test "wf/not-wf: Name characters follow the actual XML NameStartChar/NameChar grammar, not >= 0x80" {
     // `isNameStartByte` used to accept ANY byte >= 0x80 as a name-start byte
     // without decoding UTF-8 or checking it against the real Unicode
