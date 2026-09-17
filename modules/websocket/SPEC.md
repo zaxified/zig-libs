@@ -292,6 +292,11 @@ and are recorded as such instead of being dropped:
 deleted and the tests are unchanged — they never skip. Licence reasoning is in this module's
 `NOTICE`.
 
+**Handshake, separately anchored.** `tools/oracle_handshake.py` + `tools/verify_response_probe.zig`
+diff `verifyResponse`/`acceptHandshake` against python-websockets 15.0.1's `ClientProtocol`/
+`ServerProtocol` over the opening handshake itself (the frame corpus above never exercises
+either) — see `tools/README.md` for the command and the measured agreement.
+
 **Teeth, demonstrated.** Restoring `isValidCloseCode` to its previous range *together with* the
 previous self-authored close-code tests reproduces the module's state before this corpus existed:
 `zig build test-websocket` then reports 62/63 passing — every self-authored test green — with the
