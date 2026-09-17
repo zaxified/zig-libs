@@ -117,7 +117,8 @@ intact pair as the always-run positive control.
 
 Provenance: spec/RFC-only — see [SPEC.md](SPEC.md)'s Provenance section
 (no third-party source ported; the genuine quicknet KAT bytes are the
-same live-fetched public data `tlock` pins). Those bytes are LIVE beacon
+same live-fetched public data `tlock` pins). Those test vectors were fetched and
+formatted by our own tooling (`tools/fetch.py`, `tools/gen_vectors.py`); they are LIVE beacon
 output frozen at fetch time, not spec constants: public protocol output
 that owes nothing, but it ages, and nothing in the suite would notice if
 the chain it describes moved on.

@@ -16,7 +16,9 @@ convenience.
 
 Provenance: original work of the zig-libs authors (MIT); the algorithm is a
 public spec (merger doctrine — no NOTICE entry needed, see CONVENTIONS.md
-§5). No third-party source consulted or copied.
+§5). No third-party source consulted or copied. The test vectors are the
+public spec's; `tools/` is our own tooling that cross-checks them against
+Python `hashlib` and the `openssl` CLI run as black-box oracles.
 
 ## API
 
