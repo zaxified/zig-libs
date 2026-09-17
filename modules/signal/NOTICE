@@ -136,6 +136,35 @@ libsignal vector) — no libsignal code was ported into either
 implementation; only the numeric vector and the documented sign-bit fact
 were taken from it.
 
+What was taken from libsignal, and how that was checked
+--------------------------------------------------------
+
+From competing implementations this module took BEHAVIOUR needed for
+interoperability and numeric test data — never code:
+
+  - the XEdDSA sign-bit convention of deployed libsignal (the `xeddsa.libsignal`
+    variant; the specification forces sign 0 instead);
+  - libsignal's application-defined `KDF_RK` info string, used only by the
+    interop tests (this module's own constant is different);
+  - numeric test vectors (the XEdDSA known-answer vector; the KDF outputs in
+    `src/interop_vectors.zig`, produced by our own driver
+    `tools/libsignal_dump.rs`, which calls libsignal and prints what it
+    returns — it checks results the specification already fixes).
+
+Behaviour, a wire format and a short protocol constant are not copyrightable
+expression; the four specifications themselves are dedicated to the public
+domain (each says so in its IPR section).
+
+Because libsignal source WAS read during the XEdDSA pass (see above), the
+"written from the specification" claim was checked independently on
+2026-09-17: a reviewer who read libsignal (Rust, commit `857c4dca`) and
+libsignal-protocol-c, and reported verdicts only, found NO structural match in
+any region of `src/` — each region is either independent or matches only in
+behaviour the specification or the wire format dictates. Two cosmetic
+overlaps were noted and are harmless: the known-answer test's generic
+flip-each-signature-byte tamper loop, and the number 2000 used (with a
+different meaning) as a skipped-key limit.
+
 Status of this pass
 --------------------
 
