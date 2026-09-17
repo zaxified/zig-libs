@@ -48,12 +48,13 @@ switch (try r.insert(wire_bytes, now_ns)) {
 }
 ```
 
-⚠ **`max_frame_len` defaults to 65535 (its hard ceiling), and `Entry.buf` allocates the
-full `config.max_frame_len` bytes up front for every in-flight `frag_id`, regardless of
-how large the actual datagram turns out to be.** With the config above (`max_inflight =
-64`, default `max_frame_len`), 64 concurrently tracked zero-length in-flight datagrams —
-**512 bytes on the wire** — hold **4,212,312 bytes live** (measured, tracking allocator;
-Audit F5). Set `max_frame_len` to the largest frame your protocol actually needs; see
+⚠ **`max_frame_len` defaults to 65535 (its hard ceiling).** `Entry.buf` is sized to the
+first fragment and grows on demand up to that ceiling (Audit F8), so memory follows what
+is actually sent — but a sender still chooses how much of the ceiling to fill. With the
+config above (`max_inflight = 64`, default `max_frame_len`), 64 empty first fragments are
+refused and hold nothing; 64 first fragments with a 1-byte payload — **576 bytes on the
+wire** — hold **22,767 bytes live** (39×; measured 2026-09-17, tracking allocator; it was
+8227× before F8). Set `max_frame_len` to the largest frame your protocol actually needs; see
 `SPEC.md`'s memory-bound note for the full accounting (the buffer is not the only
 per-entry cost — the interval list scales with the number of fragments an attacker
 sends too, Audit F4).

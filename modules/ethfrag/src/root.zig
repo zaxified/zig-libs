@@ -1377,6 +1377,25 @@ test "F3/M4b-shape: idle time exactly equal to timeout_ns has not yet expired" {
     }
 }
 
+test "F16: the sweep's idle check has the same strict boundary as insert's" {
+    // Audit F2 added a SECOND copy of `now_ns -| last_seen_ns > timeout_ns`,
+    // in `expireOlderThan`; the test above only reaches the copy in
+    // `insert`. A gap of exactly timeout_ns must not expire here either,
+    // and one nanosecond more must.
+    var r = Reassembler.init(testing.allocator, .{ .max_inflight = 4, .timeout_ns = 100 });
+    defer r.deinit();
+
+    var a: [header_len + 5]u8 = undefined;
+    (Header{ .frag_id = 1, .offset = 0, .length = 5, .more = true }).encode(a[0..header_len]);
+    @memset(a[header_len..], 'A');
+    try testing.expectEqual(InsertResult.incomplete, try r.insert(&a, 0));
+
+    try testing.expectEqual(@as(usize, 0), r.expireOlderThan(100));
+    try testing.expectEqual(@as(u32, 1), r.entries.count());
+    try testing.expectEqual(@as(usize, 1), r.expireOlderThan(101));
+    try testing.expectEqual(@as(u32, 0), r.entries.count());
+}
+
 test "F3/M6-shape: a retroactively-checked interval that lands exactly at the newly-established total_len is accepted, one past it is not" {
     // Companion to the existing out-of-order teardrop-mirror regression
     // test, which uses a margin of 50 bytes past total_len. This pins the

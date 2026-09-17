@@ -33,18 +33,19 @@ separate policy knob. Concurrency: `.reentrant` free functions; a `Reassembler` 
 is single-owner (no internal lock — one caller drives it, matching `ratelimit`/`jobqueue`
 style bounded-state modules in this collection).
 
-Every reassembly-table entry pre-allocates a fixed `config.max_frame_len`-byte buffer up
-front rather than growing on demand, which bounds THAT part of the cost at a deterministic
-`max_inflight * max_frame_len` independent of what an attacker sends. **That is not the
-whole entry, though** — each accepted fragment also grows the entry's interval list
+Every reassembly-table entry's buffer is sized to the first fragment it receives and grows
+on demand — doubling, capped at `config.max_frame_len` (Audit F8; it used to be allocated
+at the full `max_frame_len` up front). THAT part of the cost is therefore still bounded by
+`max_inflight * max_frame_len`, but an attacker now has to send the bytes to make the
+module hold them. **That is not the whole entry, though** — each accepted fragment also grows the entry's interval list
 (`Interval` records, plus `ArrayListUnmanaged` growth headroom), up to
 `max_fragments_per_datagram` (default 4096) per datagram, and that part scales with the
 number of fragments an attacker chooses to send, not with `max_frame_len`. Measured (Audit
-F4, `perf2.zig`, peak live bytes, `max_fragments_per_datagram = 4096`, 4095 zero-length
-fragments per id): `max_frame_len = 65535` → 1.37× the buffer-only bound; `= 9216` → 3.68×;
-`= 1500` (a real Ethernet MTU) → **17.49×**. The buffer bound is real and still the
-dominant term at the module's own default `max_frame_len`; it just is not the *whole*
-bound, and the gap widens as a consumer configures `max_frame_len` down. A consumer that
+F4's worst case, peak live bytes against `max_inflight * max_frame_len`,
+`max_fragments_per_datagram = 4096`; re-measured 2026-09-17, after F8): `max_frame_len =
+65535` → 0.44× the buffer-only bound; `= 9216` → 3.13×; `= 1500` (a real Ethernet MTU) →
+**5.47×**. So the buffer bound is not the *whole* bound, and the gap widens as a consumer
+configures `max_frame_len` down. A consumer that
 needs the tight bound back should also cap `max_fragments_per_datagram`. The clock is 100%
 caller-supplied: every state-mutating call takes a plain `now_ns: u64`, and the module
 never calls `clock_gettime` or anything else itself — a consumer wires in whatever clock
@@ -83,7 +84,7 @@ enforcement point in `Reassembler.insert`:
   an `expireOlderThan` sweep reclaims a timed-out slot, and `config.max_lifetime_ns`
   (default `8 * timeout_ns`) additionally bounds how long any one datagram may occupy a
   slot in total, not just how long it may sit idle — see the "Gap-then-never-completes"
-  bullet below. Per-datagram memory is `max_frame_len` (the buffer) plus up to
+  bullet below. Per-datagram memory is at most `max_frame_len` (the buffer, grown on demand) plus up to
   `max_fragments_per_datagram` interval records — see the note on the buffer-only bound
   above; it is a real, deterministic ceiling but not the *whole* per-entry cost.
 - **Gap-then-never-completes:** `config.timeout_ns`, checked against caller-supplied
