@@ -358,3 +358,8 @@ rather than papered over.
 **What the tests actually contain.** eval KAT vs independent Python pow() oracle over real RSA-2048 challenge N
 
 **How it got there.** No external oracle exists for what remains. no VDF paper/impl publishes a worked byte-level example over a real large modulus
+
+**Run by hand, beyond the shipped KATs.** `modules/vdf/tools/README.md` — an
+independent OpenSSL `BN_mod_exp` value oracle for `eval` at `k` far past the
+largest KAT `T` (measured 2026-09-17: MATCH at `k=200000`, 20× `kat_test.zig`'s
+largest `T=10_000`).
