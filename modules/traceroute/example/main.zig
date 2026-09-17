@@ -146,7 +146,7 @@ const FixtureTransport = struct {
         };
 
         if (ttl == 1) {
-            f.pending = buildTimeExceeded(f.gpa, packet) catch return error.SendFailed;
+            f.pending = buildTimeExceeded(f.gpa, packet, f.dest) catch return error.SendFailed;
             f.pending_from = f.router_ttl1;
         } else {
             f.pending = buildEchoReply(f.gpa, packet) catch return error.SendFailed;
@@ -184,13 +184,19 @@ const FixtureTransport = struct {
     /// unused bytes, a minimal quoted IPv4 header (ihl=5), then the quoted
     /// 8-byte echo header -- exactly the shape `icmp.echo.parseV4` expects
     /// for an ICMP error (echo.zig: quoted IP header + >= 8 bytes payload).
-    fn buildTimeExceeded(gpa: std.mem.Allocator, orig_request: []const u8) ![]u8 {
+    /// The quoted header names ICMP and the probed destination, as a real
+    /// router's does: `traceWith` ignores an error quoting any other
+    /// destination (traceroute A1 F3).
+    fn buildTimeExceeded(gpa: std.mem.Allocator, orig_request: []const u8, dest: netaddr.Ip) ![]u8 {
         const quoted_ip_hdr_len = 20;
         const out = try gpa.alloc(u8, icmp.echo.echo_header_len + quoted_ip_hdr_len + icmp.echo.echo_header_len);
         @memset(out, 0);
         out[0] = icmp.echo.v4.time_exceeded;
         out[1] = 0; // code
-        out[icmp.echo.echo_header_len] = 0x45; // quoted IPv4 header: version 4, ihl 5
+        const quoted = out[icmp.echo.echo_header_len..][0..quoted_ip_hdr_len];
+        quoted[0] = 0x45; // version 4, ihl 5
+        quoted[9] = 1; // protocol: ICMP
+        @memcpy(quoted[16..20], &dest.v4); // destination
         @memcpy(
             out[icmp.echo.echo_header_len + quoted_ip_hdr_len ..],
             orig_request[0..icmp.echo.echo_header_len],
