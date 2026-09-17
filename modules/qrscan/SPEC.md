@@ -300,6 +300,16 @@ comparison is internal.
 
 **Anchor grade:** class B · oracle REDERIVED
 
+**External differential (added 2026-09-17).** The re-derived comparison above cannot
+catch a misreading of the geometry both `qr` and `qrscan` share. `tools/oracle.py`
+closes that gap by running zxing-cpp (Apache-2.0), an independently written decoder,
+over rendered/rotated/degraded/perspective images and diffing its verdict against
+this module's own `qrscan-demo` example — **identical verdicts on all 37
+flat/rotated/degraded images (33/37 each), and 19/24 vs. ZXing's 24/24 on
+perspective** (this module holds to 25° at v1/v15 and 30° at v4, more conservative
+than ZXing but not wrong — see `tools/README.md` for the measured run and the two
+tilt angles where only ZXing still reads the symbol). See `tools/README.md`.
+
 ## Backlog
 
 - **A mesh instead of one global map.** The grid is a single projective map, so
