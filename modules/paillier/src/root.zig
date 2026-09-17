@@ -1932,6 +1932,115 @@ test "fromPrimes refuses two Fermat-factorably-close primes, which the derivatio
     try testing.expectEqual(@as(usize, half_bytes * 2 * 8), kp.public.n.bits());
 }
 
+/// A `std.Random` that serves the first `prefix_calls` fills from `a`, then
+/// the single fill `inject` (which must match that call's length exactly),
+/// then everything else from `b`. Serving the prefix call by call keeps the
+/// chunking identical to a plain run of `a`, so a dry run that counted the
+/// calls is replayed byte for byte.
+const SpliceRandom = struct {
+    a: std.Random.DefaultPrng,
+    b: std.Random.DefaultPrng,
+    prefix_calls: usize,
+    inject: []const u8,
+    calls: usize = 0,
+
+    fn fill(self: *SpliceRandom, buf: []u8) void {
+        defer self.calls += 1;
+        if (self.calls < self.prefix_calls) return self.a.random().bytes(buf);
+        if (self.calls == self.prefix_calls) {
+            std.debug.assert(buf.len == self.inject.len);
+            return @memcpy(buf, self.inject);
+        }
+        self.b.random().bytes(buf);
+    }
+
+    fn random(self: *SpliceRandom) std.Random {
+        return std.Random.init(self, fill);
+    }
+};
+
+const CountingRandom = struct {
+    inner: std.Random.DefaultPrng,
+    calls: usize = 0,
+
+    fn fill(self: *CountingRandom, buf: []u8) void {
+        self.calls += 1;
+        self.inner.random().bytes(buf);
+    }
+
+    fn random(self: *CountingRandom) std.Random {
+        return std.Random.init(self, fill);
+    }
+};
+
+test "generate refuses a Fermat-close q offered as its very first candidate (F7 m8 at the call site, paillier F14)" {
+    // The test above pins `fromPrimes`; this one pins the `topBitsMatch` call
+    // inside `generate`, which goes through `fromPrimesImpl(.generated)` and
+    // so has no other closeness guard behind it.
+    const bits = 512;
+    const half_len = comptime byteLen(bits / 2);
+    const seed_a = 0xF14A;
+
+    // Dry run: which fills produce `p`?
+    var counter: CountingRandom = .{ .inner = .init(seed_a) };
+    var p: [half_len]u8 = undefined;
+    generatePrime(counter.random(), bits / 2, &p);
+
+    // `q_close`: the next prime above `p`, so its top 100 bits match.
+    var q_close = p;
+    var search_prng = std.Random.DefaultPrng.init(0xF14C);
+    var steps: usize = 0;
+    while (true) : (steps += 1) {
+        try testing.expect(steps < 100_000);
+        var carry: u16 = 2;
+        var i: usize = q_close.len;
+        while (i > 0 and carry != 0) {
+            i -= 1;
+            const sum = @as(u16, q_close[i]) + carry;
+            q_close[i] = @truncate(sum);
+            carry = sum >> 8;
+        }
+        const m = Modulus.fromBytes(&q_close, .big) catch unreachable;
+        if (isProbablePrime(m, search_prng.random())) break;
+    }
+    try testing.expect(topBitsMatch(&p, &q_close));
+    // Control: the checked path refuses this pair on its own.
+    try testing.expectError(error.InvalidPrimes, fromPrimes(&p, &q_close));
+
+    // Real run: `p` comes out as in the dry run, and the first q candidate
+    // `generatePrime` draws is exactly `q_close` (prime, so it is accepted
+    // there: top bits set, odd, passes the sieve and Miller-Rabin).
+    var splice: SpliceRandom = .{
+        .a = .init(seed_a),
+        .b = .init(0xF14B),
+        .prefix_calls = counter.calls,
+        .inject = &q_close,
+    };
+    const kp = try generate(splice.random(), bits);
+    try testing.expect(splice.calls > counter.calls + 1); // the splice was reached and passed
+
+    // Recover q = n / p. `p` divides n: `generate` kept the first prime.
+    var n_bytes: [modulus_bytes]u8 = undefined;
+    try kp.public.nToBytes(n_bytes[0..kp.public.nByteLen()]);
+    var arena_buf: [scratch_bytes]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
+    const gpa = fba.allocator();
+    const bn = try bigFromBytes(gpa, n_bytes[0..kp.public.nByteLen()]);
+    const bp = try bigFromBytes(gpa, &p);
+    var bq = try newBig(gpa);
+    var rem = try newBig(gpa);
+    try bq.divFloor(&rem, &bn, &bp);
+    try testing.expect(rem.eqlZero());
+    var q: [half_len]u8 = undefined;
+    bq.toConst().writeTwosComplement(&q, .big);
+
+    // Without the call-site guard, q == q_close and the pair is one the
+    // checked path refuses; with it, q is a later draw and the pair passes.
+    try testing.expect(!std.mem.eql(u8, &q, &q_close));
+    try testing.expect(!topBitsMatch(&p, &q));
+    _ = try fromPrimes(&p, &q);
+}
+
 test "fromPrimes checks every factor: 32 pseudoprime pairings, composites, tiny primes, and a far-apart prime pair (F7)" {
     // All 16 base-2 strong pseudoprimes paired with kat_q, both orders — the
     // audit measured 24 of these 32 accepted before the check.
