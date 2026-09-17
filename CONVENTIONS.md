@@ -870,9 +870,7 @@ that reaches it can notice.
   `modules/<name>/`, beside the thing it checks and inside what the module's own steps
   already compile — `src/` for tests and for the fuzz/ctgrind harnesses the build scans
   for (§5), a subdirectory of the module for fixtures, corpora and reference scripts.
-  **Never in an audit directory, and never pasted into an audit document.** An audit finding
-  cites the instrument by its path in this repository; it does not carry the instrument's
-  body.
+  An audit's scratch instruments are a different matter — see the last bullet.
 - **An instrument that needs a FOREIGN TOOLCHAIN lives in `modules/<name>/tools/`, never in
   `src/`** (owner's rule, 2026-09-06). A module is standalone Zig with no external dependency;
   an anchor against a foreign implementation is a different thing — it needs a C compiler, a
@@ -934,28 +932,38 @@ that reaches it can notice.
   `check-scripts-doc` already holds each file there to a mention. A shared harness written
   in Zig that modules *import* is a different thing and goes to
   [`testkit`](modules/testkit) under §6.1 instead — `test_deps`, never `deps`.
-- **A developer's private notebook is not a location for an instrument.** Audit records,
-  findings, campaign ledgers and working notes legitimately live outside this repository.
-  The instruments that produced their numbers do not. If a number in a note was measured,
-  the thing that measured it is a file in this tree, and the note names that path.
+- **Audit instruments are disposable by default** (owner's rule, 2026-09-17; replaces the
+  2026-09-06 wording that every measured number must have its instrument in this tree). An
+  audit's durable output is the finding, the fix, and a test in `modules/<name>/src/` that
+  fails without the fix. Once that test exists the instrument has done its job: it is
+  deleted, and the finding says in a few sentences how the number was measured. Audit
+  records, findings and working notes live outside this repository; so does the scratch
+  that produced them, until it is deleted.
 
-**The concrete failure this prevents.** An instrument parked in an audit directory is
-outside every gate its module has. `zig build test-<name>` does not compile it;
-`check-fuzz`, `check-ctgrind`, `check-dark-tests`, `check-portable` and `check-pubfn-reach`
-cannot see it; CI never runs it; `zig fmt --check` never touches it. So when the module's
-API moves under it, nothing reddens — the instrument simply stops being true, silently, and
-the finding it once backed keeps citing it. The next audit of that module then opens a tree
-with no instrument in it and builds the same one again from scratch, which is the expensive
-half of an audit paid for twice.
+  Exactly two kinds are kept, and the auditor decides which **when the audit closes**, not
+  in a later clean-up:
 
-That is measured, not hypothetical. The 2026-09 audit campaign built a counting allocator
-for memory amplification, a stalling stand-in peer to prove a missing deadline, a mutation
-runner to show which guards no test has teeth on, and several oracles that recompute a
-result against a foreign reference implementation — and left every one of them outside this
-repository. Each was then rebuilt by hand, module after module, because there was nothing
-here to reach for.
+  1. **A recipe for committed data** — whatever produced goldens, KATs, fixtures or
+     captures under `src/`. Without it a golden is a number nobody can re-check.
+  2. **A differential oracle against a foreign implementation** that talks to the module
+     only through its public API or wire format. It does not anchor on source text, so it
+     survives refactoring and the next audit can reuse it.
 
-**So an instrument is finished when it is in the tree and something runs it**, not when it
-has printed its number. If it is worth citing in a finding, it is worth a path here. If it
-is genuinely single-use scratch that reproduces nothing, it is deleted rather than filed
-somewhere a future reader will mistake for an asset.
+  Both go to `modules/<name>/tools/`, each with a header saying what it needs and what it
+  produces. Mutation runners, probes for one finding, benchmarks of a fixed regression and
+  snapshot copies of the module are **not** kept.
+
+**Why disposable, measured.** The 2026-09 campaign left its instruments in a droppable
+cache and then moved them into this tree (17 modules, ~15 000 lines). Every moved mutation
+runner had to be re-derived before it would run: a week after the audit, all of them had a
+stale command line (a `testkit` dependency added since), their module snapshots were
+hundreds of lines behind, and their mutation anchors had rotted precisely *because the
+findings were fixed* — a fix rewrites the text the mutation points at. Moving an instrument
+therefore costs about as much as building it again, and once moved nothing runs it, so it
+rots again. What the move did produce — twelve guards no test covered — came from
+*re-running* the mutations against today's tree, which is an audit, not a migration. The
+lasting form of such a result is the missing test, filed as a finding.
+
+What does not rot that way is an instrument that never names the module's source text:
+a recipe whose output is committed, and an oracle that speaks the wire format. Those are
+the two kept.
