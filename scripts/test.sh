@@ -1356,11 +1356,8 @@ cmd_changed() {
         echo "              the gates that read them still run below."
     fi
 
-    if [[ -z "$files" ]]; then
-        [[ -z "${closure// /}" ]] && { echo "changed: nothing to do"; exit 0; }
-        run_modules "$closure"
-        stamps_record "$closure" "$lane"
-        summary
+    if [[ -z "$files" && -z "${closure// /}" ]]; then
+        echo "changed: nothing to do"
         exit 0
     fi
     if [[ -z "${closure// /}" && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 && $trigger_docs -eq 0 && -z "${seeds// /}" ]]; then
@@ -1368,16 +1365,33 @@ cmd_changed() {
         exit 0
     fi
 
+    # ⭐ THREE KINDS OF CHECK, gated three ways (2026-09-18). Every one of
+    # these used to run on every invocation with a non-empty diff, ~52 s warm,
+    # which a comment edit paid in full.
+    #   repo    (`files`): read root docs and the diff -- run when anything moved;
+    #   text    (`mt`):    scan module source and may read comments or NOTICE,
+    #                      which no fingerprint sees -- run when a module file
+    #                      moved or a module is unproven;
+    #   content (`mc`):    compile or analyse module code, comment-blind -- run
+    #                      only when some module is unproven (no stamp at its
+    #                      current fingerprint), narrowed where the step allows.
+    # A green run stamps the modules it ran, so a stamp implies these passed.
+    local mc=0 mt=0
+    [[ -n "${closure// /}" ]] && mc=1
+    [[ $mc -eq 1 || -n "${seeds// /}" || -n "${docs_only// /}" ]] && mt=1
+    closure_has() { case " $closure " in *" $1 "*) return 0 ;; esac; return 1; }
+    stamps_narrow "$closure" "${G_NAMES[*]}"
+
     if [[ $trigger_catalog -eq 1 ]]; then
         step "check-catalog (README.md changed)" zig build check-catalog
     fi
 
-    # Unconditional for the same reason as `check-testonly` below, and reached
-    # by both paths that get here: a changed module (its own CHANGELOG.md is
+    # Runs whenever anything moved (`files`), and reached by both paths that
+    # get here: a changed module (its own CHANGELOG.md is
     # under modules/, so it seeded the module) and a changed root CHANGELOG.md
     # (`trigger_changelog`, which is what keeps the early exit above from
     # skipping this).
-    step "check-changelog" zig build check-changelog
+    [[ -n "$files" ]] && step "check-changelog" zig build check-changelog
 
     # `check-changelog` above proves the file EXISTS and is well formed; it reads
     # the tree, never a diff, so it cannot see that a module's parser was
@@ -1387,30 +1401,29 @@ cmd_changed() {
     # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
     # instance is the one CI reaches with a real base ref; the other two are
     # no-ops on a clean checkout.
-    step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
+    [[ -n "$files" ]] && step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
 
-    # Always: a testkit leak into published code is introduced by editing a
-    # MODULE, not build.zig, so there is no change signal to gate this on --
-    # and it is ~0.5s cold, ~0.15s warm, so gating would save nothing.
-    step "check-testonly" zig build check-testonly
+    # A testkit leak into published code is introduced by editing a MODULE's
+    # code, which re-keys it -- so an unproven module (`mc`) is the signal.
+    (( mc )) && step "check-testonly" zig build check-testonly
 
     # Same reasoning as `check-testonly` above: ~0.1s warm, and the change
     # signal that would gate it (editing a harness, or editing the module it
     # measures) is exactly what a developer is doing when it matters.
-    step "check-ctgrind" zig build check-ctgrind
+    (( mc )) && step "check-ctgrind" zig build check-ctgrind
 
-    # Unconditional for the same reason, and sub-second warm. It was absent
-    # from this driver until 2026-08-14, which is why nobody noticed it had
+    # Gated on `mc` like the two above. It was absent from this driver until
+    # 2026-08-14, which is why nobody noticed it had
     # been red for weeks on 21 modules: a gate that exists and is never invoked
     # makes the same claim a skipped test makes, which is that someone looked.
-    step "check-fuzz" zig build check-fuzz
-    step "check-copyleft" zig build check-copyleft
+    (( mc )) && step "check-fuzz" zig build check-fuzz
+    (( mt )) && step "check-copyleft" zig build check-copyleft
 
     # Same reasoning as check-copyleft above, and the same order of cost
     # (~1.4 s): a source scan that refuses a module whose own code runs a
     # foreign toolchain. See phase_checks_fast_tail for the rule in full.
-    step "check-module-purity" zig build check-module-purity
-    step "check-global-alloc" zig build check-global-alloc
+    (( mt )) && step "check-module-purity" zig build check-module-purity
+    (( mc )) && step "check-global-alloc" zig build check-global-alloc
 
     # 32-bit compile of every `platform = .any` module. ~6s cold for all 195,
     # near-free warm, and it is the only thing in this gate that can see a class
@@ -1418,10 +1431,10 @@ cmd_changed() {
     # `usize` is 64 bits everywhere the suite has ever run. `platform = .any`
     # covers wasm32 and arm32 too, and until this step existed nothing had ever
     # compiled for either.
-    step "check-portable" zig build check-portable
-    step "check-portable-table" zig build check-portable-table
-    step "check-libs-table" zig build check-libs-table
-    step "check-catalog-table" zig build check-catalog-table
+    (( mc )) && step "check-portable" zig build check-portable
+    [[ -n "$files" ]] && step "check-portable-table" zig build check-portable-table
+    [[ -n "$files" ]] && step "check-libs-table" zig build check-libs-table
+    [[ -n "$files" ]] && step "check-catalog-table" zig build check-catalog-table
     # The class no other gate can see: Zig analyses a function body only when
     # something references it, so a `pub fn` no test reaches can be outright
     # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
@@ -1430,13 +1443,13 @@ cmd_changed() {
     # mutation the same day -- a deliberate type error in an unreachable
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
-    step "check-pubfn-reach" zig build check-pubfn-reach
+    (( mc )) && step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     # The one class no test here can cover: is the PUBLISHED API sufficient to
     # do the job? Every test lives in the file it tests, so it reads private
     # declarations and its build carries `test_deps` a consumer never gets.
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
+    (( mc )) && step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     # ⚠ `zig build run-examples` USED TO BE HERE, running all 230 examples on
     # every scoped push under a comment claiming "only the full lane pays it".
     # It did not: this step is unconditional, so the scoped lane paid ~68 s of
@@ -1456,14 +1469,15 @@ cmd_changed() {
     # script for why one target is enough and why this is a symbol-presence
     # check rather than a byte-count one. ~30s when Client.zig's content
     # actually changed, near-instant otherwise.
-    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    closure_has http && step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
     # falcon's constant-time property is invisible to every value test (the
     # integer emulation is bit-identical to hardware FP), and falcon is not on
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
-    step "check-fp-freedom" ./scripts/check-fp-freedom.sh
-    step "check-ct-compare" ./scripts/check-ct-compare.py
-    step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
+    closure_has falcon && step "check-fp-freedom" ./scripts/check-fp-freedom.sh
+    # Strips comments before it scans, so a fingerprint change is its signal.
+    (( mc )) && step "check-ct-compare" ./scripts/check-ct-compare.py
+    (( mt )) && step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
     # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
@@ -1481,7 +1495,7 @@ cmd_changed() {
     # The ceiling is per module rather than one total on purpose -- a total lets
     # one module regress while another improves and still reads green.
     # It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
+    (( mt )) && step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
@@ -1489,9 +1503,9 @@ cmd_changed() {
     # examples compared against an external oracle that way and printed that it
     # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
     # exiting 0 and still claiming a byte-exact match.
-    step "check-example-assert" ./scripts/check-example-assert.py
+    (( mt )) && step "check-example-assert" ./scripts/check-example-assert.py
 
-    if [[ -z "$closure" ]]; then
+    if [[ -z "${closure// /}" ]]; then
         summary
         exit 0
     fi
