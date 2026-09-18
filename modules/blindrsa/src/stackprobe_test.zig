@@ -158,7 +158,9 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     for (kat.r, 0..) |c, idx| r_rev[MAX - 1 - idx] = c;
     const r_le = r_rev[0..32];
 
-    std.debug.print("\n=== STACKPROBE blindrsa B6/B9 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
+    // Every number below is printed only when an assertion fails: the lane
+    // treats stderr from a passing test as a FAIL (scripts/lib/test-lib.sh).
+    errdefer std.debug.print("\n=== STACKPROBE blindrsa B6/B9 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
 
     paint();
     callInnocent();
@@ -168,7 +170,7 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     callLeaky();
     snapshot();
     const pos = count(r_be);
-    std.debug.print("  NEG control {d}, POS control (r parked) {d}\n", .{ neg, pos });
+    errdefer std.debug.print("  NEG control {d}, POS control (r parked) {d}\n", .{ neg, pos });
     try std.testing.expectEqual(@as(usize, 0), neg);
     try std.testing.expect(pos >= 1);
 
@@ -192,8 +194,9 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
         const hits_r_le = count(r_le);
         const hits_v_be = count(v_be[0..32]);
         const hits_v_le = count(v_le[0..32]);
-        std.debug.print("  blind #{d}: r big-endian={d} r limbs={d} v=r^2 big-endian={d} v limbs={d}; dirty below the call {d} B\n", .{
-            round, hits_r_be, hits_r_le, hits_v_be, hits_v_le, dirtyBytes(),
+        const dirty = dirtyBytes();
+        errdefer std.debug.print("  blind #{d}: r big-endian={d} r limbs={d} v=r^2 big-endian={d} v limbs={d}; dirty below the call {d} B\n", .{
+            round, hits_r_be, hits_r_le, hits_v_be, hits_v_le, dirty,
         });
 
         try std.testing.expectEqual(@as(usize, 0), hits_r_be);
@@ -205,8 +208,8 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     // `blindSign` is the other half of B6: its own `b`/`b_inv` go through the
     // same `maskedInvert`, and the CRT private op runs on the key itself.
     // Under the fixed random `b` is again `kat.r`, so the same needles apply.
-    // `p`/`q` are measured too -- they belong to `rsa`, not here, so they are
-    // printed until there is a number to stand behind.
+    // `p`/`q` are measured too -- they belong to `rsa`, not here; the
+    // key-copy control is reported with a failure, not asserted.
     sk = try kat.secretKey();
     var p_rev: [kat.p.len]u8 = undefined;
     for (kat.p, 0..) |c, idx| p_rev[kat.p.len - 1 - idx] = c;
@@ -216,11 +219,10 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
     copyKeyOnly();
     snapshot();
     var offbuf: [256]u8 = undefined;
-    std.debug.print("  key-copy control: p={d} q={d}; p limb hits at {s}\n", .{
-        count(kat.p[0..32]) + count(p_rev[0..32]),
-        count(kat.q[0..32]) + count(q_rev[0..32]),
-        hitOffsets(p_rev[0..32], &offbuf),
-    });
+    const ctl_p = count(kat.p[0..32]) + count(p_rev[0..32]);
+    const ctl_q = count(kat.q[0..32]) + count(q_rev[0..32]);
+    const ctl_offsets = hitOffsets(p_rev[0..32], &offbuf);
+    errdefer std.debug.print("  key-copy control: p={d} q={d}; p limb hits at {s}\n", .{ ctl_p, ctl_q, ctl_offsets });
 
     for (0..3) |round| {
         paint();
@@ -241,10 +243,12 @@ test "STACKPROBE (A1 B6/B9): blind() leaves no r and no masked v on the dead sta
         const hits_p = count(kat.p[0..32]) + count(p_rev[0..32]);
         const hits_q = count(kat.q[0..32]) + count(q_rev[0..32]);
         var ob: [256]u8 = undefined;
-        std.debug.print("  blindSign #{d}: b big-endian={d} b limbs={d} v=b^2 big-endian={d} v limbs={d}; key p={d} q={d}; p limb hits at {s}; dirty below the call {d} B (burn starts at {d})\n", .{
-            round,        hits_b_be,                hits_b_le, hits_v_be,
-            hits_v_le,    hits_p,                   hits_q,    hitOffsets(p_rev[0..32], &ob),
-            dirtyBytes(), WINDOW - sign_burn_bytes,
+        const offsets = hitOffsets(p_rev[0..32], &ob);
+        const dirty = dirtyBytes();
+        errdefer std.debug.print("  blindSign #{d}: b big-endian={d} b limbs={d} v=b^2 big-endian={d} v limbs={d}; key p={d} q={d}; p limb hits at {s}; dirty below the call {d} B (burn starts at {d})\n", .{
+            round,     hits_b_be,                hits_b_le, hits_v_be,
+            hits_v_le, hits_p,                   hits_q,    offsets,
+            dirty,     WINDOW - sign_burn_bytes,
         });
 
         try std.testing.expectEqual(@as(usize, 0), hits_b_be);
