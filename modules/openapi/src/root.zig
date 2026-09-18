@@ -1531,7 +1531,9 @@ test "endpoint: concurrent first callers do not serialize behind a spinning lock
         try testing.expectEqual(@as(u32, 0), ctx.err_count.load(.monotonic));
     }
 
-    std.debug.print("\n[F2] 1 caller wall={d}ns, {d} callers wall={d}ns\n", .{ wall_single, nthreads, wall_concurrent });
+    // Printed only when the bound below fails: the lane treats stderr from a
+    // passing test as a FAIL (scripts/lib/test-lib.sh).
+    errdefer std.debug.print("\n[F2] 1 caller wall={d}ns, {d} callers wall={d}ns\n", .{ wall_single, nthreads, wall_concurrent });
     // Before the fix, N callers spinning on `lockSpin` held across the
     // WHOLE build made wall time go UP with concurrency (932ms -> 1762ms,
     // +89%, measured in A1/openapi.md F2) — a pure spinlock is slower than
@@ -1548,7 +1550,8 @@ test "generate: route-table build time scales linearly, not quadratically, with 
     const gpa = std.heap.smp_allocator;
     const small = try benchBuildNs(gpa, 500);
     const big = try benchBuildNs(gpa, 4000); // 8x the routes
-    std.debug.print("\n[F7] 500 routes={d}ns, 4000 routes={d}ns, ratio={d:.2}\n", .{
+    // Printed only when the bound below fails, as in F2.
+    errdefer std.debug.print("\n[F7] 500 routes={d}ns, 4000 routes={d}ns, ratio={d:.2}\n", .{
         small, big, @as(f64, @floatFromInt(big)) / @as(f64, @floatFromInt(small)),
     });
     // The old O(routes·paths) dedup scan + O(paths·13·routes) grouping scan
