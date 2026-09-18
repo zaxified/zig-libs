@@ -850,6 +850,12 @@ capability_check() {
     # `changed` can delegate to `all`; report once per invocation, not twice.
     [[ -n "$_CAP_CHECKED" ]] && return 0
     _CAP_CHECKED=1
+    # A dry run starts nothing that needs a peer, and CI skips installing them
+    # for it -- the gaps it would list are the dry run's own doing.
+    if [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]]; then
+        echo "environment: not probed (dry run -- nothing below needs a peer)"
+        return 0
+    fi
 
     local -a gaps=()
     # Two lists, because two different things go wrong. A GAP costs coverage:
