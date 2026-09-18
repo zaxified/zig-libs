@@ -379,7 +379,7 @@ provided.
 - **Class B** — published cryptographic or algorithmic construction with published vectors.
 - **Oracle MIXED** — anchored for some paths, self for others — the evidence below names which.
 
-**What the tests actually contain.** X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig); the Double Ratchet KDFs have libsignal vectors (interop_vectors.zig); PQXDH's KDF chain is checked against an INDEPENDENT second implementation (`scripts/gen/pqxdh-kdf-check.py`), not against the protocol's authors
+**What the tests actually contain.** X3DH agreement+codec only self round-trip; XEdDSA has libsignal KAT (kat_test.zig); the Double Ratchet KDFs have libsignal vectors (interop_vectors.zig); PQXDH's KDF chain is checked against an INDEPENDENT second implementation (`tools/pqxdh-kdf-check.py`), not against the protocol's authors
 
 **How it got there.** No external oracle exists for what remains. Signal publishes no official X3DH KAT; own Python oracle would be REDERIVED
 

@@ -21,10 +21,12 @@ wrong order, a missing prefix, the wrong salt length, or `info` fed to
 `std.crypto.kdf.hkdf` and Python's `hmac` would have to be wrong the same way
 -- but HKDF has RFC 5869 vectors of its own and both sides already pass those.
 
-Usage:
-    scripts/gen/pqxdh-kdf-check.py            # print the pinned vectors as Zig
-    scripts/gen/pqxdh-kdf-check.py --check    # re-derive and diff against the pin
-                                          # (exit 1 on any mismatch)
+Usage, from the repository root:
+    modules/signal/tools/pqxdh-kdf-check.py            # print the pinned vectors as Zig
+    modules/signal/tools/pqxdh-kdf-check.py --check    # re-derive and diff against the pin
+                                                   # (exit 1 on any mismatch)
+    zig build interop-signal                           # the same `--check`, as the
+                                                   # module's interop lane runs it
 
 The output is pinned in `modules/signal/src/interop_vectors.zig`; the test in
 `pqxdh.zig` compares this module's `deriveSharedSecret` against it.
@@ -78,7 +80,7 @@ def check() -> int:
     and this one is the only thing standing behind the PQXDH composition,
     because the Zig tests compare against the pin, not against this file.
     """
-    root = Path(__file__).resolve().parent.parent.parent
+    root = Path(__file__).resolve().parents[3]  # tools/ -> signal/ -> modules/ -> repo
     text = (root / PIN).read_text()
     failures = 0
     for name, dh1, dh2, dh3, dh4, ss in CASES:

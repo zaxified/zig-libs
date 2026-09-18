@@ -49,7 +49,7 @@ the spec-pure `xeddsa.verify`. See [SPEC.md](SPEC.md).
 | `src/xeddsa.zig` | XEdDSA `sign`/`verify` (spec variant) + `libsignal.sign`/`verify` (deployed-libsignal variant) + `edwardsFromMontgomery` (the sign-0 Montgomery->Edwards recovery both variants share), sign-0-convention + libsignal-variant self-consistency tests |
 | `src/ratchet.zig` | Double Ratchet `State` (`initAlice`/`initBob`/`encrypt`/`decrypt`), `Header`/`Message` + header codec, `KDF_RK`/`KDF_CK`, DH + symmetric-key ratchets, `max_skip`-bounded skipped-key store, transactional decrypt; full-session / out-of-order / MAX_SKIP / tamper tests |
 | `src/pqxdh.zig` | PQXDH (Part 3): `KemPreKey`, `PreKeyBundle`/`InitialMessage`, the four-DH + ML-KEM-1024 + HKDF agreement (`initiateUnverified`/`respond`), fail-closed `initiate`, `generateKemPreKey`; **no wire codec** — a caller transmitting a PQXDH bundle writes their own |
-| `src/interop_vectors.zig` | The Double Ratchet's `KDF_CK`/`KDF_RK` vectors captured from libsignal, and PQXDH's KDF-chain vectors from `scripts/gen/pqxdh-kdf-check.py` — see each block's doc comment for which is which and what class of anchor it is |
+| `src/interop_vectors.zig` | The Double Ratchet's `KDF_CK`/`KDF_RK` vectors captured from libsignal, and PQXDH's KDF-chain vectors from `tools/pqxdh-kdf-check.py` — see each block's doc comment for which is which and what class of anchor it is |
 | `src/kat_test.zig` | X3DH agreement + codec tests; XEdDSA round-trip/tamper/fail-closed tests; the libsignal known-answer vector as an external anchor exercised against BOTH variants (`xeddsa.libsignal.verify` byte-exact accept + 64-tamper rejection, `xeddsa.verify` reject); std-Ed25519 cross-check; `initiate`/`respond` end-to-end |
 
 ## Import
@@ -196,7 +196,7 @@ difference is stated rather than smoothed over: Signal publishes no
 byte-exact PQXDH vectors (checked 2026-08-22 — neither the spec page nor
 libsignal). XEdDSA carries libsignal's own vector, and the
 composition is checked against an independent implementation of the same
-arithmetic (`scripts/gen/pqxdh-kdf-check.py --check`). **ML-KEM-1024 itself is
+arithmetic (`tools/pqxdh-kdf-check.py --check`). **ML-KEM-1024 itself is
 unanchored** — std's three `NIST KAT test` blocks all cover `d00.Kyber*`,
 the round-3 variant this module explicitly does not implement, while
 `nist.MLKem1024` gets only a self round trip. This paragraph used to claim

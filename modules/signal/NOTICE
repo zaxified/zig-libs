@@ -195,7 +195,7 @@ a different and WEAKER provenance class than everything else in this file,
 and are listed here so a distributor is not misled by their neighbours.
 They are not libsignal's and not the protocol authors': Signal publishes no
 byte-exact PQXDH vectors (checked 2026-08-22). They are the output of
-`scripts/gen/pqxdh-kdf-check.py`, written in this repository from Python's
+`tools/pqxdh-kdf-check.py`, written in this repository from Python's
 `hmac`/`hashlib` alone — a second implementation of the same arithmetic, no
 third-party code, no licence obligation of any kind. It catches a term in
 the wrong order, a missing prefix, the wrong salt length; it cannot catch a
