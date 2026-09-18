@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `Decoder.charge` gains a
+  test-only call counter (`void` outside a test build, so the increment
+  compiles to nothing there). F7's regression guard was an opt-in
+  ReleaseFast wall-clock bench (`IMAP_BENCH_F7=1`) the default gate never
+  ran; it is now a counted test in every mode — `quoted()` and `run()` take a
+  256 KiB buffered run in a handful of `charge` calls, where the old
+  per-byte loop made one per byte. `IMAP_BENCH_F7` no longer exists.
 - **2026-09-13** — **BEHAVIOURAL:** A1 findings F1, F5, F9 (UTF-7 half).
   F1: `Client.searchMessages` took any `* SEARCH`/`* ESEARCH` as its answer — the ESEARCH
   correlator was parsed and never compared. It now refuses, with the new

@@ -29,6 +29,18 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
 const utf7 = @import("utf7.zig");
+const builtin = @import("builtin");
+
+/// Test-only counter (audit F7 regression guard): `Decoder.charge` calls
+/// since the test last zeroed it. Every byte the grammar consumes (bar a
+/// literal's payload) is charged, so the number of calls is the number of
+/// chunks the decoder took off the reader: one per buffered run for
+/// `run`/`quoted`, one per BYTE for the pre-F7 loop. That is the defect,
+/// counted rather than timed. `void` outside a test build, so the increment
+/// compiles to nothing there; thread-local so no other thread's decoding can
+/// reach a test's count.
+const ChargeCounter = if (builtin.is_test) usize else void;
+threadlocal var charge_calls_for_testing: ChargeCounter = if (builtin.is_test) 0 else {};
 
 pub const Error = error{
     /// A byte that cannot appear where it appeared.
@@ -138,6 +150,7 @@ pub const Decoder = struct {
     /// decoder consumes goes through here except a literal's payload, which
     /// `max_literal` bounds instead.
     pub fn charge(d: *Decoder, n: usize) Error!void {
+        if (builtin.is_test) charge_calls_for_testing += 1;
         d.line_bytes += n;
         if (d.line_bytes > d.opts.max_line) return error.LineTooLong;
     }
@@ -538,52 +551,64 @@ test "quoted string: escapes, and only the two that exist" {
     try testing.expectEqualStrings("a\"b\\c", s);
 }
 
-fn f7NowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
-
-test "bench (opt-in via IMAP_BENCH_F7): quoted() is not O(1) reader calls per byte" {
+test "F7: quoted() takes a buffered run in one chunk, not one reader call per byte" {
     // F7 (`~/CML/20260901-zig-libs-audit/A1/imap.md`): `quoted` did
     // `charge` + `takeByte` + `append` per BYTE while `run` (used by every
-    // atom and by `text`) already batches a buffered window into one
+    // atom and by `text`) already batched a buffered window into one
     // `appendSlice`. Measured there: 8.3-10.2x on 8000-byte quoted strings.
-    // Opt-in and ReleaseFast-only, same shape as `smtp`'s reply.zig bench:
-    // a wall-clock assert in the default gate, run alongside up to three
-    // other agents' lanes, is a flaky test waiting to happen. Run with:
-    //   IMAP_BENCH_F7=1 scripts/modtest imap -Doptimize=ReleaseFast
-    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("IMAP_BENCH_F7") == null) return error.SkipZigTest;
-
+    //
+    // This used to be an opt-in ReleaseFast wall-clock bench
+    // (`IMAP_BENCH_F7=1`, 8 MiB decode < 15 ms; measured 10.7 ms buffered vs
+    // 22.7 ms per-byte, a 1.4x margin), so the default gate never ran it. It
+    // now counts `charge` calls (`charge_calls_for_testing`), which is the
+    // number of chunks the decoder took off the reader: a handful for the
+    // buffered window, one per byte for the old loop. Deterministic, any
+    // mode, any load.
     const gpa = testing.allocator;
-    // 8 MiB quoted string, plain bytes with a handful of escapes near the
-    // end -- mostly one long buffered run, the shape that makes a per-byte
-    // loop and a batched `appendSlice` loop diverge the most.
+    const plain = 256 << 10;
+    // One long buffered run, then a couple of escapes near the end so the
+    // escape branch is on the counted path too.
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(gpa);
     try wire.append(gpa, '"');
-    try wire.appendNTimes(gpa, 'A', (8 << 20) - 8);
+    try wire.appendNTimes(gpa, 'A', plain);
     try wire.appendSlice(gpa, "\\\"\\\\AA");
     try wire.append(gpa, '"');
 
     var r = std.Io.Reader.fixed(wire.items);
-    // `charge()` is per-byte against `Options.max_line` (default 64 KiB) --
-    // this is a `quoted()`-only workload, so raise it well past 8 MiB rather
-    // than measuring `LineTooLong` instead of the decode path.
-    var d = Decoder.init(gpa, &r, .{ .max_line = 16 << 20 });
-    const start = f7NowNs();
+    // `charge()` is checked against `Options.max_line` (default 64 KiB) --
+    // raise it past the input so the decode path, not `LineTooLong`, runs.
+    var d = Decoder.init(gpa, &r, .{ .max_line = 1 << 20 });
+    charge_calls_for_testing = 0;
     const s = (try d.quoted()).?;
-    const elapsed = f7NowNs() - start;
     defer gpa.free(s);
+    const calls = charge_calls_for_testing;
 
-    std.debug.print("F7 bench: {d} bytes decoded in {d} ns\n", .{ wire.items.len, elapsed });
-    // Measured on this machine, same 8 MiB input: buffered-window 10.7 ms,
-    // the old byte-at-a-time shape (temporarily restored to check) 22.7 ms
-    // -- 2.1x here (the audit's 8.3-10.2x was on a shorter, escape-denser
-    // string, where the per-byte loop's relative cost is higher). 15 ms
-    // sits between the two, comfortably above the fast path's measured cost
-    // while still failing hard on a reversion to per-byte reader calls.
-    try testing.expect(elapsed < 15 * std.time.ns_per_ms);
+    try testing.expectEqual(plain + 4, s.len);
+    try testing.expectEqualStrings("\"\\AA", s[plain..]);
+    // Opening quote, the run, two escapes (2 each), the tail run, the
+    // closing quote: 8 today. A per-byte loop is ~plain.
+    try testing.expect(calls <= 16);
+}
+
+test "F7: run() takes a buffered run in one chunk, not one reader call per byte" {
+    // `run` is the batching `quoted` was brought in line with; same counter,
+    // same property, over `text()`.
+    const gpa = testing.allocator;
+    const plain = 256 << 10;
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(gpa);
+    try wire.appendNTimes(gpa, 'A', plain);
+    try wire.appendSlice(gpa, "\r\n");
+
+    var r = std.Io.Reader.fixed(wire.items);
+    var d = Decoder.init(gpa, &r, .{ .max_line = 1 << 20 });
+    charge_calls_for_testing = 0;
+    const s = (try d.text()).?;
+    defer gpa.free(s);
+    try testing.expectEqual(@as(usize, plain), s.len);
+    // 1 today (the whole run is one buffered window); per-byte is ~plain.
+    try testing.expect(charge_calls_for_testing <= 4);
 }
 
 test "literal: RFC 9051 §7.5.2 shape" {
