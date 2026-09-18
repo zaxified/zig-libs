@@ -12,7 +12,7 @@ semantic version.
 
 ## Unreleased
 
-The collection grew 77 → 225 modules since v0.1.0, spanning pairing/EC
+The collection grew 77 → 230 modules since v0.1.0, spanning pairing/EC
 crypto, Bitcoin/Lightning, post-quantum, FHE/ZK/MPC, protocol security,
 distributed fabric and kernel/networking. Every module now carries a
 `CHANGELOG.md`, not only the ones with a code change to record: each

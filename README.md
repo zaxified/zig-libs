@@ -32,9 +32,10 @@ carry their own attribution; it does not catalogue provenance.
 > tests run in three release modes; mutation audits across the collection ask whether each
 > test would actually go red; constant-time claims are machine-checked where a row in
 > `scripts/checks/ctgrind-expected.tsv` says so; `zig build check-fuzz` requires a fuzz harness on
-> every module that parses foreign bytes; `zig build check-portable` compiles every
-> `platform = .any` module for a 32-bit target, which the CI matrix cannot do since every
-> lane in it is 64-bit; and each module's `SPEC.md` carries an
+> every module that parses foreign bytes; `zig build check-portable` cross-compiles every
+> module for each target it declares beyond 64-bit Linux (32-bit big-endian Linux, Windows,
+> wasm32 — see "Portability" below), which no CI lane runs natively; and each module's
+> `SPEC.md` carries an
 > **anchor grade** saying where its expected values come from — `EXTERNAL` (published
 > vectors, bytes captured from a foreign implementation, or a live foreign peer) down to
 > `SELF` (we wrote them from our own reading of the spec).
@@ -167,10 +168,12 @@ zig build check-portable-table # verify the README "Portability" table matches m
 zig build gen-portable-table   # regenerate that table (run after changing a module's meta.targets)
 ```
 
-`scripts/test.sh` is the entry point for contributors: it maps changed files onto the
-modules they affect, runs the `check-*` gates alongside them, and widens to the full set by
-itself when the change is one that warrants it (`build.zig`, the harness). Reach for
-`zig build test` when you actually want everything regardless of what changed.
+`scripts/test.sh` is the entry point for contributors: `scripts/test.sh changed` runs each
+module that has no green stamp at its current fingerprint (its own sources, its dependencies,
+the build machinery) together with the `check-*` gates the change can affect, and a change to
+the harness itself adds every check plus a smoke run. See `scripts/README.md`, "Which modules
+run: stamps". Reach for `zig build test` when you actually want everything regardless of what
+changed.
 
 `zig build -l` lists the rest, including the other `check-*` gates.
 

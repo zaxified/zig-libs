@@ -624,8 +624,8 @@ the two blind oracles that make this easy to misdiagnose, in `scripts/README.md`
 
 **A note worth passing to integrators** (belongs in module docs where a parser is
 exposed, not enforced here): every parser that touches bytes it did not produce is
-held to a "never panic on arbitrary input" threat model, backed by **440 fuzz
-harnesses across 144 modules**. Those harnesses assert that arbitrary input never trips
+held to a "never panic on arbitrary input" threat model, backed by **526 fuzz
+harnesses across 171 modules** (counted 2026-09-18). Those harnesses assert that arbitrary input never trips
 a safety check — an assertion that only carries meaning in a build where the checks
 exist. Compiled `ReleaseFast`, the bound the fuzzer proved untripped is simply gone,
 and the input that would have panicked reads out of bounds instead. So the fuzz corpus
@@ -681,7 +681,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   nothing they do not already cover, so that lane compiles every module and every example
   and runs neither.
   **Why not semver.** Zig resolves dependencies by URL + hash — no resolver reads a version
-  string — so a semver tag carries no mechanism, only signal, and on a 225-module collection
+  string — so a semver tag carries no mechanism, only signal, and on a 230-module collection
   the signal would be false: one number cannot describe modules ranging from externally
   anchored to never consumed. It is also uninformative in the direction semver exists for.
   A consumer using three modules learns nothing from "the collection went 2.0"; a major bump
