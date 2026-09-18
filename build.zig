@@ -1680,8 +1680,8 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
     // the cache dir: tokenising all ~47 MB of `.zig` in the Debug-built build
     // runner took 8.4 s, and a step the local loop runs every time must not.
     // The memo is pure cache -- deleting it costs one slow run, nothing else.
-    const memo_path = "ziglibs-fingerprint-files-v2.tsv";
-    // `<kind>\t<path>\t<size>\t<mtime>\t<ctime>\t<inode>\t<hex>\t<embeds>`,
+    const memo_path = "ziglibs-fingerprint-files-v3.tsv";
+    // `<kind>\t<path>\t<size>\t<mtime>\t<ctime>\t<inode>\t<hex>\t<embeds>\t<envs>`,
     // kind = tok (a .zig file's comment-free token stream) or raw (bytes).
     // `embeds` lists the `@embedFile` targets a .zig file names, so the second
     // pass below knows which files a test reads as TEXT without re-reading.
@@ -1690,17 +1690,17 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             var f = std.mem.splitScalar(u8, line, '\t');
-            var fields: [8][]const u8 = undefined;
+            var fields: [9][]const u8 = undefined;
             var nf: usize = 0;
             while (f.next()) |x| : (nf += 1) {
-                if (nf == 8) break;
+                if (nf == 9) break;
                 fields[nf] = x;
             }
-            if (nf != 8 or fields[6].len != 64) continue;
+            if (nf != 9 or fields[6].len != 64) continue;
             var digest: [32]u8 = undefined;
             _ = std.fmt.hexToBytes(&digest, fields[6]) catch continue;
             const key_end = @intFromPtr(fields[5].ptr) - @intFromPtr(line.ptr) + fields[5].len;
-            try memo.put(line[0..key_end], .{ .digest = digest, .embeds = fields[7] });
+            try memo.put(line[0..key_end], .{ .digest = digest, .embeds = fields[7], .envs = fields[8] });
         }
     } else |_| {}
     var memo_out: std.Io.Writer.Allocating = .init(b.allocator);
@@ -1767,6 +1767,32 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
                 if (std.mem.startsWith(u8, rel, "..")) continue; // outside the module
                 try raw_set.put(rel, {});
             }
+        }
+        // ⭐ THE ENVIRONMENT A TEST READS (audit 2026-09-18). Tests read
+        // dozens of variables (FLEETSIM_EXPECT_TCP, *_BENCH*, SNMP_TEST_*,
+        // ZIG_LIBS_YAML_SUITE, ...) through several APIs, so the candidates
+        // are every ALL-CAPS string literal in the module's code; each one
+        // SET in this process's environment -- the one the tests will run in
+        // -- is folded in with its value. Over-inclusion costs a re-run.
+        var env_names = std.StringHashMap(void).init(b.allocator);
+        for (tok) |fm| {
+            var it = std.mem.splitScalar(u8, fm.envs, ',');
+            while (it.next()) |e| if (e.len != 0) try env_names.put(e, {});
+        }
+        var env_list: std.ArrayList([]const u8) = .empty;
+        var eit = env_names.keyIterator();
+        while (eit.next()) |e| try env_list.append(b.allocator, e.*);
+        std.mem.sort([]const u8, env_list.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (env_list.items) |e| {
+            const v = b.graph.environ_map.get(e) orelse continue;
+            h.update("\x00env:");
+            h.update(e);
+            h.update("=");
+            h.update(v);
         }
         // Pass 2: fold.
         for (paths.items, 0..) |path, k| {
@@ -1839,7 +1865,7 @@ fn moduleIndex(name: []const u8) ?usize {
     return null;
 }
 
-const FileMemo = struct { digest: [32]u8, embeds: []const u8 };
+const FileMemo = struct { digest: [32]u8, embeds: []const u8, envs: []const u8 = "" };
 const DigestKind = enum { tok, raw };
 
 /// One file's digest, from the memo when its stat key matches, else computed
@@ -1861,19 +1887,21 @@ fn fileDigest(
         const src = try dir.readFileAlloc(io, path, b.allocator, .limited(512 * 1024 * 1024));
         var fh = std.crypto.hash.sha2.Sha256.init(.{});
         var embeds: []const u8 = "";
+        var envs: []const u8 = "";
         if (kind == .tok and std.mem.endsWith(u8, path, ".zig")) {
             const z = try b.allocator.dupeZ(u8, src);
             hashZigTokens(&fh, z, null);
             embeds = try collectEmbeds(b, z);
+            envs = try collectEnvNames(b, z);
         } else {
             fh.update(src);
         }
         b.allocator.free(src);
         var d: [32]u8 = undefined;
         fh.final(&d);
-        break :blk .{ .digest = d, .embeds = embeds };
+        break :blk .{ .digest = d, .embeds = embeds, .envs = envs };
     };
-    try memo_out.writer.print("{s}\t{s}\t{s}\n", .{ key, std.fmt.bytesToHex(got.digest, .lower), got.embeds });
+    try memo_out.writer.print("{s}\t{s}\t{s}\t{s}\n", .{ key, std.fmt.bytesToHex(got.digest, .lower), got.embeds, got.envs });
     return got;
 }
 
@@ -1897,6 +1925,30 @@ fn collectEmbeds(b: *std.Build, src: [:0]const u8) ![]const u8 {
         }
         t0 = t1;
         t1 = t2;
+    }
+    return out.items;
+}
+
+/// Every distinct ALL-CAPS string literal of at least four characters
+/// (`[A-Z][A-Z0-9_]{3,}`), comma-joined: the candidate environment variable
+/// names a .zig source might read. Deliberately broad -- see the caller.
+fn collectEnvNames(b: *std.Build, src: [:0]const u8) ![]const u8 {
+    var seen = std.StringHashMap(void).init(b.allocator);
+    var out: std.ArrayList(u8) = .empty;
+    var tok = std.zig.Tokenizer.init(src);
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) break;
+        if (t.tag != .string_literal) continue;
+        const lit = src[t.loc.start + 1 .. t.loc.end - 1];
+        if (lit.len < 4 or !std.ascii.isUpper(lit[0])) continue;
+        const ok = for (lit) |c| {
+            if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_')) break false;
+        } else true;
+        if (!ok or seen.contains(lit)) continue;
+        try seen.put(lit, {});
+        if (out.items.len != 0) try out.append(b.allocator, ',');
+        try out.appendSlice(b.allocator, lit);
     }
     return out.items;
 }

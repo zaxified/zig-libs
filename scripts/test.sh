@@ -306,6 +306,17 @@ stamps_record() {
         echo "test.sh: stamps_record with no fingerprints loaded before the run -- refusing to stamp" >&2
         exit 1
     fi
+    # Not stamped, ever or here: modules whose peer is LIVE (the other side
+    # changes with no commit -- open62541:latest, a pip install, the runner's
+    # OpenSSH), modules this lane was told to skip live, and modules whose
+    # environment gap made their tests skip. They run every time instead.
+    local _skip=" $(live_modules) ${ZIGLIBS_SKIP_LIVE:-} $_CAP_GAP_MODS " _m _kept="" _held=""
+    for _m in $mods; do
+        case "$_skip" in *" $_m "*) _held="$_held $_m" ;; *) _kept="$_kept $_m" ;; esac
+    done
+    [[ -n "$_held" ]] && echo "stamps: not stamped (live peer or environment gap -- they run every time):$_held"
+    mods="${_kept# }"
+    [[ -z "${mods// /}" ]] && return 0
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
     {
@@ -754,6 +765,12 @@ _CAP_CHECKED=""
 # none of a peer's modules does not pay to look for it -- `podman info` alone
 # is 1.7 s, and the full probe 2.9 s, on every local run before this.
 CAP_MODS=""
+# Modules whose tests this environment cannot fully run -- a peer missing, no
+# user namespace, no root for tc. Filled by capability_check; stamps_record
+# never stamps them, because their green run skipped tests (audit 2026-09-18:
+# a transient peer-install failure would otherwise freeze a skipping pass
+# into a stamp that keeps the module from ever running with the peer).
+_CAP_GAP_MODS=""
 _cap_wants() {
     [[ -z "${CAP_MODS// /}" ]] && return 0
     local m
@@ -807,7 +824,7 @@ capability_check() {
         else
             fix='sudo apt install util-linux   # or your distro'"'"'s equivalent'
         fi
-        gaps+=("unshare -rn unavailable|netlink writes in $NETNS_MODULES run unsandboxed — their privileged tests SKIP, so those modules are reported green while covering less|$fix")
+        _CAP_GAP_MODS="$_CAP_GAP_MODS $NETNS_MODULES"; gaps+=("unshare -rn unavailable|netlink writes in $NETNS_MODULES run unsandboxed — their privileged tests SKIP, so those modules are reported green while covering less|$fix")
     elif [[ -n "$userns_key" ]] && ! grep -rqs "${userns_key%%=*}" /etc/sysctl.d /etc/sysctl.conf; then
         # Works now, but only because someone ran `sysctl -w` by hand — it
         # reverts on reboot and the netns modules start failing again.
@@ -817,10 +834,10 @@ capability_check() {
     if ! _cap_wants opcua; then
         :
     elif ! command -v podman >/dev/null 2>&1; then
-        gaps+=("podman missing|opcua live server-interop tests skip|sudo apt install podman")
+        _CAP_GAP_MODS="$_CAP_GAP_MODS opcua"; gaps+=("podman missing|opcua live server-interop tests skip|sudo apt install podman")
     else
         if ! podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
-            gaps+=("open62541 image not pulled|opcua live server-interop tests skip|podman pull docker.io/open62541/open62541:latest")
+            _CAP_GAP_MODS="$_CAP_GAP_MODS opcua"; gaps+=("open62541 image not pulled|opcua live server-interop tests skip|podman pull docker.io/open62541/open62541:latest")
         else
             # ⚠ THE PEER'S ARCHITECTURE IS PART OF WHAT THIS COSTS, and nothing
             # said so until the arm64 lane of tag 2026-08-15. open62541 publishes
@@ -882,7 +899,7 @@ capability_check() {
     command -v ssh >/dev/null 2>&1 || ssh_missing+=("ssh")
     command -v ssh-keygen >/dev/null 2>&1 || ssh_missing+=("ssh-keygen")
     if _cap_wants ssh && [[ ${#ssh_missing[@]} -gt 0 ]]; then
-        gaps+=("OpenSSH missing: ${ssh_missing[*]}|ssh live interop tests skip — the only ones that prove the transport against a real peer rather than against our own encoder|sudo apt install openssh-server openssh-client")
+        _CAP_GAP_MODS="$_CAP_GAP_MODS ssh"; gaps+=("OpenSSH missing: ${ssh_missing[*]}|ssh live interop tests skip — the only ones that prove the transport against a real peer rather than against our own encoder|sudo apt install openssh-server openssh-client")
     fi
 
     # jinja's oracle is a real Python Jinja2, and its VERSION is part of the
@@ -909,13 +926,13 @@ capability_check() {
     # container-backed tests pass without it.
     local opcua_py="${OPCUA_PYTHON:-python3}"
     if _cap_wants opcua && ! "$opcua_py" -c 'import asyncua, cryptography' >/dev/null 2>&1; then
-        gaps+=("python lacks asyncua/cryptography|1 opcua live asyncua-interop test skips|python3 -m venv ~/.cache/zig-libs-opcua && ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography && echo 'export OPCUA_PYTHON=~/.cache/zig-libs-opcua/bin/python3' >> ~/.bashrc")
+        _CAP_GAP_MODS="$_CAP_GAP_MODS opcua"; gaps+=("python lacks asyncua/cryptography|1 opcua live asyncua-interop test skips|python3 -m venv ~/.cache/zig-libs-opcua && ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography && echo 'export OPCUA_PYTHON=~/.cache/zig-libs-opcua/bin/python3' >> ~/.bashrc")
     fi
 
     # imap's live interop drives a real IMAP server (pymap -- an INDEPENDENT
     # implementation, not the one imap was ported from, which is the point).
     if _cap_wants imap && [[ ! -x "${IMAP_PYMAP:-$HOME/.cache/zig-libs-imap/bin/pymap}" ]]; then
-        gaps+=("no pymap IMAP server|1 imap live interop test skips (the only test that proves the client's SEQUENCING, not just its parsing)|python3 -m venv ~/.cache/zig-libs-imap && ~/.cache/zig-libs-imap/bin/pip -q install pymap")
+        _CAP_GAP_MODS="$_CAP_GAP_MODS imap"; gaps+=("no pymap IMAP server|1 imap live interop test skips (the only test that proves the client's SEQUENCING, not just its parsing)|python3 -m venv ~/.cache/zig-libs-imap && ~/.cache/zig-libs-imap/bin/pip -q install pymap")
     fi
 
     # ⭐ FOUR MORE PYTHON ORACLES, and they were invisible until 2026-08-15.
@@ -992,7 +1009,7 @@ capability_check() {
         local pgr_lo pgr_hi
         read -r pgr_lo pgr_hi < /proc/sys/net/ipv4/ping_group_range
         if [[ -n "$pgr_hi" ]] && (( pgr_lo > pgr_hi )); then
-            gaps+=("no unprivileged ICMP sockets (ping_group_range is $pgr_lo $pgr_hi, an empty range)|3 icmp live tests skip — the ones that send a real echo request rather than encode one|echo 'net.ipv4.ping_group_range=0 2147483647' | sudo tee /etc/sysctl.d/61-zig-libs-ping.conf >/dev/null && sudo sysctl --system >/dev/null")
+            _CAP_GAP_MODS="$_CAP_GAP_MODS icmp"; gaps+=("no unprivileged ICMP sockets (ping_group_range is $pgr_lo $pgr_hi, an empty range)|3 icmp live tests skip — the ones that send a real echo request rather than encode one|echo 'net.ipv4.ping_group_range=0 2147483647' | sudo tee /etc/sysctl.d/61-zig-libs-ping.conf >/dev/null && sudo sysctl --system >/dev/null")
         fi
     fi
 
@@ -1002,7 +1019,7 @@ capability_check() {
     # and the easiest to lose, since the whole suite collapses to one skip.
     local yaml_suite="${ZIG_LIBS_YAML_SUITE:-$HOME/.cache/zig-libs-yaml/yaml-test-suite-data}"
     if _cap_wants yaml && [[ ! -d "$yaml_suite" ]]; then
-        gaps+=("no yaml-test-suite checkout|the entire yaml conformance suite collapses into 1 skipped test — the module is then checked only against itself|git clone -b data --depth 1 https://github.com/yaml/yaml-test-suite ~/.cache/zig-libs-yaml/yaml-test-suite-data")
+        _CAP_GAP_MODS="$_CAP_GAP_MODS yaml"; gaps+=("no yaml-test-suite checkout|the entire yaml conformance suite collapses into 1 skipped test — the module is then checked only against itself|git clone -b data --depth 1 https://github.com/yaml/yaml-test-suite ~/.cache/zig-libs-yaml/yaml-test-suite-data")
     fi
 
     # Always present: RTM_NEWACTION checks CAP_NET_ADMIN in the INITIAL user
@@ -1020,7 +1037,7 @@ capability_check() {
     # would be passwordless root, not a narrow grant: `zig build` executes
     # build.zig, i.e. arbitrary code, as root.
     local zig_abs; zig_abs="$(command -v zig 2>/dev/null || echo zig)"
-    _cap_wants tc && gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
+    _cap_wants tc && _CAP_GAP_MODS="$_CAP_GAP_MODS tc"; gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
 
     # ⭐ THE EXAMPLES' OWN PEERS, and they are a different class from everything
     # above. The gate RUNS each example (it only compiled them until
