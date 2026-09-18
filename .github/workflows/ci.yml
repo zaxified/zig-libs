@@ -416,15 +416,20 @@ jobs:
             # breaks X and goes red, push B touches only Y, B tests only Y and
             # goes green with X still broken. Diffing from the last commit whose
             # run PASSED covers every commit since, A's included. Same idea as
-            # `nrwl/nx-set-shas`. If the lookup fails, the old base is used and
-            # the log says so; a base that does not resolve (history rewritten)
-            # still escalates to the full gate inside `test.sh changed`.
+            # `nrwl/nx-set-shas`. If the lookup fails, or names a commit this
+            # clone does not have, the base is the root commit (see below).
             base=$(gh run list --repo "${{ github.repository }}" --workflow ci.yml \
               --branch main --event push --status success --limit 1 \
               --json headSha --jq '.[0].headSha' 2>/dev/null || true)
-            if [ -z "$base" ]; then
-              echo "::warning::no green push run on main found -- falling back to the previous push"
-              base="${{ github.event.before }}"
+            if [ -z "$base" ] || ! git rev-parse -q --verify "$base^{commit}" >/dev/null; then
+              # Fail CLOSED (audit 2026-09-18): falling back to the previous
+              # push reopened the very hole this lookup closes -- a README
+              # broken by a red push A, out of push B's diff, never re-checked.
+              # The root commit puts every file in the diff, so every check
+              # runs; module selection is still by stamps, so this costs the
+              # checks, not the matrix.
+              base="$(git rev-list --max-parents=0 HEAD | tail -1)"
+              echo "::warning::no usable green push run on main -- diffing from the root commit, every check runs"
             fi
             echo "base: $base (last green push on main)"
           fi

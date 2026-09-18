@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     // Args (0.16 removed argsAlloc; the runtime hands us a process.Args).
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
     _ = it.next(); // exe name
-    const out_path = try gpa.dupe(u8, it.next() orelse "../../modules/tz/src/tz_data.zig");
+    const out_path = try gpa.dupe(u8, it.next() orelse "../../../modules/tz/src/tz_data.zig");
     defer gpa.free(out_path);
     const root_path = try gpa.dupe(u8, it.next() orelse "/usr/share/zoneinfo");
     defer gpa.free(root_path);

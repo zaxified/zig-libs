@@ -119,7 +119,13 @@ FAKE_CI="completed success" bash scripts/tag.sh 2026-09-05 >"$OUT/out.txt" 2>&1
 check "CI green but ci.yml is a DRY run -> refuse" 1 $?
 [[ "$(git tag | wc -l)" == "$before" ]] && grep -q "DRY_RUN" "$OUT/out.txt" ||
     { printf '  FAIL %-54s\n' "dry refusal created no tag and says why"; fails=$((fails + 1)); }
-printf 'env:\n  ZIGLIBS_DRY_RUN: "0"\n' > .github/workflows/ci.yml
+for spelling in "'1'" '"1"  # comment' '1' '"true"'; do
+    printf 'env:\n  ZIGLIBS_DRY_RUN: %s\n' "$spelling" > .github/workflows/ci.yml
+    git commit -qam "dry $spelling"
+    FAKE_CI="completed success" bash scripts/tag.sh 2026-09-06 >/dev/null 2>&1
+    check "dry run spelled $spelling -> refuse" 1 $?
+done
+printf 'env:\n  ZIGLIBS_DRY_RUN: "0"  # off\n' > .github/workflows/ci.yml
 git commit -qam real
 FAKE_CI="completed success" bash scripts/tag.sh 2026-09-05 >/dev/null 2>&1
 check "ci.yml with dry run OFF -> tags" 0 $?

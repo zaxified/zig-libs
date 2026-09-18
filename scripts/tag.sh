@@ -97,7 +97,13 @@ echo
 # `gh` is looked up on PATH, which is also how scripts/lib/test-tag.sh replaces it.
 # A DRY-RUN CI proves the pipeline and nothing about the code (see the
 # ZIGLIBS_DRY_RUN block at the top of ci.yml), so its green is not a tag's.
-if git show HEAD:.github/workflows/ci.yml 2>/dev/null | grep -qE '^\s*ZIGLIBS_DRY_RUN:\s*"?1"?\s*$'; then
+# Fail closed: any `ZIGLIBS_DRY_RUN:` line whose value is not literally 0 --
+# quoted either way, with or without a trailing comment -- counts as ON. The
+# first version matched only `"1"` exactly and let `'1'` through (audit).
+dry_val="$(git show HEAD:.github/workflows/ci.yml 2>/dev/null |
+    sed -nE 's/^[[:space:]]*ZIGLIBS_DRY_RUN:[[:space:]]*//p' | head -1 |
+    sed -E 's/[[:space:]]*#.*$//; s/^["'"'"']//; s/["'"'"'][[:space:]]*$//; s/[[:space:]]*$//')"
+if git show HEAD:.github/workflows/ci.yml 2>/dev/null | grep -qE '^[[:space:]]*ZIGLIBS_DRY_RUN:' && [[ "$dry_val" != "0" ]]; then
     echo "tag.sh: NOT tagging — ci.yml at HEAD has ZIGLIBS_DRY_RUN on, so CI tested nothing." >&2
     echo "Turn it off, push, let CI pass for real, then tag." >&2
     exit 1

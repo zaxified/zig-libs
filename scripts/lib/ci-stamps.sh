@@ -35,13 +35,35 @@ repo_id=$(gh api "repos/$repo" --jq '.id') || {
     echo "ci-stamps: cannot read the repository id -- no stamps, every module runs"
     exit 0
 }
-id=$(gh api -X GET "repos/$repo/actions/artifacts" -f name="$name" -f per_page=100 --jq "
+# Candidates, newest first: unexpired, from runs of THIS repository.
+cands=$(gh api -X GET "repos/$repo/actions/artifacts" -f name="$name" -f per_page=100 --jq "
     [ .artifacts[]
       | select(.expired == false)
-      | select(.workflow_run.head_repository_id == $repo_id)
-      | select(.workflow_run.head_branch == \"main\"
-               or (.workflow_run.head_branch | test(\"^20[0-9]{2}-[0-9]{2}-[0-9]{2}(\\\\.[0-9]+)?\$\")))
-    ] | sort_by(.created_at) | last | .id // empty") || id=""
+      | select(.workflow_run.head_repository_id == $repo_id) ]
+    | sort_by(.created_at) | reverse | .[] | \"\(.id) \(.workflow_run.id)\"") || cands=""
+
+# ⭐ WHICH RUN UPLOADED IT decides trust, not the branch name alone (audit
+# 2026-09-18): a branch can be NAMED like a date, and another workflow in this
+# repo could upload an artifact of the same name. Trusted = ci.yml, triggered
+# by a push or a manual dispatch, on `main` -- or a push of a date tag that
+# exists and points at the run's commit.
+trusted() {
+    local run="$1" info path event branch sha tagsha
+    info=$(gh api "repos/$repo/actions/runs/$run" --jq '"\(.path) \(.event) \(.head_branch) \(.head_sha)"') || return 1
+    read -r path event branch sha <<< "$info"
+    [[ "$path" == ".github/workflows/ci.yml" ]] || return 1
+    [[ "$event" == push || "$event" == workflow_dispatch ]] || return 1
+    [[ "$branch" == main ]] && return 0
+    [[ "$event" == push && "$branch" =~ ^20[0-9]{2}-[0-9]{2}-[0-9]{2}(\.[0-9]+)?$ ]] || return 1
+    tagsha=$(gh api "repos/$repo/commits/refs/tags/$branch" --jq .sha 2>/dev/null) || return 1
+    [[ "$tagsha" == "$sha" ]]
+}
+id=""
+while read -r aid rid; do
+    [[ -n "$aid" ]] || continue
+    if trusted "$rid"; then id="$aid"; break; fi
+    echo "ci-stamps: artifact $aid (run $rid) is not from a trusted ci.yml run -- skipped"
+done <<< "$cands"
 if [[ -z "$id" ]]; then
     echo "ci-stamps: no trusted artifact named '$name' -- no stamps, every module runs"
     exit 0
