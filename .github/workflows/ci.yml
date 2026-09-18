@@ -436,7 +436,12 @@ jobs:
             fi
             echo "base: $base (last green push on main)"
           fi
-          bash scripts/test.sh changed "$base" ${{ matrix.groups }}
+          # A pinned CPU level: GitHub's amd64 pool mixes at least four CPU
+          # models (znver3, znver4, emeraldrapids, ...), and with `native`
+          # every change would have to go green once per model before its
+          # stamp holds. x86_64_v3 (AVX2, BMI2) is on all of them; the
+          # AVX-512 and ADX paths are the tag's full lanes' to run.
+          bash scripts/test.sh changed "$base" -Dcpu=x86_64_v3 ${{ matrix.groups }}
       # Only a green run gets here, and only a push, tag or dispatch shares
       # what it proved; a pull request's stamps would be discarded by the
       # fetch anyway, so it does not upload them.

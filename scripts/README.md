@@ -207,8 +207,11 @@ at its current fingerprint.
   `.stamps.local.tsv` (gitignored, deliberately NOT in `.zig-cache`, which gets
   deleted by hand) or wherever `ZIGLIBS_STAMPS` points; CI carries each lane's
   file as an artifact (`ci-stamps.sh`). The lane is the command, its zig
-  arguments minus the selecting ones (`-Dgroup`, `-Dmodule`) and the arch.
-  Written only when the whole command passed. `ZIGLIBS_IGNORE_STAMPS=1` runs
+  arguments minus the selecting ones (`-Dgroup`, `-Dmodule`), the arch and
+  what `native` resolves to (`zig targets`: CPU model and features, kernel,
+  glibc), since code picks paths by CPU feature. With a pinned `-Dcpu` -- CI's
+  push lane uses `x86_64_v3`, because the runner pool mixes CPU models -- only
+  the kernel and glibc part is keyed. Written only when the whole command passed. `ZIGLIBS_IGNORE_STAMPS=1` runs
   everything.
 - **Why not a diff against a base** — a diff forgets: push A breaks X, push B
   touches Y, a diff from A tests only Y. A stamp for X was never written, so X

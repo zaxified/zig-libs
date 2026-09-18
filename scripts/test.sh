@@ -262,7 +262,12 @@ stamps_lane_key() {
         case "$a" in -Dgroup=* | -Dmodule=*) ;; *) key="$key $a" ;; esac
     done
     [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && key="$key DRY"
-    printf '%s %s %s' "$key" "$(uname -m)" "$(native_target_id)"
+    # A pinned `-Dcpu` (CI's push lane) makes the code paths independent of the
+    # runner's CPU, so only the triple -- kernel and glibc versions -- keys it.
+    case " ${EXTRA_ZIG_ARGS[*]} " in
+        *" -Dcpu="*) printf '%s %s %s' "$key" "$(uname -m)" "$(native_os_id)" ;;
+        *) printf '%s %s %s' "$key" "$(uname -m)" "$(native_target_id)" ;;
+    esac
 }
 
 # What `native` resolves to on this machine, as Zig sees it: the triple (OS
@@ -283,6 +288,26 @@ native_target_id() {
         _ZL_NATIVE_ID="native:$(printf '%s' "$sec" | sha256sum | cut -c1-12)"
     fi
     printf '%s' "$_ZL_NATIVE_ID"
+}
+
+# The triple alone (OS and glibc versions), for a lane with a pinned `-Dcpu`.
+native_os_id() {
+    local triple
+    triple="$(zig targets 2>/dev/null | awk '/^    \.native = \.\{/{on=1} on && /^        \.triple = /{print; exit}')"
+    if [[ -z "$triple" ]]; then
+        echo "test.sh: 'zig targets' gave no native triple -- cannot key stamps to this host" >&2
+        exit 1
+    fi
+    printf 'os:%s' "$(printf '%s' "$triple" | sha256sum | cut -c1-12)"
+}
+
+# For the log: the pinned `-Dcpu`, or the runner's CPU model otherwise.
+lane_cpu_note() {
+    local a
+    for a in "${EXTRA_ZIG_ARGS[@]}"; do
+        case "$a" in -Dcpu=*) printf 'cpu %s, pinned' "${a#-Dcpu=}"; return ;; esac
+    done
+    printf 'cpu %s' "$(native_cpu_name)"
 }
 
 # The CPU model behind that hash, for the log: the hash alone does not say
@@ -1328,7 +1353,7 @@ cmd_changed() {
     closure="$(stamps_pending "$lane_mods" "$lane")"
     local total_n
     total_n=$(wc -w <<< "$closure")
-    echo "changed: $total_n of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' (cpu $(native_cpu_name))"
+    echo "changed: $total_n of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' ($(lane_cpu_note))"
     if [[ $total_n -gt 0 && $total_n -le 40 ]]; then
         echo "  to test: $closure"
     fi
@@ -1807,7 +1832,7 @@ cmd_modules() {
     lane="$(stamps_lane_key modules)"
     fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
-    echo "modules: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' (cpu $(native_cpu_name)) — compiling and testing those; examples run in their own lane"
+    echo "modules: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' ($(lane_cpu_note)) — compiling and testing those; examples run in their own lane"
     if [[ -z "${todo// /}" ]]; then
         echo "modules: nothing to do — every module here is stamped green at its current fingerprint"
         summary
@@ -1834,7 +1859,7 @@ cmd_examples() {
     lane="$(stamps_lane_key examples)"
     fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
-    echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' (cpu $(native_cpu_name)) — compiling and running their examples"
+    echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' ($(lane_cpu_note)) — compiling and running their examples"
     if [[ -z "${todo// /}" ]]; then
         echo "examples: nothing to do — every module here is stamped green at its current fingerprint"
         summary
