@@ -131,7 +131,9 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
     std.mem.writeInt(u64, &v8, secret_v, .little);
     const vb = vBytes();
 
-    std.debug.print("\n=== STACKPROBE bulletproofs B12 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
+    // Every number below is printed only when an assertion fails: the lane
+    // treats stderr from a passing test as a FAIL (scripts/lib/test-lib.sh).
+    errdefer std.debug.print("\n=== STACKPROBE bulletproofs B12 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
 
     paint();
     callInnocent();
@@ -141,7 +143,7 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
     callLeaky();
     snapshot();
     const pos = count(&secret_gamma);
-    std.debug.print("  NEG control {d}, POS control (gamma parked) {d}\n", .{ neg, pos });
+    errdefer std.debug.print("  NEG control {d}, POS control (gamma parked) {d}\n", .{ neg, pos });
     try std.testing.expectEqual(@as(usize, 0), neg);
     try std.testing.expect(pos >= 1); // the scan can see a parked secret
 
@@ -162,8 +164,10 @@ test "STACKPROBE (A1 B12): no witness or blinding secret on the dead stack after
             random_hits += c;
             if (c > 0) randoms_present += 1;
         }
-        std.debug.print("  prove #{d}: v={d} v_bytes={d} gamma={d} z2gamma={d} randoms {d}/{d} present ({d} copies); dirty below the call {d} B\n", .{
-            round, v8_hits, vb_hits, gamma_hits, z2g_hits, randoms_present, rangeproof.test_random_count, random_hits, dirtyBytes(),
+        const random_count = rangeproof.test_random_count;
+        const dirty = dirtyBytes();
+        errdefer std.debug.print("  prove #{d}: v={d} v_bytes={d} gamma={d} z2gamma={d} randoms {d}/{d} present ({d} copies); dirty below the call {d} B\n", .{
+            round, v8_hits, vb_hits, gamma_hits, z2g_hits, randoms_present, random_count, random_hits, dirty,
         });
 
         try std.testing.expect(rangeproof.test_random_count > 0); // the hook recorded the draws
