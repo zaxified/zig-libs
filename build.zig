@@ -1669,22 +1669,38 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
         const src = try b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(64 * 1024 * 1024));
         machinery.update(path);
         machinery.update("\x00");
-        hashFileContent(&machinery, b, path, src);
+        if (std.mem.endsWith(u8, path, ".zig")) {
+            hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), null);
+        } else {
+            machinery.update(src);
+        }
     }
 
     // Per-file content hashes are memoised by (size, mtime, ctime, inode) in
     // the cache dir: tokenising all ~47 MB of `.zig` in the Debug-built build
     // runner took 8.4 s, and a step the local loop runs every time must not.
     // The memo is pure cache -- deleting it costs one slow run, nothing else.
-    const memo_path = "ziglibs-fingerprint-files.tsv";
-    var memo = std.StringHashMap([32]u8).init(b.allocator);
+    const memo_path = "ziglibs-fingerprint-files-v2.tsv";
+    // `<kind>\t<path>\t<size>\t<mtime>\t<ctime>\t<inode>\t<hex>\t<embeds>`,
+    // kind = tok (a .zig file's comment-free token stream) or raw (bytes).
+    // `embeds` lists the `@embedFile` targets a .zig file names, so the second
+    // pass below knows which files a test reads as TEXT without re-reading.
+    var memo = std.StringHashMap(FileMemo).init(b.allocator);
     if (b.cache_root.handle.readFileAlloc(io, memo_path, b.allocator, .limited(64 * 1024 * 1024))) |text| {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
-            const tab = std.mem.lastIndexOfScalar(u8, line, '\t') orelse continue;
+            var f = std.mem.splitScalar(u8, line, '\t');
+            var fields: [8][]const u8 = undefined;
+            var nf: usize = 0;
+            while (f.next()) |x| : (nf += 1) {
+                if (nf == 8) break;
+                fields[nf] = x;
+            }
+            if (nf != 8 or fields[6].len != 64) continue;
             var digest: [32]u8 = undefined;
-            _ = std.fmt.hexToBytes(&digest, line[tab + 1 ..]) catch continue;
-            try memo.put(line[0..tab], digest);
+            _ = std.fmt.hexToBytes(&digest, fields[6]) catch continue;
+            const key_end = @intFromPtr(fields[5].ptr) - @intFromPtr(line.ptr) + fields[5].len;
+            try memo.put(line[0..key_end], .{ .digest = digest, .embeds = fields[7] });
         }
     } else |_| {}
     var memo_out: std.Io.Writer.Allocating = .init(b.allocator);
@@ -1716,7 +1732,7 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
             if (entry.kind != .file) continue;
             if (std.mem.endsWith(u8, entry.basename, ".md")) continue;
             if (std.mem.eql(u8, entry.basename, "NOTICE") or std.mem.eql(u8, entry.basename, "LICENSE")) continue;
-            if (std.mem.indexOf(u8, entry.path, ".zig-cache") != null or std.mem.indexOf(u8, entry.path, "zig-out") != null) continue;
+            if (hasComponent(entry.path, ".zig-cache") or hasComponent(entry.path, "zig-out")) continue;
             try paths.append(b.allocator, try b.allocator.dupe(u8, entry.path));
         }
         std.mem.sort([]const u8, paths.items, {}, struct {
@@ -1724,23 +1740,42 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
                 return std.mem.lessThan(u8, x, y);
             }
         }.lt);
-        for (paths.items) |path| {
+        // Pass 1: every file's own digest (.zig as tokens) and its embeds.
+        const tok = try b.allocator.alloc(FileMemo, paths.items.len);
+        const stat_keys = try b.allocator.alloc([]const u8, paths.items.len);
+        for (paths.items, 0..) |path, k| {
             const st = try dir.statFile(io, path, .{});
-            const key = b.fmt("{s}/{s}\t{d}\t{d}\t{d}\t{d}", .{
+            stat_keys[k] = b.fmt("{s}/{s}\t{d}\t{d}\t{d}\t{d}", .{
                 m.name,               path,                 st.size,
                 st.mtime.nanoseconds, st.ctime.nanoseconds, st.inode,
             });
-            const content: [32]u8 = memo.get(key) orelse blk: {
-                const src = try dir.readFileAlloc(io, path, b.allocator, .limited(512 * 1024 * 1024));
-                defer b.allocator.free(src);
-                var fh = Sha256.init(.{});
-                hashFileContent(&fh, b, path, src);
-                var d: [32]u8 = undefined;
-                fh.final(&d);
-                break :blk d;
-            };
-            try memo_out.writer.print("{s}\t{s}\n", .{ key, std.fmt.bytesToHex(content, .lower) });
-            h.update("\x00f:");
+            tok[k] = try fileDigest(b, dir, path, stat_keys[k], .tok, &memo, &memo_out);
+        }
+        // ⭐ A file some test reads with `@embedFile` is TEXT to that test, so
+        // its comments are part of what the test sees (audit 2026-09-18: rsa
+        // and dtls assert doc-comment sentences of their own root/Connection
+        // .zig; ethtool and devlink cut their source at a `// ── tests ──`
+        // banner). Those files are hashed by bytes, comments included.
+        var raw_set = std.StringHashMap(void).init(b.allocator);
+        for (paths.items, 0..) |path, k| {
+            if (tok[k].embeds.len == 0) continue;
+            const here = std.fs.path.dirnamePosix(path) orelse "";
+            var it = std.mem.splitScalar(u8, tok[k].embeds, ',');
+            while (it.next()) |e| {
+                if (e.len == 0) continue;
+                const rel = try std.fs.path.resolvePosix(b.allocator, &.{ here, e });
+                if (std.mem.startsWith(u8, rel, "..")) continue; // outside the module
+                try raw_set.put(rel, {});
+            }
+        }
+        // Pass 2: fold.
+        for (paths.items, 0..) |path, k| {
+            const raw = std.mem.endsWith(u8, path, ".zig") and raw_set.contains(path);
+            const content = if (raw)
+                (try fileDigest(b, dir, path, stat_keys[k], .raw, &memo, &memo_out)).digest
+            else
+                tok[k].digest;
+            h.update(if (raw) "\x00r:" else "\x00f:");
             h.update(path);
             h.update("\x00");
             h.update(&content);
@@ -1804,24 +1839,72 @@ fn moduleIndex(name: []const u8) ?usize {
     return null;
 }
 
-/// `.zig` as tokens without comments, a shell script without its comment
-/// lines, anything else as bytes.
-fn hashFileContent(h: *std.crypto.hash.sha2.Sha256, b: *std.Build, path: []const u8, src: []const u8) void {
-    if (std.mem.endsWith(u8, path, ".zig")) {
-        const z = b.allocator.dupeZ(u8, src) catch @panic("OOM");
-        defer b.allocator.free(z);
-        hashZigTokens(h, z, null);
-    } else if (std.mem.endsWith(u8, path, ".sh") or std.mem.eql(u8, std.fs.path.basename(path), "capped")) {
-        var lines = std.mem.splitScalar(u8, src, '\n');
-        while (lines.next()) |line| {
-            const t = std.mem.trim(u8, line, " \t\r");
-            if (t.len == 0 or t[0] == '#') continue;
-            h.update(t);
-            h.update("\n");
+const FileMemo = struct { digest: [32]u8, embeds: []const u8 };
+const DigestKind = enum { tok, raw };
+
+/// One file's digest, from the memo when its stat key matches, else computed
+/// and recorded. `.tok` hashes a .zig file's token stream without comments
+/// (and lists its `@embedFile` targets); everything else, and `.raw`, hashes
+/// the bytes.
+fn fileDigest(
+    b: *std.Build,
+    dir: std.Io.Dir,
+    path: []const u8,
+    stat_key: []const u8,
+    kind: DigestKind,
+    memo: *std.StringHashMap(FileMemo),
+    memo_out: *std.Io.Writer.Allocating,
+) !FileMemo {
+    const io = b.graph.io;
+    const key = b.fmt("{t}\t{s}", .{ kind, stat_key });
+    const got: FileMemo = memo.get(key) orelse blk: {
+        const src = try dir.readFileAlloc(io, path, b.allocator, .limited(512 * 1024 * 1024));
+        var fh = std.crypto.hash.sha2.Sha256.init(.{});
+        var embeds: []const u8 = "";
+        if (kind == .tok and std.mem.endsWith(u8, path, ".zig")) {
+            const z = try b.allocator.dupeZ(u8, src);
+            hashZigTokens(&fh, z, null);
+            embeds = try collectEmbeds(b, z);
+        } else {
+            fh.update(src);
         }
-    } else {
-        h.update(src);
+        b.allocator.free(src);
+        var d: [32]u8 = undefined;
+        fh.final(&d);
+        break :blk .{ .digest = d, .embeds = embeds };
+    };
+    try memo_out.writer.print("{s}\t{s}\t{s}\n", .{ key, std.fmt.bytesToHex(got.digest, .lower), got.embeds });
+    return got;
+}
+
+/// The string arguments of every `@embedFile("...")` in a .zig source,
+/// comma-joined. Read from tokens, so a mention in a comment does not count.
+fn collectEmbeds(b: *std.Build, src: [:0]const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var tok = std.zig.Tokenizer.init(src);
+    var t0 = tok.next();
+    var t1 = tok.next();
+    while (t0.tag != .eof) {
+        const t2 = tok.next();
+        if (t0.tag == .builtin and std.mem.eql(u8, src[t0.loc.start..t0.loc.end], "@embedFile") and
+            t1.tag == .l_paren and t2.tag == .string_literal)
+        {
+            const lit = src[t2.loc.start + 1 .. t2.loc.end - 1];
+            if (std.mem.indexOfAny(u8, lit, ",\t\n\\") == null) {
+                if (out.items.len != 0) try out.append(b.allocator, ',');
+                try out.appendSlice(b.allocator, lit);
+            }
+        }
+        t0 = t1;
+        t1 = t2;
     }
+    return out.items;
+}
+
+fn hasComponent(path: []const u8, name: []const u8) bool {
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |c| if (std.mem.eql(u8, c, name)) return true;
+    return false;
 }
 
 /// Every token except comments, each as tag + bytes. `//` comments are never
