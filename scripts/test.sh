@@ -297,7 +297,15 @@ stamps_pending() {
 stamps_record() {
     local mods="$1" lane="$2" now tmp
     [[ -z "${mods// /}" ]] && return 0
-    fp_load
+    # ⛔ The fingerprints stamped are the ones taken BEFORE the run, never
+    # recomputed here: an edit made while the tests ran would otherwise be
+    # stamped green untested (audit 2026-09-18, demonstrated with a shim).
+    # fp_load must have run in the calling shell -- a `$(stamps_pending ...)`
+    # subshell's cache dies with it, which is exactly how that happened.
+    if [[ -z "$FP_TSV" ]]; then
+        echo "test.sh: stamps_record with no fingerprints loaded before the run -- refusing to stamp" >&2
+        exit 1
+    fi
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
     {
@@ -1155,11 +1163,13 @@ cmd_changed() {
                 case "$seeds" in *" $name "*) ;; *) seeds="$seeds$name " ;; esac
                 ;;
             build.zig|build.zig.zon)
-                # Nothing to decide here: build.zig is in every fingerprint
-                # (its `module_list` entries per module, the rest as machinery),
-                # so the stamps already say which modules this re-keyed.
+                # The stamps already say which modules this re-keyed (build.zig
+                # is in every fingerprint). What they cannot say is that the
+                # catalog still agrees: `libs` is in no fingerprint, and moving
+                # a module between libs breaks check-catalog / check-libs-table.
+                trigger_catalog=1
                 ;;
-            .github/*|scripts/test.sh|scripts/lib/test-lib.sh|scripts/lib/capped|scripts/lib/dark-tests.sh|scripts/lib/ci-environment.sh|scripts/lib/test-tag.sh|scripts/lib/ci-stamps.sh|scripts/checks/check-ci-cache-keys.sh|scripts/checks/check-http-sizeprobe.sh|scripts/checks/check-fp-freedom.sh|scripts/checks/check-skip-as-pass.py|scripts/checks/check-ct-compare.py|scripts/checks/ct-compare-expected.tsv|scripts/checks/check-fuzz-reach.py|scripts/checks/check-example-assert.py|scripts/checks/check-changelog-entry.py|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/tag.sh|scripts/check-apps.sh|scripts/lib/*|scripts/checks/*|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1181,7 +1191,7 @@ cmd_changed() {
                 trigger_all=1
                 ;;
             scripts/*)
-                ;; # scripts/README.md, scripts/vm/**, generators — not gate steps
+                ;; # README.md, vm/, gen/, modtest, fuzz-sweep.sh, cache-usage.sh -- not gate steps
             README.md)
                 trigger_catalog=1
                 ;;
@@ -1225,6 +1235,19 @@ cmd_changed() {
     fi
 
     graph_load
+    # ⚠ A directory under modules/ is not necessarily a module: `_template`,
+    # or one just deleted or renamed. Such a name must not reach `-Dmodule=`,
+    # where build.zig refuses it -- and a push that deleted a module would then
+    # stay red, since later pushes diff from the last green one and keep the
+    # deleted path in view (audit 2026-09-18). Kept to names the graph knows.
+    local _known=" ${G_NAMES[*]} " _n _kept _v
+    for _v in seeds docs_only; do
+        _kept=" "
+        for _n in ${!_v}; do
+            case "$_known" in *" $_n "*) _kept="$_kept$_n " ;; *) echo "changed: modules/$_n/ is not a module in the graph — ignored for module selection" ;; esac
+        done
+        printf -v "$_v" '%s' "$_kept"
+    done
 
     # ⭐ A HARNESS CHANGE RUNS THE SMOKE SET *AND* EVERY UNPROVEN MODULE
     # (2026-09-18). Until stamps, the harness moving meant the narrowing could
@@ -1249,6 +1272,7 @@ cmd_changed() {
     local lane closure lane_mods
     lane="$(stamps_lane_key changed)"
     lane_mods="$(lane_modules)"
+    fp_load   # here, in THIS shell: see stamps_record
     closure="$(stamps_pending "$lane_mods" "$lane")"
     local total_n
     total_n=$(wc -w <<< "$closure")
@@ -1278,10 +1302,10 @@ cmd_changed() {
         echo "changed: nothing to do"
         exit 0
     fi
-    if [[ -z "${closure// /}" && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 && $trigger_docs -eq 0 && -z "${seeds// /}" ]]; then
-        echo "changed: no modules affected — nothing to test"
-        exit 0
-    fi
+    # (No "no modules affected" exit here any more: with a non-empty diff the
+    # repo checks below always run -- they read the diff and root files, which
+    # no fingerprint covers. That exit skipped them for a build.zig `libs` edit
+    # that broke check-catalog, audit 2026-09-18.)
 
     # ⭐ THREE KINDS OF CHECK, gated three ways (2026-09-18). Every one of
     # these used to run on every invocation with a non-empty diff, ~52 s warm,
@@ -1729,6 +1753,7 @@ cmd_modules() {
     local lane_mods todo lane
     lane_mods="$(lane_modules)"
     lane="$(stamps_lane_key modules)"
+    fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
     echo "modules: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' — compiling and testing those; examples run in their own lane"
     if [[ -z "${todo// /}" ]]; then
@@ -1755,6 +1780,7 @@ cmd_examples() {
     local lane_mods todo lane
     lane_mods="$(lane_modules)"
     lane="$(stamps_lane_key examples)"
+    fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
     echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' — compiling and running their examples"
     if [[ -z "${todo// /}" ]]; then
@@ -1798,6 +1824,7 @@ cmd_build() {
     local lane_mods todo lane
     lane_mods="$(lane_modules)"
     lane="$(stamps_lane_key build)"
+    fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
     local n
     n=$(wc -w <<< "$todo")
@@ -1872,6 +1899,7 @@ cmd_all() {
     graph_load
     local all_mods
     all_mods="$(lane_modules)"
+    fp_load   # before anything runs: the stamps below must carry THESE fingerprints
     local n
     n=$(wc -w <<< "$all_mods")
     echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — ignoring stamps, and then stamping the \`changed\` lane"

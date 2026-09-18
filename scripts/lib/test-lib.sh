@@ -22,8 +22,20 @@
 # per-module fact in a script had to put the whole script into every module's
 # fingerprint. Read once, when this file is sourced, because callers test
 # membership inside loops over modules. An empty answer is refused.
-NETNS_MODULES="$(zig build module-graph 2>/dev/null | awk -F'\t' '$7=="netns"{printf "%s ", $1}')"
+# ⚠ From the REPO ROOT, whatever the caller's directory: `capped` sources this
+# file and check-apps.sh runs `capped` inside example-apps/<app>, where a bare
+# `zig build module-graph` builds the APP (audit 2026-09-18). And the graph's
+# own error is shown, not swallowed -- a build.zig compile error used to
+# surface only as "no netns modules".
+_zl_graph_out="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && zig build module-graph 2>&1)" || {
+    echo "test-lib.sh: 'zig build module-graph' failed -- cannot tell which modules need a network namespace:" >&2
+    printf '%s\n' "$_zl_graph_out" >&2
+    exit 1
+}
+NETNS_MODULES="$(awk -F'\t' '$7=="netns"{printf "%s ", $1}' <<< "$_zl_graph_out")"
 NETNS_MODULES="${NETNS_MODULES% }"
+_ZL_LIVE_CACHE="$(awk -F'\t' '$4=="live"{printf "%s ", $1}' <<< "$_zl_graph_out")"
+unset _zl_graph_out
 if [[ -z "$NETNS_MODULES" ]]; then
     echo "test-lib.sh: module-graph reported no netns modules -- refusing to run them unwrapped on a guess" >&2
     exit 1
@@ -86,15 +98,14 @@ fi
 # a module that gained a live peer and was not added kept running in parallel
 # -- the exact failure this variable exists to prevent, invisible until it went
 # flaky. Queried once and cached; callers use `$(live_modules)`.
-_ZL_LIVE_CACHE=""
+# Read with NETNS_MODULES above, from the same graph, when this file is
+# sourced -- a cache filled inside `$(live_modules)` died with the subshell,
+# so every call re-ran `zig build module-graph` (~230 per `all`).
 live_modules() {
-    if [[ -z "$_ZL_LIVE_CACHE" ]]; then
-        _ZL_LIVE_CACHE="$(zig build module-graph 2>/dev/null | awk -F'\t' '$4=="live"{printf "%s ", $1}')"
-        [[ -n "$_ZL_LIVE_CACHE" ]] || {
-            echo "test-lib.sh: module-graph reported no live modules -- refusing to run the live set in parallel on a guess" >&2
-            exit 1
-        }
-    fi
+    [[ -n "${_ZL_LIVE_CACHE// /}" ]] || {
+        echo "test-lib.sh: module-graph reported no live modules -- refusing to run the live set in parallel on a guess" >&2
+        exit 1
+    }
     printf '%s' "$_ZL_LIVE_CACHE"
 }
 
