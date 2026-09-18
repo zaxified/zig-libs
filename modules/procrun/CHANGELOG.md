@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `killerLoop` gains a
+  test-only wakeup counter (`void` outside a test build, so the increment
+  compiles to nothing there). F4's regression test now counts how many times
+  the killer thread wakes over a 300ms child (1 with the futex wait, ~60 with
+  the old fixed 5ms poll) instead of asserting a mean wall time under 50ms,
+  which the old poll (mean ~6.4ms) had passed anyway. The wall-time check
+  stays as a coarse sanity bound on the minimum of 20 runs.
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** `zig build check-portable`
   caught `.windows` compiling for the first time in this Zig version:
   `drainLoop`'s deadline wait referenced `std.posix.POLL.IN`, which lowers to

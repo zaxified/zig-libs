@@ -949,11 +949,23 @@ fn killerLoop(j: KillJob) void {
         // just loop back to re-check `remaining`/`isSet` below; `Cancelable`
         // is likewise not actionable from a detached worker thread.
         j.done.waitTimeout(j.io, timeout) catch {};
+        if (builtin.is_test) _ = killer_wakeups_for_testing.fetchAdd(1, .monotonic);
         if (j.done.isSet()) return;
     }
     if (j.done.isSet()) return;
     if (j.grouped) deliverGroup(j.child, .kill, 0, true) else deliver(j.child, .kill, 0);
 }
+
+/// Test-only counter (F4 regression guard): how many times `killerLoop` came
+/// back from its wait since the test last zeroed it. With the futex wait
+/// that is ~1 per `runTimeout` however long the child runs; the old fixed
+/// 5ms polling step made it grow linearly with the child's lifetime. A
+/// stopwatch cannot tell the two apart for a child that exits inside one
+/// step, and is load-sensitive for one that does not; this count is
+/// neither. `void` outside a test build, so the increment compiles to
+/// nothing there (same pattern as `netsim`'s `log_entries_stored_for_testing`).
+const KillerWakeups = if (builtin.is_test) std.atomic.Value(usize) else void;
+var killer_wakeups_for_testing: KillerWakeups = if (builtin.is_test) .init(0) else {};
 
 fn monoNowNs() u64 {
     switch (builtin.os.tag) {
@@ -1534,7 +1546,7 @@ test "F1 positive control: runTimeout does NOT report deadline-stopped for an or
     try testing.expect(!out.stderr_deadline_stopped);
 }
 
-test "F4: runTimeout on a child that exits immediately returns promptly, not delayed by fixed-interval polling" {
+test "F4: runTimeout's killer thread is woken by the outcome, not by a fixed polling step" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     if (!std.process.can_spawn) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
@@ -1542,17 +1554,48 @@ test "F4: runTimeout on a child that exits immediately returns promptly, not del
     const io = threaded.io();
 
     // The audit measured the OLD (fixed 5ms-step polling) killerLoop adding
-    // ~5ms per call regardless of how fast the child actually finished —
+    // ~5ms per call regardless of how fast the child actually finished --
     // 100 paired runs: run() mean 1.363ms / min 1.018ms vs runTimeout()
-    // mean 6.447ms / min 1.430ms. The *minimum* being close to run()'s
-    // shows a fast path already existed; the mean being ~5x higher shows
-    // most calls paid a near-full polling step regardless. This bound is
-    // deliberately generous (a coarse regression guard, not a tight
-    // benchmark — this machine may run several other agents' test lanes
-    // concurrently) but is still well under what a *reintroduced*
-    // fixed-step poll would add on top of a sub-millisecond spawn.
+    // mean 6.447ms / min 1.430ms. This test used to assert a MEAN wall time
+    // under 50ms for `/bin/echo`, which the old 5ms step (mean 6.4ms) passed
+    // comfortably: it could not catch the regression it was written for,
+    // and a loaded CI shard could still fail it.
+    //
+    // Count the killer's wakeups instead, over a child that lives 300ms. A
+    // fixed step of S ms wakes ~300/S times (~60 at the old 5ms; even a
+    // 100ms step wakes 3+ times); the futex wait wakes once, when
+    // `runTimeout` sets `done`. The bound leaves room for a spurious futex
+    // wake or two. Load stretches the child's lifetime, which only ADDS
+    // wakeups to a polling loop -- it cannot make one look event-driven.
+    killer_wakeups_for_testing.store(0, .monotonic);
+    var out = try runTimeout(testing.allocator, io, .{
+        .argv = &.{ "sleep", "0.3" },
+    }, "", 5 * std.time.ns_per_s);
+    defer out.deinit(testing.allocator);
+    try testing.expect(out.term == .exited);
+    try testing.expectEqual(@as(u8, 0), out.term.exited);
+
+    const wakeups = killer_wakeups_for_testing.load(.monotonic);
+    try testing.expect(wakeups >= 1); // the counter is live at all
+    try testing.expect(wakeups <= 3);
+}
+
+test "F4: runTimeout on a child that exits immediately returns promptly" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Coarse latency sanity check next to the structural test above: the
+    // FASTEST of 20 `/bin/echo` runs must come in under 50ms (measured
+    // ~1-1.5ms). The minimum, not the mean: one descheduled trial on a
+    // loaded CI shard moves a mean, it cannot move a minimum. This catches
+    // gross added latency anywhere on the path (e.g. a blocking sleep on
+    // every call); it does NOT catch a fixed polling step, whose best case
+    // is near zero -- that is what the wakeup count above is for.
     const trials = 20;
-    var total_ns: u64 = 0;
+    var min_ns: u64 = std.math.maxInt(u64);
     var i: u32 = 0;
     while (i < trials) : (i += 1) {
         const start = monoNowNs();
@@ -1560,10 +1603,9 @@ test "F4: runTimeout on a child that exits immediately returns promptly, not del
             .argv = &.{ "/bin/echo", "hi" },
         }, "", 5 * std.time.ns_per_s);
         out.deinit(testing.allocator);
-        total_ns += monoNowNs() - start;
+        min_ns = @min(min_ns, monoNowNs() - start);
     }
-    const mean_ns = total_ns / trials;
-    try testing.expect(mean_ns < 50 * std.time.ns_per_ms);
+    try testing.expect(min_ns < 50 * std.time.ns_per_ms);
 }
 
 test "spawnStreaming: separates streams and reports exit 3" {
