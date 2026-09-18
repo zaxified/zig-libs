@@ -1775,7 +1775,12 @@ cmd_interop() {
     # rule exists to catch. Exit status still decides either way.
     local m_rc=0
     for m in "${progs[@]}"; do
-        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" || m_rc=1
+        # The program's own arguments go after `--`. `opcua`'s peer is asyncua,
+        # which lives in the venv OPCUA_PYTHON names (the module's live test
+        # reads the same variable); without it the program uses `python3`.
+        local prog_args=()
+        [[ "$m" == opcua && -n "${OPCUA_PYTHON:-}" ]] && prog_args=(-- --python "$OPCUA_PYTHON")
+        ZL_STEP_STDERR_IS_OUTPUT=1 step "interop-$m" zig build "interop-$m" "${EXTRA_ZIG_ARGS[@]}" ${prog_args[@]+"${prog_args[@]}"} || m_rc=1
     done
     (( m_rc )) || true
     summary

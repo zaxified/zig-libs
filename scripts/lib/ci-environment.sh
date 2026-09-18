@@ -21,8 +21,8 @@
 #              EXAMPLE judges itself against.
 #   interop  — what `zig build interop-<m>` needs, and NOTHING here is reached
 #              by any test: a C compiler and wolfSSL headers (dtls), and
-#              jinja2 / sympy / brotli / protobuf / asyncua + cryptography /
-#              a grpcio venv (the Python-driven ones; `signal` needs only
+#              jinja2 / sympy / brotli / protobuf, a grpcio venv and an
+#              asyncua venv (the Python-driven ones; `signal` needs only
 #              python3, `dns` no peer at all).
 #   all      — both, for a machine that will do both.
 #
@@ -197,16 +197,11 @@ echo "::group::interop: python oracles"
 # exactly what a golden-vs-live test exists to catch. A gate must go red for our
 # reasons, so this is pinned and bumped deliberately. `test.sh`'s capability
 # report compares the installed version against the golden's own header.
-# asyncua + cryptography: `interop-opcua` drives a python-opcua peer with the
-# bare `python3` by default. The `tests` role's opcua venv serves the module's
-# own live tests and is not installed on this lane, so the first real run of
-# the interop lane (2026-09-18) died on `No module named 'asyncua'`.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
-    "jinja2==3.1.6" sympy brotli protobuf asyncua cryptography >/dev/null 2>&1 || true
+    "jinja2==3.1.6" sympy brotli protobuf >/dev/null 2>&1 || true
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
-                   ("brotli", "brotli"), ("google.protobuf", "protobuf"),
-                   ("asyncua", "asyncua"), ("cryptography", "cryptography")):
+                   ("brotli", "brotli"), ("google.protobuf", "protobuf")):
     try:
         m = __import__(mod)
         print(f"{label}: {getattr(m, '__version__', 'present')}")
@@ -222,6 +217,15 @@ PY
 python3 -m venv "$HOME/.cache/zig-libs-grpc" >/dev/null 2>&1 || true
 "$HOME/.cache/zig-libs-grpc/bin/pip" -q install grpcio protobuf >/dev/null 2>&1 \
     && echo "grpc venv: OK" || echo "grpc venv: install failed"
+# `interop-opcua` drives an asyncua peer; `scripts/test.sh interop` hands it
+# OPCUA_PYTHON, the same venv the `tests` role builds for the module's live
+# test. A venv and not the system pip above: asyncua pulls a newer
+# `cryptography` than the apt-installed one, pip cannot replace an apt
+# package, and the failed transaction took jinja2/sympy/brotli/protobuf down
+# with it (2026-09-18, the lane's first real run: sympy went MISSING).
+python3 -m venv "$HOME/.cache/zig-libs-opcua" >/dev/null 2>&1 || true
+"$HOME/.cache/zig-libs-opcua/bin/pip" -q install asyncua cryptography >/dev/null 2>&1 \
+    && echo "opcua venv: OK" || echo "opcua venv: install failed"
 echo "::endgroup::"
 fi
 
