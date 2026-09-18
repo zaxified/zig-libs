@@ -690,10 +690,15 @@ def module_exemption(module: str):
 # ---------------------------------------------------------------------------
 
 
-def scan():
-    """(judged, unjudged, errors). Each judged entry is a dict."""
+def scan(only=None):
+    """(judged, unjudged, errors). Each judged entry is a dict.
+
+    With `only` (a set of module names), just those modules' files are read --
+    see `--modules` in main()."""
     judged, unjudged = [], []
-    for p in sorted(Path("modules").rglob("*.zig")):
+    roots = [Path("modules")] if only is None else [Path("modules") / m for m in sorted(only)]
+    paths = sorted(p for r in roots if r.is_dir() for p in r.rglob("*.zig"))
+    for p in paths:
         # Cheap first: only ~1 file in 5 has a harness, and building the
         # function index for the rest is most of the wall time.
         if "testing.fuzz" not in p.read_text(errors="replace"):
@@ -843,6 +848,12 @@ def main() -> int:
     ap.add_argument("--advisory", action="store_true",
                     help="report and exit 0 (for wiring the gate before the burn-down is done)")
     ap.add_argument("--module", help="restrict to one module")
+    # `--modules=a,b` (from `scripts/test.sh changed`): SCAN only these, which
+    # is where the time goes (3.7 s for the whole tree), and ratchet only their
+    # rows. Every verdict here is per module -- targets, exemptions, ceiling --
+    # so a module outside the list cannot change unless its own files did, and
+    # then it is in the list.
+    ap.add_argument("--modules", help="comma-separated modules to scan and judge (skips the rest)")
     ap.add_argument("--ratchet", action="store_true",
                     help="fail only where a module got WORSE than the committed "
                          "baseline; the burn-down's own gate")
@@ -855,7 +866,12 @@ def main() -> int:
         print("check-fuzz-reach: run me from the repository root", file=sys.stderr)
         return 2
 
-    judged, unjudged = scan()
+    only = {m for m in args.modules.split(",") if m} if args.modules else None
+    if only is not None and args.update_baseline:
+        print("check-fuzz-reach: --update-baseline rewrites every row; it takes no --modules",
+              file=sys.stderr)
+        return 2
+    judged, unjudged = scan(only)
     if args.module:
         judged = [t for t in judged if t["module"] == args.module]
         unjudged = [u for u in unjudged if Path(u[0]).parts[1] == args.module]
@@ -923,6 +939,8 @@ def main() -> int:
             print(f"check-fuzz-reach: no baseline at {BASELINE}; run "
                   f"--update-baseline once to create it")
             return 1
+        if only is not None:
+            base = {m: n for m, n in base.items() if m in only}
         worse = sorted((m, base.get(m, 0), n) for m, n in counts.items()
                        if n > base.get(m, 0))
         total = sum(counts.values())

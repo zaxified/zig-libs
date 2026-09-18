@@ -1409,11 +1409,15 @@ cmd_changed() {
     [[ $mc -eq 1 || -n "${seeds// /}" || -n "${docs_only// /}" ]] && mt=1
     closure_has() { case " $closure " in *" $1 "*) return 0 ;; esac; return 1; }
     stamps_narrow "$closure" "$lane_mods"
-    # The modules a comment-reading scan must look at: the unproven ones plus
-    # every module the diff touched (a comment edit re-keys nothing).
+    # The modules a comment- or prose-reading scan must look at: the unproven
+    # ones plus every module the diff touched, docs included (a comment edit
+    # re-keys nothing, and fuzz-reach exemptions and NOTICE files are prose).
     local -a touched_args=()
-    local tm
-    for tm in $(printf '%s\n' $closure $seeds | sort -u); do touched_args+=("-Dmodule=$tm"); done
+    local tm touched=""
+    for tm in $(printf '%s\n' $closure $seeds $docs_only | sort -u); do
+        touched_args+=("-Dmodule=$tm")
+        touched="$touched${touched:+,}$tm"
+    done
 
     if [[ $trigger_catalog -eq 1 ]]; then
         step "check-catalog (README.md changed)" zig build check-catalog
@@ -1438,7 +1442,7 @@ cmd_changed() {
 
     # A testkit leak into published code is introduced by editing a MODULE's
     # code, which re-keys it -- so an unproven module (`mc`) is the signal.
-    (( mc )) && step "check-testonly" zig build check-testonly
+    (( mc )) && step "check-testonly" zig build check-testonly ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
 
     # Same reasoning as `check-testonly` above: ~0.1s warm, and the change
     # signal that would gate it (editing a harness, or editing the module it
@@ -1449,13 +1453,13 @@ cmd_changed() {
     # 2026-08-14, which is why nobody noticed it had
     # been red for weeks on 21 modules: a gate that exists and is never invoked
     # makes the same claim a skipped test makes, which is that someone looked.
-    (( mc )) && step "check-fuzz" zig build check-fuzz
-    (( mt )) && step "check-copyleft" zig build check-copyleft
+    (( mt )) && step "check-fuzz" zig build check-fuzz ${touched_args[@]+"${touched_args[@]}"}
+    (( mt )) && step "check-copyleft" zig build check-copyleft ${touched_args[@]+"${touched_args[@]}"}
 
     # Same reasoning as check-copyleft above, and the same order of cost
     # (~1.4 s): a source scan that refuses a module whose own code runs a
     # foreign toolchain. See phase_checks_fast_tail for the rule in full.
-    (( mt )) && step "check-module-purity" zig build check-module-purity
+    (( mt )) && step "check-module-purity" zig build check-module-purity ${touched_args[@]+"${touched_args[@]}"}
     # Reads `// global-alloc-ok:` exemptions, so it is a text scan: `mt`,
     # narrowed to the unproven and the touched modules.
     (( mt )) && step "check-global-alloc" zig build check-global-alloc ${touched_args[@]+"${touched_args[@]}"}
@@ -1530,7 +1534,7 @@ cmd_changed() {
     # The ceiling is per module rather than one total on purpose -- a total lets
     # one module regress while another improves and still reads green.
     # It still FAILS on a malformed or stale exemption.
-    (( mt )) && step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
+    (( mt )) && step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet "--modules=$touched"
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
