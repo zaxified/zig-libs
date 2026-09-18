@@ -22,7 +22,11 @@ Per-module design/threat-model lives in each module's `SPEC.md`.
 ## 2. Hard invariants
 
 - **100% pure Zig — no C, no libc, no external deps.** `build.zig.zon` dependencies stay
-  empty; zero `@cImport`/`linkLibrary`/`.c` source anywhere in `modules/`. (A
+  empty; zero `@cImport`/`linkLibrary`, and no `.c` source in anything a module compiles.
+  Two kinds of `.c` file do sit under `modules/` and are not violations, because no module
+  build ever compiles them: data (`ebpf`'s `.bpf.c` provenance for its `.bpf.o`
+  fixtures, see §9) and a foreign-toolchain instrument in `modules/<name>/tools/`, where
+  §9 puts it (`dtls`'s wolfSSL peer, `hqc`'s and `uci`'s reference oracles). (A
   compile-time `builtin.link_libc` *type* branch that only adapts IF a consumer already
   links libc, e.g. in `procrun`, is not a violation — the module itself never forces
   libc.)
