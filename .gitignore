@@ -30,4 +30,6 @@ example-apps/*/zig-pkg/
 __pycache__/
 *.pyc
 .stamps.local.tsv
+# stamps_record writes through a temp file beside it; an interrupted run leaves one
+.stamps.local.tsv.*
 .ci-stamps.tsv

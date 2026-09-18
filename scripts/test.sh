@@ -2,14 +2,11 @@
 # Test driver for zig-libs. `zig build test` runs every module in the
 # collection — fine for CI, absurd in a change/build/test loop where you
 # touched one module and are waiting on the rest. `changed` (the
-# default) works out which modules a change can actually affect, using
-# `zig build module-graph` (the authoritative dependency graph — this
-# script never parses build.zig) plus the reverse-dependency closure of
-# that set, and tests only those.
-#
-# Touching build.zig does NOT by itself mean running everything: the graph is
-# compared against the last verified one, and a purely additive change (a new
-# module) tests only what was added. See the graph-snapshot block below.
+# default) tests only the modules that have no green STAMP for their current
+# fingerprint (`zig build module-fingerprints`: a module's own code without
+# comments, its declaration, the build machinery, and every module it depends
+# on), plus the repo checks its diff can affect. See "stamps" below and
+# scripts/README.md, "Which modules run: stamps".
 #
 # Usage:
 #   scripts/test.sh                 — same as `changed` with no BASE_REF
@@ -1173,8 +1170,8 @@ cmd_changed() {
         case "$f" in
             # ── DOCUMENTATION-ONLY files inside a module ──────────────────────
             #
-            # These cannot change what compiles or what a test does, so they do
-            # NOT seed the reverse-dependency closure. Audit finding R27: eight
+            # These cannot change what compiles or what a test does, so they are
+            # in no fingerprint and select no module. Audit finding R27: eight
             # changed files, all NOTICE and CHANGELOG.md, seeded four modules,
             # pulled in fourteen more through `bls12_381` (which `bbs`, `ibe`,
             # `tlock`, `frost` and `voprf` all depend on) and paid 51 steps and
@@ -1255,7 +1252,7 @@ cmd_changed() {
     # this way could ship unformatted code, and one did (f76f360,
     # modules/decimal/src/root.zig). Per-file, so it costs milliseconds.
     #
-    # Skipped when the harness moved, because both escalations below open with a
+    # Skipped when the harness moved, because the smoke set below opens with a
     # whole-tree `zig fmt --check` that strictly contains this one. Running it
     # anyway printed two fmt steps in one log, which reads as two different
     # checks rather than one done twice — and a step list that misrepresents
@@ -1371,7 +1368,7 @@ cmd_changed() {
     done
 
     if [[ $trigger_catalog -eq 1 ]]; then
-        step "check-catalog (README.md changed)" zig build check-catalog
+        step "check-catalog" zig build check-catalog
     fi
 
     # Runs whenever anything moved (`files`), and reached by both paths that
@@ -1883,10 +1880,8 @@ cmd_build() {
         printf '### %s\n\n```\n  %-16s %d modules + %d examples compiled, 0 tests run (see cmd_build)\n```\n\n' \
             "${ZIGLIBS_LANE:-gate}" "compile only:" "$n" "$n" >> "$GITHUB_STEP_SUMMARY"
     fi
-    # ⚠ The graph snapshot is NOT saved here. It is what `changed` uses to
-    # decide it may run a narrow set, and a run that executed no test has no
-    # business telling the next one that anything was covered. The stamp below
-    # is keyed to the `build` lane, so it claims a compile and nothing more.
+    # The stamp below is keyed to the `build` lane, so it claims a compile and
+    # nothing more -- no test lane can mistake it for a run.
     stamps_record "$todo" "$lane"
     summary
 }
@@ -2043,13 +2038,11 @@ usage() {
     cat <<'EOF'
 Usage: scripts/test.sh [subcommand] [args]
 
-  changed [BASE_REF]   (default) test only modules affected by the current
-                        working-tree/staged/untracked changes — or, with
-                        BASE_REF, changes since that ref — plus their
-                        reverse-dependency closure.
-  all                   test every module: fmt check + check-catalog +
-                        check-changelog + the full suite + the dark-test
-                        check. The pre-commit/CI gate.
+  changed [BASE_REF]   (default) every module with no green stamp for its
+                        current fingerprint, plus the checks the diff (vs the
+                        working tree, or vs BASE_REF) can affect.
+  all                   every check and every module, ignoring stamps; then
+                        stamps the `changed` lane for all of them.
                         The dark-test check requires each module's declared
                         `^test ` count to EQUAL the `(N total)` its test binary
                         reports, so a file whose tests were never compiled —
@@ -2087,9 +2080,8 @@ Usage: scripts/test.sh [subcommand] [args]
                         nowhere else. Running the tests there was measured to
                         prove nothing the ReleaseSafe lane does not; see the
                         comment on cmd_build for the numbers.
-                        ⚠ Does NOT update the module-graph snapshot: a run that
-                        executed no test must not tell `changed` that anything
-                        was covered.
+                        Its stamps are for the `build` lane only: a run that
+                        executed no test proves no test lane.
   interop               PRE-RELEASE ONLY — re-take the interop anchors. Runs
                         every `modules/<m>/tools/interop.zig` against a REAL
                         foreign peer (wolfSSL, grpcio, Jinja2, google/brotli,
@@ -2145,7 +2137,7 @@ Which do I run? While working: `changed` (fast, scoped). Before committing:
 `checks-fast`, `checks`, `modules` and `examples` are the four phases `all`
 runs in one process, split so CI can put them in separate jobs — one lane per
 (phase, optimize mode, arch). They are not a menu for people: running them by
-hand in sequence is `all` with more typing and no graph snapshot in between.
+hand in sequence is `all` with more typing.
 The split exists because the halves share no compilation (a module is compiled
 once for its test binary and once for its example, and Zig caches whole
 compilations) and because the ReleaseFast lane cleared its 90-minute cap by 23

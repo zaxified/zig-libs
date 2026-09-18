@@ -65,6 +65,16 @@ if [[ ${#keys[@]} -lt 2 ]]; then
 fi
 
 rc=0
+# Equal cachekeys are allowed only on different runners (the arch is in the
+# key template): the same key twice on ONE runner is two lanes clobbering one
+# cache entry -- and one stamps artifact name, which the upload would refuse.
+dups=$(grep -oE '"cachekey"[[:space:]]*:[[:space:]]*"[^"]+".*"runner"[[:space:]]*:[[:space:]]*"[^"]+"' "$ci" |
+    sed -E 's/.*"cachekey"[[:space:]]*:[[:space:]]*"([^"]+)".*"runner"[[:space:]]*:[[:space:]]*"([^"]+)"/\1 \2/' |
+    sort | uniq -d)
+if [[ -n "$dups" ]]; then
+    echo "check-ci-cache-keys: cachekey repeated on the same runner: $dups" >&2
+    rc=1
+fi
 for a in "${keys[@]}"; do
     for b in "${keys[@]}"; do
         [[ "$a" == "$b" ]] && continue
@@ -81,7 +91,7 @@ done
 # primary lib absent from it would have its modules skipped on every push,
 # green. The full lanes get the same check at run time in `plan`, which does
 # not run on a push -- so it is made here, where `checks-fast` runs it.
-scoped=$(awk '/^  scoped:$/{on=1; next} /^  [a-z_-]+:$/{on=0} on' "$ci")
+scoped=$(awk '/^  scoped:$/{on=1; next} /^  [a-z_-]+:$/{on=0} on' "$ci" | grep -v '^[[:space:]]*#')
 have=$(grep -oE -- '-Dgroup=[a-z]+' <<< "$scoped" | sed 's/-Dgroup=//' | sort -u | paste -sd' ')
 want=$(zig build module-graph 2>/dev/null | cut -f6 | sort -u | paste -sd' ')
 if [[ -z "$want" ]]; then

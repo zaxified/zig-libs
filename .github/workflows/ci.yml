@@ -62,6 +62,7 @@ on:
           - examples ReleaseFast amd64
           - examples ReleaseSafe arm64
           - interop ReleaseSafe amd64
+          - ctgrind amd64
 
 # Least privilege. The gate reads the repository and nothing else — it opens no
 # issue, pushes no tag, publishes no package — so saying so here means a
@@ -258,12 +259,11 @@ jobs:
     # below requires exactly one shape to have run.
     if: "!startsWith(github.ref, 'refs/tags/') && github.event_name != 'workflow_dispatch'"
     runs-on: ubuntu-26.04
-    # A scoped lane is minutes — but this job is no longer always scoped. When
-    # the harness moves, `test.sh changed` escalates to the full gate here (see
-    # cmd_changed), and that is a run of all 225 modules whose cold-cache figure
-    # on a comparable lane was ~45 minutes. Thirty would have turned a correct
-    # escalation into a timeout, which is the worst of both: the coverage is
-    # paid for and then thrown away.
+    # A scoped lane is minutes -- unless the build MACHINERY moved (build.zig
+    # outside module_list, build.zig.zon, force-pubfn-reach.zig), which re-keys
+    # every module in the shard: a cold run of ~75 modules. Since 2026-09-18 a
+    # DRIVER change (test.sh, scripts/lib, scripts/checks) re-keys nothing and
+    # runs the smoke set instead; see cmd_changed.
     timeout-minutes: 75
     # ⭐ THREE SHARDS, like the full lanes (2026-09-18). On an ordinary push each
     # shard finds most of its modules stamped and is minutes, so the split
@@ -344,10 +344,11 @@ jobs:
       # close — so a push touching `wireguard` or `dtls` was gated by a lane
       # whose privileged and live tests skipped.
       #
-      # It became load-bearing the moment `test.sh changed` learned to escalate
-      # to the FULL gate on CI when the harness moves: this job now sometimes
-      # runs all 225 modules, and doing that with no peers installed would
-      # report green over every live test in the collection.
+      # It is load-bearing: this job can run every module of its shard (a
+      # machinery change re-keys them all), and a live module run with its peer
+      # missing skips its live tests. Since 2026-09-18 such a module is never
+      # stamped (capability_check records the gap), so a failed install here
+      # costs a re-run next time rather than a green that lasts.
       - name: Close the environment gaps the gate reports
         if: env.ZIGLIBS_DRY_RUN != '1'
         continue-on-error: true
@@ -359,10 +360,8 @@ jobs:
         # here bought the lane that gates every push nothing at all.
         run: bash scripts/lib/ci-environment.sh tests
       # The base differs by event, and a base that does not resolve is NOT
-      # allowed to read as "nothing changed" — `changed_files` fails and the
-      # driver escalates to the full run rather than passing having tested
-      # nothing. That matters here: `github.event.before` is all-zeros on a
-      # branch's first push.
+      # allowed to read as "nothing changed": `changed_files` fails and the
+      # driver runs `all` rather than passing having tested nothing.
       # ⭐ THE SAME THREE FACTS THE `full` JOB PRINTS, because this lane just
       # produced the question they answer. Two escalated runs of this job, same
       # sources and therefore the same GitHub cache key, one restoring an older
@@ -1066,12 +1065,11 @@ jobs:
   # and this job was happy. It happened for real on `eef1e28`, which changed
   # 191 lines of opcua's driver and never built the module.
   #
-  # `test.sh changed` now escalates to the FULL gate when it sees a harness
-  # change AND `GITHUB_ACTIONS` is set (see cmd_changed), so the shape this job
-  # cannot detect no longer occurs. That is the right place for it: this job
-  # reads job RESULTS, and "ran less than it should have" is not visible in a
-  # result. Which is worth remembering the next time something here needs
-  # asserting — the answer may again be in the driver rather than in this file.
+  # Since 2026-09-18 the shape cannot occur for a different reason: modules are
+  # chosen by stamps, not by the diff, and opcua's own files moving re-keys it,
+  # so a harness change runs the smoke set AND every re-keyed module. The fix is
+  # still in the driver, not here: this job reads job RESULTS, and "ran less
+  # than it should have" is not visible in a result.
   # ⭐ BLOCKING, and its own job rather than a step inside a `full` lane.
   #
   # Blocking because a lane whose red light cannot fail a commit is a lane whose

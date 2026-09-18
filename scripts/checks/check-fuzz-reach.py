@@ -867,6 +867,12 @@ def main() -> int:
         return 2
 
     only = {m for m in args.modules.split(",") if m} if args.modules else None
+    if only is not None:
+        unknown = sorted(m for m in only if not (Path("modules") / m).is_dir())
+        if unknown:
+            print(f"check-fuzz-reach: --modules names no such module: {', '.join(unknown)}",
+                  file=sys.stderr)
+            return 2
     if only is not None and args.update_baseline:
         print("check-fuzz-reach: --update-baseline rewrites every row; it takes no --modules",
               file=sys.stderr)

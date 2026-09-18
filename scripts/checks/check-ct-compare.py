@@ -204,6 +204,11 @@ def main() -> int:
     for arg in sys.argv[1:]:
         if arg.startswith("--modules="):
             only = {m for m in arg.split("=", 1)[1].split(",") if m}
+    if only is not None:
+        unknown = sorted(m for m in only if not os.path.isdir(os.path.join(REPO, "modules", m)))
+        if unknown:
+            print(f"check-ct-compare: --modules names no such module: {', '.join(unknown)}", file=sys.stderr)
+            return 2
     if update and only is not None:
         print("check-ct-compare: --update rewrites the whole pin; it takes no --modules", file=sys.stderr)
         return 2
