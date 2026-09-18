@@ -988,7 +988,9 @@ pub fn build(b: *std.Build) void {
             });
             one.dependOn(&cross_force.step);
 
-            if (is_declared) portable_pairs.append(b.allocator, .{ .module = m.name, .target = ct }) catch @panic("OOM");
+            // `-Dmodule` narrows the sweep like the other content checks;
+            // the per-pair steps above still exist for every module.
+            if (is_declared and inList(m.name, selected_modules)) portable_pairs.append(b.allocator, .{ .module = m.name, .target = ct }) catch @panic("OOM");
         }
     }
     // The gate itself does NOT `dependOn` the per-pair compile steps above --
@@ -5397,8 +5399,11 @@ const PortableBaselineStep = struct {
             // Nothing declared a cross-compiled target, or every declaration
             // errored above -- still worth its own line so a green run
             // because there was nothing to sweep is distinguishable from one
-            // that actually swept something.
-            std.log.info("check-portable: 0 (module, target) pairs declared -- nothing to sweep", .{});
+            // that actually swept something. Not when `-Dmodule` narrowed the
+            // sweep to modules that declare none: stderr from a check step is
+            // a failure to `scripts/test.sh`.
+            if (selected_modules.len == 0)
+                std.log.info("check-portable: 0 (module, target) pairs declared -- nothing to sweep", .{});
             if (failed) return step.fail("check-portable: declaration errors -- see errors above", .{});
             return;
         }

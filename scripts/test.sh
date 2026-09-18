@@ -1421,7 +1421,7 @@ cmd_changed() {
     # `usize` is 64 bits everywhere the suite has ever run. `platform = .any`
     # covers wasm32 and arm32 too, and until this step existed nothing had ever
     # compiled for either.
-    (( mc )) && step "check-portable" zig build check-portable
+    (( mc )) && step "check-portable" zig build check-portable ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     [[ -n "$files" ]] && step "check-portable-table" zig build check-portable-table
     [[ -n "$files" ]] && step "check-libs-table" zig build check-libs-table
     [[ -n "$files" ]] && step "check-catalog-table" zig build check-catalog-table
