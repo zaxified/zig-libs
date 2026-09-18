@@ -168,7 +168,6 @@ fn needlesFor(sk_bytes: [32]u8, aux: [32]u8) !Needles {
 pub fn expectNoResidue(label: []const u8, comptime call: fn (bip340.SecretKey, [32]u8) void) !void {
     if (builtin.mode == .Debug or builtin.mode == .ReleaseSafe) return error.SkipZigTest;
 
-    std.debug.print("\n=== STACKPROBE bip340 F2: {s} ({t}, window {d} KiB) ===\n", .{ label, builtin.mode, WINDOW / 1024 });
     for (cases) |case| {
         const sk = try bip340.SecretKey.fromBytes(case.sk);
         const needles = try needlesFor(case.sk, case.aux);
@@ -191,11 +190,15 @@ pub fn expectNoResidue(label: []const u8, comptime call: fn (bip340.SecretKey, [
         call(sk, case.aux);
         const depth = dirtyDepth();
 
-        std.debug.print("  key ..{x:0>2}: NEG={any} POS(d)={d} dirty below the call={d} B\n", .{ case.sk[31], neg, pos[0], depth });
-        for (needle_names, total) |name, h| {
-            if (h != 0) std.debug.print("    RESIDUE {s:<28} {d} (5 calls)\n", .{ name, h });
+        // Printed only when an assertion below fails: the lane treats stderr
+        // from a passing test as a FAIL (scripts/lib/test-lib.sh).
+        errdefer {
+            std.debug.print("\n=== STACKPROBE bip340 F2: {s} ({t}, window {d} KiB) ===\n", .{ label, builtin.mode, WINDOW / 1024 });
+            std.debug.print("  key ..{x:0>2}: NEG={any} POS(d)={d} dirty below the call={d} B\n", .{ case.sk[31], neg, pos[0], depth });
+            for (needle_names, total) |name, h| {
+                if (h != 0) std.debug.print("    RESIDUE {s:<28} {d} (5 calls)\n", .{ name, h });
+            }
         }
-
         for (neg) |h| try std.testing.expectEqual(@as(usize, 0), h);
         try std.testing.expect(pos[0] >= 1); // the scan can see a parked secret
         for (total) |h| try std.testing.expectEqual(@as(usize, 0), h);

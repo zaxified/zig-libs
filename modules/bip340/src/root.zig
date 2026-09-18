@@ -372,9 +372,9 @@ fn computeAndBurn(
 }
 
 /// How much stack below `computeAndBurn`'s frame is zeroed after steps 1-9.
-/// `stackprobe_test.zig` prints how deep the call tree dirties the stack and
-/// asserts zero residue in every representation it looks for, so a call tree
-/// that outgrows the burn goes red there.
+/// `stackprobe_test.zig` asserts zero residue in every representation it
+/// looks for, and on failure prints how deep the call tree dirtied the stack,
+/// so a call tree that outgrows the burn goes red there.
 const sign_stack_burn = 16 * 1024;
 
 /// Zero `sign_stack_burn` bytes at the depth `compute`'s frame occupied.
