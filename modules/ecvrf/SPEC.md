@@ -221,11 +221,12 @@ real — see "Implementation notes" below.
   `mlock`, matching this repository's other secret-scalar-handling
   modules, e.g. `xeddsa.zig`). **Known limitation (A1 E4, owner's decision
   2026-09-11: document, do not patch std):** secret copies still survive on
-  the dead stack after `prove`. `src/zeroize_probe_test.zig`, ReleaseFast, 5
-  rounds each: before 2026-09-14 `x=3 k=1 sk=0`; after `prove` moved its
-  steps into `proveExpanded` (secrets passed by pointer) and the SHA-512
-  states that absorb `sk` and the prefix are wiped (`Sha512.hash` left them
-  on an unwiped frame), `x=0 k=1 sk=1`. The counts follow frame layout, not
+  the dead stack after `prove`. Measured with a dead-stack probe (an audit
+  instrument, since deleted), ReleaseFast, 5 rounds each: before 2026-09-14
+  `x=3 k=1 sk=0`; after `prove` moved its steps into `proveExpanded`
+  (secrets passed by pointer) and the SHA-512 states that absorb `sk` and
+  the prefix are wiped (`Sha512.hash` left them on an unwiped frame),
+  `x=0 k=1 sk=1`. The counts follow frame layout, not
   just the code — passing `sk` by pointer alone measured `sk=2`. What remains
   sits in code this module does not control (`std`'s scalar arithmetic and
   hash internals take their inputs by value and do not wipe their frames),

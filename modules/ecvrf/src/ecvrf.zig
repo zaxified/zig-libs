@@ -407,7 +407,7 @@ pub const KeyPair = struct {
 
 /// `ECVRF_prove` steps 2-8, given step 1's `x` and `PK_string`. `sk` and
 /// `exp` come by pointer: passed by value, `sk` left one more copy of the
-/// seed on the dead stack (measured by `zeroize_probe_test.zig`, A1 E4).
+/// seed on the dead stack (measured by a dead-stack probe, A1 E4).
 fn proveExpanded(sk: *const SecretKey, exp: *const ExpandedSecretKey, y_string: PublicKey, alpha_string: []const u8) Proof {
     // Step 2-3: H = encode_to_curve(PK_string, alpha), h_string = point_to_string(H).
     const h_string = encodeToCurve(y_string, alpha_string);

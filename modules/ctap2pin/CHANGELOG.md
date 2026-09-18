@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
+  dead-stack probe `src/stackprobe_test.zig` (A1 M3) is deleted: it asserted
+  nothing and its stderr failed the CI lane in ReleaseFast. M3 stays the
+  known limitation SPEC.md describes; its last run still read `prk` 1 and
+  `hmacKey` 1.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE (doc-only):** SPEC.md's
   threat-model notes now document audit finding M3's remaining dead-stack
   residue (`prk`, intermittently `hmacKey`) as a confirmed `std.crypto`

@@ -149,5 +149,4 @@ test {
     _ = kem;
     _ = @import("kem_kat_test.zig");
     _ = @import("bench.zig");
-    _ = @import("zeroize_probe_test.zig");
 }

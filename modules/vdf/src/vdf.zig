@@ -892,51 +892,6 @@ test "A1 F4: the sieve actually rejects small-prime-divisible candidates before 
     try testing.expect(sieve_hits >= 8);
 }
 
-fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
-
-test "A1 F4: sieve wall-clock speedup over the pre-fix search (ReleaseFast, printed, not asserted)" {
-    // Not asserted -- a wall-clock number on a machine other agents share
-    // is exactly the kind of thing this campaign's own notes warn against
-    // pinning as a pass/fail gate (see A1/blindrsa.md's perf section and
-    // this campaign's "delta needs its spread" feedback). Correctness and
-    // sieve engagement are asserted above, deterministically; this is
-    // printed for the record alongside them, interleaved to reduce bias
-    // from whichever binary runs first.
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
-    var prng = std.Random.DefaultPrng.init(0xF4D1FF61);
-    const rand = prng.random();
-    const rounds = 12;
-    var sieved_ns: u64 = 0;
-    var unsieved_ns: u64 = 0;
-    var i: usize = 0;
-    while (i < rounds) : (i += 1) {
-        var n_bytes: [32]u8 = undefined;
-        var x_bytes: [32]u8 = undefined;
-        var y_bytes: [32]u8 = undefined;
-        rand.bytes(&n_bytes);
-        rand.bytes(&x_bytes);
-        rand.bytes(&y_bytes);
-        const t = rand.int(u64);
-
-        const t1a = nowNs();
-        std.mem.doNotOptimizeAway(hashToPrime(&n_bytes, &x_bytes, &y_bytes, t));
-        sieved_ns += nowNs() - t1a;
-
-        const t2a = nowNs();
-        std.mem.doNotOptimizeAway(hashToPrimeUnsieved(&n_bytes, &x_bytes, &y_bytes, t));
-        unsieved_ns += nowNs() - t2a;
-    }
-    const ratio = @as(f64, @floatFromInt(unsieved_ns)) / @as(f64, @floatFromInt(sieved_ns));
-    std.debug.print(
-        "A1 F4: {d} hashToPrime calls -- sieved {d} us total, unsieved {d} us total, {d:.2}x speedup (audit estimated ~2.5x)\n",
-        .{ rounds, sieved_ns / 1000, unsieved_ns / 1000, ratio },
-    );
-}
-
 test "prove core: streaming quotient matches naive big.int division (incl. q=0 and the 2^t ~ l boundary)" {
     const m = group.rsa2048ChallengeModulus();
     var n_canon: [group.modulus_bytes]u8 = undefined;

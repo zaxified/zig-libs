@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
+  dead-stack probe `src/zeroize_probe_test.zig` (A1 E4) is deleted: it
+  asserted nothing and its stderr failed the CI lane in ReleaseFast. SPEC.md's
+  E4 limitation keeps its numbers; its last run still read `k=1 sk=1`.
+
 - **2026-09-16** — documentation only, no code and no gate data changed (A1 E15
   closed). The audit recorded that nothing anywhere caught replacing `verify`'s
   `std.crypto.timing_safe.eql` with `std.mem.eql` — true when it was written

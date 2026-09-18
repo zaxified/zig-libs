@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The opt-in,
+  print-only dead-stack probe `src/zeroize_probe_test.zig` (A1 H4,
+  `HQC_ZEROIZE_SCAN`) is deleted: it asserted nothing, and CONVENTIONS.md §9
+  does not keep a one-finding probe.
+
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE, every KEM operation roughly twice as fast:** the
   CLMUL ring multiply in `gf2x.zig` (A1 M4). The Karatsuba base-case leaf carries each partial
   product's high limb into the next word, one store per limb per row. It used to `@memset` its

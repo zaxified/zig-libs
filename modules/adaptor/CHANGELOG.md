@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** test-only. The print-only
+  dead-stack probe `src/stackprobe_test.zig` (A1 F3) is deleted: it asserted
+  nothing and its stderr failed the CI lane in ReleaseFast. Per CONVENTIONS.md
+  §9 a one-finding probe is not kept once the finding is closed.
+
 - **2026-09-11** — **NO CONSUMER-VISIBLE CHANGE:** A1 audit F5 (MED): the
   mandatory step-9 self-check (fault-injection guard, sibling to
   `bip340.sign`'s step 10) had no way to be regression-tested without
