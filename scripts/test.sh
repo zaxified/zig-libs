@@ -1274,7 +1274,7 @@ cmd_changed() {
         esac
     done <<< "$files"
 
-    echo "changed: $(printf '%s\n' "$files" | wc -l) file(s) changed$( [[ -n "$base_ref" ]] && echo " vs $base_ref" )"
+    [[ -n "$files" ]] && echo "changed: $(printf '%s\n' "$files" | wc -l) file(s) changed$( [[ -n "$base_ref" ]] && echo " vs $base_ref" )"
 
     # fmt on the CHANGED .zig files. `all` fmt-checks the whole tree, but the
     # change-aware path used to skip fmt entirely — so a commit verified only
