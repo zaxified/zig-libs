@@ -1152,12 +1152,23 @@ needed_modes() {
     printf '%s\n' ${out[@]+"${out[@]}"}
 }
 
+# ⚠ A FIXED CPU MODEL, not `native` (2026-09-18). Every pin in
+# ctgrind-expected.tsv was measured on a Skylake-class host, and the counts are
+# a property of the generated code, so a different `native` is a different
+# binary and a different count. Worse: GitHub's amd64 pool has AVX-512
+# machines (emeraldrapids, znver4), `native` codegen there emits AVX-512, and
+# valgrind cannot execute it -- the first full CI run of this lane died with
+# "Illegal instruction" in 497 rows. `skylake` has the aes/pclmul/adx/bmi2
+# paths the harnesses measure (k256/montint asm, AES-NI) and runs under
+# valgrind on every host in that pool. Override only to re-pin on purpose.
+CTGRIND_CPU="${CTGRIND_CPU:-skylake}"
+
 mapfile -t BUILD_MODES < <(needed_modes)
 for mode in "${BUILD_MODES[@]}"; do
     for vg in true false; do
         echo "Building ctgrind harnesses ($mode, -fvalgrind=$vg)..." >&2
         scripts/lib/capped zig build ctgrind \
-            "-Doptimize=$mode" "-Dctgrind-valgrind=$vg" \
+            "-Doptimize=$mode" "-Dctgrind-valgrind=$vg" "-Dcpu=$CTGRIND_CPU" \
             "${MODFLAGS[@]}" -p "$WORKDIR/$mode-$vg" >&2
     done
 done
