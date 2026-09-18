@@ -694,11 +694,14 @@ jobs:
           # on x86_64, and `k256`/`montint` measure inline asm cores that exist
           # only there. An arm64 row would need its own pins, not a re-run.
           #
-          # `cache:false` and `timeout:30` follow interop: it builds 8 harnesses
-          # in two modes with and without `-fvalgrind`, then runs 60 memcheck
-          # processes. Measured 310 s warm for the full check on an i7-7920HQ;
-          # 30 minutes is the "this is stuck" line, not the expected cost.
-          lanes+=('{"name":"ctgrind amd64","args":"","cmd":"ctgrind","cachekey":"ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
+          # `cache:false`, like interop. `timeout:90`: the lane started at 8
+          # harnesses and 60 memcheck processes (310 s warm on an i7-7920HQ,
+          # 30-minute limit), and grew to 42 modules and 126 rows, 378 memcheck
+          # runs (609.8 s warm locally, 2026-09-16). Its first real run on CI
+          # (2026-09-18) was cancelled at 30 minutes while still COMPILING the
+          # harnesses, cold, on 4 vCPUs. 90 is a generous first bound, to be
+          # lowered once a green run has measured the cost.
+          lanes+=('{"name":"ctgrind amd64","args":"","cmd":"ctgrind","cachekey":"ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":90,"skip_live":""}')
 
           # Every shard set must cover the whole collection: per `base`, the
           # union of its `-Dgroup=` values must equal every primary lib in

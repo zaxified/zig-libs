@@ -21,8 +21,9 @@
 #              EXAMPLE judges itself against.
 #   interop  — what `zig build interop-<m>` needs, and NOTHING here is reached
 #              by any test: a C compiler and wolfSSL headers (dtls), and
-#              jinja2 / sympy / brotli / protobuf / a grpcio venv (the five
-#              Python-driven ones).
+#              jinja2 / sympy / brotli / protobuf / asyncua + cryptography /
+#              a grpcio venv (the Python-driven ones; `signal` needs only
+#              python3, `dns` no peer at all).
 #   all      — both, for a machine that will do both.
 #
 # ⛔ THE `interop` HALF IS NOT DELETABLE, and that is the whole reason it is a
@@ -196,11 +197,16 @@ echo "::group::interop: python oracles"
 # exactly what a golden-vs-live test exists to catch. A gate must go red for our
 # reasons, so this is pinned and bumped deliberately. `test.sh`'s capability
 # report compares the installed version against the golden's own header.
+# asyncua + cryptography: `interop-opcua` drives a python-opcua peer with the
+# bare `python3` by default. The `tests` role's opcua venv serves the module's
+# own live tests and is not installed on this lane, so the first real run of
+# the interop lane (2026-09-18) died on `No module named 'asyncua'`.
 sudo pip3 install --break-system-packages -q --root-user-action=ignore \
-    "jinja2==3.1.6" sympy brotli protobuf >/dev/null 2>&1 || true
+    "jinja2==3.1.6" sympy brotli protobuf asyncua cryptography >/dev/null 2>&1 || true
 python3 - <<'PY' || true
 for mod, label in (("jinja2", "jinja2"), ("sympy", "sympy"),
-                   ("brotli", "brotli"), ("google.protobuf", "protobuf")):
+                   ("brotli", "brotli"), ("google.protobuf", "protobuf"),
+                   ("asyncua", "asyncua"), ("cryptography", "cryptography")):
     try:
         m = __import__(mod)
         print(f"{label}: {getattr(m, '__version__', 'present')}")
