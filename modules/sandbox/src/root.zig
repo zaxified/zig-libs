@@ -1107,13 +1107,19 @@ test "seccomp default allow-list: named CONTENT, and no silent drop by @hasField
     // be deleted with the suite green, and `newfstatat` — spelled `fstatat64`
     // in std's x86-64 table — was silently filtered out, so C code's stat(2)
     // died of SIGSYS under a list whose author had allowed it.
-    const must_have = [_]linux.SYS{ .read, .write, .close, .epoll_wait, .accept4, .futex, .mmap, .exit_group, .rt_sigreturn, .getrandom } ++ s11_added;
+    // `.epoll_pwait`, not `.epoll_wait`: aarch64 has no `epoll_wait` syscall
+    // at all, so naming it here stopped this module compiling for arm64
+    // (found by the full matrix, 2026-09-18). Both are on the list.
+    const must_have = [_]linux.SYS{ .read, .write, .close, .epoll_pwait, .accept4, .futex, .mmap, .exit_group, .rt_sigreturn, .getrandom } ++ s11_added;
     for (must_have) |s| try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, s));
     // `prlimit64`/`setrlimit`: audit S11 listed them, and they stay out on
     // purpose (see `default_names`).
-    const must_not = [_]linux.SYS{ .execve, .fork, .clone, .ptrace, .mount, .openat, .socket, .connect, .ioctl, .prctl, .seccomp, .setuid, .prlimit64, .setrlimit };
+    const must_not = [_]linux.SYS{ .execve, .clone, .ptrace, .mount, .openat, .socket, .connect, .ioctl, .prctl, .seccomp, .setuid, .prlimit64, .setrlimit };
     for (must_not) |s| try testing.expect(!seccomp.containsSyscall(seccomp.default_allowlist, s));
     if (builtin.cpu.arch == .x86_64) {
+        // `fork` exists only where the arch has it; aarch64 forks via `clone`,
+        // which is checked above for every arch.
+        try testing.expect(!seccomp.containsSyscall(seccomp.default_allowlist, .fork));
         // stat-by-path (262) is present under std's spelling …
         try testing.expect(seccomp.containsSyscall(seccomp.default_allowlist, .fstatat64));
         // … and `newfstatat` is the ONLY name the arch filter drops here.
