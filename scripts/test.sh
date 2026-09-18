@@ -285,6 +285,12 @@ native_target_id() {
     printf '%s' "$_ZL_NATIVE_ID"
 }
 
+# The CPU model behind that hash, for the log: the hash alone does not say
+# which of the pool's machines a CI run landed on.
+native_cpu_name() {
+    zig targets 2>/dev/null | awk '/^    \.native = \.\{/{on=1} on && /^            \.name = /{gsub(/[",]/,"",$3); print $3; exit}'
+}
+
 # Prints the modules of $1 that have no stamp for lane $2 at their current
 # fingerprint.
 stamps_pending() {
@@ -398,7 +404,8 @@ harness_smoke() {
     done
 
     echo "changed: the harness or a CI lane definition changed -- running every check and"
-    echo "  a smoke set ($plain, $netns) that exercises the driver end to end; the modules"
+    local smoke="$plain${netns:+, $netns}"
+    echo "  a smoke set ($smoke) that exercises the driver end to end; the modules"
     echo "  with no green stamp follow."
     phase_all_checks
     run_modules "$plain $netns"
@@ -1321,7 +1328,7 @@ cmd_changed() {
     closure="$(stamps_pending "$lane_mods" "$lane")"
     local total_n
     total_n=$(wc -w <<< "$closure")
-    echo "changed: $total_n of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane'"
+    echo "changed: $total_n of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' (cpu $(native_cpu_name))"
     if [[ $total_n -gt 0 && $total_n -le 40 ]]; then
         echo "  to test: $closure"
     fi
@@ -1800,7 +1807,7 @@ cmd_modules() {
     lane="$(stamps_lane_key modules)"
     fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
-    echo "modules: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' — compiling and testing those; examples run in their own lane"
+    echo "modules: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' (cpu $(native_cpu_name)) — compiling and testing those; examples run in their own lane"
     if [[ -z "${todo// /}" ]]; then
         echo "modules: nothing to do — every module here is stamped green at its current fingerprint"
         summary
@@ -1827,7 +1834,7 @@ cmd_examples() {
     lane="$(stamps_lane_key examples)"
     fp_load   # here, in THIS shell: see stamps_record
     todo="$(stamps_pending "$lane_mods" "$lane")"
-    echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' — compiling and running their examples"
+    echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' (cpu $(native_cpu_name)) — compiling and running their examples"
     if [[ -z "${todo// /}" ]]; then
         echo "examples: nothing to do — every module here is stamped green at its current fingerprint"
         summary
