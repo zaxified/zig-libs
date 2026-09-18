@@ -52,6 +52,21 @@
 const std = @import("std");
 const body = @import("body.zig");
 const Server = @import("Server.zig");
+const builtin = @import("builtin");
+
+/// Test-only counter (audit G7 regression guard): header elements the
+/// `Accept` / `TokenList` iterators have examined since the test last zeroed
+/// it. One pass over an N-element header is ~N; the pre-G7 per-offer rescan
+/// was offers x N. Counting elements is what the fix is about and, unlike a
+/// stopwatch, does not care how loaded the machine is. `void` outside a test
+/// build, so the increment compiles to nothing there. Thread-local so a
+/// server thread negotiating in another test cannot bleed into the count.
+const ElementCounter = if (builtin.is_test) usize else void;
+threadlocal var header_elements_for_testing: ElementCounter = if (builtin.is_test) 0 else {};
+
+inline fn countHeaderElement() void {
+    if (builtin.is_test) header_elements_for_testing += 1;
+}
 
 /// The default quality when an element carries no `;q=` weight: `q=1` (RFC 9110
 /// §12.4.2), in milli-units.
@@ -134,6 +149,7 @@ pub const Accept = struct {
             const end = std.mem.indexOfScalar(u8, self.rest, ',') orelse self.rest.len;
             const elem = std.mem.trim(u8, self.rest[0..end], " \t");
             self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else "";
+            countHeaderElement();
             if (parseElement(elem)) |mr| return mr;
             // Malformed element — lenient: skip it and try the next one.
         }
@@ -398,6 +414,7 @@ pub const TokenList = struct {
             const end = std.mem.indexOfScalar(u8, self.rest, ',') orelse self.rest.len;
             const elem = std.mem.trim(u8, self.rest[0..end], " \t");
             self.rest = if (end < self.rest.len) self.rest[end + 1 ..] else "";
+            countHeaderElement();
             if (parseTokenElement(elem)) |wt| return wt;
             // Malformed element — lenient: skip it and try the next one.
         }
@@ -1358,116 +1375,80 @@ test "negotiateEncoding G7: codings.len over the fast-path bound still negotiate
     try testing.expectEqual(q_default, n.weight);
 }
 
-fn g7NowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
+// ── G7: the header is walked ONCE, not once per offer ───────────────────────
+//
+// These were opt-in wall-clock benches (`HTTP_BENCH_G7=1`, ReleaseFast only,
+// `per_call_ns < 300 us`), so the default gate never ran them and nothing in
+// it guarded G7. Measured then, 1000-range header, 8 offers: single pass
+// 136 us/call vs the old per-offer rescan 884 us/call (`negotiate`),
+// ~95-100 vs ~523 (`negotiateLanguage`), ~79-81 vs ~583
+// (`negotiateEncoding`). They now count header elements examined
+// (`header_elements_for_testing`) instead: deterministic, run in every mode,
+// and each carries a positive control through the `*Slow` rescan, so a
+// counter that stopped counting fails too.
 
-test "bench (opt-in via HTTP_BENCH_G7): negotiate() is not O(offers) full header rescans" {
-    // G7 (`~/CML/20260901-zig-libs-audit/A1/http.md`): `negotiate` re-walked
-    // the WHOLE `Accept` header once PER offer. Measured there: a 1000-range
-    // header (11 999 B, comfortably under `Server.Options.max_header_bytes`)
-    // against 8 offers cost ~550-598 us/call, ~550x a 1-range header, and
-    // scaled linearly in offer count (8.0-9.1x between 1 and 8 offers) at
-    // flat per-(range x offer) cost. Opt-in and ReleaseFast-only, same shape
-    // as `imap`'s F7 bench: a wall-clock assert in the default gate, run
-    // alongside up to three other agents' lanes, is a flaky test waiting to
-    // happen. Run with:
-    //   HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast
-    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_G7") == null) return error.SkipZigTest;
+const g7_ranges = 1000;
 
+fn g7Header(gpa: std.mem.Allocator, comptime fmt: []const u8) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .empty;
-    const gpa = testing.allocator;
-    defer buf.deinit(gpa);
-    for (0..1000) |i| {
+    errdefer buf.deinit(gpa);
+    for (0..g7_ranges) |i| {
         if (i != 0) try buf.append(gpa, ',');
         var elem_buf: [32]u8 = undefined;
-        const elem = std.fmt.bufPrint(&elem_buf, "type{d}/sub{d};q=0.{d}", .{ i, i, 100 + (i % 900) }) catch unreachable;
+        const elem = std.fmt.bufPrint(&elem_buf, fmt, .{ i, 100 + (i % 900) }) catch unreachable;
         try buf.appendSlice(gpa, elem);
     }
-    const offers = [_][]const u8{ "a/a", "b/b", "c/c", "d/d", "e/e", "f/f", "g/g", "type999/sub999" };
-
-    const iters = 1000;
-    const start = g7NowNs();
-    for (0..iters) |_| std.mem.doNotOptimizeAway(negotiate(buf.items, &offers));
-    const elapsed = g7NowNs() - start;
-    const per_call_ns = elapsed / iters;
-
-    std.debug.print("G7 bench: {d} ns/call over {d} iters ({d} B header, {d} offers)\n", .{ per_call_ns, iters, buf.items.len, offers.len });
-    // Measured on this machine, same shape as above (1000 ranges, 8 offers,
-    // 22 779 B header): single-pass 136 us/call, the old per-offer rescan
-    // (`negotiateOffersSlow`, measured directly, not restored via mutation)
-    // 884 us/call -- 6.5x, the same order as the audit's own ~8x on a
-    // shorter header. 300 us sits well above the fast path's measured cost
-    // while still failing hard on a reversion to the O(offers) rescan.
-    try testing.expect(per_call_ns < 300_000);
+    return buf;
 }
 
-test "bench (opt-in via HTTP_BENCH_G7): negotiateLanguage() is not O(tags) full header rescans" {
-    // G7 remainder: same shape as `negotiate` above, applied to
-    // `negotiateLanguage`. Same header size/shape (1000 ranges), 8 tags.
-    // Run with:
-    //   HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast
-    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_G7") == null) return error.SkipZigTest;
-
-    var buf: std.ArrayList(u8) = .empty;
+test "G7: negotiate() walks the Accept header once, not once per offer" {
     const gpa = testing.allocator;
+    var buf = try g7Header(gpa, "type{d}/sub;q=0.{d}");
     defer buf.deinit(gpa);
-    for (0..1000) |i| {
-        if (i != 0) try buf.append(gpa, ',');
-        var elem_buf: [16]u8 = undefined;
-        const elem = std.fmt.bufPrint(&elem_buf, "lang{d};q=0.{d}", .{ i, 100 + (i % 900) }) catch unreachable;
-        try buf.appendSlice(gpa, elem);
-    }
+    const offers = [_][]const u8{ "a/a", "b/b", "c/c", "d/d", "e/e", "f/f", "g/g", "type999/sub" };
+
+    header_elements_for_testing = 0;
+    const fast = negotiate(buf.items, &offers);
+    // One pass, plus the one element the empty-header probe reads first.
+    try testing.expect(header_elements_for_testing <= g7_ranges + 1);
+
+    header_elements_for_testing = 0;
+    const slow = negotiateOffersSlow(buf.items, &offers);
+    try testing.expect(header_elements_for_testing >= offers.len * g7_ranges);
+    try testing.expectEqual(slow, fast);
+    try testing.expectEqual(@as(usize, 7), fast.?.index);
+}
+
+test "G7: negotiateLanguage() walks the header once, not once per tag" {
+    const gpa = testing.allocator;
+    var buf = try g7Header(gpa, "lang{d};q=0.{d}");
+    defer buf.deinit(gpa);
     const tags = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "lang999" };
 
-    const iters = 1000;
-    const start = g7NowNs();
-    for (0..iters) |_| std.mem.doNotOptimizeAway(negotiateLanguage(buf.items, &tags));
-    const elapsed = g7NowNs() - start;
-    const per_call_ns = elapsed / iters;
+    header_elements_for_testing = 0;
+    const fast = negotiateLanguage(buf.items, &tags);
+    try testing.expect(header_elements_for_testing <= g7_ranges + 1);
 
-    std.debug.print("G7 negotiateLanguage bench: {d} ns/call over {d} iters ({d} B header, {d} tags)\n", .{ per_call_ns, iters, buf.items.len, tags.len });
-    // Measured on this machine, same shape as above (1000 ranges, 8 tags,
-    // 15 889 B header): single-pass ~95-100 us/call, the old per-tag rescan
-    // (`negotiateLanguageSlow`, measured directly, not restored via
-    // mutation) ~523 us/call -- ~5.3x. 300 us sits well above the fast
-    // path's measured cost while still failing hard on a reversion to the
-    // O(tags) rescan.
-    try testing.expect(per_call_ns < 300_000);
+    header_elements_for_testing = 0;
+    const slow = negotiateLanguageSlow(buf.items, &tags);
+    try testing.expect(header_elements_for_testing >= tags.len * g7_ranges);
+    try testing.expectEqual(slow, fast);
+    try testing.expectEqual(@as(usize, 7), fast.?.index);
 }
 
-test "bench (opt-in via HTTP_BENCH_G7): negotiateEncoding() is not O(codings) full header rescans" {
-    // G7 remainder: same shape as `negotiate` above, applied to
-    // `negotiateEncoding`. Same header size/shape (1000 ranges), 8 codings.
-    // Run with:
-    //   HTTP_BENCH_G7=1 scripts/modtest http -Doptimize=ReleaseFast
-    if (@import("builtin").mode == .Debug or std.testing.environ.getPosix("HTTP_BENCH_G7") == null) return error.SkipZigTest;
-
-    var buf: std.ArrayList(u8) = .empty;
+test "G7: negotiateEncoding() walks the header once, not once per coding" {
     const gpa = testing.allocator;
+    var buf = try g7Header(gpa, "enc{d};q=0.{d}");
     defer buf.deinit(gpa);
-    for (0..1000) |i| {
-        if (i != 0) try buf.append(gpa, ',');
-        var elem_buf: [16]u8 = undefined;
-        const elem = std.fmt.bufPrint(&elem_buf, "enc{d};q=0.{d}", .{ i, 100 + (i % 900) }) catch unreachable;
-        try buf.appendSlice(gpa, elem);
-    }
     const codings = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "enc999" };
 
-    const iters = 1000;
-    const start = g7NowNs();
-    for (0..iters) |_| std.mem.doNotOptimizeAway(negotiateEncoding(buf.items, &codings));
-    const elapsed = g7NowNs() - start;
-    const per_call_ns = elapsed / iters;
+    header_elements_for_testing = 0;
+    const fast = negotiateEncoding(buf.items, &codings);
+    try testing.expect(header_elements_for_testing <= g7_ranges + 1);
 
-    std.debug.print("G7 negotiateEncoding bench: {d} ns/call over {d} iters ({d} B header, {d} codings)\n", .{ per_call_ns, iters, buf.items.len, codings.len });
-    // Measured on this machine, same shape as above (1000 ranges, 8
-    // codings, 14 889 B header): single-pass ~79-81 us/call, the old
-    // per-coding rescan (`negotiateEncodingSlow`, measured directly, not
-    // restored via mutation) ~583 us/call -- ~7.3x. 300 us sits well above
-    // the fast path's measured cost while still failing hard on a
-    // reversion to the O(codings) rescan.
-    try testing.expect(per_call_ns < 300_000);
+    header_elements_for_testing = 0;
+    const slow = negotiateEncodingSlow(buf.items, &codings);
+    try testing.expect(header_elements_for_testing >= codings.len * g7_ranges);
+    try testing.expectEqual(slow, fast);
+    try testing.expectEqual(@as(usize, 7), fast.?.index);
 }

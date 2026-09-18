@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `conneg`'s `Accept` and
+  `TokenList` iterators gain a test-only element counter (`void` outside a
+  test build, so the increment compiles to nothing there). The three G7
+  regression tests were opt-in ReleaseFast wall-clock benches
+  (`HTTP_BENCH_G7=1`) that the default gate never ran; they now assert that
+  `negotiate`/`negotiateLanguage`/`negotiateEncoding` examine at most N+1
+  elements of an N-element header (the old per-offer rescan examined
+  offers x N) and run in every mode. `HTTP_BENCH_G7` no longer exists.
 - **2026-09-18** — ⛔ **F14's per-connection arena pool is REVERTED.** `h2_server.serveJob`
   builds an arena per request again, as it did before 2026-09-15. No API or wire change;
   `Session` loses `spare_arenas`/`spare_arena_count`/`reuse_arenas`, and the F14 bench and its

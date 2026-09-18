@@ -5448,10 +5448,11 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
 
     // read_timeout_ms is generous -- no individual gap below is anywhere
     // near it -- so only the whole-request deadline can be what cuts this
-    // off.
+    // off. It is also the UNARMED path's close time (see the bound below),
+    // so it is set far above that bound on purpose.
     var server = init(io, testing.allocator, .{
         .handler = testHandler,
-        .read_timeout_ms = 5_000,
+        .read_timeout_ms = 20_000,
         .request_timeout_ms = 200,
     });
     defer server.deinit();
@@ -5473,7 +5474,7 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
     var sr = stream.reader(io, &rbuf);
     var sw = stream.writer(io, &wbuf);
 
-    // One byte of the head every 80 ms: each gap is 62x under
+    // One byte of the head every 80 ms: each gap is 250x under
     // read_timeout_ms, but six of them is 480 ms of wall clock -- over the
     // 200 ms whole-request deadline. If only the per-read timer were live,
     // this loop would run to completion and the server would still be
@@ -5486,14 +5487,18 @@ test "integration: request_timeout_ms bounds the WHOLE request even when no sing
     }
     // Outcome alone does not discriminate the guard: with NO deadline armed
     // at all, `read_timeout_ms` eventually drops this connection too, just
-    // ~5 s later than the request deadline would. Time the close instead --
-    // 800 ms sits comfortably above the 200 ms deadline path (armed) and
-    // comfortably below the earliest the 5 s stall fallback could fire
-    // (unarmed), so only the armed path can pass.
+    // ~20 s later than the request deadline would. Time the close instead.
+    // Armed, the server hung up at ~200 ms, before or during the dribble
+    // loop, so this read finds the close already there (~0 ms). Unarmed, the
+    // loop ran to completion and this read waits out the stall fallback,
+    // ~20 s minus the last 80 ms gap. The bound was 800 ms against a 5 s
+    // fallback -- tight enough that a server thread descheduled on a loaded
+    // CI shard could miss it; 5 s now sits 4x under the unarmed path and
+    // leaves the armed path seconds of scheduling slack.
     const started_ns = monotonicNowNs();
     try testing.expectError(error.EndOfStream, sr.interface.take(1));
     const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
-    try testing.expect(elapsed_ms < 800);
+    try testing.expect(elapsed_ms < 5_000);
 }
 
 test "integration: an enable_h2c connection kept 'productive' forever still ends at max_h2c_connection_ms (A1 http F7)" {
@@ -5503,7 +5508,7 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     // as progress (any PING resets `noteUnproductive`'s budget same as a real
     // stream would) keeps every existing guard from firing while paying for
     // server resources indefinitely. PINGs here are individually 40 ms apart —
-    // 125x under `read_timeout_ms` — so only the new absolute cap can be what
+    // 500x under `read_timeout_ms` — so only the new absolute cap can be what
     // ends this.
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -5512,7 +5517,7 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     var server = init(io, testing.allocator, .{
         .handler = testHandler,
         .enable_h2c = true,
-        .read_timeout_ms = 5_000,
+        .read_timeout_ms = 20_000,
         .max_h2c_connection_ms = 150,
     });
     defer server.deinit();
@@ -5553,16 +5558,18 @@ test "integration: an enable_h2c connection kept 'productive' forever still ends
     // Whatever the server sent back (SETTINGS ack, PING acks, a final
     // GOAWAY) does not matter -- what matters is that reading eventually
     // hits EndOfStream, and roughly when. 20 rounds at 40 ms is 800 ms of
-    // wire time; if only `read_timeout_ms` (5 s) bounded this, the loop
-    // above would run to completion having sent every PING. 1 s sits
-    // comfortably above the 150 ms connection cap and comfortably below
-    // both `read_timeout_ms` and the 800 ms the round-trip loop itself
-    // takes.
+    // wire time; if only `read_timeout_ms` (20 s) bounded this, the loop
+    // above would run to completion having sent every PING and the read
+    // below would then wait out the stall fallback: ~20.8 s from
+    // `started_ns`. Capped, the server hangs up at ~150 ms. The bound was
+    // 1 s -- only 1.25x the loop's own 800 ms, so a loaded CI shard that
+    // stretched the 40 ms sleeps could fail the armed path; 5 s is 4x under
+    // the uncapped path and leaves the capped one seconds of slack.
     while (true) {
         _ = sr.interface.take(1) catch break; // EndOfStream or ReadFailed: connection is down
     }
     const elapsed_ms = (monotonicNowNs() - started_ns) / std.time.ns_per_ms;
-    try testing.expect(elapsed_ms < 1_000);
+    try testing.expect(elapsed_ms < 5_000);
 }
 
 // ── tests (in-process integration — Phase 2.1 hardening) ────────────────────
