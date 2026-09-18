@@ -188,7 +188,7 @@ pub fn ecdhZ(private_scalar: [32]u8, peer: PublicKey) EcdhError![32]u8 {
     // with no test able to notice.
     //
     // `timing_safe.eql` promises it instead, which is what the line 35 lines
-    // above already does deliberately — and `scripts/checks/check-ct-compare.py` now
+    // above already does deliberately — and `scripts/check-ct-compare.py` now
     // pins the call so it cannot be swapped back unnoticed.
     if (std.crypto.timing_safe.eql([32]u8, private_scalar, [_]u8{0} ** 32)) return error.InvalidScalar;
     const point = try peer.toPoint();

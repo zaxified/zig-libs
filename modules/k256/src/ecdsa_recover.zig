@@ -91,7 +91,7 @@ fn rfc6979Nonce(privkey: [32]u8, hash32: [32]u8) Scalar {
 
     while (true) {
         HmacSha256.create(&v, &v, &k);
-        // CONSTANT-TIME NOTE (measured, `scripts/checks/ctgrind.sh --stacks k256`,
+        // CONSTANT-TIME NOTE (measured, `scripts/ctgrind.sh --stacks k256`,
         // target `ecdsa`): these two lines are the only branches on this
         // module's path that are neither an input/output validation nor the
         // trailing `rejectIdentity`. `Scalar.fromBytes` branches on the DRBG

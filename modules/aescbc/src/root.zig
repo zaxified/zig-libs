@@ -156,7 +156,7 @@ pub fn padPkcs7(msg: []const u8, out: []u8) error{BufferTooSmall}!usize {
 /// returning `InvalidPadding`. Returns the unpadded length on success.
 ///
 /// ⭐ MEASURED, not reviewed (`src/ctgrind_harness.zig`, target `pkcs7`; the
-/// row is pinned in `scripts/checks/ctgrind-expected.tsv`). With the whole padded
+/// row is pinned in `scripts/ctgrind-expected.tsv`). With the whole padded
 /// buffer marked undefined, memcheck reports ONE context in this file, at the
 /// `if (invalid != 0)` below — the accept/reject decision this function returns
 /// to its caller anyway. The scan loop contributes none, so there is no early

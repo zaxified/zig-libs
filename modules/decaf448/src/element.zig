@@ -253,7 +253,7 @@ pub const Element = struct {
     /// union, nothing for a caller to branch on. Confirmed by measurement,
     /// not by reading, and the measurement is a committed program:
     /// `ctgrind_harness.zig` in this directory, run by
-    /// `../../../scripts/checks/ctgrind.sh decaf448`. With the scalar marked
+    /// `../../../scripts/ctgrind.sh decaf448`. With the scalar marked
     /// `MAKE_MEM_UNDEFINED` it reports **0 contexts** naming any
     /// decaf448/ed448 source (out of 6 total, all inside the harness's own
     /// non-constant-time formatter — the propagation witness that makes

@@ -498,7 +498,7 @@ inline fn mulRowAmd64(tp: [*]u64, vp: [*]const u64, rem: usize, grp: usize, x: u
 // `L` the loops fully unroll and LLVM recovers `smask ∈ {0, ~0}` and hoists
 // pass 2 behind a branch on the secret borrow — measured. `n` is a runtime
 // slice length here, this function measures 0 contexts under
-// `scripts/checks/ctgrind.sh montint` (target `asmcore`), and that measurement is the
+// `scripts/ctgrind.sh montint` (target `asmcore`), and that measurement is the
 // only reason it goes unlaundered. If it ever reads non-zero, add the barrier.
 fn condSub(z: []u64, top: u64, m: []const u64) void {
     // Pass 1: borrow of z - m (value untouched).
