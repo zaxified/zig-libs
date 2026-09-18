@@ -80,8 +80,15 @@ permissions:
 #
 # ⚠ Deliberately keyed on the REF, not on the workflow alone: a tag run and a
 # main-push run test different things and must not cancel each other.
+#
+# ⚠ AND ON THE EVENT (2026-09-18). A dispatch over `main` has the push's ref,
+# so it cancelled the push run it was started beside -- observed on e81bba41.
+# That left the commit with no green push run, which is exactly what
+# `tag.sh` asks for, while CONVENTIONS §8 recommends that very dispatch right
+# before a tag. Two pushes still cancel each other, which stamps make safe:
+# the later run finds the earlier commit's modules unstamped and runs them.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 # Linux-only: several modules (procnet, rawsock, netlink, wireguard, …) are
