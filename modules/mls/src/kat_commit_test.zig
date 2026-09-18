@@ -508,8 +508,10 @@ fn replay(gpa: std.mem.Allocator, sa: std.mem.Allocator, obj: std.json.ObjectMap
 }
 
 /// Commit from a group state produced by another implementation, add a new
-/// member, and require the joiner to derive the committer's epoch.
-fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed: u8) !void {
+/// member, and require the joiner to derive the committer's epoch. Returns
+/// the replayed state's tree size (before the Commit), so a caller that
+/// wants to assert on the tree does not have to replay the session again.
+fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed: u8) !usize {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
@@ -582,6 +584,7 @@ fn commitFromReplayedState(gpa: std.mem.Allocator, obj: std.json.ObjectMap, seed
         try g.processCommit(.{ .commit_msg = c3.commit, .external_psks = replayed.psks });
         try testing.expectEqualSlices(u8, &g.epochAuthenticator(), &joined.epochAuthenticator());
     }
+    return before_size;
 }
 
 test "passive-client-handling-commit.json: commit from each replayed session's final state and land a new member in the same epoch" {
@@ -590,7 +593,7 @@ test "passive-client-handling-commit.json: commit from each replayed session's f
 
     var runs: usize = 0;
     for (parsed.value.array.items, 0..) |entry, i| {
-        commitFromReplayedState(testing.allocator, entry.object, @intCast(0x30 + i)) catch |err| {
+        _ = commitFromReplayedState(testing.allocator, entry.object, @intCast(0x30 + i)) catch |err| {
             std.debug.print("commit-from-replay [handling-commit] entry {d}: {s}\n", .{ i, @errorName(err) });
             return err;
         };
@@ -610,15 +613,10 @@ test "passive-client-random.json: commit from the 200-Commit session's final sta
     // leaves and deep filtered direct paths that no hand-built group
     // reaches. Generating an UpdatePath over it exercises the §4.1.2 filter
     // and the copath resolutions at a scale the synthetic tests cannot.
-    var g_before: usize = 0;
-    {
-        var scratch = std.heap.ArenaAllocator.init(testing.allocator);
-        defer scratch.deinit();
-        var replayed = try replay(testing.allocator, scratch.allocator(), items[0].object);
-        defer replayed.g.deinit();
-        g_before = replayed.g.treeSize();
-    }
+    //
+    // The tree size comes back from the same replay the Commit runs on. It
+    // used to come from a separate replay of all 200 Commits first -- the
+    // same state computed twice, half of this test's ~30 s in Debug.
+    const g_before = try commitFromReplayedState(testing.allocator, items[0].object, 0x91);
     try testing.expect(g_before >= 16);
-
-    try commitFromReplayedState(testing.allocator, items[0].object, 0x91);
 }
