@@ -174,19 +174,15 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
         le(privkey),    memImage(d),
     };
 
-    std.debug.print("\n=== STACKPROBE k256 G2 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
-
     paint();
     const inn = callInnocent(hash);
     std.mem.doNotOptimizeAway(&inn);
     const neg = scan(&needles);
-    print("NEG control (sha256 of public data)", neg);
 
     paint();
     const lk = callLeaky(k_be);
     std.mem.doNotOptimizeAway(&lk);
     const pos = scan(&needles);
-    print("POS control (nonce parked in a local)", pos);
 
     var total: [needle_count]usize = @splat(0);
     var reps: [5]usize = undefined;
@@ -202,13 +198,22 @@ test "STACKPROBE (A1 G2): no RFC 6979 nonce or key residue on the dead stack aft
         }
         r.* = sum;
     }
-    print("ecdsa_recover.sign, summed over 5 repeats", total);
-    std.debug.print("  all-needle residue per repeat: {any}\n", .{reps});
 
     paint();
     const sd = callSign(privkey, hash);
     std.mem.doNotOptimizeAway(&sd);
-    std.debug.print("  stack bytes left non-paint below the call (burn included): {d}\n", .{dirtyDepth()});
+    const depth = dirtyDepth();
+
+    // Printed only when an assertion below fails: the lane treats stderr from
+    // a passing test as a FAIL (scripts/lib/test-lib.sh).
+    errdefer {
+        std.debug.print("\n=== STACKPROBE k256 G2 ({t}, window {d} KiB) ===\n", .{ builtin.mode, WINDOW / 1024 });
+        print("NEG control (sha256 of public data)", neg);
+        print("POS control (nonce parked in a local)", pos);
+        print("ecdsa_recover.sign, summed over 5 repeats", total);
+        std.debug.print("  all-needle residue per repeat: {any}\n", .{reps});
+        std.debug.print("  stack bytes left non-paint below the call (burn included): {d}\n", .{depth});
+    }
 
     for (neg) |h| try std.testing.expectEqual(@as(usize, 0), h);
     try std.testing.expect(pos[0] >= 1); // the scan can see a parked nonce
@@ -283,7 +288,7 @@ test "STACKPROBE (A1 R1): no scalar residue on the dead stack after Secp256k1.mu
     paint();
     std.mem.doNotOptimizeAway(callMul(p, s));
     const depth = dirtyDepth();
-    std.debug.print("\n=== STACKPROBE k256 R1 mul ({t}) NEG={d} POS={d} BE={d} LE={d} (5 calls each), non-paint below the call {d} B ===\n", .{ builtin.mode, neg, pos, be_hits, le_hits, depth });
+    errdefer std.debug.print("\n=== STACKPROBE k256 R1 mul ({t}) NEG={d} POS={d} BE={d} LE={d} (5 calls each), non-paint below the call {d} B ===\n", .{ builtin.mode, neg, pos, be_hits, le_hits, depth });
 
     try std.testing.expectEqual(@as(usize, 0), neg);
     try std.testing.expect(pos >= 1);
