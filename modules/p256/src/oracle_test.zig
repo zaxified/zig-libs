@@ -174,6 +174,16 @@ test "GATED differential: group.combMulBaseFast(k)·G == portable ladder + std" 
     }
 }
 
+// Debug: 12.8 s for 500 draws isolated, nearly all of it std's unoptimized
+// Debug `basePoint.mul` (the same cost the differential above was scaled
+// for). The property is a RATE -- a table with one window dropped must
+// disagree on ~15/16 of scalars -- and a rate needs a sample, not 500 of
+// them: 60 draws at the same >80% threshold (48; expected ~56, fixed PRNG
+// seed, so deterministic) still fail on a harness that could not see the
+// corruption. ReleaseFast/ReleaseSafe/ReleaseSmall keep 500.
+const comb_control_iters: usize = if (builtin.mode == .Debug) 60 else 500;
+const comb_control_min_disagree: usize = comb_control_iters * 4 / 5;
+
 test "comb positive control: a corrupted table DISAGREES with std (harness has teeth)" {
     if (!gate.fast_scalarmul_implemented) return error.SkipZigTest; // core not filled
 
@@ -189,7 +199,7 @@ test "comb positive control: a corrupted table DISAGREES with std (harness has t
     const rand = prng.random();
     var disagreements: usize = 0;
     var i: usize = 0;
-    while (i < 500) : (i += 1) {
+    while (i < comb_control_iters) : (i += 1) {
         var kb: [32]u8 = undefined;
         rand.bytes(&kb);
         const sp = StdCurve.basePoint.mul(kb, .big) catch continue;
@@ -198,7 +208,7 @@ test "comb positive control: a corrupted table DISAGREES with std (harness has t
         const sa = sp.affineCoordinates();
         if (!std.mem.eql(u8, &ka.x.toBytes(.big), &sa.x.toBytes(.big))) disagreements += 1;
     }
-    try std.testing.expect(disagreements > 400);
+    try std.testing.expect(disagreements > comb_control_min_disagree);
 }
 
 test "GATED differential: group.mulCtWindowed == portable CT ladder" {
@@ -218,6 +228,14 @@ test "GATED differential: group.mulCtWindowed == portable CT ladder" {
         try std.testing.expect(want.equivalent(got));
     }
 }
+
+// Debug: 6.5 s for 256 draws isolated, again std's Debug `basePoint.mul`.
+// Only claim 2 below (the redirect changes no answer) is sampled; claim 1,
+// the redirect predicate itself, is asserted unconditionally in every mode,
+// and it is what a deleted redirect breaks. 40 draws in Debug still put the
+// module's `mul`, its comb and std on the same random points;
+// ReleaseFast/ReleaseSafe/ReleaseSmall keep 256.
+const redirect_std_iters: usize = if (builtin.mode == .Debug) 40 else 256;
 
 test "basePoint.mul takes the comb redirect, and the redirect changes no answer" {
     // Two separate claims, and it is worth being precise about which is which
@@ -258,7 +276,7 @@ test "basePoint.mul takes the comb redirect, and the redirect changes no answer"
     const rand = prng.random();
 
     var i: usize = 0;
-    while (i < 256) : (i += 1) {
+    while (i < redirect_std_iters) : (i += 1) {
         var s: [32]u8 = undefined;
         rand.bytes(&s);
         s[0] &= 0x7f; // stay inside the group order for both implementations
