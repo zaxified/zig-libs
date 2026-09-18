@@ -1433,7 +1433,9 @@ test "A1 F3: keyGen and sign leave no WOTS+ chain value or seed on the dead stac
 
     var needles = F3Needles.init(std.testing.allocator);
     defer needles.deinit();
-    std.debug.print("\n=== A1 F3 dead-stack probe ({t}, window {d} KiB) ===\n", .{ mode, f3_window / 1024 });
+    // Every number below is printed only when an assertion fails: the lane
+    // treats stderr from a passing test as a FAIL (scripts/lib/test-lib.sh).
+    errdefer std.debug.print("\n=== A1 F3 dead-stack probe ({t}, window {d} KiB) ===\n", .{ mode, f3_window / 1024 });
 
     try f3BuildNeedles(&needles, null);
     var adrs = Adrs{};
@@ -1447,7 +1449,7 @@ test "A1 F3: keyGen and sign leave no WOTS+ chain value or seed on the dead stac
     f3Paint();
     f3Leaky();
     const pos = f3Scan(&needles);
-    std.debug.print("  NEG control {any}, POS control {any}\n", .{ neg, pos });
+    errdefer std.debug.print("  NEG control {any}, POS control {any}\n", .{ neg, pos });
     for (neg) |x| try std.testing.expectEqual(@as(usize, 0), x);
     try std.testing.expect(pos[@intFromEnum(F3Kind.other_leaf)] >= 1); // the scan can see a parked chain value
 
@@ -1459,8 +1461,11 @@ test "A1 F3: keyGen and sign leave no WOTS+ chain value or seed on the dead stac
     }
     f3Paint();
     f3KeyGen();
-    std.debug.print("  keyGen, 3 calls: used_leaf={d} other_leaf={d} seed={d}; dirty below the call {d} B\n", .{ total[0], total[1], total[2], f3DirtyDepth() });
-    for (total) |x| try std.testing.expectEqual(@as(usize, 0), x);
+    {
+        const dirty = f3DirtyDepth();
+        errdefer std.debug.print("  keyGen, 3 calls: used_leaf={d} other_leaf={d} seed={d}; dirty below the call {d} B\n", .{ total[0], total[1], total[2], dirty });
+        for (total) |x| try std.testing.expectEqual(@as(usize, 0), x);
+    }
 
     // Leaf 0 is the plain sequential path; at leaf 5 `sign` first rebuilds
     // the traversal state for an index it did not track (`rebuildStateTo`).
@@ -1483,7 +1488,8 @@ test "A1 F3: keyGen and sign leave no WOTS+ chain value or seed on the dead stac
         f3_kp.sk.idx = idx;
         f3Paint();
         f3Sign();
-        std.debug.print("  sign+zeroize at leaf {d}, 3 calls: used_leaf={d} other_leaf={d} seed={d}; dirty below the call {d} B\n", .{ idx, total[0], total[1], total[2], f3DirtyDepth() });
+        const dirty = f3DirtyDepth();
+        errdefer std.debug.print("  sign+zeroize at leaf {d}, 3 calls: used_leaf={d} other_leaf={d} seed={d}; dirty below the call {d} B\n", .{ idx, total[0], total[1], total[2], dirty });
         for (total) |x| try std.testing.expectEqual(@as(usize, 0), x);
     }
 }
