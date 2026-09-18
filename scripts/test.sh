@@ -1065,7 +1065,7 @@ capability_check() {
     # would be passwordless root, not a narrow grant: `zig build` executes
     # build.zig, i.e. arbitrary code, as root.
     local zig_abs; zig_abs="$(command -v zig 2>/dev/null || echo zig)"
-    _cap_wants tc && _CAP_GAP_MODS="$_CAP_GAP_MODS tc"; gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
+    _cap_wants tc && { _CAP_GAP_MODS="$_CAP_GAP_MODS tc"; gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root"); }
 
     # ⭐ THE EXAMPLES' OWN PEERS, and they are a different class from everything
     # above. The gate RUNS each example (it only compiled them until
