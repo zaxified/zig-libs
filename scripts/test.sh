@@ -265,7 +265,27 @@ stamps_lane_key() {
         case "$a" in -Dgroup=* | -Dmodule=*) ;; *) key="$key $a" ;; esac
     done
     [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && key="$key DRY"
-    printf '%s %s' "$key" "$(uname -m)"
+    printf '%s %s %s' "$key" "$(uname -m)" "$(native_target_id)"
+}
+
+# What `native` resolves to on this machine, as Zig sees it: the triple (OS
+# and glibc versions included) plus the CPU model and its feature list, hashed.
+# In the lane key because code picks paths by CPU feature (poly1305 AVX-512 /
+# AVX2 lanes; montint, k256, p256 asm on adx+bmi2), and GitHub's amd64 pool
+# mixes an EPYC without AVX-512 and a Xeon with it -- a stamp from one must not
+# stand in for the other (audit 2026-09-18). Read once per run.
+_ZL_NATIVE_ID=""
+native_target_id() {
+    if [[ -z "$_ZL_NATIVE_ID" ]]; then
+        local sec
+        sec="$(zig targets 2>/dev/null | awk '/^    \.native = \.\{/{on=1} on')"
+        if [[ -z "$sec" ]]; then
+            echo "test.sh: 'zig targets' gave no native section -- cannot key stamps to this CPU" >&2
+            exit 1
+        fi
+        _ZL_NATIVE_ID="native:$(printf '%s' "$sec" | sha256sum | cut -c1-12)"
+    fi
+    printf '%s' "$_ZL_NATIVE_ID"
 }
 
 # Prints the modules of $1 that have no stamp for lane $2 at their current
