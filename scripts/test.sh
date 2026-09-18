@@ -546,6 +546,7 @@ ZL_RUN_EXAMPLES=1
 run_modules() {
     local mods="$1"
     [[ -z "${mods// /}" ]] && return 0
+    CAP_MODS="$mods" capability_check
 
     local -a rest=() netns=() live=()
     local m
@@ -850,10 +851,26 @@ changed_files() {
 # passwordless sudo" advice: the one gap that genuinely needs root is closed by
 # running a single command under sudo interactively, not by widening sudoers.
 _CAP_CHECKED=""
+# The modules about to run, space-separated; empty = the whole collection.
+# Each probe below asks `_cap_wants <module>...` first, so a run that touches
+# none of a peer's modules does not pay to look for it -- `podman info` alone
+# is 1.7 s, and the full probe 2.9 s, on every local run before this.
+CAP_MODS=""
+_cap_wants() {
+    [[ -z "${CAP_MODS// /}" ]] && return 0
+    local m
+    for m in "$@"; do
+        case " $CAP_MODS " in *" $m "*) return 0 ;; esac
+    done
+    return 1
+}
 capability_check() {
-    # `changed` can delegate to `all`; report once per invocation, not twice.
-    [[ -n "$_CAP_CHECKED" ]] && return 0
-    _CAP_CHECKED=1
+    # Once per module set: `changed` can delegate to `all`, and `run_modules`
+    # probes again for its own set. A probe of everything (empty set) covers
+    # any later, narrower call.
+    [[ "$_CAP_CHECKED" == "all" ]] && return 0
+    [[ -n "$_CAP_CHECKED" && "$_CAP_CHECKED" == "$CAP_MODS" ]] && return 0
+    _CAP_CHECKED="${CAP_MODS:-all}"
     # A dry run starts nothing that needs a peer, and CI skips installing them
     # for it -- the gaps it would list are the dry run's own doing.
     if [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]]; then
@@ -882,7 +899,10 @@ capability_check() {
     fi
     local userns_persist="echo '$userns_key' | sudo tee /etc/sysctl.d/60-zig-libs-userns.conf >/dev/null && sudo sysctl --system >/dev/null"
 
-    if ! { command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; }; then
+    # shellcheck disable=SC2086 # word-split on purpose: a module list
+    if ! _cap_wants $NETNS_MODULES; then
+        :
+    elif ! { command -v unshare >/dev/null 2>&1 && unshare -rn true >/dev/null 2>&1; }; then
         local fix
         if [[ -n "$userns_key" ]]; then
             fix="$userns_persist"
@@ -896,7 +916,9 @@ capability_check() {
         gaps+=("userns enabled at runtime only (reverts on reboot)|nothing today; after a reboot the $NETNS_MODULES gap returns|$userns_persist")
     fi
 
-    if ! command -v podman >/dev/null 2>&1; then
+    if ! _cap_wants opcua; then
+        :
+    elif ! command -v podman >/dev/null 2>&1; then
         gaps+=("podman missing|opcua live server-interop tests skip|sudo apt install podman")
     else
         if ! podman image exists docker.io/open62541/open62541:latest 2>/dev/null; then
@@ -940,7 +962,9 @@ capability_check() {
     # and a frozen anchor that nobody can refresh is how this repo lost one
     # before. wolfSSL is the DTLS 1.3 peer because OpenSSL 3.5.5 and GnuTLS
     # 3.8.12 have no DTLS 1.3 at all.
-    if ! command -v cc >/dev/null 2>&1; then
+    if ! _cap_wants dtls; then
+        :
+    elif ! command -v cc >/dev/null 2>&1; then
         gaps+=("no C compiler (cc)|'zig build interop-dtls' cannot re-take the wolfSSL transcript (test-dtls replays it hermetically)|sudo apt install build-essential")
     elif [[ ! -e /usr/include/wolfssl/ssl.h ]]; then
         gaps+=("wolfSSL headers missing|'zig build interop-dtls' cannot re-take the wolfSSL transcript (test-dtls replays it hermetically)|sudo apt install libwolfssl-dev")
@@ -959,7 +983,7 @@ capability_check() {
     [[ -x /usr/sbin/sshd ]] || ssh_missing+=("sshd")
     command -v ssh >/dev/null 2>&1 || ssh_missing+=("ssh")
     command -v ssh-keygen >/dev/null 2>&1 || ssh_missing+=("ssh-keygen")
-    if [[ ${#ssh_missing[@]} -gt 0 ]]; then
+    if _cap_wants ssh && [[ ${#ssh_missing[@]} -gt 0 ]]; then
         gaps+=("OpenSSH missing: ${ssh_missing[*]}|ssh live interop tests skip — the only ones that prove the transport against a real peer rather than against our own encoder|sudo apt install openssh-server openssh-client")
     fi
 
@@ -971,6 +995,7 @@ capability_check() {
     # both, so what had moved was the oracle. Report the version, not just its
     # presence, because "jinja2 is installed" is not the question.
     local golden_j2 live_j2
+    if _cap_wants jinja; then
     golden_j2="$(sed -n 's/.*"jinja2"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
         modules/jinja/src/testdata/golden.json 2>/dev/null | head -1)"
     live_j2="$(python3 -c 'import jinja2; print(jinja2.__version__)' 2>/dev/null)"
@@ -979,18 +1004,19 @@ capability_check() {
     elif [[ -n "$golden_j2" && "$live_j2" != "$golden_j2" ]]; then
         gaps+=("jinja2 $live_j2 != golden's $golden_j2|the live oracle is not the one the committed golden was generated from, so a red jinja case may be drift rather than a defect|pip install 'jinja2==$golden_j2'")
     fi
+    fi
 
     # opcua's asyncua interop drives a Python client; the interpreter needs
     # asyncua + cryptography. This is a separate gate from podman — the
     # container-backed tests pass without it.
     local opcua_py="${OPCUA_PYTHON:-python3}"
-    if ! "$opcua_py" -c 'import asyncua, cryptography' >/dev/null 2>&1; then
+    if _cap_wants opcua && ! "$opcua_py" -c 'import asyncua, cryptography' >/dev/null 2>&1; then
         gaps+=("python lacks asyncua/cryptography|1 opcua live asyncua-interop test skips|python3 -m venv ~/.cache/zig-libs-opcua && ~/.cache/zig-libs-opcua/bin/pip -q install asyncua cryptography && echo 'export OPCUA_PYTHON=~/.cache/zig-libs-opcua/bin/python3' >> ~/.bashrc")
     fi
 
     # imap's live interop drives a real IMAP server (pymap -- an INDEPENDENT
     # implementation, not the one imap was ported from, which is the point).
-    if [[ ! -x "${IMAP_PYMAP:-$HOME/.cache/zig-libs-imap/bin/pymap}" ]]; then
+    if _cap_wants imap && [[ ! -x "${IMAP_PYMAP:-$HOME/.cache/zig-libs-imap/bin/pymap}" ]]; then
         gaps+=("no pymap IMAP server|1 imap live interop test skips (the only test that proves the client's SEQUENCING, not just its parsing)|python3 -m venv ~/.cache/zig-libs-imap && ~/.cache/zig-libs-imap/bin/pip -q install pymap")
     fi
 
@@ -1035,12 +1061,14 @@ capability_check() {
     # test then failed on the missing import rather than skipping.
     local oracle
     for oracle in \
-        "grpc, google.protobuf|grpcio protobuf|zig-libs-grpc|'zig build interop-grpc' cannot re-take the wire recording against a real grpcio peer (test-grpc itself is hermetic since 2026-09-06 and does not need this)" \
-        "sympy|sympy||'zig build interop-poseidon' cannot re-take the MDS subspace-trail transcript (test-poseidon replays it hermetically since 2026-09-06)" \
-        "brotli|brotli||'zig build interop-brotli' cannot re-bless the reference streams against google/brotli (test-brotli replays them hermetically since 2026-09-06)" \
-        "google.protobuf|protobuf||'zig build interop-protobuf' cannot re-capture against the upstream Python runtime (test-protobuf replays the capture hermetically since 2026-09-06)"
+        "grpc|grpc, google.protobuf|grpcio protobuf|zig-libs-grpc|'zig build interop-grpc' cannot re-take the wire recording against a real grpcio peer (test-grpc itself is hermetic since 2026-09-06 and does not need this)" \
+        "poseidon|sympy|sympy||'zig build interop-poseidon' cannot re-take the MDS subspace-trail transcript (test-poseidon replays it hermetically since 2026-09-06)" \
+        "brotli|brotli|brotli||'zig build interop-brotli' cannot re-bless the reference streams against google/brotli (test-brotli replays them hermetically since 2026-09-06)" \
+        "protobuf|google.protobuf|protobuf||'zig build interop-protobuf' cannot re-capture against the upstream Python runtime (test-protobuf replays the capture hermetically since 2026-09-06)"
     do
-        local mod="${oracle%%|*}" rest2="${oracle#*|}"
+        local owner="${oracle%%|*}" rest2="${oracle#*|}"
+        _cap_wants "$owner" || continue
+        local mod="${rest2%%|*}"; rest2="${rest2#*|}"
         local pkg="${rest2%%|*}"; rest2="${rest2#*|}"
         local venv="${rest2%%|*}" cost="${rest2#*|}"
         local py=python3 fix="pip install $pkg"
@@ -1062,7 +1090,7 @@ capability_check() {
     # contains one of our groups. The kernel default is the EMPTY range `1 0`
     # (start > end), so the tests get PermissionDenied and skip. Reading the
     # sysctl says so without needing to open a socket.
-    if [[ -r /proc/sys/net/ipv4/ping_group_range ]]; then
+    if _cap_wants icmp && [[ -r /proc/sys/net/ipv4/ping_group_range ]]; then
         local pgr_lo pgr_hi
         read -r pgr_lo pgr_hi < /proc/sys/net/ipv4/ping_group_range
         if [[ -n "$pgr_hi" ]] && (( pgr_lo > pgr_hi )); then
@@ -1075,7 +1103,7 @@ capability_check() {
     # this parser, which makes it the most valuable single test the module has
     # and the easiest to lose, since the whole suite collapses to one skip.
     local yaml_suite="${ZIG_LIBS_YAML_SUITE:-$HOME/.cache/zig-libs-yaml/yaml-test-suite-data}"
-    if [[ ! -d "$yaml_suite" ]]; then
+    if _cap_wants yaml && [[ ! -d "$yaml_suite" ]]; then
         gaps+=("no yaml-test-suite checkout|the entire yaml conformance suite collapses into 1 skipped test — the module is then checked only against itself|git clone -b data --depth 1 https://github.com/yaml/yaml-test-suite ~/.cache/zig-libs-yaml/yaml-test-suite-data")
     fi
 
@@ -1094,7 +1122,7 @@ capability_check() {
     # would be passwordless root, not a narrow grant: `zig build` executes
     # build.zig, i.e. arbitrary code, as root.
     local zig_abs; zig_abs="$(command -v zig 2>/dev/null || echo zig)"
-    gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
+    _cap_wants tc && gaps+=("tc RTM_NEWACTION needs real root|tc action tests skip (the rest of tc runs)|sudo unshare -n $zig_abs build test-tc --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root")
 
     # ⭐ THE EXAMPLES' OWN PEERS, and they are a different class from everything
     # above. The gate RUNS each example (it only compiled them until
@@ -1115,9 +1143,11 @@ capability_check() {
     # example with a third-party judge should cost one line, not a rediscovery.
     local peer
     for peer in \
-        "websockets|websockets==15.0.1|the websocket example, and with it the gate's run-examples step and the whole lane"
+        "websocket|websockets|websockets==15.0.1|the websocket example, and with it the gate's run-examples step and the whole lane"
     do
-        local imp="${peer%%|*}" rest3="${peer#*|}"
+        local powner="${peer%%|*}" rest3="${peer#*|}"
+        _cap_wants "$powner" || continue
+        local imp="${rest3%%|*}"; rest3="${rest3#*|}"
         local spec="${rest3%%|*}" what_breaks="${rest3#*|}"
         python3 -c "import $imp" >/dev/null 2>&1 \
             || blockers+=("python lacks $imp|$what_breaks|pip install '$spec'")
@@ -1198,7 +1228,7 @@ cmd_changed() {
         echo "changed: no changed/staged/untracked files$( [[ -n "$base_ref" ]] && echo " vs $base_ref" ) — checking stamps only"
     fi
 
-    capability_check
+    # capability_check runs in run_modules, for the modules actually run.
 
     local trigger_all=0 trigger_catalog=0 trigger_changelog=0
     local trigger_docs=0
@@ -1801,7 +1831,6 @@ cmd_interop() {
 # nothing.
 cmd_modules() {
     set_extra_args "$@"
-    capability_check
     graph_load
     local lane_mods todo lane
     lane_mods="$(lane_modules)"
@@ -1814,6 +1843,7 @@ cmd_modules() {
         return 0
     fi
     stamps_narrow "$todo" "$lane_mods"
+    CAP_MODS="$todo" capability_check
     step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     ZL_RUN_EXAMPLES=0 run_modules "$todo"
@@ -1827,7 +1857,6 @@ cmd_modules() {
 # example's Python peer), and this is the lane that would die without it.
 cmd_examples() {
     set_extra_args "$@"
-    capability_check
     graph_load
     local lane_mods todo lane
     lane_mods="$(lane_modules)"
@@ -1840,6 +1869,7 @@ cmd_examples() {
         return 0
     fi
     stamps_narrow "$todo" "$lane_mods"
+    CAP_MODS="$todo" capability_check
     step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     run_examples_for "$todo"
     stamps_record "$todo" "$lane"
