@@ -9,7 +9,8 @@ a `third-party attribution` file, which is where the obligation lives.
 ## Design & invariants
 - **Two layers, one record model:** both emit `LineSlice { bytes, byte_offset, unbalanced_quote }`.
   In-memory `LineIterator`/`splitFields` (standalone, caller already holds the bytes) and streaming
-  `StreamReader` (file → chunks → records, bounded memory — peak is chunk size, not file size).
+  `StreamReader` (file → chunks → records, bounded memory — peak is `max_record_len + chunk_size`,
+  twice the chunk size by default, not file size).
   `StreamReader` composes a record-aligned `ChunkReader` (file → chunks, each ending on the chunk's
   last `\n`) with a per-chunk `LineIterator`; because every chunk ends on `\n`, no record spans a
   chunk boundary, so offsets compose cleanly across chunks.
@@ -54,9 +55,9 @@ a `third-party attribution` file, which is where the obligation lives.
 
 ## Threat model / out of scope
 Not a security boundary — a codec for cooperative/trusted input. Resource bound: bounded memory via
-chunked reads (peak = chunk size), so an arbitrarily large file cannot exhaust memory just by being
-long; a single pathologically long *line* (no `\n` for the whole chunk window) is the one case not
-independently bounded beyond the chunk buffer sizing the caller picks. Failure mode for malformed
+chunked reads (peak = `max_record_len + chunk_size`, `ChunkReader.capacityBound()`), so an
+arbitrarily large file cannot exhaust memory just by being long; a single pathologically long *line*
+(no `\n`) is refused with `error.RecordTooLong` once it reaches `max_record_len`. Failure mode for malformed
 quoting is a flagged field (`unbalanced_quote`), never a hang or OOB read.
 
 ## Verification

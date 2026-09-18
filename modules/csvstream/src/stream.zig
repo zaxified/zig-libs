@@ -3,8 +3,9 @@
 //! memory, yielding CSV records with their ABSOLUTE file byte offsets.
 //!
 //! `ChunkReader` slices a file into record-aligned chunks (each ending on the
-//! last '\n' in its window) so peak memory is bounded by the chunk size, not
-//! the file size. `StreamReader` composes `ChunkReader` with an in-memory
+//! last '\n' in its window) so peak memory is bounded by
+//! `max_record_len + chunk_size` (`ChunkReader.capacityBound()`), not the
+//! file size. `StreamReader` composes `ChunkReader` with an in-memory
 //! `LineIterator` per chunk so a caller pulls one record at a time and every
 //! record carries `chunk_start_in_file + record_start_in_chunk` — the exact
 //! source byte offset, so a consumer can seek back to the original bytes.
@@ -71,9 +72,10 @@ pub const ChunkReader = struct {
         return initMax(io, alloc, file, chunk_size, 0);
     }
 
-    /// `max_record_len` of 0 means "the resolved chunk size" — the bound the
-    /// README and SPEC always claimed ("peak is the chunk size, not the file
-    /// size"). It used to be `@max(resolved_chunk, default_chunk_size)`, a
+    /// `max_record_len` of 0 means "the resolved chunk size". The README and
+    /// SPEC used to call the chunk size the peak; the buffer also carries the
+    /// previous chunk's partial record, so the peak is `capacityBound()`,
+    /// twice the chunk size by default. It used to be `@max(resolved_chunk, default_chunk_size)`, a
     /// **10 MiB floor the caller could not lower**: asking for 1 KiB chunks
     /// still permitted a 1 MiB allocation with no error, and
     /// `StreamReader.Options` exposed no knob at all
@@ -99,6 +101,14 @@ pub const ChunkReader = struct {
             .chunk_start_in_file = 0,
             .max_record_len = if (max_record_len == 0) resolved_chunk else max_record_len,
         };
+    }
+
+    /// The most the internal buffer ever holds: a residual shorter than
+    /// `max_record_len` plus one read of at most `chunk_size`. This, not the
+    /// chunk size alone, is the reader's memory bound -- `max_record_len`
+    /// defaults to the chunk size, so by default it is twice the chunk size.
+    pub fn capacityBound(self: *const ChunkReader) usize {
+        return self.max_record_len +| self.chunk_size;
     }
 
     pub fn deinit(self: *ChunkReader) void {
@@ -154,7 +164,19 @@ pub const ChunkReader = struct {
             // instead of growing the buffer to the entire file size.
             if (self.buffer.items.len >= self.max_record_len) return error.RecordTooLong;
             const want_cap: usize = @intCast(@min(@as(u64, self.chunk_size), hint));
-            try self.buffer.ensureUnusedCapacity(want_cap);
+            // Grow geometrically, but never past `capacity_bound`: the buffer
+            // holds at most a residual (< max_record_len, or the check above
+            // fired) plus one read (<= chunk_size). `ensureUnusedCapacity`
+            // grew ~1.5x past what the reads needed, so the documented
+            // memory bound was exceeded by the allocator's growth factor
+            // (measured 2026-09-17: 15,728,768 B of capacity under a
+            // 10,485,760 B cap). The READ sizes are unchanged, so the chunks
+            // this returns are byte-for-byte what they were.
+            const need = self.buffer.items.len + want_cap;
+            if (need > self.buffer.capacity) {
+                const grown = @max(need, self.buffer.capacity +| self.buffer.capacity / 2);
+                try self.buffer.ensureTotalCapacityPrecise(@min(grown, self.capacityBound()));
+            }
             const dest = self.buffer.unusedCapacitySlice();
             const want = @min(dest.len, want_cap);
             // Positional read at the running file offset (`bytes_read`). Zig
@@ -201,8 +223,8 @@ pub const StreamReader = struct {
         /// Target chunk size in bytes (0 = `default_chunk_size`).
         chunk_size: usize = default_chunk_size,
         /// Longest single record this reader will buffer before returning
-        /// `error.RecordTooLong`. 0 = the resolved chunk size, which is what
-        /// "peak memory is the chunk size" means.
+        /// `error.RecordTooLong`. 0 = the resolved chunk size, which makes the
+        /// reader's peak twice the chunk size (`ChunkReader.capacityBound()`).
         max_record_len: usize = 0,
     };
 
@@ -248,7 +270,10 @@ pub const StreamReader = struct {
     /// for the `buf`/allocator contract (fields borrow the record's bytes
     /// except for escaped-quote fields, which are allocated from `alloc`) —
     /// the same borrow contract as `next()`'s `LineSlice.bytes` therefore
-    /// applies transitively to the returned field slices.
+    /// applies transitively to the returned field slices. The escaped-quote
+    /// copies are the caller's: pass an arena reset per record, or call
+    /// `next()` and `splitFields` yourself so you hold the record bytes that
+    /// `freeFields` needs.
     pub fn nextFields(self: *StreamReader, buf: [][]const u8, alloc: std.mem.Allocator) !?[][]const u8 {
         return self.nextFieldsOpts(buf, alloc, .{});
     }
@@ -341,6 +366,45 @@ test "ChunkReader: a newline-free record past max_record_len is rejected, not bu
     defer cr.deinit();
     cr.max_record_len = 8; // shrink the cap for a cheap test
     try t.expectError(error.RecordTooLong, cr.nextChunk());
+}
+
+test "ChunkReader: the buffer never outgrows capacityBound, on a pathological or an ordinary input" {
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Newline-free: reads 4 KiB at a time until the cap refuses. The cap is
+    // set one byte past three reads, so the fourth read is the one that
+    // brings the buffer to just under the bound -- where the allocator's own
+    // ~1.5x growth factor used to carry capacity past it (16 384 bytes
+    // needed against a bound of 16 385; checked by restoring the old
+    // `ensureUnusedCapacity`, which fails this test).
+    const flat = try t.allocator.alloc(u8, 64 * 1024);
+    defer t.allocator.free(flat);
+    @memset(flat, 'a');
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "flat.csv", .data = flat });
+    var f = try tmp.dir.openFile(t.io, "flat.csv", .{});
+    defer f.close(t.io);
+    var cr = try ChunkReader.initMax(t.io, t.allocator, f, 4096, 3 * 4096 + 1);
+    defer cr.deinit();
+    try t.expectError(error.RecordTooLong, cr.nextChunk());
+    try t.expect(cr.buffer.capacity <= cr.capacityBound());
+
+    // Ordinary records, each chunk leaving a residual: every chunk still
+    // arrives, and capacity stays under the bound throughout.
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(t.allocator);
+    for (0..2000) |i| try body.print(t.allocator, "row{d},{d}\n", .{ i, i * 7 });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "rows.csv", .data = body.items });
+    var g = try tmp.dir.openFile(t.io, "rows.csv", .{});
+    defer g.close(t.io);
+    var cr2 = try ChunkReader.init(t.io, t.allocator, g, 1000);
+    defer cr2.deinit();
+    var total: usize = 0;
+    while (try cr2.nextChunk()) |c| {
+        total += c.len;
+        try t.expect(cr2.buffer.capacity <= cr2.capacityBound());
+    }
+    try t.expectEqual(body.items.len, total);
 }
 
 test "ChunkReader: tiny chunk_size splits on record boundaries across many chunks" {

@@ -50,8 +50,13 @@ pub const LineIterator = line.LineIterator;
 
 /// Split one record's bytes into fields (RFC 4180 quoting; `quote == 0`
 /// disables quoting). Field slices borrow `line`, except escaped-quote fields
-/// which are allocated from the passed allocator.
+/// which are allocated from the passed allocator — free those with
+/// `freeFields`, or split with an arena.
 pub const splitFields = line.splitFields;
+
+/// Frees the fields a split allocated (the escaped-quote copies) and leaves
+/// the borrowed ones alone.
+pub const freeFields = line.freeFields;
 
 /// `splitFields` with the caller's overflow policy (refuse, the default, or
 /// truncate). See `OverflowPolicy` before choosing `.truncate`.

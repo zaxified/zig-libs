@@ -4,7 +4,9 @@ Streaming RFC 4180 CSV reader that **preserves byte offsets**. Every record
 comes out with the absolute file offset of its first byte, so a consumer can
 seek straight back to the exact source span (drill-down, `--trace`-style source
 locators, error reporting). Streams arbitrarily large files in **bounded
-memory** — peak is `max_record_len` (which defaults to the chunk size), not the file size.
+memory** — the reader's buffer holds at most one partial record (under `max_record_len`) plus
+one chunk, so the peak is `max_record_len + chunk_size` (twice the chunk size by default,
+`ChunkReader.capacityBound()`), not the file size.
 
 - **Model after:** RFC 4180 + byte-offset-preserving streaming.
 - **Platform:** any. **Role:** codec. **Concurrency:** reentrant (no shared

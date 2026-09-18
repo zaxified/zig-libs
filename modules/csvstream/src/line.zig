@@ -45,12 +45,33 @@ pub const SplitOptions = struct {
 /// unescaped to a single quote char.
 /// Fills `buf` with slices that point directly into `line` when no unescaping
 /// is needed, or into alloc-owned copies for fields containing an escaped quote.
+/// Those copies are the caller's to free: `freeFields(line, fields, alloc)`
+/// frees exactly them, or split with an arena and reset it per record.
 /// Returns a sub-slice of `buf` containing only the fields found on the line.
 /// `buf` must be large enough to hold all fields — a record with more fields
 /// than `buf` holds is `error.FieldBufferTooSmall`, never a short row. Use
 /// `splitFieldsOpts` to choose truncation instead; extra capacity is ignored.
 pub fn splitFields(line: []const u8, buf: [][]const u8, delimiter: u8, quote: u8, alloc: std.mem.Allocator) ![][]const u8 {
     return splitFieldsOpts(line, buf, delimiter, quote, alloc, .{});
+}
+
+/// Frees the fields `splitFields`/`splitFieldsOpts` allocated for `line` —
+/// the unescaped copies of fields that held a doubled quote — and nothing
+/// else: every other field borrows `line` and is left alone. `line` and
+/// `alloc` must be the ones the split was given, and `line` must still be
+/// alive (the test is on addresses: a borrowed field lies inside `line`, a
+/// copy cannot). Not needed when `alloc` is an arena the caller resets.
+///
+/// Until 2026-09-18 a caller with a general-purpose allocator had no way to
+/// do this: which fields were copies was visible only to the split's own
+/// error path, and a record with escaped quotes leaked on the success path.
+pub fn freeFields(line: []const u8, fields: []const []const u8, alloc: std.mem.Allocator) void {
+    for (fields) |f| {
+        // Zero-length fields are never copies (a copy holds at least the one
+        // quote it unescaped) and an empty borrowed field at end of record
+        // has the one-past-the-end address, which no range test attributes.
+        if (f.len != 0 and !borrowsFrom(f, line)) alloc.free(f);
+    }
 }
 
 /// `splitFields` with the caller's overflow policy — see `SplitOptions`.
@@ -78,13 +99,12 @@ pub fn splitFieldsOpts(
     // stranded per call, on the module's own default (refusing) policy.
     // Asking the address has no ceiling to exceed and allocates nothing, which
     // is what this path needs — it runs when an allocation has just failed.
-    errdefer for (buf[0..count]) |f| {
-        // A zero-length field is skipped rather than classified: an empty
-        // borrowed field at end-of-record has the one-past-the-end address,
-        // which no range test can attribute. `Allocator.free` is a no-op at
-        // length 0 either way, so nothing is stranded by skipping it.
-        if (f.len != 0 and !borrowsFrom(f, line)) alloc.free(f);
-    };
+    // A zero-length field is skipped rather than classified: an empty
+    // borrowed field at end-of-record has the one-past-the-end address, which
+    // no range test can attribute. `Allocator.free` is a no-op at length 0
+    // either way, so nothing is stranded by skipping it. The same test is the
+    // caller's `freeFields` on the success path.
+    errdefer freeFields(line, buf[0..count], alloc);
     // Loop condition: pos <= line.len (one past end) lets the outer while
     // reach the `if (pos == line.len) break` sentinel for the trailing-field
     // case, avoiding a separate post-loop append.
@@ -857,6 +877,32 @@ test "splitFieldsOpts: .truncate fills the buffer, drops the surplus, and does N
             @intFromPtr(fld.ptr) < @intFromPtr(wide.ptr) + wide.len;
         if (!borrowed) gpa.free(fld);
     }
+}
+
+test "freeFields frees exactly the copies a split made, on the success path, past 64 of them" {
+    // `testing.allocator` is the judge both ways: a copy left behind is a
+    // leak, and a borrowed field handed to `free` is an invalid free. 200
+    // escaped fields also cross the old 64-slot ceiling the error path had
+    // (`9a42db83`), and the unescaped fields between them must stay borrowed.
+    const gpa = std.testing.allocator;
+    var rec: std.ArrayList(u8) = .empty;
+    defer rec.deinit(gpa);
+    for (0..200) |i| {
+        if (i != 0) try rec.append(gpa, ',');
+        if (i % 2 == 0) try rec.appendSlice(gpa, "\"x\"\"y\"") else try rec.appendSlice(gpa, "plain");
+    }
+    var buf: [256][]const u8 = undefined;
+    const got = try splitFields(rec.items, &buf, ',', '"', gpa);
+    try std.testing.expectEqual(@as(usize, 200), got.len);
+    try std.testing.expectEqualStrings("x\"y", got[0]);
+    try std.testing.expectEqualStrings("plain", got[1]);
+    freeFields(rec.items, got, gpa);
+
+    // A record with no escaped quote allocates nothing, and freeing it is a no-op.
+    const plain = "a,\"b,c\",,d";
+    const fields = try splitFields(plain, &buf, ',', '"', gpa);
+    try std.testing.expectEqual(@as(usize, 4), fields.len);
+    freeFields(plain, fields, gpa);
 }
 
 test "splitFieldsOpts: the DEFAULT policy is refusal, so `.{}` is byte-for-byte splitFields" {

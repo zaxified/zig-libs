@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **New `freeFields(line, fields, alloc)`** (additive). A split's
+  escaped-quote fields are copies from `alloc`, and until now a caller with a
+  general-purpose allocator had no way to tell which fields those were: only the
+  split's own error path could. `freeFields` frees exactly the copies and leaves the
+  borrowed fields alone; the error path now uses it too. An arena reset per record
+  remains the other way, and needs nothing. The example now carries a field with a
+  doubled quote, so its leak check covers the allocating path (it did not: `"Alice,
+  A."` has quotes but no doubled one). No existing signature or behaviour changed.
+- **2026-09-18** — **Memory bound: documentation corrected, and made to hold.**
+  README and SPEC said peak memory is the chunk size. `ChunkReader`'s buffer also
+  carries the previous chunk's partial record, so the bound is `max_record_len +
+  chunk_size` (twice the chunk size by default), now `ChunkReader.capacityBound()`.
+  The buffer's growth is capped at that bound; `ensureUnusedCapacity`'s ~1.5x growth
+  could exceed it when a read ended just under it. Read sizes are unchanged, so every
+  chunk is byte-for-byte what it was (checked against `bxp`: its unit tests and all
+  10 dataset regressions, 14 output files identical). The SPEC's "a pathologically
+  long line is not independently bounded" was stale since `RecordTooLong`.
+
 - **2026-09-17** — ⚠ **Memory leak on the error path, attacker-reachable.** The
   F7 cleanup (2026-09-02) recorded which `buf` slots held unescaped copies in a
   fixed `[64]usize`, under an `if (owned_n < owned.len)` guard. The 65th copy

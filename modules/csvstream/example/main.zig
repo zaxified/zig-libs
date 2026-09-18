@@ -18,7 +18,7 @@ const csvstream = @import("csvstream");
 const csv_data =
     \\name,age,score,active
     \\"Alice, A.",30,92.5,true
-    \\Bob,25,88.25,false
+    \\"Bob ""Bobby"" B.",25,88.25,false
     \\
 ;
 
@@ -40,6 +40,8 @@ pub fn main() !void {
     var header_buf: [64][]const u8 = undefined;
     const header_fields = try csvstream.splitFields(header_line.bytes, &header_buf, ',', '"', gpa);
     var header = try csvstream.Header.init(gpa, header_fields);
+    // `Header.init` copied the names, so the split's own copies can go now.
+    csvstream.freeFields(header_line.bytes, header_fields, gpa);
     defer header.deinit();
     std.debug.print("columns: {d}\n", .{header.len()});
 
@@ -47,6 +49,10 @@ pub fn main() !void {
     while (it.next()) |record| {
         var field_buf: [64][]const u8 = undefined;
         const fields = try csvstream.splitFields(record.bytes, &field_buf, ',', '"', gpa);
+        // Most fields borrow `record.bytes`; one with a doubled quote (Bob's
+        // "Bobby" above) is unescaped into a copy from `gpa`. `freeFields`
+        // frees exactly those, and the leak check in `main` holds it to that.
+        defer csvstream.freeFields(record.bytes, fields, gpa);
         try header.validateArity(fields);
 
         const name = header.get(fields, "name") orelse return error.MissingName;
@@ -91,5 +97,6 @@ pub fn main() !void {
     const next_record = quote_it.next().?;
     var next_buf: [4][]const u8 = undefined;
     const next_fields = try csvstream.splitFields(next_record.bytes, &next_buf, ',', '"', gpa);
+    defer csvstream.freeFields(next_record.bytes, next_fields, gpa);
     std.debug.print("record after the unbalanced one: {s}\n", .{next_fields[0]});
 }
