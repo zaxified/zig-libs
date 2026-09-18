@@ -245,6 +245,7 @@ lane_modules() {
 # which `step` reaches only when every step passed -- a red run writes none.
 # ZIGLIBS_IGNORE_STAMPS=1 runs everything as if no stamp existed.
 STAMPS_FILE="${ZIGLIBS_STAMPS:-.stamps.local.tsv}"
+STAMPS_KEEP=8
 declare -A FP=()
 
 fp_load() {
@@ -284,36 +285,37 @@ stamps_pending() {
     declare -A have=()
     local sm sl sf _t
     while IFS=$'\t' read -r sm sl sf _t; do
-        [[ "$sl" == "$lane" ]] && have[$sm]="$sf"
+        [[ "$sl" == "$lane" ]] && have["$sm $sf"]=1
     done < "$STAMPS_FILE"
     local -a out=()
     for m in $mods; do
-        [[ -n "${FP[$m]:-}" && "${have[$m]:-}" == "${FP[$m]}" ]] || out+=("$m")
+        [[ -n "${FP[$m]:-}" && -n "${have["$m ${FP[$m]}"]:-}" ]] || out+=("$m")
     done
     printf '%s' "${out[*]}"
 }
 
-# Records a green stamp for every module of $1 in lane $2, replacing that
-# module's previous stamp in the lane.
+# Records a green stamp for every module of $1 in lane $2. Earlier stamps of
+# the same module and lane are KEPT, newest STAMPS_KEEP of them: reverting an
+# edit or switching branches returns a module to a fingerprint that was
+# already proven, and re-testing it then would be the driver forgetting.
 stamps_record() {
     local mods="$1" lane="$2" m now tmp
     [[ -z "${mods// /}" ]] && return 0
     fp_load
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
-    declare -A drop=()
-    for m in $mods; do drop[$m]=1; done
-    if [[ -f "$STAMPS_FILE" ]]; then
-        local sm sl rest
-        while IFS=$'\t' read -r sm sl rest; do
-            [[ "$sl" == "$lane" && -n "${drop[$sm]:-}" ]] && continue
-            printf '%s\t%s\t%s\n' "$sm" "$sl" "$rest"
-        done < "$STAMPS_FILE" > "$tmp"
-    fi
-    for m in $mods; do
-        printf '%s\t%s\t%s\t%s\n' "$m" "$lane" "${FP[$m]}" "$now" >> "$tmp"
-    done
-    LC_ALL=C sort -o "$tmp" "$tmp"
+    {
+        [[ -f "$STAMPS_FILE" ]] && cat "$STAMPS_FILE"
+        for m in $mods; do
+            printf '%s\t%s\t%s\t%s\n' "$m" "$lane" "${FP[$m]}" "$now"
+        done
+    } |
+        # newest first per (module, lane, fingerprint) -> one line each; then
+        # at most STAMPS_KEEP fingerprints per (module, lane)
+        LC_ALL=C sort -t$'\t' -k1,1 -k2,2 -k4,4r |
+        awk -F'\t' -v keep="$STAMPS_KEEP" '
+            { k = $1 FS $2; if (seen[k FS $3]++) next; if (++n[k] > keep) next; print }' |
+        LC_ALL=C sort > "$tmp"
     mv "$tmp" "$STAMPS_FILE"
     echo "stamps: $(wc -w <<< "$mods") module(s) recorded green for '$lane' in $STAMPS_FILE"
 }
