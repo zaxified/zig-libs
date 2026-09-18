@@ -323,14 +323,18 @@ stamps_record() {
 # plus `-Dmodule=` for each module of $1 when it is a strict subset of the
 # lane's modules $2 -- the whole lane needs no further narrowing.
 SEL_ARGS=()
+# NARROW_ARGS: just the added `-Dmodule=`s, for steps that already pass
+# EXTRA_ZIG_ARGS (which carry the lane's own -Dgroup/-Dmodule).
+NARROW_ARGS=()
 stamps_narrow() {
     SEL_ARGS=()
     local a m
     for a in "${EXTRA_ZIG_ARGS[@]}"; do
         case "$a" in -Dgroup=* | -Dmodule=*) SEL_ARGS+=("$a") ;; esac
     done
+    NARROW_ARGS=()
     [[ "$(wc -w <<< "$1")" -eq "$(wc -w <<< "$2")" ]] && return 0
-    for m in $1; do SEL_ARGS+=("-Dmodule=$m"); done
+    for m in $1; do SEL_ARGS+=("-Dmodule=$m"); NARROW_ARGS+=("-Dmodule=$m"); done
 }
 
 # The harness itself changed (this script, test-lib.sh, capped, or a CI lane).
@@ -1450,7 +1454,7 @@ cmd_changed() {
     # declarations and its build carries `test_deps` a consumer never gets.
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
-    (( mc )) && step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    (( mc )) && step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     # ⚠ `zig build run-examples` USED TO BE HERE, running all 230 examples on
     # every scoped push under a comment claiming "only the full lane pays it".
     # It did not: this step is unconditional, so the scoped lane paid ~68 s of
@@ -1811,7 +1815,7 @@ cmd_modules() {
     fi
     stamps_narrow "$todo" "$lane_mods"
     step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
-    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     ZL_RUN_EXAMPLES=0 run_modules "$todo"
     stamps_record "$todo" "$lane"
     summary
@@ -1836,7 +1840,7 @@ cmd_examples() {
         return 0
     fi
     stamps_narrow "$todo" "$lane_mods"
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     run_examples_for "$todo"
     stamps_record "$todo" "$lane"
     summary
@@ -1880,8 +1884,8 @@ cmd_build() {
         return 0
     fi
     stamps_narrow "$todo" "$lane_mods"
-    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${NARROW_ARGS[@]+"${NARROW_ARGS[@]}"}
     # This lane runs no test, so there is no `--summary all` to digest and
     # nothing would land on the run's page. A lane that contributes NOTHING
     # there reads as one that failed to report, not as one with nothing to
