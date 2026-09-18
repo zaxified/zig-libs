@@ -36,6 +36,16 @@
 #   scripts/check-apps.sh ssh-demo   # just one
 #   scripts/check-apps.sh --run      # build, then RUN each app's smoke.sh
 #   scripts/check-apps.sh --pinned   # every app, through its pin (tag refs only)
+#   scripts/check-apps.sh --run --stamps -Dcpu=x86_64_v3+aes+pclmul
+#                                    # only apps with no green stamp; `-D…` go to every build
+#
+# ⭐ `--stamps` (2026-09-18): an app runs only when it has no green stamp at its
+# current fingerprint -- its own files, the fingerprints of the zig-libs modules
+# its build.zig imports (each already folds in its dependencies and the build
+# machinery), and this script. Same file and format as scripts/test.sh's module
+# stamps (`ZIGLIBS_STAMPS`, default `.stamps.local.tsv`), lane `apps` or
+# `apps-run` plus the zig arguments and the host. Every check above the builds
+# still covers every app. Not with `--pinned`, which is a tag's question.
 #
 # ⭐ `--run` is the difference between "it compiles" and "it works". The gate
 # over `modules/<m>/example/` used to only compile too, and the day it started
@@ -48,11 +58,15 @@ cd "$REPO_ROOT"
 
 PINNED=0
 RUN=0
+STAMPS=0
 ARGS=()
+ZARGS=()
 for a in "$@"; do
     case "$a" in
         --pinned) PINNED=1 ;;
         --run) RUN=1 ;;
+        --stamps) STAMPS=1 ;;
+        -D*) ZARGS+=("$a") ;;
         -*) echo "check-apps: unknown option '$a'" >&2; exit 2 ;;
         *) ARGS+=("$a") ;;
     esac
@@ -167,6 +181,67 @@ if [ "$PINNED" = 1 ]; then
     done
 fi
 
+# ── stamps ─────────────────────────────────────────────────────────────────
+STAMPS_FILE="${ZIGLIBS_STAMPS:-.stamps.local.tsv}"
+STAMPS_KEEP=8
+APP_FPS=""   # `app<TAB>fingerprint`, taken BEFORE anything is built
+if [ "$STAMPS" = 1 ]; then
+    if [ "$PINNED" = 1 ]; then
+        echo "check-apps: --stamps with --pinned: a tag's question is asked in full, refusing" >&2
+        exit 2
+    fi
+    source "$SCRIPT_DIR/lib/stamps-key.sh"
+    lane="apps$([ "$RUN" = 1 ] && echo -run)${ZARGS[*]:+ ${ZARGS[*]}} $(uname -m) $(host_key "${ZARGS[@]}")"
+    fp_tsv="$(zig build module-fingerprints)" || { echo "check-apps: 'zig build module-fingerprints' failed -- refusing to guess what is proven" >&2; exit 1; }
+    harness="$(sha256sum "$SCRIPT_DIR/check-apps.sh" | cut -c1-64)"
+    for n in "${WANT[@]}"; do
+        [ -d "example-apps/$n" ] || { echo "check-apps: no such app '$n'" >&2; exit 2; }
+        mods="$(grep -o 'zig_libs\.module("[^"]*")' "example-apps/$n/build.zig" | sed 's/.*("\(.*\)")/\1/' | LC_ALL=C sort -u)"
+        [ -n "$mods" ] || { echo "check-apps: example-apps/$n/build.zig imports no zig_libs module -- cannot fingerprint it" >&2; exit 1; }
+        fp="$(
+            git ls-files -z --cached --others --exclude-standard "example-apps/$n" | LC_ALL=C sort -z | xargs -0 sha256sum
+            for m in $mods; do
+                mfp="$(awk -F'\t' -v m="$m" '$1 == m { print $2 }' <<< "$fp_tsv")"
+                [ -n "$mfp" ] || { echo "check-apps: $n imports '$m', which has no fingerprint" >&2; exit 1; }
+                printf 'module %s %s\n' "$m" "$mfp"
+            done
+            printf 'harness %s\n' "$harness"
+        )" || exit 1
+        APP_FPS="$APP_FPS$n	$(printf '%s' "$fp" | sha256sum | cut -c1-32)
+"
+    done
+    todo=()
+    for n in "${WANT[@]}"; do
+        fp="$(awk -F'\t' -v n="$n" '$1 == n { print $2 }' <<< "$APP_FPS")"
+        if [ "${ZIGLIBS_IGNORE_STAMPS:-0}" != 1 ] && [ -f "$STAMPS_FILE" ] &&
+            awk -F'\t' -v n="$n" -v l="$lane" -v f="$fp" '$1 == n && $2 == l && $3 == f { found = 1 } END { exit !found }' "$STAMPS_FILE"; then
+            continue
+        fi
+        todo+=("$n")
+    done
+    echo "check-apps: ${#todo[@]} of ${#WANT[@]} app(s) have no green stamp for '$lane'${todo[*]:+: ${todo[*]}}"
+    WANT=("${todo[@]}")
+fi
+
+# Records every app of WANT green in the lane, from the fingerprints taken
+# before the builds. Same shape as test.sh's stamps_record: newest STAMPS_KEEP
+# fingerprints per (app, lane).
+stamps_record_apps() {
+    [ "$STAMPS" = 1 ] && [ ${#WANT[@]} -gt 0 ] || return 0
+    local now tmp
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
+    {
+        [ -f "$STAMPS_FILE" ] && cat "$STAMPS_FILE"
+        printf '%s' "$APP_FPS" | awk -F'\t' -v OFS='\t' -v want=" ${WANT[*]} " -v lane="$lane" -v now="$now" \
+            'index(want, " " $1 " ") { print $1, lane, $2, now }'
+    } | LC_ALL=C sort -t$'\t' -k1,1 -k2,2 -k4,4r |
+        awk -F'\t' -v keep="$STAMPS_KEEP" '{ k = $1 FS $2; if (seen[k FS $3]++) next; if (++c[k] > keep) next; print }' |
+        LC_ALL=C sort > "$tmp"
+    mv "$tmp" "$STAMPS_FILE"
+    echo "check-apps: ${#WANT[@]} app(s) recorded green for '$lane' in $STAMPS_FILE"
+}
+
 for n in "${WANT[@]}"; do
     [ -d "example-apps/$n" ] || { echo "check-apps: no such app '$n'" >&2; exit 2; }
     if [ "$PINNED" = 1 ]; then
@@ -182,7 +257,7 @@ for n in "${WANT[@]}"; do
         }
     else
         echo "check-apps: building $n against the working tree"
-        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ) || {
+        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ${ZARGS[@]+"${ZARGS[@]}"} ) || {
             echo "check-apps: $n FAILED to build against this commit." >&2
             echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
             echo "            pins — and the app's source is written against the tree, so the pin" >&2
@@ -221,7 +296,7 @@ if [ "$RUN" = 1 ]; then
             # pass reuses the binary the build stage already produced.
             if [ "$mode" != ReleaseSafe ]; then
                 echo "check-apps: rebuilding $n as $mode"
-                ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. "-Doptimize=$mode" ) || {
+                ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ${ZARGS[@]+"${ZARGS[@]}"} "-Doptimize=$mode" ) || {
                     echo "check-apps: $n FAILED to build as $mode." >&2
                     exit 1
                 }
@@ -241,8 +316,9 @@ if [ "$RUN" = 1 ]; then
         # the mode the app's own build.zig chooses. Non-fatal (the gate has
         # already passed), but SAY SO if it fails rather than silently leaving
         # the tree in ReleaseFast.
-        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. >/dev/null ) \
+        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ${ZARGS[@]+"${ZARGS[@]}"} >/dev/null ) \
             || echo "check-apps: warning: could not restore example-apps/$n to its default build mode (tree left in ReleaseFast)" >&2
     done
     echo "check-apps: ${#WANT[@]} app(s) ran their smoke tests in ReleaseSafe and ReleaseFast"
 fi
+stamps_record_apps

@@ -30,6 +30,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib/test-lib.sh"
+source "$SCRIPT_DIR/lib/stamps-key.sh"
 
 # ── one cgroup around the WHOLE run ────────────────────────────────────────
 #
@@ -262,43 +263,7 @@ stamps_lane_key() {
         case "$a" in -Dgroup=* | -Dmodule=*) ;; *) key="$key $a" ;; esac
     done
     [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && key="$key DRY"
-    # A pinned `-Dcpu` (CI's push lane) makes the code paths independent of the
-    # runner's CPU, so only the triple -- kernel and glibc versions -- keys it.
-    case " ${EXTRA_ZIG_ARGS[*]} " in
-        *" -Dcpu="*) printf '%s %s %s' "$key" "$(uname -m)" "$(native_os_id)" ;;
-        *) printf '%s %s %s' "$key" "$(uname -m)" "$(native_target_id)" ;;
-    esac
-}
-
-# What `native` resolves to on this machine, as Zig sees it: the triple (OS
-# and glibc versions included) plus the CPU model and its feature list, hashed.
-# In the lane key because code picks paths by CPU feature (poly1305 AVX-512 /
-# AVX2 lanes; montint, k256, p256 asm on adx+bmi2), and GitHub's amd64 pool
-# mixes an EPYC without AVX-512 and a Xeon with it -- a stamp from one must not
-# stand in for the other (audit 2026-09-18). Read once per run.
-_ZL_NATIVE_ID=""
-native_target_id() {
-    if [[ -z "$_ZL_NATIVE_ID" ]]; then
-        local sec
-        sec="$(zig targets 2>/dev/null | awk '/^    \.native = \.\{/{on=1} on')"
-        if [[ -z "$sec" ]]; then
-            echo "test.sh: 'zig targets' gave no native section -- cannot key stamps to this CPU" >&2
-            exit 1
-        fi
-        _ZL_NATIVE_ID="native:$(printf '%s' "$sec" | sha256sum | cut -c1-12)"
-    fi
-    printf '%s' "$_ZL_NATIVE_ID"
-}
-
-# The triple alone (OS and glibc versions), for a lane with a pinned `-Dcpu`.
-native_os_id() {
-    local triple
-    triple="$(zig targets 2>/dev/null | awk '/^    \.native = \.\{/{on=1} on && /^        \.triple = /{print; exit}')"
-    if [[ -z "$triple" ]]; then
-        echo "test.sh: 'zig targets' gave no native triple -- cannot key stamps to this host" >&2
-        exit 1
-    fi
-    printf 'os:%s' "$(printf '%s' "$triple" | sha256sum | cut -c1-12)"
+    printf '%s %s %s' "$key" "$(uname -m)" "$(host_key "${EXTRA_ZIG_ARGS[@]}")"
 }
 
 # For the log: the pinned `-Dcpu`, or the runner's CPU model otherwise.
@@ -310,11 +275,6 @@ lane_cpu_note() {
     printf 'cpu %s' "$(native_cpu_name)"
 }
 
-# The CPU model behind that hash, for the log: the hash alone does not say
-# which of the pool's machines a CI run landed on.
-native_cpu_name() {
-    zig targets 2>/dev/null | awk '/^    \.native = \.\{/{on=1} on && /^            \.name = /{gsub(/[",]/,"",$3); print $3; exit}'
-}
 
 # Prints the modules of $1 that have no stamp for lane $2 at their current
 # fingerprint.

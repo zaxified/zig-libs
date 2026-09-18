@@ -439,7 +439,9 @@ jobs:
           # every change would have to go green once per model before its
           # stamp holds. x86_64_v3 (AVX2, BMI2) is on all of them; the
           # AVX-512 and ADX paths are the tag's full lanes' to run.
-          bash scripts/test.sh changed "$base" -Dcpu=x86_64_v3 ${{ matrix.groups }}
+          # +aes+pclmul because no psABI level carries them: plain v3 would
+          # test only the software AES/GHASH that no deployed build runs.
+          bash scripts/test.sh changed "$base" -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
       # Only a green run gets here, and only a push, tag or dispatch shares
       # what it proved; a pull request's stamps would be discarded by the
       # fetch anyway, so it does not upload them.
@@ -1133,9 +1135,36 @@ jobs:
       # invisible in every safe-mode run and only lets the bad thing through in
       # the mode a consumer is most likely to build. This repository has shipped
       # exactly that defect.
+      #
+      # ⭐ STAMPS (2026-09-18): off a tag, only the apps with no green stamp at
+      # their fingerprint are built and run (see check-apps.sh `--stamps`), on
+      # the push lane's pinned CPU level for the push lane's reason. It was the
+      # longest job of an ordinary push, ~5 min, whatever the push touched. A
+      # tag runs every app, natively, with no stamps.
+      - name: Fetch the apps' stamps
+        if: env.ZIGLIBS_DRY_RUN != '1' && !startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/stamps"
+          bash scripts/lib/ci-stamps.sh fetch stamps-apps-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: example-apps built and run against this commit
         if: env.ZIGLIBS_DRY_RUN != '1'
-        run: bash scripts/check-apps.sh --run
+        env:
+          ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
+        run: |
+          if [ "${GITHUB_REF#refs/tags/}" != "$GITHUB_REF" ]; then
+            bash scripts/check-apps.sh --run
+          else
+            bash scripts/check-apps.sh --run --stamps -Dcpu=x86_64_v3+aes+pclmul
+          fi
+      - name: Keep the apps' stamps
+        if: success() && env.ZIGLIBS_DRY_RUN != '1' && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v7
+        with:
+          name: stamps-apps-${{ runner.arch }}
+          path: ${{ runner.temp }}/stamps/stamps.tsv
+          if-no-files-found: ignore
       # ⭐ THE DOWNLOADER'S PATH, and it exists only on a tag ref.
       #
       # The step above substitutes the working tree for the pinned dependency,

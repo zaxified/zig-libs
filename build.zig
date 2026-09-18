@@ -1787,7 +1787,15 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
                 return std.mem.lessThan(u8, x, y);
             }
         }.lt);
+        // Except the host session's own variables, which configure no test and
+        // differ between runs of the same machine: CI's setup-zig puts the
+        // compiler under `_temp/<uuid>/`, so `PATH` (read by `procrun`) re-keyed
+        // that module on every push. The lane key already carries the host.
+        const session_env = [_][]const u8{ "HOME", "LOGNAME", "PATH", "PWD", "TMPDIR", "USER" };
         for (env_list.items) |e| {
+            if (for (session_env) |s| {
+                if (std.mem.eql(u8, s, e)) break true;
+            } else false) continue;
             const v = b.graph.environ_map.get(e) orelse continue;
             h.update("\x00env:");
             h.update(e);

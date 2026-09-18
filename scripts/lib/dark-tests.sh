@@ -113,10 +113,8 @@ cd "$REPO_ROOT"
 # And it is reported, never silent — the summary counts it and names it. A
 # check that cannot say what it did not check is the shape this repo has been
 # bitten by before.
-declare -A lane_skips=()
-for _m in ${ZIGLIBS_SKIP_LIVE:-}; do
-    [[ -n "$_m" ]] && lane_skips["$_m"]=1
-done
+# A space-padded string, not `declare -A`: test-lib.sh's style note (bash 3.2).
+lane_skips=" $(echo ${ZIGLIBS_SKIP_LIVE:-}) "
 
 # Modules that own `.zig` sources under `src/` which their own compilation
 # deliberately does not analyse. One row per module:
@@ -252,7 +250,7 @@ for m in "${mods[@]}"; do
     exempt=$(exempt_for "$m")
 
     if [[ "$ran" == "-" ]]; then
-        if [[ -n "${lane_skips[$m]:-}" ]]; then
+        if [[ "$lane_skips" == *" $m "* ]]; then
             echo "NOT HERE   $m — $disk test block(s) on disk, not run on this lane by its own configuration (ZIGLIBS_SKIP_LIVE). Its suite is checked on the lanes that do run it; this lane cannot, and says so rather than counting it as covered."
             lane_skipped=$((lane_skipped + 1))
             continue
