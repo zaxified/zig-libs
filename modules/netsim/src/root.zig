@@ -103,15 +103,6 @@ pub const shrinkTrace = shrink_mod.shrink;
 
 const testing = std.testing;
 
-/// Monotonic wall-clock read for the F10 perf test only — std.time.Timer was
-/// removed; this is the same `clock_gettime(.MONOTONIC)` pattern used by
-/// other modules' benches (e.g. `bfv`'s `bench.zig`).
-fn nowNs() u64 {
-    var ts: std.os.linux.timespec = undefined;
-    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
-}
-
 const FLOOD_N = 5;
 
 /// Correct epoch-broadcast flood with per-epoch duplicate suppression. The
@@ -452,11 +443,17 @@ const LoopyForward = struct {
     }
 };
 
-// ── F9 perf: a ring big enough that topology-build cost isn't swamped by
-//    the noise of a shared dev machine (unlike a 5-node scenario) ───────────
-const F9_RING_N = 256;
+// ── F9: a small ring whose scenario counts its own invocations. Each call
+//    to `case.scenario` is one topology build, so the count IS the property
+//    F9 is about -- no stopwatch involved ─────────────────────────────────────
+const F9_RING_N = 16;
+
+/// Scenario calls since the test last zeroed it. A plain global is enough:
+/// the test runner is single-threaded and `Scenario` takes no context.
+var f9_scenario_calls: usize = 0;
 
 fn f9RingScenario(sim: *Sim) anyerror!void {
+    f9_scenario_calls += 1;
     var i: usize = 0;
     while (i < F9_RING_N) : (i += 1) _ = try sim.addNode(.{});
     const cfg = LinkConfig{ .latency = 1 };
@@ -654,22 +651,21 @@ test "replay(log_out=null) stores no log entries (audit F10)" {
     }
 }
 
-test "perf: run() builds the topology once, not twice (audit F9)" {
+test "run() builds the topology once, not twice (audit F9)" {
     // `run` used to call `snapshotTopo` (which builds a whole `Sim`, running
     // `case.scenario`, just to copy out the topology) and THEN `replay`
-    // (which builds ANOTHER fresh `Sim` and runs `case.scenario` again) —
+    // (which builds ANOTHER fresh `Sim` and runs `case.scenario` again) --
     // `case.scenario`'s own contract (deterministic, no unseeded randomness)
     // makes the second build strictly redundant. The audit's own A/B
     // (ReleaseFast, ring topology, two independent sessions) measured the
-    // two builds at ~47-51% of a `run()` call across 32/256/2048 nodes. This
-    // reconstructs that old two-build path explicitly (both halves are still
-    // public on their own) against the new single-build `run`, on a 256-node
-    // ring (a handful of nodes made the earlier draft of this test flaky —
-    // the build-cost difference was too small to clear the noise of a shared
-    // dev machine) and A/B-interleaved per iteration rather than run as two
-    // sequential blocks, so a load spike hits both arms rather than just one
-    // (`feedback_ratio_needs_one_instant`). Coarse, noise-tolerant regression
-    // guard, not a strict ratio.
+    // two builds at ~47-51% of a `run()` call across 32/256/2048 nodes.
+    //
+    // This used to be a wall-clock A/B (`one_build_ns <= two_build_ns` over
+    // 60 interleaved iterations on a 256-node ring). That is a coin toss
+    // under a loaded full gate whenever the build is a small share of the
+    // run, and it cost ~1 s. A topology build is exactly one `case.scenario`
+    // call (`build()` in sim.zig), so count those instead: deterministic,
+    // load-independent, and it names the defect rather than its symptom.
     const gpa = testing.allocator;
     var unused: usize = 0;
     const case = Case{
@@ -679,36 +675,26 @@ test "perf: run() builds the topology once, not twice (audit F9)" {
         .until = 2000,
     };
     const fault_cfg = fault_mod.Config{ .horizon = 1000 };
-    const iters = 60;
 
-    var two_build_ns: u64 = 0;
-    var one_build_ns: u64 = 0;
-    for (0..iters) |_| {
-        const t0 = nowNs();
-        {
-            const topo = try snapshotTopo(gpa, case);
-            defer gpa.free(topo.links);
-            var trace = try fault_mod.generate(gpa, case.seed, .{ .node_count = topo.node_count, .links = topo.links }, fault_cfg);
-            defer trace.deinit();
-            _ = try replay(gpa, case, trace.events, null);
-        }
-        two_build_ns += nowNs() - t0;
-
-        const t1 = nowNs();
-        {
-            var gr = try run(gpa, case, fault_cfg);
-            gr.trace.deinit();
-        }
-        one_build_ns += nowNs() - t1;
+    f9_scenario_calls = 0;
+    {
+        var gr = try run(gpa, case, fault_cfg);
+        gr.trace.deinit();
     }
+    try testing.expectEqual(@as(usize, 1), f9_scenario_calls);
 
-    if (std.process.Environ.getPosix(std.testing.environ, "NETSIM_VERBOSE") != null) {
-        std.debug.print(
-            "F9 perf: two_build={d}ns one_build={d}ns ({d} iters, {d}-node ring)\n",
-            .{ two_build_ns, one_build_ns, iters, F9_RING_N },
-        );
+    // Positive control: the old two-build path, reconstructed from the two
+    // public halves it was made of, counts 2 -- the counter does see a
+    // second build when there is one.
+    f9_scenario_calls = 0;
+    {
+        const topo = try snapshotTopo(gpa, case);
+        defer gpa.free(topo.links);
+        var trace = try fault_mod.generate(gpa, case.seed, .{ .node_count = topo.node_count, .links = topo.links }, fault_cfg);
+        defer trace.deinit();
+        _ = try replay(gpa, case, trace.events, null);
     }
-    try testing.expect(one_build_ns <= two_build_ns);
+    try testing.expectEqual(@as(usize, 2), f9_scenario_calls);
 }
 
 test "replay: an out-of-range node id in an externally-supplied trace is rejected (audit F1)" {
