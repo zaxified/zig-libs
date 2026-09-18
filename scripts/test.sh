@@ -576,6 +576,22 @@ run_modules() {
 
     local log="$_ZL_KEEP_OUT"
     _ZL_KEEP_OUT=""
+    # Every module of the set was a live one this lane skips (stamps can
+    # leave exactly that, e.g. only `opcua` unproven on the arm64 lane that
+    # skips it): nothing was built, so there is no summary to check, and
+    # the skip line above already says why. Anything else that ran and left
+    # no summary is still the harness failure dark_check reports.
+    if [[ ${#rest[@]} -eq 0 && ${#netns[@]} -eq 0 && ! -s "$log" ]] && (( ! ZL_RUN_EXAMPLES )); then
+        local ran_live=0
+        for m in ${live[@]+"${live[@]}"}; do
+            case " ${ZIGLIBS_SKIP_LIVE:-} " in *" $m "*) ;; *) ran_live=1 ;; esac
+        done
+        if (( ! ran_live )); then
+            echo "  dark-tests: nothing built on this lane (every module left to run is skipped live here)"
+            rm -f "$log"
+            return 0
+        fi
+    fi
     dark_check "$mods" "$log"
     summary_digest "$log"
     rm -f "$log"
