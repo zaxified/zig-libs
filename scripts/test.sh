@@ -294,9 +294,14 @@ stamps_pending() {
         printf '%s' "$mods"
         return 0
     fi
-    awk -F'\t' -v lane="$lane" -v mods="$mods" '
+    # A VOLATILE stamp (5th column `v`: live peer or environment gap, see
+    # stamps_record) counts for 24 hours, and not at all under
+    # ZIGLIBS_STRICT_STAMPS=1 -- which CI sets on tags.
+    local cutoff=""
+    [[ "${ZIGLIBS_STRICT_STAMPS:-0}" == 1 ]] || cutoff="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+    awk -F'\t' -v lane="$lane" -v mods="$mods" -v cutoff="$cutoff" '
         FNR == NR { fp[$1] = $2; next }
-        $2 == lane { have[$1 FS $3] = 1 }
+        $2 == lane && ($5 != "v" || (cutoff != "" && $4 >= cutoff)) { have[$1 FS $3] = 1 }
         END {
             n = split(mods, a, " "); out = ""
             for (i = 1; i <= n; i++) {
@@ -323,23 +328,29 @@ stamps_record() {
         echo "test.sh: stamps_record with no fingerprints loaded before the run -- refusing to stamp" >&2
         exit 1
     fi
-    # Not stamped, ever or here: modules whose peer is LIVE (the other side
-    # changes with no commit -- open62541:latest, a pip install, the runner's
-    # OpenSSH), modules this lane was told to skip live, and modules whose
-    # environment gap made their tests skip. They run every time instead.
-    local _skip=" $(live_modules) ${ZIGLIBS_SKIP_LIVE:-} $_CAP_GAP_MODS " _m _kept="" _held=""
+    # Modules this lane was told to skip live did not run: no stamp at all.
+    # Modules whose peer is LIVE (the other side changes with no commit --
+    # open62541:latest, a pip install, the runner's OpenSSH) or whose
+    # environment gap made tests skip get a VOLATILE stamp: good for 24 hours,
+    # never on a tag (stamps_pending). A skipping pass used to be stamped for
+    # good (audit 2026-09-18); never stamping them made every local run pay
+    # for ssh, imap, opcua and tc.
+    local _skip=" ${ZIGLIBS_SKIP_LIVE:-} " _vol=" $(live_modules) $_CAP_GAP_MODS " _m _kept="" _held="" _volset=" "
     for _m in $mods; do
-        case "$_skip" in *" $_m "*) _held="$_held $_m" ;; *) _kept="$_kept $_m" ;; esac
+        case "$_skip" in *" $_m "*) _held="$_held $_m"; continue ;; esac
+        _kept="$_kept $_m"
+        case "$_vol" in *" $_m "*) _volset="$_volset$_m " ;; esac
     done
-    [[ -n "$_held" ]] && echo "stamps: not stamped (live peer or environment gap -- they run every time):$_held"
+    [[ -n "$_held" ]] && echo "stamps: not stamped (skipped live on this lane):$_held"
+    [[ -n "${_volset// /}" ]] && echo "stamps: volatile, 24 h and never on a tag (live peer or environment gap):${_volset% }"
     mods="${_kept# }"
     [[ -z "${mods// /}" ]] && return 0
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
     {
         [[ -f "$STAMPS_FILE" ]] && cat "$STAMPS_FILE"
-        printf '%s\n' "$FP_TSV" | awk -F'\t' -v OFS='\t' -v mods=" $mods " -v lane="$lane" -v now="$now" \
-            'index(mods, " " $1 " ") { print $1, lane, $2, now }'
+        printf '%s\n' "$FP_TSV" | awk -F'\t' -v OFS='\t' -v mods=" $mods " -v vol="$_volset" -v lane="$lane" -v now="$now" \
+            'index(mods, " " $1 " ") { if (index(vol, " " $1 " ")) print $1, lane, $2, now, "v"; else print $1, lane, $2, now }'
     } |
         # newest first per (module, lane, fingerprint) -> one line each; then
         # at most STAMPS_KEEP fingerprints per (module, lane)

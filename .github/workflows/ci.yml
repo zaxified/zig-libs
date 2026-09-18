@@ -250,6 +250,10 @@ concurrency:
 # Set it to "0" -- or delete these lines -- to make CI real again.
 env:
   ZIGLIBS_DRY_RUN: "1"
+  # Volatile stamps (a live peer, or an environment gap that made tests skip)
+  # count for 24 hours on pushes and dispatches, and never on a tag: the tag
+  # is the claim that every lane passed, so those modules run for real there.
+  ZIGLIBS_STRICT_STAMPS: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '0' }}
 
 jobs:
   scoped:
