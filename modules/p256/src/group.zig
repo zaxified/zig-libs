@@ -40,6 +40,13 @@ const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 const NotSquareError = std.crypto.errors.NotSquareError;
 
 /// A point on NIST P-256 in projective coordinates.
+/// How many times `combMulBase` ran, in test builds only (`void` otherwise, so
+/// no shipped or measured binary carries it). Both branches of `P256.mul`
+/// return the same point by construction, so this is the only way a test can
+/// see that `basePoint.mul` took the comb redirect: a deleted redirect passed
+/// every test in this module (checked 2026-09-18 by deleting it).
+pub var comb_calls_for_testing: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {};
+
 pub const P256 = struct {
     x: Fe,
     y: Fe,
@@ -430,6 +437,7 @@ pub const P256 = struct {
     /// else the double-and-add ladder over `G`. `error.IdentityElement` iff
     /// `s ≡ 0 (mod n)`.
     pub fn combMulBase(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
+        if (builtin.is_test) comb_calls_for_testing += 1;
         if (comptime gate.fast_scalarmul_implemented) {
             return combMulBaseFast(s_, endian);
         }

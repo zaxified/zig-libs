@@ -230,9 +230,9 @@ test "GATED differential: group.mulCtWindowed == portable CT ladder" {
 }
 
 // Debug: 6.5 s for 256 draws isolated, again std's Debug `basePoint.mul`.
-// Only claim 2 below (the redirect changes no answer) is sampled; claim 1,
-// the redirect predicate itself, is asserted unconditionally in every mode,
-// and it is what a deleted redirect breaks. 40 draws in Debug still put the
+// Only claim 2 below (the redirect changes no answer) is sampled; claims 1
+// and 3 are asserted unconditionally in every mode, and claim 3 is what a
+// deleted redirect breaks. 40 draws in Debug still put the
 // module's `mul`, its comb and std on the same random points;
 // ReleaseFast/ReleaseSafe/ReleaseSmall keep 256.
 const redirect_std_iters: usize = if (builtin.mode == .Debug) 40 else 256;
@@ -248,10 +248,12 @@ test "basePoint.mul takes the comb redirect, and the redirect changes no answer"
     // -- had NO call site on the signing path, so every signature took the
     // slow road.
     //
-    // 1. The mechanism. Both branches of `mul` return identical points by
-    //    construction, so no assertion on a result can distinguish them: what
-    //    can break is the predicate that chooses, and that is what is asserted
-    //    here. The `mul` body is three lines above it.
+    // 1. The predicate that chooses. Both branches of `mul` return identical
+    //    points by construction, so no assertion on a result can distinguish
+    //    them. ⚠ This claim alone does NOT catch a deleted redirect: the
+    //    predicate still answers correctly with nothing calling it, which is
+    //    how the test passed with the redirect line removed until 2026-09-18.
+    //    Claim 3 below watches the redirect itself.
     try std.testing.expect(group.P256.isBasePointRepr(group.P256.basePoint));
     try std.testing.expect(!group.P256.isBasePointRepr(group.P256.basePoint.dbl()));
     try std.testing.expect(!group.P256.isBasePointRepr(group.P256.identityElement));
@@ -294,6 +296,20 @@ test "basePoint.mul takes the comb redirect, and the redirect changes no answer"
         try std.testing.expectEqualSlices(u8, &c.x.toBytes(.big), &a.x.toBytes(.big));
         try std.testing.expectEqualSlices(u8, &c.y.toBytes(.big), &a.y.toBytes(.big));
     }
+
+    // 3. The redirect itself, through the counter `combMulBase` keeps in test
+    //    builds: `basePoint.mul` runs the comb once, a point that is not G
+    //    does not, and ECDSA signing -- the caller the redirect exists for --
+    //    reaches it.
+    group.comb_calls_for_testing = 0;
+    _ = try group.P256.basePoint.mul([_]u8{7} ** 32, .big);
+    try std.testing.expectEqual(@as(usize, 1), group.comb_calls_for_testing);
+    _ = try group.P256.basePoint.dbl().mul([_]u8{7} ** 32, .big);
+    try std.testing.expectEqual(@as(usize, 1), group.comb_calls_for_testing);
+    const kp = try sign.EcdsaP256Sha256.KeyPair.generateDeterministic([_]u8{0x37} ** StdEcdsa.KeyPair.seed_length);
+    group.comb_calls_for_testing = 0;
+    _ = try kp.sign("redirect", null);
+    try std.testing.expect(group.comb_calls_for_testing >= 1);
 
     // And a point that is not G must still be multiplied the ordinary way:
     // the comb table is G's alone, so answering with it here would be wrong

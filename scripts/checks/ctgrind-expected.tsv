@@ -370,8 +370,8 @@ k256	ReleaseFast	ecdsa	1	11	de35a6b6fdf0588c	8ff4812d21149442
 montint	ReleaseFast	small	1	0	045eb3a8ac23bebb	4e9f8c0b1ac8efe3
 montint	ReleaseFast	portable	1	0	045eb3a8ac23bebb	5c44fe7ce913f8f6
 montint	ReleaseFast	asmcore	1	0	045eb3a8ac23bebb	51c0595ca47bd7cc
-p256	ReleaseFast	comb	1	1	aefd5530fd6443f0	9d70061e0f0133d9
-p256	ReleaseFast	sign	1	<=9	a9c8d581ee749255	af4baed5c5134f3f
+p256	ReleaseFast	comb	1	1	6b848b0bb5e8f4a6	9d70061e0f0133d9
+p256	ReleaseFast	sign	1	<=9	2f7a809ade93d914	af4baed5c5134f3f
 rsa	ReleaseFast	crt	1	<=213	cd9d282d526ba2de	d4057b00f9df7b56
 rsa	ReleaseFast	noncrt	1	2	cd9d282d526ba2de	d4057b00f9df7b56
 slhdsa	ReleaseFast	seed	1	4	6848022d967ef676	e0fdde7f5c62a2d6
