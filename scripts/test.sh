@@ -1338,12 +1338,13 @@ cmd_changed() {
     # reverse-dependency closure and the graph-snapshot escalation this used
     # to compute are both implied; and unlike a diff against a base, a stamp
     # does not forget a module that went red two commits ago.
-    local lane closure
+    local lane closure lane_mods
     lane="$(stamps_lane_key changed)"
-    closure="$(stamps_pending "${G_NAMES[*]}" "$lane")"
+    lane_mods="$(lane_modules)"
+    closure="$(stamps_pending "$lane_mods" "$lane")"
     local total_n
     total_n=$(wc -w <<< "$closure")
-    echo "changed: $total_n of ${#G_NAMES[@]} modules have no green stamp for '$lane'"
+    echo "changed: $total_n of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane'"
     if [[ $total_n -gt 0 && $total_n -le 40 ]]; then
         echo "  to test: $closure"
     fi
@@ -1380,7 +1381,7 @@ cmd_changed() {
     [[ -n "${closure// /}" ]] && mc=1
     [[ $mc -eq 1 || -n "${seeds// /}" || -n "${docs_only// /}" ]] && mt=1
     closure_has() { case " $closure " in *" $1 "*) return 0 ;; esac; return 1; }
-    stamps_narrow "$closure" "${G_NAMES[*]}"
+    stamps_narrow "$closure" "$lane_mods"
     # The modules a comment-reading scan must look at: the unproven ones plus
     # every module the diff touched (a comment edit re-keys nothing).
     local -a touched_args=()
@@ -1911,8 +1912,10 @@ cmd_all() {
     set_extra_args "$@"
     capability_check
     graph_load
-    local all_mods="${G_NAMES[*]}"
-    local n=${#G_NAMES[@]}
+    local all_mods
+    all_mods="$(lane_modules)"
+    local n
+    n=$(wc -w <<< "$all_mods")
     echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     # `af6a148` is why the fmt step is first and why the hook exists: six files
@@ -1929,7 +1932,8 @@ cmd_all() {
     # mutation the same day -- a deliberate type error in an unreachable
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
-    step "check-pubfn-reach" zig build check-pubfn-reach
+    stamps_narrow "$all_mods" "$all_mods"   # just the lane's own -Dgroup/-Dmodule
+    step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     # The one class no test here can cover: is the PUBLISHED API sufficient to
     # do the job? Every test lives in the file it tests, so it reads private
     # declarations and its build carries `test_deps` a consumer never gets.

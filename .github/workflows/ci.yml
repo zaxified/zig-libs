@@ -245,7 +245,25 @@ jobs:
     # escalation into a timeout, which is the worst of both: the coverage is
     # paid for and then thrown away.
     timeout-minutes: 75
-    name: changed modules + reverse-dep closure
+    # ⭐ THREE SHARDS, like the full lanes (2026-09-18). On an ordinary push each
+    # shard finds most of its modules stamped and is minutes, so the split
+    # costs two runner start-ups. It is there for the push that re-keys
+    # everything -- any change to the machinery in the fingerprint (build.zig
+    # outside module_list, test.sh, ...) -- which on one runner was a cold run
+    # of every module against this 75-minute cap. The shard list must cover
+    # every primary lib; `plan` checks that for the full lanes, and this list
+    # is the same three.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: crypto
+            groups: -Dgroup=crypto
+          - shard: net
+            groups: -Dgroup=net
+          - shard: rest
+            groups: -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os
+    name: changed modules [${{ matrix.shard }}]
     steps:
       # Full history: `test.sh changed <base>` diffs against the base branch,
       # and a shallow clone has nothing to diff against.
@@ -267,6 +285,16 @@ jobs:
           # exists for. It reads as warm and recompiles from scratch. The Zig
           # TOOLCHAIN download stays cached either way; that part works.
           use-cache: false
+      # ⭐ A WEEK IN EVERY BUILD-CACHE KEY (2026-09-18). An entry restores the
+      # previous tree, adds to it and saves the whole, and nothing ever
+      # deletes: the scoped entry grew 589 -> 646 -> 1156 -> 1364 MB over four
+      # pushes (`gh cache list`, 2026-09-18). With the ISO week in the key and
+      # in the restore prefix, each week starts from an empty tree and last
+      # week's generation ages out of the 10 GB LRU on its own. Cost: the first
+      # run of a week is cold.
+      - name: Cache generation
+        id: gen
+        run: echo "week=$(date -u +%GW%V)" >> "$GITHUB_OUTPUT"
       - name: Cache Zig build artifacts
         uses: actions/cache@v6
         with:
@@ -281,9 +309,11 @@ jobs:
           # restore-keys fallback would hand a 26.04 job a cache built against a
           # different glibc and toolchain surface — a hit that is worse than a
           # miss, since it is the kind that reads as warm.
-          key: zig-${{ runner.os }}-base2-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          # `base3` (2026-09-18): the shard and the week joined the key.
+          # Per shard: matrix jobs sharing one key clobber each other.
+          key: zig-${{ runner.os }}-base3-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-${{ runner.os }}-base2-
+            zig-${{ runner.os }}-base3-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-
       # ⚠ THE SCOPED LANE NEEDS THE PEERS TOO, which it did not have until
       # 2026-08-15. It gates every push, and until this step existed it opened
       # every run with the same six-gap report the `full` job had learned to
@@ -343,10 +373,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
-          bash scripts/ci-stamps.sh fetch stamps-scoped-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+          bash scripts/ci-stamps.sh fetch stamps-scoped-${{ matrix.shard }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test changed modules
         env:
-          ZIGLIBS_LANE: changed modules + reverse-dep closure
+          ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -373,7 +403,7 @@ jobs:
             fi
             echo "base: $base (last green push on main)"
           fi
-          bash scripts/test.sh changed "$base"
+          bash scripts/test.sh changed "$base" ${{ matrix.groups }}
       # Only a green run gets here, and only a push, tag or dispatch shares
       # what it proved; a pull request's stamps would be discarded by the
       # fetch anyway, so it does not upload them.
@@ -381,7 +411,7 @@ jobs:
         if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
-          name: stamps-scoped-${{ runner.arch }}
+          name: stamps-scoped-${{ matrix.shard }}-${{ runner.arch }}
           path: ${{ runner.temp }}/stamps/stamps.tsv
           if-no-files-found: ignore
 
@@ -704,6 +734,10 @@ jobs:
           # in the scoped job: measured dropping the compiled `o/`
           # outputs. The toolchain download is still cached by it.
           use-cache: false
+      # Weekly cache generation, as in the scoped job -- see there.
+      - name: Cache generation
+        id: gen
+        run: echo "week=$(date -u +%GW%V)" >> "$GITHUB_OUTPUT"
       - name: Cache Zig build artifacts
         # ⚠ OFF FOR THE DEBUG LANE, and the measurement is why. One cold run
         # each, 2026-08-15:
@@ -782,9 +816,9 @@ jobs:
           #
           # Deleting the six brought it to 3.53 GB. Nothing was lost: a build
           # cache regenerates, and these were already unreachable by design.
-          key: zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
+          key: zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
-            zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-
+            zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-
       # scripts/test.sh all runs the format check, the hook self-test, the
       # catalog/provenance gates and every module, and wraps the
       # netlink-writing modules in `unshare -rn` where the runner allows it —

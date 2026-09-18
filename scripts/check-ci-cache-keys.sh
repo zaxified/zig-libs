@@ -76,4 +76,20 @@ for a in "${keys[@]}"; do
         fi
     done
 done
+# ⭐ AND THE SCOPED JOB'S SHARDS MUST COVER EVERY PRIMARY LIB (2026-09-18).
+# The push lane is a static three-shard matrix (`-Dgroup=`, see ci.yml); a new
+# primary lib absent from it would have its modules skipped on every push,
+# green. The full lanes get the same check at run time in `plan`, which does
+# not run on a push -- so it is made here, where `checks-fast` runs it.
+scoped=$(awk '/^  scoped:$/{on=1; next} /^  [a-z_-]+:$/{on=0} on' "$ci")
+have=$(grep -oE -- '-Dgroup=[a-z]+' <<< "$scoped" | sed 's/-Dgroup=//' | sort -u | paste -sd' ')
+want=$(zig build module-graph 2>/dev/null | cut -f6 | sort -u | paste -sd' ')
+if [[ -z "$want" ]]; then
+    echo "check-ci-cache-keys: 'zig build module-graph' gave no primary libs -- cannot check the shards" >&2
+    rc=1
+elif [[ "$have" != "$want" ]]; then
+    echo "check-ci-cache-keys: the scoped job's shards cover [$have], module-graph has [$want]" >&2
+    echo "  A lib missing here is a set of modules no push ever tests." >&2
+    rc=1
+fi
 exit "$rc"
