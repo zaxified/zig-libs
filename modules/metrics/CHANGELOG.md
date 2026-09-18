@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **BEHAVIOURAL, not breaking (performance under load):** an
+  `AccessLog.log` call waiting for a full batch no longer re-takes the lock on every
+  spin. It watches a progress counter, bumped when the batch is swapped out or the
+  flusher role is given up, and takes the lock only once that moves. Waiters that
+  hammered the lock kept the flusher from getting it back after each write — the entry
+  below did not fix that, and the `AccessLog F4` test still ran past its 3-minute limit
+  on the 4-core arm64 CI runner. Whole ReleaseSafe test binary, pinned with `taskset`:
+  1 / 2 / 4 / 8 cores **3.8 / 60.9 / 16.2 / 3.3 s before, 0.6-0.7 s after** on each;
+  three binaries at once on 4 cores 20.6-25.1 s before, 0.7 s after; 40 repeated runs
+  with no failure and a 0.7 s maximum.
+
 - **2026-09-18** — **BEHAVIOURAL, not breaking (performance under load):** the module's
   spinlock yields the CPU after 64 failed tries instead of spinning forever. A pure spin
   is fair only while every contender has a core; with more runnable threads than cores a

@@ -1047,8 +1047,8 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
 ///   line too long for the batch is written whole by its own caller after it
 ///   becomes the flusher. Lines from different calls interleave only at line
 ///   boundaries; lines from one thread keep their call order;
-/// - when the batch is full, a caller waits (spinning, lock released) for the
-///   flusher to swap it out. The flusher hands the role to such a waiter after
+/// - when the batch is full, a caller waits (lock released, watching a
+///   progress counter rather than the lock) for the flusher to swap it out. The flusher hands the role to such a waiter after
 ///   each batch, so under a sustained rate the sink cannot keep up with, no
 ///   single request is left writing everyone else's lines indefinitely.
 ///
@@ -1083,7 +1083,8 @@ pub const AccessLog = struct {
     lock: std.atomic.Mutex = .unlocked,
 
     // Group-commit state (see the doc comment above). Every field below is
-    // read and written only with `lock` held. `pending[pending_idx]` is the
+    // written only with `lock` held, and read only with it held except
+    // `progress`. `pending[pending_idx]` is the
     // batch callers append to; the other buffer is the one the flusher may be
     // writing with the lock released, which is why a swap (not a copy or a
     // reset in place) is what hands a batch over.
@@ -1094,8 +1095,13 @@ pub const AccessLog = struct {
     /// held and either `pending_len == 0` or `waiters > 0`.
     flushing: bool = false,
     /// Calls whose line did not fit while another call was the flusher,
-    /// spinning with the lock released until they can append or take over.
+    /// waiting with the lock released until they can append or take over.
     waiters: u32 = 0,
+    /// Bumped, with the lock held, whenever a waiter's answer can change:
+    /// the batch was swapped out (there is room) or the flusher role was
+    /// given up. Waiters watch it WITHOUT the lock — the one field read
+    /// outside it — so waiting never competes with the flusher for `lock`.
+    progress: std.atomic.Value(u32) = .init(0),
 
     const pending_capacity = 4096;
 
@@ -1163,11 +1169,16 @@ pub const AccessLog = struct {
                 return self.finishFlushing();
             }
             // Batch full and a flusher is active: wait for it to swap the
-            // batch out or hand the role over. Never with the lock held.
+            // batch out or hand the role over. Never with the lock held, and
+            // without touching the lock until `progress` moves: waiters that
+            // re-took the lock on every spin kept the flusher from getting it
+            // back after each write (F4 test past its 3-minute limit on the
+            // 4-core arm64 CI runner; 15 s on 4 x86 cores vs 1.1 s on one).
             self.waiters += 1;
             waiting = true;
+            const seen = self.progress.load(.monotonic);
             self.lock.unlock();
-            std.atomic.spinLoopHint();
+            waitForProgress(&self.progress, seen);
             lockSpin(&self.lock);
         }
     }
@@ -1191,6 +1202,7 @@ pub const AccessLog = struct {
         const len = self.pending_len;
         self.pending_idx ^= 1;
         self.pending_len = 0;
+        _ = self.progress.fetchAdd(1, .monotonic);
         self.lock.unlock();
         self.writer.writeAll(self.pending[idx][0..len]) catch {};
         self.writer.flush() catch {};
@@ -1205,7 +1217,24 @@ pub const AccessLog = struct {
     fn finishFlushing(self: *AccessLog) void {
         while (self.pending_len != 0 and self.waiters == 0) self.writeBatch();
         self.flushing = false;
+        _ = self.progress.fetchAdd(1, .monotonic);
         self.lock.unlock();
+    }
+
+    /// Wait, lock released, until `progress` differs from `seen`. A bounded
+    /// spin, then yields, as in `lockSpin`: with more waiters than cores the
+    /// flusher needs the core. No ordering is needed — the waiter re-reads
+    /// everything under `lock` afterwards; this only decides when to try.
+    fn waitForProgress(progress: *const std.atomic.Value(u32), seen: u32) void {
+        var spins: u32 = 0;
+        while (progress.load(.monotonic) == seen) {
+            if (spins < spin_before_yield) {
+                spins += 1;
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+        }
     }
 
     fn writeLine(w: *std.Io.Writer, format: Format, entry: AccessEntry) std.Io.Writer.Error!void {
