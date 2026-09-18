@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — measures the two places this module handles the one thing
 //! it exists to hide: the client's query index. Run it through
-//! `../../../scripts/ctgrind.sh pir`.
+//! `../../../scripts/checks/ctgrind.sh pir`.
 //!
 //! ## Why this module has a harness at all
 //!

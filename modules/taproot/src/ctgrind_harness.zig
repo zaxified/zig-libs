@@ -12,7 +12,7 @@
 //! exemption)." — as an actual committed program instead of a sentence nobody
 //! re-checks. Run through `zig build ctgrind -Dctgrind-module=taproot
 //! -Dctgrind-valgrind=…` plus `valgrind --tool=memcheck` by hand —
-//! `scripts/ctgrind.sh` has no per-module TARGETS/MODES/PATTERN/LABEL entry
+//! `scripts/checks/ctgrind.sh` has no per-module TARGETS/MODES/PATTERN/LABEL entry
 //! for `taproot` yet; the suggested lines are at the bottom of this comment
 //! for the coordinator to paste in.
 //!
@@ -137,7 +137,7 @@
 //!    field/scalar arithmetic underneath (k256's `field.zig`, std's
 //!    `common.zig`) that branch on tainted values and bury the signal, and
 //!    Debug's self-hosted backend is not readable by valgrind's DWARF parser
-//!    at all (`scripts/ctgrind.sh` § MODES).
+//!    at all (`scripts/checks/ctgrind.sh` § MODES).
 //!
 //! ## The propagation witness
 //!
@@ -147,7 +147,7 @@
 //! makes the itemisation mean "no branch found" rather than "the harness
 //! never ran".
 //!
-//! ## Suggested config lines for scripts/ctgrind.sh (coordinator to paste in)
+//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
 //!
 //! ```
 //! TARGETS[taproot]="secret"

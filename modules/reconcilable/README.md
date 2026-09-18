@@ -190,7 +190,7 @@ the key *on* the deadline, so a confirmation that arrives earlier has to
 
 ```sh
 zig build test-reconcilable --summary all      # 45 tests, Debug + ReleaseFast + ReleaseSafe
-scripts/dark-tests.sh reconcilable             # every submodule's tests really run
+scripts/lib/dark-tests.sh reconcilable             # every submodule's tests really run
 ```
 
 Self-anchored: there is no published vector or reference binary for a

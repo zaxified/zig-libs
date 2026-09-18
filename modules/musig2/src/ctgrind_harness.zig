@@ -9,7 +9,7 @@
 //! `Scalar.mul` is constant-time", `root.zig`'s `sign` doc comment, step 4).
 //! Run through `zig build ctgrind -Dctgrind-module=musig2
 //! -Dctgrind-valgrind=… -Doptimize=ReleaseFast` plus `valgrind
-//! --tool=memcheck` by hand — `scripts/ctgrind.sh` has no per-module
+//! --tool=memcheck` by hand — `scripts/checks/ctgrind.sh` has no per-module
 //! TARGETS/MODES/PATTERN/LABEL entry for `musig2` yet; the suggested lines
 //! are at the bottom of this comment for the coordinator to paste in.
 //!
@@ -148,7 +148,7 @@
 //! exactly that function with a tainted scalar
 //! (`modules/k256/src/ctgrind_harness.zig`, `group.zig:346`'s
 //! `rejectIdentity` context) — attributing this module's own calls into it
-//! to "k256's problem" would be the evasion `scripts/ctgrind.sh`'s header
+//! to "k256's problem" would be the evasion `scripts/checks/ctgrind.sh`'s header
 //! exists to refuse (same reasoning as `bip340/sign`'s pattern, which this
 //! harness's PATTERN copies almost verbatim since the call graph is a
 //! superset of bip340's). The per-line breakdown in the audit record marks
@@ -181,7 +181,7 @@
 //!    field/scalar arithmetic underneath (`k256`'s `field.zig`/`scalar.zig`)
 //!    that branch on tainted values and bury the signal, and Debug's
 //!    self-hosted backend is not readable by valgrind's DWARF parser at all
-//!    (`scripts/ctgrind.sh` § MODES).
+//!    (`scripts/checks/ctgrind.sh` § MODES).
 //!
 //! ## The propagation witness
 //!
@@ -191,7 +191,7 @@
 //! to a small, itemised in-file count is what makes the itemisation mean
 //! "no branch found" rather than "the harness never ran".
 //!
-//! ## Suggested config lines for scripts/ctgrind.sh (coordinator to paste in)
+//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
 //!
 //! ```
 //! TARGETS[musig2]="sign"

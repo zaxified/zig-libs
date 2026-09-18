@@ -249,7 +249,7 @@ fn ruleDateUnix(year: i32, r: Rule, time_secs: i32) ?i64 {
 const testing = std.testing;
 
 // The zone count is written in this module's `meta.doc` (which renders the
-// root README's catalog row), in its README and in its SPEC. `scripts/tz-gen`
+// root README's catalog row), in its README and in its SPEC. `scripts/gen/tz-gen`
 // can move it: dropping `localtime` and `posixrules` took it from 600 to 598
 // and left three of those four places saying 600. Pin it here, so a
 // regeneration that changes the count cannot land without someone walking past

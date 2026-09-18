@@ -529,7 +529,7 @@ pub fn Modint(comptime max_bits: comptime_int) type {
         //    unconditionally (verified by disassembly).
         //  * `condSubTop`'s subtract mask, and `sub`'s add-back mask — see
         //    those two functions. Both were MEASURED leaking before the barrier
-        //    (`scripts/ctgrind.sh montint`) and measured clean after.
+        //    (`scripts/checks/ctgrind.sh montint`) and measured clean after.
         //
         // Note what this barrier is NOT interchangeable with: writing the code
         // in unconditional masked form is not by itself sufficient. `sub`
@@ -657,7 +657,7 @@ pub fn negInvMod2_64(x: u64) u64 {
 ///
 /// The reject paths (`error.Overflow` here, `error.NonCanonical` in
 /// `elementFromBytesBE`) are contract errors on public shape and are branches
-/// this function must take. `scripts/ctgrind.sh` does not measure any of this
+/// this function must take. `scripts/checks/ctgrind.sh` does not measure any of this
 /// — the harness never taints a byte string, precisely because a leak here
 /// would be reporting the documented behaviour rather than a regression.
 fn elemFromBytesBE(comptime M: type, bytes: []const u8) M.Error!M.Elem {
@@ -721,7 +721,7 @@ test "asm_min_limbs: the dispatch cutoff is pinned by value, and by what it sele
     // modules of the reverse-dependency closure green, because the
     // asm↔portable differentials call `asm_core` DIRECTLY rather than through
     // this dispatch. The consequence is worse for the audit than for speed —
-    // `scripts/ctgrind.sh`'s `asmcore` target (`Modint(2048)`) would keep
+    // `scripts/checks/ctgrind.sh`'s `asmcore` target (`Modint(2048)`) would keep
     // reporting `--check: OK` while silently measuring the portable path, so
     // the asm core's constant-time claim would quietly stop being measured
     // with every green light still lit.

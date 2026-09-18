@@ -31,7 +31,7 @@ pub const meta = .{
     // `.linux64` is mandatory (the collection's baseline -- proven by the
     // default test suite, not cross-compiled). Add `.linux32`/`.windows`/
     // `.wasm32` only once `zig build portable-<name>-<target>` actually
-    // passes, or is baselined in scripts/portable-known-failures.tsv with
+    // passes, or is baselined in scripts/checks/portable-known-failures.tsv with
     // the real compiler error -- never because the code "should" work
     // there. See CONVENTIONS.md §4.
     .targets = .{.linux64},

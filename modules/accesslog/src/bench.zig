@@ -5,7 +5,7 @@
 //!
 //! Off by default (`error.SkipZigTest`); run it with:
 //!
-//!   ACCESSLOG_BENCH=1 scripts/capped zig build test-accesslog -Doptimize=ReleaseFast
+//!   ACCESSLOG_BENCH=1 scripts/lib/capped zig build test-accesslog -Doptimize=ReleaseFast
 //!
 //! **The A side is the real code** (`root.writeJsonLines`). The B side,
 //! `writeJsonLinesVerbatim` below, is the pre-change implementation kept

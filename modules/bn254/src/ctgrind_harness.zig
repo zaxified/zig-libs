@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — the constant-time evidence for this module's hand-written
 //! Montgomery field, as an actual committed program. Run it through
-//! `../../../scripts/ctgrind.sh bn254`.
+//! `../../../scripts/checks/ctgrind.sh bn254`.
 //!
 //! Until this file existed there was none. Commit `1892c814` replaced `Fp`'s
 //! `std.crypto.ff` backend with ~450 lines of hand-rolled constant-time

@@ -4,7 +4,7 @@
 # wycheproof_bitcoin_vectors.zig from Google/C2SP's Wycheproof ECDSA
 # secp256k1 / SHA-256 vectors — k256 shipped NO ECDSA vectors of its own
 # (audit G3); the sibling p256 module has the same shape via
-# scripts/gen-p256-wycheproof.py, and this mirrors it for secp256k1's two
+# scripts/gen/gen-p256-wycheproof.py, and this mirrors it for secp256k1's two
 # published Wycheproof files.
 #
 #   curl -sSLO https://raw.githubusercontent.com/C2SP/wycheproof/main/\

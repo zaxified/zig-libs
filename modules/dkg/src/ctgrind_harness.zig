@@ -25,7 +25,7 @@
 //! build test-dkg` — memcheck's context count is valgrind's own verdict,
 //! not something a Zig test can assert on. `zig build check-ctgrind`
 //! compiles this (Debug, `-fvalgrind` forced on) as a rot guard only, not
-//! a measurement — see `scripts/ctgrind.sh`'s own header for why Debug is
+//! a measurement — see `scripts/checks/ctgrind.sh`'s own header for why Debug is
 //! unmeasurable here (self-hosted backend, broken `.debug_line`).
 //!
 //! ## What is tainted, entering which public function
@@ -134,7 +134,7 @@
 //! CLAIM (`taint=yes`, built `-fvalgrind`), UNTAINTED negative control
 //! (`taint=no`, same build), no-`-fvalgrind` TRAP (`taint=yes`, built
 //! without the switch — `std.valgrind.doClientRequest` silently no-ops
-//! without it, per `scripts/ctgrind.sh`'s header). A zero in the claim row
+//! without it, per `scripts/checks/ctgrind.sh`'s header). A zero in the claim row
 //! means nothing unless control and trap are also zero and the total is
 //! non-zero somewhere. `std.debug.print`ing the outputs after each call is
 //! the propagation witness (not constant-time by design) — its own
@@ -316,7 +316,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh config (for the coordinator to paste in;
+// ── suggested scripts/checks/ctgrind.sh config (for the coordinator to paste in;
 // this file does not and must not edit that script itself) ───────────────
 //
 // declare -A TARGETS=(

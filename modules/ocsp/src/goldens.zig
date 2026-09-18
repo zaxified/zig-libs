@@ -775,7 +775,7 @@ test "golden: fixture count + size canary — 2 real CAs, 6 captured DER blobs" 
 // rather than captured. The oracle is still outside this module: OpenSSL
 // 3.5.5 builds the `Name`, the DER and the RSA-SHA256 signature, and OpenSSL
 // verified its own output (`Response verify OK`) before these bytes were
-// frozen. `scripts/gen-ocsp-byname.sh` reproduces it end to end.
+// frozen. `scripts/gen/gen-ocsp-byname.sh` reproduces it end to end.
 //
 // Also the first real response here with **no nextUpdate** (OpenSSL's
 // index-based responder omits it), so it is the only golden that exercises

@@ -23,7 +23,7 @@ Figures below were measured on 2026-09-17 against the tree as it stands.
 | `volume.py` | 200 000 documents (yaml-test-suite seeds, 1-3 random byte edits) through `ydump` and libyaml (PyYAML's `CSafeLoader` binding) — a value differential at scale, not a throughput benchmark (no timing is recorded). |
 
 ```bash
-scripts/capped zig build-exe --cache-dir <scratch>/zc -OReleaseFast \
+scripts/lib/capped zig build-exe --cache-dir <scratch>/zc -OReleaseFast \
   -femit-bin=<scratch>/ydump \
   --dep yaml -Mmain=modules/yaml/tools/ydump.zig \
   -Myaml=modules/yaml/src/root.zig

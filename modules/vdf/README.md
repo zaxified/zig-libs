@@ -115,7 +115,7 @@ One sibling-module dependency (`meta.deps = .{"montint"}`) — see
 (a `Modulus`/`Fe` alias, a private Miller-Rabin helper) that this module
 does NOT import from them (none of the three export theirs).
 `montint`'s Montgomery multiply IS constant-time (see its own module doc
-comment and `scripts/ctgrind.sh`'s coverage of it) — `vdf` uses it for raw
+comment and `scripts/checks/ctgrind.sh`'s coverage of it) — `vdf` uses it for raw
 throughput (full 2^64-bit limbs plus an amd64 asm core, vs `std.crypto.ff`'s
 portable 63-bit-limb implementation), not to shed a constant-time
 requirement neither module needs to shed. See `group.zig`'s module doc

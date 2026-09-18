@@ -295,10 +295,10 @@ pub fn sampleFixedWeightBiased(
 /// select and cannot re-derive the branch. Measured effect, ReleaseFast, in-file
 /// contexts: decaps 52 → 14, keygen 26 → 4, encaps 33 → 6. The remaining ones
 /// are elsewhere (`gf256.zig:113/114`, the rejection loop) and are recorded in
-/// `SPEC.md` and `scripts/ctgrind-expected.tsv`.
+/// `SPEC.md` and `scripts/checks/ctgrind-expected.tsv`.
 ///
 /// ⚠ The barrier is not decoration and must not be "cleaned up": deleting it
-/// puts the 38 back. `scripts/ctgrind.sh --check` pins the count, so a deletion
+/// puts the 38 back. `scripts/checks/ctgrind.sh --check` pins the count, so a deletion
 /// turns that red rather than passing silently.
 pub fn writeSupportToVector(comptime weight: u16, support: *const [weight]u32, out: []u64) void {
     var index_tab: [weight]u32 = undefined;

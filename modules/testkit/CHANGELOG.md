@@ -50,13 +50,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   malformed golden compared as though it were an empty one. The cause of all
   three was structural: the decision and its diagnostics lived in one function,
   and a self-test of the failing direction would have written to stderr, which
-  `scripts/test-lib.sh` fails even for a passing step. The decision is now a
+  `scripts/lib/test-lib.sh` fails even for a passing step. The decision is now a
   silent `verdict`/`hexVerdict` that the failing direction can and does assert;
   `expectBytes`/`expectHex` are those plus `report`. `hex.bytes` no longer
   refuses a valid literal outside a comptime context — the
   `catch @compileError` branch was analysed on every runtime call, so
   `hex.bytes(4, "deadbeef")` in a test body failed to compile accusing its own
-  correct argument. New gate `scripts/check-skip-as-pass.py`: `zig test` counts
+  correct argument. New gate `scripts/checks/check-skip-as-pass.py`: `zig test` counts
   a bare `return;` as a PASS, and 11 sites across nftables, ebpf and bacnet
   still announced a skip and then returned plainly — the exact pattern
   `testkit.skip`'s doc comment says it was written to replace.

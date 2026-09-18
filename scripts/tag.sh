@@ -94,7 +94,7 @@ echo
 # The tag push then runs every lane, and the stamps (scripts/test.sh) make it
 # re-test only what no green lane has already proven at its fingerprint.
 #
-# `gh` is looked up on PATH, which is also how scripts/test-tag.sh replaces it.
+# `gh` is looked up on PATH, which is also how scripts/lib/test-tag.sh replaces it.
 # A DRY-RUN CI proves the pipeline and nothing about the code (see the
 # ZIGLIBS_DRY_RUN block at the top of ci.yml), so its green is not a tag's.
 if git show HEAD:.github/workflows/ci.yml 2>/dev/null | grep -qE '^\s*ZIGLIBS_DRY_RUN:\s*"?1"?\s*$'; then

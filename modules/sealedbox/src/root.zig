@@ -280,7 +280,7 @@ pub fn keyPairFromSecretKey(sk: [secret_length]u8) error{IdentityElement}!KeyPai
 // ⛔⛔ Why these exist at all, in one measurement. `std.base64` and
 // `std.fmt.bytesToHex`/`hexToBytes` are table-driven, and a table indexed by a
 // secret byte is a cache-timing oracle -- the class of T-table AES. Measured
-// 2026-09-09 with `scripts/ctgrind.sh sealedbox` and confirmed by disassembly
+// 2026-09-09 with `scripts/checks/ctgrind.sh sealedbox` and confirmed by disassembly
 // before anything here was written:
 //
 //     movzbl %sil,%eax                 ; the secret character

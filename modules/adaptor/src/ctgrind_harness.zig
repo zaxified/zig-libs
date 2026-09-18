@@ -7,7 +7,7 @@
 //! it through `zig build ctgrind -Dctgrind-module=adaptor
 //! -Dctgrind-valgrind=<true|false> -Doptimize=ReleaseFast` plus `valgrind
 //! --tool=memcheck --error-exitcode=99 --num-callers=20` by hand —
-//! `scripts/ctgrind.sh` has no per-module TARGETS/MODES/PATTERN/LABEL entry
+//! `scripts/checks/ctgrind.sh` has no per-module TARGETS/MODES/PATTERN/LABEL entry
 //! for `adaptor` yet; the suggested lines are at the bottom of this comment
 //! for the coordinator to paste in.
 //!
@@ -84,7 +84,7 @@
 //!
 //! `adaptor` depends on `bip340` and `k256`, both of which ALSO have a
 //! `root.zig` — the same basename collision `blindrsa`'s and `rsa`'s
-//! harnesses already ran into (`scripts/ctgrind.sh`'s `PATTERN` comment for
+//! harnesses already ran into (`scripts/checks/ctgrind.sh`'s `PATTERN` comment for
 //! `blindrsa/blind`). A pattern containing `root[.]zig` therefore buckets
 //! `adaptor/root.zig` AND `bip340/root.zig` together as "in-file" — stated
 //! here rather than papered over. The per-line breakdown in the report this
@@ -110,7 +110,7 @@
 //!   re-derive `T` from the recovered scalar, landing back in
 //!   `group.zig`/`field.zig`/`fast_core.zig` — the SAME `rejectIdentity()`
 //!   shape `k256`'s `comb` target and `bip340`'s `sign` target already
-//!   measure (see the module-level context in `scripts/ctgrind.sh`'s
+//!   measure (see the module-level context in `scripts/checks/ctgrind.sh`'s
 //!   comment about that class: probability ≈2^-256, an accepted, known
 //!   shape rather than a new defect).
 //!
@@ -122,7 +122,7 @@
 //! what makes the itemisation mean "no branch found" rather than "the taint
 //! never arrived".
 //!
-//! ## Suggested config lines for scripts/ctgrind.sh (coordinator to paste in)
+//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
 //!
 //! ```
 //! TARGETS[adaptor]="presign adapt extract"

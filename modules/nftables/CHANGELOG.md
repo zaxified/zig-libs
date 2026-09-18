@@ -30,7 +30,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   an error union instead of `?Socket`, so `orelse return;` — which swallowed the
   skip in a different function from the one that announced it — is `try`.
   Measured: the module went from 94 passing to **90 pass, 4 skip**. Found by the
-  first audit of `testkit`; `scripts/check-skip-as-pass.py` now refuses the
+  first audit of `testkit`; `scripts/checks/check-skip-as-pass.py` now refuses the
   shape.
 
 - **2026-09-02** — **Audit (drift campaign): 1 CRITICAL (in `netlink`, reached from here), 2

@@ -3,7 +3,7 @@
 //! bench — ns/op micro-benchmarks for the arithmetic rewrite. Off by default;
 //! opt in with `BFV_BENCH`:
 //!
-//!   BFV_BENCH=1 scripts/capped zig build test-bfv -Doptimize=ReleaseFast
+//!   BFV_BENCH=1 scripts/lib/capped zig build test-bfv -Doptimize=ReleaseFast
 //!
 //! Every row times the OLD path and the NEW path in the same binary on the
 //! same inputs, so the ratios are the actual claim — not a remembered number:

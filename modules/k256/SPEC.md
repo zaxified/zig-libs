@@ -167,7 +167,7 @@ addition-chain inverse and the GLV sign handling) is a later-phase obligation.
 Every statement above used to rest on disassembly read once by hand. Since
 2026-08-13 it rests on a committed program:
 [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-`scripts/ctgrind.sh k256`, which marks the secret `MAKE_MEM_UNDEFINED`, forces a
+`scripts/checks/ctgrind.sh k256`, which marks the secret `MAKE_MEM_UNDEFINED`, forces a
 volatile reload, and drives it through five code paths.
 
 **Full control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
@@ -176,7 +176,7 @@ counting rule were added). Three bucket columns, not one, and they sum to
 `total` on every row:
 
 - `in-file` — contexts whose stack names a k256 source file (see
-  `scripts/ctgrind.sh`'s `PATTERN` map for the exact regex per target);
+  `scripts/checks/ctgrind.sh`'s `PATTERN` map for the exact regex per target);
 - `witness` — contexts in the harness's own result formatting, which is not
   constant-time on purpose: it is what proves the taint arrived;
 - `unattr` — contexts matching NEITHER. **Always a `--check` failure.** Before
@@ -334,7 +334,7 @@ runtime point **9/3**, new context at the injected line.
 
 | injected defect | effect |
 |---|---|
-| `blackBox` removed from `Fe.cMov` | `--check` **FAILS**. On the `field` row the leak appears as **1 unattributed** `Conditional jump` context (total 6 → 5, in-file still 0), stack `reloadVolatile (ctgrind_harness.zig:0)` ← `main` — memcheck attributes the inlined select to the harness file, so no k256 pattern matches it. `mul` 8/2 → 1/1, `comb` 7/1 → 8/2, `sign` 13/11 → 17/15. **Until 2026-08-13 the field row read 0/0 and the driver dropped that context silently**; that is why `unattr` exists (`scripts/ctgrind.sh`, "the SECOND trap"). |
+| `blackBox` removed from `Fe.cMov` | `--check` **FAILS**. On the `field` row the leak appears as **1 unattributed** `Conditional jump` context (total 6 → 5, in-file still 0), stack `reloadVolatile (ctgrind_harness.zig:0)` ← `main` — memcheck attributes the inlined select to the harness file, so no k256 pattern matches it. `mul` 8/2 → 1/1, `comb` 7/1 → 8/2, `sign` 13/11 → 17/15. **Until 2026-08-13 the field row read 0/0 and the driver dropped that context silently**; that is why `unattr` exists (`scripts/checks/ctgrind.sh`, "the SECOND trap"). |
 | `blackBox` removed from `normalize`'s three masks AND `Fe.sub`'s, `Fe.cMov`'s kept | `mul` 8/2 → **35/29**: 28 NEW contexts, all at `normalize (field.zig:83)` and `normalize (field.zig:91)` — the carry fold and the conditional subtract, branching on the secret. `normalize`'s barriers are load-bearing and this is the measurement that shows it. (Removing ALL barriers *including* `Fe.cMov`'s does NOT show this: the `cMov` leak resolves the taint first and these contexts never appear, which is the same "total can go down" effect noted below. A whole-file barrier kill is the WRONG control for a per-site question.) |
 | `blackBox` removed from `Fe.sub`'s mask ALONE | `mul` 8/2 → 7/1 and **no new context at `field.zig:229`/`:230`** — the count moved DOWN. `Fe.sub`'s barrier has **no demonstrated teeth** under this harness. It is kept as defence-in-depth against a compiler that would lower the masked add-back to a branch, not because one currently does; nothing here proves it is preventing anything. |
 | `q.cMov(added, bit)` → `if (bit == 1) q = added` | new context at `group.zig:275` *(the 256-bit ladder, 2026-08-13; now `mulLadder`, which no target drives)* |
@@ -532,7 +532,7 @@ Constant-time contract (secret nonce — verified by disassembly of the ReleaseF
    comptime-built table) and would be a new algorithm under this repo's
    "no bespoke crypto without proof" doctrine — bit-exact KAT, a
    randomized differential, a `ctgrind` target, AND a `ctgrind` run are
-   all required before it ships, and `scripts/ctgrind.sh` was out of
+   all required before it ships, and `scripts/checks/ctgrind.sh` was out of
    scope for this pass (foreground-only, no full-repo tooling). See
    `A1/k256.md` F5 disposition.
 

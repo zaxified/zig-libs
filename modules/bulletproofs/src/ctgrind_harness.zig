@@ -3,7 +3,7 @@
 //! ctgrind_harness — constant-time evidence for the Bulletproofs PROVER
 //! (`rangeproof.prove` / `ipa.proveIpa`), as an actual committed program.
 //! Suggested driver commands (this module has no `TARGETS`/`MODES`/
-//! `PATTERN`/`LABEL` entry in `../../../scripts/ctgrind.sh` yet — that
+//! `PATTERN`/`LABEL` entry in `../../../scripts/checks/ctgrind.sh` yet — that
 //! script's header explains why a per-module block belongs there, not
 //! here; the lines below are what such a block would contain):
 //!
@@ -26,7 +26,7 @@
 //! `root[.]zig` in both patterns is deliberate, not decorative — see
 //! "Delegate: ct25519" below; it is also this module's OWN root.zig
 //! basename, which is the exact `blindrsa`/`rsa` collision
-//! `scripts/ctgrind.sh`'s header documents (same basename, two files,
+//! `scripts/checks/ctgrind.sh`'s header documents (same basename, two files,
 //! matched by the same regex). Unlike that case, this module's own
 //! `root.zig` is pure re-exports with no executable logic of its own (no
 //! branches, nothing to attribute), so in practice a `root[.]zig` hit
@@ -109,7 +109,7 @@
 //! Naming ct25519 in the pattern (as `root[.]zig`, its only source file)
 //! is the same posture `bolt8`/`bip340` take for their own k256 delegate:
 //! attributing that arithmetic to "someone else's module" would be the
-//! evasion `scripts/ctgrind.sh`'s header exists to refuse.
+//! evasion `scripts/checks/ctgrind.sh`'s header exists to refuse.
 //!
 //! ## The two traps (see `ct25519`/`bn254`'s harnesses for the same shape)
 //!

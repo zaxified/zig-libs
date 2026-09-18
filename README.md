@@ -31,7 +31,7 @@ carry their own attribution; it does not catalogue provenance.
 > **What has been done about it**, so you can judge rather than take a word for it:
 > tests run in three release modes; mutation audits across the collection ask whether each
 > test would actually go red; constant-time claims are machine-checked where a row in
-> `scripts/ctgrind-expected.tsv` says so; `zig build check-fuzz` requires a fuzz harness on
+> `scripts/checks/ctgrind-expected.tsv` says so; `zig build check-fuzz` requires a fuzz harness on
 > every module that parses foreign bytes; `zig build check-portable` compiles every
 > `platform = .any` module for a 32-bit target, which the CI matrix cannot do since every
 > lane in it is 64-bit; and each module's `SPEC.md` carries an
@@ -162,7 +162,7 @@ zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
 zig build check-catalog  # verify build.zig's module_list ↔ modules/ ↔ this README agree
 zig build check-changelog # verify every module has a dated, well-formed CHANGELOG.md
-zig build check-portable  # verify every meta.targets claim against scripts/portable-known-failures.tsv
+zig build check-portable  # verify every meta.targets claim against scripts/checks/portable-known-failures.tsv
 zig build check-portable-table # verify the README "Portability" table matches meta.targets + the baseline
 zig build gen-portable-table   # regenerate that table (run after changing a module's meta.targets)
 ```
@@ -250,7 +250,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 Every one of the 230 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 230 modules — a linux64-only module has nothing further to show here.
 
-38 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of 39 declared pairs, 38 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
+38 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 39 declared pairs, 38 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
 **A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
 

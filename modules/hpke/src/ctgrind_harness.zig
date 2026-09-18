@@ -3,7 +3,7 @@
 //! ctgrind_harness — the constant-time evidence for HPKE's DHKEM decap path
 //! and the AEAD encryption context, which `SPEC.md`/`README.md` do NOT yet
 //! state as fact anywhere (see "SPEC.md/README.md currently make NO
-//! constant-time claim" below). Run it through `../../../scripts/ctgrind.sh`
+//! constant-time claim" below). Run it through `../../../scripts/checks/ctgrind.sh`
 //! once the coordinator adds hpke's TARGETS/MODES/PATTERN block — this
 //! module has none yet, so `ctgrind.sh hpke` refuses to run; see the
 //! suggested config lines at the bottom of this comment. This file follows
@@ -61,7 +61,7 @@
 //! (`dhkem.zig`, `suite.zig`). Naming ONLY those two and leaving the actual
 //! group arithmetic — and the HKDF/HMAC/SHA-2 the shared secret is then
 //! extracted through — off the pattern would be exactly the evasion
-//! `scripts/ctgrind.sh`'s header warns about: the group multiply is where a
+//! `scripts/checks/ctgrind.sh`'s header warns about: the group multiply is where a
 //! scalar-dependent branch would actually live, not in `dhkem.zig`'s own
 //! glue code, and a bug inside HKDF's HMAC is a DIFFERENT failure than a
 //! leaky ladder. So every KEM pattern below names BOTH:
@@ -140,7 +140,7 @@
 //! `ReleaseFast` only, for the reason every other module's row is
 //! ReleaseFast-only: `Debug`/`ReleaseSafe` add overflow-check branches on
 //! tainted limbs inside std's bigint reduction (measured elsewhere in this
-//! campaign at tens of thousands of contexts, `scripts/ctgrind.sh` § MODES)
+//! campaign at tens of thousands of contexts, `scripts/checks/ctgrind.sh` § MODES)
 //! that would bury this module's own signal, and Debug's self-hosted
 //! backend is unreadable by valgrind's DWARF parser regardless.
 //!
@@ -161,7 +161,7 @@
 //! file's job is to measure, not to add prose to SPEC.md/README.md the
 //! module's maintainer has not signed off on.
 //!
-//! ## Suggested `scripts/ctgrind.sh` config (NOT added by this change —
+//! ## Suggested `scripts/checks/ctgrind.sh` config (NOT added by this change —
 //! touching that file is the coordinator's job, not this one)
 //!
 //! ```text

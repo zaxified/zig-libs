@@ -6,7 +6,7 @@
 //! `timing_safe.eql`/`verify` claim ("both `verify`s compare MACs in
 //! constant time and fail closed"), as an actual committed program instead
 //! of a paragraph nobody re-runs. Run it through
-//! `../../../scripts/ctgrind.sh ctap2pin` once the coordinator adds this
+//! `../../../scripts/checks/ctgrind.sh ctap2pin` once the coordinator adds this
 //! module's config block to that shared script (the suggested
 //! TARGETS/MODES/PATTERN lines are below); until then, by hand:
 //!
@@ -21,7 +21,7 @@
 //! still compiles this file at Debug so it cannot rot into an unbuildable
 //! recipe; that compile proves nothing about any one context count.
 //!
-//! Suggested `scripts/ctgrind.sh` config (added here as a comment only —
+//! Suggested `scripts/checks/ctgrind.sh` config (added here as a comment only —
 //! that script is coordinator-owned, per this task's instructions):
 //!
 //!     TARGETS[ctap2pin]="ecdh one two token"
@@ -133,7 +133,7 @@
 //!    pointer immediately before the call under test — defensive, per the
 //!    other harnesses' own measurement that this is precaution rather than
 //!    an observed requirement on this compiler/host.
-//! 3. ReleaseFast only, per `scripts/ctgrind.sh`'s MODES note:
+//! 3. ReleaseFast only, per `scripts/checks/ctgrind.sh`'s MODES note:
 //!    Debug/ReleaseSafe add overflow checks on wide-integer field arithmetic
 //!    that branch on tainted values and bury the signal (measured elsewhere
 //!    in this collection at tens of thousands of contexts for the same

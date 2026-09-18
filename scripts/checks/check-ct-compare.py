@@ -9,7 +9,7 @@
   * the module's test suite, 37/37 green -- and no value test can ever see it,
     because the two functions return the same answer for every input
     (`feedback_property_no_value_test_can_see`);
-  * `scripts/ctgrind.sh ctap2pin`, measured 2026-09-09: the pinned counts do
+  * `scripts/checks/ctgrind.sh ctap2pin`, measured 2026-09-09: the pinned counts do
     not move by a single context, because on this compiler `std.mem.eql` over
     a fixed-size MAC compiles branch-free too.
 
@@ -48,8 +48,8 @@ import os
 import re
 import sys
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PIN = os.path.join(REPO, "scripts", "ct-compare-expected.tsv")
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PIN = os.path.join(REPO, "scripts", "checks", "ct-compare-expected.tsv")
 
 # `timing_safe` exposes three comparisons; all of them are the posture this
 # gate is about, and a swap between them is as much a regression as a swap to
@@ -170,7 +170,7 @@ def read_pin():
 
 
 HEADER = """\
-# Constant-time comparison sites, pinned. See scripts/check-ct-compare.py for
+# Constant-time comparison sites, pinned. See scripts/checks/check-ct-compare.py for
 # why this file exists -- in short: swapping `std.crypto.timing_safe.eql` for
 # `std.mem.eql` is invisible to every value test AND to ctgrind (measured on
 # ctap2pin, 2026-09-09: not one context moves), so the only thing that can hold
@@ -211,14 +211,14 @@ def main() -> int:
 
     if update:
         write_pin(found)
-        print(f"check-ct-compare: pinned {len(found)} file(s) in scripts/ct-compare-expected.tsv")
+        print(f"check-ct-compare: pinned {len(found)} file(s) in scripts/checks/ct-compare-expected.tsv")
         return 0
 
     pinned = read_pin()
     if not pinned:
         print(
-            "check-ct-compare: scripts/ct-compare-expected.tsv is empty or missing — "
-            "run scripts/check-ct-compare.py --update",
+            "check-ct-compare: scripts/checks/ct-compare-expected.tsv is empty or missing — "
+            "run scripts/checks/check-ct-compare.py --update",
             file=sys.stderr,
         )
         return 2
@@ -264,7 +264,7 @@ def main() -> int:
         if path not in pinned:
             print(
                 f"FAIL {path}: makes a constant-time comparison but is not pinned — "
-                f"add it with scripts/check-ct-compare.py --update.",
+                f"add it with scripts/checks/check-ct-compare.py --update.",
                 file=sys.stderr,
             )
             fail = 1

@@ -194,7 +194,7 @@ test "positive control: without the three-way guard a half-open hello reaches Up
     try testing.expect(e.adjacency_up);
 }
 
-// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ────────
+// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/gen/dissect.py) ────────
 //
 // Every vector below was produced by THIS module's own `buildHello`/`helloFields`
 // (or, for the 11-octet case, hand-built to the RFC-legal shape Wireshark
@@ -204,7 +204,7 @@ test "positive control: without the three-way guard a half-open hello reaches Up
 // as `BadLength`).
 
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
 //   00 00 00 0a 00 1b 00 1b 03 f0 05 02 00 00 00 a1'
 //
 // Wireshark printed (trimmed to the load-bearing lines):
@@ -239,7 +239,7 @@ test "golden P2P Hello (Wireshark-anchored): our own start() reproduces the exac
 }
 
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
 //   00 00 00 0a 00 1b 00 25 03 f0 0f 01 00 00 00 a1 00 00 00 00 00 0b 00 00
 //   00 b1'
 //
@@ -279,7 +279,7 @@ test "golden P2P Hello (Wireshark-anchored): rxHelloBytes+helloFields reproduce 
 }
 
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
 //   00 00 00 0b 00 1b 00 21 01 f0 0b 01 00 00 00 b1 00 00 00 00 00 0a'
 //
 // Wireshark printed:

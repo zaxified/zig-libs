@@ -15,7 +15,7 @@
 //!    unmasks with one more constant-time `mul`."
 //!
 //! Until this harness that paragraph had no measurement behind it. Run it
-//! by hand (this module has NO per-module block in `scripts/ctgrind.sh` yet
+//! by hand (this module has NO per-module block in `scripts/checks/ctgrind.sh` yet
 //! — see that script's header for why, and the suggested config lines at
 //! the bottom of this comment for what to paste in):
 //!
@@ -114,7 +114,7 @@
 //! WITNESS bucket — so a zero count inside `root.zig`/`rsa`'s files means
 //! "no branch found", not "taint never arrived".
 //!
-//! ## Suggested `scripts/ctgrind.sh` config (for the coordinator to paste in)
+//! ## Suggested `scripts/checks/ctgrind.sh` config (for the coordinator to paste in)
 //!
 //! ⚠ `root.zig` is NOT a unique basename here: `blindrsa`'s own
 //! `modules/blindrsa/src/root.zig` and the sibling `modules/rsa/src/root.zig`

@@ -26,8 +26,8 @@ operations are claimed constant-time w.r.t. them, and — the part usually
 missing — **what is deliberately not**. A blanket claim is worse than none: it
 is what a reader relies on when they should be careful.
 
-If a claim is machine-checked, say by what (`scripts/ctgrind.sh <name>`, a row
-in `scripts/ctgrind-expected.tsv`). If it rests on reading the code, say that
+If a claim is machine-checked, say by what (`scripts/checks/ctgrind.sh <name>`, a row
+in `scripts/checks/ctgrind-expected.tsv`). If it rests on reading the code, say that
 instead. Those are different grades of evidence and must not be written alike.
 
 ## Limits and refusals

@@ -18,8 +18,8 @@
 # itself. This wrapper is for ad-hoc commands and for anything else that does
 # not cap for itself.
 #
-#     scripts/capped zig build test-yaml --summary all
-#     ZIGLIBS_MEM_MAX=24G scripts/capped zig build test
+#     scripts/lib/capped zig build test-yaml --summary all
+#     ZIGLIBS_MEM_MAX=24G scripts/lib/capped zig build test
 #
 # Why this exists: a Zig test binary that allocates without bound is killed by
 # the KERNEL's global OOM killer, which chooses its victim by size. Under an
@@ -38,7 +38,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/test-lib.sh"
 
 if [[ $# -eq 0 ]]; then
-    echo "usage: scripts/capped CMD [ARGS...]" >&2
+    echo "usage: scripts/lib/capped CMD [ARGS...]" >&2
     exit 2
 fi
 

@@ -38,9 +38,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   integer emulation, raised as a HIGH — had **no guard of any kind**. Replacing
   `fpr.div`'s body with a native `/` leaves the whole suite green and the KATs
   byte-exact, because the emulation is bit-identical to IEEE-754 and no value
-  test can see the difference; `falcon` is on neither `scripts/ctgrind.sh` nor
+  test can see the difference; `falcon` is on neither `scripts/checks/ctgrind.sh` nor
   `ctgrind-expected.tsv`. The property was held in place by a SPEC.md paragraph.
-  New gate **`scripts/check-fp-freedom.sh`**, wired into every `scripts/test.sh`
+  New gate **`scripts/checks/check-fp-freedom.sh`**, wired into every `scripts/test.sh`
   lane: disassembles a ReleaseFast build and fails if a variable-latency FP
   mnemonic reached a non-test symbol. Verified red under that mutation, naming
   `vdivsd` in `fft.polyLdlFft` (the secret Gram matrix), `fft.polyDivAutoadjFft`

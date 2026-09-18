@@ -39,7 +39,7 @@ const testing = std.testing;
 //   01 04 03 49 00 01         TLV #1 Area Addresses: area 49.00.01
 //   06 06 00 1b 21 3c 9d f8   TLV #6 IS Neighbours (IIH): one SNPA
 //
-// External anchor (F5, wave-2 audit): re-dissected with `scripts/dissect.py
+// External anchor (F5, wave-2 audit): re-dissected with `scripts/gen/dissect.py
 // --frame llc --fields` against Wireshark 4.6.4's real IS-IS dissector, not
 // merely re-transcribed. `frame.protocols == "eth:llc:osi:isis:isis.hello"`
 // — the real Hello sub-dissector, never a generic `data` fallback — with
@@ -112,7 +112,7 @@ test "golden P2P IIH: decode recovers every field" {
 //       00 10                     Res(4) | Base VID(12) = 16
 //       c0 00 00 64               I-SID entry: T=1,R=1, I-SID 100
 //
-// External anchor (F5, wave-2 audit): re-dissected with `scripts/dissect.py
+// External anchor (F5, wave-2 audit): re-dissected with `scripts/gen/dissect.py
 // --frame llc --fields` against Wireshark 4.6.4. `frame.protocols ==
 // "eth:llc:osi:isis:isis.lsp"` — the real LSP sub-dissector — with
 // `isis.type == 18` (L1 LSP), `isis.lsp.lsp_id == 0000.0000.0001.00-00`,
@@ -222,7 +222,7 @@ test "raw escape hatch: an unmodeled TLV type round-trips verbatim" {
     try testing.expectEqualSlices(u8, wire, b2.finish());
 }
 
-// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ────────
+// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/gen/dissect.py) ────────
 //
 // Goldens 1 and 2 above were originally hand-assembled from the spec text
 // only — an anchor whose authority comes from the same head that wrote the
@@ -230,7 +230,7 @@ test "raw escape hatch: an unmodeled TLV type round-trips verbatim" {
 // re-dissected too (see each golden's own "External anchor" note, F5 of the
 // wave-2 audit); that closed the gap for those two PDU types. The vectors
 // below were instead **produced by our own builders**, fed through
-// `scripts/dissect.py`, which runs Wireshark 4.6.4's real IS-IS dissector
+// `scripts/gen/dissect.py`, which runs Wireshark 4.6.4's real IS-IS dissector
 // (sharkd, offline, no network), and pinned to what Wireshark actually
 // printed from the start. This closes the remaining PDU types / TLVs that
 // golden 1/2 above did not cover: LAN Hello, CSNP, PSNP, old-style IS
@@ -244,7 +244,7 @@ test "raw escape hatch: an unmodeled TLV type round-trips verbatim" {
 // ── Golden 3: L1 LAN Hello (PDU type 15) with Area/Protocols/IS-Neighbours ───
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 0f 01 00 03 03 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 0f 01 00 03 03 00 00
 //   00 00 00 01 00 1b 00 2c 40 00 00 00 00 00 01 02 01 04 03 49 00 01 81 01 cc
 //   06 06 00 1b 21 3c 9d f8'
 //
@@ -311,7 +311,7 @@ test "golden LAN Hello (Wireshark-anchored): decode recovers every field" {
 // ── Golden 4: L1 CSNP (PDU type 24) with one LSP Entries record ─────────────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 33 00
+//   scripts/gen/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 33 00
 //   00 00 00 00 01 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 09 10 04
 //   ae 00 00 00 00 00 01 00 00 00 00 00 05 12 34'
 //
@@ -370,7 +370,7 @@ test "golden CSNP (Wireshark-anchored): decode recovers every field" {
 // ── Golden 5: L1 PSNP (PDU type 26) with one LSP Entries record ─────────────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 00
+//   scripts/gen/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 00
 //   00 00 00 00 01 00 09 10 04 ae 00 00 00 00 00 01 00 00 00 00 00 05 12 34'
 //
 // Wireshark printed:
@@ -416,7 +416,7 @@ test "golden PSNP (Wireshark-anchored): decode recovers every field" {
 // ── Reachability (#22, with one sub-TLV) ─────────────────────────────────────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 42 04
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 42 04
 //   b0 00 00 00 00 00 02 00 00 00 00 00 01 00 00 01 01 04 03 49 00 01 02 0c 00
 //   0a 80 80 80 00 00 00 00 00 03 00 16 11 00 00 00 00 00 03 00 00 00 0a 06 fa
 //   04 0a 00 00 01'
@@ -517,7 +517,7 @@ test "golden LSP IS-Reach/Ext-IS-Reach (Wireshark-anchored): decode recovers eve
 // ── Golden 7: L1 LSP with an SPB Instance sub-TLV (1) inside MT-Capability ───
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 3c 04
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 3c 04
 //   b0 00 00 00 00 00 03 00 00 00 00 00 01 00 00 01 90 1f 00 00 01 1b 80 00 00
 //   00 00 00 00 01 00 00 00 00 80 00 00 10 ab cd 01 c0 00 00 00 01 01 00 20'
 //
@@ -641,7 +641,7 @@ test "encode(decode(golden)) == golden for both PDUs (structural round-trip)" {
 // golden 4 otherwise, so the L2 type code is the only variable.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83210106190100030033000000000001
+//   scripts/gen/dissect.py --frame llc --fields '83210106190100030033000000000001
 //   000000000000000000ffffffffffffffff091004ae0000000000010000000000051234'
 //
 // Wireshark printed (verbatim, trimmed to the load-bearing lines):
@@ -696,7 +696,7 @@ test "golden L2 CSNP (Wireshark-anchored): decode recovers the L2 type code and 
 // Same remnant as golden 8, for PSNP. Field values match golden 5 otherwise.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '831101061b0100030023000000000001
+//   scripts/gen/dissect.py --frame llc --fields '831101061b0100030023000000000001
 //   00091004ae0000000000010000000000051234'
 //
 // Wireshark printed:

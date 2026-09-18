@@ -15,7 +15,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `<=400`→`<=378`, `betaprime` `<=313` now holds for real (was the intentionally-red R2 marker).
 - **2026-09-15** — **NO CONSUMER-VISIBLE CHANGE:** A1 R1. The ctgrind harness
   (`src/ctgrind_harness.zig`, never part of the library build) gains a `betaprime` target that
-  taints Bob's 160-byte MtA blind `β'`, and `scripts/ctgrind-expected.tsv` gains its row. No
+  taints Bob's 160-byte MtA blind `β'`, and `scripts/checks/ctgrind-expected.tsv` gains its row. No
   library source changed. The row is RED on purpose: `zkproofs.mulAddBytes`'s carry tail
   branches on secret-derived sums (A1 R2).
 - **2026-09-15** — **ADDITIVE:** audit F6. `signing.signWithSharesOptions(allocator, shares, message,

@@ -34,7 +34,7 @@
 //!   `vect_compare`-based mask trick) — reproduced here bit-for-bit via
 //!   `ctCompare`, not a source-level `if`/`select`, so there is no
 //!   secret-dependent branch in the selection itself. ⭐ As of 2026-09-09 the
-//!   second half of that sentence is no longer a hope: `scripts/ctgrind.sh`
+//!   second half of that sentence is no longer a hope: `scripts/checks/ctgrind.sh`
 //!   measures `decaps` under memcheck with the decapsulation key tainted, and
 //!   NEITHER `ctCompare` NOR this selection appears among the remaining
 //!   contexts (`SPEC.md` lists all 14 by line, and they are in `gf256`'s

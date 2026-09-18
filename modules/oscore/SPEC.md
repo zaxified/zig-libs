@@ -262,7 +262,7 @@ always correct.
 
   **Measured since 2026-09-08**, instead of asserted. The instrument is
   committed: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
-  `scripts/ctgrind.sh oscore`. Zig 0.16.0, valgrind 3.26.0, x86_64,
+  `scripts/checks/ctgrind.sh oscore`. Zig 0.16.0, valgrind 3.26.0, x86_64,
   `ReleaseFast`:
 
   | target | tainted | contexts | in-file | untainted control | no-`-fvalgrind` trap |

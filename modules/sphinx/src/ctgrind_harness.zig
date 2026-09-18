@@ -6,7 +6,7 @@
 //! test-sphinx` — memcheck's context count is valgrind's own verdict, not
 //! something a Zig test can assert on.
 //!
-//! Suggested `scripts/ctgrind.sh` config (NOT added here — the shared script
+//! Suggested `scripts/checks/ctgrind.sh` config (NOT added here — the shared script
 //! is coordinator-owned while other harnesses are in flight; see the
 //! per-module block below for the exact lines):
 //!

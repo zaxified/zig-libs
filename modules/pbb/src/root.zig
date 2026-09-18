@@ -183,7 +183,7 @@ pub const Fields = struct {
     /// matches independent vendor usage: Nokia SR OS's PBB docs also say
     /// "UCA"). Wireshark's own IEEE 802.1ah dissector calls the *identical
     /// bit* `ieee8021ah.nca`, and — verified by forcing this bit to 1 through
-    /// `scripts/dissect.py`/sharkd (see the second Wireshark-anchored golden
+    /// `scripts/gen/dissect.py`/sharkd (see the second Wireshark-anchored golden
     /// below) — its `nca` output tracks the **same raw polarity**, not the
     /// logical inverse: bit=1 reads as both `uca=true` here and
     /// `ieee8021ah.nca == 1` in Wireshark, whose dissector's own embedded
@@ -852,20 +852,20 @@ test "fuzz: decode never panics/OOBs on hostile bytes and stays within input bou
     try testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seeds });
 }
 
-// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) ───────────
+// ── External anchor: Wireshark 4.6.4 (sharkd, via scripts/gen/dissect.py) ───────────
 //
 // The two goldens above were hand-assembled from the spec text — an anchor
 // whose authority comes from the same head that wrote the encoder is not an
 // external anchor (our encoder and our own reading of 802.1ah could share one
 // misunderstanding and both goldens would still "pass"). The vector below was
 // instead produced by this module's own `encode()` and fed through
-// `scripts/dissect.py`, which runs Wireshark 4.6.4's real IEEE 802.1ah
+// `scripts/gen/dissect.py`, which runs Wireshark 4.6.4's real IEEE 802.1ah
 // dissector (sharkd, offline, no network, no capture), then pinned to what
 // Wireshark actually printed. This is a behaviour cross-check, not a port: no
 // third-party source was copied into this codec (see `/NOTICE` — none needed).
 //
 // Command:
-//   scripts/dissect.py --frame raw --fields '00 1b 21 00 00 01 00 1b 21 00 00
+//   scripts/gen/dissect.py --frame raw --fields '00 1b 21 00 00 01 00 1b 21 00 00
 //   02 88 a8 50 c8 88 e7 90 00 10 00 00 50 56 00 00 01 00 50 56 00 00 02 81 00
 //   00 0a 08 00 45 00 00 1c 00 01 00 00 40 fd 65 e2 0a 00 00 01 0a 00 00 02 41
 //   42 43 44 45 46 47 48'
@@ -976,10 +976,10 @@ test "golden (Wireshark-anchored): decode recovers every field, including the re
 // `nca` is a same-polarity relabelling of our bit" from "Wireshark's `nca` is
 // the logical inverse of our bit" — both hypotheses agree when the raw bit is
 // 0. This golden is the same frame with only that one bit forced to 1, run
-// through the identical `scripts/dissect.py`/sharkd pipeline, to settle it.
+// through the identical `scripts/gen/dissect.py`/sharkd pipeline, to settle it.
 //
 // Command:
-//   scripts/dissect.py --frame raw --fields '00 1b 21 00 00 01 00 1b 21 00 00
+//   scripts/gen/dissect.py --frame raw --fields '00 1b 21 00 00 01 00 1b 21 00 00
 //   02 88 a8 50 c8 88 e7 98 00 10 00 00 50 56 00 00 01 00 50 56 00 00 02 81 00
 //   00 0a 08 00 45 00 00 1c 00 01 00 00 40 fd 65 e2 0a 00 00 01 0a 00 00 02 41
 //   42 43 44 45 46 47 48'

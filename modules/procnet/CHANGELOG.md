@@ -62,7 +62,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `deinit`) and `readSockets` returning it, `socket_table_read_limit`, `VirtualFile`,
   `readVirtualFileReporting`, `copyClamped`. **BREAKING** for a caller that bound
   `readSockets`' result as a slice.
-  ⚠ Entry written 2026-09-06, four days after the commit: `scripts/check-changelog-entry.py`
+  ⚠ Entry written 2026-09-06, four days after the commit: `scripts/checks/check-changelog-entry.py`
   landed that day and named this module as the one open case in the whole tree.
 
 - **2026-08-24** — The IPv6 half of the big-endian byte-order rule is measured rather than

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — `opaque`'s entry in the constant-time gate (A1
-//! `opaque.md` M5). Run it through `../../../scripts/ctgrind.sh opaque`.
+//! `opaque.md` M5). Run it through `../../../scripts/checks/ctgrind.sh opaque`.
 //!
 //! NOT wired into `zig build test-opaque` — memcheck's context count is
 //! valgrind's output, not something a Zig test can assert on. `zig build

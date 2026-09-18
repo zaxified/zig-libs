@@ -90,7 +90,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   exactly what they claim to be — a second implementation, correctly labelled.
 
 - **2026-09-01** — **The tool that keeps that anchor honest verified nothing.**
-  `scripts/pqxdh-kdf-check.py` documented `--check` ("re-derive and diff
+  `scripts/gen/pqxdh-kdf-check.py` documented `--check` ("re-derive and diff
   against the pin"); `main()` ignored `argv`, so `--check` printed the vectors
   and exited 0 whether or not the pin matched. Implemented, and it exits 1 on
   a one-byte corruption. (The pin was in fact correct — all three vectors
@@ -143,7 +143,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   spec nor libsignal). XEdDSA still carries libsignal's own vector, and
   the composition is checked against a second implementation of the same
   arithmetic
-  (`scripts/pqxdh-kdf-check.py`, pinned in `interop_vectors.zig`) rather than
+  (`scripts/gen/pqxdh-kdf-check.py`, pinned in `interop_vectors.zig`) rather than
   against the protocol's authors. A round trip cannot catch a misplaced KEM
   secret — both sides would agree on the wrong answer — so the wrong answer is
   pinned too.

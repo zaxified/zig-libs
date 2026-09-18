@@ -35,7 +35,7 @@
 //! arithmetic into overflow branches on secret-derived values and flood the
 //! report; and Debug cannot be measured at all, because valgrind's DWARF
 //! reader cannot parse what Zig's self-hosted backend emits and Debug is the
-//! only mode where that backend is the default (`scripts/ctgrind.sh` § MODES).
+//! only mode where that backend is the default (`scripts/checks/ctgrind.sh` § MODES).
 
 const std = @import("std");
 const builtin = @import("builtin");

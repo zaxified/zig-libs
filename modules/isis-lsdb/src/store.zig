@@ -1380,7 +1380,7 @@ test "aging: keeps before expiry, purges at expiry, removes after ZeroAge" {
 // pins that cleanup. It goes RED without `tick`'s `self.dequeueAll(key)`
 // call: commenting that line out (verified by hand this session) makes
 // `interfacesWithSrm()` after full removal still report both interfaces set,
-// failing the final assertion below — `scripts/capped zig build
+// failing the final assertion below — `scripts/lib/capped zig build
 // test-isis-lsdb` went from 0 to a failing test with that one line removed,
 // reverted immediately after.
 test "a removed entry's SRM/SSN queue membership does not survive it" {

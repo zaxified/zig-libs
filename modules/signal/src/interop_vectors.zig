@@ -177,7 +177,7 @@ pub const root_ratchets = [_]RootRatchet{
 // ── PQXDH key-derivation chain (Part 3) ────────────────────────────────────
 
 /// PQXDH's `SK = KDF(F || DH1 || DH2 || DH3 [|| DH4] || SS)`, computed by an
-/// INDEPENDENT implementation: `scripts/pqxdh-kdf-check.py`, written from
+/// INDEPENDENT implementation: `scripts/gen/pqxdh-kdf-check.py`, written from
 /// Python's `hmac`/`hashlib` alone, sharing no code with `pqxdh.zig`.
 ///
 /// Unlike the Double Ratchet vectors above, these are NOT from libsignal, and
@@ -194,7 +194,7 @@ pub const root_ratchets = [_]RootRatchet{
 ///
 /// The inputs are deliberately fake and each a distinct constant byte, so
 /// swapping any two terms changes the answer. Regenerate with
-/// `scripts/pqxdh-kdf-check.py`.
+/// `scripts/gen/pqxdh-kdf-check.py`.
 pub const pqxdh_kdf = struct {
     /// `SK` for DH1=0x01.., DH2=0x02.., DH3=0x03.., DH4=0x04.., SS=0x05..
     pub const with_one_time_prekey = "74683c230441224d300be36d3bf9c107172118d271470fd8d71732d1a53d9acd";

@@ -190,7 +190,7 @@ shape and say so.
   returning a `Report` — the struct is 9,344 bytes (dominated by the fixed
   `entries: [max_entries]Entry` array), and returning it by value cost a full struct copy on the
   client's report-receive hot path (measured: 3,514 ns/call before, 514 ns/call after, one 106-octet
-  captured report per call, `ReleaseFast`, `IEC61850_BENCH=1 scripts/capped zig build
+  captured report per call, `ReleaseFast`, `IEC61850_BENCH=1 scripts/lib/capped zig build
   test-iec61850 -Doptimize=ReleaseFast`). `ReportHandler.on_report` follows the same contract one
   hop downstream: it takes `r: *const report.Report`, a borrow into the client's own decode-scratch
   storage, valid only for the duration of the call. **Partial-failure contract**: on an error, some

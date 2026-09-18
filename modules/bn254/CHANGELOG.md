@@ -41,8 +41,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   of hand-written constant-time Montgomery arithmetic and the module was not
   on the ctgrind list, so none of it had ever been measured -- the same
   structural gap that let `p256`'s HIGH survive an audit.
-  `modules/bn254/src/ctgrind_harness.zig` plus recipes in `scripts/ctgrind.sh`
-  and rows in `scripts/ctgrind-expected.tsv` close it, and the first run found
+  `modules/bn254/src/ctgrind_harness.zig` plus recipes in `scripts/checks/ctgrind.sh`
+  and rows in `scripts/checks/ctgrind-expected.tsv` close it, and the first run found
   something: **`Fp.ctSelect`'s mask was not laundered through `blackBox`**,
   although that barrier's own doc comment describes exactly this pattern and
   names its consequence as "a secret-dependent branch on the Groth16 prove

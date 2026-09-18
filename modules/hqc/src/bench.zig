@@ -2,7 +2,7 @@
 
 //! bench — KEM operation timings. Off by default; opt in with `HQC_BENCH`:
 //!
-//!   HQC_BENCH=1 scripts/capped zig build test-hqc -Doptimize=ReleaseFast -Dcpu=native
+//!   HQC_BENCH=1 scripts/lib/capped zig build test-hqc -Doptimize=ReleaseFast -Dcpu=native
 //!
 //! ## Why this file exists
 //!

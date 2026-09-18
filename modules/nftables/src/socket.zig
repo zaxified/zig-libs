@@ -707,7 +707,7 @@ test "live: native batch round-trip — create, list, delete" {
     for (tables2.items) |t| try testing.expect(!std.mem.eql(u8, t.name, test_table));
 
     // Success-path diagnostic: gated, because the driver treats any stderr
-    // from a passing step as a failure (scripts/test-lib.sh) — a rule that
+    // from a passing step as a failure (scripts/lib/test-lib.sh) — a rule that
     // only holds if passing tests stay silent.
     if (verboseSkip()) std.debug.print("\nLIVE nftables round-trip: create/list/delete OK.\n", .{});
 }

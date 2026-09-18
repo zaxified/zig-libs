@@ -240,7 +240,7 @@ outside oracle, and (see below) finding one turned up a real bug (§3's
 
 Per CONVENTIONS §7 this is pure logic → unit + property/round-trip **plus**,
 for the TLV 240 wire format specifically, Wireshark 4.6.4 (sharkd, headless,
-via `scripts/dissect.py`) as an external anchor: PDUs produced by this
+via `scripts/gen/dissect.py`) as an external anchor: PDUs produced by this
 module's own `start()`/`rxHelloBytes()`/`helloFields()`/`buildHello` were fed
 through Wireshark's real IS-IS dissector and the frozen bytes + Wireshark's
 printed output are pinned in `root.zig`'s golden tests and `three_way.zig`'s
@@ -254,7 +254,7 @@ Stale as of the wave-2 audit (F5): the 1-octet form HAS since been
 independently re-run, the other direction — a bare length-1 TLV 240 was fed
 to both Wireshark's dissector and this module's own `decode`, and the two
 independent readings agree (`three_way.zig`'s golden for the shape, with the
-`scripts/dissect.py` command and Wireshark's printed output quoted inline).
+`scripts/gen/dissect.py` command and Wireshark's printed output quoted inline).
 The P2P Hello *header* framing (length-indicator, PDU length, circuit-type
 bits, holding-time, local-circuit-id) is the sibling `isis` codec's own
 already-anchored surface (see this module's anchor record (`SPEC.md` § Anchoring)) — that part

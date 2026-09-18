@@ -5,7 +5,7 @@
 //! instrument behind it, and audit item A5 explicitly says so: "there is no
 //! dudect-class harness in this toolchain" (`SPEC.md` line ~741, quoted in
 //! full below). This file is that harness. Run it through
-//! `../../../scripts/ctgrind.sh threshold_ecdsa` once the coordinator wires
+//! `../../../scripts/checks/ctgrind.sh threshold_ecdsa` once the coordinator wires
 //! the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries suggested at the bottom
 //! of this comment — until then, drive it directly:
 //!
@@ -17,7 +17,7 @@
 //! count is valgrind's own verdict, not something a Zig test can assert on.
 //! `zig build check-ctgrind` compiles this (Debug, `-fvalgrind` forced on)
 //! so it cannot rot into an unbuildable recipe; that compile is not a
-//! measurement (see `scripts/ctgrind.sh`'s own header).
+//! measurement (see `scripts/checks/ctgrind.sh`'s own header).
 //!
 //! ## Why `signWithShares`, not the private per-round helpers
 //!
@@ -113,7 +113,7 @@
 //! Per (target, mode): the CLAIM row (`taint=yes`, built `-fvalgrind`), an
 //! UNTAINTED negative control (`taint=no`, same build), and a
 //! no-`-fvalgrind` TRAP (`taint=yes`, built without the switch — see
-//! `scripts/ctgrind.sh`'s header for why: `std.valgrind.doClientRequest`
+//! `scripts/checks/ctgrind.sh`'s header for why: `std.valgrind.doClientRequest`
 //! silently no-ops without it). A zero in the claim row means nothing
 //! unless the control is also zero (rules out "the pattern matches
 //! everything") and the trap is also zero with a non-zero total elsewhere
@@ -435,7 +435,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh config (for the coordinator to paste in;
+// ── suggested scripts/checks/ctgrind.sh config (for the coordinator to paste in;
 // this file does not and must not edit that script itself) ───────────────
 //
 // declare -A TARGETS=(

@@ -4,7 +4,7 @@
 //! (audit finding "tlock F3", `tlock.zig:230`), the module's own
 //! hand-rolled constant-time `Gt` exponentiation — plus, at the task's
 //! explicit request, the recipient-private-key path through `decrypt`.
-//! Run via `../../../scripts/ctgrind.sh tlock` once the coordinator adds
+//! Run via `../../../scripts/checks/ctgrind.sh tlock` once the coordinator adds
 //! the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries suggested at the
 //! bottom of this file (that script REFUSES an unlisted module). NOT
 //! wired into `zig build test-tlock` — memcheck's context count is
@@ -92,7 +92,7 @@
 //! value to be tainted as "the recipient's identity-based private key",
 //! and it genuinely has a taint PATH all the way through `decrypt` (this
 //! is not `bolt8`'s structurally-dead `act1` case — see that module's
-//! `TARGETS` comment in `scripts/ctgrind.sh` for the shape this ISN'T),
+//! `TARGETS` comment in `scripts/checks/ctgrind.sh` for the shape this ISN'T),
 //! so it is measured here and reported honestly; but a nonzero count
 //! inside `pairing.zig` is not evidence of a defect in `tlock`; see
 //! "the pairing substrate" below.
@@ -122,7 +122,7 @@
 //!
 //! 1. ReleaseFast only, same reasoning as `bls12_381`'s harness: Debug's
 //!    self-hosted backend emits `.debug_line` valgrind cannot parse
-//!    (`scripts/ctgrind.sh`'s header), and ReleaseSafe's overflow checks
+//!    (`scripts/checks/ctgrind.sh`'s header), and ReleaseSafe's overflow checks
 //!    on ordinary arithmetic would bury the ladder's branch structure
 //!    under checks unrelated to this claim.
 //! 2. `reloadVolatile` (byte arrays) / a volatile round-trip (the `G1`
@@ -134,7 +134,7 @@
 //!    insurance, not an observed requirement, on today's compiler).
 //! 3. Hex/error formatting of the result via `std.debug.print` is the
 //!    propagation witness (not constant-time on purpose) — see
-//!    `scripts/ctgrind.sh`'s `WITNESS` bucket.
+//!    `scripts/checks/ctgrind.sh`'s `WITNESS` bucket.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -232,7 +232,7 @@ fn secretRoundSignature(tainted: bool) g1.Affine {
 /// all: every run rejects, and the only thing printed is a defined error
 /// tag. The 8 in-file branches below are still real (they fire before
 /// the reject), but there was no independent propagation WITNESS the way
-/// `scripts/ctgrind.sh`'s own accounting discipline asks for. Making
+/// `scripts/checks/ctgrind.sh`'s own accounting discipline asks for. Making
 /// `decrypt` actually succeed here is what gives this row a witness
 /// alongside its in-file count.
 fn fixtureCiphertext() tlock.Ciphertext {
@@ -301,7 +301,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh config (coordinator: paste in, do not
+// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
 // generate mechanically — every existing entry carries hand-written
 // reasoning in its own comment; these follow the same shape) ─────────────
 //

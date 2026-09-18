@@ -34,7 +34,7 @@ project at `src/test/data/sighash.json` (`bitcoin/bitcoin`, tag **`v29.0`**).
 The file holds 501 array entries, one of them a header comment, so **500 data
 rows — and all 500 are vendored**, unfiltered. Each row's `raw_transaction` /
 `script` / `input_index` / `hashType` / `signature_hash` is transcribed by
-`scripts/gen-bitcoin-core-vectors.py`, never hand-typed.
+`scripts/gen/gen-bitcoin-core-vectors.py`, never hand-typed.
 
 ## Bitcoin Core `tx_valid.json` + `tx_invalid.json`
 
@@ -57,7 +57,7 @@ network established, not anyone's authored corpus.
 ## python-bitcoinlib (LGPL-3.0) — an ORACLE, and nothing is taken from it
 
 **Copyleft:** NONE-SHIPPED — python-bitcoinlib is an ORACLE this repository RUNS
-at generation time, not code it ships: `scripts/gen-bitcointx-single-bug.py`
+at generation time, not code it ships: `scripts/gen/gen-bitcointx-single-bug.py`
 builds its own transactions and reads back only the value
 `RawSignatureHash` returns for them, so no python-bitcoinlib source and no
 python-bitcoinlib data is in this repository, and nothing links against it.
@@ -67,7 +67,7 @@ saying plainly why no copyleft term reaches this collection — root `NOTICE` §
 makes copyleft in shipped material a defect to be removed, not a paperwork item,
 so "no term reaches us" has to be demonstrated rather than assumed.
 
-`scripts/gen-bitcointx-single-bug.py` builds its transactions ITSELF — `mk(n_in,
+`scripts/gen/gen-bitcointx-single-bug.py` builds its transactions ITSELF — `mk(n_in,
 n_out)` assembles inputs from `COutPoint(lx('aa'*32 …))` and outputs from
 `CScript(bytes([0x51 + i]))`, all of it our own construction — and takes from
 the library only the RETURN VALUE of `RawSignatureHash` on those inputs. That is

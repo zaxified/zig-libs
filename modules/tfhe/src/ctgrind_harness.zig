@@ -7,7 +7,7 @@
 //! fixed-trip loops over `sampleBit`, `gadget.decompose` branches only on
 //! ciphertext coefficients and never on key material) and says plainly that
 //! no timing measurement backed any of it. This file is that measurement.
-//! Run through `../../../scripts/ctgrind.sh tfhe` once the coordinator wires
+//! Run through `../../../scripts/checks/ctgrind.sh tfhe` once the coordinator wires
 //! the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries suggested at the bottom of
 //! this comment — until then, drive it directly:
 //!
@@ -202,7 +202,7 @@
 //! Every target formats its result through `std.debug.print`, not constant
 //! time by design. A non-zero WITNESS count next to a small, itemised
 //! in-file count is what makes the itemisation mean "no branch found", not
-//! "the harness never ran" — see `scripts/ctgrind.sh`'s "the SECOND trap".
+//! "the harness never ran" — see `scripts/checks/ctgrind.sh`'s "the SECOND trap".
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -443,7 +443,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh entries (coordinator wires these) ─────────
+// ── suggested scripts/checks/ctgrind.sh entries (coordinator wires these) ─────────
 //
 // ⚠⚠ `run_one`'s valgrind invocation needs `--max-stackframe=16777216` added
 // for `tfhe` specifically (see trap 3 above) -- wiring TARGETS/MODES/PATTERN
@@ -468,6 +468,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
 // already covers this harness's `std.debug.print` propagation-proof calls.
 // ⚠ `bootstrap`'s claim row hits memcheck's own 10-million-error cap
 // ("More than 10000000 total errors detected. I'm not reporting any more.")
-// -- `scripts/ctgrind.sh`'s existing `log_hit_error_limit`/`accounted=2`
+// -- `scripts/checks/ctgrind.sh`'s existing `log_hit_error_limit`/`accounted=2`
 // convention for a truncated log already covers this; it needs no new code,
 // only for whoever reads the row to expect `accounted=2`, not 1.

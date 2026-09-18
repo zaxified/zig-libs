@@ -1472,7 +1472,7 @@ test "endpoint: a malformed request_schema fails once, then a CACHED error on ev
     const second = c2 - c1;
     const third = c3 - c2;
     // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
-    // (scripts/test-lib.sh), so the number is opt-in; the assertions below run
+    // (scripts/lib/test-lib.sh), so the number is opt-in; the assertions below run
     // either way.
     if (std.process.Environ.getPosix(std.testing.environ, "OPENAPI_VERBOSE") != null) {
         std.debug.print("\n[F1] {d} routes, first={d}ns second={d}ns third={d}ns\n", .{ n, first, second, third });

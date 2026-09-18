@@ -813,7 +813,7 @@ something real:
    failure mode this repo has been burned by before. Fixed to
    `catch { return testkit.skip(...); }` (or the equivalent explicit
    `return error.SkipZigTest;`) throughout: **on this dev host (no
-   CAP_BPF), `scripts/capped zig build test-ebpf` now reports "N skipped"
+   CAP_BPF), `scripts/lib/capped zig build test-ebpf` now reports "N skipped"
    in the summary line** — currently 21 of 149 — instead of hiding them
    inside the pass count. See "How to tell whether the privileged lane
    actually ran" below for the authoritative way to confirm real kernel

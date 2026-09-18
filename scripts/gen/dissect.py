@@ -18,9 +18,9 @@ Note that `sharkd` ships with the GUI package, so it is usually present even
 where the `tshark` CLI is not.
 
 Usage:
-    scripts/dissect.py --frame llc <<< '831b0100 0f010000 ...'
-    printf '%s' "$hex" | scripts/dissect.py --frame llc --fields
-    scripts/dissect.py --frame eth --json < frame.hex
+    scripts/gen/dissect.py --frame llc <<< '831b0100 0f010000 ...'
+    printf '%s' "$hex" | scripts/gen/dissect.py --frame llc --fields
+    scripts/gen/dissect.py --frame eth --json < frame.hex
 
 Input is hex on stdin or as a positional argument; whitespace, newlines,
 `0x` prefixes and `:`/`-` separators are all ignored, so a Zig array literal

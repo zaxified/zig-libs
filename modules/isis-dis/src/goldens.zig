@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/dissect.py`).
+//! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/gen/dissect.py`).
 //!
 //! this module's anchor record (`SPEC.md` § Anchoring) read `SELF` before this file existed,
 //! justified as "lan_id/LSP-ID checked via sibling isis only" — i.e. the claim
@@ -55,7 +55,7 @@ fn snpa(last: u8) election.Snpa {
 // to check the reserved high bit stays clear on the wire.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 0f 01 00 03 03 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 0f 01 00 03 03 00 00
 //   00 00 00 11 00 1e 00 1b 7f 00 00 00 00 00 11 09'
 //
 // Wireshark printed (verbatim, trimmed to the load-bearing lines):
@@ -109,7 +109,7 @@ test "golden L1 LAN Hello (Wireshark-anchored): elect()'s Result drives isis's r
 // exercises the L2 PDU type code (16) and the 0 end of the priority range.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 10 01 00 03 02 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 10 01 00 03 02 00 00
 //   00 00 00 22 00 1e 00 1b 00 00 00 00 00 00 33 07'
 //
 // Wireshark printed:
@@ -155,7 +155,7 @@ test "golden L2 LAN Hello (Wireshark-anchored): elect()'s Result drives isis's r
 // pseudonode LSP; `Result.pseudonodeLspId()` supplies the 8-octet id.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 04
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 04
 //   b0 00 00 00 00 00 11 09 00 00 00 00 01 00 00 01'
 //
 // Wireshark printed:

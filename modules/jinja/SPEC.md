@@ -450,7 +450,7 @@ API makes easy to get wrong.
 If recompilation ever shows up in a profile, the fix is a caller-owned cache
 passed *into* `render`, not a mutable environment.
 
-**It has now been profiled** (`src/bench.zig`, `JINJA_BENCH=1 scripts/capped zig build test-jinja
+**It has now been profiled** (`src/bench.zig`, `JINJA_BENCH=1 scripts/lib/capped zig build test-jinja
 -Doptimize=ReleaseFast`), and it does not clear that bar. The bench renders a page that
 `{% extends %}`es a real-sized base layout and `{% include %}`s a row partial per row, against a
 byte-equivalent inlined page that loads nothing, asserting the two outputs match. The gap between

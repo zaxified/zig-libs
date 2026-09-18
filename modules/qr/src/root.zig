@@ -2476,7 +2476,7 @@ test "EXTERNAL ORACLE: 160 segno-produced grids decode back to segno's own input
     //
     // 160 vectors: every version (1-40) at every level (L/M/Q/H), with the mode
     // cycling so all three appear across the version range. The generator
-    // (`scripts/gen-qr-decode-vectors.py`) emits all 960; all 960 passed when
+    // (`scripts/gen/gen-qr-decode-vectors.py`) emits all 960; all 960 passed when
     // this landed, and 308 KB is what is worth committing.
     const blob = @embedFile("testdata/decode_vectors.bin");
     var off: usize = 0;

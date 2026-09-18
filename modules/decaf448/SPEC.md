@@ -161,7 +161,7 @@ are constructed by machinery independent of the stub under test.
 rather than argued. Since 2026-08-11 the measurement is a **committed
 program**, not a number to take on faith:
 [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-`scripts/ctgrind.sh decaf448`. It marks the scalar
+`scripts/checks/ctgrind.sh decaf448`. It marks the scalar
 `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer cannot
 feed the ladder a defined register copy, and drives it through
 `Element.generator.scalarMul`.
@@ -192,7 +192,7 @@ arrived". The witness prints raw projective coordinates through
 `ed448`'s harness.
 
 Re-attribute the column yourself with
-`scripts/ctgrind.sh decaf448 --pattern 'ed448[.]zig'` (also **0**), or
+`scripts/checks/ctgrind.sh decaf448 --pattern 'ed448[.]zig'` (also **0**), or
 read the frames with `--stacks`.
 
 **Teeth, measured 2026-08-11.** Re-introducing a variable-time

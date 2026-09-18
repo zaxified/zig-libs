@@ -10,7 +10,7 @@
 //! (canonical shape for this file) do for theirs.
 //!
 //! Run via `zig build ctgrind -Dctgrind-module=frost -Dctgrind-valgrind=<bool>
-//! -Doptimize=ReleaseFast` (the shared `scripts/ctgrind.sh` has no per-module
+//! -Doptimize=ReleaseFast` (the shared `scripts/checks/ctgrind.sh` has no per-module
 //! recipe for `frost` yet — see its header for the manual valgrind
 //! invocation). NOT wired into `zig build test-frost`: memcheck's context
 //! count is valgrind's own verdict, not something a Zig test can assert on.
@@ -72,7 +72,7 @@
 //! delegates instead of attributing only to the calling module's own file.
 //! ⚠ `root[.]zig` is frost's OWN basename but is shared with several other
 //! modules in this tree (`bip340`, `k256`, `blindrsa`, `rsa`, …) — see
-//! `scripts/ctgrind.sh`'s `blindrsa` comment for the exact trap. It is a
+//! `scripts/checks/ctgrind.sh`'s `blindrsa` comment for the exact trap. It is a
 //! live risk here only in principle: `round1Commit`/`round2Sign` never call
 //! into `bip340` (the module doc comment: "no function in this module
 //! currently calls into bip340"), so no `bip340/root.zig` frame should ever
@@ -150,9 +150,9 @@
 //! which is NOT constant-time (digit/hex formatting branches on the value).
 //! A non-zero total next to a small itemised in-file count is what makes a
 //! zero in-file count mean "no branch found" rather than "the taint never
-//! arrived" — see `WITNESS` in `scripts/ctgrind.sh`.
+//! arrived" — see `WITNESS` in `scripts/checks/ctgrind.sh`.
 //!
-//! ## Suggested `scripts/ctgrind.sh` config (coordinator wires these; NOT
+//! ## Suggested `scripts/checks/ctgrind.sh` config (coordinator wires these; NOT
 //! added here per this task's own instructions)
 //!
 //! ```text

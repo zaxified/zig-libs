@@ -15,7 +15,7 @@
 //!
 //! Build and run it (from the repository root):
 //!
-//!     scripts/capped zig build-exe --cache-dir .zig-cache \
+//!     scripts/lib/capped zig build-exe --cache-dir .zig-cache \
 //!       -femit-bin=.zig-cache/paillier-oracle/probe_vectors \
 //!       --dep paillier --dep montint \
 //!       -Mroot=modules/paillier/tools/probe_vectors.zig \

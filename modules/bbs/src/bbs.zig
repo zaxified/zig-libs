@@ -282,7 +282,7 @@ fn msmPippenger(allocator: std.mem.Allocator, points: []const G1.Affine, scalars
 
 /// Crossover point (term count) between `msmLoop` and `msmPippenger`,
 /// MEASURED on this host at `-Doptimize=ReleaseFast`
-/// (`BBS_BENCH=1 scripts/capped zig build test-bbs -Doptimize=ReleaseFast`,
+/// (`BBS_BENCH=1 scripts/lib/capped zig build test-bbs -Doptimize=ReleaseFast`,
 /// the "bench (opt-in via BBS_BENCH)" test below):
 ///
 /// ```

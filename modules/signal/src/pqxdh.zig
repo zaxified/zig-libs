@@ -31,7 +31,7 @@
 //! agreement — checked 2026-08-22. So the anchoring here is layered rather
 //! than end-to-end: `xeddsa` carries libsignal's own published vector, and the
 //! composition itself is checked against an independent HKDF implementation
-//! (`scripts/pqxdh-kdf-check.py`, whose output is pinned in
+//! (`scripts/gen/pqxdh-kdf-check.py`, whose output is pinned in
 //! `interop_vectors.zig`). What is NOT claimed is byte-compatibility with
 //! Signal's servers: like `x3dh.zig`, this file uses its own `info` string,
 //! which the spec explicitly leaves application-specific.
@@ -453,7 +453,7 @@ fn hexEq(want_hex: []const u8, got: []const u8) !void {
 }
 
 test "SK matches an independent implementation of the KDF chain, with and without DH4" {
-    // The anchor is `scripts/pqxdh-kdf-check.py` — see `interop_vectors.zig`
+    // The anchor is `scripts/gen/pqxdh-kdf-check.py` — see `interop_vectors.zig`
     // for why this is a second implementation rather than the protocol
     // authors' own vectors, and what that does and does not buy.
     const d1: [32]u8 = @splat(1);

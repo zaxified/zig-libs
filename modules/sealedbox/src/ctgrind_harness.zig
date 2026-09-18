@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — measures the four SECRET-KEY text codecs, which are the
 //! only place this module touches a secret with code of its own choosing.
-//! Run it through `../../../scripts/ctgrind.sh sealedbox`.
+//! Run it through `../../../scripts/checks/ctgrind.sh sealedbox`.
 //!
 //! ## Why this module has a harness at all
 //!

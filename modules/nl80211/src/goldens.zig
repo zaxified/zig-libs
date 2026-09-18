@@ -51,7 +51,7 @@
 //! `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` and `PREV_BSSID` stay round-trip-only:
 //! a PSK association through cfg80211's own SME sends none of them, which the
 //! test asserts rather than assumes. Their attribute *numbers* are
-//! standing-checked by `scripts/check-uapi-consts.py nl80211` against this
+//! standing-checked by `scripts/checks/check-uapi-consts.py nl80211` against this
 //! host's `/usr/include/linux/nl80211.h` on every run (`PMK`=254,
 //! `USE_MFP`=66, `WANT_1X_4WAY_HS`=257, `PREV_BSSID`=79).
 //!
@@ -583,7 +583,7 @@ test "golden: a real wpa_supplicant WPA2-PSK CONNECT, attribute for attribute" {
     // a PSK association through cfg80211's own SME sends none of these, so
     // `PMK`, `USE_MFP`, `WANT_1X_4WAY_HS` and `PREV_BSSID` remain covered by
     // round-trip only. Their attribute numbers are standing-checked by
-    // `scripts/check-uapi-consts.py nl80211`.
+    // `scripts/checks/check-uapi-consts.py nl80211`.
     for ([_]u16{
         uapi.ATTR.PMK,
         uapi.ATTR.USE_MFP,

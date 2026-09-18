@@ -114,7 +114,7 @@ def main() -> int:
                     hits.append((f, ln, "a helper announces a skip and returns null; its callers' `orelse return` is a PASS"))
 
     # The env-var NAME is held by convention alone: `testkit` declares it,
-    # `scripts/test-lib.sh` and the docs spell it out, and nothing connects the
+    # `scripts/lib/test-lib.sh` and the docs spell it out, and nothing connects the
     # two. Renaming the constant would silently disconnect every skip
     # diagnostic in the collection from the variable operators actually set.
     # A grep is not circular here, because the two spellings live in different
@@ -126,8 +126,8 @@ def main() -> int:
         print("modules/testkit/src/root.zig: verbose_skip_env is gone or renamed")
         return 1
     name = declared.group(1)
-    if name not in Path("scripts/test-lib.sh").read_text():
-        print(f"scripts/test-lib.sh does not mention {name}, which testkit declares")
+    if name not in Path("scripts/lib/test-lib.sh").read_text():
+        print(f"scripts/lib/test-lib.sh does not mention {name}, which testkit declares")
         return 1
 
     if hits:

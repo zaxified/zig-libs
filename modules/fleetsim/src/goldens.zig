@@ -21,7 +21,7 @@
 //! specifications, and it grades the frames our adapters produce without any
 //! knowledge of how we produced them. That is an oracle which fails
 //! independently of whoever wrote the encoder, which is the definition this
-//! repo works to (`scripts/dissect.py`, and the `isis*` goldens files).
+//! repo works to (`scripts/gen/dissect.py`, and the `isis*` goldens files).
 //!
 //! ## What each vector is
 //!
@@ -33,7 +33,7 @@
 //!
 //! ## How the frozen readings were obtained (capture-and-freeze, run once)
 //!
-//! `scripts/dissect.py` only knows the `raw`/`eth`/`llc` framings, and these
+//! `scripts/gen/dissect.py` only knows the `raw`/`eth`/`llc` framings, and these
 //! are TCP/UDP payloads, so the runs went through the same two tools it drives
 //! internally, with `text2pcap` supplying the transport header:
 //!

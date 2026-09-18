@@ -11,7 +11,7 @@
 //! `live dns test skipped: <error>` with `std.debug.print` — which is stderr.
 //!
 //! The gate driver treats ANY stderr on an exit-0 step as a failure
-//! (`scripts/test-lib.sh`, "OK-but-stderr -> treated as FAIL"), and that rule
+//! (`scripts/lib/test-lib.sh`, "OK-but-stderr -> treated as FAIL"), and that rule
 //! is right: it exists because four checkers reported success while
 //! complaining, and because `check-uapi` sat unwired for months with its
 //! summary on the wrong stream. So a slow DNS server — not a bug, not even a

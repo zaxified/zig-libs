@@ -5,7 +5,7 @@
 //! "Const-time / zeroization" one under the Double Ratchet), as an actual
 //! committed program instead of a code block a reader has to retype. Build
 //! and run it the way `ct25519`'s harness documents (`modules/ct25519/src/
-//! ctgrind_harness.zig`'s header) — `scripts/ctgrind.sh` needs a per-module
+//! ctgrind_harness.zig`'s header) — `scripts/checks/ctgrind.sh` needs a per-module
 //! config block this module does not yet have, so drive this file directly:
 //!
 //!     zig build ctgrind -Dctgrind-module=signal -Dctgrind-valgrind=true -Doptimize=ReleaseFast
@@ -75,7 +75,7 @@
 //!   `header`/`ciphertext` (the wire message an adversary observes) or
 //!   Alice's own state.
 //!
-//! ## Suggested `scripts/ctgrind.sh` config (NOT added here — the shared
+//! ## Suggested `scripts/checks/ctgrind.sh` config (NOT added here — the shared
 //! script's per-module blocks are the coordinator's to wire; see the task
 //! that produced this file)
 //!

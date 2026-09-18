@@ -235,7 +235,7 @@ it, and SPEC.md does not restate it. Vocabulary:
 
   **This is a claim about what the gate has checked, not about where the code might
   incidentally run.** Declare a target only once `zig build portable-<name>-<target>`
-  either passes or is added to `scripts/portable-known-failures.tsv` with the real
+  either passes or is added to `scripts/checks/portable-known-failures.tsv` with the real
   compiler error as the reason — never because the code "should" work there. A module
   that never intends a target (raw `std.Thread`/libc/`std.os.linux` use with no wasm or
   embedded audience) simply omits it; that is not a defect and does not need a baseline
@@ -340,7 +340,7 @@ One fact lives in exactly one place; everywhere else links to it, never restates
 | design & invariants, threat-model, verification detail, per-module backlog | `modules/<m>/SPEC.md` | — |
 | license attribution / provenance | `modules/<m>/NOTICE` — the root `NOTICE` answers only whether the library AS A WHOLE is still plain MIT, and names no module | README/SPEC only point to it, never restate the terms |
 | which modules have a LIVE external peer | `.live` on the `module_list` entry | `zig build module-graph` publishes it; the shell scripts derive theirs from that, never a list of their own |
-| which modules have a constant-time harness | `modules/<m>/src/ctgrind_harness.zig` **existing** | derived — build.zig scans for it, `module-graph` publishes it, `scripts/ctgrind.sh` reads it from there |
+| which modules have a constant-time harness | `modules/<m>/src/ctgrind_harness.zig` **existing** | derived — build.zig scans for it, `module-graph` publishes it, `scripts/checks/ctgrind.sh` reads it from there |
 | standalone consumer applications | `example-apps/<name>/`, declared in `example_apps` in `build.zig` | `scripts/check-apps.sh --run` builds each against the working tree with `--fork` and then RUNS its `smoke.sh` (required, and it must be executable) in BOTH `ReleaseSafe` and `ReleaseFast` on every run, and `--pinned` builds each from its manifest — fetch by URL and hash — on a tag ref, where the pin and the commit are the same content. Both are blocking (`consumer` job). An app's source is written against the TREE; the pin is for the downloader, a tag being the only ref that carries the all-lanes-green claim. An app importing exactly one module discharges that module's §7.2 obligation |
 | what a consumer receives when they fetch this package | `build.zig.zon`'s `.paths` | `zig build check-package` requires `LICENSE` and `NOTICE` to be in it — a file outside `.paths` is visible on GitHub and absent from every fetched copy |
 | all repo rules | this file (`CONVENTIONS.md`) | — |
@@ -453,14 +453,14 @@ reference, not a re-explanation of everything the README already covers.
    aggregator — a bare `pub const x = @import("x.zig")` re-export does **not** pull `x`'s
    tests into the test binary (the dark-tests rule; it hid 92 never-run tests before it
    was caught). Verify with the gate, not by hand: `zig build check-dark-tests
-   -Ddark-module=<name>` (or `scripts/dark-tests.sh <name>`) requires the declared count to
+   -Ddark-module=<name>` (or `scripts/lib/dark-tests.sh <name>`) requires the declared count to
    EQUAL the `(N total)` field of the run-test summary line. `scripts/test.sh` runs the same
    check over every module, reading the `--summary all` output its own suite already
    produced. Do not reconstruct this by hand: the obvious `cat modules/<m>/src/*.zig | grep
    -c '^\s*test '` is not recursive (it misses `src/testdata/*.zig` and any other
    subdirectory the compilation does analyse) and invites comparing against the *pass* count
    rather than the total, which is exactly the bug that let `ratelimit` report `18/18 passed`
-   with 3 tests dark. See `scripts/dark-tests.sh`'s header for why this must ask the compiler
+   with 3 tests dark. See `scripts/lib/dark-tests.sh`'s header for why this must ask the compiler
    instead of matching source statically.
 4. `zig build test-<name>` (per module) and `zig build test` (all) — green in **all three
    release lanes**: `-Doptimize=ReleaseSafe`, `-Doptimize=ReleaseFast`, `-Dstrict-debug`
@@ -614,7 +614,7 @@ with `-fno-llvm`, **0** with `-fllvm`, and the release modes break identically w
 `-fno-llvm` (48 395 / 37 369), so it is the backend and not the mode. The cost is not lost
 attribution but WRONG attribution: on the same harness, `ReleaseFast` and `ReleaseSafe`
 resolve 100 % of frames to `(file:line)` and Debug resolves 42.4 %, of which 51 of 60 carry
-the wrong line. This is why `scripts/ctgrind.sh` measures no module in Debug. Details, and
+the wrong line. This is why `scripts/checks/ctgrind.sh` measures no module in Debug. Details, and
 the two blind oracles that make this easy to misdiagnose, in `scripts/README.md`
 § "Constant-time harnesses (ctgrind)".
 
@@ -709,7 +709,7 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
   change to behaviour or API is recorded newest first, each entry naming the tag it shipped in
   and flagging breaking changes **BREAKING**. Routine internal refactors need no entry.
   **What "needs an entry" means mechanically** (2026-09-06): `zig build check-changelog` proves
-  the file is there and well formed; `scripts/check-changelog-entry.py` proves it MOVED when the
+  the file is there and well formed; `scripts/checks/check-changelog-entry.py` proves it MOVED when the
   module did, by this rule — a module owes a new dated bullet whenever, under
   `modules/<name>/src/`, the change-set touches a line beginning with `pub` **or** moves more
   than 25 lines of code, where "code" excludes blank lines, comment lines, whitespace-only
@@ -923,7 +923,7 @@ that reaches it can notice.
   only two honest outcomes in a gate, and both are wrong: it fails when a resolver is
   slow, or it skips, and a skip is a test reporting success for a run in which it did
   nothing. `dns` had seven, each `catch |err| return skipLive(err)` with the skip narrated
-  by `std.debug.print` — stderr, which `scripts/test-lib.sh` turns into a FAIL — so one
+  by `std.debug.print` — stderr, which `scripts/lib/test-lib.sh` turns into a FAIL — so one
   slow lookup was a red run across 217 modules.
   ⚠ Deliberately NOT the same file as `interop.zig`, and the difference is the promise:
   an interop program asserts it needs no network, a live program asserts it needs one.

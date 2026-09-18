@@ -13,7 +13,7 @@
 //! Build and run it (from the repository root; `vdf` needs `montint` behind
 //! it, same three-module wiring as `modules/paillier/tools/probe_vectors.zig`):
 //!
-//!     scripts/capped zig build-exe --cache-dir .zig-cache/o1-vdf \
+//!     scripts/lib/capped zig build-exe --cache-dir .zig-cache/o1-vdf \
 //!       -femit-bin=.zig-cache/o1-vdf/eval_driver \
 //!       --dep vdf --dep montint \
 //!       -Mroot=modules/vdf/tools/eval_driver.zig \

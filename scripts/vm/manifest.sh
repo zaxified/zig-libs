@@ -1,7 +1,7 @@
 # VM image manifest. Sourced by fetch-images.sh and run.sh — not executable
 # on its own.
 #
-# Style note: no `declare -A` (see scripts/test-lib.sh's header comment —
+# Style note: no `declare -A` (see scripts/lib/test-lib.sh's header comment —
 # macOS ships bash 3.2). Each image is one row of parallel arrays instead.
 #
 # Two images, one per libc/platform the netns-gated modules need:

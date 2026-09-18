@@ -39,7 +39,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   a name a caller should look up, and both made the output depend on who ran the generator.
   `offsetAt("localtime", ...)` now returns the same not-found result as any other unknown name.
 
-- **2026-08-22** — `scripts/tz-gen/fetch-and-build.sh`: the pinned release is now re-derivable
+- **2026-08-22** — `scripts/gen/tz-gen/fetch-and-build.sh`: the pinned release is now re-derivable
   **anywhere**, not only on a machine that happens to have that release installed. The claim in
   `SPEC.md` and the 2026-08-16 entry below — that `tz_data.zig`'s pin "can be re-derived rather
   than only trusted" — was true of the tool and false in practice: the tool reads a compiled
@@ -48,7 +48,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   table here produced a different one.
 
   The script fetches `tzdata<release>.tar.gz` from IANA against a SHA-256 pinned in
-  `scripts/tz-gen/checksums.txt`, compiles it with the system `zic -b fat`, and generates from
+  `scripts/gen/tz-gen/checksums.txt`, compiles it with the system `zic -b fat`, and generates from
   that tree. `--check` regenerates to a temp file and diffs the committed table, exiting non-zero
   on any difference — verified against a real mismatch, not just a clean run. A missing `zic` is a
   hard failure rather than a fall-back to the host tree, because a fall-back would emit a table
@@ -61,7 +61,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `tzdata.zi`. The file ends with a newline, which landed mid-sentence in the generated header
   comment and split the line.
 
-- **2026-08-16** — The `tz-gen` generator moved into this repo at `scripts/tz-gen/`, closing the
+- **2026-08-16** — The `tz-gen` generator moved into this repo at `scripts/gen/tz-gen/`, closing the
   "tzdata refresh cadence tooling" deferral in `SPEC.md`. No code or API change here — what changes
   is that `tz_data.zig`'s pinned release can now be re-derived and bumped rather than only trusted,
   which was the one thing the extraction left unanswerable. It stays out of `modules/` deliberately:

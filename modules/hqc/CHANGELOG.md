@@ -68,7 +68,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   decapsulation key), that one loop was **38 of `decaps`'s 52** secret-dependent branch
   contexts. Post-fix, ReleaseFast in-file contexts: `decaps` **52 → 14**, `keygen`
   **26 → 4**, `encaps` **33 → 6**; `sampler` stays at 2, which is the expected result
-  since that target never reaches the scatter. `scripts/ctgrind-expected.tsv` is re-pinned
+  since that target never reaches the scatter. `scripts/checks/ctgrind-expected.tsv` is re-pinned
   to the new counts, so deleting the barrier turns `ctgrind --check` red rather than
   passing quietly.
 
@@ -89,7 +89,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   secret-derived data. See `SPEC.md`.
 - **2026-09-08** — The constant-time posture is measured now, and the measurement
   disagrees with what `SPEC.md` claimed. `src/ctgrind_harness.zig` is committed and
-  `scripts/ctgrind.sh` drives it; the four rows in `scripts/ctgrind-expected.tsv` are a
+  `scripts/checks/ctgrind.sh` drives it; the four rows in `scripts/checks/ctgrind-expected.tsv` are a
   **recorded defect**, not a clean claim. ReleaseFast, tainting the secret half of the
   decapsulation key: `decaps` **52** in-file contexts, `keygen` 26, `encaps` 33, `sampler` 2,
   with the untainted control and the no-`-fvalgrind` trap at 0 for every one. 38 of the 52

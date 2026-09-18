@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // GENERATED from ldns-signzone output by an extract.py that lived only in a
-// scratchpad and is gone. `scripts/gen-dnssec-oracle.sh` re-takes the signing
+// scratchpad and is gone. `scripts/gen/gen-dnssec-oracle.sh` re-takes the signing
 // and independent-verification half of that chain; the extractor is not
 // restored, so these literals cannot currently be regenerated. See SPEC.md.
 // Independent oracle: ldns-verify-zone (rc=0) on every source zone.

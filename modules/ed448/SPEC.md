@@ -111,7 +111,7 @@ for how each formerly-stubbed piece was built.
   and since 2026-08-11 the measurement is a **committed program** rather
   than a number to take on faith:
   [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-  `scripts/ctgrind.sh ed448`. It marks the seed `MAKE_MEM_UNDEFINED`,
+  `scripts/checks/ctgrind.sh ed448`. It marks the seed `MAKE_MEM_UNDEFINED`,
   forces a volatile reload, and drives it through two targets. **Full
   control table** (zig 0.16.0, valgrind 3.26.0, x86_64, ReleaseFast,
   2026-08-11; `in-file` = memcheck CONTEXTS whose stack names an `ed448`
@@ -131,7 +131,7 @@ for how each formerly-stubbed piece was built.
   `Point.toBytes` (`ed448.zig:314`, once from `KeyPair.create` and once
   from `signInternal`) and from the X448 ladder's final `z_2.invert()`
   (`x448.zig:156`). Read them yourself with
-  `scripts/ctgrind.sh --stacks ed448` rather than trusting this
+  `scripts/checks/ctgrind.sh --stacks ed448` rather than trusting this
   sentence. Neither is a leak, and neither may be removed: for
   `Point.toBytes` the operand is a projective `Z` on a complete Edwards
   curve, so the branch outcome is invariantly "nonzero" for every

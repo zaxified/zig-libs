@@ -1044,7 +1044,7 @@ test "A1 F9: overlap-check work grows near-linearithmically with fragment count,
     const ratio_n = @as(f64, @floatFromInt(cases[1].n)) / @as(f64, @floatFromInt(cases[0].n));
     const ratio_checks = @as(f64, @floatFromInt(cases[1].checks)) / @as(f64, @floatFromInt(cases[0].checks));
     // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
-    // (scripts/test-lib.sh), so the number is opt-in; the assertion below runs
+    // (scripts/lib/test-lib.sh), so the number is opt-in; the assertion below runs
     // either way.
     if (std.process.Environ.getPosix(std.testing.environ, "ETHFRAG_VERBOSE") != null) {
         std.debug.print(

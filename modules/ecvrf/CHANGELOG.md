@@ -8,7 +8,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 - **2026-09-16** — documentation only, no code and no gate data changed (A1 E15
   closed). The audit recorded that nothing anywhere caught replacing `verify`'s
   `std.crypto.timing_safe.eql` with `std.mem.eql` — true when it was written
-  (2026-09-06), and untrue three days later, when `scripts/check-ct-compare.py`
+  (2026-09-06), and untrue three days later, when `scripts/checks/check-ct-compare.py`
   was added with a row for this file. Measured on that mutation: the suite is
   31/31 green in both release modes, both ctgrind rows keep every count
   (`prove` 2/0/2/0, `verify` 7/7/0/0), and `check-ct-compare` fails naming the

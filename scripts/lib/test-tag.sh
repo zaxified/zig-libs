@@ -14,12 +14,12 @@
 # actually arrange, in milliseconds. Same pattern as
 # scripts/hooks/test-pre-commit.sh.
 #
-#   usage: scripts/test-tag.sh
+#   usage: scripts/lib/test-tag.sh
 #   exit 0 = every case behaved; exit 1 = a case did not, and says which.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TAG_SH="$SCRIPT_DIR/tag.sh"
+TAG_SH="$SCRIPT_DIR/../tag.sh"
 [[ -x "$TAG_SH" ]] || {
     echo "test-tag: $TAG_SH is not executable" >&2
     exit 1

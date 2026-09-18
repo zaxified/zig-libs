@@ -59,7 +59,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `n = 32` case for it. (b) `asm_min_limbs`/`sqr_min_limbs` are pinned by value
   — raising `asm_min_limbs` to 64 previously left `test-montint` and all 22
   reverse-dependency modules green while silently moving what
-  `scripts/ctgrind.sh` measures. (c) `blackBox`'s `@inComptime()` guard is now
+  `scripts/checks/ctgrind.sh` measures. (c) `blackBox`'s `@inComptime()` guard is now
   exercised by a comptime `fromElem`, and its comment states the missing
   precondition (a caller-side `@setEvalBranchQuota`). (d) `sub`'s barrier is now
   measured at L=16 and L=32, not only L=4 — L=16 is the RSA-2048 CRT width the
@@ -77,7 +77,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   the default for every modulus below 2048 bits on amd64 and for every non-amd64
   target: RSA-2048 CRT sign/decrypt with secret `dP`/`dQ` (L=16), `paillier`,
   and `threshold_ecdsa`'s `powCt`. Both masks are now laundered through the
-  module's `blackBox` optimization barrier, and `scripts/ctgrind.sh montint`
+  module's `blackBox` optimization barrier, and `scripts/checks/ctgrind.sh montint`
   measures 0 in-file contexts at all three dispatch sizes, down from 7 (L=4) and
   5 (L=16). Classified as **neither BREAKING nor BEHAVIOURAL**: no signature,
   error set or field changes, and no computed value changes — every input maps

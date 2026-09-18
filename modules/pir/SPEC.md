@@ -570,8 +570,8 @@ verified layer requires `index < db.count()`.
 ### Constant-time position
 
 ⭐ **MEASURED 2026-09-09, and the claim below holds.**
-`modules/pir/src/ctgrind_harness.zig` + `scripts/ctgrind.sh pir`, ReleaseFast,
-valgrind/memcheck, pinned exactly in `scripts/ctgrind-expected.tsv` with an
+`modules/pir/src/ctgrind_harness.zig` + `scripts/checks/ctgrind.sh pir`, ReleaseFast,
+valgrind/memcheck, pinned exactly in `scripts/checks/ctgrind-expected.tsv` with an
 untainted control row and a no-`-fvalgrind` trap row at 0 beside each:
 
 | target | in-file | what the 1 is |

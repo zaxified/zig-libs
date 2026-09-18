@@ -8,7 +8,7 @@
 //!    but no systematic side-channel review was done."
 //!
 //! Until this harness, that sentence had no measurement behind it. Run
-//! through `../../../scripts/ctgrind.sh slhdsa`, which builds every
+//! through `../../../scripts/checks/ctgrind.sh slhdsa`, which builds every
 //! mode/target/taint combination and prints the control table; that
 //! script's header explains the table format and the two traps this file
 //! guards against (repeated below because this harness is not wired into
@@ -66,7 +66,7 @@
 //! separately from `engine.zig`/`address.zig`'s: seeing them nonzero is
 //! what proves the taint actually reached `sign()` and came back out, so a
 //! zero inside the module's own files means "no branch found", not "taint
-//! never arrived" — see `scripts/ctgrind.sh`'s header, "the propagation
+//! never arrived" — see `scripts/checks/ctgrind.sh`'s header, "the propagation
 //! proof" is the same shape this repo already uses for ct25519/oscore.
 //!
 //! ## Wiring note for the coordinator
@@ -74,11 +74,11 @@
 //! This file only needs to exist for `zig build ctgrind
 //! -Dctgrind-module=slhdsa` and `zig build check-ctgrind` to pick it up
 //! (`ctgrindHarnesses` in build.zig derives its list from file existence).
-//! Driving it through `scripts/ctgrind.sh slhdsa` additionally needs a
+//! Driving it through `scripts/checks/ctgrind.sh slhdsa` additionally needs a
 //! `TARGETS[slhdsa]`, `MODES[slhdsa]`, `PATTERN[slhdsa/seed]`,
 //! `PATTERN[slhdsa/prf]` and `LABEL[...]` entry in that script (see its
 //! per-module configuration block) and a row pin in
-//! `scripts/ctgrind-expected.tsv` — both out of scope for this change per
+//! `scripts/checks/ctgrind-expected.tsv` — both out of scope for this change per
 //! the task that produced this file (shared coordinator-owned files).
 //! Suggested values, for whoever wires it in:
 //!   TARGETS[slhdsa]="seed prf"

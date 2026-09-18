@@ -33,7 +33,7 @@
 //! Local Circuit ID — proof, from an independent implementation, that the
 //! all-or-nothing reading of the neighbour block was wrong. Verified via:
 //!
-//!     scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00
+//!     scripts/gen/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00
 //!     00 00 00 00 0a 00 1b 00 21 03 f0 0b 00 00 00 00 a1 00 00 00 00 00 0b'
 //!
 //! Wireshark printed (trimmed to the load-bearing lines):
@@ -222,13 +222,13 @@ test "TLV 240 round-trips the 1, 5, 11 and 15 octet forms" {
     try testing.expectEqual(@as(u8, 9), d15.neighbor.?.system_id[5]);
 }
 
-// External anchor: Wireshark 4.6.4 (sharkd, via scripts/dissect.py) — the
+// External anchor: Wireshark 4.6.4 (sharkd, via scripts/gen/dissect.py) — the
 // 11-octet shape above was not a hypothesis, it is what an independent
 // dissector's hardcoded length switch (`packet-isis-hello.c`,
 // `dissect_hello_ptp_adj_clv`: `case 1/5/11/15`) actually decodes.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00
+//   scripts/gen/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00
 //   00 00 00 00 0a 00 1b 00 21 03 f0 0b 00 00 00 00 a1 00 00 00 00 00 0b'
 //
 // Wireshark printed (trimmed to the load-bearing lines):
@@ -268,7 +268,7 @@ test "golden TLV240 11-octet form (Wireshark-anchored): decode matches what Wire
 // codec's `DecodeError.BadLength` boundary), so the comparison is real.
 //
 // Command (a full P2P Hello carrying a length-1 TLV 240 with state = Down):
-//   scripts/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
+//   scripts/gen/dissect.py --frame llc --fields '83 14 01 06 11 01 00 03 03 00 00
 //   00 00 00 0a 00 1b 00 17 03 f0 01 02'
 //
 // Wireshark printed (verbatim, trimmed to the load-bearing lines):

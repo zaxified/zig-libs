@@ -13,7 +13,7 @@ Figures below were measured on 2026-09-16 against the tree as it stands.
 
 ## Does a second implementation agree, at real key sizes?
 
-    scripts/capped zig build-exe --cache-dir .zig-cache \
+    scripts/lib/capped zig build-exe --cache-dir .zig-cache \
       -femit-bin=.zig-cache/paillier-oracle/probe_vectors \
       --dep paillier --dep montint \
       -Mroot=modules/paillier/tools/probe_vectors.zig \

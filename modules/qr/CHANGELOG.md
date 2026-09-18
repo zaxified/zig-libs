@@ -106,7 +106,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     `src/testdata/decode_vectors.bin`, 160 grids from **segno** (BSD-3,
     independently authored) spanning every version 1-40 at every level, which
     this module must read back to segno's own input. Not a round trip — nothing
-    in it was encoded here. Generator: `scripts/gen-qr-decode-vectors.py`,
+    in it was encoded here. Generator: `scripts/gen/gen-qr-decode-vectors.py`,
     which emits all 960; all 960 passed when this landed.
   - ⛔ **Six of seven decoder refusal guards deleted cleanly with the whole suite
     green.** Only the format-info BCH radius was pinned. Four now have tests,

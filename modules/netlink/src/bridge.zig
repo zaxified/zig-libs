@@ -105,7 +105,7 @@ pub const IFLA_BR = struct {
     pub const ROOT_PATH_COST: u16 = 13;
     pub const TOPOLOGY_CHANGE: u16 = 14;
     pub const TOPOLOGY_CHANGE_DETECTED: u16 = 15;
-    /// Corrected by `scripts/check-uapi-consts.py` (audit finding `netlink`
+    /// Corrected by `scripts/checks/check-uapi-consts.py` (audit finding `netlink`
     /// F3): was hand-transcribed as 22, which is `linux/if_link.h`'s
     /// position *before* the block of `IFLA_BR_HELLO_TIMER`…
     /// `IFLA_BR_NF_CALL_ARPTABLES` entries this module does not name; the
@@ -1924,7 +1924,7 @@ test "wire constants agree with the kernel UAPI" {
     // round-trips whatever `vlan_id_max` happens to be — it never checks the
     // constant's own value. `vlan_id_min`/`vlan_id_max` aren't literal
     // `#define`s in the kernel headers (802.1Q, not a netlink UAPI symbol),
-    // so `scripts/check-uapi-consts.py` cannot anchor them either; pinning
+    // so `scripts/checks/check-uapi-consts.py` cannot anchor them either; pinning
     // both ends independently here is the substitute.
     try testing.expectEqual(@as(u16, 1), vlan_id_min);
     try testing.expectEqual(@as(u16, 4094), vlan_id_max);

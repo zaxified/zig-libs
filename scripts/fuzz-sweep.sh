@@ -74,7 +74,7 @@
 #      budget per harness (see BUDGET FLOOR); a run that stopped early is
 #      INCOMPLETE, which is the fail-closed answer to "I cannot tell".
 #
-# Everything runs through scripts/capped, so a runaway allocation is killed by
+# Everything runs through scripts/lib/capped, so a runaway allocation is killed by
 # its own cgroup instead of the machine. NEVER run the fuzz command without it:
 # outside a scope the kernel's GLOBAL oom-killer picks its victim by size, and
 # under an IDE that victim is the editor. That is not hypothetical — it killed
@@ -169,7 +169,7 @@ ln -sfn "$OUT" "$BASE/latest"
 printf '%s\t%s\t%s\t%s\n' "$RUN_ID" "started" "iters=$ITERS" "targets=$*" >> "$BASE/runs.tsv"
 echo "run $RUN_ID -> $OUT   (also reachable as $BASE/latest)"
 
-# ⭐ A CGROUP OOM-KILL REPORTS 15, NOT 137. `scripts/capped` runs the command
+# ⭐ A CGROUP OOM-KILL REPORTS 15, NOT 137. `scripts/lib/capped` runs the command
 # under `systemd-run --user --scope`, and when the scope hits MemoryMax systemd
 # terminates it and reports SIGTERM's 15 — so the obvious `137) OOM-KILLED`
 # branch could never fire, and every runaway was filed as a generic EXIT-15.
@@ -187,7 +187,7 @@ oomKilled() { # $1 = epoch seconds the run started
 
 # ⭐ A TIMED-OUT FUZZ RUN LEAVES AN ORPHAN THAT WEDGES THE NEXT ONE. `timeout`
 # signals the `zig` it spawned, but the build RUNNER it forked lives on inside
-# the systemd scope `scripts/capped` created — still spinning on the input that
+# the systemd scope `scripts/lib/capped` created — still spinning on the input that
 # caused the timeout, still holding `.zig-cache/f/`. The next invocation for
 # that module then blocks forever with no output. Cost me three dead sweeps
 # while testing the HANG branch: the sweep printed "warming ..." and never
@@ -309,7 +309,7 @@ fi
 echo "warming $total instrumented builds so calibration times the target, not the compiler..."
 warm_start=$(date +%s)
 for m in "${MODS[@]}"; do
-    timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe --fuzz=1 > /dev/null 2>&1 || {
+    timeout "$CAL_WALL" ./scripts/lib/capped zig build "test-$m" --release=safe --fuzz=1 > /dev/null 2>&1 || {
         echo "  warm FAILED or timed out: $m (calibration will re-time it and can report HANG)"
         reapOrphans "$m"
     }
@@ -371,7 +371,7 @@ for m in "${MODS[@]}"; do
     while :; do
         cal_start=$(date +%s)
         stamp_before=$(crashStamp)
-        timeout "$CAL_WALL" ./scripts/capped zig build "test-$m" --release=safe \
+        timeout "$CAL_WALL" ./scripts/lib/capped zig build "test-$m" --release=safe \
             --fuzz="$cal_budget" > "$log.cal" 2>&1
         cal_rc=$?
         cal_dur=$(( $(date +%s) - cal_start ))
@@ -453,7 +453,7 @@ for m in "${MODS[@]}"; do
 
     start=$(date +%s)
     stamp_before=$(crashStamp)
-    timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
+    timeout "$wall" ./scripts/lib/capped zig build "test-$m" --release=safe \
         --fuzz="$budget" > "$log" 2>&1
     rc=$?
     dur=$(( $(date +%s) - start ))
@@ -567,7 +567,7 @@ for m in "${MODS[@]}"; do
             hlog="$OUT/$m.$(echo "$hname" | tr -c 'A-Za-z0-9' '_').log"
             hstart=$(date +%s)
             hstamp=$(crashStamp)
-            timeout "$wall" ./scripts/capped zig build "test-$m" --release=safe \
+            timeout "$wall" ./scripts/lib/capped zig build "test-$m" --release=safe \
                 -Dtest-filter="$hname" --fuzz="$budget" > "$hlog" 2>&1
             hrc=$?
             [[ $hrc -eq 124 ]] && reapOrphans "$m"

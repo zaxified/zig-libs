@@ -32,7 +32,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-source "$SCRIPT_DIR/test-lib.sh"
+source "$SCRIPT_DIR/lib/test-lib.sh"
 
 # ── one cgroup around the WHOLE run ────────────────────────────────────────
 #
@@ -131,7 +131,7 @@ export ZIGLIBS_TEST_T0="$(_now)"
 cd "$REPO_ROOT"
 
 # NETNS_MODULES — the set of modules run under `unshare -rn` — is defined in
-# test-lib.sh, because scripts/dark-tests.sh needs the identical split and a
+# test-lib.sh, because scripts/lib/dark-tests.sh needs the identical split and a
 # second copy would rot. Why each member is in it, and why `icmp`/`traceroute`
 # are deliberately NOT:
 #
@@ -549,7 +549,7 @@ run_modules() {
 # ZERO of its 52 tests, and `ratelimit` reported `18/18 passed`, exit 0, with an
 # entire new suite absent. Nothing else in this driver can see that.
 #
-# scripts/dark-tests.sh compares each module's declared test count against the
+# scripts/lib/dark-tests.sh compares each module's declared test count against the
 # `(N total)` field of its run-test line and requires EQUALITY. It is handed the
 # `--summary all` output the run above already produced, so it costs a few
 # milliseconds of awk rather than a second full suite run — Zig does not cache
@@ -704,7 +704,7 @@ dark_check() {
         esac
     done
 
-    step "dark-tests" "$SCRIPT_DIR/dark-tests.sh" --summary "$log" $mods
+    step "dark-tests" "$SCRIPT_DIR/lib/dark-tests.sh" --summary "$log" $mods
 }
 
 # ── file -> module mapping ───────────────────────────────────────────────
@@ -1159,7 +1159,7 @@ cmd_changed() {
                 # (its `module_list` entries per module, the rest as machinery),
                 # so the stamps already say which modules this re-keyed.
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/ci-stamps.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/check-ct-compare.py|scripts/ct-compare-expected.tsv|scripts/check-fuzz-reach.py|scripts/check-example-assert.py|scripts/check-changelog-entry.py|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/lib/test-lib.sh|scripts/lib/capped|scripts/lib/dark-tests.sh|scripts/lib/ci-environment.sh|scripts/lib/test-tag.sh|scripts/lib/ci-stamps.sh|scripts/checks/check-ci-cache-keys.sh|scripts/checks/check-http-sizeprobe.sh|scripts/checks/check-fp-freedom.sh|scripts/checks/check-skip-as-pass.py|scripts/checks/check-ct-compare.py|scripts/checks/ct-compare-expected.tsv|scripts/checks/check-fuzz-reach.py|scripts/checks/check-example-assert.py|scripts/checks/check-changelog-entry.py|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1328,7 +1328,7 @@ cmd_changed() {
     # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
     # instance is the one CI reaches with a real base ref; the other two are
     # no-ops on a clean checkout.
-    [[ -n "$files" ]] && step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
+    [[ -n "$files" ]] && step "check-changelog-entry" ./scripts/checks/check-changelog-entry.py ${base_ref:+"$base_ref"}
 
     # A testkit leak into published code is introduced by editing a MODULE's
     # code, which re-keys it -- so an unproven module (`mc`) is the signal.
@@ -1398,15 +1398,15 @@ cmd_changed() {
     # script for why one target is enough and why this is a symbol-presence
     # check rather than a byte-count one. ~30s when Client.zig's content
     # actually changed, near-instant otherwise.
-    closure_has http && step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    closure_has http && step "check-http-sizeprobe" ./scripts/checks/check-http-sizeprobe.sh
     # falcon's constant-time property is invisible to every value test (the
     # integer emulation is bit-identical to hardware FP), and falcon is not on
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
-    closure_has falcon && step "check-fp-freedom" ./scripts/check-fp-freedom.sh
+    closure_has falcon && step "check-fp-freedom" ./scripts/checks/check-fp-freedom.sh
     # Strips comments before it scans, so a fingerprint change is its signal.
-    (( mc )) && step "check-ct-compare" ./scripts/check-ct-compare.py "--modules=${closure// /,}"
-    (( mt )) && step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
+    (( mc )) && step "check-ct-compare" ./scripts/checks/check-ct-compare.py "--modules=${closure// /,}"
+    (( mt )) && step "check-skip-as-pass" ./scripts/checks/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
     # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
@@ -1418,13 +1418,13 @@ cmd_changed() {
     # but a gate that never fails protects nothing, and the burn-down is being
     # done a module at a time over many sessions, so a module fixed in week one
     # could regress in week three with no signal at all. `--ratchet` compares
-    # against `scripts/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
+    # against `scripts/checks/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
     # only where a module got worse, names the modules that have improved since
     # the file was written, and comes off entirely when the baseline is empty.
     # The ceiling is per module rather than one total on purpose -- a total lets
     # one module regress while another improves and still reads green.
     # It still FAILS on a malformed or stale exemption.
-    (( mt )) && step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet "--modules=$touched"
+    (( mt )) && step "check-fuzz-reach" ./scripts/checks/check-fuzz-reach.py --ratchet "--modules=$touched"
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
@@ -1432,7 +1432,7 @@ cmd_changed() {
     # examples compared against an external oracle that way and printed that it
     # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
     # exiting 0 and still claiming a byte-exact match.
-    (( mt )) && step "check-example-assert" ./scripts/check-example-assert.py
+    (( mt )) && step "check-example-assert" ./scripts/checks/check-example-assert.py
 
     if [[ -z "${closure// /}" ]]; then
         summary
@@ -1509,8 +1509,8 @@ phase_checks_fast() {
 # them a fail-fast gate rather than one more thing to wait for.
 phase_checks_fast_tail() {
     step "hook self-test" ./scripts/hooks/test-pre-commit.sh
-    step "tag.sh self-test" ./scripts/test-tag.sh
-    step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
+    step "tag.sh self-test" ./scripts/lib/test-tag.sh
+    step "check-ci-cache-keys" ./scripts/checks/check-ci-cache-keys.sh
     step "check-scripts-doc" zig build check-scripts-doc
     step "check-package" zig build check-package
     step "check-catalog" zig build check-catalog
@@ -1549,7 +1549,7 @@ phase_checks_fast_tail() {
     # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
     # instance is the one CI reaches with a real base ref; the other two are
     # no-ops on a clean checkout.
-    step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
+    step "check-changelog-entry" ./scripts/checks/check-changelog-entry.py ${base_ref:+"$base_ref"}
     step "check-portable-table" zig build check-portable-table
     step "check-libs-table" zig build check-libs-table
     step "check-catalog-table" zig build check-catalog-table
@@ -1570,14 +1570,14 @@ phase_checks() {
     step "check-fuzz" zig build check-fuzz
     step "check-global-alloc" zig build check-global-alloc
     step "check-portable" zig build check-portable
-    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
+    step "check-http-sizeprobe" ./scripts/checks/check-http-sizeprobe.sh
     # falcon's constant-time property is invisible to every value test (the
     # integer emulation is bit-identical to hardware FP), and falcon is not on
     # the ctgrind gate. This disassembly check is the only thing that fails when
     # the emulation is bypassed. See the script header.
-    step "check-fp-freedom" ./scripts/check-fp-freedom.sh
-    step "check-ct-compare" ./scripts/check-ct-compare.py
-    step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
+    step "check-fp-freedom" ./scripts/checks/check-fp-freedom.sh
+    step "check-ct-compare" ./scripts/checks/check-ct-compare.py
+    step "check-skip-as-pass" ./scripts/checks/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
     # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
@@ -1589,13 +1589,13 @@ phase_checks() {
     # but a gate that never fails protects nothing, and the burn-down is being
     # done a module at a time over many sessions, so a module fixed in week one
     # could regress in week three with no signal at all. `--ratchet` compares
-    # against `scripts/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
+    # against `scripts/checks/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
     # only where a module got worse, names the modules that have improved since
     # the file was written, and comes off entirely when the baseline is empty.
     # The ceiling is per module rather than one total on purpose -- a total lets
     # one module regress while another improves and still reads green.
     # It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
+    step "check-fuzz-reach" ./scripts/checks/check-fuzz-reach.py --ratchet
 
     # `run-examples` builds and runs each example in the LANE's optimize mode,
     # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
@@ -1603,7 +1603,7 @@ phase_checks() {
     # examples compared against an external oracle that way and printed that it
     # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
     # exiting 0 and still claiming a byte-exact match.
-    step "check-example-assert" ./scripts/check-example-assert.py
+    step "check-example-assert" ./scripts/checks/check-example-assert.py
     step "check-ctgrind" zig build check-ctgrind
 }
 
@@ -1636,7 +1636,7 @@ cmd_checks() {
 # oracles and wolfSSL for lanes that no longer touched any of them, while the
 # six programs that DID need them were run by nobody. A transcript nobody can
 # re-take is a frozen anchor — `modules/dnssec` lost one exactly that way, and
-# `scripts/gen-dnssec-oracle.sh` had to be written from nothing to get it back.
+# `scripts/gen/gen-dnssec-oracle.sh` had to be written from nothing to get it back.
 #
 # PRE-RELEASE, NOT PER-COMMIT, and that is the migration's own stated intent.
 # The full matrix runs on tags and dispatch only, so a lane here is exactly a
@@ -1659,7 +1659,7 @@ cmd_ctgrind() {
     # `zig build check-ctgrind` deliberately does NOT do.
     #
     # ⛔ WHY THIS LANE EXISTS. Until 2026-09-08 nothing in any lane ran
-    # `scripts/ctgrind.sh --check`. `check-ctgrind` in build.zig compiles the
+    # `scripts/checks/ctgrind.sh --check`. `check-ctgrind` in build.zig compiles the
     # harnesses as a rot guard and says so ("leaving the measurement itself out
     # of the critical path"), which is right for a gate that must pass on a host
     # with no valgrind -- but it left 20 pinned constant-time claims across 8
@@ -1668,7 +1668,7 @@ cmd_ctgrind() {
     # know. Audit finding R14 item 1.
     #
     # Tag/dispatch only, like `interop`, for the same reason: it needs a peer
-    # (valgrind) that `scripts/ci-environment.sh ctgrind` installs, and it costs
+    # (valgrind) that `scripts/lib/ci-environment.sh ctgrind` installs, and it costs
     # minutes rather than seconds -- measured 310 s warm for all 8 modules and
     # all 20 rows on an i7-7920HQ.
     #
@@ -1677,13 +1677,13 @@ cmd_ctgrind() {
     # report green for not having taken it.
     set_extra_args "$@"
     echo "ctgrind: taking the constant-time measurement for every module with a harness."
-    echo "  ⚠ needs valgrind (scripts/ci-environment.sh ctgrind); this is NOT check-ctgrind,"
+    echo "  ⚠ needs valgrind (scripts/lib/ci-environment.sh ctgrind); this is NOT check-ctgrind,"
     echo "    which only compiles the harnesses and runs no measurement at all."
     # ⚠ `ZL_STEP_STDERR_IS_OUTPUT`: the control table is the point of the run and
     # `ctgrind.sh` narrates its builds on stderr, so the ordinary rule (exit 0
     # with anything on stderr is a failure) would reject a green measurement.
     # Exit status still decides -- and `--check` exits 1 on any failed row.
-    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind" scripts/ctgrind.sh --check
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind" scripts/checks/ctgrind.sh --check
     summary
 }
 
@@ -1701,7 +1701,7 @@ cmd_interop() {
         exit 1
     fi
     echo "interop: re-taking the anchors of ${#progs[@]} module(s) against real peers: ${progs[*]}"
-    echo "  ⚠ these need the peers scripts/ci-environment.sh installs under the \`interop\` role;"
+    echo "  ⚠ these need the peers scripts/lib/ci-environment.sh installs under the \`interop\` role;"
     echo "    the transcripts they produce are what test-<m> replays hermetically."
     step "check-interop" zig build check-interop "${EXTRA_ZIG_ARGS[@]}"
     # ⚠ `ZL_STEP_STDERR_IS_OUTPUT` for the runs, NOT for `check-interop` above.
@@ -1990,7 +1990,7 @@ Usage: scripts/test.sh [subcommand] [args]
                         reports, so a file whose tests were never compiled —
                         which has no other symptom at all — fails the gate.
                         It reads the `--summary all` output of the run above
-                        rather than making its own. See scripts/dark-tests.sh.
+                        rather than making its own. See scripts/lib/dark-tests.sh.
                         `zig build check-fuzz` IS included, in both `changed`
                         and `all`, unconditionally — it is a static source
                         scan and costs about a second warm. It was kept out
@@ -2007,7 +2007,7 @@ Usage: scripts/test.sh [subcommand] [args]
                         source scan for `std.heap.page_allocator` and its
                         siblings reaching outside a caller-supplied allocator
                         (CONVENTIONS.md §1.2), sub-second warm.
-                        `scripts/check-http-sizeprobe.sh` likewise: rebuilds
+                        `scripts/checks/check-http-sizeprobe.sh` likewise: rebuilds
                         modules/http/sizeprobe/ (its own standalone build.zig,
                         x86_64-linux-musl only) and asserts the plaintext
                         http.Client entry points link zero TLS/certificate/
@@ -2040,18 +2040,18 @@ Usage: scripts/test.sh [subcommand] [args]
                         agree with what the peer said LAST time, and only this
                         can find that something new we send provokes a
                         different reaction, or that the peer moved. Needs
-                        `scripts/ci-environment.sh interop`.
+                        `scripts/lib/ci-environment.sh interop`.
   ctgrind               PRE-RELEASE ONLY — take the constant-time measurement.
-                        Runs `scripts/ctgrind.sh --check`: every committed
+                        Runs `scripts/checks/ctgrind.sh --check`: every committed
                         `modules/<m>/src/ctgrind_harness.zig` under
                         `valgrind --tool=memcheck`, compared against the 20
-                        pinned rows of scripts/ctgrind-expected.tsv. This is
+                        pinned rows of scripts/checks/ctgrind-expected.tsv. This is
                         NOT `zig build check-ctgrind`, which only COMPILES the
                         harnesses as a rot guard and takes no measurement — a
                         harness can build perfectly and report a leak. Until
                         2026-09-08 no lane ran this at all, so those 20 claims
                         were verified by nothing. Needs
-                        `scripts/ci-environment.sh ctgrind` (valgrind), and
+                        `scripts/lib/ci-environment.sh ctgrind` (valgrind), and
                         FAILS rather than skips without it. 310 s warm for all
                         8 modules.
   time                  run every module SERIALLY, print a duration-sorted

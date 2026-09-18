@@ -271,12 +271,12 @@ instrumented — while the module holds the node's long-term static private key,
 the ephemeral keys, `temp_k*` and both transport keys (audit finding F10).
 
 The instrument is committed: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig),
-driven by [`../../scripts/ctgrind.sh`](../../scripts/ctgrind.sh). It marks the
+driven by [`../../scripts/checks/ctgrind.sh`](../../scripts/checks/ctgrind.sh). It marks the
 secret `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer cannot
 keep a defined register copy, and drives it through the real entry points.
 
 ```sh
-scripts/ctgrind.sh bolt8
+scripts/checks/ctgrind.sh bolt8
 ```
 
 Zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `ReleaseFast`, 2026-09-08.

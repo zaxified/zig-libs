@@ -118,7 +118,7 @@ const testing = std.testing;
 // These are the LSP bytes frozen in `modules/isis-lsdb/src/goldens.zig` (Golden
 // 1), reproduced here because `isis` must not depend on its consumer. Their
 // provenance is recorded there in full: they were dissected with `sharkd` via
-// `scripts/dissect.py`, `frame.protocols == "eth:llc:osi:isis:isis.lsp"` (the
+// `scripts/gen/dissect.py`, `frame.protocols == "eth:llc:osi:isis:isis.lsp"` (the
 // real IS-IS dissector, not a `data` fallback), and Wireshark graded the
 // checksum field itself:
 //

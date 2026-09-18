@@ -4,7 +4,7 @@
 //! constant-time — read the boundary, do not round it up" section, as an
 //! actual committed program instead of a claim nobody re-runs. Run it through
 //! `zig build ctgrind -Dctgrind-module=bfv -Dctgrind-valgrind=…` plus
-//! `valgrind --tool=memcheck` by hand — `scripts/ctgrind.sh` has no
+//! `valgrind --tool=memcheck` by hand — `scripts/checks/ctgrind.sh` has no
 //! per-module TARGETS/MODES/PATTERN/LABEL entry for `bfv` yet; the suggested
 //! lines are at the bottom of this comment for the coordinator to paste in.
 //!
@@ -136,7 +136,7 @@
 //!    collection: `Debug`/`ReleaseSafe` add overflow checks that branch on
 //!    tainted arithmetic and bury the signal, and Debug's self-hosted
 //!    backend is not readable by valgrind's DWARF parser at all
-//!    (`scripts/ctgrind.sh` § MODES).
+//!    (`scripts/checks/ctgrind.sh` § MODES).
 //!
 //! ## Parameters: `params.test_mul`, not the security-grade set
 //!
@@ -193,7 +193,7 @@
 //! non-zero, confirming the taint reached the printed value in all three
 //! runs.
 //!
-//! ## Suggested config lines for scripts/ctgrind.sh (coordinator to paste in)
+//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
 //!
 //! ```
 //! TARGETS[bfv]="keygen encrypt decrypt"

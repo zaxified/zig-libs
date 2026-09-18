@@ -8,7 +8,7 @@
 //! parity, which is one bit derived from the secret nonce hash)"), as an
 //! actual committed program instead of a sentence nobody re-checks. Run it
 //! through `zig build ctgrind -Dctgrind-module=bip340 -Dctgrind-valgrind=…`
-//! plus `valgrind --tool=memcheck` by hand — `scripts/ctgrind.sh` has no
+//! plus `valgrind --tool=memcheck` by hand — `scripts/checks/ctgrind.sh` has no
 //! per-module TARGETS/MODES/PATTERN/LABEL entry for `bip340` yet; the
 //! suggested lines are at the bottom of this comment for the coordinator to
 //! paste in.
@@ -49,7 +49,7 @@
 //! `group.zig:346`'s `rejectIdentity` context). This harness's PATTERN
 //! therefore has to name `k256`'s files too — attributing this module's own
 //! two `combMulBase` calls to "k256's problem" instead would be the evasion
-//! `scripts/ctgrind.sh`'s header exists to refuse (same reasoning as
+//! `scripts/checks/ctgrind.sh`'s header exists to refuse (same reasoning as
 //! `bolt8/dh`'s and `k256/sign`'s patterns). The per-line breakdown below
 //! marks each context bip340-own or k256/std-inherited.
 //!
@@ -68,7 +68,7 @@
 //! 3. ReleaseFast only — `Debug`/`ReleaseSafe` add overflow checks in the
 //!    field arithmetic underneath (k256's `field.zig`) that branch on tainted
 //!    values and bury the signal, and Debug's self-hosted backend is not
-//!    readable by valgrind's DWARF parser at all (`scripts/ctgrind.sh` §
+//!    readable by valgrind's DWARF parser at all (`scripts/checks/ctgrind.sh` §
 //!    MODES).
 //!
 //! ## The propagation witness
@@ -79,7 +79,7 @@
 //! itemised in-file count is what makes the itemisation mean "no branch
 //! found" rather than "the harness never ran".
 //!
-//! ## Suggested config lines for scripts/ctgrind.sh (coordinator to paste in)
+//! ## Suggested config lines for scripts/checks/ctgrind.sh (coordinator to paste in)
 //!
 //! ```
 //! TARGETS[bip340]="sign"

@@ -51,7 +51,7 @@ cp.ChaCha20.xor(out, in, 1, key, nonce);
 Reproduce with:
 
 ```
-CHACHAPOLY_BENCH=1 scripts/capped zig build test-chachapoly -Doptimize=ReleaseFast
+CHACHAPOLY_BENCH=1 scripts/lib/capped zig build test-chachapoly -Doptimize=ReleaseFast
 ```
 
 Measured on an i7-7920HQ (AVX2, no AVX-512), 8 KiB working set, ReleaseFast,

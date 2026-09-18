@@ -942,7 +942,7 @@ test "a report that ends before OptFlds promised is refused" {
 // Goes RED without the early `entry_count` reset this relies on: adding
 // `.entry_count = out.entry_count` to the `out.* = .{ ... }` literal in
 // `Report.decode` (preserving whatever `out` held instead of zeroing it) made
-// this test fail — `expected 0, found 4` — `scripts/capped zig build
+// this test fail — `expected 0, found 4` — `scripts/lib/capped zig build
 // test-iec61850` exit 1, 394 pass / 1 fail / 10 skip. Reverted immediately
 // after. (Separately, the out-parameter signature itself is also pinned by
 // every other call site in this file and the rest of the module: reverting

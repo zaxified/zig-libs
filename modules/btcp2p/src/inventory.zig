@@ -282,7 +282,7 @@ test "external anchor: Wireshark's bitcoin dissector reads our inv payload field
     //
     // The oracle here is Wireshark's `bitcoin` dissector: a mature third-party
     // reading of the same specification, which this repo already uses for the
-    // same purpose elsewhere (`scripts/dissect.py`). These bytes were emitted,
+    // same purpose elsewhere (`scripts/gen/dissect.py`). These bytes were emitted,
     // wrapped in Ethernet/IPv4/TCP:8333, and handed to `sharkd`; the assertions
     // below are what IT said they mean, transcribed. It is not a captured
     // packet — no network access here — but it is an independent decoder, which

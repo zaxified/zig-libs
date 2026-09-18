@@ -309,7 +309,7 @@ quietly reshape the thing it verifies.
   arguments, as described above.
 - **`fuzz-reach.log` and the instrumented fuzz copy** — spent. F6's reach
   measurement now lives in the repository as `scripts/modtest <m> --fuzz=N` plus
-  `scripts/fuzz-coverage.py` (commit `e6434b94`), and the guards it measures are
+  `scripts/lib/fuzz-coverage.py` (commit `e6434b94`), and the guards it measures are
   `noinline` markers in `src/` rather than a patched copy.
 - **`ex.strace`, `test.strace`, `runex.sh`** — one-shot evidence that the gate
   makes no network calls, already recorded in the audit file.

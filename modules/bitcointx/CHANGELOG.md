@@ -66,7 +66,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   (213 transactions from Core's `tx_valid.json` + `tx_invalid.json`) and
   `src/single_bug_kat_vectors.zig`. The latter names an **LGPL-3.0** library, so the file now
   demonstrates rather than assumes that no copyleft term reaches this collection:
-  `scripts/gen-bitcointx-single-bug.py` builds its own transactions and takes only the
+  `scripts/gen/gen-bitcointx-single-bug.py` builds its own transactions and takes only the
   return value of `RawSignatureHash`, which is root `NOTICE` §0's black-box oracle. The MIT
   text is now reproduced, not just cited by copyright line. No code or data changed.
 - **2026-09-08** — Test-only, no production change: the knobs both fuzz targets draw after

@@ -81,7 +81,7 @@ below for the signer/keygen internals and the constant-time caveat). See
   survived (all four are tests); the reproducible count did not, and it was
   already wrong when it was written. A sentence describing a command someone
   ran once is not a gate — it goes stale in silence and nothing reports it.
-  The check is therefore now EXECUTABLE: **`scripts/check-fp-freedom.sh`**,
+  The check is therefore now EXECUTABLE: **`scripts/checks/check-fp-freedom.sh`**,
   run on every gate lane, which fails and names the offending symbol. Verified
   red: with `fpr.div`'s body replaced by a native `/`, the whole suite and the
   KATs stay green — the emulation is bit-identical to IEEE-754, so no value
@@ -142,7 +142,7 @@ below for the signer/keygen internals and the constant-time caveat). See
   84% a claim this file makes elsewhere and had no instrument for. Whether
   those 112 are a real leak or an artifact of how LLVM lowers the masking
   selects at ReleaseFast is the open question — and it is a question nobody
-  could have asked without the row. `scripts/check-fp-freedom.sh`, the gate
+  could have asked without the row. `scripts/checks/check-fp-freedom.sh`, the gate
   this module already had, cannot see it: it `objdump`s for hardware FP
   instructions (`divsd`, `sqrtsd`), and this leaks through conditional
   jumps with no FP instruction anywhere.

@@ -154,7 +154,7 @@ down, the change was made under `DECISIONS.md` P5. The four items it asks for:
 3. **ctgrind.** Not applicable to the changed code: `verify` consumes only
    public data, and `ctgrind_harness.zig` deliberately does not taint it.
    No function on the prove path changed. The `rangeproof`/`ipa` rows in
-   `scripts/ctgrind-expected.tsv` fingerprint whole files, so they need a
+   `scripts/checks/ctgrind-expected.tsv` fingerprint whole files, so they need a
    re-pin. That re-pin happens at the end of the fix campaign.
 4. **The number.** A/B against the previous verifier in one process,
    ReleaseFast, CPU time, 9 interleaved rounds, median µs per verify:

@@ -11,7 +11,7 @@
 #     scripts/modtest yaml --fuzz=200K        # ... with an explicit per-harness budget
 #     ZIGLIBS_FUZZ_REACH=decode.zig:611 scripts/modtest protobuf --fuzz=50K
 #
-# Why this exists, and why `scripts/capped zig build test-<m> | tail -20` is NOT
+# Why this exists, and why `scripts/lib/capped zig build test-<m> | tail -20` is NOT
 # the same thing:
 #
 #   `capped` puts the COMMAND in a memory-capped transient scope. A reader on
@@ -92,7 +92,7 @@
 #     them. A module with three harnesses therefore looks like one harness ran.
 #     The iteration count used here comes instead from the coverage map the
 #     fuzzed process itself updates, `.zig-cache/v/<pc digest>` -- snapshotted
-#     before and read after by scripts/fuzz-coverage.py -- which also survives a
+#     before and read after by scripts/lib/fuzz-coverage.py -- which also survives a
 #     run that was killed before any report was printed.
 #   * The same map's seen-PC bits, resolved with `addr2line -i` against the
 #     executable whose `__sancov_pcs1` section IS that map's PC list, give
@@ -233,9 +233,9 @@ export ZIGLIBS_MEM_MAX
 if [[ -z "${_ZL_MODTEST_INNER:-}" ]]; then
     export _ZL_MODTEST_INNER=1
     if [[ "$mode" == file ]]; then
-        exec "$SCRIPT_DIR/capped" nice -n "$NICE" "$0" --file "$probe" "$@"
+        exec "$SCRIPT_DIR/lib/capped" nice -n "$NICE" "$0" --file "$probe" "$@"
     fi
-    exec "$SCRIPT_DIR/capped" nice -n "$NICE" "$0" "$module" "$@"
+    exec "$SCRIPT_DIR/lib/capped" nice -n "$NICE" "$0" "$module" "$@"
 fi
 
 # ⛔⛔ TWO separate holes, both measured 2026-09-10, both from one incident.
@@ -354,7 +354,7 @@ if [[ "$mode" == file ]]; then
         zig test ${probe_arg[@]+"${probe_arg[@]}"} "$@" 2>&1 \
         | head -c "$ZIGLIBS_MODTEST_LOG_MAX" > "$log"
 elif [[ "$mode" == fuzz ]]; then
-    fuzz_py="$SCRIPT_DIR/fuzz-coverage.py"
+    fuzz_py="$SCRIPT_DIR/lib/fuzz-coverage.py"
     snap="$log_dir/$module.fuzz-before.json"
     kv="$log_dir/$module.fuzz.kv"
     rm -f "$kv" "$log_dir/$module.fuzz-crash"

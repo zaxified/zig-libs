@@ -3,7 +3,7 @@
 //! secrets `MAKE_MEM_UNDEFINED` and drives them through the code whose
 //! constant-time property `SPEC.md` claims. Not a test: memcheck's context
 //! count is valgrind's own verdict, not something a Zig test can assert on.
-//! `scripts/ctgrind.sh` drives it; `SPEC.md` § Constant-time carries the table.
+//! `scripts/checks/ctgrind.sh` drives it; `SPEC.md` § Constant-time carries the table.
 //!
 //! Usage: ctgrind-bolt8 <target> <yes|no>
 //!   targets: dh | keygen | act3 | transport
@@ -40,7 +40,7 @@
 //! std's ChaCha20 into overflow branches on secret-derived values, which flood
 //! the report. And Debug cannot be measured at all: valgrind's DWARF reader
 //! cannot parse what Zig's self-hosted backend emits, and Debug is the only
-//! mode where that backend is the default (`scripts/ctgrind.sh` § MODES).
+//! mode where that backend is the default (`scripts/checks/ctgrind.sh` § MODES).
 //!
 //! ## The propagation witness
 //!
@@ -86,7 +86,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("valgrind_support={} target={s}\n", .{ builtin.valgrind_support, target });
 
     // Deterministic keys: this harness must print the same bytes on every run,
-    // because `scripts/ctgrind.sh --check` pins a digest of what it printed.
+    // because `scripts/checks/ctgrind.sh --check` pins a digest of what it printed.
     var ils = try root.Secp256k1DH.KeyPair.generateDeterministic([_]u8{0x11} ** 32);
     const rls = try root.Secp256k1DH.KeyPair.generateDeterministic([_]u8{0x21} ** 32);
     var prng = std.Random.DefaultPrng.init(0xb01783);

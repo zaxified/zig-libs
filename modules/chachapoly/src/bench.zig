@@ -3,7 +3,7 @@
 //! bench — MB/s throughput micro-benchmarks. Off by default; opt in with
 //! `CHACHAPOLY_BENCH`:
 //!
-//!   CHACHAPOLY_BENCH=1 scripts/capped zig build test-chachapoly -Doptimize=ReleaseFast -Dcpu=native
+//!   CHACHAPOLY_BENCH=1 scripts/lib/capped zig build test-chachapoly -Doptimize=ReleaseFast -Dcpu=native
 //!
 //! Reports, at a fixed 8 KiB working-set (small enough to stay in L1 — the
 //! point is the arithmetic, not the memory system):
@@ -16,7 +16,7 @@
 //! this repo allocated multi-megabyte in-memory working sets and OOM-killed the
 //! host's editor; throughput is measured by iterating a small buffer many
 //! times, never by making one giant buffer. Everything runs under
-//! `scripts/capped`.
+//! `scripts/lib/capped`.
 //!
 //! Numbers are noisy on a mobile CPU (turbo / thermal). Treat them as ratios.
 

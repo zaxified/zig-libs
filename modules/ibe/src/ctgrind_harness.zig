@@ -4,7 +4,7 @@
 //! `ibe.zig`'s `fp12Pow` doc comment already carries ("no secret-dependent
 //! branch and no secret-dependent memory access", citing audit finding "ibe
 //! F4"), as an actual committed program instead of an unmeasured paragraph.
-//! Run it through `../../../scripts/ctgrind.sh ibe` (once the coordinator
+//! Run it through `../../../scripts/checks/ctgrind.sh ibe` (once the coordinator
 //! adds the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries this file's doc
 //! comment suggests below — that script REFUSES an unlisted module rather
 //! than silently skipping it). Until then, by hand:
@@ -118,7 +118,7 @@
 //! Every target formats its result through `std.debug.print` (NOT
 //! constant-time — branches on the value it is printing), reported
 //! separately from the target's own contexts (the WITNESS bucket in
-//! `scripts/ctgrind.sh`'s classifier). A nonzero witness count is what
+//! `scripts/checks/ctgrind.sh`'s classifier). A nonzero witness count is what
 //! proves the taint travelled all the way to an observable branch, so a
 //! zero count inside `ibe`'s/`bls12_381`'s own code means "no branch
 //! found", not "taint never arrived".
@@ -287,7 +287,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh config (coordinator: paste in, do not
+// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
 // generate mechanically — every existing entry carries hand-written
 // reasoning in its own comment; this follows the same shape) ─────────────
 //

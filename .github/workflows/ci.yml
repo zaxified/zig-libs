@@ -357,7 +357,7 @@ jobs:
         # interop-<m>` -- the six migrated modules replay committed transcripts
         # and pass on a host with no compiler and no Python -- so installing it
         # here bought the lane that gates every push nothing at all.
-        run: bash scripts/ci-environment.sh tests
+        run: bash scripts/lib/ci-environment.sh tests
       # The base differs by event, and a base that does not resolve is NOT
       # allowed to read as "nothing changed" — `changed_files` fails and the
       # driver escalates to the full run rather than passing having tested
@@ -391,14 +391,14 @@ jobs:
           echo "zig target: $(zig env 2>/dev/null | grep -m1 '\.target' | cut -d'"' -f2 || echo unknown)"
       # ⭐ STAMPS (2026-09-18): which modules this lane has already proven at
       # their current fingerprint, carried between runs as an artifact -- see
-      # scripts/ci-stamps.sh for why an artifact and whose artifacts count.
+      # scripts/lib/ci-stamps.sh for why an artifact and whose artifacts count.
       # None found = every module runs.
       - name: Fetch this lane's stamps
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
-          bash scripts/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-scoped-${{ matrix.shard }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+          bash scripts/lib/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-scoped-${{ matrix.shard }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test changed modules
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
@@ -667,7 +667,7 @@ jobs:
           # `check-ctgrind` in the `checks` lane only COMPILES the harnesses --
           # it says so, and that is right for a lane that must pass on a host
           # with no valgrind. But it meant nothing in this workflow ever ran
-          # `scripts/ctgrind.sh --check`, so 20 pinned constant-time rows across
+          # `scripts/checks/ctgrind.sh --check`, so 20 pinned constant-time rows across
           # 8 crypto modules were verified by nothing at all. A harness can
           # build perfectly and report a leak.
           #
@@ -882,17 +882,17 @@ jobs:
         # push had none of it. Two copies of an install list drift; one script
         # that both jobs run cannot.
         continue-on-error: true
-        run: bash scripts/ci-environment.sh ${{ matrix.peers }}
+        run: bash scripts/lib/ci-environment.sh ${{ matrix.peers }}
       # ⭐ STAMPS (2026-09-18): which modules this lane has already proven at
       # their current fingerprint, carried between runs as an artifact -- see
-      # scripts/ci-stamps.sh for why an artifact and whose artifacts count.
+      # scripts/lib/ci-stamps.sh for why an artifact and whose artifacts count.
       # None found = every module runs.
       - name: Fetch this lane's stamps
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
-          bash scripts/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+          bash scripts/lib/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test (${{ matrix.name }})
         env:
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
@@ -944,7 +944,7 @@ jobs:
         # business paying for a root netns they never enter.
         if: matrix.tc && env.ZIGLIBS_DRY_RUN != '1'
         # ⚠ THE ONE `zig build` IN THIS FILE THAT IS NOT MEMORY-CAPPED, and as
-        # of 2026-09-09 that is DECIDED rather than outstanding. `scripts/capped`
+        # of 2026-09-09 that is DECIDED rather than outstanding. `scripts/lib/capped`
         # exists to stop a runaway build from taking down a DEVELOPER DESKTOP:
         # 15.67 GB of unbounded `zig test` once did exactly that here, and the
         # kernel picks its victim by `oom_score_adj`, so the process that dies

@@ -6,11 +6,11 @@
 //! doc comment, "partial-failure contract"). Off by default
 //! (`error.SkipZigTest`); run it with:
 //!
-//!   IEC61850_BENCH=1 scripts/capped zig build test-iec61850 -Doptimize=ReleaseFast
+//!   IEC61850_BENCH=1 scripts/lib/capped zig build test-iec61850 -Doptimize=ReleaseFast
 //!
 //! **Sizing.** One 106-octet captured `InformationReport`, decoded in a loop —
 //! nothing close to the memory an over-eager benchmark has OOM-killed this
-//! host with before. Run under `scripts/capped`.
+//! host with before. Run under `scripts/lib/capped`.
 
 const std = @import("std");
 const report = @import("report.zig");

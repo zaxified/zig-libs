@@ -237,7 +237,7 @@ fi
 # Where this checkout lives, so the process scan cannot report a second worktree
 # or a parallel gate as this run's progress. A plausible wrong name is worse
 # than no name.
-_ZL_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+_ZL_REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 
 # ⚠ WHAT IS STILL RUNNING, not what started. `--verbose` logs a command BEFORE
 # executing it and never says it finished, so after two hours its tail is a list

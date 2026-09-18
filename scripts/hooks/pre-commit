@@ -61,7 +61,7 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 # courtesy in front of the real gate, and a hook that bricks every commit
 # because python3 is absent is a hook people uninstall. The fmt check below
 # does block, because `zig` is already required to do anything in this repo.
-CLE="$ROOT/scripts/check-changelog-entry.py"
+CLE="$ROOT/scripts/checks/check-changelog-entry.py"
 if [[ ! -x "$CLE" ]]; then
     echo "pre-commit: warning: $CLE missing or not executable — changelog check skipped" >&2
 elif ! command -v python3 >/dev/null 2>&1; then

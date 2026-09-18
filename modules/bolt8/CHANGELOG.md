@@ -68,7 +68,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   so the existing "No GPL/LGPL/AGPL source was consulted" sentence had to become a declared
   `**Copyleft:**` line.
 - **2026-09-08** — The module is measured under ctgrind now, instead of inheriting a
-  verdict. `src/ctgrind_harness.zig` is committed and `scripts/ctgrind.sh` drives it; until
+  verdict. `src/ctgrind_harness.zig` is committed and `scripts/checks/ctgrind.sh` drives it; until
   today `bolt8` was outside that table and its ledger read "PASS (inherited)" — derived from
   reading, never instrumented — while the module holds the node's long-term static private
   key, the ephemeral keys, `temp_k*` and both transport keys (audit F10). Four targets, all

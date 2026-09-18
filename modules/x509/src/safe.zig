@@ -991,7 +991,7 @@ test "spkiOf: a BIT STRING with unused bits is rejected rather than silently tru
 // either target.
 //
 // ⛔ Both were also written as inline `struct { fn … }` literals, which is why
-// `scripts/check-fuzz-reach.py` reported them UNJUDGED rather than collapsed:
+// `scripts/checks/check-fuzz-reach.py` reported them UNJUDGED rather than collapsed:
 // it matches a named target function. Same defect, invisible to the gate.
 // They are named functions now, so the gate can see them.
 //

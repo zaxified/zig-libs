@@ -19,9 +19,9 @@
 //!    path." (SPEC.md, "The `g = n+1` binomial shortcut")
 //!
 //! Until this harness none of those three sentences had a measurement
-//! behind it. Run it through `../../../scripts/ctgrind.sh paillier` once the
+//! behind it. Run it through `../../../scripts/checks/ctgrind.sh paillier` once the
 //! coordinator has wired the per-module TARGETS/MODES/PATTERN/LABEL block
-//! (this file intentionally does NOT touch `scripts/ctgrind.sh` — see the
+//! (this file intentionally does NOT touch `scripts/checks/ctgrind.sh` — see the
 //! "Suggested config" section at the bottom of this comment); until then,
 //! drive it directly:
 //!
@@ -94,11 +94,11 @@
 //! After the call, the result is formatted through `std.debug.print`,
 //! which is NOT constant-time by design (digit/hex formatting branches on
 //! the value). Its contexts are reported separately (the WITNESS bucket,
-//! per `scripts/ctgrind.sh`'s classifier) from the target's own contexts,
+//! per `scripts/checks/ctgrind.sh`'s classifier) from the target's own contexts,
 //! so a zero count inside `root.zig` (or, for `crt`/`noncrt`, inside std's
 //! `math/big/int.zig`) means "no branch found", not "taint never arrived".
 //!
-//! ## Suggested config for `scripts/ctgrind.sh` (coordinator wires this)
+//! ## Suggested config for `scripts/checks/ctgrind.sh` (coordinator wires this)
 //!
 //!   TARGETS[paillier]="crt noncrt mul addm"
 //!   MODES[paillier]="ReleaseFast"
@@ -113,7 +113,7 @@
 //!
 //! `int[.]zig|math[.]zig|mem[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig`
 //! mirrors exactly what `threshold_ecdsa`'s own PATTERN already lists for
-//! its `root[.]zig` (paillier) frames — see `scripts/ctgrind.sh`'s
+//! its `root[.]zig` (paillier) frames — see `scripts/checks/ctgrind.sh`'s
 //! `PATTERN[threshold_ecdsa/share]` — because that is where this harness's
 //! own `crt`/`noncrt` measurement (below) attributes the L-function's
 //! `divFloor` frames. Re-check against a fresh `--stacks` run before

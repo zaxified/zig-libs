@@ -48,7 +48,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   launder their result mask through an empty `asm volatile` (`blackBox`, the montint `b199192`
   idiom). Measured on this module: with the barrier on the *input* instead, LLVM still recognised
   `ctEq(c,'+') & 62` as "62 or 0" and emitted a `test`/`je`. **Deleting `blackBox` as dead weight
-  silently reverts this property**, and no value test can see it — `scripts/ctgrind.sh sealedbox`
+  silently reverts this property**, and no value test can see it — `scripts/checks/ctgrind.sh sealedbox`
   can, and its pins are exact. ⛔⛔ Verified by deploying the defect: with `blackBox` deleted,
   only `b64dec`'s **count** moves (1 → 5) — the other three rows are caught **only** by the
   source digest. On three of four rows the source pin is the whole gate.
@@ -102,9 +102,9 @@ closing E4 as "document, don't chase" applies here without modification.
 RFC 7748-cross-checked X25519 KATs, end-to-end serialize→deserialize→seal→open, tamper/forgery
 rejection, and malformed-key-input typed errors. Run: `zig build test-sealedbox`.
 
-**Constant-time anchor:** `scripts/ctgrind.sh sealedbox` (valgrind/memcheck, ReleaseFast, the
+**Constant-time anchor:** `scripts/checks/ctgrind.sh sealedbox` (valgrind/memcheck, ReleaseFast, the
 secret — or, for the parsers, the secret-derived text — marked undefined). Pinned in
-`scripts/ctgrind-expected.tsv`, exact, with an untainted control row and a no-`-fvalgrind` trap row
+`scripts/checks/ctgrind-expected.tsv`, exact, with an untainted control row and a no-`-fvalgrind` trap row
 at 0 beside each:
 
 | target | in-file | why |

@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Verified, not
 //! asserted" bullet, as an actual committed program. Run it through
-//! `../../../scripts/ctgrind.sh ecvrf`.
+//! `../../../scripts/checks/ctgrind.sh ecvrf`.
 //!
 //! That bullet quoted "11 errors / 10 contexts before, 4 / 3 after" with no
 //! harness in the repo. The "before" half describes code that no longer exists
@@ -54,7 +54,7 @@
 //! untainted first; the verdict is declassified before the harness branches
 //! on it (accept/reject is public).
 //!
-//! ⭐ The gate that DOES catch it is `scripts/check-ct-compare.py`, which pins
+//! ⭐ The gate that DOES catch it is `scripts/checks/check-ct-compare.py`, which pins
 //! `modules/ecvrf/src/ecvrf.zig` at one `timing_safe` comparison and zero
 //! plain `std.mem` ones. Measured on that mutation 2026-09-16: the module's
 //! own suite is 31/31 green in both release modes, this harness's counts do

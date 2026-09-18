@@ -172,14 +172,14 @@ turns each of those into an overflow branch on a secret-derived value.
 **The measurement, in full, so the claim is exactly as wide as the evidence.**
 Since 2026-08-11 it is a **committed program**, not numbers a reader has to take
 on faith: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), driven by
-[`../../scripts/ctgrind.sh`](../../scripts/ctgrind.sh). It marks the 32-byte
+[`../../scripts/checks/ctgrind.sh`](../../scripts/checks/ctgrind.sh). It marks the 32-byte
 Poly1305 key `MAKE_MEM_UNDEFINED`, forces a volatile reload so the optimizer
 cannot keep a defined register copy, and drives it through `Poly1305.create` at
 16/64/192/1024/8192 B plus a chunked `update`/`pad`/`update`/`final` stream.
 Run it:
 
 ```sh
-scripts/ctgrind.sh chachapoly
+scripts/checks/ctgrind.sh chachapoly
 ```
 
 Zig 0.16.0, valgrind 3.26.0, x86_64 (i7-7920HQ), `lanes = 4`, 2026-08-11.

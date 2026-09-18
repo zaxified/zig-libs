@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/dissect.py`).
+//! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/gen/dissect.py`).
 //!
 //! this module's anchor record (`SPEC.md` § Anchoring) read `SELF` before this file existed,
 //! justified as "SPEC.md: no external oracle needed, wire exercised via
@@ -90,7 +90,7 @@ fn up0() scheduler.InterfaceSet {
 // ── number ───────────────────────────────────────────────────────────────────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
+//   scripts/gen/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
 //   00 00 00 00 0a 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 09 20 01
 //   f4 11 22 33 44 55 66 00 01 00 00 00 02 6e 27 03 84 11 22 33 44 55 66 09 0a
 //   80 00 00 07 6c 91'
@@ -118,12 +118,12 @@ fn up0() scheduler.InterfaceSet {
 //
 // The two summarised LSPs, dissected on their own so Wireshark grades the
 // checksum it cannot grade inside an LSP-Entry:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 01
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 01
 //   f4 11 22 33 44 55 66 00 01 00 00 00 02 6e 27 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum == 0x6e27 = Checksum: 0x6e27 [correct]
 //     isis.lsp.checksum.status == "Good" = Checksum Status: Good
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
 //   84 11 22 33 44 55 66 09 0a 80 00 00 07 6c 91 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum == 0x6c91 = Checksum: 0x6c91 [correct]
@@ -199,7 +199,7 @@ test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces 
 // ── this module's own chunking/tiling of 3 LSPs at a 1-entry-per-PDU cap ────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 21 01 06 19 01 00 03 00 33 00
+//   scripts/gen/dissect.py --frame llc --fields '83 21 01 06 19 01 00 03 00 33 00
 //   00 00 00 00 0a 00 22 33 44 55 66 77 00 02 22 33 44 55 66 77 00 02 09 10 02
 //   58 22 33 44 55 66 77 00 02 00 00 00 03 33 f9'
 //
@@ -218,7 +218,7 @@ test "golden L1 CSNP full range (Wireshark-anchored): Scheduler.poll reproduces 
 //   isis.csnp.lsp_id == 2233.4455.6677.00-02 = LSP-ID: 2233.4455.6677.00-02
 //
 // The summarised LSP on its own, so Wireshark grades the checksum:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 02
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 02
 //   58 22 33 44 55 66 77 00 02 00 00 00 03 33 f9 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum == 0x33f9 = Checksum: 0x33f9 [correct]
@@ -290,7 +290,7 @@ test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own ch
 // in both PDUs and the dissector shares one subtree definition for it).
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 00
+//   scripts/gen/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 00
 //   00 00 00 00 0a 00 09 10 03 84 11 22 33 44 55 66 09 0a 80 00 00 07 6c 91'
 //
 // Wireshark printed:
@@ -307,7 +307,7 @@ test "golden L2 CSNP partial range (Wireshark-anchored): Scheduler.poll's own ch
 //   isis.csnp.lsp_id == 1122.3344.5566.09-0a = LSP-ID: 1122.3344.5566.09-0a
 //
 // The acknowledged LSP on its own (same bytes as Golden 1's second entry):
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
 //   84 11 22 33 44 55 66 09 0a 80 00 00 07 6c 91 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum.status == "Good" = Checksum Status: Good
@@ -351,7 +351,7 @@ test "golden L1 PSNP (Wireshark-anchored): Scheduler.poll's SSN-drain reproduces
 // ── Golden 4: L2 PSNP — the L2 type code (27) counterpart to Golden 3 ───────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 11 01 06 1b 01 00 03 00 23 00
+//   scripts/gen/dissect.py --frame llc --fields '83 11 01 06 1b 01 00 03 00 23 00
 //   00 00 00 00 0a 00 09 10 02 bc 22 33 44 55 66 77 00 01 00 00 00 09 2d fa'
 //
 // Wireshark printed:
@@ -365,7 +365,7 @@ test "golden L1 PSNP (Wireshark-anchored): Scheduler.poll's SSN-drain reproduces
 //   isis.csnp.lsp_id == 2233.4455.6677.00-01 = LSP-ID: 2233.4455.6677.00-01
 //
 // The acknowledged LSP on its own, so Wireshark grades the checksum:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 02
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 02
 //   bc 22 33 44 55 66 77 00 01 00 00 00 09 2d fa 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum == 0x2dfa = Checksum: 0x2dfa [correct]
@@ -419,7 +419,7 @@ test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP ty
 // real LSP-ID, and a third-party dissector agrees that is what the field says.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
+//   scripts/gen/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 43 00
 //   00 00 00 00 0a 00 00 00 00 00 00 00 00 00 00 00 00 00 00 0b 00 01 09 20 03
 //   84 00 00 00 00 00 0b 00 00 00 00 00 01 a6 4c 03 84 00 00 00 00 00 0b 00 01
 //   00 00 00 02 9e 52'
@@ -439,12 +439,12 @@ test "golden L2 PSNP (Wireshark-anchored): Scheduler.poll selects the L2 PSNP ty
 //   isis.csnp.lsp_id == 0000.0000.000b.00-01 = LSP-ID: 0000.0000.000b.00-01
 //
 // The two listed LSPs on their own, so Wireshark grades their checksums:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
 //   84 00 00 00 00 00 0b 00 00 00 00 00 01 a6 4c 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum == 0xa64c = Checksum: 0xa64c [correct]
 //     isis.lsp.checksum.status == "Good" = Checksum Status: Good
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 12 01 00 03 00 1b 03
 //   84 00 00 00 00 00 0b 00 01 00 00 00 02 9e 52 01'
 //     frame.protocols == "eth:llc:osi:isis:isis.lsp"
 //     isis.lsp.checksum == 0x9e52 = Checksum: 0x9e52 [correct]

@@ -136,7 +136,7 @@ verdict is itself the byte-exactness proof; the matching tampered
 `dnspython`), and README called it "ephemeral" — accurately: a scratchpad does
 not survive a reboot, so the module's strongest anchor had no re-takeable
 recipe. Same shape as the drift-ranking script this campaign had to move out of
-a session scratchpad. `scripts/gen-dnssec-oracle.sh` now restores the
+a session scratchpad. `scripts/gen/gen-dnssec-oracle.sh` now restores the
 provenance CHAIN: it builds a zone, signs it once per algorithm this module
 implements a verifier for (8, 13, 15) plus an NSEC3 pass, and has `ldns` —
 an independent implementation, not this repo — verify each result. What it

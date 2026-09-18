@@ -53,12 +53,12 @@ headers; it simply verifies nothing on that host. It is deliberately NOT a
 `zig build test` gate for the same reason -- a build that only passes with
 specific host packages installed is not a build the repo can require
 everywhere. Run it by hand, or wire it into whatever this host's CI is (see
-`scripts/check-citations.py` for the same non-gated-build precedent).
+`scripts/gen/check-citations.py` for the same non-gated-build precedent).
 
 Usage:
-    scripts/check-uapi-consts.py                     # every registered module
-    scripts/check-uapi-consts.py ethtool nl80211      # just these
-    scripts/check-uapi-consts.py --verbose            # print every MATCHED too
+    scripts/checks/check-uapi-consts.py                     # every registered module
+    scripts/checks/check-uapi-consts.py ethtool nl80211      # just these
+    scripts/checks/check-uapi-consts.py --verbose            # print every MATCHED too
 
 Python 3 stdlib only -- no pip packages, no network.
 """
@@ -67,7 +67,7 @@ import os
 import re
 import sys
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Per-module: which of the module's own source files carry the constants,
 # which installed kernel headers to diff against, and which prefixes to try

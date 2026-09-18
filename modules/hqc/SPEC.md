@@ -162,7 +162,7 @@ below). See [README.md](README.md) for purpose and API.
   here said no machine-checked verification had been run. It has been now,
   and it does not agree with the paragraph above it.
   [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig) is committed and
-  `scripts/ctgrind.sh hqc` drives it; `scripts/ctgrind-expected.tsv`
+  `scripts/checks/ctgrind.sh hqc` drives it; `scripts/checks/ctgrind-expected.tsv`
   carries the four rows as a **recorded defect**, which is what this
   repository does with a non-zero nobody can account for.
 
@@ -191,7 +191,7 @@ below). See [README.md](README.md) for purpose and API.
   `asm volatile ("" : "+r" (mask))`: an opaque identity the compiler must
   assume may have changed the value, so it can no longer prove the select.
   The barrier is load-bearing — deleting it puts all 38 back — and
-  `scripts/ctgrind.sh --check` pins the count, so a deletion turns that red
+  `scripts/checks/ctgrind.sh --check` pins the count, so a deletion turns that red
   instead of passing quietly.
 
   **What it cost.** Measured before it was applied, min of 200 calls,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Close the environment gaps `scripts/test.sh` reports, on a hosted runner.
 #
-# Usage: scripts/ci-environment.sh [tests|interop|ctgrind|all]   (default: tests)
+# Usage: scripts/lib/ci-environment.sh [tests|interop|ctgrind|all]   (default: tests)
 #
 # ⭐ TWO ROLES SINCE 2026-09-06, AND THE SPLIT IS THE POINT OF THIS HEADER.
 # Until that day one list served every lane, and it was written when every one
@@ -30,7 +30,7 @@
 # anchor: it can never be extended, corrected, or re-derived, only trusted.
 # This repository has already lost one that way — `modules/dnssec`'s
 # independent-oracle vectors credited two scratchpad paths that are not in the
-# repo, and `scripts/gen-dnssec-oracle.sh` had to be written from scratch to
+# repo, and `scripts/gen/gen-dnssec-oracle.sh` had to be written from scratch to
 # make the anchor re-takeable again. Six transcripts landed on 2026-09-06;
 # keeping the recipe installable is what stops all six going the same way.
 #
@@ -222,7 +222,7 @@ fi
 if want ctgrind; then
 echo "::group::valgrind"
 # The ONLY thing the ctgrind lane needs, and the lane is red without it rather
-# than green-and-empty: `scripts/ctgrind.sh` exits 2 when valgrind is not on
+# than green-and-empty: `scripts/checks/ctgrind.sh` exits 2 when valgrind is not on
 # PATH ("install it or run this on a host that has it — no auto-install"), so a
 # failed install here cannot be mistaken for a passing measurement.
 #

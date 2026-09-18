@@ -623,7 +623,7 @@ test "verify: no longer re-decodes pi to reach proofToHash's tail (audit E10 poi
     //
     // Opt-in, like every other bench in this repo (`K256_BENCH`, `TC_BENCH`, …):
     // a test that asserts nothing and prints unconditionally is counted as a
-    // PASS while the lane turns its stderr into a FAIL (scripts/test-lib.sh).
+    // PASS while the lane turns its stderr into a FAIL (scripts/lib/test-lib.sh).
     // Skipping when unasked says what this is; printing said it every run.
     if (std.process.Environ.getPosix(std.testing.environ, "ECVRF_BENCH") == null) return error.SkipZigTest;
     var threaded = std.Io.Threaded.init(std.testing.allocator, .{});

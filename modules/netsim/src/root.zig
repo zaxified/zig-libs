@@ -644,7 +644,7 @@ test "replay(log_out=null) stores no log entries (audit F10)" {
     try testing.expect(stored_when_enabled > 10);
 
     // Diagnostic only. The lane turns stderr from a PASSING test into a FAIL
-    // (scripts/test-lib.sh), so the number is opt-in; the assertions above run
+    // (scripts/lib/test-lib.sh), so the number is opt-in; the assertions above run
     // either way.
     if (std.process.Environ.getPosix(std.testing.environ, "NETSIM_VERBOSE") != null) {
         std.debug.print(

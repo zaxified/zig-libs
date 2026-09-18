@@ -126,7 +126,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   reboot, so the anchor had no re-takeable recipe at all, which makes it an
   assertion rather than a measurement (same shape as the drift-ranking script
   this campaign had to move out of a session scratchpad).
-  `scripts/gen-dnssec-oracle.sh` restores the provenance chain: it builds a
+  `scripts/gen/gen-dnssec-oracle.sh` restores the provenance chain: it builds a
   zone, signs it once per algorithm this module implements a verifier for
   (RSASHA256, ECDSAP256SHA256, Ed25519) plus an NSEC3 pass, and has ldns verify
   each — run and confirmed on this host, not written from memory. ⚠ It does

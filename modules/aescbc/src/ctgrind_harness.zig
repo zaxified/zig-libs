@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — measures the two padding strippers, which are the only
 //! places this module does its own arithmetic over a secret. Run it through
-//! `../../../scripts/ctgrind.sh aescbc`.
+//! `../../../scripts/checks/ctgrind.sh aescbc`.
 //!
 //! ## Why this module has a harness at all
 //!
@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // API hands its caller by contract, so a real consumer writes exactly this.
     // Hiding it in the harness would measure a caller nobody writes. It lands
     // wherever the inliner puts it; see this module's rows in
-    // `scripts/ctgrind-expected.tsv` for what was measured.
+    // `scripts/checks/ctgrind-expected.tsv` for what was measured.
     const n = switch (target) {
         .pkcs7 => root.unpadPkcs7(buf[0..padded_len]),
         .xmlenc => root.unpadXmlEnc(buf[0..padded_len]),

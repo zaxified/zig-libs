@@ -24,7 +24,7 @@
 # -> the `Vec` literals in `oracle_vectors.zig`) has something to read from.
 # That extractor is the piece that was lost; it is not reconstructed here.
 #
-# Usage: scripts/gen-dnssec-oracle.sh [outdir]
+# Usage: scripts/gen/gen-dnssec-oracle.sh [outdir]
 set -euo pipefail
 
 OUT="${1:-.zig-cache/dnssec-oracle}"

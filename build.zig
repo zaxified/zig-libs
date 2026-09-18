@@ -93,7 +93,7 @@ const Module = struct {
     /// namespace) when the host allows it. For modules doing netlink WRITES:
     /// on a bare development host they would attempt real changes that
     /// collide with host state. Moved here from a list in
-    /// `scripts/test-lib.sh` on 2026-09-18, so it is part of the module's
+    /// `scripts/lib/test-lib.sh` on 2026-09-18, so it is part of the module's
     /// fingerprint -- it changes how the module's tests run -- and the driver
     /// scripts no longer have to be. Published as `module-graph` column 7.
     netns: bool = false,
@@ -466,7 +466,7 @@ pub fn build(b: *std.Build) void {
     // milliseconds where the sweep takes minutes.
     b.step("check-example-rule", "Check CONVENTIONS 7.2: every module over a trigger has an example").dependOn(check_example_rule);
 
-    // The `own_files` list `scripts/force-pubfn-reach.zig` needs, built ONCE per
+    // The `own_files` list `scripts/lib/force-pubfn-reach.zig` needs, built ONCE per
     // module and looked up by name. Shared rather than rebuilt at each use so
     // the native gate and every cross-compiled pair cannot be handed different
     // lists -- two copies of a derived fact is the shape this repository keeps
@@ -665,7 +665,7 @@ pub fn build(b: *std.Build) void {
         // behaviour to run, and a reference that reaches code generation has
         // already proven what the step exists to prove.
         const force_mod = b.createModule(.{
-            .root_source_file = b.path("scripts/force-pubfn-reach.zig"),
+            .root_source_file = b.path("scripts/lib/force-pubfn-reach.zig"),
             .target = target,
             .optimize = if (m.heavy) heavy_optimize else optimize,
         });
@@ -706,7 +706,7 @@ pub fn build(b: *std.Build) void {
         // sit outside it (link-time reach: a MIPS `PC16` fixup overflows at
         // ±128 KB) are inside it now. What is still outside is what a module
         // DRAGS IN by size (`http`'s TLS-vs-plaintext split was 334 KB), which
-        // needs a measured binary; `scripts/check-http-sizeprobe.sh` is the one
+        // needs a measured binary; `scripts/checks/check-http-sizeprobe.sh` is the one
         // place this repository does that.
         //
         // The comment this replaces said the opposite, and had said it since
@@ -851,7 +851,7 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const portable = b.step(
         "check-portable",
-        "Compile every module's tests for each target in its meta.targets, checked against scripts/portable-known-failures.tsv",
+        "Compile every module's tests for each target in its meta.targets, checked against scripts/checks/portable-known-failures.tsv",
     );
 
     // Pass 1: parse every module's declared set once, in module_list order,
@@ -971,12 +971,12 @@ pub fn build(b: *std.Build) void {
             //
             // So each declared (module, target) pair also compiles the forcing
             // root. Deliberately part of `portable-<name>-<target>` rather than
-            // a new gate: the pair is the unit `scripts/portable-known-failures.tsv`
+            // a new gate: the pair is the unit `scripts/checks/portable-known-failures.tsv`
             // is keyed by, so a pair that already fails stays one row, and a
             // pair that starts failing BECAUSE of this fails as itself rather
             // than under a second baseline that would have to be kept in sync.
             const cross_force_mod = b.createModule(.{
-                .root_source_file = b.path("scripts/force-pubfn-reach.zig"),
+                .root_source_file = b.path("scripts/lib/force-pubfn-reach.zig"),
                 .target = cross_resolved[ti],
                 .optimize = .ReleaseSmall,
             });
@@ -1002,7 +1002,7 @@ pub fn build(b: *std.Build) void {
     // re-invokes `zig build portable-<name>-<target>...` as a subprocess (the
     // same shape `DarkTestsStep` uses to shell out to `dark-tests.sh`), reads
     // the per-pair PASS/FAIL from `--summary all`, and diffs that against
-    // `scripts/portable-known-failures.tsv` itself.
+    // `scripts/checks/portable-known-failures.tsv` itself.
     const portable_baseline = b.allocator.create(PortableBaselineStep) catch @panic("OOM");
     portable_baseline.* = .{
         .step = std.Build.Step.init(.{
@@ -1022,7 +1022,7 @@ pub fn build(b: *std.Build) void {
     // `root.zig` files and a TSV. This renders the README's "Portability"
     // table from exactly the two sources `check-portable` itself reads --
     // `module_targets`' declared sets (snapshotted into `portable_decls`
-    // above) and `scripts/portable-known-failures.tsv` -- so the table can
+    // above) and `scripts/checks/portable-known-failures.tsv` -- so the table can
     // never assert a status the gate did not itself check, and a stale table
     // (edited by hand, or left behind after a module's `.targets` changed)
     // fails the build exactly as a stale baseline row does. Two named steps
@@ -1369,7 +1369,7 @@ pub fn build(b: *std.Build) void {
     // the repo would notice a wrong value (a mutated constant compiled and
     // `zig build test-<module>` stayed green, because each module's own
     // goldens read the same mutated symbol on both the encode and the
-    // decode side). `scripts/check-uapi-consts.py` is the standing version
+    // decode side). `scripts/checks/check-uapi-consts.py` is the standing version
     // of that diff. It is a SEPARATE step, not folded into `check-catalog`
     // or `test`, because unlike those it depends on host state this build
     // does not control: a machine without `python3` or without the kernel
@@ -1383,7 +1383,7 @@ pub fn build(b: *std.Build) void {
     // skips rather than fails when python3 or the headers are missing, which
     // is exactly what makes it safe to run everywhere.
     //
-    // `scripts/check-citations.py` has the same host-dependency shape but is
+    // `scripts/gen/check-citations.py` has the same host-dependency shape but is
     // NOT gated, for a different reason: measured on `dns`, it pairs an `RFC
     // NNNN` mention with any nearby quoted string, so a quoted SPEC.md heading
     // reports as a citation mismatch. It stays a manual tool until its
@@ -1423,7 +1423,7 @@ pub fn build(b: *std.Build) void {
     // ── Constant-time (ctgrind) harnesses ───────────────────────────────
     //
     // `zig build ctgrind` builds every `modules/<m>/src/ctgrind_harness.zig`
-    // into `<prefix>/ctgrind/ctgrind-<m>`; `scripts/ctgrind.sh` drives them
+    // into `<prefix>/ctgrind/ctgrind-<m>`; `scripts/checks/ctgrind.sh` drives them
     // under `valgrind --tool=memcheck` and prints the control table. They are
     // NOT tests and are NOT run by `zig build test`: memcheck's context count
     // is valgrind's own verdict, not something a Zig test can assert on.
@@ -1454,7 +1454,7 @@ pub fn build(b: *std.Build) void {
         "Limit `zig build ctgrind` to this module (repeatable; default: every harness)",
     ) orelse &.{};
 
-    const ctgrind = b.step("ctgrind", "Build the constant-time harnesses into <prefix>/ctgrind/ (run them with scripts/ctgrind.sh)");
+    const ctgrind = b.step("ctgrind", "Build the constant-time harnesses into <prefix>/ctgrind/ (run them with scripts/checks/ctgrind.sh)");
     const check_ctgrind = b.step("check-ctgrind", "Compile every ctgrind harness — rot guard, runs no valgrind");
     for (ctgrindHarnesses(b)) |name| {
         const src = b.path(b.fmt("modules/{s}/src/ctgrind_harness.zig", .{name}));
@@ -1486,7 +1486,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .valgrind = ctgrind_valgrind,
-                // Symbol names are how `scripts/ctgrind.sh` attributes a
+                // Symbol names are how `scripts/checks/ctgrind.sh` attributes a
                 // memcheck context to a file; a stripped binary reports
                 // `???` and the whole table becomes unreadable.
                 .strip = false,
@@ -1508,7 +1508,7 @@ pub fn build(b: *std.Build) void {
         // measured in Debug any more (ctgrind-expected.tsv is 18 ReleaseFast +
         // 2 ReleaseSafe, 0 Debug) because valgrind cannot read the
         // `.debug_line` Zig's self-hosted backend emits, and that backend is
-        // the default for Debug alone. See `scripts/ctgrind.sh` § MODES. Debug
+        // the default for Debug alone. See `scripts/checks/ctgrind.sh` § MODES. Debug
         // stays here because this guard is a COMPILE and Debug is the cheapest
         // mode to compile in; Zig's semantic analysis is mode-independent
         // except for explicit comptime branches on `builtin.mode`, and no
@@ -1519,7 +1519,7 @@ pub fn build(b: *std.Build) void {
         // ⛔ AND THIS GUARD IS NOT THE MEASUREMENT, which is the whole of audit
         // finding R14 item 1. It compiles; it asserts nothing about a single
         // context count. A harness can build perfectly and report a leak. Until
-        // 2026-09-08 no lane ran `scripts/ctgrind.sh --check` at all, so the 20
+        // 2026-09-08 no lane ran `scripts/checks/ctgrind.sh --check` at all, so the 20
         // pinned rows were verified by nothing; `scripts/test.sh ctgrind` and
         // the CI lane of the same name exist to close that, and this step stays
         // exactly what it always was -- a rot guard that needs no valgrind.
@@ -1604,7 +1604,7 @@ fn appCoversModule(name: []const u8) bool {
 /// Which modules own a constant-time harness. DERIVED, never listed: the fact
 /// is `modules/<m>/src/ctgrind_harness.zig` existing, and that file is its own
 /// declaration. It used to be written out three times — here, and twice in
-/// `scripts/ctgrind.sh` — so a harness added without editing all three was
+/// `scripts/checks/ctgrind.sh` — so a harness added without editing all three was
 /// simply never measured, with every gate still green. `module-graph` publishes
 /// the derived set so the script reads it instead of keeping a fourth copy.
 fn ctgrindHarnesses(b: *std.Build) []const []const u8 {
@@ -1622,7 +1622,7 @@ fn ctgrindHarnesses(b: *std.Build) []const []const u8 {
 /// its tests or example do has changed, and (ideally) not otherwise:
 ///
 ///   * the MACHINERY: this file with `module_list` cut out, `build.zig.zon`,
-///     and `scripts/force-pubfn-reach.zig`. Changing it re-keys every module,
+///     and `scripts/lib/force-pubfn-reach.zig`. Changing it re-keys every module,
 ///     which is right -- it is how every module is compiled. The driver
 ///     scripts are deliberately NOT in it; see the list below;
 ///   * the module's DECLARATION: its `module_list` entry, minus `libs` (a
@@ -1664,7 +1664,7 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
     // is now `.netns` in `module_list`, hashed with the module.
     for ([_][]const u8{
         "build.zig.zon",
-        "scripts/force-pubfn-reach.zig",
+        "scripts/lib/force-pubfn-reach.zig",
     }) |path| {
         const src = try b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(64 * 1024 * 1024));
         machinery.update(path);
@@ -1949,7 +1949,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
 /// there is no flag to keep in step with it, and so no way for the two to
 /// disagree. Called at configure time, once per module.
 /// A module's own source files, named the way `@typeName` spells them:
-/// `modules/<m>/src/wire.zig` is `wire`. Handed to `scripts/force-pubfn-reach.zig`
+/// `modules/<m>/src/wire.zig` is `wire`. Handed to `scripts/lib/force-pubfn-reach.zig`
 /// so its `declaredHere` can tell a container declared in a sibling FILE of the
 /// module under test (walk it -- nothing else ever will) from one re-exported
 /// out of std or a sibling MODULE (skip it -- that tests its owner, not us).
@@ -1978,7 +1978,7 @@ fn moduleFileNamespaces(b: *std.Build, io: std.Io, name: []const u8) []const []c
     return out.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
-/// The options module `scripts/force-pubfn-reach.zig` imports as `own_files`.
+/// The options module `scripts/lib/force-pubfn-reach.zig` imports as `own_files`.
 /// Built once per module and shared by the native gate and every cross-compile,
 /// so the two can never be handed different lists.
 fn ownFilesModule(b: *std.Build, name: []const u8) *std.Build.Module {
@@ -2490,7 +2490,7 @@ fn checkScriptsDoc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) a
     var it = dir.iterate();
     var failed = false;
     while (try it.next(io)) |e| {
-        if (std.mem.eql(u8, e.name, "README.md")) continue;
+        if (std.mem.eql(u8, e.name, "README.md") or std.mem.eql(u8, e.name, "__pycache__")) continue;
         const needle = if (e.kind == .directory) b.fmt("`{s}/`", .{e.name}) else b.fmt("`{s}`", .{e.name});
         if (std.mem.indexOf(u8, readme, needle) == null) {
             std.log.err(
@@ -2498,6 +2498,24 @@ fn checkScriptsDoc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) a
                 .{e.name},
             );
             failed = true;
+        }
+    }
+    // The three sorting directories (2026-09-18) hold most of the files, so
+    // their CONTENTS are held to the same rule -- otherwise a new check or
+    // generator could land in one of them undocumented, which is the very
+    // case this step exists for.
+    for ([_][]const u8{ "lib", "checks", "gen" }) |sub| {
+        var sd = try b.build_root.handle.openDir(io, b.fmt("scripts/{s}", .{sub}), .{ .iterate = true });
+        defer sd.close(io);
+        var sit = sd.iterate();
+        while (try sit.next(io)) |e| {
+            // Python's bytecode cache: gitignored, appears wherever a check ran.
+            if (std.mem.eql(u8, e.name, "__pycache__")) continue;
+            const needle = if (e.kind == .directory) b.fmt("`{s}/`", .{e.name}) else b.fmt("`{s}`", .{e.name});
+            if (std.mem.indexOf(u8, readme, needle) == null) {
+                std.log.err("scripts/{s}/{s} is not mentioned in scripts/README.md — add a row for it", .{ sub, e.name });
+                failed = true;
+            }
         }
     }
     if (failed) return step.fail("scripts/README.md does not cover scripts/", .{});
@@ -3691,7 +3709,7 @@ fn namesItsPayload(name: []const u8) bool {
 /// returns `error.StreamTooLong` when the file reaches the limit, so every
 /// generated file large enough to matter -- which is all of them -- failed the
 /// read and reported "not generated". `modules/tz/src/tz_data.zig` is 1 024 634
-/// bytes and carries `// GENERATED by scripts/tz-gen` on its second line; it
+/// bytes and carries `// GENERATED by scripts/gen/tz-gen` on its second line; it
 /// was missed. Caught by probing the arm rather than by trusting that a green
 /// gate meant a working one.
 fn declaresItselfGenerated(b: *std.Build, io: std.Io, path: []const u8) bool {
@@ -3713,10 +3731,10 @@ fn declaresItselfGenerated(b: *std.Build, io: std.Io, path: []const u8) bool {
     // BEGINS with lowercase "generated" is the middle of a hard-wrapped one.
     // Measured over every `.zig` in the tree, this is exactly the split.
     //
-    //   kept   `// GENERATED by scripts/tz-gen`            (tz_data.zig)
+    //   kept   `// GENERATED by scripts/gen/tz-gen`            (tz_data.zig)
     //          `// GENERATED DATA -- every number below`   (rescue)
     //          `//! GENERATED -- do not hand-edit`         (grpc capture)
-    //          `// Generated by scripts/gen-p256-...`      (p256, both files)
+    //          `// Generated by scripts/gen/gen-p256-...`  (p256, both files)
     //          `//! Generated vector list over ...`        (csvstream, json5, xml)
     //   dropped `//! generated eBPF program (...)`         (xdp-classifier)
     //           `//! generated with OpenSSL 3.5.5`         (dtls -- still caught
@@ -4840,7 +4858,7 @@ const FuzzScan = struct {
 /// `build()`; it belongs to whoever burns those 26 down, not here. Weakening the
 /// gate to make the tree green was the alternative and was rejected.
 /// `zig build check-uapi` (campaign C-09). Shells out to
-/// `scripts/check-uapi-consts.py` rather than re-implementing its C-header
+/// `scripts/checks/check-uapi-consts.py` rather than re-implementing its C-header
 /// parsing in Zig -- the script is itself the tested, documented artifact
 /// (see its own module docstring), and this step is just what makes running
 /// it "standing" instead of "something you have to remember to type".
@@ -4854,7 +4872,7 @@ fn checkUapi(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
     const b = step.owner;
     const io = b.graph.io;
 
-    const script_path = b.pathFromRoot("scripts/check-uapi-consts.py");
+    const script_path = b.pathFromRoot("scripts/checks/check-uapi-consts.py");
     const result = std.process.run(b.allocator, io, .{
         .argv = &.{ "python3", script_path },
     }) catch |err| switch (err) {
@@ -4913,7 +4931,7 @@ fn checkUapi(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerro
 /// to count their tests costs a second full test run — it would roughly double
 /// the ~367 s gate. `scripts/test.sh` therefore does NOT call this step: it
 /// passes `--summary all` to the run it was going to make anyway, keeps the
-/// output, and hands it to `scripts/dark-tests.sh --summary <file>`, which
+/// output, and hands it to `scripts/lib/dark-tests.sh --summary <file>`, which
 /// builds nothing. That path is the gate; this step is the standalone entry
 /// point for a CI shape that does not go through the driver, and for running
 /// the check by hand. `-Ddark-module=<name>` narrows it.
@@ -5052,13 +5070,13 @@ fn parseMetaTargets(b: *std.Build, io: std.Io, name: []const u8) ParsedTargets {
 /// `<module> TAB <target> TAB <reason>` row per (module, target) pair that
 /// the module DECLARES in `meta.targets` but whose test compile is currently
 /// red, with the reason taken from the actual compiler error (never
-/// invented). See `scripts/portable-known-failures.tsv`'s own header for the
+/// invented). See `scripts/checks/portable-known-failures.tsv`'s own header for the
 /// full contract. Keyed by (module, target), not by module alone (as of this
 /// schema) -- a module can declare several targets and fail only some of
 /// them.
-const portable_baseline_path = "scripts/portable-known-failures.tsv";
+const portable_baseline_path = "scripts/checks/portable-known-failures.tsv";
 
-/// A parsed `scripts/portable-known-failures.tsv` row.
+/// A parsed `scripts/checks/portable-known-failures.tsv` row.
 const PortableBaselineEntry = struct { module: []const u8, target: PortableTarget, reason: []const u8 };
 
 /// Composite key for the (module, target) hash maps below -- a plain string
@@ -5067,7 +5085,7 @@ fn portablePairKey(b: *std.Build, module: []const u8, target: PortableTarget) []
     return b.fmt("{s}\x00{s}", .{ module, target.label() });
 }
 
-/// Parse `scripts/portable-known-failures.tsv`: blank lines and `#`-comment
+/// Parse `scripts/checks/portable-known-failures.tsv`: blank lines and `#`-comment
 /// lines are skipped, every other line is `<module>\t<target>\t<reason>` with
 /// a non-empty reason and a `target` naming one of `cross_compile_targets`.
 /// Malformed rows are reported through `failed` rather than silently skipped
@@ -5156,7 +5174,7 @@ fn parsePortableBaseline(
 /// failure short of not depending on it.
 ///
 /// Verdict per (module, target) pair, compared against
-/// `scripts/portable-known-failures.tsv`:
+/// `scripts/checks/portable-known-failures.tsv`:
 ///
 ///   pass, not listed   — fine, the common case.
 ///   fail, listed        — fine, an accounted-for baseline entry.
@@ -5586,7 +5604,7 @@ fn renderPortableTable(
             "declaration, because Zig analyses a body only when something references it and a " ++
             "`pub fn` no test reaches would otherwise never meet this target at all — and " ++
             "checks the result against " ++
-            "[`scripts/portable-known-failures.tsv`](scripts/portable-known-failures.tsv): of " ++
+            "[`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of " ++
             "{d} declared pairs, {d} currently compile clean and {d} are known-failing, tracked " ++
             "there with the real compiler error rather than silently dropped.\n\n" ++
             "**A blank cell means the module never claimed that target.** That is a different " ++
@@ -5648,7 +5666,7 @@ const DarkTestsStep = struct {
 
         var argv: std.ArrayList([]const u8) = .empty;
         try argv.append(b.allocator, "bash");
-        try argv.append(b.allocator, b.pathFromRoot("scripts/dark-tests.sh"));
+        try argv.append(b.allocator, b.pathFromRoot("scripts/lib/dark-tests.sh"));
         for (self.modules) |m| try argv.append(b.allocator, m);
 
         const result = std.process.run(b.allocator, io, .{

@@ -1334,7 +1334,7 @@ test "live: dump the conntrack table over a real ctnetlink socket" {
             try testing.expect(f.orig.dst_port != null);
         }
     }
-    // Success-path diagnostic: gated because scripts/test-lib.sh treats any
+    // Success-path diagnostic: gated because scripts/lib/test-lib.sh treats any
     // stderr from a passing step as a failure — a rule that only holds if
     // passing tests stay silent.
     if (verboseSkip()) std.debug.print("\nLIVE conntrack dump: {d} flow(s) decoded.\n", .{flows.len});
@@ -1424,7 +1424,7 @@ test "live: insert -> get -> dump -> delete round-trip (needs a netns)" {
     try testing.expectEqual(@as(?Flow, null), try sock.get(.ipv4, .orig, orig));
     try testing.expectError(error.NotFound, sock.delete(.ipv4, .orig, orig, null));
 
-    // Success-path diagnostic: gated because scripts/test-lib.sh treats any
+    // Success-path diagnostic: gated because scripts/lib/test-lib.sh treats any
     // stderr from a passing step as a failure — a rule that only holds if
     // passing tests stay silent.
     if (verboseSkip()) std.debug.print(
@@ -1472,7 +1472,7 @@ test "live: an event socket sees the flow another socket creates" {
         }
     }
     try testing.expect(found);
-    // Success-path diagnostic: gated because scripts/test-lib.sh treats any
+    // Success-path diagnostic: gated because scripts/lib/test-lib.sh treats any
     // stderr from a passing step as a failure — a rule that only holds if
     // passing tests stay silent.
     if (verboseSkip()) std.debug.print("\nLIVE conntrack events: NEW event observed for the inserted flow.\n", .{});

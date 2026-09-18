@@ -6,11 +6,11 @@
 //! those calls read `O(#queued)`/`O(interface_count)` instead of `O(n)`. Off
 //! by default (`error.SkipZigTest`); run it with:
 //!
-//!   ISIS_LSDB_BENCH=1 scripts/capped zig build test-isis-lsdb -Doptimize=ReleaseFast
+//!   ISIS_LSDB_BENCH=1 scripts/lib/capped zig build test-isis-lsdb -Doptimize=ReleaseFast
 //!
 //! **Sizing.** `default_capacity` (4096) distinct small LSPs — a few hundred
 //! KB total, nothing close to the memory an over-eager benchmark has OOM-
-//! killed this host with before. Run under `scripts/capped`.
+//! killed this host with before. Run under `scripts/lib/capped`.
 
 const std = @import("std");
 const root = @import("root.zig");

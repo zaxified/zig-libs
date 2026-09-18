@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — constant-time evidence for two of `bbs.zig`'s four
 //! Fable cores, as an actual committed program instead of an unmeasured
-//! sentence. Run it through `../../../scripts/ctgrind.sh bbs` (once the
+//! sentence. Run it through `../../../scripts/checks/ctgrind.sh bbs` (once the
 //! coordinator adds the `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries this
 //! file's doc comment suggests below — that script REFUSES an unlisted
 //! module rather than silently skipping it).
@@ -337,7 +337,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh config (coordinator: paste in, do not
+// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
 // generate mechanically — every existing entry carries hand-written
 // reasoning in its own comment; this follows the same shape) ───────────
 //

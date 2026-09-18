@@ -132,7 +132,7 @@ and the final subtract must stay a `CMOV`/masked select, not a `Jcc`.
 
 ### MEASURED 2026-08-13: found leaking on the portable path, fixed, re-measured
 
-`scripts/ctgrind.sh montint` (harness: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig))
+`scripts/checks/ctgrind.sh montint` (harness: [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig))
 is the first timing-audit tool ever run against this module. It found the
 "enforced structurally" claim FALSE on the portable path at ReleaseFast, in two
 of the four bullets above. Both are now repaired and re-measured; **every one of
@@ -158,7 +158,7 @@ names `montint.zig`, `limbs.zig` or `asm_core.zig`):
 `portable` and `asmcore` run a full `powMont`. The totals stay non-zero (8 / 4 /
 4) because the harness prints its results through a hex formatter that is not
 constant-time — that is the propagation witness which makes the in-file zeros
-readable, and `total_min` in `scripts/ctgrind-expected.tsv` asserts it fired.
+readable, and `total_min` in `scripts/checks/ctgrind-expected.tsv` asserts it fired.
 Under the classifier's `witness`/`unattr` columns every one of those 8 / 4 / 4 is
 accounted for as formatting and **0 are unattributed** — so the in-file zeros are
 zeros of a complete partition, not of a filter that dropped what it could not
@@ -336,10 +336,10 @@ caught the same way this one was.
    limb, so nothing there could ever have caught it.
    A green boundary test still says nothing about branch structure, which is
    exactly why item 5 exists.
-5. **ctgrind (valgrind/memcheck).** `scripts/ctgrind.sh montint` — three
+5. **ctgrind (valgrind/memcheck).** `scripts/checks/ctgrind.sh montint` — three
    dispatch sizes (L=4 / L=16 / L=32), each as a claim row plus an untainted
    control and a no-`-fvalgrind` trap. Rows recorded in
-   `scripts/ctgrind-expected.tsv`; `zig build check-ctgrind` compiles the harness
+   `scripts/checks/ctgrind-expected.tsv`; `zig build check-ctgrind` compiles the harness
    so it cannot rot. This is the item that found the `condSubTop` branch, and
    the only item that can tell whether it stays fixed — items 1–4 were all green
    for the entire life of the defect.
@@ -461,7 +461,7 @@ speed dispatch, not a correctness bound.
   "MEASURED 2026-08-13" under the constant-time contract above for the tables,
   the controls and what did *not* fix it. The sentence "no timing audit tool has
   been run" that used to close this bullet was the reason the defect survived,
-  and it is now `scripts/ctgrind.sh montint --check` instead.
+  and it is now `scripts/checks/ctgrind.sh montint --check` instead.
 - **The byte loaders are outside the CT contract.** `fromBytesBE` /
   `elementFromBytesBE` / `elemFromBytesBE` branch on byte VALUES (the zero-byte
   skip), so an encoding's zero-byte positions are observable. No secret reaches

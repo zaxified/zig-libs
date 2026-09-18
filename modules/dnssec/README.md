@@ -135,7 +135,7 @@ Opt-Out; a wildcard; NODATA + NXDOMAIN denial). Each signed zone was
 independently accepted by **`ldns-verify-zone`** (the independent reference
 validator, so the KATs aren't self-referential). The vectors are extracted
 into `src/oracle_vectors.zig`; the KATs live in `src/oracle_test.zig`.
-Re-take the oracle material with `scripts/gen-dnssec-oracle.sh` (needs
+Re-take the oracle material with `scripts/gen/gen-dnssec-oracle.sh` (needs
 `ldnsutils`); it signs and independently verifies a fresh zone per algorithm.
 It does not regenerate the committed vectors byte for byte — those keys are
 gone — and the extractor that turned wire rdata into the `Vec` literals was

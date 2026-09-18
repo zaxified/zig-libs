@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch a lane's stamps from the newest trusted CI artifact of that name.
 #
-#   usage: scripts/ci-stamps.sh fetch <artifact-name> <dest-file>
+#   usage: scripts/lib/ci-stamps.sh fetch <artifact-name> <dest-file>
 #
 # A stamp says a module, at a fingerprint, passed a lane (see "stamps" in
 # scripts/test.sh). CI carries a lane's stamps from run to run as an artifact

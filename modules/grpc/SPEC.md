@@ -321,7 +321,7 @@ interpreter), which answers "what would we know *without* the reference?".
 named a `test-grpc` configuration (interop forced to skip) that no longer exists — `test-grpc`
 is now always hermetic and always includes the replayed reference evidence, so there is exactly
 one number per mutation, not two. It is replaced by **`test-grpc` (replay)**, measured directly:
-each mutation applied to a clean tree, `./scripts/capped zig build test-grpc --summary all` run
+each mutation applied to a clean tree, `./scripts/lib/capped zig build test-grpc --summary all` run
 (119 tests total), the failure/crash counts read off the summary, then `git checkout` to restore
 before the next one. A no-op control (an added comment, no behavior change) was run first and
 last and stayed green both times (119/119), so the runner itself is not the thing that changed
@@ -373,7 +373,7 @@ clean error from the network; it gets silence.
 
 Eight more, same protocol. The "Offline-only" column is retired for the same reason as the
 client table above — replaced by `test-grpc` (replay), measured 2026-09-06 the same way (clean
-mutation, `./scripts/capped zig build test-grpc --summary all`, counts read off the summary,
+mutation, `./scripts/lib/capped zig build test-grpc --summary all`, counts read off the summary,
 restore, repeat; no-op control green before and after). All eight died; none failed to compile.
 
 **S7 needs a caveat the client mutations do not.** The SPEC previously recorded S7 as the sharpest

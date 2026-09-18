@@ -43,7 +43,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   even the one remaining allocation is a comparable fraction of it.
 
 - **2026-09-08** — `SPEC.md`'s constant-time sentence has an instrument behind it now:
-  `src/ctgrind_harness.zig`, driven by `scripts/ctgrind.sh`. The module was outside that
+  `src/ctgrind_harness.zig`, driven by `scripts/checks/ctgrind.sh`. The module was outside that
   table while making an explicit constant-time claim (audit F8). ReleaseFast: `derive` 0
   in-file contexts of 4, `protect` 0 of 2, `unprotect` 1 of 3 — std's `if (!valid)` at
   `aes_ccm.zig:152`, after the constant-time compare that produced it. ⚠ The two zeros are

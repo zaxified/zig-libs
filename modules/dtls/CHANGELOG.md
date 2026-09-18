@@ -54,7 +54,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 - **2026-09-07** — **NO CONSUMER-VISIBLE CHANGE:** the module's last two fuzz
   targets stop drawing their whole scenario from collapsing draws, and `dtls`
-  reaches zero on `scripts/check-fuzz-reach.py` (17 → 0).
+  reaches zero on `scripts/checks/check-fuzz-reach.py` (17 → 0).
 
   `handshake.fuzzReassemble` and `Connection.fuzzHandleFlight` both draw a
   SHAPE rather than a frame, and both took every choice from

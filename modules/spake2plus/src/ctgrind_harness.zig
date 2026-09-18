@@ -88,7 +88,7 @@
 //! 1. `std.valgrind.doClientRequest` compiles to nothing without
 //!    `-fvalgrind`, which is off by default outside Debug — a ReleaseFast
 //!    binary built without the switch is a SILENT NO-OP, not a clean result.
-//!    `scripts/ctgrind.sh` builds both ways so this is its own trap row.
+//!    `scripts/checks/ctgrind.sh` builds both ways so this is its own trap row.
 //! 2. An optimizer may keep a defined copy of a value in a register across
 //!    `makeMemUndefined`, or CSE against one — `reloadVolatile` forces one
 //!    real load from the just-tainted memory immediately before the call
@@ -98,7 +98,7 @@
 //!
 //! Debug cannot be measured at all here (valgrind's DWARF reader cannot
 //! parse what Zig's self-hosted backend emits, and Debug is the only mode
-//! where that backend is the default — `scripts/ctgrind.sh` § MODES); the
+//! where that backend is the default — `scripts/checks/ctgrind.sh` § MODES); the
 //! other safety checks (ReleaseSafe) turn `p256`'s field arithmetic and
 //! std's overflow-checked limb ops into branches on secret-derived values
 //! and flood the report the same way `ct25519` measured on its own ladder.

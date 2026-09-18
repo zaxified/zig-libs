@@ -3,7 +3,7 @@
 //! bench — WireGuard data-plane AEAD throughput. Off by default; opt in with
 //! `WIREGUARD_BENCH`:
 //!
-//!   WIREGUARD_BENCH=1 scripts/capped zig build test-wireguard -Doptimize=ReleaseFast -Dcpu=native
+//!   WIREGUARD_BENCH=1 scripts/lib/capped zig build test-wireguard -Doptimize=ReleaseFast -Dcpu=native
 //!
 //! **What this measures, and what it does NOT.** The one operation on
 //! WireGuard's packet path is `AEAD(T_send, counterNonce(counter), packet, ε)`
@@ -29,7 +29,7 @@
 //! Buffer sizes are deliberately tiny (one MTU) and throughput comes from
 //! iterating, never from allocating a large working set — a previous
 //! oversized benchmark in this repo OOM-killed the host's editor. Everything
-//! runs under `scripts/capped`.
+//! runs under `scripts/lib/capped`.
 //!
 //! Numbers are noisy on a mobile CPU (turbo / thermal). Treat them as ratios.
 

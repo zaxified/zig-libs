@@ -41,7 +41,7 @@
 //! found fewer than the eight it needs and returned the range minimum
 //! (`std/testing/Smith.zig:445`). Measured directly on 2026-09-07 with an
 //! 18-octet seed: `buf[0] == 'G'`, `len == 0`. The harness fetches its input
-//! and then throws it away. `./scripts/check-fuzz-reach.py` is the gate for
+//! and then throws it away. `./scripts/checks/check-fuzz-reach.py` is the gate for
 //! that half; this module is the other half, and neither is sufficient alone.
 
 const std = @import("std");

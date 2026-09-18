@@ -62,7 +62,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   - Docs: `SPEC.md` and `goldens.zig` pointed at `client.zig`'s `setFeaturesImpl`, which the
     2026-08-24 refactor replaced with `features.buildSetFeaturesByName`/`ByIndex`.
 
-  Out of scope but found here: `scripts/check-uapi-consts.py` was resolving 207 of this
+  Out of scope but found here: `scripts/checks/check-uapi-consts.py` was resolving 207 of this
   module's 340 constants and silently skipping 120 — every reply/notification message id, every
   `StringSetId`, and the `Port`/`Duplex`/`MdiX`/`Transceiver`/`MasterSlave*` enums the reply
   decoders `@enumFromInt` into. All 120 turned out to be **correct**; the gate simply could not

@@ -866,8 +866,8 @@ read from `py_ecc`'s source).
 
 Measured, not asserted: `src/ctgrind_harness.zig` drives the secret paths
 under valgrind's memcheck with the secret TAINTED, and
-`scripts/ctgrind.sh bn254 --check` compares the per-file context counts
-against `scripts/ctgrind-expected.tsv`. Two targets, ReleaseFast (Debug and
+`scripts/checks/ctgrind.sh bn254 --check` compares the per-file context counts
+against `scripts/checks/ctgrind-expected.tsv`. Two targets, ReleaseFast (Debug and
 ReleaseSafe add overflow checks that branch on tainted values and bury the
 signal):
 

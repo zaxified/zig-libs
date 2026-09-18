@@ -452,7 +452,7 @@ const CountingIo = struct {
 // inside the child with a seccomp filter, and asserts the child is killed by
 // SIGABRT rather than returning. Same shape as the repo's other
 // artefact-level gates, for the same reason — see
-// `scripts/check-fp-freedom.sh`.
+// `scripts/checks/check-fp-freedom.sh`.
 
 const sock_filter = extern struct { code: u16, jt: u8, jf: u8, k: u32 };
 const sock_fprog = extern struct { len: u16, filter: [*]const sock_filter };

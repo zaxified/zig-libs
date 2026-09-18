@@ -234,7 +234,7 @@ pairing math, and no unresolved hard problem remain in this module.
 ## Constant-time measurement (ctgrind)
 
 Three targets run under memcheck with one party's secret tainted; the counts
-are pinned in `scripts/ctgrind-expected.tsv`.
+are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|

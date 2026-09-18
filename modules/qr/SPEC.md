@@ -269,7 +269,7 @@ future work, not something this pass claims to have done." That work is done:
 `testdata/decode_vectors.bin` holds 160 grids produced by **segno**, spanning
 every version 1–40 at every level, which this module's decoder must read back to
 segno's own input. It is not a round trip — nothing in it was encoded here. The
-generator (`scripts/gen-qr-decode-vectors.py`) emits all 960; all 960 passed
+generator (`scripts/gen/gen-qr-decode-vectors.py`) emits all 960; all 960 passed
 when this landed.
 
 Still self-consistency only: error correction beyond what those vectors

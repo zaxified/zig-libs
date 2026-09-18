@@ -60,7 +60,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   become the program `tools/live.zig` (`zig build live-dns`). They talked to real resolvers —
   recursive UDP and TCP, reverse PTR of `8.8.8.8`, and the three DoH shapes against `dns.google` and
   `cloudflare-dns.com` — and each ended `catch |err| return skipLive(err)`, where `skipLive` printed
-  `live dns test skipped: <error>` with `std.debug.print`, i.e. to stderr. `scripts/test-lib.sh`
+  `live dns test skipped: <error>` with `std.debug.print`, i.e. to stderr. `scripts/lib/test-lib.sh`
   treats stderr on an exit-0 step as a failure ("OK-but-stderr -> treated as FAIL"), so a slow DNS
   server turned `test-dns` red and took a 217-module run with it, with nothing in this module
   changed. ⭐ Silencing the print would have been the wrong fix and so would keeping the skip: a

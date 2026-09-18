@@ -153,7 +153,7 @@ Both MAC checks are `std.crypto.timing_safe.eql` and fail closed.
 
 ## Constant time (ctgrind, audit finding M5)
 
-`src/ctgrind_harness.zig`, run by `scripts/ctgrind.sh opaque`. Each target
+`src/ctgrind_harness.zig`, run by `scripts/checks/ctgrind.sh opaque`. Each target
 taints ONE party's secrets and runs the other party untainted first, so a value
 that reached the measured party over the wire is never counted as its secret.
 Inputs are RFC 9807 C.1.1, so the printed outputs are the published vector.

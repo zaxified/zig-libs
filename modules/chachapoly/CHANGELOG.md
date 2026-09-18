@@ -6,7 +6,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 ## Unreleased
 
 - **2026-09-08** — The three `Debug` rows are gone from the constant-time table in
-  `SPEC.md` and from `scripts/ctgrind-expected.tsv`. They were a second copy of the
+  `SPEC.md` and from `scripts/checks/ctgrind-expected.tsv`. They were a second copy of the
   `ReleaseSafe` positive control (281 in-file contexts against its 210, the same checked
   operators for the same reason), and they were not a measurement: Zig 0.16 compiles Debug
   with the self-hosted x86_64 backend, whose `.debug_line` valgrind's DWARF reader cannot

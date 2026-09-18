@@ -149,7 +149,7 @@ byte-exact golden KATs (full B-Tagged frame + untagged-B-VLAN variant) are
 hand-assembled field-by-field per the IEEE spec; a third golden is externally
 anchored: `encode()`'s own output for a frame whose encapsulated customer frame
 carries its own 802.1Q C-VLAN tag was fed through Wireshark 4.6.4's real IEEE
-802.1ah dissector offline (`scripts/dissect.py`, sharkd — no capture, no
+802.1ah dissector offline (`scripts/gen/dissect.py`, sharkd — no capture, no
 network), and the frozen bytes plus the quoted Wireshark output live in
 `src/root.zig`. Wireshark independently confirmed the B-TCI and I-TCI bit
 order (including bit 27), the 24-bit I-SID window, C-DA/C-SA placement, the

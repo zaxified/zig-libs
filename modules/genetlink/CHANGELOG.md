@@ -35,7 +35,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     names over one `CTRL_CMD_GETFAMILY` round trip instead of one round trip per name (measured:
     6 names = 30 syscalls before, matches `nl80211`'s own subscribe loop). Additive; existing
     resolvers unchanged.
-  - **F9 (LOW):** `genetlink` registered with `scripts/check-uapi-consts.py` (previously the only
+  - **F9 (LOW):** `genetlink` registered with `scripts/checks/check-uapi-consts.py` (previously the only
     automatic check of its constants ran through `nl80211`'s own private copy, which SPEC's backlog
     plans to delete).
   See `SPEC.md` for the full writeup and `~/CML/20260901-zig-libs-audit/A1/genetlink.md` for the

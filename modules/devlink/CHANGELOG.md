@@ -36,7 +36,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   constructed *and* captured from a live `netdevsim`, with iproute2's own decode as the oracle).
   What the audit found is two verification holes, one on the hardware-write path.
   **MEDIUM — the standing UAPI gate checked NONE of this module's 35 kernel-ABI enum values.**
-  `scripts/check-uapi-consts.py` built `DEVLINK_PORTTYPE_ETH` from `PortType.eth` where the
+  `scripts/checks/check-uapi-consts.py` built `DEVLINK_PORTTYPE_ETH` from `PortType.eth` where the
   kernel spells it `DEVLINK_PORT_TYPE_ETH`, so every member of eight enums landed in an
   "unresolved" bucket that was never printed — not even under `--verbose` — and never failed.
   **20 of the 35 could be given a wrong value with the whole suite green**, including the ones

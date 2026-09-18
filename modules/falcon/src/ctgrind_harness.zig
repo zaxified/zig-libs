@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — the constant-time instrument for `falcon`'s signing
-//! key. Run it through `../../../scripts/ctgrind.sh falcon`; that script's
+//! key. Run it through `../../../scripts/checks/ctgrind.sh falcon`; that script's
 //! header explains the two traps (silent no-op without `-fvalgrind`, and a
 //! counting rule that must classify every context or fail).
 //!
@@ -28,7 +28,7 @@
 //! `oscore`'s harness closed for F8. Running it once, reading the actual
 //! context count and source lines, and recording them is strictly more
 //! honest than leaving the claim unmeasured. The coordinator, not this
-//! file, decides whether `scripts/ctgrind-expected.tsv` gets a permanent
+//! file, decides whether `scripts/checks/ctgrind-expected.tsv` gets a permanent
 //! (DEFECT-style, like `hqc`'s sampler row) entry for it or whether
 //! `SPEC.md`'s "should not get one" stands as written.
 //!
@@ -64,7 +64,7 @@
 //! the (real, byte-exact — taint never changes a value, only valgrind's
 //! shadow bookkeeping) nonce and signature bytes are formatted through
 //! `std.debug.print`, which is not constant-time by design. Its contexts are
-//! reported separately (the WITNESS bucket in `scripts/ctgrind.sh`); seeing
+//! reported separately (the WITNESS bucket in `scripts/checks/ctgrind.sh`); seeing
 //! them nonzero is what proves the taint travelled key -> sampler -> stdout,
 //! so a zero count inside falcon's own files means "no branch found", not
 //! "taint never arrived".
@@ -103,7 +103,7 @@ fn parseTarget(s: []const u8) !void {
     // Exactly one target: the trapdoor entering `signRandomized`. Kept as an
     // explicit argv slot (rather than dropping it) to match this
     // collection's `<target> <yes|no>` calling convention, so
-    // `scripts/ctgrind.sh`'s per-module TARGETS/MODES/PATTERN table can name
+    // `scripts/checks/ctgrind.sh`'s per-module TARGETS/MODES/PATTERN table can name
     // "sign" the same way it names every other module's targets.
     if (std.mem.eql(u8, s, "sign")) return;
     return error.UnknownTarget;

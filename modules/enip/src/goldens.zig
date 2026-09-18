@@ -981,7 +981,7 @@ test "no golden carries a real device identity" {
 //
 // Captured:
 //
-//   scripts/capped zig build test-enip \
+//   scripts/lib/capped zig build test-enip \
 //     -Dtest-filter="live: a real EtherNet/IP client against our adapter"
 //   ENIP_TEST_LISTEN=127.0.0.1:18944 (adapter under a recording proxy on 18945)
 //
@@ -1177,7 +1177,7 @@ test "a captured client session replays byte-exact through our own Adapter" {
 // against our adapter" test builds (`Adapter.init(cfg, &tags)` over the same
 // SCADA/INT, TestTag/DINT, RealTag/REAL bindings):
 //
-//   scripts/capped zig build test-enip \
+//   scripts/lib/capped zig build test-enip \
 //     -Dtest-filter="live: a real EtherNet/IP client against our adapter"
 //   ENIP_TEST_LISTEN=127.0.0.1:18951 (adapter behind a recording proxy)
 //   pycomm3 1.2.16: LogixDriver(proxy).open(); read SCADA{4}; read

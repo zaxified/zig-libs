@@ -3,7 +3,7 @@
 Copy this folder to `modules/<name>/`, then work through the list below. Steps
 2 and 4–7, and the `Provenance:` line of step 3, are each enforced by a gate —
 `check-catalog`, `check-changelog`, `check-testonly` and the dark-test check
-(`scripts/dark-tests.sh`) — all of which run in CI and in both `scripts/test.sh`
+(`scripts/lib/dark-tests.sh`) — all of which run in CI and in both `scripts/test.sh`
 lanes, so skipping one is a red build, not a style note. What those gates cannot
 read — whether the prose is any good, whether the tests assert anything — is
 what review is for. `CONVENTIONS.md` §6 is the narrative version; the rules

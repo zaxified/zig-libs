@@ -12,7 +12,7 @@
 //! the one the finding predicted.
 //! Off by default (`error.SkipZigTest`); run it with:
 //!
-//!   PAGECACHE_BENCH=1 scripts/capped zig build test-pagecache -Doptimize=ReleaseFast
+//!   PAGECACHE_BENCH=1 scripts/lib/capped zig build test-pagecache -Doptimize=ReleaseFast
 //!
 //! It reports two things per access shape, because only one of them is a
 //! property of the code rather than of this host:
@@ -25,7 +25,7 @@
 //! **Sizing.** A 1024-page (4 MiB) simulated file and a 64-page (256 KiB)
 //! cache. Deliberately small: an over-eager benchmark has OOM-killed this host
 //! before, and the constant factor under test does not need a big working set
-//! to show up. Run under `scripts/capped`.
+//! to show up. Run under `scripts/lib/capped`.
 
 const std = @import("std");
 const root = @import("root.zig");

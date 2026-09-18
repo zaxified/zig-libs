@@ -2,7 +2,7 @@
 
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "MEASURED, not
 //! merely constructed" bullet, as an actual committed program. Run it through
-//! `../../../scripts/ctgrind.sh ed448`, which builds every switch/taint
+//! `../../../scripts/checks/ctgrind.sh ed448`, which builds every switch/taint
 //! combination and prints the control table.
 //!
 //! Until 2026-08-11 that bullet quoted exact counts (3 errors / 3 contexts for

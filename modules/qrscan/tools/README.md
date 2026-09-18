@@ -33,7 +33,7 @@ python3 -m venv .zig-cache/o1-qrscan/venv
 .zig-cache/o1-qrscan/venv/bin/pip install zxing-cpp pillow segno numpy
 
 # the module's own example CLI, built against its published API only
-scripts/capped zig build-exe --cache-dir <scratch>/zc -OReleaseFast \
+scripts/lib/capped zig build-exe --cache-dir <scratch>/zc -OReleaseFast \
   -femit-bin=<scratch>/qrscan-demo \
   --dep qrscan --dep qr -Mmain=modules/qrscan/example/main.zig \
   --dep qr -Mqrscan=modules/qrscan/src/root.zig \

@@ -93,7 +93,7 @@ returns an error union, `if (!<condition>) return error.Something;`."""
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     examples = sorted(root.glob("modules/*/example/**/*.zig"))
     if not examples:
         print("check-example-assert: no modules/*/example/ sources found — "

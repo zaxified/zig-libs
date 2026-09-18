@@ -3,7 +3,7 @@
 #
 #   python3 -m venv ~/.cache/zig-libs-bitcointx
 #   ~/.cache/zig-libs-bitcointx/bin/pip install python-bitcoinlib
-#   ~/.cache/zig-libs-bitcointx/bin/python scripts/gen-bitcointx-single-bug.py
+#   ~/.cache/zig-libs-bitcointx/bin/python scripts/gen/gen-bitcointx-single-bug.py
 #
 # Emits only the array body; the file's header is written by hand. The output
 # is frozen into the repo, so the test gate stays offline and dependency-free.

@@ -91,7 +91,7 @@
 //! turns each of those into an overflow branch on a secret-derived value. So
 //! the claim is mode-dependent, and the mode boundary is where it breaks —
 //! measured, not reasoned, and re-measurable: `ctgrind_harness.zig` in this
-//! directory is the program, `../../../scripts/ctgrind.sh chachapoly` runs it.
+//! directory is the program, `../../../scripts/checks/ctgrind.sh chachapoly` runs it.
 //!
 //! ```
 //!   build            -fvalgrind  key tainted   contexts   in poly1305.zig

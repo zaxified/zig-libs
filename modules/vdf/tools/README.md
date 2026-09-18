@@ -20,7 +20,7 @@ value comparison.
 | `openssl_oracle.py` | The same value via OpenSSL's `BN_mod_exp` (independent modexp implementation), folded into the quotient `Z_N*/{±1}` the same way `eval` does, so the two are byte-comparable. |
 
 ```bash
-scripts/capped zig build-exe --cache-dir .zig-cache/o1-vdf \
+scripts/lib/capped zig build-exe --cache-dir .zig-cache/o1-vdf \
   -femit-bin=.zig-cache/o1-vdf/eval_driver \
   --dep vdf --dep montint \
   -Mroot=modules/vdf/tools/eval_driver.zig \

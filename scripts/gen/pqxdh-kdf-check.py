@@ -22,8 +22,8 @@ wrong order, a missing prefix, the wrong salt length, or `info` fed to
 -- but HKDF has RFC 5869 vectors of its own and both sides already pass those.
 
 Usage:
-    scripts/pqxdh-kdf-check.py            # print the pinned vectors as Zig
-    scripts/pqxdh-kdf-check.py --check    # re-derive and diff against the pin
+    scripts/gen/pqxdh-kdf-check.py            # print the pinned vectors as Zig
+    scripts/gen/pqxdh-kdf-check.py --check    # re-derive and diff against the pin
                                           # (exit 1 on any mismatch)
 
 The output is pinned in `modules/signal/src/interop_vectors.zig`; the test in
@@ -78,7 +78,7 @@ def check() -> int:
     and this one is the only thing standing behind the PQXDH composition,
     because the Zig tests compare against the pin, not against this file.
     """
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     text = (root / PIN).read_text()
     failures = 0
     for name, dh1, dh2, dh3, dh4, ss in CASES:

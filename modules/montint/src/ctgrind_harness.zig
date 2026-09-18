@@ -2,11 +2,11 @@
 
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Constant-time
 //! contract" section, as an actual committed program. Run it through
-//! `../../../scripts/ctgrind.sh montint`.
+//! `../../../scripts/checks/ctgrind.sh montint`.
 //!
 //! That section closed with "**No timing audit tool has been run**" and rested
-//! on one hand-read `montMul` disassembly. `scripts/ctgrind-expected.tsv` had
-//! no row for `montint` and `scripts/ctgrind.sh` had no target for it. That is
+//! on one hand-read `montMul` disassembly. `scripts/checks/ctgrind-expected.tsv` had
+//! no row for `montint` and `scripts/checks/ctgrind.sh` had no target for it. That is
 //! what this closes — and it matters more here than almost anywhere else in
 //! the repo, because montint `b199192` (the optimizer recovering the
 //! `powMont` table gather and lowering it to a secret-indexed jump table) is
@@ -56,7 +56,7 @@
 //! printed through `std.debug.print`, which is not constant-time, so a tainted
 //! byte reaching the formatter always produces contexts of its own. A zero
 //! in-file count next to a zero total would mean "the taint never arrived",
-//! which is what the `total_min` column in `scripts/ctgrind-expected.tsv`
+//! which is what the `total_min` column in `scripts/checks/ctgrind-expected.tsv`
 //! exists to rule out.
 //!
 //! ## What this harness does NOT pin (an honest gap)

@@ -3,7 +3,7 @@
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Constant
 //! time" section and for `poly1305.zig`'s own doc-comment table, as an actual
 //! committed program instead of numbers a reader has to take on faith. Run it
-//! through `../../../scripts/ctgrind.sh chachapoly`, which builds every
+//! through `../../../scripts/checks/ctgrind.sh chachapoly`, which builds every
 //! mode/switch/taint combination and prints the control table.
 //!
 //! Until 2026-08-11 both tables existed WITHOUT this file: the measurement had

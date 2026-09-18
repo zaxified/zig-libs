@@ -37,7 +37,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   8017 §7.2.2's classic construction, until now only expressible for PKCS#1
   v1.5 in this module) can do so for OAEP without re-implementing OAEP's
   padding-decode cryptography itself. ⏸ **ODLOŽENO NA KONEC KAMPANĚ —
-  vyžaduje re-pin ctgrind řádku** (`scripts/ctgrind-expected.tsv` rows `rsa
+  vyžaduje re-pin ctgrind řádku** (`scripts/checks/ctgrind-expected.tsv` rows `rsa
   ReleaseFast crt`/`noncrt`): this edit touches `src/root.zig`, one of the
   files the digest covers, so the pin goes red until the coordinator
   re-measures and re-pins at campaign end — not a defect, the digest doing

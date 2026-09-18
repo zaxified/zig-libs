@@ -76,7 +76,7 @@ pub fn mul(m: Modulus, x: Fe, y: Fe) Fe {
 // (63-bit redundant limbs, 4-way half-limb `mulWide`) — correct everywhere but
 // slow (~8–29× OpenSSL across this repo's bignum-crypto modules; see
 // `montint`'s own module doc comment). `montint` is ALSO constant-time — its
-// module doc comment says so, and `scripts/ctgrind.sh` runs three harnesses
+// module doc comment says so, and `scripts/checks/ctgrind.sh` runs three harnesses
 // over it with zero leaked branches (`ctgrind-expected.tsv`) — but is built on
 // full 2^64-bit limbs plus an amd64 `MULX`/`ADCX`/`ADOX` asm core, which is
 // where its speed actually comes from: NOT from dropping constant-time

@@ -17,7 +17,7 @@
 # is bit-for-bit identical to IEEE-754 — value tests CANNOT see the difference,
 # which is the whole point of the emulation and also why no value test can
 # defend it. `falcon` is not on the ctgrind gate either (it appears in neither
-# `scripts/ctgrind.sh` nor `scripts/ctgrind-expected.tsv`), so the property was
+# `scripts/checks/ctgrind.sh` nor `scripts/checks/ctgrind-expected.tsv`), so the property was
 # held in place by a paragraph of SPEC.md and by nothing else.
 #
 # SPEC.md did record an `objdump` run as evidence. A sentence describing a
@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 # Deliberately NOT ${TMPDIR}: this emits a ~6 MB binary, /tmp is tmpfs (RAM),
 # and the repo rule puts build scratch a rebuild can reproduce in .zig-cache.

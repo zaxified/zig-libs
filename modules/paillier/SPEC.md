@@ -113,7 +113,7 @@ special-cases `k = 0` to `one()` — `c^0 = 1` is the deterministic, unblinded `
   takes (every implementation's is); the Miller-Rabin modexps use `ff`'s constant-time
   path and all candidate buffers are `secureZero`ed — same posture as `rsa`.
 - **This section now has an instrument, not just prose** —
-  `src/ctgrind_harness.zig` + `scripts/ctgrind-expected.tsv` (targets `crt`/`noncrt`/
+  `src/ctgrind_harness.zig` + `scripts/checks/ctgrind-expected.tsv` (targets `crt`/`noncrt`/
   `mul`/`addm`); previously none of the sentences above had a measurement behind them
   (wave-3 audit F3).
 

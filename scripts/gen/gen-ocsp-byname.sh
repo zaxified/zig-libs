@@ -10,7 +10,7 @@
 # frozen. The frozen bytes are what the test gate reads — this script is never
 # run by the build.
 #
-# Usage: scripts/gen-ocsp-byname.sh <outdir>
+# Usage: scripts/gen/gen-ocsp-byname.sh <outdir>
 #
 # Then paste the printed arrays into goldens.zig and update the pinned
 # `producedAt`/`thisUpdate` epoch (printed at the end) in the tests.

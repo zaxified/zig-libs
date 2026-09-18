@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/dissect.py`).
+//! External anchor: Wireshark 4.6.4 (sharkd, via `scripts/gen/dissect.py`).
 //!
 //! this module's anchor record (`SPEC.md` § Anchoring), before this file: the §7.3.16.1
 //! checksum tie-break was cross-checked against FRRouting `isis_lsp.c`, but the
@@ -26,7 +26,7 @@
 //! (byte 12) to the end of the PDU, i.e. excluding PDU Length and Remaining
 //! Lifetime. That hand computation is **not** what makes this an anchor — it
 //! is only how the candidate byte pair was produced. The anchor is that
-//! `scripts/dissect.py`, i.e. Wireshark's own independent Fletcher
+//! `scripts/gen/dissect.py`, i.e. Wireshark's own independent Fletcher
 //! implementation, was then asked to grade it and reported `[correct]` /
 //! `"Good"`. Both LSP goldens below are fed through `Lsdb.insert`/
 //! `reconcileCsnp` (not just the sibling codec) so the assertions exercise
@@ -48,7 +48,7 @@ const testing = std.testing;
 // ── number, full flags nibble, and a real Fletcher checksum ─────────────────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 14 01 00 03 00 1b 03
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 14 01 00 03 00 1b 03
 //   84 aa bb cc dd ee ff 07 03 80 00 00 07 ae e7 d7'
 //
 // Wireshark printed (verbatim, trimmed to the load-bearing lines):
@@ -165,7 +165,7 @@ test "golden LSP (Wireshark-anchored): Lsdb.insert stores exactly the fields Wir
 //
 // Command (same LSP bytes, checksum field overwritten with the arbitrary
 // 0x1111 `store.zig` test fixtures use as a placeholder):
-//   scripts/dissect.py --frame llc --fields '83 1b 01 06 14 01 00 03 00 1b 03
+//   scripts/gen/dissect.py --frame llc --fields '83 1b 01 06 14 01 00 03 00 1b 03
 //   84 aa bb cc dd ee ff 07 03 80 00 00 07 11 11 d7'
 //
 // Wireshark printed:
@@ -193,7 +193,7 @@ test "golden LSP (Wireshark-anchored): Lsdb.insert stores exactly the fields Wir
 // ── Golden 2: CSNP LSP-Entries — non-zero pseudonode + fragment ─────────────
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 33 11
+//   scripts/gen/dissect.py --frame llc --fields '83 21 01 06 18 01 00 03 00 33 11
 //   22 33 44 55 66 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 09 10 02
 //   2b 11 22 33 44 55 66 09 0a 00 00 00 42 99 aa'
 //
@@ -270,7 +270,7 @@ test "golden CSNP LSP-Entry (Wireshark-anchored): Lsdb.reconcileCsnp requests ex
 // Golden 3a: L1 PSNP (PDU type 26) — the PSNP path, not exercised above.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 11
+//   scripts/gen/dissect.py --frame llc --fields '83 11 01 06 1a 01 00 03 00 23 11
 //   22 33 44 55 66 00 09 10 01 41 11 22 33 44 55 66 0c 0d 00 00 00 99 56 78'
 //
 // Wireshark printed:
@@ -328,7 +328,7 @@ test "golden PSNP LSP-Entry (Wireshark-anchored): Lsdb.reconcilePsnp requests ex
 // values as golden 2, so the type code is the only variable.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 21 01 06 19 01 00 03 00 33 11
+//   scripts/gen/dissect.py --frame llc --fields '83 21 01 06 19 01 00 03 00 33 11
 //   22 33 44 55 66 00 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff ff 09 10 02
 //   2b 11 22 33 44 55 66 09 0a 00 00 00 42 99 aa'
 //
@@ -384,7 +384,7 @@ test "golden L2 CSNP LSP-Entry (Wireshark-anchored): Lsdb.reconcileCsnp recogniz
 // only variable.
 //
 // Command:
-//   scripts/dissect.py --frame llc --fields '83 11 01 06 1b 01 00 03 00 23 11
+//   scripts/gen/dissect.py --frame llc --fields '83 11 01 06 1b 01 00 03 00 23 11
 //   22 33 44 55 66 00 09 10 01 41 11 22 33 44 55 66 0c 0d 00 00 00 99 56 78'
 //
 // Wireshark printed:

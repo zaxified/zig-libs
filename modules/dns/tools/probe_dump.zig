@@ -10,7 +10,7 @@
 //!
 //! Build and run it (from the repository root):
 //!
-//!     scripts/capped zig build-exe --cache-dir .zig-cache \
+//!     scripts/lib/capped zig build-exe --cache-dir .zig-cache \
 //!       -femit-bin=.zig-cache/dns-oracle/probe_dump \
 //!       --dep msg -Mroot=modules/dns/tools/probe_dump.zig \
 //!       --dep testkit -Mmsg=modules/dns/src/message.zig \

@@ -3,7 +3,7 @@
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Constant-time
 //! note (measured)" and for `element.zig`'s `scalarMul` doc comment, as an
 //! actual committed program. Run it through
-//! `../../../scripts/ctgrind.sh decaf448`.
+//! `../../../scripts/checks/ctgrind.sh decaf448`.
 //!
 //! Both of those texts quoted exact counts ("0 memcheck errors through this
 //! function", "makes the same run report 860") with no harness in the repo.

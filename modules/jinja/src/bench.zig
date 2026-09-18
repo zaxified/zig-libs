@@ -3,7 +3,7 @@
 //! loader's design. Off by default (`error.SkipZigTest`); run it with
 //! `JINJA_BENCH`:
 //!
-//!   JINJA_BENCH=1 scripts/capped zig build test-jinja -Doptimize=ReleaseFast
+//!   JINJA_BENCH=1 scripts/lib/capped zig build test-jinja -Doptimize=ReleaseFast
 //!
 //! **The question it answers.** §9 makes the template cache per-render, in the
 //! render arena, so `Environment` stays `const` and `Template` stays immutable
@@ -22,7 +22,7 @@
 //! Sizing: the working set is a few kilobytes of template text and one output
 //! buffer. Nothing here allocates a large working set — a previous oversized
 //! benchmark in this repo OOM-killed the host's editor. Run under
-//! `scripts/capped`.
+//! `scripts/lib/capped`.
 
 const std = @import("std");
 const root = @import("root.zig");

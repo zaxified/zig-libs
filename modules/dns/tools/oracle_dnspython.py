@@ -12,7 +12,7 @@ escaping), so the two renderings are directly comparable.
 The full recipe, from the repository root:
 
     modules/dns/tools/gen_corpus.py 25000 1 > .zig-cache/dns-oracle/corpus.hex
-    scripts/capped zig build-exe --cache-dir .zig-cache \\
+    scripts/lib/capped zig build-exe --cache-dir .zig-cache \\
       -femit-bin=.zig-cache/dns-oracle/probe_dump \\
       --dep msg -Mroot=modules/dns/tools/probe_dump.zig \\
       --dep testkit -Mmsg=modules/dns/src/message.zig \\

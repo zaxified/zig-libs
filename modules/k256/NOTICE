@@ -184,7 +184,7 @@ Statement of changes, per Apache-2.0 §4(b)
 
 The upstream JSON was transformed into the two Zig files by
 `modules/k256/tools/gen-k256-wycheproof.py` (MIT, this repository's own work — modeled
-directly on the sibling `scripts/gen-p256-wycheproof.py`). What it changes:
+directly on the sibling `scripts/gen/gen-p256-wycheproof.py`). What it changes:
 
   1. **Re-encoded.** Each JSON test object becomes a Zig struct literal.
      Fields kept: the enclosing test group's `publicKey.uncompressed`, and

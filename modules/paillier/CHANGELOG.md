@@ -123,7 +123,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     now this session's F5; updated to describe `montint`, and README now
     shows `SecretKey.deinit()` in the API example (it was the only way to
     clear a key and wasn't mentioned) — paillier F3/F12, wave-3 audit.
-  - Touches `src/root.zig`, which carries a `scripts/ctgrind-expected.tsv`
+  - Touches `src/root.zig`, which carries a `scripts/checks/ctgrind-expected.tsv`
     pin (4 rows, added `c2eee166` after this audit was written) — these
     edits invalidate that pin's source digest; needs a coordinator re-pin
     before the tier-A ctgrind queue is trusted again for this module.

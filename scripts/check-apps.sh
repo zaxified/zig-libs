@@ -171,7 +171,7 @@ for n in "${WANT[@]}"; do
     [ -d "example-apps/$n" ] || { echo "check-apps: no such app '$n'" >&2; exit 2; }
     if [ "$PINNED" = 1 ]; then
         echo "check-apps: building $n through its pin (fetch by URL + hash)"
-        ( cd "example-apps/$n" && "$SCRIPT_DIR/capped" zig build ) || {
+        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build ) || {
             echo "check-apps: $n FAILED to build through its pin." >&2
             echo "            The pin resolves to this very commit, so the source is not what" >&2
             echo "            broke — the package export is. Suspect build.zig.zon's .paths" >&2
@@ -182,7 +182,7 @@ for n in "${WANT[@]}"; do
         }
     else
         echo "check-apps: building $n against the working tree"
-        ( cd "example-apps/$n" && "$SCRIPT_DIR/capped" zig build --fork=../.. ) || {
+        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. ) || {
             echo "check-apps: $n FAILED to build against this commit." >&2
             echo "            This build used --fork, i.e. THIS working tree, not the tag the app" >&2
             echo "            pins — and the app's source is written against the tree, so the pin" >&2
@@ -221,7 +221,7 @@ if [ "$RUN" = 1 ]; then
             # pass reuses the binary the build stage already produced.
             if [ "$mode" != ReleaseSafe ]; then
                 echo "check-apps: rebuilding $n as $mode"
-                ( cd "example-apps/$n" && "$SCRIPT_DIR/capped" zig build --fork=../.. "-Doptimize=$mode" ) || {
+                ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. "-Doptimize=$mode" ) || {
                     echo "check-apps: $n FAILED to build as $mode." >&2
                     exit 1
                 }
@@ -231,7 +231,7 @@ if [ "$RUN" = 1 ]; then
             # that allocates without bound is the same OOM as a runaway
             # compile — the kernel picks its victim by size, so the process
             # that dies is the editor, not this one.
-            if ! ( cd "example-apps/$n" && "$SCRIPT_DIR/capped" ./smoke.sh ); then
+            if ! ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" ./smoke.sh ); then
                 echo "check-apps: $n's smoke test FAILED in $mode — the app builds but does not work." >&2
                 exit 1
             fi
@@ -241,7 +241,7 @@ if [ "$RUN" = 1 ]; then
         # the mode the app's own build.zig chooses. Non-fatal (the gate has
         # already passed), but SAY SO if it fails rather than silently leaving
         # the tree in ReleaseFast.
-        ( cd "example-apps/$n" && "$SCRIPT_DIR/capped" zig build --fork=../.. >/dev/null ) \
+        ( cd "example-apps/$n" && "$SCRIPT_DIR/lib/capped" zig build --fork=../.. >/dev/null ) \
             || echo "check-apps: warning: could not restore example-apps/$n to its default build mode (tree left in ReleaseFast)" >&2
     done
     echo "check-apps: ${#WANT[@]} app(s) ran their smoke tests in ReleaseSafe and ReleaseFast"

@@ -9,35 +9,62 @@ Most of this file explains the test driver. This table exists so the rest of the
 directory is not mistaken for leftovers — several of these are single-purpose
 tools that look disposable once the work that needed them landed, and are not.
 
+**Top level — what a person runs.** Everything a human types by hand lives here;
+the three subdirectories below are what those commands (and CI) call.
+
 | File | What it is |
 |------|------------|
-| `test.sh`, `test-lib.sh` | The test driver and its shared shell library. Everything below the next heading is about these. |
-| `test-tag.sh` | Self-test for `tag.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
+| `test.sh` | The test driver. Everything below the next heading is about it. |
 | `tag.sh` | Cuts a dated release tag, and only if CI already passed on HEAD — it runs no lane itself (since 2026-09-18); the tag push runs the full matrix, stamp-aware. A tag asserts that every module passed every lane at that commit. |
-| `ci-stamps.sh` | Fetches a CI lane's stamps (see *Stamps* below) from the newest trusted artifact of that lane: a run of this repository on `main` or a date tag, never a fork's pull request, whose artifact could otherwise skip tests. An artifact and not a cache entry because a cache entry is ref-scoped (a tag's writes are invisible to `main`) and is evicted after seven idle days. None found = every module runs. |
 | `hooks/` | The commit-time formatting hook and its own self-test. A hook that always exits 0 looks exactly like "nothing was ever unformatted". |
-| `capped` | Memory-capped process wrapper. ⛔ Run fuzzing through it and nothing else — an uncapped sweep has taken this host down. |
 | `modtest` | One module's lane (or one `zig test FILE` probe) with **producer and reader both inside the cap**, output to a file, byte-budgeted. Use it instead of `capped … \| tail` — see "The cap does not reach across a pipe". |
 | `fuzz-sweep.sh` | Repo-wide fuzz run over the harnesses `zig build check-fuzz` requires. ⛔ **This is the ONLY thing in the repo that actually fuzzes** — see below. |
-| `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
+| `check-apps.sh` | Builds every `example-apps/` project against THIS working tree, via `zig build --fork=../..`. The apps pin a released tag because that is what someone who downloads one needs; the fork overrides that pin without touching the file. It is the only check here that reaches the published API through the real package machinery, the way a consumer does. `--pinned` builds from the manifest as written instead — fetch by URL and hash, compile the exported package — which is the downloader's own path and the only thing that exercises `.paths`; it is fail-closed and refuses unless every pinned tag resolves to `HEAD`, i.e. on a tag ref and nowhere else. `--run` then executes each app's own `smoke.sh`, which starts the program and asserts on what it does — the difference between "it compiles" and "it works", and what CI runs. It does that **twice per app, in `ReleaseSafe` and in `ReleaseFast`**, because a `std.debug.assert` guard is compiled out of the latter and a fail-open one is therefore invisible in safe modes. Also refuses a directory nobody declared, a declaration whose directory is gone, an app the collection README does not list, and an app with no executable `smoke.sh`. |
+| `cache-usage.sh` | Splits every `.zig-cache` under a root into what a rebuild brings back and what it does not (`--all` adds the usual dev caches). Never deletes anything; run it by hand before freeing disk space, because the non-rebuildable part is exactly what a blind `rm` would lose. |
+| `vm/` | Boots a qemu guest and runs a module's tests as real root. The only way the live BPF, netlink and 802.11 tests execute rather than skip. |
+
+**`lib/` — automation internals.** Sourced or executed by `test.sh`, `modtest`,
+`tag.sh` and CI; nobody runs these by hand in the ordinary course of things.
+
+| File | What it is |
+|------|------------|
+| `test-lib.sh` | The driver's shared shell library (steps, the memory cap, the netns set read from `module-graph`). |
+| `test-tag.sh` | Self-test for `tag.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
+| `ci-stamps.sh` | Fetches a CI lane's stamps (see *Stamps* below) from the newest trusted artifact of that lane: a run of this repository on `main` or a date tag, never a fork's pull request, whose artifact could otherwise skip tests. An artifact and not a cache entry because a cache entry is ref-scoped (a tag's writes are invisible to `main`) and is evicted after seven idle days. None found = every module runs. |
+| `capped` | Memory-capped process wrapper. ⛔ Run fuzzing through it and nothing else — an uncapped sweep has taken this host down. |
 | `dark-tests.sh` | Finds modules that DECLARE tests the test binary never ran — the failure that reads as a pass. |
+| `force-pubfn-reach.zig` | The second root `check-pubfn-reach` compiles over the module graph. Zig analyses a function body only when something references it, so a `pub fn` no test reaches is never type-checked at all; this file takes a reference to every one of them. |
+| `ci-environment.sh` | Installs the peers a hosted runner lacks. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. **Takes a ROLE since 2026-09-06** — `tests` (default), `interop`, or `all` — and the split is the whole point of the file now. `tests` is what a lane that RUNS tests or examples needs: the userns and ping sysctls, the yaml-test-suite corpus, opcua's open62541 container and its asyncua venv, imap's pymap venv, and the pinned `websockets` the websocket EXAMPLE judges itself against. `interop` is what only `zig build interop-<m>` reaches: a C compiler + wolfSSL headers (dtls) and `jinja2==3.1.6`/sympy/brotli/protobuf plus a grpcio venv (the five Python-driven ones). ⛔ **The `interop` half is not deletable.** Those six modules replay committed transcripts and pass on a host with no compiler and no Python — but a transcript nobody can RE-TAKE is a frozen anchor, extendable and correctable by nobody. `dnssec` lost one exactly that way and `gen-dnssec-oracle.sh` had to be written from nothing to get it back. |
+| `fuzz-coverage.py` | The coverage report behind `modtest <m> --fuzz`: which harness reached which lines. Called by `modtest`, not meant for hand use (though it can be run). |
+
+**`checks/` — the gate's checks and the data they compare against.** Each is a
+step of `test.sh` (or of `zig build check-*`); running one by hand is how you
+debug it, not how the gate is run.
+
+| File | What it is |
+|------|------------|
+| `ctgrind.sh`, `ctgrind-expected.tsv` | Constant-time verification and the per-module expectations it is judged against. Needs valgrind, so it is deliberately NOT in the gate. |
 | `check-http-sizeprobe.sh` | Probes the `http` module's size-limit behaviour from outside, as a consumer would. Runs on every gate — it was in the driver but missing from this table until an audit compared the two. |
 | `check-fp-freedom.sh` | Disassembles a ReleaseFast `falcon` and fails if a variable-latency FP instruction reached a non-test symbol. The `fpr` integer emulation is bit-identical to hardware FP, so **no value test can defend it** — the whole suite stays green with `fpr.div` replaced by `/`. Runs on every gate. |
-| `check-ct-compare.py` | Pins, per file, how many constant-time comparisons (`std.crypto.timing_safe.eql`/`lt`/`gt`) the tree makes, in `ct-compare-expected.tsv`; a drop is a **FAIL**. ⛔ It exists because `ctap2pin`'s audit (A1 H3) swapped `timing_safe.eql` for `std.mem.eql` in both PIN protocols and **nothing** caught it: the suite stayed 37/37 green (the two functions return the same answer for every input, so no value test ever can), and `scripts/ctgrind.sh ctap2pin` did not move by one context — measured 2026-09-09 — because on this compiler `std.mem.eql` over a fixed MAC compiles branch-free too. That makes the mutation SAFE BY ACCIDENT, not safe: nothing pins the vectorisation, and another LLVM or `ReleaseSafe` turns it back into an early-exit byte loop. So the only thing left to hold is the INTENT, and that is what this counts. ⚠ Resolves `const` aliases first — `iec62351` writes `ts.eql` and `opaque` re-binds the name, so a literal grep would have scored both **0** and called it clean. ⛔ Says nothing about whether a module that *should* compare in constant time does; a file with no such call has no row. Re-pin with `--update`, deliberately. Runs on every gate. |
+| `check-ct-compare.py` | Pins, per file, how many constant-time comparisons (`std.crypto.timing_safe.eql`/`lt`/`gt`) the tree makes, in `ct-compare-expected.tsv`; a drop is a **FAIL**. ⛔ It exists because `ctap2pin`'s audit (A1 H3) swapped `timing_safe.eql` for `std.mem.eql` in both PIN protocols and **nothing** caught it: the suite stayed 37/37 green (the two functions return the same answer for every input, so no value test ever can), and `scripts/checks/ctgrind.sh ctap2pin` did not move by one context — measured 2026-09-09 — because on this compiler `std.mem.eql` over a fixed MAC compiles branch-free too. That makes the mutation SAFE BY ACCIDENT, not safe: nothing pins the vectorisation, and another LLVM or `ReleaseSafe` turns it back into an early-exit byte loop. So the only thing left to hold is the INTENT, and that is what this counts. ⚠ Resolves `const` aliases first — `iec62351` writes `ts.eql` and `opaque` re-binds the name, so a literal grep would have scored both **0** and called it clean. ⛔ Says nothing about whether a module that *should* compare in constant time does; a file with no such call has no row. Re-pin with `--update`, deliberately. Runs on every gate. |
 | `check-skip-as-pass.py` | Refuses a test that announces a skip and then returns plainly — `zig test` counts a bare `return;` as a **PASS**, so the test prints "SKIPPED" and the summary reports full coverage. `testkit.skip` exists to replace exactly that shape and says so in its own doc comment; the first audit of `testkit` (2026-09-04) still found **11 instances in the tree**. Measured on one: `2/2 tests passed` before, `1 pass, 1 skip` after, and `nftables` as a whole went from 94 passing to `90 pass, 4 skip`. Catches two shapes — an announcement adjacent to a bare `return;` inside a test, and a *helper* that announces a skip and returns `null`, which is how three of them hid behind `liveSocket(…) orelse return;`. ⛔ Blind to a skip that never announces itself. Runs on every gate. |
 | `check-fuzz-reach.py` | Refuses a fuzz harness that does not READ the input it is given. `zig build check-fuzz` proves a harness EXISTS; this proves it reads. `std.testing.Smith`'s ranged draws (`valueRange*`, `valueWeighted`, `index`, `bool*`, and `value` of a type narrower than 64 bits) read eight octets as a little-endian u64 and return the range MINIMUM unless that u64 already lies inside the range — **and return the minimum outright when fewer than eight octets remain** (`Smith.zig:445`). ⚠ The mechanism this row used to state — *"`bytes` consumed the whole input"* — is **false**: `Smith.zig:568` copies `@min(out.len, in.len)`. What actually happens is worse and sharper, and `modules/testkit/src/fuzz.zig` pins it in a test: with an 18-octet seed, `buf[0] == 'G'` and the length drawn right after it is **0**. **The harness fetches its input and then throws it away.** So the collapse is a function of seed LENGTH, which is why `--fuzz` (sizing its own inputs) can reproduce a crash while a hand-written corpus cannot. Three rules: **R1** the first draw must be faithful (`bytes*`/`slice*`, `value(T)` with T at least 64 bits, `[N]u8`); **R2** a collapsing binding must not govern the EXTENT of drawn bytes — as a slice of a filled buffer (any start, not just `buf[0..n]`), as the bound of a draw into one, or as the bound of the loop that feeds one; **R2(c)** a collapsing binding must not select WHICH path runs — a table index or a `switch` discriminant — unless the same table is iterated whole anyway. ⛔ **It measures one axis of two.** Outside `--fuzz` the lane replays the target's `corpus` and then one round of `in = ""`, so a target with no corpus executes exactly one input for ever. Driving this gate to zero moves targets from "collapsed" to "fixed and still fed one all-zero buffer". Use `fuzz-seed-candidates.py` and `modules/testkit/src/fuzz.zig` to close the other axis in the same edit. It also prints a worklist it deliberately does NOT count: **knobs drawn after a faithful byte draw**. `bytes` consumes `@min(buf.len, in.len)`, so a seed no longer than the buffer leaves nothing behind it and every later draw returns its minimum — `pir`'s three hostile-share harnesses meant party 1 had never run in the whole module, and an `nl80211` harness passed a pinned 0 MHz into the very function its security tests are about. ⚠ Whether those draws are dead is a property of the CORPUS, not the code: a seed longer than the buffer leaves a tail and they are faithful, which is one of the two blessed fixes and is already in use in finished modules. So it is a worklist to answer per target by reading the corpus, never a verdict, and it stays outside the ratchet. Runs `--ratchet` against `fuzz-reach-baseline.txt`; `--list` is the worklist grouped by module, `--module <name>` narrows it, `--update-baseline` locks a module's improvement in. A module states an exemption in its own SPEC.md/README.md as `**Fuzz-reach exemption:** STRUCTURED via fuzzA, fuzzB`. ⛔ Blind to whether the harness ASSERTS anything about what it decoded. Runs on every gate. |
 | `fuzz-reach-baseline.txt` | The per-module ceiling `check-fuzz-reach.py --ratchet` enforces: a module may not exceed its number, and a module absent from the file must be at **zero**. Per module and not one total on purpose — a total lets one module regress while another improves and still reads green. `--update-baseline` rewrites it and **refuses to record a regression**: raising a ceiling is a decision, made by editing the file in a commit that says why. |
-| `fuzz-seed-candidates.py` | Harvests candidate corpus seeds from a module's own tests — `./scripts/fuzz-seed-candidates.py modules/<m>/src/<file>.zig`. The expensive half of the fuzz burn-down is not the draw fix, it is finding real frames, and every module already has them in the value tests beside the harness. Prints every byte-array literal, `hex.bytes` vector and string literal as a `seed("…")` line with the line it came from, byte arrays first, and **warns when a candidate is longer than the harness's buffer** — a seed over the buffer reads back as the EMPTY one, which is silent everywhere else. ⚠ It is a shortlist to READ and choose from, not a corpus: a corpus nobody chose is worth nothing (`bacnet/service` once scored 19 of 19 "accepted" because decoding `""` is legal there). |
 | `check-example-assert.py` | Refuses `std.debug.assert` under `modules/*/example/`. `build.zig` builds each example with the run's own `.optimize` and `run-examples` RUNS it in the lane's mode, so in `-Doptimize=ReleaseFast` every assertion is compiled out, the example prints its success lines and exits 0 having checked nothing. Measured 2026-09-05: **593 sites in 63 of the 230 examples**. Not merely lost coverage — `sealedbox`, `ripemd160` and `bip340` compared against an EXTERNAL oracle this way and PRINTED that the oracle agreed when no comparison ran; verified by breaking `sealedbox`'s PyNaCl constant, after which the old example still exited 0 and still claimed a byte-exact match, while the converted one names the failing line. Replacement is `must(<cond>, @src())` over `std.debug.panic`, which is live in every optimize mode, or `if (!cond) return error.X;`. ⛔ Blind to `unreachable`, to `std.debug.assert` inside `src/`, to a check that cannot fail, and to whether the example is run at all. Runs on every gate. |
 | `check-changelog-entry.py` | Refuses a change-set that moves a module substantially without moving its `CHANGELOG.md`. `zig build check-changelog` is a PRESENCE gate — it reads the tree, never a diff, so a module can have its parser rewritten while its changelog last moved six weeks ago and stay green. **The rule, in one sentence:** a module owes a new dated bullet when, under `modules/<name>/src/`, the change-set touches a line beginning with `pub` **or** moves more than 25 lines of code — excluding blank lines, comments, whitespace-only differences, and everything inside a `test` block (tests live in `src/` here, so counting them would make a batch of regression tests look like a rewrite). Two triggers and not one, because a line threshold gets both ends backwards: widening a return type is one line every consumer must recompile against, and re-flowing a match is 200 lines nobody can observe. Base ref against the tree is authoritative and is what CI passes; `--staged` is what `hooks/pre-commit` asks of one commit; `--commit REV`/`A..B` replays history. **The escape is a real entry** — `- **YYYY-MM-DD** — **NO CONSUMER-VISIBLE CHANGE:** …` — deliberately not special-cased in code, for the same reason `FUZZ-EXEMPT.tsv` was retired, and the gate names every module that used it on every run. Replayed over the last 120 commits: 7 of 12 ten-commit windows red, 16 flags, all real. ⛔ Blind to a multi-line `pub fn` signature and to a field added inside a `pub const T = struct`; both need a Zig-side parse. Runs on every gate. |
-| `force-pubfn-reach.zig` | The second root `check-pubfn-reach` compiles over the module graph. Zig analyses a function body only when something references it, so a `pub fn` no test reaches is never type-checked at all; this file takes a reference to every one of them. |
 | `portable-known-failures.tsv` | The `(module, target)` pairs a module DECLARES in `meta.targets` but that do not currently compile, each with the real compiler error. A declared-but-broken target is a tracked debt, not a silently dropped claim. |
-| `check-apps.sh` | Builds every `example-apps/` project against THIS working tree, via `zig build --fork=../..`. The apps pin a released tag because that is what someone who downloads one needs; the fork overrides that pin without touching the file. It is the only check here that reaches the published API through the real package machinery, the way a consumer does. `--pinned` builds from the manifest as written instead — fetch by URL and hash, compile the exported package — which is the downloader's own path and the only thing that exercises `.paths`; it is fail-closed and refuses unless every pinned tag resolves to `HEAD`, i.e. on a tag ref and nowhere else. `--run` then executes each app's own `smoke.sh`, which starts the program and asserts on what it does — the difference between "it compiles" and "it works", and what CI runs. It does that **twice per app, in `ReleaseSafe` and in `ReleaseFast`**, because a `std.debug.assert` guard is compiled out of the latter and a fail-open one is therefore invisible in safe modes. Also refuses a directory nobody declared, a declaration whose directory is gone, an app the collection README does not list, and an app with no executable `smoke.sh`. |
 | `check-ci-cache-keys.sh` | Refuses a CI config where one lane's cache restore-key prefix can match another lane's entry. `restore-keys` matches by prefix, so distinct names are not enough — they must not be prefixes of each other. An amd64 lane restored an aarch64 tree this way and recompiled everything, green throughout. Also refuses a scoped-job shard list (`-Dgroup=`) that misses a primary lib from `module-graph`: its modules would never be tested on a push. |
-| `ci-environment.sh` | Installs the peers a hosted runner lacks. Run by BOTH CI jobs, because two copies of an install list drift and one script cannot. Not for a development machine: it uses `sudo` and pins system packages. **Takes a ROLE since 2026-09-06** — `tests` (default), `interop`, or `all` — and the split is the whole point of the file now. `tests` is what a lane that RUNS tests or examples needs: the userns and ping sysctls, the yaml-test-suite corpus, opcua's open62541 container and its asyncua venv, imap's pymap venv, and the pinned `websockets` the websocket EXAMPLE judges itself against. `interop` is what only `zig build interop-<m>` reaches: a C compiler + wolfSSL headers (dtls) and `jinja2==3.1.6`/sympy/brotli/protobuf plus a grpcio venv (the five Python-driven ones). ⛔ **The `interop` half is not deletable.** Those six modules replay committed transcripts and pass on a host with no compiler and no Python — but a transcript nobody can RE-TAKE is a frozen anchor, extendable and correctable by nobody. `dnssec` lost one exactly that way and `gen-dnssec-oracle.sh` had to be written from nothing to get it back. |
-| `cache-usage.sh` | Splits every `.zig-cache` under a root into what a rebuild brings back and what it does not (`--all` adds the usual dev caches). Never deletes anything; run it by hand before freeing disk space, because the non-rebuildable part is exactly what a blind `rm` would lose. |
-| `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. **Manual, not a gate — DECIDED 2026-09-09, see "Standards citations" below for why.** 2026-09-09 after two extractor fixes: 819 citations, **396 VERIFIED / 374 MISMATCH / 43 UNFETCHABLE / 6 UNCHECKED** (was 400/499/47/10). Two samples read by hand are genuinely wrong quotes, not extraction noise. ⛔ `UNCHECKED` is new that day and the ones that remain did not appear from nowhere: they were being reported as VERIFIED while comparing NOTHING. |
 | `check-uapi-consts.py` | Diffs the kernel UAPI constants modules hardcode against the headers they came from. Driven by `zig build check-uapi`, which the gate runs; it SKIPS (never fails) on a host without python3 or kernel headers. Currently 689 matched / 0 mismatched across five modules, with 263 constants unresolved — it says so rather than counting them as passes. |
+
+**`gen/` — generators and oracles, run by hand and rarely.** They re-create
+committed vectors from upstream sources or check the tree against an outside
+implementation; none of them is a gate step, and none may be deleted for looking
+unused (see each row).
+
+| File | What it is |
+|------|------------|
+| `fuzz-seed-candidates.py` | Harvests candidate corpus seeds from a module's own tests — `./scripts/gen/fuzz-seed-candidates.py modules/<m>/src/<file>.zig`. The expensive half of the fuzz burn-down is not the draw fix, it is finding real frames, and every module already has them in the value tests beside the harness. Prints every byte-array literal, `hex.bytes` vector and string literal as a `seed("…")` line with the line it came from, byte arrays first, and **warns when a candidate is longer than the harness's buffer** — a seed over the buffer reads back as the EMPTY one, which is silent everywhere else. ⚠ It is a shortlist to READ and choose from, not a corpus: a corpus nobody chose is worth nothing (`bacnet/service` once scored 19 of 19 "accepted" because decoding `""` is legal there). |
+| `check-citations.py` | Verifies the RFC/standard citations in module docs point at something real. **Manual, not a gate — DECIDED 2026-09-09, see "Standards citations" below for why.** 2026-09-09 after two extractor fixes: 819 citations, **396 VERIFIED / 374 MISMATCH / 43 UNFETCHABLE / 6 UNCHECKED** (was 400/499/47/10). Two samples read by hand are genuinely wrong quotes, not extraction noise. ⛔ `UNCHECKED` is new that day and the ones that remain did not appear from nowhere: they were being reported as VERIFIED while comparing NOTHING. |
 | `gen-qr-decode-vectors.py` | External DECODE oracle for `qr`: **segno** (BSD-3, independently authored) produces the module grid and this module's decoder must read segno's own bytes back out. **Keep it.** `modules/qr/SPEC.md` named this gap in its own words — the committed golden set anchors the ENCODER, and only 10 of 40 versions, so the decoder (the untrusted-input half) had no external anchor at all until 2026-09-04. Emits all 960 vectors; 160 stratified ones are committed. Needs `segno`, so it is not a gate step. |
 | `gen-dnssec-oracle.sh` | Re-takes `modules/dnssec`'s independent-oracle anchor: builds a zone, signs it once per implemented algorithm with **ldns** (not this repo), and has `ldns-verify-zone` check each result. **Keep it.** The committed `oracle_vectors.zig` credited two different scratchpad paths, neither of which is in the repo — the module's strongest anchor had no re-takeable recipe at all. It deliberately does NOT reproduce the committed vectors byte for byte (those keys are gone and DNSSEC signatures are not deterministic); it re-establishes the property they attest. Needs `ldns`, so it is not a gate step. |
 | `dissect.py` | Drives Wireshark's headless dissector (`sharkd`) as an external oracle for wire-format modules. |
@@ -45,7 +72,6 @@ tools that look disposable once the work that needed them landed, and are not.
 | `gen-bitcoin-core-vectors.py`, `gen-bitcointx-single-bug.py`, `gen-p256-wycheproof.py`, `gen-ocsp-byname.sh` | Regenerate committed test vectors from their upstream sources (Bitcoin Core, BIP-341, Wycheproof, OCSP). **Keep them.** The vectors are frozen in the tree and the tests do not need these to run — which is exactly why they look deletable. Without them the vectors cannot be re-derived or extended, only trusted. |
 | `tz-gen/` | Regenerates `modules/tz/src/tz_data.zig` — the 598-zone UTC-offset table — from a compiled zoneinfo tree. Same reasoning as the row above: the table is frozen in the tree and `tz`'s tests pass without this, which is exactly why it looks deletable. It is the only place `std.Tz` is used, and without it the pinned tzdata release can never be bumped, only trusted. Writes the tzdata version into the generated header, so the committed file records its own pin. A Zig package rather than a script, hence the directory. **Run `tz-gen/fetch-and-build.sh`, not the tool directly** — see the row below. |
 | `tz-gen/fetch-and-build.sh` | Fetches the PINNED tzdata release from IANA (SHA-256 in `tz-gen/checksums.txt`), compiles it with the system `zic -b fat`, and runs `tz-gen` against that tree. Without it the obvious input is `/usr/share/zoneinfo`, which is the distro's zic output at the DISTRO's release — this host is 2026c against a 2026a pin, so re-deriving there silently produces a different table. `--check` regenerates to a temp file and diffs, non-zero on any difference. Needs network and `zic`, so it is not a gate step; a missing `zic` is a hard failure, never a fall-back to the host tree. |
-| `vm/` | Boots a qemu guest and runs a module's tests as real root. The only way the live BPF, netlink and 802.11 tests execute rather than skip. |
 
 ## Which do I run?
 
@@ -55,7 +81,7 @@ tools that look disposable once the work that needed them landed, and are not.
 | Everything, ignoring stamps | `scripts/test.sh all` | Every check and every module; stamps the `changed` lane for all of them |
 | Reproducing a CI lane | `scripts/test.sh modules -Doptimize=ReleaseFast -Dgroup=net` | The lane's own command and shard (see ci.yml); trailing args pass through to `zig build`. `ZIGLIBS_IGNORE_STAMPS=1` to run it regardless |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
-| Before cutting a tag | `scripts/test.sh interop` | Re-takes the six interop anchors against REAL peers — see below. Needs `scripts/ci-environment.sh interop`; ~35 s warm |
+| Before cutting a tag | `scripts/test.sh interop` | Re-takes the six interop anchors against REAL peers — see below. Needs `scripts/lib/ci-environment.sh interop`; ~35 s warm |
 
 ### ⚠ `test.sh` is NOT the whole of CI
 
@@ -263,14 +289,14 @@ that caused the crash.
 
 `ZIGLIBS_MEM_MAX` (default `12G`) still exists and still wraps each command —
 but only when the run is NOT already inside the whole-run scope, since a
-transient scope cannot spawn another. It is what `scripts/capped` and
+transient scope cannot spawn another. It is what `scripts/lib/capped` and
 `scripts/tag.sh`'s per-lane wrapping use. Two names for two meanings, kept
 separate so raising one cannot silently mean the other.
 
 For anything that bypasses the driver — a bare `zig build test-<module>` while
-iterating — use the same cap through `scripts/capped`:
+iterating — use the same cap through `scripts/lib/capped`:
 
-    scripts/capped zig build test-yaml --summary all
+    scripts/lib/capped zig build test-yaml --summary all
 
 ### ⛔ The cap does not reach across a pipe — use `scripts/modtest`
 
@@ -333,7 +359,7 @@ fuzz test crashes** (see `fuzz-sweep.sh`):
 Run counts come from the coverage map the fuzzed process writes, not from the
 FUZZING REPORT — that report prints one block per test *executable* and names
 only its first fuzz test, so a module with three harnesses looks like one ran.
-`scripts/fuzz-coverage.py` resolves the map's seen PCs with `addr2line -f -i`
+`scripts/lib/fuzz-coverage.py` resolves the map's seen PCs with `addr2line -f -i`
 against the executable whose `__sancov_pcs1` section matches the map byte for
 byte, and prints per-file coverage for `modules/<m>/src/`.
 
@@ -452,7 +478,7 @@ is computed from what ran. `websocket` once shipped running **zero** of its 52
 tests, one of which did not even compile; `ratelimit` reported `18/18 passed`,
 exit 0, with `conn.zig`'s whole suite absent.
 
-`scripts/dark-tests.sh` compares, per module, the number of `^test ` blocks in
+`scripts/lib/dark-tests.sh` compares, per module, the number of `^test ` blocks in
 `modules/<m>/src/**/*.zig` against the `(N total)` field of that module's
 run-test line in `--summary all`, and requires them to be **equal**.
 
@@ -491,11 +517,11 @@ multi-module `zig build … --summary all` takes the same 13.3 s twice in a row,
 `compile test … cached` on both — so re-running the suites to count their tests
 would roughly double `scripts/test.sh all`. Instead the driver passes
 `--summary all` to the run it was already making, keeps that output, and hands
-it to `scripts/dark-tests.sh --summary <file>`, which builds nothing.
+it to `scripts/lib/dark-tests.sh --summary <file>`, which builds nothing.
 
     zig build check-dark-tests                     # standalone: builds+runs everything
     zig build check-dark-tests -Ddark-module=http  # …or just one module
-    scripts/dark-tests.sh ratelimit                # same thing without the build step
+    scripts/lib/dark-tests.sh ratelimit                # same thing without the build step
 
 The standalone forms pay for a full suite run, because they have no summary to
 read. Use them outside the driver; inside it the check is already running.
@@ -505,25 +531,25 @@ read. Use them outside the driver; inside it the check is already running.
 
 ## Constant-time harnesses (ctgrind)
 
-`scripts/ctgrind.sh [module ...]` runs every committed
+`scripts/checks/ctgrind.sh [module ...]` runs every committed
 `modules/<m>/src/ctgrind_harness.zig` under `valgrind --tool=memcheck` and
 prints a control table. A harness marks a secret `MAKE_MEM_UNDEFINED`, drives
 it through the code whose constant-time property that module's `SPEC.md`
 claims, and formats the result through a deliberately non-constant-time
 printer as a propagation witness.
 
-    scripts/ctgrind.sh                    # every module with a harness
-    scripts/ctgrind.sh ed448              # just this one
-    scripts/ctgrind.sh --stacks ecvrf     # …and dump each row's memcheck log
-    scripts/ctgrind.sh --pattern 'root[.]zig' ecvrf   # re-attribute the in-file column
-    scripts/ctgrind.sh --check            # compare against scripts/ctgrind-expected.tsv
+    scripts/checks/ctgrind.sh                    # every module with a harness
+    scripts/checks/ctgrind.sh ed448              # just this one
+    scripts/checks/ctgrind.sh --stacks ecvrf     # …and dump each row's memcheck log
+    scripts/checks/ctgrind.sh --pattern 'root[.]zig' ecvrf   # re-attribute the in-file column
+    scripts/checks/ctgrind.sh --check            # compare against scripts/checks/ctgrind-expected.tsv
 
 Needs `valgrind` on PATH. Not part of `zig build test`: a memcheck context
 count is valgrind's own verdict, not something a Zig test can assert on.
 
 **⭐ Who runs it: `scripts/test.sh ctgrind`, and the CI lane of the same name.**
 Tag/dispatch only, like `interop`, and it needs
-`scripts/ci-environment.sh ctgrind` to install valgrind. It FAILS rather than
+`scripts/lib/ci-environment.sh ctgrind` to install valgrind. It FAILS rather than
 skips without it — a lane whose only purpose is the measurement must not report
 green for not having taken it. Measured 310 s warm for all 8 modules and all 20
 rows.
@@ -615,7 +641,7 @@ same reason a plumbing frame is only accepted with a real line number — a
 module function inlined into the print and reported at `Writer.zig:0` is not
 std, and must not pass as std.
 
-`scripts/ctgrind.sh --self-test` runs that classifier against 17 recorded
+`scripts/checks/ctgrind.sh --self-test` runs that classifier against 17 recorded
 paragraphs (real memcheck output, no valgrind, no build, milliseconds), and
 every measurement runs it first. The rule that decides what every number here
 means is itself text processing, so it is cheap to test and expensive to leave
@@ -667,10 +693,10 @@ nothing: the client-request bodies sit behind a comptime
 leave the taint calls unanalysed and would not notice a harness that had
 stopped compiling against them.
 
-`scripts/ctgrind.sh --check` catches the other direction — the code growing a
+`scripts/checks/ctgrind.sh --check` catches the other direction — the code growing a
 secret-dependent branch. It asserts what the claims actually rest on, not the
 raw totals: every untainted control is 0, every no-`-fvalgrind` trap is 0, each
-claim row's in-file count matches `scripts/ctgrind-expected.tsv`, and each
+claim row's in-file count matches `scripts/checks/ctgrind-expected.tsv`, and each
 claim row's total is non-zero so a propagation witness demonstrably fired.
 Totals are deliberately *not* diffed — they include the harness's own hex
 formatter and std internals, so pinning them would go red on a compiler upgrade
@@ -686,7 +712,7 @@ someone edits one and not the other; and `--check` needs valgrind and a human
 
 ## Standards citations
 
-`scripts/check-citations.py [module ...]` fetches the RFC/BIP/BOLT/W3C text
+`scripts/gen/check-citations.py [module ...]` fetches the RFC/BIP/BOLT/W3C text
 behind a quoted standards citation in `modules/**` and reports each one
 VERIFIED, MISMATCH, UNFETCHABLE or UNCHECKED — a fabricated citation is worse
 than a missing one, since nothing prompts a reader to doubt it. Needs network on
@@ -882,5 +908,5 @@ fewer than 8 remain and when the value read is out of range. So a short or
 careless corpus entry silently selects the first branch of every switch — which
 looks like coverage and is not.
 
-Reserve `fuzz-sweep.sh` (through `scripts/capped` — an uncapped sweep has taken
+Reserve `fuzz-sweep.sh` (through `scripts/lib/capped` — an uncapped sweep has taken
 this host down) for actual search.

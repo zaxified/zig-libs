@@ -1,4 +1,4 @@
-# Expected values for `scripts/ctgrind.sh --check`. One row per CLAIM row of
+# Expected values for `scripts/checks/ctgrind.sh --check`. One row per CLAIM row of
 # the table — i.e. per (module, optimize mode, harness target) measured with
 # the secret TAINTED and the binary built WITH `-fvalgrind`.
 #
@@ -190,7 +190,7 @@ chachapoly	ReleaseSafe	poly1305	1	>=1	f3f338165286691b	ff3ba8f00b851bdf
 # `poly1305.zig`, the same checked operators for the same reason), nothing here
 # is consumed in Debug, and CONVENTIONS §7.1 narrowed the Debug CI lane to
 # compile-only in 2026-08-15 on the same kind of measurement. See
-# `scripts/ctgrind.sh` § MODES.
+# `scripts/checks/ctgrind.sh` § MODES.
 chachapoly	ReleaseFast	aead	1	4	b08b7e78d8c87360	870a36cbebbc4588
 chachapoly	ReleaseSafe	aead	1	>=1	b08b7e78d8c87360	870a36cbebbc4588
 # oscore — added 2026-09-08. SPEC.md § "Threat model / limits" claims the key

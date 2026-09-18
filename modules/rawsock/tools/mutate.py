@@ -37,7 +37,7 @@ gate stayed green while the thing under test stopped being tested.
 ⛔ This script runs raw `zig test` directly (twice per mutation, once under
 `unshare -rn`) with its own per-mutation `--cache-dir` -- it is deliberately
 OUTSIDE `scripts/modtest`'s single-cache, capped-resource envelope, the same
-way `scripts/ctgrind.sh` and the interop `tools/` scripts in this repo are.
+way `scripts/checks/ctgrind.sh` and the interop `tools/` scripts in this repo are.
 Do not fold it into `modtest`; do not run it from an agent session bound to
 modtest-only gates. It is meant for a human, or an agent slot explicitly
 cleared to run full/foreign-toolchain gates, at the campaign's own pace.

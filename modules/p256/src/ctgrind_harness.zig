@@ -4,7 +4,7 @@
 //! ("Sign commits `k·G` constant-time; `verify` is vartime on public inputs")
 //! and for `meta.doc`'s "constant-time comb sign, vartime wNAF verify", as an
 //! actual committed program instead of a sentence nobody re-checks. Run it
-//! through `../../../scripts/ctgrind.sh p256`.
+//! through `../../../scripts/checks/ctgrind.sh p256`.
 //!
 //! NOT wired into `zig build test-p256` — memcheck's context count is
 //! valgrind's own output, not something a Zig test can assert on. `zig build
@@ -73,7 +73,7 @@
 //!    `field.zig`'s wide-integer (`u256`/`u512`) reduction that branch on
 //!    tainted values and bury the signal, and Debug's self-hosted backend
 //!    cannot be read by valgrind's DWARF parser at all
-//!    (`scripts/ctgrind.sh` § MODES).
+//!    (`scripts/checks/ctgrind.sh` § MODES).
 //!
 //! ## The propagation witness
 //!

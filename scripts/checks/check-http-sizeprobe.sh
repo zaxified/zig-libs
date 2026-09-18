@@ -34,7 +34,7 @@
 # even when the exit code is 0.
 set -uo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../modules/http/sizeprobe" && pwd)"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../modules/http/sizeprobe" && pwd)"
 cd "$HERE"
 
 CRYPTO_GREP='tls\.Client|Certificate|X25519|P256|P384|Sha1|Sha256|Sha3|Sha512|\bRsa\b|MlKem|ml_kem|Aegis|Aes(128|256)?Gcm|ChaCha20Poly1305'

@@ -13,7 +13,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOK="$SCRIPT_DIR/pre-commit"
 [[ -x "$HOOK" ]] || { echo "test-pre-commit: $HOOK is not executable" >&2; exit 1; }
-CLE="$SCRIPT_DIR/../check-changelog-entry.py"
+CLE="$SCRIPT_DIR/../checks/check-changelog-entry.py"
 [[ -x "$CLE" ]] || { echo "test-pre-commit: $CLE is not executable" >&2; exit 1; }
 
 WORK="$(mktemp -d)"
@@ -25,8 +25,8 @@ git config user.name t
 # The hook resolves its sibling checks from `git rev-parse --show-toplevel`, so
 # the throwaway repo gets a real copy of the changelog gate. Cases 1-8 below
 # therefore run the WHOLE hook, not the fmt half of it.
-mkdir -p scripts
-cp "$CLE" scripts/check-changelog-entry.py
+mkdir -p scripts/checks
+cp "$CLE" scripts/checks/check-changelog-entry.py
 
 fails=0
 check() { # check <label> <expected-exit> <actual-exit>
@@ -187,9 +187,9 @@ git add modules
 git reset -q --hard >/dev/null
 body 60 4; git add modules
 "$HOOK" >/dev/null 2>&1; before=$?
-mv scripts/check-changelog-entry.py scripts/check-changelog-entry.py.off
+mv scripts/checks/check-changelog-entry.py scripts/check-changelog-entry.py.off
 "$HOOK" >/dev/null 2>&1; after=$?
-mv scripts/check-changelog-entry.py.off scripts/check-changelog-entry.py
+mv scripts/check-changelog-entry.py.off scripts/checks/check-changelog-entry.py
 if [[ "$before" == 1 && "$after" == 0 ]]; then
     printf '  ok   %-52s\n' "removing the script flips refuse -> allow"
 else

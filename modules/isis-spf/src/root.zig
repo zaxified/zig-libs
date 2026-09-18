@@ -88,7 +88,7 @@ pub const Route = struct {
 /// NOT be advertised", which the RFC does not say — it never uses the token
 /// `MaxLinkMetric` at all — and which **inverts** the rule: the whole point is
 /// that the link STAYS advertised, as the sentence right above already said.
-/// `scripts/check-citations.py` had been reporting the MISMATCH. Corrected
+/// `scripts/gen/check-citations.py` had been reporting the MISMATCH. Corrected
 /// 2026-09-03.
 ///
 /// RFC 5305 §3 also defines `MAX_PATH_METRIC` (0xFE000000), a ceiling on the

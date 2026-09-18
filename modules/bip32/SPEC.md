@@ -121,7 +121,7 @@ secp256k1; see [README.md](README.md) for purpose and API.
   notes.
 
   **Measured by the ctgrind gate since 2026-09-16** (audit finding M6):
-  `src/ctgrind_harness.zig`, `scripts/ctgrind.sh bip32`. zig 0.16.0, x86_64,
+  `src/ctgrind_harness.zig`, `scripts/checks/ctgrind.sh bip32`. zig 0.16.0, x86_64,
   ReleaseFast; every untainted control and no-`-fvalgrind` trap is 0,
   unattributed 0.
 

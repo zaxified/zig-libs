@@ -48,7 +48,7 @@ than by these tests alone).
   `J60`≡March 1 always, and the zero-based `n` only reaches Feb 29 at index 59; `n=60` is March 1 in a
   leap year too, so `59` is the number that actually demonstrates the divergence.)
 - **tzdata refresh cadence tooling:** the `tz-gen` generator lives in this repo at
-  `scripts/tz-gen/`, so the pinned release can be re-derived rather than only trusted. It stays out of
+  `scripts/gen/tz-gen/`, so the pinned release can be re-derived rather than only trusted. It stays out of
   `modules/` on purpose — it reads a compiled zoneinfo tree and is the sole user of `std.Tz`,
   both of which the module's no-filesystem/no-syscalls threat model above rules out — and `scripts/` is
   outside `build.zig.zon`'s `.paths`, so a consumer still fetches nothing but the generated table. This
@@ -56,8 +56,8 @@ than by these tests alone).
   states the pinned release (tzdata 2026a) and the regeneration command. A "point the loader at a fresh
   tzdata dir" helper does not apply (the table is compile-time-embedded, by design). Refreshing the
   pinned release remains a `tz-gen`-tool concern, not a `tz` (this module)-API concern.
-- **"Re-derived" means from the PINNED release, not from this machine.** `scripts/tz-gen/fetch-and-build.sh`
-  fetches `tzdata<release>.tar.gz` from IANA (SHA-256 pinned in `scripts/tz-gen/checksums.txt`),
+- **"Re-derived" means from the PINNED release, not from this machine.** `scripts/gen/tz-gen/fetch-and-build.sh`
+  fetches `tzdata<release>.tar.gz` from IANA (SHA-256 pinned in `scripts/gen/tz-gen/checksums.txt`),
   compiles it with the system `zic -b fat`, and hands that tree to the generator; `--check` regenerates
   to a temp file and diffs, exiting non-zero on any difference. Handing the generator
   `/usr/share/zoneinfo` instead re-derives the table from whatever release THIS distro shipped, which

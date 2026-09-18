@@ -4,7 +4,7 @@
 //! run through valgrind/memcheck rather than a `zig build test-coconut`
 //! assertion (memcheck's context count is valgrind's own verdict, not
 //! something a Zig test can observe). Build/run per
-//! `../../../scripts/ctgrind.sh`'s header (once the coordinator adds the
+//! `../../../scripts/checks/ctgrind.sh`'s header (once the coordinator adds the
 //! `TARGETS`/`MODES`/`PATTERN`/`LABEL` entries suggested at the bottom of
 //! this file — that script REFUSES an unlisted module rather than
 //! silently skipping it):
@@ -152,7 +152,7 @@
 //! report (`ct25519` measured 89 956 errors from 1000 contexts at
 //! ReleaseSafe — valgrind's own `--error-limit` cutoff). Not measured at
 //! Debug at all: Zig 0.16's self-hosted x86_64 backend is Debug's default
-//! and cannot be read by valgrind's DWARF parser (`scripts/ctgrind.sh`'s
+//! and cannot be read by valgrind's DWARF parser (`scripts/checks/ctgrind.sh`'s
 //! own header measured 42.4% of frames unresolved, 51/60 of the resolved
 //! ones on the WRONG line) — a property of the backend, not of this
 //! module's code.
@@ -374,7 +374,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 }
 
-// ── suggested scripts/ctgrind.sh config (coordinator: paste in, do not
+// ── suggested scripts/checks/ctgrind.sh config (coordinator: paste in, do not
 // generate mechanically — every existing entry carries hand-written
 // reasoning in its own comment; these follow the same shape) ─────────────
 //

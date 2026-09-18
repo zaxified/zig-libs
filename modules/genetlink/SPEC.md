@@ -117,7 +117,7 @@ is the same later, purely-mechanical wave already on the backlog for `findMcastG
 below) — this only makes that adoption possible without a protocol change.
 
 ## UAPI constant coverage (audit finding F9, closed 2026-09-10)
-`scripts/check-uapi-consts.py` diffed `ethtool`/`nl80211`/`devlink`/`conntrack`/`netlink` against
+`scripts/checks/check-uapi-consts.py` diffed `ethtool`/`nl80211`/`devlink`/`conntrack`/`netlink` against
 this host's kernel headers but not `genetlink` itself — the only automatic check of `GENL_ID_CTRL`,
 `CTRL_CMD_GETFAMILY`, `CTRL_ATTR_FAMILY_ID`/`NAME`, `CTRL_ATTR_MCAST_GROUPS` and
 `CTRL_ATTR_MCAST_GRP_*` ran through `nl80211`'s own private copy of them, which the backlog below

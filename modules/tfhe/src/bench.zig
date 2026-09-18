@@ -4,7 +4,7 @@
 //! that the exact NTT ring multiply is worth its code. Off by default
 //! (`error.SkipZigTest`); run it with `TFHE_BENCH`:
 //!
-//!   TFHE_BENCH=1 scripts/capped zig build test-tfhe -Doptimize=ReleaseFast
+//!   TFHE_BENCH=1 scripts/lib/capped zig build test-tfhe -Doptimize=ReleaseFast
 //!
 //! **What it answers.** The audit finding (`tfhe` F1) said the `O(N²)`
 //! schoolbook `mul` dominates the bootstrap end to end. Two numbers settle
@@ -21,7 +21,7 @@
 //! Sizing: the largest working set is one bootstrap key (~1 MB) plus a handful
 //! of `[1024]u64` scratch arrays. Nothing here allocates a large buffer — an
 //! oversized benchmark in this repo once OOM-killed the host's editor. Run
-//! under `scripts/capped`.
+//! under `scripts/lib/capped`.
 
 const std = @import("std");
 const polymod = @import("poly.zig");

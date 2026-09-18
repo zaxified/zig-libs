@@ -8,7 +8,7 @@ accept and the truncations it is supposed to refuse, and those are exactly the
 seeds a corpus wants. This prints them, deduplicated and with the line they came
 from, in the `seed("...")` form `testkit.fuzz.seedHex` takes.
 
-    ./scripts/fuzz-seed-candidates.py modules/iec61850/src/cotp.zig
+    ./scripts/gen/fuzz-seed-candidates.py modules/iec61850/src/cotp.zig
 
 It is a HARVESTER, not a generator. Its output is a shortlist to read, choose
 from and comment; a corpus pasted from it unread is a corpus nobody chose, and

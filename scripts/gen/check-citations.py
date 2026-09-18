@@ -66,11 +66,11 @@ open each `file:line`. The audit that produced it found 6 genuinely wrong
 citations out of 198 hand-checked, 3 of them invented outright.
 
 Usage:
-    scripts/check-citations.py                  # whole repo
-    scripts/check-citations.py webauthn hpke     # only modules/webauthn, modules/hpke
-    scripts/check-citations.py --json out.json   # also dump full claim list
-    scripts/check-citations.py --verbose         # print every non-VERIFIED claim (default)
-    scripts/check-citations.py --quiet           # summary counts only
+    scripts/gen/check-citations.py                  # whole repo
+    scripts/gen/check-citations.py webauthn hpke     # only modules/webauthn, modules/hpke
+    scripts/gen/check-citations.py --json out.json   # also dump full claim list
+    scripts/gen/check-citations.py --verbose         # print every non-VERIFIED claim (default)
+    scripts/gen/check-citations.py --quiet           # summary counts only
 
 Environment:
     ZIG_LIBS_CITATIONS_CACHE   cache directory (default: see CACHE_DIR below)
@@ -88,7 +88,7 @@ import re
 import sys
 import urllib.request
 
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DEFAULT_CACHE = os.path.join(
     os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),

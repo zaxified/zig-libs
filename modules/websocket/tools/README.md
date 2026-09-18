@@ -29,7 +29,7 @@ reproducer that only printed python-websockets' own verdicts (`CONVENTIONS.md` Â
 this version also builds and runs the Zig side and diffs the two.
 
 ```bash
-scripts/capped zig build-exe --cache-dir <scratch>/zc \
+scripts/lib/capped zig build-exe --cache-dir <scratch>/zc \
   -femit-bin=<scratch>/verify_response_probe \
   --dep websocket --dep http \
   -Mmain=modules/websocket/tools/verify_response_probe.zig \

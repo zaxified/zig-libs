@@ -102,7 +102,7 @@ pub const scratch_len = 4096;
 ///
 /// ⚠ The split is what makes the FAILING direction testable at all. Every
 /// refusal here used to live inside `expectHex` next to a `std.debug.print`,
-/// and `scripts/test-lib.sh` fails any step that writes to stderr while
+/// and `scripts/lib/test-lib.sh` fails any step that writes to stderr while
 /// passing — so a self-test that let `expectHex` refuse would have failed the
 /// gate, and consequently **no test asserted the refusals**. Measured at the
 /// 2026-09-04 audit pass: both guards deleted cleanly with the suite green,
@@ -166,7 +166,7 @@ test "verdict fails on every kind of inequality, and says nothing while doing it
     // TEETH for the wiring between `diff` and the returned error, and the
     // reason it can exist at all: `verdict` is silent, so the failing
     // direction can be asserted without writing to stderr — which
-    // `scripts/test-lib.sh` treats as a failure even for a passing step.
+    // `scripts/lib/test-lib.sh` treats as a failure even for a passing step.
     // Before this split, deleting the error return left the suite green.
     try testing.expectError(error.TestExpectedEqual, verdict(&.{ 1, 2, 3 }, &.{ 1, 2, 4 }));
     try testing.expectError(error.TestExpectedEqual, verdict(&.{ 1, 2, 3 }, &.{ 1, 2 }));

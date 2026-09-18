@@ -4,14 +4,14 @@
 # single number.
 #
 # Usage:
-#     scripts/ctgrind.sh                    # every module with a harness
-#     scripts/ctgrind.sh ct25519 ed448      # just these
-#     scripts/ctgrind.sh --stacks ecvrf     # …and dump each row's memcheck log
-#     scripts/ctgrind.sh --pattern 'root[.]zig' ecvrf
+#     scripts/checks/ctgrind.sh                    # every module with a harness
+#     scripts/checks/ctgrind.sh ct25519 ed448      # just these
+#     scripts/checks/ctgrind.sh --stacks ecvrf     # …and dump each row's memcheck log
+#     scripts/checks/ctgrind.sh --pattern 'root[.]zig' ecvrf
 #                                           # …re-attribute the in-file column
-#     scripts/ctgrind.sh --check            # compare against the expected table
-#     scripts/ctgrind.sh --self-test        # test the context classifier alone
-#     scripts/ctgrind.sh -j 4 --check       # …at 4 parallel runs instead of nproc
+#     scripts/checks/ctgrind.sh --check            # compare against the expected table
+#     scripts/checks/ctgrind.sh --self-test        # test the context classifier alone
+#     scripts/checks/ctgrind.sh -j 4 --check       # …at 4 parallel runs instead of nproc
 #
 # Runs go through a pool one memcheck process wide per job (valgrind serialises
 # threads inside a process, so a single run can never use a second core). The
@@ -19,7 +19,7 @@
 # recorded rather than rediscovered. Counts do not depend on the job count; the
 # times do, which is why the summary names it.
 #
-# Needs `valgrind` on PATH; builds go through `scripts/capped`. Not part of
+# Needs `valgrind` on PATH; builds go through `scripts/lib/capped`. Not part of
 # `zig build test` — memcheck's context count is valgrind's own verdict, not
 # something a Zig test can observe. What the gate DOES run is `zig build
 # check-ctgrind`, which only compiles the harnesses so they cannot rot into
@@ -83,7 +83,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 EXPECTED_FILE="$SCRIPT_DIR/ctgrind-expected.tsv"
@@ -173,7 +173,7 @@ declare -A TARGETS=(
     # the target taints the public `alpha` to list its input-dependent
     # branches. It does NOT catch E15's `timing_safe.eql` -> `mem.eql`
     # mutation (measured, same count); see the harness doc comment. The gate
-    # that does is `scripts/check-ct-compare.py`, which pins the count of
+    # that does is `scripts/checks/check-ct-compare.py`, which pins the count of
     # constant-time comparisons per file — measured on that mutation, it is
     # the ONLY one of suite/ctgrind counts/pin that goes red for a reason
     # about the comparison.
@@ -1156,7 +1156,7 @@ mapfile -t BUILD_MODES < <(needed_modes)
 for mode in "${BUILD_MODES[@]}"; do
     for vg in true false; do
         echo "Building ctgrind harnesses ($mode, -fvalgrind=$vg)..." >&2
-        scripts/capped zig build ctgrind \
+        scripts/lib/capped zig build ctgrind \
             "-Doptimize=$mode" "-Dctgrind-valgrind=$vg" \
             "${MODFLAGS[@]}" -p "$WORKDIR/$mode-$vg" >&2
     done
@@ -1650,8 +1650,8 @@ while IFS=$'\t' read -r am amode avg ataint atarget atotal _ _ aun aacc _ alog a
 done <"$ACTUAL"
 
 if [[ $fail -eq 0 ]]; then
-    echo "ctgrind --check: OK (controls 0, traps 0, unattributed 0, every context accounted for, in-file counts as recorded in scripts/ctgrind-expected.tsv)"
+    echo "ctgrind --check: OK (controls 0, traps 0, unattributed 0, every context accounted for, in-file counts as recorded in scripts/checks/ctgrind-expected.tsv)"
 else
-    echo "ctgrind --check: FAILED — see above. Re-measure, then update scripts/ctgrind-expected.tsv AND the module's SPEC.md table together." >&2
+    echo "ctgrind --check: FAILED — see above. Re-measure, then update scripts/checks/ctgrind-expected.tsv AND the module's SPEC.md table together." >&2
 fi
 exit $fail

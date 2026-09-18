@@ -757,10 +757,10 @@ signature and across sessions accumulates into a usable nonce leak. *Why
 the code cannot settle it:* this is a quantitative side-channel question
 (does limb-granularity timing carry usable information about a bijective
 function of a partially-masked secret?). **Update 2026-09-10 (audit F5,
-doc fix):** a dudect-class harness (`scripts/ctgrind.sh`, memcheck-based)
+doc fix):** a dudect-class harness (`scripts/checks/ctgrind.sh`, memcheck-based)
 now exists in this toolchain and this module HAS two registered targets
 (`share`, `nonce` in `src/ctgrind_harness.zig` /
-`scripts/ctgrind-expected.tsv`) — but those target the EC-scalar-mul call
+`scripts/checks/ctgrind-expected.tsv`) — but those target the EC-scalar-mul call
 sites in `signing.zig` (`provePoK`'s nonce, `signWithShares`'s `gamma_i`),
 not this `paillier.decrypt` L-function division. The quantitative question
 above is therefore still open — the earlier audit pass (F5) ran an ad-hoc
@@ -778,12 +778,12 @@ registry, or a *corrected* written rationale replacing the `β' mod N` one.
 is now answered; the exploitability half is not).** `paillier` already HAD
 the `paillier`-scoped ctgrind target this note asked for — it was added
 independently of this module (`src/ctgrind_harness.zig` targets `crt`/
-`noncrt`, pinned as `scripts/ctgrind-expected.tsv` rows `paillier/crt`,
+`noncrt`, pinned as `scripts/checks/ctgrind-expected.tsv` rows `paillier/crt`,
 `paillier/noncrt`) — this section simply had not been re-checked against
 it. Ran it ad hoc (`zig build-exe -fvalgrind` over
 `modules/paillier/src/ctgrind_harness.zig` + manual `valgrind
 --tool=memcheck`, the same technique this session used for `bn254`'s
-`Fr.toBytes` fix, NOT `scripts/ctgrind.sh`), tainting `lambda`/`mu`/the CRT
+`Fr.toBytes` fix, NOT `scripts/checks/ctgrind.sh`), tainting `lambda`/`mu`/the CRT
 block (`crt` target) and `lambda`/`mu` alone (`noncrt` target) — i.e. the
 secret key, which the L-function's input `x = c^λ mod n²` is a function
 of. **Result: `crt` 333 contexts / 92089 errors tainted vs 0/0 untainted;

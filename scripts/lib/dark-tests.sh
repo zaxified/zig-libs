@@ -82,8 +82,8 @@
 # hit, and it is deliberately NOT what the gate invokes.
 #
 #   usage:
-#     scripts/dark-tests.sh [module...]              build + check (default: all)
-#     scripts/dark-tests.sh --summary FILE [mod...]  check an existing
+#     scripts/lib/dark-tests.sh [module...]              build + check (default: all)
+#     scripts/lib/dark-tests.sh --summary FILE [mod...]  check an existing
 #                                                    `--summary all` build log
 #
 # With `--summary`, any module names given are the set the log is REQUIRED to
@@ -94,7 +94,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/test-lib.sh"
 cd "$REPO_ROOT"
 

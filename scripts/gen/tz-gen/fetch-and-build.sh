@@ -25,7 +25,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo="$(cd "$here/../.." && pwd)"
+repo="$(cd "$here/../../.." && pwd)"
 committed="$repo/modules/tz/src/tz_data.zig"
 
 check_only=0
@@ -54,7 +54,7 @@ url="https://data.iana.org/time-zones/releases/$tarball"
 # and verifying it needs no keyring.
 expected="$(sed -n "s/^\\([0-9a-f]\\{64\\}\\)  $tarball\$/\\1/p" "$here/checksums.txt" || true)"
 if [ -z "$expected" ]; then
-    echo "tz-gen: no pinned SHA-256 for $tarball in scripts/tz-gen/checksums.txt." >&2
+    echo "tz-gen: no pinned SHA-256 for $tarball in scripts/gen/tz-gen/checksums.txt." >&2
     echo "        Add one line '<sha256>  $tarball' after checking the release's" >&2
     echo "        PGP signature from https://data.iana.org/time-zones/releases/." >&2
     exit 1

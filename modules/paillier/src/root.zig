@@ -1499,7 +1499,7 @@ pub fn decrypt(sk_in: SecretKey, c: Ciphertext) DecryptError!Fe {
     // contributor in both (confirmed from the raw memcheck stack traces,
     // not inferred). So: the taint DOES reach the L-function division —
     // that half of the question is now answered, by this module's own
-    // pinned gate (`scripts/ctgrind-expected.tsv` rows `paillier/crt`,
+    // pinned gate (`scripts/checks/ctgrind-expected.tsv` rows `paillier/crt`,
     // `paillier/noncrt`), not a new probe.
     //
     // ⚠ RESOLVED 2026-09-16 (threshold_ecdsa F5): the `Zq`-sized mask was

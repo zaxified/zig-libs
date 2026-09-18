@@ -3,13 +3,13 @@
 //! ctgrind_harness — the constant-time evidence for `SPEC.md`'s "Constant-time
 //! contract" section and for the per-function claims in `field.zig` /
 //! `group.zig` / `fast_core.zig`, as an actual committed program. Run it
-//! through `../../../scripts/ctgrind.sh k256`.
+//! through `../../../scripts/checks/ctgrind.sh k256`.
 //!
 //! Until this file existed, every constant-time statement in this module was
 //! backed by disassembly read once by hand ("Disasm confirms: zero indirect
 //! jumps", "both reproduced by disassembly") with nothing in the repo that
-//! could re-take the reading. `scripts/ctgrind-expected.tsv` had no row for
-//! `k256` and `scripts/ctgrind.sh` had no target for it. That is what this
+//! could re-take the reading. `scripts/checks/ctgrind-expected.tsv` had no row for
+//! `k256` and `scripts/checks/ctgrind.sh` had no target for it. That is what this
 //! closes.
 //!
 //! NOT wired into `zig build test-k256` — memcheck's context count is
@@ -96,7 +96,7 @@
 //! formatting witness rather than dropping it.
 //!
 //! Every count above is a measurement, and the driver now REFUSES to leave
-//! any context out of one of its three buckets: see `scripts/ctgrind.sh`
+//! any context out of one of its three buckets: see `scripts/checks/ctgrind.sh`
 //! § "the SECOND trap" for why an unattributable context fails the check
 //! instead of vanishing.
 //!

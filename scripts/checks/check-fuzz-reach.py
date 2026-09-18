@@ -806,7 +806,7 @@ def verdicts(judged):
 # `--update-baseline` refuses to record a regression. Lowering the bar is a
 # decision, not a maintenance step, and it must be made by editing the file and
 # saying why in the commit.
-BASELINE = Path("scripts/fuzz-reach-baseline.txt")
+BASELINE = Path("scripts/checks/fuzz-reach-baseline.txt")
 
 
 def read_baseline():
@@ -959,7 +959,7 @@ def main() -> int:
             print(f"  {m}: {was} → {now}")
         print()
         print("A harness whose draw collapses replays every seed as one fixed")
-        print("input. Run `./scripts/check-fuzz-reach.py --list --module <m>` to")
+        print("input. Run `./scripts/checks/check-fuzz-reach.py --list --module <m>` to")
         print("see which target, and `modules/testkit/src/fuzz.zig` for the fix.")
         return 1
 
@@ -1022,7 +1022,7 @@ def main() -> int:
             print(f"{t['path']}:{t['line']}: {t['name']}: [{rule}] {why}")
         if len(flagged) > 20:
             print(f"    … and {len(flagged) - 20} more; run "
-                  f"`./scripts/check-fuzz-reach.py --list` for all of them")
+                  f"`./scripts/checks/check-fuzz-reach.py --list` for all of them")
 
     if flagged:
         print()

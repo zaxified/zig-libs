@@ -37,7 +37,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
     claimed `meta.deps = .{}` (it has been `.{"montint"}` since the
     montint rewire); `group.zig` claimed `montint`'s Montgomery multiply
     is non-constant-time (it IS constant-time — its own module doc comment
-    and three `scripts/ctgrind.sh` harnesses say so; the actual reason
+    and three `scripts/checks/ctgrind.sh` harnesses say so; the actual reason
     `vdf` uses it is throughput from full 2^64-bit limbs + an amd64 asm
     core, not a dropped CT requirement); `root.zig`'s Caveats section
     still said the choice "keeps `deps = .{}`" sixty lines above the

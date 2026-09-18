@@ -125,7 +125,7 @@ NOTICE entry needed (a public spec is not a copyrightable work; no third-party
 source was ported into this codec). Two of the golden frames are hand-assembled
 per the spec; a third is this module's own `encode()` output, independently
 cross-checked against Wireshark 4.6.4's real IEEE 802.1ah dissector offline
-(`scripts/dissect.py`, sharkd — no capture, no network needed). Wireshark
+(`scripts/gen/dissect.py`, sharkd — no capture, no network needed). Wireshark
 confirmed the I-TCI/B-TCI bit layout, the C-DA/C-SA relocation, and that its own
 dissector recurses correctly into the encapsulated customer frame at exactly the
 offset this codec treats as the boundary. A fourth golden, the same frame with

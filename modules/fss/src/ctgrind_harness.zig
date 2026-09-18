@@ -8,7 +8,7 @@
 //! `xorMasked` in `dpf.zig`), so the instruction and branch trace is
 //! identical for every key, every α and every control-bit pattern." Until
 //! this file, that sentence was asserted in prose and never run under an
-//! instrument. `fss` has no per-module block in `scripts/ctgrind.sh` yet
+//! instrument. `fss` has no per-module block in `scripts/checks/ctgrind.sh` yet
 //! (see the suggested wiring at the bottom of this comment), so drive it by
 //! hand:
 //!
@@ -19,7 +19,7 @@
 //!
 //! ⛔⛔ `-Doptimize=ReleaseFast` is not optional — Debug builds tens of
 //! thousands of meaningless overflow-check branches on every masked select
-//! below and buries the real question in noise (see `scripts/ctgrind.sh`'s
+//! below and buries the real question in noise (see `scripts/checks/ctgrind.sh`'s
 //! header, § MODES, for the measured Debug/ReleaseFast attribution gap).
 //!
 //! ## What this measures, and why THIS module
@@ -89,7 +89,7 @@
 //! inside `dpf.zig` itself means "no branch found", not "taint never
 //! arrived".
 //!
-//! ## Suggested `scripts/ctgrind.sh` wiring (`fss` has no block there yet)
+//! ## Suggested `scripts/checks/ctgrind.sh` wiring (`fss` has no block there yet)
 //!
 //!     TARGETS[fss]="gen eval"
 //!     MODES[fss]="ReleaseFast"

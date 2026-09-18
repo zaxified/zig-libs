@@ -121,7 +121,7 @@ directory.
   `zig build check-scripts-doc` requires every file in `scripts/` to be named
   in `scripts/README.md`; that README is the only map of the harness and had
   drifted three entries, one of them `check-http-sizeprobe.sh`, which the gate
-  runs on every invocation. `scripts/check-citations.py` stays manual and now
+  runs on every invocation. `scripts/gen/check-citations.py` stays manual and now
   says why: measured on `dns` it pairs an `RFC NNNN` mention with any nearby
   quoted string, so a quoted SPEC.md heading reports as a mismatch. Also
   removed a dead `catalogRowModule` left behind when the catalog row-mover
@@ -130,7 +130,7 @@ directory.
 - **Tooling:** two module sets that the shell scripts kept their own copies of
   now have one source each. Which modules talk to a **live external peer** is
   `.live` on the `module_list` entry, beside `heavy` and `example` where the
-  same kind of fact already lived; it was a string in `scripts/test-lib.sh`
+  same kind of fact already lived; it was a string in `scripts/lib/test-lib.sh`
   read by three scripts, so a module that gained a live peer and was not added
   kept running in parallel — the exact flakiness that variable exists to
   prevent, and invisible until it bit. Which modules own a **constant-time
@@ -155,7 +155,7 @@ directory.
   inlined `main` is reported at some other file's line 0 (measured:
   `root.zig:0` on bolt3, `Threaded.zig:0` on opaque). Re-classifying a
   complete 378-row run moves nothing, so the change is only what it now
-  refuses. `scripts/ctgrind.sh --self-test` checks the rule against 17
+  refuses. `scripts/checks/ctgrind.sh --self-test` checks the rule against 17
   recorded memcheck paragraphs without valgrind or a build, and every
   measurement runs it first.
 

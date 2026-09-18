@@ -165,7 +165,7 @@ interop vector proved the flag right, in an unexpected place:
 ## Constant-time measurement (ctgrind)
 
 Two targets run under memcheck with the secret tainted; their context counts
-are pinned in `scripts/ctgrind-expected.tsv`.
+are pinned in `scripts/checks/ctgrind-expected.tsv`.
 
 | target | tainted | in-file contexts | read at |
 |---|---|---|---|

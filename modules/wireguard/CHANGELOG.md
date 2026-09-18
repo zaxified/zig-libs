@@ -95,7 +95,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   the crypto data plane for a target nobody ships it on" trade this module has
   already declined elsewhere. `zig build portable-wireguard-linux32` fails on
   exactly this one `@compileError`, cleanly (down from 9 narrowing errors
-  before the `ReplayWindow` fix above) — see `scripts/portable-known-failures.tsv`.
+  before the `ReplayWindow` fix above) — see `scripts/checks/portable-known-failures.tsv`.
 - **2026-08-18** — New: `AllowedIp.parse` — the `wg`-tool text form of an allowed-ip
   (CIDR notation, or a bare address expanded to `/32`/`/128` the way `wg` does). Delegates
   the address/prefix-length parsing to the new sibling dependency `netaddr`

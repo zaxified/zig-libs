@@ -1,4 +1,4 @@
-# Constant-time comparison sites, pinned. See scripts/check-ct-compare.py for
+# Constant-time comparison sites, pinned. See scripts/checks/check-ct-compare.py for
 # why this file exists -- in short: swapping `std.crypto.timing_safe.eql` for
 # `std.mem.eql` is invisible to every value test AND to ctgrind (measured on
 # ctap2pin, 2026-09-09: not one context moves), so the only thing that can hold

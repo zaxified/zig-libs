@@ -6,7 +6,7 @@
 //! nothing behind it but the ladder's own reputation. Run it through
 //! `zig build ctgrind -Dctgrind-module=bolt3 -Dctgrind-valgrind=true
 //! -Doptimize=ReleaseFast` (and `-Dctgrind-valgrind=false` for the trap row);
-//! `bolt3` has no entry in `scripts/ctgrind.sh` yet, so it cannot be driven by
+//! `bolt3` has no entry in `scripts/checks/ctgrind.sh` yet, so it cannot be driven by
 //! name until the coordinator adds one. Not wired into `zig build
 //! test-bolt3`: memcheck's context count is valgrind's own verdict, not
 //! something a Zig test can assert on.
@@ -107,7 +107,7 @@
 //! their pattern should be `root[.]zig` alone; a nonzero SHA-256 context
 //! would be new information, not a known class.
 //!
-//! ## Suggested `scripts/ctgrind.sh` config (coordinator wires these)
+//! ## Suggested `scripts/checks/ctgrind.sh` config (coordinator wires these)
 //!
 //!     TARGETS: [bolt3]="derive revocation shachain shachain_index"
 //!     MODES:   [bolt3]="ReleaseFast"
@@ -144,7 +144,7 @@
 //! constant-time by design (digit/hex formatting branches on the value being
 //! printed). Seeing THAT print's contexts nonzero is what proves the taint
 //! travelled secret -> output -> stdout, so an in-file zero means "no branch
-//! found", not "the taint never arrived" — see `scripts/ctgrind.sh`'s WITNESS
+//! found", not "the taint never arrived" — see `scripts/checks/ctgrind.sh`'s WITNESS
 //! bucket.
 
 const std = @import("std");

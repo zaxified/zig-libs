@@ -43,7 +43,7 @@ const bumtree = @import("bumtree");
 /// `-Doptimize=ReleaseFast` compiles those out, and `scripts/test.sh` does not
 /// merely BUILD the examples, it RUNS them in the lane's own optimize mode --
 /// so in a release lane the check vanished and the example went on printing
-/// that it had passed. See `scripts/check-example-assert.py`.
+/// that it had passed. See `scripts/checks/check-example-assert.py`.
 fn must(ok: bool, src: std.builtin.SourceLocation) void {
     if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
 }

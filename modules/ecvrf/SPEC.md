@@ -120,7 +120,7 @@ real — see "Implementation notes" below.
   **Verified, not asserted**, and since 2026-08-11 by a **committed
   program** rather than by numbers taken once by hand:
   [`src/ctgrind_harness.zig`](src/ctgrind_harness.zig), run by
-  `scripts/ctgrind.sh ecvrf`. Target `prove` marks the 32-byte secret key
+  `scripts/checks/ctgrind.sh ecvrf`. Target `prove` marks the 32-byte secret key
   `MAKE_MEM_UNDEFINED`, forces a volatile reload, derives the key pair with
   `KeyPair.fromSecretKey` (`x`, `Y = x*B`), DECLASSIFIES the published `Y`,
   and proves with `KeyPair.prove` (`Gamma`, the nonce `k`, `k*B`, `k*H`, `s`).
@@ -164,7 +164,7 @@ real — see "Implementation notes" below.
   lines, because both forms end in one branch on a tainted equality at the
   same call site and memcheck counts contexts by address.
 
-  **That swap is caught by `scripts/check-ct-compare.py` instead** (A1 E15),
+  **That swap is caught by `scripts/checks/check-ct-compare.py` instead** (A1 E15),
   which pins this file at one `timing_safe` comparison and zero plain
   `std.mem` ones and runs in every lane that touches the module. Measured
   2026-09-16 on exactly that mutation: the suite is 31/31 green in ReleaseFast

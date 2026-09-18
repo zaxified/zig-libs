@@ -14,7 +14,7 @@
 //! Off by default; opt in with `HQC_ZEROIZE_SCAN`, same shape as
 //! `bench.zig`'s `HQC_BENCH`:
 //!
-//!   HQC_ZEROIZE_SCAN=1 scripts/capped zig build test-hqc -Doptimize=ReleaseFast
+//!   HQC_ZEROIZE_SCAN=1 scripts/lib/capped zig build test-hqc -Doptimize=ReleaseFast
 //!
 //! Read the printed counts against `A1/hqc.md` H4's RED (before
 //! `secureZero`, 2026-09-05) numbers: `seed_dk` x1, `sigma` x2, `m'` x5,

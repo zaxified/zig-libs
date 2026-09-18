@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 //! ctgrind_harness — `bip32`'s entry in the constant-time gate (A1 `bip32.md`
-//! M6). Run it through `../../../scripts/ctgrind.sh bip32`.
+//! M6). Run it through `../../../scripts/checks/ctgrind.sh bip32`.
 //!
 //! NOT wired into `zig build test-bip32` — memcheck's context count is
 //! valgrind's output, not something a Zig test can assert on. `zig build

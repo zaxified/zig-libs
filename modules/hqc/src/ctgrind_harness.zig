@@ -38,7 +38,7 @@
 //! itself a finding and it is written down in `SPEC.md`; it is not pinned here
 //! because a second mode doubles the rows for a claim of the same shape, and
 //! because Debug cannot be measured at all (valgrind's DWARF reader cannot
-//! parse what Zig's self-hosted backend emits, `scripts/ctgrind.sh` § MODES).
+//! parse what Zig's self-hosted backend emits, `scripts/checks/ctgrind.sh` § MODES).
 //!
 //! ## The propagation witness
 //!

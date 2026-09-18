@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! ECDSA secp256k1 verification against Wycheproof (audit G3) — this module
 //! shipped NO ECDSA test vectors of its own; the sibling `p256` transcribes
-//! its P-256 counterpart via `scripts/gen-p256-wycheproof.py`. Wycheproof is
+//! its P-256 counterpart via `scripts/gen/gen-p256-wycheproof.py`. Wycheproof is
 //! the right fixture precisely because it is hostile: its rows are built to
 //! catch verifiers that skip range checks, mishandle the point at infinity,
 //! accept `r`/`s` outside `[1, n-1]`, or take a signature whose integers

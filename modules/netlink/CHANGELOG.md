@@ -14,7 +14,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   meets an `AF_BRIDGE` VXLAN FDB entry (`error.MixedFamilies`): that entry is
   now counted in a new `FlushResult.skipped` field and the flush continues
   over the regular entries after it, matching the `dst_len == 0` precedent
-  SPEC.md already documents. `scripts/check-uapi-consts.py`'s `netlink`
+  SPEC.md already documents. `scripts/checks/check-uapi-consts.py`'s `netlink`
   entry now also scans `root.zig` (~90 constants), not just `bridge.zig`.
 
 - **2026-09-08** — **NO CONSUMER-VISIBLE CHANGE:** `bridge.fuzzBuilders` draws

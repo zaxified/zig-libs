@@ -8,7 +8,7 @@
 //!    branches on secret data)"
 //!
 //! Until this harness that sentence had no measurement behind it. Run it
-//! through `../../../scripts/ctgrind.sh rsa`; that script's header has the
+//! through `../../../scripts/checks/ctgrind.sh rsa`; that script's header has the
 //! exact commands.
 //!
 //! ## What is tainted, and what is deliberately NOT
@@ -55,7 +55,7 @@
 //! the key-derivation-time path, exercised by `SecretKey.fromPrimes` below
 //! BEFORE any taint, never by `rsadpCrt`/`rsadp`).
 //!
-//! ## The two traps (see `ct25519`'s harness or `scripts/ctgrind.sh`'s header)
+//! ## The two traps (see `ct25519`'s harness or `scripts/checks/ctgrind.sh`'s header)
 //!
 //! 1. `std.valgrind.doClientRequest` compiles to nothing without `-fvalgrind`
 //!    (off by default outside Debug) — the driver script builds both ways so

@@ -68,7 +68,7 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   advertised with the maximum link metric (2^24 - 1), this link MUST NOT be considered
   during the normal SPF computation."* The invented half **inverts** the rule — the whole
   mechanism is that the link stays advertised for traffic engineering, which the very next
-  sentence of the same comment already said. `scripts/check-citations.py` had been reporting
+  sentence of the same comment already said. `scripts/gen/check-citations.py` had been reporting
   the MISMATCH. Also: the `MAX_PATH_METRIC` deferral was justified by "not a fixture that
   can be driven RED at a defensible size" — a 300-router line reaches 5,016,386,986, past
   the ceiling by 754,974,122, in 22 ms, and is now a test; and the RFC's own rationale for
