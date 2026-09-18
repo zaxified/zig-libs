@@ -162,15 +162,15 @@ cd "$REPO_ROOT"
 G_NAMES=()
 G_HEAVY=()
 G_DEPS=()
+G_GROUP=()
 G_TSV=""
-GRAPH_ADDED=""
 
 # Populates G_NAMES/G_HEAVY/G_DEPS from `zig build module-graph`. Never
 # silently proceeds with an empty/partial graph — a build failure here
 # would otherwise look identical to "nothing changed", the exact silent
 # no-op class of bug this driver must not have.
 graph_load() {
-    G_NAMES=(); G_HEAVY=(); G_DEPS=()
+    G_NAMES=(); G_HEAVY=(); G_DEPS=(); G_GROUP=()
     local tsv
     if ! tsv="$(zig build module-graph 2>&1)"; then
         echo "test.sh: 'zig build module-graph' failed — refusing to guess the module set:" >&2
@@ -178,83 +178,158 @@ graph_load() {
         exit 1
     fi
     G_TSV="$tsv"
-    local name heavy deps live ct
-    while IFS=$'\t' read -r name heavy deps live ct; do
+    local name heavy deps live ct group
+    # ⚠ Split on `|`, not on the tab. A tab is IFS WHITESPACE to bash, so two in
+    # a row -- the empty deps column of every module with no siblings -- collapse
+    # into one and every later column shifts left: those modules read their
+    # `live` marker as deps and their group as `ct`. Module names never contain
+    # `|`, so the substitution is lossless.
+    while IFS='|' read -r name heavy deps live ct group; do
         [[ -z "$name" ]] && continue
         G_NAMES+=("$name")
         G_HEAVY+=("$heavy")
         G_DEPS+=("$deps")
-    done <<< "$tsv"
+        G_GROUP+=("$group")
+    done <<< "${tsv//$'\t'/|}"
     if [[ ${#G_NAMES[@]} -eq 0 ]]; then
         echo "test.sh: 'zig build module-graph' produced zero modules — refusing to pass vacuously" >&2
         exit 1
     fi
 }
 
-# ── graph snapshot ──────────────────────────────────────────────────────────
-# Touching build.zig used to escalate straight to the full run, on the
-# reasoning that the dependency graph might have changed. Usually it has not:
-# ADDING a module appends one row to `module_list` and cannot affect any
-# existing module. Paying the full gate for that is the driver being wrong, not
-# careful — and a gate that expensive for a routine edit is one people learn to
-# skip, which costs more than it saves.
-#
-# So the escalation is decided by the GRAPH, not by which file was saved. The
-# last known-good graph is kept beside the build cache and compared row by row:
-#
-#   rows only in the new graph        -> modules were added; test just those
-#   any row missing or altered       -> a module changed shape or vanished, and
-#                                       the reverse-dep closure can no longer be
-#                                       trusted -> full run
-#   no snapshot yet                  -> nothing to compare against -> full run
-#
-# This keeps the driver's existing rule that `zig build module-graph` is the
-# only authority on the module set; it still never parses build.zig.
-GRAPH_SNAPSHOT=".zig-cache/ziglibs-graph.tsv"
-
-graph_save() {
-    [[ -n "$G_TSV" ]] || return 0
-    mkdir -p "$(dirname "$GRAPH_SNAPSHOT")" 2>/dev/null || return 0
-    printf '%s\n' "$G_TSV" > "$GRAPH_SNAPSHOT" 2>/dev/null || true
+# The modules this lane covers: all of them, or -- when the lane passes
+# `-Dgroup=<lib>` (repeatable; CI splits a lane across runners with it) --
+# those whose primary lib is listed. build.zig narrows `zig build`,
+# `check-pubfn-reach` and `check-examples` by the same option and the same
+# rule (module-graph column 6), so the tests run here and the compile above
+# them cover one set. An empty selection is refused: a lane that tests
+# nothing must not pass.
+lane_modules() {
+    local -a want=() only=()
+    local a
+    for a in "${EXTRA_ZIG_ARGS[@]}"; do
+        [[ "$a" == -Dgroup=* ]] && want+=("${a#-Dgroup=}")
+        [[ "$a" == -Dmodule=* ]] && only+=("${a#-Dmodule=}")
+    done
+    local -a out=()
+    local i
+    for (( i = 0; i < ${#G_NAMES[@]}; i++ )); do
+        if [[ ${#want[@]} -gt 0 ]]; then
+            case " ${want[*]} " in *" ${G_GROUP[$i]} "*) ;; *) continue ;; esac
+        fi
+        if [[ ${#only[@]} -gt 0 ]]; then
+            case " ${only[*]} " in *" ${G_NAMES[$i]} "*) ;; *) continue ;; esac
+        fi
+        out+=("${G_NAMES[$i]}")
+    done
+    if [[ ${#out[@]} -eq 0 ]]; then
+        echo "test.sh: -Dgroup=${want[*]:-} -Dmodule=${only[*]:-} selects no module -- refusing to pass vacuously" >&2
+        exit 1
+    fi
+    printf '%s' "${out[*]}"
 }
 
-# Sets GRAPH_ADDED to the modules whose graph row was ADDED or ALTERED and
-# returns 0. Returns 1 only when there is no snapshot to compare against.
+# ── stamps ──────────────────────────────────────────────────────────────────
+# A stamp says: this module, at this fingerprint, passed this lane. A module
+# whose current fingerprint (`zig build module-fingerprints`, see build.zig for
+# what goes into it) has a stamp for the lane being run is skipped -- it has
+# already been proven, and nothing that could change the answer has moved.
 #
-# A module that gained or lost a dependency is a precisely answerable question,
-# not a reason to run everything: the module itself changed shape, so retest it
-# and — via the ordinary reverse-dependency closure, computed from the NEW graph
-# — everything built on top of it. That is the same rule the rest of this driver
-# already uses; there is nothing special about the edge having moved.
+#   <module> TAB <lane key> TAB <fingerprint> TAB <UTC time>
 #
-# ⭐ A REMOVED module needs no special case either, which is not obvious. The
-# worry is that what used to depend on it is knowable only from the OLD graph.
-# But a dependent cannot quietly survive its dependency's deletion:
-#
-#   * if the dependent's own row was updated to drop it, that row CHANGED, so
-#     the dependent is seeded here and its closure covers everything above it;
-#   * if it was not updated, it now declares a dependency on a module that does
-#     not exist — and `zig build module-graph` ABORTS (verified: deleting
-#     `protobuf` while `grpc` still names it terminates the build with SIGABRT).
-#     graph_load then refuses to guess a module set and exits, so nothing runs
-#     on a graph nobody can trust.
-#
-# So removals are simply ignored: either they are already covered, or there is
-# no working graph to test against in the first place.
-graph_added_only() {
-    GRAPH_ADDED=""
-    [[ -f "$GRAPH_SNAPSHOT" ]] || return 1
-    # Rows present now but not in the snapshot: a module that was added, or one
-    # whose row was edited (an edit shows up as a removal plus an addition, and
-    # the addition is the one that matters — it carries the current shape).
-    #
-    # LC_ALL=C is load-bearing, not hygiene: `sort` collates by locale while
-    # `comm` compares bytewise, so under cs_CZ comm reads its input as unsorted
-    # and silently returns a WRONG answer — one that fails open, i.e. seeds too
-    # little and under-tests. Its "file 1 is not in sorted order" warning goes
-    # to stderr and is easy to miss because the result still looks plausible.
-    GRAPH_ADDED="$(comm -13 <(LC_ALL=C sort "$GRAPH_SNAPSHOT") <(printf '%s\n' "$G_TSV" | LC_ALL=C sort) | cut -f1 | tr '\n' ' ')"
-    return 0
+# The lane key is the command, its zig arguments minus the ones that only
+# SELECT modules (-Dgroup, -Dmodule), and the machine architecture. The file is
+# `.stamps.local.tsv` by default (gitignored, outside `.zig-cache`, which gets
+# deleted by hand); CI points ZIGLIBS_STAMPS elsewhere and carries the file
+# between runs as an artifact. Stamps are written only at the END of a command,
+# which `step` reaches only when every step passed -- a red run writes none.
+# ZIGLIBS_IGNORE_STAMPS=1 runs everything as if no stamp existed.
+STAMPS_FILE="${ZIGLIBS_STAMPS:-.stamps.local.tsv}"
+declare -A FP=()
+
+fp_load() {
+    [[ ${#FP[@]} -gt 0 ]] && return 0
+    local tsv n f
+    if ! tsv="$(zig build module-fingerprints 2>&1)"; then
+        echo "test.sh: 'zig build module-fingerprints' failed -- refusing to guess what is proven:" >&2
+        echo "$tsv" >&2
+        exit 1
+    fi
+    while IFS=$'\t' read -r n f; do
+        [[ -n "$n" && -n "$f" ]] && FP[$n]="$f"
+    done <<< "$tsv"
+    if [[ ${#FP[@]} -eq 0 ]]; then
+        echo "test.sh: module-fingerprints produced nothing -- refusing to pass vacuously" >&2
+        exit 1
+    fi
+}
+
+stamps_lane_key() {
+    local key="$1" a
+    for a in "${EXTRA_ZIG_ARGS[@]}"; do
+        case "$a" in -Dgroup=* | -Dmodule=*) ;; *) key="$key $a" ;; esac
+    done
+    printf '%s %s' "$key" "$(uname -m)"
+}
+
+# Prints the modules of $1 that have no stamp for lane $2 at their current
+# fingerprint.
+stamps_pending() {
+    local mods="$1" lane="$2" m
+    fp_load
+    if [[ "${ZIGLIBS_IGNORE_STAMPS:-0}" == 1 || ! -f "$STAMPS_FILE" ]]; then
+        printf '%s' "$mods"
+        return 0
+    fi
+    declare -A have=()
+    local sm sl sf _t
+    while IFS=$'\t' read -r sm sl sf _t; do
+        [[ "$sl" == "$lane" ]] && have[$sm]="$sf"
+    done < "$STAMPS_FILE"
+    local -a out=()
+    for m in $mods; do
+        [[ -n "${FP[$m]:-}" && "${have[$m]:-}" == "${FP[$m]}" ]] || out+=("$m")
+    done
+    printf '%s' "${out[*]}"
+}
+
+# Records a green stamp for every module of $1 in lane $2, replacing that
+# module's previous stamp in the lane.
+stamps_record() {
+    local mods="$1" lane="$2" m now tmp
+    [[ -z "${mods// /}" ]] && return 0
+    fp_load
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
+    declare -A drop=()
+    for m in $mods; do drop[$m]=1; done
+    if [[ -f "$STAMPS_FILE" ]]; then
+        local sm sl rest
+        while IFS=$'\t' read -r sm sl rest; do
+            [[ "$sl" == "$lane" && -n "${drop[$sm]:-}" ]] && continue
+            printf '%s\t%s\t%s\n' "$sm" "$sl" "$rest"
+        done < "$STAMPS_FILE" > "$tmp"
+    fi
+    for m in $mods; do
+        printf '%s\t%s\t%s\t%s\n' "$m" "$lane" "${FP[$m]}" "$now" >> "$tmp"
+    done
+    LC_ALL=C sort -o "$tmp" "$tmp"
+    mv "$tmp" "$STAMPS_FILE"
+    echo "stamps: $(wc -w <<< "$mods") module(s) recorded green for '$lane' in $STAMPS_FILE"
+}
+
+# The selecting arguments the lane was given (-Dgroup, -Dmodule) into SEL_ARGS,
+# plus `-Dmodule=` for each module of $1 when it is a strict subset of the
+# lane's modules $2 -- the whole lane needs no further narrowing.
+SEL_ARGS=()
+stamps_narrow() {
+    SEL_ARGS=()
+    local a m
+    for a in "${EXTRA_ZIG_ARGS[@]}"; do
+        case "$a" in -Dgroup=* | -Dmodule=*) SEL_ARGS+=("$a") ;; esac
+    done
+    [[ "$(wc -w <<< "$1")" -eq "$(wc -w <<< "$2")" ]] && return 0
+    for m in $1; do SEL_ARGS+=("-Dmodule=$m"); done
 }
 
 # The harness itself changed (this script, test-lib.sh, capped, or a CI lane).
@@ -392,54 +467,7 @@ harness_smoke() {
     # exiting 0 and still claiming a byte-exact match.
     step "check-example-assert" ./scripts/check-example-assert.py
     run_modules "$plain $netns"
-    graph_save
     summary
-}
-
-module_exists() {
-    local target="$1" n
-    for n in "${G_NAMES[@]}"; do
-        [[ "$n" == "$target" ]] && return 0
-    done
-    return 1
-}
-
-# Reverse-dependency closure: given a space-separated seed set of changed
-# module names, returns the seeds plus every module that transitively
-# depends ON one of them (NOT the modules a seed depends on — that's the
-# opposite, wrong direction: if A depends on B and B changes, A must be
-# retested, not the reverse). Correctness-critical; see the worked rsa
-# example in scripts/README.md and the task report.
-reverse_closure() {
-    local seeds="$1"
-    local result=" " s
-    for s in $seeds; do
-        case "$result" in *" $s "*) ;; *) result="$result$s " ;; esac
-    done
-    local frontier="$result"
-    local changed=1
-    while [[ $changed -eq 1 ]]; do
-        changed=0
-        local new_frontier=" "
-        local i
-        for (( i = 0; i < ${#G_NAMES[@]}; i++ )); do
-            local name="${G_NAMES[$i]}"
-            case "$result" in *" $name "*) continue ;; esac
-            local deps="${G_DEPS[$i]}"
-            [[ -z "$deps" ]] && continue
-            local hit=0 d
-            for d in ${deps//,/ }; do
-                case "$frontier" in *" $d "*) hit=1; break ;; esac
-            done
-            if [[ $hit -eq 1 ]]; then
-                result="$result$name "
-                new_frontier="$new_frontier$name "
-                changed=1
-            fi
-        done
-        frontier="$new_frontier"
-    done
-    printf '%s' "$result"
 }
 
 _HAVE_UNSHARE=""
@@ -1155,14 +1183,17 @@ cmd_changed() {
     fi
     files="$(printf '%s\n' "$files" | sort -u)"
 
+    # ⚠ An empty diff is NOT "nothing to test" any more: which MODULES run is
+    # decided by the stamps below, and a module can be unproven with nothing
+    # uncommitted -- committed untested, or red on the last run. The diff only
+    # decides which repo-wide checks run.
     if [[ -z "$files" ]]; then
-        echo "changed: no changed/staged/untracked files$( [[ -n "$base_ref" ]] && echo " vs $base_ref" ) — nothing to test"
-        exit 0
+        echo "changed: no changed/staged/untracked files$( [[ -n "$base_ref" ]] && echo " vs $base_ref" ) — checking stamps only"
     fi
 
     capability_check
 
-    local trigger_all=0 trigger_catalog=0 trigger_graph=0 trigger_changelog=0
+    local trigger_all=0 trigger_catalog=0 trigger_changelog=0
     local trigger_docs=0
     local seeds=" " docs_only=" " f name
     while IFS= read -r f; do
@@ -1197,10 +1228,11 @@ cmd_changed() {
                 case "$seeds" in *" $name "*) ;; *) seeds="$seeds$name " ;; esac
                 ;;
             build.zig|build.zig.zon)
-                # Might have changed the graph — ask the graph, do not assume.
-                trigger_graph=1
+                # Nothing to decide here: build.zig is in every fingerprint
+                # (its `module_list` entries per module, the rest as machinery),
+                # so the stamps already say which modules this re-keyed.
                 ;;
-            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/check-ct-compare.py|scripts/ct-compare-expected.tsv|scripts/check-fuzz-reach.py|scripts/check-example-assert.py|scripts/check-changelog-entry.py|scripts/hooks/*)
+            .github/*|scripts/test.sh|scripts/test-lib.sh|scripts/capped|scripts/dark-tests.sh|scripts/ci-environment.sh|scripts/test-tag.sh|scripts/ci-stamps.sh|scripts/check-ci-cache-keys.sh|scripts/check-http-sizeprobe.sh|scripts/check-fp-freedom.sh|scripts/check-skip-as-pass.py|scripts/check-ct-compare.py|scripts/ct-compare-expected.tsv|scripts/check-fuzz-reach.py|scripts/check-example-assert.py|scripts/check-changelog-entry.py|scripts/hooks/*)
                 # The harness or the CI lane definition itself: no narrower set
                 # can be trusted, because what narrows it is the thing that
                 # changed.
@@ -1300,78 +1332,41 @@ cmd_changed() {
         return
     fi
 
-    if [[ $trigger_graph -eq 1 ]]; then
-        if graph_added_only; then
-            if [[ -n "${GRAPH_ADDED// /}" ]]; then
-                echo "changed: build.zig touched -> graph rows added/altered: ${GRAPH_ADDED% } (seeded; the reverse-dep closure below covers the rest)"
-                seeds="$seeds$GRAPH_ADDED"
-            else
-                # Also the "only removals" case: nothing gained or altered a
-                # row, so there is nothing extra to seed (see graph_added_only
-                # on why a removal needs no special handling).
-                echo "changed: build.zig touched, but no module gained or altered a graph row -> nothing extra to seed"
-            fi
-        else
-            echo "changed: no graph snapshot to compare against -> nothing to narrow with -> running ALL modules"
-            cmd_all ${changed_extra[@]+"${changed_extra[@]}"}
-            return
-        fi
-    fi
-
-    local -a valid_seeds=()
-    for name in $seeds; do
-        # A module can be seeded twice -- once because its own files changed and
-        # once because build.zig gained a graph row for it, which is exactly what
-        # adding a module does. The closure below dedups, so a duplicate here
-        # only corrupted the reported counts (a NEGATIVE reverse-dep count).
-        case " ${valid_seeds[*]} " in *" $name "*) continue ;; esac
-        if module_exists "$name"; then
-            valid_seeds+=("$name")
-        else
-            echo "changed: warning: modules/$name/ changed but '$name' is not in the module graph — ignoring" >&2
-        fi
-    done
-
-    if [[ ${#valid_seeds[@]} -eq 0 && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 && $trigger_docs -eq 0 ]]; then
-        echo "changed: no modules affected — nothing to test"
-        graph_save
-        exit 0
-    fi
-
-    local closure="" pulled_only=""
-    if [[ ${#valid_seeds[@]} -gt 0 ]]; then
-        closure="$(reverse_closure "${valid_seeds[*]}")"
-        local m
-        for m in $closure; do
-            case " ${valid_seeds[*]} " in *" $m "*) ;; *) pulled_only="$pulled_only$m " ;; esac
-        done
-    fi
-
-    local changed_n=${#valid_seeds[@]}
+    # ⭐ WHICH MODULES RUN IS DECIDED BY STAMPS (2026-09-18), not by the diff.
+    # A module runs when it has no green stamp for this lane at its current
+    # fingerprint. The fingerprint already folds in every dependency, so the
+    # reverse-dependency closure and the graph-snapshot escalation this used
+    # to compute are both implied; and unlike a diff against a base, a stamp
+    # does not forget a module that went red two commits ago.
+    local lane closure
+    lane="$(stamps_lane_key changed)"
+    closure="$(stamps_pending "${G_NAMES[*]}" "$lane")"
     local total_n
-    total_n=$( [[ -n "$closure" ]] && echo $closure | wc -w || echo 0 )
-    local pulled_n=$(( total_n - changed_n ))
-
-    echo "changed: $changed_n module(s) directly changed, $pulled_n pulled in via reverse-dep closure -> $total_n to test"
-    # Named, not merely counted: a reader who sees "0 to test" after editing ten
-    # files needs to be told the files were prose, or the next thing they do is
-    # distrust the narrowing.
-    # ⛔ A module that changed BOTH prose and code lands in `docs_only` *and* in
-    # `seeds`, and printing it here said "not built or tested" about a module the
-    # very next line lists as tested. Measured 2026-09-11 on an mqtt change that
-    # touched broker.zig, README.md and SPEC.md together. The narrowing was
-    # right; the sentence about it was false, which is worse than merely noisy —
-    # this gate's whole job is to be believed about what it skipped.
-    local docs_pure=" " dname
+    total_n=$(wc -w <<< "$closure")
+    echo "changed: $total_n of ${#G_NAMES[@]} modules have no green stamp for '$lane'"
+    if [[ $total_n -gt 0 && $total_n -le 40 ]]; then
+        echo "  to test: $closure"
+    fi
+    local dname docs_pure=" "
     for dname in $docs_only; do
-        case " ${valid_seeds[*]} " in *" $dname "*) ;; *) docs_pure="$docs_pure$dname " ;; esac
+        case " $closure " in *" $dname "*) ;; *) docs_pure="$docs_pure$dname " ;; esac
     done
     if [[ $trigger_docs -eq 1 && -n "${docs_pure// /}" ]]; then
         echo "  docs only:  ${docs_pure# } — not built or tested (they cannot change what compiles);"
         echo "              the gates that read them still run below."
     fi
-    [[ ${#valid_seeds[@]} -gt 0 ]] && echo "  changed:    ${valid_seeds[*]}"
-    [[ -n "$pulled_only" ]] && echo "  reverse-dep: $pulled_only"
+
+    if [[ -z "$files" ]]; then
+        [[ -z "${closure// /}" ]] && { echo "changed: nothing to do"; exit 0; }
+        run_modules "$closure"
+        stamps_record "$closure" "$lane"
+        summary
+        exit 0
+    fi
+    if [[ -z "${closure// /}" && $trigger_catalog -eq 0 && $trigger_changelog -eq 0 && $trigger_docs -eq 0 && -z "${seeds// /}" ]]; then
+        echo "changed: no modules affected — nothing to test"
+        exit 0
+    fi
 
     if [[ $trigger_catalog -eq 1 ]]; then
         step "check-catalog (README.md changed)" zig build check-catalog
@@ -1497,13 +1492,12 @@ cmd_changed() {
     step "check-example-assert" ./scripts/check-example-assert.py
 
     if [[ -z "$closure" ]]; then
-        graph_save
         summary
         exit 0
     fi
 
     run_modules "$closure"
-    graph_save
+    stamps_record "$closure" "$lane"
     summary
 }
 
@@ -1790,12 +1784,21 @@ cmd_modules() {
     set_extra_args "$@"
     capability_check
     graph_load
-    local all_mods="${G_NAMES[*]}"
-    echo "modules: compiling and testing every module (${#G_NAMES[@]} total) — examples run in their own lane"
-    step "check-pubfn-reach" zig build check-pubfn-reach
-    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
-    ZL_RUN_EXAMPLES=0 run_modules "$all_mods"
-    graph_save
+    local lane_mods todo lane
+    lane_mods="$(lane_modules)"
+    lane="$(stamps_lane_key modules)"
+    todo="$(stamps_pending "$lane_mods" "$lane")"
+    echo "modules: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' — compiling and testing those; examples run in their own lane"
+    if [[ -z "${todo// /}" ]]; then
+        echo "modules: nothing to do — every module here is stamped green at its current fingerprint"
+        summary
+        return 0
+    fi
+    stamps_narrow "$todo" "$lane_mods"
+    step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    ZL_RUN_EXAMPLES=0 run_modules "$todo"
+    stamps_record "$todo" "$lane"
     summary
 }
 
@@ -1807,10 +1810,20 @@ cmd_examples() {
     set_extra_args "$@"
     capability_check
     graph_load
-    local all_mods="${G_NAMES[*]}"
-    echo "examples: compiling and running every module's example (${#G_NAMES[@]} modules)"
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
-    run_examples_for "$all_mods"
+    local lane_mods todo lane
+    lane_mods="$(lane_modules)"
+    lane="$(stamps_lane_key examples)"
+    todo="$(stamps_pending "$lane_mods" "$lane")"
+    echo "examples: $(wc -w <<< "$todo") of $(wc -w <<< "$lane_mods") modules in this lane have no green stamp for '$lane' — compiling and running their examples"
+    if [[ -z "${todo// /}" ]]; then
+        echo "examples: nothing to do — every module here is stamped green at its current fingerprint"
+        summary
+        return 0
+    fi
+    stamps_narrow "$todo" "$lane_mods"
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    run_examples_for "$todo"
+    stamps_record "$todo" "$lane"
     summary
 }
 
@@ -1839,10 +1852,21 @@ cmd_build() {
     GATE_BUILD_ONLY=1
     set_extra_args "$@"
     graph_load
-    local n=${#G_NAMES[@]}
-    echo "build: COMPILING every module ($n total) and every example, running NOTHING"
-    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}"
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
+    local lane_mods todo lane
+    lane_mods="$(lane_modules)"
+    lane="$(stamps_lane_key build)"
+    todo="$(stamps_pending "$lane_mods" "$lane")"
+    local n
+    n=$(wc -w <<< "$todo")
+    echo "build: COMPILING $n of $(wc -w <<< "$lane_mods") modules (no green stamp for '$lane') and their examples, running NOTHING"
+    if [[ -z "${todo// /}" ]]; then
+        echo "build: nothing to do — every module here is stamped green at its current fingerprint"
+        summary
+        return 0
+    fi
+    stamps_narrow "$todo" "$lane_mods"
+    step "build (all modules)" zig build "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}" ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     # This lane runs no test, so there is no `--summary all` to digest and
     # nothing would land on the run's page. A lane that contributes NOTHING
     # there reads as one that failed to report, not as one with nothing to
@@ -1854,7 +1878,9 @@ cmd_build() {
     fi
     # ⚠ The graph snapshot is NOT saved here. It is what `changed` uses to
     # decide it may run a narrow set, and a run that executed no test has no
-    # business telling the next one that anything was covered.
+    # business telling the next one that anything was covered. The stamp below
+    # is keyed to the `build` lane, so it claims a compile and nothing more.
+    stamps_record "$todo" "$lane"
     summary
 }
 
@@ -1934,7 +1960,9 @@ cmd_all() {
     # binaries in a ReleaseSafe lane and compiled all 230 a second time to do
     # it). `all_mods` is every module, so nothing lost coverage in the move.
     run_modules "$all_mods"
-    graph_save
+    # `all` runs everything `changed` would, for every module, with the same
+    # arguments -- so it proves the `changed` lane for all of them.
+    stamps_record "$all_mods" "$(stamps_lane_key changed)"
     summary
 }
 

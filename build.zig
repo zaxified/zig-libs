@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // zig-libs — a curated collection of foundational Zig modules.
 //
@@ -384,6 +385,40 @@ pub fn build(b: *std.Build) void {
         "Only build tests whose name contains this substring (repeatable)",
     ) orelse &.{};
 
+    // `-Dgroup=<lib>` (repeatable) — narrow the whole-collection steps
+    // (`zig build`, `check-pubfn-reach`, `check-examples`, `run-examples`) to
+    // the modules whose PRIMARY lib (`libs[0]`) is one of these. It exists so
+    // CI can split one lane across several runners: compiling every module is
+    // the bulk of a lane (`build (all modules)` 2428 s of 48 min on the
+    // 2026-09-02 tag), and the groups share little compilation. Dependencies
+    // outside the group are still compiled -- a module needs them -- but not
+    // tested. Per-module steps (`test-<m>`) ignore it. A name matching no
+    // module is refused, so a typo cannot turn a lane into one that tests
+    // nothing and passes.
+    const groups = b.option(
+        []const []const u8,
+        "group",
+        "Only compile/check modules whose primary lib is this (repeatable; CI sharding)",
+    ) orelse &.{};
+    for (groups) |g| {
+        const known = for (module_list) |m| {
+            if (std.mem.eql(u8, m.libs[0], g)) break true;
+        } else false;
+        if (!known) std.debug.panic("-Dgroup={s}: no module has this primary lib", .{g});
+    }
+    // `-Dmodule=<name>` (repeatable) — narrow the same steps further, to named
+    // modules. `scripts/test.sh` passes the modules of a lane that have no
+    // green stamp for their current fingerprint, so a lane compiles only what
+    // it has not already proven. Combined with `-Dgroup` by AND.
+    const only_modules = b.option(
+        []const []const u8,
+        "module",
+        "Only compile/check these modules (repeatable; set by test.sh from its stamps)",
+    ) orelse &.{};
+    for (only_modules) |name| {
+        if (moduleIndex(name) == null) std.debug.panic("-Dmodule={s}: no such module", .{name});
+    }
+
     // Gate for the "a body nothing references is never analysed" class — see
     // the `force_mod` block in pass 2 for what it compiles and why.
     const check_pubfn_reach = b.step("check-pubfn-reach", "Analyse every non-generic public declaration, including the ones no test reaches");
@@ -456,6 +491,7 @@ pub fn build(b: *std.Build) void {
     for (module_list) |m| {
         const mod = mods.get(m.name).?;
         for (m.deps) |dep| mod.addImport(dep, mods.get(dep).?);
+        const in_group = inGroups(m, groups) and inList(m.name, only_modules);
 
         // A module with test-only deps gets a SECOND module object over the
         // same source, carrying the extra imports. `mod` -- the one
@@ -505,7 +541,7 @@ pub fn build(b: *std.Build) void {
         // it is the copy, not the build, that the install step then names. The
         // dependency is on the Compile step itself, the same shape
         // `check-testonly` already uses below for its probe objects.
-        b.getInstallStep().dependOn(&unit_tests.step);
+        if (in_group) b.getInstallStep().dependOn(&unit_tests.step);
 
         // Per-module test step: `zig build test-<name>`.
         const one = b.step(b.fmt("test-{s}", .{m.name}), b.fmt("Test the {s} module", .{m.name}));
@@ -630,7 +666,7 @@ pub fn build(b: *std.Build) void {
             .name = b.fmt("force-{s}", .{m.name}),
             .root_module = force_mod,
         });
-        check_pubfn_reach.dependOn(&force_tests.step);
+        if (in_group) check_pubfn_reach.dependOn(&force_tests.step);
 
         // ⭐ The one class nothing else here can cover: **is the published API
         // sufficient to do the job?**
@@ -709,7 +745,7 @@ pub fn build(b: *std.Build) void {
                 .name = b.fmt("example-{s}", .{m.name}),
                 .root_module = example_mod,
             });
-            check_examples.dependOn(&example.step);
+            if (in_group) check_examples.dependOn(&example.step);
             // Per-module entry point, so one example can be compiled on its
             // own: `zig build example-<name>`. Without it the only way to
             // check a single new example is the whole `check-examples` sweep,
@@ -728,7 +764,7 @@ pub fn build(b: *std.Build) void {
             // that would drift the way `.example` did.
             const run_example = b.addRunArtifact(example);
             b.step(b.fmt("run-example-{s}", .{m.name}), b.fmt("Build AND run the {s} example", .{m.name})).dependOn(&run_example.step);
-            run_examples.dependOn(&run_example.step);
+            if (in_group) run_examples.dependOn(&run_example.step);
         }
     }
 
@@ -1147,6 +1183,20 @@ pub fn build(b: *std.Build) void {
     });
     graph.dependOn(graph_inner);
 
+    // `zig build module-fingerprints` — one line per module,
+    // `name<TAB>fingerprint`. The key `scripts/test.sh` keeps its stamps under:
+    // a module whose fingerprint has a green stamp for a lane need not run in
+    // that lane again. See `printModuleFingerprints` for what goes in.
+    const fps = b.step("module-fingerprints", "Print each module's content fingerprint as TSV (name, fingerprint)");
+    const fps_inner = b.allocator.create(std.Build.Step) catch @panic("OOM");
+    fps_inner.* = std.Build.Step.init(.{
+        .id = .custom,
+        .name = "module-fingerprints",
+        .owner = b,
+        .makeFn = printModuleFingerprints,
+    });
+    fps.dependOn(fps_inner);
+
     // Catalog consistency gate: `zig build check-catalog` (CI runs it).
     // Verifies module_list ↔ modules/ ↔ the README catalog table agree, so a
     // module can't ship without a catalog row (6 rows had drifted before this
@@ -1556,10 +1606,258 @@ fn ctgrindHarnesses(b: *std.Build) []const []const u8 {
     return out.items;
 }
 
+/// `zig build module-fingerprints` — the key a stamp is kept under.
+///
+/// A module's fingerprint changes exactly when something that can change what
+/// its tests or example do has changed, and (ideally) not otherwise:
+///
+///   * the MACHINERY: this file with `module_list` cut out, `build.zig.zon`,
+///     and the scripts that select, build and run modules. Changing it
+///     re-keys every module, which is right -- it is how everything is run;
+///   * the module's DECLARATION: its `module_list` entry, minus `libs` (a
+///     catalog placement, which changes nothing that compiles);
+///   * the module's OWN FILES, every file under `modules/<m>/` except prose
+///     (`*.md`, `NOTICE`, `LICENSE`). `.zig` files are hashed as their token
+///     stream with comments dropped, so a comment, a doc comment, a blank line
+///     or a `zig fmt` pass does not re-key; any other file by its bytes;
+///   * the own hash of every module in its dependency CLOSURE (`deps` and
+///     `test_deps`, transitively) -- so a change in `netaddr` re-keys `http`
+///     and everything above it with no reverse-dependency pass anywhere.
+///
+/// Zig's version is folded in too. Mode, target and lane are not: they are
+/// the other half of a stamp's key, and `scripts/test.sh` writes them.
+///
+/// ⚠ The one blind spot of dropping comments: code that reads `@src().line`
+/// sees a line shift that the token stream does not. A false "unchanged" is
+/// the direction that must not happen, so a module doing that must say so.
+fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const io = b.graph.io;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    var machinery = Sha256.init(.{});
+    machinery.update(builtin.zig_version_string);
+    machinery.update("\x00");
+    {
+        const src = try b.build_root.handle.readFileAlloc(io, "build.zig", b.allocator, .limited(64 * 1024 * 1024));
+        hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), "module_list");
+    }
+    for ([_][]const u8{
+        "build.zig.zon",
+        "scripts/test.sh",
+        "scripts/test-lib.sh",
+        "scripts/capped",
+        "scripts/dark-tests.sh",
+        "scripts/force-pubfn-reach.zig",
+    }) |path| {
+        const src = try b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(64 * 1024 * 1024));
+        machinery.update(path);
+        machinery.update("\x00");
+        hashFileContent(&machinery, b, path, src);
+    }
+
+    // Per-file content hashes are memoised by (size, mtime, ctime, inode) in
+    // the cache dir: tokenising all ~47 MB of `.zig` in the Debug-built build
+    // runner took 8.4 s, and a step the local loop runs every time must not.
+    // The memo is pure cache -- deleting it costs one slow run, nothing else.
+    const memo_path = "ziglibs-fingerprint-files.tsv";
+    var memo = std.StringHashMap([32]u8).init(b.allocator);
+    if (b.cache_root.handle.readFileAlloc(io, memo_path, b.allocator, .limited(64 * 1024 * 1024))) |text| {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const tab = std.mem.lastIndexOfScalar(u8, line, '\t') orelse continue;
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, line[tab + 1 ..]) catch continue;
+            try memo.put(line[0..tab], digest);
+        }
+    } else |_| {}
+    var memo_out: std.Io.Writer.Allocating = .init(b.allocator);
+    defer memo_out.deinit();
+
+    // Own hash per module, in module_list order.
+    const own = try b.allocator.alloc([32]u8, module_list.len);
+    for (module_list, 0..) |m, i| {
+        var h = Sha256.init(.{});
+        h.update(m.name);
+        h.update(if (m.heavy) "\x00heavy" else "\x00light");
+        h.update(if (m.live) "\x00live" else "\x00-");
+        for (m.deps) |d| {
+            h.update("\x00d:");
+            h.update(d);
+        }
+        for (m.test_deps) |d| {
+            h.update("\x00t:");
+            h.update(d);
+        }
+
+        var dir = try b.build_root.handle.openDir(io, b.fmt("modules/{s}", .{m.name}), .{ .iterate = true });
+        defer dir.close(io);
+        var paths: std.ArrayList([]const u8) = .empty;
+        var walker = try dir.walk(b.allocator);
+        defer walker.deinit();
+        while (try walker.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.basename, ".md")) continue;
+            if (std.mem.eql(u8, entry.basename, "NOTICE") or std.mem.eql(u8, entry.basename, "LICENSE")) continue;
+            if (std.mem.indexOf(u8, entry.path, ".zig-cache") != null or std.mem.indexOf(u8, entry.path, "zig-out") != null) continue;
+            try paths.append(b.allocator, try b.allocator.dupe(u8, entry.path));
+        }
+        std.mem.sort([]const u8, paths.items, {}, struct {
+            fn lt(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.lt);
+        for (paths.items) |path| {
+            const st = try dir.statFile(io, path, .{});
+            const key = b.fmt("{s}/{s}\t{d}\t{d}\t{d}\t{d}", .{
+                m.name,               path,                 st.size,
+                st.mtime.nanoseconds, st.ctime.nanoseconds, st.inode,
+            });
+            const content: [32]u8 = memo.get(key) orelse blk: {
+                const src = try dir.readFileAlloc(io, path, b.allocator, .limited(512 * 1024 * 1024));
+                defer b.allocator.free(src);
+                var fh = Sha256.init(.{});
+                hashFileContent(&fh, b, path, src);
+                var d: [32]u8 = undefined;
+                fh.final(&d);
+                break :blk d;
+            };
+            try memo_out.writer.print("{s}\t{s}\n", .{ key, std.fmt.bytesToHex(content, .lower) });
+            h.update("\x00f:");
+            h.update(path);
+            h.update("\x00");
+            h.update(&content);
+        }
+        h.final(&own[i]);
+    }
+
+    var out: std.Io.Writer.Allocating = .init(b.allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    const seen = try b.allocator.alloc(bool, module_list.len);
+    const stack = try b.allocator.alloc(usize, module_list.len);
+    for (module_list, 0..) |m, i| {
+        // Closure by DFS with a visited set: `test_deps` may close a cycle,
+        // and a visited set makes that harmless. Folded in module_list order,
+        // so the result does not depend on the walk.
+        @memset(seen, false);
+        seen[i] = true;
+        var sp: usize = 0;
+        stack[sp] = i;
+        sp += 1;
+        while (sp > 0) {
+            sp -= 1;
+            const cur = module_list[stack[sp]];
+            for ([_][]const []const u8{ cur.deps, cur.test_deps }) |list| for (list) |d| {
+                const j = moduleIndex(d) orelse return step.fail("module-fingerprints: {s} names unknown dep {s}", .{ cur.name, d });
+                if (!seen[j]) {
+                    seen[j] = true;
+                    stack[sp] = j;
+                    sp += 1;
+                }
+            };
+        }
+        var h = Sha256.init(.{});
+        h.update(&machinery.peek());
+        for (seen, 0..) |in_closure, j| if (in_closure) h.update(&own[j]);
+        var digest: [32]u8 = undefined;
+        h.final(&digest);
+        try w.print("{s}\t{s}\n", .{ m.name, std.fmt.bytesToHex(digest[0..16], .lower) });
+    }
+
+    b.cache_root.handle.writeFile(io, .{ .sub_path = memo_path, .data = memo_out.written() }) catch {};
+
+    var buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &buf);
+    try stdout.interface.writeAll(out.written());
+    try stdout.interface.flush();
+}
+
+fn moduleIndex(name: []const u8) ?usize {
+    for (module_list, 0..) |m, i| if (std.mem.eql(u8, m.name, name)) return i;
+    return null;
+}
+
+/// `.zig` as tokens without comments, a shell script without its comment
+/// lines, anything else as bytes.
+fn hashFileContent(h: *std.crypto.hash.sha2.Sha256, b: *std.Build, path: []const u8, src: []const u8) void {
+    if (std.mem.endsWith(u8, path, ".zig")) {
+        const z = b.allocator.dupeZ(u8, src) catch @panic("OOM");
+        defer b.allocator.free(z);
+        hashZigTokens(h, z, null);
+    } else if (std.mem.endsWith(u8, path, ".sh") or std.mem.eql(u8, std.fs.path.basename(path), "capped")) {
+        var lines = std.mem.splitScalar(u8, src, '\n');
+        while (lines.next()) |line| {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (t.len == 0 or t[0] == '#') continue;
+            h.update(t);
+            h.update("\n");
+        }
+    } else {
+        h.update(src);
+    }
+}
+
+/// Every token except comments, each as tag + bytes. `//` comments are never
+/// tokens; `///` and `//!` are, and are dropped here. With `skip_decl`, the
+/// initializer of the top-level `const <skip_decl> = ...;` is dropped too
+/// (build.zig's `module_list`, whose entries are hashed per module instead).
+fn hashZigTokens(h: *std.crypto.hash.sha2.Sha256, src: [:0]const u8, skip_decl: ?[]const u8) void {
+    var tok = std.zig.Tokenizer.init(src);
+    var skipping = false;
+    var depth: usize = 0;
+    var prev_ident: []const u8 = "";
+    while (true) {
+        const t = tok.next();
+        if (t.tag == .eof) break;
+        if (t.tag == .doc_comment or t.tag == .container_doc_comment) continue;
+        const text = src[t.loc.start..t.loc.end];
+        if (skipping) {
+            switch (t.tag) {
+                .l_brace, .l_paren, .l_bracket => depth += 1,
+                .r_brace, .r_paren, .r_bracket => depth -|= 1,
+                .semicolon => if (depth == 0) {
+                    skipping = false;
+                },
+                else => {},
+            }
+            continue;
+        }
+        if (skip_decl) |name| {
+            if (t.tag == .equal and std.mem.eql(u8, prev_ident, name)) {
+                skipping = true;
+                depth = 0;
+                continue;
+            }
+        }
+        prev_ident = if (t.tag == .identifier) text else "";
+        h.update(@tagName(t.tag));
+        h.update("\x00");
+        h.update(text);
+        h.update("\x00");
+    }
+}
+
+/// `-Dmodule` membership: every module when the list is empty.
+fn inList(name: []const u8, list: []const []const u8) bool {
+    if (list.len == 0) return true;
+    for (list) |x| if (std.mem.eql(u8, x, name)) return true;
+    return false;
+}
+
+/// `-Dgroup` membership: every module when no group is given, else the ones
+/// whose primary lib (`libs[0]`) is listed.
+fn inGroups(m: Module, groups: []const []const u8) bool {
+    if (groups.len == 0) return true;
+    for (groups) |g| if (std.mem.eql(u8, m.libs[0], g)) return true;
+    return false;
+}
+
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
 /// to parse Zig source. One line per module:
 ///
-///     name<TAB>heavy|light<TAB>dep,dep,...
+///     name<TAB>heavy|light<TAB>dep,dep,...<TAB>live|-<TAB>ct|-<TAB>primary-lib
 ///
 /// The deps column is empty for a module with no siblings. Consumed by
 /// `scripts/test.sh` to map changed files onto the modules they affect,
@@ -1593,7 +1891,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
         // copies of these two module sets. `live` is declared in `module_list`;
         // `ct` is derived from the tree (the harness file is its own
         // declaration). Both were duplicated into scripts/ before this.
-        try w.print("\t{s}\t{s}\n", .{
+        try w.print("\t{s}\t{s}\t{s}\n", .{
             if (m.live) "live" else "-",
             if (blk: {
                 for (harnesses) |h| {
@@ -1601,6 +1899,10 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
                 }
                 break :blk false;
             }) "ct" else "-",
+            // Column 6: the primary lib, which is what `-Dgroup` selects on.
+            // Published so `scripts/test.sh` narrows its own module list by
+            // the same rule instead of keeping a second copy of it.
+            m.libs[0],
         });
     }
 

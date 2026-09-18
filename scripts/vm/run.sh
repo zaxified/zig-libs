@@ -611,11 +611,13 @@ if [[ $? -ne 0 ]]; then
     echo "$tsv" >&2
     exit 1
 fi
-while IFS=$'\t' read -r name _heavy deps; do
+# `|`, not the tab: consecutive tabs (an empty deps column) collapse under
+# IFS whitespace rules and shift the columns -- see graph_load in test.sh.
+while IFS='|' read -r name _heavy deps _rest; do
     [[ -z "$name" ]] && continue
     G_NAMES+=("$name")
     G_DEPS+=("$deps")
-done <<< "$tsv"
+done <<< "${tsv//$'\t'/|}"
 
 deps_of() {
     local target="$1" i

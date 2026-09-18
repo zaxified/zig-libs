@@ -29,3 +29,5 @@ example-apps/*/zig-pkg/
 # Python bytecode from scripts/*.py
 __pycache__/
 *.pyc
+.stamps.local.tsv
+.ci-stamps.tsv

@@ -13,7 +13,8 @@ tools that look disposable once the work that needed them landed, and are not.
 |------|------------|
 | `test.sh`, `test-lib.sh` | The test driver and its shared shell library. Everything below the next heading is about these. |
 | `test-tag.sh` | Self-test for `tag.sh`. Runs inside the driver, because a release tool whose refusal path is untested refuses nothing. |
-| `tag.sh` | Cuts a dated release tag, and re-runs every lane before it does. A tag asserts that every module passed every lane at that commit. |
+| `tag.sh` | Cuts a dated release tag, and only if CI already passed on HEAD — it runs no lane itself (since 2026-09-18); the tag push runs the full matrix, stamp-aware. A tag asserts that every module passed every lane at that commit. |
+| `ci-stamps.sh` | Fetches a CI lane's stamps (see *Stamps* below) from the newest trusted artifact of that lane: a run of this repository on `main` or a date tag, never a fork's pull request, whose artifact could otherwise skip tests. An artifact and not a cache entry because a cache entry is ref-scoped (a tag's writes are invisible to `main`) and is evicted after seven idle days. None found = every module runs. |
 | `hooks/` | The commit-time formatting hook and its own self-test. A hook that always exits 0 looks exactly like "nothing was ever unformatted". |
 | `capped` | Memory-capped process wrapper. ⛔ Run fuzzing through it and nothing else — an uncapped sweep has taken this host down. |
 | `modtest` | One module's lane (or one `zig test FILE` probe) with **producer and reader both inside the cap**, output to a file, byte-budgeted. Use it instead of `capped … \| tail` — see "The cap does not reach across a pipe". |
@@ -136,10 +137,11 @@ Changed files come from the working tree, the index and untracked files — or
 from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
 
 - `modules/<name>/**` → module `<name>`
-- `build.zig`, `build.zig.zon` → **ask the graph** (see below), not "all"
+- `build.zig`, `build.zig.zon` → nothing extra: both are in every
+  fingerprint, so the stamps already say what they re-keyed (see *Stamps*)
 - `.github/**` and any script the gate itself executes — `test.sh`,
   `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`,
-  `check-ci-cache-keys.sh`, `hooks/**` → **locally, a smoke set** plus a loud
+  `ci-stamps.sh`, `check-ci-cache-keys.sh`, `hooks/**` → **locally, a smoke set** plus a loud
   note that this is not the
   gate. The harness is the very thing that decides a narrower set, so it cannot
   vouch for its own narrowing; instead it runs one plain and one netns-wrapped
@@ -158,31 +160,35 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
   the index of the per-module changelogs, so editing it is exactly how it goes
   out of step with them)
 
-### Touching `build.zig` does not mean running everything
+### Which modules run: stamps (2026-09-18)
 
-Adding a module appends one row to `module_list` and cannot affect any existing
-module, so escalating to the full gate for it is the driver being
-wrong, not careful. The decision is made from the **module graph**, not from
-which file was saved: the last verified graph is kept at
-`.zig-cache/ziglibs-graph.tsv` and compared row by row.
+The diff above decides which repo-wide CHECKS run. Which MODULES run is decided
+by **stamps**: a module runs in a lane when it has no green stamp for that lane
+at its current fingerprint.
 
-| Graph delta | What runs |
-|---|---|
-| Rows only ADDED | just the new modules — adding `yaml` tests `yaml`, not everything |
-| A row altered (deps moved) | that module, plus its reverse-dep closure |
-| A row removed (module deleted) | nothing extra — either the dependent's own row also changed (covered above), or it now names a module that does not exist and `zig build module-graph` aborts, so no run happens at all |
-| Byte-identical | nothing extra |
-| No snapshot yet | everything — there is nothing to compare against |
+- **Fingerprint** — `zig build module-fingerprints`. A hash of the module's own
+  files (`.zig` as tokens without comments, so a comment or `zig fmt` changes
+  nothing; prose files excluded), its `module_list` entry, the machinery
+  (`build.zig` minus `module_list`, `build.zig.zon`, the driver scripts), Zig's
+  version, and the own hash of every module in its dependency closure. So a
+  change in `rsa` re-keys the 17 modules above it (`blindrsa`, `ssh`, `xmldsig`,
+  `saml`, …) without any reverse-dependency pass, and editing a comment re-keys
+  nothing. Per-file hashes are memoised in the cache dir (0.2 s warm, 8 s cold).
+- **Stamp** — `<module> TAB <lane> TAB <fingerprint> TAB <time>` in
+  `.stamps.local.tsv` (gitignored, deliberately NOT in `.zig-cache`, which gets
+  deleted by hand) or wherever `ZIGLIBS_STAMPS` points; CI carries each lane's
+  file as an artifact (`ci-stamps.sh`). The lane is the command, its zig
+  arguments minus the selecting ones (`-Dgroup`, `-Dmodule`) and the arch.
+  Written only when the whole command passed. `ZIGLIBS_IGNORE_STAMPS=1` runs
+  everything.
+- **Why not a diff against a base** — a diff forgets: push A breaks X, push B
+  touches Y, a diff from A tests only Y. A stamp for X was never written, so X
+  runs until it passes.
 
-The snapshot is written only after a run **succeeds**, so a failed run never
-promotes a graph to "known good". `build.zig` is still never parsed by this
-script; `zig build module-graph` remains the only authority.
-
-It then adds the **reverse-dependency closure**: every module that transitively
-depends on a changed one. This is the part that makes the shortcut safe —
-touching `rsa` selects 17 modules (`blindrsa`, `ssh`, `xmldsig`, `saml`, `jwe`,
-`iec62351`, `opcua`, `netconf`, `fleetsim`, …), not one. The graph comes from
-`zig build module-graph`, so `build.zig` stays its single source of truth.
+`changed`, `modules`, `examples` and `build` are stamp-aware; `all` runs
+everything and then stamps the `changed` lane for every module. `modules` and
+`examples` also take `-Dgroup=<lib>` (repeatable; the module's primary lib,
+`libs[0]`) — CI splits each lane into `crypto`, `net` and the rest with it.
 
 ## Network-namespace wrapping
 

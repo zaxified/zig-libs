@@ -646,10 +646,13 @@ nothing about a `ReleaseFast` one. What an integrator does with that is their ca
 
   The red branch is not theoretical. Tag `2026-08-18` was cut on three green local lanes and
   pushed; the matrix then failed on ReleaseFast amd64 and the tag was deleted rather than
-  argued with. That is the pipeline working, not a mishap — which is why `tag.sh`'s three
-  local lanes are a PRE-CHECK and not the authority. They are amd64-only, so the arm64 lane
-  that found x86 inline asm in `montint` on 2026-08-24 is not among them. What the tag
-  asserts is what the matrix ran.
+  argued with. That is the pipeline working, not a mishap — and it is why `tag.sh` runs no
+  lane of its own since 2026-09-18: the local lanes were amd64-only, repeated work the
+  matrix then did again, and were never the authority. `tag.sh` refuses unless CI already
+  passed on HEAD; what the tag asserts is what the matrix ran. The matrix is stamp-aware
+  (`scripts/README.md`, *Stamps*): a module whose fingerprint already has a green stamp
+  for a lane is not re-run in it, and each `modules`/`examples` lane is split into three
+  jobs by primary lib.
 
   Running the matrix over `main` by hand BEFORE asking for the tag (`workflow_dispatch`,
   lane `all`) is prudence, not policy: it costs one run and turns a withdrawal into a

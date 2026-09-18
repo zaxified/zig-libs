@@ -13,12 +13,13 @@
 #                            -> green: a Release is cut from this tag's message
 #                            -> red:   no Release, and the tag is WITHDRAWN
 #
-# So THESE THREE LANES ARE A PRE-CHECK, NOT THE AUTHORITY. They are amd64-only:
-# the arm64 lane that found x86 inline asm in `montint` on 2026-08-24 is not
-# among them, and neither is any lane this host cannot run. What the tag asserts
-# is what the MATRIX ran. Tag `2026-08-18` was cut on three green local lanes,
-# pushed, and deleted when the matrix went red on ReleaseFast amd64 -- that is
-# the pipeline working.
+# So the MATRIX IS THE AUTHORITY, and this script runs no lane of its own
+# (since 2026-09-18). It refuses unless CI already passed on this commit, which
+# costs a second; the local lanes it used to run first were amd64-only, repeated
+# work the matrix then did again, and could not see what the arm64 lane found in
+# `montint` on 2026-08-24. Tag `2026-08-18` was cut on three green local lanes,
+# pushed, and deleted when the matrix went red on ReleaseFast amd64 -- the
+# local pre-check was never what made a tag true.
 #
 # The Release is not cut from here: this script and CI both hold no
 # `contents: write`, on purpose. It is cut by hand from the tag's own message
@@ -32,7 +33,7 @@
 # 2.0"; they learn what they need from those modules' CHANGELOG entries. So the
 # tag carries the one fact it can carry honestly: a date, and a green gate.
 #
-#   usage: scripts/tag.sh [--dry-run] [--all-lanes] [YYYY-MM-DD]
+#   usage: scripts/tag.sh [--dry-run] [YYYY-MM-DD]
 #
 # With no date, today's. A second tag on the same day gets a `.1`, `.2`, … so
 # the name stays sortable and never collides.
@@ -41,15 +42,12 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-source scripts/test-lib.sh   # for _zl_cap_argv (memory cap); see the lane loop below
 
 dry_run=0
-all_lanes=0
 date_arg=""
 for a in "$@"; do
     case "$a" in
         --dry-run) dry_run=1 ;;
-        --all-lanes) all_lanes=1 ;;
         -h | --help)
             sed -n '2,20p' "$0"
             exit 0
@@ -100,118 +98,36 @@ echo
 # and left the fourth as 1509 bytes of nothing, so an hour of gate time
 # produced a refusal nobody could explain. Under `.zig-cache/` they sit next
 # to the build they describe and are already gitignored.
-LOG_DIR=".zig-cache/tag-logs"
-mkdir -p "$LOG_DIR"
-
-# ORDER IS DELIBERATE, and it is not about cache reuse — there is none to have.
-# `heavy_optimize` (build.zig) substitutes ReleaseSafe for Debug on the heavy
-# modules, which makes the DEFAULT lane's every (module, mode) pair a subset of
-# strict-debug's and ReleaseSafe's. Those three therefore share artifacts; the
-# three below share nothing at all, since each names one mode for every module.
-# No ordering can save a single compile between them.
+# ⭐ THE LANES RUN IN CI, NOT HERE (2026-09-18). This script used to run the
+# full gate locally in two optimize modes before cutting the tag, and the tag
+# push then ran the whole matrix again in CI -- the same work twice, the local
+# half amd64-only and so never the authority anyway. Now the one question asked
+# here is the one that can be answered in a second: did CI pass on THIS commit?
+# The tag push then runs every lane, and the stamps (scripts/test.sh) make it
+# re-test only what no green lane has already proven at its fingerprint.
 #
-# So the order optimises TIME TO FIRST FAILURE instead:
-#   ReleaseSafe  first — optimisations AND safety checks, the combination that
-#                        caught the only real defect of 2026-08-12 while Debug
-#                        and ReleaseFast both passed it by luck.
-#   ReleaseFast  next  — same optimisations, no checks.
-#   strict-debug last  — structurally the most expensive, since it is the one
-#                        lane that builds the heavy modules in real Debug.
-#
-# The default lane is absent on purpose: it has no (module, mode) pair the
-# other two do not already cover. Locally it is nearly free to add after them
-# — its artifacts are already built — but it proves nothing new, so it is not
-# worth the test-run time here.
-# Each entry is `<subcommand> <flags>`. Debug is COMPILE-ONLY, matching CI:
-# nothing consumes this collection in Debug, so what that lane can honestly
-# claim is that the code builds there — and running its tests was measured to
-# prove nothing ReleaseSafe does not, while skipping fifteen that its siblings
-# run. See `cmd_build` in scripts/test.sh.
-lanes=("all -Doptimize=ReleaseSafe" "all -Doptimize=ReleaseFast" "build -Dstrict-debug")
-failed=()
-for lane in "${lanes[@]}"; do
-    label="${lane:-default}"
-    log="$LOG_DIR/${label//[^a-zA-Z0-9]/_}.log"
-    printf 'tag.sh: lane %-24s ... ' "$label"
-    start=$(date +%s)
-    # Each lane runs INSIDE the memory cap, not beside it. A bare `test.sh all`
-    # left unbounded is what killed a desktop here on 2026-08-18: the kernel OOM
-    # killer picks its victim by size, and under an IDE that victim is the
-    # editor. Capping the lane means a runaway dies as one red lane (exit 137).
-    #
-    # ⛔ AND THE LANE MUST BE TOLD IT IS ALREADY IN A SCOPE, or it starts none
-    # of them. The comment here used to say `test.sh` "never calls
-    # `_zl_cap_argv`, so a bare `test.sh all` is unbounded". That stopped being
-    # true on 2026-08-22, when `test.sh` began re-execing its WHOLE run into a
-    # scope of its own (`scripts/test.sh`, the `_ZL_IN_RUN_SCOPE` block). Two
-    # scopes do not nest: `systemd-run --user --scope` names its unit
-    # `run-p<PID>-i<instance>.scope` from the client's PID, and inside the outer
-    # scope the inner client draws the name the outer unit already holds, so
-    # systemd refuses it -- `Failed to start transient scope unit: Unit
-    # run-p…​.scope was already loaded or has a fragment file`. The `exec` then
-    # fails, `test.sh` exits 1 having run NOTHING, and every lane here reads as
-    # red. Measured 2026-09-06: 5 attempts, 5 failures, 0 tests run. Reproduce
-    # the composition without a full gate run:
-    #
-    #   bash -c 'source scripts/test-lib.sh; _zl_cap_argv;
-    #            ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} bash scripts/test.sh --help'
-    #
-    # `scripts/test-tag.sh` cannot see this: it stubs `scripts/test.sh` with a
-    # plain script that re-execs nothing, so the stand-in lacks the very
-    # property that breaks the real one.
-    #
-    # Exporting `_ZL_IN_RUN_SCOPE` is the contract `test.sh` and `capped`
-    # already share for "you are inside the run scope already" -- it suppresses
-    # the inner re-exec and the per-step wrapper both. Set only when a scope was
-    # actually created, so a host without the cap (macOS, container, non-systemd)
-    # still lets `test.sh` make its own decision.
-    # ⚠ The guard is `${_ZL_CAP[*]+…}`, the same set-or-not idiom the call below
-    # already uses, and NOT `${#_ZL_CAP[@]}`: under `set -u` the latter aborts
-    # the shell when the array is unset, and it IS unset in `scripts/test-tag.sh`
-    # -- that harness copies only `tag.sh` into its throwaway repo, so the
-    # `source scripts/test-lib.sh` above fails there and `_zl_cap_argv` never
-    # defines it. Empty (no cap available) and unset (no test-lib) both mean the
-    # same thing here: no scope was made, so say nothing about one.
-    _zl_cap_argv
-    lane_env=()
-    [[ -n "${_ZL_CAP[*]+set}" ]] && lane_env=(env _ZL_IN_RUN_SCOPE=1)
-    if ${_ZL_CAP[@]+"${_ZL_CAP[@]}"} ${lane_env[@]+"${lane_env[@]}"} \
-        bash scripts/test.sh $lane >"$log" 2>&1; then
-        printf 'OK   %ss\n' "$(($(date +%s) - start))"
-    else
-        printf 'FAILED %ss\n' "$(($(date +%s) - start))"
-        failed+=("$label")
-        # The reason belongs HERE, not in a file the reader has to go find.
-        # A refusal you cannot explain is barely better than no refusal.
-        printf '\n  ── why %s failed (last 25 lines of %s) ──\n' "$label" "$log"
-        if [[ -s "$log" ]]; then
-            sed 's/^/  | /' <<<"$(tail -25 "$log")"
-        else
-            printf '  | (the lane wrote NO output — that is itself the finding:\n'
-            printf '  |  the gate died before it could say anything)\n'
-        fi
-        printf '\n'
-        # Stop at the first red lane unless asked otherwise. The 2026-08-12
-        # run spent 2053 s on ReleaseFast and 587 s on ReleaseSafe AFTER
-        # strict-debug had already failed — 44 minutes producing a verdict
-        # that was going to be discarded, because a red lane means fixing and
-        # re-running anyway.
-        if [[ $all_lanes -eq 0 ]]; then
-            printf 'tag.sh: stopping at the first red lane (--all-lanes to run them all)\n\n'
-            break
-        fi
-    fi
-done
-
-echo
-if [[ ${#failed[@]} -gt 0 ]]; then
-    echo "tag.sh: NOT tagging — ${#failed[@]} lane(s) red: ${failed[*]}" >&2
-    echo "Reasons are printed above; full logs in $LOG_DIR/." >&2
-    echo "A tag here would assert something untrue. Fix the lane, then run this again." >&2
-    exit 1
-fi
-
-echo "tag.sh: all ${#lanes[@]} lanes green at $head_sha"
+# `gh` is looked up on PATH, which is also how scripts/test-tag.sh replaces it.
+full_sha="$(git rev-parse HEAD)"
+verdict="$(gh run list --workflow ci.yml --branch main --event push --commit "$full_sha" \
+    --limit 1 --json status,conclusion --jq '.[0] | "\(.status) \(.conclusion)"' 2>/dev/null)" || verdict=""
+case "$verdict" in
+    "completed success")
+        echo "tag.sh: CI passed on $head_sha"
+        ;;
+    "" | "null null")
+        echo "tag.sh: NOT tagging — no CI run on main for $head_sha." >&2
+        echo "Push it and let CI finish; the tag asserts what CI proved, not what was hoped." >&2
+        exit 1
+        ;;
+    completed\ *)
+        echo "tag.sh: NOT tagging — CI on $head_sha concluded '${verdict#completed }'." >&2
+        exit 1
+        ;;
+    *)
+        echo "tag.sh: NOT tagging — CI on $head_sha is still '${verdict%% *}'. Wait for it." >&2
+        exit 1
+        ;;
+esac
 if [[ $dry_run -eq 1 ]]; then
     echo "tag.sh: --dry-run, so no tag was created (would have been '$tag')"
     exit 0
@@ -302,8 +218,10 @@ fi
 
 git tag -a "$tag" -m "$tag
 
-$range_line Every module passed every release lane: ReleaseSafe and
-ReleaseFast, and compiled in strict Debug. That is the whole claim — this
+$range_line Every module passed every CI lane at this commit (ReleaseSafe
+and ReleaseFast on amd64, ReleaseSafe on arm64, examples, strict-Debug
+compile) -- directly, or by a green stamp for its unchanged fingerprint.
+A red matrix on this tag withdraws it. That is the whole claim — this
 is a dated snapshot of the collection, not a semantic version. Per-module
 changes are in each module's CHANGELOG; see CONVENTIONS §8.
 

@@ -69,6 +69,9 @@ on:
 # vercel-labs/native's Zig CI, which declares the same.
 permissions:
   contents: read
+  # Read-only, for one query: the `scoped` job asks which commit the last
+  # GREEN run on main tested, and diffs from there (see "Test changed modules").
+  actions: read
 
 # One run per ref, and the superseded one is cancelled. Re-cutting a tag
 # happened four times on 2026-08-15 alone, and each time the previous matrix
@@ -127,12 +130,13 @@ concurrency:
 #
 # TWO SHAPES, and the split is the point. (Three EVENTS now reach them.)
 #
-#   pull_request        -> `test.sh changed`, one lane. Tests the modules the
-#                          branch touched plus their reverse-dependency
-#                          closure, computed from `zig build module-graph`.
-#   push to main        -> the same scoped lane, against the previous head.
-#   tag                 -> `test.sh all`, every optimize lane and both
-#                          architectures.
+#   pull_request        -> `test.sh changed`, one lane. Tests every module
+#                          with no green stamp at its current fingerprint.
+#   push to main        -> the same scoped lane; its repo-wide checks diff
+#                          against the last GREEN push, not the previous one.
+#   tag                 -> every optimize lane and both architectures, each
+#                          `modules`/`examples` lane split into three jobs by
+#                          primary lib, each stamp-aware.
 #   workflow_dispatch   -> the SAME full shape, over any branch, and optionally
 #                          narrowed to one lane. It claims nothing about the
 #                          commit; it exists so that reproducing a red lane no
@@ -145,13 +149,13 @@ concurrency:
 # should not cost six runner-hours to say so. The scoped lane still gates every
 # push, and it is minutes.
 #
-# WHY SCOPING IS SOUND, rather than merely cheaper. The driver decides the
-# escalation from the GRAPH, not from which file was edited: it keeps a
-# snapshot of the last known-good `module-graph` and, if any row is missing or
-# altered — a module changed shape or vanished — the reverse-dep closure can no
-# longer be trusted and it runs everything. With no snapshot at all it also
-# runs everything. Both failure directions are fail-closed, which is what makes
-# this safe to put in front of merges.
+# WHY SCOPING IS SOUND, rather than merely cheaper (rewritten 2026-09-18). A
+# module is skipped only when a green stamp exists for this lane at its
+# current fingerprint, and the fingerprint folds in the module's code, its
+# declaration, the machinery that runs it and every module in its dependency
+# closure (`zig build module-fingerprints`). Anything that could change the
+# answer changes the key. No stamps at all -- a first run, an expired artifact
+# -- means every module runs. Both failure directions are fail-closed.
 #
 # The shape of the win, measured on the real graph 2026-08-12: the closure is a
 # MEDIAN OF ONE MODULE, because most modules have no in-repo consumer at all. It
@@ -330,9 +334,21 @@ jobs:
           [ -n "$cpu" ] || cpu="$(grep -m1 'CPU part' /proc/cpuinfo 2>/dev/null | cut -d: -f2- | xargs)"
           echo "cpu:        ${cpu:-unknown}"
           echo "zig target: $(zig env 2>/dev/null | grep -m1 '\.target' | cut -d'"' -f2 || echo unknown)"
+      # ⭐ STAMPS (2026-09-18): which modules this lane has already proven at
+      # their current fingerprint, carried between runs as an artifact -- see
+      # scripts/ci-stamps.sh for why an artifact and whose artifacts count.
+      # None found = every module runs.
+      - name: Fetch this lane's stamps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/stamps"
+          bash scripts/ci-stamps.sh fetch stamps-scoped-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test changed modules
         env:
           ZIGLIBS_LANE: changed modules + reverse-dep closure
+          ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Same as the `full` job: the imap peer is found at its default path,
           # the opcua one is named by an environment variable.
@@ -340,9 +356,34 @@ jobs:
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             base="origin/${{ github.base_ref }}"
           else
-            base="${{ github.event.before }}"
+            # ⭐ FROM THE LAST GREEN PUSH, NOT FROM THE PREVIOUS ONE (2026-09-18).
+            # `github.event.before` is the previous push, green or not: push A
+            # breaks X and goes red, push B touches only Y, B tests only Y and
+            # goes green with X still broken. Diffing from the last commit whose
+            # run PASSED covers every commit since, A's included. Same idea as
+            # `nrwl/nx-set-shas`. If the lookup fails, the old base is used and
+            # the log says so; a base that does not resolve (history rewritten)
+            # still escalates to the full gate inside `test.sh changed`.
+            base=$(gh run list --repo "${{ github.repository }}" --workflow ci.yml \
+              --branch main --event push --status success --limit 1 \
+              --json headSha --jq '.[0].headSha' 2>/dev/null || true)
+            if [ -z "$base" ]; then
+              echo "::warning::no green push run on main found -- falling back to the previous push"
+              base="${{ github.event.before }}"
+            fi
+            echo "base: $base (last green push on main)"
           fi
           bash scripts/test.sh changed "$base"
+      # Only a green run gets here, and only a push, tag or dispatch shares
+      # what it proved; a pull request's stamps would be discarded by the
+      # fetch anyway, so it does not upload them.
+      - name: Keep this lane's stamps
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: stamps-scoped-${{ runner.arch }}
+          path: ${{ runner.temp }}/stamps/stamps.tsv
+          if-no-files-found: ignore
 
   # ⭐ THE LANE TABLE LIVES IN A JOB NOW, not in `strategy.matrix.include`, and
   # `workflow_dispatch`'s `lane` input is why. A job-level `if:` cannot see the
@@ -413,8 +454,29 @@ jobs:
           # the tables, the catalog, `check-portable` (which cross-compiles from
           # wherever it runs), the ctgrind harnesses, the sizeprobe.
           lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":15,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"modules","cachekey":"mod-relfast","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
+          # ⭐ SHARDED BY PRIMARY LIB, added 2026-09-18. Each `modules` lane
+          # and each amd64 `examples` lane is three jobs: `crypto`, `net`, and
+          # the other four libs together (75 / 74 / 81 modules). `-Dgroup`
+          # narrows `zig build`, `check-pubfn-reach`, `check-examples` and
+          # test.sh's module list by `libs[0]` (build.zig, `lane_modules`).
+          # Why: compiling is the lane. On the 2026-09-02 tag `build (all
+          # modules)` was 2428 s of the 48-minute ReleaseSafe amd64 lane and
+          # the tests 213 s, and the A1 campaign has grown both since, against
+          # a 90-minute cap. Dependencies in another group are compiled again
+          # in each shard that needs them; that is cheap next to the split.
+          #
+          # ⚠ THE SHARDS OF ONE LANE MUST COVER EVERY MODULE. "Choose the
+          # lanes" below checks that per `base`, against module-graph, so a new
+          # primary lib fails this job instead of going untested.
+          #
+          # ⚠ `tc` is true on the `net` shard only: tc is a `net` module and
+          # the root step tests just it, so the other shards would repeat it.
+          lanes+=('{"name":"modules ReleaseSafe amd64 [crypto]","base":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64 [net]","base":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64 [rest]","base":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64 [crypto]","base":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=crypto","cmd":"modules","cachekey":"mod-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64 [net]","base":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=net","cmd":"modules","cachekey":"mod-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64 [rest]","base":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
           # ONE arm64 pair, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions,
           # atomics, and the asm-vs-fallback dispatch -- and none of that varies
@@ -436,7 +498,9 @@ jobs:
           # its own tests on that host anyway. "Our client interoperates with
           # open62541" is not an architecture-dependent claim, and amd64 makes
           # it in a minute. The skip prints a line every time it happens.
-          lanes+=('{"name":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"modules","cachekey":"mod-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [crypto]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [net]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":true,"timeout":90,"skip_live":"opcua"}')
+          lanes+=('{"name":"modules ReleaseSafe arm64 [rest]","base":"modules ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":90,"skip_live":"opcua"}')
           # ⚠ `build`, NOT `modules` — this lane COMPILES every module and every
           # example in real Debug and RUNS NOTHING, and that is the whole claim
           # it can support. Nobody consumes this collection in Debug: it ships
@@ -492,9 +556,13 @@ jobs:
           # rather than a defect. That is survivable only because the lanes are
           # split: a cold `modules` lane is ~50 minutes against a 90-minute cap,
           # where the unsplit lane cleared it by 23 seconds.
-          lanes+=('{"name":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast","cmd":"examples","cachekey":"ex-relfast","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64 [crypto]","base":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"examples","cachekey":"ex-relsafe-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64 [net]","base":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"examples","cachekey":"ex-relsafe-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64 [rest]","base":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relsafe-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64 [crypto]","base":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=crypto","cmd":"examples","cachekey":"ex-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64 [net]","base":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=net","cmd":"examples","cachekey":"ex-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64 [rest]","base":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe-all","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           # ⭐ THE ONE LANE THAT RE-TAKES THE ANCHORS, added 2026-09-06 —
           # and until it existed, NOTHING anywhere ran `zig build interop-<m>`.
           # The migration that day moved six interop programs out of the modules
@@ -564,8 +632,21 @@ jobs:
           # 30 minutes is the "this is stuck" line, not the expected cost.
           lanes+=('{"name":"ctgrind amd64","args":"","cmd":"ctgrind","cachekey":"ctgrind","cache":false,"runner":"ubuntu-26.04","peers":"ctgrind","tc":false,"timeout":30,"skip_live":""}')
 
+          # Every shard set must cover the whole collection: per `base`, the
+          # union of its `-Dgroup=` values must equal every primary lib in
+          # module-graph (column 6). Lanes without `base` are not sharded.
+          all_groups=$(zig build module-graph | cut -f6 | sort -u | paste -sd' ')
+          while IFS= read -r base; do
+            have=$(printf '%s\n' "${lanes[@]}" | jq -r --arg b "$base" 'select(.base == $b) | .args' |
+              grep -oE -- '-Dgroup=[^ ]+' | sed 's/-Dgroup=//' | sort -u | paste -sd' ')
+            if [ "$have" != "$all_groups" ]; then
+              echo "::error::shards of '$base' cover groups [$have], module-graph has [$all_groups]"
+              exit 1
+            fi
+          done < <(printf '%s\n' "${lanes[@]}" | jq -r 'select(.base != null) | .base' | sort -u)
+          # A dispatch may name a whole lane (`base`, every shard) or one shard.
           sel=$(printf '%s\n' "${lanes[@]}" | jq -s -c --arg want "$WANT" \
-            '[ .[] | select($want == "all" or .name == $want) ]')
+            '[ .[] | select($want == "all" or .name == $want or .base == $want) ]')
           n=$(printf '%s' "$sel" | jq 'length')
           # An input matching nothing must not read as "nothing to do". The
           # `choice` type makes a typo unlikely from the UI, but the API accepts
@@ -743,8 +824,19 @@ jobs:
         # that both jobs run cannot.
         continue-on-error: true
         run: bash scripts/ci-environment.sh ${{ matrix.peers }}
+      # ⭐ STAMPS (2026-09-18): which modules this lane has already proven at
+      # their current fingerprint, carried between runs as an artifact -- see
+      # scripts/ci-stamps.sh for why an artifact and whose artifacts count.
+      # None found = every module runs.
+      - name: Fetch this lane's stamps
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/stamps"
+          bash scripts/ci-stamps.sh fetch stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test (${{ matrix.name }})
         env:
+          ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
           # Names this lane's block on the run's summary page, where the lane
           # digests land side by side instead of in separate downloadable logs.
           ZIGLIBS_LANE: ${{ matrix.name }}
@@ -824,6 +916,17 @@ jobs:
           sudo unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
             --summary all \
             --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root
+      # After the root `tc` step, so a lane whose tc root tests fail keeps
+      # nothing. Only a green run gets here, and only a push, tag or dispatch shares
+      # what it proved; a pull request's stamps would be discarded by the
+      # fetch anyway, so it does not upload them.
+      - name: Keep this lane's stamps
+        if: success() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: stamps-full-${{ matrix.cachekey }}-${{ runner.arch }}
+          path: ${{ runner.temp }}/stamps/stamps.tsv
+          if-no-files-found: ignore
       - name: Report the cache footprint and what this runner is
         # The number the cache decision has never had. Whether five lanes fit
         # under a 10 GB repository quota is arithmetic, and until this line
