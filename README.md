@@ -156,8 +156,8 @@ never compiled.
 ## Build
 
 ```
-scripts/test.sh          # the gate — tests what changed, escalates on its own
-scripts/test.sh all      # every module; what CI and the pre-commit hook run
+scripts/test.sh          # the gate — every module not yet proven at its current content
+scripts/test.sh all      # every check and every module, ignoring what is proven
 zig build test           # run all module tests
 zig build test-<name>    # run one module's tests
 zig build check-catalog  # verify build.zig's module_list ↔ modules/ ↔ this README agree

@@ -10,7 +10,7 @@
 #
 # WHY THIS EXISTS. Formatting is gated in three places already — `scripts/
 # test.sh all` fmt-checks the whole tree, `scripts/test.sh changed` fmt-checks
-# the changed files, and CI runs `test.sh all` across four optimize matrices.
+# the changed files, and CI runs the `checks` lane on every tag.
 # None of them runs at COMMIT time, so all three are gates you have to remember
 # to reach. `a23a933` ("rdap, taproot: restore zig fmt compliance") is what that
 # costs: drift reached committed code in a repo that had a format gate the

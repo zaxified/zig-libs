@@ -844,8 +844,8 @@ jobs:
           key: zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-
-      # scripts/test.sh all runs the format check, the hook self-test, the
-      # catalog/provenance gates and every module, and wraps the
+      # scripts/test.sh runs the lane's command over its shard -- every module
+      # without a green stamp for this lane, checks included -- and wraps the
       # netlink-writing modules in `unshare -rn` where the runner allows it —
       # otherwise those tests skip rather than fight the runner's own network
       # state. It also prints a capability report naming anything the runner

@@ -160,17 +160,6 @@ _zl_cap_argv() {
         -p "MemoryMax=$max" -p MemorySwapMax=0 --)
 }
 
-# section "changed"  ->  "\nchanged ────────────────────────────────────"
-section() {
-    local title="$1"
-    local head="$title "
-    local pad=$(( _ZL_LINE_W - ${#head} ))
-    (( pad < 3 )) && pad=3
-    echo
-    printf '%s' "$head"
-    printf '─%.0s' $(seq 1 $pad)
-    echo
-}
 
 # step "label" cmd args...
 # Runs cmd, capturing stdout and stderr SEPARATELY. On success with empty

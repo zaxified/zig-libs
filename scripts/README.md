@@ -51,13 +51,13 @@ tools that look disposable once the work that needed them landed, and are not.
 
 | When | Command | What it does |
 |------|---------|--------------|
-| **While working** | `scripts/test.sh` | Tests only what your change can affect |
-| **Before committing** | `scripts/test.sh all` | Every module — **most** of what CI runs; see the gap below |
-| Reproducing a CI lane | `scripts/test.sh all -Dstrict-debug` / `-Doptimize=ReleaseFast` | Trailing args pass through to `zig build` |
+| **While working, and before committing** | `scripts/test.sh` | Every module with no green stamp at its current fingerprint, plus the checks the change can affect (see *Stamps*). Seconds when little moved |
+| Everything, ignoring stamps | `scripts/test.sh all` | Every check and every module; stamps the `changed` lane for all of them |
+| Reproducing a CI lane | `scripts/test.sh modules -Doptimize=ReleaseFast -Dgroup=net` | The lane's own command and shard (see ci.yml); trailing args pass through to `zig build`. `ZIGLIBS_IGNORE_STAMPS=1` to run it regardless |
 | Investigating slowness | `scripts/test.sh time` | Serial per-module duration table |
 | Before cutting a tag | `scripts/test.sh interop` | Re-takes the six interop anchors against REAL peers — see below. Needs `scripts/ci-environment.sh interop`; ~35 s warm |
 
-### ⚠ `test.sh all` is NOT the whole of CI
+### ⚠ `test.sh` is NOT the whole of CI
 
 This table said "the same gate CI runs" until 2026-09-09, and it was not true.
 CI additionally runs a `consumer` job that `test.sh` never calls at all:

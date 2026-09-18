@@ -161,23 +161,20 @@ cd "$REPO_ROOT"
 
 G_NAMES=()
 G_HEAVY=()
-G_DEPS=()
 G_GROUP=()
-G_TSV=""
 
-# Populates G_NAMES/G_HEAVY/G_DEPS from `zig build module-graph`. Never
+# Populates G_NAMES/G_HEAVY/G_GROUP from `zig build module-graph`. Never
 # silently proceeds with an empty/partial graph — a build failure here
 # would otherwise look identical to "nothing changed", the exact silent
 # no-op class of bug this driver must not have.
 graph_load() {
-    G_NAMES=(); G_HEAVY=(); G_DEPS=(); G_GROUP=()
+    G_NAMES=(); G_HEAVY=(); G_GROUP=()
     local tsv
     if ! tsv="$(zig build module-graph 2>&1)"; then
         echo "test.sh: 'zig build module-graph' failed — refusing to guess the module set:" >&2
         echo "$tsv" >&2
         exit 1
     fi
-    G_TSV="$tsv"
     local name heavy deps live ct group _rest
     # ⚠ Split on `|`, not on the tab. A tab is IFS WHITESPACE to bash, so two in
     # a row -- the empty deps column of every module with no siblings -- collapse
@@ -188,7 +185,6 @@ graph_load() {
         [[ -z "$name" ]] && continue
         G_NAMES+=("$name")
         G_HEAVY+=("$heavy")
-        G_DEPS+=("$deps")
         G_GROUP+=("$group")
     done <<< "${tsv//$'\t'/|}"
     if [[ ${#G_NAMES[@]} -eq 0 ]]; then
@@ -357,113 +353,7 @@ harness_smoke() {
     echo "changed: the harness or a CI lane definition changed -- running every check and"
     echo "  a smoke set ($plain, $netns) that exercises the driver end to end; the modules"
     echo "  with no green stamp follow."
-    stamps_narrow "$(lane_modules)" "$(lane_modules)"   # just the lane's own -Dgroup/-Dmodule
-    step "fmt check" zig fmt --check build.zig build.zig.zon modules
-    # The commit-time formatting hook is only as good as the last edit to it; a
-    # hook that always exits 0 looks exactly like "nothing was ever unformatted".
-    # ~0.2 s in a throwaway repo. See scripts/hooks/test-pre-commit.sh.
-    step "hook self-test" ./scripts/hooks/test-pre-commit.sh
-    step "tag.sh self-test" ./scripts/test-tag.sh
-    step "check-ci-cache-keys" ./scripts/check-ci-cache-keys.sh
-    step "check-scripts-doc" zig build check-scripts-doc
-    step "check-package" zig build check-package
-    step "check-catalog" zig build check-catalog
-
-    # The root NOTICE stopped listing modules on 2026-09-06: a module's
-    # third-party obligation is discharged in the module's own NOTICE, and the
-    # root file answers one question only -- is the library as a whole still
-    # plain MIT. This is what makes that answer checkable. It refuses a shipped
-    # file that GRANTS ITSELF under a copyleft licence (an SPDX expression
-    # naming GPL/AGPL/LGPL/EUPL/CeCILL/SSPL/OSL, or an FSF grant paragraph),
-    # which is why `ebpf`'s `_license = "GPL"` -- a BPF verifier ABI value, not
-    # a copyright notice -- does not trip it. Copyleft in shipped code is a
-    # defect to be removed, not a paperwork item.
-    step "check-copyleft" zig build check-copyleft
-
-    # The teeth on the owner's rule of 2026-09-06 -- a module is standalone Zig
-    # with no external dependency, and an anchor against a foreign
-    # implementation is an EXTERNAL test that belongs in `modules/<m>/tools/`.
-    # Six modules were separated from their interop programs that day; nothing
-    # stopped the seventh being written the old way tomorrow. It refuses a file
-    # under `modules/<m>/src/` that starts a child process AND either names a
-    # foreign toolchain (`cc`, `python3`, `node`, `make`, ...) or `@embedFile`s
-    # foreign SOURCE. The spawn is the condition, which is why json5's six `.js`
-    # fixtures, ebpf's `.bpf.c` provenance and qr's `reference.py` -- none of
-    # which anything in their own file can run -- do not trip it. ~1.4 s, the
-    # same order as check-copyleft beside it.
-    step "check-module-purity" zig build check-module-purity
-    step "check-uapi" zig build check-uapi
-    step "check-changelog" zig build check-changelog
-
-    # `check-changelog` above proves the file EXISTS and is well formed; it reads
-    # the tree, never a diff, so it cannot see that a module's parser was
-    # rewritten while its changelog last moved six weeks ago. This one reads the
-    # diff. Replayed over the last 120 commits it found public declarations that
-    # reached no changelog at any later point either -- `http.setHeaderStatic`,
-    # `cors.applyPreflight`, `ssh.max_packets_per_direction`. The `changed` lane
-    # instance is the one CI reaches with a real base ref; the other two are
-    # no-ops on a clean checkout.
-    step "check-changelog-entry" ./scripts/check-changelog-entry.py ${base_ref:+"$base_ref"}
-    step "check-testonly" zig build check-testonly
-    step "check-ctgrind" zig build check-ctgrind
-    step "check-fuzz" zig build check-fuzz
-    step "check-global-alloc" zig build check-global-alloc
-    step "check-portable" zig build check-portable
-    step "check-portable-table" zig build check-portable-table
-    step "check-libs-table" zig build check-libs-table
-    step "check-catalog-table" zig build check-catalog-table
-    # The class no other gate can see: Zig analyses a function body only when
-    # something references it, so a `pub fn` no test reaches can be outright
-    # non-compiling and still ship green. Measured 2026-08-21: 403 of 9626
-    # public functions are unreachable from any test, across 106 modules, 90 of
-    # them on a module's own published `root.zig` surface. Demonstrated by
-    # mutation the same day -- a deliberate type error in an unreachable
-    # `nftables` function compiled, linked and ran green under `test-nftables`,
-    # and only this step went red on it.
-    step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
-    # The one class no test here can cover: is the PUBLISHED API sufficient to
-    # do the job? Every test lives in the file it tests, so it reads private
-    # declarations and its build carries `test_deps` a consumer never gets.
-    # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
-    # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
-    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
-    # ~30s when modules/http/src/Client.zig (or anything it pulls in) changed
-    # content, near-instant otherwise (Zig's own cache). See the script's
-    # header for what it checks and why one target, not two.
-    step "check-http-sizeprobe" ./scripts/check-http-sizeprobe.sh
-    # falcon's constant-time property is invisible to every value test (the
-    # integer emulation is bit-identical to hardware FP), and falcon is not on
-    # the ctgrind gate. This disassembly check is the only thing that fails when
-    # the emulation is bypassed. See the script header.
-    step "check-fp-freedom" ./scripts/check-fp-freedom.sh
-    step "check-ct-compare" ./scripts/check-ct-compare.py
-    step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
-
-    # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its
-    # input. A `Smith` ranged draw returns the range MINIMUM unless the eight
-    # bytes it reads as a little-endian u64 already lie inside the range, so a
-    # harness that opens with one -- or that slices its drawn bytes to a length
-    # that came from one -- replays every corpus seed, and every crash `--fuzz`
-    # minimises into a seed, as the same fixed input. 416 of 474 targets did at
-    # landing. `--advisory` printed that burn-down without failing anything --
-    # but a gate that never fails protects nothing, and the burn-down is being
-    # done a module at a time over many sessions, so a module fixed in week one
-    # could regress in week three with no signal at all. `--ratchet` compares
-    # against `scripts/fuzz-reach-baseline.txt`, a ceiling PER MODULE: it fails
-    # only where a module got worse, names the modules that have improved since
-    # the file was written, and comes off entirely when the baseline is empty.
-    # The ceiling is per module rather than one total on purpose -- a total lets
-    # one module regress while another improves and still reads green.
-    # It still FAILS on a malformed or stale exemption.
-    step "check-fuzz-reach" ./scripts/check-fuzz-reach.py --ratchet
-
-    # `run-examples` builds and runs each example in the LANE's optimize mode,
-    # so in a ReleaseFast lane every `std.debug.assert` in one is compiled out
-    # and the example prints its success lines having checked nothing. Three
-    # examples compared against an external oracle that way and printed that it
-    # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
-    # exiting 0 and still claiming a byte-exact match.
-    step "check-example-assert" ./scripts/check-example-assert.py
+    phase_all_checks
     run_modules "$plain $netns"
 }
 
@@ -1939,15 +1829,9 @@ cmd_build() {
 
 GATE_BUILD_ONLY=0
 
-cmd_all() {
-    set_extra_args "$@"
-    capability_check
-    graph_load
-    local all_mods
-    all_mods="$(lane_modules)"
-    local n
-    n=$(wc -w <<< "$all_mods")
-    echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — the pre-commit/CI gate"
+# Every check the collection has, in gate order. `all` and the harness smoke
+# set run exactly this; they used to carry two hand-kept copies of it.
+phase_all_checks() {
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     # `af6a148` is why the fmt step is first and why the hook exists: six files
     # had drifted out of fmt, the gate stops on the first failure, and so NO
@@ -1963,7 +1847,9 @@ cmd_all() {
     # mutation the same day -- a deliberate type error in an unreachable
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
-    stamps_narrow "$all_mods" "$all_mods"   # just the lane's own -Dgroup/-Dmodule
+    local lane_mods
+    lane_mods="$(lane_modules)"
+    stamps_narrow "$lane_mods" "$lane_mods"   # just the lane's own -Dgroup/-Dmodule
     step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     # The one class no test here can cover: is the PUBLISHED API sufficient to
     # do the job? Every test lives in the file it tests, so it reads private
@@ -1978,6 +1864,18 @@ cmd_all() {
     # in the lane that does nothing else: the compile-only lane's whole
     # deliverable is "the modules and the examples build in this mode".
     step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
+}
+
+cmd_all() {
+    set_extra_args "$@"
+    capability_check
+    graph_load
+    local all_mods
+    all_mods="$(lane_modules)"
+    local n
+    n=$(wc -w <<< "$all_mods")
+    echo "all: running every module ($n total, $(printf '%s\n' "${G_HEAVY[@]}" | grep -c heavy) heavy) — ignoring stamps, and then stamping the \`changed\` lane"
+    phase_all_checks
     # ⚠ `run-examples` USED TO BE HERE, and being here made the compile-only
     # lane a liar. It announces "COMPILING every module and running NO tests"
     # and then executed 216 example binaries — which is also why CI skips that
