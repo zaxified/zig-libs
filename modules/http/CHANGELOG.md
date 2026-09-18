@@ -5,6 +5,33 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — ⛔ **F14's per-connection arena pool is REVERTED.** `h2_server.serveJob`
+  builds an arena per request again, as it did before 2026-09-15. No API or wire change;
+  `Session` loses `spare_arenas`/`spare_arena_count`/`reuse_arenas`, and the F14 bench and its
+  tests go with them.
+  - **What it cost the only real consumer.** Measured 2026-09-18 on qap's h2 saturation lane
+    (480 B body over TLS, 256 connections, two samples per arm, product tree held constant and
+    only the pool toggled): **+11.8 KiB of resident memory per connection** and **2.3× the
+    memory still held three seconds after every connection closed** (2 304 → ~5 200 KiB).
+    Throughput: no difference outside run-to-run spread, and the arm with the pool OFF was the
+    faster of the two samples.
+  - **What it bought, restated from the entry below.** 7 → 4 allocations per request, worth
+    16.5× behind `DebugAllocator(.{})` and **within noise behind `smp_allocator`** — the
+    original entry says so itself. `std.testing.allocator` IS a `DebugAllocator`, and
+    `example-apps/http-service` constructs one as a leak assertion, so the beneficiaries were
+    this repository's own test suite and demo apps. No deployed configuration reaches the fast
+    row: a service built in ReleaseFast gets `smp_allocator` from `std/start.zig`.
+  - **Why that is not a trade worth making.** A gate exists to test the product; it does not
+    get to shape it. Carrying a pool in shipped code because the test loop runs under a
+    debugging allocator charges every consumer for the convenience of this repository's own
+    gate — and the charge was never measured before it was made (the 2026-09-15 entry has
+    ns/req and no bytes). If the gate is slow, that is the gate's problem to solve in the gate.
+  - ⚠ **Before reinstating this, measure the memory cost against a real consumer first.** The
+    finding it came from stated no problem it solved: no gate timeout, no false failure, no
+    user report — only that h2 cost more CPU per request than h1 in an in-memory benchmark with
+    no syscalls and a debugging allocator underneath. The one full-gate timeout in that period
+    is recorded as a test-scaffolding defect, explicitly "not the client and not F14".
+
 - **2026-09-15** — A1 fix campaign, G13. Behavioural fix, no API change: the rest of the
   local file-system calls around a transfer reported a cancelation as a file-system
   failure, the same collapse G12 fixed for `putFile`'s file read. `putFile`/`putFilePlain`
