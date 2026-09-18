@@ -1750,12 +1750,18 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
     var out: std.Io.Writer.Allocating = .init(b.allocator);
     defer out.deinit();
     const w = &out.writer;
+    const by_name = try b.allocator.alloc(usize, module_list.len);
+    for (by_name, 0..) |*k, i| k.* = i;
+    std.mem.sort(usize, by_name, {}, struct {
+        fn lt(_: void, x: usize, y: usize) bool {
+            return std.mem.lessThan(u8, module_list[x].name, module_list[y].name);
+        }
+    }.lt);
     const seen = try b.allocator.alloc(bool, module_list.len);
     const stack = try b.allocator.alloc(usize, module_list.len);
     for (module_list, 0..) |m, i| {
         // Closure by DFS with a visited set: `test_deps` may close a cycle,
-        // and a visited set makes that harmless. Folded in module_list order,
-        // so the result does not depend on the walk.
+        // and a visited set makes that harmless.
         @memset(seen, false);
         seen[i] = true;
         var sp: usize = 0;
@@ -1773,9 +1779,12 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
                 }
             };
         }
+        // Folded in NAME order, not module_list order: moving a row in the
+        // table (it is reviewed as a list, and rows get regrouped) must not
+        // re-key anything. Measured before this: swapping two rows re-keyed 47.
         var h = Sha256.init(.{});
         h.update(&machinery.peek());
-        for (seen, 0..) |in_closure, j| if (in_closure) h.update(&own[j]);
+        for (by_name) |j| if (seen[j]) h.update(&own[j]);
         var digest: [32]u8 = undefined;
         h.final(&digest);
         try w.print("{s}\t{s}\n", .{ m.name, std.fmt.bytesToHex(digest[0..16], .lower) });
