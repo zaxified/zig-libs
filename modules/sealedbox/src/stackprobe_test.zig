@@ -92,7 +92,9 @@ test "STACKPROBE (A1 L4): wipe's zeroing survives the optimiser on a buffer noth
         holdThenWipe();
         wiped += scan(&secret);
     }
-    std.debug.print("\n=== STACKPROBE sealedbox L4 ({t}): NEG={d} POS(not wiped)={d} wiped={d}/5 ===\n", .{ builtin.mode, neg, pos, wiped });
+    // Printed only when an assertion below fails: the lane treats stderr from
+    // a passing test as a FAIL (scripts/lib/test-lib.sh).
+    errdefer std.debug.print("\n=== STACKPROBE sealedbox L4 ({t}): NEG={d} POS(not wiped)={d} wiped={d}/5 ===\n", .{ builtin.mode, neg, pos, wiped });
 
     try std.testing.expectEqual(@as(usize, 0), neg);
     try std.testing.expect(pos >= 1); // the scan can see an unwiped buffer
@@ -163,7 +165,8 @@ test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the k
     paint();
     parkKey();
     const pos = scan(&codec_sk);
-    std.debug.print("\n=== STACKPROBE sealedbox L4 codecs ({t}): NEG={d} POS(key parked)={d} ===\n", .{ builtin.mode, neg, pos });
+    // Printed only when an assertion fails, as in the test above.
+    errdefer std.debug.print("\n=== STACKPROBE sealedbox L4 codecs ({t}): NEG={d} POS(key parked)={d} ===\n", .{ builtin.mode, neg, pos });
     try std.testing.expectEqual(@as(usize, 0), neg);
     try std.testing.expect(pos >= 1);
 
@@ -175,7 +178,8 @@ test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the k
         .{ .name = "keyPairFromSecretKey", .f = keyPairAndWipe },
     };
     var total: usize = 0;
-    for (calls) |call| {
+    var per_call: [calls.len][3]usize = undefined;
+    for (calls, &per_call) |call, *row| {
         var key: usize = 0;
         var b64: usize = 0;
         var hex: usize = 0;
@@ -190,8 +194,13 @@ test "STACKPROBE (A1 L4): the secret-key codecs leave neither the text nor the k
             call.f();
             hex += scan(&codec_hex);
         }
-        std.debug.print("  {s:<24} key={d}/5 base64 text={d}/5 hex text={d}/5\n", .{ call.name, key, b64, hex });
+        row.* = .{ key, b64, hex };
         total += key + b64 + hex;
+    }
+    errdefer {
+        for (calls, per_call) |call, row| {
+            std.debug.print("  {s:<24} key={d}/5 base64 text={d}/5 hex text={d}/5\n", .{ call.name, row[0], row[1], row[2] });
+        }
     }
     try std.testing.expectEqual(@as(usize, 0), total);
 }
