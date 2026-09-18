@@ -238,18 +238,16 @@ concurrency:
 # distinct per caching job, since matrix jobs sharing one key clobber each
 # other every run. Today only this job caches, so there is nothing to collide
 # with — that stops being true the moment a second one does.
-# ⛔⛔ DRY RUN IS ON (2026-09-18). While this says "1", NOTHING in this workflow
-# compiles or tests anything: every `scripts/test.sh` step prints what it
-# would run and passes, and the peer installs, build caches, root `tc` step
-# and example-apps build are skipped. What IS real: module selection,
+# Dry run: set ZIGLIBS_DRY_RUN to "1" to debug this pipeline without a
+# 90-minute matrix per attempt. Every `scripts/test.sh` step then prints what
+# it would run and passes, and the peer installs, build caches, root `tc`
+# step and example-apps build are skipped. What stays real: module selection,
 # fingerprints, stamps (kept under separate `dry-` artifacts with `DRY` in the
 # lane key, so they can never stand in for real ones), shards, the plan's
-# coverage checks and the gate. It exists to debug this pipeline without a
-# 90-minute matrix per attempt. A green run here proves the plumbing and
-# NOTHING about the code, and `scripts/tag.sh` refuses to tag while it is on.
-# Set it to "0" -- or delete these lines -- to make CI real again.
+# coverage checks and the gate. A green dry run proves the plumbing and
+# NOTHING about the code; `scripts/tag.sh` refuses to tag while it is on.
 env:
-  ZIGLIBS_DRY_RUN: "1"
+  ZIGLIBS_DRY_RUN: "0"
   # Volatile stamps (a live peer, or an environment gap that made tests skip)
   # count for 24 hours on pushes and dispatches, and never on a tag: the tag
   # is the claim that every lane passed, so those modules run for real there.
