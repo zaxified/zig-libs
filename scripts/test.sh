@@ -1753,14 +1753,46 @@ cmd_ctgrind() {
     # its own message; a lane whose only purpose is the measurement must not
     # report green for not having taken it.
     set_extra_args "$@"
-    echo "ctgrind: taking the constant-time measurement for every module with a harness."
+    echo "ctgrind: taking the constant-time measurement for every module with a harness"
+    echo "  and no green stamp for it."
     echo "  ⚠ needs valgrind (scripts/lib/ci-environment.sh ctgrind); this is NOT check-ctgrind,"
     echo "    which only compiles the harnesses and runs no measurement at all."
+    # ⭐ STAMPED (2026-09-18). The lane measured all 44 modules on every run,
+    # 43 minutes. A module's fingerprint covers its harness (it is in src/) and
+    # its dependency closure; what it does not cover is the measuring side, so
+    # that goes into the lane key instead: the driver and its pinned table (a
+    # changed row or recipe re-measures everything), the CPU the harnesses are
+    # built for (ctgrind.sh's own pin, not the runner's -- the counts are a
+    # property of the generated code) and the valgrind that counts.
+    local all=() m todo lane drv vg
+    for m in modules/*/src/ctgrind_harness.zig; do
+        [[ -e "$m" ]] || continue
+        m="${m#modules/}"
+        all+=("${m%%/*}")
+    done
+    drv="$(cat scripts/checks/ctgrind.sh scripts/checks/ctgrind-expected.tsv | sha256sum | cut -c1-12)"
+    vg="$(valgrind --version 2>/dev/null || echo no-valgrind)"
+    lane="ctgrind cpu=${CTGRIND_CPU:-skylake} drv=$drv $vg $(uname -m)"
+    fp_load   # here, in THIS shell: see stamps_record
+    todo="$(stamps_pending "${all[*]}" "$lane")"
+    echo "ctgrind: $(wc -w <<< "$todo") of ${#all[@]} modules have no green stamp for '$lane'"
+    if [[ -z "${todo// /}" ]]; then
+        echo "ctgrind: nothing to do — every harness is stamped green at its current fingerprint"
+        summary
+        return 0
+    fi
+    # A strict subset is named on the command line, which is also what tells
+    # `--check` that the other modules' rows are legitimately unmeasured. The
+    # whole set is passed as NO names, so a harness missing from the recipe
+    # still fails the run rather than being left out of it.
+    local names=()
+    [[ "$(wc -w <<< "$todo")" -lt ${#all[@]} ]] && read -ra names <<< "$todo"
     # ⚠ `ZL_STEP_STDERR_IS_OUTPUT`: the control table is the point of the run and
     # `ctgrind.sh` narrates its builds on stderr, so the ordinary rule (exit 0
     # with anything on stderr is a failure) would reject a green measurement.
     # Exit status still decides -- and `--check` exits 1 on any failed row.
-    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind" scripts/checks/ctgrind.sh --check
+    ZL_STEP_STDERR_IS_OUTPUT=1 step "ctgrind" scripts/checks/ctgrind.sh --check ${names[@]+"${names[@]}"}
+    stamps_record "$todo" "$lane"
     summary
 }
 
@@ -2133,8 +2165,10 @@ Usage: scripts/test.sh [subcommand] [args]
                         2026-09-08 no lane ran this at all, so those 20 claims
                         were verified by nothing. Needs
                         `scripts/lib/ci-environment.sh ctgrind` (valgrind), and
-                        FAILS rather than skips without it. 310 s warm for all
-                        8 modules.
+                        FAILS rather than skips without it. Stamped since
+                        2026-09-18: a module whose harness, dependencies,
+                        ctgrind.sh, pinned table, CPU pin and valgrind are
+                        unchanged since its last green measurement is skipped.
   time                  run every module SERIALLY, print a duration-sorted
                         table. Slow; measurement only, never use this to
                         decide what to run.

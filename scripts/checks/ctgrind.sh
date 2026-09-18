@@ -1136,9 +1136,8 @@ WORKDIR="$(mktemp -d "$PWD/.zig-cache/ctgrind.XXXXXX")"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 # ── build ──────────────────────────────────────────────────────────────────
-# One build per (mode, -fvalgrind) pair, covering every requested module.
-MODFLAGS=()
-for m in "${MODULES[@]}"; do MODFLAGS+=("-Dctgrind-module=$m"); done
+# One build per (mode, -fvalgrind) pair, covering the requested modules that
+# are MEASURED in that mode -- see modes_modflags.
 
 needed_modes() {
     local out=()
@@ -1163,10 +1162,27 @@ needed_modes() {
 # valgrind on every host in that pool. Override only to re-pin on purpose.
 CTGRIND_CPU="${CTGRIND_CPU:-skylake}"
 
+# `-Dctgrind-module=` for each requested module that MODES measures in $1.
+# ⚠ Per mode, not every module in every mode (2026-09-18): 44 modules measure
+# in ReleaseFast and ONE also in ReleaseSafe, and building the ReleaseSafe
+# pair for all 44 was half of the CI lane's ~31 minutes of compiling -- binaries
+# the run pool never executes, since it only runs (module, mode) from MODES.
+modes_modflags() {
+    local mode="$1" m md
+    MODFLAGS=()
+    for m in "${MODULES[@]}"; do
+        for md in ${MODES[$m]}; do
+            if [[ "$md" == "$mode" ]]; then MODFLAGS+=("-Dctgrind-module=$m"); fi
+        done
+    done
+    return 0
+}
+
 mapfile -t BUILD_MODES < <(needed_modes)
 for mode in "${BUILD_MODES[@]}"; do
+    modes_modflags "$mode"
     for vg in true false; do
-        echo "Building ctgrind harnesses ($mode, -fvalgrind=$vg)..." >&2
+        echo "Building ctgrind harnesses ($mode, -fvalgrind=$vg, ${#MODFLAGS[@]} module(s))..." >&2
         scripts/lib/capped zig build ctgrind \
             "-Doptimize=$mode" "-Dctgrind-valgrind=$vg" "-Dcpu=$CTGRIND_CPU" \
             "${MODFLAGS[@]}" -p "$WORKDIR/$mode-$vg" >&2

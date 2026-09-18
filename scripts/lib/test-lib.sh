@@ -274,7 +274,16 @@ _zl_inflight_note() {
     out=$(awk -v repo="$_ZL_REPO_ROOT" '
         {
             et = $1 + 0
-            if (match($0, / -Mroot=[^ ]*\/modules\/[^\/]+\//)) {
+            # A ctgrind measurement: valgrind running an installed harness,
+            # `<prefix>/ctgrind/ctgrind-<module>`. Neither shape below sees
+            # it, so the ctgrind lane printed nothing for the last ~11 minutes
+            # of every run (2026-09-18). One line per module: the launcher and
+            # the tool it execs can both carry the path.
+            if (match($0, /\/ctgrind\/ctgrind-[A-Za-z0-9_]+/)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/.*\/ctgrind-/, "", s)
+                if (!(s in vg)) { vg[s] = 1; print et "\t" s "\tvalgrind" }
+            } else if (match($0, / -Mroot=[^ ]*\/modules\/[^\/]+\//)) {
                 s = substr($0, RSTART, RLENGTH)
                 sub(/.*\/modules\//, "", s); sub(/\/$/, "", s)
                 if (index($0, repo) > 0) print et "\t" s "\tcompile"

@@ -321,8 +321,11 @@ jobs:
         # Off in a dry run: an almost empty tree saved under the exact key
         # would be restored as a HIT by the first real run, which then saves
         # nothing (an exact hit never saves) -- a cold cache that reads warm.
+        # Restore here, save after the tests and only if the tree grew -- the
+        # same arrangement as the `full` job, see there.
+        id: zcache
         if: env.ZIGLIBS_DRY_RUN != '1'
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
           # Exact key on the sources; restore-keys falls back to the newest
@@ -340,6 +343,9 @@ jobs:
           key: zig-${{ runner.os }}-base3-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-${{ runner.os }}-base3-${{ steps.gen.outputs.week }}-${{ matrix.shard }}-
+      - name: Mark the restored build tree
+        if: env.ZIGLIBS_DRY_RUN != '1'
+        run: touch "$RUNNER_TEMP/zig-cache-restored"
       # ⚠ THE SCOPED LANE NEEDS THE PEERS TOO, which it did not have until
       # 2026-08-15. It gates every push, and until this step existed it opened
       # every run with the same six-gap report the `full` job had learned to
@@ -437,11 +443,22 @@ jobs:
           # A pinned CPU level: GitHub's amd64 pool mixes at least four CPU
           # models (znver3, znver4, emeraldrapids, ...), and with `native`
           # every change would have to go green once per model before its
-          # stamp holds. x86_64_v3 (AVX2, BMI2) is on all of them; the
-          # AVX-512 and ADX paths are the tag's full lanes' to run.
+          # stamp holds. x86_64_v3 (AVX2, BMI2) is on all of them; the full
+          # lanes pin the same level plus `adx`, which is what turns on the
+          # k256/p256/montint asm cores (see the lane table).
           # +aes+pclmul because no psABI level carries them: plain v3 would
           # test only the software AES/GHASH that no deployed build runs.
           bash scripts/test.sh changed "$base" -Dcpu=x86_64_v3+aes+pclmul ${{ matrix.groups }}
+      - name: Decide whether the build tree grew
+        id: zsave
+        if: success() && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true'
+        run: bash scripts/lib/ci-cache-decide.sh "$GITHUB_WORKSPACE/.zig-cache" "$RUNNER_TEMP/zig-cache-restored"
+      - name: Save the build tree if it grew
+        if: success() && steps.zsave.outputs.save == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: ${{ steps.zcache.outputs.cache-primary-key }}
       # Only a green run gets here, and only a push, tag or dispatch shares
       # what it proved; a pull request's stamps would be discarded by the
       # fetch anyway, so it does not upload them.
@@ -484,6 +501,9 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+          # Nothing here is worth a cache entry: it saved 93 MB under a new
+          # run-id key every run (2026-09-18), for 9 s of work.
+          use-cache: false
       - name: The sub-second gates, before anything expensive starts
         run: bash scripts/test.sh checks-fast
       - name: Choose the lanes
@@ -522,6 +542,19 @@ jobs:
           # the tables, the catalog, `check-portable` (which cross-compiles from
           # wherever it runs), the ctgrind harnesses, the sizeprobe.
           lanes+=('{"name":"checks","args":"","cmd":"checks","cachekey":"checks","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":15,"skip_live":""}')
+          # ⭐ A PINNED CPU ON EVERY amd64 LANE THAT STAMPS (2026-09-18), for
+          # the push lane's reason: GitHub's amd64 pool mixes CPU models, and
+          # with `native` a stamp holds only on the model that earned it. On
+          # the 2026-09-18 dispatch the crypto shards landed on emeraldrapids
+          # and znver4 and re-ran 75 of 75 modules (844 s, 945 s) beside
+          # shards on a "known" CPU that ran 0-1 in seconds -- and each lane's
+          # cache then held two trees, one per CPU. The level is the push
+          # lane's plus `adx`: k256, p256 and montint select their asm cores
+          # on adx+bmi2, and every model in the pool has it (Broadwell, Zen).
+          # ⚠ What no CI lane runs any more: chachapoly's AVX-512 poly1305
+          # lanes. `native` ran them only when a lane happened to land on an
+          # AVX-512 host, and the pool also has Zen 3, which has none.
+          #
           # ⭐ SHARDED BY PRIMARY LIB, added 2026-09-18. Each `modules` lane
           # and each amd64 `examples` lane is three jobs: `crypto`, `net`, and
           # the other four libs together (75 / 74 / 81 modules). `-Dgroup`
@@ -539,12 +572,12 @@ jobs:
           #
           # ⚠ `tc` is true on the `net` shard only: tc is a `net` module and
           # the root step tests just it, so the other shards would repeat it.
-          lanes+=('{"name":"modules ReleaseSafe amd64 [crypto]","base":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseSafe amd64 [net]","base":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseSafe amd64 [rest]","base":"modules ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseFast amd64 [crypto]","base":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=crypto","cmd":"modules","cachekey":"mod-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseFast amd64 [net]","base":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=net","cmd":"modules","cachekey":"mod-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
-          lanes+=('{"name":"modules ReleaseFast amd64 [rest]","base":"modules ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64 [crypto]","base":"modules ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"modules","cachekey":"mod-relsafe-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64 [net]","base":"modules ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe -Dgroup=net","cmd":"modules","cachekey":"mod-relsafe-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseSafe amd64 [rest]","base":"modules ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relsafe-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64 [crypto]","base":"modules ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=crypto","cmd":"modules","cachekey":"mod-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64 [net]","base":"modules ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=net","cmd":"modules","cachekey":"mod-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":true,"timeout":90,"skip_live":""}')
+          lanes+=('{"name":"modules ReleaseFast amd64 [rest]","base":"modules ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"modules","cachekey":"mod-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":90,"skip_live":""}')
           # ONE arm64 pair, not three. What a second architecture buys is
           # portability coverage -- alignment and endianness assumptions,
           # atomics, and the asm-vs-fallback dispatch -- and none of that varies
@@ -584,7 +617,7 @@ jobs:
           # documented cross-mode catch went the other way. Tests that run only
           # in Debug: zero. Tests that SKIP in Debug: fifteen. See `cmd_build`
           # in scripts/test.sh.
-          lanes+=('{"name":"compile-only strict Debug amd64","args":"-Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":30,"skip_live":""}')
+          lanes+=('{"name":"compile-only strict Debug amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Dstrict-debug","cmd":"build","cachekey":"strictdebug","cache":false,"runner":"ubuntu-26.04","peers":"","tc":false,"timeout":30,"skip_live":""}')
           # BOTH release modes run the examples, and that is deliberate: the two
           # catch different classes and both are documented here. ReleaseFast is
           # where `qrscan`'s uninitialised perspective terms showed (Debug and
@@ -624,12 +657,12 @@ jobs:
           # rather than a defect. That is survivable only because the lanes are
           # split: a cold `modules` lane is ~50 minutes against a 90-minute cap,
           # where the unsplit lane cleared it by 23 seconds.
-          lanes+=('{"name":"examples ReleaseSafe amd64 [crypto]","base":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"examples","cachekey":"ex-relsafe-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseSafe amd64 [net]","base":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=net","cmd":"examples","cachekey":"ex-relsafe-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseSafe amd64 [rest]","base":"examples ReleaseSafe amd64","args":"-Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relsafe-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseFast amd64 [crypto]","base":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=crypto","cmd":"examples","cachekey":"ex-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseFast amd64 [net]","base":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=net","cmd":"examples","cachekey":"ex-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
-          lanes+=('{"name":"examples ReleaseFast amd64 [rest]","base":"examples ReleaseFast amd64","args":"-Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64 [crypto]","base":"examples ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe -Dgroup=crypto","cmd":"examples","cachekey":"ex-relsafe-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64 [net]","base":"examples ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe -Dgroup=net","cmd":"examples","cachekey":"ex-relsafe-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseSafe amd64 [rest]","base":"examples ReleaseSafe amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseSafe -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relsafe-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64 [crypto]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=crypto","cmd":"examples","cachekey":"ex-relfast-crypto","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64 [net]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=net","cmd":"examples","cachekey":"ex-relfast-net","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
+          lanes+=('{"name":"examples ReleaseFast amd64 [rest]","base":"examples ReleaseFast amd64","args":"-Dcpu=x86_64_v3+aes+pclmul+adx -Doptimize=ReleaseFast -Dgroup=web -Dgroup=format -Dgroup=storage -Dgroup=os","cmd":"examples","cachekey":"ex-relfast-rest","cache":true,"runner":"ubuntu-26.04","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           lanes+=('{"name":"examples ReleaseSafe arm64","args":"-Doptimize=ReleaseSafe","cmd":"examples","cachekey":"ex-relsafe-all","cache":true,"runner":"ubuntu-26.04-arm","peers":"tests","tc":false,"timeout":60,"skip_live":""}')
           # ⭐ THE ONE LANE THAT RE-TAKES THE ANCHORS, added 2026-09-06 —
           # and until it existed, NOTHING anywhere ran `zig build interop-<m>`.
@@ -796,8 +829,11 @@ jobs:
         # while the lanes that take 33 to 51 minutes compete for the remainder.
         # Those three are 87-89 % compile by wall-clock, which is precisely what
         # a build cache is for.
+        # ⭐ RESTORE HERE, SAVE BELOW, and only when this run compiled
+        # something (2026-09-18) -- see "Save the build tree if it grew".
+        id: zcache
         if: matrix.cache && env.ZIGLIBS_DRY_RUN != '1'
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
           # ⚠ `matrix.cachekey` is load-bearing. Each lane compiles EVERY module
@@ -860,6 +896,9 @@ jobs:
           key: zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-${{ hashFiles('modules/**/*.zig', 'build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-full-${{ matrix.cachekey }}-${{ runner.arch }}-${{ steps.gen.outputs.week }}-
+      - name: Mark the restored build tree
+        if: matrix.cache && env.ZIGLIBS_DRY_RUN != '1'
+        run: touch "$RUNNER_TEMP/zig-cache-restored"
       # scripts/test.sh runs the lane's command over its shard -- every module
       # without a green stamp for this lane, checks included -- and wraps the
       # netlink-writing modules in `unshare -rn` where the runner allows it —
@@ -991,6 +1030,24 @@ jobs:
           sudo unshare -n "$(command -v zig)" build test-tc ${{ matrix.args }} \
             --summary all \
             --cache-dir /tmp/zig-cache-root --global-cache-dir /tmp/zig-gcache-root
+      # ⭐ SAVED ONLY WHEN THE TREE GREW (2026-09-18). The key carries a hash
+      # of every module source, so `actions/cache` used to save a fresh copy
+      # of every lane's tree on every commit -- also when stamps had left the
+      # lane nothing to compile, which on most runs is most lanes. Those
+      # copies took the repository to 11.19 GB of its 10 and evicted the arm64
+      # lanes' entries. scripts/lib/ci-cache-decide.sh says save only when
+      # `o/` gained an entry, and not past a size cap; the `cache-prune` job
+      # deletes what a newer entry superseded.
+      - name: Decide whether the build tree grew
+        id: zsave
+        if: success() && matrix.cache && env.ZIGLIBS_DRY_RUN != '1' && steps.zcache.outputs.cache-hit != 'true'
+        run: bash scripts/lib/ci-cache-decide.sh "$GITHUB_WORKSPACE/.zig-cache" "$RUNNER_TEMP/zig-cache-restored"
+      - name: Save the build tree if it grew
+        if: success() && steps.zsave.outputs.save == 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ github.workspace }}/.zig-cache
+          key: ${{ steps.zcache.outputs.cache-primary-key }}
       # After the root `tc` step, so a lane whose tc root tests fail keeps
       # nothing. Only a green run gets here, and only a push, tag or dispatch shares
       # what it proved; a pull request's stamps would be discarded by the
@@ -1187,6 +1244,37 @@ jobs:
       - name: example-apps through their pins (tag refs only)
         if: startsWith(github.ref, 'refs/tags/') && env.ZIGLIBS_DRY_RUN != '1'
         run: bash scripts/check-apps.sh --pinned
+
+  # ⭐ THE ONLY JOB THAT MAY DELETE A CACHE ENTRY, and nothing else runs in it
+  # (2026-09-18). Every build-cache key changes with the sources, so each save
+  # leaves the entry it restored from behind, still counting against the 10 GB.
+  # GitHub evicts least-recently-used first, and the full lanes run only on
+  # dispatches and tags, so a few pushes' superseded entries were enough to
+  # evict the full lanes' CURRENT ones: 11.19 GB on 2026-09-18, all three arm64
+  # module lanes restoring nothing. scripts/lib/ci-cache-prune.sh keeps the
+  # newest entry of each key family and ref -- the one every restore prefix
+  # would pick anyway -- and deletes the rest.
+  #
+  # `actions: write` is granted to THIS job only: it checks out the repository
+  # and runs that one script, no module code and no build. Not on pull
+  # requests, whose token could not delete anyway. It gates nothing, so it is
+  # not in `gate`'s needs, and a failed prune is a warning, not a red run.
+  cache-prune:
+    name: prune superseded caches
+    if: always() && github.event_name != 'pull_request'
+    needs: [scoped, full, consumer]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Delete cache entries a newer one superseded
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/lib/ci-cache-prune.sh
 
   gate:
     name: gate
