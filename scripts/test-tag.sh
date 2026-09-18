@@ -111,6 +111,19 @@ check "--dry-run, CI green -> succeeds" 0 $?
 FAKE_CI="completed success" bash scripts/tag.sh v1.2.3 >/dev/null 2>&1
 check "semver-shaped argument -> refuse" 1 $?
 
+mkdir -p .github/workflows
+printf 'env:\n  ZIGLIBS_DRY_RUN: "1"\n' > .github/workflows/ci.yml
+git add -A && git commit -qm dry
+before="$(git tag | wc -l)"
+FAKE_CI="completed success" bash scripts/tag.sh 2026-09-05 >"$OUT/out.txt" 2>&1
+check "CI green but ci.yml is a DRY run -> refuse" 1 $?
+[[ "$(git tag | wc -l)" == "$before" ]] && grep -q "DRY_RUN" "$OUT/out.txt" ||
+    { printf '  FAIL %-54s\n' "dry refusal created no tag and says why"; fails=$((fails + 1)); }
+printf 'env:\n  ZIGLIBS_DRY_RUN: "0"\n' > .github/workflows/ci.yml
+git commit -qam real
+FAKE_CI="completed success" bash scripts/tag.sh 2026-09-05 >/dev/null 2>&1
+check "ci.yml with dry run OFF -> tags" 0 $?
+
 echo
 if [[ $fails -eq 0 ]]; then
     echo "tag.sh self-test: all cases behaved"

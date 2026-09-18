@@ -89,6 +89,14 @@ const Module = struct {
     /// thing this flag serialises has left the test binary. Declaring it
     /// anyway costs the serial run for nothing.
     live: bool = false,
+    /// Run this module's tests inside `unshare -rn` (a fresh network
+    /// namespace) when the host allows it. For modules doing netlink WRITES:
+    /// on a bare development host they would attempt real changes that
+    /// collide with host state. Moved here from a list in
+    /// `scripts/test-lib.sh` on 2026-09-18, so it is part of the module's
+    /// fingerprint -- it changes how the module's tests run -- and the driver
+    /// scripts no longer have to be. Published as `module-graph` column 7.
+    netns: bool = false,
 };
 
 const module_list = [_]Module{
@@ -132,11 +140,11 @@ const module_list = [_]Module{
     .{ .name = "aaa-gate", .libs = &.{"web"}, .deps = &.{ "router", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "resilience", .libs = &.{ "web", "net" } },
     .{ .name = "acme", .libs = &.{"web"}, .deps = &.{ "http", "router", "entropy" }, .test_deps = &.{"testkit"} },
-    .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
-    .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
-    .{ .name = "ethtool", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
-    .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"} },
+    .{ .name = "netlink", .libs = &.{"net"}, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "genetlink", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "nl80211", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "ethtool", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "devlink", .libs = &.{"net"}, .deps = &.{ "genetlink", "netlink" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "decimal", .libs = &.{ "storage", "format" }, .test_deps = &.{"testkit"} },
     .{ .name = "seqmap", .libs = &.{"net"} },
     .{ .name = "icmp", .libs = &.{"net"}, .deps = &.{ "seqmap", "netaddr" }, .test_deps = &.{"testkit"} },
@@ -184,7 +192,7 @@ const module_list = [_]Module{
     .{ .name = "blindrsa", .libs = &.{"crypto"}, .deps = &.{"rsa"}, .test_deps = &.{"testkit"} },
     .{ .name = "ssh", .libs = &.{"net"}, .deps = &.{"rsa"}, .test_deps = &.{"testkit"}, .heavy = true, .live = true },
     .{ .name = "netconf", .libs = &.{"net"}, .deps = &.{ "ssh", "xml" }, .test_deps = &.{"testkit"} },
-    .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
+    .{ .name = "nftables", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "trie", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "fuzzysearch", .libs = &.{"storage"}, .deps = &.{"trie"}, .test_deps = &.{"testkit"} },
     .{ .name = "geoindex", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
@@ -206,8 +214,8 @@ const module_list = [_]Module{
     .{ .name = "uci", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "mqtt", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
     .{ .name = "snmp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
-    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .test_deps = &.{"testkit"} },
-    .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"} },
+    .{ .name = "wireguard", .libs = &.{"net"}, .deps = &.{ "netlink", "genetlink", "chachapoly", "entropy", "netaddr" }, .test_deps = &.{"testkit"}, .netns = true },
+    .{ .name = "tc", .libs = &.{"net"}, .deps = &.{"netlink"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "traceroute", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr", "latency-stats" } },
     .{ .name = "probe", .libs = &.{"net"}, .deps = &.{ "netaddr", "latency-stats" }, .test_deps = &.{"testkit"} },
     .{ .name = "pathmtu", .libs = &.{"net"}, .deps = &.{ "icmp", "netaddr" } },
@@ -227,7 +235,7 @@ const module_list = [_]Module{
     .{ .name = "procnet", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
     .{ .name = "diskfree", .libs = &.{"os"} },
     .{ .name = "diskusage", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
-    .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"} },
+    .{ .name = "conntrack", .libs = &.{"net"}, .deps = &.{ "netlink", "netaddr" }, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "procrun", .libs = &.{"os"}, .deps = &.{"argsafe"} },
     .{ .name = "dataset", .libs = &.{"storage"}, .test_deps = &.{"testkit"} },
     .{ .name = "tabular", .libs = &.{"storage"}, .deps = &.{"dataset"} },
@@ -258,7 +266,7 @@ const module_list = [_]Module{
     .{ .name = "jobqueue", .libs = &.{"storage"}, .deps = &.{"kv"} },
     .{ .name = "reconcilable", .libs = &.{"net"}, .deps = &.{"resilience"} },
     .{ .name = "llmclient", .libs = &.{"web"}, .deps = &.{"http"} },
-    .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"} },
+    .{ .name = "rawsock", .libs = &.{"net"}, .deps = &.{"netaddr"}, .test_deps = &.{"testkit"}, .netns = true },
     .{ .name = "encoding", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "syslog", .libs = &.{"net"}, .deps = &.{"datefmt"} },
     .{ .name = "sntp", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
@@ -1613,8 +1621,9 @@ fn ctgrindHarnesses(b: *std.Build) []const []const u8 {
 /// its tests or example do has changed, and (ideally) not otherwise:
 ///
 ///   * the MACHINERY: this file with `module_list` cut out, `build.zig.zon`,
-///     and the scripts that select, build and run modules. Changing it
-///     re-keys every module, which is right -- it is how everything is run;
+///     and `scripts/force-pubfn-reach.zig`. Changing it re-keys every module,
+///     which is right -- it is how every module is compiled. The driver
+///     scripts are deliberately NOT in it; see the list below;
 ///   * the module's DECLARATION: its `module_list` entry, minus `libs` (a
 ///     catalog placement, which changes nothing that compiles);
 ///   * the module's OWN FILES, every file under `modules/<m>/` except prose
@@ -1644,12 +1653,16 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
         const src = try b.build_root.handle.readFileAlloc(io, "build.zig", b.allocator, .limited(64 * 1024 * 1024));
         hashZigTokens(&machinery, try b.allocator.dupeZ(u8, src), "module_list");
     }
+    // ⚠ NOT the driver scripts (2026-09-18). test.sh, test-lib.sh and friends
+    // decide WHICH modules run and how the result is reported; they do not
+    // change what a module compiles to or what its tests do, so a stamp earned
+    // under the old driver is still true under the new one. With them in here
+    // every edit to test.sh re-keyed all 230 modules on every lane. A driver
+    // change is checked by running the driver (the smoke set in `changed`),
+    // and the one per-module fact that lived in a script -- netns wrapping --
+    // is now `.netns` in `module_list`, hashed with the module.
     for ([_][]const u8{
         "build.zig.zon",
-        "scripts/test.sh",
-        "scripts/test-lib.sh",
-        "scripts/capped",
-        "scripts/dark-tests.sh",
         "scripts/force-pubfn-reach.zig",
     }) |path| {
         const src = try b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(64 * 1024 * 1024));
@@ -1683,6 +1696,7 @@ fn printModuleFingerprints(step: *std.Build.Step, options: std.Build.Step.MakeOp
         h.update(m.name);
         h.update(if (m.heavy) "\x00heavy" else "\x00light");
         h.update(if (m.live) "\x00live" else "\x00-");
+        h.update(if (m.netns) "\x00netns" else "\x00-");
         for (m.deps) |d| {
             h.update("\x00d:");
             h.update(d);
@@ -1862,7 +1876,7 @@ fn inGroups(m: Module, groups: []const []const u8) bool {
 /// `zig build module-graph` — dump module_list as TSV so tooling does not have
 /// to parse Zig source. One line per module:
 ///
-///     name<TAB>heavy|light<TAB>dep,dep,...<TAB>live|-<TAB>ct|-<TAB>primary-lib
+///     name<TAB>heavy|light<TAB>dep,dep,...<TAB>live|-<TAB>ct|-<TAB>primary-lib<TAB>netns|-
 ///
 /// The deps column is empty for a module with no siblings. Consumed by
 /// `scripts/test.sh` to map changed files onto the modules they affect,
@@ -1896,7 +1910,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
         // copies of these two module sets. `live` is declared in `module_list`;
         // `ct` is derived from the tree (the harness file is its own
         // declaration). Both were duplicated into scripts/ before this.
-        try w.print("\t{s}\t{s}\t{s}\n", .{
+        try w.print("\t{s}\t{s}\t{s}\t{s}\n", .{
             if (m.live) "live" else "-",
             if (blk: {
                 for (harnesses) |h| {
@@ -1908,6 +1922,7 @@ fn printModuleGraph(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
             // Published so `scripts/test.sh` narrows its own module list by
             // the same rule instead of keeping a second copy of it.
             m.libs[0],
+            if (m.netns) "netns" else "-",
         });
     }
 

@@ -141,18 +141,15 @@ from a diff against `BASE_REF` if you pass one (`scripts/test.sh changed main`).
   fingerprint, so the stamps already say what they re-keyed (see *Stamps*)
 - `.github/**` and any script the gate itself executes — `test.sh`,
   `test-lib.sh`, `capped`, `dark-tests.sh`, `ci-environment.sh`, `test-tag.sh`,
-  `ci-stamps.sh`, `check-ci-cache-keys.sh`, `hooks/**` → **locally, a smoke set** plus a loud
-  note that this is not the
-  gate. The harness is the very thing that decides a narrower set, so it cannot
-  vouch for its own narrowing; instead it runs one plain and one netns-wrapped
-  module — the two classes `run_modules` actually distinguishes — to prove the
-  select → build → run → report path still works, and tells you to run
-  `scripts/test.sh all` before committing.
-  **On CI (`GITHUB_ACTIONS` set) it escalates to the full gate instead.** The
-  advice above is something a person at a keyboard can act on; a runner cannot,
-  and on 2026-08-15 a push that rewrote 191 lines of opcua's driver went green
-  having never built the module. The membership rule is "the gate executes it",
-  not "it lives in `scripts/`" — four of those entries were missing until then
+  `ci-stamps.sh`, `check-ci-cache-keys.sh`, `hooks/**` → **every check plus a smoke
+  set** — one plain and one netns module, end to end — to prove the driver itself
+  works, locally and on CI alike, and then the modules with no green stamp as always.
+  The driver is not in any fingerprint (it decides which modules run, not what they
+  compile to), so a driver edit re-tests nothing that was already proven. Until
+  2026-09-18 CI escalated to the full gate here: on 2026-08-15 a push that changed the
+  driver AND 191 lines of opcua ran only the smoke set and went green with opcua
+  unbuilt. Stamps close that — opcua's files moved, so it has no stamp and runs.
+  The membership rule is "the gate executes it", not "it lives in `scripts/`"
 - `scripts/README.md`, `scripts/vm/**`, the generators → nothing; none is a gate
   step
 - Root docs → no modules, but a `README.md` change still runs `check-catalog`,
@@ -168,12 +165,18 @@ at its current fingerprint.
 
 - **Fingerprint** — `zig build module-fingerprints`. A hash of the module's own
   files (`.zig` as tokens without comments, so a comment or `zig fmt` changes
-  nothing; prose files excluded), its `module_list` entry, the machinery
-  (`build.zig` minus `module_list`, `build.zig.zon`, the driver scripts), Zig's
-  version, and the own hash of every module in its dependency closure. So a
+  nothing; prose files excluded), its `module_list` entry (`.netns` included),
+  the machinery (`build.zig` minus `module_list`, `build.zig.zon`,
+  `force-pubfn-reach.zig` — NOT the driver scripts, see above), Zig's version,
+  and the own hash of every module in its dependency closure. So a
   change in `rsa` re-keys the 17 modules above it (`blindrsa`, `ssh`, `xmldsig`,
   `saml`, …) without any reverse-dependency pass, and editing a comment re-keys
   nothing. Per-file hashes are memoised in the cache dir (0.2 s warm, 8 s cold).
+- **Dry run** — `ZIGLIBS_DRY_RUN=1`: every step prints what it would run and
+  passes; selection, fingerprints and stamps are real, and the stamps carry
+  `DRY` in the lane key so they never stand in for real ones. `ci.yml` has a
+  switch for it at the top, for debugging the pipeline without paying the
+  matrix; `tag.sh` refuses while it is on.
 - **Stamp** — `<module> TAB <lane> TAB <fingerprint> TAB <time>` in
   `.stamps.local.tsv` (gitignored, deliberately NOT in `.zig-cache`, which gets
   deleted by hand) or wherever `ZIGLIBS_STAMPS` points; CI carries each lane's

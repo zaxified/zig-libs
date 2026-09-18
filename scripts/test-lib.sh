@@ -17,7 +17,17 @@
 # It lives here, not in test.sh, because dark-tests.sh has to make the same
 # split for the same reason (a module whose build FAILS prints no test count)
 # and a second copy of this list would rot.
-NETNS_MODULES="netlink genetlink nl80211 ethtool devlink tc conntrack nftables wireguard rawsock"
+# ⭐ Declared per module since 2026-09-18 (`.netns` in build.zig's
+# module_list, `module-graph` column 7), no longer spelled out here: a
+# per-module fact in a script had to put the whole script into every module's
+# fingerprint. Read once, when this file is sourced, because callers test
+# membership inside loops over modules. An empty answer is refused.
+NETNS_MODULES="$(zig build module-graph 2>/dev/null | awk -F'\t' '$7=="netns"{printf "%s ", $1}')"
+NETNS_MODULES="${NETNS_MODULES% }"
+if [[ -z "$NETNS_MODULES" ]]; then
+    echo "test-lib.sh: module-graph reported no netns modules -- refusing to run them unwrapped on a guess" >&2
+    exit 1
+fi
 
 # ⭐ MODULES WHOSE TESTS HOLD A CONVERSATION WITH A REAL THIRD-PARTY PEER, and
 # which therefore run SERIALLY, in their own step, after everything else.
@@ -297,8 +307,19 @@ _zl_inflight_note() {
     done <<< "$out"
 }
 
+# ⭐ DRY RUN (ZIGLIBS_DRY_RUN=1, 2026-09-18): every step prints what it would
+# run and passes, and nothing is compiled or tested. Everything AROUND the
+# steps is real -- module selection, fingerprints, stamps, and in CI the
+# shards, artifacts and gates -- which is what this mode exists to debug
+# without paying a full matrix per attempt. Its stamps carry `DRY` in the lane
+# key (stamps_lane_key in test.sh), so no dry pass can ever stand in for a real
+# one.
 step() {
     local label="$1"; shift
+    if [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]]; then
+        printf '  %s ... DRY (not run: %s)\n' "$label" "$*"
+        return 0
+    fi
     local out err
     out=$(mktemp)
     err=$(mktemp)

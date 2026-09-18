@@ -178,13 +178,13 @@ graph_load() {
         exit 1
     fi
     G_TSV="$tsv"
-    local name heavy deps live ct group
+    local name heavy deps live ct group _rest
     # ⚠ Split on `|`, not on the tab. A tab is IFS WHITESPACE to bash, so two in
     # a row -- the empty deps column of every module with no siblings -- collapse
     # into one and every later column shifts left: those modules read their
     # `live` marker as deps and their group as `ct`. Module names never contain
     # `|`, so the substitution is lossless.
-    while IFS='|' read -r name heavy deps live ct group; do
+    while IFS='|' read -r name heavy deps live ct group _rest; do
         [[ -z "$name" ]] && continue
         G_NAMES+=("$name")
         G_HEAVY+=("$heavy")
@@ -246,21 +246,19 @@ lane_modules() {
 # ZIGLIBS_IGNORE_STAMPS=1 runs everything as if no stamp existed.
 STAMPS_FILE="${ZIGLIBS_STAMPS:-.stamps.local.tsv}"
 STAMPS_KEEP=8
-declare -A FP=()
+# `name<TAB>fingerprint` lines. A string and awk rather than an associative
+# array: see the style note at the top of test-lib.sh (bash 3.2 has none).
+FP_TSV=""
 
 fp_load() {
-    [[ ${#FP[@]} -gt 0 ]] && return 0
-    local tsv n f
-    if ! tsv="$(zig build module-fingerprints 2>&1)"; then
+    [[ -n "$FP_TSV" ]] && return 0
+    if ! FP_TSV="$(zig build module-fingerprints 2>&1)"; then
         echo "test.sh: 'zig build module-fingerprints' failed -- refusing to guess what is proven:" >&2
-        echo "$tsv" >&2
+        echo "$FP_TSV" >&2
         exit 1
     fi
-    while IFS=$'\t' read -r n f; do
-        [[ -n "$n" && -n "$f" ]] && FP[$n]="$f"
-    done <<< "$tsv"
-    if [[ ${#FP[@]} -eq 0 ]]; then
-        echo "test.sh: module-fingerprints produced nothing -- refusing to pass vacuously" >&2
+    if ! awk -F'\t' 'NF != 2 { exit 1 } END { exit NR == 0 }' <<< "$FP_TSV"; then
+        echo "test.sh: module-fingerprints produced nothing usable -- refusing to pass vacuously" >&2
         exit 1
     fi
 }
@@ -270,28 +268,30 @@ stamps_lane_key() {
     for a in "${EXTRA_ZIG_ARGS[@]}"; do
         case "$a" in -Dgroup=* | -Dmodule=*) ;; *) key="$key $a" ;; esac
     done
+    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && key="$key DRY"
     printf '%s %s' "$key" "$(uname -m)"
 }
 
 # Prints the modules of $1 that have no stamp for lane $2 at their current
 # fingerprint.
 stamps_pending() {
-    local mods="$1" lane="$2" m
+    local mods="$1" lane="$2"
     fp_load
     if [[ "${ZIGLIBS_IGNORE_STAMPS:-0}" == 1 || ! -f "$STAMPS_FILE" ]]; then
         printf '%s' "$mods"
         return 0
     fi
-    declare -A have=()
-    local sm sl sf _t
-    while IFS=$'\t' read -r sm sl sf _t; do
-        [[ "$sl" == "$lane" ]] && have["$sm $sf"]=1
-    done < "$STAMPS_FILE"
-    local -a out=()
-    for m in $mods; do
-        [[ -n "${FP[$m]:-}" && -n "${have["$m ${FP[$m]}"]:-}" ]] || out+=("$m")
-    done
-    printf '%s' "${out[*]}"
+    awk -F'\t' -v lane="$lane" -v mods="$mods" '
+        FNR == NR { fp[$1] = $2; next }
+        $2 == lane { have[$1 FS $3] = 1 }
+        END {
+            n = split(mods, a, " "); out = ""
+            for (i = 1; i <= n; i++) {
+                m = a[i]
+                if (!(m in fp) || !((m FS fp[m]) in have)) out = out (out == "" ? "" : " ") m
+            }
+            printf "%s", out
+        }' <(printf '%s\n' "$FP_TSV") "$STAMPS_FILE"
 }
 
 # Records a green stamp for every module of $1 in lane $2. Earlier stamps of
@@ -299,16 +299,15 @@ stamps_pending() {
 # edit or switching branches returns a module to a fingerprint that was
 # already proven, and re-testing it then would be the driver forgetting.
 stamps_record() {
-    local mods="$1" lane="$2" m now tmp
+    local mods="$1" lane="$2" now tmp
     [[ -z "${mods// /}" ]] && return 0
     fp_load
     now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     tmp="$(mktemp "${STAMPS_FILE}.XXXXXX")"
     {
         [[ -f "$STAMPS_FILE" ]] && cat "$STAMPS_FILE"
-        for m in $mods; do
-            printf '%s\t%s\t%s\t%s\n' "$m" "$lane" "${FP[$m]}" "$now"
-        done
+        printf '%s\n' "$FP_TSV" | awk -F'\t' -v OFS='\t' -v mods=" $mods " -v lane="$lane" -v now="$now" \
+            'index(mods, " " $1 " ") { print $1, lane, $2, now }'
     } |
         # newest first per (module, lane, fingerprint) -> one line each; then
         # at most STAMPS_KEEP fingerprints per (module, lane)
@@ -336,20 +335,14 @@ stamps_narrow() {
 
 # The harness itself changed (this script, test-lib.sh, capped, or a CI lane).
 #
-# There is no dependency edge to follow here: what changed is the mechanism that
-# decides the narrow set, so it cannot vouch for its own narrowing. The honest
-# answer is not to silently pick a smaller set and call it verified — it is to
-# run what actually exercises the harness's own branches, and to say plainly
-# that this is not the gate.
-#
-# `run_modules` distinguishes exactly two classes, plain and netns-wrapped, so
-# one live module from each covers both paths end to end (select -> build ->
-# run -> report) in seconds. Heavy modules are NOT included: "heavy" is a
-# build.zig optimisation choice, invisible to this script, and one of them costs
-# minutes. Picked from the graph rather than hardcoded, so the set cannot rot.
+# The driver is in no fingerprint, so a driver edit makes no module unproven;
+# what has to be shown instead is that the driver still works. So: every check,
+# and one plain plus one netns module end to end -- the two classes
+# `run_modules` distinguishes -- picked from this lane's modules. `changed`
+# then runs the unproven modules as it always does.
 harness_smoke() {
     local plain="" netns="" n
-    for n in "${G_NAMES[@]}"; do
+    for n in $(lane_modules); do
         case " $NETNS_MODULES " in
             *" $n "*) [[ -z "$netns" ]] && netns="$n" ;;
             *) [[ -z "$plain" ]] && plain="$n" ;;
@@ -357,11 +350,10 @@ harness_smoke() {
         [[ -n "$plain" && -n "$netns" ]] && break
     done
 
-    echo "changed: the harness or a CI lane definition changed."
-    echo "  The thing that narrows the module set is the thing that moved, so it cannot"
-    echo "  narrow itself. Running a smoke set that exercises the driver's own branches"
-    echo "  instead — this is NOT the gate:"
-    echo "      scripts/test.sh all      <- run this before committing a harness change"
+    echo "changed: the harness or a CI lane definition changed -- running every check and"
+    echo "  a smoke set ($plain, $netns) that exercises the driver end to end; the modules"
+    echo "  with no green stamp follow."
+    stamps_narrow "$(lane_modules)" "$(lane_modules)"   # just the lane's own -Dgroup/-Dmodule
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     # The commit-time formatting hook is only as good as the last edit to it; a
     # hook that always exits 0 looks exactly like "nothing was ever unformatted".
@@ -424,13 +416,13 @@ harness_smoke() {
     # mutation the same day -- a deliberate type error in an unreachable
     # `nftables` function compiled, linked and ran green under `test-nftables`,
     # and only this step went red on it.
-    step "check-pubfn-reach" zig build check-pubfn-reach
+    step "check-pubfn-reach" zig build check-pubfn-reach ${SEL_ARGS[@]+"${SEL_ARGS[@]}"}
     # The one class no test here can cover: is the PUBLISHED API sufficient to
     # do the job? Every test lives in the file it tests, so it reads private
     # declarations and its build carries `test_deps` a consumer never gets.
     # Proven on l2disco 2026-08-21: dropping `pub` from a type its API needs
     # left both `test-l2disco` and `check-pubfn-reach` green, and only this red.
-    step "check-examples" zig build check-examples
+    step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
     # ~30s when modules/http/src/Client.zig (or anything it pulls in) changed
     # content, near-instant otherwise (Zig's own cache). See the script's
     # header for what it checks and why one target, not two.
@@ -469,7 +461,6 @@ harness_smoke() {
     # exiting 0 and still claiming a byte-exact match.
     step "check-example-assert" ./scripts/check-example-assert.py
     run_modules "$plain $netns"
-    summary
 }
 
 _HAVE_UNSHARE=""
@@ -686,6 +677,8 @@ run_modules() {
 # modules skipped is the only way that stays visible — see the `skip = pass`
 # family of findings for why a silent skip is the expensive kind.
 summary_digest() {
+    # Dry run: nothing was built, so there is no --summary to read.
+    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && return 0
     local log="$1" text full prog
     [[ -s "$log" ]] || return 0
     # One program, rendered twice — see `skip_cap` in the END block for why.
@@ -788,6 +781,8 @@ summary_digest() {
 }
 
 dark_check() {
+    # Dry run: nothing was built, so there is no --summary to read.
+    [[ "${ZIGLIBS_DRY_RUN:-0}" == 1 ]] && return 0
     local mods="$1" log="$2"
 
     # An empty log is NOT "nothing to check". run_modules only gets here after
@@ -1301,37 +1296,18 @@ cmd_changed() {
 
     graph_load
 
+    # ⭐ A HARNESS CHANGE RUNS THE SMOKE SET *AND* EVERY UNPROVEN MODULE
+    # (2026-09-18). Until stamps, the harness moving meant the narrowing could
+    # not be trusted, so CI escalated to the full gate -- because on 2026-08-15
+    # `eef1e28` changed the driver AND opcua, the smoke set ran `netlink` and
+    # `testkit`, and opcua went green unbuilt. Stamps close that: opcua's own
+    # files moved, so its fingerprint moved, so it has no stamp and runs below
+    # whatever else changed. What the smoke set adds is the driver's own
+    # proof: every check, plus one plain and one netns module end to end.
+    local smoke_done=0
     if [[ $trigger_all -eq 1 ]]; then
-        # ⭐ ON CI THE SMOKE SET IS NOT ENOUGH, and 2026-08-15 is why.
-        #
-        # `eef1e28` changed scripts/test.sh, test-lib.sh, dark-tests.sh, ci.yml
-        # AND modules/opcua/src/server_interop.zig — 191 lines of the driver two
-        # days of work had gone into. The harness had moved, so this branch ran
-        # the smoke set: `netlink` and `testkit`. opcua was not built, let alone
-        # tested. The job exited 0, the aggregate `gate` job read `success`, and
-        # the push went green having tested none of what it changed.
-        #
-        # The message below is the right answer AT A KEYBOARD, where "run
-        # scripts/test.sh all before committing" is advice a person can take.
-        # In CI there is nobody to take it and a runner already standing idle,
-        # so the honest thing is to spend the runner rather than print advice
-        # into a log nobody reads on a green run.
-        #
-        # ⚠ Fail-closed, like every other escalation in this driver: unable to
-        # narrow means run everything, never run less. The cost is that a push
-        # touching the harness pays a full lane — which is exactly what a change
-        # to the thing that decides coverage should cost.
-        if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-            echo "changed: the harness or a CI lane definition changed, and this is CI."
-            echo "  What narrows the module set is what moved, so it cannot narrow itself."
-            echo "  Escalating to the full gate rather than to a smoke set — see cmd_changed."
-            # ⚠ The mode goes WITH the escalation. Without it a ReleaseFast lane
-            # that escalates silently becomes a second Debug lane.
-            cmd_all ${changed_extra[@]+"${changed_extra[@]}"}
-            return
-        fi
         harness_smoke
-        return
+        smoke_done=1
     fi
 
     # ⭐ WHICH MODULES RUN IS DECIDED BY STAMPS (2026-09-18), not by the diff.
@@ -1359,6 +1335,15 @@ cmd_changed() {
         echo "              the gates that read them still run below."
     fi
 
+    if [[ $smoke_done -eq 1 ]]; then
+        # Every check already ran in the smoke set; only modules are left.
+        if [[ -n "${closure// /}" ]]; then
+            run_modules "$closure"
+            stamps_record "$closure" "$lane"
+        fi
+        summary
+        exit 0
+    fi
     if [[ -z "$files" && -z "${closure// /}" ]]; then
         echo "changed: nothing to do"
         exit 0

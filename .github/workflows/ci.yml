@@ -230,6 +230,19 @@ concurrency:
 # distinct per caching job, since matrix jobs sharing one key clobber each
 # other every run. Today only this job caches, so there is nothing to collide
 # with — that stops being true the moment a second one does.
+# ⛔⛔ DRY RUN IS ON (2026-09-18). While this says "1", NOTHING in this workflow
+# compiles or tests anything: every `scripts/test.sh` step prints what it
+# would run and passes, and the peer installs, build caches, root `tc` step
+# and example-apps build are skipped. What IS real: module selection,
+# fingerprints, stamps (kept under separate `dry-` artifacts with `DRY` in the
+# lane key, so they can never stand in for real ones), shards, the plan's
+# coverage checks and the gate. It exists to debug this pipeline without a
+# 90-minute matrix per attempt. A green run here proves the plumbing and
+# NOTHING about the code, and `scripts/tag.sh` refuses to tag while it is on.
+# Set it to "0" -- or delete these lines -- to make CI real again.
+env:
+  ZIGLIBS_DRY_RUN: "1"
+
 jobs:
   scoped:
     # ⚠ AND NOT ON A DISPATCH EITHER. A manual run exists to exercise the FULL
@@ -296,6 +309,10 @@ jobs:
         id: gen
         run: echo "week=$(date -u +%GW%V)" >> "$GITHUB_OUTPUT"
       - name: Cache Zig build artifacts
+        # Off in a dry run: an almost empty tree saved under the exact key
+        # would be restored as a HIT by the first real run, which then saves
+        # nothing (an exact hit never saves) -- a cold cache that reads warm.
+        if: env.ZIGLIBS_DRY_RUN != '1'
         uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
@@ -325,6 +342,7 @@ jobs:
       # runs all 225 modules, and doing that with no peers installed would
       # report green over every live test in the collection.
       - name: Close the environment gaps the gate reports
+        if: env.ZIGLIBS_DRY_RUN != '1'
         continue-on-error: true
         # `tests`, not `all`: this job runs `test.sh changed`, which runs tests
         # and examples and never `interop-*`. Since 2026-09-06 the wolfSSL and
@@ -373,7 +391,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
-          bash scripts/ci-stamps.sh fetch stamps-scoped-${{ matrix.shard }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+          bash scripts/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-scoped-${{ matrix.shard }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test changed modules
         env:
           ZIGLIBS_LANE: changed modules [${{ matrix.shard }}]
@@ -411,7 +429,7 @@ jobs:
         if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
-          name: stamps-scoped-${{ matrix.shard }}-${{ runner.arch }}
+          name: ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-scoped-${{ matrix.shard }}-${{ runner.arch }}
           path: ${{ runner.temp }}/stamps/stamps.tsv
           if-no-files-found: ignore
 
@@ -755,7 +773,7 @@ jobs:
         # while the lanes that take 33 to 51 minutes compete for the remainder.
         # Those three are 87-89 % compile by wall-clock, which is precisely what
         # a build cache is for.
-        if: matrix.cache
+        if: matrix.cache && env.ZIGLIBS_DRY_RUN != '1'
         uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}/.zig-cache
@@ -851,7 +869,7 @@ jobs:
         # `interop` is the C-compiler/wolfSSL and four-Python-oracle set that
         # ONLY `zig build interop-<m>` reaches. A lane declares what it will
         # actually use, and an empty string still reads as false here.
-        if: matrix.peers
+        if: matrix.peers && env.ZIGLIBS_DRY_RUN != '1'
         # ⚠ SHARED WITH THE `scoped` JOB, deliberately. This was inline here
         # until 2026-08-15, which is precisely why the lane that gates every
         # push had none of it. Two copies of an install list drift; one script
@@ -867,7 +885,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/stamps"
-          bash scripts/ci-stamps.sh fetch stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
+          bash scripts/ci-stamps.sh fetch ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }} "$RUNNER_TEMP/stamps/stamps.tsv"
       - name: Test (${{ matrix.name }})
         env:
           ZIGLIBS_STAMPS: ${{ runner.temp }}/stamps/stamps.tsv
@@ -917,7 +935,7 @@ jobs:
         # shape it was written to fix.
         # Only where module TESTS run. The examples and checks lanes have no
         # business paying for a root netns they never enter.
-        if: matrix.tc
+        if: matrix.tc && env.ZIGLIBS_DRY_RUN != '1'
         # ⚠ THE ONE `zig build` IN THIS FILE THAT IS NOT MEMORY-CAPPED, and as
         # of 2026-09-09 that is DECIDED rather than outstanding. `scripts/capped`
         # exists to stop a runaway build from taking down a DEVELOPER DESKTOP:
@@ -958,7 +976,7 @@ jobs:
         if: success() && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
-          name: stamps-full-${{ matrix.cachekey }}-${{ runner.arch }}
+          name: ${{ env.ZIGLIBS_DRY_RUN == '1' && 'dry-' || '' }}stamps-full-${{ matrix.cachekey }}-${{ runner.arch }}
           path: ${{ runner.temp }}/stamps/stamps.tsv
           if-no-files-found: ignore
       - name: Report the cache footprint and what this runner is
@@ -1099,6 +1117,7 @@ jobs:
       # the mode a consumer is most likely to build. This repository has shipped
       # exactly that defect.
       - name: example-apps built and run against this commit
+        if: env.ZIGLIBS_DRY_RUN != '1'
         run: bash scripts/check-apps.sh --run
       # ⭐ THE DOWNLOADER'S PATH, and it exists only on a tag ref.
       #
@@ -1117,7 +1136,7 @@ jobs:
       # `--pinned` proves that condition itself and refuses otherwise, so this
       # `if` and the script agree or the job goes red rather than vacuous.
       - name: example-apps through their pins (tag refs only)
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') && env.ZIGLIBS_DRY_RUN != '1'
         run: bash scripts/check-apps.sh --pinned
 
   gate:
@@ -1145,6 +1164,9 @@ jobs:
           CONSUMER: ${{ needs.consumer.result }}
         run: |
           echo "scoped=$SCOPED  full=$FULL  consumer=$CONSUMER  tag=$IS_TAG  dispatch=$IS_DISPATCH"
+          if [ "${ZIGLIBS_DRY_RUN:-0}" = 1 ]; then
+            echo "::warning::DRY RUN -- nothing was compiled or tested. This result is about the pipeline, not the code."
+          fi
           if [ "$IS_TAG" = true ] || [ "$IS_DISPATCH" = true ]; then
             ran_name=full;   ran=$FULL;   idle_name=scoped; idle=$SCOPED
           else
