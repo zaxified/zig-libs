@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-18** — **BEHAVIOURAL, not breaking (performance under load):** the module's
+  spinlock yields the CPU after 64 failed tries instead of spinning forever. A pure spin
+  is fair only while every contender has a core; with more runnable threads than cores a
+  waiter burns its whole time slice while the lock's holder is descheduled. Measured on
+  the `AccessLog F4` test (8 threads x 400 lines x 3 rounds, ReleaseSafe): 0.7 s on 8 or
+  2 cores but **49.8 s on 1 core** before, 3.4-4.4 s after; it had run past its 3-minute
+  limit on the 4-core arm64 CI runner. The F4 bench on 8 cores moved within its noise
+  (one run per arm; CPU per line at 8 threads fell, 7,564 -> 5,776 ns file sink). An
+  uncontended or briefly held lock never reaches the yield.
+
 - **2026-09-15** — A1 fix campaign, F4 (performance, concurrency):
   `AccessLog.log` with `synchronized = true` no longer holds its spinlock
   across `writer.flush()`. Every other request thread used to spin for the

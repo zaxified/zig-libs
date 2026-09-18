@@ -84,19 +84,38 @@ const Allocator = std.mem.Allocator;
 /// Spinlock acquire (std SmpAllocator pattern) — see the module doc for why
 /// a spinlock and what it guards.
 ///
-/// ⚠ Tried and measured NOT to help (kept pure spin instead): replacing the
-/// `spinLoopHint` loop with a few spins then `std.Thread.yield()` (Zig 0.16
-/// std has no io-less blocking mutex). On an 8-core box with 8 contending
-/// threads there is no idle core for `sched_yield` to hand off to, so it
-/// just adds syscall overhead on top of the same busy-wait: measured worse,
-/// not better, on both the concurrent-scrape and the slow-sink benchmarks
-/// (see the module's audit F2/F4 disposition for the numbers). Left as pure
-/// spin; F2 (2026-09-15) and F4 (2026-09-16) were instead fixed by shrinking
-/// the critical sections — `writeText` snapshots under the lock and formats
-/// outside it, `AccessLog.log` never holds the lock across writer I/O.
+/// History: a yield was tried once before and measured worse on an 8-core box
+/// with 8 contending threads, where there is no idle core for `sched_yield`
+/// to hand off to (audit F2/F4 disposition), so the lock stayed a pure spin
+/// and F2 (2026-09-15) and F4 (2026-09-16) were fixed by shrinking the
+/// critical sections instead — `writeText` snapshots under the lock and
+/// formats outside it, `AccessLog.log` never holds the lock across writer
+/// I/O. That measurement never had more threads than cores; the bounded spin
+/// below is for that case, and the F4 bench is re-measured with it.
 fn lockSpin(m: *std.atomic.Mutex) void {
-    while (!m.tryLock()) std.atomic.spinLoopHint();
+    var spins: u32 = 0;
+    while (!m.tryLock()) {
+        if (spins < spin_before_yield) {
+            spins += 1;
+            std.atomic.spinLoopHint();
+        } else {
+            // ⚠ Bounded spin, then yield (2026-09-18). A pure spin is only
+            // fair while every contender has a core: with more runnable
+            // threads than cores, a waiter burns its whole time slice while
+            // the holder is descheduled. Measured on the `AccessLog F4`
+            // test (8 threads x 400 lines x 3 rounds, ReleaseSafe): 0.7 s on
+            // 8 or 2 cores, 49.8 s on 1 core -- and past its 3-minute limit
+            // on the 4-core arm64 CI runner, which runs many test binaries
+            // at once. The yield only starts after `spin_before_yield`
+            // failed tries, so an uncontended or briefly held lock never
+            // reaches it.
+            std.Thread.yield() catch {};
+        }
+    }
 }
+
+/// Failed `tryLock`s `lockSpin` spins through before it starts yielding.
+const spin_before_yield = 64;
 
 // ── clock injection ─────────────────────────────────────────────────────────
 
