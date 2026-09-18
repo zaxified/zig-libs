@@ -1381,6 +1381,11 @@ cmd_changed() {
     [[ $mc -eq 1 || -n "${seeds// /}" || -n "${docs_only// /}" ]] && mt=1
     closure_has() { case " $closure " in *" $1 "*) return 0 ;; esac; return 1; }
     stamps_narrow "$closure" "${G_NAMES[*]}"
+    # The modules a comment-reading scan must look at: the unproven ones plus
+    # every module the diff touched (a comment edit re-keys nothing).
+    local -a touched_args=()
+    local tm
+    for tm in $(printf '%s\n' $closure $seeds | sort -u); do touched_args+=("-Dmodule=$tm"); done
 
     if [[ $trigger_catalog -eq 1 ]]; then
         step "check-catalog (README.md changed)" zig build check-catalog
@@ -1423,7 +1428,9 @@ cmd_changed() {
     # (~1.4 s): a source scan that refuses a module whose own code runs a
     # foreign toolchain. See phase_checks_fast_tail for the rule in full.
     (( mt )) && step "check-module-purity" zig build check-module-purity
-    (( mc )) && step "check-global-alloc" zig build check-global-alloc
+    # Reads `// global-alloc-ok:` exemptions, so it is a text scan: `mt`,
+    # narrowed to the unproven and the touched modules.
+    (( mt )) && step "check-global-alloc" zig build check-global-alloc ${touched_args[@]+"${touched_args[@]}"}
 
     # 32-bit compile of every `platform = .any` module. ~6s cold for all 195,
     # near-free warm, and it is the only thing in this gate that can see a class
@@ -1476,7 +1483,7 @@ cmd_changed() {
     # the emulation is bypassed. See the script header.
     closure_has falcon && step "check-fp-freedom" ./scripts/check-fp-freedom.sh
     # Strips comments before it scans, so a fingerprint change is its signal.
-    (( mc )) && step "check-ct-compare" ./scripts/check-ct-compare.py
+    (( mc )) && step "check-ct-compare" ./scripts/check-ct-compare.py "--modules=${closure// /,}"
     (( mt )) && step "check-skip-as-pass" ./scripts/check-skip-as-pass.py
 
     # `zig build check-fuzz` proves a harness EXISTS; this proves it READS its

@@ -133,11 +133,15 @@ def measure(path: str):
     return count_calls(src, ct_roots, CT_FNS), count_calls(src, plain_roots, PLAIN_FNS)
 
 
-def scan_all():
-    """Every module source file that makes at least one constant-time comparison."""
+def scan_all(only=None):
+    """Every module source file that makes at least one constant-time comparison.
+
+    With `only`, just those modules' files -- see `--modules` in main()."""
     found = {}
     modules_dir = os.path.join(REPO, "modules")
     for module in sorted(os.listdir(modules_dir)):
+        if only is not None and module not in only:
+            continue
         src_dir = os.path.join(modules_dir, module, "src")
         if not os.path.isdir(src_dir):
             continue
@@ -191,7 +195,19 @@ def write_pin(rows):
 
 def main() -> int:
     update = "--update" in sys.argv
-    found = scan_all()
+    # `--modules a,b` (from `scripts/test.sh changed`): scan and compare only
+    # these modules' files. The pin is per file and a file's counts depend on
+    # that file alone, so the rows of other modules cannot change unless their
+    # own source did -- which re-keys them and puts them in the list. The scan
+    # of all 230 modules is 7 s; the list is usually one or two.
+    only = None
+    for arg in sys.argv[1:]:
+        if arg.startswith("--modules="):
+            only = {m for m in arg.split("=", 1)[1].split(",") if m}
+    if update and only is not None:
+        print("check-ct-compare: --update rewrites the whole pin; it takes no --modules", file=sys.stderr)
+        return 2
+    found = scan_all(only)
 
     if update:
         write_pin(found)
@@ -210,13 +226,16 @@ def main() -> int:
     # ⛔ A gate that scans nothing also exits zero. If the scan finds no
     # constant-time comparison anywhere, the pin cannot have been satisfied
     # honestly and the scanner itself is what broke.
-    if not found:
+    if not found and only is None:
         print(
             "check-ct-compare: the scan found NO constant-time comparison in any module. "
             "That is not a code change, that is this script failing to see the tree.",
             file=sys.stderr,
         )
         return 2
+
+    if only is not None:
+        pinned = {p: v for p, v in pinned.items() if p.split("/")[1] in only}
 
     fail = 0
     for path in sorted(pinned):

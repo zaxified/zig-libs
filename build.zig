@@ -418,6 +418,7 @@ pub fn build(b: *std.Build) void {
     for (only_modules) |name| {
         if (moduleIndex(name) == null) std.debug.panic("-Dmodule={s}: no such module", .{name});
     }
+    selected_modules = only_modules;
 
     // Gate for the "a body nothing references is never analysed" class — see
     // the `force_mod` block in pass 2 for what it compiles and why.
@@ -1838,6 +1839,10 @@ fn hashZigTokens(h: *std.crypto.hash.sha2.Sha256, src: [:0]const u8, skip_decl: 
         h.update("\x00");
     }
 }
+
+/// `-Dmodule` as given, for the source-scanning steps whose make functions
+/// cannot see `build()`'s locals. Empty = every module.
+var selected_modules: []const []const u8 = &.{};
 
 /// `-Dmodule` membership: every module when the list is empty.
 fn inList(name: []const u8, list: []const []const u8) bool {
@@ -5791,6 +5796,7 @@ fn checkGlobalAlloc(step: *std.Build.Step, options: std.Build.Step.MakeOptions) 
     var n_exempt: usize = 0;
 
     for (module_list) |m| {
+        if (!inList(m.name, selected_modules)) continue;
         const dir_path = b.fmt("modules/{s}/src", .{m.name});
         var dir = b.build_root.handle.openDir(io, dir_path, .{ .iterate = true }) catch continue;
         defer dir.close(io);
