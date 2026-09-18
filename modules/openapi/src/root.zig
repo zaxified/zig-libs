@@ -1496,53 +1496,85 @@ fn specWorker(c: *SpecWorkerCtx) void {
     };
 }
 
-test "endpoint: concurrent first callers do not serialize behind a spinning lock (F2)" {
-    if (@import("builtin").mode == .Debug) return; // wall-time assertion needs ReleaseFast
-    const gpa = std.heap.smp_allocator;
-    const n: usize = 4000;
+/// An allocator that, on every call, records whether the Endpoint's lock was
+/// held at that moment. `Generator.build` allocates through `Endpoint.gpa`,
+/// so this sees the lock from INSIDE the build.
+const LockProbeAllocator = struct {
+    inner: Allocator,
+    lock: *std.atomic.Mutex,
+    calls: usize = 0,
+    calls_under_lock: usize = 0,
+
+    fn allocator(p: *LockProbeAllocator) Allocator {
+        return .{ .ptr = p, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn probe(p: *LockProbeAllocator) void {
+        p.calls += 1;
+        if (p.lock.tryLock()) p.lock.unlock() else p.calls_under_lock += 1;
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const p: *LockProbeAllocator = @ptrCast(@alignCast(ctx));
+        p.probe();
+        return p.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const p: *LockProbeAllocator = @ptrCast(@alignCast(ctx));
+        p.probe();
+        return p.inner.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const p: *LockProbeAllocator = @ptrCast(@alignCast(ctx));
+        p.probe();
+        return p.inner.rawRemap(m, a, n, ra);
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const p: *LockProbeAllocator = @ptrCast(@alignCast(ctx));
+        p.inner.rawFree(m, a, ra);
+    }
+};
+
+test "endpoint: the document is built with the lock released (F2)" {
+    // F2: `spec()` held its spinlock across the whole `Generator.build`, so
+    // concurrent first callers spun behind hundreds of ms of work (932 ->
+    // 1762 ms wall with more callers, A1/openapi.md F2). The fix builds
+    // outside the lock. This checks that structurally rather than by wall
+    // time, which a loaded CI runner cannot be trusted with: every
+    // allocation the build makes looks at the lock, and none may find it
+    // held. (The only allocation-free work under the lock is the cache peek
+    // and publish.)
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try addBenchRoutes(&r, 50, false);
+
+    var e: Endpoint = .{ .gpa = undefined, .router = &r, .info = .{ .title = "T", .version = "1" } };
+    var probe: LockProbeAllocator = .{ .inner = testing.allocator, .lock = &e.lock };
+    e.gpa = probe.allocator();
+    defer e.deinit();
+
+    _ = try e.spec();
+    try testing.expect(probe.calls > 0); // the build did allocate, so it was observed
+    try testing.expectEqual(@as(usize, 0), probe.calls_under_lock);
+}
+
+test "endpoint: concurrent first callers all get the one cached document (F2)" {
+    // testing.allocator is thread-safe and reports a leak, so a loser of the
+    // publish race that kept its duplicate document fails this test.
+    const gpa = testing.allocator;
     var r = router.Router.init(gpa);
     defer r.deinit();
-    try addBenchRoutes(&r, n, false);
+    try addBenchRoutes(&r, 400, false);
 
-    // Arm A: one caller, alone — the reference cost.
-    var wall_single: u64 = 0;
-    {
-        var e: Endpoint = .{ .gpa = gpa, .router = &r, .info = .{ .title = "T", .version = "1" } };
-        defer e.deinit();
-        const w0 = monoNs();
-        _ = try e.spec();
-        wall_single = monoNs() - w0;
-    }
-
-    // Arm B: several callers racing on the first request of a FRESH
-    // Endpoint (its own empty cache, so all of them actually race to build).
-    const cpus = std.Thread.getCpuCount() catch 4;
-    const nthreads = @min(cpus, 8);
-    var wall_concurrent: u64 = 0;
-    {
-        var e: Endpoint = .{ .gpa = gpa, .router = &r, .info = .{ .title = "T", .version = "1" } };
-        defer e.deinit();
-        var ctx: SpecWorkerCtx = .{ .e = &e };
-        var threads: [8]std.Thread = undefined;
-        const w0 = monoNs();
-        for (0..nthreads) |k| threads[k] = try std.Thread.spawn(.{}, specWorker, .{&ctx});
-        for (0..nthreads) |k| threads[k].join();
-        wall_concurrent = monoNs() - w0;
-        try testing.expectEqual(@as(u32, 0), ctx.err_count.load(.monotonic));
-    }
-
-    // Printed only when the bound below fails: the lane treats stderr from a
-    // passing test as a FAIL (scripts/lib/test-lib.sh).
-    errdefer std.debug.print("\n[F2] 1 caller wall={d}ns, {d} callers wall={d}ns\n", .{ wall_single, nthreads, wall_concurrent });
-    // Before the fix, N callers spinning on `lockSpin` held across the
-    // WHOLE build made wall time go UP with concurrency (932ms -> 1762ms,
-    // +89%, measured in A1/openapi.md F2) — a pure spinlock is slower than
-    // no coordination at all when what it guards is not O(1). After it,
-    // concurrent first-callers build in parallel (at worst duplicating the
-    // walk a bounded number of times, never serialized behind a spin), so
-    // wall time under N callers must stay within a generous multiple of
-    // the single-caller wall time, not blow past it.
-    try testing.expect(wall_concurrent < wall_single * 3 + 50 * std.time.ns_per_ms);
+    var e: Endpoint = .{ .gpa = gpa, .router = &r, .info = .{ .title = "T", .version = "1" } };
+    defer e.deinit();
+    var ctx: SpecWorkerCtx = .{ .e = &e };
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, specWorker, .{&ctx});
+    for (threads) |t| t.join();
+    try testing.expectEqual(@as(u32, 0), ctx.err_count.load(.monotonic));
+    // Every later call returns the one published document.
+    const a = try e.spec();
+    const b = try e.spec();
+    try testing.expect(a.json.ptr == b.json.ptr);
 }
 
 test "generate: route-table build time scales linearly, not quadratically, with route count (F7)" {
