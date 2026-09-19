@@ -156,7 +156,8 @@ pub const Error = error{
 pub const Disposition = enum {
     /// Keep serving this connection.
     keep,
-    /// Tear it down (DISCONNECT received, take-over, or refused CONNECT).
+    /// Tear it down (DISCONNECT received, take-over, refused CONNECT, or a
+    /// PUBLISH the tap refused).
     close,
 };
 
@@ -666,22 +667,33 @@ pub const Config = struct {
     authorizeFn: ?*const fn (ctx: ?*anyopaque, req: AclRequest) bool = null,
     acl_ctx: ?*anyopaque = null,
 
-    /// Optional observer of every PUBLISH the broker accepts. Null = nothing is
-    /// observed and nothing changes; this hook has no effect on routing.
+    /// Optional tap on every PUBLISH the ACL allowed. Null = every allowed
+    /// publish is taken, exactly as if the tap returned `.accept`.
     ///
     /// It exists because `authorizeFn` cannot serve: `AclRequest` carries the
-    /// topic but not the payload, and returns a verdict rather than observing.
-    /// A bridge, a recorder or a protocol proxy needs the message itself, and
-    /// without this the only way to obtain it is to register a loopback
-    /// subscriber and re-decode the broker's own output.
+    /// topic but not the payload. A bridge, a recorder or a store needs the
+    /// message itself, and without this the only way to obtain it is to register
+    /// a loopback subscriber and re-decode the broker's own output — which sees
+    /// the message only after the publisher has been acknowledged.
     ///
-    /// Called after the ACL verdict and **before** fan-out, so an observer sees
-    /// exactly what the broker accepted whether or not delivery to subscribers
-    /// then succeeds. A denied publish is not observed — the hook reports what
-    /// the broker took, not what a client attempted.
+    /// Called after the ACL verdict and **before** fan-out, the retained store
+    /// and the PUBACK. A denied publish is not seen — the hook is about what the
+    /// broker would take, not what a client attempted. The return value decides:
+    ///  - `.accept` — the broker takes the message: retained store, fan-out,
+    ///    PUBACK, all as without a tap.
+    ///  - `.refuse` — the broker does NOT take it, and says so the only way
+    ///    MQTT 3.1.1 can: no fan-out, no retained update, **no PUBACK**, and the
+    ///    connection is closed (`Disposition.close`, counted in
+    ///    `tapRefusals`). A QoS 1 publisher still holds the message as
+    ///    unacknowledged and sends it again; a QoS 0 message is gone, which is
+    ///    what QoS 0 promised. Packets pipelined behind the refused one are not
+    ///    processed. The close is not a DISCONNECT from the client, so its Will
+    ///    is published (spec 3.1.2.5). This is how a store that could not write
+    ///    the message keeps the publisher's copy alive instead of acknowledging
+    ///    one it lost — an ACL denial cannot do that, it PUBACKs.
     ///
     /// ⚠ `topic` and `payload` point into the publishing connection's receive
-    /// buffer and are valid **only for the duration of the call**. An observer
+    /// buffer and are valid **only for the duration of the call**. A tap
     /// that keeps them must copy.
     ///
     /// It runs on the publisher's own thread with **no broker lock held**. This
@@ -700,8 +712,16 @@ pub const Config = struct {
         payload: []const u8,
         qos: QoS,
         retain: bool,
-    ) void = null,
+    ) PublishVerdict = null,
     publish_ctx: ?*anyopaque = null,
+};
+
+/// What `Config.onPublishFn` decides about one PUBLISH.
+pub const PublishVerdict = enum {
+    /// Take the message: retained store, fan-out, PUBACK.
+    accept,
+    /// Do not take it: none of the above, and close the connection.
+    refuse,
 };
 
 /// One retained message snapshotted (owned dups) under the global lock for
@@ -753,6 +773,9 @@ pub const Broker = struct {
     /// disappearing: a non-zero value means subscribers were not told about a
     /// client that vanished.
     will_failures: std.atomic.Value(usize) = .init(0),
+    /// Count of PUBLISHes `Config.onPublishFn` refused — each one closed its
+    /// connection unacknowledged.
+    tap_refusals: std.atomic.Value(usize) = .init(0),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -800,6 +823,12 @@ pub const Broker = struct {
     /// Non-zero means a client vanished and its subscribers were not told.
     pub fn willFailures(b: *const Broker) u64 {
         return b.will_failures.load(.monotonic);
+    }
+
+    /// How many PUBLISHes the tap refused. Each one closed the publisher's
+    /// connection without a PUBACK, so a QoS 1 publisher still holds it.
+    pub fn tapRefusals(b: *const Broker) u64 {
+        return b.tap_refusals.load(.monotonic);
     }
 
     /// Register a new connection over `transport`; returns an owned pointer
@@ -928,8 +957,8 @@ pub const Broker = struct {
     ///  - **No ACL call.** `aclAllows` answers "may *this connection* publish
     ///    here", and the server is not a connection. A server that wants to
     ///    police its own messages does so before calling this.
-    ///  - **The tap does not fire.** `Config.onPublishFn` observes what the
-    ///    broker *accepted from its clients*; a server-originated message is
+    ///  - **The tap does not fire.** `Config.onPublishFn` sees what the broker
+    ///    is about to take *from its clients*; a server-originated message is
     ///    the caller's own action, which the caller already knows about.
     ///    Feeding it back would make a bridge echo itself.
     ///
@@ -1365,10 +1394,19 @@ pub const Broker = struct {
         // ACL (FIX D): a denied PUBLISH is silently dropped — not retained, not
         // fanned out — but still PUBACKed so the publisher stays well-behaved.
         if (b.aclAllows(conn, pub_pkt.topic, .publish)) {
-            // Observer before delivery: what the broker accepted is a fact even
-            // if fan-out then fails, and `fanout` can return an error.
+            // Tap before delivery: what the broker took is a fact even if
+            // fan-out then fails, and `fanout` can return an error. A refusal
+            // must come before `fanout` (which also writes the retained store)
+            // and before the PUBACK below — acknowledging a message the tap
+            // could not take is exactly what the verdict exists to prevent.
             if (b.config.onPublishFn) |tap| {
-                tap(b.config.publish_ctx, pub_pkt.topic, pub_pkt.payload, pub_pkt.qos, pub_pkt.retain);
+                switch (tap(b.config.publish_ctx, pub_pkt.topic, pub_pkt.payload, pub_pkt.qos, pub_pkt.retain)) {
+                    .accept => {},
+                    .refuse => {
+                        _ = b.tap_refusals.fetchAdd(1, .monotonic);
+                        return .close;
+                    },
+                }
             }
             try b.fanout(pub_pkt);
         }
@@ -3116,6 +3154,8 @@ test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback
 
 const TapRecorder = struct {
     calls: usize = 0,
+    /// What every call answers.
+    verdict: PublishVerdict = .accept,
     topic: [64]u8 = undefined,
     topic_len: usize = 0,
     payload: [64]u8 = undefined,
@@ -3123,7 +3163,7 @@ const TapRecorder = struct {
     qos: QoS = .at_most_once,
     retain: bool = false,
 
-    fn onPublish(ctx: ?*anyopaque, t: []const u8, pl: []const u8, q: QoS, r: bool) void {
+    fn onPublish(ctx: ?*anyopaque, t: []const u8, pl: []const u8, q: QoS, r: bool) PublishVerdict {
         const self: *TapRecorder = @ptrCast(@alignCast(ctx.?));
         self.calls += 1;
         @memcpy(self.topic[0..t.len], t);
@@ -3132,6 +3172,7 @@ const TapRecorder = struct {
         self.payload_len = pl.len;
         self.qos = q;
         self.retain = r;
+        return self.verdict;
     }
 
     fn seenTopic(self: *const TapRecorder) []const u8 {
@@ -3203,6 +3244,151 @@ test "publish tap does not observe what the ACL refused" {
     try testing.expectEqual(@as(u16, 9), ack.puback);
 
     b.remove(conn);
+}
+
+test "a refused publish is not taken: no PUBACK, no fan-out, no retained update, closed" {
+    var rec: TapRecorder = .{ .verdict = .refuse };
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    // A retained value that exists before, so "not updated" is distinguishable
+    // from "cleared" and from "never there".
+    try b.publish("sn/1/data", "before", .at_most_once, true);
+
+    var sub_tt: TestTransport = .{};
+    const sub = try connectClient(&b, &sub_tt, "sub", 0, 0);
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "sn/1/data", .qos = .at_least_once }});
+    _ = try sub_tt.next(); // SUBACK
+    _ = try sub_tt.next(); // retained "before"
+    const sub_len = sub_tt.len;
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+    const pub_len = tt.len;
+    try testing.expectEqual(Disposition.close, try feedPublish(&b, conn, .{
+        .topic = "sn/1/data",
+        .payload = "refused",
+        .qos = .at_least_once,
+        .packet_id = 7,
+        .retain = true,
+    }));
+
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqual(@as(u64, 1), b.tapRefusals());
+    // Not one byte to the publisher: a PUBACK here would acknowledge a message
+    // nobody took, which is the whole reason the verdict exists.
+    try testing.expectEqual(pub_len, tt.len);
+    // The subscriber heard nothing.
+    try testing.expectEqual(sub_len, sub_tt.len);
+    b.remove(conn);
+
+    // The retained store still holds the value from before.
+    var late_tt: TestTransport = .{};
+    const late = try connectClient(&b, &late_tt, "late", 0, 0);
+    try feedSubscribe(&b, late, 1, &.{.{ .filter = "sn/1/data", .qos = .at_most_once }});
+    _ = try late_tt.next(); // SUBACK
+    const ret = (try late_tt.next()).?;
+    try testing.expect(ret == .publish);
+    try testing.expectEqualStrings("before", ret.publish.payload);
+
+    b.remove(late);
+    b.remove(sub);
+}
+
+test "an accepted publish is taken exactly as without a tap" {
+    // The negative control for the test above: the same publish, `.accept`.
+    var rec: TapRecorder = .{ .verdict = .accept };
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    var sub_tt: TestTransport = .{};
+    const sub = try connectClient(&b, &sub_tt, "sub", 0, 0);
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "sn/1/data", .qos = .at_most_once }});
+    _ = try sub_tt.next(); // SUBACK
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, conn, .{
+        .topic = "sn/1/data",
+        .payload = "taken",
+        .qos = .at_least_once,
+        .packet_id = 7,
+        .retain = true,
+    }));
+
+    try testing.expectEqual(@as(u64, 0), b.tapRefusals());
+    const ack = (try tt.next()).?;
+    try testing.expect(ack == .puback);
+    try testing.expectEqual(@as(u16, 7), ack.puback);
+    const got = (try sub_tt.next()).?;
+    try testing.expectEqualStrings("taken", got.publish.payload);
+
+    var late_tt: TestTransport = .{};
+    const late = try connectClient(&b, &late_tt, "late", 0, 0);
+    try feedSubscribe(&b, late, 1, &.{.{ .filter = "sn/1/data", .qos = .at_most_once }});
+    _ = try late_tt.next(); // SUBACK
+    try testing.expectEqualStrings("taken", (try late_tt.next()).?.publish.payload);
+
+    b.remove(late);
+    b.remove(conn);
+    b.remove(sub);
+}
+
+test "packets pipelined behind a refused publish are not processed" {
+    // A publisher that sends two in one segment must not get the second
+    // acknowledged: its connection ended at the first, and after reconnecting
+    // it resends both.
+    var rec: TapRecorder = .{ .verdict = .refuse };
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+    const pub_len = tt.len;
+    var buf: [128]u8 = undefined;
+    const first = try packet.encodePublish(&buf, .{ .topic = "a", .payload = "1", .qos = .at_least_once, .packet_id = 1 });
+    var buf2: [64]u8 = undefined;
+    const second = try packet.encodePublish(&buf2, .{ .topic = "a", .payload = "2", .qos = .at_least_once, .packet_id = 2 });
+    try b.feed(conn, first);
+    try b.feed(conn, second);
+    try testing.expectEqual(Disposition.close, try b.process(conn, 1));
+
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqual(pub_len, tt.len);
+    b.remove(conn);
+}
+
+test "a refusal is not a DISCONNECT: the publisher's Will is published" {
+    var rec: TapRecorder = .{ .verdict = .refuse };
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    var watcher_tt: TestTransport = .{};
+    const watcher = try connectClient(&b, &watcher_tt, "watcher", 0, 0);
+    try feedSubscribe(&b, watcher, 1, &.{.{ .filter = "sn/1/status", .qos = .at_most_once }});
+    _ = try watcher_tt.next(); // SUBACK
+
+    var tt: TestTransport = .{};
+    const conn = try connectWithWill(&b, &tt, "pub", .{ .topic = "sn/1/status", .message = "disconnected" });
+    try testing.expectEqual(Disposition.close, try feedPublish(&b, conn, .{ .topic = "sn/1/data", .payload = "x" }));
+    b.remove(conn);
+
+    const will = (try watcher_tt.next()).?;
+    try testing.expectEqualStrings("sn/1/status", will.publish.topic);
+    try testing.expectEqualStrings("disconnected", will.publish.payload);
+    b.remove(watcher);
 }
 
 // ── Will / LWT (spec 3.1.2.5, 3.1.3.3, 3.14.4) ──────────────────────────────

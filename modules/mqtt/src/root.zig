@@ -97,6 +97,7 @@ pub const AuthDecision = broker.AuthDecision;
 pub const AuthRequest = broker.AuthRequest;
 pub const AclRequest = broker.AclRequest;
 pub const Operation = broker.Operation;
+pub const PublishVerdict = broker.PublishVerdict;
 
 // Convenience re-exports of the codec types used at the client surface.
 pub const QoS = packet.QoS;

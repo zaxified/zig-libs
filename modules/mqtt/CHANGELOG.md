@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-19** — **BREAKING:** `Config.onPublishFn` returns the new `PublishVerdict`
+  (`.accept` / `.refuse`) instead of `void`; an existing tap migrates by returning `.accept`, which
+  changes nothing. Before this the tap could observe a publish but not stop it, and it runs before
+  the PUBACK — so a consumer that *stores* what it taps (its first one: a store-and-forward hub
+  behind a proxy) had no way to say "I could not write this" except to let the broker acknowledge
+  a message it had just lost. An ACL denial cannot say it either: it PUBACKs by design. On
+  `.refuse` the broker does not take the message — no retained update, no fan-out, **no PUBACK** —
+  and returns `Disposition.close`, counted by the new `Broker.tapRefusals()`. That is the only
+  "no" MQTT 3.1.1 has for a server: a QoS 1 publisher still holds the message unacknowledged and
+  sends it again after reconnecting; a QoS 0 one is gone, which is what QoS 0 promised. Packets
+  pipelined behind the refused one are not processed, and the close is not a DISCONNECT, so the
+  publisher's Will is published (3.1.2.5). `PublishVerdict` is also re-exported from the root.
+  Four regressions (refused: no PUBACK byte, subscriber hears nothing, retained value from before
+  survives, `.close`, counter 1 · accepted: PUBACK, delivery and retained update as before, the
+  negative control · a second publish pipelined behind a refused one is neither tapped nor
+  acknowledged · the Will fires). Mutants, each RED: PUBACK sent on refuse (2 fail), fan-out before
+  the verdict (1), retained store updated on refuse (1), `.keep` instead of `.close` (3).
+  `scripts/modtest mqtt` **99/100** (1 skip).
+
 - **2026-09-16** — **BEHAVIOURAL (refuses one input it used to accept) + bug fix:** the A1 drift
   audit of everything that landed after `7888f3f5`, findings M1 and M2. Both were demonstrated
   with a probe before anything was changed.

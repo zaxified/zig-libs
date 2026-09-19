@@ -93,11 +93,17 @@ transport-agnostic client and a broker, all fully offline-testable.
     CONNACK code, since none of 3.2.2.3's codes describes it. Undeliverable
     wills are counted by `willFailures()` rather than lost silently.
 
-    **Observing traffic:** `Config.onPublishFn` is called for every PUBLISH the
-    broker accepts, before fan-out, with the topic and payload. It exists
-    because `authorizeFn` cannot serve — `AclRequest` carries no payload — and
-    because the alternative is registering a loopback subscriber and re-decoding
-    the broker's own output. Null by default; it never affects routing.
+    **Tapping traffic:** `Config.onPublishFn` is called for every PUBLISH the
+    ACL allowed, before the retained store, fan-out and PUBACK, with the topic
+    and payload. It exists because `authorizeFn` cannot serve — `AclRequest`
+    carries no payload — and because the alternative is registering a loopback
+    subscriber and re-decoding the broker's own output, after the publisher was
+    already acknowledged. It returns a `PublishVerdict`: `.accept` changes
+    nothing; `.refuse` means the broker does not take the message — no fan-out,
+    no retained update, no PUBACK, the connection is closed and
+    `tapRefusals()` counts it — so a QoS 1 publisher keeps its copy and sends
+    it again. That is how a store that failed to write keeps the message alive
+    instead of acknowledging one it lost. Null by default = accept everything.
 
     **Deliberately deferred (documented, not built):** QoS 2
     (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
