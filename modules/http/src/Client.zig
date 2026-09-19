@@ -2030,6 +2030,7 @@ fn readResponseHead(conn: *Conn) Error!h1.ResponseHead {
             error.ReadFailed => return conn.readFailure(),
             error.ConnectionClosed => return error.ConnectionClosed,
             error.HeadTooLarge => return error.HeadTooLarge,
+            error.MalformedHead => return error.MalformedResponse,
         };
         const head = h1.ResponseHead.parse(block) catch |err| switch (err) {
             error.MalformedHead => return error.MalformedResponse,

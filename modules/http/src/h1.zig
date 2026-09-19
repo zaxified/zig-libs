@@ -24,6 +24,8 @@ pub const ReadHeadError = error{
     ConnectionClosed,
     /// The head (or a single line of it) exceeds the provided buffer.
     HeadTooLarge,
+    /// A head line ended in a bare LF (no preceding CR) — see `readHead`.
+    MalformedHead,
 };
 
 /// One line as `takeLineInto` produced it.
@@ -46,6 +48,10 @@ const Line = struct {
     /// used `dest.len == 0` for discarded lines, so nothing about `bytes`
     /// could have bounded it).
     raw_len: usize,
+    /// The `\n` that ended the line was not preceded by `\r` on the wire —
+    /// read from the wire, not from `bytes`, so it holds however much of the
+    /// line `dest` kept.
+    bare_lf: bool,
 };
 
 /// Read one `\n`-terminated line into `dest`, scanning what has arrived and
@@ -75,6 +81,9 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
     // silently ended the head / the chunk trailer / the post-chunk CRLF,
     // letting a smuggled second message ride along as if it were body).
     var raw_len: usize = 0;
+    // Last byte consumed so far: the `\r` that makes a terminator a CRLF can
+    // arrive in an earlier read than its `\n`.
+    var prev: ?u8 = null;
     while (true) {
         const avail = r.peekGreedy(1) catch |err| switch (err) {
             error.ReadFailed => return error.ReadFailed,
@@ -82,6 +91,7 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
         };
         const nl = std.mem.indexOfScalar(u8, avail, '\n');
         const take = if (nl) |i| i + 1 else avail.len;
+        const before_nl: ?u8 = if (nl) |i| (if (i > 0) avail[i - 1] else prev) else null;
         raw_len += take;
         // Only worth scanning while it could still be blank, which is only
         // ever the terminator line and the first byte settles it.
@@ -95,8 +105,15 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
         @memcpy(dest[len..][0..n], avail[0..n]);
         len += n;
         if (n < take) overflow = true;
+        prev = avail[take - 1];
         r.toss(take);
-        if (nl != null) return .{ .bytes = dest[0..len], .overflow = overflow, .blank = blank and raw_len == 2, .raw_len = raw_len };
+        if (nl != null) return .{
+            .bytes = dest[0..len],
+            .overflow = overflow,
+            .blank = blank and raw_len == 2,
+            .raw_len = raw_len,
+            .bare_lf = before_nl != '\r',
+        };
     }
 }
 
@@ -109,6 +126,15 @@ fn takeLineInto(r: *Reader, dest: []u8) error{ ReadFailed, EndOfStream }!Line {
 /// so `r` is never asked for more contiguous bytes than it has. That is what
 /// lets a server run h1 over a reader that hands out one TLS record or one
 /// frame at a time.
+///
+/// A line ended by a bare LF is `MalformedHead` the moment it arrives — this
+/// module does not take RFC 9112 §2.2's bare-LF leniency (see `stripCrlf`).
+/// On the spot, because waiting for a CRLF terminator instead left a head
+/// whose every line ends in a bare LF with no end at all: the peer got no
+/// answer until a deadline closed the connection. And as an error, not as a
+/// block handed on for the parse to refuse: a bare LF in the terminator's
+/// place leaves the block ending `\r\n\n`, which the parse reads as a valid
+/// head (A1 http F4 again). The reader is left mid-head either way.
 pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
     var len: usize = 0;
     while (true) {
@@ -123,6 +149,7 @@ pub fn readHead(r: *Reader, buf: []u8) ReadHeadError![]const u8 {
         if (line.blank) return buf[0..len];
         if (line.overflow) return error.HeadTooLarge;
         len += line.bytes.len;
+        if (line.bare_lf) return error.MalformedHead;
     }
 }
 
@@ -1066,6 +1093,27 @@ test "readHead consumes the blank line and preserves raw lines" {
     try testing.expectEqualStrings("HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\n", head);
     // Body must remain unread on the stream.
     try testing.expectEqualStrings("BODY", try r.take(4));
+}
+
+test "readHead refuses a bare-LF line instead of waiting for a CRLF that never comes" {
+    // Every line ends in a bare LF, so there is no CRLF terminator anywhere.
+    // Before this, `readHead` read straight past all of it looking for one:
+    // on a fixed reader that is `ConnectionClosed`, on a live connection it
+    // was no answer until a deadline (qap conformance `http/400-closes`).
+    var buf: [256]u8 = undefined;
+    var all_lf: Reader = .fixed("GET /q HTTP/1.1\nHost: x\n\nNEXT");
+    try testing.expectError(error.MalformedHead, readHead(&all_lf, &buf));
+
+    // A bare LF where the terminator would be. Handing this block on for
+    // the parse to refuse would not do: `ResponseHead.parse` accepts
+    // "...\r\n\n", so the error has to come from here.
+    var lf_term: Reader = .fixed("HTTP/1.1 200 OK\r\nA: 1\r\n\nBODY");
+    try testing.expectError(error.MalformedHead, readHead(&lf_term, &buf));
+
+    // A CRLF split across two reads is not a bare LF: three bytes a record
+    // puts this request line's '\r' and '\n' in different records.
+    var split: RecordSource = .init("GET /suggest?q=abcde HTTP/1.1\r\n\r\n", 3);
+    try testing.expectEqualStrings("GET /suggest?q=abcde HTTP/1.1\r\n", try readHead(&split.reader, &buf));
 }
 
 test "readHead errors" {

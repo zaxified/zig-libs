@@ -1592,6 +1592,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
 
     const block = h1.readHead(in, bufs.head) catch |err| switch (err) {
         error.HeadTooLarge => return respondError(opts, out, date, 431),
+        error.MalformedHead => return respondError(opts, out, date, 400),
         error.ReadFailed, error.ConnectionClosed => return .close,
     };
     fireConnState(&opts, .active);
@@ -3848,6 +3849,13 @@ test "serveStream: bare-LF in the request head → 400, connection closes (smugg
     // Bare LF between two header lines is rejected the same way.
     const between = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\nAccept: */*\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, between, "HTTP/1.1 400 Bad Request\r\n"));
+    // A head with no CRLF anywhere — every line bare-LF — is answered too.
+    // It used to get no answer at all: the head reader kept looking for a
+    // CRLF terminator, which on a live connection meant a hang until a
+    // deadline (here, on a fixed input, a silent close).
+    const all_lf = runStream(&hits, "GET /hello HTTP/1.1\nHost: t\n\n", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, all_lf, "HTTP/1.1 400 Bad Request\r\n"));
+    try testing.expectEqual(@as(u32, 0), hits.load(.monotonic));
     // The all-CRLF control still succeeds.
     const ok = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
     try testing.expect(std.mem.startsWith(u8, ok, "HTTP/1.1 200 OK\r\n"));

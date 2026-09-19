@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-19** — **A head whose every line ends in a bare LF now gets a 400. Until
+  now it got no answer at all.** `GET /q HTTP/1.1\nHost: x\n\n` has no CRLF anywhere.
+  Since the A1 http F4 fix (2026-09-11), a bare `\n` line correctly stopped ending
+  the head, but nothing rejected it either. `readHead` kept reading for a CRLF
+  terminator that never came, so the server held the connection until a deadline.
+  Found by qap's conformance check `http/400-closes`, which is red on both of its
+  engines. Nothing was ever served, so this is not a smuggling hole.
+  - ⚠ **API: `h1.ReadHeadError` gains `MalformedHead`**, returned the moment a
+    head line ends in a bare LF. A consumer with an exhaustive `switch` over
+    `readHead`'s errors must add the arm. `Server` answers it with 400 and closes,
+    and `Client` maps it to `MalformedResponse`, as each already did for a parse
+    failure. It has to be an error because the alternative fails: if `readHead`
+    returned the block for the parse to reject, a bare LF in the terminator's
+    place leaves the block ending `\r\n\n`, and `ResponseHead.parse` accepts that.
+    F4's own test caught exactly this during the change.
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `conneg`'s `Accept` and
   `TokenList` iterators gain a test-only element counter (`void` outside a
   test build, so the increment compiles to nothing there). The three G7
