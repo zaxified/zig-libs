@@ -1576,7 +1576,19 @@ const Session = struct {
         // written a second time). Every name and value here passed
         // `regularFieldIsValid`, which is what makes a `print` of them into
         // CRLF framing sound.
-        var block: Writer.Allocating = .init(arena);
+        // The size is known before the first byte is written, so the block is
+        // allocated once at exactly that size instead of growing from zero:
+        // an `Allocating` that starts empty rebases (allocate, copy, free)
+        // several times per response, and every one of those copies is of a
+        // header block this function throws away at the end of the request.
+        var block_len: usize = 0;
+        if (authority) |a| block_len += "host: \r\n".len + a.len;
+        for (req_headers.fields) |f| {
+            if (f.name[0] == ':' or std.mem.eql(u8, f.name, "host")) continue;
+            block_len += f.name.len + ": \r\n".len + f.value.len;
+        }
+        var block: Writer.Allocating = Writer.Allocating.initCapacity(arena, block_len) catch
+            return .close;
         if (authority) |a| block.writer.print("host: {s}\r\n", .{a}) catch return .close;
         for (req_headers.fields) |f| {
             if (f.name[0] == ':' or std.mem.eql(u8, f.name, "host")) continue;
@@ -1600,12 +1612,32 @@ const Session = struct {
         // bytes — a bare `.fixed` Reader would lose its buffered tail on the
         // `discard` path (std drops partial counts under EndOfStream).
         var body_inner: Reader = .fixed(buffered_body);
-        const body_scratch = arena.alloc(u8, 4096) catch return .close;
+        // ── one arena block for every request-scoped buffer ──────────────
+        // Body scratch, the response buffer and the framer's interface buffer
+        // are all fixed sizes known right here, so they are cut from a single
+        // allocation. As four separate `arena.alloc` calls they also made the
+        // arena take a second chunk from the gpa, so the saving is both the
+        // arena's own bookkeeping and one malloc/free pair per request.
+        const scratch_len = 4096;
+        const framer_buf_len = 256;
+        const slab = arena.alloc(
+            u8,
+            scratch_len * @as(usize, if (streaming) 2 else 1) +
+                s.opts.response_buffer_size + framer_buf_len,
+        ) catch return .close;
+        const body_scratch = slab[0..scratch_len];
+        var cut: usize = scratch_len;
         // Only one of the two body surfaces is ever wired into `body`, so
         // they share `body_scratch`; the streaming one needs a second buffer
-        // (see `StreamBody.scratch`) and only allocates it when it is live.
+        // (see `StreamBody.scratch`) and only takes its slice when it is live.
         var stream_scratch: []u8 = &.{};
-        if (streaming) stream_scratch = arena.alloc(u8, 4096) catch return .close;
+        if (streaming) {
+            stream_scratch = slab[cut..][0..scratch_len];
+            cut += scratch_len;
+        }
+        const body_buf = slab[cut..][0..s.opts.response_buffer_size];
+        cut += s.opts.response_buffer_size;
+        const framer_buf = slab[cut..][0..framer_buf_len];
         var sb: StreamBody = .init(s, id, arena, .{
             .content_length = content_length,
             .budget = s.opts.max_body_bytes,
@@ -1658,7 +1690,6 @@ const Session = struct {
             Server.httpDateInto(n, &date_buf)
         else
             null;
-        const body_buf = arena.alloc(u8, s.opts.response_buffer_size) catch return .close;
         var chunk_buf: [64]u8 = undefined;
         const compression_on = s.opts.compression != null and s.opts.gzip_scratch != null;
         // The handler writes an ordinary HTTP/1.1 response, as it always
@@ -1668,7 +1699,7 @@ const Session = struct {
         // works on h2 unchanged, because none of it knows the difference.
         var framer: Framer = .init(s, id, arena, .{
             .hold_cap = @max(s.opts.response_buffer_size, 1),
-            .buffer = arena.alloc(u8, 256) catch return .close,
+            .buffer = framer_buf,
         });
         var rw: Server.ResponseWriter = .init(&framer.interface, body_buf, &chunk_buf, .{
             .head_request = method == .head,
@@ -1956,6 +1987,11 @@ const Framer = struct {
         f.head.appendSlice(f.arena, bytes) catch return f.die(.close);
         if (f.head.items.len > max_staged_head) return f.die(.close);
         // The terminator can straddle two writes: rescan the last 3 octets.
+        // ⚠ Not a byte-at-a-time state machine carried across calls: that was
+        // tried and MEASURED at +531 instructions per response (callgrind,
+        // 2026-09-20). `indexOfPos` rescans from three octets back and does one
+        // scan per CR in the staged head, but each of those scans is vectorised,
+        // and a head is short enough that the vector wins outright.
         const from = start -| 3;
         const idx = std.mem.indexOfPos(u8, f.head.items, from, "\r\n\r\n") orelse return "";
         // `h1.readHead`'s shape: the field lines, without the blank line.
@@ -3574,6 +3610,52 @@ test "h2c serve: legit request with CONTINUATIONs under the limit succeeds" {
 }
 
 // ── response trailers (RFC 9113 §8.1) ───────────────────────────────────────
+
+/// Padding length for `straddleHandler`, set by the test around it.
+var straddle_pad: usize = 0;
+
+fn straddleHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+    _ = req;
+    var pad: [320]u8 = undefined;
+    @memset(pad[0..straddle_pad], 'p');
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.setHeader("X-Pad", pad[0..straddle_pad]);
+    try rw.writeAll("hello");
+}
+
+test "h2: the CRLFCRLF ending the staged head may straddle two feeds, at any offset" {
+    // The framer finds the end of the handler's h1 head in the octets as they
+    // arrive and carries how much of the terminator it has seen across calls.
+    // A head longer than the framer's own interface buffer drains in more than
+    // one piece, so the terminator lands on the boundary -- and sweeping the
+    // head length one octet at a time puts every one of the four possible
+    // splits (\r|\n\r\n through \r\n\r|\n) on that boundary in turn.
+    // ⚠ A single length proves nothing here: with the default buffer the whole
+    // head arrives in one call, which is the one case an incremental detector
+    // cannot get wrong (a 1-byte `response_buffer_size` does NOT force the
+    // split -- measured: the head still reaches the framer whole).
+    const gpa = testing.allocator;
+    var pad: usize = 120;
+    while (pad <= 300) : (pad += 1) {
+        straddle_pad = pad;
+        var peer: TestPeer = .init(gpa, .{});
+        defer peer.deinit();
+        try peer.conn.sendPreface(&peer.wire);
+        const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
+
+        var out_buf: [8192]u8 = undefined;
+        try runOffline(&peer, .{ .handler = straddleHandler }, &out_buf);
+
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        // The parsed fields, not merely "a 200 arrived".
+        try testing.expectEqualStrings("text/plain", c.header("content-type").?);
+        const padded = c.header("x-pad") orelse return error.PadHeaderMissing;
+        try testing.expectEqual(pad, padded.len);
+        try testing.expectEqualStrings("hello", c.body.items);
+        try testing.expect(c.end);
+    }
+}
 
 test "h2: response trailers are a HEADERS frame AFTER the DATA frames (§8.1)" {
     const gpa = testing.allocator;

@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-20** — **NO CONSUMER-VISIBLE CHANGE:** the h2 response path stops
+  paying for allocator bookkeeping it does not need. `serveJob` cuts the body
+  scratch, the response buffer and the framer's interface buffer from **one**
+  arena block instead of four separate `arena.alloc` calls (which also made the
+  arena take a second chunk from the gpa), the synthesized h1 request block is
+  allocated at the size its fields already imply rather than rebased as it
+  grows, and `hpack.Decoder.decodeBlock` sizes its two per-block lists from the
+  block length instead of doubling up from empty. Measured under callgrind on
+  qap's h2 path, ReleaseFast, per response: **−1,000 instructions on a 480-byte
+  response (−4.9% of the user-space cost of the request) and −532 on a 32 KiB
+  one**; the h1 path is unchanged to within the instrument's ±0.2%.
+  - A new test with it: **the CRLFCRLF that ends the staged response head may
+    straddle two `feed` calls**, swept over every head length from 120 to 300
+    octets so each of the four possible splits lands on the framer's buffer
+    boundary in turn. Nothing covered that before — the default buffer hands the
+    whole head over in one call, and a 1-byte `response_buffer_size` does not
+    change that (measured; a mutant that dropped the carried state stayed green
+    under it).
+  - ⚠ Recorded because it was tried and is wrong: replacing the terminator
+    search with a byte-at-a-time state machine carried across calls **cost +531
+    instructions per response**. `indexOfPos` rescans from three octets back and
+    runs one scan per CR in the staged head, but those scans are vectorised and a
+    head is short enough that the vector wins outright.
 - **2026-09-19** — **A head whose every line ends in a bare LF now gets a 400. Until
   now it got no answer at all.** `GET /q HTTP/1.1\nHost: x\n\n` has no CRLF anywhere.
   Since the A1 http F4 fix (2026-09-11), a bare `\n` line correctly stopped ending

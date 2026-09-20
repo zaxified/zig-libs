@@ -775,9 +775,14 @@ pub const Decoder = struct {
         // Every name and value of the block lands in `storage`, indexed
         // fields copied from the tables and literals decoded straight into
         // it -- two allocations per block instead of two per field.
-        var storage: std.ArrayList(u8) = .empty;
+        // Both lists start at a size the block itself implies rather than at
+        // zero: growing from empty is three or four allocate-copy-free rounds
+        // per block, all of them on the request's hot path. A field costs at
+        // least one octet of block, and its decoded name and value are a few
+        // times the indexed reference that stood for them.
+        var storage: std.ArrayList(u8) = try .initCapacity(d.gpa, block.len * 4 + 64);
         errdefer storage.deinit(d.gpa);
-        var spans: std.ArrayList(Span) = .empty;
+        var spans: std.ArrayList(Span) = try .initCapacity(d.gpa, @min(block.len, 16));
         defer spans.deinit(d.gpa);
 
         var list_size: usize = 0;
