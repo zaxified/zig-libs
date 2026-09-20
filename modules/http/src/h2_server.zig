@@ -1701,6 +1701,9 @@ const Session = struct {
             .hold_cap = @max(s.opts.response_buffer_size, 1),
             .buffer = framer_buf,
         });
+        // §8.1.2.1 wants the pseudo-header first and the sink sees the status
+        // last, so its slot is reserved now and filled in `sinkHeadDone`.
+        framer.fields.append(arena, .{ .name = ":status", .value = "" }) catch return .close;
         var rw: Server.ResponseWriter = .init(&framer.interface, body_buf, &chunk_buf, .{
             .head_request = method == .head,
             .date = date,
@@ -1709,6 +1712,9 @@ const Session = struct {
             .gzip_scratch = if (compression_on) s.opts.gzip_scratch else null,
             .accept_gzip = compression_on and
                 gzip.acceptsGzip(head.header("accept-encoding")),
+            // The head crosses as fields: it never becomes HTTP/1.1 text, and
+            // nothing parses it back (worth 6,354 instructions per response).
+            .field_sink = framer.sink(),
         });
         sb.req = &req;
         var failed = false;
@@ -1810,13 +1816,11 @@ const Session = struct {
     }
 };
 
-/// Cap on the staged HTTP/1.1 response head the framer will accumulate.
-/// `ResponseWriter`'s own `max_response_headers` bounds it far below this;
-/// the cap is here so that a framing bug cannot become unbounded growth.
-const max_staged_head = 64 * 1024;
-
 /// Cap on one line of the staged chunked framing (a chunk-size line or a
-/// trailer field). Same reasoning as `max_staged_head`.
+/// trailer field): the cap is here so that a framing bug cannot become
+/// unbounded growth. (Its companion `max_staged_head` went away with the
+/// staged head itself -- the response head now crosses as fields, bounded by
+/// `ResponseWriter`'s own `max_response_headers`.)
 const max_staged_line = 4096;
 
 // ── the response side: one engine, streaming ────────────────────────────────
@@ -1880,9 +1884,10 @@ const Framer = struct {
     hold_cap: usize,
     /// Backs the `:status` field's value until `sendHead` encodes it.
     status_buf: [5]u8 = undefined,
+    /// Backs the `content-length` value until `sendHead` encodes it.
+    clen_buf: [20]u8 = undefined,
 
-    /// Staged response head, until CRLFCRLF.
-    head: std.ArrayList(u8) = .empty,
+    /// Set once the head has crossed as fields; body octets may follow.
     head_done: bool = false,
     /// Parsed response fields, waiting for `sendHead`.
     fields: std.ArrayList(hpack.Field) = .empty,
@@ -1925,6 +1930,53 @@ const Framer = struct {
         };
     }
 
+    /// The response head reaches the framer as fields: the handler's writer
+    /// calls `sinkPut` per field and `sinkHeadDone` at the end, and no HTTP/1.1
+    /// text is produced or parsed anywhere on the way.
+    fn sink(f: *Framer) Server.ResponseWriter.FieldSink {
+        return .{ .ctx = f, .put = sinkPut, .head_done = sinkHeadDone };
+    }
+
+    fn sinkPut(ctx: *anyopaque, name: []const u8, value: []const u8) Writer.Error!void {
+        const f: *Framer = @ptrCast(@alignCast(ctx));
+        // §8.2.2: connection-specific headers never cross into h2.
+        if (isConnectionSpecific(name)) return;
+        // §8.2.1 on the way out, checked rather than assumed. `setHeader`
+        // already rejects a malformed name or value at set time and is the only
+        // way into the header table -- but not everything in a head comes from
+        // there: `server_name` is the caller's option, and this is where that
+        // reaches the wire. Two bytes of CR/LF in it would be a field value no
+        // §8.2.1 peer may accept and, through any h2-to-h1 gateway downstream,
+        // a second response head. The head is refused whole, the same answer
+        // the h1 parser used to give when it rejected such a field.
+        if (!h1.isValidFieldValue(value)) return f.die(.close);
+        for (name) |c| {
+            if (std.ascii.isUpper(c) or !h1.isTchar(c)) return f.die(.close);
+        }
+        f.fields.append(f.arena, .{ .name = name, .value = value }) catch
+            return f.die(.close);
+    }
+
+    fn sinkHeadDone(
+        ctx: *anyopaque,
+        status: u16,
+        chunked: bool,
+        content_length: ?u64,
+    ) Writer.Error!void {
+        const f: *Framer = @ptrCast(@alignCast(ctx));
+        if (f.dead) return error.WriteFailed;
+        f.chunked = chunked;
+        f.fields.items[0].value = std.fmt.bufPrint(&f.status_buf, "{d}", .{status}) catch
+            return f.die(.close);
+        if (content_length) |n| {
+            const text = std.fmt.bufPrint(&f.clen_buf, "{d}", .{n}) catch
+                return f.die(.close);
+            f.fields.append(f.arena, .{ .name = "content-length", .value = text }) catch
+                return f.die(.close);
+        }
+        f.head_done = true;
+    }
+
     fn drainFn(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
         const f: *Framer = @alignCast(@fieldParentPtr("interface", w));
         const buffered = w.buffer[0..w.end];
@@ -1964,62 +2016,23 @@ const Framer = struct {
         return error.WriteFailed;
     }
 
+    /// Body octets only. The head never comes through here: the writer hands it
+    /// over as fields (`sinkPut`/`sinkHeadDone`) before any body byte drains, so
+    /// what arrives is either the body itself or, when the response is chunked,
+    /// the body inside chunked framing that this strips back off.
     fn feed(f: *Framer, bytes: []const u8) Writer.Error!void {
         if (f.dead) return error.WriteFailed;
+        // A body before a head would mean a `ResponseWriter` that drained
+        // without calling `writeHead`, which it does not do.
+        std.debug.assert(f.head_done);
         var rest = bytes;
         while (rest.len != 0) {
-            if (!f.head_done) {
-                rest = try f.feedHead(rest);
-                continue;
-            }
             if (!f.chunked) {
                 try f.push(rest);
                 return;
             }
             rest = try f.feedChunked(rest);
         }
-    }
-
-    /// Accumulate the staged response head; once CRLFCRLF lands, parse it
-    /// into h2 fields and return whatever followed it.
-    fn feedHead(f: *Framer, bytes: []const u8) Writer.Error![]const u8 {
-        const start = f.head.items.len;
-        f.head.appendSlice(f.arena, bytes) catch return f.die(.close);
-        if (f.head.items.len > max_staged_head) return f.die(.close);
-        // The terminator can straddle two writes: rescan the last 3 octets.
-        // ⚠ Not a byte-at-a-time state machine carried across calls: that was
-        // tried and MEASURED at +531 instructions per response (callgrind,
-        // 2026-09-20). `indexOfPos` rescans from three octets back and does one
-        // scan per CR in the staged head, but each of those scans is vectorised,
-        // and a head is short enough that the vector wins outright.
-        const from = start -| 3;
-        const idx = std.mem.indexOfPos(u8, f.head.items, from, "\r\n\r\n") orelse return "";
-        // `h1.readHead`'s shape: the field lines, without the blank line.
-        const res = h1.ResponseHead.parse(f.head.items[0 .. idx + 2]) catch
-            return f.die(.close);
-        f.chunked = res.chunked;
-        const status_str = std.fmt.bufPrint(&f.status_buf, "{d}", .{res.status}) catch
-            return f.die(.close);
-        f.fields.append(f.arena, .{ .name = ":status", .value = status_str }) catch
-            return f.die(.close);
-        var it = res.iterate();
-        while (it.next()) |hd| {
-            // §8.2.2: connection-specific headers never cross into h2
-            // (framing is the frame layer's job now).
-            if (isConnectionSpecific(hd.name)) continue;
-            // §8.2.1: lowercase on the wire -- lowered IN PLACE. `head` is
-            // this framer's own buffer, and the CRLFCRLF this parse just
-            // found is where it stops growing forever (`head_done` guards
-            // every further append), so the parsed slices are stable and
-            // nothing downstream wants the original case. These used to be
-            // two arena copies per field, per response. Values are left
-            // alone: a Date value has uppercase octets that matter.
-            for (@constCast(hd.name)) |*c| c.* = std.ascii.toLower(c.*);
-            f.fields.append(f.arena, .{ .name = hd.name, .value = hd.value }) catch
-                return f.die(.close);
-        }
-        f.head_done = true;
-        return bytes[idx + 4 - start ..];
     }
 
     /// One step of the push-mode chunked decoder; returns the unconsumed
@@ -3611,50 +3624,53 @@ test "h2c serve: legit request with CONTINUATIONs under the limit succeeds" {
 
 // ── response trailers (RFC 9113 §8.1) ───────────────────────────────────────
 
-/// Padding length for `straddleHandler`, set by the test around it.
-var straddle_pad: usize = 0;
+test "h2: a field the header table never saw is still held to §8.2.1 — CRLF in server_name kills the response" {
+    // `setHeader` rejects CR/LF/NUL at set time and is the only way into the
+    // header table, so nothing a HANDLER sets can arrive malformed. `server_name`
+    // is the caller's option and does not go through it -- and it used to be
+    // checked anyway, by accident, because the head was serialised and parsed
+    // back. It is not serialised any more, so the sink checks it: CRLF in a
+    // field value is a value no §8.2.1 peer may accept, and through an
+    // h2-to-h1 gateway it is a second response head.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
 
-fn straddleHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
-    _ = req;
-    var pad: [320]u8 = undefined;
-    @memset(pad[0..straddle_pad], 'p');
-    try rw.setHeader("Content-Type", "text/plain");
-    try rw.setHeader("X-Pad", pad[0..straddle_pad]);
-    try rw.writeAll("hello");
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .server_name = "qap\r\nx-injected: yes",
+    }, &out_buf);
+
+    // Refused whole: no HEADERS frame reached the peer at all, so there is
+    // nothing for it to have injected into.
+    try testing.expect(peer.resps.get(sid) == null);
 }
 
-test "h2: the CRLFCRLF ending the staged head may straddle two feeds, at any offset" {
-    // The framer finds the end of the handler's h1 head in the octets as they
-    // arrive and carries how much of the terminator it has seen across calls.
-    // A head longer than the framer's own interface buffer drains in more than
-    // one piece, so the terminator lands on the boundary -- and sweeping the
-    // head length one octet at a time puts every one of the four possible
-    // splits (\r|\n\r\n through \r\n\r|\n) on that boundary in turn.
-    // ⚠ A single length proves nothing here: with the default buffer the whole
-    // head arrives in one call, which is the one case an incremental detector
-    // cannot get wrong (a 1-byte `response_buffer_size` does NOT force the
-    // split -- measured: the head still reaches the framer whole).
+test "h2: an uppercase field name from the handler reaches the wire lowercased (§8.2.1)" {
+    // The handler sets `Content-Type`; h2 forbids uppercase in a field name.
+    // The lowering happens in the response writer's own header storage, which
+    // is the only memory it is allowed to write to -- hence a test that reads
+    // the name off the wire rather than trusting the call.
     const gpa = testing.allocator;
-    var pad: usize = 120;
-    while (pad <= 300) : (pad += 1) {
-        straddle_pad = pad;
-        var peer: TestPeer = .init(gpa, .{});
-        defer peer.deinit();
-        try peer.conn.sendPreface(&peer.wire);
-        const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &get_fields, true);
 
-        var out_buf: [8192]u8 = undefined;
-        try runOffline(&peer, .{ .handler = straddleHandler }, &out_buf);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
 
-        const c = peer.resp(sid);
-        try testing.expectEqual(@as(u16, 200), c.status);
-        // The parsed fields, not merely "a 200 arrived".
-        try testing.expectEqualStrings("text/plain", c.header("content-type").?);
-        const padded = c.header("x-pad") orelse return error.PadHeaderMissing;
-        try testing.expectEqual(pad, padded.len);
-        try testing.expectEqualStrings("hello", c.body.items);
-        try testing.expect(c.end);
+    const c = peer.resps.getPtr(sid) orelse return error.NoResponse;
+    const hl = c.headers orelse return error.NoHeaders;
+    var saw = false;
+    for (hl.fields) |f| {
+        for (f.name) |ch| try testing.expect(!std.ascii.isUpper(ch));
+        if (std.mem.eql(u8, f.name, "content-type")) saw = true;
     }
+    try testing.expect(saw);
 }
 
 test "h2: response trailers are a HEADERS frame AFTER the DATA frames (§8.1)" {

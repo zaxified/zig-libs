@@ -5,6 +5,35 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-20** — **The h2 response head no longer travels as HTTP/1.1 text.**
+  `ResponseWriter` hands it to the h2 framer as (name, value) pairs through a new
+  `FieldSink`, instead of formatting a head the framer parsed straight back. The
+  wire is unchanged — the response heads of fourteen shapes (h2 and h1, HEAD,
+  gzip, 404, five routes) are byte-identical, all 186 h2 tests pass, and qap's
+  conformance suite is 68/68 on both of its engines.
+  - **Measured, per response:** h2 goes from 19,358 to 13,670 instructions of
+    user-space code on a 480-byte body (**−29.4%**) and 25,094 → 19,123 on 32 KiB
+    (−23.8%); h2/h1 falls from 2.90x to 2.05x. On qap's `h2sat` lane (TLS, 256
+    connections, saturating) the earlier prototype of this measured
+    **−13.1% instructions per request and +5.5% throughput**, with kernel
+    instructions per request unchanged, as expected — the work removed was all
+    in user space.
+  - ⚠ **A guard that used to be a side effect is now explicit.** `setHeader`
+    rejects CR/LF/NUL at set time and is the only way into the header table, so
+    nothing a handler sets can be malformed — but `server_name` comes from the
+    caller's options and never went through it. Serialising the head and parsing
+    it back used to catch that by accident. `sinkPut` now checks §8.2.1 for every
+    field it forwards (a value with CR/LF, or a name that is not a lowercase
+    token, refuses the head and closes), which costs 666 instructions per
+    response of the 6,354 the change saves. Two tests hold it, both verified by
+    mutation.
+  - **API:** `ResponseWriter.InitOptions` gains `field_sink` (default null =
+    today's text behaviour), and `ResponseWriter.FieldSink` is public. Nothing
+    existing changes shape; the h1 path is untouched and measures unchanged.
+  - Gone with it: the framer's staged-head buffer, `feedHead`, `max_staged_head`,
+    and the straddle test that covered the terminator search — the property it
+    tested no longer exists. Field names are lowered in `header_buf` by the
+    writer that owns that memory, asserted in place, rather than in the framer.
 - **2026-09-20** — **NO CONSUMER-VISIBLE CHANGE:** the h2 response path stops
   paying for allocator bookkeeping it does not need. `serveJob` cuts the body
   scratch, the response buffer and the framer's interface buffer from **one**

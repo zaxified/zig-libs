@@ -2274,6 +2274,14 @@ pub const ResponseWriter = struct {
     header_buf: [header_copy_bytes]u8 = undefined,
     header_buf_len: usize = 0,
     sent_head: bool = false,
+    /// When set, `writeHead` hands the response head over as (name, value)
+    /// pairs instead of formatting it into HTTP/1.1 text. That is what the h2
+    /// server uses: its framer needs fields, and formatting a head into text
+    /// for it to parse straight back cost 6,354 instructions per response
+    /// (measured 2026-09-20; a third of the h2 path's user-space cost).
+    /// Null on the h1 path, which wants the text and is unaffected.
+    field_sink: ?FieldSink = null,
+
     ended: bool = false,
     failed: bool = false,
     /// See `detach`. Only the single-task h2 serve loop reads it.
@@ -2326,6 +2334,8 @@ pub const ResponseWriter = struct {
         compression: ?Compression = null,
         /// Working memory for the gzip encoder (usually per-connection).
         gzip_scratch: ?*GzipScratch = null,
+        /// Hand the head over as fields instead of text; see `FieldSink`.
+        field_sink: ?FieldSink = null,
         /// The request's Accept-Encoding admits gzip (`gzip.acceptsGzip`)
         /// — evaluated by the serving loop, the negotiation input here.
         accept_gzip: bool = false,
@@ -2346,6 +2356,7 @@ pub const ResponseWriter = struct {
             .compression = opts.compression,
             .gzip_scratch = opts.gzip_scratch,
             .accept_gzip = opts.accept_gzip,
+            .field_sink = opts.field_sink,
             .interface = .{
                 .vtable = &.{ .drain = drainFn },
                 .buffer = body_buf,
@@ -3023,12 +3034,36 @@ pub const ResponseWriter = struct {
         try rw.finishChunked(&g.chunked);
     }
 
+    /// A consumer of the response head as fields, for a protocol that frames
+    /// headers itself (h2) rather than serialising them.
+    ///
+    /// ⭐ **Lifetime:** slices handed to `put` are NOT copied, and must outlive
+    /// the response. Every one of them does: header names and values live in
+    /// `header_buf`, the rest are literals, the caller's options, or the date
+    /// buffer the server owns for the whole request.
+    ///
+    /// ⚠ **Names arrive lowercase** (RFC 9113 §8.2.1), lowered in `header_buf`
+    /// by the writer that owns it. A sink must not lower them itself: the ones
+    /// that are already lowercase may be literals in read-only memory.
+    ///
+    /// ⭐ **Values are not re-validated here.** `setHeader` is the single
+    /// mutation path for the header table and rejects CR/LF/NUL at set time, so
+    /// nothing a handler set can reach a sink malformed. Fields this writer adds
+    /// itself (`server_name` from the caller's options) do not pass through it,
+    /// which is why the h2 sink checks them (see `sinkPut`).
+    pub const FieldSink = struct {
+        ctx: *anyopaque,
+        put: *const fn (ctx: *anyopaque, name: []const u8, value: []const u8) Writer.Error!void,
+        head_done: *const fn (ctx: *anyopaque, status: u16, chunked: bool, content_length: ?u64) Writer.Error!void,
+    };
+
     const Framing = union(enum) { none, content_length: u64, chunked };
 
     /// Emit the status line + headers. Header order: user headers (set
     /// order), then auto Date/Server, Vary/Content-Encoding (compression),
     /// Connection, framing.
     fn writeHead(rw: *ResponseWriter, framing: Framing) Writer.Error!void {
+        if (rw.field_sink) |sink| return rw.writeHeadToSink(sink, framing);
         const out = rw.out;
         try out.print("HTTP/1.1 {d} {s}\r\n", .{ rw.status, reasonPhrase(rw.status) });
 
@@ -3075,6 +3110,74 @@ pub const ResponseWriter = struct {
             .chunked => try out.writeAll("Transfer-Encoding: chunked\r\n"),
         }
         try out.writeAll("\r\n");
+        rw.sent_head = true;
+    }
+
+    /// RFC 9113 §8.2.1: field names go on the h2 wire lowercase. Lowered IN
+    /// PLACE, which is sound here and nowhere else: every name in `headers`
+    /// came through `setHeader`, which copies it into `header_buf` -- this
+    /// object's own storage. The assert is the guard, not the comment: a
+    /// future path that puts a borrowed or static name in the table would trip
+    /// it in Debug and ReleaseSafe rather than writing to read-only memory.
+    fn lowerName(rw: *ResponseWriter, name: []const u8) []const u8 {
+        var upper = false;
+        for (name) |c| {
+            if (std.ascii.isUpper(c)) {
+                upper = true;
+                break;
+            }
+        }
+        if (!upper) return name;
+        const base = @intFromPtr(&rw.header_buf);
+        const at = @intFromPtr(name.ptr);
+        std.debug.assert(at >= base and at + name.len <= base + rw.header_buf.len);
+        for (@constCast(name)) |*c| c.* = std.ascii.toLower(c.*);
+        return name;
+    }
+
+    /// The same head as `writeHead`, handed over as fields instead of text.
+    /// It mirrors that function decision for decision -- the ETag weakening, the
+    /// implicit Date/Server, the compression Vary -- because the two must put
+    /// the same response on the wire in either protocol; the h2 test suite and
+    /// qap's conformance run are what hold them together.
+    fn writeHeadToSink(rw: *ResponseWriter, sink: FieldSink, framing: Framing) Writer.Error!void {
+        var saw_date = false;
+        var saw_server = false;
+        var vary_covered = false;
+        for (rw.headers[0..rw.headers_len]) |hd| {
+            if (std.ascii.eqlIgnoreCase(hd.name, "date")) saw_date = true;
+            if (std.ascii.eqlIgnoreCase(hd.name, "server")) saw_server = true;
+            if (std.ascii.eqlIgnoreCase(hd.name, "vary") and
+                (h1.tokenListContains(hd.value, "accept-encoding") or
+                    h1.tokenListContains(hd.value, "*"))) vary_covered = true;
+            if (rw.content_encoding_gzip and std.ascii.eqlIgnoreCase(hd.name, "etag") and
+                !std.mem.startsWith(u8, hd.value, "W/"))
+            {
+                // The weakened form needs bytes that outlive this call, and the
+                // header store is the only place with that lifetime.
+                const room = rw.header_buf[rw.header_buf_len..];
+                if (room.len < hd.value.len + 2) return error.WriteFailed;
+                room[0] = 'W';
+                room[1] = '/';
+                @memcpy(room[2..][0..hd.value.len], hd.value);
+                const weak = room[0 .. hd.value.len + 2];
+                rw.header_buf_len += weak.len;
+                try sink.put(sink.ctx, rw.lowerName(hd.name), weak);
+                continue;
+            }
+            try sink.put(sink.ctx, rw.lowerName(hd.name), hd.value);
+        }
+        if (!saw_date) if (rw.date) |d| try sink.put(sink.ctx, "date", d);
+        if (!saw_server) if (rw.server_name) |sn| try sink.put(sink.ctx, "server", sn);
+        if (rw.compression != null and !vary_covered)
+            try sink.put(sink.ctx, "vary", "Accept-Encoding");
+        if (rw.content_encoding_gzip) try sink.put(sink.ctx, "content-encoding", "gzip");
+        // `connection: close` is §8.2.2-forbidden in h2 and the framer drops it
+        // anyway, so it is not offered here.
+        try sink.head_done(sink.ctx, rw.status, framing == .chunked, switch (framing) {
+            .content_length => |n| n,
+            else => null,
+        });
         rw.sent_head = true;
     }
 
