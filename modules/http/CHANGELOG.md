@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-20** — **NO CONSUMER-VISIBLE CHANGE (h2):** `server_name` is checked
+  once per connection instead of once per field per response, and the per-field
+  §8.2.1 walk the h2 field sink did is now an assert. Both answers were already
+  settled by construction — `setHeader` is the only way into the header table and
+  rejects a non-token name or a CR/LF/NUL value at set time, and
+  `ResponseWriter.lowerName` lowercases what it forwards — so the walk was the
+  same question re-answered for every field of every response. What remains is
+  the one input that never passed through `setHeader`: a `server_name` that
+  cannot go on the wire is dropped once, at `serve`, and the response is served
+  without the banner rather than refused (a server that will not answer because
+  its own banner is malformed helps nobody). Measured: −92 instructions per
+  response; the assert block costs 15 in ReleaseFast, inside the instrument's
+  noise. The test that covered this moved with the behaviour and was re-verified
+  by mutation.
 - **2026-09-20** — **The h2 response head no longer travels as HTTP/1.1 text.**
   `ResponseWriter` hands it to the h2 framer as (name, value) pairs through a new
   `FieldSink`, instead of formatting a head the framer parsed straight back. The

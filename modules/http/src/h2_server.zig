@@ -531,10 +531,29 @@ fn connOptions(opts: Options) h2.Connection.Options {
     };
 }
 
+/// Everything in a response head is held to RFC 9113 §8.2.1, and almost all of
+/// it is guaranteed before it gets here: header names and values reach the
+/// framer through `setHeader`, which rejects CR/LF/NUL at set time and is the
+/// only way into the table, and the rest are literals or generated (the date,
+/// the content-length digits).
+///
+/// `server_name` is the exception -- it comes straight from the caller -- so it
+/// is checked ONCE, here, where a connection begins, instead of on every field
+/// of every response. A value that cannot go on the wire is dropped rather than
+/// refused: the header is optional, and a server that will not start because
+/// its own banner is malformed helps nobody.
+fn checkedOptions(opts: Options) Options {
+    var out = opts;
+    if (opts.server_name) |name| {
+        if (!h1.isValidFieldValue(name)) out.server_name = null;
+    }
+    return out;
+}
+
 pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
     var s: Session = .{
         .gpa = gpa,
-        .opts = opts,
+        .opts = checkedOptions(opts),
         .in = in,
         .out = out,
         .threaded = opts.dispatcher != null,
@@ -1941,17 +1960,31 @@ const Framer = struct {
         const f: *Framer = @ptrCast(@alignCast(ctx));
         // §8.2.2: connection-specific headers never cross into h2.
         if (isConnectionSpecific(name)) return;
-        // §8.2.1 on the way out, checked rather than assumed. `setHeader`
-        // already rejects a malformed name or value at set time and is the only
-        // way into the header table -- but not everything in a head comes from
-        // there: `server_name` is the caller's option, and this is where that
-        // reaches the wire. Two bytes of CR/LF in it would be a field value no
-        // §8.2.1 peer may accept and, through any h2-to-h1 gateway downstream,
-        // a second response head. The head is refused whole, the same answer
-        // the h1 parser used to give when it rejected such a field.
-        if (!h1.isValidFieldValue(value)) return f.die(.close);
-        for (name) |c| {
-            if (std.ascii.isUpper(c) or !h1.isTchar(c)) return f.die(.close);
+        // §8.2.1 is settled before a field reaches here, by construction rather
+        // than by re-walking every octet of every field of every response (a
+        // check here measured 600 instructions per response -- 4% of the whole
+        // h2 path -- to re-answer a question with two known answers):
+        //
+        //   * names: `setHeader` is the only way into the header table and
+        //     rejects anything that is not a token; `ResponseWriter.lowerName`
+        //     lowercases what it hands over. The rest are literals in this file.
+        //   * values: `setHeader` rejects CR/LF/NUL at set time, `checkedOptions`
+        //     holds `server_name` once per connection, and the others are
+        //     generated here (the date, the content-length digits).
+        //
+        // The assert is what keeps that a fact rather than a belief: it runs in
+        // Debug and ReleaseSafe, which is what the test suite and the gate build,
+        // so a new path that forwards a field from somewhere else trips it there
+        // instead of putting it on the wire.
+        // The assert is what keeps that a fact rather than a belief: it runs in
+        // Debug and ReleaseSafe, which is what the test suite and the gate build,
+        // so a new path that forwards a field from somewhere else trips it there
+        // instead of putting it on the wire. In ReleaseFast the whole block is
+        // gone -- measured at 15 instructions per response, inside the
+        // instrument's own noise.
+        if (std.debug.runtime_safety) {
+            for (name) |c| std.debug.assert(!std.ascii.isUpper(c) and h1.isTchar(c));
+            std.debug.assert(h1.isValidFieldValue(value));
         }
         f.fields.append(f.arena, .{ .name = name, .value = value }) catch
             return f.die(.close);
@@ -3624,14 +3657,14 @@ test "h2c serve: legit request with CONTINUATIONs under the limit succeeds" {
 
 // ── response trailers (RFC 9113 §8.1) ───────────────────────────────────────
 
-test "h2: a field the header table never saw is still held to §8.2.1 — CRLF in server_name kills the response" {
+test "h2: a server_name that cannot go on the wire is dropped once, not sent and not fatal" {
     // `setHeader` rejects CR/LF/NUL at set time and is the only way into the
-    // header table, so nothing a HANDLER sets can arrive malformed. `server_name`
-    // is the caller's option and does not go through it -- and it used to be
-    // checked anyway, by accident, because the head was serialised and parsed
-    // back. It is not serialised any more, so the sink checks it: CRLF in a
-    // field value is a value no §8.2.1 peer may accept, and through an
-    // h2-to-h1 gateway it is a second response head.
+    // header table, so nothing a HANDLER sets can arrive malformed.
+    // `server_name` comes straight from the caller and never goes through it --
+    // and it used to be checked anyway, by accident, because the head was
+    // serialised and parsed back. It is not serialised any more, so `serve`
+    // checks it once per connection: the banner is dropped, the response is
+    // served, and no second field appears out of the CRLF.
     const gpa = testing.allocator;
     var peer: TestPeer = .init(gpa, .{});
     defer peer.deinit();
@@ -3644,9 +3677,12 @@ test "h2: a field the header table never saw is still held to §8.2.1 — CRLF i
         .server_name = "qap\r\nx-injected: yes",
     }, &out_buf);
 
-    // Refused whole: no HEADERS frame reached the peer at all, so there is
-    // nothing for it to have injected into.
-    try testing.expect(peer.resps.get(sid) == null);
+    const c = peer.resps.getPtr(sid) orelse return error.NoResponse;
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expectEqualStrings("hello", c.body.items);
+    // Neither the banner nor anything the CRLF could have framed out of it.
+    try testing.expect(c.header("server") == null);
+    try testing.expect(c.header("x-injected") == null);
 }
 
 test "h2: an uppercase field name from the handler reaches the wire lowercased (§8.2.1)" {
