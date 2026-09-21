@@ -640,6 +640,11 @@ const Job = struct {
     fn deinit(job: *Job, gpa: Allocator) void {
         job.headers.deinit(gpa);
         if (job.trailers) |*hl| hl.deinit(gpa);
+        // The body is the caller's data -- credentials, payloads -- and this
+        // block goes back to an allocator the next connection draws from.
+        // The whole allocation, not just `items`: a streaming body that was
+        // drained (`clearRetainingCapacity`) still has its bytes past `len`.
+        std.crypto.secureZero(u8, job.body.allocatedSlice());
         job.body.deinit(gpa);
     }
 
@@ -1654,6 +1659,11 @@ const Session = struct {
             stream_scratch = slab[cut..][0..scratch_len];
             cut += scratch_len;
         }
+        // The body passes through these on its way to the handler; zero them
+        // before the arena hands the slab back (defers run in reverse, so
+        // this runs first). See `Job.deinit`.
+        defer std.crypto.secureZero(u8, body_scratch);
+        defer std.crypto.secureZero(u8, stream_scratch);
         const body_buf = slab[cut..][0..s.opts.response_buffer_size];
         cut += s.opts.response_buffer_size;
         const framer_buf = slab[cut..][0..framer_buf_len];
@@ -2444,6 +2454,7 @@ const StreamBody = struct {
                     if (jp.read_pos == jp.body.items.len) {
                         // Fully drained: reclaim the buffer instead of
                         // letting a long upload accumulate behind the cursor.
+                        std.crypto.secureZero(u8, jp.body.items);
                         jp.body.clearRetainingCapacity();
                         jp.read_pos = 0;
                     }
@@ -5577,4 +5588,79 @@ test "dispatcher: the connection window bounds two concurrent senders (§6.9.1)"
     // The connection window really was the binding constraint: more octets
     // were delivered than it ever held at once.
     try testing.expect(fw.data_bytes.load(.acquire) > fc_grant);
+}
+
+/// Counts frees whose block still holds `marker` -- request-body bytes the
+/// codec handed back to the allocator without zeroing them first.
+const ScrubWatch = struct {
+    inner: Allocator,
+    marker: []const u8,
+    dirty_frees: usize = 0,
+
+    fn allocator(w: *ScrubWatch) Allocator {
+        return .{ .ptr = w, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const w: *ScrubWatch = @ptrCast(@alignCast(ctx));
+        return w.inner.rawAlloc(len, a, ra);
+    }
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const w: *ScrubWatch = @ptrCast(@alignCast(ctx));
+        return w.inner.rawResize(m, a, n, ra);
+    }
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const w: *ScrubWatch = @ptrCast(@alignCast(ctx));
+        // A remap that moves copies the block and drops the old one: that
+        // old one is a free too, and nothing zeroed it. Refuse, so growth
+        // goes through alloc + copy + free, where `free` sees it.
+        _ = w;
+        _ = m;
+        _ = a;
+        _ = n;
+        _ = ra;
+        return null;
+    }
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const w: *ScrubWatch = @ptrCast(@alignCast(ctx));
+        if (std.mem.indexOf(u8, m, w.marker) != null) w.dirty_frees += 1;
+        w.inner.rawFree(m, a, ra);
+    }
+};
+
+test "h2: a buffered request body is zeroed before the codec frees it" {
+    // A request body is the caller's data -- credentials, payloads -- and the
+    // heap block that held it goes back to an allocator the next connection
+    // draws from. The body is read and discarded by the handler here, so any
+    // freed block still holding it is the codec's own copy. Three were found:
+    // the job's buffered body, the request arena's body scratch, and the
+    // connection's raw frame buffer.
+    //
+    // ⚠ Meaningful in ReleaseFast. A safe build's `Allocator.free` clobbers
+    // the block itself (`@memset(undefined)`), so in Debug two of the three
+    // copies are invisible here -- measured: removing either fix passes in
+    // Debug and fails in ReleaseFast.
+    const marker = "BODY-SECRET-7f3a";
+    var watch: ScrubWatch = .{ .inner = testing.allocator, .marker = marker };
+    const gpa = watch.allocator();
+
+    var peer: TestPeer = .init(testing.allocator, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
+    try peer.conn.sendData(&peer.wire, sid, marker, true);
+
+    var out_buf: [8192]u8 = undefined;
+    var in: Reader = .fixed(peer.wire.items);
+    var out: Writer = .fixed(&out_buf);
+    serve(gpa, .{ .handler = testHandler }, &in, &out);
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(out.buffered());
+
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+    try testing.expectEqual(@as(usize, 0), watch.dirty_frees);
 }

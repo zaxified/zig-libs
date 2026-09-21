@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — **Request bodies are zeroed before the h2 codec frees them.**
+  Three heap copies of a request body went back to the allocator intact: the
+  job's buffered body, the request arena's body scratch, and the connection's
+  raw frame buffer (`h2.Connection.recv_buf`, which also holds header blocks,
+  credentials included). All three are now `secureZero`ed first. Invisible in
+  a safe build, whose `free` clobbers the block anyway; in ReleaseFast the
+  bytes stayed. Test with a free-inspecting allocator, each fix red on its own
+  in ReleaseFast. ⚠ Not covered: copies an `ArrayList` leaves behind when it
+  grows by reallocating (an upload arriving in many DATA frames).
+
 - **2026-09-21** — **FIX (h2, crash): a header set with `setHeaderStatic` under a
   mixed-case name took the process down.** Since the 2026-09-20 re-frame the h2
   head lowers field names in the response writer's own storage, and asserted that

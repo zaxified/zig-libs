@@ -897,9 +897,19 @@ pub const Connection = struct {
         c.hpack_enc.deinit();
         c.hpack_dec.deinit();
         c.streams.deinit(c.gpa);
+        // Raw frames: request bodies (DATA) and header blocks, credentials
+        // included. Zeroed before they go back to an allocator the next
+        // connection draws from -- the whole allocation, since compaction
+        // leaves consumed bytes past `len`. A safe build's `free` clobbers
+        // freed memory anyway; ReleaseFast does not.
+        std.crypto.secureZero(u8, c.recv_buf.allocatedSlice());
         c.recv_buf.deinit(c.gpa);
+        std.crypto.secureZero(u8, c.hpack_block.allocatedSlice());
         c.hpack_block.deinit(c.gpa);
-        if (c.assembling) |*a| a.buf.deinit(c.gpa);
+        if (c.assembling) |*a| {
+            std.crypto.secureZero(u8, a.buf.allocatedSlice());
+            a.buf.deinit(c.gpa);
+        }
         c.* = undefined;
     }
 
