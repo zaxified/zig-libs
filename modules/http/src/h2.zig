@@ -48,6 +48,7 @@
 
 const std = @import("std");
 const hpack = @import("hpack.zig");
+const zeroize = @import("zeroize.zig");
 const Allocator = std.mem.Allocator;
 
 // ── constants (§3.4, §4.1, §4.2, §6.5.2, §6.9.1) ────────────────────────────
@@ -901,13 +902,14 @@ pub const Connection = struct {
         // included. Zeroed before they go back to an allocator the next
         // connection draws from -- the whole allocation, since compaction
         // leaves consumed bytes past `len`. A safe build's `free` clobbers
-        // freed memory anyway; ReleaseFast does not.
-        std.crypto.secureZero(u8, c.recv_buf.allocatedSlice());
+        // freed memory anyway; ReleaseFast does not. `zeroize`, not
+        // `std.crypto.secureZero` -- see `zeroize.zig`.
+        zeroize.zeroize(c.recv_buf.allocatedSlice());
         c.recv_buf.deinit(c.gpa);
-        std.crypto.secureZero(u8, c.hpack_block.allocatedSlice());
+        zeroize.zeroize(c.hpack_block.allocatedSlice());
         c.hpack_block.deinit(c.gpa);
         if (c.assembling) |*a| {
-            std.crypto.secureZero(u8, a.buf.allocatedSlice());
+            zeroize.zeroize(a.buf.allocatedSlice());
             a.buf.deinit(c.gpa);
         }
         c.* = undefined;

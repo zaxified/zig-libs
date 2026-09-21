@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — **FIX (perf): the 60a08442 body-zeroing above used
+  `std.crypto.secureZero`, whose `@memset` over a `[]volatile T` cannot
+  lower to the ordinary `memset` intrinsic and so stores one byte at a
+  time — 5657 instructions to zero 4096 B in ReleaseFast. One of the six
+  call sites, `h2_server.zig`'s per-stream `body_scratch`, runs on *every*
+  h2 stream, GET included, and regressed a downstream server's h2 GET path
+  (no body to protect at all) by +13% total instructions, measured in a
+  same-day qap perf audit (F1). Replaced with this module's own `zeroize`
+  (`src/zeroize.zig`): the same volatile, non-elidable stores, but 32
+  bytes at a time — 169 instructions for the same 4096 B. No behaviour
+  change; every site still zeroes the whole allocation it zeroed before,
+  verified by the same free-inspecting-allocator test from 60a08442.
+
 - **2026-09-21** — **Request bodies are zeroed before the h2 codec frees them.**
   Three heap copies of a request body went back to the allocator intact: the
   job's buffered body, the request arena's body scratch, and the connection's

@@ -180,6 +180,7 @@ const http = @import("root.zig");
 const h1 = @import("h1.zig");
 const h2 = @import("h2.zig");
 const hpack = @import("hpack.zig");
+const zeroize = @import("zeroize.zig");
 const gzip = @import("gzip.zig");
 const Server = @import("Server.zig");
 const Allocator = std.mem.Allocator;
@@ -644,7 +645,8 @@ const Job = struct {
         // block goes back to an allocator the next connection draws from.
         // The whole allocation, not just `items`: a streaming body that was
         // drained (`clearRetainingCapacity`) still has its bytes past `len`.
-        std.crypto.secureZero(u8, job.body.allocatedSlice());
+        // `zeroize`, not `std.crypto.secureZero` -- see `zeroize.zig`.
+        zeroize.zeroize(job.body.allocatedSlice());
         job.body.deinit(gpa);
     }
 
@@ -1661,9 +1663,12 @@ const Session = struct {
         }
         // The body passes through these on its way to the handler; zero them
         // before the arena hands the slab back (defers run in reverse, so
-        // this runs first). See `Job.deinit`.
-        defer std.crypto.secureZero(u8, body_scratch);
-        defer std.crypto.secureZero(u8, stream_scratch);
+        // this runs first). See `Job.deinit`. `zeroize`, not
+        // `std.crypto.secureZero` -- this runs on every h2 stream, GET
+        // included, and secureZero's byte-at-a-time store showed up as a
+        // measured regression on the no-body path (see `zeroize.zig`).
+        defer zeroize.zeroize(body_scratch);
+        defer zeroize.zeroize(stream_scratch);
         const body_buf = slab[cut..][0..s.opts.response_buffer_size];
         cut += s.opts.response_buffer_size;
         const framer_buf = slab[cut..][0..framer_buf_len];
@@ -2454,7 +2459,9 @@ const StreamBody = struct {
                     if (jp.read_pos == jp.body.items.len) {
                         // Fully drained: reclaim the buffer instead of
                         // letting a long upload accumulate behind the cursor.
-                        std.crypto.secureZero(u8, jp.body.items);
+                        // `zeroize`, not `std.crypto.secureZero` -- see
+                        // `zeroize.zig`.
+                        zeroize.zeroize(jp.body.items);
                         jp.body.clearRetainingCapacity();
                         jp.read_pos = 0;
                     }
