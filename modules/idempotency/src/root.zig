@@ -393,7 +393,9 @@ pub const Store = struct {
 
 // Stored blob layout:
 // [digest:32][status:u16 BE][ct_len:u16 BE][ct bytes][body bytes].
-const RecordedResponse = struct {
+/// A recorded response, as `decode` reads it out of a `Begin.replay` blob.
+/// The slices borrow the blob.
+pub const RecordedResponse = struct {
     digest: [digest_len]u8,
     status: u16,
     content_type: []const u8,
@@ -411,7 +413,9 @@ fn encode(gpa: std.mem.Allocator, digest: [digest_len]u8, status: u16, content_t
     return blob;
 }
 
-fn decode(blob: []const u8) ?RecordedResponse {
+/// Read a `Begin.replay` blob; null for one that is not a record (a server
+/// then runs the request instead, as the middleware does).
+pub fn decode(blob: []const u8) ?RecordedResponse {
     if (blob.len < digest_len + 4) return null;
     var digest: [digest_len]u8 = undefined;
     @memcpy(&digest, blob[0..digest_len]);

@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — `decode` and `RecordedResponse` are public: a server without
+  `router` reads a `Store.begin` `.replay` blob itself (status, content type,
+  body) to answer the replay.
 - **2026-09-21** — **A1 audit (for qap's write layer): three findings fixed, API
   changed.**
   - **F1 (HIGH): one record namespace for every caller.** Keys were scoped by
