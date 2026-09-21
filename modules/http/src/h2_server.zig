@@ -2559,6 +2559,11 @@ fn testHandler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
         if (req.peerAddress()) |p| try w.print("{f}", .{p}) else try w.writeAll("none");
         try w.print(" #{d} host={s}", .{ req.connRequestIndex(), req.header("host") orelse "-" });
         try rw.writeAll(w.buffered());
+    } else if (std.mem.eql(u8, req.path, "/static-name")) {
+        // A comptime name: `setHeaderStatic` stores the literal itself, so
+        // the h2 head cannot lower it where it lies.
+        rw.setStatus(405);
+        try rw.setHeaderStatic("Allow", "GET, HEAD");
     } else if (std.mem.eql(u8, req.path, "/big")) {
         try rw.writeAll(big_body);
     } else if (std.mem.eql(u8, req.path, "/drain")) {
@@ -3707,6 +3712,28 @@ test "h2: an uppercase field name from the handler reaches the wire lowercased (
         if (std.mem.eql(u8, f.name, "content-type")) saw = true;
     }
     try testing.expect(saw);
+}
+
+test "h2: a mixed-case name set with setHeaderStatic reaches the wire lowercased, and the literal is untouched" {
+    // The head lowers names in the writer's own storage. A static name is NOT
+    // in that storage -- it is a string literal, read-only memory -- and the
+    // first version asserted it never would be: one POST to a GET-only server
+    // (whose 405 sets `Allow` this way) took a qap process down, an assert in
+    // Debug and a write into .rodata in ReleaseFast.
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("GET", "/static-name"), true);
+
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{ .handler = testHandler }, &out_buf);
+
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 405), c.status);
+    try testing.expectEqualStrings("GET, HEAD", c.header("allow").?);
+    const hl = c.headers orelse return error.NoHeaders;
+    for (hl.fields) |f| for (f.name) |ch| try testing.expect(!std.ascii.isUpper(ch));
 }
 
 test "h2: response trailers are a HEADERS frame AFTER the DATA frames (§8.1)" {

@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — **FIX (h2, crash): a header set with `setHeaderStatic` under a
+  mixed-case name took the process down.** Since the 2026-09-20 re-frame the h2
+  head lowers field names in the response writer's own storage, and asserted that
+  every name lived there. `setHeaderStatic` stores the caller's string literal
+  instead, so the first such header on an h2 response was an assert failure
+  (Debug, ReleaseSafe) or a write into read-only memory (ReleaseFast). Found by
+  qap, whose GET-only server answers a POST 405 with `setHeaderStatic("Allow", …)`:
+  one h2 POST from any client ended the process. A static name is now lowered
+  into a copy in `header_buf`; a header table with no room left for it fails the
+  head (`WriteFailed`) like the ETag weakening beside it. h1 is unaffected — it
+  writes names as given. Regression test in `h2_server.zig`, red before the fix.
 - **2026-09-20** — **NO CONSUMER-VISIBLE CHANGE (h2):** `server_name` is checked
   once per connection instead of once per field per response, and the per-field
   §8.2.1 walk the h2 field sink did is now an assert. Both answers were already

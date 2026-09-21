@@ -3113,13 +3113,20 @@ pub const ResponseWriter = struct {
         rw.sent_head = true;
     }
 
-    /// RFC 9113 §8.2.1: field names go on the h2 wire lowercase. Lowered IN
-    /// PLACE, which is sound here and nowhere else: every name in `headers`
-    /// came through `setHeader`, which copies it into `header_buf` -- this
-    /// object's own storage. The assert is the guard, not the comment: a
-    /// future path that puts a borrowed or static name in the table would trip
-    /// it in Debug and ReleaseSafe rather than writing to read-only memory.
-    fn lowerName(rw: *ResponseWriter, name: []const u8) []const u8 {
+    /// RFC 9113 §8.2.1: field names go on the h2 wire lowercase.
+    ///
+    /// A name `setHeader` copied into `header_buf` -- this object's own
+    /// storage -- is lowered in place. A name `setHeaderStatic` stored is the
+    /// caller's string literal, read-only memory, and is lowered into a COPY
+    /// in `header_buf` instead.
+    ///
+    /// ⛔ The first version asserted that the second kind never reached here,
+    /// and it did from the day it shipped: `setHeaderStatic` exists and puts
+    /// the literal in the table. A GET-only server answering a POST 405 sets
+    /// `Allow` that way, so one request from anyone was an assert (Debug,
+    /// ReleaseSafe) or a write into .rodata (ReleaseFast) -- a dead process
+    /// either way. Found by qap, 2026-09-21.
+    fn lowerName(rw: *ResponseWriter, name: []const u8) Writer.Error![]const u8 {
         var upper = false;
         for (name) |c| {
             if (std.ascii.isUpper(c)) {
@@ -3130,9 +3137,16 @@ pub const ResponseWriter = struct {
         if (!upper) return name;
         const base = @intFromPtr(&rw.header_buf);
         const at = @intFromPtr(name.ptr);
-        std.debug.assert(at >= base and at + name.len <= base + rw.header_buf.len);
-        for (@constCast(name)) |*c| c.* = std.ascii.toLower(c.*);
-        return name;
+        if (at >= base and at + name.len <= base + rw.header_buf.len) {
+            for (@constCast(name)) |*c| c.* = std.ascii.toLower(c.*);
+            return name;
+        }
+        const room = rw.header_buf[rw.header_buf_len..];
+        if (room.len < name.len) return error.WriteFailed;
+        const copy = room[0..name.len];
+        for (name, copy) |c, *d| d.* = std.ascii.toLower(c);
+        rw.header_buf_len += name.len;
+        return copy;
     }
 
     /// The same head as `writeHead`, handed over as fields instead of text.
@@ -3162,10 +3176,10 @@ pub const ResponseWriter = struct {
                 @memcpy(room[2..][0..hd.value.len], hd.value);
                 const weak = room[0 .. hd.value.len + 2];
                 rw.header_buf_len += weak.len;
-                try sink.put(sink.ctx, rw.lowerName(hd.name), weak);
+                try sink.put(sink.ctx, try rw.lowerName(hd.name), weak);
                 continue;
             }
-            try sink.put(sink.ctx, rw.lowerName(hd.name), hd.value);
+            try sink.put(sink.ctx, try rw.lowerName(hd.name), hd.value);
         }
         if (!saw_date) if (rw.date) |d| try sink.put(sink.ctx, "date", d);
         if (!saw_server) if (rw.server_name) |sn| try sink.put(sink.ctx, "server", sn);
