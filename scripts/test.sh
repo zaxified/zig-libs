@@ -94,6 +94,40 @@ if [[ -z "${TMPDIR:-}" ]] || _zl_on_ram "$TMPDIR"; then
     export TMPDIR="$_zl_disk_tmp"
 fi
 
+# ⭐ ONE RUN PER CHECKOUT (2026-09-22). Two runs on one `.zig-cache` fight over
+# it and load the host for each other, and what that produces reads as module
+# failures. On 2026-09-03 a backgrounded `all` that was believed dead kept
+# running beside its replacement; the pair failed twice, on `dns` and then
+# `http`, and the conclusion "the gate defeats itself under its own load" went
+# into the audit record before anyone looked at the process list.
+#
+# So a second run in the same checkout refuses to start and says who holds it.
+# Worktrees have their own `.zig-cache` and do not block each other. The lock
+# is taken after the cgroup re-exec, so it is held by the process that runs.
+# `ZIGLIBS_WAIT_LOCK=1` queues behind the holder instead of refusing.
+# ⚠ No `2>/dev/null` on the `exec` below: on an `exec` without a command a
+# redirect applies to the whole script from there on, and would silence it.
+case "${1:-changed}" in
+    vm|-h|--help|help) ;;
+    *)
+        if command -v flock >/dev/null 2>&1 && [[ -z "${_ZL_LOCK_HELD:-}" ]]; then
+            mkdir -p "$REPO_ROOT/.zig-cache"
+            _zl_lock="$REPO_ROOT/.zig-cache/test-sh.lock"
+            exec 9>>"$_zl_lock"
+            if [[ "${ZIGLIBS_WAIT_LOCK:-0}" == 1 ]]; then
+                flock 9
+            elif ! flock -n 9; then
+                echo "test.sh: another run holds this checkout: $(cat "$_zl_lock.owner" 2>/dev/null || echo '(unknown)')" >&2
+                echo "         two runs on one .zig-cache produce failures that are not the modules'." >&2
+                echo "         Wait for it, stop it, or rerun with ZIGLIBS_WAIT_LOCK=1 to queue." >&2
+                exit 1
+            fi
+            echo "pid $$ since $(date -u +%H:%M:%SZ): test.sh $*" > "$_zl_lock.owner"
+            export _ZL_LOCK_HELD=1
+        fi
+        ;;
+esac
+
 # A cgroup cap bounds THIS run; it cannot bound the machine. Measured here on
 # 2026-08-23: a full run peaked at 4.5 GB against its own 20 GB limit and was
 # never close to it, yet the kernel still fired a GLOBAL oom-kill
@@ -1386,6 +1420,7 @@ cmd_changed() {
         touched="$touched${touched:+,}$tm"
     done
 
+    checks_begin   # every check below runs; checks_end names all that failed
     if [[ $trigger_catalog -eq 1 ]]; then
         step "check-catalog" zig build check-catalog
     fi
@@ -1510,6 +1545,7 @@ cmd_changed() {
     # agreed; breaking `sealedbox`'s PyNaCl constant left the old example
     # exiting 0 and still claiming a byte-exact match.
     (( mt )) && step "check-example-assert" ./scripts/checks/check-example-assert.py
+    checks_end
 
     if [[ -z "${closure// /}" ]]; then
         summary
@@ -1686,13 +1722,17 @@ phase_checks() {
 
 cmd_checks_fast() {
     echo "checks-fast: the sub-second gates, before anything expensive starts"
+    checks_begin
     phase_checks_fast
+    checks_end
     summary
 }
 
 cmd_checks() {
     echo "checks: the mode- and arch-independent gates, once for the whole matrix"
+    checks_begin
     phase_checks
+    checks_end
     summary
 }
 
@@ -1947,6 +1987,7 @@ GATE_BUILD_ONLY=0
 # Every check the collection has, in gate order. `all` and the harness smoke
 # set run exactly this; they used to carry two hand-kept copies of it.
 phase_all_checks() {
+    checks_begin   # every check below runs; checks_end names all that failed
     step "fmt check" zig fmt --check build.zig build.zig.zon modules
     # `af6a148` is why the fmt step is first and why the hook exists: six files
     # had drifted out of fmt, the gate stops on the first failure, and so NO
@@ -1979,6 +2020,7 @@ phase_all_checks() {
     # in the lane that does nothing else: the compile-only lane's whole
     # deliverable is "the modules and the examples build in this mode".
     step "check-examples" zig build check-examples "${EXTRA_ZIG_ARGS[@]}"
+    checks_end
 }
 
 cmd_all() {

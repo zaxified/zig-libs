@@ -241,6 +241,23 @@ Skip reasons are silent by default, so **any stderr output means a real
 problem**. Set `ZIG_LIBS_VERBOSE_SKIP=1` to see why something skipped; the skip
 *count* is always in the summary either way.
 
+## One run per checkout, and checks run to the end
+
+**A second `test.sh` in the same checkout refuses to start** and names the run
+holding it (`.zig-cache/test-sh.lock`, owner in `test-sh.lock.owner`). Two runs
+on one `.zig-cache` load the host for each other and fail in ways that read as
+module defects: on 2026-09-03 a backgrounded `all` believed dead ran beside its
+replacement, and the pair "found" a load failure in `dns`, then in `http`.
+`ZIGLIBS_WAIT_LOCK=1` queues behind the holder instead. Worktrees have their own
+cache and lock.
+
+**A check phase no longer stops at the first red check.** Inside `checks-fast`,
+`checks`, the check block of `changed` and the check phase of `all`, a failing
+step is recorded and the rest still run; the phase then lists every failure and
+stops before any module is built. On 2026-09-15 stopping at the first one cost
+two full-gate attempts to surface two defects, and a manual pass found five more
+at once. Module steps still fail fast.
+
 ## Memory cap
 
 `test.sh` re-execs itself inside **one** transient cgroup limited to

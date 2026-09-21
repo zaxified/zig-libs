@@ -458,7 +458,37 @@ step() {
         cat "$err" >&2
     fi
     rm -f "$out" "$err"
+    if [[ "$_ZL_KEEP_GOING" == 1 ]]; then
+        _ZL_FAILED+=("$label")
+        return 0
+    fi
     exit "$rc"
+}
+
+# ⭐ A CHECK PHASE RUNS TO THE END (2026-09-22). `step` used to exit on the
+# first red step everywhere, and for the repo checks that cost whole gate runs:
+# on 2026-09-15 run #1 stopped at `check-catalog` after 10 s, run #2 at
+# `check-global-alloc` after 67 s, and only a third pass, every check by hand,
+# found the other five defects at once. The checks are independent and cost
+# seconds, so between `checks_begin` and `checks_end` a failing step is
+# recorded and the phase carries on; `checks_end` then names every failure and
+# stops the run before any module is built. Module steps keep failing fast --
+# after a red check, twenty minutes of tests would answer nothing.
+_ZL_KEEP_GOING=0
+_ZL_FAILED=()
+checks_begin() {
+    _ZL_KEEP_GOING=1
+    _ZL_FAILED=()
+}
+checks_end() {
+    _ZL_KEEP_GOING=0
+    (( ${#_ZL_FAILED[@]} == 0 )) && return 0
+    local f
+    echo
+    echo "  ${#_ZL_FAILED[@]} check(s) FAILED -- stopping before any module runs:"
+    for f in "${_ZL_FAILED[@]}"; do echo "    - $f"; done
+    summary
+    exit 1
 }
 
 # Bottom rule + total wall time. No-op if ZIGLIBS_TEST_T0 was never set.
