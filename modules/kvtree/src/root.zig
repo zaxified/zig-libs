@@ -85,15 +85,18 @@ pub const OpenError = kv.Storage.Error || core.RecoverError || error{
 pub const GetError = kv.Storage.Error || error{ Corrupt, OutOfMemory };
 pub const GetRefError = kv.Storage.Error || error{ Corrupt, CannotLend };
 
-/// A value borrowed from a leaf page -- see `Db.getRef`. `bytes` is valid
-/// until `release`, and exactly one `release` is owed.
+/// A value borrowed without a copy -- see `Db.getRef` and `Txn.getRef`.
+/// `bytes` is valid until `release`, and exactly one `release` is owed.
 pub const ValueRef = struct {
     bytes: []const u8,
     pager: *Pager,
-    ref: kv.Storage.Ref,
+    /// The leaf page lent by the store, or null when `bytes` is a value
+    /// buffered in a `Txn` (owned by its arena: valid until `release` AND
+    /// until the txn is consumed, whichever comes first).
+    ref: ?kv.Storage.Ref,
 
     pub fn release(self: *ValueRef) void {
-        self.pager.releasePageRef(self.ref);
+        if (self.ref) |r| self.pager.releasePageRef(r);
         self.* = undefined;
     }
 };
@@ -291,29 +294,7 @@ pub const Db = struct {
     /// "did it?" unanswerable -- the same rule `preadRef` itself keeps.
     pub fn getRef(self: *Db, key: []const u8) GetRefError!?ValueRef {
         if (!self.pager.store.canLend()) return error.CannotLend;
-        var id = self.meta_rec.root;
-        while (true) {
-            const ref = (try self.pager.readPageRef(id)) orelse return error.CannotLend;
-            const bytes: *const [page_size]u8 = ref.bytes[0..page_size];
-            switch (format.kindOf(bytes) orelse {
-                self.pager.releasePageRef(ref);
-                return error.Corrupt;
-            }) {
-                .branch => {
-                    id = format.Branch.init(bytes).childFor(key);
-                    self.pager.releasePageRef(ref);
-                },
-                .leaf => {
-                    const leaf = format.Leaf.init(bytes);
-                    const found = leaf.search(key);
-                    if (!found.found) {
-                        self.pager.releasePageRef(ref);
-                        return null;
-                    }
-                    return .{ .bytes = leaf.valAt(found.index), .pager = &self.pager, .ref = ref };
-                },
-            }
-        }
+        return lookupRef(&self.pager, self.meta_rec.root, key);
     }
 
     /// A cursor over the newest committed version (ordered iteration / scan).
@@ -467,6 +448,26 @@ pub const Txn = struct {
         return lookup(&self.db.pager, self.base.root, gpa, key);
     }
 
+    /// `get` without the copy: a buffered change is lent straight from the
+    /// transaction's arena, anything else from the base tree exactly as
+    /// `Db.getRef` lends it. Release it before the txn is consumed -- a
+    /// buffered value dies with the arena at `commit`/`rollback`. The same
+    /// `error.CannotLend` rule as `Db.getRef`, for a buffered key too, so
+    /// whether a call borrows never depends on what the batch holds.
+    pub fn getRef(self: *Txn, key: []const u8) GetRefError!?ValueRef {
+        if (!self.db.pager.store.canLend()) return error.CannotLend;
+        var i: usize = self.changes.items.len;
+        while (i > 0) {
+            i -= 1;
+            switch (self.changes.items[i]) {
+                .put => |p| if (std.mem.eql(u8, p.key, key))
+                    return .{ .bytes = p.val, .pager = &self.db.pager, .ref = null },
+                .del => |k| if (std.mem.eql(u8, k, key)) return null,
+            }
+        }
+        return lookupRef(&self.db.pager, self.base.root, key);
+    }
+
     /// Commit atomically (via `core.commit`). CONSUMES the transaction on
     /// BOTH outcomes: after a failed commit the txn is already torn down —
     /// do not call `rollback` on it. The store is always left on *some*
@@ -530,6 +531,34 @@ pub const Snapshot = struct {
 };
 
 // ── read path: descend + ordered cursor (all mechanical) ─────────────────────
+
+/// `lookup` without the copy: the leaf page stays borrowed from the store and
+/// the value points into it. The caller has checked `canLend`.
+fn lookupRef(pager: *Pager, root: PageId, key: []const u8) GetRefError!?ValueRef {
+    var id = root;
+    while (true) {
+        const ref = (try pager.readPageRef(id)) orelse return error.CannotLend;
+        const bytes: *const [page_size]u8 = ref.bytes[0..page_size];
+        switch (format.kindOf(bytes) orelse {
+            pager.releasePageRef(ref);
+            return error.Corrupt;
+        }) {
+            .branch => {
+                id = format.Branch.init(bytes).childFor(key);
+                pager.releasePageRef(ref);
+            },
+            .leaf => {
+                const leaf = format.Leaf.init(bytes);
+                const found = leaf.search(key);
+                if (!found.found) {
+                    pager.releasePageRef(ref);
+                    return null;
+                }
+                return .{ .bytes = leaf.valAt(found.index), .pager = pager, .ref = ref };
+            },
+        }
+    }
+}
 
 /// Descend from `root` to the leaf that would hold `key` and return a copy of
 /// its value, or null. No allocation beyond the returned value.
@@ -1245,4 +1274,11 @@ test "getRef on a store that cannot lend is CannotLend, never a silent copy" {
     const v = (try db.get(gpa, "k")).?;
     defer gpa.free(v);
     try std.testing.expectEqualStrings("v", v);
+    // Txn.getRef refuses too -- for a key the batch buffers as well, so
+    // whether a call borrows never depends on what the batch holds.
+    var txn = try db.begin();
+    defer txn.rollback();
+    try txn.put("b", "2");
+    try std.testing.expectError(error.CannotLend, txn.getRef("b"));
+    try std.testing.expectError(error.CannotLend, txn.getRef("k"));
 }

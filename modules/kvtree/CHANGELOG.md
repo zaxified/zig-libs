@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **`Txn.getRef`: a read inside a transaction without the
+  copy.** A buffered change is lent from the txn's arena, anything else from
+  the base tree exactly as `Db.getRef` lends it; release before the txn is
+  consumed. qap's kv-store checks `If-Match` inside a batch by hashing the
+  current value, and paid an allocation + copy + free per PUT for it (qap
+  perf audit F7). **BREAKING** only for code that reads `ValueRef.ref`
+  directly: it is now `?kv.Storage.Ref` (null = a buffered value).
+  `ValueRef.bytes` and `release` are unchanged.
 - **2026-09-21** — **Commit path halved: builders borrow, pages zero by vector.**
   A qap perf audit profiled a PUT through `Serial` + kvtree on tmpfs and found
   67 % of the user-side cost in `applyRec` and 19 % in `compiler_rt.memset`:

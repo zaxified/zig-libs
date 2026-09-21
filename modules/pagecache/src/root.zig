@@ -1431,3 +1431,48 @@ test "W3: kvtree getRef lends the value in place -- same bytes as get, held stab
     // Every borrow was handed back.
     try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
 }
+
+test "W3: kvtree Txn.getRef -- buffered changes shadow the tree, tree values are lent in place" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 64 });
+    defer pc.deinit();
+    var db = try kvtree.Db.open(gpa, pc.storage(), "t.kvt", .{});
+    defer db.close();
+
+    var kbuf: [32]u8 = undefined;
+    var vbuf: [48]u8 = undefined;
+    var id: u64 = 0;
+    while (id < 400) : (id += 1) {
+        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const val = try std.fmt.bufPrint(&vbuf, "value-{d}-{d}", .{ id, id * 7 });
+        try db.put(key, val);
+    }
+
+    var txn = try db.begin();
+    try txn.put("key00013", "first");
+    try txn.put("key00013", "second"); // the latest buffered change wins
+    try txn.del("key00026");
+    try txn.put("new-key", "fresh");
+
+    // Each answer equals the copying `Txn.get`, whichever layer it came from.
+    const probes = [_][]const u8{ "key00013", "key00026", "new-key", "key00039", "no-such-key" };
+    const refs_before = pc.stats().ref_hits;
+    for (probes) |key| {
+        const copied = try txn.get(gpa, key);
+        defer if (copied) |c| gpa.free(c);
+        var lent = try txn.getRef(key);
+        defer if (lent) |*l| l.release();
+        if (copied) |c| try testing.expectEqualSlices(u8, c, lent.?.bytes) else try testing.expectEqual(@as(?kvtree.ValueRef, null), lent);
+    }
+    var latest = (try txn.getRef("key00013")).?;
+    try testing.expectEqualStrings("second", latest.bytes);
+    latest.release();
+    // A key the batch did not touch came from the store's lent page.
+    try testing.expect(pc.stats().ref_hits > refs_before);
+
+    try txn.commit();
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}
