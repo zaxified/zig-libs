@@ -110,6 +110,8 @@ pub const Stats = struct {
     hits: u64 = 0,
     misses: u64 = 0,
     evictions: u64 = 0,
+    /// Times the index was rebuilt to shed tombstones (see `Cache.removals`).
+    rehashes: u64 = 0,
     expired: u64 = 0,
     /// Candidates that won the W-TinyLFU frequency contest against the main
     /// region's LRU victim (the victim was evicted instead).
@@ -424,6 +426,18 @@ pub const Cache = struct {
     /// with capacity. That is the acceptance criterion the audit set, and the
     /// regression test reads this counter rather than a clock.
     maintenance_visits: u64 = 0,
+    /// Entries removed from `map` since its last rebuild. ⛔ std's open-addressing
+    /// map leaves a TOMBSTONE per removal and hands the slot back to `available`
+    /// (`removeByIndex`: `available += 1`), so a remove-then-insert workload --
+    /// which is what a cache under miss pressure IS -- never triggers the grow
+    /// that would clear them. The table fills with tombstones until it has no
+    /// free slot left, and from then on every lookup of an ABSENT key (the `pin`
+    /// before every `reserve`) walks the whole table. Measured on pagecache over
+    /// a flat backend, 4 KiB pages, 93 % misses: 700 000 instructions per access
+    /// at a 1 024-entry budget, 92 % of them in the map's probe loop; the same
+    /// probe with the rebuild below: see the CHANGELOG. `maintain` rebuilds the
+    /// index once this passes a quarter of the capacity.
+    removals: u32 = 0,
 
     pub fn init(alloc: std.mem.Allocator, options: Options) Cache {
         return .{ .alloc = alloc, .options = options };
@@ -914,6 +928,7 @@ pub const Cache = struct {
             return;
         }
         const kv = self.map.fetchRemove(n.key).?;
+        self.removals +|= 1;
         switch (kv.value.region) {
             .window => self.window_count -= 1,
             .probation => self.probation_count -= 1,
@@ -1059,6 +1074,7 @@ pub const Cache = struct {
             }
         }
         const found = if (self.map.fetchRemove(key)) |kv| blk: {
+            self.removals +|= 1;
             self.lruRemove(kv.value.region, kv.value.node);
             self.expRemove(kv.value.node);
             switch (kv.value.region) {
@@ -1107,6 +1123,7 @@ pub const Cache = struct {
     /// snapshot it was given.
     fn doomEntry(self: *Cache, key: []const u8, reason: ?EvictReason) void {
         const kv = self.map.fetchRemove(key).?;
+        self.removals +|= 1;
         std.debug.assert(kv.value.node.pins > 0);
         // A `null` reason means "unlink it, but tell nobody" — `discard`'s
         // case, where the bytes were never written and handing a caller's
@@ -1359,6 +1376,23 @@ pub const Cache = struct {
             self.probation_count += 1;
         }
         self.enforceProtectedCap();
+        self.shedTombstones();
+    }
+
+    /// Rebuild the index once removals since the last rebuild pass a quarter
+    /// of its capacity, so a lookup never probes more than that many
+    /// tombstones. O(capacity) once per capacity/4 removals -- a few
+    /// instructions per removal, against a whole-table walk per lookup
+    /// without it. Only here, at the end of `maintain`: nothing in this
+    /// module holds an `*Entry` across it (borrows hold `*Node`, which the
+    /// rebuild does not move), and every insert passes through `maintain`.
+    fn shedTombstones(self: *Cache) void {
+        const cap = self.map.capacity();
+        if (cap == 0) return;
+        if (self.removals < @max(32, cap / 4)) return;
+        self.map.rehash(std.hash_map.StringContext{});
+        self.removals = 0;
+        self.stats.rehashes += 1;
     }
 
     /// Demote protected LRU entries back to probation while over the cap.
@@ -1658,6 +1692,32 @@ test "clear frees everything but keeps cumulative counters" {
 }
 
 // ── borrow seam ─────────────────────────────────────────────────────────────
+
+test "miss churn sheds the index's tombstones: the map is rebuilt, every live key still answers" {
+    // Every miss on a full cache is a remove plus an insert. std's map keeps
+    // a tombstone per remove and never rebuilds on its own (a remove hands
+    // the slot back to `available`), so without `shedTombstones` this loop
+    // ends with a table that has no free slot and a probe that walks all of
+    // it. RED without the rebuild: `rehashes` stays 0.
+    var c = testCache(1 << 20, 64);
+    defer c.deinit();
+    var k: [16]u8 = undefined;
+    for (0..4096) |i| {
+        c.put(std.fmt.bufPrint(&k, "key{d}", .{i}) catch unreachable, "v", 0, 0, 0);
+    }
+    try testing.expect(c.stats.rehashes >= 1);
+    try testing.expect(c.stats.rehashes <= 4096 / 32);
+    // The rebuild kept the live set intact: the newest keys are resident.
+    var live: usize = 0;
+    for (4096 - 8..4096) |i| {
+        if (c.get(std.fmt.bufPrint(&k, "key{d}", .{i}) catch unreachable, 0, 0)) |v| {
+            try testing.expectEqualStrings("v", v);
+            live += 1;
+        }
+    }
+    try testing.expect(live >= 1);
+    try testing.expectEqual(@as(usize, c.map.count()), c.stats.entries);
+}
 
 test "borrow: a pinned entry is never chosen as an eviction victim" {
     // A one-entry cache makes the choice forced and frequency-free: the

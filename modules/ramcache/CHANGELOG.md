@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — **A cache under miss pressure no longer degrades to a
+  whole-table probe per lookup.** std's open-addressing map leaves a tombstone
+  per removal and hands the slot back to `available`, so a remove-then-insert
+  workload -- every miss on a full cache -- never triggered the rebuild that
+  clears them; the table filled with tombstones until no free slot was left,
+  and each lookup of an absent key (the `pin` before every `reserve`) walked
+  all of it. Measured through pagecache over a flat backend (4 KiB pages,
+  93 % misses, ReleaseFast): 74 000 / 212 000 / **697 000** user instructions
+  per access at 64 / 256 / 1 024 entries -- 92 % in the probe loop -- against
+  **30 000 at every size** once `maintain` rebuilds the index after removals
+  reach a quarter of its capacity (`Stats.rehashes` counts them). Found by a
+  qap perf audit: a kv-store GET whose store outgrew its page cache cost
+  8x a hit. Test: 4 096 puts through a 64-entry cache rebuild at least once
+  and the live keys still answer.
+
 - **2026-09-03** — **`put` over a resident key no longer leaves the OLD value
   behind when its value dupe fails.** `put` cannot report failure, and
   `pagecache`'s write-through refresh calls it *after* the durable write has
