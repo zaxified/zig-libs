@@ -511,9 +511,14 @@ run_modules() {
     [[ -z "${mods// /}" ]] && return 0
     CAP_MODS="$mods" capability_check
 
-    local -a rest=() netns=() live=()
+    local -a rest=() netns=() live=() timing=()
     local m
     for m in $mods; do
+        # Timing first: `tc` is both, and serial wins -- it is wrapped in its
+        # namespace inside the serial loop below.
+        case " $TIMING_MODULES " in
+            *" $m "*) timing+=("$m"); continue ;;
+        esac
         case " $NETNS_MODULES " in
             *" $m "*) netns+=("$m"); continue ;;
         esac
@@ -579,6 +584,30 @@ run_modules() {
                     ;;
             esac
             step "live interop: $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+        done
+    fi
+
+    # ⭐ ALSO ONE AT A TIME: modules whose tests bound MEASURED time
+    # (`.timing` in build.zig, 2026-09-22). In the parallel step every such
+    # bound became a load test that failed on a random module per run -- five
+    # full-gate attempts on 2026-09-15, five different losers. Alone, each
+    # measures itself. One `zig build` per module, for the reason given for the
+    # live set above: `-j1` does not bound concurrent run steps.
+    if [[ ${#timing[@]} -gt 0 ]]; then
+        local m
+        for m in "${timing[@]}"; do
+            case " $NETNS_MODULES " in
+                *" $m "*)
+                    if have_unshare; then
+                        step "timing (serial, unshare -rn): $m" unshare -rn zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                    else
+                        step "timing (serial, NO unshare): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                    fi
+                    ;;
+                *)
+                    step "timing (serial): $m" zig build "test-$m" --summary all --test-timeout "$TEST_TIMEOUT" "${EXTRA_ZIG_ARGS[@]}"
+                    ;;
+            esac
         done
     fi
 

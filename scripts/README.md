@@ -251,6 +251,17 @@ replacement, and the pair "found" a load failure in `dns`, then in `http`.
 `ZIGLIBS_WAIT_LOCK=1` queues behind the holder instead. Worktrees have their own
 cache and lock.
 
+**Modules whose tests bound measured time run alone.** `.timing = true` in
+`build.zig`'s `module_list` (graph column 8) marks a module where some test
+asserts an UPPER bound on wall-clock or CPU time, or on a ratio of two timings.
+`run_modules` runs those one `zig build` each, after the parallel step, like the
+`live` set (`tc` is also netns, so it runs alone inside `unshare -rn`). Beside 217
+other test binaries such a bound is a load test: five full-gate attempts on
+2026-09-15 each failed on a different module, almost none of them defective.
+The flag is not in the fingerprint, so marking or unmarking a module does not
+re-test it. A lower bound ("did not fire before 50 ms") or a bound on a count is
+not a reason to set it.
+
 **A check phase no longer stops at the first red check.** Inside `checks-fast`,
 `checks`, the check block of `changed` and the check phase of `all`, a failing
 step is recorded and the rest still run; the phase then lists every failure and

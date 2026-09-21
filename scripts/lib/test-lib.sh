@@ -35,6 +35,11 @@ _zl_graph_out="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && zig build module-g
 NETNS_MODULES="$(awk -F'\t' '$7=="netns"{printf "%s ", $1}' <<< "$_zl_graph_out")"
 NETNS_MODULES="${NETNS_MODULES% }"
 _ZL_LIVE_CACHE="$(awk -F'\t' '$4=="live"{printf "%s ", $1}' <<< "$_zl_graph_out")"
+# Column 8: modules whose tests bound MEASURED time (`.timing` in build.zig).
+# Unlike netns and live, an empty set is legitimate -- every such test can be
+# rewritten to count instead -- so it is not refused.
+TIMING_MODULES="$(awk -F'\t' '$8=="timing"{printf "%s ", $1}' <<< "$_zl_graph_out")"
+TIMING_MODULES="${TIMING_MODULES% }"
 unset _zl_graph_out
 if [[ -z "$NETNS_MODULES" ]]; then
     echo "test-lib.sh: module-graph reported no netns modules -- refusing to run them unwrapped on a guess" >&2
