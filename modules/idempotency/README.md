@@ -42,7 +42,13 @@ is simply not expressible against a concrete `ResponseWriter`):
   cached status + `Content-Type` + body, stamps `Idempotent-Replayed: true`,
   and short-circuits the chain — **the handler genuinely never runs** (the
   strongest guarantee, and what the hit-counter test asserts). On a miss it
-  exposes the scoped key via `idempotency.currentKey()` and runs the chain.
+  binds the scoped key to the request (`store.current(ctx.req)`) and runs the
+  chain.
+- ⚠ **Set `Options.principal`** unless there is exactly one caller: without
+  it every caller shares one key namespace, and a second client that picks
+  the same key for the same endpoint and body is handed the FIRST client's
+  recorded response (A1 F1). The principal (e.g. the `Authorization` value)
+  enters the cache key as a SHA-256 tag, never raw.
 - The **handler** owns the *record* half. Instead of writing to `ctx.res`
   directly it calls `store.respond(ctx, status, content_type, body)`, which
   writes the response **and** records it under the key the middleware exposed.
@@ -108,8 +114,8 @@ processes/machines sharing one store.
   SmpAllocator pattern), so `respond` and the middleware may race across all
   connection threads; the cached bytes are copied out under the lock and
   written to the socket lock-free. The scoped key travels middleware→handler in
-  thread-local storage (the server is task-per-connection: one request at a
-  time per thread), the same model `requestid` uses. The `Store` and
+  the store, bound to the request's address -- never thread-local, which a
+  nested dispatch or another fiber on the same thread overwrote (A1 F2). The `Store` and
   `Idempotency` must outlive the `Router`, at stable addresses. The clock is
   injected (`Store.clock`) so TTL tests are deterministic; only the default
   `.monotonic` clock touches the OS.
@@ -121,7 +127,7 @@ modules.
 
 ## Verification
 
-`zig build test-idempotency` — 13 offline tests through `http.Server.serveStream`
+`zig build test-idempotency` — 16 offline tests through `http.Server.serveStream`
 with a real `router` + `ramcache`: first key runs the handler once and a replay
 returns the cached response without re-running (hit-counter asserted), a
 concurrent same-key duplicate fired from inside the first handler is rejected

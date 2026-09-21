@@ -26,7 +26,7 @@
 //!   cached status + `Content-Type` + body and short-circuits the chain — the
 //!   handler genuinely never runs (the strongest guarantee, and what the
 //!   hit-counter test asserts). On a miss it exposes the (scoped) key via
-//!   `currentKey()` and runs the chain.
+//!   `Store.current(req)` and runs the chain.
 //! - The **handler** owns the *record* half. Instead of writing to `ctx.res`
 //!   directly it calls `store.respond(ctx, status, content_type, body)`, which
 //!   writes the response **and** records it in the store under the key the
@@ -103,12 +103,13 @@
 //! and the middleware may race across all connection threads. Critical sections
 //! are a single map touch plus a bounded value copy — never socket I/O (the
 //! cached bytes are copied out under the lock, then written to the socket
-//! lock-free). The scoped key travels middleware→handler in thread-local
-//! storage (the server is task-per-connection: one request at a time per
-//! thread), the same model `requestid` uses. The in-flight reservation set is
-//! guarded by the same lock; call `Store.deinit()` once when the store is
-//! retired to release it. The `Store` and `Idempotency` must outlive the
-//! `Router`, at stable addresses.
+//! lock-free). The scoped key travels middleware→handler in the store itself,
+//! bound to the request's address (`Store.current`) -- never in thread-local
+//! storage, which a second request on the same thread (a nested dispatch, or
+//! another fiber on an evented `Io`) would overwrite (A1 F2). The in-flight
+//! reservation set is guarded by the same lock; call `Store.deinit()` once
+//! when the store is retired to release it. The `Store` and `Idempotency`
+//! must outlive the `Router`, at stable addresses.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -238,6 +239,20 @@ pub const Store = struct {
     /// closing the concurrent first-flight double-execution window. Keys are
     /// `cache.alloc`-owned copies; guarded by `lock`.
     in_flight: std.StringHashMapUnmanaged(void) = .empty,
+    /// The reservation each executing request holds, by the request's
+    /// address: how `respond` (and `current`) find the key and fingerprint
+    /// the middleware looked up FOR THAT REQUEST. It used to be a
+    /// thread-local, and anything that ran a second request on the same
+    /// thread while the first was inside its handler -- a nested dispatch, or
+    /// on an evented `Io` just another fiber -- overwrote it (A1 F2). The key
+    /// slices point into `in_flight`'s owned copies. Guarded by `lock`.
+    pending: std.AutoHashMapUnmanaged(usize, Current) = .empty,
+
+    /// What a request holding a reservation is recording under.
+    pub const Current = struct {
+        key: []const u8,
+        digest: [digest_len]u8,
+    };
 
     /// Release the in-flight reservation set. Call once when the store is no
     /// longer used. In steady state the set is empty (every reservation is
@@ -247,11 +262,12 @@ pub const Store = struct {
         var it = store.in_flight.keyIterator();
         while (it.next()) |k| store.cache.alloc.free(k.*);
         store.in_flight.deinit(store.cache.alloc);
+        store.pending.deinit(store.cache.alloc);
         store.lock.unlock();
         store.* = undefined;
     }
 
-    /// The outcome of `beginOrReplay`.
+    /// The outcome of `begin`.
     pub const Begin = union(enum) {
         /// A completed response is already recorded, and its fingerprint
         /// matches this request's body — an owned copy of the encoded blob
@@ -276,7 +292,12 @@ pub const Store = struct {
     /// concurrent first-flight lose the race cleanly. `digest` is this
     /// request's SHA-256 body fingerprint, computed by the caller before the
     /// lock is taken (hashing never happens under the lock).
-    fn beginOrReplay(store: *Store, key: []const u8, digest: [digest_len]u8, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
+    ///
+    /// Public for a server that has no `router` (qap): build the key with
+    /// `scopeKey`, fingerprint the body, `begin`; on `.reserved` run the side
+    /// effect, `record` its answer, and `finish` -- or pass `request` to have
+    /// `current` find the reservation from inside the handler.
+    pub fn begin(store: *Store, key: []const u8, digest: [digest_len]u8, request: ?*const anyopaque, gpa: std.mem.Allocator) std.mem.Allocator.Error!Begin {
         const now = store.clock.now();
         lockSpin(&store.lock);
         defer store.lock.unlock();
@@ -305,19 +326,32 @@ pub const Store = struct {
         const owned = try store.cache.alloc.dupe(u8, key);
         errdefer store.cache.alloc.free(owned);
         try store.in_flight.put(store.cache.alloc, owned, {});
+        errdefer _ = store.in_flight.remove(owned);
+        if (request) |r| try store.pending.put(store.cache.alloc, @intFromPtr(r), .{ .key = owned, .digest = digest });
         return .reserved;
     }
 
-    /// Release the reservation taken by `beginOrReplay` for `key`.
-    fn finish(store: *Store, key: []const u8) void {
+    /// Release the reservation taken by `begin` for `key` (and `request`'s
+    /// binding to it, when one was given).
+    pub fn finish(store: *Store, key: []const u8, request: ?*const anyopaque) void {
         lockSpin(&store.lock);
         defer store.lock.unlock();
+        if (request) |r| _ = store.pending.remove(@intFromPtr(r));
         if (store.in_flight.fetchRemove(key)) |kv| store.cache.alloc.free(kv.key);
+    }
+
+    /// The reservation `request` holds, or null when it holds none (no key,
+    /// an unguarded method, an invalid key, a replay). The key slice is
+    /// valid until that request's reservation is finished.
+    pub fn current(store: *Store, request: *const anyopaque) ?Current {
+        lockSpin(&store.lock);
+        defer store.lock.unlock();
+        return store.pending.get(@intFromPtr(request));
     }
 
     /// Write `body` to the response with `status` and optional `content_type`,
     /// **and** record it under the key the middleware exposed for this request
-    /// (via `currentKey()`) so a later replay of the same key returns it. When
+    /// (`current(ctx.req)`) so a later replay of the same key returns it. When
     /// no key is in scope (the request carried none, or the method is not
     /// guarded), it simply writes the response — the one call works for both
     /// idempotent and plain requests. `body`/`content_type` are copied into the
@@ -332,19 +366,21 @@ pub const Store = struct {
         ctx.res.setStatus(status);
         if (content_type) |ct| try ctx.res.setHeader("Content-Type", ct);
         try ctx.res.writeAll(body);
-        // `current_key` and `current_digest` are set and cleared together by
-        // the middleware (see `middlewareRun`), so a non-null key always has
-        // a digest alongside it.
-        if (currentKey()) |key| store.record(key, current_digest.?, status, content_type orelse "", body);
+        if (store.current(ctx.req)) |c| store.record(c.key, c.digest, status, content_type orelse "", body);
     }
 
     /// Record a completed response under `key`, alongside `digest` — the
     /// SHA-256 fingerprint of the request body that produced it, checked
-    /// against a later same-key request (see `beginOrReplay`). Best-effort: a
-    /// failed encode or a full cache silently skips caching (a missed dedup
-    /// is never fatal — the next replay just re-runs the handler). Callable
-    /// directly when a handler does not use `respond` — pair with
-    /// `currentDigest()` for the matching fingerprint.
+    /// against a later same-key request (see `begin`). **Best-effort, and
+    /// that is a real limit, not a footnote** (A1 F3): a failed encode, a
+    /// full cache, or an eviction before the TTL -- `ramcache` is bounded and
+    /// W-TinyLFU, and other callers' keys compete for the same room -- all
+    /// mean a later retry runs the side effect AGAIN. For a charge or an
+    /// order that is a double execution. Size the cache for the retry window
+    /// of the traffic it guards, and where a duplicate is unacceptable keep
+    /// the record in the same store and transaction as the side effect.
+    /// Callable directly when a handler does not use `respond` -- pair with
+    /// `current(ctx.req)` for the key and matching fingerprint.
     pub fn record(store: *Store, key: []const u8, digest: [digest_len]u8, status: u16, content_type: []const u8, body: []const u8) void {
         const blob = encode(store.cache.alloc, digest, status, content_type, body) catch return;
         defer store.cache.alloc.free(blob);
@@ -413,6 +449,19 @@ pub const Options = struct {
     /// doc's "Request-fingerprint mismatch" note. Default
     /// `default_max_body_bytes` (16 KiB).
     max_body_bytes: usize = default_max_body_bytes,
+    /// Who the caller is, for keeping records apart: each caller gets its own
+    /// key namespace (A1 F1). Return the credential or identity the request
+    /// authenticated with -- the `Authorization` value, an account id; it is
+    /// hashed before it reaches the cache. A request it returns null for is
+    /// run without deduplication.
+    ///
+    /// ⚠ **Null here -- the default -- is ONE namespace for every caller.**
+    /// Two clients that pick the same key for the same endpoint and body
+    /// then share a record: the second is handed the FIRST one's response,
+    /// and with a different body learns (422) that the key is in use.
+    /// Client keys are client-chosen and often guessable. Leave this null
+    /// only where there is exactly one caller.
+    principal: ?*const fn (req: *const http.Server.Request) ?[]const u8 = null,
 };
 
 /// Config + the middleware over a `Store`. Immutable once built; share one
@@ -426,46 +475,21 @@ pub const Idempotency = struct {
     }
 };
 
-// The scoped cache key for the in-flight request, exposed to the handler so
-// `Store.respond` records under the exact key the middleware looked up. Valid
-// on the connection thread for the duration of the request only (see the
-// module doc's concurrency note; same model as requestid).
-threadlocal var key_buf: [max_scoped_key]u8 = undefined;
-threadlocal var current_key: []const u8 = &.{};
-
-// The SHA-256 fingerprint of the current request's (buffered) body, set
-// alongside `current_key` by the middleware and cleared with it — so a
-// non-null `current_key` always has a matching digest. See `currentDigest`.
-threadlocal var current_digest: ?[digest_len]u8 = null;
-
-/// The scoped idempotency key in effect for the current request, or null when
-/// none is (the request carried no key, the method is not guarded, or the key
-/// was invalid / too long to scope). Call it from the connection thread during
-/// the request; `Store.respond` uses it internally.
-pub fn currentKey() ?[]const u8 {
-    return if (current_key.len == 0) null else current_key;
-}
-
-/// The SHA-256 fingerprint of the current request's body, or null exactly
-/// when `currentKey()` is null (the two are set and cleared together). A
-/// handler that records a response via `Store.record` directly instead of
-/// `Store.respond` needs this to pass the matching digest.
-pub fn currentDigest() ?[digest_len]u8 {
-    return current_digest;
-}
-
 fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!void {
     const idem: *const Idempotency = @ptrCast(@alignCast(state.?));
-    // Clear any key/digest left over from a prior request on this thread, so
-    // a bypassed request never inherits a stale one.
-    current_key = &.{};
-    current_digest = null;
-
     if (!methodGuarded(idem.options.methods, ctx.req.method)) return next.run(ctx);
     const client_key = ctx.req.header(idem.options.header_name) orelse return next.run(ctx);
     if (!validKey(client_key, idem.options.max_key_len)) return badRequest(ctx);
 
-    const scoped = scopeKey(&key_buf, idem.options.scope, ctx.req, client_key) orelse
+    // A caller-scoped server whose request names no caller has nobody to
+    // keep the record apart for: run it, record nothing (A1 F1).
+    var principal_buf: [principal_hex_len]u8 = undefined;
+    const principal: ?[]const u8 = if (idem.options.principal) |f|
+        principalTag(f(ctx.req) orelse return next.run(ctx), &principal_buf)
+    else
+        null;
+    var key_buf: [max_scoped_key]u8 = undefined;
+    const scoped = scopeKey(&key_buf, idem.options.scope, ctx.req.method, ctx.req.path, principal, client_key) orelse
         // Too long to scope — degrade to running normally without dedup.
         return next.run(ctx);
 
@@ -487,7 +511,11 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         error.StreamTooLong => return payloadTooLarge(ctx),
         else => |e| return e,
     };
-    defer idem.store.cache.alloc.free(body_bytes);
+    defer {
+        // The caller's payload, on a heap the next request draws from (A1 F4).
+        std.crypto.secureZero(u8, body_bytes);
+        idem.store.cache.alloc.free(body_bytes);
+    }
     var digest: [digest_len]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(body_bytes, &digest, .{});
 
@@ -505,7 +533,7 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
     // One atomic step: replay a completed response, flag a body-fingerprint
     // mismatch, reject a concurrent in-flight duplicate (409), or reserve
     // this key and run the handler.
-    switch (try idem.store.beginOrReplay(scoped, digest, idem.store.cache.alloc)) {
+    switch (try idem.store.begin(scoped, digest, ctx.req, idem.store.cache.alloc)) {
         .replay => |blob| {
             // A hit writes the recorded response and short-circuits the chain,
             // so the handler never runs.
@@ -531,16 +559,9 @@ fn middlewareRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerr
         .reserved => {},
     }
 
-    // Miss (reserved): expose the scoped key + digest for the handler's
-    // `respond`, run the chain, then release the reservation so a later
-    // retry can proceed.
-    current_key = scoped;
-    current_digest = digest;
-    defer {
-        current_key = &.{};
-        current_digest = null;
-        idem.store.finish(scoped);
-    }
+    // Miss (reserved): the reservation is bound to THIS request (`current`),
+    // run the chain, then release it so a later retry can proceed.
+    defer idem.store.finish(scoped, ctx.req);
     return next.run(ctx);
 }
 
@@ -554,7 +575,7 @@ fn methodGuarded(methods: []const http.Method, m: http.Method) bool {
 /// A key is accepted when non-empty, within `max_len`, and every byte is a
 /// printable non-space ASCII character (no controls — also rejected by
 /// `setHeader` — and no spaces, keeping the scoped key a clean triple).
-fn validKey(v: []const u8, max_len: usize) bool {
+pub fn validKey(v: []const u8, max_len: usize) bool {
     if (v.len == 0 or v.len > max_len) return false;
     for (v) |c| {
         if (c <= ' ' or c >= 0x7f) return false;
@@ -563,14 +584,36 @@ fn validKey(v: []const u8, max_len: usize) bool {
 }
 
 /// Build the scoped cache key into `buf`, or null when it would overflow.
-/// `client_key` is the already-fetched (and validated) header value.
-fn scopeKey(buf: []u8, scope: Scope, req: *const http.Server.Request, client_key: []const u8) ?[]const u8 {
-    switch (scope) {
-        .key_only => return client_key,
-        .target => return std.fmt.bufPrint(buf, "{s} {s} {s}", .{
-            req.method.token(), req.path, client_key,
+/// `client_key` is the already-fetched (and validated) header value;
+/// `principal` a `principalTag` (or null for a shared namespace).
+pub fn scopeKey(
+    buf: []u8,
+    scope: Scope,
+    method: http.Method,
+    path: []const u8,
+    principal: ?[]const u8,
+    client_key: []const u8,
+) ?[]const u8 {
+    const who = principal orelse "*";
+    return switch (scope) {
+        .key_only => std.fmt.bufPrint(buf, "{s} {s}", .{ who, client_key }) catch null,
+        .target => std.fmt.bufPrint(buf, "{s} {s} {s} {s}", .{
+            who, method.token(), path, client_key,
         }) catch null,
-    }
+    };
+}
+
+/// Length of a `principalTag`.
+pub const principal_hex_len = 32;
+
+/// The caller's identity as it enters a cache key: 16 bytes of SHA-256, in
+/// hex. Never the raw value -- a principal is typically a bearer token, and
+/// the cache is a long-lived map that outlives the request and would hold
+/// it at rest.
+pub fn principalTag(principal: []const u8, out: *[principal_hex_len]u8) []const u8 {
+    var d: [digest_len]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(principal, &d, .{});
+    return std.fmt.bufPrint(out, "{x}", .{d[0 .. principal_hex_len / 2]}) catch unreachable;
 }
 
 fn badRequest(ctx: *router.Ctx) anyerror!void {
@@ -789,6 +832,100 @@ test "concurrent first-flight of the same key does not double-run (in-flight 409
     try testing.expectEqual(@as(u32, 1), app.calls);
     // …because the concurrent duplicate was rejected with 409 in-flight.
     try testing.expect(app.second_got_409);
+}
+
+test "A1 F2: a nested same-key request does not erase the outer one's record -- the retry replays" {
+    // The per-request key used to travel middleware -> handler in a
+    // thread-local. Anything that runs a second request on the same thread
+    // while the first is inside its handler -- this nested call, or on an
+    // evented `Io` simply another fiber -- reset it: the outer `respond` then
+    // recorded nothing, and the client's retry ran the side effect again.
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    var app = ReentrantApp{
+        .store = &store,
+        .r = &r,
+        .second_key = reqKey("POST", "/orders", "dup-key"),
+    };
+    r.state = &app;
+    var idem = Idempotency{ .store = &store };
+    try r.use(idem.middleware());
+    try r.post("/orders", hReentrant);
+
+    var buf: [2048]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "dup-key"), &buf);
+    try testing.expectEqual(@as(u32, 1), app.calls);
+
+    // The retry: a replay of the outer request's answer, handler untouched.
+    var buf2: [2048]u8 = undefined;
+    const retry = runWire(&r, reqKey("POST", "/orders", "dup-key"), &buf2);
+    try testing.expectEqualStrings("true", headerValue(retry, "Idempotent-Replayed") orelse "");
+    try testing.expectEqual(@as(u32, 1), app.calls);
+}
+
+fn authPrincipal(req: *const http.Server.Request) ?[]const u8 {
+    return req.header("authorization");
+}
+
+fn reqAuthKey(comptime auth: []const u8, comptime key: []const u8) []const u8 {
+    return "POST /orders HTTP/1.1\r\nHost: t\r\nAuthorization: " ++ auth ++
+        "\r\nIdempotency-Key: " ++ key ++ "\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+}
+
+test "A1 F1: with a principal, two callers' same key are two records -- neither is handed the other's answer" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .principal = authPrincipal } };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+
+    var b: [2048]u8 = undefined;
+    // Alice and Bob both pick the key "1" -- same endpoint, same body.
+    try testing.expectEqualStrings("order-1", bodyOf(runWire(&r, reqAuthKey("Bearer alice", "1"), &b)));
+    const bob = runWire(&r, reqAuthKey("Bearer bob", "1"), &b);
+    // Without the principal Bob got "order-1" -- Alice's order -- as a replay.
+    try testing.expectEqualStrings("order-2", bodyOf(bob));
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(bob, "Idempotent-Replayed"));
+    try testing.expectEqual(@as(u32, 2), app.calls);
+
+    // Each caller's own retry still replays its own answer.
+    const alice_retry = runWire(&r, reqAuthKey("Bearer alice", "1"), &b);
+    try testing.expectEqualStrings("order-1", bodyOf(alice_retry));
+    try testing.expectEqualStrings("true", headerValue(alice_retry, "Idempotent-Replayed").?);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+}
+
+test "A1 F1: a request the principal hook cannot name runs without deduplication" {
+    var cache = newCache();
+    defer cache.deinit();
+    var store = Store{ .cache = &cache };
+    defer store.deinit();
+    var app = App{ .store = &store };
+    var idem = Idempotency{ .store = &store, .options = .{ .principal = authPrincipal } };
+
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    r.state = &app;
+    try r.use(idem.middleware());
+    try r.post("/orders", hOrder);
+
+    var b: [2048]u8 = undefined;
+    _ = runWire(&r, reqKey("POST", "/orders", "anon"), &b);
+    _ = runWire(&r, reqKey("POST", "/orders", "anon"), &b);
+    try testing.expectEqual(@as(u32, 2), app.calls);
+    try testing.expectEqual(@as(usize, 0), cache.stats.entries);
 }
 
 test "a different key runs the handler again" {

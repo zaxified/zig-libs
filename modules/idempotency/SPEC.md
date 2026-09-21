@@ -29,7 +29,11 @@ handler that reads the body still sees it. Bounds via `ramcache`: TTL (default 2
 `Store.ttl_ns`), byte cap, entry cap, W-TinyLFU admission/eviction. Concurrency: the `ramcache` store sits behind an internal
 spinlock (`std.atomic.Mutex` + `spinLoopHint`, the std `SmpAllocator` pattern); cached bytes are
 copied out under the lock and written to the socket lock-free. The scoped key travels
-middleware→handler via thread-local storage (task-per-connection, same model as `requestid`).
+middleware→handler in the store, bound to the request's address (`Store.current`) -- not in
+thread-local storage, which a nested dispatch or another fiber on the same thread overwrote (A1
+F2). Records are one namespace for every caller unless `Options.principal` names the caller
+(A1 F1); the principal enters the key as a SHA-256 tag, never raw. A router-free server drives
+`scopeKey` / `Store.begin` / `record` / `finish` directly.
 `Store`/`Idempotency` must outlive the `Router` at stable addresses. The clock is injected
 (`Store.clock`) for deterministic TTL tests. Clean-room from the Idempotency-Key pattern (Stripe's
 public docs + `draft-ietf-httpapi-idempotency-key-header`); built on sibling `ramcache`/`router`/
