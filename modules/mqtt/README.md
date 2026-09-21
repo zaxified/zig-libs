@@ -108,7 +108,12 @@ transport-agnostic client and a broker, all fully offline-testable.
     `queueDrops()`), and `session_expiry_ms`, applied when the caller runs
     `expireSessions(now)` — MQTT 3.1.1 itself keeps sessions for ever.
     ⚠ Sessions live in memory: they survive a client's reconnect, not a
-    restart of the process holding the broker.
+    restart of the process holding the broker — unless that process keeps
+    them: `sessionStates(arena)` copies out every session (subscriptions with
+    granted QoS, queued, in flight, `drops`), and `restoreSession(id, subs,
+    now)` recreates one offline before clients connect; refilling its queue
+    is the server's own replay. `queued + inflight == 0` at an instant means
+    everything published to the session before it was acknowledged.
 
     **Tapping traffic:** `Config.onPublishFn` is called for every PUBLISH the
     ACL allowed, before the retained store, fan-out and PUBACK, with the topic
@@ -124,7 +129,7 @@ transport-agnostic client and a broker, all fully offline-testable.
 
     **Deliberately deferred (documented, not built):** QoS 2
     (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
-    down), sessions that survive a broker restart, DUP retransmit
+    down), sessions persisted by the broker itself, DUP retransmit
     to a clean-session subscriber, MQTT 5.0, and TLS (terminate in
     front and hand `TcpServer` plaintext, or drive the socket-free core over a
     TLS stream).

@@ -421,6 +421,9 @@ pub const Session = struct {
     /// so moving a message into flight cannot fail.
     inflight: std.ArrayListUnmanaged(Message) = .empty,
     next_packet_id: u16 = 1,
+    /// Messages this session lost to its queue limits (or to memory) — the
+    /// per-session share of `Broker.queueDrops`.
+    drops: u64 = 0,
 
     pub fn clientId(s: *const Session) []const u8 {
         return s.client_id_buf[0..s.client_id_len];
@@ -569,6 +572,22 @@ const Index = struct {
             }
         }
         setQosIn(&node.subs, owner, qos);
+    }
+
+    /// The granted QoS of `(owner, filter)`, or null when it is not there.
+    fn qosOf(idx: *Index, filter: []const u8, owner: Owner) ?QoS {
+        var node = &idx.root;
+        var it = std.mem.splitScalar(u8, filter, '/');
+        const list = while (it.next()) |level| {
+            if (std.mem.eql(u8, level, "#")) break &node.hash_subs;
+            if (std.mem.eql(u8, level, "+")) {
+                node = node.plus orelse return null;
+            } else {
+                node = node.children.get(level) orelse return null;
+            }
+        } else &node.subs;
+        for (list.items) |r| if (r.owner.eql(owner)) return r.qos;
+        return null;
     }
 
     fn setQosIn(list: *std.ArrayListUnmanaged(SubRef), owner: Owner, qos: QoS) void {
@@ -1016,6 +1035,127 @@ pub const Broker = struct {
         x.lock.lock();
         defer x.lock.unlock();
         return x.queuedLen();
+    }
+
+    /// One subscription of a persistent session, as `sessionStates` reports
+    /// it and `restoreSession` takes it back.
+    pub const SessionSub = struct { filter: []const u8, qos: QoS };
+
+    /// What a persistent session holds, as of one instant.
+    pub const SessionState = struct {
+        client_id: []const u8,
+        online: bool,
+        /// QoS 1 messages waiting for a delivery window.
+        queued: usize,
+        /// Sent and not yet acknowledged.
+        inflight: usize,
+        /// Messages the session has lost to its queue limits, ever.
+        drops: u64,
+        subs: []SessionSub,
+    };
+
+    /// Every persistent session, copied into `arena` (the caller frees it
+    /// whole). Taken under the registry lock, so the list is one instant.
+    ///
+    /// ⭐ What this is for: a server that keeps its sessions across its own
+    /// restart (spec 3.1.2.4 allows the state to be lost, and says nothing of
+    /// how it is kept). `queued + inflight == 0` at some instant means every
+    /// message published to the session BEFORE that instant has been
+    /// acknowledged — a message is queued by the `publish` that fans it out,
+    /// before that call returns — which is what lets such a server know how
+    /// far back it must go to refill the session after a restart.
+    pub fn sessionStates(b: *Broker, arena: std.mem.Allocator) error{OutOfMemory}![]SessionState {
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        const out = try arena.alloc(SessionState, b.sessions.items.len);
+        for (b.sessions.items, out) |x, *o| {
+            const subs = try arena.alloc(SessionSub, x.subs.items.len);
+            for (x.subs.items, subs) |f, *d| d.* = .{
+                .filter = try arena.dupe(u8, f),
+                .qos = b.index.qosOf(f, .{ .session = x }) orelse .at_most_once,
+            };
+            x.lock.lock();
+            defer x.lock.unlock();
+            o.* = .{
+                .client_id = try arena.dupe(u8, x.clientId()),
+                .online = x.conn != null,
+                .queued = x.queuedLen(),
+                .inflight = x.inflight.items.len,
+                .drops = x.drops,
+                .subs = subs,
+            };
+        }
+        return out;
+    }
+
+    pub const RestoreError = error{
+        /// A session under this client id exists already.
+        SessionExists,
+        /// `Config.max_sessions` reached.
+        SessionLimitReached,
+        /// A client id longer than the broker keeps, or empty.
+        InvalidClientId,
+        /// A filter that is not one (4.7), one nested past the broker's
+        /// limit, or a QoS above 1 — nothing a SUBSCRIBE could have granted.
+        InvalidSubscription,
+        /// `max_subscriptions_per_conn` or `max_subscriptions_total`.
+        TooManySubscriptions,
+        OutOfMemory,
+    };
+
+    /// Recreate an offline persistent session, with its subscriptions, as a
+    /// server does after its own restart from state it kept (`sessionStates`).
+    /// Messages published from now on are queued for it, and the client that
+    /// connects with clean session 0 under this id resumes it (CONNACK
+    /// session present). All or nothing: on an error, no session exists.
+    ///
+    /// No ACL call — the subscriptions were granted to a client once, and the
+    /// server's own restore is not a client asking again (the same reason
+    /// `publish` skips it). A server whose rules may have changed since
+    /// checks them before calling this. `now` is the caller clock
+    /// `expireSessions` measures from: the session is offline since `now`.
+    pub fn restoreSession(b: *Broker, client_id: []const u8, subs: []const SessionSub, now: i64) RestoreError!void {
+        if (client_id.len == 0 or client_id.len > max_client_id) return error.InvalidClientId;
+        if (subs.len > b.config.max_subscriptions_per_conn) return error.TooManySubscriptions;
+        for (subs) |sub| {
+            if (@intFromEnum(sub.qos) > 1) return error.InvalidSubscription;
+            topic.validateFilter(sub.filter) catch return error.InvalidSubscription;
+            if (std.mem.count(u8, sub.filter, "/") + 1 > max_filter_levels) return error.InvalidSubscription;
+        }
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        if (b.findSession(client_id) != null) return error.SessionExists;
+        if (b.sessions.items.len >= b.config.max_sessions) return error.SessionLimitReached;
+        if (b.subscriptions_total + subs.len > b.config.max_subscriptions_total) return error.TooManySubscriptions;
+        const x = b.createSession(client_id) catch return error.OutOfMemory;
+        x.offline_since_ms = now;
+        for (subs) |sub| {
+            if (b.hasSessionSub(x, sub.filter)) {
+                b.index.updateQos(sub.filter, .{ .session = x }, sub.qos);
+                continue;
+            }
+            b.addSessionSub(x, sub.filter, sub.qos) catch {
+                b.discardSession(x);
+                return error.OutOfMemory;
+            };
+        }
+    }
+
+    /// Caller holds `mutex`.
+    fn hasSessionSub(b: *Broker, x: *Session, filter: []const u8) bool {
+        _ = b;
+        for (x.subs.items) |f| if (std.mem.eql(u8, f, filter)) return true;
+        return false;
+    }
+
+    /// Caller holds `mutex`.
+    fn addSessionSub(b: *Broker, x: *Session, filter: []const u8, qos: QoS) error{OutOfMemory}!void {
+        const owned = try b.allocator.dupe(u8, filter);
+        errdefer b.allocator.free(owned);
+        try x.subs.append(b.allocator, owned);
+        errdefer x.subs.items.len -= 1;
+        b.index.add(b.allocator, filter, .{ .session = x }, qos) catch return error.OutOfMemory;
+        b.subscriptions_total += 1;
     }
 
     /// Discard every offline session whose connection's last packet is at
@@ -1557,21 +1697,27 @@ pub const Broker = struct {
         if (x.queuedLen() >= b.config.max_queued_messages or
             x.queued_bytes + len > b.config.max_queued_bytes)
         {
-            _ = b.queue_drops.fetchAdd(1, .monotonic);
+            b.countDrop(x);
             return;
         }
         const bytes = b.allocator.alloc(u8, len) catch {
-            _ = b.queue_drops.fetchAdd(1, .monotonic);
+            b.countDrop(x);
             return;
         };
         @memcpy(bytes[0..topic_name.len], topic_name);
         @memcpy(bytes[topic_name.len..], payload);
         x.queue.append(b.allocator, .{ .bytes = bytes, .topic_len = topic_name.len, .retain = retain }) catch {
             b.allocator.free(bytes);
-            _ = b.queue_drops.fetchAdd(1, .monotonic);
+            b.countDrop(x);
             return;
         };
         x.queued_bytes += len;
+    }
+
+    /// Caller holds `x.lock`.
+    fn countDrop(b: *Broker, x: *Session) void {
+        x.drops += 1;
+        _ = b.queue_drops.fetchAdd(1, .monotonic);
     }
 
     /// Move queued messages into flight and write them, while `conn` is the
@@ -1598,7 +1744,7 @@ pub const Broker = struct {
                     .packet_id = m.id,
                 }) catch {
                     b.allocator.free(m.bytes);
-                    _ = b.queue_drops.fetchAdd(1, .monotonic);
+                    b.countDrop(x);
                     continue;
                 };
                 x.inflight.appendAssumeCapacity(m);
@@ -3190,6 +3336,95 @@ test "expireSessions is a no-op without a TTL" {
     b.remove(s1.conn);
     try testing.expectEqual(@as(usize, 0), b.expireSessions(std.math.maxInt(i64)));
     try testing.expectEqual(@as(usize, 1), b.sessionCount());
+}
+
+test "sessionStates reports subscriptions, queue, flight and drops of every session" {
+    var b = Broker.init(testing.allocator, .{ .max_queued_messages = 2 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    const on = try connectSession(&b, &t1, "on", false, 0);
+    const off = try connectSession(&b, &t2, "off", false, 0);
+    try feedSubscribe(&b, on.conn, 1, &.{.{ .filter = "a/+", .qos = .at_least_once }});
+    try feedSubscribe(&b, off.conn, 1, &.{ .{ .filter = "a/#", .qos = .at_least_once }, .{ .filter = "z", .qos = .at_most_once } });
+    b.remove(off.conn);
+    for ([_][]const u8{ "1", "2", "3" }) |v| try b.publish("a/x", v, .at_least_once, false);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const states = try b.sessionStates(arena.allocator());
+    try testing.expectEqual(@as(usize, 2), states.len);
+    for (states) |st| {
+        if (std.mem.eql(u8, st.client_id, "on")) {
+            try testing.expect(st.online);
+            try testing.expectEqual(@as(usize, 0), st.queued);
+            try testing.expectEqual(@as(usize, 3), st.inflight); // written, not acked
+            try testing.expectEqual(@as(u64, 0), st.drops);
+            try testing.expectEqual(@as(usize, 1), st.subs.len);
+            try testing.expectEqualStrings("a/+", st.subs[0].filter);
+            try testing.expectEqual(QoS.at_least_once, st.subs[0].qos);
+        } else {
+            try testing.expectEqualStrings("off", st.client_id);
+            try testing.expect(!st.online);
+            try testing.expectEqual(@as(usize, 2), st.queued);
+            try testing.expectEqual(@as(usize, 0), st.inflight);
+            try testing.expectEqual(@as(u64, 1), st.drops); // the third did not fit
+            try testing.expectEqual(@as(usize, 2), st.subs.len);
+            for (st.subs) |sub| {
+                const want: QoS = if (std.mem.eql(u8, sub.filter, "z")) .at_most_once else .at_least_once;
+                try testing.expectEqual(want, sub.qos);
+            }
+        }
+    }
+    try testing.expectEqual(@as(u64, 1), b.queueDrops());
+}
+
+test "a restored session queues from the start, and its client resumes it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    try b.restoreSession("web", &.{ .{ .filter = "egw/#", .qos = .at_least_once }, .{ .filter = "q0", .qos = .at_most_once } }, 100);
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
+    try testing.expectEqual(@as(usize, 2), b.subscriptionCount());
+    try b.publish("egw/1/t", "20.5", .at_least_once, false);
+    try b.publish("q0", "gone", .at_least_once, false); // QoS 0 grant: nothing kept offline
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("web"));
+
+    var t = TestTransport{};
+    const s = try connectSession(&b, &t, "web", false, 200);
+    try testing.expect(s.present);
+    const m = (try t.next()).?.publish;
+    try testing.expectEqualStrings("20.5", m.payload);
+    try feedPuback(&b, s.conn, m.packet_id);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const st = (try b.sessionStates(arena.allocator()))[0];
+    try testing.expectEqual(@as(usize, 0), st.queued + st.inflight);
+}
+
+test "restoreSession refuses what a SUBSCRIBE could not have granted, and leaves nothing" {
+    var b = Broker.init(testing.allocator, .{ .max_sessions = 1, .max_subscriptions_per_conn = 2 });
+    defer b.deinit();
+    const ok: []const Broker.SessionSub = &.{.{ .filter = "a", .qos = .at_least_once }};
+    try testing.expectError(error.InvalidClientId, b.restoreSession("", ok, 0));
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", &.{.{ .filter = "a/#/b", .qos = .at_least_once }}, 0));
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", &.{.{ .filter = "a", .qos = .exactly_once }}, 0));
+    try testing.expectError(error.TooManySubscriptions, b.restoreSession("x", &.{
+        .{ .filter = "a", .qos = .at_least_once }, .{ .filter = "b", .qos = .at_least_once }, .{ .filter = "c", .qos = .at_least_once },
+    }, 0));
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+    try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
+    try b.restoreSession("x", ok, 0);
+    try testing.expectError(error.SessionExists, b.restoreSession("x", ok, 0));
+    try testing.expectError(error.SessionLimitReached, b.restoreSession("y", ok, 0));
+}
+
+test "a restored session expires like any offline one, from the restore" {
+    var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 1000 });
+    defer b.deinit();
+    try b.restoreSession("web", &.{.{ .filter = "a", .qos = .at_least_once }}, 5000);
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(5999));
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(6000));
+    try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
 }
 
 test "a retained QoS 1 message reaches a session through its queue" {

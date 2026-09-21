@@ -48,7 +48,7 @@ to typed errors, never panics (fuzzed both directions). Out of scope: MQTT 5.0; 
 persistence / offline-message replay (buffering across reconnects, the caller's job); client-side
 QoS 2 and DUP retransmit and Will/LWT are implemented, but the **broker's** first-cut deliberately
 omits QoS 2 (an inbound QoS 2 PUBLISH is a protocol violation that tears the connection down),
-sessions that survive a broker restart, and DUP retransmit to a clean-session subscriber. **Will/LWT is no
+sessions the broker itself persists (a server keeps them with `sessionStates`/`restoreSession`), and DUP retransmit to a clean-session subscriber. **Will/LWT is no
 longer deferred** (2026-09-11): the broker keeps the will from CONNECT, publishes it on any
 ungraceful end and discards it on a clean DISCONNECT (3.1.2.5, 3.14.4). The publish happens *after*
 the connection has left the subscription index (2026-09-16, A1 M2), so the dying client is not
@@ -119,8 +119,8 @@ limitations have now been fixed:
   allow-all (backward compatible).
 
 Residual deferred scope (documented, not bugs): **QoS 2** (an inbound QoS 2 PUBLISH is a protocol
-violation that tears the connection down), sessions that survive a broker restart (they are
-in memory), and DUP retransmit to a clean-session subscriber (a persistent one gets it on resume). TLS is out of scope by design
+violation that tears the connection down), sessions the broker itself persists (they are in
+memory; `sessionStates`/`restoreSession` let a server keep them), and DUP retransmit to a clean-session subscriber (a persistent one gets it on resume). TLS is out of scope by design
 (terminate in front, or drive the socket-free core over a TLS stream). The concurrency hardening
 targets the thread-per-connection `TcpServer`; the offline core remains single-owner per connection
 and fully socket-free for testing.
@@ -158,8 +158,16 @@ Bounds: `max_sessions` (new past it → CONNACK `server_unavailable`; a resume a
 `queueDrops`), and `session_expiry_ms` applied by the caller's `expireSessions(now)`, since the
 broker has no clock. QoS 0 is not queued (3.1.2.4 leaves it optional).
 
-⚠ Not persisted: sessions are memory, so a broker restart loses them. A consumer that must
-survive that needs its own replay source.
+⚠ Not persisted by the broker: sessions are memory. A server that keeps them across its own
+restart does it with two calls (2026-09-21): `sessionStates(arena)` copies out every session —
+client id, subscriptions with their granted QoS, queued, in flight, and a per-session `drops`
+count — under one lock, and `restoreSession(client_id, subs, now)` recreates one offline, all or
+nothing, before clients connect. What goes back into the restored queue is the server's business
+(its own replay source); the broker's part is the fact that makes that possible: a message is
+queued by the `publish` that fans it out, so `queued + inflight == 0` at an instant means every
+message published to the session before it has been acknowledged. `restoreSession` applies no
+ACL (as `publish` does not — no client is asking) and refuses what no SUBSCRIBE could have been
+granted: an invalid or too-deep filter, QoS 2, past `max_subscriptions_per_conn`/`_total`.
 
 ## Verification
 **External anchor (`external_goldens.zig`).** Every KAT below this point is hand-authored from the
@@ -225,7 +233,9 @@ unavailable), so a constrained `zig build test` stays green.
 socket death without DISCONNECT, clean-session discard, DUP resend with the original id, a failed
 write kept in flight, QoS 0 not queued, both queue bounds, the in-flight window refilled by
 PUBACK, persistent and clean take-over, `max_sessions` without a stray Will, expiry, retained QoS 1
-through the queue, `deinit` with queued and in-flight messages). 16 guards were removed one at a
+through the queue, `deinit` with queued and in-flight messages), plus 4 for keeping them across a
+server restart (`sessionStates` of online and offline sessions with a drop, a restored session
+queueing and resumed, `restoreSession` refusals leaving nothing, expiry from the restore). 16 guards were removed one at a
 time on 2026-09-21 and each turned a test red (runner deleted afterwards, CONVENTIONS §9). The
 stress pass runs its upper half of workers on persistent sessions — resuming on most reconnects,
 discarding with a clean CONNECT on every third — and asserts after the storm that every

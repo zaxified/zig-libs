@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — Broker: sessions can be **kept across a server restart** by the server that
+  holds the broker. New `Broker.sessionStates(arena)` (every session: client id, subscriptions
+  with granted QoS, queued, in flight, and a new per-session `drops` count) and
+  `Broker.restoreSession(client_id, subs, now)` (recreate one offline, all or nothing, no ACL;
+  refuses an invalid filter, QoS 2, a duplicate id, `max_sessions`, the subscription caps). The
+  broker still persists nothing itself; the replay into a restored queue is the caller's. Wanted
+  by a hub whose readers must not lose what was queued for them when the hub restarts.
+
 - **2026-09-21** — Broker: **persistent sessions** (MQTT 3.1.1 §3.1.2.4, §4.4). A CONNECT with
   clean session 0 now gets a session that outlives the connection: its subscriptions stay
   routable, QoS 1 messages that match them while the client is away are queued, and on resume the
