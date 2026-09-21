@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — Broker: **persistent sessions** (MQTT 3.1.1 §3.1.2.4, §4.4). A CONNECT with
+  clean session 0 now gets a session that outlives the connection: its subscriptions stay
+  routable, QoS 1 messages that match them while the client is away are queued, and on resume the
+  CONNACK says `session_present = 1`, unacknowledged messages go again with DUP and their original
+  ids, then the queue in order. Clean session 1 discards a session left behind (3.1.2-6). Every QoS 1
+  delivery to a session goes through its queue, so a subscriber slower than its 64-message window
+  waits rather than losing messages. New `Config.max_sessions`, `max_queued_messages`,
+  `max_queued_bytes`, `session_expiry_ms`; new `Broker.expireSessions`, `sessionCount`,
+  `sessionQueued`, `queueDrops`. ⚠ Behaviour change for any client that already sent clean
+  session 0: it used to be served as clean, and now keeps a session. Sessions are in memory — they
+  do not survive a broker restart. Wanted by a hub that serves several consumers, each of which
+  must catch up after a disconnect. The stress pass found one real race on the way (a superseded
+  connection registering a filter on a discarded session); see SPEC § Persistent sessions.
+
 - **2026-09-19** — **BREAKING:** `Config.onPublishFn` returns the new `PublishVerdict`
   (`.accept` / `.refuse`) instead of `void`; an existing tap migrates by returning `.accept`, which
   changes nothing. Before this the tap could observe a publish but not stop it, and it runs before

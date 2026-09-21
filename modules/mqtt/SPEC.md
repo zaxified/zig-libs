@@ -19,8 +19,8 @@ drives feed/poll/tick). `Broker` — the mirror image: owns the shared connectio
 index (levels on `/`, `+`/`#` children, `$`-topic exclusion — matched only along a published topic's
 path, never the whole set) and retained store; each `Connection` is a reversed per-connection state
 machine (first packet must be CONNECT, client-id assigned or rejected, session take-over on
-duplicate client-id which also shuts the superseded socket down, `session_present` always false —
-clean-session only, keep-alive deadline = 1.5x client's keep-alive against a caller-supplied
+duplicate client-id which also shuts the superseded socket down, clean and persistent sessions —
+see *Persistent sessions* below, keep-alive deadline = 1.5x client's keep-alive against a caller-supplied
 timestamp). Optional auth + per-operation ACL hooks (function-pointer + opaque-ctx seam, default
 allow-all). PUBLISH fan-out at min(publisher QoS, granted QoS), one copy per connection at highest
 granted QoS among overlapping filters; QoS 0 fire-and-forget, QoS 1 inbound→immediate PUBACK,
@@ -48,7 +48,7 @@ to typed errors, never panics (fuzzed both directions). Out of scope: MQTT 5.0; 
 persistence / offline-message replay (buffering across reconnects, the caller's job); client-side
 QoS 2 and DUP retransmit and Will/LWT are implemented, but the **broker's** first-cut deliberately
 omits QoS 2 (an inbound QoS 2 PUBLISH is a protocol violation that tears the connection down),
-persistent/offline sessions, and DUP retransmit of an unacked outbound publish. **Will/LWT is no
+sessions that survive a broker restart, and DUP retransmit to a clean-session subscriber. **Will/LWT is no
 longer deferred** (2026-09-11): the broker keeps the will from CONNECT, publishes it on any
 ungraceful end and discards it on a clean DISCONNECT (3.1.2.5, 3.14.4). The publish happens *after*
 the connection has left the subscription index (2026-09-16, A1 M2), so the dying client is not
@@ -119,11 +119,47 @@ limitations have now been fixed:
   allow-all (backward compatible).
 
 Residual deferred scope (documented, not bugs): **QoS 2** (an inbound QoS 2 PUBLISH is a protocol
-violation that tears the connection down), persistent/offline sessions (clean-session only), and DUP
-retransmit of an unacked outbound QoS 1 publish. TLS is out of scope by design
+violation that tears the connection down), sessions that survive a broker restart (they are
+in memory), and DUP retransmit to a clean-session subscriber (a persistent one gets it on resume). TLS is out of scope by design
 (terminate in front, or drive the socket-free core over a TLS stream). The concurrency hardening
 targets the thread-per-connection `TcpServer`; the offline core remains single-owner per connection
 and fully socket-free for testing.
+
+## Persistent sessions (2026-09-21)
+A CONNECT with clean session 0 gets a `Session` keyed by client id (spec 3.1.2.4): subscriptions,
+a queue of QoS 1 messages, and up to `max_in_flight` sent-but-unacknowledged ones. Resume answers
+`session_present = 1`, resends the in-flight messages with DUP and their original ids (4.4), then
+drains the queue in order; clean session 1 discards the session (3.1.2-6).
+
+Invariants and what holds each:
+- **The session owns its subscriptions, not the connection.** The trie index refers to an `Owner`
+  (a clean connection or a session), so a session's filters stay routable while no connection
+  exists, and a park, resume or take-over moves no index entry — only `Session.conn`.
+- **A QoS 1 message for a session is never lost to a disconnect racing its delivery.** Fan-out
+  copies it into the session's queue *under the registry lock*, online or not; a pump holding the
+  connection's `tx_lock` then moves it into flight and writes it. A connection that vanishes
+  between snapshot and write leaves the message queued; a write that fails leaves it in flight, to
+  go again with DUP on resume.
+- **Nothing reaches a client before its CONNACK.** `handleConnect` holds the connection's
+  `tx_lock` from before the session is attached until the CONNACK and every resent message are
+  written, so a concurrent fan-out's pump waits.
+- **Lock order: `Connection.tx_lock` → `Broker.mutex` → `Session.lock`**, and `Session.lock` is
+  never held across a socket write — a message is encoded under it, written after it.
+- **A superseded connection cannot edit a session.** `ownsRouting` refuses SUBSCRIBE/UNSUBSCRIBE
+  from a connection that a take-over replaced, or whose session was discarded. ⛔ Found by the
+  stress pass, not by review: without it an old connection still draining its receive buffer
+  added a filter to a discarded session, which stayed in the index pointing at freed memory
+  (SEGV in ReleaseFast, subscription count 126 against 26 in Debug).
+- **Lifetime by reference count**: the registry, each connection carrying the session and each
+  fan-out about to pump it hold one; the last to drop frees it.
+
+Bounds: `max_sessions` (new past it → CONNACK `server_unavailable`; a resume always succeeds),
+`max_queued_messages` / `max_queued_bytes` per session (overflow drops the newest, counted in
+`queueDrops`), and `session_expiry_ms` applied by the caller's `expireSessions(now)`, since the
+broker has no clock. QoS 0 is not queued (3.1.2.4 leaves it optional).
+
+⚠ Not persisted: sessions are memory, so a broker restart loses them. A consumer that must
+survive that needs its own replay source.
 
 ## Verification
 **External anchor (`external_goldens.zig`).** Every KAT below this point is hand-authored from the
@@ -185,6 +221,21 @@ drains to 0 and `subscriptionCount()` to 0 (no take-over zombie, no leaked or wr
 The test is socket-gated (`error.SkipZigTest` on a single-threaded build or where loopback/threads are
 unavailable), so a constrained `zig build test` stays green.
 
+**Persistent sessions** have 16 offline tests (resume with `session_present`, queue while away,
+socket death without DISCONNECT, clean-session discard, DUP resend with the original id, a failed
+write kept in flight, QoS 0 not queued, both queue bounds, the in-flight window refilled by
+PUBACK, persistent and clean take-over, `max_sessions` without a stray Will, expiry, retained QoS 1
+through the queue, `deinit` with queued and in-flight messages). 16 guards were removed one at a
+time on 2026-09-21 and each turned a test red (runner deleted afterwards, CONVENTIONS §9). The
+stress pass runs its upper half of workers on persistent sessions — resuming on most reconnects,
+discarding with a clean CONNECT on every third — and asserts after the storm that every
+remaining subscription is a session's, every session is offline and holds exactly the registry's
+reference. Run 10× ReleaseSafe and 20× ReleaseFast clean; with `ownsRouting` removed it failed 5
+of 5. ⚠ The valgrind pass below predates sessions. Run over the Debug build with sessions in the
+storm, valgrind stopped intermittently (1 run in 2–12) with a SIGSEGV in `fanout`, reading a
+session pointer from the index that was never a heap address. Open, not investigated: Debug is
+not a verification mode here, the release builds never failed, and valgrind was not run over them.
+
 Race-detection method: Zig **0.16.0's `-fsanitize-thread` is a no-op** here — it compiles and links but
 emits **zero `__tsan_*` instrumentation** and fails to flag a deliberate data race — so, per the SPEC's
 own fallback, race detection is the real-thread run under **Debug and `-Doptimize=ReleaseFast`, repeated
@@ -194,7 +245,7 @@ use-after-free in the reference-counted teardown). No race, deadlock, or UAF was
 confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred
-Broker: QoS 2, persistent/offline sessions, DUP retransmit of unacked outbound publishes,
+Broker: QoS 2, sessions persisted across a broker restart, DUP retransmit to clean-session subscribers,
 TLS, MQTT 5.0 (all documented deferrals, not bugs). The four architectural limitations of the first
 cut — O(conns×subs) fan-out under a global lock held across I/O, publisher-killing per-subscriber
 delivery failures, take-over socket leak, and missing auth/ACL — are now fixed (trie index +

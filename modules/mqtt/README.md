@@ -65,7 +65,7 @@ transport-agnostic client and a broker, all fully offline-testable.
     **Broker scope (3.1.1, production-hardened):** CONNECT/CONNACK (protocol
     name+level validated, client-id assigned — empty → server-generated — or
     rejected, session take-over on a duplicate client-id which also shuts the
-    superseded socket down, `session_present` always false / clean-session only,
+    superseded socket down, clean and persistent sessions — see below,
     keep-alive deadline = 1.5 × the client's keep-alive checked against a
     caller-supplied last-packet timestamp); optional authentication + per-topic
     ACL hooks (function-pointer + opaque-ctx seam on `BrokerConfig`, default
@@ -93,6 +93,23 @@ transport-agnostic client and a broker, all fully offline-testable.
     CONNACK code, since none of 3.2.2.3's codes describes it. Undeliverable
     wills are counted by `willFailures()` rather than lost silently.
 
+    **Persistent sessions** (3.1.2.4, 4.4): a CONNECT with clean session 0
+    keeps a session under its client id — its subscriptions, the QoS 1
+    messages that matched them while the client was away, and those sent but
+    not acknowledged. Resuming it answers CONNACK `session_present = 1`,
+    resends the unacknowledged ones with DUP and their original ids, then the
+    queue in order. A clean-session-1 CONNECT discards whatever the client left
+    (3.1.2-6). QoS 0 is not queued. Every QoS 1 delivery to a session goes
+    through its queue even while online, so a subscriber slower than its
+    64-message window waits instead of losing messages (`qos1Drops` counts
+    only clean sessions). Bounds: `Config.max_sessions` (a new session past it
+    gets `server_unavailable`, a resume never does), `max_queued_messages` /
+    `max_queued_bytes` per session (overflow drops the newest, counted by
+    `queueDrops()`), and `session_expiry_ms`, applied when the caller runs
+    `expireSessions(now)` — MQTT 3.1.1 itself keeps sessions for ever.
+    ⚠ Sessions live in memory: they survive a client's reconnect, not a
+    restart of the process holding the broker.
+
     **Tapping traffic:** `Config.onPublishFn` is called for every PUBLISH the
     ACL allowed, before the retained store, fan-out and PUBACK, with the topic
     and payload. It exists because `authorizeFn` cannot serve — `AclRequest`
@@ -107,8 +124,8 @@ transport-agnostic client and a broker, all fully offline-testable.
 
     **Deliberately deferred (documented, not built):** QoS 2
     (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection
-    down), persistent / offline sessions (clean-session only), DUP retransmit
-    of an unacked outbound publish, MQTT 5.0, and TLS (terminate in
+    down), sessions that survive a broker restart, DUP retransmit
+    to a clean-session subscriber, MQTT 5.0, and TLS (terminate in
     front and hand `TcpServer` plaintext, or drive the socket-free core over a
     TLS stream).
 

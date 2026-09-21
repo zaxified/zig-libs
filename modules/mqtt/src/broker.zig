@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-//! MQTT 3.1.1 broker (server) — QoS 0 + 1, clean session, no TLS.
+//! MQTT 3.1.1 broker (server) — QoS 0 + 1, clean and persistent sessions, no TLS.
 //!
 //! The mirror image of `client.zig`. Where the client drives one connection
 //! *to* a broker, the `Broker` here owns the shared server-side state — the
@@ -43,7 +43,9 @@
 //! Scope (spec 3.1.1): CONNECT/CONNACK (protocol validated by the codec,
 //! client-id assigned/rejected, session take-over on a duplicate client-id —
 //! which now also closes the superseded socket so its owner thread is promptly
-//! reaped, FIX C; `session_present` always false / clean session only),
+//! reaped, FIX C), persistent sessions (clean session 0, spec 3.1.2.4: the
+//! subscriptions, QoS 1 messages queued while away and unacknowledged ones
+//! resent with DUP on resume — see `Session`),
 //! optional authentication + per-operation ACL hooks (FIX D), SUBSCRIBE/SUBACK
 //! and UNSUBSCRIBE/UNSUBACK over a topic-filter trie index, PUBLISH fan-out at
 //! min(publisher QoS, granted QoS) with a per-subscriber delivery failure
@@ -52,12 +54,13 @@
 //! max_subscriptions_per_conn / max_retained / connect_timeout_ms).
 //!
 //! Deliberately deferred (documented, not built): QoS 2 (an inbound QoS 2
-//! PUBLISH is a protocol violation that tears the connection down), persistent
-//! / offline sessions (clean-session only), DUP retransmit of an unacked
-//! outbound QoS 1 publish, MQTT 5.0, and TLS (terminate it in front and hand
+//! PUBLISH is a protocol violation that tears the connection down), sessions
+//! that survive a restart of the broker itself (they live in memory), DUP
+//! retransmit to a clean-session subscriber, MQTT 5.0, and TLS (terminate it in front and hand
 //! `TcpServer` the plaintext, or drive the socket-free core over a TLS stream
 //! yourself). ⭐ Will / LWT was on this list until 2026-09-11 and is now built
-//! (3.1.2.5, 3.14.4), as is `publish` — a message the server itself originates.
+//! (3.1.2.5, 3.14.4), as is `publish` — a message the server itself originates
+//! — and, since 2026-09-21, persistent sessions.
 //!
 //! Provenance: clean-room from the OASIS MQTT 3.1.1 specification;
 //! mosquitto/Paho referenced for behavior only, no source consulted or copied.
@@ -238,6 +241,13 @@ pub const Connection = struct {
     /// it drains before freeing — no write ever lands on freed memory.
     refs: std.atomic.Value(u32) = .init(0),
 
+    /// The persistent session this connection carries (CONNECT with clean
+    /// session 0), or null for a clean session. Set once, in `handleConnect`,
+    /// and held — with a reference — until the connection is freed, even
+    /// after a take-over has moved the session on: `Session.conn` says which
+    /// connection the session is currently delivering to, this does not.
+    session: ?*Session = null,
+
     pub const State = enum { awaiting_connect, connected, disconnected };
 
     pub fn clientId(c: *const Connection) []const u8 {
@@ -345,6 +355,112 @@ pub const Connection = struct {
     }
 };
 
+// ── persistent sessions (spec 3.1.2.4) ──────────────────────────────────────
+
+/// One QoS 1 message held for a persistent session: queued while it waits for
+/// a delivery window, then in flight until its PUBACK. Topic and payload share
+/// one owned allocation.
+const Message = struct {
+    bytes: []u8,
+    topic_len: usize,
+    retain: bool,
+    /// Packet id in the session's id space; 0 while queued.
+    id: u16 = 0,
+
+    fn topicName(m: Message) []const u8 {
+        return m.bytes[0..m.topic_len];
+    }
+
+    fn payload(m: Message) []const u8 {
+        return m.bytes[m.topic_len..];
+    }
+};
+
+/// The state a CONNECT with clean session 0 asks the Server to keep across
+/// connections (spec 3.1.2.4): the subscriptions, QoS 1 messages published
+/// while the client was away, and QoS 1 messages sent but not acknowledged.
+///
+/// ⭐ The session, not the connection, owns the subscriptions — so they stay in
+/// the index while no connection exists, and a message that matches them is
+/// queued instead of lost. Every QoS 1 delivery to a persistent session goes
+/// through the queue, online or not: whichever thread holds the connection's
+/// `tx_lock` moves messages from the queue into flight (`pumpLocked`), so a
+/// connection that goes away between a fan-out's snapshot and its write
+/// leaves the message queued rather than dropped.
+///
+/// Locks, outermost first: `Connection.tx_lock` → `Broker.mutex` →
+/// `Session.lock`. `lock` is innermost and is never held across a socket
+/// write — a message is encoded under it, and written after it is released.
+pub const Session = struct {
+    client_id_buf: [max_client_id]u8 = undefined,
+    client_id_len: usize = 0,
+
+    // Guarded by `Broker.mutex`.
+    /// Owned filter strings; the index references this session by pointer.
+    subs: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Caller clock (ms) of the last packet of the connection that parked
+    /// this session — what `Broker.expireSessions` measures from.
+    offline_since_ms: i64 = 0,
+    /// Still in `Broker.sessions`. Cleared when the session is discarded; it
+    /// is freed when the last reference goes.
+    registered: bool = true,
+
+    /// One for the registry, one per connection that carries it, one per
+    /// fan-out that is about to pump it. Freed by whoever drops the last.
+    refs: std.atomic.Value(u32) = .init(1),
+
+    lock: Mutex = .{},
+    // Guarded by `lock` (and `conn` is written with `Broker.mutex` held too).
+    /// The connection now delivering, or null while offline.
+    conn: ?*Connection = null,
+    /// Oldest first; `queue_head` is the next to send.
+    queue: std.ArrayListUnmanaged(Message) = .empty,
+    queue_head: usize = 0,
+    queued_bytes: usize = 0,
+    /// At most `max_in_flight`; capacity reserved when the session is made,
+    /// so moving a message into flight cannot fail.
+    inflight: std.ArrayListUnmanaged(Message) = .empty,
+    next_packet_id: u16 = 1,
+
+    pub fn clientId(s: *const Session) []const u8 {
+        return s.client_id_buf[0..s.client_id_len];
+    }
+
+    fn queuedLen(s: *const Session) usize {
+        return s.queue.items.len - s.queue_head;
+    }
+
+    /// Caller holds `lock`.
+    fn popQueue(s: *Session) ?Message {
+        if (s.queue_head >= s.queue.items.len) return null;
+        const m = s.queue.items[s.queue_head];
+        s.queue_head += 1;
+        s.queued_bytes -= m.bytes.len;
+        if (s.queue_head == s.queue.items.len) {
+            s.queue.clearRetainingCapacity();
+            s.queue_head = 0;
+        } else if (s.queue_head >= 64 and s.queue_head * 2 >= s.queue.items.len) {
+            const rest = s.queue.items.len - s.queue_head;
+            std.mem.copyForwards(Message, s.queue.items[0..rest], s.queue.items[s.queue_head..]);
+            s.queue.items.len = rest;
+            s.queue_head = 0;
+        }
+        return m;
+    }
+
+    /// Next id not in flight (wraps 65535 → 1). Caller holds `lock` and has
+    /// checked that the window has room, so one is always free.
+    fn allocId(s: *Session) u16 {
+        while (true) {
+            const id = s.next_packet_id;
+            s.next_packet_id = if (id == std.math.maxInt(u16)) 1 else id + 1;
+            for (s.inflight.items) |m| {
+                if (m.id == id) break;
+            } else return id;
+        }
+    }
+};
+
 // ── subscription index: a topic-filter trie (FIX A) ─────────────────────────
 // Replaces the old flat O(total-subscriptions) scan per PUBLISH. Filters are
 // split on '/'; a literal level is an exact child, '+' a dedicated single-level
@@ -356,9 +472,24 @@ pub const Connection = struct {
 // filter never matches a `$`-prefixed topic, spec 4.7.2-1) is honored at the
 // root by skipping `plus` / `hash_subs` there — exactly `topic.matches`'s rule.
 
-/// A subscribing connection reference stored in the trie (the filter string is
-/// implicit in the path and owned by the connection).
-const SubRef = struct { conn: *Connection, qos: QoS };
+/// Who holds a subscription: a clean-session connection, or a persistent
+/// session (which outlives its connections, so its filters must not point at
+/// one).
+const Owner = union(enum) {
+    conn: *Connection,
+    session: *Session,
+
+    fn eql(a: Owner, b: Owner) bool {
+        return switch (a) {
+            .conn => |c| b == .conn and b.conn == c,
+            .session => |x| b == .session and b.session == x,
+        };
+    }
+};
+
+/// A subscriber reference stored in the trie (the filter string is implicit in
+/// the path and owned by the connection or session).
+const SubRef = struct { owner: Owner, qos: QoS };
 
 const Node = struct {
     children: std.StringHashMapUnmanaged(*Node) = .empty,
@@ -394,13 +525,13 @@ const Index = struct {
         if (!is_root) alloc.destroy(node);
     }
 
-    /// Register `(conn, qos)` under `filter`. Creates trie nodes as needed.
-    fn add(idx: *Index, alloc: std.mem.Allocator, filter: []const u8, conn: *Connection, qos: QoS) Error!void {
+    /// Register `(owner, qos)` under `filter`. Creates trie nodes as needed.
+    fn add(idx: *Index, alloc: std.mem.Allocator, filter: []const u8, owner: Owner, qos: QoS) Error!void {
         var node = &idx.root;
         var it = std.mem.splitScalar(u8, filter, '/');
         while (it.next()) |level| {
             if (std.mem.eql(u8, level, "#")) {
-                try node.hash_subs.append(alloc, .{ .conn = conn, .qos = qos });
+                try node.hash_subs.append(alloc, .{ .owner = owner, .qos = qos });
                 return;
             }
             if (std.mem.eql(u8, level, "+")) {
@@ -422,44 +553,44 @@ const Index = struct {
                 node = child;
             }
         }
-        try node.subs.append(alloc, .{ .conn = conn, .qos = qos });
+        try node.subs.append(alloc, .{ .owner = owner, .qos = qos });
     }
 
-    /// Update the granted QoS of an existing `(conn, filter)` (re-subscribe).
-    fn updateQos(idx: *Index, filter: []const u8, conn: *Connection, qos: QoS) void {
+    /// Update the granted QoS of an existing `(owner, filter)` (re-subscribe).
+    fn updateQos(idx: *Index, filter: []const u8, owner: Owner, qos: QoS) void {
         var node = &idx.root;
         var it = std.mem.splitScalar(u8, filter, '/');
         while (it.next()) |level| {
-            if (std.mem.eql(u8, level, "#")) return setQosIn(&node.hash_subs, conn, qos);
+            if (std.mem.eql(u8, level, "#")) return setQosIn(&node.hash_subs, owner, qos);
             if (std.mem.eql(u8, level, "+")) {
                 node = node.plus orelse return;
             } else {
                 node = node.children.get(level) orelse return;
             }
         }
-        setQosIn(&node.subs, conn, qos);
+        setQosIn(&node.subs, owner, qos);
     }
 
-    fn setQosIn(list: *std.ArrayListUnmanaged(SubRef), conn: *Connection, qos: QoS) void {
+    fn setQosIn(list: *std.ArrayListUnmanaged(SubRef), owner: Owner, qos: QoS) void {
         for (list.items) |*r| {
-            if (r.conn == conn) {
+            if (r.owner.eql(owner)) {
                 r.qos = qos;
                 return;
             }
         }
     }
 
-    fn removeRefFrom(list: *std.ArrayListUnmanaged(SubRef), conn: *Connection) void {
+    fn removeRefFrom(list: *std.ArrayListUnmanaged(SubRef), owner: Owner) void {
         for (list.items, 0..) |r, i| {
-            if (r.conn == conn) {
+            if (r.owner.eql(owner)) {
                 _ = list.swapRemove(i);
                 return;
             }
         }
     }
 
-    /// Remove `(conn, filter)` and prune any nodes left empty.
-    fn removeFilter(idx: *Index, alloc: std.mem.Allocator, filter: []const u8, conn: *Connection) void {
+    /// Remove `(owner, filter)` and prune any nodes left empty.
+    fn removeFilter(idx: *Index, alloc: std.mem.Allocator, filter: []const u8, owner: Owner) void {
         var levels: [max_filter_levels][]const u8 = undefined;
         var n: usize = 0;
         var it = std.mem.splitScalar(u8, filter, '/');
@@ -468,23 +599,23 @@ const Index = struct {
             levels[n] = level;
             n += 1;
         }
-        _ = removeRec(alloc, &idx.root, levels[0..n], conn);
+        _ = removeRec(alloc, &idx.root, levels[0..n], owner);
     }
 
     /// Returns whether `node` became empty (and was pruned by the caller).
-    fn removeRec(alloc: std.mem.Allocator, node: *Node, levels: [][]const u8, conn: *Connection) bool {
+    fn removeRec(alloc: std.mem.Allocator, node: *Node, levels: [][]const u8, owner: Owner) bool {
         if (levels.len == 0) {
-            removeRefFrom(&node.subs, conn);
+            removeRefFrom(&node.subs, owner);
             return node.isEmpty();
         }
         const head = levels[0];
         if (std.mem.eql(u8, head, "#")) {
-            removeRefFrom(&node.hash_subs, conn);
+            removeRefFrom(&node.hash_subs, owner);
             return node.isEmpty();
         }
         if (std.mem.eql(u8, head, "+")) {
             if (node.plus) |p| {
-                if (removeRec(alloc, p, levels[1..], conn)) {
+                if (removeRec(alloc, p, levels[1..], owner)) {
                     freeNode(alloc, p, false);
                     node.plus = null;
                 }
@@ -494,7 +625,7 @@ const Index = struct {
         if (node.children.getEntry(head)) |e| {
             const child = e.value_ptr.*;
             const key = e.key_ptr.*;
-            if (removeRec(alloc, child, levels[1..], conn)) {
+            if (removeRec(alloc, child, levels[1..], owner)) {
                 _ = node.children.remove(head);
                 alloc.free(key);
                 freeNode(alloc, child, false);
@@ -503,8 +634,8 @@ const Index = struct {
         return node.isEmpty();
     }
 
-    /// Collect every `(conn, qos)` whose filter matches `topic_name` into
-    /// `out`, up to `max` matches. Duplicates (a connection matching via several
+    /// Collect every `(owner, qos)` whose filter matches `topic_name` into
+    /// `out`, up to `max` matches. Duplicates (an owner matching via several
     /// overlapping filters) are collapsed later by the caller. Returns `true`
     /// when the walk was cut short at `max` — the per-PUBLISH fan-out envelope
     /// (bounds the work one publish can trigger); once hit, no further trie work
@@ -654,6 +785,23 @@ pub const Config = struct {
     /// payload size, and `max_retained` never did either. 16 MiB.
     max_retained_bytes: usize = 16 << 20,
 
+    /// Hard cap on persistent sessions (CONNECT with clean session 0), online
+    /// or not. A new one past this is refused with CONNACK
+    /// `server_unavailable`; resuming an existing one always succeeds.
+    max_sessions: usize = 1024,
+    /// Per session: QoS 1 messages kept waiting while the client is away or
+    /// its delivery window (`max_in_flight`) is full. A message past either
+    /// bound is dropped for that session and counted in `queueDrops`.
+    /// mosquitto's default is the same 1000 messages.
+    max_queued_messages: usize = 1000,
+    /// Per session: the bytes (topic + payload) those messages may hold.
+    max_queued_bytes: usize = 1 << 20,
+    /// How long an offline session is kept, measured from its connection's
+    /// last packet, when the caller runs `expireSessions`. 0 = for ever,
+    /// which is what MQTT 3.1.1 itself specifies; the broker never expires a
+    /// session on its own, having no clock.
+    session_expiry_ms: u64 = 0,
+
     /// Optional authentication hook (FIX D). Null = allow every CONNECT.
     /// Invoked in `handleConnect` with the client id + credentials; a deny
     /// sends the mapped CONNACK return code and closes the connection.
@@ -729,9 +877,11 @@ pub const PublishVerdict = enum {
 /// happen off the lock like every other fan-out.
 const RetSnap = struct { topic: []u8, payload: []u8, qos: QoS };
 
-/// One fan-out target: a subscribing connection and the (already merged, still
-/// uncapped by the publisher's QoS) highest granted QoS among its filters.
-const Target = struct { conn: *Connection, qos: QoS };
+/// One fan-out target: a connection to write to at `qos` (already the
+/// minimum of the publisher's QoS and the highest grant among its filters), or
+/// — with `session` set — a persistent session's connection to pump, the
+/// message having been queued for it under the registry lock.
+const Target = struct { conn: *Connection, qos: QoS, session: ?*Session = null };
 
 /// The shared server-side state. Offline-testable: `accept` registers a
 /// `Transport`, `feed` + `process` drive a connection, `remove` tears it down —
@@ -776,6 +926,12 @@ pub const Broker = struct {
     /// Count of PUBLISHes `Config.onPublishFn` refused — each one closed its
     /// connection unacknowledged.
     tap_refusals: std.atomic.Value(usize) = .init(0),
+    /// Count of QoS 1 messages a persistent session could not queue
+    /// (`max_queued_messages` / `max_queued_bytes`, or out of memory).
+    queue_drops: std.atomic.Value(usize) = .init(0),
+
+    /// Persistent sessions, online and offline. Guarded by `mutex`.
+    sessions: std.ArrayList(*Session) = .empty,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Broker {
         return .{ .allocator = allocator, .config = config };
@@ -783,8 +939,15 @@ pub const Broker = struct {
 
     /// Free every connection, subscription and retained message.
     pub fn deinit(b: *Broker) void {
-        for (b.connections.items) |conn| b.freeConnection(conn);
+        // Sessions are freed below, whatever their reference count says, so a
+        // connection must not release its reference on the way out.
+        for (b.connections.items) |conn| {
+            conn.session = null;
+            b.freeConnection(conn);
+        }
         b.connections.deinit(b.allocator);
+        for (b.sessions.items) |x| b.freeSession(x);
+        b.sessions.deinit(b.allocator);
         b.index.deinit(b.allocator);
         for (b.retained.items) |r| {
             b.allocator.free(r.topic);
@@ -831,6 +994,56 @@ pub const Broker = struct {
         return b.tap_refusals.load(.monotonic);
     }
 
+    /// How many QoS 1 messages a persistent session could not queue. Non-zero
+    /// means a client came back to a session with a gap in it.
+    pub fn queueDrops(b: *const Broker) u64 {
+        return b.queue_drops.load(.monotonic);
+    }
+
+    /// Persistent sessions held, online and offline.
+    pub fn sessionCount(b: *Broker) usize {
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        return b.sessions.items.len;
+    }
+
+    /// QoS 1 messages queued for the session of `client_id` (not counting
+    /// those in flight), or null when there is no such session.
+    pub fn sessionQueued(b: *Broker, client_id: []const u8) ?usize {
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        const x = b.findSession(client_id) orelse return null;
+        x.lock.lock();
+        defer x.lock.unlock();
+        return x.queuedLen();
+    }
+
+    /// Discard every offline session whose connection's last packet is at
+    /// least `Config.session_expiry_ms` before `now` (the caller's clock, the
+    /// one `process` is given). Returns how many went. A no-op while
+    /// `session_expiry_ms` is 0.
+    pub fn expireSessions(b: *Broker, now: i64) usize {
+        const ttl = b.config.session_expiry_ms;
+        if (ttl == 0) return 0;
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        var gone: usize = 0;
+        var i: usize = 0;
+        while (i < b.sessions.items.len) {
+            const x = b.sessions.items[i];
+            x.lock.lock();
+            const offline = x.conn == null;
+            x.lock.unlock();
+            if (offline and now - x.offline_since_ms >= @as(i64, @intCast(@min(ttl, std.math.maxInt(i64))))) {
+                b.discardSession(x); // swap-removes index i
+                gone += 1;
+                continue;
+            }
+            i += 1;
+        }
+        return gone;
+    }
+
     /// Register a new connection over `transport`; returns an owned pointer
     /// (freed by `remove`). Allocates the connection's rx/tx buffers.
     pub fn accept(b: *Broker, transport: Transport) Error!*Connection {
@@ -858,7 +1071,10 @@ pub const Broker = struct {
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            // A persistent session keeps its subscriptions: it goes offline
+            // and starts queueing (spec 3.1.2.4).
             b.dropSubscriptions(conn);
+            b.park(conn);
             if (std.mem.indexOfScalar(*Connection, b.connections.items, conn)) |i| {
                 _ = b.connections.swapRemove(i);
             }
@@ -890,6 +1106,7 @@ pub const Broker = struct {
 
     fn freeConnection(b: *Broker, conn: *Connection) void {
         b.dropWill(conn);
+        if (conn.session) |x| b.releaseSession(x);
         for (conn.subs.items) |f| b.allocator.free(f);
         conn.subs.deinit(b.allocator);
         b.allocator.free(conn.rx_buf);
@@ -1077,8 +1294,13 @@ pub const Broker = struct {
                 },
                 .puback => |id| {
                     conn.tx_lock.lock();
-                    conn.removePending(id);
-                    conn.tx_lock.unlock();
+                    defer conn.tx_lock.unlock();
+                    if (conn.session) |x| {
+                        // A freed window slot is the cue to send the next
+                        // queued message — nothing else would.
+                        ackInflight(b.allocator, x, conn, id);
+                        try b.pumpLocked(conn, x);
+                    } else conn.removePending(id);
                     return .keep;
                 },
                 .pingreq => {
@@ -1093,8 +1315,10 @@ pub const Broker = struct {
                     // the test `remove` uses for an ungraceful end.
                     b.dropWill(conn);
                     // Clean session: routing state is dropped on disconnect.
+                    // A persistent one keeps it and goes offline.
                     b.mutex.lock();
                     b.dropSubscriptions(conn);
+                    b.park(conn);
                     conn.state = .disconnected;
                     b.mutex.unlock();
                     return .close;
@@ -1190,25 +1414,224 @@ pub const Broker = struct {
             conn.will_retain = w.retain;
         }
 
+        // ⛔ `tx_lock` is taken BEFORE a session is attached and held until the
+        // CONNACK and every resent message are written: from the moment
+        // `Session.conn` names this connection, a publisher's fan-out may pump
+        // it, and nothing may reach a client ahead of its CONNACK (spec 3.2).
+        conn.tx_lock.lock();
+        defer conn.tx_lock.unlock();
+
         // Session take-over: a live connection with the same client-id is
         // disconnected (spec 3.1.4-2), its routing state dropped and — FIX C —
-        // its socket shut down so its owner thread wakes and reaps it. Clean
-        // session → no state carried over.
+        // its socket shut down so its owner thread wakes and reaps it.
+        //
+        // Then the session (spec 3.1.2.4). Clean session 1 discards any the
+        // client left behind (3.1.2-6). Clean session 0 resumes it — its
+        // subscriptions, what was queued for it and what was never
+        // acknowledged — or starts one.
+        var resumed: ?*Session = null;
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            const existing = b.findSession(conn.clientId());
+            if (!c.clean_session and existing == null and b.sessions.items.len >= b.config.max_sessions) {
+                // Refused before anything changed hands, so a live session
+                // under this id — there is none — is not disturbed either.
+                b.dropWill(conn);
+                var cbuf: [4]u8 = undefined;
+                try conn.write(try packet.encodeConnack(&cbuf, .{
+                    .session_present = false,
+                    .return_code = .server_unavailable,
+                }));
+                return .close;
+            }
+            // Allocated before the take-over, so running out of memory here
+            // leaves the earlier connection alone.
+            const fresh: ?*Session = if (!c.clean_session and existing == null) try b.createSession(conn.clientId()) else null;
             b.takeover(conn);
+            if (existing) |x| {
+                if (c.clean_session) b.discardSession(x) else {
+                    attach(x, conn);
+                    resumed = x;
+                }
+            } else if (fresh) |x| attach(x, conn);
             conn.keep_alive_s = c.keep_alive_s;
             conn.last_packet_ms = now;
             conn.state = .connected;
         }
 
         var cbuf: [4]u8 = undefined;
-        try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
-            .session_present = false, // clean session only
+        try conn.write(try packet.encodeConnack(&cbuf, .{
+            .session_present = resumed != null,
             .return_code = .accepted,
         }));
+        if (resumed) |x| {
+            // Spec 4.4: unacknowledged PUBLISHes go again, with their
+            // original ids and DUP set, before anything new.
+            try b.resendLocked(conn, x);
+            try b.pumpLocked(conn, x);
+        }
         return .keep;
+    }
+
+    // ── persistent sessions ──────────────────────────────────────────────────
+
+    /// Caller holds `mutex`.
+    fn findSession(b: *Broker, client_id: []const u8) ?*Session {
+        for (b.sessions.items) |x| {
+            if (std.mem.eql(u8, x.clientId(), client_id)) return x;
+        }
+        return null;
+    }
+
+    /// A new, registered, unattached session. Caller holds `mutex`.
+    fn createSession(b: *Broker, client_id: []const u8) Error!*Session {
+        const x = try b.allocator.create(Session);
+        errdefer b.allocator.destroy(x);
+        x.* = .{};
+        @memcpy(x.client_id_buf[0..client_id.len], client_id);
+        x.client_id_len = client_id.len;
+        try x.inflight.ensureTotalCapacity(b.allocator, max_in_flight);
+        errdefer x.inflight.deinit(b.allocator);
+        try b.sessions.append(b.allocator, x);
+        return x;
+    }
+
+    /// Make `conn` the connection `x` delivers to. Caller holds `mutex`.
+    fn attach(x: *Session, conn: *Connection) void {
+        x.lock.lock();
+        x.conn = conn;
+        x.lock.unlock();
+        conn.session = x;
+        _ = x.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Take `conn`'s session offline, if it is still the one delivering.
+    /// Caller holds `mutex`.
+    fn park(b: *Broker, conn: *Connection) void {
+        _ = b;
+        const x = conn.session orelse return;
+        x.lock.lock();
+        defer x.lock.unlock();
+        if (x.conn != conn) return; // taken over: the session lives on elsewhere
+        x.conn = null;
+        x.offline_since_ms = conn.last_packet_ms;
+    }
+
+    /// Drop a session from the registry and the index; it is freed when its
+    /// last reference goes. Caller holds `mutex`.
+    fn discardSession(b: *Broker, x: *Session) void {
+        if (std.mem.indexOfScalar(*Session, b.sessions.items, x)) |i| _ = b.sessions.swapRemove(i);
+        for (x.subs.items) |f| {
+            b.index.removeFilter(b.allocator, f, .{ .session = x });
+            b.allocator.free(f);
+            b.subscriptions_total -= 1;
+        }
+        x.subs.clearRetainingCapacity();
+        x.registered = false;
+        x.lock.lock();
+        x.conn = null;
+        x.lock.unlock();
+        b.releaseSession(x);
+    }
+
+    fn releaseSession(b: *Broker, x: *Session) void {
+        if (x.refs.fetchSub(1, .acq_rel) == 1) b.freeSession(x);
+    }
+
+    fn freeSession(b: *Broker, x: *Session) void {
+        for (x.subs.items) |f| b.allocator.free(f);
+        x.subs.deinit(b.allocator);
+        for (x.queue.items[x.queue_head..]) |m| b.allocator.free(m.bytes);
+        x.queue.deinit(b.allocator);
+        for (x.inflight.items) |m| b.allocator.free(m.bytes);
+        x.inflight.deinit(b.allocator);
+        b.allocator.destroy(x);
+    }
+
+    /// Queue one QoS 1 message for `x`, or count it dropped. Caller holds
+    /// `x.lock`. Never fails: a session that cannot take a message must not
+    /// fail the publish that produced it.
+    fn enqueueLocked(b: *Broker, x: *Session, topic_name: []const u8, payload: []const u8, retain: bool) void {
+        const len = topic_name.len + payload.len;
+        if (x.queuedLen() >= b.config.max_queued_messages or
+            x.queued_bytes + len > b.config.max_queued_bytes)
+        {
+            _ = b.queue_drops.fetchAdd(1, .monotonic);
+            return;
+        }
+        const bytes = b.allocator.alloc(u8, len) catch {
+            _ = b.queue_drops.fetchAdd(1, .monotonic);
+            return;
+        };
+        @memcpy(bytes[0..topic_name.len], topic_name);
+        @memcpy(bytes[topic_name.len..], payload);
+        x.queue.append(b.allocator, .{ .bytes = bytes, .topic_len = topic_name.len, .retain = retain }) catch {
+            b.allocator.free(bytes);
+            _ = b.queue_drops.fetchAdd(1, .monotonic);
+            return;
+        };
+        x.queued_bytes += len;
+    }
+
+    /// Move queued messages into flight and write them, while `conn` is the
+    /// session's connection and the window has room. Caller holds
+    /// `conn.tx_lock`. A failed write leaves its message in flight, so it
+    /// goes again, with DUP, when the client resumes the session.
+    fn pumpLocked(b: *Broker, conn: *Connection, x: *Session) Error!void {
+        while (true) {
+            var bytes: []const u8 = undefined;
+            {
+                x.lock.lock();
+                defer x.lock.unlock();
+                if (x.conn != conn or conn.state != .connected) return;
+                if (x.inflight.items.len >= max_in_flight) return;
+                var m = x.popQueue() orelse return;
+                m.id = x.allocId();
+                // Cannot fail: every message was held to `max_packet_size`
+                // when it arrived, and `tx_buf` has `tx_headroom` for the id.
+                bytes = packet.encodePublish(conn.tx_buf, .{
+                    .topic = m.topicName(),
+                    .payload = m.payload(),
+                    .qos = .at_least_once,
+                    .retain = m.retain,
+                    .packet_id = m.id,
+                }) catch {
+                    b.allocator.free(m.bytes);
+                    _ = b.queue_drops.fetchAdd(1, .monotonic);
+                    continue;
+                };
+                x.inflight.appendAssumeCapacity(m);
+            }
+            try conn.write(bytes);
+        }
+    }
+
+    /// Write every in-flight message of `x` again, with DUP. Caller holds
+    /// `conn.tx_lock`, which is also what keeps the in-flight list from
+    /// changing under the loop: only a PUBACK on `conn` removes from it, and
+    /// only a pump holding this same lock adds to it.
+    fn resendLocked(b: *Broker, conn: *Connection, x: *Session) Error!void {
+        _ = b;
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            var bytes: []const u8 = undefined;
+            {
+                x.lock.lock();
+                defer x.lock.unlock();
+                if (x.conn != conn or i >= x.inflight.items.len) return;
+                const m = x.inflight.items[i];
+                bytes = try packet.encodePublish(conn.tx_buf, .{
+                    .topic = m.topicName(),
+                    .payload = m.payload(),
+                    .qos = .at_least_once,
+                    .retain = m.retain,
+                    .dup = true,
+                    .packet_id = m.id,
+                });
+            }
+            try conn.write(bytes);
+        }
     }
 
     /// Caller holds `mutex`. Supersede any live connection sharing the new
@@ -1263,12 +1686,20 @@ pub const Broker = struct {
             var walked_n: usize = 0;
             var snap_bytes: usize = 0;
             var truncated = false;
+            // ⛔ A connection a take-over has superseded may still be working
+            // through packets it had already received. It must not register
+            // anything: its session — if it had one — now belongs to the new
+            // connection, or was discarded, and a filter added to a discarded
+            // session would stay in the index pointing at freed memory (found
+            // by the stress pass). Read under `mutex`, which is what
+            // `takeover` and `discardSession` write these under.
+            const live = b.ownsRouting(conn);
             var it = s.iterator();
             while (it.next()) |req| {
                 var code: u8 = packet.suback_failure;
                 var granted: QoS = .at_most_once;
                 var ok = false;
-                if (topic.validateFilter(req.filter)) |_| {
+                if (!live) {} else if (topic.validateFilter(req.filter)) |_| {
                     if (b.aclAllows(conn, req.filter, .subscribe)) {
                         granted = minQos(req.qos, .at_least_once); // support up to QoS 1
                         if (try b.registerSubscription(conn, req.filter, granted)) {
@@ -1324,8 +1755,37 @@ pub const Broker = struct {
         var sbuf: [4 + max_filters_per_subscribe]u8 = undefined;
         try conn.write(try packet.encodeSuback(&sbuf, s.packet_id, codes[0..n]));
         for (retsnap.items) |r| {
+            if (conn.session) |x| if (r.qos == .at_least_once) {
+                // A persistent session's QoS 1 goes through its queue, so the
+                // id is the session's and survives a reconnect.
+                x.lock.lock();
+                b.enqueueLocked(x, r.topic, r.payload, true);
+                x.lock.unlock();
+                continue;
+            };
             try b.deliverLocked(conn, r.topic, r.payload, r.qos, true);
         }
+        if (conn.session) |x| try b.pumpLocked(conn, x);
+    }
+
+    /// Whether `conn` may still change its subscriptions: it has not been
+    /// superseded, and its session, if any, is still registered and still
+    /// delivering to it. Caller holds `mutex`.
+    fn ownsRouting(b: *Broker, conn: *Connection) bool {
+        _ = b;
+        if (conn.state != .connected) return false;
+        const x = conn.session orelse return true;
+        return x.registered and x.conn == conn;
+    }
+
+    /// Who holds `conn`'s subscriptions: its persistent session, or itself.
+    fn ownerOf(conn: *Connection) Owner {
+        return if (conn.session) |x| .{ .session = x } else .{ .conn = conn };
+    }
+
+    /// The filter list `ownerOf(conn)` keeps. Caller holds `mutex`.
+    fn subsOf(conn: *Connection) *std.ArrayListUnmanaged([]u8) {
+        return if (conn.session) |x| &x.subs else &conn.subs;
     }
 
     fn alreadyWalked(seen: []const []const u8, filter: []const u8) bool {
@@ -1340,14 +1800,16 @@ pub const Broker = struct {
     /// genuinely new filter, or the filter is too deeply nested — the caller
     /// reports that as a per-filter SUBACK 0x80. Caller holds `mutex`.
     fn registerSubscription(b: *Broker, conn: *Connection, filter: []const u8, qos: QoS) Error!bool {
-        for (conn.subs.items) |f| {
+        const owner = ownerOf(conn);
+        const subs = subsOf(conn);
+        for (subs.items) |f| {
             if (std.mem.eql(u8, f, filter)) {
-                b.index.updateQos(filter, conn, qos); // re-subscribe (spec 3.8.4-3)
+                b.index.updateQos(filter, owner, qos); // re-subscribe (spec 3.8.4-3)
                 return true;
             }
         }
         if (b.subscriptions_total >= b.config.max_subscriptions_total) return false;
-        if (conn.subs.items.len >= b.config.max_subscriptions_per_conn) return false;
+        if (subs.items.len >= b.config.max_subscriptions_per_conn) return false;
         var level_count: usize = 0;
         var lv = std.mem.splitScalar(u8, filter, '/');
         while (lv.next()) |_| {
@@ -1357,9 +1819,9 @@ pub const Broker = struct {
 
         const owned = try b.allocator.dupe(u8, filter);
         errdefer b.allocator.free(owned);
-        try conn.subs.append(b.allocator, owned);
-        errdefer conn.subs.items.len -= 1; // undo the append on a later failure
-        try b.index.add(b.allocator, filter, conn, qos);
+        try subs.append(b.allocator, owned);
+        errdefer subs.items.len -= 1; // undo the append on a later failure
+        try b.index.add(b.allocator, filter, owner, qos);
         b.subscriptions_total += 1;
         return true;
     }
@@ -1368,14 +1830,19 @@ pub const Broker = struct {
         {
             b.mutex.lock();
             defer b.mutex.unlock();
+            const owner = ownerOf(conn);
+            const subs = subsOf(conn);
+            // Same reason as in `handleSubscribe`: a superseded connection
+            // must not edit a session that is no longer its own.
             var it = u.iterator();
+            if (!b.ownsRouting(conn)) it.rest = &.{};
             while (it.next()) |filter| {
                 var i: usize = 0;
-                while (i < conn.subs.items.len) {
-                    if (std.mem.eql(u8, conn.subs.items[i], filter)) {
-                        b.index.removeFilter(b.allocator, filter, conn);
-                        b.allocator.free(conn.subs.items[i]);
-                        _ = conn.subs.swapRemove(i);
+                while (i < subs.items.len) {
+                    if (std.mem.eql(u8, subs.items[i], filter)) {
+                        b.index.removeFilter(b.allocator, filter, owner);
+                        b.allocator.free(subs.items[i]);
+                        _ = subs.swapRemove(i);
                         b.subscriptions_total -= 1;
                         continue; // a filter appears once per conn; scan on defensively
                     }
@@ -1450,24 +1917,52 @@ pub const Broker = struct {
             const capped = try b.index.collect(b.allocator, pub_pkt.topic, &matches, b.config.max_fanout_matches);
             if (capped) _ = b.fanout_truncations.fetchAdd(1, .monotonic);
 
-            // Collapse to one target per connection at its highest granted QoS
+            // Collapse to one entry per owner at its highest granted QoS
             // (overlapping filters → a single copy, spec behavior).
+            var owners: std.ArrayListUnmanaged(SubRef) = .empty;
+            defer owners.deinit(b.allocator);
             for (matches.items) |ref| {
-                if (ref.conn.state != .connected) continue;
-                var found = false;
-                for (targets.items) |*t| {
-                    if (t.conn == ref.conn) {
-                        t.qos = maxQos(t.qos, ref.qos);
-                        found = true;
+                if (ref.owner == .conn and ref.owner.conn.state != .connected) continue;
+                for (owners.items) |*o| {
+                    if (o.owner.eql(ref.owner)) {
+                        o.qos = maxQos(o.qos, ref.qos);
                         break;
                     }
+                } else try owners.append(b.allocator, ref);
+            }
+
+            // A persistent session takes its QoS 1 copy into its queue here,
+            // under the lock, whether or not a connection is there to send it:
+            // what is queued cannot be lost to a disconnect that lands between
+            // this snapshot and the write. QoS 0 reaches it only while online
+            // (spec 3.1.2.4 keeps QoS 0 optional; this broker does not).
+            try targets.ensureTotalCapacity(b.allocator, owners.items.len);
+            for (owners.items) |o| {
+                const q = minQos(pub_pkt.qos, o.qos);
+                switch (o.owner) {
+                    .conn => |c| targets.appendAssumeCapacity(.{ .conn = c, .qos = q }),
+                    .session => |x| {
+                        x.lock.lock();
+                        defer x.lock.unlock();
+                        if (q == .at_least_once) b.enqueueLocked(x, pub_pkt.topic, pub_pkt.payload, false);
+                        const c = x.conn orelse continue;
+                        if (c.state != .connected) continue;
+                        targets.appendAssumeCapacity(.{
+                            .conn = c,
+                            .qos = q,
+                            .session = if (q == .at_least_once) x else null,
+                        });
+                    },
                 }
-                if (!found) try targets.append(b.allocator, .{ .conn = ref.conn, .qos = ref.qos });
             }
 
             // Reference every target so `remove` cannot free it under the
-            // upcoming (lock-free) writes.
-            for (targets.items) |t| _ = t.conn.refs.fetchAdd(1, .acquire);
+            // upcoming (lock-free) writes — and every session, so a discard
+            // cannot free it under a pump.
+            for (targets.items) |t| {
+                _ = t.conn.refs.fetchAdd(1, .acquire);
+                if (t.session) |x| _ = x.refs.fetchAdd(1, .monotonic);
+            }
         }
 
         // Off the global lock: deliver to each subscriber under its own
@@ -1481,25 +1976,31 @@ pub const Broker = struct {
         // still releasing every reference it took first (FIX A's invariant:
         // `remove` must never spin on a fan-out that will not touch these
         // connections again).
+        defer b.releaseTargets(targets.items);
         for (targets.items) |t| {
             var failed = false;
             {
                 t.conn.tx_lock.lock();
                 defer t.conn.tx_lock.unlock();
-                if (t.conn.state == .connected) {
-                    b.deliverLocked(t.conn, pub_pkt.topic, pub_pkt.payload, minQos(pub_pkt.qos, t.qos), false) catch |e| {
-                        if (e == error.Canceled) {
-                            for (targets.items) |tt| _ = tt.conn.refs.fetchSub(1, .release);
-                            return e;
-                        }
-                        failed = true;
-                    };
-                }
+                const sent = if (t.session) |x|
+                    b.pumpLocked(t.conn, x)
+                else if (t.conn.state == .connected)
+                    b.deliverLocked(t.conn, pub_pkt.topic, pub_pkt.payload, t.qos, false)
+                else {};
+                sent catch |e| {
+                    if (e == error.Canceled) return e;
+                    failed = true;
+                };
             }
             if (failed) disconnectPeer(t.conn);
         }
+    }
 
-        for (targets.items) |t| _ = t.conn.refs.fetchSub(1, .release);
+    fn releaseTargets(b: *Broker, targets: []const Target) void {
+        for (targets) |t| {
+            _ = t.conn.refs.fetchSub(1, .release);
+            if (t.session) |x| b.releaseSession(x);
+        }
     }
 
     /// Contain a subscriber's delivery failure (FIX B): flag it disconnected
@@ -1582,16 +2083,34 @@ pub const Broker = struct {
         }
     }
 
-    /// Caller holds `mutex`. Drop every subscription this connection holds.
+    /// Caller holds `mutex`. Drop every subscription this connection holds
+    /// itself — none, for a persistent session, whose filters are the
+    /// session's.
     fn dropSubscriptions(b: *Broker, conn: *Connection) void {
         for (conn.subs.items) |f| {
-            b.index.removeFilter(b.allocator, f, conn);
+            b.index.removeFilter(b.allocator, f, .{ .conn = conn });
             b.allocator.free(f);
             b.subscriptions_total -= 1;
         }
         conn.subs.clearRetainingCapacity();
     }
 };
+
+/// Free the in-flight message `id` of `x` on its PUBACK — only when `conn` is
+/// still the session's connection. Takes `x.lock`.
+fn ackInflight(alloc: std.mem.Allocator, x: *Session, conn: *Connection, id: u16) void {
+    x.lock.lock();
+    defer x.lock.unlock();
+    if (x.conn != conn) return;
+    for (x.inflight.items, 0..) |m, i| {
+        if (m.id == id) {
+            alloc.free(m.bytes);
+            // Ordered: a resume resends in the order they were first sent.
+            _ = x.inflight.orderedRemove(i);
+            return;
+        }
+    }
+}
 
 fn minQos(a: QoS, b: QoS) QoS {
     return if (@intFromEnum(a) <= @intFromEnum(b)) a else b;
@@ -2363,6 +2882,347 @@ test "FIX A: trie fan-out routes wildcards to exactly the matching subscribers" 
     try testing.expectEqual(@as(?packet.Packet, null), try t5.next()); // '#' must not match $-topic
 }
 
+// ── persistent sessions (spec 3.1.2.4, 4.4) ─────────────────────────────────
+
+/// CONNECT with an explicit clean-session flag; asserts an accepted CONNACK
+/// and returns it with the connection.
+fn connectSession(b: *Broker, tt: *TestTransport, client_id: []const u8, clean: bool, now: i64) !struct { conn: *Connection, present: bool } {
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = client_id, .clean_session = clean, .keep_alive_s = 60 }));
+    try testing.expectEqual(Disposition.keep, try b.process(conn, now));
+    const p = (try tt.next()).?;
+    try testing.expect(p == .connack);
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, p.connack.return_code);
+    return .{ .conn = conn, .present = p.connack.session_present };
+}
+
+fn feedDisconnect(b: *Broker, conn: *Connection) !void {
+    var buf: [2]u8 = undefined;
+    try b.feed(conn, try packet.encodeDisconnect(&buf));
+    try testing.expectEqual(Disposition.close, try b.process(conn, 5));
+}
+
+fn feedPuback(b: *Broker, conn: *Connection, id: u16) !void {
+    var buf: [4]u8 = undefined;
+    try b.feed(conn, try packet.encodePuback(&buf, id));
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 6));
+}
+
+test "a persistent session keeps its subscriptions and queues QoS 1 while away" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try testing.expect(!s1.present); // nothing to resume the first time
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "egw/#", .qos = .at_least_once }});
+    try testing.expect((try t1.next()).? == .suback);
+    try feedDisconnect(&b, s1.conn);
+    b.remove(s1.conn);
+
+    // Away: the subscription is still counted, and both messages wait.
+    try testing.expectEqual(@as(usize, 1), b.subscriptionCount());
+    try b.publish("egw/1/t", "20.5", .at_least_once, false);
+    try b.publish("egw/1/t", "20.6", .at_least_once, false);
+    try testing.expectEqual(@as(?usize, 2), b.sessionQueued("web"));
+
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "web", false, 10);
+    try testing.expect(s2.present);
+    const m1 = (try t2.next()).?.publish;
+    const m2 = (try t2.next()).?.publish;
+    try testing.expectEqualStrings("20.5", m1.payload);
+    try testing.expectEqualStrings("20.6", m2.payload);
+    try testing.expectEqual(QoS.at_least_once, m1.qos);
+    try testing.expect(!m1.dup);
+    try testing.expect(m1.packet_id != m2.packet_id);
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("web"));
+    // No SUBSCRIBE was needed: a live publish reaches it directly.
+    try b.publish("egw/1/t", "20.7", .at_least_once, false);
+    try testing.expectEqualStrings("20.7", (try t2.next()).?.publish.payload);
+}
+
+test "a session also survives a connection that dies without DISCONNECT" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    b.remove(s1.conn); // a dead socket: the owner reaps it, no DISCONNECT
+    try b.publish("a", "x", .at_least_once, false);
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("web"));
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "web", false, 1);
+    try testing.expect(s2.present);
+    try testing.expectEqualStrings("x", (try t2.next()).?.publish.payload);
+}
+
+test "clean session 1 discards the session the client left behind (3.1.2-6)" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    try feedDisconnect(&b, s1.conn);
+    b.remove(s1.conn);
+    try b.publish("a", "x", .at_least_once, false);
+
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "web", true, 1);
+    try testing.expect(!s2.present);
+    try testing.expect((try t2.next()) == null); // the queued message went with it
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+    try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
+    // And a later clean-session-0 CONNECT starts from nothing.
+    try feedDisconnect(&b, s2.conn);
+    b.remove(s2.conn);
+    var t3 = TestTransport{};
+    try testing.expect(!(try connectSession(&b, &t3, "web", false, 2)).present);
+}
+
+test "an unacknowledged QoS 1 message goes again with DUP and its id (4.4)" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    _ = try t1.next();
+    try b.publish("a", "one", .at_least_once, false);
+    try b.publish("a", "two", .at_least_once, false);
+    const first = (try t1.next()).?.publish;
+    const second = (try t1.next()).?.publish;
+    try feedPuback(&b, s1.conn, first.packet_id); // only the first is acknowledged
+    b.remove(s1.conn);
+
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "web", false, 1);
+    try testing.expect(s2.present);
+    const again = (try t2.next()).?.publish;
+    try testing.expectEqualStrings("two", again.payload);
+    try testing.expect(again.dup);
+    try testing.expectEqual(second.packet_id, again.packet_id);
+    try testing.expect((try t2.next()) == null); // "one" was acknowledged: not resent
+}
+
+test "a failed write to a session leaves the message in flight, not lost" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    t1.fail = true;
+    try b.publish("a", "kept", .at_least_once, false); // contained: the publisher is fine
+    try testing.expectEqual(Connection.State.disconnected, s1.conn.state);
+    b.remove(s1.conn);
+    var t2 = TestTransport{};
+    const s2 = try connectSession(&b, &t2, "web", false, 1);
+    try testing.expect(s2.present);
+    const m = (try t2.next()).?.publish;
+    try testing.expectEqualStrings("kept", m.payload);
+    try testing.expect(m.dup); // it had been handed to the transport once
+}
+
+test "QoS 0 is not queued for an offline session, and a QoS 0 grant queues nothing" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{
+        .{ .filter = "q1", .qos = .at_least_once },
+        .{ .filter = "q0", .qos = .at_most_once },
+    });
+    try feedDisconnect(&b, s1.conn);
+    b.remove(s1.conn);
+    try b.publish("q1", "a", .at_most_once, false); // publisher QoS 0
+    try b.publish("q0", "b", .at_least_once, false); // grant QoS 0
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("web"));
+    try testing.expectEqual(@as(u64, 0), b.queueDrops());
+}
+
+test "a full queue drops the newest and counts it, keeping the oldest" {
+    var b = Broker.init(testing.allocator, .{ .max_queued_messages = 2 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    try feedDisconnect(&b, s1.conn);
+    b.remove(s1.conn);
+    try b.publish("a", "1", .at_least_once, false);
+    try b.publish("a", "2", .at_least_once, false);
+    try b.publish("a", "3", .at_least_once, false);
+    try testing.expectEqual(@as(u64, 1), b.queueDrops());
+    var t2 = TestTransport{};
+    _ = try connectSession(&b, &t2, "web", false, 1);
+    try testing.expectEqualStrings("1", (try t2.next()).?.publish.payload);
+    try testing.expectEqualStrings("2", (try t2.next()).?.publish.payload);
+    try testing.expect((try t2.next()) == null);
+}
+
+test "the byte bound on a queue holds too" {
+    var b = Broker.init(testing.allocator, .{ .max_queued_bytes = 10 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    b.remove(s1.conn);
+    try b.publish("a", "12345678", .at_least_once, false); // 1 + 8 = 9 bytes
+    try b.publish("a", "12", .at_least_once, false); // 9 + 3 > 10
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("web"));
+    try testing.expectEqual(@as(u64, 1), b.queueDrops());
+}
+
+test "past the in-flight window messages wait, and a PUBACK sends the next" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    _ = try t1.next();
+    var i: usize = 0;
+    while (i < max_in_flight + 2) : (i += 1) try b.publish("a", "m", .at_least_once, false);
+    var first_id: u16 = 0;
+    var sent: usize = 0;
+    while (try t1.next()) |p| : (sent += 1) {
+        if (sent == 0) first_id = p.publish.packet_id;
+    }
+    try testing.expectEqual(@as(usize, max_in_flight), sent);
+    try testing.expectEqual(@as(?usize, 2), b.sessionQueued("web"));
+    // Nothing is dropped, unlike a clean session's full pool.
+    try testing.expectEqual(@as(u64, 0), b.qos1Drops());
+    try feedPuback(&b, s1.conn, first_id);
+    try testing.expect((try t1.next()).? == .publish);
+    try testing.expect((try t1.next()) == null);
+    try testing.expectEqual(@as(?usize, 1), b.sessionQueued("web"));
+}
+
+test "a persistent take-over moves the session to the new connection" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    _ = try t1.next();
+    const s2 = try connectSession(&b, &t2, "web", false, 1);
+    try testing.expect(s2.present);
+    try testing.expect(t1.closed);
+    try testing.expectEqual(Connection.State.disconnected, s1.conn.state);
+    try testing.expectEqual(@as(usize, 1), b.subscriptionCount()); // kept, not dropped
+    try b.publish("a", "x", .at_least_once, false);
+    try testing.expect((try t1.next()) == null);
+    try testing.expectEqualStrings("x", (try t2.next()).?.publish.payload);
+    // The superseded connection's teardown must not park the session the
+    // new one is using.
+    b.remove(s1.conn);
+    try b.publish("a", "y", .at_least_once, false);
+    try testing.expectEqualStrings("y", (try t2.next()).?.publish.payload);
+}
+
+test "a clean take-over of a persistent client discards its session" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    const s2 = try connectSession(&b, &t2, "web", true, 1);
+    try testing.expect(!s2.present);
+    try testing.expectEqual(@as(usize, 0), b.sessionCount());
+    try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
+    b.remove(s1.conn); // releases the last reference; testing.allocator checks the free
+}
+
+test "max_sessions refuses a new session but never a resume" {
+    var b = Broker.init(testing.allocator, .{ .max_sessions = 1 });
+    defer b.deinit();
+    var tw = TestTransport{};
+    const watcher = try connectClient(&b, &tw, "watcher", 60, 0);
+    try feedSubscribe(&b, watcher, 1, &.{.{ .filter = "gone/#" }});
+    _ = try tw.next();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "a", false, 0);
+    try feedDisconnect(&b, s1.conn);
+    b.remove(s1.conn);
+
+    var t2 = TestTransport{};
+    const c2 = try b.accept(t2.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(c2, try packet.encodeConnect(&buf, .{
+        .client_id = "b",
+        .clean_session = false,
+        .will = .{ .topic = "gone/b", .message = "x" },
+    }));
+    try testing.expectEqual(Disposition.close, try b.process(c2, 1));
+    try testing.expectEqual(packet.ConnectReturnCode.server_unavailable, (try t2.next()).?.connack.return_code);
+    b.remove(c2);
+    // A refused CONNECT registered nothing, so no Will announces it.
+    try testing.expect((try tw.next()) == null);
+
+    var t3 = TestTransport{};
+    try testing.expect((try connectSession(&b, &t3, "a", false, 2)).present);
+    var t4 = TestTransport{};
+    _ = try connectSession(&b, &t4, "c", true, 2); // clean sessions are not counted
+}
+
+test "expireSessions drops only offline sessions past the TTL" {
+    var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 1000 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    const old = try connectSession(&b, &t1, "old", false, 0);
+    try feedSubscribe(&b, old.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    try feedDisconnect(&b, old.conn); // last packet at 5
+    b.remove(old.conn);
+    const live = try connectSession(&b, &t2, "live", false, 0);
+    _ = live;
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(1004)); // 999 ms offline
+    try testing.expectEqual(@as(usize, 1), b.expireSessions(1005));
+    try testing.expectEqual(@as(usize, 1), b.sessionCount()); // the online one stays
+    try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
+    try testing.expectEqual(@as(?usize, null), b.sessionQueued("old"));
+}
+
+test "expireSessions is a no-op without a TTL" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    b.remove(s1.conn);
+    try testing.expectEqual(@as(usize, 0), b.expireSessions(std.math.maxInt(i64)));
+    try testing.expectEqual(@as(usize, 1), b.sessionCount());
+}
+
+test "a retained QoS 1 message reaches a session through its queue" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    try b.publish("cfg", "v1", .at_least_once, true);
+    var t1 = TestTransport{};
+    const s1 = try connectSession(&b, &t1, "web", false, 0);
+    try feedSubscribe(&b, s1.conn, 1, &.{.{ .filter = "cfg", .qos = .at_least_once }});
+    try testing.expect((try t1.next()).? == .suback);
+    const r = (try t1.next()).?.publish;
+    try testing.expect(r.retain);
+    b.remove(s1.conn); // never acknowledged
+    var t2 = TestTransport{};
+    _ = try connectSession(&b, &t2, "web", false, 1);
+    const again = (try t2.next()).?.publish;
+    try testing.expect(again.dup and again.retain);
+    try testing.expectEqual(r.packet_id, again.packet_id);
+}
+
+test "deinit frees online and offline sessions with messages queued and in flight" {
+    var b = Broker.init(testing.allocator, .{});
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    const on = try connectSession(&b, &t1, "on", false, 0);
+    const off = try connectSession(&b, &t2, "off", false, 0);
+    try feedSubscribe(&b, on.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    try feedSubscribe(&b, off.conn, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    b.remove(off.conn);
+    try b.publish("a", "x", .at_least_once, false); // in flight for one, queued for the other
+    b.deinit(); // testing.allocator fails the test on any leak
+}
+
 fn expectDelivered(t: *TestTransport, expect_topic: []const u8) !void {
     const p = (try t.next()).?;
     try testing.expect(p == .publish);
@@ -2780,8 +3640,11 @@ const StressClient = struct {
     }
 
     fn sendConnect(c: *StressClient, client_id: []const u8) !void {
+        return c.sendConnectClean(client_id, true);
+    }
+    fn sendConnectClean(c: *StressClient, client_id: []const u8, clean: bool) !void {
         var buf: [320]u8 = undefined;
-        try c.writeAll(try packet.encodeConnect(&buf, .{ .client_id = client_id, .keep_alive_s = 0 }));
+        try c.writeAll(try packet.encodeConnect(&buf, .{ .client_id = client_id, .clean_session = clean, .keep_alive_s = 0 }));
     }
     fn sendSubscribe(c: *StressClient, pid: u16, filters: []const packet.Subscription) !void {
         var buf: [512]u8 = undefined;
@@ -2936,8 +3799,13 @@ fn stressWorker(ctl: *StressCtl, id: usize) void {
         // shut our socket on take-over or on a contained delivery failure) — we
         // just reconnect. The test's verdict is the global invariants, not any
         // single client's fate.
+        // Persistent sessions (spec 3.1.2.4) ride the same storm: the upper
+        // half of the workers resume a session on most reconnects and discard
+        // it with a clean CONNECT on every third — so take-overs, parks,
+        // resumes, discards and queueing all race the fan-out.
+        const clean = id < stress_workers / 2 or iter % 3 == 2;
         blk: {
-            c.sendConnect(client_id) catch break :blk;
+            c.sendConnectClean(client_id, clean) catch break :blk;
             if (!c.waitFor(ctl, .connack, 2000)) break :blk;
 
             switch (role) {
@@ -3140,7 +4008,18 @@ test "STRESS: multi-threaded fan-out / take-over / churn race pass over loopback
     try testing.expect(live_ok); // broker responsive + delivery correct after the storm
     try testing.expect(drained); // no zombie connection left (take-over reaped cleanly)
     try testing.expectEqual(@as(usize, 0), broker.connections.items.len);
-    try testing.expectEqual(@as(usize, 0), broker.subscriptionCount()); // no leak / no wrap-to-huge
+    // Every subscription left is a persistent session's, every session is
+    // offline, and each holds only the registry's reference — a leaked
+    // fan-out or connection reference would show up here, not as a leak.
+    var session_subs: usize = 0;
+    for (broker.sessions.items) |x| {
+        session_subs += x.subs.items.len;
+        try testing.expect(x.conn == null);
+        try testing.expectEqual(@as(u32, 1), x.refs.load(.acquire));
+        try testing.expect(x.inflight.items.len <= max_in_flight);
+    }
+    try testing.expect(broker.sessions.items.len > 0); // the persistent half ran
+    try testing.expectEqual(session_subs, broker.subscriptionCount()); // no leak / no wrap-to-huge
     try testing.expectEqual(@as(usize, 0), broker.retained.items.len);
     try testing.expectEqual(@as(usize, 0), ctl.torn_packets.load(.monotonic)); // never a corrupt packet
     try testing.expect(ctl.probe_stalls.load(.monotonic) == 0); // accept never stalled behind fan-out
