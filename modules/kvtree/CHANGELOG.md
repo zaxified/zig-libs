@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — **Commit path halved: builders borrow, pages zero by vector.**
+  A qap perf audit profiled a PUT through `Serial` + kvtree on tmpfs and found
+  67 % of the user-side cost in `applyRec` and 19 % in `compiler_rt.memset`:
+  `@memset(page, 0)` without libc stores one byte at a time (5 600
+  instructions per 4 KiB page), and every leaf or branch on the root→leaf path
+  was decoded with an arena `dupe` of each key, value and separator, then
+  re-encoded. Now `format.zeroPage` zeroes a page with 32-byte volatile
+  vector stores (unaligned form -- page buffers live on callers' stacks), the
+  builders borrow from the page and the change list (the one copy left is the
+  separator a split promotes to its parent), the branch rebuild reads the base
+  page in one pass, and a node that does not split takes no lists. Measured
+  end to end (qap `examples/kv-store`, 128 B PUTs, one worker, tmpfs, c=8,
+  two runs each): **94 100 → 47 100 user instructions per PUT**, kernel
+  150 k → 124 k, 13.5 k → 18.5 k req/s. Page images are byte-identical.
+  Contract change: a builder's inputs must outlive its `encode`; the split
+  test that reused one key buffer now allocates its keys.
+
 - **2026-09-21** — **`Db.getRef`: a point read that lends the value instead of
   copying it.** The result (`ValueRef`) points into the leaf page the store
   lends (`kv.Storage.preadRef`, i.e. a `pagecache` in front) and allocates

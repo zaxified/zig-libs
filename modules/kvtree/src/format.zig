@@ -54,6 +54,23 @@ const format_version: u32 = 2;
 /// arena — never owns).
 pub const Entry = struct { key: []const u8, val: []const u8 };
 
+/// Zero a whole page with 32-byte volatile vector stores.
+///
+/// Not `@memset`: without libc that lowers to `compiler_rt.memset`, which in
+/// Zig 0.16 stores ONE BYTE at a time -- measured at ~5 600 instructions per
+/// 4 KiB page in ReleaseFast, 19 % of the user-side cost of a `kvtree` commit
+/// (qap perf audit, 2026-09-21). The vector loop is ~170. Volatile so LLVM's
+/// loop-idiom pass cannot fold the loop back into that same `memset` call.
+pub fn zeroPage(page: *[page_size]u8) void {
+    const V = @Vector(32, u8);
+    comptime std.debug.assert(page_size % @sizeOf(V) == 0);
+    // Page buffers are plain `[page_size]u8` on callers' stacks: byte
+    // aligned, so the stores are the unaligned form (a `movdqu`, not a
+    // `movdqa` -- same cost on every x86 since Nehalem, and no trap).
+    const words: [*]align(1) volatile V = @ptrCast(page);
+    for (0..page_size / @sizeOf(V)) |k| words[k] = @splat(0);
+}
+
 // ── Meta page ────────────────────────────────────────────────────────────────
 
 /// The root-of-everything record. Two copies exist on disk (pages 0 and 1);
@@ -78,7 +95,7 @@ pub const Meta = struct {
     const crc_off = 44; // bytes [0..44) are covered by the CRC at [44..48)
 
     pub fn encode(self: Meta, page: *[page_size]u8) void {
-        @memset(page, 0);
+        zeroPage(page);
         @memcpy(page[0..4], meta_magic);
         std.mem.writeInt(u32, page[4..8], format_version, .little);
         std.mem.writeInt(u32, page[8..12], @intCast(page_size), .little);
@@ -346,6 +363,19 @@ fn binarySearch(comptime V: type, view: V, key: []const u8) Search {
 /// large values are a documented backlog item (see SPEC.md).
 pub const oversize_error = error.EntryTooLarge;
 
+/// Node builders BORROW every key, value and separator handed to them --
+/// from the page they were decoded from (`fromPage`), from the caller's
+/// change list (`put`), from a child's promoted separator (`insert`). Nothing
+/// is copied into the arena except what must outlive its source: the
+/// separator a `split` promotes to the parent, whose page frame is gone by
+/// the time the parent encodes. The arena pays for the entry lists only.
+///
+/// The contract that buys: whatever a builder was given stays alive and
+/// unchanged until the builder has been `encode`d (or `split` off it). The
+/// commit path honours it by construction -- a node's page buffer and the
+/// transaction's staging arena both outlive `finishNodes`. It used to copy
+/// everything, which made a leaf rewrite cost two arena allocations per entry
+/// on top of the page memset; that was the bulk of a commit's user-side cost.
 pub const LeafBuilder = struct {
     arena: Allocator,
     entries: std.ArrayList(Entry) = .empty,
@@ -358,16 +388,16 @@ pub const LeafBuilder = struct {
         self.entries.deinit(self.arena);
     }
 
+    /// Decode `page` into a builder whose entries point INTO `page`.
     pub fn fromPage(arena: Allocator, page: *const [page_size]u8) !LeafBuilder {
         var b = LeafBuilder.init(arena);
         const leaf = Leaf.init(page);
+        const n = leaf.count();
+        // One entry more than the page holds: the common case is one insert.
+        try b.entries.ensureTotalCapacityPrecise(arena, @as(usize, n) + 1);
         var i: usize = 0;
-        while (i < leaf.count()) : (i += 1) {
-            try b.entries.append(arena, .{
-                .key = try arena.dupe(u8, leaf.keyAt(i)),
-                .val = try arena.dupe(u8, leaf.valAt(i)),
-            });
-        }
+        while (i < n) : (i += 1)
+            b.entries.appendAssumeCapacity(.{ .key = leaf.keyAt(i), .val = leaf.valAt(i) });
         return b;
     }
 
@@ -382,7 +412,7 @@ pub const LeafBuilder = struct {
         if (leafCellBytes(key.len, val.len) + hdr_len + slot_len > page_size)
             return oversize_error;
         const s = self.search(key);
-        const e = Entry{ .key = try self.arena.dupe(u8, key), .val = try self.arena.dupe(u8, val) };
+        const e = Entry{ .key = key, .val = val };
         if (s.found) {
             self.entries.items[s.index] = e;
         } else {
@@ -433,14 +463,16 @@ pub const LeafBuilder = struct {
 
     /// Split an overflowing leaf into two, at the entry midpoint. Returns the
     /// right half plus the separator key (== the right half's first key). The
-    /// receiver becomes the left half. Both halves own copies in `arena`.
+    /// receiver becomes the left half. The separator is the one copy made:
+    /// it is promoted into a parent that outlives this leaf's page frame.
     pub fn split(self: *LeafBuilder) !SplitLeaf {
         const n = self.entries.items.len;
         std.debug.assert(n >= 2);
         const mid = n / 2;
         var right = LeafBuilder.init(self.arena);
+        try right.entries.ensureTotalCapacityPrecise(self.arena, n - mid);
         for (self.entries.items[mid..]) |e|
-            try right.entries.append(self.arena, e);
+            right.entries.appendAssumeCapacity(e);
         const sep = try self.arena.dupe(u8, self.entries.items[mid].key);
         self.entries.shrinkRetainingCapacity(mid);
         return .{ .right = right, .sep = sep };
@@ -465,16 +497,15 @@ pub const BranchBuilder = struct {
         self.cells.deinit(self.arena);
     }
 
+    /// Decode `page` into a builder whose separators point INTO `page`.
     pub fn fromPage(arena: Allocator, page: *const [page_size]u8) !BranchBuilder {
         const br = Branch.init(page);
         var b = BranchBuilder.init(arena, br.leftmost());
+        const n = br.count();
+        try b.cells.ensureTotalCapacityPrecise(arena, @as(usize, n) + 1);
         var i: usize = 0;
-        while (i < br.count()) : (i += 1) {
-            try b.cells.append(arena, .{
-                .sep = try arena.dupe(u8, br.keyAt(i)),
-                .child = br.rightChildAt(i),
-            });
-        }
+        while (i < n) : (i += 1)
+            b.cells.appendAssumeCapacity(.{ .sep = br.keyAt(i), .child = br.rightChildAt(i) });
         return b;
     }
 
@@ -487,7 +518,7 @@ pub const BranchBuilder = struct {
             const mid = lo + (hi - lo) / 2;
             if (std.mem.lessThan(u8, self.cells.items[mid].sep, sep)) lo = mid + 1 else hi = mid;
         }
-        try self.cells.insert(self.arena, lo, .{ .sep = try self.arena.dupe(u8, sep), .child = child });
+        try self.cells.insert(self.arena, lo, .{ .sep = sep, .child = child });
     }
 
     pub fn byteSize(self: *const BranchBuilder) usize {
@@ -514,10 +545,13 @@ pub const BranchBuilder = struct {
         const mid = n / 2;
         const promoted = self.cells.items[mid];
         var right = BranchBuilder.init(self.arena, promoted.child);
+        try right.cells.ensureTotalCapacityPrecise(self.arena, self.cells.items.len - mid);
         for (self.cells.items[mid + 1 ..]) |c|
-            try right.cells.append(self.arena, c);
+            right.cells.appendAssumeCapacity(c);
         self.cells.shrinkRetainingCapacity(mid);
-        return .{ .right = right, .sep = promoted.sep };
+        // The one copy: the separator leaves this node for its parent, and
+        // the page it points into does not live that long.
+        return .{ .right = right, .sep = try self.arena.dupe(u8, promoted.sep) };
     }
 };
 
@@ -533,7 +567,7 @@ fn branchCellBytes(klen: usize) usize {
 }
 
 fn writeHeader(page: *[page_size]u8, kind: NodeKind, count: u16, leftmost: PageId) void {
-    @memset(page, 0);
+    zeroPage(page);
     page[0] = @intFromEnum(kind);
     page[1] = 0;
     std.mem.writeInt(u16, page[2..4], count, .little);
@@ -624,6 +658,26 @@ test "leaf encode/decode round-trip + binary search (found + insertion point)" {
     try testing.expectEqual(@as(u16, 2), miss.index); // would insert before cherry
 }
 
+test "zeroPage clears every byte" {
+    var page: [page_size]u8 = undefined;
+    @memset(&page, 0xA5);
+    zeroPage(&page);
+    for (page) |b| try testing.expectEqual(@as(u8, 0), b);
+}
+
+test "builders borrow: the encoded page reads what the caller's buffers hold at encode time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var b = LeafBuilder.init(arena_state.allocator());
+    var key = "k".*;
+    var val = "v".*;
+    try b.put(&key, &val);
+    val[0] = 'w'; // still the caller's buffer: the builder holds no copy
+    var page: [page_size]u8 = undefined;
+    b.encode(&page);
+    try testing.expectEqualStrings("w", Leaf.init(&page).valAt(0));
+}
+
 test "leaf delete" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -646,8 +700,8 @@ test "leaf split halves entries and reports a correct separator" {
     @memset(&big, 'x');
     var i: usize = 0;
     while (!b.overflows()) : (i += 1) {
-        var kb: [8]u8 = undefined;
-        try b.put(try std.fmt.bufPrint(&kb, "k{d:0>5}", .{i}), &big);
+        // The builder borrows its keys, so each one needs its own bytes.
+        try b.put(try std.fmt.allocPrint(a, "k{d:0>5}", .{i}), &big);
     }
     const before = b.entries.items.len;
     const sp = try b.split();

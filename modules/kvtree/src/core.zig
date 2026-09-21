@@ -345,21 +345,27 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
             return finishNodes(format.LeafBuilder, ctx, b);
         },
         .branch => {
-            const b = format.BranchBuilder.fromPage(ctx.arena, &page) catch return error.OutOfMemory;
-            const ncells = b.cells.items.len;
+            // Read the base branch straight off its page -- one pass, no
+            // intermediate builder: every separator the new node keeps is
+            // borrowed from `page`, which outlives `finishNodes` below.
+            const b = format.Branch.init(&page);
+            const ncells: usize = b.count();
             // Rebuild the branch, routing each op run to its child: child i
             // covers [sep[i-1], sep[i]) with a key EQUAL to a separator going
             // right — the exact dual of the read path's childIndexFor.
-            var nb = format.BranchBuilder.init(ctx.arena, b.leftmost);
+            var nb = format.BranchBuilder.init(ctx.arena, b.leftmost());
+            // Every base cell plus one per op is the most a rebuild without
+            // splits can hold; a split past that grows the list normally.
+            nb.cells.ensureTotalCapacityPrecise(ctx.arena, ncells + ops.len) catch return error.OutOfMemory;
             var op_i: usize = 0;
             var ci: usize = 0;
             while (ci <= ncells) : (ci += 1) {
-                const child = if (ci == 0) b.leftmost else b.cells.items[ci - 1].child;
+                const child = b.childAtIndex(ci);
                 if (ci > 0)
-                    nb.cells.append(ctx.arena, .{ .sep = b.cells.items[ci - 1].sep, .child = child }) catch return error.OutOfMemory;
+                    nb.cells.append(ctx.arena, .{ .sep = b.keyAt(ci - 1), .child = child }) catch return error.OutOfMemory;
                 const start = op_i;
                 while (op_i < ops.len and
-                    (ci == ncells or std.mem.lessThan(u8, ops[op_i].key, b.cells.items[ci].sep)))
+                    (ci == ncells or std.mem.lessThan(u8, ops[op_i].key, b.keyAt(ci))))
                     op_i += 1;
                 if (op_i > start) {
                     const sub = try applyRec(ctx, child, ops[start..op_i]);
@@ -386,6 +392,16 @@ fn applyRec(ctx: *Ctx, id: PageId, ops: []const Op) CommitError![]Piece {
 /// to a freshly-allocated page. Works for leaves and branches (both split
 /// types expose `{ right, sep }`).
 fn finishNodes(comptime B: type, ctx: *Ctx, first: B) CommitError![]Piece {
+    if (!first.overflows()) {
+        // The common case -- one node in, one page out -- takes no lists.
+        const pieces = ctx.arena.alloc(Piece, 1) catch return error.OutOfMemory;
+        var buf: [page_size]u8 = undefined;
+        const pid = ctx.allocPage();
+        first.encode(&buf);
+        ctx.pager.writePage(pid, &buf) catch return error.CommitFailed;
+        pieces[0] = .{ .sep = "", .id = pid };
+        return pieces;
+    }
     var builders: std.ArrayList(B) = .empty;
     var seps: std.ArrayList([]const u8) = .empty;
     builders.append(ctx.arena, first) catch return error.OutOfMemory;

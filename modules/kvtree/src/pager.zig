@@ -235,7 +235,7 @@ pub const Freelist = struct {
 
     fn encodeChunk(ids: []const PageId, txns: []const u64, next: PageId, page: *[page_size]u8) void {
         std.debug.assert(ids.len <= capacity);
-        @memset(page, 0);
+        format.zeroPage(page);
         std.mem.writeInt(u16, page[0..2], @intCast(ids.len), .little);
         std.mem.writeInt(u32, page[2..6], next, .little);
         for (ids, txns, 0..) |id, txn, k| {
