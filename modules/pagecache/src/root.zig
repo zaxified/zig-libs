@@ -1383,3 +1383,51 @@ test "F5: vClose forgets only the closing handle's pages, not every open file's 
     try testing.expectEqual(hits_before + 1, pc.hits); // served from RAM
     try testing.expectEqualSlices(u8, page, &buf);
 }
+
+test "W3: kvtree getRef lends the value in place -- same bytes as get, held stable across an overwrite" {
+    const gpa = testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var pc = PageCache.init(gpa, sim.storage(), .{ .max_pages = 64 });
+    defer pc.deinit();
+    var db = try kvtree.Db.open(gpa, pc.storage(), "t.kvt", .{});
+    defer db.close();
+
+    // Enough keys for a tree with branches, so the descent is not one leaf.
+    var kbuf: [32]u8 = undefined;
+    var vbuf: [48]u8 = undefined;
+    var id: u64 = 0;
+    while (id < 400) : (id += 1) {
+        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const val = try std.fmt.bufPrint(&vbuf, "value-{d}-{d}", .{ id, id * 7 });
+        try db.put(key, val);
+    }
+
+    const hits_before = pc.stats().ref_hits;
+    id = 0;
+    while (id < 400) : (id += 13) {
+        const key = try std.fmt.bufPrint(&kbuf, "key{d:0>5}", .{id});
+        const copied = (try db.get(gpa, key)).?;
+        defer gpa.free(copied);
+        var lent = (try db.getRef(key)).?;
+        defer lent.release();
+        try testing.expectEqualSlices(u8, copied, lent.bytes);
+    }
+    try testing.expect(pc.stats().ref_hits > hits_before);
+    try testing.expectEqual(@as(?kvtree.ValueRef, null), try db.getRef("no-such-key"));
+
+    // Held across a commit that rewrites the key: the borrower keeps the
+    // bytes it was lent; a fresh read sees the new value.
+    var held = (try db.getRef("key00013")).?;
+    try testing.expectEqualStrings("value-13-91", held.bytes);
+    try db.put("key00013", "rewritten");
+    try testing.expectEqualStrings("value-13-91", held.bytes);
+    held.release();
+    var fresh = (try db.getRef("key00013")).?;
+    try testing.expectEqualStrings("rewritten", fresh.bytes);
+    fresh.release();
+
+    // Every borrow was handed back.
+    try testing.expectEqual(@as(usize, 0), pc.stats().borrowed_pages);
+}

@@ -83,6 +83,20 @@ pub const OpenError = kv.Storage.Error || core.RecoverError || error{
     Locked,
 };
 pub const GetError = kv.Storage.Error || error{ Corrupt, OutOfMemory };
+pub const GetRefError = kv.Storage.Error || error{ Corrupt, CannotLend };
+
+/// A value borrowed from a leaf page -- see `Db.getRef`. `bytes` is valid
+/// until `release`, and exactly one `release` is owed.
+pub const ValueRef = struct {
+    bytes: []const u8,
+    pager: *Pager,
+    ref: kv.Storage.Ref,
+
+    pub fn release(self: *ValueRef) void {
+        self.pager.releasePageRef(self.ref);
+        self.* = undefined;
+    }
+};
 pub const CommitError = core.CommitError;
 
 /// A borrowed key/value pair yielded by a `Cursor`. The slices point into the
@@ -258,6 +272,48 @@ pub const Db = struct {
     /// Look up `key` in the newest committed version. Caller frees the result.
     pub fn get(self: *Db, gpa: Allocator, key: []const u8) GetError!?[]u8 {
         return lookup(&self.pager, self.meta_rec.root, gpa, key);
+    }
+
+    /// Look up `key` in the newest committed version **without copying the
+    /// value**: the result points into the leaf page the store lends
+    /// (`kv.Storage.preadRef` -- in practice a `pagecache` in front of the
+    /// backend). Nothing is allocated. Hand it back with `ValueRef.release`.
+    ///
+    /// The bytes are the value as of this call, and they stay those bytes
+    /// until released -- a commit that rewrites the key, or recycles the
+    /// page, does not reach them: a lending store parks a borrowed page's old
+    /// bytes for the borrower (pagecache F3). Hold it briefly all the same: a
+    /// borrowed page cannot be evicted.
+    ///
+    /// `error.CannotLend` from a store that holds no bytes to lend. There is
+    /// deliberately no silent fall-back to `get`: the caller chose this call
+    /// to avoid the copy and the allocation, and a fall-back would make
+    /// "did it?" unanswerable -- the same rule `preadRef` itself keeps.
+    pub fn getRef(self: *Db, key: []const u8) GetRefError!?ValueRef {
+        if (!self.pager.store.canLend()) return error.CannotLend;
+        var id = self.meta_rec.root;
+        while (true) {
+            const ref = (try self.pager.readPageRef(id)) orelse return error.CannotLend;
+            const bytes: *const [page_size]u8 = ref.bytes[0..page_size];
+            switch (format.kindOf(bytes) orelse {
+                self.pager.releasePageRef(ref);
+                return error.Corrupt;
+            }) {
+                .branch => {
+                    id = format.Branch.init(bytes).childFor(key);
+                    self.pager.releasePageRef(ref);
+                },
+                .leaf => {
+                    const leaf = format.Leaf.init(bytes);
+                    const found = leaf.search(key);
+                    if (!found.found) {
+                        self.pager.releasePageRef(ref);
+                        return null;
+                    }
+                    return .{ .bytes = leaf.valAt(found.index), .pager = &self.pager, .ref = ref };
+                },
+            }
+        }
     }
 
     /// A cursor over the newest committed version (ordered iteration / scan).
@@ -1174,4 +1230,19 @@ test "a Db poisoned by CommitFailed refuses begin/put/del until closed and reope
     const d2 = try db2.get(testing.allocator, "d");
     defer if (d2) |g| testing.allocator.free(g);
     try testing.expectEqualStrings("4", d2.?);
+}
+
+test "getRef on a store that cannot lend is CannotLend, never a silent copy" {
+    const gpa = std.testing.allocator;
+    var sim = kv.SimStorage.init(gpa);
+    defer sim.deinit();
+    sim.allow_overwrite = true;
+    var db = try Db.open(gpa, sim.storage(), "t.kvt", .{});
+    defer db.close();
+    try db.put("k", "v");
+    try std.testing.expectError(error.CannotLend, db.getRef("k"));
+    // The copying read still answers: the refusal is about lending only.
+    const v = (try db.get(gpa, "k")).?;
+    defer gpa.free(v);
+    try std.testing.expectEqualStrings("v", v);
 }

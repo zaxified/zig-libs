@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-21** — **`Db.getRef`: a point read that lends the value instead of
+  copying it.** The result (`ValueRef`) points into the leaf page the store
+  lends (`kv.Storage.preadRef`, i.e. a `pagecache` in front) and allocates
+  nothing; `release` hands the page back. Held across a commit that rewrites
+  the key, it keeps the bytes it was lent (pagecache parks them). A store that
+  cannot lend answers `error.CannotLend` -- never a silent copy, the rule
+  `preadRef` keeps. For a server whose read path must not allocate (qap's
+  `Dataset.lookup`). Tests here (CannotLend) and in pagecache (same bytes as
+  `get` over 400 keys, stable across an overwrite, every borrow returned; red
+  when `release` does not release).
+
 - **2026-09-10** — A1 audit fix campaign, six findings (one HIGH, one MED, four
   LOW/LOW-MED) closed with RED→GREEN tests; module lane `52/52`.
 
