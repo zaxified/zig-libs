@@ -231,10 +231,9 @@ stress pass runs its upper half of workers on persistent sessions — resuming o
 discarding with a clean CONNECT on every third — and asserts after the storm that every
 remaining subscription is a session's, every session is offline and holds exactly the registry's
 reference. Run 10× ReleaseSafe and 20× ReleaseFast clean; with `ownsRouting` removed it failed 5
-of 5. ⚠ The valgrind pass below predates sessions. Run over the Debug build with sessions in the
-storm, valgrind stopped intermittently (1 run in 2–12) with a SIGSEGV in `fanout`, reading a
-session pointer from the index that was never a heap address. Open, not investigated: Debug is
-not a verification mode here, the release builds never failed, and valgrind was not run over them.
+of 5. ⚠ The valgrind pass below predates sessions and has not been repeated for them. (A run over
+the Debug build was made and is not evidence either way — CONVENTIONS §7.1: nothing measured under
+valgrind may be a Debug build.)
 
 Race-detection method: Zig **0.16.0's `-fsanitize-thread` is a no-op** here — it compiles and links but
 emits **zero `__tsan_*` instrumentation** and fails to flag a deliberate data race — so, per the SPEC's
