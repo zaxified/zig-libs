@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — `Generator.buildRoutes` / `writeRoutes`: the same document from a plain
+  `[]const router.Route` instead of a `*const router.Router`, for a server whose table is a comptime
+  `router.Static` or its own. `build`/`write` now delegate to them; their output is unchanged.
 - **2026-09-11** — **BEHAVIOURAL + API change (user-approved, Q1/Q7/Q8/Q9 — `QUESTIONS-ROUND-2.md`),
   `example-apps/http-service` checked by hand, no change needed** — A1/openapi.md F4, F5, F9, F10,
   F11, F13 closed (F12 closed as a strict subset of F9).

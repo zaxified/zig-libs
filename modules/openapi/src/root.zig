@@ -143,9 +143,17 @@ pub const Generator = struct {
     /// fix already caches the build outcome (success or failure) after the
     /// first call.
     pub fn build(gpa: Allocator, r: *const router.Router, info: Info) BuildError![]u8 {
+        return buildRoutes(gpa, r.routes(), info);
+    }
+
+    /// `build` over a plain route slice -- for a server whose route table is
+    /// not a `router.Router` (a comptime `router.Static` table, or its own),
+    /// which describes its routes as `router.Route` values: method, full
+    /// pattern in `Router.add` syntax, optional `RouteDoc`.
+    pub fn buildRoutes(gpa: Allocator, routes: []const router.Route, info: Info) BuildError![]u8 {
         var out: Writer.Allocating = .init(gpa);
         defer out.deinit();
-        write(gpa, r, info, &out.writer) catch |err| switch (err) {
+        writeRoutes(gpa, routes, info, &out.writer) catch |err| switch (err) {
             // The allocating writer fails only on allocation failure.
             error.WriteFailed => return error.OutOfMemory,
             else => |e| return e,
@@ -162,6 +170,11 @@ pub const Generator = struct {
     /// conversion + request-schema validation) — everything is freed
     /// before returning.
     pub fn write(gpa: Allocator, r: *const router.Router, info: Info, w: *Writer) (BuildError || Writer.Error)!void {
+        return writeRoutes(gpa, r.routes(), info, w);
+    }
+
+    /// `write` over a plain route slice; see `buildRoutes`.
+    pub fn writeRoutes(gpa: Allocator, routes: []const router.Route, info: Info, w: *Writer) (BuildError || Writer.Error)!void {
         var arena_state = std.heap.ArenaAllocator.init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -184,11 +197,11 @@ pub const Generator = struct {
         // IS included, and it never appears in the document at all.
         const rs: []const router.Route = if (info.include) |shouldInclude| blk: {
             var kept: std.ArrayList(router.Route) = .empty;
-            for (r.routes()) |rt| {
+            for (routes) |rt| {
                 if (shouldInclude(rt)) try kept.append(arena, rt);
             }
             break :blk kept.items;
-        } else r.routes();
+        } else routes;
         for (rs) |rt| {
             try checkUtf8(rt.pattern); // covers the converted path too --
             // `convertPattern` only rewrites `:`/`*`/`{`/`}`, all ASCII
@@ -981,6 +994,31 @@ test "generate: golden OpenAPI 3.1 document for a known route set" {
     // conformance-checker section above) — also run the real structural
     // checker against it.
     try validateOpenApi31(parsed.value);
+}
+
+test "generate: buildRoutes over a plain slice equals build over the Router with the same routes" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    const user_doc: router.RouteDoc = .{
+        .summary = "Fetch a user",
+        .tags = &.{"users"},
+        .responses = &.{.{ .status = 200, .description = "The user" }},
+    };
+    try r.get("/health", hOk);
+    try r.addDoc(.get, "/users/:id", hOk, user_doc);
+    try r.get("/static/*path", hOk);
+
+    const plain = [_]router.Route{
+        .{ .method = .get, .pattern = "/health" },
+        .{ .method = .get, .pattern = "/users/:id", .doc = &user_doc },
+        .{ .method = .get, .pattern = "/static/*path" },
+    };
+    const info: Info = .{ .title = "T", .version = "1" };
+    const from_router = try Generator.build(testing.allocator, &r, info);
+    defer testing.allocator.free(from_router);
+    const from_slice = try Generator.buildRoutes(testing.allocator, &plain, info);
+    defer testing.allocator.free(from_slice);
+    try testing.expectEqualStrings(from_router, from_slice);
 }
 
 test "generate: empty router → valid empty-paths document, no panic" {

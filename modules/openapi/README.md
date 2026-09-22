@@ -60,6 +60,13 @@ try r.addDoc(.post, "/users", createUser, .{
 // Or generate without serving (CI artifact, file on disk, ...):
 const json = try openapi.Generator.build(gpa, &r, .{ .title = "My API", .version = "1.0.0" });
 defer gpa.free(json);
+
+// Without a Router at all -- a comptime `router.Static` table, or your own --
+// describe the routes as `router.Route` values; same document, same checks:
+const json2 = try openapi.Generator.buildRoutes(gpa, &.{
+    .{ .method = .get, .pattern = "/users/:id", .doc = &user_doc },
+}, .{ .title = "My API", .version = "1.0.0" });
+defer gpa.free(json2);
 ```
 
 ## Emitted document (documented choices)
