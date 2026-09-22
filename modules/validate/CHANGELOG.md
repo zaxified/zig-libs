@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **FIX (memory safety): `parseInto`/`parseIntoLimited` freed
+  the validation arena twice when the decode into `T` ran out of memory.** On the
+  success path the error builder is aborted before `std.json.parseFromValue`
+  runs, but its `errdefer b.abort()` was still armed, so an `OutOfMemory` from the
+  decode deinitialized the same arena again — a double free on a heap allocator
+  (heap corruption in ReleaseFast), an assertion on a `FixedBufferAllocator`.
+  Reachable by any caller whose allocator can fail (a bounded arena, a request
+  budget). Found by a sizing probe on a `FixedBufferAllocator`. New test sweeps
+  every allocation failure point of `parseIntoLimited`, `validateJsonLimited` and
+  `validateQuery` with `checkAllAllocationFailures` (no leak, no double free);
+  red on the old code.
+
 - **2026-09-22** — **Errors as RFC 9457 problem details, and `validateParams`
   over any lookup.** New `Report.writeProblem(w, http.problem.Problem)` and the
   standalone `writeErrorsProblem(errors, problem, w)`: an

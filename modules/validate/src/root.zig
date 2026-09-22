@@ -1399,16 +1399,23 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     };
     defer parsed.deinit();
 
-    var b = Builder.init(gpa);
-    errdefer b.abort();
-    try checkValue(&b, "", parsed.value, schema);
-    if (@hasDecl(T, "validate_rules")) {
-        const first_pass_len = b.list.items.len;
-        try checkValue(&b, "", parsed.value, T.validate_rules);
-        b.dedupeFrom(first_pass_len);
+    // Scoped so the builder's `errdefer` ends with it: on the success path
+    // the builder is aborted here, and an `errdefer` still armed below would
+    // free its arena a SECOND time when the decode that follows runs out of
+    // memory -- a double free, found by a sizing probe on a
+    // FixedBufferAllocator (2026-09-22), whose `free` asserts ownership.
+    {
+        var b = Builder.init(gpa);
+        errdefer b.abort();
+        try checkValue(&b, "", parsed.value, schema);
+        if (@hasDecl(T, "validate_rules")) {
+            const first_pass_len = b.list.items.len;
+            try checkValue(&b, "", parsed.value, T.validate_rules);
+            b.dedupeFrom(first_pass_len);
+        }
+        if (b.list.items.len != 0) return .{ .invalid = b.finish() };
+        b.abort();
     }
-    if (b.list.items.len != 0) return .{ .invalid = b.finish() };
-    b.abort();
 
     const typed = std.json.parseFromValue(T, gpa, parsed.value, .{
         .ignore_unknown_fields = true,
@@ -2578,6 +2585,53 @@ test "params: validateParams over a lookup that is not router.Params" {
         try expectError(&r, "id", "int_parsing");
         try expectError(&r, "absent", "missing");
     }
+}
+
+test "every allocation failure point: no leak, no double free" {
+    // `checkAllAllocationFailures` fails each allocation in turn; the testing
+    // allocator reports a leak or a double free on any of those paths.
+    const T = struct {
+        name: []const u8,
+        age: u8,
+        tags: []const []const u8 = &.{},
+        pub const validate_rules: []const Rule = &.{.{ .field = "name", .kind = .string, .min_len = 2 }};
+    };
+    const bodies = [_][]const u8{
+        \\{"name":"Ada","age":36,"tags":["a","b"]}
+        , // valid: fails inside the decode after validation passed
+        \\{"name":"A","age":"x","tags":[1]}
+        , // invalid: fails while aggregating errors
+        \\{"name":
+        , // malformed
+    };
+    const schema = [_]Rule{
+        .{ .field = "name", .kind = .string, .required = true, .min_len = 2 },
+        .{ .field = "age", .kind = .int, .min = 0 },
+        .{ .field = "tags", .kind = .array, .max_len = 4 },
+    };
+    const S = struct {
+        fn parse(gpa: Allocator, body: []const u8) !void {
+            var r = try parseIntoLimited(T, gpa, body, .{});
+            r.deinit();
+        }
+        fn json(gpa: Allocator, body: []const u8, rules: []const Rule) !void {
+            var r = try validateJsonLimited(gpa, body, rules, .{});
+            r.deinit();
+        }
+        fn query(gpa: Allocator, q: []const u8, rules: []const Rule) !void {
+            var r = try validateQuery(gpa, q, rules);
+            r.deinit();
+        }
+    };
+    for (bodies) |body| {
+        try testing.checkAllAllocationFailures(testing.allocator, S.parse, .{body});
+        try testing.checkAllAllocationFailures(testing.allocator, S.json, .{ body, @as([]const Rule, &schema) });
+    }
+    const qschema = [_]Rule{
+        .{ .field = "name", .kind = .string, .required = true, .min_len = 2 },
+        .{ .field = "age", .kind = .int },
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, S.query, .{ "name=a%20b&age=x", @as([]const Rule, &qschema) });
 }
 
 test "writeProblem: RFC 9457 body carrying the aggregated errors" {
