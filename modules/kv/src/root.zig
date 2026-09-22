@@ -147,7 +147,23 @@ pub const Storage = struct {
     /// Backend-scoped open-file token (an index, not an OS fd).
     pub const Handle = u32;
 
-    pub const OpenMode = enum { open_or_create, create_truncate };
+    /// How `open` treats the path.
+    ///
+    ///   * `open_or_create` — read-write; creates an empty file if absent.
+    ///   * `create_truncate` — read-write; creates, or empties an existing file.
+    ///   * `read_only` — the file must already exist (`error.FileNotFound`
+    ///     otherwise) and is never created, emptied or written. `writeAll` and
+    ///     `truncate` on such a handle fail with `error.AccessDenied` — every
+    ///     backend refuses them itself, so the answer does not depend on which
+    ///     errno the OS picks for a write to an `O_RDONLY` descriptor. For a
+    ///     reader that must not disturb a directory it does not own: another
+    ///     process's live store, a backup, a read-only mount.
+    ///
+    /// ⚠ Implementers: switch on the mode exhaustively. A test such as
+    /// `mode == .create_truncate` silently treats every other mode — this one
+    /// included — as `open_or_create`, i.e. creates the file a reader expected
+    /// to find.
+    pub const OpenMode = enum { open_or_create, create_truncate, read_only };
 
     /// A **borrowed** run of bytes owned by the backend — the zero-copy read
     /// path (`preadRef`). `bytes` stays valid, and stays the bytes that were
@@ -405,6 +421,9 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
         io: std.Io,
         dir: std.Io.Dir,
         files: [max_handles]?std.Io.File = @splat(null),
+        /// Opened `.read_only`: writes and truncation are refused here, not
+        /// left to the OS's choice of errno.
+        read_only: [max_handles]bool = @splat(false),
 
         /// How many files this backend can hold open at once. Exceeding it is
         /// `error.HandleTableFull`, never `error.Unexpected`.
@@ -458,11 +477,15 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             const slot: usize = for (self.files, 0..) |f, i| {
                 if (f == null) break i;
             } else return error.HandleTableFull;
-            const file = self.dir.createFile(self.io, path, .{
-                .read = true,
-                .truncate = mode == .create_truncate,
-            }) catch |e| return mapErr(e);
+            const file = switch (mode) {
+                .open_or_create, .create_truncate => self.dir.createFile(self.io, path, .{
+                    .read = true,
+                    .truncate = mode == .create_truncate,
+                }),
+                .read_only => self.dir.openFile(self.io, path, .{ .mode = .read_only }),
+            } catch |e| return mapErr(e);
             self.files[slot] = file;
+            self.read_only[slot] = mode == .read_only;
             return @intCast(slot);
         }
 
@@ -482,6 +505,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
 
         fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
             const self = cast(ctx);
+            if (self.read_only[h]) return error.AccessDenied;
             self.fileOf(h).writePositionalAll(self.io, bytes, off) catch |e| return mapErr(e);
         }
 
@@ -492,6 +516,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
 
         fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
             const self = cast(ctx);
+            if (self.read_only[h]) return error.AccessDenied;
             self.fileOf(h).setLength(self.io, len) catch |e| return mapErr(e);
         }
 
@@ -1649,6 +1674,41 @@ test "Storage.VTable.consistent: catches a backend that sets preadRef without re
     var bad = base;
     bad.preadRef = Stub.preadRef;
     try testing.expect(!bad.consistent());
+}
+
+test "real filesystem: read_only neither creates, empties nor writes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    const st = fs_store.storage();
+
+    // Absent: reported, and still absent afterwards — not created.
+    try testing.expectError(error.FileNotFound, st.open("missing", .read_only));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "missing", .{}));
+
+    const w = try st.open("f", .create_truncate);
+    try st.writeAll(w, "data", 0);
+    try st.sync(w);
+
+    const r = try st.open("f", .read_only);
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("data", buf[0..try st.pread(r, &buf, 0)]);
+    try testing.expectError(error.AccessDenied, st.writeAll(r, "XXXX", 0));
+    try testing.expectError(error.AccessDenied, st.writeAll(r, "tail", 4));
+    try testing.expectError(error.AccessDenied, st.truncate(r, 0));
+    try testing.expectEqual(@as(u64, 4), try st.size(r));
+
+    // The reader follows what the writer appends through its own handle.
+    try st.writeAll(w, "more", 4);
+    try testing.expectEqualStrings("datamore", buf[0..try st.pread(r, &buf, 0)]);
+    defer st.close(w);
+
+    // The slot a read-only handle leaves behind carries no read-only flag.
+    st.close(r);
+    const again = try st.open("g", .open_or_create);
+    defer st.close(again);
+    try testing.expectEqual(r, again);
+    try st.writeAll(again, "ok", 0);
 }
 
 test "real filesystem: torn tail on disk is recovered" {

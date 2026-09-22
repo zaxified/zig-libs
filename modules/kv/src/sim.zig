@@ -98,6 +98,9 @@ pub const SimStorage = struct {
     /// inode held open).
     all_files: std.ArrayListUnmanaged(*SimFile) = .empty,
     handles: std.ArrayListUnmanaged(?*SimFile) = .empty,
+    /// Parallel to `handles`: opened `.read_only`, so writes and truncation
+    /// are refused with `error.AccessDenied`.
+    handle_read_only: std.ArrayListUnmanaged(bool) = .empty,
     crash_mode: CrashMode = .lose_unsynced,
     /// When non-null: the side effect after this many more side effects
     /// crashes (0 = the very next one). Null = never crash.
@@ -204,6 +207,7 @@ pub const SimStorage = struct {
         }
         self.all_files.deinit(self.gpa);
         self.handles.deinit(self.gpa);
+        self.handle_read_only.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -446,27 +450,38 @@ pub const SimStorage = struct {
         if (self.inject()) return error.Crashed;
         const f: *SimFile = blk: {
             if (self.names.get(path)) |existing| {
-                if (mode == .create_truncate) {
-                    // Model O_TRUNC as immediately effective (see module doc).
-                    existing.content.clearRetainingCapacity();
-                    existing.durable_len = 0;
-                    self.clearUnsynced(existing);
+                switch (mode) {
+                    .open_or_create, .read_only => {},
+                    .create_truncate => {
+                        // Model O_TRUNC as immediately effective (see module doc).
+                        existing.content.clearRetainingCapacity();
+                        existing.durable_len = 0;
+                        self.clearUnsynced(existing);
+                    },
                 }
                 break :blk existing;
+            }
+            switch (mode) {
+                .open_or_create, .create_truncate => {},
+                .read_only => return error.FileNotFound,
             }
             const f = self.newFile() catch return error.OutOfMemory;
             // A newly created name is volatile until syncDir.
             putName(self.gpa, &self.names, path, f) catch return error.OutOfMemory;
             break :blk f;
         };
+        const ro = mode == .read_only;
         // Reuse a free slot or append.
         for (self.handles.items, 0..) |slot, i| {
             if (slot == null) {
                 self.handles.items[i] = f;
+                self.handle_read_only.items[i] = ro;
                 return @intCast(i);
             }
         }
+        self.handle_read_only.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
         self.handles.append(self.gpa, f) catch return error.OutOfMemory;
+        self.handle_read_only.appendAssumeCapacity(ro);
         return @intCast(self.handles.items.len - 1);
     }
 
@@ -494,6 +509,8 @@ pub const SimStorage = struct {
     fn vWriteAll(ctx: *anyopaque, h: Storage.Handle, bytes: []const u8, off: u64) Storage.Error!void {
         const self = cast(ctx);
         if (self.crashed) return error.Crashed;
+        // Refused before it can count as an operation: it never reaches media.
+        if (self.handle_read_only.items[h]) return error.AccessDenied;
         const f = self.fileOf(h);
         // The kv store never overwrites already-durable bytes (append-only +
         // truncate-first discipline) — a violation is a store bug. Consumers
@@ -566,6 +583,7 @@ pub const SimStorage = struct {
     fn vTruncate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!void {
         const self = cast(ctx);
         if (self.crashed) return error.Crashed;
+        if (self.handle_read_only.items[h]) return error.AccessDenied;
         if (self.inject()) return error.Crashed;
         const f = self.fileOf(h);
         std.debug.assert(len <= f.content.items.len);
@@ -875,6 +893,34 @@ test "sim: created file name vanishes on crash without syncDir" {
     try testing.expectError(error.Crashed, st.sync(h));
     sim.reboot();
     try testing.expect(sim.fileContent("new") == null);
+}
+
+test "sim: read_only neither creates, empties nor writes" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+
+    try testing.expectError(error.FileNotFound, st.open("missing", .read_only));
+    try testing.expect(sim.fileContent("missing") == null);
+
+    const w = try st.open("f", .create_truncate);
+    try st.writeAll(w, "data", 0);
+    try st.sync(w);
+
+    const r = try st.open("f", .read_only);
+    try testing.expectEqualStrings("data", sim.fileContent("f").?);
+    // A refused write is not an operation: an armed crash does not fire on it.
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.AccessDenied, st.writeAll(r, "XXXX", 0));
+    try testing.expectError(error.AccessDenied, st.truncate(r, 0));
+    sim.ops_until_crash = null;
+    try testing.expectEqualStrings("data", sim.fileContent("f").?);
+
+    // The slot a read-only handle leaves behind carries no read-only flag.
+    st.close(r);
+    const again = try st.open("g", .open_or_create);
+    try testing.expectEqual(r, again);
+    try st.writeAll(again, "ok", 0);
 }
 
 test "sim: the exclusive lock contends between handles and is released by close" {

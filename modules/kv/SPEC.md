@@ -65,6 +65,15 @@ torn/partial writes, short reads, garbage tails, and crash points ×4 modes (inc
 out-of-order durability, see below) over chained epochs; min-fault-count asserts + the sabotage
 self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`.
 
+- **`OpenMode.read_only`** (2026-09-22): open an existing file without creating, emptying or
+  writing it — for a reader of a store another process owns (first user: `seglog`'s read-only
+  open). Absent → `error.FileNotFound`, nothing created. `writeAll`/`truncate` on such a handle →
+  `error.AccessDenied`, refused by `FsStorage` and `SimStorage` themselves (not left to the errno
+  Linux picks for a write to `O_RDONLY`, which differs between `pwrite` and `ftruncate`); in
+  `SimStorage` the refusal is not an operation, so an armed crash does not fire on it. Wrappers
+  (`vopr`, `pagecache`, the test doubles in `kvtree`/`shardstore`/`tsdb`) pass the mode through.
+  Tests: one per backend, each RED against its mutant (read-only open that creates; truncate that
+  is not refused).
 - **Cross-process lock — modeled, not just implemented** (2026-08-06): `tryLockExclusive` is a
   `Storage` vtable op and an injection point, so the fixed sweep crashes on the acquisition like
   any other side effect (57 points × 3 modes). `SimStorage` models a lock as belonging to an open
