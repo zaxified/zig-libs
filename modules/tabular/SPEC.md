@@ -49,6 +49,18 @@ strict-ordering guard for `rolling`/`outlierFlag` (they still assume the caller 
 unchanged from the module README's threat-model note) — deferred as a v-next hardening pass, not
 required for the join/reshape/pagination gaps closed here.
 
+Consumer gaps (found 2026-09-22 in wgs, which works around both in-tree):
+- **`map` ops beyond `BinOp {add, sub, mul, div}`**: unary `abs`, `sqrt` and binary `min`/`max`
+  over the same column-or-literal operands. wgs dispatches them before `tabular.map`
+  (`wgs/src/pipeline.zig`, `applyMapExt`); each replaced SQL or frontend arithmetic in a config
+  (`sqrt`: the ulcer index arrived as a mean square because the bundled SQLite has no `SQRT()`).
+  Wanted: the ops in `MapSpec` itself (unary ops ignoring `rhs`, or a separate unary spec).
+- **Exact grouped sum over `.decimal` columns.** `aggregate` accumulates through `Value.asFloat`
+  (`transforms.zig`, `self.sum += v.asFloat()`), so a ledger total drifts. wgs carries its own
+  `aggregate_exact` (i128 addition, nulls skipped, first-seen group order, saturating) in
+  `wgs/src/decimalx.zig`. Wanted: `aggregate` summing `.decimal` cells exactly when the column is
+  decimal (or an explicit exact mode), keeping f64 for statistics.
+
 ## Status
 `extract · any · util · reentrant` + deps: `dataset` — canonical source is `pub const meta` in
 src/root.zig.
