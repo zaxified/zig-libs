@@ -1,28 +1,29 @@
 # zstd
 
-**Zstandard (RFC 8878) compressor** for levels 1–8 and the negative ("fast")
+**Zstandard (RFC 8878) compressor** for levels 1–10 and the negative ("fast")
 levels, emitting **exactly the bytes libzstd 1.5.7 emits** for the same input
 and level. Decoding is not here: `std.compress.zstd.Decompress` already does
 it. This module is the half std lacks.
 
-It is a port of libzstd's `fast`, `dfast`, `greedy`, `lazy` and `lazy2` match
-finders (the latter three with both the hash-chain and the row-based search),
+It is a port of libzstd's `fast`, `dfast`, `greedy`, `lazy`, `lazy2` and
+`btlazy2` match finders (`greedy`..`lazy2` with both the hash-chain and the
+row-based search, `btlazy2` with its lazily sorted binary tree),
 one-shot frame and block driver, block pre-splitter, and Huffman/FSE entropy
 encoders. Pure Zig,
 no C, no libc.
 
-- **Levels:** 1–8 (0 means the default, 3), and negative levels down to
-  -131072 (lower values are clamped, as libzstd does). **9 and up are refused**
-  with `error.LevelUnsupported`: for some input sizes they select the
-  binary-tree match finders (`btlazy2`, `btopt`, ...), which are not ported.
+- **Levels:** 1–10 (0 means the default, 3), and negative levels down to
+  -131072 (lower values are clamped, as libzstd does). **11 and up are
+  refused** with `error.LevelUnsupported`: for some input sizes they select
+  the optimal parsers (`btopt`, `btultra`, ...), which are not ported yet.
   There is no silent downgrade.
 - **Output:** one frame, content size in the header, optional content checksum
   (`checksum = true`). Byte-identical to `ZSTD_compress2()` with the same
-  level and checksum setting — pinned by the golden test on a 40-case corpus at
-  ten levels, both checksum settings (800 frames).
+  level and checksum setting — pinned by the golden test on a 56-case corpus at
+  twelve levels, both checksum settings (1344 frames).
 - **Speed:** about 1.2–1.5× libzstd's time on the same input (process wall
   time, ReleaseFast, 4–13 MB inputs; see SPEC.md). Memory: the match tables for
-  the chosen level (at most 4 MiB + 1 MiB, at levels 7–8 on inputs over
+  the chosen level (at most 16 MiB + 4 MiB, at level 10 on inputs over
   256 KB) plus about 0.5 MiB of block buffers, allocated per call and freed
   before it returns.
 - **Platform:** any (no OS calls). **Role:** codec. **Concurrency:** reentrant.
@@ -53,7 +54,7 @@ var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
 `gpa` backs only the per-call match tables and block buffers; everything is
 freed before `compress` returns.
 
-Errors: `LevelUnsupported` (level > 8), `NoSpaceLeft` (`dst` below
+Errors: `LevelUnsupported` (level > 10), `NoSpaceLeft` (`dst` below
 `compressBound`), `InputTooLarge` (over `max_input_size`, 3500 MiB — libzstd
 would start rescaling its indices there, which is not ported), `OutOfMemory`.
 
@@ -61,7 +62,7 @@ would start rescaling its indices there, which is not ported), `OutOfMemory`.
 
 `zig build test-zstd` (all three release lanes). The load-bearing one is
 `src/golden_test.zig`: every corpus input (`src/testdata/corpus.zig`,
-generated, so the repository stores none) is compressed at levels -5, -1 and 1–8
+generated, so the repository stores none) is compressed at levels -5, -1 and 1–10
 with and without checksum, and each frame's length and SHA-256 must equal
 what libzstd 1.5.7 produced (`src/testdata/goldens.zig`, written by
 `tools/gen-goldens.sh`). The corpus is built for coverage: each size tier of

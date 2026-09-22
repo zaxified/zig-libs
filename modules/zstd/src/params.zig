@@ -24,10 +24,10 @@ pub const CParams = struct {
     strategy: Strategy,
 };
 
-/// Highest level implemented: every size tier resolves levels up to 8 to a
-/// strategy between `fast` and `lazy2`. Level 9 is `btlazy2` for inputs of
+/// Highest level implemented: every size tier resolves levels up to 10 to a
+/// strategy between `fast` and `btlazy2`. Level 11 is `btopt` for inputs of
 /// 16 KB or less, which this module does not have.
-pub const max_level = 8;
+pub const max_level = 10;
 /// `ZSTD_MAX_CLEVEL`: rows in each table.
 const table_levels = 22;
 /// `ZSTD_minCLevel()`: -ZSTD_TARGETLENGTH_MAX.
@@ -231,15 +231,25 @@ test "negative levels set the acceleration factor" {
     try std.testing.expectEqual(Strategy.fast, cp.strategy);
 }
 
-test "every size tier stays at or below lazy2 up to max_level" {
+test "every size tier stays at or below btlazy2 up to max_level" {
     for ([_]u64{ 1000, 16 * 1024, 100_000, 200_000, 10 << 20 }) |size| {
         var level: i32 = 1;
         while (level <= max_level) : (level += 1) {
-            try std.testing.expect(@intFromEnum(get(level, size).strategy) <= @intFromEnum(Strategy.lazy2));
+            try std.testing.expect(@intFromEnum(get(level, size).strategy) <= @intFromEnum(Strategy.btlazy2));
         }
     }
-    // the next level is btlazy2 in the smallest tier
-    try std.testing.expectEqual(Strategy.btlazy2, table[3][max_level + 1].strategy);
+    // the next level is btopt in the smallest tier
+    try std.testing.expectEqual(Strategy.btopt, table[3][max_level + 1].strategy);
+}
+
+test "btlazy2 halves the chain log to the window (ZSTD_cycleLog)" {
+    // level 10, 16 KB tier: row (14, 15, 14, 9, 4, 8); 1000 bytes -> window 10,
+    // chain 15 - 1 = 14 > 10 cut to 11 (two entries per position)
+    const cp = get(10, 1000);
+    try std.testing.expectEqual(Strategy.btlazy2, cp.strategy);
+    try std.testing.expectEqual(@as(u32, 10), cp.window_log);
+    try std.testing.expectEqual(@as(u32, 11), cp.chain_log);
+    try std.testing.expect(!useRowMatchFinder(cp));
 }
 
 test "the row match finder takes over above a 16 KB window" {

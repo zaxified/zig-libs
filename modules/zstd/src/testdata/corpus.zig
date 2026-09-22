@@ -102,9 +102,14 @@ pub const cases = [_]Case{
     .{ .name = "mix-16000-1", .len = 16000, .kind = .mix, .seed = 1 }, // predefined table wins a tie with a new one
     .{ .name = "drift-300000-8", .len = 300000, .kind = .drift, .seed = 8 }, // repeated table wins a tie with a new one
     .{ .name = "mix-300000-30", .len = 300000, .kind = .mix, .seed = 30 }, // cross-entropy prices a -1 probability as 1
+    // ... and for btlazy2 (levels 9-10, inputs up to 16 KB):
+    .{ .name = "two-symbols-16384-0", .len = 16384, .kind = .two_symbols, .seed = 0 }, // DUBT drops the last still-unsorted candidate; 1 << searchLog compares
+    .{ .name = "two-symbols-16384-1", .len = 16384, .kind = .two_symbols, .seed = 1 }, // DUBT stacks unsorted candidates only while more than one is left
+    .{ .name = "two-symbols-16000-1", .len = 16000, .kind = .two_symbols, .seed = 1 }, // DUBT skips a repetitive match to its end - 8; sorting stops at the input end
+    .{ .name = "skewed-16384-2", .len = 16384, .kind = .skewed, .seed = 2 }, // DUBT prices an offset as highbit(distance + 1)
 };
 
-pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8 };
+pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
 
 /// The dfast pre-splitter's chunk size (`CHUNKSIZE` in zstd_preSplit.c).
 const chunk_len = 8 << 10;

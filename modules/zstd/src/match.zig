@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
 //! Match finders for the `fast` and `dfast` strategies, and the match state
-//! every strategy shares (the lazy ones live in `lazy.zig`).
+//! every strategy shares (the lazy and binary-tree ones live in `lazy.zig`).
 //!
 //! Port of the no-dictionary paths of libzstd lib/compress/zstd_fast.c and
 //! lib/compress/zstd_double_fast.c, with the window helpers and hashes of
@@ -31,7 +31,8 @@ pub const MatchState = struct {
     cp: params.CParams,
     hash_table: []u32,
     /// dfast: the short-hash table; greedy..lazy2 without the row match
-    /// finder: the hash chains (`chainTable` in libzstd). Empty otherwise.
+    /// finder: the hash chains; btlazy2: the binary tree, two entries per
+    /// position (`chainTable` in libzstd). Empty otherwise.
     chain_table: []u32,
     /// Row match finder only: one tag byte per `hash_table` slot; the first
     /// byte of each row holds the row's head (`tagTable`).
@@ -137,7 +138,7 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             7 => dfastBlock(ms, ss, rep, istart, src_size, 7),
             else => dfastBlock(ms, ss, rep, istart, src_size, 4),
         },
-        .greedy, .lazy, .lazy2 => lazy.compressBlock(ms, ss, rep, istart, src_size),
+        .greedy, .lazy, .lazy2, .btlazy2 => lazy.compressBlock(ms, ss, rep, istart, src_size),
         else => unreachable, // above params.max_level
     };
 }

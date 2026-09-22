@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
-//! Match finders for the `greedy`, `lazy` and `lazy2` strategies.
+//! Match finders for the `greedy`, `lazy`, `lazy2` and `btlazy2` strategies.
 //!
 //! Port of the no-dictionary paths of libzstd lib/compress/zstd_lazy.c
 //! (v1.5.7): the hash-chain finder (`ZSTD_HcFindBestMatch`), the row-based
-//! finder (`ZSTD_RowFindBestMatch`) and the parser that both feed
-//! (`ZSTD_compressBlock_lazy_generic`). libzstd picks the row finder whenever
-//! the window is larger than 16 KB, so both are needed for every level.
+//! finder (`ZSTD_RowFindBestMatch`), the lazily sorted binary tree of
+//! `btlazy2` (`ZSTD_BtFindBestMatch`, "DUBT") and the parser that all three
+//! feed (`ZSTD_compressBlock_lazy_generic`). libzstd picks the row finder over
+//! the hash chain whenever the window is larger than 16 KB, so both are needed
+//! for every level of `greedy`..`lazy2`.
 //!
 //! The row finder's SIMD tag comparison is written as a plain vector compare;
 //! only the set of matching slots matters, not how it is computed.
@@ -17,7 +19,7 @@ const sequences = @import("sequences.zig");
 const MatchState = match.MatchState;
 const SeqStore = sequences.SeqStore;
 
-const Method = enum { hash_chain, row };
+const Method = enum { hash_chain, row, binary_tree };
 
 /// `kLazySkippingStep`.
 const lazy_skipping_step = 8;
@@ -29,17 +31,24 @@ const cache_mask = cache_size - 1;
 const row_max_entries = 64;
 /// Offset placeholder libzstd passes to a search that may find nothing.
 const no_offset = 999999999;
+/// `ZSTD_DUBT_UNSORTED_MARK`: below `window_start`, so never a real index.
+const dubt_unsorted_mark = 1;
 
-/// Compress one block with the strategy in `ms.cp` (greedy, lazy or lazy2).
+/// Compress one block with the strategy in `ms.cp` (greedy, lazy, lazy2 or
+/// btlazy2).
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
+    const mls = std.math.clamp(ms.cp.min_match, 4, 6);
     const depth: u32 = switch (ms.cp.strategy) {
         .greedy => 0,
         .lazy => 1,
         .lazy2 => 2,
+        .btlazy2 => return switch (mls) {
+            inline 4, 5, 6 => |m| lazyGeneric(ms, ss, rep, istart, src_size, .binary_tree, 2, m),
+            else => unreachable,
+        },
         else => unreachable,
     };
     const row = params.useRowMatchFinder(ms.cp);
-    const mls = std.math.clamp(ms.cp.min_match, 4, 6);
     return switch (depth) {
         inline 0, 1, 2 => |d| if (row) switch (mls) {
             inline 4, 5, 6 => |m| lazyGeneric(ms, ss, rep, istart, src_size, .row, d, m),
@@ -257,12 +266,217 @@ fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, com
 }
 
 // ---------------------------------------------------------------------------
+// Binary tree (DUBT: "delayed update binary tree")
+//
+// The chain table holds two entries per position: the smaller and the larger
+// child. New positions are only chained (like a hash chain) and marked
+// unsorted; a search first sorts the unsorted candidates it meets into the
+// tree, then descends it.
+
+/// `ZSTD_getLowestMatchIndex` without a dictionary.
+inline fn lowestMatchIndex(ms: *const MatchState, curr: u32) u32 {
+    const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
+    const lowest_valid = ms.low_limit;
+    return if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+}
+
+inline fn btMask(ms: *const MatchState) u32 {
+    return (@as(u32, 1) << @intCast(ms.cp.chain_log - 1)) - 1;
+}
+
+/// `ZSTD_updateDUBT`: chain every position from `next_to_update` up to `ip`
+/// and mark it unsorted.
+fn updateDubt(ms: *MatchState, ip: u32, comptime mls: u32) void {
+    const bt = ms.chain_table;
+    const bt_mask = btMask(ms);
+    var idx = ms.next_to_update;
+    while (idx < ip) : (idx += 1) {
+        const h = ms.hash(idx, ms.cp.hash_log, mls);
+        const match_index = ms.hash_table[h];
+        const slot = 2 * @as(usize, idx & bt_mask);
+        ms.hash_table[h] = idx; // Update Hash Table
+        bt[slot] = match_index; // update BT like a chain
+        bt[slot + 1] = dubt_unsorted_mark;
+    }
+    ms.next_to_update = ip;
+}
+
+/// `ZSTD_insertDUBT1` (noDict): sort one already inserted but unsorted
+/// position `curr` into the tree, comparing at most `nb_compares` nodes and
+/// not descending below `bt_low`.
+fn insertDubt1(ms: *MatchState, curr: u32, iend: usize, nb_compares_in: u32, bt_low: u32) void {
+    const bt = ms.chain_table;
+    const bt_mask = btMask(ms);
+    var common_length_smaller: usize = 0;
+    var common_length_larger: usize = 0;
+    const slot = 2 * @as(usize, curr & bt_mask);
+    var smaller_ptr: *u32 = &bt[slot];
+    var larger_ptr: *u32 = &bt[slot + 1];
+    // this candidate is unsorted: the next sorted candidate is reached through
+    // smaller_ptr, while larger_ptr holds the previous unsorted candidate
+    // (already saved, can be overwritten)
+    var match_index = smaller_ptr.*;
+    var dummy32: u32 = undefined; // to be nullified at the end
+    const window_low = lowestMatchIndex(ms, curr);
+    var nb_compares = nb_compares_in;
+
+    while (nb_compares > 0 and match_index > window_low) : (nb_compares -= 1) {
+        const next_slot = 2 * @as(usize, match_index & bt_mask);
+        var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
+        std.debug.assert(match_index < curr);
+        match_length += ms.count(curr + match_length, match_index + match_length, iend);
+
+        // equal: no way to know if inf or sup. Drop, to guarantee consistency;
+        // miss a bit of compression, but other solutions can corrupt the tree.
+        if (curr + match_length == iend) break;
+
+        if (ms.at(match_index + match_length) < ms.at(curr + match_length)) {
+            // match is smaller than current
+            smaller_ptr.* = match_index; // update smaller idx
+            common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
+            if (match_index <= bt_low) { // beyond tree size, stop searching
+                smaller_ptr = &dummy32;
+                break;
+            }
+            smaller_ptr = &bt[next_slot + 1]; // new "candidate" => larger than match, which was smaller than target
+            match_index = bt[next_slot + 1]; // new matchIndex, larger than previous and closer to current
+        } else {
+            // match is larger than current
+            larger_ptr.* = match_index;
+            common_length_larger = match_length;
+            if (match_index <= bt_low) { // beyond tree size, stop searching
+                larger_ptr = &dummy32;
+                break;
+            }
+            larger_ptr = &bt[next_slot];
+            match_index = bt[next_slot];
+        }
+    }
+    smaller_ptr.* = 0;
+    larger_ptr.* = 0;
+}
+
+/// `ZSTD_DUBT_findBestMatch` (noDict). Returns the best length (0 when none)
+/// and stores its offBase in `off_base_ptr`, whose incoming value also
+/// prices the first candidate.
+fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32) usize {
+    const hash_table = ms.hash_table;
+    const h = ms.hash(ip, ms.cp.hash_log, mls);
+    var match_index = hash_table[h];
+    const curr = ip;
+    const window_low = lowestMatchIndex(ms, curr);
+    const bt = ms.chain_table;
+    const bt_mask = btMask(ms);
+    const bt_low: u32 = if (bt_mask >= curr) 0 else curr - bt_mask;
+    const unsort_limit = @max(bt_low, window_low);
+    var nb_compares: u32 = @as(u32, 1) << @intCast(ms.cp.search_log);
+    var nb_candidates = nb_compares;
+    var previous_candidate: u32 = 0;
+
+    // reach end of unsorted candidates list
+    while (match_index > unsort_limit and bt[2 * @as(usize, match_index & bt_mask) + 1] == dubt_unsorted_mark and nb_candidates > 1) {
+        const slot = 2 * @as(usize, match_index & bt_mask);
+        // the unsorted mark becomes a reversed chain, to move up back to the original position
+        bt[slot + 1] = previous_candidate;
+        previous_candidate = match_index;
+        match_index = bt[slot];
+        nb_candidates -= 1;
+    }
+
+    // nullify last candidate if it's still unsorted: simplification,
+    // detrimental to compression ratio, beneficial for speed
+    if (match_index > unsort_limit and bt[2 * @as(usize, match_index & bt_mask) + 1] == dubt_unsorted_mark) {
+        const slot = 2 * @as(usize, match_index & bt_mask);
+        bt[slot] = 0;
+        bt[slot + 1] = 0;
+    }
+
+    // batch sort stacked candidates
+    match_index = previous_candidate;
+    while (match_index != 0) { // will end on match_index == 0
+        const next_candidate_idx = bt[2 * @as(usize, match_index & bt_mask) + 1];
+        insertDubt1(ms, match_index, iend, nb_candidates, unsort_limit);
+        match_index = next_candidate_idx;
+        nb_candidates += 1;
+    }
+
+    // find longest match
+    var common_length_smaller: usize = 0;
+    var common_length_larger: usize = 0;
+    const slot = 2 * @as(usize, curr & bt_mask);
+    var smaller_ptr: *u32 = &bt[slot];
+    var larger_ptr: *u32 = &bt[slot + 1];
+    var match_end_idx: u32 = curr + 8 + 1;
+    var dummy32: u32 = undefined; // to be nullified at the end
+    var best_length: usize = 0;
+
+    match_index = hash_table[h];
+    hash_table[h] = curr; // Update Hash Table
+
+    while (nb_compares > 0 and match_index > window_low) : (nb_compares -= 1) {
+        const next_slot = 2 * @as(usize, match_index & bt_mask);
+        var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
+        match_length += ms.count(curr + match_length, match_index + match_length, iend);
+
+        if (match_length > best_length) {
+            if (match_length > match_end_idx - match_index)
+                match_end_idx = match_index + @as(u32, @intCast(match_length));
+            const gain_len = 4 * @as(i64, @intCast(match_length - best_length));
+            const gain_off = @as(i64, std.math.log2_int(u32, curr - match_index + 1)) - std.math.log2_int(u32, off_base_ptr.*);
+            if (gain_len > gain_off) {
+                best_length = match_length;
+                off_base_ptr.* = curr - match_index + sequences.rep_num;
+            }
+            // equal: no way to know if inf or sup. Drop, to guarantee
+            // consistency (miss a little bit of compression).
+            if (curr + match_length == iend) break;
+        }
+
+        if (ms.at(match_index + match_length) < ms.at(curr + match_length)) {
+            // match is smaller than current
+            smaller_ptr.* = match_index; // update smaller idx
+            common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
+            if (match_index <= bt_low) { // beyond tree size, stop the search
+                smaller_ptr = &dummy32;
+                break;
+            }
+            smaller_ptr = &bt[next_slot + 1]; // new "smaller" => larger of match
+            match_index = bt[next_slot + 1]; // new matchIndex larger than previous (closer to current)
+        } else {
+            // match is larger than current
+            larger_ptr.* = match_index;
+            common_length_larger = match_length;
+            if (match_index <= bt_low) { // beyond tree size, stop the search
+                larger_ptr = &dummy32;
+                break;
+            }
+            larger_ptr = &bt[next_slot];
+            match_index = bt[next_slot];
+        }
+    }
+    smaller_ptr.* = 0;
+    larger_ptr.* = 0;
+
+    std.debug.assert(match_end_idx > curr + 8); // ensure next_to_update is increased
+    ms.next_to_update = match_end_idx - 8; // skip repetitive patterns
+    return best_length;
+}
+
+/// `ZSTD_BtFindBestMatch`: tree updater, providing the best match.
+fn btFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32) usize {
+    if (ip < ms.next_to_update) return 0; // skipped area
+    updateDubt(ms, ip, mls);
+    return dubtFindBestMatch(ms, ip, iend, off_base_ptr, mls);
+}
+
+// ---------------------------------------------------------------------------
 // Parser
 
 inline fn searchMax(ms: *MatchState, ip: usize, iend: usize, offset_ptr: *u32, comptime method: Method, comptime mls: u32, row_log: u32) usize {
     return switch (method) {
         .hash_chain => hcFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls),
         .row => rowFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls, row_log),
+        .binary_tree => btFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls),
     };
 }
 
@@ -271,7 +485,7 @@ inline fn gain(ml: usize, mult: i64, off_base: u32, bonus: i64) i64 {
 }
 
 /// `ZSTD_compressBlock_lazy_generic` (noDict). `depth` 0 is greedy, 1 lazy,
-/// 2 lazy2. Stores sequences into `ss`, updates `rep`, and returns the number
+/// 2 lazy2 and btlazy2. Stores sequences into `ss`, updates `rep`, and returns the number
 /// of trailing literals.
 fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime method: Method, comptime depth: u32, comptime mls: u32) usize {
     const iend: usize = istart + src_size;

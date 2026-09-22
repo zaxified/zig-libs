@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — Levels 9–10: the `btlazy2` strategy (`zstd_lazy.c`'s
+  lazily sorted binary tree, "DUBT", under the existing lazy parser).
+  Byte-identical to `ZSTD_compress2()`: the goldens grow to 1344 frames
+  (56 inputs × 12 levels × checksum on/off). Levels 11+ remain
+  `error.LevelUnsupported` (level 11 is `btopt` for inputs up to 16 KB).
+  A 35-mutation sweep added 4 corpus cases; 15 mutations survive with
+  reasons in SPEC.md (11 unreachable until levels 11–15 run `btlazy2` on
+  larger inputs, 4 equivalent).
 - **2026-09-22** — Levels 4–8: the `greedy`, `lazy` and `lazy2` strategies
   (`zstd_lazy.c`: hash-chain and row-based match finders, one lazy parser),
   the priced choice between predefined, repeated and new sequence tables, and

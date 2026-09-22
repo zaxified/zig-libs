@@ -5,9 +5,9 @@ Consumer view, API and purpose: [README.md](README.md).
 ## What this module is, and what it is not
 
 A one-shot Zstandard **compressor** that reproduces libzstd 1.5.7's output
-byte for byte for levels 1–8 and every negative level. The match finders
-(`fast`, `dfast`, and `greedy`/`lazy`/`lazy2` over both the hash chain and the
-row-based search), the frame/block driver, the block pre-splitter and the
+byte for byte for levels 1–10 and every negative level. The match finders
+(`fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both the hash chain and the
+row-based search, and `btlazy2`'s binary tree), the frame/block driver, the block pre-splitter and the
 entropy stage (literals via Huffman, sequences via FSE) are translated from
 libzstd; see [NOTICE](NOTICE) for the file-by-file map.
 
@@ -15,13 +15,13 @@ Not here, and a reader might expect it:
 
 - **A decoder.** `std.compress.zstd.Decompress` exists (CONVENTIONS.md §1.3).
   The tests use it as the round-trip oracle.
-- **Levels 9–22.** The binary-tree finder `btlazy2` and the optimal parsers
-  `btopt`/`btultra`/`btultra2` are not ported. Levels map to strategies per
-  input-size tier, so the cut is where the *first* tier leaves `lazy2`: level
-  9 is `btlazy2` for inputs of 16 KB or less (for larger inputs `lazy2` runs up
-  to level 10 or 12). Asking for 9 or more is `error.LevelUnsupported` for
-  every input size, so a level's support never depends on the data.
-  *In progress*: `btlazy2`, then `zstd_opt.c` (the target is level 19).
+- **Levels 11–22.** The optimal parsers `btopt`/`btultra`/`btultra2` are not
+  ported. Levels map to strategies per input-size tier, so the cut is where
+  the *first* tier leaves `btlazy2`: level 11 is `btopt` for inputs of 16 KB
+  or less (for larger inputs `btlazy2` runs up to level 12 or 15). Asking for
+  11 or more is `error.LevelUnsupported` for every input size, so a level's
+  support never depends on the data. *In progress*: `zstd_opt.c` (the target
+  is level 19).
 - **Streaming.** One call, whole input. libzstd's streaming API blocks the
   input on its own buffer boundaries and so produces *different* (equally
   valid) frames; matching those would be a different contract.
@@ -47,7 +47,7 @@ libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
    of the first and last 512 bytes (and the middle, to pick 32/64/96 KB);
    `dfast` fingerprints 8 KB chunks sampled every 43rd byte and cuts at the
    first chunk that deviates; `greedy`/`lazy` sample every 11th byte of 2-byte
-   hashes, `lazy2` every 5th.
+   hashes, `lazy2` and `btlazy2` every 5th.
 4. **Match finding** (`match.zig`, `lazy.zig`): indices start at 2, as in libzstd, so a zero
    hash slot means "empty". Repeat offsets carry across blocks; a block emitted
    raw or RLE does not commit its repeat offsets or entropy tables (the next
@@ -55,8 +55,12 @@ libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
    `greedy`/`lazy`/`lazy2` share one parser (lookahead depth 0/1/2) over a hash
    chain when the window is 16 KB or less, and over libzstd's row-based finder
    (16/32/64-entry rows of 8-bit tags) above that — libzstd's own automatic
-   choice. Insertion state (`nextToUpdate`) carries across blocks, with
-   libzstd's caps after long matches.
+   choice. `btlazy2` runs the same parser at depth 2 over libzstd's "delayed
+   update" binary tree: new positions are only chained and marked unsorted,
+   and a search first sorts the unsorted candidates it meets into the tree
+   (two chain-table entries per position, hence `ZSTD_cycleLog` = chain log − 1
+   in the parameter adjustment). Insertion state (`nextToUpdate`) carries
+   across blocks, with libzstd's caps after long matches.
 5. **Entropy** (`literals.zig`, `huf.zig`, `sequences.zig`, `fse.zig`):
    literals are Huffman-coded (1 or 4 streams) when that beats `minGain`,
    reusing the previous block's table when libzstd would; each sequence code
@@ -90,7 +94,7 @@ pre-splitter's 16-bit hash, which `greedy` and up use).
 
 | limit | value | source |
 |---|---|---|
-| level | `min_level` (-131072) … 8; lower is clamped | `ZSTD_minCLevel()`; 8 is the last level that is `lazy2` or below in every size tier |
+| level | `min_level` (-131072) … 10; lower is clamped | `ZSTD_minCLevel()`; 10 is the last level that is `btlazy2` or below in every size tier |
 | input | `max_input_size` = 3500 MiB − 2 | libzstd corrects index overflow past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit); that correction is not ported, so the input stops before it |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
@@ -150,16 +154,37 @@ the sweep, the hash salt:
 | row: `break` → `continue` at `matchIndex < lowLimit` | equivalent: a row lists entries newest first, so every entry after the first out-of-window one is out of the window too |
 | `fillHashCache` limit `>` → `>=` | the entry it drops is for a position no search reaches before the block ends |
 | `nextToUpdate` raised to `lowLimit` before a block | unreachable one-shot: insertion trails the parser by at most a block, the window's low end only moves once the input passes the window |
-| row `hashLog` cap `24 + rowLog` → `23 + rowLog` | unreachable at levels ≤ 8 (hash logs ≤ 23, cap ≥ 28); binds from level 22 |
+| row `hashLog` cap `24 + rowLog` → `23 + rowLog` | unreachable at levels ≤ 10 (hash logs ≤ 23, cap ≥ 28); binds from level 22 |
 | hash salt → 0 | equivalent on a fresh context: the salt XORs every hash before the shift, a bijection on (row, tag) that leaves every collision in place; it matters only for reused tag tables |
 | `nbSeq >= 2048` → `>` in `ZSTD_NCountCost` | reachable in principle: a block of exactly 2048 sequences whose cost comparison flips on the low-probability rule; 4 000 generated seeds × 7 kinds × 6 sizes did not hit it. **Uncovered.** |
+
+`btlazy2` (levels 9–10) followed on the same day: 35 mutations of the
+binary-tree code in `lazy.zig` and of `max_level`. 11 were caught by the
+existing corpus, 9 by the 4 `btlazy2` cases found by the seed search
+(`two_symbols` inputs reach the unsorted-candidate limits, the skip over
+repetitive matches and the end-of-input stop; a `skewed` one the offset
+price), and 15 survive:
+
+| mutation | why no case exists |
+|---|---|
+| window and tree-size limits: `matchIndex > windowLow` → `>=` (insertion), `matchIndex <= btLow` → `<` (insertion and search, both sides), the `dummy32` redirect dropped (both sides), `btMask >= curr` → `>`, `unsortLimit` → `windowLow` or → `btLow` alone, `maxDistance` − 1 | unreachable below level 11: at levels 9–10 `btlazy2` runs only on inputs ≤ 16 KB, whose window covers the whole input, so `windowLow` stays at the first index and `btLow` at 0 (the parser stops 8 bytes before the end, below `btMask`). `btlazy2` on larger inputs comes with levels 11–15, and their goldens will reach these lines; until then they were checked against libzstd with the strategy forced (below) |
+| byte order `match[ml] < ip[ml]` → `<=` (insertion and search) | equivalent: `ml` is where `ZSTD_count` stopped, so the two bytes differ, unless the match reached the input end, which breaks out first |
+| `matchEndIdx` update `>` → `>=` | equivalent: at equality it stores the value it already holds |
+| `commonLengthSmaller` reset to 0 | equivalent: the common-prefix floor only saves re-comparing bytes known to be equal |
 
 Beyond the committed goldens, the port was compared against `zref` on 49
 boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
 JSON, text) and 800 random mixed inputs across levels -7…3, all identical;
 for levels 4–8, on the golden corpus, 54 boundary-size and system files and
 600 random mixed inputs (7 bytes to 900 KB) at every level — 3 470 frames,
-all identical.
+all identical; for levels 9–10, on the golden corpus plus 25 boundary-size and
+system files (308 frames) and 600 random inputs (1 byte to 400 KB), all
+identical. Because those levels reach `btlazy2` only up to 16 KB, the
+binary tree was also run on large inputs with the strategy forced — libzstd
+via `ZSTD_c_strategy`, the port via a throwaway copy of `params.zig` that
+repeats libzstd's two parameter adjustments (one for the level's own
+strategy, one for the forced one) — on the same 77 files, a 9 MB input
+(window slides) and about 200 of the random inputs: identical.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -174,8 +199,8 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
   the goldens. *Not now.*
 - **Matching the `zstd` CLI.** See *Streaming* above. *Never*, as a contract;
   the CLI's output is equally valid and decodes the same.
-- **Levels ≥ 9 by downgrading to 8.** Refused: a caller asking for level 19
-  would get level-8 ratio with no signal.
+- **Levels ≥ 11 by downgrading to 10.** Refused: a caller asking for level 19
+  would get level-10 ratio with no signal.
 
 ## Open
 

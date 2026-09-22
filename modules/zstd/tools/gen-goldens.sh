@@ -14,7 +14,7 @@ mod=$(dirname "$here")
 root=$(cd "$mod/../.." && pwd)
 R=${ZSTD_REF:-$root/.zig-cache/zstd-ref}
 pin=f8745da6ff1ad1e7bab384bd1f9d742439278e99 # tag v1.5.7
-LEVELS="-5 -1 1 2 3 4 5 6 7 8"
+LEVELS="-5 -1 1 2 3 4 5 6 7 8 9 10"
 
 if [ ! -d "$R/lib" ]; then
     git clone --quiet --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git "$R"
