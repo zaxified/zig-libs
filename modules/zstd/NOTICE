@@ -21,11 +21,16 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/compress/zstd_lazy.c            no-dictionary hash-chain, row and
                                       binary-tree (DUBT) match finders,
                                       greedy/lazy/lazy2/btlazy2 parser      -> src/lazy.zig
+  lib/compress/zstd_opt.c             no-dictionary binary-tree match
+                                      finder, price model and optimal
+                                      parser (btopt/btultra/btultra2)       -> src/opt.zig
   lib/compress/zstd_compress_internal.h  window helpers, hashes, ZSTD_count,
                                       seqStore, repcode handling            -> src/match.zig, src/sequences.zig
   lib/compress/zstd_compress.c        one-shot frame/block driver, frame
                                       header, parameter adjustment, entropy
                                       glue for a block                      -> src/frame.zig, src/params.zig
+                                      post-block splitter and its block
+                                      size estimates                        -> src/blocksplit.zig
   lib/compress/clevels.h              level tables                          -> src/params.zig
   lib/compress/zstd_preSplit.c        block pre-splitter                    -> src/presplit.zig
   lib/compress/zstd_compress_literals.c  literals section                  -> src/literals.zig
@@ -42,8 +47,8 @@ Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
 and `src/testdata/` are this collection's own work (MIT).
 
-Not taken: libzstd's decoder (std has one), dictionaries, the binary-tree
-match finders (btlazy2, btopt, btultra, btultra2), long-distance matching, multithreading, streaming.
+Not taken: libzstd's decoder (std has one), dictionaries, long-distance
+matching, multithreading, streaming, `targetCBlockSize` super-blocks.
 
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` (lengths and SHA-256 digests of its output). No

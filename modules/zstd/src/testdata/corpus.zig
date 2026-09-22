@@ -21,6 +21,9 @@ pub const Case = struct {
     kind: Kind,
     /// Extra generator seed; 0 for every hand-designed case.
     seed: u64 = 0,
+    /// When set, the case is in the golden set at these levels only, without
+    /// the checksum variant: a large input kept for one optimal-parser path.
+    only_levels: []const i32 = &.{},
 };
 
 pub const Kind = enum {
@@ -43,6 +46,7 @@ pub const Kind = enum {
     mix, // random pieces (text, csv, noise, runs, small alphabets, copies): found by search
     rle_tail, // 128 KB of text, then a 6-byte run as the last block
     repeat_1024, // 128 KB of text, then a 1024-byte block of literals only
+    far_mix, // 1.1 MB of `mix`, then a copy of it with sparse edits: offsets past 2^20
 };
 
 pub const cases = [_]Case{
@@ -107,9 +111,41 @@ pub const cases = [_]Case{
     .{ .name = "two-symbols-16384-1", .len = 16384, .kind = .two_symbols, .seed = 1 }, // DUBT stacks unsorted candidates only while more than one is left
     .{ .name = "two-symbols-16000-1", .len = 16000, .kind = .two_symbols, .seed = 1 }, // DUBT skips a repetitive match to its end - 8; sorting stops at the input end
     .{ .name = "skewed-16384-2", .len = 16384, .kind = .skewed, .seed = 2 }, // DUBT prices an offset as highbit(distance + 1)
+    // ... and for the optimal parsers (levels 11-21):
+    .{ .name = "far-mix-5", .len = 1_400_000, .kind = .far_mix, .seed = 5, .only_levels = &.{16} }, // btopt's surcharge on offsets of 2^20 and up
+    .{ .name = "csv-200000-18", .len = 200000, .kind = .csv, .seed = 18, .only_levels = &.{16} }, // two repcodes of one length: the later is listed too, and the longest entry's offset is what an immediate encoding takes
+    .{ .name = "two-symbols-100000-0", .len = 100000, .kind = .two_symbols, .seed = 0, .only_levels = &.{13} }, // a repcode exactly `targetLength` long does not end the search
+    .{ .name = "mix-200000-33", .len = 200000, .kind = .mix, .seed = 33, .only_levels = &.{19} }, // btultra's "match + 1 literal" wins only when strictly cheaper than more literals
+    .{ .name = "csv-200000-0", .len = 200000, .kind = .csv, .seed = 0, .only_levels = &.{16} }, // ... and than what the next position already holds
+    .{ .name = "mix-200000-2", .len = 200000, .kind = .mix, .seed = 2, .only_levels = &.{16} }, // split estimate: literals of 63 bytes or fewer are priced raw
+    .{ .name = "mix-200000-0", .len = 200000, .kind = .mix, .seed = 0, .only_levels = &.{13} }, // a split part's repcode is rewritten only where the two offset histories disagree
+    .{ .name = "mix-70000-0", .len = 70000, .kind = .mix, .seed = 0, .only_levels = &.{15} }, // the post-splitter starts at a 128 KB window (windowLog 17)
+    .{ .name = "mix-200000-93", .len = 200000, .kind = .mix, .seed = 93, .only_levels = &.{16} }, // a split part stored raw leaves the decoder's offset history where it was
+    .{ .name = "drift-200000-0", .len = 200000, .kind = .drift, .seed = 0, .only_levels = &.{19} }, // split estimate: four Huffman streams add a 6-byte jump table
+    .{ .name = "drift-200000-20", .len = 200000, .kind = .drift, .seed = 20, .only_levels = &.{19} }, // split estimate: one stream below 256 literals
+    .{ .name = "words-100000-6", .len = 100000, .kind = .words, .seed = 6, .only_levels = &.{16} }, // optimal Huffman depth stops once a size exceeds the best by more than one
+    .{ .name = "skewed-262144-75", .len = 262144, .kind = .skewed, .seed = 75, .only_levels = &.{11} }, // DUBT search stops at the tree's low end (smaller side, `<=`)
+    .{ .name = "skewed-200000-43", .len = 200000, .kind = .skewed, .seed = 43, .only_levels = &.{11} }, // ... and on the larger side
 };
 
-pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21 };
+
+/// First level of the optimal parsers (btopt in the 16 KB tier).
+pub const opt_level_min = 11;
+/// Largest input the golden set compresses at the optimal-parser levels.
+pub const opt_len_max = 600_000;
+
+/// Whether the golden set holds `(case, level, checksum)`. The optimal
+/// parsers cost 10-40x a lazy level, so from `opt_level_min` up the set
+/// leaves out the checksum variant (the trailer does not depend on the level)
+/// and inputs above `opt_len_max` (their long-window paths are the earlier
+/// levels' concern). A case with `only_levels` is covered there alone.
+/// `tools/dump_corpus.zig` writes the covered set for the recipe.
+pub fn covered(case: Case, level: i32, checksum: bool) bool {
+    if (case.only_levels.len != 0) return !checksum and std.mem.indexOfScalar(i32, case.only_levels, level) != null;
+    if (level < opt_level_min) return true;
+    return !checksum and case.len <= opt_len_max;
+}
 
 /// The dfast pre-splitter's chunk size (`CHUNKSIZE` in zstd_preSplit.c).
 const chunk_len = 8 << 10;
@@ -281,6 +317,11 @@ pub fn generate(case: Case, out: []u8) void {
             @memcpy(out[700000..], out[0..700000]);
         },
         .debruijn => deBruijn(9, 4, out),
+        .far_mix => {
+            const p = @min(out.len, 1_100_000);
+            mix(&r, out[0..p]);
+            for (out[p..], p..) |*b, i| b.* = if (r.below(1500) == 0) @truncate(r.next()) else out[i - p];
+        },
         .sparse_matches => {
             const phrases = [_][]const u8{ "<record id=\"", "\" type=\"sample\">", "</record>\n", "timestamp=" };
             var i: usize = 0;

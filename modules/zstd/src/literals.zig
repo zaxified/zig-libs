@@ -11,7 +11,7 @@ pub const HufState = struct {
     repeat: huf.Repeat = .none,
 };
 
-const lit_huf_log = 11;
+pub const lit_huf_log = 11;
 const set_basic = 0;
 const set_rle = 1;
 const set_compressed = 2;
@@ -94,6 +94,7 @@ pub fn compress(dst: []u8, src: []const u8, prev: *const HufState, next: *HufSta
         const flags: huf.Flags = .{
             .prefer_repeat = strategy < 4 and src.len <= 1024,
             .suspect_uncompressible = suspect_uncompressible,
+            .optimal_depth = strategy >= 8, // HUF_OPTIMAL_DEPTH_THRESHOLD: btultra
         };
         c_lit_size = huf.compress(dst[lh_size..], src, lit_huf_log, if (single_stream) .single else .four, &next.table, &repeat, flags) catch blk: {
             failed = true;

@@ -10,6 +10,8 @@ const match = @import("match.zig");
 const sequences = @import("sequences.zig");
 const literals = @import("literals.zig");
 const presplit = @import("presplit.zig");
+const opt = @import("opt.zig");
+const blocksplit = @import("blocksplit.zig");
 
 pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
@@ -55,6 +57,9 @@ const Ctx = struct {
     strategy: u32,
     disable_literal_compression: bool,
     is_first_block: bool = true,
+    /// `ZSTD_blockSplitterEnabled`.
+    split_blocks: bool,
+    partitions: [blocksplit.partitions_len]u32 = undefined,
 };
 
 fn writeFrameHeader(dst: []u8, cp: params.CParams, src_size: u64, checksum: bool) usize {
@@ -119,8 +124,7 @@ fn isRle(src: []const u8) bool {
 const EntropyError = error{ DstSizeTooSmall, Generic };
 
 /// `ZSTD_entropyCompressSeqStore_internal`.
-fn entropyCompressInternal(c: *Ctx, dst: []u8) EntropyError!usize {
-    const ss = &c.ss;
+fn entropyCompressInternal(c: *Ctx, ss: *sequences.SeqStore, dst: []u8) EntropyError!usize {
     const n_seq = ss.n_seq;
     var op: usize = 0;
 
@@ -165,8 +169,8 @@ fn entropyCompressInternal(c: *Ctx, dst: []u8) EntropyError!usize {
 }
 
 /// `ZSTD_entropyCompressSeqStore_wExtLitBuffer`: 0 means "store raw".
-fn entropyCompress(c: *Ctx, dst: []u8, block_size: usize) usize {
-    const c_size = entropyCompressInternal(c, dst) catch |err| switch (err) {
+fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usize) usize {
+    const c_size = entropyCompressInternal(c, ss, dst) catch |err| switch (err) {
         // Out of space with room for a raw block: the block is not compressible.
         error.DstSizeTooSmall => return 0,
         // libzstd surfaces an internal error here; none is reachable from the
@@ -179,23 +183,30 @@ fn entropyCompress(c: *Ctx, dst: []u8, block_size: usize) usize {
     return c_size;
 }
 
+/// `ZSTD_buildSeqStore`: run the match finder over the block. Returns false
+/// for a block too small to try (`ZSTDbss_noCompress`).
+fn buildSeqStore(c: *Ctx, block_start: usize, block_size: usize) bool {
+    const src = c.ms.src;
+    // don't even attempt compression below a certain srcSize
+    if (block_size < min_cblock_size + block_header_size + 1 + 1) return false;
+    c.ss.reset();
+    const istart: u32 = @intCast(block_start + match.window_start);
+    // limited update after a very long match
+    if (istart > c.ms.next_to_update + 384)
+        c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
+    c.next.rep = c.prev.rep;
+    const last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
+    c.ss.storeLastLiterals(src[block_start + block_size - last_ll .. block_start + block_size]);
+    return true;
+}
+
 /// `ZSTD_compressBlock_internal` (frame mode). Returns 0 for "store raw", 1 for
 /// "RLE" (`dst[0]` holds the byte), otherwise the compressed block size.
 fn compressBlock(c: *Ctx, dst: []u8, block_start: usize, block_size: usize) usize {
     const src = c.ms.src;
     var c_size: usize = 0;
-    // don't even attempt compression below a certain srcSize
-    if (block_size >= min_cblock_size + block_header_size + 1 + 1) {
-        c.ss.reset();
-        const istart: u32 = @intCast(block_start + match.window_start);
-        // limited update after a very long match
-        if (istart > c.ms.next_to_update + 384)
-            c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
-        c.next.rep = c.prev.rep;
-        const last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
-        c.ss.storeLastLiterals(src[block_start + block_size - last_ll .. block_start + block_size]);
-        c_size = entropyCompress(c, dst, block_size);
-
+    if (buildSeqStore(c, block_start, block_size)) {
+        c_size = entropyCompress(c, &c.ss, dst, block_size);
         if (!c.is_first_block and c_size < rle_max_length and isRle(src[block_start..][0..block_size])) {
             c_size = 1;
             dst[0] = src[block_start];
@@ -205,9 +216,89 @@ fn compressBlock(c: *Ctx, dst: []u8, block_start: usize, block_size: usize) usiz
     return c_size;
 }
 
+/// Write one block (header included) for the outcome `c_size` of a block
+/// compression: 0 raw, 1 RLE, otherwise compressed and already in place
+/// after the header. Returns the bytes written.
+fn emitBlock(out: []u8, src: []const u8, c_size: usize, last_block: u32) usize {
+    const bs: u32 = @intCast(src.len);
+    if (c_size == 0) { // block is not compressible
+        writeBlockHeader(out, last_block + (bt_raw << 1) + (bs << 3));
+        @memcpy(out[block_header_size..][0..src.len], src);
+        return block_header_size + src.len;
+    } else if (c_size == 1) {
+        writeBlockHeader(out, last_block + (bt_rle << 1) + (bs << 3));
+        out[block_header_size] = src[0];
+        return block_header_size + 1;
+    } else {
+        writeBlockHeader(out, last_block + (bt_compressed << 1) + (@as(u32, @intCast(c_size)) << 3));
+        return block_header_size + c_size;
+    }
+}
+
+/// `ZSTD_compressSeqStore_singleBlock`: one block from the sequences in `ss`
+/// covering `src`. Returns the bytes written, header included.
+fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: *[3]u32, out: []u8, src: []const u8, last_block: u32, is_partition: bool) usize {
+    const d_rep_original = d_rep.*;
+    if (is_partition) blocksplit.resolveOffCodes(d_rep, c_rep, ss);
+    var c_seqs_size = entropyCompress(c, ss, out[block_header_size..], src.len);
+    if (!c.is_first_block and c_seqs_size < rle_max_length and isRle(src)) c_seqs_size = 1;
+    if (c_seqs_size > 1) {
+        std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
+    } else {
+        d_rep.* = d_rep_original;
+    }
+    return emitBlock(out, src, c_seqs_size, last_block);
+}
+
+/// `ZSTD_compressBlock_splitBlock`: one block of input, emitted as one or
+/// more blocks. Returns the bytes written, headers included.
+fn compressBlockSplit(c: *Ctx, out: []u8, block_start: usize, block_size: usize, last_block: u32) usize {
+    const src = c.ms.src[block_start..][0..block_size];
+    if (!buildSeqStore(c, block_start, block_size)) return emitBlock(out, src, 0, last_block);
+
+    const prev: blocksplit.Entropy = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
+    const next: blocksplit.Entropy = .{ .huf = &c.next.huf, .fse = &c.next.fse };
+    const partitions = &c.partitions;
+    const num_splits = blocksplit.deriveSplits(partitions, &c.ss, prev, next, c.strategy);
+    var d_rep = c.prev.rep;
+    var c_rep = c.prev.rep;
+    if (num_splits == 0) return compressSingleBlock(c, &c.ss, &d_rep, &c_rep, out, src, last_block, false);
+
+    var op: usize = 0;
+    var ip: usize = 0;
+    var src_bytes_total: usize = 0;
+    var curr = blocksplit.deriveChunk(&c.ss, 0, partitions[0]);
+    var i: usize = 0;
+    while (i <= num_splits) : (i += 1) {
+        const last_partition = i == num_splits;
+        var last_block_entire_src: u32 = 0;
+        var src_bytes = blocksplit.countLiteralsBytes(&curr) + blocksplit.countMatchBytes(&curr);
+        src_bytes_total += src_bytes;
+        var next_chunk: sequences.SeqStore = undefined;
+        if (last_partition) {
+            // This is the final partition, need to account for possible last literals
+            src_bytes += block_size - src_bytes_total;
+            last_block_entire_src = last_block;
+        } else {
+            next_chunk = blocksplit.deriveChunk(&c.ss, partitions[i], partitions[i + 1]);
+        }
+        op += compressSingleBlock(c, &curr, &d_rep, &c_rep, out[op..], src[ip..][0..src_bytes], last_block_entire_src, true);
+        ip += src_bytes;
+        curr = next_chunk;
+    }
+    // cRep and dRep may have diverged during the compression. If so, we use
+    // the dRep repcodes for the next block.
+    c.prev.rep = d_rep;
+    return op;
+}
+
 pub const Options = struct {
     level: i32,
     checksum: bool,
+    /// Test seam: override the level's strategy the way
+    /// `ZSTD_c_strategy` does, to reach strategy/size pairs no level maps
+    /// to. Not part of the public API.
+    strategy: ?params.Strategy = null,
 };
 
 /// One-shot frame. `dst.len` must be at least `compressBound(src.len)`.
@@ -217,7 +308,7 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
     if (dst.len < bound) return error.NoSpaceLeft;
     const out = dst[0..bound];
 
-    const cp = params.get(opts.level, src.len);
+    const cp = if (opts.strategy) |st| params.getWithStrategy(opts.level, src.len, st) else params.get(opts.level, src.len);
     var op = writeFrameHeader(out, cp, src.len, opts.checksum);
 
     if (src.len == 0) {
@@ -238,10 +329,20 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
         defer gpa.free(tag_table);
         @memset(tag_table, 0);
 
+        // ZSTD_reset_matchState: the 3-byte hash of the optimal parser
+        const hash_log3: u32 = if (cp.min_match == 3) @min(opt.hash_log3_max, cp.window_log) else 0;
+        const hash_table3 = try gpa.alloc(u32, if (hash_log3 != 0) @as(usize, 1) << @intCast(hash_log3) else 0);
+        defer gpa.free(hash_table3);
+        @memset(hash_table3, 0);
+        const opt_state: ?*opt.State = if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt)) try gpa.create(opt.State) else null;
+        defer if (opt_state) |p| gpa.destroy(p);
+        if (opt_state) |p| p.* = .{};
+
         const window_size: usize = @as(usize, 1) << @intCast(cp.window_log);
         const block_size_max: usize = @min(block_size_max_abs, @max(1, @min(window_size, src.len)));
-        // every sequence carries a match of at least 4 bytes (min_match >= 4)
-        const max_n_seq = block_size_max / 4 + 1;
+        // ZSTD_maxNbSeq: every sequence carries a match of at least
+        // min_match bytes
+        const max_n_seq = block_size_max / @as(usize, if (cp.min_match == 3) 3 else 4) + 1;
         const seqs = try gpa.alloc(sequences.SeqDef, max_n_seq);
         defer gpa.free(seqs);
         const codes = try gpa.alloc(u8, 3 * max_n_seq);
@@ -264,6 +365,9 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
                 .row_hash_log = if (row) cp.hash_log - params.rowLog(cp) else 0,
                 // ZSTD_advanceHashSalt on a fresh context: salt and entropy 0
                 .hash_salt = if (row) bitmix(0, 8) ^ bitmix(0, 4) else 0,
+                .hash_table3 = hash_table3,
+                .hash_log3 = hash_log3,
+                .opt = opt_state,
             },
             .ss = .{
                 .seqs = seqs,
@@ -277,6 +381,8 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
             .strategy = @intFromEnum(cp.strategy),
             // ZSTD_literalsCompressionIsDisabled (auto): fast + acceleration
             .disable_literal_compression = cp.strategy == .fast and cp.target_length > 0,
+            // ZSTD_resolveBlockSplitterMode (auto)
+            .split_blocks = @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt) and cp.window_log >= 17,
         };
 
         var savings: i64 = 0;
@@ -291,20 +397,10 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
             // Ensure hash/chain table insertion resumes no sooner than lowlimit
             if (c.ms.next_to_update < c.ms.low_limit) c.ms.next_to_update = c.ms.low_limit;
 
-            const block_out = out[op + block_header_size ..];
-            var c_size = compressBlock(&c, block_out, ip, block_size);
-            const bs: u32 = @intCast(block_size);
-            if (c_size == 0) { // block is not compressible
-                writeBlockHeader(out[op..], last_block + (bt_raw << 1) + (bs << 3));
-                @memcpy(out[op + block_header_size ..][0..block_size], src[ip..][0..block_size]);
-                c_size = block_header_size + block_size;
-            } else if (c_size == 1) {
-                writeBlockHeader(out[op..], last_block + (bt_rle << 1) + (bs << 3));
-                c_size += block_header_size;
-            } else {
-                writeBlockHeader(out[op..], last_block + (bt_compressed << 1) + (@as(u32, @intCast(c_size)) << 3));
-                c_size += block_header_size;
-            }
+            const c_size = if (c.split_blocks)
+                compressBlockSplit(&c, out[op..], ip, block_size, last_block)
+            else
+                emitBlock(out[op..], src[ip..][0..block_size], compressBlock(&c, out[op + block_header_size ..], ip, block_size), last_block);
             savings += @as(i64, @intCast(block_size)) - @as(i64, @intCast(c_size));
             ip += block_size;
             op += c_size;

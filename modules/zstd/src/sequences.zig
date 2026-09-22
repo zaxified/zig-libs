@@ -221,7 +221,7 @@ const inverse_probability_log256 = [256]u32{
 };
 
 /// A cost libzstd reports as an error code: larger than every real cost.
-const cost_error = std.math.maxInt(usize);
+pub const cost_error = std.math.maxInt(usize);
 
 /// `ZSTD_NCountCost`: bytes of the table header a fresh table would need.
 fn nCountCost(counts: []const u32, max: u32, n_seq: usize, fse_log: u32) Error!usize {
@@ -245,7 +245,7 @@ fn entropyCost(counts: []const u32, max: u32, total: usize) usize {
 
 /// `ZSTD_fseBitCost`: bits to code `counts` with `ct`, or `cost_error` when
 /// `ct` cannot represent one of the symbols.
-fn fseBitCost(ct: *const fse.CTable, counts: []const u32, max: u32) usize {
+pub fn fseBitCost(ct: *const fse.CTable, counts: []const u32, max: u32) usize {
     const accuracy_log = 8;
     if (ct.max_symbol < max) return cost_error;
     const table_log = ct.table_log;
@@ -268,7 +268,7 @@ fn fseBitCost(ct: *const fse.CTable, counts: []const u32, max: u32) usize {
 }
 
 /// `ZSTD_crossEntropyCost`: bits to code `counts` with the table `norm`.
-fn crossEntropyCost(norm: []const i16, accuracy_log: u32, counts: []const u32, max: u32) usize {
+pub fn crossEntropyCost(norm: []const i16, accuracy_log: u32, counts: []const u32, max: u32) usize {
     const shift: u5 = @intCast(8 - accuracy_log);
     var cost: usize = 0;
     for (counts[0 .. max + 1], norm[0 .. max + 1]) |c, n| {

@@ -17,7 +17,7 @@ const zstd = @import("root.zig");
 const fuzzSeed = @import("testkit").fuzz.seed;
 
 const fuzz_buf_len = 1 << 16;
-const levels = [_]i32{ -3, 1, 2, 3, -1, 4, 5, 6, 7, 8 };
+const levels = [_]i32{ -3, 1, 2, 3, -1, 4, 5, 6, 7, 8, 10, 12, 14, 17, 19, 21 };
 
 fn roundTrip(input: []const u8) !void {
     const gpa = std.testing.allocator;

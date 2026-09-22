@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — Levels 11–21: the optimal parsers `btopt`, `btultra`
+  and `btultra2` (`zstd_opt.c`: all-matches binary tree, 3-byte hash for
+  `minMatch` 3, adaptive price model, forward pricing and backward trace,
+  btultra2's statistics-seeding first pass), the post-block splitter
+  (`ZSTD_compressBlock_splitBlock` with its size estimates and repcode
+  resolution) and optimal Huffman depth from `btultra` on. Byte-identical to
+  `ZSTD_compress2()`: the goldens grow to 1941 frames (levels 11–21 without
+  the checksum variant on inputs up to 600 KB, plus 14 single-level cases).
+  Level 22 is `error.LevelUnsupported` (long-distance matching above 64 MB is
+  not ported; `max_level` was 10). A 101-mutation sweep added 14 corpus
+  cases; 33 mutations survive with reasons in SPEC.md, 13 of them reachable
+  equalities no seed search hit. The golden recipe now reads the covered set
+  from `dump_corpus.zig`'s manifest, and `tools/zref.c` can force a strategy.
 - **2026-09-22** — Levels 9–10: the `btlazy2` strategy (`zstd_lazy.c`'s
   lazily sorted binary tree, "DUBT", under the existing lazy parser).
   Byte-identical to `ZSTD_compress2()`: the goldens grow to 1344 frames

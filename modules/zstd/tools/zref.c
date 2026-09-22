@@ -2,7 +2,11 @@
 /* zref -- differential oracle: compress a file with libzstd exactly the way
  * modules/zstd does (one-shot ZSTD_compress2, content size in the header).
  *
- *   zref <level> <checksum 0|1> <in> <out>
+ *   zref <level> <checksum 0|1> <in> <out> [strategy]
+ *
+ * With a strategy (1 = fast ... 9 = btultra2) it is forced through
+ * ZSTD_c_strategy on top of the level, which reaches strategy/size pairs no
+ * level maps to; the module's counterpart is `frame.Options.strategy`.
  *
  * Build against the pinned libzstd checkout (see README.md):
  *   cc -O2 -I "$R/lib" -o zref zref.c "$R/lib/libzstd.a"
@@ -16,8 +20,8 @@
 
 int main(int argc, char** argv)
 {
-    if (argc != 5) {
-        fprintf(stderr, "usage: zref <level> <checksum 0|1> <in> <out>\n");
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr, "usage: zref <level> <checksum 0|1> <in> <out> [strategy]\n");
         return 2;
     }
     int const level = atoi(argv[1]);
@@ -37,6 +41,7 @@ int main(int argc, char** argv)
     ZSTD_CCtx* const cctx = ZSTD_createCCtx();
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, level);
     ZSTD_CCtx_setParameter(cctx, ZSTD_c_checksumFlag, checksum);
+    if (argc == 6) ZSTD_CCtx_setParameter(cctx, ZSTD_c_strategy, atoi(argv[5]));
     size_t const r = ZSTD_compress2(cctx, dst, cap, src, (size_t)n);
     if (ZSTD_isError(r)) { fprintf(stderr, "%s\n", ZSTD_getErrorName(r)); return 5; }
 

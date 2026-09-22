@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
 //! Match finders for the `fast` and `dfast` strategies, and the match state
-//! every strategy shares (the lazy and binary-tree ones live in `lazy.zig`).
+//! every strategy shares (the lazy and binary-tree ones live in `lazy.zig`,
+//! the optimal parser in `opt.zig`).
 //!
 //! Port of the no-dictionary paths of libzstd lib/compress/zstd_fast.c and
 //! lib/compress/zstd_double_fast.c, with the window helpers and hashes of
@@ -15,6 +16,7 @@ const std = @import("std");
 const params = @import("params.zig");
 const sequences = @import("sequences.zig");
 const lazy = @import("lazy.zig");
+const opt = @import("opt.zig");
 const SeqStore = sequences.SeqStore;
 
 /// `ZSTD_WINDOW_START_INDEX`.
@@ -48,6 +50,12 @@ pub const MatchState = struct {
     hash_salt_entropy: u32 = 0,
     hash_cache: [row_hash_cache_size]u32 = @splat(0),
     lazy_skipping: bool = false,
+    /// `minMatch` 3 with the optimal parser: newest index per 3-byte hash
+    /// (`hashTable3`, `hashLog3`).
+    hash_table3: []u32 = &.{},
+    hash_log3: u32 = 0,
+    /// btopt and up: the parser's statistics and scratch tables.
+    opt: ?*opt.State = null,
 
     pub inline fn at(ms: *const MatchState, idx: usize) u8 {
         return ms.src[idx - window_start];
@@ -139,7 +147,9 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             else => dfastBlock(ms, ss, rep, istart, src_size, 4),
         },
         .greedy, .lazy, .lazy2, .btlazy2 => lazy.compressBlock(ms, ss, rep, istart, src_size),
-        else => unreachable, // above params.max_level
+        .btopt => opt.compressBlock(ms, ss, rep, istart, src_size, 0),
+        .btultra => opt.compressBlock(ms, ss, rep, istart, src_size, 2),
+        .btultra2 => opt.compressBlockUltra2(ms, ss, rep, istart, src_size),
     };
 }
 

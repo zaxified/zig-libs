@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
 //! Huffman literal encoder (port of libzstd lib/compress/huf_compress.c, v1.5.7).
 //!
-//! Only the paths reachable from the fast/dfast strategies are carried: no
-//! "optimal depth" search (libzstd enables it from btultra up), and no
-//! `HUF_repeat_valid` (that state only comes from a loaded dictionary). The
+//! Not carried: `HUF_repeat_valid` (that state only comes from a loaded
+//! dictionary). The "optimal depth" table-log search libzstd enables from
+//! `btultra` up is `optimalTableLog`. The
 //! symbol sort keeps libzstd's bucket sort *and* its unstable quicksort, because
 //! the order of equal counts decides which symbol gets which code, and so
 //! reaches the output bytes.
@@ -36,6 +36,8 @@ pub const CTable = struct {
 pub const Flags = struct {
     prefer_repeat: bool = false,
     suspect_uncompressible: bool = false,
+    /// `HUF_flags_optimalDepth`: search the table log by trial encoding.
+    optimal_depth: bool = false,
 };
 
 // ── tree construction ───────────────────────────────────────────────────────
@@ -319,13 +321,41 @@ pub fn estimateCompressedSize(ct: *const CTable, counts: []const u32, max_symbol
     return nb_bits >> 3;
 }
 
-fn validateCTable(ct: *const CTable, counts: []const u32, max_symbol: u32) bool {
+pub fn validateCTable(ct: *const CTable, counts: []const u32, max_symbol: u32) bool {
     if (ct.max_symbol < max_symbol) return false;
     var s: u32 = 0;
     while (s <= max_symbol) : (s += 1) {
         if (counts[s] != 0 and ct.elt[s].nb_bits == 0) return false;
     }
     return true;
+}
+
+/// `HUF_optimalTableLog`. Without `optimal_depth` the cheap FSE-based guess;
+/// with it, every log from the smallest that fits the alphabet up is tried
+/// and the one with the smallest table + payload estimate wins.
+pub fn optimalTableLog(max_table_log: u32, src_len: usize, max_symbol: u32, counts: []const u32, optimal_depth: bool) u32 {
+    if (!optimal_depth) return fse.optimalTableLogInternal(max_table_log, src_len, max_symbol, 1);
+    var cardinality: u32 = 0;
+    for (counts[0 .. max_symbol + 1]) |c| cardinality += @intFromBool(c != 0);
+    const min_table_log = fse.highbit32(cardinality) + 1; // HUF_minTableLog
+    var opt_size: usize = std.math.maxInt(usize) - 1;
+    var opt_log = max_table_log;
+    var guess = min_table_log;
+    // Search until size increases
+    while (guess <= max_table_log) : (guess += 1) {
+        var ct: CTable = .{};
+        const max_bits = buildCTable(&ct, counts, max_symbol, guess) catch continue;
+        if (max_bits < guess and guess > min_table_log) break;
+        var header: [1024]u8 = undefined;
+        const h_size = writeCTable(&header, &ct, max_symbol, max_bits) catch continue;
+        const new_size = estimateCompressedSize(&ct, counts, max_symbol) + h_size;
+        if (new_size > opt_size + 1) break;
+        if (new_size < opt_size) {
+            opt_size = new_size;
+            opt_log = guess;
+        }
+    }
+    return opt_log;
 }
 
 // ── table header ────────────────────────────────────────────────────────────
@@ -482,7 +512,7 @@ pub fn compress(dst: []u8, src: []const u8, huff_log_in: u32, streams: Streams, 
     if (repeat.* == .check and !validateCTable(old, &counts, max_symbol)) repeat.* = .none;
     if (flags.prefer_repeat and repeat.* != .none) return compressWithTable(dst, 0, src, streams, old);
 
-    huff_log = fse.optimalTableLogInternal(huff_log, src.len, max_symbol, 1);
+    huff_log = optimalTableLog(huff_log, src.len, max_symbol, &counts, flags.optimal_depth);
     var ct: CTable = .{};
     huff_log = try buildCTable(&ct, &counts, max_symbol, huff_log);
 

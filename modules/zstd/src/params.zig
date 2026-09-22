@@ -24,10 +24,11 @@ pub const CParams = struct {
     strategy: Strategy,
 };
 
-/// Highest level implemented: every size tier resolves levels up to 10 to a
-/// strategy between `fast` and `btlazy2`. Level 11 is `btopt` for inputs of
-/// 16 KB or less, which this module does not have.
-pub const max_level = 10;
+/// Highest level implemented. Level 22 resolves to a 128 MB window on inputs
+/// over 64 MB, where libzstd switches on long-distance matching for the
+/// optimal parsers (`ZSTD_resolveEnableLdm`), which this module does not
+/// have; refusing the level outright keeps support independent of the input.
+pub const max_level = 21;
 /// `ZSTD_MAX_CLEVEL`: rows in each table.
 const table_levels = 22;
 /// `ZSTD_minCLevel()`: -ZSTD_TARGETLENGTH_MAX.
@@ -210,6 +211,15 @@ pub fn get(level: i32, src_size: u64) CParams {
     return adjust(cp, src_size);
 }
 
+/// `ZSTD_getCParamsFromCCtxParams` with `ZSTD_c_strategy` set: the level's
+/// parameters (already adjusted for its own strategy), the strategy
+/// replaced, and the adjustment run again.
+pub fn getWithStrategy(level: i32, src_size: u64, strategy: Strategy) CParams {
+    var cp = get(level, src_size);
+    cp.strategy = strategy;
+    return adjust(cp, src_size);
+}
+
 test "a 1000-byte input shrinks the window to 1 KB" {
     const cp = get(3, 1000);
     try std.testing.expectEqual(@as(u32, 10), cp.window_log);
@@ -231,15 +241,19 @@ test "negative levels set the acceleration factor" {
     try std.testing.expectEqual(Strategy.fast, cp.strategy);
 }
 
-test "every size tier stays at or below btlazy2 up to max_level" {
-    for ([_]u64{ 1000, 16 * 1024, 100_000, 200_000, 10 << 20 }) |size| {
+test "no level up to max_level reaches long-distance matching" {
+    // ZSTD_resolveEnableLdm: btopt and up with windowLog >= 27
+    for ([_]u64{ 1000, 16 * 1024, 100_000, 200_000, 10 << 20, 1 << 30 }) |size| {
         var level: i32 = 1;
         while (level <= max_level) : (level += 1) {
-            try std.testing.expect(@intFromEnum(get(level, size).strategy) <= @intFromEnum(Strategy.btlazy2));
+            const cp = get(level, size);
+            try std.testing.expect(@intFromEnum(cp.strategy) < @intFromEnum(Strategy.btopt) or cp.window_log < 27);
         }
     }
-    // the next level is btopt in the smallest tier
-    try std.testing.expectEqual(Strategy.btopt, table[3][max_level + 1].strategy);
+    // the next level does, above 64 MB
+    const cp22 = adjust(table[0][max_level + 1], 1 << 30);
+    try std.testing.expectEqual(Strategy.btultra2, cp22.strategy);
+    try std.testing.expectEqual(@as(u32, 27), cp22.window_log);
 }
 
 test "btlazy2 halves the chain log to the window (ZSTD_cycleLog)" {

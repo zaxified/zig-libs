@@ -8,7 +8,7 @@ which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 | file | kind (§9) | what it answers |
 |---|---|---|
 | `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits. |
-| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. |
+| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. An optional fifth argument forces the strategy (`ZSTD_c_strategy`). |
 
 ## The reference they need
 
@@ -33,11 +33,24 @@ input), so its frames legitimately differ from one-shot output. Measured on a
 
 Needed when `src/testdata/corpus.zig` changes (a new case, or a generator
 change — `golden_test.zig` pins a digest of all corpus inputs, so the latter
-cannot happen silently). The recipe prints the row count; it must equal
-cases × 10 levels × 2.
+cannot happen silently). The recipe prints the row count; it must equal what
+`corpus.covered` admits: cases × 12 levels (-5…10) × 2, plus the cases up to
+600 KB × 11 levels (11–21) without checksum.
 
 ## Comparing an arbitrary file
 
     "$R/zref" <level> <checksum 0|1> in.bin ref.zst
     # and the same input through this module (e.g. a three-line main around
     # zstd.compressAlloc), then: cmp ref.zst ours.zst
+
+The level table keeps some strategy/parameter pairs out of every level's
+reach (`fast` never gets a window above 1 MB, `btopt` never the 8 MB window
+of level 19). To reach one, force the strategy on both sides:
+
+    "$R/zref" <level> 0 in.bin ref.zst 7          # 7 = btopt
+    # module side: frame.compress(..., .{ .level = L, .checksum = false,
+    #     .strategy = .btopt }) from a main that imports src/frame.zig
+
+libzstd then derives the parameters twice — once for the level's own
+strategy, once for the forced one — and `params.getWithStrategy` does the
+same; comparing against a single derivation gives false mismatches.
