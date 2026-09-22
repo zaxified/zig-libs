@@ -1434,6 +1434,416 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     return .{ .ok = typed };
 }
 
+// ── the streaming path: no value tree ───────────────────────────────────────
+//
+// `parseIntoLimited` / `validateJsonLimited` build the whole document as a
+// `std.json.Value` tree and then walk it. That tree is what their memory is:
+// measured 2026-09-22, the smallest FixedBufferAllocator `parseIntoLimited`
+// completes in is 4.4 KiB for a 118-byte body, 47 KiB for 1.1 KiB and 955 KiB
+// for 16.5 KiB (peak live bytes on a heap: 4.3 / 31 / 449 KiB) -- 30-60x the
+// body, which rules out a server that decodes into a fixed per-request buffer.
+//
+// The streaming path validates straight off the `std.json.Scanner` tokens:
+//
+//  * a scalar becomes a one-node `Value` and goes through the SAME `checkRule`
+//    as the tree path, so the type gate, every constraint and every message
+//    are shared, not re-implemented;
+//  * containers are walked in place: object members are matched to rules by
+//    key, array items by position; `required` is settled at the object's end
+//    and `min_len`/`max_len` at the array's end;
+//  * a container whose rule carries `custom` is the one exception -- the
+//    predicate takes a `Value`, so that subtree (and only it) is materialized
+//    and handed to `checkRule` whole;
+//  * error paths are a chain of stack frames, rendered into the report only
+//    when an error is recorded -- a valid document allocates no path at all;
+//  * duplicate object keys are refused at every depth, known field or not,
+//    exactly as the tree parser refuses them (`DuplicateField` → json_invalid).
+//
+// What differs from the tree path, by design: errors come in DOCUMENT order
+// (the tree path reports in schema order), and when more than `max_errors`
+// are found a different subset may be kept. The set of errors is the same --
+// a differential fuzz target pins that.
+
+/// Outcome of `parseIntoLeaky`.
+pub fn LeakyResult(comptime T: type) type {
+    return union(enum) {
+        /// Decoded and valid. Lives in the allocator passed in; its strings
+        /// may point into `body` (they do whenever the JSON string had no
+        /// escapes), so `body` must outlive it too.
+        ok: T,
+        /// Owns its memory like any Report (`deinit`).
+        invalid: Report,
+    };
+}
+
+/// `parseIntoLimited` without the value tree: the same rules (`rulesFor(T)`
+/// plus `T.validate_rules`), the same error codes and messages, validated in
+/// one streaming pass, then decoded by `std.json.parseFromSliceLeaky` with
+/// strings borrowed from `body`. Memory is of the order of the body, not a
+/// multiple of it, so `arena` can be a fixed per-request buffer. Pass an
+/// arena-like allocator: the decoded `T` is never freed piecemeal (the
+/// `Leaky` convention of `std.json`). Errors come in document order.
+pub fn parseIntoLeaky(comptime T: type, arena: Allocator, body: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
+    const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+    {
+        var report = try streamValidate(arena, body, comptime rulesFor(T), extra, limits);
+        if (!report.ok()) return .{ .invalid = report };
+        report.deinit();
+    }
+    const value = std.json.parseFromSliceLeaky(T, arena, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+        .max_value_len = body.len,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Defensive, as in `parseIntoLimited`: valid against the schema, yet
+        // the decode refused (a 64-bit integer past what f64 bounds express).
+        else => {
+            var db = Builder.init(arena);
+            errdefer db.abort();
+            try db.appendf("", "invalid", "Input could not be decoded: {s}", .{@errorName(err)});
+            return .{ .invalid = db.finish() };
+        },
+    };
+    return .{ .ok = value };
+}
+
+/// `validateJsonLimited` without the value tree (see `parseIntoLeaky`). Any
+/// allocator; every temporary is freed before return, and the Report owns
+/// what it keeps. Errors come in document order.
+pub fn validateJsonStreaming(gpa: Allocator, body: []const u8, schema: []const Rule, limits: Limits) Allocator.Error!Report {
+    return streamValidate(gpa, body, schema, &.{}, limits);
+}
+
+/// Validate `body` against `schema` and, as a second rule set over the same
+/// document, `extra` (a typed `T.validate_rules`), deduplicating the second
+/// set's (path, code) pairs against the first -- the `parseIntoLimited`
+/// double-pass, done in one walk.
+fn streamValidate(gpa: Allocator, body: []const u8, schema: []const Rule, extra: []const Rule, limits: Limits) Allocator.Error!Report {
+    if (try jsonLimitError(gpa, body, limits)) |e| return singleErrorReport(gpa, e);
+
+    // No `errdefer` over the builder: the json_invalid branch below aborts it
+    // and then allocates again, and an armed errdefer would free it twice on
+    // that allocation's failure (the bug fixed in `parseIntoLimited`).
+    var b = Builder.init(gpa);
+    const bad_json = walkDocument(&b, gpa, body, schema, extra) catch |err| {
+        b.abort();
+        return err;
+    };
+    if (bad_json) |err| {
+        b.abort();
+        return jsonInvalidReport(gpa, err);
+    }
+    return b.finish();
+}
+
+/// Walk the whole document into `b`. Returns the error a tree parse would
+/// have failed with (syntax, truncation, duplicate key) -- the caller turns
+/// it into json_invalid and drops whatever validation errors were found --
+/// or null. Only `OutOfMemory` propagates.
+fn walkDocument(b: *Builder, gpa: Allocator, body: []const u8, schema: []const Rule, extra: []const Rule) Allocator.Error!?anyerror {
+    var s: Stream = .{
+        .scanner = std.json.Scanner.initCompleteInput(gpa, body),
+        .gpa = gpa,
+        .body_len = body.len,
+        .b = b,
+    };
+    defer s.deinit();
+
+    // The document root is held to an implicit `.object` rule per rule set,
+    // which is `checkValue`'s root behaviour: a non-object root is one
+    // `object_type` error at path "".
+    const roots = [2]Rule{
+        .{ .field = "", .kind = .object, .fields = schema },
+        .{ .field = "", .kind = .object, .fields = extra },
+    };
+    const actives = [2]Active{ .{ .rule = &roots[0], .pass = 0 }, .{ .rule = &roots[1], .pass = 1 } };
+    const active: []const Active = if (extra.len == 0) actives[0..1] else actives[0..2];
+
+    // A non-OOM error here is the document's, not ours: it is the VALUE this
+    // function returns, hence the `@as` -- a bare `return err` would raise it.
+    s.walkValue(null, active) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return @as(?anyerror, err),
+    };
+    const last = s.scanner.next() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return @as(?anyerror, err),
+    };
+    if (last != .end_of_document) return @as(?anyerror, error.SyntaxError);
+
+    // Merge the second rule set's errors after the first's, minus the pairs
+    // the first already reported.
+    s.use(0);
+    const first_len = b.list.items.len;
+    for (s.other.items) |e| {
+        if (b.full()) break;
+        try b.list.append(b.a(), e);
+    }
+    b.dedupeFrom(first_len);
+    return null;
+}
+
+/// One rule applying to the value being walked, and which rule set it came
+/// from (0 = the schema, 1 = `T.validate_rules`).
+const Active = struct { rule: *const Rule, pass: u1 };
+
+/// A node's place in the document, as a chain up to the root. Rendered to the
+/// report's path syntax ("a.b", "a[2].c") only when an error needs it.
+const Seg = struct {
+    parent: ?*Seg,
+    /// A rule's `field` string (schema memory, so a rendered path may borrow
+    /// it), or unused for an array item.
+    field: []const u8 = "",
+    index: usize = 0,
+    is_index: bool = false,
+    rendered: ?[]const u8 = null,
+};
+
+const Stream = struct {
+    scanner: std.json.Scanner,
+    gpa: Allocator,
+    body_len: usize,
+    b: *Builder,
+    /// The list of the rule set NOT currently in `b.list` (see `use`).
+    other: std.ArrayList(Error) = .empty,
+    current: u1 = 0,
+    /// Keys of every object currently open, innermost last -- the duplicate
+    /// check. `owned` keys were unescaped into `gpa` and are freed when their
+    /// object closes.
+    keys: std.ArrayList(Key) = .empty,
+
+    const Key = struct { name: []const u8, owned: bool };
+
+    const WalkError = std.json.Scanner.AllocError || error{ DuplicateField, BufferUnderrun };
+
+    fn deinit(s: *Stream) void {
+        s.freeKeysFrom(0);
+        s.keys.deinit(s.gpa);
+        s.scanner.deinit();
+    }
+
+    fn freeKeysFrom(s: *Stream, mark: usize) void {
+        var i = s.keys.items.len;
+        while (i > mark) {
+            i -= 1;
+            const k = s.keys.items[i];
+            if (k.owned) s.gpa.free(k.name);
+        }
+        s.keys.shrinkRetainingCapacity(mark);
+    }
+
+    /// Point `b.list` at rule set `pass`'s error list. Both lists allocate
+    /// from `b`'s arena, so either can end up in the Report.
+    fn use(s: *Stream, pass: u1) void {
+        if (s.current == pass) return;
+        std.mem.swap(std.ArrayList(Error), &s.b.list, &s.other);
+        s.current = pass;
+    }
+
+    fn path(s: *Stream, seg: ?*Seg) Allocator.Error![]const u8 {
+        const node = seg orelse return "";
+        if (node.rendered) |r| return r;
+        const r = if (node.parent) |p| blk: {
+            const prefix = try s.path(p);
+            break :blk if (node.is_index)
+                try std.fmt.allocPrint(s.b.a(), "{s}[{d}]", .{ prefix, node.index })
+            else if (prefix.len == 0)
+                node.field
+            else
+                try std.fmt.allocPrint(s.b.a(), "{s}.{s}", .{ prefix, node.field });
+        } else if (node.is_index)
+            try std.fmt.allocPrint(s.b.a(), "[{d}]", .{node.index})
+        else
+            node.field;
+        node.rendered = r;
+        return r;
+    }
+
+    /// Run `checkRule` for a value it can see whole. The path is rendered
+    /// only if the rule reported something: `checkRule` is given a
+    /// placeholder, and the entries it appended are repointed afterwards.
+    /// A container's rule recurses with its path, so it gets the real one.
+    fn check(s: *Stream, seg: ?*Seg, v: Value, a: Active) Allocator.Error!void {
+        s.use(a.pass);
+        if (s.b.full()) return;
+        if (v == .array or v == .object) return checkRule(s.b, try s.path(seg), v, a.rule);
+        const mark = s.b.list.items.len;
+        try checkRule(s.b, "", v, a.rule);
+        if (s.b.list.items.len == mark) return;
+        const p = try s.path(seg);
+        for (s.b.list.items[mark..]) |*e| e.path = p;
+    }
+
+    fn walkValue(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
+        switch (try s.scanner.peekNextTokenType()) {
+            .object_begin, .array_begin => {
+                for (active) |a| if (a.rule.custom != null) return s.materialize(seg, active);
+                if (try s.scanner.peekNextTokenType() == .object_begin)
+                    return s.walkObject(seg, active);
+                return s.walkArray(seg, active);
+            },
+            else => return s.walkScalar(seg, active),
+        }
+    }
+
+    fn walkScalar(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
+        const token = try s.scanner.nextAllocMax(s.gpa, .alloc_if_needed, s.body_len);
+        var owned: ?[]const u8 = null;
+        defer if (owned) |o| s.gpa.free(o);
+        const v: Value = switch (token) {
+            .string => |str| .{ .string = str },
+            .allocated_string => |str| blk: {
+                owned = str;
+                break :blk .{ .string = str };
+            },
+            .number => |n| Value.parseFromNumberSlice(n),
+            .allocated_number => |n| blk: {
+                owned = n;
+                break :blk Value.parseFromNumberSlice(n);
+            },
+            .true => .{ .bool = true },
+            .false => .{ .bool = false },
+            .null => .null,
+            else => unreachable, // peeked: not a container, not an end
+        };
+        for (active) |a| try s.check(seg, v, a);
+    }
+
+    /// A subtree some rule needs as a `Value` (its `custom` predicate): parse
+    /// just that subtree and let the tree path check it.
+    fn materialize(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        const v = std.json.Value.jsonParse(arena.allocator(), &s.scanner, .{
+            .max_value_len = s.body_len,
+            .allocate = .alloc_always,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DuplicateField => return error.DuplicateField,
+            error.SyntaxError => return error.SyntaxError,
+            error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
+            error.ValueTooLong => return error.ValueTooLong,
+            else => return error.SyntaxError, // type-directed errors: unreachable for Value
+        };
+        for (active) |a| try s.check(seg, v, a);
+    }
+
+    /// The container type gate of `checkRule`, for rule `a` and a container
+    /// of `kind` (.array / .object): true when the rule's constraints apply.
+    fn gate(s: *Stream, seg: ?*Seg, a: Active, kind: Kind) Allocator.Error!bool {
+        if (a.rule.kind == .any or a.rule.kind == kind) return true;
+        s.use(a.pass);
+        if (!s.b.full()) try appendTypeError(s.b, try s.path(seg), a.rule.kind);
+        return false;
+    }
+
+    fn walkObject(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
+        _ = try s.scanner.next(); // .object_begin
+
+        var fallback = std.heap.stackFallback(256, s.gpa);
+        const scratch = fallback.get();
+
+        // One entry per rule that passed the gate and has fields to match.
+        const Fields = struct { rules: []const Rule, pass: u1, seen: []bool };
+        var sets: std.ArrayList(Fields) = .empty;
+        defer {
+            for (sets.items) |f| scratch.free(f.seen);
+            sets.deinit(scratch);
+        }
+        for (active) |a| {
+            if (!try s.gate(seg, a, .object)) continue;
+            const rules = a.rule.fields orelse continue;
+            const seen = try scratch.alloc(bool, rules.len);
+            @memset(seen, false);
+            sets.append(scratch, .{ .rules = rules, .pass = a.pass, .seen = seen }) catch |err| {
+                scratch.free(seen);
+                return err;
+            };
+        }
+
+        const mark = s.keys.items.len;
+        defer s.freeKeysFrom(mark);
+        var children: std.ArrayList(Active) = .empty;
+        defer children.deinit(scratch);
+
+        while (true) {
+            const token = try s.scanner.nextAllocMax(s.gpa, .alloc_if_needed, s.body_len);
+            const key: Key = switch (token) {
+                .object_end => break,
+                .string => |k| .{ .name = k, .owned = false },
+                .allocated_string => |k| .{ .name = k, .owned = true },
+                else => unreachable, // the scanner only yields a key here
+            };
+            s.keys.append(s.gpa, key) catch |err| {
+                if (key.owned) s.gpa.free(key.name);
+                return err;
+            };
+            var duplicate = false;
+            for (s.keys.items[mark .. s.keys.items.len - 1]) |k| {
+                if (std.mem.eql(u8, k.name, key.name)) duplicate = true;
+            }
+
+            children.clearRetainingCapacity();
+            var child: Seg = .{ .parent = seg };
+            for (sets.items) |set| {
+                for (set.rules, set.seen) |*r, *seen| {
+                    if (!std.mem.eql(u8, r.field, key.name)) continue;
+                    seen.* = true;
+                    child.field = r.field;
+                    try children.append(scratch, .{ .rule = r, .pass = set.pass });
+                }
+            }
+            try s.walkValue(&child, children.items);
+            // Reported after the value, as the tree parser does: an error
+            // inside the duplicate's value wins over the duplicate itself.
+            if (duplicate) return error.DuplicateField;
+        }
+
+        for (sets.items) |set| {
+            for (set.rules, set.seen) |r, seen| {
+                if (seen or !r.required) continue;
+                s.use(set.pass);
+                if (s.b.full()) continue;
+                var missing: Seg = .{ .parent = seg, .field = r.field };
+                try s.b.append(try s.path(&missing), "missing", "Field required");
+            }
+        }
+    }
+
+    fn walkArray(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
+        _ = try s.scanner.next(); // .array_begin
+
+        var fallback = std.heap.stackFallback(128, s.gpa);
+        const scratch = fallback.get();
+        var gated: std.ArrayList(Active) = .empty;
+        defer gated.deinit(scratch);
+        var items: std.ArrayList(Active) = .empty;
+        defer items.deinit(scratch);
+        for (active) |a| {
+            if (!try s.gate(seg, a, .array)) continue;
+            try gated.append(scratch, a);
+            if (a.rule.items) |r| try items.append(scratch, .{ .rule = r, .pass = a.pass });
+        }
+
+        var count: usize = 0;
+        while (try s.scanner.peekNextTokenType() != .array_end) : (count += 1) {
+            var child: Seg = .{ .parent = seg, .index = count, .is_index = true };
+            try s.walkValue(&child, items.items);
+        }
+        _ = try s.scanner.next(); // .array_end
+
+        for (gated.items) |a| {
+            s.use(a.pass);
+            if (s.b.full()) continue;
+            if (a.rule.min_len) |m| if (count < m)
+                try s.b.appendf(try s.path(seg), "too_short", "Array should have at least {d} items", .{m});
+            if (a.rule.max_len) |m| if (count > m)
+                try s.b.appendf(try s.path(seg), "too_long", "Array should have at most {d} items", .{m});
+        }
+    }
+};
+
 // ── middleware (router + http) ──────────────────────────────────────────────
 
 /// Runtime-schema JSON body validation middleware. Register on the group (or
@@ -2634,6 +3044,286 @@ test "every allocation failure point: no leak, no double free" {
     try testing.checkAllAllocationFailures(testing.allocator, S.query, .{ "name=a%20b&age=x", @as([]const Rule, &qschema) });
 }
 
+// ── tests: the streaming path agrees with the tree path ────────────────────
+
+fn lessError(_: void, x: Error, y: Error) bool {
+    return switch (std.mem.order(u8, x.path, y.path)) {
+        .lt => true,
+        .gt => false,
+        .eq => switch (std.mem.order(u8, x.code, y.code)) {
+            .lt => true,
+            .gt => false,
+            .eq => std.mem.lessThan(u8, x.message, y.message),
+        },
+    };
+}
+
+/// Same errors, order aside (the streaming path reports in document order).
+fn expectSameErrors(want: []const Error, got: []const Error) !void {
+    const a = try testing.allocator.dupe(Error, want);
+    defer testing.allocator.free(a);
+    const b = try testing.allocator.dupe(Error, got);
+    defer testing.allocator.free(b);
+    std.mem.sort(Error, a, {}, lessError);
+    std.mem.sort(Error, b, {}, lessError);
+    if (a.len != b.len) {
+        std.debug.print("\ntree: {d} errors, stream: {d}\n", .{ a.len, b.len });
+        for (a) |e| std.debug.print("  tree   {s} {s} {s}\n", .{ e.path, e.code, e.message });
+        for (b) |e| std.debug.print("  stream {s} {s} {s}\n", .{ e.path, e.code, e.message });
+        return error.TestExpectedEqual;
+    }
+    for (a, b) |x, y| {
+        try testing.expectEqualStrings(x.path, y.path);
+        try testing.expectEqualStrings(x.code, y.code);
+        try testing.expectEqualStrings(x.message, y.message);
+    }
+}
+
+/// Run both runtime-schema paths on `body` and require the same outcome.
+fn expectSchemaAgrees(body: []const u8, schema: []const Rule) !void {
+    var tree = try validateJson(testing.allocator, body, schema);
+    defer tree.deinit();
+    var stream = try validateJsonStreaming(testing.allocator, body, schema, .{});
+    defer stream.deinit();
+    try expectSameErrors(tree.errors, stream.errors);
+}
+
+/// Run both typed paths on `body` and require the same outcome: the same
+/// errors, or equal decoded values.
+fn expectTypedAgrees(comptime T: type, body: []const u8) !void {
+    var tree = try parseIntoLimited(T, testing.allocator, body, .{});
+    defer tree.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var stream = try parseIntoLeaky(T, arena.allocator(), body, .{});
+    switch (tree) {
+        .ok => |parsed| {
+            if (stream != .ok) {
+                std.debug.print("\ntree ok, stream invalid:\n", .{});
+                for (stream.invalid.errors) |e| std.debug.print("  {s} {s} {s}\n", .{ e.path, e.code, e.message });
+                return error.TestExpectedEqual;
+            }
+            try testing.expectEqualDeep(parsed.value, stream.ok);
+        },
+        .invalid => |r| {
+            if (stream != .invalid) {
+                std.debug.print("\ntree invalid ({d} errors), stream ok\n", .{r.errors.len});
+                return error.TestExpectedEqual;
+            }
+            defer stream.invalid.deinit();
+            try expectSameErrors(r.errors, stream.invalid.errors);
+        },
+    }
+}
+
+const StreamAddr = struct { street: []const u8, city: []const u8, zip: ?[5]u8 = null };
+const StreamColor = enum { red, green, blue };
+const StreamUser = struct {
+    name: []const u8,
+    age: u8,
+    score: f64 = 0,
+    admin: bool = false,
+    color: StreamColor = .red,
+    tags: []const []const u8 = &.{},
+    address: ?StreamAddr = null,
+    history: []const StreamAddr = &.{},
+    big: i64 = 0,
+
+    fn noSpaces(_: ?*anyopaque, v: Value) bool {
+        return v != .string or std.mem.indexOfScalar(u8, v.string, ' ') == null;
+    }
+    fn fewerThanThree(_: ?*anyopaque, v: Value) bool {
+        return v != .array or v.array.items.len < 3;
+    }
+    pub const validate_rules: []const Rule = &.{
+        .{ .field = "name", .kind = .string, .min_len = 2, .custom = .{ .check = noSpaces, .code = "no_spaces", .message = "No spaces" } },
+        // The same field, the same failure as the derived rule: deduplicated.
+        .{ .field = "age", .kind = .int, .max = 150 },
+        // `custom` on a container: this subtree is materialized.
+        .{ .field = "history", .kind = .array, .custom = .{ .check = fewerThanThree, .code = "too_much_history", .message = "At most two" } },
+        .{ .field = "address", .kind = .object, .allow_null = true, .fields = &.{
+            .{ .field = "city", .kind = .string, .one_of = &.{ "Praha", "Brno" } },
+        } },
+    };
+};
+
+test "streaming: typed decode agrees with parseIntoLimited" {
+    const bodies = [_][]const u8{
+        \\{"name":"Ada","age":36}
+        ,
+        \\{"name":"Ada","age":36,"score":1,"admin":true,"color":"blue","tags":["a","b\"c"],"address":{"street":"S","city":"Brno","zip":"12345"},"history":[{"street":"x","city":"Praha"}],"big":9007199254740993,"extra":{"deep":[1,{"k":null}]}}
+        ,
+        // Escapes everywhere: in keys, in values, in unknown fields.
+        \\{"n\u0061me":"\u0041da","age":1,"x\n":"\ud83d\ude00"}
+        ,
+        // Every kind wrong.
+        \\{"name":1,"age":"x","score":"s","admin":0,"color":"pink","tags":[1,[]],"address":[],"history":{},"big":1.5}
+        ,
+        // Bounds: u8 overflow, float for an int, an integral float.
+        \\{"name":"Ada","age":256}
+        ,
+        \\{"name":"Ada","age":36.0}
+        ,
+        \\{"name":"Ada","age":-1}
+        ,
+        // Missing required fields, at the root and nested.
+        \\{}
+        ,
+        \\{"name":"Ada","age":1,"address":{"street":"s"}}
+        ,
+        \\{"name":"Ada","age":1,"history":[{"city":"Praha"},{"street":"x"}]}
+        ,
+        // validate_rules: custom on a scalar, custom on a container, nested one_of.
+        \\{"name":"A B","age":1}
+        ,
+        \\{"name":"Ada","age":1,"history":[{"street":"a","city":"b"},{"street":"a","city":"b"},{"street":"a","city":"b"}]}
+        ,
+        \\{"name":"Ada","age":1,"address":{"street":"s","city":"Ostrava"}}
+        ,
+        \\{"name":"Ada","age":1,"address":null}
+        ,
+        // Fixed-size byte array: bytes, not code points.
+        \\{"name":"Ada","age":1,"address":{"street":"s","city":"Brno","zip":"1234"}}
+        ,
+        \\{"name":"Ada","age":1,"address":{"street":"s","city":"Brno","zip":"éé1"}}
+        ,
+        // Huge numbers: number_string on the tree side.
+        \\{"name":"Ada","age":1,"big":123456789012345678901234567890}
+        ,
+        \\{"name":"Ada","age":1,"score":1e400}
+        ,
+        // Not an object at the root.
+        \\[1,2]
+        ,
+        \\null
+        ,
+        \\"x"
+        ,
+        // Malformed: json_invalid, whatever validation found first.
+        "",
+        \\{"name":1,
+        ,
+        \\{"name":"Ada","age":1}x
+        ,
+        \\{"age":"x","name":}
+        ,
+        // Duplicate keys: known, unknown, nested, escaped, and one whose
+        // value is itself malformed (the syntax error wins, as in a tree parse).
+        \\{"name":"Ada","age":1,"name":"Bob"}
+        ,
+        \\{"name":"Ada","age":1,"u":1,"u":2}
+        ,
+        \\{"name":"Ada","age":1,"extra":{"a":{"b":1,"b":2}}}
+        ,
+        \\{"name":"Ada","age":1,"a":1,"\u0061":2}
+        ,
+        \\{"name":"Ada","age":1,"d":1,"d":[1,}
+        ,
+        // Duplicate inside a materialized subtree.
+        \\{"name":"Ada","age":1,"history":[{"street":"a","city":"b","city":"c"}]}
+        ,
+    };
+    for (bodies) |body| {
+        expectTypedAgrees(StreamUser, body) catch |err| {
+            std.debug.print("body: {s}\n", .{body});
+            return err;
+        };
+    }
+}
+
+test "streaming: runtime schema agrees with validateJson" {
+    const schema = [_]Rule{
+        .{ .field = "a", .kind = .any, .min_len = 2, .max = 3, .format = .email },
+        .{ .field = "b", .kind = .array, .min_len = 1, .max_len = 2, .items = &.{ .field = "", .kind = .object, .fields = &.{
+            .{ .field = "c", .kind = .int, .required = true },
+        } } },
+        .{ .field = "d", .kind = .object, .required = true, .fields = &.{
+            .{ .field = "e", .kind = .any, .fields = &.{.{ .field = "f", .kind = .bool, .required = true }} },
+        } },
+        // Two rules for one field: both apply.
+        .{ .field = "g", .kind = .string, .pattern = .{ .prefix = "x" } },
+        .{ .field = "g", .kind = .string, .max_len = 2 },
+        .{ .field = "h", .kind = .float, .allow_null = true, .min = 0 },
+    };
+    const bodies = [_][]const u8{
+        \\{"d":{}}
+        ,
+        \\{"a":"x","b":[],"d":{"e":{}},"g":"yyy","h":null}
+        ,
+        \\{"a":5,"b":[{"c":1},{"c":"2"},{}],"d":{"e":{"f":1}},"g":"x","h":-1}
+        ,
+        \\{"a":[1],"b":{},"d":[],"g":1,"h":"1"}
+        ,
+        \\{"a":{"x":1},"d":{"e":[1,2]}}
+        ,
+        \\{"a":null,"b":null,"d":null}
+        ,
+        \\{"a":"bad@","d":{"e":"s"},"b":[{"c":1.5},{"c":1e2}]}
+        ,
+    };
+    for (bodies) |body| {
+        expectSchemaAgrees(body, &schema) catch |err| {
+            std.debug.print("body: {s}\n", .{body});
+            return err;
+        };
+    }
+}
+
+test "streaming: a valid document allocates no error path, and decodes into a body-sized buffer" {
+    // The measurement that motivated the streaming path, pinned: a 16.5 KiB
+    // body of 1500 strings decoded into a FixedBufferAllocator of 3x its size.
+    // The tree path needs 955 KiB for the same body.
+    const T = struct { name: []const u8, tags: []const []const u8 };
+    var body_buf: [20000]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&body_buf);
+    try w.writeAll("{\"name\":\"n\",\"tags\":[");
+    for (0..1500) |i| try w.print("{s}\"tag-{d:0>4}\"", .{ if (i == 0) "" else ",", i });
+    try w.writeAll("]}");
+    const body = w.buffered();
+
+    const mem = try testing.allocator.alloc(u8, 3 * body.len);
+    defer testing.allocator.free(mem);
+    var fba: std.heap.FixedBufferAllocator = .init(mem);
+    const r = try parseIntoLeaky(T, fba.allocator(), body, .{});
+    try testing.expect(r == .ok);
+    try testing.expectEqual(@as(usize, 1500), r.ok.tags.len);
+    try testing.expectEqualStrings("tag-1499", r.ok.tags[1499]);
+    // Unescaped strings are borrowed from the body, not copied.
+    try testing.expect(@intFromPtr(r.ok.name.ptr) >= @intFromPtr(body.ptr) and
+        @intFromPtr(r.ok.name.ptr) < @intFromPtr(body.ptr) + body.len);
+}
+
+test "streaming: every allocation failure point, no leak, no double free" {
+    const S = struct {
+        fn stream(gpa: Allocator, body: []const u8) !void {
+            var r = try validateJsonStreaming(gpa, body, &fuzz_schema, .{});
+            r.deinit();
+        }
+        fn typed(gpa: Allocator, body: []const u8) !void {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            var r = try parseIntoLeaky(StreamUser, arena.allocator(), body, .{});
+            if (r == .invalid) r.invalid.deinit();
+        }
+    };
+    const bodies = [_][]const u8{
+        \\{"name":"ok","age":1,"tags":["a","b"],"meta":{"id":1,"active":true},"x\u0041":{"k":[1,"\u00e9"]}}
+        ,
+        \\{"name":7,"age":"x","tags":[1,2,3,4,5,6],"meta":{"active":1}}
+        ,
+        \\{"name":"A B","age":300,"history":[{"street":"a","city":"b"},{},{}],"address":{"city":"x"}}
+        ,
+        \\{"name":"a","name":"b"}
+        ,
+        \\{"name":
+        ,
+    };
+    for (bodies) |body| {
+        try testing.checkAllAllocationFailures(testing.allocator, S.stream, .{body});
+        try testing.checkAllAllocationFailures(testing.allocator, S.typed, .{body});
+    }
+}
+
 test "writeProblem: RFC 9457 body carrying the aggregated errors" {
     var r = try validateJson(testing.allocator, "{\"age\":\"x\"}", &.{
         .{ .field = "age", .kind = .int },
@@ -3496,6 +4186,32 @@ fn fuzzValidateJson(_: void, smith: *std.testing.Smith) !void {
 
     var r = validateJson(testing.allocator, body, &fuzz_schema) catch return;
     defer r.deinit();
+}
+
+/// The fuzz schema as a typed struct, carrying the schema itself as
+/// `validate_rules` -- so the typed differential also runs the second rule set
+/// and its deduplication on every input.
+const FuzzTyped = struct {
+    name: []const u8,
+    age: ?i32 = null,
+    email: ?[]const u8 = null,
+    code: []const u8 = "",
+    tags: []const []const u8 = &.{},
+    meta: ?struct { id: i64, active: bool = false } = null,
+    pub const validate_rules: []const Rule = &fuzz_schema;
+};
+
+test "fuzz: the streaming path agrees with the tree path" {
+    try testing.fuzz({}, fuzzStreamingAgrees, .{ .corpus = &json_seeds });
+}
+
+fn fuzzStreamingAgrees(_: void, smith: *std.testing.Smith) !void {
+    var raw: [1 + json_buf_len]u8 = undefined;
+    const n: usize = smith.slice(&raw);
+    var buf: [json_buf_len]u8 = undefined;
+    const body = buildJsonBody(raw[0..n], &buf);
+    try expectSchemaAgrees(body, &fuzz_schema);
+    try expectTypedAgrees(FuzzTyped, body);
 }
 
 test "corpus: every body reaches validateJson, and the violations reported are pinned" {

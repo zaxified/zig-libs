@@ -65,7 +65,20 @@ switch (result) {
     .ok => |parsed| use(parsed.value),
     .invalid => |report| for (report.errors) |e| log(e.path, e.code, e.message),
 }
+
+// Streaming, into a fixed per-request buffer (no value tree; ~1.5x the body).
+// `thing` lives in `fba` and borrows unescaped strings from `body_bytes`:
+var fba: std.heap.FixedBufferAllocator = .init(&request_buf);
+switch (try validate.parseIntoLeaky(CreateThing, fba.allocator(), body_bytes, .{})) {
+    .ok => |thing| use(thing),
+    .invalid => |report| try report.writeProblem(w, .{ .status = 422 }),
+}
 ```
+
+`parseInto`/`validateJson` build a `std.json.Value` tree first, which costs
+30–60× the body; `parseIntoLeaky`/`validateJsonStreaming` apply the same rules
+straight from the scanner's tokens. Same errors — reported in document order
+rather than schema order.
 
 ### Runtime schema (body, query, path params)
 

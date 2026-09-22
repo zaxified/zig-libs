@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **New streaming path: `parseIntoLeaky(T, arena, body, limits)` and
+  `validateJsonStreaming(gpa, body, schema, limits)`** — the rules, codes and messages of
+  `parseIntoLimited`/`validateJsonLimited` without building a `std.json.Value` tree. The tree
+  costs 30–60× the body; the streaming path ~1.5× + ~2 KiB (smallest FixedBufferAllocator for a
+  16.5 KiB body: 955 KiB → 25 KiB; 118 B body: 4.4 KiB → 704 B), so a server can decode typed
+  bodies into a fixed per-request buffer. Scalars go through the same `checkRule`; containers are
+  walked from the scanner's tokens; only a container with a `custom` rule is materialized. The
+  decoded `T` is allocator-leaky and borrows unescaped strings from `body`. Errors come in document
+  order; the error set equals the tree path's — pinned by a differential fuzz target and a
+  hand-written edge set (escaped/duplicate/nested keys, malformed values inside a duplicate,
+  number_string, fixed byte arrays). Also: `SPEC.md` claimed duplicate keys resolve "last wins";
+  they are refused (`DuplicateField` → `json_invalid`), on both paths.
+
 - **2026-09-22** — **FIX (memory safety): `parseInto`/`parseIntoLimited` freed
   the validation arena twice when the decode into `T` ran out of memory.** On the
   success path the error builder is aborted before `std.json.parseFromValue`
