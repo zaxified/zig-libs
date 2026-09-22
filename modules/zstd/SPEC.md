@@ -14,15 +14,23 @@ libzstd switches it on by itself (level 22 above 64 MB), and the entropy stage
 (literals via Huffman, sequences via FSE); see [NOTICE](NOTICE) for the
 file-by-file map.
 
-Not here, and a reader might expect it:
+**Goal (2026-09-22): production quality — as close to libzstd's feature set
+and behaviour as possible, so that a Zig program never needs to link libzstd.**
+Today it is the one-shot compressor only; everything else libzstd offers is
+in *Backlog / deferred* below, with its cost.
 
-- **A decoder.** `std.compress.zstd.Decompress` exists (CONVENTIONS.md §1.3).
-  The tests use it as the round-trip oracle.
+Not here yet, and a reader might expect it (each is a backlog item):
+
+- **A decoder.** `std.compress.zstd.Decompress` decodes what this module
+  writes and is the tests' round-trip oracle, but it refuses dictionary
+  frames, leaves checksum verification as a TODO panic, and defaults to an
+  8 MB window (frames of levels 20–22 on large inputs need
+  `window_len` raised). Z2.
 - **Streaming.** One call, whole input. libzstd's streaming API blocks the
   input on its own buffer boundaries and so produces *different* (equally
-  valid) frames; matching those would be a different contract.
-- **Dictionaries, multithreading, `targetCBlockSize`, and long-distance
-  matching as an option.** libzstd's `ZSTD_c_enableLongDistanceMatching`
+  valid) frames; matching those is its own contract. Z1.
+- **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8),
+  and long-distance matching as an option (Z7).** libzstd's `ZSTD_c_enableLongDistanceMatching`
   (the CLI's `--long`) is not in `Options`: LDM happens exactly where libzstd
   switches it on by itself. Under the optimal parsers the by-hand switch is
   a test seam (`frame.Options.ldm`); below `btopt` LDM runs a different path
@@ -297,12 +305,105 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
   The reference's speed comes from unrolling, prefetch and branchless selects
   that do not change decisions; adding them is possible later without touching
   the goldens. *Not now.*
-- **Matching the `zstd` CLI.** See *Streaming* above. *Never*, as a contract;
-  the CLI's output is equally valid and decodes the same.
-- **Long-distance matching below `btopt`, or as an option** (see *Not
-  here*). *Not now* — no consumer asks for `--long`; porting the
-  sequence-splicing path is ~100 lines of C plus `ZSTD_fillHashTable` /
-  `ZSTD_fillDoubleHashTable` for `fast`/`dfast`.
+- **Matching the `zstd` CLI as such.** The CLI drives the streaming API with
+  its own buffer sizes; once Z1 matches `ZSTD_compressStream2`, the same
+  chunking reproduces the CLI's frames, but the CLI (argv, file handling) is
+  not this module's contract. *Never.*
+
+## Backlog / deferred
+
+Toward the goal above. "Session" ≈ one working session of the size of the
+level-22/LDM port (≈ 500 lines of Zig with its goldens, diff runs and
+mutation sweep). Every item that changes output is anchored the same way as
+today: byte-identical to libzstd 1.5.7 through `tools/zref.c`, extended for
+the API in question, plus goldens and a mutation sweep. Consumers as of
+2026-09-22: **egw-hub** compresses CSV backups (one-shot suffices today);
+**qap** wants HTTP `Content-Encoding: zstd` (Z1a now, Z1 later);
+dictionaries are undecided.
+
+- **Z1 — Streaming compression, byte-identical to `ZSTD_compressStream2`.**
+  A compression context (`ZSTD_CCtx`) with `compressStream2`
+  (`continue`/`flush`/`end`), reset and parameter setting; libzstd's input
+  buffer of window + block size that wraps around; unknown pledged size (no
+  parameter shrinking, header without content size — or with it when
+  pledged); the stable-input mode. The wrap makes the window two segments,
+  so **every match finder needs its extDict variant** (fast, dfast, lazy
+  over hash chain / row / DUBT, the binary tree and optimal parser —
+  roughly 1 500–2 000 lines of C across `zstd_fast.c`, `zstd_double_fast.c`,
+  `zstd_lazy.c`, `zstd_opt.c`), and `ZSTD_count_2segments` plus LDM's
+  two-segment counters. Long streams need Z3. Oracle: a `zref` mode that
+  feeds the input in a given chunk schedule. **3–4 sessions.**
+- **Z1a — Frame-per-flush writer (interim).** A `std.Io.Writer` that
+  buffers input and emits one one-shot frame per flush / buffer fill;
+  std's decoder reads concatenated frames. Anchored by the existing goldens
+  (each frame is a one-shot frame). Worse ratio for small chunks.
+  **Hours.** Unblocks qap now.
+- **Z2 — Decoder.** Frames with dictionaries (raw content and zstd-format:
+  entropy tables + repcodes + content as history), checksum verification,
+  configurable window limit (`ZSTD_d_windowLogMax`), streaming
+  (`ZSTD_decompressStream`), and the frame utilities
+  (`ZSTD_getFrameContentSize`, `ZSTD_findFrameCompressedSize`,
+  `ZSTD_getDictID_fromFrame`, skippable frames). Correctness, not byte
+  equality, is the contract: differential against libzstd's decoder plus
+  its fuzz corpus. Can start from std's decoder (MIT) — it is a superset,
+  which is why it is not a duplicate of std (CONVENTIONS.md §1.3). Legacy
+  (pre-v0.8) formats: no. **1–2 sessions.**
+- **Z3 — Index overflow correction.** `ZSTD_window_correctOverflow` and the
+  table reductions (`ZSTD_reduceTable`, the binary-tree variant keeping
+  unsorted marks, the row tag table, the LDM table), so that inputs and
+  streams past 3 500 MiB work; `max_input_size` goes away. **< 1 session.**
+  Prerequisite for long-running Z1 streams.
+- **Z4 — Compression with a dictionary.** Raw-content and zstd-format
+  dictionaries (`ZSTD_loadCEntropy`, `ZSTD_loadDictionaryContent`), a
+  reusable `CDict`, libzstd's attach / copy / reload choice
+  (`ZSTD_shouldAttachDict` by size and strategy), which needs the
+  **dictMatchState variant of every match finder** (on top of Z1's
+  extDict), and the dictionary ID in the header. Dedicated dictionary
+  search (`enableDedicatedDictSearch`) optional. Needs Z2 to decode.
+  **2–3 sessions** after Z1.
+- **Z5 — Dictionary training.** `ZDICT_trainFromBuffer` (fastCover, the
+  CLI's default), `ZDICT_optimizeTrainFromBuffer_*`, `cover`, and
+  `ZDICT_finalizeDictionary` (entropy tables for a given content); the
+  legacy divsufsort trainer: no. Until then `zstd --train` offline works.
+  **1–2 sessions.**
+- **Z6 — Advanced parameters.** Explicit compression parameters (window,
+  chain, hash, search log, min match, target length, strategy) with
+  libzstd's bounds and adjustment; content-size and dictID flags;
+  magicless frames; writing skippable frames; `literalCompressionMode`,
+  `useRowMatchFinder`, `useBlockSplitter`/`postBlockSplitter`,
+  `maxBlockSize`, `searchForExternalRepcodes`. Each goldened through
+  `zref` with the parameter set. **~1 session.**
+- **Z7 — Long-distance matching as an option** (`--long`, window log 27 by
+  default): the path below `btopt` (`ZSTD_ldm_blockCompress`'s splicing
+  loop, `maybeSplitSequence`, `ZSTD_ldm_skipSequences`,
+  `ZSTD_ldm_fillFastTables` with `ZSTD_fillHashTable` /
+  `ZSTD_fillDoubleHashTable`), and the LDM parameters. The optimal-parser
+  path exists (level 22). **~0.5 session.**
+- **Z8 — `targetCBlockSize`** (superblocks, `zstd_compress_superblock.c`,
+  ~700 lines): blocks cut to a target compressed size for low-latency
+  streaming. **~1 session.** After Z1.
+- **Z9 — Multithreaded compression** (`zstdmt_compress.c`, ~1 900 lines):
+  jobs, overlap between them, LDM across jobs, `rsyncable`. libzstd's
+  output does not depend on the worker count once there is more than
+  none, so it stays goldenable. **~2 sessions.** After Z1.
+- **Z10 — Sequence-level API.** `ZSTD_compressSequences`,
+  `ZSTD_generateSequences`, the external sequence producer. **~1
+  session.** Niche.
+- **Z11 — Speed parity** (target ≤ 1.1× libzstd): unrolled Huffman and
+  histogram loops, prefetch, SIMD row-tag compare, the fast/dfast inner
+  loops' cmov variants — none changes a decision, so the goldens stay.
+  Today 1.2–1.5× at levels 1–8. **~2 sessions**, open-ended.
+- **Z12 — Portability.** Run `portable-zstd-*`; big-endian (the
+  pre-splitter's 16-bit hash reads *native* order in libzstd — decide which
+  to match); 32-bit (`ZSTD_CURRENT_MAX` 2 000 MB). **~0.5 session.**
+- **Z13 — Context reuse and sizing.** A reused `CCtx` gives different
+  output than a fresh one (hash salt, tables kept between frames); match
+  that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
+  caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
+
+Suggested order: Z1a → Z3 → Z1 → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+(once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
+roughly 17–22 sessions.
 
 ## Open
 

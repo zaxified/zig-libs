@@ -5,6 +5,13 @@
 and level. Decoding is not here: `std.compress.zstd.Decompress` already does
 it. This module is the half std lacks.
 
+Not yet a full libzstd replacement — that is the goal: one-shot
+compression is complete, while streaming, a decoder with dictionaries,
+dictionaries themselves, multithreading and the advanced parameters are
+queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs). Note that
+std's decoder defaults to an 8 MB window: frames of levels 20–22 on large
+inputs need its `window_len` raised.
+
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
 lazily sorted binary tree), and the optimal parsers `btopt`, `btultra` and
