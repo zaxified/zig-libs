@@ -5,11 +5,12 @@ Consumer view, API and purpose: [README.md](README.md).
 ## What this module is, and what it is not
 
 A one-shot Zstandard **compressor** that reproduces libzstd 1.5.7's output
-byte for byte for levels 1–21 and every negative level. Every strategy is
+byte for byte for every level, 1–22 and negative. Every strategy is
 translated from libzstd — `fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both
 the hash chain and the row-based search, `btlazy2`'s binary tree, and the
 optimal parsers `btopt`/`btultra`/`btultra2` — together with the frame/block
-driver, the block pre-splitter and post-splitter, and the entropy stage
+driver, the block pre-splitter and post-splitter, long-distance matching as
+libzstd switches it on by itself (level 22 above 64 MB), and the entropy stage
 (literals via Huffman, sequences via FSE); see [NOTICE](NOTICE) for the
 file-by-file map.
 
@@ -17,16 +18,17 @@ Not here, and a reader might expect it:
 
 - **A decoder.** `std.compress.zstd.Decompress` exists (CONVENTIONS.md §1.3).
   The tests use it as the round-trip oracle.
-- **Level 22.** Its largest-tier row asks for a 128 MB window (`windowLog`
-  27), reached on inputs over 64 MB, and libzstd switches long-distance
-  matching on for the optimal parsers from that window up
-  (`ZSTD_resolveEnableLdm`). LDM (`zstd_ldm.c`) is not ported, so level 22 is
-  `error.LevelUnsupported` for every input size — a level's support never
-  depends on the data. Levels 20 and 21 stop at windows of 32 and 64 MB.
 - **Streaming.** One call, whole input. libzstd's streaming API blocks the
   input on its own buffer boundaries and so produces *different* (equally
   valid) frames; matching those would be a different contract.
-- **Dictionaries, long-distance matching, multithreading, `targetCBlockSize`.**
+- **Dictionaries, multithreading, `targetCBlockSize`, and long-distance
+  matching as an option.** libzstd's `ZSTD_c_enableLongDistanceMatching`
+  (the CLI's `--long`) is not in `Options`: LDM happens exactly where libzstd
+  switches it on by itself. Under the optimal parsers the by-hand switch is
+  a test seam (`frame.Options.ldm`); below `btopt` LDM runs a different path
+  (its sequences spliced between runs of the block compressor,
+  `ZSTD_ldm_blockCompress`'s loop with `maybeSplitSequence` and
+  `ZSTD_ldm_fillFastTables`), which is not ported.
 
 ## Algorithm
 
@@ -71,6 +73,22 @@ libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
    block only to seed the statistics, then forgets that block's matches
    (libzstd moves its window base; here the tables are emptied, the same thing
    for every comparison the finders make) and parses it again.
+   **Long-distance matching** (`ldm.zig`), on when the strategy is `btopt` or
+   up and the window log is at least 27 — level 22 on inputs over 64 MB
+   (`ZSTD_resolveEnableLdm`): before each block is parsed, a gear rolling hash
+   marks split points about every 2^4 bytes (2^5 for `btopt`/`btultra`); the
+   32 (`btopt`: 64) bytes before each are hashed with XXH64 into a table of
+   2^23 entries in buckets of 256 (`btopt`: 128), keyed by the low bits and
+   checked by the high 32. A checksum hit that extends forwards to at least
+   that length (and then backwards) becomes a raw sequence; the table keeps
+   its own window, cut back by the END of each block. The block's sequences
+   are then offered to the optimal parser as one extra candidate per position
+   (`ZSTD_optLdm_*`), appended when longer than every match the tree found.
+   Two libzstd quirks are kept because the output depends on them:
+   `ZSTD_ldm_gear_reset` rolls a local copy and never stores it (so it
+   resets nothing), and the candidate taken from a block's last LDM sequence
+   is never offered (consuming it leaves the store exhausted, which returns
+   before the candidate is added).
 5. **Post-split** (`blocksplit.zig`), `btopt` and up with a window of at least
    128 KB: the block's sequences are halved recursively (ranges of ≥ 300
    sequences, ≤ 196 splits) while the estimated sizes of the two halves, each
@@ -112,7 +130,8 @@ pre-splitter's 16-bit hash, which `greedy` and up use).
 
 | limit | value | source |
 |---|---|---|
-| level | `min_level` (-131072) … 21; lower is clamped | `ZSTD_minCLevel()`; 22 would need long-distance matching above 64 MB inputs |
+| level | `min_level` (-131072) … 22; lower is clamped, higher is `error.LevelUnsupported` | `ZSTD_minCLevel()` / `ZSTD_maxCLevel()`; libzstd clamps above 22 too, which would hand a caller a level it did not ask for |
+| memory | level 22 above 64 MB: 512 MiB binary tree + 128 MiB hash + 64 MiB LDM table + 32 KiB bucket offsets (≈ 820 MB peak on a 70 MB input, as libzstd) | the level's own table sizes; nothing is capped, as libzstd caps nothing |
 | input | `max_input_size` = 3500 MiB − 2 | libzstd corrects index overflow past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit); that correction is not ported, so the input stops before it |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
@@ -124,8 +143,9 @@ pin the level refusal and the destination bound.
 
 **External anchor.** `src/testdata/goldens.zig` holds, for each of 56 corpus
 inputs × levels {-5, -1, 1…10} × checksum {off, on}, and for the 53 inputs up
-to 600 KB × levels 11…21 without checksum, plus 14 cases golden at one level
-each (1941 frames), the length and
+to 600 KB × levels 11…22 without checksum, plus 14 cases golden at one level
+each and 15 compressed with long-distance matching switched on by hand, also
+at one or two levels each (2011 frames), the length and
 SHA-256 of the frame libzstd v1.5.7 (`f8745da6`) emits via `ZSTD_compress2`.
 The optimal-parser levels cost 10–40× a lazy one, and the checksum trailer
 does not depend on the level, hence the narrower set there
@@ -213,6 +233,25 @@ offsets btopt surcharges), and 33 survive:
 | `insertBt1`'s window low at `curr` instead of `target`; DUBT insertion `matchIndex > windowLow` → `>=`; DUBT `maxDistance` − 1 | reached only when the input outgrows the window, which at the optimal levels takes > 4 MB (the golden set stops at 600 KB there, bar `far-mix-5`, whose window is 4 MB); checked instead against `zref` on 8–13 MB inputs at levels 13, 16 and 19 |
 | tree low end `matchIndex <= btLow` → `<` (insertion, both sides — `insertBt1` and DUBT); DUBT `unsortLimit` → `btLow` (differs only for a candidate at index 2); a 3-byte-hash match of exactly `targetLength`; a tree match of exactly 4096 bytes (`> ZSTD_OPT_NUM` → `>=`); split literal estimate thresholds (`largest <= n/128 + 4`, repeat when `old < n`, `hSize + 12 >= n`, `old <= hSize + new`); estimate header sizes at 1024 literals and 128 sequences | reachable in principle, each at an equality; ten minutes of seed search per mutation (tens of thousands of inputs of 70 KB–600 KB at the levels concerned) did not hit one. **Uncovered.** |
 
+Long-distance matching (level 22) got its own sweep on 2026-09-22: 47
+mutations of `ldm.zig`, the LDM candidate code in `opt.zig`, the LDM switch
+and the by-hand window in `params.zig`. The golden set can only reach LDM
+through the by-hand seam (`frame.Options.ldm`, libzstd's
+`ZSTD_c_enableLongDistanceMatching`), because it switches itself on only
+above 64 MB; so the 5 cases that first carried it were inputs where LDM
+changes the output at all. 16 mutations were caught by those, 1 by a unit
+test added for it (LDM on from exactly 64 MB + 1 byte), 12 by 10 cases the
+seed search found (the later `ldm-*` entries of `corpus.zig`; among them the
+two libzstd quirks the port keeps — a "fixed" `ZSTD_ldm_gear_reset` and
+offering the block's last LDM candidate both change the output), 2 only by
+the 140 MB comparison below, and 16 survive:
+
+| mutation | why no case exists |
+|---|---|
+| LDM window raising neither `lowLimit` nor `dictLimit` | reached only past 128 MB of input (window log 27); caught by `zref` on a 140 MB input whose last 10 MB repeat its first at a distance of 130 MB — the module's output matches libzstd's, both mutants do not |
+| hash log floor 6 → 7; `srcSize < minMatchLength` → `<=`; `literalsBytesRemaining >= blockBytesRemaining` → `>`; a candidate cut at the block end `>` → `>=`, or skipping its full length; the candidate's initial end position | equivalent: at a 1 KB window (the only place the floor binds) the table is one bucket that fewer than 64 splits never fill; a chunk of exactly the minimum length has no byte left to hash; at the equality the candidate starts and ends at the block end, where no position lies, and the store is discarded with the block; the first fetch overwrites the initial value |
+| backward extension stopping one byte above the prefix start; the last hashable byte (`ilimit`) one further; a split exactly at the previous match's end searched (`split < anchor` → `<=`); a table entry exactly at the lowest valid index; an overlapping match that ends exactly where hashing stopped (`>` → `>=`); continuing the batch after skipping an overlap; a batch of 32; another XXH64 seed; the checksum from bits 31..62; a candidate of exactly `minMatch` | reachable in principle; four minutes of seed search each (about 2 000 inputs of 3–600 KB at levels 16–22, 300 000 of 40 B–2.5 KB for the two small-window ones) did not hit one. The index equality needs the window past 128 MB. **Uncovered.** |
+
 Beyond the committed goldens, the port was compared against `zref` on 49
 boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
 JSON, text) and 800 random mixed inputs across levels -7…3, all identical;
@@ -232,8 +271,18 @@ slides, multi-block post-splits) at 8 levels, 600 random mixed inputs up to
 700 KB, and every file with the strategy forced to `btopt`, `btultra` and
 `btultra2` at levels 1–19 (about 1 000 frames): all identical, the first
 time each ran. The strategy is now forced through `frame.Options.strategy`
-and `params.getWithStrategy`, which repeat libzstd's two parameter
+and `params.getOverridden`, which repeat libzstd's two parameter
 derivations, and `zref` takes the strategy as a fifth argument.
+For level 22 and long-distance matching (2026-09-22): level 22 itself on
+64 MB (window log 26, no LDM), 64 MB + 1 byte, 70 MB and 140 MB inputs of
+system binaries with repeats 10–130 MB back (LDM on, the 140 MB one sliding
+both windows past 128 MB); and with LDM switched on by hand, 50 system
+files and concatenations up to 6 MB at levels 16–22 and with the strategy
+forced to `btopt`/`btultra`/`btultra2` at levels 3, 9 and 12 (885 frames),
+62 boundary sizes from 1 byte to 300 KB (around the minimum match, the hash
+read limit and the block size) and 300 random mixed inputs up to 700 KB
+(848 frames with level 22 without LDM): all identical, the first time each
+ran.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -250,18 +299,17 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
   the goldens. *Not now.*
 - **Matching the `zstd` CLI.** See *Streaming* above. *Never*, as a contract;
   the CLI's output is equally valid and decodes the same.
-- **Level 22 by downgrading to 21.** Refused: a caller asking for 22 would
-  get level-21 ratio with no signal. Porting LDM (`zstd_ldm.c`, ~700 lines of
-  C) would lift it; *not now* — no consumer compresses 64 MB+ inputs in
-  process.
+- **Long-distance matching below `btopt`, or as an option** (see *Not
+  here*). *Not now* — no consumer asks for `--long`; porting the
+  sequence-splicing path is ~100 lines of C plus `ZSTD_fillHashTable` /
+  `ZSTD_fillDoubleHashTable` for `fast`/`dfast`.
 
 ## Open
 
 - Reachable boundaries without a case: the sequence encoding-type
   heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality, the table
   pricing's low-probability switch at exactly 2048 sequences, and 13
-  equalities in the optimal parsers and the post-splitter's estimates (see
-  *Anchoring*).
-- Level 22: long-distance matching (`zstd_ldm.c`) for inputs over 64 MB.
+  equalities in the optimal parsers and the post-splitter's estimates, and
+  10 in long-distance matching (see *Anchoring*).
 - `targets` declares only `.linux64`; the code has no OS or endianness
   dependency, but `portable-zstd-*` has not been run.

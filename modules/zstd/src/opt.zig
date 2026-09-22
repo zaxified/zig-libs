@@ -6,7 +6,8 @@
 //! (`ZSTD_insertBtAndGetAllMatches`, plus the 3-byte hash of `minMatch` 3),
 //! the adaptive symbol statistics that price literals, lengths and offsets,
 //! and the forward pass / backward trace of `ZSTD_compressBlock_opt_generic`.
-//! Long-distance matching is off by default in libzstd and not carried.
+//! Long-distance matches (`ldm.zig`) join the candidates at each position
+//! (`ZSTD_optLdm_*`) when the frame has them.
 //!
 //! Prices are in 1/256 bit (`BITCOST_ACCURACY` 8). `opt_level` 0 is btopt
 //! (whole-bit weights, early exits), 2 is btultra and btultra2 (fractional
@@ -15,6 +16,7 @@
 const std = @import("std");
 const match = @import("match.zig");
 const sequences = @import("sequences.zig");
+const ldm = @import("ldm.zig");
 const MatchState = match.MatchState;
 const SeqStore = sequences.SeqStore;
 
@@ -492,6 +494,94 @@ inline fn getAllMatches(matches: []Match, ms: *MatchState, next_to_update3: *u32
 }
 
 // ---------------------------------------------------------------------------
+// Long-distance match candidates
+
+/// `ZSTD_optLdm_t`: a private copy of the block's LDM sequences and the one
+/// match candidate they currently offer, as block positions.
+const OptLdm = struct {
+    store: ldm.RawSeqStore,
+    start_pos_in_block: u32 = 0,
+    end_pos_in_block: u32 = 0,
+    offset: u32 = 0,
+
+    fn exhausted(o: *const OptLdm) bool {
+        return o.store.size == 0 or o.store.pos >= o.store.size;
+    }
+
+    /// `ZSTD_opt_getNextMatchAndUpdateSeqStore`: the next candidate's start
+    /// and end in the block, consuming it from the store.
+    fn getNextMatch(o: *OptLdm, curr_pos_in_block: u32, block_bytes_remaining: u32) void {
+        // Setting match end position to MAX to ensure we never use an LDM during this block
+        if (o.exhausted()) {
+            o.start_pos_in_block = std.math.maxInt(u32);
+            o.end_pos_in_block = std.math.maxInt(u32);
+            return;
+        }
+        const curr = o.store.seq[o.store.pos];
+        std.debug.assert(o.store.pos_in_sequence <= curr.lit_length + curr.match_length);
+        const pos_in_seq: u32 = @intCast(o.store.pos_in_sequence);
+        const curr_block_end_pos = curr_pos_in_block + block_bytes_remaining;
+        const literals_bytes_remaining = if (pos_in_seq < curr.lit_length) curr.lit_length - pos_in_seq else 0;
+        const match_bytes_remaining = if (literals_bytes_remaining == 0) curr.match_length - (pos_in_seq - curr.lit_length) else curr.match_length;
+
+        // If there are more literal bytes than bytes remaining in block, no ldm is possible
+        if (literals_bytes_remaining >= block_bytes_remaining) {
+            o.start_pos_in_block = std.math.maxInt(u32);
+            o.end_pos_in_block = std.math.maxInt(u32);
+            o.store.skipBytes(block_bytes_remaining);
+            return;
+        }
+
+        // Matches may be < minMatch by this process. In that case, we will
+        // reject them when we are deciding whether or not to add the ldm
+        o.start_pos_in_block = curr_pos_in_block + literals_bytes_remaining;
+        o.end_pos_in_block = o.start_pos_in_block + match_bytes_remaining;
+        o.offset = curr.offset;
+
+        if (o.end_pos_in_block > curr_block_end_pos) {
+            // Match ends after the block ends, we can't use the whole match
+            o.end_pos_in_block = curr_block_end_pos;
+            o.store.skipBytes(curr_block_end_pos - curr_pos_in_block);
+        } else {
+            // Consume nb of bytes equal to size of sequence left
+            o.store.skipBytes(literals_bytes_remaining + match_bytes_remaining);
+        }
+    }
+
+    /// `ZSTD_optLdm_maybeAddMatch`: append the candidate if the position is
+    /// inside it, it is long enough, and it is longer than every match found.
+    fn maybeAddMatch(o: *const OptLdm, matches: []Match, nb_matches: *u32, curr_pos_in_block: u32, min_match: u32) void {
+        const pos_diff = curr_pos_in_block -% o.start_pos_in_block;
+        const candidate_match_length = o.end_pos_in_block -% o.start_pos_in_block -% pos_diff;
+        // Ensure that current block position is not outside of the match
+        if (curr_pos_in_block < o.start_pos_in_block or
+            curr_pos_in_block >= o.end_pos_in_block or
+            candidate_match_length < min_match) return;
+        const n = nb_matches.*;
+        if (n == 0 or (candidate_match_length > matches[n - 1].len and n < opt_num)) {
+            matches[n] = .{ .len = candidate_match_length, .off = o.offset + sequences.rep_num };
+            nb_matches.* = n + 1;
+        }
+    }
+
+    /// `ZSTD_optLdm_processMatchCandidate`. Note that the candidate taken
+    /// from the store's last sequence is never offered: consuming it leaves
+    /// the store exhausted, and that returns early (as in libzstd).
+    fn processMatchCandidate(o: *OptLdm, matches: []Match, nb_matches: *u32, curr_pos_in_block: u32, remaining_bytes: u32, min_match: u32) void {
+        if (o.exhausted()) return;
+        if (curr_pos_in_block >= o.end_pos_in_block) {
+            if (curr_pos_in_block > o.end_pos_in_block) {
+                // The parser is often some bytes past the candidate's end:
+                // correct for the overshoot.
+                o.store.skipBytes(curr_pos_in_block - o.end_pos_in_block);
+            }
+            o.getNextMatch(curr_pos_in_block, remaining_bytes);
+        }
+        o.maybeAddMatch(matches, nb_matches, curr_pos_in_block, min_match);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Parser
 
 /// Compress one block with `btopt` (`opt_level` 0) or `btultra` (2).
@@ -538,7 +628,7 @@ fn initStatsUltra(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src
     ms.next_to_update = ms.dict_limit;
 }
 
-/// `ZSTD_compressBlock_opt_generic` (noDict, no long-distance matches).
+/// `ZSTD_compressBlock_opt_generic` (noDict).
 fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime opt_level: u32, comptime mls: u32) usize {
     const st = ms.opt.?;
     var ip: u32 = istart;
@@ -553,6 +643,8 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
     const opt = &st.price_table;
     const matches = &st.match_table;
     var last_stretch: Optimal = .{};
+    var opt_ldm: OptLdm = .{ .store = if (ms.ldm_seq_store) |s| s.* else .{} };
+    opt_ldm.getNextMatch(ip - istart, @intCast(iend - ip));
 
     rescaleFreqs(st, ms.src[istart - match.window_start ..][0..src_size], opt_level);
     ip += @intFromBool(ip == prefix_start);
@@ -567,7 +659,8 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
             {
                 const litlen = ip - anchor;
                 const ll0 = litlen == 0;
-                const nb_matches = getAllMatches(matches, ms, &next_to_update3, ip, iend, rep, ll0, min_match, mls);
+                var nb_matches = getAllMatches(matches, ms, &next_to_update3, ip, iend, rep, ll0, min_match, mls);
+                opt_ldm.processMatchCandidate(matches, &nb_matches, ip - istart, @intCast(iend - ip), min_match);
                 if (nb_matches == 0) {
                     ip += 1;
                     continue;
@@ -684,7 +777,8 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
                     const ll0 = opt[cur].litlen == 0;
                     const previous_price = opt[cur].price;
                     const base_price = previous_price + litLengthPrice(st, 0, opt_level);
-                    const nb_matches = getAllMatches(matches, ms, &next_to_update3, inr, iend, &opt[cur].rep, ll0, min_match, mls);
+                    var nb_matches = getAllMatches(matches, ms, &next_to_update3, inr, iend, &opt[cur].rep, ll0, min_match, mls);
+                    opt_ldm.processMatchCandidate(matches, &nb_matches, inr - istart, @intCast(iend - inr), min_match);
                     if (nb_matches == 0) continue;
 
                     {

@@ -3,13 +3,15 @@
 //!
 //! For every corpus case, level and checksum setting, the frame this module
 //! produces must have the length and SHA-256 that libzstd's `ZSTD_compress2`
-//! produced for the same input (`testdata/goldens.zig`, written by
+//! produced for the same input (for a case marked `ldm`, with long-distance
+//! matching switched on by hand on both sides) (`testdata/goldens.zig`, written by
 //! `tools/gen-goldens.sh`). A digest rather than the frame itself keeps the
 //! repository small; the recipe regenerates the reference bytes when a
 //! mismatch needs to be looked at.
 
 const std = @import("std");
 const zstd = @import("root.zig");
+const frame = @import("frame.zig");
 const corpus = @import("testdata/corpus.zig");
 const goldens = @import("testdata/goldens.zig");
 
@@ -45,7 +47,10 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus" {
         for (corpus.levels) |level| for ([_]bool{ false, true }) |ck| {
             if (!corpus.covered(case, level, ck)) continue;
             const g = find(case.name, level, ck).?;
-            const n = try zstd.compress(gpa, dst, src, .{ .level = level, .checksum = ck });
+            const n = if (case.ldm)
+                try frame.compress(gpa, dst, src, .{ .level = level, .checksum = ck, .ldm = true })
+            else
+                try zstd.compress(gpa, dst, src, .{ .level = level, .checksum = ck });
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(dst[0..n], &digest, .{});
             const hex = std.fmt.bytesToHex(digest, .lower);
@@ -71,5 +76,5 @@ test "corpus inputs are the ones the goldens were made from" {
         h.update(buf);
     }
     const hex = std.fmt.bytesToHex(h.finalResult(), .lower);
-    try std.testing.expectEqualStrings("b89750fbc20548584ec426ab40932599a042504847f8656f4b5b188405410911", &hex);
+    try std.testing.expectEqualStrings("eae2fe45e9f995cfaf4977d322b8c802b401265fc3b111553fbf46b58e5da48a", &hex);
 }

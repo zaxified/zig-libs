@@ -24,6 +24,11 @@ pub const Case = struct {
     /// When set, the case is in the golden set at these levels only, without
     /// the checksum variant: a large input kept for one optimal-parser path.
     only_levels: []const i32 = &.{},
+    /// Compressed with long-distance matching switched on by hand
+    /// (`frame.Options.ldm`, libzstd's `ZSTD_c_enableLongDistanceMatching`),
+    /// which reaches LDM far below the 64 MB where level 22 switches it on.
+    /// Needs `only_levels` (btopt and up).
+    ldm: bool = false,
 };
 
 pub const Kind = enum {
@@ -126,9 +131,27 @@ pub const cases = [_]Case{
     .{ .name = "words-100000-6", .len = 100000, .kind = .words, .seed = 6, .only_levels = &.{16} }, // optimal Huffman depth stops once a size exceeds the best by more than one
     .{ .name = "skewed-262144-75", .len = 262144, .kind = .skewed, .seed = 75, .only_levels = &.{11} }, // DUBT search stops at the tree's low end (smaller side, `<=`)
     .{ .name = "skewed-200000-43", .len = 200000, .kind = .skewed, .seed = 43, .only_levels = &.{11} }, // ... and on the larger side
+    // Long-distance matching by hand: inputs where its candidates change what
+    // the optimal parser picks (found by comparing with and without).
+    .{ .name = "ldm-mix-100000-3", .len = 100000, .kind = .mix, .seed = 3, .only_levels = &.{ 16, 19 }, .ldm = true }, // btultra, btultra2
+    .{ .name = "ldm-mix-600000-0", .len = 600000, .kind = .mix, .seed = 0, .only_levels = &.{16}, .ldm = true }, // btopt: minMatch 64, bucket 2^7
+    .{ .name = "ldm-far-mix-300000-3", .len = 300000, .kind = .far_mix, .seed = 3, .only_levels = &.{ 17, 19 }, .ldm = true },
+    .{ .name = "ldm-far-mix-300000-2", .len = 300000, .kind = .far_mix, .seed = 2, .only_levels = &.{19}, .ldm = true },
+    .{ .name = "ldm-drift-600000-0", .len = 600000, .kind = .drift, .seed = 0, .only_levels = &.{22}, .ldm = true },
+    // ... and cases the mutation sweep's seed search found (SPEC.md, *Anchoring*)
+    .{ .name = "ldm-words-40", .len = 40, .kind = .words, .only_levels = &.{16}, .ldm = true }, // a 1 KB window: hash log 6 bounds the bucket log
+    .{ .name = "ldm-mix-140000-13", .len = 140000, .kind = .mix, .seed = 13, .only_levels = &.{17}, .ldm = true }, // btultra halves the minimum match
+    .{ .name = "ldm-far-mix-200000-20", .len = 200000, .kind = .far_mix, .seed = 20, .only_levels = &.{17}, .ldm = true }, // gear reset leaves the hash as it was
+    .{ .name = "ldm-far-mix-200000-23", .len = 200000, .kind = .far_mix, .seed = 23, .only_levels = &.{20}, .ldm = true }, // equal totals keep the earlier bucket entry
+    .{ .name = "ldm-far-mix-200000-3", .len = 200000, .kind = .far_mix, .seed = 3, .only_levels = &.{21}, .ldm = true }, // a matched split is inserted too; the next candidate is fetched at its end
+    .{ .name = "ldm-far-mix-600000-6", .len = 600000, .kind = .far_mix, .seed = 6, .only_levels = &.{19}, .ldm = true }, // a forward match of exactly minMatchLength counts
+    .{ .name = "ldm-far-mix-600000-13", .len = 600000, .kind = .far_mix, .seed = 13, .only_levels = &.{19}, .ldm = true }, // a split sits just past the byte that triggered it
+    .{ .name = "ldm-drift-300000-2", .len = 300000, .kind = .drift, .seed = 2, .only_levels = &.{20}, .ldm = true }, // the parser's overshoot past a candidate is skipped
+    .{ .name = "ldm-mix-600000-7", .len = 600000, .kind = .mix, .seed = 7, .only_levels = &.{17}, .ldm = true }, // the first candidate is fetched before the first position
+    .{ .name = "ldm-mix-600000-25", .len = 600000, .kind = .mix, .seed = 25, .only_levels = &.{21}, .ldm = true }, // a candidate resumed inside its match
 };
 
-pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21 };
+pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };
 
 /// First level of the optimal parsers (btopt in the 16 KB tier).
 pub const opt_level_min = 11;

@@ -12,6 +12,7 @@ const literals = @import("literals.zig");
 const presplit = @import("presplit.zig");
 const opt = @import("opt.zig");
 const blocksplit = @import("blocksplit.zig");
+const ldm = @import("ldm.zig");
 
 pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
@@ -60,6 +61,9 @@ const Ctx = struct {
     /// `ZSTD_blockSplitterEnabled`.
     split_blocks: bool,
     partitions: [blocksplit.partitions_len]u32 = undefined,
+    /// Long-distance matching: the table, and room for one block's sequences.
+    ldm: ?*ldm.State = null,
+    ldm_seqs: []ldm.RawSeq = &.{},
 };
 
 fn writeFrameHeader(dst: []u8, cp: params.CParams, src_size: u64, checksum: bool) usize {
@@ -195,7 +199,18 @@ fn buildSeqStore(c: *Ctx, block_start: usize, block_size: usize) bool {
     if (istart > c.ms.next_to_update + 384)
         c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
     c.next.rep = c.prev.rep;
-    const last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
+    var last_ll: usize = undefined;
+    if (c.ldm) |ls| {
+        // ZSTD_ldm_blockCompress, strategy >= btopt: the long-distance
+        // matches are candidates for the optimal parser, not sequences
+        var ldm_seq_store: ldm.RawSeqStore = .{ .seq = c.ldm_seqs };
+        ls.generateSequences(&ldm_seq_store, istart, block_size);
+        c.ms.ldm_seq_store = &ldm_seq_store;
+        defer c.ms.ldm_seq_store = null;
+        last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
+    } else {
+        last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
+    }
     c.ss.storeLastLiterals(src[block_start + block_size - last_ll .. block_start + block_size]);
     return true;
 }
@@ -299,6 +314,11 @@ pub const Options = struct {
     /// `ZSTD_c_strategy` does, to reach strategy/size pairs no level maps
     /// to. Not part of the public API.
     strategy: ?params.Strategy = null,
+    /// Test seam: long-distance matching switched on by hand, as
+    /// `ZSTD_c_enableLongDistanceMatching` = 1 does (window log reset to 27
+    /// before the input shrinks it), to reach LDM on inputs far below the
+    /// 64 MB where level 22 switches it on. Only for btopt and up.
+    ldm: bool = false,
 };
 
 /// One-shot frame. `dst.len` must be at least `compressBound(src.len)`.
@@ -308,7 +328,11 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
     if (dst.len < bound) return error.NoSpaceLeft;
     const out = dst[0..bound];
 
-    const cp = if (opts.strategy) |st| params.getWithStrategy(opts.level, src.len, st) else params.get(opts.level, src.len);
+    const cp = params.getOverridden(opts.level, src.len, opts.strategy, opts.ldm);
+    const ldm_params: ?ldm.Params = if (opts.ldm or ldm.enabledByDefault(cp)) ldm.adjustParameters(cp) else null;
+    // LDM by hand below btopt splices LDM sequences between runs of the
+    // block compressor (`ZSTD_ldm_blockCompress`), which is not ported.
+    std.debug.assert(ldm_params == null or @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt));
     var op = writeFrameHeader(out, cp, src.len, opts.checksum);
 
     if (src.len == 0) {
@@ -355,6 +379,22 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
         const split_ws = try gpa.create(presplit.Workspace);
         defer gpa.destroy(split_ws);
 
+        // ZSTD_resetCCtx_internal: the LDM hash table, bucket offsets and
+        // sequence buffer (`ZSTD_ldm_getMaxNbSeq` over one block)
+        const lp: ldm.Params = ldm_params orelse std.mem.zeroes(ldm.Params);
+        const ldm_on = ldm_params != null;
+        const ldm_table = try gpa.alloc(ldm.Entry, if (ldm_on) @as(usize, 1) << @intCast(lp.hash_log) else 0);
+        defer gpa.free(ldm_table);
+        @memset(ldm_table, .{});
+        const ldm_buckets = try gpa.alloc(u8, if (ldm_on) @as(usize, 1) << @intCast(lp.hash_log - lp.bucket_size_log) else 0);
+        defer gpa.free(ldm_buckets);
+        @memset(ldm_buckets, 0);
+        const ldm_seqs = try gpa.alloc(ldm.RawSeq, if (ldm_on) ldm.maxNbSeq(lp, block_size_max) else 0);
+        defer gpa.free(ldm_seqs);
+        const ldm_state: ?*ldm.State = if (ldm_on) try gpa.create(ldm.State) else null;
+        defer if (ldm_state) |p| gpa.destroy(p);
+        if (ldm_state) |p| p.* = .{ .src = src, .p = lp, .hash_table = ldm_table, .bucket_offsets = ldm_buckets };
+
         var c: Ctx = .{
             .ms = .{
                 .src = src,
@@ -383,6 +423,8 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
             .disable_literal_compression = cp.strategy == .fast and cp.target_length > 0,
             // ZSTD_resolveBlockSplitterMode (auto)
             .split_blocks = @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt) and cp.window_log >= 17,
+            .ldm = ldm_state,
+            .ldm_seqs = ldm_seqs,
         };
 
         var savings: i64 = 0;

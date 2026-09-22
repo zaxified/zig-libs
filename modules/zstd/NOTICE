@@ -23,7 +23,11 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       greedy/lazy/lazy2/btlazy2 parser      -> src/lazy.zig
   lib/compress/zstd_opt.c             no-dictionary binary-tree match
                                       finder, price model and optimal
-                                      parser (btopt/btultra/btultra2)       -> src/opt.zig
+                                      parser (btopt/btultra/btultra2), with
+                                      its long-distance candidates          -> src/opt.zig
+  lib/compress/zstd_ldm.c,            long-distance matching: gear rolling
+  lib/compress/zstd_ldm_geartab.h     hash and its table, bucketed match
+                                      table, sequence generation            -> src/ldm.zig
   lib/compress/zstd_compress_internal.h  window helpers, hashes, ZSTD_count,
                                       seqStore, repcode handling            -> src/match.zig, src/sequences.zig
   lib/compress/zstd_compress.c        one-shot frame/block driver, frame

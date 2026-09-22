@@ -52,5 +52,16 @@ of level 19). To reach one, force the strategy on both sides:
     #     .strategy = .btopt }) from a main that imports src/frame.zig
 
 libzstd then derives the parameters twice — once for the level's own
-strategy, once for the forced one — and `params.getWithStrategy` does the
+strategy, once for the forced one — and `params.getOverridden` does the
 same; comparing against a single derivation gives false mismatches.
+
+Long-distance matching switches itself on only at level 22 above 64 MB. To
+reach it on a small input, switch it on by hand on both sides (strategy 0
+keeps the level's own):
+
+    "$R/zref" <level> 0 in.bin ref.zst 0 1        # ZSTD_c_enableLongDistanceMatching
+    # module side: frame.compress(..., .{ .level = L, .checksum = false,
+    #     .ldm = true }); btopt and up only (levels 16+, or a forced strategy)
+
+By hand, libzstd first resets the window log to 27 and only then shrinks it to
+the input; `params.getOverridden` does the same.

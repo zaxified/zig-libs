@@ -7,6 +7,8 @@
 #
 # The rows are exactly the (case, level, checksum) set `corpus.covered`
 # admits, which `dump_corpus.zig` writes to a manifest; the loop below reads it.
+# A case marked `ldm` is compressed with long-distance matching switched on
+# by hand (zref's last argument).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -42,8 +44,8 @@ out="$mod/src/testdata/goldens.zig"
     echo "pub const Golden = struct { case: []const u8, level: i32, checksum: bool, len: usize, sha256: *const [64]u8 };"
     echo ""
     echo "pub const rows = [_]Golden{"
-    while read -r f l ck; do
-        "$R/zref" "$l" "$ck" "$work/$f" "$R/out.zst"
+    while read -r f l ck ldm; do
+        "$R/zref" "$l" "$ck" "$work/$f" "$R/out.zst" 0 "$ldm"
         len=$(stat -c %s "$R/out.zst")
         sum=$(sha256sum "$R/out.zst" | cut -d' ' -f1)
         b=$([ "$ck" = 1 ] && echo true || echo false)

@@ -33,7 +33,8 @@ pub fn main() !void {
     const data = csv.written();
 
     // Level 1 for a fast rotation, 3 (the default) for the archive; a negative
-    // level trades ratio for speed; 22 is not implemented and says so.
+    // level trades ratio for speed; above 22 there is no level, and asking
+    // for one is an error rather than a quiet clamp.
     const fast = try zstd.compressAlloc(gpa, data, .{ .level = 1 });
     defer gpa.free(fast);
     const archive = try zstd.compressAlloc(gpa, data, .{ .level = 3, .checksum = true });
@@ -42,7 +43,7 @@ pub fn main() !void {
     must(archive.len < data.len / 3, @src());
 
     var buf: [16]u8 = undefined;
-    const refused = zstd.compress(gpa, &buf, data, .{ .level = 22 });
+    const refused = zstd.compress(gpa, &buf, data, .{ .level = 23 });
     must(refused == error.LevelUnsupported, @src());
 
     // Read it back: std decodes, the caller checks the frame checksum.

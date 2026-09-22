@@ -1,28 +1,27 @@
 // SPDX-License-Identifier: MIT
-//! zstd — Zstandard (RFC 8878) compressor for levels 1-21 and the negative
-//! ("fast") levels, byte-identical to libzstd 1.5.7.
+//! zstd — Zstandard (RFC 8878) compressor for every level, 1-22 and the
+//! negative ("fast") levels, byte-identical to libzstd 1.5.7.
 //!
 //! Decoding is std's job (`std.compress.zstd.Decompress`); this module fills
 //! the other half. It is a port of every libzstd strategy — `fast`, `dfast`,
 //! `greedy`, `lazy`, `lazy2` (hash-chain and row match finders), `btlazy2`,
 //! and the optimal parsers `btopt`, `btultra`, `btultra2` — with the frame
-//! and block driver, the block pre- and post-splitters, and the Huffman and
-//! FSE encoders. For the same input and level it emits exactly the bytes
+//! and block driver, the block pre- and post-splitters, long-distance
+//! matching (which libzstd switches on at level 22 for inputs over 64 MB),
+//! and the Huffman and FSE encoders. For the same input and level it emits exactly the bytes
 //! `ZSTD_compress2()` from libzstd v1.5.7 does (one-shot, content size in the
 //! header, checksum optional) — that equality is what the tests pin, not
 //! merely round-trips.
 //!
-//! Level 22 is refused: on inputs over 64 MB libzstd adds long-distance
-//! matching there, which is not ported, and a level's support must not
-//! depend on the input. Asking for it is an error rather than a silent
-//! downgrade. See SPEC.md.
+//! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
+//! match tables, as in libzstd. See SPEC.md.
 
 const std = @import("std");
 const frame = @import("frame.zig");
 const params = @import("params.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-21 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd`",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd`",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -33,7 +32,7 @@ pub const meta = .{
 };
 
 pub const Options = struct {
-    /// 1..21, 0 for the default (3), or negative for the faster "fast" levels
+    /// 1..22, 0 for the default (3), or negative for the faster "fast" levels
     /// (down to -131072; lower values are clamped, as libzstd does).
     level: i32 = params.default_level,
     /// Append the XXH64-based content checksum (frame header flag + 4 bytes).
@@ -41,7 +40,8 @@ pub const Options = struct {
 };
 
 pub const Error = frame.Error || error{
-    /// Level above `max_level` (22): long-distance matching is not ported.
+    /// Level above `max_level` (22). libzstd clamps it to 22; this module
+    /// refuses rather than silently compress at another level.
     LevelUnsupported,
 };
 
@@ -85,6 +85,7 @@ test {
     _ = @import("match.zig");
     _ = @import("lazy.zig");
     _ = @import("opt.zig");
+    _ = @import("ldm.zig");
     _ = @import("presplit.zig");
     _ = @import("frame.zig");
     _ = @import("golden_test.zig");
@@ -128,7 +129,7 @@ test "round trip through std's decoder at every implemented level" {
         @memcpy(src[i..][0..n], w[0..n]);
         i += n;
     }
-    for ([_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 19, 21 }) |level| {
+    for ([_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 19, 21, 22 }) |level| {
         for ([_]bool{ false, true }) |ck| {
             const z = try compressAlloc(gpa, &src, .{ .level = level, .checksum = ck });
             defer gpa.free(z);
@@ -140,9 +141,9 @@ test "round trip through std's decoder at every implemented level" {
     }
 }
 
-test "levels above 21 are refused, not downgraded" {
+test "levels above 22 are refused, not clamped" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 22 }));
+    try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 23 }));
 }
 
 test "a destination below the bound is refused" {

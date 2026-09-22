@@ -24,11 +24,10 @@ pub const CParams = struct {
     strategy: Strategy,
 };
 
-/// Highest level implemented. Level 22 resolves to a 128 MB window on inputs
-/// over 64 MB, where libzstd switches on long-distance matching for the
-/// optimal parsers (`ZSTD_resolveEnableLdm`), which this module does not
-/// have; refusing the level outright keeps support independent of the input.
-pub const max_level = 21;
+/// Highest level: every row of libzstd's tables is implemented, including
+/// level 22's 128 MB window on inputs over 64 MB, where libzstd switches on
+/// long-distance matching (`ZSTD_resolveEnableLdm`, see `ldm.zig`).
+pub const max_level = 22;
 /// `ZSTD_MAX_CLEVEL`: rows in each table.
 const table_levels = 22;
 /// `ZSTD_minCLevel()`: -ZSTD_TARGETLENGTH_MAX.
@@ -211,12 +210,15 @@ pub fn get(level: i32, src_size: u64) CParams {
     return adjust(cp, src_size);
 }
 
-/// `ZSTD_getCParamsFromCCtxParams` with `ZSTD_c_strategy` set: the level's
-/// parameters (already adjusted for its own strategy), the strategy
-/// replaced, and the adjustment run again.
-pub fn getWithStrategy(level: i32, src_size: u64, strategy: Strategy) CParams {
+/// `ZSTD_getCParamsFromCCtxParams` with the test overrides the oracle can
+/// set: the level's parameters (already adjusted for its own strategy);
+/// with LDM switched on by hand (`ZSTD_c_enableLongDistanceMatching`) the
+/// window log reset to 27, `ZSTD_LDM_DEFAULT_WINDOW_LOG`; with
+/// `ZSTD_c_strategy` the strategy replaced; and the adjustment run again.
+pub fn getOverridden(level: i32, src_size: u64, strategy: ?Strategy, ldm_by_hand: bool) CParams {
     var cp = get(level, src_size);
-    cp.strategy = strategy;
+    if (ldm_by_hand) cp.window_log = 27;
+    if (strategy) |st| cp.strategy = st;
     return adjust(cp, src_size);
 }
 
@@ -241,19 +243,33 @@ test "negative levels set the acceleration factor" {
     try std.testing.expectEqual(Strategy.fast, cp.strategy);
 }
 
-test "no level up to max_level reaches long-distance matching" {
+test "only level 22 above 64 MB reaches long-distance matching" {
     // ZSTD_resolveEnableLdm: btopt and up with windowLog >= 27
-    for ([_]u64{ 1000, 16 * 1024, 100_000, 200_000, 10 << 20, 1 << 30 }) |size| {
+    const ldm_on = struct {
+        fn f(cp: CParams) bool {
+            return @intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btopt) and cp.window_log >= 27;
+        }
+    }.f;
+    for ([_]u64{ 1000, 16 * 1024, 100_000, 200_000, 10 << 20, 1 << 26, (1 << 26) + 1, 1 << 30 }) |size| {
         var level: i32 = 1;
         while (level <= max_level) : (level += 1) {
-            const cp = get(level, size);
-            try std.testing.expect(@intFromEnum(cp.strategy) < @intFromEnum(Strategy.btopt) or cp.window_log < 27);
+            try std.testing.expectEqual(level == 22 and size > 1 << 26, ldm_on(get(level, size)));
         }
     }
-    // the next level does, above 64 MB
-    const cp22 = adjust(table[0][max_level + 1], 1 << 30);
-    try std.testing.expectEqual(Strategy.btultra2, cp22.strategy);
-    try std.testing.expectEqual(@as(u32, 27), cp22.window_log);
+    try std.testing.expectEqual(@as(u32, 26), get(22, 1 << 26).window_log);
+    try std.testing.expectEqual(@as(u32, 27), get(22, (1 << 26) + 1).window_log);
+    try std.testing.expectEqual(@as(u32, 27), get(22, 1 << 30).window_log);
+}
+
+test "LDM by hand widens the window before the input shrinks it" {
+    // level 19 above 256 KB has windowLog 23; LDM by hand starts from 27
+    try std.testing.expectEqual(@as(u32, 23), get(19, 20 << 20).window_log);
+    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, null, true).window_log);
+    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, null, true).window_log);
+    // the hash and chain logs were already cut to the level's own window
+    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, null, true).chain_log);
+    // a small input shrinks both to the same window
+    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, null, true));
 }
 
 test "btlazy2 halves the chain log to the window (ZSTD_cycleLog)" {

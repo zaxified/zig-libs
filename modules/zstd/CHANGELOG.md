@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — Level 22: long-distance matching (`zstd_ldm.c`: gear
+  rolling hash, bucketed XXH64 table, sequence generation over its own
+  trailing window) and its candidates in the optimal parser
+  (`ZSTD_optLdm_*`), which libzstd switches on at level 22 for inputs over
+  64 MB (window log 27). `max_level` is 22; `error.LevelUnsupported` now
+  means a level above 22. Byte-identical to `ZSTD_compress2()`: the goldens
+  grow to 2011 frames (level 22 on the corpus, and 15 cases compressed with
+  LDM switched on by hand through the new `frame.Options.ldm` test seam, 10
+  of them found by a 47-mutation sweep that leaves 10 reachable equalities
+  uncovered, see SPEC.md);
+  level 22 was compared with libzstd on 64 MB, 64 MB + 1, 70 MB and 140 MB
+  inputs. `tools/zref.c` takes LDM-by-hand as a sixth argument, and
+  `params.getWithStrategy` became `params.getOverridden`.
 - **2026-09-22** — Levels 11–21: the optimal parsers `btopt`, `btultra`
   and `btultra2` (`zstd_opt.c`: all-matches binary tree, 3-byte hash for
   `minMatch` 3, adaptive price model, forward pricing and backward trace,

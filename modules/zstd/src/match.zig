@@ -17,6 +17,7 @@ const params = @import("params.zig");
 const sequences = @import("sequences.zig");
 const lazy = @import("lazy.zig");
 const opt = @import("opt.zig");
+const ldm = @import("ldm.zig");
 const SeqStore = sequences.SeqStore;
 
 /// `ZSTD_WINDOW_START_INDEX`.
@@ -56,6 +57,9 @@ pub const MatchState = struct {
     hash_log3: u32 = 0,
     /// btopt and up: the parser's statistics and scratch tables.
     opt: ?*opt.State = null,
+    /// The block's long-distance matches while the optimal parser runs on
+    /// it (`ms->ldmSeqStore`); the parser reads a copy.
+    ldm_seq_store: ?*const ldm.RawSeqStore = null,
 
     pub inline fn at(ms: *const MatchState, idx: usize) u8 {
         return ms.src[idx - window_start];
