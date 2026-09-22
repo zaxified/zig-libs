@@ -65,7 +65,20 @@ switch (result) {
     .ok => |parsed| use(parsed.value),
     .invalid => |report| for (report.errors) |e| log(e.path, e.code, e.message),
 }
+
+// Streaming, into a fixed per-request buffer (no value tree; ~1.5x the body).
+// `thing` lives in `fba` and borrows unescaped strings from `body_bytes`:
+var fba: std.heap.FixedBufferAllocator = .init(&request_buf);
+switch (try validate.parseIntoLeaky(CreateThing, fba.allocator(), body_bytes, .{})) {
+    .ok => |thing| use(thing),
+    .invalid => |report| try report.writeProblem(w, .{ .status = 422 }),
+}
 ```
+
+`parseInto`/`validateJson` build a `std.json.Value` tree first, which costs
+30–60× the body; `parseIntoLeaky`/`validateJsonStreaming` apply the same rules
+straight from the scanner's tokens. Same errors — reported in document order
+rather than schema order.
 
 ### Runtime schema (body, query, path params)
 
@@ -81,7 +94,12 @@ var report = try validate.validateJson(gpa, body_bytes, &schema);
 defer report.deinit();
 if (!report.ok()) ...;                      // report.errors = []{path,code,message}
 // Also: validateValue (an already-parsed std.json.Value),
-//       validateQuery (raw query string), validateParams (router path params).
+//       validateQuery (raw query string), validateParams (path params: any
+//       value with get(name) ?[]const u8 -- router.Params or your own).
+
+// As an RFC 9457 problem (Content-Type: http.problem.content_type):
+try report.writeProblem(w, .{ .status = 422 });
+// {"type":"about:blank","status":422,"title":"Unprocessable Content","errors":[…]}
 
 // Middleware:
 const body_mw: validate.Body = .{ .gpa = gpa, .schema = &schema };

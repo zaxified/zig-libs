@@ -159,13 +159,9 @@ pub const conneg = @import("conneg.zig");
 /// was reachable only by inference through `Server.Options.compression`.
 pub const gzip = @import("gzip.zig");
 
-/// Negotiated response compression for `Server` (`acceptsGzip`,
-/// `contentTypeCompressible`, `requestContentEncoding`, the `Scratch` /
-/// `DecodeScratch` compression/decompression buffers) — the pure,
-/// offline-testable half; the wire-side integration lives in `Server.zig`.
-/// Was missing from this list (A1 audit G9, 2026-09-04): every sibling
-/// codec module above is reachable by name through `http.<name>`, this one
-/// was reachable only by inference through `Server.Options.compression`.
+/// Problem details for HTTP APIs (RFC 9457): the `application/problem+json`
+/// error body — standard members + caller extensions, always valid UTF-8.
+pub const problem = @import("problem.zig");
 
 // ── request vocabulary ──────────────────────────────────────────────────────
 
@@ -497,6 +493,7 @@ test {
     _ = sse;
     _ = range;
     _ = conneg;
+    _ = problem;
     _ = curl_interop;
     _ = h11_interop;
 }

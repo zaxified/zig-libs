@@ -5,6 +5,62 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **New: `writeJsonSchema(rules, w)` / `writeJsonSchemaFor(T, w)`** — the
+  rules as a JSON Schema 2020-12 document, for an API description (OpenAPI 3.1 embeds 2020-12
+  as is). Faithful mapping: lengths in code points (`minLength`) and items (`minItems`), `.any`
+  states both, `.int` → `integer` (accepts `1.0`, as the validator does), `allow_null` → a type
+  array, `one_of` → `enum`, `format` → the 2020-12 names, patterns → `const` or an anchored,
+  escaped ECMA-262 `pattern`, two rules for one field → `allOf`, `T.validate_rules` → `allOf` of
+  both sets. Byte bounds have no keyword: `x-minBytes`/`x-maxBytes` plus the code-point bounds
+  they imply (looser, never stricter); `custom` → `x-custom`. Checked against Python `jsonschema`
+  4.19.2 on 33 bodies: 32 agree, the 33rd is that byte-bound looseness; pinned as a golden.
+
+- **2026-09-22** — **`Limits.max_errors`: a caller can lower the error cap.** The
+  report keeps at most `max_errors` errors (default and ceiling: the module's
+  1000) and builds none past it; 0 counts as 1, so an invalid document is never
+  reported valid. Honoured by `validateJsonLimited`, `parseIntoLimited` and the
+  streaming path. Why: a caller decoding into a fixed buffer (qap's typed bodies)
+  found that aggregating the errors of a body wrong everywhere costs more than
+  decoding it — 1500 wrong items overflowed a 4 KiB buffer, so the answer read
+  "too large" instead of "invalid". Test pins each path, the 0→1 rule and the
+  ceiling.
+
+- **2026-09-22** — **New streaming path: `parseIntoLeaky(T, arena, body, limits)` and
+  `validateJsonStreaming(gpa, body, schema, limits)`** — the rules, codes and messages of
+  `parseIntoLimited`/`validateJsonLimited` without building a `std.json.Value` tree. The tree
+  costs 30–60× the body; the streaming path ~1.5× + ~2 KiB (smallest FixedBufferAllocator for a
+  16.5 KiB body: 955 KiB → 25 KiB; 118 B body: 4.4 KiB → 704 B), so a server can decode typed
+  bodies into a fixed per-request buffer. Scalars go through the same `checkRule`; containers are
+  walked from the scanner's tokens; only a container with a `custom` rule is materialized. The
+  decoded `T` is allocator-leaky and borrows unescaped strings from `body`. Errors come in document
+  order; the error set equals the tree path's — pinned by a differential fuzz target and a
+  hand-written edge set (escaped/duplicate/nested keys, malformed values inside a duplicate,
+  number_string, fixed byte arrays). Also: `SPEC.md` claimed duplicate keys resolve "last wins";
+  they are refused (`DuplicateField` → `json_invalid`), on both paths.
+
+- **2026-09-22** — **FIX (memory safety): `parseInto`/`parseIntoLimited` freed
+  the validation arena twice when the decode into `T` ran out of memory.** On the
+  success path the error builder is aborted before `std.json.parseFromValue`
+  runs, but its `errdefer b.abort()` was still armed, so an `OutOfMemory` from the
+  decode deinitialized the same arena again — a double free on a heap allocator
+  (heap corruption in ReleaseFast), an assertion on a `FixedBufferAllocator`.
+  Reachable by any caller whose allocator can fail (a bounded arena, a request
+  budget). Found by a sizing probe on a `FixedBufferAllocator`. New test sweeps
+  every allocation failure point of `parseIntoLimited`, `validateJsonLimited` and
+  `validateQuery` with `checkAllAllocationFailures` (no leak, no double free);
+  red on the old code.
+
+- **2026-09-22** — **Errors as RFC 9457 problem details, and `validateParams`
+  over any lookup.** New `Report.writeProblem(w, http.problem.Problem)` and the
+  standalone `writeErrorsProblem(errors, problem, w)`: an
+  `application/problem+json` body whose `errors` extension member is the same
+  `[{path,code,message},…]` list `writeJson` writes. `validateParams` now takes
+  `params: anytype` — anything with `get(name: []const u8) ?[]const u8`, by value
+  or pointer — instead of only `*const router.Params`, so a server whose params
+  type is its own can use it; existing `&router.Params` callers compile
+  unchanged, and a type without such a `get` is a compile error that says so.
+  The middleware still answers 400 with `application/json` (see SPEC backlog).
+
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/json_schema_format_test.zig` and `src/json_schema_format_vectors.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

@@ -23,6 +23,20 @@ allocation, never panic on any byte sequence. Clean-room; design references pyda
 + code vocabulary), JSON Schema draft 2020-12 (keyword semantics + format vocabulary), and
 go-playground/validator (struct-tag ergonomics) — behavior/format only, no source copied — see NOTICE.
 
+**Streaming path** (`parseIntoLeaky`, `validateJsonStreaming`, 2026-09-22): the same rules without
+the `std.json.Value` tree, for servers that decode into a fixed per-request buffer. The tree is 30–60×
+the body (FBA minimum for `parseIntoLimited`: 16.5 KiB body → 955 KiB); the streaming path needs
+~1.5× the body + ~2 KiB (same body → 25 KiB). One pass over `std.json.Scanner` tokens: a scalar
+becomes a one-node `Value` and goes through the SAME `checkRule` (one implementation of the type gate,
+constraints and messages); containers are walked in place (`required` settled at object end,
+`min_len`/`max_len` at array end); a container whose rule has `custom` is materialized — that subtree
+only — and checked by the tree code; error paths are stack-frame chains rendered only when an error
+is recorded; both typed rule sets (derived + `T.validate_rules`) are walked together and
+deduplicated as in the tree path. Then `std.json.parseFromSliceLeaky(T)` decodes with strings
+borrowed from the body. Differences by design: errors in document order (tree: schema order), and a
+different subset past `max_errors`. Equality of the error SET and of decoded values is pinned by a
+differential fuzz target against the tree path.
+
 ## Threat model / out of scope
 The JSON structural `Limits` are the security-relevant control here (JSON-DoS mitigation on untrusted
 bodies); the byte cap (413) bounds size, the structural scan bounds shape. Explicitly out of scope:
@@ -30,8 +44,10 @@ bodies); the byte cap (413) bounds size, the structural scan bounds shape. Expli
 dependency); a top-level JSON array cannot be described (root must be an object, as with pydantic
 models); `min`/`max` compare as f64, so 54+-bit integer bounds are not exact (`parseInto` surfaces an
 out-of-range decode as a defensive root-level `invalid` error, never a crash); `uuid` format checks
-shape only, not the RFC 4122 variant/version nibbles; duplicate JSON object keys resolve per
-`std.json` (last wins) before validation runs. Not a security boundary beyond the DoS caps — it does
+shape only, not the RFC 4122 variant/version nibbles. Duplicate JSON object keys are refused at
+every depth, known field or not (`json_invalid`, "DuplicateField") — `std.json`'s default, which
+the streaming path reproduces by tracking the keys of every open object (this line said "last wins"
+until 2026-09-22; it never did). Not a security boundary beyond the DoS caps — it does
 not authenticate, authorize, or sanitize for injection (SQL/HTML); callers still own that.
 
 ## Verification
@@ -48,6 +64,12 @@ decoded struct; bad query param → 400). Run: `zig build test-validate`.
 ## Backlog / deferred
 Regex-backed `pattern` support is a tracked future ADOPT dependency (README TODO) — not implemented;
 literal/prefix/suffix/charset matching is the v1 ceiling.
+
+The middleware (`Body`/`TypedBody`/`Query`/`PathParams`) answers only in the plain
+`{"errors":[…]}` shape with `application/json`. An opt-in to answer as RFC 9457
+problem details (`writeErrorsProblem`, `application/problem+json`) is deferred until a
+`router`-middleware consumer asks — the one consumer that wanted problem+json (qap,
+2026-09-22) calls the core directly, not the middleware.
 
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http`, `netaddr` — canonical source is

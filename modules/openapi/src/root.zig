@@ -91,12 +91,18 @@ pub const Info = struct {
     /// or written, so it also cannot trigger `error.InvalidUtf8` or
     /// `error.PathCollision` against a route that IS included.
     include: ?*const fn (router.Route) bool = null,
+    /// Declare HTTP bearer authentication (`components.securitySchemes.
+    /// bearerAuth`, RFC 6750) and require it on every operation (top-level
+    /// `security`). For an API whose every route sits behind a bearer token.
+    bearer_auth: bool = false,
 };
 
 pub const BuildError = error{
     OutOfMemory,
     /// A `RouteDoc.request_schema` is not valid JSON.
     InvalidRequestSchema,
+    /// A `RouteDoc.Response.schema` is not valid JSON.
+    InvalidResponseSchema,
     /// Route/document metadata (`Info` field, `RouteDoc` field, or a route
     /// pattern) is not valid UTF-8 (audit finding openapi-F4). JSON text
     /// MUST be valid UTF-8 (RFC 8259 §8.1); `std.json.Stringify.write`
@@ -209,7 +215,10 @@ pub const Generator = struct {
                 if (d.summary) |s| try checkUtf8(s);
                 if (d.description) |s| try checkUtf8(s);
                 for (d.tags) |t| try checkUtf8(t);
-                for (d.responses) |resp| try checkUtf8(resp.description);
+                for (d.responses) |resp| {
+                    try checkUtf8(resp.description);
+                    try checkUtf8(resp.media_type);
+                }
             }
         }
 
@@ -251,6 +260,16 @@ pub const Generator = struct {
             try jw.write(d);
         }
         try jw.endObject();
+        if (info.bearer_auth) {
+            try jw.objectField("security");
+            try jw.beginArray();
+            try jw.beginObject();
+            try jw.objectField("bearerAuth");
+            try jw.beginArray();
+            try jw.endArray();
+            try jw.endObject();
+            try jw.endArray();
+        }
         try jw.objectField("paths");
         try jw.beginObject();
         for (paths.items, route_groups.items) |path, group| {
@@ -285,6 +304,21 @@ pub const Generator = struct {
             try jw.endObject();
         }
         try jw.endObject();
+        if (info.bearer_auth) {
+            try jw.objectField("components");
+            try jw.beginObject();
+            try jw.objectField("securitySchemes");
+            try jw.beginObject();
+            try jw.objectField("bearerAuth");
+            try jw.beginObject();
+            try jw.objectField("type");
+            try jw.write("http");
+            try jw.objectField("scheme");
+            try jw.write("bearer");
+            try jw.endObject();
+            try jw.endObject();
+            try jw.endObject();
+        }
         try jw.endObject();
     }
 };
@@ -392,6 +426,20 @@ fn writeOperation(
             try jw.beginObject();
             try jw.objectField("description");
             try jw.write(resp.description);
+            if (resp.schema) |schema_text| {
+                const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.InvalidResponseSchema,
+                };
+                try jw.objectField("content");
+                try jw.beginObject();
+                try jw.objectField(resp.media_type);
+                try jw.beginObject();
+                try jw.objectField("schema");
+                try jw.write(schema);
+                try jw.endObject();
+                try jw.endObject();
+            }
             try jw.endObject();
         }
     } else {
@@ -1319,6 +1367,37 @@ test "external anchor: our generator's own output is genuinely valid OpenAPI 3.1
     // The exact bytes `openapi_spec_validator.validate()` accepted with no
     // exception raised.
     try testing.expectEqualStrings(own_generated_document, json);
+}
+
+test "external anchor: response schemas and bearer auth (frozen 2026-09-22)" {
+    const routes = [_]router.Route{
+        .{ .method = .post, .pattern = "/users", .doc = &.{
+            .summary = "Create a user",
+            .request_schema = "{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}",
+            .responses = &.{
+                .{ .status = 201, .description = "Created", .schema = "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}}}" },
+                .{ .status = 422, .description = "Invalid body", .media_type = "application/problem+json", .schema = "{\"type\":\"object\"}" },
+                .{ .status = 401, .description = "No valid token" },
+            },
+        } },
+    };
+    const json = try Generator.buildRoutes(testing.allocator, &routes, .{
+        .title = "T",
+        .version = "1",
+        .bearer_auth = true,
+    });
+    defer testing.allocator.free(json);
+    // The exact bytes `openapi_spec_validator.validate()` 0.7.1 accepted.
+    try testing.expectEqualStrings(
+        \\{"openapi":"3.1.0","info":{"title":"T","version":"1"},"security":[{"bearerAuth":[]}],"paths":{"/users":{"post":{"summary":"Create a user","operationId":"post_users","requestBody":{"content":{"application/json":{"schema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}},"required":true},"responses":{"201":{"description":"Created","content":{"application/json":{"schema":{"type":"object","properties":{"id":{"type":"integer"}}}}}},"422":{"description":"Invalid body","content":{"application/problem+json":{"schema":{"type":"object"}}}},"401":{"description":"No valid token"}}}}},"components":{"securitySchemes":{"bearerAuth":{"type":"http","scheme":"bearer"}}}}
+    , json);
+}
+
+test "generate: malformed response schema -> error.InvalidResponseSchema" {
+    const routes = [_]router.Route{.{ .method = .get, .pattern = "/x", .doc = &.{
+        .responses = &.{.{ .status = 200, .description = "ok", .schema = "{nope" }},
+    } }};
+    try testing.expectError(error.InvalidResponseSchema, Generator.buildRoutes(testing.allocator, &routes, .{ .title = "T", .version = "1" }));
 }
 
 test "external anchor: a document our checker rejects, a real validator rejects too — same reason (frozen 2026-08-01)" {
