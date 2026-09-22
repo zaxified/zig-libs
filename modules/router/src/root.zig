@@ -389,6 +389,12 @@ pub const RouteDoc = struct {
         /// HTTP status code (the OpenAPI responses key).
         status: u16,
         description: []const u8,
+        /// JSON Schema of the response body, as JSON text; `openapi`
+        /// validates and embeds it under `content."<media_type>".schema`.
+        /// Null: a response described by its status alone.
+        schema: ?[]const u8 = null,
+        /// The body's media type, when `schema` is set.
+        media_type: []const u8 = "application/json",
     };
 };
 

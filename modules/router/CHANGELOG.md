@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — `RouteDoc.Response` gains `schema: ?[]const u8 = null` (JSON Schema text of
+  the response body) and `media_type = "application/json"`, for `openapi` to describe response
+  bodies. Defaults keep every existing `RouteDoc` literal meaning what it meant.
+
 - **2026-09-22** — `router.Static(routes, options)`: a route table built at compile time over the
   same matcher as `Router` — `match(method, path, *Params)` returns `.found` (route index),
   `.method_not_allowed` (an `Allow`) or `.not_found`; `trailingSlashVariant` is the redirect probe

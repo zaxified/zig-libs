@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **Response bodies and bearer auth.** A `RouteDoc.Response` with a `schema`
+  is emitted with `content."<media_type>".schema` (validated and re-emitted like
+  `request_schema`; malformed text → new `error.InvalidResponseSchema`). `Info.bearer_auth`
+  declares `components.securitySchemes.bearerAuth` (`http`/`bearer`) and requires it on every
+  operation. New golden accepted by `openapi_spec_validator` 0.7.1.
+
 - **2026-09-22** — `Generator.buildRoutes` / `writeRoutes`: the same document from a plain
   `[]const router.Route` instead of a `*const router.Router`, for a server whose table is a comptime
   `router.Static` or its own. `build`/`write` now delegate to them; their output is unchanged.

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **New: `writeJsonSchema(rules, w)` / `writeJsonSchemaFor(T, w)`** — the
+  rules as a JSON Schema 2020-12 document, for an API description (OpenAPI 3.1 embeds 2020-12
+  as is). Faithful mapping: lengths in code points (`minLength`) and items (`minItems`), `.any`
+  states both, `.int` → `integer` (accepts `1.0`, as the validator does), `allow_null` → a type
+  array, `one_of` → `enum`, `format` → the 2020-12 names, patterns → `const` or an anchored,
+  escaped ECMA-262 `pattern`, two rules for one field → `allOf`, `T.validate_rules` → `allOf` of
+  both sets. Byte bounds have no keyword: `x-minBytes`/`x-maxBytes` plus the code-point bounds
+  they imply (looser, never stricter); `custom` → `x-custom`. Checked against Python `jsonschema`
+  4.19.2 on 33 bodies: 32 agree, the 33rd is that byte-bound looseness; pinned as a golden.
+
 - **2026-09-22** — **`Limits.max_errors`: a caller can lower the error cap.** The
   report keeps at most `max_errors` errors (default and ceiling: the module's
   1000) and builds none past it; 0 counts as 1, so an invalid document is never

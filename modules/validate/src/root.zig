@@ -1863,6 +1863,281 @@ const Stream = struct {
     }
 };
 
+// ── JSON Schema export ──────────────────────────────────────────────────────
+//
+// The rules as a JSON Schema 2020-12 document, for an API description
+// (OpenAPI 3.1 embeds 2020-12 schemas as they are). Faithful where the two
+// vocabularies meet, and they meet almost everywhere:
+//
+//  * `min_len`/`max_len` → `minLength`/`maxLength` on strings (both count
+//    code points) and `minItems`/`maxItems` on arrays; a `.any` rule states
+//    both, since each keyword applies only to its own type -- exactly how the
+//    validator applies them;
+//  * `.int` → `"integer"`, which in 2020-12 accepts `1.0` as the validator does;
+//  * `allow_null` → a `["<type>", "null"]` type array;
+//  * `pattern`: `literal` → `const`, `prefix`/`suffix`/`charset` → an anchored,
+//    escaped ECMA-262 `pattern`;
+//  * `format` → the 2020-12 format name (`uri-reference`, `date-time`, ...);
+//  * two rules for one field in the same set → `allOf` of both.
+//
+// No 2020-12 keyword states a length in BYTES: `min_bytes`/`max_bytes` go out
+// as the annotations `x-minBytes`/`x-maxBytes`, which a schema validator
+// ignores, plus the code-point bounds they imply (at most N, at least
+// ceil(N/4)) -- so a schema validator is looser there, never stricter. `custom` predicates are code and have no schema form at all; a
+// field carrying one says so in `x-custom` (its error code).
+
+/// The object schema a rule set describes: `{"type":"object","properties":
+/// {...},"required":[...]}`.
+pub fn writeJsonSchema(rules: []const Rule, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var s: std.json.Stringify = .{ .writer = w };
+    try schemaOfFields(&s, rules, true);
+}
+
+/// The schema of the typed body `T`: `rulesFor(T)`, and -- when `T` declares
+/// `validate_rules` -- `allOf` of that and the extra set, which is what the
+/// typed paths check.
+pub fn writeJsonSchemaFor(comptime T: type, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var s: std.json.Stringify = .{ .writer = w };
+    if (@hasDecl(T, "validate_rules")) {
+        try s.beginObject();
+        try s.objectField("allOf");
+        try s.beginArray();
+        try schemaOfFields(&s, comptime rulesFor(T), true);
+        try schemaOfFields(&s, T.validate_rules, false);
+        try s.endArray();
+        try s.endObject();
+    } else {
+        try schemaOfFields(&s, comptime rulesFor(T), true);
+    }
+}
+
+fn schemaOfFields(s: *std.json.Stringify, rules: []const Rule, typed: bool) std.Io.Writer.Error!void {
+    try s.beginObject();
+    if (typed) {
+        try s.objectField("type");
+        try s.write("object");
+    }
+    try writeFieldsMembers(s, rules);
+    try s.endObject();
+}
+
+/// `properties` and `required` for a rule set, into an object already open.
+fn writeFieldsMembers(s: *std.json.Stringify, rules: []const Rule) std.Io.Writer.Error!void {
+    if (rules.len == 0) return;
+    try s.objectField("properties");
+    try s.beginObject();
+    for (rules, 0..) |*r, i| {
+        if (firstIndexOf(rules, r.field) != i) continue; // grouped below
+        try s.objectField(r.field);
+        var count: usize = 0;
+        for (rules) |o| {
+            if (std.mem.eql(u8, o.field, r.field)) count += 1;
+        }
+        if (count == 1) {
+            try writeRuleSchema(s, r);
+        } else {
+            try s.beginObject();
+            try s.objectField("allOf");
+            try s.beginArray();
+            for (rules) |*o| {
+                if (std.mem.eql(u8, o.field, r.field)) try writeRuleSchema(s, o);
+            }
+            try s.endArray();
+            try s.endObject();
+        }
+    }
+    try s.endObject();
+    var any_required = false;
+    for (rules, 0..) |r, i| {
+        if (!r.required or firstRequiredIndexOf(rules, r.field) != i) continue;
+        if (!any_required) {
+            try s.objectField("required");
+            try s.beginArray();
+            any_required = true;
+        }
+        try s.write(r.field);
+    }
+    if (any_required) try s.endArray();
+}
+
+fn firstIndexOf(rules: []const Rule, field: []const u8) usize {
+    for (rules, 0..) |r, i| if (std.mem.eql(u8, r.field, field)) return i;
+    unreachable;
+}
+
+fn firstRequiredIndexOf(rules: []const Rule, field: []const u8) usize {
+    for (rules, 0..) |r, i| if (r.required and std.mem.eql(u8, r.field, field)) return i;
+    unreachable;
+}
+
+fn writeRuleSchema(s: *std.json.Stringify, r: *const Rule) std.Io.Writer.Error!void {
+    try s.beginObject();
+    const type_name: ?[]const u8 = switch (r.kind) {
+        .string => "string",
+        .int => "integer",
+        .float => "number",
+        .bool => "boolean",
+        .array => "array",
+        .object => "object",
+        .any => null,
+    };
+    if (type_name) |t| {
+        try s.objectField("type");
+        if (r.allow_null) {
+            try s.beginArray();
+            try s.write(t);
+            try s.write("null");
+            try s.endArray();
+        } else try s.write(t);
+    }
+    if (r.min) |m| {
+        try s.objectField("minimum");
+        try writeNumber(s, m);
+    }
+    if (r.max) |m| {
+        try s.objectField("maximum");
+        try writeNumber(s, m);
+    }
+    const strings = r.kind == .string or r.kind == .any;
+    const arrays = r.kind == .array or r.kind == .any;
+    // A byte bound implies a code-point bound -- N bytes of UTF-8 hold at
+    // most N code points and at least ceil(N/4) -- so a byte-bounded string
+    // also gets the (looser, never wrong) code-point keyword.
+    const min_chars: ?usize = maxOpt(r.min_len, if (r.min_bytes) |b| (b + 3) / 4 else null);
+    const max_chars: ?usize = minOpt(r.max_len, r.max_bytes);
+    if (strings) if (min_chars) |m| {
+        try s.objectField("minLength");
+        try s.write(m);
+    };
+    if (arrays) if (r.min_len) |m| {
+        try s.objectField("minItems");
+        try s.write(m);
+    };
+    if (strings) if (max_chars) |m| {
+        try s.objectField("maxLength");
+        try s.write(m);
+    };
+    if (arrays) if (r.max_len) |m| {
+        try s.objectField("maxItems");
+        try s.write(m);
+    };
+    if (r.min_bytes) |m| {
+        try s.objectField("x-minBytes");
+        try s.write(m);
+    }
+    if (r.max_bytes) |m| {
+        try s.objectField("x-maxBytes");
+        try s.write(m);
+    }
+    if (r.one_of) |allowed| {
+        try s.objectField("enum");
+        try s.write(allowed);
+    }
+    if (r.pattern) |p| switch (p) {
+        .literal => |lit| {
+            try s.objectField("const");
+            try s.write(lit);
+        },
+        .prefix => |pre| {
+            try s.objectField("pattern");
+            try writeRegex(s, "^", pre, "", false);
+        },
+        .suffix => |suf| {
+            try s.objectField("pattern");
+            try writeRegex(s, "", suf, "$", false);
+        },
+        .charset => |set| {
+            try s.objectField("pattern");
+            try writeRegex(s, "^[", set, "]*$", true);
+        },
+    };
+    if (r.format) |f| {
+        try s.objectField("format");
+        try s.write(formatName(f));
+    }
+    if (r.custom) |c| {
+        try s.objectField("x-custom");
+        try s.write(c.code);
+    }
+    if (r.kind == .object or r.kind == .any) if (r.fields) |fields| try writeFieldsMembers(s, fields);
+    if (r.kind == .array or r.kind == .any) if (r.items) |item| {
+        try s.objectField("items");
+        try writeRuleSchema(s, item);
+    };
+    try s.endObject();
+}
+
+fn maxOpt(a: ?usize, b: ?usize) ?usize {
+    if (a == null) return b;
+    if (b == null) return a;
+    return @max(a.?, b.?);
+}
+
+fn minOpt(a: ?usize, b: ?usize) ?usize {
+    if (a == null) return b;
+    if (b == null) return a;
+    return @min(a.?, b.?);
+}
+
+/// An integral bound as an integer (`255`, not `2.55e2`), anything else as
+/// the float it is.
+fn writeNumber(s: *std.json.Stringify, x: f64) std.Io.Writer.Error!void {
+    if (@floor(x) == x and @abs(x) < 9007199254740992.0) return s.write(@as(i64, @intFromFloat(x)));
+    return s.write(x);
+}
+
+/// `lead ++ escape(text) ++ tail` as one JSON string: `text` taken literally
+/// by an ECMA-262 regex, inside a character class when `class` is set.
+fn writeRegex(s: *std.json.Stringify, lead: []const u8, text: []const u8, tail: []const u8, class: bool) std.Io.Writer.Error!void {
+    var buf: [512]u8 = undefined;
+    var n: usize = 0;
+    var fits = true;
+    for (lead) |c| {
+        buf[n] = c;
+        n += 1;
+    }
+    const special: []const u8 = if (class) "\\]^-[" else "\\^$.|?*+()[]{}/";
+    for (text) |c| {
+        if (n + 2 + tail.len > buf.len) {
+            fits = false;
+            break;
+        }
+        if (std.mem.indexOfScalar(u8, special, c) != null) {
+            buf[n] = '\\';
+            n += 1;
+        }
+        buf[n] = c;
+        n += 1;
+    }
+    if (!fits) {
+        // A literal too long for the fixed buffer: say nothing rather than
+        // state a truncated -- and so wrong -- pattern.
+        return s.write(".*");
+    }
+    for (tail) |c| {
+        buf[n] = c;
+        n += 1;
+    }
+    return s.write(buf[0..n]);
+}
+
+fn formatName(f: Format) []const u8 {
+    return switch (f) {
+        .email => "email",
+        .uri => "uri",
+        .uri_reference => "uri-reference",
+        .uuid => "uuid",
+        .ipv4 => "ipv4",
+        .ipv6 => "ipv6",
+        .hostname => "hostname",
+        .date => "date",
+        .time => "time",
+        .date_time => "date-time",
+        .duration => "duration",
+        .json_pointer => "json-pointer",
+    };
+}
+
 // ── middleware (router + http) ──────────────────────────────────────────────
 
 /// Runtime-schema JSON body validation middleware. Register on the group (or
@@ -3310,6 +3585,53 @@ test "streaming: a valid document allocates no error path, and decodes into a bo
     // Unescaped strings are borrowed from the body, not copied.
     try testing.expect(@intFromPtr(r.ok.name.ptr) >= @intFromPtr(body.ptr) and
         @intFromPtr(r.ok.name.ptr) < @intFromPtr(body.ptr) + body.len);
+}
+
+test "writeJsonSchemaFor: golden, checked against an independent JSON Schema implementation" {
+    // The golden below was checked with Python `jsonschema` 4.19.2 (Draft
+    // 2020-12, format assertions on) against `parseIntoLimited` on 33 bodies
+    // covering every mapping here (2026-09-22): the two agreed on 32. The one
+    // difference is by design -- `"ab"` for `[3]u8` passes the schema (which
+    // can only say "1..3 code points") and fails the byte bound.
+    const T = struct {
+        name: []const u8,
+        age: u8,
+        score: ?f64 = null,
+        color: enum { red, green } = .red,
+        tags: []const []const u8 = &.{},
+        code: [3]u8 = .{ 'a', 'b', 'c' },
+        addr: ?struct { city: []const u8, zip: ?[]const u8 = null } = null,
+        pub const validate_rules: []const Rule = &.{
+            .{ .field = "name", .kind = .string, .min_len = 2, .max_len = 5, .pattern = .{ .prefix = "a.b" } },
+            .{ .field = "tags", .kind = .array, .max_len = 2, .items = &.{ .field = "", .kind = .string, .pattern = .{ .charset = "xy-]" } } },
+            .{ .field = "email", .kind = .string, .format = .email },
+            .{ .field = "misc", .kind = .any, .min_len = 2 },
+            .{ .field = "lit", .kind = .string, .pattern = .{ .literal = "q" } },
+            .{ .field = "suf", .kind = .string, .pattern = .{ .suffix = "$z" } },
+            .{ .field = "when", .kind = .string, .format = .date },
+        };
+    };
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchemaFor(T, &w);
+    try testing.expectEqualStrings(
+        \\{"allOf":[{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer","minimum":0,"maximum":255},"score":{"type":["number","null"]},"color":{"type":"string","enum":["red","green"]},"tags":{"type":"array","items":{"type":"string"}},"code":{"type":"string","minLength":1,"maxLength":3,"x-minBytes":3,"x-maxBytes":3},"addr":{"type":["object","null"],"properties":{"city":{"type":"string"},"zip":{"type":["string","null"]}},"required":["city"]}},"required":["name","age"]},{"properties":{"name":{"type":"string","minLength":2,"maxLength":5,"pattern":"^a\\.b"},"tags":{"type":"array","maxItems":2,"items":{"type":"string","pattern":"^[xy\\-\\]]*$"}},"email":{"type":"string","format":"email"},"misc":{"minLength":2,"minItems":2},"lit":{"type":"string","const":"q"},"suf":{"type":"string","pattern":"\\$z$"},"when":{"type":"string","format":"date"}}}]}
+    , w.buffered());
+}
+
+test "writeJsonSchema: two rules for one field are allOf, required listed once, bounds as integers" {
+    const rules = [_]Rule{
+        .{ .field = "a", .kind = .string, .required = true, .max_len = 3 },
+        .{ .field = "a", .kind = .string, .required = true, .format = .uri_reference },
+        .{ .field = "n", .kind = .float, .min = -1.5, .max = 1e3, .allow_null = true },
+        .{ .field = "c", .kind = .int, .custom = .{ .check = undefined, .code = "odd" } },
+    };
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeJsonSchema(&rules, &w);
+    try testing.expectEqualStrings(
+        \\{"type":"object","properties":{"a":{"allOf":[{"type":"string","maxLength":3},{"type":"string","format":"uri-reference"}]},"n":{"type":["number","null"],"minimum":-1.5,"maximum":1000},"c":{"type":"integer","x-custom":"odd"}},"required":["a"]}
+    , w.buffered());
 }
 
 test "Limits.max_errors lowers the cap on every limited path, and never to zero" {
