@@ -127,7 +127,7 @@ const normalize_buf_len = 2048;
 const method_count = @typeInfo(http.Method).@"enum".fields.len;
 
 /// One bit per `http.Method`, used to accumulate the union of methods a
-/// path shape supports across every candidate `matchRecDepth` visits (audit
+/// path shape supports across every candidate `matchIn` visits (audit
 /// finding router-F5) -- HEAD-implied-by-GET is applied once, at format
 /// time (`writeAllow`), not baked into the stored bits, so union stays a
 /// plain bitwise OR.
@@ -581,7 +581,7 @@ pub const Router = struct {
             .backtrack => {
                 var allow_bits: AllowSet = .initEmpty();
                 if (matchRecMethod(&r.root, req.path[1..], &params, req.method, &allow_bits)) |node|
-                    matched = endpointFor(node, req.method).? // guaranteed: see matchRecDepth
+                    matched = endpointFor(node, req.method).? // guaranteed: see matchIn
                 else if (allow_bits.count() != 0)
                     miss_allow = writeAllow(&miss_allow_buf, allow_bits);
             },
@@ -1080,11 +1080,11 @@ const Node = struct {
     /// value, never grow it, so `@min` on every insert along the new route's
     /// path keeps it correct without a separate rebuild pass). `maxInt` for a
     /// node no successful `insert` has reached yet — never observed by
-    /// `matchRecDepth` in practice, since a node only exists because some
+    /// `matchIn` in practice, since a node only exists because some
     /// `insert` walked through it, and that same call finalizes this field
     /// before returning (see `insert`'s bottom-up update).
     ///
-    /// F4 (A1/router.md): `matchRecDepth`'s backtracking search is
+    /// F4 (A1/router.md): `matchIn`'s backtracking search is
     /// O(#nodes reachable at the query's own length), which a route table
     /// with the same static segment name repeated at many depths plus a
     /// `:param` sibling at each one can blow up to O(k²) — measured 64,000
@@ -1092,7 +1092,7 @@ const Node = struct {
     /// prior session's memoization attempt could NOT fix (measured 20-25x
     /// SLOWER: the adversarial construction's param subtrees are disjoint,
     /// so no node is ever revisited — there is no redundant work to cache).
-    /// This field lets `matchRecDepth` reject a subtree in O(1) BEFORE
+    /// This field lets `matchIn` reject a subtree in O(1) BEFORE
     /// descending into it whenever the query's remaining segment count
     /// cannot possibly reach ANY endpoint under it — sound (never rejects a
     /// subtree that could still match) because it is a strictly NECESSARY
@@ -1132,11 +1132,11 @@ fn endpointFor(node: *const Node, method: http.Method) ?Endpoint {
 /// leading '/'; null = all segments consumed. `extra` appends one virtual
 /// "" segment (used to probe `path ++ "/"` without building the string).
 /// Recursion depth = segment count, bounded by this module's own
-/// `max_path_segments` (see `matchRecDepth`) — not by whatever caps the
+/// `max_path_segments` (see `matchIn`) — not by whatever caps the
 /// path upstream.
 fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) ?*const Node {
     var unused_allow: AllowSet = .initEmpty();
-    return matchRecDepth(node, rest, extra, params, 0, segmentsRemaining(rest, extra), null, &unused_allow);
+    return matchIn(runtime_tree, node, rest, extra, params, 0, segmentsRemaining(rest, extra), null, &unused_allow);
 }
 
 /// `matchRec`'s `MethodPrecedence.backtrack` twin (audit finding
@@ -1150,13 +1150,13 @@ fn matchRec(node: *const Node, rest: ?[]const u8, extra: bool, params: *Params) 
 /// exists, just not for this method" (405/auto-OPTIONS); empty means a
 /// genuine 404.
 fn matchRecMethod(node: *const Node, rest: ?[]const u8, params: *Params, method: http.Method, allow: *AllowSet) ?*const Node {
-    return matchRecDepth(node, rest, false, params, 0, segmentsRemaining(rest, false), method, allow);
+    return matchIn(runtime_tree, node, rest, false, params, 0, segmentsRemaining(rest, false), method, allow);
 }
 
 /// Total segment count `rest`/`extra` still represent — computed ONCE per
 /// top-level `matchRec` call (not per recursion level, which would turn an
 /// O(1)-per-level count into an O(depth) rescan and reintroduce an O(depth²)
-/// cost of its own). `matchRecDepth` threads the result down, decrementing
+/// cost of its own). `matchIn` threads the result down, decrementing
 /// by exactly one per segment consumed (see its own doc comment, F4).
 fn segmentsRemaining(rest: ?[]const u8, extra: bool) u32 {
     var n: u32 = if (extra) 1 else 0;
@@ -1169,8 +1169,46 @@ fn segmentsRemaining(rest: ?[]const u8, extra: bool) u32 {
     return n;
 }
 
-fn matchRecDepth(
-    node: *const Node,
+/// The runtime trie as `matchIn` sees it: a `Ref` is a node pointer.
+///
+/// ⭐ `matchIn` is the ONE matching algorithm in this module. The runtime
+/// `Router` and the comptime `Static` table differ only in how a node is
+/// stored -- a heap `Node` with a hash map of static children here, a flat
+/// comptime array addressed by index there -- and each supplies these few
+/// accessors. Precedence, backtracking, the F4 `min_reach` pruning and the
+/// F5 Allow union exist once, so the two cannot drift.
+const RuntimeTree = struct {
+    pub const Ref = *const Node;
+    pub const Edge = struct { name: []const u8, ref: Ref };
+
+    inline fn static(_: RuntimeTree, n: Ref, seg: []const u8) ?Ref {
+        return n.static.get(seg);
+    }
+    inline fn param(_: RuntimeTree, n: Ref) ?Edge {
+        const e = n.param orelse return null;
+        return .{ .name = e.name, .ref = e.node };
+    }
+    inline fn wildcard(_: RuntimeTree, n: Ref) ?Edge {
+        const e = n.wildcard orelse return null;
+        return .{ .name = e.name, .ref = e.node };
+    }
+    inline fn serves(_: RuntimeTree, n: Ref, m: http.Method) bool {
+        return endpointFor(n, m) != null;
+    }
+    inline fn allowBits(_: RuntimeTree, n: Ref) AllowSet {
+        return n.allow_bits;
+    }
+    inline fn minReach(_: RuntimeTree, n: Ref) u32 {
+        return n.min_reach;
+    }
+};
+const runtime_tree: RuntimeTree = .{};
+
+/// The matcher. `tree` supplies the node accessors (see `RuntimeTree`);
+/// `node` is where this level starts.
+fn matchIn(
+    tree: anytype,
+    node: @TypeOf(tree).Ref,
     rest: ?[]const u8,
     extra: bool,
     params: *Params,
@@ -1185,7 +1223,7 @@ fn matchRecDepth(
     // unions its `allow_bits` into `allow` and the search keeps going.
     method: ?http.Method,
     allow: *AllowSet,
-) ?*const Node {
+) ?@TypeOf(tree).Ref {
     // Router-owned recursion bound (see `max_path_segments`). A path this deep
     // cannot match a registered pattern, so refusing it costs nothing and the
     // frame count stops depending on the transport's path cap.
@@ -1195,13 +1233,14 @@ fn matchRecDepth(
         // here -- `segmentsRemaining` already counted it, so `remaining` is
         // passed through UNCHANGED; it is decremented below, the same as any
         // other segment, once this call re-enters with `rest = ""`.
-        if (extra) return matchRecDepth(node, "", false, params, depth + 1, remaining, method, allow);
+        if (extra) return matchIn(tree, node, "", false, params, depth + 1, remaining, method, allow);
+        const bits = tree.allowBits(node);
         if (method) |m| {
-            if (endpointFor(node, m) != null) return node;
-            if (node.hasEndpoint()) allow.setUnion(node.allow_bits);
+            if (tree.serves(node, m)) return node;
+            if (bits.count() != 0) allow.setUnion(bits);
             return null;
         }
-        return if (node.hasEndpoint()) node else null;
+        return if (bits.count() != 0) node else null;
     };
     var seg = r;
     var next: ?[]const u8 = null;
@@ -1213,29 +1252,30 @@ fn matchRecDepth(
     // reached from here has exactly `remaining - 1` segments left to work
     // with -- computed once, shared by the static AND param checks below.
     const remaining_after_seg = remaining - 1;
-    if (node.static.get(seg)) |child| {
-        if (child.min_reach <= remaining_after_seg) {
-            if (matchRecDepth(child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
+    if (tree.static(node, seg)) |child| {
+        if (tree.minReach(child) <= remaining_after_seg) {
+            if (matchIn(tree, child, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
         }
     }
-    if (seg.len != 0) if (node.param) |p| {
-        if (p.node.min_reach <= remaining_after_seg) {
+    if (seg.len != 0) if (tree.param(node)) |p| {
+        if (tree.minReach(p.ref) <= remaining_after_seg) {
             const saved = params.len;
             params.push(p.name, seg);
-            if (matchRecDepth(p.node, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
+            if (matchIn(tree, p.ref, next, extra, params, depth + 1, remaining_after_seg, method, allow)) |n| return n;
             params.len = saved;
         }
     };
-    if (node.wildcard) |wc| {
+    if (tree.wildcard(node)) |wc| {
+        const bits = tree.allowBits(wc.ref);
         if (method) |m| {
-            if (endpointFor(wc.node, m) != null) {
+            if (tree.serves(wc.ref, m)) {
                 params.push(wc.name, r);
-                return wc.node;
+                return wc.ref;
             }
-            if (wc.node.hasEndpoint()) allow.setUnion(wc.node.allow_bits);
-        } else if (wc.node.hasEndpoint()) {
+            if (bits.count() != 0) allow.setUnion(bits);
+        } else if (bits.count() != 0) {
             params.push(wc.name, r);
-            return wc.node;
+            return wc.ref;
         }
     }
     return null;
@@ -2541,7 +2581,7 @@ fn processCpuNs() u64 {
 }
 
 test "F4: a route table with the same static segment repeated at every depth plus a :param sibling matches in bounded time" {
-    // A1/router.md F4: `matchRecDepth`'s backtracking search cost used to be
+    // A1/router.md F4: `matchIn`'s backtracking search cost used to be
     // O(#nodes reachable within the query's own length) rather than O(query
     // length) -- a route table with the same static segment name repeated at
     // many depths, each with a `:param` sibling, is the adversarial shape:

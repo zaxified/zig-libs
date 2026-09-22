@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **NO CONSUMER-VISIBLE CHANGE:** the matcher (`matchRecDepth` → `matchIn`) is
+  now generic over a tree's node accessors, so a comptime route table can reuse it; the runtime
+  trie is its first implementation and every existing router test passes unchanged.
 - **2026-09-11** — **BEHAVIOURAL + API change (user-approved, Q7/Q8 — `QUESTIONS-ROUND-2.md`),
   changes observable behavior for all 18 in-repo consumers** — A1/router.md F5, F6, F8, F11 closed.
   - **F5 (405/method precedence, HIGH-adjacent footgun):** new `method_precedence` (default
