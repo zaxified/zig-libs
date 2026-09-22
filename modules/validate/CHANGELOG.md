@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **Errors as RFC 9457 problem details, and `validateParams`
+  over any lookup.** New `Report.writeProblem(w, http.problem.Problem)` and the
+  standalone `writeErrorsProblem(errors, problem, w)`: an
+  `application/problem+json` body whose `errors` extension member is the same
+  `[{path,code,message},…]` list `writeJson` writes. `validateParams` now takes
+  `params: anytype` — anything with `get(name: []const u8) ?[]const u8`, by value
+  or pointer — instead of only `*const router.Params`, so a server whose params
+  type is its own can use it; existing `&router.Params` callers compile
+  unchanged, and a type without such a `get` is a compile error that says so.
+  The middleware still answers 400 with `application/json` (see SPEC backlog).
+
 - **2026-09-09** — Docs: the `NOTICE` pointer in ``src/json_schema_format_test.zig` and `src/json_schema_format_vectors.zig`` resolved to `modules/NOTICE`,
   a path that has never existed in this repository. Now ``../NOTICE``. No code or data
   changed. `zig build check-catalog` gained a check that resolves every relative NOTICE

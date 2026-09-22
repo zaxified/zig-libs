@@ -81,7 +81,12 @@ var report = try validate.validateJson(gpa, body_bytes, &schema);
 defer report.deinit();
 if (!report.ok()) ...;                      // report.errors = []{path,code,message}
 // Also: validateValue (an already-parsed std.json.Value),
-//       validateQuery (raw query string), validateParams (router path params).
+//       validateQuery (raw query string), validateParams (path params: any
+//       value with get(name) ?[]const u8 -- router.Params or your own).
+
+// As an RFC 9457 problem (Content-Type: http.problem.content_type):
+try report.writeProblem(w, .{ .status = 422 });
+// {"type":"about:blank","status":422,"title":"Unprocessable Content","errors":[…]}
 
 // Middleware:
 const body_mw: validate.Body = .{ .gpa = gpa, .schema = &schema };

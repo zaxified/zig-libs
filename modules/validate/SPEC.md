@@ -49,6 +49,12 @@ decoded struct; bad query param → 400). Run: `zig build test-validate`.
 Regex-backed `pattern` support is a tracked future ADOPT dependency (README TODO) — not implemented;
 literal/prefix/suffix/charset matching is the v1 ceiling.
 
+The middleware (`Body`/`TypedBody`/`Query`/`PathParams`) answers only in the plain
+`{"errors":[…]}` shape with `application/json`. An opt-in to answer as RFC 9457
+problem details (`writeErrorsProblem`, `application/problem+json`) is deferred until a
+`router`-middleware consumer asks — the one consumer that wanted problem+json (qap,
+2026-09-22) calls the core directly, not the middleware.
+
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http`, `netaddr` — canonical source is
 `pub const meta` in src/root.zig.

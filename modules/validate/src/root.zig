@@ -265,6 +265,13 @@ pub const Report = struct {
         return writeErrorsJson(r.errors, w);
     }
 
+    /// Serialize as an RFC 9457 `application/problem+json` body: `p`'s
+    /// standard members plus an `errors` extension member carrying the same
+    /// `[{path,code,message},…]` list `writeJson` writes.
+    pub fn writeProblem(r: *const Report, w: *std.Io.Writer, p: http.problem.Problem) std.Io.Writer.Error!void {
+        return writeErrorsProblem(r.errors, p, w);
+    }
+
     pub fn deinit(r: *Report) void {
         r.arena.deinit();
         r.* = undefined;
@@ -274,6 +281,16 @@ pub const Report = struct {
 /// The 400 wire shape, also usable standalone: `{"errors":[…]}`.
 pub fn writeErrorsJson(errors: []const Error, w: *std.Io.Writer) std.Io.Writer.Error!void {
     return std.json.Stringify.value(.{ .errors = errors }, .{}, w);
+}
+
+/// The problem-details wire shape (RFC 9457), also usable standalone:
+/// `{"type":…,"status":…,"title":…,…,"errors":[…]}`. Send it with
+/// `Content-Type: http.problem.content_type` and the status in `p.status`.
+/// Error paths and messages are valid UTF-8 whatever the input was: paths
+/// come from the schema or from keys a JSON parser already validated, and
+/// messages never quote the rejected value.
+pub fn writeErrorsProblem(errors: []const Error, p: http.problem.Problem, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    return http.problem.write(w, p, .{ .errors = errors });
 }
 
 /// Hard cap on aggregated errors per `Report`. Bounds worst-case aggregation
@@ -1110,10 +1127,16 @@ pub fn validateQuery(gpa: Allocator, query: []const u8, schema: []const Rule) Al
     return b.finish();
 }
 
-/// Validate `router` path params of the matched route. Values are the raw
-/// path segments (the router matches byte-for-byte, no percent-decoding —
-/// its documented policy), coerced per the rule's kind like `validateQuery`.
-pub fn validateParams(gpa: Allocator, params: *const router.Params, schema: []const Rule) Allocator.Error!Report {
+/// Validate the path params of a matched route. Values are the raw path
+/// segments (the router matches byte-for-byte, no percent-decoding — its
+/// documented policy), coerced per the rule's kind like `validateQuery`.
+///
+/// `params` is any name → value lookup: a value or pointer whose
+/// `get(name: []const u8) ?[]const u8` returns the segment bound to `name`
+/// — `*const router.Params`, or a server's own params type that does not
+/// come from `router` at all.
+pub fn validateParams(gpa: Allocator, params: anytype, schema: []const Rule) Allocator.Error!Report {
+    comptime assertLookup(@TypeOf(params));
     var b = Builder.init(gpa);
     errdefer b.abort();
     for (schema) |*rule| {
@@ -1124,6 +1147,23 @@ pub fn validateParams(gpa: Allocator, params: *const router.Params, schema: []co
         }
     }
     return b.finish();
+}
+
+/// Compile error unless `P` (or what it points to) has
+/// `get([]const u8) ?[]const u8` — says what is missing instead of failing
+/// deep inside `validateParams`.
+fn assertLookup(comptime P: type) void {
+    const T = switch (@typeInfo(P)) {
+        .pointer => |ptr| ptr.child,
+        else => P,
+    };
+    const ok = switch (@typeInfo(T)) {
+        .@"struct", .@"union", .@"enum", .@"opaque" => @hasDecl(T, "get") and
+            @TypeOf(T.get(undefined, undefined)) == ?[]const u8,
+        else => false,
+    };
+    if (!ok) @compileError("validateParams: " ++ @typeName(P) ++
+        " is not a param lookup -- it needs `get(name: []const u8) ?[]const u8`");
 }
 
 /// Coerce one string value to the rule's kind, then run the shared checks.
@@ -2512,6 +2552,53 @@ test "params: validateParams over router.Params (raw segments, coerce+check)" {
     var low = try validateParams(testing.allocator, &params, &schema);
     defer low.deinit();
     try expectError(&low, "id", "greater_than_equal");
+}
+
+test "params: validateParams over a lookup that is not router.Params" {
+    // A server with its own params type (no `router` in its API) — anything
+    // with `get(name) ?[]const u8`, by value or by pointer.
+    const Pairs = struct {
+        names: []const []const u8,
+        values: []const []const u8,
+        fn get(p: @This(), name: []const u8) ?[]const u8 {
+            for (p.names, p.values) |n, v| if (std.mem.eql(u8, n, name)) return v;
+            return null;
+        }
+    };
+    const pairs: Pairs = .{ .names = &.{ "id", "tag" }, .values = &.{ "x7", "ok" } };
+    const schema = [_]Rule{
+        .{ .field = "id", .kind = .int, .required = true },
+        .{ .field = "tag", .kind = .string, .one_of = &.{ "ok", "no" } },
+        .{ .field = "absent", .kind = .string, .required = true },
+    };
+    inline for (.{ pairs, &pairs }) |lookup| {
+        var r = try validateParams(testing.allocator, lookup, &schema);
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 2), r.errors.len);
+        try expectError(&r, "id", "int_parsing");
+        try expectError(&r, "absent", "missing");
+    }
+}
+
+test "writeProblem: RFC 9457 body carrying the aggregated errors" {
+    var r = try validateJson(testing.allocator, "{\"age\":\"x\"}", &.{
+        .{ .field = "age", .kind = .int },
+        .{ .field = "name", .kind = .string, .required = true },
+    });
+    defer r.deinit();
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try r.writeProblem(&w, .{ .status = 422 });
+    try testing.expectEqualStrings(
+        \\{"type":"about:blank","status":422,"title":"Unprocessable Content","errors":[{"path":"age","code":"int_type","message":"Input should be a valid integer"},{"path":"name","code":"missing","message":"Field required"}]}
+    , w.buffered());
+
+    // Same `errors` array as the plain 400 shape.
+    var plain_buf: [512]u8 = undefined;
+    var plain: std.Io.Writer = .fixed(&plain_buf);
+    try r.writeJson(&plain);
+    const list = plain.buffered()["{\"errors\":".len .. plain.buffered().len - 1];
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), list) != null);
 }
 
 // ── tests: the typed style ──────────────────────────────────────────────────

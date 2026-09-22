@@ -641,7 +641,12 @@ functions; `http.Server.serveStream` / `http.Server.ResponseWriter` /
 `http.h2` / `http.h2_client` / `http.h2_server` — the HTTP/2 stack;
 `http.proxy` — the reverse-proxy handler (offline-testable pure helpers
 `isHopByHop` / `statusForBackendError` / URL + `Via` builders, plus a
-loopback origin↔proxy↔client integration test).
+loopback origin↔proxy↔client integration test); `http.problem` — RFC 9457
+problem details (`application/problem+json`): `problem.write(w, .{ .status =
+404 }, .{ .extra = x })` writes the standard members plus any struct's fields
+as extensions, allocation-free; the standard string members are always valid
+UTF-8 (invalid bytes → U+FFFD), and `problem.Problem` doubles as the
+`std.json` parse target for a client.
 
 ## Verification
 

@@ -6,7 +6,7 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
 Submodules: `Client` / `Server` (h1), `h1` (parser), `hpack` + `h2` + `h2_server` + `h2_client`
 (HTTP/2), `proxy` (reverse-proxy handler) + `h2_upstream` (h2 upstream pool) + `bufpool` (shared
 client buffer pool), plus request/response feature layers `conditional`, `body`, `multipart`, `sse`,
-`range`, `conneg`, `gzip`. One `test { _ = … }` aggregator pulls every submodule's tests (the dark-tests
+`range`, `conneg`, `gzip`, `problem`. One `test { _ = … }` aggregator pulls every submodule's tests (the dark-tests
 rule). Same handler serves h1 and h2 — h2 pseudo-headers map to the stock `Request`, the
 `ResponseWriter` is re-framed as HEADERS+DATA; h2 is opt-in (`enable_h2c`), off by default so the h1
 path is byte-for-byte unchanged. Streaming + backpressure: `ResponseWriter.flush()` for incremental

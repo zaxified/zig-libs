@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **New `http.problem`: RFC 9457 problem details**
+  (`application/problem+json`). `problem.write(w, Problem, extensions)` writes the
+  five standard members and then the fields of any struct value as extension
+  members, allocation-free, into a `std.Io.Writer`. `about:blank` with no `title`
+  takes the status code's reason phrase (§4.2.1); absent members are omitted;
+  an extension named like a standard member is a compile error. `type`, `title`,
+  `detail` and `instance` are written as valid UTF-8 whatever they hold — each
+  maximal invalid subpart becomes U+FFFD — because `detail`/`instance` routinely
+  carry request bytes and a client must be able to parse the error it gets
+  (`std.json` passes invalid UTF-8 through verbatim). `problem.Problem` is also
+  the `std.json` parse target on the client side. Anchored on the RFC's §3
+  example, byte for byte. Also removed a duplicated, detached copy of the `gzip`
+  doc comment from `root.zig`.
+
 - **2026-09-21** — **FIX (perf): the 60a08442 body-zeroing above used
   `std.crypto.secureZero`, whose `@memset` over a `[]volatile T` cannot
   lower to the ordinary `memset` intrinsic and so stores one byte at a
