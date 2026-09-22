@@ -707,6 +707,9 @@ pub const Router = struct {
 
     fn addRoute(r: *Router, g: ?*Group, method: http.Method, pattern: []const u8, h: Handler, doc: ?RouteDoc) AddError!void {
         if (pattern.len == 0 or pattern[0] != '/') return error.InvalidPattern;
+        // The per-pattern grammar, shared with `Static`. `insert` checks the
+        // full, prefixed pattern again as it walks the trie.
+        try validatePattern(pattern);
         const a = r.arena.allocator();
         // Arena-duplicated: the full pattern is stored in the route table
         // and stashed as Ctx.matched_pattern — the caller's slice may be a
@@ -1009,6 +1012,297 @@ fn makeGroup(r: *Router, parent: ?*Group, prefix: []const u8) GroupError!*Group 
     return g;
 }
 
+// ── the comptime table ─────────────────────────────────────────────────────
+
+/// The methods a path serves, as a 405's `Allow` lists them (HEAD implied by
+/// GET, `http.Method` order). What `Static.match` reports for a path whose
+/// shape exists but whose method does not.
+pub const Allow = struct {
+    bits: AllowSet = .initEmpty(),
+
+    /// Longest `write` output: every method token, comma-separated.
+    pub const max_len = 64;
+
+    pub fn has(a: Allow, m: http.Method) bool {
+        if (a.bits.isSet(@intFromEnum(m))) return true;
+        return m == .head and a.bits.isSet(@intFromEnum(http.Method.get));
+    }
+
+    /// The header value into `buf` -- the same bytes `Router`'s 405 sends.
+    pub fn write(a: Allow, buf: *[max_len]u8) []const u8 {
+        return writeAllow(buf, a.bits);
+    }
+};
+
+/// One route of a comptime table. Its index in the slice handed to `Static`
+/// is what a match returns: the caller keeps its own handler, doc and policy
+/// per route in a parallel table of the same order.
+pub const StaticRoute = struct {
+    method: http.Method,
+    /// Same grammar as `Router.add`.
+    pattern: []const u8,
+};
+
+pub const StaticOptions = struct {
+    /// See `MethodPrecedence`; same default as `Router`.
+    method_precedence: MethodPrecedence = .backtrack,
+};
+
+/// What `Static.match` found.
+pub const Match = union(enum) {
+    /// The index of the matched route in the table. HEAD reaches a GET
+    /// route when no HEAD route exists, as with `Router`.
+    found: usize,
+    /// The path shape exists, the method does not: answer 405 (or 204 to an
+    /// OPTIONS) with this `Allow`.
+    method_not_allowed: Allow,
+    not_found,
+};
+
+/// A route table built at compile time: the same matcher (`matchIn`), the same
+/// precedence, backtracking and pruning as `Router`, with no allocator, no
+/// hash map, no `Ctx` and no middleware -- a function from `(method, path)` to
+/// a route index and its params. Every pattern error `Router.add` would
+/// return at startup is a compile error here instead.
+///
+/// `path` is matched byte-for-byte, as `Router` matches: it must be
+/// origin-form (start with '/'), and the caller decides normalization first
+/// (`http.Server` has already removed dot segments from `req.path`; see
+/// `NormalizePath` and `rawPath`). No trailing-slash redirect is issued --
+/// `trailingSlashVariant` says whether one would exist.
+pub fn Static(comptime routes: []const StaticRoute, comptime options: StaticOptions) type {
+    const table = comptime buildStatic(routes);
+    return struct {
+        pub const route_count = routes.len;
+        const tree: StaticTree = .{ .nodes = table };
+
+        /// Match `path` (origin-form) for `method`. `params` receives the
+        /// captures of the matched route; they are slices of `path`.
+        pub fn match(method: http.Method, path: []const u8, params: *Params) Match {
+            params.len = 0;
+            if (path.len == 0 or path[0] != '/') return .not_found;
+            const rest = path[1..];
+            var allow: AllowSet = .initEmpty();
+            switch (options.method_precedence) {
+                .backtrack => {
+                    if (matchIn(tree, 0, rest, false, params, 0, segmentsRemaining(rest, false), method, &allow)) |n|
+                        return .{ .found = tree.routeFor(n, method).? };
+                    if (allow.count() != 0) return .{ .method_not_allowed = .{ .bits = allow } };
+                    return .not_found;
+                },
+                .first_match => {
+                    const n = matchIn(tree, 0, rest, false, params, 0, segmentsRemaining(rest, false), null, &allow) orelse
+                        return .not_found;
+                    if (tree.routeFor(n, method)) |i| return .{ .found = i };
+                    return .{ .method_not_allowed = .{ .bits = table[n].allow_bits } };
+                },
+            }
+        }
+
+        pub const SlashVariant = enum { add_slash, drop_slash };
+
+        /// For a path that matched nothing: would the other trailing-slash
+        /// form serve `method`? The probe `Router`'s `.redirect` posture runs
+        /// before its 404, as a pure function -- the caller builds the
+        /// `Location` and decides whether to redirect at all.
+        pub fn trailingSlashVariant(method: http.Method, path: []const u8) ?SlashVariant {
+            if (path.len == 0 or path[0] != '/') return null;
+            var probe: Params = .{};
+            var unused: AllowSet = .initEmpty();
+            if (path.len > 1 and path[path.len - 1] == '/') {
+                const alt = path[1 .. path.len - 1];
+                const n = matchIn(tree, 0, alt, false, &probe, 0, segmentsRemaining(alt, false), null, &unused) orelse return null;
+                return if (tree.serves(n, method)) .drop_slash else null;
+            }
+            const rest = path[1..];
+            const n = matchIn(tree, 0, rest, true, &probe, 0, segmentsRemaining(rest, true), null, &unused) orelse return null;
+            return if (tree.serves(n, method)) .add_slash else null;
+        }
+    };
+}
+
+/// A comptime table node. Children are indices into the same table.
+const StaticNode = struct {
+    statics: []const StaticEdge = &.{},
+    param: ?StaticEdge = null,
+    wildcard: ?StaticEdge = null,
+    /// Route index per method.
+    routes: [method_count]?u32 = @splat(null),
+    allow_bits: AllowSet = .initEmpty(),
+    min_reach: u32 = std.math.maxInt(u32),
+};
+
+/// A static child (`seg` = its segment) or a named capture (`seg` = the name).
+const StaticEdge = struct { seg: []const u8, child: u32 };
+
+/// The comptime table as `matchIn` sees it: a `Ref` is an index.
+const StaticTree = struct {
+    nodes: []const StaticNode,
+
+    pub const Ref = u32;
+    pub const Edge = struct { name: []const u8, ref: Ref };
+
+    inline fn static(t: StaticTree, n: Ref, seg: []const u8) ?Ref {
+        for (t.nodes[n].statics) |e| {
+            if (std.mem.eql(u8, e.seg, seg)) return e.child;
+        }
+        return null;
+    }
+    inline fn param(t: StaticTree, n: Ref) ?Edge {
+        const e = t.nodes[n].param orelse return null;
+        return .{ .name = e.seg, .ref = e.child };
+    }
+    inline fn wildcard(t: StaticTree, n: Ref) ?Edge {
+        const e = t.nodes[n].wildcard orelse return null;
+        return .{ .name = e.seg, .ref = e.child };
+    }
+    inline fn routeFor(t: StaticTree, n: Ref, m: http.Method) ?usize {
+        const rs = t.nodes[n].routes;
+        if (rs[@intFromEnum(m)]) |i| return i;
+        if (m == .head) if (rs[@intFromEnum(http.Method.get)]) |i| return i;
+        return null;
+    }
+    inline fn serves(t: StaticTree, n: Ref, m: http.Method) bool {
+        return t.routeFor(n, m) != null;
+    }
+    inline fn allowBits(t: StaticTree, n: Ref) AllowSet {
+        return t.nodes[n].allow_bits;
+    }
+    inline fn minReach(t: StaticTree, n: Ref) u32 {
+        return t.nodes[n].min_reach;
+    }
+};
+
+/// Build the table, refusing at compile time what `Router.add` refuses at
+/// startup. Mirrors `Router.insert` step for step; the differential test
+/// holds the two to the same answers.
+fn buildStatic(comptime routes: []const StaticRoute) []const StaticNode {
+    comptime {
+        var segments: usize = 1;
+        for (routes) |rt| segments += std.mem.count(u8, rt.pattern, "/") + 1;
+        @setEvalBranchQuota(10_000 + 2_000 * segments);
+        var nodes: [segments]StaticNode = @splat(.{});
+        var len: usize = 1;
+        for (routes, 0..) |rt, ri| {
+            validatePattern(rt.pattern) catch |err| @compileError(std.fmt.comptimePrint(
+                "router.Static: route {d} ({s} {s}): {s} -- see router.AddError.{s}",
+                .{ ri, @tagName(rt.method), rt.pattern, @errorName(err), @errorName(err) },
+            ));
+            var node: u32 = 0;
+            var ancestors: [max_path_segments]u32 = undefined;
+            var ancestors_len: usize = 0;
+            var total_segments: u32 = 0;
+            var rest: ?[]const u8 = rt.pattern[1..];
+            while (rest) |cur| {
+                ancestors[ancestors_len] = node;
+                ancestors_len += 1;
+                total_segments += 1;
+                var seg = cur;
+                var next: ?[]const u8 = null;
+                if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+                    seg = cur[0..i];
+                    next = cur[i + 1 ..];
+                }
+                const kind: enum { static, param, wildcard } = if (seg.len != 0 and seg[0] == '*')
+                    .wildcard
+                else if (seg.len != 0 and seg[0] == ':')
+                    .param
+                else
+                    .static;
+                switch (kind) {
+                    .static => {
+                        var found: ?u32 = null;
+                        for (nodes[node].statics) |e| {
+                            if (std.mem.eql(u8, e.seg, seg)) found = e.child;
+                        }
+                        node = found orelse blk: {
+                            const child: u32 = len;
+                            len += 1;
+                            nodes[node].statics = nodes[node].statics ++ &[_]StaticEdge{.{ .seg = seg, .child = child }};
+                            break :blk child;
+                        };
+                    },
+                    .param, .wildcard => {
+                        const name = seg[1..];
+                        const slot = if (kind == .param) &nodes[node].param else &nodes[node].wildcard;
+                        if (slot.*) |e| {
+                            if (!std.mem.eql(u8, e.seg, name)) @compileError(std.fmt.comptimePrint(
+                                "router.Static: route {d} ({s}): capture '{s}' conflicts with '{s}' at the same position -- see router.AddError.ParamNameConflict",
+                                .{ ri, rt.pattern, name, e.seg },
+                            ));
+                            node = e.child;
+                        } else {
+                            const child: u32 = len;
+                            len += 1;
+                            slot.* = .{ .seg = name, .child = child };
+                            node = child;
+                        }
+                    },
+                }
+                rest = if (kind == .wildcard) null else next;
+            }
+            const m = @intFromEnum(rt.method);
+            if (nodes[node].routes[m]) |prev| @compileError(std.fmt.comptimePrint(
+                "router.Static: route {d} ({s} {s}) duplicates route {d} -- see router.AddError.DuplicateRoute",
+                .{ ri, @tagName(rt.method), rt.pattern, prev },
+            ));
+            nodes[node].routes[m] = ri;
+            nodes[node].allow_bits.set(m);
+            nodes[node].min_reach = 0;
+            var i: usize = ancestors_len;
+            while (i > 0) {
+                i -= 1;
+                const distance = total_segments - @as(u32, @intCast(i));
+                nodes[ancestors[i]].min_reach = @min(nodes[ancestors[i]].min_reach, distance);
+            }
+        }
+        const final: [len]StaticNode = nodes[0..len].*;
+        return &final;
+    }
+}
+
+/// The per-pattern rules of `AddError` -- everything that can be decided from
+/// one pattern alone, without the rest of the table. Shared by `Router.add`
+/// and `Static`, so the grammar is stated once.
+pub fn validatePattern(pattern: []const u8) AddError!void {
+    if (pattern.len == 0 or pattern[0] != '/') return error.InvalidPattern;
+    var names: [max_params][]const u8 = undefined;
+    var n: usize = 0;
+    var rest: ?[]const u8 = pattern[1..];
+    while (rest) |cur| {
+        var seg = cur;
+        var next: ?[]const u8 = null;
+        if (std.mem.indexOfScalar(u8, cur, '/')) |i| {
+            seg = cur[0..i];
+            next = cur[i + 1 ..];
+        }
+        if (seg.len != 0 and (seg[0] == '*' or seg[0] == ':')) {
+            const name = seg[1..];
+            if (name.len == 0) return error.InvalidPattern;
+            if (seg[0] == '*' and next != null) return error.InvalidPattern;
+            if (std.mem.indexOfAny(u8, name, ":*") != null) return error.InvalidPattern;
+            for (names[0..n]) |x| if (std.mem.eql(u8, x, name)) return error.DuplicateParamName;
+            if (n == max_params) return error.TooManyParams;
+            names[n] = name;
+            n += 1;
+        } else {
+            // F11: an empty segment only as the final one (a trailing slash).
+            if (seg.len == 0 and next != null) return error.InvalidPattern;
+            if (std.mem.indexOfAny(u8, seg, ":*") != null) return error.InvalidPattern;
+        }
+        rest = next;
+    }
+}
+
+/// The target's path portion -- up to '?', or the whole target when there is
+/// none -- i.e. `req.path` as it stood *before* `http.Server`'s dot-segment
+/// rewrite ran. `req.target` is preserved raw by `http.Server` specifically
+/// so a private copy could be normalized without losing this.
+pub fn rawPath(target: []const u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[0..i];
+    return target;
+}
+
 fn serverAdapter(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
     const r: *Router = @ptrCast(@alignCast(req.context.?));
     return r.dispatch(req, rw);
@@ -1031,15 +1325,6 @@ fn defaultBadRequest(ctx: *Ctx) anyerror!void {
     ctx.res.setStatus(400);
     try ctx.res.setHeader("Content-Type", "text/plain");
     try ctx.res.writeAll("Bad Request\n");
-}
-
-/// The target's path portion — up to '?', or the whole target when there is
-/// none — i.e. `req.path` as it stood *before* `http.Server`'s dot-segment
-/// rewrite ran. `req.target` is preserved raw by `http.Server` specifically
-/// so a private copy could be normalized without losing this.
-fn rawPath(target: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, target, '?')) |i| return target[0..i];
-    return target;
 }
 
 fn defaultAutoOptions(ctx: *Ctx) anyerror!void {
@@ -2643,4 +2928,185 @@ test "F4: a route table with the same static segment repeated at every depth plu
     // catching a regression back to the O(k^2) shape.
     errdefer std.debug.print("F4 probe: avg {d} ns/call over {d} reps (k={d})\n", .{ avg_ns, reps, k });
     try testing.expect(avg_ns < 200_000);
+}
+
+// ── Static: the comptime table ──────────────────────────────────────────────
+
+const static_demo = [_]StaticRoute{
+    .{ .method = .get, .pattern = "/users/new" },
+    .{ .method = .get, .pattern = "/users/:id" },
+    .{ .method = .post, .pattern = "/users" },
+    .{ .method = .delete, .pattern = "/users/:id" },
+    .{ .method = .get, .pattern = "/static/*path" },
+    .{ .method = .get, .pattern = "/dir/" },
+};
+
+test "Static: precedence, captures, HEAD -> GET, 405 with Router's Allow, 404" {
+    const S = Static(&static_demo, .{});
+    var p: Params = .{};
+
+    try testing.expectEqual(Match{ .found = 0 }, S.match(.get, "/users/new", &p));
+    try testing.expectEqual(@as(usize, 0), p.len);
+
+    try testing.expectEqual(Match{ .found = 1 }, S.match(.get, "/users/42", &p));
+    try testing.expectEqualStrings("42", p.get("id").?);
+    try testing.expectEqual(Match{ .found = 1 }, S.match(.head, "/users/42", &p));
+    try testing.expectEqual(Match{ .found = 3 }, S.match(.delete, "/users/42", &p));
+
+    try testing.expectEqual(Match{ .found = 4 }, S.match(.get, "/static/css/a.css", &p));
+    try testing.expectEqualStrings("css/a.css", p.get("path").?);
+
+    const m = S.match(.put, "/users/42", &p);
+    var buf: [Allow.max_len]u8 = undefined;
+    try testing.expectEqualStrings("GET, HEAD, DELETE", m.method_not_allowed.write(&buf));
+    try testing.expect(m.method_not_allowed.has(.head));
+    try testing.expect(!m.method_not_allowed.has(.put));
+
+    try testing.expectEqual(Match.not_found, S.match(.get, "/nope", &p));
+    try testing.expectEqual(Match.not_found, S.match(.get, "users", &p));
+    // `:id` never matches an empty segment.
+    try testing.expectEqual(Match.not_found, S.match(.get, "/users/", &p));
+}
+
+test "Static: trailing-slash variant mirrors Router's redirect probe" {
+    const S = Static(&static_demo, .{});
+    try testing.expectEqual(S.SlashVariant.add_slash, S.trailingSlashVariant(.get, "/dir").?);
+    try testing.expectEqual(S.SlashVariant.drop_slash, S.trailingSlashVariant(.post, "/users/").?);
+    try testing.expectEqual(@as(?S.SlashVariant, null), S.trailingSlashVariant(.post, "/dir"));
+    try testing.expectEqual(@as(?S.SlashVariant, null), S.trailingSlashVariant(.get, "/nope"));
+}
+
+test "validatePattern and Router.add refuse the same patterns" {
+    const bad = [_][]const u8{
+        "",                            "x", "//x", "/a//b", "/:", "/*", "/*w/x", "/a:b", "/:a/:a", "/:a/*a", "/:x:y",
+        "/:a/:b/:c/:d/:e/:f/:g/:h/:i",
+    };
+    for (bad) |pat| {
+        var r = Router.init(testing.allocator);
+        defer r.deinit();
+        const want = if (r.add(.get, pat, hRoot)) |_| return error.RouterAcceptedABadPattern else |e| e;
+        try testing.expectError(want, validatePattern(pat));
+    }
+    try validatePattern("/x/");
+    try validatePattern("/a/:b/*c");
+}
+
+// M2.2 -- the differential test: the comptime table against the runtime trie,
+// on generated tables, every method, both precedence postures.
+
+const diff_vocab = [_][]const u8{ "a", "b", "users", "x" };
+
+/// A comptime-generated table: `count` patterns of 1..4 segments drawn from
+/// static words, one capture name per depth (`:p<depth>`, so no two routes
+/// can conflict on a name) and a final `*w`, deduplicated per (method,
+/// pattern).
+fn diffTable(comptime seed: u64, comptime count: usize) []const StaticRoute {
+    comptime {
+        @setEvalBranchQuota(200_000);
+        var state = seed;
+        var out: [count]StaticRoute = undefined;
+        var n: usize = 0;
+        const methods = [_]http.Method{ .get, .post, .put, .delete, .head };
+        while (n < count) {
+            var pat: []const u8 = "";
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            const depth = 1 + (state >> 33) % 4;
+            var d: usize = 0;
+            while (d < depth) : (d += 1) {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                const pick = (state >> 33) % 10;
+                const seg: []const u8 = if (pick < 6)
+                    diff_vocab[pick % diff_vocab.len]
+                else if (pick < 9)
+                    ":p" ++ std.fmt.comptimePrint("{d}", .{d})
+                else if (d + 1 == depth) "*w" else diff_vocab[0];
+                pat = pat ++ "/" ++ seg;
+            }
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            if ((state >> 40) % 8 == 0 and !std.mem.endsWith(u8, pat, "*w")) pat = pat ++ "/";
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            const m = methods[(state >> 33) % methods.len];
+            var dup = false;
+            for (out[0..n]) |o| {
+                if (o.method == m and std.mem.eql(u8, o.pattern, pat)) dup = true;
+            }
+            if (!dup) {
+                out[n] = .{ .method = m, .pattern = pat };
+                n += 1;
+            }
+        }
+        const final = out;
+        return &final;
+    }
+}
+
+fn diffPath(rng: std.Random, buf: []u8) []const u8 {
+    const words = diff_vocab ++ [_][]const u8{ "42", "" };
+    var w: std.Io.Writer = .fixed(buf);
+    const depth = 1 + rng.uintLessThan(usize, 5);
+    for (0..depth) |_| {
+        w.writeByte('/') catch unreachable;
+        w.writeAll(words[rng.uintLessThan(usize, words.len)]) catch unreachable;
+    }
+    return w.buffered();
+}
+
+fn diffOne(comptime routes: []const StaticRoute, comptime prec: MethodPrecedence) !void {
+    const S = Static(routes, .{ .method_precedence = prec });
+    var r = Router.init(testing.allocator);
+    defer r.deinit();
+    for (routes) |rt| try r.add(rt.method, rt.pattern, hRoot);
+
+    var prng: std.Random.DefaultPrng = .init(0x5eed ^ routes.len);
+    const rng = prng.random();
+    var buf: [128]u8 = undefined;
+    var checked: usize = 0;
+    for (0..3000) |_| {
+        const path = diffPath(rng, &buf);
+        inline for (@typeInfo(http.Method).@"enum".fields) |f| {
+            const m: http.Method = @enumFromInt(f.value);
+            var ps: Params = .{};
+            const got = S.match(m, path, &ps);
+
+            var pr: Params = .{};
+            var allow_bits: AllowSet = .initEmpty();
+            var want_pattern: ?[]const u8 = null;
+            switch (prec) {
+                .backtrack => {
+                    if (matchRecMethod(&r.root, path[1..], &pr, m, &allow_bits)) |node|
+                        want_pattern = endpointFor(node, m).?.pattern;
+                },
+                .first_match => if (matchRec(&r.root, path[1..], false, &pr)) |node| {
+                    if (endpointFor(node, m)) |ep| want_pattern = ep.pattern else allow_bits = node.allow_bits;
+                },
+            }
+
+            errdefer std.debug.print("differential: {s} {s} (table of {d}, {s})\n", .{ @tagName(m), path, routes.len, @tagName(prec) });
+            if (want_pattern) |wp| {
+                if (got != .found) return error.StaticMissedARouterMatch;
+                try testing.expectEqualStrings(wp, routes[got.found].pattern);
+                try testing.expectEqual(pr.len, ps.len);
+                for (pr.entries[0..pr.len], ps.entries[0..ps.len]) |a, b| {
+                    try testing.expectEqualStrings(a.name, b.name);
+                    try testing.expectEqualStrings(a.value, b.value);
+                }
+                checked += 1;
+            } else if (allow_bits.count() != 0) {
+                if (got != .method_not_allowed) return error.StaticDisagreesOn405;
+                try testing.expectEqual(allow_bits, got.method_not_allowed.bits);
+            } else {
+                try testing.expectEqual(Match.not_found, got);
+            }
+        }
+    }
+    // A table that never matches anything would pass vacuously.
+    try testing.expect(checked > 0);
+}
+
+test "M2.2 differential: Static answers exactly as the runtime Router, generated tables" {
+    inline for (.{ 1, 2, 3, 4, 5, 6, 7, 8 }) |seed| {
+        const routes = comptime diffTable(@as(u64, seed) *% 0x9e3779b97f4a7c15, 12 + seed * 3);
+        try diffOne(routes, .backtrack);
+        try diffOne(routes, .first_match);
+    }
 }

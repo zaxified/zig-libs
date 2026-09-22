@@ -190,6 +190,37 @@ handler that percent-decodes a captured segment before using it as a key
 result as untrusted and re-validate it (see `filestore`'s `segmentSafe`
 allowlist for one way to do that).
 
+## A comptime table (`Static`)
+
+For a server whose routes are known when it is built, `router.Static(routes, .{})` builds the
+same trie at compile time and answers with a route index instead of running a handler: no
+allocator, no hash map, no `Ctx`, no middleware. The matcher is the one `Router` uses (`matchIn`,
+generic over how a node is stored), so precedence, backtracking, HEAD→GET, the F4 pruning and the
+F5 `Allow` union are identical — a differential test holds the two to the same answers on
+generated tables. Every error `Router.add` returns at startup is a `@compileError` here.
+
+```zig
+const routes = [_]router.StaticRoute{
+    .{ .method = .get, .pattern = "/users/:id" },
+    .{ .method = .post, .pattern = "/users" },
+};
+const Table = router.Static(&routes, .{});
+
+var params: router.Params = .{};
+switch (Table.match(req.method, req.path, &params)) {
+    .found => |i| handlers[i](params.get("id")), // a table of yours, same order as `routes`
+    .method_not_allowed => |allow| {
+        var buf: [router.Allow.max_len]u8 = undefined;
+        try rw.setHeader("Allow", allow.write(&buf)); // then 405
+    },
+    .not_found => {}, // `Table.trailingSlashVariant` says whether the other slash form exists
+}
+```
+
+`path` is matched byte-for-byte, as `Router` matches it; normalization is the caller's
+(`http.Server` has already removed dot segments; `router.rawPath(req.target)` is the path before
+that rewrite). `router.validatePattern` is the per-pattern grammar both share.
+
 ## Verification
 
 - Offline: the full matrix (matching, precedence, backtracking, params,

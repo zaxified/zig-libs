@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — `router.Static(routes, options)`: a route table built at compile time over the
+  same matcher as `Router` — `match(method, path, *Params)` returns `.found` (route index),
+  `.method_not_allowed` (an `Allow`) or `.not_found`; `trailingSlashVariant` is the redirect probe
+  as a pure function. Pattern errors are compile errors. New public helpers: `Allow` (`has`,
+  `write`), `validatePattern` (the per-pattern grammar `Router.add` and `Static` share), `rawPath`.
+  `Router`'s API and behaviour are unchanged; a differential test compares the two on generated
+  tables, every method, both `MethodPrecedence` postures.
 - **2026-09-22** — **NO CONSUMER-VISIBLE CHANGE:** the matcher (`matchRecDepth` → `matchIn`) is
   now generic over a tree's node accessors, so a comptime route table can reuse it; the runtime
   trie is its first implementation and every existing router test passes unchanged.
