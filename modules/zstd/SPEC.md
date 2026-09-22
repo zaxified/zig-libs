@@ -5,8 +5,9 @@ Consumer view, API and purpose: [README.md](README.md).
 ## What this module is, and what it is not
 
 A one-shot Zstandard **compressor** that reproduces libzstd 1.5.7's output
-byte for byte for levels 1–3 and every negative level. The match finders
-(`fast`, `dfast`), the frame/block driver, the block pre-splitter and the
+byte for byte for levels 1–8 and every negative level. The match finders
+(`fast`, `dfast`, and `greedy`/`lazy`/`lazy2` over both the hash chain and the
+row-based search), the frame/block driver, the block pre-splitter and the
 entropy stage (literals via Huffman, sequences via FSE) are translated from
 libzstd; see [NOTICE](NOTICE) for the file-by-file map.
 
@@ -14,12 +15,13 @@ Not here, and a reader might expect it:
 
 - **A decoder.** `std.compress.zstd.Decompress` exists (CONVENTIONS.md §1.3).
   The tests use it as the round-trip oracle.
-- **Levels 4–22.** `greedy`/`lazy`/`lazy2` (4–12), `btlazy2` (13–15) and the
-  optimal parsers `btopt`/`btultra`/`btultra2` (16–22) are not ported;
-  asking for them is `error.LevelUnsupported`. *Deferred*: a port of
-  `zstd_opt.c` for level 19 is the planned second stage, wanted only once
-  something must archive in-process (today's archives call the `zstd`/`xz`
-  CLIs; see the root README's Non-goals row).
+- **Levels 9–22.** The binary-tree finder `btlazy2` and the optimal parsers
+  `btopt`/`btultra`/`btultra2` are not ported. Levels map to strategies per
+  input-size tier, so the cut is where the *first* tier leaves `lazy2`: level
+  9 is `btlazy2` for inputs of 16 KB or less (for larger inputs `lazy2` runs up
+  to level 10 or 12). Asking for 9 or more is `error.LevelUnsupported` for
+  every input size, so a level's support never depends on the data.
+  *In progress*: `btlazy2`, then `zstd_opt.c` (the target is level 19).
 - **Streaming.** One call, whole input. libzstd's streaming API blocks the
   input on its own buffer boundaries and so produces *different* (equally
   valid) frames; matching those would be a different contract.
@@ -44,16 +46,23 @@ libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
    cut by the pre-splitter (`presplit.zig`): `fast` compares the byte histograms
    of the first and last 512 bytes (and the middle, to pick 32/64/96 KB);
    `dfast` fingerprints 8 KB chunks sampled every 43rd byte and cuts at the
-   first chunk that deviates.
-4. **Match finding** (`match.zig`): indices start at 2, as in libzstd, so a zero
+   first chunk that deviates; `greedy`/`lazy` sample every 11th byte of 2-byte
+   hashes, `lazy2` every 5th.
+4. **Match finding** (`match.zig`, `lazy.zig`): indices start at 2, as in libzstd, so a zero
    hash slot means "empty". Repeat offsets carry across blocks; a block emitted
    raw or RLE does not commit its repeat offsets or entropy tables (the next
    block starts again from the last compressed block's state).
+   `greedy`/`lazy`/`lazy2` share one parser (lookahead depth 0/1/2) over a hash
+   chain when the window is 16 KB or less, and over libzstd's row-based finder
+   (16/32/64-entry rows of 8-bit tags) above that — libzstd's own automatic
+   choice. Insertion state (`nextToUpdate`) carries across blocks, with
+   libzstd's caps after long matches.
 5. **Entropy** (`literals.zig`, `huf.zig`, `sequences.zig`, `fse.zig`):
    literals are Huffman-coded (1 or 4 streams) when that beats `minGain`,
    reusing the previous block's table when libzstd would; each sequence code
-   stream uses the predefined table, RLE, or a new table by libzstd's
-   below-`lazy` heuristics.
+   stream uses the predefined table, RLE, or a new table — below `lazy` by
+   libzstd's count heuristics, from `lazy` on by pricing the predefined, the
+   previous block's and a new table and taking the cheapest.
 6. **Block type**: compressed if it beats `blockSize - minGain`, RLE when the
    whole block is one byte (never for the first block — zstd ≤ 1.4.3 decoders
    mishandle that), raw otherwise. Optional XXH64 checksum at the end.
@@ -75,13 +84,13 @@ and one path is carried.
 
 Endianness: every multi-byte read that feeds a decision is little-endian,
 matching libzstd on x86/arm64 (libzstd reads native order in one place, the
-pre-splitter's 16-bit hash, which only levels ≥ `lazy` use).
+pre-splitter's 16-bit hash, which `greedy` and up use).
 
 ## Limits and refusals
 
 | limit | value | source |
 |---|---|---|
-| level | `min_level` (-131072) … 3; lower is clamped | `ZSTD_minCLevel()`; 3 is the last level on `fast`/`dfast` |
+| level | `min_level` (-131072) … 8; lower is clamped | `ZSTD_minCLevel()`; 8 is the last level that is `lazy2` or below in every size tier |
 | input | `max_input_size` = 3500 MiB − 2 | libzstd corrects index overflow past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit); that correction is not ported, so the input stops before it |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
@@ -91,8 +100,8 @@ pin the level refusal and the destination bound.
 
 ## Anchoring
 
-**External anchor.** `src/testdata/goldens.zig` holds, for each of 40 corpus
-inputs × levels {-5, -1, 1, 2, 3} × checksum {off, on} (400 frames), the length and
+**External anchor.** `src/testdata/goldens.zig` holds, for each of 50 corpus
+inputs × levels {-5, -1, 1…8} × checksum {off, on} (1000 frames), the length and
 SHA-256 of the frame libzstd v1.5.7 (`f8745da6`) emits via `ZSTD_compress2`.
 It is written by `tools/gen-goldens.sh`, which builds that exact tag and runs
 `tools/zref.c`; the inputs come from `src/testdata/corpus.zig`, whose own
@@ -111,7 +120,7 @@ constant) and every mutation the corpus did not notice got a case that does:
 | `split-margin` | a `dfast` pre-split deviation of 36 860, between the penalty-2 (36 100) and penalty-3 (38 356) thresholds |
 | `rle-tail-6` | a 6-byte run as last block: below the 7-byte "attempt compression" size, so raw, not RLE |
 | `repeat-1024` | exactly 1024 literals: the Huffman table is reused unpriced at `<= 1024` |
-| `mix-*`, `skewed-180` | found by searching generator seeds for an input where one boundary flips the output; `corpus.zig` names the boundary beside each |
+| `mix-*`, `skewed-180`, `two-symbols-300000-1`, `drift-300000-8` | found by searching generator seeds for an input where one boundary flips the output; `corpus.zig` names the boundary beside each |
 
 Nine mutations still pass, and are left so on purpose:
 
@@ -124,9 +133,33 @@ Nine mutations still pass, and are left so on purpose:
 | Huffman `largest <= n/128 + 4`, `total >= n - 1`, `hSize + 12 >= n`, sampled `largestTotal <= 68` | masked: at equality the literals are near-uniform and the section is stored raw by the `minGain` check that follows anyway |
 | `mostFrequent < nbSeq >> (log - 1)` → `<=` | reachable in principle; 50 000 generated inputs did not hit equality. **Uncovered.** |
 
+The lazy strategies (levels 4–8) got the same treatment on 2026-09-22: 43
+mutations of `lazy.zig`, the lazy half of `sequences.zig` and the new
+`frame.zig`/`params.zig` lines. 21 were caught by the existing corpus (two
+of them as a safety-checked overflow rather than a mismatch), 13 are caught by
+12 cases found by the seed search (the lazy entries of `corpus.zig`: repcode
+and lookahead limits, the row finder's long-match skip, `nextToUpdate`'s
+resume cap, every tie in the table pricing, the `-1` probability in
+cross-entropy), and 9 survive — listed below with one mutation from outside
+the sweep, the hash salt:
+
+| mutation | why no case exists |
+|---|---|
+| hash chain `matchIndex <= minChain` → `<`, `minChain + 1` | the hash chain runs only for windows ≤ 16 KB, where the chain table covers the whole input: `minChain` never rises above the first index |
+| `currentMl > ml` → `>=` (hash chain and row) | equivalent: a candidate is measured only when the 4 bytes ending at offset `ml` match, so it is at least `ml + 1` long; a tie cannot occur |
+| row: `break` → `continue` at `matchIndex < lowLimit` | equivalent: a row lists entries newest first, so every entry after the first out-of-window one is out of the window too |
+| `fillHashCache` limit `>` → `>=` | the entry it drops is for a position no search reaches before the block ends |
+| `nextToUpdate` raised to `lowLimit` before a block | unreachable one-shot: insertion trails the parser by at most a block, the window's low end only moves once the input passes the window |
+| row `hashLog` cap `24 + rowLog` → `23 + rowLog` | unreachable at levels ≤ 8 (hash logs ≤ 23, cap ≥ 28); binds from level 22 |
+| hash salt → 0 | equivalent on a fresh context: the salt XORs every hash before the shift, a bijection on (row, tag) that leaves every collision in place; it matters only for reused tag tables |
+| `nbSeq >= 2048` → `>` in `ZSTD_NCountCost` | reachable in principle: a block of exactly 2048 sequences whose cost comparison flips on the low-probability rule; 4 000 generated seeds × 7 kinds × 6 sizes did not hit it. **Uncovered.** |
+
 Beyond the committed goldens, the port was compared against `zref` on 49
 boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
-JSON, text) and 800 random mixed inputs across levels -7…3, all identical.
+JSON, text) and 800 random mixed inputs across levels -7…3, all identical;
+for levels 4–8, on the golden corpus, 54 boundary-size and system files and
+600 random mixed inputs (7 bytes to 900 KB) at every level — 3 470 frames,
+all identical.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -134,18 +167,20 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
 ## What is deliberately not done
 
 - **A faster port.** This is 1.3–1.5× slower than libzstd (process time,
-  ReleaseFast, level 1 and 3 on a 13.7 MB CSV, a 3 MB text and an 11 MB ELF).
+  ReleaseFast, level 1 and 3 on a 13.7 MB CSV, a 3 MB text and an 11 MB ELF);
+  1.2–1.4× at levels 5–8 (12 MB of Zig source, a 4.5 MB ELF).
   The reference's speed comes from unrolling, prefetch and branchless selects
   that do not change decisions; adding them is possible later without touching
   the goldens. *Not now.*
 - **Matching the `zstd` CLI.** See *Streaming* above. *Never*, as a contract;
   the CLI's output is equally valid and decodes the same.
-- **Levels ≥ 4 by downgrading to 3.** Refused: a caller asking for level 19
-  would get level-3 ratio with no signal.
+- **Levels ≥ 9 by downgrading to 8.** Refused: a caller asking for level 19
+  would get level-8 ratio with no signal.
 
 ## Open
 
-- The one reachable boundary without a case: the sequence encoding-type
-  heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality (see *Anchoring*).
+- Two reachable boundaries without a case: the sequence encoding-type
+  heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality, and the table
+  pricing's low-probability switch at exactly 2048 sequences (see *Anchoring*).
 - `targets` declares only `.linux64`; the code has no OS or endianness
   dependency, but `portable-zstd-*` has not been run.

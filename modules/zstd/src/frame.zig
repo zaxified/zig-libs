@@ -100,6 +100,16 @@ fn writeBlockHeader(dst: []u8, v: u32) void {
     dst[2] = @truncate(v >> 16);
 }
 
+/// `ZSTD_bitmix`: XXH3's rrmxmx.
+fn bitmix(val_in: u64, len: u64) u64 {
+    var val = val_in;
+    val ^= std.math.rotr(u64, val, 49) ^ std.math.rotr(u64, val, 24);
+    val *%= 0x9FB21C651E98DF25;
+    val ^= (val >> 35) +% len;
+    val *%= 0x9FB21C651E98DF25;
+    return val ^ (val >> 28);
+}
+
 /// `ZSTD_isRLE`.
 fn isRle(src: []const u8) bool {
     for (src[1..]) |b| if (b != src[0]) return false;
@@ -177,8 +187,11 @@ fn compressBlock(c: *Ctx, dst: []u8, block_start: usize, block_size: usize) usiz
     // don't even attempt compression below a certain srcSize
     if (block_size >= min_cblock_size + block_header_size + 1 + 1) {
         c.ss.reset();
-        c.next.rep = c.prev.rep;
         const istart: u32 = @intCast(block_start + match.window_start);
+        // limited update after a very long match
+        if (istart > c.ms.next_to_update + 384)
+            c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
+        c.next.rep = c.prev.rep;
         const last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
         c.ss.storeLastLiterals(src[block_start + block_size - last_ll .. block_start + block_size]);
         c_size = entropyCompress(c, dst, block_size);
@@ -212,13 +225,18 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
         writeBlockHeader(out[op..], 1 + (bt_raw << 1));
         op += block_header_size;
     } else {
+        const row = params.useRowMatchFinder(cp);
         const hash_table = try gpa.alloc(u32, @as(usize, 1) << @intCast(cp.hash_log));
         defer gpa.free(hash_table);
         @memset(hash_table, 0);
-        const chain_len: usize = if (cp.strategy == .dfast) @as(usize, 1) << @intCast(cp.chain_log) else 0;
+        // ZSTD_allocateChainTable: not for fast, not with the row match finder
+        const chain_len: usize = if (cp.strategy != .fast and !row) @as(usize, 1) << @intCast(cp.chain_log) else 0;
         const chain_table = try gpa.alloc(u32, chain_len);
         defer gpa.free(chain_table);
         @memset(chain_table, 0);
+        const tag_table = try gpa.alloc(u8, if (row) @as(usize, 1) << @intCast(cp.hash_log) else 0);
+        defer gpa.free(tag_table);
+        @memset(tag_table, 0);
 
         const window_size: usize = @as(usize, 1) << @intCast(cp.window_log);
         const block_size_max: usize = @min(block_size_max_abs, @max(1, @min(window_size, src.len)));
@@ -237,7 +255,16 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
         defer gpa.destroy(split_ws);
 
         var c: Ctx = .{
-            .ms = .{ .src = src, .cp = cp, .hash_table = hash_table, .chain_table = chain_table },
+            .ms = .{
+                .src = src,
+                .cp = cp,
+                .hash_table = hash_table,
+                .chain_table = chain_table,
+                .tag_table = tag_table,
+                .row_hash_log = if (row) cp.hash_log - params.rowLog(cp) else 0,
+                // ZSTD_advanceHashSalt on a fresh context: salt and entropy 0
+                .hash_salt = if (row) bitmix(0, 8) ^ bitmix(0, 4) else 0,
+            },
             .ss = .{
                 .seqs = seqs,
                 .lits = lits,
@@ -261,6 +288,8 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
             std.debug.assert(out.len - op >= block_header_size + min_cblock_size + 1);
 
             c.ms.enforceMaxDist(@intCast(ip + match.window_start));
+            // Ensure hash/chain table insertion resumes no sooner than lowlimit
+            if (c.ms.next_to_update < c.ms.low_limit) c.ms.next_to_update = c.ms.low_limit;
 
             const block_out = out[op + block_header_size ..];
             var c_size = compressBlock(&c, block_out, ip, block_size);

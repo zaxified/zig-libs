@@ -365,7 +365,7 @@ way to recognise it.
 | [`p256`](modules/p256/README.md) *(crypto)* | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
-| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-3 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
+| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-8 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
 
 ### Networking
 
@@ -484,7 +484,7 @@ way to recognise it.
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | [`hashdigest`](modules/hashdigest/README.md) *(crypto)* | Streaming digests — one-shot, incremental, and file hashing; SHA-256 convenience plus a multi-algorithm SHA-2/SHA-3/BLAKE2b/BLAKE3 layer. | any | — |
-| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-3 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
+| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-8 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
 
 ### Crypto
 
@@ -596,7 +596,7 @@ way to recognise it.
 | [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
 | [`yaml`](modules/yaml/README.md) | YAML 1.2 reader (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans); cyclic aliases rejected. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
-| [`zstd`](modules/zstd/README.md) | Zstandard (RFC 8878) compressor, levels 1-3 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
+| [`zstd`](modules/zstd/README.md) | Zstandard (RFC 8878) compressor, levels 1-8 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
 
 **Also worth reaching for from `format`** — these are filed under another library (in brackets), and appear here because a consumer working in `format` has a use for them:
 
@@ -646,5 +646,5 @@ become a module.
 | Structured logging | `karlseguin/log.zig` | Cleanest "just use it" |
 | S3 | `lobo/aws-sdk-for-zig` | SigV4 built in |
 | Redis/Valkey | `kristoff-it/zig-okredis` (partial/alpha) | Best available design |
-| xz compression; zstd levels 4–22 | bind `liblzma` / `libzstd` (`allyourcodebase/zstd` packages it for the Zig build system); or compress outside the process (the `xz`/`zstd` CLI in the consumer's pipeline) | Decoding is covered: std 0.16 ships `std.compress.xz` and `std.compress.zstd` decoders, and levels 1–3 of the zstd encoder are a module (`zstd`). What remains is an LZMA2 encoder and zstd's lazy/optimal parsers — each a large arc with no in-process consumer yet; today's consumers write plain bytes and compress in a backup/build step. The one pure-Zig zstd encoder found (`muhammad-fiaz/zstd.zig` `fc6f968`, surveyed 2026-09-22) emitted frames the reference `zstd -d` rejects as corrupt, and ignored the level <!-- non-goal-ok: zstd --> |
+| xz compression; zstd levels 9–22 | bind `liblzma` / `libzstd` (`allyourcodebase/zstd` packages it for the Zig build system); or compress outside the process (the `xz`/`zstd` CLI in the consumer's pipeline) | Decoding is covered: std 0.16 ships `std.compress.xz` and `std.compress.zstd` decoders, and levels 1–8 of the zstd encoder are a module (`zstd`). What remains is an LZMA2 encoder and zstd's binary-tree/optimal parsers — each a large arc with no in-process consumer yet; today's consumers write plain bytes and compress in a backup/build step. The one pure-Zig zstd encoder found (`muhammad-fiaz/zstd.zig` `fc6f968`, surveyed 2026-09-22) emitted frames the reference `zstd -d` rejects as corrupt, and ignored the level <!-- non-goal-ok: zstd --> |
 | HTTP/3 transport | `ngtcp2` | The transport (streams, loss detection, ACK logic, flight scheduling) is a bigger arc than SSH or OPC-UA were, and ngtcp2 is crypto-agnostic by design — it takes a TLS backend, which is the shape `quic-crypto` already has. The RFC 9001 crypto seam is ours; the state machine is not <!-- non-goal-ok: http, quic-crypto, ssh --> |

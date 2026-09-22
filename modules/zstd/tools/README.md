@@ -34,7 +34,7 @@ input), so its frames legitimately differ from one-shot output. Measured on a
 Needed when `src/testdata/corpus.zig` changes (a new case, or a generator
 change — `golden_test.zig` pins a digest of all corpus inputs, so the latter
 cannot happen silently). The recipe prints the row count; it must equal
-cases × 5 levels × 2.
+cases × 10 levels × 2.
 
 ## Comparing an arbitrary file
 

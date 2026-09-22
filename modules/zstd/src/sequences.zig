@@ -5,11 +5,11 @@
 //! code tables of lib/common/zstd_internal.h, and the encoder of
 //! lib/compress/zstd_compress_sequences.c (v1.5.7).
 //!
-//! Encoding-type selection keeps only the branch libzstd takes below the `lazy`
-//! strategy: there it never prices tables, it only picks between the
-//! predefined table, RLE and a freshly built one by count heuristics. The
-//! "repeat" choice needs a table marked valid, which only a dictionary
-//! produces, so it cannot arise here.
+//! Encoding-type selection follows both of libzstd's branches: below the
+//! `lazy` strategy it picks by count heuristics, from `lazy` on it prices the
+//! predefined table, the previous block's table and a fresh one. The
+//! "repeat_valid" state that lets the heuristic branch reuse a table comes
+//! only from a dictionary, so it does not arise here.
 
 const std = @import("std");
 const bitstream = @import("bitstream.zig");
@@ -194,29 +194,126 @@ pub const FseTables = struct {
     ll_repeat: FseRepeat = .none,
 };
 
-/// `ZSTD_selectEncodingType`, the `strategy < ZSTD_lazy` branch.
-fn selectEncodingType(repeat_mode: *FseRepeat, max_count_n: usize, n_seq: usize, default_norm_log: u32, default_allowed: bool, strategy: u32) EncodingType {
-    std.debug.assert(strategy < 4); // below ZSTD_lazy
-    if (max_count_n == n_seq) {
+/// `kInverseProbabilityLog256`: floor(-log2(x / 256) * 256), 0 for x = 0.
+const inverse_probability_log256 = [256]u32{
+    0,    2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162,
+    1130, 1100, 1073, 1047, 1024, 1001, 980,  960,  941,  923,  906,  889,
+    874,  859,  844,  830,  817,  804,  791,  779,  768,  756,  745,  734,
+    724,  714,  704,  694,  685,  676,  667,  658,  650,  642,  633,  626,
+    618,  610,  603,  595,  588,  581,  574,  567,  561,  554,  548,  542,
+    535,  529,  523,  517,  512,  506,  500,  495,  489,  484,  478,  473,
+    468,  463,  458,  453,  448,  443,  438,  434,  429,  424,  420,  415,
+    411,  407,  402,  398,  394,  390,  386,  382,  377,  373,  370,  366,
+    362,  358,  354,  350,  347,  343,  339,  336,  332,  329,  325,  322,
+    318,  315,  311,  308,  305,  302,  298,  295,  292,  289,  286,  282,
+    279,  276,  273,  270,  267,  264,  261,  258,  256,  253,  250,  247,
+    244,  241,  239,  236,  233,  230,  228,  225,  222,  220,  217,  215,
+    212,  209,  207,  204,  202,  199,  197,  194,  192,  190,  187,  185,
+    182,  180,  178,  175,  173,  171,  168,  166,  164,  162,  159,  157,
+    155,  153,  151,  149,  146,  144,  142,  140,  138,  136,  134,  132,
+    130,  128,  126,  123,  121,  119,  117,  115,  114,  112,  110,  108,
+    106,  104,  102,  100,  98,   96,   94,   93,   91,   89,   87,   85,
+    83,   82,   80,   78,   76,   74,   73,   71,   69,   67,   66,   64,
+    62,   61,   59,   57,   55,   54,   52,   50,   49,   47,   46,   44,
+    42,   41,   39,   37,   36,   34,   33,   31,   30,   28,   26,   25,
+    23,   22,   20,   19,   17,   16,   14,   13,   11,   10,   8,    7,
+    5,    4,    2,    1,
+};
+
+/// A cost libzstd reports as an error code: larger than every real cost.
+const cost_error = std.math.maxInt(usize);
+
+/// `ZSTD_NCountCost`: bytes of the table header a fresh table would need.
+fn nCountCost(counts: []const u32, max: u32, n_seq: usize, fse_log: u32) Error!usize {
+    var wksp: [512]u8 = undefined; // FSE_NCOUNTBOUND
+    var norm: [max_ml + 1]i16 = undefined;
+    const table_log = fse.optimalTableLog(fse_log, n_seq, max);
+    _ = try fse.normalizeCount(&norm, table_log, counts, n_seq, max, n_seq >= 2048);
+    return fse.writeNCount(&wksp, &norm, max, table_log);
+}
+
+/// `ZSTD_entropyCost`: bits to code `counts` at the entropy bound.
+fn entropyCost(counts: []const u32, max: u32, total: usize) usize {
+    var cost: usize = 0;
+    for (counts[0 .. max + 1]) |c| {
+        var norm: usize = (256 * @as(usize, c)) / total;
+        if (c != 0 and norm == 0) norm = 1;
+        cost += c * inverse_probability_log256[norm];
+    }
+    return cost >> 8;
+}
+
+/// `ZSTD_fseBitCost`: bits to code `counts` with `ct`, or `cost_error` when
+/// `ct` cannot represent one of the symbols.
+fn fseBitCost(ct: *const fse.CTable, counts: []const u32, max: u32) usize {
+    const accuracy_log = 8;
+    if (ct.max_symbol < max) return cost_error;
+    const table_log = ct.table_log;
+    const table_size: u32 = @as(u32, 1) << @intCast(table_log);
+    var cost: usize = 0;
+    for (counts[0 .. max + 1], 0..) |c, s| {
+        if (c == 0) continue;
+        // FSE_bitCost
+        const delta_nb_bits = ct.symbol_tt[s].delta_nb_bits;
+        const min_nb_bits = delta_nb_bits >> 16;
+        const threshold = (min_nb_bits + 1) << 16;
+        const delta_from_threshold = threshold -% (delta_nb_bits +% table_size);
+        const normalized_delta = (delta_from_threshold << accuracy_log) >> @intCast(table_log);
+        const bit_cost = (min_nb_bits + 1) * (1 << accuracy_log) -% normalized_delta;
+        const bad_cost = (table_log + 1) << accuracy_log;
+        if (bit_cost >= bad_cost) return cost_error; // Prob[s] == 0
+        cost += @as(usize, c) * bit_cost;
+    }
+    return cost >> accuracy_log;
+}
+
+/// `ZSTD_crossEntropyCost`: bits to code `counts` with the table `norm`.
+fn crossEntropyCost(norm: []const i16, accuracy_log: u32, counts: []const u32, max: u32) usize {
+    const shift: u5 = @intCast(8 - accuracy_log);
+    var cost: usize = 0;
+    for (counts[0 .. max + 1], norm[0 .. max + 1]) |c, n| {
+        const norm_acc: u32 = if (n != -1) @intCast(n) else 1;
+        cost += c * inverse_probability_log256[norm_acc << shift];
+    }
+    return cost >> 8;
+}
+
+/// `ZSTD_selectEncodingType`.
+fn selectEncodingType(repeat_mode: *FseRepeat, counts: []const u32, max: u32, most_frequent: usize, n_seq: usize, fse_log: u32, prev: *const fse.CTable, default_norm: []const i16, default_norm_log: u32, default_allowed: bool, strategy: u32) Error!EncodingType {
+    if (most_frequent == n_seq) {
         repeat_mode.* = .none;
+        // set_basic codes 2 or fewer symbols in fewer bits than RLE's byte
         if (default_allowed and n_seq <= 2) return .basic;
         return .rle;
     }
-    if (default_allowed) {
-        const mult = 10 - strategy;
-        const base_log = 3;
-        const dynamic_fse_nb_seq_min = ((@as(usize, 1) << @intCast(default_norm_log)) * mult) >> base_log;
-        if (n_seq < dynamic_fse_nb_seq_min or max_count_n < (n_seq >> @intCast(default_norm_log - 1))) {
+    if (strategy < 4) { // below ZSTD_lazy
+        if (default_allowed) {
+            const mult = 10 - strategy;
+            const base_log = 3;
+            const dynamic_fse_nb_seq_min = ((@as(usize, 1) << @intCast(default_norm_log)) * mult) >> base_log;
+            if (n_seq < dynamic_fse_nb_seq_min or most_frequent < (n_seq >> @intCast(default_norm_log - 1))) {
+                repeat_mode.* = .none;
+                return .basic;
+            }
+        }
+    } else {
+        const basic_cost = if (default_allowed) crossEntropyCost(default_norm, default_norm_log, counts, max) else cost_error;
+        const repeat_cost = if (repeat_mode.* != .none) fseBitCost(prev, counts, max) else cost_error;
+        const n_count_cost = try nCountCost(counts, max, n_seq, fse_log);
+        const compressed_cost = (n_count_cost << 3) + entropyCost(counts, max, n_seq);
+        if (basic_cost <= repeat_cost and basic_cost <= compressed_cost) {
+            std.debug.assert(default_allowed);
             repeat_mode.* = .none;
             return .basic;
         }
+        if (repeat_cost <= compressed_cost) return .repeat;
     }
     repeat_mode.* = .check;
     return .compressed;
 }
 
 /// `ZSTD_buildCTable`: build `next` for `kind` and write its header (if any).
-fn buildCTable(dst: []u8, next: *fse.CTable, fse_log: u32, kind: EncodingType, counts: []u32, max: u32, codes: []const u8, default_norm: []const i16, default_norm_log: u32, default_max: u32) Error!usize {
+fn buildCTable(dst: []u8, next: *fse.CTable, prev: *const fse.CTable, fse_log: u32, kind: EncodingType, counts: []u32, max: u32, codes: []const u8, default_norm: []const i16, default_norm_log: u32, default_max: u32) Error!usize {
     switch (kind) {
         .rle => {
             next.buildRle(@intCast(max));
@@ -224,7 +321,10 @@ fn buildCTable(dst: []u8, next: *fse.CTable, fse_log: u32, kind: EncodingType, c
             dst[0] = codes[0];
             return 1;
         },
-        .repeat => unreachable,
+        .repeat => {
+            next.* = prev.*;
+            return 0;
+        },
         .basic => {
             try next.build(default_norm, default_max, default_norm_log);
             return 0;
@@ -271,8 +371,8 @@ pub fn buildStatistics(ss: *SeqStore, prev: *const FseTables, next: *FseTables, 
         var max: u32 = max_ll;
         const most_frequent = hist.count(&counts, &max, ss.ll_code[0..n_seq]);
         next.ll_repeat = prev.ll_repeat;
-        stats.ll_type = selectEncodingType(&next.ll_repeat, most_frequent, n_seq, ll_default_norm_log, true, strategy);
-        const count_size = try buildCTable(dst[op..], &next.ll, ll_fse_log, stats.ll_type, &counts, max, ss.ll_code[0..n_seq], &ll_default_norm, ll_default_norm_log, max_ll);
+        stats.ll_type = try selectEncodingType(&next.ll_repeat, &counts, max, most_frequent, n_seq, ll_fse_log, &prev.ll, &ll_default_norm, ll_default_norm_log, true, strategy);
+        const count_size = try buildCTable(dst[op..], &next.ll, &prev.ll, ll_fse_log, stats.ll_type, &counts, max, ss.ll_code[0..n_seq], &ll_default_norm, ll_default_norm_log, max_ll);
         if (stats.ll_type == .compressed) stats.last_count_size = count_size;
         op += count_size;
     }
@@ -283,8 +383,8 @@ pub fn buildStatistics(ss: *SeqStore, prev: *const FseTables, next: *FseTables, 
         // The predefined table only reaches code 28.
         const default_allowed = max <= default_max_off;
         next.of_repeat = prev.of_repeat;
-        stats.of_type = selectEncodingType(&next.of_repeat, most_frequent, n_seq, of_default_norm_log, default_allowed, strategy);
-        const count_size = try buildCTable(dst[op..], &next.of, off_fse_log, stats.of_type, &counts, max, ss.of_code[0..n_seq], &of_default_norm, of_default_norm_log, default_max_off);
+        stats.of_type = try selectEncodingType(&next.of_repeat, &counts, max, most_frequent, n_seq, off_fse_log, &prev.of, &of_default_norm, of_default_norm_log, default_allowed, strategy);
+        const count_size = try buildCTable(dst[op..], &next.of, &prev.of, off_fse_log, stats.of_type, &counts, max, ss.of_code[0..n_seq], &of_default_norm, of_default_norm_log, default_max_off);
         if (stats.of_type == .compressed) stats.last_count_size = count_size;
         op += count_size;
     }
@@ -293,8 +393,8 @@ pub fn buildStatistics(ss: *SeqStore, prev: *const FseTables, next: *FseTables, 
         var max: u32 = max_ml;
         const most_frequent = hist.count(&counts, &max, ss.ml_code[0..n_seq]);
         next.ml_repeat = prev.ml_repeat;
-        stats.ml_type = selectEncodingType(&next.ml_repeat, most_frequent, n_seq, ml_default_norm_log, true, strategy);
-        const count_size = try buildCTable(dst[op..], &next.ml, ml_fse_log, stats.ml_type, &counts, max, ss.ml_code[0..n_seq], &ml_default_norm, ml_default_norm_log, max_ml);
+        stats.ml_type = try selectEncodingType(&next.ml_repeat, &counts, max, most_frequent, n_seq, ml_fse_log, &prev.ml, &ml_default_norm, ml_default_norm_log, true, strategy);
+        const count_size = try buildCTable(dst[op..], &next.ml, &prev.ml, ml_fse_log, stats.ml_type, &counts, max, ss.ml_code[0..n_seq], &ml_default_norm, ml_default_norm_log, max_ml);
         if (stats.ml_type == .compressed) stats.last_count_size = count_size;
         op += count_size;
     }

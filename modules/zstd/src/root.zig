@@ -1,34 +1,36 @@
 // SPDX-License-Identifier: MIT
-//! zstd — Zstandard (RFC 8878) compressor for levels 1-3 and the negative
+//! zstd — Zstandard (RFC 8878) compressor for levels 1-8 and the negative
 //! ("fast") levels, byte-identical to libzstd 1.5.7.
 //!
 //! Decoding is std's job (`std.compress.zstd.Decompress`); this module fills
-//! the other half. It is a port of libzstd's `fast` and `dfast` strategies,
-//! frame/block driver, block pre-splitter, Huffman and FSE encoders. For the
+//! the other half. It is a port of libzstd's `fast`, `dfast`, `greedy`, `lazy`
+//! and `lazy2` strategies (hash-chain and row match finders), frame/block
+//! driver, block pre-splitter, Huffman and FSE encoders. For the
 //! same input and level it emits exactly the bytes `ZSTD_compress2()` from
 //! libzstd v1.5.7 does (one-shot, content size in the header, checksum
 //! optional) — that equality is what the tests pin, not merely round-trips.
 //!
-//! Levels 4 and up need the lazy/btopt match finders and are not carried;
-//! asking for one is an error rather than a silent downgrade. See SPEC.md.
+//! Levels 9 and up need the binary-tree match finders (`btlazy2`, `btopt`,
+//! ...) for at least one input size and are not carried; asking for one is an
+//! error rather than a silent downgrade. See SPEC.md.
 
 const std = @import("std");
 const frame = @import("frame.zig");
 const params = @import("params.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-3 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd`",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-8 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd`",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
     .role = .codec,
     .concurrency = .reentrant,
-    .model_after = "libzstd 1.5.7 (facebook/zstd) fast/dfast strategies; output checked byte-for-byte against it",
+    .model_after = "libzstd 1.5.7 (facebook/zstd) fast/dfast/greedy/lazy/lazy2 strategies; output checked byte-for-byte against it",
     .deps = .{},
 };
 
 pub const Options = struct {
-    /// 1..3, 0 for the default (3), or negative for the faster "fast" levels
+    /// 1..8, 0 for the default (3), or negative for the faster "fast" levels
     /// (down to -131072; lower values are clamped, as libzstd does).
     level: i32 = params.default_level,
     /// Append the XXH64-based content checksum (frame header flag + 4 bytes).
@@ -78,6 +80,7 @@ test {
     _ = @import("literals.zig");
     _ = @import("params.zig");
     _ = @import("match.zig");
+    _ = @import("lazy.zig");
     _ = @import("presplit.zig");
     _ = @import("frame.zig");
     _ = @import("golden_test.zig");
@@ -121,7 +124,7 @@ test "round trip through std's decoder at every implemented level" {
         @memcpy(src[i..][0..n], w[0..n]);
         i += n;
     }
-    for ([_]i32{ -5, -1, 1, 2, 3 }) |level| {
+    for ([_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8 }) |level| {
         for ([_]bool{ false, true }) |ck| {
             const z = try compressAlloc(gpa, &src, .{ .level = level, .checksum = ck });
             defer gpa.free(z);
@@ -133,9 +136,9 @@ test "round trip through std's decoder at every implemented level" {
     }
 }
 
-test "levels above 3 are refused, not downgraded" {
+test "levels above 8 are refused, not downgraded" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 4 }));
+    try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 9 }));
 }
 
 test "a destination below the bound is refused" {

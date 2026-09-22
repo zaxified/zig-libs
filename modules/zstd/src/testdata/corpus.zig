@@ -89,9 +89,22 @@ pub const cases = [_]Case{
     .{ .name = "mix-39", .len = 9000, .kind = .mix, .seed = 39 }, // predefined table for nbSeq <= 2 of one code
     .{ .name = "mix-10086", .len = 300000, .kind = .mix, .seed = 10086 }, // old Huffman table kept when oldSize <= hSize + newSize
     .{ .name = "skewed-180", .len = 180, .kind = .skewed, .seed = 22903 }, // FSE-coded weights only when hSize < maxSymbol / 2
+    // Found the same way for the lazy strategies (levels 4-8):
+    .{ .name = "two-symbols-300000-1", .len = 300000, .kind = .two_symbols, .seed = 1 }, // immediate repcode check at ip == ilimit
+    .{ .name = "mix-140000-2", .len = 140000, .kind = .mix, .seed = 2 }, // row update keeps 96 positions from a long match's start
+    .{ .name = "mix-300000-9", .len = 300000, .kind = .mix, .seed = 9 }, // ... and 32 from its end
+    .{ .name = "mix-140000-1148", .len = 140000, .kind = .mix, .seed = 1148 }, // ... and skips only past a 384-position gap
+    .{ .name = "mix-140000-1", .len = 140000, .kind = .mix, .seed = 1 }, // lazy2's second lookahead only while ip < ilimit
+    .{ .name = "mix-9000-5", .len = 9000, .kind = .mix, .seed = 5 }, // hash chain inserts one position while lazily skipping
+    .{ .name = "mix-300000-28", .len = 300000, .kind = .mix, .seed = 28 }, // a block start resumes at most 192 positions back
+    .{ .name = "mix-300000-2675", .len = 300000, .kind = .mix, .seed = 2675 }, // ... and only past a 384-position gap
+    .{ .name = "mix-300000-34", .len = 300000, .kind = .mix, .seed = 34 }, // predefined table wins a tie with the repeated one
+    .{ .name = "mix-16000-1", .len = 16000, .kind = .mix, .seed = 1 }, // predefined table wins a tie with a new one
+    .{ .name = "drift-300000-8", .len = 300000, .kind = .drift, .seed = 8 }, // repeated table wins a tie with a new one
+    .{ .name = "mix-300000-30", .len = 300000, .kind = .mix, .seed = 30 }, // cross-entropy prices a -1 probability as 1
 };
 
-pub const levels = [_]i32{ -5, -1, 1, 2, 3 };
+pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8 };
 
 /// The dfast pre-splitter's chunk size (`CHUNKSIZE` in zstd_preSplit.c).
 const chunk_len = 8 << 10;

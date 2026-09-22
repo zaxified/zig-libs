@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
-//! Match finders for the `fast` and `dfast` strategies.
+//! Match finders for the `fast` and `dfast` strategies, and the match state
+//! every strategy shares (the lazy ones live in `lazy.zig`).
 //!
 //! Port of the no-dictionary paths of libzstd lib/compress/zstd_fast.c and
 //! lib/compress/zstd_double_fast.c, with the window helpers and hashes of
@@ -13,38 +14,53 @@
 const std = @import("std");
 const params = @import("params.zig");
 const sequences = @import("sequences.zig");
+const lazy = @import("lazy.zig");
 const SeqStore = sequences.SeqStore;
 
 /// `ZSTD_WINDOW_START_INDEX`.
 pub const window_start = 2;
 /// `HASH_READ_SIZE`.
-const hash_read_size = 8;
+pub const hash_read_size = 8;
 /// `kSearchStrength`.
-const search_strength = 8;
+pub const search_strength = 8;
+/// `ZSTD_ROW_HASH_CACHE_SIZE`.
+pub const row_hash_cache_size = 8;
 
 pub const MatchState = struct {
     src: []const u8,
     cp: params.CParams,
     hash_table: []u32,
-    /// dfast only: the short-hash table (`chainTable` in libzstd).
+    /// dfast: the short-hash table; greedy..lazy2 without the row match
+    /// finder: the hash chains (`chainTable` in libzstd). Empty otherwise.
     chain_table: []u32,
+    /// Row match finder only: one tag byte per `hash_table` slot; the first
+    /// byte of each row holds the row's head (`tagTable`).
+    tag_table: []u8 = &.{},
     /// `window.lowLimit` / `window.dictLimit`; equal here (no extDict ever).
     low_limit: u32 = window_start,
     dict_limit: u32 = window_start,
+    /// First index the lazy match finders have not inserted yet.
+    next_to_update: u32 = window_start,
+    /// Row match finder: `rowHashLog` (hash_log - rowLog) and hash salt.
+    row_hash_log: u32 = 0,
+    hash_salt: u64 = 0,
+    hash_salt_entropy: u32 = 0,
+    hash_cache: [row_hash_cache_size]u32 = @splat(0),
+    lazy_skipping: bool = false,
 
-    inline fn at(ms: *const MatchState, idx: usize) u8 {
+    pub inline fn at(ms: *const MatchState, idx: usize) u8 {
         return ms.src[idx - window_start];
     }
-    inline fn read32(ms: *const MatchState, idx: usize) u32 {
+    pub inline fn read32(ms: *const MatchState, idx: usize) u32 {
         return std.mem.readInt(u32, ms.src[idx - window_start ..][0..4], .little);
     }
-    inline fn read64(ms: *const MatchState, idx: usize) u64 {
+    pub inline fn read64(ms: *const MatchState, idx: usize) u64 {
         return std.mem.readInt(u64, ms.src[idx - window_start ..][0..8], .little);
     }
 
     /// `ZSTD_count`: length of the common run at `p_in` and `p_match`,
     /// not reading at or past `p_limit` on the `p_in` side.
-    fn count(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
+    pub fn count(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
         const s = ms.src;
         var i = p_in - window_start;
         var m = p_match - window_start;
@@ -64,14 +80,19 @@ pub const MatchState = struct {
     }
 
     /// `ZSTD_hashPtr` for `mls` in 4..8.
-    inline fn hash(ms: *const MatchState, idx: usize, h_bits: u32, mls: u32) usize {
+    pub inline fn hash(ms: *const MatchState, idx: usize, h_bits: u32, mls: u32) usize {
+        return ms.hashSalted(idx, h_bits, mls, 0);
+    }
+
+    /// `ZSTD_hashPtrSalted`: `h_bits` up to 32.
+    pub inline fn hashSalted(ms: *const MatchState, idx: usize, h_bits: u32, mls: u32, salt: u64) usize {
         const sh: u6 = @intCast(64 - h_bits);
         return switch (mls) {
-            5 => @intCast(((ms.read64(idx) << 24) *% prime5) >> sh),
-            6 => @intCast(((ms.read64(idx) << 16) *% prime6) >> sh),
-            7 => @intCast(((ms.read64(idx) << 8) *% prime7) >> sh),
-            8 => @intCast((ms.read64(idx) *% prime8) >> sh),
-            else => @intCast((ms.read32(idx) *% prime4) >> @intCast(32 - h_bits)),
+            5 => @intCast((((ms.read64(idx) << 24) *% prime5) ^ salt) >> sh),
+            6 => @intCast((((ms.read64(idx) << 16) *% prime6) ^ salt) >> sh),
+            7 => @intCast((((ms.read64(idx) << 8) *% prime7) ^ salt) >> sh),
+            8 => @intCast(((ms.read64(idx) *% prime8) ^ salt) >> sh),
+            else => @intCast(((ms.read32(idx) *% prime4) ^ @as(u32, @truncate(salt))) >> @intCast(32 - h_bits)),
         };
     }
 
@@ -86,7 +107,7 @@ pub const MatchState = struct {
     }
 
     /// `ZSTD_getLowestPrefixIndex` without a dictionary.
-    fn lowestPrefixIndex(ms: *const MatchState, curr: u32) u32 {
+    pub fn lowestPrefixIndex(ms: *const MatchState, curr: u32) u32 {
         const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
         const lowest_valid = ms.dict_limit;
         return if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
@@ -116,6 +137,8 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             7 => dfastBlock(ms, ss, rep, istart, src_size, 7),
             else => dfastBlock(ms, ss, rep, istart, src_size, 4),
         },
+        .greedy, .lazy, .lazy2 => lazy.compressBlock(ms, ss, rep, istart, src_size),
+        else => unreachable, // above params.max_level
     };
 }
 

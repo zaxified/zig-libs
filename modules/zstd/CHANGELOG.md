@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — Levels 4–8: the `greedy`, `lazy` and `lazy2` strategies
+  (`zstd_lazy.c`: hash-chain and row-based match finders, one lazy parser),
+  the priced choice between predefined, repeated and new sequence tables, and
+  libzstd's full level tables. Still byte-identical to `ZSTD_compress2()`:
+  the goldens grow to 1040 frames (52 inputs × 10 levels × checksum on/off).
+  Levels 9+ remain `error.LevelUnsupported` (level 9 is `btlazy2` for inputs
+  up to 16 KB). A 43-mutation sweep of the new code added 12 corpus cases; 9
+  mutations survive with reasons in SPEC.md, one of them (the 2048-sequence
+  pricing switch) a real gap.
 - **2026-09-22** — New module: a Zstandard compressor for levels 1–3 and the
   negative levels, translated from libzstd 1.5.7 (`fast`/`dfast`, frame and
   block driver, pre-splitter, Huffman and FSE encoders), whose frames are

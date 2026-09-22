@@ -67,5 +67,5 @@ test "corpus inputs are the ones the goldens were made from" {
         h.update(buf);
     }
     const hex = std.fmt.bytesToHex(h.finalResult(), .lower);
-    try std.testing.expectEqualStrings("d26ed2de39f6d4c5638222de1b85b0a4076d10eb024a5c555c1d4cfca1c60d07", &hex);
+    try std.testing.expectEqualStrings("88a8b8ab48fe97c5853c9bf42ed092e0f4b28e45d05f0d9f9c0765ac1112f94b", &hex);
 }

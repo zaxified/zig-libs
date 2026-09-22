@@ -32,7 +32,7 @@ fn hash2(p: []const u8, hash_log: u32) u32 {
     if (hash_log == 8) return p[0];
     std.debug.assert(hash_log <= hashlog_max);
     // libzstd reads these two bytes in native order; little-endian is what the
-    // reference output on x86/arm64 corresponds to. (Only levels >= lazy use it.)
+    // reference output on x86/arm64 corresponds to. (Only greedy and up use it.)
     const v: u32 = std.mem.readInt(u16, p[0..2], .little);
     return (v *% knuth) >> @intCast(32 - hash_log);
 }

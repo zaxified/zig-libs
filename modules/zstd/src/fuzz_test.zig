@@ -17,7 +17,7 @@ const zstd = @import("root.zig");
 const fuzzSeed = @import("testkit").fuzz.seed;
 
 const fuzz_buf_len = 1 << 16;
-const levels = [_]i32{ -3, 1, 2, 3, -1 };
+const levels = [_]i32{ -3, 1, 2, 3, -1, 4, 5, 6, 7, 8 };
 
 fn roundTrip(input: []const u8) !void {
     const gpa = std.testing.allocator;
@@ -62,6 +62,9 @@ const fuzz_seed_corpus = [_][]const u8{
     fuzzSeed(seed_runs),
     fuzzSeed(&seed_noise),
     fuzzSeed(seed_words ++ seed_noise ++ seed_words),
+    // over 16 KB: the lazy levels switch from the hash chain to the row finder
+    // (17 927 bytes -> levels[7], level 6)
+    fuzzSeed(seed_words ** 7 ++ "abcdefg"),
 };
 
 test "fuzz: every input round-trips through std's decoder" {
