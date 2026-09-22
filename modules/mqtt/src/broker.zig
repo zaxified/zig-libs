@@ -749,6 +749,13 @@ pub const AclRequest = struct {
     username: ?[]const u8,
     topic: []const u8,
     operation: Operation,
+    /// The PUBLISH's RETAIN flag; always false for a SUBSCRIBE. A retained
+    /// message outlives its publisher and reaches every future subscriber, so
+    /// "may publish here" and "may leave a value here" are different rights —
+    /// e.g. a command topic that must never hold a stale command. mosquitto's
+    /// ACL sees the same flag (`mosquitto_acl_msg.retain`). A denial is the
+    /// ordinary ACL denial: dropped, still PUBACKed.
+    retain: bool = false,
 };
 
 pub const Config = struct {
@@ -858,6 +865,12 @@ pub const Config = struct {
     ///    is published (spec 3.1.2.5). This is how a store that could not write
     ///    the message keeps the publisher's copy alive instead of acknowledging
     ///    one it lost — an ACL denial cannot do that, it PUBACKs.
+    ///  - `.consume` — the message was meant for the broker's host, not for
+    ///    subscribers: a request the host answers on another topic, a control
+    ///    command. PUBACK as usual, but no fan-out and no retained update (a
+    ///    RETAIN flag is ignored). Without it the host could only `.accept` —
+    ///    and route the command to every subscriber whose filter matches — or
+    ///    `.refuse` and drop the connection.
     ///
     /// ⚠ `topic` and `payload` point into the publishing connection's receive
     /// buffer and are valid **only for the duration of the call**. A tap
@@ -889,6 +902,8 @@ pub const PublishVerdict = enum {
     accept,
     /// Do not take it: none of the above, and close the connection.
     refuse,
+    /// The host took it for itself: PUBACK only — no retained store, no fan-out.
+    consume,
 };
 
 /// One retained message snapshotted (owned dups) under the global lock for
@@ -1846,7 +1861,7 @@ pub const Broker = struct {
                 var granted: QoS = .at_most_once;
                 var ok = false;
                 if (!live) {} else if (topic.validateFilter(req.filter)) |_| {
-                    if (b.aclAllows(conn, req.filter, .subscribe)) {
+                    if (b.aclAllows(conn, req.filter, .subscribe, false)) {
                         granted = minQos(req.qos, .at_least_once); // support up to QoS 1
                         if (try b.registerSubscription(conn, req.filter, granted)) {
                             code = @intFromEnum(granted);
@@ -2006,7 +2021,7 @@ pub const Broker = struct {
 
         // ACL (FIX D): a denied PUBLISH is silently dropped — not retained, not
         // fanned out — but still PUBACKed so the publisher stays well-behaved.
-        if (b.aclAllows(conn, pub_pkt.topic, .publish)) {
+        if (b.aclAllows(conn, pub_pkt.topic, .publish, pub_pkt.retain)) routed: {
             // Tap before delivery: what the broker took is a fact even if
             // fan-out then fails, and `fanout` can return an error. A refusal
             // must come before `fanout` (which also writes the retained store)
@@ -2019,6 +2034,7 @@ pub const Broker = struct {
                         _ = b.tap_refusals.fetchAdd(1, .monotonic);
                         return .close;
                     },
+                    .consume => break :routed,
                 }
             }
             try b.fanout(pub_pkt);
@@ -2187,13 +2203,14 @@ pub const Broker = struct {
         try sub_conn.write(bytes);
     }
 
-    fn aclAllows(b: *Broker, conn: *Connection, topic_name: []const u8, op: Operation) bool {
+    fn aclAllows(b: *Broker, conn: *Connection, topic_name: []const u8, op: Operation, retain: bool) bool {
         const f = b.config.authorizeFn orelse return true;
         return f(b.config.acl_ctx, .{
             .client_id = conn.clientId(),
             .username = conn.usernameOpt(),
             .topic = topic_name,
             .operation = op,
+            .retain = retain,
         });
     }
 
@@ -4503,6 +4520,136 @@ test "a refusal is not a DISCONNECT: the publisher's Will is published" {
     try testing.expectEqualStrings("sn/1/status", will.publish.topic);
     try testing.expectEqualStrings("disconnected", will.publish.payload);
     b.remove(watcher);
+}
+
+test "a consumed publish is acknowledged but neither fanned out nor retained" {
+    var rec: TapRecorder = .{ .verdict = .consume };
+    var b = Broker.init(testing.allocator, .{
+        .onPublishFn = TapRecorder.onPublish,
+        .publish_ctx = &rec,
+    });
+    defer b.deinit();
+
+    // A retained value that exists before, so "not updated" is distinguishable
+    // from "cleared" and from "never there".
+    try b.publish("host/cmd", "before", .at_most_once, true);
+
+    var sub_tt: TestTransport = .{};
+    const sub = try connectClient(&b, &sub_tt, "sub", 0, 0);
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "host/#", .qos = .at_least_once }});
+    _ = try sub_tt.next(); // SUBACK
+    _ = try sub_tt.next(); // retained "before"
+    const sub_len = sub_tt.len;
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, conn, .{
+        .topic = "host/cmd",
+        .payload = "consumed",
+        .qos = .at_least_once,
+        .packet_id = 7,
+        .retain = true,
+    }));
+
+    try testing.expectEqual(@as(usize, 1), rec.calls);
+    try testing.expectEqualStrings("consumed", rec.seenPayload());
+    try testing.expectEqual(@as(u64, 0), b.tapRefusals());
+    const ack = (try tt.next()).?;
+    try testing.expect(ack == .puback);
+    try testing.expectEqual(@as(u16, 7), ack.puback);
+    // The subscriber whose filter matches heard nothing.
+    try testing.expectEqual(sub_len, sub_tt.len);
+
+    // The connection lives on: the next publish, accepted, is routed — the
+    // other direction of the check above, on the same subscriber.
+    rec.verdict = .accept;
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, conn, .{ .topic = "host/data", .payload = "routed" }));
+    try testing.expectEqualStrings("routed", (try sub_tt.next()).?.publish.payload);
+
+    // The retained store still holds the value from before.
+    var late_tt: TestTransport = .{};
+    const late = try connectClient(&b, &late_tt, "late", 0, 0);
+    try feedSubscribe(&b, late, 1, &.{.{ .filter = "host/cmd", .qos = .at_most_once }});
+    _ = try late_tt.next(); // SUBACK
+    try testing.expectEqualStrings("before", (try late_tt.next()).?.publish.payload);
+
+    b.remove(late);
+    b.remove(conn);
+    b.remove(sub);
+}
+
+// ── the ACL sees the RETAIN flag ────────────────────────────────────────────
+
+const RetainAcl = struct {
+    publishes: usize = 0,
+    subscribes: usize = 0,
+    subscribe_retain_seen: bool = false,
+
+    /// Deny a retained publish under "cmd/"; allow everything else.
+    fn check(ctx: ?*anyopaque, req: AclRequest) bool {
+        const self: *RetainAcl = @ptrCast(@alignCast(ctx.?));
+        switch (req.operation) {
+            .subscribe => {
+                self.subscribes += 1;
+                if (req.retain) self.subscribe_retain_seen = true;
+                return true;
+            },
+            .publish => {
+                self.publishes += 1;
+                return !(req.retain and std.mem.startsWith(u8, req.topic, "cmd/"));
+            },
+        }
+    }
+};
+
+test "ACL: a retained publish can be denied where a plain one is allowed" {
+    var acl: RetainAcl = .{};
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = RetainAcl.check, .acl_ctx = &acl });
+    defer b.deinit();
+
+    var sub_tt: TestTransport = .{};
+    const sub = try connectClient(&b, &sub_tt, "sub", 0, 0);
+    try feedSubscribe(&b, sub, 1, &.{.{ .filter = "cmd/#", .qos = .at_most_once }});
+    _ = try sub_tt.next(); // SUBACK
+    try testing.expectEqual(@as(usize, 1), acl.subscribes);
+    try testing.expect(!acl.subscribe_retain_seen);
+    const sub_len = sub_tt.len;
+
+    var tt: TestTransport = .{};
+    const conn = try connectClient(&b, &tt, "pub", 0, 0);
+
+    // Retained: denied — dropped, not stored, but still PUBACKed.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, conn, .{
+        .topic = "cmd/reboot",
+        .payload = "stale",
+        .qos = .at_least_once,
+        .packet_id = 3,
+        .retain = true,
+    }));
+    try testing.expectEqual(@as(u16, 3), (try tt.next()).?.puback);
+    try testing.expectEqual(sub_len, sub_tt.len);
+
+    // The same publish without RETAIN: allowed and delivered.
+    try testing.expectEqual(Disposition.keep, try feedPublish(&b, conn, .{
+        .topic = "cmd/reboot",
+        .payload = "now",
+        .qos = .at_least_once,
+        .packet_id = 4,
+    }));
+    try testing.expectEqual(@as(u16, 4), (try tt.next()).?.puback);
+    try testing.expectEqualStrings("now", (try sub_tt.next()).?.publish.payload);
+    try testing.expectEqual(@as(usize, 2), acl.publishes);
+
+    // Nothing was retained: a late subscriber gets only its SUBACK.
+    var late_tt: TestTransport = .{};
+    const late = try connectClient(&b, &late_tt, "late", 0, 0);
+    try feedSubscribe(&b, late, 1, &.{.{ .filter = "cmd/#", .qos = .at_most_once }});
+    _ = try late_tt.next(); // SUBACK
+    try testing.expect((try late_tt.next()) == null);
+
+    b.remove(late);
+    b.remove(conn);
+    b.remove(sub);
 }
 
 // ── Will / LWT (spec 3.1.2.5, 3.1.3.3, 3.14.4) ──────────────────────────────

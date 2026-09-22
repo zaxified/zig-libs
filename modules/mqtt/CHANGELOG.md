@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — Broker hooks: `AclRequest.retain` carries the PUBLISH's RETAIN flag (false for
+  SUBSCRIBE), so an ACL can deny a retained publish — e.g. to a command topic, where a stored
+  command would reach every future subscriber — while allowing the plain one; mosquitto's ACL sees
+  the same flag. New `PublishVerdict.consume`: PUBACK, but no retained store and no fan-out, for a
+  PUBLISH addressed to the broker's host (a request it answers on another topic). ⚠ An exhaustive
+  `switch` over `PublishVerdict` needs the new arm. `AclRequest.retain` defaults to false, so a
+  struct literal built by hand still compiles. Wanted by the egw-hub audit.
+
 - **2026-09-21** — Broker: sessions can be **kept across a server restart** by the server that
   holds the broker. New `Broker.sessionStates(arena)` (every session: client id, subscriptions
   with granted QoS, queued, in flight, and a new per-session `drops` count) and

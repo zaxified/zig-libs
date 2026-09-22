@@ -118,14 +118,18 @@ transport-agnostic client and a broker, all fully offline-testable.
     **Tapping traffic:** `Config.onPublishFn` is called for every PUBLISH the
     ACL allowed, before the retained store, fan-out and PUBACK, with the topic
     and payload. It exists because `authorizeFn` cannot serve — `AclRequest`
-    carries no payload — and because the alternative is registering a loopback
-    subscriber and re-decoding the broker's own output, after the publisher was
-    already acknowledged. It returns a `PublishVerdict`: `.accept` changes
-    nothing; `.refuse` means the broker does not take the message — no fan-out,
-    no retained update, no PUBACK, the connection is closed and
-    `tapRefusals()` counts it — so a QoS 1 publisher keeps its copy and sends
-    it again. That is how a store that failed to write keeps the message alive
-    instead of acknowledging one it lost. Null by default = accept everything.
+    carries the topic and the RETAIN flag (so the ACL can deny a retained
+    publish on its own), but no payload — and because the alternative is
+    registering a loopback subscriber and re-decoding the broker's own output,
+    after the publisher was already acknowledged. It returns a `PublishVerdict`:
+    `.accept` changes nothing; `.consume` acknowledges the message but neither
+    stores nor routes it — for a PUBLISH meant for the host itself (a request it
+    answers on another topic, a control command); `.refuse` means the broker
+    does not take the message — no fan-out, no retained update, no PUBACK, the
+    connection is closed and `tapRefusals()` counts it — so a QoS 1 publisher
+    keeps its copy and sends it again. That is how a store that failed to write
+    keeps the message alive instead of acknowledging one it lost. Null by
+    default = accept everything.
 
     **Deliberately deferred (documented, not built):** QoS 2
     (PUBREC/PUBREL/PUBCOMP — an inbound QoS 2 PUBLISH tears the connection

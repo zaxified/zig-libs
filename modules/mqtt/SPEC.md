@@ -112,11 +112,19 @@ limitations have now been fixed:
   (+`auth_ctx`) invoked in `handleConnect` with the client id + username + password — a deny returns
   the proper CONNACK (`not_authorized` / `bad_username_or_password`) and closes; and an
   `authorizeFn` (+`acl_ctx`) checked in `handlePublish`/`handleSubscribe` with the client identity +
-  topic + operation. A denied SUBSCRIBE yields per-filter SUBACK `0x80`; a denied PUBLISH is
+  topic + operation + the PUBLISH's RETAIN flag (`AclRequest.retain`, false for SUBSCRIBE — so a
+  retained publish can be denied where a plain one is allowed, as mosquitto's ACL can; added
+  2026-09-22). A denied SUBSCRIBE yields per-filter SUBACK `0x80`; a denied PUBLISH is
   silently dropped (not retained, not fanned out) while the publisher is still PUBACKed. The
   authenticated username is threaded onto the connection so the ACL hook sees it. Both hooks are a
   clean function-pointer + opaque-ctx seam with **no external deps**; both default to null =
   allow-all (backward compatible).
+- **Publish tap verdicts.** `Config.onPublishFn` sees every PUBLISH the ACL allowed, before the
+  retained store, fan-out and PUBACK, and answers a `PublishVerdict`: `.accept` (take it as without
+  a tap), `.refuse` (no store, no fan-out, no PUBACK, close — the publisher keeps its copy), or
+  `.consume` (2026-09-22: PUBACK only — no store, no fan-out; a RETAIN flag is ignored). `.consume`
+  is for a PUBLISH addressed to the broker's host — a request it answers on another topic, a
+  control command — which `.accept` would also route to every matching subscriber.
 
 Residual deferred scope (documented, not bugs): **QoS 2** (an inbound QoS 2 PUBLISH is a protocol
 violation that tears the connection down), sessions the broker itself persists (they are in
@@ -267,19 +275,6 @@ multi-threaded stress/race pass is now **COVERED** — see Verification above (1
 OS-thread clients racing fan-out / take-over / churn, run repeatedly under Debug + ReleaseFast and
 under valgrind memcheck, all clean; TSan is a no-op stub in Zig 0.16.0, so real-thread stress is the
 fallback). Client: MQTT 5.0 out of scope.
-
-**Broker hooks — two gaps (from the egw-hub audit, 2026-09-22):**
-- `AclRequest` has no `retain` flag. A retained PUBLISH to a command topic
-  cannot be denied by the ACL, only refused in `onPublishFn` (which closes the
-  connection). Mosquitto's ACL check sees it (`mosquitto_acl_msg.retain`).
-  egw-hub today: `hubTap` refuses a retained command (`egw-hub/src/loop.zig`,
-  `acl_mod.isCommand`). Ideal: `AclRequest.retain: bool` (false for SUBSCRIBE).
-- `PublishVerdict` has only `accept` (store + fan-out + PUBACK) and `refuse`
-  (no PUBACK, close). A PUBLISH that is a command to the broker's host
-  (a request answered on another topic) needs a third answer: PUBACK, but no
-  retained store and no fan-out. egw-hub today moved its request topics out of
-  every consumer's filters instead (`egw-hub/history/…`, audit B9). Ideal:
-  `.consume`.
 
 ## Status
 `gap · any (codec+client pure; TcpTransport uses std.Io.net) · client+codec · single-owner` + deps:
