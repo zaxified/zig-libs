@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-22** — **`Limits.max_errors`: a caller can lower the error cap.** The
+  report keeps at most `max_errors` errors (default and ceiling: the module's
+  1000) and builds none past it; 0 counts as 1, so an invalid document is never
+  reported valid. Honoured by `validateJsonLimited`, `parseIntoLimited` and the
+  streaming path. Why: a caller decoding into a fixed buffer (qap's typed bodies)
+  found that aggregating the errors of a body wrong everywhere costs more than
+  decoding it — 1500 wrong items overflowed a 4 KiB buffer, so the answer read
+  "too large" instead of "invalid". Test pins each path, the 0→1 rule and the
+  ceiling.
+
 - **2026-09-22** — **New streaming path: `parseIntoLeaky(T, arena, body, limits)` and
   `validateJsonStreaming(gpa, body, schema, limits)`** — the rules, codes and messages of
   `parseIntoLimited`/`validateJsonLimited` without building a `std.json.Value` tree. The tree

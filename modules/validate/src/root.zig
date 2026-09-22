@@ -303,9 +303,19 @@ const max_errors: usize = 1000;
 const Builder = struct {
     arena: std.heap.ArenaAllocator,
     list: std.ArrayList(Error),
+    /// Errors kept, at most: `max_errors`, or a caller's lower
+    /// `Limits.max_errors`. Never 0 -- a builder that could keep nothing
+    /// would report an invalid document as valid.
+    cap: usize = max_errors,
 
     fn init(gpa: Allocator) Builder {
         return .{ .arena = std.heap.ArenaAllocator.init(gpa), .list = .empty };
+    }
+
+    fn initCapped(gpa: Allocator, cap: usize) Builder {
+        var b = init(gpa);
+        b.cap = @max(1, @min(cap, max_errors));
+        return b;
     }
 
     fn a(b: *Builder) Allocator {
@@ -322,7 +332,7 @@ const Builder = struct {
     /// `dedupeFrom` after the second pass, bounded by `max_errors` on both
     /// sides rather than by attacker-controlled input size.
     fn append(b: *Builder, path: []const u8, code: []const u8, message: []const u8) Allocator.Error!void {
-        if (b.list.items.len >= max_errors) return;
+        if (b.list.items.len >= b.cap) return;
         try b.list.append(b.a(), .{ .path = path, .code = code, .message = message });
     }
 
@@ -356,7 +366,7 @@ const Builder = struct {
     /// True once the error list is full: nothing more will be retained, so
     /// nothing more needs to be BUILT.
     fn full(b: *const Builder) bool {
-        return b.list.items.len >= max_errors;
+        return b.list.items.len >= b.cap;
     }
 
     fn appendf(b: *Builder, path: []const u8, code: []const u8, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
@@ -431,7 +441,10 @@ pub fn validateJsonLimited(gpa: Allocator, body: []const u8, schema: []const Rul
         else => return jsonInvalidReport(gpa, err),
     };
     defer parsed.deinit();
-    return validateValue(gpa, parsed.value, schema);
+    var b = Builder.initCapped(gpa, limits.max_errors);
+    errdefer b.abort();
+    try checkValue(&b, "", parsed.value, schema);
+    return b.finish();
 }
 
 fn jsonInvalidReport(gpa: Allocator, err: anyerror) Allocator.Error!Report {
@@ -476,6 +489,12 @@ pub const Limits = struct {
     /// not counted). Over → `too_many_nodes`. Set to a very large value to
     /// effectively disable this overall cap.
     max_total_nodes: usize = 1_000_000,
+    /// Errors kept per report, at most; the rest are not built at all. Only
+    /// lowers the module's own hard cap of 1000, and 0 counts as 1 (an
+    /// invalid document always carries at least one error). A caller that
+    /// holds the report in a fixed buffer sizes it with this: aggregating
+    /// 1000 errors costs more memory than most bodies do.
+    max_errors: usize = max_errors,
 };
 
 const limit_too_deep: Error = .{ .path = "", .code = "too_deep", .message = "JSON nesting is too deep" };
@@ -1405,7 +1424,7 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
     // memory -- a double free, found by a sizing probe on a
     // FixedBufferAllocator (2026-09-22), whose `free` asserts ownership.
     {
-        var b = Builder.init(gpa);
+        var b = Builder.initCapped(gpa, limits.max_errors);
         errdefer b.abort();
         try checkValue(&b, "", parsed.value, schema);
         if (@hasDecl(T, "validate_rules")) {
@@ -1525,7 +1544,7 @@ fn streamValidate(gpa: Allocator, body: []const u8, schema: []const Rule, extra:
     // No `errdefer` over the builder: the json_invalid branch below aborts it
     // and then allocates again, and an armed errdefer would free it twice on
     // that allocation's failure (the bug fixed in `parseIntoLimited`).
-    var b = Builder.init(gpa);
+    var b = Builder.initCapped(gpa, limits.max_errors);
     const bad_json = walkDocument(&b, gpa, body, schema, extra) catch |err| {
         b.abort();
         return err;
@@ -3291,6 +3310,29 @@ test "streaming: a valid document allocates no error path, and decodes into a bo
     // Unescaped strings are borrowed from the body, not copied.
     try testing.expect(@intFromPtr(r.ok.name.ptr) >= @intFromPtr(body.ptr) and
         @intFromPtr(r.ok.name.ptr) < @intFromPtr(body.ptr) + body.len);
+}
+
+test "Limits.max_errors lowers the cap on every limited path, and never to zero" {
+    const schema = [_]Rule{.{ .field = "a", .kind = .array, .items = &.{ .field = "", .kind = .string } }};
+    const body = "{\"a\":[1,2,3,4,5,6,7,8,9,10]}";
+    var tree = try validateJsonLimited(testing.allocator, body, &schema, .{ .max_errors = 3 });
+    defer tree.deinit();
+    try testing.expectEqual(@as(usize, 3), tree.errors.len);
+    var stream = try validateJsonStreaming(testing.allocator, body, &schema, .{ .max_errors = 3 });
+    defer stream.deinit();
+    try testing.expectEqual(@as(usize, 3), stream.errors.len);
+    const T = struct { a: []const []const u8 };
+    var typed = try parseIntoLimited(T, testing.allocator, body, .{ .max_errors = 2 });
+    defer typed.deinit();
+    try testing.expectEqual(@as(usize, 2), typed.invalid.errors.len);
+    // 0 is 1: an invalid document is never reported valid.
+    var zero = try validateJsonStreaming(testing.allocator, body, &schema, .{ .max_errors = 0 });
+    defer zero.deinit();
+    try testing.expectEqual(@as(usize, 1), zero.errors.len);
+    // Above the module's own cap: the module's cap.
+    var many = try validateJsonLimited(testing.allocator, "{\"a\":[" ++ "1," ** 1200 ++ "1]}", &schema, .{ .max_errors = 5000 });
+    defer many.deinit();
+    try testing.expectEqual(max_errors, many.errors.len);
 }
 
 test "streaming: every allocation failure point, no leak, no double free" {
