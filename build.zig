@@ -134,6 +134,7 @@ const module_list = [_]Module{
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "brotli", .libs = &.{"web"}, .test_deps = &.{"testkit"} },
+    .{ .name = "zstd", .libs = &.{ "format", "storage", "web" }, .test_deps = &.{"testkit"} },
     .{ .name = "dns", .libs = &.{"net"}, .deps = &.{ "netaddr", "http" }, .test_deps = &.{"testkit"} },
     .{ .name = "ramcache", .libs = &.{ "storage", "net" } },
     .{ .name = "router", .libs = &.{"web"}, .deps = &.{"http"}, .timing = true },

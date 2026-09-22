@@ -1,0 +1,80 @@
+zstd — third-party attribution
+
+This file carries a CONDITION. The encoder in `src/` is a translation of C
+source from libzstd (github.com/facebook/zstd, tag v1.5.7, commit
+f8745da6ff1ad1e7bab384bd1f9d742439278e99) into Zig. The BSD licence that source
+is offered under requires its copyright notice, conditions and disclaimer to
+travel with redistributions of the source and to be reproduced with binary
+redistributions. They are reproduced in full below. The obligation lives here,
+beside the code that owes it; the root NOTICE does not list modules.
+
+**Copyleft:** NONE-SHIPPED — libzstd is dual-licensed "BSD-style OR GPLv2" at
+the recipient's option. This port is taken under the BSD licence only; no text
+of this module is offered under, or relies on, the GPLv2.
+
+WHAT WAS TAKEN
+
+Translated (source, restructured into Zig but decision-for-decision the same):
+
+  lib/compress/zstd_fast.c            no-dictionary `fast` match finder     -> src/match.zig
+  lib/compress/zstd_double_fast.c     no-dictionary `dfast` match finder    -> src/match.zig
+  lib/compress/zstd_compress_internal.h  window helpers, hashes, ZSTD_count,
+                                      seqStore, repcode handling            -> src/match.zig, src/sequences.zig
+  lib/compress/zstd_compress.c        one-shot frame/block driver, frame
+                                      header, parameter adjustment, entropy
+                                      glue for a block                      -> src/frame.zig, src/params.zig
+  lib/compress/clevels.h              level table rows 0-3                  -> src/params.zig
+  lib/compress/zstd_preSplit.c        block pre-splitter                    -> src/presplit.zig
+  lib/compress/zstd_compress_literals.c  literals section                  -> src/literals.zig
+  lib/compress/zstd_compress_sequences.c encoding-type choice, table build,
+                                      sequence bitstream                    -> src/sequences.zig
+  lib/compress/huf_compress.c         Huffman tree, table header, streams   -> src/huf.zig
+  lib/compress/fse_compress.c, lib/common/fse.h
+                                      FSE normalisation, header, coding     -> src/fse.zig
+  lib/common/bitstream.h              bit writer                            -> src/bitstream.zig
+  lib/compress/hist.c                 byte histograms                       -> src/hist.zig
+  lib/common/zstd_internal.h          code tables, default distributions    -> src/sequences.zig
+
+Each of those files says so in its first line
+(`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
+and `src/testdata/` are this collection's own work (MIT).
+
+Not taken: libzstd's decoder (std has one), dictionaries, the lazy/btopt/
+btultra match finders, long-distance matching, multithreading, streaming.
+
+Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
+`src/testdata/goldens.zig` (lengths and SHA-256 digests of its output). No
+libzstd bytes are stored in this repository.
+
+LICENSE TEXT (libzstd `LICENSE`, verbatim)
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

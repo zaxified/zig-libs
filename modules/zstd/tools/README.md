@@ -1,0 +1,43 @@
+# `zstd` verification instruments
+
+Two instruments that check this module against **libzstd itself**. They live
+here and not in `src/` because they need a C compiler and a libzstd checkout,
+which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
+`zig build`; run them by hand.
+
+| file | kind (§9) | what it answers |
+|---|---|---|
+| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits. |
+| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. |
+
+## The reference they need
+
+    R=.zig-cache/zstd-ref            # disposable: the recipe re-clones it
+    git clone --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git "$R"
+    make -C "$R/lib" libzstd.a
+    cc -O2 -I "$R/lib" -o "$R/zref" modules/zstd/tools/zref.c "$R/lib/libzstd.a"
+
+Tag `v1.5.7` is commit `f8745da6ff1ad1e7bab384bd1f9d742439278e99`;
+`gen-goldens.sh` refuses any other checkout. Nothing is copied out of the tree
+into the goldens except lengths and digests of libzstd's *output*.
+
+⚠ **Compare against `ZSTD_compress2`, not the `zstd` CLI.** The CLI feeds the
+library through its streaming API, which blocks the input differently (a
+pre-split decision is taken on each 128 KB input buffer, not on the whole
+input), so its frames legitimately differ from one-shot output. Measured on a
+13.7 MB CSV at level 1: CLI 803 211 bytes, `ZSTD_compress2` 803 403.
+
+## Regenerating the goldens
+
+    ZSTD_REF=<dir> modules/zstd/tools/gen-goldens.sh   # default dir as above
+
+Needed when `src/testdata/corpus.zig` changes (a new case, or a generator
+change — `golden_test.zig` pins a digest of all corpus inputs, so the latter
+cannot happen silently). The recipe prints the row count; it must equal
+cases × 5 levels × 2.
+
+## Comparing an arbitrary file
+
+    "$R/zref" <level> <checksum 0|1> in.bin ref.zst
+    # and the same input through this module (e.g. a three-line main around
+    # zstd.compressAlloc), then: cmp ref.zst ours.zst

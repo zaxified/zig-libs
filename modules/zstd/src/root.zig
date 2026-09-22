@@ -1,0 +1,144 @@
+// SPDX-License-Identifier: MIT
+//! zstd — Zstandard (RFC 8878) compressor for levels 1-3 and the negative
+//! ("fast") levels, byte-identical to libzstd 1.5.7.
+//!
+//! Decoding is std's job (`std.compress.zstd.Decompress`); this module fills
+//! the other half. It is a port of libzstd's `fast` and `dfast` strategies,
+//! frame/block driver, block pre-splitter, Huffman and FSE encoders. For the
+//! same input and level it emits exactly the bytes `ZSTD_compress2()` from
+//! libzstd v1.5.7 does (one-shot, content size in the header, checksum
+//! optional) — that equality is what the tests pin, not merely round-trips.
+//!
+//! Levels 4 and up need the lazy/btopt match finders and are not carried;
+//! asking for one is an error rather than a silent downgrade. See SPEC.md.
+
+const std = @import("std");
+const frame = @import("frame.zig");
+const params = @import("params.zig");
+
+pub const meta = .{
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-3 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd`",
+    .platform_note = "any",
+    .targets = .{.linux64},
+    .platform = .any,
+    .role = .codec,
+    .concurrency = .reentrant,
+    .model_after = "libzstd 1.5.7 (facebook/zstd) fast/dfast strategies; output checked byte-for-byte against it",
+    .deps = .{},
+};
+
+pub const Options = struct {
+    /// 1..3, 0 for the default (3), or negative for the faster "fast" levels
+    /// (down to -131072; lower values are clamped, as libzstd does).
+    level: i32 = params.default_level,
+    /// Append the XXH64-based content checksum (frame header flag + 4 bytes).
+    checksum: bool = false,
+};
+
+pub const Error = frame.Error || error{
+    /// Level above `max_level`: those strategies are not implemented.
+    LevelUnsupported,
+};
+
+pub const max_level = params.max_level;
+pub const min_level = params.min_level;
+pub const default_level = params.default_level;
+
+/// Largest input a single `compress` call accepts.
+pub const max_input_size = frame.max_input_size;
+
+/// Worst-case compressed size of `src_size` bytes (`ZSTD_compressBound`).
+pub fn compressBound(src_size: usize) usize {
+    return frame.compressBound(src_size);
+}
+
+/// Compress `src` into one frame in `dst`, which must hold at least
+/// `compressBound(src.len)` bytes. Returns the frame length. `gpa` is used
+/// for the match tables and block buffers only, all freed before returning.
+pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
+    if (opts.level > max_level) return error.LevelUnsupported;
+    return frame.compress(gpa, dst, src, .{ .level = opts.level, .checksum = opts.checksum });
+}
+
+/// Compress `src` into a newly allocated frame owned by the caller.
+pub fn compressAlloc(gpa: std.mem.Allocator, src: []const u8, opts: Options) Error![]u8 {
+    if (src.len > max_input_size) return error.InputTooLarge;
+    const buf = try gpa.alloc(u8, compressBound(src.len));
+    errdefer gpa.free(buf);
+    const n = try compress(gpa, buf, src, opts);
+    return gpa.realloc(buf, n) catch buf[0..n];
+}
+
+test {
+    _ = @import("bitstream.zig");
+    _ = @import("hist.zig");
+    _ = @import("fse.zig");
+    _ = @import("huf.zig");
+    _ = @import("sequences.zig");
+    _ = @import("literals.zig");
+    _ = @import("params.zig");
+    _ = @import("match.zig");
+    _ = @import("presplit.zig");
+    _ = @import("frame.zig");
+    _ = @import("golden_test.zig");
+    _ = @import("fuzz_test.zig");
+}
+
+/// Decode with std. std's own checksum verification is a TODO panic in the
+/// streaming path (0.16), so a checksummed frame is checked here instead.
+fn decompress(gpa: std.mem.Allocator, compressed: []const u8, has_checksum: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(compressed);
+    var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .verify_checksum = false });
+    _ = try d.reader.streamRemaining(&out.writer);
+    const plain = try out.toOwnedSlice();
+    errdefer gpa.free(plain);
+    try std.testing.expectEqual(has_checksum, compressed[4] & 4 != 0);
+    if (has_checksum) {
+        const want: u32 = @truncate(std.hash.XxHash64.hash(0, plain));
+        try std.testing.expectEqual(want, std.mem.readInt(u32, compressed[compressed.len - 4 ..][0..4], .little));
+    }
+    return plain;
+}
+
+test "empty input is the 9-byte frame libzstd emits" {
+    const gpa = std.testing.allocator;
+    const z = try compressAlloc(gpa, "", .{});
+    defer gpa.free(z);
+    try std.testing.expectEqualSlices(u8, &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 }, z);
+}
+
+test "round trip through std's decoder at every implemented level" {
+    const gpa = std.testing.allocator;
+    var src: [40000]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x5eed);
+    const words = [_][]const u8{ "alpha ", "beta ", "gamma ", "delta,", "42;", "\n", "zstd " };
+    var i: usize = 0;
+    while (i < src.len) {
+        const w = words[prng.random().uintLessThan(usize, words.len)];
+        const n = @min(w.len, src.len - i);
+        @memcpy(src[i..][0..n], w[0..n]);
+        i += n;
+    }
+    for ([_]i32{ -5, -1, 1, 2, 3 }) |level| {
+        for ([_]bool{ false, true }) |ck| {
+            const z = try compressAlloc(gpa, &src, .{ .level = level, .checksum = ck });
+            defer gpa.free(z);
+            try std.testing.expect(z.len < src.len / 2);
+            const back = try decompress(gpa, z, ck);
+            defer gpa.free(back);
+            try std.testing.expectEqualSlices(u8, &src, back);
+        }
+    }
+}
+
+test "levels above 3 are refused, not downgraded" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 4 }));
+}
+
+test "a destination below the bound is refused" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, compress(std.testing.allocator, &buf, "hello", .{}));
+}

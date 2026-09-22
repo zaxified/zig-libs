@@ -1,0 +1,151 @@
+# `zstd` — specification
+
+Consumer view, API and purpose: [README.md](README.md).
+
+## What this module is, and what it is not
+
+A one-shot Zstandard **compressor** that reproduces libzstd 1.5.7's output
+byte for byte for levels 1–3 and every negative level. The match finders
+(`fast`, `dfast`), the frame/block driver, the block pre-splitter and the
+entropy stage (literals via Huffman, sequences via FSE) are translated from
+libzstd; see [NOTICE](NOTICE) for the file-by-file map.
+
+Not here, and a reader might expect it:
+
+- **A decoder.** `std.compress.zstd.Decompress` exists (CONVENTIONS.md §1.3).
+  The tests use it as the round-trip oracle.
+- **Levels 4–22.** `greedy`/`lazy`/`lazy2` (4–12), `btlazy2` (13–15) and the
+  optimal parsers `btopt`/`btultra`/`btultra2` (16–22) are not ported;
+  asking for them is `error.LevelUnsupported`. *Deferred*: a port of
+  `zstd_opt.c` for level 19 is the planned second stage, wanted only once
+  something must archive in-process (today's archives call the `zstd`/`xz`
+  CLIs; see the root README's Non-goals row).
+- **Streaming.** One call, whole input. libzstd's streaming API blocks the
+  input on its own buffer boundaries and so produces *different* (equally
+  valid) frames; matching those would be a different contract.
+- **Dictionaries, long-distance matching, multithreading, `targetCBlockSize`,
+  the post-block splitter** (libzstd enables that one from `btopt` up, so no
+  implemented level uses it).
+
+## Algorithm
+
+libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
+`compressBound`-sized destination goes through `ZSTD_compressEnd_public`):
+
+1. **Parameters** (`params.zig`): row `level` (0 → 3, negative → row 0 with
+   `targetLength = -level`) of the table chosen by source size (≤16 KB,
+   ≤128 KB, ≤256 KB, larger), then `ZSTD_adjustCParams_internal` shrinks the
+   window to the input and caps hash/chain logs by it. The window log goes into
+   the frame header.
+2. **Frame header** (`frame.zig`): content size always present; single-segment
+   when the window covers the input.
+3. **Blocks**: at most `min(128 KB, window, input)` each. From the second full
+   block on — once the frame has saved at least 3 bytes — a 128 KB block may be
+   cut by the pre-splitter (`presplit.zig`): `fast` compares the byte histograms
+   of the first and last 512 bytes (and the middle, to pick 32/64/96 KB);
+   `dfast` fingerprints 8 KB chunks sampled every 43rd byte and cuts at the
+   first chunk that deviates.
+4. **Match finding** (`match.zig`): indices start at 2, as in libzstd, so a zero
+   hash slot means "empty". Repeat offsets carry across blocks; a block emitted
+   raw or RLE does not commit its repeat offsets or entropy tables (the next
+   block starts again from the last compressed block's state).
+5. **Entropy** (`literals.zig`, `huf.zig`, `sequences.zig`, `fse.zig`):
+   literals are Huffman-coded (1 or 4 streams) when that beats `minGain`,
+   reusing the previous block's table when libzstd would; each sequence code
+   stream uses the predefined table, RLE, or a new table by libzstd's
+   below-`lazy` heuristics.
+6. **Block type**: compressed if it beats `blockSize - minGain`, RLE when the
+   whole block is one byte (never for the first block — zstd ≤ 1.4.3 decoders
+   mishandle that), raw otherwise. Optional XXH64 checksum at the end.
+
+**Everything that can reach the output is kept verbatim**, including three
+things that look like incidental implementation detail and are not:
+
+- the Huffman symbol sort's *unstable* quicksort on its log buckets (it decides
+  which of equally frequent symbols gets the longer code);
+- `HUF_setMaxHeight`'s repayment order when capping code lengths at 11 bits;
+- the FSE normaliser's `rtbTable` rounding and its fallback `normalizeM2`.
+
+What is *not* kept is how libzstd gets there fast: the unrolled Huffman loops,
+the cmov/branch match-found variants, 4-way histograms and 8-byte table
+spreading are replaced by plain loops that make the same decisions. Where the
+reference chooses between two code paths on *capacity* (`HUF_compress1X`'s
+fast flush when the destination is large), both paths produce the same bits
+and one path is carried.
+
+Endianness: every multi-byte read that feeds a decision is little-endian,
+matching libzstd on x86/arm64 (libzstd reads native order in one place, the
+pre-splitter's 16-bit hash, which only levels ≥ `lazy` use).
+
+## Limits and refusals
+
+| limit | value | source |
+|---|---|---|
+| level | `min_level` (-131072) … 3; lower is clamped | `ZSTD_minCLevel()`; 3 is the last level on `fast`/`dfast` |
+| input | `max_input_size` = 3500 MiB − 2 | libzstd corrects index overflow past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit); that correction is not ported, so the input stops before it |
+| destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
+| block | 128 KB | format |
+
+`golden_test.zig` pins all of the above through the output; `root.zig` tests
+pin the level refusal and the destination bound.
+
+## Anchoring
+
+**External anchor.** `src/testdata/goldens.zig` holds, for each of 40 corpus
+inputs × levels {-5, -1, 1, 2, 3} × checksum {off, on} (400 frames), the length and
+SHA-256 of the frame libzstd v1.5.7 (`f8745da6`) emits via `ZSTD_compress2`.
+It is written by `tools/gen-goldens.sh`, which builds that exact tag and runs
+`tools/zref.c`; the inputs come from `src/testdata/corpus.zig`, whose own
+output is pinned by a digest test so a generator drift cannot pass as an
+encoder regression.
+
+The corpus is built to reach decisions. On 2026-09-22 the port was mutated
+(32 single-edit mutations: thresholds off by one, `>=` for `>`, a changed
+constant) and every mutation the corpus did not notice got a case that does:
+
+| case | what it pins |
+|---|---|
+| `debruijn-9-4` | 9 equally frequent literals, no 4-byte repeat: the Huffman quicksort order |
+| `sparse-matches` | `fast`'s `step <= 4` hash-table write |
+| `sparse-far` | `dfast`'s `step < 4` write (needs 48-byte phrases so the 8-byte hash at match+4 stays inside the phrase) |
+| `split-margin` | a `dfast` pre-split deviation of 36 860, between the penalty-2 (36 100) and penalty-3 (38 356) thresholds |
+| `rle-tail-6` | a 6-byte run as last block: below the 7-byte "attempt compression" size, so raw, not RLE |
+| `repeat-1024` | exactly 1024 literals: the Huffman table is reused unpriced at `<= 1024` |
+| `mix-*`, `skewed-180` | found by searching generator seeds for an input where one boundary flips the output; `corpus.zig` names the boundary beside each |
+
+Nine mutations still pass, and are left so on purpose:
+
+| mutation | why no case exists |
+|---|---|
+| `lastCountSize + bitstreamSize < 4` → `< 3` | unreachable below `lazy`: a `set_compressed` sequence table needs ≥ 36 sequences, which cannot fit a 1-byte bitstream |
+| pre-split `savings < 3` → `< 2` | frame savings of exactly 2 need hundreds of raw blocks (> 80 MB of input) |
+| `dfast` `idxl1 > prefixLowest` → `>=` | index 2 is never inserted, and the prefix only moves once the input passes the 2 MB window |
+| RLE block when `cSize < 25` → `< 24` | a block of one repeated byte compresses to far fewer than 24 bytes |
+| Huffman `largest <= n/128 + 4`, `total >= n - 1`, `hSize + 12 >= n`, sampled `largestTotal <= 68` | masked: at equality the literals are near-uniform and the section is stored raw by the `minGain` check that follows anyway |
+| `mostFrequent < nbSeq >> (log - 1)` → `<=` | reachable in principle; 50 000 generated inputs did not hit equality. **Uncovered.** |
+
+Beyond the committed goldens, the port was compared against `zref` on 49
+boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
+JSON, text) and 800 random mixed inputs across levels -7…3, all identical.
+Those runs are not stored; the oracle is, and re-runs them on any input.
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+## What is deliberately not done
+
+- **A faster port.** This is 1.3–1.5× slower than libzstd (process time,
+  ReleaseFast, level 1 and 3 on a 13.7 MB CSV, a 3 MB text and an 11 MB ELF).
+  The reference's speed comes from unrolling, prefetch and branchless selects
+  that do not change decisions; adding them is possible later without touching
+  the goldens. *Not now.*
+- **Matching the `zstd` CLI.** See *Streaming* above. *Never*, as a contract;
+  the CLI's output is equally valid and decodes the same.
+- **Levels ≥ 4 by downgrading to 3.** Refused: a caller asking for level 19
+  would get level-3 ratio with no signal.
+
+## Open
+
+- The one reachable boundary without a case: the sequence encoding-type
+  heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality (see *Anchoring*).
+- `targets` declares only `.linux64`; the code has no OS or endianness
+  dependency, but `portable-zstd-*` has not been run.
