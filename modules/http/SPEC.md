@@ -293,6 +293,16 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
+
+**Query-string parameters and path percent-decoding** — BACKLOG (2026-09-22, found by qap).
+`Request` exposes the raw `path` and `query` but nothing that reads a parameter out of the query
+or decodes the path; `body.zig` already has the `application/x-www-form-urlencoded` decoder for
+*bodies*, and Go's `URL.Query()`/`PathUnescape` or Rust's `form_urlencoded` are the equivalents a
+consumer expects. qap wrote its own (`src/inputs.zig`: first-match `param` with decoded keys,
+`+`→space, and a strict path decoder that refuses `%2F`, `%00` and malformed escapes so an
+encoded separator can never reach a router). Wanted here, shared with `router`, so the rule that
+decides what a path segment is lives in one place.
+
 **h2 upstream forwarding** reuses the multiplexing `h2_client.Session` through its *buffered*
 surface, so it (a) buffers request/response bodies in memory (bounded) rather than streaming like
 the h1 path — no longer an engine limitation since `h2_client` grew `openStream`/`sendData`/

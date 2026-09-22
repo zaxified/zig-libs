@@ -165,6 +165,19 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
 - **OAuth2 error-response parsing (RFC 6749 §5.2)** — DEFERRED: `parseTokenResponse` assumes a
   200-status success body; a non-200 response's `{"error": …}` shape is a caller concern (check the
   HTTP status before parsing) rather than a second typed parser this pass adds.
+- **Token issuance / signing** — BACKLOG (2026-09-22, found by qap). "Out of scope: token
+  issuance/signing" above was a scope choice, and it leaves a gap every JWT library in other
+  languages fills (jsonwebtoken, jose, PyJWT all encode+sign): a consumer that mints its own
+  service tokens, and every test that needs a token, hand-rolls base64url + HMAC/ECDSA today
+  (qap's `auth_jwt_test.zig` does exactly that). Wanted: `encode(header, claims, key)` for the
+  algorithms `verify` already supports, over the same `Key` union, with the RFC 8725 rules
+  (`alg` taken from the key, never from the caller alone; no `none`).
+- **`Guard` over a static `JwkSet`** — BACKLOG (2026-09-22, found by qap). `Guard` requires a
+  `*Provider` (a network-fetching JWKS cache). A resource server whose keys come from its own
+  configuration — the common small-deployment case — has to build a Provider around a fake
+  fetcher or drop down to `parseVerifyJwks` and re-implement the Bearer extraction, `at+jwt`
+  typ check, scope policy and RFC 6750 challenges `Guard` already has. Wanted: a key source that
+  is either a Provider or a caller-held `*const JwkSet`.
 - No other module-local backlog recorded (README has no Deferred section).
 
 ## Status

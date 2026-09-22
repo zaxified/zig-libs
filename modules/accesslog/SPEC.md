@@ -253,6 +253,15 @@ header sizes upstream, e.g. `http.Server.Options`' own 431/414 limits), and PII
 redaction/scrubbing (an app that logs a bearer token in a custom field is an app policy issue,
 not something this formatter can detect).
 
+## Backlog / deferred
+
+- **`%u` — the authenticated user** — BACKLOG (2026-09-22, found by qap). Common/Combined
+  write `%l` and `%u` as a constant `-`, and `Entry` has no field to fill `%u` from, so a server
+  that knows its caller (qap's principal form, a JWT `sub`) cannot log it in the formats that
+  define a slot for exactly that. Wanted: an optional `Entry.user` rendered as `%u` (escaped like
+  every other client-influenced field) and as a `user` key in the JSON/logfmt formats; `-` when
+  null, so existing output is byte-identical.
+
 ## Design & invariants
 
 - Every `write*` function takes `entry: Entry` by value and a `*std.Io.Writer` — no allocation,
