@@ -73,7 +73,9 @@ generated, so the repository stores none) is compressed at levels -5, -1 and
 is built for coverage: each size tier of the level table, RLE blocks, literal
 and match lengths past 0xFFFF, both pre-splitters, the post-splitter, offsets
 beyond the window, and cases constructed so that specific decisions are
-marginal (see SPEC.md, *Anchoring*). The lane takes about 2 minutes in Debug.
+marginal (see SPEC.md, *Anchoring*). The module is `heavy` in `build.zig`:
+its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
+ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder; unit
 tests cover the FSE normalisation, Huffman depth limiting, bit writer and

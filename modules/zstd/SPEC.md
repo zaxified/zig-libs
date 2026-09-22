@@ -263,7 +263,5 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
   equalities in the optimal parsers and the post-splitter's estimates (see
   *Anchoring*).
 - Level 22: long-distance matching (`zstd_ldm.c`) for inputs over 64 MB.
-- The golden lane takes ~2 min 20 s in Debug (45 s before levels 11–21);
-  the module may qualify for `heavy` in `build.zig`.
 - `targets` declares only `.linux64`; the code has no OS or endianness
   dependency, but `portable-zstd-*` has not been run.
