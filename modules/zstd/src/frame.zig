@@ -57,8 +57,6 @@ const Ctx = struct {
     /// Long-distance matching: the table, and room for one block's sequences.
     ldm: ?*ldm.State = null,
     ldm_seqs: []ldm.RawSeq = &.{},
-    /// Address of the input's first byte: LDM takes input positions.
-    ldm_origin: usize = 0,
 
     /// The match state's index of `block`, which lies in its prefix.
     fn index(c: *const Ctx, block: []const u8) u32 {
@@ -206,7 +204,7 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
         // ZSTD_ldm_blockCompress, strategy >= btopt: the long-distance
         // matches are candidates for the optimal parser, not sequences
         var ldm_seq_store: ldm.RawSeqStore = .{ .seq = c.ldm_seqs };
-        ls.generateSequences(&ldm_seq_store, @intFromPtr(block.ptr) - c.ldm_origin, block.len);
+        ls.generateSequences(&ldm_seq_store, block);
         c.ms.ldm_seq_store = &ldm_seq_store;
         defer c.ms.ldm_seq_store = null;
         last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
@@ -443,7 +441,6 @@ pub const Compressor = struct {
         const ldm_state: ?*ldm.State = if (ldm_on) try gpa.create(ldm.State) else null;
         errdefer if (ldm_state) |p| gpa.destroy(p);
         if (ldm_state) |p| p.* = .{
-            .src = &.{},
             .p = lp,
             .hash_table = ldm_table,
             .bucket_offsets = ldm_buckets,
@@ -534,13 +531,7 @@ pub const Compressor = struct {
 
         const ms = &comp.c.ms;
         if (!ms.windowUpdate(chunk)) ms.next_to_update = ms.dict_limit;
-        if (comp.c.ldm) |ls| {
-            // Long-distance matching runs only one-shot (its window is the
-            // whole input).
-            std.debug.assert(ls.src.len == 0);
-            ls.src = chunk;
-            comp.c.ldm_origin = @intFromPtr(chunk.ptr);
-        }
+        if (comp.c.ldm) |ls| ls.windowUpdate(chunk);
 
         const c_size = comp.frameChunk(dst[fh_size..], chunk, last_chunk);
         comp.consumed += chunk.len;

@@ -27,10 +27,12 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/compress/zstd_opt.c             no-dictionary binary-tree match
                                       finder, price model and optimal
                                       parser (btopt/btultra/btultra2), with
-                                      its long-distance candidates          -> src/opt.zig
+                                      its long-distance candidates, and
+                                      their extDict variants                -> src/opt.zig
   lib/compress/zstd_ldm.c,            long-distance matching: gear rolling
   lib/compress/zstd_ldm_geartab.h     hash and its table, bucketed match
-                                      table, sequence generation            -> src/ldm.zig
+                                      table, sequence generation (prefix
+                                      and extDict)                          -> src/ldm.zig
   lib/compress/zstd_compress_internal.h  window helpers, hashes, ZSTD_count,
                                       seqStore, repcode handling            -> src/match.zig, src/sequences.zig
   lib/compress/zstd_compress.c        frame/block driver (compressContinue,
@@ -57,8 +59,7 @@ Each of those files says so in its first line
 and `src/testdata/` are this collection's own work (MIT).
 
 Not taken: libzstd's decoder (std has one), dictionaries, long-distance
-matching below `btopt`, multithreading, the extDict variants of the optimal
-parsers, `targetCBlockSize` super-blocks.
+matching below `btopt`, multithreading, `targetCBlockSize` super-blocks.
 
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and

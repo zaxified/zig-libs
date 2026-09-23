@@ -262,6 +262,14 @@ inline fn btMask(ms: *const MatchState) u32 {
     return (@as(u32, 1) << @intCast(ms.cp.chain_log - 1)) - 1;
 }
 
+/// `ZSTD_readMINMATCH(ip) == ZSTD_readMINMATCH(dictBase + rep_index)`.
+inline fn readMinMatchDict(ms: *const MatchState, curr: usize, rep_index: usize, dict_limit: u32, comptime length: u32) bool {
+    std.debug.assert(rep_index < dict_limit);
+    const a = ms.read32(curr);
+    const b = ms.read32Seg(rep_index, dict_limit);
+    return if (length == 3) a << 8 == b << 8 else a == b;
+}
+
 /// `ZSTD_readMINMATCH`: the first 3 or 4 bytes, comparable as one number.
 inline fn readMinMatch(ms: *const MatchState, idx: usize, comptime length: u32) u32 {
     return if (length == 3) ms.read32(idx) << 8 else ms.read32(idx);
@@ -283,9 +291,25 @@ fn insertAndFindFirstIndexHash3(ms: *MatchState, next_to_update3: *u32, ip: u32)
     return table3[hash3(ms, ip, hash_log3)];
 }
 
-/// `ZSTD_insertBt1` (noDict): sort `curr` into the tree. Returns how many
-/// positions the caller may skip (more than 1 inside long repetitions).
-fn insertBt1(ms: *MatchState, curr: u32, iend: usize, target: u32, comptime mls: u32) u32 {
+/// The byte at index `idx`: from the extDict below `dict_limit` when `ext`.
+inline fn byteAt(ms: *const MatchState, idx: usize, dict_limit: u32, comptime ext: bool) u8 {
+    return if (ext) ms.atSeg(idx, dict_limit) else ms.at(idx);
+}
+
+/// `ZSTD_count` from `curr` against the candidate at `match_index` (both
+/// `match_length` bytes in): with an extDict (`ext`) a candidate below its
+/// end counts on into the prefix.
+inline fn countFrom(ms: *const MatchState, curr: usize, match_index: usize, match_length: usize, iend: usize, dict_limit: u32, comptime ext: bool) usize {
+    if (!ext or match_index + match_length >= dict_limit)
+        return ms.count(curr + match_length, match_index + match_length, iend);
+    return ms.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
+}
+
+/// `ZSTD_insertBt1` (noDict, or extDict when `ext`): sort `curr`, which is
+/// in the prefix, into the tree. Returns how many positions the caller may
+/// skip (more than 1 inside long repetitions).
+fn insertBt1(ms: *MatchState, curr: u32, iend: usize, target: u32, comptime mls: u32, comptime ext: bool) u32 {
+    const dict_limit = ms.dict_limit;
     const hash_table = ms.hash_table;
     const h = ms.hash(curr, ms.cp.hash_log, mls);
     const bt = ms.chain_table;
@@ -312,7 +336,7 @@ fn insertBt1(ms: *MatchState, curr: u32, iend: usize, target: u32, comptime mls:
         const next_slot = 2 * @as(usize, match_index & bt_mask);
         var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
         std.debug.assert(match_index < curr);
-        match_length += ms.count(curr + match_length, match_index + match_length, iend);
+        match_length += countFrom(ms, curr, match_index, match_length, iend, dict_limit, ext);
 
         if (match_length > best_length) {
             best_length = match_length;
@@ -324,7 +348,7 @@ fn insertBt1(ms: *MatchState, curr: u32, iend: usize, target: u32, comptime mls:
         // miss a bit of compression, but other solutions can corrupt the tree.
         if (curr + match_length == iend) break;
 
-        if (ms.at(match_index + match_length) < ms.at(curr + match_length)) {
+        if (byteAt(ms, match_index + match_length, dict_limit, ext) < ms.at(curr + match_length)) {
             // match is smaller than current
             smaller_ptr.* = match_index; // update smaller idx
             common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
@@ -356,15 +380,16 @@ fn insertBt1(ms: *MatchState, curr: u32, iend: usize, target: u32, comptime mls:
 }
 
 /// `ZSTD_updateTree_internal`: insert every position up to `ip`.
-fn updateTree(ms: *MatchState, ip: u32, iend: usize, comptime mls: u32) void {
+fn updateTree(ms: *MatchState, ip: u32, iend: usize, comptime mls: u32, comptime ext: bool) void {
     var idx = ms.next_to_update;
-    while (idx < ip) idx += insertBt1(ms, idx, iend, ip, mls);
+    while (idx < ip) idx += insertBt1(ms, idx, iend, ip, mls, ext);
     ms.next_to_update = ip;
 }
 
-/// `ZSTD_insertBtAndGetAllMatches` (noDict): insert `curr` and list its
-/// matches, each longer than the one before, into `matches`. Returns how many.
-fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: *u32, curr: u32, i_limit: usize, rep: *const [3]u32, ll0: bool, length_to_beat: u32, comptime mls: u32) u32 {
+/// `ZSTD_insertBtAndGetAllMatches` (noDict, or extDict when `ext`): insert
+/// `curr` and list its matches, each longer than the one before, into
+/// `matches`. Returns how many.
+fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: *u32, curr: u32, i_limit: usize, rep: *const [3]u32, ll0: bool, length_to_beat: u32, comptime mls: u32, comptime ext: bool) u32 {
     const sufficient_len = @min(ms.cp.target_length, opt_num - 1);
     const min_match: u32 = if (mls == 3) 3 else 4;
     const hash_table = ms.hash_table;
@@ -404,8 +429,16 @@ fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: 
                 if (rep_index >= window_low and readMinMatch(ms, curr, min_match) == readMinMatch(ms, curr - rep_offset, min_match)) {
                     rep_len = @intCast(ms.count(curr + min_match, curr + min_match - rep_offset, i_limit) + min_match);
                 }
+            } else if (ext) { // repIndex < dictLimit || repIndex >= curr
+                std.debug.assert(curr >= window_low);
+                // `curr > repIndex >= windowLow`, and the bytes do not
+                // straddle the extDict's end
+                if (rep_offset -% 1 < curr - window_low and match.indexOverlapCheck(dict_limit, rep_index) and
+                    readMinMatchDict(ms, curr, rep_index, dict_limit, min_match))
+                {
+                    rep_len = @intCast(ms.count2Segments(@as(usize, curr) + min_match, @as(usize, rep_index) + min_match, i_limit, dict_limit, dict_limit) + min_match);
+                }
             }
-            // no extDict / dictMatchState: nothing else to check
             if (rep_len > best_length) {
                 best_length = rep_len;
                 matches[mnum] = .{ .off = rep_code - @intFromBool(ll0) + 1, .len = rep_len }; // REPCODE_TO_OFFBASE
@@ -422,7 +455,10 @@ fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: 
         const match_index3 = insertAndFindFirstIndexHash3(ms, next_to_update3, curr);
         // heuristic: longer distance likely too expensive
         if (match_index3 >= match_low and curr - match_index3 < (1 << 18)) {
-            const mlen = ms.count(curr, match_index3, i_limit);
+            const mlen = if (!ext or match_index3 >= dict_limit)
+                ms.count(curr, match_index3, i_limit)
+            else
+                ms.count2Segments(curr, match_index3, i_limit, dict_limit, dict_limit);
             if (mlen >= mls) {
                 best_length = mlen;
                 std.debug.assert(curr > match_index3);
@@ -444,7 +480,7 @@ fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: 
         const next_slot = 2 * @as(usize, match_index & bt_mask);
         var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
         std.debug.assert(curr > match_index);
-        match_length += ms.count(curr + match_length, match_index + match_length, i_limit);
+        match_length += countFrom(ms, curr, match_index, match_length, i_limit, dict_limit, ext);
 
         if (match_length > best_length) {
             std.debug.assert(match_end_idx > match_index);
@@ -457,7 +493,7 @@ fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: 
             if (match_length > opt_num or curr + match_length == i_limit) break; // drop, to preserve bt consistency (miss a little bit of compression)
         }
 
-        if (ms.at(match_index + match_length) < ms.at(curr + match_length)) {
+        if (byteAt(ms, match_index + match_length, dict_limit, ext) < ms.at(curr + match_length)) {
             // match smaller than current
             smaller_ptr.* = match_index; // update smaller idx
             common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
@@ -487,10 +523,10 @@ fn insertBtAndGetAllMatches(matches: []Match, ms: *MatchState, next_to_update3: 
 }
 
 /// `ZSTD_btGetAllMatches_internal`.
-inline fn getAllMatches(matches: []Match, ms: *MatchState, next_to_update3: *u32, ip: u32, i_high_limit: usize, rep: *const [3]u32, ll0: bool, length_to_beat: u32, comptime mls: u32) u32 {
+inline fn getAllMatches(matches: []Match, ms: *MatchState, next_to_update3: *u32, ip: u32, i_high_limit: usize, rep: *const [3]u32, ll0: bool, length_to_beat: u32, comptime mls: u32, comptime ext: bool) u32 {
     if (ip < ms.next_to_update) return 0; // skipped area
-    updateTree(ms, ip, i_high_limit, mls);
-    return insertBtAndGetAllMatches(matches, ms, next_to_update3, ip, i_high_limit, rep, ll0, length_to_beat, mls);
+    updateTree(ms, ip, i_high_limit, mls, ext);
+    return insertBtAndGetAllMatches(matches, ms, next_to_update3, ip, i_high_limit, rep, ll0, length_to_beat, mls, ext);
 }
 
 // ---------------------------------------------------------------------------
@@ -586,8 +622,12 @@ const OptLdm = struct {
 
 /// Compress one block with `btopt` (`opt_level` 0) or `btultra` (2).
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime opt_level: u32) usize {
+    if (ms.hasExtDict()) ms.n_ext_dict_blocks += 1;
     return switch (std.math.clamp(ms.cp.min_match, 3, 6)) {
-        inline 3, 4, 5, 6 => |m| optGeneric(ms, ss, rep, istart, src_size, opt_level, m),
+        inline 3, 4, 5, 6 => |m| if (ms.hasExtDict())
+            optGeneric(ms, ss, rep, istart, src_size, opt_level, m, true)
+        else
+            optGeneric(ms, ss, rep, istart, src_size, opt_level, m, false),
         else => unreachable,
     };
 }
@@ -629,7 +669,7 @@ fn initStatsUltra(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src
 }
 
 /// `ZSTD_compressBlock_opt_generic` (noDict).
-fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime opt_level: u32, comptime mls: u32) usize {
+fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime opt_level: u32, comptime mls: u32, comptime ext: bool) usize {
     const st = ms.opt.?;
     var ip: u32 = istart;
     var anchor: u32 = istart;
@@ -659,7 +699,7 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
             {
                 const litlen = ip - anchor;
                 const ll0 = litlen == 0;
-                var nb_matches = getAllMatches(matches, ms, &next_to_update3, ip, iend, rep, ll0, min_match, mls);
+                var nb_matches = getAllMatches(matches, ms, &next_to_update3, ip, iend, rep, ll0, min_match, mls, ext);
                 opt_ldm.processMatchCandidate(matches, &nb_matches, ip - istart, @intCast(iend - ip), min_match);
                 if (nb_matches == 0) {
                     ip += 1;
@@ -777,7 +817,7 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
                     const ll0 = opt[cur].litlen == 0;
                     const previous_price = opt[cur].price;
                     const base_price = previous_price + litLengthPrice(st, 0, opt_level);
-                    var nb_matches = getAllMatches(matches, ms, &next_to_update3, inr, iend, &opt[cur].rep, ll0, min_match, mls);
+                    var nb_matches = getAllMatches(matches, ms, &next_to_update3, inr, iend, &opt[cur].rep, ll0, min_match, mls, ext);
                     opt_ldm.processMatchCandidate(matches, &nb_matches, inr - istart, @intCast(iend - inr), min_match);
                     if (nb_matches == 0) continue;
 

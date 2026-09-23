@@ -206,6 +206,8 @@ pub const lazy_stream_levels = [_]i32{ 4, 5, 6, 7, 8, 9, 10 };
 const lazy_levels: []const i32 = &lazy_stream_levels;
 /// Without a pledged size level 4 is dfast (the table for inputs over 256 KB).
 const lazy_only_levels: []const i32 = lazy_stream_levels[1..];
+/// btopt, btultra, btultra2 without a pledged size, 22 with LDM.
+const opt_levels: []const i32 = &.{ 16, 18, 19, 22 };
 
 pub const stream_cases = [_]StreamCase{
     .{ .case = "empty", .schedule = "e*" }, // pledged 0: the one-shot shortcut
@@ -253,6 +255,19 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "split-margin", .schedule = "x,p400000,w14,c2230,c7,c4,c44823,c1546,f43664,c115585,f1125,c31499,c6933,c65582,c3986,c9187,c475,c23209,c7,c3,c14831,c10841,c12647,f3477,c6978,c575,c326,f159,c171,c102,c14,f2,c5,c0,c6,c0,c0,f1,e0", .levels = &.{8}, .ext_dict = &.{8} }, // ... down to just above it
     .{ .case = "mix-140000-1", .schedule = "x,w13,c3797,c36559,f33578,c5,f24157,c19101,e22803", .levels = &.{6}, .ext_dict = &.{6}, .corrects = false }, // lazy skipping from a step of 9, not 8
     .{ .case = "mix-43", .schedule = "x,w17,c123076,f4272,c48374,f288,c67,f4530,c376,f43560,c60468,f115,e14874", .levels = &.{9}, .ext_dict = &.{9}, .corrects = false }, // rows: the hash cache is refilled after lazy skipping
+    // The optimal parsers (levels 11-22) and long-distance matching over a
+    // two-segment window:
+    .{ .case = "mix-300000-9", .schedule = "w14,c*,e0", .levels = opt_levels, .ext_dict = opt_levels }, // unknown size: btopt from level 16
+    .{ .case = "skewed-16384-2", .schedule = "p16384,w10,c3000,f0,c*,e0", .levels = &.{ 11, 13, 16, 19, 22 }, .ext_dict = &.{ 11, 13, 16, 19, 22 } }, // pledged <= 16 KB: btopt from level 11
+    .{ .case = "two-symbols-200000", .schedule = "w13,c1000,f0,c7777,f0,c*,e0", .levels = opt_levels, .ext_dict = opt_levels }, // minMatch 3: the 3-byte hash across both segments
+    .{ .case = "csv-200000-0", .schedule = "l,w15,c*,e0", .levels = opt_levels, .ext_dict = opt_levels }, // LDM by hand: its window wraps too
+    .{ .case = "far-mix-5", .schedule = "l,w18,c300000,f0,c*,e0", .levels = &.{ 16, 19 }, .ext_dict = &.{ 16, 19 } }, // offsets past 2^20, LDM matches into the extDict
+    .{ .case = "mix-300000-9", .schedule = "x,p300000,l,w12,c*,e0", .levels = &.{ 16, 19 }, .ext_dict = &.{ 16, 19 } }, // both windows corrected for overflow
+    // ... found by a seed search over schedules (original against mutant):
+    .{ .case = "mix-300000-28", .schedule = "l,w18,o1000,f52800,c7,c24476,c8,c10,f68511,c2247,c49127,c49898,c8741,c58,c168,e43949", .levels = &.{21}, .ext_dict = &.{21} }, // LDM: a candidate in the extDict extends backwards to the window's low limit
+    .{ .case = "split-margin", .schedule = "l,w17,f35551,c10,f105190,c25472,c1,c1,f138968,f2984,c2378,c28907,c212,c23,c50027,e10276", .levels = &.{18}, .ext_dict = &.{18} }, // LDM: candidates are valid down to the low limit, not the prefix
+    .{ .case = "csv-131072", .schedule = "p131072,w10,c74508,c24956,e31608", .levels = &.{21}, .ext_dict = &.{21} }, // a 3-byte-hash match from the extDict goes on at the prefix's first byte
+    .{ .case = "mix-70000-0", .schedule = "x,l,w13,c16208,f34666,c9,f4384,c3296,c4130,f4398,e2909", .levels = &.{16}, .ext_dict = &.{16} }, // the LDM window's correction moves its extDict too
     // x: libzstd's frequent overflow correction, here of a two-segment window
     .{ .case = "mix-300000-9", .schedule = "x,w10,c*,e0", .ext_dict = all_stream_levels },
     .{ .case = "far-repeat", .schedule = "x,w14,c200000,f0,c*,e0", .ext_dict = all_stream_levels },

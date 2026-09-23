@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — Streaming at every level (SPEC backlog Z1c): the binary
+  tree of `btopt`/`btultra`/`btultra2` and the 3-byte hash across a
+  two-segment window, and long-distance matching over its own two-segment
+  window (`ZSTD_window_update` on the LDM window, forward and backward
+  counts across the boundary). `stream_max_level` equals `max_level`. New
+  test seam `Stream.ldm` / schedule token `l` (LDM by hand, as
+  `ZSTD_c_enableLongDistanceMatching`); level 22 on an unknown-size 150 MB
+  stream (window 128 MB wrapped, LDM on by itself) matched libzstd.
+
 - **2026-09-23** — Streaming up to level 10 (SPEC backlog Z1b): the extDict
   parser of `greedy` … `btlazy2` (`ZSTD_compressBlock_lazy_extDict_generic`)
   and the hash-chain, row and binary-tree searches across two segments.

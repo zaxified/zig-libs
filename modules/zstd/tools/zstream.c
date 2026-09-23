@@ -12,6 +12,8 @@
  *   cN   ZSTD_e_continue with the next N input bytes ("c*": all the rest)
  *   fN   ZSTD_e_flush, likewise
  *   eN   ZSTD_e_end, likewise; ends the schedule
+ *   l    long-distance matching switched on by hand
+ *        (ZSTD_c_enableLongDistanceMatching; the module's `Stream.ldm`)
  *   x    index overflow corrected whenever it safely can: only accepted by a
  *        build with -DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1 (the
  *        module's `Stream.overflow_correct_frequently`)
@@ -69,6 +71,7 @@ int main(int argc, char** argv)
 #endif
             continue;
         }
+        if (op == 'l') { ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1); continue; }
         size_t const num = tok[1] == '*' ? (size_t)n - fed : (size_t)strtoull(tok + 1, NULL, 10);
         if (op == 'p') { ZSTD_CCtx_setPledgedSrcSize(cctx, num); continue; }
         if (op == 'w') { ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, (int)num); continue; }

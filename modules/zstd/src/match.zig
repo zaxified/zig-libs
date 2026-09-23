@@ -113,46 +113,9 @@ pub const MatchState = struct {
         return ms.low_limit < ms.dict_limit;
     }
 
-    /// `ZSTD_window_update`: `chunk` is the next input to compress. Where
-    /// it does not follow the prefix in memory (a stream's input buffer
-    /// wrapped, or a new buffer), the prefix becomes the extDict and the
-    /// chunk starts a new prefix at the next index. Input that overwrites
-    /// the extDict's memory raises `low_limit` past it. Returns whether the
-    /// chunk was contiguous.
+    /// `ZSTD_window_update` (see `updateWindow`).
     pub fn windowUpdate(ms: *MatchState, chunk: []const u8) bool {
-        if (chunk.len == 0) return true;
-        var contiguous = true;
-        // A fresh window's `nextSrc` points at nothing, so the first chunk
-        // takes this path too (and changes nothing but the base).
-        if (ms.src.len == 0 or @intFromPtr(chunk.ptr) != @intFromPtr(ms.src.ptr) + ms.src.len) {
-            const distance_from_base: u32 = @intCast(ms.src_base + ms.src.len);
-            ms.low_limit = ms.dict_limit;
-            ms.dict_limit = distance_from_base;
-            ms.dict = ms.src;
-            ms.dict_base = ms.src_base;
-            const buf = @intFromPtr(ms.buffer.ptr);
-            const old = @intFromPtr(ms.src.ptr);
-            if (ms.src.len != 0 and old >= buf and old + ms.src.len <= buf + ms.buffer.len)
-                ms.dict = ms.src.ptr[0 .. buf + ms.buffer.len - old];
-            ms.src = chunk[0..0];
-            ms.src_base = distance_from_base;
-            // too small extDict
-            if (ms.dict_limit - ms.low_limit < hash_read_size) ms.low_limit = ms.dict_limit;
-            contiguous = false;
-        }
-        ms.src = ms.src.ptr[0 .. ms.src.len + chunk.len];
-        // if input and dictionary overlap: reduce dictionary (area presumed
-        // modified by input)
-        if (ms.low_limit < ms.dict_limit) {
-            const dict_origin: i128 = @as(i128, @intFromPtr(ms.dict.ptr)) - ms.dict_base; // dictBase
-            const ip: i128 = @intFromPtr(chunk.ptr);
-            const iend: i128 = ip + chunk.len;
-            if (iend > dict_origin + ms.low_limit and ip < dict_origin + ms.dict_limit) {
-                const high_input_idx = iend - dict_origin;
-                ms.low_limit = if (high_input_idx > ms.dict_limit) ms.dict_limit else @intCast(high_input_idx);
-            }
-        }
-        return contiguous;
+        return updateWindow(ms, chunk);
     }
 
     /// `ZSTD_getLowestMatchIndex` without a dictionary.
@@ -272,9 +235,53 @@ pub const MatchState = struct {
     }
 };
 
+/// `ZSTD_window_update` of a match state or the LDM state (anything with
+/// the window fields `src`, `src_base`, `dict`, `dict_base`, `buffer`,
+/// `low_limit`, `dict_limit`): `chunk` is the next input to compress. Where
+/// it does not follow the prefix in memory (a stream's input buffer
+/// wrapped, or a new buffer), the prefix becomes the extDict and the
+/// chunk starts a new prefix at the next index. Input that overwrites
+/// the extDict's memory raises `low_limit` past it. Returns whether the
+/// chunk was contiguous.
+pub fn updateWindow(ms: anytype, chunk: []const u8) bool {
+    if (chunk.len == 0) return true;
+    var contiguous = true;
+    // A fresh window's `nextSrc` points at nothing, so the first chunk
+    // takes this path too (and changes nothing but the base).
+    if (ms.src.len == 0 or @intFromPtr(chunk.ptr) != @intFromPtr(ms.src.ptr) + ms.src.len) {
+        const distance_from_base: u32 = @intCast(ms.src_base + ms.src.len);
+        ms.low_limit = ms.dict_limit;
+        ms.dict_limit = distance_from_base;
+        ms.dict = ms.src;
+        ms.dict_base = ms.src_base;
+        const buf = @intFromPtr(ms.buffer.ptr);
+        const old = @intFromPtr(ms.src.ptr);
+        if (ms.src.len != 0 and old >= buf and old + ms.src.len <= buf + ms.buffer.len)
+            ms.dict = ms.src.ptr[0 .. buf + ms.buffer.len - old];
+        ms.src = chunk[0..0];
+        ms.src_base = distance_from_base;
+        // too small extDict
+        if (ms.dict_limit - ms.low_limit < hash_read_size) ms.low_limit = ms.dict_limit;
+        contiguous = false;
+    }
+    ms.src = ms.src.ptr[0 .. ms.src.len + chunk.len];
+    // if input and dictionary overlap: reduce dictionary (area presumed
+    // modified by input)
+    if (ms.low_limit < ms.dict_limit) {
+        const dict_origin: i128 = @as(i128, @intFromPtr(ms.dict.ptr)) - ms.dict_base; // dictBase
+        const ip: i128 = @intFromPtr(chunk.ptr);
+        const iend: i128 = ip + chunk.len;
+        if (iend > dict_origin + ms.low_limit and ip < dict_origin + ms.dict_limit) {
+            const high_input_idx = iend - dict_origin;
+            ms.low_limit = if (high_input_idx > ms.dict_limit) ms.dict_limit else @intCast(high_input_idx);
+        }
+    }
+    return contiguous;
+}
+
 /// Indices of `seg` (whose first byte is index `base.*`) drop by
 /// `correction`.
-fn shiftSegment(seg: *[]const u8, base: *u32, correction: u32) void {
+pub fn shiftSegment(seg: *[]const u8, base: *u32, correction: u32) void {
     if (base.* >= correction + window_start) {
         base.* -= correction;
     } else {
@@ -369,9 +376,8 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             else => dfastExtDictBlock(ms, ss, rep, istart, src_size, 4),
         },
         .greedy, .lazy, .lazy2, .btlazy2 => return lazy.compressBlock(ms, ss, rep, istart, src_size),
-        // Only streams make an extDict, and they refuse the optimal
-        // parsers for now (stream.zig).
-        else => unreachable,
+        // the optimal parsers pick their extDict variant themselves
+        else => {},
     };
     return switch (ms.cp.strategy) {
         .fast => switch (mls) {

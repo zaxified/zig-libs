@@ -50,10 +50,8 @@ pub const Options = struct {
     pledged_size: ?u64 = null,
 };
 
-/// The highest level a stream accepts for now: levels up to 10 use
-/// `fast` .. `btlazy2` for every input size (level 11 is `btopt` on inputs
-/// of 16 KB or less), the match finders whose extDict variants are ported.
-pub const max_level = 10;
+/// The highest level a stream accepts: every level, as one-shot.
+pub const max_level = params.max_level;
 
 pub const Error = error{
     /// Level above `max_level`.
@@ -92,6 +90,10 @@ pub const Stream = struct {
     /// overflow_correct_frequently`), which reaches the correction of a
     /// two-segment window within kilobytes.
     overflow_correct_frequently: bool = false,
+    /// Test seam, set before the first call: long-distance matching switched
+    /// on by hand (`frame.Options.ldm`), which reaches LDM over a small
+    /// window. Only for `btopt` and up.
+    ldm: bool = false,
 
     /// Nothing is allocated until the first `compressStream2`, which knows
     /// whether that call ends the frame (and so the size).
@@ -127,12 +129,12 @@ pub const Stream = struct {
     /// block in and one compressed block out.
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
         const pledged: ?u64 = if (end_op == .end) in_size else s.opts.pledged_size;
-        const cp = params.getOverridden(s.opts.level, pledged orelse params.unknown_size, null, false, s.window_log);
-        std.debug.assert(@intFromEnum(cp.strategy) <= @intFromEnum(params.Strategy.btlazy2));
+        const cp = params.getOverridden(s.opts.level, pledged orelse params.unknown_size, null, s.ldm, s.window_log);
         var comp = try frame.Compressor.init(s.gpa, cp, pledged, .{
             .level = s.opts.level,
             .checksum = s.opts.checksum,
             .overflow_correct_frequently = s.overflow_correct_frequently,
+            .ldm = s.ldm,
         });
         errdefer comp.deinit();
         const window_size: usize = @intCast(@max(1, @min(@as(u64, 1) << @intCast(cp.window_log), pledged orelse std.math.maxInt(u64))));
@@ -146,6 +148,7 @@ pub const Stream = struct {
         const out_buff = try s.gpa.alloc(u8, frame.compressBound(block_size) + 1);
         s.comp = comp;
         s.comp.c.ms.buffer = in_buff;
+        if (s.comp.c.ldm) |ls| ls.buffer = in_buff;
         s.in_buff = in_buff;
         s.out_buff = out_buff;
         s.in_to_compress = 0;

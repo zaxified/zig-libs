@@ -122,7 +122,14 @@ const Candidate = struct {
 /// finder's (it is moved by the END of each block, the match state's by the
 /// start).
 pub const State = struct {
-    src: []const u8,
+    /// The window, as in `match.MatchState`: the prefix `src` from index
+    /// `src_base`, the extDict `dict` from `dict_base`, and a stream's input
+    /// buffer (`match.updateWindow`).
+    src: []const u8 = &.{},
+    src_base: u32 = match.window_start,
+    dict: []const u8 = &.{},
+    dict_base: u32 = match.window_start,
+    buffer: []const u8 = &.{},
     p: Params,
     /// `1 << hash_log` entries, `1 << bucket_size_log` per bucket
     hash_table: []Entry,
@@ -130,22 +137,39 @@ pub const State = struct {
     bucket_offsets: []u8,
     low_limit: u32 = match.window_start,
     dict_limit: u32 = match.window_start,
-    /// `window.nbOverflowCorrections`, and the sum of the corrections: index
-    /// `i` names input byte `i - window_start + base`, and `src` starts at
-    /// input byte `base`.
+    /// `window.nbOverflowCorrections`.
     n_overflow_corrections: u32 = 0,
-    base: usize = 0,
+    /// Chunks searched with the window in two segments. Not libzstd's;
+    /// tests read it.
+    n_ext_dict_chunks: u32 = 0,
     /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY` (see `match.needOverflowCorrection`).
     overflow_correct_frequently: bool = false,
     split_indices: [batch_size]usize = undefined,
     candidates: [batch_size]Candidate = undefined,
 
-    fn index(ls: *const State, pos: usize) usize {
-        return pos + match.window_start - ls.base;
+    /// The index of the prefix byte at `ptr`.
+    fn indexOf(ls: *const State, ptr: [*]const u8) usize {
+        return ls.src_base + (@intFromPtr(ptr) - @intFromPtr(ls.src.ptr));
     }
 
-    inline fn at(ls: *const State, idx: usize) u8 {
-        return ls.src[idx - match.window_start];
+    fn bytes(ls: *const State, idx: usize, len: usize) []const u8 {
+        return ls.src[idx - ls.src_base ..][0..len];
+    }
+
+    /// The byte at `idx`, from the extDict below `dict_limit`.
+    inline fn atSeg(ls: *const State, idx: usize) u8 {
+        return if (idx < ls.dict_limit) ls.dict[idx - ls.dict_base] else ls.src[idx - ls.src_base];
+    }
+
+    /// Address of the byte at index `idx` in the segment `in_dict` names:
+    /// libzstd compares segment bounds as pointers.
+    fn addr(ls: *const State, idx: usize, in_dict: bool) usize {
+        return if (in_dict) @intFromPtr(ls.dict.ptr) + idx - ls.dict_base else @intFromPtr(ls.src.ptr) + idx - ls.src_base;
+    }
+
+    /// `ZSTD_window_update` of the LDM window.
+    pub fn windowUpdate(ls: *State, chunk: []const u8) void {
+        _ = match.updateWindow(ls, chunk);
     }
 
     /// `ZSTD_ldm_insertEntry`.
@@ -159,9 +183,9 @@ pub const State = struct {
     /// at or past `p_limit` on the `p_in` side.
     fn count(ls: *const State, p_in: usize, p_match: usize, p_limit: usize) usize {
         const s = ls.src;
-        var i = p_in - match.window_start;
-        var m = p_match - match.window_start;
-        const lim = p_limit - match.window_start;
+        var i = p_in - ls.src_base;
+        var m = p_match - ls.src_base;
+        const lim = p_limit - ls.src_base;
         const start = i;
         while (i + 8 <= lim) {
             const d = std.mem.readInt(u64, s[i..][0..8], .little) ^ std.mem.readInt(u64, s[m..][0..8], .little);
@@ -182,7 +206,7 @@ pub const State = struct {
     fn countBackwards(ls: *const State, p_in_start: usize, p_anchor: usize, p_match_start: usize, p_match_base: usize) usize {
         var p_in = p_in_start;
         var p_match = p_match_start;
-        while (p_in > p_anchor and p_match > p_match_base and ls.at(p_in - 1) == ls.at(p_match - 1)) {
+        while (p_in > p_anchor and p_match > p_match_base and ls.atSeg(p_in - 1) == ls.atSeg(p_match - 1)) {
             p_in -= 1;
             p_match -= 1;
         }
@@ -199,17 +223,41 @@ pub const State = struct {
         }
     }
 
+    /// `ZSTD_count_2segments` for a candidate in the extDict (`m_end` its
+    /// end); in the prefix (`m_end == i_end`) a plain count.
+    fn count2Segments(ls: *const State, p_in: usize, p_match: usize, i_end: usize, m_end: usize, i_start: usize) usize {
+        if (m_end == i_end) return ls.count(p_in, p_match, i_end);
+        const v_end = if (p_match > m_end) p_in else @min(p_in + (m_end - p_match), i_end);
+        var n: usize = 0;
+        while (p_in + n < v_end and ls.src[p_in + n - ls.src_base] == ls.dict[p_match + n - ls.dict_base]) n += 1;
+        if (p_match + n != m_end) return n;
+        return n + ls.count(p_in + n, i_start, i_end);
+    }
+
+    /// `ZSTD_ldm_countBackwardsMatch_2segments`: on reaching the prefix's
+    /// start, go on from the extDict's end — unless the match was in the
+    /// extDict, or (a pointer comparison in libzstd) the two segments'
+    /// starts are one address.
+    fn countBackwards2Segments(ls: *const State, p_in: usize, p_anchor: usize, p_match: usize, p_match_base: usize, match_in_dict: bool) usize {
+        var match_length = ls.countBackwards(p_in, p_anchor, p_match, p_match_base);
+        const dict_start: usize = ls.low_limit;
+        if (p_match - match_length != p_match_base or ls.addr(p_match_base, match_in_dict) == ls.addr(dict_start, true)) return match_length;
+        match_length += ls.countBackwards(p_in - match_length, p_anchor, ls.dict_limit, dict_start);
+        return match_length;
+    }
+
     /// `ZSTD_ldm_reduceTable`.
     fn reduceTable(ls: *State, reducer: u32) void {
         for (ls.hash_table) |*e| e.offset = if (e.offset < reducer) 0 else e.offset - reducer;
     }
 
-    /// `ZSTD_ldm_generateSequences`: the raw sequences of the block at input
-    /// position `pos`, `src_size` bytes long, into `out` (whose capacity is
-    /// `maxNbSeq`). The table keeps what it learnt for later blocks. The
-    /// position, not an index: this window's indices drift from the match
-    /// state's once either is corrected for overflow.
-    pub fn generateSequences(ls: *State, out: *RawSeqStore, pos: usize, src_size: usize) void {
+    /// `ZSTD_ldm_generateSequences`: the raw sequences of `block`, which is
+    /// in this window's prefix, into `out` (whose capacity is `maxNbSeq`).
+    /// The table keeps what it learnt for later blocks. Indices are this
+    /// window's own: they drift from the match state's once either is
+    /// corrected for overflow.
+    pub fn generateSequences(ls: *State, out: *RawSeqStore, block: []const u8) void {
+        const src_size = block.len;
         const k_max_chunk_size: usize = 1 << 20;
         const max_dist: u32 = @as(u32, 1) << @intCast(ls.p.window_log);
         const nb_chunks = src_size / k_max_chunk_size + @intFromBool(src_size % k_max_chunk_size != 0);
@@ -217,22 +265,25 @@ pub const State = struct {
         std.debug.assert(out.pos <= out.size and out.size <= out.seq.len);
         var chunk: usize = 0;
         while (chunk < nb_chunks and out.size < out.seq.len) : (chunk += 1) {
-            const chunk_pos = pos + chunk * k_max_chunk_size;
+            const chunk_ptr = block.ptr + chunk * k_max_chunk_size;
             const chunk_size = @min(src_size - chunk * k_max_chunk_size, k_max_chunk_size);
             const prev_size = out.size;
             // 1. Perform overflow correction if necessary.
-            if (match.needOverflowCorrection(ls.overflow_correct_frequently, ls.n_overflow_corrections, 0, max_dist, ls.index(chunk_pos), ls.index(chunk_pos) + chunk_size)) {
-                const correction = match.correctOverflow(&ls.low_limit, &ls.dict_limit, &ls.n_overflow_corrections, ls.overflow_correct_frequently, 0, max_dist, @intCast(ls.index(chunk_pos)));
-                ls.src = ls.src[correction..];
-                ls.base += correction;
+            if (match.needOverflowCorrection(ls.overflow_correct_frequently, ls.n_overflow_corrections, 0, max_dist, ls.indexOf(chunk_ptr), ls.indexOf(chunk_ptr) + chunk_size)) {
+                const correction = match.correctOverflow(&ls.low_limit, &ls.dict_limit, &ls.n_overflow_corrections, ls.overflow_correct_frequently, 0, max_dist, @intCast(ls.indexOf(chunk_ptr)));
+                match.shiftSegment(&ls.src, &ls.src_base, correction);
+                match.shiftSegment(&ls.dict, &ls.dict_base, correction);
                 ls.reduceTable(correction);
             }
-            const chunk_start = ls.index(chunk_pos);
+            const chunk_start = ls.indexOf(chunk_ptr);
             const chunk_end = chunk_start + chunk_size;
             // 2. We enforce the maximum offset allowed.
             ls.enforceMaxDist(@intCast(chunk_end));
             // 3. Generate the sequences for the chunk, and get newLeftoverSize.
-            const new_leftover_size = ls.generateInternal(out, chunk_start, chunk_size);
+            const new_leftover_size = if (ls.low_limit < ls.dict_limit) blk: {
+                ls.n_ext_dict_chunks += 1;
+                break :blk ls.generateInternal(out, chunk_start, chunk_size, true);
+            } else ls.generateInternal(out, chunk_start, chunk_size, false);
             // 4. Prepend the leftover literals from the last call.
             if (prev_size < out.size) {
                 out.seq[prev_size].lit_length += @intCast(leftover_size);
@@ -244,14 +295,14 @@ pub const State = struct {
         }
     }
 
-    /// `ZSTD_ldm_generateSequences_internal` (no extDict). Returns the
-    /// trailing literals of the chunk.
-    fn generateInternal(ls: *State, out: *RawSeqStore, istart: usize, src_size: usize) usize {
+    /// `ZSTD_ldm_generateSequences_internal` (extDict when `ext`). Returns
+    /// the trailing literals of the chunk.
+    fn generateInternal(ls: *State, out: *RawSeqStore, istart: usize, src_size: usize, comptime ext: bool) usize {
         const min_match_length = ls.p.min_match_length;
         const ents_per_bucket = @as(usize, 1) << @intCast(ls.p.bucket_size_log);
         const h_bits: u5 = @intCast(ls.p.hash_log - ls.p.bucket_size_log);
         const dict_limit = ls.dict_limit;
-        const lowest_index = dict_limit;
+        const lowest_index = if (ext) ls.low_limit else dict_limit;
         const low_prefix: usize = dict_limit;
         const iend = istart + src_size;
         var anchor = istart;
@@ -261,16 +312,16 @@ pub const State = struct {
 
         // Initialize the rolling hash state with the first minMatchLength bytes
         var hs: GearState = .init(ls.p);
-        hs.reset(ls.src[istart - match.window_start ..][0..min_match_length]);
+        hs.reset(ls.bytes(istart, min_match_length));
         var ip = istart + min_match_length;
 
         while (ip < ilimit) {
             var num_splits: usize = 0;
-            const hashed = hs.feed(ls.src[ip - match.window_start .. ilimit - match.window_start], &ls.split_indices, &num_splits);
+            const hashed = hs.feed(ls.bytes(ip, ilimit - ip), &ls.split_indices, &num_splits);
 
             for (ls.split_indices[0..num_splits], ls.candidates[0..num_splits]) |s, *c| {
                 const split = ip + s - min_match_length;
-                const xxhash = std.hash.XxHash64.hash(0, ls.src[split - match.window_start ..][0..min_match_length]);
+                const xxhash = std.hash.XxHash64.hash(0, ls.bytes(split, min_match_length));
                 c.* = .{
                     .split = @intCast(split),
                     .hash = @as(u32, @truncate(xxhash)) & ((@as(u32, 1) << h_bits) - 1),
@@ -298,9 +349,20 @@ pub const State = struct {
                 for (bucket) |cur| {
                     if (cur.checksum != c.checksum or cur.offset <= lowest_index) continue;
                     const p_match: usize = cur.offset;
-                    const cur_forward = ls.count(split, p_match, iend);
-                    if (cur_forward < min_match_length) continue;
-                    const cur_backward = ls.countBackwards(split, anchor, p_match, low_prefix);
+                    var cur_forward: usize = undefined;
+                    var cur_backward: usize = undefined;
+                    if (ext) {
+                        const in_dict = cur.offset < dict_limit;
+                        const match_end: usize = if (in_dict) dict_limit else iend;
+                        const low_match: usize = if (in_dict) ls.low_limit else low_prefix;
+                        cur_forward = ls.count2Segments(split, p_match, iend, match_end, low_prefix);
+                        if (cur_forward < min_match_length) continue;
+                        cur_backward = ls.countBackwards2Segments(split, anchor, p_match, low_match, in_dict);
+                    } else {
+                        cur_forward = ls.count(split, p_match, iend);
+                        if (cur_forward < min_match_length) continue;
+                        cur_backward = ls.countBackwards(split, anchor, p_match, low_prefix);
+                    }
                     const cur_total = cur_forward + cur_backward;
                     if (cur_total > best_match_length) {
                         best_match_length = cur_total;
@@ -339,7 +401,7 @@ pub const State = struct {
                 // repeating, overlapping pattern (e.g. all zeros): skip over
                 // it instead of inserting every repetition.
                 if (anchor > ip + hashed) {
-                    hs.reset(ls.src[anchor - min_match_length - match.window_start ..][0..min_match_length]);
+                    hs.reset(ls.bytes(anchor - min_match_length, min_match_length));
                     // Continue the outer loop at anchor (ip + hashed == anchor).
                     ip = anchor - hashed;
                     break;

@@ -20,7 +20,10 @@ const Run = struct {
     out: []u8,
     /// Blocks compressed with the window in two segments.
     ext_dict_blocks: u32,
+    /// Of the match state and, with LDM, its window.
     overflow_corrections: u32,
+    /// LDM chunks searched over two segments.
+    ldm_ext_dict_chunks: u32,
 };
 
 /// Drive a stream over `src` as `tools/zstream.c` does for `schedule`.
@@ -34,12 +37,18 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
     var s: ?stream.Stream = null;
     defer if (s) |*st| st.deinit();
     var ocf = false;
+    var ldm = false;
     var ext_dict_blocks: u32 = 0;
     var overflow_corrections: u32 = 0;
+    var ldm_ext_dict_chunks: u32 = 0;
     var it = std.mem.tokenizeScalar(u8, schedule, ',');
     while (it.next()) |tok| {
         if (std.mem.eql(u8, tok, "x")) {
             ocf = true;
+            continue;
+        }
+        if (std.mem.eql(u8, tok, "l")) {
+            ldm = true;
             continue;
         }
         const num: usize = if (tok[1] == '*') src.len - fed else try std.fmt.parseInt(usize, tok[1..], 10);
@@ -65,6 +74,7 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
             s = try stream.Stream.init(gpa, .{ .level = level, .checksum = checksum, .pledged_size = pledged });
             s.?.window_log = window_log;
             s.?.overflow_correct_frequently = ocf;
+            s.?.ldm = ldm;
         }
         const obuf = try gpa.alloc(u8, ocap);
         defer gpa.free(obuf);
@@ -79,10 +89,14 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
         if (dir == .end) {
             ext_dict_blocks = s.?.comp.c.ms.n_ext_dict_blocks;
             overflow_corrections = s.?.comp.c.ms.n_overflow_corrections;
+            if (s.?.comp.c.ldm) |ls| {
+                ldm_ext_dict_chunks = ls.n_ext_dict_chunks;
+                overflow_corrections += ls.n_overflow_corrections;
+            }
             break;
         }
     }
-    return .{ .out = try out.toOwnedSlice(gpa), .ext_dict_blocks = ext_dict_blocks, .overflow_corrections = overflow_corrections };
+    return .{ .out = try out.toOwnedSlice(gpa), .ext_dict_blocks = ext_dict_blocks, .overflow_corrections = overflow_corrections, .ldm_ext_dict_chunks = ldm_ext_dict_chunks };
 }
 
 fn findCase(name: []const u8) corpus.Case {
@@ -132,6 +146,11 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
             // is checked here.
             if (std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.ext_dict_blocks == 0) {
                 std.debug.print("NO EXTDICT BLOCK {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
+                mismatches += 1;
+            }
+            // ... and, with LDM on by hand (token l), by LDM too.
+            if (std.mem.startsWith(u8, sc.schedule, "l,") and std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.ldm_ext_dict_chunks == 0) {
+                std.debug.print("NO LDM EXTDICT CHUNK {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
                 mismatches += 1;
             }
             // Likewise a correction for index overflow (token x).
