@@ -343,9 +343,9 @@ ran.
 For index overflow correction at its real threshold (2026-09-23): a 4.4 GB
 generated input (words, noise and copies from anywhere earlier, so indices
 pass 3500 MiB and positions pass 4 GiB) at levels 1, 3, 7 (row match
-finder) and 13 (`btlazy2`), identical to plain `zref` — the port 1.0–1.15×
-libzstd's time — and at level 1 in ReleaseSafe, where an index overflow
-would have trapped.
+finder), 13 (`btlazy2`) and 16 (`btopt`, 36 min), identical to plain `zref`
+— the port 1.0–1.15× libzstd's time where both were timed — and at level 1
+in ReleaseSafe, where an index overflow would have trapped.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
 **Anchor grade:** class A · oracle EXTERNAL
