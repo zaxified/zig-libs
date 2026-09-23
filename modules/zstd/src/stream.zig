@@ -50,10 +50,10 @@ pub const Options = struct {
     pledged_size: ?u64 = null,
 };
 
-/// The highest level a stream accepts for now: levels 1-3 (and the
-/// negative ones) are `fast` or `dfast` for every input size, the only
-/// match finders with their extDict variant ported so far.
-pub const max_level = 3;
+/// The highest level a stream accepts for now: levels up to 10 use
+/// `fast` .. `btlazy2` for every input size (level 11 is `btopt` on inputs
+/// of 16 KB or less), the match finders whose extDict variants are ported.
+pub const max_level = 10;
 
 pub const Error = error{
     /// Level above `max_level`.
@@ -128,7 +128,7 @@ pub const Stream = struct {
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
         const pledged: ?u64 = if (end_op == .end) in_size else s.opts.pledged_size;
         const cp = params.getOverridden(s.opts.level, pledged orelse params.unknown_size, null, false, s.window_log);
-        std.debug.assert(cp.strategy == .fast or cp.strategy == .dfast);
+        std.debug.assert(@intFromEnum(cp.strategy) <= @intFromEnum(params.Strategy.btlazy2));
         var comp = try frame.Compressor.init(s.gpa, cp, pledged, .{
             .level = s.opts.level,
             .checksum = s.opts.checksum,

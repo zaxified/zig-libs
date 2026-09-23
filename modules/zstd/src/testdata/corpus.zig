@@ -190,11 +190,22 @@ pub const StreamCase = struct {
     /// with the window in two segments (the extDict match finders); the
     /// test checks that some were.
     ext_dict: []const i32 = &.{},
+    /// With `x`: whether a correction must have run (a case found by
+    /// search may carry an `x` that corrects nothing).
+    corrects: bool = true,
+    /// The levels it is golden at.
+    levels: []const i32 = &stream_levels,
 };
 
 const all_stream_levels: []const i32 = &stream_levels;
 
 pub const stream_levels = [_]i32{ -5, -1, 1, 2, 3 };
+/// greedy, lazy, lazy2 (hash chain up to a 16 KB window, rows above) and,
+/// for inputs of 16 KB or less, btlazy2.
+pub const lazy_stream_levels = [_]i32{ 4, 5, 6, 7, 8, 9, 10 };
+const lazy_levels: []const i32 = &lazy_stream_levels;
+/// Without a pledged size level 4 is dfast (the table for inputs over 256 KB).
+const lazy_only_levels: []const i32 = lazy_stream_levels[1..];
 
 pub const stream_cases = [_]StreamCase{
     .{ .case = "empty", .schedule = "e*" }, // pledged 0: the one-shot shortcut
@@ -227,6 +238,21 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "far-mix-5", .schedule = "x,w10,o64,c1167020,c3409,c68773,c7,c2226,c28665,c4874,c12263,f128,c12858,f2327,c20695,c9,f3,c49880,f62,c2372,c5505,c9407,c6,c8754,f60,c144,f540,c5,f6,c2,e0", .ext_dict = &.{-5} }, // fast: a match extends backwards down to just above its segment's low end
     .{ .case = "two-symbols-200000", .schedule = "w10,c7,c4,c2865,f107,c7,c5,c70919,f1678,f70857,f33002,c9655,f2078,c2213,c449,c5556,f481,c15,c95,c7,e0", .ext_dict = &.{1} }, // a repcode 4 bytes before the extDict's end does not straddle it
     .{ .case = "mix-140000-1148", .schedule = "w17,f1,f71,c2,c93058,c10526,c227,c31763,f1296,c286,f5,f1715,c0,c594,c5,c370,f16,e65" }, // the pre-splitter's savings count the frame header
+    // The lazy levels over a two-segment window:
+    .{ .case = "csv-600000", .schedule = "w18,c*,e0", .levels = lazy_levels, .ext_dict = lazy_levels }, // rows; a 256 KB window wraps a 384 KB buffer
+    .{ .case = "far-repeat", .schedule = "w19,c300000,f0,c*,e0", .levels = lazy_levels, .ext_dict = lazy_levels }, // repeats 700 KB back reach into the extDict
+    .{ .case = "mix-300000-9", .schedule = "w12,o50,c3000,f0,c*,e0", .levels = lazy_levels, .ext_dict = lazy_only_levels }, // hash chain (window 4 KB), flushes
+    .{ .case = "two-symbols-200000", .schedule = "w13,c1000,f0,c7777,f0,c*,e0", .levels = lazy_levels, .ext_dict = lazy_only_levels },
+    .{ .case = "two-symbols-16384-0", .schedule = "p16384,w10,c*,e0", .levels = lazy_levels, .ext_dict = lazy_levels }, // pledged <= 16 KB: btlazy2 at 9-10, the tree across both segments
+    .{ .case = "skewed-16384-2", .schedule = "p16384,w11,c3000,f0,c*,e0", .levels = lazy_levels, .ext_dict = lazy_levels },
+    .{ .case = "mix-300000-9", .schedule = "x,p300000,w12,c*,e0", .levels = lazy_levels, .ext_dict = lazy_only_levels }, // overflow correction, both segments (pledged: the chain log shrinks to the window, so corrections come early)
+    // ... found by a seed search over schedules (original against mutant):
+    .{ .case = "drift-200000-0", .schedule = "w10,o1,e200000", .levels = &.{5}, .ext_dict = &.{5} }, // the immediate repcode is tried at ip == ilimit too
+    .{ .case = "far-repeat", .schedule = "p1400000,w10,o1000,c1055633,f196936,c252,f116014,c74,c7,c13336,f8367,c2,c4688,c3,c3619,c948,c64,c2,c50,c1,c2,c1,c1,e0", .levels = &.{10}, .ext_dict = &.{10} }, // a repcode exactly a window back is taken
+    .{ .case = "long-literals", .schedule = "w13,o1000,c158,f70733,f26279,e42830", .levels = &.{8}, .ext_dict = &.{8} }, // catching up stops at the extDict's low limit (not the window's)
+    .{ .case = "split-margin", .schedule = "x,p400000,w14,c2230,c7,c4,c44823,c1546,f43664,c115585,f1125,c31499,c6933,c65582,c3986,c9187,c475,c23209,c7,c3,c14831,c10841,c12647,f3477,c6978,c575,c326,f159,c171,c102,c14,f2,c5,c0,c6,c0,c0,f1,e0", .levels = &.{8}, .ext_dict = &.{8} }, // ... down to just above it
+    .{ .case = "mix-140000-1", .schedule = "x,w13,c3797,c36559,f33578,c5,f24157,c19101,e22803", .levels = &.{6}, .ext_dict = &.{6}, .corrects = false }, // lazy skipping from a step of 9, not 8
+    .{ .case = "mix-43", .schedule = "x,w17,c123076,f4272,c48374,f288,c67,f4530,c376,f43560,c60468,f115,e14874", .levels = &.{9}, .ext_dict = &.{9}, .corrects = false }, // rows: the hash cache is refilled after lazy skipping
     // x: libzstd's frequent overflow correction, here of a two-segment window
     .{ .case = "mix-300000-9", .schedule = "x,w10,c*,e0", .ext_dict = all_stream_levels },
     .{ .case = "far-repeat", .schedule = "x,w14,c200000,f0,c*,e0", .ext_dict = all_stream_levels },

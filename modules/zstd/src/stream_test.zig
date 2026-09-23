@@ -99,7 +99,7 @@ fn find(sc: corpus.StreamCase, level: i32, checksum: bool) ?goldens.Golden {
 
 test "every streaming case has a golden row, and nothing else does" {
     var n: usize = 0;
-    for (corpus.stream_cases) |sc| for (corpus.stream_levels) |level| for ([_]bool{ false, true }) |ck| {
+    for (corpus.stream_cases) |sc| for (sc.levels) |level| for ([_]bool{ false, true }) |ck| {
         n += 1;
         if (find(sc, level, ck) == null) {
             std.debug.print("no golden row for {s} {s} level {d} checksum {}\n", .{ sc.case, sc.schedule, level, ck });
@@ -117,7 +117,7 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
         const src = try gpa.alloc(u8, case.len);
         defer gpa.free(src);
         corpus.generate(case, src);
-        for (corpus.stream_levels) |level| for ([_]bool{ false, true }) |ck| {
+        for (sc.levels) |level| for ([_]bool{ false, true }) |ck| {
             const g = find(sc, level, ck).?;
             const r = try run(gpa, src, level, ck, sc.schedule);
             defer gpa.free(r.out);
@@ -135,7 +135,7 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
                 mismatches += 1;
             }
             // Likewise a correction for index overflow (token x).
-            if (std.mem.startsWith(u8, sc.schedule, "x,") and r.overflow_corrections == 0) {
+            if (std.mem.startsWith(u8, sc.schedule, "x,") and sc.corrects and std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.overflow_corrections == 0) {
                 std.debug.print("NO CORRECTION {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
                 mismatches += 1;
             }

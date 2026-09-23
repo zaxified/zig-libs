@@ -14,7 +14,7 @@
 //! merely round-trips.
 //!
 //! `Stream` is libzstd's streaming compression (`ZSTD_compressStream2`):
-//! the same bytes for the same sequence of calls, at levels up to 3 so far.
+//! the same bytes for the same sequence of calls, at levels up to 10 so far.
 //!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd. See SPEC.md.
@@ -26,7 +26,7 @@ const frame_writer = @import("frame_writer.zig");
 const stream = @import("stream.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` (and `ZSTD_compressStream2` at levels up to 3); decode with `std.compress.zstd`",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` (and `ZSTD_compressStream2` at levels up to 10); decode with `std.compress.zstd`",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,

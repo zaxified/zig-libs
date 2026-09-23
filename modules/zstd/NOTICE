@@ -20,9 +20,10 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       match finders                         -> src/match.zig
   lib/compress/zstd_double_fast.c     no-dictionary and extDict `dfast`
                                       match finders                         -> src/match.zig
-  lib/compress/zstd_lazy.c            no-dictionary hash-chain, row and
-                                      binary-tree (DUBT) match finders,
-                                      greedy/lazy/lazy2/btlazy2 parser      -> src/lazy.zig
+  lib/compress/zstd_lazy.c            no-dictionary and extDict hash-chain,
+                                      row and binary-tree (DUBT) match
+                                      finders, greedy/lazy/lazy2/btlazy2
+                                      parsers                               -> src/lazy.zig
   lib/compress/zstd_opt.c             no-dictionary binary-tree match
                                       finder, price model and optimal
                                       parser (btopt/btultra/btultra2), with
@@ -56,8 +57,8 @@ Each of those files says so in its first line
 and `src/testdata/` are this collection's own work (MIT).
 
 Not taken: libzstd's decoder (std has one), dictionaries, long-distance
-matching below `btopt`, multithreading, the extDict variants of the match
-finders above `dfast`, `targetCBlockSize` super-blocks.
+matching below `btopt`, multithreading, the extDict variants of the optimal
+parsers, `targetCBlockSize` super-blocks.
 
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and

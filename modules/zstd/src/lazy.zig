@@ -37,13 +37,18 @@ pub const dubt_unsorted_mark = 1;
 /// Compress one block with the strategy in `ms.cp` (greedy, lazy, lazy2 or
 /// btlazy2).
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
+    return if (ms.hasExtDict()) dispatch(ms, ss, rep, istart, src_size, true) else dispatch(ms, ss, rep, istart, src_size, false);
+}
+
+fn dispatch(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime ext: bool) usize {
     const mls = std.math.clamp(ms.cp.min_match, 4, 6);
+    const generic = if (ext) lazyExtDictGeneric else lazyGeneric;
     const depth: u32 = switch (ms.cp.strategy) {
         .greedy => 0,
         .lazy => 1,
         .lazy2 => 2,
         .btlazy2 => return switch (mls) {
-            inline 4, 5, 6 => |m| lazyGeneric(ms, ss, rep, istart, src_size, .binary_tree, 2, m),
+            inline 4, 5, 6 => |m| generic(ms, ss, rep, istart, src_size, .binary_tree, 2, m),
             else => unreachable,
         },
         else => unreachable,
@@ -51,10 +56,10 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
     const row = params.useRowMatchFinder(ms.cp);
     return switch (depth) {
         inline 0, 1, 2 => |d| if (row) switch (mls) {
-            inline 4, 5, 6 => |m| lazyGeneric(ms, ss, rep, istart, src_size, .row, d, m),
+            inline 4, 5, 6 => |m| generic(ms, ss, rep, istart, src_size, .row, d, m),
             else => unreachable,
         } else switch (mls) {
-            inline 4, 5, 6 => |m| lazyGeneric(ms, ss, rep, istart, src_size, .hash_chain, d, m),
+            inline 4, 5, 6 => |m| generic(ms, ss, rep, istart, src_size, .hash_chain, d, m),
             else => unreachable,
         },
         else => unreachable,
@@ -85,9 +90,11 @@ fn insertAndFindFirstIndex(ms: *MatchState, ip: u32, comptime mls: u32) u32 {
     return hash_table[ms.hash(ip, hash_log, mls)];
 }
 
-/// `ZSTD_HcFindBestMatch` (noDict). Returns the best length found (3 when
-/// none reaches 4) and stores its offBase in `offset_ptr`.
-fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32) usize {
+/// `ZSTD_HcFindBestMatch` (noDict, or extDict when `ext`). Returns the best
+/// length found (3 when none reaches 4) and stores its offBase in
+/// `offset_ptr`.
+fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, comptime ext: bool) usize {
+    const dict_limit = ms.dict_limit;
     const chain_table = ms.chain_table;
     const chain_size: u32 = @as(u32, 1) << @intCast(ms.cp.chain_log);
     const chain_mask = chain_size - 1;
@@ -101,10 +108,7 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
 
     var match_index = insertAndFindFirstIndex(ms, ip, mls);
     while (match_index >= low_limit and nb_attempts > 0) : (nb_attempts -= 1) {
-        var current_ml: usize = 0;
-        // read 4B starting from (match + ml + 1 - sizeof(U32))
-        if (ms.read32(match_index + ml - 3) == ms.read32(ip + ml - 3)) // potentially better
-            current_ml = ms.count(ip, match_index, iend);
+        const current_ml = candidateLength(ms, ip, match_index, iend, ml, dict_limit, ext);
         // save best solution
         if (current_ml > ml) {
             ml = current_ml;
@@ -115,6 +119,23 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
         match_index = chain_table[match_index & chain_mask];
     }
     return ml;
+}
+
+/// The length of the match at `match_index` if it can beat `ml`, else 0: the
+/// candidate test of the hash-chain and row finders. In the prefix, the 4
+/// bytes ending at `ml` must match; in the extDict (`ext`), the first 4,
+/// and the count may run on into the prefix.
+inline fn candidateLength(ms: *const MatchState, ip: u32, match_index: u32, iend: usize, ml: usize, dict_limit: u32, comptime ext: bool) usize {
+    if (!ext or match_index >= dict_limit) {
+        // read 4B starting from (match + ml + 1 - sizeof(U32))
+        if (ms.read32(match_index + ml - 3) == ms.read32(ip + ml - 3)) // potentially better
+            return ms.count(ip, match_index, iend);
+        return 0;
+    }
+    // assumption: matchIndex <= dictLimit-4 (by table construction)
+    if (ms.read32Seg(match_index, dict_limit) == ms.read32(ip))
+        return ms.count2Segments(@as(usize, ip) + 4, @as(usize, match_index) + 4, iend, dict_limit, dict_limit) + 4;
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +213,9 @@ inline fn matchMask(comptime entries: u32, tag_row: []const u8, tag: u8, head: u
     return std.math.rotr(B, eq, head);
 }
 
-/// `ZSTD_RowFindBestMatch` (noDict).
-fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, row_log: u32) usize {
+/// `ZSTD_RowFindBestMatch` (noDict, or extDict when `ext`).
+fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, row_log: u32, comptime ext: bool) usize {
+    const dict_limit = ms.dict_limit;
     const curr = ip;
     const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
     const lowest_valid = ms.low_limit;
@@ -253,9 +275,7 @@ fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, com
 
     // Return the longest match
     for (match_buffer[0..num_matches]) |match_index| {
-        var current_ml: usize = 0;
-        if (ms.read32(match_index + ml - 3) == ms.read32(ip + ml - 3)) // potentially better
-            current_ml = ms.count(ip, match_index, iend);
+        const current_ml = candidateLength(ms, ip, match_index, iend, ml, dict_limit, ext);
         if (current_ml > ml) {
             ml = current_ml;
             offset_ptr.* = curr - match_index + sequences.rep_num;
@@ -301,10 +321,13 @@ fn updateDubt(ms: *MatchState, ip: u32, comptime mls: u32) void {
     ms.next_to_update = ip;
 }
 
-/// `ZSTD_insertDUBT1` (noDict): sort one already inserted but unsorted
-/// position `curr` into the tree, comparing at most `nb_compares` nodes and
-/// not descending below `bt_low`.
-fn insertDubt1(ms: *MatchState, curr: u32, iend: usize, nb_compares_in: u32, bt_low: u32) void {
+/// `ZSTD_insertDUBT1` (noDict, or extDict when `ext`): sort one already
+/// inserted but unsorted position `curr` into the tree, comparing at most
+/// `nb_compares` nodes and not descending below `bt_low`. With an extDict,
+/// `curr` itself may lie in it; its input then ends at the extDict's end.
+fn insertDubt1(ms: *MatchState, curr: u32, input_end: usize, nb_compares_in: u32, bt_low: u32, comptime ext: bool) void {
+    const dict_limit = ms.dict_limit;
+    const iend: usize = if (!ext or curr >= dict_limit) input_end else dict_limit;
     const bt = ms.chain_table;
     const bt_mask = btMask(ms);
     var common_length_smaller: usize = 0;
@@ -324,13 +347,19 @@ fn insertDubt1(ms: *MatchState, curr: u32, iend: usize, nb_compares_in: u32, bt_
         const next_slot = 2 * @as(usize, match_index & bt_mask);
         var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
         std.debug.assert(match_index < curr);
-        match_length += ms.count(curr + match_length, match_index + match_length, iend);
+        if (!ext or match_index + match_length >= dict_limit) {
+            match_length += ms.count(curr + match_length, match_index + match_length, iend);
+        } else if (curr < dict_limit) { // both in extDict
+            match_length += ms.countInDict(curr + match_length, match_index + match_length, iend);
+        } else {
+            match_length += ms.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
+        }
 
         // equal: no way to know if inf or sup. Drop, to guarantee consistency;
         // miss a bit of compression, but other solutions can corrupt the tree.
         if (curr + match_length == iend) break;
 
-        if (ms.at(match_index + match_length) < ms.at(curr + match_length)) {
+        if (byteAt(ms, match_index + match_length, dict_limit, ext) < byteAt(ms, curr + match_length, dict_limit, ext)) {
             // match is smaller than current
             smaller_ptr.* = match_index; // update smaller idx
             common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
@@ -356,10 +385,16 @@ fn insertDubt1(ms: *MatchState, curr: u32, iend: usize, nb_compares_in: u32, bt_
     larger_ptr.* = 0;
 }
 
-/// `ZSTD_DUBT_findBestMatch` (noDict). Returns the best length (0 when none)
-/// and stores its offBase in `off_base_ptr`, whose incoming value also
-/// prices the first candidate.
-fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32) usize {
+/// The byte at index `idx`: from the extDict below `dict_limit` when `ext`.
+inline fn byteAt(ms: *const MatchState, idx: usize, dict_limit: u32, comptime ext: bool) u8 {
+    return if (ext) ms.atSeg(idx, dict_limit) else ms.at(idx);
+}
+
+/// `ZSTD_DUBT_findBestMatch` (noDict, or extDict when `ext`). Returns the
+/// best length (0 when none) and stores its offBase in `off_base_ptr`, whose
+/// incoming value also prices the first candidate.
+fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32, comptime ext: bool) usize {
+    const dict_limit = ms.dict_limit;
     const hash_table = ms.hash_table;
     const h = ms.hash(ip, ms.cp.hash_log, mls);
     var match_index = hash_table[h];
@@ -395,7 +430,7 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
     match_index = previous_candidate;
     while (match_index != 0) { // will end on match_index == 0
         const next_candidate_idx = bt[2 * @as(usize, match_index & bt_mask) + 1];
-        insertDubt1(ms, match_index, iend, nb_candidates, unsort_limit);
+        insertDubt1(ms, match_index, iend, nb_candidates, unsort_limit, ext);
         match_index = next_candidate_idx;
         nb_candidates += 1;
     }
@@ -416,7 +451,11 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
     while (nb_compares > 0 and match_index > window_low) : (nb_compares -= 1) {
         const next_slot = 2 * @as(usize, match_index & bt_mask);
         var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
-        match_length += ms.count(curr + match_length, match_index + match_length, iend);
+        if (!ext or match_index + match_length >= dict_limit) {
+            match_length += ms.count(curr + match_length, match_index + match_length, iend);
+        } else {
+            match_length += ms.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
+        }
 
         if (match_length > best_length) {
             if (match_length > match_end_idx - match_index)
@@ -432,7 +471,7 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
             if (curr + match_length == iend) break;
         }
 
-        if (ms.at(match_index + match_length) < ms.at(curr + match_length)) {
+        if (byteAt(ms, match_index + match_length, dict_limit, ext) < ms.at(curr + match_length)) {
             // match is smaller than current
             smaller_ptr.* = match_index; // update smaller idx
             common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
@@ -463,20 +502,20 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
 }
 
 /// `ZSTD_BtFindBestMatch`: tree updater, providing the best match.
-fn btFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32) usize {
+fn btFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32, comptime ext: bool) usize {
     if (ip < ms.next_to_update) return 0; // skipped area
     updateDubt(ms, ip, mls);
-    return dubtFindBestMatch(ms, ip, iend, off_base_ptr, mls);
+    return dubtFindBestMatch(ms, ip, iend, off_base_ptr, mls, ext);
 }
 
 // ---------------------------------------------------------------------------
 // Parser
 
-inline fn searchMax(ms: *MatchState, ip: usize, iend: usize, offset_ptr: *u32, comptime method: Method, comptime mls: u32, row_log: u32) usize {
+inline fn searchMax(ms: *MatchState, ip: usize, iend: usize, offset_ptr: *u32, comptime method: Method, comptime mls: u32, row_log: u32, comptime ext: bool) usize {
     return switch (method) {
-        .hash_chain => hcFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls),
-        .row => rowFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls, row_log),
-        .binary_tree => btFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls),
+        .hash_chain => hcFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls, ext),
+        .row => rowFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls, row_log, ext),
+        .binary_tree => btFindBestMatch(ms, @intCast(ip), iend, offset_ptr, mls, ext),
     };
 }
 
@@ -535,7 +574,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
             // first search (depth 0)
             {
                 var offbase_found: u32 = no_offset;
-                const ml2 = searchMax(ms, ip, iend, &offbase_found, method, mls, row_log);
+                const ml2 = searchMax(ms, ip, iend, &offbase_found, method, mls, row_log, false);
                 if (ml2 > match_length) {
                     match_length = ml2;
                     start = ip;
@@ -567,7 +606,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
                 }
                 {
                     var ofb_candidate: u32 = no_offset;
-                    const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log);
+                    const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log, false);
                     const gain2 = gain(ml2, 4, ofb_candidate, 0); // raw approx
                     const gain1 = gain(match_length, 4, off_base, 4);
                     if (ml2 >= 4 and gain2 > gain1) {
@@ -593,7 +632,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
                     }
                     {
                         var ofb_candidate: u32 = no_offset;
-                        const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log);
+                        const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log, false);
                         const gain2 = gain(ml2, 4, ofb_candidate, 0); // raw approx
                         const gain1 = gain(match_length, 4, off_base, 7);
                         if (ml2 >= 4 and gain2 > gain1) {
@@ -647,6 +686,178 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
     rep[0] = if (offset_1 != 0) offset_1 else offset_saved1;
     rep[1] = if (offset_2 != 0) offset_2 else offset_saved2;
     return iend - anchor;
+}
+
+/// `ZSTD_compressBlock_lazy_extDict_generic`: the parser over a window in
+/// two segments. Unlike the prefix-only parser it never drops a repcode at
+/// the block start; each repcode check tests the offset against the window
+/// at that position and refuses one whose 4 bytes straddle the extDict's
+/// end.
+fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime method: Method, comptime depth: u32, comptime mls: u32) usize {
+    const iend: usize = istart + src_size;
+    const ilimit: i64 = @as(i64, @intCast(iend)) - 8 - (if (method == .row) cache_size else 0);
+    const dict_limit = ms.dict_limit;
+    const prefix_start: usize = dict_limit;
+    const dict_start: usize = ms.low_limit;
+    const row_log = params.rowLog(ms.cp);
+    var ip: usize = istart;
+    var anchor: usize = istart;
+
+    var offset_1: u32 = rep[0];
+    var offset_2: u32 = rep[1];
+    ms.n_ext_dict_blocks += 1;
+
+    // Reset the lazy skipping state
+    ms.lazy_skipping = false;
+
+    // init
+    ip += @intFromBool(ip == prefix_start);
+    if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit);
+
+    while (@as(i64, @intCast(ip)) < ilimit) {
+        var match_length: usize = 0;
+        var off_base: u32 = 1; // REPCODE1_TO_OFFBASE
+        var start: usize = ip + 1;
+        var curr: u32 = @intCast(ip);
+
+        store: {
+            // check repCode
+            if (repMatchLength(ms, curr + 1, offset_1, iend, dict_limit)) |len| {
+                match_length = len;
+                if (depth == 0) break :store;
+            }
+
+            // first search (depth 0)
+            {
+                var ofb_candidate: u32 = no_offset;
+                const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log, true);
+                if (ml2 > match_length) {
+                    match_length = ml2;
+                    start = ip;
+                    off_base = ofb_candidate;
+                }
+            }
+
+            if (match_length < 4) {
+                const step = (ip - anchor) >> match.search_strength;
+                ip += step + 1; // jump faster over incompressible sections
+                ms.lazy_skipping = step > lazy_skipping_step;
+                continue;
+            }
+
+            // let's try to find a better solution
+            if (depth >= 1) while (@as(i64, @intCast(ip)) < ilimit) {
+                ip += 1;
+                curr += 1;
+                // check repCode
+                if (off_base != 0) if (repMatchLength(ms, curr, offset_1, iend, dict_limit)) |rep_length| {
+                    const gain2: i64 = @as(i64, @intCast(rep_length)) * 3;
+                    const gain1 = gain(match_length, 3, off_base, 1);
+                    if (rep_length >= 4 and gain2 > gain1) {
+                        match_length = rep_length;
+                        off_base = 1;
+                        start = ip;
+                    }
+                };
+
+                // search match, depth 1
+                {
+                    var ofb_candidate: u32 = no_offset;
+                    const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log, true);
+                    const gain2 = gain(ml2, 4, ofb_candidate, 0); // raw approx
+                    const gain1 = gain(match_length, 4, off_base, 4);
+                    if (ml2 >= 4 and gain2 > gain1) {
+                        match_length = ml2;
+                        off_base = ofb_candidate;
+                        start = ip;
+                        continue; // search a better one
+                    }
+                }
+
+                // let's find an even better one
+                if (depth == 2 and @as(i64, @intCast(ip)) < ilimit) {
+                    ip += 1;
+                    curr += 1;
+                    // check repCode
+                    if (off_base != 0) if (repMatchLength(ms, curr, offset_1, iend, dict_limit)) |rep_length| {
+                        const gain2: i64 = @as(i64, @intCast(rep_length)) * 4;
+                        const gain1 = gain(match_length, 4, off_base, 1);
+                        if (rep_length >= 4 and gain2 > gain1) {
+                            match_length = rep_length;
+                            off_base = 1;
+                            start = ip;
+                        }
+                    };
+
+                    // search match, depth 2
+                    {
+                        var ofb_candidate: u32 = no_offset;
+                        const ml2 = searchMax(ms, ip, iend, &ofb_candidate, method, mls, row_log, true);
+                        const gain2 = gain(ml2, 4, ofb_candidate, 0); // raw approx
+                        const gain1 = gain(match_length, 4, off_base, 7);
+                        if (ml2 >= 4 and gain2 > gain1) {
+                            match_length = ml2;
+                            off_base = ofb_candidate;
+                            start = ip;
+                            continue;
+                        }
+                    }
+                }
+                break; // nothing found : store previous solution
+            };
+
+            // catch up
+            if (off_base > sequences.rep_num) {
+                const offset = off_base - sequences.rep_num;
+                var match_index: usize = start - offset;
+                const m_start: usize = if (match_index < dict_limit) dict_start else prefix_start;
+                while (start > anchor and match_index > m_start and ms.at(start - 1) == ms.atSeg(match_index - 1, dict_limit)) {
+                    start -= 1;
+                    match_index -= 1;
+                    match_length += 1;
+                }
+                offset_2 = offset_1;
+                offset_1 = offset;
+            }
+        }
+
+        // store sequence
+        ss.store(ms.bytes(anchor, start), off_base, match_length);
+        ip = start + match_length;
+        anchor = ip;
+        if (ms.lazy_skipping) {
+            // We've found a match, disable lazy skipping mode, and refill the hash cache.
+            if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit);
+            ms.lazy_skipping = false;
+        }
+
+        // check immediate repcode
+        while (@as(i64, @intCast(ip)) <= ilimit) {
+            const len = repMatchLength(ms, @intCast(ip), offset_2, iend, dict_limit) orelse break;
+            match_length = len;
+            std.mem.swap(u32, &offset_1, &offset_2); // swap offset history
+            ss.store(&.{}, 1, match_length);
+            ip += match_length;
+            anchor = ip;
+        }
+    }
+
+    // Save reps for next block
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+    return iend - anchor;
+}
+
+/// The extDict parser's repcode test at index `curr` for `offset`: the
+/// match length when the offset lies within the window, its 4 bytes do not
+/// straddle the extDict's end, and they match; else null.
+inline fn repMatchLength(ms: *const MatchState, curr: u32, offset: u32, iend: usize, dict_limit: u32) ?usize {
+    const window_low = ms.lowestMatchIndex(curr);
+    const rep_index = curr -% offset;
+    if (!(match.indexOverlapCheck(dict_limit, rep_index) and offset <= curr - window_low)) return null;
+    if (ms.read32(curr) != ms.read32Seg(rep_index, dict_limit)) return null;
+    const rep_end: usize = if (rep_index < dict_limit) dict_limit else iend;
+    return ms.count2Segments(@as(usize, curr) + 4, @as(usize, rep_index) + 4, iend, rep_end, dict_limit) + 4;
 }
 
 test "the next row slot cycles backwards and skips the head" {

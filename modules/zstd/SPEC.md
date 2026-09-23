@@ -6,7 +6,7 @@ Consumer view, API and purpose: [README.md](README.md).
 
 A Zstandard **compressor** that reproduces libzstd 1.5.7's output byte for
 byte: one-shot for every level, 1–22 and negative, and streaming
-(`ZSTD_compressStream2`, for the same sequence of calls) for levels 1–3 and
+(`ZSTD_compressStream2`, for the same sequence of calls) for levels 1–10 and
 negative so far. Every strategy is
 translated from libzstd — `fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both
 the hash chain and the row-based search, `btlazy2`'s binary tree, and the
@@ -18,8 +18,8 @@ file-by-file map.
 
 **Goal (2026-09-22): production quality — as close to libzstd's feature set
 and behaviour as possible, so that a Zig program never needs to link libzstd.**
-Today it is the one-shot compressor and streaming at the `fast`/`dfast`
-levels; everything else libzstd offers is in *Backlog / deferred* below,
+Today it is the one-shot compressor and streaming up to `btlazy2` (level
+10); everything else libzstd offers is in *Backlog / deferred* below,
 with its cost.
 
 Not here yet, and a reader might expect it (each is a backlog item):
@@ -29,10 +29,11 @@ Not here yet, and a reader might expect it (each is a backlog item):
   frames, leaves checksum verification as a TODO panic, and defaults to an
   8 MB window (frames of levels 20–22 on large inputs need
   `window_len` raised). Z2.
-- **Streaming above level 3.** `Stream` (see *Algorithm*) refuses levels
-  above 3 with `error.LevelUnsupported`: once libzstd's input buffer wraps,
+- **Streaming above level 10.** `Stream` (see *Algorithm*) refuses levels
+  above 10 with `error.LevelUnsupported`: once libzstd's input buffer wraps,
   the window is two segments and every match finder runs its extDict
-  variant, which exists so far for `fast` and `dfast` only (Z1b, Z1c).
+  variant, which exists so far for `fast` … `btlazy2`, not for the optimal
+  parsers (Z1c).
   Nor does it do libzstd's stable-buffer modes or start a second frame on
   the same context (Z1, Z13). `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
@@ -189,7 +190,15 @@ their extDict variants (`ZSTD_compressBlock_fast_extDict_generic`,
 segment holds its index, a match may run from the extDict's end on into
 the prefix (`ZSTD_count_2segments`), repcodes straddling the boundary are
 refused, and once the window has left the extDict behind they fall back to
-the plain variants. An overflow correction moves both segments. libzstd's
+the plain variants. `greedy` … `btlazy2` run libzstd's extDict parser
+(`ZSTD_compressBlock_lazy_extDict_generic`), which has no such fall-back and
+no saved repcodes: each repcode test checks the offset against the window at
+that position instead. Its three searches take a candidate below the
+extDict's end by its first 4 bytes and count on into the prefix (hash chain,
+row); the binary tree compares across the boundary too, and sorting a
+still-unsorted candidate that is itself in the extDict compares it against
+older extDict positions up to the extDict's end. Tables are only ever filled
+from the prefix (`nextToUpdate` moves to the new segment's start). An overflow correction moves both segments. libzstd's
 `dfast` extDict search reads 8 bytes at a table index that can lie 7 bytes
 before the extDict's end, so one byte past it: the port reads the same
 buffer byte (the extDict stays readable up to the buffer's end, which starts
@@ -220,7 +229,7 @@ one member, so a failure of our own (out of memory) is kept in
 | input | none (the input and `compressBound` of it in memory) | past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit) the indices are rescaled, as libzstd does (see *Algorithm*) |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
-| stream level | ≤ 3 (`stream_max_level`), else `error.LevelUnsupported` | the extDict variants exist for `fast`/`dfast` only; levels 1–3 use those at every input size, so the limit does not depend on the data |
+| stream level | ≤ 10 (`stream_max_level`), else `error.LevelUnsupported` | the extDict variants exist up to `btlazy2`; levels ≤ 10 use those at every input size (level 11 is `btopt` up to 16 KB), so the limit does not depend on the data |
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
 | stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
 
@@ -359,9 +368,10 @@ survives; a mutation of the correction's back-off only changes how often it
 runs, which no output can show.
 
 **Streaming** (2026-09-23) has its own goldens: `src/testdata/
-stream_goldens.zig` holds, for each of 31 `corpus.stream_cases` (a corpus
-input and a call schedule) × levels {-5, -1, 1, 2, 3} × checksum, the length
-and SHA-256 of everything `ZSTD_compressStream2` emits (310 streams),
+stream_goldens.zig` holds, for each of 44 `corpus.stream_cases` (a corpus
+input and a call schedule) × its levels (-5, -1 and 1–3 for 31 cases, 4–10
+for 7, one lazy level each for 6) × checksum, the length and SHA-256 of
+everything `ZSTD_compressStream2` emits (420 streams),
 written by the same recipe through `tools/zstream.c`; schedules starting
 with `x` run against libzstd built with frequent overflow correction. The
 extDict search leaves no mark in the output, so the test also demands, where
@@ -390,6 +400,16 @@ whose buffered pre-split differs from one-shot). 16 survive:
 | `ZSTD_getLowestMatchIndex` `>` → `>=`; overflow correction of a segment at exactly the threshold (`>=` → `>`) | equivalent: both branches give the same value at the equality |
 | `fast` extDict: `offset >= maxRep` → `>` (both repcodes), the saved-offset rotation dropped; `dfast` extDict: repcode `offset <= curr + 1 - dictStart` → `<` (both), short and 3-byte-hash candidates at exactly the extDict's low end | reachable in principle, each at an equality; 1 200 random schedules per mutation over the corpus did not hit one. **Uncovered.** |
 | more input than pledged caught when a chunk passes the size | equivalent in outcome: the end catches the same stream with the same error, only later |
+
+The lazy extDict code (Z1b, 2026-09-23) got 22 mutations (the parser's
+repcode tests, catch-up limits, gains, lazy skipping and hash-cache refill,
+the extDict candidate test of the hash chain and rows, DUBT's comparisons
+across the boundary and within the extDict). 14 were caught by the 7 lazy
+cases, 6 by cases the schedule search found (the last 6 lazy entries of
+`corpus.stream_cases`), and 2 survive as equivalent: DUBT's segment choice
+at `matchIndex + matchLength == dictLimit` (`>=` → `>`, in insertion and
+search) — a match starting exactly at the extDict's end counts nothing
+there and goes on from the prefix's first byte, which is where it is.
 
 Beyond the committed goldens, the port was compared against `zref` on 49
 boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
@@ -468,12 +488,9 @@ dictionaries are undecided.
   pledged or unknown size, the window in two segments, and the extDict
   variants of `fast` and `dfast` — so levels ≤ 3. Oracle `tools/zstream.c`
   (a call schedule), goldens in `stream_goldens.zig`. Left:
-  - **Z1b — lazy family.** extDict variants of the hash chain, the row
-    match finder and DUBT (`zstd_lazy.c` `ZSTD_compressBlock_*_extDict`,
-    `ZSTD_HcFindBestMatch`/`ZSTD_RowFindBestMatch`/`ZSTD_DUBT_findBestMatch`
-    in `ZSTD_extDict` mode, the `searchMax` dispatch), `nextToUpdate`
-    reset on a non-contiguous chunk (already in place) → the stream limit
-    rises to 10 (level 11 is `btopt` for inputs ≤ 16 KB). **~1 session.**
+  - ~~**Z1b — lazy family.**~~ done 2026-09-23: the extDict parser and the
+    hash chain, row and DUBT searches in extDict mode; streams up to
+    level 10.
   - **Z1c — optimal parsers and LDM.** extDict in `ZSTD_insertBt1`,
     `ZSTD_insertBtAndGetAllMatches` (both segments, `dictMode` extDict), the
     3-byte hash, `ZSTD_btultra2`'s seeding (it checks for a first block
@@ -546,7 +563,7 @@ dictionaries are undecided.
   that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
   caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
 
-Suggested order: (Z1a, Z1-1, Z3 done) Z1b → Z1c → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z3 done) Z1c → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 

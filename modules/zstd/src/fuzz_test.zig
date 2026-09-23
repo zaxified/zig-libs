@@ -43,7 +43,7 @@ fn roundTrip(input: []const u8) !void {
 /// 64-byte output buffer.
 fn streamRoundTrip(input: []const u8) !void {
     const gpa = std.testing.allocator;
-    const stream_levels = [_]i32{ -3, 1, 2, 3 };
+    const stream_levels = [_]i32{ -3, 1, 2, 3, 5, 6, 8, 10 };
     var s = try zstd.Stream.init(gpa, .{ .level = stream_levels[input.len % stream_levels.len], .checksum = input.len & 8 != 0 });
     defer s.deinit();
     s.window_log = 10;

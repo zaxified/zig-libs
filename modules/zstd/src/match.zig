@@ -175,6 +175,16 @@ pub const MatchState = struct {
         return match_length + ms.count(p_in + match_length, i_start, i_end);
     }
 
+    /// `ZSTD_count` with both sides in the extDict (`binary tree insertion
+    /// of a position that is itself in the extDict).
+    pub fn countInDict(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
+        if (p_limit <= p_in) return 0;
+        const n = p_limit - p_in;
+        const a = ms.dict[p_in - ms.dict_base ..][0..n];
+        const b = ms.dict[p_match - ms.dict_base ..][0..n];
+        return std.mem.indexOfDiff(u8, a, b) orelse n;
+    }
+
     /// `ZSTD_count` with the match side in the extDict.
     fn countDict(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
@@ -358,8 +368,9 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
             7 => dfastExtDictBlock(ms, ss, rep, istart, src_size, 7),
             else => dfastExtDictBlock(ms, ss, rep, istart, src_size, 4),
         },
-        // Only streams make an extDict, and they refuse these strategies
-        // for now (stream.zig).
+        .greedy, .lazy, .lazy2, .btlazy2 => return lazy.compressBlock(ms, ss, rep, istart, src_size),
+        // Only streams make an extDict, and they refuse the optimal
+        // parsers for now (stream.zig).
         else => unreachable,
     };
     return switch (ms.cp.strategy) {
@@ -718,7 +729,7 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
 
 /// `ZSTD_index_overlap_check`: the four bytes at `rep_index` do not straddle
 /// the extDict's end.
-inline fn indexOverlapCheck(prefix_lowest_index: u32, rep_index: u32) bool {
+pub inline fn indexOverlapCheck(prefix_lowest_index: u32, rep_index: u32) bool {
     return (prefix_lowest_index -% 1) -% rep_index >= 3;
 }
 

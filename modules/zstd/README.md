@@ -7,9 +7,9 @@ it. This module is the half std lacks.
 
 Not yet a full libzstd replacement — that is the goal: one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
-for the same calls) covers levels 1–3 and negative, and `FrameWriter` is a
+for the same calls) covers levels 1–10 and negative, and `FrameWriter` is a
 `std.Io.Writer` that emits one frame per flush at any level; streaming above
-level 3, a decoder with dictionaries,
+level 10, a decoder with dictionaries,
 dictionaries themselves, multithreading and the advanced parameters are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs). Note that
 std's decoder defaults to an 8 MB window: frames of levels 20–22 on large
@@ -92,7 +92,7 @@ means `out` failed.
 
 Streaming as libzstd streams — one frame, history kept across flushes, the
 same bytes `ZSTD_compressStream2` produces for the same sequence of calls
-(levels ≤ `zstd.stream_max_level`, 3, for now):
+(levels ≤ `zstd.stream_max_level`, 10, for now):
 
 ```zig
 var s = try zstd.Stream.init(gpa, .{ .level = 3 }); // .pledged_size = n puts the size in the header
@@ -140,11 +140,11 @@ so that specific decisions are marginal (see SPEC.md, *Anchoring*). The module i
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
-`src/stream_test.zig` does the same for streaming: 31 cases, each a schedule of calls
+`src/stream_test.zig` does the same for streaming: 44 cases, each a schedule of calls
 (pledged and unknown sizes, flushes, 50-byte outputs, windows down to 1 KB
-so libzstd's input buffer wraps, index overflow correction run often; 14 of
+so libzstd's input buffer wraps, index overflow correction run often; 20 of
 them found by mutation testing) over corpus inputs at levels -5, -1, 1–3
-with and without checksum — 310 streams,
+or 4–10, with and without checksum — 420 streams,
 each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 (`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
 

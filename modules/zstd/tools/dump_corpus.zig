@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
 
     var stream_manifest: std.ArrayList(u8) = .empty;
     defer stream_manifest.deinit(gpa);
-    for (corpus.stream_cases) |sc| for (corpus.stream_levels) |level| for ([_]bool{ false, true }) |ck| {
+    for (corpus.stream_cases) |sc| for (sc.levels) |level| for ([_]bool{ false, true }) |ck| {
         try stream_manifest.print(gpa, "{s} {d} {d} {s}\n", .{ sc.case, level, @intFromBool(ck), sc.schedule });
     };
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stream_manifest_path, .data = stream_manifest.items });

@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — Streaming up to level 10 (SPEC backlog Z1b): the extDict
+  parser of `greedy` … `btlazy2` (`ZSTD_compressBlock_lazy_extDict_generic`)
+  and the hash-chain, row and binary-tree searches across two segments.
+  `stream_max_level` is 10. Streaming goldens gain 13 cases at levels 4–10
+  (per-case level lists in `corpus.stream_cases`; 6 found by a schedule
+  search against a 22-mutation sweep, 2 survivors equivalent), and 1 600
+  random schedules at levels -5…10 matched libzstd.
+
 - **2026-09-23** — Streaming (SPEC backlog Z1, first part): `zstd.Stream`,
   a port of `ZSTD_compressStream2` / `ZSTD_compressStream_generic` with
   buffered input and output — `continue`/`flush`/`end`, pledged or unknown
