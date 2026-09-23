@@ -126,11 +126,16 @@ test "every streaming case has a golden row, and nothing else does" {
 test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2" {
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
+    var dec = try zstd.Decompressor.init(gpa, .{});
+    defer dec.deinit();
     for (corpus.stream_cases) |sc| {
         const case = findCase(sc.case);
         const src = try gpa.alloc(u8, case.len);
         defer gpa.free(src);
         corpus.generate(case, src);
+        // one byte more than the input: a frame decoding too long is caught
+        const back = try gpa.alloc(u8, src.len + 1);
+        defer gpa.free(back);
         for (sc.levels) |level| for ([_]bool{ false, true }) |ck| {
             const g = find(sc, level, ck).?;
             const r = try run(gpa, src, level, ck, sc.schedule);
@@ -140,6 +145,15 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
             const hex = std.fmt.bytesToHex(digest, .lower);
             if (r.out.len != g.len or !std.mem.eql(u8, &hex, g.sha256)) {
                 std.debug.print("MISMATCH {s} {s} level {d} checksum {}: len {d} (libzstd {d})\n", .{ sc.case, sc.schedule, level, ck, r.out.len, g.len });
+                mismatches += 1;
+            }
+            const got = dec.decompress(back, r.out) catch |e| {
+                std.debug.print("DECODE ERROR {s} {s} level {d} checksum {}: {s}\n", .{ sc.case, sc.schedule, level, ck, @errorName(e) });
+                mismatches += 1;
+                continue;
+            };
+            if (got != src.len or !std.mem.eql(u8, back[0..got], src)) {
+                std.debug.print("DECODE MISMATCH {s} {s} level {d} checksum {}\n", .{ sc.case, sc.schedule, level, ck });
                 mismatches += 1;
             }
             // The extDict path leaves no mark in the output; that it ran

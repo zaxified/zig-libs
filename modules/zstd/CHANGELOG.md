@@ -5,6 +5,29 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — Decoder (SPEC backlog Z2a): a port of libzstd's one-shot
+  decoder — `Decompressor`, `decompress`, `decompressAlloc`, content
+  checksum verification (`DecompressOptions.ignore_checksum` to skip it),
+  concatenated and skippable frames, and the frame queries
+  (`getFrameHeader`, `frameHeaderSize`, `getFrameContentSize`,
+  `findFrameCompressedSize`, `findDecompressedSize`, `decompressBound`,
+  `decompressionMargin`, `readSkippableFrame`, `getDictIdFromFrame`,
+  `isFrame`, `isSkippableFrame`). Errors are named after `ZSTD_error_*`.
+  1.04–1.05× libzstd's decode time (std's decoder: 30×). Checked against
+  libzstd through the new oracle `tools/zdec.c`: 13 600 random valid frames
+  from libzstd's `decodecorpus` and the CLI's `--long`/multithreaded frames
+  decode identically; of 5 000 damaged frames none crashed or decoded
+  differently, and every one libzstd refused was refused. One deliberate
+  difference on malformed frames: a raw or RLE block larger than the
+  block maximum is refused (as RFC 8878 and libzstd's streaming decoder
+  do; libzstd's one-shot decoder lets it through). Golden and streaming
+  tests now decode every frame back; `decoder_test.zig` covers frame
+  structure and the errors; a new fuzz target feeds the decoder arbitrary
+  bytes. A 64-mutation sweep of the decoder plus a hunt over 45 000
+  frames added `testdata/decode_kats.zig` (11 damaged frames, each pinning
+  a decision nothing else reached); the equivalent survivors and three
+  reachable-but-unemitted cases are listed in SPEC.md.
+
 - **2026-09-23** — Streaming at every level (SPEC backlog Z1c): the binary
   tree of `btopt`/`btultra`/`btultra2` and the 3-byte hash across a
   two-segment window, and long-distance matching over its own two-segment

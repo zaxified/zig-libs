@@ -6,7 +6,8 @@ Consumer view, API and purpose: [README.md](README.md).
 
 A Zstandard **compressor** that reproduces libzstd 1.5.7's output byte for
 byte: one-shot for every level, 1–22 and negative, and streaming
-(`ZSTD_compressStream2`, for the same sequence of calls) for the same levels. Every strategy is
+(`ZSTD_compressStream2`, for the same sequence of calls) for the same levels;
+and a one-shot **decoder** ported from libzstd's (see *Decoder*). Every strategy is
 translated from libzstd — `fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both
 the hash chain and the row-based search, `btlazy2`'s binary tree, and the
 optimal parsers `btopt`/`btultra`/`btultra2` — together with the frame/block
@@ -17,16 +18,17 @@ file-by-file map.
 
 **Goal (2026-09-22): production quality — as close to libzstd's feature set
 and behaviour as possible, so that a Zig program never needs to link libzstd.**
-Today it is the compressor, one-shot and streaming; everything else libzstd offers is in *Backlog / deferred* below,
+Today it is the compressor, one-shot and streaming, and the one-shot
+decoder; everything else libzstd offers is in *Backlog / deferred* below,
 with its cost.
 
 Not here yet, and a reader might expect it (each is a backlog item):
 
-- **A decoder.** `std.compress.zstd.Decompress` decodes what this module
-  writes and is the tests' round-trip oracle, but it refuses dictionary
-  frames, leaves checksum verification as a TODO panic, and defaults to an
-  8 MB window (frames of levels 20–22 on large inputs need
-  `window_len` raised). Z2.
+- **Streaming decompression and dictionaries.** `Decompressor.decompress`
+  takes the whole input and a destination large enough for the whole
+  output (`decompressAlloc` sizes it from the headers); libzstd's
+  `ZSTD_decompressStream` with its window limit is Z2b, dictionary frames
+  Z2c. Until then a frame naming a dictionary is `error.DictionaryWrong`.
 - **The rest of the streaming API.** `Stream` (see *Algorithm*) does
   libzstd's default buffered modes for one frame; not the stable-buffer
   modes, a second frame on the same context (Z1, Z13), or a `std.Io.Writer`
@@ -229,6 +231,48 @@ small flushes cost ratio and time; Z1 is the real stream. `Writer.Error` has
 one member, so a failure of our own (out of memory) is kept in
 `FrameWriter.err`; null there means `output` failed.
 
+## Decoder
+
+A port of libzstd's decoder (`lib/decompress/*`, `lib/common/entropy_common.c`,
+`fse_decompress.c` and the reader half of `bitstream.h`): frame header, raw,
+RLE and compressed blocks, Huffman literals (single- and double-symbol
+tables, one and four streams, the choice between them by
+`HUF_selectDecoder`), FSE sequence tables (predefined, RLE, compressed,
+repeat), repeat offsets, content checksum, concatenated and skippable
+frames, and the frame queries (`getFrameHeader`, `getFrameContentSize`,
+`findFrameCompressedSize`, `findDecompressedSize`, `decompressBound`,
+`decompressionMargin`, `readSkippableFrame`, `getDictIdFromFrame`). Errors
+are named after `ZSTD_error_*`, so a differential run compares the error
+class too.
+
+The contract is correctness: every valid frame decodes to its content, and
+a malformed one is refused where libzstd refuses it. Corrupt input is where
+ports drift, so the code keeps libzstd's behaviour past the end of a
+corrupt bitstream (the reader keeps handing out bits from its stale
+container, and only the final "fully consumed" check rejects the block)
+and uses libzstd's fast four-stream Huffman loop wherever libzstd does on a
+64-bit little-endian CPU with BMI2 — that loop does not check a stream's
+end mark, so which damaged literal sections are accepted depends on it.
+Three simplifications, none of which changes a decoded byte: literals are
+decoded into the context's own buffer (libzstd parks them at the far end
+of `dst` when there is room, saving a copy); only the "short" sequence
+decoder is ported (libzstd switches to a prefetching one for cold
+dictionaries and long distances, which checks the bitstream's end before
+its last eight sequences run — on corrupt input only the reported error can
+differ); and one deliberate difference on malformed frames: a block that
+decodes to more than the frame's `Block_Maximum_Size` is refused for every
+block type (`error.CorruptionDetected`), as RFC 8878 §3.1.1.2.4 and
+libzstd's streaming decoder require; libzstd's one-shot `ZSTD_decompress`
+does not bound raw and RLE blocks.
+
+Speed: 1.04–1.05× libzstd's decode time on 200 MB of system binaries
+compressed at levels 3 and 19 (decode only, best of 5, ReleaseFast). std's
+decoder takes 30× libzstd's time on the same frames, which is why this is a
+port and not an extension of it.
+
+`Decompressor` holds the tables and a 128 KB literal buffer (≈ 190 KB) on
+the heap; `decompress` allocates one per call.
+
 ## Limits and refusals
 
 | limit | value | source |
@@ -241,6 +285,9 @@ one member, so a failure of our own (out of memory) is kept in
 | stream level | as one-shot (`stream_max_level` = `max_level`) | level 22 without a pledged size uses a 128 MB window and long-distance matching (window log 27, as libzstd), ≈ 1 GB |
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
 | stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
+| decode window | none: one-shot decoding references the whole output, as libzstd's one-shot decoder does (window log ≤ 31 in the header, else `error.FrameParameterWindowTooLarge`) | `ZSTD_WINDOWLOG_MAX` (64-bit); the streaming limit `ZSTD_d_windowLogMax` belongs to Z2b |
+| decode destination | the whole output; too small is `error.DstSizeTooSmall`. `decompressAlloc` sizes from the headers, else `decompressBound`, never above its `max_size` | `ZSTD_decompress` |
+| decode block | decoded size ≤ `Block_Maximum_Size` for every block type | RFC 8878; libzstd's one-shot decoder checks compressed blocks only (see *Decoder*) |
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
 pin the level refusal and the destination bound, `stream_test.zig` the
@@ -471,6 +518,41 @@ finder), 13 (`btlazy2`) and 16 (`btopt`, 36 min), identical to plain `zref`
 in ReleaseSafe, where an index overflow would have trapped.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
+**Decoder (2026-09-23).** The contract is correctness (see *Decoder*), so
+the anchor is libzstd's own decoder rather than digests: every golden and
+streaming frame above is decoded back to its input in the test suite, and
+off-line, through `tools/zdec.c`, 13 600 random valid frames from libzstd's
+`tests/decodecorpus` (block sizes down to 1 KB, forced raw/RLE/compressed
+blocks, content sizes on and off) and the CLI's `--long=30`,
+`--rsyncable` and concatenated/skippable frames decoded identically, and of
+5 000 damaged frames (bit flips, byte changes, cuts, insertions, zeroed
+runs) none crashed a ReleaseSafe build, none decoded differently, and every
+one libzstd refused was refused, with the same error except the
+block-maximum difference in *Decoder*.
+
+A mutation sweep of the new decoder files (64 single-edit mutations) then
+drove the tests: 26 were caught by the corpus round trips and
+`decoder_test.zig`, 3 had to be rewritten to compile (one of them,
+`more_than_1_frame` ignored, is caught by `decoder_test`), and for the
+survivors a hunt ran each mutant against the unmutated decoder over 45 000
+valid and damaged `decodecorpus` frames. It found a frame for 11 of them;
+those frames are `src/testdata/decode_kats.zig` (13–210 bytes each, random
+content, each with libzstd's verdict and the mutation it pins): the fast
+Huffman loop's conditions and table log (it decides which damaged literals
+are accepted), X1/X2 choice, the bitstream's exact end, a literal length
+past the literals, a content size larger than the output, the window
+mantissa and `decompressBound` for frames without a size. The rest survive:
+
+| mutation | why no case exists |
+|---|---|
+| bit reader `ptr >= start + 8` → `>`, `bitsConsumed < 64` → `<=`, `ptr - start < nbBytes` → `<=` | equivalent: the two reload paths read the same bytes at the boundary, and callers do not tell `endOfBuffer` from `completed` |
+| `FSE_readNCount` `remaining != 1` → `> 1`; Huffman `rankStats[1] < 2` → `< 1`; FSE weight table `tableLog > maxLog` → `> maxLog + 1` | equivalent: `remaining` never drops below 1; a single weight-1 symbol is odd and caught by `& 1`; this port's weight table holds log 6 and refuses more itself |
+| FSE `fastMode` at `count >= tableSize/2` → `>` | equivalent: at exactly half the table no state consumes 0 bits |
+| `FSE_readNCount` `count >= threshold` → `>`, `bitCount > 32` → `>=` | reachable only in damaged headers (no encoder writes the value `threshold`); 45 000 frames did not produce one |
+| Huffman fast-loop and X2 tail limits (`p_end - p > 3`, `op[3] >= oend`, `dtLog <= 11`, X2 level-2 fill rounding), `HUF_selectDecoder`'s weighting, raw literals read in place vs copied, `total_bits >= 31` reload, last-literals bound, the checksum computed when ignored, the frame-size precheck | equivalent: each changes only which of two equal paths runs |
+| 4 streams with exactly 6 literals refused; an RLE table of the largest code refused | **uncovered**: valid by the format, but no encoder emits either (libzstd uses one stream below 256 literals, and RLE tables only for three or more sequences, which the largest codes cannot fit in a block) |
+| `nbSeq` ≥ 0x7F00 (3-byte count) off by one | **uncovered**: needs a block of more than 32 512 sequences; generated token streams reached 31 106 |
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## What is deliberately not done
@@ -521,16 +603,19 @@ dictionaries are undecided.
     buffer and waits for a full block), `ZSTD_CCtx_reset` and a second frame
     on the same context (with Z13), a `std.Io.Writer` over `Stream`
     (replacing `FrameWriter` for callers that want libzstd's bytes).
-- **Z2 — Decoder.** Frames with dictionaries (raw content and zstd-format:
-  entropy tables + repcodes + content as history), checksum verification,
-  configurable window limit (`ZSTD_d_windowLogMax`), streaming
-  (`ZSTD_decompressStream`), and the frame utilities
-  (`ZSTD_getFrameContentSize`, `ZSTD_findFrameCompressedSize`,
-  `ZSTD_getDictID_fromFrame`, skippable frames). Correctness, not byte
-  equality, is the contract: differential against libzstd's decoder plus
-  its fuzz corpus. Can start from std's decoder (MIT) — it is a superset,
-  which is why it is not a duplicate of std (CONVENTIONS.md §1.3). Legacy
-  (pre-v0.8) formats: no. **1–2 sessions.**
+- **Z2 — Decoder.** ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
+  checksum verification, concatenated and skippable frames and the frame
+  utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
+  so it was not the base); see *Decoder*. Left:
+  - **Z2b — streaming** (`ZSTD_decompressStream`: buffered input and output,
+    the window limit `ZSTD_d_windowLogMax`, the stable-output mode) and a
+    `std.Io.Reader` over it. The block decoder already takes the history as
+    two segments (`dblock.History`), as a wrapped output buffer needs.
+    **~1 session.**
+  - **Z2c — dictionaries**: raw-content and zstd-format (`ZSTD_loadDEntropy`:
+    entropy tables, repcodes, content as history), a reusable `DDict`, and
+    the multiple-dictionary table. **~1 session**; together with Z4.
+  Legacy (pre-v0.8) formats: no. Magicless frames: with Z6.
 - ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
   *Algorithm*. (The row tag table needs no reduction: it holds tags and
   in-row heads, not indices.)
@@ -582,12 +667,15 @@ dictionaries are undecided.
   that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
   caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3 done) Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a done) Z2b → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 
 ## Open
 
+- Decoder: three reachable decisions without a case (see *Anchoring*):
+  a block of ≥ 0x7F00 sequences, four-stream literals of exactly 6 bytes, an
+  RLE sequence table of the largest code.
 - Reachable boundaries without a case: the sequence encoding-type
   heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality, the table
   pricing's low-probability switch at exactly 2048 sequences, and 13

@@ -9,7 +9,8 @@
 //! frequently) (`testdata/goldens.zig`, written by
 //! `tools/gen-goldens.sh`). A digest rather than the frame itself keeps the
 //! repository small; the recipe regenerates the reference bytes when a
-//! mismatch needs to be looked at.
+//! mismatch needs to be looked at. Each frame is also decoded by this
+//! module's decoder and must give the input back.
 
 const std = @import("std");
 const zstd = @import("root.zig");
@@ -37,15 +38,19 @@ test "every covered corpus combination has a golden row, and nothing else does" 
     try std.testing.expectEqual(n, goldens.rows.len);
 }
 
-test "output is byte-identical to libzstd 1.5.7 on the whole corpus" {
+test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes back" {
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
+    var dec = try zstd.Decompressor.init(gpa, .{});
+    defer dec.deinit();
     for (corpus.cases) |case| {
         const src = try gpa.alloc(u8, case.len);
         defer gpa.free(src);
         corpus.generate(case, src);
         const dst = try gpa.alloc(u8, zstd.compressBound(src.len));
         defer gpa.free(dst);
+        const back = try gpa.alloc(u8, src.len + 1);
+        defer gpa.free(back);
         for (corpus.levels) |level| for ([_]bool{ false, true }) |ck| {
             if (!corpus.covered(case, level, ck)) continue;
             const g = find(case.name, level, ck).?;
@@ -66,6 +71,16 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus" {
             const hex = std.fmt.bytesToHex(digest, .lower);
             if (n != g.len or !std.mem.eql(u8, &hex, g.sha256)) {
                 std.debug.print("MISMATCH {s} level {d} checksum {}: len {d} (libzstd {d})\n", .{ case.name, level, ck, n, g.len });
+                mismatches += 1;
+            }
+            // The frame is libzstd's own; the decoder must give the input back.
+            const got = dec.decompress(back, dst[0..n]) catch |e| {
+                std.debug.print("DECODE ERROR {s} level {d} checksum {}: {s}\n", .{ case.name, level, ck, @errorName(e) });
+                mismatches += 1;
+                continue;
+            };
+            if (got != src.len or !std.mem.eql(u8, back[0..got], src)) {
+                std.debug.print("DECODE MISMATCH {s} level {d} checksum {}\n", .{ case.name, level, ck });
                 mismatches += 1;
             }
             // A correction leaves the output as it was; that it ran at all

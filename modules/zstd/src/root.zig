@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! zstd — Zstandard (RFC 8878) compressor for every level, 1-22 and the
-//! negative ("fast") levels, byte-identical to libzstd 1.5.7.
+//! negative ("fast") levels, byte-identical to libzstd 1.5.7, and a decoder
+//! ported from libzstd's.
 //!
-//! Decoding is std's job (`std.compress.zstd.Decompress`); this module fills
-//! the other half. It is a port of every libzstd strategy — `fast`, `dfast`,
+//! The compressor is a port of every libzstd strategy — `fast`, `dfast`,
 //! `greedy`, `lazy`, `lazy2` (hash-chain and row match finders), `btlazy2`,
 //! and the optimal parsers `btopt`, `btultra`, `btultra2` — with the frame
 //! and block driver, the block pre- and post-splitters, long-distance
@@ -17,16 +17,22 @@
 //! the same bytes for the same sequence of calls.
 //!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
-//! match tables, as in libzstd. See SPEC.md.
+//! match tables, as in libzstd.
+//!
+//! `Decompressor` / `decompress` / `decompressAlloc` decode whole frames
+//! one-shot (`ZSTD_decompress`), with content checksums, concatenated and
+//! skippable frames, and the frame queries (`getFrameContentSize`,
+//! `decompressBound`, ...); errors carry libzstd's names. See SPEC.md.
 
 const std = @import("std");
 const frame = @import("frame.zig");
 const params = @import("params.zig");
 const frame_writer = @import("frame_writer.zig");
 const stream = @import("stream.zig");
+const dec = @import("decompress.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`; decode with `std.compress.zstd`",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2` — and a one-shot decoder ported from libzstd's (checksums, concatenated and skippable frames, frame queries)",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -84,6 +90,53 @@ pub const InBuffer = stream.InBuffer;
 pub const OutBuffer = stream.OutBuffer;
 pub const stream_max_level = stream.max_level;
 
+/// Decoding context (libzstd's `ZSTD_DCtx`): reuse it across calls to
+/// avoid reallocating its ~190 KB of tables.
+pub const Decompressor = dec.Decompressor;
+pub const DecompressOptions = dec.Options;
+/// Errors named after libzstd's error codes (`ZSTD_error_*`).
+pub const DecompressError = dec.Error;
+pub const FrameHeader = dec.FrameHeader;
+pub const FrameType = dec.FrameType;
+pub const HeaderResult = dec.HeaderResult;
+pub const SkippableFrame = dec.SkippableFrame;
+pub const getFrameHeader = dec.getFrameHeader;
+pub const frameHeaderSize = dec.frameHeaderSize;
+pub const getFrameContentSize = dec.getFrameContentSize;
+pub const findFrameCompressedSize = dec.findFrameCompressedSize;
+pub const findDecompressedSize = dec.findDecompressedSize;
+pub const decompressBound = dec.decompressBound;
+pub const decompressionMargin = dec.decompressionMargin;
+pub const readSkippableFrame = dec.readSkippableFrame;
+pub const getDictIdFromFrame = dec.getDictIdFromFrame;
+pub const isFrame = dec.isFrame;
+pub const isSkippableFrame = dec.isSkippableFrame;
+
+/// Decode every frame in `src` into `dst` (`ZSTD_decompress`): returns
+/// the number of bytes written. Concatenated and skippable frames are
+/// allowed; content checksums are verified.
+pub fn decompress(gpa: std.mem.Allocator, dst: []u8, src: []const u8) (DecompressError || error{OutOfMemory})!usize {
+    var d = try Decompressor.init(gpa, .{});
+    defer d.deinit();
+    return d.decompress(dst, src);
+}
+
+/// Decode `src` into a newly allocated buffer owned by the caller. The
+/// buffer is sized from the frame headers (`findDecompressedSize`), or
+/// from `decompressBound` when a frame does not record its size; either
+/// way at most `max_size` bytes, beyond which the call fails with
+/// `error.DstSizeTooSmall`.
+pub fn decompressAlloc(gpa: std.mem.Allocator, src: []const u8, max_size: usize) (DecompressError || error{OutOfMemory})![]u8 {
+    const size: usize = if (try findDecompressedSize(src)) |n| blk: {
+        if (n > max_size) return error.DstSizeTooSmall;
+        break :blk @intCast(n);
+    } else @intCast(@min(try decompressBound(src), max_size));
+    const buf = try gpa.alloc(u8, size);
+    errdefer gpa.free(buf);
+    const n = try decompress(gpa, buf, src);
+    return gpa.realloc(buf, n) catch buf[0..n];
+}
+
 /// Compress `src` into a newly allocated frame owned by the caller.
 pub fn compressAlloc(gpa: std.mem.Allocator, src: []const u8, opts: Options) Error![]u8 {
     const buf = try gpa.alloc(u8, compressBound(src.len));
@@ -109,13 +162,18 @@ test {
     _ = @import("frame_writer.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");
+    _ = @import("dbits.zig");
+    _ = @import("huf_dec.zig");
+    _ = @import("dblock.zig");
+    _ = @import("decompress.zig");
+    _ = @import("decoder_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
 }
 
 /// Decode with std. std's own checksum verification is a TODO panic in the
 /// streaming path (0.16), so a checksummed frame is checked here instead.
-fn decompress(gpa: std.mem.Allocator, compressed: []const u8, has_checksum: bool) ![]u8 {
+fn stdDecompress(gpa: std.mem.Allocator, compressed: []const u8, has_checksum: bool) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var in: std.Io.Reader = .fixed(compressed);
@@ -138,7 +196,7 @@ test "empty input is the 9-byte frame libzstd emits" {
     try std.testing.expectEqualSlices(u8, &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 }, z);
 }
 
-test "round trip through std's decoder at every implemented level" {
+test "round trip through std's decoder and this one at every implemented level" {
     const gpa = std.testing.allocator;
     var src: [40000]u8 = undefined;
     var prng: std.Random.DefaultPrng = .init(0x5eed);
@@ -155,9 +213,12 @@ test "round trip through std's decoder at every implemented level" {
             const z = try compressAlloc(gpa, &src, .{ .level = level, .checksum = ck });
             defer gpa.free(z);
             try std.testing.expect(z.len < src.len / 2);
-            const back = try decompress(gpa, z, ck);
+            const back = try stdDecompress(gpa, z, ck);
             defer gpa.free(back);
             try std.testing.expectEqualSlices(u8, &src, back);
+            const ours = try decompressAlloc(gpa, z, src.len);
+            defer gpa.free(ours);
+            try std.testing.expectEqualSlices(u8, &src, ours);
         }
     }
 }

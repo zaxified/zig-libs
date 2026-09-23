@@ -2,18 +2,18 @@
 
 **Zstandard (RFC 8878) compressor** for every level — 1–22 and the negative
 ("fast") levels — emitting **exactly the bytes libzstd 1.5.7 emits** for the same input
-and level. Decoding is not here: `std.compress.zstd.Decompress` already does
-it. This module is the half std lacks.
+and level, and a **decoder** ported from libzstd's: as fast (1.05× its time),
+checksums verified, concatenated and skippable frames, the frame size
+queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
+leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
 Not yet a full libzstd replacement — that is the goal: one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
 for the same calls) covers every level too, and `FrameWriter` is a
 `std.Io.Writer` that emits one frame per flush; the stable-buffer and
-context-reuse parts of the streaming API, a decoder with dictionaries,
-dictionaries themselves, multithreading and the advanced parameters are
-queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs). Note that
-std's decoder defaults to an 8 MB window: frames of levels 20–22 on large
-inputs need its `window_len` raised.
+context-reuse parts of the streaming API, streaming decompression,
+dictionaries, multithreading and the advanced parameters are
+queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
@@ -66,10 +66,22 @@ var buf = try gpa.alloc(u8, zstd.compressBound(data.len));
 const n = try zstd.compress(gpa, buf, data, .{ .level = 1, .checksum = true });
 // buf[0..n] is the frame.
 
-// Decode with std:
-var in: std.Io.Reader = .fixed(frame);
-var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
+// Decode: into a new buffer sized from the header (at most max_size) ...
+const back = try zstd.decompressAlloc(gpa, frame, 1 << 30);
+defer gpa.free(back);
+// ... or into your own; reuse a Decompressor to keep its ~190 KB of tables.
+var dec = try zstd.Decompressor.init(gpa, .{});
+defer dec.deinit();
+const out = try gpa.alloc(u8, data.len);
+const len = try dec.decompress(out, frame); // error.DstSizeTooSmall if out is short
 ```
+
+Decoding takes the whole input and a destination for the whole output
+(one-shot, `ZSTD_decompress`); a frame's size is in `getFrameContentSize`
+(null when the header omits it — `decompressBound` then gives an upper
+bound). Errors carry libzstd's names (`error.CorruptionDetected`,
+`error.ChecksumWrong`, `error.SrcSizeWrong`, ...). Streaming decompression
+and dictionary frames are not here yet.
 
 `gpa` backs only the per-call match tables and block buffers; everything is
 freed before `compress` returns.
@@ -150,6 +162,13 @@ corpus inputs at levels -5 … 22, with and without checksum — 470 streams,
 each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 (`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
 
-`src/fuzz_test.zig` round-trips arbitrary input through std's decoder; unit
+The decoder is checked by decoding every golden and streaming frame back to
+its input, by `src/decoder_test.zig` (frame structure, the size queries and
+every error a malformed frame produces, each checked against libzstd), and
+off-line against libzstd's decoder through `tools/zdec.c` (see SPEC.md,
+*Anchoring*).
+
+`src/fuzz_test.zig` round-trips arbitrary input through std's decoder and
+this one, and feeds the decoder arbitrary bytes; unit
 tests cover the FSE normalisation, Huffman depth limiting, bit writer and
 parameter selection.

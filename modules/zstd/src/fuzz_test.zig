@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! Fuzz: compress arbitrary bytes (one-shot, and streamed), decode them with
-//! std, demand the input back.
+//! std and with this module's decoder, demand the input back; and feed the
+//! decoder arbitrary bytes, which must never crash it.
 //!
 //! The compressor's input is caller data, so every byte pattern must yield a
 //! valid frame without a panic. The oracle is std's independent decoder: a
@@ -34,6 +35,16 @@ fn roundTrip(input: []const u8) !void {
     var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .verify_checksum = false });
     _ = try d.reader.streamRemaining(&out.writer);
     try std.testing.expectEqualSlices(u8, input, out.written());
+
+    try decodeBack(z, input);
+}
+
+/// The module's own decoder must agree with std's on the same frame.
+fn decodeBack(z: []const u8, input: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const back = try zstd.decompressAlloc(gpa, z, input.len);
+    defer gpa.free(back);
+    try std.testing.expectEqualSlices(u8, input, back);
 }
 
 /// The same through a `Stream` with a 1 KB window, so the input buffer
@@ -73,6 +84,25 @@ fn streamRoundTrip(input: []const u8) !void {
     var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .verify_checksum = false });
     _ = try d.reader.streamRemaining(&out.writer);
     try std.testing.expectEqualSlices(u8, input, out.written());
+
+    try decodeBack(z.items, input);
+}
+
+/// Decode arbitrary bytes: any result or error, never a panic, never a
+/// write outside the destination (the safe lanes check every index).
+fn decodeAnything(input: []const u8) void {
+    var d = zstd.Decompressor.init(std.testing.allocator, .{}) catch return;
+    defer d.deinit();
+    var out: [1 << 17]u8 = undefined;
+    _ = d.decompress(&out, input) catch {};
+    _ = zstd.decompressBound(input) catch {};
+    _ = zstd.findDecompressedSize(input) catch {};
+}
+
+fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    decodeAnything(buf[0..len]);
 }
 
 fn fuzzStream(_: void, smith: *std.testing.Smith) !void {
@@ -113,8 +143,24 @@ const fuzz_seed_corpus = [_][]const u8{
     fuzzSeed(seed_words ** 7 ++ "abcdefg"),
 };
 
+/// Decoder seeds: hand-built frames (empty; raw block; RLE block;
+/// skippable frame followed by a frame; checksummed), so mutations start
+/// from something the decoder parses deep into.
+const decode_seed_corpus = [_][]const u8{
+    fuzzSeed(""),
+    fuzzSeed(&.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 }),
+    fuzzSeed(&.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29, 0x00, 0x00, 'h', 'e', 'l', 'l', 'o' }),
+    fuzzSeed(&.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x40, 0x03, 0x02, 0x00, 'z' }),
+    fuzzSeed(&.{ 0x50, 0x2a, 0x4d, 0x18, 0x02, 0x00, 0x00, 0x00, 'h', 'i', 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 }),
+    fuzzSeed(&seed_noise),
+};
+
 test "fuzz: every input round-trips through std's decoder" {
     try std.testing.fuzz({}, fuzzCompress, .{ .corpus = &fuzz_seed_corpus });
+}
+
+test "fuzz: arbitrary bytes never crash the decoder" {
+    try std.testing.fuzz({}, fuzzDecode, .{ .corpus = &decode_seed_corpus });
 }
 
 test "fuzz: every input streamed round-trips through std's decoder" {

@@ -1,6 +1,6 @@
 zstd — third-party attribution
 
-This file carries a CONDITION. The encoder in `src/` is a translation of C
+This file carries a CONDITION. The encoder and the decoder in `src/` are a translation of C
 source from libzstd (github.com/facebook/zstd, tag v1.5.7, commit
 f8745da6ff1ad1e7bab384bd1f9d742439278e99) into Zig. The BSD licence that source
 is offered under requires its copyright notice, conditions and disclaimer to
@@ -53,17 +53,31 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/common/bitstream.h              bit writer                            -> src/bitstream.zig
   lib/compress/hist.c                 byte histograms                       -> src/hist.zig
   lib/common/zstd_internal.h          code tables, default distributions    -> src/sequences.zig
+  lib/decompress/zstd_decompress.c    frame decoder (one-shot), frame
+                                      header, size queries, skippable
+                                      frames                                -> src/decompress.zig
+  lib/decompress/zstd_decompress_block.c, lib/decompress/zstd_decompress_internal.h
+                                      literals and sequences sections,
+                                      sequence tables, sequence execution   -> src/dblock.zig
+  lib/decompress/huf_decompress.c     Huffman decoding tables and streams,
+                                      incl. the fast four-stream loop       -> src/huf_dec.zig
+  lib/common/entropy_common.c         FSE_readNCount, HUF_readStats         -> src/dbits.zig, src/huf_dec.zig
+  lib/common/fse_decompress.c, lib/common/bitstream.h
+                                      FSE decoding, bit reader              -> src/dbits.zig
 
 Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
 and `src/testdata/` are this collection's own work (MIT).
 
-Not taken: libzstd's decoder (std has one), dictionaries, long-distance
-matching below `btopt`, multithreading, `targetCBlockSize` super-blocks.
+Not taken: the streaming decoder, dictionaries, the prefetching sequence
+decoder, the x86-64 assembly Huffman loop (its C twin is ported),
+long-distance matching below `btopt`, multithreading, `targetCBlockSize`
+super-blocks.
 
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and
-SHA-256 digests of its output). `tools/zref.c` and `tools/zstream.c` are this
+SHA-256 digests of its output). `tools/zref.c`, `tools/zstream.c` and
+`tools/zdec.c` (the decoder's differential oracle) are this
 collection's own programs (MIT) calling libzstd's public API. No
 libzstd bytes are stored in this repository.
 
