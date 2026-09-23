@@ -156,7 +156,15 @@
 //!
 //! **Caller obligations with a dispatcher installed:** the `gpa` and the
 //! `on_conn_state` hook must be thread-safe, and `Dispatcher.spawn` must run
-//! the task on a *different* thread (running it inline self-deadlocks).
+//! the task on a *different* thread (running it inline self-deadlocks) — or,
+//! with `Dispatcher.io` set, on a different fiber of the same thread.
+//!
+//! **Fibers (`Dispatcher.io`).** Without it the session lock and the waits
+//! yield-spin, which is right for OS threads and a deadlock for fibers that
+//! share one: a spinning fiber never hands the thread back to the fiber it is
+//! waiting for. With it they park through that `Io` (`std.Io.Mutex` +
+//! `std.Io.Condition`), so an io_uring engine can dispatch each stream to a
+//! fiber of the connection's own thread.
 //!
 //! **Not here: per-user connection rate limiting.** The other half of the
 //! DoS answer (max N new connections/s per user, identified by source IP +
@@ -382,8 +390,11 @@ pub const Task = struct {
 pub const Dispatcher = struct {
     /// Passed back to `spawn`.
     ctx: ?*anyopaque = null,
-    /// Run `task.func(task.ctx)` on a thread **other than the caller's**,
-    /// exactly once, and return true.
+    /// Run `task.func(task.ctx)` exactly once on a task **other than the
+    /// caller's**, and return true. Without `io` that task must be another
+    /// OS thread; with `io` it may be a fiber of the caller's own thread
+    /// (queued, or even switched to before `spawn` returns — it parks on
+    /// the session lock the caller holds, which `io` makes a parking lock).
     ///
     /// Return **false** to refuse: the stream is answered with
     /// RST_STREAM(REFUSED_STREAM) (retryable, §8.7) and nothing is queued.
@@ -391,9 +402,27 @@ pub const Dispatcher = struct {
     /// not queue", so a saturated pool sheds load instead of growing a
     /// backlog behind it.
     ///
-    /// ⚠ Running the task inline on the calling thread self-deadlocks: the
-    /// caller holds `Session.mu`, which the task needs.
+    /// ⚠ Calling `task.func` inline, on the caller's own stack, self-deadlocks
+    /// in either mode: the caller holds the session lock, which the task needs.
     spawn: *const fn (ctx: ?*anyopaque, task: Task) bool,
+    /// How the session's waits block. Null (the default) is the historical
+    /// mode for tasks that are OS threads: the session lock and the two
+    /// "wait for the connection to move" loops yield-spin.
+    ///
+    /// Set it when the tasks `spawn` starts are **fibers sharing a thread**
+    /// (an io_uring engine, `std.Io.Evented`): a spinning fiber never gives
+    /// the thread back, so a stream fiber parked in a socket write while
+    /// holding the session lock would leave the reading fiber spinning on
+    /// that lock forever — a deadlock, not a slowdown. With `io` the lock is
+    /// a `std.Io.Mutex` and the waits are a `std.Io.Condition`, both of
+    /// which park through `io.futexWait` — on a fiber engine, the fiber.
+    /// Every wait is uncancelable: a handler blocked on flow control is
+    /// released by progress or by the connection ending, not by `io`'s
+    /// cancelation.
+    ///
+    /// Must be the `Io` the tasks and the connection's own reader/writer
+    /// run on.
+    io: ?std.Io = null,
     /// Handlers allowed to run concurrently on **one** connection.
     ///
     /// Deliberately NOT `Limits.max_concurrent_streams`, which bounds
@@ -558,6 +587,7 @@ pub fn serve(gpa: Allocator, opts: Options, in: *Reader, out: *Writer) void {
         .in = in,
         .out = out,
         .threaded = opts.dispatcher != null,
+        .io = if (opts.dispatcher) |d| d.io else null,
         .conn = .init(gpa, .server, connOptions(opts)),
     };
     defer s.deinit();
@@ -725,31 +755,69 @@ const Session = struct {
     /// keep waiting for a peer nobody is reading from any more.
     gone: std.atomic.Value(bool) = .init(false),
 
+    // ── the parking variant (`Dispatcher.io` set; inert otherwise) ───────
+    //
+    // Same scheme as above with blocking primitives in place of the spins:
+    // `io_mu` stands in for `mu` (the same invariants 1–5, the same holders),
+    // and `moved` is broadcast whenever something a waiter may be waiting
+    // for has happened — `pump` processed a batch of frames, a handler
+    // retired, the connection task left. Its counter `progress` is what makes
+    // a wait immune to the lost wakeup: a waiter samples it under the lock
+    // when it decides to wait, and sleeps only while it is unchanged.
+
+    /// `Dispatcher.io`, hoisted.
+    io: ?std.Io = null,
+    io_mu: std.Io.Mutex = .init,
+    moved: std.Io.Condition = .init,
+    /// Bumped (under the lock) together with every `moved` broadcast.
+    progress: u32 = 0,
+
     /// Take `mu` (no-op on the sequential path). Yield-spin: this lock is
     /// held across blocking writes, so a plain `spinLoopHint` spin could
     /// starve the holder on a busy core — same reasoning, same shape as
-    /// `h2_upstream.lockBlocking`.
+    /// `h2_upstream.lockBlocking`. With `Dispatcher.io` a contended lock
+    /// parks instead (`io_mu`), which is what fibers of one thread need.
     fn lock(s: *Session) void {
         if (!s.threaded) return;
+        if (s.io) |io| return s.io_mu.lockUncancelable(io);
         while (!s.mu.tryLock()) std.Thread.yield() catch std.atomic.spinLoopHint();
     }
 
     fn unlock(s: *Session) void {
         if (!s.threaded) return;
+        if (s.io) |io| return s.io_mu.unlock(io);
         s.mu.unlock();
     }
 
+    /// Tell every parked waiter that the connection moved. **Caller holds
+    /// the lock.** No-op unless `Dispatcher.io` is set.
+    fn announce(s: *Session) void {
+        const io = s.io orelse return;
+        s.progress +%= 1;
+        s.moved.broadcast(io);
+    }
+
     /// Wait for the connection task to make progress (a WINDOW_UPDATE, more
-    /// DATA). **Must not be called holding `mu`.**
+    /// DATA). **Must not be called holding `mu`.** `seen` is `s.progress` as
+    /// the caller read it under the lock when it found it had to wait.
     ///
     /// Sequential: there is no other task, so the caller pumps the
     /// connection itself — unchanged behavior. Threaded: only the connection
     /// task may touch `in`, so a worker yields and re-checks; `gone` is what
-    /// stops it waiting forever once nobody is reading any more.
-    fn waitForPeer(s: *Session) error{Closed}!void {
+    /// stops it waiting forever once nobody is reading any more. With
+    /// `Dispatcher.io` it parks until `progress` moves past `seen` — if it
+    /// already has, it returns at once, so a WINDOW_UPDATE processed between
+    /// the caller's unlock and this call is not slept through.
+    fn waitForPeer(s: *Session, seen: u32) error{Closed}!void {
         if (!s.threaded) return s.pump();
+        if (s.io) |io| {
+            s.io_mu.lockUncancelable(io);
+            defer s.io_mu.unlock(io);
+            while (s.progress == seen and !s.gone.load(.acquire))
+                s.moved.waitUncancelable(io, &s.io_mu);
+        }
         if (s.gone.load(.acquire)) return error.Closed;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
+        if (s.io == null) std.Thread.yield() catch std.atomic.spinLoopHint();
     }
 
     fn deinit(s: *Session) void {
@@ -783,7 +851,12 @@ const Session = struct {
         // that has left.
         defer if (s.threaded) {
             s.gone.store(true, .release);
-            while (true) {
+            if (s.io) |io| {
+                s.io_mu.lockUncancelable(io);
+                defer s.io_mu.unlock(io);
+                s.announce(); // wakes workers parked in `waitForPeer`
+                while (s.inflight != 0) s.moved.waitUncancelable(io, &s.io_mu);
+            } else while (true) {
                 s.lock();
                 const busy = s.inflight != 0;
                 s.unlock();
@@ -931,6 +1004,7 @@ const Session = struct {
             s.finishJob(id, disp);
             if (disp == .close) s.closing = true;
             s.inflight -= 1;
+            s.announce(); // the drain in `run` waits for `inflight == 0`
             // A slot just freed: pull the next ready stream in now rather
             // than at the next wire event (see `dispatchReady`).
             s.dispatchReady();
@@ -1016,6 +1090,9 @@ const Session = struct {
         _ = s.in.peekGreedy(1) catch return error.Closed; // EOF/timeout/reset
         s.lock();
         defer s.unlock();
+        // Runs before the unlock: whatever this batch carried (credit, DATA,
+        // a reset) is visible to a woken worker the moment it holds the lock.
+        defer s.announce();
         const bytes = s.in.buffered();
         var chunk: []const u8 = bytes;
         s.in.toss(bytes.len);
@@ -2237,9 +2314,11 @@ const Framer = struct {
         var off: usize = 0;
         while (off < body.len) {
             var n: usize = 0;
+            var seen: u32 = undefined;
             const step: Step = blk: {
                 s.lock();
                 defer s.unlock();
+                seen = s.progress;
                 if (s.jobs.getPtr(f.id)) |job| {
                     if (job.rst) break :blk .dead_keep;
                 }
@@ -2267,7 +2346,7 @@ const Framer = struct {
                     off += n;
                     f.data_sent = true;
                 },
-                .wait => s.waitForPeer() catch return f.die(.close),
+                .wait => s.waitForPeer(seen) catch return f.die(.close),
                 .dead_keep => return f.die(.keep),
                 .dead_close => return f.die(.close),
             }
@@ -2402,6 +2481,7 @@ const StreamBody = struct {
         const b: *StreamBody = @alignCast(@fieldParentPtr("reader", r));
         while (true) {
             var n: usize = 0;
+            var seen: u32 = undefined;
             // **Invariants 4+5**: the `*Job` is re-derived under `mu` and
             // never leaves this section — `onData` may append to (and so
             // reallocate) `job.body` from the connection task at any moment,
@@ -2409,6 +2489,7 @@ const StreamBody = struct {
             const step: Step = blk: {
                 b.s.lock();
                 defer b.s.unlock();
+                seen = b.s.progress;
                 const job = b.s.jobs.getPtr(b.id) orelse break :blk .fail;
                 if (job.rst) break :blk .fail;
                 const src = limit.sliceConst(job.unread());
@@ -2446,7 +2527,7 @@ const StreamBody = struct {
                     return error.ReadFailed;
                 },
                 .eof => return error.EndOfStream,
-                .wait => b.s.waitForPeer() catch return error.ReadFailed,
+                .wait => b.s.waitForPeer(seen) catch return error.ReadFailed,
                 .copied => {
                     // Outside the lock on purpose: this write can re-enter
                     // the connection through `Framer` (see `scratch`), which
@@ -4953,6 +5034,10 @@ const StagedReader = struct {
         /// keep EOF from racing the workers).
         counter: ?*std.atomic.Value(usize) = null, // see awaitAtLeast's comment
         at_least: usize = 0,
+        /// Withhold them until this event is set — the gate the fiber tests
+        /// use: waiting on it parks the reading fiber, where the two gates
+        /// above would spin the one thread every fiber shares.
+        event: ?*std.Io.Event = null,
         bytes: []const u8,
     };
 
@@ -4973,6 +5058,7 @@ const StagedReader = struct {
                 if (st.gate) |g| awaitFlag(sr.io, g) catch return error.ReadFailed;
                 if (st.counter) |c|
                     awaitAtLeast(sr.io, c, st.at_least) catch return error.ReadFailed;
+                if (st.event) |e| e.waitUncancelable(sr.io);
             }
             const src = limit.sliceConst(st.bytes[sr.off..]);
             if (src.len == 0) {
@@ -5010,7 +5096,20 @@ const FrameWatcher = struct {
     /// never need to represent more than `usize` can hold — see
     /// `awaitAtLeast`'s comment for the rest of the reasoning.
     data_bytes: std.atomic.Value(usize) = .init(0),
+    /// Fiber tests only: the same facts as events a fiber can park on, and
+    /// a write that parks. `park` is what a socket write on an io_uring
+    /// engine does — the writing fiber, still holding the session lock,
+    /// hands the thread to whoever is ready — and it is that hand-over a
+    /// spinning lock turns into a deadlock.
+    fiber: ?struct {
+        io: std.Io,
+        park: bool = true,
+        ping_ack: ?*std.Io.Event = null,
+        data: []const DataGate = &.{},
+    } = null,
     writer: Writer,
+
+    const DataGate = struct { at_least: usize, ev: *std.Io.Event };
 
     fn init(gpa: Allocator, buffer: []u8) FrameWatcher {
         return .{
@@ -5037,6 +5136,11 @@ const FrameWatcher = struct {
         for (0..splat) |_| fw.buf.appendSlice(fw.gpa, last) catch return error.WriteFailed;
         consumed += last.len * splat;
         fw.classify();
+        if (fw.fiber) |f| {
+            if (f.ping_ack) |e| if (fw.ping_ack.load(.acquire)) e.set(f.io);
+            for (f.data) |g| if (fw.data_bytes.load(.acquire) >= g.at_least) g.ev.set(f.io);
+            if (f.park) f.io.sleep(.fromMilliseconds(1), .awake) catch return error.WriteFailed;
+        }
         return consumed;
     }
 
@@ -5594,6 +5698,313 @@ test "dispatcher: the connection window bounds two concurrent senders (§6.9.1)"
     }
     // The connection window really was the binding constraint: more octets
     // were delivered than it ever held at once.
+    try testing.expect(fw.data_bytes.load(.acquire) > fc_grant);
+}
+
+// ── concurrent handlers as fibers of ONE thread (`Dispatcher.io`) ───────────
+//
+// The same scenarios as above under the scheduling rule of fibers sharing a
+// thread: exactly one task runs at a time, and a task gives the thread up
+// only when it blocks through `Io`. Zig 0.16's own fiber engine cannot serve
+// here — `std.Io.Evented` does not compile in 0.16.0 (`Io/Uring.zig` returns
+// `error.ReadOnlyFileSystem` outside its declared error sets) — so `BatonIo`
+// models the rule with OS threads and one baton: a task runs only while it
+// holds the baton, and releases it only inside a blocking `Io` call (futex
+// wait, sleep). A task that spins with `std.Thread.yield` keeps the baton,
+// exactly as a spinning fiber keeps its thread.
+//
+// What makes these tests bite: the writer PARKS (`FrameWatcher.fiber.park`),
+// so a stream task regularly holds the session lock across a hand-over, and
+// every gate is an `std.Io.Event`, never a spin. Without `Dispatcher.io` (the
+// yield-spin lock) they hang on the first contended lock — measured on the
+// first of them before `Dispatcher.io` existed.
+
+/// `std.Io.Threaded` with the one-runner-at-a-time rule of a fiber engine.
+/// Every task must hold `baton` to run: the test thread from `init` to
+/// `deinit`, a dispatched task from start to end (`BatonDispatcher.run`).
+const BatonIo = struct {
+    threaded: std.Io.Threaded,
+    baton: std.Io.Mutex = .init,
+    vtable: std.Io.VTable,
+
+    /// The overrides are called with `Threaded`'s own userdata (every other
+    /// vtable entry is Threaded's and needs it), so they find the baton here.
+    /// Test-only and one at a time: the test runner runs tests sequentially.
+    var active: ?*BatonIo = null;
+
+    fn init(b: *BatonIo, gpa: Allocator) void {
+        b.* = .{ .threaded = .init(gpa, .{}), .vtable = undefined };
+        b.vtable = b.inner().vtable.*;
+        b.vtable.futexWait = futexWait;
+        b.vtable.futexWaitUncancelable = futexWaitUncancelable;
+        b.vtable.sleep = sleep;
+        std.debug.assert(active == null);
+        active = b;
+        b.enter();
+    }
+
+    fn deinit(b: *BatonIo) void {
+        b.leave();
+        active = null;
+        b.threaded.deinit();
+    }
+
+    /// The `Io` the code under test gets: blocking hands the baton over.
+    fn io(b: *BatonIo) std.Io {
+        return .{ .userdata = b.inner().userdata, .vtable = &b.vtable };
+    }
+
+    /// The plain `Threaded` underneath, for the harness's own plumbing.
+    fn inner(b: *BatonIo) std.Io {
+        return b.threaded.io();
+    }
+
+    fn enter(b: *BatonIo) void {
+        b.baton.lockUncancelable(b.inner());
+    }
+
+    fn leave(b: *BatonIo) void {
+        b.baton.unlock(b.inner());
+    }
+
+    fn futexWait(ud: ?*anyopaque, ptr: *const u32, expected: u32, t: std.Io.Timeout) std.Io.Cancelable!void {
+        const b = active.?;
+        b.leave();
+        defer b.enter();
+        return b.inner().vtable.futexWait(ud, ptr, expected, t);
+    }
+
+    fn futexWaitUncancelable(ud: ?*anyopaque, ptr: *const u32, expected: u32) void {
+        const b = active.?;
+        b.leave();
+        defer b.enter();
+        b.inner().vtable.futexWaitUncancelable(ud, ptr, expected);
+    }
+
+    fn sleep(ud: ?*anyopaque, t: std.Io.Timeout) std.Io.Cancelable!void {
+        const b = active.?;
+        b.leave();
+        defer b.enter();
+        return b.inner().vtable.sleep(ud, t);
+    }
+};
+
+/// A `Dispatcher` whose tasks obey `BatonIo`'s rule — the shape of a fiber
+/// engine dispatching each stream to a fiber of the connection's thread.
+const BatonDispatcher = struct {
+    b: *BatonIo,
+    group: std.Io.Group = .init,
+
+    fn iface(d: *BatonDispatcher, per_conn: u32) Dispatcher {
+        return .{ .ctx = d, .spawn = spawn, .max_concurrent_handlers = per_conn, .io = d.b.io() };
+    }
+
+    fn spawn(ctx: ?*anyopaque, task: Task) bool {
+        const d: *BatonDispatcher = @ptrCast(@alignCast(ctx.?));
+        d.group.concurrent(d.b.inner(), run, .{ d.b, task }) catch return false;
+        return true;
+    }
+
+    fn run(b: *BatonIo, task: Task) void {
+        b.enter();
+        defer b.leave();
+        task.func(task.ctx);
+    }
+
+    /// Wait for every task to have returned (the session only guarantees
+    /// they are off it); blocking, so the baton goes.
+    fn join(d: *BatonDispatcher) void {
+        d.b.leave();
+        defer d.b.enter();
+        d.group.await(d.b.inner()) catch {};
+    }
+};
+
+const FiberOverlapProbe = struct {
+    io: std.Io,
+    t0: i96 = 0,
+    slow_exit: i96 = 0,
+    fast_enter: i96 = 0,
+    fast_exit: i96 = 0,
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *FiberOverlapProbe = @ptrCast(@alignCast(req.context.?));
+        if (std.mem.eql(u8, req.path, "/slow")) {
+            try p.io.sleep(.fromMilliseconds(300), .awake);
+            // A body bigger than the writer's buffer: several parking
+            // writes, each under the session lock.
+            var chunk: [1024]u8 = @splat('s');
+            for (0..16) |_| try rw.writeAll(&chunk);
+            p.slow_exit = nowNs(p.io);
+        } else {
+            p.fast_enter = nowNs(p.io);
+            try rw.writeAll("ok");
+            p.fast_exit = nowNs(p.io);
+        }
+    }
+};
+
+test "dispatcher (fibers): /fast completes while /slow sleeps, one runner" {
+    const gpa = testing.allocator;
+    var bio: BatonIo = undefined;
+    bio.init(gpa);
+    defer bio.deinit();
+    const io = bio.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const slow = try stageGet(&peer, "/slow");
+    const fast = try stageGet(&peer, "/fast");
+
+    var wbuf: [512]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    fw.fiber = .{ .io = io };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{.{ .bytes = peer.wire.items }}, &rbuf);
+
+    var fd: BatonDispatcher = .{ .b = &bio };
+    var probe: FiberOverlapProbe = .{ .io = io };
+    probe.t0 = nowNs(io);
+    serve(gpa, .{
+        .handler = FiberOverlapProbe.handler,
+        .context = &probe,
+        .dispatcher = fd.iface(8),
+    }, &sr.reader, &fw.writer);
+    fd.join();
+
+    peer.wire.clearRetainingCapacity();
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(slow).status);
+    try testing.expectEqual(@as(usize, 16 * 1024), peer.resp(slow).body.items.len);
+    try testing.expectEqual(@as(u16, 200), peer.resp(fast).status);
+    // Overlap with one runner at a time: /fast ran to completion inside /slow's sleep.
+    try testing.expect(probe.fast_exit < probe.slow_exit);
+    try testing.expect(probe.fast_exit - probe.t0 < 300 * std.time.ns_per_ms);
+}
+
+const FiberPingProbe = struct {
+    io: std.Io,
+    entered: std.Io.Event = .unset,
+    ack: std.Io.Event = .unset,
+
+    fn handler(req: *Server.Request, rw: *Server.ResponseWriter) anyerror!void {
+        const p: *FiberPingProbe = @ptrCast(@alignCast(req.context.?));
+        p.entered.set(p.io);
+        // Parked on application state the connection itself must produce.
+        p.ack.waitUncancelable(p.io);
+        try rw.writeAll("ok");
+    }
+};
+
+test "dispatcher (fibers): a PING is answered while a handler is parked" {
+    const gpa = testing.allocator;
+    var bio: BatonIo = undefined;
+    bio.init(gpa);
+    defer bio.deinit();
+    const io = bio.io();
+
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/block");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    try peer.conn.sendPing(&peer.wire, .{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    const stage1 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage1);
+    peer.wire.clearRetainingCapacity();
+
+    var probe: FiberPingProbe = .{ .io = io };
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    fw.fiber = .{ .io = io, .ping_ack = &probe.ack };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .event = &probe.entered, .bytes = stage1 },
+    }, &rbuf);
+
+    var fd: BatonDispatcher = .{ .b = &bio };
+    serve(gpa, .{
+        .handler = FiberPingProbe.handler,
+        .context = &probe,
+        .dispatcher = fd.iface(8),
+    }, &sr.reader, &fw.writer);
+    fd.join();
+
+    try testing.expect(fw.ping_ack.load(.acquire));
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(u16, 200), peer.resp(sid).status);
+}
+
+test "dispatcher (fibers): flow-control waits park, and the connection window bounds two senders" {
+    const gpa = testing.allocator;
+    var bio: BatonIo = undefined;
+    bio.init(gpa);
+    defer bio.deinit();
+    const io = bio.io();
+
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = fc_stream_window });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid_a = try stageGet(&peer, "/big/a");
+    const sid_b = try stageGet(&peer, "/big/b");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+    var grants: [3][]u8 = undefined;
+    for (&grants) |*g| {
+        try peer.conn.sendWindowUpdate(&peer.wire, 0, fc_grant);
+        g.* = try gpa.dupe(u8, peer.wire.items);
+        peer.wire.clearRetainingCapacity();
+    }
+    defer for (grants) |g| gpa.free(g);
+
+    // Same thresholds as the threaded test, as events: each is below the
+    // credit outstanding when it is due, so a correct server reaches it.
+    var evs: [4]std.Io.Event = @splat(.unset);
+    const gates = [_]FrameWatcher.DataGate{
+        .{ .at_least = 60_000, .ev = &evs[0] },
+        .{ .at_least = 125_000, .ev = &evs[1] },
+        .{ .at_least = 190_000, .ev = &evs[2] },
+        .{ .at_least = 2 * fc_body_len, .ev = &evs[3] },
+    };
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    fw.fiber = .{ .io = io, .data = &gates };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .event = &evs[0], .bytes = grants[0] },
+        .{ .event = &evs[1], .bytes = grants[1] },
+        .{ .event = &evs[2], .bytes = grants[2] },
+        .{ .event = &evs[3], .bytes = "" },
+    }, &rbuf);
+
+    var probe: FlowProbe = .{};
+    var fd: BatonDispatcher = .{ .b = &bio };
+    serve(gpa, .{
+        .handler = FlowProbe.handler,
+        .context = &probe,
+        .response_buffer_size = 128 * 1024,
+        .dispatcher = fd.iface(8),
+    }, &sr.reader, &fw.writer);
+    fd.join();
+
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+    for ([_]u31{ sid_a, sid_b }, [_]u8{ 'a', 'b' }) |sid, ch| {
+        const c = peer.resp(sid);
+        try testing.expectEqual(@as(u16, 200), c.status);
+        try testing.expect(c.end);
+        try testing.expectEqual(@as(usize, fc_body_len), c.body.items.len);
+        for (c.body.items) |b| try testing.expectEqual(ch, b);
+    }
     try testing.expect(fw.data_bytes.load(.acquire) > fc_grant);
 }
 

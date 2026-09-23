@@ -172,7 +172,8 @@ Hardened for direct internet exposure (no reverse proxy required):
   `Options.h2_dispatcher` installed (concurrent handlers, off by default) two more caps apply:
   per-connection `Dispatcher.max_concurrent_handlers` (a ready stream over it waits in the
   already-bounded jobs map) and the dispatcher's own global admission, whose refusal is answered
-  with RST_STREAM(REFUSED_STREAM) rather than a queue. Rapid-reset stays a *budget* rather than a
+  with RST_STREAM(REFUSED_STREAM) rather than a queue. The dispatched tasks may be OS threads or,
+  with `Dispatcher.io`, fibers of the connection's own thread (every wait then parks). Rapid-reset stays a *budget* rather than a
   consequence of one-handler-at-a-time: a cancellation after dispatch is charged exactly like one
   before it. **Not covered:** per-user connection-rate limiting — that belongs on the accept path
   (`Options.on_connect`), not in the h2 loop. GOAWAY is charged against the no-progress budget the
@@ -303,21 +304,14 @@ consumer expects. qap wrote its own (`src/inputs.zig`: first-match `param` with 
 encoded separator can never reach a router). Wanted here, shared with `router`, so the rule that
 decides what a path segment is lives in one place.
 
-**h2 server concurrency for fibers (`Options.dispatcher` on one thread)** — BACKLOG (2026-09-23,
-found by qap plan M4.7). The threaded mode assumes every task is an OS thread: `Session.lock`
-(`h2_server.zig` :732) is a `std.atomic.Mutex` yield-spin **held across `flushWire`'s socket
-write**, and `waitForPeer` (:749) and the drain in `run` (:791) wait by yield-spinning too. With
-handlers on fibers of the connection's own thread (an io_uring engine), a stream fiber that parks
-in the write while holding `mu` leaves the reader fiber spinning on `mu` forever -- it never
-returns to the event loop, so the write never completes: a deadlock, not a slowdown. Wanted: an
-optional `std.Io` for the concurrent mode (e.g. `Dispatcher.io`) through which those three waits
-go -- `std.Io.Mutex` for `mu` (a contended lock parks the task: on a fiber engine whose `futexWait`
-parks the fiber, that is the fiber), and a "connection made progress" `std.Io.Condition` that
-`pump` broadcasts and `waitForPeer`/the drain wait on. Io-less (`null`) stays today's yield-spin,
-byte for byte. Also state in the `Dispatcher.spawn` contract that "a different thread" can be
-"a task that does not run before `spawn` returns" (a fiber queued on the same loop). Test: the
-existing `/fast`-while-`/slow` and PING-while-blocked dispatcher tests, driven with a
-single-threaded dispatcher that runs tasks cooperatively.
+**h2 server concurrency for fibers** — DONE 2026-09-23 (qap plan M4.7a): `Dispatcher.io`. With it
+set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a `std.Io.Condition`
+(`Session.moved`) that `pump`, a retiring handler and the connection task's exit broadcast; a
+`progress` counter sampled under the lock makes the wait immune to a wakeup that lands between the
+caller's unlock and its wait. `null` keeps the yield-spin. Tested under `BatonIo` (OS threads, one
+runner at a time, the baton handed over only inside a blocking `Io` call = the fiber rule), because
+`std.Io.Evented` does not compile in Zig 0.16.0; without `io` the first such test hangs, and a `pump`
+that does not broadcast hangs the flow-control one (both measured).
 
 **h2 upstream forwarding** reuses the multiplexing `h2_client.Session` through its *buffered*
 surface, so it (a) buffers request/response bodies in memory (bounded) rather than streaming like

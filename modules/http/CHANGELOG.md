@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — **New `h2_server.Dispatcher.io`: concurrent h2 handlers on fibers of one
+  thread.** Without it the dispatcher mode's session lock and its two waits (flow-control credit,
+  the drain before the connection ends) yield-spin, which is right for OS-thread pools and a
+  deadlock when the tasks are fibers sharing the connection's thread (a fiber spinning on the lock
+  never hands the thread back to the fiber holding it across a socket write). With `io` set the
+  lock is a `std.Io.Mutex` and the waits a `std.Io.Condition`, so they park through that `Io`;
+  `spawn` may then start the task as a fiber of the calling thread. Every such wait is
+  uncancelable. `io = null` (the default) is unchanged.
+
 - **2026-09-22** — **New `http.problem`: RFC 9457 problem details**
   (`application/problem+json`). `problem.write(w, Problem, extensions)` writes the
   five standard members and then the fields of any struct value as extension
