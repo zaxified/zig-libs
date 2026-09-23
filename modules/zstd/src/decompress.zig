@@ -18,6 +18,7 @@ const dblock = @import("dblock.zig");
 const readLE16 = dbits.readLE16;
 const readLE32 = dbits.readLE32;
 const readLE64 = dbits.readLE64;
+pub const Format = @import("params.zig").Format;
 
 pub const Error = dblock.Error || error{
     ChecksumWrong,
@@ -84,21 +85,45 @@ pub fn isSkippableFrame(buf: []const u8) bool {
     return isSkippableMagic(readLE32(buf, 0));
 }
 
+/// `ZSTD_startingInputLength` / `ZSTD_FRAMEHEADERSIZE_PREFIX`: the bytes
+/// up to and including the frame header descriptor.
+pub fn headerPrefixSize(format: Format) usize {
+    return if (format == .zstd1) frame_header_size_prefix else frame_header_size_prefix - 4;
+}
+
+/// `ZSTD_FRAMEHEADERSIZE_MIN`.
+pub fn headerSizeMin(format: Format) usize {
+    return if (format == .zstd1) frame_header_size_min else frame_header_size_min - 4;
+}
+
 /// `ZSTD_frameHeaderSize`: the full header size, from its first 5 bytes.
 pub fn frameHeaderSize(src: []const u8) Error!usize {
-    if (src.len < frame_header_size_prefix) return error.SrcSizeWrong;
-    const fhd = src[frame_header_size_prefix - 1];
+    return frameHeaderSizeFormat(src, .zstd1);
+}
+
+/// `ZSTD_frameHeaderSize_internal`.
+fn frameHeaderSizeFormat(src: []const u8, format: Format) Error!usize {
+    const min_input_size = headerPrefixSize(format);
+    if (src.len < min_input_size) return error.SrcSizeWrong;
+    const fhd = src[min_input_size - 1];
     const dict_id = fhd & 3;
     const single_segment = (fhd >> 5) & 1;
     const fcs_id = fhd >> 6;
-    return frame_header_size_prefix + @as(usize, 1 - single_segment) + did_field_size[dict_id] + fcs_field_size[fcs_id] +
+    return min_input_size + @as(usize, 1 - single_segment) + did_field_size[dict_id] + fcs_field_size[fcs_id] +
         @intFromBool(single_segment != 0 and fcs_id == 0);
 }
 
 /// `ZSTD_getFrameHeader`.
 pub fn getFrameHeader(src: []const u8) Error!HeaderResult {
-    if (src.len < frame_header_size_prefix) {
-        if (src.len > 0) {
+    return getFrameHeaderAdvanced(src, .zstd1);
+}
+
+/// `ZSTD_getFrameHeader_advanced`: a magicless frame header has neither
+/// the magic number nor a skippable alternative.
+pub fn getFrameHeaderAdvanced(src: []const u8, format: Format) Error!HeaderResult {
+    const min_input_size = headerPrefixSize(format);
+    if (src.len < min_input_size) {
+        if (src.len > 0 and format != .magicless) {
             // what is there must at least start like a frame
             var hbuf: [4]u8 = undefined;
             std.mem.writeInt(u32, &hbuf, magic_number, .little);
@@ -110,9 +135,9 @@ pub fn getFrameHeader(src: []const u8) Error!HeaderResult {
                 if (!isSkippableMagic(readLE32(&hbuf, 0))) return error.PrefixUnknown;
             }
         }
-        return .{ .need = frame_header_size_prefix };
+        return .{ .need = min_input_size };
     }
-    const magic = readLE32(src, 0);
+    const magic = if (format == .magicless) magic_number else readLE32(src, 0);
     if (magic != magic_number) {
         if (isSkippableMagic(magic)) {
             if (src.len < skippable_header_size) return .{ .need = skippable_header_size };
@@ -129,11 +154,11 @@ pub fn getFrameHeader(src: []const u8) Error!HeaderResult {
         return error.PrefixUnknown;
     }
 
-    const fhsize = try frameHeaderSize(src);
+    const fhsize = try frameHeaderSizeFormat(src, format);
     if (src.len < fhsize) return .{ .need = fhsize };
 
-    const fhd = src[frame_header_size_prefix - 1];
-    var pos: usize = frame_header_size_prefix;
+    const fhd = src[min_input_size - 1];
+    var pos: usize = min_input_size;
     const dict_id_size_code = fhd & 3;
     const checksum_flag = (fhd >> 2) & 1 != 0;
     const single_segment = (fhd >> 5) & 1 != 0;
@@ -258,11 +283,11 @@ const FrameSizeInfo = struct {
 };
 
 /// `ZSTD_findFrameSizeInfo`.
-fn findFrameSizeInfo(src: []const u8) Error!FrameSizeInfo {
-    if (src.len >= skippable_header_size and isSkippableMagic(readLE32(src, 0))) {
+fn findFrameSizeInfo(src: []const u8, format: Format) Error!FrameSizeInfo {
+    if (format == .zstd1 and src.len >= skippable_header_size and isSkippableMagic(readLE32(src, 0))) {
         return .{ .nb_blocks = 0, .compressed_size = try readSkippableFrameSize(src), .decompressed_bound = 0 };
     }
-    const zfh = switch (try getFrameHeader(src)) {
+    const zfh = switch (try getFrameHeaderAdvanced(src, format)) {
         .need => return error.SrcSizeWrong,
         .header => |h| h,
     };
@@ -290,7 +315,12 @@ fn findFrameSizeInfo(src: []const u8) Error!FrameSizeInfo {
 /// `ZSTD_findFrameCompressedSize`: how many bytes of `src` the first
 /// (zstd or skippable) frame occupies.
 pub fn findFrameCompressedSize(src: []const u8) Error!usize {
-    return (try findFrameSizeInfo(src)).compressed_size;
+    return findFrameCompressedSizeAdvanced(src, .zstd1);
+}
+
+/// `ZSTD_findFrameCompressedSize_advanced`.
+pub fn findFrameCompressedSizeAdvanced(src: []const u8, format: Format) Error!usize {
+    return (try findFrameSizeInfo(src, format)).compressed_size;
 }
 
 /// `ZSTD_decompressBound`: an upper bound of the decompressed size of all
@@ -299,7 +329,7 @@ pub fn decompressBound(src_in: []const u8) Error!u64 {
     var src = src_in;
     var bound: u64 = 0;
     while (src.len > 0) {
-        const info = try findFrameSizeInfo(src);
+        const info = try findFrameSizeInfo(src, .zstd1);
         src = src[info.compressed_size..];
         bound += info.decompressed_bound;
     }
@@ -331,7 +361,7 @@ pub fn decompressionMargin(src_in: []const u8) Error!usize {
     var margin: usize = 0;
     var max_block_size: usize = 0;
     while (src.len > 0) {
-        const info = try findFrameSizeInfo(src);
+        const info = try findFrameSizeInfo(src, .zstd1);
         const zfh = switch (try getFrameHeader(src)) {
             .need => return error.SrcSizeWrong,
             .header => |h| h,
@@ -352,6 +382,9 @@ pub fn decompressionMargin(src_in: []const u8) Error!usize {
 pub const Options = struct {
     /// Do not verify content checksums (`ZSTD_d_forceIgnoreChecksum`).
     ignore_checksum: bool = false,
+    /// `ZSTD_d_format`: `.magicless` reads only frames written without the
+    /// magic number (and no skippable frames).
+    format: Format = .zstd1,
 };
 
 /// `ZSTD_dStage`: where `decompressContinue` is within a frame.
@@ -402,7 +435,7 @@ pub const Decompressor = struct {
         st.* = .{};
         // the slack behind the literals is read (and overwritten) by wildcopy
         @memset(st.lit_buf[block_size_max..], 0);
-        return .{ .gpa = gpa, .st = st, .options = options };
+        return .{ .gpa = gpa, .st = st, .options = options, .expected = headerPrefixSize(options.format) };
     }
 
     pub fn deinit(d: *Decompressor) void {
@@ -414,7 +447,7 @@ pub const Decompressor = struct {
     pub fn begin(d: *Decompressor) void {
         d.st.begin();
         d.dict_id = 0;
-        d.expected = frame_header_size_prefix;
+        d.expected = headerPrefixSize(d.options.format);
         d.stage = .get_frame_header_size;
         d.decoded_size = 0;
         d.prefix_addr = 0;
@@ -446,7 +479,7 @@ pub const Decompressor = struct {
 
     /// `ZSTD_decodeFrameHeader`.
     pub fn decodeFrameHeader(d: *Decompressor, header: []const u8) Error!void {
-        d.fparams = switch (try getFrameHeader(header)) {
+        d.fparams = switch (try getFrameHeaderAdvanced(header, d.options.format)) {
             .need => return error.SrcSizeWrong,
             .header => |h| h,
         };
@@ -460,11 +493,12 @@ pub const Decompressor = struct {
     /// `dst[op0..]`, advancing `ip`. Returns the decoded size.
     fn decompressFrame(d: *Decompressor, dst: []u8, op0: usize, src: []const u8, ip: *usize) Error!usize {
         const st = d.st;
+        const format = d.options.format;
         var remaining = src.len - ip.*;
-        if (remaining < frame_header_size_min + block_header_size) return error.SrcSizeWrong;
+        if (remaining < headerSizeMin(format) + block_header_size) return error.SrcSizeWrong;
 
         {
-            const fhs = try frameHeaderSize(src[ip.*..][0..frame_header_size_prefix]);
+            const fhs = try frameHeaderSizeFormat(src[ip.*..][0..headerPrefixSize(format)], format);
             if (remaining < fhs + block_header_size) return error.SrcSizeWrong;
             try d.decodeFrameHeader(src[ip.*..][0..fhs]);
             ip.* += fhs;
@@ -525,8 +559,8 @@ pub const Decompressor = struct {
         var ip: usize = 0;
         var op: usize = 0;
         var more_than_1_frame = false;
-        while (src.len - ip >= frame_header_size_prefix) {
-            if (isSkippableMagic(readLE32(src, ip))) {
+        while (src.len - ip >= headerPrefixSize(d.options.format)) {
+            if (d.options.format == .zstd1 and isSkippableMagic(readLE32(src, ip))) {
                 ip += try readSkippableFrameSize(src[ip..]);
                 continue;
             }
@@ -568,13 +602,13 @@ pub const Decompressor = struct {
         d.checkContinuity(dst);
         switch (d.stage) {
             .get_frame_header_size => {
-                if (isSkippableMagic(readLE32(src, 0))) {
+                if (d.options.format == .zstd1 and isSkippableMagic(readLE32(src, 0))) {
                     @memcpy(d.header_buffer[0..src.len], src);
                     d.expected = skippable_header_size - src.len;
                     d.stage = .decode_skippable_header;
                     return 0;
                 }
-                d.header_size = try frameHeaderSize(src);
+                d.header_size = try frameHeaderSizeFormat(src, d.options.format);
                 @memcpy(d.header_buffer[0..src.len], src);
                 d.expected = d.header_size - src.len;
                 d.stage = .decode_frame_header;

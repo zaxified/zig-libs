@@ -10,9 +10,12 @@ leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 Not yet a full libzstd replacement — that is the goal: one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
 for the same calls) covers every level too, and `FrameWriter` is a
-`std.Io.Writer` that emits one frame per flush; the stable-buffer and
-context-reuse parts of the streaming API, dictionaries, multithreading
-and the advanced parameters are
+`std.Io.Writer` that emits one frame per flush, and libzstd's advanced
+parameters (`zstd.Advanced`: explicit window/hash/chain/search/strategy,
+frame flags, magicless frames, the splitters, the row match finder, literal
+compression, block size) give libzstd's bytes for the same settings; the
+stable-buffer and context-reuse parts of the streaming API, dictionaries and
+multithreading are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
@@ -148,8 +151,31 @@ all, as libzstd). Errors: `LevelUnsupported`,
 `SrcSizeWrong` (a pledged size not met), `FrameEnded` (a call after the end;
 a new frame needs a new `Stream`), `InvalidBuffer`, `OutOfMemory`.
 
-Errors: `LevelUnsupported` (level > 22), `NoSpaceLeft` (`dst` below
-`compressBound`), `OutOfMemory`. There is no input size limit: past 3500 MiB
+libzstd's advanced parameters (`ZSTD_CCtx_setParameter`), by field of
+`advanced`; each defaults to the level's choice, and the output is what
+libzstd emits with the same parameters set:
+
+```zig
+const frame = try zstd.compressAlloc(gpa, data, .{ .level = 19, .advanced = .{
+    .window_log = 24, // ZSTD_c_windowLog; also hash_log, chain_log, search_log,
+    .strategy = .btultra2, // min_match, target_length, strategy
+    .content_size = false, // ZSTD_c_contentSizeFlag
+    .format = .magicless, // ZSTD_c_format: decode with DecompressOptions.format
+    .row_match_finder = .disable, // .auto / .enable / .disable
+    .max_block_size = 16 * 1024, // ZSTD_c_maxBlockSize
+} });
+```
+
+Also `literal_compression`, `split_after_sequences` (the post-splitter),
+`block_splitter_level` (the pre-splitter, 0–6); `Stream` takes the same
+`advanced` plus `src_size_hint` (`ZSTD_c_srcSizeHint`: parameters for an
+unknown size chosen as for about that many bytes), and so does
+`FrameWriter`. A value outside libzstd's bounds is
+`error.ParameterOutOfBound`. `writeSkippableFrame` writes a skippable frame
+(`ZSTD_writeSkippableFrame`).
+
+Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`
+(`dst` below `compressBound`), `OutOfMemory`. There is no input size limit: past 3500 MiB
 the indices are rescaled as libzstd does (the whole input still has to be in
 memory, and so does its `compressBound`).
 
@@ -169,13 +195,20 @@ so that specific decisions are marginal (see SPEC.md, *Anchoring*). The module i
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
-`src/stream_test.zig` does the same for streaming: 54 cases, each a schedule of calls
+`src/stream_test.zig` does the same for streaming: 62 cases, each a schedule of calls
 (pledged and unknown sizes, flushes, 50-byte outputs, windows down to 1 KB
 so libzstd's input buffer wraps, index overflow correction run often, long-distance
 matching switched on by hand; 24 of them found by mutation testing) over
-corpus inputs at levels -5 … 22, with and without checksum — 470 streams,
+corpus inputs at levels -5 … 22, with and without checksum — 534 streams,
 each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 (`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
+
+`src/param_test.zig` does it for the advanced parameters: 37 cases (an
+input, a `name=value` list of libzstd parameters, levels) — 67 frames equal
+to what `ZSTD_compress2` produced with the same parameters set
+(`src/testdata/param_goldens.zig`); 8 more stream cases carry parameters
+too. It also pins the bounds of every parameter, magicless frames both ways
+and the content-size flag.
 
 The decoder is checked by decoding every golden and streaming frame back to
 its input, by `src/decoder_test.zig` (frame structure, the size queries and

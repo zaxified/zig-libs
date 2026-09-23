@@ -53,7 +53,7 @@ fn dispatch(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size:
         },
         else => unreachable,
     };
-    const row = params.useRowMatchFinder(ms.cp);
+    const row = ms.use_row;
     return switch (depth) {
         inline 0, 1, 2 => |d| if (row) switch (mls) {
             inline 4, 5, 6 => |m| generic(ms, ss, rep, istart, src_size, .row, d, m),

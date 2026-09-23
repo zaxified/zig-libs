@@ -75,6 +75,10 @@ pub const State = struct {
     match_length_sum_base_price: u32 = 0,
     off_code_sum_base_price: u32 = 0,
     price_type: PriceType = .dynamic,
+    /// `ZSTD_compressedLiterals`: false only when literal compression is
+    /// switched off (`ZSTD_c_literalCompressionMode` disable); literals are
+    /// then priced at 8 bits and gather no statistics.
+    compressed_literals: bool = true,
     price_table: [opt_size]Optimal = undefined,
     match_table: [opt_size]Match = undefined,
 };
@@ -104,7 +108,7 @@ inline fn weight(stat: u32, comptime opt_level: u32) u32 {
 }
 
 fn setBasePrices(st: *State, comptime opt_level: u32) void {
-    st.lit_sum_base_price = weight(st.lit_sum, opt_level);
+    if (st.compressed_literals) st.lit_sum_base_price = weight(st.lit_sum, opt_level);
     st.lit_length_sum_base_price = weight(st.lit_length_sum, opt_level);
     st.match_length_sum_base_price = weight(st.match_length_sum, opt_level);
     st.off_code_sum_base_price = weight(st.off_code_sum, opt_level);
@@ -151,16 +155,17 @@ const base_ofc_freqs = [max_off + 1]u32{
 };
 
 /// `ZSTD_rescaleFreqs` (no dictionary: the `HUF_repeat_valid` seeding from
-/// dictionary tables does not arise). Literal compression is never disabled
-/// for these strategies.
+/// dictionary tables does not arise).
 fn rescaleFreqs(st: *State, src: []const u8, comptime opt_level: u32) void {
     st.price_type = .dynamic;
     if (st.lit_length_sum == 0) { // no statistics yet: first block
         if (src.len <= predef_threshold) st.price_type = .predef;
         // literals: histogram of the block, downscaled
-        @memset(&st.lit_freq, 0);
-        for (src) |b| st.lit_freq[b] += 1;
-        st.lit_sum = downscaleStats(&st.lit_freq, 8, false);
+        if (st.compressed_literals) {
+            @memset(&st.lit_freq, 0);
+            for (src) |b| st.lit_freq[b] += 1;
+            st.lit_sum = downscaleStats(&st.lit_freq, 8, false);
+        }
         st.lit_length_freq = base_ll_freqs;
         st.lit_length_sum = sum(&base_ll_freqs);
         @memset(&st.match_length_freq, 1);
@@ -169,7 +174,7 @@ fn rescaleFreqs(st: *State, src: []const u8, comptime opt_level: u32) void {
         st.off_code_sum = sum(&base_ofc_freqs);
     } else {
         // new block: keep the previous statistics, scaled down
-        st.lit_sum = scaleStats(&st.lit_freq, 12);
+        if (st.compressed_literals) st.lit_sum = scaleStats(&st.lit_freq, 12);
         st.lit_length_sum = scaleStats(&st.lit_length_freq, 11);
         st.match_length_sum = scaleStats(&st.match_length_freq, 11);
         st.off_code_sum = scaleStats(&st.off_code_freq, 11);
@@ -179,6 +184,7 @@ fn rescaleFreqs(st: *State, src: []const u8, comptime opt_level: u32) void {
 
 /// `ZSTD_rawLiteralsCost` for one literal.
 inline fn literalPrice(st: *const State, lit: u8, comptime opt_level: u32) i32 {
+    if (!st.compressed_literals) return 8 * bitcost_multiplier; // uncompressed: 8 bits per literal
     if (st.price_type == .predef) return 6 * bitcost_multiplier;
     const lit_price_max = st.lit_sum_base_price - bitcost_multiplier;
     var lit_price = weight(st.lit_freq[lit], opt_level);
@@ -219,8 +225,10 @@ inline fn matchPrice(st: *const State, off_base: u32, match_length: u32, comptim
 
 /// `ZSTD_updateStats`.
 fn updateStats(st: *State, lits: []const u8, off_base: u32, match_length: u32) void {
-    for (lits) |b| st.lit_freq[b] += lit_freq_add;
-    st.lit_sum += @as(u32, @intCast(lits.len)) * lit_freq_add;
+    if (st.compressed_literals) {
+        for (lits) |b| st.lit_freq[b] += lit_freq_add;
+        st.lit_sum += @as(u32, @intCast(lits.len)) * lit_freq_add;
+    }
     st.lit_length_freq[sequences.llCode(@intCast(lits.len))] += 1;
     st.lit_length_sum += 1;
     st.off_code_freq[highbit32(off_base)] += 1;

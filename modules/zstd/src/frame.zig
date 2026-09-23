@@ -18,7 +18,7 @@ pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
     NoSpaceLeft,
     OutOfMemory,
-};
+} || params.Advanced.CheckError;
 
 /// `ZSTD_compressBound`.
 pub fn compressBound(src_size: usize) usize {
@@ -26,7 +26,7 @@ pub fn compressBound(src_size: usize) usize {
     return src_size + (src_size >> 8) + margin;
 }
 
-const block_size_max_abs = 128 * 1024;
+const block_size_max_abs = params.block_size_max_abs;
 const block_header_size = 3;
 const min_cblock_size = 2;
 const magic = 0xFD2FB528;
@@ -50,6 +50,8 @@ const Ctx = struct {
     next: *BlockState,
     strategy: u32,
     disable_literal_compression: bool,
+    /// `ZSTD_c_blockSplitterLevel`.
+    pre_split_level: u32,
     is_first_block: bool = true,
     /// `ZSTD_blockSplitterEnabled`.
     split_blocks: bool,
@@ -65,8 +67,8 @@ const Ctx = struct {
 };
 
 /// `ZSTD_writeFrameHeader`; `content_size` null leaves the size out
-/// (`contentSizeFlag` 0, a stream of unknown length).
-fn writeFrameHeader(dst: []u8, cp: params.CParams, content_size: ?u64, checksum: bool) usize {
+/// (`contentSizeFlag` 0, or a stream of unknown length).
+fn writeFrameHeader(dst: []u8, cp: params.CParams, content_size: ?u64, checksum: bool, format: params.Format) usize {
     const window_size: u64 = @as(u64, 1) << @intCast(cp.window_log);
     const src_size = content_size orelse 0;
     const single_segment = content_size != null and window_size >= src_size;
@@ -75,8 +77,11 @@ fn writeFrameHeader(dst: []u8, cp: params.CParams, content_size: ?u64, checksum:
         @intFromBool(src_size >= 65536 + 256) +
         @intFromBool(src_size >= 0xFFFFFFFF);
     const fhd: u8 = (@as(u8, @intFromBool(checksum)) << 2) + (@as(u8, @intFromBool(single_segment)) << 5) + (fcs_code << 6);
-    std.mem.writeInt(u32, dst[0..4], magic, .little);
-    var pos: usize = 4;
+    var pos: usize = 0;
+    if (format == .zstd1) {
+        std.mem.writeInt(u32, dst[0..4], magic, .little);
+        pos = 4;
+    }
     dst[pos] = fhd;
     pos += 1;
     if (!single_segment) {
@@ -273,7 +278,7 @@ fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usiz
     const prev: blocksplit.Entropy = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
     const next: blocksplit.Entropy = .{ .huf = &c.next.huf, .fse = &c.next.fse };
     const partitions = &c.partitions;
-    const num_splits = blocksplit.deriveSplits(partitions, &c.ss, prev, next, c.strategy);
+    const num_splits = blocksplit.deriveSplits(partitions, &c.ss, prev, next, .{ .strategy = c.strategy, .disable_literal_compression = c.disable_literal_compression });
     var d_rep = c.prev.rep;
     var c_rep = c.prev.rep;
     if (num_splits == 0) return compressSingleBlock(c, &c.ss, &d_rep, &c_rep, out, src, last_block, false);
@@ -309,17 +314,12 @@ fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usiz
 pub const Options = struct {
     level: i32,
     checksum: bool,
-    /// Test seam: override the level's strategy the way
-    /// `ZSTD_c_strategy` does, to reach strategy/size pairs no level maps
-    /// to. Not part of the public API.
-    strategy: ?params.Strategy = null,
+    advanced: params.Advanced = .{},
     /// Test seam: long-distance matching switched on by hand, as
     /// `ZSTD_c_enableLongDistanceMatching` = 1 does (window log reset to 27
     /// before the input shrinks it), to reach LDM on inputs far below the
     /// 64 MB where level 22 switches it on. Only for btopt and up.
     ldm: bool = false,
-    /// Test seam: `ZSTD_c_windowLog`, a window smaller than the level's.
-    window_log: ?u32 = null,
     /// Test seam: libzstd built with `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`
     /// (its fuzzing mode), which corrects index overflow whenever it safely
     /// can instead of only past `ZSTD_CURRENT_MAX` (3500 MiB). The output
@@ -338,7 +338,8 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
     // libzstd is given exactly the bound (zref); the room a block may use
     // can decide whether it is stored compressed
     const out = dst[0..bound];
-    const cp = params.getOverridden(opts.level, src.len, opts.strategy, opts.ldm, opts.window_log);
+    try opts.advanced.check();
+    const cp = params.getOverridden(opts.level, src.len, opts.advanced, opts.ldm);
     var comp = try Compressor.init(gpa, cp, src.len, opts);
     defer comp.deinit();
     const n = comp.compressContinue(out, src, true) catch unreachable; // pledged is src.len
@@ -360,8 +361,12 @@ pub const Compressor = struct {
     /// `pledgedSrcSize`; null for unknown, which also leaves it out of the
     /// frame header.
     pledged: ?u64,
-    /// `blockSizeMax`: `min(128 KB, window size)`, the window shrunk to a
-    /// known size.
+    /// `ZSTD_c_contentSizeFlag`.
+    content_size_flag: bool,
+    format: params.Format,
+    /// `blockSizeMax`: `min(maxBlockSize, window size)` (128 KB unless
+    /// `Advanced.max_block_size` says less), the window shrunk to a known
+    /// size.
     block_size_max: usize,
     stage: enum { init, ongoing, ending } = .init,
     consumed: u64 = 0,
@@ -392,9 +397,11 @@ pub const Compressor = struct {
         // block compressor (`ZSTD_ldm_blockCompress`), which is not ported.
         std.debug.assert(ldm_params == null or @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt));
 
+        const adv = opts.advanced;
         const window_size: u64 = @max(1, @min(@as(u64, 1) << @intCast(cp.window_log), pledged orelse std.math.maxInt(u64)));
-        const block_size_max: usize = @intCast(@min(block_size_max_abs, window_size));
-        const row = params.useRowMatchFinder(cp);
+        // ZSTD_resolveMaxBlockSize
+        const block_size_max: usize = @intCast(@min(adv.max_block_size orelse block_size_max_abs, window_size));
+        const row = params.resolveRowMatchFinder(adv.row_match_finder, cp);
         const hash_len = @as(usize, 1) << @intCast(cp.hash_log);
         // ZSTD_allocateChainTable: not for fast, not with the row match finder
         const chain_len: usize = if (cp.strategy != .fast and !row) @as(usize, 1) << @intCast(cp.chain_log) else 0;
@@ -409,7 +416,7 @@ pub const Compressor = struct {
         @memset(tag_table, 0);
         const opt_state: ?*opt.State = if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt)) try gpa.create(opt.State) else null;
         errdefer if (opt_state) |p| gpa.destroy(p);
-        if (opt_state) |p| p.* = .{};
+        if (opt_state) |p| p.* = .{ .compressed_literals = adv.literal_compression != .disable };
 
         // ZSTD_maxNbSeq: every sequence carries a match of at least
         // min_match bytes
@@ -452,6 +459,8 @@ pub const Compressor = struct {
             .cp = cp,
             .checksum = opts.checksum,
             .pledged = pledged,
+            .content_size_flag = adv.content_size,
+            .format = adv.format,
             .block_size_max = block_size_max,
             .overflow_correct_frequently = opts.overflow_correct_frequently,
             .states = states,
@@ -472,6 +481,7 @@ pub const Compressor = struct {
                     .hash_table = tables[0..hash_len],
                     .chain_table = tables[hash_len..][0..chain_len],
                     .tag_table = tag_table,
+                    .use_row = row,
                     .row_hash_log = if (row) cp.hash_log - params.rowLog(cp) else 0,
                     // ZSTD_advanceHashSalt on a fresh context: salt and entropy 0
                     .hash_salt = if (row) bitmix(0, 8) ^ bitmix(0, 4) else 0,
@@ -489,10 +499,9 @@ pub const Compressor = struct {
                 .prev = &states[0],
                 .next = &states[1],
                 .strategy = @intFromEnum(cp.strategy),
-                // ZSTD_literalsCompressionIsDisabled (auto): fast + acceleration
-                .disable_literal_compression = cp.strategy == .fast and cp.target_length > 0,
-                // ZSTD_resolveBlockSplitterMode (auto)
-                .split_blocks = @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt) and cp.window_log >= 17,
+                .disable_literal_compression = params.literalCompressionDisabled(adv.literal_compression, cp),
+                .pre_split_level = adv.block_splitter_level,
+                .split_blocks = params.resolveSplitAfterSequences(adv.split_after_sequences, cp),
                 .ldm = ldm_state,
                 .ldm_seqs = ldm_seqs,
             },
@@ -524,7 +533,7 @@ pub const Compressor = struct {
     pub fn compressContinue(comp: *Compressor, dst: []u8, chunk: []const u8, last_chunk: bool) SizeError!usize {
         var fh_size: usize = 0;
         if (comp.stage == .init) {
-            fh_size = writeFrameHeader(dst, comp.cp, comp.pledged, comp.checksum);
+            fh_size = writeFrameHeader(dst, comp.cp, comp.headerContentSize(comp.pledged), comp.checksum, comp.format);
             comp.stage = .ongoing;
         }
         if (chunk.len == 0) return fh_size; // do not generate an empty block if no input
@@ -549,7 +558,7 @@ pub const Compressor = struct {
         var ip: usize = 0;
         while (ip < chunk.len) {
             const remaining = chunk.len - ip;
-            const block_size = presplit.optimalBlockSize(chunk[ip..], comp.block_size_max, c.strategy, savings, comp.split_ws);
+            const block_size = presplit.optimalBlockSize(chunk[ip..], comp.block_size_max, c.pre_split_level, c.strategy, savings, comp.split_ws);
             const last_block: u32 = @intFromBool(last_chunk and block_size == remaining);
             std.debug.assert(out.len - op >= block_header_size + min_cblock_size + 1);
             const block = chunk[ip..][0..block_size];
@@ -573,13 +582,19 @@ pub const Compressor = struct {
         return op;
     }
 
+    /// The content size the frame header records: none without
+    /// `contentSizeFlag`, which libzstd also clears for an unknown size.
+    fn headerContentSize(comp: *const Compressor, size: ?u64) ?u64 {
+        return if (comp.content_size_flag and comp.pledged != null) size else null;
+    }
+
     /// `ZSTD_writeEpilogue`: a last empty block unless the last chunk ended
     /// the frame, then the checksum. `dst` has room for 7 bytes.
     pub fn writeEpilogue(comp: *Compressor, dst: []u8) usize {
         var op: usize = 0;
         if (comp.stage == .init) {
             // special case: empty frame
-            op += writeFrameHeader(dst, comp.cp, 0, comp.checksum);
+            op += writeFrameHeader(dst, comp.cp, comp.headerContentSize(0), comp.checksum, comp.format);
             comp.stage = .ongoing;
         }
         if (comp.stage != .ending) {

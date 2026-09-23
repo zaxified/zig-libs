@@ -55,9 +55,12 @@ fn decodeBack(z: []const u8, input: []const u8) !void {
 fn streamRoundTrip(input: []const u8) !void {
     const gpa = std.testing.allocator;
     const stream_levels = [_]i32{ -3, 1, 2, 3, 5, 6, 8, 10 };
-    var s = try zstd.Stream.init(gpa, .{ .level = stream_levels[input.len % stream_levels.len], .checksum = input.len & 8 != 0 });
+    var s = try zstd.Stream.init(gpa, .{
+        .level = stream_levels[input.len % stream_levels.len],
+        .checksum = input.len & 8 != 0,
+        .advanced = .{ .window_log = 10 },
+    });
     defer s.deinit();
-    s.window_log = 10;
     var z: std.ArrayList(u8) = .empty;
     defer z.deinit(gpa);
     var obuf: [64]u8 = undefined;

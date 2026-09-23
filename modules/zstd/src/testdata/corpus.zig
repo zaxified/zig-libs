@@ -177,6 +177,65 @@ pub const cases = [_]Case{
     .{ .name = "ocf-ldm-mix-600000-67-w11", .len = 600000, .kind = .mix, .seed = 67, .only_levels = &.{19}, .ldm = true, .window_log = 11, .ocf = true }, // ... and its offsets below the correction become 0
 };
 
+/// Goldens with libzstd's advanced parameters (`zstd.Advanced`): corpus case
+/// `case` compressed one-shot at each of `levels` with `params` set --
+/// libzstd's parameter names, `name=value`, comma-separated (the grammar of
+/// `tools/zref.c`'s last argument; switches are 0 auto, 1 enable, 2
+/// disable) -- once per entry of `checksums`.
+pub const ParamCase = struct {
+    case: []const u8,
+    params: []const u8,
+    levels: []const i32,
+    checksums: []const bool = &.{false},
+};
+
+pub const param_cases = [_]ParamCase{
+    // explicit compression parameters, over and against the level's own
+    .{ .case = "words-262145", .params = "minMatch=3", .levels = &.{ 1, 3 } }, // fast and dfast search 3 as 4
+    .{ .case = "words-262145", .params = "minMatch=4", .levels = &.{ 1, 3 } },
+    .{ .case = "csv-600000", .params = "minMatch=7", .levels = &.{ 1, 3, 5 } }, // greedy clamps it to 6
+    .{ .case = "mix-300000-9", .params = "minMatch=3", .levels = &.{ 5, 7 } }, // ... and 3 to 4
+    .{ .case = "csv-600000", .params = "hashLog=12,chainLog=10,searchLog=6", .levels = &.{ 5, 8, 13 } }, // small tables: rows, chain, tree
+    .{ .case = "sparse-matches", .params = "targetLength=4", .levels = &.{1} }, // fast's step
+    .{ .case = "csv-131073", .params = "targetLength=0", .levels = &.{-5} }, // 0 does not override the acceleration
+    .{ .case = "mix-200000-2", .params = "targetLength=8", .levels = &.{ 16, 19 } }, // the optimal parsers' "long enough"
+    .{ .case = "csv-600000", .params = "strategy=9", .levels = &.{1} }, // btultra2 on level 1's tables
+    .{ .case = "words-262145", .params = "strategy=1", .levels = &.{19} }, // fast on level 19's: minMatch 3, a 256 step
+    .{ .case = "far-repeat", .params = "windowLog=21", .levels = &.{1} }, // a wider window than the level's
+    .{ .case = "csv-600000", .params = "strategy=6,windowLog=20", .levels = &.{3} }, // btlazy2 over a 1 MB window
+    // the row match finder
+    .{ .case = "words-16384", .params = "useRowMatchFinder=1", .levels = &.{ 4, 5, 6, 7, 8 } }, // rows in a 16 KB window
+    .{ .case = "csv-600000", .params = "useRowMatchFinder=2", .levels = &.{ 5, 7, 8 } }, // the hash chain in a 2 MB one
+    .{ .case = "mix-140000-2", .params = "useRowMatchFinder=1,searchLog=7", .levels = &.{6} }, // 64-entry rows
+    .{ .case = "words-262145", .params = "useRowMatchFinder=1", .levels = &.{13} }, // btlazy2 has no rows
+    // literal compression
+    .{ .case = "csv-131073", .params = "literalCompressionMode=1", .levels = &.{ -5, -1 } }, // Huffman at the negative levels
+    .{ .case = "csv-131073", .params = "literalCompressionMode=2", .levels = &.{ 1, 3, 5, 9 } }, // raw literals
+    .{ .case = "mix-200000-33", .params = "literalCompressionMode=2", .levels = &.{ 16, 18, 19 } }, // priced at 8 bits, and in the split estimate
+    // the post-splitter
+    .{ .case = "mix-200000-2", .params = "splitAfterSequences=1", .levels = &.{ -10, 1, 3, 5 } }, // below btopt; at -10 over raw literals
+    .{ .case = "mix-200000-0", .params = "splitAfterSequences=2", .levels = &.{ 13, 19 } },
+    // the pre-splitter
+    .{ .case = "alternating", .params = "blockSplitterLevel=1", .levels = &.{ 1, 3 } }, // never splits
+    .{ .case = "alternating", .params = "blockSplitterLevel=2", .levels = &.{5} }, // from the borders
+    .{ .case = "alternating", .params = "blockSplitterLevel=3", .levels = &.{1} }, // by chunks, levels 0..3
+    .{ .case = "drift", .params = "blockSplitterLevel=4", .levels = &.{1} },
+    .{ .case = "drift", .params = "blockSplitterLevel=5", .levels = &.{3} },
+    .{ .case = "split-margin", .params = "blockSplitterLevel=6", .levels = &.{1} },
+    // block size
+    .{ .case = "words-262145", .params = "maxBlockSize=1024", .levels = &.{ 1, 5, 19 } },
+    .{ .case = "csv-600000", .params = "maxBlockSize=65536", .levels = &.{3} }, // no pre-split below 128 KB blocks
+    .{ .case = "mix-300000-9", .params = "maxBlockSize=100000", .levels = &.{13} },
+    .{ .case = "random-5000", .params = "maxBlockSize=1024", .levels = &.{3} }, // raw blocks
+    // frame header
+    .{ .case = "empty", .params = "contentSizeFlag=0", .levels = &.{3}, .checksums = &.{ false, true } }, // the empty frame
+    .{ .case = "words-1000", .params = "contentSizeFlag=0", .levels = &.{3} }, // a window byte instead of the size
+    .{ .case = "csv-600000", .params = "contentSizeFlag=0", .levels = &.{1} },
+    .{ .case = "empty", .params = "format=1", .levels = &.{3}, .checksums = &.{ false, true } },
+    .{ .case = "words-1000", .params = "format=1", .levels = &.{3}, .checksums = &.{ false, true } },
+    .{ .case = "csv-131073", .params = "format=1,contentSizeFlag=0", .levels = &.{1} },
+};
+
 /// Streaming goldens: corpus case `case` compressed through `zstd.Stream`
 /// following `schedule` (the grammar of `tools/zstream.c`: `pN` pledge,
 /// `wN` window log, `oN` output buffer size, `cN`/`fN`/`eN` continue /
@@ -271,6 +330,15 @@ pub const stream_cases = [_]StreamCase{
     // x: libzstd's frequent overflow correction, here of a two-segment window
     .{ .case = "mix-300000-9", .schedule = "x,w10,c*,e0", .ext_dict = all_stream_levels },
     .{ .case = "far-repeat", .schedule = "x,w14,c200000,f0,c*,e0", .ext_dict = all_stream_levels },
+    // advanced parameters (`name=value`, as in `param_cases`)
+    .{ .case = "csv-600000", .schedule = "srcSizeHint=5000,c*,e0" }, // unknown size chosen as 5000 bytes: an 8 KB window (as long as a block, so no extDict)
+    .{ .case = "words-262145", .schedule = "srcSizeHint=200000,c100000,f0,c*,e0", .levels = lazy_only_levels }, // the 256 KB tier
+    .{ .case = "csv-600000", .schedule = "maxBlockSize=4096,c*,e0", .levels = &.{ 1, 3, 5, 16 } },
+    .{ .case = "words-16385", .schedule = "format=1,contentSizeFlag=0,p16385,c*,e0", .levels = &.{ 1, 5 } }, // pledged, yet no size in the header
+    .{ .case = "words-16385", .schedule = "format=1,c1000,f0,c*,e0", .levels = &.{3} },
+    .{ .case = "mix-300000-9", .schedule = "useRowMatchFinder=2,w15,c*,e0", .levels = lazy_only_levels, .ext_dict = &.{ 5, 6, 7, 8, 9, 10 } }, // hash chains over two segments where rows would run
+    .{ .case = "mix-300000-9", .schedule = "useRowMatchFinder=1,w13,c*,e0", .levels = &.{ 5, 6, 7, 8 }, .ext_dict = &.{ 5, 6, 7, 8 } }, // rows in an 8 KB window
+    .{ .case = "mix-200000-33", .schedule = "literalCompressionMode=2,w15,c*,e0", .levels = opt_levels, .ext_dict = opt_levels },
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };

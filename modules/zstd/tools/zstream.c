@@ -17,6 +17,9 @@
  *   x    index overflow corrected whenever it safely can: only accepted by a
  *        build with -DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1 (the
  *        module's `Stream.overflow_correct_frequently`)
+ *   name=value  an advanced parameter by libzstd's name (`hashLog=12`,
+ *        `srcSizeHint=5000`; switches 0 auto, 1 enable, 2 disable), before
+ *        any call: the module's `StreamOptions.advanced` / `src_size_hint`
  * Each c/f/e call is repeated with a fresh output buffer until its input is
  * consumed (continue) or it returns 0 (flush, end); every output buffer's
  * contents are appended to <out>.
@@ -32,6 +35,42 @@
 #include <stdlib.h>
 #include <string.h>
 #include "zstd.h"
+
+/* The advanced parameters by libzstd's own names, as `name=value` tokens
+ * (the module's `zstd.Advanced`; `srcSizeHint` is `StreamOptions`). */
+static struct { char const* name; ZSTD_cParameter p; } const params[] = {
+    { "windowLog", ZSTD_c_windowLog },
+    { "hashLog", ZSTD_c_hashLog },
+    { "chainLog", ZSTD_c_chainLog },
+    { "searchLog", ZSTD_c_searchLog },
+    { "minMatch", ZSTD_c_minMatch },
+    { "targetLength", ZSTD_c_targetLength },
+    { "strategy", ZSTD_c_strategy },
+    { "contentSizeFlag", ZSTD_c_contentSizeFlag },
+    { "format", ZSTD_c_format },
+    { "literalCompressionMode", ZSTD_c_literalCompressionMode },
+    { "useRowMatchFinder", ZSTD_c_useRowMatchFinder },
+    { "splitAfterSequences", ZSTD_c_splitAfterSequences },
+    { "blockSplitterLevel", ZSTD_c_blockSplitterLevel },
+    { "maxBlockSize", ZSTD_c_maxBlockSize },
+    { "srcSizeHint", ZSTD_c_srcSizeHint },
+};
+
+/* Set one `name=value` token; 0 when it is not one, -1 on error. */
+static int setParam(ZSTD_CCtx* cctx, char const* tok)
+{
+    char const* const eq = strchr(tok, '=');
+    if (!eq) return 0;
+    for (size_t i = 0; i < sizeof(params) / sizeof(params[0]); i++) {
+        if (strlen(params[i].name) == (size_t)(eq - tok) && !strncmp(tok, params[i].name, (size_t)(eq - tok))) {
+            size_t const r = ZSTD_CCtx_setParameter(cctx, params[i].p, atoi(eq + 1));
+            if (ZSTD_isError(r)) { fprintf(stderr, "%s: %s\n", tok, ZSTD_getErrorName(r)); return -1; }
+            return 1;
+        }
+    }
+    fprintf(stderr, "unknown parameter %s\n", tok);
+    return -1;
+}
 
 int main(int argc, char** argv)
 {
@@ -63,6 +102,11 @@ int main(int argc, char** argv)
     size_t fed = 0;
     char* const sched = strdup(argv[5]);
     for (char* tok = strtok(sched, ","); tok; tok = strtok(NULL, ",")) {
+        {   /* before the one-letter tokens: a name may start with any of them */
+            int const r = setParam(cctx, tok);
+            if (r < 0) return 7;
+            if (r > 0) continue;
+        }
         char const op = tok[0];
         if (op == 'x') {
 #if !defined(ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY) || !ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY

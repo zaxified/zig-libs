@@ -48,6 +48,8 @@ pub const Options = struct {
     /// into it and no output ring is allocated. A frame whose content size
     /// is known must then fit it whole.
     stable_output: bool = false,
+    /// `ZSTD_d_format`, as `DecompressOptions.format`.
+    format: dec.Format = .zstd1,
 };
 
 const StreamStage = enum { init, load_header, read, load, flush };
@@ -73,7 +75,7 @@ pub const DecompressStream = struct {
 
     pub fn init(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!DecompressStream {
         return .{
-            .d = try dec.Decompressor.init(gpa, .{ .ignore_checksum = options.ignore_checksum }),
+            .d = try dec.Decompressor.init(gpa, .{ .ignore_checksum = options.ignore_checksum, .format = options.format }),
             .max_window_size = if (options.window_log_max) |l| @as(u64, 1) << @max(l, dec.window_log_absolute_min) else (@as(u64, 1) << window_log_limit_default) + 1,
             .stable_output = options.stable_output,
         };
@@ -160,7 +162,8 @@ pub const DecompressStream = struct {
                         s.hostage_byte = false;
                         s.expected_out = .{ .ptr = @intFromPtr(out.dst.ptr), .len = out.dst.len, .pos = out.pos };
                     }
-                    switch (try dec.getFrameHeader(d.header_buffer[0..s.lh_size])) {
+                    const format = d.options.format;
+                    switch (try dec.getFrameHeaderAdvanced(d.header_buffer[0..s.lh_size], format)) {
                         .need => |h_size| {
                             const to_load = h_size - s.lh_size;
                             const remaining = iend - ip;
@@ -171,8 +174,8 @@ pub const DecompressStream = struct {
                                 }
                                 in.pos = in.src.len;
                                 // the first few bytes may already show it is no frame
-                                _ = try dec.getFrameHeader(d.header_buffer[0..s.lh_size]);
-                                return (@max(dec.frame_header_size_min, h_size) - s.lh_size) + dec.block_header_size;
+                                _ = try dec.getFrameHeaderAdvanced(d.header_buffer[0..s.lh_size], format);
+                                return (@max(dec.headerSizeMin(format), h_size) - s.lh_size) + dec.block_header_size;
                             }
                             @memcpy(d.header_buffer[s.lh_size..][0..to_load], in.src[ip..][0..to_load]);
                             s.lh_size = h_size;
@@ -184,7 +187,7 @@ pub const DecompressStream = struct {
 
                     // single-pass shortcut: the whole frame is here and fits
                     if (d.fparams.content_size) |fcs| if (d.fparams.frame_type != .skippable and oend - op >= fcs) {
-                        if (dec.findFrameCompressedSize(in.src[istart..iend])) |c_size| {
+                        if (dec.findFrameCompressedSizeAdvanced(in.src[istart..iend], format)) |c_size| {
                             const n = try d.decompress(out.dst[op..oend], in.src[istart..][0..c_size]);
                             ip = istart + c_size;
                             op += n;
@@ -201,7 +204,7 @@ pub const DecompressStream = struct {
 
                     // consume the header
                     d.begin();
-                    if (dec.isSkippableFrame(d.header_buffer[0..s.lh_size])) {
+                    if (format == .zstd1 and dec.isSkippableFrame(d.header_buffer[0..s.lh_size])) {
                         d.expected = dbits.readLE32(&d.header_buffer, 4);
                         d.stage = .skip_frame;
                     } else {

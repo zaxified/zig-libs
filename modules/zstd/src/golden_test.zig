@@ -60,7 +60,7 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes
                     .level = level,
                     .checksum = ck,
                     .ldm = case.ldm,
-                    .window_log = case.window_log,
+                    .advanced = .{ .window_log = case.window_log },
                     .overflow_correct_frequently = case.ocf,
                     .overflow_corrections = &corrections,
                 })

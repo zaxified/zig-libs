@@ -48,6 +48,11 @@ pub const Options = struct {
     /// already ends the frame, in which case its input is the size, as in
     /// libzstd.
     pledged_size: ?u64 = null,
+    /// `ZSTD_c_srcSizeHint`, 1..2^31-1: when the size is unknown, choose
+    /// and shrink the parameters as for an input of about this many bytes
+    /// (the header still records no size).
+    src_size_hint: ?u32 = null,
+    advanced: params.Advanced = .{},
 };
 
 /// The highest level a stream accepts: every level, as one-shot.
@@ -56,6 +61,8 @@ pub const max_level = params.max_level;
 pub const Error = error{
     /// Level above `max_level`.
     LevelUnsupported,
+    /// An advanced parameter or `src_size_hint` outside libzstd's bounds.
+    ParameterOutOfBound,
     OutOfMemory,
     /// More input than pledged, or, at the end, less (`srcSize_wrong`).
     SrcSizeWrong,
@@ -82,9 +89,6 @@ pub const Stream = struct {
     out_content: usize = 0,
     out_flushed: usize = 0,
     frame_ended: bool = false,
-    /// Test seam, set before the first call: `ZSTD_c_windowLog`, a window
-    /// smaller than the level's, so the input buffer wraps within kilobytes.
-    window_log: ?u32 = null,
     /// Test seam, set before the first call: index overflow corrected as
     /// libzstd's fuzzing build does it (`frame.Options.
     /// overflow_correct_frequently`), which reaches the correction of a
@@ -99,6 +103,8 @@ pub const Stream = struct {
     /// whether that call ends the frame (and so the size).
     pub fn init(gpa: std.mem.Allocator, opts: Options) Error!Stream {
         if (opts.level > max_level) return error.LevelUnsupported;
+        try opts.advanced.check();
+        if (opts.src_size_hint) |h| if (h == 0 or h > std.math.maxInt(i32)) return error.ParameterOutOfBound;
         return .{ .gpa = gpa, .opts = opts };
     }
 
@@ -129,10 +135,13 @@ pub const Stream = struct {
     /// block in and one compressed block out.
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
         const pledged: ?u64 = if (end_op == .end) in_size else s.opts.pledged_size;
-        const cp = params.getOverridden(s.opts.level, pledged orelse params.unknown_size, null, s.ldm, s.window_log);
+        // ZSTD_getCParamsFromCCtxParams: the hint stands in for an unknown size
+        const size_hint: u64 = pledged orelse if (s.opts.src_size_hint) |h| h else params.unknown_size;
+        const cp = params.getOverridden(s.opts.level, size_hint, s.opts.advanced, s.ldm);
         var comp = try frame.Compressor.init(s.gpa, cp, pledged, .{
             .level = s.opts.level,
             .checksum = s.opts.checksum,
+            .advanced = s.opts.advanced,
             .overflow_correct_frequently = s.overflow_correct_frequently,
             .ldm = s.ldm,
         });

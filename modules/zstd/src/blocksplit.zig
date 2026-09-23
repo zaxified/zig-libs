@@ -152,12 +152,16 @@ const HType = enum { basic, rle, compressed, repeat };
 
 const HufMetadata = struct { h_type: HType, des_size: usize };
 
-/// `ZSTD_buildBlockEntropyStats_literals` (literal compression enabled; no
-/// dictionary). Returns libzstd's size_t, error codes included.
-fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next: *literals.HufState, optimal_depth: bool, meta: *HufMetadata) usize {
+/// `ZSTD_buildBlockEntropyStats_literals` (no dictionary). Returns libzstd's
+/// size_t, error codes included.
+fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next: *literals.HufState, disabled: bool, optimal_depth: bool, meta: *HufMetadata) usize {
     var repeat = prev.repeat;
     next.* = prev.*;
     meta.des_size = 0;
+    if (disabled) { // set_basic - disabled
+        meta.h_type = .basic;
+        return 0;
+    }
     if (src.len <= compress_literals_size_min) { // set_basic - too small
         meta.h_type = .basic;
         return 0;
@@ -246,10 +250,11 @@ fn estimateSymbolType(kind: sequences.EncodingType, codes: []const u8, max_code:
 /// `ZSTD_buildEntropyStatisticsAndEstimateSubBlockSize`: build the tables
 /// `ss` would get as a block of its own (into `next`) and estimate that
 /// block's size. Null when libzstd's estimate fails.
-pub fn estimateSubBlockSize(ss: *SeqStore, prev: Entropy, next: Entropy, strategy: u32) ?usize {
+pub fn estimateSubBlockSize(ss: *SeqStore, prev: Entropy, next: Entropy, cfg: Config) ?usize {
+    const strategy = cfg.strategy;
     const lits = ss.lits[0..ss.n_lit];
     var huf_meta: HufMetadata = undefined;
-    const huf_size = buildLiteralsStats(lits, prev.huf, next.huf, strategy >= 8, &huf_meta);
+    const huf_size = buildLiteralsStats(lits, prev.huf, next.huf, cfg.disable_literal_compression, strategy >= 8, &huf_meta);
     if (isError(huf_size)) return null;
 
     const n_seq = ss.n_seq;
@@ -273,37 +278,45 @@ pub fn estimateSubBlockSize(ss: *SeqStore, prev: Entropy, next: Entropy, strateg
     return seq_size + lit_size + block_header_size;
 }
 
+/// What the estimates take from the compression parameters.
+pub const Config = struct {
+    /// libzstd's numeric strategy.
+    strategy: u32,
+    /// `ZSTD_literalsCompressionIsDisabled`.
+    disable_literal_compression: bool,
+};
+
 const Splits = struct {
     locations: *[partitions_len]u32,
     idx: usize = 0,
 };
 
 /// `ZSTD_deriveBlockSplitsHelper`.
-fn deriveHelper(splits: *Splits, start: usize, end: usize, orig: *const SeqStore, prev: Entropy, next: Entropy, strategy: u32) void {
+fn deriveHelper(splits: *Splits, start: usize, end: usize, orig: *const SeqStore, prev: Entropy, next: Entropy, cfg: Config) void {
     const mid = (start + end) / 2;
     std.debug.assert(end >= start);
     if (end - start < min_sequences_block_splitting or splits.idx >= max_nb_block_splits) return;
     var full = deriveChunk(orig, start, end);
     var first = deriveChunk(orig, start, mid);
     var second = deriveChunk(orig, mid, end);
-    const est_full = estimateSubBlockSize(&full, prev, next, strategy) orelse return;
-    const est_first = estimateSubBlockSize(&first, prev, next, strategy) orelse return;
-    const est_second = estimateSubBlockSize(&second, prev, next, strategy) orelse return;
+    const est_full = estimateSubBlockSize(&full, prev, next, cfg) orelse return;
+    const est_first = estimateSubBlockSize(&first, prev, next, cfg) orelse return;
+    const est_second = estimateSubBlockSize(&second, prev, next, cfg) orelse return;
     if (est_first + est_second < est_full) {
-        deriveHelper(splits, start, mid, orig, prev, next, strategy);
+        deriveHelper(splits, start, mid, orig, prev, next, cfg);
         splits.locations[splits.idx] = @intCast(mid);
         splits.idx += 1;
-        deriveHelper(splits, mid, end, orig, prev, next, strategy);
+        deriveHelper(splits, mid, end, orig, prev, next, cfg);
     }
 }
 
 /// `ZSTD_deriveBlockSplits`: fill `partitions` with the sequence indices to
 /// split at, terminated by `n_seq`, and return how many splits there are.
-pub fn deriveSplits(partitions: *[partitions_len]u32, orig: *const SeqStore, prev: Entropy, next: Entropy, strategy: u32) usize {
+pub fn deriveSplits(partitions: *[partitions_len]u32, orig: *const SeqStore, prev: Entropy, next: Entropy, cfg: Config) usize {
     const n_seq = orig.n_seq;
     if (n_seq <= 4) return 0; // too few sequences to split
     var splits: Splits = .{ .locations = partitions };
-    deriveHelper(&splits, 0, n_seq, orig, prev, next, strategy);
+    deriveHelper(&splits, 0, n_seq, orig, prev, next, cfg);
     splits.locations[splits.idx] = @intCast(n_seq);
     return splits.idx;
 }

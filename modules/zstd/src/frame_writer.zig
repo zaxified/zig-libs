@@ -17,11 +17,14 @@ const params = @import("params.zig");
 pub const Options = struct {
     level: i32 = params.default_level,
     checksum: bool = false,
+    advanced: params.Advanced = .{},
 };
 
 pub const InitError = error{
     /// See `zstd.Error.LevelUnsupported`.
     LevelUnsupported,
+    /// An advanced parameter outside libzstd's bounds.
+    ParameterOutOfBound,
     OutOfMemory,
 };
 
@@ -47,6 +50,7 @@ pub const FrameWriter = struct {
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: Options) InitError!FrameWriter {
         std.debug.assert(buffer.len != 0);
         if (opts.level > params.max_level) return error.LevelUnsupported;
+        try opts.advanced.check();
         return .{
             .writer = .{
                 .buffer = buffer,
@@ -54,7 +58,7 @@ pub const FrameWriter = struct {
             },
             .output = output,
             .gpa = gpa,
-            .opts = .{ .level = opts.level, .checksum = opts.checksum },
+            .opts = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced },
             .scratch = try gpa.alloc(u8, frame.compressBound(buffer.len)),
         };
     }

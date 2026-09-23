@@ -14,7 +14,8 @@
 //! merely round-trips.
 //!
 //! `Stream` is libzstd's streaming compression (`ZSTD_compressStream2`):
-//! the same bytes for the same sequence of calls.
+//! the same bytes for the same sequence of calls. `Advanced` holds libzstd's
+//! advanced parameters (`ZSTD_CCtx_setParameter`), with the same effect.
 //!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd.
@@ -35,7 +36,7 @@ const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2` — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size) — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -51,7 +52,21 @@ pub const Options = struct {
     level: i32 = params.default_level,
     /// Append the XXH64-based content checksum (frame header flag + 4 bytes).
     checksum: bool = false,
+    /// libzstd's advanced parameters (window, hash, strategy, frame flags,
+    /// ...); each left to the level by default. Same bytes as libzstd with
+    /// the same parameters set.
+    advanced: Advanced = .{},
 };
+
+/// libzstd's advanced compression parameters (`ZSTD_CCtx_setParameter`),
+/// with its bounds.
+pub const Advanced = params.Advanced;
+/// `ZSTD_strategy`.
+pub const Strategy = params.Strategy;
+/// `ZSTD_ParamSwitch_e`: auto / enable / disable.
+pub const Switch = params.Switch;
+/// `ZSTD_format_e`: with or without the magic number, for both directions.
+pub const Format = params.Format;
 
 pub const Error = frame.Error || error{
     /// Level above `max_level` (22). libzstd clamps it to 22; this module
@@ -73,7 +88,32 @@ pub fn compressBound(src_size: usize) usize {
 /// for the match tables and block buffers only, all freed before returning.
 pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
-    return frame.compress(gpa, dst, src, .{ .level = opts.level, .checksum = opts.checksum });
+    return frame.compress(gpa, dst, src, .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced });
+}
+
+/// `ZSTD_SKIPPABLEHEADERSIZE`.
+pub const skippable_header_size = dec.skippable_header_size;
+
+pub const SkippableError = error{
+    /// `dst` holds fewer than `src.len + skippable_header_size` bytes.
+    NoSpaceLeft,
+    /// `src` is 4 GiB or more (`srcSize_wrong`).
+    SrcSizeWrong,
+    /// `magic_variant` above 15 (`parameter_outOfBound`).
+    ParameterOutOfBound,
+};
+
+/// `ZSTD_writeSkippableFrame`: a skippable frame holding `src`, with magic
+/// number 0x184D2A50 + `magic_variant` (0..15). Decoders pass over it;
+/// `readSkippableFrame` gives `src` back. Returns the bytes written.
+pub fn writeSkippableFrame(dst: []u8, src: []const u8, magic_variant: u32) SkippableError!usize {
+    if (dst.len < src.len + skippable_header_size) return error.NoSpaceLeft;
+    if (src.len > std.math.maxInt(u32)) return error.SrcSizeWrong;
+    if (magic_variant > 15) return error.ParameterOutOfBound;
+    std.mem.writeInt(u32, dst[0..4], dec.magic_skippable_start + magic_variant, .little);
+    std.mem.writeInt(u32, dst[4..8], @intCast(src.len), .little);
+    @memcpy(dst[skippable_header_size..][0..src.len], src);
+    return src.len + skippable_header_size;
 }
 
 /// A `std.Io.Writer` that emits one frame per buffer fill and per flush
@@ -104,6 +144,7 @@ pub const FrameType = dec.FrameType;
 pub const HeaderResult = dec.HeaderResult;
 pub const SkippableFrame = dec.SkippableFrame;
 pub const getFrameHeader = dec.getFrameHeader;
+pub const getFrameHeaderAdvanced = dec.getFrameHeaderAdvanced;
 pub const frameHeaderSize = dec.frameHeaderSize;
 pub const getFrameContentSize = dec.getFrameContentSize;
 pub const findFrameCompressedSize = dec.findFrameCompressedSize;
@@ -183,6 +224,7 @@ test {
     _ = @import("dstream_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("golden_test.zig");
+    _ = @import("param_test.zig");
     _ = @import("fuzz_test.zig");
 }
 
@@ -241,6 +283,26 @@ test "round trip through std's decoder and this one at every implemented level" 
 test "levels above 22 are refused, not clamped" {
     var buf: [64]u8 = undefined;
     try std.testing.expectError(error.LevelUnsupported, compress(std.testing.allocator, &buf, "x", .{ .level = 23 }));
+}
+
+test "a skippable frame is written as libzstd writes it and read back" {
+    var buf: [16]u8 = undefined;
+    const n = try writeSkippableFrame(&buf, "hey", 5);
+    try std.testing.expectEqualSlices(u8, &.{ 0x55, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 'h', 'e', 'y' }, buf[0..n]);
+    var back: [3]u8 = undefined;
+    const r = try readSkippableFrame(&back, buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 5), r.magic_variant);
+    try std.testing.expectEqualSlices(u8, "hey", &back);
+    try std.testing.expectError(error.ParameterOutOfBound, writeSkippableFrame(&buf, "hey", 16));
+    try std.testing.expectError(error.NoSpaceLeft, writeSkippableFrame(buf[0..10], "hey", 0));
+    // decoders pass over it
+    const z = try compressAlloc(std.testing.allocator, "abc", .{});
+    defer std.testing.allocator.free(z);
+    var both: [64]u8 = undefined;
+    @memcpy(both[0..n], buf[0..n]);
+    @memcpy(both[n..][0..z.len], z);
+    var out: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try decompress(std.testing.allocator, &out, both[0 .. n + z.len]));
 }
 
 test "a destination below the bound is refused" {

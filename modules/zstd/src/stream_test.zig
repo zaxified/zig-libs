@@ -15,6 +15,7 @@ const stream = @import("stream.zig");
 const zstd = @import("root.zig");
 const corpus = @import("testdata/corpus.zig");
 const goldens = @import("testdata/stream_goldens.zig");
+const param_test = @import("param_test.zig");
 
 const Run = struct {
     out: []u8,
@@ -38,6 +39,8 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
     defer if (s) |*st| st.deinit();
     var ocf = false;
     var ldm = false;
+    var advanced: zstd.Advanced = .{};
+    var src_size_hint: ?u32 = null;
     var ext_dict_blocks: u32 = 0;
     var overflow_corrections: u32 = 0;
     var ldm_ext_dict_chunks: u32 = 0;
@@ -51,6 +54,7 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
             ldm = true;
             continue;
         }
+        if (try param_test.applyParam(&advanced, &src_size_hint, tok)) continue;
         const num: usize = if (tok[1] == '*') src.len - fed else try std.fmt.parseInt(usize, tok[1..], 10);
         const dir: stream.EndDirective = switch (tok[0]) {
             'p' => {
@@ -71,8 +75,8 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
             else => return error.BadSchedule,
         };
         if (s == null) {
-            s = try stream.Stream.init(gpa, .{ .level = level, .checksum = checksum, .pledged_size = pledged });
-            s.?.window_log = window_log;
+            if (window_log) |w| advanced.window_log = w;
+            s = try stream.Stream.init(gpa, .{ .level = level, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced });
             s.?.overflow_correct_frequently = ocf;
             s.?.ldm = ldm;
         }
@@ -126,9 +130,12 @@ test "every streaming case has a golden row, and nothing else does" {
 test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2" {
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
-    var dec = try zstd.Decompressor.init(gpa, .{});
-    defer dec.deinit();
+    var dec_zstd1 = try zstd.Decompressor.init(gpa, .{});
+    defer dec_zstd1.deinit();
+    var dec_magicless = try zstd.Decompressor.init(gpa, .{ .format = .magicless });
+    defer dec_magicless.deinit();
     for (corpus.stream_cases) |sc| {
+        const dec = if (std.mem.indexOf(u8, sc.schedule, "format=1") != null) &dec_magicless else &dec_zstd1;
         const case = findCase(sc.case);
         const src = try gpa.alloc(u8, case.len);
         defer gpa.free(src);

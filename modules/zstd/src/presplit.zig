@@ -123,15 +123,18 @@ fn splitBlock(block: []const u8, level: u32, stats: *Stats) usize {
     return splitByChunks(block, level - 1, stats);
 }
 
-/// `ZSTD_optimalBlockSize` with the default `preBlockSplitter_level` (0).
-/// `strategy` is libzstd's numeric strategy (1 = fast, 2 = dfast).
-pub fn optimalBlockSize(src: []const u8, block_size_max: usize, strategy: u32, savings: i64, stats: *Stats) usize {
+/// `ZSTD_optimalBlockSize`. `strategy` is libzstd's numeric strategy
+/// (1 = fast, 2 = dfast); `split_level` is `ZSTD_c_blockSplitterLevel`: 0
+/// picks by strategy, 1 never splits, 2..6 are the splitter's levels 0..4.
+pub fn optimalBlockSize(src: []const u8, block_size_max: usize, split_level: u32, strategy: u32, savings: i64, stats: *Stats) usize {
     // split level based on compression strategy, from `fast` to `btultra2`
     const split_levels = [_]u32{ 0, 0, 1, 2, 2, 3, 3, 4, 4, 4 };
     if (src.len < full_block or block_size_max < full_block) return @min(src.len, block_size_max);
     // do not split incompressible data: the first full block is never split
     if (savings < 3) return full_block;
-    return splitBlock(src[0..block_size_max], split_levels[strategy], stats);
+    if (split_level == 1) return full_block;
+    const level = if (split_level == 0) split_levels[strategy] else split_level - 2;
+    return splitBlock(src[0..block_size_max], level, stats);
 }
 
 pub const Workspace = Stats;
@@ -140,8 +143,8 @@ test "a homogeneous block is not split" {
     var buf: [full_block]u8 = undefined;
     for (&buf, 0..) |*b, i| b.* = @truncate(i *% 7);
     var ws: Workspace = .{};
-    try std.testing.expectEqual(@as(usize, full_block), optimalBlockSize(&buf, full_block, 1, 1000, &ws));
-    try std.testing.expectEqual(@as(usize, full_block), optimalBlockSize(&buf, full_block, 2, 1000, &ws));
+    try std.testing.expectEqual(@as(usize, full_block), optimalBlockSize(&buf, full_block, 0, 1, 1000, &ws));
+    try std.testing.expectEqual(@as(usize, full_block), optimalBlockSize(&buf, full_block, 0, 2, 1000, &ws));
 }
 
 test "a block whose halves differ is split from the borders" {
@@ -149,7 +152,7 @@ test "a block whose halves differ is split from the borders" {
     @memset(buf[0 .. full_block / 4], 'a');
     @memset(buf[full_block / 4 ..], 'z');
     var ws: Workspace = .{};
-    try std.testing.expectEqual(@as(usize, 32 * 1024), optimalBlockSize(&buf, full_block, 1, 1000, &ws));
+    try std.testing.expectEqual(@as(usize, 32 * 1024), optimalBlockSize(&buf, full_block, 0, 1, 1000, &ws));
 }
 
 test "no split before the frame has saved anything" {
@@ -157,5 +160,5 @@ test "no split before the frame has saved anything" {
     @memset(buf[0 .. full_block / 2], 'a');
     @memset(buf[full_block / 2 ..], 'z');
     var ws: Workspace = .{};
-    try std.testing.expectEqual(@as(usize, full_block), optimalBlockSize(&buf, full_block, 1, 0, &ws));
+    try std.testing.expectEqual(@as(usize, full_block), optimalBlockSize(&buf, full_block, 0, 1, 0, &ws));
 }

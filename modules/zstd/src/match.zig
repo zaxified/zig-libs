@@ -64,6 +64,9 @@ pub const MatchState = struct {
     n_ext_dict_blocks: u32 = 0,
     /// First index the lazy match finders have not inserted yet.
     next_to_update: u32 = window_start,
+    /// `greedy`/`lazy`/`lazy2` search the row match finder rather than the
+    /// hash chain (`ZSTD_resolveRowMatchFinderMode`).
+    use_row: bool = false,
     /// Row match finder: `rowHashLog` (hash_log - rowLog) and hash salt.
     row_hash_log: u32 = 0,
     hash_salt: u64 = 0,

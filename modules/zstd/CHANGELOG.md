@@ -5,6 +5,25 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Advanced parameters (SPEC backlog Z6): `Options`,
+  `StreamOptions` and `FrameWriterOptions` take `advanced: zstd.Advanced`,
+  libzstd's `ZSTD_CCtx_setParameter` set — explicit window, hash, chain and
+  search logs, minimum match, target length and strategy (over the level's
+  row, derived as `ZSTD_getCParamsFromCCtxParams` does), the content-size
+  flag, magicless frames, literal compression, the row match finder, the
+  post-splitter, the pre-splitter level and the maximum block size — with
+  libzstd's bounds (`error.ParameterOutOfBound`); `StreamOptions.
+  src_size_hint` (`ZSTD_c_srcSizeHint`); `writeSkippableFrame`. The decoder
+  reads magicless frames (`DecompressOptions.format`,
+  `DecompressStreamOptions.format`, `getFrameHeaderAdvanced`). The
+  `frame.Options.strategy` / `window_log` and `Stream.window_log` test seams
+  are gone (now `advanced`). `param_goldens.zig`: 67 frames of 37 cases
+  from libzstd with the same parameters, plus 64 streams; `zref` and
+  `zstream` take `name=value` parameters. With literal compression off the
+  optimal parsers price literals raw (`ZSTD_compressedLiterals`), and the
+  post-splitter's estimate stores them raw — the latter found by the
+  differential run, the only mismatch in 4 850 random parameter sets
+  (3 300 one-shot, 1 550 streams). 47 mutations: 43 caught, 4 equivalent.
 - **2026-09-23** — Streaming decompression (SPEC backlog Z2b):
   `DecompressStream` (`ZSTD_decompressStream`: input and output in any
   pieces, output ring of one window plus two blocks or `stable_output`,

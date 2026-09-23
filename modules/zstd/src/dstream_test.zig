@@ -88,9 +88,8 @@ test "a window-sized ring: a stream without content size, window smaller than th
     // window 1 KB so the ring wraps many times and matches cross it
     const src = try corpusInput("far-repeat");
     defer gpa.free(src);
-    var s = try zstd.Stream.init(gpa, .{ .level = 5 });
+    var s = try zstd.Stream.init(gpa, .{ .level = 5, .advanced = .{ .window_log = 10 } });
     defer s.deinit();
-    s.window_log = 10;
     const cap = zstd.compressBound(src.len) + 1024;
     const z = try gpa.alloc(u8, cap);
     defer gpa.free(z);
@@ -402,9 +401,8 @@ test "a stream with a 128 KB window through a small output buffer" {
     // its wrap while the caller drains 700 bytes at a time
     const src = try corpusInput("far-repeat");
     defer gpa.free(src);
-    var st = try zstd.Stream.init(gpa, .{ .level = 3 });
+    var st = try zstd.Stream.init(gpa, .{ .level = 3, .advanced = .{ .window_log = 17 } });
     defer st.deinit();
-    st.window_log = 17;
     const z = try gpa.alloc(u8, zstd.compressBound(src.len) + 1024);
     defer gpa.free(z);
     var o: zstd.OutBuffer = .{ .dst = z };

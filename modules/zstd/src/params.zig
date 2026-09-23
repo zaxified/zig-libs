@@ -36,8 +36,9 @@ pub const min_level = -(1 << 17);
 pub const default_level = 3;
 
 const window_log_absolute_min = 10;
-const hash_log_min = 6;
-const window_log_max = 31;
+pub const hash_log_min = 6;
+/// `ZSTD_WINDOWLOG_MAX` (64-bit).
+pub const window_log_max = 31;
 /// `ZSTD_ROW_HASH_TAG_BITS`.
 pub const row_hash_tag_bits = 8;
 
@@ -180,6 +181,12 @@ pub fn cycleLog(cp: CParams) u32 {
 pub const unknown_size: u64 = std.math.maxInt(u64);
 
 fn adjust(cp_in: CParams, src_size: u64) CParams {
+    return adjustFor(cp_in, src_size, true);
+}
+
+/// `ZSTD_adjustCParams_internal`; `row_possible` false when the row match
+/// finder is switched off, which lifts its cap on the hash log.
+fn adjustFor(cp_in: CParams, src_size: u64, row_possible: bool) CParams {
     var cp = cp_in;
     const max_window_resize: u64 = @as(u64, 1) << (window_log_max - 1);
     // resize windowLog if input is small enough, to use less memory
@@ -198,8 +205,9 @@ fn adjust(cp_in: CParams, src_size: u64) CParams {
     }
     if (cp.window_log < window_log_absolute_min) cp.window_log = window_log_absolute_min;
     // The row match finder hashes hashLog - rowLog + 8 bits into 32. libzstd
-    // assumes it is in use here, before the window size decides.
-    if (rowMatchFinderSupported(cp.strategy)) {
+    // assumes it is in use here, before the window size decides, unless it
+    // is switched off.
+    if (row_possible and rowMatchFinderSupported(cp.strategy)) {
         const max_hash_log = 32 - row_hash_tag_bits + rowLog(cp);
         if (cp.hash_log > max_hash_log) cp.hash_log = max_hash_log;
     }
@@ -220,19 +228,156 @@ pub fn get(level: i32, src_size: u64) CParams {
     return adjust(cp, src_size);
 }
 
-/// `ZSTD_getCParamsFromCCtxParams` with the test overrides the oracle can
-/// set: the level's parameters (already adjusted for its own strategy);
-/// with LDM switched on by hand (`ZSTD_c_enableLongDistanceMatching`) the
-/// window log reset to 27, `ZSTD_LDM_DEFAULT_WINDOW_LOG`; with
-/// `ZSTD_c_strategy` the strategy replaced, with `ZSTD_c_windowLog` the
-/// window log; and the adjustment run again.
-pub fn getOverridden(level: i32, src_size: u64, strategy: ?Strategy, ldm_by_hand: bool, window_log: ?u32) CParams {
+/// `ZSTD_getCParamsFromCCtxParams`: the level's parameters (already
+/// adjusted for its own strategy); with LDM switched on by hand
+/// (`ZSTD_c_enableLongDistanceMatching`, a test seam here) the window log
+/// reset to 27, `ZSTD_LDM_DEFAULT_WINDOW_LOG`; the explicit parameters of
+/// `adv` put over them (`ZSTD_overrideCParams`); and the adjustment run
+/// again, this time knowing whether the row match finder is ruled out.
+/// `adv` must have passed `check`.
+pub fn getOverridden(level: i32, src_size: u64, adv: Advanced, ldm_by_hand: bool) CParams {
     var cp = get(level, src_size);
     if (ldm_by_hand) cp.window_log = 27;
-    // ZSTD_overrideCParams
-    if (window_log) |wl| cp.window_log = wl;
-    if (strategy) |st| cp.strategy = st;
-    return adjust(cp, src_size);
+    if (adv.window_log) |v| cp.window_log = v;
+    if (adv.hash_log) |v| cp.hash_log = v;
+    if (adv.chain_log) |v| cp.chain_log = v;
+    if (adv.search_log) |v| cp.search_log = v;
+    if (adv.min_match) |v| cp.min_match = v;
+    // 0 is in bounds but, as in libzstd, means "not set"
+    if (adv.target_length) |v| if (v != 0) {
+        cp.target_length = v;
+    };
+    if (adv.strategy) |v| cp.strategy = v;
+    return adjustFor(cp, src_size, adv.row_match_finder != .disable);
+}
+
+/// `ZSTD_ParamSwitch_e`.
+pub const Switch = enum {
+    /// libzstd's own choice from the parameters.
+    auto,
+    enable,
+    disable,
+};
+
+/// `ZSTD_format_e`.
+pub const Format = enum {
+    /// RFC 8878 frames, starting with the magic number.
+    zstd1,
+    /// The same frames without the 4-byte magic number
+    /// (`ZSTD_f_zstd1_magicless`). A decoder must be told to expect them;
+    /// they cannot be mixed with skippable frames.
+    magicless,
+};
+
+/// libzstd's advanced compression parameters (`ZSTD_CCtx_setParameter`).
+/// Null or `.auto` leaves each to the level. The bounds are libzstd's
+/// (`ZSTD_cParam_getBounds`, 64-bit): a value outside them is
+/// `error.ParameterOutOfBound`, where libzstd refuses to set it.
+pub const Advanced = struct {
+    /// `ZSTD_c_windowLog`, 10..31: the largest back-reference distance, and
+    /// the window a decoder must hold. The input's size still shrinks it.
+    window_log: ?u32 = null,
+    /// `ZSTD_c_hashLog`, 6..30.
+    hash_log: ?u32 = null,
+    /// `ZSTD_c_chainLog`, 6..30.
+    chain_log: ?u32 = null,
+    /// `ZSTD_c_searchLog`, 1..30.
+    search_log: ?u32 = null,
+    /// `ZSTD_c_minMatch`, 3..7.
+    min_match: ?u32 = null,
+    /// `ZSTD_c_targetLength`, 0..131072; 0 keeps the level's, as in libzstd.
+    target_length: ?u32 = null,
+    /// `ZSTD_c_strategy`.
+    strategy: ?Strategy = null,
+    /// `ZSTD_c_contentSizeFlag`: record the content size in the frame header
+    /// when it is known.
+    content_size: bool = true,
+    /// `ZSTD_c_format`.
+    format: Format = .zstd1,
+    /// `ZSTD_c_literalCompressionMode`: `.auto` compresses literals except
+    /// at the negative levels (strategy `fast` with an acceleration).
+    literal_compression: Switch = .auto,
+    /// `ZSTD_c_useRowMatchFinder`, for `greedy`, `lazy` and `lazy2`: `.auto`
+    /// uses it above a 16 KB window.
+    row_match_finder: Switch = .auto,
+    /// `ZSTD_c_splitAfterSequences`, the post-splitter: `.auto` runs it for
+    /// `btopt` and up with a window of 128 KB or more.
+    split_after_sequences: Switch = .auto,
+    /// `ZSTD_c_blockSplitterLevel`, the pre-splitter, 0..6: 0 by strategy,
+    /// 1 never splits, 2..6 in increasing cost.
+    block_splitter_level: u32 = 0,
+    /// `ZSTD_c_maxBlockSize`, 1024..131072: the largest block.
+    max_block_size: ?u32 = null,
+
+    pub const CheckError = error{
+        /// A parameter outside libzstd's bounds (`parameter_outOfBound`).
+        ParameterOutOfBound,
+    };
+
+    /// `ZSTD_cParam_getBounds`, as `ZSTD_CCtx_setParameter` enforces it.
+    pub fn check(adv: Advanced) CheckError!void {
+        const B = struct {
+            fn in(v: ?u32, lo: u32, hi: u32) bool {
+                return if (v) |x| x >= lo and x <= hi else true;
+            }
+        };
+        if (!B.in(adv.window_log, window_log_min, window_log_max) or
+            !B.in(adv.hash_log, hash_log_min, hash_log_max) or
+            !B.in(adv.chain_log, chain_log_min, chain_log_max) or
+            !B.in(adv.search_log, search_log_min, search_log_max) or
+            !B.in(adv.min_match, min_match_min, min_match_max) or
+            !B.in(adv.target_length, 0, target_length_max) or
+            !B.in(adv.block_splitter_level, 0, block_splitter_level_max) or
+            !B.in(adv.max_block_size, block_size_max_min, block_size_max_abs))
+            return error.ParameterOutOfBound;
+    }
+};
+
+/// `ZSTD_WINDOWLOG_MIN`.
+pub const window_log_min = 10;
+/// `ZSTD_HASHLOG_MAX`, `ZSTD_CHAINLOG_MAX` (64-bit).
+pub const hash_log_max = 30;
+pub const chain_log_min = 6;
+pub const chain_log_max = 30;
+pub const search_log_min = 1;
+/// `ZSTD_SEARCHLOG_MAX`: `ZSTD_WINDOWLOG_MAX` - 1.
+pub const search_log_max = window_log_max - 1;
+pub const min_match_min = 3;
+pub const min_match_max = 7;
+/// `ZSTD_TARGETLENGTH_MAX`: `ZSTD_BLOCKSIZE_MAX`.
+pub const target_length_max = block_size_max_abs;
+/// `ZSTD_BLOCKSPLITTER_LEVEL_MAX`.
+pub const block_splitter_level_max = 6;
+/// `ZSTD_BLOCKSIZE_MAX_MIN`.
+pub const block_size_max_min = 1 << 10;
+/// `ZSTD_BLOCKSIZE_MAX`.
+pub const block_size_max_abs = 128 * 1024;
+
+/// `ZSTD_resolveRowMatchFinderMode`.
+pub fn resolveRowMatchFinder(mode: Switch, cp: CParams) bool {
+    return switch (mode) {
+        .enable => rowMatchFinderSupported(cp.strategy),
+        .disable => false,
+        .auto => useRowMatchFinder(cp),
+    };
+}
+
+/// `ZSTD_resolveBlockSplitterMode`: whether the post-splitter runs.
+pub fn resolveSplitAfterSequences(mode: Switch, cp: CParams) bool {
+    return switch (mode) {
+        .enable => true,
+        .disable => false,
+        .auto => @intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btopt) and cp.window_log >= 17,
+    };
+}
+
+/// `ZSTD_literalsCompressionIsDisabled`.
+pub fn literalCompressionDisabled(mode: Switch, cp: CParams) bool {
+    return switch (mode) {
+        .enable => false,
+        .disable => true,
+        .auto => cp.strategy == .fast and cp.target_length > 0,
+    };
 }
 
 test "a 1000-byte input shrinks the window to 1 KB" {
@@ -277,12 +422,12 @@ test "only level 22 above 64 MB reaches long-distance matching" {
 test "LDM by hand widens the window before the input shrinks it" {
     // level 19 above 256 KB has windowLog 23; LDM by hand starts from 27
     try std.testing.expectEqual(@as(u32, 23), get(19, 20 << 20).window_log);
-    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, null, true, null).window_log);
-    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, null, true, null).window_log);
+    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, .{}, true).window_log);
+    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, .{}, true).window_log);
     // the hash and chain logs were already cut to the level's own window
-    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, null, true, null).chain_log);
+    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, .{}, true).chain_log);
     // a small input shrinks both to the same window
-    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, null, true, null));
+    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, .{}, true));
 }
 
 test "btlazy2 halves the chain log to the window (ZSTD_cycleLog)" {

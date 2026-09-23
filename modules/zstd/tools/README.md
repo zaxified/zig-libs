@@ -7,10 +7,10 @@ which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 
 | file | kind (§9) | what it answers |
 |---|---|---|
-| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits; and `src/testdata/stream_goldens.zig`, the same for every `corpus.stream_cases` schedule through `zstream`. |
-| `zstream.c` | **differential oracle** (streaming) | Compresses any file with `ZSTD_compressStream2` following a call schedule (`p` pledge, `w` window log, `o` output buffer size, `c`/`f`/`e` continue/flush/end with the next N bytes, `x` frequent overflow correction); `stream_test.zig` parses the same schedules. The recipe uses it for `src/testdata/stream_goldens.zig` and builds it a second time as `zstream-ocf`. |
+| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits; `src/testdata/stream_goldens.zig`, the same for every `corpus.stream_cases` schedule through `zstream`; and `src/testdata/param_goldens.zig`, for every `corpus.param_cases` entry with its advanced parameters through `zref`. |
+| `zstream.c` | **differential oracle** (streaming) | Compresses any file with `ZSTD_compressStream2` following a call schedule (`p` pledge, `w` window log, `o` output buffer size, `c`/`f`/`e` continue/flush/end with the next N bytes, `x` frequent overflow correction, `name=value` an advanced parameter by libzstd's name); `stream_test.zig` parses the same schedules. The recipe uses it for `src/testdata/stream_goldens.zig` and builds it a second time as `zstream-ocf`. |
 | `zdec.c` | **differential oracle** (decoder) | Decompresses any file with libzstd — mode 0 one-shot `ZSTD_decompressDCtx` into `ZSTD_decompressBound` bytes (the capacity `Decompressor` gets from the same query), mode 1 streaming with window log max 31, whole input at once (libzstd then takes its single-pass shortcut), mode 2 streaming one input byte per call into a 997-byte output buffer (no shortcut: the plan `DecompressStream` is compared under) — and prints `OK <size> <fnv1a64>` or `ERR <ZSTD_ErrorCode>`, so a run of both decoders over valid and damaged frames compares output, acceptance and error class. With a repetition count it times the decode alone. Pair it with libzstd's own `tests/decodecorpus` (`make -C "$R/tests" decodecorpus`), which writes random valid frames that reach every decoder path, and their contents. |
-| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. Optional arguments: the strategy (`ZSTD_c_strategy`), LDM by hand, the window log (`ZSTD_c_windowLog`). Built a second time with `-DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1` (`zref-ocf`), it is the reference for frequent index-overflow correction. |
+| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. Optional arguments: the strategy (`ZSTD_c_strategy`), LDM by hand, the window log (`ZSTD_c_windowLog`), and a `name=value` list of any advanced parameter (`zstd.Advanced`). Built a second time with `-DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1` (`zref-ocf`), it is the reference for frequent index-overflow correction. |
 
 ## The reference they need
 
@@ -51,8 +51,8 @@ reach (`fast` never gets a window above 1 MB, `btopt` never the 8 MB window
 of level 19). To reach one, force the strategy on both sides:
 
     "$R/zref" <level> 0 in.bin ref.zst 7          # 7 = btopt
-    # module side: frame.compress(..., .{ .level = L, .checksum = false,
-    #     .strategy = .btopt }) from a main that imports src/frame.zig
+    # module side: zstd.compress(..., .{ .level = L,
+    #     .advanced = .{ .strategy = .btopt } })
 
 libzstd then derives the parameters twice — once for the level's own
 strategy, once for the forced one — and `params.getOverridden` does the
@@ -77,7 +77,16 @@ input of kilobytes:
 
     "$R/zref-ocf" <level> 0 in.bin ref.zst 0 0 12   # window log 12
     # module side: frame.compress(..., .{ .level = L, .checksum = false,
-    #     .window_log = 12, .overflow_correct_frequently = true })
+    #     .advanced = .{ .window_log = 12 }, .overflow_correct_frequently = true })
+
+Any of libzstd's advanced parameters goes in as the last argument, by
+libzstd's names, `name=value`, comma-separated (switches 0 auto, 1 enable,
+2 disable; `-` for none) — the grammar of `corpus.param_cases`, which
+`param_test.zig` reads into `zstd.Advanced`:
+
+    "$R/zref" 5 0 in.bin ref.zst 0 0 0 "useRowMatchFinder=2,hashLog=12,maxBlockSize=4096"
+    # module side: zstd.compress(..., .{ .level = 5, .advanced = .{
+    #     .row_match_finder = .disable, .hash_log = 12, .max_block_size = 4096 } })
 
 A correction only drops indices that have left the window, so the frame is
 the same as without it: the test also reads `frame.Options.

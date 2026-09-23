@@ -6,9 +6,9 @@ Consumer view, API and purpose: [README.md](README.md).
 
 A Zstandard **compressor** that reproduces libzstd 1.5.7's output byte for
 byte: one-shot for every level, 1–22 and negative, and streaming
-(`ZSTD_compressStream2`, for the same sequence of calls) for the same levels;
-and a **decoder** ported from libzstd's, one-shot and streaming (see
-*Decoder*). Every strategy is
+(`ZSTD_compressStream2`, for the same sequence of calls) for the same levels,
+with libzstd's advanced parameters (see *Advanced parameters*); and a
+**decoder** ported from libzstd's, one-shot and streaming (see *Decoder*). Every strategy is
 translated from libzstd — `fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both
 the hash chain and the row-based search, `btlazy2`'s binary tree, and the
 optimal parsers `btopt`/`btultra`/`btultra2` — together with the frame/block
@@ -229,6 +229,58 @@ small flushes cost ratio and time; Z1 is the real stream. `Writer.Error` has
 one member, so a failure of our own (out of memory) is kept in
 `FrameWriter.err`; null there means `output` failed.
 
+## Advanced parameters
+
+`Options.advanced` (and the same field of `StreamOptions` and
+`FrameWriterOptions`) is libzstd's `ZSTD_CCtx_setParameter` set, each field
+one parameter, null or `.auto` for "not set":
+
+| field | libzstd | bounds |
+|---|---|---|
+| `window_log`, `hash_log`, `chain_log`, `search_log`, `min_match`, `target_length`, `strategy` | `ZSTD_c_windowLog` … `ZSTD_c_strategy` | 10–31, 6–30, 6–30, 1–30, 3–7, 0–131072 |
+| `content_size` | `ZSTD_c_contentSizeFlag` | |
+| `format` | `ZSTD_c_format` (`.magicless`: no magic number) | |
+| `literal_compression`, `row_match_finder`, `split_after_sequences` | `ZSTD_c_literalCompressionMode`, `ZSTD_c_useRowMatchFinder`, `ZSTD_c_splitAfterSequences` | auto / enable / disable |
+| `block_splitter_level` | `ZSTD_c_blockSplitterLevel` | 0–6 |
+| `max_block_size` | `ZSTD_c_maxBlockSize` | 1024–131072 |
+| `StreamOptions.src_size_hint` | `ZSTD_c_srcSizeHint` | 1–2^31-1 |
+
+The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
+`error.ParameterOutOfBound`, where `ZSTD_CCtx_setParameter` refuses. The
+parameters are derived as `ZSTD_getCParamsFromCCtxParams` does: the
+level's row (by the source size, or for an unknown size by
+`src_size_hint`), already adjusted once for the level's own strategy; the
+explicit parameters put over it (`ZSTD_overrideCParams`, where a
+`target_length` of 0 counts as "not set"); and the adjustment run again —
+which caps the hash log for the row match finder unless that is switched
+off. Then libzstd's resolvers: the row match finder only for `greedy` …
+`lazy2` (enable on another strategy does nothing), the post-splitter and
+literal compression (`.auto`: off for `fast` with an acceleration, that is
+the negative levels) as described in *Algorithm*. The block size is
+`min(max_block_size, window)`; with blocks under 128 KB the pre-splitter
+never cuts. `block_splitter_level` 1 never pre-splits, 2–6 are the
+splitter's levels 0–4 (from the borders, then by chunks), 0 picks by
+strategy. Two places consult literal compression besides the literals
+section itself: the optimal parsers price a literal at 8 bits and keep no
+literal statistics when it is disabled (`ZSTD_compressedLiterals`), and the
+post-splitter's size estimate stores the literals raw.
+
+`content_size = false` leaves the size out of the header (and so the
+header is never single-segment); libzstd clears the flag for an unknown
+size anyway. A magicless frame is the same frame without its first four
+bytes; only a decoder told `format = .magicless` reads it, and such a
+decoder knows no skippable frames. `writeSkippableFrame` writes one
+(`ZSTD_writeSkippableFrame`, magic variants 0–15).
+
+Not here, each with its backlog item: `ZSTD_c_dictIDFlag`,
+`deterministicRefPrefix`, `forceMaxWindow`, `forceAttachDict`,
+`enableDedicatedDictSearch`, `prefetchCDictTables` (they act on
+dictionaries: Z4); the LDM switch and parameters (Z7); `targetCBlockSize`
+(Z8); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
+`repcodeResolution` (formerly `searchForExternalRepcodes`),
+`blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
+act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
+
 ## Decoder
 
 A port of libzstd's decoder (`lib/decompress/*`, `lib/common/entropy_common.c`,
@@ -239,7 +291,10 @@ tables, one and four streams, the choice between them by
 repeat), repeat offsets, content checksum, concatenated and skippable
 frames, and the frame queries (`getFrameHeader`, `getFrameContentSize`,
 `findFrameCompressedSize`, `findDecompressedSize`, `decompressBound`,
-`decompressionMargin`, `readSkippableFrame`, `getDictIdFromFrame`). Errors
+`decompressionMargin`, `readSkippableFrame`, `getDictIdFromFrame`), and
+magicless frames (`DecompressOptions.format`, `ZSTD_d_format`: the header
+starts at the descriptor byte, and no frame is taken for a skippable one;
+`getFrameHeaderAdvanced` reads such a header). Errors
 are named after `ZSTD_error_*`, so a differential run compares the error
 class too.
 
@@ -301,6 +356,7 @@ the heap; `decompress` allocates one per call.
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
 | stream level | as one-shot (`stream_max_level` = `max_level`) | level 22 without a pledged size uses a 128 MB window and long-distance matching (window log 27, as libzstd), ≈ 1 GB |
+| advanced parameters | libzstd's bounds (see *Advanced parameters*), else `error.ParameterOutOfBound` | `ZSTD_cParam_getBounds`, 64-bit |
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
 | stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
 | decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header, else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (64-bit); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
@@ -443,10 +499,11 @@ survives; a mutation of the correction's back-off only changes how often it
 runs, which no output can show.
 
 **Streaming** (2026-09-23) has its own goldens: `src/testdata/
-stream_goldens.zig` holds, for each of 54 `corpus.stream_cases` (a corpus
+stream_goldens.zig` holds, for each of 62 `corpus.stream_cases` (a corpus
 input and a call schedule) × its levels (-5, -1 and 1–3 for 31 cases, 4–10
-for 7, 11–22 for 6, one level each for the 10 found by search) × checksum,
-the length and SHA-256 of everything `ZSTD_compressStream2` emits (470
+for 7, 11–22 for 6, one level each for the 10 found by search, and the 8
+with advanced parameters, 2026-09-24) × checksum,
+the length and SHA-256 of everything `ZSTD_compressStream2` emits (534
 streams),
 written by the same recipe through `tools/zstream.c`; schedules starting
 with `x` run against libzstd built with frequent overflow correction. The
@@ -516,7 +573,7 @@ system files at every level (682 frames), 6 inputs of 0.3–13 MB (window
 slides, multi-block post-splits) at 8 levels, 600 random mixed inputs up to
 700 KB, and every file with the strategy forced to `btopt`, `btultra` and
 `btultra2` at levels 1–19 (about 1 000 frames): all identical, the first
-time each ran. The strategy is now forced through `frame.Options.strategy`
+time each ran. The strategy is now forced through `Advanced.strategy`
 and `params.getOverridden`, which repeat libzstd's two parameter
 derivations, and `zref` takes the strategy as a fifth argument.
 For level 22 and long-distance matching (2026-09-22): level 22 itself on
@@ -606,6 +663,31 @@ decoded) — all equivalent; and the literal-placement limit off by one
 (`+ 32` → `+ 33`), reachable only on damaged input, not found in 18 680
 damaged frames.
 
+**Advanced parameters** (2026-09-24) have their own goldens:
+`src/testdata/param_goldens.zig` holds, for each of 37 `corpus.param_cases`
+(a corpus input, a `name=value` list of libzstd parameters, levels), the
+length and SHA-256 of the frame `ZSTD_compress2` emits with the same
+parameters set (67 frames, through `tools/zref.c`'s last argument); 8
+stream cases carry parameters as schedule tokens (64 streams). Before the
+cases were chosen, random parameter sets — every field of `Advanced` with
+probability 0.15–0.4, over the whole corpus at levels -10…22 — were run
+against `zref`: of the first 300 one-shot frames 2 differed (the
+post-splitter's estimate priced literals as compressed when literal
+compression was off; fixed), then 3 300 one-shot frames and 1 550 streams
+(the same sets plus a size hint, pledges, window logs 10–18, chunks,
+flushes and small outputs, against `zstream`) were all identical. 47
+mutations of the new code (bounds, the override, the three resolvers, the
+row cap, the header, the block size, both splitters, the optimal parsers'
+raw literal price, the size hint, the decoder's format checks, the API
+plumbing): 43 caught, 4 of them once rewritten to compile, 4 only after a
+hand-built magicless frame whose first four bytes read like a skippable
+magic number was added. 4 survive, all equivalent: the optimal parsers'
+literal statistics gathered or scaled while literal compression is off
+(3 — nothing reads them then, the price is a flat 8 bits), and the
+streaming decoder's single-pass shortcut sizing a magicless frame as a
+zstd1 one (it then finds no frame and decodes through the stream path, to
+the same bytes).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## What is deliberately not done
@@ -665,7 +747,7 @@ dictionaries are undecided.
   - **Z2c — dictionaries**: raw-content and zstd-format (`ZSTD_loadDEntropy`:
     entropy tables, repcodes, content as history), a reusable `DDict`, and
     the multiple-dictionary table. **~1 session**; together with Z4.
-  Legacy (pre-v0.8) formats: no. Magicless frames: with Z6.
+  Legacy (pre-v0.8) formats: no. Magicless frames: done with Z6.
 - ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
   *Algorithm*. (The row tag table needs no reduction: it holds tags and
   in-row heads, not indices.)
@@ -674,7 +756,10 @@ dictionaries are undecided.
   reusable `CDict`, libzstd's attach / copy / reload choice
   (`ZSTD_shouldAttachDict` by size and strategy), which needs the
   **dictMatchState variant of every match finder** (on top of Z1's
-  extDict), and the dictionary ID in the header. Dedicated dictionary
+  extDict), and the dictionary ID in the header with its flag
+  (`ZSTD_c_dictIDFlag`), and the dictionary parameters
+  (`deterministicRefPrefix`, `forceMaxWindow`, `forceAttachDict`,
+  `prefetchCDictTables`). Dedicated dictionary
   search (`enableDedicatedDictSearch`) optional. Needs Z2 to decode.
   **2–3 sessions** after Z1.
 - **Z5 — Dictionary training.** `ZDICT_trainFromBuffer` (fastCover, the
@@ -682,13 +767,13 @@ dictionaries are undecided.
   `ZDICT_finalizeDictionary` (entropy tables for a given content); the
   legacy divsufsort trainer: no. Until then `zstd --train` offline works.
   **1–2 sessions.**
-- **Z6 — Advanced parameters.** Explicit compression parameters (window,
-  chain, hash, search log, min match, target length, strategy) with
-  libzstd's bounds and adjustment; content-size and dictID flags;
-  magicless frames; writing skippable frames; `literalCompressionMode`,
-  `useRowMatchFinder`, `useBlockSplitter`/`postBlockSplitter`,
-  `maxBlockSize`, `searchForExternalRepcodes`. Each goldened through
-  `zref` with the parameter set. **~1 session.**
+- ~~**Z6 — Advanced parameters.**~~ Done 2026-09-24, see *Advanced
+  parameters*: the explicit compression parameters with libzstd's bounds
+  and derivation, the content-size flag, magicless frames (both ways),
+  skippable frames, literal compression, the row match finder, both
+  splitters, the block size, the size hint. Moved out: the dictID flag
+  (Z4, it has no effect without a dictionary) and
+  `searchForExternalRepcodes` (Z10, it acts on external sequences only).
 - **Z7 — Long-distance matching as an option** (`--long`, window log 27 by
   default): the path below `btopt` (`ZSTD_ldm_blockCompress`'s splicing
   loop, `maybeSplitSequence`, `ZSTD_ldm_skipSequences`,
@@ -703,8 +788,9 @@ dictionaries are undecided.
   output does not depend on the worker count once there is more than
   none, so it stays goldenable. **~2 sessions.** After Z1.
 - **Z10 — Sequence-level API.** `ZSTD_compressSequences`,
-  `ZSTD_generateSequences`, the external sequence producer. **~1
-  session.** Niche.
+  `ZSTD_generateSequences`, the external sequence producer, and their
+  parameters (`repcodeResolution`, `blockDelimiters`, `validateSequences`,
+  `enableSeqProducerFallback`). **~1 session.** Niche.
 - **Z11 — Speed parity** (target ≤ 1.1× libzstd): unrolled Huffman and
   histogram loops, prefetch, SIMD row-tag compare, the fast/dfast inner
   loops' cmov variants — none changes a decision, so the goldens stay.
@@ -717,7 +803,7 @@ dictionaries are undecided.
   that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
   caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b done) Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6 done) Z13 → Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 
