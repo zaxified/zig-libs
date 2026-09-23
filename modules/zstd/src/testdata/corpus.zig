@@ -29,6 +29,16 @@ pub const Case = struct {
     /// which reaches LDM far below the 64 MB where level 22 switches it on.
     /// Needs `only_levels` (btopt and up).
     ldm: bool = false,
+    /// `ZSTD_c_windowLog` set by hand (`frame.Options.window_log`): a window
+    /// far smaller than the input, so overflow correction (below) has room
+    /// to run many times. Needs `only_levels`.
+    window_log: ?u32 = null,
+    /// Compressed with overflow correction as libzstd's fuzzing build does it
+    /// (`ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`, `frame.Options.
+    /// overflow_correct_frequently`): whenever it is safe rather than past
+    /// 3500 MiB. The reference is a libzstd compiled with that switch.
+    /// Needs `only_levels`.
+    ocf: bool = false,
 };
 
 pub const Kind = enum {
@@ -149,6 +159,22 @@ pub const cases = [_]Case{
     .{ .name = "ldm-drift-300000-2", .len = 300000, .kind = .drift, .seed = 2, .only_levels = &.{20}, .ldm = true }, // the parser's overshoot past a candidate is skipped
     .{ .name = "ldm-mix-600000-7", .len = 600000, .kind = .mix, .seed = 7, .only_levels = &.{17}, .ldm = true }, // the first candidate is fetched before the first position
     .{ .name = "ldm-mix-600000-25", .len = 600000, .kind = .mix, .seed = 25, .only_levels = &.{21}, .ldm = true }, // a candidate resumed inside its match
+    // Index overflow correction (Z3), run often: a window of 1..128 KB over
+    // inputs of 200..600 KB, one case per match finder and its tables.
+    .{ .name = "ocf-mix-200000-1-w10", .len = 200000, .kind = .mix, .seed = 1, .only_levels = &.{-5}, .window_log = 10, .ocf = true }, // fast, the smallest window
+    .{ .name = "ocf-mix-200000-2-w12", .len = 200000, .kind = .mix, .seed = 2, .only_levels = &.{1}, .window_log = 12, .ocf = true }, // fast
+    .{ .name = "ocf-mix-200000-3-w12", .len = 200000, .kind = .mix, .seed = 3, .only_levels = &.{3}, .window_log = 12, .ocf = true }, // dfast: both tables
+    .{ .name = "ocf-mix-200000-4-w12", .len = 200000, .kind = .mix, .seed = 4, .only_levels = &.{ 5, 7 }, .window_log = 12, .ocf = true }, // greedy, lazy on hash chains
+    .{ .name = "ocf-mix-600000-5-w15", .len = 600000, .kind = .mix, .seed = 5, .only_levels = &.{ 5, 8 }, .window_log = 15, .ocf = true }, // greedy, lazy2 on the row match finder (window > 16 KB)
+    .{ .name = "ocf-mix-200000-6-w12", .len = 200000, .kind = .mix, .seed = 6, .only_levels = &.{ 11, 12 }, .window_log = 12, .ocf = true }, // btlazy2: the unsorted mark survives the reduction
+    .{ .name = "ocf-mix-200000-7-w12", .len = 200000, .kind = .mix, .seed = 7, .only_levels = &.{ 13, 16, 19 }, .window_log = 12, .ocf = true }, // btopt, btultra and btultra2 with the 3-byte hash
+    .{ .name = "ocf-mix-600000-8-w17", .len = 600000, .kind = .mix, .seed = 8, .only_levels = &.{19}, .window_log = 17, .ocf = true }, // btultra2 with the post-splitter (window >= 128 KB)
+    .{ .name = "ocf-ldm-mix-600000-9-w15", .len = 600000, .kind = .mix, .seed = 9, .only_levels = &.{16}, .ldm = true, .window_log = 15, .ocf = true }, // the LDM window corrects on its own (cycle log 0)
+    .{ .name = "ocf-far-repeat-1400000", .len = 1_400_000, .kind = .far_repeat, .only_levels = &.{1}, .ocf = true }, // the level's own window, no override
+    // found by seed search against surviving mutations
+    .{ .name = "ocf-mix-20000-128-w12", .len = 20000, .kind = .mix, .seed = 128, .only_levels = &.{11}, .window_log = 12, .ocf = true }, // btlazy2's unsorted mark must survive the reduction
+    .{ .name = "ocf-ldm-mix-600000-244-w13", .len = 600000, .kind = .mix, .seed = 244, .only_levels = &.{18}, .ldm = true, .window_log = 13, .ocf = true }, // the LDM table is reduced with the window
+    .{ .name = "ocf-ldm-mix-600000-67-w11", .len = 600000, .kind = .mix, .seed = 67, .only_levels = &.{19}, .ldm = true, .window_log = 11, .ocf = true }, // ... and its offsets below the correction become 0
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };

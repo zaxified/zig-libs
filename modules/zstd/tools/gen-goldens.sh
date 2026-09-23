@@ -27,6 +27,11 @@ if [ "$got" != "$pin" ]; then
 fi
 make -C "$R/lib" -j"$(nproc)" libzstd.a >/dev/null
 cc -O2 -I "$R/lib" -o "$R/zref" "$here/zref.c" "$R/lib/libzstd.a"
+# The same compressor with index overflow corrected whenever it safely can
+# (libzstd's fuzzing mode), for the corpus cases marked `ocf`: that is how
+# inputs of kilobytes reach the correction that otherwise waits for 3500 MiB.
+cc -O2 -DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1 -I "$R/lib" -I "$R/lib/common" \
+    -o "$R/zref-ocf" "$here/zref.c" "$R"/lib/common/*.c "$R"/lib/compress/*.c
 
 work="$R/corpus"
 mkdir -p "$work"
@@ -44,8 +49,9 @@ out="$mod/src/testdata/goldens.zig"
     echo "pub const Golden = struct { case: []const u8, level: i32, checksum: bool, len: usize, sha256: *const [64]u8 };"
     echo ""
     echo "pub const rows = [_]Golden{"
-    while read -r f l ck ldm; do
-        "$R/zref" "$l" "$ck" "$work/$f" "$R/out.zst" 0 "$ldm"
+    while read -r f l ck ldm wl ocf; do
+        z=$([ "$ocf" = 1 ] && echo "$R/zref-ocf" || echo "$R/zref")
+        "$z" "$l" "$ck" "$work/$f" "$R/out.zst" 0 "$ldm" "$wl"
         len=$(stat -c %s "$R/out.zst")
         sum=$(sha256sum "$R/out.zst" | cut -d' ' -f1)
         b=$([ "$ck" = 1 ] && echo true || echo false)

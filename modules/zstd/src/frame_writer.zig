@@ -22,8 +22,6 @@ pub const Options = struct {
 pub const InitError = error{
     /// See `zstd.Error.LevelUnsupported`.
     LevelUnsupported,
-    /// `buffer` is longer than one frame may be (`max_input_size`).
-    InputTooLarge,
     OutOfMemory,
 };
 
@@ -49,7 +47,6 @@ pub const FrameWriter = struct {
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: Options) InitError!FrameWriter {
         std.debug.assert(buffer.len != 0);
         if (opts.level > params.max_level) return error.LevelUnsupported;
-        if (buffer.len > frame.max_input_size) return error.InputTooLarge;
         return .{
             .writer = .{
                 .buffer = buffer,

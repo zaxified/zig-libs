@@ -17,9 +17,6 @@ const ldm = @import("ldm.zig");
 pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
     NoSpaceLeft,
-    /// The input is too large for one frame of 32-bit indices (libzstd would
-    /// start rescaling its tables, which this port does not carry).
-    InputTooLarge,
     OutOfMemory,
 };
 
@@ -28,10 +25,6 @@ pub fn compressBound(src_size: usize) usize {
     const margin: usize = if (src_size < 128 << 10) ((128 << 10) - src_size) >> 11 else 0;
     return src_size + (src_size >> 8) + margin;
 }
-
-/// Largest input one frame can take here: libzstd corrects index overflow
-/// once `ZSTD_CURRENT_MAX` (3500 MB on 64-bit) is crossed.
-pub const max_input_size: usize = 3500 * (1 << 20) - match.window_start;
 
 const block_size_max_abs = 128 * 1024;
 const block_header_size = 3;
@@ -51,6 +44,12 @@ const BlockState = struct {
 };
 
 const Ctx = struct {
+    /// The whole input. `ms.src` is its tail from `base` on.
+    src: []const u8,
+    /// Sum of the overflow corrections: index `i` of the match state names
+    /// input byte `i - window_start + base`.
+    base: usize = 0,
+    overflow_correct_frequently: bool,
     ms: match.MatchState,
     ss: sequences.SeqStore,
     prev: *BlockState,
@@ -64,6 +63,11 @@ const Ctx = struct {
     /// Long-distance matching: the table, and room for one block's sequences.
     ldm: ?*ldm.State = null,
     ldm_seqs: []ldm.RawSeq = &.{},
+
+    /// The match state's index of input position `pos`.
+    fn index(c: *const Ctx, pos: usize) u32 {
+        return @intCast(pos + match.window_start - c.base);
+    }
 };
 
 fn writeFrameHeader(dst: []u8, cp: params.CParams, src_size: u64, checksum: bool) usize {
@@ -190,11 +194,11 @@ fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usiz
 /// `ZSTD_buildSeqStore`: run the match finder over the block. Returns false
 /// for a block too small to try (`ZSTDbss_noCompress`).
 fn buildSeqStore(c: *Ctx, block_start: usize, block_size: usize) bool {
-    const src = c.ms.src;
+    const src = c.src;
     // don't even attempt compression below a certain srcSize
     if (block_size < min_cblock_size + block_header_size + 1 + 1) return false;
     c.ss.reset();
-    const istart: u32 = @intCast(block_start + match.window_start);
+    const istart = c.index(block_start);
     // limited update after a very long match
     if (istart > c.ms.next_to_update + 384)
         c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
@@ -204,7 +208,7 @@ fn buildSeqStore(c: *Ctx, block_start: usize, block_size: usize) bool {
         // ZSTD_ldm_blockCompress, strategy >= btopt: the long-distance
         // matches are candidates for the optimal parser, not sequences
         var ldm_seq_store: ldm.RawSeqStore = .{ .seq = c.ldm_seqs };
-        ls.generateSequences(&ldm_seq_store, istart, block_size);
+        ls.generateSequences(&ldm_seq_store, block_start, block_size);
         c.ms.ldm_seq_store = &ldm_seq_store;
         defer c.ms.ldm_seq_store = null;
         last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block_size));
@@ -218,7 +222,7 @@ fn buildSeqStore(c: *Ctx, block_start: usize, block_size: usize) bool {
 /// `ZSTD_compressBlock_internal` (frame mode). Returns 0 for "store raw", 1 for
 /// "RLE" (`dst[0]` holds the byte), otherwise the compressed block size.
 fn compressBlock(c: *Ctx, dst: []u8, block_start: usize, block_size: usize) usize {
-    const src = c.ms.src;
+    const src = c.src;
     var c_size: usize = 0;
     if (buildSeqStore(c, block_start, block_size)) {
         c_size = entropyCompress(c, &c.ss, dst, block_size);
@@ -268,7 +272,7 @@ fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: 
 /// `ZSTD_compressBlock_splitBlock`: one block of input, emitted as one or
 /// more blocks. Returns the bytes written, headers included.
 fn compressBlockSplit(c: *Ctx, out: []u8, block_start: usize, block_size: usize, last_block: u32) usize {
-    const src = c.ms.src[block_start..][0..block_size];
+    const src = c.src[block_start..][0..block_size];
     if (!buildSeqStore(c, block_start, block_size)) return emitBlock(out, src, 0, last_block);
 
     const prev: blocksplit.Entropy = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
@@ -319,16 +323,26 @@ pub const Options = struct {
     /// before the input shrinks it), to reach LDM on inputs far below the
     /// 64 MB where level 22 switches it on. Only for btopt and up.
     ldm: bool = false,
+    /// Test seam: `ZSTD_c_windowLog`, a window smaller than the level's.
+    window_log: ?u32 = null,
+    /// Test seam: libzstd built with `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`
+    /// (its fuzzing mode), which corrects index overflow whenever it safely
+    /// can instead of only past `ZSTD_CURRENT_MAX` (3500 MiB). The output
+    /// changes; it is how inputs of kilobytes reach the correction.
+    overflow_correct_frequently: bool = false,
+    /// Test seam: receives how many corrections the match state and the LDM
+    /// window made. The output does not show them -- a correction only drops
+    /// indices outside the window -- so this is how a test knows they ran.
+    overflow_corrections: ?*[2]u32 = null,
 };
 
 /// One-shot frame. `dst.len` must be at least `compressBound(src.len)`.
 pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
-    if (src.len > max_input_size) return error.InputTooLarge;
     const bound = compressBound(src.len);
     if (dst.len < bound) return error.NoSpaceLeft;
     const out = dst[0..bound];
 
-    const cp = params.getOverridden(opts.level, src.len, opts.strategy, opts.ldm);
+    const cp = params.getOverridden(opts.level, src.len, opts.strategy, opts.ldm, opts.window_log);
     const ldm_params: ?ldm.Params = if (opts.ldm or ldm.enabledByDefault(cp)) ldm.adjustParameters(cp) else null;
     // LDM by hand below btopt splices LDM sequences between runs of the
     // block compressor (`ZSTD_ldm_blockCompress`), which is not ported.
@@ -393,9 +407,17 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
         defer gpa.free(ldm_seqs);
         const ldm_state: ?*ldm.State = if (ldm_on) try gpa.create(ldm.State) else null;
         defer if (ldm_state) |p| gpa.destroy(p);
-        if (ldm_state) |p| p.* = .{ .src = src, .p = lp, .hash_table = ldm_table, .bucket_offsets = ldm_buckets };
+        if (ldm_state) |p| p.* = .{
+            .src = src,
+            .p = lp,
+            .hash_table = ldm_table,
+            .bucket_offsets = ldm_buckets,
+            .overflow_correct_frequently = opts.overflow_correct_frequently,
+        };
 
         var c: Ctx = .{
+            .src = src,
+            .overflow_correct_frequently = opts.overflow_correct_frequently,
             .ms = .{
                 .src = src,
                 .cp = cp,
@@ -435,7 +457,8 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
             const last_block: u32 = @intFromBool(block_size == remaining);
             std.debug.assert(out.len - op >= block_header_size + min_cblock_size + 1);
 
-            c.ms.enforceMaxDist(@intCast(ip + match.window_start));
+            c.base += c.ms.overflowCorrectIfNeeded(c.overflow_correct_frequently, c.index(ip), @as(usize, c.index(ip)) + block_size);
+            c.ms.enforceMaxDist(c.index(ip));
             // Ensure hash/chain table insertion resumes no sooner than lowlimit
             if (c.ms.next_to_update < c.ms.low_limit) c.ms.next_to_update = c.ms.low_limit;
 
@@ -448,6 +471,7 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
             op += c_size;
             c.is_first_block = false;
         }
+        if (opts.overflow_corrections) |oc| oc.* = .{ c.ms.n_overflow_corrections, if (ldm_state) |ls| ls.n_overflow_corrections else 0 };
     }
 
     if (opts.checksum) {

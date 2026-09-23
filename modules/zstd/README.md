@@ -28,10 +28,12 @@ libc.
 - **Output:** one frame, content size in the header, optional content checksum
   (`checksum = true`). Byte-identical to `ZSTD_compress2()` with the same
   level and checksum setting — pinned by the golden test on a 56-case corpus
-  (2011 frames: every case at levels -5…10 with and without checksum, cases up
+  (2029 frames: every case at levels -5…10 with and without checksum, cases up
   to 600 KB at levels 11–22, 14 cases found by mutation testing at the one
-  level each pins, and 15 compressed with long-distance matching switched
-  on by hand), and against libzstd at level 22 on 64–140 MB inputs.
+  level each pins, 15 compressed with long-distance matching switched
+  on by hand, and 13 with index overflow correction run often), and against
+  libzstd at level 22 on 64–140 MB inputs and on a 4.4 GB input past the
+  3500 MiB index limit.
 - **Speed:** about 1.2–1.5× libzstd's time on the same input up to level 10
   (process wall time, ReleaseFast, 4–13 MB inputs), 0.9–1.4× at levels 13–19
   (single runs on a loaded machine; see SPEC.md). Level 19 compresses about
@@ -87,8 +89,9 @@ Frames share no history, so frequent small flushes cost ratio. On
 means `out` failed.
 
 Errors: `LevelUnsupported` (level > 22), `NoSpaceLeft` (`dst` below
-`compressBound`), `InputTooLarge` (over `max_input_size`, 3500 MiB — libzstd
-would start rescaling its indices there, which is not ported), `OutOfMemory`.
+`compressBound`), `OutOfMemory`. There is no input size limit: past 3500 MiB
+the indices are rescaled as libzstd does (the whole input still has to be in
+memory, and so does its `compressBound`).
 
 ## Tests
 

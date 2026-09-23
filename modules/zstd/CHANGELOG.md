@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — Index overflow correction (SPEC backlog Z3):
+  `ZSTD_window_correctOverflow` with the table reductions of the match state
+  (hash, chain / binary tree keeping `btlazy2`'s unsorted mark, 3-byte hash)
+  and of the LDM window, so inputs past 3500 MiB compress as libzstd does.
+  `max_input_size` and `error.InputTooLarge` are gone. Anchored by 13 golden
+  cases compressed with a small window (new `frame.Options.window_log` seam,
+  `ZSTD_c_windowLog`) and correction run often (`frame.Options.
+  overflow_correct_frequently`, against libzstd built with
+  `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`), a check that the corrections
+  ran, 13 mutations all caught, and a 4.4 GB input identical to libzstd.
+  `tools/zref.c` takes the window log as a seventh argument.
+
 - **2026-09-23** — `FrameWriter`: a `std.Io.Writer` that compresses into
   concatenated one-shot frames, one per buffer fill and per flush (SPEC
   backlog Z1a, the interim before libzstd-identical streaming). Each frame is

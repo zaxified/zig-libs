@@ -50,9 +50,6 @@ pub const max_level = params.max_level;
 pub const min_level = params.min_level;
 pub const default_level = params.default_level;
 
-/// Largest input a single `compress` call accepts.
-pub const max_input_size = frame.max_input_size;
-
 /// Worst-case compressed size of `src_size` bytes (`ZSTD_compressBound`).
 pub fn compressBound(src_size: usize) usize {
     return frame.compressBound(src_size);
@@ -74,7 +71,6 @@ pub const FrameWriterOptions = frame_writer.Options;
 
 /// Compress `src` into a newly allocated frame owned by the caller.
 pub fn compressAlloc(gpa: std.mem.Allocator, src: []const u8, opts: Options) Error![]u8 {
-    if (src.len > max_input_size) return error.InputTooLarge;
     const buf = try gpa.alloc(u8, compressBound(src.len));
     errdefer gpa.free(buf);
     const n = try compress(gpa, buf, src, opts);

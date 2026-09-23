@@ -4,7 +4,9 @@
 //! For every corpus case, level and checksum setting, the frame this module
 //! produces must have the length and SHA-256 that libzstd's `ZSTD_compress2`
 //! produced for the same input (for a case marked `ldm`, with long-distance
-//! matching switched on by hand on both sides) (`testdata/goldens.zig`, written by
+//! matching switched on by hand on both sides; `window_log`, with the window
+//! set by hand; `ocf`, against libzstd built to correct index overflow
+//! frequently) (`testdata/goldens.zig`, written by
 //! `tools/gen-goldens.sh`). A digest rather than the frame itself keeps the
 //! repository small; the recipe regenerates the reference bytes when a
 //! mismatch needs to be looked at.
@@ -47,8 +49,16 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus" {
         for (corpus.levels) |level| for ([_]bool{ false, true }) |ck| {
             if (!corpus.covered(case, level, ck)) continue;
             const g = find(case.name, level, ck).?;
-            const n = if (case.ldm)
-                try frame.compress(gpa, dst, src, .{ .level = level, .checksum = ck, .ldm = true })
+            var corrections: [2]u32 = .{ 0, 0 };
+            const n = if (case.ldm or case.window_log != null or case.ocf)
+                try frame.compress(gpa, dst, src, .{
+                    .level = level,
+                    .checksum = ck,
+                    .ldm = case.ldm,
+                    .window_log = case.window_log,
+                    .overflow_correct_frequently = case.ocf,
+                    .overflow_corrections = &corrections,
+                })
             else
                 try zstd.compress(gpa, dst, src, .{ .level = level, .checksum = ck });
             var digest: [32]u8 = undefined;
@@ -56,6 +66,12 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus" {
             const hex = std.fmt.bytesToHex(digest, .lower);
             if (n != g.len or !std.mem.eql(u8, &hex, g.sha256)) {
                 std.debug.print("MISMATCH {s} level {d} checksum {}: len {d} (libzstd {d})\n", .{ case.name, level, ck, n, g.len });
+                mismatches += 1;
+            }
+            // A correction leaves the output as it was; that it ran at all
+            // is checked here (on both windows for an LDM case).
+            if (case.ocf and (corrections[0] == 0 or (case.ldm and corrections[1] == 0))) {
+                std.debug.print("NO CORRECTION {s} level {d}: {any}\n", .{ case.name, level, corrections });
                 mismatches += 1;
             }
         };
@@ -76,5 +92,5 @@ test "corpus inputs are the ones the goldens were made from" {
         h.update(buf);
     }
     const hex = std.fmt.bytesToHex(h.finalResult(), .lower);
-    try std.testing.expectEqualStrings("eae2fe45e9f995cfaf4977d322b8c802b401265fc3b111553fbf46b58e5da48a", &hex);
+    try std.testing.expectEqualStrings("030ead96599721f48e348e5a4310acd558e6e0e2a56fc01851315dabbaef25bb", &hex);
 }

@@ -43,6 +43,8 @@ pub const MatchState = struct {
     /// `window.lowLimit` / `window.dictLimit`; equal here (no extDict ever).
     low_limit: u32 = window_start,
     dict_limit: u32 = window_start,
+    /// `window.nbOverflowCorrections`.
+    n_overflow_corrections: u32 = 0,
     /// First index the lazy match finders have not inserted yet.
     next_to_update: u32 = window_start,
     /// Row match finder: `rowHashLog` (hash_log - rowLog) and hash salt.
@@ -119,6 +121,24 @@ pub const MatchState = struct {
         }
     }
 
+    /// `ZSTD_overflowCorrectIfNeeded` for the block at indices
+    /// `ip`..`iend`. Returns the correction made (0 for none): every index
+    /// drops by it, and `src` loses that many bytes at the front, which is
+    /// libzstd's `window.base += correction`.
+    pub fn overflowCorrectIfNeeded(ms: *MatchState, frequently: bool, ip: usize, iend: usize) u32 {
+        const cycle_log = params.cycleLog(ms.cp);
+        const max_dist: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
+        if (!needOverflowCorrection(frequently, ms.n_overflow_corrections, cycle_log, max_dist, ip, iend)) return 0;
+        const correction = correctOverflow(&ms.low_limit, &ms.dict_limit, &ms.n_overflow_corrections, frequently, cycle_log, max_dist, @intCast(ip));
+        ms.src = ms.src[correction..];
+        // ZSTD_reduceIndex
+        reduceTable(ms.hash_table, correction, false);
+        reduceTable(ms.chain_table, correction, ms.cp.strategy == .btlazy2);
+        reduceTable(ms.hash_table3, correction, false);
+        ms.next_to_update = if (ms.next_to_update < correction) 0 else ms.next_to_update - correction;
+        return correction;
+    }
+
     /// `ZSTD_getLowestPrefixIndex` without a dictionary.
     pub fn lowestPrefixIndex(ms: *const MatchState, curr: u32) u32 {
         const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
@@ -126,6 +146,68 @@ pub const MatchState = struct {
         return if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
     }
 };
+
+/// `ZSTD_CURRENT_MAX` on 64-bit: past this index the indices are rescaled.
+pub const current_max: u32 = 3500 << 20;
+
+/// `ZSTD_window_canOverflowCorrect` (no dictionary: `loadedDictEnd` 0).
+fn canOverflowCorrect(n_corrections: u32, cycle_log: u32, max_dist: u32, curr: u32) bool {
+    const cycle_size = @as(u32, 1) << @intCast(cycle_log);
+    const min_index_to_overflow_correct = cycle_size +% @max(max_dist, cycle_size) +% window_start;
+    // Back off the correction frequency; if the product overflows it only
+    // has to stay at least the minimum.
+    const adjustment = n_corrections +% 1;
+    const adjusted_index = @max(min_index_to_overflow_correct *% adjustment, min_index_to_overflow_correct);
+    const index_large_enough = curr > adjusted_index;
+    const dictionary_invalidated = curr > max_dist;
+    return index_large_enough and dictionary_invalidated;
+}
+
+/// `ZSTD_window_needOverflowCorrection` for the chunk at indices
+/// `ip`..`iend`. `frequently` is `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`,
+/// libzstd's fuzzing switch: correct whenever it is safe, not only past
+/// `current_max`, which is how the tests reach this code on small inputs.
+pub fn needOverflowCorrection(frequently: bool, n_corrections: u32, cycle_log: u32, max_dist: u32, ip: usize, iend: usize) bool {
+    if (frequently and canOverflowCorrect(n_corrections, cycle_log, max_dist, @intCast(ip))) return true;
+    return iend > current_max;
+}
+
+/// `ZSTD_window_correctOverflow`: the correction that brings index `curr`
+/// down to just above `max_dist` while keeping its low `cycle_log` bits
+/// (the chains and trees index by them). Updates the window limits; the
+/// caller moves its base and reduces its tables.
+pub fn correctOverflow(low_limit: *u32, dict_limit: *u32, n_corrections: *u32, frequently: bool, cycle_log: u32, max_dist: u32, curr: u32) u32 {
+    const cycle_size = @as(u32, 1) << @intCast(cycle_log);
+    const cycle_mask = cycle_size - 1;
+    const current_cycle = curr & cycle_mask;
+    // Ensure newCurrent - maxDist >= ZSTD_WINDOW_START_INDEX.
+    const current_cycle_correction: u32 = if (current_cycle < window_start) @max(cycle_size, window_start) else 0;
+    const new_current = current_cycle + current_cycle_correction + @max(max_dist, cycle_size);
+    const correction = curr - new_current;
+    std.debug.assert(max_dist & (max_dist - 1) == 0);
+    std.debug.assert(curr & cycle_mask == new_current & cycle_mask);
+    std.debug.assert(curr > new_current);
+    if (!frequently) std.debug.assert(correction > 1 << 28);
+
+    low_limit.* = if (low_limit.* < correction + window_start) window_start else low_limit.* - correction;
+    dict_limit.* = if (dict_limit.* < correction + window_start) window_start else dict_limit.* - correction;
+    std.debug.assert(new_current >= max_dist and new_current - max_dist >= window_start);
+    std.debug.assert(low_limit.* <= new_current and dict_limit.* <= new_current);
+    n_corrections.* +%= 1;
+    return correction;
+}
+
+/// `ZSTD_reduceTable` / `ZSTD_reduceTable_btlazy2`: indices drop by
+/// `reducer`; those that would fall below `window_start` become 0 (empty).
+/// `preserve_mark` keeps btlazy2's unsorted mark, which is below
+/// `window_start` itself.
+pub fn reduceTable(table: []u32, reducer: u32, preserve_mark: bool) void {
+    const threshold = reducer + window_start;
+    for (table) |*v| {
+        if (preserve_mark and v.* == lazy.dubt_unsorted_mark) continue;
+        v.* = if (v.* < threshold) 0 else v.* - reducer;
+    }
+}
 
 const prime4: u32 = 2654435761;
 const prime5: u64 = 889523592379;
@@ -489,4 +571,42 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
     rep[0] = if (offset_1 != 0) offset_1 else offset_saved1;
     rep[1] = if (offset_2 != 0) offset_2 else offset_saved2;
     return iend - anchor;
+}
+
+test "reduceTable squashes indices below the threshold and keeps btlazy2's mark" {
+    var t = [_]u32{ 0, 1, 2, 1000, 1001, 1002, 1003, 5000 };
+    var u = t;
+    reduceTable(&t, 1000, false);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0, 0, 2, 3, 4000 }, &t);
+    reduceTable(&u, 1000, true);
+    try std.testing.expectEqualSlices(u32, &.{ 0, lazy.dubt_unsorted_mark, 0, 0, 0, 2, 3, 4000 }, &u);
+}
+
+test "past current_max the correction keeps the low cycle bits and the whole window" {
+    // 3500 MiB is a multiple of 2^16, so the index's cycle position is 5.
+    try std.testing.expect(!needOverflowCorrection(false, 0, 16, 1 << 19, current_max - 100, current_max));
+    try std.testing.expect(needOverflowCorrection(false, 0, 16, 1 << 19, current_max - 100, current_max + 1));
+    var low: u32 = current_max + 5 - (1 << 19);
+    var dict: u32 = low;
+    var n: u32 = 0;
+    const corr = correctOverflow(&low, &dict, &n, false, 16, 1 << 19, current_max + 5);
+    try std.testing.expectEqual(current_max + 5 - (5 + (1 << 19)), corr);
+    try std.testing.expectEqual(@as(u32, 5), low);
+    try std.testing.expectEqual(@as(u32, 5), dict);
+    try std.testing.expectEqual(@as(u32, 1), n);
+    // At cycle position 1 (below window_start) one more cycle is kept.
+    low = 2;
+    dict = 2;
+    const corr1 = correctOverflow(&low, &dict, &n, false, 16, 1 << 19, current_max + 1);
+    try std.testing.expectEqual(current_max + 1 - (1 + (1 << 16) + (1 << 19)), corr1);
+    try std.testing.expectEqual(@as(u32, window_start), low);
+    try std.testing.expectEqual(@as(u32, 2), n);
+}
+
+test "frequent correction backs off with each correction made" {
+    // min index = 2^12 + 2^14 + 2 = 20482
+    try std.testing.expect(!needOverflowCorrection(true, 0, 12, 1 << 14, 20482, 20483));
+    try std.testing.expect(needOverflowCorrection(true, 0, 12, 1 << 14, 20483, 20484));
+    try std.testing.expect(!needOverflowCorrection(true, 2, 12, 1 << 14, 3 * 20482, 3 * 20482 + 1));
+    try std.testing.expect(needOverflowCorrection(true, 2, 12, 1 << 14, 3 * 20482 + 1, 3 * 20482 + 2));
 }

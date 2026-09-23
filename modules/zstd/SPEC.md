@@ -136,6 +136,23 @@ Endianness: every multi-byte read that feeds a decision is little-endian,
 matching libzstd on x86/arm64 (libzstd reads native order in one place, the
 pre-splitter's 16-bit hash, which `greedy` and up use).
 
+**Index overflow correction** (`match.zig`, `ldm.zig`; libzstd's
+`ZSTD_overflowCorrectIfNeeded`, `ZSTD_window_correctOverflow`,
+`ZSTD_reduceIndex`, `ZSTD_ldm_reduceTable`). Indices are 32-bit. Before each
+block, once the block's end index would pass `ZSTD_CURRENT_MAX` (3500 MiB),
+every index drops by a correction that brings the block start to just above
+the window while keeping its low `cycleLog` bits (`chainLog`, one less from
+`btlazy2` up — the chains and trees are indexed by them). The hash, chain /
+tree and 3-byte hash tables are reduced (an index below the correction plus 2
+becomes 0, empty; `btlazy2`'s unsorted mark 1 is kept), and so are the window
+limits and `nextToUpdate`. libzstd moves `window.base` forward by the
+correction; here `ms.src` loses that many bytes at the front, so every
+`idx - window_start` access stays as it was, and the frame driver keeps the
+sum to turn input positions into indices. The LDM window corrects on its
+own, per 1 MB chunk, with cycle log 0, and reduces its table. Nothing inside
+the window is lost, so the output is the same with or without a correction —
+which is also why the tests have to ask whether one ran (*Anchoring*).
+
 **`FrameWriter`** (`frame_writer.zig`, not a port) is a `std.Io.Writer` over
 that one-shot path. Every byte passes through the caller's buffer; the
 buffer's contents become one frame — exactly `compress` of those bytes — when
@@ -156,22 +173,23 @@ one member, so a failure of our own (out of memory) is kept in
 |---|---|---|
 | level | `min_level` (-131072) … 22; lower is clamped, higher is `error.LevelUnsupported` | `ZSTD_minCLevel()` / `ZSTD_maxCLevel()`; libzstd clamps above 22 too, which would hand a caller a level it did not ask for |
 | memory | level 22 above 64 MB: 512 MiB binary tree + 128 MiB hash + 64 MiB LDM table + 32 KiB bucket offsets (≈ 820 MB peak on a 70 MB input, as libzstd) | the level's own table sizes; nothing is capped, as libzstd caps nothing |
-| input | `max_input_size` = 3500 MiB − 2 | libzstd corrects index overflow past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit); that correction is not ported, so the input stops before it |
+| input | none (the input and `compressBound` of it in memory) | past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit) the indices are rescaled, as libzstd does (see *Algorithm*) |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
 pin the level refusal and the destination bound. `FrameWriter` takes a
-buffer of 1 … `max_input_size` bytes (longer is `error.InputTooLarge` at
-`init`) and holds `compressBound(buffer.len)` of scratch for its life.
+nonempty buffer and holds `compressBound(buffer.len)` of scratch for its life.
 
 ## Anchoring
 
 **External anchor.** `src/testdata/goldens.zig` holds, for each of 56 corpus
 inputs × levels {-5, -1, 1…10} × checksum {off, on}, and for the 53 inputs up
 to 600 KB × levels 11…22 without checksum, plus 14 cases golden at one level
-each and 15 compressed with long-distance matching switched on by hand, also
-at one or two levels each (2011 frames), the length and
+each, 15 compressed with long-distance matching switched on by hand and 13
+with index overflow correction run often (a small window set by hand, and
+libzstd built with `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`), also at one to
+three levels each (2029 frames), the length and
 SHA-256 of the frame libzstd v1.5.7 (`f8745da6`) emits via `ZSTD_compress2`.
 The optimal-parser levels cost 10–40× a lazy one, and the checksum trailer
 does not depend on the level, hence the narrower set there
@@ -278,6 +296,19 @@ the 140 MB comparison below, and 16 survive:
 | hash log floor 6 → 7; `srcSize < minMatchLength` → `<=`; `literalsBytesRemaining >= blockBytesRemaining` → `>`; a candidate cut at the block end `>` → `>=`, or skipping its full length; the candidate's initial end position | equivalent: at a 1 KB window (the only place the floor binds) the table is one bucket that fewer than 64 splits never fill; a chunk of exactly the minimum length has no byte left to hash; at the equality the candidate starts and ends at the block end, where no position lies, and the store is discarded with the block; the first fetch overwrites the initial value |
 | backward extension stopping one byte above the prefix start; the last hashable byte (`ilimit`) one further; a split exactly at the previous match's end searched (`split < anchor` → `<=`); a table entry exactly at the lowest valid index; an overlapping match that ends exactly where hashing stopped (`>` → `>=`); continuing the batch after skipping an overlap; a batch of 32; another XXH64 seed; the checksum from bits 31..62; a candidate of exactly `minMatch` | reachable in principle; four minutes of seed search each (about 2 000 inputs of 3–600 KB at levels 16–22, 300 000 of 40 B–2.5 KB for the two small-window ones) did not hit one. The index equality needs the window past 128 MB. **Uncovered.** |
 
+Index overflow correction (2026-09-23) is invisible in the output by design,
+so the golden test also demands, for every `ocf` case, a nonzero correction
+count from the match state and (for LDM) the LDM window
+(`frame.Options.overflow_corrections`). 13 mutations of the correction and
+the table reductions: 9 were caught by the first 10 `ocf` cases (mostly as
+a crash — a stale index reads outside the input), one only by the
+`reduceTable` unit test (the threshold without the `+ 2`), and 3 by cases a
+seed search found (original against mutant over corpus-generated inputs,
+windows of 1–128 KB): dropping `btlazy2`'s unsorted mark hit in 28 % of
+inputs, and the two LDM table mutations crash within a minute. None
+survives; a mutation of the correction's back-off only changes how often it
+runs, which no output can show.
+
 Beyond the committed goldens, the port was compared against `zref` on 49
 boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
 JSON, text) and 800 random mixed inputs across levels -7…3, all identical;
@@ -309,6 +340,12 @@ forced to `btopt`/`btultra`/`btultra2` at levels 3, 9 and 12 (885 frames),
 read limit and the block size) and 300 random mixed inputs up to 700 KB
 (848 frames with level 22 without LDM): all identical, the first time each
 ran.
+For index overflow correction at its real threshold (2026-09-23): a 4.4 GB
+generated input (words, noise and copies from anywhere earlier, so indices
+pass 3500 MiB and positions pass 4 GiB) at levels 1, 3, 7 (row match
+finder) and 13 (`btlazy2`), identical to plain `zref` — the port 1.0–1.15×
+libzstd's time — and at level 1 in ReleaseSafe, where an index overflow
+would have trapped.
 Those runs are not stored; the oracle is, and re-runs them on any input.
 
 **Anchor grade:** class A · oracle EXTERNAL
@@ -363,11 +400,9 @@ dictionaries are undecided.
   its fuzz corpus. Can start from std's decoder (MIT) — it is a superset,
   which is why it is not a duplicate of std (CONVENTIONS.md §1.3). Legacy
   (pre-v0.8) formats: no. **1–2 sessions.**
-- **Z3 — Index overflow correction.** `ZSTD_window_correctOverflow` and the
-  table reductions (`ZSTD_reduceTable`, the binary-tree variant keeping
-  unsorted marks, the row tag table, the LDM table), so that inputs and
-  streams past 3 500 MiB work; `max_input_size` goes away. **< 1 session.**
-  Prerequisite for long-running Z1 streams.
+- ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
+  *Algorithm*. (The row tag table needs no reduction: it holds tags and
+  in-row heads, not indices.)
 - **Z4 — Compression with a dictionary.** Raw-content and zstd-format
   dictionaries (`ZSTD_loadCEntropy`, `ZSTD_loadDictionaryContent`), a
   reusable `CDict`, libzstd's attach / copy / reload choice
@@ -416,7 +451,7 @@ dictionaries are undecided.
   that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
   caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
 
-Suggested order: (Z1a done) Z3 → Z1 → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z3 done) Z1 → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 

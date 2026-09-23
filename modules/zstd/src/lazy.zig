@@ -32,7 +32,7 @@ const row_max_entries = 64;
 /// Offset placeholder libzstd passes to a search that may find nothing.
 const no_offset = 999999999;
 /// `ZSTD_DUBT_UNSORTED_MARK`: below `window_start`, so never a real index.
-const dubt_unsorted_mark = 1;
+pub const dubt_unsorted_mark = 1;
 
 /// Compress one block with the strategy in `ms.cp` (greedy, lazy, lazy2 or
 /// btlazy2).

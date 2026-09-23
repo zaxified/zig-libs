@@ -8,7 +8,7 @@ which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 | file | kind (§9) | what it answers |
 |---|---|---|
 | `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits. |
-| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. An optional fifth argument forces the strategy (`ZSTD_c_strategy`). |
+| `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. Optional arguments: the strategy (`ZSTD_c_strategy`), LDM by hand, the window log (`ZSTD_c_windowLog`). Built a second time with `-DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1` (`zref-ocf`), it is the reference for frequent index-overflow correction. |
 
 ## The reference they need
 
@@ -65,3 +65,18 @@ keeps the level's own):
 
 By hand, libzstd first resets the window log to 27 and only then shrinks it to
 the input; `params.getOverridden` does the same.
+
+Index overflow correction happens by itself only once an index passes
+`ZSTD_CURRENT_MAX` (3500 MiB). libzstd's fuzzing build corrects whenever it
+safely can instead; `gen-goldens.sh` builds that variant from the sources as
+`$R/zref-ocf`. With a small window set by hand it corrects many times on an
+input of kilobytes:
+
+    "$R/zref-ocf" <level> 0 in.bin ref.zst 0 0 12   # window log 12
+    # module side: frame.compress(..., .{ .level = L, .checksum = false,
+    #     .window_log = 12, .overflow_correct_frequently = true })
+
+A correction only drops indices that have left the window, so the frame is
+the same as without it: the test also reads `frame.Options.
+overflow_corrections` to know the correction ran. The real threshold is
+checked by comparing a > 3500 MiB input with plain `zref`.

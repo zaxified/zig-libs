@@ -170,6 +170,11 @@ pub fn rowLog(cp: CParams) u32 {
 }
 
 /// `ZSTD_adjustCParams_internal` for a known source size and no dictionary.
+/// `ZSTD_cycleLog`: the binary-tree strategies keep two entries per position.
+pub fn cycleLog(cp: CParams) u32 {
+    return cp.chain_log - @intFromBool(@intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btlazy2));
+}
+
 fn adjust(cp_in: CParams, src_size: u64) CParams {
     var cp = cp_in;
     const max_window_resize: u64 = @as(u64, 1) << (window_log_max - 1);
@@ -182,8 +187,7 @@ fn adjust(cp_in: CParams, src_size: u64) CParams {
     }
     // no dictionary: dictAndWindowLog == windowLog
     const dict_and_window_log = cp.window_log;
-    // ZSTD_cycleLog: the binary-tree strategies keep two entries per position
-    const cycle_log = cp.chain_log - @intFromBool(@intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btlazy2));
+    const cycle_log = cycleLog(cp);
     if (cp.hash_log > dict_and_window_log + 1) cp.hash_log = dict_and_window_log + 1;
     if (cycle_log > dict_and_window_log) cp.chain_log -= (cycle_log - dict_and_window_log);
     if (cp.window_log < window_log_absolute_min) cp.window_log = window_log_absolute_min;
@@ -214,10 +218,13 @@ pub fn get(level: i32, src_size: u64) CParams {
 /// set: the level's parameters (already adjusted for its own strategy);
 /// with LDM switched on by hand (`ZSTD_c_enableLongDistanceMatching`) the
 /// window log reset to 27, `ZSTD_LDM_DEFAULT_WINDOW_LOG`; with
-/// `ZSTD_c_strategy` the strategy replaced; and the adjustment run again.
-pub fn getOverridden(level: i32, src_size: u64, strategy: ?Strategy, ldm_by_hand: bool) CParams {
+/// `ZSTD_c_strategy` the strategy replaced, with `ZSTD_c_windowLog` the
+/// window log; and the adjustment run again.
+pub fn getOverridden(level: i32, src_size: u64, strategy: ?Strategy, ldm_by_hand: bool, window_log: ?u32) CParams {
     var cp = get(level, src_size);
     if (ldm_by_hand) cp.window_log = 27;
+    // ZSTD_overrideCParams
+    if (window_log) |wl| cp.window_log = wl;
     if (strategy) |st| cp.strategy = st;
     return adjust(cp, src_size);
 }
@@ -264,12 +271,12 @@ test "only level 22 above 64 MB reaches long-distance matching" {
 test "LDM by hand widens the window before the input shrinks it" {
     // level 19 above 256 KB has windowLog 23; LDM by hand starts from 27
     try std.testing.expectEqual(@as(u32, 23), get(19, 20 << 20).window_log);
-    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, null, true).window_log);
-    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, null, true).window_log);
+    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, null, true, null).window_log);
+    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, null, true, null).window_log);
     // the hash and chain logs were already cut to the level's own window
-    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, null, true).chain_log);
+    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, null, true, null).chain_log);
     // a small input shrinks both to the same window
-    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, null, true));
+    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, null, true, null));
 }
 
 test "btlazy2 halves the chain log to the window (ZSTD_cycleLog)" {

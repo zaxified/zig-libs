@@ -130,8 +130,19 @@ pub const State = struct {
     bucket_offsets: []u8,
     low_limit: u32 = match.window_start,
     dict_limit: u32 = match.window_start,
+    /// `window.nbOverflowCorrections`, and the sum of the corrections: index
+    /// `i` names input byte `i - window_start + base`, and `src` starts at
+    /// input byte `base`.
+    n_overflow_corrections: u32 = 0,
+    base: usize = 0,
+    /// `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY` (see `match.needOverflowCorrection`).
+    overflow_correct_frequently: bool = false,
     split_indices: [batch_size]usize = undefined,
     candidates: [batch_size]Candidate = undefined,
+
+    fn index(ls: *const State, pos: usize) usize {
+        return pos + match.window_start - ls.base;
+    }
 
     inline fn at(ls: *const State, idx: usize) u8 {
         return ls.src[idx - match.window_start];
@@ -188,24 +199,36 @@ pub const State = struct {
         }
     }
 
-    /// `ZSTD_ldm_generateSequences`: the raw sequences of the block at index
-    /// `istart`, `src_size` bytes long, into `out` (whose capacity is
-    /// `maxNbSeq`). The table keeps what it learnt for later blocks.
-    pub fn generateSequences(ls: *State, out: *RawSeqStore, istart: u32, src_size: usize) void {
+    /// `ZSTD_ldm_reduceTable`.
+    fn reduceTable(ls: *State, reducer: u32) void {
+        for (ls.hash_table) |*e| e.offset = if (e.offset < reducer) 0 else e.offset - reducer;
+    }
+
+    /// `ZSTD_ldm_generateSequences`: the raw sequences of the block at input
+    /// position `pos`, `src_size` bytes long, into `out` (whose capacity is
+    /// `maxNbSeq`). The table keeps what it learnt for later blocks. The
+    /// position, not an index: this window's indices drift from the match
+    /// state's once either is corrected for overflow.
+    pub fn generateSequences(ls: *State, out: *RawSeqStore, pos: usize, src_size: usize) void {
         const k_max_chunk_size: usize = 1 << 20;
-        const iend: usize = @as(usize, istart) + src_size;
+        const max_dist: u32 = @as(u32, 1) << @intCast(ls.p.window_log);
         const nb_chunks = src_size / k_max_chunk_size + @intFromBool(src_size % k_max_chunk_size != 0);
         var leftover_size: usize = 0;
         std.debug.assert(out.pos <= out.size and out.size <= out.seq.len);
         var chunk: usize = 0;
         while (chunk < nb_chunks and out.size < out.seq.len) : (chunk += 1) {
-            const chunk_start = @as(usize, istart) + chunk * k_max_chunk_size;
-            const remaining = iend - chunk_start;
-            const chunk_end = if (remaining < k_max_chunk_size) iend else chunk_start + k_max_chunk_size;
-            const chunk_size = chunk_end - chunk_start;
+            const chunk_pos = pos + chunk * k_max_chunk_size;
+            const chunk_size = @min(src_size - chunk * k_max_chunk_size, k_max_chunk_size);
             const prev_size = out.size;
-            // 1. Overflow correction never triggers: inputs stop short of
-            //    `ZSTD_CURRENT_MAX` (see frame.max_input_size).
+            // 1. Perform overflow correction if necessary.
+            if (match.needOverflowCorrection(ls.overflow_correct_frequently, ls.n_overflow_corrections, 0, max_dist, ls.index(chunk_pos), ls.index(chunk_pos) + chunk_size)) {
+                const correction = match.correctOverflow(&ls.low_limit, &ls.dict_limit, &ls.n_overflow_corrections, ls.overflow_correct_frequently, 0, max_dist, @intCast(ls.index(chunk_pos)));
+                ls.src = ls.src[correction..];
+                ls.base += correction;
+                ls.reduceTable(correction);
+            }
+            const chunk_start = ls.index(chunk_pos);
+            const chunk_end = chunk_start + chunk_size;
             // 2. We enforce the maximum offset allowed.
             ls.enforceMaxDist(@intCast(chunk_end));
             // 3. Generate the sequences for the chunk, and get newLeftoverSize.
