@@ -71,6 +71,15 @@ problem details (`writeErrorsProblem`, `application/problem+json`) is deferred u
 `router`-middleware consumer asks — the one consumer that wanted problem+json (qap,
 2026-09-22) calls the core directly, not the middleware.
 
+`parseIntoLeaky` scans the body twice: `streamValidate` walks it with a `std.json.Scanner`,
+then `std.json.parseFromSliceLeaky` tokenizes it again to build `T`. Measured by qap
+(2026-09-23, a 50-byte two-field body, `perf stat instructions:u`, stable to ±2 instr): the
+typed layer costs **+7.6 k user instructions per request** over a hand-written
+`parseFromSlice`, of which ~2.8 k are the second `Scanner.next` pass and ~0.85 k
+`Stream.walkValue`. Wanted: one pass that checks the rules and fills `T` from the same
+tokens (a validating `parseFromTokenSource`), same error codes and document order, still
+body-sized memory. Differential test: one-pass vs today's two-pass on the existing corpus.
+
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http`, `netaddr` — canonical source is
 `pub const meta` in src/root.zig.
