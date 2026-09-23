@@ -1,0 +1,201 @@
+// SPDX-License-Identifier: MIT
+//! Streaming byte-exactness against libzstd 1.5.7.
+//!
+//! Every `corpus.stream_cases` entry is compressed through `Stream` by the
+//! same call schedule `tools/zstream.c` gave `ZSTD_compressStream2`; the
+//! concatenated output must have the length and SHA-256 recorded in
+//! `testdata/stream_goldens.zig`. The schedule decides the bytes (where
+//! chunks end, when the input buffer wraps, whether the end is compressed
+//! straight from the caller's buffer), so both sides parse the same string.
+//! A schedule starting with the token `x` is compared against libzstd built
+//! to correct index overflow frequently (`tools/gen-goldens.sh` picks it).
+
+const std = @import("std");
+const stream = @import("stream.zig");
+const zstd = @import("root.zig");
+const corpus = @import("testdata/corpus.zig");
+const goldens = @import("testdata/stream_goldens.zig");
+
+const Run = struct {
+    out: []u8,
+    /// Blocks compressed with the window in two segments.
+    ext_dict_blocks: u32,
+    overflow_corrections: u32,
+};
+
+/// Drive a stream over `src` as `tools/zstream.c` does for `schedule`.
+fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, schedule: []const u8) !Run {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var pledged: ?u64 = null;
+    var window_log: ?u32 = null;
+    var ocap: usize = 1 << 24;
+    var fed: usize = 0;
+    var s: ?stream.Stream = null;
+    defer if (s) |*st| st.deinit();
+    var ocf = false;
+    var ext_dict_blocks: u32 = 0;
+    var overflow_corrections: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, schedule, ',');
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "x")) {
+            ocf = true;
+            continue;
+        }
+        const num: usize = if (tok[1] == '*') src.len - fed else try std.fmt.parseInt(usize, tok[1..], 10);
+        const dir: stream.EndDirective = switch (tok[0]) {
+            'p' => {
+                pledged = num;
+                continue;
+            },
+            'w' => {
+                window_log = @intCast(num);
+                continue;
+            },
+            'o' => {
+                ocap = num;
+                continue;
+            },
+            'c' => .@"continue",
+            'f' => .flush,
+            'e' => .end,
+            else => return error.BadSchedule,
+        };
+        if (s == null) {
+            s = try stream.Stream.init(gpa, .{ .level = level, .checksum = checksum, .pledged_size = pledged });
+            s.?.window_log = window_log;
+            s.?.overflow_correct_frequently = ocf;
+        }
+        const obuf = try gpa.alloc(u8, ocap);
+        defer gpa.free(obuf);
+        var in: stream.InBuffer = .{ .src = src[fed..][0..num] };
+        while (true) {
+            var o: stream.OutBuffer = .{ .dst = obuf };
+            const remaining = try s.?.compressStream2(&o, &in, dir);
+            try out.appendSlice(gpa, obuf[0..o.pos]);
+            if (if (dir == .@"continue") in.pos == in.src.len else remaining == 0) break;
+        }
+        fed += num;
+        if (dir == .end) {
+            ext_dict_blocks = s.?.comp.c.ms.n_ext_dict_blocks;
+            overflow_corrections = s.?.comp.c.ms.n_overflow_corrections;
+            break;
+        }
+    }
+    return .{ .out = try out.toOwnedSlice(gpa), .ext_dict_blocks = ext_dict_blocks, .overflow_corrections = overflow_corrections };
+}
+
+fn findCase(name: []const u8) corpus.Case {
+    for (corpus.cases) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    unreachable;
+}
+
+fn find(sc: corpus.StreamCase, level: i32, checksum: bool) ?goldens.Golden {
+    for (goldens.rows) |g| {
+        if (g.level == level and g.checksum == checksum and std.mem.eql(u8, g.case, sc.case) and std.mem.eql(u8, g.schedule, sc.schedule)) return g;
+    }
+    return null;
+}
+
+test "every streaming case has a golden row, and nothing else does" {
+    var n: usize = 0;
+    for (corpus.stream_cases) |sc| for (corpus.stream_levels) |level| for ([_]bool{ false, true }) |ck| {
+        n += 1;
+        if (find(sc, level, ck) == null) {
+            std.debug.print("no golden row for {s} {s} level {d} checksum {}\n", .{ sc.case, sc.schedule, level, ck });
+            return error.MissingGolden;
+        }
+    };
+    try std.testing.expectEqual(n, goldens.rows.len);
+}
+
+test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2" {
+    const gpa = std.testing.allocator;
+    var mismatches: usize = 0;
+    for (corpus.stream_cases) |sc| {
+        const case = findCase(sc.case);
+        const src = try gpa.alloc(u8, case.len);
+        defer gpa.free(src);
+        corpus.generate(case, src);
+        for (corpus.stream_levels) |level| for ([_]bool{ false, true }) |ck| {
+            const g = find(sc, level, ck).?;
+            const r = try run(gpa, src, level, ck, sc.schedule);
+            defer gpa.free(r.out);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(r.out, &digest, .{});
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            if (r.out.len != g.len or !std.mem.eql(u8, &hex, g.sha256)) {
+                std.debug.print("MISMATCH {s} {s} level {d} checksum {}: len {d} (libzstd {d})\n", .{ sc.case, sc.schedule, level, ck, r.out.len, g.len });
+                mismatches += 1;
+            }
+            // The extDict path leaves no mark in the output; that it ran
+            // is checked here.
+            if (std.mem.indexOfScalar(i32, sc.ext_dict, level) != null and r.ext_dict_blocks == 0) {
+                std.debug.print("NO EXTDICT BLOCK {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
+                mismatches += 1;
+            }
+            // Likewise a correction for index overflow (token x).
+            if (std.mem.startsWith(u8, sc.schedule, "x,") and r.overflow_corrections == 0) {
+                std.debug.print("NO CORRECTION {s} {s} level {d}\n", .{ sc.case, sc.schedule, level });
+                mismatches += 1;
+            }
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+}
+
+test "a stream ended in its first call is the one-shot frame" {
+    const gpa = std.testing.allocator;
+    const case = findCase("csv-131073");
+    const src = try gpa.alloc(u8, case.len);
+    defer gpa.free(src);
+    corpus.generate(case, src);
+    for ([_]i32{ -1, 1, 3 }) |level| {
+        const one = try zstd.compressAlloc(gpa, src, .{ .level = level, .checksum = true });
+        defer gpa.free(one);
+        const r = try run(gpa, src, level, true, "e*");
+        defer gpa.free(r.out);
+        try std.testing.expectEqualSlices(u8, one, r.out);
+    }
+}
+
+test "a pledged size is enforced both ways" {
+    const gpa = std.testing.allocator;
+    const src = "0123456789" ** 10;
+    // more than pledged
+    try std.testing.expectError(error.SrcSizeWrong, run(gpa, src, 1, false, "p50,c*,e0"));
+    // less than pledged, at the end
+    try std.testing.expectError(error.SrcSizeWrong, run(gpa, src, 1, false, "p150,c*,e0"));
+    const r = try run(gpa, src, 1, false, "p100,c*,e0");
+    gpa.free(r.out);
+}
+
+test "levels above the streaming maximum are refused; a call after the end too" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.LevelUnsupported, stream.Stream.init(gpa, .{ .level = stream.max_level + 1 }));
+    var s = try stream.Stream.init(gpa, .{});
+    defer s.deinit();
+    var buf: [64]u8 = undefined;
+    var o: stream.OutBuffer = .{ .dst = &buf };
+    var in: stream.InBuffer = .{ .src = "abc" };
+    try std.testing.expectEqual(@as(usize, 0), try s.compressStream2(&o, &in, .end));
+    try std.testing.expectError(error.FrameEnded, s.compressStream2(&o, &in, .end));
+}
+
+test "streams round-trip through std's decoder" {
+    const gpa = std.testing.allocator;
+    const case = findCase("far-repeat");
+    const src = try gpa.alloc(u8, case.len);
+    defer gpa.free(src);
+    corpus.generate(case, src);
+    for ([_][]const u8{ "c*,e0", "w10,o77,c1000,f0,c*,e0", "w12,c300000,f0,c*,e0" }) |sched| {
+        const r = try run(gpa, src, 1, false, sched);
+        defer gpa.free(r.out);
+        var out: std.Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var in: std.Io.Reader = .fixed(r.out);
+        var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .verify_checksum = false });
+        _ = try d.reader.streamRemaining(&out.writer);
+        try std.testing.expectEqualSlices(u8, src, out.written());
+    }
+}

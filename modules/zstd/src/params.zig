@@ -175,6 +175,10 @@ pub fn cycleLog(cp: CParams) u32 {
     return cp.chain_log - @intFromBool(@intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btlazy2));
 }
 
+/// `ZSTD_CONTENTSIZE_UNKNOWN`: a stream whose length is not pledged. It
+/// selects the table for inputs over 256 KB and shrinks nothing.
+pub const unknown_size: u64 = std.math.maxInt(u64);
+
 fn adjust(cp_in: CParams, src_size: u64) CParams {
     var cp = cp_in;
     const max_window_resize: u64 = @as(u64, 1) << (window_log_max - 1);
@@ -185,11 +189,13 @@ fn adjust(cp_in: CParams, src_size: u64) CParams {
         const src_log: u32 = if (t_size < hash_size_min) hash_log_min else highbit32(t_size - 1) + 1;
         if (cp.window_log > src_log) cp.window_log = src_log;
     }
-    // no dictionary: dictAndWindowLog == windowLog
-    const dict_and_window_log = cp.window_log;
-    const cycle_log = cycleLog(cp);
-    if (cp.hash_log > dict_and_window_log + 1) cp.hash_log = dict_and_window_log + 1;
-    if (cycle_log > dict_and_window_log) cp.chain_log -= (cycle_log - dict_and_window_log);
+    if (src_size != unknown_size) {
+        // no dictionary: dictAndWindowLog == windowLog
+        const dict_and_window_log = cp.window_log;
+        const cycle_log = cycleLog(cp);
+        if (cp.hash_log > dict_and_window_log + 1) cp.hash_log = dict_and_window_log + 1;
+        if (cycle_log > dict_and_window_log) cp.chain_log -= (cycle_log - dict_and_window_log);
+    }
     if (cp.window_log < window_log_absolute_min) cp.window_log = window_log_absolute_min;
     // The row match finder hashes hashLog - rowLog + 8 bits into 32. libzstd
     // assumes it is in use here, before the window size decides.

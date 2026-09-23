@@ -365,7 +365,7 @@ way to recognise it.
 | [`p256`](modules/p256/README.md) *(crypto)* | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
-| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
+| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` (and `ZSTD_compressStream2` at levels up to 3); decode with `std.compress.zstd` | any | — |
 
 ### Networking
 
@@ -484,7 +484,7 @@ way to recognise it.
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | [`hashdigest`](modules/hashdigest/README.md) *(crypto)* | Streaming digests — one-shot, incremental, and file hashing; SHA-256 convenience plus a multi-algorithm SHA-2/SHA-3/BLAKE2b/BLAKE3 layer. | any | — |
-| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
+| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` (and `ZSTD_compressStream2` at levels up to 3); decode with `std.compress.zstd` | any | — |
 
 ### Crypto
 
@@ -596,7 +596,7 @@ way to recognise it.
 | [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
 | [`yaml`](modules/yaml/README.md) | YAML 1.2 reader (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans); cyclic aliases rejected. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
-| [`zstd`](modules/zstd/README.md) | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd` | any | — |
+| [`zstd`](modules/zstd/README.md) | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` (and `ZSTD_compressStream2` at levels up to 3); decode with `std.compress.zstd` | any | — |
 
 **Also worth reaching for from `format`** — these are filed under another library (in brackets), and appear here because a consumer working in `format` has a use for them:
 

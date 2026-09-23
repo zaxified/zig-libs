@@ -621,7 +621,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
         }
 
         // store sequence
-        ss.store(ms.src[anchor - match.window_start .. start - match.window_start], off_base, match_length);
+        ss.store(ms.bytes(anchor, start), off_base, match_length);
         ip = start + match_length;
         anchor = ip;
         if (ms.lazy_skipping) {

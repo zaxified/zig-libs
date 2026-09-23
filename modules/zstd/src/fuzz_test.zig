@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
-//! Fuzz: compress arbitrary bytes, decode them with std, demand the input back.
+//! Fuzz: compress arbitrary bytes (one-shot, and streamed), decode them with
+//! std, demand the input back.
 //!
 //! The compressor's input is caller data, so every byte pattern must yield a
 //! valid frame without a panic. The oracle is std's independent decoder: a
@@ -33,6 +34,51 @@ fn roundTrip(input: []const u8) !void {
     var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .verify_checksum = false });
     _ = try d.reader.streamRemaining(&out.writer);
     try std.testing.expectEqualSlices(u8, input, out.written());
+}
+
+/// The same through a `Stream` with a 1 KB window, so the input buffer
+/// (window + block) wraps within the harness's 64 KB and the extDict match
+/// finders run. The schedule is fixed by the length, like the level: chunks
+/// of 1, 7, 1000 and 3000 bytes, every third followed by a flush, into a
+/// 64-byte output buffer.
+fn streamRoundTrip(input: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const stream_levels = [_]i32{ -3, 1, 2, 3 };
+    var s = try zstd.Stream.init(gpa, .{ .level = stream_levels[input.len % stream_levels.len], .checksum = input.len & 8 != 0 });
+    defer s.deinit();
+    s.window_log = 10;
+    var z: std.ArrayList(u8) = .empty;
+    defer z.deinit(gpa);
+    var obuf: [64]u8 = undefined;
+    const chunks = [_]usize{ 1, 7, 1000, 3000 };
+    var fed: usize = 0;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const n = @min(chunks[i % chunks.len], input.len - fed);
+        const dir: zstd.EndDirective = if (fed + n == input.len) .end else if (i % 3 == 2) .flush else .@"continue";
+        var in: zstd.InBuffer = .{ .src = input[fed..][0..n] };
+        while (true) {
+            var o: zstd.OutBuffer = .{ .dst = &obuf };
+            const left = try s.compressStream2(&o, &in, dir);
+            try z.appendSlice(gpa, obuf[0..o.pos]);
+            if (if (dir == .@"continue") in.pos == in.src.len else left == 0) break;
+        }
+        fed += n;
+        if (dir == .end) break;
+    }
+
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var in: std.Io.Reader = .fixed(z.items);
+    var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{ .verify_checksum = false });
+    _ = try d.reader.streamRemaining(&out.writer);
+    try std.testing.expectEqualSlices(u8, input, out.written());
+}
+
+fn fuzzStream(_: void, smith: *std.testing.Smith) !void {
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    try streamRoundTrip(buf[0..len]);
 }
 
 fn fuzzCompress(_: void, smith: *std.testing.Smith) !void {
@@ -71,6 +117,10 @@ test "fuzz: every input round-trips through std's decoder" {
     try std.testing.fuzz({}, fuzzCompress, .{ .corpus = &fuzz_seed_corpus });
 }
 
+test "fuzz: every input streamed round-trips through std's decoder" {
+    try std.testing.fuzz({}, fuzzStream, .{ .corpus = &fuzz_seed_corpus });
+}
+
 test "fuzz corpus reaches the compressor intact" {
     // Draws exactly as the harness does: a seed must come back as its own
     // bytes, or the ordinary lane is not running what the corpus says.
@@ -82,6 +132,7 @@ test "fuzz corpus reaches the compressor intact" {
         if (len != 0) nonempty += 1;
         try std.testing.expectEqual(sd.len - 4, len);
         try roundTrip(buf[0..len]);
+        try streamRoundTrip(buf[0..len]);
     }
     try std.testing.expectEqual(fuzz_seed_corpus.len - 1, nonempty);
 }

@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — Streaming (SPEC backlog Z1, first part): `zstd.Stream`,
+  a port of `ZSTD_compressStream2` / `ZSTD_compressStream_generic` with
+  buffered input and output — `continue`/`flush`/`end`, pledged or unknown
+  size (no content size in the header then), the input buffer of one window
+  plus one block and its wrap, the end compressed straight from the
+  caller's buffer — byte-identical to libzstd for the same calls, at levels
+  ≤ 3 (`stream_max_level`). The wrap makes the window two segments:
+  `ZSTD_window_update`, `ZSTD_count_2segments` and the extDict variants of
+  `fast` and `dfast` are ported; overflow correction moves both segments.
+  The one-shot path now runs through the same context (`frame.Compressor`,
+  one chunk), its goldens unchanged. Anchored by 310 streaming goldens (new
+  `tools/zstream.c`, driven by a call schedule both sides parse; the recipe
+  also builds it with frequent overflow correction), checks that the extDict
+  search and the correction ran, a 59-mutation sweep (16 survivors, reasons
+  in SPEC.md), a streaming fuzz harness, and 1 150 schedules compared with
+  libzstd (files up to 6 MB and random schedules). One-shot compression costs +4.5 %
+  instructions (the prefix's first index is now a variable).
+
 - **2026-09-23** — Index overflow correction (SPEC backlog Z3):
   `ZSTD_window_correctOverflow` with the table reductions of the match state
   (hash, chain / binary tree keeping `btlazy2`'s unsorted mark, 3-byte hash)

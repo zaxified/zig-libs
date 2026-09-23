@@ -1,13 +1,14 @@
 # `zstd` verification instruments
 
-Two instruments that check this module against **libzstd itself**. They live
+Three instruments that check this module against **libzstd itself**. They live
 here and not in `src/` because they need a C compiler and a libzstd checkout,
 which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 `zig build`; run them by hand.
 
 | file | kind (§9) | what it answers |
 |---|---|---|
-| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits. |
+| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits; and `src/testdata/stream_goldens.zig`, the same for every `corpus.stream_cases` schedule through `zstream`. |
+| `zstream.c` | **differential oracle** (streaming) | Compresses any file with `ZSTD_compressStream2` following a call schedule (`p` pledge, `w` window log, `o` output buffer size, `c`/`f`/`e` continue/flush/end with the next N bytes, `x` frequent overflow correction); `stream_test.zig` parses the same schedules. The recipe uses it for `src/testdata/stream_goldens.zig` and builds it a second time as `zstream-ocf`. |
 | `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. Optional arguments: the strategy (`ZSTD_c_strategy`), LDM by hand, the window log (`ZSTD_c_windowLog`). Built a second time with `-DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1` (`zref-ocf`), it is the reference for frequent index-overflow correction. |
 
 ## The reference they need
@@ -80,3 +81,18 @@ A correction only drops indices that have left the window, so the frame is
 the same as without it: the test also reads `frame.Options.
 overflow_corrections` to know the correction ran. The real threshold is
 checked by comparing a > 3500 MiB input with plain `zref`.
+
+## Comparing a stream
+
+    cc -O2 -I "$R/lib" -o "$R/zstream" modules/zstd/tools/zstream.c "$R/lib/libzstd.a"
+    "$R/zstream" 3 0 in.bin ref.zst "w12,o100,c50000,f0,c*,e0"
+    # module side: the same schedule through zstd.Stream (`run` in
+    # src/stream_test.zig does exactly this), then: cmp ref.zst ours.zst
+
+The bytes depend on the schedule, not only the input: where chunks end
+(every block's worth of buffered input, every flush and the end), when the
+input buffer (one window plus one block) wraps — the window log `w` makes
+that happen within kilobytes — and whether the end finds the buffer empty
+and room for `compressBound` of the rest in the output, in which case it is
+compressed straight from the caller's input. The output buffer size `o`
+matters only for that last condition.

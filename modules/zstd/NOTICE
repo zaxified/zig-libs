@@ -16,8 +16,10 @@ WHAT WAS TAKEN
 
 Translated (source, restructured into Zig but decision-for-decision the same):
 
-  lib/compress/zstd_fast.c            no-dictionary `fast` match finder     -> src/match.zig
-  lib/compress/zstd_double_fast.c     no-dictionary `dfast` match finder    -> src/match.zig
+  lib/compress/zstd_fast.c            no-dictionary and extDict `fast`
+                                      match finders                         -> src/match.zig
+  lib/compress/zstd_double_fast.c     no-dictionary and extDict `dfast`
+                                      match finders                         -> src/match.zig
   lib/compress/zstd_lazy.c            no-dictionary hash-chain, row and
                                       binary-tree (DUBT) match finders,
                                       greedy/lazy/lazy2/btlazy2 parser      -> src/lazy.zig
@@ -30,9 +32,11 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       table, sequence generation            -> src/ldm.zig
   lib/compress/zstd_compress_internal.h  window helpers, hashes, ZSTD_count,
                                       seqStore, repcode handling            -> src/match.zig, src/sequences.zig
-  lib/compress/zstd_compress.c        one-shot frame/block driver, frame
-                                      header, parameter adjustment, entropy
-                                      glue for a block                      -> src/frame.zig, src/params.zig
+  lib/compress/zstd_compress.c        frame/block driver (compressContinue,
+                                      compressEnd), frame header, parameter
+                                      adjustment, entropy glue for a block  -> src/frame.zig, src/params.zig
+                                      streaming (compressStream2 over
+                                      buffered input and output)            -> src/stream.zig
                                       post-block splitter and its block
                                       size estimates                        -> src/blocksplit.zig
   lib/compress/clevels.h              level tables                          -> src/params.zig
@@ -52,10 +56,13 @@ Each of those files says so in its first line
 and `src/testdata/` are this collection's own work (MIT).
 
 Not taken: libzstd's decoder (std has one), dictionaries, long-distance
-matching, multithreading, streaming, `targetCBlockSize` super-blocks.
+matching below `btopt`, multithreading, the extDict variants of the match
+finders above `dfast`, `targetCBlockSize` super-blocks.
 
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
-`src/testdata/goldens.zig` (lengths and SHA-256 digests of its output). No
+`src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and
+SHA-256 digests of its output). `tools/zref.c` and `tools/zstream.c` are this
+collection's own programs (MIT) calling libzstd's public API. No
 libzstd bytes are stored in this repository.
 
 LICENSE TEXT (libzstd `LICENSE`, verbatim)

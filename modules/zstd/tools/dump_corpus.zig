@@ -4,11 +4,14 @@
 //! "name level checksum ldm window_log ocf" line each (`corpus.covered`; the
 //! flags 0|1, ldm for long-distance matching switched on by hand, window_log
 //! 0 for the level's own, ocf for the frequent-overflow-correction
-//! reference). Part of the golden recipe
+//! reference), and the streaming set to a second manifest, one
+//! "case level checksum schedule" line each (`corpus.stream_cases`). Part of
+//! the golden recipe
 //! (see README.md); not built by `zig build`.
 //!
 //!   zig run --dep corpus -Mroot=modules/zstd/tools/dump_corpus.zig \
-//!       -Mcorpus=modules/zstd/src/testdata/corpus.zig -- <out-dir> <manifest>
+//!       -Mcorpus=modules/zstd/src/testdata/corpus.zig -- <out-dir> <manifest> \
+//!       <stream-manifest>
 
 const std = @import("std");
 const corpus = @import("corpus");
@@ -21,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     const out_path = args.next() orelse return error.MissingOutDir;
     const manifest_path = args.next() orelse return error.MissingManifest;
+    const stream_manifest_path = args.next() orelse return error.MissingManifest;
 
     var dir = try std.Io.Dir.cwd().openDir(io, out_path, .{});
     defer dir.close(io);
@@ -38,4 +42,11 @@ pub fn main(init: std.process.Init) !void {
         try manifest.print(gpa, "{s} {d} {d} {d} {d} {d}\n", .{ case.name, level, @intFromBool(ck), @intFromBool(case.ldm), case.window_log orelse 0, @intFromBool(case.ocf) });
     };
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.items });
+
+    var stream_manifest: std.ArrayList(u8) = .empty;
+    defer stream_manifest.deinit(gpa);
+    for (corpus.stream_cases) |sc| for (corpus.stream_levels) |level| for ([_]bool{ false, true }) |ck| {
+        try stream_manifest.print(gpa, "{s} {d} {d} {s}\n", .{ sc.case, level, @intFromBool(ck), sc.schedule });
+    };
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stream_manifest_path, .data = stream_manifest.items });
 }

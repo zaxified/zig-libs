@@ -4,8 +4,10 @@ Consumer view, API and purpose: [README.md](README.md).
 
 ## What this module is, and what it is not
 
-A one-shot Zstandard **compressor** that reproduces libzstd 1.5.7's output
-byte for byte for every level, 1–22 and negative. Every strategy is
+A Zstandard **compressor** that reproduces libzstd 1.5.7's output byte for
+byte: one-shot for every level, 1–22 and negative, and streaming
+(`ZSTD_compressStream2`, for the same sequence of calls) for levels 1–3 and
+negative so far. Every strategy is
 translated from libzstd — `fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both
 the hash chain and the row-based search, `btlazy2`'s binary tree, and the
 optimal parsers `btopt`/`btultra`/`btultra2` — together with the frame/block
@@ -16,8 +18,9 @@ file-by-file map.
 
 **Goal (2026-09-22): production quality — as close to libzstd's feature set
 and behaviour as possible, so that a Zig program never needs to link libzstd.**
-Today it is the one-shot compressor only; everything else libzstd offers is
-in *Backlog / deferred* below, with its cost.
+Today it is the one-shot compressor and streaming at the `fast`/`dfast`
+levels; everything else libzstd offers is in *Backlog / deferred* below,
+with its cost.
 
 Not here yet, and a reader might expect it (each is a backlog item):
 
@@ -26,11 +29,13 @@ Not here yet, and a reader might expect it (each is a backlog item):
   frames, leaves checksum verification as a TODO panic, and defaults to an
   8 MB window (frames of levels 20–22 on large inputs need
   `window_len` raised). Z2.
-- **Streaming, as libzstd streams.** libzstd's streaming API blocks the
-  input on its own buffer boundaries and so produces *different* (equally
-  valid) frames; matching those is its own contract. Z1. What exists is
-  `FrameWriter` (Z1a, see *Algorithm*): a `std.Io.Writer` that emits one
-  independent one-shot frame per buffer fill and per flush.
+- **Streaming above level 3.** `Stream` (see *Algorithm*) refuses levels
+  above 3 with `error.LevelUnsupported`: once libzstd's input buffer wraps,
+  the window is two segments and every match finder runs its extDict
+  variant, which exists so far for `fast` and `dfast` only (Z1b, Z1c).
+  Nor does it do libzstd's stable-buffer modes or start a second frame on
+  the same context (Z1, Z13). `FrameWriter` (Z1a) — a `std.Io.Writer` of
+  independent one-shot frames — takes every level.
 - **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8),
   and long-distance matching as an option (Z7).** libzstd's `ZSTD_c_enableLongDistanceMatching`
   (the CLI's `--long`) is not in `Options`: LDM happens exactly where libzstd
@@ -153,6 +158,45 @@ own, per 1 MB chunk, with cycle log 0, and reduces its table. Nothing inside
 the window is lost, so the output is the same with or without a correction —
 which is also why the tests have to ask whether one ran (*Anchoring*).
 
+**Streaming** (`stream.zig`, `ZSTD_compressStream2` /
+`ZSTD_compressStream_generic` with libzstd's default buffered input and
+output). A `Stream` sets its parameters at the first call: from the pledged
+size, or — when that first call already ends the frame — from that call's
+input, as libzstd does; with neither, from the table for inputs over 256 KB,
+without shrinking anything, and the header then carries no content size.
+Input is copied into a buffer of one window plus one block (the window
+shrunk to a pledged size). Each time a block's worth (`blockSizeMax`) is
+buffered — at the first block, one byte more when the pledged size is
+exactly one block, so the frame does not need an empty last block — and at
+each `flush` and `end`, the buffered chunk is compressed
+(`ZSTD_compressContinue`, `ZSTD_compressEnd`: `frame.Compressor`, which the
+one-shot path runs over the whole input as one chunk). So the pre-splitter
+sees one chunk at a time, and its savings count the frame header. When the
+next block would not fit before the buffer's end, buffering restarts at its
+start. An `end` that finds the buffer empty and the caller's output large
+enough (`compressBound` of the rest) compresses the rest straight from the
+caller's input. The output goes straight into the caller's buffer when it
+has room for `compressBound` of the chunk, else through a buffer of one
+compressed block that later calls drain; the bytes are the same either way.
+
+A chunk that does not follow the previous one in memory (the buffer
+wrapped, or the end came from the caller's input) makes the window two
+segments (`ZSTD_window_update`): the old prefix becomes the *extDict*, the
+chunk starts a new prefix at the next index, and new input copied over the
+extDict's memory raises its low limit. From then on `fast` and `dfast` run
+their extDict variants (`ZSTD_compressBlock_fast_extDict_generic`,
+`..._doubleFast_extDict_generic`): a candidate's bytes come from whichever
+segment holds its index, a match may run from the extDict's end on into
+the prefix (`ZSTD_count_2segments`), repcodes straddling the boundary are
+refused, and once the window has left the extDict behind they fall back to
+the plain variants. An overflow correction moves both segments. libzstd's
+`dfast` extDict search reads 8 bytes at a table index that can lie 7 bytes
+before the extDict's end, so one byte past it: the port reads the same
+buffer byte (the extDict stays readable up to the buffer's end, which starts
+zeroed like a fresh allocation). The byte only matters on an 8-byte hash
+hit whose first 7 bytes match; libzstd's own buffer there holds whatever the
+allocator gave it.
+
 **`FrameWriter`** (`frame_writer.zig`, not a port) is a `std.Io.Writer` over
 that one-shot path. Every byte passes through the caller's buffer; the
 buffer's contents become one frame — exactly `compress` of those bytes — when
@@ -176,9 +220,14 @@ one member, so a failure of our own (out of memory) is kept in
 | input | none (the input and `compressBound` of it in memory) | past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit) the indices are rescaled, as libzstd does (see *Algorithm*) |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
+| stream level | ≤ 3 (`stream_max_level`), else `error.LevelUnsupported` | the extDict variants exist for `fast`/`dfast` only; levels 1–3 use those at every input size, so the limit does not depend on the data |
+| stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
+| stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
-pin the level refusal and the destination bound. `FrameWriter` takes a
+pin the level refusal and the destination bound, `stream_test.zig` the
+stream's level refusal, the pledged size both ways and the call after the
+end. `FrameWriter` takes a
 nonempty buffer and holds `compressBound(buffer.len)` of scratch for its life.
 
 ## Anchoring
@@ -309,6 +358,39 @@ inputs, and the two LDM table mutations crash within a minute. None
 survives; a mutation of the correction's back-off only changes how often it
 runs, which no output can show.
 
+**Streaming** (2026-09-23) has its own goldens: `src/testdata/
+stream_goldens.zig` holds, for each of 31 `corpus.stream_cases` (a corpus
+input and a call schedule) × levels {-5, -1, 1, 2, 3} × checksum, the length
+and SHA-256 of everything `ZSTD_compressStream2` emits (310 streams),
+written by the same recipe through `tools/zstream.c`; schedules starting
+with `x` run against libzstd built with frequent overflow correction. The
+extDict search leaves no mark in the output, so the test also demands, where
+a case says so, that the extDict variant of a match finder actually searched
+some block (`MatchState.n_ext_dict_blocks`, counted after the fall-back to
+the plain variant — a first version counted windows that merely had an
+extDict and was blind: with a window of 128 KB or less a full block reaches
+back exactly one window, the extDict is out of reach and the plain variant
+runs), and for `x` cases a nonzero correction count.
+
+59 mutations of the new code (`windowUpdate`, `count2Segments`, the `fast`
+and `dfast` extDict variants, overflow correction of two segments,
+`stream.zig`, `frame.Compressor`, the unknown-size parameters): 26 were
+caught by the first 17 cases, 3 more once rewritten to compile, and 14 by
+cases a seed search found — the mutant against `zstream` over corpus inputs
+× random schedules (window logs 10–20, chunks of 0 bytes to the whole
+input, flushes, small outputs, `x`) — or built for the purpose (a pledged
+size of exactly one block; an output of exactly `compressBound`, on an input
+whose buffered pre-split differs from one-shot). 16 survive:
+
+| mutation | why no case exists |
+|---|---|
+| `ZSTD_window_update`: the overlap rule (off, `>` → `>=`, `<` → `<=`), `lowLimit` not moved up to the old `dictLimit` | equivalent in the buffered mode: the input buffer is one window plus one block, so input written over the extDict's memory only ever overwrites bytes more than a window back, which `maxDist` already excludes; at the overlap's equalities the new limit equals the old one |
+| "too small extDict" (< 8 bytes) → < 7 | unreachable: a segment is a whole pass through the buffer (at least one window, 1 KB) |
+| extDict readable to the buffer's end dropped | not reached by any case (it would be a bounds panic, not a different frame); see *Algorithm* |
+| `ZSTD_getLowestMatchIndex` `>` → `>=`; overflow correction of a segment at exactly the threshold (`>=` → `>`) | equivalent: both branches give the same value at the equality |
+| `fast` extDict: `offset >= maxRep` → `>` (both repcodes), the saved-offset rotation dropped; `dfast` extDict: repcode `offset <= curr + 1 - dictStart` → `<` (both), short and 3-byte-hash candidates at exactly the extDict's low end | reachable in principle, each at an equality; 1 200 random schedules per mutation over the corpus did not hit one. **Uncovered.** |
+| more input than pledged caught when a chunk passes the size | equivalent in outcome: the end catches the same stream with the same error, only later |
+
 Beyond the committed goldens, the port was compared against `zref` on 49
 boundary-size and edge-case files, 11 system files (ELF binaries, gzip, PNG,
 JSON, text) and 800 random mixed inputs across levels -7…3, all identical;
@@ -352,7 +434,11 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
 
 ## What is deliberately not done
 
-- **A faster port.** This is 1.3–1.5× slower than libzstd (process time,
+- **A faster port.** Z1 made the match state's prefix start at a variable
+  index (a segment can begin anywhere): +4.5 % instructions on one-shot
+  compression at levels 1–16 of a 6 MB text (`perf stat`, ReleaseFast),
+  output unchanged. Z11 is where it comes back.
+  This is 1.3–1.5× slower than libzstd (process time,
   ReleaseFast, level 1 and 3 on a 13.7 MB CSV, a 3 MB text and an 11 MB ELF);
   1.2–1.4× at levels 5–8 (12 MB of Zig source, a 4.5 MB ELF); 0.9–1.4× at
   levels 13–19 (a 12.9 MB JSON and a 7.5 MB ELF, single runs on a loaded
@@ -361,7 +447,7 @@ Those runs are not stored; the oracle is, and re-runs them on any input.
   that do not change decisions; adding them is possible later without touching
   the goldens. *Not now.*
 - **Matching the `zstd` CLI as such.** The CLI drives the streaming API with
-  its own buffer sizes; once Z1 matches `ZSTD_compressStream2`, the same
+  its own buffer sizes; `Stream` matches `ZSTD_compressStream2`, so the same
   chunking reproduces the CLI's frames, but the CLI (argv, file handling) is
   not this module's contract. *Never.*
 
@@ -377,19 +463,28 @@ the API in question, plus goldens and a mutation sweep. Consumers as of
 dictionaries are undecided.
 
 - **Z1 — Streaming compression, byte-identical to `ZSTD_compressStream2`.**
-  A compression context (`ZSTD_CCtx`) with `compressStream2`
-  (`continue`/`flush`/`end`), reset and parameter setting; libzstd's input
-  buffer of window + block size that wraps around; unknown pledged size (no
-  parameter shrinking, header without content size — or with it when
-  pledged); the stable-input mode. The wrap makes the window two segments,
-  so **every match finder needs its extDict variant** (fast, dfast, lazy
-  over hash chain / row / DUBT, the binary tree and optimal parser —
-  roughly 1 500–2 000 lines of C across `zstd_fast.c`, `zstd_double_fast.c`,
-  `zstd_lazy.c`, `zstd_opt.c`), and `ZSTD_count_2segments` plus LDM's
-  two-segment counters. Long streams need Z3. Oracle: a `zref` mode that
-  feeds the input in a given chunk schedule. **3–4 sessions.**
-- ~~**Z1a — Frame-per-flush writer (interim).**~~ Done 2026-09-23:
-  `FrameWriter`, see *Algorithm*.
+  ~~**Z1a**~~ `FrameWriter`, done 2026-09-23. ~~**Z1-1**~~ done 2026-09-23:
+  `Stream` with `continue`/`flush`/`end` over buffered input and output,
+  pledged or unknown size, the window in two segments, and the extDict
+  variants of `fast` and `dfast` — so levels ≤ 3. Oracle `tools/zstream.c`
+  (a call schedule), goldens in `stream_goldens.zig`. Left:
+  - **Z1b — lazy family.** extDict variants of the hash chain, the row
+    match finder and DUBT (`zstd_lazy.c` `ZSTD_compressBlock_*_extDict`,
+    `ZSTD_HcFindBestMatch`/`ZSTD_RowFindBestMatch`/`ZSTD_DUBT_findBestMatch`
+    in `ZSTD_extDict` mode, the `searchMax` dispatch), `nextToUpdate`
+    reset on a non-contiguous chunk (already in place) → the stream limit
+    rises to 10 (level 11 is `btopt` for inputs ≤ 16 KB). **~1 session.**
+  - **Z1c — optimal parsers and LDM.** extDict in `ZSTD_insertBt1`,
+    `ZSTD_insertBtAndGetAllMatches` (both segments, `dictMode` extDict), the
+    3-byte hash, `ZSTD_btultra2`'s seeding (it checks for a first block
+    with no history), LDM's two-segment counters and window
+    (`ZSTD_ldm_generateSequences` over a stream; LDM's own window follows
+    the chunks) → level 22. **~1–2 sessions.**
+  - **Later:** the stable-input / stable-output buffer modes
+    (`ZSTD_c_stableInBuffer`, which compresses straight from the caller's
+    buffer and waits for a full block), `ZSTD_CCtx_reset` and a second frame
+    on the same context (with Z13), a `std.Io.Writer` over `Stream`
+    (replacing `FrameWriter` for callers that want libzstd's bytes).
 - **Z2 — Decoder.** Frames with dictionaries (raw content and zstd-format:
   entropy tables + repcodes + content as history), checksum verification,
   configurable window limit (`ZSTD_d_windowLogMax`), streaming
@@ -451,7 +546,7 @@ dictionaries are undecided.
   that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
   caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
 
-Suggested order: (Z1a, Z3 done) Z1 → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z3 done) Z1b → Z1c → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 

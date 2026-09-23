@@ -646,7 +646,7 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
     var opt_ldm: OptLdm = .{ .store = if (ms.ldm_seq_store) |s| s.* else .{} };
     opt_ldm.getNextMatch(ip - istart, @intCast(iend - ip));
 
-    rescaleFreqs(st, ms.src[istart - match.window_start ..][0..src_size], opt_level);
+    rescaleFreqs(st, ms.bytes(istart, istart + src_size), opt_level);
     ip += @intFromBool(ip == prefix_start);
 
     // Match Loop
@@ -890,7 +890,7 @@ fn optGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
                     ip = anchor + llen; // last "sequence" is a bunch of literals => don't progress anchor
                     continue; // will finish
                 }
-                const lits = ms.src[anchor - match.window_start ..][0..llen];
+                const lits = ms.bytes(anchor, anchor + llen);
                 updateStats(st, lits, off_base, mlen);
                 ss.store(lits, off_base, mlen);
                 anchor += advance;

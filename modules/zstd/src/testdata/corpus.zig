@@ -177,6 +177,61 @@ pub const cases = [_]Case{
     .{ .name = "ocf-ldm-mix-600000-67-w11", .len = 600000, .kind = .mix, .seed = 67, .only_levels = &.{19}, .ldm = true, .window_log = 11, .ocf = true }, // ... and its offsets below the correction become 0
 };
 
+/// Streaming goldens: corpus case `case` compressed through `zstd.Stream`
+/// following `schedule` (the grammar of `tools/zstream.c`: `pN` pledge,
+/// `wN` window log, `oN` output buffer size, `cN`/`fN`/`eN` continue /
+/// flush / end with the next N input bytes, `*` for the rest; a leading
+/// `x` for libzstd's frequent index-overflow correction) at every
+/// level of `stream_levels`, with and without the checksum.
+pub const StreamCase = struct {
+    case: []const u8,
+    schedule: []const u8,
+    /// Levels at which the input buffer wraps, so blocks are compressed
+    /// with the window in two segments (the extDict match finders); the
+    /// test checks that some were.
+    ext_dict: []const i32 = &.{},
+};
+
+const all_stream_levels: []const i32 = &stream_levels;
+
+pub const stream_levels = [_]i32{ -5, -1, 1, 2, 3 };
+
+pub const stream_cases = [_]StreamCase{
+    .{ .case = "empty", .schedule = "e*" }, // pledged 0: the one-shot shortcut
+    .{ .case = "empty", .schedule = "c*,e0" }, // unknown size: no size in the header
+    .{ .case = "seven", .schedule = "p7,c*,f0,e0" }, // pledged, a flush of a block too small to compress
+    .{ .case = "words-262145", .schedule = "e*" }, // the shortcut: the one-shot frame
+    .{ .case = "words-262145", .schedule = "o100,e*" }, // output too small for the shortcut: buffered, size from the first call
+    .{ .case = "csv-600000", .schedule = "c*,e0" }, // unknown size: the >256 KB parameters, a chunk per block
+    .{ .case = "csv-600000", .schedule = "p600000,c*,e0" }, // pledged
+    .{ .case = "alternating", .schedule = "c100000,f0,c*,e0" }, // a flush mid-block; the pre-splitter per chunk
+    .{ .case = "far-repeat", .schedule = "c*,e0", .ext_dict = &.{ -5, -1, 1, 2 } }, // a 512 KB or 1 MB window wraps its buffer; level 3's 2 MB does not
+    .{ .case = "mix-300000-9", .schedule = "w10,c*,e0", .ext_dict = all_stream_levels }, // the smallest window: a wrap every 2 KB
+    .{ .case = "mix-300000-9", .schedule = "w12,o50,c3000,f0,c*,e0" }, // flushes through a 50-byte output
+    .{ .case = "rle-text-rle", .schedule = "w14,c65536,c65536,f0,c*,e0" },
+    .{ .case = "sparse-far", .schedule = "w11,c100000,f0,c50000,e*", .ext_dict = all_stream_levels }, // the end straight from the caller's buffer
+    .{ .case = "random-300000", .schedule = "w17,c*,e0", .ext_dict = all_stream_levels }, // raw blocks
+    .{ .case = "mix-9000-5", .schedule = "w10,c1,c1,c1,f0,c10,f0,c*,e0" }, // flushes of 1 and 10 bytes
+    .{ .case = "csv-131072", .schedule = "p131072,c*,e0" }, // pledged exactly one block: buffered one byte past it, no empty last block
+    .{ .case = "mix-300000-9", .schedule = "o301171,e*" }, // output of exactly compressBound(input): still the shortcut (buffered, this input's pre-split differs)
+    // Found by a seed search over schedules (original against mutant):
+    .{ .case = "mix-140000-1148", .schedule = "w14,c526,c4191,c278,c130005,c1,c1,f3,c3518,c500,c5,c64,c1,c204,c230,c366,c87,e20", .ext_dict = &.{1} }, // a match from the extDict's end goes on at the prefix's first byte
+    .{ .case = "csv-600000", .schedule = "x,w12,c10,c3971,f458744,c128202,e9073", .ext_dict = &.{-1} }, // ... at all
+    .{ .case = "two-symbols-200000", .schedule = "w13,o1048576,c15239,c152195,f2318,c4470,f2,f3389,f8,c3206,c4524,c209,f10,c12302,c167,f5,f599,c132,c205,c228,f245,c356,c106,c45,f1,c0,c35,c4,e0", .ext_dict = &.{3} }, // dfast: a long candidate exactly at the extDict's low end is refused
+    .{ .case = "csv-200000-0", .schedule = "w10,c24539,c4450,c144065,f23131,c1891,c8,c352,c246,c776,c3,f243,c90,f132,f26,c41,c6,c1,e0", .ext_dict = &.{3} }, // dfast: the search stops 9 bytes before the end (ip < ilimit)
+    .{ .case = "mix-300000-28", .schedule = "x,w13,c84908,c24801,c3798,f1829,c5,c46473,c243,c6,c8448,f0,c7,f9,f43303,f39361,f9,c300,f0,f28049,c3725,c6,c5,c4308,c8,c8,f8034,c1962,f261,c83,c35,e16", .ext_dict = &.{3} }, // dfast: a long match in the extDict extends backwards only to the extDict's low end
+    .{ .case = "words-100000-6", .schedule = "w10,c2,c29324,c9,f37,f1387,c20400,e48841", .ext_dict = &.{3} }, // ... a short one likewise
+    .{ .case = "mix-300000-34", .schedule = "w16,o1,c2,c1658,e298340", .ext_dict = &.{3} }, // dfast: the step after a miss grows with the distance from the anchor
+    .{ .case = "csv-200000-0", .schedule = "x,w11,c3,c169,c4,c156974,c108,f53,c35795,c3692,c430,c58,c7,f10,c337,c18,c501,c696,c13,c253,c653,c206,c4,c13,f2,f0,c1,e0", .ext_dict = &.{-5} }, // fast: a candidate exactly at the extDict's low end is taken (first lookup)
+    .{ .case = "skewed-200000-43", .schedule = "x,w12,o1048576,c36590,c78,c6365,f86076,f4685,c0,c3,c75,c1497,c5,f18190,c38785,f5,c2237,c3881,c1177,f4,c243,f48,c53,c2,c0,c1,e0", .ext_dict = &.{2} }, // ... (second lookup)
+    .{ .case = "far-mix-5", .schedule = "x,w10,o64,c1167020,c3409,c68773,c7,c2226,c28665,c4874,c12263,f128,c12858,f2327,c20695,c9,f3,c49880,f62,c2372,c5505,c9407,c6,c8754,f60,c144,f540,c5,f6,c2,e0", .ext_dict = &.{-5} }, // fast: a match extends backwards down to just above its segment's low end
+    .{ .case = "two-symbols-200000", .schedule = "w10,c7,c4,c2865,f107,c7,c5,c70919,f1678,f70857,f33002,c9655,f2078,c2213,c449,c5556,f481,c15,c95,c7,e0", .ext_dict = &.{1} }, // a repcode 4 bytes before the extDict's end does not straddle it
+    .{ .case = "mix-140000-1148", .schedule = "w17,f1,f71,c2,c93058,c10526,c227,c31763,f1296,c286,f5,f1715,c0,c594,c5,c370,f16,e65" }, // the pre-splitter's savings count the frame header
+    // x: libzstd's frequent overflow correction, here of a two-segment window
+    .{ .case = "mix-300000-9", .schedule = "x,w10,c*,e0", .ext_dict = all_stream_levels },
+    .{ .case = "far-repeat", .schedule = "x,w14,c200000,f0,c*,e0", .ext_dict = all_stream_levels },
+};
+
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };
 
 /// First level of the optimal parsers (btopt in the 16 KB tier).

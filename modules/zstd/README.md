@@ -6,8 +6,10 @@ and level. Decoding is not here: `std.compress.zstd.Decompress` already does
 it. This module is the half std lacks.
 
 Not yet a full libzstd replacement — that is the goal: one-shot
-compression is complete (plus `FrameWriter`, a `std.Io.Writer` that emits
-one frame per flush), while libzstd-identical streaming, a decoder with dictionaries,
+compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
+for the same calls) covers levels 1–3 and negative, and `FrameWriter` is a
+`std.Io.Writer` that emits one frame per flush at any level; streaming above
+level 3, a decoder with dictionaries,
 dictionaries themselves, multithreading and the advanced parameters are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs). Note that
 std's decoder defaults to an 8 MB window: frames of levels 20–22 on large
@@ -88,6 +90,35 @@ Frames share no history, so frequent small flushes cost ratio. On
 `error.WriteFailed`, `fw.err` names our own cause (`OutOfMemory`); null
 means `out` failed.
 
+Streaming as libzstd streams — one frame, history kept across flushes, the
+same bytes `ZSTD_compressStream2` produces for the same sequence of calls
+(levels ≤ `zstd.stream_max_level`, 3, for now):
+
+```zig
+var s = try zstd.Stream.init(gpa, .{ .level = 3 }); // .pledged_size = n puts the size in the header
+defer s.deinit();
+var out_buf: [64 * 1024]u8 = undefined;
+var in: zstd.InBuffer = .{ .src = chunk };
+while (in.pos < in.src.len) { // .continue: buffer input, emit whole blocks
+    var o: zstd.OutBuffer = .{ .dst = &out_buf };
+    _ = try s.compressStream2(&o, &in, .@"continue");
+    try sink.writeAll(out_buf[0..o.pos]);
+}
+// .flush / .end: repeat until the return value (bytes still held back) is 0
+var end: zstd.InBuffer = .{ .src = "" };
+while (true) {
+    var o: zstd.OutBuffer = .{ .dst = &out_buf };
+    const left = try s.compressStream2(&o, &end, .end);
+    try sink.writeAll(out_buf[0..o.pos]);
+    if (left == 0) break;
+}
+```
+
+Its memory is the level's tables plus an input buffer of one window and one
+block (2.1 MB at level 3 with an unknown size). Errors: `LevelUnsupported`,
+`SrcSizeWrong` (a pledged size not met), `FrameEnded` (a call after the end;
+a new frame needs a new `Stream`), `InvalidBuffer`, `OutOfMemory`.
+
 Errors: `LevelUnsupported` (level > 22), `NoSpaceLeft` (`dst` below
 `compressBound`), `OutOfMemory`. There is no input size limit: past 3500 MiB
 the indices are rescaled as libzstd does (the whole input still has to be in
@@ -108,6 +139,14 @@ test seam, as it only switches itself on above 64 MB), and cases constructed
 so that specific decisions are marginal (see SPEC.md, *Anchoring*). The module is `heavy` in `build.zig`:
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
+
+`src/stream_test.zig` does the same for streaming: 31 cases, each a schedule of calls
+(pledged and unknown sizes, flushes, 50-byte outputs, windows down to 1 KB
+so libzstd's input buffer wraps, index overflow correction run often; 14 of
+them found by mutation testing) over corpus inputs at levels -5, -1, 1–3
+with and without checksum — 310 streams,
+each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
+(`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder; unit
 tests cover the FSE normalisation, Huffman depth limiting, bit writer and
