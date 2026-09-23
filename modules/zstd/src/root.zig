@@ -19,6 +19,7 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 const params = @import("params.zig");
+const frame_writer = @import("frame_writer.zig");
 
 pub const meta = .{
     .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2`; decode with `std.compress.zstd`",
@@ -65,6 +66,12 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
     return frame.compress(gpa, dst, src, .{ .level = opts.level, .checksum = opts.checksum });
 }
 
+/// A `std.Io.Writer` that emits one frame per buffer fill and per flush
+/// (see frame_writer.zig): streaming output, not yet libzstd's streaming
+/// bytes.
+pub const FrameWriter = frame_writer.FrameWriter;
+pub const FrameWriterOptions = frame_writer.Options;
+
 /// Compress `src` into a newly allocated frame owned by the caller.
 pub fn compressAlloc(gpa: std.mem.Allocator, src: []const u8, opts: Options) Error![]u8 {
     if (src.len > max_input_size) return error.InputTooLarge;
@@ -88,6 +95,7 @@ test {
     _ = @import("ldm.zig");
     _ = @import("presplit.zig");
     _ = @import("frame.zig");
+    _ = @import("frame_writer.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");
 }

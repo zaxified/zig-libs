@@ -6,7 +6,8 @@ and level. Decoding is not here: `std.compress.zstd.Decompress` already does
 it. This module is the half std lacks.
 
 Not yet a full libzstd replacement — that is the goal: one-shot
-compression is complete, while streaming, a decoder with dictionaries,
+compression is complete (plus `FrameWriter`, a `std.Io.Writer` that emits
+one frame per flush), while libzstd-identical streaming, a decoder with dictionaries,
 dictionaries themselves, multithreading and the advanced parameters are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs). Note that
 std's decoder defaults to an 8 MB window: frames of levels 20–22 on large
@@ -68,6 +69,22 @@ var d: std.compress.zstd.Decompress = .init(&in, &.{}, .{});
 
 `gpa` backs only the per-call match tables and block buffers; everything is
 freed before `compress` returns.
+
+Streaming into any `std.Io.Writer` (an HTTP body, a file), one independent
+frame per buffer fill and per flush:
+
+```zig
+var buf: [64 * 1024]u8 = undefined; // frame size when nobody flushes
+var fw: zstd.FrameWriter = try .init(gpa, out, &buf, .{ .level = 3 });
+defer fw.deinit();
+try fw.writer.writeAll(chunk);
+try fw.writer.flush(); // what is buffered becomes a frame on `out`
+try fw.finish(); // the last frame; `out` itself is not flushed
+```
+
+Frames share no history, so frequent small flushes cost ratio. On
+`error.WriteFailed`, `fw.err` names our own cause (`OutOfMemory`); null
+means `out` failed.
 
 Errors: `LevelUnsupported` (level > 22), `NoSpaceLeft` (`dst` below
 `compressBound`), `InputTooLarge` (over `max_input_size`, 3500 MiB — libzstd

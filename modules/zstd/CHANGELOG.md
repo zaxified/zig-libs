@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — `FrameWriter`: a `std.Io.Writer` that compresses into
+  concatenated one-shot frames, one per buffer fill and per flush (SPEC
+  backlog Z1a, the interim before libzstd-identical streaming). Each frame is
+  exactly `compress` of its bytes, which is what its tests pin; an empty
+  stream is the empty frame.
+
 - **2026-09-22** — Level 22: long-distance matching (`zstd_ldm.c`: gear
   rolling hash, bucketed XXH64 table, sequence generation over its own
   trailing window) and its candidates in the optimal parser

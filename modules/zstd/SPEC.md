@@ -26,9 +26,11 @@ Not here yet, and a reader might expect it (each is a backlog item):
   frames, leaves checksum verification as a TODO panic, and defaults to an
   8 MB window (frames of levels 20–22 on large inputs need
   `window_len` raised). Z2.
-- **Streaming.** One call, whole input. libzstd's streaming API blocks the
+- **Streaming, as libzstd streams.** libzstd's streaming API blocks the
   input on its own buffer boundaries and so produces *different* (equally
-  valid) frames; matching those is its own contract. Z1.
+  valid) frames; matching those is its own contract. Z1. What exists is
+  `FrameWriter` (Z1a, see *Algorithm*): a `std.Io.Writer` that emits one
+  independent one-shot frame per buffer fill and per flush.
 - **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8),
   and long-distance matching as an option (Z7).** libzstd's `ZSTD_c_enableLongDistanceMatching`
   (the CLI's `--long`) is not in `Options`: LDM happens exactly where libzstd
@@ -134,6 +136,20 @@ Endianness: every multi-byte read that feeds a decision is little-endian,
 matching libzstd on x86/arm64 (libzstd reads native order in one place, the
 pre-splitter's 16-bit hash, which `greedy` and up use).
 
+**`FrameWriter`** (`frame_writer.zig`, not a port) is a `std.Io.Writer` over
+that one-shot path. Every byte passes through the caller's buffer; the
+buffer's contents become one frame — exactly `compress` of those bytes — when
+the buffer fills, at each `flush` that finds something buffered, and at
+`finish`. So frame boundaries follow the buffer length and the flush points,
+never how the writes were cut (a `rebase` asking for more room than is left
+also cuts one, as a flush would). `finish` on a stream that never produced a
+frame writes the 9-byte empty frame, so an empty body is still a valid zstd
+stream. A decoder reads concatenated frames as one stream (RFC 8878 §3.1).
+Each frame starts with no history and allocates its match tables anew, so
+small flushes cost ratio and time; Z1 is the real stream. `Writer.Error` has
+one member, so a failure of our own (out of memory) is kept in
+`FrameWriter.err`; null there means `output` failed.
+
 ## Limits and refusals
 
 | limit | value | source |
@@ -145,7 +161,9 @@ pre-splitter's 16-bit hash, which `greedy` and up use).
 | block | 128 KB | format |
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
-pin the level refusal and the destination bound.
+pin the level refusal and the destination bound. `FrameWriter` takes a
+buffer of 1 … `max_input_size` bytes (longer is `error.InputTooLarge` at
+`init`) and holds `compressBound(buffer.len)` of scratch for its life.
 
 ## Anchoring
 
@@ -333,11 +351,8 @@ dictionaries are undecided.
   `zstd_lazy.c`, `zstd_opt.c`), and `ZSTD_count_2segments` plus LDM's
   two-segment counters. Long streams need Z3. Oracle: a `zref` mode that
   feeds the input in a given chunk schedule. **3–4 sessions.**
-- **Z1a — Frame-per-flush writer (interim).** A `std.Io.Writer` that
-  buffers input and emits one one-shot frame per flush / buffer fill;
-  std's decoder reads concatenated frames. Anchored by the existing goldens
-  (each frame is a one-shot frame). Worse ratio for small chunks.
-  **Hours.** Unblocks qap now.
+- ~~**Z1a — Frame-per-flush writer (interim).**~~ Done 2026-09-23:
+  `FrameWriter`, see *Algorithm*.
 - **Z2 — Decoder.** Frames with dictionaries (raw content and zstd-format:
   entropy tables + repcodes + content as history), checksum verification,
   configurable window limit (`ZSTD_d_windowLogMax`), streaming
@@ -401,7 +416,7 @@ dictionaries are undecided.
   that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
   caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
 
-Suggested order: Z1a → Z3 → Z1 → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a done) Z3 → Z1 → Z2 → Z6 + Z13 → Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 
