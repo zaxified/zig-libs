@@ -11,6 +11,12 @@
  *   the whole input at once, output drained through a 128 KB buffer; this
  *   is the reference for which malformed frames are refused (the one-shot
  *   decoder does not bound raw and RLE blocks by the block maximum).
+ *   With the whole frame in the input and room for its content, libzstd
+ *   takes its single-pass shortcut, i.e. the one-shot decoder.
+ * mode 2: streaming as mode 1, but the input fed one byte per call and the
+ *   output drained through a 997-byte buffer: no shortcut, every block
+ *   through ZSTD_decompressContinue -- the plan `DecompressStream` tests
+ *   repeat call for call.
  *
  * Prints "OK <size> <fnv1a64 of the output>" and writes the output
  * (unless <out> is "-"), or
@@ -90,14 +96,15 @@ int main(int argc, char** argv)
         }
         if (reps > 0) printf("NS %llu\n", best);
     } else {
+        size_t const ochunk = mode == 2 ? 997 : (1 << 17);
         ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31);
         size_t cap = 1 << 20;
         out = malloc(cap);
         char buf[1 << 17];
-        ZSTD_inBuffer in = { src, (size_t)n, 0 };
+        ZSTD_inBuffer in = { src, mode == 2 ? (n > 0 ? 1 : 0) : (size_t)n, 0 };
         size_t r = 1;
         for (;;) {
-            ZSTD_outBuffer o = { buf, sizeof(buf), 0 };
+            ZSTD_outBuffer o = { buf, ochunk, 0 };
             r = ZSTD_decompressStream(dctx, &o, &in);
             if (ZSTD_isError(r)) return fail(r);
             if (outSize + o.pos > cap) {
@@ -106,6 +113,7 @@ int main(int argc, char** argv)
             }
             memcpy(out + outSize, buf, o.pos);
             outSize += o.pos;
+            if (mode == 2 && in.pos == in.size && in.size < (size_t)n) { in.size++; continue; }
             if (in.pos == in.size && o.pos < o.size) break;
         }
         /* input ended inside a frame */

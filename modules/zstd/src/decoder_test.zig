@@ -184,9 +184,11 @@ test "a destination too small is refused" {
     try std.testing.expectError(error.DstSizeTooSmall, zstd.decompress(gpa, out[0..10], &raw_frame ++ raw_frame ++ raw_frame));
 }
 
-test "a raw block larger than the block maximum is refused (libzstd one-shot lets it through)" {
+test "a raw block larger than the block maximum: one-shot takes it, the piecewise decoder does not" {
     // window 1 KB => Block_Maximum_Size 1 KB; one raw block of 1025 bytes,
-    // no content size. RFC 8878 and libzstd's streaming decoder refuse it.
+    // no content size. libzstd's one-shot decoder does not bound raw
+    // blocks; its streaming decoder (without the single-pass shortcut)
+    // refuses them, as RFC 8878 asks.
     var f: [4 + 2 + 3 + 1025]u8 = undefined;
     @memcpy(f[0..4], &magic);
     f[4] = 0x00;
@@ -197,14 +199,15 @@ test "a raw block larger than the block maximum is refused (libzstd one-shot let
     f[8] = @truncate(h >> 16);
     @memset(f[9..], 'q');
     var out: [2048]u8 = undefined;
-    try std.testing.expectError(error.CorruptionDetected, zstd.decompress(gpa, &out, &f));
-    // 1024 is fine
-    const g = f[0 .. f.len - 1].*;
-    var g2 = g;
-    const h2: u32 = (1024 << 3) | 1;
-    g2[6] = @truncate(h2);
-    g2[7] = @truncate(h2 >> 8);
-    try std.testing.expectEqual(@as(usize, 1024), try zstd.decompress(gpa, &out, &g2));
+    try std.testing.expectEqual(@as(usize, 1025), try zstd.decompress(gpa, &out, &f));
+
+    var s = try zstd.DecompressStream.init(gpa, .{});
+    defer s.deinit();
+    var o: zstd.OutBuffer = .{ .dst = &out };
+    // header and block header only: refused at the block header already
+    // ("Block Size Exceeds Maximum")
+    var in: zstd.InBuffer = .{ .src = f[0..9] };
+    try std.testing.expectError(error.CorruptionDetected, s.decompressStream(&o, &in));
 }
 
 test "a context is reusable across frames and after errors" {
@@ -218,6 +221,15 @@ test "a context is reusable across frames and after errors" {
         try std.testing.expectError(error.PrefixUnknown, d.decompress(&out, "junk, not a frame"));
     }
     try std.testing.expectEqualStrings("reuse " ** 400, out[0..2400]);
+}
+
+test "window size: exponent and mantissa" {
+    // window byte 0x0B: log 10 + 1 = 11 (2048), mantissa 3: + 3 * 2048/8
+    const f = magic ++ [_]u8{ 0x00, 0x0B, 0x01, 0x00, 0x00 };
+    const h = (try zstd.getFrameHeader(&f)).header;
+    try std.testing.expectEqual(@as(u64, 2816), h.window_size);
+    try std.testing.expectEqual(@as(u32, 2816), h.block_size_max);
+    try std.testing.expectEqual(@as(?u64, null), h.content_size);
 }
 
 test "header queries on short input" {
@@ -244,7 +256,9 @@ test "damaged frames give libzstd's verdict (mutation-sweep fixtures)" {
             }
             continue;
         };
-        const out = try gpa.alloc(u8, @intCast(bound));
+        // capped: a damaged header may claim terabytes (libzstd's verdict on
+        // each frame is the same at this capacity)
+        const out = try gpa.alloc(u8, @intCast(@min(bound, 1 << 20)));
         defer gpa.free(out);
         if (d.decompress(out, k.frame)) |n| {
             var h: u64 = 0xcbf29ce484222325;

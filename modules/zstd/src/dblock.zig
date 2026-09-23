@@ -13,7 +13,10 @@
 //!   executes the same sequences in the same order.
 //! On corrupt input either choice can change which error is reported (not
 //! whether one is): the prefetching decoder checks the end of the bitstream
-//! before executing its last eight sequences.
+//! before executing its last eight sequences. Where libzstd would put the
+//! literals into `dst`, the limit that puts on the block's output is kept
+//! (see `decompressBlock`); its "split" placement (over 64 KB of literals
+//! with little room left) is not, which again changes only the error.
 
 const std = @import("std");
 const dbits = @import("dbits.zig");
@@ -743,15 +746,26 @@ fn decompressSequences(st: *State, h: *const History, op0: usize, capacity: usiz
 }
 
 /// `ZSTD_decompressBlock_internal`: decodes one compressed block into
-/// `h.out[op..op + capacity]`. Returns the decoded size.
-pub fn decompressBlock(st: *State, h: *const History, op: usize, capacity: usize, src: []const u8) Error!usize {
+/// `h.out[op..op + capacity]`. Returns the decoded size. `streaming` is
+/// libzstd's `is_streaming` (the piecewise decoder).
+pub fn decompressBlock(st: *State, h: *const History, op: usize, capacity: usize, src: []const u8, streaming: bool) Error!usize {
     if (src.len > st.block_size_max) return error.SrcSizeWrong;
     const lit_c_size = try decodeLiterals(st, src, capacity);
     const rest = src[lit_c_size..];
     var nb_seq: u32 = undefined;
     const seq_h_size = try decodeSeqHeaders(st, &nb_seq, rest);
     if (capacity == 0 and nb_seq > 0) return error.DstSizeTooSmall;
-    return decompressSequences(st, h, op, capacity, rest[seq_h_size..], nb_seq);
+    // `ZSTD_allocateLiteralsBuffer`: one-shot with room to spare, libzstd
+    // decodes the literals into `dst` behind the block, and the block may
+    // then write only up to them (`block_size_max + 32` bytes). The
+    // literals stay in our own buffer; the limit is kept, since it decides
+    // what a malformed block may write. (Raw literals read in place, from
+    // the source, never sit in `dst`.)
+    const lit_size = st.lit_end - st.lit_pos;
+    const in_place = st.lit_src.ptr != &st.lit_buf;
+    const in_dst = !streaming and !in_place and capacity > st.block_size_max + wildcopy_overlength + lit_size + wildcopy_overlength;
+    const seq_capacity = if (in_dst) st.block_size_max + wildcopy_overlength else capacity;
+    return decompressSequences(st, h, op, seq_capacity, rest[seq_h_size..], nb_seq);
 }
 
 test "default sequence tables match libzstd's literal tables" {

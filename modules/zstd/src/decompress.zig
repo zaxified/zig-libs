@@ -4,11 +4,13 @@
 //! (`ZSTD_getFrameContentSize`, `ZSTD_findFrameCompressedSize`,
 //! `ZSTD_decompressBound`, ...).
 //!
-//! Port of the one-shot half of lib/decompress/zstd_decompress.c (v1.5.7).
-//! One deliberate difference, on malformed frames only: a block that
-//! decodes to more than the frame's `Block_Maximum_Size` is refused here
-//! for every block type, as RFC 8878 and libzstd's own streaming decoder
-//! do; libzstd's one-shot `ZSTD_decompress` lets a raw or RLE block through.
+//! Port of lib/decompress/zstd_decompress.c (v1.5.7): the one-shot decoder
+//! and `ZSTD_decompressContinue`, the piecewise one the stream is built on.
+//! As in libzstd, the one-shot decoder does not hold a block to the frame's
+//! `Block_Maximum_Size` (malformed frames only): raw and RLE blocks are not
+//! bounded at all, and a compressed block only by where libzstd would have
+//! put its literals (see `dblock.decompressBlock`); the piecewise decoder
+//! refuses any block over the maximum.
 
 const std = @import("std");
 const dbits = @import("dbits.zig");
@@ -352,6 +354,18 @@ pub const Options = struct {
     ignore_checksum: bool = false,
 };
 
+/// `ZSTD_dStage`: where `decompressContinue` is within a frame.
+pub const Stage = enum {
+    get_frame_header_size,
+    decode_frame_header,
+    decode_block_header,
+    decompress_block,
+    decompress_last_block,
+    check_checksum,
+    decode_skippable_header,
+    skip_frame,
+};
+
 /// A decoding context (`ZSTD_DCtx`). Its tables and literal buffer (about
 /// 190 KB) live on the heap, so the handle itself can be moved freely.
 pub const Decompressor = struct {
@@ -362,6 +376,26 @@ pub const Decompressor = struct {
     fparams: FrameHeader = undefined,
     /// Dictionary ID the context holds (0 = none).
     dict_id: u32 = 0,
+
+    // The history, as libzstd keeps it: addresses of the start of the
+    // contiguous output so far (`prefixStart`) and of its end
+    // (`previousDstEnd`), and the older segment still in reach
+    // (`virtualStart`..`dictEnd`). Output written somewhere else than right
+    // after `prev_end` starts a new prefix and demotes the old one to `ext`.
+    prefix_addr: usize = 0,
+    prev_end_addr: usize = 0,
+    ext: []const u8 = &.{},
+
+    // `ZSTD_decompressContinue`'s state.
+    stage: Stage = .get_frame_header_size,
+    expected: usize = frame_header_size_prefix,
+    block_type: u2 = 3,
+    rle_size: usize = 0,
+    decoded_size: u64 = 0,
+    header_size: usize = 0,
+    header_buffer: [frame_header_size_max]u8 = undefined,
+    xxh: std.hash.XxHash64 = .init(0),
+    validate: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!Decompressor {
         const st = try gpa.create(dblock.State);
@@ -377,9 +411,49 @@ pub const Decompressor = struct {
     }
 
     /// `ZSTD_decompressBegin`.
-    fn begin(d: *Decompressor) void {
+    pub fn begin(d: *Decompressor) void {
         d.st.begin();
         d.dict_id = 0;
+        d.expected = frame_header_size_prefix;
+        d.stage = .get_frame_header_size;
+        d.decoded_size = 0;
+        d.prefix_addr = 0;
+        d.prev_end_addr = 0;
+        d.ext = &.{};
+        d.block_type = 3;
+    }
+
+    /// `ZSTD_checkContinuity`.
+    fn checkContinuity(d: *Decompressor, dst: []u8) void {
+        const a = @intFromPtr(dst.ptr);
+        if (a != d.prev_end_addr and dst.len > 0) {
+            const n = d.prev_end_addr - d.prefix_addr;
+            d.ext = if (n == 0) &.{} else @as([*]const u8, @ptrFromInt(d.prefix_addr))[0..n];
+            d.prefix_addr = a;
+            d.prev_end_addr = a;
+        }
+    }
+
+    /// The block decoder's view of the history for output at `dst`: the
+    /// prefix runs from `prefix_addr` (same buffer) up to `dst`. Returns the
+    /// history and `dst`'s index in it.
+    fn history(d: *const Decompressor, dst: []u8) struct { h: dblock.History, op: usize } {
+        if (dst.len == 0 or d.prefix_addr == 0) return .{ .h = .{ .out = dst, .prefix = 0, .ext = d.ext }, .op = 0 };
+        const back = @intFromPtr(dst.ptr) - d.prefix_addr;
+        const base: [*]u8 = @ptrFromInt(d.prefix_addr);
+        return .{ .h = .{ .out = base[0 .. back + dst.len], .prefix = 0, .ext = d.ext }, .op = back };
+    }
+
+    /// `ZSTD_decodeFrameHeader`.
+    pub fn decodeFrameHeader(d: *Decompressor, header: []const u8) Error!void {
+        d.fparams = switch (try getFrameHeader(header)) {
+            .need => return error.SrcSizeWrong,
+            .header => |h| h,
+        };
+        if (d.fparams.dict_id != 0 and d.dict_id != d.fparams.dict_id) return error.DictionaryWrong;
+        d.validate = d.fparams.checksum and !d.options.ignore_checksum;
+        if (d.validate) d.xxh = .init(0);
+        d.st.block_size_max = d.fparams.block_size_max;
     }
 
     /// `ZSTD_decompressFrame`: decodes the frame at `src[ip.*..]` into
@@ -392,20 +466,11 @@ pub const Decompressor = struct {
         {
             const fhs = try frameHeaderSize(src[ip.*..][0..frame_header_size_prefix]);
             if (remaining < fhs + block_header_size) return error.SrcSizeWrong;
-            // ZSTD_decodeFrameHeader
-            d.fparams = switch (try getFrameHeader(src[ip.*..][0..fhs])) {
-                .need => return error.SrcSizeWrong,
-                .header => |h| h,
-            };
-            if (d.fparams.dict_id != 0 and d.dict_id != d.fparams.dict_id) return error.DictionaryWrong;
+            try d.decodeFrameHeader(src[ip.*..][0..fhs]);
             ip.* += fhs;
             remaining -= fhs;
         }
-        const validate = d.fparams.checksum and !d.options.ignore_checksum;
-        var xxh = std.hash.XxHash64.init(0);
-        st.block_size_max = d.fparams.block_size_max;
 
-        const h: dblock.History = .{ .out = dst, .prefix = op0 };
         var op = op0;
         while (true) {
             var bp: BlockProperties = undefined;
@@ -416,7 +481,10 @@ pub const Decompressor = struct {
             const block = src[ip.*..][0..c_block_size];
             const cap = dst.len - op;
             const decoded: usize = switch (bp.block_type) {
-                2 => try dblock.decompressBlock(st, &h, op, cap, block),
+                2 => blk: {
+                    const v = d.history(dst[op..]);
+                    break :blk try dblock.decompressBlock(st, &v.h, v.op, cap, block, false);
+                },
                 0 => blk: {
                     if (c_block_size > cap) return error.DstSizeTooSmall;
                     @memcpy(dst[op..][0..c_block_size], block);
@@ -429,8 +497,7 @@ pub const Decompressor = struct {
                 },
                 else => return error.CorruptionDetected,
             };
-            if (decoded > st.block_size_max) return error.CorruptionDetected;
-            if (validate) xxh.update(dst[op..][0..decoded]);
+            if (d.validate) d.xxh.update(dst[op..][0..decoded]);
             op += decoded;
             ip.* += c_block_size;
             remaining -= c_block_size;
@@ -443,7 +510,7 @@ pub const Decompressor = struct {
         if (d.fparams.checksum) {
             if (remaining < 4) return error.ChecksumWrong;
             if (!d.options.ignore_checksum) {
-                const calc: u32 = @truncate(xxh.final());
+                const calc: u32 = @truncate(d.xxh.final());
                 if (readLE32(src, ip.*) != calc) return error.ChecksumWrong;
             }
             ip.* += 4;
@@ -464,6 +531,7 @@ pub const Decompressor = struct {
                 continue;
             }
             d.begin();
+            d.checkContinuity(dst[op..]);
             const res = d.decompressFrame(dst, op, src, &ip) catch |e| {
                 // garbage after complete frames is more likely a size error
                 if (e == error.PrefixUnknown and more_than_1_frame) return error.SrcSizeWrong;
@@ -474,6 +542,143 @@ pub const Decompressor = struct {
         }
         if (ip != src.len) return error.SrcSizeWrong;
         return op;
+    }
+
+    /// `ZSTD_nextSrcSizeToDecompress`: how many input bytes the next
+    /// `decompressContinue` call takes (0: the frame is done).
+    pub fn nextSrcSizeToDecompress(d: *const Decompressor) usize {
+        return d.expected;
+    }
+
+    /// `ZSTD_nextSrcSizeToDecompressWithInputSize`: a raw block may be fed
+    /// in pieces.
+    pub fn nextSrcSizeWithInputSize(d: *const Decompressor, input_size: usize) usize {
+        if (!(d.stage == .decompress_block or d.stage == .decompress_last_block)) return d.expected;
+        if (d.block_type != 0) return d.expected;
+        return @max(1, @min(input_size, d.expected));
+    }
+
+    /// `ZSTD_decompressContinue`: feeds exactly the next piece of a frame
+    /// (`nextSrcSizeWithInputSize` bytes) and writes what it decodes to
+    /// `dst`, which must directly follow the previous output to keep the
+    /// history contiguous (else the previous output becomes the older
+    /// segment). Returns the bytes written. Call `begin` before a frame.
+    pub fn decompressContinue(d: *Decompressor, dst: []u8, src: []const u8) Error!usize {
+        if (src.len != d.nextSrcSizeWithInputSize(src.len)) return error.SrcSizeWrong;
+        d.checkContinuity(dst);
+        switch (d.stage) {
+            .get_frame_header_size => {
+                if (isSkippableMagic(readLE32(src, 0))) {
+                    @memcpy(d.header_buffer[0..src.len], src);
+                    d.expected = skippable_header_size - src.len;
+                    d.stage = .decode_skippable_header;
+                    return 0;
+                }
+                d.header_size = try frameHeaderSize(src);
+                @memcpy(d.header_buffer[0..src.len], src);
+                d.expected = d.header_size - src.len;
+                d.stage = .decode_frame_header;
+                return 0;
+            },
+            .decode_frame_header => {
+                @memcpy(d.header_buffer[d.header_size - src.len ..][0..src.len], src);
+                try d.decodeFrameHeader(d.header_buffer[0..d.header_size]);
+                d.expected = block_header_size;
+                d.stage = .decode_block_header;
+                return 0;
+            },
+            .decode_block_header => {
+                var bp: BlockProperties = undefined;
+                const c_block_size = try getcBlockSize(src[0..block_header_size], &bp);
+                if (c_block_size > d.fparams.block_size_max) return error.CorruptionDetected;
+                d.expected = c_block_size;
+                d.block_type = bp.block_type;
+                d.rle_size = bp.orig_size;
+                if (c_block_size != 0) {
+                    d.stage = if (bp.last) .decompress_last_block else .decompress_block;
+                    return 0;
+                }
+                // empty block
+                if (bp.last) {
+                    if (d.fparams.checksum) {
+                        d.expected = 4;
+                        d.stage = .check_checksum;
+                    } else {
+                        d.expected = 0;
+                        d.stage = .get_frame_header_size;
+                    }
+                } else {
+                    d.expected = block_header_size;
+                    d.stage = .decode_block_header;
+                }
+                return 0;
+            },
+            .decompress_block, .decompress_last_block => {
+                var r_size: usize = undefined;
+                switch (d.block_type) {
+                    2 => {
+                        const v = d.history(dst);
+                        r_size = try dblock.decompressBlock(d.st, &v.h, v.op, dst.len, src, true);
+                        d.expected = 0;
+                    },
+                    0 => {
+                        if (src.len > dst.len) return error.DstSizeTooSmall;
+                        @memcpy(dst[0..src.len], src);
+                        r_size = src.len;
+                        d.expected -= r_size;
+                    },
+                    1 => {
+                        if (d.rle_size > dst.len) return error.DstSizeTooSmall;
+                        @memset(dst[0..d.rle_size], src[0]);
+                        r_size = d.rle_size;
+                        d.expected = 0;
+                    },
+                    else => return error.CorruptionDetected,
+                }
+                if (r_size > d.fparams.block_size_max) return error.CorruptionDetected;
+                d.decoded_size += r_size;
+                if (d.validate) d.xxh.update(dst[0..r_size]);
+                d.prev_end_addr = @intFromPtr(dst.ptr) + r_size;
+                if (d.expected > 0) return r_size; // more of this raw block to come
+
+                if (d.stage == .decompress_last_block) {
+                    if (d.fparams.content_size) |fcs| {
+                        if (d.decoded_size != fcs) return error.CorruptionDetected;
+                    }
+                    if (d.fparams.checksum) {
+                        d.expected = 4;
+                        d.stage = .check_checksum;
+                    } else {
+                        d.expected = 0;
+                        d.stage = .get_frame_header_size;
+                    }
+                } else {
+                    d.stage = .decode_block_header;
+                    d.expected = block_header_size;
+                }
+                return r_size;
+            },
+            .check_checksum => {
+                if (d.validate) {
+                    const h32: u32 = @truncate(d.xxh.final());
+                    if (readLE32(src, 0) != h32) return error.ChecksumWrong;
+                }
+                d.expected = 0;
+                d.stage = .get_frame_header_size;
+                return 0;
+            },
+            .decode_skippable_header => {
+                @memcpy(d.header_buffer[skippable_header_size - src.len ..][0..src.len], src);
+                d.expected = readLE32(&d.header_buffer, 4);
+                d.stage = .skip_frame;
+                return 0;
+            },
+            .skip_frame => {
+                d.expected = 0;
+                d.stage = .get_frame_header_size;
+                return 0;
+            },
+        }
     }
 };
 

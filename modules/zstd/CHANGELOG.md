@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-23** — Streaming decompression (SPEC backlog Z2b):
+  `DecompressStream` (`ZSTD_decompressStream`: input and output in any
+  pieces, output ring of one window plus two blocks or `stable_output`,
+  `window_log_max` defaulting to libzstd's 2^27 + 1, hostage byte, the
+  single-pass shortcut, the no-progress error), `DecompressReader` (a
+  `std.Io.Reader` over another reader) and `Decompressor.decompressContinue`
+  (`ZSTD_decompressContinue`). History across output buffers follows
+  libzstd's `ZSTD_checkContinuity`. The one-shot decoder now bounds a
+  block's output exactly where libzstd's does (by where it would have put
+  the literals), no longer by the block maximum for raw and RLE blocks —
+  the difference Z2a documented is gone. `tools/zdec.c` mode 2 streams one
+  byte per call; one-shot and streaming each agree with libzstd on
+  35 662 valid and damaged frames. `decode_kats.zig`: the window-mantissa
+  frame no longer pins anything under the new bound (a header test does),
+  and one frame joins for literals read in place; 11 frames. A 26-mutation
+  sweep of the streaming code: 19 caught, 7 survivors in SPEC.md.
+
 - **2026-09-23** — Decoder (SPEC backlog Z2a): a port of libzstd's one-shot
   decoder — `Decompressor`, `decompress`, `decompressAlloc`, content
   checksum verification (`DecompressOptions.ignore_checksum` to skip it),

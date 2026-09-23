@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //! zstd — Zstandard (RFC 8878) compressor for every level, 1-22 and the
 //! negative ("fast") levels, byte-identical to libzstd 1.5.7, and a decoder
-//! ported from libzstd's.
+//! ported from libzstd's, one-shot and streaming.
 //!
 //! The compressor is a port of every libzstd strategy — `fast`, `dfast`,
 //! `greedy`, `lazy`, `lazy2` (hash-chain and row match finders), `btlazy2`,
@@ -22,7 +22,9 @@
 //! `Decompressor` / `decompress` / `decompressAlloc` decode whole frames
 //! one-shot (`ZSTD_decompress`), with content checksums, concatenated and
 //! skippable frames, and the frame queries (`getFrameContentSize`,
-//! `decompressBound`, ...); errors carry libzstd's names. See SPEC.md.
+//! `decompressBound`, ...); `DecompressStream` (`ZSTD_decompressStream`)
+//! and `DecompressReader` (a `std.Io.Reader`) decode in any pieces. Errors
+//! carry libzstd's names. See SPEC.md.
 
 const std = @import("std");
 const frame = @import("frame.zig");
@@ -30,9 +32,10 @@ const params = @import("params.zig");
 const frame_writer = @import("frame_writer.zig");
 const stream = @import("stream.zig");
 const dec = @import("decompress.zig");
+const dstream = @import("dstream.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2` — and a one-shot decoder ported from libzstd's (checksums, concatenated and skippable frames, frame queries)",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2` — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -112,6 +115,16 @@ pub const getDictIdFromFrame = dec.getDictIdFromFrame;
 pub const isFrame = dec.isFrame;
 pub const isSkippableFrame = dec.isSkippableFrame;
 
+/// Streaming decompression (`ZSTD_decompressStream`): input and output in
+/// any pieces, through a window-sized output ring (or straight into a
+/// stable output buffer); frames asking for more than 2^27 bytes of window
+/// are refused unless `window_log_max` allows them.
+pub const DecompressStream = dstream.DecompressStream;
+pub const DecompressStreamOptions = dstream.Options;
+pub const DecompressStreamError = dstream.Error;
+/// A `std.Io.Reader` of the decompressed content of another reader.
+pub const DecompressReader = dstream.Reader;
+
 /// Decode every frame in `src` into `dst` (`ZSTD_decompress`): returns
 /// the number of bytes written. Concatenated and skippable frames are
 /// allowed; content checksums are verified.
@@ -166,6 +179,8 @@ test {
     _ = @import("huf_dec.zig");
     _ = @import("dblock.zig");
     _ = @import("decompress.zig");
+    _ = @import("dstream.zig");
+    _ = @import("dstream_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("fuzz_test.zig");

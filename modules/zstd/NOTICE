@@ -53,9 +53,10 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/common/bitstream.h              bit writer                            -> src/bitstream.zig
   lib/compress/hist.c                 byte histograms                       -> src/hist.zig
   lib/common/zstd_internal.h          code tables, default distributions    -> src/sequences.zig
-  lib/decompress/zstd_decompress.c    frame decoder (one-shot), frame
-                                      header, size queries, skippable
-                                      frames                                -> src/decompress.zig
+  lib/decompress/zstd_decompress.c    frame decoder (one-shot and
+                                      piecewise), frame header, size
+                                      queries, skippable frames             -> src/decompress.zig
+                                      streaming (decompressStream)          -> src/dstream.zig
   lib/decompress/zstd_decompress_block.c, lib/decompress/zstd_decompress_internal.h
                                       literals and sequences sections,
                                       sequence tables, sequence execution   -> src/dblock.zig
@@ -69,7 +70,7 @@ Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
 and `src/testdata/` are this collection's own work (MIT).
 
-Not taken: the streaming decoder, dictionaries, the prefetching sequence
+Not taken: dictionaries, the prefetching sequence
 decoder, the x86-64 assembly Huffman loop (its C twin is ported),
 long-distance matching below `btopt`, multithreading, `targetCBlockSize`
 super-blocks.

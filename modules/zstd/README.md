@@ -2,17 +2,17 @@
 
 **Zstandard (RFC 8878) compressor** for every level — 1–22 and the negative
 ("fast") levels — emitting **exactly the bytes libzstd 1.5.7 emits** for the same input
-and level, and a **decoder** ported from libzstd's: as fast (1.05× its time),
-checksums verified, concatenated and skippable frames, the frame size
-queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
+and level, and a **decoder** ported from libzstd's, one-shot and streaming (also as a
+`std.Io.Reader`): as fast (1.05× its time), checksums verified,
+concatenated and skippable frames, the frame size queries. std's `std.compress.zstd.Decompress` takes 30× libzstd's time,
 leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
 Not yet a full libzstd replacement — that is the goal: one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
 for the same calls) covers every level too, and `FrameWriter` is a
 `std.Io.Writer` that emits one frame per flush; the stable-buffer and
-context-reuse parts of the streaming API, streaming decompression,
-dictionaries, multithreading and the advanced parameters are
+context-reuse parts of the streaming API, dictionaries, multithreading
+and the advanced parameters are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
@@ -76,12 +76,27 @@ const out = try gpa.alloc(u8, data.len);
 const len = try dec.decompress(out, frame); // error.DstSizeTooSmall if out is short
 ```
 
-Decoding takes the whole input and a destination for the whole output
-(one-shot, `ZSTD_decompress`); a frame's size is in `getFrameContentSize`
+One-shot decoding takes the whole input and a destination for the whole
+output (`ZSTD_decompress`); a frame's size is in `getFrameContentSize`
 (null when the header omits it — `decompressBound` then gives an upper
 bound). Errors carry libzstd's names (`error.CorruptionDetected`,
-`error.ChecksumWrong`, `error.SrcSizeWrong`, ...). Streaming decompression
-and dictionary frames are not here yet.
+`error.ChecksumWrong`, `error.SrcSizeWrong`, ...). Dictionary frames are
+not here yet.
+
+Streaming decompression, from any `std.Io.Reader` (a file, a socket):
+
+```zig
+var dr = try zstd.DecompressReader.init(gpa, &file_reader.interface, &.{}, .{});
+defer dr.deinit();
+_ = try dr.interface.streamRemaining(&out.writer); // every frame, in order
+// error.ReadFailed with dr.err set: a decoding error, or the input ended mid-frame
+```
+
+or call by call (`ZSTD_decompressStream`): `DecompressStream.decompressStream(&out_buf, &in_buf)`
+returns 0 when a frame is fully decoded and flushed. It keeps one window
+plus two blocks of output ring and refuses frames asking for more than a
+128 MB window unless `window_log_max` says otherwise (libzstd's default);
+`stable_output` decodes straight into a caller's buffer that stays put.
 
 `gpa` backs only the per-call match tables and block buffers; everything is
 freed before `compress` returns.
@@ -164,7 +179,9 @@ each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 
 The decoder is checked by decoding every golden and streaming frame back to
 its input, by `src/decoder_test.zig` (frame structure, the size queries and
-every error a malformed frame produces, each checked against libzstd), and
+every error a malformed frame produces, each checked against libzstd) and
+`src/dstream_test.zig` (streaming under 1-byte and random call patterns,
+the window limit, stable output, the `Reader`), and
 off-line against libzstd's decoder through `tools/zdec.c` (see SPEC.md,
 *Anchoring*).
 
