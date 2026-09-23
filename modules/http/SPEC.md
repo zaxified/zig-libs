@@ -303,6 +303,22 @@ consumer expects. qap wrote its own (`src/inputs.zig`: first-match `param` with 
 encoded separator can never reach a router). Wanted here, shared with `router`, so the rule that
 decides what a path segment is lives in one place.
 
+**h2 server concurrency for fibers (`Options.dispatcher` on one thread)** — BACKLOG (2026-09-23,
+found by qap plan M4.7). The threaded mode assumes every task is an OS thread: `Session.lock`
+(`h2_server.zig` :732) is a `std.atomic.Mutex` yield-spin **held across `flushWire`'s socket
+write**, and `waitForPeer` (:749) and the drain in `run` (:791) wait by yield-spinning too. With
+handlers on fibers of the connection's own thread (an io_uring engine), a stream fiber that parks
+in the write while holding `mu` leaves the reader fiber spinning on `mu` forever -- it never
+returns to the event loop, so the write never completes: a deadlock, not a slowdown. Wanted: an
+optional `std.Io` for the concurrent mode (e.g. `Dispatcher.io`) through which those three waits
+go -- `std.Io.Mutex` for `mu` (a contended lock parks the task: on a fiber engine whose `futexWait`
+parks the fiber, that is the fiber), and a "connection made progress" `std.Io.Condition` that
+`pump` broadcasts and `waitForPeer`/the drain wait on. Io-less (`null`) stays today's yield-spin,
+byte for byte. Also state in the `Dispatcher.spawn` contract that "a different thread" can be
+"a task that does not run before `spawn` returns" (a fiber queued on the same loop). Test: the
+existing `/fast`-while-`/slow` and PING-while-blocked dispatcher tests, driven with a
+single-threaded dispatcher that runs tasks cooperatively.
+
 **h2 upstream forwarding** reuses the multiplexing `h2_client.Session` through its *buffered*
 surface, so it (a) buffers request/response bodies in memory (bounded) rather than streaming like
 the h1 path — no longer an engine limitation since `h2_client` grew `openStream`/`sendData`/
