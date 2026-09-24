@@ -301,7 +301,7 @@ const module_list = [_]Module{
     .{ .name = "falcon", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "hqc", .libs = &.{"crypto"}, .heavy = true },
     .{ .name = "dtls", .libs = &.{"crypto"}, .deps = &.{ "rsa", "x509", "chachapoly" }, .test_deps = &.{"testkit"} },
-    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{"x509"} }, // x509: RFC 5280 chain verification + DER guard
+    .{ .name = "tlsclient", .libs = &.{ "crypto", "net" }, .deps = &.{"x509"}, .test_deps = &.{"testkit"} }, // x509: RFC 5280 chain verification + DER guard
     .{ .name = "tlsresume", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
     .{ .name = "quic-crypto", .libs = &.{"crypto"}, .deps = &.{"chachapoly"}, .test_deps = &.{"testkit"} },
     .{ .name = "sandbox", .libs = &.{"os"} },

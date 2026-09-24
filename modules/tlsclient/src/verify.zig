@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const x509 = @import("x509");
+const testkit = @import("testkit");
 const Certificate = std.crypto.Certificate;
 
 /// The most certificates a server's Certificate message may carry. Real
@@ -204,18 +205,23 @@ fn fuzzChain(bundle: *Certificate.Bundle, smith: *std.testing.Smith) anyerror!vo
     verifyAgainstBundle(chain[0..n], bundle, now) catch {};
 }
 
+/// A corpus seed for `fuzzChain`: the chain frame (2-byte length + DER per
+/// certificate) wrapped by `testkit.fuzz.seedInto`, because `Smith.slice`
+/// reads a 4-byte little-endian length first. A raw frame would lose its
+/// first four bytes to that length and never reach the verifier.
 fn seed(gpa: std.mem.Allocator, pems: []const []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
+    var frame: std.ArrayList(u8) = .empty;
+    defer frame.deinit(gpa);
     var der_buf: [4096]u8 = undefined;
     for (pems) |p| {
         const der = try pemToDer(p, &der_buf);
         var len: [2]u8 = undefined;
         std.mem.writeInt(u16, &len, @intCast(der.len), .big);
-        try out.appendSlice(gpa, &len);
-        try out.appendSlice(gpa, der);
+        try frame.appendSlice(gpa, &len);
+        try frame.appendSlice(gpa, der);
     }
-    return out.toOwnedSlice(gpa);
+    const out = try gpa.alloc(u8, 4 + frame.items.len);
+    return @constCast(testkit.fuzz.seedInto(out, frame.items));
 }
 
 test "fuzz: arbitrary chains through the guard and the verifier never panic" {
@@ -229,14 +235,30 @@ test "fuzz: arbitrary chains through the guard and the verifier never panic" {
     try testing.fuzz(&bundle, fuzzChain, .{ .corpus = &.{ honest, forged } });
 }
 
-test "corpus: the seeds reach the verifier -- honest verifies, forged is refused" {
+/// Reads a corpus seed back exactly as `fuzzChain` does, through `Smith`.
+fn chainFromSeed(entry: []const u8, buf: *[4 * 4096]u8, chain: *[max_chain_len][]const u8) usize {
+    var smith: std.testing.Smith = .{ .in = entry };
+    return splitChain(buf[0..smith.slice(buf)], chain);
+}
+
+test "corpus: the seeds reach the verifier through Smith -- honest verifies, forged is refused" {
     const gpa = testing.allocator;
     var bundle = try rootBundle(gpa);
     defer bundle.deinit(gpa);
+    var buf: [4 * 4096]u8 = undefined;
+    var chain: [max_chain_len][]const u8 = undefined;
+
     const honest = try seed(gpa, &.{ @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") });
     defer gpa.free(honest);
-    var chain: [max_chain_len][]const u8 = undefined;
-    const n = splitChain(honest, &chain);
+    const n = chainFromSeed(honest, &buf, &chain);
     try testing.expectEqual(@as(usize, 2), n);
+    for (chain[0..n]) |der| try checkWellFormed(der);
     try verifyAgainstBundle(chain[0..n], &bundle, now);
+
+    const forged = try seed(gpa, &.{ @embedFile("testdata/forged.pem"), @embedFile("testdata/leaf.pem"), @embedFile("testdata/inter.pem") });
+    defer gpa.free(forged);
+    const m = chainFromSeed(forged, &buf, &chain);
+    try testing.expectEqual(@as(usize, 3), m);
+    for (chain[0..m]) |der| try checkWellFormed(der);
+    try testing.expectError(error.TlsCertificateNotVerified, verifyAgainstBundle(chain[0..m], &bundle, now));
 }
