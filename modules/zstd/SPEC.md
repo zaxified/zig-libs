@@ -734,31 +734,43 @@ through the digested (unstripped) path, since that is what
 `ZSTD_DCtx_loadDictionary` itself does internally — only the one-shot
 `Decompressor`'s raw-bytes option is stripped. `Options.prefix`
 (`ZSTD_DCtx_refPrefix`) is forced raw content (a zstd-format dictionary's
-magic number is never looked for) and applies to exactly one frame; a
-skippable frame between it and the next real frame does *not* consume it in
-this port (libzstd's does, since it evaluates `ZSTD_getDDict` — which flips
-`dictUses` from "once" to "don't use" — before checking whether the frame
-is skippable). `Options.ddicts` (`ZSTD_d_refMultipleDDicts`) picks a
-dictionary by the frame's dictionary ID from a caller-given list, falling
-back to `Options.ddict`; the selection itself is a linear scan (last match
-wins on a duplicate ID) rather than a port of libzstd's open-addressing
-hash set, since only which `DDict` is picked is observable, not how. It is
-selected fresh for every frame in this port -- **a deliberate difference**
-from libzstd's own one-shot `ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx`,
-which apply whichever `ZSTD_DDict*` was resolved once before the frame loop
-started to every frame's content and entropy (only the dictID *check*, not
-the content applied, is re-resolved per frame via
-`ZSTD_DCtx_selectFrameDDict`) — so libzstd's one-shot multi-dictionary
-decoding of concatenated frames naming *different* dictionaries is, by this
-reading of its source, not what a fresh-per-frame selection would give; this
-port instead gives every frame its own correctly-selected dictionary, which
-is the more useful behaviour but is *not* verified byte-identical against
-libzstd's one-shot API for that specific combination (streaming was: see
-below). Flagged rather than decided silently, per the agent rules; the
-streaming API (`DecompressStream`), by contrast, resolves the dictionary
-before applying it for every frame — matching `ZSTD_decompressStream`'s own
-early `ZSTD_DCtx_selectFrameDDict` call, and is exactly what this port does
-too.
+magic number is never looked for) and applies to exactly one frame,
+including when that frame turns out to be skippable: libzstd evaluates
+`ZSTD_getDDict` — which flips `dictUses` from "once" to "don't use" —
+*before* checking whether the frame is skippable, so a skippable frame
+between the prefix and the next real frame consumes it too, without the
+prefix ever reaching a decode; this port matches (the skippable-frame
+branch in `dstream.zig`'s header-consume step clears `prefix_once` too).
+
+`Options.ddicts` (`ZSTD_d_refMultipleDDicts`) picks a dictionary by the
+frame's dictionary ID from a caller-given list, falling back to
+`Options.ddict`; the selection itself is a linear scan (last match wins on
+a duplicate ID) rather than a port of libzstd's open-addressing hash set,
+since only which `DDict` is picked is observable, not how. **Streaming**
+selects fresh for every frame, matching libzstd's own early
+`ZSTD_DCtx_selectFrameDDict` call inside `ZSTD_decompressStream`.
+**One-shot is different, and was verified empirically, not just read from
+the source**: `ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx` resolve
+ONE dictionary — `ZSTD_getDDict(dctx)`, "whichever `ZSTD_DCtx_refDDict`
+call was last" — *before* the frame loop starts, and apply its content and
+entropy to *every* frame in that one call; `ZSTD_d_refMultipleDDicts` only
+re-validates each frame's dictID against the right `DDict`
+(`ZSTD_DCtx_selectFrameDDict`, called from inside `ZSTD_decodeFrameHeader`,
+*after* that frame's content/entropy were already applied from the fixed
+one) — it does not re-apply. Five adversarial cases were built by hand
+(two same-size, differently-trained dictionaries; frames whose matches
+depend on their own dictionary's vocabulary; both `refDDict` orders; both
+frame orders) and run through `tools/zdec.c`: every combination that
+*would* need the "wrong" fixed dictionary's content refused cleanly with
+`error.CorruptionDetected` — never silently wrong output — and every
+combination that happened not to need it decoded correctly. Since libzstd
+never produced demonstrably wrong output (only a clean refusal, which is a
+false negative on valid input, not corruption), this port matches
+exactly (`Decompressor.decompress`'s doc comment) rather than keeping the
+"more correct" fresh-per-frame selection an earlier version of this work
+had: `Options.ddict` if set, else `Options.ddicts`'s *last* entry (mirrors
+"last ref'd"), fixed for the whole one-shot call; the KATs this produced
+(`frame2b_full_l3` etc.) are in `testdata/dict_kats.zig`.
 
 **One divergence this work makes reachable for the first time, not new:**
 already documented above, libzstd switches between a "short" and a
@@ -1547,18 +1559,85 @@ roughly 17–22 sessions.
   10 in long-distance matching (see *Anchoring*).
 - `targets` declares only `.linux64`; the code has no OS or endianness
   dependency, but `portable-zstd-*` has not been run.
-- Dictionaries (Z2c mutation sweep, 14 mutations: 10 killed, 1 equivalent, 3
-  uncovered): `loadDEntropy`'s repcode-room check at exactly
-  `pos + 12 == dict.len` (needs a hand-built dictionary with zero content
-  bytes past the repeat offsets — every dictionary here comes from
-  `ZDICT_trainFromBuffer`, which does not produce that shape) and a
-  repcode of exactly 0 (needs a dictionary corrupted at a byte offset this
-  port does not expose — the `rep == 0` half of its check); `selectDDict`'s
-  `frame_dict_id != 0` guard (observable only with a raw-content `DDict`,
-  dictID 0 by construction, placed in `ddicts` and a frame that itself
-  needs no dictionary — see ddict.zig/SPEC.md's dictID-0 sentinel-ambiguity
-  note). `setHistoryFrom`'s `content.len == 0` guard is equivalent, not
-  uncovered: the address arithmetic it skips computes the same
+- Dictionaries (Z2c mutation sweep, widened per the coordinator's request:
+  48 mutations across every bounds/length check and error branch of
+  `loadDEntropy` and its header parsing, the content-type dispatch, dictID
+  checks and selection, history/entropy setup in one-shot and streaming,
+  and `refPrefix`'s lifetime — 43 killed, 4 equivalent, 1 hunted and not
+  found). All three originally-uncovered cases the coordinator asked to be
+  hand-crafted byte by byte were, checked against libzstd through
+  `tools/zdec.c`, and turned into KATs (`testdata/dict_kats.zig`):
+  - A dictionary truncated to exactly its entropy header (content size 0,
+    `full_dict_zero_content`) — libzstd rejects it too
+    (`dictionary_corrupted`), and turned out to prove the repcode-room
+    check (`pos + 12 > dict.len`) **equivalent** to its `>=` mutant, not
+    merely uncovered: with content size 0, `rep == 0 or rep > 0` is a
+    tautology, so every valid repeat offset (always ≥ 1) fails the
+    *other* half of the same check regardless of the room check's
+    boundary — confirmed by running the mutant against this exact
+    dictionary, which still rejects it, same class.
+  - A dictionary with its first repeat offset patched to 0
+    (`full_dict_rep0_zero`, otherwise identical to `full_dict` so its
+    content size stays > 0) — kills the `rep == 0` half of that check
+    directly; libzstd rejects it too.
+  - Two small raw-content dictionaries (dictionary ID 0 by construction,
+    like every raw-content dictionary — `small_raw_a`/`small_raw_b`) in a
+    `ddicts` set, decoding a dictID-0 frame (`small_frame`): confirmed
+    against libzstd (`tools/zdec.c`, `refMultipleDDicts`) that a dictID-0
+    frame is *not* exempt from selection — libzstd's hash set uses
+    `currDictID == 0` as both its empty-slot sentinel and a real
+    raw-content dictionary's ID, so it genuinely matches whichever one
+    last landed at that bucket. This reversed the original guard
+    (`selectDDict` no longer special-cases `frame_dict_id == 0`) rather
+    than confirming it — the guard was a wrong, undisclosed simplification
+    from before this round, not a deliberate one.
+  Also hand-crafted, found by the widened sweep itself, each checked
+  against libzstd and turned into a KAT: a dictionary of exactly 8 bytes
+  (magic + dictID, no entropy header at all, `eight_byte_dict` — also
+  proved `dict.len <= 8` vs `< 8` **equivalent**: at exactly 8 bytes both
+  reach the same downstream Huffman-header failure); `raw_dict` requested
+  as `.full` (has no magic number, so `.full` must still refuse it);
+  `frame_raw_l5` (dictID 0) decoded with an unrelated nonzero-dictID
+  dictionary active, confirming libzstd's dictID check really does
+  short-circuit entirely at `fParams.dictID == 0` regardless of what
+  dictionary is configured; a frame whose literals reuse the dictionary's
+  Huffman table (`lit_repeat_frame`, found by hunting ~50 (input, level)
+  combinations — most frames here don't exercise this at all); and three
+  `refPrefix`-lifetime KATs (single-pass shortcut, the regular
+  block-by-block path, and an intervening skippable frame all correctly
+  drop the prefix after one frame, matching libzstd exactly per the
+  deviation-4 resolution above).
+
+  Two more equivalent, by the same kind of proof as the repcode-room
+  check: `readEntropyFse` building its table with the *declared* maximum
+  symbol value instead of the one `FSE_readNCount` actually read is
+  unobservable, because that value can only be smaller (the read loop is
+  bounded by the declared one), and every symbol between the two has
+  probability 0 in the returned table by construction, contributing no
+  cells to it either way. `setHistoryFrom`'s `content.len == 0` guard is
+  equivalent too: the address arithmetic it skips computes the same
   `checkContinuity` outcome (an empty `ext`) either way, since
   `prefix_addr == prev_end_addr` whenever `content.len == 0` regardless of
   which address they hold.
+
+  One mutation was hunted and not found: dropping `applyEntropy`'s
+  `st.rep = e.rep` (the dictionary's repeat offsets never actually reach
+  the decoder) survived every attempt — a hand-built dictionary with
+  distinctive repeat offsets (50/60/70, in place of the default 1/4/8
+  every `ZDICT_trainFromBuffer` dictionary here has) decoded through
+  `tools/zdec.c` identically regardless of which repeat offsets were
+  active, across 5 corpus inputs × 5 levels × content styled to match the
+  dictionary's own training vocabulary, and again through this port's own
+  differential tool across a further 150 (input, level) combinations.
+  Contrast with `lit_entropy` above (a structurally similar mutation,
+  found within roughly 50 attempts by the same kind of hunt): a dictionary
+  match landing at one of the dictionary's own specific repeat-offset
+  values, as the very first sequence of a freshly attached dictionary
+  compression, appears not to happen for `ZSTD_compress_usingDict` at any
+  level on content of the sizes tried here — plausibly because it needs
+  the encoder's very first match to coincide exactly with one of three
+  fixed distances into unrelated dictionary bytes, unlike Huffman-table
+  reuse, which the cost model can choose deliberately. Confirming this
+  would need a hand-encoded sequence bitstream (bypassing the compressor
+  entirely) rather than a compression-based hunt; not attempted this
+  round.

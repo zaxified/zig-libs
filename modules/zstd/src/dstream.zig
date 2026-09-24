@@ -258,14 +258,17 @@ pub const DecompressStream = struct {
                     // consume the header
                     d.begin();
                     if (format == .zstd1 and dec.isSkippableFrame(d.header_buffer[0..s.lh_size])) {
+                        // `ZSTD_DCtx_refPrefix`/`ZSTD_getDDict`: the "used
+                        // once" flip happens before libzstd even checks
+                        // whether the frame is skippable, so a skippable
+                        // frame DOES consume it here, same as libzstd,
+                        // even though it never gets applied to anything.
+                        d.options.prefix_once = null;
                         d.expected = dbits.readLE32(&d.header_buffer, 4);
                         d.stage = .skip_frame;
                     } else {
                         try d.decodeFrameHeader(d.header_buffer[0..s.lh_size]);
-                        // `ZSTD_DCtx_refPrefix`: used for exactly one
-                        // frame (a following skippable frame does not
-                        // consume it in this port, unlike libzstd -- see
-                        // SPEC.md, § Dictionaries).
+                        // `ZSTD_DCtx_refPrefix`: used for exactly one frame.
                         d.options.prefix_once = null;
                         d.expected = dec.block_header_size;
                         d.stage = .decode_block_header;

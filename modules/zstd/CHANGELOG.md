@@ -5,6 +5,36 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **BEHAVIOURAL, not breaking:** two Z2c corners now match
+  libzstd exactly instead of an earlier, unverified reading of it (both
+  confirmed empirically against libzstd 1.5.7 through `tools/zdec.c`, not
+  just read from its source — see SPEC.md, *Decoder*). One-shot
+  `Decompressor.decompress` with `Options.ddicts` set now fixes ONE
+  dictionary (`.ddict` if set, else `ddicts`' last entry) for content and
+  entropy across the whole call, re-selecting only each frame's dictID for
+  validation, matching libzstd's own `ZSTD_decompress_usingDDict`/
+  `ZSTD_decompressDCtx` (confirmed with five adversarial concatenated-
+  frame cases: libzstd never produced silently wrong output, only a clean
+  refusal or the correct result, so this port matches exactly rather than
+  keeping the more useful fresh-per-frame selection an earlier version
+  had). `selectDDict` no longer exempts a dictID-0 frame from `ddicts`
+  selection: libzstd's hash set uses dictID 0 as both its empty-slot
+  sentinel and a real raw-content dictionary's ID, so a dictID-0 frame
+  genuinely can match one. A `refPrefix`-lifetime KAT closes the third:
+  an intervening skippable frame consumes a one-shot `Options.prefix`,
+  same as libzstd, confirmed with a test (this one was already matched in
+  the prior entry's implementation, just not anchored by a test until
+  now). Mutation sweep of `ddict.zig` and the decoder's dictionary
+  plumbing widened from 14 to 48 mutations (every bounds/length check and
+  error branch of `loadDEntropy` and its header parsing, the content-type
+  dispatch, dictID checks and selection, history/entropy setup in
+  one-shot and streaming, `refPrefix`'s lifetime): 43 killed, 4 equivalent
+  (proven, not just asserted — see SPEC.md, *Open*), 1 hunted extensively
+  and not found (dictionary repeat-offsets never reaching the decoder;
+  SPEC.md explains why a compression-based hunt could not reach it). 8 new
+  KATs in `testdata/dict_kats.zig`, three of them the ones originally left
+  as "needs a hand-built dictionary" in the prior entry.
+
 - **2026-09-24** — **BEHAVIOURAL, not breaking:** a `CDict` of strategy
   `greedy`, `lazy`, `lazy2` or `btlazy2` is now attached where libzstd
   attaches it (inputs up to 32 KB, unknown sizes, `force_attach_dict =

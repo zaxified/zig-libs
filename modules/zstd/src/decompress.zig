@@ -403,9 +403,15 @@ pub const Options = struct {
     /// dictionary ID from this set (falling back to `ddict` when no
     /// entry matches, or to no dictionary at all if `ddict` is null too).
     /// A duplicate dictionary ID is resolved to the last matching entry.
-    /// Selected fresh for every frame (see SPEC.md for how this differs
-    /// from libzstd's own one-shot `ZSTD_decompress_usingDDict`, which
-    /// only re-validates, not re-applies, past the first frame).
+    /// **Streaming** (`DecompressStream`) selects fresh for every frame,
+    /// matching libzstd's own `ZSTD_decompressStream`. **One-shot**
+    /// (`Decompressor.decompress`) instead fixes ONE dictionary --
+    /// `ddict` if set, else this list's *last* entry -- for content and
+    /// entropy across the whole call, re-selecting only for each frame's
+    /// dictID validation: this is libzstd's own one-shot behaviour too
+    /// (`ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx`, confirmed
+    /// empirically -- see SPEC.md, *Decoder*, and `decompress`'s doc
+    /// comment), not a simplification.
     ddicts: []const *const ddict_mod.DDict = &.{},
     /// `ZSTD_DCtx_refPrefix`: forced raw content (never auto-detected as
     /// zstd-format), applied to exactly one frame, then cleared by the
@@ -537,17 +543,26 @@ pub const Decompressor = struct {
     /// `ZSTD_DDictHashSet_getDDict`, rewritten as a linear scan (this
     /// port's `ddicts` list is expected to be small; only the selected
     /// entry is observable, not how it was found) -- last match wins on a
-    /// duplicate dictionary ID, as libzstd's hash-set insertion does.
-    /// Falls back to `options.ddict` (libzstd's `ZSTD_DCtx_selectFrameDDict`
-    /// falls back to whichever `ZSTD_DCtx_refDDict` last set, which this
-    /// port has no equivalent of; see `Options.ddicts`).
+    /// duplicate dictionary ID, as libzstd's hash-set insertion does
+    /// (`ZSTD_DDictHashSet_emplaceDDict` replaces rather than adds a
+    /// second entry with the same ID). Falls back to `options.ddict`
+    /// (libzstd's `ZSTD_DCtx_selectFrameDDict` falls back to whichever
+    /// `ZSTD_DCtx_refDDict` last set, which this port has no equivalent
+    /// of; see `Options.ddicts`).
+    ///
+    /// `frame_dict_id == 0` (the common case: no dictionary named) is
+    /// searched too, not special-cased -- confirmed against libzstd, not
+    /// assumed: its hash set uses `currDictID == 0` as BOTH its
+    /// empty-slot sentinel and a real raw-content dictionary's ID (always
+    /// 0), so a `dictID`-0 frame genuinely does match whichever
+    /// raw-content `DDict` last landed at that hash bucket -- e.g. every
+    /// dictionary here, all with ID 0, collide on one bucket, and the
+    /// last-registered one wins on lookup, same as this scan gives.
     fn selectDDict(d: *const Decompressor, frame_dict_id: u32) ?*const ddict_mod.DDict {
-        if (frame_dict_id != 0) {
-            var i = d.options.ddicts.len;
-            while (i > 0) {
-                i -= 1;
-                if (d.options.ddicts[i].dictId() == frame_dict_id) return d.options.ddicts[i];
-            }
+        var i = d.options.ddicts.len;
+        while (i > 0) {
+            i -= 1;
+            if (d.options.ddicts[i].dictId() == frame_dict_id) return d.options.ddicts[i];
         }
         return d.options.ddict;
     }
@@ -561,7 +576,21 @@ pub const Decompressor = struct {
     /// Called once per frame, right after the header is parsed (so
     /// `frame_dict_id` -- and hence `ddicts` selection -- is known), and
     /// always before this frame's first real `checkContinuity`.
-    fn applyDictionary(d: *Decompressor, frame_dict_id: u32) Error!void {
+    ///
+    /// `apply_content = false` (one-shot `decompress` only, see its doc
+    /// comment): `dictionary`/`prefix_once` were already applied once for
+    /// this whole call by `applyFixedDictionary` and need no repeating
+    /// here; a `ddict`/`ddicts` frame still gets `d.dict_id` refreshed
+    /// from a fresh per-frame selection -- matching libzstd's
+    /// `ZSTD_DCtx_selectFrameDDict`, which re-validates every frame's
+    /// dictID even though it does not re-apply that dictionary's content.
+    fn applyDictionary(d: *Decompressor, frame_dict_id: u32, apply_content: bool) Error!void {
+        if (!apply_content) {
+            if (d.options.dictionary == null and d.options.prefix_once == null) {
+                if (d.selectDDict(frame_dict_id)) |dd| d.dict_id = dd.dict_id;
+            }
+            return;
+        }
         if (d.options.prefix_once) |p| {
             // forced raw content: never parsed for entropy or a
             // dictionary ID, whatever its first bytes look like
@@ -587,16 +616,51 @@ pub const Decompressor = struct {
         }
     }
 
+    /// Applies a *fixed* dictionary once per frame, for one-shot
+    /// `decompress`'s multi-frame loop: unlike `applyDictionary`'s
+    /// `ddict`/`ddicts` branch, `fixed_ddict` is resolved once before the
+    /// loop starts (see `decompress`) and reused for every frame,
+    /// regardless of what each frame's own dictID would select. Identical
+    /// to `applyDictionary(..., true)` for `dictionary`/`prefix_once`,
+    /// which have no per-frame ambiguity to begin with.
+    fn applyFixedDictionary(d: *Decompressor, fixed_ddict: ?*const ddict_mod.DDict) Error!void {
+        if (d.options.prefix_once) |p| {
+            d.setHistoryFrom(p);
+            return;
+        }
+        if (d.options.dictionary) |raw| {
+            if (raw.len < 8 or readLE32(raw, 0) != ddict_mod.magic_dictionary) {
+                d.setHistoryFrom(raw);
+                return;
+            }
+            d.dict_id = readLE32(raw, 4);
+            var e: ddict_mod.Entropy = .{};
+            const consumed = ddict_mod.loadDEntropy(&e, raw) catch return error.DictionaryCorrupted;
+            d.applyEntropy(&e);
+            d.setHistoryFrom(raw[consumed..]);
+            return;
+        }
+        if (fixed_ddict) |dd| {
+            d.dict_id = dd.dict_id;
+            if (dd.entropy_present) d.applyEntropy(&dd.entropy);
+            d.setHistoryFrom(dd.content);
+        }
+    }
+
     /// `ZSTD_decodeFrameHeader`: also applies the frame's dictionary (see
     /// `applyDictionary`) once its dictionary ID is known, before the
     /// dictID-mismatch check -- as libzstd's does with
     /// `ZSTD_DCtx_selectFrameDDict`.
     pub fn decodeFrameHeader(d: *Decompressor, header: []const u8) Error!void {
+        return d.decodeFrameHeaderImpl(header, true);
+    }
+
+    fn decodeFrameHeaderImpl(d: *Decompressor, header: []const u8, apply_content: bool) Error!void {
         d.fparams = switch (try getFrameHeaderAdvanced(header, d.options.format)) {
             .need => return error.SrcSizeWrong,
             .header => |h| h,
         };
-        try d.applyDictionary(d.fparams.dict_id);
+        try d.applyDictionary(d.fparams.dict_id, apply_content);
         if (d.fparams.dict_id != 0 and d.dict_id != d.fparams.dict_id) return error.DictionaryWrong;
         d.validate = d.fparams.checksum and !d.options.ignore_checksum;
         if (d.validate) d.xxh = .init(0);
@@ -604,8 +668,10 @@ pub const Decompressor = struct {
     }
 
     /// `ZSTD_decompressFrame`: decodes the frame at `src[ip.*..]` into
-    /// `dst[op0..]`, advancing `ip`. Returns the decoded size.
-    fn decompressFrame(d: *Decompressor, dst: []u8, op0: usize, src: []const u8, ip: *usize) Error!usize {
+    /// `dst[op0..]`, advancing `ip`. Returns the decoded size. `apply_content`
+    /// is `decodeFrameHeaderImpl`'s (one-shot `decompress` passes `false`:
+    /// it has already applied a fixed dictionary itself).
+    fn decompressFrame(d: *Decompressor, dst: []u8, op0: usize, src: []const u8, ip: *usize, apply_content: bool) Error!usize {
         const st = d.st;
         const format = d.options.format;
         var remaining = src.len - ip.*;
@@ -614,7 +680,7 @@ pub const Decompressor = struct {
         {
             const fhs = try frameHeaderSizeFormat(src[ip.*..][0..headerPrefixSize(format)], format);
             if (remaining < fhs + block_header_size) return error.SrcSizeWrong;
-            try d.decodeFrameHeader(src[ip.*..][0..fhs]);
+            try d.decodeFrameHeaderImpl(src[ip.*..][0..fhs], apply_content);
             ip.* += fhs;
             remaining -= fhs;
         }
@@ -675,17 +741,36 @@ pub const Decompressor = struct {
     /// `ZSTD_decompressDCtx`: decodes every frame in `src` (concatenated
     /// frames and skippable frames allowed) into `dst`. Returns the number
     /// of bytes written. `dst` and `src` must not overlap.
+    ///
+    /// With `Options.ddicts` set, libzstd's own one-shot
+    /// `ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx` resolves ONE
+    /// dictionary before this loop even starts -- `ZSTD_getDDict(dctx)`,
+    /// "whichever `ZSTD_DCtx_refDDict` call was last" -- and applies its
+    /// content and entropy to *every* frame; `ZSTD_d_refMultipleDDicts`
+    /// only re-validates each frame's dictID against the right `DDict` in
+    /// the set (`ZSTD_DCtx_selectFrameDDict`), it does not re-apply it.
+    /// Confirmed empirically, not just read from the source (SPEC.md,
+    /// *Decoder*): concatenated frames naming different dictionary IDs
+    /// either decode correctly (when the "wrong" fixed dictionary's
+    /// content happens not to be needed by that frame) or refuse cleanly
+    /// with `error.CorruptionDetected` -- never silently wrong output --
+    /// across every combination tried, so this port matches exactly:
+    /// `Options.ddict` if set, else the *last* entry of `Options.ddicts`
+    /// (mirroring "last ref'd"), else none, fixed for the whole call.
     pub fn decompress(d: *Decompressor, dst: []u8, src: []const u8) Error!usize {
         var ip: usize = 0;
         var op: usize = 0;
         var more_than_1_frame = false;
+        const fixed_ddict: ?*const ddict_mod.DDict = d.options.ddict orelse
+            if (d.options.ddicts.len > 0) d.options.ddicts[d.options.ddicts.len - 1] else null;
         while (src.len - ip >= headerPrefixSize(d.options.format)) {
             if (d.options.format == .zstd1 and isSkippableMagic(readLE32(src, ip))) {
                 ip += try readSkippableFrameSize(src[ip..]);
                 continue;
             }
             d.begin();
-            const res = d.decompressFrame(dst, op, src, &ip) catch |e| {
+            try d.applyFixedDictionary(fixed_ddict);
+            const res = d.decompressFrame(dst, op, src, &ip, false) catch |e| {
                 // garbage after complete frames is more likely a size error
                 if (e == error.PrefixUnknown and more_than_1_frame) return error.SrcSizeWrong;
                 return e;
