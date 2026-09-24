@@ -12,8 +12,9 @@ with libzstd's advanced parameters (see *Advanced parameters*); and a
 translated from libzstd — `fast`, `dfast`, `greedy`/`lazy`/`lazy2` over both
 the hash chain and the row-based search, `btlazy2`'s binary tree, and the
 optimal parsers `btopt`/`btultra`/`btultra2` — together with the frame/block
-driver, the block pre-splitter and post-splitter, long-distance matching as
-libzstd switches it on by itself (level 22 above 64 MB), and the entropy stage
+driver, the block pre-splitter and post-splitter, long-distance matching
+(where libzstd switches it on by itself, level 22 above 64 MB, and as the
+option `--long` is, at any level), and the entropy stage
 (literals via Huffman, sequences via FSE); see [NOTICE](NOTICE) for the
 file-by-file map.
 
@@ -31,14 +32,7 @@ Not here yet, and a reader might expect it (each is a backlog item):
   libzstd's default buffered modes, frame after frame on one context; not
   the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
-- **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8),
-  and long-distance matching as an option (Z7).** libzstd's `ZSTD_c_enableLongDistanceMatching`
-  (the CLI's `--long`) is not in `Options`: LDM happens exactly where libzstd
-  switches it on by itself. Under the optimal parsers the by-hand switch is
-  a test seam (`frame.Options.ldm`); below `btopt` LDM runs a different path
-  (its sequences spliced between runs of the block compressor,
-  `ZSTD_ldm_blockCompress`'s loop with `maybeSplitSequence` and
-  `ZSTD_ldm_fillFastTables`), which is not ported.
+- **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8).**
 
 ## Algorithm
 
@@ -99,6 +93,21 @@ libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
    resets nothing), and the candidate taken from a block's last LDM sequence
    is never offered (consuming it leaves the store exhausted, which returns
    before the candidate is added).
+   Switched on as an option (`Advanced.long_distance_matching = .enable`,
+   the CLI's `--long`), LDM runs at any level, and the window log starts
+   from 27 before the input shrinks it. Below `btopt` its sequences are not
+   candidates but taken as they come (`ZSTD_ldm_blockCompress`): the level's
+   own match finder runs over the literals before each (with its repeat
+   offsets, then the LDM offset pushed onto them), and before each run `fast` and `dfast`
+   insert every third position from `nextToUpdate` into their tables
+   (`ZSTD_ldm_fillFastTables` — with no lower bound but
+   `ZSTD_ldm_limitTableUpdate`, which after a long match keeps only the
+   last 512 positions before it). The match finders run on stretches a few
+   bytes long there, so their `iend - 8` limits saturate at 0 rather than
+   point below the stretch. libzstd's loop also cuts a sequence that runs
+   past the block's end (`maybeSplitSequence`, `ZSTD_ldm_skipSequences`);
+   that is ported but not reachable from LDM, whose sequences are generated
+   per block and end inside it — it is there for external sequences (Z10).
 5. **Post-split** (`blocksplit.zig`), `btopt` and up with a window of at least
    128 KB: the block's sequences are halved recursively (ranges of ≥ 300
    sequences, ≤ 196 splits) while the estimated sizes of the two halves, each
@@ -243,6 +252,8 @@ one parameter, null or `.auto` for "not set":
 | `literal_compression`, `row_match_finder`, `split_after_sequences` | `ZSTD_c_literalCompressionMode`, `ZSTD_c_useRowMatchFinder`, `ZSTD_c_splitAfterSequences` | auto / enable / disable |
 | `block_splitter_level` | `ZSTD_c_blockSplitterLevel` | 0–6 |
 | `max_block_size` | `ZSTD_c_maxBlockSize` | 1024–131072 |
+| `long_distance_matching` | `ZSTD_c_enableLongDistanceMatching` | auto / enable / disable |
+| `ldm_hash_log`, `ldm_min_match`, `ldm_bucket_size_log`, `ldm_hash_rate_log` | `ZSTD_c_ldmHashLog` … `ZSTD_c_ldmHashRateLog` (0 = not set) | 6–30, 4–4096, 1–8, 0–25 |
 | `StreamOptions.src_size_hint` | `ZSTD_c_srcSizeHint` | 1–2^31-1 |
 
 The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
@@ -260,7 +271,20 @@ the negative levels) as described in *Algorithm*. The block size is
 `min(max_block_size, window)`; with blocks under 128 KB the pre-splitter
 never cuts. `block_splitter_level` 1 never pre-splits, 2–6 are the
 splitter's levels 0–4 (from the borders, then by chunks), 0 picks by
-strategy. Two places consult literal compression besides the literals
+strategy. Long-distance matching `.enable` sets the window log to 27
+before the explicit parameters go over it (`ZSTD_LDM_DEFAULT_WINDOW_LOG`);
+`.auto` decides from the final parameters (`btopt` and up with a window log
+of 27 or more, `ZSTD_resolveEnableLdm`), so an explicit `window_log` of 27
+turns it on under the optimal parsers, and so does a stream of unknown size
+there. The LDM parameters left unset are derived by
+`ZSTD_ldm_adjustParameters`: the hash rate from the hash log when that is
+set (window log − hash log, or 0 when the table is not smaller than the
+window: then every position is a split point), else 7 − strategy/3; the
+hash log from the rate, window log − rate bounded to 6–30 — in libzstd's
+unsigned arithmetic, so a rate above the window log (which the input can
+have shrunk) wraps to a hash log of 30, a table of 8 GB, exactly as libzstd
+allocates it; the minimum match 64, 32 from `btultra`; the bucket log the
+strategy bounded to 4–8, and never above the hash log. Two places consult literal compression besides the literals
 section itself: the optimal parsers price a literal at 8 bits and keep no
 literal statistics when it is disabled (`ZSTD_compressedLiterals`), and the
 post-splitter's size estimate stores the literals raw.
@@ -275,7 +299,7 @@ decoder knows no skippable frames. `writeSkippableFrame` writes one
 Not here, each with its backlog item: `ZSTD_c_dictIDFlag`,
 `deterministicRefPrefix`, `forceMaxWindow`, `forceAttachDict`,
 `enableDedicatedDictSearch`, `prefetchCDictTables` (they act on
-dictionaries: Z4); the LDM switch and parameters (Z7); `targetCBlockSize`
+dictionaries: Z4); `targetCBlockSize`
 (Z8); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
@@ -556,8 +580,8 @@ offsets btopt surcharges), and 33 survive:
 Long-distance matching (level 22) got its own sweep on 2026-09-22: 47
 mutations of `ldm.zig`, the LDM candidate code in `opt.zig`, the LDM switch
 and the by-hand window in `params.zig`. The golden set can only reach LDM
-through the by-hand seam (`frame.Options.ldm`, libzstd's
-`ZSTD_c_enableLongDistanceMatching`), because it switches itself on only
+switched on by hand (then a test seam, since Z7 `Advanced.long_distance_matching`;
+libzstd's `ZSTD_c_enableLongDistanceMatching`), because it switches itself on only
 above 64 MB; so the 5 cases that first carried it were inputs where LDM
 changes the output at all. 16 mutations were caught by those, 1 by a unit
 test added for it (LDM on from exactly 64 MB + 1 byte), 12 by 10 cases the
@@ -571,6 +595,21 @@ the 140 MB comparison below, and 16 survive:
 | LDM window raising neither `lowLimit` nor `dictLimit` | reached only past 128 MB of input (window log 27); caught by `zref` on a 140 MB input whose last 10 MB repeat its first at a distance of 130 MB — the module's output matches libzstd's, both mutants do not |
 | hash log floor 6 → 7; `srcSize < minMatchLength` → `<=`; `literalsBytesRemaining >= blockBytesRemaining` → `>`; a candidate cut at the block end `>` → `>=`, or skipping its full length; the candidate's initial end position | equivalent: at a 1 KB window (the only place the floor binds) the table is one bucket that fewer than 64 splits never fill; a chunk of exactly the minimum length has no byte left to hash; at the equality the candidate starts and ends at the block end, where no position lies, and the store is discarded with the block; the first fetch overwrites the initial value |
 | backward extension stopping one byte above the prefix start; the last hashable byte (`ilimit`) one further; a split exactly at the previous match's end searched (`split < anchor` → `<=`); a table entry exactly at the lowest valid index; an overlapping match that ends exactly where hashing stopped (`>` → `>=`); continuing the batch after skipping an overlap; a batch of 32; another XXH64 seed; the checksum from bits 31..62; a candidate of exactly `minMatch` | reachable in principle; four minutes of seed search each (about 2 000 inputs of 3–600 KB at levels 16–22, 300 000 of 40 B–2.5 KB for the two small-window ones) did not hit one. The index equality needs the window past 128 MB. **Uncovered.** |
+
+Long-distance matching as an option (Z7, 2026-09-24) got 38 mutations of
+the LDM path below `btopt` (`ldm.blockCompress` and its helpers, the table
+fills in `match.zig`, the saturated limits), the parameter derivation, the
+bounds and the switch. 19 were caught by the cases first written for it, 6
+by 2 cases a search over corpus inputs, LDM parameters and schedules found
+(original against mutant), and 2 — `fast`/`dfast` on a stretch ending below
+index 8, where libzstd's `iend - 8` goes below zero — by a test on a fresh
+context (the golden tests reuse one, so their frames never start at index
+2). 11 survive:
+
+| mutation | why no case exists |
+|---|---|
+| `maybeSplitSequence` and `ZSTD_ldm_skipSequences`: every comparison at its equality, the cut match's `minMatch` test, the carry of a too-short match into the next sequence's literals, the skip dropped (8) | unreachable from LDM: its sequences are generated per block, counted only up to the block's end, and the store is discarded with the block, so no sequence runs past the end and the loop leaves when the store is empty. A panic on that path did not fire in 4 128 hunted inputs and schedules. They wait for external sequences (Z10) |
+| the loop's `ip < iend` dropped; `rep[2]` not pushed down after an LDM sequence; the hash rate derived from the hash log also at equality (`>` → `>=`) | equivalent: the store empties exactly at the block's end; below `btopt` no match finder reads the third repcode (the optimal parsers and the post-splitter, which do, take LDM matches as candidates instead); at equality the rate is 0 either way |
 
 Index overflow correction (2026-09-23) is invisible in the output by design,
 so the golden test also demands, for every `ocf` case, a nonzero correction
@@ -881,12 +920,9 @@ dictionaries are undecided.
   splitters, the block size, the size hint. Moved out: the dictID flag
   (Z4, it has no effect without a dictionary) and
   `searchForExternalRepcodes` (Z10, it acts on external sequences only).
-- **Z7 — Long-distance matching as an option** (`--long`, window log 27 by
-  default): the path below `btopt` (`ZSTD_ldm_blockCompress`'s splicing
-  loop, `maybeSplitSequence`, `ZSTD_ldm_skipSequences`,
-  `ZSTD_ldm_fillFastTables` with `ZSTD_fillHashTable` /
-  `ZSTD_fillDoubleHashTable`), and the LDM parameters. The optimal-parser
-  path exists (level 22). **~0.5 session.**
+- ~~**Z7 — Long-distance matching as an option.**~~ Done 2026-09-24, see
+  *Algorithm* and *Advanced parameters*: the switch and the four LDM
+  parameters, and the path below `btopt`.
 - **Z8 — `targetCBlockSize`** (superblocks, `zstd_compress_superblock.c`,
   ~700 lines): blocks cut to a target compressed size for low-latency
   streaming. **~1 session.** After Z1.
@@ -914,7 +950,7 @@ dictionaries are undecided.
   `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
   `CDict` attached or copied into a reused context.
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13 done) Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7 done) Z11 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 

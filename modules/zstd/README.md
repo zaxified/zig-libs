@@ -23,7 +23,8 @@ It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 lazily sorted binary tree), and the optimal parsers `btopt`, `btultra` and
 `btultra2`; plus the one-shot frame and block driver, the block pre-splitter
 and post-splitter, long-distance matching (which libzstd switches on by
-itself at level 22 for inputs over 64 MB), and the Huffman/FSE entropy
+itself at level 22 for inputs over 64 MB, and at any level as the option
+`--long` does), and the Huffman/FSE entropy
 encoders. Pure Zig, no C, no
 libc.
 
@@ -191,11 +192,17 @@ const frame = try zstd.compressAlloc(gpa, data, .{ .level = 19, .advanced = .{
     .format = .magicless, // ZSTD_c_format: decode with DecompressOptions.format
     .row_match_finder = .disable, // .auto / .enable / .disable
     .max_block_size = 16 * 1024, // ZSTD_c_maxBlockSize
+    .long_distance_matching = .enable, // ZSTD_c_enableLongDistanceMatching (--long)
 } });
 ```
 
 Also `literal_compression`, `split_after_sequences` (the post-splitter),
-`block_splitter_level` (the pre-splitter, 0–6); `Stream` takes the same
+`block_splitter_level` (the pre-splitter, 0–6), and the long-distance
+matcher's `ldm_hash_log`, `ldm_min_match`, `ldm_bucket_size_log`,
+`ldm_hash_rate_log` (0 or null: derived, as libzstd does). Long-distance
+matching on sets the window log to 27 (128 MB) unless `window_log` says
+otherwise, so a stream of unknown size buffers that much; the input's size
+shrinks it in one-shot and pledged frames; `Stream` takes the same
 `advanced` plus `src_size_hint` (`ZSTD_c_srcSizeHint`: parameters for an
 unknown size chosen as for about that many bytes), and so does
 `FrameWriter`. A value outside libzstd's bounds is
@@ -217,8 +224,8 @@ generated, so the repository stores none) is compressed at levels -5, -1 and
 (`src/testdata/goldens.zig`, written by `tools/gen-goldens.sh`). The corpus
 is built for coverage: each size tier of the level table, RLE blocks, literal
 and match lengths past 0xFFFF, both pre-splitters, the post-splitter, offsets
-beyond the window, long-distance matching (switched on by hand through a
-test seam, as it only switches itself on above 64 MB), and cases constructed
+beyond the window, long-distance matching (switched on through
+`Advanced.long_distance_matching`, as it only switches itself on above 64 MB), and cases constructed
 so that specific decisions are marginal (see SPEC.md, *Anchoring*). All
 the frames come from one reused context, so every golden also checks
 context reuse (libzstd gives a reused context's frames the same bytes as a
@@ -226,18 +233,18 @@ fresh one's). The module is `heavy` in `build.zig`:
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
-`src/stream_test.zig` does the same for streaming: 62 cases, each a schedule of calls
+`src/stream_test.zig` does the same for streaming: 65 cases, each a schedule of calls
 (pledged and unknown sizes, flushes, 50-byte outputs, windows down to 1 KB
 so libzstd's input buffer wraps, index overflow correction run often, long-distance
 matching switched on by hand; 24 of them found by mutation testing) over
-corpus inputs at levels -5 … 22, with and without checksum — 534 streams,
+corpus inputs at levels -5 … 22, with and without checksum — 562 streams,
 each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 (`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
 
-`src/param_test.zig` does it for the advanced parameters: 37 cases (an
-input, a `name=value` list of libzstd parameters, levels) — 67 frames equal
+`src/param_test.zig` does it for the advanced parameters: 50 cases (an
+input, a `name=value` list of libzstd parameters, levels) — 95 frames equal
 to what `ZSTD_compress2` produced with the same parameters set
-(`src/testdata/param_goldens.zig`); 8 more stream cases carry parameters
+(`src/testdata/param_goldens.zig`); 9 more stream cases carry parameters
 too. It also pins the bounds of every parameter, magicless frames both ways
 and the content-size flag.
 

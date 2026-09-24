@@ -63,14 +63,16 @@ same; comparing against a single derivation gives false mismatches.
 
 Long-distance matching switches itself on only at level 22 above 64 MB. To
 reach it on a small input, switch it on by hand on both sides (strategy 0
-keeps the level's own):
+keeps the level's own), at any level:
 
     "$R/zref" <level> 0 in.bin ref.zst 0 1        # ZSTD_c_enableLongDistanceMatching
-    # module side: frame.compress(..., .{ .level = L, .checksum = false,
-    #     .ldm = true }); btopt and up only (levels 16+, or a forced strategy)
+    "$R/zref" <level> 0 in.bin ref.zst 0 0 0 enableLongDistanceMatching=1,ldmMinMatch=16
+    # module side: .advanced = .{ .long_distance_matching = .enable, .ldm_min_match = 16 }
 
 By hand, libzstd first resets the window log to 27 and only then shrinks it to
-the input; `params.getOverridden` does the same.
+the input; `params.getOverridden` does the same. Keep `ldmHashRateLog` at or
+below the (shrunk) window log unless `ldmHashLog` is set too: above it the
+hash log wraps to 30 and both sides allocate an 8 GB table.
 
 Index overflow correction happens by itself only once an index passes
 `ZSTD_CURRENT_MAX` (3500 MiB). libzstd's fuzzing build corrects whenever it

@@ -361,6 +361,36 @@ const prime6: u64 = 227718039650203;
 const prime7: u64 = 58295818150454627;
 const prime8: u64 = 0xCF1BBCDCB7A56463;
 
+// saturated_limit: long-distance matching (`ldm.blockCompress`) runs the
+// match finders over the literals between its matches, which can be a few
+// bytes at the window's first indices. libzstd's `iend - HASH_READ_SIZE`
+// then points below `istart`; saturating at 0 keeps it below every index
+// (they start at 2), so each comparison comes out the same.
+
+/// `ZSTD_fillHashTableForCCtx` (`ZSTD_dtlm_fast`): every third position
+/// from `next_to_update` into the hash table, up to `end`. Long-distance
+/// matching calls it before it runs `fast` on a stretch of literals.
+pub fn fillHashTable(ms: *MatchState, end: usize) void {
+    const fill_step = 3;
+    var ip: usize = ms.next_to_update;
+    // `ip + fastHashFillStep < iend + 2`, iend = end - HASH_READ_SIZE
+    while (ip + fill_step + hash_read_size < end + 2) : (ip += fill_step)
+        ms.hash_table[ms.hash(ip, ms.cp.hash_log, ms.cp.min_match)] = @intCast(ip);
+}
+
+/// `ZSTD_fillDoubleHashTableForCCtx` (`ZSTD_dtlm_fast`): every third
+/// position from `next_to_update` into both of `dfast`'s tables, up to
+/// `end`.
+pub fn fillDoubleHashTable(ms: *MatchState, end: usize) void {
+    const fill_step = 3;
+    var ip: usize = ms.next_to_update;
+    // `ip + fastHashFillStep - 1 <= iend`, iend = end - HASH_READ_SIZE
+    while (ip + fill_step - 1 + hash_read_size <= end) : (ip += fill_step) {
+        ms.chain_table[ms.hash(ip, ms.cp.chain_log, ms.cp.min_match)] = @intCast(ip);
+        ms.hash_table[ms.hash(ip, ms.cp.hash_log, 8)] = @intCast(ip);
+    }
+}
+
 /// Compress one block with the strategy in `ms.cp`. Stores sequences into
 /// `ss`, updates `rep`, and returns the number of trailing literals.
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
@@ -412,7 +442,7 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
     const prefix_start_index = ms.lowestPrefixIndex(end_index);
     const prefix_start: usize = prefix_start_index;
     const iend: usize = end_index;
-    const ilimit: usize = iend - hash_read_size;
+    const ilimit: usize = iend -| hash_read_size; // see `saturated_limit`
 
     var anchor: usize = istart;
     var ip0: usize = istart;
@@ -571,7 +601,7 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
     const prefix_lowest_index = ms.lowestPrefixIndex(end_index);
     const prefix_lowest: usize = prefix_lowest_index;
     const iend: usize = end_index;
-    const ilimit: usize = iend - hash_read_size;
+    const ilimit: usize = iend -| hash_read_size; // see `saturated_limit`
     var offset_1: u32 = rep[0];
     var offset_2: u32 = rep[1];
     var offset_saved1: u32 = 0;
@@ -757,7 +787,7 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
     const dict_start: usize = dict_start_index;
     const dict_end: usize = prefix_start_index; // the extDict's end, as an index
     const iend: usize = end_index;
-    const ilimit: usize = iend - 8;
+    const ilimit: usize = iend -| 8; // see `saturated_limit`
     var offset_1: u32 = rep[0];
     var offset_2: u32 = rep[1];
     var offset_saved1: u32 = 0;
@@ -940,7 +970,7 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
     var ip: usize = istart;
     var anchor: usize = istart;
     const iend: usize = @as(usize, istart) + src_size;
-    const ilimit: usize = iend - 8;
+    const ilimit: usize = iend -| 8; // see `saturated_limit`
     const end_index: u32 = istart + src_size;
     const low_limit = ms.lowestMatchIndex(end_index);
     const dict_start_index = low_limit;

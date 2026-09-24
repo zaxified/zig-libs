@@ -68,8 +68,7 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes
             const n = try ctx.compressFrame(dst, src, .{
                 .level = level,
                 .checksum = ck,
-                .ldm = case.ldm,
-                .advanced = .{ .window_log = case.window_log },
+                .advanced = .{ .window_log = case.window_log, .long_distance_matching = if (case.ldm) .enable else .auto },
                 .overflow_correct_frequently = case.ocf,
                 .overflow_corrections = &corrections,
             });

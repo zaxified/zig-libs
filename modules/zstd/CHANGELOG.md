@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Long-distance matching as an option (SPEC backlog Z7):
+  `Advanced.long_distance_matching` (`ZSTD_c_enableLongDistanceMatching`,
+  the CLI's `--long`; `.enable` starts the window log from 27) and
+  `ldm_hash_log`, `ldm_min_match`, `ldm_bucket_size_log`,
+  `ldm_hash_rate_log` with libzstd's bounds and derivation. Below `btopt`
+  the LDM sequences are taken as they come and the level's match finder
+  runs between them (`ZSTD_ldm_blockCompress`, `maybeSplitSequence`,
+  `ZSTD_ldm_skipSequences`, `ZSTD_ldm_fillFastTables` with
+  `ZSTD_fillHashTable` / `ZSTD_fillDoubleHashTable`), one-shot and
+  streaming over a two-segment window. The test seams `frame.Options.ldm`
+  and `Stream.ldm` are gone (the option replaces them). 13 parameter and 3
+  stream cases (28 frames, 28 streams) byte-identical to libzstd 1.5.7;
+  3 800 random one-shot and streamed inputs (levels −30…22, random LDM
+  and match parameters, windows down to 1 KB) identical on the first run.
+  `zref.c` / `zstream.c` take the LDM parameters by name. A 38-mutation
+  sweep: 27 caught, 8 unreachable (the sequence cut at a block's end, which
+  LDM's per-block sequences never need), 3 equivalent.
+
 - **2026-09-24** — Context reuse and sizing (SPEC backlog Z13):
   `zstd.Compressor` (a reusable `ZSTD_CCtx` for one-shot frames), and
   `Stream` goes on after the end of a frame with the next one (unknown

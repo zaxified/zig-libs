@@ -10,7 +10,7 @@
  * Strategy 0 leaves the level's own. With ldm 1, long-distance matching is
  * switched on by hand (ZSTD_c_enableLongDistanceMatching), which reaches it
  * far below the 64 MB where level 22 switches it on; the counterpart is
- * `frame.Options.ldm`. A nonzero window log is set through ZSTD_c_windowLog
+ * `zstd.Advanced.long_distance_matching = .enable`. A nonzero window log is set through ZSTD_c_windowLog
  * (`zstd.Advanced.window_log`). `params` is a comma-separated list of
  * advanced parameters by libzstd's names, `name=value` (`windowLog=12,
  * useRowMatchFinder=1`; switches 0 auto, 1 enable, 2 disable), the module's
@@ -49,6 +49,11 @@ static struct { char const* name; ZSTD_cParameter p; } const params[] = {
     { "splitAfterSequences", ZSTD_c_splitAfterSequences },
     { "blockSplitterLevel", ZSTD_c_blockSplitterLevel },
     { "maxBlockSize", ZSTD_c_maxBlockSize },
+    { "enableLongDistanceMatching", ZSTD_c_enableLongDistanceMatching },
+    { "ldmHashLog", ZSTD_c_ldmHashLog },
+    { "ldmMinMatch", ZSTD_c_ldmMinMatch },
+    { "ldmBucketSizeLog", ZSTD_c_ldmBucketSizeLog },
+    { "ldmHashRateLog", ZSTD_c_ldmHashRateLog },
     { "srcSizeHint", ZSTD_c_srcSizeHint },
 };
 

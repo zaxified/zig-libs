@@ -13,7 +13,8 @@
  *   fN   ZSTD_e_flush, likewise
  *   eN   ZSTD_e_end, likewise; ends the schedule
  *   l    long-distance matching switched on by hand
- *        (ZSTD_c_enableLongDistanceMatching; the module's `Stream.ldm`)
+ *        (ZSTD_c_enableLongDistanceMatching; the module's
+ *        `Advanced.long_distance_matching = .enable`)
  *   x    index overflow corrected whenever it safely can: only accepted by a
  *        build with -DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1 (the
  *        module's `Stream.overflow_correct_frequently`)
@@ -53,6 +54,11 @@ static struct { char const* name; ZSTD_cParameter p; } const params[] = {
     { "splitAfterSequences", ZSTD_c_splitAfterSequences },
     { "blockSplitterLevel", ZSTD_c_blockSplitterLevel },
     { "maxBlockSize", ZSTD_c_maxBlockSize },
+    { "enableLongDistanceMatching", ZSTD_c_enableLongDistanceMatching },
+    { "ldmHashLog", ZSTD_c_ldmHashLog },
+    { "ldmMinMatch", ZSTD_c_ldmMinMatch },
+    { "ldmBucketSizeLog", ZSTD_c_ldmBucketSizeLog },
+    { "ldmHashRateLog", ZSTD_c_ldmHashRateLog },
     { "srcSizeHint", ZSTD_c_srcSizeHint },
 };
 

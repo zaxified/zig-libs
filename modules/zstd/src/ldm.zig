@@ -6,35 +6,28 @@
 //! each split's `minMatchLength` preceding bytes are hashed with XXH64 into a
 //! bucketed table of (index, checksum). A split whose checksum is found again
 //! extends forwards and backwards into a long match, and the block's matches
-//! become raw sequences. Only the optimal parsers consume them here, as extra
-//! candidates next to their own binary-tree matches (`ZSTD_ldm_blockCompress`
-//! for `strategy >= btopt`) -- that is the only way libzstd turns LDM on by
-//! itself: `ZSTD_resolveEnableLdm`, window log 27 and up, which only level 22
-//! reaches (inputs over 64 MB). The path that splices LDM sequences between
-//! runs of the other strategies (`maybeSplitSequence`, `fillFastTables`)
-//! exists only for LDM switched on by hand and is not carried.
+//! become raw sequences. The optimal parsers take them as extra candidates
+//! next to their own binary-tree matches; every other strategy takes each
+//! of them as it comes, compressing only the literals between them with its
+//! own match finder (`blockCompress`). libzstd turns LDM on by itself only
+//! for `btopt` and up with a window log of 27 or more (`resolve`), which
+//! only level 22 reaches (inputs over 64 MB); `Advanced.long_distance_matching`
+//! turns it on for any level.
 //!
-//! The whole input is one contiguous prefix (no dictionary, no extDict), so the
-//! two-segment match counters are not needed either.
+//! A stream's window can be in two segments (extDict); the LDM state keeps
+//! its own window, like the match state's, and counts matches across both.
 
 const std = @import("std");
 const params = @import("params.zig");
 const match = @import("match.zig");
+const sequences = @import("sequences.zig");
 
 /// `LDM_BUCKET_SIZE_LOG`.
-const bucket_size_log_default = 4;
+const bucket_size_log_default: u32 = 4;
 /// `LDM_MIN_MATCH_LENGTH`.
-const min_match_length_default = 64;
-/// `ZSTD_LDM_BUCKETSIZELOG_MAX`.
-const bucket_size_log_max = 8;
-/// `ZSTD_HASHLOG_MIN` / `ZSTD_HASHLOG_MAX` (64-bit).
-const hash_log_min = 6;
-const hash_log_max = 30;
+const min_match_length_default: u32 = 64;
 /// `LDM_BATCH_SIZE`: splits gathered before their buckets are searched.
 const batch_size = 64;
-/// `ZSTD_LDM_DEFAULT_WINDOW_LOG` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT`): the window
-/// log libzstd starts from when LDM is switched on by hand.
-pub const default_window_log = 27;
 
 /// `ldmParams_t` once `ZSTD_ldm_adjustParameters` has filled it in.
 pub const Params = struct {
@@ -45,21 +38,39 @@ pub const Params = struct {
     hash_rate_log: u32,
 };
 
-/// `ZSTD_resolveEnableLdm` for the default (auto) mode.
-pub fn enabledByDefault(cp: params.CParams) bool {
-    return @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt) and cp.window_log >= 27;
+/// `ZSTD_resolveEnableLdm`: whether LDM runs with the frame's final
+/// parameters `cp`.
+pub fn resolve(mode: params.Switch, cp: params.CParams) bool {
+    return switch (mode) {
+        .enable => true,
+        .disable => false,
+        .auto => @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt) and cp.window_log >= 27,
+    };
 }
 
-/// `ZSTD_ldm_adjustParameters` from all-zero (default) LDM parameters.
-pub fn adjustParameters(cp: params.CParams) Params {
+/// `ZSTD_ldm_adjustParameters`: the LDM parameters `adv` leaves unset
+/// (null or 0), derived from the frame's parameters and the others.
+pub fn adjustParameters(cp: params.CParams, adv: params.Advanced) Params {
     const strategy = @intFromEnum(cp.strategy);
     const window_log = cp.window_log;
-    // mapping from [fast, rate7] to [btultra2, rate4]
-    const hash_rate_log = 7 - strategy / 3;
-    const hash_log = std.math.clamp(window_log -| hash_rate_log, hash_log_min, hash_log_max);
-    var min_match_length: u32 = min_match_length_default;
-    if (strategy >= @intFromEnum(params.Strategy.btultra)) min_match_length /= 2;
-    const bucket_size_log = std.math.clamp(strategy, bucket_size_log_default, bucket_size_log_max);
+    var hash_rate_log = params.nonZero(adv.ldm_hash_rate_log) orelse 0;
+    var hash_log = params.nonZero(adv.ldm_hash_log) orelse 0;
+    if (hash_rate_log == 0) {
+        if (hash_log > 0) {
+            // if params->hashLog is set, derive hashRateLog from it
+            if (window_log > hash_log) hash_rate_log = window_log - hash_log;
+        } else {
+            // mapping from [fast, rate7] to [btultra2, rate4]
+            hash_rate_log = 7 - strategy / 3;
+        }
+    }
+    // (unsigned in libzstd: a rate above the window log wraps, and the
+    // table takes the largest size)
+    if (hash_log == 0) hash_log = std.math.clamp(window_log -% hash_rate_log, params.hash_log_min, params.hash_log_max);
+    const min_match_length = params.nonZero(adv.ldm_min_match) orelse
+        if (strategy >= @intFromEnum(params.Strategy.btultra)) min_match_length_default / 2 else min_match_length_default;
+    const bucket_size_log = params.nonZero(adv.ldm_bucket_size_log) orelse
+        std.math.clamp(strategy, bucket_size_log_default, params.ldm_bucket_size_log_max);
     return .{
         .window_log = window_log,
         .hash_log = hash_log,
@@ -107,7 +118,124 @@ pub const RawSeqStore = struct {
         }
         if (curr_pos == 0 or s.pos == s.size) s.pos_in_sequence = 0;
     }
+
+    /// `ZSTD_ldm_skipSequences`: consume `src_size` bytes of the sequences,
+    /// shortening the one they end in; a match left shorter than
+    /// `min_match` turns into literals of the next sequence.
+    pub fn skipSequences(s: *RawSeqStore, src_size_in: usize, min_match: u32) void {
+        var src_size = src_size_in;
+        while (src_size > 0 and s.pos < s.size) {
+            const seq = &s.seq[s.pos];
+            if (src_size <= seq.lit_length) {
+                // Skip past srcSize literals
+                seq.lit_length -= @intCast(src_size);
+                return;
+            }
+            src_size -= seq.lit_length;
+            seq.lit_length = 0;
+            if (src_size < seq.match_length) {
+                // Skip past the first srcSize of the match
+                seq.match_length -= @intCast(src_size);
+                if (seq.match_length < min_match) {
+                    // The match is too short, omit it
+                    if (s.pos + 1 < s.size) s.seq[s.pos + 1].lit_length += seq.match_length;
+                    s.pos += 1;
+                }
+                return;
+            }
+            src_size -= seq.match_length;
+            seq.match_length = 0;
+            s.pos += 1;
+        }
+    }
+
+    /// `maybeSplitSequence`: the next sequence, cut short where it runs
+    /// past the `remaining` bytes of the block (the rest goes to the next
+    /// block). An `offset` of 0 means the rest of the block is literals.
+    fn maybeSplitSequence(s: *RawSeqStore, remaining: u32, min_match: u32) RawSeq {
+        var seq = s.seq[s.pos];
+        std.debug.assert(seq.offset > 0);
+        // Likely: No partial sequence
+        if (remaining >= seq.lit_length + seq.match_length) {
+            s.pos += 1;
+            return seq;
+        }
+        // Cut the sequence short (offset == 0 ==> rest is literals).
+        if (remaining <= seq.lit_length) {
+            seq.offset = 0;
+        } else if (remaining < seq.lit_length + seq.match_length) {
+            seq.match_length = remaining - seq.lit_length;
+            if (seq.match_length < min_match) seq.offset = 0;
+        }
+        // Skip past `remaining` bytes for the future sequences.
+        s.skipSequences(remaining, min_match);
+        return seq;
+    }
 };
+
+/// `ZSTD_ldm_blockCompress`: the block at indices `istart`..`istart +
+/// src_size` with its long-distance matches in `store`. The optimal
+/// parsers weigh them against their own; every other strategy takes each
+/// one, running its match finder over the literals before it. Returns the
+/// trailing literals, as `match.compressBlock` does.
+pub fn blockCompress(store: *RawSeqStore, ms: *match.MatchState, ss: *sequences.SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
+    // If using opt parser, use LDMs only as candidates rather than always
+    // accepting them
+    if (@intFromEnum(ms.cp.strategy) >= @intFromEnum(params.Strategy.btopt)) {
+        ms.ldm_seq_store = store;
+        defer ms.ldm_seq_store = null;
+        const last_ll = match.compressBlock(ms, ss, rep, istart, src_size);
+        store.skipBytes(src_size);
+        return last_ll;
+    }
+
+    const min_match = ms.cp.min_match;
+    const iend: usize = @as(usize, istart) + src_size;
+    var ip: usize = istart;
+    // Loop through each sequence and apply the block compressor to the literals
+    while (store.pos < store.size and ip < iend) {
+        const seq = store.maybeSplitSequence(@intCast(iend - ip), min_match);
+        // End signal
+        if (seq.offset == 0) break;
+        std.debug.assert(ip + seq.lit_length + seq.match_length <= iend);
+        // Fill tables for block compressor
+        limitTableUpdate(ms, ip);
+        fillFastTables(ms, ip);
+        // Run the block compressor
+        const new_lit_length = match.compressBlock(ms, ss, rep, @intCast(ip), seq.lit_length);
+        ip += seq.lit_length;
+        // Update the repcodes
+        rep[2] = rep[1];
+        rep[1] = rep[0];
+        rep[0] = seq.offset;
+        // Store the sequence
+        ss.store(ms.bytes(ip - new_lit_length, ip), seq.offset + sequences.rep_num, seq.match_length);
+        ip += seq.match_length;
+    }
+    // Fill the tables for the block compressor
+    limitTableUpdate(ms, ip);
+    fillFastTables(ms, ip);
+    // Compress the last literals
+    return match.compressBlock(ms, ss, rep, @intCast(ip), @intCast(iend - ip));
+}
+
+/// `ZSTD_ldm_limitTableUpdate`: after a long match, the match finder
+/// inserts only the last positions before `anchor`.
+fn limitTableUpdate(ms: *match.MatchState, anchor: usize) void {
+    const curr: u32 = @intCast(anchor);
+    if (curr > ms.next_to_update + 1024)
+        ms.next_to_update = curr - @min(512, curr - ms.next_to_update - 1024);
+}
+
+/// `ZSTD_ldm_fillFastTables`: `fast` and `dfast` fill their tables here up
+/// to `end` (the other strategies fill theirs while they search).
+fn fillFastTables(ms: *match.MatchState, end: usize) void {
+    switch (ms.cp.strategy) {
+        .fast => match.fillHashTable(ms, end),
+        .dfast => match.fillDoubleHashTable(ms, end),
+        else => {},
+    }
+}
 
 /// `ldmEntry_t`: offset 0 is an empty slot (indices start at 2).
 pub const Entry = struct { offset: u32 = 0, checksum: u32 = 0 };
@@ -463,20 +591,38 @@ const GearState = struct {
 test "level 22 above 64 MB: the parameters libzstd derives" {
     // btultra2, windowLog 27: rate 7 - 9/3, table 2^(27-4), bucket
     // clamp(9, 4, 8), half of the default minimum match
-    const p = adjustParameters(params.get(22, 100 << 20));
+    const p = adjustParameters(params.get(22, 100 << 20), .{});
     try std.testing.expectEqual(Params{ .window_log = 27, .hash_log = 23, .bucket_size_log = 8, .min_match_length = 32, .hash_rate_log = 4 }, p);
     try std.testing.expectEqual(@as(usize, 4096), maxNbSeq(p, 128 * 1024));
 }
 
 test "level 22 switches LDM on from one byte over 64 MB" {
-    try std.testing.expect(!enabledByDefault(params.get(22, 1 << 26)));
-    try std.testing.expect(enabledByDefault(params.get(22, (1 << 26) + 1)));
-    try std.testing.expect(!enabledByDefault(params.get(21, 1 << 30)));
+    try std.testing.expect(!resolve(.auto, params.get(22, 1 << 26)));
+    try std.testing.expect(resolve(.auto, params.get(22, (1 << 26) + 1)));
+    try std.testing.expect(!resolve(.auto, params.get(21, 1 << 30)));
+    try std.testing.expect(!resolve(.disable, params.get(22, (1 << 26) + 1)));
+    try std.testing.expect(resolve(.enable, params.get(1, 1000)));
 }
 
 test "btopt keeps the default minimum match and a bucket of 2^strategy" {
     const cp: params.CParams = .{ .window_log = 20, .chain_log = 20, .hash_log = 20, .search_log = 5, .min_match = 4, .target_length = 64, .strategy = .btopt };
-    try std.testing.expectEqual(Params{ .window_log = 20, .hash_log = 15, .bucket_size_log = 7, .min_match_length = 64, .hash_rate_log = 5 }, adjustParameters(cp));
+    try std.testing.expectEqual(Params{ .window_log = 20, .hash_log = 15, .bucket_size_log = 7, .min_match_length = 64, .hash_rate_log = 5 }, adjustParameters(cp, .{}));
+}
+
+test "LDM parameters set by hand, and the ones derived from them" {
+    const cp: params.CParams = .{ .window_log = 20, .chain_log = 16, .hash_log = 17, .search_log = 1, .min_match = 5, .target_length = 0, .strategy = .fast };
+    // a hash log sets the rate: one split per 2^(window - hash) bytes
+    try std.testing.expectEqual(Params{ .window_log = 20, .hash_log = 12, .bucket_size_log = 4, .min_match_length = 64, .hash_rate_log = 8 }, adjustParameters(cp, .{ .ldm_hash_log = 12 }));
+    // ... and none when the table is as large as the window
+    try std.testing.expectEqual(@as(u32, 0), adjustParameters(cp, .{ .ldm_hash_log = 20 }).hash_rate_log);
+    try std.testing.expectEqual(@as(u32, 1), adjustParameters(cp, .{ .ldm_hash_log = 19 }).hash_rate_log);
+    // a rate sets the hash log; one past the window log wraps to the largest
+    try std.testing.expectEqual(@as(u32, 15), adjustParameters(cp, .{ .ldm_hash_rate_log = 5 }).hash_log);
+    try std.testing.expectEqual(@as(u32, params.hash_log_max), adjustParameters(cp, .{ .ldm_hash_rate_log = 21 }).hash_log);
+    // the bucket never exceeds the table; 0 is "not set"
+    try std.testing.expectEqual(@as(u32, 6), adjustParameters(cp, .{ .ldm_hash_log = 6, .ldm_bucket_size_log = 8 }).bucket_size_log);
+    try std.testing.expectEqual(Params{ .window_log = 20, .hash_log = 13, .bucket_size_log = 4, .min_match_length = 64, .hash_rate_log = 7 }, adjustParameters(cp, .{ .ldm_hash_log = 0, .ldm_min_match = 0, .ldm_bucket_size_log = 0, .ldm_hash_rate_log = 0 }));
+    try std.testing.expectEqual(@as(u32, 4096), adjustParameters(cp, .{ .ldm_min_match = 4096 }).min_match_length);
 }
 
 test "the stop mask takes the highest bits a match can depend on" {

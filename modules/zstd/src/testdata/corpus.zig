@@ -25,7 +25,7 @@ pub const Case = struct {
     /// the checksum variant: a large input kept for one optimal-parser path.
     only_levels: []const i32 = &.{},
     /// Compressed with long-distance matching switched on by hand
-    /// (`frame.Options.ldm`, libzstd's `ZSTD_c_enableLongDistanceMatching`),
+    /// (`Advanced.long_distance_matching`, libzstd's `ZSTD_c_enableLongDistanceMatching`),
     /// which reaches LDM far below the 64 MB where level 22 switches it on.
     /// Needs `only_levels` (btopt and up).
     ldm: bool = false,
@@ -234,6 +234,22 @@ pub const param_cases = [_]ParamCase{
     .{ .case = "empty", .params = "format=1", .levels = &.{3}, .checksums = &.{ false, true } },
     .{ .case = "words-1000", .params = "format=1", .levels = &.{3}, .checksums = &.{ false, true } },
     .{ .case = "csv-131073", .params = "format=1,contentSizeFlag=0", .levels = &.{1} },
+    // long-distance matching below the optimal parsers: its matches taken
+    // as they come, the level's match finder over the literals between
+    .{ .case = "ldm-mix-600000-0", .params = "enableLongDistanceMatching=1", .levels = &.{ -5, 1, 3, 5, 7, 9, 12 } },
+    .{ .case = "far-repeat", .params = "enableLongDistanceMatching=1", .levels = &.{ 1, 4 } }, // repeats 700 KB back, past level 1's window
+    .{ .case = "zeros-300000", .params = "enableLongDistanceMatching=1", .levels = &.{ 1, 3 } }, // one overlapping match: the hash skips over it
+    .{ .case = "mix-300000-9", .params = "enableLongDistanceMatching=1,ldmMinMatch=4,ldmHashRateLog=1", .levels = &.{ 1, 3, 5, 8 } }, // many short matches, cut at block ends
+    .{ .case = "csv-600000", .params = "enableLongDistanceMatching=1,ldmHashLog=10,ldmBucketSizeLog=1", .levels = &.{ 3, 6 } }, // a tiny table
+    .{ .case = "words-262145", .params = "enableLongDistanceMatching=1,ldmHashLog=12", .levels = &.{2} }, // the hash rate from the hash log
+    .{ .case = "ldm-far-mix-300000-3", .params = "enableLongDistanceMatching=1,useRowMatchFinder=2", .levels = &.{ 5, 7 } }, // hash chains
+    .{ .case = "far-repeat", .params = "enableLongDistanceMatching=1,ldmMinMatch=4096", .levels = &.{3} }, // the longest minimum
+    .{ .case = "words-100", .params = "enableLongDistanceMatching=1,ldmHashLog=12,ldmMinMatch=4", .levels = &.{ 1, 3, 5 } }, // a split at every byte: a few literals at the window's first indices
+    // ... found by a seed search over corpus inputs and parameters (original against mutant):
+    .{ .case = "mix-10086", .params = "enableLongDistanceMatching=1,ldmHashLog=15,ldmMinMatch=6,ldmBucketSizeLog=4", .levels = &.{3} }, // the LDM offset pushes the repcodes down; dfast's table fill ends exactly 10 bytes before the stretch; the table update is limited from exactly 1024 positions on
+    .{ .case = "ldm-far-mix-600000-6", .params = "enableLongDistanceMatching=1,ldmHashLog=21,ldmMinMatch=16", .levels = &.{1} }, // fast's table fill ends exactly 9 bytes before the stretch
+    .{ .case = "zeros-300000", .params = "enableLongDistanceMatching=1,ldmHashLog=19", .levels = &.{2} }, // fast on the first 1 byte of the window (iend - 8 below index 0)
+    .{ .case = "mix-70000-0", .params = "enableLongDistanceMatching=1,ldmHashLog=15,windowLog=12", .levels = &.{3} }, // ... and dfast
 };
 
 /// Streaming goldens: corpus case `case` compressed through `zstd.Stream`
@@ -339,6 +355,11 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "mix-300000-9", .schedule = "useRowMatchFinder=2,w15,c*,e0", .levels = lazy_only_levels, .ext_dict = &.{ 5, 6, 7, 8, 9, 10 } }, // hash chains over two segments where rows would run
     .{ .case = "mix-300000-9", .schedule = "useRowMatchFinder=1,w13,c*,e0", .levels = &.{ 5, 6, 7, 8 }, .ext_dict = &.{ 5, 6, 7, 8 } }, // rows in an 8 KB window
     .{ .case = "mix-200000-33", .schedule = "literalCompressionMode=2,w15,c*,e0", .levels = opt_levels, .ext_dict = opt_levels },
+    // long-distance matching below the optimal parsers, over a two-segment
+    // window: the match finders' extDict variants between its matches
+    .{ .case = "far-repeat", .schedule = "l,w17,c300000,f0,c*,e0", .levels = &.{ -5, 1, 3 }, .ext_dict = &.{ -5, 1, 3 } },
+    .{ .case = "csv-200000-0", .schedule = "l,w15,c*,e0", .levels = lazy_levels, .ext_dict = lazy_only_levels },
+    .{ .case = "mix-300000-9", .schedule = "l,ldmMinMatch=4,ldmHashRateLog=1,w14,c*,e0", .levels = &.{ 1, 3, 5, 7 }, .ext_dict = &.{ 1, 3, 5, 7 } },
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };

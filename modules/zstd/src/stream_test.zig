@@ -45,7 +45,6 @@ fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level
     defer if (own) |*st| st.deinit();
     var s: ?*stream.Stream = null;
     var ocf = false;
-    var ldm = false;
     var advanced: zstd.Advanced = .{};
     var src_size_hint: ?u32 = null;
     var ext_dict_blocks: u32 = 0;
@@ -58,7 +57,7 @@ fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level
             continue;
         }
         if (std.mem.eql(u8, tok, "l")) {
-            ldm = true;
+            advanced.long_distance_matching = .enable;
             continue;
         }
         if (try param_test.applyParam(&advanced, &src_size_hint, tok)) continue;
@@ -92,7 +91,6 @@ fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level
                 s = &own.?;
             }
             s.?.overflow_correct_frequently = ocf;
-            s.?.ldm = ldm;
         }
         const obuf = try gpa.alloc(u8, ocap);
         defer gpa.free(obuf);

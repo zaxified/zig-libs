@@ -94,10 +94,6 @@ pub const Stream = struct {
     /// overflow_correct_frequently`), which reaches the correction of a
     /// two-segment window within kilobytes.
     overflow_correct_frequently: bool = false,
-    /// Test seam, set before the first call: long-distance matching switched
-    /// on by hand (`frame.Options.ldm`), which reaches LDM over a small
-    /// window. Only for `btopt` and up.
-    ldm: bool = false,
 
     /// Nothing is allocated until the first `compressStream2`, which knows
     /// whether that call ends the frame (and so the size).
@@ -159,7 +155,7 @@ pub const Stream = struct {
     /// block in and one compressed block out.
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
         const pledged: ?u64 = if (end_op == .end) in_size else s.pledged;
-        const cp = frameParams(s.opts, pledged, s.ldm);
+        const cp = frameParams(s.opts, pledged);
         try s.comp.begin(cp, pledged, s.frameOptions(), true);
         const block_size = s.comp.block_size_max;
         s.in_to_compress = 0;
@@ -179,7 +175,6 @@ pub const Stream = struct {
             .checksum = s.opts.checksum,
             .advanced = s.opts.advanced,
             .overflow_correct_frequently = s.overflow_correct_frequently,
-            .ldm = s.ldm,
         };
     }
 
@@ -288,9 +283,9 @@ pub const Stream = struct {
 
 /// The parameters of a stream's frame: sized for its pledged size, else
 /// for the size hint (`ZSTD_getCParamsFromCCtxParams`), else unknown.
-fn frameParams(opts: Options, pledged: ?u64, ldm_by_hand: bool) params.CParams {
+fn frameParams(opts: Options, pledged: ?u64) params.CParams {
     const size_hint: u64 = pledged orelse if (opts.src_size_hint) |h| h else params.unknown_size;
-    return params.getOverridden(opts.level, size_hint, opts.advanced, ldm_by_hand);
+    return params.getOverridden(opts.level, size_hint, opts.advanced);
 }
 
 /// The workspace a stream with `opts` needs for its first frame when
@@ -301,12 +296,12 @@ pub fn estimateSize(opts: Options) Error!usize {
     try Stream.checkOptions(opts);
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };
     if (opts.pledged_size != null or opts.src_size_hint != null)
-        return frame.workspaceSize(frameParams(opts, opts.pledged_size, false), opts.pledged_size, fo, true);
+        return frame.workspaceSize(frameParams(opts, opts.pledged_size), opts.pledged_size, fo, true);
     // Unknown, or known at the first call (which ends the frame): the need
     // grows with the size within each of the level's size classes, and a
     // size past the last class needs what an unknown one does.
-    var most = frame.workspaceSize(frameParams(opts, null, false), null, fo, true);
+    var most = frame.workspaceSize(frameParams(opts, null), null, fo, true);
     for (params.size_class_bounds) |size|
-        most = @max(most, frame.workspaceSize(frameParams(opts, size, false), size, fo, true));
+        most = @max(most, frame.workspaceSize(frameParams(opts, size), size, fo, true));
     return most;
 }

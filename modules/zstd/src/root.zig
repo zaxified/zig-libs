@@ -7,7 +7,8 @@
 //! `greedy`, `lazy`, `lazy2` (hash-chain and row match finders), `btlazy2`,
 //! and the optimal parsers `btopt`, `btultra`, `btultra2` — with the frame
 //! and block driver, the block pre- and post-splitters, long-distance
-//! matching (which libzstd switches on at level 22 for inputs over 64 MB),
+//! matching (which libzstd switches on at level 22 for inputs over 64 MB,
+//! and at any level as the option `Advanced.long_distance_matching`),
 //! and the Huffman and FSE encoders. For the same input and level it emits exactly the bytes
 //! `ZSTD_compress2()` from libzstd v1.5.7 does (one-shot, content size in the
 //! header, checksum optional) — that equality is what the tests pin, not
@@ -39,7 +40,7 @@ const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -148,14 +149,14 @@ pub fn estimateCompressorSize(src_size: ?u64, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
     try opts.advanced.check();
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };
-    if (src_size) |n| return frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced, false), n, fo, false);
+    if (src_size) |n| return frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced), n, fo, false);
     // The need grows with the size within each size class; past the last
     // class it stops growing once the window no longer shrinks to the
     // input, which the largest size stands for.
     const largest = params.unknown_size - 1;
-    var most = frame.workspaceSize(params.getOverridden(opts.level, largest, opts.advanced, false), largest, fo, false);
+    var most = frame.workspaceSize(params.getOverridden(opts.level, largest, opts.advanced), largest, fo, false);
     for (params.size_class_bounds) |n|
-        most = @max(most, frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced, false), n, fo, false));
+        most = @max(most, frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced), n, fo, false));
     return most;
 }
 

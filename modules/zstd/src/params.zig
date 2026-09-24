@@ -234,15 +234,15 @@ pub fn get(level: i32, src_size: u64) CParams {
 }
 
 /// `ZSTD_getCParamsFromCCtxParams`: the level's parameters (already
-/// adjusted for its own strategy); with LDM switched on by hand
-/// (`ZSTD_c_enableLongDistanceMatching`, a test seam here) the window log
-/// reset to 27, `ZSTD_LDM_DEFAULT_WINDOW_LOG`; the explicit parameters of
-/// `adv` put over them (`ZSTD_overrideCParams`); and the adjustment run
-/// again, this time knowing whether the row match finder is ruled out.
-/// `adv` must have passed `check`.
-pub fn getOverridden(level: i32, src_size: u64, adv: Advanced, ldm_by_hand: bool) CParams {
+/// adjusted for its own strategy); with long-distance matching switched on
+/// (`.enable`, not `.auto`) the window log reset to 27,
+/// `ZSTD_LDM_DEFAULT_WINDOW_LOG`; the explicit parameters of `adv` put over
+/// them (`ZSTD_overrideCParams`); and the adjustment run again, this time
+/// knowing whether the row match finder is ruled out. `adv` must have
+/// passed `check`.
+pub fn getOverridden(level: i32, src_size: u64, adv: Advanced) CParams {
     var cp = get(level, src_size);
-    if (ldm_by_hand) cp.window_log = 27;
+    if (adv.long_distance_matching == .enable) cp.window_log = ldm_default_window_log;
     if (adv.window_log) |v| cp.window_log = v;
     if (adv.hash_log) |v| cp.hash_log = v;
     if (adv.chain_log) |v| cp.chain_log = v;
@@ -313,6 +313,24 @@ pub const Advanced = struct {
     block_splitter_level: u32 = 0,
     /// `ZSTD_c_maxBlockSize`, 1024..131072: the largest block.
     max_block_size: ?u32 = null,
+    /// `ZSTD_c_enableLongDistanceMatching` (`--long`): a second match finder
+    /// over the whole window that finds long repeats far back. `.auto` runs
+    /// it for `btopt` and up with a window log of 27 or more (level 22 on
+    /// inputs over 64 MB); `.enable` also raises the window log to 27 unless
+    /// `window_log` says otherwise (the input's size still shrinks it).
+    long_distance_matching: Switch = .auto,
+    /// `ZSTD_c_ldmHashLog`, 6..30: the LDM table's size; 0 or null derives
+    /// it from the window and the hash rate.
+    ldm_hash_log: ?u32 = null,
+    /// `ZSTD_c_ldmMinMatch`, 4..4096: the shortest long-distance match; 0 or
+    /// null is 64, or 32 for `btultra` and up.
+    ldm_min_match: ?u32 = null,
+    /// `ZSTD_c_ldmBucketSizeLog`, 1..8: entries per LDM hash bucket; 0 or
+    /// null derives it from the strategy.
+    ldm_bucket_size_log: ?u32 = null,
+    /// `ZSTD_c_ldmHashRateLog`, 0..25: one position in 2^rate enters the LDM
+    /// table; 0 or null derives it from the hash log, else the strategy.
+    ldm_hash_rate_log: ?u32 = null,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).
@@ -333,13 +351,34 @@ pub const Advanced = struct {
             !B.in(adv.min_match, min_match_min, min_match_max) or
             !B.in(adv.target_length, 0, target_length_max) or
             !B.in(adv.block_splitter_level, 0, block_splitter_level_max) or
-            !B.in(adv.max_block_size, block_size_max_min, block_size_max_abs))
+            !B.in(adv.max_block_size, block_size_max_min, block_size_max_abs) or
+            // for the LDM parameters, as for libzstd, 0 is "not set"
+            !B.in(nonZero(adv.ldm_hash_log), hash_log_min, hash_log_max) or
+            !B.in(nonZero(adv.ldm_min_match), ldm_min_match_min, ldm_min_match_max) or
+            !B.in(nonZero(adv.ldm_bucket_size_log), ldm_bucket_size_log_min, ldm_bucket_size_log_max) or
+            !B.in(nonZero(adv.ldm_hash_rate_log), 0, ldm_hash_rate_log_max))
             return error.ParameterOutOfBound;
     }
 };
 
+/// Null for 0, which libzstd's LDM parameters take as "not set".
+pub fn nonZero(v: ?u32) ?u32 {
+    return if (v) |x| if (x == 0) null else x else null;
+}
+
 /// `ZSTD_WINDOWLOG_MIN`.
 pub const window_log_min = 10;
+/// `ZSTD_LDM_DEFAULT_WINDOW_LOG`: the window log long-distance matching
+/// switched on starts from.
+pub const ldm_default_window_log = 27;
+/// `ZSTD_LDM_MINMATCH_MIN` / `_MAX`.
+pub const ldm_min_match_min = 4;
+pub const ldm_min_match_max = 4096;
+/// `ZSTD_LDM_BUCKETSIZELOG_MIN` / `_MAX`.
+pub const ldm_bucket_size_log_min = 1;
+pub const ldm_bucket_size_log_max = 8;
+/// `ZSTD_LDM_HASHRATELOG_MAX`: `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`.
+pub const ldm_hash_rate_log_max = window_log_max - hash_log_min;
 /// `ZSTD_HASHLOG_MAX`, `ZSTD_CHAINLOG_MAX` (64-bit).
 pub const hash_log_max = 30;
 pub const chain_log_min = 6;
@@ -427,12 +466,12 @@ test "only level 22 above 64 MB reaches long-distance matching" {
 test "LDM by hand widens the window before the input shrinks it" {
     // level 19 above 256 KB has windowLog 23; LDM by hand starts from 27
     try std.testing.expectEqual(@as(u32, 23), get(19, 20 << 20).window_log);
-    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, .{}, true).window_log);
-    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, .{}, true).window_log);
+    try std.testing.expectEqual(@as(u32, 25), getOverridden(19, 20 << 20, .{ .long_distance_matching = .enable }).window_log);
+    try std.testing.expectEqual(@as(u32, 27), getOverridden(19, 1 << 30, .{ .long_distance_matching = .enable }).window_log);
     // the hash and chain logs were already cut to the level's own window
-    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, .{}, true).chain_log);
+    try std.testing.expectEqual(get(19, 20 << 20).chain_log, getOverridden(19, 20 << 20, .{ .long_distance_matching = .enable }).chain_log);
     // a small input shrinks both to the same window
-    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, .{}, true));
+    try std.testing.expectEqual(get(19, 5000), getOverridden(19, 5000, .{ .long_distance_matching = .enable }));
 }
 
 test "btlazy2 halves the chain log to the window (ZSTD_cycleLog)" {

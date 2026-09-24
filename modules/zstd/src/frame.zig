@@ -204,18 +204,13 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
     if (istart > c.ms.next_to_update + 384)
         c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
     c.next.rep = c.prev.rep;
-    var last_ll: usize = undefined;
-    if (c.ldm) |ls| {
-        // ZSTD_ldm_blockCompress, strategy >= btopt: the long-distance
-        // matches are candidates for the optimal parser, not sequences
+    const last_ll = if (c.ldm) |ls| blk: {
         var ldm_seq_store: ldm.RawSeqStore = .{ .seq = c.ldm_seqs };
         ls.generateSequences(&ldm_seq_store, block);
-        c.ms.ldm_seq_store = &ldm_seq_store;
-        defer c.ms.ldm_seq_store = null;
-        last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
-    } else {
-        last_ll = match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
-    }
+        const n = ldm.blockCompress(&ldm_seq_store, &c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
+        std.debug.assert(ldm_seq_store.pos == ldm_seq_store.size);
+        break :blk n;
+    } else match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
     c.ss.storeLastLiterals(block[block.len - last_ll ..]);
     return true;
 }
@@ -315,11 +310,6 @@ pub const Options = struct {
     level: i32,
     checksum: bool,
     advanced: params.Advanced = .{},
-    /// Test seam: long-distance matching switched on by hand, as
-    /// `ZSTD_c_enableLongDistanceMatching` = 1 does (window log reset to 27
-    /// before the input shrinks it), to reach LDM on inputs far below the
-    /// 64 MB where level 22 switches it on. Only for btopt and up.
-    ldm: bool = false,
     /// Test seam: libzstd built with `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`
     /// (its fuzzing mode), which corrects index overflow whenever it safely
     /// can instead of only past `ZSTD_CURRENT_MAX` (3500 MiB). The output
@@ -384,7 +374,7 @@ const Layout = struct {
 
     fn compute(cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) Layout {
         const adv = opts.advanced;
-        const ldm_params: ?ldm.Params = if (opts.ldm or ldm.enabledByDefault(cp)) ldm.adjustParameters(cp) else null;
+        const ldm_params: ?ldm.Params = if (ldm.resolve(adv.long_distance_matching, cp)) ldm.adjustParameters(cp, adv) else null;
         const window_size: usize = @intCast(@max(1, @min(@as(u64, 1) << @intCast(cp.window_log), pledged orelse std.math.maxInt(u64))));
         // ZSTD_resolveMaxBlockSize
         const block_size_max: usize = @min(adv.max_block_size orelse block_size_max_abs, window_size);
@@ -556,7 +546,7 @@ pub const Compressor = struct {
         // can decide whether it is stored compressed
         const out = dst[0..bound];
         try opts.advanced.check();
-        const cp = params.getOverridden(opts.level, src.len, opts.advanced, opts.ldm);
+        const cp = params.getOverridden(opts.level, src.len, opts.advanced);
         try comp.begin(cp, src.len, opts, false);
         const n = comp.compressContinue(out, src, true) catch unreachable; // pledged is src.len
         const m = comp.writeEpilogue(out[n..]);
@@ -570,9 +560,6 @@ pub const Compressor = struct {
     /// `buffered` adds a stream's input and output buffers.
     pub fn begin(comp: *Compressor, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) error{OutOfMemory}!void {
         const l = Layout.compute(cp, pledged, opts, buffered);
-        // LDM by hand below btopt splices LDM sequences between runs of the
-        // block compressor (`ZSTD_ldm_blockCompress`), which is not ported.
-        std.debug.assert(l.ldm_params == null or @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt));
 
         const ms_old = comp.c.ms;
         var index_reset = !comp.initialized or ms_old.src_base + ms_old.src.len > comp.index_too_close;

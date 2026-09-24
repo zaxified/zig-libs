@@ -56,6 +56,16 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.block_splitter_level = v;
     } else if (Eq.f(name, "maxBlockSize")) {
         adv.max_block_size = v;
+    } else if (Eq.f(name, "enableLongDistanceMatching")) {
+        adv.long_distance_matching = switches[v];
+    } else if (Eq.f(name, "ldmHashLog")) {
+        adv.ldm_hash_log = v;
+    } else if (Eq.f(name, "ldmMinMatch")) {
+        adv.ldm_min_match = v;
+    } else if (Eq.f(name, "ldmBucketSizeLog")) {
+        adv.ldm_bucket_size_log = v;
+    } else if (Eq.f(name, "ldmHashRateLog")) {
+        adv.ldm_hash_rate_log = v;
     } else if (Eq.f(name, "srcSizeHint")) {
         hint.* = v;
     } else return error.BadParam;
@@ -136,6 +146,31 @@ test "output with advanced parameters is byte-identical to libzstd 1.5.7, and de
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 
+test "long-distance matching at a fresh window's first indices" {
+    // The reused context above indexes each frame past the last, so the
+    // window's first indices (2..) are reached only on a fresh one: there
+    // `fast` and `dfast` run on stretches ending below index 8 (see
+    // `saturated_limit` in match.zig).
+    const gpa = std.testing.allocator;
+    for (corpus.param_cases) |pc| {
+        if (!std.mem.eql(u8, pc.case, "zeros-300000") and !std.mem.eql(u8, pc.case, "mix-70000-0")) continue;
+        const case = findCase(pc.case);
+        const src = try gpa.alloc(u8, case.len);
+        defer gpa.free(src);
+        corpus.generate(case, src);
+        const adv = try parse(pc.params);
+        for (pc.levels) |level| {
+            const out = try zstd.compressAlloc(gpa, src, .{ .level = level, .advanced = adv });
+            defer gpa.free(out);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(out, &digest, .{});
+            const g = find(pc, level, false).?;
+            try std.testing.expectEqual(g.len, out.len);
+            try std.testing.expectEqualStrings(g.sha256, &std.fmt.bytesToHex(digest, .lower));
+        }
+    }
+}
+
 test "parameters outside libzstd's bounds are refused, its edges accepted" {
     const gpa = std.testing.allocator;
     var buf: [128]u8 = undefined; // compressBound(3) is 66
@@ -149,6 +184,11 @@ test "parameters outside libzstd's bounds are refused, its edges accepted" {
         .{ .ok = &.{ .{ .target_length = 0 }, .{ .target_length = 131072 } }, .bad = &.{.{ .target_length = 131073 }} },
         .{ .ok = &.{.{ .block_splitter_level = 6 }}, .bad = &.{.{ .block_splitter_level = 7 }} },
         .{ .ok = &.{ .{ .max_block_size = 1024 }, .{ .max_block_size = 131072 } }, .bad = &.{ .{ .max_block_size = 1023 }, .{ .max_block_size = 131073 } } },
+        // the LDM parameters: 0 is "not set", as in libzstd
+        .{ .ok = &.{ .{ .ldm_hash_log = 0 }, .{ .ldm_hash_log = 6 }, .{ .ldm_hash_log = 30 } }, .bad = &.{ .{ .ldm_hash_log = 5 }, .{ .ldm_hash_log = 31 } } },
+        .{ .ok = &.{ .{ .ldm_min_match = 0 }, .{ .ldm_min_match = 4 }, .{ .ldm_min_match = 4096 } }, .bad = &.{ .{ .ldm_min_match = 3 }, .{ .ldm_min_match = 4097 } } },
+        .{ .ok = &.{ .{ .ldm_bucket_size_log = 0 }, .{ .ldm_bucket_size_log = 1 }, .{ .ldm_bucket_size_log = 8 } }, .bad = &.{.{ .ldm_bucket_size_log = 9 }} },
+        .{ .ok = &.{ .{ .ldm_hash_rate_log = 0 }, .{ .ldm_hash_rate_log = 25 } }, .bad = &.{.{ .ldm_hash_rate_log = 26 }} },
     };
     for (edges) |e| {
         for (e.ok) |adv| _ = try zstd.compress(gpa, &buf, "abc", .{ .advanced = adv });
@@ -170,13 +210,13 @@ test "switching the row match finder off lifts its cap on the hash log" {
     // unknown size: nothing else shrinks the hash log. Rows of 16 hash
     // hashLog - 4 + 8 bits into 32, so the cap is 28.
     const unknown = params.unknown_size;
-    try std.testing.expectEqual(@as(u32, 28), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 4 }, false).hash_log);
-    try std.testing.expectEqual(@as(u32, 28), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 4, .row_match_finder = .enable }, false).hash_log);
-    try std.testing.expectEqual(@as(u32, 30), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 4, .row_match_finder = .disable }, false).hash_log);
+    try std.testing.expectEqual(@as(u32, 28), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 4 }).hash_log);
+    try std.testing.expectEqual(@as(u32, 28), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 4, .row_match_finder = .enable }).hash_log);
+    try std.testing.expectEqual(@as(u32, 30), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 4, .row_match_finder = .disable }).hash_log);
     // 64-entry rows: 30
-    try std.testing.expectEqual(@as(u32, 30), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 6 }, false).hash_log);
+    try std.testing.expectEqual(@as(u32, 30), params.getOverridden(5, unknown, .{ .hash_log = 30, .search_log = 6 }).hash_log);
     // strategies without rows are never capped
-    try std.testing.expectEqual(@as(u32, 30), params.getOverridden(13, unknown, .{ .hash_log = 30, .search_log = 4 }, false).hash_log);
+    try std.testing.expectEqual(@as(u32, 30), params.getOverridden(13, unknown, .{ .hash_log = 30, .search_log = 4 }).hash_log);
 }
 
 test "a magicless frame is the frame without its magic number, and needs a decoder told so" {
