@@ -1202,3 +1202,45 @@ const dict_cases_attach_lazy = [_]DictCase{
     .{ .name = "attach-lazy-stream-hint", .input = in_words_40000, .dict = "raw-csv-30000", .path = .load, .schedule = "srcSizeHint=300000,c*,e0", .levels = &.{ 5, 6, 8, 12, 13, 15 } },
     .{ .name = "attach-lazy-stream-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "w12,c10000,f0,c*,e0", .levels = &.{ 5, 8, 10 } },
 };
+
+const in_words_8192_fast: Case = .{ .name = "", .len = 8192, .kind = .words, .seed = 101 };
+const in_words_8193_fast: Case = .{ .name = "", .len = 8193, .kind = .words, .seed = 102 };
+const in_csv_16384: Case = .{ .name = "", .len = 16384, .kind = .csv, .seed = 103 };
+const in_csv_16385: Case = .{ .name = "", .len = 16385, .kind = .csv, .seed = 104 };
+const in_words_2000: Case = .{ .name = "", .len = 2000, .kind = .words, .seed = 105 };
+
+/// Wave 2 (D1): attach (`ms.dict_match_state`) cases for the `fast` and
+/// `dfast` strategies, where `match.hasDictMatchStateVariant` now admits
+/// them (SPEC.md, *Dictionaries*). Kept separate from `dict_cases` so
+/// sibling agents' own attach cases (other strategy families) merge
+/// cleanly; wired into the same golden test and manifest as `dict_cases`.
+/// Levels: -3/-7 and 1 are `fast` (negative levels are always the base
+/// `fast` row); 2 and 3 are `dfast` on the small-input table `dict_cases`'
+/// own "the attach cutoffs are libzstd's" test already pins.
+pub const dict_cases_attach_fast = [_]DictCase{
+    // at the 8 KB (fast) / 16 KB (dfast) cutoff -- attaches -- and just
+    // above -- copies; the boundary itself must give the same bytes either way
+    .{ .name = "attach-fast-at-cutoff", .input = in_words_8192_fast, .dict = "raw-words-8000", .path = .cdict, .levels = &.{1} },
+    .{ .name = "attach-fast-just-over", .input = in_words_8193_fast, .dict = "raw-words-8000", .path = .cdict, .levels = &.{1} },
+    .{ .name = "attach-dfast-at-cutoff", .input = in_csv_16384, .dict = "raw-csv-30000", .path = .cdict, .levels = &.{3} },
+    .{ .name = "attach-dfast-just-over", .input = in_csv_16385, .dict = "raw-csv-30000", .path = .cdict, .levels = &.{3} },
+    // unknown-size streams: shouldAttachDict treats them like the smallest input
+    .{ .name = "attach-fast-stream-unknown", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdict, .schedule = "c*,e0", .levels = &.{1} },
+    .{ .name = "attach-dfast-stream-unknown", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .cdict, .schedule = "c20000,f0,c*,e0", .levels = &.{3} },
+    // forceAttachDict=1 (attach) past the cutoff, where libzstd would
+    // otherwise copy
+    .{ .name = "attach-fast-forced-big", .input = in_words_40000, .dict = "raw-words-8000", .path = .cdictadv, .params = "forceAttachDict=1", .levels = &.{1} },
+    .{ .name = "attach-dfast-forced-big", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "forceAttachDict=1", .levels = &.{3} },
+    // a full (trained) dictionary, attached, vs. raw content
+    .{ .name = "attach-fast-full-dict", .input = in_words_2000, .dict = "zd-words", .path = .cdict, .levels = &.{1} },
+    .{ .name = "attach-dfast-full-dict", .input = in_words_2000, .dict = "zd-csv", .path = .cdict, .levels = &.{3} },
+    // a dictionary bigger than a forced-small window (truncated to it) vs.
+    // comfortably inside a wide one
+    .{ .name = "attach-fast-dict-over-window", .input = in_words_2000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "windowLog=12,forceAttachDict=1", .levels = &.{1} },
+    .{ .name = "attach-dfast-dict-under-window", .input = in_words_2000, .dict = "raw-words-3584", .path = .cdictadv, .params = "windowLog=20,forceAttachDict=1", .levels = &.{3} },
+    // negative levels: always the fast strategy's base row
+    .{ .name = "attach-fast-negative-level", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdict, .levels = &.{ -1, -3, -7 } },
+    // level 2 (dfast on the small-input table), raw and full
+    .{ .name = "attach-level2-raw", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdict, .levels = &.{2} },
+    .{ .name = "attach-level2-full", .input = in_words_3000, .dict = "zd-words", .path = .cdict, .levels = &.{2} },
+};

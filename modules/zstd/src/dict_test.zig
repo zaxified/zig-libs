@@ -17,10 +17,13 @@
 //! dictionaries too (SPEC.md, *Dictionaries*).
 //!
 //! Where libzstd would attach a `CDict` (small inputs, unknown sizes), this
-//! port searches it in place with the strategy's dictMatchState variant --
-//! `greedy`..`btlazy2` (`corpus.dict_cases_attach_lazy`) and the optimal
-//! parsers (`corpus.dict_cases_attach_opt`) -- and refuses the other
-//! strategies (`error.DictAttachUnsupported`); the last tests pin that.
+//! port now searches it in place with every strategy's dictMatchState
+//! variant: `fast`/`dfast` (D1, `corpus.dict_cases_attach_fast`),
+//! `greedy`..`btlazy2` (D2, `corpus.dict_cases_attach_lazy`) and the
+//! optimal parsers (D3, `corpus.dict_cases_attach_opt`) -- so
+//! `error.DictAttachUnsupported` no longer has a strategy left to name;
+//! the last test pins that it is still refused where asked for on
+//! purpose (`force_attach_dict = .copy`/`.load`, never `.attach`).
 
 const std = @import("std");
 const zstd = @import("root.zig");
@@ -50,7 +53,7 @@ fn find(dc: corpus.DictCase, level: i32, checksum: bool) ?goldens.Golden {
 
 test "every dictionary case has a golden row, and nothing else does" {
     var n: usize = 0;
-    for (corpus.dict_cases) |dc| for (dc.levels) |level| for (dc.checksums) |ck| {
+    for (corpus.dict_cases ++ corpus.dict_cases_attach_fast) |dc| for (dc.levels) |level| for (dc.checksums) |ck| {
         n += 1;
         if (find(dc, level, ck) == null) {
             std.debug.print("no golden row for {s} level {d} checksum {}\n", .{ dc.name, level, ck });
@@ -173,7 +176,7 @@ test "output with dictionaries is byte-identical to libzstd 1.5.7" {
     defer ctx.deinit();
     var strm = try zstd.Stream.init(gpa, .{});
     defer strm.deinit();
-    for (corpus.dict_cases) |dc| {
+    for (corpus.dict_cases ++ corpus.dict_cases_attach_fast) |dc| {
         const dict = try buildDict(gpa, dc.dict);
         defer gpa.free(dict);
         // the dictionary and the input in one buffer: adjacent for a
@@ -208,7 +211,13 @@ test "output with dictionaries is byte-identical to libzstd 1.5.7" {
     try std.testing.expect(ctx.ctx.n_cdict_copies > 0 and ctx.ctx.n_dict_loads > 0);
 }
 
-test "where libzstd would attach a CDict without a dictMatchState variant, the frame is refused, not copied" {
+test "every strategy's dictMatchState variant attaches where libzstd would, D1-D3 together" {
+    // D1 (fast/dfast), D2 (greedy..btlazy2) and D3 (the optimal parsers)
+    // together give every strategy a dictMatchState variant, so
+    // `error.DictAttachUnsupported` no longer has a strategy left to name
+    // -- this pins that `hasDictMatchStateVariant` is exhaustively `true`
+    // and that attaching actually succeeds end to end for each one, below
+    // every strategy's cutoff (3000 bytes) and for an unknown-size stream.
     const gpa = std.testing.allocator;
     const dict = trained("zd-words");
     var src: [3000]u8 = undefined;
@@ -219,24 +228,24 @@ test "where libzstd would attach a CDict without a dictMatchState variant, the f
     for ([_]i32{ -3, 1, 3, 5, 9, 13, 16, 19, 22 }) |level| {
         var cd = try zstd.CDict.init(gpa, dict, level);
         defer cd.deinit();
-        // strategies whose dictMatchState variants are ported attach
-        if (match.hasDictMatchStateVariant(cd.ms.cp.strategy)) continue;
-        // 3000 bytes are below every strategy's cutoff
-        try std.testing.expectError(error.DictAttachUnsupported, ctx.compress(&dst, &src, .{ .level = level, .dictionary = .{ .cdict = &cd } }));
-        try std.testing.expectError(error.DictAttachUnsupported, ctx.compressUsingCDict(&dst, &src, &cd, .{}));
-        try std.testing.expectError(error.DictAttachUnsupported, ctx.compress(&dst, &src, .{ .level = level, .dictionary = .{ .raw = .{ .bytes = dict } } }));
-        // ... and so is any size when asked for
-        try std.testing.expectError(error.DictAttachUnsupported, ctx.compress(&dst, &src, .{ .level = level, .advanced = .{ .force_attach_dict = .attach }, .dictionary = .{ .cdict = &cd } }));
-        // copying (or loading) instead is libzstd's choice when asked for
+        try std.testing.expect(match.hasDictMatchStateVariant(cd.ms.cp.strategy));
+        _ = try ctx.compress(&dst, &src, .{ .level = level, .dictionary = .{ .cdict = &cd } });
+        _ = try ctx.compressUsingCDict(&dst, &src, &cd, .{});
+        _ = try ctx.compress(&dst, &src, .{ .level = level, .dictionary = .{ .raw = .{ .bytes = dict } } });
+        _ = try ctx.compress(&dst, &src, .{ .level = level, .advanced = .{ .force_attach_dict = .attach }, .dictionary = .{ .cdict = &cd } });
+        // copying or loading is still available too (byte-identity is
+        // `corpus.dict_cases`/`dict_cases_attach_fast`/`_lazy`/`_opt`'s
+        // job, not this one's)
         _ = try ctx.compress(&dst, &src, .{ .level = level, .advanced = .{ .force_attach_dict = .copy }, .dictionary = .{ .cdict = &cd } });
         _ = try ctx.compress(&dst, &src, .{ .level = level, .advanced = .{ .force_attach_dict = .load }, .dictionary = .{ .cdict = &cd } });
     }
-    // a stream of unknown size attaches
-    var strm = try zstd.Stream.init(gpa, .{ .dictionary = .{ .raw = .{ .bytes = dict } } });
+    // a stream of unknown size attaches too
+    var strm = try zstd.Stream.init(gpa, .{ .level = 9, .dictionary = .{ .raw = .{ .bytes = dict } } });
     defer strm.deinit();
     var in: zstd.InBuffer = .{ .src = &src };
     var out: zstd.OutBuffer = .{ .dst = &dst };
-    try std.testing.expectError(error.DictAttachUnsupported, strm.compressStream2(&out, &in, .@"continue"));
+    _ = try strm.compressStream2(&out, &in, .@"continue");
+    _ = try strm.compressStream2(&out, &in, .end);
 }
 
 test "the attach cutoffs are libzstd's, per strategy" {

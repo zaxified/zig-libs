@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var dict_manifest: std.ArrayList(u8) = .empty;
     defer dict_manifest.deinit(gpa);
-    for (corpus.dict_cases) |dc| {
+    for (corpus.dict_cases ++ corpus.dict_cases_attach_fast) |dc| {
         const buf = try gpa.alloc(u8, dc.input.len);
         defer gpa.free(buf);
         corpus.generate(dc.input, buf);

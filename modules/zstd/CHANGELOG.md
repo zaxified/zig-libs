@@ -61,6 +61,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   dictionary goldens gain a `slice` dictionary source (a piece of an
   input).
 
+- **2026-09-24** — **NO CONSUMER-VISIBLE CHANGE:** `corpus.dict_cases_attach_fast`,
+  a test-only corpus array (`pub` only so `tools/dump_corpus.zig` can read
+  it) for the previous entry's attach goldens; nothing a consumer of the
+  module observes.
+
 - **2026-09-24** — Compression with a dictionary, attach for `fast` and
   `dfast` (SPEC backlog Z4, part D1): where libzstd would attach a `CDict`
   in place (inputs under 8/16 KB, unknown sizes) rather than copy it,
