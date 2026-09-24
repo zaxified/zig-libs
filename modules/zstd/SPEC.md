@@ -27,10 +27,8 @@ with its cost.
 Not here yet, and a reader might expect it (each is a backlog item):
 
 - **Part of dictionaries (Z2c, Z4, Z5b).** Compressing with a dictionary is
-  here (see *Dictionaries*) except where libzstd **attaches** a `CDict` —
-  small or unknown input sizes — of a strategy whose `dictMatchState`
-  variant is not ported yet (so far `greedy`…`btlazy2` and the optimal
-  parsers have theirs, `fast`/`dfast` do not): `error.DictAttachUnsupported`.
+  here (see *Dictionaries*), attaching included for every strategy now
+  (`fast`/`dfast`: D1; `greedy`…`btlazy2`: D2; the optimal parsers: D3).
   **Decompression with a dictionary is done too** (Z2c, see *Decoder*):
   raw-content and zstd-format dictionaries, a digested `DDict`,
   `ZSTD_d_refMultipleDDicts`, one-shot and streaming; a frame that names a
@@ -519,12 +517,13 @@ input alone. A `CDict`'s level, if it has one, replaces the context's. Then:
   `ZSTD_shouldAttachDict` says: an input of at most 8 KB (`fast`,
   `btultra`, `btultra2`), 16 KB (`dfast`) or 32 KB (the others) by the
   CDict's strategy, or of unknown size, or `force_attach_dict = .attach` —
-  never with `.copy`, never with `force_max_window`. Ported for
-  `greedy`…`btlazy2` (*Attach for the lazy family*, below) and for `btopt`,
-  `btultra`, `btultra2` (below). For the other strategies the frame is
-  refused with `error.DictAttachUnsupported` before anything is written,
-  rather than copied (which would change the bytes); the gate is
-  `match.hasDictMatchStateVariant`.
+  never with `.copy`, never with `force_max_window`. Ported for every
+  strategy now: `fast`/`dfast` (D1), `greedy`…`btlazy2` (D2, *Attach for
+  the lazy family*, below) and `btopt`/`btultra`/`btultra2` (D3, below) --
+  the gate, `match.hasDictMatchStateVariant`, is exhaustively `true`, so
+  `error.DictAttachUnsupported` (refusing before anything is written,
+  rather than copying, which would change the bytes) no longer has a
+  strategy left to name.
 
 `Options.dictionary` / `StreamOptions.dictionary` mirror libzstd's calls on
 a context before `ZSTD_compress2` / `ZSTD_compressStream2`: `.raw` is
@@ -572,21 +571,24 @@ so a dictionary index maps into the context's space by libzstd's
 (`zstd_fast.c` → `match.zig`, `zstd_double_fast.c` → `match.zig`,
 `zstd_lazy.c` → `lazy.zig`, `zstd_opt.c` → `opt.zig`) from libzstd's
 `*_dictMatchState*` functions; dispatch to it where `ms.dict_match_state
-!= null` and `!ms.hasExtDict()` (`match.compressBlock` holds an
-`unreachable` there today; `lazy.compressBlock` and `opt.compressBlock`
+!= null` and `!ms.hasExtDict()` (`match.compressBlock` dispatches
+`fast`/`dfast` there since D1; `lazy.compressBlock` and `opt.compressBlock`
 choose their own variants); flip the strategy in
 `match.hasDictMatchStateVariant`, which lifts the refusal in
 `frame.Compressor.resetByAttachingCDict`; then the goldens: small inputs
 (≤ 8/16/32 KB) and unknown-size streams with `.cdict` and `.raw`
 dictionaries, which `dict_test.zig`'s "refused" test lists today, into
-`corpus.dict_cases`, and `tools/gen-goldens.sh`. Checked against libzstd
-the same way (`zref.c` / `zstream.c` take every dictionary path already).
-The attach reset (`resetByAttachingCDict`) is ported but unexercised;
-verify it with the first variant (`ZSTD_resetCCtx_byAttachingCDict`: the
-parameters by `ZSTD_adjustCParams_internal(cdict cParams, …,
-ZSTD_cpm_attachDict)` with the frame's window log, the working window
-moved up to the CDict's end when it lies below, `loadedDictEnd`).
-D2 exercised it as it stands.
+`corpus.dict_cases` (D1: a separate `corpus.dict_cases_attach_fast`, so
+siblings' own cases merge without conflict), and `tools/gen-goldens.sh`
+(`dump_corpus.zig` reads both arrays). Checked against libzstd the same
+way (`zref.c` / `zstream.c` take every dictionary path already). The
+attach reset (`resetByAttachingCDict`) is ported and exercised by D1's
+and D2's goldens (window move-up via `ZSTD_window_clear`'s semantics,
+`loadedDictEnd`, `ZSTD_adjustCParams_internal(cdict cParams, …,
+ZSTD_cpm_attachDict)`) — D1 read it line by line against
+`ZSTD_resetCCtx_byAttachingCDict` and found no bug there by *reading*
+(not mutation-backed: D1's sweep targeted the new match finders, not
+this function specifically); D2 exercised it as it stands.
 
 **Attach for the lazy family** (D2, 2026-09-24; `lazy.zig`). Every
 function of the lazy finders takes libzstd's dictionary mode at compile
@@ -621,6 +623,47 @@ own parameters would choose). The frame's own resolution only caps the
 context's hash log in `ZSTD_adjustCParams_internal`. Both tables then
 have the same kind, so the dictMatchState search reads the CDict's tables
 of the kind the context searches its own.
+D1's `fast`/`dfast` variants (`fastDictMatchStateBlock`,
+`dfastDictMatchStateBlock` in `match.zig`) port libzstd's
+`ZSTD_compressBlock_fast_dictMatchState_generic` /
+`..._doubleFast_dictMatchState_generic` literally, including a quirk
+worth flagging for D2/D3: unlike the noDict/extDict variants, libzstd's
+own dictMatchState repcode checks do **not** guard against a zero
+(invalidated) `rep_offset1`/`rep_offset2` -- the comment in
+`zstd_fast.c` notes this is intentional (dictMatchState inputs are
+assumed to start with valid reps). The two new match finders share a
+`countAcrossDict` helper (`match.zig`) -- `ZSTD_count_2segments` where
+the match side is a different `MatchState` (the attached CDict's own,
+not `ms.dict`) rather than a second segment of the same one.
+
+**D1 mutation sweep** (33 mutants over `countAcrossDict`,
+`comparePackedTags`, `fastDictMatchStateBlock`, `dfastDictMatchStateBlock`;
+`-Dtest-filter=dict`, `dict_test.zig`'s 33 dictionary tests only -- a
+narrower binary than the full suite, valid for finding whether a mutation
+is caught at all, not as evidence about the rest of the module):
+**19 killed, 14 survived**, all early-return/early-exit boundary checks
+that only misfire when a match starts or ends at *exactly* an index
+(`dict_start_index`, `prefix_start_index`/`prefix_lowest_index`, or the
+CDict's own end) -- the same shape as the equality-boundary survivors
+already open elsewhere in this file (`opt`/splitter, LDM, decoder); no
+golden here happens to land a match on the boundary byte. Listed for a
+future hunt (SPEC backlog, not blocking): `countAcrossDict`'s `p_match >
+m_end` / `v_end > p_in` / the `orelse len` fallback / the `i_start,i_end`
+argument order in its continuation call; the `>` vs `>=` reads against
+`prefix_start_index`/`dict_start_index` in both new match finders'
+prefix-vs-dict preference and backward catch-up bounds (11 sites, see
+`match.zig`'s `fastDictMatchStateBlock`/`dfastDictMatchStateBlock`).
+One mutation (removing `countAcrossDict`'s fallthrough for a dict match
+that ends exactly at the CDict's edge) exposed a **real bug** the sweep
+caught before it shipped: the first port of `countAcrossDict` returned 0
+early whenever the dict-side runway was exactly exhausted
+(`p_match == m_end` / `v_end == p_in`), instead of falling through to
+`ZSTD_count_2segments`'s continuation into the prefix, as the existing
+`Base.count2Segments` already does correctly for the extDict case. Fixed
+to mirror `Base.count2Segments`'s shape exactly. No committed golden
+currently exercises this exact boundary (fixing it left all 33 dict
+tests unchanged), which is why the boundary mutants above still survive
+after the fix -- flagged, not hidden, in the list above.
 
 **The optimal parsers attached (D3).** `btopt`, `btultra` and `btultra2`
 search an attached CDict (`zstd_opt.c` with `dictMode ==
@@ -1491,13 +1534,14 @@ dictionaries are undecided.
   load / copy / reload paths and the attach decision, prefixes,
   `compressUsingDict` / `compressUsingCDict`, the dictionary ID and its
   flag, `forceAttachDict`, `deterministicRefPrefix`, `forceMaxWindow`;
-  attaching is refused. Left:
+  attaching is refused for strategies without a `dictMatchState` variant
+  yet. Left:
   - **D1–D3 — attach**: the `dictMatchState` variant of every match
-    finder — D1 `fast`/`dfast` (tagged CDict tables), ~~D2 hash chain /
-    row / DUBT~~ (done 2026-09-24, *Attach for the lazy family*), ~~D3 the
-    optimal parsers (and LDM with a dictionary)~~ done 2026-09-24 — each
+    finder — ~~D1 `fast`/`dfast`~~ (tagged CDict tables), ~~D2 hash chain /
+    row / DUBT~~ (*Attach for the lazy family*), ~~D3 the optimal parsers
+    (and LDM with a dictionary)~~ — all done 2026-09-24-2026-09-25, each
     lifting the refusal for its strategies (*Dictionaries*, "Adding an
-    attach variant"). **~1 session each.**
+    attach variant"); `hasDictMatchStateVariant` is exhaustively `true`.
   - Dedicated dictionary search (`enableDedicatedDictSearch`) optional;
     `prefetchCDictTables` (speed only).
 - **Z5 — Dictionary training.** ~~**Z5a**~~ done 2026-09-24: the content

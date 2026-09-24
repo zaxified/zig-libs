@@ -14,15 +14,16 @@ for the same calls) covers every level too, and `FrameWriter` is a
 parameters (`zstd.Advanced`: explicit window/hash/chain/search/strategy,
 frame flags, magicless frames, the splitters, the row match finder, literal
 compression, block size) give libzstd's bytes for the same settings, and so
-does **compressing** with a dictionary (raw or trained, `CDict`, prefixes) —
-except where libzstd would *attach* a `CDict` (inputs under 8–32 KB, unknown
-sizes) of a strategy other than `greedy`…`btlazy2` and the optimal parsers
-(`fast`, `dfast`), which is refused for now. **Decoding** with a dictionary
-(raw-content or zstd-format, a digested `DDict`, `ZSTD_d_refMultipleDDicts`)
-is done too. Dictionary *training*'s content selection is done
-(`zstd.dict_builder`), finalization is not; the stable-buffer and
-context-reuse parts of the streaming API and multithreading are queued in
-[SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
+does **compressing** with a dictionary (raw or trained, `CDict`, prefixes),
+including every strategy's way of **attaching** a `CDict` in place instead
+of copying it (`fast`, `dfast`; `greedy`…`btlazy2`; the optimal parsers) —
+inputs under 8/16/32 KB by strategy, or unknown sizes.
+**Decoding** with a dictionary (raw-content or zstd-format, a digested
+`DDict`, `ZSTD_d_refMultipleDDicts`) is done too. Dictionary *training*'s
+content selection is done (`zstd.dict_builder`), finalization is not; the
+stable-buffer and context-reuse parts of the streaming API and
+multithreading are queued in [SPEC.md](SPEC.md) (*Backlog / deferred*,
+with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
@@ -260,11 +261,11 @@ The frame carries the dictionary's ID (`advanced.dict_id_flag = false`
 leaves it out); a decoder needs the same dictionary. `StreamOptions` takes
 the same `dictionary` (a `.prefix` for its first frame only). For small
 inputs — up to 8, 16 or 32 KB by strategy — and streams of unknown size,
-libzstd attaches a `CDict` instead of copying it and searches it in place:
-ported for `greedy`, `lazy`, `lazy2`, `btlazy2` and the optimal parsers
-(`btopt`, `btultra`, `btultra2`); for `fast` and `dfast` it is
-`error.DictAttachUnsupported` for now (`advanced.force_attach_dict = .copy`
-gets libzstd's bytes for the copy). `CDict.initAdvanced` takes a content type
+libzstd attaches a `CDict` instead of copying it and searches it in
+place, for every strategy now (`fast`, `dfast`; `greedy`, `lazy`, `lazy2`,
+`btlazy2`; the optimal parsers `btopt`, `btultra`, `btultra2`) --
+`advanced.force_attach_dict = .copy` still gets libzstd's bytes for the
+copy instead, on any strategy. `CDict.initAdvanced` takes a content type
 (`.auto`, `.raw_content`, `.full`) and advanced parameters; see SPEC.md,
 *Dictionaries*.
 
