@@ -24,8 +24,10 @@
 //! Compression with a dictionary (`Options.dictionary`, `CDict`,
 //! `Compressor.compressUsingDict` / `compressUsingCDict`) gives libzstd's
 //! bytes for the dictionary set the same way -- loaded, a `CDict` copied or
-//! reloaded, a prefix -- except where libzstd attaches a `CDict` (small or
-//! unknown input sizes): `error.DictAttachUnsupported` for now.
+//! reloaded, a prefix, or a `CDict` attached (small or unknown input sizes)
+//! -- except that attaching is ported only for the optimal parsers (`btopt`,
+//! `btultra`, `btultra2`): `error.DictAttachUnsupported` for the others for
+//! now.
 //!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd.

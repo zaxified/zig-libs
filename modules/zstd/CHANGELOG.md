@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Compression with a dictionary attached to the optimal
+  parsers (SPEC backlog Z4, part D3): where libzstd attaches a `CDict`
+  (inputs up to 32 KB for `btopt`, 8 KB for `btultra` / `btultra2`,
+  unknown sizes, `force_attach_dict = .attach`), `btopt`, `btultra` and
+  `btultra2` now search it in place (`zstd_opt.c`'s `dictMatchState`
+  mode: repcodes into the dictionary, the CDict's binary tree) instead of
+  failing with `error.DictAttachUnsupported`; attached `btultra2` runs
+  `btultra`, as in libzstd. Long-distance matching with a loaded raw
+  dictionary gets a golden case that needs its LDM entries. 118 new
+  dictionary frames and streams (26 cases, `corpus.dict_cases_attach_opt`)
+  byte-identical to libzstd 1.5.7; 5 085 random frames and streams
+  identical (1 985 of them through an attached CDict); a 50-mutation
+  sweep: 34 caught, 5 equivalent, 10 uncovered (SPEC.md). The
+  dictionary goldens gain a `slice` dictionary source (a piece of an
+  input).
+
 - **2026-09-24** — Compression with a dictionary (SPEC backlog Z4, part
   D0): `CDict` (`init` = `ZSTD_createCDict`, `initAdvanced` =
   `ZSTD_createCDict_advanced2`), `Options.dictionary` /

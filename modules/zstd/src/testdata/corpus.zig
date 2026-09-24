@@ -709,6 +709,9 @@ pub const DictDef = struct {
         /// the newline), FSE tables with zero probabilities, repcodes 1 4 8,
         /// then `content`.
         crafted: struct { content: Case, id: u32 },
+        /// Raw content: `len` bytes of the generated input `of` from
+        /// `from` -- a dictionary that is a piece of the input it serves.
+        slice: struct { of: Case, from: usize, len: usize },
     };
 };
 
@@ -722,6 +725,9 @@ pub const dict_defs = [_]DictDef{
     .{ .name = "raw-one", .source = .{ .generated = .{ .name = "", .len = 1, .kind = .words, .seed = 29 } } },
     .{ .name = "raw-mix-100000-self", .source = .{ .generated = .{ .name = "", .len = 100000, .kind = .mix, .seed = 14 } } },
     .{ .name = "raw-mix-3000", .source = .{ .generated = .{ .name = "", .len = 3000, .kind = .mix, .seed = 24 } } },
+    .{ .name = "raw-words-9000-self", .source = .{ .generated = .{ .name = "", .len = 9000, .kind = .words, .seed = 30 } } },
+    .{ .name = "slice-words-6000-at-1000", .source = .{ .slice = .{ .of = .{ .name = "", .len = 9000, .kind = .words, .seed = 35 }, .from = 1000, .len = 6000 } } },
+    .{ .name = "slice-far-repeat-tail", .source = .{ .slice = .{ .of = .{ .name = "", .len = 1400000, .kind = .far_repeat, .seed = 34 }, .from = 692000, .len = 8000 } } },
     .{ .name = "zd-words", .source = .{ .trained = "zd-words" } },
     .{ .name = "zd-csv", .source = .{ .trained = "zd-csv" } },
     .{ .name = "zd-words-id200", .source = .{ .reid = .{ .of = "zd-words", .id = 200 } } },
@@ -756,6 +762,11 @@ pub fn buildDict(d: DictDef, trained: *const fn ([]const u8) []const u8, out: []
             return t.len;
         },
         .crafted => |x| return crafted(x.content, x.id, out),
+        .slice => |x| {
+            generate(x.of, out[0..x.of.len]);
+            std.mem.copyForwards(u8, out[0..x.len], out[x.from..][0..x.len]);
+            return x.len;
+        },
     }
 }
 
@@ -766,6 +777,7 @@ pub fn dictLen(d: DictDef, trained: *const fn ([]const u8) []const u8) usize {
         .trained => |name| trained(name).len,
         .reid => |x| trained(x.of).len,
         .crafted => |x| x.content.len + 512,
+        .slice => |x| x.of.len,
     };
 }
 
@@ -1029,4 +1041,64 @@ pub const dict_cases = [_]DictCase{
     .{ .name = "stream-cdict-reload", .input = in_csv_200000, .dict = "zd-csv", .path = .cdict, .schedule = "p200000,c*,e0", .levels = &.{ 1, 3, 5, 9, 16 } },
     .{ .name = "stream-prefix", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .schedule = "c50000,f0,c*,e0", .levels = &.{ 1, 3, 6, 12 } },
     .{ .name = "stream-cdictadv-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "w12,forceAttachDict=2,c10000,f0,c*,e0", .levels = &.{ 3, 7, 16 } }, // the buffer wraps: the dictionary leaves the window
+} ++ dict_cases_attach_opt;
+
+const attach_opt_levels: []const i32 = &.{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };
+const in_words_8192: Case = .{ .name = "", .len = 8192, .kind = .words, .seed = 31 };
+const in_words_8193: Case = .{ .name = "", .len = 8193, .kind = .words, .seed = 31 };
+const in_words_32768: Case = .{ .name = "", .len = 32768, .kind = .words, .seed = 32 };
+const in_words_32769: Case = .{ .name = "", .len = 32769, .kind = .words, .seed = 32 };
+
+/// D3: the optimal parsers with an attached CDict (`dictMatchState`, the
+/// attach cutoffs of btopt 32 KB and btultra / btultra2 8 KB), and
+/// long-distance matching with a dictionary. zd-words' CDict (a 4 KB
+/// dictionary: the 16 KB table) runs btopt at 11-12, btultra at 13-15 and
+/// btultra2 from 16; zd-csv's (16 KB: the 128 KB table) btopt at 13-15,
+/// btultra at 16-18, btultra2 from 19.
+pub const dict_cases_attach_opt = [_]DictCase{
+    // small inputs attach, every optimal level
+    .{ .name = "attach-opt-cdict", .input = in_words_3000, .dict = "zd-words", .path = .cdict, .levels = attach_opt_levels, .checksums = &.{ false, true } },
+    .{ .name = "attach-opt-load", .input = in_words_3000, .dict = "raw-words-8000", .path = .load, .levels = attach_opt_levels },
+    .{ .name = "attach-opt-usingcdict", .input = in_words_3000, .dict = "zd-words", .path = .usingcdict, .levels = &.{ 11, 13, 16, 19, 22 } },
+    .{ .name = "attach-opt-full-as-raw", .input = in_words_3000, .dict = "zd-csv", .path = .cdictadv, .content_type = 1, .levels = &.{ 13, 16, 19, 22 } },
+    // the cutoffs: 8 KB attaches btultra / btultra2, one byte more copies;
+    // btopt attaches up to 32 KB
+    .{ .name = "attach-opt-8192", .input = in_words_8192, .dict = "zd-words", .path = .cdict, .levels = &.{ 11, 13, 15, 16, 19, 22 } },
+    .{ .name = "attach-opt-8193", .input = in_words_8193, .dict = "zd-words", .path = .cdict, .levels = &.{ 11, 13, 15, 16, 19, 22 } },
+    .{ .name = "attach-opt-32768", .input = in_words_32768, .dict = "zd-csv", .path = .cdict, .levels = &.{ 13, 14, 15 } },
+    .{ .name = "attach-opt-32769", .input = in_words_32769, .dict = "zd-csv", .path = .cdict, .levels = &.{ 13, 14, 15 } },
+    // forced: a larger input, several blocks (the dictionary stays valid)
+    .{ .name = "attach-opt-force", .input = in_mix_100000, .dict = "zd-csv", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{ 13, 16, 19, 22 } },
+    .{ .name = "attach-opt-force-blocks", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .load, .params = "forceAttachDict=1", .levels = &.{ 13, 16, 19, 22 } },
+    // strategies and match lengths no level gives with this CDict
+    .{ .name = "attach-opt-strategy-btopt", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .params = "strategy=7", .levels = &.{ 1, 5 } },
+    .{ .name = "attach-opt-strategy-btultra", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .params = "strategy=8", .levels = &.{ 3, 19 } },
+    .{ .name = "attach-opt-strategy-btultra2", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .params = "strategy=9", .levels = &.{ 1, 12 } },
+    .{ .name = "attach-opt-minmatch", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=5", .levels = &.{ 11, 16, 19 } },
+    .{ .name = "attach-opt-minmatch-3", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=3,targetLength=999", .levels = &.{ 11, 13 } },
+    // the input is the dictionary: matches longer than ZSTD_OPT_NUM and up
+    // to the end of the input
+    .{ .name = "attach-opt-self", .input = .{ .name = "", .len = 9000, .kind = .words, .seed = 30 }, .dict = "raw-words-9000-self", .path = .cdict, .levels = &.{ 11, 12 } },
+    .{ .name = "attach-opt-self-force", .input = .{ .name = "", .len = 9000, .kind = .words, .seed = 30 }, .dict = "raw-words-9000-self", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{ 13, 19 } },
+    // attached with long-distance matching
+    .{ .name = "attach-opt-ldm", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .load, .params = "forceAttachDict=1,enableLongDistanceMatching=1", .levels = &.{ 16, 19 } },
+    // unknown sizes attach: streams
+    .{ .name = "attach-opt-stream", .input = in_words_40000, .dict = "zd-words", .path = .cdict, .schedule = "c*,e0", .levels = attach_opt_levels },
+    .{ .name = "attach-opt-stream-load", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .load, .schedule = "c50000,f0,c*,e0", .levels = &.{ 13, 16, 19, 22 } },
+    .{ .name = "attach-opt-stream-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "w12,c10000,f0,c*,e0", .levels = &.{ 13, 19 } }, // the dictionary leaves the window, then the buffer wraps
+    // Found by the mutation sweep:
+    // a CDict longer than its binary tree reaches (`dmsBtLow`)
+    .{ .name = "attach-opt-bt-low", .input = .{ .name = "", .len = 6000, .kind = .csv, .seed = 33 }, .dict = "raw-csv-30000", .path = .cdictadv, .params = "chainLog=12,searchLog=8", .levels = &.{ 13, 16, 19 } },
+    // ... and a candidate right at that edge
+    .{ .name = "attach-opt-bt-low-edge", .input = in_words_40000, .dict = "raw-words-15900", .path = .cdictadv, .params = "chainLog=9,forceAttachDict=1", .levels = &.{ 13, 16 } },
+    // a dictionary taken from the input at 1000: the best match there
+    // starts at the dictionary's first byte (`> dmsLowLimit`)
+    .{ .name = "attach-opt-dict-start", .input = .{ .name = "", .len = 9000, .kind = .words, .seed = 35 }, .dict = "slice-words-6000-at-1000", .path = .cdict, .levels = &.{ 11, 12 } },
+    // the dictionary is the text right before the input's second copy of
+    // itself: its matches run past its end into the prefix
+    // (`ZSTD_count_2segments`)
+    .{ .name = "attach-opt-cross-end", .input = .{ .name = "", .len = 1400000, .kind = .far_repeat, .seed = 34 }, .dict = "slice-far-repeat-tail", .path = .load, .params = "forceAttachDict=1", .levels = &.{ 13, 16 } },
+    // long-distance matching into a raw dictionary the tables reach only
+    // the end of: the LDM table holds all of it
+    .{ .name = "prefix-ldm-beyond-tables", .input = in_mix_100000, .dict = "raw-mix-100000-self", .path = .prefix, .params = "enableLongDistanceMatching=1,hashLog=10,chainLog=10,windowLog=17", .levels = &.{ 1, 5, 16 } },
 };

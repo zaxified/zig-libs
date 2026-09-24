@@ -639,7 +639,7 @@ pub fn hasDictMatchStateVariant(strategy: params.Strategy) bool {
     return switch (strategy) {
         .fast, .dfast => false, // zstd_fast.c, zstd_double_fast.c
         .greedy, .lazy, .lazy2, .btlazy2 => false, // zstd_lazy.c
-        .btopt, .btultra, .btultra2 => false, // zstd_opt.c
+        .btopt, .btultra, .btultra2 => true, // zstd_opt.c
     };
 }
 
@@ -649,9 +649,10 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
     const mls = ms.cp.min_match;
     // `ZSTD_matchState_dictMode`: extDict, else dictMatchState, else noDict.
     // An attached CDict (`dict_match_state`) needs the dictMatchState
-    // variants, which are not ported yet: attaching is refused before any
-    // block (frame.zig, `resetByAttachingCDict`), so it never gets here.
-    if (!ms.hasExtDict() and ms.dict_match_state != null) unreachable;
+    // variants; where they are not ported yet attaching is refused before
+    // any block (frame.zig, `resetByAttachingCDict`), so it never gets here.
+    // The optimal parsers pick their dictMatchState variant themselves.
+    if (!ms.hasExtDict() and ms.dict_match_state != null and !hasDictMatchStateVariant(ms.cp.strategy)) unreachable;
     if (ms.hasExtDict()) switch (ms.cp.strategy) {
         .fast => return switch (mls) {
             5 => fastExtDictBlock(ms, ss, rep, istart, src_size, 5),

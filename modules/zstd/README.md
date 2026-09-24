@@ -16,7 +16,8 @@ frame flags, magicless frames, the splitters, the row match finder, literal
 compression, block size) give libzstd's bytes for the same settings, and so
 does compression with a dictionary (raw or trained, `CDict`, prefixes) —
 except where libzstd would *attach* a `CDict` (inputs under 8–32 KB, unknown
-sizes), which is refused for now; decoding dictionary frames, dictionary
+sizes) with a strategy below the optimal parsers (attaching is ported for
+`btopt`, `btultra`, `btultra2`), which is refused for now; decoding dictionary frames, dictionary
 finalization (of training, the content selection is done:
 `zstd.dict_builder`), the stable-buffer streaming modes and multithreading are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
@@ -234,9 +235,10 @@ The frame carries the dictionary's ID (`advanced.dict_id_flag = false`
 leaves it out); a decoder needs the same dictionary. `StreamOptions` takes
 the same `dictionary` (a `.prefix` for its first frame only). For small
 inputs — up to 8, 16 or 32 KB by strategy — and streams of unknown size,
-libzstd attaches a `CDict` instead of copying it, which is not ported yet:
-`error.DictAttachUnsupported` (`advanced.force_attach_dict = .copy` gets
-libzstd's bytes for the copy). `CDict.initAdvanced` takes a content type
+libzstd attaches a `CDict` instead of copying it. That is ported for the
+optimal parsers (`btopt`, `btultra`, `btultra2`); for the other strategies
+it is not yet: `error.DictAttachUnsupported` (`advanced.force_attach_dict =
+.copy` gets libzstd's bytes for the copy). `CDict.initAdvanced` takes a content type
 (`.auto`, `.raw_content`, `.full`) and advanced parameters; see SPEC.md,
 *Dictionaries*.
 

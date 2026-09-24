@@ -16,12 +16,15 @@
 //! reused stream; libzstd gives fresh-context bytes either way with
 //! dictionaries too (SPEC.md, *Dictionaries*).
 //!
-//! Where libzstd would attach a `CDict` (small inputs), this port refuses
-//! for now (`error.DictAttachUnsupported`); the last tests pin that.
+//! Where libzstd would attach a `CDict` (small inputs), this port does so
+//! for the optimal parsers (`corpus.dict_cases_attach_opt`) and refuses for
+//! the strategies whose `dictMatchState` variant is not ported yet
+//! (`error.DictAttachUnsupported`); the last tests pin that.
 
 const std = @import("std");
 const zstd = @import("root.zig");
 const frame = @import("frame.zig");
+const match = @import("match.zig");
 const corpus = @import("testdata/corpus.zig");
 const goldens = @import("testdata/cdict_goldens.zig");
 const param_test = @import("param_test.zig");
@@ -215,6 +218,8 @@ test "where libzstd would attach a CDict, the frame is refused, not copied" {
     for ([_]i32{ -3, 1, 3, 5, 9, 13, 16, 19, 22 }) |level| {
         var cd = try zstd.CDict.init(gpa, dict, level);
         defer cd.deinit();
+        // strategies whose dictMatchState variants are ported attach
+        if (match.hasDictMatchStateVariant(cd.ms.cp.strategy)) continue;
         // 3000 bytes are below every strategy's cutoff
         try std.testing.expectError(error.DictAttachUnsupported, ctx.compress(&dst, &src, .{ .level = level, .dictionary = .{ .cdict = &cd } }));
         try std.testing.expectError(error.DictAttachUnsupported, ctx.compressUsingCDict(&dst, &src, &cd, .{}));

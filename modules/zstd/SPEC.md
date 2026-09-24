@@ -28,8 +28,9 @@ Not here yet, and a reader might expect it (each is a backlog item):
 
 - **Part of dictionaries (Z2c, Z4, Z5b).** Compressing with a dictionary is
   here (see *Dictionaries*) except where libzstd **attaches** a `CDict` —
-  small or unknown input sizes — which is `error.DictAttachUnsupported`
-  until the match finders' `dictMatchState` variants are ported. Decoding a
+  small or unknown input sizes — of a strategy whose `dictMatchState`
+  variant is not ported yet, which is `error.DictAttachUnsupported` (the
+  optimal parsers' is ported: D3). Decoding a
   frame that names a dictionary is `error.DictionaryWrong`. Of training,
   the content selection is here (*Dictionary training*); finalization is
   not.
@@ -515,11 +516,11 @@ input alone. A `CDict`'s level, if it has one, replaces the context's. Then:
   `ZSTD_shouldAttachDict` says: an input of at most 8 KB (`fast`,
   `btultra`, `btultra2`), 16 KB (`dfast`) or 32 KB (the others) by the
   CDict's strategy, or of unknown size, or `force_attach_dict = .attach` —
-  never with `.copy`, never with `force_max_window`. **Not ported yet:**
-  the frame is refused with `error.DictAttachUnsupported` before anything
-  is written, rather than copied (which would change the bytes). The
-  attach reset itself is in place behind the gate (`match.
-  hasDictMatchStateVariant`).
+  never with `.copy`, never with `force_max_window`. Ported for `btopt`,
+  `btultra` and `btultra2` (below); for a strategy whose variant is **not
+  ported yet** the frame is refused with `error.DictAttachUnsupported`
+  before anything is written, rather than copied (which would change the
+  bytes) — the gate is `match.hasDictMatchStateVariant`.
 
 `Options.dictionary` / `StreamOptions.dictionary` mirror libzstd's calls on
 a context before `ZSTD_compress2` / `ZSTD_compressStream2`: `.raw` is
@@ -581,6 +582,28 @@ verify it with the first variant (`ZSTD_resetCCtx_byAttachingCDict`: the
 parameters by `ZSTD_adjustCParams_internal(cdict cParams, …,
 ZSTD_cpm_attachDict)` with the frame's window log, the working window
 moved up to the CDict's end when it lies below, `loadedDictEnd`).
+
+**The optimal parsers attached (D3).** `btopt`, `btultra` and `btultra2`
+search an attached CDict (`zstd_opt.c` with `dictMode ==
+ZSTD_dictMatchState`: `opt.DictMode.dict_match_state`, a compile-time
+mode, so the no-dictionary and extDict loops are unchanged). A repcode may
+point into the CDict's content, not across the prefix start
+(`ZSTD_index_overlap_check`). Once the context's own tree has been walked,
+what is left of the `searchLog` budget walks the CDict's binary tree —
+read only, hashed with the CDict's hash log and the context's `minMatch`,
+masked by the CDict's chain log, stopped at its `btLow` — and a match may
+run past the CDict's end into the prefix (`ZSTD_count_2segments`). A
+match that ends the context's walk (longer than `ZSTD_OPT_NUM`, or up to
+the block's end) skips the CDict's. The 3-byte hash of `minMatch` 3 is
+searched in the context only (a CDict has none). Attached, `btultra2` runs
+`btultra`, as libzstd has no btultra2 variant for dictMatchState: no first
+statistics pass (`ZSTD_initStats_ultra`), whose "no dictionary" test would
+otherwise pass — an attached window is one segment. The first block's
+statistics come from the CDict's entropy tables as with a copied one
+(`ZSTD_rescaleFreqs`). Long-distance matching runs over the input as
+without a dictionary: a CDict has no LDM table (libzstd gives its
+`ZSTD_loadDictionaryContent` no LDM state), so an attached dictionary
+never enters it, while a loaded one does (above).
 
 ## Decoder
 
@@ -1182,6 +1205,36 @@ prefix larger than the window within one small block, the post-splitter's
 exact power of two (the parameters differ, the frames do not on the one
 case), and the tagged-table cap at 2^24 (needs a 16 MB dictionary).
 
+**Attached, the optimal parsers** (D3, 2026-09-24): 118 more rows in
+`cdict_goldens.zig`, 26 cases in `corpus.dict_cases_attach_opt` (every
+optimal level on small inputs, `.cdict`, `.load`, `compressUsingCDict`
+and a full dictionary as raw; both sides of the 8 KB and 32 KB cutoffs;
+forced attach over several blocks and with LDM; forced strategies and
+`minMatch` 3 / 5; unknown-size streams, one whose window leaves the
+dictionary and wraps). Before them: 5 085 random frames and streams
+(inputs up to 400 KB, raw dictionaries of 1 byte to 400 KB near the input
+and trained ones on the same data, every dictionary path, levels −3…22
+with forced optimal strategies, random advanced parameters incl. LDM)
+identical to libzstd, 1 985 of them through an attached CDict. A
+50-mutation sweep of the new code: 34 caught (9 only after the cases it
+asked for: a CDict longer than its tree and a candidate at its edge, a
+dictionary cut from the input so the best match starts at its first byte,
+and one that ends right before the input's repeat so its matches run on
+into the prefix — the `slice` dictionary source), 5 equivalent (`vEnd` at
+`p_match == m_end`, which counts nothing either way; `dmsBtLow` at
+`dmsBtMask == dmsHighLimit - dmsLowLimit` and its fallback, the same index;
+the `nbCompares != 0` guard, which the loop repeats; the tree update's
+extDict flag, as every candidate is in the prefix), and 10 uncovered: a
+repcode at the CDict's first byte or one before it; a repcode match into
+the CDict that runs on into the prefix (the random frames catch it, no
+generated input does); a CDict match of exactly `ZSTD_OPT_NUM` + 1; a
+CDict match longer than its distance (`matchEndIdx`; the prefix then
+offers the same run nearer); and the guaranteed common length and byte
+order of the CDict's tree walk (they matter only when that length reaches
+past the CDict's end). **LDM entries from a raw dictionary**, D0's
+uncovered mutant, are now caught by `prefix-ldm-beyond-tables` (a
+dictionary its tables reach only the end of).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Speed
@@ -1283,9 +1336,9 @@ dictionaries are undecided.
   attaching is refused. Left:
   - **D1–D3 — attach**: the `dictMatchState` variant of every match
     finder — D1 `fast`/`dfast` (tagged CDict tables), D2 hash chain / row
-    / DUBT, D3 the optimal parsers (and LDM with a dictionary) — each
-    lifting the refusal for its strategies (*Dictionaries*, "Adding an
-    attach variant"). **~1 session each.**
+    / DUBT, ~~D3 the optimal parsers (and LDM with a dictionary)~~ done
+    2026-09-24 — each lifting the refusal for its strategies
+    (*Dictionaries*, "Adding an attach variant"). **~1 session each.**
   - Dedicated dictionary search (`enableDedicatedDictSearch`) optional;
     `prefetchCDictTables` (speed only).
 - **Z5 — Dictionary training.** ~~**Z5a**~~ done 2026-09-24: the content
