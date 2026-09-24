@@ -306,6 +306,18 @@ consumer expects. qap wrote its own (`src/inputs.zig`: first-match `param` with 
 encoded separator can never reach a router). Wanted here, shared with `router`, so the rule that
 decides what a path segment is lives in one place.
 
+**PROXY protocol v1/v2 (server side)** — BACKLOG (2026-09-24, found by qap plan M5.1). A server
+behind a load balancer learns the real client only from the haproxy PROXY header the balancer
+prepends to the connection; nginx (`proxy_protocol`), Go (`pires/go-proxyproto`) and HAProxy itself
+parse it on accept, and nothing in zig-libs does. qap wrote its own (`src/proxy_protocol.zig`: v2
+only, TCP4/TCP6/LOCAL, TLVs bounds-walked and skipped, a 536-byte header cap, and the trusted-peer
+check over `netaddr.Prefix`). Wanted here or as a small module of its own: a parser over a
+`std.Io.Reader` (peek + toss, so a missing optional header leaves the bytes for the codec), v1 text
+form too, TLV access (AWS/GCP ids, SSL info), and the "only from listed peers" rule as the API's
+default rather than the caller's discipline.
+
+**HTTP Upgrade from a handler** — DONE 2026-09-24 (qap plan M5.3): `ResponseWriter.upgrade`.
+
 **h2 server concurrency for fibers** — DONE 2026-09-23 (qap plan M4.7a): `Dispatcher.io`. With it
 set, the session lock is a `std.Io.Mutex` and `waitForPeer`/the drain park on a `std.Io.Condition`
 (`Session.moved`) that `pump`, a retiring handler and the connection task's exit broadcast; a
