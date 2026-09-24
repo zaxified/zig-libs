@@ -313,6 +313,11 @@ new memory ordering.)*
 - **Bounded ring MPMC** — a fixed-capacity, allocation-free variant (Vyukov
   style) for back-pressured pools that prefer blocking-on-full to unbounded
   growth. Complements, does not replace, the Michael-Scott queue.
+  **Second consumer asking (2026-09-24, qap plan M5.2):** qap's span queue needs
+  exactly this with *drop-on-full* (a telemetry producer must never wait) and a
+  single consumer; it carries its own copy (`src/otel.zig` `Queue`, marked
+  `zig-libs request: lockfree`). Wanted: `BoundedRing(T, capacity)` with
+  `tryPush` (false when full) / `tryPop`, MPMC with an MPSC fast path.
 - **Linearizability history check** — the current oracle is multiset-equality
   against a coarse-locked queue (sound for the "no lost/dup/corrupt" properties).
   A full per-op timestamped history + sequential-witness search would additionally
