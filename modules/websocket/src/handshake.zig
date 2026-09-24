@@ -221,6 +221,33 @@ pub fn writeResponse(w: *std.Io.Writer, accept: ServerAccept) std.Io.Writer.Erro
     try w.writeAll("\r\n");
 }
 
+/// Answer a validated handshake through an `http.Server` handler's
+/// response: `Sec-WebSocket-Accept` (and `Sec-WebSocket-Protocol` when one
+/// was negotiated) plus the 101 itself, by `ResponseWriter.upgrade`. Once it
+/// returns the HTTP exchange is over — the serving loop stops, and the
+/// caller speaks frames on the connection's reader and writer (the reader
+/// may already hold the client's first frame).
+///
+/// `writeResponse` is the same answer for a caller that owns the raw
+/// writer; this one is for a handler, whose `ResponseWriter` would refuse
+/// the `Connection: Upgrade` header `writeResponse` writes by hand.
+/// `error.Unsupported` (HTTP/2, a request with a body, HEAD) leaves the
+/// response untouched, so the handler can still answer with an error.
+pub fn respond(rw: *http.Server.ResponseWriter, accept: ServerAccept) http.Server.ResponseWriter.UpgradeError!void {
+    // Checked before a header is set, so a refusal leaves no WebSocket
+    // field behind on the ordinary answer the handler gives instead.
+    if (!rw.upgradable) return error.Unsupported;
+    rw.setHeader("Sec-WebSocket-Accept", &accept.accept_key) catch |err| return switch (err) {
+        error.InvalidHeader => unreachable, // base64 of a digest: always valid
+        else => |e| e,
+    };
+    if (accept.protocol) |p| rw.setHeader("Sec-WebSocket-Protocol", p) catch |err| return switch (err) {
+        error.InvalidHeader => error.InvalidHeader,
+        else => |e| e,
+    };
+    return rw.upgrade("websocket");
+}
+
 // ── client side ─────────────────────────────────────────────────────────
 
 /// Generate a fresh `Sec-WebSocket-Key` (§4.1 point 7): 16 random bytes,
@@ -856,4 +883,48 @@ test "corpus: every response seed reaches h1.ResponseHead.parse, and verifyRespo
     try testing.expectEqual(@as(usize, 1), duplicate_header);
     try testing.expectEqual(@as(usize, 1), unexpected_extension);
     try testing.expectEqual(@as(usize, 1), unexpected_subprotocol);
+}
+
+test "respond: a handler answers the RFC 1.3 handshake with a 101 through http.Server" {
+    const H = struct {
+        fn handle(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+            const accept = try acceptHandshake(req.head, .{ .protocols = &.{"chat"} });
+            try respond(rw, accept);
+        }
+    };
+    const wire = "GET /chat HTTP/1.1\r\nHost: server.example.com\r\nUpgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n\r\n\x88\x80";
+    var in: std.Io.Reader = .fixed(wire);
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var body_buf: [64]u8 = undefined;
+    var resp_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    const d = http.Server.serveStep(.{ .handler = H.handle, .server_name = null }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &body_buf,
+        .response_body = &resp_buf,
+        .chunk = &chunk_buf,
+    }, 0);
+    try std.testing.expectEqual(http.Server.ConnDisposition.close, d);
+    try std.testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "Sec-WebSocket-Protocol: chat\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n\r\n", out.buffered());
+    // The client's first frame (a close) is still there for the frame layer.
+    try std.testing.expectEqualStrings("\x88\x80", in.buffered());
+}
+
+test "respond: refused on a writer that cannot upgrade, with no header left behind" {
+    var out_buf: [256]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    const accept: ServerAccept = .{ .accept_key = computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="), .protocol = null };
+    try std.testing.expectError(error.Unsupported, respond(&rw, accept));
+    try std.testing.expectEqual(@as(usize, 0), rw.headers_len);
 }

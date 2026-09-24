@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — **New `ResponseWriter.upgrade(protocol)`: `101 Switching Protocols` from a
+  handler.** `Connection` is a managed header `setHeader` swallows, so no handler could answer an
+  HTTP Upgrade before. `upgrade` writes the 101 with `Connection: Upgrade` + `Upgrade: <protocol>`
+  (plus the headers already set), flushes, and the h1 loop stops (`.close`) without reading
+  another request — the embedder then speaks the new protocol on the same reader, which may
+  already hold bytes the client pipelined behind its request. `error.Unsupported` on HTTP/2,
+  HTTP/1.0, HEAD, a request with a body and any writer the h1 loop did not build (new
+  `InitOptions.upgradable`, default false), leaving the response usable for an ordinary answer;
+  `error.InvalidHeader` for a protocol that is not `token ["/" token]`. Additive.
+
 - **2026-09-23** — **New `h2_server.Dispatcher.io`: concurrent h2 handlers on fibers of one
   thread.** Without it the dispatcher mode's session lock and its two waits (flow-control credit,
   the drain before the connection ends) yield-spin, which is right for OS-thread pools and a

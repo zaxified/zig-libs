@@ -1775,6 +1775,7 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .compression = if (compression_on) opts.compression else null,
         .gzip_scratch = if (compression_on) bufs.gzip else null,
         .accept_gzip = compression_on and gzip.acceptsGzip(head.header("accept-encoding")),
+        .upgradable = !has_body and !head.http1_0,
     });
 
     // Compiled out entirely outside the test build; see `frame_probe`.
@@ -2286,6 +2287,9 @@ pub const ResponseWriter = struct {
     failed: bool = false,
     /// See `detach`. Only the single-task h2 serve loop reads it.
     detached: bool = false,
+    /// See `upgrade`: only the h1 serving loop sets it, and only for a
+    /// request that carries no body.
+    upgradable: bool = false,
     body: BodySink = .buffering,
     interface: Writer,
 
@@ -2339,6 +2343,10 @@ pub const ResponseWriter = struct {
         /// The request's Accept-Encoding admits gzip (`gzip.acceptsGzip`)
         /// — evaluated by the serving loop, the negotiation input here.
         accept_gzip: bool = false,
+        /// `upgrade` may answer 101 on this connection. Set by the h1
+        /// serving loop for an HTTP/1.1 request without a body; false
+        /// everywhere else (h2, a hand-built writer), so `upgrade` refuses.
+        upgradable: bool = false,
     };
 
     /// `body_buf` is the buffering/auto-Content-Length threshold;
@@ -2357,6 +2365,7 @@ pub const ResponseWriter = struct {
             .gzip_scratch = opts.gzip_scratch,
             .accept_gzip = opts.accept_gzip,
             .field_sink = opts.field_sink,
+            .upgradable = opts.upgradable,
             .interface = .{
                 .vtable = &.{ .drain = drainFn },
                 .buffer = body_buf,
@@ -2800,6 +2809,49 @@ pub const ResponseWriter = struct {
     /// and finishes normally.
     pub fn detach(rw: *ResponseWriter) void {
         rw.detached = true;
+    }
+
+    pub const UpgradeError = Writer.Error || error{ HeadersSent, Unsupported, InvalidHeader, TooManyHeaders, HeaderBytesExhausted };
+
+    /// Answer `101 Switching Protocols` (RFC 9110 §15.2.2) with
+    /// `Connection: Upgrade` and `Upgrade: <protocol>` (§7.8), put it on the
+    /// wire, and hand the connection over: the serving loop stops (`.close`)
+    /// without reading another request, and the embedder speaks `protocol`
+    /// on the same reader and writer — the reader may already hold bytes the
+    /// client sent after its request (a WebSocket client may pipeline a
+    /// frame behind its handshake), so the embedder must keep reading from
+    /// THAT reader, not from the socket. Headers set before the call (e.g.
+    /// `Sec-WebSocket-Accept`) go out with the 101.
+    ///
+    /// `Connection` is a managed header `setHeader` swallows, which is why
+    /// this exists at all: without it no handler could put
+    /// `Connection: Upgrade` on the wire.
+    ///
+    /// `error.Unsupported` where a 101 cannot be right: HTTP/2 (RFC 9113
+    /// §8.6 removed Upgrade), HTTP/1.0 (no 1xx), a HEAD request, and a
+    /// request that carries a body — whose unread bytes would otherwise sit
+    /// in front of the new protocol's first byte. The writer is untouched
+    /// then, so the handler can still answer normally (e.g. 400).
+    pub fn upgrade(rw: *ResponseWriter, protocol: []const u8) UpgradeError!void {
+        if (rw.sent_head) return error.HeadersSent;
+        if (!rw.upgradable or rw.field_sink != null or rw.http1_0 or rw.head_request)
+            return error.Unsupported;
+        // RFC 9110 §7.8: protocol-name ["/" protocol-version], both tokens.
+        const slash = std.mem.indexOfScalar(u8, protocol, '/');
+        const name = protocol[0 .. slash orelse protocol.len];
+        if (!h1.isToken(name)) return error.InvalidHeader;
+        if (slash) |i| if (!h1.isToken(protocol[i + 1 ..])) return error.InvalidHeader;
+        try rw.putHeader("Connection", "Upgrade");
+        try rw.putHeader("Upgrade", protocol);
+        rw.status = 101;
+        // A 101 ends the HTTP exchange; `Connection: close` would contradict
+        // the `Connection: Upgrade` above, and the loop stops either way.
+        rw.close_connection = false;
+        rw.body = .discard;
+        try rw.writeHead(.none);
+        rw.ended = true;
+        rw.detached = true;
+        try rw.out.flush();
     }
 
     /// Whether the connection must close after this response (explicit
@@ -6526,4 +6578,124 @@ test "integration: a connection dropped before serving still reports .new/.close
     // counter that pairs these two must come back to zero.
     try testing.expectEqual(@as(u32, 1), tally.new.load(.monotonic));
     try testing.expectEqual(@as(u32, 1), tally.closed.load(.monotonic));
+}
+
+// ── upgrade (101 Switching Protocols) ────────────────────────────────────
+
+/// What the upgrade handler below saw from `upgrade`, per test.
+const UpgradeProbe = struct {
+    protocol: []const u8 = "websocket",
+    /// Write a body byte first, so the head is on the wire before `upgrade`.
+    send_first: bool = false,
+    result: ?ResponseWriter.UpgradeError!void = null,
+};
+
+fn upgradeHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
+    const probe: *UpgradeProbe = @ptrCast(@alignCast(req.context.?));
+    if (probe.send_first) {
+        try rw.writeAll("x");
+        try rw.flush();
+    }
+    rw.setHeader("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") catch |err|
+        if (!probe.send_first) return err;
+    probe.result = rw.upgrade(probe.protocol);
+    // A refused upgrade leaves the writer usable: answer normally.
+    probe.result.? catch |err| if (err == error.Unsupported or err == error.InvalidHeader) {
+        rw.setStatus(400);
+        try rw.writeAll("no\n");
+    };
+}
+
+fn runUpgrade(probe: *UpgradeProbe, wire: []const u8, out_buf: []u8, residue: *[]const u8) struct { []const u8, ConnDisposition } {
+    var in: Reader = .fixed(wire);
+    var out: Writer = .fixed(out_buf);
+    var head_buf: [1024]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [64]u8 = undefined;
+    var chunk_buf: [128]u8 = undefined;
+    const d = serveStep(.{ .handler = upgradeHandler, .context = probe }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    }, 0);
+    residue.* = in.buffered();
+    return .{ out.buffered(), d };
+}
+
+const ws_request = "GET /chat HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+test "upgrade: 101 on the wire, the loop stops, and bytes behind the head stay in the reader" {
+    var probe: UpgradeProbe = .{};
+    var out_buf: [512]u8 = undefined;
+    var residue: []const u8 = undefined;
+    // A client may pipeline its first frame right behind the handshake.
+    const got, const d = runUpgrade(&probe, ws_request ++ "\x81\x85FRAME", &out_buf, &residue);
+    try probe.result.?;
+    try testing.expectEqual(ConnDisposition.close, d);
+    try testing.expectEqualStrings("HTTP/1.1 101 Switching Protocols\r\n" ++
+        "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Server: zig-libs-http/0.1\r\n\r\n", got);
+    try testing.expectEqualStrings("\x81\x85FRAME", residue);
+}
+
+test "upgrade: a client that asked to close still gets a 101 without Connection: close" {
+    var probe: UpgradeProbe = .{ .protocol = "foo/2" };
+    var out_buf: [512]u8 = undefined;
+    var residue: []const u8 = undefined;
+    const got, _ = runUpgrade(&probe, "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf, &residue);
+    try probe.result.?;
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 101 Switching Protocols\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "Connection: close") == null);
+    try testing.expect(std.mem.indexOf(u8, got, "Upgrade: foo/2\r\n") != null);
+}
+
+test "upgrade: refused where a 101 cannot be right, and the handler still answers" {
+    const cases = [_][]const u8{
+        // HTTP/1.0 has no 1xx.
+        "GET /chat HTTP/1.0\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        // HEAD.
+        "HEAD /chat HTTP/1.1\r\nHost: t\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        // A body: its bytes would sit in front of the new protocol's first.
+        "GET /chat HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nhi",
+        "GET /chat HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n0\r\n\r\n",
+    };
+    for (cases) |wire| {
+        var probe: UpgradeProbe = .{};
+        var out_buf: [512]u8 = undefined;
+        var residue: []const u8 = undefined;
+        const got, _ = runUpgrade(&probe, wire, &out_buf, &residue);
+        try testing.expectError(error.Unsupported, probe.result.?);
+        try testing.expect(std.mem.indexOf(u8, got, "101") == null);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+}
+
+test "upgrade: a malformed protocol and a head already sent are refused" {
+    for ([_][]const u8{ "", "web socket", "a/b/c", "/1", "ws/", "ws\r\nX: y" }) |bad| {
+        var probe: UpgradeProbe = .{ .protocol = bad };
+        var out_buf: [512]u8 = undefined;
+        var residue: []const u8 = undefined;
+        const got, _ = runUpgrade(&probe, ws_request, &out_buf, &residue);
+        try testing.expectError(error.InvalidHeader, probe.result.?);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400 Bad Request\r\n"));
+    }
+    var probe: UpgradeProbe = .{ .send_first = true };
+    var out_buf: [512]u8 = undefined;
+    var residue: []const u8 = undefined;
+    const got, _ = runUpgrade(&probe, ws_request, &out_buf, &residue);
+    try testing.expectError(error.HeadersSent, probe.result.?);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+}
+
+test "upgrade: a writer the h1 loop did not build refuses (h2, hand-built)" {
+    var out_buf: [256]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    try testing.expectError(error.Unsupported, rw.upgrade("websocket"));
+    try testing.expectEqual(@as(usize, 0), out.buffered().len);
 }

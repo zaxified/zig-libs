@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — **New `handshake.respond(rw, accept)`**: answers a validated handshake from an
+  `http.Server` handler — `Sec-WebSocket-Accept` (+ `Sec-WebSocket-Protocol`) and the 101 through
+  `http`'s new `ResponseWriter.upgrade`. `writeResponse` stays for callers that own the raw writer.
+  `error.Unsupported` (HTTP/2, a body, HEAD) sets no header, so the handler can still answer an
+  error. Tested end to end through `http.Server.serveStep` on the RFC §1.3 example, including the
+  client's first frame left in the reader. Additive.
+
 - **2026-09-14** — **BREAKING (error set):** A1 F6, round-2 decision Q7 (API change allowed, consumer
   fixed in the same batch). `writeFrame` guarded the control-frame invariants (`fin`, payload ≤ 125)
   with `std.debug.assert`: in ReleaseFast a 200-byte ping went out as `89 7e 00 c8`, which this
