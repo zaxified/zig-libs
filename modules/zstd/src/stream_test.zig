@@ -29,14 +29,21 @@ const Run = struct {
 
 /// Drive a stream over `src` as `tools/zstream.c` does for `schedule`.
 fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, schedule: []const u8) !Run {
+    return runOn(gpa, null, src, level, checksum, schedule);
+}
+
+/// `run`, on `reused` (reset to the schedule's options) rather than on a
+/// fresh stream when it is given.
+fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level: i32, checksum: bool, schedule: []const u8) !Run {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var pledged: ?u64 = null;
     var window_log: ?u32 = null;
     var ocap: usize = 1 << 24;
     var fed: usize = 0;
-    var s: ?stream.Stream = null;
-    defer if (s) |*st| st.deinit();
+    var own: ?stream.Stream = null;
+    defer if (own) |*st| st.deinit();
+    var s: ?*stream.Stream = null;
     var ocf = false;
     var ldm = false;
     var advanced: zstd.Advanced = .{};
@@ -76,7 +83,14 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
         };
         if (s == null) {
             if (window_log) |w| advanced.window_log = w;
-            s = try stream.Stream.init(gpa, .{ .level = level, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced });
+            const opts: stream.Options = .{ .level = level, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced };
+            if (reused) |r| {
+                try r.reset(opts);
+                s = r;
+            } else {
+                own = try stream.Stream.init(gpa, opts);
+                s = &own.?;
+            }
             s.?.overflow_correct_frequently = ocf;
             s.?.ldm = ldm;
         }
@@ -134,6 +148,11 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
     defer dec_zstd1.deinit();
     var dec_magicless = try zstd.Decompressor.init(gpa, .{ .format = .magicless });
     defer dec_magicless.deinit();
+    // one stream for every frame, reset to each schedule's options (see
+    // golden_test.zig)
+    var reused = try stream.Stream.init(gpa, .{});
+    defer reused.deinit();
+    var frames: u32 = 0;
     for (corpus.stream_cases) |sc| {
         const dec = if (std.mem.indexOf(u8, sc.schedule, "format=1") != null) &dec_magicless else &dec_zstd1;
         const case = findCase(sc.case);
@@ -145,8 +164,9 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
         defer gpa.free(back);
         for (sc.levels) |level| for ([_]bool{ false, true }) |ck| {
             const g = find(sc, level, ck).?;
-            const r = try run(gpa, src, level, ck, sc.schedule);
+            const r = try runOn(gpa, &reused, src, level, ck, sc.schedule);
             defer gpa.free(r.out);
+            frames += 1;
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(r.out, &digest, .{});
             const hex = std.fmt.bytesToHex(digest, .lower);
@@ -182,6 +202,9 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
         };
     }
     try std.testing.expectEqual(@as(usize, 0), mismatches);
+    const ctx = &reused.comp;
+    try std.testing.expect(ctx.n_index_resets > 1 and ctx.n_index_resets < frames / 2);
+    try std.testing.expect(ctx.n_workspace_allocs > 1 and ctx.n_workspace_allocs < frames / 2);
 }
 
 test "a stream ended in its first call is the one-shot frame" {
@@ -210,16 +233,85 @@ test "a pledged size is enforced both ways" {
     gpa.free(r.out);
 }
 
-test "levels above the streaming maximum are refused; a call after the end too" {
+test "levels above the streaming maximum are refused" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.LevelUnsupported, stream.Stream.init(gpa, .{ .level = stream.max_level + 1 }));
     var s = try stream.Stream.init(gpa, .{});
     defer s.deinit();
-    var buf: [64]u8 = undefined;
-    var o: stream.OutBuffer = .{ .dst = &buf };
-    var in: stream.InBuffer = .{ .src = "abc" };
-    try std.testing.expectEqual(@as(usize, 0), try s.compressStream2(&o, &in, .end));
-    try std.testing.expectError(error.FrameEnded, s.compressStream2(&o, &in, .end));
+    try std.testing.expectError(error.LevelUnsupported, s.reset(.{ .level = stream.max_level + 1 }));
+}
+
+/// Feed `src` to `s` as schedule "c<half>,c*,e0" does: one frame.
+fn feedFrame(gpa: std.mem.Allocator, s: *stream.Stream, src: []const u8, out: *std.ArrayList(u8)) !void {
+    var obuf: [4096]u8 = undefined;
+    const half = src.len / 2;
+    for ([_][]const u8{ src[0..half], src[half..], "" }, [_]stream.EndDirective{ .@"continue", .@"continue", .end }) |piece, dir| {
+        var in: stream.InBuffer = .{ .src = piece };
+        while (true) {
+            var o: stream.OutBuffer = .{ .dst = &obuf };
+            const remaining = try s.compressStream2(&o, &in, dir);
+            try out.appendSlice(gpa, obuf[0..o.pos]);
+            if (if (dir == .@"continue") in.pos == in.src.len else remaining == 0) break;
+        }
+    }
+}
+
+test "after its end a stream goes on with a new frame of unknown size, as libzstd" {
+    // libzstd resets the session at the end of a frame
+    // (`ZSTD_CCtx_reset(ZSTD_reset_session_only)`): the pledged size is
+    // forgotten, the options stay, and the context is reused.
+    const gpa = std.testing.allocator;
+    const case = findCase("far-repeat");
+    const src = try gpa.alloc(u8, case.len);
+    defer gpa.free(src);
+    corpus.generate(case, src);
+    const a = src[0 .. src.len / 3];
+    const b = src[src.len / 3 ..];
+    var sched_buf: [3][64]u8 = undefined;
+    for ([_]i32{ 1, 5, 12 }) |level| {
+        var s = try stream.Stream.init(gpa, .{ .level = level, .checksum = true, .pledged_size = a.len });
+        defer s.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(gpa);
+        try feedFrame(gpa, &s, a, &out);
+        const first_len = out.items.len;
+        try feedFrame(gpa, &s, b, &out);
+        try feedFrame(gpa, &s, a, &out);
+        const want_a = try run(gpa, a, level, true, try std.fmt.bufPrint(&sched_buf[0], "p{d},c{d},c*,e0", .{ a.len, a.len / 2 }));
+        defer gpa.free(want_a.out);
+        const want_b = try run(gpa, b, level, true, try std.fmt.bufPrint(&sched_buf[1], "c{d},c*,e0", .{b.len / 2}));
+        defer gpa.free(want_b.out);
+        const want_a2 = try run(gpa, a, level, true, try std.fmt.bufPrint(&sched_buf[2], "c{d},c*,e0", .{a.len / 2}));
+        defer gpa.free(want_a2.out);
+        try std.testing.expectEqualSlices(u8, want_a.out, out.items[0..first_len]);
+        try std.testing.expectEqualSlices(u8, want_b.out, out.items[first_len..][0..want_b.out.len]);
+        try std.testing.expectEqualSlices(u8, want_a2.out, out.items[first_len + want_b.out.len ..]);
+        // the pledged first frame needs less than the two of unknown size,
+        // the third reuses the second's workspace
+        try std.testing.expectEqual(@as(u32, 2), s.comp.n_workspace_allocs);
+    }
+}
+
+test "reset abandons a frame and starts over with new options" {
+    const gpa = std.testing.allocator;
+    const case = findCase("csv-131073");
+    const src = try gpa.alloc(u8, case.len);
+    defer gpa.free(src);
+    corpus.generate(case, src);
+    var s = try stream.Stream.init(gpa, .{ .level = 7 });
+    defer s.deinit();
+    var obuf: [1 << 18]u8 = undefined;
+    var o: stream.OutBuffer = .{ .dst = &obuf };
+    var in: stream.InBuffer = .{ .src = src[0..70000] };
+    _ = try s.compressStream2(&o, &in, .flush); // half a frame, dropped
+    try s.reset(.{ .level = 3, .pledged_size = src.len });
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try feedFrame(gpa, &s, src, &out);
+    var sched_buf: [1][64]u8 = undefined;
+    const want = try run(gpa, src, 3, false, try std.fmt.bufPrint(&sched_buf[0], "p{d},c{d},c*,e0", .{ src.len, src.len / 2 }));
+    defer gpa.free(want.out);
+    try std.testing.expectEqualSlices(u8, want.out, out.items);
 }
 
 test "streams round-trip through std's decoder" {

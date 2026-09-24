@@ -16,6 +16,9 @@
 //! `Stream` is libzstd's streaming compression (`ZSTD_compressStream2`):
 //! the same bytes for the same sequence of calls. `Advanced` holds libzstd's
 //! advanced parameters (`ZSTD_CCtx_setParameter`), with the same effect.
+//! `Compressor` and `Stream` are reusable contexts in one workspace, which
+//! `estimateCompressorSize` / `estimateStreamSize` size exactly and a
+//! caller may provide (`initStatic`).
 //!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd.
@@ -36,7 +39,7 @@ const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size) — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -85,10 +88,83 @@ pub fn compressBound(src_size: usize) usize {
 
 /// Compress `src` into one frame in `dst`, which must hold at least
 /// `compressBound(src.len)` bytes. Returns the frame length. `gpa` is used
-/// for the match tables and block buffers only, all freed before returning.
+/// for the match tables and block buffers only, all freed before returning;
+/// a `Compressor` keeps them for the next frame.
 pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
+    var c: Compressor = .init(gpa);
+    defer c.deinit();
+    return c.compress(dst, src, opts);
+}
+
+/// A compression context (libzstd's `ZSTD_CCtx` with `ZSTD_compress2`),
+/// reusable from frame to frame: its workspace -- match tables, block
+/// states, buffers, in one allocation -- is kept while it is big enough
+/// and not long three times too big, and the tables are not cleared
+/// between frames (indexing goes on past the last frame, as in libzstd).
+/// Every frame is the one a fresh context gives.
+pub const Compressor = struct {
+    ctx: frame.Compressor,
+
+    /// Allocates nothing until the first frame.
+    pub fn init(gpa: std.mem.Allocator) Compressor {
+        return .{ .ctx = .initEmpty(gpa) };
+    }
+
+    /// A context in the caller's `workspace` (`ZSTD_initStaticCCtx`), which
+    /// it never frees or resizes: a frame needing more than
+    /// `workspace.len` bytes (`estimateCompressorSize`) fails with
+    /// `error.OutOfMemory`.
+    pub fn initStatic(workspace: Workspace) Compressor {
+        return .{ .ctx = .initStatic(workspace) };
+    }
+
+    pub fn deinit(c: *Compressor) void {
+        c.ctx.deinit();
+        c.* = undefined;
+    }
+
+    /// See `zstd.compress`.
+    pub fn compress(c: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
+        if (opts.level > max_level) return error.LevelUnsupported;
+        return c.ctx.compressFrame(dst, src, .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced });
+    }
+
+    /// The bytes the workspace holds now (`ZSTD_sizeof_CCtx` less the
+    /// context itself).
+    pub fn workspaceSize(c: *const Compressor) usize {
+        return c.ctx.ws.len;
+    }
+};
+
+/// A caller's workspace for `Compressor.initStatic` / `Stream.initStatic`.
+pub const Workspace = frame.Workspace;
+pub const workspace_alignment = frame.workspace_alignment;
+
+/// The exact workspace a `Compressor` allocates to compress `src_size`
+/// bytes with `opts` (`ZSTD_estimateCCtxSize_usingCCtxParams`, for this
+/// port's layout, not libzstd's number); null for the most that any input
+/// size needs (`ZSTD_estimateCCtxSize`).
+pub fn estimateCompressorSize(src_size: ?u64, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
-    return frame.compress(gpa, dst, src, .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced });
+    try opts.advanced.check();
+    const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };
+    if (src_size) |n| return frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced, false), n, fo, false);
+    // The need grows with the size within each size class; past the last
+    // class it stops growing once the window no longer shrinks to the
+    // input, which the largest size stands for.
+    const largest = params.unknown_size - 1;
+    var most = frame.workspaceSize(params.getOverridden(opts.level, largest, opts.advanced, false), largest, fo, false);
+    for (params.size_class_bounds) |n|
+        most = @max(most, frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced, false), n, fo, false));
+    return most;
+}
+
+/// The exact workspace a `Stream` with `opts` allocates for its first
+/// frame when `opts.pledged_size` or `opts.src_size_hint` is set (with a
+/// hint, for every frame); with neither, the most any of its frames can
+/// need (`ZSTD_estimateCStreamSize`).
+pub fn estimateStreamSize(opts: StreamOptions) StreamError!usize {
+    return stream.estimateSize(opts);
 }
 
 /// `ZSTD_SKIPPABLEHEADERSIZE`.
@@ -123,8 +199,8 @@ pub const FrameWriter = frame_writer.FrameWriter;
 pub const FrameWriterOptions = frame_writer.Options;
 
 /// Streaming compression, byte-identical to libzstd's `ZSTD_compressStream2`
-/// for the same sequence of calls (see stream.zig). Levels up to
-/// `stream_max_level` for now.
+/// for the same sequence of calls (see stream.zig), frame after frame on
+/// one context.
 pub const Stream = stream.Stream;
 pub const StreamOptions = stream.Options;
 pub const StreamError = stream.Error;
@@ -225,6 +301,7 @@ test {
     _ = @import("decoder_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("param_test.zig");
+    _ = @import("context_test.zig");
     _ = @import("fuzz_test.zig");
 }
 

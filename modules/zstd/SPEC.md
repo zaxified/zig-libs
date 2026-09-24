@@ -28,9 +28,8 @@ Not here yet, and a reader might expect it (each is a backlog item):
 - **Dictionaries (Z2c, Z4, Z5).** A frame naming a dictionary is
   `error.DictionaryWrong`.
 - **The rest of the streaming API.** `Stream` (see *Algorithm*) does
-  libzstd's default buffered modes for one frame; not the stable-buffer
-  modes, a second frame on the same context (Z1, Z13), or a `std.Io.Writer`
-  over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
+  libzstd's default buffered modes, frame after frame on one context; not
+  the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
 - **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8),
   and long-distance matching as an option (Z7).** libzstd's `ZSTD_c_enableLongDistanceMatching`
@@ -224,8 +223,9 @@ never how the writes were cut (a `rebase` asking for more room than is left
 also cuts one, as a flush would). `finish` on a stream that never produced a
 frame writes the 9-byte empty frame, so an empty body is still a valid zstd
 stream. A decoder reads concatenated frames as one stream (RFC 8878 §3.1).
-Each frame starts with no history and allocates its match tables anew, so
-small flushes cost ratio and time; Z1 is the real stream. `Writer.Error` has
+Each frame starts with no history, so small flushes cost ratio; the
+compression context (its workspace, see *Contexts*) is reused from frame
+to frame. `Stream` is the real stream. `Writer.Error` has
 one member, so a failure of our own (out of memory) is kept in
 `FrameWriter.err`; null there means `output` failed.
 
@@ -280,6 +280,91 @@ dictionaries: Z4); the LDM switch and parameters (Z7); `targetCBlockSize`
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
 act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
+
+## Contexts: reuse and sizing
+
+`Compressor` (one-shot, `ZSTD_compress2` on a `ZSTD_CCtx`), `Stream` and
+`FrameWriter` hold a compression context (`frame.Compressor`) that is set
+up anew for each frame by `begin`, the port of `ZSTD_resetCCtx_internal`.
+Everything the context needs — match tables, tag table, block states, the
+pre-splitter's and the optimal parser's scratch, the LDM table and
+sequences, sequence and literal buffers, a stream's input and output
+buffers — lives in one workspace (libzstd's `ZSTD_cwksp`), tables first.
+The port keeps libzstd's policy for it:
+
+- The workspace is kept for the next frame when it is big enough, and
+  replaced when it is too small or when three times what a frame needs has
+  been free for more than 128 frames in a row
+  (`ZSTD_WORKSPACETOOLARGE_FACTOR` / `_MAXDURATION`; "free" counts from the
+  previous frame's layout, so the first smaller frame after a bigger one
+  does not count).
+- Indexing goes on where the last frame ended (`ZSTD_window_clear`: the new
+  window starts at the old end, nothing below it is valid) unless the
+  context is new, its workspace was replaced, or the index is within 16 MB
+  of `ZSTD_CURRENT_MAX` (`ZSTD_indexTooCloseToMax`) — then it restarts at 2
+  (`ZSTD_window_init`). The match tables are not cleared when indexing goes
+  on: whatever they hold is an index of an older frame, below the window.
+  Only table space the last frame's tables did not cover is zeroed
+  (libzstd's `tableValidEnd`), and all of it when indexing restarts. The
+  row match finder's tag table keeps its contents when it lands where it
+  was (libzstd's init-once space), and is zeroed otherwise.
+- The row match finder's hash salt advances at every frame that uses it
+  (`ZSTD_advanceHashSalt`; the entropy mixed in is never set in libzstd
+  1.5.7, so the sequence is fixed). Block states, repeat offsets, the
+  optimal parser's statistics and LDM's table and window start fresh.
+
+**The output of a reused context is the output of a fresh one.** This was
+measured before building on it (2026-09-24): libzstd 1.5.7 compressing with
+one reused `ZSTD_CCtx` and with a fresh one per frame, 1 960 frames —
+`ZSTD_compress2` and `ZSTD_compressStream2` (random chunking and flushes),
+levels −7…22, sizes 0 to 1.1 MB from a 12 MB mix, half of them with random
+explicit window/strategy/search/minimum-match/row/LDM settings, and 600 on
+a build that corrects index overflow frequently — gave no difference. A
+debug build confirmed the reused frames continued their indexing (37 of 40
+in a sample; the rest restarted on a resized workspace). The reasons: the
+salt XORs the hash before the shift, a bijection on (row, tag), so it moves
+entries without changing which collide; a stale table entry is below the
+window and is rejected like an empty one; a row lists its entries newest
+first, so stale entries come after every live one. Hence the golden tests
+run every frame through one reused context (`golden_test.zig`,
+`param_test.zig`, `stream_test.zig`), across levels, sizes and seams, so
+they exercise keeping, replacing and relaying out the workspace and both
+ways of starting the index — and still must equal libzstd's fresh-context
+frames. One byte is left to chance on both sides: the `dfast` extDict read
+one byte past the old segment (see *Algorithm*) finds whatever the input
+buffer held there, in a reused stream the last frame's input, as in
+libzstd while its buffer stays in place.
+
+What reuse saves (instructions under callgrind, ReleaseFast, `smp_allocator`,
+the same frames fresh and on one context): 16 % on 1 KB frames and 24 % on
+16 KB frames at level 3 — mostly the table clearing a fresh context does
+per frame — and under 1 % where compression dominates (16 KB at level 19,
+128 KB at level 1). The allocator's system calls are not in those counts.
+
+`Stream` after its end: libzstd resets the session
+(`ZSTD_CCtx_reset(ZSTD_reset_session_only)`), so the next call starts a new
+frame with the same options and an unknown size; `Stream.reset(opts)`
+(`ZSTD_reset_session_and_parameters` plus the new options, pledged size
+included) abandons a frame or changes the options.
+
+**Sizes.** `estimateCompressorSize(src_size, opts)` and
+`estimateStreamSize(opts)` return exactly the workspace the context
+allocates — this port's layout, computed by the same function `begin`
+lays the workspace out with, not libzstd's number (which counts its C
+structures and packing); `workspaceSize()` reports what a context holds.
+A null size, and a stream with neither a pledged size nor a size hint,
+give the most any input can need: within each of the level table's size
+classes (≤ 16 KB, ≤ 128 KB, ≤ 256 KB) the parameters grow with the size,
+so the maximum is at a class bound or at the largest size (an unknown size
+for a stream, whose hash log is not capped by the window). A stream with a
+pledged size is exact for its first frame (later frames have an unknown
+size); with a size hint, for every frame. `initStatic` takes a caller's
+workspace (`ZSTD_initStaticCCtx`), aligned to 64 bytes (`Workspace`); it is
+never freed or replaced, and a frame that needs more is
+`error.OutOfMemory`. For scale (`estimate*`): level 1 one-shot on 64 KB,
+0.3 MB; level 3 on 1 MB, 1.3 MB one-shot, 2.6 MB as a stream with that
+size pledged, 3.7 MB for an unknown size; level 19 on 1 MB, 18 MB; the
+most any input needs at level 22, 740 MB one-shot and 874 MB streaming.
 
 ## Decoder
 
@@ -359,6 +444,7 @@ the heap; `decompress` allocates one per call.
 | advanced parameters | libzstd's bounds (see *Advanced parameters*), else `error.ParameterOutOfBound` | `ZSTD_cParam_getBounds`, 64-bit |
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
 | stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
+| context memory | one workspace, exactly `estimateCompressorSize` / `estimateStreamSize`; a static one is never exceeded (`error.OutOfMemory`) | `ZSTD_estimateCCtxSize*`, `ZSTD_initStaticCCtx` |
 | decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header, else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (64-bit); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
 | decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), plus the ≈ 190 KB context | `ZSTD_decodingBufferSize_min` |
 | decode destination | the whole output; too small is `error.DstSizeTooSmall`. `decompressAlloc` sizes from the headers, else `decompressBound`, never above its `max_size` | `ZSTD_decompress` |
@@ -366,9 +452,10 @@ the heap; `decompress` allocates one per call.
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
 pin the level refusal and the destination bound, `stream_test.zig` the
-stream's level refusal, the pledged size both ways and the call after the
-end. `FrameWriter` takes a
-nonempty buffer and holds `compressBound(buffer.len)` of scratch for its life.
+stream's level refusal, the pledged size both ways and the frame after the
+end, `context_test.zig` the estimates and a static workspace's bound.
+`FrameWriter` takes a nonempty buffer and holds `compressBound(buffer.len)`
+of scratch and its context's workspace for its life.
 
 ## Anchoring
 
@@ -432,7 +519,7 @@ the sweep, the hash salt:
 | `fillHashCache` limit `>` → `>=` | the entry it drops is for a position no search reaches before the block ends |
 | `nextToUpdate` raised to `lowLimit` before a block | unreachable one-shot: insertion trails the parser by at most a block, the window's low end only moves once the input passes the window |
 | row `hashLog` cap `24 + rowLog` → `23 + rowLog` | unreachable at levels ≤ 10 (hash logs ≤ 23, cap ≥ 28); binds from level 22 |
-| hash salt → 0 | equivalent on a fresh context: the salt XORs every hash before the shift, a bijection on (row, tag) that leaves every collision in place; it matters only for reused tag tables |
+| hash salt → 0 | equivalent: the salt XORs every hash before the shift, a bijection on (row, tag) that leaves every collision in place — on a reused context too (see *Contexts*) |
 | `nbSeq >= 2048` → `>` in `ZSTD_NCountCost` | reachable in principle: a block of exactly 2048 sequences whose cost comparison flips on the low-probability rule; 4 000 generated seeds × 7 kinds × 6 sizes did not hit it. **Uncovered.** |
 
 `btlazy2` (levels 9–10) followed on the same day: 35 mutations of the
@@ -688,6 +775,26 @@ streaming decoder's single-pass shortcut sizing a magicless frame as a
 zstd1 one (it then finds no frame and decodes through the stream path, to
 the same bytes).
 
+**Context reuse** (2026-09-24) has no goldens of its own: libzstd gives a
+reused context the bytes of a fresh one (measured, see *Contexts*), so the
+golden, parameter and stream goldens all run through one reused context
+each, and `context_test.zig` checks the policy and the sizes. 12 mutations
+of the new code: 7 caught — the table space a larger layout newly covers
+left uncleared, or kept as clean across an index restart (both crash on
+garbage indices), indexing never restarting near its limit, the oversized
+workspace never replaced or replaced one frame early, a stream keeping its
+pledged size into the next frame, and the estimate for an unknown size
+ignoring the size classes (caught only once level 11 with tiny explicit
+tables was added: its 16 KB class runs `btopt`, whose parser scratch
+outweighs everything a larger input needs). 5 survive, all equivalent:
+the cleared window's `lowLimit` and `nextToUpdate` (the continuing window
+has an empty prefix, so its first update takes the non-contiguous path,
+which sets both again), the tag table never cleared and the hash salt not
+advanced (see *Contexts*: stale tags come after every live entry, and the
+salt permutes rows and tags), and the stream's output buffer one byte
+short of libzstd's `compressBound(block) + 1` (the bound leaves 512 bytes
+over a block and its header, so the room never decides).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## What is deliberately not done
@@ -735,9 +842,9 @@ dictionaries are undecided.
     every level.
   - **Later:** the stable-input / stable-output buffer modes
     (`ZSTD_c_stableInBuffer`, which compresses straight from the caller's
-    buffer and waits for a full block), `ZSTD_CCtx_reset` and a second frame
-    on the same context (with Z13), a `std.Io.Writer` over `Stream`
+    buffer and waits for a full block), a `std.Io.Writer` over `Stream`
     (replacing `FrameWriter` for callers that want libzstd's bytes).
+    (`ZSTD_CCtx_reset` and frames after the first: done with Z13.)
 - **Z2 — Decoder.** ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
   checksum verification, concatenated and skippable frames and the frame
   utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
@@ -798,12 +905,16 @@ dictionaries are undecided.
 - **Z12 — Portability.** Run `portable-zstd-*`; big-endian (the
   pre-splitter's 16-bit hash reads *native* order in libzstd — decide which
   to match); 32-bit (`ZSTD_CURRENT_MAX` 2 000 MB). **~0.5 session.**
-- **Z13 — Context reuse and sizing.** A reused `CCtx` gives different
-  output than a fresh one (hash salt, tables kept between frames); match
-  that, plus `ZSTD_estimateCCtxSize*` for memory planning and a
-  caller-provided workspace (`ZSTD_initStaticCCtx`). **~1 session.** With Z1.
+- ~~**Z13 — Context reuse and sizing.**~~ Done 2026-09-24, see *Contexts*.
+  Its premise was wrong: without a dictionary a reused libzstd context gives
+  the same bytes as a fresh one (measured), so reuse is for speed and
+  memory; libzstd's reuse policy is ported anyway. Also
+  `ZSTD_estimateCCtxSize*` (as this port's exact sizes), a caller's
+  workspace (`ZSTD_initStaticCCtx`), and a stream's later frames and
+  `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
+  `CDict` attached or copied into a reused context.
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6 done) Z13 → Z11 → Z7 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13 done) Z11 → Z7 → Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 

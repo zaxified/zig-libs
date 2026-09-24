@@ -97,6 +97,9 @@ test "every parameter case has a golden row, and nothing else does" {
 test "output with advanced parameters is byte-identical to libzstd 1.5.7, and decodes back" {
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
+    // one context for every frame (see golden_test.zig)
+    var ctx: zstd.Compressor = .init(gpa);
+    defer ctx.deinit();
     for (corpus.param_cases) |pc| {
         const case = findCase(pc.case);
         const src = try gpa.alloc(u8, case.len);
@@ -111,7 +114,7 @@ test "output with advanced parameters is byte-identical to libzstd 1.5.7, and de
         defer dec.deinit();
         for (pc.levels) |level| for (pc.checksums) |ck| {
             const g = find(pc, level, ck).?;
-            const n = try zstd.compress(gpa, dst, src, .{ .level = level, .checksum = ck, .advanced = adv });
+            const n = try ctx.compress(dst, src, .{ .level = level, .checksum = ck, .advanced = adv });
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(dst[0..n], &digest, .{});
             const hex = std.fmt.bytesToHex(digest, .lower);

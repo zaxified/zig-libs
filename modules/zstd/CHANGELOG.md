@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Context reuse and sizing (SPEC backlog Z13):
+  `zstd.Compressor` (a reusable `ZSTD_CCtx` for one-shot frames), and
+  `Stream` goes on after the end of a frame with the next one (unknown
+  size, same options) as libzstd does; `Stream.reset(opts)`
+  (`ZSTD_CCtx_reset`) abandons a frame or changes the options.
+  `error.FrameEnded` is gone. A context now lives in one workspace, kept
+  from frame to frame under libzstd's policy (replaced when too small or
+  three times too big for 128 frames; indexing goes on past the last frame,
+  tables not cleared, restarting near the index limit); `FrameWriter`
+  reuses its context too. `estimateCompressorSize` / `estimateStreamSize`
+  give the exact workspace (null / no size: the most any input needs);
+  `Compressor.initStatic` / `Stream.initStatic` run in a caller's
+  64-byte-aligned workspace (`ZSTD_initStaticCCtx`), `error.OutOfMemory`
+  when a frame needs more. The backlog's premise that a reused context
+  changes the output was measured false (1 960 frames of libzstd 1.5.7,
+  reused vs fresh, no difference), so every golden test now runs through
+  one reused context. Reuse saves 16–24 % of instructions on 1–16 KB
+  frames at level 3.
 - **2026-09-24** — Advanced parameters (SPEC backlog Z6): `Options`,
   `StreamOptions` and `FrameWriterOptions` take `advanced: zstd.Advanced`,
   libzstd's `ZSTD_CCtx_setParameter` set — explicit window, hash, chain and

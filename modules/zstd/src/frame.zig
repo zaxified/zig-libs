@@ -331,198 +331,390 @@ pub const Options = struct {
     overflow_corrections: ?*[2]u32 = null,
 };
 
-/// One-shot frame. `dst.len` must be at least `compressBound(src.len)`.
+/// One-shot frame on a fresh context. `dst.len` must be at least
+/// `compressBound(src.len)`.
 pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Options) Error!usize {
-    const bound = compressBound(src.len);
-    if (dst.len < bound) return error.NoSpaceLeft;
-    // libzstd is given exactly the bound (zref); the room a block may use
-    // can decide whether it is stored compressed
-    const out = dst[0..bound];
-    try opts.advanced.check();
-    const cp = params.getOverridden(opts.level, src.len, opts.advanced, opts.ldm);
-    var comp = try Compressor.init(gpa, cp, src.len, opts);
+    var comp: Compressor = .initEmpty(gpa);
     defer comp.deinit();
-    const n = comp.compressContinue(out, src, true) catch unreachable; // pledged is src.len
-    const m = comp.writeEpilogue(out[n..]);
-    if (opts.overflow_corrections) |oc| oc.* = .{ comp.c.ms.n_overflow_corrections, if (comp.c.ldm) |ls| ls.n_overflow_corrections else 0 };
-    return n + m;
+    return comp.compressFrame(dst, src, opts);
 }
 
-/// libzstd's compression context between `ZSTD_compressBegin` and the end
-/// of the frame: parameters, match state, block states and buffers
-/// (`ZSTD_resetCCtx_internal`), fed one chunk of input at a time
+/// The workspace alignment: the tables start on a cache line, as libzstd's
+/// do (`ZSTD_CWKSP_ALIGNMENT_BYTES`).
+pub const workspace_alignment = 64;
+pub const Workspace = []align(workspace_alignment) u8;
+
+/// Where each part of a compression context lives in its workspace, for
+/// one frame's parameters (libzstd's `ZSTD_cwksp` reservations in
+/// `ZSTD_resetCCtx_internal`, not its byte layout). The match tables come
+/// first, so that a reused workspace keeps them in place; `total` is what
+/// the context needs (`ZSTD_estimateCCtxSize_usingCCtxParams`, for this
+/// port).
+const Layout = struct {
+    total: usize = 0,
+    hash_len: usize,
+    chain_len: usize,
+    hash3_len: usize,
+    hash_log3: u32,
+    row: bool,
+    block_size_max: usize,
+    window_size: usize,
+    max_n_seq: usize,
+    ldm_params: ?ldm.Params,
+    tag: usize = 0,
+    states: usize = 0,
+    split_ws: usize = 0,
+    opt_state: usize = 0,
+    ldm_state: usize = 0,
+    ldm_table: usize = 0,
+    ldm_buckets: usize = 0,
+    ldm_seqs: usize = 0,
+    ldm_n_seqs: usize = 0,
+    seqs: usize = 0,
+    codes: usize = 0,
+    lits: usize = 0,
+    in_buff: usize = 0,
+    in_buff_len: usize = 0,
+    out_buff: usize = 0,
+    out_buff_len: usize = 0,
+
+    fn tablesBytes(l: *const Layout) usize {
+        return (l.hash_len + l.chain_len + l.hash3_len) * @sizeOf(u32);
+    }
+
+    fn compute(cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) Layout {
+        const adv = opts.advanced;
+        const ldm_params: ?ldm.Params = if (opts.ldm or ldm.enabledByDefault(cp)) ldm.adjustParameters(cp) else null;
+        const window_size: usize = @intCast(@max(1, @min(@as(u64, 1) << @intCast(cp.window_log), pledged orelse std.math.maxInt(u64))));
+        // ZSTD_resolveMaxBlockSize
+        const block_size_max: usize = @min(adv.max_block_size orelse block_size_max_abs, window_size);
+        const row = params.resolveRowMatchFinder(adv.row_match_finder, cp);
+        const hash_len = @as(usize, 1) << @intCast(cp.hash_log);
+        // ZSTD_reset_matchState: the 3-byte hash of the optimal parser
+        const hash_log3: u32 = if (cp.min_match == 3) @min(opt.hash_log3_max, cp.window_log) else 0;
+        var l: Layout = .{
+            .hash_len = hash_len,
+            // ZSTD_allocateChainTable: not for fast, not with the row match finder
+            .chain_len = if (cp.strategy != .fast and !row) @as(usize, 1) << @intCast(cp.chain_log) else 0,
+            .hash3_len = if (hash_log3 != 0) @as(usize, 1) << @intCast(hash_log3) else 0,
+            .hash_log3 = hash_log3,
+            .row = row,
+            .block_size_max = block_size_max,
+            .window_size = window_size,
+            // ZSTD_maxNbSeq: every sequence carries a match of at least
+            // min_match bytes
+            .max_n_seq = block_size_max / @as(usize, if (cp.min_match == 3) 3 else 4) + 1,
+            .ldm_params = ldm_params,
+        };
+        var off = l.tablesBytes();
+        l.tag = place(&off, u8, if (row) hash_len else 0, workspace_alignment);
+        l.states = place(&off, BlockState, 2, @alignOf(BlockState));
+        l.split_ws = place(&off, presplit.Workspace, 1, @alignOf(presplit.Workspace));
+        if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt))
+            l.opt_state = place(&off, opt.State, 1, @alignOf(opt.State));
+        if (ldm_params) |lp| {
+            l.ldm_state = place(&off, ldm.State, 1, @alignOf(ldm.State));
+            l.ldm_table = place(&off, ldm.Entry, @as(usize, 1) << @intCast(lp.hash_log), @alignOf(ldm.Entry));
+            l.ldm_buckets = place(&off, u8, @as(usize, 1) << @intCast(lp.hash_log - lp.bucket_size_log), 1);
+            // ZSTD_ldm_getMaxNbSeq over one block
+            l.ldm_n_seqs = ldm.maxNbSeq(lp, block_size_max);
+            l.ldm_seqs = place(&off, ldm.RawSeq, l.ldm_n_seqs, @alignOf(ldm.RawSeq));
+        }
+        l.seqs = place(&off, sequences.SeqDef, l.max_n_seq, @alignOf(sequences.SeqDef));
+        l.codes = place(&off, u8, 3 * l.max_n_seq, 1);
+        l.lits = place(&off, u8, block_size_max, 1);
+        if (buffered) {
+            // one window plus one block in, one compressed block out
+            l.in_buff_len = window_size + block_size_max;
+            l.in_buff = place(&off, u8, l.in_buff_len, 1);
+            l.out_buff_len = compressBound(block_size_max) + 1;
+            l.out_buff = place(&off, u8, l.out_buff_len, 1);
+        }
+        l.total = std.mem.alignForward(usize, off, workspace_alignment);
+        return l;
+    }
+
+    fn place(off: *usize, comptime T: type, n: usize, alignment: usize) usize {
+        off.* = std.mem.alignForward(usize, off.*, alignment);
+        const at = off.*;
+        off.* += n * @sizeOf(T);
+        return at;
+    }
+};
+
+/// The workspace a context needs for a frame with these parameters: the
+/// same number `Compressor.begin` then asks for.
+pub fn workspaceSize(cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) usize {
+    return Layout.compute(cp, pledged, opts, buffered).total;
+}
+
+/// `ZSTD_INDEXOVERFLOW_MARGIN`.
+const index_overflow_margin: u32 = 16 << 20;
+/// `ZSTD_WORKSPACETOOLARGE_FACTOR`, `ZSTD_WORKSPACETOOLARGE_MAXDURATION`.
+const workspace_too_large_factor = 3;
+const workspace_too_large_max_duration = 128;
+
+/// libzstd's compression context (`ZSTD_CCtx`): one workspace holding the
+/// match tables, block states and buffers, set up for each frame by
+/// `begin` (`ZSTD_resetCCtx_internal`) and fed one chunk of input at a time
 /// (`ZSTD_compressContinue`, `ZSTD_compressEnd`). A chunk that follows the
 /// previous one in memory extends the window's prefix; one that does not
 /// turns the prefix into the extDict (`match.MatchState.windowUpdate`).
+///
+/// Reused for another frame, the context keeps its workspace when it is
+/// big enough and not wastefully big, and, as libzstd does, its indices go
+/// on from where the last frame ended: the match tables are not cleared
+/// (whatever they hold lies below the new window), only the table space
+/// the last frame did not use is. The frame's output is the same as from a
+/// fresh context.
 pub const Compressor = struct {
-    gpa: std.mem.Allocator,
-    cp: params.CParams,
-    checksum: bool,
+    /// Null for a caller's fixed workspace (`ZSTD_initStaticCCtx`), which
+    /// is never resized.
+    gpa: ?std.mem.Allocator,
+    ws: Workspace = &.{},
+    /// Bytes of `ws` the current frame's layout uses.
+    ws_used: usize = 0,
+    /// `workspaceOversizedDuration`.
+    oversized_duration: u32 = 0,
+    /// `zc->initialized`: the window has been set up once.
+    initialized: bool = false,
+    /// Leading bytes of `ws` whose values are table indices below the
+    /// window (`tableValidEnd`): a table laid over them needs no clearing.
+    tables_valid: usize = 0,
+    /// Where the last frame's tag table was, if it had one: a tag table in
+    /// the same place keeps its contents (libzstd's init-once space).
+    tag_prev: ?[2]usize = null,
+    /// Test seam: the index past which a new frame restarts indexing
+    /// rather than going on (`ZSTD_CURRENT_MAX - ZSTD_INDEXOVERFLOW_MARGIN`).
+    index_too_close: u32 = match.current_max - index_overflow_margin,
+    /// Frames that restarted indexing, and workspaces allocated. Not
+    /// libzstd's; tests read them.
+    n_index_resets: u32 = 0,
+    n_workspace_allocs: u32 = 0,
+
+    // Set by `begin` for each frame.
+    cp: params.CParams = undefined,
+    checksum: bool = false,
     /// `pledgedSrcSize`; null for unknown, which also leaves it out of the
     /// frame header.
-    pledged: ?u64,
+    pledged: ?u64 = null,
     /// `ZSTD_c_contentSizeFlag`.
-    content_size_flag: bool,
-    format: params.Format,
+    content_size_flag: bool = true,
+    format: params.Format = .zstd1,
     /// `blockSizeMax`: `min(maxBlockSize, window size)` (128 KB unless
     /// `Advanced.max_block_size` says less), the window shrunk to a known
     /// size.
-    block_size_max: usize,
+    block_size_max: usize = 0,
     stage: enum { init, ongoing, ending } = .init,
     consumed: u64 = 0,
     produced: u64 = 0,
     xxh: std.hash.XxHash64 = .init(0),
-    overflow_correct_frequently: bool,
-    c: Ctx,
-    states: *[2]BlockState,
-    split_ws: *presplit.Workspace,
-    tables: []u32,
-    tag_table: []u8,
-    codes: []u8,
-    lits: []u8,
-    seqs: []sequences.SeqDef,
-    opt_state: ?*opt.State,
-    ldm_table: []ldm.Entry,
-    ldm_buckets: []u8,
-    ldm_state: ?*ldm.State,
+    overflow_correct_frequently: bool = false,
+    c: Ctx = .{
+        .ms = .{ .src = &.{}, .cp = undefined, .hash_table = &.{}, .chain_table = &.{} },
+        .ss = undefined,
+        .prev = undefined,
+        .next = undefined,
+        .strategy = 0,
+        .disable_literal_compression = false,
+        .pre_split_level = 0,
+        .split_blocks = false,
+    },
+    split_ws: *presplit.Workspace = undefined,
+    /// A buffered stream's input and output buffers (`begin` with
+    /// `buffered`), in the workspace.
+    in_buff: []u8 = &.{},
+    out_buff: []u8 = &.{},
 
     pub const SizeError = error{
         /// More input than pledged, or less at the end (`srcSize_wrong`).
         SrcSizeWrong,
     };
 
-    pub fn init(gpa: std.mem.Allocator, cp: params.CParams, pledged: ?u64, opts: Options) error{OutOfMemory}!Compressor {
-        const ldm_params: ?ldm.Params = if (opts.ldm or ldm.enabledByDefault(cp)) ldm.adjustParameters(cp) else null;
-        // LDM by hand below btopt splices LDM sequences between runs of the
-        // block compressor (`ZSTD_ldm_blockCompress`), which is not ported.
-        std.debug.assert(ldm_params == null or @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt));
+    /// A context that allocates its workspace from `gpa` at the first
+    /// `begin`.
+    pub fn initEmpty(gpa: std.mem.Allocator) Compressor {
+        return .{ .gpa = gpa };
+    }
 
-        const adv = opts.advanced;
-        const window_size: u64 = @max(1, @min(@as(u64, 1) << @intCast(cp.window_log), pledged orelse std.math.maxInt(u64)));
-        // ZSTD_resolveMaxBlockSize
-        const block_size_max: usize = @intCast(@min(adv.max_block_size orelse block_size_max_abs, window_size));
-        const row = params.resolveRowMatchFinder(adv.row_match_finder, cp);
-        const hash_len = @as(usize, 1) << @intCast(cp.hash_log);
-        // ZSTD_allocateChainTable: not for fast, not with the row match finder
-        const chain_len: usize = if (cp.strategy != .fast and !row) @as(usize, 1) << @intCast(cp.chain_log) else 0;
-        // ZSTD_reset_matchState: the 3-byte hash of the optimal parser
-        const hash_log3: u32 = if (cp.min_match == 3) @min(opt.hash_log3_max, cp.window_log) else 0;
-        const hash3_len: usize = if (hash_log3 != 0) @as(usize, 1) << @intCast(hash_log3) else 0;
-        const tables = try gpa.alloc(u32, hash_len + chain_len + hash3_len);
-        errdefer gpa.free(tables);
-        @memset(tables, 0);
-        const tag_table = try gpa.alloc(u8, if (row) hash_len else 0);
-        errdefer gpa.free(tag_table);
-        @memset(tag_table, 0);
-        const opt_state: ?*opt.State = if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt)) try gpa.create(opt.State) else null;
-        errdefer if (opt_state) |p| gpa.destroy(p);
-        if (opt_state) |p| p.* = .{ .compressed_literals = adv.literal_compression != .disable };
-
-        // ZSTD_maxNbSeq: every sequence carries a match of at least
-        // min_match bytes
-        const max_n_seq = block_size_max / @as(usize, if (cp.min_match == 3) 3 else 4) + 1;
-        const seqs = try gpa.alloc(sequences.SeqDef, max_n_seq);
-        errdefer gpa.free(seqs);
-        const codes = try gpa.alloc(u8, 3 * max_n_seq);
-        errdefer gpa.free(codes);
-        const lits = try gpa.alloc(u8, block_size_max);
-        errdefer gpa.free(lits);
-        const states = try gpa.create([2]BlockState);
-        errdefer gpa.destroy(states);
-        states.* = .{ .{}, .{} };
-        const split_ws = try gpa.create(presplit.Workspace);
-        errdefer gpa.destroy(split_ws);
-
-        // ZSTD_resetCCtx_internal: the LDM hash table, bucket offsets and
-        // sequence buffer (`ZSTD_ldm_getMaxNbSeq` over one block)
-        const lp: ldm.Params = ldm_params orelse std.mem.zeroes(ldm.Params);
-        const ldm_on = ldm_params != null;
-        const ldm_table = try gpa.alloc(ldm.Entry, if (ldm_on) @as(usize, 1) << @intCast(lp.hash_log) else 0);
-        errdefer gpa.free(ldm_table);
-        @memset(ldm_table, .{});
-        const ldm_buckets = try gpa.alloc(u8, if (ldm_on) @as(usize, 1) << @intCast(lp.hash_log - lp.bucket_size_log) else 0);
-        errdefer gpa.free(ldm_buckets);
-        @memset(ldm_buckets, 0);
-        const ldm_seqs = try gpa.alloc(ldm.RawSeq, if (ldm_on) ldm.maxNbSeq(lp, block_size_max) else 0);
-        errdefer gpa.free(ldm_seqs);
-        const ldm_state: ?*ldm.State = if (ldm_on) try gpa.create(ldm.State) else null;
-        errdefer if (ldm_state) |p| gpa.destroy(p);
-        if (ldm_state) |p| p.* = .{
-            .p = lp,
-            .hash_table = ldm_table,
-            .bucket_offsets = ldm_buckets,
-            .overflow_correct_frequently = opts.overflow_correct_frequently,
-        };
-
-        return .{
-            .gpa = gpa,
-            .cp = cp,
-            .checksum = opts.checksum,
-            .pledged = pledged,
-            .content_size_flag = adv.content_size,
-            .format = adv.format,
-            .block_size_max = block_size_max,
-            .overflow_correct_frequently = opts.overflow_correct_frequently,
-            .states = states,
-            .split_ws = split_ws,
-            .tables = tables,
-            .tag_table = tag_table,
-            .codes = codes,
-            .lits = lits,
-            .seqs = seqs,
-            .opt_state = opt_state,
-            .ldm_table = ldm_table,
-            .ldm_buckets = ldm_buckets,
-            .ldm_state = ldm_state,
-            .c = .{
-                .ms = .{
-                    .src = &.{},
-                    .cp = cp,
-                    .hash_table = tables[0..hash_len],
-                    .chain_table = tables[hash_len..][0..chain_len],
-                    .tag_table = tag_table,
-                    .use_row = row,
-                    .row_hash_log = if (row) cp.hash_log - params.rowLog(cp) else 0,
-                    // ZSTD_advanceHashSalt on a fresh context: salt and entropy 0
-                    .hash_salt = if (row) bitmix(0, 8) ^ bitmix(0, 4) else 0,
-                    .hash_table3 = tables[hash_len + chain_len ..],
-                    .hash_log3 = hash_log3,
-                    .opt = opt_state,
-                },
-                .ss = .{
-                    .seqs = seqs,
-                    .lits = lits,
-                    .ll_code = codes[0..max_n_seq],
-                    .ml_code = codes[max_n_seq .. 2 * max_n_seq],
-                    .of_code = codes[2 * max_n_seq ..],
-                },
-                .prev = &states[0],
-                .next = &states[1],
-                .strategy = @intFromEnum(cp.strategy),
-                .disable_literal_compression = params.literalCompressionDisabled(adv.literal_compression, cp),
-                .pre_split_level = adv.block_splitter_level,
-                .split_blocks = params.resolveSplitAfterSequences(adv.split_after_sequences, cp),
-                .ldm = ldm_state,
-                .ldm_seqs = ldm_seqs,
-            },
-        };
+    /// A context in the caller's `ws`, which must hold what `begin` needs
+    /// (`workspaceSize`); it is never freed or resized.
+    pub fn initStatic(ws: Workspace) Compressor {
+        return .{ .gpa = null, .ws = ws };
     }
 
     pub fn deinit(comp: *Compressor) void {
-        const gpa = comp.gpa;
-        if (comp.ldm_state) |p| gpa.destroy(p);
-        gpa.free(comp.c.ldm_seqs);
-        gpa.free(comp.ldm_buckets);
-        gpa.free(comp.ldm_table);
-        gpa.destroy(comp.split_ws);
-        gpa.destroy(comp.states);
-        gpa.free(comp.lits);
-        gpa.free(comp.codes);
-        gpa.free(comp.seqs);
-        if (comp.opt_state) |p| gpa.destroy(p);
-        gpa.free(comp.tag_table);
-        gpa.free(comp.tables);
+        if (comp.gpa) |gpa| gpa.free(comp.ws);
         comp.* = undefined;
+    }
+
+    /// One whole frame of `src` (`ZSTD_compress2`), on this context.
+    pub fn compressFrame(comp: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
+        const bound = compressBound(src.len);
+        if (dst.len < bound) return error.NoSpaceLeft;
+        // libzstd is given exactly the bound (zref); the room a block may use
+        // can decide whether it is stored compressed
+        const out = dst[0..bound];
+        try opts.advanced.check();
+        const cp = params.getOverridden(opts.level, src.len, opts.advanced, opts.ldm);
+        try comp.begin(cp, src.len, opts, false);
+        const n = comp.compressContinue(out, src, true) catch unreachable; // pledged is src.len
+        const m = comp.writeEpilogue(out[n..]);
+        if (opts.overflow_corrections) |oc| oc.* = .{ comp.c.ms.n_overflow_corrections, if (comp.c.ldm) |ls| ls.n_overflow_corrections else 0 };
+        return n + m;
+    }
+
+    /// `ZSTD_resetCCtx_internal`: set the context up for a frame with
+    /// parameters `cp` (the level's, sized for `pledged`), resizing the
+    /// workspace if it is too small or has long been three times too big.
+    /// `buffered` adds a stream's input and output buffers.
+    pub fn begin(comp: *Compressor, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) error{OutOfMemory}!void {
+        const l = Layout.compute(cp, pledged, opts, buffered);
+        // LDM by hand below btopt splices LDM sequences between runs of the
+        // block compressor (`ZSTD_ldm_blockCompress`), which is not ported.
+        std.debug.assert(l.ldm_params == null or @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt));
+
+        const ms_old = comp.c.ms;
+        var index_reset = !comp.initialized or ms_old.src_base + ms_old.src.len > comp.index_too_close;
+
+        // ZSTD_cwksp_bump_oversized_duration, ZSTD_cwksp_check_wasteful
+        const available = comp.ws.len - comp.ws_used;
+        const too_large = available >= l.total * workspace_too_large_factor;
+        if (comp.gpa != null) comp.oversized_duration = if (too_large) comp.oversized_duration + 1 else 0;
+        const wasteful = too_large and comp.oversized_duration > workspace_too_large_max_duration;
+        var fresh_ws = false;
+        if (comp.ws.len < l.total or wasteful) {
+            const gpa = comp.gpa orelse return error.OutOfMemory; // static: no resize
+            const ws = try gpa.alignedAlloc(u8, .fromByteUnits(workspace_alignment), l.total);
+            gpa.free(comp.ws);
+            comp.ws = ws;
+            comp.oversized_duration = 0;
+            comp.tables_valid = 0;
+            comp.tag_prev = null;
+            comp.n_workspace_allocs += 1;
+            index_reset = true;
+            fresh_ws = true;
+        }
+        comp.ws_used = l.total;
+        const ws = comp.ws;
+
+        // The tables: cleared where their values are not known to be
+        // indices, all of it when indexing restarts.
+        const tables_bytes = l.tablesBytes();
+        const tables = slice(u32, ws, 0, l.hash_len + l.chain_len + l.hash3_len);
+        if (index_reset) comp.tables_valid = 0;
+        if (comp.tables_valid < tables_bytes) @memset(ws[comp.tables_valid..tables_bytes], 0);
+        comp.tables_valid = tables_bytes;
+        const tag_table = slice(u8, ws, l.tag, if (l.row) l.hash_len else 0);
+        if (l.row) {
+            const here: [2]usize = .{ l.tag, l.hash_len };
+            if (comp.tag_prev == null or !std.meta.eql(comp.tag_prev.?, here)) @memset(tag_table, 0);
+            comp.tag_prev = here;
+        } else comp.tag_prev = null;
+
+        const adv = opts.advanced;
+        const states = &slice(BlockState, ws, l.states, 2)[0..2].*;
+        states.* = .{ .{}, .{} };
+        const opt_state: ?*opt.State = if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt)) &slice(opt.State, ws, l.opt_state, 1)[0] else null;
+        if (opt_state) |p| p.* = .{ .compressed_literals = adv.literal_compression != .disable };
+
+        // ZSTD_resetCCtx_internal: the LDM hash table, bucket offsets and
+        // sequence buffer, and its own window from scratch
+        const ldm_state: ?*ldm.State = if (l.ldm_params) |lp| blk: {
+            const ls = &slice(ldm.State, ws, l.ldm_state, 1)[0];
+            const table = slice(ldm.Entry, ws, l.ldm_table, @as(usize, 1) << @intCast(lp.hash_log));
+            @memset(table, .{});
+            const buckets = slice(u8, ws, l.ldm_buckets, @as(usize, 1) << @intCast(lp.hash_log - lp.bucket_size_log));
+            @memset(buckets, 0);
+            ls.* = .{
+                .p = lp,
+                .hash_table = table,
+                .bucket_offsets = buckets,
+                .overflow_correct_frequently = opts.overflow_correct_frequently,
+            };
+            break :blk ls;
+        } else null;
+
+        const n = l.max_n_seq;
+        const codes = slice(u8, ws, l.codes, 3 * n);
+        comp.in_buff = slice(u8, ws, l.in_buff, l.in_buff_len);
+        comp.out_buff = slice(u8, ws, l.out_buff, l.out_buff_len);
+        // libzstd's workspace comes from the allocator unwritten; a stream
+        // can read a few bytes past the end of the old window segment (see
+        // SPEC.md), which a fresh large allocation holds as zeros, and a
+        // reused one as whatever the last frame left there.
+        if (fresh_ws) @memset(comp.in_buff, 0);
+
+        comp.cp = cp;
+        comp.checksum = opts.checksum;
+        comp.pledged = pledged;
+        comp.content_size_flag = adv.content_size;
+        comp.format = adv.format;
+        comp.block_size_max = l.block_size_max;
+        comp.stage = .init;
+        comp.consumed = 0;
+        comp.produced = 0;
+        comp.xxh = .init(0);
+        comp.overflow_correct_frequently = opts.overflow_correct_frequently;
+        comp.split_ws = &slice(presplit.Workspace, ws, l.split_ws, 1)[0];
+        comp.c = .{
+            .ms = .{
+                .src = &.{},
+                .cp = cp,
+                .hash_table = tables[0..l.hash_len],
+                .chain_table = tables[l.hash_len..][0..l.chain_len],
+                .tag_table = tag_table,
+                .buffer = comp.in_buff,
+                .use_row = l.row,
+                .row_hash_log = if (l.row) cp.hash_log - params.rowLog(cp) else 0,
+                .hash_salt = ms_old.hash_salt,
+                .hash_salt_entropy = ms_old.hash_salt_entropy,
+                .hash_table3 = tables[l.hash_len + l.chain_len ..],
+                .hash_log3 = l.hash_log3,
+                .opt = opt_state,
+            },
+            .ss = .{
+                .seqs = slice(sequences.SeqDef, ws, l.seqs, n),
+                .lits = slice(u8, ws, l.lits, l.block_size_max),
+                .ll_code = codes[0..n],
+                .ml_code = codes[n .. 2 * n],
+                .of_code = codes[2 * n ..],
+            },
+            .prev = &states[0],
+            .next = &states[1],
+            .strategy = @intFromEnum(cp.strategy),
+            .disable_literal_compression = params.literalCompressionDisabled(adv.literal_compression, cp),
+            .pre_split_level = adv.block_splitter_level,
+            .split_blocks = params.resolveSplitAfterSequences(adv.split_after_sequences, cp),
+            .ldm = ldm_state,
+            .ldm_seqs = slice(ldm.RawSeq, ws, l.ldm_seqs, l.ldm_n_seqs),
+        };
+        if (ldm_state) |ls| ls.buffer = comp.in_buff;
+        const ms = &comp.c.ms;
+        // ZSTD_advanceHashSalt, for every frame that uses the row match
+        // finder; a fresh context starts from salt and entropy 0
+        if (l.row) ms.hash_salt = bitmix(ms.hash_salt, 8) ^ bitmix(ms.hash_salt_entropy, 4);
+        if (index_reset) {
+            // ZSTD_window_init
+            comp.n_index_resets += 1;
+        } else {
+            // ZSTD_window_clear: indexing goes on past the last frame, whose
+            // bytes are below the window from now on
+            const end: u32 = @intCast(ms_old.src_base + ms_old.src.len);
+            ms.src = ms_old.src[ms_old.src.len..];
+            ms.src_base = end;
+            ms.dict_base = end;
+            ms.low_limit = end;
+            ms.dict_limit = end;
+            ms.next_to_update = end;
+            ms.n_overflow_corrections = ms_old.n_overflow_corrections;
+        }
+        comp.initialized = true;
+    }
+
+    fn slice(comptime T: type, ws: Workspace, at: usize, n: usize) []T {
+        const p: [*]T = @ptrCast(@alignCast(ws.ptr + at));
+        return p[0..n];
     }
 
     /// `ZSTD_compressContinue_internal` in frame mode: the frame header on

@@ -68,24 +68,24 @@ pub const Error = error{
     SrcSizeWrong,
     /// `pos` beyond the end of a buffer.
     InvalidBuffer,
-    /// A call after the frame ended. libzstd would start a new frame on the
-    /// same context, reusing its tables (which changes the output); that is
-    /// not supported yet.
-    FrameEnded,
 };
 
 /// A compression context in streaming mode (`ZSTD_CCtx` driven by
-/// `ZSTD_compressStream2`), for one frame.
+/// `ZSTD_compressStream2`). Once a frame has ended, the next call starts
+/// another on the same context, with the same options but an unknown size
+/// (as libzstd); `reset` changes the options or abandons a frame. The
+/// context's workspace is reused from frame to frame (see
+/// `frame.Compressor`); the bytes are those of a fresh context.
 pub const Stream = struct {
-    gpa: std.mem.Allocator,
     opts: Options,
-    stage: enum { init, load, flush, done } = .init,
-    comp: frame.Compressor = undefined,
-    in_buff: []u8 = &.{},
+    /// This frame's pledged size: `opts.pledged_size` for the first frame
+    /// after `init` or `reset`, unknown for the frames after it.
+    pledged: ?u64,
+    stage: enum { init, load, flush } = .init,
+    comp: frame.Compressor,
     in_buff_pos: usize = 0,
     in_buff_target: usize = 0,
     in_to_compress: usize = 0,
-    out_buff: []u8 = &.{},
     out_content: usize = 0,
     out_flushed: usize = 0,
     frame_ended: bool = false,
@@ -102,19 +102,44 @@ pub const Stream = struct {
     /// Nothing is allocated until the first `compressStream2`, which knows
     /// whether that call ends the frame (and so the size).
     pub fn init(gpa: std.mem.Allocator, opts: Options) Error!Stream {
+        try checkOptions(opts);
+        return .{ .opts = opts, .pledged = opts.pledged_size, .comp = .initEmpty(gpa) };
+    }
+
+    /// A stream in the caller's workspace (`ZSTD_initStaticCCtx`), which is
+    /// never resized: a frame needing more than `workspace.len` bytes
+    /// (`estimateStreamSize`) fails with `error.OutOfMemory`.
+    pub fn initStatic(workspace: frame.Workspace, opts: Options) Error!Stream {
+        try checkOptions(opts);
+        return .{ .opts = opts, .pledged = opts.pledged_size, .comp = .initStatic(workspace) };
+    }
+
+    fn checkOptions(opts: Options) Error!void {
         if (opts.level > max_level) return error.LevelUnsupported;
         try opts.advanced.check();
         if (opts.src_size_hint) |h| if (h == 0 or h > std.math.maxInt(i32)) return error.ParameterOutOfBound;
-        return .{ .gpa = gpa, .opts = opts };
     }
 
     pub fn deinit(s: *Stream) void {
-        if (s.stage != .init) {
-            s.comp.deinit();
-            s.gpa.free(s.in_buff);
-            s.gpa.free(s.out_buff);
-        }
+        s.comp.deinit();
         s.* = undefined;
+    }
+
+    /// `ZSTD_CCtx_reset(ZSTD_reset_session_and_parameters)` with `opts` set
+    /// anew: the current frame, if any, is abandoned (its output so far is
+    /// not a complete frame), and the next call starts one with `opts`,
+    /// `opts.pledged_size` included. The workspace stays.
+    pub fn reset(s: *Stream, opts: Options) Error!void {
+        try checkOptions(opts);
+        s.opts = opts;
+        s.pledged = opts.pledged_size;
+        s.stage = .init;
+    }
+
+    /// The bytes the stream's workspace holds (`ZSTD_sizeof_CCtx` less the
+    /// context itself).
+    pub fn workspaceSize(s: *const Stream) usize {
+        return s.comp.ws.len;
     }
 
     /// `ZSTD_compressStream2`. Consumes input and writes output as far as
@@ -123,7 +148,6 @@ pub const Stream = struct {
     /// until it is 0 — for `end`, the frame is then complete).
     pub fn compressStream2(s: *Stream, output: *OutBuffer, input: *InBuffer, end_op: EndDirective) Error!usize {
         if (output.pos > output.dst.len or input.pos > input.src.len) return error.InvalidBuffer;
-        if (s.stage == .done) return error.FrameEnded;
         if (s.stage == .init) try s.begin(end_op, input.src.len - input.pos);
         try s.generic(output, input, end_op);
         return s.out_content - s.out_flushed; // remaining to flush
@@ -134,32 +158,10 @@ pub const Stream = struct {
     /// `ZSTD_compressBegin_internal` with buffers of one window plus one
     /// block in and one compressed block out.
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
-        const pledged: ?u64 = if (end_op == .end) in_size else s.opts.pledged_size;
-        // ZSTD_getCParamsFromCCtxParams: the hint stands in for an unknown size
-        const size_hint: u64 = pledged orelse if (s.opts.src_size_hint) |h| h else params.unknown_size;
-        const cp = params.getOverridden(s.opts.level, size_hint, s.opts.advanced, s.ldm);
-        var comp = try frame.Compressor.init(s.gpa, cp, pledged, .{
-            .level = s.opts.level,
-            .checksum = s.opts.checksum,
-            .advanced = s.opts.advanced,
-            .overflow_correct_frequently = s.overflow_correct_frequently,
-            .ldm = s.ldm,
-        });
-        errdefer comp.deinit();
-        const window_size: usize = @intCast(@max(1, @min(@as(u64, 1) << @intCast(cp.window_log), pledged orelse std.math.maxInt(u64))));
-        const block_size = comp.block_size_max;
-        const in_buff = try s.gpa.alloc(u8, window_size + block_size);
-        errdefer s.gpa.free(in_buff);
-        // libzstd's workspace comes from the allocator unwritten; a stream
-        // can read a few bytes past the end of the old window segment (see
-        // SPEC.md), which a fresh large allocation holds as zeros.
-        @memset(in_buff, 0);
-        const out_buff = try s.gpa.alloc(u8, frame.compressBound(block_size) + 1);
-        s.comp = comp;
-        s.comp.c.ms.buffer = in_buff;
-        if (s.comp.c.ldm) |ls| ls.buffer = in_buff;
-        s.in_buff = in_buff;
-        s.out_buff = out_buff;
+        const pledged: ?u64 = if (end_op == .end) in_size else s.pledged;
+        const cp = frameParams(s.opts, pledged, s.ldm);
+        try s.comp.begin(cp, pledged, s.frameOptions(), true);
+        const block_size = s.comp.block_size_max;
         s.in_to_compress = 0;
         s.in_buff_pos = 0;
         // for small input: avoid automatic flush on reaching end of block,
@@ -169,6 +171,23 @@ pub const Stream = struct {
         s.out_flushed = 0;
         s.stage = .load;
         s.frame_ended = false;
+    }
+
+    fn frameOptions(s: *const Stream) frame.Options {
+        return .{
+            .level = s.opts.level,
+            .checksum = s.opts.checksum,
+            .advanced = s.opts.advanced,
+            .overflow_correct_frequently = s.overflow_correct_frequently,
+            .ldm = s.ldm,
+        };
+    }
+
+    /// `ZSTD_CCtx_reset(ZSTD_reset_session_only)` at the end of a frame:
+    /// the next call starts another, of unknown size.
+    fn endFrame(s: *Stream) void {
+        s.stage = .init;
+        s.pledged = null;
     }
 
     /// `ZSTD_compressEnd_public`: the last chunk, the epilogue, and the
@@ -182,6 +201,8 @@ pub const Stream = struct {
 
     /// `ZSTD_compressStream_generic`.
     fn generic(s: *Stream, output: *OutBuffer, input: *InBuffer, end_op: EndDirective) Error!void {
+        const in_buff = s.comp.in_buff;
+        const out_buff = s.comp.out_buff;
         const iend = input.src.len;
         var ip = input.pos;
         const oend = output.dst.len;
@@ -192,7 +213,7 @@ pub const Stream = struct {
         }
 
         while (true) switch (s.stage) {
-            .init, .done => unreachable,
+            .init => unreachable,
             .load => {
                 if (end_op == .end and oend - op >= frame.compressBound(iend - ip) and s.in_buff_pos == 0) {
                     // shortcut to compression pass directly into output buffer
@@ -200,13 +221,13 @@ pub const Stream = struct {
                     ip = iend;
                     op += c_size;
                     s.frame_ended = true;
-                    s.stage = .done;
+                    s.endFrame();
                     return;
                 }
                 // complete loading into inBuffer
                 const to_load = s.in_buff_target - s.in_buff_pos;
                 const loaded = @min(to_load, iend - ip);
-                @memcpy(s.in_buff[s.in_buff_pos..][0..loaded], input.src[ip..][0..loaded]);
+                @memcpy(in_buff[s.in_buff_pos..][0..loaded], input.src[ip..][0..loaded]);
                 s.in_buff_pos += loaded;
                 ip += loaded;
                 // not enough input to fill full block: stop here
@@ -218,8 +239,8 @@ pub const Stream = struct {
                 // the middle)
                 const i_size = s.in_buff_pos - s.in_to_compress;
                 const direct = oend - op >= frame.compressBound(i_size);
-                const c_dst = if (direct) output.dst[op..] else s.out_buff;
-                const chunk = s.in_buff[s.in_to_compress..s.in_buff_pos];
+                const c_dst = if (direct) output.dst[op..] else out_buff;
+                const chunk = in_buff[s.in_to_compress..s.in_buff_pos];
                 const last_block = end_op == .end and ip == iend;
                 const c_size = if (last_block)
                     try s.compressEnd(c_dst, chunk)
@@ -228,7 +249,7 @@ pub const Stream = struct {
                 s.frame_ended = last_block;
                 // prepare next block
                 s.in_buff_target = s.in_buff_pos + s.comp.block_size_max;
-                if (s.in_buff_target > s.in_buff.len) {
+                if (s.in_buff_target > in_buff.len) {
                     s.in_buff_pos = 0;
                     s.in_buff_target = s.comp.block_size_max;
                 }
@@ -236,7 +257,7 @@ pub const Stream = struct {
                 if (direct) { // no need to flush
                     op += c_size;
                     if (s.frame_ended) {
-                        s.stage = .done;
+                        s.endFrame();
                         return;
                     }
                     continue;
@@ -248,7 +269,7 @@ pub const Stream = struct {
             .flush => {
                 const to_flush = s.out_content - s.out_flushed;
                 const flushed = @min(to_flush, oend - op);
-                @memcpy(output.dst[op..][0..flushed], s.out_buff[s.out_flushed..][0..flushed]);
+                @memcpy(output.dst[op..][0..flushed], out_buff[s.out_flushed..][0..flushed]);
                 op += flushed;
                 s.out_flushed += flushed;
                 // flush not fully completed, presumably because dst is too small
@@ -256,7 +277,7 @@ pub const Stream = struct {
                 s.out_content = 0;
                 s.out_flushed = 0;
                 if (s.frame_ended) {
-                    s.stage = .done;
+                    s.endFrame();
                     return;
                 }
                 s.stage = .load;
@@ -264,3 +285,28 @@ pub const Stream = struct {
         };
     }
 };
+
+/// The parameters of a stream's frame: sized for its pledged size, else
+/// for the size hint (`ZSTD_getCParamsFromCCtxParams`), else unknown.
+fn frameParams(opts: Options, pledged: ?u64, ldm_by_hand: bool) params.CParams {
+    const size_hint: u64 = pledged orelse if (opts.src_size_hint) |h| h else params.unknown_size;
+    return params.getOverridden(opts.level, size_hint, opts.advanced, ldm_by_hand);
+}
+
+/// The workspace a stream with `opts` needs for its first frame when
+/// `opts.pledged_size` or `opts.src_size_hint` is set; with neither, the
+/// most any of its frames can need, whatever the input and however it
+/// arrives.
+pub fn estimateSize(opts: Options) Error!usize {
+    try Stream.checkOptions(opts);
+    const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };
+    if (opts.pledged_size != null or opts.src_size_hint != null)
+        return frame.workspaceSize(frameParams(opts, opts.pledged_size, false), opts.pledged_size, fo, true);
+    // Unknown, or known at the first call (which ends the frame): the need
+    // grows with the size within each of the level's size classes, and a
+    // size past the last class needs what an unknown one does.
+    var most = frame.workspaceSize(frameParams(opts, null, false), null, fo, true);
+    for (params.size_class_bounds) |size|
+        most = @max(most, frame.workspaceSize(frameParams(opts, size, false), size, fo, true));
+    return most;
+}

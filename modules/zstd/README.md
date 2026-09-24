@@ -102,7 +102,32 @@ plus two blocks of output ring and refuses frames asking for more than a
 `stable_output` decodes straight into a caller's buffer that stays put.
 
 `gpa` backs only the per-call match tables and block buffers; everything is
-freed before `compress` returns.
+freed before `compress` returns. For many frames, keep a context — its one
+workspace is reused (and its tables are not cleared, as in libzstd), and
+each frame is still exactly the one a fresh context gives:
+
+```zig
+var c: zstd.Compressor = .init(gpa); // ZSTD_CCtx + ZSTD_compress2
+defer c.deinit();
+for (messages) |m| {
+    const n = try c.compress(buf, m, .{ .level = 3 });
+    try sink.writeAll(buf[0..n]);
+}
+```
+
+The workspace size is known in advance, exactly (`ZSTD_estimateCCtxSize`),
+and it can be the caller's memory (`ZSTD_initStaticCCtx`) — then nothing is
+allocated and a frame needing more is `error.OutOfMemory`:
+
+```zig
+const size = try zstd.estimateCompressorSize(max_input, .{ .level = 3 }); // null: any input
+const ws = try gpa.alignedAlloc(u8, .fromByteUnits(zstd.workspace_alignment), size);
+var c: zstd.Compressor = .initStatic(ws);
+```
+
+`estimateStreamSize(opts)` and `Stream.initStatic(ws, opts)` do the same
+for a stream (exact for a pledged size or a size hint; without either, the
+most any frame can need).
 
 Streaming into any `std.Io.Writer` (an HTTP body, a file), one independent
 frame per buffer fill and per flush:
@@ -116,13 +141,14 @@ try fw.writer.flush(); // what is buffered becomes a frame on `out`
 try fw.finish(); // the last frame; `out` itself is not flushed
 ```
 
-Frames share no history, so frequent small flushes cost ratio. On
+Frames share no history, so frequent small flushes cost ratio (the
+compression context is reused, so they cost no allocation). On
 `error.WriteFailed`, `fw.err` names our own cause (`OutOfMemory`); null
 means `out` failed.
 
-Streaming as libzstd streams — one frame, history kept across flushes, the
-same bytes `ZSTD_compressStream2` produces for the same sequence of calls
-(every level):
+Streaming as libzstd streams — history kept across flushes, the same bytes
+`ZSTD_compressStream2` produces for the same sequence of calls (every
+level):
 
 ```zig
 var s = try zstd.Stream.init(gpa, .{ .level = 3 }); // .pledged_size = n puts the size in the header
@@ -144,12 +170,14 @@ while (true) {
 }
 ```
 
-Its memory is the level's tables plus an input buffer of one window and one
-block (2.1 MB at level 3 with an unknown size; at level 22 without a pledged
-size the window is 128 MB and long-distance matching is on, about 1 GB in
-all, as libzstd). Errors: `LevelUnsupported`,
-`SrcSizeWrong` (a pledged size not met), `FrameEnded` (a call after the end;
-a new frame needs a new `Stream`), `InvalidBuffer`, `OutOfMemory`.
+Once a frame has ended, the next call starts another on the same context
+with the same options and an unknown size, as libzstd does;
+`s.reset(opts)` abandons a frame or changes the options (pledged size
+included). Its memory is the level's tables plus an input buffer of one
+window and one block (3.7 MB at level 3 with an unknown size; at level 22
+without a pledged size the window is 128 MB and long-distance matching is
+on, about 1 GB in all, as libzstd). Errors: `LevelUnsupported`,
+`SrcSizeWrong` (a pledged size not met), `InvalidBuffer`, `OutOfMemory`.
 
 libzstd's advanced parameters (`ZSTD_CCtx_setParameter`), by field of
 `advanced`; each defaults to the level's choice, and the output is what
@@ -191,7 +219,10 @@ is built for coverage: each size tier of the level table, RLE blocks, literal
 and match lengths past 0xFFFF, both pre-splitters, the post-splitter, offsets
 beyond the window, long-distance matching (switched on by hand through a
 test seam, as it only switches itself on above 64 MB), and cases constructed
-so that specific decisions are marginal (see SPEC.md, *Anchoring*). The module is `heavy` in `build.zig`:
+so that specific decisions are marginal (see SPEC.md, *Anchoring*). All
+the frames come from one reused context, so every golden also checks
+context reuse (libzstd gives a reused context's frames the same bytes as a
+fresh one's). The module is `heavy` in `build.zig`:
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
@@ -217,6 +248,10 @@ every error a malformed frame produces, each checked against libzstd) and
 the window limit, stable output, the `Reader`), and
 off-line against libzstd's decoder through `tools/zdec.c` (see SPEC.md,
 *Anchoring*).
+
+`src/context_test.zig` pins the estimates (exact, and the largest for an
+unknown size), a static workspace's bound, the workspace being replaced
+when too small or long too big, and indexing restarting near its limit.
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder and
 this one, and feeds the decoder arbitrary bytes; unit

@@ -35,6 +35,8 @@ pub const FrameWriter = struct {
     output: *Writer,
     gpa: std.mem.Allocator,
     opts: frame.Options,
+    /// The compression context, reused for every frame.
+    ctx: frame.Compressor,
     /// `compressBound(buffer.len)` bytes: where a frame is built before it
     /// is written to `output`.
     scratch: []u8,
@@ -45,8 +47,9 @@ pub const FrameWriter = struct {
     err: ?frame.Error = null,
 
     /// `buffer` sets the frame size for a stream written without flushes; it
-    /// must be nonempty. `gpa` holds the frame scratch for the writer's life
-    /// and the match tables for the length of each frame.
+    /// must be nonempty. `gpa` holds the frame scratch and the compression
+    /// context's workspace (allocated at the first frame) for the writer's
+    /// life.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: Options) InitError!FrameWriter {
         std.debug.assert(buffer.len != 0);
         if (opts.level > params.max_level) return error.LevelUnsupported;
@@ -59,11 +62,13 @@ pub const FrameWriter = struct {
             .output = output,
             .gpa = gpa,
             .opts = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced },
+            .ctx = .initEmpty(gpa),
             .scratch = try gpa.alloc(u8, frame.compressBound(buffer.len)),
         };
     }
 
     pub fn deinit(fw: *FrameWriter) void {
+        fw.ctx.deinit();
         fw.gpa.free(fw.scratch);
         fw.* = undefined;
     }
@@ -80,7 +85,7 @@ pub const FrameWriter = struct {
     /// One frame of `buffer[0..end]` to `output`; the buffer is empty after.
     fn emit(fw: *FrameWriter) Writer.Error!void {
         const w = &fw.writer;
-        const n = frame.compress(fw.gpa, fw.scratch, w.buffer[0..w.end], fw.opts) catch |e| {
+        const n = fw.ctx.compressFrame(fw.scratch, w.buffer[0..w.end], fw.opts) catch |e| {
             fw.err = e;
             return error.WriteFailed;
         };

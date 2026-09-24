@@ -214,6 +214,11 @@ fn adjustFor(cp_in: CParams, src_size: u64, row_possible: bool) CParams {
     return cp;
 }
 
+/// The largest input of each of the parameter tables' size classes but
+/// the last (`get`): within a class the parameters, and so the memory,
+/// grow with the size.
+pub const size_class_bounds = [_]u64{ 16 * 1024, 128 * 1024, 256 * 1024 };
+
 /// `ZSTD_getCParams_internal(level, srcSize, 0, ZSTD_cpm_noAttachDict)` as used
 /// by one-shot compression. `level` must be in `min_level..max_level`; 0 means
 /// the default level.

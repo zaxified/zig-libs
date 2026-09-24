@@ -11,6 +11,13 @@
 //! repository small; the recipe regenerates the reference bytes when a
 //! mismatch needs to be looked at. Each frame is also decoded by this
 //! module's decoder and must give the input back.
+//!
+//! All the frames come from ONE compression context, reused from frame to
+//! frame across levels and sizes -- so its workspace is kept, resized and
+//! laid out anew, and its indexing goes on from frame to frame or restarts
+//! -- while the goldens are from a fresh libzstd context each. libzstd
+//! gives the same bytes either way (SPEC.md, *Context reuse*); so must the
+//! port.
 
 const std = @import("std");
 const zstd = @import("root.zig");
@@ -43,6 +50,9 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes
     var mismatches: usize = 0;
     var dec = try zstd.Decompressor.init(gpa, .{});
     defer dec.deinit();
+    var ctx: frame.Compressor = .initEmpty(gpa);
+    defer ctx.deinit();
+    var frames: u32 = 0;
     for (corpus.cases) |case| {
         const src = try gpa.alloc(u8, case.len);
         defer gpa.free(src);
@@ -55,17 +65,15 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes
             if (!corpus.covered(case, level, ck)) continue;
             const g = find(case.name, level, ck).?;
             var corrections: [2]u32 = .{ 0, 0 };
-            const n = if (case.ldm or case.window_log != null or case.ocf)
-                try frame.compress(gpa, dst, src, .{
-                    .level = level,
-                    .checksum = ck,
-                    .ldm = case.ldm,
-                    .advanced = .{ .window_log = case.window_log },
-                    .overflow_correct_frequently = case.ocf,
-                    .overflow_corrections = &corrections,
-                })
-            else
-                try zstd.compress(gpa, dst, src, .{ .level = level, .checksum = ck });
+            const n = try ctx.compressFrame(dst, src, .{
+                .level = level,
+                .checksum = ck,
+                .ldm = case.ldm,
+                .advanced = .{ .window_log = case.window_log },
+                .overflow_correct_frequently = case.ocf,
+                .overflow_corrections = &corrections,
+            });
+            frames += 1;
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(dst[0..n], &digest, .{});
             const hex = std.fmt.bytesToHex(digest, .lower);
@@ -84,7 +92,9 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes
                 mismatches += 1;
             }
             // A correction leaves the output as it was; that it ran at all
-            // is checked here (on both windows for an LDM case).
+            // is checked here (on both windows for an LDM case). The match
+            // state counts from the start of its indexing, the LDM window
+            // from the start of the frame.
             if (case.ocf and (corrections[0] == 0 or (case.ldm and corrections[1] == 0))) {
                 std.debug.print("NO CORRECTION {s} level {d}: {any}\n", .{ case.name, level, corrections });
                 mismatches += 1;
@@ -92,6 +102,10 @@ test "output is byte-identical to libzstd 1.5.7 on the whole corpus, and decodes
         };
     }
     try std.testing.expectEqual(@as(usize, 0), mismatches);
+    // Both ways of starting a frame ran, and the workspace was both kept
+    // and replaced.
+    try std.testing.expect(ctx.n_index_resets > 1 and ctx.n_index_resets < frames / 2);
+    try std.testing.expect(ctx.n_workspace_allocs > 1 and ctx.n_workspace_allocs < frames / 2);
 }
 
 test "corpus inputs are the ones the goldens were made from" {
