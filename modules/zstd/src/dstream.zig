@@ -17,6 +17,7 @@ const std = @import("std");
 const dec = @import("decompress.zig");
 const stream = @import("stream.zig");
 const dbits = @import("dbits.zig");
+const ddict_mod = @import("ddict.zig");
 
 pub const InBuffer = stream.InBuffer;
 pub const OutBuffer = stream.OutBuffer;
@@ -50,6 +51,29 @@ pub const Options = struct {
     stable_output: bool = false,
     /// `ZSTD_d_format`, as `DecompressOptions.format`.
     format: dec.Format = .zstd1,
+    /// `ZSTD_DCtx_loadDictionary`: raw bytes, digested internally (an
+    /// owned copy, content type auto-detected) and applied to every
+    /// frame. Unlike the one-shot `Decompressor`'s `dictionary` option,
+    /// this goes through the same digested path as `ddict` -- libzstd
+    /// always builds a `DDict` for streaming, even from raw bytes -- so
+    /// its whole buffer (header included, for a zstd-format dictionary)
+    /// is reachable as history. At most one of `dictionary`, `ddict`
+    /// should be set.
+    dictionary: ?[]const u8 = null,
+    /// `ZSTD_DCtx_refDDict`: a caller-owned digested dictionary, applied
+    /// to every frame (unless `ddicts` selects a better match). Must
+    /// outlive the `DecompressStream`.
+    ddict: ?*const ddict_mod.DDict = null,
+    /// `ZSTD_DCtx_refPrefix`: raw content, referenced (not copied, so it
+    /// must outlive the first frame), forced content type (no
+    /// zstd-format auto-detection: never parsed for entropy tables, even
+    /// if it happens to start with the dictionary magic number), applied
+    /// to the first frame decoded by this stream only.
+    prefix: ?[]const u8 = null,
+    /// `ZSTD_d_refMultipleDDicts`: pick the dictionary by each frame's
+    /// dictionary ID from this set (falling back to `ddict`, then to no
+    /// dictionary). Must outlive the `DecompressStream`.
+    ddicts: []const *const ddict_mod.DDict = &.{},
 };
 
 const StreamStage = enum { init, load_header, read, load, flush };
@@ -72,17 +96,45 @@ pub const DecompressStream = struct {
     no_forward_progress: u32 = 0,
     oversized_duration: usize = 0,
     expected_out: struct { ptr: usize = 0, len: usize = 0, pos: usize = 0 } = .{},
+    /// An internally-digested dictionary, when `Options.dictionary` was
+    /// raw bytes (`ZSTD_DCtx_loadDictionary`): heap-allocated (not held
+    /// by value) so the `*const DDict` this struct's own `d.options.ddict`
+    /// points at survives `DecompressStream` itself being moved after
+    /// `init` returns.
+    owned_ddict: ?*ddict_mod.DDict = null,
 
-    pub fn init(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!DecompressStream {
+    pub fn init(gpa: std.mem.Allocator, options: Options) (error{OutOfMemory} || ddict_mod.Error)!DecompressStream {
+        var owned: ?*ddict_mod.DDict = null;
+        if (options.dictionary) |raw| {
+            const dd = try gpa.create(ddict_mod.DDict);
+            errdefer gpa.destroy(dd);
+            dd.* = try ddict_mod.DDict.init(gpa, raw, .auto);
+            owned = dd;
+        }
+        errdefer if (owned) |dd| {
+            dd.deinit(gpa);
+            gpa.destroy(dd);
+        };
         return .{
-            .d = try dec.Decompressor.init(gpa, .{ .ignore_checksum = options.ignore_checksum, .format = options.format }),
+            .d = try dec.Decompressor.init(gpa, .{
+                .ignore_checksum = options.ignore_checksum,
+                .format = options.format,
+                .ddict = if (owned) |dd| dd else options.ddict,
+                .ddicts = options.ddicts,
+                .prefix_once = options.prefix,
+            }),
             .max_window_size = if (options.window_log_max) |l| @as(u64, 1) << @max(l, dec.window_log_absolute_min) else (@as(u64, 1) << window_log_limit_default) + 1,
             .stable_output = options.stable_output,
+            .owned_ddict = owned,
         };
     }
 
     pub fn deinit(s: *DecompressStream) void {
         s.d.gpa.free(s.buf);
+        if (s.owned_ddict) |dd| {
+            dd.deinit(s.d.gpa);
+            s.d.gpa.destroy(dd);
+        }
         s.d.deinit();
         s.* = undefined;
     }
@@ -189,6 +241,7 @@ pub const DecompressStream = struct {
                     if (d.fparams.content_size) |fcs| if (d.fparams.frame_type != .skippable and oend - op >= fcs) {
                         if (dec.findFrameCompressedSizeAdvanced(in.src[istart..iend], format)) |c_size| {
                             const n = try d.decompress(out.dst[op..oend], in.src[istart..][0..c_size]);
+                            d.options.prefix_once = null; // consumed by that one frame, see above
                             ip = istart + c_size;
                             op += n;
                             d.expected = 0;
@@ -209,6 +262,11 @@ pub const DecompressStream = struct {
                         d.stage = .skip_frame;
                     } else {
                         try d.decodeFrameHeader(d.header_buffer[0..s.lh_size]);
+                        // `ZSTD_DCtx_refPrefix`: used for exactly one
+                        // frame (a following skippable frame does not
+                        // consume it in this port, unlike libzstd -- see
+                        // SPEC.md, § Dictionaries).
+                        d.options.prefix_once = null;
                         d.expected = dec.block_header_size;
                         d.stage = .decode_block_header;
                     }
@@ -360,7 +418,7 @@ pub const Reader = struct {
 
     /// `buffer` may be empty; reads then go straight into the caller's
     /// writer.
-    pub fn init(gpa: std.mem.Allocator, input: *std.Io.Reader, buffer: []u8, options: Options) error{OutOfMemory}!Reader {
+    pub fn init(gpa: std.mem.Allocator, input: *std.Io.Reader, buffer: []u8, options: Options) (error{OutOfMemory} || ddict_mod.Error)!Reader {
         var o = options;
         o.stable_output = false;
         return .{

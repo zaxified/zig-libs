@@ -46,6 +46,7 @@ const stream = @import("stream.zig");
 const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
 const cdict_mod = @import("cdict.zig");
+const ddict_mod = @import("ddict.zig");
 
 /// Dictionary training, content selection: libzstd's cover and fastCover
 /// trainers up to (not including) finalization; see dict_builder.zig.
@@ -285,6 +286,20 @@ pub const getDictIdFromFrame = dec.getDictIdFromFrame;
 pub const isFrame = dec.isFrame;
 pub const isSkippableFrame = dec.isSkippableFrame;
 
+/// A digested dictionary for decompression (`ZSTD_DDict`): entropy
+/// tables read once from a zstd-format dictionary and reused across
+/// frames. See `Decompressor`'s and `DecompressStream`'s `ddict` /
+/// `ddicts` options, and ddict.zig for the history/entropy semantics.
+pub const DDict = ddict_mod.DDict;
+/// `ZSTD_getDictID_fromDict`: 0 when `dict` is not a conformant
+/// zstd-format dictionary (it can still be loaded, as a content-only
+/// dictionary).
+pub const getDictId = ddict_mod.getDictId;
+/// `ZSTD_getDictID_fromFrame`: the dictionary ID the frame at the start
+/// of `src` requires to decode (0 = none, or the header could not be
+/// read). Same as `getDictIdFromFrame`, libzstd's exact name.
+pub const getFrameDictId = dec.getDictIdFromFrame;
+
 /// Streaming decompression (`ZSTD_decompressStream`): input and output in
 /// any pieces, through a window-sized output ring (or straight into a
 /// stable output buffer); frames asking for more than 2^27 bytes of window
@@ -351,10 +366,12 @@ test {
     _ = @import("dbits.zig");
     _ = @import("huf_dec.zig");
     _ = @import("dblock.zig");
+    _ = @import("ddict.zig");
     _ = @import("decompress.zig");
     _ = @import("dstream.zig");
     _ = @import("dstream_test.zig");
     _ = @import("decoder_test.zig");
+    _ = @import("decoder_dict_test.zig");
     _ = @import("golden_test.zig");
     _ = @import("param_test.zig");
     _ = @import("context_test.zig");

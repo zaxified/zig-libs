@@ -15,6 +15,7 @@
 const std = @import("std");
 const dbits = @import("dbits.zig");
 const dblock = @import("dblock.zig");
+const ddict_mod = @import("ddict.zig");
 const readLE16 = dbits.readLE16;
 const readLE32 = dbits.readLE32;
 const readLE64 = dbits.readLE64;
@@ -385,6 +386,35 @@ pub const Options = struct {
     /// `ZSTD_d_format`: `.magicless` reads only frames written without the
     /// magic number (and no skippable frames).
     format: Format = .zstd1,
+    /// `ZSTD_decompress_usingDict`: raw dictionary bytes, applied
+    /// directly (not digested into a `DDict`) to every frame. Content
+    /// type is auto-detected; a zstd-format dictionary's header (magic,
+    /// dictionary ID, entropy tables) is *not* itself reachable as
+    /// history -- only the content past it is (see ddict.zig and
+    /// SPEC.md, § Dictionaries -- `ddict` below differs here). At most
+    /// one of `dictionary`, `ddict`, `ddicts` should be set.
+    dictionary: ?[]const u8 = null,
+    /// `ZSTD_decompress_usingDDict`: a pre-digested dictionary, applied
+    /// to every frame. Its whole buffer (header included, for a
+    /// zstd-format dictionary) is reachable as history -- libzstd's real
+    /// behaviour (`ZSTD_copyDDictParameters`), not a simplification.
+    ddict: ?*const ddict_mod.DDict = null,
+    /// `ZSTD_d_refMultipleDDicts`: pick the dictionary by each frame's
+    /// dictionary ID from this set (falling back to `ddict` when no
+    /// entry matches, or to no dictionary at all if `ddict` is null too).
+    /// A duplicate dictionary ID is resolved to the last matching entry.
+    /// Selected fresh for every frame (see SPEC.md for how this differs
+    /// from libzstd's own one-shot `ZSTD_decompress_usingDDict`, which
+    /// only re-validates, not re-applies, past the first frame).
+    ddicts: []const *const ddict_mod.DDict = &.{},
+    /// `ZSTD_DCtx_refPrefix`: forced raw content (never auto-detected as
+    /// zstd-format), applied to exactly one frame, then cleared by the
+    /// caller. Set by `DecompressStream`/`Reader` from their own
+    /// `Options.prefix`; a one-shot `Decompressor` caller may set it
+    /// directly too (there is no libzstd one-shot equivalent, but nothing
+    /// about it is stream-specific). Takes priority over `dictionary` /
+    /// `ddict` / `ddicts` while set.
+    prefix_once: ?[]const u8 = null,
 };
 
 /// `ZSTD_dStage`: where `decompressContinue` is within a frame.
@@ -477,12 +507,96 @@ pub const Decompressor = struct {
         return .{ .h = .{ .out = base[0 .. back + dst.len], .prefix = 0, .ext = d.ext }, .op = back };
     }
 
-    /// `ZSTD_decodeFrameHeader`.
+    /// The address range `checkContinuity` treats as "previous output":
+    /// our history model is address-based, like libzstd's
+    /// `prefixStart`/`previousDstEnd`/`dictEnd`, so a dictionary's real
+    /// buffer address serves the same role a prior write's would --
+    /// `checkContinuity`, called before the next real write, promotes it
+    /// into `d.ext` exactly as it would a previous frame's output.
+    fn setHistoryFrom(d: *Decompressor, content: []const u8) void {
+        if (content.len == 0) return;
+        d.prefix_addr = @intFromPtr(content.ptr);
+        d.prev_end_addr = d.prefix_addr + content.len;
+    }
+
+    fn applyEntropy(d: *Decompressor, e: *const ddict_mod.Entropy) void {
+        const st = d.st;
+        st.huf = e.huf;
+        st.of = e.of;
+        st.ml = e.ml;
+        st.ll = e.ll;
+        st.ll_ptr = &st.ll;
+        st.of_ptr = &st.of;
+        st.ml_ptr = &st.ml;
+        st.huf_ptr = &st.huf;
+        st.rep = e.rep;
+        st.lit_entropy = true;
+        st.fse_entropy = true;
+    }
+
+    /// `ZSTD_DDictHashSet_getDDict`, rewritten as a linear scan (this
+    /// port's `ddicts` list is expected to be small; only the selected
+    /// entry is observable, not how it was found) -- last match wins on a
+    /// duplicate dictionary ID, as libzstd's hash-set insertion does.
+    /// Falls back to `options.ddict` (libzstd's `ZSTD_DCtx_selectFrameDDict`
+    /// falls back to whichever `ZSTD_DCtx_refDDict` last set, which this
+    /// port has no equivalent of; see `Options.ddicts`).
+    fn selectDDict(d: *const Decompressor, frame_dict_id: u32) ?*const ddict_mod.DDict {
+        if (frame_dict_id != 0) {
+            var i = d.options.ddicts.len;
+            while (i > 0) {
+                i -= 1;
+                if (d.options.ddicts[i].dictId() == frame_dict_id) return d.options.ddicts[i];
+            }
+        }
+        return d.options.ddict;
+    }
+
+    /// Applies this decompressor's configured dictionary (`Options.dictionary`
+    /// / `.ddict` / `.ddicts`, mutually exclusive) to `d.st`'s entropy tables
+    /// and to the history `checkContinuity` will pick up on the next real
+    /// write. Ports `ZSTD_decompress_insertDictionary` (raw bytes: the
+    /// entropy header is stripped from history) and
+    /// `ZSTD_copyDDictParameters` (a `DDict`: the whole buffer is history).
+    /// Called once per frame, right after the header is parsed (so
+    /// `frame_dict_id` -- and hence `ddicts` selection -- is known), and
+    /// always before this frame's first real `checkContinuity`.
+    fn applyDictionary(d: *Decompressor, frame_dict_id: u32) Error!void {
+        if (d.options.prefix_once) |p| {
+            // forced raw content: never parsed for entropy or a
+            // dictionary ID, whatever its first bytes look like
+            d.setHistoryFrom(p);
+            return;
+        }
+        if (d.options.dictionary) |raw| {
+            if (raw.len < 8 or readLE32(raw, 0) != ddict_mod.magic_dictionary) {
+                d.setHistoryFrom(raw);
+                return;
+            }
+            d.dict_id = readLE32(raw, 4);
+            var e: ddict_mod.Entropy = .{};
+            const consumed = ddict_mod.loadDEntropy(&e, raw) catch return error.DictionaryCorrupted;
+            d.applyEntropy(&e);
+            d.setHistoryFrom(raw[consumed..]);
+            return;
+        }
+        if (d.selectDDict(frame_dict_id)) |dd| {
+            d.dict_id = dd.dict_id;
+            if (dd.entropy_present) d.applyEntropy(&dd.entropy);
+            d.setHistoryFrom(dd.content);
+        }
+    }
+
+    /// `ZSTD_decodeFrameHeader`: also applies the frame's dictionary (see
+    /// `applyDictionary`) once its dictionary ID is known, before the
+    /// dictID-mismatch check -- as libzstd's does with
+    /// `ZSTD_DCtx_selectFrameDDict`.
     pub fn decodeFrameHeader(d: *Decompressor, header: []const u8) Error!void {
         d.fparams = switch (try getFrameHeaderAdvanced(header, d.options.format)) {
             .need => return error.SrcSizeWrong,
             .header => |h| h,
         };
+        try d.applyDictionary(d.fparams.dict_id);
         if (d.fparams.dict_id != 0 and d.dict_id != d.fparams.dict_id) return error.DictionaryWrong;
         d.validate = d.fparams.checksum and !d.options.ignore_checksum;
         if (d.validate) d.xxh = .init(0);
@@ -504,6 +618,12 @@ pub const Decompressor = struct {
             ip.* += fhs;
             remaining -= fhs;
         }
+        // after the dictionary (if any) is applied above, not before: a
+        // dictionary's content is set up as history the same way this
+        // does, through `d.prefix_addr`/`d.prev_end_addr` (see
+        // `setHistoryFrom`), so checking continuity first would let a
+        // real write's address wipe it out before it is ever used.
+        d.checkContinuity(dst[op0..]);
 
         var op = op0;
         while (true) {
@@ -565,7 +685,6 @@ pub const Decompressor = struct {
                 continue;
             }
             d.begin();
-            d.checkContinuity(dst[op..]);
             const res = d.decompressFrame(dst, op, src, &ip) catch |e| {
                 // garbage after complete frames is more likely a size error
                 if (e == error.PrefixUnknown and more_than_1_frame) return error.SrcSizeWrong;

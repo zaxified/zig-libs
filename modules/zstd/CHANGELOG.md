@@ -64,6 +64,41 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   deliberate refusals apart); a 92-mutation sweep: 84 caught, 8
   equivalent (SPEC.md).
 
+- **2026-09-24** — Decoding with a dictionary (SPEC backlog Z2c): raw-content
+  and zstd-format dictionaries, a digested `DDict` (`zstd.DDict.init` /
+  `initByReference`, `.auto`/`.raw_content`/`.full` content types,
+  `loadDEntropy`'s Huffman and three FSE tables and repeat offsets, a port
+  of `zstd_ddict.c`, `src/ddict.zig`), `Decompressor`'s and
+  `DecompressStream`'s `Options.dictionary`/`.ddict`/`.ddicts`/`.prefix`
+  (`ZSTD_decompress_usingDict`/`_usingDDict`, `ZSTD_DCtx_loadDictionary` /
+  `refDDict`/`refPrefix`, `ZSTD_d_refMultipleDDicts`), and
+  `zstd.getDictId`/`getFrameDictId`. A dictionary's content becomes history
+  through the same address-based model `checkContinuity` already used
+  (`Decompressor.setHistoryFrom`), which needed the continuity check in
+  one-shot `decompressFrame` moved to *after* the dictionary is applied
+  (was before) — a real ordering bug the mutation sweep confirms: reverting
+  it fails 92 of the module's existing tests, dictionaries aside. One
+  deliberate divergence, not decided silently: `ddicts`
+  (`ZSTD_d_refMultipleDDicts`) picks a dictionary fresh for every frame in
+  this port; libzstd's own one-shot `ZSTD_decompress_usingDDict` (by this
+  reading of its source) applies whichever dictionary was resolved once
+  before the frame loop to every frame's content, only re-validating (not
+  re-applying) per frame — see SPEC.md, *Decoder*. Anchored against libzstd
+  1.5.7 through an extended `tools/zdec.c` (new `dict-spec` arguments, e.g.
+  `full:path.bin`, `auto:`/`raw:`/`prefix:`/`legacy:`) and a new recipe
+  `tools/gen-dict-testdata.sh`: 3681 valid (input × level × dictionary kind
+  × content type × one-shot/streaming) combinations, a dictID-mismatch case
+  and a multi-dictionary-selection case all byte- and error-class-identical;
+  a 4000-case random single-byte-corruption run over dictionary-compressed
+  frames and dictionaries, 3984 identical, 13 an already-documented
+  equivalence (the un-ported prefetching sequence decoder, first actually
+  exercised here since a fresh `ZSTD_DCtx` always starts "cold" with a
+  dictionary), 3 a throwaway-oracle formatting gap, not a module difference
+  (SPEC.md, *Decoder*, *Open*). 14-mutation sweep of the new code: 10
+  killed, 1 equivalent, 3 uncovered (justified in SPEC.md, *Open*).
+  Compression with a dictionary (Z4) and training one (Z5) are still not
+  here; this work's test frames come from libzstd itself.
+
 - **2026-09-24** — `targetCBlockSize` (SPEC backlog Z8):
   `Advanced.target_c_block_size` (`ZSTD_c_targetCBlockSize`, 0 = off,
   values below 1340 count as 1340, above 131072 `ParameterOutOfBound`)
