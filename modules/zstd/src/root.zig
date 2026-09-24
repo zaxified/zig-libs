@@ -39,6 +39,10 @@ const stream = @import("stream.zig");
 const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
 
+/// Dictionary training, content selection: libzstd's cover and fastCover
+/// trainers up to (not including) finalization; see dict_builder.zig.
+pub const dict_builder = @import("dict_builder.zig");
+
 pub const meta = .{
     .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
     .platform_note = "any",
@@ -305,6 +309,8 @@ test {
     _ = @import("param_test.zig");
     _ = @import("context_test.zig");
     _ = @import("fuzz_test.zig");
+    _ = @import("dict_builder.zig");
+    _ = @import("dict_golden_test.zig");
 }
 
 /// Decode with std. std's own checksum verification is a TODO panic in the

@@ -5,6 +5,21 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Dictionary training, content selection (SPEC backlog
+  Z5a): `zstd.dict_builder` ports libzstd's cover and fastCover trainers
+  (`cover.c`, `fastcover.c`) up to, not including, finalization.
+  `trainCover` / `trainFastCover` (and `*Into`, which leaves the content at
+  the tail of the caller's buffer where libzstd places it) return the
+  dictionary content `ZDICT_trainFromBuffer_cover` / `_fastCover` pick,
+  byte for byte -- usable as a raw-content dictionary. Exact memory
+  estimates (`estimateCoverMemory`, `estimateFastCoverMemory`) and a
+  `memory_limit` ceiling (default 256 MiB) refused with
+  `error.MemoryLimitExceeded` before any allocation. The optimizer's
+  (d, k) grid (`optimizeCover`, `optimizeFastCover`) runs with the
+  compression-based score supplied by the caller. 44 golden runs
+  (content digests and refusals) byte-identical to libzstd 1.5.7 through
+  the new oracle `tools/ztrain.c`.
+
 - **2026-09-24** — `targetCBlockSize` (SPEC backlog Z8):
   `Advanced.target_c_block_size` (`ZSTD_c_targetCBlockSize`, 0 = off,
   values below 1340 count as 1340, above 131072 `ParameterOutOfBound`)
