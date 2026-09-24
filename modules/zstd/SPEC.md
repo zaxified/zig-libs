@@ -30,10 +30,13 @@ Not here yet, and a reader might expect it (each is a backlog item):
   here (see *Dictionaries*) except where libzstd **attaches** a `CDict` —
   small or unknown input sizes — of a strategy whose `dictMatchState`
   variant is not ported yet (so far `greedy`…`btlazy2` and the optimal
-  parsers have theirs): `error.DictAttachUnsupported`. Decoding a
-  frame that names a dictionary is `error.DictionaryWrong`. Of training,
-  the content selection is here (*Dictionary training*); finalization is
-  not.
+  parsers have theirs, `fast`/`dfast` do not): `error.DictAttachUnsupported`.
+  **Decompression with a dictionary is done too** (Z2c, see *Decoder*):
+  raw-content and zstd-format dictionaries, a digested `DDict`,
+  `ZSTD_d_refMultipleDDicts`, one-shot and streaming; a frame that names a
+  dictionary this module was not given is `error.DictionaryWrong`. Of
+  training, the content selection is here (*Dictionary training*);
+  finalization is not.
 - **The rest of the streaming API.** `Stream` (see *Algorithm*) does
   libzstd's default buffered modes, frame after frame on one context; not
   the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
@@ -698,13 +701,92 @@ error after 16 calls without progress, and shrinking buffers that stayed
 3× too large for 128 frames. `DecompressReader` is a `std.Io.Reader` over
 it.
 
+**Dictionaries** (`ddict.zig`, port of `zstd_ddict.c` and
+`ZSTD_loadDEntropy`/`ZSTD_getDictID_from*` from `zstd_decompress.c`).
+`DDict.init`/`initByReference` load a dictionary by copy or by reference
+(`ZSTD_createDDict_advanced`'s two `ZSTD_dictLoadMethod_e`); `DictContentType`
+is `ZSTD_dictContentType_e` (`.auto`/`.raw_content`/`.full`). For a
+zstd-format dictionary (starts with the magic number `0xEC30A437`,
+`ZSTD_MAGIC_DICTIONARY`) `loadDEntropy` reads the Huffman table (X2, as
+libzstd's default non-`HUF_FORCE_DECOMPRESS_X1` build), the three FSE tables
+and three repeat offsets once, validating each repeat offset against the
+content size that follows (`rep == 0 or rep > content_size` is
+`error.DictionaryCorrupted`); `.raw_content` skips all of that, `.full`
+requires it (`error.DictionaryCorrupted` otherwise), `.auto` falls back to
+raw content when the magic number is absent or the buffer is under 8 bytes.
+
+**A dictionary's content becomes history the same way this port's history
+already works: as an address range `checkContinuity` can compare against a
+real write.** libzstd does this too (`ZSTD_copyDDictParameters` sets
+`prefixStart`/`previousDstEnd` from `ddict->dictContent`/`dictSize`), which
+this port mirrors exactly (`Decompressor.setHistoryFrom`) rather than
+threading a separate "external content" value through the history model.
+One genuine libzstd asymmetry, kept: a digested `DDict`
+(`Options.ddict`/`.ddicts`, `ZSTD_decompress_usingDDict`) makes its **whole**
+buffer reachable as history, header and entropy tables included, even
+though those bytes are never themselves valid output; the undigested
+one-shot path (`Options.dictionary`, the legacy `ZSTD_decompress_usingDict`)
+**strips** the entropy header first (`ZSTD_decompress_insertDictionary`) —
+only the content after it is history. Both are anchored independently
+(`tools/zdec.c`'s `legacy:` vs `auto:`/`raw:`/`full:` dict-specs). A
+streaming `DecompressStream`/`Reader`'s `Options.dictionary` always goes
+through the digested (unstripped) path, since that is what
+`ZSTD_DCtx_loadDictionary` itself does internally — only the one-shot
+`Decompressor`'s raw-bytes option is stripped. `Options.prefix`
+(`ZSTD_DCtx_refPrefix`) is forced raw content (a zstd-format dictionary's
+magic number is never looked for) and applies to exactly one frame; a
+skippable frame between it and the next real frame does *not* consume it in
+this port (libzstd's does, since it evaluates `ZSTD_getDDict` — which flips
+`dictUses` from "once" to "don't use" — before checking whether the frame
+is skippable). `Options.ddicts` (`ZSTD_d_refMultipleDDicts`) picks a
+dictionary by the frame's dictionary ID from a caller-given list, falling
+back to `Options.ddict`; the selection itself is a linear scan (last match
+wins on a duplicate ID) rather than a port of libzstd's open-addressing
+hash set, since only which `DDict` is picked is observable, not how. It is
+selected fresh for every frame in this port -- **a deliberate difference**
+from libzstd's own one-shot `ZSTD_decompress_usingDDict`/`ZSTD_decompressDCtx`,
+which apply whichever `ZSTD_DDict*` was resolved once before the frame loop
+started to every frame's content and entropy (only the dictID *check*, not
+the content applied, is re-resolved per frame via
+`ZSTD_DCtx_selectFrameDDict`) — so libzstd's one-shot multi-dictionary
+decoding of concatenated frames naming *different* dictionaries is, by this
+reading of its source, not what a fresh-per-frame selection would give; this
+port instead gives every frame its own correctly-selected dictionary, which
+is the more useful behaviour but is *not* verified byte-identical against
+libzstd's one-shot API for that specific combination (streaming was: see
+below). Flagged rather than decided silently, per the agent rules; the
+streaming API (`DecompressStream`), by contrast, resolves the dictionary
+before applying it for every frame — matching `ZSTD_decompressStream`'s own
+early `ZSTD_DCtx_selectFrameDDict` call, and is exactly what this port does
+too.
+
+**One divergence this work makes reachable for the first time, not new:**
+already documented above, libzstd switches between a "short" and a
+"prefetching" sequence decoder per block (`usePrefetchDecoder`), defaulting
+to the prefetching one whenever `dctx->ddictIsCold` — true essentially every
+time a dictionary decode begins, since it means "this dctx has not already
+been decoding with this exact dictionary". Only the short decoder is
+ported. On a corrupted sequences section the two can disagree on which
+check trips first — confirmed empirically here (`ERR 20`
+`corruption_detected` from libzstd vs `error.DstSizeTooSmall` from this
+port, both refusing the frame) — exactly the already-declared "on corrupt
+input either can change only the reported error" simplification above,
+observed in practice once decoding actually exercises a "cold" dictionary
+path (13/4000 random single-byte-flip corruptions of dictionary-compressed
+frames in a throwaway differential run hit this; every other corrupted
+input and every valid one, output and error class alike, matched).
+
 Speed: 1.04–1.05× libzstd's decode time on 200 MB of system binaries
 compressed at levels 3 and 19 (decode only, best of 5, ReleaseFast). std's
 decoder takes 30× libzstd's time on the same frames, which is why this is a
-port and not an extension of it.
+port and not an extension of it. Dictionary decoding was not separately
+measured (no compressor support yet to produce a realistic corpus, Z4).
 
 `Decompressor` holds the tables and a 128 KB literal buffer (≈ 190 KB) on
-the heap; `decompress` allocates one per call.
+the heap; `decompress` allocates one per call. A `DDict` adds its content
+buffer (by copy or by reference) and, when a zstd-format dictionary's
+entropy is present, the same three FSE tables and one Huffman table
+`Decompressor` itself holds (a few KB).
 
 ## Dictionary training (content selection)
 
@@ -1465,3 +1547,18 @@ roughly 17–22 sessions.
   10 in long-distance matching (see *Anchoring*).
 - `targets` declares only `.linux64`; the code has no OS or endianness
   dependency, but `portable-zstd-*` has not been run.
+- Dictionaries (Z2c mutation sweep, 14 mutations: 10 killed, 1 equivalent, 3
+  uncovered): `loadDEntropy`'s repcode-room check at exactly
+  `pos + 12 == dict.len` (needs a hand-built dictionary with zero content
+  bytes past the repeat offsets — every dictionary here comes from
+  `ZDICT_trainFromBuffer`, which does not produce that shape) and a
+  repcode of exactly 0 (needs a dictionary corrupted at a byte offset this
+  port does not expose — the `rep == 0` half of its check); `selectDDict`'s
+  `frame_dict_id != 0` guard (observable only with a raw-content `DDict`,
+  dictID 0 by construction, placed in `ddicts` and a frame that itself
+  needs no dictionary — see ddict.zig/SPEC.md's dictID-0 sentinel-ambiguity
+  note). `setHistoryFrom`'s `content.len == 0` guard is equivalent, not
+  uncovered: the address arithmetic it skips computes the same
+  `checkContinuity` outcome (an empty `ext`) either way, since
+  `prefix_addr == prev_end_addr` whenever `content.len == 0` regardless of
+  which address they hold.

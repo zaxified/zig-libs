@@ -14,13 +14,15 @@ for the same calls) covers every level too, and `FrameWriter` is a
 parameters (`zstd.Advanced`: explicit window/hash/chain/search/strategy,
 frame flags, magicless frames, the splitters, the row match finder, literal
 compression, block size) give libzstd's bytes for the same settings, and so
-does compression with a dictionary (raw or trained, `CDict`, prefixes) —
+does **compressing** with a dictionary (raw or trained, `CDict`, prefixes) —
 except where libzstd would *attach* a `CDict` (inputs under 8–32 KB, unknown
 sizes) of a strategy other than `greedy`…`btlazy2` and the optimal parsers
-(`fast`, `dfast`), which is refused for now; decoding dictionary frames, dictionary
-finalization (of training, the content selection is done:
-`zstd.dict_builder`), the stable-buffer streaming modes and multithreading are
-queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
+(`fast`, `dfast`), which is refused for now. **Decoding** with a dictionary
+(raw-content or zstd-format, a digested `DDict`, `ZSTD_d_refMultipleDDicts`)
+is done too. Dictionary *training*'s content selection is done
+(`zstd.dict_builder`), finalization is not; the stable-buffer and
+context-reuse parts of the streaming API and multithreading are queued in
+[SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
@@ -90,8 +92,31 @@ One-shot decoding takes the whole input and a destination for the whole
 output (`ZSTD_decompress`); a frame's size is in `getFrameContentSize`
 (null when the header omits it — `decompressBound` then gives an upper
 bound). Errors carry libzstd's names (`error.CorruptionDetected`,
-`error.ChecksumWrong`, `error.SrcSizeWrong`, ...). Dictionary frames are
-not here yet.
+`error.ChecksumWrong`, `error.SrcSizeWrong`, ...).
+
+A frame compressed with a dictionary decodes via `Decompressor`'s
+`DecompressOptions` (the free `zstd.decompress` takes none) or
+`DecompressStreamOptions`, either raw bytes (`.dictionary`) or a digested
+`zstd.DDict` (`.ddict`, load once and reuse — `zstd.DDict.init`/
+`initByReference`, `.raw_content`/`.full`/`.auto` content types), plus
+`.ddicts` for `ZSTD_d_refMultipleDDicts` (pick by the frame's dictionary
+ID) and, for streaming, `.prefix` for a one-frame `ZSTD_DCtx_refPrefix`:
+
+```zig
+var dd = try zstd.DDict.init(gpa, dict_bytes, .auto);
+defer dd.deinit(gpa);
+var dec = try zstd.Decompressor.init(gpa, .{ .ddict = &dd });
+defer dec.deinit();
+const len = try dec.decompress(out, frame); // error.DictionaryWrong if frame/dict mismatch
+```
+
+`zstd.getDictId(dict_bytes)` and `zstd.getFrameDictId(frame)` read a
+dictionary's or a frame's dictionary ID without decoding (see SPEC.md, §
+Decoder, for exactly what a dictionary's content covers as history — a
+digested `DDict`'s whole buffer, an undigested `.dictionary`'s only the
+part past its entropy header). This module's own **compressor** does not
+support dictionaries yet (Z4); the frames these decode were produced by
+libzstd itself.
 
 Streaming decompression, from any `std.Io.Reader` (a file, a socket):
 
