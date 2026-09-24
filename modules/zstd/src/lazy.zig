@@ -18,6 +18,7 @@ const match = @import("match.zig");
 const sequences = @import("sequences.zig");
 const MatchState = match.MatchState;
 const SeqStore = sequences.SeqStore;
+const Base = match.Base;
 
 const Method = enum { hash_chain, row, binary_tree };
 
@@ -73,13 +74,14 @@ fn dispatch(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size:
 /// `next_to_update` up to `ip` (only one when lazily skipping) and return the
 /// newest candidate for `ip`.
 fn insertAndFindFirstIndex(ms: *MatchState, ip: u32, comptime mls: u32) u32 {
+    const w: Base = .of(ms);
     const hash_table = ms.hash_table;
     const hash_log = ms.cp.hash_log;
     const chain_table = ms.chain_table;
     const chain_mask = (@as(u32, 1) << @intCast(ms.cp.chain_log)) - 1;
     var idx = ms.next_to_update;
     while (idx < ip) {
-        const h = ms.hash(idx, hash_log, mls);
+        const h = w.hash(idx, hash_log, mls);
         chain_table[idx & chain_mask] = hash_table[h];
         hash_table[h] = idx;
         idx += 1;
@@ -87,13 +89,14 @@ fn insertAndFindFirstIndex(ms: *MatchState, ip: u32, comptime mls: u32) u32 {
         if (ms.lazy_skipping) break;
     }
     ms.next_to_update = ip;
-    return hash_table[ms.hash(ip, hash_log, mls)];
+    return hash_table[w.hash(ip, hash_log, mls)];
 }
 
 /// `ZSTD_HcFindBestMatch` (noDict, or extDict when `ext`). Returns the best
 /// length found (3 when none reaches 4) and stores its offBase in
 /// `offset_ptr`.
 fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, comptime ext: bool) usize {
+    const w: Base = .of(ms);
     const dict_limit = ms.dict_limit;
     const chain_table = ms.chain_table;
     const chain_size: u32 = @as(u32, 1) << @intCast(ms.cp.chain_log);
@@ -108,7 +111,7 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
 
     var match_index = insertAndFindFirstIndex(ms, ip, mls);
     while (match_index >= low_limit and nb_attempts > 0) : (nb_attempts -= 1) {
-        const current_ml = candidateLength(ms, ip, match_index, iend, ml, dict_limit, ext);
+        const current_ml = candidateLength(w, ip, match_index, iend, ml, dict_limit, ext);
         // save best solution
         if (current_ml > ml) {
             ml = current_ml;
@@ -125,16 +128,16 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
 /// candidate test of the hash-chain and row finders. In the prefix, the 4
 /// bytes ending at `ml` must match; in the extDict (`ext`), the first 4,
 /// and the count may run on into the prefix.
-inline fn candidateLength(ms: *const MatchState, ip: u32, match_index: u32, iend: usize, ml: usize, dict_limit: u32, comptime ext: bool) usize {
+inline fn candidateLength(w: Base, ip: u32, match_index: u32, iend: usize, ml: usize, dict_limit: u32, comptime ext: bool) usize {
     if (!ext or match_index >= dict_limit) {
         // read 4B starting from (match + ml + 1 - sizeof(U32))
-        if (ms.read32(match_index + ml - 3) == ms.read32(ip + ml - 3)) // potentially better
-            return ms.count(ip, match_index, iend);
+        if (w.read32(match_index + ml - 3) == w.read32(ip + ml - 3)) // potentially better
+            return w.count(ip, match_index, iend);
         return 0;
     }
     // assumption: matchIndex <= dictLimit-4 (by table construction)
-    if (ms.read32Seg(match_index, dict_limit) == ms.read32(ip))
-        return ms.count2Segments(@as(usize, ip) + 4, @as(usize, match_index) + 4, iend, dict_limit, dict_limit) + 4;
+    if (w.read32Seg(match_index, dict_limit) == w.read32(ip))
+        return w.count2Segments(@as(usize, ip) + 4, @as(usize, match_index) + 4, iend, dict_limit, dict_limit) + 4;
     return 0;
 }
 
@@ -150,33 +153,50 @@ inline fn rowNextIndex(tag_row: []u8, row_mask: u32) u32 {
     return next;
 }
 
-inline fn rowHash(ms: *const MatchState, idx: usize, comptime mls: u32) u32 {
-    return @intCast(ms.hashSalted(idx, ms.row_hash_log + tag_bits, mls, ms.hash_salt));
+inline fn rowHash(ms: *const MatchState, w: Base, idx: usize, comptime mls: u32) u32 {
+    return @intCast(w.hashSalted(idx, ms.row_hash_log + tag_bits, mls, ms.hash_salt));
+}
+
+/// `ZSTD_row_prefetch`: the hash-table and tag-table row of a hash the
+/// cache will hand out 8 positions later. Changes no decision.
+inline fn rowPrefetch(ms: *const MatchState, h: u32, row_log: u32) void {
+    const rel_row: usize = @as(usize, h >> tag_bits) << @intCast(row_log);
+    @prefetch(ms.hash_table.ptr + rel_row, .{});
+    if (row_log >= 5) @prefetch(ms.hash_table.ptr + rel_row + 16, .{});
+    @prefetch(ms.tag_table.ptr + rel_row, .{});
+    if (row_log == 6) @prefetch(ms.tag_table.ptr + rel_row + 32, .{});
 }
 
 /// `ZSTD_row_fillHashCache`: hashes of up to 8 positions from `idx`, not
 /// past `ilimit`.
-fn fillHashCache(ms: *MatchState, comptime mls: u32, idx_in: u32, ilimit: i64) void {
+fn fillHashCache(ms: *MatchState, comptime mls: u32, idx_in: u32, ilimit: i64, row_log: u32) void {
+    const w: Base = .of(ms);
     var idx = idx_in;
     const max_elems: u32 = if (@as(i64, idx) > ilimit) 0 else @intCast(ilimit - idx + 1);
     const lim = idx + @min(cache_size, max_elems);
-    while (idx < lim) : (idx += 1) ms.hash_cache[idx & cache_mask] = rowHash(ms, idx, mls);
+    while (idx < lim) : (idx += 1) {
+        const h = rowHash(ms, w, idx, mls);
+        rowPrefetch(ms, h, row_log);
+        ms.hash_cache[idx & cache_mask] = h;
+    }
 }
 
 /// `ZSTD_row_nextCachedHash`: the hash of `idx`, replaced in the cache by the
 /// hash of `idx + 8`.
-inline fn nextCachedHash(ms: *MatchState, idx: u32, comptime mls: u32) u32 {
-    const new_hash = rowHash(ms, idx + cache_size, mls);
+inline fn nextCachedHash(ms: *MatchState, w: Base, idx: u32, comptime mls: u32, comptime row_log: u32) u32 {
+    const new_hash = rowHash(ms, w, idx + cache_size, mls);
+    rowPrefetch(ms, new_hash, row_log);
     const h = ms.hash_cache[idx & cache_mask];
     ms.hash_cache[idx & cache_mask] = new_hash;
     return h;
 }
 
 /// `ZSTD_row_update_internalImpl` with the hash cache.
-fn rowUpdateImpl(ms: *MatchState, start: u32, end: u32, comptime mls: u32, row_log: u32, row_mask: u32) void {
+fn rowUpdateImpl(ms: *MatchState, start: u32, end: u32, comptime mls: u32, comptime row_log: u32, row_mask: u32) void {
+    const w: Base = .of(ms);
     var idx = start;
     while (idx < end) : (idx += 1) {
-        const h = nextCachedHash(ms, idx, mls);
+        const h = nextCachedHash(ms, w, idx, mls, row_log);
         const rel_row: usize = @as(usize, h >> tag_bits) << @intCast(row_log);
         const tag_row = ms.tag_table[rel_row..];
         const pos = rowNextIndex(tag_row, row_mask);
@@ -187,7 +207,7 @@ fn rowUpdateImpl(ms: *MatchState, start: u32, end: u32, comptime mls: u32, row_l
 
 /// `ZSTD_row_update_internal` (useCache): insert positions up to `ip`,
 /// skipping the middle of long matches.
-fn rowUpdate(ms: *MatchState, ip: u32, comptime mls: u32, row_log: u32, row_mask: u32) void {
+fn rowUpdate(ms: *MatchState, ip: u32, comptime mls: u32, comptime row_log: u32, row_mask: u32) void {
     var idx = ms.next_to_update;
     const target = ip;
     const skip_threshold = 384;
@@ -197,7 +217,7 @@ fn rowUpdate(ms: *MatchState, ip: u32, comptime mls: u32, row_log: u32, row_mask
         const bound = idx + max_match_start_positions_to_update;
         rowUpdateImpl(ms, idx, bound, mls, row_log, row_mask);
         idx = target - max_match_end_positions_to_update;
-        fillHashCache(ms, mls, idx, @as(i64, ip) + 1);
+        fillHashCache(ms, mls, idx, @as(i64, ip) + 1, row_log);
     }
     rowUpdateImpl(ms, idx, target, mls, row_log, row_mask);
     ms.next_to_update = target;
@@ -213,14 +233,23 @@ inline fn matchMask(comptime entries: u32, tag_row: []const u8, tag: u8, head: u
     return std.math.rotr(B, eq, head);
 }
 
-/// `ZSTD_RowFindBestMatch` (noDict, or extDict when `ext`).
-fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, row_log: u32, comptime ext: bool) usize {
+/// `ZSTD_RowFindBestMatch` (noDict, or extDict when `ext`), specialised on
+/// the row log as libzstd's templates are.
+inline fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, row_log: u32, comptime ext: bool) usize {
+    return switch (row_log) {
+        inline 4, 5, 6 => |rl| rowFindBestMatchT(ms, ip, iend, offset_ptr, mls, rl, ext),
+        else => unreachable,
+    };
+}
+
+fn rowFindBestMatchT(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comptime mls: u32, comptime row_log: u32, comptime ext: bool) usize {
+    const w: Base = .of(ms);
     const dict_limit = ms.dict_limit;
     const curr = ip;
     const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
     const lowest_valid = ms.low_limit;
     const low_limit = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
-    const row_entries: u32 = @as(u32, 1) << @intCast(row_log);
+    const row_entries: u32 = 1 << row_log;
     const row_mask = row_entries - 1;
     const capped_search_log = @min(ms.cp.search_log, row_log); // nb of searches is capped at nb entries per row
     var nb_attempts: u32 = @as(u32, 1) << @intCast(capped_search_log);
@@ -230,11 +259,11 @@ fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, com
     var h: u32 = undefined;
     if (!ms.lazy_skipping) {
         rowUpdate(ms, ip, mls, row_log, row_mask);
-        h = nextCachedHash(ms, curr, mls);
+        h = nextCachedHash(ms, w, curr, mls, row_log);
     } else {
         // Stop inserting every position when in the lazy skipping mode. The
         // hash cache is also not kept up to date in this mode.
-        h = rowHash(ms, ip, mls);
+        h = rowHash(ms, w, ip, mls);
         ms.next_to_update = curr;
     }
     ms.hash_salt_entropy +%= h; // collect salt entropy
@@ -246,12 +275,7 @@ fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, com
     const head = tag_row[0] & row_mask;
     var match_buffer: [row_max_entries]u32 = undefined;
     var num_matches: usize = 0;
-    var matches: u64 = switch (row_log) {
-        4 => matchMask(16, tag_row, tag, head),
-        5 => matchMask(32, tag_row, tag, head),
-        6 => matchMask(64, tag_row, tag, head),
-        else => unreachable,
-    };
+    var matches: u64 = matchMask(row_entries, tag_row, tag, head);
 
     // Cycle through the matches
     while (matches > 0 and nb_attempts > 0) : (matches &= matches - 1) {
@@ -259,6 +283,10 @@ fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, com
         const match_index = row[match_pos];
         if (match_pos == 0) continue;
         if (match_index < low_limit) break;
+        if (!ext or match_index >= dict_limit)
+            @prefetch(ms.src.ptr + (match_index - ms.src_base), .{})
+        else
+            @prefetch(ms.dict.ptr + (match_index - ms.dict_base), .{});
         match_buffer[num_matches] = match_index;
         num_matches += 1;
         nb_attempts -= 1;
@@ -275,7 +303,7 @@ fn rowFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, com
 
     // Return the longest match
     for (match_buffer[0..num_matches]) |match_index| {
-        const current_ml = candidateLength(ms, ip, match_index, iend, ml, dict_limit, ext);
+        const current_ml = candidateLength(w, ip, match_index, iend, ml, dict_limit, ext);
         if (current_ml > ml) {
             ml = current_ml;
             offset_ptr.* = curr - match_index + sequences.rep_num;
@@ -307,11 +335,12 @@ inline fn btMask(ms: *const MatchState) u32 {
 /// `ZSTD_updateDUBT`: chain every position from `next_to_update` up to `ip`
 /// and mark it unsorted.
 fn updateDubt(ms: *MatchState, ip: u32, comptime mls: u32) void {
+    const w: Base = .of(ms);
     const bt = ms.chain_table;
     const bt_mask = btMask(ms);
     var idx = ms.next_to_update;
     while (idx < ip) : (idx += 1) {
-        const h = ms.hash(idx, ms.cp.hash_log, mls);
+        const h = w.hash(idx, ms.cp.hash_log, mls);
         const match_index = ms.hash_table[h];
         const slot = 2 * @as(usize, idx & bt_mask);
         ms.hash_table[h] = idx; // Update Hash Table
@@ -326,6 +355,7 @@ fn updateDubt(ms: *MatchState, ip: u32, comptime mls: u32) void {
 /// `nb_compares` nodes and not descending below `bt_low`. With an extDict,
 /// `curr` itself may lie in it; its input then ends at the extDict's end.
 fn insertDubt1(ms: *MatchState, curr: u32, input_end: usize, nb_compares_in: u32, bt_low: u32, comptime ext: bool) void {
+    const w: Base = .of(ms);
     const dict_limit = ms.dict_limit;
     const iend: usize = if (!ext or curr >= dict_limit) input_end else dict_limit;
     const bt = ms.chain_table;
@@ -348,18 +378,18 @@ fn insertDubt1(ms: *MatchState, curr: u32, input_end: usize, nb_compares_in: u32
         var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
         std.debug.assert(match_index < curr);
         if (!ext or match_index + match_length >= dict_limit) {
-            match_length += ms.count(curr + match_length, match_index + match_length, iend);
+            match_length += w.count(curr + match_length, match_index + match_length, iend);
         } else if (curr < dict_limit) { // both in extDict
-            match_length += ms.countInDict(curr + match_length, match_index + match_length, iend);
+            match_length += w.countInDict(curr + match_length, match_index + match_length, iend);
         } else {
-            match_length += ms.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
+            match_length += w.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
         }
 
         // equal: no way to know if inf or sup. Drop, to guarantee consistency;
         // miss a bit of compression, but other solutions can corrupt the tree.
         if (curr + match_length == iend) break;
 
-        if (byteAt(ms, match_index + match_length, dict_limit, ext) < byteAt(ms, curr + match_length, dict_limit, ext)) {
+        if (byteAt(w, match_index + match_length, dict_limit, ext) < byteAt(w, curr + match_length, dict_limit, ext)) {
             // match is smaller than current
             smaller_ptr.* = match_index; // update smaller idx
             common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
@@ -386,17 +416,18 @@ fn insertDubt1(ms: *MatchState, curr: u32, input_end: usize, nb_compares_in: u32
 }
 
 /// The byte at index `idx`: from the extDict below `dict_limit` when `ext`.
-inline fn byteAt(ms: *const MatchState, idx: usize, dict_limit: u32, comptime ext: bool) u8 {
-    return if (ext) ms.atSeg(idx, dict_limit) else ms.at(idx);
+inline fn byteAt(w: Base, idx: usize, dict_limit: u32, comptime ext: bool) u8 {
+    return if (ext) w.atSeg(idx, dict_limit) else w.at(idx);
 }
 
 /// `ZSTD_DUBT_findBestMatch` (noDict, or extDict when `ext`). Returns the
 /// best length (0 when none) and stores its offBase in `off_base_ptr`, whose
 /// incoming value also prices the first candidate.
 fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, comptime mls: u32, comptime ext: bool) usize {
+    const w: Base = .of(ms);
     const dict_limit = ms.dict_limit;
     const hash_table = ms.hash_table;
-    const h = ms.hash(ip, ms.cp.hash_log, mls);
+    const h = w.hash(ip, ms.cp.hash_log, mls);
     var match_index = hash_table[h];
     const curr = ip;
     const window_low = lowestMatchIndex(ms, curr);
@@ -452,9 +483,9 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
         const next_slot = 2 * @as(usize, match_index & bt_mask);
         var match_length = @min(common_length_smaller, common_length_larger); // guaranteed minimum nb of common bytes
         if (!ext or match_index + match_length >= dict_limit) {
-            match_length += ms.count(curr + match_length, match_index + match_length, iend);
+            match_length += w.count(curr + match_length, match_index + match_length, iend);
         } else {
-            match_length += ms.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
+            match_length += w.count2Segments(curr + match_length, match_index + match_length, iend, dict_limit, dict_limit);
         }
 
         if (match_length > best_length) {
@@ -471,7 +502,7 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
             if (curr + match_length == iend) break;
         }
 
-        if (byteAt(ms, match_index + match_length, dict_limit, ext) < ms.at(curr + match_length)) {
+        if (byteAt(w, match_index + match_length, dict_limit, ext) < w.at(curr + match_length)) {
             // match is smaller than current
             smaller_ptr.* = match_index; // update smaller idx
             common_length_smaller = match_length; // all smaller will now have at least this guaranteed common length
@@ -527,6 +558,7 @@ inline fn gain(ml: usize, mult: i64, off_base: u32, bonus: i64) i64 {
 /// 2 lazy2 and btlazy2. Stores sequences into `ss`, updates `rep`, and returns the number
 /// of trailing literals.
 fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime method: Method, comptime depth: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
     const iend: usize = istart + src_size;
     // Signed: a short block puts the limit before the block start.
     const ilimit: i64 = @as(i64, @intCast(iend)) - 8 - (if (method == .row) cache_size else 0);
@@ -557,7 +589,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
 
     // Reset the lazy skipping state
     ms.lazy_skipping = false;
-    if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit);
+    if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit, row_log);
 
     while (@as(i64, @intCast(ip)) < ilimit) {
         var match_length: usize = 0;
@@ -566,8 +598,8 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
 
         store: {
             // check repCode
-            if (offset_1 > 0 and ms.read32(ip + 1 - offset_1) == ms.read32(ip + 1)) {
-                match_length = ms.count(ip + 1 + 4, ip + 1 + 4 - offset_1, iend) + 4;
+            if (offset_1 > 0 and w.read32(ip + 1 - offset_1) == w.read32(ip + 1)) {
+                match_length = w.count(ip + 1 + 4, ip + 1 + 4 - offset_1, iend) + 4;
                 if (depth == 0) break :store;
             }
 
@@ -594,8 +626,8 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
             // let's try to find a better solution
             if (depth >= 1) while (@as(i64, @intCast(ip)) < ilimit) {
                 ip += 1;
-                if (off_base != 0 and offset_1 > 0 and ms.read32(ip) == ms.read32(ip - offset_1)) {
-                    const ml_rep = ms.count(ip + 4, ip + 4 - offset_1, iend) + 4;
+                if (off_base != 0 and offset_1 > 0 and w.read32(ip) == w.read32(ip - offset_1)) {
+                    const ml_rep = w.count(ip + 4, ip + 4 - offset_1, iend) + 4;
                     const gain2: i64 = @as(i64, @intCast(ml_rep)) * 3;
                     const gain1 = gain(match_length, 3, off_base, 1);
                     if (ml_rep >= 4 and gain2 > gain1) {
@@ -620,8 +652,8 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
                 // let's find an even better one
                 if (depth == 2 and @as(i64, @intCast(ip)) < ilimit) {
                     ip += 1;
-                    if (off_base != 0 and offset_1 > 0 and ms.read32(ip) == ms.read32(ip - offset_1)) {
-                        const ml_rep = ms.count(ip + 4, ip + 4 - offset_1, iend) + 4;
+                    if (off_base != 0 and offset_1 > 0 and w.read32(ip) == w.read32(ip - offset_1)) {
+                        const ml_rep = w.count(ip + 4, ip + 4 - offset_1, iend) + 4;
                         const gain2: i64 = @as(i64, @intCast(ml_rep)) * 4;
                         const gain1 = gain(match_length, 4, off_base, 1);
                         if (ml_rep >= 4 and gain2 > gain1) {
@@ -650,7 +682,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
             if (off_base > sequences.rep_num) {
                 const offset = off_base - sequences.rep_num;
                 // only search for offset within prefix
-                while (start > anchor and start - offset > prefix_lowest and ms.at(start - 1) == ms.at(start - offset - 1)) {
+                while (start > anchor and start - offset > prefix_lowest and w.at(start - 1) == w.at(start - offset - 1)) {
                     start -= 1;
                     match_length += 1;
                 }
@@ -660,19 +692,21 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
         }
 
         // store sequence
-        ss.store(ms.bytes(anchor, start), off_base, match_length);
+        ss.store(w.bytes(anchor, start), off_base, match_length);
         ip = start + match_length;
         anchor = ip;
         if (ms.lazy_skipping) {
             // We've found a match, disable lazy skipping mode, and refill the hash cache.
-            if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit);
+            if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit, row_log);
             ms.lazy_skipping = false;
         }
 
         // check immediate repcode
-        while (@as(i64, @intCast(ip)) <= ilimit and offset_2 > 0 and ms.read32(ip) == ms.read32(ip - offset_2)) {
-            match_length = ms.count(ip + 4, ip + 4 - offset_2, iend) + 4;
-            std.mem.swap(u32, &offset_1, &offset_2); // swap repcodes
+        while (@as(i64, @intCast(ip)) <= ilimit and offset_2 > 0 and w.read32(ip) == w.read32(ip - offset_2)) {
+            match_length = w.count(ip + 4, ip + 4 - offset_2, iend) + 4;
+            const tmp = offset_1; // swap repcodes
+            offset_1 = offset_2;
+            offset_2 = tmp;
             ss.store(&.{}, 1, match_length);
             ip += match_length;
             anchor = ip;
@@ -694,6 +728,7 @@ fn lazyGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_si
 /// at that position and refuses one whose 4 bytes straddle the extDict's
 /// end.
 fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime method: Method, comptime depth: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
     const iend: usize = istart + src_size;
     const ilimit: i64 = @as(i64, @intCast(iend)) - 8 - (if (method == .row) cache_size else 0);
     const dict_limit = ms.dict_limit;
@@ -712,7 +747,7 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
 
     // init
     ip += @intFromBool(ip == prefix_start);
-    if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit);
+    if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit, row_log);
 
     while (@as(i64, @intCast(ip)) < ilimit) {
         var match_length: usize = 0;
@@ -722,7 +757,7 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
 
         store: {
             // check repCode
-            if (repMatchLength(ms, curr + 1, offset_1, iend, dict_limit)) |len| {
+            if (repMatchLength(ms, w, curr + 1, offset_1, iend, dict_limit)) |len| {
                 match_length = len;
                 if (depth == 0) break :store;
             }
@@ -750,7 +785,7 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
                 ip += 1;
                 curr += 1;
                 // check repCode
-                if (off_base != 0) if (repMatchLength(ms, curr, offset_1, iend, dict_limit)) |rep_length| {
+                if (off_base != 0) if (repMatchLength(ms, w, curr, offset_1, iend, dict_limit)) |rep_length| {
                     const gain2: i64 = @as(i64, @intCast(rep_length)) * 3;
                     const gain1 = gain(match_length, 3, off_base, 1);
                     if (rep_length >= 4 and gain2 > gain1) {
@@ -779,7 +814,7 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
                     ip += 1;
                     curr += 1;
                     // check repCode
-                    if (off_base != 0) if (repMatchLength(ms, curr, offset_1, iend, dict_limit)) |rep_length| {
+                    if (off_base != 0) if (repMatchLength(ms, w, curr, offset_1, iend, dict_limit)) |rep_length| {
                         const gain2: i64 = @as(i64, @intCast(rep_length)) * 4;
                         const gain1 = gain(match_length, 4, off_base, 1);
                         if (rep_length >= 4 and gain2 > gain1) {
@@ -811,7 +846,7 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
                 const offset = off_base - sequences.rep_num;
                 var match_index: usize = start - offset;
                 const m_start: usize = if (match_index < dict_limit) dict_start else prefix_start;
-                while (start > anchor and match_index > m_start and ms.at(start - 1) == ms.atSeg(match_index - 1, dict_limit)) {
+                while (start > anchor and match_index > m_start and w.at(start - 1) == w.atSeg(match_index - 1, dict_limit)) {
                     start -= 1;
                     match_index -= 1;
                     match_length += 1;
@@ -822,20 +857,22 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
         }
 
         // store sequence
-        ss.store(ms.bytes(anchor, start), off_base, match_length);
+        ss.store(w.bytes(anchor, start), off_base, match_length);
         ip = start + match_length;
         anchor = ip;
         if (ms.lazy_skipping) {
             // We've found a match, disable lazy skipping mode, and refill the hash cache.
-            if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit);
+            if (method == .row) fillHashCache(ms, mls, ms.next_to_update, ilimit, row_log);
             ms.lazy_skipping = false;
         }
 
         // check immediate repcode
         while (@as(i64, @intCast(ip)) <= ilimit) {
-            const len = repMatchLength(ms, @intCast(ip), offset_2, iend, dict_limit) orelse break;
+            const len = repMatchLength(ms, w, @intCast(ip), offset_2, iend, dict_limit) orelse break;
             match_length = len;
-            std.mem.swap(u32, &offset_1, &offset_2); // swap offset history
+            const tmp = offset_1; // swap offset history
+            offset_1 = offset_2;
+            offset_2 = tmp;
             ss.store(&.{}, 1, match_length);
             ip += match_length;
             anchor = ip;
@@ -851,13 +888,13 @@ fn lazyExtDictGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32,
 /// The extDict parser's repcode test at index `curr` for `offset`: the
 /// match length when the offset lies within the window, its 4 bytes do not
 /// straddle the extDict's end, and they match; else null.
-inline fn repMatchLength(ms: *const MatchState, curr: u32, offset: u32, iend: usize, dict_limit: u32) ?usize {
+inline fn repMatchLength(ms: *const MatchState, w: Base, curr: u32, offset: u32, iend: usize, dict_limit: u32) ?usize {
     const window_low = ms.lowestMatchIndex(curr);
     const rep_index = curr -% offset;
     if (!(match.indexOverlapCheck(dict_limit, rep_index) and offset <= curr - window_low)) return null;
-    if (ms.read32(curr) != ms.read32Seg(rep_index, dict_limit)) return null;
+    if (w.read32(curr) != w.read32Seg(rep_index, dict_limit)) return null;
     const rep_end: usize = if (rep_index < dict_limit) dict_limit else iend;
-    return ms.count2Segments(@as(usize, curr) + 4, @as(usize, rep_index) + 4, iend, rep_end, dict_limit) + 4;
+    return w.count2Segments(@as(usize, curr) + 4, @as(usize, rep_index) + 4, iend, rep_end, dict_limit) + 4;
 }
 
 test "the next row slot cycles backwards and skips the head" {

@@ -355,6 +355,128 @@ pub fn reduceTable(table: []u32, reducer: u32, preserve_mark: bool) void {
     }
 }
 
+/// libzstd's `window.base` for the prefix: index `i` is the byte at
+/// `addr + i`. The match finders' inner loops read through it rather than
+/// through `MatchState.src`, whose fields the compiler must reload after
+/// every table store (a store through a `u32` slice may alias them). The
+/// safe build modes still check each read against the prefix.
+pub const Base = struct {
+    addr: usize,
+    lo: usize,
+    hi: usize,
+    /// The extDict segment, libzstd's `window.dictBase`.
+    dict_addr: usize,
+    dict_lo: usize,
+    dict_hi: usize,
+
+    pub inline fn of(ms: *const MatchState) Base {
+        return .{
+            .addr = @intFromPtr(ms.src.ptr) -% ms.src_base,
+            .lo = ms.src_base,
+            .hi = ms.src_base + ms.src.len,
+            .dict_addr = @intFromPtr(ms.dict.ptr) -% ms.dict_base,
+            .dict_lo = ms.dict_base,
+            .dict_hi = ms.dict_base + ms.dict.len,
+        };
+    }
+    inline fn ptr(b: Base, idx: usize, n: usize) [*]const u8 {
+        if (std.debug.runtime_safety) std.debug.assert(idx >= b.lo and idx + n <= b.hi);
+        return @ptrFromInt(b.addr +% idx);
+    }
+    inline fn dictPtr(b: Base, idx: usize, n: usize) [*]const u8 {
+        if (std.debug.runtime_safety) std.debug.assert(idx >= b.dict_lo and idx + n <= b.dict_hi);
+        return @ptrFromInt(b.dict_addr +% idx);
+    }
+    /// The segment holding `idx`: libzstd's
+    /// `(idx < prefixStart ? dictBase : base) + idx`.
+    inline fn segPtr(b: Base, idx: usize, prefix_start: usize, n: usize) [*]const u8 {
+        return if (idx < prefix_start) b.dictPtr(idx, n) else b.ptr(idx, n);
+    }
+    pub inline fn atSeg(b: Base, idx: usize, prefix_start: usize) u8 {
+        return b.segPtr(idx, prefix_start, 1)[0];
+    }
+    pub inline fn read32Seg(b: Base, idx: usize, prefix_start: usize) u32 {
+        return std.mem.readInt(u32, b.segPtr(idx, prefix_start, 4)[0..4], .little);
+    }
+    pub inline fn read64Seg(b: Base, idx: usize, prefix_start: usize) u64 {
+        return std.mem.readInt(u64, b.segPtr(idx, prefix_start, 8)[0..8], .little);
+    }
+    /// `MatchState.count2Segments`.
+    pub inline fn count2Segments(b: Base, p_in: usize, p_match: usize, i_end: usize, m_end: usize, i_start: usize) usize {
+        if (m_end == i_end) return b.count(p_in, p_match, i_end);
+        const v_end = if (p_match > m_end) p_in else @min(p_in + (m_end - p_match), i_end);
+        var n: usize = 0;
+        if (v_end > p_in) {
+            const len = v_end - p_in;
+            n = std.mem.indexOfDiff(u8, b.ptr(p_in, len)[0..len], b.dictPtr(p_match, len)[0..len]) orelse len;
+        }
+        if (p_match + n != m_end) return n;
+        return n + b.count(p_in + n, i_start, i_end);
+    }
+    pub inline fn at(b: Base, idx: usize) u8 {
+        return b.ptr(idx, 1)[0];
+    }
+    pub inline fn read32(b: Base, idx: usize) u32 {
+        return std.mem.readInt(u32, b.ptr(idx, 4)[0..4], .little);
+    }
+    pub inline fn read64(b: Base, idx: usize) u64 {
+        return std.mem.readInt(u64, b.ptr(idx, 8)[0..8], .little);
+    }
+    /// The prefix bytes at indices `from`..`to`.
+    pub inline fn bytes(b: Base, from: usize, to: usize) []const u8 {
+        return b.ptr(from, to - from)[0 .. to - from];
+    }
+    /// `ZSTD_hashPtrSalted` (see `MatchState.hashSalted`).
+    pub inline fn hashSalted(b: Base, idx: usize, h_bits: u32, comptime mls: u32, salt: u64) usize {
+        const sh: u6 = @intCast(64 - h_bits);
+        return switch (mls) {
+            5 => @intCast((((b.read64(idx) << 24) *% prime5) ^ salt) >> sh),
+            6 => @intCast((((b.read64(idx) << 16) *% prime6) ^ salt) >> sh),
+            7 => @intCast((((b.read64(idx) << 8) *% prime7) ^ salt) >> sh),
+            8 => @intCast(((b.read64(idx) *% prime8) ^ salt) >> sh),
+            else => @intCast(((b.read32(idx) *% prime4) ^ @as(u32, @truncate(salt))) >> @intCast(32 - h_bits)),
+        };
+    }
+    /// `MatchState.countInDict`.
+    pub inline fn countInDict(b: Base, p_in: usize, p_match: usize, p_limit: usize) usize {
+        if (p_limit <= p_in) return 0;
+        const n = p_limit - p_in;
+        return std.mem.indexOfDiff(u8, b.dictPtr(p_in, n)[0..n], b.dictPtr(p_match, n)[0..n]) orelse n;
+    }
+    /// `ZSTD_hashPtr` for `mls` in 4..8.
+    pub inline fn hash(b: Base, idx: usize, h_bits: u32, comptime mls: u32) usize {
+        const sh: u6 = @intCast(64 - h_bits);
+        return switch (mls) {
+            5 => @intCast(((b.read64(idx) << 24) *% prime5) >> sh),
+            6 => @intCast(((b.read64(idx) << 16) *% prime6) >> sh),
+            7 => @intCast(((b.read64(idx) << 8) *% prime7) >> sh),
+            8 => @intCast((b.read64(idx) *% prime8) >> sh),
+            else => @intCast((b.read32(idx) *% prime4) >> @intCast(32 - h_bits)),
+        };
+    }
+    /// `PREFETCH_L1(base + idx)`: may point past the input, which a
+    /// prefetch never faults on.
+    pub inline fn prefetch(b: Base, idx: usize) void {
+        @prefetch(@as([*]const u8, @ptrFromInt(b.addr +% idx)), .{});
+    }
+    /// `ZSTD_count` (see `MatchState.count`).
+    pub inline fn count(b: Base, p_in: usize, p_match: usize, p_limit: usize) usize {
+        var i = p_in;
+        var m = p_match;
+        while (i + 8 <= p_limit) {
+            const d = b.read64(i) ^ b.read64(m);
+            if (d != 0) return i - p_in + (@ctz(d) >> 3);
+            i += 8;
+            m += 8;
+        }
+        while (i < p_limit and b.at(i) == b.at(m)) {
+            i += 1;
+            m += 1;
+        }
+        return i - p_in;
+    }
+};
+
 const prime4: u32 = 2654435761;
 const prime5: u64 = 889523592379;
 const prime6: u64 = 227718039650203;
@@ -435,6 +557,7 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
 /// `ZSTD_compressBlock_fast_noDict_generic`. The cmov and branch variants of
 /// libzstd's `matchFound` accept exactly the same candidates, so one serves.
 fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
     const hash_table = ms.hash_table;
     const hlog = ms.cp.hash_log;
     const step_size: usize = ms.cp.target_length + @intFromBool(ms.cp.target_length == 0) + 1;
@@ -490,19 +613,19 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
         ip3 = ip2 + 1;
         if (ip3 >= ilimit) break :outer;
 
-        hash0 = ms.hash(ip0, hlog, mls);
-        hash1 = ms.hash(ip1, hlog, mls);
+        hash0 = w.hash(ip0, hlog, mls);
+        hash1 = w.hash(ip1, hlog, mls);
         match_idx = hash_table[hash0];
 
         const found: enum { rep, offset } = search: while (true) {
             // check repcode at ip[2]
-            const rval = ms.read32(ip2 - rep_offset1);
+            const rval = w.read32(ip2 - rep_offset1);
             current0 = @intCast(ip0);
             hash_table[hash0] = current0;
-            if (ms.read32(ip2) == rval and rep_offset1 > 0) {
+            if (w.read32(ip2) == rval and rep_offset1 > 0) {
                 ip0 = ip2;
                 match0 = ip0 - rep_offset1;
-                m_length = @intFromBool(ms.at(ip0 - 1) == ms.at(match0 - 1));
+                m_length = @intFromBool(w.at(ip0 - 1) == w.at(match0 - 1));
                 ip0 -= m_length;
                 match0 -= m_length;
                 offcode = 1; // REPCODE1_TO_OFFBASE
@@ -511,7 +634,7 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
                 hash_table[hash1] = @intCast(ip1);
                 break :search .rep;
             }
-            if (match_idx >= prefix_start_index and ms.read32(ip0) == ms.read32(match_idx)) {
+            if (match_idx >= prefix_start_index and w.read32(ip0) == w.read32(match_idx)) {
                 hash_table[hash1] = @intCast(ip1);
                 break :search .offset;
             }
@@ -519,14 +642,14 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
             // lookup ip[1]
             match_idx = hash_table[hash1];
             hash0 = hash1;
-            hash1 = ms.hash(ip2, hlog, mls);
+            hash1 = w.hash(ip2, hlog, mls);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
 
             current0 = @intCast(ip0);
             hash_table[hash0] = current0;
-            if (match_idx >= prefix_start_index and ms.read32(ip0) == ms.read32(match_idx)) {
+            if (match_idx >= prefix_start_index and w.read32(ip0) == w.read32(match_idx)) {
                 if (step <= 4) hash_table[hash1] = @intCast(ip1);
                 break :search .offset;
             }
@@ -534,13 +657,15 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
             // lookup ip[2]
             match_idx = hash_table[hash1];
             hash0 = hash1;
-            hash1 = ms.hash(ip2, hlog, mls);
+            hash1 = w.hash(ip2, hlog, mls);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip0 + step;
             ip3 = ip1 + step;
             if (ip2 >= next_step) {
                 step += 1;
+                w.prefetch(ip1 + 64);
+                w.prefetch(ip1 + 128);
                 next_step += step_incr;
             }
             if (!(ip3 < ilimit)) break :outer;
@@ -553,7 +678,7 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
             offcode = rep_offset1 + sequences.rep_num;
             m_length = 4;
             // Count the backwards match length.
-            while (ip0 > anchor and match0 > prefix_start and ms.at(ip0 - 1) == ms.at(match0 - 1)) {
+            while (ip0 > anchor and match0 > prefix_start and w.at(ip0 - 1) == w.at(match0 - 1)) {
                 ip0 -= 1;
                 match0 -= 1;
                 m_length += 1;
@@ -561,20 +686,22 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
         }
 
         // _match: count the forward length
-        m_length += ms.count(ip0 + m_length, match0 + m_length, iend);
-        ss.store(ms.bytes(anchor, ip0), offcode, m_length);
+        m_length += w.count(ip0 + m_length, match0 + m_length, iend);
+        ss.store(w.bytes(anchor, ip0), offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
 
         // Fill table and check for immediate repcode.
         if (ip0 <= ilimit) {
-            hash_table[ms.hash(current0 + 2, hlog, mls)] = current0 + 2;
-            hash_table[ms.hash(ip0 - 2, hlog, mls)] = @intCast(ip0 - 2);
+            hash_table[w.hash(current0 + 2, hlog, mls)] = current0 + 2;
+            hash_table[w.hash(ip0 - 2, hlog, mls)] = @intCast(ip0 - 2);
             if (rep_offset2 > 0) {
-                while (ip0 <= ilimit and ms.read32(ip0) == ms.read32(ip0 - rep_offset2)) {
-                    const r_length = ms.count(ip0 + 4, ip0 + 4 - rep_offset2, iend) + 4;
-                    std.mem.swap(u32, &rep_offset1, &rep_offset2);
-                    hash_table[ms.hash(ip0, hlog, mls)] = @intCast(ip0);
+                while (ip0 <= ilimit and w.read32(ip0) == w.read32(ip0 - rep_offset2)) {
+                    const r_length = w.count(ip0 + 4, ip0 + 4 - rep_offset2, iend) + 4;
+                    const tmp = rep_offset1;
+                    rep_offset1 = rep_offset2;
+                    rep_offset2 = tmp;
+                    hash_table[w.hash(ip0, hlog, mls)] = @intCast(ip0);
                     ip0 += r_length;
                     ss.store(&.{}, 1, r_length);
                     anchor = ip0;
@@ -592,6 +719,7 @@ fn fastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size
 
 /// `ZSTD_compressBlock_doubleFast_noDict_generic`.
 fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
     const hash_long = ms.hash_table;
     const h_bits_l = ms.cp.hash_log;
     const hash_small = ms.chain_table;
@@ -646,12 +774,12 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
         ip1 = ip + step;
         if (ip1 > ilimit) break :outer;
 
-        hl0 = ms.hash(ip, h_bits_l, 8);
+        hl0 = w.hash(ip, h_bits_l, 8);
         idxl0 = hash_long[hl0];
         matchl0 = idxl0;
 
         const found: enum { stored, found, next_long } = search: while (true) {
-            const hs0 = ms.hash(ip, h_bits_s, mls);
+            const hs0 = w.hash(ip, h_bits_s, mls);
             const idxs0 = hash_small[hs0];
             curr = @intCast(ip);
             matchs0 = idxs0;
@@ -660,20 +788,20 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
             hash_small[hs0] = curr; // update hash tables
 
             // check noDict repcode
-            if (offset_1 > 0 and ms.read32(ip + 1 - offset_1) == ms.read32(ip + 1)) {
-                m_length = ms.count(ip + 1 + 4, ip + 1 + 4 - offset_1, iend) + 4;
+            if (offset_1 > 0 and w.read32(ip + 1 - offset_1) == w.read32(ip + 1)) {
+                m_length = w.count(ip + 1 + 4, ip + 1 + 4 - offset_1, iend) + 4;
                 ip += 1;
-                ss.store(ms.bytes(anchor, ip), 1, m_length);
+                ss.store(w.bytes(anchor, ip), 1, m_length);
                 break :search .stored;
             }
 
-            hl1 = ms.hash(ip1, h_bits_l, 8);
+            hl1 = w.hash(ip1, h_bits_l, 8);
 
             // idxl0 > 0 && idxl0 >= prefixLowestIndex
-            if (idxl0 >= prefix_lowest_index and ms.read64(matchl0) == ms.read64(ip)) {
-                m_length = ms.count(ip + 8, matchl0 + 8, iend) + 8;
+            if (idxl0 >= prefix_lowest_index and w.read64(matchl0) == w.read64(ip)) {
+                m_length = w.count(ip + 8, matchl0 + 8, iend) + 8;
                 offset = @intCast(ip - matchl0);
-                while (ip > anchor and matchl0 > prefix_lowest and ms.at(ip - 1) == ms.at(matchl0 - 1)) {
+                while (ip > anchor and matchl0 > prefix_lowest and w.at(ip - 1) == w.at(matchl0 - 1)) {
                     ip -= 1;
                     matchl0 -= 1;
                     m_length += 1;
@@ -685,11 +813,13 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
             matchl1 = idxl1;
 
             // Is there a short match at ip?
-            if (idxs0 >= prefix_lowest_index and ms.read32(matchs0) == ms.read32(ip)) {
+            if (idxs0 >= prefix_lowest_index and w.read32(matchs0) == w.read32(ip)) {
                 break :search .next_long;
             }
 
             if (ip1 >= next_step) {
+                w.prefetch(ip1 + 64);
+                w.prefetch(ip1 + 128);
                 step += 1;
                 next_step += step_incr;
             }
@@ -704,10 +834,10 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
 
         if (found == .next_long) {
             // check prefix long +1 match
-            m_length = ms.count(ip + 4, matchs0 + 4, iend) + 4;
+            m_length = w.count(ip + 4, matchs0 + 4, iend) + 4;
             offset = @intCast(ip - matchs0);
-            if (idxl1 > prefix_lowest_index and ms.read64(matchl1) == ms.read64(ip1)) {
-                const l1len = ms.count(ip1 + 8, matchl1 + 8, iend) + 8;
+            if (idxl1 > prefix_lowest_index and w.read64(matchl1) == w.read64(ip1)) {
+                const l1len = w.count(ip1 + 8, matchl1 + 8, iend) + 8;
                 if (l1len > m_length) {
                     // use the long match found
                     ip = ip1;
@@ -716,7 +846,7 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
                     matchs0 = matchl1;
                 }
             }
-            while (ip > anchor and matchs0 > prefix_lowest and ms.at(ip - 1) == ms.at(matchs0 - 1)) {
+            while (ip > anchor and matchs0 > prefix_lowest and w.at(ip - 1) == w.at(matchs0 - 1)) {
                 ip -= 1;
                 matchs0 -= 1;
                 m_length += 1;
@@ -731,7 +861,7 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
                 // Write next hash table entry: it's already calculated.
                 hash_long[hl1] = @intCast(ip1);
             }
-            ss.store(ms.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+            ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
         }
 
         // _match_stored
@@ -741,17 +871,19 @@ fn dfastBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_siz
         if (ip <= ilimit) {
             // Complementary insertion
             const index_to_insert = curr + 2;
-            hash_long[ms.hash(index_to_insert, h_bits_l, 8)] = index_to_insert;
-            hash_long[ms.hash(ip - 2, h_bits_l, 8)] = @intCast(ip - 2);
-            hash_small[ms.hash(index_to_insert, h_bits_s, mls)] = index_to_insert;
-            hash_small[ms.hash(ip - 1, h_bits_s, mls)] = @intCast(ip - 1);
+            hash_long[w.hash(index_to_insert, h_bits_l, 8)] = index_to_insert;
+            hash_long[w.hash(ip - 2, h_bits_l, 8)] = @intCast(ip - 2);
+            hash_small[w.hash(index_to_insert, h_bits_s, mls)] = index_to_insert;
+            hash_small[w.hash(ip - 1, h_bits_s, mls)] = @intCast(ip - 1);
 
             // check immediate repcode
-            while (ip <= ilimit and offset_2 > 0 and ms.read32(ip) == ms.read32(ip - offset_2)) {
-                const r_length = ms.count(ip + 4, ip + 4 - offset_2, iend) + 4;
-                std.mem.swap(u32, &offset_1, &offset_2);
-                hash_small[ms.hash(ip, h_bits_s, mls)] = @intCast(ip);
-                hash_long[ms.hash(ip, h_bits_l, 8)] = @intCast(ip);
+            while (ip <= ilimit and offset_2 > 0 and w.read32(ip) == w.read32(ip - offset_2)) {
+                const r_length = w.count(ip + 4, ip + 4 - offset_2, iend) + 4;
+                const tmp = offset_1;
+                offset_1 = offset_2;
+                offset_2 = tmp;
+                hash_small[w.hash(ip, h_bits_s, mls)] = @intCast(ip);
+                hash_long[w.hash(ip, h_bits_l, 8)] = @intCast(ip);
                 ss.store(&.{}, 1, r_length);
                 ip += r_length;
                 anchor = ip;
@@ -775,6 +907,7 @@ pub inline fn indexOverlapCheck(prefix_lowest_index: u32, rep_index: u32) bool {
 /// `ZSTD_compressBlock_fast_extDict_generic`: the window is two segments,
 /// the extDict (indices `low_limit`..`dict_limit`) and the prefix.
 fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
     const hash_table = ms.hash_table;
     const hlog = ms.cp.hash_log;
     const step_size: usize = ms.cp.target_length + @intFromBool(ms.cp.target_length == 0) + 1;
@@ -839,8 +972,8 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
         ip3 = ip2 + 1;
         if (ip3 >= ilimit) break :outer;
 
-        hash0 = ms.hash(ip0, hlog, mls);
-        hash1 = ms.hash(ip1, hlog, mls);
+        hash0 = w.hash(ip0, hlog, mls);
+        hash1 = w.hash(ip1, hlog, mls);
         idx = hash_table[hash0];
 
         const found: enum { rep, offset } = search: while (true) {
@@ -850,18 +983,18 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
                 const rep_index = current2 -% offset_1;
                 const in_dict = rep_index < prefix_start_index;
                 const rval: u32 = if (prefix_start_index -% rep_index >= 4 and offset_1 > 0)
-                    ms.read32Seg(rep_index, prefix_start)
+                    w.read32Seg(rep_index, prefix_start)
                 else
-                    ms.read32(ip2) ^ 1; // guaranteed to not match
+                    w.read32(ip2) ^ 1; // guaranteed to not match
                 // write back hash table entry
                 current0 = @intCast(ip0);
                 hash_table[hash0] = current0;
                 // check repcode at ip[2]
-                if (ms.read32(ip2) == rval) {
+                if (w.read32(ip2) == rval) {
                     ip0 = ip2;
                     match0 = rep_index;
                     match_end = if (in_dict) dict_end else iend;
-                    m_length = @intFromBool(ms.at(ip0 - 1) == ms.atSeg(match0 - 1, prefix_start));
+                    m_length = @intFromBool(w.at(ip0 - 1) == w.atSeg(match0 - 1, prefix_start));
                     ip0 -= m_length;
                     match0 -= m_length;
                     offcode = 1; // REPCODE1_TO_OFFBASE
@@ -871,14 +1004,14 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
             }
             {
                 // load match for ip[0]
-                const mval: u32 = if (idx >= dict_start_index) ms.read32Seg(idx, prefix_start) else ms.read32(ip0) ^ 1;
-                if (ms.read32(ip0) == mval) break :search .offset;
+                const mval: u32 = if (idx >= dict_start_index) w.read32Seg(idx, prefix_start) else w.read32(ip0) ^ 1;
+                if (w.read32(ip0) == mval) break :search .offset;
             }
 
             // lookup ip[1]
             idx = hash_table[hash1];
             hash0 = hash1;
-            hash1 = ms.hash(ip2, hlog, mls);
+            hash1 = w.hash(ip2, hlog, mls);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip3;
@@ -886,20 +1019,22 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
             current0 = @intCast(ip0);
             hash_table[hash0] = current0;
             {
-                const mval: u32 = if (idx >= dict_start_index) ms.read32Seg(idx, prefix_start) else ms.read32(ip0) ^ 1;
-                if (ms.read32(ip0) == mval) break :search .offset;
+                const mval: u32 = if (idx >= dict_start_index) w.read32Seg(idx, prefix_start) else w.read32(ip0) ^ 1;
+                if (w.read32(ip0) == mval) break :search .offset;
             }
 
             // lookup ip[1]
             idx = hash_table[hash1];
             hash0 = hash1;
-            hash1 = ms.hash(ip2, hlog, mls);
+            hash1 = w.hash(ip2, hlog, mls);
             ip0 = ip1;
             ip1 = ip2;
             ip2 = ip0 + step;
             ip3 = ip1 + step;
             if (ip2 >= next_step) {
                 step += 1;
+                w.prefetch(ip1 + 64);
+                w.prefetch(ip1 + 128);
                 next_step += step_incr;
             }
             if (!(ip3 < ilimit)) break :outer;
@@ -915,7 +1050,7 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
             offcode = offset + sequences.rep_num;
             m_length = 4;
             // Count the backwards match length.
-            while (ip0 > anchor and match0 > low_match and ms.at(ip0 - 1) == ms.atSeg(match0 - 1, prefix_start)) {
+            while (ip0 > anchor and match0 > low_match and w.at(ip0 - 1) == w.atSeg(match0 - 1, prefix_start)) {
                 ip0 -= 1;
                 match0 -= 1;
                 m_length += 1;
@@ -923,8 +1058,8 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
         }
 
         // _match: count the forward length
-        m_length += ms.count2Segments(ip0 + m_length, match0 + m_length, iend, match_end, prefix_start);
-        ss.store(ms.bytes(anchor, ip0), offcode, m_length);
+        m_length += w.count2Segments(ip0 + m_length, match0 + m_length, iend, match_end, prefix_start);
+        ss.store(w.bytes(anchor, ip0), offcode, m_length);
         ip0 += m_length;
         anchor = ip0;
 
@@ -933,18 +1068,20 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
 
         // Fill table and check for immediate repcode.
         if (ip0 <= ilimit) {
-            hash_table[ms.hash(current0 + 2, hlog, mls)] = current0 + 2;
-            hash_table[ms.hash(ip0 - 2, hlog, mls)] = @intCast(ip0 - 2);
+            hash_table[w.hash(current0 + 2, hlog, mls)] = current0 + 2;
+            hash_table[w.hash(ip0 - 2, hlog, mls)] = @intCast(ip0 - 2);
             while (ip0 <= ilimit) {
                 const rep_index2: u32 = @as(u32, @intCast(ip0)) -% offset_2;
                 if (indexOverlapCheck(prefix_start_index, rep_index2) and offset_2 > 0 and
-                    ms.read32Seg(rep_index2, prefix_start) == ms.read32(ip0))
+                    w.read32Seg(rep_index2, prefix_start) == w.read32(ip0))
                 {
                     const rep_end2: usize = if (rep_index2 < prefix_start_index) dict_end else iend;
-                    const rep_length2 = ms.count2Segments(ip0 + 4, @as(usize, rep_index2) + 4, iend, rep_end2, prefix_start) + 4;
-                    std.mem.swap(u32, &offset_1, &offset_2);
+                    const rep_length2 = w.count2Segments(ip0 + 4, @as(usize, rep_index2) + 4, iend, rep_end2, prefix_start) + 4;
+                    const tmp = offset_1;
+                    offset_1 = offset_2;
+                    offset_2 = tmp;
                     ss.store(&.{}, 1, rep_length2);
-                    hash_table[ms.hash(ip0, hlog, mls)] = @intCast(ip0);
+                    hash_table[w.hash(ip0, hlog, mls)] = @intCast(ip0);
                     ip0 += rep_length2;
                     anchor = ip0;
                     continue;
@@ -963,6 +1100,7 @@ fn fastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, s
 
 /// `ZSTD_compressBlock_doubleFast_extDict_generic`.
 fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
     const hash_long = ms.hash_table;
     const h_bits_l = ms.cp.hash_log;
     const hash_small = ms.chain_table;
@@ -988,9 +1126,9 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
 
     // Search Loop
     while (ip < ilimit) { // < instead of <=, because (ip+1)
-        const h_small = ms.hash(ip, h_bits_s, mls);
+        const h_small = w.hash(ip, h_bits_s, mls);
         const match_index = hash_small[h_small];
-        const h_long = ms.hash(ip, h_bits_l, 8);
+        const h_long = w.hash(ip, h_bits_l, 8);
         const match_long_index = hash_long[h_long];
 
         const curr: u32 = @intCast(ip);
@@ -1000,40 +1138,40 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
         hash_long[h_long] = curr; // update hash table
 
         if (indexOverlapCheck(prefix_start_index, rep_index) and offset_1 <= curr + 1 - dict_start_index and
-            ms.read32Seg(rep_index, prefix_start) == ms.read32(ip + 1))
+            w.read32Seg(rep_index, prefix_start) == w.read32(ip + 1))
         {
             const rep_match_end: usize = if (rep_index < prefix_start_index) dict_end else iend;
-            m_length = ms.count2Segments(ip + 1 + 4, @as(usize, rep_index) + 4, iend, rep_match_end, prefix_start) + 4;
+            m_length = w.count2Segments(ip + 1 + 4, @as(usize, rep_index) + 4, iend, rep_match_end, prefix_start) + 4;
             ip += 1;
-            ss.store(ms.bytes(anchor, ip), 1, m_length);
+            ss.store(w.bytes(anchor, ip), 1, m_length);
         } else {
-            if (match_long_index > dict_start_index and ms.read64Seg(match_long_index, prefix_start) == ms.read64(ip)) {
+            if (match_long_index > dict_start_index and w.read64Seg(match_long_index, prefix_start) == w.read64(ip)) {
                 const match_end: usize = if (match_long_index < prefix_start_index) dict_end else iend;
                 const low_match: usize = if (match_long_index < prefix_start_index) dict_start else prefix_start;
                 var match_long: usize = match_long_index;
-                m_length = ms.count2Segments(ip + 8, match_long + 8, iend, match_end, prefix_start) + 8;
+                m_length = w.count2Segments(ip + 8, match_long + 8, iend, match_end, prefix_start) + 8;
                 const offset = curr - match_long_index;
-                while (ip > anchor and match_long > low_match and ms.at(ip - 1) == ms.atSeg(match_long - 1, prefix_start)) { // catch up
+                while (ip > anchor and match_long > low_match and w.at(ip - 1) == w.atSeg(match_long - 1, prefix_start)) { // catch up
                     ip -= 1;
                     match_long -= 1;
                     m_length += 1;
                 }
                 offset_2 = offset_1;
                 offset_1 = offset;
-                ss.store(ms.bytes(anchor, ip), offset + sequences.rep_num, m_length);
-            } else if (match_index > dict_start_index and ms.read32Seg(match_index, prefix_start) == ms.read32(ip)) {
-                const h3 = ms.hash(ip + 1, h_bits_l, 8);
+                ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+            } else if (match_index > dict_start_index and w.read32Seg(match_index, prefix_start) == w.read32(ip)) {
+                const h3 = w.hash(ip + 1, h_bits_l, 8);
                 const match_index3 = hash_long[h3];
                 var offset: u32 = undefined;
                 hash_long[h3] = curr + 1;
-                if (match_index3 > dict_start_index and ms.read64Seg(match_index3, prefix_start) == ms.read64(ip + 1)) {
+                if (match_index3 > dict_start_index and w.read64Seg(match_index3, prefix_start) == w.read64(ip + 1)) {
                     const match_end: usize = if (match_index3 < prefix_start_index) dict_end else iend;
                     const low_match: usize = if (match_index3 < prefix_start_index) dict_start else prefix_start;
                     var match3: usize = match_index3;
-                    m_length = ms.count2Segments(ip + 9, match3 + 8, iend, match_end, prefix_start) + 8;
+                    m_length = w.count2Segments(ip + 9, match3 + 8, iend, match_end, prefix_start) + 8;
                     ip += 1;
                     offset = curr + 1 - match_index3;
-                    while (ip > anchor and match3 > low_match and ms.at(ip - 1) == ms.atSeg(match3 - 1, prefix_start)) { // catch up
+                    while (ip > anchor and match3 > low_match and w.at(ip - 1) == w.atSeg(match3 - 1, prefix_start)) { // catch up
                         ip -= 1;
                         match3 -= 1;
                         m_length += 1;
@@ -1042,9 +1180,9 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
                     const match_end: usize = if (match_index < prefix_start_index) dict_end else iend;
                     const low_match: usize = if (match_index < prefix_start_index) dict_start else prefix_start;
                     var match: usize = match_index;
-                    m_length = ms.count2Segments(ip + 4, match + 4, iend, match_end, prefix_start) + 4;
+                    m_length = w.count2Segments(ip + 4, match + 4, iend, match_end, prefix_start) + 4;
                     offset = curr - match_index;
-                    while (ip > anchor and match > low_match and ms.at(ip - 1) == ms.atSeg(match - 1, prefix_start)) { // catch up
+                    while (ip > anchor and match > low_match and w.at(ip - 1) == w.atSeg(match - 1, prefix_start)) { // catch up
                         ip -= 1;
                         match -= 1;
                         m_length += 1;
@@ -1052,7 +1190,7 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
                 }
                 offset_2 = offset_1;
                 offset_1 = offset;
-                ss.store(ms.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+                ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
             } else {
                 ip += ((ip - anchor) >> search_strength) + 1;
                 continue;
@@ -1066,24 +1204,26 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
         if (ip <= ilimit) {
             // Complementary insertion
             const index_to_insert = curr + 2;
-            hash_long[ms.hash(index_to_insert, h_bits_l, 8)] = index_to_insert;
-            hash_long[ms.hash(ip - 2, h_bits_l, 8)] = @intCast(ip - 2);
-            hash_small[ms.hash(index_to_insert, h_bits_s, mls)] = index_to_insert;
-            hash_small[ms.hash(ip - 1, h_bits_s, mls)] = @intCast(ip - 1);
+            hash_long[w.hash(index_to_insert, h_bits_l, 8)] = index_to_insert;
+            hash_long[w.hash(ip - 2, h_bits_l, 8)] = @intCast(ip - 2);
+            hash_small[w.hash(index_to_insert, h_bits_s, mls)] = index_to_insert;
+            hash_small[w.hash(ip - 1, h_bits_s, mls)] = @intCast(ip - 1);
 
             // check immediate repcode
             while (ip <= ilimit) {
                 const current2: u32 = @intCast(ip);
                 const rep_index2 = current2 -% offset_2;
                 if (indexOverlapCheck(prefix_start_index, rep_index2) and offset_2 <= current2 - dict_start_index and
-                    ms.read32Seg(rep_index2, prefix_start) == ms.read32(ip))
+                    w.read32Seg(rep_index2, prefix_start) == w.read32(ip))
                 {
                     const rep_end2: usize = if (rep_index2 < prefix_start_index) dict_end else iend;
-                    const rep_length2 = ms.count2Segments(ip + 4, @as(usize, rep_index2) + 4, iend, rep_end2, prefix_start) + 4;
-                    std.mem.swap(u32, &offset_1, &offset_2);
+                    const rep_length2 = w.count2Segments(ip + 4, @as(usize, rep_index2) + 4, iend, rep_end2, prefix_start) + 4;
+                    const tmp = offset_1;
+                    offset_1 = offset_2;
+                    offset_2 = tmp;
                     ss.store(&.{}, 1, rep_length2);
-                    hash_small[ms.hash(ip, h_bits_s, mls)] = current2;
-                    hash_long[ms.hash(ip, h_bits_l, 8)] = current2;
+                    hash_small[w.hash(ip, h_bits_s, mls)] = current2;
+                    hash_long[w.hash(ip, h_bits_l, 8)] = current2;
                     ip += rep_length2;
                     anchor = ip;
                     continue;

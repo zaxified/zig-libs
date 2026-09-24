@@ -40,9 +40,11 @@ libc.
   on by hand, and 13 with index overflow correction run often), and against
   libzstd at level 22 on 64–140 MB inputs and on a 4.4 GB input past the
   3500 MiB index limit.
-- **Speed:** about 1.2–1.5× libzstd's time on the same input up to level 10
-  (process wall time, ReleaseFast, 4–13 MB inputs), 0.9–1.4× at levels 13–19
-  (single runs on a loaded machine; see SPEC.md). Level 19 compresses about
+- **Speed:** within about 10 % of libzstd at every level, one-shot and
+  streaming: 0.87–1.15× its CPU cycles (min of 3 runs on a pinned core,
+  ReleaseFast, 3–12 MB text/CSV/ELF inputs, levels −5…19; the upper end on
+  a loaded machine, 1.03–1.07× on a quieter one) and 0.95–1.15× its
+  instructions (see SPEC.md, *Speed*). Level 19 compresses about
   2 MB/s; level 22 about 2.4 MB/s on a 70 MB input (libzstd: 2.5). Memory:
   the match tables for the chosen level, allocated per call and freed before
   it returns — 64 + 16 MiB at level 19 on inputs over 256 KB, up to 256 +

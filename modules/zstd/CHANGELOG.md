@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Speed parity with libzstd (SPEC backlog Z11): within
+  about 10 % of its CPU cycles at every level, one-shot and streaming (was
+  1.2–1.4× at levels −5…3 and 1.3–2.0× at 5–12). The row match finder
+  prefetches the rows of the hash 8 positions ahead and each candidate
+  (`ZSTD_row_prefetch`), and is specialised on the row log; the match
+  finders read the input through `match.Base` (libzstd's `window.base` in a
+  register, still bounds-checked in the safe modes) instead of reloading
+  `MatchState.src` after every table store; repcode swaps no longer go
+  through `std.mem.swap`, which made LLVM spill two hot locals byte by byte
+  (16 % of level 1's instructions); `fast`/`dfast` prefetch ahead when
+  their step grows. Output unchanged (goldens; 57 frames of 3–12 MB real
+  files at levels −7…19 identical to libzstd).
+
 - **2026-09-24** — Long-distance matching as an option (SPEC backlog Z7):
   `Advanced.long_distance_matching` (`ZSTD_c_enableLongDistanceMatching`,
   the CLI's `--long`; `.enable` starts the window log from 27) and

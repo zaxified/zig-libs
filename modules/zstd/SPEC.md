@@ -836,20 +836,50 @@ over a block and its header, so the room never decides).
 
 **Anchor grade:** class A · oracle EXTERNAL
 
+## Speed
+
+Speed changes no decision, so the goldens pin them like everything else.
+Measured against libzstd 1.5.7 (built `-O3` by its Makefile) on an
+i7-7920HQ, both compressing the same input in-process on a reused context,
+min of 3 runs on a pinned core, user-mode cycles and instructions
+(`perf stat`), ReleaseFast; inputs a 3.4 MB CSV, 12 MB of Zig source and
+12 MB of ELF binaries:
+
+| | one-shot, levels −5…19 | streaming (128 KB chunks, unknown size), −5…12 |
+|---|---|---|
+| cycles | 0.87–1.15× (1.03–1.07× at 1–7 on a quieter run) | 0.99–1.10× |
+| instructions | 0.95–1.15× | 0.97–1.12× |
+
+Before Z11 (2026-09-24) the same measurement gave 1.2–1.4× at levels
+−5…3 and 1.3–2.0× at 5–12. What closed it:
+
+- **Row match finder prefetch** (`ZSTD_row_prefetch`): the hash cache
+  computes a hash 8 positions ahead, and now also prefetches that hash's
+  hash-table and tag-table rows; each candidate's bytes are prefetched as
+  it is collected. The row search is specialised on the row log at
+  compile time. Levels 5–12 went from 1.3–2.0× to about 1.05×, with *more*
+  instructions — it was memory latency.
+- **The window's base in a register** (`match.Base`, libzstd's
+  `window.base`): the match finders read the input as `base + index`
+  through a local copy instead of `MatchState.src` / `src_base`, which the
+  compiler had to reload after every table store (a store through a `u32`
+  slice may alias them). The safe build modes still bounds-check every
+  read. −15–20 % instructions at the fast levels.
+- **Repcode swaps without `std.mem.swap`**: swapping two hot `u32` locals
+  through pointers made LLVM keep them in memory and reassemble them byte
+  by byte — 16 % of all instructions at level 1. A plain temporary fixes
+  it. (`a, b = .{ b, a }` is not a swap in Zig 0.16: the tuple is built in
+  place, so `b` receives the new `a`; the goldens caught it.)
+- `fast`/`dfast` prefetch 64 and 128 bytes ahead when their step grows, as
+  libzstd does.
+
+What is left above 1.0×: a few percent of instructions in `fast`'s search
+loop and `btopt`'s (levels 13–16, 1.13–1.15× instructions at equal
+cycles). The entropy stage (literals, sequences) already costs what
+libzstd's does.
+
 ## What is deliberately not done
 
-- **A faster port.** Z1 made the match state's prefix start at a variable
-  index (a segment can begin anywhere): +4.5 % instructions on one-shot
-  compression at levels 1–16 of a 6 MB text (`perf stat`, ReleaseFast),
-  output unchanged. Z11 is where it comes back.
-  This is 1.3–1.5× slower than libzstd (process time,
-  ReleaseFast, level 1 and 3 on a 13.7 MB CSV, a 3 MB text and an 11 MB ELF);
-  1.2–1.4× at levels 5–8 (12 MB of Zig source, a 4.5 MB ELF); 0.9–1.4× at
-  levels 13–19 (a 12.9 MB JSON and a 7.5 MB ELF, single runs on a loaded
-  machine).
-  The reference's speed comes from unrolling, prefetch and branchless selects
-  that do not change decisions; adding them is possible later without touching
-  the goldens. *Not now.*
 - **Matching the `zstd` CLI as such.** The CLI drives the streaming API with
   its own buffer sizes; `Stream` matches `ZSTD_compressStream2`, so the same
   chunking reproduces the CLI's frames, but the CLI (argv, file handling) is
@@ -934,10 +964,8 @@ dictionaries are undecided.
   `ZSTD_generateSequences`, the external sequence producer, and their
   parameters (`repcodeResolution`, `blockDelimiters`, `validateSequences`,
   `enableSeqProducerFallback`). **~1 session.** Niche.
-- **Z11 — Speed parity** (target ≤ 1.1× libzstd): unrolled Huffman and
-  histogram loops, prefetch, SIMD row-tag compare, the fast/dfast inner
-  loops' cmov variants — none changes a decision, so the goldens stay.
-  Today 1.2–1.5× at levels 1–8. **~2 sessions**, open-ended.
+- ~~**Z11 — Speed parity.**~~ Done 2026-09-24, see *Speed*: within about
+  10 % of libzstd at every level (was 1.2–2.0×).
 - **Z12 — Portability.** Run `portable-zstd-*`; big-endian (the
   pre-splitter's 16-bit hash reads *native* order in libzstd — decide which
   to match); 32-bit (`ZSTD_CURRENT_MAX` 2 000 MB). **~0.5 session.**
@@ -950,7 +978,7 @@ dictionaries are undecided.
   `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
   `CDict` attached or copied into a reused context.
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7 done) Z11 → Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7, Z11 done) Z8 → Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 
