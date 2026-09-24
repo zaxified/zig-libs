@@ -20,6 +20,8 @@ pub const Kind = enum {
     mix, // corpus `mix`: text, numbers, noise, runs, copies
     random, // incompressible: every score stays low
     zeros, // a single repeated d-mer: one segment and done
+    islands, // zeros up to sample `seed`, then text: epochs scoring nothing, then content
+    periodic, // zeros, with a text sample every `seed`-th: runs of empty epochs between content
 };
 
 pub const Set = struct {
@@ -41,6 +43,16 @@ pub const sets = [_]Set{
     .{ .name = "zeros-20", .kind = .zeros, .nb = 20, .min_len = 10, .max_len = 500 },
     .{ .name = "tiny-6", .kind = .json, .nb = 6, .min_len = 2, .max_len = 12, .seed = 3 },
     .{ .name = "json-40k", .kind = .json, .nb = 400, .min_len = 50, .max_len = 150, .seed = 9 },
+    // Built for the empty-epoch stop (`maxZeroScoreRun`), 100-byte samples:
+    // with k = 50 and a 64 KiB buffer, epochs are 500 d-mers (5 samples);
+    // text first reaches epoch 10 (the last one the stop at 10 lets run),
+    // epoch 11 (the first it does not), and with k = 16 and 16 KiB, epochs
+    // of 164 among 256, epoch 45 (cover's stop is then 32, not 64).
+    .{ .name = "islands-53", .kind = .islands, .nb = 150, .min_len = 100, .max_len = 100, .seed = 53 },
+    .{ .name = "islands-58", .kind = .islands, .nb = 150, .min_len = 100, .max_len = 100, .seed = 58 },
+    .{ .name = "islands-74", .kind = .islands, .nb = 420, .min_len = 100, .max_len = 100, .seed = 74 },
+    // text every 7 epochs: runs of 6 empty epochs, reset by each island
+    .{ .name = "periodic-35", .kind = .periodic, .nb = 150, .min_len = 100, .max_len = 100, .seed = 35 },
 };
 
 pub const Generated = struct {
@@ -109,6 +121,10 @@ pub fn generate(gpa: std.mem.Allocator, set: Set) !Generated {
                 json(&sr, out);
             },
             .zeros => @memset(out, 0),
+            .islands, .periodic => {
+                const text = if (set.kind == .islands) i >= set.seed else i % set.seed == set.seed - 1;
+                if (text) corpus.generate(.{ .name = "", .len = n, .kind = .words, .seed = seed +% i }, out) else @memset(out, 0);
+            },
             inline .words, .csv, .mix, .random => |k| corpus.generate(.{
                 .name = "",
                 .len = n,
@@ -169,7 +185,14 @@ pub const runs = [_]Run{
     .{ .trainer = .cover, .set = "json-40k", .capacity = 300, .k = 40, .d = 5 },
     .{ .trainer = .cover, .set = "json-2000", .capacity = 4096, .k = 200, .d = 8, .split = "0.75" },
     .{ .trainer = .cover, .set = "mix-400", .capacity = 4096, .k = 537, .d = 6, .split = "0.5" },
+    // the empty-epoch stop and its reset
+    .{ .trainer = .cover, .set = "islands-53", .capacity = 65536, .k = 50, .d = 8 },
+    .{ .trainer = .cover, .set = "islands-58", .capacity = 65536, .k = 50, .d = 8 },
+    .{ .trainer = .cover, .set = "islands-74", .capacity = 16384, .k = 16, .d = 8 },
+    .{ .trainer = .cover, .set = "periodic-35", .capacity = 65536, .k = 50, .d = 8 },
+    .{ .trainer = .cover, .set = "json-200", .capacity = 1024, .k = 8, .d = 8 }, // d = k
     // cover refusals, in libzstd's order
+    .{ .trainer = .cover, .set = "json-200", .capacity = 1024, .k = 50, .d = 0 },
     .{ .trainer = .cover, .set = "json-200", .capacity = 1024, .k = 0, .d = 6 },
     .{ .trainer = .cover, .set = "json-200", .capacity = 1024, .k = 5, .d = 6 },
     .{ .trainer = .cover, .set = "json-200", .capacity = 1024, .k = 1025, .d = 6 },
@@ -193,6 +216,10 @@ pub const runs = [_]Run{
     .{ .trainer = .fastcover, .set = "json-40k", .capacity = 300, .k = 40, .d = 6, .f = 10 },
     .{ .trainer = .fastcover, .set = "json-2000", .capacity = 4096, .k = 200, .d = 8, .split = "0.75" },
     .{ .trainer = .fastcover, .set = "mix-400", .capacity = 4096, .k = 537, .d = 6, .f = 16, .accel = 3, .split = "0.5" },
+    .{ .trainer = .fastcover, .set = "islands-53", .capacity = 65536, .k = 50, .d = 8 },
+    .{ .trainer = .fastcover, .set = "islands-58", .capacity = 65536, .k = 50, .d = 8 },
+    .{ .trainer = .fastcover, .set = "periodic-35", .capacity = 65536, .k = 50, .d = 8 },
+    .{ .trainer = .fastcover, .set = "json-200", .capacity = 1024, .k = 6, .d = 6 }, // d = k
     // fastCover refusals, in libzstd's order
     .{ .trainer = .fastcover, .set = "json-200", .capacity = 1024, .k = 50, .d = 7 },
     .{ .trainer = .fastcover, .set = "json-200", .capacity = 1024, .k = 50, .d = 6, .f = 32 },

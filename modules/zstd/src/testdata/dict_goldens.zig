@@ -26,6 +26,12 @@ pub const rows = [_]Golden{
     .{ .len = 300, .small = false, .sha256 = "3f6cb32ee4f21a03b27dc9099b32ee494ef03553ac3579ae1226cc8f7adca575" }, // cover json-40k 300 k=40 d=5 f=0 accel=0 split=1
     .{ .len = 4094, .small = false, .sha256 = "910404302a336589519ec0907e0dbac836d780fa1592769ed9439a31adc8d6d9" }, // cover json-2000 4096 k=200 d=8 f=0 accel=0 split=0.75
     .{ .len = 4096, .small = false, .sha256 = "fe3757606c959e272f4608d2c13b34646b7bbb8a8ebf9cedcb60cf3b761f792a" }, // cover mix-400 4096 k=537 d=6 f=0 accel=0 split=0.5
+    .{ .len = 957, .small = true, .sha256 = "b5ac5948129682318e44a673f7687e84e61df8756ff1e75f107aaa813c7949d8" }, // cover islands-53 65536 k=50 d=8 f=0 accel=0 split=1
+    .{ .len = 8, .small = true, .sha256 = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc" }, // cover islands-58 65536 k=50 d=8 f=0 accel=0 split=1
+    .{ .len = 8, .small = true, .sha256 = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc" }, // cover islands-74 16384 k=16 d=8 f=0 accel=0 split=1
+    .{ .len = 502, .small = true, .sha256 = "bb29c81e9d4ceaf675f3cb02c0b6be4d2240df48555f79edcfb0a9a5268b42a5" }, // cover periodic-35 65536 k=50 d=8 f=0 accel=0 split=1
+    .{ .len = 1024, .small = false, .sha256 = "7b83b142d9d0d59b39c520a4ac514f18c829f90753b107160b9fc864316848bb" }, // cover json-200 1024 k=8 d=8 f=0 accel=0 split=1
+    .{ .err = 42 }, // cover json-200 1024 k=50 d=0 f=0 accel=0 split=1
     .{ .err = 42 }, // cover json-200 1024 k=0 d=6 f=0 accel=0 split=1
     .{ .err = 42 }, // cover json-200 1024 k=5 d=6 f=0 accel=0 split=1
     .{ .err = 42 }, // cover json-200 1024 k=1025 d=6 f=0 accel=0 split=1
@@ -47,6 +53,10 @@ pub const rows = [_]Golden{
     .{ .len = 300, .small = false, .sha256 = "cc45edd5119cbafd191c7f14e6107be6269849e8c8090709b9881a29bd5d269f" }, // fastcover json-40k 300 k=40 d=6 f=10 accel=0 split=1
     .{ .len = 4096, .small = false, .sha256 = "c9e53c82bebbe9489b5ed149c47c77dacf61b3e9fde221e10a91114190d31a8f" }, // fastcover json-2000 4096 k=200 d=8 f=0 accel=0 split=0.75
     .{ .len = 4096, .small = false, .sha256 = "fcdf479c376f4b137f164f2b67edbe9f64e1ca87a48dc689d66a9d39ce18de08" }, // fastcover mix-400 4096 k=537 d=6 f=16 accel=3 split=0.5
+    .{ .len = 955, .small = true, .sha256 = "77b641f624e49656c77e71095f156efbddbe2b3949cb13496d08ef7aa7ba8926" }, // fastcover islands-53 65536 k=50 d=8 f=0 accel=0 split=1
+    .{ .len = 8, .small = true, .sha256 = "af5570f5a1810b7af78caf4bc70a660f0df51e42baf91d4de5b2328de0e83dfc" }, // fastcover islands-58 65536 k=50 d=8 f=0 accel=0 split=1
+    .{ .len = 608, .small = true, .sha256 = "57cb8f0a7d7236736c3ea204e116215c3ba2a65b975fc67e42271c9a80afef10" }, // fastcover periodic-35 65536 k=50 d=8 f=0 accel=0 split=1
+    .{ .len = 1020, .small = false, .sha256 = "5da66b7e4bfc749063cf5a1328db73b3426b5cb165296b416766b545d2926f1c" }, // fastcover json-200 1024 k=6 d=6 f=0 accel=0 split=1
     .{ .err = 42 }, // fastcover json-200 1024 k=50 d=7 f=0 accel=0 split=1
     .{ .err = 42 }, // fastcover json-200 1024 k=50 d=6 f=32 accel=0 split=1
     .{ .err = 42 }, // fastcover json-200 1024 k=50 d=6 f=0 accel=11 split=1

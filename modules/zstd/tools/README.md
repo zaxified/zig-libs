@@ -1,6 +1,6 @@
 # `zstd` verification instruments
 
-Five instruments that check this module against **libzstd itself**. They live
+Instruments that check this module against **libzstd itself**. They live
 here and not in `src/` because they need a C compiler and a libzstd checkout,
 which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 `zig build`; run them by hand.
@@ -11,6 +11,8 @@ which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 | `zstream.c` | **differential oracle** (streaming) | Compresses any file with `ZSTD_compressStream2` following a call schedule (`p` pledge, `w` window log, `o` output buffer size, `c`/`f`/`e` continue/flush/end with the next N bytes, `x` frequent overflow correction, `name=value` an advanced parameter by libzstd's name); `stream_test.zig` parses the same schedules. The recipe uses it for `src/testdata/stream_goldens.zig` and builds it a second time as `zstream-ocf`. |
 | `zdec.c` | **differential oracle** (decoder) | Decompresses any file with libzstd — mode 0 one-shot `ZSTD_decompressDCtx` into `ZSTD_decompressBound` bytes (the capacity `Decompressor` gets from the same query), mode 1 streaming with window log max 31, whole input at once (libzstd then takes its single-pass shortcut), mode 2 streaming one input byte per call into a 997-byte output buffer (no shortcut: the plan `DecompressStream` is compared under) — and prints `OK <size> <fnv1a64>` or `ERR <ZSTD_ErrorCode>`, so a run of both decoders over valid and damaged frames compares output, acceptance and error class. With a repetition count it times the decode alone. Pair it with libzstd's own `tests/decodecorpus` (`make -C "$R/tests" decodecorpus`), which writes random valid frames that reach every decoder path, and their contents. |
 | `zreuse.c` | **differential oracle** (context reuse) | Compresses random slices of a file at random levels and parameters, one-shot and streaming, on a reused `ZSTD_CCtx` and on a fresh one, and reports any frame that differs. The golden tests run every frame through one reused context against fresh-context goldens, which is sound only while libzstd answers "no difference" (SPEC.md, *Contexts*: 1 960 frames, none, on v1.5.7); re-run it when the pinned version changes. |
+| `gen-dict-goldens.sh` + `dump_samples.zig` | **recipe** for committed goldens | Writes `src/testdata/dict_goldens.zig`: for every run in `src/testdata/dict_samples.zig` (`runs`: a sample set, cover or fastCover, capacity, k, d, f, accel, split point), the length and SHA-256 of the dictionary content libzstd's trainer picks before finalization and its small-corpus verdict, or the error it refuses with -- through `ztrain`. |
+| `ztrain.c` | **differential oracle** (dictionary training) | The content libzstd's cover or fastCover trainer places in the dictionary buffer before `ZDICT_finalizeDictionary` (`OK <size> <small corpus 0|1>`, the content to a file) or `ERR <ZSTD_ErrorCode>`, for any sample set (u32 count, u32 sizes, samples) and parameters. The public trainers finalize, and finalization drops the content's tail to make room for the header, so `ztrain` `#include`s `cover.c` or `fastcover.c` and calls their internal steps in `ZDICT_trainFromBuffer_*`'s order; a split point below 1 gives the candidate `ZDICT_optimizeTrainFromBuffer_*` builds for that (k, d). Checked against the public trainers: the finalized dictionaries carry the same content's kept head. Built twice (`ztrain-cover`, `ztrain-fastcover`): `cover.h` has no include guard. |
 | `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. Optional arguments: the strategy (`ZSTD_c_strategy`), LDM by hand, the window log (`ZSTD_c_windowLog`), and a `name=value` list of any advanced parameter (`zstd.Advanced`). Built a second time with `-DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1` (`zref-ocf`), it is the reference for frequent index-overflow correction. |
 
 ## The reference they need
@@ -22,6 +24,13 @@ which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
     cc -O2 -I "$R/lib" -o "$R/zdec" modules/zstd/tools/zdec.c "$R/lib/libzstd.a"
     cc -O2 -I "$R/lib" -o "$R/zreuse" modules/zstd/tools/zreuse.c "$R/lib/libzstd.a"
     "$R/zreuse" some-file 1 300 2 -7 22   # frames 300 diffs 0
+
+The trainer oracle compiles from the sources, once per trainer:
+
+    L="$R/lib/common/*.c $R/lib/compress/*.c $R/lib/dictBuilder/zdict.c $R/lib/dictBuilder/divsufsort.c"
+    cc -O2 -I "$R/lib" -I "$R/lib/dictBuilder" -o "$R/ztrain-cover" modules/zstd/tools/ztrain.c $L "$R/lib/dictBuilder/fastcover.c"
+    cc -O2 -DZTRAIN_FASTCOVER -I "$R/lib" -I "$R/lib/dictBuilder" -o "$R/ztrain-fastcover" modules/zstd/tools/ztrain.c $L "$R/lib/dictBuilder/cover.c"
+    "$R/ztrain-fastcover" fastcover samples.bin content.bin 16384 200 8 20 1   # [f accel [splitPoint]]
 
 Tag `v1.5.7` is commit `f8745da6ff1ad1e7bab384bd1f9d742439278e99`;
 `gen-goldens.sh` refuses any other checkout. Nothing is copied out of the tree
@@ -36,6 +45,10 @@ input), so its frames legitimately differ from one-shot output. Measured on a
 ## Regenerating the goldens
 
     ZSTD_REF=<dir> modules/zstd/tools/gen-goldens.sh   # default dir as above
+    ZSTD_REF=<dir> modules/zstd/tools/gen-dict-goldens.sh   # training content: dict_goldens.zig
+
+The second is needed when `src/testdata/dict_samples.zig` changes (its sets
+or runs; `dict_golden_test.zig` pins a digest of the sample files).
 
 Needed when `src/testdata/corpus.zig` changes (a new case, or a generator
 change — `golden_test.zig` pins a digest of all corpus inputs, so the latter

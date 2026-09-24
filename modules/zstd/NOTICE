@@ -66,12 +66,19 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/common/entropy_common.c         FSE_readNCount, HUF_readStats         -> src/dbits.zig, src/huf_dec.zig
   lib/common/fse_decompress.c, lib/common/bitstream.h
                                       FSE decoding, bit reader              -> src/dbits.zig
+  lib/dictBuilder/cover.c, lib/dictBuilder/cover.h, lib/dictBuilder/fastcover.c
+                                      dictionary training up to
+                                      finalization: cover and fastCover
+                                      contexts, segment selection, epochs,
+                                      parameter checks, the optimizers'
+                                      parameter grid                        -> src/dict_builder.zig
 
 Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
 and `src/testdata/` are this collection's own work (MIT).
 
-Not taken: dictionaries, the prefetching sequence
+Not taken: dictionaries (other than the training content above), the
+prefetching sequence
 decoder, the x86-64 assembly Huffman loop (its C twin is ported),
 long-distance matching below `btopt`, multithreading, `targetCBlockSize`
 super-blocks.
@@ -80,7 +87,10 @@ Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and
 SHA-256 digests of its output). `tools/zref.c`, `tools/zstream.c` and
 `tools/zdec.c` (the decoder's differential oracle) are this
-collection's own programs (MIT) calling libzstd's public API. No
+collection's own programs (MIT) calling libzstd's public API;
+`tools/ztrain.c` (MIT) `#include`s libzstd's `cover.c` / `fastcover.c` at
+build time to call their internal steps, and writes
+`src/testdata/dict_goldens.zig` through `tools/gen-dict-goldens.sh`. No
 libzstd bytes are stored in this repository.
 
 LICENSE TEXT (libzstd `LICENSE`, verbatim)

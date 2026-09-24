@@ -14,7 +14,8 @@ for the same calls) covers every level too, and `FrameWriter` is a
 parameters (`zstd.Advanced`: explicit window/hash/chain/search/strategy,
 frame flags, magicless frames, the splitters, the row match finder, literal
 compression, block size) give libzstd's bytes for the same settings; the
-stable-buffer and context-reuse parts of the streaming API, dictionaries and
+stable-buffer and context-reuse parts of the streaming API, dictionaries
+(of training, the content selection is done: `zstd.dict_builder`) and
 multithreading are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
@@ -219,6 +220,39 @@ Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`
 the indices are rescaled as libzstd does (the whole input still has to be in
 memory, and so does its `compressBound`).
 
+### Dictionary training: content (`zstd.dict_builder`)
+
+libzstd's cover and fastCover trainers pick a dictionary's *content*
+(segments of the samples, best last) and then finalize it with a header and
+entropy tables. The first half is here, byte-identical: the content
+`ZDICT_trainFromBuffer_cover` / `_fastCover` place in the buffer before
+`ZDICT_finalizeDictionary`, usable as a raw-content dictionary.
+Finalization, and the optimizers' score, compress with a dictionary and
+come later (SPEC.md, backlog Z5).
+
+```zig
+const db = zstd.dict_builder;
+// samples back to back, and their sizes -- libzstd's representation
+const s: db.Samples = .{ .buffer = all_samples, .sizes = sample_sizes };
+const content = try db.trainFastCover(gpa, s, 16 * 1024, .{ .k = 200, .d = 8 }); // f = 20, accel = 1
+defer gpa.free(content);
+const c2 = try db.trainCover(gpa, s, 16 * 1024, .{ .k = 200, .d = 8 });
+// or trainCoverInto / trainFastCoverInto(gpa, dict_buffer, s, params) -> n:
+// the content is dict_buffer[len - n ..], where libzstd leaves it
+```
+
+k and d are required, as in libzstd (fastCover: d is 6 or 8; f 1–31;
+accel 1–10). Memory besides the dictionary: cover 8 bytes per sample byte
+plus the active-d-mer map (`estimateCoverMemory`), fastCover 6 · 2^f bytes
+(`estimateFastCoverMemory`, 6 MiB at the default f = 20); past
+`memory_limit` (default 256 MiB) a trainer refuses with
+`error.MemoryLimitExceeded` before allocating. Other errors are libzstd's:
+`ParameterOutOfBound`, `SrcSizeWrong` (fewer than 5 samples, under 8 bytes,
+4 GiB and up, sizes past the buffer), `DstSizeTooSmall` (capacity below
+256). `optimizeCover` / `optimizeFastCover` walk the optimizers' (d, k)
+grid as libzstd does single-threaded, with the score (`COVER_selectDict`:
+finalize, compress the test samples) supplied by the caller.
+
 ## Tests
 
 `zig build test-zstd` (all three release lanes). The load-bearing one is
@@ -260,6 +294,13 @@ every error a malformed frame produces, each checked against libzstd) and
 the window limit, stable output, the `Reader`), and
 off-line against libzstd's decoder through `tools/zdec.c` (see SPEC.md,
 *Anchoring*).
+
+`src/dict_golden_test.zig` does it for dictionary training: 54 runs (13
+generated sample sets, `src/testdata/dict_samples.zig`, × cover and
+fastCover parameters, capacities, split points; refusals included), each
+content equal in length and SHA-256 to what libzstd's trainer placed in the
+buffer before finalization (`src/testdata/dict_goldens.zig`,
+`tools/ztrain.c` calling the trainers' internal steps).
 
 `src/context_test.zig` pins the estimates (exact, and the largest for an
 unknown size), a static workspace's bound, the workspace being replaced

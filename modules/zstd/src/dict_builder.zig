@@ -1109,6 +1109,30 @@ test "refusals: libzstd's, and sizes past the buffer" {
     try testing.expectError(error.SrcSizeWrong, CoverContext.init(gpa, .{ .buffer = "abcdefghijklmnopqrstuvwxyz", .sizes = &.{ 1, 1, 1, 1, 1, 1, 20 } }, 8, 0.8, default_memory_limit));
 }
 
+test "samples of 2^32 - 1 bytes and up are refused, just below are not" {
+    // Split.init reads only the sizes and the buffer's length, so a length
+    // stands in for the bytes (never read: the checks come first).
+    var byte: u8 = 0;
+    const many: [*]const u8 = @ptrCast(&byte);
+    const top: usize = std.math.maxInt(u32);
+    const at: Samples = .{ .buffer = many[0..top], .sizes = &.{ top - 4, 1, 1, 1, 1 } };
+    try testing.expectError(error.SrcSizeWrong, Split.init(at, 8, 1.0));
+    const below: Samples = .{ .buffer = many[0..top], .sizes = &.{ top - 5, 1, 1, 1, 1 } };
+    const sp = try Split.init(below, 8, 1.0);
+    try testing.expectEqual(@as(u64, top - 1), sp.total_size);
+}
+
+test "parameter checks reject what the trainers resolve before them" {
+    // f and accel of 0 are resolved to the defaults before the check, so
+    // the check's own zero cases are reachable only directly.
+    try testing.expect(checkFastCoverParameters(50, 8, 1.0, 1024, 20, 1));
+    try testing.expect(!checkFastCoverParameters(50, 8, 1.0, 1024, 0, 1));
+    try testing.expect(!checkFastCoverParameters(50, 8, 1.0, 1024, 20, 0));
+    try testing.expect(!checkFastCoverParameters(50, 0, 1.0, 1024, 20, 1));
+    try testing.expect(!checkCoverParameters(50, 0, 1.0, 1024));
+    try testing.expect(checkCoverParameters(8, 8, 1.0, 1024));
+}
+
 test "trainCover / trainFastCover return the content trainInto places at the tail" {
     const gpa = testing.allocator;
     const gen = try testSet("words-300");
@@ -1146,6 +1170,15 @@ test "optimizer grid: libzstd's defaults, checks and iteration count" {
     try testing.expectEqual(@as(f64, 0.75), t.split_point);
     try testing.expectEqual(@as(u32, 20), t.f);
     try testing.expectEqual(@as(u32, 1), t.accel);
+    // a narrow k range: steps of 1, not less
+    const n: OptimizeGrid = try .init(.cover, .{ .k = 0, .d = 8, .steps = 40 }, 100, 4096);
+    try testing.expectEqual(@as(u32, 48), n.k_step_size);
+    const narrow: OptimizeGrid = try .init(.cover, .{ .d = 8, .steps = 3000 }, 100, 4096);
+    try testing.expectEqual(@as(u32, 1), narrow.k_step_size);
+    try testing.expectEqual(@as(u32, 1951), narrow.iterations);
+    // k = d is allowed (k_min < d_max is not)
+    const kd: OptimizeGrid = try .init(.cover, .{ .k = 8, .d = 8 }, 100, 4096);
+    try testing.expectEqual(@as(u32, 1), kd.iterations);
     try testing.expectError(error.ParameterOutOfBound, OptimizeGrid.init(.cover, .{ .split_point = 1.5 }, 100, 4096));
     try testing.expectError(error.ParameterOutOfBound, OptimizeGrid.init(.fast_cover, .{ .accel = 11 }, 100, 4096));
     try testing.expectError(error.ParameterOutOfBound, OptimizeGrid.init(.cover, .{ .k = 7, .d = 8 }, 100, 4096));
@@ -1160,8 +1193,10 @@ const MockScorer = struct {
     contents: std.ArrayList([]u8) = .empty,
     fail_k: u32 = 0,
     released: usize = 0,
+    finalize: usize = 0,
 
     fn select(m: *MockScorer, c: Candidate) !?Selection {
+        m.finalize = c.nb_finalize_samples;
         try m.seen.append(testing.allocator, .{ c.d, c.k });
         try m.contents.append(testing.allocator, try testing.allocator.dupe(u8, c.content));
         if (c.k == m.fail_k) return null;
@@ -1190,6 +1225,8 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
         const r = if (trainer == .cover) try optimizeCover(gpa, &dict, s, p, &m) else try optimizeFastCover(gpa, &dict, s, p, &m);
         // k above the capacity (1500) is skipped: 50 + 48·j ≤ 1500 → 31 per d
         try testing.expectEqual(@as(usize, 62), m.seen.items.len);
+        // accel 1 finalizes on all training samples: 2000 · 0.75 (fastCover), 2000
+        try testing.expectEqual(@as(usize, if (trainer == .cover) 2000 else 1500), m.finalize);
         try testing.expectEqual(@as(usize, 60), m.released);
         for (m.seen.items, 0..) |dk, i| {
             try testing.expectEqual(@as(u32, if (i < 31) 6 else 8), dk[0]);
@@ -1226,6 +1263,13 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
             try testing.expectEqualSlices(u8, one[tail..], m.contents.items[pick]);
             try testing.expectEqual(@as(usize, 1500), ctx.nb_train_samples);
         }
+    }
+    // accel 4: a quarter of the training samples
+    {
+        var m4: MockScorer = .{};
+        defer m4.deinit();
+        _ = try optimizeFastCover(gpa, &dict, s, .{ .k = 100, .d = 8, .accel = 4 }, &m4);
+        try testing.expectEqual(@as(usize, 1500 * 25 / 100), m4.finalize);
     }
     // no candidate succeeds
     var m: MockScorer = .{ .fail_k = 100 };

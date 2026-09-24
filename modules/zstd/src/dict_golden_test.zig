@@ -120,5 +120,5 @@ test "sample sets are the ones the goldens were made from" {
         h.update(bytes);
     }
     const hex = std.fmt.bytesToHex(h.finalResult(), .lower);
-    try std.testing.expectEqualStrings("c07ba8ac1f19c33126e811540c8132aaaa25fd29bf31d257ee6b35c3c4bc426a", &hex);
+    try std.testing.expectEqualStrings("1b7d7681f9afed8e997c8bfa21fc03e8c0ff4071404e51e0800a39b6eb066948", &hex);
 }

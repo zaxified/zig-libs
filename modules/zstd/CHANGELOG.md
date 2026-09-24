@@ -16,9 +16,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `memory_limit` ceiling (default 256 MiB) refused with
   `error.MemoryLimitExceeded` before any allocation. The optimizer's
   (d, k) grid (`optimizeCover`, `optimizeFastCover`) runs with the
-  compression-based score supplied by the caller. 44 golden runs
+  compression-based score supplied by the caller. 54 golden runs
   (content digests and refusals) byte-identical to libzstd 1.5.7 through
-  the new oracle `tools/ztrain.c`.
+  the new oracle `tools/ztrain.c`; 2 450 random runs identical (two
+  deliberate refusals apart); a 92-mutation sweep: 84 caught, 8
+  equivalent (SPEC.md).
 
 - **2026-09-24** — `targetCBlockSize` (SPEC backlog Z8):
   `Advanced.target_c_block_size` (`ZSTD_c_targetCBlockSize`, 0 = off,
