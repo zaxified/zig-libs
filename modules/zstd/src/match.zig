@@ -558,6 +558,13 @@ inline fn writeTaggedIndex(table: []u32, hash_and_tag: usize, index: u32) void {
     table[h] = (index << tag_bits) | tag;
 }
 
+/// `ZSTD_comparePackedTags`: whether two tagged values' low `tag_bits`
+/// agree -- a candidate from a `CDict`'s tagged table (`writeTaggedIndex`)
+/// is worth the (likely cold) read of its content only when they do.
+inline fn comparePackedTags(a: usize, b: usize) bool {
+    return (a & tag_mask) == (b & tag_mask);
+}
+
 /// `ZSTD_fillHashTable`: every third position from `next_to_update` up to
 /// `end` into the `fast` hash table (with `.full`, the others too where
 /// their slot is empty); tagged for a `CDict`. Long-distance matching calls
@@ -637,7 +644,7 @@ pub fn fillDoubleHashTable(ms: *MatchState, end: usize) void {
 /// of a variant sets its strategies here (SPEC.md, *Dictionaries*).
 pub fn hasDictMatchStateVariant(strategy: params.Strategy) bool {
     return switch (strategy) {
-        .fast, .dfast => false, // zstd_fast.c, zstd_double_fast.c
+        .fast, .dfast => true, // zstd_fast.c, zstd_double_fast.c
         .greedy, .lazy, .lazy2, .btlazy2 => true, // zstd_lazy.c (lazy.zig)
         .btopt, .btultra, .btultra2 => true, // zstd_opt.c
     };
@@ -651,9 +658,29 @@ pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
     // An attached CDict (`dict_match_state`) needs the strategy's
     // dictMatchState variant; attaching is refused before any block for a
     // strategy without one (frame.zig, `resetByAttachingCDict`), so only
-    // those with one get here with it. The lazy family chooses its variant
-    // in `lazy.compressBlock`, the optimal parsers theirs themselves.
+    // those with one get here with it (`hasDictMatchStateVariant`).
+    // fast/dfast dispatch here (D1); the lazy family chooses its variant in
+    // `lazy.compressBlock` (D2), the optimal parsers theirs themselves (D3)
+    // -- both in the final switch below.
     if (!ms.hasExtDict() and ms.dict_match_state != null and !hasDictMatchStateVariant(ms.cp.strategy)) unreachable;
+    if (!ms.hasExtDict() and ms.dict_match_state != null) switch (ms.cp.strategy) {
+        .fast => return switch (mls) {
+            5 => fastDictMatchStateBlock(ms, ss, rep, istart, src_size, 5),
+            6 => fastDictMatchStateBlock(ms, ss, rep, istart, src_size, 6),
+            7 => fastDictMatchStateBlock(ms, ss, rep, istart, src_size, 7),
+            else => fastDictMatchStateBlock(ms, ss, rep, istart, src_size, 4),
+        },
+        .dfast => return switch (mls) {
+            5 => dfastDictMatchStateBlock(ms, ss, rep, istart, src_size, 5),
+            6 => dfastDictMatchStateBlock(ms, ss, rep, istart, src_size, 6),
+            7 => dfastDictMatchStateBlock(ms, ss, rep, istart, src_size, 7),
+            else => dfastDictMatchStateBlock(ms, ss, rep, istart, src_size, 4),
+        },
+        // the lazy family (D2) and the optimal parsers (D3) fall through
+        // to the bottom switch's lazy.compressBlock / opt.compressBlock --
+        // each picks its own .dict_match_state mode internally.
+        else => {},
+    };
     if (ms.hasExtDict()) switch (ms.cp.strategy) {
         .fast => return switch (mls) {
             5 => fastExtDictBlock(ms, ss, rep, istart, src_size, 5),
@@ -1366,6 +1393,436 @@ fn dfastExtDictBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, 
                     continue;
                 }
                 break;
+            }
+        }
+    }
+
+    // save reps for next block
+    rep[0] = offset_1;
+    rep[1] = offset_2;
+    return iend - anchor;
+}
+
+/// `ZSTD_count_2segments` where the match lies in an attached CDict's own
+/// `MatchState` (`dms`) rather than in `ms.dict`: `p_match` is one of
+/// *its* indices (not translated by `dictIndexDelta`, which only maps
+/// distances into the context's index space for `offset`/`offcode`). If
+/// the match reaches the CDict's end (`m_end`, `dms`'s own end index) it
+/// continues at `i_start` in the context's own prefix, as
+/// `MatchState.count2Segments` continues an extDict match at the prefix's
+/// start within one window.
+fn countAcrossDict(w: Base, dms: *const MatchState, p_in: usize, p_match: usize, i_end: usize, m_end: usize, i_start: usize) usize {
+    // `p_match > m_end` cannot happen (a dict match's index is always
+    // within the dict); guarded only so the subtraction below never
+    // underflows. Note `p_match == m_end` (zero runway left in the dict)
+    // is a real, reachable case -- as in `Base.count2Segments`, it must
+    // still fall through to the continuation below, not return early: a
+    // match that ends exactly at the dict's edge continues counting from
+    // `i_start`, which an early "return 0" here would silently drop.
+    const v_end = if (p_match > m_end) p_in else @min(p_in + (m_end - p_match), i_end);
+    var n: usize = 0;
+    if (v_end > p_in) {
+        const len = v_end - p_in;
+        n = std.mem.indexOfDiff(u8, w.bytes(p_in, v_end), dms.bytes(p_match, p_match + len)) orelse len;
+    }
+    if (p_match + n != m_end) return n;
+    return n + w.count(p_in + n, i_start, i_end);
+}
+
+/// `ZSTD_compressBlock_fast_dictMatchState_generic`: as `fastBlock`, but
+/// beside the window's own hash table also searches the attached CDict's
+/// tagged one (`ms.dict_match_state`, `dms`). `dms`'s own indices (below
+/// the window's) translate into the window's index space -- for the
+/// offset/offcode of a dict match, never for addressing `dms`'s own bytes
+/// -- by `dict_index_delta` (`ZSTD_resetCCtx_byAttachingCDict`'s
+/// `dictIndexDelta`, the context's `prefix_start_index` less `dms`'s own
+/// end index). Deliberately ports libzstd's repcode checks as written: they
+/// do not guard against a zero (invalidated) `rep_offset1`/`rep_offset2` the
+/// way `fastBlock`/`fastExtDictBlock` do (the comment in zstd_fast.c notes
+/// this), relying instead on the offsets always starting valid for an
+/// attached dictionary's small inputs.
+fn fastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
+    const hash_table = ms.hash_table;
+    const hlog = ms.cp.hash_log;
+    const step_size: usize = ms.cp.target_length + @intFromBool(ms.cp.target_length == 0);
+    const prefix_start_index: u32 = ms.dict_limit;
+    const prefix_start: usize = prefix_start_index;
+    const end_index: u32 = istart + src_size;
+    const iend: usize = end_index;
+    const ilimit: usize = iend -| hash_read_size;
+    var rep_offset1: u32 = rep[0];
+    var rep_offset2: u32 = rep[1];
+
+    const dms = ms.dict_match_state.?;
+    const dict_hash_table = dms.hash_table;
+    const dict_start_index: u32 = dms.dict_limit;
+    const dict_end_index: u32 = dms.src_base + @as(u32, @intCast(dms.src.len));
+    const dict_index_delta: u32 = prefix_start_index -% dict_end_index;
+    const dict_h_bits: u32 = dms.cp.hash_log + tag_bits;
+    const dict_and_prefix_length: u32 = (istart -% prefix_start_index) +% (dict_end_index -% dict_start_index);
+
+    var anchor: usize = istart;
+    var ip0: usize = istart;
+    var ip1: usize = ip0 + step_size; // before the dict_and_prefix_length==0 bump, as libzstd has it
+    ip0 += @intFromBool(dict_and_prefix_length == 0);
+    const step_incr: usize = 1 << search_strength;
+
+    outer: while (ip1 <= ilimit) {
+        var hash0 = w.hash(ip0, hlog, mls);
+        const dict_hash_and_tag0 = w.hash(ip0, dict_h_bits, mls);
+        var dict_match_idx_tag = dict_hash_table[dict_hash_and_tag0 >> tag_bits];
+        var dict_tags_match = comparePackedTags(dict_match_idx_tag, dict_hash_and_tag0);
+        var match_idx = hash_table[hash0];
+        var curr: u32 = @intCast(ip0);
+        var step: usize = step_size;
+        var next_step: usize = ip0 + step_incr;
+
+        var m_length: usize = undefined;
+        var offcode: u32 = undefined;
+
+        const Found = enum { rep, dict, prefix };
+        const found: Found = search: while (true) {
+            const rep_index = curr +% 1 -% rep_offset1;
+            const hash1 = w.hash(ip1, hlog, mls);
+            const dict_hash_and_tag1 = w.hash(ip1, dict_h_bits, mls);
+            hash_table[hash0] = curr;
+
+            if (indexOverlapCheck(prefix_start_index, rep_index)) {
+                const rep_val: u32 = if (rep_index < prefix_start_index)
+                    dms.read32(rep_index -% dict_index_delta)
+                else
+                    w.read32(rep_index);
+                if (rep_val == w.read32(ip0 + 1)) {
+                    const rep_match_end: usize = if (rep_index < prefix_start_index) dict_end_index else iend;
+                    m_length = if (rep_index < prefix_start_index)
+                        countAcrossDict(w, dms, ip0 + 1 + 4, @as(usize, rep_index -% dict_index_delta) + 4, iend, rep_match_end, prefix_start) + 4
+                    else
+                        w.count(ip0 + 1 + 4, rep_index + 4, iend) + 4;
+                    ip0 += 1;
+                    ss.store(w.bytes(anchor, ip0), 1, m_length);
+                    offcode = 1;
+                    break :search .rep;
+                }
+            }
+
+            if (dict_tags_match) {
+                const dict_match_idx = dict_match_idx_tag >> tag_bits;
+                if (dict_match_idx > dict_start_index and dms.read32(dict_match_idx) == w.read32(ip0) and match_idx <= prefix_start_index) {
+                    break :search .dict;
+                }
+            }
+
+            if (match_idx >= prefix_start_index and w.read32(ip0) == w.read32(match_idx)) {
+                break :search .prefix;
+            }
+
+            // Prepare for next iteration
+            dict_match_idx_tag = dict_hash_table[dict_hash_and_tag1 >> tag_bits];
+            dict_tags_match = comparePackedTags(dict_match_idx_tag, dict_hash_and_tag1);
+            match_idx = hash_table[hash1];
+
+            if (ip1 >= next_step) {
+                step += 1;
+                next_step += step_incr;
+            }
+            ip0 = ip1;
+            ip1 = ip1 + step;
+            if (ip1 > ilimit) break :outer;
+
+            curr = @intCast(ip0);
+            hash0 = hash1;
+        };
+
+        switch (found) {
+            .rep => {},
+            .dict => {
+                var dm: usize = dict_match_idx_tag >> tag_bits;
+                const offset = curr -% @as(u32, @intCast(dm)) -% dict_index_delta;
+                m_length = countAcrossDict(w, dms, ip0 + 4, dm + 4, iend, dict_end_index, prefix_start) + 4;
+                while (ip0 > anchor and dm > dict_start_index and w.at(ip0 - 1) == dms.at(dm - 1)) {
+                    ip0 -= 1;
+                    dm -= 1;
+                    m_length += 1;
+                }
+                rep_offset2 = rep_offset1;
+                rep_offset1 = offset;
+                offcode = offset + sequences.rep_num;
+                ss.store(w.bytes(anchor, ip0), offcode, m_length);
+            },
+            .prefix => {
+                var match0: usize = match_idx;
+                const offset = curr -% @as(u32, @intCast(match0));
+                m_length = w.count(ip0 + 4, match0 + 4, iend) + 4;
+                while (ip0 > anchor and match0 > prefix_start_index and w.at(ip0 - 1) == w.at(match0 - 1)) {
+                    ip0 -= 1;
+                    match0 -= 1;
+                    m_length += 1;
+                }
+                rep_offset2 = rep_offset1;
+                rep_offset1 = offset;
+                offcode = offset + sequences.rep_num;
+                ss.store(w.bytes(anchor, ip0), offcode, m_length);
+            },
+        }
+
+        ip0 += m_length;
+        anchor = ip0;
+
+        if (ip0 <= ilimit) {
+            hash_table[w.hash(curr + 2, hlog, mls)] = curr + 2;
+            hash_table[w.hash(ip0 - 2, hlog, mls)] = @intCast(ip0 - 2);
+            while (ip0 <= ilimit) {
+                const current2: u32 = @intCast(ip0);
+                const rep_index2 = current2 -% rep_offset2;
+                if (indexOverlapCheck(prefix_start_index, rep_index2)) {
+                    const rep_val2: u32 = if (rep_index2 < prefix_start_index)
+                        dms.read32(rep_index2 -% dict_index_delta)
+                    else
+                        w.read32(rep_index2);
+                    if (rep_val2 == w.read32(ip0)) {
+                        const rep_end2: usize = if (rep_index2 < prefix_start_index) dict_end_index else iend;
+                        const rep_length2 = if (rep_index2 < prefix_start_index)
+                            countAcrossDict(w, dms, ip0 + 4, @as(usize, rep_index2 -% dict_index_delta) + 4, iend, rep_end2, prefix_start) + 4
+                        else
+                            w.count(ip0 + 4, rep_index2 + 4, iend) + 4;
+                        const tmp = rep_offset1;
+                        rep_offset1 = rep_offset2;
+                        rep_offset2 = tmp;
+                        ss.store(&.{}, 1, rep_length2);
+                        hash_table[w.hash(ip0, hlog, mls)] = @intCast(ip0);
+                        ip0 += rep_length2;
+                        anchor = ip0;
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+
+        ip1 = ip0 + step_size;
+    }
+
+    // save reps for next block
+    rep[0] = rep_offset1;
+    rep[1] = rep_offset2;
+    return iend - anchor;
+}
+
+/// `ZSTD_compressBlock_doubleFast_dictMatchState_generic`: as `dfastBlock`,
+/// but beside the window's own two tables also searches the attached
+/// CDict's tagged ones, the same way `fastDictMatchStateBlock` does for
+/// `fast` (see its doc comment for the index-space convention).
+fn dfastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime mls: u32) usize {
+    const w: Base = .of(ms);
+    const hash_long = ms.hash_table;
+    const h_bits_l = ms.cp.hash_log;
+    const hash_small = ms.chain_table;
+    const h_bits_s = ms.cp.chain_log;
+    var ip: usize = istart;
+    var anchor: usize = istart;
+    const end_index: u32 = istart + src_size;
+    const iend: usize = @as(usize, istart) + src_size;
+    const ilimit: usize = iend -| hash_read_size;
+    const prefix_lowest_index = ms.lowestPrefixIndex(end_index);
+    const prefix_lowest: usize = prefix_lowest_index;
+    var offset_1: u32 = rep[0];
+    var offset_2: u32 = rep[1];
+
+    const dms = ms.dict_match_state.?;
+    const dict_hash_long = dms.hash_table;
+    const dict_hash_small = dms.chain_table;
+    const dict_start_index: u32 = dms.dict_limit;
+    const dict_end_index: u32 = dms.src_base + @as(u32, @intCast(dms.src.len));
+    const dict_index_delta: u32 = prefix_lowest_index -% dict_end_index;
+    const dict_h_bits_l: u32 = dms.cp.hash_log + tag_bits;
+    const dict_h_bits_s: u32 = dms.cp.chain_log + tag_bits;
+    const dict_and_prefix_length: u32 = (istart -% prefix_lowest_index) +% (dict_end_index -% dict_start_index);
+
+    ip += @intFromBool(dict_and_prefix_length == 0);
+
+    while (ip < ilimit) { // < instead of <=, because repcode check at (ip+1)
+        const h2 = w.hash(ip, h_bits_l, 8);
+        const h = w.hash(ip, h_bits_s, mls);
+        const dict_hash_and_tag_l = w.hash(ip, dict_h_bits_l, 8);
+        const dict_hash_and_tag_s = w.hash(ip, dict_h_bits_s, mls);
+        const dict_match_idx_tag_l = dict_hash_long[dict_hash_and_tag_l >> tag_bits];
+        const dict_match_idx_tag_s = dict_hash_small[dict_hash_and_tag_s >> tag_bits];
+        const dict_tags_match_l = comparePackedTags(dict_match_idx_tag_l, dict_hash_and_tag_l);
+        const dict_tags_match_s = comparePackedTags(dict_match_idx_tag_s, dict_hash_and_tag_s);
+        const curr: u32 = @intCast(ip);
+        const match_idx_l: u32 = hash_long[h2];
+        var match_idx_s: u32 = hash_small[h];
+        const rep_index = curr +% 1 -% offset_1;
+        hash_long[h2] = curr;
+        hash_small[h] = curr;
+
+        var m_length: usize = undefined;
+        var offset: u32 = undefined;
+        var stored = false;
+
+        rep_check: {
+            if (!indexOverlapCheck(prefix_lowest_index, rep_index)) break :rep_check;
+            const rep_val: u32 = if (rep_index < prefix_lowest_index)
+                dms.read32(rep_index -% dict_index_delta)
+            else
+                w.read32(rep_index);
+            if (rep_val != w.read32(ip + 1)) break :rep_check;
+            const rep_match_end: usize = if (rep_index < prefix_lowest_index) dict_end_index else iend;
+            m_length = if (rep_index < prefix_lowest_index)
+                countAcrossDict(w, dms, ip + 1 + 4, @as(usize, rep_index -% dict_index_delta) + 4, iend, rep_match_end, prefix_lowest) + 4
+            else
+                w.count(ip + 1 + 4, rep_index + 4, iend) + 4;
+            ip += 1;
+            ss.store(w.bytes(anchor, ip), 1, m_length);
+            stored = true;
+        }
+
+        if (!stored) found: {
+            if (match_idx_l >= prefix_lowest_index and w.read64(ip) == w.read64(match_idx_l)) {
+                m_length = w.count(ip + 8, match_idx_l + 8, iend) + 8;
+                offset = curr -% match_idx_l;
+                var m0: usize = match_idx_l;
+                while (ip > anchor and m0 > prefix_lowest and w.at(ip - 1) == w.at(m0 - 1)) {
+                    ip -= 1;
+                    m0 -= 1;
+                    m_length += 1;
+                }
+                break :found;
+            }
+            if (dict_tags_match_l) {
+                const dict_match_idx_l = dict_match_idx_tag_l >> tag_bits;
+                if (dict_match_idx_l > dict_start_index and dms.read64(dict_match_idx_l) == w.read64(ip)) {
+                    m_length = countAcrossDict(w, dms, ip + 8, dict_match_idx_l + 8, iend, dict_end_index, prefix_lowest) + 8;
+                    offset = curr -% dict_match_idx_l -% dict_index_delta;
+                    var dm: usize = dict_match_idx_l;
+                    while (ip > anchor and dm > dict_start_index and w.at(ip - 1) == dms.at(dm - 1)) {
+                        ip -= 1;
+                        dm -= 1;
+                        m_length += 1;
+                    }
+                    break :found;
+                }
+            }
+
+            var short_in_dict = false;
+            var short_dict_local: u32 = undefined;
+            var short_found = false;
+            if (match_idx_s > prefix_lowest_index) {
+                if (w.read32(ip) == w.read32(match_idx_s)) short_found = true;
+            } else if (dict_tags_match_s) {
+                const dict_match_idx_s = dict_match_idx_tag_s >> tag_bits;
+                if (dict_match_idx_s > dict_start_index and dms.read32(dict_match_idx_s) == w.read32(ip)) {
+                    short_found = true;
+                    short_in_dict = true;
+                    short_dict_local = dict_match_idx_s;
+                    match_idx_s = dict_match_idx_s +% dict_index_delta;
+                }
+            }
+
+            if (!short_found) {
+                ip += ((ip - anchor) >> search_strength) + 1;
+                continue;
+            }
+
+            // _search_next_long
+            const hl3 = w.hash(ip + 1, h_bits_l, 8);
+            const dict_hash_and_tag_l3 = w.hash(ip + 1, dict_h_bits_l, 8);
+            const match_idx_l3: u32 = hash_long[hl3];
+            const dict_match_idx_tag_l3 = dict_hash_long[dict_hash_and_tag_l3 >> tag_bits];
+            const dict_tags_match_l3 = comparePackedTags(dict_match_idx_tag_l3, dict_hash_and_tag_l3);
+            hash_long[hl3] = curr + 1;
+
+            var long1_found = false;
+            if (match_idx_l3 >= prefix_lowest_index and w.read64(ip + 1) == w.read64(match_idx_l3)) {
+                m_length = w.count(ip + 9, match_idx_l3 + 8, iend) + 8;
+                ip += 1;
+                offset = @as(u32, @intCast(ip)) -% match_idx_l3;
+                var m3: usize = match_idx_l3;
+                while (ip > anchor and m3 > prefix_lowest and w.at(ip - 1) == w.at(m3 - 1)) {
+                    ip -= 1;
+                    m3 -= 1;
+                    m_length += 1;
+                }
+                long1_found = true;
+            } else if (dict_tags_match_l3) {
+                const dict_match_idx_l3 = dict_match_idx_tag_l3 >> tag_bits;
+                if (dict_match_idx_l3 > dict_start_index and dms.read64(dict_match_idx_l3) == w.read64(ip + 1)) {
+                    m_length = countAcrossDict(w, dms, ip + 1 + 8, dict_match_idx_l3 + 8, iend, dict_end_index, prefix_lowest) + 8;
+                    ip += 1;
+                    offset = curr +% 1 -% dict_match_idx_l3 -% dict_index_delta;
+                    var dm3: usize = dict_match_idx_l3;
+                    while (ip > anchor and dm3 > dict_start_index and w.at(ip - 1) == dms.at(dm3 - 1)) {
+                        ip -= 1;
+                        dm3 -= 1;
+                        m_length += 1;
+                    }
+                    long1_found = true;
+                }
+            }
+
+            if (!long1_found) {
+                if (short_in_dict) {
+                    m_length = countAcrossDict(w, dms, ip + 4, short_dict_local + 4, iend, dict_end_index, prefix_lowest) + 4;
+                    offset = curr -% match_idx_s;
+                    var dm: usize = short_dict_local;
+                    while (ip > anchor and dm > dict_start_index and w.at(ip - 1) == dms.at(dm - 1)) {
+                        ip -= 1;
+                        dm -= 1;
+                        m_length += 1;
+                    }
+                } else {
+                    m_length = w.count(ip + 4, match_idx_s + 4, iend) + 4;
+                    offset = curr -% match_idx_s;
+                    var m0: usize = match_idx_s;
+                    while (ip > anchor and m0 > prefix_lowest and w.at(ip - 1) == w.at(m0 - 1)) {
+                        ip -= 1;
+                        m0 -= 1;
+                        m_length += 1;
+                    }
+                }
+            }
+        }
+
+        if (!stored) {
+            offset_2 = offset_1;
+            offset_1 = offset;
+            ss.store(w.bytes(anchor, ip), offset + sequences.rep_num, m_length);
+        }
+
+        // _match_stored
+        ip += m_length;
+        anchor = ip;
+
+        if (ip <= ilimit) {
+            const index_to_insert = curr + 2;
+            hash_long[w.hash(index_to_insert, h_bits_l, 8)] = index_to_insert;
+            hash_long[w.hash(ip - 2, h_bits_l, 8)] = @intCast(ip - 2);
+            hash_small[w.hash(index_to_insert, h_bits_s, mls)] = index_to_insert;
+            hash_small[w.hash(ip - 1, h_bits_s, mls)] = @intCast(ip - 1);
+
+            while (ip <= ilimit) {
+                const current2: u32 = @intCast(ip);
+                const rep_index2 = current2 -% offset_2;
+                if (!indexOverlapCheck(prefix_lowest_index, rep_index2)) break;
+                const rep_val2: u32 = if (rep_index2 < prefix_lowest_index)
+                    dms.read32(rep_index2 -% dict_index_delta)
+                else
+                    w.read32(rep_index2);
+                if (rep_val2 != w.read32(ip)) break;
+                const rep_end2: usize = if (rep_index2 < prefix_lowest_index) dict_end_index else iend;
+                const rep_length2 = if (rep_index2 < prefix_lowest_index)
+                    countAcrossDict(w, dms, ip + 4, @as(usize, rep_index2 -% dict_index_delta) + 4, iend, rep_end2, prefix_lowest) + 4
+                else
+                    w.count(ip + 4, rep_index2 + 4, iend) + 4;
+                const tmp = offset_1;
+                offset_1 = offset_2;
+                offset_2 = tmp;
+                ss.store(&.{}, 1, rep_length2);
+                hash_small[w.hash(ip, h_bits_s, mls)] = current2;
+                hash_long[w.hash(ip, h_bits_l, 8)] = current2;
+                ip += rep_length2;
+                anchor = ip;
             }
         }
     }

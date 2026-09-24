@@ -61,6 +61,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   dictionary goldens gain a `slice` dictionary source (a piece of an
   input).
 
+- **2026-09-24** — Compression with a dictionary, attach for `fast` and
+  `dfast` (SPEC backlog Z4, part D1): where libzstd would attach a `CDict`
+  in place (inputs under 8/16 KB, unknown sizes) rather than copy it,
+  this now happens for the `fast` and `dfast` strategies (levels 1–4ish,
+  and every negative level), matching libzstd byte-for-byte; every other
+  strategy still refuses with `error.DictAttachUnsupported` until its own
+  `dictMatchState` variant lands (D2, the hash-chain/row/DUBT family).
+
 - **2026-09-24** — Compression with a dictionary (SPEC backlog Z4, part
   D0): `CDict` (`init` = `ZSTD_createCDict`, `initAdvanced` =
   `ZSTD_createCDict_advanced2`), `Options.dictionary` /
