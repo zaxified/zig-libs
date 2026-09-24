@@ -638,7 +638,7 @@ pub fn fillDoubleHashTable(ms: *MatchState, end: usize) void {
 pub fn hasDictMatchStateVariant(strategy: params.Strategy) bool {
     return switch (strategy) {
         .fast, .dfast => false, // zstd_fast.c, zstd_double_fast.c
-        .greedy, .lazy, .lazy2, .btlazy2 => false, // zstd_lazy.c
+        .greedy, .lazy, .lazy2, .btlazy2 => true, // zstd_lazy.c (lazy.zig)
         .btopt, .btultra, .btultra2 => true, // zstd_opt.c
     };
 }
@@ -648,10 +648,11 @@ pub fn hasDictMatchStateVariant(strategy: params.Strategy) bool {
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
     const mls = ms.cp.min_match;
     // `ZSTD_matchState_dictMode`: extDict, else dictMatchState, else noDict.
-    // An attached CDict (`dict_match_state`) needs the dictMatchState
-    // variants; where they are not ported yet attaching is refused before
-    // any block (frame.zig, `resetByAttachingCDict`), so it never gets here.
-    // The optimal parsers pick their dictMatchState variant themselves.
+    // An attached CDict (`dict_match_state`) needs the strategy's
+    // dictMatchState variant; attaching is refused before any block for a
+    // strategy without one (frame.zig, `resetByAttachingCDict`), so only
+    // those with one get here with it. The lazy family chooses its variant
+    // in `lazy.compressBlock`, the optimal parsers theirs themselves.
     if (!ms.hasExtDict() and ms.dict_match_state != null and !hasDictMatchStateVariant(ms.cp.strategy)) unreachable;
     if (ms.hasExtDict()) switch (ms.cp.strategy) {
         .fast => return switch (mls) {

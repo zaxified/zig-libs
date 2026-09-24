@@ -734,6 +734,8 @@ pub const dict_defs = [_]DictDef{
     .{ .name = "zd-words-id1000", .source = .{ .reid = .{ .of = "zd-words", .id = 1000 } } },
     .{ .name = "zd-words-id256", .source = .{ .reid = .{ .of = "zd-words", .id = 256 } } },
     .{ .name = "zd-words-id65536", .source = .{ .reid = .{ .of = "zd-words", .id = 65536 } } },
+    .{ .name = "raw-two-symbols-12528", .source = .{ .generated = .{ .name = "", .len = 12528, .kind = .two_symbols, .seed = 17340 } } },
+    .{ .name = "raw-skewed-18461", .source = .{ .generated = .{ .name = "", .len = 18461, .kind = .skewed, .seed = 666518 } } },
     .{ .name = "crafted-words", .source = .{ .crafted = .{ .content = .{ .name = "", .len = 3000, .kind = .words, .seed = 23 }, .id = 70000 } } },
 };
 
@@ -937,7 +939,11 @@ const in_mix_100000: Case = .{ .name = "", .len = 100000, .kind = .mix, .seed = 
 const in_empty: Case = .{ .name = "", .len = 0, .kind = .words };
 const some_levels: []const i32 = &.{ -5, 1, 3, 5, 9, 13, 19 };
 
-pub const dict_cases = [_]DictCase{
+/// Every dictionary golden: D0's (the dictionary in the window) and those
+/// of the attach variants (the CDict searched in place).
+pub const dict_cases = dict_cases_d0 ++ dict_cases_attach_lazy;
+
+const dict_cases_d0 = [_]DictCase{
     // every level, one path each
     .{ .name = "cdict-copy", .input = in_words_40000, .dict = "zd-words", .path = .cdict, .levels = all_levels, .checksums = &.{ false, true } }, // above every attach cutoff: tables copied
     .{ .name = "load-copy", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .levels = all_levels }, // the context's own CDict (no level): copied
@@ -1101,4 +1107,98 @@ pub const dict_cases_attach_opt = [_]DictCase{
     // long-distance matching into a raw dictionary the tables reach only
     // the end of: the LDM table holds all of it
     .{ .name = "prefix-ldm-beyond-tables", .input = in_mix_100000, .dict = "raw-mix-100000-self", .path = .prefix, .params = "enableLongDistanceMatching=1,hashLog=10,chainLog=10,windowLog=17", .levels = &.{ 1, 5, 16 } },
+};
+
+const in_csv_32768: Case = .{ .name = "", .len = 32768, .kind = .csv, .seed = 31 };
+const in_csv_32769: Case = .{ .name = "", .len = 32769, .kind = .csv, .seed = 31 };
+const in_mix_20000: Case = .{ .name = "", .len = 20000, .kind = .mix, .seed = 32 };
+/// A CDict of zd-words (4 KB) is made for 4.6 KB: levels 4 greedy, 5 lazy,
+/// 6..8 lazy2, 9 and 10 btlazy2, all with a 16 KB window (hash chains).
+const levels_attach_small: []const i32 = &.{ 4, 5, 6, 7, 8, 9, 10 };
+/// A CDict of 30 KB is made for the 128 KB row: 5 greedy, 6 lazy, 7..10
+/// lazy2 (row match finder), 11 and 12 btlazy2.
+const levels_attach_30k: []const i32 = &.{ 5, 6, 7, 8, 10, 11, 12 };
+
+/// The dictMatchState variants of `greedy`, `lazy`, `lazy2` and `btlazy2`
+/// (hash chain, rows, binary tree): an attached CDict searched in place.
+const dict_cases_attach_lazy = [_]DictCase{
+    // at the cutoff (32 KB, attached) and a byte above it (copied)
+    .{ .name = "attach-lazy-cdict", .input = in_words_3000, .dict = "zd-words", .path = .cdict, .levels = levels_attach_small, .checksums = &.{ false, true } },
+    .{ .name = "attach-lazy-cdict-32k", .input = in_csv_32768, .dict = "raw-csv-30000", .path = .cdict, .levels = levels_attach_30k },
+    .{ .name = "attach-lazy-cdict-32k-plus-1", .input = in_csv_32769, .dict = "raw-csv-30000", .path = .cdict, .levels = levels_attach_30k },
+    .{ .name = "attach-lazy-load", .input = in_words_3000, .dict = "raw-words-8000", .path = .load, .levels = &.{ 4, 5, 6, 8, 9, 10 } },
+    .{ .name = "attach-lazy-usingcdict", .input = in_words_3000, .dict = "zd-words", .path = .usingcdict, .levels = &.{ 4, 5, 7, 9 } },
+    // content types: a full dictionary as raw content, tables to check
+    .{ .name = "attach-lazy-full-as-raw", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .content_type = 1, .levels = &.{ 4, 6, 9 } },
+    .{ .name = "attach-lazy-crafted", .input = in_words_3000, .dict = "crafted-words", .path = .load, .levels = &.{ 4, 5, 7, 10 } },
+    // a dictionary larger than the window (the frame's is the input's), and
+    // one of 150 KB made for the 256 KB row
+    .{ .name = "attach-lazy-dict-over-window", .input = in_mix_20000, .dict = "raw-csv-150000", .path = .cdict, .levels = &.{ 4, 6, 8, 11 } },
+    // forced on inputs past the cutoff, over many blocks (a CDict without a
+    // level, or 200 KB would load it anew); with a small window the
+    // dictionary leaves it within the frame, and then indices are corrected
+    .{ .name = "attach-lazy-force", .input = in_words_40000, .dict = "zd-words", .path = .cdict, .params = "forceAttachDict=1", .levels = levels_attach_small },
+    .{ .name = "attach-lazy-force-200k", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "forceAttachDict=1", .levels = levels_attach_30k },
+    .{ .name = "attach-lazy-force-window", .input = in_csv_200000, .dict = "zd-csv", .path = .cdictadv, .params = "windowLog=12,forceAttachDict=1", .levels = &.{ 5, 6, 8, 10, 12 } },
+    .{ .name = "attach-lazy-force-ocf", .input = in_csv_200000, .dict = "zd-csv", .path = .load, .params = "windowLog=11,forceAttachDict=1", .levels = &.{ 5, 6, 7, 11 }, .ocf = true },
+    // the row match finder on and off, for the CDict and the context alike
+    .{ .name = "attach-lazy-rows-on", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .params = "useRowMatchFinder=1", .levels = &.{ 4, 5, 6, 8 } },
+    .{ .name = "attach-lazy-rows-off", .input = in_csv_32768, .dict = "raw-csv-30000", .path = .cdictadv, .params = "useRowMatchFinder=2", .levels = &.{ 5, 6, 7, 10 } },
+    .{ .name = "attach-lazy-rows-search", .input = in_words_40000, .dict = "raw-words-15900", .path = .cdictadv, .params = "useRowMatchFinder=1,searchLog=6,forceAttachDict=1", .levels = &.{ 5, 7 } },
+    // minimum match lengths 3 (hashed as 4), 5, 6 and 7 (searched as 6)
+    .{ .name = "attach-lazy-minmatch-3", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=3", .levels = &.{ 4, 6, 9 } },
+    .{ .name = "attach-lazy-minmatch-5-row", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=5,useRowMatchFinder=1", .levels = &.{ 5, 7 } },
+    .{ .name = "attach-lazy-minmatch-6", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=6", .levels = &.{ 4, 8, 10 } },
+    .{ .name = "attach-lazy-minmatch-7", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=7,useRowMatchFinder=1", .levels = &.{ 5, 8 } },
+    // strategies forced where no level puts them for this size
+    .{ .name = "attach-lazy-strategy-greedy", .input = in_words_3000, .dict = "raw-words-8000", .path = .load, .params = "strategy=3", .levels = &.{ 1, 19 } },
+    .{ .name = "attach-lazy-strategy-btlazy2", .input = in_words_3000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "strategy=6", .levels = &.{ 3, 16 } },
+    .{ .name = "attach-lazy-strategy-lazy-row", .input = in_words_3000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "strategy=4,useRowMatchFinder=1,searchLog=4", .levels = &.{ 1, 22 } },
+    // an empty input: nothing searched, the header carries the ID
+    .{ .name = "attach-lazy-empty", .input = in_empty, .dict = "zd-words", .path = .cdict, .levels = &.{ 5, 9 } },
+    // Found by the mutation sweep (generator seeds searched, original
+    // against mutant; SPEC.md, *Anchoring*):
+    // the CDict's tree smaller than it: its low end, larger side
+    .{ .name = "attach-lazy-bt-tree-low-larger", .input = .{ .name = "", .len = 80927, .kind = .mix, .seed = 323089 }, .dict = "zd-words", .path = .cdictadv, .params = "forceAttachDict=1,strategy=6,chainLog=9,searchLog=3,hashLog=16", .levels = &.{7} },
+    // ... smaller side
+    .{ .name = "attach-lazy-bt-tree-low-smaller", .input = .{ .name = "", .len = 73245, .kind = .mix, .seed = 620601 }, .dict = "raw-words-3584", .path = .cdictadv, .params = "forceAttachDict=1,strategy=6,chainLog=8,searchLog=5", .levels = &.{10} },
+    // one compare left for the CDict's tree
+    .{ .name = "attach-lazy-bt-one-compare-left", .input = .{ .name = "", .len = 9918, .kind = .csv, .seed = 748492 }, .dict = "raw-csv-30000", .path = .cdictadv, .params = "forceAttachDict=1,strategy=6,chainLog=13,searchLog=2,hashLog=10,windowLog=16", .levels = &.{5} },
+    // a window match to the input's end skips the CDict
+    .{ .name = "attach-lazy-bt-input-end", .input = .{ .name = "", .len = 242, .kind = .words, .seed = 384050 }, .dict = "zd-words", .path = .cdict, .params = "-", .levels = &.{9} },
+    // a dictionary offset of 2^k - 1
+    .{ .name = "attach-lazy-bt-offset-price", .input = .{ .name = "", .len = 49917, .kind = .words, .seed = 609613 }, .dict = "crafted-words", .path = .cdictadv, .params = "forceAttachDict=1,strategy=6,chainLog=14,searchLog=6", .levels = &.{13} },
+    // the tree's low end when it spans less than the CDict
+    .{ .name = "attach-lazy-bt-tree-low-span", .input = .{ .name = "", .len = 14565, .kind = .mix, .seed = 63123 }, .dict = "crafted-words", .path = .cdictadv, .params = "forceAttachDict=1,strategy=6,chainLog=10,searchLog=6,minMatch=4", .levels = &.{11} },
+    // ... with the compares left zeroed
+    .{ .name = "attach-lazy-bt-input-end-zero", .input = .{ .name = "", .len = 86911, .kind = .csv, .seed = 80382 }, .dict = "zd-csv", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{11} },
+    // a CDict chain candidate needs its first 4 bytes
+    .{ .name = "attach-lazy-hc-first-four", .input = .{ .name = "", .len = 3016, .kind = .csv, .seed = 733954 }, .dict = "raw-csv-150000", .path = .cdictadv, .params = "forceAttachDict=1,useRowMatchFinder=2,chainLog=13,searchLog=6,strategy=3,minMatch=6,hashLog=9", .levels = &.{12} },
+    // a CDict chain match running on into the input
+    .{ .name = "attach-lazy-hc-into-prefix", .input = .{ .name = "", .len = 27487, .kind = .drift, .seed = 208226 }, .dict = "zd-words", .path = .cdictadv, .params = "forceAttachDict=1,minMatch=4", .levels = &.{6} },
+    // the CDict's chain shorter than it: where it ends
+    .{ .name = "attach-lazy-hc-chain-end", .input = .{ .name = "", .len = 58554, .kind = .words, .seed = 361537 }, .dict = "raw-words-3584", .path = .cdictadv, .params = "forceAttachDict=1,useRowMatchFinder=2,chainLog=10,searchLog=8,strategy=4,minMatch=4", .levels = &.{10} },
+    .{ .name = "attach-lazy-hc-chain-end-2", .input = .{ .name = "", .len = 32389, .kind = .words, .seed = 471759 }, .dict = "raw-words-8000", .path = .cdictadv, .params = "forceAttachDict=1,useRowMatchFinder=2,chainLog=7,searchLog=7,strategy=5", .levels = &.{4} },
+    // catching a match up to the CDict's first byte
+    .{ .name = "attach-lazy-catch-up-dict-start", .input = .{ .name = "", .len = 75888, .kind = .words, .seed = 849755 }, .dict = "raw-words-3584", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{10} },
+    // ... and to the input's first byte
+    .{ .name = "attach-lazy-catch-up-prefix-start", .input = .{ .name = "", .len = 27934, .kind = .two_symbols, .seed = 709728 }, .dict = "raw-words-8000", .path = .cdict, .params = "-", .levels = &.{5} },
+    // an immediate repcode right at the parser's limit
+    .{ .name = "attach-lazy-imm-rep-at-limit", .input = .{ .name = "", .len = 40616, .kind = .drift, .seed = 146458 }, .dict = "raw-mix-3000", .path = .cdictadv, .params = "forceAttachDict=1,strategy=6,chainLog=8,searchLog=1,minMatch=7", .levels = &.{22} },
+    // a CDict row match running on into the input
+    .{ .name = "attach-lazy-row-into-prefix", .input = .{ .name = "", .len = 1002, .kind = .drift, .seed = 689080 }, .dict = "zd-words", .path = .cdictadv, .params = "forceAttachDict=1,useRowMatchFinder=1,searchLog=6,strategy=5", .levels = &.{9} },
+    // a CDict row entry at its first index
+    .{ .name = "attach-lazy-row-dict-start", .input = .{ .name = "", .len = 47993, .kind = .drift, .seed = 517561 }, .dict = "crafted-words", .path = .cdictadv, .params = "forceAttachDict=1,useRowMatchFinder=1,searchLog=3,strategy=3,hashLog=14", .levels = &.{9} },
+    // a repcode match from the CDict on into the input
+    .{ .name = "attach-lazy-rep-into-prefix", .input = .{ .name = "", .len = 6247, .kind = .two_symbols, .seed = 17340 }, .dict = "raw-two-symbols-12528", .path = .load, .params = "forceAttachDict=1,strategy=6,chainLog=6,searchLog=4,minMatch=4", .levels = &.{7} },
+    // a match at the input's first byte is not caught up into the CDict
+    .{ .name = "attach-lazy-catch-up-at-prefix", .input = .{ .name = "", .len = 2935, .kind = .skewed, .seed = 110998 }, .dict = "raw-skewed-18461", .path = .usingcdict, .levels = &.{9} },
+    // unknown sizes: a stream attaches
+    .{ .name = "attach-lazy-stream-load", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .schedule = "c*,e0", .levels = &.{ 4, 5, 6, 7, 8, 9, 10 } },
+    .{ .name = "attach-lazy-stream-cdict", .input = in_csv_200000, .dict = "zd-csv", .path = .cdict, .schedule = "c50000,f0,c*,e0", .levels = &.{ 5, 6, 7, 11 } },
+    .{ .name = "attach-lazy-stream-cdictadv", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "useRowMatchFinder=1,o3000,c1000,f0,c*,e0", .levels = &.{ 4, 5, 6 } },
+    // a size hint makes the context's own CDict for over 256 KB: 5 greedy,
+    // 6 and 7 lazy, 8..12 lazy2, 13..15 btlazy2
+    .{ .name = "attach-lazy-stream-hint", .input = in_words_40000, .dict = "raw-csv-30000", .path = .load, .schedule = "srcSizeHint=300000,c*,e0", .levels = &.{ 5, 6, 8, 12, 13, 15 } },
+    .{ .name = "attach-lazy-stream-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "w12,c10000,f0,c*,e0", .levels = &.{ 5, 8, 10 } },
 };

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — **BEHAVIOURAL, not breaking:** a `CDict` of strategy
+  `greedy`, `lazy`, `lazy2` or `btlazy2` is now attached where libzstd
+  attaches it (inputs up to 32 KB, unknown sizes, `force_attach_dict =
+  .attach`) and searched in place, byte-identical to libzstd 1.5.7 (SPEC
+  backlog Z4, part D2: the `dictMatchState` variants of the hash chain, the
+  row match finder and the DUBT); those calls no longer fail with
+  `error.DictAttachUnsupported`, which remains for the other strategies.
+  141 attached frames and streams in the goldens, 6 660 random ones
+  identical.
+
 - **2026-09-24** — Compression with a dictionary attached to the optimal
   parsers (SPEC backlog Z4, part D3): where libzstd attaches a `CDict`
   (inputs up to 32 KB for `btopt`, 8 KB for `btultra` / `btultra2`,

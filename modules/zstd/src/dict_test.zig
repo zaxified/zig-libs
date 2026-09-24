@@ -16,10 +16,11 @@
 //! reused stream; libzstd gives fresh-context bytes either way with
 //! dictionaries too (SPEC.md, *Dictionaries*).
 //!
-//! Where libzstd would attach a `CDict` (small inputs), this port does so
-//! for the optimal parsers (`corpus.dict_cases_attach_opt`) and refuses for
-//! the strategies whose `dictMatchState` variant is not ported yet
-//! (`error.DictAttachUnsupported`); the last tests pin that.
+//! Where libzstd would attach a `CDict` (small inputs, unknown sizes), this
+//! port searches it in place with the strategy's dictMatchState variant --
+//! `greedy`..`btlazy2` (`corpus.dict_cases_attach_lazy`) and the optimal
+//! parsers (`corpus.dict_cases_attach_opt`) -- and refuses the other
+//! strategies (`error.DictAttachUnsupported`); the last tests pin that.
 
 const std = @import("std");
 const zstd = @import("root.zig");
@@ -207,7 +208,7 @@ test "output with dictionaries is byte-identical to libzstd 1.5.7" {
     try std.testing.expect(ctx.ctx.n_cdict_copies > 0 and ctx.ctx.n_dict_loads > 0);
 }
 
-test "where libzstd would attach a CDict, the frame is refused, not copied" {
+test "where libzstd would attach a CDict without a dictMatchState variant, the frame is refused, not copied" {
     const gpa = std.testing.allocator;
     const dict = trained("zd-words");
     var src: [3000]u8 = undefined;
