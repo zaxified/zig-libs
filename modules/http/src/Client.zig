@@ -83,7 +83,10 @@ const h1 = @import("h1.zig");
 const h2_client = @import("h2_client.zig");
 const bufpool = @import("bufpool.zig");
 const net = std.Io.net;
-const tls = std.crypto.tls;
+// std's TLS client, with the server chain verified by RFC 5280: std checks
+// no basicConstraints (ziglang/zig #35877), so any certificate holder could
+// impersonate any host to it. Same API as `std.crypto.tls`.
+const tls = @import("tlsclient");
 
 /// Shared, bounded slab pool for client connection buffers (see
 /// `bufpool.BufferPool` and `Options.buffer_pool`).

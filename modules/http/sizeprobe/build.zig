@@ -22,6 +22,29 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     http_mod.addImport("netaddr", netaddr_mod);
+    // `tlsclient` and its closure: `Conn.tls_client`'s TYPE names it, so the
+    // module must resolve even here -- none of its code may be linked into
+    // probe_after, which is exactly what the nm check asserts.
+    const dep = struct {
+        fn mod(bb: *std.Build, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, name: []const u8) *std.Build.Module {
+            return bb.createModule(.{
+                .root_source_file = bb.path(bb.fmt("../../{s}/src/root.zig", .{name})),
+                .target = t,
+                .optimize = o,
+            });
+        }
+    };
+    const montint_mod = dep.mod(b, target, optimize, "montint");
+    const rsa_mod = dep.mod(b, target, optimize, "rsa");
+    rsa_mod.addImport("montint", montint_mod);
+    const slhdsa_mod = dep.mod(b, target, optimize, "slhdsa");
+    const x509_mod = dep.mod(b, target, optimize, "x509");
+    x509_mod.addImport("rsa", rsa_mod);
+    x509_mod.addImport("slhdsa", slhdsa_mod);
+    const tlsclient_mod = dep.mod(b, target, optimize, "tlsclient");
+    tlsclient_mod.addImport("x509", x509_mod);
+    http_mod.addImport("tlsclient", tlsclient_mod);
+    http_mod.addImport("datefmt", dep.mod(b, target, optimize, "datefmt"));
 
     const names = [_][]const u8{ "before", "after" };
     inline for (names) |which| {

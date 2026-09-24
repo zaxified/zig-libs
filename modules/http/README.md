@@ -1,6 +1,6 @@
 # http
 
-HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
+HTTP/1.1 client **and server** in pure Zig (client TLS over `tlsclient` — std's client with RFC 5280 chain checks).
 
 - HTTP/1.1 **and HTTP/2** client + server, plus a reverse-proxy handler and
   an opt-in multicore (SO_REUSEPORT thread-per-core) accept engine.
@@ -14,7 +14,7 @@ HTTP/1.1 client **and server** in pure Zig (client TLS over `std.crypto.tls`).
   compile-time disabled elsewhere). **Role:** both.
   **Concurrency:** single-owner handles; the Server runs its own
   per-connection tasks — handlers must be thread-safe if they share state.
-  **Deps:** `netaddr`, `std.crypto.tls`, `std.Io.net`.
+  **Deps:** `netaddr`, `tlsclient`, `std.Io.net`.
 
 Provenance: original work of the zig-libs authors (MIT); the HTTP/1.1 framing,
 the server, HPACK, HTTP/2 and the reverse proxy are clean-room from the RFCs.
@@ -589,7 +589,7 @@ covers the client population; `deflate` adds nothing over it).
   all close the connection instead of pooling it). Set
   `Options.pool.enabled = false` for the old one-shot-per-request behavior
   (`Connection: close` on every request).
-- **TLS:** `std.crypto.tls.Client`, system CA bundle loaded lazily once per
+- **TLS:** `tlsclient.Client` (std's `std.crypto.tls.Client` with the server chain verified by RFC 5280 — std checks no basicConstraints, ziglang/zig #35877), system CA bundle loaded lazily once per
   Client; `tls.verify = .insecure_no_verify` opt-out for testing.
 - **Plaintext-only entry points:** `requestPlain`/`requestStreamingPlain`/
   `putFilePlain` never reference the TLS client at all (see "Plaintext-only

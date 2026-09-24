@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **https dials verify the server chain by RFC 5280.** The TLS client is now
+  `tlsclient` (std's `std.crypto.tls.Client` with the Certificate-message handling replaced by
+  `x509.verifyChain`), not std's own: std checks no basicConstraints (ziglang/zig #35877), so
+  anyone holding one valid certificate could impersonate any host to `http.Client` -- and to
+  `acme`, which dials through it. A chain std accepted is now refused
+  (`error.TlsCertificateNotVerified`) when an issuer is not a CA, a pathLen/keyUsage/
+  nameConstraints rule is broken, or the leaf's extKeyUsage excludes serverAuth. API unchanged;
+  the plaintext entry points still link no TLS (`check-http-sizeprobe`: 0 crypto symbols after,
+  193 before).
+
 - **2026-09-24** — **New `ResponseWriter.upgrade(protocol)`: `101 Switching Protocols` from a
   handler.** `Connection` is a managed header `setHeader` swallows, so no handler could answer an
   HTTP Upgrade before. `upgrade` writes the 101 with `Connection: Upgrade` + `Upgrade: <protocol>`

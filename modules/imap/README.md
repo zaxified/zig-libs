@@ -1,7 +1,7 @@
 # imap
 
 An **IMAP4rev2 (RFC 9051) client** in pure Zig, transport-agnostic: it owns no
-socket and speaks no TLS, so it drops onto plain TCP, `std.crypto.tls.Client`,
+socket and speaks no TLS, so it drops onto plain TCP, a TLS client (use `tlsclient.Client`: std's does not check CA constraints, ziglang/zig #35877),
 or a test buffer unchanged — the same seam `smtp` and `dtls` use.
 
 **Status: COMPLETE.** Modified UTF-7, the wire grammar, the response reader,

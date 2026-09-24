@@ -57,7 +57,7 @@ pub const meta = .{
     .model_after = "lalinsky/dusty (1.1 client shape) + Go net/http (redirect semantics, Server shape, gzip handler); nghttp2 later for h2",
     // `datefmt` for the `Date` header's calendar: std has one, and it walks a
     // year at a time from 1970 (`Server.formatHttpDate`).
-    .deps = .{ "netaddr", "datefmt" }, // also uses std.crypto.tls, std.Io.net, std.compress.flate
+    .deps = .{ "netaddr", "datefmt", "tlsclient" }, // `tlsclient`: std's TLS client with RFC 5280 chain checks (ziglang/zig #35877); also uses std.Io.net, std.compress.flate
 };
 
 /// Pure HTTP/1.1 wire framing (request/response head parse, chunked codec,

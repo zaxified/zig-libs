@@ -41,6 +41,7 @@ modules/spake2plus/src/root.zig	2	1
 modules/sphinx/src/core.zig	1	0
 modules/ssh/src/transport.zig	2	40
 modules/stun/src/root.zig	1	1
+modules/tlsclient/src/Client.zig	2	3
 modules/tlsresume/src/psk.zig	1	0
 modules/voprf/src/root.zig	2	1
 modules/webhooksig/src/root.zig	2	2

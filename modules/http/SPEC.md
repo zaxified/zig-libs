@@ -67,7 +67,7 @@ Foundational module: `router`, `dns` (DoH),
 authors; design refs (behavior only, no source copied):
 lalinsky/dusty (1.1 client), Go net/http (redirect semantics, server shape, gzip handler); RFCs
 7230/9110 (1.1), 7541 (HPACK), 9113 (h2), 7301 (ALPN), 7233 (Range), 9110 §8.8/12 (conditional/
-content-negotiation), 7578 (multipart); TLS via `std.crypto.tls`. See NOTICE.
+content-negotiation), 7578 (multipart); TLS via `tlsclient` (std's client + RFC 5280 chain verification). See NOTICE.
 
 **`Client` has a plaintext-only call graph, decl-level, no flag.**
 `Client.requestPlain`/`requestStreamingPlain`/`putFilePlain` mirror
@@ -341,7 +341,7 @@ termination stays BYO (reverse proxy today)
 pending a native std TLS server.
 
 ## Status
-`extract+gap · any · both · single_owner` · deps: `netaddr` (+ `std.crypto.tls`, `std.Io.net`,
+`extract+gap · any · both · single_owner` · deps: `netaddr`, `tlsclient` (+ `std.Io.net`,
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
 
 ## Known limits a consumer should size for

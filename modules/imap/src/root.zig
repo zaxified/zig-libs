@@ -9,7 +9,8 @@
 //!
 //! Like `smtp` and `dtls`, this module **owns no socket and speaks no TLS**.
 //! It works on caller-supplied bytes and `std.Io` streams, so it drops onto
-//! plain TCP, `std.crypto.tls.Client`, or a test buffer unchanged. That seam
+//! plain TCP, a TLS client (`tlsclient.Client` -- std's checks no CA
+//! constraints, ziglang/zig #35877), or a test buffer unchanged. That seam
 //! is why `emersion/go-imap` was chosen as the port source over the Rust and
 //! Python candidates: its client takes an already-connected socket and runs
 //! every protocol path over reader/writer interfaces, which is the shape this
