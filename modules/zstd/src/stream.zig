@@ -15,6 +15,7 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 const params = @import("params.zig");
+const cdict_mod = @import("cdict.zig");
 
 pub const EndDirective = enum {
     /// Buffer the input; compress only full blocks (`ZSTD_e_continue`).
@@ -53,6 +54,13 @@ pub const Options = struct {
     /// (the header still records no size).
     src_size_hint: ?u32 = null,
     advanced: params.Advanced = .{},
+    /// The dictionary (`ZSTD_CCtx_loadDictionary_advanced`, `ZSTD_CCtx_refCDict`,
+    /// `ZSTD_CCtx_refPrefix_advanced`): `.raw` and `.cdict` serve every
+    /// frame until `reset`; a `.prefix` only the next frame, as in libzstd.
+    /// The bytes (and a `CDict`) must outlive their use. `.raw` needs an
+    /// allocator: the stream digests it into a `CDict` of its own at the
+    /// first frame (a static stream fails with `error.OutOfMemory`).
+    dictionary: frame.Dict = .none,
 };
 
 /// The highest level a stream accepts: every level, as one-shot.
@@ -61,6 +69,10 @@ pub const max_level = params.max_level;
 pub const Error = error{
     /// Level above `max_level`.
     LevelUnsupported,
+    /// See `frame.Error`.
+    DictAttachUnsupported,
+    DictionaryCorrupted,
+    DictionaryWrong,
     /// An advanced parameter or `src_size_hint` outside libzstd's bounds.
     ParameterOutOfBound,
     OutOfMemory,
@@ -89,6 +101,8 @@ pub const Stream = struct {
     out_content: usize = 0,
     out_flushed: usize = 0,
     frame_ended: bool = false,
+    /// The stream's own `CDict` for a `.raw` dictionary (`localDict`).
+    local_cdict: ?cdict_mod.CDict = null,
     /// Test seam, set before the first call: index overflow corrected as
     /// libzstd's fuzzing build does it (`frame.Options.
     /// overflow_correct_frequently`), which reaches the correction of a
@@ -117,6 +131,7 @@ pub const Stream = struct {
     }
 
     pub fn deinit(s: *Stream) void {
+        if (s.local_cdict) |*l| l.deinit();
         s.comp.deinit();
         s.* = undefined;
     }
@@ -127,6 +142,9 @@ pub const Stream = struct {
     /// `opts.pledged_size` included. The workspace stays.
     pub fn reset(s: *Stream, opts: Options) Error!void {
         try checkOptions(opts);
+        // ZSTD_clearAllDicts
+        if (s.local_cdict) |*l| l.deinit();
+        s.local_cdict = null;
         s.opts = opts;
         s.pledged = opts.pledged_size;
         s.stage = .init;
@@ -155,8 +173,9 @@ pub const Stream = struct {
     /// block in and one compressed block out.
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
         const pledged: ?u64 = if (end_op == .end) in_size else s.pledged;
-        const cp = frameParams(s.opts, pledged);
-        try s.comp.begin(cp, pledged, s.frameOptions(), true);
+        try s.comp.initStream2(s.frameOptions(), pledged, s.opts.src_size_hint, true, &s.local_cdict);
+        // a prefix is single usage
+        if (s.opts.dictionary == .prefix) s.opts.dictionary = .none;
         const block_size = s.comp.block_size_max;
         s.in_to_compress = 0;
         s.in_buff_pos = 0;
@@ -175,6 +194,7 @@ pub const Stream = struct {
             .checksum = s.opts.checksum,
             .advanced = s.opts.advanced,
             .overflow_correct_frequently = s.overflow_correct_frequently,
+            .dict = s.opts.dictionary,
         };
     }
 
@@ -291,7 +311,8 @@ fn frameParams(opts: Options, pledged: ?u64) params.CParams {
 /// The workspace a stream with `opts` needs for its first frame when
 /// `opts.pledged_size` or `opts.src_size_hint` is set; with neither, the
 /// most any of its frames can need, whatever the input and however it
-/// arrives.
+/// arrives. Without the dictionary: a copied `CDict` brings its own table
+/// sizes.
 pub fn estimateSize(opts: Options) Error!usize {
     try Stream.checkOptions(opts);
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };

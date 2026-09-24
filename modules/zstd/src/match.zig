@@ -82,6 +82,21 @@ pub const MatchState = struct {
     /// The block's long-distance matches while the optimal parser runs on
     /// it (`ms->ldmSeqStore`); the parser reads a copy.
     ldm_seq_store: ?*const ldm.RawSeqStore = null,
+    /// `loadedDictEnd`: the index just past a dictionary loaded into (or
+    /// copied into) this window, while it is valid; 0 without one. While
+    /// it is set, the whole window counts as reachable (a dictionary is
+    /// valid as long as one byte of it is in the window), and it is reset
+    /// once the input has gone a window past it.
+    loaded_dict_end: u32 = 0,
+    /// `dictMatchState`: an attached `CDict`'s match state, searched beside
+    /// this window (its indices sit just below the window's). Only the
+    /// match finders' `dictMatchState` variants read it; see SPEC.md,
+    /// *Dictionaries*, for how to add one.
+    dict_match_state: ?*const MatchState = null,
+    /// `forceNonContiguous`: the next chunk starts a new segment even if it
+    /// follows the window in memory (`Advanced.deterministic_ref_prefix`
+    /// after a dictionary was loaded).
+    force_non_contiguous: bool = false,
 
     pub inline fn at(ms: *const MatchState, idx: usize) u8 {
         return ms.src[idx - ms.src_base];
@@ -117,15 +132,20 @@ pub const MatchState = struct {
     }
 
     /// `ZSTD_window_update` (see `updateWindow`).
-    pub fn windowUpdate(ms: *MatchState, chunk: []const u8) bool {
-        return updateWindow(ms, chunk);
+    pub fn windowUpdate(ms: *MatchState, chunk: []const u8, force_non_contiguous: bool) bool {
+        return updateWindow(ms, chunk, force_non_contiguous);
     }
 
-    /// `ZSTD_getLowestMatchIndex` without a dictionary.
+    /// `ZSTD_getLowestMatchIndex`: the lowest index a match may start at,
+    /// in the extDict or the prefix. With a dictionary loaded it is the
+    /// whole window: the dictionary is invalidated (`loaded_dict_end` reset)
+    /// as soon as it is not valid for a whole block.
     pub fn lowestMatchIndex(ms: *const MatchState, curr: u32) u32 {
         const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
         const lowest_valid = ms.low_limit;
-        return if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+        const within_window = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+        const is_dictionary = ms.loaded_dict_end != 0;
+        return if (is_dictionary) lowest_valid else within_window;
     }
 
     /// `ZSTD_count_2segments` over indices: a match in the extDict
@@ -198,13 +218,32 @@ pub const MatchState = struct {
         };
     }
 
-    /// `ZSTD_window_enforceMaxDist(window, blockStart, maxDist, NULL, NULL)`.
-    pub fn enforceMaxDist(ms: *MatchState, block_start_idx: u32) void {
+    /// `ZSTD_window_enforceMaxDist(window, blockEnd, maxDist,
+    /// &loadedDictEnd, &dictMatchState)` (the frame driver passes the
+    /// block's start): raise the low limit to a window below `block_end_idx`
+    /// once that is past a loaded dictionary, which is then invalid.
+    pub fn enforceMaxDist(ms: *MatchState, block_end_idx: u32) void {
         const max_dist: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
-        if (block_start_idx > max_dist) {
-            const new_low = block_start_idx - max_dist;
+        if (block_end_idx > max_dist +% ms.loaded_dict_end) {
+            const new_low = block_end_idx - max_dist;
             if (ms.low_limit < new_low) ms.low_limit = new_low;
             if (ms.dict_limit < ms.low_limit) ms.dict_limit = ms.low_limit;
+            // On reaching window size, dictionaries are invalidated
+            ms.loaded_dict_end = 0;
+            ms.dict_match_state = null;
+        }
+    }
+
+    /// `ZSTD_checkDictValidity`: a dictionary that is not valid for the
+    /// whole block ending at `block_end_idx` -- it lies more than a window
+    /// back, or the window went on in another segment -- is dropped.
+    pub fn checkDictValidity(ms: *MatchState, block_end_idx: u32) void {
+        const max_dist: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
+        const loaded_dict_end = ms.loaded_dict_end;
+        std.debug.assert(block_end_idx >= loaded_dict_end);
+        if (block_end_idx > loaded_dict_end +% max_dist or loaded_dict_end != ms.dict_limit) {
+            ms.loaded_dict_end = 0;
+            ms.dict_match_state = null;
         }
     }
 
@@ -215,7 +254,7 @@ pub const MatchState = struct {
     pub fn overflowCorrectIfNeeded(ms: *MatchState, frequently: bool, ip: usize, iend: usize) u32 {
         const cycle_log = params.cycleLog(ms.cp);
         const max_dist: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
-        if (!needOverflowCorrection(frequently, ms.n_overflow_corrections, cycle_log, max_dist, ip, iend)) return 0;
+        if (!needOverflowCorrection(frequently, ms.n_overflow_corrections, cycle_log, max_dist, ms.loaded_dict_end, ip, iend)) return 0;
         const correction = correctOverflow(&ms.low_limit, &ms.dict_limit, &ms.n_overflow_corrections, frequently, cycle_log, max_dist, @intCast(ip));
         // `window.base` and `window.dictBase` move up by the correction: a
         // segment whose first index would drop below `window_start` loses
@@ -227,14 +266,21 @@ pub const MatchState = struct {
         reduceTable(ms.chain_table, correction, ms.cp.strategy == .btlazy2);
         reduceTable(ms.hash_table3, correction, false);
         ms.next_to_update = if (ms.next_to_update < correction) 0 else ms.next_to_update - correction;
+        // invalidate dictionaries on overflow correction
+        ms.loaded_dict_end = 0;
+        ms.dict_match_state = null;
         return correction;
     }
 
-    /// `ZSTD_getLowestPrefixIndex` without a dictionary.
+    /// `ZSTD_getLowestPrefixIndex`: the lowest index a match in the prefix
+    /// may start at (all of the prefix while a dictionary is loaded: it may
+    /// lie in the prefix, when the input follows it in memory).
     pub fn lowestPrefixIndex(ms: *const MatchState, curr: u32) u32 {
         const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
         const lowest_valid = ms.dict_limit;
-        return if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+        const within_window = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+        const is_dictionary = ms.loaded_dict_end != 0;
+        return if (is_dictionary) lowest_valid else within_window;
     }
 };
 
@@ -244,14 +290,15 @@ pub const MatchState = struct {
 /// it does not follow the prefix in memory (a stream's input buffer
 /// wrapped, or a new buffer), the prefix becomes the extDict and the
 /// chunk starts a new prefix at the next index. Input that overwrites
-/// the extDict's memory raises `low_limit` past it. Returns whether the
-/// chunk was contiguous.
-pub fn updateWindow(ms: anytype, chunk: []const u8) bool {
+/// the extDict's memory raises `low_limit` past it. `force_non_contiguous`
+/// takes that path even for a contiguous chunk. Returns whether the chunk
+/// was contiguous.
+pub fn updateWindow(ms: anytype, chunk: []const u8, force_non_contiguous: bool) bool {
     if (chunk.len == 0) return true;
     var contiguous = true;
     // A fresh window's `nextSrc` points at nothing, so the first chunk
     // takes this path too (and changes nothing but the base).
-    if (ms.src.len == 0 or @intFromPtr(chunk.ptr) != @intFromPtr(ms.src.ptr) + ms.src.len) {
+    if (ms.src.len == 0 or @intFromPtr(chunk.ptr) != @intFromPtr(ms.src.ptr) + ms.src.len or force_non_contiguous) {
         const distance_from_base: u32 = @intCast(ms.src_base + ms.src.len);
         ms.low_limit = ms.dict_limit;
         ms.dict_limit = distance_from_base;
@@ -296,8 +343,8 @@ pub fn shiftSegment(seg: *[]const u8, base: *u32, correction: u32) void {
 /// `ZSTD_CURRENT_MAX` on 64-bit: past this index the indices are rescaled.
 pub const current_max: u32 = 3500 << 20;
 
-/// `ZSTD_window_canOverflowCorrect` (no dictionary: `loadedDictEnd` 0).
-fn canOverflowCorrect(n_corrections: u32, cycle_log: u32, max_dist: u32, curr: u32) bool {
+/// `ZSTD_window_canOverflowCorrect`.
+fn canOverflowCorrect(n_corrections: u32, cycle_log: u32, max_dist: u32, loaded_dict_end: u32, curr: u32) bool {
     const cycle_size = @as(u32, 1) << @intCast(cycle_log);
     const min_index_to_overflow_correct = cycle_size +% @max(max_dist, cycle_size) +% window_start;
     // Back off the correction frequency; if the product overflows it only
@@ -305,7 +352,9 @@ fn canOverflowCorrect(n_corrections: u32, cycle_log: u32, max_dist: u32, curr: u
     const adjustment = n_corrections +% 1;
     const adjusted_index = @max(min_index_to_overflow_correct *% adjustment, min_index_to_overflow_correct);
     const index_large_enough = curr > adjusted_index;
-    const dictionary_invalidated = curr > max_dist;
+    // Only overflow correct early if the dictionary is invalidated already,
+    // so we don't hurt compression ratio.
+    const dictionary_invalidated = curr > max_dist +% loaded_dict_end;
     return index_large_enough and dictionary_invalidated;
 }
 
@@ -313,8 +362,8 @@ fn canOverflowCorrect(n_corrections: u32, cycle_log: u32, max_dist: u32, curr: u
 /// `ip`..`iend`. `frequently` is `ZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY`,
 /// libzstd's fuzzing switch: correct whenever it is safe, not only past
 /// `current_max`, which is how the tests reach this code on small inputs.
-pub fn needOverflowCorrection(frequently: bool, n_corrections: u32, cycle_log: u32, max_dist: u32, ip: usize, iend: usize) bool {
-    if (frequently and canOverflowCorrect(n_corrections, cycle_log, max_dist, @intCast(ip))) return true;
+pub fn needOverflowCorrection(frequently: bool, n_corrections: u32, cycle_log: u32, max_dist: u32, loaded_dict_end: u32, ip: usize, iend: usize) bool {
+    if (frequently and canOverflowCorrect(n_corrections, cycle_log, max_dist, loaded_dict_end, @intCast(ip))) return true;
     return iend > current_max;
 }
 
@@ -489,34 +538,120 @@ const prime8: u64 = 0xCF1BBCDCB7A56463;
 // then points below `istart`; saturating at 0 keeps it below every index
 // (they start at 2), so each comparison comes out the same.
 
-/// `ZSTD_fillHashTableForCCtx` (`ZSTD_dtlm_fast`): every third position
-/// from `next_to_update` into the hash table, up to `end`. Long-distance
-/// matching calls it before it runs `fast` on a stretch of literals.
-pub fn fillHashTable(ms: *MatchState, end: usize) void {
+/// `ZSTD_dictTableLoadMethod_e`: `fast` inserts every third position,
+/// `full` also the two between them where their slot is still empty.
+pub const TableLoad = enum { fast, full };
+
+/// `ZSTD_tableFillPurpose_e`: a `CDict`'s `fast`/`dfast` tables are tagged
+/// (`ZSTD_SHORT_CACHE_TAG_BITS` of hash in the low bits of each entry).
+pub const FillPurpose = enum { for_cctx, for_cdict };
+
+const tag_bits = params.short_cache_tag_bits;
+const tag_mask = (1 << tag_bits) - 1;
+
+/// `ZSTD_writeTaggedIndex`: `hash_and_tag` is a hash `tag_bits` wider than
+/// the table's; its low bits go into the entry beside the index.
+inline fn writeTaggedIndex(table: []u32, hash_and_tag: usize, index: u32) void {
+    const h = hash_and_tag >> tag_bits;
+    const tag: u32 = @intCast(hash_and_tag & tag_mask);
+    std.debug.assert(index >> (32 - tag_bits) == 0);
+    table[h] = (index << tag_bits) | tag;
+}
+
+/// `ZSTD_fillHashTable`: every third position from `next_to_update` up to
+/// `end` into the `fast` hash table (with `.full`, the others too where
+/// their slot is empty); tagged for a `CDict`. Long-distance matching calls
+/// it (`.fast`, `.for_cctx`) before it runs `fast` on a stretch of
+/// literals; a dictionary's content is loaded with it.
+pub fn fillHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp: FillPurpose) void {
+    const tagged = tfp == .for_cdict;
+    const hash_table = ms.hash_table;
+    const h_bits = ms.cp.hash_log + if (tagged) @as(u32, tag_bits) else 0;
+    const mls = ms.cp.min_match;
     const fill_step = 3;
     var ip: usize = ms.next_to_update;
     // `ip + fastHashFillStep < iend + 2`, iend = end - HASH_READ_SIZE
-    while (ip + fill_step + hash_read_size < end + 2) : (ip += fill_step)
-        ms.hash_table[ms.hash(ip, ms.cp.hash_log, ms.cp.min_match)] = @intCast(ip);
+    while (ip + fill_step + hash_read_size < end + 2) : (ip += fill_step) {
+        const curr: u32 = @intCast(ip);
+        const h0 = ms.hash(ip, h_bits, mls);
+        if (tagged) writeTaggedIndex(hash_table, h0, curr) else hash_table[h0] = curr;
+        if (dtlm == .fast) continue;
+        // Only load extra positions for ZSTD_dtlm_full
+        var p: u32 = 1;
+        while (p < fill_step) : (p += 1) {
+            const h = ms.hash(ip + p, h_bits, mls);
+            if (tagged) {
+                if (hash_table[h >> tag_bits] == 0) writeTaggedIndex(hash_table, h, curr + p); // not yet filled
+            } else if (hash_table[h] == 0) hash_table[h] = curr + p;
+        }
+    }
 }
 
-/// `ZSTD_fillDoubleHashTableForCCtx` (`ZSTD_dtlm_fast`): every third
-/// position from `next_to_update` into both of `dfast`'s tables, up to
-/// `end`.
-pub fn fillDoubleHashTable(ms: *MatchState, end: usize) void {
+/// `ZSTD_fillHashTableForCCtx` (`ZSTD_dtlm_fast`).
+pub fn fillHashTable(ms: *MatchState, end: usize) void {
+    fillHashTableFor(ms, end, .fast, .for_cctx);
+}
+
+/// `ZSTD_fillDoubleHashTable`: every third position from `next_to_update`
+/// up to `end` into both of `dfast`'s tables (with `.full`, the two after
+/// it into the long table where their slot is empty); tagged for a
+/// `CDict`.
+pub fn fillDoubleHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp: FillPurpose) void {
+    const tagged = tfp == .for_cdict;
+    const hash_large = ms.hash_table;
+    const h_bits_l = ms.cp.hash_log + if (tagged) @as(u32, tag_bits) else 0;
+    const mls = ms.cp.min_match;
+    const hash_small = ms.chain_table;
+    const h_bits_s = ms.cp.chain_log + if (tagged) @as(u32, tag_bits) else 0;
     const fill_step = 3;
     var ip: usize = ms.next_to_update;
     // `ip + fastHashFillStep - 1 <= iend`, iend = end - HASH_READ_SIZE
     while (ip + fill_step - 1 + hash_read_size <= end) : (ip += fill_step) {
-        ms.chain_table[ms.hash(ip, ms.cp.chain_log, ms.cp.min_match)] = @intCast(ip);
-        ms.hash_table[ms.hash(ip, ms.cp.hash_log, 8)] = @intCast(ip);
+        const curr: u32 = @intCast(ip);
+        var i: u32 = 0;
+        while (i < fill_step) : (i += 1) {
+            const sm = ms.hash(ip + i, h_bits_s, mls);
+            const lg = ms.hash(ip + i, h_bits_l, 8);
+            if (tagged) {
+                if (i == 0) writeTaggedIndex(hash_small, sm, curr + i);
+                if (i == 0 or hash_large[lg >> tag_bits] == 0) writeTaggedIndex(hash_large, lg, curr + i);
+            } else {
+                if (i == 0) hash_small[sm] = curr + i;
+                if (i == 0 or hash_large[lg] == 0) hash_large[lg] = curr + i;
+            }
+            // Only load extra positions for ZSTD_dtlm_full
+            if (dtlm == .fast) break;
+        }
     }
+}
+
+/// `ZSTD_fillDoubleHashTableForCCtx` (`ZSTD_dtlm_fast`).
+pub fn fillDoubleHashTable(ms: *MatchState, end: usize) void {
+    fillDoubleHashTableFor(ms, end, .fast, .for_cctx);
+}
+
+/// Whether `strategy`'s match finders have their `dictMatchState`
+/// variant, which searches an attached `CDict` (`MatchState.
+/// dict_match_state`) beside the window. A context refuses to attach a
+/// CDict of any other strategy (`error.DictAttachUnsupported`). Each port
+/// of a variant sets its strategies here (SPEC.md, *Dictionaries*).
+pub fn hasDictMatchStateVariant(strategy: params.Strategy) bool {
+    return switch (strategy) {
+        .fast, .dfast => false, // zstd_fast.c, zstd_double_fast.c
+        .greedy, .lazy, .lazy2, .btlazy2 => false, // zstd_lazy.c
+        .btopt, .btultra, .btultra2 => false, // zstd_opt.c
+    };
 }
 
 /// Compress one block with the strategy in `ms.cp`. Stores sequences into
 /// `ss`, updates `rep`, and returns the number of trailing literals.
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
     const mls = ms.cp.min_match;
+    // `ZSTD_matchState_dictMode`: extDict, else dictMatchState, else noDict.
+    // An attached CDict (`dict_match_state`) needs the dictMatchState
+    // variants, which are not ported yet: attaching is refused before any
+    // block (frame.zig, `resetByAttachingCDict`), so it never gets here.
+    if (!ms.hasExtDict() and ms.dict_match_state != null) unreachable;
     if (ms.hasExtDict()) switch (ms.cp.strategy) {
         .fast => return switch (mls) {
             5 => fastExtDictBlock(ms, ss, rep, istart, src_size, 5),
@@ -1250,8 +1385,8 @@ test "reduceTable squashes indices below the threshold and keeps btlazy2's mark"
 
 test "past current_max the correction keeps the low cycle bits and the whole window" {
     // 3500 MiB is a multiple of 2^16, so the index's cycle position is 5.
-    try std.testing.expect(!needOverflowCorrection(false, 0, 16, 1 << 19, current_max - 100, current_max));
-    try std.testing.expect(needOverflowCorrection(false, 0, 16, 1 << 19, current_max - 100, current_max + 1));
+    try std.testing.expect(!needOverflowCorrection(false, 0, 16, 1 << 19, 0, current_max - 100, current_max));
+    try std.testing.expect(needOverflowCorrection(false, 0, 16, 1 << 19, 0, current_max - 100, current_max + 1));
     var low: u32 = current_max + 5 - (1 << 19);
     var dict: u32 = low;
     var n: u32 = 0;
@@ -1271,8 +1406,8 @@ test "past current_max the correction keeps the low cycle bits and the whole win
 
 test "frequent correction backs off with each correction made" {
     // min index = 2^12 + 2^14 + 2 = 20482
-    try std.testing.expect(!needOverflowCorrection(true, 0, 12, 1 << 14, 20482, 20483));
-    try std.testing.expect(needOverflowCorrection(true, 0, 12, 1 << 14, 20483, 20484));
-    try std.testing.expect(!needOverflowCorrection(true, 2, 12, 1 << 14, 3 * 20482, 3 * 20482 + 1));
-    try std.testing.expect(needOverflowCorrection(true, 2, 12, 1 << 14, 3 * 20482 + 1, 3 * 20482 + 2));
+    try std.testing.expect(!needOverflowCorrection(true, 0, 12, 1 << 14, 0, 20482, 20483));
+    try std.testing.expect(needOverflowCorrection(true, 0, 12, 1 << 14, 0, 20483, 20484));
+    try std.testing.expect(!needOverflowCorrection(true, 2, 12, 1 << 14, 0, 3 * 20482, 3 * 20482 + 1));
+    try std.testing.expect(needOverflowCorrection(true, 2, 12, 1 << 14, 0, 3 * 20482 + 1, 3 * 20482 + 2));
 }

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
 //! Huffman literal encoder (port of libzstd lib/compress/huf_compress.c, v1.5.7).
 //!
-//! Not carried: `HUF_repeat_valid` (that state only comes from a loaded
-//! dictionary). The "optimal depth" table-log search libzstd enables from
-//! `btultra` up is `optimalTableLog`. The
+//! `readCTable` is `HUF_readCTable`, for a dictionary's table. The
+//! "optimal depth" table-log search libzstd enables from `btultra` up is
+//! `optimalTableLog`. The
 //! symbol sort keeps libzstd's bucket sort *and* its unstable quicksort, because
 //! the order of equal counts decides which symbol gets which code, and so
 //! reaches the output bytes.
@@ -20,7 +20,10 @@ pub const table_log_default = 11;
 pub const symbol_value_max = 255;
 pub const block_size_max = 128 * 1024;
 
-pub const Repeat = enum { none, check };
+/// `HUF_repeat`: whether the previous table may be reused -- `check`
+/// after validating it against the literals, `valid` without (a
+/// dictionary's table giving every byte a code).
+pub const Repeat = enum { none, check, valid };
 
 pub const CElt = struct {
     nb_bits: u8 = 0,
@@ -358,6 +361,49 @@ pub fn optimalTableLog(max_table_log: u32, src_len: usize, max_symbol: u32, coun
     return opt_log;
 }
 
+/// `HUF_readCTable`: the table a header written by `writeCTable` (a
+/// dictionary's) describes, into `ct`. Returns the header's size, and
+/// whether some symbol up to the last has no code (`hasZeroWeights`).
+pub fn readCTable(ct: *CTable, src: []const u8, has_zero_weights: *bool) Error!usize {
+    const huf_dec = @import("huf_dec.zig");
+    var huff_weight: [symbol_value_max + 1]u8 = undefined;
+    var rank_val: [huf_dec.tablelog_max + 1]u32 = undefined;
+    var table_log: u32 = 0;
+    var nb_symbols: u32 = 0;
+    // get symbol weights
+    const read_size = huf_dec.readStats(&huff_weight, &rank_val, &nb_symbols, &table_log, src) catch return error.Generic;
+    has_zero_weights.* = rank_val[0] > 0;
+    // check result
+    if (table_log > table_log_max) return error.Generic;
+    if (nb_symbols > symbol_value_max + 1) return error.Generic;
+    ct.table_log = table_log;
+    ct.max_symbol = nb_symbols - 1;
+    // fill nbBits
+    for (huff_weight[0..nb_symbols], ct.elt[0..nb_symbols]) |w, *e|
+        e.nb_bits = if (w != 0) @intCast(table_log + 1 - w) else 0;
+    // fill val
+    var nb_per_rank = [_]u16{0} ** (table_log_max + 2); // support w=0=>n=tableLog+1
+    var val_per_rank = [_]u16{0} ** (table_log_max + 2);
+    for (ct.elt[0..nb_symbols]) |e| nb_per_rank[e.nb_bits] += 1;
+    // determine starting value per rank
+    val_per_rank[table_log + 1] = 0; // for w==0
+    {
+        var min: u16 = 0;
+        var n: u32 = table_log;
+        while (n > 0) : (n -= 1) { // start at n=tablelog <-> w=1
+            val_per_rank[n] = min; // get starting value within each rank
+            min += nb_per_rank[n];
+            min >>= 1;
+        }
+    }
+    // assign value within rank, symbol order
+    for (ct.elt[0..nb_symbols]) |*e| {
+        e.value = val_per_rank[e.nb_bits];
+        val_per_rank[e.nb_bits] +%= 1;
+    }
+    return read_size;
+}
+
 // ── table header ────────────────────────────────────────────────────────────
 
 const max_fse_table_log_for_huff_header = 6;
@@ -491,6 +537,9 @@ pub fn compress(dst: []u8, src: []const u8, huff_log_in: u32, streams: Streams, 
     if (huff_log == 0) huff_log = table_log_default;
     var max_symbol: u32 = symbol_value_max;
     var counts: [symbol_value_max + 1]u32 = undefined;
+
+    // Heuristic : If old table is valid, use it for small inputs
+    if (flags.prefer_repeat and repeat.* == .valid) return compressWithTable(dst, 0, src, streams, old);
 
     // If uncompressible data is suspected, do a smaller sampling first.
     if (flags.suspect_uncompressible and src.len >= suspect_incompressible_sample_size * suspect_incompressible_sample_ratio) {

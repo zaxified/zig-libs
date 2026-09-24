@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — Compression with a dictionary (SPEC backlog Z4, part
+  D0): `CDict` (`init` = `ZSTD_createCDict`, `initAdvanced` =
+  `ZSTD_createCDict_advanced2`), `Options.dictionary` /
+  `StreamOptions.dictionary` (`.raw` = `ZSTD_CCtx_loadDictionary_advanced`,
+  `.cdict` = `ZSTD_CCtx_refCDict`, `.prefix` = `ZSTD_CCtx_refPrefix_advanced`),
+  `Compressor.compressUsingDict` / `compressUsingCDict`, raw-content and
+  full zstd dictionaries (`DictContentType`), the dictionary ID in the
+  header, and `Advanced.dict_id_flag`, `force_attach_dict`,
+  `deterministic_ref_prefix`, `force_max_window`. A CDict is copied into
+  the context or its content loaded anew, as libzstd chooses; where
+  libzstd would **attach** it (inputs up to 8–32 KB by strategy, unknown
+  sizes) the call fails with `error.DictAttachUnsupported` for now. 326
+  dictionary frames and streams byte-identical to libzstd 1.5.7 (all
+  levels), 2 700 random ones identical on the first run. `zref.c` /
+  `zstream.c` take a dictionary; `zdtrain.c` trains the committed ones.
+
 - **2026-09-24** — Dictionary training, content selection (SPEC backlog
   Z5a): `zstd.dict_builder` ports libzstd's cover and fastCover trainers
   (`cover.c`, `fastcover.c`) up to, not including, finalization.

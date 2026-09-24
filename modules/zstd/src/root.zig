@@ -21,6 +21,12 @@
 //! `estimateCompressorSize` / `estimateStreamSize` size exactly and a
 //! caller may provide (`initStatic`).
 //!
+//! Compression with a dictionary (`Options.dictionary`, `CDict`,
+//! `Compressor.compressUsingDict` / `compressUsingCDict`) gives libzstd's
+//! bytes for the dictionary set the same way -- loaded, a `CDict` copied or
+//! reloaded, a prefix -- except where libzstd attaches a `CDict` (small or
+//! unknown input sizes): `error.DictAttachUnsupported` for now.
+//!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd.
 //!
@@ -38,6 +44,7 @@ const frame_writer = @import("frame_writer.zig");
 const stream = @import("stream.zig");
 const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
+const cdict_mod = @import("cdict.zig");
 
 /// Dictionary training, content selection: libzstd's cover and fastCover
 /// trainers up to (not including) finalization; see dict_builder.zig.
@@ -64,7 +71,30 @@ pub const Options = struct {
     /// ...); each left to the level by default. Same bytes as libzstd with
     /// the same parameters set.
     advanced: Advanced = .{},
+    /// A dictionary, as libzstd has one set on the context
+    /// (`ZSTD_CCtx_loadDictionary_advanced`, `ZSTD_CCtx_refCDict`,
+    /// `ZSTD_CCtx_refPrefix_advanced`) before `ZSTD_compress2`. `.raw` is
+    /// digested into a `CDict` for the call (make a `CDict` to digest it
+    /// once for many frames). A decoder needs the same dictionary.
+    dictionary: Dictionary = .none,
 };
+
+/// A compression dictionary: see `Options.dictionary`.
+pub const Dictionary = frame.Dict;
+pub const RawDictionary = frame.RawDict;
+/// `ZSTD_dictContentType_e`: raw content, a full zstd dictionary (magic
+/// number, ID, entropy tables, repcodes, content), or either by its first
+/// four bytes.
+pub const DictContentType = cdict_mod.ContentType;
+/// `ZSTD_CDict`: a dictionary digested once -- its match tables filled,
+/// its entropy tables read -- for any number of frames and contexts.
+pub const CDict = cdict_mod.CDict;
+/// `ZSTD_dictAttachPref_e` (`Advanced.force_attach_dict`).
+pub const DictAttachPref = params.DictAttachPref;
+/// The frame parameters of `Compressor.compressUsingCDict`.
+pub const FrameParams = frame.FrameParams;
+/// `ZSTD_MAGIC_DICTIONARY`: the first four bytes of a full dictionary.
+pub const magic_dictionary = cdict_mod.magic_dictionary;
 
 /// libzstd's advanced compression parameters (`ZSTD_CCtx_setParameter`),
 /// with its bounds.
@@ -131,7 +161,24 @@ pub const Compressor = struct {
     /// See `zstd.compress`.
     pub fn compress(c: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
         if (opts.level > max_level) return error.LevelUnsupported;
-        return c.ctx.compressFrame(dst, src, .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced });
+        return c.ctx.compressFrame(dst, src, .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .dict = opts.dictionary });
+    }
+
+    /// `ZSTD_compress_usingDict`: one frame of `src` with `dict` (a full
+    /// dictionary by its magic number, else raw content) loaded into the
+    /// context, at `level` with every other parameter at its default and
+    /// the parameters sized for the input and the dictionary together.
+    /// `dst` must hold `compressBound(src.len)` bytes.
+    pub fn compressUsingDict(c: *Compressor, dst: []u8, src: []const u8, dict: []const u8, level: i32) Error!usize {
+        if (level > max_level) return error.LevelUnsupported;
+        return c.ctx.compressUsingDict(dst, src, dict, level);
+    }
+
+    /// `ZSTD_compress_usingCDict_advanced` (`ZSTD_compress_usingCDict` with
+    /// the default `fp`): one frame of `src` with `cdict` and its
+    /// parameters, every other parameter at its default.
+    pub fn compressUsingCDict(c: *Compressor, dst: []u8, src: []const u8, cdict: *const CDict, fp: FrameParams) Error!usize {
+        return c.ctx.compressUsingCDict(dst, src, cdict, fp);
     }
 
     /// The bytes the workspace holds now (`ZSTD_sizeof_CCtx` less the
@@ -295,6 +342,8 @@ test {
     _ = @import("superblock.zig");
     _ = @import("presplit.zig");
     _ = @import("frame.zig");
+    _ = @import("cdict.zig");
+    _ = @import("dict_test.zig");
     _ = @import("frame_writer.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");

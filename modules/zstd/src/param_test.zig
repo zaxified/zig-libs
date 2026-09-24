@@ -70,11 +70,19 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.target_c_block_size = v;
     } else if (Eq.f(name, "srcSizeHint")) {
         hint.* = v;
+    } else if (Eq.f(name, "dictIDFlag")) {
+        adv.dict_id_flag = v != 0;
+    } else if (Eq.f(name, "forceAttachDict")) {
+        adv.force_attach_dict = std.enums.fromInt(zstd.DictAttachPref, v) orelse return error.BadParam;
+    } else if (Eq.f(name, "deterministicRefPrefix")) {
+        adv.deterministic_ref_prefix = v != 0;
+    } else if (Eq.f(name, "forceMaxWindow")) {
+        adv.force_max_window = v != 0;
     } else return error.BadParam;
     return true;
 }
 
-fn parse(list: []const u8) !zstd.Advanced {
+pub fn parse(list: []const u8) !zstd.Advanced {
     var adv: zstd.Advanced = .{};
     var hint: ?u32 = null;
     var it = std.mem.tokenizeScalar(u8, list, ',');

@@ -14,12 +14,26 @@ const opt = @import("opt.zig");
 const blocksplit = @import("blocksplit.zig");
 const ldm = @import("ldm.zig");
 const superblock = @import("superblock.zig");
+const cdict_mod = @import("cdict.zig");
+const CDict = cdict_mod.CDict;
 
 pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
     NoSpaceLeft,
+} || BeginError;
+
+/// What setting a context up for a frame can fail with.
+pub const BeginError = error{
     OutOfMemory,
-} || params.Advanced.CheckError;
+    /// libzstd would attach the `CDict` (a small or unknown input size, or
+    /// `Advanced.force_attach_dict = .attach`), searching its tables in
+    /// place with the match finders' `dictMatchState` variants, which are
+    /// not ported yet for its strategy. Copying instead would change the
+    /// output, so the frame is refused. Temporary.
+    DictAttachUnsupported,
+    /// Level above `params.max_level` (for a context's own `CDict`).
+    LevelUnsupported,
+} || params.Advanced.CheckError || cdict_mod.Error;
 
 /// `ZSTD_compressBound`.
 pub fn compressBound(src_size: usize) usize {
@@ -37,8 +51,9 @@ const bt_raw = 0;
 const bt_rle = 1;
 const bt_compressed = 2;
 
-/// What one block leaves behind for the next (`ZSTD_compressedBlockState_t`).
-const BlockState = struct {
+/// What one block leaves behind for the next (`ZSTD_compressedBlockState_t`);
+/// a full dictionary sets the first block's.
+pub const BlockState = struct {
     huf: literals.HufState = .{},
     fse: sequences.FseTables = .{},
     rep: [3]u32 = .{ 1, 4, 8 },
@@ -70,16 +85,19 @@ const Ctx = struct {
 };
 
 /// `ZSTD_writeFrameHeader`; `content_size` null leaves the size out
-/// (`contentSizeFlag` 0, or a stream of unknown length).
-fn writeFrameHeader(dst: []u8, cp: params.CParams, content_size: ?u64, checksum: bool, format: params.Format) usize {
+/// (`contentSizeFlag` 0, or a stream of unknown length); `dict_id` 0 or
+/// `no_dict_id` leaves the dictionary ID out.
+fn writeFrameHeader(dst: []u8, cp: params.CParams, content_size: ?u64, checksum: bool, format: params.Format, dict_id: u32, no_dict_id: bool) usize {
     const window_size: u64 = @as(u64, 1) << @intCast(cp.window_log);
     const src_size = content_size orelse 0;
+    const dict_id_size_code_length: u8 = @as(u8, @intFromBool(dict_id > 0)) + @intFromBool(dict_id >= 256) + @intFromBool(dict_id >= 65536); // 0-3
+    const dict_id_size_code: u8 = if (no_dict_id) 0 else dict_id_size_code_length;
     const single_segment = content_size != null and window_size >= src_size;
     const window_log_byte: u8 = @intCast((cp.window_log - 10) << 3);
     const fcs_code: u8 = if (content_size == null) 0 else @as(u8, @intFromBool(src_size >= 256)) +
         @intFromBool(src_size >= 65536 + 256) +
         @intFromBool(src_size >= 0xFFFFFFFF);
-    const fhd: u8 = (@as(u8, @intFromBool(checksum)) << 2) + (@as(u8, @intFromBool(single_segment)) << 5) + (fcs_code << 6);
+    const fhd: u8 = dict_id_size_code + (@as(u8, @intFromBool(checksum)) << 2) + (@as(u8, @intFromBool(single_segment)) << 5) + (fcs_code << 6);
     var pos: usize = 0;
     if (format == .zstd1) {
         std.mem.writeInt(u32, dst[0..4], magic, .little);
@@ -90,6 +108,21 @@ fn writeFrameHeader(dst: []u8, cp: params.CParams, content_size: ?u64, checksum:
     if (!single_segment) {
         dst[pos] = window_log_byte;
         pos += 1;
+    }
+    switch (dict_id_size_code) {
+        0 => {},
+        1 => {
+            dst[pos] = @truncate(dict_id);
+            pos += 1;
+        },
+        2 => {
+            std.mem.writeInt(u16, dst[pos..][0..2], @truncate(dict_id), .little);
+            pos += 2;
+        },
+        else => {
+            std.mem.writeInt(u32, dst[pos..][0..4], dict_id, .little);
+            pos += 4;
+        },
     }
     switch (fcs_code) {
         0 => if (single_segment) {
@@ -126,6 +159,13 @@ fn bitmix(val_in: u64, len: u64) u64 {
     val ^= (val >> 35) +% len;
     val *%= 0x9FB21C651E98DF25;
     return val ^ (val >> 28);
+}
+
+/// The offset table a dictionary gave was valid for the first block's
+/// offsets only; from the next block on it must be checked (libzstd does
+/// this after every block).
+fn offcodeValidToCheck(c: *Ctx) void {
+    if (c.prev.fse.of_repeat == .valid) c.prev.fse.of_repeat = .check;
 }
 
 /// `ZSTD_isRLE`.
@@ -202,6 +242,8 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
     // don't even attempt compression below a certain srcSize
     if (block.len < min_cblock_size + block_header_size + 1 + 1) return false;
     c.ss.reset();
+    // required for optimal parser to read stats from dictionary
+    if (c.ms.opt) |st| st.symbol_costs = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
     const istart = c.index(block);
     // limited update after a very long match
     if (istart > c.ms.next_to_update + 384)
@@ -230,6 +272,7 @@ fn compressBlock(c: *Ctx, dst: []u8, block: []const u8) usize {
         }
         if (c_size > 1) std.mem.swap(*BlockState, &c.prev, &c.next);
     }
+    offcodeValidToCheck(c);
     return c_size;
 }
 
@@ -264,6 +307,7 @@ fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: 
     } else {
         d_rep.* = d_rep_original;
     }
+    offcodeValidToCheck(c);
     return emitBlock(out, src, c_seqs_size, last_block);
 }
 
@@ -271,6 +315,7 @@ fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: 
 /// sub-blocks of about `targetCBlockSize` compressed bytes each
 /// (`superblock.zig`), else as one raw block. Returns the bytes written.
 fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usize {
+    defer offcodeValidToCheck(c);
     if (buildSeqStore(c, src)) {
         // We don't want to emit our first block as a RLE even if it
         // qualifies because doing so will cause the decoder (cli only) to
@@ -302,7 +347,10 @@ fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block
 /// more blocks. Returns the bytes written, headers included.
 fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usize {
     const block_size = src.len;
-    if (!buildSeqStore(c, src)) return emitBlock(out, src, 0, last_block);
+    if (!buildSeqStore(c, src)) {
+        offcodeValidToCheck(c);
+        return emitBlock(out, src, 0, last_block);
+    }
 
     const prev: blocksplit.Entropy = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
     const next: blocksplit.Entropy = .{ .huf = &c.next.huf, .fse = &c.next.fse };
@@ -353,6 +401,69 @@ pub const Options = struct {
     /// window made. The output does not show them -- a correction only drops
     /// indices outside the window -- so this is how a test knows they ran.
     overflow_corrections: ?*[2]u32 = null,
+    /// The dictionary, as libzstd has it set on the context before
+    /// `ZSTD_compress2` / `ZSTD_compressStream2`.
+    dict: Dict = .none,
+};
+
+/// A dictionary for a frame: libzstd's `ZSTD_CCtx_loadDictionary_advanced`,
+/// `ZSTD_CCtx_refCDict` and `ZSTD_CCtx_refPrefix_advanced`.
+pub const Dict = union(enum) {
+    none,
+    /// Digested into a `CDict` of the context's own, with the frame's
+    /// parameters (`ZSTD_initLocalDict`), then used as `cdict` is -- except
+    /// that its level stays the frame's.
+    raw: RawDict,
+    /// A dictionary digested beforehand; its level, if it has one, replaces
+    /// the frame's.
+    cdict: *const CDict,
+    /// Loaded into the context for this frame only, raw by default
+    /// (`ZSTD_CCtx_refPrefix`): the input is compressed as its continuation.
+    prefix: RawDict,
+};
+
+pub const RawDict = struct {
+    bytes: []const u8,
+    content_type: cdict_mod.ContentType = .auto,
+};
+
+/// `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`, `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`:
+/// up to 128 KB of input, or six times the dictionary, a `CDict` is used
+/// with its own tables (attached or copied); above, a CDict with a level is
+/// loaded anew with the input's parameters.
+const use_cdict_params_src_size_cutoff = 128 << 10;
+const use_cdict_params_dict_size_multiplier = 6;
+
+/// `attachDictSizeCutoffs`: per strategy, the input size up to which a
+/// `CDict` is attached rather than copied.
+const attach_dict_size_cutoffs = [10]u64{
+    8 << 10, // unused
+    8 << 10, // ZSTD_fast
+    16 << 10, // ZSTD_dfast
+    32 << 10, // ZSTD_greedy
+    32 << 10, // ZSTD_lazy
+    32 << 10, // ZSTD_lazy2
+    32 << 10, // ZSTD_btlazy2
+    32 << 10, // ZSTD_btopt
+    8 << 10, // ZSTD_btultra
+    8 << 10, // ZSTD_btultra2
+};
+
+/// `ZSTD_shouldAttachDict`: whether a frame of `pledged` bytes
+/// (`unknown_size` when not known) searches `cdict` in place rather than a
+/// copy of its tables.
+pub fn shouldAttachDict(cdict: *const CDict, adv: params.Advanced, pledged: u64) bool {
+    const cutoff = attach_dict_size_cutoffs[@intFromEnum(cdict.ms.cp.strategy)];
+    return (pledged <= cutoff or pledged == params.unknown_size or adv.force_attach_dict == .attach) and
+        adv.force_attach_dict != .copy and
+        !adv.force_max_window; // dictMatchState isn't correctly handled in _enforceMaxDist
+}
+
+/// The frame parameters of `ZSTD_compress_usingCDict_advanced`.
+pub const FrameParams = struct {
+    content_size: bool = true,
+    checksum: bool = false,
+    dict_id: bool = true,
 };
 
 /// One-shot frame on a fresh context. `dst.len` must be at least
@@ -474,6 +585,8 @@ pub fn workspaceSize(cp: params.CParams, pledged: ?u64, opts: Options, buffered:
 
 /// `ZSTD_INDEXOVERFLOW_MARGIN`.
 const index_overflow_margin: u32 = 16 << 20;
+/// `ZSTD_CHUNKSIZE_MAX`.
+const chunk_size_max: usize = std.math.maxInt(u32) - match.current_max;
 /// `ZSTD_WORKSPACETOOLARGE_FACTOR`, `ZSTD_WORKSPACETOOLARGE_MAXDURATION`.
 const workspace_too_large_factor = 3;
 const workspace_too_large_max_duration = 128;
@@ -515,6 +628,10 @@ pub const Compressor = struct {
     /// libzstd's; tests read them.
     n_index_resets: u32 = 0,
     n_workspace_allocs: u32 = 0,
+    /// Frames that copied a `CDict`'s tables, and that loaded a dictionary
+    /// into the context. Not libzstd's; tests read them.
+    n_cdict_copies: u32 = 0,
+    n_dict_loads: u32 = 0,
 
     // Set by `begin` for each frame.
     cp: params.CParams = undefined,
@@ -525,6 +642,11 @@ pub const Compressor = struct {
     /// `ZSTD_c_contentSizeFlag`.
     content_size_flag: bool = true,
     format: params.Format = .zstd1,
+    /// `dictID` for the frame header, and `fParams.noDictIDFlag`.
+    dict_id: u32 = 0,
+    no_dict_id: bool = false,
+    /// `dictContentSize`.
+    dict_content_size: usize = 0,
     /// `blockSizeMax`: `min(maxBlockSize, window size)` (128 KB unless
     /// `Advanced.max_block_size` says less), the window shrunk to a known
     /// size.
@@ -572,7 +694,8 @@ pub const Compressor = struct {
         comp.* = undefined;
     }
 
-    /// One whole frame of `src` (`ZSTD_compress2`), on this context.
+    /// One whole frame of `src` (`ZSTD_compress2`, with `opts.dict` set on
+    /// the context), on this context.
     pub fn compressFrame(comp: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
         const bound = compressBound(src.len);
         if (dst.len < bound) return error.NoSpaceLeft;
@@ -580,23 +703,260 @@ pub const Compressor = struct {
         // can decide whether it is stored compressed
         const out = dst[0..bound];
         try opts.advanced.check();
-        const cp = params.getOverridden(opts.level, src.len, opts.advanced);
-        try comp.begin(cp, src.len, opts, false);
+        var local: ?CDict = null;
+        defer if (local) |*l| l.deinit();
+        try comp.initStream2(opts, src.len, null, false, &local);
+        return comp.finishFrame(out, src, opts);
+    }
+
+    fn finishFrame(comp: *Compressor, out: []u8, src: []const u8, opts: Options) usize {
         const n = comp.compressContinue(out, src, true) catch unreachable; // pledged is src.len
         const m = comp.writeEpilogue(out[n..]);
         if (opts.overflow_corrections) |oc| oc.* = .{ comp.c.ms.n_overflow_corrections, if (comp.c.ldm) |ls| ls.n_overflow_corrections else 0 };
         return n + m;
     }
 
+    /// `ZSTD_compress_usingDict`: one frame of `src` with `dict` (raw
+    /// content, or a full dictionary by its magic number) loaded into the
+    /// context, at `level` with every other parameter at its default, sized
+    /// for the input and the dictionary together.
+    pub fn compressUsingDict(comp: *Compressor, dst: []u8, src: []const u8, dict: []const u8, level: i32) Error!usize {
+        const bound = compressBound(src.len);
+        if (dst.len < bound) return error.NoSpaceLeft;
+        const cp = params.getInternal(level, src.len, dict.len, .no_attach_dict);
+        const opts: Options = .{ .level = if (level == 0) params.default_level else level, .checksum = false };
+        try comp.beginInternal(.{ .bytes = dict }, null, cp, src.len, opts, false);
+        return comp.finishFrame(dst[0..bound], src, opts);
+    }
+
+    /// `ZSTD_compress_usingCDict_advanced`: one frame of `src` with
+    /// `cdict`, with its parameters (and the window widened to the input,
+    /// up to 512 KB) for inputs up to 128 KB or six times the dictionary,
+    /// else -- a CDict with a level -- the level's for the input size and
+    /// the dictionary loaded anew. Every other parameter at its default.
+    pub fn compressUsingCDict(comp: *Compressor, dst: []u8, src: []const u8, cdict: *const CDict, fp: FrameParams) Error!usize {
+        const bound = compressBound(src.len);
+        if (dst.len < bound) return error.NoSpaceLeft;
+        const pledged: u64 = src.len;
+        const dict_size: u64 = cdict.content.len;
+        var cp = if (pledged < use_cdict_params_src_size_cutoff or pledged < dict_size * use_cdict_params_dict_size_multiplier or
+            cdict.compression_level == 0)
+            cdict.ms.cp
+        else
+            // ZSTD_getCParams: a size of 0 is unknown (not reachable here)
+            params.getInternal(cdict.compression_level, pledged, dict_size, .unknown);
+        // ZSTD_CCtxParams_init_internal resolves the switches on these
+        // parameters, before the window grows below
+        var adv: params.Advanced = .{ .content_size = fp.content_size, .dict_id_flag = fp.dict_id };
+        adv.row_match_finder = resolved(params.resolveRowMatchFinder(.auto, cp));
+        adv.split_after_sequences = resolved(params.resolveSplitAfterSequences(.auto, cp));
+        adv.long_distance_matching = resolved(ldm.resolve(.auto, cp));
+        // Increase window log to fit the entire dictionary and source if the
+        // source size is known. Limit the increase to 19, which is the
+        // window log for compression level 1 with the largest source size.
+        {
+            const limited_src_size: u32 = @intCast(@min(pledged, 1 << 19));
+            const limited_src_log: u32 = if (limited_src_size > 1) std.math.log2_int(u32, limited_src_size - 1) + 1 else 1;
+            cp.window_log = @max(cp.window_log, limited_src_log);
+        }
+        const opts: Options = .{ .level = cdict.compression_level, .checksum = fp.checksum, .advanced = adv };
+        try comp.beginInternal(null, cdict, cp, src.len, opts, false);
+        return comp.finishFrame(dst[0..bound], src, opts);
+    }
+
+    fn resolved(on: bool) params.Switch {
+        return if (on) .enable else .disable;
+    }
+
+    /// `ZSTD_CCtx_init_compressStream2` (single-threaded): the frame's
+    /// parameters from its pledged size (else the size hint) and the
+    /// dictionary's size, then `ZSTD_compressBegin_internal`. `local` holds
+    /// the context's own `CDict` for a `.raw` dictionary, made on first use
+    /// and kept by the caller for the frames after.
+    pub fn initStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, buffered: bool, local: *?CDict) BeginError!void {
+        const adv = opts.advanced;
+        var level = opts.level;
+        var cdict: ?*const CDict = null;
+        var prefix: ?RawDict = null;
+        switch (opts.dict) {
+            .none => {},
+            // 0 bytes are no dictionary (ZSTD_CCtx_loadDictionary, refPrefix)
+            .raw => |r| if (r.bytes.len != 0) {
+                if (local.* == null) {
+                    const gpa = comp.gpa orelse return error.OutOfMemory;
+                    local.* = try CDict.initReference(gpa, r.bytes, .{ .level = level, .content_type = r.content_type, .advanced = adv, .src_size_hint = size_hint });
+                }
+                cdict = &local.*.?;
+            },
+            .cdict => |c| {
+                // Let the cdict's compression level take priority over the
+                // requested params (not the context's own CDict's).
+                cdict = c;
+                level = c.compression_level;
+            },
+            .prefix => |p| if (p.bytes.len != 0) {
+                prefix = p;
+            },
+        }
+        const dict_size: u64 = if (prefix) |p| p.bytes.len else if (cdict) |c| c.content.len else 0;
+        const mode: params.CParamMode = if (cdict) |c| (if (shouldAttachDict(c, adv, pledged orelse params.unknown_size)) .attach_dict else .no_attach_dict) else .no_attach_dict;
+        const size: u64 = pledged orelse if (size_hint) |h| h else params.unknown_size;
+        const cp = params.getFromCCtxParams(level, size, dict_size, mode, adv);
+        var o = opts;
+        o.level = level;
+        try comp.beginInternal(prefix, cdict, cp, pledged, o, buffered);
+    }
+
+    /// `ZSTD_compressBegin_internal`: set the context up for a frame with
+    /// the dictionary `dict` (loaded into it) or `cdict` (its tables
+    /// attached or copied -- or, for a large input and a CDict with a
+    /// level, its content loaded anew).
+    pub fn beginInternal(comp: *Compressor, dict: ?RawDict, cdict: ?*const CDict, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) BeginError!void {
+        const adv = opts.advanced;
+        const dict_content_size: usize = if (cdict) |c| c.content.len else if (dict) |d| d.bytes.len else 0;
+        const p = pledged orelse params.unknown_size;
+        if (cdict) |c| if (c.content.len > 0 and
+            (p < use_cdict_params_src_size_cutoff or p < @as(u64, c.content.len) * use_cdict_params_dict_size_multiplier or
+                p == params.unknown_size or c.compression_level == 0) and
+            adv.force_attach_dict != .load)
+        {
+            // ZSTD_resetCCtx_usingCDict
+            if (shouldAttachDict(c, adv, p)) return comp.resetByAttachingCDict(c, cp, pledged, opts, buffered);
+            return comp.resetByCopyingCDict(c, cp, pledged, opts, buffered);
+        };
+        try comp.begin(cp, pledged, opts, buffered, .{ .loaded_dict_size = dict_content_size });
+        const d: RawDict = if (cdict) |c| .{ .bytes = c.content, .content_type = c.content_type } else dict orelse .{ .bytes = &.{} };
+        if (d.bytes.len >= 8 or d.content_type == .full) comp.n_dict_loads += 1;
+        comp.dict_id = try cdict_mod.insertDictionary(comp.c.prev, &comp.c.ms, comp.c.ldm, d.bytes, d.content_type, .fast, .for_cctx, .{
+            .no_dict_id = !adv.dict_id_flag,
+            .force_window = adv.force_max_window,
+            .deterministic_ref_prefix = adv.deterministic_ref_prefix,
+            .overflow_correct_frequently = opts.overflow_correct_frequently,
+        });
+        comp.dict_content_size = dict_content_size;
+    }
+
+    /// The switches libzstd resolved on the frame's parameters `cp`, before
+    /// a CDict's replaced them: `ZSTD_CCtx_init_compressStream2` resolves
+    /// them first.
+    fn resolvedOn(opts: Options, cp: params.CParams, use_row: bool) Options {
+        var o = opts;
+        o.advanced.split_after_sequences = resolved(params.resolveSplitAfterSequences(opts.advanced.split_after_sequences, cp));
+        o.advanced.long_distance_matching = resolved(ldm.resolve(opts.advanced.long_distance_matching, cp));
+        o.advanced.row_match_finder = resolved(use_row);
+        return o;
+    }
+
+    /// `ZSTD_resetCCtx_byCopyingCDict`: the CDict's parameters but for the
+    /// window log, and a copy of its tables (untagged), window, entropy
+    /// tables and repcodes.
+    fn resetByCopyingCDict(comp: *Compressor, cdict: *const CDict, cp_frame: params.CParams, pledged: ?u64, opts: Options, buffered: bool) BeginError!void {
+        const cdict_cp = cdict.ms.cp;
+        // Copy only compression parameters related to tables.
+        var cp = cdict_cp;
+        cp.window_log = cp_frame.window_log;
+        try comp.begin(cp, pledged, resolvedOn(opts, cp_frame, cdict.use_row), buffered, .{ .leave_dirty = true });
+        const ms = &comp.c.ms;
+        std.debug.assert(ms.use_row == cdict.use_row);
+        // copy tables
+        copyCDictTable(ms.hash_table, cdict.ms.hash_table, cdict_cp);
+        // Do not copy cdict's chainTable if cctx has parameters such that it
+        // would not use chainTable (it has the CDict's size when it does)
+        std.debug.assert(ms.chain_table.len == cdict.ms.chain_table.len);
+        copyCDictTable(ms.chain_table, cdict.ms.chain_table, cdict_cp);
+        // copy tag table
+        if (cdict.use_row) {
+            @memcpy(ms.tag_table, cdict.ms.tag_table);
+            ms.hash_salt = cdict.ms.hash_salt;
+        }
+        // Zero the hashTable3, since the cdict never fills it
+        @memset(ms.hash_table3, 0);
+        // copy dictionary offsets
+        ms.src = cdict.ms.src;
+        ms.src_base = cdict.ms.src_base;
+        ms.dict = cdict.ms.dict;
+        ms.dict_base = cdict.ms.dict_base;
+        ms.low_limit = cdict.ms.low_limit;
+        ms.dict_limit = cdict.ms.dict_limit;
+        ms.n_overflow_corrections = cdict.ms.n_overflow_corrections;
+        ms.next_to_update = cdict.ms.next_to_update;
+        ms.loaded_dict_end = cdict.ms.loaded_dict_end;
+        comp.dict_id = cdict.dict_id;
+        comp.dict_content_size = cdict.content.len;
+        // copy block state
+        comp.c.prev.* = cdict.block_state;
+        comp.n_cdict_copies += 1;
+    }
+
+    /// `ZSTD_copyCDictTableIntoCCtx`: a `fast`/`dfast` CDict's entries lose
+    /// their tag.
+    fn copyCDictTable(dst: []u32, src: []const u32, cdict_cp: params.CParams) void {
+        if (params.cdictIndicesAreTagged(cdict_cp)) {
+            for (dst, src) |*d, t| d.* = t >> params.short_cache_tag_bits;
+        } else @memcpy(dst, src);
+    }
+
+    /// `ZSTD_resetCCtx_byAttachingCDict`: parameters for the input alone
+    /// (the CDict keeps its own tables), and the CDict's match state
+    /// attached below the window (`MatchState.dict_match_state`), which the
+    /// match finders' `dictMatchState` variants search. Refused
+    /// (`error.DictAttachUnsupported`) until the CDict's strategy has them
+    /// (`match.hasDictMatchStateVariant`); the rest is libzstd's attach,
+    /// ready for them.
+    fn resetByAttachingCDict(comp: *Compressor, cdict: *const CDict, cp_frame: params.CParams, pledged: ?u64, opts: Options, buffered: bool) BeginError!void {
+        if (!match.hasDictMatchStateVariant(cdict.ms.cp.strategy)) return error.DictAttachUnsupported;
+        const use_row_frame = params.resolveRowMatchFinder(opts.advanced.row_match_finder, cp_frame);
+        // Resize working context table params for input only, since the
+        // dict has its own tables.
+        var cp = params.adjustInternal(cdict.ms.cp, pledged orelse params.unknown_size, cdict.content.len, .attach_dict, resolved(use_row_frame));
+        cp.window_log = cp_frame.window_log;
+        try comp.begin(cp, pledged, resolvedOn(opts, cp_frame, cdict.use_row), buffered, .{});
+        const ms = &comp.c.ms;
+        const cdict_end: u32 = @intCast(cdict.ms.src_base + cdict.ms.src.len);
+        const cdict_len = cdict_end - cdict.ms.dict_limit;
+        if (cdict_len != 0) { // don't even attach dictionaries with no contents
+            ms.dict_match_state = &cdict.ms;
+            // prep working match state so dict matches never have negative
+            // indices when they are translated to the working context's
+            // index space: the window starts (empty) at the CDict's end
+            if (ms.dict_limit < cdict_end) {
+                ms.src = ms.src[ms.src.len..];
+                ms.src_base = cdict_end;
+                ms.low_limit = cdict_end; // ZSTD_window_clear
+                ms.dict_limit = cdict_end;
+            }
+            // loadedDictEnd is expressed within the referential of the
+            // active context
+            ms.loaded_dict_end = ms.dict_limit;
+        }
+        comp.dict_id = cdict.dict_id;
+        comp.dict_content_size = cdict.content.len;
+        // copy block state
+        comp.c.prev.* = cdict.block_state;
+    }
+
+    /// How `begin` treats the tables (`ZSTD_resetCCtx_internal`'s
+    /// `loadedDictSize` and `ZSTD_compResetPolicy_e`).
+    pub const Reset = struct {
+        /// A dictionary about to be loaded; over `ZSTD_CHUNKSIZE_MAX` it
+        /// restarts indexing.
+        loaded_dict_size: usize = 0,
+        /// `ZSTDcrp_leaveDirty`: the tables are about to be overwritten.
+        leave_dirty: bool = false,
+    };
+
     /// `ZSTD_resetCCtx_internal`: set the context up for a frame with
     /// parameters `cp` (the level's, sized for `pledged`), resizing the
     /// workspace if it is too small or has long been three times too big.
     /// `buffered` adds a stream's input and output buffers.
-    pub fn begin(comp: *Compressor, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool) error{OutOfMemory}!void {
+    pub fn begin(comp: *Compressor, cp: params.CParams, pledged: ?u64, opts: Options, buffered: bool, reset: Reset) error{OutOfMemory}!void {
         const l = Layout.compute(cp, pledged, opts, buffered);
 
         const ms_old = comp.c.ms;
-        var index_reset = !comp.initialized or ms_old.src_base + ms_old.src.len > comp.index_too_close;
+        // ZSTD_dictTooBig: a dictionary larger than ZSTD_CHUNKSIZE_MAX is
+        // loaded from index 0, as much of it as fits
+        const dict_too_big = reset.loaded_dict_size > chunk_size_max;
+        var index_reset = !comp.initialized or ms_old.src_base + ms_old.src.len > comp.index_too_close or dict_too_big;
 
         // ZSTD_cwksp_bump_oversized_duration, ZSTD_cwksp_check_wasteful
         const available = comp.ws.len - comp.ws_used;
@@ -624,7 +984,8 @@ pub const Compressor = struct {
         const tables_bytes = l.tablesBytes();
         const tables = slice(u32, ws, 0, l.hash_len + l.chain_len + l.hash3_len);
         if (index_reset) comp.tables_valid = 0;
-        if (comp.tables_valid < tables_bytes) @memset(ws[comp.tables_valid..tables_bytes], 0);
+        // (left dirty, they are overwritten whole right after)
+        if (comp.tables_valid < tables_bytes and !reset.leave_dirty) @memset(ws[comp.tables_valid..tables_bytes], 0);
         comp.tables_valid = tables_bytes;
         const tag_table = slice(u8, ws, l.tag, if (l.row) l.hash_len else 0);
         if (l.row) {
@@ -671,6 +1032,9 @@ pub const Compressor = struct {
         comp.pledged = pledged;
         comp.content_size_flag = adv.content_size;
         comp.format = adv.format;
+        comp.dict_id = 0;
+        comp.no_dict_id = !adv.dict_id_flag;
+        comp.dict_content_size = 0;
         comp.block_size_max = l.block_size_max;
         comp.stage = .init;
         comp.consumed = 0;
@@ -731,6 +1095,8 @@ pub const Compressor = struct {
             ms.next_to_update = end;
             ms.n_overflow_corrections = ms_old.n_overflow_corrections;
         }
+        // `forceNonContiguous` is libzstd's until the next chunk consumes it
+        ms.force_non_contiguous = ms_old.force_non_contiguous;
         comp.initialized = true;
     }
 
@@ -747,13 +1113,16 @@ pub const Compressor = struct {
     pub fn compressContinue(comp: *Compressor, dst: []u8, chunk: []const u8, last_chunk: bool) SizeError!usize {
         var fh_size: usize = 0;
         if (comp.stage == .init) {
-            fh_size = writeFrameHeader(dst, comp.cp, comp.headerContentSize(comp.pledged), comp.checksum, comp.format);
+            fh_size = writeFrameHeader(dst, comp.cp, comp.headerContentSize(comp.pledged), comp.checksum, comp.format, comp.dict_id, comp.no_dict_id);
             comp.stage = .ongoing;
         }
         if (chunk.len == 0) return fh_size; // do not generate an empty block if no input
 
         const ms = &comp.c.ms;
-        if (!ms.windowUpdate(chunk)) ms.next_to_update = ms.dict_limit;
+        if (!ms.windowUpdate(chunk, ms.force_non_contiguous)) {
+            ms.force_non_contiguous = false;
+            ms.next_to_update = ms.dict_limit;
+        }
         if (comp.c.ldm) |ls| ls.windowUpdate(chunk);
 
         const c_size = comp.frameChunk(dst[fh_size..], chunk, last_chunk);
@@ -779,6 +1148,7 @@ pub const Compressor = struct {
 
             const bi = c.index(block);
             _ = c.ms.overflowCorrectIfNeeded(comp.overflow_correct_frequently, bi, @as(usize, bi) + block_size);
+            c.ms.checkDictValidity(c.index(block) + @as(u32, @intCast(block_size)));
             c.ms.enforceMaxDist(c.index(block));
             // Ensure hash/chain table insertion resumes no sooner than lowlimit
             if (c.ms.next_to_update < c.ms.low_limit) c.ms.next_to_update = c.ms.low_limit;
@@ -809,8 +1179,8 @@ pub const Compressor = struct {
     pub fn writeEpilogue(comp: *Compressor, dst: []u8) usize {
         var op: usize = 0;
         if (comp.stage == .init) {
-            // special case: empty frame
-            op += writeFrameHeader(dst, comp.cp, comp.headerContentSize(0), comp.checksum, comp.format);
+            // special case: empty frame (libzstd passes dictID 0 here)
+            op += writeFrameHeader(dst, comp.cp, comp.headerContentSize(0), comp.checksum, comp.format, 0, comp.no_dict_id);
             comp.stage = .ongoing;
         }
         if (comp.stage != .ending) {

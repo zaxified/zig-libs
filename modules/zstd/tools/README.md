@@ -7,12 +7,13 @@ which a module must never require (`CONVENTIONS.md` §9). Neither is wired into
 
 | file | kind (§9) | what it answers |
 |---|---|---|
-| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits; `src/testdata/stream_goldens.zig`, the same for every `corpus.stream_cases` schedule through `zstream`; and `src/testdata/param_goldens.zig`, for every `corpus.param_cases` entry with its advanced parameters through `zref`. |
+| `gen-goldens.sh` + `dump_corpus.zig` | **recipe** for committed goldens | Writes `src/testdata/goldens.zig`: for every case in `src/testdata/corpus.zig`, level and checksum setting, the length and SHA-256 of the frame libzstd emits; `src/testdata/stream_goldens.zig`, the same for every `corpus.stream_cases` schedule through `zstream`; `src/testdata/param_goldens.zig`, for every `corpus.param_cases` entry with its advanced parameters through `zref`; and `src/testdata/cdict_goldens.zig`, for every `corpus.dict_cases` entry through `zref` or `zstream` with its dictionary (both decode each frame back with it; exit 8 if that fails). |
 | `zstream.c` | **differential oracle** (streaming) | Compresses any file with `ZSTD_compressStream2` following a call schedule (`p` pledge, `w` window log, `o` output buffer size, `c`/`f`/`e` continue/flush/end with the next N bytes, `x` frequent overflow correction, `name=value` an advanced parameter by libzstd's name); `stream_test.zig` parses the same schedules. The recipe uses it for `src/testdata/stream_goldens.zig` and builds it a second time as `zstream-ocf`. |
 | `zdec.c` | **differential oracle** (decoder) | Decompresses any file with libzstd — mode 0 one-shot `ZSTD_decompressDCtx` into `ZSTD_decompressBound` bytes (the capacity `Decompressor` gets from the same query), mode 1 streaming with window log max 31, whole input at once (libzstd then takes its single-pass shortcut), mode 2 streaming one input byte per call into a 997-byte output buffer (no shortcut: the plan `DecompressStream` is compared under) — and prints `OK <size> <fnv1a64>` or `ERR <ZSTD_ErrorCode>`, so a run of both decoders over valid and damaged frames compares output, acceptance and error class. With a repetition count it times the decode alone. Pair it with libzstd's own `tests/decodecorpus` (`make -C "$R/tests" decodecorpus`), which writes random valid frames that reach every decoder path, and their contents. |
 | `zreuse.c` | **differential oracle** (context reuse) | Compresses random slices of a file at random levels and parameters, one-shot and streaming, on a reused `ZSTD_CCtx` and on a fresh one, and reports any frame that differs. The golden tests run every frame through one reused context against fresh-context goldens, which is sound only while libzstd answers "no difference" (SPEC.md, *Contexts*: 1 960 frames, none, on v1.5.7); re-run it when the pinned version changes. |
 | `gen-dict-goldens.sh` + `dump_samples.zig` | **recipe** for committed goldens | Writes `src/testdata/dict_goldens.zig`: for every run in `src/testdata/dict_samples.zig` (`runs`: a sample set, cover or fastCover, capacity, k, d, f, accel, split point), the length and SHA-256 of the dictionary content libzstd's trainer picks before finalization and its small-corpus verdict, or the error it refuses with -- through `ztrain`. |
 | `ztrain.c` | **differential oracle** (dictionary training) | The content libzstd's cover or fastCover trainer places in the dictionary buffer before `ZDICT_finalizeDictionary` (`OK <size> <small corpus 0|1>`, the content to a file) or `ERR <ZSTD_ErrorCode>`, for any sample set (u32 count, u32 sizes, samples) and parameters. The public trainers finalize, and finalization drops the content's tail to make room for the header, so `ztrain` `#include`s `cover.c` or `fastcover.c` and calls their internal steps in `ZDICT_trainFromBuffer_*`'s order; a split point below 1 gives the candidate `ZDICT_optimizeTrainFromBuffer_*` builds for that (k, d). Checked against the public trainers: the finalized dictionaries carry the same content's kept head. Built twice (`ztrain-cover`, `ztrain-fastcover`): `cover.h` has no include guard. |
+| `zdtrain.c` | **recipe** (dictionaries) | Trains a zstd dictionary with `ZDICT_trainFromBuffer` (fastCover, one thread: deterministic) on sample files; `gen-goldens.sh` uses it for the committed `src/testdata/*.zdict` that `dict_test.zig` embeds, on the samples `dump_corpus.zig` writes (`corpus.train_sets`). |
 | `zref.c` | **differential oracle** | Compresses any file the way this module does (one-shot `ZSTD_compress2`, content size on, optional checksum), so any input can be compared, not only the corpus. Optional arguments: the strategy (`ZSTD_c_strategy`), LDM by hand, the window log (`ZSTD_c_windowLog`), and a `name=value` list of any advanced parameter (`zstd.Advanced`). Built a second time with `-DZSTD_WINDOW_OVERFLOW_CORRECT_FREQUENTLY=1` (`zref-ocf`), it is the reference for frequent index-overflow correction. |
 
 ## The reference they need
@@ -110,6 +111,31 @@ A correction only drops indices that have left the window, so the frame is
 the same as without it: the test also reads `frame.Options.
 overflow_corrections` to know the correction ran. The real threshold is
 checked by comparing a > 3500 MiB input with plain `zref`.
+
+## Comparing with a dictionary
+
+`zref`'s ninth argument (and `zstream`'s sixth) is `<mode>:<content
+type>:<file>`: the dictionary and how it is set — `load`
+(`ZSTD_CCtx_loadDictionary_advanced`, the module's `.raw`), `cdict`
+(`ZSTD_createCDict` at the level, `CDict.init`), `cdictadv`
+(`ZSTD_createCDict_advanced2` with the level and the parameters,
+`CDict.initAdvanced`), `prefix` (`ZSTD_CCtx_refPrefix_advanced`), and for
+`zref` only `prefixadj` (the input placed right after the prefix in
+memory), `usingdict` (`ZSTD_compress_usingDict`) and `usingcdict`
+(`ZSTD_compress_usingCDict_advanced`, frame flags from the checksum
+argument and `contentSizeFlag` / `dictIDFlag` in the parameters); content
+type 0 auto, 1 raw, 2 full. The parameter names include `dictIDFlag`,
+`forceAttachDict` (0 default, 1 attach, 2 copy, 3 load), `deterministicRefPrefix`
+and `forceMaxWindow`:
+
+    "$R/zref" 3 0 in.bin ref.zst 0 0 0 forceAttachDict=2 cdict:0:words.zdict
+    # module side: var cd = try zstd.CDict.init(gpa, dict, 3);
+    #   c.compress(..., .{ .level = 3, .advanced = .{ .force_attach_dict = .copy },
+    #       .dictionary = .{ .cdict = &cd } })
+
+Where libzstd attaches the dictionary (small inputs, unknown sizes) the
+module refuses for now (`error.DictAttachUnsupported`); `forceAttachDict=2`
+(copy) or `3` (load) reach the other paths at any size.
 
 ## Comparing a stream
 

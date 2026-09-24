@@ -170,7 +170,6 @@ pub fn rowLog(cp: CParams) u32 {
     return std.math.clamp(cp.search_log, 4, 6);
 }
 
-/// `ZSTD_adjustCParams_internal` for a known source size and no dictionary.
 /// `ZSTD_cycleLog`: the binary-tree strategies keep two entries per position.
 pub fn cycleLog(cp: CParams) u32 {
     return cp.chain_log - @intFromBool(@intFromEnum(cp.strategy) >= @intFromEnum(Strategy.btlazy2));
@@ -180,38 +179,98 @@ pub fn cycleLog(cp: CParams) u32 {
 /// selects the table for inputs over 256 KB and shrinks nothing.
 pub const unknown_size: u64 = std.math.maxInt(u64);
 
-fn adjust(cp_in: CParams, src_size: u64) CParams {
-    return adjustFor(cp_in, src_size, true);
+/// `ZSTD_CParamMode_e`: how the dictionary size takes part in choosing the
+/// parameters.
+pub const CParamMode = enum {
+    /// `ZSTD_cpm_unknown` (`ZSTD_getCParams`, `ZSTD_adjustCParams`).
+    unknown,
+    /// `ZSTD_cpm_noAttachDict`: the dictionary goes into the window (loaded,
+    /// copied, or a prefix), so the window and tables must cover both.
+    no_attach_dict,
+    /// `ZSTD_cpm_attachDict`: the dictionary keeps its own tables; the
+    /// parameters are for the input alone.
+    attach_dict,
+    /// `ZSTD_cpm_createCDict`: a CDict's own parameters; an unknown input
+    /// size counts as small (513 bytes).
+    create_cdict,
+};
+
+/// `ZSTD_dictAndWindowLog`: a window log covering the dictionary and the
+/// window, for sizing the hash and chain tables (`src_size` is known).
+fn dictAndWindowLog(window_log: u32, src_size: u64, dict_size: u64) u32 {
+    if (dict_size == 0) return window_log; // No dictionary ==> No change
+    const window_size: u64 = @as(u64, 1) << @intCast(window_log);
+    const dict_and_window_size = dict_size +% window_size;
+    // the window already fits both the source and the dictionary
+    if (window_size >= dict_size +% src_size) return window_log;
+    if (dict_and_window_size >= @as(u64, 1) << window_log_max) return window_log_max;
+    return highbit32(@intCast(dict_and_window_size - 1)) + 1;
 }
 
-/// `ZSTD_adjustCParams_internal`; `row_possible` false when the row match
-/// finder is switched off, which lifts its cap on the hash log.
-fn adjustFor(cp_in: CParams, src_size: u64, row_possible: bool) CParams {
+/// `ZSTD_CDictIndicesAreTagged`: a CDict for `fast` and `dfast` keeps an
+/// 8-bit tag in the low bits of each table entry ("short cache").
+pub fn cdictIndicesAreTagged(cp: CParams) bool {
+    return cp.strategy == .fast or cp.strategy == .dfast;
+}
+
+/// `ZSTD_SHORT_CACHE_TAG_BITS`.
+pub const short_cache_tag_bits = 8;
+
+/// `ZSTD_adjustCParams_internal`: shrink `cp_in` to an input of `src_size`
+/// bytes (`unknown_size` when not known) and a dictionary of `dict_size`
+/// bytes. `row_mode` is the row match finder switch: only `.disable` lifts
+/// its cap on the hash log, since libzstd assumes it may be used here.
+pub fn adjustInternal(cp_in: CParams, src_size_in: u64, dict_size_in: u64, mode: CParamMode, row_mode: Switch) CParams {
     var cp = cp_in;
+    var src_size = src_size_in;
+    var dict_size = dict_size_in;
+    const min_src_size: u64 = 513; // (1<<9) + 1
     const max_window_resize: u64 = @as(u64, 1) << (window_log_max - 1);
+    switch (mode) {
+        // If we don't know the source size, don't make any assumptions
+        // about it: smaller parameters are already chosen for a dictionary.
+        .unknown, .no_attach_dict => {},
+        // Assume a small source size when creating a dictionary with an
+        // unknown source size.
+        .create_cdict => if (dict_size != 0 and src_size == unknown_size) {
+            src_size = min_src_size;
+        },
+        // The dictionary has its own parameters, already chosen: these are
+        // for the source only.
+        .attach_dict => dict_size = 0,
+    }
     // resize windowLog if input is small enough, to use less memory
-    if (src_size <= max_window_resize) {
-        const t_size: u32 = @intCast(src_size);
+    if (src_size <= max_window_resize and dict_size <= max_window_resize) {
+        const t_size: u32 = @truncate(src_size + dict_size);
         const hash_size_min: u32 = 1 << hash_log_min;
         const src_log: u32 = if (t_size < hash_size_min) hash_log_min else highbit32(t_size - 1) + 1;
         if (cp.window_log > src_log) cp.window_log = src_log;
     }
     if (src_size != unknown_size) {
-        // no dictionary: dictAndWindowLog == windowLog
-        const dict_and_window_log = cp.window_log;
+        const dict_and_window_log = dictAndWindowLog(cp.window_log, src_size, dict_size);
         const cycle_log = cycleLog(cp);
         if (cp.hash_log > dict_and_window_log + 1) cp.hash_log = dict_and_window_log + 1;
         if (cycle_log > dict_and_window_log) cp.chain_log -= (cycle_log - dict_and_window_log);
     }
     if (cp.window_log < window_log_absolute_min) cp.window_log = window_log_absolute_min;
+    // A CDict's tagged tables keep 8 bits of each entry for the tag.
+    if (mode == .create_cdict and cdictIndicesAreTagged(cp)) {
+        const max_short_cache_hash_log = 32 - short_cache_tag_bits;
+        if (cp.hash_log > max_short_cache_hash_log) cp.hash_log = max_short_cache_hash_log;
+        if (cp.chain_log > max_short_cache_hash_log) cp.chain_log = max_short_cache_hash_log;
+    }
     // The row match finder hashes hashLog - rowLog + 8 bits into 32. libzstd
     // assumes it is in use here, before the window size decides, unless it
     // is switched off.
-    if (row_possible and rowMatchFinderSupported(cp.strategy)) {
+    if (row_mode != .disable and rowMatchFinderSupported(cp.strategy)) {
         const max_hash_log = 32 - row_hash_tag_bits + rowLog(cp);
         if (cp.hash_log > max_hash_log) cp.hash_log = max_hash_log;
     }
     return cp;
+}
+
+fn adjust(cp_in: CParams, src_size: u64) CParams {
+    return adjustInternal(cp_in, src_size, 0, .no_attach_dict, .auto);
 }
 
 /// The largest input of each of the parameter tables' size classes but
@@ -219,18 +278,33 @@ fn adjustFor(cp_in: CParams, src_size: u64, row_possible: bool) CParams {
 /// grow with the size.
 pub const size_class_bounds = [_]u64{ 16 * 1024, 128 * 1024, 256 * 1024 };
 
+/// `ZSTD_getCParamRowSize`: the size that picks the table.
+fn rowSize(src_size_hint: u64, dict_size_in: u64, mode: CParamMode) u64 {
+    const dict_size = if (mode == .attach_dict) 0 else dict_size_in;
+    const unknown = src_size_hint == unknown_size;
+    const added_size: u64 = if (unknown and dict_size > 0) 500 else 0;
+    return if (unknown and dict_size == 0) unknown_size else src_size_hint +% dict_size +% added_size;
+}
+
+/// `ZSTD_getCParams_internal(level, srcSizeHint, dictSize, mode)`. `level`
+/// must be at most `max_level`; 0 means the default level.
+pub fn getInternal(level: i32, src_size_hint: u64, dict_size: u64, mode: CParamMode) CParams {
+    std.debug.assert(level <= max_level);
+    const r_size = rowSize(src_size_hint, dict_size, mode);
+    const table_id: usize = @as(usize, @intFromBool(r_size <= 256 * 1024)) +
+        @intFromBool(r_size <= 128 * 1024) +
+        @intFromBool(r_size <= 16 * 1024);
+    const r: usize = if (level == 0) default_level else if (level < 0) 0 else @intCast(level);
+    var cp = table[table_id][r];
+    if (level < 0) cp.target_length = @intCast(-@max(min_level, level)); // acceleration factor
+    return adjustInternal(cp, src_size_hint, dict_size, mode, .auto);
+}
+
 /// `ZSTD_getCParams_internal(level, srcSize, 0, ZSTD_cpm_noAttachDict)` as used
 /// by one-shot compression. `level` must be in `min_level..max_level`; 0 means
 /// the default level.
 pub fn get(level: i32, src_size: u64) CParams {
-    std.debug.assert(level <= max_level);
-    const table_id: usize = @as(usize, @intFromBool(src_size <= 256 * 1024)) +
-        @intFromBool(src_size <= 128 * 1024) +
-        @intFromBool(src_size <= 16 * 1024);
-    const r: usize = if (level == 0) default_level else if (level < 0) 0 else @intCast(level);
-    var cp = table[table_id][r];
-    if (level < 0) cp.target_length = @intCast(-@max(min_level, level)); // acceleration factor
-    return adjust(cp, src_size);
+    return getInternal(level, src_size, 0, .no_attach_dict);
 }
 
 /// `ZSTD_getCParamsFromCCtxParams`: the level's parameters (already
@@ -241,7 +315,14 @@ pub fn get(level: i32, src_size: u64) CParams {
 /// knowing whether the row match finder is ruled out. `adv` must have
 /// passed `check`.
 pub fn getOverridden(level: i32, src_size: u64, adv: Advanced) CParams {
-    var cp = get(level, src_size);
+    return getFromCCtxParams(level, src_size, 0, .no_attach_dict, adv);
+}
+
+/// `ZSTD_getCParamsFromCCtxParams` with a dictionary of `dict_size` bytes
+/// used in `mode` (see `getOverridden`). The caller has already put a size
+/// hint in place of an unknown `src_size`.
+pub fn getFromCCtxParams(level: i32, src_size: u64, dict_size: u64, mode: CParamMode, adv: Advanced) CParams {
+    var cp = getInternal(level, src_size, dict_size, mode);
     if (adv.long_distance_matching == .enable) cp.window_log = ldm_default_window_log;
     if (adv.window_log) |v| cp.window_log = v;
     if (adv.hash_log) |v| cp.hash_log = v;
@@ -253,7 +334,7 @@ pub fn getOverridden(level: i32, src_size: u64, adv: Advanced) CParams {
         cp.target_length = v;
     };
     if (adv.strategy) |v| cp.strategy = v;
-    return adjustFor(cp, src_size, adv.row_match_finder != .disable);
+    return adjustInternal(cp, src_size, dict_size, mode, adv.row_match_finder);
 }
 
 /// `ZSTD_ParamSwitch_e`.
@@ -336,6 +417,20 @@ pub const Advanced = struct {
     /// streaming decoder can start sooner; values below 1340 count as 1340.
     /// 0 or null: off.
     target_c_block_size: ?u32 = null,
+    /// `ZSTD_c_dictIDFlag`: write the dictionary's ID into the frame header
+    /// (a full dictionary's; a raw one has none).
+    dict_id_flag: bool = true,
+    /// `ZSTD_c_forceAttachDict`: how a `CDict` gets into the context.
+    force_attach_dict: DictAttachPref = .default,
+    /// `ZSTD_c_deterministicRefPrefix`: always treat a prefix (or a
+    /// dictionary loaded into the context) as a separate segment of the
+    /// window, even when the input follows it in memory, so the output does
+    /// not depend on where the buffers lie.
+    deterministic_ref_prefix: bool = false,
+    /// `ZSTD_c_forceMaxWindow`: a dictionary counts only as far as the
+    /// window reaches (a byte of it no longer keeps all of it valid), and a
+    /// `CDict` is never attached.
+    force_max_window: bool = false,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).
@@ -365,6 +460,21 @@ pub const Advanced = struct {
             !B.in(adv.target_c_block_size, 0, block_size_max_abs))
             return error.ParameterOutOfBound;
     }
+};
+
+/// `ZSTD_dictAttachPref_e`: libzstd picks between attaching a `CDict`'s
+/// tables (for small inputs) and copying them into the context by the
+/// input size and strategy; this overrides the pick.
+pub const DictAttachPref = enum {
+    /// `ZSTD_dictDefaultAttach`: libzstd's choice.
+    default,
+    /// `ZSTD_dictForceAttach`: always attach.
+    attach,
+    /// `ZSTD_dictForceCopy`: always copy the tables.
+    copy,
+    /// `ZSTD_dictForceLoad`: always load the dictionary's content into the
+    /// context anew, as if it were not digested.
+    load,
 };
 
 /// Null for 0, which libzstd's LDM parameters take as "not set".

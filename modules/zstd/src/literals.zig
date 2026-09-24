@@ -58,10 +58,11 @@ pub fn rle(dst: []u8, src: []const u8) usize {
     return fl_size + 1;
 }
 
+/// `ZSTD_minLiteralsToCompress`: 8 bytes for btultra2, twice as many for
+/// each faster strategy up to 64; 6 with a dictionary's table.
 fn minLiteralsToCompress(strategy: u32, repeat: huf.Repeat) usize {
-    _ = repeat; // HUF_repeat_valid (6 bytes) needs a dictionary
     const shift: u6 = @intCast(@min(9 - strategy, 3));
-    return @as(usize, 8) << shift;
+    return if (repeat == .valid) 6 else @as(usize, 8) << shift;
 }
 
 /// `ZSTD_minGain`.
@@ -79,7 +80,7 @@ fn allBytesIdentical(src: []const u8) bool {
 /// state the next block inherits.
 pub fn compress(dst: []u8, src: []const u8, prev: *const HufState, next: *HufState, strategy: u32, disable_literal_compression: bool, suspect_uncompressible: bool) Error!usize {
     const lh_size: usize = 3 + @as(usize, @intFromBool(src.len >= 1024)) + @intFromBool(src.len >= 16 * 1024);
-    const single_stream = src.len < 256;
+    var single_stream = src.len < 256;
     var h_type: u32 = set_compressed;
 
     next.* = prev.*;
@@ -96,6 +97,7 @@ pub fn compress(dst: []u8, src: []const u8, prev: *const HufState, next: *HufSta
             .suspect_uncompressible = suspect_uncompressible,
             .optimal_depth = strategy >= 8, // HUF_OPTIMAL_DEPTH_THRESHOLD: btultra
         };
+        if (repeat == .valid and lh_size == 3) single_stream = true;
         c_lit_size = huf.compress(dst[lh_size..], src, lit_huf_log, if (single_stream) .single else .four, &next.table, &repeat, flags) catch blk: {
             failed = true;
             break :blk 0;

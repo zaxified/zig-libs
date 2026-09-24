@@ -7,9 +7,9 @@
 //!
 //! Encoding-type selection follows both of libzstd's branches: below the
 //! `lazy` strategy it picks by count heuristics, from `lazy` on it prices the
-//! predefined table, the previous block's table and a fresh one. The
-//! "repeat_valid" state that lets the heuristic branch reuse a table comes
-//! only from a dictionary, so it does not arise here.
+//! predefined table, the previous block's table and a fresh one. A
+//! dictionary's tables start out `valid`: the heuristic branch then reuses
+//! them for fewer than 1000 sequences.
 
 const std = @import("std");
 const bitstream = @import("bitstream.zig");
@@ -182,7 +182,9 @@ pub fn mlCode(ml_base: u32) u32 {
 
 pub const EncodingType = enum(u2) { basic = 0, rle = 1, compressed = 2, repeat = 3 };
 
-pub const FseRepeat = enum { none, check };
+/// `FSE_repeat`: `check` when the previous table may lack a symbol,
+/// `valid` for a dictionary's table that has them all.
+pub const FseRepeat = enum { none, check, valid };
 
 /// The three sequence tables a block leaves behind for the next one.
 pub const FseTables = struct {
@@ -291,6 +293,8 @@ fn selectEncodingType(repeat_mode: *FseRepeat, counts: []const u32, max: u32, mo
             const mult = 10 - strategy;
             const base_log = 3;
             const dynamic_fse_nb_seq_min = ((@as(usize, 1) << @intCast(default_norm_log)) * mult) >> base_log;
+            const static_fse_nb_seq_max = 1000;
+            if (repeat_mode.* == .valid and n_seq < static_fse_nb_seq_max) return .repeat;
             if (n_seq < dynamic_fse_nb_seq_min or most_frequent < (n_seq >> @intCast(default_norm_log - 1))) {
                 repeat_mode.* = .none;
                 return .basic;

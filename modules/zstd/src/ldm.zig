@@ -267,6 +267,9 @@ pub const State = struct {
     dict_limit: u32 = match.window_start,
     /// `window.nbOverflowCorrections`.
     n_overflow_corrections: u32 = 0,
+    /// `loadedDictEnd`: the index past a raw dictionary loaded into the
+    /// table, until the input is a window past it (see `match.MatchState`).
+    loaded_dict_end: u32 = 0,
     /// Chunks searched with the window in two segments. Not libzstd's;
     /// tests read it.
     n_ext_dict_chunks: u32 = 0,
@@ -297,7 +300,7 @@ pub const State = struct {
 
     /// `ZSTD_window_update` of the LDM window.
     pub fn windowUpdate(ls: *State, chunk: []const u8) void {
-        _ = match.updateWindow(ls, chunk);
+        _ = match.updateWindow(ls, chunk, false);
     }
 
     /// `ZSTD_ldm_insertEntry`.
@@ -341,13 +344,15 @@ pub const State = struct {
         return p_in_start - p_in;
     }
 
-    /// `ZSTD_window_enforceMaxDist(&ldmState->window, blockEnd, maxDist, &loadedDictEnd (0), NULL)`.
+    /// `ZSTD_window_enforceMaxDist(&ldmState->window, blockEnd, maxDist, &loadedDictEnd, NULL)`.
     fn enforceMaxDist(ls: *State, block_end_idx: u32) void {
         const max_dist: u32 = @as(u32, 1) << @intCast(ls.p.window_log);
-        if (block_end_idx > max_dist) {
+        if (block_end_idx > max_dist +% ls.loaded_dict_end) {
             const new_low = block_end_idx - max_dist;
             if (ls.low_limit < new_low) ls.low_limit = new_low;
             if (ls.dict_limit < ls.low_limit) ls.dict_limit = ls.low_limit;
+            // On reaching window size, dictionaries are invalidated
+            ls.loaded_dict_end = 0;
         }
     }
 
@@ -379,6 +384,30 @@ pub const State = struct {
         for (ls.hash_table) |*e| e.offset = if (e.offset < reducer) 0 else e.offset - reducer;
     }
 
+    /// `ZSTD_ldm_fillHashTable`: enter the split points of `content` (the
+    /// window's prefix, a dictionary just loaded) into the table.
+    pub fn fillHashTable(ls: *State, content: []const u8) void {
+        const min_match_length = ls.p.min_match_length;
+        const h_bits: u5 = @intCast(ls.p.hash_log - ls.p.bucket_size_log);
+        const istart = ls.indexOf(content.ptr);
+        const iend = istart + content.len;
+        var hs: GearState = .init(ls.p);
+        var ip = istart;
+        while (ip < iend) {
+            var num_splits: usize = 0;
+            const hashed = hs.feed(ls.bytes(ip, iend - ip), &ls.split_indices, &num_splits);
+            for (ls.split_indices[0..num_splits]) |sp| {
+                if (ip + sp >= istart + min_match_length) {
+                    const split = ip + sp - min_match_length;
+                    const xxhash = std.hash.XxHash64.hash(0, ls.bytes(split, min_match_length));
+                    const hash = @as(u32, @truncate(xxhash)) & ((@as(u32, 1) << h_bits) - 1);
+                    ls.insertEntry(hash, .{ .offset = @intCast(split), .checksum = @truncate(xxhash >> 32) });
+                }
+            }
+            ip += hashed;
+        }
+    }
+
     /// `ZSTD_ldm_generateSequences`: the raw sequences of `block`, which is
     /// in this window's prefix, into `out` (whose capacity is `maxNbSeq`).
     /// The table keeps what it learnt for later blocks. Indices are this
@@ -397,11 +426,13 @@ pub const State = struct {
             const chunk_size = @min(src_size - chunk * k_max_chunk_size, k_max_chunk_size);
             const prev_size = out.size;
             // 1. Perform overflow correction if necessary.
-            if (match.needOverflowCorrection(ls.overflow_correct_frequently, ls.n_overflow_corrections, 0, max_dist, ls.indexOf(chunk_ptr), ls.indexOf(chunk_ptr) + chunk_size)) {
+            if (match.needOverflowCorrection(ls.overflow_correct_frequently, ls.n_overflow_corrections, 0, max_dist, ls.loaded_dict_end, ls.indexOf(chunk_ptr), ls.indexOf(chunk_ptr) + chunk_size)) {
                 const correction = match.correctOverflow(&ls.low_limit, &ls.dict_limit, &ls.n_overflow_corrections, ls.overflow_correct_frequently, 0, max_dist, @intCast(ls.indexOf(chunk_ptr)));
                 match.shiftSegment(&ls.src, &ls.src_base, correction);
                 match.shiftSegment(&ls.dict, &ls.dict_base, correction);
                 ls.reduceTable(correction);
+                // invalidate dictionaries on overflow correction
+                ls.loaded_dict_end = 0;
             }
             const chunk_start = ls.indexOf(chunk_ptr);
             const chunk_end = chunk_start + chunk_size;

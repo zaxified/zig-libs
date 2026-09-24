@@ -38,6 +38,11 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/compress/zstd_compress.c        frame/block driver (compressContinue,
                                       compressEnd), frame header, parameter
                                       adjustment, entropy glue for a block  -> src/frame.zig, src/params.zig
+                                      dictionary loading (insertDictionary,
+                                      loadCEntropy, loadDictionaryContent)
+                                      and the CDict                         -> src/cdict.zig
+                                      a CDict into a context (copy, reload,
+                                      attach), prefixes, usingDict/CDict    -> src/frame.zig
                                       streaming (compressStream2 over
                                       buffered input and output)            -> src/stream.zig
                                       post-block splitter and its block
@@ -48,7 +53,9 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/compress/zstd_compress_literals.c  literals section                  -> src/literals.zig
   lib/compress/zstd_compress_sequences.c encoding-type choice, table build,
                                       sequence bitstream                    -> src/sequences.zig
-  lib/compress/huf_compress.c         Huffman tree, table header, streams   -> src/huf.zig
+  lib/compress/huf_compress.c         Huffman tree, table header (writing
+                                      and, for dictionaries, reading),
+                                      streams                               -> src/huf.zig
   lib/compress/fse_compress.c, lib/common/fse.h
                                       FSE normalisation, header, coding     -> src/fse.zig
   lib/common/bitstream.h              bit writer                            -> src/bitstream.zig
@@ -77,7 +84,8 @@ Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
 and `src/testdata/` are this collection's own work (MIT).
 
-Not taken: dictionaries (other than the training content above), the
+Not taken: the dictMatchState (attached dictionary) variants of the match
+finders, dictionary finalization and decoding with a dictionary, the
 prefetching sequence
 decoder, the x86-64 assembly Huffman loop (its C twin is ported),
 long-distance matching below `btopt`, multithreading, `targetCBlockSize`
@@ -86,12 +94,15 @@ super-blocks.
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and
 SHA-256 digests of its output). `tools/zref.c`, `tools/zstream.c` and
-`tools/zdec.c` (the decoder's differential oracle) are this
-collection's own programs (MIT) calling libzstd's public API;
+`tools/zdec.c` (the decoder's differential oracle) and `tools/zdtrain.c`
+are this collection's own programs (MIT) calling libzstd's public API;
 `tools/ztrain.c` (MIT) `#include`s libzstd's `cover.c` / `fastcover.c` at
 build time to call their internal steps, and writes
 `src/testdata/dict_goldens.zig` through `tools/gen-dict-goldens.sh`. No
-libzstd bytes are stored in this repository.
+libzstd source bytes are stored in this repository; the two trained
+dictionaries `src/testdata/*.zdict` are libzstd's output (its trainer,
+`ZDICT_trainFromBuffer`, run on this collection's generated samples), as
+the golden digests are.
 
 LICENSE TEXT (libzstd `LICENSE`, verbatim)
 

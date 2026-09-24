@@ -152,7 +152,7 @@ pub const HType = enum { basic, rle, compressed, repeat };
 
 pub const HufMetadata = struct { h_type: HType, des_size: usize };
 
-/// `ZSTD_buildBlockEntropyStats_literals` (no dictionary): the serialised
+/// `ZSTD_buildBlockEntropyStats_literals`: the serialised
 /// table goes to `des_buffer` (`hufDesBuffer`). Returns libzstd's size_t,
 /// error codes included.
 pub fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next: *literals.HufState, disabled: bool, optimal_depth: bool, meta: *HufMetadata, des_buffer: *[max_huf_header_size]u8) usize {
@@ -163,7 +163,8 @@ pub fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next:
         meta.h_type = .basic;
         return 0;
     }
-    if (src.len <= compress_literals_size_min) { // set_basic - too small
+    const min_lit_size: usize = if (prev.repeat == .valid) 6 else compress_literals_size_min;
+    if (src.len <= min_lit_size) { // set_basic - too small
         meta.h_type = .basic;
         return 0;
     }

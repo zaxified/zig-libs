@@ -662,3 +662,371 @@ pub fn generate(case: Case, out: []u8) void {
         },
     }
 }
+
+// ---------------------------------------------------------------------------
+// Dictionaries (`dict_test.zig`, `testdata/cdict_goldens.zig`)
+
+/// A dictionary the recipe trains with libzstd's `ZDICT_trainFromBuffer`
+/// (`tools/zdtrain.c`) on generated samples; the result is committed as
+/// `testdata/<name>.zdict`, which `dict_test.zig` embeds and pins.
+pub const TrainSet = struct {
+    name: []const u8,
+    /// `dictBufferCapacity`.
+    capacity: usize,
+    kind: Kind,
+    count: usize,
+    seed: u64,
+};
+
+pub const train_sets = [_]TrainSet{
+    .{ .name = "zd-words", .capacity = 4096, .kind = .words, .count = 200, .seed = 101 },
+    .{ .name = "zd-csv", .capacity = 16384, .kind = .csv, .count = 200, .seed = 202 },
+};
+
+/// Training sample `i` of `ts`: 200..3000 bytes of its generator.
+pub fn trainSample(ts: TrainSet, i: usize, out_len: *usize) Case {
+    var r: Rng = .{ .s = ts.seed *% 0x9E3779B97F4A7C15 +% i };
+    const len: usize = 200 + @as(usize, @intCast(r.below(2800)));
+    out_len.* = len;
+    return .{ .name = "", .len = len, .kind = ts.kind, .seed = ts.seed * 1000 + i };
+}
+
+/// A dictionary of the dictionary goldens.
+pub const DictDef = struct {
+    name: []const u8,
+    source: Source,
+
+    pub const Source = union(enum) {
+        /// Raw content: this generated input.
+        generated: Case,
+        /// A trained full dictionary (`train_sets`).
+        trained: []const u8,
+        /// The trained dictionary `of` with its ID replaced: 1- and 2-byte
+        /// ID fields (libzstd's trainer picks IDs of 32768 and up).
+        reid: struct { of: []const u8, id: u32 },
+        /// A hand-built full dictionary whose tables all start as `check`:
+        /// a Huffman table over ASCII with zero weights (control bytes but
+        /// the newline), FSE tables with zero probabilities, repcodes 1 4 8,
+        /// then `content`.
+        crafted: struct { content: Case, id: u32 },
+    };
+};
+
+pub const dict_defs = [_]DictDef{
+    .{ .name = "raw-words-8000", .source = .{ .generated = .{ .name = "", .len = 8000, .kind = .words, .seed = 21 } } },
+    .{ .name = "raw-csv-30000", .source = .{ .generated = .{ .name = "", .len = 30000, .kind = .csv, .seed = 22 } } },
+    .{ .name = "raw-csv-150000", .source = .{ .generated = .{ .name = "", .len = 150000, .kind = .csv, .seed = 25 } } },
+    .{ .name = "raw-csv-28672", .source = .{ .generated = .{ .name = "", .len = 28672, .kind = .csv, .seed = 26 } } },
+    .{ .name = "raw-words-3584", .source = .{ .generated = .{ .name = "", .len = 3584, .kind = .words, .seed = 27 } } },
+    .{ .name = "raw-words-15900", .source = .{ .generated = .{ .name = "", .len = 15900, .kind = .words, .seed = 28 } } },
+    .{ .name = "raw-one", .source = .{ .generated = .{ .name = "", .len = 1, .kind = .words, .seed = 29 } } },
+    .{ .name = "raw-mix-100000-self", .source = .{ .generated = .{ .name = "", .len = 100000, .kind = .mix, .seed = 14 } } },
+    .{ .name = "raw-mix-3000", .source = .{ .generated = .{ .name = "", .len = 3000, .kind = .mix, .seed = 24 } } },
+    .{ .name = "zd-words", .source = .{ .trained = "zd-words" } },
+    .{ .name = "zd-csv", .source = .{ .trained = "zd-csv" } },
+    .{ .name = "zd-words-id200", .source = .{ .reid = .{ .of = "zd-words", .id = 200 } } },
+    .{ .name = "zd-words-id1000", .source = .{ .reid = .{ .of = "zd-words", .id = 1000 } } },
+    .{ .name = "zd-words-id256", .source = .{ .reid = .{ .of = "zd-words", .id = 256 } } },
+    .{ .name = "zd-words-id65536", .source = .{ .reid = .{ .of = "zd-words", .id = 65536 } } },
+    .{ .name = "crafted-words", .source = .{ .crafted = .{ .content = .{ .name = "", .len = 3000, .kind = .words, .seed = 23 }, .id = 70000 } } },
+};
+
+pub fn findDict(name: []const u8) DictDef {
+    for (dict_defs) |d| if (std.mem.eql(u8, d.name, name)) return d;
+    unreachable;
+}
+
+/// The bytes of `d` into `out` (at least `dictLen(d)` long); `trained`
+/// gives a trained dictionary's bytes by name. Returns the length.
+pub fn buildDict(d: DictDef, trained: *const fn ([]const u8) []const u8, out: []u8) usize {
+    switch (d.source) {
+        .generated => |c| {
+            generate(c, out[0..c.len]);
+            return c.len;
+        },
+        .trained => |name| {
+            const t = trained(name);
+            @memcpy(out[0..t.len], t);
+            return t.len;
+        },
+        .reid => |x| {
+            const t = trained(x.of);
+            @memcpy(out[0..t.len], t);
+            std.mem.writeInt(u32, out[4..8], x.id, .little);
+            return t.len;
+        },
+        .crafted => |x| return crafted(x.content, x.id, out),
+    }
+}
+
+/// An upper bound of `buildDict`'s length.
+pub fn dictLen(d: DictDef, trained: *const fn ([]const u8) []const u8) usize {
+    return switch (d.source) {
+        .generated => |c| c.len,
+        .trained => |name| trained(name).len,
+        .reid => |x| trained(x.of).len,
+        .crafted => |x| x.content.len + 512,
+    };
+}
+
+/// `FSE_writeNCount` (the safe variant), for the crafted dictionary.
+fn writeNCount(out: []u8, norm: []const i16, max_symbol: u32, table_log: u32) usize {
+    var op: usize = 0;
+    const table_size: i32 = @as(i32, 1) << @intCast(table_log);
+    var bit_stream: u32 = table_log - 5;
+    var bit_count: u32 = 4;
+    var remaining: i32 = table_size + 1;
+    var threshold: i32 = table_size;
+    var nb_bits: u32 = table_log + 1;
+    var symbol: u32 = 0;
+    var previous_is0 = false;
+    while (symbol <= max_symbol and remaining > 1) {
+        if (previous_is0) {
+            var start = symbol;
+            while (symbol <= max_symbol and norm[symbol] == 0) symbol += 1;
+            std.debug.assert(symbol <= max_symbol);
+            while (symbol >= start + 24) {
+                start += 24;
+                bit_stream +%= @as(u32, 0xFFFF) << @intCast(bit_count);
+                std.mem.writeInt(u16, out[op..][0..2], @truncate(bit_stream), .little);
+                op += 2;
+                bit_stream >>= 16;
+            }
+            while (symbol >= start + 3) {
+                start += 3;
+                bit_stream +%= @as(u32, 3) << @intCast(bit_count);
+                bit_count += 2;
+            }
+            bit_stream +%= (symbol - start) << @intCast(bit_count);
+            bit_count += 2;
+            if (bit_count > 16) {
+                std.mem.writeInt(u16, out[op..][0..2], @truncate(bit_stream), .little);
+                op += 2;
+                bit_stream >>= 16;
+                bit_count -= 16;
+            }
+        }
+        var count: i32 = norm[symbol];
+        symbol += 1;
+        const max: i32 = (2 * threshold - 1) - remaining;
+        remaining -= if (count < 0) -count else count;
+        count += 1; // +1 for extra accuracy
+        if (count >= threshold) count += max;
+        bit_stream +%= @as(u32, @bitCast(count)) << @intCast(bit_count);
+        bit_count += nb_bits;
+        bit_count -= @intFromBool(count < max);
+        previous_is0 = count == 1;
+        std.debug.assert(remaining >= 1);
+        while (remaining < threshold) {
+            nb_bits -= 1;
+            threshold >>= 1;
+        }
+        if (bit_count > 16) {
+            std.mem.writeInt(u16, out[op..][0..2], @truncate(bit_stream), .little);
+            op += 2;
+            bit_stream >>= 16;
+            bit_count -= 16;
+        }
+    }
+    std.debug.assert(remaining == 1);
+    std.mem.writeInt(u16, out[op..][0..2], @truncate(bit_stream), .little);
+    op += (bit_count + 7) / 8;
+    return op;
+}
+
+/// The crafted full dictionary (`DictDef.Source.crafted`).
+fn crafted(content: Case, id: u32, out: []u8) usize {
+    std.mem.writeInt(u32, out[0..4], 0xEC30A437, .little);
+    std.mem.writeInt(u32, out[4..8], id, .little);
+    var p: usize = 8;
+    // Huffman weights, direct representation: symbols 0..126 (the last,
+    // 127, implied). Zero for the control bytes but '\n'; 2 for the 31
+    // most common text bytes, 1 for the other 65: 31 * 2 + 65 = 127, so the
+    // implied weight is 1 and the table log 7.
+    var w = [_]u8{0} ** 128;
+    for (32..127) |s| w[s] = 1;
+    w['\n'] = 1;
+    for ("abcdefghijklmnopqrstuvwxyz ,.\n0") |s| w[s] = 2;
+    out[p] = 127 + 127;
+    p += 1;
+    var n: usize = 0;
+    while (n < 127) : (n += 2) {
+        out[p] = (w[n] << 4) | w[n + 1];
+        p += 1;
+    }
+    // offset codes (log 6): 0..20 but 5, so the table has a zero within
+    // what the content's offsets need
+    var of_norm = [_]i16{0} ** 32;
+    for (0..21) |s| of_norm[s] = 3;
+    of_norm[5] = 0;
+    of_norm[0] += 4;
+    p += writeNCount(out[p..], &of_norm, 20, 6);
+    // match lengths (log 6): codes 0..31 only
+    var ml_norm = [_]i16{0} ** 53;
+    for (0..32) |s| ml_norm[s] = 2;
+    p += writeNCount(out[p..], &ml_norm, 31, 6);
+    // literal lengths (log 6): codes 0..15 only
+    var ll_norm = [_]i16{0} ** 36;
+    for (0..16) |s| ll_norm[s] = 4;
+    p += writeNCount(out[p..], &ll_norm, 15, 6);
+    for ([_]u32{ 1, 4, 8 }) |rep| {
+        std.mem.writeInt(u32, out[p..][0..4], rep, .little);
+        p += 4;
+    }
+    generate(content, out[p..][0..content.len]);
+    return p + content.len;
+}
+
+/// How a dictionary golden uses its dictionary: libzstd's call on one side
+/// (`tools/zref.c`, `tools/zstream.c` with a schedule), this module's on the
+/// other.
+pub const DictPath = enum {
+    /// `ZSTD_CCtx_loadDictionary_advanced` + `ZSTD_compress2` (`Options.dictionary = .raw`).
+    load,
+    /// `ZSTD_createCDict(level)` + `ZSTD_CCtx_refCDict` (`CDict.init`, `.cdict`).
+    cdict,
+    /// `ZSTD_createCDict_advanced2` with the level and the parameters (`CDict.initAdvanced`).
+    cdictadv,
+    /// `ZSTD_CCtx_refPrefix_advanced` (`.prefix`).
+    prefix,
+    /// The same, the input right after the prefix in memory.
+    prefixadj,
+    /// `ZSTD_compress_usingDict` (`Compressor.compressUsingDict`).
+    usingdict,
+    /// `ZSTD_compress_usingCDict_advanced` (`Compressor.compressUsingCDict`).
+    usingcdict,
+};
+
+/// A dictionary golden: `input` compressed with dictionary `dict` used as
+/// `path` says, content type `content_type` (0 auto, 1 raw, 2 full),
+/// advanced parameters `params` (`param_cases`' grammar), one-shot -- or,
+/// with a `schedule`, streaming (`stream_cases`' grammar) -- at each of
+/// `levels`, once per `checksums` entry.
+pub const DictCase = struct {
+    name: []const u8,
+    input: Case,
+    dict: []const u8,
+    path: DictPath,
+    content_type: u2 = 0,
+    params: []const u8 = "-",
+    schedule: ?[]const u8 = null,
+    levels: []const i32,
+    checksums: []const bool = &.{false},
+    /// Against libzstd built to correct index overflow frequently
+    /// (`Case.ocf`); one-shot `.load`, `.cdict` or `.prefix` only.
+    ocf: bool = false,
+};
+
+const all_levels: []const i32 = &levels;
+const in_words_40000: Case = .{ .name = "", .len = 40000, .kind = .words, .seed = 11 };
+const in_csv_200000: Case = .{ .name = "", .len = 200000, .kind = .csv, .seed = 12 };
+const in_words_3000: Case = .{ .name = "", .len = 3000, .kind = .words, .seed = 13 };
+const in_mix_100000: Case = .{ .name = "", .len = 100000, .kind = .mix, .seed = 14 };
+const in_empty: Case = .{ .name = "", .len = 0, .kind = .words };
+const some_levels: []const i32 = &.{ -5, 1, 3, 5, 9, 13, 19 };
+
+pub const dict_cases = [_]DictCase{
+    // every level, one path each
+    .{ .name = "cdict-copy", .input = in_words_40000, .dict = "zd-words", .path = .cdict, .levels = all_levels, .checksums = &.{ false, true } }, // above every attach cutoff: tables copied
+    .{ .name = "load-copy", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .levels = all_levels }, // the context's own CDict (no level): copied
+    .{ .name = "prefix", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .levels = all_levels }, // loaded into the context
+    .{ .name = "usingdict", .input = in_csv_200000, .dict = "zd-csv", .path = .usingdict, .levels = all_levels },
+    .{ .name = "cdict-reload", .input = in_csv_200000, .dict = "zd-csv", .path = .cdict, .levels = all_levels }, // 200 KB >= 128 KB and 6x the dictionary: loaded anew with the input's parameters
+    .{ .name = "usingcdict", .input = in_words_40000, .dict = "zd-words", .path = .usingcdict, .levels = some_levels, .checksums = &.{ false, true } },
+    .{ .name = "usingcdict-reload", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .usingcdict, .levels = &.{ 1, 3, 7 } },
+    // content types
+    .{ .name = "cdictadv-full-as-raw", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .content_type = 1, .params = "forceAttachDict=2", .levels = &.{ 1, 3, 6, 12, 16 } },
+    .{ .name = "load-full", .input = in_mix_100000, .dict = "zd-csv", .path = .load, .content_type = 2, .levels = &.{ -1, 2, 4, 7, 10, 15, 18 } },
+    .{ .name = "prefix-raw", .input = in_words_40000, .dict = "raw-mix-3000", .path = .prefix, .content_type = 1, .levels = &.{ 1, 3, 5, 8, 11, 17 } },
+    // dictionary IDs: none, 1, 2 and 4 bytes
+    .{ .name = "cdict-no-id", .input = in_words_40000, .dict = "zd-words", .path = .cdict, .params = "dictIDFlag=0", .levels = &.{ 3, 19 } },
+    .{ .name = "load-id200", .input = in_words_40000, .dict = "zd-words-id200", .path = .load, .levels = &.{3} },
+    .{ .name = "load-id1000", .input = in_words_40000, .dict = "zd-words-id1000", .path = .load, .levels = &.{3} },
+    .{ .name = "load-id256", .input = in_words_40000, .dict = "zd-words-id256", .path = .load, .levels = &.{3} }, // the 2-byte field from 256
+    .{ .name = "load-id65536", .input = in_words_40000, .dict = "zd-words-id65536", .path = .load, .levels = &.{3} }, // the 4-byte field from 65536
+    .{ .name = "cdictadv-no-id", .input = in_words_40000, .dict = "zd-words-id1000", .path = .cdictadv, .params = "dictIDFlag=0,forceAttachDict=2", .levels = &.{5} },
+    // tables that must be checked (the crafted dictionary)
+    .{ .name = "usingdict-crafted", .input = in_words_40000, .dict = "crafted-words", .path = .usingdict, .levels = &.{ -1, 1, 3, 5, 8, 12, 16, 19 } },
+    .{ .name = "load-crafted", .input = in_words_3000, .dict = "crafted-words", .path = .load, .params = "forceAttachDict=2", .levels = &.{ 1, 3, 5, 13 } },
+    // 128 KB exactly: a CDict with a level is loaded anew
+    .{ .name = "cdict-reload-at-128k", .input = .{ .name = "", .len = 131072, .kind = .csv, .seed = 15 }, .dict = "zd-words", .path = .cdict, .levels = &.{ 3, 12 } },
+    .{ .name = "usingcdict-reload-at-128k", .input = .{ .name = "", .len = 131072, .kind = .csv, .seed = 15 }, .dict = "zd-words", .path = .usingcdict, .levels = &.{5} },
+    // ... and six times the dictionary exactly (below it, the CDict's own
+    // parameters)
+    .{ .name = "cdict-reload-at-6x", .input = .{ .name = "", .len = 180000, .kind = .csv, .seed = 16 }, .dict = "raw-csv-30000", .path = .cdict, .levels = &.{ 2, 9 } },
+    // the match length a dictionary is hashed with: 7 as 7 (the search
+    // clamps it to 6), 3 as 4
+    .{ .name = "prefix-minmatch-7", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefix, .params = "minMatch=7", .levels = &.{ 1, 3, 5, 7, 13 } },
+    .{ .name = "prefix-minmatch-3-chain", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefix, .params = "minMatch=3,useRowMatchFinder=2", .levels = &.{ 5, 8, 11 } },
+    .{ .name = "cdict-minmatch-7-row", .input = in_words_40000, .dict = "raw-words-8000", .path = .cdictadv, .params = "minMatch=7,useRowMatchFinder=1,forceAttachDict=2", .levels = &.{ 5, 7 } },
+    // Found by the mutation sweep (SPEC.md, *Anchoring*):
+    // a dictionary longer than the tables reach loads its end only
+    .{ .name = "prefix-long-dict", .input = in_csv_200000, .dict = "raw-csv-150000", .path = .prefix, .levels = &.{ 1, 3 } }, // 2^(hashLog + 3)
+    .{ .name = "prefix-long-dict-chain", .input = in_csv_200000, .dict = "raw-csv-150000", .path = .prefix, .params = "hashLog=10,chainLog=16,useRowMatchFinder=2", .levels = &.{5} }, // 2^(chainLog + 1)
+    // a dictionary valid across a window: as far back as the dictionary, not further
+    .{ .name = "prefix-force-max-window", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefix, .params = "forceMaxWindow=1,windowLog=12", .levels = &.{ 1, 5, 16 } },
+    .{ .name = "prefix-adjacent-window", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefixadj, .params = "windowLog=12", .levels = &.{ 1, 3, 5, 12 } },
+    .{ .name = "prefix-window-rows", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .params = "windowLog=15", .levels = &.{ 5, 7 } },
+    .{ .name = "prefix-ldm-window", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .params = "enableLongDistanceMatching=1,windowLog=15", .levels = &.{ 3, 16 } },
+    // levels: a CDict made at level 0 has level 3; one without a level
+    // gives the frame the default level, and is never reloaded
+    .{ .name = "cdict-reload-level0", .input = in_csv_200000, .dict = "zd-csv", .path = .cdict, .levels = &.{0} },
+    .{ .name = "cdictadv-large", .input = in_csv_200000, .dict = "zd-csv", .path = .cdictadv, .levels = &.{ 1, 19 } },
+    .{ .name = "cdictadv-force-load", .input = in_csv_200000, .dict = "zd-csv", .path = .cdictadv, .params = "forceAttachDict=3", .levels = &.{ 1, 19 } },
+    // compressUsingCDict: at six times the dictionary, reloaded; a window
+    // grown to the input past 256 KB; switches resolved before it grows
+    .{ .name = "usingcdict-reload-at-6x", .input = .{ .name = "", .len = 180000, .kind = .csv, .seed = 16 }, .dict = "raw-csv-30000", .path = .usingcdict, .levels = &.{2} },
+    .{ .name = "usingcdict-wide", .input = .{ .name = "", .len = 300000, .kind = .csv, .seed = 17 }, .dict = "raw-csv-150000", .path = .usingcdict, .levels = &.{ 1, 5 } },
+    .{ .name = "usingcdict-grown-window", .input = in_mix_100000, .dict = "raw-mix-3000", .path = .usingcdict, .levels = &.{ 16, 19 } },
+    // a copy keeps the switches resolved on the frame's parameters
+    .{ .name = "cdict-copy-splitter", .input = in_mix_100000, .dict = "zd-words", .path = .cdict, .levels = &.{ 16, 19 } },
+    // minMatch 7 into hash chains
+    .{ .name = "prefix-minmatch-7-chain", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefix, .params = "minMatch=7,useRowMatchFinder=2", .levels = &.{ 5, 7 } },
+    // an input of 8 bytes: the optimal parser seeded from the dictionary
+    .{ .name = "cdict-eight-bytes", .input = .{ .name = "", .len = 8, .kind = .words, .seed = 18 }, .dict = "zd-words", .path = .cdict, .params = "forceAttachDict=2", .levels = &.{ 16, 19 } },
+    // the window covering the dictionary and the input exactly, and a
+    // dictionary plus window of exactly 2^15 (ZSTD_dictAndWindowLog)
+    .{ .name = "prefix-window-fits", .input = .{ .name = "", .len = 2768, .kind = .csv, .seed = 19 }, .dict = "raw-csv-30000", .path = .prefix, .levels = &.{ 4, 7, 12 } },
+    .{ .name = "prefix-dict-and-window-pow2", .input = in_csv_200000, .dict = "raw-csv-28672", .path = .prefix, .params = "windowLog=12", .levels = &.{ 4, 7 } },
+    .{ .name = "prefix-one-byte", .input = in_csv_200000, .dict = "raw-one", .path = .prefix, .params = "windowLog=17", .levels = &.{10} },
+    // a CDict for 513 + 3584 = 4097 bytes; a tagged table capped at 2^24
+    .{ .name = "cdict-513", .input = in_words_40000, .dict = "raw-words-3584", .path = .cdict, .params = "forceAttachDict=2", .levels = &.{ 3, 6 } },
+    .{ .name = "cdictadv-tag-cap", .input = in_words_40000, .dict = "raw-words-8000", .path = .cdictadv, .params = "hashLog=25,forceAttachDict=2", .levels = &.{1} },
+    // an unknown size: the table row for the dictionary + 500 bytes
+    .{ .name = "stream-prefix-500", .input = in_words_40000, .dict = "raw-words-15900", .path = .prefix, .schedule = "c*,e0", .levels = &.{ 5, 12 } },
+    // ... and by searching generator seeds (original against mutant):
+    .{ .name = "usingdict-6-literals", .input = .{ .name = "", .len = 272, .kind = .words, .seed = 660316 }, .dict = "zd-words", .path = .usingdict, .levels = &.{3} }, // a dictionary's Huffman table compresses 6 literals
+    .{ .name = "cdict-1000-sequences", .input = .{ .name = "", .len = 101386, .kind = .mix, .seed = 812926 }, .dict = "zd-words", .path = .cdict, .params = "forceAttachDict=2", .levels = &.{3} }, // a valid table is repeated below 1000 sequences only
+    // long-distance matching into a raw dictionary (here the input itself)
+    .{ .name = "prefix-ldm-self", .input = in_mix_100000, .dict = "raw-mix-100000-self", .path = .prefix, .params = "enableLongDistanceMatching=1,windowLog=15", .levels = &.{ 1, 3, 16 } },
+    // a tagged CDict table capped at 2^24 (the window lets the hash log stay)
+    .{ .name = "cdictadv-tag-cap-24", .input = in_words_40000, .dict = "raw-words-8000", .path = .cdictadv, .params = "hashLog=25,windowLog=27,forceAttachDict=2", .levels = &.{1} },
+    // loaded anew where it would be attached: the parameters ignore the dictionary's size
+    .{ .name = "cdict-force-load-csv", .input = in_words_3000, .dict = "zd-csv", .path = .cdict, .params = "forceAttachDict=3", .levels = &.{ 1, 5 } },
+    // attach preference: small inputs copied, or loaded anew
+    .{ .name = "cdict-force-copy", .input = in_words_3000, .dict = "zd-words", .path = .cdict, .params = "forceAttachDict=2", .levels = &.{ 1, 3, 5, 9, 13, 19 } },
+    .{ .name = "cdict-force-load", .input = in_words_3000, .dict = "zd-words", .path = .cdict, .params = "forceAttachDict=3", .levels = &.{ 1, 4, 16 } },
+    .{ .name = "load-force-max-window", .input = in_words_3000, .dict = "raw-words-8000", .path = .load, .params = "forceMaxWindow=1", .levels = &.{ 1, 3, 7, 16 } }, // never attached; the dictionary only within the window
+    // a prefix right before the input in memory: one segment
+    .{ .name = "prefix-adjacent", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefixadj, .levels = &.{ 1, 3, 5, 9, 13, 19 } },
+    .{ .name = "prefix-adjacent-deterministic", .input = in_words_40000, .dict = "raw-words-8000", .path = .prefixadj, .params = "deterministicRefPrefix=1", .levels = &.{ 3, 9 } },
+    // a window shorter than the dictionary and the input
+    .{ .name = "prefix-window", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .params = "windowLog=12", .levels = &.{ 1, 3, 5, 13 } },
+    // ... with index overflow corrected as often as it may: not while the
+    // dictionary is still valid, and a correction invalidates it
+    .{ .name = "prefix-window-ocf", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .params = "windowLog=12", .levels = &.{ 1, 3, 5, 13 }, .ocf = true },
+    .{ .name = "cdict-window-ocf", .input = in_csv_200000, .dict = "zd-csv", .path = .cdict, .params = "windowLog=11,forceAttachDict=2", .levels = &.{ -1, 4, 16 }, .ocf = true },
+    // long-distance matching with a raw dictionary (it enters the LDM table too)
+    .{ .name = "prefix-ldm", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .params = "enableLongDistanceMatching=1", .levels = &.{ 3, 16 } },
+    // frame flags
+    .{ .name = "cdict-magicless", .input = in_words_40000, .dict = "zd-words", .path = .cdict, .params = "format=1", .levels = &.{3} },
+    .{ .name = "usingcdict-no-size", .input = in_words_40000, .dict = "zd-words", .path = .usingcdict, .params = "contentSizeFlag=0,dictIDFlag=0", .levels = &.{3} },
+    // an empty input: the header still carries the dictionary ID
+    .{ .name = "empty-cdict", .input = in_empty, .dict = "zd-words", .path = .cdict, .params = "forceAttachDict=2", .levels = &.{3} },
+    .{ .name = "empty-usingdict", .input = in_empty, .dict = "zd-words", .path = .usingdict, .levels = &.{3} },
+    // streaming (`schedule`): the dictionary is the first frame's
+    .{ .name = "stream-load", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .schedule = "forceAttachDict=2,c*,e0", .levels = &.{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 19 } },
+    .{ .name = "stream-cdict-reload", .input = in_csv_200000, .dict = "zd-csv", .path = .cdict, .schedule = "p200000,c*,e0", .levels = &.{ 1, 3, 5, 9, 16 } },
+    .{ .name = "stream-prefix", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .prefix, .schedule = "c50000,f0,c*,e0", .levels = &.{ 1, 3, 6, 12 } },
+    .{ .name = "stream-cdictadv-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "w12,forceAttachDict=2,c10000,f0,c*,e0", .levels = &.{ 3, 7, 16 } }, // the buffer wraps: the dictionary leaves the window
+};

@@ -13,10 +13,12 @@ for the same calls) covers every level too, and `FrameWriter` is a
 `std.Io.Writer` that emits one frame per flush, and libzstd's advanced
 parameters (`zstd.Advanced`: explicit window/hash/chain/search/strategy,
 frame flags, magicless frames, the splitters, the row match finder, literal
-compression, block size) give libzstd's bytes for the same settings; the
-stable-buffer and context-reuse parts of the streaming API, dictionaries
-(of training, the content selection is done: `zstd.dict_builder`) and
-multithreading are
+compression, block size) give libzstd's bytes for the same settings, and so
+does compression with a dictionary (raw or trained, `CDict`, prefixes) —
+except where libzstd would *attach* a `CDict` (inputs under 8–32 KB, unknown
+sizes), which is refused for now; decoding dictionary frames, dictionary
+finalization (of training, the content selection is done:
+`zstd.dict_builder`), the stable-buffer streaming modes and multithreading are
 queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
@@ -215,8 +217,32 @@ unknown size chosen as for about that many bytes), and so does
 `error.ParameterOutOfBound`. `writeSkippableFrame` writes a skippable frame
 (`ZSTD_writeSkippableFrame`).
 
+Compressing with a dictionary — the same bytes as libzstd with the
+dictionary set the same way:
+
+```zig
+// Digest it once (ZSTD_createCDict): for many frames and contexts.
+var cd = try zstd.CDict.init(gpa, dict_bytes, 3); // raw content, or a `zstd --train` dictionary
+defer cd.deinit();
+const n = try c.compress(buf, data, .{ .level = 3, .dictionary = .{ .cdict = &cd } });
+// Or: .{ .raw = .{ .bytes = dict_bytes } }      (ZSTD_CCtx_loadDictionary: digested per call)
+//     .{ .prefix = .{ .bytes = previous_version } } (ZSTD_CCtx_refPrefix: this frame only)
+// and c.compressUsingDict(buf, data, dict_bytes, level) / c.compressUsingCDict(buf, data, &cd, .{}).
+```
+
+The frame carries the dictionary's ID (`advanced.dict_id_flag = false`
+leaves it out); a decoder needs the same dictionary. `StreamOptions` takes
+the same `dictionary` (a `.prefix` for its first frame only). For small
+inputs — up to 8, 16 or 32 KB by strategy — and streams of unknown size,
+libzstd attaches a `CDict` instead of copying it, which is not ported yet:
+`error.DictAttachUnsupported` (`advanced.force_attach_dict = .copy` gets
+libzstd's bytes for the copy). `CDict.initAdvanced` takes a content type
+(`.auto`, `.raw_content`, `.full`) and advanced parameters; see SPEC.md,
+*Dictionaries*.
+
 Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`
-(`dst` below `compressBound`), `OutOfMemory`. There is no input size limit: past 3500 MiB
+(`dst` below `compressBound`), `OutOfMemory`, and with a dictionary
+`DictionaryCorrupted`, `DictionaryWrong`, `DictAttachUnsupported`. There is no input size limit: past 3500 MiB
 the indices are rescaled as libzstd does (the whole input still has to be in
 memory, and so does its `compressBound`).
 
@@ -301,6 +327,15 @@ fastCover parameters, capacities, split points; refusals included), each
 content equal in length and SHA-256 to what libzstd's trainer placed in the
 buffer before finalization (`src/testdata/dict_goldens.zig`,
 `tools/ztrain.c` calling the trainers' internal steps).
+
+`src/dict_test.zig` does it with dictionaries: 74 cases (an input, a
+dictionary — raw content from the corpus generators, two trained by
+libzstd's `ZDICT_trainFromBuffer` and committed as `src/testdata/*.zdict`,
+those with 1-, 2- and 4-byte IDs, and a hand-built one whose tables all
+need checking — the way it is used, content type, parameters, levels
+−5…22) — 326 frames and streams equal to libzstd's
+(`src/testdata/cdict_goldens.zig`), which the recipe also decodes back
+with the dictionary.
 
 `src/context_test.zig` pins the estimates (exact, and the largest for an
 unknown size), a static workspace's bound, the workspace being replaced

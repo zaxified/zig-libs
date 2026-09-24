@@ -104,7 +104,9 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
     const curr = ip;
     const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
     const lowest_valid = ms.low_limit;
-    const low_limit = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+    const within_max_distance = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+    const is_dictionary = ms.loaded_dict_end != 0;
+    const low_limit = if (is_dictionary) lowest_valid else within_max_distance;
     const min_chain: u32 = if (curr > chain_size) curr - chain_size else 0;
     var nb_attempts: u32 = @as(u32, 1) << @intCast(ms.cp.search_log);
     var ml: usize = 4 - 1;
@@ -139,6 +141,17 @@ inline fn candidateLength(w: Base, ip: u32, match_index: u32, iend: usize, ml: u
     if (w.read32Seg(match_index, dict_limit) == w.read32(ip))
         return w.count2Segments(@as(usize, ip) + 4, @as(usize, match_index) + 4, iend, dict_limit, dict_limit) + 4;
     return 0;
+}
+
+/// `ZSTD_insertAndFindFirstIndex` as dictionary loading calls it: every
+/// position from `next_to_update` up to `ip` into the hash chains, hashed
+/// with `minMatch` as it is (3 hashes as 4, 7 as 7), not with the search's
+/// clamped length.
+pub fn insertDictionary(ms: *MatchState, ip: u32) void {
+    switch (ms.cp.min_match) {
+        inline 5, 6, 7 => |m| _ = insertAndFindFirstIndex(ms, ip, m),
+        else => _ = insertAndFindFirstIndex(ms, ip, 4),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +236,33 @@ fn rowUpdate(ms: *MatchState, ip: u32, comptime mls: u32, comptime row_log: u32,
     ms.next_to_update = target;
 }
 
+/// `ZSTD_row_update`: insert every position from `next_to_update` up to
+/// `ip`, without the hash cache and without skipping (dictionary loading).
+pub fn rowUpdateDictionary(ms: *MatchState, ip: u32) void {
+    const row_log = params.rowLog(ms.cp);
+    const row_mask = (@as(u32, 1) << @intCast(row_log)) - 1;
+    const w: Base = .of(ms);
+    // mls caps out at 6; 3 hashes as 4
+    switch (@min(ms.cp.min_match, 6)) {
+        inline 5, 6 => |m| rowUpdateNoCache(ms, w, ip, m, row_log, row_mask),
+        else => rowUpdateNoCache(ms, w, ip, 4, row_log, row_mask),
+    }
+    ms.next_to_update = ip;
+}
+
+/// `ZSTD_row_update_internalImpl` without the hash cache.
+fn rowUpdateNoCache(ms: *MatchState, w: Base, end: u32, comptime mls: u32, row_log: u32, row_mask: u32) void {
+    var idx = ms.next_to_update;
+    while (idx < end) : (idx += 1) {
+        const h = rowHash(ms, w, idx, mls);
+        const rel_row: usize = @as(usize, h >> tag_bits) << @intCast(row_log);
+        const tag_row = ms.tag_table[rel_row..];
+        const pos = rowNextIndex(tag_row, row_mask);
+        tag_row[pos] = @truncate(h & tag_mask);
+        ms.hash_table[rel_row + pos] = idx;
+    }
+}
+
 /// Bit `i` set when slot `(head + i) % entries` of `tag_row` holds `tag`
 /// (`ZSTD_row_getMatchMask`).
 inline fn matchMask(comptime entries: u32, tag_row: []const u8, tag: u8, head: u32) u64 {
@@ -248,7 +288,9 @@ fn rowFindBestMatchT(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, co
     const curr = ip;
     const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
     const lowest_valid = ms.low_limit;
-    const low_limit = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+    const within_max_distance = if (curr - lowest_valid > max_distance) curr - max_distance else lowest_valid;
+    const is_dictionary = ms.loaded_dict_end != 0;
+    const low_limit = if (is_dictionary) lowest_valid else within_max_distance;
     const row_entries: u32 = 1 << row_log;
     const row_mask = row_entries - 1;
     const capped_search_log = @min(ms.cp.search_log, row_log); // nb of searches is capped at nb entries per row
@@ -321,7 +363,8 @@ fn rowFindBestMatchT(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, co
 // unsorted; a search first sorts the unsorted candidates it meets into the
 // tree, then descends it.
 
-/// `ZSTD_getLowestMatchIndex` without a dictionary.
+/// The window's low end as `ZSTD_insertDUBT1` computes it: a window back
+/// from `curr`, even with a dictionary (unlike `ZSTD_getLowestMatchIndex`).
 inline fn lowestMatchIndex(ms: *const MatchState, curr: u32) u32 {
     const max_distance: u32 = @as(u32, 1) << @intCast(ms.cp.window_log);
     const lowest_valid = ms.low_limit;
@@ -430,7 +473,7 @@ fn dubtFindBestMatch(ms: *MatchState, ip: u32, iend: usize, off_base_ptr: *u32, 
     const h = w.hash(ip, ms.cp.hash_log, mls);
     var match_index = hash_table[h];
     const curr = ip;
-    const window_low = lowestMatchIndex(ms, curr);
+    const window_low = ms.lowestMatchIndex(curr); // ZSTD_getLowestMatchIndex
     const bt = ms.chain_table;
     const bt_mask = btMask(ms);
     const bt_low: u32 = if (bt_mask >= curr) 0 else curr - bt_mask;

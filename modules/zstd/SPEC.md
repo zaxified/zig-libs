@@ -26,14 +26,18 @@ with its cost.
 
 Not here yet, and a reader might expect it (each is a backlog item):
 
-- **Dictionaries (Z2c, Z4, Z5b).** A frame naming a dictionary is
-  `error.DictionaryWrong`. Of training, the content selection is here
-  (*Dictionary training*); finalization is not.
+- **Part of dictionaries (Z2c, Z4, Z5b).** Compressing with a dictionary is
+  here (see *Dictionaries*) except where libzstd **attaches** a `CDict` —
+  small or unknown input sizes — which is `error.DictAttachUnsupported`
+  until the match finders' `dictMatchState` variants are ported. Decoding a
+  frame that names a dictionary is `error.DictionaryWrong`. Of training,
+  the content selection is here (*Dictionary training*); finalization is
+  not.
 - **The rest of the streaming API.** `Stream` (see *Algorithm*) does
   libzstd's default buffered modes, frame after frame on one context; not
   the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
-- **Dictionaries (Z4, Z5), multithreading (Z9).**
+- **Multithreading (Z9).**
 
 ## Algorithm
 
@@ -257,6 +261,10 @@ one parameter, null or `.auto` for "not set":
 | `ldm_hash_log`, `ldm_min_match`, `ldm_bucket_size_log`, `ldm_hash_rate_log` | `ZSTD_c_ldmHashLog` … `ZSTD_c_ldmHashRateLog` (0 = not set) | 6–30, 4–4096, 1–8, 0–25 |
 | `target_c_block_size` | `ZSTD_c_targetCBlockSize` (0 = off; 1–1339 count as 1340) | 0–131072 |
 | `StreamOptions.src_size_hint` | `ZSTD_c_srcSizeHint` | 1–2^31-1 |
+| `dict_id_flag` | `ZSTD_c_dictIDFlag` | |
+| `force_attach_dict` | `ZSTD_c_forceAttachDict` | default / attach / copy / load |
+| `deterministic_ref_prefix` | `ZSTD_c_deterministicRefPrefix` | |
+| `force_max_window` | `ZSTD_c_forceMaxWindow` | |
 
 The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
 `error.ParameterOutOfBound`, where `ZSTD_CCtx_setParameter` refuses. The
@@ -320,10 +328,9 @@ the first). The frame is not bound by `compressBound` sub-block by
 sub-block: a superblock of a raw block's size or more is replaced by the
 raw block, as libzstd does.
 
-Not here, each with its backlog item: `ZSTD_c_dictIDFlag`,
-`deterministicRefPrefix`, `forceMaxWindow`, `forceAttachDict`,
-`enableDedicatedDictSearch`, `prefetchCDictTables` (they act on
-dictionaries: Z4); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
+The four dictionary parameters are described in *Dictionaries*. Not here,
+each with its backlog item: `enableDedicatedDictSearch`,
+`prefetchCDictTables` (Z4; the second changes speed only); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
 act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
@@ -412,6 +419,168 @@ never freed or replaced, and a frame that needs more is
 0.3 MB; level 3 on 1 MB, 1.3 MB one-shot, 2.6 MB as a stream with that
 size pledged, 3.7 MB for an unknown size; level 19 on 1 MB, 18 MB; the
 most any input needs at level 22, 740 MB one-shot and 874 MB streaming.
+
+## Dictionaries
+
+Compression with a dictionary is libzstd's (`zstd_compress.c`): a
+**raw-content** dictionary is bytes the input is likely to repeat; a
+**full** one (RFC 8878, *Dictionary Format*) starts with the magic number
+0xEC30A437 and an ID, then a Huffman table, the offset, match-length and
+literal-length FSE tables, three repcodes, and its content.
+`DictContentType` (`ZSTD_dictContentType_e`) says which: `.auto` goes by
+the first four bytes, `.raw_content` takes even a full dictionary as raw
+bytes, `.full` refuses anything else (`error.DictionaryWrong`). A
+dictionary under 8 bytes is ignored (unless it must be full); an empty
+`.raw` or `.prefix` is no dictionary at all, as in libzstd.
+
+**Loading** (`cdict.zig`: `ZSTD_compress_insertDictionary`,
+`ZSTD_loadZstdDictionary`, `ZSTD_loadCEntropy`, `ZSTD_loadDictionaryContent`).
+The entropy tables become the first block's previous tables, the repcodes
+its repcodes. The Huffman table is `valid` (reused without checking, and
+for inputs of 6 literals up) only when it gives all 256 bytes a code;
+otherwise `check`. An FSE table is `valid` when every symbol up to the
+largest code the frame can need has a nonzero probability — for offsets,
+the code of the dictionary's content size + 128 KB — else `check`; the
+offset table's `valid` is demoted to `check` after the first block (the
+content no longer bounds the offsets), the length tables' is kept. A
+`valid` table is reused by the `fast`/`dfast` heuristic for fewer than 1000
+sequences; `valid` Huffman makes a 3-byte-header literal section single
+stream. The optimal parsers seed their first block's statistics from a
+`valid` Huffman table and the three FSE tables (`ZSTD_rescaleFreqs`).
+A table must satisfy libzstd's checks (table logs 8/9/9, repcodes nonzero
+and within the content), else `error.DictionaryCorrupted`.
+
+The content goes into the window as its prefix, and the strategy's tables
+are filled from it: `fast`/`dfast` every third position (a `CDict`: all of
+them where free, `ZSTD_dtlm_full`), the hash chains every position (hashed
+with `minMatch` as it is: 7 as 7, although the search clamps it to 6), the
+rows every position (without the hash cache and its skipping), the binary tree (also for `btlazy2`) every position up to its last 8
+bytes; for raw content with long-distance matching, the LDM table too
+(a full dictionary's content never enters it). A dictionary longer than
+the tables can reach, `2^max(hashLog + 3, chainLog + 1)`, loads only its
+end into them (the LDM table takes up to `ZSTD_CURRENT_MAX`). The frame's
+input then starts a new segment, so the dictionary becomes the window's
+extDict and every strategy's extDict match finder searches it — unless
+the input follows the dictionary in memory (a `.prefix` right before it),
+when the two are one prefix. `loaded_dict_end` (`loadedDictEnd`) marks the
+dictionary valid: the whole window may be referenced while any byte of the
+dictionary is in it; once the input is a window past its end, or the window
+went on in another segment, or indices were corrected for overflow, it is
+dropped (`ZSTD_checkDictValidity`, `ZSTD_window_enforceMaxDist`), and index
+overflow correction waits until then. `force_max_window` keeps it 0 from
+the start (the dictionary counts only within the window);
+`deterministic_ref_prefix` makes the input a new segment even when it
+follows a prefix in memory, so the output does not depend on where the
+buffers lie.
+
+**The dictionary ID** goes into the header in 1, 2 or 4 bytes (up to 255,
+65 535, above), unless `dict_id_flag` is false or the dictionary is raw
+content. An empty frame's header written by the epilogue carries none,
+as libzstd's does.
+
+**`CDict`** (`ZSTD_CDict`) digests a dictionary once: its content (copied),
+entropy tables, and its own match tables filled with its own parameters —
+`ZSTD_getCParams_internal(level, unknown, dictSize, ZSTD_cpm_createCDict)`,
+which takes the input as 513 bytes and the table for 513 + dictSize,
+caps a tagged table's logs at 24, and resolves the row match finder. For
+`fast` and `dfast` its entries are tagged: the index in the upper 24 bits,
+8 more bits of hash below (`ZSTD_SHORT_CACHE_TAG_BITS`), so a dictionary
+loads only its last 16 MB. `CDict.init(gpa, dict, level)` is
+`ZSTD_createCDict` (remembers its level); `initAdvanced` is
+`ZSTD_createCDict_advanced2` with a level and `Advanced` (no level: libzstd's
+`ZSTD_NO_CLEVEL`), and takes a size hint.
+
+**Into a context** (`frame.Compressor.beginInternal`,
+`ZSTD_compressBegin_internal`). The frame's parameters come from
+`ZSTD_getCParamsFromCCtxParams` with the dictionary's size: in
+`ZSTD_cpm_noAttachDict` mode the table row is chosen for input +
+dictionary (+ 500 bytes when the input size is unknown), the window for
+their sum, and the hash and chain logs for a window covering both
+(`ZSTD_dictAndWindowLog`); in `ZSTD_cpm_attachDict` mode (below) for the
+input alone. A `CDict`'s level, if it has one, replaces the context's. Then:
+
+- **Loaded into the context** (`dtlm_fast`): a `.prefix` (for one frame
+  only, raw by default: `ZSTD_CCtx_refPrefix`), `compressUsingDict`
+  (`ZSTD_compress_usingDict`: the level, every other parameter default),
+  and a `CDict` *with a level* when the input is at least 128 KB and six
+  times the dictionary (its content, reloaded with the input's parameters),
+  or any `CDict` with `force_attach_dict = .load`. A dictionary over
+  `ZSTD_CHUNKSIZE_MAX` restarts indexing.
+- **Copied** (`ZSTD_resetCCtx_byCopyingCDict`): the context takes the
+  CDict's parameters but for the window log, its tables (untagged: `>> 8`),
+  its tag table and hash salt (row), its window, entropy tables and
+  repcodes; a hash3 table is zeroed. The switches resolved on the frame's
+  own parameters (post-splitter, LDM) stay, as libzstd resolves them before.
+- **Attached** (`ZSTD_resetCCtx_byAttachingCDict`) where
+  `ZSTD_shouldAttachDict` says: an input of at most 8 KB (`fast`,
+  `btultra`, `btultra2`), 16 KB (`dfast`) or 32 KB (the others) by the
+  CDict's strategy, or of unknown size, or `force_attach_dict = .attach` —
+  never with `.copy`, never with `force_max_window`. **Not ported yet:**
+  the frame is refused with `error.DictAttachUnsupported` before anything
+  is written, rather than copied (which would change the bytes). The
+  attach reset itself is in place behind the gate (`match.
+  hasDictMatchStateVariant`).
+
+`Options.dictionary` / `StreamOptions.dictionary` mirror libzstd's calls on
+a context before `ZSTD_compress2` / `ZSTD_compressStream2`: `.raw` is
+`ZSTD_CCtx_loadDictionary_advanced` — a `CDict` made by the context with
+the frame's parameters (by reference; no level of its own, so copied or
+attached, never reloaded), for one call (`Compressor.compress`) or for
+every frame until `reset` (`Stream`); `.cdict` is `ZSTD_CCtx_refCDict`;
+`.prefix` is `ZSTD_CCtx_refPrefix_advanced`. `compressUsingCDict` is
+`ZSTD_compress_usingCDict_advanced`: the CDict's parameters (for inputs up
+to 128 KB or six times the dictionary, or a CDict without a level) with
+the window widened to the input up to 512 KB — the switches resolved
+before that — else the level's for the input and the dictionary, loaded
+anew. Error classes: a corrupt dictionary is `DictionaryCorrupted` /
+`DictionaryWrong` on every path, where libzstd's `ZSTD_compress2` with
+`ZSTD_CCtx_loadDictionary` reports `memory_allocation` (its internal CDict
+creation fails and it cannot tell why).
+
+**Reuse.** libzstd 1.5.7 gives a reused context the bytes of a fresh one
+with dictionaries too (1 500 frames, every way of using a dictionary,
+attach included, levels −3…22, measured 2026-09-24 with a probe like
+`tools/zreuse.c`): the dictionary is loaded above the last frame's
+indices, and the copy replaces the window and tables outright. The
+dictionary goldens run through one context and one stream.
+
+**Not expressible here:** `ZSTD_c_srcSizeHint` set on a context for
+`ZSTD_compress2` with `ZSTD_CCtx_loadDictionary` sizes that call's internal
+CDict; `Options` has no size hint (`StreamOptions` does, and `CDict.
+initAdvanced` takes one). `estimateCompressorSize` / `estimateStreamSize`
+leave dictionaries out (a copied CDict brings its own table sizes; a
+`.raw` dictionary allocates a CDict per call or per stream; a static
+context cannot make one: `error.OutOfMemory`). libzstd reads the FSE
+entries past a dictionary table's last symbol when seeding the optimal
+parser — memory it never initialised; this port zeroes them (a
+difference only for a dictionary with a valid Huffman table but length
+tables that stop short of the largest code, which no trainer makes).
+
+**Adding an attach (`dictMatchState`) variant** (D1–D3). The seam is
+`MatchState.dict_match_state`: the attached CDict's `ms` (its window —
+content from index 2 up to its end, `dict_limit`, `low_limit` — its
+`cp`, its tables, tagged for `fast`/`dfast`, and `hash_salt` 0). The
+context's window starts at the CDict's end (`src_base` = its end index),
+so a dictionary index maps into the context's space by libzstd's
+`dictIndexDelta` (the context's low limit less the CDict's end), and `loaded_dict_end` = the context's
+`dict_limit`. To port one: write the variant in the strategy's file
+(`zstd_fast.c` → `match.zig`, `zstd_double_fast.c` → `match.zig`,
+`zstd_lazy.c` → `lazy.zig`, `zstd_opt.c` → `opt.zig`) from libzstd's
+`*_dictMatchState*` functions; dispatch to it where `ms.dict_match_state
+!= null` and `!ms.hasExtDict()` (`match.compressBlock` holds an
+`unreachable` there today; `lazy.compressBlock` and `opt.compressBlock`
+choose their own variants); flip the strategy in
+`match.hasDictMatchStateVariant`, which lifts the refusal in
+`frame.Compressor.resetByAttachingCDict`; then the goldens: small inputs
+(≤ 8/16/32 KB) and unknown-size streams with `.cdict` and `.raw`
+dictionaries, which `dict_test.zig`'s "refused" test lists today, into
+`corpus.dict_cases`, and `tools/gen-goldens.sh`. Checked against libzstd
+the same way (`zref.c` / `zstream.c` take every dictionary path already).
+The attach reset (`resetByAttachingCDict`) is ported but unexercised;
+verify it with the first variant (`ZSTD_resetCCtx_byAttachingCDict`: the
+parameters by `ZSTD_adjustCParams_internal(cdict cParams, …,
+ZSTD_cpm_attachDict)` with the frame's window log, the working window
+moved up to the CDict's end when it lies below, `loadedDictEnd`).
 
 ## Decoder
 
@@ -980,6 +1149,39 @@ salt permutes rows and tags), and the stream's output buffer one byte
 short of libzstd's `compressBound(block) + 1` (the bound leaves 512 bytes
 over a block and its header, so the room never decides).
 
+**Dictionaries** (D0, 2026-09-24) have their own goldens:
+`src/testdata/cdict_goldens.zig`, 326 frames and streams over 74
+`corpus.dict_cases` (every level −5…22 on the copy, load, prefix,
+`compressUsingDict` and reload paths; content types; IDs of 0–4 bytes;
+the attach preferences; windows across a dictionary; frequent overflow
+correction; long dictionaries; streams), through `tools/zref.c` /
+`zstream.c`, which decode each frame back with the dictionary. Before the
+cases: 2 700 random one-shot and 1 900 random streamed frames (inputs up
+to 700 KB, raw and trained dictionaries of 0 bytes to 64 KB and a 17.5 MB
+one, every path, random advanced parameters) identical to libzstd, 600
+more against the frequent-correction build; edge dictionaries (empty,
+under 8 bytes, truncated, flipped bytes) fail on both sides. A 112-mutation
+sweep of the new code: 89 caught (37 only after the cases and unit tests
+it asked for, 2 of them inputs found by seed search), 11 equivalent (the
+no-magic branch's `auto` test after `raw_content` was handled; a full
+dictionary with no content, whose repcodes fail anyway; an 8-byte content,
+which fills no position; clearing the tag table, whose stale entries sort
+after live ones; `loadedDictEnd` resets that `ZSTD_checkDictValidity`
+already makes; the optimal parser's price type for inputs of 8 bytes, which
+search nothing; a zero `valPerRank` slot already zero; the copy's row
+switch, `nextToUpdate` and `lowLimit`, all set again by the first window
+update), 5 unreachable today (the CDict tags, read only by the attach
+variants; a Huffman or FSE cost of 0 bits under a table the trainer
+makes; the epilogue's empty-frame header, which no API path reaches; a
+dictionary over 596 MB), and 7 uncovered: the table-reach trim by the
+chain log, LDM entries from a raw dictionary (the one case's dictionary
+equals its input, so the normal finder finds the same matches — D3, LDM
+with a dictionary, owns it), `ZSTD_getLowestPrefixIndex` with an adjacent
+prefix larger than the window within one small block, the post-splitter's
+6-literal threshold under a dictionary table, `ZSTD_dictAndWindowLog` at an
+exact power of two (the parameters differ, the frames do not on the one
+case), and the tagged-table cap at 2^24 (needs a 16 MB dictionary).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Speed
@@ -1073,17 +1275,19 @@ dictionaries are undecided.
 - ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
   *Algorithm*. (The row tag table needs no reduction: it holds tags and
   in-row heads, not indices.)
-- **Z4 — Compression with a dictionary.** Raw-content and zstd-format
-  dictionaries (`ZSTD_loadCEntropy`, `ZSTD_loadDictionaryContent`), a
-  reusable `CDict`, libzstd's attach / copy / reload choice
-  (`ZSTD_shouldAttachDict` by size and strategy), which needs the
-  **dictMatchState variant of every match finder** (on top of Z1's
-  extDict), and the dictionary ID in the header with its flag
-  (`ZSTD_c_dictIDFlag`), and the dictionary parameters
-  (`deterministicRefPrefix`, `forceMaxWindow`, `forceAttachDict`,
-  `prefetchCDictTables`). Dedicated dictionary
-  search (`enableDedicatedDictSearch`) optional. Needs Z2 to decode.
-  **2–3 sessions** after Z1.
+- **Z4 — Compression with a dictionary.** ~~**D0**~~ done 2026-09-24
+  (see *Dictionaries*): raw-content and full dictionaries, `CDict`, the
+  load / copy / reload paths and the attach decision, prefixes,
+  `compressUsingDict` / `compressUsingCDict`, the dictionary ID and its
+  flag, `forceAttachDict`, `deterministicRefPrefix`, `forceMaxWindow`;
+  attaching is refused. Left:
+  - **D1–D3 — attach**: the `dictMatchState` variant of every match
+    finder — D1 `fast`/`dfast` (tagged CDict tables), D2 hash chain / row
+    / DUBT, D3 the optimal parsers (and LDM with a dictionary) — each
+    lifting the refusal for its strategies (*Dictionaries*, "Adding an
+    attach variant"). **~1 session each.**
+  - Dedicated dictionary search (`enableDedicatedDictSearch`) optional;
+    `prefetchCDictTables` (speed only).
 - **Z5 — Dictionary training.** ~~**Z5a**~~ done 2026-09-24: the content
   cover and fastCover pick, the optimizers' grid, memory estimates and a
   ceiling (see *Dictionary training*). Left, **Z5b**:

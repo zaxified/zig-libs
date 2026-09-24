@@ -17,7 +17,7 @@ const corpus = @import("testdata/corpus.zig");
 const goldens = @import("testdata/stream_goldens.zig");
 const param_test = @import("param_test.zig");
 
-const Run = struct {
+pub const Run = struct {
     out: []u8,
     /// Blocks compressed with the window in two segments.
     ext_dict_blocks: u32,
@@ -29,12 +29,12 @@ const Run = struct {
 
 /// Drive a stream over `src` as `tools/zstream.c` does for `schedule`.
 fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, schedule: []const u8) !Run {
-    return runOn(gpa, null, src, level, checksum, schedule);
+    return runOn(gpa, null, src, level, checksum, schedule, .none);
 }
 
 /// `run`, on `reused` (reset to the schedule's options) rather than on a
 /// fresh stream when it is given.
-fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level: i32, checksum: bool, schedule: []const u8) !Run {
+pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level: i32, checksum: bool, schedule: []const u8, dictionary: zstd.Dictionary) !Run {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var pledged: ?u64 = null;
@@ -82,7 +82,7 @@ fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level
         };
         if (s == null) {
             if (window_log) |w| advanced.window_log = w;
-            const opts: stream.Options = .{ .level = level, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced };
+            const opts: stream.Options = .{ .level = level, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced, .dictionary = dictionary };
             if (reused) |r| {
                 try r.reset(opts);
                 s = r;
@@ -162,7 +162,7 @@ test "streaming output is byte-identical to libzstd 1.5.7's ZSTD_compressStream2
         defer gpa.free(back);
         for (sc.levels) |level| for ([_]bool{ false, true }) |ck| {
             const g = find(sc, level, ck).?;
-            const r = try runOn(gpa, &reused, src, level, ck, sc.schedule);
+            const r = try runOn(gpa, &reused, src, level, ck, sc.schedule, .none);
             defer gpa.free(r.out);
             frames += 1;
             var digest: [32]u8 = undefined;
