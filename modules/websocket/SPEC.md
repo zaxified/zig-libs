@@ -307,6 +307,8 @@ The RED comes from the foreign corpus and from nothing else.
 
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
+**Server-side `Origin` check** — REQUESTED (2026-09-24, qap security review M6.2). `handshake.acceptHandshake` accepts any `Origin`, so a server that trusts ambient browser credentials (cookies, a TLS client certificate) can be hijacked across sites: another site's page opens the socket as the user, and CORS does not apply to WebSockets. gorilla/websocket (`Upgrader.CheckOrigin`, default = same host) and Node `ws` (`verifyClient`) both check it. Ideal API: `AcceptOptions.origins: []const []const u8` (allow-list, `"*"` = any), with the default letting through a request without `Origin` or one whose host equals `Host`, and a distinct error (`error.OriginNotAllowed` → 403). qap does it itself for now: `ws.originAllowed` (`src/ws.zig`, marked `zig-libs request: websocket`).
+
 - permessage-deflate (RFC 7692) extension negotiation + DEFLATE framing — see "Out of scope" above.
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller.
 
