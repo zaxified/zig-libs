@@ -66,6 +66,8 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.ldm_bucket_size_log = v;
     } else if (Eq.f(name, "ldmHashRateLog")) {
         adv.ldm_hash_rate_log = v;
+    } else if (Eq.f(name, "targetCBlockSize")) {
+        adv.target_c_block_size = v;
     } else if (Eq.f(name, "srcSizeHint")) {
         hint.* = v;
     } else return error.BadParam;
@@ -189,6 +191,8 @@ test "parameters outside libzstd's bounds are refused, its edges accepted" {
         .{ .ok = &.{ .{ .ldm_min_match = 0 }, .{ .ldm_min_match = 4 }, .{ .ldm_min_match = 4096 } }, .bad = &.{ .{ .ldm_min_match = 3 }, .{ .ldm_min_match = 4097 } } },
         .{ .ok = &.{ .{ .ldm_bucket_size_log = 0 }, .{ .ldm_bucket_size_log = 1 }, .{ .ldm_bucket_size_log = 8 } }, .bad = &.{.{ .ldm_bucket_size_log = 9 }} },
         .{ .ok = &.{ .{ .ldm_hash_rate_log = 0 }, .{ .ldm_hash_rate_log = 25 } }, .bad = &.{.{ .ldm_hash_rate_log = 26 }} },
+        // below 1340 counts as 1340, as in libzstd
+        .{ .ok = &.{ .{ .target_c_block_size = 0 }, .{ .target_c_block_size = 1 }, .{ .target_c_block_size = 131072 } }, .bad = &.{.{ .target_c_block_size = 131073 }} },
     };
     for (edges) |e| {
         for (e.ok) |adv| _ = try zstd.compress(gpa, &buf, "abc", .{ .advanced = adv });

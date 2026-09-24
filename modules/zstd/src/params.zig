@@ -331,6 +331,11 @@ pub const Advanced = struct {
     /// `ZSTD_c_ldmHashRateLog`, 0..25: one position in 2^rate enters the LDM
     /// table; 0 or null derives it from the hash log, else the strategy.
     ldm_hash_rate_log: ?u32 = null,
+    /// `ZSTD_c_targetCBlockSize`, up to 131072: cut each block into
+    /// compressed blocks of about this many bytes (superblocks), so a
+    /// streaming decoder can start sooner; values below 1340 count as 1340.
+    /// 0 or null: off.
+    target_c_block_size: ?u32 = null,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).
@@ -356,7 +361,8 @@ pub const Advanced = struct {
             !B.in(nonZero(adv.ldm_hash_log), hash_log_min, hash_log_max) or
             !B.in(nonZero(adv.ldm_min_match), ldm_min_match_min, ldm_min_match_max) or
             !B.in(nonZero(adv.ldm_bucket_size_log), ldm_bucket_size_log_min, ldm_bucket_size_log_max) or
-            !B.in(nonZero(adv.ldm_hash_rate_log), 0, ldm_hash_rate_log_max))
+            !B.in(nonZero(adv.ldm_hash_rate_log), 0, ldm_hash_rate_log_max) or
+            !B.in(adv.target_c_block_size, 0, block_size_max_abs))
             return error.ParameterOutOfBound;
     }
 };

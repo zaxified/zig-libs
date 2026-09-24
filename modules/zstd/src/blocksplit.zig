@@ -29,14 +29,14 @@ const min_sequences_block_splitting = 300;
 /// `COMPRESS_LITERALS_SIZE_MIN`.
 const compress_literals_size_min = 63;
 /// `ZSTD_MAX_HUF_HEADER_SIZE`.
-const max_huf_header_size = 128;
+pub const max_huf_header_size = 128;
 const block_header_size = 3;
 
 /// libzstd's error codes, which the literal estimate carries through
 /// unsigned arithmetic before anyone checks them (`ZSTD_isError`).
 const error_generic: usize = 0 -% @as(usize, 1);
 const error_dst_size_too_small: usize = 0 -% @as(usize, 70);
-fn isError(code: usize) bool {
+pub fn isError(code: usize) bool {
     return code > 0 -% @as(usize, 120); // ZSTD_error_maxCode
 }
 
@@ -126,7 +126,7 @@ fn resolveRepcode(rep: *const [3]u32, off_base: u32, ll0: bool) u32 {
 }
 
 /// `ZSTD_updateRep`.
-fn updateRep(rep: *[3]u32, off_base: u32, ll0: bool) void {
+pub fn updateRep(rep: *[3]u32, off_base: u32, ll0: bool) void {
     if (off_base > sequences.rep_num) {
         rep[2] = rep[1];
         rep[1] = rep[0];
@@ -148,13 +148,14 @@ pub const Entropy = struct {
     fse: *sequences.FseTables,
 };
 
-const HType = enum { basic, rle, compressed, repeat };
+pub const HType = enum { basic, rle, compressed, repeat };
 
-const HufMetadata = struct { h_type: HType, des_size: usize };
+pub const HufMetadata = struct { h_type: HType, des_size: usize };
 
-/// `ZSTD_buildBlockEntropyStats_literals` (no dictionary). Returns libzstd's
-/// size_t, error codes included.
-fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next: *literals.HufState, disabled: bool, optimal_depth: bool, meta: *HufMetadata) usize {
+/// `ZSTD_buildBlockEntropyStats_literals` (no dictionary): the serialised
+/// table goes to `des_buffer` (`hufDesBuffer`). Returns libzstd's size_t,
+/// error codes included.
+pub fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next: *literals.HufState, disabled: bool, optimal_depth: bool, meta: *HufMetadata, des_buffer: *[max_huf_header_size]u8) usize {
     var repeat = prev.repeat;
     next.* = prev.*;
     meta.des_size = 0;
@@ -188,8 +189,7 @@ fn buildLiteralsStats(src: []const u8, prev: *const literals.HufState, next: *li
 
     // Build and write the CTable
     const new_c_size = huf.estimateCompressedSize(&next.table, &counts, max_symbol);
-    var des_buffer: [max_huf_header_size]u8 = undefined;
-    const h_size: usize = huf.writeCTable(&des_buffer, &next.table, max_symbol, huff_log) catch |err| switch (err) {
+    const h_size: usize = huf.writeCTable(des_buffer, &next.table, max_symbol, huff_log) catch |err| switch (err) {
         error.Generic => error_generic,
         error.DstSizeTooSmall => error_dst_size_too_small,
     };
@@ -254,7 +254,8 @@ pub fn estimateSubBlockSize(ss: *SeqStore, prev: Entropy, next: Entropy, cfg: Co
     const strategy = cfg.strategy;
     const lits = ss.lits[0..ss.n_lit];
     var huf_meta: HufMetadata = undefined;
-    const huf_size = buildLiteralsStats(lits, prev.huf, next.huf, cfg.disable_literal_compression, strategy >= 8, &huf_meta);
+    var des_buffer: [max_huf_header_size]u8 = undefined;
+    const huf_size = buildLiteralsStats(lits, prev.huf, next.huf, cfg.disable_literal_compression, strategy >= 8, &huf_meta, &des_buffer);
     if (isError(huf_size)) return null;
 
     const n_seq = ss.n_seq;

@@ -42,6 +42,7 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       buffered input and output)            -> src/stream.zig
                                       post-block splitter and its block
                                       size estimates                        -> src/blocksplit.zig
+  lib/compress/zstd_compress_superblock.c  superblocks (targetCBlockSize)   -> src/superblock.zig
   lib/compress/clevels.h              level tables                          -> src/params.zig
   lib/compress/zstd_preSplit.c        block pre-splitter                    -> src/presplit.zig
   lib/compress/zstd_compress_literals.c  literals section                  -> src/literals.zig

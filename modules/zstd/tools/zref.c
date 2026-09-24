@@ -54,6 +54,7 @@ static struct { char const* name; ZSTD_cParameter p; } const params[] = {
     { "ldmMinMatch", ZSTD_c_ldmMinMatch },
     { "ldmBucketSizeLog", ZSTD_c_ldmBucketSizeLog },
     { "ldmHashRateLog", ZSTD_c_ldmHashRateLog },
+    { "targetCBlockSize", ZSTD_c_targetCBlockSize },
     { "srcSizeHint", ZSTD_c_srcSizeHint },
 };
 

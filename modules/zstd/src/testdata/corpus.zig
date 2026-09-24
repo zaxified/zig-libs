@@ -250,6 +250,22 @@ pub const param_cases = [_]ParamCase{
     .{ .case = "ldm-far-mix-600000-6", .params = "enableLongDistanceMatching=1,ldmHashLog=21,ldmMinMatch=16", .levels = &.{1} }, // fast's table fill ends exactly 9 bytes before the stretch
     .{ .case = "zeros-300000", .params = "enableLongDistanceMatching=1,ldmHashLog=19", .levels = &.{2} }, // fast on the first 1 byte of the window (iend - 8 below index 0)
     .{ .case = "mix-70000-0", .params = "enableLongDistanceMatching=1,ldmHashLog=15,windowLog=12", .levels = &.{3} }, // ... and dfast
+    // targetCBlockSize: each block cut into compressed blocks of about that size
+    .{ .case = "csv-600000", .params = "targetCBlockSize=1340", .levels = &.{ -5, 1, 3, 7, 16 }, .checksums = &.{ false, true } }, // the smallest target: the entropy tables go with the first sub-block
+    .{ .case = "words-262145", .params = "targetCBlockSize=1", .levels = &.{ 3, 19 } }, // below the minimum counts as it
+    .{ .case = "mix-300000-9", .params = "targetCBlockSize=16384", .levels = &.{ 1, 5, 12 } },
+    .{ .case = "random-300000", .params = "targetCBlockSize=5000", .levels = &.{3} }, // no gain: raw blocks
+    .{ .case = "zeros-300000", .params = "targetCBlockSize=2000", .levels = &.{ 1, 3 } }, // RLE blocks after the first
+    .{ .case = "long-literals", .params = "targetCBlockSize=4096", .levels = &.{ 1, 7 } }, // literal runs past a sub-block's budget
+    .{ .case = "csv-131073", .params = "targetCBlockSize=131072", .levels = &.{3} }, // the largest target: one sub-block
+    .{ .case = "mix-200000-2", .params = "targetCBlockSize=3000,literalCompressionMode=2", .levels = &.{ 3, 16 } }, // raw literals
+    .{ .case = "two-symbols-200000", .params = "targetCBlockSize=1500", .levels = &.{ 1, 9 } },
+    // ... found by a seed search over corpus inputs and parameters (original against mutant):
+    .{ .case = "ldm-drift-300000-2", .params = "targetCBlockSize=2000,strategy=8,minMatch=5,literalCompressionMode=1", .levels = &.{3} }, // a later sub-block's literals that do not shrink are stored raw
+    .{ .case = "mix-6643", .params = "targetCBlockSize=1400,minMatch=4", .levels = &.{5} }, // ... but the first one's may grow within their header size
+    .{ .case = "mix-300000-28", .params = "targetCBlockSize=1400", .levels = &.{8} }, // a sub-block exactly as long as it decodes to is folded into the next
+    .{ .case = "mix-772", .params = "targetCBlockSize=5000,windowLog=18,maxBlockSize=2000", .levels = &.{-5} }, // a superblock exactly a raw block's size minus minGain is stored raw
+    .{ .case = "ocf-mix-600000-5-w15", .params = "targetCBlockSize=7634", .levels = &.{12} }, // ... the bound counts minGain
 };
 
 /// Streaming goldens: corpus case `case` compressed through `zstd.Stream`
@@ -360,6 +376,15 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "far-repeat", .schedule = "l,w17,c300000,f0,c*,e0", .levels = &.{ -5, 1, 3 }, .ext_dict = &.{ -5, 1, 3 } },
     .{ .case = "csv-200000-0", .schedule = "l,w15,c*,e0", .levels = lazy_levels, .ext_dict = lazy_only_levels },
     .{ .case = "mix-300000-9", .schedule = "l,ldmMinMatch=4,ldmHashRateLog=1,w14,c*,e0", .levels = &.{ 1, 3, 5, 7 }, .ext_dict = &.{ 1, 3, 5, 7 } },
+    // targetCBlockSize while streaming: flushes cut blocks short, then sub-blocks
+    .{ .case = "csv-600000", .schedule = "targetCBlockSize=1340,w15,c100000,f0,c3000,f0,c*,e0", .levels = &.{ -5, 1, 3, 5, 7 }, .ext_dict = &.{ -5, 1, 3, 5, 7 } },
+    .{ .case = "far-repeat", .schedule = "targetCBlockSize=8192,o700,c*,e0", .levels = &.{ 1, 3 } }, // a small output buffer
+    // ... found by a seed search over corpus inputs and schedules (original against mutant):
+    .{ .case = "mix-2031", .schedule = "targetCBlockSize=5000,o2755,c69,c15,c17979,c1225,f82,c65,c527,c32,c3,c3,e*", .levels = &.{9} }, // the literal header allows 200 bytes for the tables
+    .{ .case = "sparse-far", .schedule = "targetCBlockSize=1340,f42293,c138441,c42,c207007,f5778,c1568,c1244,f2404,c337,c596,c0,c128,c149,c5,c3,f5,e*", .levels = &.{3} }, // a sub-block stops at its budget only while it still shrinks what it covers
+    .{ .case = "drift-300000-8", .schedule = "targetCBlockSize=1340,literalCompressionMode=2,w12,o4072,f179089,c62647,c143,c21137,c17859,f76,f371,c4148,c95,f13305,c414,c31,f585,c15,f63,c3,c18,f0,f0,c1,e*", .levels = &.{-8} }, // the last sub-block exactly as long as it decodes to: the rest goes raw
+    .{ .case = "ocf-ldm-mix-600000-9-w15", .schedule = "targetCBlockSize=1340,windowLog=13,c43458,c1546,f222273,c34063,c4968,c4479,c3902,c67154,c1427,c49105,c80,c1244,c31285,c131867,c55,c613,f1653,c54,c590,c160,c5,c13,c0,c4,c0,c2,e*", .levels = &.{-9} }, // ... and the repeat offsets go back to those of the sub-blocks emitted
+    .{ .case = "long-match", .schedule = "targetCBlockSize=2000,maxBlockSize=65536,w11,c55789,c70384,c2304,c1276,c20498,f678,f24,c74,c29,c851,c48,c43,c1,c0,c1,e*", .levels = &.{-10} }, // an RLE block needs fewer than 10 literals
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };

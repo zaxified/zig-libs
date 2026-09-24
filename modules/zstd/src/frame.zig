@@ -13,6 +13,7 @@ const presplit = @import("presplit.zig");
 const opt = @import("opt.zig");
 const blocksplit = @import("blocksplit.zig");
 const ldm = @import("ldm.zig");
+const superblock = @import("superblock.zig");
 
 pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
@@ -55,6 +56,8 @@ const Ctx = struct {
     is_first_block: bool = true,
     /// `ZSTD_blockSplitterEnabled`.
     split_blocks: bool,
+    /// `ZSTD_c_targetCBlockSize` (0: off), already raised to its minimum.
+    target_c_block_size: u32 = 0,
     partitions: [blocksplit.partitions_len]u32 = undefined,
     /// Long-distance matching: the table, and room for one block's sequences.
     ldm: ?*ldm.State = null,
@@ -262,6 +265,37 @@ fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: 
         d_rep.* = d_rep_original;
     }
     return emitBlock(out, src, c_seqs_size, last_block);
+}
+
+/// `ZSTD_compressBlock_targetCBlockSize`: one block of input, emitted as
+/// sub-blocks of about `targetCBlockSize` compressed bytes each
+/// (`superblock.zig`), else as one raw block. Returns the bytes written.
+fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usize {
+    if (buildSeqStore(c, src)) {
+        // We don't want to emit our first block as a RLE even if it
+        // qualifies because doing so will cause the decoder (cli only) to
+        // throw a "should consume all input error." This is only an issue
+        // for zstd <= v1.4.3
+        if (!c.is_first_block and c.ss.n_seq < 4 and c.ss.n_lit < 10 and isRle(src)) // ZSTD_maybeRLE
+            return emitBlock(out, src, 1, last_block);
+        const prev: superblock.State = .{ .huf = &c.prev.huf, .fse = &c.prev.fse, .rep = &c.prev.rep };
+        const next: superblock.State = .{ .huf = &c.next.huf, .fse = &c.next.fse, .rep = &c.next.rep };
+        // A superblock is not bound by compressBound: a size of a raw block
+        // or more, or no room, falls back to a raw block.
+        if (superblock.compress(&c.ss, prev, next, c.strategy, c.disable_literal_compression, c.target_c_block_size, out, src, last_block)) |c_size| {
+            const max_c_size = src.len - literals.minGain(src.len, c.strategy);
+            if (c_size != 0 and c_size < max_c_size + block_header_size) {
+                std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
+                return c_size;
+            }
+        } else |err| switch (err) {
+            error.DstSizeTooSmall => {},
+        }
+    }
+    // Superblock compression failed, attempt to emit a single no compress
+    // block. The decoder will be able to stream this block since it is
+    // uncompressed.
+    return emitBlock(out, src, 0, last_block);
 }
 
 /// `ZSTD_compressBlock_splitBlock`: one block of input, emitted as one or
@@ -673,6 +707,7 @@ pub const Compressor = struct {
             .disable_literal_compression = params.literalCompressionDisabled(adv.literal_compression, cp),
             .pre_split_level = adv.block_splitter_level,
             .split_blocks = params.resolveSplitAfterSequences(adv.split_after_sequences, cp),
+            .target_c_block_size = if (params.nonZero(adv.target_c_block_size)) |v| @max(v, superblock.target_c_block_size_min) else 0,
             .ldm = ldm_state,
             .ldm_seqs = slice(ldm.RawSeq, ws, l.ldm_seqs, l.ldm_n_seqs),
         };
@@ -748,7 +783,9 @@ pub const Compressor = struct {
             // Ensure hash/chain table insertion resumes no sooner than lowlimit
             if (c.ms.next_to_update < c.ms.low_limit) c.ms.next_to_update = c.ms.low_limit;
 
-            const c_size = if (c.split_blocks)
+            const c_size = if (c.target_c_block_size != 0)
+                compressBlockTargetCBlockSize(c, out[op..], block, last_block)
+            else if (c.split_blocks)
                 compressBlockSplit(c, out[op..], block, last_block)
             else
                 emitBlock(out[op..], block, compressBlock(c, out[op + block_header_size ..], block), last_block);

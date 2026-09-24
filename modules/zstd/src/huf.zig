@@ -417,7 +417,7 @@ pub fn writeCTable(dst: []u8, ct: *const CTable, max_symbol: u32, huff_log: u32)
 
 /// `HUF_compress1X_usingCTable_internal`: symbols are written last-to-first.
 /// Returns 0 when the stream does not fit.
-fn compress1X(dst: []u8, src: []const u8, ct: *const CTable) usize {
+pub fn compress1X(dst: []u8, src: []const u8, ct: *const CTable) usize {
     if (dst.len < 8) return 0;
     var bits = bitstream.CStream.init(dst) catch return 0;
     var n = src.len;
@@ -438,7 +438,7 @@ fn compress1X(dst: []u8, src: []const u8, ct: *const CTable) usize {
 }
 
 /// `HUF_compress4X_usingCTable_internal`: jump table + four 1X streams.
-fn compress4X(dst: []u8, src: []const u8, ct: *const CTable) usize {
+pub fn compress4X(dst: []u8, src: []const u8, ct: *const CTable) usize {
     const segment_size = (src.len + 3) / 4;
     if (dst.len < 6 + 1 + 1 + 1 + 8) return 0; // minimum space to compress successfully
     if (src.len < 12) return 0; // no saving possible: input too small

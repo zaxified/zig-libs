@@ -32,7 +32,7 @@ Not here yet, and a reader might expect it (each is a backlog item):
   libzstd's default buffered modes, frame after frame on one context; not
   the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
-- **Dictionaries (Z4, Z5), multithreading (Z9), `targetCBlockSize` (Z8).**
+- **Dictionaries (Z4, Z5), multithreading (Z9).**
 
 ## Algorithm
 
@@ -254,6 +254,7 @@ one parameter, null or `.auto` for "not set":
 | `max_block_size` | `ZSTD_c_maxBlockSize` | 1024–131072 |
 | `long_distance_matching` | `ZSTD_c_enableLongDistanceMatching` | auto / enable / disable |
 | `ldm_hash_log`, `ldm_min_match`, `ldm_bucket_size_log`, `ldm_hash_rate_log` | `ZSTD_c_ldmHashLog` … `ZSTD_c_ldmHashRateLog` (0 = not set) | 6–30, 4–4096, 1–8, 0–25 |
+| `target_c_block_size` | `ZSTD_c_targetCBlockSize` (0 = off; 1–1339 count as 1340) | 0–131072 |
 | `StreamOptions.src_size_hint` | `ZSTD_c_srcSizeHint` | 1–2^31-1 |
 
 The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
@@ -296,11 +297,32 @@ bytes; only a decoder told `format = .magicless` reads it, and such a
 decoder knows no skippable frames. `writeSkippableFrame` writes one
 (`ZSTD_writeSkippableFrame`, magic variants 0–15).
 
+`target_c_block_size` cuts each block into compressed blocks of about that
+many bytes (*superblocks*, `superblock.zig`, `ZSTD_compressBlock_targetCBlockSize`),
+so that a decoder fed over a network can emit output sooner. It takes
+precedence over the post-splitter. The block's entropy tables are built
+once for all its sequences (`ZSTD_buildBlockEntropyStats`); from their
+estimated cost per literal and per sequence, the sequences are dealt into
+`round(estimate / target)` sub-blocks of equal budget, the first charged
+120 bytes more for the tables it will carry. The first sub-block that
+writes literals (or sequences) carries their tables; the later ones say
+`set_repeat`, so a sub-block's literal header may be 3 bytes where a block
+of its own would need 4 (the header size is chosen with 200 bytes of slack
+for the tables, and a sub-block whose compressed literals would outgrow it
+stores them raw). A sub-block that does not come out smaller than what it
+decodes to is folded into the next one; if the last one fails too, the
+rest of the block goes out raw and the repeat offsets are set back to what
+the emitted sub-blocks leave. A block whose estimate exceeds its own size,
+or whose sub-blocks together would, is one raw block; a block of fewer than
+4 sequences and 10 literals that repeats one byte is an RLE block (never
+the first). The frame is not bound by `compressBound` sub-block by
+sub-block: a superblock of a raw block's size or more is replaced by the
+raw block, as libzstd does.
+
 Not here, each with its backlog item: `ZSTD_c_dictIDFlag`,
 `deterministicRefPrefix`, `forceMaxWindow`, `forceAttachDict`,
 `enableDedicatedDictSearch`, `prefetchCDictTables` (they act on
-dictionaries: Z4); `targetCBlockSize`
-(Z8); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
+dictionaries: Z4); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
 act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
@@ -610,6 +632,21 @@ context (the golden tests reuse one, so their frames never start at index
 |---|---|
 | `maybeSplitSequence` and `ZSTD_ldm_skipSequences`: every comparison at its equality, the cut match's `minMatch` test, the carry of a too-short match into the next sequence's literals, the skip dropped (8) | unreachable from LDM: its sequences are generated per block, counted only up to the block's end, and the store is discarded with the block, so no sequence runs past the end and the loop leaves when the store is empty. A panic on that path did not fire in 4 128 hunted inputs and schedules. They wait for external sequences (Z10) |
 | the loop's `ip < iend` dropped; `rep[2]` not pushed down after an LDM sequence; the hash rate derived from the hash log also at equality (`>` → `>=`) | equivalent: the store empties exactly at the block's end; below `btopt` no match finder reads the third repcode (the optimal parsers and the post-splitter, which do, take LDM matches as candidates instead); at equality the rate is 0 either way |
+
+Superblocks (Z8, 2026-09-24): 5 200 random one-shot and streamed inputs
+(corpus and generated, levels −20…22, random `targetCBlockSize` and other
+parameters) identical to libzstd the first time. 43 mutations of
+`superblock.zig` and the frame's `targetCBlockSize` path: 14 caught by the
+first 9 parameter and 2 stream cases, 10 by 10 cases the seed search found
+(corpus inputs × parameters × schedules, original against mutant; the later
+`targetCBlockSize` entries of `corpus.zig`), and 19 survive:
+
+| mutation | why no case exists |
+|---|---|
+| the target raised to 1340 in `compressMulti` or in the frame (either dropped) | equivalent: libzstd raises it twice, at `ZSTD_CCtx_setParameter` and in `ZSTD_compressSubBlock_multi`; either one suffices |
+| "sequence tables never written" returning 0 (dropped, or `set_rle` left out) | equivalent: the tables stay unwritten only when no sub-block with sequences came out smaller, so nothing was emitted but a raw block of the whole input, which the frame's size check replaces with the same raw block |
+| the predefined offset table's `max <= 28` at equality | unreachable: offset code 28 needs an offset of 2^28, a window past 256 MB |
+| literal header sizes at exactly 16 KB − 200 literals and at compressed sizes of exactly 1 KB / 16 KB; the sequence section under 4 bytes (dropped, or at 3) and the zstd ≤ 1.3.4 table workaround at 3; the sub-block budget at equality (`>` → `>=`, `<` → `<=`); no literals at all (average cost 0); the estimate exactly the block's size; the Huffman table not restored when no sub-block wrote it; the repeat-offset fix's "no literals" flag; the empty-block statistics not resetting the literal-length table; an RLE block of exactly 4 sequences | reachable in principle; two rounds of seed search (2 900 corpus and generated inputs × random targets from 1340, block sizes down to 1 KB, windows down to 1 KB, every level) did not hit one. **Uncovered.** |
 
 Index overflow correction (2026-09-23) is invisible in the output by design,
 so the golden test also demands, for every `ocf` case, a nonzero correction
@@ -953,9 +990,8 @@ dictionaries are undecided.
 - ~~**Z7 — Long-distance matching as an option.**~~ Done 2026-09-24, see
   *Algorithm* and *Advanced parameters*: the switch and the four LDM
   parameters, and the path below `btopt`.
-- **Z8 — `targetCBlockSize`** (superblocks, `zstd_compress_superblock.c`,
-  ~700 lines): blocks cut to a target compressed size for low-latency
-  streaming. **~1 session.** After Z1.
+- ~~**Z8 — `targetCBlockSize`.**~~ Done 2026-09-24, see *Advanced
+  parameters*.
 - **Z9 — Multithreaded compression** (`zstdmt_compress.c`, ~1 900 lines):
   jobs, overlap between them, LDM across jobs, `rsyncable`. libzstd's
   output does not depend on the worker count once there is more than
@@ -978,7 +1014,7 @@ dictionaries are undecided.
   `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
   `CDict` attached or copied into a reused context.
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7, Z11 done) Z8 → Z4 + Z5
+Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7, Z11, Z8 done) Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
 roughly 17–22 sessions.
 

@@ -40,7 +40,7 @@ pub fn noCompress(dst: []u8, src: []const u8) Error!usize {
 }
 
 /// `ZSTD_compressRleLiteralsBlock`.
-fn rle(dst: []u8, src: []const u8) usize {
+pub fn rle(dst: []u8, src: []const u8) usize {
     const fl_size: usize = 1 + @as(usize, @intFromBool(src.len > 31)) + @intFromBool(src.len > 4095);
     const n: u32 = @intCast(src.len);
     switch (fl_size) {

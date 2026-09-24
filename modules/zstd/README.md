@@ -201,7 +201,10 @@ const frame = try zstd.compressAlloc(gpa, data, .{ .level = 19, .advanced = .{
 Also `literal_compression`, `split_after_sequences` (the post-splitter),
 `block_splitter_level` (the pre-splitter, 0–6), and the long-distance
 matcher's `ldm_hash_log`, `ldm_min_match`, `ldm_bucket_size_log`,
-`ldm_hash_rate_log` (0 or null: derived, as libzstd does). Long-distance
+`ldm_hash_rate_log` (0 or null: derived, as libzstd does), and
+`target_c_block_size` (`ZSTD_c_targetCBlockSize`: blocks cut into
+compressed blocks of about that many bytes, at least 1340, for decoders
+fed over a network). Long-distance
 matching on sets the window log to 27 (128 MB) unless `window_log` says
 otherwise, so a stream of unknown size buffers that much; the input's size
 shrinks it in one-shot and pledged frames; `Stream` takes the same
@@ -235,18 +238,18 @@ fresh one's). The module is `heavy` in `build.zig`:
 its tests run at ReleaseSafe when Debug is asked for (Debug takes ~2 min 15 s,
 ReleaseSafe ~1 min with the build); `-Dstrict-debug` forces Debug.
 
-`src/stream_test.zig` does the same for streaming: 65 cases, each a schedule of calls
+`src/stream_test.zig` does the same for streaming: 72 cases, each a schedule of calls
 (pledged and unknown sizes, flushes, 50-byte outputs, windows down to 1 KB
 so libzstd's input buffer wraps, index overflow correction run often, long-distance
 matching switched on by hand; 24 of them found by mutation testing) over
-corpus inputs at levels -5 … 22, with and without checksum — 562 streams,
+corpus inputs at levels -10 … 22, with and without checksum — 586 streams,
 each equal in length and SHA-256 to what `ZSTD_compressStream2` produced
 (`src/testdata/stream_goldens.zig`, `tools/zstream.c` driving libzstd).
 
-`src/param_test.zig` does it for the advanced parameters: 50 cases (an
-input, a `name=value` list of libzstd parameters, levels) — 95 frames equal
+`src/param_test.zig` does it for the advanced parameters: 64 cases (an
+input, a `name=value` list of libzstd parameters, levels) — 125 frames equal
 to what `ZSTD_compress2` produced with the same parameters set
-(`src/testdata/param_goldens.zig`); 9 more stream cases carry parameters
+(`src/testdata/param_goldens.zig`); 15 more stream cases carry parameters
 too. It also pins the bounds of every parameter, magicless frames both ways
 and the content-size flag.
 

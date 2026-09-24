@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-24** — `targetCBlockSize` (SPEC backlog Z8):
+  `Advanced.target_c_block_size` (`ZSTD_c_targetCBlockSize`, 0 = off,
+  values below 1340 count as 1340, above 131072 `ParameterOutOfBound`)
+  cuts each block into compressed blocks of about that size — superblocks,
+  a port of `zstd_compress_superblock.c` (`src/superblock.zig`) with the
+  frame's `ZSTD_compressBlock_targetCBlockSize` path, one-shot, streaming
+  and `FrameWriter`. 14 parameter and 7 stream cases (30 frames, 24
+  streams) byte-identical to libzstd 1.5.7; 5 200 random inputs identical
+  on the first run; a 43-mutation sweep: 24 caught, 4 equivalent, 1
+  unreachable, 14 uncovered (SPEC.md). `zref.c` / `zstream.c` take
+  `targetCBlockSize`.
+
 - **2026-09-24** — Speed parity with libzstd (SPEC backlog Z11): within
   about 10 % of its CPU cycles at every level, one-shot and streaming (was
   1.2–1.4× at levels −5…3 and 1.3–2.0× at 5–12). The row match finder
