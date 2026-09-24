@@ -262,6 +262,8 @@ use-after-free in the reference-counted teardown). No race, deadlock, or UAF was
 confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/mqttz` is a client only. Drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so our broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+
 Broker: QoS 2, sessions persisted across a broker restart, DUP retransmit to clean-session subscribers,
 TLS, MQTT 5.0 (all documented deferrals, not bugs). The four architectural limitations of the first
 cut — O(conns×subs) fan-out under a global lock held across I/O, publisher-killing per-subscriber

@@ -385,6 +385,8 @@ Honest list of what this module does **not** do:
 * **A timeout implementation.** By design (see above) — the seam is there, the policy is the
   caller's.
 
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/smtp_client.zig`. Point both clients at one recording SMTP server with the same message and compare the command/DATA transcripts: dot-stuffing, line endings, EHLO parameters and AUTH. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT, but its last commit (2025-09) predates Zig 0.16, so it needs a port or a 0.15 toolchain first.
+
 ## Anchoring
 
 **Anchor grade:** class A · oracle EXTERNAL

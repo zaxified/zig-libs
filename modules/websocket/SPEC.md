@@ -305,6 +305,8 @@ The RED comes from the foreign corpus and from nothing else.
 
 ## Backlog / deferred
 
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+
 - permessage-deflate (RFC 7692) extension negotiation + DEFLATE framing — see "Out of scope" above.
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller.
 

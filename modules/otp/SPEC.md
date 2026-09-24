@@ -60,6 +60,10 @@ HOTP (RFC 4226) + TOTP (RFC 6238) one-time passwords; see
   directions; wrong-code reject across a window; underflow clamp at `t0`;
   non-default `t0`.
 
+## Backlog / deferred
+
+**Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/otp.zig`. Beyond the RFC 4226/6238 vectors, generate random secrets, counters, times, digit counts and algorithms, then require identical codes from both. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
+
 ## Fuzz exemption
 
 **Fuzz exemption:** EMIT-ONLY
