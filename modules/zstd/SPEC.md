@@ -267,6 +267,7 @@ one parameter, null or `.auto` for "not set":
 | `force_attach_dict` | `ZSTD_c_forceAttachDict` | default / attach / copy / load |
 | `deterministic_ref_prefix` | `ZSTD_c_deterministicRefPrefix` | |
 | `force_max_window` | `ZSTD_c_forceMaxWindow` | |
+| `enable_dedicated_dict_search` | `ZSTD_c_enableDedicatedDictSearch` | |
 
 The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
 `error.ParameterOutOfBound`, where `ZSTD_CCtx_setParameter` refuses. The
@@ -330,9 +331,9 @@ the first). The frame is not bound by `compressBound` sub-block by
 sub-block: a superblock of a raw block's size or more is replaced by the
 raw block, as libzstd does.
 
-The four dictionary parameters are described in *Dictionaries*. Not here,
-each with its backlog item: `enableDedicatedDictSearch`,
-`prefetchCDictTables` (Z4; the second changes speed only); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
+The five dictionary parameters are described in *Dictionaries*. Not here,
+each with its backlog item: `prefetchCDictTables` (Z4; it changes speed
+only); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
 act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
@@ -712,6 +713,68 @@ and the long-match-plus-one dict branch (`m23`, `m27`).
   `m26` (`dfastDictMatchStateBlock`'s long-match-plus-one prefix
   acceptance `match_idx_l3 >= prefix_lowest_index` vs `>`, the sibling of
   the now-killed `m22`/`m24`, just on the "+1" lookahead specifically).
+
+**The dedicated dictionary search (D4, 2026-09-25).**
+`Advanced.enable_dedicated_dict_search` (`ZSTD_c_enableDedicatedDictSearch`)
+acts on the `CDict`s made with those parameters (`CDict.initAdvanced`, and
+the context's own for `Dictionary.raw`, which libzstd makes from the
+context's requested parameters); a `CDict.init` never has it
+(`ZSTD_createCDict`). `ZSTD_createCDict_advanced2`: the parameters are
+`ZSTD_dedicatedDictSearch_getCParams` -- the level's row for an input of 0
+bytes (not 513) plus the dictionary, so the window is sized for the
+dictionary alone, the hash log 2 larger for `greedy`..`lazy2` -- with the
+explicit parameters put over them and no further adjustment (no size hint,
+no LDM window). If they are not supported (`ZSTD_dedicatedDictSearch_isSupported`:
+`greedy`..`lazy2`, hash log above the chain log, chain log at most 24), the
+CDict is a plain one with the plain parameters. The row match finder is
+resolved on the dedicated parameters too (a 15.9 KB dictionary: 16 KB
+window, hash chains; its plain CDict would have rows). The chain table is
+always allocated (`ZSTD_allocateChainTable` with `forDDSDict`).
+
+Loading (`lazy.ddsLoadDictionary`, `ZSTD_dedicatedDictSearch_lazy_loadDictionary`)
+hashes every position with the hash log less 2 (and `minMatch` as it is: 3
+as 4, 7 as 7) into a temporary hash chain built inside the oversized hash
+table, then lays each hash's chain out as a bucket of 4 entries -- the
+three newest positions, newest first, and `(start << 8) | length` of the
+rest of the chain, copied contiguously into the chain table: at most
+`min(2^searchLog - 3, 255)` entries (unsigned, so a search log of 1 wraps
+to 255), and at most 3 of them older than the chain table's reach. A
+context always attaches such a CDict (`ZSTD_shouldAttachDict`: even with
+`force_attach_dict = .copy` or `force_max_window`, at any input size; only
+`.load` loads its content into the context, whose own tables are plain),
+sizing its own tables from the CDict's parameters with the hash log taken
+back down (`ZSTD_dedicatedDictSearch_revertCParams`, not below 6). The
+parser is the dictMatchState one (`DictMode.dedicated_dict_search`,
+compile-time); the hash-chain and row finders, after the window, spend
+their attempts left on the bucket (stopping at an empty entry) and then on
+the chain's contiguous entries (`lazy.ddsSearch`,
+`ZSTD_dedicatedDictSearch_lazy_search`); the row finder adds
+`2^(searchLog - rowLog)` attempts the rows are capped at. libzstd also
+prefetches every candidate's bytes; that decides nothing and is left out
+(the pointer arithmetic on an empty entry would trip a safe build).
+
+Verified: 99 goldens (`corpus.dict_cases_dds`: supported and fallen-back
+levels, `.raw` and `.cdictadv`, raw and trained dictionaries, forced
+copy/load, `force_max_window`, rows on and off, search logs 1 and 7,
+minimum matches 3/5/7, explicit hash logs, 150 KB dictionary, index
+overflow correction, four stream schedules, and two hunted by the
+mutation sweep) and a random diff against libzstd 1.5.7 linked in: 7 700
+cases over random raw and trained dictionaries (tiny vocabularies for long
+chains), input sizes 0-400 KB, levels -1..22, one-shot and streamed, `.raw`
+and `.cdictadv`, random row/search/min-match/hash/chain/strategy/window/
+attach settings -- 0 mismatches. Mutation sweep (46 mutants over the new
+code in `lazy.zig`, `cdict.zig`, `frame.zig`): 41 killed (38 by the random
+diff, 1 by a unit test, 2 by hunted goldens `dds-tmp-chain-low-end` and
+`dds-chain-limit-255`), 5 equivalent: `min_chain`'s `<` as `<=` (equal
+sides give the same value); the chain attempts `2^s - 3` as `2^s - 2`
+(the one more entry laid out is never read: a search has at most `2^s`
+attempts, 3 of them spent on the bucket); zeroing only 2 of a bucket's 3
+slots (every insert shifts slot 1 into slot 2, and a bucket without
+inserts stops at slot 0); and the two "match reached the input's end"
+early exits of `ddsSearch` (no later candidate can be longer). Without a
+dictionary the port runs the same instructions (`instructions:u` of
+greedy..lazy2 on 6 MB, rows and chains: 12 336 220 k before and after,
+within 4 k); with an attached CDict (dictMatchState), within 0.002 %.
 
 **The optimal parsers attached (D3).** `btopt`, `btultra` and `btultra2`
 search an attached CDict (`zstd_opt.c` with `dictMode ==
@@ -1709,8 +1772,9 @@ dictionaries are undecided.
     (and LDM with a dictionary)~~ — all done 2026-09-24-2026-09-25, each
     lifting the refusal for its strategies (*Dictionaries*, "Adding an
     attach variant"); `hasDictMatchStateVariant` is exhaustively `true`.
-  - Dedicated dictionary search (`enableDedicatedDictSearch`) optional;
-    `prefetchCDictTables` (speed only).
+  - ~~**D4** dedicated dictionary search (`enableDedicatedDictSearch`)~~
+    done 2026-09-25 (*Dictionaries*, "The dedicated dictionary search").
+  - `prefetchCDictTables` (speed only).
 - ~~**Z5 — Dictionary training.**~~ ~~**Z5a**~~ done 2026-09-24 (content
   selection, the optimizers' grid, memory estimates and a ceiling);
   ~~**Z5b**~~ done 2026-09-25: finalization, `COVER_selectDict` (with

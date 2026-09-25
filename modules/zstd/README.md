@@ -268,7 +268,10 @@ place, for every strategy now (`fast`, `dfast`; `greedy`, `lazy`, `lazy2`,
 `btlazy2`; the optimal parsers `btopt`, `btultra`, `btultra2`) --
 `advanced.force_attach_dict = .copy` still gets libzstd's bytes for the
 copy instead, on any strategy. `CDict.initAdvanced` takes a content type
-(`.auto`, `.raw_content`, `.full`) and advanced parameters; see SPEC.md,
+(`.auto`, `.raw_content`, `.full`) and advanced parameters, among them
+`enable_dedicated_dict_search` (libzstd's dedicated dictionary search:
+for `greedy`..`lazy2`, a CDict with a bucketed table 4x the size, always
+attached; also on a context for its own `.raw` CDict); see SPEC.md,
 *Dictionaries*.
 
 Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`

@@ -2474,6 +2474,8 @@ pub const dict_defs = [_]DictDef{
     .{ .name = "raw-one", .source = .{ .generated = .{ .name = "", .len = 1, .kind = .words, .seed = 29 } } },
     .{ .name = "raw-mix-100000-self", .source = .{ .generated = .{ .name = "", .len = 100000, .kind = .mix, .seed = 14 } } },
     .{ .name = "raw-mix-3000", .source = .{ .generated = .{ .name = "", .len = 3000, .kind = .mix, .seed = 24 } } },
+    .{ .name = "raw-words-10264", .source = .{ .generated = .{ .name = "", .len = 10264, .kind = .words, .seed = 141981 } } },
+    .{ .name = "raw-two-symbols-17900", .source = .{ .generated = .{ .name = "", .len = 17900, .kind = .two_symbols, .seed = 791639 } } },
     .{ .name = "raw-words-9000-self", .source = .{ .generated = .{ .name = "", .len = 9000, .kind = .words, .seed = 30 } } },
     .{ .name = "slice-words-6000-at-1000", .source = .{ .slice = .{ .of = .{ .name = "", .len = 9000, .kind = .words, .seed = 35 }, .from = 1000, .len = 6000 } } },
     .{ .name = "slice-far-repeat-tail", .source = .{ .slice = .{ .of = .{ .name = "", .len = 1400000, .kind = .far_repeat, .seed = 34 }, .from = 692000, .len = 8000 } } },
@@ -3036,6 +3038,11 @@ pub const dict_cases_dds = [_]DictCase{
     .{ .name = "dds-stream-load", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .schedule = "enableDedicatedDictSearch=1,c*,e0", .levels = &.{ 4, 5, 6, 8 } },
     .{ .name = "dds-stream-cdictadv", .input = in_csv_200000, .dict = "zd-csv", .path = .cdictadv, .schedule = "enableDedicatedDictSearch=1,c50000,f0,c*,e0", .levels = &.{ 5, 6, 7, 11 } },
     .{ .name = "dds-stream-pledged", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "enableDedicatedDictSearch=1,p40000,c*,e0", .levels = &.{ 4, 6 } },
+    // Found by the mutation sweep (hunted, original against mutant):
+    // a position exactly at the temporary chain's low end starts a chain
+    .{ .name = "dds-tmp-chain-low-end", .input = .{ .name = "", .len = 1874, .kind = .words, .seed = 667508 }, .dict = "raw-words-10264", .path = .load, .params = "enableDedicatedDictSearch=1,hashLog=9,chainLog=7", .levels = &.{5} },
+    // a search log of 10: the laid-out chains stop at 255 entries
+    .{ .name = "dds-chain-limit-255", .input = .{ .name = "", .len = 1893, .kind = .two_symbols, .seed = 830422 }, .dict = "raw-two-symbols-17900", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,searchLog=10,useRowMatchFinder=2", .levels = &.{6} },
     .{ .name = "dds-stream-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "enableDedicatedDictSearch=1,w12,c10000,f0,c*,e0", .levels = &.{ 5, 8 } },
 };
 

@@ -708,6 +708,8 @@ pub const rows = [_]Golden{
     .{ .case = "dds-stream-cdictadv", .level = 11, .checksum = false, .len = 72750, .sha256 = "d94d4bd52628c10f82843af2975e90bc3081dadc2b6493198d43d561a128ba7b" },
     .{ .case = "dds-stream-pledged", .level = 4, .checksum = false, .len = 8161, .sha256 = "d55bbf15f21aadf4186596f66aa8054f1bdd71968520a251c80fe2500fb6bda0" },
     .{ .case = "dds-stream-pledged", .level = 6, .checksum = false, .len = 8055, .sha256 = "952a6f3d2c316100b1038c348147146f5eb77e9e69555dfe436b3530dfbbb0aa" },
+    .{ .case = "dds-tmp-chain-low-end", .level = 5, .checksum = false, .len = 490, .sha256 = "64057ea8c249ca7269377d5495fa380743fa04c51ea9b2616009859d05eb2d19" },
+    .{ .case = "dds-chain-limit-255", .level = 6, .checksum = false, .len = 362, .sha256 = "13aab3ce08faf384c6ba4a66bf0bd9db3c45dcc031767a580bbd348501f26919" },
     .{ .case = "dds-stream-wrap", .level = 5, .checksum = false, .len = 8642, .sha256 = "ab2f922a34a46d69d75cc5450335f98a818e13cf7be1cbc814faf7c0cbcf4dc9" },
     .{ .case = "dds-stream-wrap", .level = 8, .checksum = false, .len = 7734, .sha256 = "78a90c5d1c93f43547b2cd9e400c39a494a2cadb78c24771f3a90caac7be7be3" },
     .{ .case = "attach-fast-at-cutoff", .level = 1, .checksum = false, .len = 1944, .sha256 = "96925446f06fea872cfa038020ab54af717f89b8d9a862ed0e1550e768c74a63" },

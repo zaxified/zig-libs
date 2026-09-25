@@ -14,6 +14,8 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   falls back to a plain CDict as libzstd does. `CDict` gains
   `dedicated_dict_search`; `CDict.paramsFor` returns the dedicated
   parameters when they apply. No-dictionary output and speed unchanged.
+  99 new dictionary goldens, 7 700 random cases identical to libzstd
+  1.5.7, mutation sweep 46: 41 killed, 5 equivalent.
 - **2026-09-25** — **BREAKING:** dictionary training now gives finished
   zstd dictionaries (SPEC backlog Z5b). `zstd.dict_builder` gains
   `finalizeDictionary` (`ZDICT_finalizeDictionary`, its entropy tables
