@@ -20,7 +20,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `deinit`); `frame.Compressor.setupStream2` split from `initStream2`
   (internal). Out of range `nb_workers`/`job_size`/`overlap_log` are
   `error.ParameterOutOfBound` (libzstd clamps). `rsyncable` and the
-  trainers' multithreaded optimizers: Z9b.
+  trainers' multithreaded optimizers: Z9b. 57 goldens (each checked with
+  1/2/4/8 threads and inline), 2 040 random runs identical, mutation sweep
+  56: 45 caught, 8 equivalent, 3 uncovered (SPEC *Anchoring*).
 
 - **2026-09-25** — `Advanced.enable_dedicated_dict_search`
   (`ZSTD_c_enableDedicatedDictSearch`, SPEC backlog Z4): a `CDict` made

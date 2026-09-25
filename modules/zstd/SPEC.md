@@ -1764,6 +1764,45 @@ for `>` on the best length (a zero-length candidate re-pricing the
 offset; one random real-text input caught it, no generator input in
 29 000 tried).
 
+**Multithreading** (Z9a, 2026-09-25): `testdata/mt_goldens.zig`, 57 rows
+over 29 `corpus.mt_cases` (one-shot and streamed, 512 KB jobs over 1–3 MB
+inputs, every strategy family, every overlap from none to a window, the
+round buffer wrapping, LDM across jobs and its reach into a raw prefix,
+checksums, a job of no input, empty frames, the 512 KB routing edge,
+dictionaries loaded / as a raw or full prefix / a CDict attached or
+copied), from libzstd built with `ZSTD_MULTITHREAD` at 3 workers; the
+recipe checks that 1 worker gives the same bytes, and `mt_test.zig` runs
+every row with 1, 2, 4 and 8 threads and once with the jobs inline. The
+oracles for everything else are now the multithreaded build too: all
+other goldens came out unchanged. Before the goldens, 2 040 random runs
+against libzstd (`ZSTD_compress2` and `ZSTD_compressStream2` plans with
+flushes, pledges and small output buffers; levels −7…22, inputs 0–4.5 MB,
+1–8 workers, random job size and overlap, LDM with small windows, random
+advanced parameters, raw and trained dictionaries by every path), 400 of
+them with the jobs inline: all identical. A mutation sweep of the new
+code, 56 mutations: 45 caught (4 of them as a hang: a job that never
+completes), 12 of those only after the cases they asked for (a copy just
+past the window, a raw prefix with a small window, `deterministicRefPrefix`,
+LDM with a large cycle log, a prefix that only LDM reaches from the second
+job and whose validity ends exactly at the input's end, exactly 512 KB
+pledged, a prefix across two frames). 8 equivalent: `forceMaxWindow` for
+the later jobs (their prefix is contiguous with the input, so
+`ZSTD_checkDictValidity` clears `loadedDictEnd` at the first block either
+way); the later jobs' pledged size (it only sizes buffers and the dropped
+header); clearing the checksum flag of a one-job frame (nothing reads it
+again in that frame); the level of a full prefix's CDict (a CDict made
+this way has no level, and level 0's row is the default level's, under the
+frame's explicit parameters); the external sequences skipped by a block
+under 7 bytes, both ways (only a job's last block can be that small); an
+assertion; `end`'s "frame not ended" answer (unreachable: an `end` that
+consumed its input has created the last job, or holds it ready). 3
+uncovered: a later job's prefix read as `auto` instead of raw content (it
+matters only when the overlap starts with the dictionary magic), and two
+concurrency invariants a deterministic test cannot provoke (one job more
+in flight than threads, which could overwrite a queued job; the
+round-buffer in-use check skipped for one job too many, which could
+overwrite a running job's input).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Speed
@@ -1802,6 +1841,14 @@ Before Z11 (2026-09-24) the same measurement gave 1.2–1.4× at levels
   place, so `b` receives the new `a`; the goldens caught it.)
 - `fast`/`dfast` prefetch 64 and 128 bytes ahead when their step grows, as
   libzstd does.
+
+**Multithreaded** (Z9a; wall-clock and CPU seconds, 33.5 MB of Zig
+source and a mixed corpus, one-shot, ReleaseFast, 8 cores, not pinned):
+level 3, 1 worker 0.17–0.21 s wall (libzstd 0.15–0.21), 4 workers 0.09 s
+(libzstd 0.09–0.10); level 9, 0.57–0.63 (0.56–0.59) and 0.36–0.39
+(0.37–0.38); level 19 with 4 MB jobs, 1 worker 14.2 s (14.4), 4 workers
+5.1 s wall, 16.7 s CPU (4.8, 15.4). At level 19's default job size (32 MB)
+that input is one job and 4 workers gain nothing, as in libzstd.
 
 What is left above 1.0×: a few percent of instructions in `fast`'s search
 loop and `btopt`'s (levels 13–16, 1.13–1.15× instructions at equal

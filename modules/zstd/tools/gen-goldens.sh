@@ -2,7 +2,8 @@
 # Regenerate modules/zstd/src/testdata/goldens.zig (one-shot),
 # stream_goldens.zig (streaming), param_goldens.zig (one-shot with advanced
 # parameters) and cdict_goldens.zig (with dictionaries, and the trained
-# dictionaries zd-*.zdict they use) from libzstd v1.5.7.
+# dictionaries zd-*.zdict they use) and mt_goldens.zig (multithreaded,
+# ZSTD_c_nbWorkers) from libzstd v1.5.7.
 #
 # Needs: git, make, a C compiler, sha256sum, zig. Writes only the goldens files;
 # the libzstd checkout and the corpus files go to a disposable directory
