@@ -252,7 +252,7 @@ dictionary set the same way:
 var cd = try zstd.CDict.init(gpa, dict_bytes, 3); // raw content, or a `zstd --train` dictionary
 defer cd.deinit();
 const n = try c.compress(buf, data, .{ .level = 3, .dictionary = .{ .cdict = &cd } });
-// Or: .{ .raw = .{ .bytes = dict_bytes } }      (ZSTD_CCtx_loadDictionary: digested per call)
+// Or: .{ .raw = .{ .bytes = dict_bytes } }      (ZSTD_CCtx_loadDictionary: copied, digested per call)
 //     .{ .prefix = .{ .bytes = previous_version } } (ZSTD_CCtx_refPrefix: this frame only)
 // and c.compressUsingDict(buf, data, dict_bytes, level) / c.compressUsingCDict(buf, data, &cd, .{}).
 ```

@@ -121,8 +121,10 @@ type>:<file>`: the dictionary and how it is set — `load`
 (`ZSTD_createCDict` at the level, `CDict.init`), `cdictadv`
 (`ZSTD_createCDict_advanced2` with the level and the parameters,
 `CDict.initAdvanced`), `prefix` (`ZSTD_CCtx_refPrefix_advanced`), and for
-`zref` only `prefixadj` (the input placed right after the prefix in
-memory), `usingdict` (`ZSTD_compress_usingDict`) and `usingcdict`
+`zref` only `prefixadj` / `loadadj` (the input placed right after the
+prefix / the loaded dictionary in memory), `cdictref` / `cdictrefadj`
+(`ZSTD_createCDict_advanced2` by reference, `CDict.initReference`; the
+input after it in memory), `usingdict` (`ZSTD_compress_usingDict`) and `usingcdict`
 (`ZSTD_compress_usingCDict_advanced`, frame flags from the checksum
 argument and `contentSizeFlag` / `dictIDFlag` in the parameters); content
 type 0 auto, 1 raw, 2 full. The parameter names include `dictIDFlag`,

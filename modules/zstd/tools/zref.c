@@ -20,10 +20,15 @@
  * the way <mode> names -- the module's counterpart in brackets --
  *   load        ZSTD_CCtx_loadDictionary_advanced (by copy) + ZSTD_compress2
  *               [Options.dictionary = .raw]
+ *   loadadj     the same, with the input placed right after the dictionary
+ *               in one buffer (the copy libzstd keeps is not adjacent)
  *   cdict       ZSTD_createCDict(level) + ZSTD_CCtx_refCDict + ZSTD_compress2
  *               [CDict.init + .cdict]
  *   cdictadv    ZSTD_createCDict_advanced2 with the level and `params`
  *               + ZSTD_CCtx_refCDict + ZSTD_compress2 [CDict.initAdvanced]
+ *   cdictref    the same by reference (ZSTD_dlm_byRef) [CDict.initReference]
+ *   cdictrefadj the same, with the input placed right after the dictionary
+ *               in one buffer (the CDict's window continues into it)
  *   prefix      ZSTD_CCtx_refPrefix_advanced + ZSTD_compress2 [.prefix]
  *   prefixadj   the same, with the input placed right after the prefix in
  *               one buffer (contiguous in memory)
@@ -161,7 +166,8 @@ int main(int argc, char** argv)
         ctype = atoi(c1 + 1);
         dict = readFile(c2 + 1, 0, &dsize);
     }
-    int const adjacent = !strcmp(mode, "prefixadj");
+    int const adjacent = !strcmp(mode, "prefixadj") || !strcmp(mode, "loadadj") || !strcmp(mode, "cdictrefadj");
+    int const byref = !strcmp(mode, "cdictref") || !strcmp(mode, "cdictrefadj");
 
     /* the input, right after a copy of the prefix when they must be adjacent */
     size_t sz;
@@ -184,8 +190,8 @@ int main(int argc, char** argv)
     size_t r;
     if (!dict) {
         r = ZSTD_compress2(cctx, dst, cap, src, (size_t)n);
-    } else if (!strcmp(mode, "load")) {
-        if (ZSTD_isError(ZSTD_CCtx_loadDictionary_advanced(cctx, dict, dsize, ZSTD_dlm_byCopy, (ZSTD_dictContentType_e)ctype))) return 7;
+    } else if (!strcmp(mode, "load") || !strcmp(mode, "loadadj")) {
+        if (ZSTD_isError(ZSTD_CCtx_loadDictionary_advanced(cctx, adjacent ? buf : dict, dsize, ZSTD_dlm_byCopy, (ZSTD_dictContentType_e)ctype))) return 7;
         r = ZSTD_compress2(cctx, dst, cap, src, (size_t)n);
     } else if (!strcmp(mode, "cdict") || !strcmp(mode, "usingcdict")) {
         cdict = ZSTD_createCDict(dict, dsize, level);
@@ -199,11 +205,11 @@ int main(int argc, char** argv)
             r = ZSTD_compress_usingCDict_advanced(fresh, dst, cap, src, (size_t)n, cdict, fp);
             ZSTD_freeCCtx(fresh);
         }
-    } else if (!strcmp(mode, "cdictadv")) {
+    } else if (!strcmp(mode, "cdictadv") || byref) {
         ZSTD_CCtx_params* const cp = ZSTD_createCCtxParams();
         ZSTD_CCtxParams_init(cp, level);
         if (setParams(NULL, cp, plist)) return 7;
-        cdict = ZSTD_createCDict_advanced2(dict, dsize, ZSTD_dlm_byCopy, (ZSTD_dictContentType_e)ctype, cp, ZSTD_defaultCMem);
+        cdict = ZSTD_createCDict_advanced2(adjacent ? buf : dict, dsize, byref ? ZSTD_dlm_byRef : ZSTD_dlm_byCopy, (ZSTD_dictContentType_e)ctype, cp, ZSTD_defaultCMem);
         ZSTD_freeCCtxParams(cp);
         if (!cdict) { fprintf(stderr, "ZSTD_createCDict_advanced2 failed\n"); return 5; }
         ZSTD_CCtx_refCDict(cctx, cdict);
@@ -225,7 +231,7 @@ int main(int argc, char** argv)
         ZSTD_DCtx* const dctx = ZSTD_createDCtx();
         ZSTD_DCtx_setParameter(dctx, ZSTD_d_windowLogMax, 31);
         if (paramValue(plist, "format", 0)) ZSTD_DCtx_setParameter(dctx, ZSTD_d_format, ZSTD_f_zstd1_magicless);
-        if (!strcmp(mode, "prefix") || adjacent)
+        if (!strcmp(mode, "prefix") || !strcmp(mode, "prefixadj"))
             ZSTD_DCtx_refPrefix_advanced(dctx, dict, dsize, (ZSTD_dictContentType_e)ctype);
         else
             ZSTD_DCtx_loadDictionary_advanced(dctx, dict, dsize, ZSTD_dlm_byRef, (ZSTD_dictContentType_e)ctype);

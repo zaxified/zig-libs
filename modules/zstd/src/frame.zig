@@ -410,9 +410,11 @@ pub const Options = struct {
 /// `ZSTD_CCtx_refCDict` and `ZSTD_CCtx_refPrefix_advanced`.
 pub const Dict = union(enum) {
     none,
-    /// Digested into a `CDict` of the context's own, with the frame's
-    /// parameters (`ZSTD_initLocalDict`), then used as `cdict` is -- except
-    /// that its level stays the frame's.
+    /// Copied (`ZSTD_dlm_byCopy`) and digested into a `CDict` of the
+    /// context's own, with the frame's parameters (`ZSTD_initLocalDict`),
+    /// then used as `cdict` is -- except that its level stays the frame's.
+    /// Where the bytes lie does not matter: an input right after them in
+    /// memory is not their continuation.
     raw: RawDict,
     /// A dictionary digested beforehand; its level, if it has one, replaces
     /// the frame's.
@@ -784,7 +786,12 @@ pub const Compressor = struct {
             .raw => |r| if (r.bytes.len != 0) {
                 if (local.* == null) {
                     const gpa = comp.gpa orelse return error.OutOfMemory;
-                    local.* = try CDict.initReference(gpa, r.bytes, .{ .level = level, .content_type = r.content_type, .advanced = adv, .src_size_hint = size_hint });
+                    // ZSTD_CCtx_loadDictionary copies the dictionary
+                    // (ZSTD_dlm_byCopy) and ZSTD_initLocalDict digests that
+                    // copy: the window must not end in the caller's memory,
+                    // or an input placed right after the dictionary would
+                    // continue it (one segment instead of an extDict).
+                    local.* = try CDict.initAdvanced(gpa, r.bytes, .{ .level = level, .content_type = r.content_type, .advanced = adv, .src_size_hint = size_hint });
                 }
                 cdict = &local.*.?;
             },

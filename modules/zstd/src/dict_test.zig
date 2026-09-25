@@ -144,7 +144,7 @@ fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Strea
         return dst[0..n];
     }
     const n = switch (dc.path) {
-        .load => try ctx.compress(dst, src, withDict(opts, .{ .raw = .{ .bytes = dict, .content_type = ctype } })),
+        .load, .loadadj => try ctx.compress(dst, src, withDict(opts, .{ .raw = .{ .bytes = dict, .content_type = ctype } })),
         .prefix, .prefixadj => try ctx.compress(dst, src, withDict(opts, .{ .prefix = .{ .bytes = dict, .content_type = ctype } })),
         .usingdict => try ctx.compressUsingDict(dst, src, dict, level),
         .cdict, .usingcdict => blk: {
@@ -153,8 +153,9 @@ fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Strea
             if (dc.path == .cdict) break :blk try ctx.compress(dst, src, withDict(opts, .{ .cdict = &cd }));
             break :blk try ctx.compressUsingCDict(dst, src, &cd, .{ .content_size = adv.content_size, .checksum = ck, .dict_id = adv.dict_id_flag });
         },
-        .cdictadv => blk: {
-            var cd = try zstd.CDict.initAdvanced(gpa, dict, .{ .level = level, .content_type = ctype, .advanced = adv });
+        .cdictadv, .cdictrefadj => blk: {
+            const o: zstd.CDict.Options = .{ .level = level, .content_type = ctype, .advanced = adv };
+            var cd = try if (dc.path == .cdictadv) zstd.CDict.initAdvanced(gpa, dict, o) else zstd.CDict.initReference(gpa, dict, o);
             defer cd.deinit();
             adv = opts.advanced;
             break :blk try ctx.compress(dst, src, withDict(opts, .{ .cdict = &cd }));
@@ -180,13 +181,17 @@ test "output with dictionaries is byte-identical to libzstd 1.5.7" {
         const dict = try buildDict(gpa, dc.dict);
         defer gpa.free(dict);
         // the dictionary and the input in one buffer: adjacent for a
-        // `prefixadj` case, whose prefix is the copy right before the input
+        // `prefixadj` / `loadadj` / `cdictrefadj` case, whose dictionary is
+        // the copy right before the input
         const buf = try gpa.alloc(u8, dict.len + dc.input.len);
         defer gpa.free(buf);
         @memcpy(buf[0..dict.len], dict);
         const src = buf[dict.len..];
         corpus.generate(dc.input, src);
-        const d = if (dc.path == .prefixadj) buf[0..dict.len] else dict;
+        const d = switch (dc.path) {
+            .prefixadj, .loadadj, .cdictrefadj => buf[0..dict.len],
+            else => dict,
+        };
         const dst = try gpa.alloc(u8, zstd.compressBound(src.len) + 64);
         defer gpa.free(dst);
         for (dc.levels) |level| for (dc.checksums) |ck| {

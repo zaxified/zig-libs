@@ -2663,10 +2663,17 @@ fn crafted(content: Case, id: u32, out: []u8) usize {
 pub const DictPath = enum {
     /// `ZSTD_CCtx_loadDictionary_advanced` + `ZSTD_compress2` (`Options.dictionary = .raw`).
     load,
+    /// The same, the input right after the dictionary in memory: libzstd
+    /// keeps a copy, so the input never continues it.
+    loadadj,
     /// `ZSTD_createCDict(level)` + `ZSTD_CCtx_refCDict` (`CDict.init`, `.cdict`).
     cdict,
     /// `ZSTD_createCDict_advanced2` with the level and the parameters (`CDict.initAdvanced`).
     cdictadv,
+    /// `ZSTD_createCDict_advanced2` by reference (`CDict.initReference`),
+    /// the input right after the dictionary in memory: the CDict's window
+    /// continues into it.
+    cdictrefadj,
     /// `ZSTD_CCtx_refPrefix_advanced` (`.prefix`).
     prefix,
     /// The same, the input right after the prefix in memory.
@@ -2707,7 +2714,19 @@ const some_levels: []const i32 = &.{ -5, 1, 3, 5, 9, 13, 19 };
 
 /// Every dictionary golden: D0's (the dictionary in the window) and those
 /// of the attach variants (the CDict searched in place).
-pub const dict_cases = dict_cases_d0 ++ dict_cases_attach_lazy;
+pub const dict_cases = dict_cases_d0 ++ dict_cases_attach_lazy ++ dict_cases_load_adjacent;
+
+/// `.raw` is loaded by copy (`ZSTD_dlm_byCopy`): an input right after the
+/// caller's dictionary in memory must not continue the context's own
+/// CDict's window. Copied (the default above the attach cutoffs, and
+/// forced), and loaded into the context anew.
+const dict_cases_load_adjacent = [_]DictCase{
+    .{ .name = "load-adjacent-copy", .input = in_words_40000, .dict = "raw-words-8000", .path = .loadadj, .levels = some_levels },
+    .{ .name = "load-adjacent-force-copy", .input = in_words_3000, .dict = "raw-words-8000", .path = .loadadj, .params = "forceAttachDict=2", .levels = &.{ -5, 1, 3, 5, 13 } },
+    .{ .name = "load-adjacent-force-load", .input = in_words_40000, .dict = "raw-words-8000", .path = .loadadj, .params = "forceAttachDict=3", .levels = &.{ -5, 1, 3, 5, 13 } },
+    // ... whereas a CDict by reference is continued, in libzstd too
+    .{ .name = "cdictref-adjacent-copy", .input = in_words_40000, .dict = "raw-words-8000", .path = .cdictrefadj, .levels = &.{ -5, 3, 13 } },
+};
 
 const dict_cases_d0 = [_]DictCase{
     // every level, one path each

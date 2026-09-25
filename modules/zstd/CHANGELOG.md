@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **BEHAVIOURAL, not breaking (bug fix):** `Options.
+  dictionary = .raw` (one-shot and `Stream`) now copies the dictionary
+  into the context's own `CDict`, as `ZSTD_CCtx_loadDictionary` does
+  (`ZSTD_dlm_byCopy`); it referenced the caller's bytes. With the input
+  placed right after the dictionary in memory, the window continued into
+  the input and the frame differed from libzstd 1.5.7's whenever the
+  CDict was copied or loaded anew (not attached). Output for any other
+  placement is unchanged. Goldens `load-adjacent-copy`,
+  `load-adjacent-force-copy`, `load-adjacent-force-load` and
+  `cdictref-adjacent-copy` (a by-reference CDict is continued, in libzstd
+  too); `tools/zref.c` gained the `loadadj`, `cdictref` and `cdictrefadj`
+  modes. The context's CDict costs one copy of the dictionary more.
+
 - **2026-09-25** — **NO CONSUMER-VISIBLE CHANGE:** `cdict_goldens.zig`
   regenerated after rebasing D1 onto D2 and Z2c's merges; +141 rows
   (D2's own cases), the rest byte-identical.

@@ -528,9 +528,9 @@ input alone. A `CDict`'s level, if it has one, replaces the context's. Then:
 `Options.dictionary` / `StreamOptions.dictionary` mirror libzstd's calls on
 a context before `ZSTD_compress2` / `ZSTD_compressStream2`: `.raw` is
 `ZSTD_CCtx_loadDictionary_advanced` — a `CDict` made by the context with
-the frame's parameters (by reference; no level of its own, so copied or
-attached, never reloaded), for one call (`Compressor.compress`) or for
-every frame until `reset` (`Stream`); `.cdict` is `ZSTD_CCtx_refCDict`;
+the frame's parameters (no level of its own, so copied or attached, never
+reloaded), for one call (`Compressor.compress`) or for every frame until
+`reset` (`Stream`); `.cdict` is `ZSTD_CCtx_refCDict`;
 `.prefix` is `ZSTD_CCtx_refPrefix_advanced`. `compressUsingCDict` is
 `ZSTD_compress_usingCDict_advanced`: the CDict's parameters (for inputs up
 to 128 KB or six times the dictionary, or a CDict without a level) with
@@ -540,6 +540,23 @@ anew. Error classes: a corrupt dictionary is `DictionaryCorrupted` /
 `DictionaryWrong` on every path, where libzstd's `ZSTD_compress2` with
 `ZSTD_CCtx_loadDictionary` reports `memory_allocation` (its internal CDict
 creation fails and it cannot tell why).
+
+**Where the dictionary lies.** libzstd's window is pointers: an input
+that starts where the window's content ends in memory continues it (one
+segment) instead of starting a new one below an extDict, and the match
+finders may then choose differently. So the bytes depend on placement
+exactly where libzstd's do: a `.prefix`, `compressUsingDict` and a
+`CDict.initReference` (`ZSTD_dlm_byRef`) are continued by an input right
+after them, in libzstd too (goldens `prefix-adjacent*`,
+`cdictref-adjacent-copy`). `.raw` is not: `ZSTD_CCtx_loadDictionary`
+copies the dictionary (`ZSTD_dlm_byCopy`) and digests the copy, so this
+port's context CDict is made with `CDict.initAdvanced` (a copy), never
+`initReference` — until 2026-09-25 it referenced the caller's bytes, and
+an input placed right after them gave other bytes than libzstd whenever
+the CDict was copied or loaded anew (goldens `load-adjacent-*`; a
+5 000-case random diff over every entry path, adjacent and not, 0
+mismatches). A CDict that owns its copy (`init`, `initAdvanced`) is
+placement-independent.
 
 **Reuse.** libzstd 1.5.7 gives a reused context the bytes of a fresh one
 with dictionaries too (1 500 frames, every way of using a dictionary,

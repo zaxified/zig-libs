@@ -319,8 +319,12 @@ pub const CDict = struct {
         return create(gpa, dict, opts, true);
     }
 
-    /// `ZSTD_createCDict_advanced2` by reference (the context's own
-    /// dictionary, `ZSTD_initLocalDict`): `dict` must outlive it.
+    /// `ZSTD_createCDict_advanced2` by reference (`ZSTD_dlm_byRef`):
+    /// `dict` must outlive it. As in libzstd, its window ends in the
+    /// caller's memory, so an input placed right after `dict` continues it
+    /// (one segment, not an extDict) and may compress differently from one
+    /// elsewhere. `Options.dictionary = .raw` does not use it: it copies,
+    /// as `ZSTD_CCtx_loadDictionary` does.
     pub fn initReference(gpa: std.mem.Allocator, dict: []const u8, opts: Options) InitError!CDict {
         return create(gpa, dict, opts, false);
     }
