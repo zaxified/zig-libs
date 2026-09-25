@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
-//! Dictionary training, content selection (port of libzstd
-//! lib/dictBuilder/cover.c and fastcover.c, v1.5.7).
+//! Dictionary training (port of libzstd lib/dictBuilder/cover.c and
+//! fastcover.c, v1.5.7; finalization in zdict.zig).
 //!
 //! libzstd's trainers pick a dictionary's CONTENT -- segments of the
 //! samples, best first at the end -- and then `ZDICT_finalizeDictionary`
-//! puts the header and the entropy tables in front of it. This file is the
-//! first half: the content, byte for byte what the trainers place in the
-//! dictionary buffer before finalization (`dict + tail .. dict + capacity`).
-//! That content is a usable raw-content dictionary by itself.
+//! puts the header and the entropy tables in front of it. The content alone
+//! (`coverContent*`, `fastCoverContent*`) is byte for byte what the
+//! trainers place in the dictionary buffer before finalization (`dict +
+//! tail .. dict + capacity`), a usable raw-content dictionary by itself;
+//! `trainCover`, `trainFastCover`, `optimizeCover`, `optimizeFastCover`
+//! and `train` give the finished dictionary.
 //!
 //! `cover` sorts every d-byte substring of the samples (a partial suffix
 //! array, `COVER_ctx_init`) and scores segments by how many samples each of
@@ -17,12 +19,11 @@
 //! segment from each in turn (`COVER_computeEpochs`), filling the buffer
 //! from the back, until it is full or the scores run out.
 //!
-//! Not here (finalization and scoring compress with a dictionary): the
-//! header and entropy tables (`ZDICT_finalizeDictionary`), and the
-//! compressed-size score `ZDICT_optimizeTrainFromBuffer_*` ranks candidates
-//! by (`COVER_selectDict`). `optimizeCoverWith` / `optimizeFastCoverWith` run the
-//! optimizer's grid of (k, d) over one shared context each, as libzstd does
-//! single-threaded, and leave the score to a caller-supplied `scorer`.
+//! The optimizers (`ZDICT_optimizeTrainFromBuffer_*`) walk a grid of
+//! (k, d) over one shared context per d, as libzstd does single-threaded,
+//! and rank candidates by `COVER_selectDict` (`selectDict`): finalize, then
+//! compress the testing samples with the dictionary. `optimize*With` takes
+//! a caller's score instead.
 //!
 //! Memory: cover needs 8 bytes per sample byte (the suffix array, then the
 //! frequencies, and the position-to-d-mer map) plus the offsets and the
@@ -30,7 +31,9 @@
 //! 2^f 16-bit in-segment counts) plus the offsets. `estimateCoverMemory` /
 //! `estimateFastCoverMemory` give the exact bytes the trainers allocate
 //! besides the dictionary itself, and every trainer refuses with
-//! `error.MemoryLimitExceeded` rather than allocate past `memory_limit`.
+//! `error.MemoryLimitExceeded` rather than allocate past `memory_limit`;
+//! the complete trainers count finalization and scoring against it too
+//! (`LimitedAllocator`).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -1769,6 +1772,21 @@ test "trainFromSlices copies the samples and trains as the contiguous trainers d
         const k = try trainFromSlices(gpa, &got, slices, m);
         try testing.expectEqualSlices(u8, want[0..n], got[0..k]);
     }
+    // `.default` is `train`: on a set where its grid's k matters
+    {
+        const j = try testSet("json-2000");
+        defer j.deinit(gpa);
+        const js: Samples = .{ .buffer = j.buffer, .sizes = j.sizes };
+        const jslices = try gpa.alloc([]const u8, js.sizes.len);
+        defer gpa.free(jslices);
+        var jat: usize = 0;
+        for (jslices, js.sizes) |*sl, n| {
+            sl.* = js.buffer[jat..][0..n];
+            jat += n;
+        }
+        const n = try train(gpa, &want, js);
+        try testing.expectEqualSlices(u8, want[0..n], got[0..try trainFromSlices(gpa, &got, jslices, .{ .default = default_memory_limit })]);
+    }
     // the copy counts: a ceiling of the samples' size refuses
     try testing.expectError(error.MemoryLimitExceeded, trainFromSlices(gpa, &got, slices, .{ .cover = .{ .k = 100, .memory_limit = s.buffer.len } }));
     try testing.expectEqual(@as(u32, 77), getDictId(got[0..try trainFromSlices(gpa, &got, slices, methods[3])]));
@@ -1825,4 +1843,18 @@ test "content of 2 GiB - 128 KiB and up cannot be finalized (offset codes above 
     const s: Samples = .{ .buffer = "", .sizes = &.{} };
     try testing.expectError(error.DictionaryCreationFailed, addEntropyTablesFromBuffer(testing.allocator, many[0..top], top, s, .{}));
     try testing.expectError(error.DictionaryCreationFailed, addEntropyTablesFromBuffer(testing.allocator, many[0 .. top + 9], top + 9, s, .{}));
+}
+
+test "addEntropyTablesFromBuffer: the caller's ID, and a buffer too small for the header" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-200");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var dict: [2048]u8 = undefined;
+    @memcpy(dict[dict.len - 1000 ..], s.buffer[0..1000]);
+    const n = try addEntropyTablesFromBuffer(gpa, &dict, 1000, s, .{ .dict_id = 7 });
+    try testing.expectEqual(@as(u32, 7), getDictId(dict[0..n]));
+    var tiny: [7]u8 = undefined;
+    try testing.expectError(error.DstSizeTooSmall, addEntropyTablesFromBuffer(gpa, &tiny, 0, s, .{}));
+    try testing.expectError(error.DstSizeTooSmall, addEntropyTablesFromBuffer(gpa, dict[0..100], 101, s, .{}));
 }

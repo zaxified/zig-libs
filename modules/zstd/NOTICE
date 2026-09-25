@@ -76,22 +76,27 @@ Translated (source, restructured into Zig but decision-for-decision the same):
   lib/common/fse_decompress.c, lib/common/bitstream.h
                                       FSE decoding, bit reader              -> src/dbits.zig
   lib/dictBuilder/cover.c, lib/dictBuilder/cover.h, lib/dictBuilder/fastcover.c
-                                      dictionary training up to
-                                      finalization: cover and fastCover
-                                      contexts, segment selection, epochs,
-                                      parameter checks, the optimizers'
-                                      parameter grid                        -> src/dict_builder.zig
+                                      dictionary training: cover and
+                                      fastCover contexts, segment selection,
+                                      epochs, parameter checks, the
+                                      optimizers, candidate scoring
+                                      (COVER_selectDict,
+                                      COVER_checkTotalCompressedSize), the
+                                      trainers' entry points                -> src/dict_builder.zig
+  lib/dictBuilder/zdict.c             dictionary finalization
+                                      (ZDICT_finalizeDictionary,
+                                      ZDICT_analyzeEntropy,
+                                      ZDICT_addEntropyTablesFromBuffer),
+                                      ZDICT_getDictID / getDictHeaderSize;
+                                      not the legacy trainer                -> src/zdict.zig
 
 Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests
 and `src/testdata/` are this collection's own work (MIT).
 
-Not taken: the dictMatchState (attached dictionary) variants of the `fast`
-and `dfast` match finders (the others are ported), training a dictionary
-past content selection (`zdict.c`'s finalization step), the prefetching
+Not taken: `zdict.c`'s legacy (divsufsort) trainer, the prefetching
 sequence decoder, the x86-64 assembly Huffman loop (its C twin is ported),
-long-distance matching below `btopt`, multithreading, `targetCBlockSize`
-super-blocks.
+multithreading.
 
 Run, not copied: `tools/` builds the same libzstd tag and runs it to produce
 `src/testdata/goldens.zig` and `src/testdata/stream_goldens.zig` (lengths and
@@ -100,7 +105,9 @@ SHA-256 digests of its output). `tools/zref.c`, `tools/zstream.c` and
 are this collection's own programs (MIT) calling libzstd's public API;
 `tools/ztrain.c` (MIT) `#include`s libzstd's `cover.c` / `fastcover.c` at
 build time to call their internal steps, and writes
-`src/testdata/dict_goldens.zig` through `tools/gen-dict-goldens.sh`. No
+`src/testdata/dict_goldens.zig` through `tools/gen-dict-goldens.sh`;
+`tools/zfinal.c` (MIT) links libzstd and calls its public dictBuilder API
+and `COVER_selectDict` for `src/testdata/dict_final_goldens.zig`. No
 libzstd source bytes are stored in this repository; the two trained
 dictionaries `src/testdata/*.zdict` are libzstd's output (its trainer,
 `ZDICT_trainFromBuffer`, run on this collection's generated samples), as

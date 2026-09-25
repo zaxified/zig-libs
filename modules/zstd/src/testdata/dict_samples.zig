@@ -56,6 +56,8 @@ pub const sets = [_]Set{
     // samples above a block (128 KB) and above a small CDict's window, for
     // finalization's truncation and skipping
     .{ .name = "big-6", .kind = .words, .nb = 6, .min_len = 60000, .max_len = 300000, .seed = 5 },
+    // samples of exactly one byte more than a 1 KiB window's block
+    .{ .name = "csv-1025", .kind = .csv, .nb = 12, .min_len = 1025, .max_len = 1025, .seed = 2 },
 };
 
 pub const Generated = struct {
@@ -283,6 +285,12 @@ pub const final_runs = [_]FinalRun{
     .{ .op = .finalize, .set = "big-6", .capacity = 65536, .off = 12345, .len = 60000, .level = 3 },
     .{ .op = .finalize, .set = "big-6", .capacity = 2048, .off = 70000, .len = 2000, .level = 19 },
     .{ .op = .finalize, .set = "big-6", .capacity = 131072, .len = 131072, .level = 1 },
+    // a 300-byte content: a 1 KiB CDict window refuses the 1025-byte samples
+    // (and counts those of 1024 in the other set)
+    .{ .op = .finalize, .set = "csv-1025", .capacity = 1024, .off = 1000, .len = 300 },
+    // average sample (223) + content = 16 KiB: the parameter table's and the
+    // window's boundary
+    .{ .op = .finalize, .set = "json-200", .capacity = 16384, .len = 16161, .level = 3 },
     // flat literals (ZDICT_flatLit), runs, few samples
     .{ .op = .finalize, .set = "random-50", .capacity = 2048, .len = 1500 },
     .{ .op = .finalize, .set = "zeros-20", .capacity = 1024, .len = 900 },
@@ -302,6 +310,8 @@ pub const final_runs = [_]FinalRun{
     .{ .op = .addentropy, .set = "words-300", .capacity = 4000, .off = 999, .len = 3800 },
     .{ .op = .addentropy, .set = "json-200", .capacity = 1000, .len = 1000 },
     .{ .op = .addentropy, .set = "csv-100", .capacity = 600, .len = 400 },
+    // exactly the 12 bytes of repcodes left after the tables
+    .{ .op = .addentropy, .set = "csv-100", .capacity = 113, .len = 100 },
     // the trainers, finished; a full buffer always keeps the content's head
     .{ .op = .cover, .set = "json-200", .capacity = 4096, .k = 200, .d = 8 },
     .{ .op = .cover, .set = "json-2000", .capacity = 16384, .k = 1000, .d = 8, .level = 1, .dict_id = 99 },

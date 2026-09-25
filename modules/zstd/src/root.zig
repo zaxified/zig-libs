@@ -25,8 +25,7 @@
 //! `Compressor.compressUsingDict` / `compressUsingCDict`) gives libzstd's
 //! bytes for the dictionary set the same way -- loaded, a `CDict` copied or
 //! reloaded, a prefix, or a `CDict` attached (small or unknown input sizes)
-//! -- except that attaching is not ported yet for `fast` and `dfast`:
-//! `error.DictAttachUnsupported` for those for now.
+//! -- and `dict_builder` trains dictionaries as libzstd's `zdict.h` does.
 //!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd.
@@ -48,8 +47,9 @@ const dstream = @import("dstream.zig");
 const cdict_mod = @import("cdict.zig");
 const ddict_mod = @import("ddict.zig");
 
-/// Dictionary training, content selection: libzstd's cover and fastCover
-/// trainers up to (not including) finalization; see dict_builder.zig.
+/// Dictionary training: libzstd's cover and fastCover trainers, their
+/// optimizers, `ZDICT_trainFromBuffer` and finalization, giving the same
+/// finished dictionaries; see dict_builder.zig.
 pub const dict_builder = @import("dict_builder.zig");
 
 pub const meta = .{
@@ -377,6 +377,7 @@ test {
     _ = @import("context_test.zig");
     _ = @import("fuzz_test.zig");
     _ = @import("dict_builder.zig");
+    _ = @import("zdict.zig");
     _ = @import("dict_golden_test.zig");
 }
 

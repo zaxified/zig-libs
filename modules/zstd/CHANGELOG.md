@@ -21,8 +21,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   `optimizeCoverWith` / `optimizeFastCoverWith`. `d` defaults to 8; the
   params structs gain `level` and `dict_id`; `memory_limit` (still 256
   MiB) now bounds all working memory, finalization and scoring included
-  (not the dictionary buffer). 63 finished dictionaries byte-identical to
-  libzstd 1.5.7 through the new oracle `tools/zfinal.c`.
+  (not the dictionary buffer). 66 finished dictionaries byte-identical to
+  libzstd 1.5.7 through the new oracle `tools/zfinal.c`, 2 060 random runs
+  identical; mutation sweep 63: 48 killed, 12 equivalent, 3 unreached.
+  `dict_test` now also decodes every dictionary frame with this module's
+  decoder.
   `frame.Compressor` gains `beginUsingCDict` / `compressBlockOnly` /
   `seqStore` (block mode, internal).
 

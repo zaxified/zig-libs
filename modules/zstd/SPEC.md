@@ -891,13 +891,15 @@ buffer (by copy or by reference) and, when a zstd-format dictionary's
 entropy is present, the same three FSE tables and one Huffman table
 `Decompressor` itself holds (a few KB).
 
-## Dictionary training (content selection)
+## Dictionary training
 
-`dict_builder.zig` ports libzstd's `cover.c` and `fastcover.c` up to, not
-including, `ZDICT_finalizeDictionary`: the dictionary content -- sample
-segments -- the trainers place at the end of the dictionary buffer, byte for
-byte (`trainCoverInto` / `trainFastCoverInto` leave it at the same place,
-`dict[len - n ..]`; `trainCover` / `trainFastCover` return a copy).
+`dict_builder.zig` ports libzstd's `cover.c` and `fastcover.c`, and
+`zdict.zig` the finalization of `zdict.c` (not its legacy divsufsort
+trainer). First the content selection (Z5a): the sample segments the
+trainers place at the end of the dictionary buffer, byte for byte
+(`coverContentInto` / `fastCoverContentInto` leave it at the same place,
+`dict[len - n ..]`; `coverContent` / `fastCoverContent` return a copy).
+Then finalization and the complete trainers (Z5b, *Finalization* below).
 
 - **cover** (`COVER_ctx_init`): every training position with `max(d, 8)`
   bytes left (`suffixSize`) is sorted by its first d bytes -- for d ≤ 8 as
@@ -944,11 +946,77 @@ byte (`trainCoverInto` / `trainFastCoverInto` leave it at the same place,
   from the accel table, the offsets). The first strictly smallest total
   wins (`COVER_best_finish` in submission order: single-threaded; libzstd's
   pool would break ties by completion order).
-- **For finalization (Z5b)**: `ZDICT_finalizeDictionary` keeps the content's
-  *head* when header + content exceed the capacity (`memmove` of the first
-  `capacity - hSize` bytes), dropping the best segments at the tail -- a
-  libzstd quirk the port must reproduce, and why `tools/ztrain.c` reads the
-  content before finalization rather than out of a finished dictionary.
+- `ZDICT_finalizeDictionary` keeps the content's *head* when header +
+  content exceed the capacity (`memmove` of the first `capacity - hSize`
+  bytes), dropping the best segments at the tail -- reproduced (every
+  trainer run that fills its buffer does it), and why `tools/ztrain.c`
+  reads the content before finalization rather than out of a finished
+  dictionary.
+
+**Finalization** (`zdict.zig`, Z5b). `ZDICT_finalizeDictionary`: magic
+number, ID (the caller's, else XXH64 of the content taken into 32 768 ..
+2^31 − 1), entropy tables, then the content, zero-padded in front to the 8
+bytes the largest start repcode needs; checks and order as libzstd's
+(capacity below the content or 256; no room for the padding). The tables
+(`ZDICT_analyzeEntropy`) come from the compressor itself: a `CDict` of the
+content made with `ZSTD_getParams(level, average sample size, content size)`
+put over the default level's (`ZSTD_createCDict_advanced`, raw content, by
+reference, no level), each sample (cut to `min(128 KB, window)` of those
+parameters) compressed as one block on one reused context through the
+**attached** CDict -- `frame.Compressor.beginUsingCDict` +
+`compressBlockOnly`, ports of `ZSTD_compressBegin_usingCDict_deprecated`
+and `ZSTD_compressBlock_deprecated` (block mode: no frame, no RLE block,
+unknown size so always attached). A sample above the context's block --
+the CDict's window, which `ZSTD_cpm_createCDict` sizes for 513 bytes plus
+the content, so a small content makes a small window -- is refused by
+`compressBlock` and not counted, as in libzstd; a block that does not
+compress is not counted either. Counted: every literal (starting from 1
+each, so all 256 bytes get a code), and the offset, match-length and
+literal-length codes (`ZSTD_seqToCodes`), from 1 up to the offset code of
+content + 128 KB (above code 30: `DictionaryCreationFailed`). Then the
+Huffman table (max 11 bits; a flat distribution that gives 8 bits is
+replaced by `ZDICT_flatLit`'s), the three normalized FSE tables
+(`useLowProbCount`), and the repcodes 1, 4, 8 -- libzstd computes the most
+common first offsets and does not use them ("impact not properly
+evaluated"); that ranking is not ported. The header must fit in 256 bytes.
+`ZDICT_addEntropyTablesFromBuffer` writes the tables straight into the
+buffer (over the content's head if they reach it), hashes the content for
+the ID after that, and moves the content down only when there is room to
+spare -- reproduced.
+
+**Scoring and the optimizers.** `selectDict` is `COVER_selectDict`:
+finalize the candidate on the finalization share (cover: the training
+samples; fastCover: `accel`'s percentage of them), then
+`COVER_checkTotalCompressedSize`: the dictionary's size plus each testing
+sample (all samples at split 1) compressed with `ZSTD_createCDict(dict,
+level)` and `ZSTD_compress_usingCDict` on one context. With `shrink`, it
+finalizes the last 256 bytes of the candidate's buffer and goes on with
+*twice the finished size* (libzstd reassigns the size to finalization's
+result) until one is within `shrink_max_regression` percent -- reading
+before the content once the size passes it, from the candidate's whole
+buffer, as libzstd does. libzstd 1.5.7's optimizers pass `shrinkDict = 0`
+whatever the caller sets, so no public trainer shrinks; `selectDict` offers
+it, anchored through `tools/zfinal.c` calling `COVER_selectDict` directly.
+`optimizeCover` / `optimizeFastCover` plug `selectDict` into Z5a's grid:
+the first strictly smallest total wins, as `COVER_best_finish` decides in
+submission order when single-threaded; libzstd's thread pool would break
+ties by completion order instead. `train` is `ZDICT_trainFromBuffer`
+(fastCover, d = 8, steps = 4, level 3). A failed candidate (finalization
+or compression error) is skipped, as libzstd's error selections never beat
+the best; none left is `error.NoCandidate` (libzstd `GENERIC`).
+
+**API choices (the user's, 2026-09-25).** `d` defaults to 8 (the CLI's);
+k stays required for `trainCover` / `trainFastCover`; the optimizers keep
+libzstd's defaults. `memory_limit` stays 256 MiB and now bounds *all*
+working memory, the dictionary buffer excluded: the complete trainers run
+on a `LimitedAllocator` that refuses any allocation past it
+(`error.MemoryLimitExceeded`), so finalization's compressor and `CDict`,
+the optimizer's candidates and scoring count too (the content selection
+is still checked up front, before allocating). `trainFromSlices` takes the
+samples as `[]const []const u8` and copies them into one buffer (the
+trainers need them contiguous: segments cross sample boundaries); the copy
+counts against the limit. Levels above 22 are `LevelUnsupported` (libzstd
+clamps). Nothing is printed (`notificationLevel`).
 
 **Memory.** Besides the dictionary buffer, cover allocates the offsets
 ((n + 1) · 8), the suffix array and the d-mer map (2 · 4 · `suffixSize`,
@@ -995,7 +1063,58 @@ cannot see the buffer's length). (3) The context API checks its split point
 2^30) is `ParameterOutOfBound`; libzstd's `(U32)1 << 32` is undefined there.
 (5) The optimizer's loops count in 64 bits (libzstd's wrap at d or k near
 2^32 and never end). (6) Warnings are not printed: `smallCorpus` gives
-`COVER_warnOnSmallCorpus`'s verdict.
+`COVER_warnOnSmallCorpus`'s verdict. (7) Finalization levels above 22 are
+`LevelUnsupported` (libzstd clamps them to 22). (8)
+`addEntropyTablesFromBuffer` refuses a content longer than the buffer or a
+buffer under 8 bytes (`DstSizeTooSmall`; libzstd reads or writes outside
+it). (9) Running out of memory (or past `memory_limit`) while scoring a
+candidate is an error, not a skipped candidate (libzstd skips a candidate
+whose `malloc` fails, and so can return another dictionary under memory
+pressure). (10) A sample-buffer check: sizes summing past it are
+`SrcSizeWrong` in finalization too.
+
+**Anchoring (Z5b).** `dict_golden_test.zig`: 66 finished-dictionary runs
+(`dict_samples.final_runs`: finalization at levels −5..22 of every
+strategy, IDs, finalization shares incl. none, flat literals, a content
+whose CDict window refuses most samples, samples above a block, the header
+not fitting, padding, refusals; `addEntropyTablesFromBuffer` incl. tables
+over the content; both trainers; both optimizers on coarse grids;
+`ZDICT_trainFromBuffer`; `COVER_selectDict` with and without shrinking),
+each dictionary's length and SHA-256, `ZDICT_getDictHeaderSize` of it, and
+the optimizers' k and d or the selection's total equal to libzstd's through
+`tools/zfinal.c` -- identical on the first run -- and each loads as a
+`DDict` (unless its tables overwrote the content). A one-off diff over
+2 060 random runs (every operation; sample
+sets of 1–700 samples, some up to 250 KB each, up to ~4 MB; capacities
+200–110 000; levels −7..22; random IDs, splits, f, accel, finalization
+shares, shrink tolerances) gave the same dictionary, header size, chosen
+parameters and totals, or the same refusal, on all of them.
+Mutation sweep of the new code (`zdict.zig`, the block-mode additions to
+`frame.zig`, the scoring, trainers and ceiling in `dict_builder.zig`): 63
+mutants, 48 killed (six only after hunting: goldens for an average sample
++ content of exactly 16 KiB, 12 bytes left for the repcodes, 1025-byte
+samples against a 1 KiB window, and unit tests for `addEntropyTables`'
+own ID and tiny buffers and `trainFromSlices(.default)` on a set where the
+grid matters), 12 equivalent, 3 unreached. Equivalent: an 8-byte
+dictionary in `getDictHeaderSize` (`<= 8` vs `< 8`: the tables then fail
+to parse anyway); the content cut at `hSize + content == capacity` (`>`
+vs `>=` cut to the same size); padding at exactly 8 bytes of content (none
+either way); `addEntropyTables`' move at `hSize + content == capacity`
+(onto itself); an average sample size of 0 treated as a known 0 (then no
+sample has a byte to compress); the analysis `CDict` made at the level
+instead of the default (every field is overridden but a zero target
+length, and the only level whose target length differs between the size
+classes, 4, uses it only with strategies that ignore it); `ZDICT_flatLit`'s
+weight of byte 0 as 3 (same code lengths; the path is reached: m30/m32
+kill); the offset table written with `offcode_max` rather than 30 symbols
+(the writer stops at the last one); RLE allowed in block mode (a context
+never leaves its first block there); the row match finder switch not
+resolved (`resetByAttachingCDict` overwrites it from the CDict); the
+optimizers' own level check (finalization refuses the level anyway); the
+candidate's buffer re-sliced. Unreached: the padding check at `hSize + 8
+== capacity` (a capacity of 256 and up needs a 248-byte header), the offset
+code limit at 30 vs 29 (a content of 1 GiB), the shrink tolerance at
+equality (a smaller dictionary with exactly the full one's total).
 
 ## Limits and refusals
 
@@ -1592,15 +1711,13 @@ dictionaries are undecided.
     attach variant"); `hasDictMatchStateVariant` is exhaustively `true`.
   - Dedicated dictionary search (`enableDedicatedDictSearch`) optional;
     `prefetchCDictTables` (speed only).
-- **Z5 — Dictionary training.** ~~**Z5a**~~ done 2026-09-24: the content
-  cover and fastCover pick, the optimizers' grid, memory estimates and a
-  ceiling (see *Dictionary training*). Left, **Z5b**:
-  `ZDICT_finalizeDictionary` (`ZDICT_analyzeEntropy` compresses the samples
-  through an attached CDict, so it needs Z4's dictMatchState path at the
-  finalization level, L3 = dfast by default; it keeps the content's head
-  when short of room), `ZDICT_trainFromBuffer*` on top of it, and
-  `COVER_selectDict` (incl. `shrinkDict`) as the optimizers' `scorer`. The
-  legacy divsufsort trainer: no. **~1 session** after Z4.
+- ~~**Z5 — Dictionary training.**~~ ~~**Z5a**~~ done 2026-09-24 (content
+  selection, the optimizers' grid, memory estimates and a ceiling);
+  ~~**Z5b**~~ done 2026-09-25: finalization, `COVER_selectDict` (with
+  shrinking) as the optimizers' score, the complete trainers and
+  `ZDICT_trainFromBuffer` (see *Dictionary training*). The legacy
+  divsufsort trainer: no. Left: multithreaded optimizers (libzstd's pool;
+  ties by completion order make them nondeterministic, so only with Z9).
 - ~~**Z6 — Advanced parameters.**~~ Done 2026-09-24, see *Advanced
   parameters*: the explicit compression parameters with libzstd's bounds
   and derivation, the content-size flag, magicless frames (both ways),
