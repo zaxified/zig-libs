@@ -86,6 +86,8 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.job_size = v;
     } else if (Eq.f(name, "overlapLog")) {
         adv.overlap_log = v;
+    } else if (Eq.f(name, "rsyncable")) {
+        adv.rsyncable = v != 0;
     } else return error.BadParam;
     return true;
 }

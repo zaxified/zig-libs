@@ -30,8 +30,10 @@
 //! module needs neither libc nor an `Io` from its caller. See SPEC.md,
 //! *Multithreading*, for the choice against `workerpool`.
 //!
-//! Not here (Z9b): `ZSTD_c_rsyncable` (`findSynchronizationPoint`, see
-//! `toLoad`), and the dictionary trainers' multithreaded optimizers.
+//! With `ZSTD_c_rsyncable` (`Advanced.rsyncable`), a rolling hash over the
+//! last 32 input bytes also cuts a job wherever its low bits are all ones
+//! (`findSynchronizationPoint`), so that an edit to the input changes the
+//! output only up to the next such point.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -54,6 +56,41 @@ const block_size_max = params.block_size_max_abs;
 /// A job compresses its input by chunks of this size (for finer progress).
 const chunk_size = 4 * block_size_max;
 const block_header_size = 3;
+
+/// `RSYNC_LENGTH`: the rolling hash's window.
+const rsync_length = 32;
+/// `RSYNC_MIN_BLOCK_LOG` (`ZSTD_BLOCKSIZELOG_MAX`): no job is cut by a
+/// synchronization point before it holds this many bytes.
+const rsync_min_block_log = 17;
+const rsync_min_block_size: usize = 1 << rsync_min_block_log;
+/// `prime8bytes`, the rolling hash's multiplier.
+const prime8bytes: u64 = 0xCF1BBCDCB7A56463;
+/// `ZSTD_ROLL_HASH_CHAR_OFFSET`.
+const roll_hash_char_offset = 10;
+
+/// `ZSTD_rollingHash_append`: `buf` added to `hash`.
+fn rollingHashAppend(hash_in: u64, buf: []const u8) u64 {
+    var hash = hash_in;
+    for (buf) |b| hash = hash *% prime8bytes +% (@as(u64, b) + roll_hash_char_offset);
+    return hash;
+}
+
+/// `ZSTD_rollingHash_compute`.
+fn rollingHashCompute(buf: []const u8) u64 {
+    return rollingHashAppend(0, buf);
+}
+
+/// `ZSTD_rollingHash_primePower`: `prime8bytes` to the `length - 1`.
+fn rollingHashPrimePower(length: u32) u64 {
+    var power: u64 = 1;
+    for (1..length) |_| power *%= prime8bytes;
+    return power;
+}
+
+/// `ZSTD_rollingHash_rotate`: the window moves by one byte.
+fn rollingHashRotate(hash: u64, to_remove: u8, to_add: u8, prime_power: u64) u64 {
+    return (hash -% (@as(u64, to_remove) + roll_hash_char_offset) *% prime_power) *% prime8bytes +% (@as(u64, to_add) + roll_hash_char_offset);
+}
 
 pub const JobError = frame.BeginError || frame.Compressor.SizeError;
 
@@ -298,6 +335,8 @@ pub const MtCtx = struct {
     target_section_size: usize = 0,
     target_prefix_size: usize = 0,
     job_ready: bool = false,
+    /// `rsync` (`RSyncState_t`), with `rsyncable` only.
+    rsync: ?Rsync = null,
 
     /// `roundBuff`: `round` lies one cache line into `round_alloc`, so no
     /// caller's buffer can end where it starts (a window would take the
@@ -442,7 +481,16 @@ pub const MtCtx = struct {
         mt.target_prefix_size = computeOverlapSize(cp, adv.overlap_log, ldm_on);
         mt.target_section_size = job_size;
         if (mt.target_section_size == 0) mt.target_section_size = @as(usize, 1) << @intCast(computeTargetJobLog(cp, ldm_on));
-        // (ZSTD_c_rsyncable, Z9b: the rolling hash's mask from the section size)
+        mt.rsync = null;
+        if (adv.rsyncable) {
+            // Aim for the targetsectionSize as the average job size.
+            const job_size_kb: u32 = @intCast(mt.target_section_size >> 10);
+            const rsync_bits: u6 = @intCast(std.math.log2_int(u32, job_size_kb) + 10);
+            // We refuse to create jobs < RSYNC_MIN_BLOCK_SIZE bytes, so make
+            // sure our expected job size is at least 4x larger.
+            std.debug.assert(rsync_bits >= rsync_min_block_log + 2);
+            mt.rsync = .{ .hit_mask = (@as(u64, 1) << rsync_bits) - 1, .prime_power = rollingHashPrimePower(rsync_length) };
+        }
         // job size must be >= overlap size
         if (mt.target_section_size < mt.target_prefix_size) mt.target_section_size = mt.target_prefix_size;
         {
@@ -626,7 +674,9 @@ pub const MtCtx = struct {
                 if (!mt.tryGetInputRange()) std.debug.assert(mt.done_job_id != mt.next_job_id);
             }
             if (mt.in_buffer) |buf| {
-                const to_load = mt.toLoad(input.*);
+                const sync = mt.findSynchronizationPoint(input.*);
+                if (sync.flush and end_op == .@"continue") end_op = .flush;
+                const to_load = sync.to_load;
                 if (mt.frame_content_size) |p| if (mt.ingested + to_load > p) return error.SrcSizeWrong;
                 @memcpy(buf[mt.in_filled..][0..to_load], input.src[input.pos..][0..to_load]);
                 input.pos += to_load;
@@ -656,10 +706,79 @@ pub const MtCtx = struct {
         return remaining;
     }
 
-    /// `findSynchronizationPoint` without `rsyncable` (Z9b adds the rolling
-    /// hash that cuts a job early): as much as fits the job.
-    fn toLoad(mt: *const MtCtx, input: stream.InBuffer) usize {
-        return @min(input.src.len - input.pos, mt.target_section_size - mt.in_filled);
+    const Rsync = struct { hit_mask: u64, prime_power: u64 };
+    const SyncPoint = struct { to_load: usize, flush: bool = false };
+
+    /// `findSynchronizationPoint`: how much of `input` to load -- as much
+    /// as fits the job, or, with `rsyncable`, up to and including the first
+    /// byte (at least `rsync_min_block_size` into the job) at which the
+    /// rolling hash of the last 32 bytes hits the mask, which then ends the
+    /// job (`flush`).
+    fn findSynchronizationPoint(mt: *const MtCtx, input: stream.InBuffer) SyncPoint {
+        const istart = input.src[input.pos..];
+        var sync: SyncPoint = .{ .to_load = @min(istart.len, mt.target_section_size - mt.in_filled) };
+        const rs = mt.rsync orelse return sync; // Rsync is disabled.
+        const filled = mt.in_filled;
+        // We don't emit synchronization points if it would produce too
+        // small blocks. We don't have enough input to find a
+        // synchronization point, so don't look.
+        if (filled + istart.len < rsync_min_block_size) return sync;
+        // Not enough to compute the hash. We will miss any synchronization
+        // points in this RSYNC_LENGTH byte window. However, since it depends
+        // only in the internal buffers, if the state is already
+        // synchronized, we will remain synchronized.
+        if (filled + sync.to_load < rsync_length) return sync;
+        const buf = mt.in_buffer.?;
+        var hash: u64 = undefined;
+        var prev: []const u8 = undefined;
+        var pos: usize = undefined;
+        // Initialize the loop variables.
+        if (filled < rsync_min_block_size) {
+            // We don't need to scan the first RSYNC_MIN_BLOCK_SIZE positions
+            // because they can't possibly be a sync point. So we can start
+            // part way through the input buffer.
+            pos = rsync_min_block_size - filled;
+            if (pos >= rsync_length) {
+                prev = istart[pos - rsync_length ..];
+                hash = rollingHashCompute(prev[0..rsync_length]);
+            } else {
+                std.debug.assert(filled >= rsync_length);
+                prev = buf[filled - rsync_length ..];
+                hash = rollingHashCompute(prev[pos..rsync_length]);
+                hash = rollingHashAppend(hash, istart[0..pos]);
+            }
+        } else {
+            // We have enough bytes buffered to initialize the hash, and have
+            // processed enough bytes to find a sync point. Start scanning at
+            // the beginning of the input.
+            pos = 0;
+            prev = buf[filled - rsync_length ..];
+            hash = rollingHashCompute(prev[0..rsync_length]);
+            if (hash & rs.hit_mask == rs.hit_mask) {
+                // We're already at a sync point so don't load any more until
+                // we're able to flush this sync point. This likely happened
+                // because the job table was full so we couldn't add our job.
+                return .{ .to_load = 0, .flush = true };
+            }
+        }
+        // Starting with the hash of the previous RSYNC_LENGTH bytes, roll
+        // through the input. If we hit a synchronization point, then cut the
+        // job off, and tell the compressor to flush the job. Otherwise, load
+        // all the bytes and continue as normal. If we go too long without a
+        // synchronization point (targetSectionSize) then a block will be
+        // emitted anyways, but this is okay, since if we are already
+        // synchronized we will remain synchronized.
+        while (pos < sync.to_load) : (pos += 1) {
+            const to_remove = if (pos < rsync_length) prev[pos] else istart[pos - rsync_length];
+            hash = rollingHashRotate(hash, to_remove, istart[pos], rs.prime_power);
+            std.debug.assert(filled + pos >= rsync_min_block_size);
+            if (hash & rs.hit_mask == rs.hit_mask) {
+                sync.to_load = pos + 1;
+                sync.flush = true;
+                break;
+            }
+        }
+        return sync;
     }
 
     const Range = struct {

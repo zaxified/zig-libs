@@ -64,6 +64,7 @@ pub const Kind = enum {
     far_mix, // 1.1 MB of `mix`, then a copy of it with sparse edits: offsets past 2^20
     dict_boundary_echo, // hunted (D1): a dictMatchState match reaches exactly the CDict's end and continues into the prefix
     survivor_literal, // hunted (D1): a mutation-sweep survivor's killing case; `seed` indexes `survivor_inputs`
+    rsync_marks, // words with rsyncable synchronization points placed by hand: `seed` indexes `rsync_mark_sets`
 };
 
 pub const cases = [_]Case{
@@ -585,6 +586,7 @@ pub fn generate(case: Case, out: []u8) void {
         },
         .dict_boundary_echo => @memcpy(out, &dict_boundary_echo_input),
         .survivor_literal => @memcpy(out, survivor_inputs[case.seed]),
+        .rsync_marks => rsyncMarks(&r, out, rsync_mark_sets[case.seed]),
         .sparse_matches => {
             const phrases = [_][]const u8{ "<record id=\"", "\" type=\"sample\">", "</record>\n", "timestamp=" };
             var i: usize = 0;
@@ -3107,6 +3109,64 @@ pub const dict_cases_attach_fast = [_]DictCase{
     .{ .name = "surv-m27-dfast", .input = .{ .name = "", .len = surv_m27_input.len, .kind = .survivor_literal, .seed = 6 }, .dict = "surv-m27-dict", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{3} },
 };
 
+/// 32 bytes whose rolling hash (`ZSTD_rollingHash_compute`) has its low 30
+/// bits set: wherever they end, an `rsyncable` job whose mask is up to 30
+/// bits (jobs up to 512 MB) may be cut (found by search).
+pub const rsync_trigger = "wbnkmjicotcudwfcxgcbczcuyvwoiqkh";
+
+/// Where `rsync_marks` inputs end a `rsync_trigger` (index of its last
+/// byte). The comments give the jobs they make; the words around them
+/// happen to hit none of these masks (checked when the goldens were made).
+pub const rsync_mark_sets = [_][]const usize{
+    // 0 (1 829 651 bytes, 512 KB jobs): a mark one byte before a job may
+    // be cut (ignored), one at 300 000 (job 300 001); one exactly 128 KB
+    // into the next job (131 073); one on a full job's last byte
+    // (524 288); one just past a full job (the next job's byte 0: ignored);
+    // 200 000 into the next; the input's last byte
+    &.{ 131071, 300000, 300001 + 131072, 431074 + 524287, 955362 + 524288, 1479650 + 200000, 1829650 },
+    // 1 (2 397 153 bytes, 1 MB jobs, 512 KB chunks): jobs of exactly one
+    // chunk, one chunk and a byte, a full job
+    &.{ 524287, 524288 + 524288, 1048577 + 1048575 },
+    // 2 (3 000 000 bytes): a mark every 140 000 bytes, jobs of 140 000
+    &.{
+        139999,  279999,  419999,  559999,  699999,  839999,  979999,  1119999, 1259999, 1399999,
+        1539999, 1679999, 1819999, 1959999, 2099999, 2239999, 2379999, 2519999, 2659999, 2799999,
+        2939999,
+    },
+};
+
+/// Words with `rsync_trigger` ending at each of `marks`, and no other
+/// 32-byte window whose rolling hash has its low 19 bits set (the smallest
+/// mask, 512 KB jobs): where such a window ends, its last byte is changed
+/// until it does not. So the marks alone cut the jobs.
+fn rsyncMarks(r: *Rng, out: []u8, marks: []const usize) void {
+    const P: u64 = 0xCF1BBCDCB7A56463; // prime8bytes
+    const mask: u64 = (1 << 19) - 1;
+    const n = rsync_trigger.len;
+    words(r, out);
+    for (marks) |m| @memcpy(out[m + 1 - n ..][0..n], rsync_trigger);
+    var power: u64 = 1; // P^(n-1)
+    for (1..n) |_| power *%= P;
+    var hash: u64 = 0;
+    var next_mark: usize = 0;
+    for (out, 0..) |*b, i| {
+        const out_byte: u64 = if (i >= n) @as(u64, out[i - n]) + 10 else 0;
+        const base = (hash -% out_byte *% (if (i >= n) power else 0)) *% P;
+        hash = base +% (@as(u64, b.*) + 10);
+        if (next_mark < marks.len and marks[next_mark] == i) {
+            next_mark += 1;
+            continue;
+        }
+        if (i + 1 < n) continue;
+        while (hash & mask == mask) {
+            // (a trigger's own bytes are never changed)
+            std.debug.assert(next_mark >= marks.len or i + n <= marks[next_mark]);
+            b.* = if (b.* >= 'a' and b.* < 'z') b.* + 1 else 'a';
+            hash = base +% (@as(u64, b.*) + 10);
+        }
+    }
+}
+
 /// A multithreaded golden (Z9a): `input` compressed with `ZSTD_c_nbWorkers`
 /// -- one-shot (`ZSTD_compress2`) with the advanced parameters `params`, or
 /// streaming with `schedule` (`stream_cases`' grammar) -- optionally with a
@@ -3190,4 +3250,32 @@ pub const mt_cases = [_]MtCase{
     .{ .name = "mt-dict-prefix-full", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .prefix, .levels = &.{ 3, 5 } },
     .{ .name = "mt-dict-cdict-attach", .input = mt_in_csv, .schedule = "c200000,f0,c*,e0", .dict = "zd-csv", .path = .cdict, .levels = &.{ 1, 5, 16 } },
     .{ .name = "mt-dict-cdict-copy", .input = mt_in_alternating, .params = "jobSize=524288,forceAttachDict=2", .dict = "zd-words", .path = .cdict, .levels = &.{3} },
+} ++ mt_cases_rsync;
+
+const mt_in_rsync_a: Case = .{ .name = "", .len = 1_829_651, .kind = .rsync_marks, .seed = 0 };
+const mt_in_rsync_b: Case = .{ .name = "", .len = 2_397_153, .kind = .rsync_marks, .seed = 1 };
+const mt_in_rsync_c: Case = .{ .name = "", .len = 3_000_000, .kind = .rsync_marks, .seed = 2 };
+
+/// `ZSTD_c_rsyncable` (Z9b): jobs cut by the rolling hash.
+const mt_cases_rsync = [_]MtCase{
+    // hand-placed synchronization points (`rsync_mark_sets`)
+    .{ .name = "mt-rsync-marks", .input = mt_in_rsync_a, .params = "jobSize=524288,rsyncable=1", .levels = &.{ -3, 1, 3, 7, 12, 19 }, .checksums = &.{ false, true } },
+    .{ .name = "mt-rsync-chunks", .input = mt_in_rsync_b, .params = "jobSize=1048576,rsyncable=1", .levels = &.{ 1, 5, 16 } },
+    // the default job size (one job of 16 MB) cut by the marks alone
+    .{ .name = "mt-rsync-default-job", .input = mt_in_rsync_c, .params = "rsyncable=1", .levels = &.{ 3, 9 } },
+    .{ .name = "mt-rsync-ldm", .input = mt_in_rsync_c, .params = "jobSize=524288,rsyncable=1,enableLongDistanceMatching=1,windowLog=20", .levels = &.{4} },
+    .{ .name = "mt-rsync-ov9", .input = mt_in_rsync_a, .params = "jobSize=524288,rsyncable=1,overlapLog=9", .levels = &.{6} },
+    // synchronization points the data makes by itself
+    .{ .name = "mt-rsync-mix-3m", .input = mt_in_mix_3m, .params = "jobSize=524288,rsyncable=1", .levels = &.{ 1, 5 } },
+    .{ .name = "mt-rsync-far-mix", .input = mt_in_far_mix, .params = "jobSize=524288,rsyncable=1", .levels = &.{2} },
+    // a frame kept on the calling thread ignores it
+    .{ .name = "mt-rsync-small", .input = mt_in_mix_300k, .params = "rsyncable=1", .levels = &.{3} },
+    .{ .name = "mt-rsync-dict", .input = mt_in_rsync_a, .params = "jobSize=524288,rsyncable=1", .dict = "zd-words", .path = .load, .levels = &.{3} },
+    // streaming: the hash started from the buffer's tail (a call ending 12
+    // bytes before 128 KB), from within the input, and at a sync point
+    // already buffered (the job table full: a tiny output buffer)
+    .{ .name = "mt-rsync-stream-tail", .input = mt_in_rsync_a, .schedule = "rsyncable=1,jobSize=524288,c131060,c*,e0", .levels = &.{ 1, 5 } },
+    .{ .name = "mt-rsync-stream-steps", .input = mt_in_rsync_c, .schedule = "rsyncable=1,jobSize=524288,c70000,c70000,c70000,c1,c20000,f0,c*,e0", .levels = &.{3}, .checksums = &.{true} },
+    .{ .name = "mt-rsync-stream-full-table", .input = mt_in_rsync_c, .schedule = "rsyncable=1,jobSize=524288,o50,c*,e0", .levels = &.{ 1, 3 } },
+    .{ .name = "mt-rsync-stream-pledged", .input = mt_in_rsync_a, .schedule = "p1829651,rsyncable=1,jobSize=524288,c300000,c*,e0", .levels = &.{3} },
 };

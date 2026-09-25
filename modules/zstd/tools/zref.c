@@ -92,6 +92,7 @@ static struct { char const* name; ZSTD_cParameter p; } const params[] = {
     { "nbWorkers", ZSTD_c_nbWorkers },
     { "jobSize", ZSTD_c_jobSize },
     { "overlapLog", ZSTD_c_overlapLog },
+    { "rsyncable", ZSTD_c_rsyncable },
 };
 
 /* Set one `name=value` token on `cctx` (or on `cparams` when given); 0 when

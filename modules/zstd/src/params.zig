@@ -460,6 +460,14 @@ pub const Advanced = struct {
     /// `btlazy2`, 8 `btopt` and `btultra`, 9 `btultra2`). Only with
     /// `nb_workers`.
     overlap_log: u32 = 0,
+    /// `ZSTD_c_rsyncable`: also end a job wherever a rolling hash of the
+    /// last 32 input bytes hits a mask of about log2(job size) bits (after
+    /// at least 128 KB of the job), so that the jobs -- and the output --
+    /// resynchronize after a local change to the input, as `gzip
+    /// --rsyncable` does for rsync. Only with `nb_workers` (a frame kept on
+    /// the calling thread ignores it, as libzstd does); costs a little
+    /// ratio and caps the speed near 400 MB/s.
+    rsyncable: bool = false,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).

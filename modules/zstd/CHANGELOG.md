@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — `Advanced.rsyncable` (`ZSTD_c_rsyncable`, SPEC backlog
+  Z9b): with `nb_workers`, a rolling hash over the last 32 input bytes also
+  ends a job where it hits a mask of about log2(job size) bits, so the
+  output resynchronizes after a local edit of the input (rsync-friendly) —
+  byte-identical to libzstd 1.5.7 for any worker count.
+
 - **2026-09-25** — **BREAKING (error set):** multithreaded compression (SPEC
   backlog Z9a, port of `zstdmt_compress.c`). `Advanced` gains `nb_workers`
   (`ZSTD_c_nbWorkers`, 0..256), `job_size` (`ZSTD_c_jobSize`) and
