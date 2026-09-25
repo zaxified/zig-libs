@@ -39,7 +39,8 @@ Not here yet, and a reader might expect it (each is a backlog item):
   libzstd's default buffered modes, frame after frame on one context; not
   the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
-- **Multithreading (Z9).**
+- **`rsyncable` and the trainers' multithreaded optimizers (Z9b).**
+  Multithreaded compression itself is here (see *Multithreading*).
 
 ## Algorithm
 
@@ -268,6 +269,7 @@ one parameter, null or `.auto` for "not set":
 | `deterministic_ref_prefix` | `ZSTD_c_deterministicRefPrefix` | |
 | `force_max_window` | `ZSTD_c_forceMaxWindow` | |
 | `enable_dedicated_dict_search` | `ZSTD_c_enableDedicatedDictSearch` | |
+| `nb_workers`, `job_size`, `overlap_log` | `ZSTD_c_nbWorkers`, `ZSTD_c_jobSize`, `ZSTD_c_overlapLog` (see *Multithreading*) | 0–256, 0–1 GiB (under 512 KB counts as 512 KB), 0–9 |
 
 The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
 `error.ParameterOutOfBound`, where `ZSTD_CCtx_setParameter` refuses. The
@@ -333,7 +335,7 @@ raw block, as libzstd does.
 
 The five dictionary parameters are described in *Dictionaries*. Not here,
 each with its backlog item: `prefetchCDictTables` (Z4; it changes speed
-only); `nbWorkers`, `jobSize`, `overlapLog`, `rsyncable` (Z9);
+only); `rsyncable` (Z9b);
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
 act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
@@ -797,6 +799,102 @@ statistics come from the CDict's entropy tables as with a copied one
 without a dictionary: a CDict has no LDM table (libzstd gives its
 `ZSTD_loadDictionaryContent` no LDM state), so an attached dictionary
 never enters it, while a loaded one does (above).
+
+## Multithreading
+
+`Advanced.nb_workers` (libzstd's `ZSTD_c_nbWorkers`) of 1 or more hands a
+frame to `zstdmt.zig`, the port of `zstdmt_compress.c`, as libzstd's
+`ZSTD_compressStream2` does: for a `Stream` whose frame is of unknown size
+or pledged above 512 KB (`ZSTDMT_JOBSIZE_MIN`; a first call that ends the
+frame pledges its input), and for one-shot `compress` of more than 512 KB
+(`ZSTD_compress2` goes through the same path). Smaller frames stay on the
+calling thread and give nbWorkers 0's bytes. From one worker up the frame
+differs from nbWorkers 0's, and **does not depend on the worker count**:
+the goldens are made with 3 workers, checked equal with 1 by the recipe,
+and the test compares 1, 2, 4 and 8.
+
+**Jobs.** The input is copied into a round buffer and cut into jobs of
+`targetSectionSize` bytes: `Advanced.job_size` (`ZSTD_c_jobSize`, a value
+under 512 KB counts as 512 KB), else 4 windows and at least 1 MB
+(`ZSTDMT_computeTargetJobLog`; with long-distance matching, whose window is
+typically oversized, 2^(cycle log + 3), at least 2 MB); a flush, or the
+end, cuts a shorter one. Where jobs end depends only on the calls — the
+caller must go on calling `flush`/`end` until they return 0, as for
+libzstd — so the bytes do too. Each job is compressed on a context of its
+own as a frame of its own: the first writes the frame header (with the
+content size and checksum flag of the whole frame) and carries the
+dictionary; every later one reloads the last `targetPrefixSize` bytes of
+the previous job's input as a raw-content prefix
+(`ZSTD_compressBegin_advanced_internal`, with `forceMaxWindow` and without
+`deterministicRefPrefix`), writes a header that is then dropped, and
+starts with its repeat offsets set to 0 (`ZSTD_invalidateRepCodes`); the
+last one ends the frame (a job of no input writes just the last empty
+block). A job compresses its input 512 KB at a time
+(`ZSTD_compressContinue`), which the pre-splitter sees as chunks. The
+overlap is `Advanced.overlap_log` (`ZSTD_c_overlapLog`): 9 reloads a whole
+window, each step below half as much, 1 nothing; 0 picks 6 up to `lazy`, 7
+for `lazy2`/`btlazy2`, 8 for `btopt`/`btultra`, 9 for `btultra2`
+(`ZSTDMT_computeOverlapSize`; with LDM a fraction of a quarter job). When
+the round buffer has no room for another job, the prefix is moved to its
+start, so a job's window is always one segment.
+
+**Serial state.** Two things run across jobs in job order
+(`ZSTDMT_serialState`): the content checksum, appended after the last job,
+and long-distance matching, whose table and window span the round buffer
+from job to job (a raw prefix is loaded into it first); the sequences it
+finds for a job are handed to that job's context as external sequences
+(`ZSTD_referenceExternalSequences`), which `ZSTD_buildSeqStore` consumes
+block by block ahead of the match finder, through `ZSTD_ldm_blockCompress`
+as when LDM runs in the context. libzstd runs this step in the workers,
+each waiting for its turn; the port runs it on the calling thread when it
+prepares the job, which is the same order and needs no lock. libzstd waits
+there, too, before it reuses round-buffer space the LDM window still
+covers; once every prepared job's step has run the window never does
+(else libzstd would wait forever), which a safety-checked assertion pins.
+
+**Dictionaries.** Only the first job has one. `.raw` and `.cdict` are
+used by the first job's context as by a single-threaded frame (attached,
+copied or reloaded by its size — the frame's, unknown included); a raw
+`.prefix` (content type raw) is the first job's prefix and is loaded into
+the LDM table; a `.prefix` of another content type becomes a `CDict` made
+by reference with the frame's parameters and no level (libzstd's
+`ZSTD_createCDict_advanced` in `ZSTDMT_initCStream_internal`). The later
+jobs see only their predecessor's tail.
+
+**Threads.** `Stream` and `Compressor` make a `zstdmt.MtCtx` at their
+first multithreaded frame and keep it: `nb_workers` `std.Thread`s, each
+with its own compression context (reused frame after frame, as libzstd's
+CCtx pool), a job table of a power of two above `nb_workers + 2`, the round
+buffer, each job slot's output and sequence buffers, and the LDM table. A
+job is posted only while a thread is free (`POOL_tryAdd` on a pool without
+a queue); otherwise it waits prepared (`jobReady`) and the input is not
+read further. `flush` and `end` wait for the oldest job's next output when
+no input could be taken. Synchronisation is atomics plus the futex of
+`std.Io` through the process-global `std.Io.Threaded` instance, whose
+futex calls touch no state of the instance, so the module needs neither
+libc (zig-libs policy) nor an `Io` from its caller. Not `workerpool`: it
+needs the caller's `Io`, boxes every job on the heap and queues without
+bound, where this needs a fixed set of threads each owning a context and
+at most one job each. With `builtin.single_threaded`, or the test seam
+`run_inline`, the jobs run on the calling thread when posted — the same
+bytes. The large buffers (the round buffer, up to `max(window,
+nb_workers × job) + 3 jobs`; each job's output, `compressBound(job)`) come
+from the allocator's `rawAlloc`, so a safe build does not fill them with
+`undefined` and they stay unresident until used, as libzstd's `malloc`
+does; at level 22 with an unknown size a job is 512 MB.
+
+Deviations: the pledged size is checked against the whole frame (more
+input than pledged, or less at the end, is `error.SrcSizeWrong`), where
+libzstd's jobs check only their own; `continue` while a frame is being
+ended is `error.StageWrong` (libzstd's `stage_wrong`); `nb_workers` above
+256, `job_size` above 1 GiB and `overlap_log` above 9 are
+`error.ParameterOutOfBound` where libzstd clamps; a frame abandoned with a
+job prepared but not posted does not leave it for the next frame (libzstd
+keeps `jobReady`). `estimateCompressorSize` / `estimateStreamSize` size the
+single-threaded context only (libzstd refuses to estimate with workers);
+`MtCtx.memorySize` reports what a multithreaded context holds.
+`ZSTD_c_rsyncable` and the dictionary trainers' multithreaded optimizers
+are Z9b (`zstdmt.MtCtx.toLoad` is `findSynchronizationPoint` without it).
 
 ## Decoder
 
@@ -1794,10 +1892,13 @@ dictionaries are undecided.
   parameters, and the path below `btopt`.
 - ~~**Z8 — `targetCBlockSize`.**~~ Done 2026-09-24, see *Advanced
   parameters*.
-- **Z9 — Multithreaded compression** (`zstdmt_compress.c`, ~1 900 lines):
-  jobs, overlap between them, LDM across jobs, `rsyncable`. libzstd's
-  output does not depend on the worker count once there is more than
-  none, so it stays goldenable. **~2 sessions.** After Z1.
+- **Z9 — Multithreaded compression** (`zstdmt_compress.c`, ~1 900 lines).
+  ~~**Z9a**~~ done 2026-09-25 (see *Multithreading*): jobs, overlap, the
+  round buffer, LDM and the checksum across jobs, flushing, dictionaries,
+  `ZSTD_compress2` and `ZSTD_compressStream2` with workers. Left, **Z9b**:
+  `rsyncable` (`findSynchronizationPoint`, seam `MtCtx.toLoad`) and the
+  dictionary trainers' multithreaded optimizers (libzstd breaks ties by
+  completion order: decide what to match).
 - **Z10 — Sequence-level API.** `ZSTD_compressSequences`,
   `ZSTD_generateSequences`, the external sequence producer, and their
   parameters (`repcodeResolution`, `blockDelimiters`, `validateSequences`,

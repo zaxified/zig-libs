@@ -107,12 +107,9 @@ test "multithreaded output is libzstd's for every worker count, and decodes back
         const src = try gpa.alloc(u8, mc.input.len);
         defer gpa.free(src);
         corpus.generate(mc.input, src);
-        const dict = if (mc.dict) |name| blk: {
-            const def = corpus.findDict(name);
-            const buf = try gpa.alloc(u8, corpus.dictLen(def, &trained));
-            break :blk buf[0..corpus.buildDict(def, &trained, buf)];
-        } else try gpa.alloc(u8, 0);
-        defer gpa.free(dict);
+        const dict_buf = try gpa.alloc(u8, if (mc.dict) |name| corpus.dictLen(corpus.findDict(name), &trained) else 0);
+        defer gpa.free(dict_buf);
+        const dict = if (mc.dict) |name| dict_buf[0..corpus.buildDict(corpus.findDict(name), &trained, dict_buf)] else dict_buf;
         const out = try gpa.alloc(u8, zstd.compressBound(src.len));
         defer gpa.free(out);
         for (mc.levels) |level| for (mc.checksums) |ck| {
@@ -245,4 +242,29 @@ test "worker count and job parameters are bounded as libzstd bounds them" {
     try std.testing.expectError(error.ParameterOutOfBound, zstd.compress(gpa, &buf, "x", .{ .advanced = .{ .nb_workers = 257 } }));
     try std.testing.expectError(error.ParameterOutOfBound, zstd.compress(gpa, &buf, "x", .{ .advanced = .{ .overlap_log = 10 } }));
     try std.testing.expectError(error.ParameterOutOfBound, zstd.compress(gpa, &buf, "x", .{ .advanced = .{ .job_size = (1 << 30) + 1 } }));
+}
+
+test "a prefix serves one multithreaded frame only" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 700_000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 6 }, src);
+    const out = try gpa.alloc(u8, 2 * zstd.compressBound(src.len));
+    defer gpa.free(out);
+    const adv: zstd.Advanced = .{ .nb_workers = 2, .job_size = 1 };
+    var s = try zstd.Stream.init(gpa, .{ .level = 3, .advanced = adv, .dictionary = .{ .prefix = .{ .bytes = src[0..20000], .content_type = .raw_content } } });
+    defer s.deinit();
+    var plain = try zstd.Stream.init(gpa, .{ .level = 3, .advanced = adv });
+    defer plain.deinit();
+    var frames: [3][]const u8 = undefined;
+    var at: usize = 0;
+    for ([_]*zstd.Stream{ &s, &s, &plain }, &frames) |st, *f| {
+        var o: zstd.OutBuffer = .{ .dst = out[at..] };
+        var in: zstd.InBuffer = .{ .src = src };
+        while (try st.compressStream2(&o, &in, .end) != 0) {}
+        f.* = o.dst[0..o.pos];
+        at += o.pos;
+    }
+    try std.testing.expect(!std.mem.eql(u8, frames[0], frames[1]));
+    try std.testing.expectEqualSlices(u8, frames[2], frames[1]);
 }

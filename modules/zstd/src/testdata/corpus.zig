@@ -2479,6 +2479,8 @@ pub const dict_defs = [_]DictDef{
     .{ .name = "raw-words-9000-self", .source = .{ .generated = .{ .name = "", .len = 9000, .kind = .words, .seed = 30 } } },
     .{ .name = "slice-words-6000-at-1000", .source = .{ .slice = .{ .of = .{ .name = "", .len = 9000, .kind = .words, .seed = 35 }, .from = 1000, .len = 6000 } } },
     .{ .name = "slice-far-repeat-tail", .source = .{ .slice = .{ .of = .{ .name = "", .len = 1400000, .kind = .far_repeat, .seed = 34 }, .from = 692000, .len = 8000 } } },
+    // (Z9a) a piece of `mt-dict-prefix-raw-ldm-reach`'s own input
+    .{ .name = "slice-mix-1m-60000-at-600000", .source = .{ .slice = .{ .of = .{ .name = "", .len = 1_000_000, .kind = .mix, .seed = 42 }, .from = 600_000, .len = 60_000 } } },
     .{ .name = "zd-words", .source = .{ .trained = "zd-words" } },
     .{ .name = "zd-csv", .source = .{ .trained = "zd-csv" } },
     .{ .name = "zd-words-id200", .source = .{ .reid = .{ .of = "zd-words", .id = 200 } } },
@@ -3151,6 +3153,18 @@ pub const mt_cases = [_]MtCase{
     // sequences in the greedy..btlazy2 and in the optimal parsers' paths
     .{ .name = "mt-mix-3m-ldm", .input = mt_in_mix_3m, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20", .levels = &.{ 1, 5 } },
     .{ .name = "mt-far-mix-ldm", .input = mt_in_far_mix, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20,ldmHashRateLog=4", .levels = &.{16} },
+    // jobs longer than the window: a later job's prefix counts only within
+    // it (forceMaxWindow); a raw dictionary does for the first job
+    .{ .name = "mt-far-repeat-w18-ov9", .input = mt_in_far_repeat, .params = "jobSize=524288,overlapLog=9,windowLog=18", .levels = &.{ 1, 5 } },
+    // ... and a copy just past the window, reloaded as the prefix: only
+    // forceMaxWindow keeps the later job from matching it
+    .{ .name = "mt-far-mix-w20-ov9", .input = mt_in_far_mix, .params = "jobSize=1048576,overlapLog=9,windowLog=20", .levels = &.{ 3, 13 } },
+    .{ .name = "mt-dict-prefix-raw-w17", .input = mt_in_far_repeat, .params = "jobSize=524288,windowLog=17", .dict = "raw-words-8000", .path = .prefix, .content_type = 1, .levels = &.{ 3, 13 } },
+    // deterministicRefPrefix holds for the first job's prefix only
+    .{ .name = "mt-far-repeat-detprefix", .input = mt_in_far_repeat, .params = "jobSize=524288,deterministicRefPrefix=1", .levels = &.{3} },
+    // with LDM the overlap is a fraction of a quarter job: 2^(cycle log + 1)
+    // once the cycle log passes 18
+    .{ .name = "mt-mix-3m-ldm-chain21", .input = mt_in_mix_3m, .params = "jobSize=524288,enableLongDistanceMatching=1,chainLog=21", .levels = &.{5} },
     // the default job size: one job, which writes the checksum itself
     .{ .name = "mt-single-job", .input = mt_in_far_repeat, .levels = &.{3}, .checksums = &.{ false, true } },
     // streaming, unknown size: jobs cut by flushes
@@ -3166,6 +3180,12 @@ pub const mt_cases = [_]MtCase{
     .{ .name = "mt-dict-load", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .load, .levels = &.{ 3, 9 } },
     .{ .name = "mt-dict-prefix-raw", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "raw-words-8000", .path = .prefix, .content_type = 1, .levels = &.{ 3, 13 } },
     .{ .name = "mt-dict-prefix-raw-ldm", .input = mt_in_mix_3m, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20", .dict = "raw-words-8000", .path = .prefix, .content_type = 1, .levels = &.{3} },
+    // the prefix reached by LDM only, from the second job: filled into the
+    // serial table, valid while a chunk ends within window + prefix (the
+    // input ends exactly there)
+    .{ .name = "mt-dict-prefix-raw-ldm-reach", .input = .{ .name = "", .len = 1_000_000, .kind = .mix, .seed = 42 }, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20", .dict = "slice-mix-1m-60000-at-600000", .path = .prefix, .content_type = 1, .levels = &.{3} },
+    // exactly 512 KB pledged: still one thread (the goldens are nbWorkers 0's)
+    .{ .name = "mt-pledged-512k", .input = .{ .name = "", .len = 524288, .kind = .words, .seed = 43 }, .schedule = "p524288,c*,e0", .levels = &.{3} },
     // a full dictionary as a prefix becomes a CDict by reference
     .{ .name = "mt-dict-prefix-full", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .prefix, .levels = &.{ 3, 5 } },
     .{ .name = "mt-dict-cdict-attach", .input = mt_in_csv, .schedule = "c200000,f0,c*,e0", .dict = "zd-csv", .path = .cdict, .levels = &.{ 1, 5, 16 } },

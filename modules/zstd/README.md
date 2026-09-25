@@ -22,10 +22,13 @@ inputs under 8/16/32 KB by strategy, or unknown sizes.
 `DDict`, `ZSTD_d_refMultipleDDicts`) is done too, and so is dictionary
 **training** (`zstd.dict_builder`: cover, fastCover, the optimizers,
 `ZDICT_trainFromBuffer`, finalization — the same finished dictionaries as
-libzstd). The
-stable-buffer and context-reuse parts of the streaming API and
-multithreading are queued in [SPEC.md](SPEC.md) (*Backlog / deferred*,
-with costs).
+libzstd), and so is **multithreaded** compression
+(`Advanced.nb_workers`, `job_size`, `overlap_log`: libzstd's jobs, overlap,
+long-distance matching across jobs — the same bytes as libzstd's for any
+worker count, on a small pool of `std.Thread`s without libc). The
+stable-buffer part of the streaming API, `rsyncable` and the trainers'
+multithreaded optimizers are queued in [SPEC.md](SPEC.md) (*Backlog /
+deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
