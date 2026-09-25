@@ -129,6 +129,17 @@ pub const Options = struct {
     /// shared-`submit` slot. Size this ≥ the number of threads that will hold a
     /// `Submitter` concurrently. Default 0 ⇒ only the shared `submit` path.
     max_submitters: usize = 0,
+    /// How long a worker that found the queue empty keeps looking before it
+    /// parks, in nanoseconds. 0 (the default) parks at once, as before.
+    ///
+    /// With short jobs a worker otherwise parks between every two, and every
+    /// submit then pays a `futexWake` and every job a park -- two futex
+    /// syscalls per job. A spinning worker is not counted as idle, so a
+    /// submit that lands during its spin skips the wake, and the worker takes
+    /// the job without entering the kernel. The spin always ends in the same
+    /// park as before: an idle pool costs `spin_ns` of CPU per worker after
+    /// its last job, then nothing.
+    spin_ns: u64 = 0,
 };
 
 pub const InitError = error{
@@ -224,6 +235,8 @@ pub const WorkerPool = struct {
     /// only costs one avoidable wake — never zero while a worker is actually
     /// asleep).
     idle: std.atomic.Value(usize) = .init(0),
+    /// `Options.spin_ns`.
+    spin_ns: u64 = 0,
 
     state: std.atomic.Value(State) = .init(.running),
 
@@ -269,6 +282,7 @@ pub const WorkerPool = struct {
         self.* = .{
             .allocator = allocator,
             .io = options.io,
+            .spin_ns = options.spin_ns,
             .domain = undefined,
             .qnodes = undefined,
             .queue = undefined,
@@ -544,7 +558,7 @@ var park_seam: std.atomic.Value(?*const fn () void) = .init(null);
 fn workerRun(w: *Worker) void {
     const self = w.pool;
     const p = w.participant;
-    while (true) {
+    outer: while (true) {
         const st = self.state.load(.seq_cst);
         // Abrupt stop: drop whatever is queued, exit now (in-flight job, if
         // any, already completed before this loop turn).
@@ -556,6 +570,22 @@ fn workerRun(w: *Worker) void {
         }
         // Queue observed empty.
         if (st == .draining) break; // graceful: nothing left ⇒ done.
+
+        // `Options.spin_ns`: keep looking for a while before parking. Not
+        // counted in `idle`, so a submit meanwhile bumps `notify` and skips
+        // the wake; the bump is what this watches (one shared load per turn,
+        // not a dequeue attempt that contends with the other workers).
+        if (self.spin_ns != 0) {
+            const seen = self.notify.load(.seq_cst);
+            const until = std.Io.Timestamp.now(self.io, .awake).nanoseconds + self.spin_ns;
+            var turn: u32 = 0;
+            while (true) : (turn +%= 1) {
+                if (self.notify.load(.seq_cst) != seen) continue :outer;
+                std.atomic.spinLoopHint();
+                // The clock every 64 turns: a vDSO call, cheap, not free.
+                if (turn % 64 == 63 and std.Io.Timestamp.now(self.io, .awake).nanoseconds >= until) break;
+            }
+        }
 
         // st == .running: park until woken. Snapshot the generation FIRST,
         // then re-check the queue and state, so any submit/shutdown that raced
@@ -746,6 +776,55 @@ test "F6: drainedCleanly() reports false when submitted permanently exceeds comp
     // Restore, so `deinit`'s own bookkeeping (which does not itself depend
     // on submitted == completed) tears down cleanly.
     _ = pool.submitted.fetchSub(1, .monotonic);
+}
+
+fn sleepMsIo(io: std.Io, ms: i64) void {
+    var word = std.atomic.Value(u32).init(0);
+    io.futexWaitTimeout(u32, &word.raw, 0, .{ .duration = .{
+        .raw = .fromMilliseconds(ms),
+        .clock = .awake,
+    } }) catch {};
+}
+
+fn awaitCount(io: std.Io, c: *const Counter, n: u64) void {
+    while (c.n.load(.seq_cst) < n) sleepMsIo(io, 1);
+}
+
+test "spin_ns: a worker keeps looking instead of parking, then parks" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var wd = Watchdog{ .io = io, .timeout_ms = 10_000 };
+    try wd.start();
+    defer wd.finish();
+
+    // Control: without a spin the worker is asleep 50 ms after its job.
+    {
+        const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1 });
+        defer pool.deinit();
+        var c = Counter{};
+        try pool.submit(.{ .func = incr, .ctx = &c });
+        awaitCount(io, &c, 1);
+        sleepMsIo(io, 50);
+        try testing.expectEqual(@as(usize, 1), pool.idle.load(.seq_cst));
+    }
+    // With one: 50 ms after its job it is still looking -- not idle, so the
+    // next submit skips the futexWake -- takes that job, and once the spin
+    // has run out it is asleep like the control.
+    {
+        const pool = try WorkerPool.init(testing.allocator, .{ .io = io, .n_workers = 1, .spin_ns = 300 * std.time.ns_per_ms });
+        defer pool.deinit();
+        var c = Counter{};
+        try pool.submit(.{ .func = incr, .ctx = &c });
+        awaitCount(io, &c, 1);
+        sleepMsIo(io, 50);
+        try testing.expectEqual(@as(usize, 0), pool.idle.load(.seq_cst));
+        try pool.submit(.{ .func = incr, .ctx = &c });
+        awaitCount(io, &c, 2);
+        try testing.expectEqual(@as(usize, 0), pool.idle.load(.seq_cst));
+        sleepMsIo(io, 600);
+        try testing.expectEqual(@as(usize, 1), pool.idle.load(.seq_cst));
+    }
 }
 
 test "idle → wake: a submit into an idle pool runs promptly" {

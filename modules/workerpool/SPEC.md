@@ -186,23 +186,12 @@ underlying `seq_cst` reclamation proof lives in `lockfree`).
 
 ## 6b. Backlog / deferred
 
-- **A short spin before a worker parks (qap, 2026-09-23).** Measured by qap's
-  `Offload` (a handler hands a blocking job to the pool and parks its fiber):
-  with short jobs, every single job pays a futex wake AND a park, because a job
-  that finishes in microseconds never keeps a worker busy long enough for the
-  next one to find it awake — `idle`'s check only skips the wake when nobody is
-  asleep at all. `strace -c` over 3 000 jobs, 4 workers, 8 concurrent
-  submitters: **6 519 `futex` (2.2 per job, 85 % of syscall time)** against
-  3 003 hand-back syscalls of qap's own (one per job, 8 %). The pool's share of
-  the round trip is ~21–27 k kernel instructions per job; qap's break-even is
-  therefore ~16 µs of blocking work per job, which rules the pool out for
-  anything smaller. Ask: spin for a bounded few microseconds (`Backoff`, which
-  this module already uses in `BackoffSpinLock`) re-checking the queue before
-  committing to `idle` + `futexWaitUncancelable`, so a busy pool stops entering
-  the kernel per job. Must not cost an idle pool any CPU: the spin ends in the
-  park it has today. A consumer-visible knob (`Options.spin_ns`, 0 = today's
-  behaviour) keeps the measurement honest — qap would then re-run the numbers in
-  its NOTES "M4.3" table.
+- ~~**A short spin before a worker parks**~~ — DONE 2026-09-25: `Options.spin_ns`
+  (0 = park at once, as before). A worker that finds the queue empty watches `notify`
+  for up to `spin_ns` before counting itself idle and parking, so a submit landing in
+  that window skips the `futexWake` and the job skips the park. The spin always ends in
+  the old park. Test: with a spin the worker is not idle 50 ms after its job, takes the
+  next one, and is parked once the spin has run out; control without it is parked.
 
 ## 7. Out of scope — next increments
 
