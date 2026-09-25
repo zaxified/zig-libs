@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **`h2_server`: the codec's own error answers carry `date` and `server`.** The
+  400/413/500/501 an h2 stream gets without reaching a handler went out with `:status`,
+  `content-type` and `content-length` only, while h1's (`writeErrorResponse`) carry `Date` and
+  `Server` -- RFC 9110 §6.6.1 wants `Date` on a 4xx from a server with a clock. Both now come from
+  `Options.now` / `Options.server_name`, as on a handler's answer. Found by an embedder's h1-vs-h2
+  differential test.
+
 - **2026-09-25** — **`h2_server`: a handler's waits are cancelable with `Dispatcher.io`.** A handler
   parked for flow-control credit or for more of its request body now returns on its `Io`'s
   cancelation (e.g. an embedder's handler deadline) instead of waiting for the peer or for the

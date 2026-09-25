@@ -1921,11 +1921,28 @@ const Session = struct {
         const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch unreachable;
         const body_text = std.fmt.bufPrint(&body_buf, "{s}\n", .{reason}) catch unreachable;
         const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{body_text.len}) catch unreachable;
-        s.conn.sendHeaders(&s.wire, id, &.{
-            .{ .name = ":status", .value = status_str },
-            .{ .name = "content-type", .value = "text/plain" },
-            .{ .name = "content-length", .value = len_str },
-        }, false) catch return .keep; // stream gone (reset) or overloaded
+        // h1 parity (`Server.writeErrorResponse`): `date` and `server` on the
+        // codec's own answers too. RFC 9110 §6.6.1 wants `Date` on a 4xx from
+        // a server with a clock, and these are the answers no handler ever
+        // saw to add one.
+        var date_buf: [Server.http_date_len]u8 = undefined;
+        var fields: [5]hpack.Field = undefined;
+        var n: usize = 0;
+        fields[n] = .{ .name = ":status", .value = status_str };
+        n += 1;
+        if (s.opts.now) |now| {
+            fields[n] = .{ .name = "date", .value = Server.httpDateInto(now, &date_buf) };
+            n += 1;
+        }
+        if (s.opts.server_name) |sn| {
+            fields[n] = .{ .name = "server", .value = sn };
+            n += 1;
+        }
+        fields[n] = .{ .name = "content-type", .value = "text/plain" };
+        n += 1;
+        fields[n] = .{ .name = "content-length", .value = len_str };
+        n += 1;
+        s.conn.sendHeaders(&s.wire, id, fields[0..n], false) catch return .keep; // stream gone (reset) or overloaded
         s.conn.sendData(&s.wire, id, body_text, true) catch {
             // No window even for the reason text: abort the stream instead.
             s.conn.sendRstStream(&s.wire, id, .internal_error) catch {};
@@ -3452,6 +3469,32 @@ test "h2c serve: garbage after the preface → GOAWAY (offline)" {
 
     try testing.expectEqual(@as(?h2.ErrorCode, h2.ErrorCode.frame_size_error), peer.goaway);
     try testing.expectEqual(@as(usize, 0), peer.resps.count()); // nothing served
+}
+
+fn epochForErrorTest(_: ?*anyopaque) i64 {
+    return 784111777; // RFC 9110 §5.6.7's example instant
+}
+
+test "h2c serve: the codec's own error answers carry date and server, as h1's do (offline)" {
+    const gpa = testing.allocator;
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try peer.conn.startStream(&peer.wire, &fieldsFor("POST", "/drain"), false);
+    try peer.conn.sendData(&peer.wire, sid, "x" ** 32, true);
+
+    var out_buf: [2048]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .max_body_bytes = 8,
+        .now = .{ .epochSeconds = epochForErrorTest },
+        .server_name = "t/1",
+    }, &out_buf);
+    const r = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 413), r.status);
+    try testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", r.header("date").?);
+    try testing.expectEqualStrings("t/1", r.header("server").?);
+    try testing.expectEqualStrings("text/plain", r.header("content-type").?);
 }
 
 test "h2c serve: request body over max_body_bytes → 413, connection closes (offline)" {
