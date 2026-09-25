@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **`h2_server`: a handler's waits are cancelable with `Dispatcher.io`.** A handler
+  parked for flow-control credit or for more of its request body now returns on its `Io`'s
+  cancelation (e.g. an embedder's handler deadline) instead of waiting for the peer or for the
+  connection to end. A response already started is ended with `RST_STREAM(CANCEL)` and the
+  handler's write fails; a body read fails with `error.ReadFailed`. The connection stays up. The
+  session lock and the connection task's own waits stay uncancelable.
+
 - **2026-09-25** — **gzip responses no longer put the deflate state on the stack.** `flate.Compress`
   is ~225 KiB and std's `Compress.init` returns it by value in an error union, so
   `ResponseWriter.beginGzip`'s assignment was a stack temporary: 97 KiB of its frame in ReleaseFast

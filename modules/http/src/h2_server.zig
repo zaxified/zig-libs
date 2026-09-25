@@ -416,9 +416,11 @@ pub const Dispatcher = struct {
     /// that lock forever — a deadlock, not a slowdown. With `io` the lock is
     /// a `std.Io.Mutex` and the waits are a `std.Io.Condition`, both of
     /// which park through `io.futexWait` — on a fiber engine, the fiber.
-    /// Every wait is uncancelable: a handler blocked on flow control is
-    /// released by progress or by the connection ending, not by `io`'s
-    /// cancelation.
+    /// A handler's waits -- for flow-control credit, for more of its request
+    /// body -- are cancelation points of `io`: canceled, a response already
+    /// started is ended by `RST_STREAM(CANCEL)` and the handler's write fails;
+    /// a body read fails (`error.ReadFailed`). The connection stays up. The
+    /// session lock and the connection task's own waits stay uncancelable.
     ///
     /// Must be the `Io` the tasks and the connection's own reader/writer
     /// run on.
@@ -808,13 +810,19 @@ const Session = struct {
     /// `Dispatcher.io` it parks until `progress` moves past `seen` — if it
     /// already has, it returns at once, so a WINDOW_UPDATE processed between
     /// the caller's unlock and this call is not slept through.
-    fn waitForPeer(s: *Session, seen: u32) error{Closed}!void {
+    ///
+    /// Only a handler waits here, and with `Dispatcher.io` the park is a
+    /// cancelation point of that handler's `Io`: `error.Canceled` when the
+    /// embedder cancels it (a handler deadline), so a handler stuck on a peer
+    /// that never grants credit or never sends the body is released. The
+    /// lock itself stays uncancelable -- it is only ever held briefly.
+    fn waitForPeer(s: *Session, seen: u32) error{ Closed, Canceled }!void {
         if (!s.threaded) return s.pump();
         if (s.io) |io| {
             s.io_mu.lockUncancelable(io);
             defer s.io_mu.unlock(io);
             while (s.progress == seen and !s.gone.load(.acquire))
-                s.moved.waitUncancelable(io, &s.io_mu);
+                try s.moved.wait(io, &s.io_mu);
         }
         if (s.gone.load(.acquire)) return error.Closed;
         if (s.io == null) std.Thread.yield() catch std.atomic.spinLoopHint();
@@ -2346,7 +2354,19 @@ const Framer = struct {
                     off += n;
                     f.data_sent = true;
                 },
-                .wait => s.waitForPeer(seen) catch return f.die(.close),
+                .wait => s.waitForPeer(seen) catch |err| switch (err) {
+                    error.Closed => return f.die(.close),
+                    // The handler was canceled waiting for credit. Part of
+                    // the response is on the wire: end just this stream
+                    // (§5.4.2), the connection stays.
+                    error.Canceled => {
+                        s.lock();
+                        defer s.unlock();
+                        s.conn.sendRstStream(&s.wire, f.id, .cancel) catch {};
+                        s.stageWire() catch return f.die(.close);
+                        return f.die(.keep);
+                    },
+                },
                 .dead_keep => return f.die(.keep),
                 .dead_close => return f.die(.close),
             }
@@ -2527,6 +2547,8 @@ const StreamBody = struct {
                     return error.ReadFailed;
                 },
                 .eof => return error.EndOfStream,
+                // Canceled too: `Reader.Error` cannot carry it. The job's
+                // body is then unread, and `finishJob` resets the stream.
                 .wait => b.s.waitForPeer(seen) catch return error.ReadFailed,
                 .copied => {
                     // Outside the lock on purpose: this write can re-enter
@@ -5139,7 +5161,15 @@ const FrameWatcher = struct {
         if (fw.fiber) |f| {
             if (f.ping_ack) |e| if (fw.ping_ack.load(.acquire)) e.set(f.io);
             for (f.data) |g| if (fw.data_bytes.load(.acquire) >= g.at_least) g.ev.set(f.io);
-            if (f.park) f.io.sleep(.fromMilliseconds(1), .awake) catch return error.WriteFailed;
+            // The connection's socket, not the handler's `Io`: a real engine
+            // writes it uncancelably, so a canceled handler that happens to
+            // be the one flushing must not see its cancelation here -- that
+            // would fail a write whose bytes are already out.
+            if (f.park) {
+                const was = f.io.swapCancelProtection(.blocked);
+                defer _ = f.io.swapCancelProtection(was);
+                f.io.sleep(.fromMilliseconds(1), .awake) catch unreachable;
+            }
         }
         return consumed;
     }
@@ -6006,6 +6036,68 @@ test "dispatcher (fibers): flow-control waits park, and the connection window bo
         for (c.body.items) |b| try testing.expectEqual(ch, b);
     }
     try testing.expect(fw.data_bytes.load(.acquire) > fc_grant);
+}
+
+test "dispatcher (fibers): a handler canceled while waiting for credit resets only its stream" {
+    const gpa = testing.allocator;
+    var bio: BatonIo = undefined;
+    bio.init(gpa);
+    defer bio.deinit();
+    const io = bio.io();
+
+    // One stream, a body past the connection window (65 535), and no
+    // WINDOW_UPDATE ever: the handler parks in `waitForPeer` for good.
+    var peer: TestPeer = .init(gpa, .{ .initial_window_size = fc_stream_window });
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const sid = try stageGet(&peer, "/big/a");
+    const stage0 = try gpa.dupe(u8, peer.wire.items);
+    defer gpa.free(stage0);
+    peer.wire.clearRetainingCapacity();
+
+    // `window_spent` fires once the server has used the whole window; the
+    // canceller then cancels the stream's task and only after that lets the
+    // connection end (`done`), so the reset cannot be the connection's exit.
+    var window_spent: std.Io.Event = .unset;
+    var done: std.Io.Event = .unset;
+    const gates = [_]FrameWatcher.DataGate{.{ .at_least = 65_535, .ev = &window_spent }};
+    var wbuf: [4096]u8 = undefined;
+    var fw: FrameWatcher = .init(gpa, &wbuf);
+    defer fw.deinit();
+    fw.fiber = .{ .io = io, .data = &gates };
+    var rbuf: [4096]u8 = undefined;
+    var sr: StagedReader = .init(io, &.{
+        .{ .bytes = stage0 },
+        .{ .event = &done, .bytes = "" },
+    }, &rbuf);
+
+    var probe: FlowProbe = .{};
+    var fd: BatonDispatcher = .{ .b = &bio };
+    const Canceller = struct {
+        fn run(d: *BatonDispatcher, spent: *std.Io.Event, end: *std.Io.Event) void {
+            const inner = d.b.inner();
+            spent.waitUncancelable(inner);
+            d.group.cancel(inner);
+            end.set(inner);
+        }
+    };
+    const canceller = try std.Thread.spawn(.{}, Canceller.run, .{ &fd, &window_spent, &done });
+    serve(gpa, .{
+        .handler = FlowProbe.handler,
+        .context = &probe,
+        .response_buffer_size = 128 * 1024,
+        .dispatcher = fd.iface(8),
+    }, &sr.reader, &fw.writer);
+    canceller.join();
+    fd.join();
+
+    try peer.feed(fw.buf.items);
+    try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+    const c = peer.resp(sid);
+    try testing.expectEqual(@as(u16, 200), c.status);
+    try testing.expect(!c.data_end_stream and !c.headers_end_stream); // ended by the reset, not END_STREAM
+    try testing.expectEqual(@as(?h2.ErrorCode, .cancel), c.rst);
+    try testing.expect(c.body.items.len < fc_body_len);
 }
 
 /// Counts frees whose block still holds `marker` -- request-body bytes the
