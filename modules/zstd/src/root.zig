@@ -46,6 +46,7 @@ const dec = @import("decompress.zig");
 const dstream = @import("dstream.zig");
 const cdict_mod = @import("cdict.zig");
 const ddict_mod = @import("ddict.zig");
+const zstdmt = @import("zstdmt.zig");
 
 /// Dictionary training: libzstd's cover and fastCover trainers, their
 /// optimizers, `ZDICT_trainFromBuffer` and finalization, giving the same
@@ -141,6 +142,12 @@ pub fn compress(gpa: std.mem.Allocator, dst: []u8, src: []const u8, opts: Option
 /// Every frame is the one a fresh context gives.
 pub const Compressor = struct {
     ctx: frame.Compressor,
+    /// The multithreaded context, made at the first frame with
+    /// `Advanced.nb_workers` over 512 KB and kept for the next.
+    mt: ?*zstdmt.MtCtx = null,
+    /// Test seam: the workers' jobs run on the calling thread
+    /// (`zstdmt.MtCtx.run_inline`); the bytes are the same.
+    mt_run_inline: bool = false,
 
     /// Allocates nothing until the first frame.
     pub fn init(gpa: std.mem.Allocator) Compressor {
@@ -156,6 +163,7 @@ pub const Compressor = struct {
     }
 
     pub fn deinit(c: *Compressor) void {
+        if (c.mt) |m| m.destroy();
         c.ctx.deinit();
         c.* = undefined;
     }
@@ -163,7 +171,40 @@ pub const Compressor = struct {
     /// See `zstd.compress`.
     pub fn compress(c: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
         if (opts.level > max_level) return error.LevelUnsupported;
-        return c.ctx.compressFrame(dst, src, .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .dict = opts.dictionary });
+        const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .dict = opts.dictionary };
+        // ZSTD_compress2 goes through ZSTD_compressStream2, which leaves an
+        // input of up to ZSTDMT_JOBSIZE_MIN to the calling thread
+        if (opts.advanced.nb_workers > 0 and src.len > zstdmt.job_size_min) return c.compressMt(dst, src, fo);
+        return c.ctx.compressFrame(dst, src, fo);
+    }
+
+    /// `ZSTD_compress2` with workers: one `ZSTD_e_end` call over the whole
+    /// input.
+    fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options) Error!usize {
+        const bound = compressBound(src.len);
+        if (dst.len < bound) return error.NoSpaceLeft;
+        try fo.advanced.check();
+        var local: ?CDict = null;
+        defer if (local) |*l| l.deinit();
+        const setup = try c.ctx.setupStream2(fo, src.len, null, &local);
+        if (c.mt == null) {
+            const gpa = c.ctx.gpa orelse return error.OutOfMemory; // a static context
+            c.mt = try zstdmt.MtCtx.create(gpa, fo.advanced.nb_workers, c.mt_run_inline);
+        }
+        const mt = c.mt.?;
+        try mt.initFrame(setup, src.len);
+        var in: stream.InBuffer = .{ .src = src };
+        var out: stream.OutBuffer = .{ .dst = dst[0..bound] };
+        const left = mt.compressStream2(&out, &in, .end) catch |e| switch (e) {
+            // the input is the pledged size, and `end` follows no `continue`
+            error.SrcSizeWrong, error.StageWrong => unreachable,
+            else => |x| return x,
+        };
+        if (left != 0) {
+            mt.abandon();
+            return error.NoSpaceLeft;
+        }
+        return out.pos;
     }
 
     /// `ZSTD_compress_usingDict`: one frame of `src` with `dict` (a full
@@ -363,6 +404,8 @@ test {
     _ = @import("frame_writer.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");
+    _ = @import("zstdmt.zig");
+    _ = @import("mt_test.zig");
     _ = @import("dbits.zig");
     _ = @import("huf_dec.zig");
     _ = @import("dblock.zig");

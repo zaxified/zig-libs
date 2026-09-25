@@ -16,6 +16,7 @@ const std = @import("std");
 const frame = @import("frame.zig");
 const params = @import("params.zig");
 const cdict_mod = @import("cdict.zig");
+const zstdmt = @import("zstdmt.zig");
 
 pub const EndDirective = enum {
     /// Buffer the input; compress only full blocks (`ZSTD_e_continue`).
@@ -80,6 +81,8 @@ pub const Error = error{
     SrcSizeWrong,
     /// `pos` beyond the end of a buffer.
     InvalidBuffer,
+    /// With workers: `continue` while a frame is being ended (`stage_wrong`).
+    StageWrong,
 };
 
 /// A compression context in streaming mode (`ZSTD_CCtx` driven by
@@ -93,7 +96,8 @@ pub const Stream = struct {
     /// This frame's pledged size: `opts.pledged_size` for the first frame
     /// after `init` or `reset`, unknown for the frames after it.
     pledged: ?u64,
-    stage: enum { init, load, flush } = .init,
+    /// `.mt`: the frame is compressed by `mt`'s workers.
+    stage: enum { init, load, flush, mt } = .init,
     comp: frame.Compressor,
     in_buff_pos: usize = 0,
     in_buff_target: usize = 0,
@@ -108,6 +112,12 @@ pub const Stream = struct {
     /// overflow_correct_frequently`), which reaches the correction of a
     /// two-segment window within kilobytes.
     overflow_correct_frequently: bool = false,
+    /// The multithreaded context (`cctx->mtctx`), made at the first frame
+    /// with `Advanced.nb_workers` and kept for the next.
+    mt: ?*zstdmt.MtCtx = null,
+    /// Test seam, set before the first call: the workers' jobs run on the
+    /// calling thread (`zstdmt.MtCtx.run_inline`); the bytes are the same.
+    mt_run_inline: bool = false,
 
     /// Nothing is allocated until the first `compressStream2`, which knows
     /// whether that call ends the frame (and so the size).
@@ -131,6 +141,7 @@ pub const Stream = struct {
     }
 
     pub fn deinit(s: *Stream) void {
+        if (s.mt) |m| m.destroy();
         if (s.local_cdict) |*l| l.deinit();
         s.comp.deinit();
         s.* = undefined;
@@ -142,6 +153,7 @@ pub const Stream = struct {
     /// `opts.pledged_size` included. The workspace stays.
     pub fn reset(s: *Stream, opts: Options) Error!void {
         try checkOptions(opts);
+        if (s.mt) |m| m.abandon();
         // ZSTD_clearAllDicts
         if (s.local_cdict) |*l| l.deinit();
         s.local_cdict = null;
@@ -163,6 +175,15 @@ pub const Stream = struct {
     pub fn compressStream2(s: *Stream, output: *OutBuffer, input: *InBuffer, end_op: EndDirective) Error!usize {
         if (output.pos > output.dst.len or input.pos > input.src.len) return error.InvalidBuffer;
         if (s.stage == .init) try s.begin(end_op, input.src.len - input.pos);
+        if (s.stage == .mt) {
+            const flush_min = s.mt.?.compressStream2(output, input, end_op) catch |e| {
+                s.endFrame();
+                return e;
+            };
+            // compression completed
+            if (end_op == .end and flush_min == 0) s.endFrame();
+            return flush_min;
+        }
         try s.generic(output, input, end_op);
         return s.out_content - s.out_flushed; // remaining to flush
     }
@@ -173,6 +194,18 @@ pub const Stream = struct {
     /// block in and one compressed block out.
     fn begin(s: *Stream, end_op: EndDirective, in_size: usize) Error!void {
         const pledged: ?u64 = if (end_op == .end) in_size else s.pledged;
+        // do not invoke multi-threading when src size is too small
+        if (s.opts.advanced.nb_workers > 0 and (pledged orelse params.unknown_size) > zstdmt.job_size_min) {
+            const setup = try s.comp.setupStream2(s.frameOptions(), pledged, s.opts.src_size_hint, &s.local_cdict);
+            if (s.mt == null) {
+                const gpa = s.comp.gpa orelse return error.OutOfMemory; // a static context
+                s.mt = try zstdmt.MtCtx.create(gpa, s.opts.advanced.nb_workers, s.mt_run_inline);
+            }
+            try s.mt.?.initFrame(setup, pledged);
+            if (s.opts.dictionary == .prefix) s.opts.dictionary = .none;
+            s.stage = .mt;
+            return;
+        }
         try s.comp.initStream2(s.frameOptions(), pledged, s.opts.src_size_hint, true, &s.local_cdict);
         // a prefix is single usage
         if (s.opts.dictionary == .prefix) s.opts.dictionary = .none;
@@ -228,7 +261,7 @@ pub const Stream = struct {
         }
 
         while (true) switch (s.stage) {
-            .init => unreachable,
+            .init, .mt => unreachable,
             .load => {
                 if (end_op == .end and oend - op >= frame.compressBound(iend - ip) and s.in_buff_pos == 0) {
                     // shortcut to compression pass directly into output buffer

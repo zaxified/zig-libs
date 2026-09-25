@@ -18,7 +18,12 @@
 //!
 //!   zig run --dep corpus -Mroot=modules/zstd/tools/dump_corpus.zig \
 //!       -Mcorpus=modules/zstd/src/testdata/corpus.zig -- <out-dir> <manifest> \
-//!       <stream-manifest> <param-manifest> [<dict-manifest> <testdata-dir>]
+//!       <stream-manifest> <param-manifest> [<dict-manifest> <testdata-dir>
+//!       [<mt-manifest>]]
+//!
+//! The multithreaded set (`corpus.mt_cases`) goes to `mt-in-<case>` and one
+//! "case level checksum params schedule dict path content-type" line each
+//! (params, schedule and dict "-" when none).
 
 const std = @import("std");
 const corpus = @import("corpus");
@@ -138,4 +143,20 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dict_manifest_path, .data = dict_manifest.items });
+
+    const mt_manifest_path = args.next() orelse return;
+    var mt_manifest: std.ArrayList(u8) = .empty;
+    defer mt_manifest.deinit(gpa);
+    for (corpus.mt_cases) |mc| {
+        const buf = try gpa.alloc(u8, mc.input.len);
+        defer gpa.free(buf);
+        corpus.generate(mc.input, buf);
+        const name = try std.fmt.allocPrint(gpa, "mt-in-{s}", .{mc.name});
+        defer gpa.free(name);
+        try dir.writeFile(io, .{ .sub_path = name, .data = buf });
+        for (mc.levels) |level| for (mc.checksums) |ck| {
+            try mt_manifest.print(gpa, "{s} {d} {d} {s} {s} {s} {s} {d}\n", .{ mc.name, level, @intFromBool(ck), mc.params, mc.schedule orelse "-", mc.dict orelse "-", @tagName(mc.path), mc.content_type });
+        };
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mt_manifest_path, .data = mt_manifest.items });
 }

@@ -445,6 +445,21 @@ pub const Advanced = struct {
     /// ignores it (another strategy, a hash log not above the chain log, or
     /// a chain log above 24); it changes nothing without a dictionary.
     enable_dedicated_dict_search: bool = false,
+    /// `ZSTD_c_nbWorkers`, 0..256: 0 compresses on the calling thread; from
+    /// 1, a frame of more than 512 KB (or of unknown size, as a stream) is
+    /// cut into jobs compressed by this many threads (`zstdmt.zig`). The
+    /// bytes are the same for any count from 1 up (and differ from 0's).
+    nb_workers: u32 = 0,
+    /// `ZSTD_c_jobSize`, 0..1 GiB: the input of one job; 0 derives it from
+    /// the window (4 window sizes, at least 1 MB), and a value under 512 KB
+    /// counts as 512 KB. Only with `nb_workers`.
+    job_size: u32 = 0,
+    /// `ZSTD_c_overlapLog`, 0..9: how much of the previous job's input a
+    /// job reloads as its window -- 9 a whole window, each step below half
+    /// as much, 1 none; 0 by strategy (6 up to `lazy`, 7 `lazy2` and
+    /// `btlazy2`, 8 `btopt` and `btultra`, 9 `btultra2`). Only with
+    /// `nb_workers`.
+    overlap_log: u32 = 0,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).
@@ -471,10 +486,19 @@ pub const Advanced = struct {
             !B.in(nonZero(adv.ldm_min_match), ldm_min_match_min, ldm_min_match_max) or
             !B.in(nonZero(adv.ldm_bucket_size_log), ldm_bucket_size_log_min, ldm_bucket_size_log_max) or
             !B.in(nonZero(adv.ldm_hash_rate_log), 0, ldm_hash_rate_log_max) or
-            !B.in(adv.target_c_block_size, 0, block_size_max_abs))
+            !B.in(adv.target_c_block_size, 0, block_size_max_abs) or
+            !B.in(adv.nb_workers, 0, nb_workers_max) or
+            !B.in(adv.job_size, 0, job_size_max) or
+            !B.in(adv.overlap_log, 0, overlap_log_max))
             return error.ParameterOutOfBound;
     }
 };
+
+/// `ZSTDMT_NBWORKERS_MAX` (64-bit), `ZSTDMT_JOBSIZE_MAX` (64-bit),
+/// `ZSTD_OVERLAPLOG_MAX`.
+pub const nb_workers_max = 256;
+pub const job_size_max = 1024 << 20;
+pub const overlap_log_max = 9;
 
 /// `ZSTD_dictAttachPref_e`: libzstd picks between attaching a `CDict`'s
 /// tables (for small inputs) and copying them into the context by the

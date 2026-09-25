@@ -80,6 +80,12 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.force_max_window = v != 0;
     } else if (Eq.f(name, "enableDedicatedDictSearch")) {
         adv.enable_dedicated_dict_search = v != 0;
+    } else if (Eq.f(name, "nbWorkers")) {
+        adv.nb_workers = v;
+    } else if (Eq.f(name, "jobSize")) {
+        adv.job_size = v;
+    } else if (Eq.f(name, "overlapLog")) {
+        adv.overlap_log = v;
     } else return error.BadParam;
     return true;
 }

@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **BREAKING (error set):** multithreaded compression (SPEC
+  backlog Z9a, port of `zstdmt_compress.c`). `Advanced` gains `nb_workers`
+  (`ZSTD_c_nbWorkers`, 0..256), `job_size` (`ZSTD_c_jobSize`) and
+  `overlap_log` (`ZSTD_c_overlapLog`); with a worker count, `Stream`
+  frames of unknown size or pledged above 512 KB, and one-shot `compress`
+  of more than 512 KB, are cut into jobs compressed by that many threads —
+  byte-identical to libzstd 1.5.7's `ZSTD_compress2` /
+  `ZSTD_compressStream2` with the same parameters, for any worker count
+  (long-distance matching across jobs, checksums, dictionaries included).
+  No libc: a small pool of `std.Thread`s on atomics and `std.Io`'s futex.
+  `StreamError` gains `StageWrong` (`continue` while a multithreaded frame
+  is ending). `Stream` and `Compressor` gain an `mt` context (freed by
+  `deinit`); `frame.Compressor.setupStream2` split from `initStream2`
+  (internal). Out of range `nb_workers`/`job_size`/`overlap_log` are
+  `error.ParameterOutOfBound` (libzstd clamps). `rsyncable` and the
+  trainers' multithreaded optimizers: Z9b.
+
 - **2026-09-25** — `Advanced.enable_dedicated_dict_search`
   (`ZSTD_c_enableDedicatedDictSearch`, SPEC backlog Z4): a `CDict` made
   with it (`CDict.initAdvanced`, or the context's own for

@@ -77,6 +77,10 @@ const Ctx = struct {
     /// Long-distance matching: the table, and room for one block's sequences.
     ldm: ?*ldm.State = null,
     ldm_seqs: []ldm.RawSeq = &.{},
+    /// `externSeqStore`: long-distance matches made elsewhere for the whole
+    /// frame, consumed block by block (`ZSTD_referenceExternalSequences`;
+    /// multithreaded compression generates them serially across jobs).
+    extern_seqs: ldm.RawSeqStore = .{},
 
     /// The match state's index of `block`, which lies in its prefix.
     fn index(c: *const Ctx, block: []const u8) u32 {
@@ -240,7 +244,13 @@ fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usiz
 /// for a block too small to try (`ZSTDbss_noCompress`).
 fn buildSeqStore(c: *Ctx, block: []const u8) bool {
     // don't even attempt compression below a certain srcSize
-    if (block.len < min_cblock_size + block_header_size + 1 + 1) return false;
+    if (block.len < min_cblock_size + block_header_size + 1 + 1) {
+        if (c.strategy >= @intFromEnum(params.Strategy.btopt))
+            c.extern_seqs.skipBytes(block.len)
+        else
+            c.extern_seqs.skipSequences(block.len, c.ms.cp.min_match);
+        return false;
+    }
     c.ss.reset();
     // required for optimal parser to read stats from dictionary
     if (c.ms.opt) |st| st.symbol_costs = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
@@ -249,7 +259,9 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
     if (istart > c.ms.next_to_update + 384)
         c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
     c.next.rep = c.prev.rep;
-    const last_ll = if (c.ldm) |ls| blk: {
+    const last_ll = if (c.extern_seqs.pos < c.extern_seqs.size)
+        ldm.blockCompress(&c.extern_seqs, &c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len))
+    else if (c.ldm) |ls| blk: {
         var ldm_seq_store: ldm.RawSeqStore = .{ .seq = c.ldm_seqs };
         ls.generateSequences(&ldm_seq_store, block);
         const n = ldm.blockCompress(&ldm_seq_store, &c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
@@ -832,6 +844,23 @@ pub const Compressor = struct {
     /// the context's own `CDict` for a `.raw` dictionary, made on first use
     /// and kept by the caller for the frames after.
     pub fn initStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, buffered: bool, local: *?CDict) BeginError!void {
+        const s = try comp.setupStream2(opts, pledged, size_hint, local);
+        try comp.beginInternal(s.prefix, s.cdict, s.cp, pledged, s.opts, buffered);
+    }
+
+    /// What `ZSTD_CCtx_init_compressStream2` settles before it begins a
+    /// frame: the parameters, the level (a `CDict`'s replaces the
+    /// options'), and the dictionary as a prefix or a `CDict`.
+    pub const StreamSetup = struct {
+        cp: params.CParams,
+        opts: Options,
+        prefix: ?RawDict,
+        cdict: ?*const CDict,
+    };
+
+    /// The first half of `initStream2`, which multithreaded compression
+    /// shares (it hands the frame to its jobs instead of beginning it here).
+    pub fn setupStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, local: *?CDict) BeginError!StreamSetup {
         const adv = opts.advanced;
         var level = opts.level;
         var cdict: ?*const CDict = null;
@@ -867,7 +896,7 @@ pub const Compressor = struct {
         const cp = params.getFromCCtxParams(level, size, dict_size, mode, adv);
         var o = opts;
         o.level = level;
-        try comp.beginInternal(prefix, cdict, cp, pledged, o, buffered);
+        return .{ .cp = cp, .opts = o, .prefix = prefix, .cdict = cdict };
     }
 
     /// `ZSTD_compressBegin_internal`: set the context up for a frame with

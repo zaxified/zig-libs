@@ -3104,3 +3104,70 @@ pub const dict_cases_attach_fast = [_]DictCase{
     .{ .name = "surv-m25-dfast", .input = .{ .name = "", .len = surv_m25_input.len, .kind = .survivor_literal, .seed = 5 }, .dict = "surv-m25-dict", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{3} },
     .{ .name = "surv-m27-dfast", .input = .{ .name = "", .len = surv_m27_input.len, .kind = .survivor_literal, .seed = 6 }, .dict = "surv-m27-dict", .path = .cdict, .params = "forceAttachDict=1", .levels = &.{3} },
 };
+
+/// A multithreaded golden (Z9a): `input` compressed with `ZSTD_c_nbWorkers`
+/// -- one-shot (`ZSTD_compress2`) with the advanced parameters `params`, or
+/// streaming with `schedule` (`stream_cases`' grammar) -- optionally with a
+/// dictionary (`dict`, used as `path` says: `.load`, `.prefix`, `.cdict`),
+/// at each of `levels`, once per `checksums` entry. Neither carries
+/// `nbWorkers`: the recipe gives libzstd `mt_golden_workers` (and checks
+/// that one worker gives the same bytes), the test every count of
+/// `mt_test_workers`.
+pub const MtCase = struct {
+    name: []const u8,
+    input: Case,
+    params: []const u8 = "-",
+    schedule: ?[]const u8 = null,
+    dict: ?[]const u8 = null,
+    path: DictPath = .load,
+    content_type: u2 = 0,
+    levels: []const i32,
+    checksums: []const bool = &.{false},
+};
+
+pub const mt_golden_workers = 3;
+pub const mt_test_workers = [_]u32{ 1, 2, 4, 8 };
+
+const mt_in_far_repeat: Case = .{ .name = "", .len = 1_400_000, .kind = .far_repeat };
+const mt_in_alternating: Case = .{ .name = "", .len = 1_000_000, .kind = .alternating };
+const mt_in_drift: Case = .{ .name = "", .len = 1_000_000, .kind = .drift };
+const mt_in_far_mix: Case = .{ .name = "", .len = 1_400_000, .kind = .far_mix, .seed = 5 };
+const mt_in_mix_3m: Case = .{ .name = "", .len = 3_000_000, .kind = .mix, .seed = 41 };
+const mt_in_csv: Case = .{ .name = "", .len = 600_000, .kind = .csv };
+const mt_in_mix_300k: Case = .{ .name = "", .len = 300_000, .kind = .mix, .seed = 9 };
+
+/// 512 KB jobs (`ZSTDMT_JOBSIZE_MIN`) keep inputs of 1..3 MB several jobs
+/// long; the 3 MB ones wrap the round buffer for up to 4 workers.
+pub const mt_cases = [_]MtCase{
+    // one-shot: every strategy family, the default overlap for its strategy
+    .{ .name = "mt-far-repeat", .input = mt_in_far_repeat, .params = "jobSize=524288", .levels = &.{ -5, 1, 3, 5, 7, 9, 12, 16, 19 } },
+    .{ .name = "mt-far-repeat-ck", .input = mt_in_far_repeat, .params = "jobSize=524288", .levels = &.{ 1, 7 }, .checksums = &.{true} },
+    // a whole window reloaded; none (overlap log 1)
+    .{ .name = "mt-alternating-ov9", .input = mt_in_alternating, .params = "jobSize=524288,overlapLog=9", .levels = &.{ 1, 6, 13 } },
+    .{ .name = "mt-drift-ov1", .input = mt_in_drift, .params = "jobSize=524288,overlapLog=1", .levels = &.{ 2, 8 } },
+    // the round buffer wraps: the prefix moves to its start
+    .{ .name = "mt-mix-3m-wrap", .input = mt_in_mix_3m, .params = "jobSize=524288,overlapLog=7", .levels = &.{ 1, 4 }, .checksums = &.{ false, true } },
+    // long-distance matching across jobs (and across the wrap), external
+    // sequences in the greedy..btlazy2 and in the optimal parsers' paths
+    .{ .name = "mt-mix-3m-ldm", .input = mt_in_mix_3m, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20", .levels = &.{ 1, 5 } },
+    .{ .name = "mt-far-mix-ldm", .input = mt_in_far_mix, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20,ldmHashRateLog=4", .levels = &.{16} },
+    // the default job size: one job, which writes the checksum itself
+    .{ .name = "mt-single-job", .input = mt_in_far_repeat, .levels = &.{3}, .checksums = &.{ false, true } },
+    // streaming, unknown size: jobs cut by flushes
+    .{ .name = "mt-csv-flush", .input = mt_in_csv, .schedule = "c100000,f0,c*,e0", .levels = &.{ 1, 3, 7 } },
+    .{ .name = "mt-mix-tiny-jobs", .input = mt_in_mix_300k, .schedule = "jobSize=524288,o50,c3000,f0,c1,f0,c*,e0", .levels = &.{ -1, 5, 19 }, .checksums = &.{true} },
+    // an empty frame through one job; a last job of no input (the checksum
+    // appended after it)
+    .{ .name = "mt-empty", .input = in_empty, .schedule = "c*,e0", .levels = &.{3}, .checksums = &.{ false, true } },
+    .{ .name = "mt-empty-last-job", .input = mt_in_csv, .schedule = "c*,f0,e0", .levels = &.{3}, .checksums = &.{true} },
+    .{ .name = "mt-pledged", .input = mt_in_alternating, .schedule = "p1000000,jobSize=524288,c*,e0", .levels = &.{3}, .checksums = &.{true} },
+    .{ .name = "mt-stream-ldm", .input = mt_in_far_mix, .schedule = "jobSize=524288,enableLongDistanceMatching=1,windowLog=19,c700000,f0,c*,e0", .levels = &.{4} },
+    // dictionaries: only the first job has one
+    .{ .name = "mt-dict-load", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .load, .levels = &.{ 3, 9 } },
+    .{ .name = "mt-dict-prefix-raw", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "raw-words-8000", .path = .prefix, .content_type = 1, .levels = &.{ 3, 13 } },
+    .{ .name = "mt-dict-prefix-raw-ldm", .input = mt_in_mix_3m, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20", .dict = "raw-words-8000", .path = .prefix, .content_type = 1, .levels = &.{3} },
+    // a full dictionary as a prefix becomes a CDict by reference
+    .{ .name = "mt-dict-prefix-full", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .prefix, .levels = &.{ 3, 5 } },
+    .{ .name = "mt-dict-cdict-attach", .input = mt_in_csv, .schedule = "c200000,f0,c*,e0", .dict = "zd-csv", .path = .cdict, .levels = &.{ 1, 5, 16 } },
+    .{ .name = "mt-dict-cdict-copy", .input = mt_in_alternating, .params = "jobSize=524288,forceAttachDict=2", .dict = "zd-words", .path = .cdict, .levels = &.{3} },
+};
