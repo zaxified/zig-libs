@@ -469,4 +469,12 @@ pub const rows = [_]Golden{
     .{ .case = "attach-fast-negative-level", .level = -7, .checksum = false, .len = 805, .sha256 = "bed42518c18876acd8db089e7a2308df844871f833f3a76f9aa226be9184efca" },
     .{ .case = "attach-level2-raw", .level = 2, .checksum = false, .len = 746, .sha256 = "cadb9980f03b0f91e230c230cfe35081801e2e73c0b9a16d7f543650c6e1d464" },
     .{ .case = "attach-level2-full", .level = 2, .checksum = false, .len = 888, .sha256 = "b7a284057d519ae7f797e8882b116919959947f4eac6126e4214f0eb896e9ed8" },
+    .{ .case = "attach-dfast-cross-end", .level = 3, .checksum = false, .len = 454, .sha256 = "c7be92d7283af29ce2ecba1ecf1965618543f7fd4604d62efb09b37eb6866ec0" },
+    .{ .case = "surv-m12-fast", .level = 1, .checksum = false, .len = 264, .sha256 = "1f3d4c5826e7adbfe524c65292af8cd3c0dfd058d10c45f94530880c49861a1a" },
+    .{ .case = "surv-m17-fast", .level = 1, .checksum = false, .len = 90, .sha256 = "919c9fe0d427ceb055de8091f8076646e4b24c95b1087aca54ac687b159cecf9" },
+    .{ .case = "surv-m22-dfast", .level = 3, .checksum = false, .len = 489, .sha256 = "a4cd83d6d56436163cb136265601c44afaaa2f0f99351123acd97b47a434bfae" },
+    .{ .case = "surv-m23-dfast", .level = 3, .checksum = false, .len = 308, .sha256 = "8154cfe7ddb29a2811c1bcd2c914113c06bfe1523d60bf8db76db43bbbb40769" },
+    .{ .case = "surv-m24-dfast", .level = 3, .checksum = false, .len = 525, .sha256 = "b4df40f0991fc9d7fa0e35a4b9bc05a5b1a1b841359de48acb31a00212e340b7" },
+    .{ .case = "surv-m25-dfast", .level = 3, .checksum = false, .len = 551, .sha256 = "40d7e5a2d68a6cb7300b081927b4baac6b58c782183dfa1fcf2e9d21eb8b8fb7" },
+    .{ .case = "surv-m27-dfast", .level = 3, .checksum = false, .len = 284, .sha256 = "4a9cba7ae9708fa3c818fedd1844bb3a7b5823f46b523efb108adc4692e9436c" },
 };

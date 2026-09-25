@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **NO CONSUMER-VISIBLE CHANGE:** D1's random diff loop
+  (≥3000 cases vs libzstd, fast/dfast attach) and mutation-sweep hunt
+  added 8 golden cases (`attach-dfast-cross-end`, `surv-m12-fast`,
+  `surv-m17-fast`, `surv-m22-dfast`, `surv-m23-dfast`, `surv-m24-dfast`,
+  `surv-m25-dfast`, `surv-m27-dfast`) and a `DictDef.Source.literal`
+  variant (test-only, `pub` so `dump_corpus.zig` can read it) for exact
+  hunted byte sequences a generator would not reproduce; no behaviour
+  change outside the test corpus.
+
 - **2026-09-25** — **BEHAVIOURAL, not breaking:** two Z2c corners now match
   libzstd exactly instead of an earlier, unverified reading of it (both
   confirmed empirically against libzstd 1.5.7 through `tools/zdec.c`, not

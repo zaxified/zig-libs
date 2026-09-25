@@ -637,33 +637,64 @@ the match side is a different `MatchState` (the attached CDict's own,
 not `ms.dict`) rather than a second segment of the same one.
 
 **D1 mutation sweep** (33 mutants over `countAcrossDict`,
-`comparePackedTags`, `fastDictMatchStateBlock`, `dfastDictMatchStateBlock`;
-`-Dtest-filter=dict`, `dict_test.zig`'s 33 dictionary tests only -- a
-narrower binary than the full suite, valid for finding whether a mutation
-is caught at all, not as evidence about the rest of the module):
-**19 killed, 14 survived**, all early-return/early-exit boundary checks
-that only misfire when a match starts or ends at *exactly* an index
-(`dict_start_index`, `prefix_start_index`/`prefix_lowest_index`, or the
-CDict's own end) -- the same shape as the equality-boundary survivors
-already open elsewhere in this file (`opt`/splitter, LDM, decoder); no
-golden here happens to land a match on the boundary byte. Listed for a
-future hunt (SPEC backlog, not blocking): `countAcrossDict`'s `p_match >
-m_end` / `v_end > p_in` / the `orelse len` fallback / the `i_start,i_end`
-argument order in its continuation call; the `>` vs `>=` reads against
-`prefix_start_index`/`dict_start_index` in both new match finders'
-prefix-vs-dict preference and backward catch-up bounds (11 sites, see
-`match.zig`'s `fastDictMatchStateBlock`/`dfastDictMatchStateBlock`).
-One mutation (removing `countAcrossDict`'s fallthrough for a dict match
-that ends exactly at the CDict's edge) exposed a **real bug** the sweep
-caught before it shipped: the first port of `countAcrossDict` returned 0
-early whenever the dict-side runway was exactly exhausted
-(`p_match == m_end` / `v_end == p_in`), instead of falling through to
-`ZSTD_count_2segments`'s continuation into the prefix, as the existing
-`Base.count2Segments` already does correctly for the extDict case. Fixed
-to mirror `Base.count2Segments`'s shape exactly. No committed golden
-currently exercises this exact boundary (fixing it left all 33 dict
-tests unchanged), which is why the boundary mutants above still survive
-after the fix -- flagged, not hidden, in the list above.
+`comparePackedTags`, `fastDictMatchStateBlock`, `dfastDictMatchStateBlock`).
+First pass against `-Dtest-filter=dict` (`dict_test.zig`'s dictionary
+tests only, a narrower binary -- fast enough to iterate, but only
+evidence that a mutation is caught at all, not about the rest of the
+module): 19 killed, 14 survived, 0 invalid. One mutation (removing
+`countAcrossDict`'s fallthrough for a dict match that ends exactly at
+the CDict's edge) exposed a **real bug**: the first port of
+`countAcrossDict` returned 0 early whenever the dict-side runway was
+exactly exhausted (`p_match == m_end` / `v_end == p_in`), instead of
+falling through to `ZSTD_count_2segments`'s continuation into the
+prefix, as the existing `Base.count2Segments` already does for the
+extDict case. Fixed to mirror `Base.count2Segments`'s shape exactly, and
+anchored with a hunted golden, `attach-dfast-cross-end` (dfast, a match
+confirmed at the CDict's last bytes that continues counting from the
+prefix's start; found by generating random `dict = filler ++ P`,
+`input = Z ++ mid ++ P ++ Z ++ tail` constructions and comparing the
+fixed helper's output against the pre-fix one until one diverged, then
+confirmed against libzstd 1.5.7 byte-for-byte: 454 bytes either way,
+while the pre-fix code gives 456 and does not match).
+
+The 14 survivors were then re-run against the **full** `test-zstd` suite
+(not just the dict filter, since a filtered binary is a different
+binary and a survivor there could still be caught elsewhere): 2 flipped
+to KILLED outright (`m04`, an argument-order bug in the continuation
+call -- some *other* test in the full suite already covered it) or were
+found by hunting. Orig-vs-mutant search (plan §5.4: random `(dict,
+input)` triples, `forceAttachDict=1`, ~15–100 k tries per batch,
+capped) killed **7 more** with a real divergence confirmed against
+libzstd, each now a golden (`surv-m12-fast`, `surv-m17-fast`,
+`surv-m22-dfast`, `surv-m23-dfast`, `surv-m24-dfast`, `surv-m25-dfast`,
+`surv-m27-dfast`) exercising: the `>` vs `>=` read against
+`prefix_start_index`/`prefix_lowest_index` in the prefix-match
+acceptance (`fastDictMatchStateBlock`'s `m12`, `dfastDictMatchStateBlock`'s
+`m22`, `m24`); the outer loop's off-by-one exit bound (`m17`); and the
+`>` vs `>=` read against `dict_start_index` in the dict-match acceptance
+and the long-match-plus-one dict branch (`m23`, `m27`).
+
+**Final tally: 28/33 killed, 2 confirmed equivalent, 3 open.**
+- **Equivalent** (justified, not hunted further): `m01`/`m02`
+  (`countAcrossDict`'s `p_match > m_end` vs `>=`, and `v_end > p_in` vs
+  `>=`) -- at the exact boundary these mutate (`p_match == m_end`), the
+  `@min` formula and the direct `p_in` branch both evaluate to
+  `v_end == p_in`, so `n` comes out 0 either way: no input can tell them
+  apart, confirmed by re-running the new `attach-dfast-cross-end` golden
+  (which hits exactly this boundary) against both -- still survives,
+  as expected of a genuinely equivalent mutant.
+- **Open** (30–100 k random tries each did not land the exact index
+  coincidence; a future session may hunt further, is not blocking):
+  `m03` (`countAcrossDict`'s `orelse len` vs `orelse 0`, needs a full
+  matching span up to but short of `m_end`, not the cross-end case
+  `attach-dfast-cross-end` covers); `m14` (`fastDictMatchStateBlock`'s
+  backward catch-up bound `dm > dict_start_index` vs `>=`); `m19`
+  (`fastDictMatchStateBlock`'s `ip1`/`ip0` init-order swap, likely a rare
+  or equivalent reordering since it only matters when
+  `dict_and_prefix_length == 0` interacts with the very first step);
+  `m26` (`dfastDictMatchStateBlock`'s long-match-plus-one prefix
+  acceptance `match_idx_l3 >= prefix_lowest_index` vs `>`, the sibling of
+  the now-killed `m22`/`m24`, just on the "+1" lookahead specifically).
 
 **The optimal parsers attached (D3).** `btopt`, `btultra` and `btultra2`
 search an attached CDict (`zstd_opt.c` with `dictMode ==
