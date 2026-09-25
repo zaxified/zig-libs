@@ -104,6 +104,14 @@ pub const Entry = struct {
     /// `"192.0.2.1:54321"`. Null when unknown (no live connection, e.g. a
     /// trusted-proxy deployment with no forwarded-for signal parsed yet).
     remote_addr: ?[]const u8 = null,
+    /// The authenticated caller -- a verified principal's id, a JWT `sub` --
+    /// as the server established it, never a header the client asserted.
+    /// Combined's `%u`; a `user` key in JSON Lines and logfmt. Null (the
+    /// default) writes exactly what every format wrote before the field
+    /// existed: `-` in Combined, no key in the other two -- JSON Lines too,
+    /// which otherwise writes an explicit `null`, so no existing line
+    /// changes. It is personal data: log it only where that is allowed.
+    user: ?[]const u8 = null,
     /// Request method token, e.g. `"GET"`.
     method: []const u8,
     /// Raw request-target as sent, e.g. `"/path?q=1"` or `"*"`.
@@ -177,6 +185,10 @@ pub fn write(entry: Entry, format: Format, w: *std.Io.Writer) std.Io.Writer.Erro
 pub fn writeJsonLines(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     try w.print("{{\"ts\":{d},\"remote_addr\":", .{entry.timestamp_ns});
     try writeJsonOptString(w, entry.remote_addr);
+    if (entry.user) |u| {
+        try w.writeAll(",\"user\":");
+        try writeJsonString(w, u);
+    }
     try w.writeAll(",\"method\":");
     try writeJsonString(w, entry.method);
     try w.writeAll(",\"target\":");
@@ -374,6 +386,10 @@ pub fn writeLogfmt(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll(" remote_addr=");
         try writeLogfmtValue(w, v);
     }
+    if (entry.user) |v| {
+        try w.writeAll(" user=");
+        try writeLogfmtValue(w, v);
+    }
     try w.writeAll(" method=");
     try writeLogfmtValue(w, entry.method);
     try w.writeAll(" target=");
@@ -443,8 +459,12 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 
 /// `%h %l %u %t "%r" %>s %b "%{Referer}i" "%{User-Agent}i"\n`.
 ///
-/// `%l` (identity) and `%u` (authenticated user) are always `-` — this
-/// module tracks neither. `%b` is `-` when `response_bytes` is null, the
+/// `%l` (identity, RFC 1413) is always `-`. `%u` is `Entry.user`, or `-`
+/// when null. It is an UNQUOTED field, so beside the escaping below every
+/// Combined delimiter in it -- space, `"`, `[`, `]` -- is hex-escaped (a raw
+/// space would shift every later field, a quote or bracket would give a
+/// reader a false start of `"%r"` or `[%t]`), and an empty user is written
+/// `""`, as Apache does. `%b` is `-` when `response_bytes` is null, the
 /// decimal count otherwise (0 prints as `0`, matching real servers).
 /// Referer/User-Agent print the literal `"-"` when absent, matching
 /// `mod_log_config`'s own behavior for a missing header on a quoted field.
@@ -458,7 +478,17 @@ fn writeLogfmtValue(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
 /// caller's method/target/protocol/referer/user-agent/remote_addr contain.
 pub fn writeCombined(entry: Entry, w: *std.Io.Writer) std.Io.Writer.Error!void {
     if (entry.remote_addr) |a| try writeClfEscaped(w, hostOnly(a)) else try w.writeByte('-');
-    try w.writeAll(" - - [");
+    try w.writeAll(" - ");
+    if (entry.user) |u| {
+        if (u.len == 0) try w.writeAll("\"\"");
+        for (u) |c| {
+            switch (c) {
+                ' ', '"', '[', ']' => try w.print("\\x{x:0>2}", .{c}),
+                else => try writeClfEscaped(w, &.{c}),
+            }
+        }
+    } else try w.writeByte('-');
+    try w.writeAll(" [");
     if (entry.time_formatted) |t| try writeClfEscaped(w, t) else try w.print("{d}", .{entry.timestamp_ns});
     try w.writeAll("] \"");
     try writeClfEscaped(w, entry.method);
@@ -732,6 +762,74 @@ test "missing optional fields: JSON emits null, logfmt omits the key, combined u
     var cw: std.Io.Writer = .fixed(&cbuf);
     try writeCombined(entry, &cw);
     try testing.expectEqualStrings("- - - [1] \"GET / HTTP/1.1\" 204 - \"-\" \"-\"\n", cw.buffered());
+}
+
+test "user: %u in Combined, a user key in JSON Lines and logfmt" {
+    var entry = sampleEntry();
+    entry.user = "svc-billing";
+
+    var jbuf: [512]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try writeJsonLines(entry, &jw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, jw.buffered(), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("svc-billing", parsed.value.object.get("user").?.string);
+
+    var lbuf: [512]u8 = undefined;
+    var lw: std.Io.Writer = .fixed(&lbuf);
+    try writeLogfmt(entry, &lw);
+    try testing.expect(std.mem.indexOf(u8, lw.buffered(), " remote_addr=192.0.2.1:54321 user=svc-billing method=GET ") != null);
+
+    var cbuf: [512]u8 = undefined;
+    var cw: std.Io.Writer = .fixed(&cbuf);
+    try writeCombined(entry, &cw);
+    try testing.expect(std.mem.startsWith(u8, cw.buffered(), "192.0.2.1 - svc-billing [22/Jul/2026:10:00:00 +0000] \"GET "));
+
+    // Empty: Apache's `""`, so the field is still there to count.
+    entry.user = "";
+    cw = .fixed(&cbuf);
+    try writeCombined(entry, &cw);
+    try testing.expect(std.mem.startsWith(u8, cw.buffered(), "192.0.2.1 - \"\" [22/Jul"));
+}
+
+test "user: null writes what the formats wrote before the field existed" {
+    const entry = sampleEntry(); // user null
+    var jbuf: [512]u8 = undefined;
+    var jw: std.Io.Writer = .fixed(&jbuf);
+    try writeJsonLines(entry, &jw);
+    try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"user\"") == null);
+    var lbuf: [512]u8 = undefined;
+    var lw: std.Io.Writer = .fixed(&lbuf);
+    try writeLogfmt(entry, &lw);
+    try testing.expect(std.mem.indexOf(u8, lw.buffered(), " user=") == null);
+    var cbuf: [512]u8 = undefined;
+    var cw: std.Io.Writer = .fixed(&cbuf);
+    try writeCombined(entry, &cw);
+    try testing.expect(std.mem.startsWith(u8, cw.buffered(), "192.0.2.1 - - [22/Jul"));
+}
+
+test "user: a crafted user cannot add a field or a line to a Combined record" {
+    var entry = sampleEntry();
+    entry.user = "a b \"c\" [d] \r\nforged - - [1] \"GET / HTTP/1.1\" 200 0";
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeCombined(entry, &w);
+    const out = w.buffered();
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, "\n"));
+    // `%h %l %u [` -- the user is still exactly the third space-separated field.
+    var it = std.mem.splitScalar(u8, out, ' ');
+    _ = it.next(); // %h
+    try testing.expectEqualStrings("-", it.next().?); // %l
+    const u = it.next().?;
+    try testing.expect(std.mem.indexOfAny(u8, u, " \r\n\"[]") == null);
+    try testing.expect(std.mem.startsWith(u8, it.next().?, "[22/Jul/2026"));
+
+    // And the JSON record carries it back byte for byte.
+    w = .fixed(&buf);
+    try writeJsonLines(entry, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, w.buffered(), .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(entry.user.?, parsed.value.object.get("user").?.string);
 }
 
 // ── log-injection teeth ──────────────────────────────────────────────────

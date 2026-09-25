@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **New `Entry.user`: the authenticated caller.** Combined writes it as `%u`
+  (was always `-`); JSON Lines and logfmt gain a `user` key. `%u` is unquoted, so a space, `"`,
+  `[` or `]` in it is hex-escaped (`\xHH`) on top of the usual escaping, and an empty user is
+  `""`. Null -- the default -- writes exactly the old output in all three formats (JSON Lines
+  omits the key rather than writing `null`, so no existing line changes).
+
 - **2026-09-10** — A1 audit close-out, 3 findings. (1) Combined's
   `writeClfEscaped` now hex-escapes `]` the same way it already hex-escapes
   control bytes: `]` is the one non-control byte that is also a delimiter

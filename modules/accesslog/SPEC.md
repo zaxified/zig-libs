@@ -255,12 +255,9 @@ not something this formatter can detect).
 
 ## Backlog / deferred
 
-- **`%u` — the authenticated user** — BACKLOG (2026-09-22, found by qap). Common/Combined
-  write `%l` and `%u` as a constant `-`, and `Entry` has no field to fill `%u` from, so a server
-  that knows its caller (qap's principal form, a JWT `sub`) cannot log it in the formats that
-  define a slot for exactly that. Wanted: an optional `Entry.user` rendered as `%u` (escaped like
-  every other client-influenced field) and as a `user` key in the JSON/logfmt formats; `-` when
-  null, so existing output is byte-identical.
+- ~~**`%u` — the authenticated user**~~ — DONE 2026-09-25: `Entry.user` (Combined `%u` with every
+  Combined delimiter hex-escaped, a `user` key in JSON Lines/logfmt written only when set, so
+  output with `user = null` is byte-identical to before).
 
 ## Design & invariants
 
