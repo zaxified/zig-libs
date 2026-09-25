@@ -4,7 +4,7 @@
 //! (`ZSTD_compress_insertDictionary`, `ZSTD_loadZstdDictionary`,
 //! `ZSTD_loadCEntropy`, `ZSTD_loadDictionaryContent`), and `CDict`, a
 //! dictionary digested once for many frames (`ZSTD_createCDict_advanced2`,
-//! without the dedicated dictionary search).
+//! with the dedicated dictionary search's parameters).
 //!
 //! A dictionary is either raw content -- bytes the input is likely to
 //! repeat -- or a "full" zstd dictionary: magic number, ID, the entropy
@@ -181,6 +181,37 @@ pub fn loadCEntropy(bs: *frame.BlockState, dict: []const u8) Error!usize {
     return p;
 }
 
+/// `ZSTD_dedicatedDictSearch_getCParams`: the level's parameters for a
+/// CDict of `dict_size` bytes (sized for an input of 0 bytes, not a small
+/// one), the hash log 2 larger for `greedy`..`lazy2`.
+fn ddsGetCParams(level: i32, dict_size: usize) params.CParams {
+    var cp = params.getInternal(level, 0, dict_size, .create_cdict);
+    switch (cp.strategy) {
+        .fast, .dfast => {},
+        .greedy, .lazy, .lazy2 => cp.hash_log += lazy.ddss_bucket_log,
+        .btlazy2, .btopt, .btultra, .btultra2 => {},
+    }
+    return cp;
+}
+
+/// `ZSTD_dedicatedDictSearch_isSupported`.
+fn ddsIsSupported(cp: params.CParams) bool {
+    return @intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.greedy) and
+        @intFromEnum(cp.strategy) <= @intFromEnum(params.Strategy.lazy2) and
+        cp.hash_log > cp.chain_log and
+        cp.chain_log <= 24;
+}
+
+/// `ZSTD_dedicatedDictSearch_revertCParams`: the parameters a context
+/// attaching a dedicated-search CDict sizes its own tables from.
+pub fn ddsRevertCParams(cp: *params.CParams) void {
+    switch (cp.strategy) {
+        .fast, .dfast => {},
+        .greedy, .lazy, .lazy2 => cp.hash_log = @max(cp.hash_log - lazy.ddss_bucket_log, params.hash_log_min),
+        .btlazy2, .btopt, .btultra, .btultra2 => {},
+    }
+}
+
 fn zeroedCTable() fse.CTable {
     var ct: fse.CTable = .{};
     @memset(&ct.state_table, 0);
@@ -246,7 +277,10 @@ pub fn loadDictionaryContent(ms: *match.MatchState, ls: ?*ldm.State, content: []
     switch (cp.strategy) {
         .fast => match.fillHashTableFor(ms, iend, dtlm, tfp),
         .dfast => match.fillDoubleHashTableFor(ms, iend, dtlm, tfp),
-        .greedy, .lazy, .lazy2 => if (ms.use_row) {
+        .greedy, .lazy, .lazy2 => if (ms.dedicated_dict_search) {
+            std.debug.assert(ms.chain_table.len != 0);
+            lazy.ddsLoadDictionary(ms, iend - match.hash_read_size);
+        } else if (ms.use_row) {
             @memset(ms.tag_table, 0);
             lazy.rowUpdateDictionary(ms, iend - match.hash_read_size);
         } else {
@@ -279,6 +313,12 @@ pub const CDict = struct {
     compression_level: i32,
     /// `useRowMatchFinder`.
     use_row: bool,
+    /// `matchState.dedicatedDictSearch`: made with
+    /// `Advanced.enable_dedicated_dict_search` where libzstd supports it
+    /// (`greedy`..`lazy2`); its hash table is laid out in buckets, its
+    /// parameters (`compressionParameters`) have a hash log 2 larger, and
+    /// a context always attaches it.
+    dedicated_dict_search: bool,
     /// `matchState`: the window (the content as its prefix) and the filled
     /// tables, `fast`/`dfast` ones tagged. An attached CDict is searched
     /// through it (`MatchState.dict_match_state`).
@@ -330,19 +370,36 @@ pub const CDict = struct {
     }
 
     /// The parameters a CDict for `dict_size` bytes gets with `opts`
-    /// (`ZSTD_getCParamsFromCCtxParams(..., ZSTD_cpm_createCDict)`).
+    /// (`ZSTD_getCParamsFromCCtxParams(..., ZSTD_cpm_createCDict)`, or
+    /// `ZSTD_dedicatedDictSearch_getCParams` with the explicit parameters
+    /// over it when `Advanced.enable_dedicated_dict_search` applies).
     pub fn paramsFor(dict_size: usize, opts: Options) params.CParams {
+        return resolveParams(dict_size, opts)[0];
+    }
+
+    /// `ZSTD_createCDict_advanced2`'s choice: the parameters, and whether
+    /// the CDict gets the dedicated dictionary search (asked for, and
+    /// supported with the parameters it would get; else the plain ones).
+    fn resolveParams(dict_size: usize, opts: Options) struct { params.CParams, bool } {
+        if (opts.advanced.enable_dedicated_dict_search) {
+            var cp = ddsGetCParams(opts.level, dict_size);
+            params.overrideCParams(&cp, opts.advanced);
+            if (ddsIsSupported(cp)) return .{ cp, true };
+        }
+        // Fall back to non-DDSS params
         const size_hint: u64 = if (opts.src_size_hint) |h| h else params.unknown_size;
-        return params.getFromCCtxParams(opts.level, size_hint, dict_size, .create_cdict, opts.advanced);
+        return .{ params.getFromCCtxParams(opts.level, size_hint, dict_size, .create_cdict, opts.advanced), false };
     }
 
     fn create(gpa: std.mem.Allocator, dict: []const u8, opts: Options, copy: bool) InitError!CDict {
         if (opts.level > params.max_level) return error.LevelUnsupported;
         try opts.advanced.check();
-        const cp = paramsFor(dict.len, opts);
+        const cp, const dds = resolveParams(dict.len, opts);
         const use_row = params.resolveRowMatchFinder(opts.advanced.row_match_finder, cp);
-        // ZSTD_allocateChainTable: not for fast, not with the row match finder
-        const chain_len: usize = if (cp.strategy != .fast and !use_row) @as(usize, 1) << @intCast(cp.chain_log) else 0;
+        // ZSTD_allocateChainTable: not for fast, not with the row match
+        // finder -- always for the dedicated search, whose table layout
+        // lives in it
+        const chain_len: usize = if (dds or (cp.strategy != .fast and !use_row)) @as(usize, 1) << @intCast(cp.chain_log) else 0;
         const hash_len: usize = @as(usize, 1) << @intCast(cp.hash_log);
 
         const owned: ?[]u8 = if (copy and dict.len != 0) try gpa.dupe(u8, dict) else null;
@@ -362,6 +419,7 @@ pub const CDict = struct {
             .dict_id = 0,
             .compression_level = 0, // ZSTD_NO_CLEVEL: signals advanced API usage
             .use_row = use_row,
+            .dedicated_dict_search = dds,
             .ms = .{
                 .src = &.{},
                 .cp = cp,
@@ -372,6 +430,7 @@ pub const CDict = struct {
                 .row_hash_log = if (use_row) cp.hash_log - params.rowLog(cp) else 0,
                 // a CDict never salts its row hashes
                 .hash_salt = 0,
+                .dedicated_dict_search = dds,
             },
             .block_state = .{},
             .tables = tables,
@@ -569,4 +628,39 @@ test "a Huffman header's zero weight is a symbol without a code" {
     try std.testing.expect(zero);
     try std.testing.expectEqual(@as(u8, 0), ct.elt[200].nb_bits);
     try std.testing.expect(ct.elt[199].nb_bits != 0);
+}
+
+test "the dedicated dictionary search's support and parameters are libzstd's" {
+    var cp = params.getInternal(5, 0, 30000, .create_cdict);
+    try std.testing.expect(ddsIsSupported(ddsGetCParams(5, 30000)));
+    try std.testing.expectEqual(cp.hash_log + lazy.ddss_bucket_log, ddsGetCParams(5, 30000).hash_log);
+    // a chain log above 24, or a hash log not above the chain log
+    cp.strategy = .lazy2;
+    cp.chain_log = 25;
+    cp.hash_log = 26;
+    try std.testing.expect(!ddsIsSupported(cp));
+    cp.chain_log = 24;
+    try std.testing.expect(ddsIsSupported(cp));
+    cp.hash_log = 24;
+    try std.testing.expect(!ddsIsSupported(cp));
+    cp.hash_log = 25;
+    cp.strategy = .btlazy2;
+    try std.testing.expect(!ddsIsSupported(cp));
+    cp.strategy = .dfast;
+    try std.testing.expect(!ddsIsSupported(cp));
+    // reverting never goes below the smallest hash log
+    cp.strategy = .greedy;
+    cp.hash_log = 7;
+    ddsRevertCParams(&cp);
+    try std.testing.expectEqual(@as(u32, params.hash_log_min), cp.hash_log);
+    cp.hash_log = 20;
+    ddsRevertCParams(&cp);
+    try std.testing.expectEqual(@as(u32, 18), cp.hash_log);
+    // fast, dfast and the binary trees keep theirs
+    const fast = ddsGetCParams(1, 30000);
+    try std.testing.expectEqual(params.getInternal(1, 0, 30000, .create_cdict).hash_log, fast.hash_log);
+    var bt = ddsGetCParams(13, 30000);
+    const bt_hash = bt.hash_log;
+    ddsRevertCParams(&bt);
+    try std.testing.expectEqual(bt_hash, bt.hash_log);
 }

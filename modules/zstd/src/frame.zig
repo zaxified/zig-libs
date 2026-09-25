@@ -459,9 +459,12 @@ const attach_dict_size_cutoffs = [10]u64{
 
 /// `ZSTD_shouldAttachDict`: whether a frame of `pledged` bytes
 /// (`unknown_size` when not known) searches `cdict` in place rather than a
-/// copy of its tables.
+/// copy of its tables. A dedicated-search CDict is always attached (its
+/// table layout is for searching in place only), even with `.copy` or
+/// `force_max_window`.
 pub fn shouldAttachDict(cdict: *const CDict, adv: params.Advanced, pledged: u64) bool {
     const cutoff = attach_dict_size_cutoffs[@intFromEnum(cdict.ms.cp.strategy)];
+    if (cdict.dedicated_dict_search) return true;
     return (pledged <= cutoff or pledged == params.unknown_size or adv.force_attach_dict == .attach) and
         adv.force_attach_dict != .copy and
         !adv.force_max_window; // dictMatchState isn't correctly handled in _enforceMaxDist
@@ -912,6 +915,7 @@ pub const Compressor = struct {
     /// tables and repcodes.
     fn resetByCopyingCDict(comp: *Compressor, cdict: *const CDict, cp_frame: params.CParams, pledged: ?u64, opts: Options, buffered: bool) BeginError!void {
         const cdict_cp = cdict.ms.cp;
+        std.debug.assert(!cdict.dedicated_dict_search);
         // Copy only compression parameters related to tables.
         var cp = cdict_cp;
         cp.window_log = cp_frame.window_log;
@@ -968,7 +972,9 @@ pub const Compressor = struct {
         const use_row_frame = params.resolveRowMatchFinder(opts.advanced.row_match_finder, cp_frame);
         // Resize working context table params for input only, since the
         // dict has its own tables.
-        var cp = params.adjustInternal(cdict.ms.cp, pledged orelse params.unknown_size, cdict.content.len, .attach_dict, resolved(use_row_frame));
+        var cdict_cp = cdict.ms.cp;
+        if (cdict.dedicated_dict_search) cdict_mod.ddsRevertCParams(&cdict_cp);
+        var cp = params.adjustInternal(cdict_cp, pledged orelse params.unknown_size, cdict.content.len, .attach_dict, resolved(use_row_frame));
         cp.window_log = cp_frame.window_log;
         try comp.begin(cp, pledged, resolvedOn(opts, cp_frame, cdict.use_row), buffered, .{});
         const ms = &comp.c.ms;

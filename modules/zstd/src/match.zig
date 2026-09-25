@@ -93,6 +93,10 @@ pub const MatchState = struct {
     /// match finders' `dictMatchState` variants read it; see SPEC.md,
     /// *Dictionaries*, for how to add one.
     dict_match_state: ?*const MatchState = null,
+    /// `dedicatedDictSearch`: a `CDict`'s match state whose hash table is
+    /// laid out in buckets for the dedicated dictionary search
+    /// (`lazy.ddsLoadDictionary`). Never set on a context's own.
+    dedicated_dict_search: bool = false,
     /// `forceNonContiguous`: the next chunk starts a new segment even if it
     /// follows the window in memory (`Advanced.deterministic_ref_prefix`
     /// after a dictionary was loaded).

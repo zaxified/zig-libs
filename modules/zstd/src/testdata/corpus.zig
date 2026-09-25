@@ -2714,7 +2714,7 @@ const some_levels: []const i32 = &.{ -5, 1, 3, 5, 9, 13, 19 };
 
 /// Every dictionary golden: D0's (the dictionary in the window) and those
 /// of the attach variants (the CDict searched in place).
-pub const dict_cases = dict_cases_d0 ++ dict_cases_attach_lazy ++ dict_cases_load_adjacent;
+pub const dict_cases = dict_cases_d0 ++ dict_cases_attach_lazy ++ dict_cases_load_adjacent ++ dict_cases_dds;
 
 /// `.raw` is loaded by copy (`ZSTD_dlm_byCopy`): an input right after the
 /// caller's dictionary in memory must not continue the context's own
@@ -2986,6 +2986,57 @@ const dict_cases_attach_lazy = [_]DictCase{
     // 6 and 7 lazy, 8..12 lazy2, 13..15 btlazy2
     .{ .name = "attach-lazy-stream-hint", .input = in_words_40000, .dict = "raw-csv-30000", .path = .load, .schedule = "srcSizeHint=300000,c*,e0", .levels = &.{ 5, 6, 8, 12, 13, 15 } },
     .{ .name = "attach-lazy-stream-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "w12,c10000,f0,c*,e0", .levels = &.{ 5, 8, 10 } },
+};
+
+/// D4: the dedicated dictionary search (`enableDedicatedDictSearch=1`):
+/// a CDict for `greedy`..`lazy2` laid out in buckets and always attached
+/// (`lazy.ddsLoadDictionary`, `lazy.ddsSearch`), and where libzstd falls
+/// back to a plain CDict (other strategies, a hash log not above the chain
+/// log). zd-words (4 KB) is made for its own size: 4 greedy, 5 lazy, 6..8
+/// lazy2, 9 btlazy2; raw-csv-30000 on the 128 KB row: 5 greedy, 6 lazy,
+/// 7..10 lazy2 (rows), 11 btlazy2.
+pub const dict_cases_dds = [_]DictCase{
+    .{ .name = "dds-cdictadv", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .params = "enableDedicatedDictSearch=1", .levels = &.{ 1, 3, 4, 5, 6, 7, 8, 9, 13, 19 }, .checksums = &.{ false, true } },
+    .{ .name = "dds-cdictadv-30k", .input = in_csv_32768, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1", .levels = &.{ 5, 6, 7, 8, 10, 11 } },
+    // attached past the cutoffs too, over many blocks
+    .{ .name = "dds-cdictadv-200k", .input = in_csv_200000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1", .levels = &.{ 5, 6, 8, 12 } },
+    // the context's own CDict (`.raw`) takes the parameter from the context
+    .{ .name = "dds-load", .input = in_words_3000, .dict = "raw-words-8000", .path = .load, .params = "enableDedicatedDictSearch=1", .levels = &.{ 3, 4, 5, 6, 8, 9 } },
+    .{ .name = "dds-load-40k", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .params = "enableDedicatedDictSearch=1", .levels = &.{ 4, 5, 7 } },
+    .{ .name = "dds-full-as-raw", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .content_type = 1, .params = "enableDedicatedDictSearch=1", .levels = &.{ 4, 6 } },
+    .{ .name = "dds-crafted", .input = in_words_3000, .dict = "crafted-words", .path = .load, .params = "enableDedicatedDictSearch=1", .levels = &.{ 4, 5, 7 } },
+    // forced copy and `forceMaxWindow` still attach; a forced load loads
+    // the content into the context
+    .{ .name = "dds-force-copy", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,forceAttachDict=2", .levels = &.{ 4, 6, 8 } },
+    .{ .name = "dds-force-load", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,forceAttachDict=3", .levels = &.{ 4, 6 } },
+    .{ .name = "dds-force-max-window", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,forceMaxWindow=1", .levels = &.{ 4, 6, 8 } },
+    // rows on and off; a 15.9 KB dictionary gets a 16 KB window (hash
+    // chains) where a plain CDict's 32 KB one gets rows
+    .{ .name = "dds-rows-on", .input = in_words_3000, .dict = "zd-words", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,useRowMatchFinder=1", .levels = &.{ 4, 5, 6 } },
+    .{ .name = "dds-rows-off", .input = in_csv_32768, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,useRowMatchFinder=2", .levels = &.{ 5, 7, 10 } },
+    .{ .name = "dds-window-16k", .input = in_words_3000, .dict = "raw-words-15900", .path = .cdictadv, .params = "enableDedicatedDictSearch=1", .levels = &.{ 5, 7 } },
+    // search logs: 1 (the chain limit wraps to 255), 7 with rows (the
+    // CDict gets the attempts the rows are capped at)
+    .{ .name = "dds-search-1", .input = in_words_40000, .dict = "raw-words-8000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,searchLog=1", .levels = &.{ 4, 6 } },
+    .{ .name = "dds-search-7-row", .input = in_words_40000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,searchLog=7,useRowMatchFinder=1", .levels = &.{ 5, 8 } },
+    // minimum matches 3 (hashed as 4), 5, and 7 (loaded as 7, searched as 6)
+    .{ .name = "dds-minmatch-3", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,minMatch=3", .levels = &.{ 4, 6 } },
+    .{ .name = "dds-minmatch-5-row", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,minMatch=5,useRowMatchFinder=1", .levels = &.{ 5, 7 } },
+    .{ .name = "dds-minmatch-7", .input = in_words_3000, .dict = "raw-words-8000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,minMatch=7", .levels = &.{ 4, 8 } },
+    // an explicit hash log replaces the dedicated one; one not above the
+    // chain log falls back to a plain CDict
+    .{ .name = "dds-hashlog", .input = in_words_40000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,hashLog=18", .levels = &.{ 5, 7 } },
+    .{ .name = "dds-hashlog-fallback", .input = in_words_40000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,hashLog=14,chainLog=16", .levels = &.{ 5, 7 } },
+    .{ .name = "dds-strategy-lazy2", .input = in_words_3000, .dict = "raw-csv-30000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1,strategy=5", .levels = &.{ 1, 19 } },
+    .{ .name = "dds-dict-150k", .input = in_words_40000, .dict = "raw-csv-150000", .path = .cdictadv, .params = "enableDedicatedDictSearch=1", .levels = &.{ 4, 6, 8, 11 } },
+    .{ .name = "dds-empty", .input = in_empty, .dict = "zd-words", .path = .cdictadv, .params = "enableDedicatedDictSearch=1", .levels = &.{ 5, 8 } },
+    // index overflow corrected while the CDict stays attached
+    .{ .name = "dds-ocf", .input = in_csv_200000, .dict = "zd-csv", .path = .load, .params = "enableDedicatedDictSearch=1,windowLog=11", .levels = &.{ 5, 6, 7 }, .ocf = true },
+    // streams
+    .{ .name = "dds-stream-load", .input = in_words_40000, .dict = "raw-words-8000", .path = .load, .schedule = "enableDedicatedDictSearch=1,c*,e0", .levels = &.{ 4, 5, 6, 8 } },
+    .{ .name = "dds-stream-cdictadv", .input = in_csv_200000, .dict = "zd-csv", .path = .cdictadv, .schedule = "enableDedicatedDictSearch=1,c50000,f0,c*,e0", .levels = &.{ 5, 6, 7, 11 } },
+    .{ .name = "dds-stream-pledged", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "enableDedicatedDictSearch=1,p40000,c*,e0", .levels = &.{ 4, 6 } },
+    .{ .name = "dds-stream-wrap", .input = in_words_40000, .dict = "zd-words", .path = .cdictadv, .schedule = "enableDedicatedDictSearch=1,w12,c10000,f0,c*,e0", .levels = &.{ 5, 8 } },
 };
 
 const in_words_8192_fast: Case = .{ .name = "", .len = 8192, .kind = .words, .seed = 101 };

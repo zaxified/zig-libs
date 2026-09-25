@@ -351,3 +351,53 @@ test "a prefix serves one frame; an empty dictionary is none" {
     const n = try c.compress(&got, &src, .{ .dictionary = .{ .raw = .{ .bytes = "", .content_type = .full } } });
     try std.testing.expectEqualSlices(u8, plain[0..want], got[0..n]);
 }
+
+test "a dedicated-search CDict: greedy..lazy2 only, bucketed, always attached" {
+    const gpa = std.testing.allocator;
+    var raw: [30000]u8 = undefined;
+    corpus.generate(.{ .name = "", .len = raw.len, .kind = .csv, .seed = 5 }, &raw);
+    const dds: zstd.Advanced = .{ .enable_dedicated_dict_search = true };
+    // raw-csv-30000's levels: 1 fast, 3 dfast, 5 greedy, 6 lazy, 8 lazy2
+    // (rows), 11 btlazy2, 13 btopt
+    for ([_]struct { i32, bool }{ .{ 1, false }, .{ 3, false }, .{ 5, true }, .{ 6, true }, .{ 8, true }, .{ 11, false }, .{ 13, false } }) |lw| {
+        var cd = try zstd.CDict.initAdvanced(gpa, &raw, .{ .level = lw[0], .advanced = dds });
+        defer cd.deinit();
+        try std.testing.expectEqual(lw[1], cd.dedicated_dict_search);
+        try std.testing.expectEqual(lw[1], cd.ms.dedicated_dict_search);
+        if (!lw[1]) continue;
+        // sized for the dictionary alone, the hash log 2 larger; the
+        // chain table is there even with rows
+        try std.testing.expect(cd.ms.chain_table.len != 0);
+        try std.testing.expectEqual(@as(usize, 1) << @intCast(cd.ms.cp.hash_log), cd.ms.hash_table.len);
+        try std.testing.expectEqual(cd.ms.cp, zstd.CDict.paramsFor(raw.len, .{ .level = lw[0], .advanced = dds }));
+        const cp = @import("params.zig").getInternal(lw[0], 0, raw.len, .create_cdict);
+        try std.testing.expectEqual(cp.hash_log + 2, cd.ms.cp.hash_log);
+        // every bucket: three positions newest first, then (start << 8) | length
+        var chained: usize = 0;
+        var i: usize = 0;
+        while (i < cd.ms.hash_table.len) : (i += 4) {
+            const b = cd.ms.hash_table[i..][0..4];
+            if (b[1] != 0) try std.testing.expect(b[0] > b[1]);
+            if (b[2] != 0) try std.testing.expect(b[1] > b[2]);
+            const len = b[3] & 0xff;
+            try std.testing.expect((b[3] >> 8) + len <= cd.ms.chain_table.len);
+            chained += len;
+        }
+        try std.testing.expect(chained > 0);
+        // always attached: a forced copy, `force_max_window`, a large input
+        try std.testing.expect(frame.shouldAttachDict(&cd, .{ .force_attach_dict = .copy }, 1 << 30));
+        try std.testing.expect(frame.shouldAttachDict(&cd, .{ .force_max_window = true }, 1));
+        var comp: frame.Compressor = .initEmpty(gpa);
+        defer comp.deinit();
+        var local: ?zstd.CDict = null;
+        try comp.initStream2(.{ .level = lw[0], .checksum = false, .dict = .{ .cdict = &cd }, .advanced = .{ .force_attach_dict = .copy } }, 1 << 20, null, false, &local);
+        try std.testing.expectEqual(@as(u32, 0), comp.n_cdict_copies);
+        try std.testing.expectEqual(@as(?*const match.MatchState, &cd.ms), comp.c.ms.dict_match_state);
+        // the context's own tables no larger than the plain size (reverted)
+        try std.testing.expect(comp.c.ms.hash_table.len <= @as(usize, 1) << @intCast(cd.ms.cp.hash_log - 2));
+    }
+    // a hash log not above the chain log falls back to a plain CDict
+    var cd = try zstd.CDict.initAdvanced(gpa, &raw, .{ .level = 5, .advanced = .{ .enable_dedicated_dict_search = true, .hash_log = 14, .chain_log = 16 } });
+    defer cd.deinit();
+    try std.testing.expect(!cd.dedicated_dict_search);
+}

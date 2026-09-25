@@ -87,6 +87,7 @@ static struct { char const* name; ZSTD_cParameter p; } const params[] = {
     { "forceAttachDict", ZSTD_c_forceAttachDict },
     { "deterministicRefPrefix", ZSTD_c_deterministicRefPrefix },
     { "forceMaxWindow", ZSTD_c_forceMaxWindow },
+    { "enableDedicatedDictSearch", ZSTD_c_enableDedicatedDictSearch },
 };
 
 /* Set one `name=value` token on `cctx` (or on `cparams` when given); 0 when

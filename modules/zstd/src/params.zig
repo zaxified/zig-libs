@@ -324,6 +324,12 @@ pub fn getOverridden(level: i32, src_size: u64, adv: Advanced) CParams {
 pub fn getFromCCtxParams(level: i32, src_size: u64, dict_size: u64, mode: CParamMode, adv: Advanced) CParams {
     var cp = getInternal(level, src_size, dict_size, mode);
     if (adv.long_distance_matching == .enable) cp.window_log = ldm_default_window_log;
+    overrideCParams(&cp, adv);
+    return adjustInternal(cp, src_size, dict_size, mode, adv.row_match_finder);
+}
+
+/// `ZSTD_overrideCParams`: the explicit parameters of `adv` over `cp`.
+pub fn overrideCParams(cp: *CParams, adv: Advanced) void {
     if (adv.window_log) |v| cp.window_log = v;
     if (adv.hash_log) |v| cp.hash_log = v;
     if (adv.chain_log) |v| cp.chain_log = v;
@@ -334,7 +340,6 @@ pub fn getFromCCtxParams(level: i32, src_size: u64, dict_size: u64, mode: CParam
         cp.target_length = v;
     };
     if (adv.strategy) |v| cp.strategy = v;
-    return adjustInternal(cp, src_size, dict_size, mode, adv.row_match_finder);
 }
 
 /// `ZSTD_ParamSwitch_e`.
@@ -431,6 +436,15 @@ pub const Advanced = struct {
     /// window reaches (a byte of it no longer keeps all of it valid), and a
     /// `CDict` is never attached.
     force_max_window: bool = false,
+    /// `ZSTD_c_enableDedicatedDictSearch`: a `CDict` made with these
+    /// parameters (`CDict.initAdvanced`, or the context's own for
+    /// `Dictionary.raw`) for `greedy`, `lazy` or `lazy2` gets a hash table
+    /// four times larger, laid out for searching it in place (libzstd's
+    /// dedicated dictionary search), is always attached, and is searched
+    /// faster than an attached one otherwise is. Ignored where libzstd
+    /// ignores it (another strategy, a hash log not above the chain log, or
+    /// a chain log above 24); it changes nothing without a dictionary.
+    enable_dedicated_dict_search: bool = false,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).

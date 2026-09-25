@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
 //! Match finders for the `greedy`, `lazy`, `lazy2` and `btlazy2` strategies.
 //!
-//! Port of libzstd lib/compress/zstd_lazy.c (v1.5.7) but for its dedicated
-//! dictionary search: the hash-chain finder (`ZSTD_HcFindBestMatch`), the
-//! row-based finder (`ZSTD_RowFindBestMatch`), the lazily sorted binary tree
-//! of `btlazy2` (`ZSTD_BtFindBestMatch`, "DUBT") and the parser that all three
-//! feed (`ZSTD_compressBlock_lazy_generic`), each in libzstd's three
-//! dictionary modes (`DictMode`). libzstd picks the row finder over the hash
-//! chain whenever the window is larger than 16 KB, so both are needed for
-//! every level of `greedy`..`lazy2`.
+//! Port of libzstd lib/compress/zstd_lazy.c (v1.5.7): the hash-chain finder
+//! (`ZSTD_HcFindBestMatch`), the row-based finder (`ZSTD_RowFindBestMatch`),
+//! the lazily sorted binary tree of `btlazy2` (`ZSTD_BtFindBestMatch`,
+//! "DUBT") and the parser that all three feed
+//! (`ZSTD_compressBlock_lazy_generic`), each in libzstd's dictionary modes
+//! (`DictMode`), and the dedicated dictionary search's table layout
+//! (`ZSTD_dedicatedDictSearch_lazy_loadDictionary`) and search. libzstd
+//! picks the row finder over the hash chain whenever the window is larger
+//! than 16 KB, so both are needed for every level of `greedy`..`lazy2`.
 //!
 //! The row finder's SIMD tag comparison is written as a plain vector compare;
 //! only the set of matching slots matters, not how it is computed.
@@ -23,13 +24,21 @@ const Base = match.Base;
 
 const Method = enum { hash_chain, row, binary_tree };
 
-/// `ZSTD_dictMode_e` but for `ZSTD_dedicatedDictSearch`: the window in one
-/// segment (`no_dict`), in two (`ext_dict`: a dictionary or an earlier
-/// buffer below the prefix), or one segment with an attached `CDict`
-/// searched beside it (`dict_match_state`, `MatchState.dict_match_state`).
-/// Every function takes it at compile time, as libzstd's templates do, so
-/// the dictionary branches cost the other modes nothing.
-const DictMode = enum { no_dict, ext_dict, dict_match_state };
+/// `ZSTD_dictMode_e`: the window in one segment (`no_dict`), in two
+/// (`ext_dict`: a dictionary or an earlier buffer below the prefix), or one
+/// segment with an attached `CDict` searched beside it
+/// (`dict_match_state`, `MatchState.dict_match_state`) -- or one whose
+/// tables are laid out for the dedicated dictionary search
+/// (`dedicated_dict_search`, `MatchState.dedicated_dict_search`; hash
+/// chain and rows only). Every function takes it at compile time, as
+/// libzstd's templates do, so the dictionary branches cost the other modes
+/// nothing.
+const DictMode = enum { no_dict, ext_dict, dict_match_state, dedicated_dict_search };
+
+/// `ZSTD_LAZY_DDSS_BUCKET_LOG`: a dedicated-dictionary-search CDict's hash
+/// table has 2^2 entries per hash -- the three newest positions and a
+/// pointer into its chain table -- so it is 4 times the size of a plain one.
+pub const ddss_bucket_log = 2;
 
 /// `kLazySkippingStep`.
 const lazy_skipping_step = 8;
@@ -49,7 +58,10 @@ pub const dubt_unsorted_mark = 1;
 pub fn compressBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32) usize {
     // ZSTD_matchState_dictMode
     if (ms.hasExtDict()) return dispatch(ms, ss, rep, istart, src_size, .ext_dict);
-    if (ms.dict_match_state != null) return dispatch(ms, ss, rep, istart, src_size, .dict_match_state);
+    if (ms.dict_match_state) |dms| return if (dms.dedicated_dict_search)
+        dispatch(ms, ss, rep, istart, src_size, .dedicated_dict_search)
+    else
+        dispatch(ms, ss, rep, istart, src_size, .dict_match_state);
     return dispatch(ms, ss, rep, istart, src_size, .no_dict);
 }
 
@@ -59,12 +71,15 @@ fn dispatch(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size:
         .ext_dict => lazyExtDictGeneric,
         .no_dict => lazyGeneric,
         .dict_match_state => lazyDictMatchStateGeneric,
+        .dedicated_dict_search => lazyDedicatedDictSearchGeneric,
     };
     const depth: u32 = switch (ms.cp.strategy) {
         .greedy => 0,
         .lazy => 1,
         .lazy2 => 2,
-        .btlazy2 => return switch (mls) {
+        // libzstd has no binary-tree variant: a CDict for btlazy2 never
+        // gets the dedicated layout (ZSTD_dedicatedDictSearch_isSupported)
+        .btlazy2 => if (mode == .dedicated_dict_search) unreachable else return switch (mls) {
             inline 4, 5, 6 => |m| generic(ms, ss, rep, istart, src_size, .binary_tree, 2, m),
             else => unreachable,
         },
@@ -127,6 +142,8 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
     var nb_attempts: u32 = @as(u32, 1) << @intCast(ms.cp.search_log);
     var ml: usize = 4 - 1;
 
+    const dds_idx: usize = if (mode == .dedicated_dict_search) ddsBucket(w, ms.dict_match_state.?, ip, mls) else 0;
+
     var match_index = insertAndFindFirstIndex(ms, ip, mls);
     while (match_index >= low_limit and nb_attempts > 0) : (nb_attempts -= 1) {
         const current_ml = candidateLength(w, ip, match_index, iend, ml, dict_limit, mode);
@@ -140,6 +157,8 @@ fn hcFindBestMatch(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, comp
         match_index = chain_table[match_index & chain_mask];
     }
 
+    if (mode == .dedicated_dict_search)
+        return ddsSearch(w, ms.dict_match_state.?, offset_ptr, ml, nb_attempts, ip, iend, dict_limit, dds_idx);
     if (mode == .dict_match_state) {
         // the attempts left go to the CDict's own hash chain
         const dm: Dms = .of(ms.dict_match_state.?);
@@ -194,6 +213,199 @@ pub fn insertDictionary(ms: *MatchState, ip: u32) void {
         inline 5, 6, 7 => |m| _ = insertAndFindFirstIndex(ms, ip, m),
         else => _ = insertAndFindFirstIndex(ms, ip, 4),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dedicated dictionary search
+//
+// A CDict made with `Advanced.enable_dedicated_dict_search` for greedy..lazy2
+// gets a hash table of 2^(hashLog) entries where a plain one would have
+// 2^(hashLog - 2): a bucket of 4 per hash, the three newest positions with
+// that hash (newest first, 0 when fewer) and a packed pointer
+// `(start << 8) | length` to the rest of its chain, laid out contiguously in
+// the chain table. The search reads it without following links.
+
+/// `ZSTD_dedicatedDictSearch_lazy_loadDictionary`: lay the positions from
+/// `next_to_update` up to `target` out in `ms`'s buckets and chain table.
+/// The positions are hashed with `minMatch` as it is (3 as 4, 7 as 7),
+/// although the search clamps it to 6, as libzstd does.
+pub fn ddsLoadDictionary(ms: *MatchState, target: u32) void {
+    switch (ms.cp.min_match) {
+        inline 5, 6, 7 => |m| ddsLoadDictionaryT(ms, target, m),
+        else => ddsLoadDictionaryT(ms, target, 4),
+    }
+}
+
+fn ddsLoadDictionaryT(ms: *MatchState, target: u32, comptime mls: u32) void {
+    const w: Base = .of(ms);
+    const hash_table = ms.hash_table;
+    const chain_table = ms.chain_table;
+    const chain_size: u32 = @as(u32, 1) << @intCast(ms.cp.chain_log);
+    var idx = ms.next_to_update;
+    const min_chain: u32 = if (chain_size < target -% idx) target - chain_size else idx;
+    const bucket_size: u32 = 1 << ddss_bucket_log;
+    const cache_sz: u32 = bucket_size - 1;
+    // U32 in libzstd: a search log of 1 wraps, and then caps at 255
+    const chain_attempts: u32 = (@as(u32, 1) << @intCast(ms.cp.search_log)) -% cache_sz;
+    const chain_limit: u32 = if (chain_attempts > 255) 255 else chain_attempts;
+
+    // We know the hashtable is oversized by a factor of `bucketSize`. We
+    // are going to temporarily pretend `bucketSize == 1`, keeping only a
+    // single entry. We will use the rest of the space to construct a
+    // temporary chaintable.
+    const hash_log: u32 = ms.cp.hash_log - ddss_bucket_log;
+    const n_hashes: u32 = @as(u32, 1) << @intCast(hash_log);
+    const tmp_hash_table = hash_table[0..n_hashes];
+    const tmp_chain_table = hash_table[n_hashes..];
+    const tmp_chain_size: u32 = @as(u32, (1 << ddss_bucket_log) - 1) << @intCast(hash_log);
+    const tmp_min_chain: u32 = if (tmp_chain_size < target) target - tmp_chain_size else idx;
+
+    std.debug.assert(ms.cp.chain_log <= 24);
+    std.debug.assert(ms.cp.hash_log > ms.cp.chain_log);
+    std.debug.assert(idx != 0);
+    std.debug.assert(tmp_min_chain <= min_chain);
+
+    // fill conventional hash table and conventional chain table
+    while (idx < target) : (idx += 1) {
+        const h = w.hash(idx, hash_log, mls);
+        if (idx >= tmp_min_chain) tmp_chain_table[idx - tmp_min_chain] = hash_table[h];
+        tmp_hash_table[h] = idx;
+    }
+
+    // sort chains into ddss chain table
+    {
+        var chain_pos: u32 = 0;
+        for (tmp_hash_table) |*head| {
+            var count: u32 = 0;
+            var count_beyond_min_chain: u32 = 0;
+            var i = head.*;
+            while (i >= tmp_min_chain and count < cache_sz) : (count += 1) {
+                // skip through the chain to the first position that won't be
+                // in the hash cache bucket
+                if (i < min_chain) count_beyond_min_chain += 1;
+                i = tmp_chain_table[i - tmp_min_chain];
+            }
+            if (count == cache_sz) {
+                count = 0;
+                while (count < chain_limit) {
+                    if (i < min_chain) {
+                        // only allow pulling `cacheSize` number of entries
+                        // into the cache or chainTable beyond `minChain`, to
+                        // replace the entries pulled out of the chainTable
+                        // into the cache. This lets us reach back further
+                        // without increasing the total number of entries in
+                        // the chainTable, guaranteeing the DDSS chain table
+                        // will fit into the space allocated for the regular
+                        // one.
+                        if (i == 0) break;
+                        count_beyond_min_chain += 1;
+                        if (count_beyond_min_chain > cache_sz) break;
+                    }
+                    chain_table[chain_pos] = i;
+                    chain_pos += 1;
+                    count += 1;
+                    if (i < tmp_min_chain) break;
+                    i = tmp_chain_table[i - tmp_min_chain];
+                }
+            } else {
+                count = 0;
+            }
+            head.* = if (count != 0) ((chain_pos - count) << 8) + count else 0;
+        }
+        std.debug.assert(chain_pos <= chain_size);
+    }
+
+    // move chain pointers into the last entry of each hash bucket (from the
+    // top down: a bucket lies at or above the entry it is made from)
+    var hash_idx: u32 = n_hashes;
+    while (hash_idx != 0) {
+        hash_idx -= 1;
+        const bucket_idx = @as(usize, hash_idx) << ddss_bucket_log;
+        const chain_packed_pointer = tmp_hash_table[hash_idx];
+        @memset(hash_table[bucket_idx..][0..cache_sz], 0);
+        hash_table[bucket_idx + bucket_size - 1] = chain_packed_pointer;
+    }
+
+    // fill the buckets of the hash table
+    idx = ms.next_to_update;
+    while (idx < target) : (idx += 1) {
+        const h = w.hash(idx, hash_log, mls) << ddss_bucket_log;
+        // Shift hash cache down 1.
+        var k: usize = cache_sz - 1;
+        while (k != 0) : (k -= 1) hash_table[h + k] = hash_table[h + k - 1];
+        hash_table[h] = idx;
+    }
+
+    ms.next_to_update = target;
+}
+
+/// The first entry of `ip`'s bucket in the dedicated-search CDict `dms`
+/// (hashed with its hash log less the bucket log, unsalted), prefetched.
+inline fn ddsBucket(w: Base, dms: *const MatchState, ip: u32, comptime mls: u32) usize {
+    const dds_hash_log = dms.cp.hash_log - ddss_bucket_log;
+    const dds_idx = w.hash(ip, dds_hash_log, mls) << ddss_bucket_log;
+    @prefetch(dms.hash_table.ptr + dds_idx, .{});
+    return dds_idx;
+}
+
+/// `ZSTD_dedicatedDictSearch_lazy_search`: spend `nb_attempts` on the
+/// CDict `dms`'s bucket `dds_idx` and then its chain, for a match longer
+/// than `ml`. Returns the longest length found (`ml` if none is longer),
+/// and its offBase in `offset_ptr`. (libzstd also prefetches the
+/// candidates' bytes; that changes no decision and is left out.)
+inline fn ddsSearch(w: Base, dms: *const MatchState, offset_ptr: *u32, ml_in: usize, nb_attempts: u32, ip: u32, iend: usize, dict_limit: u32, dds_idx: usize) usize {
+    const dm: Dms = .of(dms);
+    const curr = ip;
+    const dds_index_delta = dict_limit -% dm.end;
+    const bucket_size: u32 = 1 << ddss_bucket_log;
+    const bucket_limit: u32 = @min(nb_attempts, bucket_size - 1);
+    var ml = ml_in;
+
+    const chain_packed_pointer = dms.hash_table[dds_idx + bucket_size - 1];
+    @prefetch(dms.chain_table.ptr + (chain_packed_pointer >> 8), .{});
+
+    var dds_attempt: u32 = 0;
+    while (dds_attempt < bucket_limit) : (dds_attempt += 1) {
+        const match_index = dms.hash_table[dds_idx + dds_attempt];
+        if (match_index == 0) return ml;
+        // guaranteed by table construction
+        std.debug.assert(match_index >= dm.lowest);
+        var current_ml: usize = 0;
+        // assumption: matchIndex <= dictLimit-4 (by table construction)
+        if (dm.b.read32(match_index) == w.read32(ip))
+            current_ml = countDms(w, dm.b, @as(usize, ip) + 4, @as(usize, match_index) + 4, iend, dm.end, dict_limit) + 4;
+        // save best solution
+        if (current_ml > ml) {
+            ml = current_ml;
+            offset_ptr.* = curr - (match_index +% dds_index_delta) + sequences.rep_num;
+            if (ip + current_ml == iend) return ml; // best possible, avoids read overflow on next attempt
+        }
+    }
+
+    var chain_index = chain_packed_pointer >> 8;
+    const chain_length = chain_packed_pointer & 0xFF;
+    const chain_attempts = nb_attempts - dds_attempt;
+    const chain_limit = @min(chain_attempts, chain_length);
+    var chain_attempt: u32 = 0;
+    while (chain_attempt < chain_limit) : ({
+        chain_attempt += 1;
+        chain_index += 1;
+    }) {
+        const match_index = dms.chain_table[chain_index];
+        // guaranteed by table construction
+        std.debug.assert(match_index >= dm.lowest);
+        var current_ml: usize = 0;
+        // assumption: matchIndex <= dictLimit-4 (by table construction)
+        if (dm.b.read32(match_index) == w.read32(ip))
+            current_ml = countDms(w, dm.b, @as(usize, ip) + 4, @as(usize, match_index) + 4, iend, dm.end, dict_limit) + 4;
+        // save best solution
+        if (current_ml > ml) {
+            ml = current_ml;
+            offset_ptr.* = curr - (match_index +% dds_index_delta) + sequences.rep_num;
+            if (ip + current_ml == iend) break; // best possible, avoids read overflow on next attempt
+        }
+    }
+    return ml;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +551,15 @@ fn rowFindBestMatchT(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, co
     var nb_attempts: u32 = @as(u32, 1) << @intCast(capped_search_log);
     var ml: usize = 4 - 1;
 
+    // The dedicated search's bucket, and the extra attempts it gets: the
+    // context's rows are capped in searches, the CDict's search is not.
+    var dds_idx: usize = 0;
+    var dds_extra_attempts: u32 = 0;
+    if (mode == .dedicated_dict_search) {
+        dds_idx = ddsBucket(w, ms.dict_match_state.?, ip, mls);
+        dds_extra_attempts = if (ms.cp.search_log > row_log) @as(u32, 1) << @intCast(ms.cp.search_log - row_log) else 0;
+    }
+
     // The CDict's row: hashed with its row hash log, unsalted, into its
     // own tables, prefetched before this window's update.
     const dm: Dms = if (mode == .dict_match_state) .of(ms.dict_match_state.?) else undefined;
@@ -407,6 +628,8 @@ fn rowFindBestMatchT(ms: *MatchState, ip: u32, iend: usize, offset_ptr: *u32, co
         }
     }
 
+    if (mode == .dedicated_dict_search)
+        return ddsSearch(w, ms.dict_match_state.?, offset_ptr, ml, nb_attempts + dds_extra_attempts, ip, iend, dict_limit, dds_idx);
     if (mode == .dict_match_state) {
         // the attempts left go to the CDict's row
         const dms_index_delta = dict_limit -% dm.end;
@@ -768,6 +991,13 @@ fn lazyDictMatchStateGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istar
     return lazyPrefixGeneric(ms, ss, rep, istart, src_size, method, depth, mls, .dict_match_state);
 }
 
+/// `ZSTD_compressBlock_lazy_generic` (dedicatedDictSearch): the
+/// dictMatchState parser, the attached `CDict` searched through its
+/// bucketed table (`ddsSearch`).
+fn lazyDedicatedDictSearchGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime method: Method, comptime depth: u32, comptime mls: u32) usize {
+    return lazyPrefixGeneric(ms, ss, rep, istart, src_size, method, depth, mls, .dedicated_dict_search);
+}
+
 /// The attached `CDict` (`ms->dictMatchState`) as the dictMatchState
 /// variants read it. Its content lies at its own indices `lowest`..`end`;
 /// the context's window starts right above them in the context's index
@@ -823,7 +1053,8 @@ inline fn dmsRepMatchLength(w: Base, dm: Dms, ip: usize, rep_index: u32, iend: u
 /// updates `rep`, and returns the number of trailing literals.
 inline fn lazyPrefixGeneric(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart: u32, src_size: u32, comptime method: Method, comptime depth: u32, comptime mls: u32, comptime mode: DictMode) usize {
     comptime std.debug.assert(mode != .ext_dict);
-    const is_dms = mode == .dict_match_state;
+    // isDxS: the dedicated dictionary search parses as dictMatchState does
+    const is_dms = mode == .dict_match_state or mode == .dedicated_dict_search;
     const w: Base = .of(ms);
     const iend: usize = istart + src_size;
     // Signed: a short block puts the limit before the block start.

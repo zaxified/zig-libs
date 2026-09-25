@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — `Advanced.enable_dedicated_dict_search`
+  (`ZSTD_c_enableDedicatedDictSearch`, SPEC backlog Z4): a `CDict` made
+  with it (`CDict.initAdvanced`, or the context's own for
+  `Dictionary.raw`) for `greedy`..`lazy2` gets libzstd's dedicated
+  dictionary search -- a bucketed hash table 4x the size, always attached,
+  searched without following links -- with libzstd's bytes; elsewhere it
+  falls back to a plain CDict as libzstd does. `CDict` gains
+  `dedicated_dict_search`; `CDict.paramsFor` returns the dedicated
+  parameters when they apply. No-dictionary output and speed unchanged.
 - **2026-09-25** — **BREAKING:** dictionary training now gives finished
   zstd dictionaries (SPEC backlog Z5b). `zstd.dict_builder` gains
   `finalizeDictionary` (`ZDICT_finalizeDictionary`, its entropy tables

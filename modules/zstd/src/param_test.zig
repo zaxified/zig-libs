@@ -78,6 +78,8 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.deterministic_ref_prefix = v != 0;
     } else if (Eq.f(name, "forceMaxWindow")) {
         adv.force_max_window = v != 0;
+    } else if (Eq.f(name, "enableDedicatedDictSearch")) {
+        adv.enable_dedicated_dict_search = v != 0;
     } else return error.BadParam;
     return true;
 }
