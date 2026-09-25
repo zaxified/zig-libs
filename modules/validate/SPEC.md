@@ -79,6 +79,14 @@ typed layer costs **+7.6 k user instructions per request** over a hand-written
 `Stream.walkValue`. Wanted: one pass that checks the rules and fills `T` from the same
 tokens (a validating `parseFromTokenSource`), same error codes and document order, still
 body-sized memory. Differential test: one-pass vs today's two-pass on the existing corpus.
+Scoped 2026-09-25 (qap M7.3, deferred by the consumer): the second tokenization is ~2.8 k of
+the 7.6 k, so the ceiling is ~+12.6 % → ~+9 % per request. Recording the tokens in the walk and
+replaying them into `parseFromTokenSourceLeaky` is simple but costs ~5× the body (a token per
+~3 bytes at ~16 B each) -- past the body-sized budget a fixed per-request buffer has. The real
+fix is a push-shaped walker (explicit frame stack instead of recursion) fed by a token-source
+wrapper that `std.json`'s decoder pulls through, with the two-pass path kept as the fallback
+for a body the decoder rejects mid-way (so the invalid path still reports every error).
+~400-600 lines. Revisit when typed JSON dominates a profile.
 
 ## Status
 `gap · any · util · reentrant` + deps: `router`, `http`, `netaddr` — canonical source is
