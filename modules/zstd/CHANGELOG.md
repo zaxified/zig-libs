@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **NO CONSUMER-VISIBLE CHANGE:** `cdict_goldens.zig`
+  regenerated after rebasing D1 onto D2 and Z2c's merges; +141 rows
+  (D2's own cases), the rest byte-identical.
+
 - **2026-09-25** — **NO CONSUMER-VISIBLE CHANGE:** D1's random diff loop
   (≥3000 cases vs libzstd, fast/dfast attach) and mutation-sweep hunt
   added 8 golden cases (`attach-dfast-cross-end`, `surv-m12-fast`,
