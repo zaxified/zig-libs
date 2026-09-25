@@ -14,7 +14,8 @@
 //! back with the dictionary). As in golden_test.zig, all the one-shot
 //! frames come from one reused context and the streamed ones from one
 //! reused stream; libzstd gives fresh-context bytes either way with
-//! dictionaries too (SPEC.md, *Dictionaries*).
+//! dictionaries too (SPEC.md, *Dictionaries*). Every frame is also
+//! decoded back with this module's decoder and the same dictionary.
 //!
 //! Where libzstd would attach a `CDict` (small inputs, unknown sizes), this
 //! port now searches it in place with every strategy's dictMatchState
@@ -164,6 +165,25 @@ fn compressCase(gpa: std.mem.Allocator, ctx: *zstd.Compressor, strm: *zstd.Strea
     return dst[0..n];
 }
 
+/// Decode `frames` with the dictionary they were made with -- a prefix as
+/// `prefix_once`, anything else as a `DDict` of the case's content type --
+/// and compare with `src`.
+fn decodeBack(gpa: std.mem.Allocator, dc: corpus.DictCase, dict: []const u8, frames: []const u8, src: []const u8) !void {
+    const ctype: zstd.DictContentType = @enumFromInt(dc.content_type);
+    var dd = try zstd.DDict.init(gpa, dict, ctype);
+    defer dd.deinit(gpa);
+    const prefix = dc.path == .prefix or dc.path == .prefixadj;
+    // magicless frames are read as such (a schedule's own parameters are
+    // never the format)
+    const format = if (std.mem.eql(u8, dc.params, "-")) zstd.Format.zstd1 else (try param_test.parse(dc.params)).format;
+    var d = try zstd.Decompressor.init(gpa, if (prefix) .{ .prefix_once = dict, .format = format } else .{ .ddict = &dd, .format = format });
+    defer d.deinit();
+    const back = try gpa.alloc(u8, src.len);
+    defer gpa.free(back);
+    const n = try d.decompress(back, frames);
+    if (!std.mem.eql(u8, back[0..n], src)) return error.DecodedOtherBytes;
+}
+
 fn withDict(opts: zstd.Options, d: zstd.Dictionary) zstd.Options {
     var o = opts;
     o.dictionary = d;
@@ -208,6 +228,12 @@ test "output with dictionaries is byte-identical to libzstd 1.5.7" {
                 std.debug.print("MISMATCH {s} level {d} checksum {}: len {d} (libzstd {d})\n", .{ dc.name, level, ck, out.len, g.len });
                 mismatches += 1;
             }
+            // and this module's decoder gives the input back with the same
+            // dictionary
+            decodeBack(gpa, dc, d, out, src) catch |e| {
+                std.debug.print("DECODE {s} level {d} checksum {}: {s}\n", .{ dc.name, level, ck, @errorName(e) });
+                mismatches += 1;
+            };
         };
     }
     try std.testing.expectEqual(@as(usize, 0), mismatches);
