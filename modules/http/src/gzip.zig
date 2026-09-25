@@ -57,6 +57,69 @@ pub const Scratch = struct {
     window: [flate.max_window_len]u8,
 };
 
+/// `c.* = try flate.Compress.init(output, buffer, container, opts)`, built in
+/// place.
+///
+/// `Compress` is ~225 KiB and `init` returns it by value inside an error
+/// union. The assignment is then a stack temporary of that size in the
+/// caller's frame -- 97 KiB of `ResponseWriter.beginGzip`'s frame even in
+/// ReleaseFast, and in Debug (several copies) more than a 512 KiB fiber stack
+/// holds: an HTTP/2 response reached it through the deeper h2 call chain and
+/// segfaulted inside `Compress.init` (an embedder, 2026-09-25). Here each field is
+/// set where it lives, and nothing the size of the deflate state is ever on
+/// the stack.
+///
+/// A copy of std 0.16's `Compress.init`, kept honest two ways: the field list
+/// is checked at compile time (a field std adds is a compile error here, not a
+/// field left undefined), and a test compares the result with std's `init`
+/// field by field. The one value std keeps private -- the writer's vtable --
+/// is taken from a `Compress.init` evaluated at compile time.
+pub fn initCompress(
+    c: *flate.Compress,
+    output: *std.Io.Writer,
+    buffer: []u8,
+    container: flate.Container,
+    opts: flate.Compress.Options,
+) std.Io.Writer.Error!void {
+    comptime {
+        const expected = [_][]const u8{
+            "writer", "history_len", "history_end_unhashed", "bit_writer", "buffered_tokens",
+            "lookup", "container",   "hasher",               "opts",
+        };
+        const fields = std.meta.fields(flate.Compress);
+        if (fields.len != expected.len) @compileError("gzip.initCompress: std's flate.Compress changed its fields; update the copy");
+        for (fields, expected) |f, e| if (!std.mem.eql(u8, f.name, e))
+            @compileError("gzip.initCompress: std's flate.Compress field '" ++ f.name ++ "' is new or moved; update the copy");
+    }
+    std.debug.assert(output.buffer.len > 8);
+    std.debug.assert(buffer.len >= flate.max_window_len);
+    try output.writeAll(container.header());
+    c.writer = .{ .buffer = buffer, .vtable = compress_vtable };
+    c.history_len = 0;
+    c.history_end_unhashed = false;
+    c.bit_writer = .init(output);
+    c.buffered_tokens.pos = 0;
+    c.buffered_tokens.n = 0;
+    c.buffered_tokens.lit_freqs = @splat(0);
+    c.buffered_tokens.dist_freqs = @splat(0);
+    c.lookup.head = @splat(.{ .value = std.math.maxInt(u15), .is_null = true });
+    c.lookup.chain_pos = std.math.maxInt(u15);
+    c.container = container;
+    c.opts = opts;
+    c.hasher = .init(container);
+}
+
+/// `flate.Compress`'s writer vtable -- private in std, so read off a
+/// `Compress.init` run at compile time over a fixed buffer.
+const compress_vtable: *const std.Io.Writer.VTable = blk: {
+    @setEvalBranchQuota(1 << 20);
+    var out_buf: [16]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var window: [flate.max_window_len]u8 = undefined;
+    const c = flate.Compress.init(&out, &window, .gzip, .default) catch unreachable;
+    break :blk c.writer.vtable;
+};
+
 /// Handler-facing buffer for the decompressed request-body reader (the cap
 /// wrapper's `std.Io.Reader` buffer). Small — the decoder streams straight
 /// through, this only backs buffered reads (peek/take) the handler may do.
@@ -269,7 +332,7 @@ test "gzip round-trip through a Scratch (compress, then flate decompress)" {
 
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
     defer aw.deinit();
-    scratch.compress = try flate.Compress.init(&aw.writer, &scratch.window, .gzip, levelOptions(6));
+    try initCompress(&scratch.compress, &aw.writer, &scratch.window, .gzip, levelOptions(6));
     try scratch.compress.writer.writeAll(plain);
     try scratch.compress.finish();
     const compressed = aw.written();
@@ -281,4 +344,56 @@ test "gzip round-trip through a Scratch (compress, then flate decompress)" {
     defer out.deinit();
     _ = try dc.reader.streamRemaining(&out.writer);
     try testing.expectEqualStrings(plain, out.written());
+}
+
+test "initCompress: the same state as std's Compress.init, field by field" {
+    const gpa = testing.allocator;
+    inline for (.{ flate.Container.gzip, flate.Container.zlib, flate.Container.raw }) |container| {
+        const a = try gpa.create(Scratch);
+        defer gpa.destroy(a);
+        const b = try gpa.create(Scratch);
+        defer gpa.destroy(b);
+        var out_a: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+        defer out_a.deinit();
+        var out_b: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+        defer out_b.deinit();
+
+        // Both over garbage, so a field the copy forgets shows up as a difference.
+        @memset(std.mem.asBytes(&a.compress), 0xa5);
+        @memset(std.mem.asBytes(&b.compress), 0x5a);
+        a.compress = try flate.Compress.init(&out_a.writer, &a.window, container, levelOptions(4));
+        try initCompress(&b.compress, &out_b.writer, &b.window, container, levelOptions(4));
+
+        try testing.expectEqualSlices(u8, out_a.written(), out_b.written());
+        const x = &a.compress;
+        const y = &b.compress;
+        try testing.expectEqual(x.writer.vtable, y.writer.vtable);
+        try testing.expectEqual(@intFromPtr(&a.window), @intFromPtr(x.writer.buffer.ptr));
+        try testing.expectEqual(@intFromPtr(&b.window), @intFromPtr(y.writer.buffer.ptr));
+        try testing.expectEqual(x.writer.buffer.len, y.writer.buffer.len);
+        try testing.expectEqual(x.writer.end, y.writer.end);
+        try testing.expectEqual(x.history_len, y.history_len);
+        try testing.expectEqual(x.history_end_unhashed, y.history_end_unhashed);
+        try testing.expectEqual(&out_a.writer, x.bit_writer.output);
+        try testing.expectEqual(&out_b.writer, y.bit_writer.output);
+        try testing.expectEqual(x.bit_writer.buffered, y.bit_writer.buffered);
+        try testing.expectEqual(x.bit_writer.buffered_n, y.bit_writer.buffered_n);
+        try testing.expectEqual(x.buffered_tokens.pos, y.buffered_tokens.pos);
+        try testing.expectEqual(x.buffered_tokens.n, y.buffered_tokens.n);
+        try testing.expectEqualSlices(u16, &x.buffered_tokens.lit_freqs, &y.buffered_tokens.lit_freqs);
+        try testing.expectEqualSlices(u16, &x.buffered_tokens.dist_freqs, &y.buffered_tokens.dist_freqs);
+        try testing.expectEqualSlices(u8, std.mem.asBytes(&x.lookup.head), std.mem.asBytes(&y.lookup.head));
+        try testing.expectEqual(x.lookup.chain_pos, y.lookup.chain_pos);
+        try testing.expectEqual(x.container, y.container);
+        try testing.expectEqual(x.opts, y.opts);
+        try testing.expect(std.meta.eql(x.hasher, y.hasher));
+
+        // And the same bytes out for the same input.
+        const plain = ("{\"key\":\"value\"," ** 300) ++ "\"end\":true}";
+        try x.writer.writeAll(plain);
+        try x.finish();
+        try y.writer.writeAll(plain);
+        try y.finish();
+        try testing.expectEqualSlices(u8, out_a.written(), out_b.written());
+    }
 }

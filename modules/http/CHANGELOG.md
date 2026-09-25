@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **gzip responses no longer put the deflate state on the stack.** `flate.Compress`
+  is ~225 KiB and std's `Compress.init` returns it by value in an error union, so
+  `ResponseWriter.beginGzip`'s assignment was a stack temporary: 97 KiB of its frame in ReleaseFast
+  (now 88 bytes), and in Debug enough copies to overflow a 512 KiB fiber stack -- an HTTP/2
+  response through an embedder's fiber-per-connection server segfaulted inside `Compress.init`. New
+  `gzip.initCompress(c, output, buffer, container, opts)` builds it in place (std 0.16's `init`,
+  copied; the field list is checked at compile time and a test compares the result with std's
+  field by field). API otherwise unchanged.
+
 - **2026-09-25** — **https dials verify the server chain by RFC 5280.** The TLS client is now
   `tlsclient` (std's `std.crypto.tls.Client` with the Certificate-message handling replaced by
   `x509.verifyChain`), not std's own: std checks no basicConstraints (ziglang/zig #35877), so

@@ -3064,7 +3064,8 @@ pub const ResponseWriter = struct {
         // chunked encoder's buffer, safely after the response head. The
         // chunked writer must be at its final address by now (the
         // encoder keeps a pointer to it).
-        scratch.compress = try flate.Compress.init(
+        try gzip.initCompress(
+            &scratch.compress,
             &rw.body.gzip.chunked.writer,
             &scratch.window,
             .gzip,
@@ -5254,7 +5255,7 @@ fn gzipAlloc(plain: []const u8) ![]u8 {
     defer testing.allocator.destroy(scratch);
     var aw: Writer.Allocating = try .initCapacity(testing.allocator, 64);
     defer aw.deinit();
-    scratch.compress = try flate.Compress.init(&aw.writer, &scratch.window, .gzip, gzip.levelOptions(6));
+    try gzip.initCompress(&scratch.compress, &aw.writer, &scratch.window, .gzip, gzip.levelOptions(6));
     try scratch.compress.writer.writeAll(plain);
     try scratch.compress.finish();
     return testing.allocator.dupe(u8, aw.written());
