@@ -263,10 +263,16 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
 /// `ZSTD_compressBlock_internal` (frame mode). Returns 0 for "store raw", 1 for
 /// "RLE" (`dst[0]` holds the byte), otherwise the compressed block size.
 fn compressBlock(c: *Ctx, dst: []u8, block: []const u8) usize {
+    return compressBlockMode(c, dst, block, true);
+}
+
+/// `ZSTD_compressBlock_internal`; outside a frame (`frame` 0,
+/// `ZSTD_compressBlock_deprecated`) a block is never turned into RLE.
+fn compressBlockMode(c: *Ctx, dst: []u8, block: []const u8, frame_mode: bool) usize {
     var c_size: usize = 0;
     if (buildSeqStore(c, block)) {
         c_size = entropyCompress(c, &c.ss, dst, block.len);
-        if (!c.is_first_block and c_size < rle_max_length and isRle(block)) {
+        if (frame_mode and !c.is_first_block and c_size < rle_max_length and isRle(block)) {
             c_size = 1;
             dst[0] = block[0];
         }
@@ -768,6 +774,53 @@ pub const Compressor = struct {
 
     fn resolved(on: bool) params.Switch {
         return if (on) .enable else .disable;
+    }
+
+    /// `ZSTD_compressBegin_usingCDict_deprecated`: the context set up with
+    /// `cdict` for input of unknown size (so `cdict` is attached, its
+    /// parameters used as they are), no frame parameters, for
+    /// `compressBlockOnly`. Dictionary training compresses its samples
+    /// this way (`ZDICT_analyzeEntropy`).
+    pub fn beginUsingCDict(comp: *Compressor, cdict: *const CDict) BeginError!void {
+        const cp = cdict.ms.cp;
+        // ZSTD_CCtxParams_init_internal resolves the switches on the
+        // CDict's parameters; fParams are all 0
+        var adv: params.Advanced = .{ .content_size = false };
+        adv.row_match_finder = resolved(params.resolveRowMatchFinder(.auto, cp));
+        adv.split_after_sequences = resolved(params.resolveSplitAfterSequences(.auto, cp));
+        adv.long_distance_matching = resolved(ldm.resolve(.auto, cp));
+        const opts: Options = .{ .level = cdict.compression_level, .checksum = false, .advanced = adv };
+        try comp.beginInternal(null, cdict, cp, null, opts, false);
+    }
+
+    /// `ZSTD_compressBlock_deprecated`: `src` as one block without a
+    /// block header or frame (`ZSTD_compressContinue_internal` in block
+    /// mode), after `beginUsingCDict` or another `begin*`. Returns 0 when
+    /// the block is not compressible (store it raw), else the compressed
+    /// size; `seqStore` then holds its sequences. `src` above the
+    /// context's block size is `error.SrcSizeWrong`. `dst` is the room
+    /// the caller gives (libzstd's callers give `ZSTD_BLOCKSIZE_MAX`).
+    pub fn compressBlockOnly(comp: *Compressor, dst: []u8, src: []const u8) SizeError!usize {
+        if (src.len > comp.block_size_max) return error.SrcSizeWrong; // input is larger than a block
+        if (src.len == 0) return 0; // do not generate an empty block if no input
+        const ms = &comp.c.ms;
+        if (!ms.windowUpdate(src, ms.force_non_contiguous)) {
+            ms.force_non_contiguous = false;
+            ms.next_to_update = ms.dict_limit;
+        }
+        if (comp.c.ldm) |ls| ls.windowUpdate(src);
+        // overflow check and correction for block mode
+        const bi = comp.c.index(src);
+        _ = ms.overflowCorrectIfNeeded(comp.overflow_correct_frequently, bi, @as(usize, bi) + src.len);
+        const c_size = compressBlockMode(&comp.c, dst, src, false);
+        comp.consumed += src.len;
+        comp.produced += c_size;
+        return c_size;
+    }
+
+    /// `ZSTD_getSeqStore`: the sequences and literals of the last block.
+    pub fn seqStore(comp: *Compressor) *sequences.SeqStore {
+        return &comp.c.ss;
     }
 
     /// `ZSTD_CCtx_init_compressStream2` (single-threaded): the frame's

@@ -20,7 +20,7 @@
 //! Not here (finalization and scoring compress with a dictionary): the
 //! header and entropy tables (`ZDICT_finalizeDictionary`), and the
 //! compressed-size score `ZDICT_optimizeTrainFromBuffer_*` ranks candidates
-//! by (`COVER_selectDict`). `optimizeCover` / `optimizeFastCover` run the
+//! by (`COVER_selectDict`). `optimizeCoverWith` / `optimizeFastCoverWith` run the
 //! optimizer's grid of (k, d) over one shared context each, as libzstd does
 //! single-threaded, and leave the score to a caller-supplied `scorer`.
 //!
@@ -70,9 +70,21 @@ pub const Error = error{
     /// Capacity below `dict_size_min` (`dstSize_tooSmall`).
     DstSizeTooSmall,
     /// The working memory the parameters need exceeds `memory_limit`
-    /// (no allocation was made).
+    /// (no allocation was made), or the trainer's working memory would
+    /// have gone past it (an allocation was refused).
     MemoryLimitExceeded,
     OutOfMemory,
+    /// Finalization (`zdict.Error`): content too large for the offset
+    /// codes (`dictionaryCreation_failed`).
+    DictionaryCreationFailed,
+    /// Finalization: an entropy table could not be built or written
+    /// (`GENERIC`).
+    Generic,
+    /// A finalization level above 22 (libzstd clamps it).
+    LevelUnsupported,
+    /// The optimizer found no candidate that finalized and compressed
+    /// (libzstd: `GENERIC`).
+    NoCandidate,
 };
 
 /// Training samples as libzstd takes them (`samplesBuffer`, `samplesSizes`):
@@ -100,9 +112,16 @@ fn sum(sizes: []const usize) u64 {
 pub const CoverParams = struct {
     /// Segment size (required, `d` ≤ k ≤ capacity).
     k: u32,
-    /// d-mer size (required, 1 ≤ d ≤ k; libzstd's optimizer tries 6 and 8).
-    d: u32,
-    /// Working-memory ceiling; see `estimateCoverMemory`.
+    /// d-mer size (1 ≤ d ≤ k); 8 as the `zstd` CLI's default (libzstd's
+    /// optimizer tries 6 and 8).
+    d: u32 = 8,
+    /// `zParams.compressionLevel`: the level finalization measures the
+    /// entropy tables with; 0 = 3.
+    level: i32 = 0,
+    /// `zParams.dictID`: 0 = derived from the content.
+    dict_id: u32 = 0,
+    /// Working-memory ceiling (the dictionary buffer not counted); see
+    /// `estimateCoverMemory` for the content selection's share.
     memory_limit: usize = default_memory_limit,
 };
 
@@ -110,15 +129,20 @@ pub const CoverParams = struct {
 pub const FastCoverParams = struct {
     /// Segment size (required, `d` ≤ k ≤ capacity).
     k: u32,
-    /// d-mer size (required): 6 or 8.
-    d: u32,
+    /// d-mer size: 6 or 8 (the `zstd` CLI's default).
+    d: u32 = 8,
     /// log2 of the frequency table (1..31); 0 means `fastcover_default_f`.
     f: u32 = fastcover_default_f,
     /// Acceleration (1..10): count every accel-th d-mer only; 0 means
     /// `fastcover_default_accel`. It also sets the share of samples
     /// finalization uses (`Accel.finalize`).
     accel: u32 = fastcover_default_accel,
-    /// Working-memory ceiling; see `estimateFastCoverMemory`.
+    /// See `CoverParams.level`.
+    level: i32 = 0,
+    /// See `CoverParams.dict_id`.
+    dict_id: u32 = 0,
+    /// Working-memory ceiling (the dictionary buffer not counted); see
+    /// `estimateFastCoverMemory` for the content selection's share.
     memory_limit: usize = default_memory_limit,
 };
 
@@ -533,7 +557,7 @@ pub fn checkCoverParameters(k: u32, d: u32, split_point: f64, max_dict_size: usi
     return true;
 }
 
-/// The bytes `trainCover` / `trainCoverInto` allocate for `nb_samples`
+/// The bytes `coverContent` / `coverContentInto` allocate for `nb_samples`
 /// samples of `total_samples_size` bytes (besides the dictionary): offsets,
 /// suffix array, d-mer map, active-d-mer map. `maxInt(u64)` when the
 /// active-d-mer map cannot exist (k - d + 1 ≥ 2^30). Parameters are not
@@ -547,7 +571,7 @@ pub fn estimateCoverMemory(total_samples_size: u64, nb_samples: usize, params: C
 /// libzstd places at the end of a `dict.len`-byte dictionary buffer, which
 /// is `dict[dict.len - n ..]` for the returned n (the rest of `dict` is
 /// left as it was). Checks in libzstd's order, then the memory ceiling.
-pub fn trainCoverInto(gpa: Allocator, dict: []u8, samples: Samples, params: CoverParams) Error!usize {
+pub fn coverContentInto(gpa: Allocator, dict: []u8, samples: Samples, params: CoverParams) Error!usize {
     if (!checkCoverParameters(params.k, params.d, 1.0, dict.len)) return error.ParameterOutOfBound;
     if (samples.sizes.len == 0) return error.SrcSizeWrong;
     if (dict.len < dict_size_min) return error.DstSizeTooSmall;
@@ -561,10 +585,10 @@ pub fn trainCoverInto(gpa: Allocator, dict: []u8, samples: Samples, params: Cove
     return dict.len - tail;
 }
 
-/// `trainCoverInto` into a `capacity`-byte buffer; returns the content
+/// `coverContentInto` into a `capacity`-byte buffer; returns the content
 /// alone, owned by the caller.
-pub fn trainCover(gpa: Allocator, samples: Samples, capacity: usize, params: CoverParams) Error![]u8 {
-    return trainAlloc(gpa, capacity, samples, params, trainCoverInto);
+pub fn coverContent(gpa: Allocator, samples: Samples, capacity: usize, params: CoverParams) Error![]u8 {
+    return trainAlloc(gpa, capacity, samples, params, coverContentInto);
 }
 
 fn trainAlloc(gpa: Allocator, capacity: usize, samples: Samples, params: anytype, comptime into: anytype) Error![]u8 {
@@ -767,7 +791,7 @@ fn resolvedAccel(accel: u32) u32 {
     return if (accel == 0) fastcover_default_accel else accel;
 }
 
-/// The bytes `trainFastCover` / `trainFastCoverInto` allocate for
+/// The bytes `fastCoverContent` / `fastCoverContentInto` allocate for
 /// `nb_samples` samples (besides the dictionary): offsets, 2^f frequencies
 /// and 2^f in-segment counts. Independent of the samples' size. f is
 /// resolved (0 → default) but not checked; above 31 gives `maxInt(u64)`.
@@ -778,8 +802,8 @@ pub fn estimateFastCoverMemory(nb_samples: usize, params: FastCoverParams) u64 {
 }
 
 /// `ZDICT_trainFromBuffer_fastCover` up to its finalization; see
-/// `trainCoverInto`.
-pub fn trainFastCoverInto(gpa: Allocator, dict: []u8, samples: Samples, params: FastCoverParams) Error!usize {
+/// `coverContentInto`.
+pub fn fastCoverContentInto(gpa: Allocator, dict: []u8, samples: Samples, params: FastCoverParams) Error!usize {
     const f = resolvedF(params.f);
     const accel = resolvedAccel(params.accel);
     if (!checkFastCoverParameters(params.k, params.d, 1.0, dict.len, f, accel)) return error.ParameterOutOfBound;
@@ -796,10 +820,10 @@ pub fn trainFastCoverInto(gpa: Allocator, dict: []u8, samples: Samples, params: 
     return dict.len - tail;
 }
 
-/// `trainFastCoverInto` into a `capacity`-byte buffer; returns the content
+/// `fastCoverContentInto` into a `capacity`-byte buffer; returns the content
 /// alone, owned by the caller.
-pub fn trainFastCover(gpa: Allocator, samples: Samples, capacity: usize, params: FastCoverParams) Error![]u8 {
-    return trainAlloc(gpa, capacity, samples, params, trainFastCoverInto);
+pub fn fastCoverContent(gpa: Allocator, samples: Samples, capacity: usize, params: FastCoverParams) Error![]u8 {
+    return trainAlloc(gpa, capacity, samples, params, fastCoverContentInto);
 }
 
 // ---------------------------------------------------------------------------
@@ -817,8 +841,15 @@ pub const OptimizeParams = struct {
     f: u32 = 0,
     /// fastCover only.
     accel: u32 = 0,
-    /// Ceiling for one context plus one candidate's working memory
-    /// (the scorer's own memory is its business).
+    /// See `CoverParams.level`.
+    level: i32 = 0,
+    /// See `CoverParams.dict_id`.
+    dict_id: u32 = 0,
+    /// Working-memory ceiling (the dictionary buffer not counted).
+    /// `optimize*With` checks one context plus one candidate's content
+    /// selection against it up front and leaves the scorer's memory to the
+    /// scorer; `optimizeCover` / `optimizeFastCover` hold all of it,
+    /// scoring included, below the ceiling.
     memory_limit: usize = default_memory_limit,
 };
 
@@ -870,6 +901,9 @@ pub const OptimizeGrid = struct {
 pub const Candidate = struct {
     /// The raw content (`dict + tail`), `capacity - tail` bytes.
     content: []const u8,
+    /// The candidate's whole buffer, `capacity` bytes, `content` at its end
+    /// (`COVER_selectDict`'s shrinking reads before the content).
+    buffer: []const u8,
     capacity: usize,
     k: u32,
     d: u32,
@@ -891,6 +925,8 @@ pub const Selection = struct {
     /// Owned by the scorer until `optimize*` copies it.
     dict: []const u8,
     total_compressed_size: u64,
+    /// The allocation `dict` lies in, if the scorer wants it back.
+    buffer: []u8 = &.{},
 };
 
 /// The optimizer's result: the winning dictionary's size (copied to the
@@ -905,12 +941,12 @@ pub const Optimized = struct { size: usize, k: u32, d: u32, split_point: f64, st
 /// submission order; `scorer.release(Selection)` is called for every
 /// selection once it has been compared. No winner: `error.NoCandidate`
 /// (libzstd returns `GENERIC`).
-pub fn optimizeCover(gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
+pub fn optimizeCoverWith(gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
     return optimize(.cover, gpa, dict, samples, params, scorer);
 }
 
-/// `ZDICT_optimizeTrainFromBuffer_fastCover`; see `optimizeCover`.
-pub fn optimizeFastCover(gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
+/// `ZDICT_optimizeTrainFromBuffer_fastCover`; see `optimizeCoverWith`.
+pub fn optimizeFastCoverWith(gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
     return optimize(.fast_cover, gpa, dict, samples, params, scorer);
 }
 
@@ -960,6 +996,7 @@ fn optimize(comptime trainer: Trainer, gpa: Allocator, dict: []u8, samples: Samp
             };
             const selection = (try scorer.select(Candidate{
                 .content = scratch[tail..],
+                .buffer = scratch,
                 .capacity = dict.len,
                 .k = k,
                 .d = d,
@@ -978,6 +1015,380 @@ fn optimize(comptime trainer: Trainer, gpa: Allocator, dict: []u8, samples: Samp
         }
     }
     return best orelse error.NoCandidate;
+}
+
+// ---------------------------------------------------------------------------
+// Finalization, scoring and the complete trainers (zdict.c, cover.c)
+
+pub const zdict = @import("zdict.zig");
+const frame = @import("frame.zig");
+const cdict_mod = @import("cdict.zig");
+
+/// `ZDICT_getDictID`.
+pub const getDictId = zdict.getDictId;
+/// `ZDICT_getDictHeaderSize`.
+pub const getDictHeaderSize = zdict.getDictHeaderSize;
+/// `ZDICT_params_t`.
+pub const FinalizeParams = struct {
+    /// `compressionLevel`: 0 = 3.
+    level: i32 = 0,
+    /// `dictID`: 0 = derived from the content (`zdict.defaultDictId`).
+    dict_id: u32 = 0,
+    /// Working-memory ceiling: the compressor and `CDict` that measure the
+    /// samples (the dictionary buffer not counted).
+    memory_limit: usize = default_memory_limit,
+};
+
+/// An allocator that refuses (`OutOfMemory`) any allocation taking the
+/// bytes it has live past `limit`, and remembers that it did. The complete
+/// trainers run on it so that every piece of their working memory --
+/// contexts, candidates, compressors, `CDict`s -- counts against
+/// `memory_limit`. (std has no such wrapper outside `DebugAllocator`.)
+pub const LimitedAllocator = struct {
+    child: Allocator,
+    limit: usize,
+    live: usize = 0,
+    /// The most bytes live at once.
+    peak: usize = 0,
+    refused: bool = false,
+
+    pub fn init(child: Allocator, limit: usize) LimitedAllocator {
+        return .{ .child = child, .limit = limit };
+    }
+
+    pub fn allocator(l: *LimitedAllocator) Allocator {
+        return .{ .ptr = l, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn grow(l: *LimitedAllocator, n: usize) bool {
+        if (n > l.limit - l.live) {
+            l.refused = true;
+            return false;
+        }
+        return true;
+    }
+
+    fn note(l: *LimitedAllocator, old: usize, new: usize) void {
+        l.live = l.live - old + new;
+        l.peak = @max(l.peak, l.live);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
+        if (!l.grow(len)) return null;
+        const p = l.child.rawAlloc(len, alignment, ra) orelse return null;
+        l.note(0, len);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !l.grow(new_len - memory.len)) return false;
+        if (!l.child.rawResize(memory, alignment, new_len, ra)) return false;
+        l.note(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len and !l.grow(new_len - memory.len)) return null;
+        const p = l.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
+        l.note(memory.len, new_len);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
+        l.child.rawFree(memory, alignment, ra);
+        l.note(memory.len, 0);
+    }
+
+    /// An error of work done on this allocator, with a refusal of its own
+    /// named as the ceiling.
+    fn map(l: *const LimitedAllocator, e: anytype) @TypeOf(e) {
+        return if (e == error.OutOfMemory and l.refused) error.MemoryLimitExceeded else e;
+    }
+};
+
+fn finalizeError(e: zdict.Error) Error {
+    return switch (e) {
+        error.DictionaryCorrupted => unreachable, // getDictHeaderSize's alone
+        inline else => |x| @field(Error, @errorName(x)),
+    };
+}
+
+fn zdictSamples(s: Samples, nb: usize) zdict.Samples {
+    return .{ .buffer = s.buffer, .sizes = s.sizes[0..nb] };
+}
+
+/// `ZDICT_finalizeDictionary` (see `zdict.finalizeDictionary`) with the
+/// memory ceiling: `content` (anywhere, `dict` included) into a zstd
+/// dictionary in `dict`, entropy tables from all of `samples`. Returns its
+/// size.
+pub fn finalizeDictionary(gpa: Allocator, dict: []u8, content: []const u8, samples: Samples, p: FinalizeParams) Error!usize {
+    var lim: LimitedAllocator = .init(gpa, p.memory_limit);
+    return zdict.finalizeDictionary(lim.allocator(), dict, content, zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| lim.map(finalizeError(e));
+}
+
+/// `ZDICT_addEntropyTablesFromBuffer` (`_advanced`; see
+/// `zdict.addEntropyTablesFromBuffer`): the content is the last
+/// `content_size` bytes of `dict`.
+pub fn addEntropyTablesFromBuffer(gpa: Allocator, dict: []u8, content_size: usize, samples: Samples, p: FinalizeParams) Error!usize {
+    var lim: LimitedAllocator = .init(gpa, p.memory_limit);
+    return zdict.addEntropyTablesFromBuffer(lim.allocator(), dict, content_size, zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| lim.map(finalizeError(e));
+}
+
+/// `COVER_checkTotalCompressedSize`: the finished dictionary's size plus
+/// every checked sample compressed with it (`ZSTD_createCDict` at `level`,
+/// `ZSTD_compress_usingCDict` on one context) -- the testing share
+/// `[nb_train_samples..]` for a split below 1, else all samples. Null when
+/// libzstd's would fail (a compression error); out of memory is an error.
+fn checkTotalCompressedSize(gpa: Allocator, dict: []const u8, level: i32, samples: Samples, offsets: []const usize, nb_train_samples: usize, split_point: f64) Allocator.Error!?u64 {
+    const first: usize = if (split_point < 1.0) nb_train_samples else 0;
+    // enough space to compress the maximum sized sample
+    var max_sample_size: usize = 0;
+    for (samples.sizes[first..]) |n| max_sample_size = @max(max_sample_size, n);
+    const dst = try gpa.alloc(u8, frame.compressBound(max_sample_size));
+    defer gpa.free(dst);
+    var comp: frame.Compressor = .initEmpty(gpa);
+    defer comp.deinit();
+    var cdict = cdict_mod.CDict.init(gpa, dict, level) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+    defer cdict.deinit();
+    var total: u64 = dict.len;
+    for (first..samples.sizes.len) |i| {
+        const src = samples.buffer[offsets[i]..][0..samples.sizes[i]];
+        total += comp.compressUsingCDict(dst, src, &cdict, .{}) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => null,
+        };
+    }
+    return total;
+}
+
+/// What `COVER_selectDict` takes besides the content.
+pub const SelectParams = struct {
+    /// `zParams.compressionLevel` (0 = 3) and `dictID` (0 = derived).
+    level: i32 = 0,
+    dict_id: u32 = 0,
+    /// `shrinkDict`: try dictionaries of 256 bytes and up (doubling) and
+    /// take the first whose total compresses within
+    /// `shrink_max_regression` percent of the full one's. libzstd 1.5.7's
+    /// optimizers always pass 0, so no public libzstd trainer shrinks.
+    shrink: bool = false,
+    /// `shrinkDictMaxRegression`, in percent.
+    shrink_max_regression: u32 = 0,
+};
+
+/// `COVER_selectDict`: finalize the content `buffer[buffer.len - content_len
+/// ..]` into a dictionary of up to `buffer.len` bytes (entropy tables from
+/// the first `nb_finalize_samples` samples), and score it by
+/// `checkTotalCompressedSize`; with `p.shrink`, try shorter ones -- the
+/// last n bytes of `buffer` for n = 256, then twice each finished size,
+/// reading before the content when n passes it, as libzstd does. Null when
+/// finalization or compression fails (`COVER_dictSelectionIsError`). The
+/// selection's `buffer` is allocated from `gpa`; free it with
+/// `freeSelection`.
+pub fn selectDict(gpa: Allocator, buffer: []const u8, content_len: usize, samples: Samples, offsets: []const usize, nb_finalize_samples: usize, nb_train_samples: usize, split_point: f64, p: SelectParams) Error!?Selection {
+    const capacity = buffer.len;
+    const content = buffer[capacity - content_len ..];
+    const regression_tolerance = @as(f64, @floatFromInt(p.shrink_max_regression)) / 100.0 + 1.00;
+    const zp: zdict.Params = .{ .level = p.level, .dict_id = p.dict_id };
+    const fs = zdictSamples(samples, nb_finalize_samples);
+
+    const largest_buf = try gpa.alloc(u8, capacity);
+    var keep_largest = false;
+    defer if (!keep_largest) gpa.free(largest_buf);
+    // Initial dictionary size and compressed size
+    const largest_dict = zdict.finalizeDictionary(gpa, largest_buf, content, fs, zp) catch |e| return switch (e) {
+        error.OutOfMemory, error.LevelUnsupported => finalizeError(e),
+        else => null,
+    };
+    const largest_compressed = try checkTotalCompressedSize(gpa, largest_buf[0..largest_dict], p.level, samples, offsets, nb_train_samples, split_point) orelse return null;
+    if (!p.shrink) {
+        keep_largest = true;
+        return .{ .dict = largest_buf[0..largest_dict], .total_compressed_size = largest_compressed, .buffer = largest_buf };
+    }
+
+    const candidate_buf = try gpa.alloc(u8, capacity);
+    var keep_candidate = false;
+    defer if (!keep_candidate) gpa.free(candidate_buf);
+    // Largest dict is initially at least ZDICT_DICTSIZE_MIN
+    var size: usize = dict_size_min;
+    while (size < largest_dict) {
+        // (libzstd copies the largest dictionary into the candidate buffer
+        // first; finalization overwrites what it returns, so that is not
+        // observable)
+        size = zdict.finalizeDictionary(gpa, candidate_buf, buffer[capacity - size ..], fs, zp) catch |e| return switch (e) {
+            error.OutOfMemory, error.LevelUnsupported => finalizeError(e),
+            else => null,
+        };
+        const total = try checkTotalCompressedSize(gpa, candidate_buf[0..size], p.level, samples, offsets, nb_train_samples, split_point) orelse return null;
+        if (@as(f64, @floatFromInt(total)) <= @as(f64, @floatFromInt(largest_compressed)) * regression_tolerance) {
+            keep_candidate = true;
+            return .{ .dict = candidate_buf[0..size], .total_compressed_size = total, .buffer = candidate_buf };
+        }
+        size *= 2;
+    }
+    keep_largest = true;
+    return .{ .dict = largest_buf[0..largest_dict], .total_compressed_size = largest_compressed, .buffer = largest_buf };
+}
+
+/// Frees a `selectDict` selection.
+pub fn freeSelection(gpa: Allocator, s: Selection) void {
+    gpa.free(s.buffer);
+}
+
+/// The optimizers' scorer: `COVER_selectDict` without shrinking, as
+/// libzstd 1.5.7's optimizers call it.
+const SelectScorer = struct {
+    gpa: Allocator,
+    level: i32,
+    dict_id: u32,
+
+    fn select(s: *SelectScorer, c: Candidate) Error!?Selection {
+        return selectDict(s.gpa, c.buffer, c.content.len, c.samples, c.offsets, c.nb_finalize_samples, c.nb_train_samples, c.split_point, .{ .level = s.level, .dict_id = s.dict_id });
+    }
+
+    fn release(s: *SelectScorer, sel: Selection) void {
+        freeSelection(s.gpa, sel);
+    }
+};
+
+/// `ZDICT_optimizeTrainFromBuffer_cover`, single-threaded: every (k, d) of
+/// the grid (see `OptimizeParams`, `OptimizeGrid`) trained on the training
+/// share, finalized and scored by compressing the testing share
+/// (`COVER_selectDict`); the dictionary with the smallest total -- the first
+/// of equals -- ends up in `dict[0..size]`. libzstd with several threads
+/// breaks ties by which job finishes first; its single-threaded result is
+/// this one. `error.NoCandidate` when no candidate finalizes.
+pub fn optimizeCover(gpa: Allocator, dict: []u8, samples: Samples, p: OptimizeParams) Error!Optimized {
+    return optimizeFinished(.cover, gpa, dict, samples, p);
+}
+
+/// `ZDICT_optimizeTrainFromBuffer_fastCover`, single-threaded; see
+/// `optimizeCover`.
+pub fn optimizeFastCover(gpa: Allocator, dict: []u8, samples: Samples, p: OptimizeParams) Error!Optimized {
+    return optimizeFinished(.fast_cover, gpa, dict, samples, p);
+}
+
+fn optimizeFinished(comptime trainer: Trainer, gpa: Allocator, dict: []u8, samples: Samples, p: OptimizeParams) Error!Optimized {
+    if (p.level > max_level) return error.LevelUnsupported;
+    var lim: LimitedAllocator = .init(gpa, p.memory_limit);
+    const a = lim.allocator();
+    var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id };
+    return optimize(trainer, a, dict, samples, p, &scorer) catch |e| lim.map(e);
+}
+
+const max_level = @import("params.zig").max_level;
+
+/// `ZDICT_trainFromBuffer`: `optimizeFastCover` with d = 8, steps = 4
+/// (k from 50 to 2000 in steps of 487, split 0.75, f 20, accel 1) at level
+/// 3 -- the `zstd --train` default. Returns the dictionary's size in
+/// `dict`.
+pub fn train(gpa: Allocator, dict: []u8, samples: Samples) Error!usize {
+    return (try optimizeFastCover(gpa, dict, samples, default_train_params)).size;
+}
+
+/// `ZDICT_trainFromBuffer`'s parameters.
+pub const default_train_params: OptimizeParams = .{ .d = 8, .steps = 4, .level = 3 };
+
+/// `ZDICT_trainFromBuffer_cover`: the content (`coverContentInto`), then
+/// `ZDICT_finalizeDictionary` on the training samples; the finished
+/// dictionary is `dict[0..n]` for the returned n. When the header does not
+/// fit in front of the content, the content's head is kept (libzstd's
+/// finalization).
+pub fn trainCover(gpa: Allocator, dict: []u8, samples: Samples, p: CoverParams) Error!usize {
+    if (p.level > max_level) return error.LevelUnsupported;
+    var lim: LimitedAllocator = .init(gpa, p.memory_limit);
+    return trainCoverImpl(lim.allocator(), dict, samples, p) catch |e| lim.map(e);
+}
+
+fn trainCoverImpl(gpa: Allocator, dict: []u8, samples: Samples, p: CoverParams) Error!usize {
+    const n = try coverContentInto(gpa, dict, samples, p);
+    return zdict.finalizeDictionary(gpa, dict, dict[dict.len - n ..], zdictSamples(samples, samples.sizes.len), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| finalizeError(e);
+}
+
+/// `ZDICT_trainFromBuffer_fastCover`; see `trainCover`. Finalization uses
+/// the first `accel_table[accel].finalize` percent of the samples.
+pub fn trainFastCover(gpa: Allocator, dict: []u8, samples: Samples, p: FastCoverParams) Error!usize {
+    if (p.level > max_level) return error.LevelUnsupported;
+    var lim: LimitedAllocator = .init(gpa, p.memory_limit);
+    return trainFastCoverImpl(lim.allocator(), dict, samples, p) catch |e| lim.map(e);
+}
+
+fn trainFastCoverImpl(gpa: Allocator, dict: []u8, samples: Samples, p: FastCoverParams) Error!usize {
+    const n = try fastCoverContentInto(gpa, dict, samples, p);
+    // nbFinalizeSamples: of the training samples (all of them: split 1)
+    const nb_finalize: usize = @intCast(@as(u64, samples.sizes.len) * accel_table[resolvedAccel(p.accel)].finalize / 100);
+    return zdict.finalizeDictionary(gpa, dict, dict[dict.len - n ..], zdictSamples(samples, nb_finalize), .{ .level = p.level, .dict_id = p.dict_id }) catch |e| finalizeError(e);
+}
+
+/// A trainer and its parameters, for `trainFromSlices`.
+pub const Method = union(enum) {
+    /// `ZDICT_trainFromBuffer` (`train`), under this ceiling.
+    default: usize,
+    cover: CoverParams,
+    fast_cover: FastCoverParams,
+    optimize_cover: OptimizeParams,
+    optimize_fast_cover: OptimizeParams,
+
+    fn memoryLimit(m: Method) usize {
+        return switch (m) {
+            .default => |l| l,
+            inline else => |p| p.memory_limit,
+        };
+    }
+};
+
+/// Any trainer over samples given one slice each: they are COPIED into one
+/// contiguous buffer first (libzstd's trainers, and so these, take them
+/// back to back, since segments run across sample boundaries), and that
+/// copy counts against the method's `memory_limit`. Returns the finished
+/// dictionary's size in `dict`.
+pub fn trainFromSlices(gpa: Allocator, dict: []u8, slices: []const []const u8, method: Method) Error!usize {
+    var lim: LimitedAllocator = .init(gpa, method.memoryLimit());
+    const a = lim.allocator();
+    return trainSlicesImpl(a, dict, slices, method) catch |e| lim.map(e);
+}
+
+fn trainSlicesImpl(a: Allocator, dict: []u8, slices: []const []const u8, method: Method) Error!usize {
+    var total: usize = 0;
+    for (slices) |s| total +|= s.len;
+    const sizes = try a.alloc(usize, slices.len);
+    defer a.free(sizes);
+    const buffer = try a.alloc(u8, total);
+    defer a.free(buffer);
+    var at: usize = 0;
+    for (slices, sizes) |s, *n| {
+        @memcpy(buffer[at..][0..s.len], s);
+        at += s.len;
+        n.* = s.len;
+    }
+    const samples: Samples = .{ .buffer = buffer, .sizes = sizes };
+    switch (method) {
+        .default => |limit| {
+            var dp = default_train_params;
+            dp.memory_limit = limit;
+            var scorer: SelectScorer = .{ .gpa = a, .level = dp.level, .dict_id = 0 };
+            return (try optimize(.fast_cover, a, dict, samples, dp, &scorer)).size;
+        },
+        .cover => |p| {
+            if (p.level > max_level) return error.LevelUnsupported;
+            return trainCoverImpl(a, dict, samples, p);
+        },
+        .fast_cover => |p| {
+            if (p.level > max_level) return error.LevelUnsupported;
+            return trainFastCoverImpl(a, dict, samples, p);
+        },
+        inline .optimize_cover, .optimize_fast_cover => |p, tag| {
+            if (p.level > max_level) return error.LevelUnsupported;
+            var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id };
+            return (try optimize(if (tag == .optimize_cover) .cover else .fast_cover, a, dict, samples, p, &scorer)).size;
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,13 +1459,13 @@ test "memory estimates are exactly what the trainers allocate" {
     var dict: [4096]u8 = undefined;
     for ([_]CoverParams{ .{ .k = 200, .d = 8 }, .{ .k = 1000, .d = 12 }, .{ .k = 16, .d = 3 } }) |p| {
         var fa: testing.FailingAllocator = .init(testing.allocator, .{});
-        _ = try trainCoverInto(fa.allocator(), &dict, s, p);
+        _ = try coverContentInto(fa.allocator(), &dict, s, p);
         try testing.expectEqual(estimateCoverMemory(s.totalSize(), s.sizes.len, p), fa.allocated_bytes);
         try testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
     }
     for ([_]FastCoverParams{ .{ .k = 200, .d = 8 }, .{ .k = 50, .d = 6, .f = 9, .accel = 3 }, .{ .k = 50, .d = 6, .f = 0 } }) |p| {
         var fa: testing.FailingAllocator = .init(testing.allocator, .{});
-        _ = try trainFastCoverInto(fa.allocator(), &dict, s, p);
+        _ = try fastCoverContentInto(fa.allocator(), &dict, s, p);
         try testing.expectEqual(estimateFastCoverMemory(s.sizes.len, p), fa.allocated_bytes);
     }
 }
@@ -1069,12 +1480,12 @@ test "the memory ceiling refuses before allocating anything" {
     var fa: testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
     var low = cp;
     low.memory_limit = @intCast(need - 1);
-    try testing.expectError(error.MemoryLimitExceeded, trainCoverInto(fa.allocator(), &dict, s, low));
+    try testing.expectError(error.MemoryLimitExceeded, coverContentInto(fa.allocator(), &dict, s, low));
     low.memory_limit = @intCast(need);
-    try testing.expectError(error.OutOfMemory, trainCoverInto(fa.allocator(), &dict, s, low)); // it tried
+    try testing.expectError(error.OutOfMemory, coverContentInto(fa.allocator(), &dict, s, low)); // it tried
     const fp: FastCoverParams = .{ .k = 200, .d = 8, .f = 31 };
     try testing.expectEqual((@as(u64, 1) << 31) * 6 + (s.sizes.len + 1) * 8, estimateFastCoverMemory(s.sizes.len, fp));
-    try testing.expectError(error.MemoryLimitExceeded, trainFastCoverInto(fa.allocator(), &dict, s, fp));
+    try testing.expectError(error.MemoryLimitExceeded, fastCoverContentInto(fa.allocator(), &dict, s, fp));
     // the default ceiling holds cover over ~30 MB of samples, not over 40
     try testing.expect(estimateCoverMemory(30 << 20, 1000, .{ .k = 1000, .d = 8 }) <= default_memory_limit);
     try testing.expect(estimateCoverMemory(40 << 20, 1000, .{ .k = 1000, .d = 8 }) > default_memory_limit);
@@ -1088,20 +1499,20 @@ test "refusals: libzstd's, and sizes past the buffer" {
     var dict: [1024]u8 = undefined;
     // sizes summing past the buffer (libzstd would read past it)
     const short: Samples = .{ .buffer = gen.buffer[0 .. gen.buffer.len - 1], .sizes = gen.sizes };
-    try testing.expectError(error.SrcSizeWrong, trainCoverInto(gpa, &dict, short, .{ .k = 50, .d = 6 }));
-    try testing.expectError(error.SrcSizeWrong, trainFastCoverInto(gpa, &dict, short, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.SrcSizeWrong, coverContentInto(gpa, &dict, short, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.SrcSizeWrong, fastCoverContentInto(gpa, &dict, short, .{ .k = 50, .d = 6 }));
     // no samples
     const none: Samples = .{ .buffer = "", .sizes = &.{} };
-    try testing.expectError(error.SrcSizeWrong, trainCoverInto(gpa, &dict, none, .{ .k = 50, .d = 6 }));
-    try testing.expectError(error.SrcSizeWrong, trainFastCoverInto(gpa, &dict, none, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.SrcSizeWrong, coverContentInto(gpa, &dict, none, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.SrcSizeWrong, fastCoverContentInto(gpa, &dict, none, .{ .k = 50, .d = 6 }));
     // fewer than 5 samples, and fewer than 8 bytes
-    try testing.expectError(error.SrcSizeWrong, trainCoverInto(gpa, &dict, .{ .buffer = s.buffer, .sizes = s.sizes[0..4] }, .{ .k = 50, .d = 6 }));
-    try testing.expectError(error.SrcSizeWrong, trainFastCoverInto(gpa, &dict, .{ .buffer = "abcdefg", .sizes = &.{ 1, 1, 1, 1, 3 } }, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.SrcSizeWrong, coverContentInto(gpa, &dict, .{ .buffer = s.buffer, .sizes = s.sizes[0..4] }, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.SrcSizeWrong, fastCoverContentInto(gpa, &dict, .{ .buffer = "abcdefg", .sizes = &.{ 1, 1, 1, 1, 3 } }, .{ .k = 50, .d = 6 }));
     // d above the samples' total
-    try testing.expectError(error.SrcSizeWrong, trainCoverInto(gpa, &dict, .{ .buffer = "abcdefghij", .sizes = &.{ 2, 2, 2, 2, 2 } }, .{ .k = 50, .d = 11 }));
+    try testing.expectError(error.SrcSizeWrong, coverContentInto(gpa, &dict, .{ .buffer = "abcdefghij", .sizes = &.{ 2, 2, 2, 2, 2 } }, .{ .k = 50, .d = 11 }));
     // parameter checks come first
-    try testing.expectError(error.ParameterOutOfBound, trainCoverInto(gpa, dict[0..10], none, .{ .k = 50, .d = 6 }));
-    try testing.expectError(error.DstSizeTooSmall, trainCoverInto(gpa, dict[0..100], s, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.ParameterOutOfBound, coverContentInto(gpa, dict[0..10], none, .{ .k = 50, .d = 6 }));
+    try testing.expectError(error.DstSizeTooSmall, coverContentInto(gpa, dict[0..100], s, .{ .k = 50, .d = 6 }));
     // a split point out of (0, 1] at the context level
     try testing.expectError(error.ParameterOutOfBound, CoverContext.init(gpa, s, 8, 0, default_memory_limit));
     try testing.expectError(error.ParameterOutOfBound, FastCoverContext.init(gpa, s, 8, 1.5, 20, accel_table[1], default_memory_limit));
@@ -1133,25 +1544,25 @@ test "parameter checks reject what the trainers resolve before them" {
     try testing.expect(checkCoverParameters(8, 8, 1.0, 1024));
 }
 
-test "trainCover / trainFastCover return the content trainInto places at the tail" {
+test "coverContent / fastCoverContent return the content trainInto places at the tail" {
     const gpa = testing.allocator;
     const gen = try testSet("words-300");
     defer gen.deinit(gpa);
     const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
     var dict: [3000]u8 = undefined;
     @memset(&dict, 0xAA);
-    const n = try trainCoverInto(gpa, &dict, s, .{ .k = 100, .d = 6 });
-    const c = try trainCover(gpa, s, dict.len, .{ .k = 100, .d = 6 });
+    const n = try coverContentInto(gpa, &dict, s, .{ .k = 100, .d = 6 });
+    const c = try coverContent(gpa, s, dict.len, .{ .k = 100, .d = 6 });
     defer gpa.free(c);
     try testing.expectEqualSlices(u8, dict[dict.len - n ..], c);
     const zeros = try testSet("zeros-20");
     defer zeros.deinit(gpa);
     // a short content leaves the head of the buffer untouched
     @memset(&dict, 0xAA);
-    const m = try trainFastCoverInto(gpa, &dict, .{ .buffer = zeros.buffer, .sizes = zeros.sizes }, .{ .k = 64, .d = 8 });
+    const m = try fastCoverContentInto(gpa, &dict, .{ .buffer = zeros.buffer, .sizes = zeros.sizes }, .{ .k = 64, .d = 8 });
     try testing.expectEqual(@as(usize, 8), m);
     for (dict[0 .. dict.len - m]) |b| try testing.expectEqual(@as(u8, 0xAA), b);
-    const fc = try trainFastCover(gpa, .{ .buffer = zeros.buffer, .sizes = zeros.sizes }, dict.len, .{ .k = 64, .d = 8 });
+    const fc = try fastCoverContent(gpa, .{ .buffer = zeros.buffer, .sizes = zeros.sizes }, dict.len, .{ .k = 64, .d = 8 });
     defer gpa.free(fc);
     try testing.expectEqualSlices(u8, dict[dict.len - m ..], fc);
 }
@@ -1222,7 +1633,7 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
         var m: MockScorer = .{ .fail_k = 50 + 3 * 48 };
         defer m.deinit();
         const p: OptimizeParams = .{};
-        const r = if (trainer == .cover) try optimizeCover(gpa, &dict, s, p, &m) else try optimizeFastCover(gpa, &dict, s, p, &m);
+        const r = if (trainer == .cover) try optimizeCoverWith(gpa, &dict, s, p, &m) else try optimizeFastCoverWith(gpa, &dict, s, p, &m);
         // k above the capacity (1500) is skipped: 50 + 48·j ≤ 1500 → 31 per d
         try testing.expectEqual(@as(usize, 62), m.seen.items.len);
         // accel 1 finalizes on all training samples: 2000 · 0.75 (fastCover), 2000
@@ -1251,7 +1662,7 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
         const k: u32 = 50 + 48 * 9;
         var one: [1500]u8 = undefined;
         if (trainer == .cover) {
-            const n = try trainCoverInto(gpa, &one, s, .{ .k = k, .d = 8 });
+            const n = try coverContentInto(gpa, &one, s, .{ .k = k, .d = 8 });
             try testing.expectEqualSlices(u8, one[one.len - n ..], m.contents.items[pick]);
         } else {
             var ctx: FastCoverContext = try .init(gpa, s, 8, 0.75, 20, accel_table[1], default_memory_limit);
@@ -1268,11 +1679,150 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
     {
         var m4: MockScorer = .{};
         defer m4.deinit();
-        _ = try optimizeFastCover(gpa, &dict, s, .{ .k = 100, .d = 8, .accel = 4 }, &m4);
+        _ = try optimizeFastCoverWith(gpa, &dict, s, .{ .k = 100, .d = 8, .accel = 4 }, &m4);
         try testing.expectEqual(@as(usize, 1500 * 25 / 100), m4.finalize);
     }
     // no candidate succeeds
     var m: MockScorer = .{ .fail_k = 100 };
     defer m.deinit();
-    try testing.expectError(error.NoCandidate, optimizeCover(gpa, &dict, s, .{ .k = 100, .d = 8 }, &m));
+    try testing.expectError(error.NoCandidate, optimizeCoverWith(gpa, &dict, s, .{ .k = 100, .d = 8 }, &m));
+}
+
+test "LimitedAllocator: refuses past the limit, counts what is live" {
+    var lim: LimitedAllocator = .init(testing.allocator, 1000);
+    const a = lim.allocator();
+    const x = try a.alloc(u8, 600);
+    try testing.expectError(error.OutOfMemory, a.alloc(u8, 401));
+    try testing.expect(lim.refused);
+    const y = try a.alloc(u8, 400);
+    try testing.expectEqual(@as(usize, 1000), lim.live);
+    a.free(x);
+    const z = try a.realloc(y, 550); // (moved, or grown in place)
+    try testing.expectEqual(@as(usize, 550), lim.live);
+    a.free(z);
+    try testing.expectEqual(@as(usize, 0), lim.live);
+    try testing.expectEqual(@as(usize, 1000), lim.peak);
+    try testing.expectEqual(error.MemoryLimitExceeded, lim.map(@as(Error, error.OutOfMemory)));
+}
+
+test "the complete trainers hold their working memory under memory_limit" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-2000");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var dict: [4096]u8 = undefined;
+    try testing.expectError(error.MemoryLimitExceeded, trainFastCover(gpa, &dict, s, .{ .k = 200, .f = 10, .level = 19, .memory_limit = 64 << 10 }));
+    try testing.expectError(error.MemoryLimitExceeded, optimizeFastCover(gpa, &dict, s, .{ .d = 8, .steps = 1, .f = 10, .memory_limit = 64 << 10 }));
+    // the peak is what it takes: a ceiling at it succeeds, one below fails
+    {
+        var lim: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+        const want = try trainFastCover(lim.allocator(), &dict, s, .{ .k = 200, .f = 12 });
+        const peak = lim.peak;
+        try testing.expectEqual(want, try trainFastCover(gpa, &dict, s, .{ .k = 200, .f = 12, .memory_limit = peak }));
+        try testing.expectError(error.MemoryLimitExceeded, trainFastCover(gpa, &dict, s, .{ .k = 200, .f = 12, .memory_limit = peak - 1 }));
+    }
+    {
+        // cover's peak is its content selection (8 bytes per sample byte),
+        // finalization's compressor at level 19 comes after it
+        var lim: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+        const want = try trainCover(lim.allocator(), &dict, s, .{ .k = 200, .level = 19 });
+        const peak = lim.peak;
+        try testing.expect(peak >= estimateCoverMemory(s.totalSize(), s.sizes.len, .{ .k = 200 }));
+        try testing.expectEqual(want, try trainCover(gpa, &dict, s, .{ .k = 200, .level = 19, .memory_limit = peak }));
+        try testing.expectError(error.MemoryLimitExceeded, trainCover(gpa, &dict, s, .{ .k = 200, .level = 19, .memory_limit = peak - 1 }));
+    }
+    // levels above 22 are refused, not clamped
+    try testing.expectError(error.LevelUnsupported, trainCover(gpa, &dict, s, .{ .k = 200, .level = 23 }));
+    try testing.expectError(error.LevelUnsupported, optimizeCover(gpa, &dict, s, .{ .level = 23 }));
+    try testing.expectError(error.LevelUnsupported, finalizeDictionary(gpa, &dict, s.buffer[0..1000], s, .{ .level = 23 }));
+}
+
+test "trainFromSlices copies the samples and trains as the contiguous trainers do" {
+    const gpa = testing.allocator;
+    const gen = try testSet("words-300");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    const slices = try gpa.alloc([]const u8, s.sizes.len);
+    defer gpa.free(slices);
+    var at: usize = 0;
+    for (slices, s.sizes) |*sl, n| {
+        sl.* = s.buffer[at..][0..n];
+        at += n;
+    }
+    var want: [4096]u8 = undefined;
+    var got: [4096]u8 = undefined;
+    const methods = [_]Method{
+        .{ .cover = .{ .k = 100, .level = 5 } },
+        .{ .fast_cover = .{ .k = 100, .d = 6, .accel = 2 } },
+        .{ .optimize_cover = .{ .k = 200, .d = 8 } },
+        .{ .optimize_fast_cover = .{ .d = 8, .steps = 2, .dict_id = 77 } },
+        .{ .default = default_memory_limit },
+    };
+    for (methods) |m| {
+        const n = switch (m) {
+            .cover => |p| try trainCover(gpa, &want, s, p),
+            .fast_cover => |p| try trainFastCover(gpa, &want, s, p),
+            .optimize_cover => |p| (try optimizeCover(gpa, &want, s, p)).size,
+            .optimize_fast_cover => |p| (try optimizeFastCover(gpa, &want, s, p)).size,
+            .default => try train(gpa, &want, s),
+        };
+        const k = try trainFromSlices(gpa, &got, slices, m);
+        try testing.expectEqualSlices(u8, want[0..n], got[0..k]);
+    }
+    // the copy counts: a ceiling of the samples' size refuses
+    try testing.expectError(error.MemoryLimitExceeded, trainFromSlices(gpa, &got, slices, .{ .cover = .{ .k = 100, .memory_limit = s.buffer.len } }));
+    try testing.expectEqual(@as(u32, 77), getDictId(got[0..try trainFromSlices(gpa, &got, slices, methods[3])]));
+}
+
+test "a finished dictionary compresses its samples, and decodes them back" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-2000");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var dict: [8192]u8 = undefined;
+    const n = try train(gpa, &dict, s);
+    const d = dict[0..n];
+    try testing.expect(getDictId(d) >= 32768);
+    const hdr = try getDictHeaderSize(d);
+    try testing.expect(hdr > 8 and hdr < 256);
+    var cd = try cdict_mod.CDict.init(gpa, d, 3);
+    defer cd.deinit();
+    var comp: frame.Compressor = .initEmpty(gpa);
+    defer comp.deinit();
+    const dec = @import("decompress.zig");
+    var dd = try @import("ddict.zig").DDict.init(gpa, d, .auto);
+    defer dd.deinit(gpa);
+    var dctx = try dec.Decompressor.init(gpa, .{ .ddict = &dd });
+    defer dctx.deinit();
+    var dst: [2048]u8 = undefined;
+    var back: [1024]u8 = undefined;
+    var with: usize = 0;
+    var at: usize = 0;
+    for (s.sizes[0..200]) |len| {
+        const src = s.buffer[at..][0..len];
+        at += len;
+        const c = try comp.compressUsingCDict(&dst, src, &cd, .{});
+        with += c;
+        const m = try dctx.decompress(&back, dst[0..c]);
+        try testing.expectEqualSlices(u8, src, back[0..m]);
+    }
+    // and it pays: the same samples without it take far more
+    var without: usize = 0;
+    at = 0;
+    for (s.sizes[0..200]) |len| {
+        without += try frame.compress(gpa, &dst, s.buffer[at..][0..len], .{ .level = 3, .checksum = false });
+        at += len;
+    }
+    try testing.expect(with * 2 < without);
+}
+
+test "content of 2 GiB - 128 KiB and up cannot be finalized (offset codes above 30)" {
+    // addEntropyTablesFromBuffer checks before reading the content, so a
+    // length stands in for the bytes
+    var byte: u8 = 0;
+    const many: [*]u8 = @ptrCast(&byte);
+    const top: usize = (1 << 31) - (128 << 10);
+    const s: Samples = .{ .buffer = "", .sizes = &.{} };
+    try testing.expectError(error.DictionaryCreationFailed, addEntropyTablesFromBuffer(testing.allocator, many[0..top], top, s, .{}));
+    try testing.expectError(error.DictionaryCreationFailed, addEntropyTablesFromBuffer(testing.allocator, many[0 .. top + 9], top + 9, s, .{}));
 }

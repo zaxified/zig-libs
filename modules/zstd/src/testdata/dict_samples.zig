@@ -53,6 +53,9 @@ pub const sets = [_]Set{
     .{ .name = "islands-74", .kind = .islands, .nb = 420, .min_len = 100, .max_len = 100, .seed = 74 },
     // text every 7 epochs: runs of 6 empty epochs, reset by each island
     .{ .name = "periodic-35", .kind = .periodic, .nb = 150, .min_len = 100, .max_len = 100, .seed = 35 },
+    // samples above a block (128 KB) and above a small CDict's window, for
+    // finalization's truncation and skipping
+    .{ .name = "big-6", .kind = .words, .nb = 6, .min_len = 60000, .max_len = 300000, .seed = 5 },
 };
 
 pub const Generated = struct {
@@ -226,6 +229,116 @@ pub const runs = [_]Run{
     .{ .trainer = .fastcover, .set = "json-200", .capacity = 1024, .k = 50, .d = 6, .accel = 11 },
     .{ .trainer = .fastcover, .set = "json-200", .capacity = 200, .k = 50, .d = 6 },
     .{ .trainer = .fastcover, .set = "tiny-6", .capacity = 256, .k = 50, .d = 8, .split = "0.9" },
+};
+
+/// What a finished-dictionary golden run calls (`tools/zfinal.c`):
+/// `ZDICT_finalizeDictionary`, `ZDICT_addEntropyTablesFromBuffer`, the
+/// trainers, the optimizers, `ZDICT_trainFromBuffer`, `COVER_selectDict`.
+pub const FinalOp = enum { finalize, addentropy, cover, fastcover, optcover, optfast, default, select };
+
+/// One finished-dictionary golden run over `set` into a `capacity`-byte
+/// buffer. finalize: the content is the samples' bytes `[off, off + len)`,
+/// the tables from the first `nb_finalize` samples (null: all);
+/// addentropy: those bytes copied to the end of a zeroed buffer; select:
+/// the buffer is a copy of the samples' bytes from `off`, the content its
+/// last `len` bytes, `nb_train` the training share. `split` "0" is the
+/// optimizers' default.
+pub const FinalRun = struct {
+    op: FinalOp,
+    set: []const u8,
+    capacity: u32,
+    off: u32 = 0,
+    len: u32 = 0,
+    nb_finalize: ?u32 = null,
+    nb_train: u32 = 0,
+    k: u32 = 0,
+    d: u32 = 0,
+    f: u32 = 0,
+    accel: u32 = 0,
+    steps: u32 = 0,
+    split: []const u8 = "0",
+    level: i32 = 0,
+    dict_id: u32 = 0,
+    shrink: bool = false,
+    max_regression: u32 = 0,
+};
+
+pub const final_runs = [_]FinalRun{
+    // finalization: levels of every strategy (the tables come from blocks
+    // compressed through the attached content), IDs, sample shares
+    .{ .op = .finalize, .set = "json-200", .capacity = 2048, .len = 1000 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 2048, .off = 5000, .len = 1500, .level = -5 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 2048, .off = 100, .len = 1500, .level = 1 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 4096, .off = 300, .len = 3000, .level = 5, .dict_id = 7 },
+    .{ .op = .finalize, .set = "json-2000", .capacity = 8192, .off = 1000, .len = 8000, .level = 7, .nb_finalize = 1500 },
+    .{ .op = .finalize, .set = "words-300", .capacity = 4096, .len = 4000, .level = 12, .dict_id = 0x12345678 },
+    .{ .op = .finalize, .set = "words-300", .capacity = 4096, .off = 7, .len = 4000, .level = 16 },
+    .{ .op = .finalize, .set = "csv-100", .capacity = 4096, .len = 4000, .level = 19 },
+    .{ .op = .finalize, .set = "csv-100", .capacity = 2048, .off = 999, .len = 2000, .level = 22 },
+    .{ .op = .finalize, .set = "mix-400", .capacity = 16384, .len = 16384, .level = 3 },
+    .{ .op = .finalize, .set = "mix-400", .capacity = 16384, .off = 20000, .len = 12000, .level = 9 },
+    // a small content: the CDict's window, and so the block, below most
+    // samples, which are then not counted
+    .{ .op = .finalize, .set = "csv-100", .capacity = 1024, .len = 300, .level = 3 },
+    .{ .op = .finalize, .set = "big-6", .capacity = 65536, .off = 12345, .len = 60000, .level = 3 },
+    .{ .op = .finalize, .set = "big-6", .capacity = 2048, .off = 70000, .len = 2000, .level = 19 },
+    .{ .op = .finalize, .set = "big-6", .capacity = 131072, .len = 131072, .level = 1 },
+    // flat literals (ZDICT_flatLit), runs, few samples
+    .{ .op = .finalize, .set = "random-50", .capacity = 2048, .len = 1500 },
+    .{ .op = .finalize, .set = "zeros-20", .capacity = 1024, .len = 900 },
+    .{ .op = .finalize, .set = "tiny-6", .capacity = 256, .len = 20 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 1024, .len = 900, .nb_finalize = 0 },
+    // the header and the content do not both fit: the head is kept
+    .{ .op = .finalize, .set = "json-200", .capacity = 1100, .len = 1000 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 1000, .len = 1000, .level = 19 },
+    // padding a short content; refusals
+    .{ .op = .finalize, .set = "json-200", .capacity = 512, .off = 50, .len = 5 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 512, .len = 0 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 256, .len = 1000 },
+    .{ .op = .finalize, .set = "json-200", .capacity = 255, .len = 100 },
+    // ZDICT_addEntropyTablesFromBuffer: room to spare, none, and tables
+    // written over the content's head
+    .{ .op = .addentropy, .set = "json-200", .capacity = 2048, .len = 1000 },
+    .{ .op = .addentropy, .set = "words-300", .capacity = 4000, .off = 999, .len = 3800 },
+    .{ .op = .addentropy, .set = "json-200", .capacity = 1000, .len = 1000 },
+    .{ .op = .addentropy, .set = "csv-100", .capacity = 600, .len = 400 },
+    // the trainers, finished; a full buffer always keeps the content's head
+    .{ .op = .cover, .set = "json-200", .capacity = 4096, .k = 200, .d = 8 },
+    .{ .op = .cover, .set = "json-2000", .capacity = 16384, .k = 1000, .d = 8, .level = 1, .dict_id = 99 },
+    .{ .op = .cover, .set = "words-300", .capacity = 65536, .k = 2000, .d = 8, .level = 19 },
+    .{ .op = .cover, .set = "csv-100", .capacity = 2000, .k = 77, .d = 7, .level = 9 },
+    .{ .op = .cover, .set = "mix-400", .capacity = 8192, .k = 250, .d = 6, .level = -3 },
+    .{ .op = .cover, .set = "zeros-20", .capacity = 1024, .k = 64, .d = 8 },
+    .{ .op = .cover, .set = "tiny-6", .capacity = 256, .k = 8, .d = 6 },
+    .{ .op = .cover, .set = "random-50", .capacity = 4096, .k = 100, .d = 8, .level = 5 },
+    .{ .op = .cover, .set = "json-200", .capacity = 1024, .k = 0, .d = 8 },
+    .{ .op = .fastcover, .set = "json-200", .capacity = 4096, .k = 200, .d = 8 },
+    .{ .op = .fastcover, .set = "json-2000", .capacity = 16384, .k = 1000, .d = 8, .accel = 4, .level = 12 },
+    .{ .op = .fastcover, .set = "words-300", .capacity = 65536, .k = 2000, .d = 6, .f = 16, .level = 16 },
+    .{ .op = .fastcover, .set = "csv-100", .capacity = 2000, .k = 77, .d = 6, .accel = 10, .level = 22 },
+    .{ .op = .fastcover, .set = "tiny-6", .capacity = 256, .k = 8, .d = 6, .accel = 10 },
+    .{ .op = .fastcover, .set = "big-6", .capacity = 32768, .k = 500, .d = 8, .f = 18, .accel = 2 },
+    .{ .op = .fastcover, .set = "json-200", .capacity = 1024, .k = 50, .d = 7 },
+    // the optimizers (a coarse grid), and ZDICT_trainFromBuffer
+    .{ .op = .optcover, .set = "json-200", .capacity = 2048, .steps = 4 },
+    .{ .op = .optcover, .set = "json-2000", .capacity = 4096, .d = 8, .steps = 6, .split = "0.75", .level = 1 },
+    .{ .op = .optcover, .set = "csv-100", .capacity = 2000, .k = 100, .d = 6, .level = 9 },
+    .{ .op = .optcover, .set = "mix-400", .capacity = 4096, .k = 300, .split = "0.5", .level = 19 },
+    .{ .op = .optcover, .set = "tiny-6", .capacity = 256, .d = 6, .steps = 2 },
+    .{ .op = .optfast, .set = "json-2000", .capacity = 4096, .d = 8, .steps = 4 },
+    .{ .op = .optfast, .set = "words-300", .capacity = 8192, .steps = 3, .f = 16, .accel = 3, .level = 5 },
+    .{ .op = .optfast, .set = "json-200", .capacity = 2048, .k = 120, .split = "1", .level = -1 },
+    .{ .op = .optfast, .set = "tiny-6", .capacity = 256, .d = 8, .steps = 2, .split = "0.9" },
+    .{ .op = .optfast, .set = "random-50", .capacity = 1024, .d = 6, .steps = 2, .accel = 10 },
+    .{ .op = .default, .set = "json-2000", .capacity = 4096 },
+    .{ .op = .default, .set = "words-300", .capacity = 8192 },
+    .{ .op = .default, .set = "csv-100", .capacity = 2000 },
+    // COVER_selectDict with shrinking (no public trainer reaches it)
+    .{ .op = .select, .set = "json-2000", .capacity = 4096, .off = 1000, .len = 3000, .nb_finalize = 1500, .nb_train = 1500, .split = "0.75", .shrink = true, .max_regression = 10 },
+    .{ .op = .select, .set = "json-2000", .capacity = 4096, .off = 1000, .len = 3000, .nb_finalize = 1500, .nb_train = 1500, .split = "0.75", .shrink = true },
+    .{ .op = .select, .set = "words-300", .capacity = 8192, .off = 500, .len = 8192, .nb_finalize = 300, .nb_train = 300, .split = "1", .shrink = true, .max_regression = 3, .level = 7 },
+    .{ .op = .select, .set = "csv-100", .capacity = 3000, .len = 2500, .nb_finalize = 75, .nb_train = 75, .split = "0.75", .level = 19, .dict_id = 1234 },
+    .{ .op = .select, .set = "mix-400", .capacity = 1500, .off = 77, .len = 1000, .nb_finalize = 300, .nb_train = 200, .split = "0.5", .shrink = true, .max_regression = 50 },
 };
 
 pub fn find(name: []const u8) Set {

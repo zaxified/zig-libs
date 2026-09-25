@@ -5,6 +5,27 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — **BREAKING:** dictionary training now gives finished
+  zstd dictionaries (SPEC backlog Z5b). `zstd.dict_builder` gains
+  `finalizeDictionary` (`ZDICT_finalizeDictionary`, its entropy tables
+  measured by compressing the samples through the attached content),
+  `addEntropyTablesFromBuffer`, `getDictId`, `getDictHeaderSize`,
+  `selectDict` (`COVER_selectDict`, with shrinking), and the complete
+  trainers `trainCover` / `trainFastCover` (`ZDICT_trainFromBuffer_cover`
+  / `_fastCover`), `optimizeCover` / `optimizeFastCover` (the optimizers,
+  single-threaded) and `train` (`ZDICT_trainFromBuffer`), plus
+  `trainFromSlices` for samples in separate slices (copied, counted
+  against the ceiling). Renamed: Z5a's content-only `trainCover*` /
+  `trainFastCover*` are now `coverContent*` / `fastCoverContent*`, the
+  scorer-taking `optimizeCover` / `optimizeFastCover` are
+  `optimizeCoverWith` / `optimizeFastCoverWith`. `d` defaults to 8; the
+  params structs gain `level` and `dict_id`; `memory_limit` (still 256
+  MiB) now bounds all working memory, finalization and scoring included
+  (not the dictionary buffer). 63 finished dictionaries byte-identical to
+  libzstd 1.5.7 through the new oracle `tools/zfinal.c`.
+  `frame.Compressor` gains `beginUsingCDict` / `compressBlockOnly` /
+  `seqStore` (block mode, internal).
+
 - **2026-09-25** — **BEHAVIOURAL, not breaking (bug fix):** `Options.
   dictionary = .raw` (one-shot and `Stream`) now copies the dictionary
   into the context's own `CDict`, as `ZSTD_CCtx_loadDictionary` does

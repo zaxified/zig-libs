@@ -2,11 +2,13 @@
 //! Write every dictionary-training sample set (`src/testdata/dict_samples.zig`)
 //! to a directory as `<name>.bin` in the form `ztrain.c` reads, and the
 //! golden runs to a manifest, one "trainer set capacity k d f accel split"
-//! line each. Part of the dictionary golden recipe (`gen-dict-goldens.sh`);
-//! not built by `zig build`.
+//! line each, and, given a third path, the finished-dictionary runs
+//! (`final_runs`) to a second manifest. Part of the dictionary golden
+//! recipe (`gen-dict-goldens.sh`); not built by `zig build`.
 //!
 //!   zig run --dep samples -Mroot=modules/zstd/tools/dump_samples.zig \
-//!       -Msamples=modules/zstd/src/testdata/dict_samples.zig -- <out-dir> <manifest>
+//!       -Msamples=modules/zstd/src/testdata/dict_samples.zig -- \
+//!       <out-dir> <manifest> [<final-manifest>]
 
 const std = @import("std");
 const samples = @import("samples");
@@ -38,4 +40,17 @@ pub fn main(init: std.process.Init) !void {
         try manifest.print(gpa, "{s} {s} {d} {d} {d} {d} {d} {s}\n", .{ @tagName(r.trainer), r.set, r.capacity, r.k, r.d, r.f, r.accel, r.split });
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = manifest_path, .data = manifest.items });
+
+    // the finished-dictionary runs: "op set capacity off len nb_finalize
+    // nb_train k d f accel steps split level dict_id shrink max_regression"
+    const final_path = args.next() orelse return;
+    manifest.clearRetainingCapacity();
+    for (samples.final_runs) |r| {
+        const nb_finalize = r.nb_finalize orelse samples.find(r.set).nb;
+        try manifest.print(gpa, "{s} {s} {d} {d} {d} {d} {d} {d} {d} {d} {d} {d} {s} {d} {d} {d} {d}\n", .{
+            @tagName(r.op), r.set,   r.capacity, r.off,     r.len,                  nb_finalize,      r.nb_train, r.k, r.d, r.f, r.accel,
+            r.steps,        r.split, r.level,    r.dict_id, @intFromBool(r.shrink), r.max_regression,
+        });
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = final_path, .data = manifest.items });
 }
