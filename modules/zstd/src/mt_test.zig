@@ -141,6 +141,30 @@ test "multithreaded output is libzstd's for every worker count, and decodes back
     try std.testing.expectEqual(goldens.rows.len * (corpus.mt_test_workers.len + 1), runs);
 }
 
+test "rsyncable holds for its frame only" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 3_000_000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .mix, .seed = 41 }, src);
+    const out = try gpa.alloc(u8, zstd.compressBound(src.len));
+    defer gpa.free(out);
+    const fresh = try gpa.alloc(u8, zstd.compressBound(src.len));
+    defer gpa.free(fresh);
+    const adv: zstd.Advanced = .{ .nb_workers = 2, .job_size = 524288 };
+    var rs = adv;
+    rs.rsyncable = true;
+    var c: zstd.Compressor = .init(gpa);
+    defer c.deinit();
+    var f: zstd.Compressor = .init(gpa);
+    defer f.deinit();
+    const n_rs = try c.compress(out, src, .{ .level = 1, .advanced = rs });
+    const n_plain = try f.compress(fresh, src, .{ .level = 1, .advanced = adv });
+    // (the input has synchronization points of its own)
+    try std.testing.expect(!std.mem.eql(u8, out[0..n_rs], fresh[0..n_plain]));
+    const n = try c.compress(out, src, .{ .level = 1, .advanced = adv });
+    try std.testing.expectEqualSlices(u8, fresh[0..n_plain], out[0..n]);
+}
+
 test "the jobs are threads: one frame is cut into several, posted to the pool" {
     const gpa = std.testing.allocator;
     const src = try gpa.alloc(u8, 1_400_000);

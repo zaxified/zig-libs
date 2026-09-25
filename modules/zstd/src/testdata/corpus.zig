@@ -3267,6 +3267,9 @@ const mt_cases_rsync = [_]MtCase{
     .{ .name = "mt-rsync-ov9", .input = mt_in_rsync_a, .params = "jobSize=524288,rsyncable=1,overlapLog=9", .levels = &.{6} },
     // synchronization points the data makes by itself
     .{ .name = "mt-rsync-mix-3m", .input = mt_in_mix_3m, .params = "jobSize=524288,rsyncable=1", .levels = &.{ 1, 5 } },
+    // the mask comes from the job size before the overlap (a whole
+    // window, 2 MB here) raises it: 19 bits, not 21
+    .{ .name = "mt-rsync-mix-3m-ov9", .input = mt_in_mix_3m, .params = "jobSize=524288,rsyncable=1,overlapLog=9", .levels = &.{6} },
     .{ .name = "mt-rsync-far-mix", .input = mt_in_far_mix, .params = "jobSize=524288,rsyncable=1", .levels = &.{2} },
     // a frame kept on the calling thread ignores it
     .{ .name = "mt-rsync-small", .input = mt_in_mix_300k, .params = "rsyncable=1", .levels = &.{3} },
@@ -3276,6 +3279,10 @@ const mt_cases_rsync = [_]MtCase{
     // already buffered (the job table full: a tiny output buffer)
     .{ .name = "mt-rsync-stream-tail", .input = mt_in_rsync_a, .schedule = "rsyncable=1,jobSize=524288,c131060,c*,e0", .levels = &.{ 1, 5 } },
     .{ .name = "mt-rsync-stream-steps", .input = mt_in_rsync_c, .schedule = "rsyncable=1,jobSize=524288,c70000,c70000,c70000,c1,c20000,f0,c*,e0", .levels = &.{3}, .checksums = &.{true} },
+    // a call ending exactly 128 KB into the job, right after a window that
+    // hits (ending one byte too early to cut): the next call takes the
+    // buffered hit as a synchronization point and cuts there
+    .{ .name = "mt-rsync-stream-at-128k", .input = mt_in_rsync_a, .schedule = "rsyncable=1,jobSize=524288,c131072,c*,e0", .levels = &.{3} },
     .{ .name = "mt-rsync-stream-full-table", .input = mt_in_rsync_c, .schedule = "rsyncable=1,jobSize=524288,o50,c*,e0", .levels = &.{ 1, 3 } },
     .{ .name = "mt-rsync-stream-pledged", .input = mt_in_rsync_a, .schedule = "p1829651,rsyncable=1,jobSize=524288,c300000,c*,e0", .levels = &.{3} },
 };
