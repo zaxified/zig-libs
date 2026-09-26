@@ -305,6 +305,15 @@ The RED comes from the foreign corpus and from nothing else.
 
 ## Backlog / deferred
 
+**Fail-fast UTF-8 across fragments** — BACKLOG (2026-09-26, found by qap's Autobahn lane). A text
+message is validated when it is complete (`connection.zig` `utf8ValidateSlice` over the reassembled
+payload), so invalid UTF-8 in the first fragment of a long message is refused (1007) only after the
+last one arrives. Autobahn|Testsuite scores §6.4.1-4 NON-STRICT for it; RFC 6455 §8.1 requires the
+failure, not its timing, but the other libraries (autobahn-python, gorilla, tungstenite) fail at the
+fragment. Wanted: an incremental validator carried across frames (the state is at most 3 pending
+bytes of a code point), checked per frame, and the whole-message check dropped. qap's own `ws.Core`
+has the same shape and baselines the four cases (`scripts/conformance-baseline/autobahn.tsv`).
+
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/websocket.zig` has a client and a server. Run it over the wire in both directions: its client against our server, our client against its server. Cover fragmentation, interleaved control frames, close codes and handshake rejections. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 **Server-side `Origin` check** — REQUESTED (2026-09-24, qap security review M6.2). `handshake.acceptHandshake` accepts any `Origin`, so a server that trusts ambient browser credentials (cookies, a TLS client certificate) can be hijacked across sites: another site's page opens the socket as the user, and CORS does not apply to WebSockets. gorilla/websocket (`Upgrader.CheckOrigin`, default = same host) and Node `ws` (`verifyClient`) both check it. Ideal API: `AcceptOptions.origins: []const []const u8` (allow-list, `"*"` = any), with the default letting through a request without `Origin` or one whose host equals `Host`, and a distinct error (`error.OriginNotAllowed` → 403). qap does it itself for now: `ws.originAllowed` (`src/ws.zig`, marked `zig-libs request: websocket`).
