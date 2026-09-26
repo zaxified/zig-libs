@@ -1467,7 +1467,7 @@ equality (a smaller dictionary with exactly the full one's total).
 |---|---|---|
 | level | `min_level` (-131072) … 22; lower is clamped, higher is `error.LevelUnsupported` | `ZSTD_minCLevel()` / `ZSTD_maxCLevel()`; libzstd clamps above 22 too, which would hand a caller a level it did not ask for |
 | memory | level 22 above 64 MB: 512 MiB binary tree + 128 MiB hash + 64 MiB LDM table + 32 KiB bucket offsets (≈ 820 MB peak on a 70 MB input, as libzstd) | the level's own table sizes; nothing is capped, as libzstd caps nothing |
-| input | none (the input and `compressBound` of it in memory) | past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit) the indices are rescaled, as libzstd does (see *Algorithm*) |
+| input | none (the input and `compressBound` of it in memory) | past `ZSTD_CURRENT_MAX` (3500 MiB on 64-bit, 2000 MiB on 32-bit -- *Portability*) the indices are rescaled, as libzstd does (see *Algorithm*) |
 | destination | ≥ `compressBound(src.len)` or `error.NoSpaceLeft` | the reference's decisions assume the one-shot bound; accepting less would let capacity change the output |
 | block | 128 KB | format |
 | stream level | as one-shot (`stream_max_level` = `max_level`) | level 22 without a pledged size uses a 128 MB window and long-distance matching (window log 27, as libzstd), ≈ 1 GB |
@@ -1475,7 +1475,7 @@ equality (a smaller dictionary with exactly the full one's total).
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
 | stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
 | context memory | one workspace, exactly `estimateCompressorSize` / `estimateStreamSize`; a static one is never exceeded (`error.OutOfMemory`) | `ZSTD_estimateCCtxSize*`, `ZSTD_initStaticCCtx` |
-| decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header, else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (64-bit); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
+| decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header on 64-bit, ≤ 30 on 32-bit -- *Portability* -- else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (`_64`/`_32` by `sizeof(size_t)`); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
 | decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), plus the ≈ 190 KB context | `ZSTD_decodingBufferSize_min` |
 | decode destination | the whole output; too small is `error.DstSizeTooSmall`. `decompressAlloc` sizes from the headers, else `decompressBound`, never above its `max_size` | `ZSTD_decompress` |
 | training memory | `estimateCoverMemory` / `estimateFastCoverMemory` ≤ `memory_limit` (default 256 MiB), else `error.MemoryLimitExceeded` before any allocation | libzstd has none (cover ≈ 8 B per sample byte, fastCover 6 · 2^f B) |
@@ -2146,6 +2146,273 @@ loop and `btopt`'s (levels 13–16, 1.13–1.15× instructions at equal
 cycles). The entropy stage (literals, sequences) already costs what
 libzstd's does.
 
+## Portability
+
+`meta.targets` (`root.zig`): `.linux64` (mandatory), `.linux32`, `.windows`
+(`check-portable`'s vocabulary, `build.zig`'s `PortableTarget` -- see its
+doc comments before adding a target here). Not `.wasm32`: `zstdmt.zig`'s
+worker pool uses `std.Thread.spawn`, unavailable in `wasm32-wasi`'s
+single-threaded build (`std/Thread.zig`'s `@compileError`) -- an open
+question, not decided here (below).
+
+`.linux32` is `mips-linux-musl`, `mips32,soft_float` -- 32-bit **and**
+big-endian at once, libzstd's actual combination on real hardware (an
+ath79 24Kc; `build.zig`'s doc comment on `PortableTarget.linux32`), so this
+section covers both axes through the targets `check-portable` actually
+declares, not the wider i386/arm/s390x sweep a first read of libzstd's
+`MEM_32bits()`/`MEM_isLittleEndian()` might suggest.
+
+**What changed, by libzstd site** (`rg 'MEM_32bits|MEM_64bits'` over
+`lib/`, every hit read):
+
+- `zstd_compress_internal.h`'s `ZSTD_CURRENT_MAX` (3500 MiB / 2000 MiB) and
+  `zstd.h`'s `ZSTD_WINDOWLOG_MAX_64`/`_32` (31 / 30) are real behaviour,
+  not perf: the first decides when indices rescale (`match.zig`'s
+  `current_max`, past which `ZSTD_window_correctOverflow`'s C also runs on
+  a 32-bit build), the second is the advanced-parameter bound and the
+  decoder's hard frame-header cap (`params.window_log_max`,
+  `decompress.window_log_max`). Both were a bare `31` / `3500 << 20`
+  (the 64-bit value only) and are now `if (@sizeOf(usize) == 4) ... else
+  ...` -- libzstd's own `sizeof(size_t) == 4` check, with a Zig
+  cross-compile's `usize` standing in for the C `size_t`. A dedicated test
+  next to each pins the selected constant against the literal libzstd
+  picks (`match.zig`, `params.zig`, `decompress.zig`), so it runs for real
+  under every declared target, not just read as consistent with itself.
+- Every other `MEM_32bits()`/`MEM_64bits()` site (`huf_compress.c`,
+  `zstd_compress_sequences.c`, `huf_decompress.c`, `zstd_decompress_block.c`
+  -- about twenty, all in the bitstream and sequence-decode paths) only
+  decides how often libzstd's C flushes or reloads a `size_t`-sized bit
+  accumulator to avoid overflowing a 32-bit register; the serialized
+  bitstream is invariant to that timing (a later flush moves already-
+  decided bits to the output earlier, never changes them). This port's
+  accumulators are `u64` unconditionally (`bitstream.zig`'s `CStream`,
+  `dbits.zig`'s `DStream`), so it always has 64-bit headroom and never
+  needs the narrower path -- confirmed by the existing goldens (built
+  against libzstd's 64-bit output) staying byte-identical under both
+  32-bit targets in the sweep below, including `zstd_decompress_block.c`'s
+  `isLongOffset`, which exists only to compensate a 32-bit accumulator
+  that this port does not have.
+- `huf_decompress.c:203`, `!MEM_isLittleEndian() || MEM_32bits()`: gates
+  libzstd's 64-bit-little-endian fast Huffman decode loop, falling back to
+  the reference decoder elsewhere -- a speed selection between two
+  implementations proven to agree, not a value difference. `huf_dec.zig`
+  already had the equivalent gate (`@sizeOf(usize) != 8 or
+  builtin.cpu.arch.endian() != .little`, `initFastDStream` and its
+  callers) before Z12; nothing to change.
+
+**Big-endian: the pre-splitter's hash** (`zstd_preSplit.c`'s `hash2`,
+`MEM_read16` -- native order on the build host). `presplit.zig`'s `hash2`
+already read the two bytes as **explicitly little-endian**
+(`std.mem.readInt(u16, p[0..2], .little)`), not native order, before Z12
+-- a deliberate choice (its existing comment) rather than an oversight.
+**Decision, made explicit here: keep it.** This module's byte-identical
+claim is against libzstd's ordinary little-endian builds (amd64/arm64,
+the mandatory `.linux64`, and every real-world zstd installation a
+consumer's frames need to interoperate with) -- matching *this* build's
+native order instead would make a big-endian build of this module produce
+frames a little-endian libzstd decodes fine (the format is endianness-
+agnostic) but whose *bytes* differ from what every other zstd
+implementation in existence writes for the same input and level, which is
+a worse portability property than a deliberately fixed byte order. Checked
+against a genuinely big-endian libzstd build (below): the two disagree
+exactly where the pre-splitter's cut points move because of it, nowhere
+else. Everywhere else in this port already reads and writes explicitly
+`.little` or `.big` (`rg` over `src/*.zig` for `readInt`/`writeInt` with
+no explicit endianness: zero hits) -- `ZSTD_count`'s trailing-zero byte
+count (`match.zig`'s `count`/`hashSalted`, `huf_dec.zig`'s CTZ-driven
+Huffman fast loop) reads its words with an explicit `.little`
+`std.mem.readInt`, so `@ctz`/byte-count arithmetic is correct on any host
+regardless of native order, unlike libzstd's C (`ZSTD_NbCommonBytes`,
+`bits.h`), which branches on `MEM_isLittleEndian()` to get the same
+answer from a native-order read.
+
+**The real bug: the row match finder's tag-match mask** (`lazy.zig`'s
+`matchMask`, `ZSTD_row_getMatchMask`). Its vector compare
+(`tag_row[0..entries] == splat(tag)`) is bitcast straight to an integer
+mask, bit `i` meaning "slot `i` matched" -- the convention `rotr` and
+every caller (`headGrouped + ZSTD_VecMask_next(matches)`) depend on, and
+the one libzstd's own SIMD paths *and* its portable SWAR fallback both
+preserve on purpose: the fallback's comment literally says "big endian:
+reverse bits during extraction", doing extra work so a big-endian host's
+`MEM_readST`-native-order read still lands bit `i` on slot `i`. This
+port's `@bitCast(@Vector(entries, bool))` does not carry that guarantee.
+Measured directly (a standalone comparison of the identical vector
+compare + bitcast on `x86_64-linux` vs. `mips-linux-musl`, 16-, 32- and
+64-lane, matching the three row widths this function is ever
+instantiated at): the big-endian result is the little-endian one with
+**every bit reversed end to end**, not a byte swap. This is not a compile
+failure `check-portable` (compile-only, see *Anchoring* below) could ever
+catch -- it produces a *valid*, decodable frame, just not libzstd's bytes
+-- and it was found by actually running the test suite under `qemu-mips`
+(below), where `context_test.zig`'s "indexing restarts near the index
+limit, with the same bytes" (level 7, `lazy`, which crosses the 16 KB row
+threshold) failed reproducibly while every other test passed. Fixed with
+`@bitReverse` on a big-endian target only, a no-op branch removed at
+comptime elsewhere, so `.linux64`/`.windows` emit the exact same code as
+before.
+
+**Four more bugs `check-portable -Dportable-measure-all` actually
+found**, all now fixed:
+
+- `literals.zig`'s `minLiteralsToCompress`/`minGain` shifted a `usize`
+  value by a bare `u6` -- correct only when `usize` is 64-bit
+  (`Log2Int(usize)` is `u5` on 32-bit) -- the exact bug class
+  `build.zig`'s `check-portable` comment names (`qr`'s `BitWriter`). Now
+  `std.math.Log2Int(usize)`.
+- `zstdmt.zig`'s `Pool.posted`/`taken`/`finished` were
+  `std.atomic.Value(u64)`: `mips-linux-musl` has no native 64-bit atomic
+  ops, and `@atomicLoad`/`Store`/`Rmw` refuse to compile there for a
+  64-bit operand. Narrowed to `u32` -- which turns out to match libzstd's
+  own `nextJobID`/`doneJobID` (`zstdmt_compress.c`, plain `unsigned`) more
+  closely than the `u64` this port had; a `u32` job-sequence wrap needs
+  over four billion jobs in one compression, unreachable at any realistic
+  job size. `Pool.slot` centralises the `u32`/`usize` cast at the one
+  place indices meet the queue length.
+- `frame_writer.zig`'s `drain`/`flush` recover `*FrameWriter` from
+  `*Writer` with `@fieldParentPtr`; on `mips-linux-musl` alone the
+  compiler reports the result as only 2-aligned and refuses to widen it,
+  even though the field's actual offset is a multiple of 8 there
+  (`@offsetOf`, checked by hand) -- a conservative bound this target's
+  ABI makes `@fieldParentPtr` compute, not a real alignment hazard (`w`
+  only ever points at the `writer` field of an actual `FrameWriter`
+  value). `@alignCast` at both call sites, as the compiler's own error
+  suggests.
+- `testdata/corpus.zig` and `testdata/dict_samples.zig` (test-only, not
+  shipped): several `Rng.below(n: u64) u64` results indexed a slice
+  directly, which needs `usize` -- fine by implicit widening on a 64-bit
+  `usize` and a compile error on a 32-bit one. `@intCast` at each site.
+
+**Five more test-only bugs, found only by actually running the suite**
+(`check-portable` is compile-only and could not have caught any of
+these -- see *Anchoring*): `dict_builder.zig`'s "the memory ceiling
+refuses before allocating anything" hardcoded `(s.sizes.len + 1) * 8`
+where the code under test (`FastCoverContext.memory`) correctly uses
+`* @sizeOf(usize)` (libzstd's own `sizeof(size_t)`-sized per-sample
+entries) -- the estimate itself was already right for both widths, only
+the test's expectation assumed 64-bit; now `* @sizeOf(usize)`. And
+`param_test.zig`'s advanced-parameter bounds table hardcoded four
+64-bit-only edges as bare literals instead of the constants they check:
+`window_log` (`params.window_log_max`, 30 not 31), `search_log`
+(`params.search_log_max` = `ZSTD_SEARCHLOG_MAX` = `ZSTD_WINDOWLOG_MAX -
+1`, 29 not 30) and `ldm_hash_rate_log` (`params.ldm_hash_rate_log_max` =
+`ZSTD_LDM_HASHRATELOG_MAX` = `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`, 24
+not 25) -- all three confirmed against libzstd's own `zstd.h`.
+`hash_log`/`chain_log`'s edges (30/31) needed no change: their bound is a
+fixed `ZSTD_HASHLOG_MAX`/`ZSTD_CHAINLOG_MAX` = 30, not derived from
+`ZSTD_WINDOWLOG_MAX`.
+
+**Anchoring.** `check-portable`'s own claim is compile-only
+(`build.zig`'s comment on why: `addTest`, never run, on every
+cross-compiled target) -- it caught the four compile-time bugs above but,
+by construction, never could have caught the row-match-finder bug, which
+compiles cleanly and only produces wrong bytes at runtime. The evidence
+below is this module's own, beyond that gate:
+
+- `zig build test-zstd -Dtarget=mips-linux-musl
+  -Dcpu=baseline+mips32+soft_float -Doptimize=ReleaseSafe`, actually
+  *executed* under `qemu-mips` (Zig's test runner picks it up from `PATH`
+  automatically for a foreign target): first run (before any Z12 fix)
+  179/193 passed, 11 failed, 3 crashed -- nearly all traced to the
+  row-match-finder mask (`context_test`'s reuse-equals-fresh checks and
+  `param_test`'s byte-identical-with-advanced-parameters check, every one
+  exercising `greedy`..`lazy2` above a 16 KB window) or the test-only
+  memory-ceiling literal above. One more pre-existing failure was fixed
+  alongside the others: `param_test.zig`'s bounds table hardcoded three
+  more 64-bit-only edges besides `window_log` -- `search_log`
+  (`ZSTD_SEARCHLOG_MAX = ZSTD_WINDOWLOG_MAX - 1`, 29 not 30 on 32-bit) and
+  `ldm_hash_rate_log` (`ZSTD_LDM_HASHRATELOG_MAX = ZSTD_WINDOWLOG_MAX -
+  ZSTD_HASHLOG_MIN`, 24 not 25) -- now `params.search_log_max` /
+  `params.ldm_hash_rate_log_max`, both real libzstd constants confirmed
+  in `zstd.h`.
+
+  **Full runs after every fix (2026-09-26, with Z9b and Z10 merged in),
+  ReleaseSafe under qemu:** `x86-linux-musl` (i386) 212/212 and
+  `arm-linux-musleabihf` 212/212, both with every sweep in full;
+  `s390x-linux-musl` (64-bit big-endian, used to separate the two axes)
+  211/212, the failing `seq_test` fixed and rerun alone, 6/6;
+  `mips-linux-musl` soft-float 211/212 with `mt_test` skipped (below).
+  Two bugs of the Z10 sequence API showed up only here:
+  `blockSizeExplicitDelimiter` and `fastSequenceLengthSum` summed `u32`
+  lengths into `usize`, and the validation's running position grew before
+  the block-bound check, so lengths near 2^32 -- refused on 64-bit --
+  overflowed a 32-bit `usize` (a panic in ReleaseSafe on i386); the sums
+  are `u64` and the bound is checked first (the same error class either
+  way). And `seq_test` read the little-endian sequence records it writes
+  for the goldens back as native `Sequence`s -- garbage on big-endian (a
+  test-only bug).
+
+  **qemu-mips crashes:** `qemu-mips: accel/tcg/user-exec.c:581:
+  page_find_range_empty: Assertion 'min <= max' failed` -- QEMU's own
+  page-tracking invariant, in tests that allocate and free many
+  differently-sized regions or thread pools in quick succession
+  (`stream_test`, `context_test`, `mt_test`). i386 and ARM (32-bit) and
+  s390x (big-endian) run all three in full, so both axes are covered;
+  on 32-bit MIPS only, `context_test` and `stream_test` run a trimmed
+  sweep and `mt_test` (whose load grew with Z9b's rsyncable cases until
+  even a trimmed run tripped qemu) is skipped.
+
+  **The damaged-frame KATs are libzstd's verdict per platform, not a
+  bug:** `decoder_test.zig`'s `c00743`, `c01822` and `d04112` (mutation-
+  sweep fixtures for fast Huffman loop decisions) give
+  `error.ChecksumWrong` on x86_64 and `error.CorruptionDetected` on every
+  target without the fast loop (not 64-bit little-endian). libzstd 1.5.7
+  itself does the same: `tools/zdec.c` built with `zig cc` for i386 and
+  s390x and run under qemu gives `corruption_detected` on all three,
+  x86_64 `checksum_wrong` -- libzstd's fast loop, like this port's, runs
+  on 64-bit little-endian only, and these frames decode differently
+  without it. The fixtures carry both verdicts
+  (`Kat.expect_no_fast_loop`).
+- A differential sweep of **libzstd itself** (not this port): `.linux32`'s
+  `mips-linux-musl` soft-float and, for comparison, plain 32-bit
+  little-endian (`x86-linux-musl`, `qemu-i386`) -- `zref.c` (this module's
+  own reference oracle, `tools/README.md`) built three ways with `zig cc`
+  straight from libzstd 1.5.7's sources (`-target x86_64-linux-musl` /
+  `x86-linux-musl` / `mips-linux-musleabi -mcpu=baseline+mips32+soft_float`,
+  no prebuilt static lib needed) -- native x86_64, `qemu-i386`, `qemu-mips`.
+  Every `(case, level, checksum, ldm, window_log)` combination the golden
+  tests themselves use (`tools/dump_corpus.zig`'s manifest, 2 011
+  non-`ocf` entries over 98 inputs) compressed natively; one in six also
+  compressed under both emulators and diffed by SHA-256 against the
+  native frame: **0 mismatches** (335 checked per emulator) -- real
+  libzstd's own output is unaffected by 32-bitness or big-endianness for
+  every case this corpus reaches (unsurprising: `ZSTD_CURRENT_MAX`/
+  `ZSTD_WINDOWLOG_MAX` need multi-gigabyte inputs to matter, and this
+  corpus is small by design).
+- **This port itself**, compiled for `x86-linux-musl` (a throwaway batch
+  driver over this module's `compressAlloc`, not committed) under
+  `qemu-i386`, against `zref-i386`, real libzstd built the same way: 249
+  `(case, level, checksum)` combinations (every eighth manifest entry,
+  spanning every strategy and level) -- **0 mismatches**. Independent of
+  the golden tests (which pin this port's output against goldens
+  generated on the native x86_64 host, not against a live i386 libzstd
+  run) and of the `qemu-mips` test-suite execution above (which pins
+  this port's 32-bit-big-endian output against those same goldens); this
+  is the one piece of evidence that compares this port's own 32-bit
+  *little-endian* bytes directly against a real 32-bit libzstd build's
+  bytes for the same input.
+- `s390x-linux-musl` (64-bit, big-endian -- not a declared `meta.targets`
+  member, since `PortableTarget` has no 64-bit-big-endian entry;
+  used here only to separate the two axes `.linux32` conflates): full
+  suite green except what the runs above record, *none* of `.linux32`'s
+  qemu crashes (confirming those are about a 32-bit
+  address space specifically, per their entry above) -- and, importantly,
+  every row-match-finder test that `.linux32` needed the `matchMask` fix
+  for also passes here, on a completely different big-endian QEMU
+  backend from `mips`, which is the strongest evidence available that
+  the fix is correct in general and not a MIPS-shaped coincidence.
+- The presplitter's endianness decision (above) checked directly, since
+  the manifest sweep above is all small inputs unlikely to reach a
+  presplit-changing threshold: a 1.96 MB mixed Zig-source file, `zref`
+  (real libzstd) natively vs. under `qemu-mips`, at levels 5/9/12/17/19
+  with checksums both off and on. Levels 5, 17 and 19 (`greedy` and
+  `btopt`/`btultra2`, presplitting active) **differ** between the two
+  builds, by tens of bytes out of ~350-410 KB each -- confirming the
+  documented decision above is a real, deliberate divergence from a
+  genuine big-endian libzstd build, not a hypothetical one. Levels 9 and
+  12 (`lazy2`/`btlazy2`) happened to agree for this input -- the
+  pre-splitter's cut decision is a threshold, not guaranteed to move for
+  every input just because presplitting runs.
+
 ## What is deliberately not done
 
 - **Matching the `zstd` CLI as such.** The CLI drives the streaming API with
@@ -2245,9 +2512,15 @@ dictionaries are undecided.
   fallback.
 - ~~**Z11 — Speed parity.**~~ Done 2026-09-24, see *Speed*: within about
   10 % of libzstd at every level (was 1.2–2.0×).
-- **Z12 — Portability.** Run `portable-zstd-*`; big-endian (the
-  pre-splitter's 16-bit hash reads *native* order in libzstd — decide which
-  to match); 32-bit (`ZSTD_CURRENT_MAX` 2 000 MB). **~0.5 session.**
+- ~~**Z12 — Portability.**~~ Done 2026-09-25, see *Portability*: 32-bit
+  (`window_log_max`, `ZSTD_CURRENT_MAX`) and big-endian (`.linux32` is
+  libzstd's actual combination of both, `mips-linux-musl` soft-float); the
+  headline finding was a real correctness bug (the row match finder's
+  tag-match mask, big-endian-only, found by actually running the tests
+  under `qemu-mips` rather than by `check-portable`, which is compile-only
+  and did catch four smaller ones). Run in full under qemu on i386, ARM,
+  s390x and mips (2026-09-26); the 3 KAT differences off 64-bit
+  little-endian are libzstd's own (see *Portability*'s *Anchoring*).
 - ~~**Z13 — Context reuse and sizing.**~~ Done 2026-09-24, see *Contexts*.
   Its premise was wrong: without a dictionary a reused libzstd context gives
   the same bytes as a fresh one (measured), so reuse is for speed and
@@ -2274,8 +2547,6 @@ roughly 17–22 sessions.
   pricing's low-probability switch at exactly 2048 sequences, and 13
   equalities in the optimal parsers and the post-splitter's estimates, and
   10 in long-distance matching (see *Anchoring*).
-- `targets` declares only `.linux64`; the code has no OS or endianness
-  dependency, but `portable-zstd-*` has not been run.
 - Dictionaries (Z2c mutation sweep, widened per the coordinator's request:
   48 mutations across every bounds/length check and error branch of
   `loadDEntropy` and its header parsing, the content-type dispatch, dictID

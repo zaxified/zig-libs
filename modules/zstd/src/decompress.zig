@@ -38,7 +38,12 @@ pub const frame_header_size_min = 6;
 pub const frame_header_size_max = 18;
 pub const block_header_size = 3;
 pub const window_log_absolute_min = 10;
-pub const window_log_max = 31;
+/// `ZSTD_WINDOWLOG_MAX`: 31 on a 64-bit `usize` target, 30 on a 32-bit one
+/// (`ZSTD_WINDOWLOG_MAX_32`/`_64`, `lib/zstd.h`) — a frame whose header
+/// declares a larger window than this is unconditionally refused, before
+/// `DecompressStream.Options.window_log_max` (the caller's own, lower,
+/// configurable cap) is even consulted.
+pub const window_log_max = if (@sizeOf(usize) == 4) 30 else 31;
 pub const block_size_max = dblock.block_size_max;
 
 const did_field_size = [4]usize{ 0, 1, 2, 4 };
@@ -932,4 +937,13 @@ test "short input: header needs more bytes, wrong magic is refused early" {
     try std.testing.expectEqual(HeaderResult{ .need = 5 }, try getFrameHeader(&.{ 0x28, 0xb5 }));
     try std.testing.expectError(error.PrefixUnknown, getFrameHeader(&.{ 0x28, 0xb6 }));
     try std.testing.expectEqual(HeaderResult{ .need = 5 }, try getFrameHeader(&.{0x5a}));
+}
+
+test "window_log_max matches libzstd's ZSTD_WINDOWLOG_MAX for this target's usize width" {
+    // SPEC.md Z12: same constant as `params.window_log_max`, declared
+    // separately here because the decoder's hard cap (frame header, any
+    // window size) is a different call site than the encoder's advanced-
+    // parameter bound.
+    const want: u32 = if (@sizeOf(usize) == 4) 30 else 31;
+    try std.testing.expectEqual(want, window_log_max);
 }

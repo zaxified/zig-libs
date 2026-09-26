@@ -435,7 +435,7 @@ const vocabulary = [_][]const u8{
 fn words(r: *Rng, out: []u8) void {
     var i: usize = 0;
     while (i < out.len) {
-        const w = vocabulary[r.below(vocabulary.len)];
+        const w = vocabulary[@as(usize, @intCast(r.below(vocabulary.len)))];
         const n = @min(w.len, out.len - i);
         @memcpy(out[i..][0..n], w[0..n]);
         i += n;
@@ -519,11 +519,11 @@ fn mix(r: *Rng, out: []u8) void {
                 const k = 2 + r.below(7);
                 var alphabet: [8]u8 = undefined;
                 random(r, &alphabet);
-                for (piece) |*b| b.* = alphabet[r.below(k)];
+                for (piece) |*b| b.* = alphabet[@as(usize, @intCast(r.below(k)))];
             },
             5 => if (i > 0) {
                 // copy from earlier output: a match at some offset
-                const dist = 1 + r.below(i);
+                const dist: usize = @intCast(1 + r.below(i));
                 for (piece, 0..) |*b, j| b.* = out[i + j - dist];
             } else @memset(piece, 0),
             else => @memset(piece, 0),
@@ -585,8 +585,8 @@ pub fn generate(case: Case, out: []u8) void {
             for (out[p..], p..) |*b, i| b.* = if (r.below(1500) == 0) @truncate(r.next()) else out[i - p];
         },
         .dict_boundary_echo => @memcpy(out, &dict_boundary_echo_input),
-        .survivor_literal => @memcpy(out, survivor_inputs[case.seed]),
-        .rsync_marks => rsyncMarks(&r, out, rsync_mark_sets[case.seed]),
+        .survivor_literal => @memcpy(out, survivor_inputs[@as(usize, @intCast(case.seed))]),
+        .rsync_marks => rsyncMarks(&r, out, rsync_mark_sets[@as(usize, @intCast(case.seed))]),
         .sparse_matches => {
             const phrases = [_][]const u8{ "<record id=\"", "\" type=\"sample\">", "</record>\n", "timestamp=" };
             var i: usize = 0;
@@ -594,7 +594,7 @@ pub fn generate(case: Case, out: []u8) void {
                 const noise = @min(250 + r.below(200), out.len - i);
                 random(&r, out[i..][0..noise]);
                 i += noise;
-                const p = phrases[r.below(phrases.len)];
+                const p = phrases[@as(usize, @intCast(r.below(phrases.len)))];
                 const n = @min(p.len, out.len - i);
                 @memcpy(out[i..][0..n], p[0..n]);
                 i += n;
@@ -612,7 +612,7 @@ pub fn generate(case: Case, out: []u8) void {
                 const noise = @min(800 + r.below(300), out.len - i);
                 random(&r, out[i..][0..noise]);
                 i += noise;
-                const p = &phrases[r.below(phrases.len)];
+                const p = &phrases[@as(usize, @intCast(r.below(phrases.len)))];
                 const n = @min(p.len, out.len - i);
                 @memcpy(out[i..][0..n], p[0..n]);
                 i += n;
@@ -659,7 +659,10 @@ pub fn generate(case: Case, out: []u8) void {
             while (i < out.len) {
                 // the favoured half of the vocabulary slides with position
                 const shift = (i * vocabulary.len) / out.len;
-                const pick = if (r.below(4) != 0) (shift + r.below(vocabulary.len / 2)) % vocabulary.len else r.below(vocabulary.len);
+                const pick: usize = if (r.below(4) != 0)
+                    (shift + @as(usize, @intCast(r.below(vocabulary.len / 2)))) % vocabulary.len
+                else
+                    @intCast(r.below(vocabulary.len));
                 const w = vocabulary[pick];
                 const n = @min(w.len, out.len - i);
                 @memcpy(out[i..][0..n], w[0..n]);
@@ -3462,8 +3465,8 @@ pub const seq_cases = [_]SeqCase{
         .{ .offset = 1500, .lit_length = 1000, .match_length = 24 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 },
     } ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 1024, .match_length = 0 }} ** 15 } },
     .{ .name = "cseq-rep0-minus-1", .input = "words-1000", .cmd = "cseq", .params = explicit ++ ",repcodeResolution=1", .gen = .{ .list = &[_]seqgen.Seq{
-        .{ .offset = 8, .lit_length = 10, .match_length = 5 },  .{ .offset = 7, .lit_length = 0, .match_length = 5 },
-        .{ .offset = 7, .lit_length = 3, .match_length = 4 },   .{ .offset = 0, .lit_length = 973, .match_length = 0 },
+        .{ .offset = 8, .lit_length = 10, .match_length = 5 }, .{ .offset = 7, .lit_length = 0, .match_length = 5 },
+        .{ .offset = 7, .lit_length = 3, .match_length = 4 },  .{ .offset = 0, .lit_length = 973, .match_length = 0 },
     } } },
     .{ .name = "prod-mm3-cut-v", .input = "words-16384", .cmd = "prod:2304", .params = "validateSequences=1" },
 
@@ -3491,14 +3494,14 @@ pub const seq_cases = [_]SeqCase{
     // a 6-byte block (raw, still the first); then RLE's edges: 1 sequence
     // (the first compressed block: never RLE), 4 sequences, 10 literals
     .{ .name = "cseq-rle-edges", .input = "zeros-300000", .cmd = "cseq", .params = explicit, .gen = .{ .list = &[_]seqgen.Seq{
-        .{ .offset = 1, .lit_length = 1, .match_length = 5 },      .{ .offset = 0, .lit_length = 0, .match_length = 0 },
-        .{ .offset = 1, .lit_length = 1, .match_length = 999 },    .{ .offset = 0, .lit_length = 0, .match_length = 0 },
-        .{ .offset = 1, .lit_length = 1, .match_length = 100 },    .{ .offset = 1, .lit_length = 0, .match_length = 100 },
-        .{ .offset = 1, .lit_length = 0, .match_length = 100 },    .{ .offset = 1, .lit_length = 0, .match_length = 100 },
-        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 10, .match_length = 100 },
-        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 0, .match_length = 131072 },
-        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 0, .match_length = 131072 },
-        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 0, .match_length = 36339 },
+        .{ .offset = 1, .lit_length = 1, .match_length = 5 },   .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+        .{ .offset = 1, .lit_length = 1, .match_length = 999 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+        .{ .offset = 1, .lit_length = 1, .match_length = 100 }, .{ .offset = 1, .lit_length = 0, .match_length = 100 },
+        .{ .offset = 1, .lit_length = 0, .match_length = 100 }, .{ .offset = 1, .lit_length = 0, .match_length = 100 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },   .{ .offset = 1, .lit_length = 10, .match_length = 100 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },   .{ .offset = 1, .lit_length = 0, .match_length = 131072 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },   .{ .offset = 1, .lit_length = 0, .match_length = 131072 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },   .{ .offset = 1, .lit_length = 0, .match_length = 36339 },
         .{ .offset = 0, .lit_length = 0, .match_length = 0 },
     } } },
     // room for exactly the raw block after the entropy stage ran out

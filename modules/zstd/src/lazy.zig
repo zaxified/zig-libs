@@ -11,10 +11,13 @@
 //! picks the row finder over the hash chain whenever the window is larger
 //! than 16 KB, so both are needed for every level of `greedy`..`lazy2`.
 //!
-//! The row finder's SIMD tag comparison is written as a plain vector compare;
-//! only the set of matching slots matters, not how it is computed.
+//! The row finder's SIMD tag comparison is written as a plain vector compare
+//! (`matchMask`); the set of matching slots is what must match libzstd, and
+//! it does -- but getting that set out of the vector is endianness-sensitive
+//! (see `matchMask`'s own comment, SPEC.md *Portability*).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const params = @import("params.zig");
 const match = @import("match.zig");
 const sequences = @import("sequences.zig");
@@ -523,7 +526,26 @@ inline fn matchMask(comptime entries: u32, tag_row: []const u8, tag: u8, head: u
     const V = @Vector(entries, u8);
     const B = std.meta.Int(.unsigned, entries);
     const v: V = tag_row[0..entries].*;
-    const eq: B = @bitCast(v == @as(V, @splat(tag)));
+    // `@bitCast` of a `@Vector(entries, bool)` must give bit `i` == lane
+    // `i` (`tag_row[i]`'s comparison), the convention libzstd's own SIMD
+    // paths use and its portable SWAR fallback (`zstd_lazy.c`'s
+    // `ZSTD_row_getMatchMask`) goes out of its way to preserve on a
+    // big-endian host too ("reverse bits during extraction", its own
+    // comment) -- `rotr` below, and every caller's `headGrouped +
+    // ZSTD_VecMask_next(matches)`, depend on that mapping being
+    // bit-for-bit the same regardless of target.
+    //
+    // Zig's `@bitCast` does not honour it: measured directly (a standalone
+    // comparison of the same vector-of-bool bitcast on `x86_64-linux` vs.
+    // `mips-linux-musl`, 32-bit big-endian -- `check-portable`'s
+    // `.linux32`), the big-endian result is the little-endian one with
+    // every bit reversed end to end, not merely a byte swap, at both the
+    // 16- and 32-lane widths this function is instantiated at.
+    // `@bitReverse` on a big-endian target only undoes exactly that, at
+    // zero cost on every currently little-endian target (`.linux64`,
+    // `.windows`) this collapses to a no-op branch.
+    const raw: B = @bitCast(v == @as(V, @splat(tag)));
+    const eq: B = if (comptime builtin.cpu.arch.endian() == .big) @bitReverse(raw) else raw;
     return std.math.rotr(B, eq, head);
 }
 

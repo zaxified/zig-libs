@@ -299,7 +299,15 @@ test "the sequence-level API is byte-identical to libzstd 1.5.7, errors included
                     if (std.mem.eql(u8, sc.cmd, "gen") and sc.dict == null) {
                         const back = try gpa.alloc(u8, src.len);
                         defer gpa.free(back);
-                        const s: []const zstd.Sequence = @ptrCast(@alignCast(b));
+                        // (the records are little-endian, as the goldens are)
+                        const s = try gpa.alloc(zstd.Sequence, b.len / 16);
+                        defer gpa.free(s);
+                        for (s, 0..) |*q, i| q.* = .{
+                            .offset = std.mem.readInt(u32, b[16 * i ..][0..4], .little),
+                            .lit_length = std.mem.readInt(u32, b[16 * i + 4 ..][0..4], .little),
+                            .match_length = std.mem.readInt(u32, b[16 * i + 8 ..][0..4], .little),
+                            .rep = std.mem.readInt(u32, b[16 * i + 12 ..][0..4], .little),
+                        };
                         try std.testing.expectEqual(src.len, try rebuild(s, src, back));
                         try std.testing.expectEqualSlices(u8, src, back);
                     } else if (!std.mem.eql(u8, sc.cmd, "merge") and sc.gen.damage == .none and sc.gen.list.len == 0 and std.mem.indexOf(u8, sc.params, "format=1") == null and

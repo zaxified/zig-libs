@@ -90,6 +90,11 @@ fn decodeBack(gpa: std.mem.Allocator, mc: corpus.MtCase, dict: []const u8, frame
 }
 
 test "multithreaded output is libzstd's for every worker count, and decodes back" {
+    // Under qemu-mips this test's pool and buffer churn trips qemu's own
+    // page_find_range_empty assertion (SPEC.md, *Portability*); its two
+    // axes run in full elsewhere: 32-bit on i386 and ARM, big-endian on
+    // s390x.
+    if (@import("builtin").cpu.arch.isMIPS32()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var ctx: zstd.Compressor = .init(gpa);
     defer ctx.deinit();
@@ -181,14 +186,14 @@ test "the jobs are threads: one frame is cut into several, posted to the pool" {
     // 512 KB jobs (a job size under the minimum counts as the minimum)
     try std.testing.expectEqual(zstdmt.job_size_min, mt.target_section_size);
     try std.testing.expectEqual(@as(usize, 4), mt.pool.threads.len);
-    try std.testing.expectEqual(@as(u64, 3), mt.pool.posted.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 3), mt.pool.finished.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), mt.pool.posted.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 3), mt.pool.finished.load(.monotonic));
     try std.testing.expect(mt.all_jobs_completed);
     // the next frame starts clean on the same threads
     in = .{ .src = src[0..700_000] };
     o.pos = 0;
     while (try s.compressStream2(&o, &in, .end) != 0) {}
-    try std.testing.expectEqual(@as(u64, 5), mt.pool.posted.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 5), mt.pool.posted.load(.monotonic));
     const back = try zstd.decompressAlloc(gpa, o.dst[0..o.pos], 700_000);
     defer gpa.free(back);
     try std.testing.expectEqualSlices(u8, src[0..700_000], back);

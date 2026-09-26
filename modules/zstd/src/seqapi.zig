@@ -247,15 +247,17 @@ pub fn transferWithBlockDelim(ss: *SeqStore, reps: Reps, p: *const Params, pos: 
             off_base = finalizeOffBase(in[idx].offset, &rep, ll0);
             updateRep(&rep, off_base, ll0);
         }
+        // (libzstd reads past the block here; the sum up to the delimiter
+        // is the block size in every caller, so this does not fire)
+        // (checked before the validation's running position, which would
+        // overflow a 32-bit usize first; either refusal is the same error)
+        if (@as(u64, lit_length) + match_length > block.len - ip) return error.ExternalSequencesInvalid;
         if (p.validate) {
             pos.pos_in_src += @as(usize, lit_length) + match_length;
             try validateSequence(off_base, match_length, p, pos.pos_in_src);
         }
         // Not enough memory allocated. Try adjusting ZSTD_c_minMatch.
         if (idx - pos.idx >= p.max_nb_seq) return error.ExternalSequencesInvalid;
-        // (libzstd reads past the block here; the sum up to the delimiter
-        // is the block size in every caller, so this does not fire)
-        if (@as(u64, lit_length) + match_length > block.len - ip) return error.ExternalSequencesInvalid;
         try storeSeq(ss, block[ip..][0..lit_length], off_base, match_length);
         ip += @as(usize, match_length) + lit_length;
     }
@@ -369,15 +371,17 @@ pub fn transferNoDelim(ss: *SeqStore, reps: Reps, p: *const Params, pos: *Positi
         const off_base = finalizeOffBase(raw_offset, &rep, ll0);
         updateRep(&rep, off_base, ll0);
 
+        // (libzstd reads past the block on lengths wrapped by the cuts
+        // above; not reachable from lengths that sum within 2^32)
+        // (checked before the validation's running position, which would
+        // overflow a 32-bit usize first; either refusal is the same error)
+        if (@as(u64, lit_length) + match_length > block.len - ip) return error.ExternalSequencesInvalid;
         if (p.validate) {
             pos.pos_in_src += @as(usize, lit_length) + match_length;
             try validateSequence(off_base, match_length, p, pos.pos_in_src);
         }
         // Not enough memory allocated. Try adjusting ZSTD_c_minMatch.
         if (idx - pos.idx >= p.max_nb_seq) return error.ExternalSequencesInvalid;
-        // (libzstd reads past the block on lengths wrapped by the cuts
-        // above; not reachable from lengths that sum within 2^32)
-        if (@as(u64, lit_length) + match_length > block.len - ip) return error.ExternalSequencesInvalid;
         try storeSeq(ss, block[ip..][0..lit_length], off_base, match_length);
         ip += @as(usize, match_length) + lit_length;
         if (!final_match_split) idx += 1; // Next Sequence
@@ -398,13 +402,14 @@ pub fn transferNoDelim(ss: *SeqStore, reps: Reps, p: *const Params, pos: *Positi
 
 /// `blockSize_explicitDelimiter`: the size of the block the sequences at
 /// `pos` describe, up to and including the next delimiter.
-fn blockSizeExplicitDelimiter(in: []const Sequence, pos: Position) Error!usize {
+fn blockSizeExplicitDelimiter(in: []const Sequence, pos: Position) Error!u64 {
     var end = false;
-    var block_size: usize = 0;
+    // (u64: lengths near 2^32 must be refused below, not overflow a 32-bit usize)
+    var block_size: u64 = 0;
     var spos: usize = pos.idx;
     while (spos < in.len) {
         end = in[spos].offset == 0;
-        block_size += @as(usize, in[spos].lit_length) + in[spos].match_length;
+        block_size += @as(u64, in[spos].lit_length) + in[spos].match_length;
         if (end) {
             // delimiter format error : both matchlength and offset must be == 0
             if (in[spos].match_length != 0) return error.ExternalSequencesInvalid;
@@ -423,7 +428,7 @@ pub fn determineBlockSize(mode: BlockDelimiters, block_size_max: usize, remainin
     const explicit = try blockSizeExplicitDelimiter(in, pos);
     if (explicit > block_size_max) return error.ExternalSequencesInvalid; // sequences incorrectly define a too large block
     if (explicit > remaining) return error.ExternalSequencesInvalid; // sequences define a frame longer than source
-    return explicit;
+    return @intCast(explicit);
 }
 
 /// `ZSTD_maybeRLE`: a block with this few sequences and literals may be
@@ -456,9 +461,9 @@ pub fn postProcessProducerResult(out: []Sequence, n_ext: usize, src_size: usize)
 
 /// `ZSTD_fastSequenceLengthSum`: every literal and match length, past the
 /// first delimiter too.
-pub fn fastSequenceLengthSum(seqs: []const Sequence) usize {
-    var lit_sum: usize = 0;
-    var match_sum: usize = 0;
+pub fn fastSequenceLengthSum(seqs: []const Sequence) u64 {
+    var lit_sum: u64 = 0;
+    var match_sum: u64 = 0;
     for (seqs) |s| {
         lit_sum += s.lit_length;
         match_sum += s.match_length;

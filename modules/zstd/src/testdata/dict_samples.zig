@@ -93,9 +93,9 @@ fn json(r: *Rng, out: []u8) void {
     while (i < out.len) {
         const s = std.fmt.bufPrint(&line, "{{\"id\":{d},\"name\":\"{s}\",\"tags\":[\"{s}\",\"{s}\"],\"ts\":{d},\"ok\":{s}}}\n", .{
             r.below(100000),
-            names[r.below(names.len)],
-            tags[r.below(tags.len)],
-            tags[r.below(tags.len)],
+            names[@as(usize, @intCast(r.below(names.len)))],
+            tags[@as(usize, @intCast(r.below(tags.len)))],
+            tags[@as(usize, @intCast(r.below(tags.len)))],
             1_700_000_000 + r.below(1_000_000),
             if (r.below(2) == 0) "true" else "false",
         }) catch unreachable;

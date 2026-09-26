@@ -266,7 +266,15 @@ test "after its end a stream goes on with a new frame of unknown size, as libzst
     const a = src[0 .. src.len / 3];
     const b = src[src.len / 3 ..];
     var sched_buf: [3][64]u8 = undefined;
-    for ([_]i32{ 1, 5, 12 }) |level| {
+    // One level, not three, on 32-bit MIPS: this loop's handful of
+    // `Stream.init`/`deinit` and one-shot `run` contexts is a fraction of
+    // `context_test.zig`'s churn, yet still reliably hits `qemu-mips`'s
+    // `page_find_range_empty` assertion there (confirmed absent under
+    // `qemu-i386`, unmodified -- SPEC.md Z12, *Portability*); one level
+    // still exercises the reused-context "goes on with a new frame of
+    // unknown size" path this test is about.
+    const test_levels = if (@import("builtin").cpu.arch.isMIPS32()) &[_]i32{5} else &[_]i32{ 1, 5, 12 };
+    for (test_levels) |level| {
         var s = try stream.Stream.init(gpa, .{ .level = level, .checksum = true, .pledged_size = a.len });
         defer s.deinit();
         var out: std.ArrayList(u8) = .empty;

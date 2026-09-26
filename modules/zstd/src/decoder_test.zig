@@ -6,6 +6,7 @@
 //! Whole-corpus decoding is in the golden and stream tests.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const zstd = @import("root.zig");
 
 const gpa = std.testing.allocator;
@@ -247,8 +248,15 @@ test "damaged frames give libzstd's verdict (mutation-sweep fixtures)" {
     const kats = @import("testdata/decode_kats.zig").kats;
     var d = try zstd.Decompressor.init(gpa, .{});
     defer d.deinit();
+    // libzstd's fast Huffman loop (and this port's) runs on 64-bit
+    // little-endian only; a few damaged frames get another verdict without it
+    const fast_loop = builtin.cpu.arch.endian() == .little and @sizeOf(usize) == 8;
     var failures: usize = 0;
-    for (kats) |k| {
+    for (kats) |kat| {
+        var k = kat;
+        if (!fast_loop) if (kat.expect_no_fast_loop) |e| {
+            k.expect = e;
+        };
         const bound = zstd.decompressBound(k.frame) catch |e| {
             if (!(k.expect == .err and k.expect.err == e)) {
                 std.debug.print("{s}: decompressBound {s}\n", .{ k.name, @errorName(e) });

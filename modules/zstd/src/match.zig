@@ -344,8 +344,12 @@ pub fn shiftSegment(seg: *[]const u8, base: *u32, correction: u32) void {
     }
 }
 
-/// `ZSTD_CURRENT_MAX` on 64-bit: past this index the indices are rescaled.
-pub const current_max: u32 = 3500 << 20;
+/// `ZSTD_CURRENT_MAX`: past this index the indices are rescaled. 3500 MiB
+/// on a 64-bit `usize` target, 2000 MiB on a 32-bit one — libzstd picks by
+/// `sizeof(size_t)` (`MEM_64bits()`, `zstd_compress_internal.h`), since a
+/// 32-bit build has less address space to keep a stale window mapped in
+/// while it waits to rescale.
+pub const current_max: u32 = if (@sizeOf(usize) == 4) 2000 << 20 else 3500 << 20;
 
 /// `ZSTD_window_canOverflowCorrect`.
 fn canOverflowCorrect(n_corrections: u32, cycle_log: u32, max_dist: u32, loaded_dict_end: u32, curr: u32) bool {
@@ -1873,4 +1877,13 @@ test "frequent correction backs off with each correction made" {
     try std.testing.expect(needOverflowCorrection(true, 0, 12, 1 << 14, 0, 20483, 20484));
     try std.testing.expect(!needOverflowCorrection(true, 2, 12, 1 << 14, 0, 3 * 20482, 3 * 20482 + 1));
     try std.testing.expect(needOverflowCorrection(true, 2, 12, 1 << 14, 0, 3 * 20482 + 1, 3 * 20482 + 2));
+}
+
+test "current_max matches libzstd's ZSTD_CURRENT_MAX for this target's usize width" {
+    // SPEC.md Z12: 3500 MiB on 64-bit (`sizeof(size_t) == 8`), 2000 MiB on
+    // 32-bit -- `zstd_compress_internal.h`'s `ZSTD_CURRENT_MAX`. Written as
+    // the literal libzstd picks, not by re-deriving `current_max`'s own
+    // formula, so a change to one side cannot silently agree with itself.
+    const want: u32 = if (@sizeOf(usize) == 4) 2000 << 20 else 3500 << 20;
+    try std.testing.expectEqual(want, current_max);
 }

@@ -1814,7 +1814,10 @@ test "the memory ceiling refuses before allocating anything" {
     low.memory_limit = @intCast(need);
     try testing.expectError(error.OutOfMemory, coverContentInto(fa.allocator(), &dict, s, low)); // it tried
     const fp: FastCoverParams = .{ .k = 200, .d = 8, .f = 31 };
-    try testing.expectEqual((@as(u64, 1) << 31) * 6 + (s.sizes.len + 1) * 8, estimateFastCoverMemory(s.sizes.len, fp));
+    // `* @sizeOf(usize)`, not a bare `8`: `FastCoverContext.memory` mirrors
+    // libzstd's `sizeof(size_t)`-sized per-sample entries (SPEC.md Z12),
+    // 4 bytes on a 32-bit target instead of 8.
+    try testing.expectEqual((@as(u64, 1) << 31) * 6 + (s.sizes.len + 1) * @sizeOf(usize), estimateFastCoverMemory(s.sizes.len, fp));
     try testing.expectError(error.MemoryLimitExceeded, fastCoverContentInto(fa.allocator(), &dict, s, fp));
     // the default ceiling holds cover over ~30 MB of samples, not over 40
     try testing.expect(estimateCoverMemory(30 << 20, 1000, .{ .k = 1000, .d = 8 }) <= default_memory_limit);

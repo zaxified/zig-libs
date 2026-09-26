@@ -61,13 +61,17 @@ pub fn rle(dst: []u8, src: []const u8) usize {
 /// `ZSTD_minLiteralsToCompress`: 8 bytes for btultra2, twice as many for
 /// each faster strategy up to 64; 6 with a dictionary's table.
 fn minLiteralsToCompress(strategy: u32, repeat: huf.Repeat) usize {
-    const shift: u6 = @intCast(@min(9 - strategy, 3));
+    // `usize`, not a fixed `u6`: the shift amount type must be
+    // `Log2Int(usize)`, which is `u5` on a 32-bit target -- a bare `u6`
+    // (correct only for a 64-bit `usize`) fails to compile there
+    // (CONVENTIONS.md, `check-portable`'s reason for existing at all).
+    const shift: std.math.Log2Int(usize) = @intCast(@min(9 - strategy, 3));
     return if (repeat == .valid) 6 else @as(usize, 8) << shift;
 }
 
 /// `ZSTD_minGain`.
 pub fn minGain(src_size: usize, strategy: u32) usize {
-    const min_log: u6 = if (strategy >= 8) @intCast(strategy - 1) else 6;
+    const min_log: std.math.Log2Int(usize) = if (strategy >= 8) @intCast(strategy - 1) else 6;
     return (src_size >> min_log) + 2;
 }
 

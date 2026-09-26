@@ -37,8 +37,13 @@ pub const default_level = 3;
 
 const window_log_absolute_min = 10;
 pub const hash_log_min = 6;
-/// `ZSTD_WINDOWLOG_MAX` (64-bit).
-pub const window_log_max = 31;
+/// `ZSTD_WINDOWLOG_MAX`: `ZSTD_WINDOWLOG_MAX_64` (31) on a 64-bit `usize`
+/// target, `ZSTD_WINDOWLOG_MAX_32` (30) on a 32-bit one — libzstd picks by
+/// `sizeof(size_t)`, and a Zig cross-compile's `usize` is the equivalent
+/// knob. Feeds the advanced-parameter bound check and the automatic
+/// dictionary+window log below, so a 32-bit build clamps one step lower,
+/// same as a 32-bit libzstd build.
+pub const window_log_max = if (@sizeOf(usize) == 4) 30 else 31;
 /// `ZSTD_ROW_HASH_TAG_BITS`.
 pub const row_hash_tag_bits = 8;
 
@@ -365,8 +370,10 @@ pub const Format = enum {
 /// (`ZSTD_cParam_getBounds`, 64-bit): a value outside them is
 /// `error.ParameterOutOfBound`, where libzstd refuses to set it.
 pub const Advanced = struct {
-    /// `ZSTD_c_windowLog`, 10..31: the largest back-reference distance, and
-    /// the window a decoder must hold. The input's size still shrinks it.
+    /// `ZSTD_c_windowLog`, 10..31 (10..30 on a 32-bit `usize` target --
+    /// `window_log_max`, SPEC.md *Portability*): the largest back-reference
+    /// distance, and the window a decoder must hold. The input's size
+    /// still shrinks it.
     window_log: ?u32 = null,
     /// `ZSTD_c_hashLog`, 6..30.
     hash_log: ?u32 = null,
@@ -683,4 +690,11 @@ test "the row match finder takes over above a 16 KB window" {
     const large = get(5, 16 * 1024 + 1);
     try std.testing.expect(useRowMatchFinder(large));
     try std.testing.expectEqual(Strategy.lazy, get(6, 1 << 20).strategy);
+}
+
+test "window_log_max matches libzstd's ZSTD_WINDOWLOG_MAX for this target's usize width" {
+    // SPEC.md Z12: `lib/zstd.h`'s `ZSTD_WINDOWLOG_MAX_64` (31) /
+    // `_32` (30), picked by `sizeof(size_t)`.
+    const want: u32 = if (@sizeOf(usize) == 4) 30 else 31;
+    try std.testing.expectEqual(want, window_log_max);
 }

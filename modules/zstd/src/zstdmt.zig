@@ -173,7 +173,7 @@ const Job = struct {
 
     /// `ZSTDMT_compressionJob`, on `cctx`. `finished` counts the pool's
     /// completed jobs (bumped before the job is published complete).
-    fn run(job: *Job, cctx: *frame.Compressor, finished: ?*std.atomic.Value(u64)) void {
+    fn run(job: *Job, cctx: *frame.Compressor, finished: ?*std.atomic.Value(u32)) void {
         var last_c: usize = 0;
         job.compress(cctx, &last_c) catch |e| {
             job.err = e;
@@ -245,13 +245,28 @@ const Job = struct {
 const Pool = struct {
     threads: []std.Thread = &.{},
     queue: []*Job = &.{},
-    posted: std.atomic.Value(u64) = .init(0),
-    taken: std.atomic.Value(u64) = .init(0),
-    finished: std.atomic.Value(u64) = .init(0),
+    // `unsigned` (32-bit) in libzstd's own `nextJobID`/`doneJobID`
+    // (`zstdmt_compress.c`) -- not just matching that width but required by
+    // it: a 32-bit target (`check-portable`'s `.linux32`) has no native
+    // 64-bit atomic ops, and `std.atomic.Value(u64)` fails to compile there
+    // (`std/atomic.zig`'s `@atomicLoad`/`Store`/`Rmw` need <= register
+    // width). A `u32` sequence wrapping around would need over 4 billion
+    // jobs in one compression -- unreachable at any realistic job size.
+    posted: std.atomic.Value(u32) = .init(0),
+    taken: std.atomic.Value(u32) = .init(0),
+    finished: std.atomic.Value(u32) = .init(0),
     /// The futex word idle workers sleep on.
     wake_seq: std.atomic.Value(u32) = .init(0),
     shutdown: std.atomic.Value(bool) = .init(false),
     cctxs: []frame.Compressor = &.{},
+
+    /// `queue.len` is the worker count -- a handful, always representable
+    /// in `u32` -- so a sequence number's slot is a `u32 % u32` (matching
+    /// `posted`/`taken`/`finished`'s own width), cast to `usize` only at
+    /// the very end, for the index.
+    fn slot(pool: *Pool, seq_no: u32) usize {
+        return seq_no % @as(u32, @intCast(pool.queue.len));
+    }
 
     fn worker(pool: *Pool, idx: usize) void {
         while (true) {
@@ -260,7 +275,7 @@ const Pool = struct {
             const t = pool.taken.load(.acquire);
             if (t < pool.posted.load(.acquire)) {
                 if (pool.taken.cmpxchgWeak(t, t + 1, .acq_rel, .monotonic) == null)
-                    pool.queue[@intCast(t % pool.queue.len)].run(&pool.cctxs[idx], &pool.finished);
+                    pool.queue[pool.slot(t)].run(&pool.cctxs[idx], &pool.finished);
                 continue;
             }
             Futex.wait(&pool.wake_seq, seq);
@@ -269,8 +284,8 @@ const Pool = struct {
 
     fn tryAdd(pool: *Pool, job: *Job) bool {
         const p = pool.posted.load(.monotonic);
-        if (p - pool.finished.load(.acquire) >= pool.threads.len) return false;
-        pool.queue[@intCast(p % pool.queue.len)] = job;
+        if (p - pool.finished.load(.acquire) >= @as(u32, @intCast(pool.threads.len))) return false;
+        pool.queue[pool.slot(p)] = job;
         pool.posted.store(p + 1, .release);
         _ = pool.wake_seq.fetchAdd(1, .release);
         Futex.wake(&pool.wake_seq, 1);

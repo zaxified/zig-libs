@@ -99,7 +99,18 @@ pub const FrameWriter = struct {
     /// All input passes through the buffer, so frame boundaries depend on
     /// the buffer length and the flushes, not on how the writes were cut.
     fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
-        const fw: *FrameWriter = @fieldParentPtr("writer", w);
+        // `@alignCast`: on `mips-linux-musl` (soft-float, `check-portable`'s
+        // `.linux32`) `@fieldParentPtr` alone reports the result as only
+        // 2-aligned and refuses to widen it back to `*FrameWriter`'s
+        // alignment, even though `writer`'s actual offset in `FrameWriter`
+        // is a multiple of 8 there (`@offsetOf`, checked by hand) -- a
+        // conservative bound `@fieldParentPtr` computes for this target's
+        // pointer ABI, not a real alignment hazard: `w` always points at
+        // the `writer` field of an actual `FrameWriter` value (`init`
+        // returns the struct by value with `writer` embedded in it, and
+        // nothing else ever constructs one), so the parent is genuinely
+        // aligned.
+        const fw: *FrameWriter = @alignCast(@fieldParentPtr("writer", w));
         const before = w.end;
         _ = w.fixedDrain(data, splat) catch {}; // fills the buffer; the rest waits
         const consumed = w.end - before;
@@ -110,7 +121,7 @@ pub const FrameWriter = struct {
     /// Buffered bytes become a frame. Nothing buffered, no frame: a flush
     /// never emits an empty one. `output` is not flushed.
     fn flush(w: *Writer) Writer.Error!void {
-        const fw: *FrameWriter = @fieldParentPtr("writer", w);
+        const fw: *FrameWriter = @alignCast(@fieldParentPtr("writer", w));
         if (w.end != 0) try fw.emit();
     }
 };

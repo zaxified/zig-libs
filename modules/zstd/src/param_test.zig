@@ -204,10 +204,16 @@ test "parameters outside libzstd's bounds are refused, its edges accepted" {
     var buf: [128]u8 = undefined; // compressBound(3) is 66
     // ZSTD_cParam_getBounds, 64-bit
     const edges = [_]struct { ok: []const zstd.Advanced, bad: []const zstd.Advanced }{
-        .{ .ok = &.{ .{ .window_log = 10 }, .{ .window_log = 31 } }, .bad = &.{ .{ .window_log = 9 }, .{ .window_log = 32 } } },
+        // `params.window_log_max`, not a bare `31`: 30 on a 32-bit `usize`
+        // target (SPEC.md Z12, *Portability*), one below libzstd's 64-bit
+        // edge.
+        .{ .ok = &.{ .{ .window_log = 10 }, .{ .window_log = params.window_log_max } }, .bad = &.{ .{ .window_log = 9 }, .{ .window_log = params.window_log_max + 1 } } },
         .{ .ok = &.{ .{ .hash_log = 6 }, .{ .hash_log = 30 } }, .bad = &.{ .{ .hash_log = 5 }, .{ .hash_log = 31 } } },
         .{ .ok = &.{ .{ .chain_log = 6 }, .{ .chain_log = 30 } }, .bad = &.{ .{ .chain_log = 5 }, .{ .chain_log = 31 } } },
-        .{ .ok = &.{ .{ .search_log = 1 }, .{ .search_log = 30 } }, .bad = &.{ .{ .search_log = 0 }, .{ .search_log = 31 } } },
+        // `params.search_log_max` (`ZSTD_SEARCHLOG_MAX` =
+        // `ZSTD_WINDOWLOG_MAX - 1`): 29 on a 32-bit target, not the
+        // 64-bit-only bare `30`.
+        .{ .ok = &.{ .{ .search_log = 1 }, .{ .search_log = params.search_log_max } }, .bad = &.{ .{ .search_log = 0 }, .{ .search_log = params.search_log_max + 1 } } },
         .{ .ok = &.{ .{ .min_match = 3 }, .{ .min_match = 7 } }, .bad = &.{ .{ .min_match = 2 }, .{ .min_match = 8 } } },
         .{ .ok = &.{ .{ .target_length = 0 }, .{ .target_length = 131072 } }, .bad = &.{.{ .target_length = 131073 }} },
         .{ .ok = &.{.{ .block_splitter_level = 6 }}, .bad = &.{.{ .block_splitter_level = 7 }} },
@@ -216,7 +222,10 @@ test "parameters outside libzstd's bounds are refused, its edges accepted" {
         .{ .ok = &.{ .{ .ldm_hash_log = 0 }, .{ .ldm_hash_log = 6 }, .{ .ldm_hash_log = 30 } }, .bad = &.{ .{ .ldm_hash_log = 5 }, .{ .ldm_hash_log = 31 } } },
         .{ .ok = &.{ .{ .ldm_min_match = 0 }, .{ .ldm_min_match = 4 }, .{ .ldm_min_match = 4096 } }, .bad = &.{ .{ .ldm_min_match = 3 }, .{ .ldm_min_match = 4097 } } },
         .{ .ok = &.{ .{ .ldm_bucket_size_log = 0 }, .{ .ldm_bucket_size_log = 1 }, .{ .ldm_bucket_size_log = 8 } }, .bad = &.{.{ .ldm_bucket_size_log = 9 }} },
-        .{ .ok = &.{ .{ .ldm_hash_rate_log = 0 }, .{ .ldm_hash_rate_log = 25 } }, .bad = &.{.{ .ldm_hash_rate_log = 26 }} },
+        // `params.ldm_hash_rate_log_max` (`ZSTD_LDM_HASHRATELOG_MAX` =
+        // `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`): 24 on a 32-bit target,
+        // not the 64-bit-only bare `25`.
+        .{ .ok = &.{ .{ .ldm_hash_rate_log = 0 }, .{ .ldm_hash_rate_log = params.ldm_hash_rate_log_max } }, .bad = &.{.{ .ldm_hash_rate_log = params.ldm_hash_rate_log_max + 1 }} },
         // below 1340 counts as 1340, as in libzstd
         .{ .ok = &.{ .{ .target_c_block_size = 0 }, .{ .target_c_block_size = 1 }, .{ .target_c_block_size = 131072 } }, .bad = &.{.{ .target_c_block_size = 131073 }} },
     };

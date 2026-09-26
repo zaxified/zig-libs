@@ -5,6 +5,22 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — Portability (SPEC backlog Z12): `meta.targets` gains
+  `.linux32` and `.windows`; the test suite runs green under qemu on i386,
+  ARM, s390x (big-endian) and mips (32-bit big-endian, soft-float), and
+  the output on 32-bit little-endian was diffed against a real i386
+  libzstd (249 combinations, identical). **BEHAVIOURAL, not breaking**
+  on big-endian and 32-bit hosts only (`.linux64` output unchanged):
+  the row match finder's tag mask came out bit-reversed on big-endian
+  (`greedy`…`lazy2` above a 16 KB window gave another, still valid,
+  frame); `window_log_max` and `ZSTD_CURRENT_MAX` now take libzstd's
+  32-bit values there; the sequence API refused lengths near 2^32 on
+  64-bit but overflowed on 32-bit (now refused everywhere). The
+  pre-splitter's hash stays little-endian on purpose (identical to
+  little-endian libzstd; a big-endian libzstd differs where it presplits).
+  Three damaged-frame fixtures give libzstd's own other verdict off
+  64-bit little-endian, where neither has the fast Huffman loop.
+
 - **2026-09-25** — the sequence-level API (SPEC backlog Z10):
   `Compressor.compressSequences`, `compressSequencesAndLiterals`,
   `generateSequences`, `sequenceBound`, `mergeBlockDelimiters`, a
