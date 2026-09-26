@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-08-31** — `isAdoptable` (whether an incoming ID would be adopted)
+  and `generateInto` (a fresh ID into a caller-owned buffer, nothing
+  request-scoped kept) are public, for callers outside the middleware.
+  (Entry added 2026-09-26: the change shipped without one.)
 - **2026-07-19** — Security audit: one finding fixed (part of the collection-wide audit;
   the root changelog records no further detail than this). Modeled on nginx
   `$request_id`, Envoy `x-request-id`, chi `middleware.RequestID` (design reference, not

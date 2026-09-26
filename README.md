@@ -253,7 +253,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 
 Every one of the 232 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 232 modules — a linux64-only module has nothing further to show here.
 
-38 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 39 declared pairs, 38 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
+39 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 41 declared pairs, 40 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
 **A blank cell means the module never claimed that target.** That is a different fact from a `known-failing` cell next to it — one is an absent claim, the other is a claim currently broken and tracked — and this table exists so the two are never shown as the same thing.
 
@@ -299,6 +299,7 @@ Every one of the 232 modules above claims `.linux64` (Linux, amd64 or arm64) —
 | `uci` | compiles | — | — |
 | `wireguard` | known-failing | — | — |
 | `zipstream` | — | compiles | — |
+| `zstd` | compiles | compiles | — |
 
 <!-- END GENERATED: check-portable-table -->
 
@@ -365,7 +366,7 @@ way to recognise it.
 | [`p256`](modules/p256/README.md) *(crypto)* | asm-accelerated NIST P-256 — Solinas field, constant-time comb sign, vartime wNAF verify; bit-exact vs `std.crypto.ecc.P256` and RFC 6979. | amd64 asm + portable fallback | — |
 | [`protobuf`](modules/protobuf/README.md) *(format)* | Protocol Buffers wire format (proto3) codec — schema derived at comptime from Zig structs, no `.proto` compiler; untrusted-input hardened. | any | — |
 | [`rsa`](modules/rsa/README.md) *(crypto)* | Pure-Zig RSA (PKCS#1 v2.2, RFC 8017) — keygen, PKCS1-v1.5/PSS sign+verify, OAEP/PKCS1 encrypt+decrypt, DER/PEM/OpenSSH key parsing. | any | montint |
-| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
+| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
 
 ### Networking
 
@@ -485,7 +486,7 @@ way to recognise it.
 | Module | What it does | Platform | Deps |
 |---|---|---|---|
 | [`hashdigest`](modules/hashdigest/README.md) *(crypto)* | Streaming digests — one-shot, incremental, and file hashing; SHA-256 convenience plus a multi-algorithm SHA-2/SHA-3/BLAKE2b/BLAKE3 layer. | any | — |
-| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
+| [`zstd`](modules/zstd/README.md) *(format)* | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
 
 ### Crypto
 
@@ -598,7 +599,7 @@ way to recognise it.
 | [`tz`](modules/tz/README.md) | IANA time-zone offset lookup — zone name → UTC offset/DST at a given instant (598 zones + POSIX-TZ footer). | any | datefmt |
 | [`yaml`](modules/yaml/README.md) | YAML 1.2 reader (not 1.1) — scanner → parser → composer over the core schema (no `yes`/`no` booleans); cyclic aliases rejected. | any | — |
 | [`zipstream`](modules/zipstream/README.md) | Streaming ZIP archive reader — walks the central directory once, streams decompressed member bytes on demand. | any | — |
-| [`zstd`](modules/zstd/README.md) | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
+| [`zstd`](modules/zstd/README.md) | Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries | any | — |
 
 **Also worth reaching for from `format`** — these are filed under another library (in brackets), and appear here because a consumer working in `format` has a use for them:
 
