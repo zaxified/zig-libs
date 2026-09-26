@@ -16,11 +16,18 @@ const ldm = @import("ldm.zig");
 const superblock = @import("superblock.zig");
 const cdict_mod = @import("cdict.zig");
 const CDict = cdict_mod.CDict;
+const seqapi = @import("seqapi.zig");
+pub const SequenceProducer = seqapi.SequenceProducer;
 
 pub const Error = error{
     /// `dst` is smaller than `compressBound(src.len)`.
     NoSpaceLeft,
-} || BeginError;
+} || BeginError || BlockError;
+
+/// What compressing a block can fail with: only with an external sequence
+/// producer (`Options.sequence_producer`) or while collecting sequences
+/// (`Compressor.generateSequences`), see seqapi.zig.
+pub const BlockError = seqapi.Error;
 
 /// What setting a context up for a frame can fail with.
 pub const BeginError = error{
@@ -33,6 +40,9 @@ pub const BeginError = error{
     DictAttachUnsupported,
     /// Level above `params.max_level` (for a context's own `CDict`).
     LevelUnsupported,
+    /// `parameter_combination_unsupported`: a sequence producer with
+    /// workers (`Advanced.nb_workers`), which libzstd refuses.
+    ParameterCombinationUnsupported,
 } || params.Advanced.CheckError || cdict_mod.Error;
 
 /// `ZSTD_compressBound`.
@@ -81,6 +91,11 @@ const Ctx = struct {
     /// frame, consumed block by block (`ZSTD_referenceExternalSequences`;
     /// multithreaded compression generates them serially across jobs).
     extern_seqs: ldm.RawSeqStore = .{},
+    /// External sequences (seqapi.zig): the settings, the producer's
+    /// buffer (`extSeqBuf`) and `ZSTD_generateSequences`' collector.
+    seq: seqapi.Params = .{},
+    ext_seqs: []seqapi.Sequence = &.{},
+    collector: ?*seqapi.Collector = null,
 
     /// The match state's index of `block`, which lies in its prefix.
     fn index(c: *const Ctx, block: []const u8) u32 {
@@ -182,13 +197,19 @@ const EntropyError = error{ DstSizeTooSmall, Generic };
 
 /// `ZSTD_entropyCompressSeqStore_internal`.
 fn entropyCompressInternal(c: *Ctx, ss: *sequences.SeqStore, dst: []u8) EntropyError!usize {
+    return entropyCompressLits(c, ss, ss.lits[0..ss.n_lit], dst);
+}
+
+/// `ZSTD_entropyCompressSeqStore_internal` with the literals given apart
+/// from the store (`ZSTD_compressSequencesAndLiterals`).
+fn entropyCompressLits(c: *Ctx, ss: *sequences.SeqStore, lits: []const u8, dst: []u8) EntropyError!usize {
     const n_seq = ss.n_seq;
     var op: usize = 0;
 
     // Compress literals
     {
-        const suspect_uncompressible = n_seq == 0 or ss.n_lit / n_seq >= 20;
-        op += try literals.compress(dst, ss.lits[0..ss.n_lit], &c.prev.huf, &c.next.huf, c.strategy, c.disable_literal_compression, suspect_uncompressible);
+        const suspect_uncompressible = n_seq == 0 or lits.len / n_seq >= 20;
+        op += try literals.compress(dst, lits, &c.prev.huf, &c.next.huf, c.strategy, c.disable_literal_compression, suspect_uncompressible);
     }
 
     // Sequences header
@@ -240,9 +261,10 @@ fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usiz
     return c_size;
 }
 
-/// `ZSTD_buildSeqStore`: run the match finder over the block. Returns false
-/// for a block too small to try (`ZSTDbss_noCompress`).
-fn buildSeqStore(c: *Ctx, block: []const u8) bool {
+/// `ZSTD_buildSeqStore`: run the match finder (or the external sequence
+/// producer) over the block. Returns false for a block too small to try
+/// (`ZSTDbss_noCompress`).
+fn buildSeqStore(c: *Ctx, block: []const u8) BlockError!bool {
     // don't even attempt compression below a certain srcSize
     if (block.len < min_cblock_size + block_header_size + 1 + 1) {
         if (c.strategy >= @intFromEnum(params.Strategy.btopt))
@@ -259,14 +281,22 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
     if (istart > c.ms.next_to_update + 384)
         c.ms.next_to_update = istart - @min(192, istart - c.ms.next_to_update - 384);
     c.next.rep = c.prev.rep;
-    const last_ll = if (c.extern_seqs.pos < c.extern_seqs.size)
-        ldm.blockCompress(&c.extern_seqs, &c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len))
-    else if (c.ldm) |ls| blk: {
+    const last_ll = if (c.extern_seqs.pos < c.extern_seqs.size) blk: {
+        // External matchfinder + LDM is technically possible, just not
+        // implemented yet (libzstd).
+        if (c.seq.producer != null) return error.ParameterCombinationUnsupported;
+        break :blk ldm.blockCompress(&c.extern_seqs, &c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
+    } else if (c.ldm) |ls| blk: {
+        if (c.seq.producer != null) return error.ParameterCombinationUnsupported;
         var ldm_seq_store: ldm.RawSeqStore = .{ .seq = c.ldm_seqs };
         ls.generateSequences(&ldm_seq_store, block);
         const n = ldm.blockCompress(&ldm_seq_store, &c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
         std.debug.assert(ldm_seq_store.pos == ldm_seq_store.size);
         break :blk n;
+    } else if (c.seq.producer != null) blk: {
+        if (try seqapi.produceBlock(&c.ss, .{ .prev = &c.prev.rep, .next = &c.next.rep }, &c.seq, c.ext_seqs, block)) return true;
+        // Fallback to software matchfinder
+        break :blk match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
     } else match.compressBlock(&c.ms, &c.ss, &c.next.rep, istart, @intCast(block.len));
     c.ss.storeLastLiterals(block[block.len - last_ll ..]);
     return true;
@@ -274,22 +304,27 @@ fn buildSeqStore(c: *Ctx, block: []const u8) bool {
 
 /// `ZSTD_compressBlock_internal` (frame mode). Returns 0 for "store raw", 1 for
 /// "RLE" (`dst[0]` holds the byte), otherwise the compressed block size.
-fn compressBlock(c: *Ctx, dst: []u8, block: []const u8) usize {
+fn compressBlock(c: *Ctx, dst: []u8, block: []const u8) BlockError!usize {
     return compressBlockMode(c, dst, block, true);
 }
 
 /// `ZSTD_compressBlock_internal`; outside a frame (`frame` 0,
 /// `ZSTD_compressBlock_deprecated`) a block is never turned into RLE.
-fn compressBlockMode(c: *Ctx, dst: []u8, block: []const u8, frame_mode: bool) usize {
+fn compressBlockMode(c: *Ctx, dst: []u8, block: []const u8, frame_mode: bool) BlockError!usize {
     var c_size: usize = 0;
-    if (buildSeqStore(c, block)) {
+    if (try buildSeqStore(c, block)) {
+        if (c.collector) |col| {
+            try col.copyBlockSequences(&c.ss, c.prev.rep);
+            std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
+            return 0;
+        }
         c_size = entropyCompress(c, &c.ss, dst, block.len);
         if (frame_mode and !c.is_first_block and c_size < rle_max_length and isRle(block)) {
             c_size = 1;
             dst[0] = block[0];
         }
         if (c_size > 1) std.mem.swap(*BlockState, &c.prev, &c.next);
-    }
+    } else if (c.collector != null) return error.SequenceProducerFailed; // Uncompressible block
     offcodeValidToCheck(c);
     return c_size;
 }
@@ -315,11 +350,17 @@ fn emitBlock(out: []u8, src: []const u8, c_size: usize, last_block: u32) usize {
 
 /// `ZSTD_compressSeqStore_singleBlock`: one block from the sequences in `ss`
 /// covering `src`. Returns the bytes written, header included.
-fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: *[3]u32, out: []u8, src: []const u8, last_block: u32, is_partition: bool) usize {
+fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: *[3]u32, out: []u8, src: []const u8, last_block: u32, is_partition: bool) BlockError!usize {
     const d_rep_original = d_rep.*;
     if (is_partition) blocksplit.resolveOffCodes(d_rep, c_rep, ss);
     var c_seqs_size = entropyCompress(c, ss, out[block_header_size..], src.len);
     if (!c.is_first_block and c_seqs_size < rle_max_length and isRle(src)) c_seqs_size = 1;
+    // Sequence collection not supported when block splitting
+    if (c.collector) |col| {
+        try col.copyBlockSequences(ss, d_rep_original);
+        std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
+        return 0;
+    }
     if (c_seqs_size > 1) {
         std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
     } else {
@@ -332,9 +373,9 @@ fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: 
 /// `ZSTD_compressBlock_targetCBlockSize`: one block of input, emitted as
 /// sub-blocks of about `targetCBlockSize` compressed bytes each
 /// (`superblock.zig`), else as one raw block. Returns the bytes written.
-fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usize {
+fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block: u32) BlockError!usize {
     defer offcodeValidToCheck(c);
-    if (buildSeqStore(c, src)) {
+    if (try buildSeqStore(c, src)) {
         // We don't want to emit our first block as a RLE even if it
         // qualifies because doing so will cause the decoder (cli only) to
         // throw a "should consume all input error." This is only an issue
@@ -363,10 +404,11 @@ fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block
 
 /// `ZSTD_compressBlock_splitBlock`: one block of input, emitted as one or
 /// more blocks. Returns the bytes written, headers included.
-fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usize {
+fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) BlockError!usize {
     const block_size = src.len;
-    if (!buildSeqStore(c, src)) {
+    if (!try buildSeqStore(c, src)) {
         offcodeValidToCheck(c);
+        if (c.collector != null) return error.SequenceProducerFailed; // Uncompressible block
         return emitBlock(out, src, 0, last_block);
     }
 
@@ -396,7 +438,7 @@ fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) usiz
         } else {
             next_chunk = blocksplit.deriveChunk(&c.ss, partitions[i], partitions[i + 1]);
         }
-        op += compressSingleBlock(c, &curr, &d_rep, &c_rep, out[op..], src[ip..][0..src_bytes], last_block_entire_src, true);
+        op += try compressSingleBlock(c, &curr, &d_rep, &c_rep, out[op..], src[ip..][0..src_bytes], last_block_entire_src, true);
         ip += src_bytes;
         curr = next_chunk;
     }
@@ -422,6 +464,12 @@ pub const Options = struct {
     /// The dictionary, as libzstd has it set on the context before
     /// `ZSTD_compress2` / `ZSTD_compressStream2`.
     dict: Dict = .none,
+    /// `ZSTD_registerSequenceProducer`: a block-level sequence producer
+    /// run in place of the level's match finder (seqapi.zig).
+    sequence_producer: ?seqapi.SequenceProducer = null,
+    /// `ZSTD_generateSequences`' collector (`zc->seqCollector`): each
+    /// block's sequences are copied there and the block is stored raw.
+    collector: ?*seqapi.Collector = null,
 };
 
 /// A dictionary for a frame: libzstd's `ZSTD_CCtx_loadDictionary_advanced`,
@@ -528,6 +576,8 @@ const Layout = struct {
     ldm_buckets: usize = 0,
     ldm_seqs: usize = 0,
     ldm_n_seqs: usize = 0,
+    ext_seqs: usize = 0,
+    ext_n_seqs: usize = 0,
     seqs: usize = 0,
     codes: usize = 0,
     lits: usize = 0,
@@ -560,8 +610,8 @@ const Layout = struct {
             .block_size_max = block_size_max,
             .window_size = window_size,
             // ZSTD_maxNbSeq: every sequence carries a match of at least
-            // min_match bytes
-            .max_n_seq = block_size_max / @as(usize, if (cp.min_match == 3) 3 else 4) + 1,
+            // min_match bytes (3 from an external producer)
+            .max_n_seq = block_size_max / seqDivider(cp, opts) + 1,
             .ldm_params = ldm_params,
         };
         var off = l.tablesBytes();
@@ -578,6 +628,11 @@ const Layout = struct {
             l.ldm_n_seqs = ldm.maxNbSeq(lp, block_size_max);
             l.ldm_seqs = place(&off, ldm.RawSeq, l.ldm_n_seqs, @alignOf(ldm.RawSeq));
         }
+        // reserve space for block-level external sequences
+        if (opts.sequence_producer != null) {
+            l.ext_n_seqs = seqapi.sequenceBound(block_size_max);
+            l.ext_seqs = place(&off, seqapi.Sequence, l.ext_n_seqs, @alignOf(seqapi.Sequence));
+        }
         l.seqs = place(&off, sequences.SeqDef, l.max_n_seq, @alignOf(sequences.SeqDef));
         l.codes = place(&off, u8, 3 * l.max_n_seq, 1);
         l.lits = place(&off, u8, block_size_max, 1);
@@ -590,6 +645,11 @@ const Layout = struct {
         }
         l.total = std.mem.alignForward(usize, off, workspace_alignment);
         return l;
+    }
+
+    /// `ZSTD_maxNbSeq`'s divider.
+    fn seqDivider(cp: params.CParams, opts: Options) usize {
+        return if (cp.min_match == 3 or opts.sequence_producer != null) 3 else 4;
     }
 
     fn place(off: *usize, comptime T: type, n: usize, alignment: usize) usize {
@@ -732,8 +792,11 @@ pub const Compressor = struct {
         return comp.finishFrame(out, src, opts);
     }
 
-    fn finishFrame(comp: *Compressor, out: []u8, src: []const u8, opts: Options) usize {
-        const n = comp.compressContinue(out, src, true) catch unreachable; // pledged is src.len
+    fn finishFrame(comp: *Compressor, out: []u8, src: []const u8, opts: Options) BlockError!usize {
+        const n = comp.compressContinue(out, src, true) catch |err| switch (err) {
+            error.SrcSizeWrong => unreachable, // pledged is src.len
+            else => |e| return e,
+        };
         const m = comp.writeEpilogue(out[n..]);
         if (opts.overflow_corrections) |oc| oc.* = .{ comp.c.ms.n_overflow_corrections, if (comp.c.ldm) |ls| ls.n_overflow_corrections else 0 };
         return n + m;
@@ -815,7 +878,7 @@ pub const Compressor = struct {
     /// size; `seqStore` then holds its sequences. `src` above the
     /// context's block size is `error.SrcSizeWrong`. `dst` is the room
     /// the caller gives (libzstd's callers give `ZSTD_BLOCKSIZE_MAX`).
-    pub fn compressBlockOnly(comp: *Compressor, dst: []u8, src: []const u8) SizeError!usize {
+    pub fn compressBlockOnly(comp: *Compressor, dst: []u8, src: []const u8) (SizeError || BlockError)!usize {
         if (src.len > comp.block_size_max) return error.SrcSizeWrong; // input is larger than a block
         if (src.len == 0) return 0; // do not generate an empty block if no input
         const ms = &comp.c.ms;
@@ -827,7 +890,7 @@ pub const Compressor = struct {
         // overflow check and correction for block mode
         const bi = comp.c.index(src);
         _ = ms.overflowCorrectIfNeeded(comp.overflow_correct_frequently, bi, @as(usize, bi) + src.len);
-        const c_size = compressBlockMode(&comp.c, dst, src, false);
+        const c_size = try compressBlockMode(&comp.c, dst, src, false);
         comp.consumed += src.len;
         comp.produced += c_size;
         return c_size;
@@ -846,6 +909,9 @@ pub const Compressor = struct {
     pub fn initStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, buffered: bool, local: *?CDict) BeginError!void {
         const s = try comp.setupStream2(opts, pledged, size_hint, local);
         try comp.beginInternal(s.prefix, s.cdict, s.cp, pledged, s.opts, buffered);
+        // the external sequences' offsets may reach into a CDict's content
+        // (a prefix is cleared before they are read: single usage)
+        comp.c.seq.dict_size = if (s.cdict) |c| c.content.len else 0;
     }
 
     /// What `ZSTD_CCtx_init_compressStream2` settles before it begins a
@@ -896,6 +962,9 @@ pub const Compressor = struct {
         const cp = params.getFromCCtxParams(level, size, dict_size, mode, adv);
         var o = opts;
         o.level = level;
+        // If external matchfinder is enabled, make sure to fail before
+        // checking job size (for consistency)
+        if (opts.sequence_producer != null and adv.nb_workers >= 1) return error.ParameterCombinationUnsupported;
         return .{ .cp = cp, .opts = o, .prefix = prefix, .cdict = cdict };
     }
 
@@ -1169,6 +1238,20 @@ pub const Compressor = struct {
             .target_c_block_size = if (params.nonZero(adv.target_c_block_size)) |v| @max(v, superblock.target_c_block_size_min) else 0,
             .ldm = ldm_state,
             .ldm_seqs = slice(ldm.RawSeq, ws, l.ldm_seqs, l.ldm_n_seqs),
+            .seq = .{
+                .validate = adv.validate_sequences,
+                .repcode_resolution = seqapi.resolveRepcodeResolution(adv.repcode_resolution, appliedLevel(opts.level)),
+                .block_delimiters = adv.block_delimiters,
+                .fallback = adv.enable_seq_producer_fallback,
+                .producer = opts.sequence_producer,
+                .min_match = cp.min_match,
+                .window_log = cp.window_log,
+                // ZSTD_maxNbSeq (without the port's spare slot)
+                .max_nb_seq = l.block_size_max / Layout.seqDivider(cp, opts),
+                .level = appliedLevel(opts.level),
+            },
+            .ext_seqs = slice(seqapi.Sequence, ws, l.ext_seqs, l.ext_n_seqs),
+            .collector = opts.collector,
         };
         if (ldm_state) |ls| ls.buffer = comp.in_buff;
         const ms = &comp.c.ms;
@@ -1195,6 +1278,12 @@ pub const Compressor = struct {
         comp.initialized = true;
     }
 
+    /// `appliedParams.compressionLevel`: 0 is the default level, and
+    /// levels below the lowest are clamped (`ZSTD_CCtx_setParameter`).
+    fn appliedLevel(level: i32) i32 {
+        return if (level == 0) params.default_level else @max(level, params.min_level);
+    }
+
     fn slice(comptime T: type, ws: Workspace, at: usize, n: usize) []T {
         const p: [*]T = @ptrCast(@alignCast(ws.ptr + at));
         return p[0..n];
@@ -1205,7 +1294,7 @@ pub const Compressor = struct {
     /// marked last when `last_chunk`. `dst.len` is the room libzstd would
     /// have (a block that does not fit is stored raw), at least
     /// `compressBound(chunk.len)` plus the header. Returns the bytes written.
-    pub fn compressContinue(comp: *Compressor, dst: []u8, chunk: []const u8, last_chunk: bool) SizeError!usize {
+    pub fn compressContinue(comp: *Compressor, dst: []u8, chunk: []const u8, last_chunk: bool) (SizeError || BlockError)!usize {
         var fh_size: usize = 0;
         if (comp.stage == .init) {
             fh_size = writeFrameHeader(dst, comp.cp, comp.headerContentSize(comp.pledged), comp.checksum, comp.format, comp.dict_id, comp.no_dict_id);
@@ -1220,7 +1309,7 @@ pub const Compressor = struct {
         }
         if (comp.c.ldm) |ls| ls.windowUpdate(chunk);
 
-        const c_size = comp.frameChunk(dst[fh_size..], chunk, last_chunk);
+        const c_size = try comp.frameChunk(dst[fh_size..], chunk, last_chunk);
         comp.consumed += chunk.len;
         comp.produced += c_size + fh_size;
         if (comp.pledged) |p| if (comp.consumed > p) return error.SrcSizeWrong;
@@ -1228,7 +1317,7 @@ pub const Compressor = struct {
     }
 
     /// `ZSTD_compress_frameChunk`.
-    fn frameChunk(comp: *Compressor, out: []u8, chunk: []const u8, last_chunk: bool) usize {
+    fn frameChunk(comp: *Compressor, out: []u8, chunk: []const u8, last_chunk: bool) BlockError!usize {
         const c = &comp.c;
         var savings: i64 = @as(i64, @intCast(comp.consumed)) - @as(i64, @intCast(comp.produced));
         if (comp.checksum) comp.xxh.update(chunk);
@@ -1249,11 +1338,11 @@ pub const Compressor = struct {
             if (c.ms.next_to_update < c.ms.low_limit) c.ms.next_to_update = c.ms.low_limit;
 
             const c_size = if (c.target_c_block_size != 0)
-                compressBlockTargetCBlockSize(c, out[op..], block, last_block)
+                try compressBlockTargetCBlockSize(c, out[op..], block, last_block)
             else if (c.split_blocks)
-                compressBlockSplit(c, out[op..], block, last_block)
+                try compressBlockSplit(c, out[op..], block, last_block)
             else
-                emitBlock(out[op..], block, compressBlock(c, out[op + block_header_size ..], block), last_block);
+                emitBlock(out[op..], block, try compressBlock(c, out[op + block_header_size ..], block), last_block);
             savings += @as(i64, @intCast(block_size)) - @as(i64, @intCast(c_size));
             ip += block_size;
             op += c_size;
@@ -1289,5 +1378,258 @@ pub const Compressor = struct {
             op += 4;
         }
         return op;
+    }
+
+    // ---- Sequence-level API (Z10; seqapi.zig) ----
+
+    pub const SequenceError = Error || error{
+        /// `dstSize_tooSmall`: `dst` too small for the frame (libzstd's
+        /// capacity rules: the frame header needs 18 bytes of room).
+        DstSizeTooSmall,
+        /// `parameter_unsupported`: `generateSequences` with
+        /// `target_c_block_size`; `compressSequencesAndLiterals` with
+        /// validation.
+        ParameterUnsupported,
+        /// `frameParameter_unsupported`: `compressSequencesAndLiterals`
+        /// without explicit block delimiters, or with a checksum.
+        FrameParameterUnsupported,
+        /// `cannotProduce_uncompressedBlock`: a block of
+        /// `compressSequencesAndLiterals` does not compress, and without the
+        /// input it cannot be stored raw.
+        CannotProduceUncompressedBlock,
+        /// `GENERIC`: the entropy stage failed on sequences no encoder
+        /// produces.
+        Generic,
+    };
+
+    /// `ZSTD_compressSequences`: one frame of `src` from the caller's
+    /// sequences `seqs` (with or without block delimiters, as
+    /// `opts.advanced.block_delimiters` says), with every parameter and
+    /// the dictionary of `opts` as `compressFrame` takes them. No match
+    /// finder runs. Unlike `compressFrame`, `dst` may have any size; too
+    /// little room is `error.DstSizeTooSmall` where libzstd says so.
+    pub fn compressSequences(comp: *Compressor, dst: []u8, seqs: []const seqapi.Sequence, src: []const u8, opts: Options) SequenceError!usize {
+        try opts.advanced.check();
+        var local: ?CDict = null;
+        defer if (local) |*l| l.deinit();
+        try comp.initStream2(opts, src.len, null, false, &local);
+        const n = try comp.writeSeqFrameHeader(dst, src.len);
+        var c_size = n;
+        if (comp.checksum and src.len != 0) comp.xxh.update(src);
+        // Now generate compressed blocks
+        c_size += try comp.compressSequencesInternal(dst[n..], seqs, src);
+        // Complete with frame checksum, if needed
+        if (comp.checksum) {
+            if (dst.len - c_size < 4) return error.DstSizeTooSmall; // no room for checksum
+            std.mem.writeInt(u32, dst[c_size..][0..4], @truncate(comp.xxh.final()), .little);
+            c_size += 4;
+        }
+        return c_size;
+    }
+
+    /// `ZSTD_writeFrameHeader` as the sequence API calls it: the header
+    /// needs `ZSTD_FRAMEHEADERSIZE_MAX` bytes of room. (libzstd does not
+    /// check the error it returns there and goes on at a wild position;
+    /// here it is `error.DstSizeTooSmall`.)
+    fn writeSeqFrameHeader(comp: *Compressor, dst: []u8, content_size: u64) error{DstSizeTooSmall}!usize {
+        const frame_header_size_max = 18;
+        if (dst.len < frame_header_size_max) return error.DstSizeTooSmall;
+        return writeFrameHeader(dst, comp.cp, comp.headerContentSize(content_size), comp.checksum, comp.format, comp.dict_id, comp.no_dict_id);
+    }
+
+    /// `ZSTD_compressSequences_internal`: the blocks.
+    fn compressSequencesInternal(comp: *Compressor, dst: []u8, seqs: []const seqapi.Sequence, src: []const u8) SequenceError!usize {
+        const c = &comp.c;
+        var c_size: usize = 0;
+        var remaining = src.len;
+        var pos: seqapi.Position = .{};
+        var ip: usize = 0;
+        var op: usize = 0;
+        // Special case: empty frame
+        if (remaining == 0) {
+            // (libzstd writes the 24-bit header as 4 bytes)
+            if (dst.len < 4) return error.DstSizeTooSmall; // No room for empty frame block header
+            writeBlockHeader(dst, 1 + (bt_raw << 1));
+            dst[3] = 0;
+            op += block_header_size;
+            c_size += block_header_size;
+        }
+        while (remaining != 0) {
+            var block_size = try seqapi.determineBlockSize(c.seq.block_delimiters, comp.block_size_max, remaining, seqs, pos);
+            const last_block: u32 = @intFromBool(block_size == remaining);
+            c.ss.reset();
+            const reps: seqapi.Reps = .{ .prev = &c.prev.rep, .next = &c.next.rep };
+            const block = src[ip..][0..block_size];
+            block_size = switch (c.seq.block_delimiters) {
+                .explicit => try seqapi.transferWithBlockDelim(&c.ss, reps, &c.seq, &pos, seqs, block, c.seq.repcode_resolution),
+                .none => try seqapi.transferNoDelim(&c.ss, reps, &c.seq, &pos, seqs, block),
+            };
+            const out = dst[op..];
+
+            // If blocks are too small, emit as a nocompress block
+            if (block_size < min_cblock_size + block_header_size + 1 + 1) {
+                const n = try noCompressBlock(out, src[ip..][0..block_size], last_block);
+                c_size += n;
+                ip += block_size;
+                op += n;
+                remaining -= block_size;
+                continue;
+            }
+
+            // not enough dstCapacity to write a new compressed block
+            if (out.len < block_header_size) return error.DstSizeTooSmall;
+            var c_seqs_size = try entropyCompressSeqStore(c, &c.ss, out[block_header_size..], block_size);
+            // Note: don't emit the first block as RLE even if it qualifies
+            // because doing so will cause the decoder (cli <= v1.4.3 only)
+            // to throw an (invalid) error "should consume all input error."
+            if (!c.is_first_block and seqapi.maybeRle(&c.ss) and isRle(src[ip..][0..block_size])) c_seqs_size = 1;
+
+            var c_block_size: usize = undefined;
+            if (c_seqs_size == 0) {
+                c_block_size = try noCompressBlock(out, src[ip..][0..block_size], last_block);
+            } else if (c_seqs_size == 1) {
+                if (out.len < 4) return error.DstSizeTooSmall;
+                c_block_size = emitBlock(out, src[ip..][0..block_size], 1, last_block);
+            } else {
+                // Error checking and repcodes update
+                std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
+                offcodeValidToCheck(c);
+                c_block_size = emitBlock(out, src[ip..][0..block_size], c_seqs_size, last_block);
+            }
+            c_size += c_block_size;
+            if (last_block != 0) break;
+            ip += block_size;
+            op += c_block_size;
+            remaining -= block_size;
+            c.is_first_block = false;
+        }
+        return c_size;
+    }
+
+    /// `ZSTD_noCompressBlock`.
+    fn noCompressBlock(out: []u8, src: []const u8, last_block: u32) error{DstSizeTooSmall}!usize {
+        // dst buf too small for uncompressed block
+        if (src.len + block_header_size > out.len) return error.DstSizeTooSmall;
+        return emitBlock(out, src, 0, last_block);
+    }
+
+    /// `ZSTD_entropyCompressSeqStore` with libzstd's capacity rule: out of
+    /// room is "store raw" only when the raw block would fit.
+    fn entropyCompressSeqStore(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usize) error{DstSizeTooSmall}!usize {
+        const c_size = entropyCompressInternal(c, ss, dst) catch |err| switch (err) {
+            error.DstSizeTooSmall => if (block_size <= dst.len) return 0 else return error.DstSizeTooSmall,
+            // as in `entropyCompress`: not reachable from inputs libzstd encodes
+            error.Generic => return 0,
+        };
+        if (c_size == 0) return 0;
+        const max_c_size = block_size - literals.minGain(block_size, c.strategy);
+        if (c_size >= max_c_size) return 0; // block not compressed
+        return c_size;
+    }
+
+    /// `ZSTD_compressSequencesAndLiterals`: one frame of
+    /// `decompressed_size` bytes from `seqs` (with explicit block
+    /// delimiters) and `lits`, all their literals one after the other --
+    /// without the input itself, so a block that does not compress is
+    /// `error.CannotProduceUncompressedBlock`. Refuses validation and the
+    /// checksum, as libzstd does. (libzstd also takes the literal buffer's
+    /// capacity, only to refuse one smaller than the literals; a slice
+    /// needs no such check.)
+    pub fn compressSequencesAndLiterals(comp: *Compressor, dst: []u8, seqs: []const seqapi.Sequence, lits: []const u8, decompressed_size: usize, opts: Options) SequenceError!usize {
+        try opts.advanced.check();
+        var local: ?CDict = null;
+        defer if (local) |*l| l.deinit();
+        try comp.initStream2(opts, decompressed_size, null, false, &local);
+        // This mode is only compatible with explicit delimiters
+        if (comp.c.seq.block_delimiters == .none) return error.FrameParameterUnsupported;
+        // This mode is not compatible with Sequence validation
+        if (comp.c.seq.validate) return error.ParameterUnsupported;
+        // this mode is not compatible with frame checksum
+        if (comp.checksum) return error.FrameParameterUnsupported;
+        const n = try comp.writeSeqFrameHeader(dst, decompressed_size);
+        return n + try comp.compressSequencesAndLiteralsInternal(dst[n..], seqs, lits, decompressed_size);
+    }
+
+    /// `ZSTD_compressSequencesAndLiterals_internal`.
+    fn compressSequencesAndLiteralsInternal(comp: *Compressor, dst: []u8, seqs_in: []const seqapi.Sequence, lits_in: []const u8, src_size: usize) SequenceError!usize {
+        const c = &comp.c;
+        var seqs = seqs_in;
+        var lits = lits_in;
+        var remaining: u64 = src_size;
+        var c_size: usize = 0;
+        var op: usize = 0;
+        if (seqs.len == 0) return error.ExternalSequencesInvalid; // Requires at least 1 end-of-block
+        // Special case: empty frame
+        if (seqs.len == 1 and seqs[0].lit_length == 0) {
+            if (dst.len < 3) return error.DstSizeTooSmall; // No room for empty frame block header
+            writeBlockHeader(dst, 1 + (bt_raw << 1));
+            op += block_header_size;
+            c_size += block_header_size;
+        }
+        while (seqs.len != 0) {
+            const block = try seqapi.get1BlockSummary(seqs);
+            const last_block: u32 = @intFromBool(block.n_seq == seqs.len);
+            // discrepancy: Sequences require more literals than present in buffer
+            if (block.lit_size > lits.len) return error.ExternalSequencesInvalid;
+            c.ss.reset();
+            try seqapi.convertBlockSequences(&c.ss, .{ .prev = &c.prev.rep, .next = &c.next.rep }, &c.seq, seqs[0..block.n_seq], c.seq.repcode_resolution);
+            seqs = seqs[block.n_seq..];
+            remaining -%= block.block_size;
+
+            // Note: when blockSize is very small, other variant send it
+            // uncompressed. Here, we still send the sequences, because we
+            // don't have the original source to send it uncompressed.
+            const out = dst[op..];
+            // not enough dstCapacity to write a new compressed block
+            if (out.len < block_header_size) return error.DstSizeTooSmall;
+            const block_lits = lits[0..@intCast(block.lit_size)];
+            var c_seqs_size = entropyCompressLits(c, &c.ss, block_lits, out[block_header_size..]) catch |err| switch (err) {
+                error.DstSizeTooSmall => return error.DstSizeTooSmall,
+                error.Generic => return error.Generic,
+            };
+            // note: the spec forbids for any compressed block to be larger
+            // than maximum block size
+            if (c_seqs_size > comp.block_size_max) c_seqs_size = 0;
+            lits = lits[block_lits.len..];
+            // Sending uncompressed blocks is out of reach, because the
+            // source is not provided.
+            if (c_seqs_size == 0) return error.CannotProduceUncompressedBlock;
+            // Error checking and repcodes update
+            std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
+            offcodeValidToCheck(c);
+            writeBlockHeader(out, last_block + (bt_compressed << 1) + (@as(u32, @intCast(c_seqs_size)) << 3));
+            const c_block_size = block_header_size + c_seqs_size;
+            c_size += c_block_size;
+            op += c_block_size;
+            c.is_first_block = false;
+            if (last_block != 0) break;
+        }
+        // literals must be entirely and exactly consumed
+        if (lits.len != 0) return error.ExternalSequencesInvalid;
+        // Sequences must represent a total of exactly srcSize
+        if (remaining != 0) return error.ExternalSequencesInvalid;
+        return c_size;
+    }
+
+    /// `ZSTD_generateSequences`: the sequences `compressFrame` finds for
+    /// `src` with `opts`, each block's followed by a delimiter holding its
+    /// last literals, into `out` (`sequenceBound(src.len)` is always
+    /// enough). Returns how many. libzstd marks it deprecated and "for
+    /// debugging only": it fails (`error.SequenceProducerFailed`) on a
+    /// block too small to compress, i.e. an input whose last block is
+    /// under 7 bytes, and does not take `target_c_block_size`. It
+    /// compresses into a scratch buffer from the context's allocator (a
+    /// static context has none: `error.OutOfMemory`).
+    pub fn generateSequences(comp: *Compressor, out: []seqapi.Sequence, src: []const u8, opts: Options) SequenceError!usize {
+        if (params.nonZero(opts.advanced.target_c_block_size) != null) return error.ParameterUnsupported; // targetCBlockSize != 0
+        if (opts.advanced.nb_workers != 0) return error.ParameterUnsupported; // nbWorkers != 0
+        const gpa = comp.gpa orelse return error.OutOfMemory;
+        const dst = try gpa.alloc(u8, compressBound(src.len));
+        defer gpa.free(dst);
+        var col: seqapi.Collector = .{ .seqs = out };
+        var o = opts;
+        o.collector = &col;
+        _ = try comp.compressFrame(dst, src, o);
+        return col.idx;
     }
 };

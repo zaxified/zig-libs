@@ -3250,6 +3250,13 @@ pub const mt_cases = [_]MtCase{
     .{ .name = "mt-dict-prefix-full", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .prefix, .levels = &.{ 3, 5 } },
     .{ .name = "mt-dict-cdict-attach", .input = mt_in_csv, .schedule = "c200000,f0,c*,e0", .dict = "zd-csv", .path = .cdict, .levels = &.{ 1, 5, 16 } },
     .{ .name = "mt-dict-cdict-copy", .input = mt_in_alternating, .params = "jobSize=524288,forceAttachDict=2", .dict = "zd-words", .path = .cdict, .levels = &.{3} },
+    // (Z10) LDM's raw sequences cut at small blocks below `btopt`
+    // (`maybeSplitSequence`, `ZSTD_ldm_skipSequences`): a cut match of
+    // exactly minMatch, one shorter carried into the next literals, the
+    // skipped part ending exactly at a sequence's literals -- found by
+    // search, the Z7 survivors
+    .{ .name = "mt-ldm-cut-4k", .input = mt_in_far_repeat, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=19,minMatch=6,ldmMinMatch=8,maxBlockSize=4096", .levels = &.{2} },
+    .{ .name = "mt-ldm-cut-1500", .input = mt_in_far_mix, .params = "jobSize=524288,enableLongDistanceMatching=1,windowLog=20,minMatch=7,ldmMinMatch=4,maxBlockSize=1500", .levels = &.{8} },
 } ++ mt_cases_rsync;
 
 const mt_in_rsync_a: Case = .{ .name = "", .len = 1_829_651, .kind = .rsync_marks, .seed = 0 };
@@ -3285,4 +3292,239 @@ const mt_cases_rsync = [_]MtCase{
     .{ .name = "mt-rsync-stream-at-128k", .input = mt_in_rsync_a, .schedule = "rsyncable=1,jobSize=524288,c131072,c*,e0", .levels = &.{3} },
     .{ .name = "mt-rsync-stream-full-table", .input = mt_in_rsync_c, .schedule = "rsyncable=1,jobSize=524288,o50,c*,e0", .levels = &.{ 1, 3 } },
     .{ .name = "mt-rsync-stream-pledged", .input = mt_in_rsync_a, .schedule = "p1829651,rsyncable=1,jobSize=524288,c300000,c*,e0", .levels = &.{3} },
+};
+
+// ---- Sequence-level API (Z10) ----
+
+pub const seqgen = @import("seqgen.zig");
+
+/// One golden of the sequence-level API: `tools/zseq.c`'s command `cmd`
+/// (`gen`, `merge`, `cseq`, `clit`, `prod:<mode>`, `sprod:<mode>:<chunk>`)
+/// over the `cases` input `input` with the parameters `params` (zref's
+/// `name=value` list), at each of `levels`. The sequences `merge`, `cseq`
+/// and `clit` read are `seqgen.generate(input, gen)`. The golden is the
+/// length and SHA-256 of the output (a frame, or the sequences as 16-byte
+/// records), or libzstd's error.
+pub const SeqCase = struct {
+    name: []const u8,
+    input: []const u8,
+    cmd: []const u8,
+    params: []const u8 = "-",
+    levels: []const i32 = &.{3},
+    checksum: bool = false,
+    gen: seqgen.Gen = .{},
+    /// The destination's size (sequences for `gen`); 0 for zseq's default.
+    capacity: usize = 0,
+    /// A dictionary: the first `len` bytes of the `cases` input `input`,
+    /// or a trained one, used the way `mode` says (load, cdict, prefix).
+    dict: ?SeqDict = null,
+};
+
+pub const SeqDict = struct {
+    mode: []const u8,
+    input: []const u8 = "",
+    len: usize = 0,
+    /// A trained dictionary of `testdata/` (`<name>.zdict`) instead.
+    trained: ?[]const u8 = null,
+    /// `ZSTD_dictContentType_e`: 0 auto, 1 raw content, 2 full.
+    content_type: u32 = 1,
+};
+
+const explicit = "blockDelimiters=1";
+
+pub const seq_cases = [_]SeqCase{
+    // ZSTD_generateSequences: every strategy, the post-splitter, pre-split
+    // blocks, long lengths, LDM, a dictionary's repcodes; its refusals
+    .{ .name = "gen-words", .input = "words-262144", .cmd = "gen", .levels = &.{ -1, 1, 3, 7, 9, 12, 16, 19 } },
+    .{ .name = "gen-csv-split", .input = "csv-600000", .cmd = "gen", .params = "splitAfterSequences=1", .levels = &.{ 5, 13 } },
+    .{ .name = "gen-mix-mm3", .input = "mix-300000-9", .cmd = "gen", .params = "minMatch=3", .levels = &.{ 1, 5, 19 } },
+    .{ .name = "gen-alternating", .input = "alternating", .cmd = "gen", .levels = &.{3} },
+    .{ .name = "gen-long-literals", .input = "long-literals", .cmd = "gen", .levels = &.{ 3, 19 } },
+    .{ .name = "gen-long-match", .input = "long-match", .cmd = "gen", .levels = &.{ 1, 7 } },
+    .{ .name = "gen-ldm", .input = "ldm-far-mix-300000-3", .cmd = "gen", .params = "enableLongDistanceMatching=1", .levels = &.{ 3, 16 } },
+    .{ .name = "gen-dict", .input = "words-16385", .cmd = "gen", .dict = .{ .mode = "load", .input = "words-262144", .len = 20000 }, .levels = &.{ 1, 5, 19 } },
+    .{ .name = "gen-empty", .input = "empty", .cmd = "gen" },
+    .{ .name = "gen-six", .input = "six", .cmd = "gen" }, // a block too small to compress: refused
+    .{ .name = "gen-rle-tail", .input = "rle-tail-6", .cmd = "gen" },
+    .{ .name = "gen-target", .input = "words-16384", .cmd = "gen", .params = "targetCBlockSize=2000" },
+    .{ .name = "gen-workers", .input = "words-16384", .cmd = "gen", .params = "nbWorkers=1" },
+    .{ .name = "gen-capacity", .input = "words-16384", .cmd = "gen", .capacity = 100 },
+    // ZSTD_mergeBlockDelimiters
+    .{ .name = "merge", .input = "words-262145", .cmd = "merge", .gen = .{ .block = 4096 } },
+
+    // ZSTD_compressSequences, explicit delimiters: repcode resolution by
+    // level (auto flips at 10) and by hand, validation on valid sequences,
+    // the checksum, small blocks (raw, never RLE while the first), RLE
+    .{ .name = "cseq-words", .input = "words-262145", .cmd = "cseq", .params = explicit, .levels = &.{ -5, 1, 3, 9, 10, 16, 19 } },
+    .{ .name = "cseq-words-rep1", .input = "words-262145", .cmd = "cseq", .params = explicit ++ ",repcodeResolution=1", .levels = &.{3} },
+    .{ .name = "cseq-words-rep2", .input = "words-262145", .cmd = "cseq", .params = explicit ++ ",repcodeResolution=2", .levels = &.{16} },
+    .{ .name = "cseq-words-noreps", .input = "words-262145", .cmd = "cseq", .params = explicit, .gen = .{ .reps = false }, .levels = &.{ 3, 12 } },
+    .{ .name = "cseq-words-validate", .input = "words-262145", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .levels = &.{ 3, 12 }, .checksum = true },
+    .{ .name = "cseq-csv-small-blocks", .input = "csv-131073", .cmd = "cseq", .params = explicit, .gen = .{ .block = 1000 }, .levels = &.{ 1, 7 } },
+    .{ .name = "cseq-tiny-blocks", .input = "words-1000", .cmd = "cseq", .params = explicit, .gen = .{ .block = 5 } },
+    .{ .name = "cseq-zeros-rle", .input = "zeros-300000", .cmd = "cseq", .params = explicit, .gen = .{ .block = 10000 }, .levels = &.{ 1, 19 } },
+    .{ .name = "cseq-rle-text-rle", .input = "rle-text-rle", .cmd = "cseq", .params = explicit, .levels = &.{3} },
+    .{ .name = "cseq-random", .input = "random-5000", .cmd = "cseq", .params = explicit },
+    .{ .name = "cseq-long-literals", .input = "long-literals", .cmd = "cseq", .params = explicit, .levels = &.{ 3, 19 } },
+    .{ .name = "cseq-empty", .input = "empty", .cmd = "cseq", .params = explicit, .checksum = true },
+    .{ .name = "cseq-six", .input = "six", .cmd = "cseq", .params = explicit },
+    .{ .name = "cseq-mm3", .input = "mix-300000-9", .cmd = "cseq", .params = explicit ++ ",minMatch=3,validateSequences=1", .gen = .{ .min_len = 3 }, .levels = &.{ 5, 16 } },
+    .{ .name = "cseq-literals-off", .input = "csv-131072", .cmd = "cseq", .params = explicit ++ ",literalCompressionMode=2" },
+    .{ .name = "cseq-magicless", .input = "csv-131072", .cmd = "cseq", .params = explicit ++ ",format=1,contentSizeFlag=0" },
+    // ... without delimiters: blocks cut at the block size, a match longer
+    // than the block split, one cut short of minMatch moved back
+    .{ .name = "cseq-nodelim", .input = "words-262145", .cmd = "cseq", .gen = .{ .block = 0 }, .levels = &.{ 1, 3, 19 } },
+    .{ .name = "cseq-nodelim-long-match", .input = "long-match", .cmd = "cseq", .gen = .{ .block = 0 }, .levels = &.{ 3, 19 } },
+    .{ .name = "cseq-nodelim-4k", .input = "csv-131073", .cmd = "cseq", .params = "maxBlockSize=4096,validateSequences=1", .gen = .{ .block = 0 }, .levels = &.{ 1, 5 } },
+    .{ .name = "cseq-nodelim-zeros-mm7", .input = "zeros-300000", .cmd = "cseq", .params = "minMatch=7,maxBlockSize=4096", .gen = .{ .block = 0 } },
+    .{ .name = "cseq-nodelim-explicit-list", .input = "words-16384", .cmd = "cseq", .gen = .{ .block = 4096 } }, // delimiters read as sequences
+    // damaged sequences, with and without validation
+    .{ .name = "cseq-offset-far", .input = "words-262145", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .offset_add, .at = 7 } },
+    .{ .name = "cseq-offset-far-v", .input = "words-262145", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .damage = .offset_add, .at = 7 } },
+    .{ .name = "cseq-offset-far-nodelim-v", .input = "words-262145", .cmd = "cseq", .params = "validateSequences=1", .gen = .{ .block = 0, .damage = .offset_add, .at = 3000 } },
+    .{ .name = "cseq-window-v", .input = "words-262145", .cmd = "cseq", .params = explicit ++ ",validateSequences=1,windowLog=12" },
+    .{ .name = "cseq-match-3", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .match_3, .at = 20 } },
+    .{ .name = "cseq-match-3-v", .input = "words-16384", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .damage = .match_3, .at = 20 } },
+    .{ .name = "cseq-match-3-mm3-v", .input = "words-16384", .cmd = "cseq", .params = explicit ++ ",validateSequences=1,minMatch=3", .gen = .{ .damage = .match_3, .at = 20 } },
+    .{ .name = "cseq-match-2", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .match_2, .at = 20 } },
+    .{ .name = "cseq-match-2-v", .input = "words-16384", .cmd = "cseq", .params = explicit ++ ",validateSequences=1,minMatch=3", .gen = .{ .damage = .match_2, .at = 20 } },
+    .{ .name = "cseq-offset-0", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .offset_0, .at = 5 } },
+    .{ .name = "cseq-offset-0-nodelim", .input = "words-16384", .cmd = "cseq", .gen = .{ .block = 0, .damage = .offset_0, .at = 5 }, .levels = &.{ 3, 12 } },
+    .{ .name = "cseq-offset-wrap", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .offset_wrap, .at = 9 } },
+    .{ .name = "cseq-last-lits-plus-1", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .last_lits_plus_1 } },
+    .{ .name = "cseq-no-last-delimiter", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .no_last_delimiter } },
+    .{ .name = "cseq-delimiter-with-match", .input = "words-16384", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .delimiter_with_match } },
+    .{ .name = "cseq-merged-blocks", .input = "words-262145", .cmd = "cseq", .params = explicit, .gen = .{ .damage = .merge_blocks } },
+    .{ .name = "cseq-too-many-seqs", .input = "words-16384", .cmd = "cseq", .params = explicit ++ ",maxBlockSize=1024", .gen = .{ .block = 1024, .min_len = 3 } },
+    // dictionaries: repcodes and entropy tables from a full one (none
+    // here: raw), offsets reaching into the dictionary under validation
+    .{ .name = "cseq-dict-load-v", .input = "words-16385", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .damage = .offset_add, .at = 0, .add = 15000 }, .dict = .{ .mode = "load", .input = "words-262144", .len = 20000 }, .levels = &.{ 3, 19 } },
+    .{ .name = "cseq-dict-cdict-v", .input = "words-16385", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .damage = .offset_add, .at = 0, .add = 15000 }, .dict = .{ .mode = "cdict", .input = "words-262144", .len = 20000 } },
+    .{ .name = "cseq-dict-prefix-v", .input = "words-16385", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .damage = .offset_add, .at = 0, .add = 15000 }, .dict = .{ .mode = "prefix", .input = "words-262144", .len = 20000 } },
+    // the destination's capacity: too small for a block, for the checksum
+    // (below 18 bytes, too small for the header, libzstd goes on at a wild
+    // position: seq_test.zig checks the refusal)
+    .{ .name = "cseq-cap-small", .input = "random-5000", .cmd = "cseq", .params = explicit, .capacity = 2000 },
+    .{ .name = "cseq-cap-checksum", .input = "six", .cmd = "cseq", .params = explicit, .capacity = 18, .checksum = true },
+
+    // ZSTD_compressSequencesAndLiterals
+    .{ .name = "clit-words", .input = "words-262145", .cmd = "clit", .params = explicit, .levels = &.{ 1, 3, 10, 19 } },
+    .{ .name = "clit-words-rep1", .input = "words-262145", .cmd = "clit", .params = explicit ++ ",repcodeResolution=1", .levels = &.{3} },
+    .{ .name = "clit-long-literals", .input = "long-literals", .cmd = "clit", .params = explicit, .levels = &.{3} },
+    .{ .name = "clit-csv-small-blocks", .input = "csv-131073", .cmd = "clit", .params = explicit, .gen = .{ .block = 1000 } },
+    .{ .name = "clit-empty", .input = "empty", .cmd = "clit", .params = explicit },
+    .{ .name = "clit-random", .input = "random-5000", .cmd = "clit", .params = explicit }, // cannot store it raw
+    .{ .name = "clit-nodelim", .input = "words-16384", .cmd = "clit" },
+    .{ .name = "clit-validate", .input = "words-16384", .cmd = "clit", .params = explicit ++ ",validateSequences=1" },
+    .{ .name = "clit-checksum", .input = "words-16384", .cmd = "clit", .params = explicit, .checksum = true },
+    .{ .name = "clit-lits-short", .input = "words-16384", .cmd = "clit", .params = explicit, .gen = .{ .damage = .last_lits_plus_1 } },
+    .{ .name = "clit-no-last-delimiter", .input = "words-16384", .cmd = "clit", .params = explicit, .gen = .{ .damage = .no_last_delimiter } },
+    .{ .name = "clit-match-2", .input = "words-16384", .cmd = "clit", .params = explicit, .gen = .{ .damage = .match_2, .at = 20 }, .levels = &.{ 3, 12 } },
+    .{ .name = "clit-merged-blocks", .input = "words-262145", .cmd = "clit", .params = explicit, .gen = .{ .damage = .merge_blocks } },
+
+    // a registered sequence producer (the example in seq_test.zig):
+    // repcode resolution by level, the post-splitter and superblocks over
+    // its sequences, its failures with and without the fallback
+    .{ .name = "prod-words", .input = "words-262145", .cmd = "prod:0", .levels = &.{ -1, 1, 3, 9, 10, 16, 19 } },
+    .{ .name = "prod-csv-split", .input = "csv-600000", .cmd = "prod:0", .params = "splitAfterSequences=1", .levels = &.{ 3, 13 } },
+    .{ .name = "prod-target", .input = "words-262145", .cmd = "prod:0", .params = "targetCBlockSize=2000" },
+    .{ .name = "prod-4k", .input = "words-262145", .cmd = "prod:256", .params = "maxBlockSize=4096,validateSequences=1,minMatch=5", .levels = &.{ 1, 7 } },
+    .{ .name = "prod-fail-2", .input = "csv-600000", .cmd = "prod:2" },
+    .{ .name = "prod-fail-2-fallback", .input = "csv-600000", .cmd = "prod:2", .params = "enableSeqProducerFallback=1", .levels = &.{ 1, 5, 12 } },
+    .{ .name = "prod-no-delimiter", .input = "csv-131073", .cmd = "prod:16" },
+    .{ .name = "prod-zero", .input = "words-16384", .cmd = "prod:32" },
+    .{ .name = "prod-zero-fallback", .input = "words-16384", .cmd = "prod:32", .params = "enableSeqProducerFallback=1" },
+    .{ .name = "prod-overcap-fallback", .input = "words-16384", .cmd = "prod:64", .params = "enableSeqProducerFallback=1" },
+    .{ .name = "prod-too-long", .input = "words-16384", .cmd = "prod:128", .params = "enableSeqProducerFallback=1" },
+    .{ .name = "prod-too-short", .input = "words-16384", .cmd = "prod:512" },
+    .{ .name = "prod-offset-far", .input = "words-16384", .cmd = "prod:1024" },
+    .{ .name = "prod-offset-far-v", .input = "words-16384", .cmd = "prod:1024", .params = "validateSequences=1" },
+    .{ .name = "prod-mm3-v", .input = "mix-300000-9", .cmd = "prod:256", .params = "validateSequences=1", .levels = &.{ 3, 19 } },
+    .{ .name = "prod-ldm", .input = "words-16384", .cmd = "prod:0", .params = "enableLongDistanceMatching=1" },
+    .{ .name = "prod-workers", .input = "words-16384", .cmd = "prod:0", .params = "nbWorkers=1" },
+    .{ .name = "prod-six", .input = "six", .cmd = "prod:32" }, // no block to produce for
+    .{ .name = "prod-dict", .input = "words-16385", .cmd = "prod:0", .dict = .{ .mode = "load", .input = "words-262144", .len = 20000 }, .levels = &.{ 3, 16 } },
+    .{ .name = "sprod-words", .input = "words-262145", .cmd = "sprod:0:5000", .levels = &.{ 3, 16 }, .checksum = true },
+    // hand-made lists, found by the mutation sweep: a literal length of
+    // exactly 0xFFFF and a match of exactly 0xFFFF + 3 (not long lengths);
+    // an offset of exactly everything decoded under validation; the
+    // validation bound at exactly the window, with a dictionary; a match
+    // at repcode 1 - 1 after no literals
+    .{ .name = "cseq-long-edges", .input = "words-262144", .cmd = "cseq", .params = explicit, .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 100, .lit_length = 65535, .match_length = 4 }, .{ .offset = 0, .lit_length = 1000, .match_length = 0 },
+        .{ .offset = 50, .lit_length = 10, .match_length = 65538 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+        .{ .offset = 0, .lit_length = 130057, .match_length = 0 },
+    } } },
+    .{ .name = "cseq-offset-bound-v", .input = "words-1000", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 30, .lit_length = 20, .match_length = 10 }, .{ .offset = 0, .lit_length = 970, .match_length = 0 },
+    } } },
+    .{ .name = "cseq-window-edge-dict-v", .input = "words-16384", .cmd = "cseq", .params = explicit ++ ",validateSequences=1,windowLog=10", .dict = .{ .mode = "load", .input = "words-262144", .len = 2000 }, .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 1500, .lit_length = 1000, .match_length = 24 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+    } ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 1024, .match_length = 0 }} ** 15 } },
+    .{ .name = "cseq-rep0-minus-1", .input = "words-1000", .cmd = "cseq", .params = explicit ++ ",repcodeResolution=1", .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 8, .lit_length = 10, .match_length = 5 },  .{ .offset = 7, .lit_length = 0, .match_length = 5 },
+        .{ .offset = 7, .lit_length = 3, .match_length = 4 },   .{ .offset = 0, .lit_length = 973, .match_length = 0 },
+    } } },
+    .{ .name = "prod-mm3-cut-v", .input = "words-16384", .cmd = "prod:2304", .params = "validateSequences=1" },
+
+    .{ .name = "clit-long-edges", .input = "words-262144", .cmd = "clit", .params = explicit, .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 100, .lit_length = 65535, .match_length = 4 }, .{ .offset = 0, .lit_length = 1000, .match_length = 0 },
+        .{ .offset = 50, .lit_length = 10, .match_length = 65538 }, .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+        .{ .offset = 0, .lit_length = 130057, .match_length = 0 },
+    } } },
+    // the store's room (1000-byte blocks: 250 sequences), one over
+    .{ .name = "cseq-max-seqs", .input = "words-1000", .cmd = "cseq", .params = explicit, .gen = .{ .list = &([_]seqgen.Seq{.{ .offset = 1, .lit_length = 0, .match_length = 3 }} ** 251 ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 247, .match_length = 0 }}) } },
+    .{ .name = "clit-max-seqs", .input = "words-1000", .cmd = "clit", .params = explicit, .gen = .{ .list = &([_]seqgen.Seq{.{ .offset = 1, .lit_length = 0, .match_length = 3 }} ** 249 ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 253, .match_length = 0 }}) } },
+    // validation positions carry the previous block's last literals
+    .{ .name = "cseq-pos-after-delim-v", .input = "words-1000", .cmd = "cseq", .params = explicit ++ ",validateSequences=1", .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 10, .lit_length = 10, .match_length = 10 }, .{ .offset = 0, .lit_length = 100, .match_length = 0 },
+        .{ .offset = 125, .lit_length = 5, .match_length = 5 },  .{ .offset = 0, .lit_length = 870, .match_length = 0 },
+    } } },
+    // the no-delimiter copier's cuts at their equalities (4 KB blocks,
+    // minMatch 4): a match exactly the block size, a first half and a
+    // second half of exactly minMatch, literals resumed across a block
+    .{ .name = "cseq-nodelim-ml-block", .input = "words-16384", .cmd = "cseq", .params = "maxBlockSize=4096,minMatch=4", .gen = .{ .list = &[_]seqgen.Seq{.{ .offset = 100, .lit_length = 100, .match_length = 4096 }} } },
+    .{ .name = "cseq-nodelim-first-half", .input = "words-16384", .cmd = "cseq", .params = "maxBlockSize=4096,minMatch=4", .gen = .{ .list = &[_]seqgen.Seq{.{ .offset = 100, .lit_length = 4092, .match_length = 5000 }} } },
+    .{ .name = "cseq-nodelim-second-half", .input = "words-16384", .cmd = "cseq", .params = "maxBlockSize=4096,minMatch=4", .gen = .{ .list = &[_]seqgen.Seq{.{ .offset = 100, .lit_length = 2, .match_length = 4098 }} } },
+    .{ .name = "cseq-nodelim-second-short", .input = "words-16384", .cmd = "cseq", .params = "maxBlockSize=4096,minMatch=4", .gen = .{ .list = &[_]seqgen.Seq{.{ .offset = 100, .lit_length = 2, .match_length = 4097 }} } },
+    .{ .name = "cseq-nodelim-resumed-lits", .input = "words-16384", .cmd = "cseq", .params = "maxBlockSize=4096,minMatch=4", .gen = .{ .list = &[_]seqgen.Seq{.{ .offset = 100, .lit_length = 5000, .match_length = 4000 }} } },
+    // a 6-byte block (raw, still the first); then RLE's edges: 1 sequence
+    // (the first compressed block: never RLE), 4 sequences, 10 literals
+    .{ .name = "cseq-rle-edges", .input = "zeros-300000", .cmd = "cseq", .params = explicit, .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 1, .lit_length = 1, .match_length = 5 },      .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+        .{ .offset = 1, .lit_length = 1, .match_length = 999 },    .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+        .{ .offset = 1, .lit_length = 1, .match_length = 100 },    .{ .offset = 1, .lit_length = 0, .match_length = 100 },
+        .{ .offset = 1, .lit_length = 0, .match_length = 100 },    .{ .offset = 1, .lit_length = 0, .match_length = 100 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 10, .match_length = 100 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 0, .match_length = 131072 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 0, .match_length = 131072 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },      .{ .offset = 1, .lit_length = 0, .match_length = 36339 },
+        .{ .offset = 0, .lit_length = 0, .match_length = 0 },
+    } } },
+    // room for exactly the raw block after the entropy stage ran out
+    .{ .name = "cseq-random-cap-exact", .input = "random-5000", .cmd = "cseq", .params = explicit, .capacity = 5010 },
+    // a block compressed to exactly the block size; a match length of 0
+    // ending a block; sizes that add up short of the content size
+    .{ .name = "clit-block-max-edge", .input = "random-5000", .cmd = "clit", .params = explicit ++ ",maxBlockSize=1024", .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 0, .lit_length = 1021, .match_length = 0 }, .{ .offset = 0, .lit_length = 10, .match_length = 0 },
+    } } },
+    .{ .name = "clit-ml0-offset", .input = "words-1000", .cmd = "clit", .params = explicit, .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 5, .lit_length = 10, .match_length = 0 }, .{ .offset = 8, .lit_length = 20, .match_length = 30 }, .{ .offset = 0, .lit_length = 940, .match_length = 0 },
+    } } },
+    .{ .name = "clit-sum-short", .input = "words-16384", .cmd = "clit", .params = explicit, .gen = .{ .list = &[_]seqgen.Seq{
+        .{ .offset = 10, .lit_length = 100, .match_length = 50 }, .{ .offset = 0, .lit_length = 20, .match_length = 0 },
+    } } },
+    // a full (trained) dictionary: its repcodes and entropy tables, the
+    // offset table valid for the first block only
+    .{ .name = "cseq-full-dict", .input = "words-262144", .cmd = "cseq", .params = explicit, .dict = .{ .mode = "load", .trained = "zd-words", .content_type = 0 }, .levels = &.{ 1, 3, 12 } },
+    .{ .name = "cseq-full-dict-1k", .input = "words-262144", .cmd = "cseq", .params = explicit ++ ",maxBlockSize=1024", .gen = .{ .block = 1024 }, .dict = .{ .mode = "load", .trained = "zd-words", .content_type = 0 }, .levels = &.{1} },
+    .{ .name = "cseq-full-cdict-nodelim", .input = "words-262144", .cmd = "cseq", .gen = .{ .block = 0 }, .dict = .{ .mode = "cdict", .trained = "zd-words", .content_type = 0 } },
+    .{ .name = "prod-full-dict", .input = "words-262144", .cmd = "prod:0", .dict = .{ .mode = "load", .trained = "zd-words", .content_type = 0 }, .levels = &.{ 3, 12 } },
+    // found by search (the mutant against the original over corpus
+    // inputs): the history a producer block of 3, 2 and 1 sequences leaves
+    // without repcode resolution, read by the next block's fallback
+    .{ .name = "prod-fallback-reps-3", .input = "ldm-far-mix-300000-3", .cmd = "prod:2", .params = "maxBlockSize=1024,enableSeqProducerFallback=1,repcodeResolution=2", .levels = &.{1} },
+    .{ .name = "prod-fallback-reps-2", .input = "ldm-far-mix-300000-3", .cmd = "prod:2", .params = "maxBlockSize=2048,enableSeqProducerFallback=1,repcodeResolution=2", .levels = &.{16} },
+    .{ .name = "prod-fallback-reps-1", .input = "ldm-far-mix-200000-20", .cmd = "prod:2", .params = "maxBlockSize=1024,enableSeqProducerFallback=1,repcodeResolution=2", .levels = &.{16} },
+    .{ .name = "sprod-fail-fallback", .input = "csv-600000", .cmd = "sprod:3:70000", .params = "enableSeqProducerFallback=1", .levels = &.{ 1, 7 } },
 };

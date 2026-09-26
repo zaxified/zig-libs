@@ -50,6 +50,10 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       external sequences into a block
                                       (ZSTD_referenceExternalSequences'
                                       path of ZSTD_buildSeqStore)           -> src/frame.zig
+                                      the sequence-level API
+                                      (compressSequences[AndLiterals],
+                                      generateSequences, sequence copiers,
+                                      validation, the sequence producer)    -> src/seqapi.zig, src/frame.zig
   lib/compress/zstdmt_compress.c      multithreaded compression: job and
                                       overlap sizing, round buffer, jobs,
                                       serial state (checksum, LDM across

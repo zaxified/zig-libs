@@ -65,6 +65,8 @@ pub const rows = [_]Golden{
     .{ .case = "mt-dict-cdict-attach", .level = 5, .checksum = false, .len = 229311, .sha256 = "656859757391e7fb2537e845c2e2aaf96b84f9fde35076692c7b825450a8261e" },
     .{ .case = "mt-dict-cdict-attach", .level = 16, .checksum = false, .len = 190619, .sha256 = "62d028d066876b9c0fa214c4ba19ebcd227108575175861740a96e45d1462b98" },
     .{ .case = "mt-dict-cdict-copy", .level = 3, .checksum = false, .len = 597375, .sha256 = "028e9cff88681a671d60bfbc5797da361f4cd096c8451cd7326c653e3f3ca76a" },
+    .{ .case = "mt-ldm-cut-4k", .level = 2, .checksum = false, .len = 345254, .sha256 = "15041b30fbc780c0617b52146d2516b38e4c664f75ae273cc7fc217234fea0b1" },
+    .{ .case = "mt-ldm-cut-1500", .level = 8, .checksum = false, .len = 190684, .sha256 = "c75f64570a10e85aea911aedf3ec551e60a4f6b225f60890f1e5d8cdcac8784f" },
     .{ .case = "mt-rsync-marks", .level = -3, .checksum = false, .len = 411156, .sha256 = "58dda0874cce30e8c214ac1ec23b889503fdefd8404d5b91c6801c85f17ca2db" },
     .{ .case = "mt-rsync-marks", .level = -3, .checksum = true, .len = 411160, .sha256 = "f3b5205e57a6c1dcdcfaaa3bbbe793ccbde78de7c3dfe61e898ca700093bbe48" },
     .{ .case = "mt-rsync-marks", .level = 1, .checksum = false, .len = 384585, .sha256 = "f6546ddd9d71147c0f121aee9047d1a66c1829212111fa8d86fbdec2a0933cdd" },

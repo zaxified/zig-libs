@@ -27,6 +27,11 @@
 //! reloaded, a prefix, or a `CDict` attached (small or unknown input sizes)
 //! -- and `dict_builder` trains dictionaries as libzstd's `zdict.h` does.
 //!
+//! The sequence-level API (`Compressor.compressSequences`,
+//! `compressSequencesAndLiterals`, `generateSequences`, a
+//! `SequenceProducer` in place of the match finder) gives libzstd's bytes
+//! and errors for the same sequences.
+//!
 //! Level 22 on an input over 64 MB uses a 128 MB window: about 820 MB of
 //! match tables, as in libzstd.
 //!
@@ -47,6 +52,7 @@ const dstream = @import("dstream.zig");
 const cdict_mod = @import("cdict.zig");
 const ddict_mod = @import("ddict.zig");
 const zstdmt = @import("zstdmt.zig");
+const seqapi = @import("seqapi.zig");
 
 /// Dictionary training: libzstd's cover and fastCover trainers, their
 /// optimizers, `ZDICT_trainFromBuffer` and finalization, giving the same
@@ -54,7 +60,7 @@ const zstdmt = @import("zstdmt.zig");
 pub const dict_builder = @import("dict_builder.zig");
 
 pub const meta = .{
-    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
+    .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
     .platform_note = "any",
     .targets = .{.linux64},
     .platform = .any,
@@ -80,7 +86,31 @@ pub const Options = struct {
     /// digested into a `CDict` for the call (make a `CDict` to digest it
     /// once for many frames). A decoder needs the same dictionary.
     dictionary: Dictionary = .none,
+    /// `ZSTD_registerSequenceProducer`: a block-level sequence producer that
+    /// replaces the level's match finder (see `SequenceProducer`); with
+    /// `advanced.enable_seq_producer_fallback`, the match finder still runs
+    /// for the blocks it fails on.
+    sequence_producer: ?SequenceProducer = null,
 };
+
+/// `ZSTD_Sequence`: a match and the literals before it, as the
+/// sequence-level API (`Compressor.compressSequences`,
+/// `Compressor.generateSequences`) takes and gives them; offset and match
+/// length 0 is a block delimiter. C-compatible layout.
+pub const Sequence = seqapi.Sequence;
+/// `ZSTD_SequenceFormat_e` (`Advanced.block_delimiters`).
+pub const BlockDelimiters = params.BlockDelimiters;
+/// A block-level sequence producer (`ZSTD_sequenceProducer_F` with its
+/// state): a function pointer and a context.
+pub const SequenceProducer = seqapi.SequenceProducer;
+/// `ZSTD_sequenceBound`: room for every sequence and delimiter
+/// `generateSequences` can give for `src_size` bytes.
+pub const sequenceBound = seqapi.sequenceBound;
+/// `ZSTD_mergeBlockDelimiters`: turn `generateSequences`' output into the
+/// no-delimiter form; returns the new length.
+pub const mergeBlockDelimiters = seqapi.mergeBlockDelimiters;
+/// What the sequence-level API can fail with (libzstd's error names).
+pub const SequenceError = frame.Compressor.SequenceError || error{LevelUnsupported};
 
 /// A compression dictionary: see `Options.dictionary`.
 pub const Dictionary = frame.Dict;
@@ -171,7 +201,7 @@ pub const Compressor = struct {
     /// See `zstd.compress`.
     pub fn compress(c: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
         if (opts.level > max_level) return error.LevelUnsupported;
-        const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .dict = opts.dictionary };
+        const fo = frameOptions(opts);
         // ZSTD_compress2 goes through ZSTD_compressStream2, which leaves an
         // input of up to ZSTDMT_JOBSIZE_MIN to the calling thread
         if (opts.advanced.nb_workers > 0 and src.len > zstdmt.job_size_min) return c.compressMt(dst, src, fo);
@@ -205,6 +235,56 @@ pub const Compressor = struct {
             return error.NoSpaceLeft;
         }
         return out.pos;
+    }
+
+    /// libzstd hands a frame of more than `ZSTDMT_JOBSIZE_MIN` with
+    /// workers to its multithreaded context, which the sequence API then
+    /// bypasses (its single-threaded state was never set up: it crashes or
+    /// reads garbage); refused here. Smaller frames run single-threaded,
+    /// as in libzstd.
+    fn refuseMt(opts: Options, size: usize) error{ParameterUnsupported}!void {
+        if (opts.advanced.nb_workers > 0 and size > zstdmt.job_size_min) return error.ParameterUnsupported;
+    }
+
+    fn frameOptions(opts: Options) frame.Options {
+        return .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .dict = opts.dictionary, .sequence_producer = opts.sequence_producer };
+    }
+
+    /// `ZSTD_compressSequences`: one frame of `src` from the caller's
+    /// `seqs` instead of a match finder -- with a delimiter ending each
+    /// block when `opts.advanced.block_delimiters` is `.explicit`, else cut
+    /// into blocks here -- entropy-coded as `opts` (level, parameters,
+    /// dictionary) says. Byte-identical to libzstd. Without
+    /// `advanced.validate_sequences` the sequences are trusted: invalid
+    /// ones give the frame libzstd gives (not a decodable one); with it,
+    /// they fail with `error.ExternalSequencesInvalid`. `dst` may have any
+    /// length; `compressBound(src.len)` plus 4 bytes per block delimiter
+    /// is always enough.
+    pub fn compressSequences(c: *Compressor, dst: []u8, seqs: []const Sequence, src: []const u8, opts: Options) SequenceError!usize {
+        if (opts.level > max_level) return error.LevelUnsupported;
+        try refuseMt(opts, src.len);
+        return c.ctx.compressSequences(dst, seqs, src, frameOptions(opts));
+    }
+
+    /// `ZSTD_compressSequencesAndLiterals`: as `compressSequences`, from
+    /// the sequences (explicit block delimiters required) and all their
+    /// literals in `lits`, without the input; `content_size` is its
+    /// length. No validation, no checksum, and a block that does not
+    /// compress fails (`error.CannotProduceUncompressedBlock`).
+    pub fn compressSequencesAndLiterals(c: *Compressor, dst: []u8, seqs: []const Sequence, lits: []const u8, content_size: usize, opts: Options) SequenceError!usize {
+        if (opts.level > max_level) return error.LevelUnsupported;
+        try refuseMt(opts, content_size);
+        return c.ctx.compressSequencesAndLiterals(dst, seqs, lits, content_size, frameOptions(opts));
+    }
+
+    /// `ZSTD_generateSequences` (deprecated in libzstd, "for debugging"):
+    /// the sequences `compress` would encode for `src` with `opts`, each
+    /// block's closed by a delimiter with its last literals, into `out`;
+    /// returns how many. An input whose last block is under 7 bytes fails
+    /// (`error.SequenceProducerFailed`), as in libzstd.
+    pub fn generateSequences(c: *Compressor, out: []Sequence, src: []const u8, opts: Options) SequenceError!usize {
+        if (opts.level > max_level) return error.LevelUnsupported;
+        return c.ctx.generateSequences(out, src, frameOptions(opts));
     }
 
     /// `ZSTD_compress_usingDict`: one frame of `src` with `dict` (a full
@@ -242,7 +322,7 @@ pub const workspace_alignment = frame.workspace_alignment;
 pub fn estimateCompressorSize(src_size: ?u64, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
     try opts.advanced.check();
-    const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };
+    const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
     if (src_size) |n| return frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced), n, fo, false);
     // The need grows with the size within each size class; past the last
     // class it stops growing once the window no longer shrinks to the
@@ -399,6 +479,9 @@ test {
     _ = @import("superblock.zig");
     _ = @import("presplit.zig");
     _ = @import("frame.zig");
+    _ = @import("seqapi.zig");
+    _ = @import("seq_test.zig");
+    _ = @import("testdata/seqgen.zig");
     _ = @import("cdict.zig");
     _ = @import("dict_test.zig");
     _ = @import("frame_writer.zig");

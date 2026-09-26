@@ -62,6 +62,8 @@ pub const Options = struct {
     /// allocator: the stream digests it into a `CDict` of its own at the
     /// first frame (a static stream fails with `error.OutOfMemory`).
     dictionary: frame.Dict = .none,
+    /// `ZSTD_registerSequenceProducer`: see `zstd.SequenceProducer`.
+    sequence_producer: ?frame.SequenceProducer = null,
 };
 
 /// The highest level a stream accepts: every level, as one-shot.
@@ -83,7 +85,7 @@ pub const Error = error{
     InvalidBuffer,
     /// With workers: `continue` while a frame is being ended (`stage_wrong`).
     StageWrong,
-};
+} || frame.BlockError; // with a sequence producer only
 
 /// A compression context in streaming mode (`ZSTD_CCtx` driven by
 /// `ZSTD_compressStream2`). Once a frame has ended, the next call starts
@@ -228,6 +230,7 @@ pub const Stream = struct {
             .advanced = s.opts.advanced,
             .overflow_correct_frequently = s.overflow_correct_frequently,
             .dict = s.opts.dictionary,
+            .sequence_producer = s.opts.sequence_producer,
         };
     }
 
@@ -348,7 +351,7 @@ fn frameParams(opts: Options, pledged: ?u64) params.CParams {
 /// sizes.
 pub fn estimateSize(opts: Options) Error!usize {
     try Stream.checkOptions(opts);
-    const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced };
+    const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
     if (opts.pledged_size != null or opts.src_size_hint != null)
         return frame.workspaceSize(frameParams(opts, opts.pledged_size), opts.pledged_size, fo, true);
     // Unknown, or known at the first call (which ends the frame): the need

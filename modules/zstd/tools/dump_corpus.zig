@@ -159,4 +159,51 @@ pub fn main(init: std.process.Init) !void {
         };
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = mt_manifest_path, .data = mt_manifest.items });
+
+    // the sequence-API goldens: the sequences a case reads and its
+    // dictionary, then one line per level:
+    // "name input cmd level checksum params seqs capacity dict"
+    const seq_manifest_path = args.next() orelse return;
+    var seq_manifest: std.ArrayList(u8) = .empty;
+    defer seq_manifest.deinit(gpa);
+    const table = try gpa.create([1 << 16]u32);
+    defer gpa.destroy(table);
+    for (corpus.seq_cases) |sc| {
+        const src = try gpa.alloc(u8, findCase(sc.input).len);
+        defer gpa.free(src);
+        corpus.generate(findCase(sc.input), src);
+        const reads = std.mem.eql(u8, sc.cmd, "merge") or std.mem.eql(u8, sc.cmd, "cseq") or std.mem.eql(u8, sc.cmd, "clit");
+        const seq_name = try std.fmt.allocPrint(gpa, "seq-{s}.seq", .{sc.name});
+        defer gpa.free(seq_name);
+        if (reads) {
+            const seqs = try gpa.alloc(corpus.seqgen.Seq, corpus.seqgen.bound(src.len));
+            defer gpa.free(seqs);
+            const n = corpus.seqgen.generate(src, sc.gen, table, seqs);
+            try dir.writeFile(io, .{ .sub_path = seq_name, .data = std.mem.sliceAsBytes(seqs[0..n]) });
+        }
+        const dict_name = try std.fmt.allocPrint(gpa, "seq-dict-{s}", .{sc.name});
+        defer gpa.free(dict_name);
+        if (sc.dict) |d| if (d.trained) |tn| {
+            const file = try std.fmt.allocPrint(gpa, "{s}.zdict", .{tn});
+            defer gpa.free(file);
+            const bytes = try testdata.readFileAlloc(io, file, gpa, .limited(1 << 20));
+            defer gpa.free(bytes);
+            try dir.writeFile(io, .{ .sub_path = dict_name, .data = bytes });
+        } else {
+            const buf = try gpa.alloc(u8, findCase(d.input).len);
+            defer gpa.free(buf);
+            corpus.generate(findCase(d.input), buf);
+            try dir.writeFile(io, .{ .sub_path = dict_name, .data = buf[0..d.len] });
+        };
+        for (sc.levels) |level| {
+            try seq_manifest.print(gpa, "{s} {s} {s} {d} {d} {s} {s} {d} ", .{ sc.name, sc.input, sc.cmd, level, @intFromBool(sc.checksum), sc.params, if (reads) seq_name else "-", sc.capacity });
+            if (sc.dict) |d| try seq_manifest.print(gpa, "{s}:{d}:{s}\n", .{ d.mode, d.content_type, dict_name }) else try seq_manifest.print(gpa, "-\n", .{});
+        }
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = seq_manifest_path, .data = seq_manifest.items });
+}
+
+fn findCase(name: []const u8) corpus.Case {
+    for (corpus.cases) |c| if (std.mem.eql(u8, c.name, name)) return c;
+    std.debug.panic("no corpus case {s}", .{name});
 }

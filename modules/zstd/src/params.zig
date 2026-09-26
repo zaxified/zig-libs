@@ -468,6 +468,25 @@ pub const Advanced = struct {
     /// the calling thread ignores it, as libzstd does); costs a little
     /// ratio and caps the speed near 400 MB/s.
     rsyncable: bool = false,
+    /// `ZSTD_c_blockDelimiters`: whether the sequences given to
+    /// `Compressor.compressSequences` end each block with a delimiter.
+    block_delimiters: BlockDelimiters = .none,
+    /// `ZSTD_c_validateSequences`: check every external sequence (its
+    /// offset against the window and the dictionary, its match length
+    /// against the minimum) and refuse invalid ones with
+    /// `error.ExternalSequencesInvalid`. Off, sequences are taken as they
+    /// are, as in libzstd.
+    validate_sequences: bool = false,
+    /// `ZSTD_c_repcodeResolution` (formerly `searchForExternalRepcodes`):
+    /// encode an external sequence's offset as a repeat offset where one
+    /// matches. `.auto` does from level 10 on. Only with
+    /// `block_delimiters = .explicit` and for a sequence producer; without
+    /// delimiters libzstd always does.
+    repcode_resolution: Switch = .auto,
+    /// `ZSTD_c_enableSeqProducerFallback`: when the sequence producer fails
+    /// for a block, compress that block with the level's match finder
+    /// instead of failing.
+    enable_seq_producer_fallback: bool = false,
 
     pub const CheckError = error{
         /// A parameter outside libzstd's bounds (`parameter_outOfBound`).
@@ -507,6 +526,17 @@ pub const Advanced = struct {
 pub const nb_workers_max = 256;
 pub const job_size_max = 1024 << 20;
 pub const overlap_log_max = 9;
+
+/// `ZSTD_SequenceFormat_e` (`ZSTD_c_blockDelimiters`).
+pub const BlockDelimiters = enum {
+    /// `ZSTD_sf_noBlockDelimiters`: no delimiters; blocks are cut at the
+    /// block size, splitting a sequence where needed.
+    none,
+    /// `ZSTD_sf_explicitBlockDelimiters`: every block ends with a
+    /// delimiter (offset and match length 0), which carries its last
+    /// literals.
+    explicit,
+};
 
 /// `ZSTD_dictAttachPref_e`: libzstd picks between attaching a `CDict`'s
 /// tables (for small inputs) and copying them into the context by the

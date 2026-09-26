@@ -88,6 +88,14 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.overlap_log = v;
     } else if (Eq.f(name, "rsyncable")) {
         adv.rsyncable = v != 0;
+    } else if (Eq.f(name, "blockDelimiters")) {
+        adv.block_delimiters = if (v == 1) .explicit else .none;
+    } else if (Eq.f(name, "validateSequences")) {
+        adv.validate_sequences = v != 0;
+    } else if (Eq.f(name, "repcodeResolution")) {
+        adv.repcode_resolution = switches[v];
+    } else if (Eq.f(name, "enableSeqProducerFallback")) {
+        adv.enable_seq_producer_fallback = v != 0;
     } else return error.BadParam;
     return true;
 }

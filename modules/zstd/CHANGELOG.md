@@ -5,6 +5,23 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — the sequence-level API (SPEC backlog Z10):
+  `Compressor.compressSequences`, `compressSequencesAndLiterals`,
+  `generateSequences`, `sequenceBound`, `mergeBlockDelimiters`, a
+  block-level `SequenceProducer` (`Options.sequence_producer`,
+  `StreamOptions.sequence_producer`), and `Advanced.block_delimiters`,
+  `validate_sequences`, `repcode_resolution`,
+  `enable_seq_producer_fallback`, byte-identical to libzstd 1.5.7 (bytes
+  and error class); where libzstd is undefined (a destination under 18
+  bytes, lengths that wrap 32 bits, offset 0xFFFFFFFD, workers over a
+  frame > 512 KB) the call fails instead. `zstd.Error` and `StreamError`
+  gain the producer's errors; a producer with workers is
+  `error.ParameterCombinationUnsupported` (`BeginError`). 172 goldens,
+  4 300 random runs identical, mutation sweep 67: 59 killed, 6
+  equivalent, 2 uncovered; plus 9 of LDM's raw-sequence helpers, now
+  reached through multithreaded LDM: 5 killed (2 new `mt_cases`), 4
+  equivalent.
+
 - **2026-09-25** — `OptimizeParams.nb_threads` (libzstd's `nbThreads`,
   SPEC backlog Z9b): `optimizeCover` / `optimizeFastCover` (and
   `optimize*With`, `trainFromSlices`) build and score candidates on that

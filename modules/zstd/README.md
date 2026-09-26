@@ -26,10 +26,13 @@ libzstd), and so is **multithreaded** compression
 (`Advanced.nb_workers`, `job_size`, `overlap_log`, `rsyncable`: libzstd's
 jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
 — the same bytes as libzstd's for any worker count, on a small pool of
-`std.Thread`s without libc), and the optimizers train on several threads
-(`OptimizeParams.nb_threads`, the single-threaded result for any count).
-The stable-buffer part of the streaming API is queued in
-[SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
+`std.Thread`s without libc), the optimizers train on several threads
+(`OptimizeParams.nb_threads`, the single-threaded result for any count),
+and so is the **sequence-level API** (`compressSequences`,
+`generateSequences`, a block-level `SequenceProducer` in place of the match
+finder: libzstd's bytes and errors for the same sequences). The
+stable-buffer part of the streaming API is queued in [SPEC.md](SPEC.md)
+(*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
@@ -278,6 +281,47 @@ for `greedy`..`lazy2`, a CDict with a bucketed table 4x the size, always
 attached; also on a context for its own `.raw` CDict); see SPEC.md,
 *Dictionaries*.
 
+### Compressing sequences
+
+libzstd's sequence-level API: compress the caller's own parse, see the
+parse libzstd finds, or plug in a match finder of one's own — the same
+bytes (and the same errors) as libzstd 1.5.7 for the same sequences and
+parameters.
+
+```zig
+var c: zstd.Compressor = .init(gpa);
+defer c.deinit();
+// The sequences compress would encode (ZSTD_generateSequences), one
+// delimiter (offset 0, match length 0, the block's last literals) per block:
+const seqs = try gpa.alloc(zstd.Sequence, zstd.sequenceBound(data.len));
+const n = try c.generateSequences(seqs, data, .{ .level = 19 });
+// ... and back into a frame (ZSTD_compressSequences), entropy-coded at
+// the level given; no match finder runs:
+const z = try c.compressSequences(buf, seqs[0..n], data, .{ .level = 3, .advanced = .{
+    .block_delimiters = .explicit, // else: none, blocks cut here
+    .validate_sequences = true, // refuse offsets/lengths a decoder would
+} });
+// Without the delimiters: zstd.mergeBlockDelimiters(seqs[0..n]).
+```
+
+`compressSequencesAndLiterals` takes the literals already gathered
+instead of the input (explicit delimiters only, no validation, no
+checksum; a block that does not compress is an error, as the input is not
+there to store raw). `advanced.repcode_resolution` (`.auto`: from level
+10) encodes offsets that repeat as repcodes. A `SequenceProducer` (a
+context pointer and a function, `ZSTD_registerSequenceProducer`) set in
+`Options.sequence_producer` / `StreamOptions.sequence_producer` replaces
+the match finder block by block; `advanced.enable_seq_producer_fallback`
+runs the match finder for the blocks it fails on. Without validation the
+sequences are trusted as libzstd trusts them (invalid ones give libzstd's
+undecodable frame); where libzstd's behaviour is undefined (lengths that
+wrap 32 bits, an offset of 0xFFFFFFFD, a destination under 18 bytes) the
+call fails instead. Errors: `ExternalSequencesInvalid`,
+`SequenceProducerFailed`, `DstSizeTooSmall`, `ParameterUnsupported`,
+`FrameParameterUnsupported`, `CannotProduceUncompressedBlock`,
+`ParameterCombinationUnsupported` (a producer with LDM or workers). See
+SPEC.md, *Sequences*.
+
 Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`
 (`dst` below `compressBound`), `OutOfMemory`, and with a dictionary
 `DictionaryCorrupted`, `DictionaryWrong`, `DictAttachUnsupported`. There is no input size limit: past 3500 MiB
@@ -386,6 +430,16 @@ need checking — the way it is used, content type, parameters, levels
 −5…22) — 326 frames and streams equal to libzstd's
 (`src/testdata/cdict_goldens.zig`), which the recipe also decodes back
 with the dictionary.
+
+`src/seq_test.zig` does it for the sequence-level API: 118 cases, 172 rows
+(`generateSequences` at every strategy family, with the post-splitter,
+LDM and a dictionary; `compressSequences` with and without delimiters,
+repcode resolution both ways, validation, small and RLE blocks, damaged
+sequences of ten kinds, dictionaries by every path, small destinations;
+`compressSequencesAndLiterals`; the example producer failing, falling back,
+misbehaving, streamed), each output equal in length and SHA-256 to
+libzstd's, or failing with libzstd's error (`src/testdata/seq_goldens.zig`,
+`tools/zseq.c`); frames from valid sequences decode back.
 
 `src/context_test.zig` pins the estimates (exact, and the largest for an
 unknown size), a static workspace's bound, the workspace being replaced

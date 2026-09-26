@@ -112,8 +112,12 @@ libzstd's one-shot path (`ZSTD_compress2` with the whole input and a
    bytes long there, so their `iend - 8` limits saturate at 0 rather than
    point below the stretch. libzstd's loop also cuts a sequence that runs
    past the block's end (`maybeSplitSequence`, `ZSTD_ldm_skipSequences`);
-   that is ported but not reachable from LDM, whose sequences are generated
-   per block and end inside it — it is there for external sequences (Z10).
+   single-threaded LDM never needs it (its sequences are generated per
+   block and end inside it), multithreaded LDM does: a job's sequences
+   are generated for the whole job and handed to it as external raw
+   sequences (see *Multithreading*). (The sequence-level API's sequences
+   are another kind, `ZSTD_Sequence`, copied straight into the block's
+   store: *Sequences*.)
 5. **Post-split** (`blocksplit.zig`), `btopt` and up with a window of at least
    128 KB: the block's sequences are halved recursively (ranges of ≥ 300
    sequences, ≤ 196 splits) while the estimated sizes of the two halves, each
@@ -268,6 +272,7 @@ one parameter, null or `.auto` for "not set":
 | `force_max_window` | `ZSTD_c_forceMaxWindow` | |
 | `enable_dedicated_dict_search` | `ZSTD_c_enableDedicatedDictSearch` | |
 | `nb_workers`, `job_size`, `overlap_log` | `ZSTD_c_nbWorkers`, `ZSTD_c_jobSize`, `ZSTD_c_overlapLog` (see *Multithreading*) | 0–256, 0–1 GiB (under 512 KB counts as 512 KB), 0–9 |
+| `block_delimiters`, `validate_sequences`, `repcode_resolution`, `enable_seq_producer_fallback` | `ZSTD_c_blockDelimiters`, `ZSTD_c_validateSequences`, `ZSTD_c_repcodeResolution` (formerly `searchForExternalRepcodes`), `ZSTD_c_enableSeqProducerFallback` (see *Sequences*) | none / explicit, —, auto / enable / disable, — |
 
 The bounds are `ZSTD_cParam_getBounds` on 64-bit; outside them is
 `error.ParameterOutOfBound`, where `ZSTD_CCtx_setParameter` refuses. The
@@ -331,12 +336,10 @@ the first). The frame is not bound by `compressBound` sub-block by
 sub-block: a superblock of a raw block's size or more is replaced by the
 raw block, as libzstd does.
 
-The five dictionary parameters are described in *Dictionaries*. Not here,
-each with its backlog item: `prefetchCDictTables` (Z4; it changes speed
-only);
-`repcodeResolution` (formerly `searchForExternalRepcodes`),
-`blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
-act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
+The five dictionary parameters are described in *Dictionaries*, the four
+sequence parameters in *Sequences*. Not here, each with its backlog item:
+`prefetchCDictTables` (Z4; it changes speed only); `stableInBuffer` /
+`stableOutBuffer` (Z1).
 
 ## Contexts: reuse and sizing
 
@@ -909,6 +912,142 @@ a frame kept on the calling thread ignores it. The one branch never
 taken: "fewer than 32 bytes to hash" (it needs a buffer under 32 bytes
 with 128 KB in view, which the section size of 512 KB and up rules out).
 
+## Sequences
+
+The sequence-level API (`seqapi.zig`, with its drivers at the end of
+`frame.zig`), ported from `zstd_compress.c`: the caller's parse compressed
+without a match finder, the parse a compression makes returned, and a
+block-level match finder of the caller's own. A sequence is libzstd's
+`ZSTD_Sequence` (`zstd.Sequence`: offset, literal length, match length,
+rep — the same four `u32`s, so a C array passes as it is); one with offset
+and match length 0 is a *block delimiter* whose literals end a block.
+
+**`Compressor.compressSequences`** (`ZSTD_compressSequences`) sets the
+context up exactly as `compress` does for the input's size — parameters,
+dictionary, frame flags — writes the frame header and then, block by
+block (`ZSTD_compressSequences_internal`): the block's size — with
+`block_delimiters = .explicit` the sum up to the next delimiter, refused
+over the block size or the input left; with `.none`, the block size — and
+its sequences copied into the block's store. The explicit copier
+(`ZSTD_transferSequences_wBlockDelim`) takes them as they are, encoding an
+offset as a repcode only with `repcode_resolution` (`.auto`: from level
+10, `ZSTD_resolveExternalRepcodeSearch`; without it the history the next
+block starts from is the block's last three raw offsets). The
+no-delimiter copier (`ZSTD_transferSequences_noDelim`) always resolves
+repcodes and cuts the sequence that crosses the block's end: inside its
+literals the block ends there; inside its match, the match is split only
+when it is longer than the block and both halves keep `minMatch` (the
+first half shortened for the second to reach it), else the block ends
+before the match — so a block may come out shorter than the block size,
+and a sequence may span several blocks. A block under 7 bytes is stored
+raw; otherwise it is entropy-coded as any block
+(`ZSTD_entropyCompressSeqStore`, where running out of room is "store raw"
+only when the raw block fits, else `error.DstSizeTooSmall`), made RLE when
+it is not the first block, has fewer than 4 sequences and 10 literals and
+repeats one byte (`ZSTD_maybeRLE`), and stored raw when it does not
+compress. Unlike the frame path, a raw or RLE block leaves the offset
+table's `valid` mark as it was, and a raw block under 7 bytes does not end
+the "first block" (libzstd clears it only after a block that went through
+the entropy stage). No pre-splitter, post-splitter, superblocks, match
+finder or window update run; the checksum is over the input. The
+destination may have any size: its room decides as in libzstd.
+
+With `validate_sequences` every stored sequence is checked
+(`ZSTD_validateSequence`): its offset against the bytes decoded so far
+plus the dictionary's content (while those are within the window; then
+the window), its match length against 3 (`minMatch` 3, or a producer
+registered) or 4. The dictionary counted is a `CDict`'s, loaded or
+referenced; a prefix counts 0 — libzstd clears the prefix from the
+context before the sequences are read. A block of more sequences than the
+store holds (`ZSTD_maxNbSeq`: the block size / 3 with `minMatch` 3 or a
+producer, else / 4) is `error.ExternalSequencesInvalid` either way.
+Without validation the sequences are trusted, as in libzstd: the port
+keeps libzstd's unsigned wrapping arithmetic on them (a match shorter
+than 3 stored with its wrapped length and flagged long, a second long
+length replacing the first, offsets that wrap into repcodes), so invalid
+sequences give libzstd's (undecodable) frame, byte for byte.
+
+**`compressSequencesAndLiterals`** (`ZSTD_compressSequencesAndLiterals`)
+takes the literals gathered instead of the input, and the content size:
+explicit delimiters only (`error.FrameParameterUnsupported`), no
+validation (`error.ParameterUnsupported`) and no checksum
+(`error.FrameParameterUnsupported`). A block ends at the first match
+length of 0 (`ZSTD_get1BlockSummary`); its sequences are converted
+without their literals (`ZSTD_convertBlockSequences`) and the literals
+entropy-coded from the caller's buffer. There is no raw fallback: a block
+that does not come out under the block size, or does not compress at all,
+is `error.CannotProduceUncompressedBlock`; literals or sizes that do not
+add up exactly are `error.ExternalSequencesInvalid`. An empty frame (one
+delimiter) fails too, as in libzstd: its store holds 0 sequences for a
+block size of 1.
+
+**`generateSequences`** (`ZSTD_generateSequences`, deprecated in libzstd)
+runs `compress` into a scratch buffer from the context's allocator (a
+static context has none: `error.OutOfMemory`) with a collector
+(`SeqCollector`) that takes each block's sequences with raw offsets
+(repcodes resolved against the history before the block) and a delimiter
+holding its last literals (`ZSTD_copyBlockSequences`; the delimiter's
+`rep` is left as the caller's buffer had it), after which the block is
+stored raw, so the pre-splitter's savings see raw blocks. With the
+post-splitter each part is collected with the history before it, its
+repcodes already rewritten where an earlier part's raw storage would have
+broken them. A block under 7 bytes is `error.SequenceProducerFailed`
+("uncompressible block"): an input whose last block is that short cannot
+be collected. `target_c_block_size` and workers are
+`error.ParameterUnsupported`; room for fewer sequences than the blocks
+give, `error.DstSizeTooSmall`. `sequenceBound` and `mergeBlockDelimiters`
+(which folds each delimiter's literals into the next sequence and drops
+the last one's) are libzstd's.
+
+**A sequence producer** (`zstd.SequenceProducer` in
+`Options.sequence_producer` / `StreamOptions.sequence_producer`;
+`ZSTD_registerSequenceProducer`) replaces the match finder in
+`ZSTD_buildSeqStore`: for each block of 7 bytes or more it is given the
+block alone (no dictionary; the frame's level and window size) and room for
+`sequenceBound(block size)` sequences, a buffer in the context's workspace
+(which `estimateCompressorSize` counts, with the store's room for a
+sequence per 3 bytes). Its count is checked
+(`ZSTD_postProcessSequenceProducerResult`: more than the room, or none for
+a nonempty block, is a failure; a missing final delimiter is appended),
+the lengths must not add up past the block
+(`error.ExternalSequencesInvalid`, fallback or not), and the sequences go
+through the explicit copier, validated against the block's own positions.
+When it fails, `enable_seq_producer_fallback` runs the level's match
+finder for that block; otherwise the frame fails with
+`error.SequenceProducerFailed`. The post-splitter, superblocks and every
+later stage run over its sequences as over the match finder's. With
+long-distance matching each block of 7 bytes or more fails with
+`error.ParameterCombinationUnsupported` (libzstd's check, in the same
+place); with workers the frame does, before anything else. The producer is
+a struct of a context pointer and a function pointer, as libzstd's
+(state, function) pair: chosen at run time, so neither `Compressor` nor
+`Stream` becomes generic over it; failing is an error
+(`error.SequenceProducerFailed`) rather than libzstd's magic count, and a
+count above the room counts as a failure too.
+
+**Deviations** — where libzstd's behaviour is undefined, the call fails
+instead:
+
+- a destination under 18 bytes (`ZSTD_FRAMEHEADERSIZE_MAX`):
+  `error.DstSizeTooSmall` (libzstd does not check the error its frame
+  header writer returns and goes on at a wild position; on the random runs
+  it returned unrelated errors);
+- an offset code of 0 (a raw offset of 0xFFFFFFFD stored without
+  resolution): `error.ExternalSequencesInvalid` (libzstd takes
+  `highbit32(0)`);
+- a sequence whose literal and match lengths wrap 32 bits, or run past the
+  block (only through such a wrap, or the no-delimiter copier's cut of
+  one): `error.ExternalSequencesInvalid` (libzstd copies literals from
+  outside the input; it crashed on the random runs that got there);
+- `compressSequences*` with workers over a frame of more than 512 KB:
+  `error.ParameterUnsupported` (libzstd hands the frame to its
+  multithreaded context, which the sequence API then bypasses, reading a
+  block state never set up). Smaller frames run single-threaded, as in
+  libzstd;
+- `compressSequencesAndLiterals` takes the literals as a slice, so
+  libzstd's literal-buffer capacity argument (checked only against the
+  literal count) has no counterpart.
+
 ## Decoder
 
 A port of libzstd's decoder (`lib/decompress/*`, `lib/common/entropy_common.c`,
@@ -1477,7 +1616,7 @@ context (the golden tests reuse one, so their frames never start at index
 
 | mutation | why no case exists |
 |---|---|
-| `maybeSplitSequence` and `ZSTD_ldm_skipSequences`: every comparison at its equality, the cut match's `minMatch` test, the carry of a too-short match into the next sequence's literals, the skip dropped (8) | unreachable from LDM: its sequences are generated per block, counted only up to the block's end, and the store is discarded with the block, so no sequence runs past the end and the loop leaves when the store is empty. A panic on that path did not fire in 4 128 hunted inputs and schedules. They wait for external sequences (Z10) |
+| `maybeSplitSequence` and `ZSTD_ldm_skipSequences`: every comparison at its equality, the cut match's `minMatch` test, the carry of a too-short match into the next sequence's literals, the skip dropped (8) | unreachable from single-threaded LDM: its sequences are generated per block, counted only up to the block's end, and the store is discarded with the block. Multithreaded LDM reaches them (a job's sequences span its blocks); Z10 swept them there (*Sequences* below): killed, or equivalent |
 | the loop's `ip < iend` dropped; `rep[2]` not pushed down after an LDM sequence; the hash rate derived from the hash log also at equality (`>` → `>=`) | equivalent: the store empties exactly at the block's end; below `btopt` no match finder reads the third repcode (the optimal parsers and the post-splitter, which do, take LDM matches as candidates instead); at equality the rate is 0 either way |
 
 Superblocks (Z8, 2026-09-24): 5 200 random one-shot and streamed inputs
@@ -1900,6 +2039,61 @@ slots are idle with no result, so they compare as nothing until the
 count is back under the new one, and the reposted candidates follow them
 in grid order).
 
+**Sequences** (Z10, 2026-09-25): `testdata/seq_goldens.zig`, 172 rows
+over 118 `corpus.seq_cases` through `tools/zseq.c` — `generateSequences`
+over every strategy family, the post-splitter, LDM, a dictionary and its
+refusals; `mergeBlockDelimiters`; `compressSequences` with and without
+delimiters, repcode resolution by level and by hand, validation, small,
+raw and RLE blocks, the no-delimiter copier's cuts at each equality, ten
+kinds of damaged sequences (`testdata/seqgen.zig`) and hand-made lists,
+raw and full dictionaries by every path, small destinations;
+`compressSequencesAndLiterals`; the example producer (`seq_test.zig`,
+the same function as zseq's) failing, falling back, misbehaving, cutting
+matches to 3 bytes, streamed — 37 of the rows are libzstd's error, which
+must match by class. Before them, 4 300 random runs (inputs 0–700 KB of
+source, binaries and generated mixes; levels −7…22; libzstd's own
+generated parses, re-blocked, merged and damaged at random; random
+parameters, capacities and dictionaries; producer modes and stream
+chunkings) against `zseq`: all identical, bytes or error class, the first
+time — except where libzstd's behaviour is undefined (it crashed on 7, and
+returned unrelated errors on 19 with a destination under 18 bytes; the
+port refuses those, see *Sequences*, *Deviations*). A full dictionary
+loaded into the context briefly looked like a divergence; it was a
+stale recipe copy that passed the dictionary as raw content.
+
+A mutation sweep of `seqapi.zig` and the new `frame.zig` lines, 67
+mutations: 59 killed (21 only after the cases they asked for: hand-made
+lists at the long-length, validation-bound, store-room and RLE edges; a
+full dictionary over 1 KB blocks, where the offset table's `valid` mark
+must end after the first compressed block; three producer inputs found
+by search, original against mutant, where a block of 3, 2 or 1 sequences
+without repcode resolution leaves the history the next block's fallback
+match finder reads), 6 equivalent, 2 uncovered:
+
+| mutation | why no case exists |
+|---|---|
+| no-delimiter copier: `start_pos >= lit_length` → `>`; `second_half < minMatch` → `<=`; `end_pos > lit_length` → `>=` in the split branch | equivalent: at each equality both branches leave the same lengths (a literal length of 0, an adjustment of 0, a first half of 0 that falls to the same "end before the match") |
+| `ZSTD_convertBlockSequences`' history without resolution for 3 sequences (`>= 4` → `> 4`, the 2-sequence branch's `rep[2]`) | equivalent: `compressSequencesAndLiterals` has no match finder and no later reader of the history unless repcode resolution is on, and then this branch does not run |
+| the empty-frame special case of `compressSequencesAndLiterals` dropped | equivalent: every path through it fails anyway (a 1-byte block size leaves room for no sequence) |
+| a producer's trailing delimiter not recognised (appended again) | reachable only when the producer fills its whole buffer, `sequenceBound(block)` sequences, which needs zero-length sequences; the example producer makes none. **Uncovered.** |
+| the collector's history updated with the long literal length (`+ 0x10000`) instead of the stored 16 bits | differs only for a literal length of exactly 65 536 before a match in `generateSequences`. **Uncovered.** |
+
+The LDM raw-sequence mutations Z7 left (`maybeSplitSequence`,
+`ZSTD_ldm_skipSequences`; 9 as swept here) were run against multithreaded
+LDM, which reaches them: 5 killed — the skip dropped by the existing
+multithreaded goldens, 4 by `mt-ldm-cut-4k` and `mt-ldm-cut-1500` in
+`corpus.mt_cases` (found by search against libzstd-checked originals: a cut
+match of exactly `minMatch`, a too-short one carried into the next
+literals, the skip at exactly a sequence's literals), 4
+equivalent (the whole-sequence test `>=` → `>`, where the cut path returns
+the same sequence and skips it whole; the cut's `remaining < ll + ml`
+equality, excluded by the test before it; `remaining <= ll` → `<`, where
+the match cut to 0 bytes is below `minMatch` and dropped the same way;
+the skip's `src_size < ml` → `<=`, where a 0-byte match carries 0
+literals). (A first hunt driver rejected `jobSize` on both sides and
+compared stale files; the finds above were each checked by hand against
+`zref`.)
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Speed
@@ -2029,7 +2223,8 @@ dictionaries are undecided.
   skippable frames, literal compression, the row match finder, both
   splitters, the block size, the size hint. Moved out: the dictID flag
   (Z4, it has no effect without a dictionary) and
-  `searchForExternalRepcodes` (Z10, it acts on external sequences only).
+  `searchForExternalRepcodes` (Z10, it acts on external sequences only;
+  done there).
 - ~~**Z7 — Long-distance matching as an option.**~~ Done 2026-09-24, see
   *Algorithm* and *Advanced parameters*: the switch and the four LDM
   parameters, and the path below `btopt`.
@@ -2042,10 +2237,12 @@ dictionaries are undecided.
   done 2026-09-25: `rsyncable` (*Multithreading*) and the dictionary
   trainers' multithreaded optimizers, deterministic: libzstd's
   single-threaded winner for any thread count (*Dictionary training*).
-- **Z10 — Sequence-level API.** `ZSTD_compressSequences`,
-  `ZSTD_generateSequences`, the external sequence producer, and their
-  parameters (`repcodeResolution`, `blockDelimiters`, `validateSequences`,
-  `enableSeqProducerFallback`). **~1 session.** Niche.
+- ~~**Z10 — Sequence-level API.**~~ Done 2026-09-25, see *Sequences*:
+  `ZSTD_compressSequences` (both delimiter modes, validation, repcode
+  resolution), `ZSTD_compressSequencesAndLiterals`,
+  `ZSTD_generateSequences`, `ZSTD_sequenceBound`,
+  `ZSTD_mergeBlockDelimiters`, the block-level sequence producer with its
+  fallback.
 - ~~**Z11 — Speed parity.**~~ Done 2026-09-24, see *Speed*: within about
   10 % of libzstd at every level (was 1.2–2.0×).
 - **Z12 — Portability.** Run `portable-zstd-*`; big-endian (the
@@ -2069,6 +2266,9 @@ roughly 17–22 sessions.
 - Decoder: three reachable decisions without a case (see *Anchoring*):
   a block of ≥ 0x7F00 sequences, four-stream literals of exactly 6 bytes, an
   RLE sequence table of the largest code.
+- Sequences (Z10): a producer that fills its whole buffer with a
+  trailing delimiter, and a literal length of exactly 65 536 in
+  `generateSequences`, have no case (see *Anchoring*).
 - Reachable boundaries without a case: the sequence encoding-type
   heuristic's `mostFrequent < nbSeq >> (log - 1)` at equality, the table
   pricing's low-probability switch at exactly 2048 sequences, and 13

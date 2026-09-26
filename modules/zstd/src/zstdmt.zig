@@ -92,7 +92,7 @@ fn rollingHashRotate(hash: u64, to_remove: u8, to_add: u8, prime_power: u64) u64
     return (hash -% (@as(u64, to_remove) + roll_hash_char_offset) *% prime_power) *% prime8bytes +% (@as(u64, to_add) + roll_hash_char_offset);
 }
 
-pub const JobError = frame.BeginError || frame.Compressor.SizeError;
+pub const JobError = frame.BeginError || frame.Compressor.SizeError || frame.BlockError; // (no producer reaches a job: refused with workers)
 
 pub const Error = JobError || error{
     /// `ZSTD_e_continue` after `ZSTD_e_end` asked to end a frame that is
