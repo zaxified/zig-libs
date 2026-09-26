@@ -36,6 +36,7 @@
 //! (`LimitedAllocator`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 /// `ZDICT_DICTSIZE_MIN`: the smallest dictionary buffer a trainer accepts.
@@ -854,6 +855,18 @@ pub const OptimizeParams = struct {
     /// scorer; `optimizeCover` / `optimizeFastCover` hold all of it,
     /// scoring included, below the ceiling.
     memory_limit: usize = default_memory_limit,
+    /// `nbThreads`: candidates built and scored at once, each on a thread
+    /// of its own (0 and 1: one, on the calling thread). The result is the
+    /// same for every count: the candidates are compared in grid order, as
+    /// libzstd compares them single-threaded, where libzstd with threads
+    /// keeps whichever of two equally good candidates finishes first. Each
+    /// candidate needs its own working memory; `memory_limit` bounds the
+    /// sum: fewer run at once when the ceiling does not hold this many
+    /// content selections next to the context, and a candidate refused by
+    /// the ceiling while others held memory is run again with half as many
+    /// at once (refused alone, it is `error.MemoryLimitExceeded`, as with
+    /// one thread). The allocator must be thread-safe.
+    nb_threads: u32 = 1,
 };
 
 pub const Trainer = enum { cover, fast_cover };
@@ -920,6 +933,10 @@ pub const Candidate = struct {
     samples: Samples,
     /// Sample starts (`ctx->offsets`), nb + 1 entries.
     offsets: []const usize,
+    /// For the scorer's own allocations: the optimizer's allocator, or,
+    /// under a memory ceiling, this candidate's share of it (so that a
+    /// refusal is told apart when candidates run in parallel).
+    gpa: Allocator,
 };
 
 /// What a scorer makes of a candidate (`COVER_dictSelection_t`): the
@@ -936,27 +953,265 @@ pub const Selection = struct {
 /// front of `dict`) and parameters.
 pub const Optimized = struct { size: usize, k: u32, d: u32, split_point: f64, steps: u32, f: u32, accel: u32 };
 
-/// `ZDICT_optimizeTrainFromBuffer_cover` single-threaded, with
-/// `COVER_selectDict` replaced by `scorer.select(Candidate) !?Selection`
-/// (null: the candidate failed, as a `COVER_dictSelectionIsError` result;
-/// an error ends the search). The first candidate with the strictly
-/// smallest total compressed size wins, as `COVER_best_finish` decides in
-/// submission order; `scorer.release(Selection)` is called for every
-/// selection once it has been compared. No winner: `error.NoCandidate`
-/// (libzstd returns `GENERIC`).
+/// `ZDICT_optimizeTrainFromBuffer_cover`, with `COVER_selectDict` replaced
+/// by `scorer.select(Candidate) !?Selection` (null: the candidate failed,
+/// as a `COVER_dictSelectionIsError` result; an error ends the search).
+/// The first candidate in grid order with the strictly smallest total
+/// compressed size wins, as `COVER_best_finish` decides when the
+/// candidates finish in submission order (libzstd single-threaded);
+/// `scorer.release(Selection)` is called for every selection once it has
+/// been compared. No winner: `error.NoCandidate` (libzstd returns
+/// `GENERIC`). With `params.nb_threads` above 1, `select` runs on several
+/// threads at once and must be thread-safe, as must `gpa` (`release` is
+/// called on the calling thread only); the result does not change (see
+/// `OptimizeParams.nb_threads`).
 pub fn optimizeCoverWith(gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
-    return optimize(.cover, gpa, dict, samples, params, scorer);
+    return optimize(.cover, gpa, null, dict, samples, params, scorer);
 }
 
 /// `ZDICT_optimizeTrainFromBuffer_fastCover`; see `optimizeCoverWith`.
 pub fn optimizeFastCoverWith(gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
-    return optimize(.fast_cover, gpa, dict, samples, params, scorer);
+    return optimize(.fast_cover, gpa, null, dict, samples, params, scorer);
 }
 
-fn optimize(comptime trainer: Trainer, gpa: Allocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) !Optimized {
+/// The futex of the process-global `std.Io.Threaded` (its futex calls use
+/// no state of the instance), as `zstdmt.zig` uses it: no libc, and no
+/// `Io` from the caller.
+const Futex = struct {
+    fn io() std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
+    }
+    fn wait(word: *const std.atomic.Value(u32), expected: u32) void {
+        io().futexWaitUncancelable(u32, &word.raw, expected);
+    }
+    fn wake(word: *const std.atomic.Value(u32), n: u32) void {
+        io().futexWake(u32, &word.raw, n);
+    }
+};
+
+/// The optimizers' engine. libzstd with `nbThreads > 1` posts each (k, d)
+/// candidate to a pool and keeps whichever strictly smaller total
+/// finishes first (`COVER_best_finish` under a mutex), so of two
+/// candidates with the same total it may keep either. Here the candidates
+/// of one d are built and scored `n_par` at a time (one worker thread per
+/// slot) but compared on the calling thread in grid order, so the winner
+/// is the single-threaded one whatever the thread count or the timing.
+/// A slot holds its candidate -- in flight, or done and waiting for its
+/// turn -- until it is compared, so no more than `n_par` candidates' memory
+/// is ever live.
+fn Optimizer(comptime trainer: Trainer, comptime ScorerPtr: type) type {
+    return struct {
+        const Self = @This();
+        const Ctx = if (trainer == .cover) CoverContext else FastCoverContext;
+        const Scorer = switch (@typeInfo(ScorerPtr)) {
+            .pointer => |p| p.child,
+            else => ScorerPtr,
+        };
+        const SelectReturn = @typeInfo(@TypeOf(Scorer.select)).@"fn".return_type.?;
+        pub const Err = @typeInfo(SelectReturn).error_union.error_set || Error;
+        const Result = Err!?Selection;
+
+        const idle = 0;
+        const posted = 1;
+        const done = 2;
+        const shutdown = 3;
+
+        const Slot = struct {
+            /// The futex word: `idle`, `posted`, `done` or `shutdown`.
+            state: std.atomic.Value(u32) = .init(idle),
+            owner: *Self,
+            k: u32 = 0,
+            /// This slot's share of the ceiling, when there is one: tells a
+            /// refusal of its own allocations from any other failure.
+            view: LimitedAllocator.View = undefined,
+            /// The candidate's buffer (its content at the end), kept until
+            /// the candidate is compared: the selection may point into it.
+            scratch: []u8 = &.{},
+            result: Result = null,
+
+            fn allocator(slot: *Slot) Allocator {
+                return if (slot.owner.budget != null) slot.view.allocator() else slot.owner.gpa;
+            }
+
+            fn refused(slot: *const Slot) bool {
+                return slot.owner.budget != null and slot.view.refused;
+            }
+        };
+
+        gpa: Allocator,
+        budget: ?*LimitedAllocator,
+        /// For the slots and threads: bookkeeping that does not grow with
+        /// the input, kept out of the ceiling so that a candidate run
+        /// alone sees the same budget whatever the thread count.
+        meta: Allocator,
+        scorer: ScorerPtr,
+        grid: OptimizeGrid,
+        capacity: usize,
+        samples: Samples,
+        ctx: *const Ctx = undefined,
+        d: u32 = 0,
+        slots: []Slot = &.{},
+        threads: []std.Thread = &.{},
+
+        /// One candidate (`COVER_tryParameters`): its content built on a
+        /// copy of the context's frequencies, then scored.
+        fn run(o: *Self, slot: *Slot) Result {
+            const a = slot.allocator();
+            const k = slot.k;
+            const d = o.d;
+            const ctx = o.ctx;
+            slot.scratch = try a.alloc(u8, o.capacity);
+            const tail = blk: {
+                // Copy the frequencies because we need to modify them
+                const freqs = try a.alloc(u32, ctx.freqs.len);
+                defer a.free(freqs);
+                @memcpy(freqs, ctx.freqs);
+                if (trainer == .cover) {
+                    var active: ActiveDmers = try .init(a, k - d + 1);
+                    defer active.deinit(a);
+                    break :blk ctx.buildDictionary(freqs, &active, slot.scratch, k, d);
+                } else {
+                    const segment_freqs = try a.alloc(u16, ctx.freqs.len);
+                    defer a.free(segment_freqs);
+                    @memset(segment_freqs, 0);
+                    break :blk ctx.buildDictionary(freqs, slot.scratch, k, d, segment_freqs);
+                }
+            };
+            return o.scorer.select(Candidate{
+                .content = slot.scratch[tail..],
+                .buffer = slot.scratch,
+                .capacity = o.capacity,
+                .k = k,
+                .d = d,
+                .split_point = o.grid.split_point,
+                .nb_finalize_samples = if (trainer == .cover) ctx.nb_train_samples else ctx.nbFinalizeSamples(),
+                .nb_train_samples = ctx.nb_train_samples,
+                .samples = o.samples,
+                .offsets = ctx.offsets,
+                .gpa = a,
+            });
+        }
+
+        fn worker(o: *Self, slot: *Slot) void {
+            while (true) {
+                const s = slot.state.load(.acquire);
+                if (s == shutdown) return;
+                if (s != posted) {
+                    Futex.wait(&slot.state, s);
+                    continue;
+                }
+                slot.result = o.run(slot);
+                slot.state.store(done, .release);
+                Futex.wake(&slot.state, 1);
+            }
+        }
+
+        fn post(o: *Self, slot: *Slot, k: u32) void {
+            slot.k = k;
+            slot.result = null;
+            slot.scratch = &.{};
+            if (o.budget) |b| slot.view = .{ .parent = b };
+            if (o.threads.len == 0) {
+                slot.result = o.run(slot);
+                slot.state.store(done, .monotonic);
+                return;
+            }
+            slot.state.store(posted, .release);
+            Futex.wake(&slot.state, 1);
+        }
+
+        fn wait(slot: *Slot) void {
+            while (true) {
+                const s = slot.state.load(.acquire);
+                if (s == done or s == idle) return;
+                Futex.wait(&slot.state, s);
+            }
+        }
+
+        /// Done with the slot's candidate: its selection released, its
+        /// buffer freed.
+        fn clear(o: *Self, slot: *Slot) void {
+            if (slot.result) |sel| {
+                if (sel) |x| o.scorer.release(x);
+            } else |_| {}
+            slot.result = null;
+            if (slot.scratch.len != 0) slot.allocator().free(slot.scratch);
+            slot.scratch = &.{};
+            slot.state.store(idle, .monotonic);
+        }
+
+        /// Waits for every slot in flight and drops what it made.
+        fn drain(o: *Self) void {
+            for (o.slots) |*s| {
+                wait(s);
+                o.clear(s);
+            }
+        }
+
+        /// `n` slots; with more than one, a worker thread for each.
+        fn start(o: *Self, n: usize) error{OutOfMemory}!void {
+            o.slots = try o.meta.alloc(Slot, n);
+            for (o.slots) |*s| s.* = .{ .owner = o };
+            if (n < 2) return;
+            const threads = try o.meta.alloc(std.Thread, n);
+            for (threads, 0..) |*t, i| {
+                t.* = std.Thread.spawn(.{}, worker, .{ o, &o.slots[i] }) catch {
+                    o.threads = threads[0..i];
+                    o.stop();
+                    o.meta.free(threads);
+                    return error.OutOfMemory;
+                };
+            }
+            o.threads = threads;
+        }
+
+        /// Joins the workers (idle: every posted candidate was waited
+        /// for) and frees the slots.
+        fn stop(o: *Self) void {
+            for (o.slots[0..o.threads.len]) |*s| {
+                s.state.store(shutdown, .release);
+                Futex.wake(&s.state, 1);
+            }
+            for (o.threads) |t| t.join();
+            if (o.threads.len == o.slots.len and o.threads.len != 0) o.meta.free(o.threads);
+            o.threads = &.{};
+            o.meta.free(o.slots);
+            o.slots = &.{};
+        }
+
+        /// The next k of the grid for this d, from `next.*` (`k += kStepSize`
+        /// while `k <= kMaxK`) that passes `COVER_checkParameters`.
+        fn nextK(o: *const Self, next: *u64) ?u32 {
+            while (next.* <= o.grid.k_max) {
+                const k: u32 = @intCast(next.*);
+                next.* += o.grid.k_step_size;
+                const ok = if (trainer == .cover)
+                    checkCoverParameters(k, o.d, o.grid.split_point, o.capacity)
+                else
+                    checkFastCoverParameters(k, o.d, o.grid.split_point, o.capacity, o.ctx.f, o.grid.accel);
+                if (ok) return k;
+            }
+            return null;
+        }
+    };
+}
+
+/// Test seams: how often a candidate refused under contention was run again;
+/// the slot count of the last run and the static count of its last d.
+var optimize_retries: std.atomic.Value(u32) = .init(0);
+var optimize_slots: std.atomic.Value(usize) = .init(0);
+var optimize_static_par: std.atomic.Value(usize) = .init(0);
+
+fn optimize(comptime trainer: Trainer, gpa: Allocator, budget: ?*LimitedAllocator, dict: []u8, samples: Samples, params: OptimizeParams, scorer: anytype) (Optimizer(trainer, @TypeOf(scorer)).Err || Error)!Optimized {
     const grid: OptimizeGrid = try .init(trainer, params, samples.sizes.len, dict.len);
-    const scratch = try gpa.alloc(u8, dict.len);
-    defer gpa.free(scratch);
+    const O = Optimizer(trainer, @TypeOf(scorer));
+    var o: O = .{ .gpa = gpa, .budget = budget, .meta = if (budget) |b| b.child else gpa, .scorer = scorer, .grid = grid, .capacity = dict.len, .samples = samples };
+    // no more slots than one d has candidates
+    const per_d: u64 = 1 + (grid.k_max - grid.k_min) / grid.k_step_size;
+    const threads: u64 = if (builtin.single_threaded) 1 else @max(params.nb_threads, 1);
+    try o.start(@intCast(@min(threads, per_d)));
+    defer o.stop();
+    optimize_slots.store(o.slots.len, .monotonic);
     var best: ?Optimized = null;
     var best_size: u64 = std.math.maxInt(u64);
     // u64 counters: libzstd's unsigned ones wrap (and loop forever) when
@@ -964,57 +1219,63 @@ fn optimize(comptime trainer: Trainer, gpa: Allocator, dict: []u8, samples: Samp
     var d64: u64 = grid.d_min;
     while (d64 <= grid.d_max) : (d64 += 2) {
         const d: u32 = @intCast(d64);
-        const Ctx = if (trainer == .cover) CoverContext else FastCoverContext;
-        var ctx: Ctx = if (trainer == .cover)
+        var ctx: O.Ctx = if (trainer == .cover)
             try .init(gpa, samples, d, grid.split_point, params.memory_limit)
         else
             try .init(gpa, samples, d, grid.split_point, grid.f, accel_table[grid.accel], params.memory_limit);
         defer ctx.deinit(gpa);
+        o.ctx = &ctx;
+        o.d = d;
+        const ctx_memory = O.Ctx.memory(samples.sizes.len, if (trainer == .cover) ctx.suffix_size else grid.f);
         const candidate_memory: u64 = if (trainer == .cover)
             @as(u64, ctx.suffix_size) * @sizeOf(u32) + (ActiveDmers.bytes(grid.k_max -| d + 1) orelse std.math.maxInt(u64))
         else
             (@as(u64, 1) << @intCast(grid.f)) * (@sizeOf(u32) + @sizeOf(u16));
-        if (Ctx.memory(samples.sizes.len, if (trainer == .cover) ctx.suffix_size else grid.f) +| candidate_memory > params.memory_limit)
-            return error.MemoryLimitExceeded;
-        const freqs = try gpa.alloc(u32, ctx.freqs.len);
-        defer gpa.free(freqs);
-        var k64: u64 = grid.k_min;
-        while (k64 <= grid.k_max) : (k64 += grid.k_step_size) {
-            const k: u32 = @intCast(k64);
-            const ok = if (trainer == .cover)
-                checkCoverParameters(k, d, grid.split_point, dict.len)
-            else
-                checkFastCoverParameters(k, d, grid.split_point, dict.len, ctx.f, grid.accel);
-            if (!ok) continue;
-            @memcpy(freqs, ctx.freqs);
-            const tail = if (trainer == .cover) blk: {
-                var active: ActiveDmers = try .init(gpa, k - d + 1);
-                defer active.deinit(gpa);
-                break :blk ctx.buildDictionary(freqs, &active, scratch, k, d);
-            } else blk: {
-                const segment_freqs = try gpa.alloc(u16, ctx.freqs.len);
-                defer gpa.free(segment_freqs);
-                @memset(segment_freqs, 0);
-                break :blk ctx.buildDictionary(freqs, scratch, k, d, segment_freqs);
-            };
-            const selection = (try scorer.select(Candidate{
-                .content = scratch[tail..],
-                .buffer = scratch,
-                .capacity = dict.len,
-                .k = k,
-                .d = d,
-                .split_point = grid.split_point,
-                .nb_finalize_samples = if (trainer == .cover) ctx.nb_train_samples else ctx.nbFinalizeSamples(),
-                .nb_train_samples = ctx.nb_train_samples,
-                .samples = samples,
-                .offsets = ctx.offsets,
-            })) orelse continue;
-            defer scorer.release(selection);
-            if (selection.total_compressed_size < best_size) {
-                best_size = selection.total_compressed_size;
-                @memcpy(dict[0..selection.dict.len], selection.dict);
-                best = .{ .size = selection.dict.len, .k = k, .d = d, .split_point = grid.split_point, .steps = grid.steps, .f = grid.f, .accel = grid.accel };
+        if (ctx_memory +| candidate_memory > params.memory_limit) return error.MemoryLimitExceeded;
+        // As many candidates at once as the ceiling holds next to the
+        // context (each: its content selection and its buffer)
+        var n_par: usize = @intCast(@min(o.slots.len, @max(1, (params.memory_limit - ctx_memory) / (candidate_memory +| dict.len))));
+        optimize_static_par.store(n_par, .monotonic);
+
+        var next: u64 = grid.k_min; // the next k to post
+        var head: usize = 0; // the slot compared next
+        var in_flight: usize = 0;
+        while (true) {
+            while (in_flight < n_par) : (in_flight += 1) {
+                const k = o.nextK(&next) orelse break;
+                o.post(&o.slots[(head + in_flight) % n_par], k);
             }
+            if (in_flight == 0) break;
+            const slot = &o.slots[head];
+            O.wait(slot);
+            const selection = slot.result catch |e| {
+                if (e == error.OutOfMemory and slot.refused() and n_par > 1) {
+                    // Refused by the ceiling while other candidates held
+                    // memory: drop them all and go on from this one with
+                    // half as many at once. Alone, a refusal is final --
+                    // as it is with one thread.
+                    next = slot.k;
+                    _ = optimize_retries.fetchAdd(1, .monotonic);
+                    o.drain();
+                    n_par = @max(1, n_par / 2);
+                    head = 0;
+                    in_flight = 0;
+                    continue;
+                }
+                o.drain();
+                return e;
+            };
+            if (selection) |sel| {
+                // COVER_best_finish: if the new dictionary is better
+                if (sel.total_compressed_size < best_size) {
+                    best_size = sel.total_compressed_size;
+                    @memcpy(dict[0..sel.dict.len], sel.dict);
+                    best = .{ .size = sel.dict.len, .k = slot.k, .d = d, .split_point = grid.split_point, .steps = grid.steps, .f = grid.f, .accel = grid.accel };
+                }
+            }
+            o.clear(slot);
+            head = (head + 1) % n_par;
+            in_flight -= 1;
         }
     }
     return best orelse error.NoCandidate;
@@ -1046,7 +1307,10 @@ pub const FinalizeParams = struct {
 /// bytes it has live past `limit`, and remembers that it did. The complete
 /// trainers run on it so that every piece of their working memory --
 /// contexts, candidates, compressors, `CDict`s -- counts against
-/// `memory_limit`. (std has no such wrapper outside `DebugAllocator`.)
+/// `memory_limit`. Thread-safe when `child` is: the parallel optimizers
+/// charge it from several threads, each candidate through a `View`. Read
+/// `live`, `peak` and `refused` once no other thread uses it. (std has no
+/// such wrapper outside `DebugAllocator`.)
 pub const LimitedAllocator = struct {
     child: Allocator,
     limit: usize,
@@ -1063,47 +1327,110 @@ pub const LimitedAllocator = struct {
         return .{ .ptr = l, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
-    fn grow(l: *LimitedAllocator, n: usize) bool {
-        if (n > l.limit - l.live) {
-            l.refused = true;
-            return false;
+    /// A share of a `LimitedAllocator`: its allocations count against the
+    /// parent's limit, and it remembers whether the parent refused one of
+    /// ITS allocations.
+    pub const View = struct {
+        parent: *LimitedAllocator,
+        refused: bool = false,
+
+        pub fn allocator(v: *View) Allocator {
+            return .{ .ptr = v, .vtable = &.{ .alloc = viewAlloc, .resize = viewResize, .remap = viewRemap, .free = viewFree } };
         }
+
+        fn viewAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const v: *View = @ptrCast(@alignCast(ctx));
+            return v.parent.doAlloc(&v.refused, len, alignment, ra);
+        }
+        fn viewResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const v: *View = @ptrCast(@alignCast(ctx));
+            return v.parent.doResize(&v.refused, memory, alignment, new_len, ra);
+        }
+        fn viewRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const v: *View = @ptrCast(@alignCast(ctx));
+            return v.parent.doRemap(&v.refused, memory, alignment, new_len, ra);
+        }
+        fn viewFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const v: *View = @ptrCast(@alignCast(ctx));
+            v.parent.doFree(memory, alignment, ra);
+        }
+    };
+
+    /// Takes `n` more bytes live, unless that passes the limit.
+    fn reserve(l: *LimitedAllocator, n: usize, refused: *bool) bool {
+        var cur = @atomicLoad(usize, &l.live, .monotonic);
+        while (true) {
+            if (n > l.limit - cur) {
+                @atomicStore(bool, &l.refused, true, .monotonic);
+                refused.* = true;
+                return false;
+            }
+            cur = @cmpxchgWeak(usize, &l.live, cur, cur + n, .monotonic, .monotonic) orelse break;
+        }
+        const now = cur + n;
+        var p = @atomicLoad(usize, &l.peak, .monotonic);
+        while (now > p) p = @cmpxchgWeak(usize, &l.peak, p, now, .monotonic, .monotonic) orelse break;
         return true;
     }
 
-    fn note(l: *LimitedAllocator, old: usize, new: usize) void {
-        l.live = l.live - old + new;
-        l.peak = @max(l.peak, l.live);
+    fn unreserve(l: *LimitedAllocator, n: usize) void {
+        _ = @atomicRmw(usize, &l.live, .Sub, n, .monotonic);
+    }
+
+    fn doAlloc(l: *LimitedAllocator, refused: *bool, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+        if (!l.reserve(len, refused)) return null;
+        return l.child.rawAlloc(len, alignment, ra) orelse {
+            l.unreserve(len);
+            return null;
+        };
+    }
+
+    fn doResize(l: *LimitedAllocator, refused: *bool, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        if (new_len > memory.len and !l.reserve(new_len - memory.len, refused)) return false;
+        if (!l.child.rawResize(memory, alignment, new_len, ra)) {
+            if (new_len > memory.len) l.unreserve(new_len - memory.len);
+            return false;
+        }
+        if (new_len < memory.len) l.unreserve(memory.len - new_len);
+        return true;
+    }
+
+    fn doRemap(l: *LimitedAllocator, refused: *bool, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        if (new_len > memory.len and !l.reserve(new_len - memory.len, refused)) return null;
+        const p = l.child.rawRemap(memory, alignment, new_len, ra) orelse {
+            if (new_len > memory.len) l.unreserve(new_len - memory.len);
+            return null;
+        };
+        if (new_len < memory.len) l.unreserve(memory.len - new_len);
+        return p;
+    }
+
+    fn doFree(l: *LimitedAllocator, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+        l.child.rawFree(memory, alignment, ra);
+        l.unreserve(memory.len);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
         const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
-        if (!l.grow(len)) return null;
-        const p = l.child.rawAlloc(len, alignment, ra) orelse return null;
-        l.note(0, len);
-        return p;
+        var r = false;
+        return l.doAlloc(&r, len, alignment, ra);
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
         const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
-        if (new_len > memory.len and !l.grow(new_len - memory.len)) return false;
-        if (!l.child.rawResize(memory, alignment, new_len, ra)) return false;
-        l.note(memory.len, new_len);
-        return true;
+        var r = false;
+        return l.doResize(&r, memory, alignment, new_len, ra);
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
         const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
-        if (new_len > memory.len and !l.grow(new_len - memory.len)) return null;
-        const p = l.child.rawRemap(memory, alignment, new_len, ra) orelse return null;
-        l.note(memory.len, new_len);
-        return p;
+        var r = false;
+        return l.doRemap(&r, memory, alignment, new_len, ra);
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
         const l: *LimitedAllocator = @ptrCast(@alignCast(ctx));
-        l.child.rawFree(memory, alignment, ra);
-        l.note(memory.len, 0);
+        l.doFree(memory, alignment, ra);
     }
 
     /// An error of work done on this allocator, with a refusal of its own
@@ -1252,7 +1579,7 @@ const SelectScorer = struct {
     dict_id: u32,
 
     fn select(s: *SelectScorer, c: Candidate) Error!?Selection {
-        return selectDict(s.gpa, c.buffer, c.content.len, c.samples, c.offsets, c.nb_finalize_samples, c.nb_train_samples, c.split_point, .{ .level = s.level, .dict_id = s.dict_id });
+        return selectDict(c.gpa, c.buffer, c.content.len, c.samples, c.offsets, c.nb_finalize_samples, c.nb_train_samples, c.split_point, .{ .level = s.level, .dict_id = s.dict_id });
     }
 
     fn release(s: *SelectScorer, sel: Selection) void {
@@ -1260,19 +1587,19 @@ const SelectScorer = struct {
     }
 };
 
-/// `ZDICT_optimizeTrainFromBuffer_cover`, single-threaded: every (k, d) of
-/// the grid (see `OptimizeParams`, `OptimizeGrid`) trained on the training
-/// share, finalized and scored by compressing the testing share
+/// `ZDICT_optimizeTrainFromBuffer_cover`: every (k, d) of the grid (see
+/// `OptimizeParams`, `OptimizeGrid`) trained on the training share,
+/// finalized and scored by compressing the testing share
 /// (`COVER_selectDict`); the dictionary with the smallest total -- the first
-/// of equals -- ends up in `dict[0..size]`. libzstd with several threads
-/// breaks ties by which job finishes first; its single-threaded result is
-/// this one. `error.NoCandidate` when no candidate finalizes.
+/// of equals in grid order -- ends up in `dict[0..size]`. That is libzstd's
+/// single-threaded result for any `p.nb_threads` (libzstd with several
+/// threads keeps whichever of equals finishes first). `error.NoCandidate`
+/// when no candidate finalizes.
 pub fn optimizeCover(gpa: Allocator, dict: []u8, samples: Samples, p: OptimizeParams) Error!Optimized {
     return optimizeFinished(.cover, gpa, dict, samples, p);
 }
 
-/// `ZDICT_optimizeTrainFromBuffer_fastCover`, single-threaded; see
-/// `optimizeCover`.
+/// `ZDICT_optimizeTrainFromBuffer_fastCover`; see `optimizeCover`.
 pub fn optimizeFastCover(gpa: Allocator, dict: []u8, samples: Samples, p: OptimizeParams) Error!Optimized {
     return optimizeFinished(.fast_cover, gpa, dict, samples, p);
 }
@@ -1282,7 +1609,7 @@ fn optimizeFinished(comptime trainer: Trainer, gpa: Allocator, dict: []u8, sampl
     var lim: LimitedAllocator = .init(gpa, p.memory_limit);
     const a = lim.allocator();
     var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id };
-    return optimize(trainer, a, dict, samples, p, &scorer) catch |e| lim.map(e);
+    return optimize(trainer, a, &lim, dict, samples, p, &scorer) catch |e| lim.map(e);
 }
 
 const max_level = @import("params.zig").max_level;
@@ -1354,10 +1681,10 @@ pub const Method = union(enum) {
 pub fn trainFromSlices(gpa: Allocator, dict: []u8, slices: []const []const u8, method: Method) Error!usize {
     var lim: LimitedAllocator = .init(gpa, method.memoryLimit());
     const a = lim.allocator();
-    return trainSlicesImpl(a, dict, slices, method) catch |e| lim.map(e);
+    return trainSlicesImpl(a, &lim, dict, slices, method) catch |e| lim.map(e);
 }
 
-fn trainSlicesImpl(a: Allocator, dict: []u8, slices: []const []const u8, method: Method) Error!usize {
+fn trainSlicesImpl(a: Allocator, lim: *LimitedAllocator, dict: []u8, slices: []const []const u8, method: Method) Error!usize {
     var total: usize = 0;
     for (slices) |s| total +|= s.len;
     const sizes = try a.alloc(usize, slices.len);
@@ -1376,7 +1703,7 @@ fn trainSlicesImpl(a: Allocator, dict: []u8, slices: []const []const u8, method:
             var dp = default_train_params;
             dp.memory_limit = limit;
             var scorer: SelectScorer = .{ .gpa = a, .level = dp.level, .dict_id = 0 };
-            return (try optimize(.fast_cover, a, dict, samples, dp, &scorer)).size;
+            return (try optimize(.fast_cover, a, lim, dict, samples, dp, &scorer)).size;
         },
         .cover => |p| {
             if (p.level > max_level) return error.LevelUnsupported;
@@ -1389,7 +1716,7 @@ fn trainSlicesImpl(a: Allocator, dict: []u8, slices: []const []const u8, method:
         inline .optimize_cover, .optimize_fast_cover => |p, tag| {
             if (p.level > max_level) return error.LevelUnsupported;
             var scorer: SelectScorer = .{ .gpa = a, .level = p.level, .dict_id = p.dict_id };
-            return (try optimize(if (tag == .optimize_cover) .cover else .fast_cover, a, dict, samples, p, &scorer)).size;
+            return (try optimize(if (tag == .optimize_cover) .cover else .fast_cover, a, lim, dict, samples, p, &scorer)).size;
         },
     }
 }
@@ -1628,7 +1955,7 @@ const MockScorer = struct {
 
 test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
     const gpa = testing.allocator;
-    const gen = try testSet("json-2000");
+    const gen = try testSet("json-200");
     defer gen.deinit(gpa);
     const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
     var dict: [1500]u8 = undefined;
@@ -1639,8 +1966,8 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
         const r = if (trainer == .cover) try optimizeCoverWith(gpa, &dict, s, p, &m) else try optimizeFastCoverWith(gpa, &dict, s, p, &m);
         // k above the capacity (1500) is skipped: 50 + 48·j ≤ 1500 → 31 per d
         try testing.expectEqual(@as(usize, 62), m.seen.items.len);
-        // accel 1 finalizes on all training samples: 2000 · 0.75 (fastCover), 2000
-        try testing.expectEqual(@as(usize, if (trainer == .cover) 2000 else 1500), m.finalize);
+        // accel 1 finalizes on all training samples: 200 · 0.75 (fastCover), 200
+        try testing.expectEqual(@as(usize, if (trainer == .cover) 200 else 150), m.finalize);
         try testing.expectEqual(@as(usize, 60), m.released);
         for (m.seen.items, 0..) |dk, i| {
             try testing.expectEqual(@as(u32, if (i < 31) 6 else 8), dk[0]);
@@ -1675,7 +2002,7 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
             @memset(seg, 0);
             const tail = ctx.buildDictionary(ctx.freqs, &one, k, 8, seg);
             try testing.expectEqualSlices(u8, one[tail..], m.contents.items[pick]);
-            try testing.expectEqual(@as(usize, 1500), ctx.nb_train_samples);
+            try testing.expectEqual(@as(usize, 150), ctx.nb_train_samples);
         }
     }
     // accel 4: a quarter of the training samples
@@ -1683,12 +2010,333 @@ test "optimizer: walks the grid in libzstd's order, first strict minimum wins" {
         var m4: MockScorer = .{};
         defer m4.deinit();
         _ = try optimizeFastCoverWith(gpa, &dict, s, .{ .k = 100, .d = 8, .accel = 4 }, &m4);
-        try testing.expectEqual(@as(usize, 1500 * 25 / 100), m4.finalize);
+        try testing.expectEqual(@as(usize, 150 * 25 / 100), m4.finalize);
     }
     // no candidate succeeds
     var m: MockScorer = .{ .fail_k = 100 };
     defer m.deinit();
     try testing.expectError(error.NoCandidate, optimizeCoverWith(gpa, &dict, s, .{ .k = 100, .d = 8 }, &m));
+}
+
+/// A thread-safe scorer with many ties: a hash of the content, mod 5.
+const TieScorer = struct {
+    released: std.atomic.Value(usize) = .init(0),
+
+    fn select(_: *TieScorer, c: Candidate) !?Selection {
+        if (c.k == 50 + 3 * 48) return null;
+        return .{ .dict = c.content, .total_compressed_size = std.hash.Wyhash.hash(0, c.content) % 5 };
+    }
+    fn release(m: *TieScorer, _: Selection) void {
+        _ = m.released.fetchAdd(1, .monotonic);
+    }
+};
+
+test "optimizer: every thread count keeps the single-threaded winner, ties included" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-200");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var one: [1500]u8 = undefined;
+    var many: [1500]u8 = undefined;
+    inline for (.{ Trainer.cover, Trainer.fast_cover }) |trainer| {
+        const f = if (trainer == .cover) optimizeCoverWith else optimizeFastCoverWith;
+        var m1: TieScorer = .{};
+        const want = try f(gpa, &one, s, .{}, &m1);
+        try testing.expectEqual(@as(usize, 60), m1.released.load(.monotonic));
+        for ([_]u32{ 0, 2, 3, 4, 8, 64 }) |n| {
+            var m: TieScorer = .{};
+            const got = try f(gpa, &many, s, .{ .nb_threads = n }, &m);
+            try testing.expectEqual(want, got);
+            try testing.expectEqualSlices(u8, one[0..want.size], many[0..got.size]);
+            try testing.expectEqual(@as(usize, 60), m.released.load(.monotonic));
+        }
+        // several candidates tie at the winning total
+        var ties: usize = 0;
+        var k: u32 = 50;
+        while (k <= 1500) : (k += 48) {
+            if (k == 50 + 3 * 48) continue;
+            var buf: [1500]u8 = undefined;
+            const n = if (trainer == .cover) try coverContentInto(gpa, &buf, .{ .buffer = s.buffer, .sizes = s.sizes }, .{ .k = k, .d = want.d }) else 0;
+            if (trainer == .cover and std.hash.Wyhash.hash(0, buf[buf.len - n ..]) % 5 == std.hash.Wyhash.hash(0, one[0..want.size]) % 5) ties += 1;
+        }
+        if (trainer == .cover) try testing.expect(ties > 1);
+    }
+}
+
+test "parallel optimizers: memory_limit bounds the sum; the result does not change" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-200");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var a: [4096]u8 = undefined;
+    var b: [4096]u8 = undefined;
+    inline for (.{ Trainer.cover, Trainer.fast_cover }) |trainer| {
+        const f = if (trainer == .cover) optimizeCover else optimizeFastCover;
+        var p: OptimizeParams = .{ .d = 8, .steps = 3, .f = 10, .split_point = 0.75, .level = 5 };
+        const want = try f(gpa, &a, s, p);
+        // no ceiling to speak of: four at once, more memory at once
+        var lim1: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+        _ = try f(lim1.allocator(), &b, s, p);
+        var lim4: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+        p.nb_threads = 4;
+        try testing.expectEqual(want, try f(lim4.allocator(), &b, s, p));
+        try testing.expectEqualSlices(u8, a[0..want.size], b[0..want.size]);
+        try testing.expect(lim4.peak > lim1.peak);
+        // the smallest ceiling one thread gets through with
+        p.nb_threads = 1;
+        var lo: usize = 0; // fails
+        var hi: usize = lim1.peak; // succeeds
+        while (hi - lo > 1) {
+            p.memory_limit = lo + (hi - lo) / 2;
+            if (f(gpa, &b, s, p)) |_| {
+                hi = p.memory_limit;
+            } else |e| {
+                try testing.expectEqual(error.MemoryLimitExceeded, e);
+                lo = p.memory_limit;
+            }
+        }
+        // four threads under it: fewer at once, the same winner
+        // (candidates refused under contention run again); one byte less
+        // is refused, as for one thread
+        p.nb_threads = 4;
+        p.memory_limit = hi;
+        optimize_retries.store(0, .monotonic);
+        // (fastCover's content selection is small next to its scoring:
+        // four fit the static count, and the scorers contend -- unless the
+        // threads happen to run one after another, so a few attempts)
+        for (0..5) |_| {
+            var lim4l: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+            try testing.expectEqual(want, try f(lim4l.allocator(), &b, s, p));
+            try testing.expectEqualSlices(u8, a[0..want.size], b[0..want.size]);
+            // (the slots and threads are not counted)
+            try testing.expect(lim4l.peak <= hi + 4096);
+            if (optimize_retries.load(.monotonic) > 0) break;
+        }
+        if (trainer == .fast_cover) try testing.expect(optimize_retries.load(.monotonic) > 0);
+        p.memory_limit = lo;
+        try testing.expectError(error.MemoryLimitExceeded, f(gpa, &b, s, p));
+    }
+}
+
+/// A scorer that holds `hog` bytes of the ceiling per selection until it
+/// is released, and records the order selections are released in: grid
+/// order once compared, and any order when dropped for a rerun.
+const HogScorer = struct {
+    gpa: Allocator,
+    hog: usize,
+    released: std.ArrayList(u32) = .empty,
+
+    fn select(h: *HogScorer, c: Candidate) !?Selection {
+        const buf = try c.gpa.alloc(u8, h.hog);
+        std.mem.writeInt(u32, buf[0..4], c.k, .little);
+        // ties: every third k scores the same
+        return .{ .dict = c.content, .total_compressed_size = (c.k / 48) % 3, .buffer = buf };
+    }
+    fn release(h: *HogScorer, sel: Selection) void {
+        h.released.append(testing.allocator, std.mem.readInt(u32, sel.buffer[0..4], .little)) catch unreachable;
+        h.gpa.free(sel.buffer);
+    }
+};
+
+test "parallel optimizers: candidates refused under contention are rerun, compared once each, in order" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-200");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var one: [1500]u8 = undefined;
+    var many: [1500]u8 = undefined;
+    const hog = 1 << 20;
+    const p: OptimizeParams = .{ .d = 8, .f = 10 };
+    // one thread: its peak, and the order
+    var lim1: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+    var h1: HogScorer = .{ .gpa = lim1.allocator(), .hog = hog };
+    defer h1.released.deinit(testing.allocator);
+    const want = try optimize(.fast_cover, lim1.allocator(), &lim1, &one, s, p, &h1);
+    try testing.expectEqual(@as(usize, 31), h1.released.items.len);
+    // a ceiling that holds one hog only; the static count (from
+    // `memory_limit`) still starts four at once
+    optimize_retries.store(0, .monotonic);
+    for (0..6) |_| {
+        var lim: LimitedAllocator = .init(gpa, lim1.peak + hog / 2);
+        var h: HogScorer = .{ .gpa = lim.allocator(), .hog = hog };
+        defer h.released.deinit(testing.allocator);
+        var p4 = p;
+        p4.nb_threads = 4;
+        const got = try optimize(.fast_cover, lim.allocator(), &lim, &many, s, p4, &h);
+        try testing.expectEqual(want, got);
+        try testing.expectEqualSlices(u8, one[0..want.size], many[0..got.size]);
+        // each k's last release is its comparison: in grid order, each once
+        var last: std.ArrayList(u32) = .empty;
+        defer last.deinit(testing.allocator);
+        for (h.released.items, 0..) |k, i| {
+            if (std.mem.indexOfScalar(u32, h.released.items[i + 1 ..], k) == null) try last.append(testing.allocator, k);
+        }
+        try testing.expectEqualSlices(u32, h1.released.items, last.items);
+        try testing.expectEqual(@as(usize, 0), lim.live);
+    }
+    try testing.expect(optimize_retries.load(.monotonic) > 0);
+}
+
+/// Counts the candidates scored on a thread other than the caller's.
+const ThreadScorer = struct {
+    caller: std.Thread.Id,
+    elsewhere: std.atomic.Value(u32) = .init(0),
+
+    fn select(t: *ThreadScorer, c: Candidate) !?Selection {
+        if (std.Thread.getCurrentId() != t.caller) _ = t.elsewhere.fetchAdd(1, .monotonic);
+        return .{ .dict = c.content, .total_compressed_size = c.k % 7 };
+    }
+    fn release(_: *ThreadScorer, _: Selection) void {}
+};
+
+test "parallel optimizers: one thread runs on the caller, no more slots than a d has candidates, as many at once as the ceiling holds" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-200");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var dict: [1500]u8 = undefined;
+    for ([_]u32{ 0, 1 }) |n| {
+        var t: ThreadScorer = .{ .caller = std.Thread.getCurrentId() };
+        _ = try optimizeCoverWith(gpa, &dict, s, .{ .d = 8, .nb_threads = n }, &t);
+        try testing.expectEqual(@as(u32, 0), t.elsewhere.load(.monotonic));
+        try testing.expectEqual(@as(usize, 1), optimize_slots.load(.monotonic));
+    }
+    // libzstd's grid: k from 50 to 2000 in steps of (2000 - 50) / 40 = 48,
+    // 41 per d (the checks skip some later; the slots are counted before)
+    var t: ThreadScorer = .{ .caller = std.Thread.getCurrentId() };
+    _ = try optimizeCoverWith(gpa, &dict, s, .{ .d = 8, .nb_threads = 64 }, &t);
+    try testing.expectEqual(@as(usize, 41), optimize_slots.load(.monotonic));
+    try testing.expect(t.elsewhere.load(.monotonic) > 0);
+    inline for (.{ Trainer.cover, Trainer.fast_cover }) |trainer| {
+        const f = if (trainer == .cover) optimizeCover else optimizeFastCover;
+        // a small grid (5 k per d) is enough for four slots
+        var p: OptimizeParams = .{ .d = 8, .f = 10, .steps = 4, .nb_threads = 4 };
+        // no ceiling to speak of: all four at once
+        var lim: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+        _ = try f(lim.allocator(), &dict, s, p);
+        try testing.expectEqual(@as(usize, 4), optimize_static_par.load(.monotonic));
+        // the lowest ceiling the up-front check lets through holds one
+        // candidate: one at a time (the count is set before the first runs)
+        var lo: usize = 0; // refused up front
+        var hi: usize = lim.peak; // let through
+        while (hi - lo > 1) {
+            p.memory_limit = lo + (hi - lo) / 2;
+            optimize_static_par.store(0, .monotonic);
+            _ = f(gpa, &dict, s, p) catch {};
+            if (optimize_static_par.load(.monotonic) != 0) hi = p.memory_limit else lo = p.memory_limit;
+        }
+        p.memory_limit = hi;
+        optimize_static_par.store(0, .monotonic);
+        _ = f(gpa, &dict, s, p) catch {};
+        try testing.expectEqual(@as(usize, 1), optimize_static_par.load(.monotonic));
+    }
+}
+
+/// Makes the ceiling refuse at a chosen grid position whatever the
+/// scheduling: in the first round, positions below `hold` each take `hog`
+/// bytes of it and wait until the other `4 - hold` have tried the same (and
+/// been refused); the last refusal disarms it. Once disarmed nothing hogs,
+/// and position `fail_at` fails with an OutOfMemory of its own -- not the
+/// ceiling's. Scores tie in threes; selections are released in the order
+/// recorded (on the main thread).
+const GateScorer = struct {
+    gpa: Allocator,
+    hog: usize,
+    hold: u32,
+    fail_at: ?u32 = null,
+    armed: std.atomic.Value(bool) = .init(true),
+    held: std.atomic.Value(u32) = .init(0),
+    refusals: std.atomic.Value(u32) = .init(0),
+    leaked_through: std.atomic.Value(bool) = .init(false),
+    released: std.ArrayList(u32) = .empty,
+
+    fn waitFor(v: *std.atomic.Value(u32), n: u32) void {
+        // bounded: a gate that cannot close fails the test instead of hanging it
+        var spins: usize = 0;
+        while (v.load(.acquire) < n and spins < 50_000_000) : (spins += 1) std.Thread.yield() catch {};
+    }
+
+    fn select(g: *GateScorer, c: Candidate) !?Selection {
+        const i = (c.k - 50) / 48;
+        const score = (c.k / 48) % 3;
+        if (g.armed.load(.acquire)) {
+            if (i < g.hold) {
+                const buf = try c.gpa.alloc(u8, g.hog);
+                std.mem.writeInt(u32, buf[0..4], c.k, .little);
+                _ = g.held.fetchAdd(1, .acq_rel);
+                waitFor(&g.refusals, 4 - g.hold);
+                return .{ .dict = c.content, .total_compressed_size = score, .buffer = buf };
+            }
+            waitFor(&g.held, g.hold);
+            if (c.gpa.alloc(u8, g.hog)) |buf| {
+                g.leaked_through.store(true, .monotonic);
+                std.mem.writeInt(u32, buf[0..4], c.k, .little);
+                return .{ .dict = c.content, .total_compressed_size = score, .buffer = buf };
+            } else |e| {
+                if (g.refusals.fetchAdd(1, .acq_rel) + 1 == 4 - g.hold) g.armed.store(false, .release);
+                return e;
+            }
+        }
+        if (g.fail_at == i) return error.OutOfMemory;
+        const buf = try c.gpa.alloc(u8, 4);
+        std.mem.writeInt(u32, buf[0..4], c.k, .little);
+        return .{ .dict = c.content, .total_compressed_size = score, .buffer = buf };
+    }
+    fn release(g: *GateScorer, sel: Selection) void {
+        g.released.append(testing.allocator, std.mem.readInt(u32, sel.buffer[0..4], .little)) catch unreachable;
+        g.gpa.free(sel.buffer);
+    }
+};
+
+test "parallel optimizers: a refusal at any position is rerun from it, in grid order; a failure of its own is final" {
+    const gpa = testing.allocator;
+    const gen = try testSet("json-200");
+    defer gen.deinit(gpa);
+    const s: Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+    var one: [1500]u8 = undefined;
+    var many: [1500]u8 = undefined;
+    const hog = 1 << 20;
+    const p: OptimizeParams = .{ .d = 8, .f = 10 };
+    var lim1: LimitedAllocator = .init(gpa, std.math.maxInt(usize));
+    var g1: GateScorer = .{ .gpa = lim1.allocator(), .hog = hog, .hold = 0, .armed = .init(false) };
+    defer g1.released.deinit(testing.allocator);
+    const want = try optimize(.fast_cover, lim1.allocator(), &lim1, &one, s, p, &g1);
+    var p4 = p;
+    p4.nb_threads = 4;
+    // refused at position 1, 2 and 3: the rerun starts from there, with
+    // the head of the ring anywhere
+    for ([_]u32{ 1, 2, 3 }) |hold| {
+        var lim: LimitedAllocator = .init(gpa, lim1.peak + hold * hog + hog / 2);
+        var g: GateScorer = .{ .gpa = lim.allocator(), .hog = hog, .hold = hold };
+        defer g.released.deinit(testing.allocator);
+        optimize_retries.store(0, .monotonic);
+        const got = try optimize(.fast_cover, lim.allocator(), &lim, &many, s, p4, &g);
+        try testing.expect(!g.leaked_through.load(.monotonic));
+        try testing.expectEqual(@as(u32, 4 - hold), g.refusals.load(.monotonic));
+        try testing.expectEqual(@as(u32, 1), optimize_retries.load(.monotonic));
+        try testing.expectEqual(want, got);
+        try testing.expectEqualSlices(u8, one[0..want.size], many[0..got.size]);
+        // each k's last release is its comparison: in grid order, each once
+        var last: std.ArrayList(u32) = .empty;
+        defer last.deinit(testing.allocator);
+        for (g.released.items, 0..) |k, i| {
+            if (std.mem.indexOfScalar(u32, g.released.items[i + 1 ..], k) == null) try last.append(testing.allocator, k);
+        }
+        try testing.expectEqualSlices(u32, g1.released.items, last.items);
+        try testing.expectEqual(@as(usize, 0), lim.live);
+    }
+    // after the rerun (two at once), position 2 runs on a slot refused in
+    // the first round; its own OutOfMemory is final, not another rerun --
+    // with two at once, as it would be alone
+    {
+        var lim: LimitedAllocator = .init(gpa, lim1.peak + hog + hog / 2);
+        var g: GateScorer = .{ .gpa = lim.allocator(), .hog = hog, .hold = 1, .fail_at = 2 };
+        defer g.released.deinit(testing.allocator);
+        optimize_retries.store(0, .monotonic);
+        try testing.expectError(error.OutOfMemory, optimize(.fast_cover, lim.allocator(), &lim, &many, s, p4, &g));
+        try testing.expectEqual(@as(u32, 1), optimize_retries.load(.monotonic));
+        try testing.expectEqual(@as(usize, 0), lim.live);
+    }
 }
 
 test "LimitedAllocator: refuses past the limit, counts what is live" {
@@ -1706,6 +2354,32 @@ test "LimitedAllocator: refuses past the limit, counts what is live" {
     try testing.expectEqual(@as(usize, 0), lim.live);
     try testing.expectEqual(@as(usize, 1000), lim.peak);
     try testing.expectEqual(error.MemoryLimitExceeded, lim.map(@as(Error, error.OutOfMemory)));
+}
+
+test "LimitedAllocator: a failure of the allocator below gives its bytes back, and is not a refusal" {
+    var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = 0 });
+    var lim: LimitedAllocator = .init(failing.allocator(), 1000);
+    try testing.expectError(error.OutOfMemory, lim.allocator().alloc(u8, 600));
+    try testing.expectEqual(@as(usize, 0), lim.live);
+    try testing.expect(!lim.refused);
+    try testing.expectEqual(error.OutOfMemory, lim.map(@as(Error, error.OutOfMemory)));
+}
+
+test "LimitedAllocator: shrunk in place, the difference is live no more" {
+    var buf: [1000]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    var lim: LimitedAllocator = .init(fba.allocator(), 1000);
+    const a = lim.allocator();
+    const x = try a.alloc(u8, 600);
+    try testing.expect(a.resize(x, 200));
+    try testing.expectEqual(@as(usize, 200), lim.live);
+    // the 400 given back are there to take again
+    const y = try a.alloc(u8, 800);
+    try testing.expectEqual(@as(usize, 1000), lim.live);
+    a.free(y);
+    const shrunk: []u8 = x[0..200];
+    a.free(shrunk);
+    try testing.expectEqual(@as(usize, 0), lim.live);
 }
 
 test "the complete trainers hold their working memory under memory_limit" {

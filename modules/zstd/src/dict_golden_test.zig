@@ -142,7 +142,7 @@ const no_selection = 1000;
 const FinalOut = struct { size: usize, a: u64 = 0, b: u64 = 0 };
 
 /// The run as `tools/zfinal.c` performs it; the dictionary is `dict[0..size]`.
-fn finalRun(gpa: std.mem.Allocator, r: samples.FinalRun, s: db.Samples, dict: []u8) (db.Error || error{NoSelection})!FinalOut {
+fn finalRun(gpa: std.mem.Allocator, r: samples.FinalRun, s: db.Samples, dict: []u8, nb_threads: u32) (db.Error || error{NoSelection})!FinalOut {
     const split = std.fmt.parseFloat(f64, r.split) catch unreachable;
     const nb_finalize: usize = r.nb_finalize orelse s.sizes.len;
     switch (r.op) {
@@ -159,7 +159,7 @@ fn finalRun(gpa: std.mem.Allocator, r: samples.FinalRun, s: db.Samples, dict: []
         .cover => return .{ .size = try db.trainCover(gpa, dict, s, .{ .k = r.k, .d = r.d, .level = r.level, .dict_id = r.dict_id }) },
         .fastcover => return .{ .size = try db.trainFastCover(gpa, dict, s, .{ .k = r.k, .d = r.d, .f = r.f, .accel = r.accel, .level = r.level, .dict_id = r.dict_id }) },
         .optcover, .optfast => {
-            const p: db.OptimizeParams = .{ .k = r.k, .d = r.d, .steps = r.steps, .split_point = split, .f = r.f, .accel = r.accel, .level = r.level, .dict_id = r.dict_id };
+            const p: db.OptimizeParams = .{ .k = r.k, .d = r.d, .steps = r.steps, .split_point = split, .f = r.f, .accel = r.accel, .level = r.level, .dict_id = r.dict_id, .nb_threads = nb_threads };
             const o = if (r.op == .optcover) try db.optimizeCover(gpa, dict, s, p) else try db.optimizeFastCover(gpa, dict, s, p);
             return .{ .size = o.size, .a = o.k, .b = o.d };
         },
@@ -189,39 +189,52 @@ test "every finished-dictionary run has a row, and nothing else does" {
 }
 
 test "finished dictionaries are byte-identical to libzstd 1.5.7's" {
+    try finished(&.{1});
+}
+
+test "the optimizers give libzstd's single-threaded dictionaries with threads" {
+    try finished(&.{ 2, 3, 8 });
+}
+
+/// Every final run (with `threads` > 1: the optimizers' only) with each of
+/// `threads` against its golden.
+fn finished(threads: []const u32) !void {
     const gpa = std.testing.allocator;
     var mismatches: usize = 0;
     for (samples.final_runs, final_goldens.rows) |r, g| {
-        const gen = try samples.generate(gpa, samples.find(r.set));
-        defer gen.deinit(gpa);
-        const s: db.Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
-        const dict = try gpa.alloc(u8, r.capacity);
-        defer gpa.free(dict);
-        const out = finalRun(gpa, r, s, dict) catch |e| {
-            const code: u32 = if (e == error.NoSelection) no_selection else errorCode(@errorCast(e));
-            if (code != g.err) {
-                std.debug.print("MISMATCH {s} {s} cap {d}: {s}, libzstd error {d}\n", .{ @tagName(r.op), r.set, r.capacity, @errorName(e), g.err });
+        for (threads) |nb_threads| {
+            if (nb_threads > 1 and r.op != .optcover and r.op != .optfast) continue;
+            const gen = try samples.generate(gpa, samples.find(r.set));
+            defer gen.deinit(gpa);
+            const s: db.Samples = .{ .buffer = gen.buffer, .sizes = gen.sizes };
+            const dict = try gpa.alloc(u8, r.capacity);
+            defer gpa.free(dict);
+            const out = finalRun(gpa, r, s, dict, nb_threads) catch |e| {
+                const code: u32 = if (e == error.NoSelection) no_selection else errorCode(@errorCast(e));
+                if (code != g.err) {
+                    std.debug.print("MISMATCH {s} {s} cap {d} threads {d}: {s}, libzstd error {d}\n", .{ @tagName(r.op), r.set, r.capacity, nb_threads, @errorName(e), g.err });
+                    mismatches += 1;
+                }
+                continue;
+            };
+            const d = dict[0..out.size];
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(d, &digest, .{});
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            const hdr: i64 = if (db.getDictHeaderSize(d)) |h| @intCast(h) else |_| -30;
+            if (g.err != 0 or out.size != g.len or !std.mem.eql(u8, &hex, g.sha256) or hdr != g.hdr or out.a != g.a or out.b != g.b) {
+                std.debug.print("MISMATCH {s} {s} cap {d} threads {d}: len {d} hdr {d} a {d} b {d} (libzstd len {d} hdr {d} a {d} b {d} err {d})\n", .{ @tagName(r.op), r.set, r.capacity, nb_threads, out.size, hdr, out.a, out.b, g.len, g.hdr, g.a, g.b, g.err });
                 mismatches += 1;
+                continue;
             }
-            continue;
-        };
-        const d = dict[0..out.size];
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(d, &digest, .{});
-        const hex = std.fmt.bytesToHex(digest, .lower);
-        const hdr: i64 = if (db.getDictHeaderSize(d)) |h| @intCast(h) else |_| -30;
-        if (g.err != 0 or out.size != g.len or !std.mem.eql(u8, &hex, g.sha256) or hdr != g.hdr or out.a != g.a or out.b != g.b) {
-            std.debug.print("MISMATCH {s} {s} cap {d}: len {d} hdr {d} a {d} b {d} (libzstd len {d} hdr {d} a {d} b {d} err {d})\n", .{ @tagName(r.op), r.set, r.capacity, out.size, hdr, out.a, out.b, g.len, g.hdr, g.a, g.b, g.err });
-            mismatches += 1;
-            continue;
+            // the decoder takes it as a zstd dictionary with that ID (unless
+            // its tables overwrote the content, as addEntropyTablesFromBuffer
+            // may)
+            if (hdr < 0) continue;
+            var dd = try ddict.DDict.init(gpa, d, .full);
+            defer dd.deinit(gpa);
+            try std.testing.expectEqual(db.getDictId(d), dd.dictId());
         }
-        // the decoder takes it as a zstd dictionary with that ID (unless
-        // its tables overwrote the content, as addEntropyTablesFromBuffer
-        // may)
-        if (hdr < 0) continue;
-        var dd = try ddict.DDict.init(gpa, d, .full);
-        defer dd.deinit(gpa);
-        try std.testing.expectEqual(db.getDictId(d), dd.dictId());
     }
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }

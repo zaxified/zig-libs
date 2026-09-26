@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-25** — `OptimizeParams.nb_threads` (libzstd's `nbThreads`,
+  SPEC backlog Z9b): `optimizeCover` / `optimizeFastCover` (and
+  `optimize*With`, `trainFromSlices`) build and score candidates on that
+  many threads, and still return libzstd's SINGLE-threaded dictionary for
+  any count (libzstd with threads breaks ties by completion order). The
+  allocator (and a custom scorer) must be thread-safe then. `memory_limit`
+  bounds the sum over candidates in flight: fewer run at once instead of
+  the result changing. `Candidate` gains `gpa` (the candidate's share of
+  the ceiling, for a scorer's allocations); `LimitedAllocator` is
+  thread-safe and gains `View`.
+
 - **2026-09-25** — `Advanced.rsyncable` (`ZSTD_c_rsyncable`, SPEC backlog
   Z9b): with `nb_workers`, a rolling hash over the last 32 input bytes also
   ends a job where it hits a mask of about log2(job size) bits, so the

@@ -39,8 +39,6 @@ Not here yet, and a reader might expect it (each is a backlog item):
   libzstd's default buffered modes, frame after frame on one context; not
   the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
   independent one-shot frames — takes every level.
-- **`rsyncable` and the trainers' multithreaded optimizers (Z9b).**
-  Multithreaded compression itself is here (see *Multithreading*).
 
 ## Algorithm
 
@@ -335,7 +333,7 @@ raw block, as libzstd does.
 
 The five dictionary parameters are described in *Dictionaries*. Not here,
 each with its backlog item: `prefetchCDictTables` (Z4; it changes speed
-only); `rsyncable` (Z9b);
+only);
 `repcodeResolution` (formerly `searchForExternalRepcodes`),
 `blockDelimiters`, `validateSequences`, `enableSeqProducerFallback` (they
 act on external sequences: Z10); `stableInBuffer` / `stableOutBuffer` (Z1).
@@ -893,8 +891,23 @@ job prepared but not posted does not leave it for the next frame (libzstd
 keeps `jobReady`). `estimateCompressorSize` / `estimateStreamSize` size the
 single-threaded context only (libzstd refuses to estimate with workers);
 `MtCtx.memorySize` reports what a multithreaded context holds.
-`ZSTD_c_rsyncable` and the dictionary trainers' multithreaded optimizers
-are Z9b (`zstdmt.MtCtx.toLoad` is `findSynchronizationPoint` without it).
+
+**`rsyncable`** (Z9b, `ZSTD_c_rsyncable`, `Advanced.rsyncable`): while
+input is copied into the round buffer, `findSynchronizationPoint` rolls a
+hash over the last 32 bytes (`ZSTD_rollingHash_*`: a polynomial in
+`prime8bytes` over the bytes plus 10, modulo 2^64) and ends the job
+right after the first byte, at least 128 KB (`RSYNC_MIN_BLOCK_SIZE`) into
+it, where the hash's low log2(section size in KB) + 10 bits are all set
+-- the mask is taken from the job size before it is raised to the overlap
+size, as libzstd does -- turning the call's `continue` into a `flush`; so
+jobs, and the output, resynchronize after a local change of the input.
+The hash is started from the input when the 128 KB point lies 32 bytes or
+more into it, else from the buffered tail; with 128 KB already buffered,
+from the buffer's last 32 bytes, and a hit there (a job cut but not yet
+taken, the job table being full) loads nothing until it is. Like libzstd,
+a frame kept on the calling thread ignores it. The one branch never
+taken: "fewer than 32 bytes to hash" (it needs a buffer under 32 bytes
+with 128 KB in view, which the section size of 512 KB and up rules out).
 
 ## Decoder
 
@@ -1160,8 +1173,9 @@ whatever the caller sets, so no public trainer shrinks; `selectDict` offers
 it, anchored through `tools/zfinal.c` calling `COVER_selectDict` directly.
 `optimizeCover` / `optimizeFastCover` plug `selectDict` into Z5a's grid:
 the first strictly smallest total wins, as `COVER_best_finish` decides in
-submission order when single-threaded; libzstd's thread pool would break
-ties by completion order instead. `train` is `ZDICT_trainFromBuffer`
+submission order when single-threaded -- with threads too (see
+*Multithreaded optimizers* below; libzstd's thread pool breaks ties by
+completion order instead). `train` is `ZDICT_trainFromBuffer`
 (fastCover, d = 8, steps = 4, level 3). A failed candidate (finalization
 or compression error) is skipped, as libzstd's error selections never beat
 the best; none left is `error.NoCandidate` (libzstd `GENERIC`).
@@ -1173,7 +1187,38 @@ working memory, the dictionary buffer excluded: the complete trainers run
 on a `LimitedAllocator` that refuses any allocation past it
 (`error.MemoryLimitExceeded`), so finalization's compressor and `CDict`,
 the optimizer's candidates and scoring count too (the content selection
-is still checked up front, before allocating). `trainFromSlices` takes the
+is still checked up front, before allocating).
+
+**Multithreaded optimizers** (Z9b, `OptimizeParams.nb_threads`, libzstd's
+`nbThreads`). libzstd posts each (k, d) candidate to a pool
+(`POOL_create(nbThreads, 1)`), and `COVER_best_finish` keeps, under a
+mutex, any candidate strictly better than the best *so far*: of two
+candidates with the same total, whichever finishes first wins, so its
+result with threads depends on the timing -- which a byte-identical port
+cannot follow. The port runs the candidates of one d on `nb_threads`
+worker threads (a slot and a thread each, fed through a futex like
+`zstdmt.zig`'s; no libc) but compares them on the calling thread in grid
+order, so the first strictly smallest total wins -- libzstd's
+single-threaded result, which the goldens pin, for every thread count.
+Measured on the random diff below: libzstd with 4 threads returned
+another dictionary than its own single-threaded run on 7 of 300 runs; the
+port never did. Memory: each candidate in flight holds its own
+frequencies copy (cover: 4 bytes per training d-mer; fastCover: 6 · 2^f
+bytes), buffer and scorer (finalization, a `CDict` and a compressor), so
+threads multiply the working memory. `memory_limit` bounds the sum rather
+than each candidate, and the thread count must not change the answer:
+fewer candidates run at once when the ceiling does not hold `nb_threads`
+content selections next to the context (a static count), and a candidate
+refused by the ceiling while others held memory -- the scorers' memory is
+not known up front -- is run again after the others are dropped, with half
+as many at once; refused alone, the refusal is final
+(`MemoryLimitExceeded`), exactly where one thread is refused. Each
+candidate charges its own `LimitedAllocator.View` of the one ceiling to
+tell its own refusals apart; the slots and threads (a few hundred bytes)
+are not counted. Refusing `nb_threads` beyond what the ceiling holds was
+the alternative: it would make a call that succeeds with one thread fail
+with more, for the same memory. The allocator must be thread-safe with
+`nb_threads` > 1, and so must a scorer given to `optimize*With`. `trainFromSlices` takes the
 samples as `[]const []const u8` and copies them into one buffer (the
 trainers need them contiguous: segments cross sample boundaries); the copy
 counts against the limit. Levels above 22 are `LevelUnsupported` (libzstd
@@ -1803,6 +1848,58 @@ in flight than threads, which could overwrite a queued job; the
 round-buffer in-use check skipped for one job too many, which could
 overwrite a running job's input).
 
+**`rsyncable`** (Z9b, 2026-09-25): 14 more `mt_cases` (32 rows) with
+`rsyncable=1`, most on `rsync_marks` inputs -- words with a 32-byte
+trigger whose rolling hash has 30 low bits set placed at chosen offsets,
+and every other window that would hit a 19-bit mask edited away -- so the
+jobs are cut where the case says (checked with a probe when they were
+made): one byte before a cut may happen and exactly at the first byte it
+may; a full job's last byte and just past it; jobs of one 512 KB chunk and
+of a chunk and a byte; one 16 MB default job cut by the marks alone;
+overlap 9 raising the section size over the mask's; LDM; a dictionary;
+natural data; a frame too small for workers; streams whose hash starts
+from the buffered tail, at exactly 128 KB buffered, and at a buffered hit
+while the job table is full (a 50-byte output buffer). The recipe checks
+1 worker against 3; the test runs 1, 2, 4, 8 and inline. 1 600 random
+runs against libzstd (one-shot and stream plans, 0.1–2.6 MB with up to 25
+triggers at random places, levels −5..19, random job size, overlap, LDM,
+window, 1–4 workers): all identical. Mutation sweep, 38 mutants: 33 caught
+(3 after the cases they asked for: overlap 9 on natural data, the call
+ending at 128 KB, `rsyncable` left on a reused context -- a unit test), 5
+equivalent: the "too little to hash" return (unreachable, see
+*Multithreading*) dropped or at `<=`; the "too little input" return at
+`<=` (at equality the scan is empty); the input-start test at `pos > 32`
+(at 32 the tail branch hashes the same 32 input bytes, and `prev` is not
+read); the missing `break` after a hit (the loop bound is the new
+`to_load`, so it ends anyway).
+
+**Multithreaded optimizers** (Z9b, 2026-09-25): `dict_golden_test.zig`
+runs every optimizer row of the finished-dictionary goldens with 2, 3 and
+8 threads: libzstd's single-threaded dictionary, k and d each time; a
+unit test compares 0/2/3/4/8/64 threads against one with a scorer that
+ties a lot (a hash mod 5); another bisects the smallest `memory_limit`
+one thread succeeds with, and checks that 4 threads succeed with the same
+dictionary under it, stay under it, and are refused one byte lower. The
+rerun after a refusal does not wait for contention to happen: a scorer
+gates the first round so that the ceiling refuses at grid position 1, 2
+or 3 whatever the scheduling (exactly one rerun, grid order, nothing
+live after), and a scorer's own OutOfMemory on a slot refused before is
+final. Test seams record the slot count (at most one d's 41 candidates;
+0 and 1 thread run on the caller) and the static count (4 with no
+ceiling, 1 at the lowest ceiling the up-front check lets through). 300 random
+optimizer runs (both trainers, 5–700 samples, random k, d, steps, split,
+f, accel, level, ID; 2–8 threads) against `tools/zfinal.c`: the same
+dictionary, k and d or the same refusal as libzstd single-threaded, and
+N threads = 1 thread, on all; libzstd itself with 4 threads gave another
+dictionary than single-threaded on 7 of them (on 2 in a rerun of the same
+300 on 2026-09-26: its ties go by completion order). Mutation sweep, 33 mutants of the
+driver and `LimitedAllocator`: 32 caught (8 only after the seams above,
+2 after unit tests of a failing child allocator and an in-place shrink),
+1 equivalent: the rerun keeping the old in-flight count (the drained
+slots are idle with no result, so they compare as nothing until the
+count is back under the new one, and the reposted candidates follow them
+in grid order).
+
 **Anchor grade:** class A · oracle EXTERNAL
 
 ## Speed
@@ -1925,8 +2022,7 @@ dictionaries are undecided.
   ~~**Z5b**~~ done 2026-09-25: finalization, `COVER_selectDict` (with
   shrinking) as the optimizers' score, the complete trainers and
   `ZDICT_trainFromBuffer` (see *Dictionary training*). The legacy
-  divsufsort trainer: no. Left: multithreaded optimizers (libzstd's pool;
-  ties by completion order make them nondeterministic, so only with Z9).
+  divsufsort trainer: no. The multithreaded optimizers: Z9b.
 - ~~**Z6 — Advanced parameters.**~~ Done 2026-09-24, see *Advanced
   parameters*: the explicit compression parameters with libzstd's bounds
   and derivation, the content-size flag, magicless frames (both ways),
@@ -1942,10 +2038,10 @@ dictionaries are undecided.
 - **Z9 — Multithreaded compression** (`zstdmt_compress.c`, ~1 900 lines).
   ~~**Z9a**~~ done 2026-09-25 (see *Multithreading*): jobs, overlap, the
   round buffer, LDM and the checksum across jobs, flushing, dictionaries,
-  `ZSTD_compress2` and `ZSTD_compressStream2` with workers. Left, **Z9b**:
-  `rsyncable` (`findSynchronizationPoint`, seam `MtCtx.toLoad`) and the
-  dictionary trainers' multithreaded optimizers (libzstd breaks ties by
-  completion order: decide what to match).
+  `ZSTD_compress2` and `ZSTD_compressStream2` with workers. ~~**Z9b**~~
+  done 2026-09-25: `rsyncable` (*Multithreading*) and the dictionary
+  trainers' multithreaded optimizers, deterministic: libzstd's
+  single-threaded winner for any thread count (*Dictionary training*).
 - **Z10 — Sequence-level API.** `ZSTD_compressSequences`,
   `ZSTD_generateSequences`, the external sequence producer, and their
   parameters (`repcodeResolution`, `blockDelimiters`, `validateSequences`,

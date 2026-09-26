@@ -23,12 +23,13 @@ inputs under 8/16/32 KB by strategy, or unknown sizes.
 **training** (`zstd.dict_builder`: cover, fastCover, the optimizers,
 `ZDICT_trainFromBuffer`, finalization — the same finished dictionaries as
 libzstd), and so is **multithreaded** compression
-(`Advanced.nb_workers`, `job_size`, `overlap_log`: libzstd's jobs, overlap,
-long-distance matching across jobs — the same bytes as libzstd's for any
-worker count, on a small pool of `std.Thread`s without libc). The
-stable-buffer part of the streaming API, `rsyncable` and the trainers'
-multithreaded optimizers are queued in [SPEC.md](SPEC.md) (*Backlog /
-deferred*, with costs).
+(`Advanced.nb_workers`, `job_size`, `overlap_log`, `rsyncable`: libzstd's
+jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
+— the same bytes as libzstd's for any worker count, on a small pool of
+`std.Thread`s without libc), and the optimizers train on several threads
+(`OptimizeParams.nb_threads`, the single-threaded result for any count).
+The stable-buffer part of the streaming API is queued in
+[SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
@@ -301,6 +302,8 @@ const n2 = try db.trainFastCover(gpa, &dict, s, .{ .k = 200, .level = 19 });
 const n3 = try db.trainCover(gpa, &dict, s, .{ .k = 200, .d = 6 });
 // the optimizers (libzstd's defaults for k, d, steps; the chosen k, d back)
 const o = try db.optimizeCover(gpa, &dict, s, .{ .steps = 8 });
+// ... on 8 threads: the same dictionary (gpa must be thread-safe)
+const o8 = try db.optimizeCover(gpa, &dict, s, .{ .steps = 8, .nb_threads = 8 });
 // samples in separate slices: copied into one buffer first (counted)
 const n4 = try db.trainFromSlices(gpa, &dict, slices, .{ .fast_cover = .{ .k = 200 } });
 // your own content: header, entropy tables and ID in front of it
@@ -318,7 +321,8 @@ Memory: `memory_limit` (default 256 MiB) bounds all the working memory —
 content selection (cover: 8 bytes per sample byte, `estimateCoverMemory`;
 fastCover: 6 · 2^f bytes, `estimateFastCoverMemory`), finalization and the
 optimizers' scoring — but not the dictionary buffer; past it,
-`error.MemoryLimitExceeded`. Other errors are libzstd's:
+`error.MemoryLimitExceeded`. With `nb_threads` it bounds the sum over the
+candidates in flight: fewer run at once rather than the answer changing. Other errors are libzstd's:
 `ParameterOutOfBound`, `SrcSizeWrong` (fewer than 5 samples, under 8 bytes,
 4 GiB and up, sizes past the buffer), `DstSizeTooSmall`,
 `DictionaryCreationFailed`, `Generic`, `NoCandidate` (no optimizer candidate
