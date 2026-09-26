@@ -32,8 +32,13 @@ constraints and messages); containers are walked in place (`required` settled at
 `min_len`/`max_len` at array end); a container whose rule has `custom` is materialized — that subtree
 only — and checked by the tree code; error paths are stack-frame chains rendered only when an error
 is recorded; both typed rule sets (derived + `T.validate_rules`) are walked together and
-deduplicated as in the tree path. Then `std.json.parseFromSliceLeaky(T)` decodes with strings
-borrowed from the body. Differences by design: errors in document order (tree: schema order), and a
+deduplicated as in the tree path. The walker is push-shaped (an explicit frame stack, fed one whole
+token at a time), so for a typed body `std.json.parseFromTokenSourceLeaky(T)` pulls the tokens
+through a tap that feeds each to the walker, which checks the structural limits on the way too:
+**one tokenization** where there used to be three (limit pre-scan, walk, decode). A document the
+decoder refuses, or the walker stops (duplicate key, a limit), is answered by the multi-pass path
+instead -- pre-scan, walk, `parseFromSliceLeaky` -- so an invalid document gets exactly the report
+and precedence it always had. Strings are borrowed from the body. Differences by design: errors in document order (tree: schema order), and a
 different subset past `max_errors`. Equality of the error SET and of decoded values is pinned by a
 differential fuzz target against the tree path.
 
@@ -71,7 +76,14 @@ problem details (`writeErrorsProblem`, `application/problem+json`) is deferred u
 `router`-middleware consumer asks — the one consumer that wanted problem+json (qap,
 2026-09-22) calls the core directly, not the middleware.
 
-`parseIntoLeaky` scans the body twice: `streamValidate` walks it with a `std.json.Scanner`,
+~~`parseIntoLeaky` scans the body twice~~ — DONE 2026-09-26 (qap M7.3), see *Streaming path*:
+one tokenization for every document that decodes (`parseOnePass`), the multi-pass path for the
+rest (`parseMultiPass`), both pinned against each other on the corpus and in the differential
+fuzz target. Measured on a 33-byte two-field body (`perf stat instructions:u`, ReleaseFast,
+stable to the instruction): 7,357 → 5,034 instructions per parse, against 2,221 for a bare
+`parseFromSliceLeaky` -- the typed layer's cost down from +5.1 k to +2.8 k. It was three
+tokenizations, not two: `jsonLimitError`'s pre-scan counted as well. History of the item:
+`parseIntoLeaky` scanned the body twice: `streamValidate` walks it with a `std.json.Scanner`,
 then `std.json.parseFromSliceLeaky` tokenizes it again to build `T`. Measured by qap
 (2026-09-23, a 50-byte two-field body, `perf stat instructions:u`, stable to ±2 instr): the
 typed layer costs **+7.6 k user instructions per request** over a hand-written

@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — **`parseIntoLeaky` validates and decodes in one tokenization.** The streaming
+  walker is push-shaped now (an explicit frame stack fed whole tokens), and `std.json`'s typed
+  decoder pulls the tokens through a tap that feeds each to it, with the structural limits
+  checked on the way: one pass over the body where there were three (limit pre-scan, validation
+  walk, decode). A document the decoder refuses, or the walker stops (duplicate key, a limit),
+  takes the old multi-pass path, so every invalid document is reported exactly as before; the two
+  paths are pinned against each other on the corpus and in the differential fuzz target. A 33-byte
+  two-field body: 7,357 → 5,034 instructions per parse (bare `parseFromSliceLeaky`: 2,221).
+  `validateJsonStreaming` runs on the same walker. No API change. (SPEC backlog, found by qap.)
+
 - **2026-09-22** — **New: `writeJsonSchema(rules, w)` / `writeJsonSchemaFor(T, w)`** — the
   rules as a JSON Schema 2020-12 document, for an API description (OpenAPI 3.1 embeds 2020-12
   as is). Faithful mapping: lengths in code points (`minLength`) and items (`minItems`), `.any`

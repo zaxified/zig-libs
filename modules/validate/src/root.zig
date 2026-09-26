@@ -1496,14 +1496,60 @@ pub fn LeakyResult(comptime T: type) type {
 }
 
 /// `parseIntoLimited` without the value tree: the same rules (`rulesFor(T)`
-/// plus `T.validate_rules`), the same error codes and messages, validated in
-/// one streaming pass, then decoded by `std.json.parseFromSliceLeaky` with
-/// strings borrowed from `body`. Memory is of the order of the body, not a
+/// plus `T.validate_rules`), the same error codes and messages, validated
+/// and decoded in one tokenization (`parseOnePass`; an invalid document may
+/// take a second look, `parseMultiPass`), with strings borrowed from
+/// `body`. Memory is of the order of the body, not a
 /// multiple of it, so `arena` can be a fixed per-request buffer. Pass an
 /// arena-like allocator: the decoded `T` is never freed piecemeal (the
 /// `Leaky` convention of `std.json`). Errors come in document order.
 pub fn parseIntoLeaky(comptime T: type, arena: Allocator, body: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
     const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+    if (try parseOnePass(T, arena, body, limits, extra)) |r| return r;
+    return parseMultiPass(T, arena, body, limits, extra);
+}
+
+/// The common case in ONE tokenization: `std.json`'s typed decoder pulls the
+/// tokens through a `TokenTap`, which feeds each to a `Walker` that also
+/// checks the structural limits on the way. A document that decodes -- valid,
+/// or invalid against rules the decoder does not know -- is answered here.
+/// Null when it does not decode, or the walker refused it (a duplicate key,
+/// a limit): `parseMultiPass` then gives the exact report, in the precedence
+/// it always had (limits first, then JSON errors, then rules). The walker's
+/// own memory is a stack buffer first, so a body-sized arena still fits.
+fn parseOnePass(comptime T: type, arena: Allocator, body: []const u8, limits: Limits, extra: []const Rule) Allocator.Error!?LeakyResult(T) {
+    var fallback = std.heap.stackFallback(2048, arena);
+    const scratch = fallback.get();
+    var b = Builder.initCapped(arena, limits.max_errors);
+    var w: Walker = undefined;
+    w.start(scratch, body.len, &b, comptime rulesFor(T), extra, limits);
+    defer w.deinit();
+    var tap: TokenTap = .{ .scanner = .initCompleteInput(scratch, body), .w = &w };
+    defer tap.deinit();
+    const value = std.json.parseFromTokenSourceLeaky(T, arena, &tap, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_if_needed,
+        .max_value_len = body.len,
+    }) catch |err| {
+        b.abort();
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return null;
+    };
+    w.finish() catch |err| {
+        b.abort();
+        return err;
+    };
+    var report = b.finish();
+    if (!report.ok()) return .{ .invalid = report };
+    report.deinit();
+    return .{ .ok = value };
+}
+
+/// Limits, then the streaming validation, then the decode: three
+/// tokenizations. The path every document took before `parseOnePass`, kept
+/// for the ones it hands back, so an invalid document is reported exactly
+/// as it always was.
+fn parseMultiPass(comptime T: type, arena: Allocator, body: []const u8, limits: Limits, extra: []const Rule) Allocator.Error!LeakyResult(T) {
     {
         var report = try streamValidate(arena, body, comptime rulesFor(T), extra, limits);
         if (!report.ok()) return .{ .invalid = report };
@@ -1561,46 +1607,39 @@ fn streamValidate(gpa: Allocator, body: []const u8, schema: []const Rule, extra:
 /// it into json_invalid and drops whatever validation errors were found --
 /// or null. Only `OutOfMemory` propagates.
 fn walkDocument(b: *Builder, gpa: Allocator, body: []const u8, schema: []const Rule, extra: []const Rule) Allocator.Error!?anyerror {
-    var s: Stream = .{
-        .scanner = std.json.Scanner.initCompleteInput(gpa, body),
-        .gpa = gpa,
-        .body_len = body.len,
-        .b = b,
-    };
-    defer s.deinit();
-
-    // The document root is held to an implicit `.object` rule per rule set,
-    // which is `checkValue`'s root behaviour: a non-object root is one
-    // `object_type` error at path "".
-    const roots = [2]Rule{
-        .{ .field = "", .kind = .object, .fields = schema },
-        .{ .field = "", .kind = .object, .fields = extra },
-    };
-    const actives = [2]Active{ .{ .rule = &roots[0], .pass = 0 }, .{ .rule = &roots[1], .pass = 1 } };
-    const active: []const Active = if (extra.len == 0) actives[0..1] else actives[0..2];
-
-    // A non-OOM error here is the document's, not ours: it is the VALUE this
-    // function returns, hence the `@as` -- a bare `return err` would raise it.
-    s.walkValue(null, active) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return @as(?anyerror, err),
-    };
-    const last = s.scanner.next() catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return @as(?anyerror, err),
-    };
-    if (last != .end_of_document) return @as(?anyerror, error.SyntaxError);
-
-    // Merge the second rule set's errors after the first's, minus the pairs
-    // the first already reported.
-    s.use(0);
-    const first_len = b.list.items.len;
-    for (s.other.items) |e| {
-        if (b.full()) break;
-        try b.list.append(b.a(), e);
+    var scanner = std.json.Scanner.initCompleteInput(gpa, body);
+    defer scanner.deinit();
+    // The walker's frames and key copies: a stack buffer first, as the
+    // recursion's locals were.
+    var fallback = std.heap.stackFallback(1024, gpa);
+    var w: Walker = undefined;
+    w.start(fallback.get(), body.len, b, schema, extra, null);
+    defer w.deinit();
+    while (true) {
+        // A non-OOM error here is the document's, not ours: it is the VALUE
+        // this function returns, hence the `@as` -- a bare `return err` would
+        // raise it.
+        const token = scanner.nextAllocMax(gpa, .alloc_if_needed, body.len) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return @as(?anyerror, err),
+        };
+        if (token == .end_of_document) break;
+        defer freeToken(gpa, token);
+        w.feed(token) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.DuplicateField => return @as(?anyerror, error.DuplicateField),
+            error.LimitExceeded => unreachable, // no inline limits on this path
+        };
     }
-    b.dedupeFrom(first_len);
+    try w.finish();
     return null;
+}
+
+fn freeToken(gpa: Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_string, .allocated_number => |s| gpa.free(s),
+        else => {},
+    }
 }
 
 /// One rule applying to the value being walked, and which rule set it came
@@ -1619,8 +1658,24 @@ const Seg = struct {
     rendered: ?[]const u8 = null,
 };
 
-const Stream = struct {
-    scanner: std.json.Scanner,
+/// The streaming validator, push-shaped: `feed` it every token of one
+/// document in order -- whole tokens, strings and numbers as `nextAllocMax`
+/// gives them, never `partial_*` -- then `finish`. Push rather than pull so
+/// that something else can drive the scanner: `parseIntoLeaky` lets
+/// `std.json`'s typed decoder pull the tokens and hands each one here on the
+/// way (`TokenTap`), which is what makes the typed path one pass. The
+/// recursion a pull walker would use is an explicit stack of `Frame`s, heap
+/// allocated one per depth and kept for reuse, so the `Seg` a child points
+/// at never moves.
+///
+/// Rules and reporting are the pull walker's that this replaced, unchanged:
+/// a scalar is a one-node `Value` checked by `checkRule`; containers are
+/// walked in place (`required` at object end, lengths at array end); a
+/// container under a `custom` rule is materialized (that subtree only) and
+/// checked whole; duplicate keys are refused at every depth after their
+/// value, as the tree parser refuses them.
+const Walker = struct {
+    /// Walker-internal memory: frames, key copies, materialized subtrees.
     gpa: Allocator,
     body_len: usize,
     b: *Builder,
@@ -1628,51 +1683,144 @@ const Stream = struct {
     other: std.ArrayList(Error) = .empty,
     current: u1 = 0,
     /// Keys of every object currently open, innermost last -- the duplicate
-    /// check. `owned` keys were unescaped into `gpa` and are freed when their
+    /// check. `owned` keys were copied into `gpa` and are freed when their
     /// object closes.
     keys: std.ArrayList(Key) = .empty,
+    /// Structural limits checked on the way (the one-pass typed path). Null
+    /// when the caller ran `jsonLimitError` first.
+    limit: ?LimitScan = null,
+    frames: std.ArrayList(*Frame) = .empty,
+    depth: usize = 0,
+    roots: [2]Rule = undefined,
+    actives: [2]Active = undefined,
+    root_active: []const Active = &.{},
+    /// The root value is complete.
+    done: bool = false,
+    mat: Mat = .{},
 
     const Key = struct { name: []const u8, owned: bool };
 
-    const WalkError = std.json.Scanner.AllocError || error{ DuplicateField, BufferUnderrun };
+    const WalkError = Allocator.Error || error{
+        DuplicateField,
+        /// A structural limit (see `limit`); the caller reports it.
+        LimitExceeded,
+    };
 
-    fn deinit(s: *Stream) void {
-        s.freeKeysFrom(0);
-        s.keys.deinit(s.gpa);
-        s.scanner.deinit();
+    const Fields = struct { rules: []const Rule, pass: u1, seen: std.ArrayList(bool) = .empty };
+
+    const Frame = struct {
+        kind: ContainerKind,
+        /// This container's place (null = the root). Points into the parent
+        /// frame's `child`, which stays put while this frame lives.
+        seg: ?*Seg,
+        /// Objects: one entry per rule that passed the gate and has fields.
+        sets: std.ArrayList(Fields) = .empty,
+        sets_len: usize = 0,
+        /// Objects: `keys` length when this object opened.
+        key_mark: usize = 0,
+        /// Objects: the next token is a key; else that key's value.
+        expect_key: bool = true,
+        /// Objects: the key just read repeats one of this object's.
+        dup: bool = false,
+        /// Arrays: the rules that passed the gate (lengths are settled at the end).
+        gated: std.ArrayList(Active) = .empty,
+        /// The rules for the value at the current position: the matched
+        /// fields' rules, or the array's `items` rules.
+        children: std.ArrayList(Active) = .empty,
+        count: usize = 0,
+        /// The current child's place.
+        child: Seg = .{ .parent = null },
+
+        fn fieldSets(f: *Frame) []Fields {
+            return f.sets.items[0..f.sets_len];
+        }
+    };
+
+    /// A subtree some rule needs as a `Value` (its `custom` predicate), being
+    /// built from the tokens as they arrive.
+    const Mat = struct {
+        arena: ?std.heap.ArenaAllocator = null,
+        /// Open containers, innermost last; `key` is an object's pending key.
+        stack: std.ArrayList(struct { v: Value, key: ?[]const u8 = null }) = .empty,
+        seg: ?*Seg = null,
+        active: []const Active = &.{},
+    };
+
+    /// In place: `actives` points at `roots`.
+    fn start(w: *Walker, gpa: Allocator, body_len: usize, b: *Builder, schema: []const Rule, extra: []const Rule, limits: ?Limits) void {
+        w.* = .{ .gpa = gpa, .body_len = body_len, .b = b };
+        if (limits) |l| w.limit = .{ .gpa = gpa, .limits = l, .frames = .empty };
+        // The document root is held to an implicit `.object` rule per rule
+        // set, which is `checkValue`'s root behaviour: a non-object root is
+        // one `object_type` error at path "".
+        w.roots = .{
+            .{ .field = "", .kind = .object, .fields = schema },
+            .{ .field = "", .kind = .object, .fields = extra },
+        };
+        w.actives = .{ .{ .rule = &w.roots[0], .pass = 0 }, .{ .rule = &w.roots[1], .pass = 1 } };
+        w.root_active = if (extra.len == 0) w.actives[0..1] else w.actives[0..2];
     }
 
-    fn freeKeysFrom(s: *Stream, mark: usize) void {
-        var i = s.keys.items.len;
+    fn deinit(w: *Walker) void {
+        w.freeKeysFrom(0);
+        w.keys.deinit(w.gpa);
+        for (w.frames.items) |f| {
+            for (f.sets.items) |*s| s.seen.deinit(w.gpa);
+            f.sets.deinit(w.gpa);
+            f.gated.deinit(w.gpa);
+            f.children.deinit(w.gpa);
+            w.gpa.destroy(f);
+        }
+        w.frames.deinit(w.gpa);
+        w.matReset();
+        w.mat.stack.deinit(w.gpa);
+        if (w.limit) |*l| l.frames.deinit(w.gpa);
+    }
+
+    /// Merge the second rule set's errors after the first's, minus the pairs
+    /// the first already reported.
+    fn finish(w: *Walker) Allocator.Error!void {
+        std.debug.assert(w.done);
+        w.use(0);
+        const first_len = w.b.list.items.len;
+        for (w.other.items) |e| {
+            if (w.b.full()) break;
+            try w.b.list.append(w.b.a(), e);
+        }
+        w.b.dedupeFrom(first_len);
+    }
+
+    fn freeKeysFrom(w: *Walker, mark: usize) void {
+        var i = w.keys.items.len;
         while (i > mark) {
             i -= 1;
-            const k = s.keys.items[i];
-            if (k.owned) s.gpa.free(k.name);
+            const k = w.keys.items[i];
+            if (k.owned) w.gpa.free(k.name);
         }
-        s.keys.shrinkRetainingCapacity(mark);
+        w.keys.shrinkRetainingCapacity(mark);
     }
 
     /// Point `b.list` at rule set `pass`'s error list. Both lists allocate
     /// from `b`'s arena, so either can end up in the Report.
-    fn use(s: *Stream, pass: u1) void {
-        if (s.current == pass) return;
-        std.mem.swap(std.ArrayList(Error), &s.b.list, &s.other);
-        s.current = pass;
+    fn use(w: *Walker, pass: u1) void {
+        if (w.current == pass) return;
+        std.mem.swap(std.ArrayList(Error), &w.b.list, &w.other);
+        w.current = pass;
     }
 
-    fn path(s: *Stream, seg: ?*Seg) Allocator.Error![]const u8 {
+    fn path(w: *Walker, seg: ?*Seg) Allocator.Error![]const u8 {
         const node = seg orelse return "";
         if (node.rendered) |r| return r;
         const r = if (node.parent) |p| blk: {
-            const prefix = try s.path(p);
+            const prefix = try w.path(p);
             break :blk if (node.is_index)
-                try std.fmt.allocPrint(s.b.a(), "{s}[{d}]", .{ prefix, node.index })
+                try std.fmt.allocPrint(w.b.a(), "{s}[{d}]", .{ prefix, node.index })
             else if (prefix.len == 0)
                 node.field
             else
-                try std.fmt.allocPrint(s.b.a(), "{s}.{s}", .{ prefix, node.field });
+                try std.fmt.allocPrint(w.b.a(), "{s}.{s}", .{ prefix, node.field });
         } else if (node.is_index)
-            try std.fmt.allocPrint(s.b.a(), "[{d}]", .{node.index})
+            try std.fmt.allocPrint(w.b.a(), "[{d}]", .{node.index})
         else
             node.field;
         node.rendered = r;
@@ -1683,183 +1831,415 @@ const Stream = struct {
     /// only if the rule reported something: `checkRule` is given a
     /// placeholder, and the entries it appended are repointed afterwards.
     /// A container's rule recurses with its path, so it gets the real one.
-    fn check(s: *Stream, seg: ?*Seg, v: Value, a: Active) Allocator.Error!void {
-        s.use(a.pass);
-        if (s.b.full()) return;
-        if (v == .array or v == .object) return checkRule(s.b, try s.path(seg), v, a.rule);
-        const mark = s.b.list.items.len;
-        try checkRule(s.b, "", v, a.rule);
-        if (s.b.list.items.len == mark) return;
-        const p = try s.path(seg);
-        for (s.b.list.items[mark..]) |*e| e.path = p;
-    }
-
-    fn walkValue(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
-        switch (try s.scanner.peekNextTokenType()) {
-            .object_begin, .array_begin => {
-                for (active) |a| if (a.rule.custom != null) return s.materialize(seg, active);
-                if (try s.scanner.peekNextTokenType() == .object_begin)
-                    return s.walkObject(seg, active);
-                return s.walkArray(seg, active);
-            },
-            else => return s.walkScalar(seg, active),
-        }
-    }
-
-    fn walkScalar(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
-        const token = try s.scanner.nextAllocMax(s.gpa, .alloc_if_needed, s.body_len);
-        var owned: ?[]const u8 = null;
-        defer if (owned) |o| s.gpa.free(o);
-        const v: Value = switch (token) {
-            .string => |str| .{ .string = str },
-            .allocated_string => |str| blk: {
-                owned = str;
-                break :blk .{ .string = str };
-            },
-            .number => |n| Value.parseFromNumberSlice(n),
-            .allocated_number => |n| blk: {
-                owned = n;
-                break :blk Value.parseFromNumberSlice(n);
-            },
-            .true => .{ .bool = true },
-            .false => .{ .bool = false },
-            .null => .null,
-            else => unreachable, // peeked: not a container, not an end
-        };
-        for (active) |a| try s.check(seg, v, a);
-    }
-
-    /// A subtree some rule needs as a `Value` (its `custom` predicate): parse
-    /// just that subtree and let the tree path check it.
-    fn materialize(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
-        var arena = std.heap.ArenaAllocator.init(s.gpa);
-        defer arena.deinit();
-        const v = std.json.Value.jsonParse(arena.allocator(), &s.scanner, .{
-            .max_value_len = s.body_len,
-            .allocate = .alloc_always,
-        }) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.DuplicateField => return error.DuplicateField,
-            error.SyntaxError => return error.SyntaxError,
-            error.UnexpectedEndOfInput => return error.UnexpectedEndOfInput,
-            error.ValueTooLong => return error.ValueTooLong,
-            else => return error.SyntaxError, // type-directed errors: unreachable for Value
-        };
-        for (active) |a| try s.check(seg, v, a);
+    fn check(w: *Walker, seg: ?*Seg, v: Value, a: Active) Allocator.Error!void {
+        w.use(a.pass);
+        if (w.b.full()) return;
+        if (v == .array or v == .object) return checkRule(w.b, try w.path(seg), v, a.rule);
+        const mark = w.b.list.items.len;
+        try checkRule(w.b, "", v, a.rule);
+        if (w.b.list.items.len == mark) return;
+        const p = try w.path(seg);
+        for (w.b.list.items[mark..]) |*e| e.path = p;
     }
 
     /// The container type gate of `checkRule`, for rule `a` and a container
     /// of `kind` (.array / .object): true when the rule's constraints apply.
-    fn gate(s: *Stream, seg: ?*Seg, a: Active, kind: Kind) Allocator.Error!bool {
+    fn gate(w: *Walker, seg: ?*Seg, a: Active, kind: Kind) Allocator.Error!bool {
         if (a.rule.kind == .any or a.rule.kind == kind) return true;
-        s.use(a.pass);
-        if (!s.b.full()) try appendTypeError(s.b, try s.path(seg), a.rule.kind);
+        w.use(a.pass);
+        if (!w.b.full()) try appendTypeError(w.b, try w.path(seg), a.rule.kind);
         return false;
     }
 
-    fn walkObject(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
-        _ = try s.scanner.next(); // .object_begin
+    fn top(w: *Walker) ?*Frame {
+        return if (w.depth == 0) null else w.frames.items[w.depth - 1];
+    }
 
-        var fallback = std.heap.stackFallback(256, s.gpa);
-        const scratch = fallback.get();
+    // ── limits, when checked on the way ────────────────────────────────────
 
-        // One entry per rule that passed the gate and has fields to match.
-        const Fields = struct { rules: []const Rule, pass: u1, seen: []bool };
-        var sets: std.ArrayList(Fields) = .empty;
-        defer {
-            for (sets.items) |f| scratch.free(f.seen);
-            sets.deinit(scratch);
-        }
-        for (active) |a| {
-            if (!try s.gate(seg, a, .object)) continue;
-            const rules = a.rule.fields orelse continue;
-            const seen = try scratch.alloc(bool, rules.len);
-            @memset(seen, false);
-            sets.append(scratch, .{ .rules = rules, .pass = a.pass, .seen = seen }) catch |err| {
-                scratch.free(seen);
-                return err;
-            };
-        }
+    fn limitBegin(w: *Walker) WalkError!void {
+        const l = &(w.limit orelse return);
+        var is_value: bool = undefined;
+        if (try l.begin(&is_value) != null) return error.LimitExceeded;
+    }
 
-        const mark = s.keys.items.len;
-        defer s.freeKeysFrom(mark);
-        var children: std.ArrayList(Active) = .empty;
-        defer children.deinit(scratch);
+    fn limitEnter(w: *Walker, kind: ContainerKind) WalkError!void {
+        const l = &(w.limit orelse return);
+        if (try l.enter(kind) != null) return error.LimitExceeded;
+    }
 
-        while (true) {
-            const token = try s.scanner.nextAllocMax(s.gpa, .alloc_if_needed, s.body_len);
-            const key: Key = switch (token) {
-                .object_end => break,
-                .string => |k| .{ .name = k, .owned = false },
-                .allocated_string => |k| .{ .name = k, .owned = true },
+    fn limitClose(w: *Walker) void {
+        const l = &(w.limit orelse return);
+        _ = l.frames.pop();
+        l.complete();
+    }
+
+    fn limitComplete(w: *Walker) void {
+        if (w.limit) |*l| l.complete();
+    }
+
+    // ── the push interface ─────────────────────────────────────────────────
+
+    fn feed(w: *Walker, token: std.json.Token) WalkError!void {
+        std.debug.assert(!w.done);
+        if (w.mat.arena != null) return w.matFeed(token);
+        if (w.top()) |f| switch (f.kind) {
+            .object => if (f.expect_key) switch (token) {
+                .object_end => return w.closeObject(f),
+                .string => |k| return w.key(f, k, false),
+                .allocated_string => |k| return w.key(f, k, true),
                 else => unreachable, // the scanner only yields a key here
-            };
-            s.keys.append(s.gpa, key) catch |err| {
-                if (key.owned) s.gpa.free(key.name);
-                return err;
-            };
-            var duplicate = false;
-            for (s.keys.items[mark .. s.keys.items.len - 1]) |k| {
-                if (std.mem.eql(u8, k.name, key.name)) duplicate = true;
-            }
+            },
+            .array => if (token == .array_end) return w.closeArray(f),
+        };
 
-            children.clearRetainingCapacity();
-            var child: Seg = .{ .parent = seg };
-            for (sets.items) |set| {
-                for (set.rules, set.seen) |*r, *seen| {
-                    if (!std.mem.eql(u8, r.field, key.name)) continue;
-                    seen.* = true;
-                    child.field = r.field;
-                    try children.append(scratch, .{ .rule = r, .pass = set.pass });
-                }
-            }
-            try s.walkValue(&child, children.items);
-            // Reported after the value, as the tree parser does: an error
-            // inside the duplicate's value wins over the duplicate itself.
-            if (duplicate) return error.DuplicateField;
+        // A value, at the current position.
+        var seg: ?*Seg = null;
+        var active: []const Active = w.root_active;
+        if (w.top()) |f| {
+            if (f.kind == .array) f.child = .{ .parent = f.seg, .index = f.count, .is_index = true };
+            seg = &f.child;
+            active = f.children.items;
         }
-
-        for (sets.items) |set| {
-            for (set.rules, set.seen) |r, seen| {
-                if (seen or !r.required) continue;
-                s.use(set.pass);
-                if (s.b.full()) continue;
-                var missing: Seg = .{ .parent = seg, .field = r.field };
-                try s.b.append(try s.path(&missing), "missing", "Field required");
-            }
+        switch (token) {
+            .object_begin, .array_begin => {
+                const kind: ContainerKind = if (token == .object_begin) .object else .array;
+                try w.limitEnter(kind);
+                for (active) |a| if (a.rule.custom != null) return w.matBegin(seg, active, kind);
+                return w.open(seg, active, kind);
+            },
+            else => {
+                try w.limitBegin();
+                const v: Value = switch (token) {
+                    .string, .allocated_string => |s| .{ .string = s },
+                    .number, .allocated_number => |n| Value.parseFromNumberSlice(n),
+                    .true => .{ .bool = true },
+                    .false => .{ .bool = false },
+                    .null => .null,
+                    else => unreachable, // whole tokens only; ends handled above
+                };
+                for (active) |a| try w.check(seg, v, a);
+                w.limitComplete();
+                return w.afterValue();
+            },
         }
     }
 
-    fn walkArray(s: *Stream, seg: ?*Seg, active: []const Active) WalkError!void {
-        _ = try s.scanner.next(); // .array_begin
-
-        var fallback = std.heap.stackFallback(128, s.gpa);
-        const scratch = fallback.get();
-        var gated: std.ArrayList(Active) = .empty;
-        defer gated.deinit(scratch);
-        var items: std.ArrayList(Active) = .empty;
-        defer items.deinit(scratch);
-        for (active) |a| {
-            if (!try s.gate(seg, a, .array)) continue;
-            try gated.append(scratch, a);
-            if (a.rule.items) |r| try items.append(scratch, .{ .rule = r, .pass = a.pass });
+    /// A value just completed at the current position.
+    fn afterValue(w: *Walker) WalkError!void {
+        const f = w.top() orelse {
+            w.done = true;
+            return;
+        };
+        switch (f.kind) {
+            .object => {
+                // Reported after the value, as the tree parser does: an error
+                // inside the duplicate's value wins over the duplicate itself.
+                if (f.dup) return error.DuplicateField;
+                f.expect_key = true;
+            },
+            .array => f.count += 1,
         }
+    }
 
-        var count: usize = 0;
-        while (try s.scanner.peekNextTokenType() != .array_end) : (count += 1) {
-            var child: Seg = .{ .parent = seg, .index = count, .is_index = true };
-            try s.walkValue(&child, items.items);
+    fn open(w: *Walker, seg: ?*Seg, active: []const Active, kind: ContainerKind) WalkError!void {
+        if (w.depth == w.frames.items.len) {
+            const f = try w.gpa.create(Frame);
+            f.* = .{ .kind = kind, .seg = null };
+            w.frames.append(w.gpa, f) catch |err| {
+                w.gpa.destroy(f);
+                return err;
+            };
         }
-        _ = try s.scanner.next(); // .array_end
+        const f = w.frames.items[w.depth];
+        // Reused: keep the lists' capacity, reset everything else.
+        f.kind = kind;
+        f.seg = seg;
+        f.sets_len = 0;
+        f.gated.clearRetainingCapacity();
+        f.children.clearRetainingCapacity();
+        f.count = 0;
+        f.expect_key = true;
+        f.dup = false;
+        f.key_mark = w.keys.items.len;
+        w.depth += 1;
+        switch (kind) {
+            .object => for (active) |a| {
+                if (!try w.gate(seg, a, .object)) continue;
+                const rules = a.rule.fields orelse continue;
+                if (f.sets_len == f.sets.items.len) try f.sets.append(w.gpa, .{ .rules = rules, .pass = a.pass });
+                const set = &f.sets.items[f.sets_len];
+                set.rules = rules;
+                set.pass = a.pass;
+                try set.seen.resize(w.gpa, rules.len);
+                @memset(set.seen.items, false);
+                f.sets_len += 1;
+            },
+            .array => for (active) |a| {
+                if (!try w.gate(seg, a, .array)) continue;
+                try f.gated.append(w.gpa, a);
+                if (a.rule.items) |r| try f.children.append(w.gpa, .{ .rule = r, .pass = a.pass });
+            },
+        }
+    }
 
-        for (gated.items) |a| {
-            s.use(a.pass);
-            if (s.b.full()) continue;
-            if (a.rule.min_len) |m| if (count < m)
-                try s.b.appendf(try s.path(seg), "too_short", "Array should have at least {d} items", .{m});
-            if (a.rule.max_len) |m| if (count > m)
-                try s.b.appendf(try s.path(seg), "too_long", "Array should have at most {d} items", .{m});
+    fn key(w: *Walker, f: *Frame, name: []const u8, allocated: bool) WalkError!void {
+        try w.limitBegin();
+        // An allocated key belongs to whoever drives the scanner, and a
+        // decoder frees an unknown field's name at once: keep a copy.
+        const k: Key = if (allocated) .{ .name = try w.gpa.dupe(u8, name), .owned = true } else .{ .name = name, .owned = false };
+        w.keys.append(w.gpa, k) catch |err| {
+            if (k.owned) w.gpa.free(k.name);
+            return err;
+        };
+        f.dup = false;
+        for (w.keys.items[f.key_mark .. w.keys.items.len - 1]) |prev| {
+            if (std.mem.eql(u8, prev.name, k.name)) f.dup = true;
         }
+        f.children.clearRetainingCapacity();
+        f.child = .{ .parent = f.seg };
+        for (f.fieldSets()) |*set| {
+            for (set.rules, set.seen.items) |*r, *seen| {
+                if (!std.mem.eql(u8, r.field, k.name)) continue;
+                seen.* = true;
+                f.child.field = r.field;
+                try f.children.append(w.gpa, .{ .rule = r, .pass = set.pass });
+            }
+        }
+        f.expect_key = false;
+    }
+
+    fn closeObject(w: *Walker, f: *Frame) WalkError!void {
+        for (f.fieldSets()) |set| {
+            for (set.rules, set.seen.items) |r, seen| {
+                if (seen or !r.required) continue;
+                w.use(set.pass);
+                if (w.b.full()) continue;
+                var missing: Seg = .{ .parent = f.seg, .field = r.field };
+                try w.b.append(try w.path(&missing), "missing", "Field required");
+            }
+        }
+        w.freeKeysFrom(f.key_mark);
+        w.depth -= 1;
+        w.limitClose();
+        return w.afterValue();
+    }
+
+    fn closeArray(w: *Walker, f: *Frame) WalkError!void {
+        for (f.gated.items) |a| {
+            w.use(a.pass);
+            if (w.b.full()) continue;
+            if (a.rule.min_len) |m| if (f.count < m)
+                try w.b.appendf(try w.path(f.seg), "too_short", "Array should have at least {d} items", .{m});
+            if (a.rule.max_len) |m| if (f.count > m)
+                try w.b.appendf(try w.path(f.seg), "too_long", "Array should have at most {d} items", .{m});
+        }
+        w.depth -= 1;
+        w.limitClose();
+        return w.afterValue();
+    }
+
+    // ── materialized subtrees ──────────────────────────────────────────────
+
+    fn matBegin(w: *Walker, seg: ?*Seg, active: []const Active, kind: ContainerKind) WalkError!void {
+        w.mat.arena = std.heap.ArenaAllocator.init(w.gpa);
+        w.mat.seg = seg;
+        w.mat.active = active;
+        return w.matOpen(kind);
+    }
+
+    fn matReset(w: *Walker) void {
+        if (w.mat.arena) |*a| a.deinit();
+        w.mat.arena = null;
+        w.mat.stack.clearRetainingCapacity();
+    }
+
+    fn matOpen(w: *Walker, kind: ContainerKind) WalkError!void {
+        const a = w.mat.arena.?.allocator();
+        const v: Value = switch (kind) {
+            .object => .{ .object = .empty },
+            .array => .{ .array = .init(a) },
+        };
+        try w.mat.stack.append(w.gpa, .{ .v = v });
+    }
+
+    /// `Value.jsonParse` with `.alloc_always`, one token at a time: strings
+    /// and number texts are copied, a duplicate key fails once its value is
+    /// complete.
+    fn matFeed(w: *Walker, token: std.json.Token) WalkError!void {
+        const a = w.mat.arena.?.allocator();
+        const t = &w.mat.stack.items[w.mat.stack.items.len - 1];
+        if (t.v == .object and t.key == null) {
+            switch (token) {
+                .object_end => return w.matClose(),
+                .string, .allocated_string => |k| {
+                    try w.limitBegin();
+                    t.key = try a.dupe(u8, k);
+                    return;
+                },
+                else => unreachable,
+            }
+        }
+        if (t.v == .array and token == .array_end) return w.matClose();
+        switch (token) {
+            .object_begin => {
+                try w.limitEnter(.object);
+                return w.matOpen(.object);
+            },
+            .array_begin => {
+                try w.limitEnter(.array);
+                return w.matOpen(.array);
+            },
+            else => {
+                try w.limitBegin();
+                const v: Value = switch (token) {
+                    .string, .allocated_string => |s| .{ .string = try a.dupe(u8, s) },
+                    .number, .allocated_number => |n| Value.parseFromNumberSlice(try a.dupe(u8, n)),
+                    .true => .{ .bool = true },
+                    .false => .{ .bool = false },
+                    .null => .null,
+                    else => unreachable,
+                };
+                w.limitComplete();
+                return w.matAttach(v);
+            },
+        }
+    }
+
+    fn matClose(w: *Walker) WalkError!void {
+        const v = w.mat.stack.pop().?.v;
+        w.limitClose();
+        if (w.mat.stack.items.len != 0) return w.matAttach(v);
+        // The subtree is whole: check it, then it is a value completed at
+        // the position it started at.
+        for (w.mat.active) |act| try w.check(w.mat.seg, v, act);
+        w.matReset();
+        return w.afterValue();
+    }
+
+    fn matAttach(w: *Walker, v: Value) WalkError!void {
+        const t = &w.mat.stack.items[w.mat.stack.items.len - 1];
+        switch (t.v) {
+            .array => |*arr| try arr.append(v),
+            .object => |*obj| {
+                const gop = try obj.getOrPut(w.mat.arena.?.allocator(), t.key.?);
+                if (gop.found_existing) return error.DuplicateField;
+                gop.value_ptr.* = v;
+                t.key = null;
+            },
+            else => unreachable,
+        }
+    }
+};
+
+/// The token source `parseIntoLeaky` hands `std.json`'s typed decoder: the
+/// scanner's tokens, each also fed to a `Walker` on its way through, so that
+/// validation and decoding share one tokenization. It answers every method
+/// `std.json.parseFromTokenSourceLeaky` calls on a source. The walker gets
+/// whole tokens only: where the decoder asks `next` for a string (a
+/// fixed-size `[N]u8`), the whole string is read and fed, and handed over as
+/// one `string` -- which that caller copies at once, before the next call
+/// frees it -- where the scanner would have given a run of partials.
+///
+/// When the walker refuses the document (a duplicate key, a structural
+/// limit), the decoder is stopped with `SyntaxError`; the caller then takes
+/// the multi-pass path, which says exactly why.
+const TokenTap = struct {
+    scanner: std.json.Scanner,
+    w: *Walker,
+    /// Walker memory the last `next` handed out, freed on the next call.
+    lent: ?[]const u8 = null,
+
+    pub const NextError = std.json.Scanner.NextError;
+    pub const PeekError = std.json.Scanner.PeekError;
+    pub const AllocError = std.json.Scanner.AllocError;
+    pub const SkipError = std.json.Scanner.SkipError;
+    pub const AllocIntoArrayListError = std.json.Scanner.AllocIntoArrayListError;
+
+    fn deinit(t: *TokenTap) void {
+        t.giveBack();
+        t.scanner.deinit();
+    }
+
+    fn giveBack(t: *TokenTap) void {
+        if (t.lent) |l| t.w.gpa.free(l);
+        t.lent = null;
+    }
+
+    fn tap(t: *TokenTap, token: std.json.Token) error{ SyntaxError, OutOfMemory }!void {
+        if (token == .end_of_document) return;
+        t.w.feed(token) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else error.SyntaxError;
+    }
+
+    pub fn peekNextTokenType(t: *TokenTap) PeekError!std.json.TokenType {
+        return t.scanner.peekNextTokenType();
+    }
+
+    pub fn nextAllocMax(t: *TokenTap, allocator: Allocator, when: std.json.AllocWhen, max_value_len: usize) AllocError!std.json.Token {
+        const token = try t.scanner.nextAllocMax(allocator, when, max_value_len);
+        try t.tap(token);
+        return token;
+    }
+
+    pub fn nextAlloc(t: *TokenTap, allocator: Allocator, when: std.json.AllocWhen) AllocError!std.json.Token {
+        return t.nextAllocMax(allocator, when, std.json.default_max_value_len);
+    }
+
+    pub fn next(t: *TokenTap) NextError!std.json.Token {
+        t.giveBack();
+        switch (try t.scanner.peekNextTokenType()) {
+            .string, .number => {
+                const token = t.nextAllocMax(t.w.gpa, .alloc_if_needed, t.scanner.input.len) catch |err| switch (err) {
+                    error.ValueTooLong => unreachable, // the max is the whole input
+                    else => |e| return e,
+                };
+                switch (token) {
+                    .allocated_string => |str| {
+                        t.lent = str;
+                        return .{ .string = str };
+                    },
+                    .allocated_number => |n| {
+                        t.lent = n;
+                        return .{ .number = n };
+                    },
+                    else => return token,
+                }
+            },
+            else => {
+                const token = try t.scanner.next();
+                try t.tap(token);
+                return token;
+            },
+        }
+    }
+
+    pub fn skipValue(t: *TokenTap) SkipError!void {
+        var depth: usize = 0;
+        while (true) {
+            const token = t.nextAllocMax(t.w.gpa, .alloc_if_needed, t.scanner.input.len) catch |err| switch (err) {
+                error.ValueTooLong => unreachable,
+                else => |e| return e,
+            };
+            freeToken(t.w.gpa, token);
+            switch (token) {
+                .object_begin, .array_begin => depth += 1,
+                .object_end, .array_end => depth -= 1,
+                else => {},
+            }
+            if (depth == 0) return;
+        }
+    }
+
+    pub fn allocNextIntoArrayList(t: *TokenTap, value_list: *std.array_list.Managed(u8), when: std.json.AllocWhen) AllocIntoArrayListError!?[]const u8 {
+        const token = try t.nextAllocMax(t.w.gpa, .alloc_if_needed, t.scanner.input.len);
+        defer freeToken(t.w.gpa, token);
+        const s = switch (token) {
+            .string, .allocated_string => |s| s,
+            else => return error.SyntaxError, // the decoder peeked a string
+        };
+        if (when == .alloc_if_needed and token == .string and value_list.items.len == 0) return s;
+        try value_list.appendSlice(s);
+        return null;
     }
 };
 
@@ -3382,9 +3762,41 @@ fn expectSchemaAgrees(body: []const u8, schema: []const Rule) !void {
     try expectSameErrors(tree.errors, stream.errors);
 }
 
+/// When `parseOnePass` answers `body`, require `parseMultiPass`'s answer:
+/// the same errors, or equal decoded values. Returns whether it answered.
+fn expectOnePassAgrees(comptime T: type, body: []const u8, limits: Limits) !bool {
+    const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+    var one_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer one_arena.deinit();
+    const one = try parseOnePass(T, one_arena.allocator(), body, limits, extra) orelse return false;
+    var multi_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer multi_arena.deinit();
+    const multi = try parseMultiPass(T, multi_arena.allocator(), body, limits, extra);
+    switch (multi) {
+        .ok => |v| {
+            if (one != .ok) {
+                std.debug.print("\nmulti-pass ok, one pass invalid:\n", .{});
+                for (one.invalid.errors) |e| std.debug.print("  {s} {s} {s}\n", .{ e.path, e.code, e.message });
+                return error.TestExpectedEqual;
+            }
+            try testing.expectEqualDeep(v, one.ok);
+        },
+        .invalid => |r| {
+            if (one != .invalid) {
+                std.debug.print("\nmulti-pass invalid ({d} errors), one pass ok\n", .{r.errors.len});
+                return error.TestExpectedEqual;
+            }
+            try expectSameErrors(r.errors, one.invalid.errors);
+        },
+    }
+    return true;
+}
+
 /// Run both typed paths on `body` and require the same outcome: the same
-/// errors, or equal decoded values.
+/// errors, or equal decoded values -- and the one-pass path, where it
+/// answers, the same as the multi-pass one it stands in for.
 fn expectTypedAgrees(comptime T: type, body: []const u8) !void {
+    _ = try expectOnePassAgrees(T, body, .{});
     var tree = try parseIntoLimited(T, testing.allocator, body, .{});
     defer tree.deinit();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -3516,6 +3928,11 @@ test "streaming: typed decode agrees with parseIntoLimited" {
         // Duplicate inside a materialized subtree.
         \\{"name":"Ada","age":1,"history":[{"street":"a","city":"b","city":"c"}]}
         ,
+        // A duplicate of an ESCAPED unknown key: the decoder frees that key's
+        // name at once, and the escaped value after it lands in the same
+        // bytes -- the walker must have kept a copy to see the repeat.
+        \\{"\u0078":1,"name":"\u0079da","age":1,"x":2}
+        ,
     };
     for (bodies) |body| {
         expectTypedAgrees(StreamUser, body) catch |err| {
@@ -3523,6 +3940,69 @@ test "streaming: typed decode agrees with parseIntoLimited" {
             return err;
         };
     }
+}
+
+test "one pass: every document that decodes is answered in one tokenization, the rest by the multi-pass path" {
+    const Case = struct { body: []const u8, one_pass: bool };
+    const cases = [_]Case{
+        // Valid: the common case this path exists for.
+        .{ .body =
+        \\{"name":"Ada","age":36}
+        , .one_pass = true },
+        .{ .body =
+        \\{"name":"Ada","age":36,"tags":["a","b\"c"],"address":{"street":"S","city":"Brno","zip":"12345"},"extra":{"deep":[1,{"k":null}]}}
+        , .one_pass = true },
+        // A fixed-size byte array read through `next` (the partial-string emulation), escaped.
+        .{ .body =
+        \\{"name":"Ada","age":1,"address":{"street":"s","city":"Brno","zip":"1\u00323\u00345"}}
+        , .one_pass = true },
+        // Invalid only against rules the decoder does not know: still one pass.
+        .{ .body =
+        \\{"name":"A B","age":151}
+        , .one_pass = true },
+        .{ .body =
+        \\{"name":"Ada","age":1,"history":[{"street":"a","city":"b"},{"street":"a","city":"b"},{"street":"a","city":"b"}]}
+        , .one_pass = true },
+        .{ .body =
+        \\{"name":"Ada","age":1,"address":{"street":"s","city":"Ostrava"}}
+        , .one_pass = true },
+        // The decoder refuses: the multi-pass path reports.
+        .{ .body =
+        \\{"name":"Ada","age":"x"}
+        , .one_pass = false },
+        .{ .body =
+        \\{}
+        , .one_pass = false },
+        // The walker refuses: a duplicate key, known or not.
+        .{ .body =
+        \\{"name":"Ada","age":1,"u":1,"u":2}
+        , .one_pass = false },
+        .{ .body =
+        \\{"name":"Ada","age":1,"name":"Bob"}
+        , .one_pass = false },
+        // Malformed.
+        .{ .body =
+        \\{"name":"Ada","age":1}x
+        , .one_pass = false },
+    };
+    for (cases) |c| {
+        const answered = expectOnePassAgrees(StreamUser, c.body, .{}) catch |err| {
+            std.debug.print("body: {s}\n", .{c.body});
+            return err;
+        };
+        if (answered != c.one_pass) {
+            std.debug.print("body: {s}\none pass answered: {}, wanted {}\n", .{ c.body, answered, c.one_pass });
+            return error.TestExpectedEqual;
+        }
+    }
+    // A structural limit: the walker stops the decoder, and the multi-pass
+    // path's pre-scan reports it, as before.
+    const deep = "{\"name\":\"Ada\",\"age\":1,\"extra\":[[[[1]]]]}";
+    try testing.expect(!try expectOnePassAgrees(StreamUser, deep, .{ .max_depth = 3 }));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r = try parseIntoLeaky(StreamUser, arena.allocator(), deep, .{ .max_depth = 3 });
+    try testing.expectEqualStrings("too_deep", r.invalid.errors[0].code);
 }
 
 test "streaming: runtime schema agrees with validateJson" {
