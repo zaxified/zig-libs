@@ -416,7 +416,7 @@ test "stable input: calls under one block wait, pretending to consume; the contr
 const params_zstd1 = .{ .adv = zstd.Advanced{ .stable_in_buffer = true }, .hint = 6 };
 const params_magicless = .{ .adv = zstd.Advanced{ .stable_in_buffer = true, .format = .magicless }, .hint = 2 };
 
-test "stable output: the room left is checked; short of compressBound it is refused (a deviation)" {
+test "stable output: the room left is checked; blocks go into whatever room there is" {
     const gpa = std.testing.allocator;
     const src = try gpa.alloc(u8, 200_000);
     defer gpa.free(src);
@@ -435,8 +435,8 @@ test "stable output: the room left is checked; short of compressBound it is refu
         _ = try s.compressStream2(&moved, &in, .flush);
     }
     {
-        // 1000 bytes of room for a 150 000-byte block: libzstd would try
-        // (and fail here too); this port refuses up front
+        // 1000 bytes of room for a 128 KB block: neither its compressed
+        // form nor a raw block fits
         var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_out_buffer = true } });
         defer s.deinit();
         var in: stream.InBuffer = .{ .src = src };
@@ -452,14 +452,19 @@ test "stable output: the room left is checked; short of compressBound it is refu
         try std.testing.expectError(error.DstSizeTooSmall, s.compressStream2(&o, &in, .@"continue"));
     }
     {
-        // room for a block but not for all of it: libzstd ends the frame
-        // in one pass (its shortcut), so this port refuses rather than
-        // cut blocks libzstd would not
+        // less room than compressBound, but enough for what it compresses
+        // to: the one-pass end succeeds, as libzstd's (the goldens pin the
+        // bytes)
         var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_out_buffer = true } });
         defer s.deinit();
         var in: stream.InBuffer = .{ .src = src };
         var o: stream.OutBuffer = .{ .dst = out[0..150_000] };
-        try std.testing.expectError(error.DstSizeTooSmall, s.compressStream2(&o, &in, .end));
+        try std.testing.expectEqual(@as(usize, 0), try s.compressStream2(&o, &in, .end));
+        var d = try zstd.Decompressor.init(gpa, .{});
+        defer d.deinit();
+        const back = try gpa.alloc(u8, src.len);
+        defer gpa.free(back);
+        try std.testing.expectEqualSlices(u8, src, back[0..try d.decompress(back, out[0..o.pos])]);
     }
 }
 
@@ -485,4 +490,139 @@ test "stable buffers leave the stream's own out of the workspace, as estimated" 
     try std.testing.expect(sizes[0] - sizes[1] >= 300_000 + (1 << 17));
     try std.testing.expect(sizes[0] - sizes[2] >= 1 << 17);
     try std.testing.expect(sizes[3] < sizes[1] and sizes[3] < sizes[2]);
+}
+
+test "stable output: one byte less than the least room libzstd succeeds in is refused, as by libzstd" {
+    // the golden rows at that least room (`stableOutBuffer=1,o<min>,...`
+    // in `corpus.stream_cases`) pin the bytes; here the room one byte short
+    const gpa = std.testing.allocator;
+    var n: usize = 0;
+    for (corpus.stream_cases) |sc| {
+        if (!std.mem.startsWith(u8, sc.schedule, "stableOutBuffer=1,o")) continue;
+        const rest = sc.schedule["stableOutBuffer=1,o".len..];
+        const room = try std.fmt.parseInt(usize, rest[0..std.mem.indexOfScalar(u8, rest, ',').?], 10);
+        var short: std.ArrayList(u8) = .empty;
+        defer short.deinit(gpa);
+        try short.print(gpa, "stableOutBuffer=1,o{d}{s}", .{ room - 1, rest[std.mem.indexOfScalar(u8, rest, ',').?..] });
+        const src = try gpa.alloc(u8, findCase(sc.case).len);
+        defer gpa.free(src);
+        corpus.generate(findCase(sc.case), src);
+        try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, sc.levels[0], true, short.items));
+        // without the checksum: the least room libzstd succeeds in there
+        // (zstream), where the last block's own check decides
+        const no_checksum = [_]struct { []const u8, []const u8, usize }{
+            .{ "zeros-300000", "c*,e0", 43 },
+            .{ "seven", "c*,e0", 18 },
+            .{ "empty", "c*,e0", 18 },
+            .{ "words-16385", "c*,f0,e0", 3604 },
+            .{ "csv-600000", "c*,e0", 207433 },
+            .{ "mix-300000-9", "c*,e0", 84494 },
+        };
+        for (no_checksum) |nc| {
+            if (!std.mem.eql(u8, sc.case, nc[0]) or !std.mem.endsWith(u8, sc.schedule, nc[1]) or std.mem.indexOf(u8, sc.schedule, "Size") != null) continue;
+            if (std.mem.eql(u8, sc.case, "csv-600000") and sc.levels[0] != 1) continue;
+            var at: std.ArrayList(u8) = .empty;
+            defer at.deinit(gpa);
+            try at.print(gpa, "stableOutBuffer=1,o{d},{s}", .{ nc[2], nc[1] });
+            const ok = try run(gpa, src, sc.levels[0], false, at.items);
+            gpa.free(ok.out);
+            at.clearRetainingCapacity();
+            try at.print(gpa, "stableOutBuffer=1,o{d},{s}", .{ nc[2] - 1, nc[1] });
+            try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, sc.levels[0], false, at.items));
+        }
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 13), n);
+}
+
+test "stable output: every room below the least libzstd succeeds in is refused (block splitter)" {
+    // with the post-block splitter a block goes out as partitions, each
+    // checked for its header's room where it lands; libzstd refuses each of
+    // these 32 rooms (zstream, 2026-09-26)
+    const gpa = std.testing.allocator;
+    const c = findCase("mix-300000-9");
+    const src = try gpa.alloc(u8, c.len);
+    defer gpa.free(src);
+    corpus.generate(c, src);
+    var buf: [64]u8 = undefined;
+    for (84494 - 32..84494) |room| {
+        const sched = try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,e0", .{room});
+        try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 19, true, sched));
+    }
+}
+
+test "stable output: where libzstd would write past the end, the block is refused" {
+    // libzstd's sub-blocks (targetCBlockSize) copy the Huffman table
+    // description and the FSE tables unchecked: with this little room
+    // AddressSanitizer reports libzstd writing past the output buffer
+    // (zstream built with -fsanitize=address, 2026-09-26). This port
+    // stops there, and the raw block does not fit either.
+    const gpa = std.testing.allocator;
+    for ([_][2][]const u8{
+        .{ "mix-9000-5", "stableOutBuffer=1,targetCBlockSize=1340,o24,c*,e0" }, // the literals' table description
+        .{ "two-symbols-16000-1", "stableOutBuffer=1,targetCBlockSize=1340,o47,c*,e0" }, // the sequences' FSE tables
+    }) |cs| {
+        const c = findCase(cs[0]);
+        const src = try gpa.alloc(u8, c.len);
+        defer gpa.free(src);
+        corpus.generate(c, src);
+        try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, false, cs[1]));
+    }
+}
+
+test "stable output: a raw block exactly the room left after its header" {
+    // random-5000 without the checksum: 5009 bytes of room leave the one
+    // block exactly its own size after the frame and block headers; its
+    // compressed form runs out of room and it goes out raw, as libzstd's
+    // (zstream: 5009 succeeds with the o5013 golden's bytes, 5008 fails)
+    const gpa = std.testing.allocator;
+    const c = findCase("random-5000");
+    const src = try gpa.alloc(u8, c.len);
+    defer gpa.free(src);
+    corpus.generate(c, src);
+    const ample = try run(gpa, src, 3, false, "stableOutBuffer=1,c*,e0");
+    defer gpa.free(ample.out);
+    const exact = try run(gpa, src, 3, false, "stableOutBuffer=1,o5009,c*,e0");
+    defer gpa.free(exact.out);
+    try std.testing.expectEqualSlices(u8, ample.out, exact.out);
+    try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, false, "stableOutBuffer=1,o5008,c*,e0"));
+}
+
+test "stable output: six bytes asked before each block, whatever the block needs" {
+    // "seven" as 6 bytes flushed, then the last byte: the 1-byte block goes
+    // out raw in 4 bytes, but libzstd asks 6 before trying any block (the
+    // header, a least block, one byte) -- 21 bytes of room succeed with
+    // exactly 6 left there, 20 fail at that check (zstream)
+    const gpa = std.testing.allocator;
+    const c = findCase("seven");
+    const src = try gpa.alloc(u8, c.len);
+    defer gpa.free(src);
+    corpus.generate(c, src);
+    const ample = try run(gpa, src, 3, false, "stableOutBuffer=1,c6,f0,e*");
+    defer gpa.free(ample.out);
+    const exact = try run(gpa, src, 3, false, "stableOutBuffer=1,o21,c6,f0,e*");
+    defer gpa.free(exact.out);
+    try std.testing.expectEqualSlices(u8, ample.out, exact.out);
+    try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, false, "stableOutBuffer=1,o20,c6,f0,e*"));
+}
+
+test "stable output: the epilogue's empty last block and checksum ask their own room" {
+    // random-5000 flushed as one raw block, then ended: the empty last
+    // block (3 bytes) and the checksum (4) come after it and fail on their
+    // own checks one byte short (zstream: 5012 / 5016 succeed, 5011 fails
+    // at "no room for epilogue", 5015 at "no room for checksum")
+    const gpa = std.testing.allocator;
+    const c = findCase("random-5000");
+    const src = try gpa.alloc(u8, c.len);
+    defer gpa.free(src);
+    corpus.generate(c, src);
+    for ([_]struct { bool, usize }{ .{ false, 5012 }, .{ true, 5016 } }) |cr| {
+        const ample = try run(gpa, src, 3, cr[0], "stableOutBuffer=1,c*,f0,e0");
+        defer gpa.free(ample.out);
+        var buf: [64]u8 = undefined;
+        const exact = try run(gpa, src, 3, cr[0], try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1]}));
+        defer gpa.free(exact.out);
+        try std.testing.expectEqualSlices(u8, ample.out, exact.out);
+        try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, cr[0], try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1] - 1})));
+    }
 }

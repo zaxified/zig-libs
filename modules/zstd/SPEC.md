@@ -40,9 +40,6 @@ Not here yet, and a reader might expect it (each is a backlog item):
   `ZSTD_c_stableOutBuffer`), frame after frame on one context;
   `StreamWriter` is a `std.Io.Writer` over it (libzstd's bytes), and
   `FrameWriter` (Z1a) a `std.Io.Writer` of independent one-shot frames.
-  A stable output buffer with less room than `compressBound` of what is
-  compressed into it is refused where libzstd would try (*Limits and
-  refusals*; backlog Z1d).
 
 ## Algorithm
 
@@ -214,13 +211,19 @@ are chosen once more input, a flush or the end has come; the held-back
 bytes go to the workers too with `nb_workers`. With a stable output there
 is no output buffer: every block goes straight into the caller's buffer
 (`end`'s one-pass shortcut is taken whatever the room), and the caller may
-not change the room left between calls (it may move the buffer). libzstd
-then compresses into whatever room there is, storing a block raw when its
-compressed form does not fit and failing when neither does; this port
-compresses only into room for `compressBound` of the input and is
-`error.DstSizeTooSmall` short of it (*Limits and refusals*), so the bytes are
-libzstd's whenever it succeeds. The workspace leaves out the buffers the
-caller's stand in for, and `estimateStreamSize` with it.
+not change the room left between calls (it may move the buffer). Blocks
+are then compressed into whatever room there is, as libzstd does (Z1d):
+the frame header needs 18 bytes, a block 6 before it is tried, a block
+whose compressed form does not fit is stored raw when that fits
+(`ZSTD_entropyCompressSeqStore`'s fallback) and is `error.DstSizeTooSmall`
+when it does not, and the epilogue needs its 3 and 4 bytes -- each check
+where libzstd makes it, so a frame needs a few bytes more than it ends up
+as, the same few. Where libzstd writes without checking (a sub-block's
+header, literal header and Huffman table description, its FSE tables, an
+RLE literal section, with `targetCBlockSize`) and runs past the end of a
+smaller buffer, this port stops with `error.DstSizeTooSmall` instead. The
+workspace leaves out the buffers the caller's stand in for, and
+`estimateStreamSize` with it.
 `ZSTD_CCtx_reset` leaves the input a waiting frame held back on the
 context (the next frame would take it off its own input); `reset` drops it.
 
@@ -1518,7 +1521,7 @@ equality (a smaller dictionary with exactly the full one's total).
 | advanced parameters | libzstd's bounds (see *Advanced parameters*), else `error.ParameterOutOfBound` | `ZSTD_cParam_getBounds`, 64-bit |
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
 | stream memory | one window plus one block of input buffer (none with `stable_in_buffer`), `compressBound(block) + 1` of output buffer (none with `stable_out_buffer`), and the level's tables | `ZSTD_resetCCtx_internal` |
-| stable output room | ≥ `compressBound` of each chunk compressed into it, else `error.DstSizeTooSmall` | libzstd tries any room (a raw block, or `dstSize_tooSmall`); the port's block path assumes the bound (backlog Z1d) |
+| stable output room | any: blocks go into what is left, raw when the compressed form does not fit, else `error.DstSizeTooSmall`; where libzstd would write past the end (sub-blocks), `error.DstSizeTooSmall` | `ZSTD_c_stableOutBuffer`: libzstd's own capacity checks (Z1d) |
 | context memory | one workspace, exactly `estimateCompressorSize` / `estimateStreamSize`; a static one is never exceeded (`error.OutOfMemory`) | `ZSTD_estimateCCtxSize*`, `ZSTD_initStaticCCtx` |
 | decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header on 64-bit, ≤ 30 on 32-bit -- *Portability* -- else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (`_64`/`_32` by `sizeof(size_t)`); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
 | decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), plus the ≈ 190 KB context | `ZSTD_decodingBufferSize_min` |
@@ -1723,7 +1726,7 @@ binaries, text, noise and generated mixes; levels −5…19, window, pledged
 size, size hint, block size, workers, flushes and chunkings up to
 600 KB): 1 155 identical, 98 refused alike (a stable output that fills),
 7 where a stable output below `compressBound` was refused and libzstd went
-on (the deviation above), none different. Unit tests pin the contract
+on (the refusal Z1d then removed, below), none different. Unit tests pin the contract
 checks one condition at a time (address, `pos`, room left), the wait's
 hint and pretended consumption, exactly one block starting the frame, a
 reset dropping a waiting frame's input, both refusals short of
@@ -1737,6 +1740,35 @@ the block path's direct test, always true behind the `compressBound`
 refusal -- and 1 whose code went (`StreamWriter` sent `finish` as
 `continue` plus an empty `end` once anything had been written; the
 one-block scratch makes one `end` the same bytes).
+
+**Any room** (Z1d, 2026-09-26): libzstd's capacity checks in the frame
+path, anchored at their edges. For 13 cases (plain, flushed,
+`targetCBlockSize`, `maxBlockSize`, the block splitter at 16 and 19, a
+stable input, an incompressible and an all-zero input, a 7-byte and an
+empty one, a flush before an empty end) the least room libzstd succeeds in
+was bisected with `zstream` and is a golden row (`o<room>`, 26 rows with
+the checksum and without): the same bytes as with room to spare, a few
+bytes more than the frame (libzstd checks for a block's worst case before
+it knows the size). One byte less is refused, as by libzstd, with the
+checksum and, where libzstd's least room is the same, without; 32 rooms
+below the least for a level-19 frame all refused; each check shown to be
+the deciding one by a `zstream` built with `DEBUGLEVEL=3`: the raw block
+exactly the room after its header, six bytes asked before a 1-byte block
+that needs four, the epilogue's 3 and 4 bytes after a raw block. 1 260
+random runs against `zstream` built with AddressSanitizer (a stable output
+of 0 bytes to a little over `compressBound`, with a stable input, sub-blocks,
+block sizes, windows, flushes and chunkings): 561 identical, 691 refused
+alike, none different, and 8 where libzstd wrote past the end of the
+output buffer (a sub-block's Huffman description or FSE tables copied
+unchecked) and this port refuses; two such inputs from the corpus are unit
+tests. Mutation sweep, 17 mutants of the capacity checks: 12 caught (8
+after the cases above), 2 equivalent -- the epilogue's own frame-header
+check (the epilogue always follows the header's writer), the RLE block's
+4 bytes in the frame path (6 are asked before every block; in
+`compressSequences` a destination ending 3 bytes into an RLE block would
+reach it, and no case does) -- and 3 guards with no case found: a
+block-splitter partition, and a sub-block or its RLE literals, starting
+within 2 or 3 bytes of the end.
 
 59 mutations of the new code (`windowUpdate`, `count2Segments`, the `fast`
 and `dfast` extDict variants, overflow correction of two segments,
@@ -2523,15 +2555,13 @@ dictionaries are undecided.
     `ZSTD_c_stableOutBuffer`) and `StreamWriter`, a `std.Io.Writer` over
     `Stream` with libzstd's bytes; see *Algorithm*. (`ZSTD_CCtx_reset` and
     frames after the first: done with Z13.)
-  - **Z1d — compression into less room than `compressBound`.** libzstd
-    compresses a block into whatever room the destination has, storing it
-    raw when the compressed form does not fit and failing only when that
-    does not fit either; this port's block path (`frameChunk`, the
-    superblock, the epilogue) assumes room for `compressBound` and asserts
-    it, so a stable output buffer short of it is refused up front. Porting
-    libzstd's capacity checks there would let a stable output (and a
-    one-shot destination below the bound) succeed where libzstd does.
-    **~0.5 session**, with a diff over tight destinations.
+  - ~~**Z1d — compression into less room than `compressBound`.**~~ done
+    2026-09-26: libzstd's capacity checks in the frame path (header, each
+    block, the raw and RLE fallbacks, the epilogue); a stable output takes
+    any room, as libzstd's. The one-shot API still asks for
+    `compressBound` (`error.NoSpaceLeft`): its callers get the whole frame
+    or nothing, and libzstd's `ZSTD_compress2` below the bound is left for
+    a caller that asks.
 - **Z2 — Decoder.** ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
   checksum verification, concatenated and skippable frames and the frame
   utilities, ported from libzstd (std's decoder takes 30× libzstd's time,

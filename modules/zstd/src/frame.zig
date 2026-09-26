@@ -54,6 +54,8 @@ pub fn compressBound(src_size: usize) usize {
 const block_size_max_abs = params.block_size_max_abs;
 const block_header_size = 3;
 const min_cblock_size = 2;
+/// `ZSTD_FRAMEHEADERSIZE_MAX`: the room a frame header needs.
+const frame_header_size_max = 18;
 const magic = 0xFD2FB528;
 const rle_max_length = 25;
 
@@ -247,10 +249,11 @@ fn entropyCompressLits(c: *Ctx, ss: *sequences.SeqStore, lits: []const u8, dst: 
 }
 
 /// `ZSTD_entropyCompressSeqStore_wExtLitBuffer`: 0 means "store raw".
-fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usize) usize {
+fn entropyCompress(c: *Ctx, ss: *sequences.SeqStore, dst: []u8, block_size: usize) error{DstSizeTooSmall}!usize {
     const c_size = entropyCompressInternal(c, ss, dst) catch |err| switch (err) {
-        // Out of space with room for a raw block: the block is not compressible.
-        error.DstSizeTooSmall => return 0,
+        // Out of space with room for a raw block: the block is not
+        // compressible. Without that room, out of space.
+        error.DstSizeTooSmall => return if (block_size <= dst.len) 0 else error.DstSizeTooSmall,
         // libzstd surfaces an internal error here; none is reachable from the
         // inputs this port accepts, so a raw block is the conservative answer.
         error.Generic => return 0,
@@ -318,7 +321,7 @@ fn compressBlockMode(c: *Ctx, dst: []u8, block: []const u8, frame_mode: bool) Bl
             std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
             return 0;
         }
-        c_size = entropyCompress(c, &c.ss, dst, block.len);
+        c_size = try entropyCompress(c, &c.ss, dst, block.len);
         if (frame_mode and !c.is_first_block and c_size < rle_max_length and isRle(block)) {
             c_size = 1;
             dst[0] = block[0];
@@ -332,13 +335,15 @@ fn compressBlockMode(c: *Ctx, dst: []u8, block: []const u8, frame_mode: bool) Bl
 /// Write one block (header included) for the outcome `c_size` of a block
 /// compression: 0 raw, 1 RLE, otherwise compressed and already in place
 /// after the header. Returns the bytes written.
-fn emitBlock(out: []u8, src: []const u8, c_size: usize, last_block: u32) usize {
+fn emitBlock(out: []u8, src: []const u8, c_size: usize, last_block: u32) error{DstSizeTooSmall}!usize {
     const bs: u32 = @intCast(src.len);
-    if (c_size == 0) { // block is not compressible
+    if (c_size == 0) { // block is not compressible (ZSTD_noCompressBlock)
+        if (src.len + block_header_size > out.len) return error.DstSizeTooSmall; // dst buf too small for uncompressed block
         writeBlockHeader(out, last_block + (bt_raw << 1) + (bs << 3));
         @memcpy(out[block_header_size..][0..src.len], src);
         return block_header_size + src.len;
-    } else if (c_size == 1) {
+    } else if (c_size == 1) { // ZSTD_rleCompressBlock
+        if (out.len < 4) return error.DstSizeTooSmall;
         writeBlockHeader(out, last_block + (bt_rle << 1) + (bs << 3));
         out[block_header_size] = src[0];
         return block_header_size + 1;
@@ -353,7 +358,8 @@ fn emitBlock(out: []u8, src: []const u8, c_size: usize, last_block: u32) usize {
 fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: *[3]u32, out: []u8, src: []const u8, last_block: u32, is_partition: bool) BlockError!usize {
     const d_rep_original = d_rep.*;
     if (is_partition) blocksplit.resolveOffCodes(d_rep, c_rep, ss);
-    var c_seqs_size = entropyCompress(c, ss, out[block_header_size..], src.len);
+    if (out.len < block_header_size) return error.DstSizeTooSmall; // Block header doesn't fit
+    var c_seqs_size = try entropyCompress(c, ss, out[block_header_size..], src.len);
     if (!c.is_first_block and c_seqs_size < rle_max_length and isRle(src)) c_seqs_size = 1;
     // Sequence collection not supported when block splitting
     if (c.collector) |col| {
@@ -367,7 +373,7 @@ fn compressSingleBlock(c: *Ctx, ss: *sequences.SeqStore, d_rep: *[3]u32, c_rep: 
         d_rep.* = d_rep_original;
     }
     offcodeValidToCheck(c);
-    return emitBlock(out, src, c_seqs_size, last_block);
+    return try emitBlock(out, src, c_seqs_size, last_block);
 }
 
 /// `ZSTD_compressBlock_targetCBlockSize`: one block of input, emitted as
@@ -381,7 +387,7 @@ fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block
         // throw a "should consume all input error." This is only an issue
         // for zstd <= v1.4.3
         if (!c.is_first_block and c.ss.n_seq < 4 and c.ss.n_lit < 10 and isRle(src)) // ZSTD_maybeRLE
-            return emitBlock(out, src, 1, last_block);
+            return try emitBlock(out, src, 1, last_block);
         const prev: superblock.State = .{ .huf = &c.prev.huf, .fse = &c.prev.fse, .rep = &c.prev.rep };
         const next: superblock.State = .{ .huf = &c.next.huf, .fse = &c.next.fse, .rep = &c.next.rep };
         // A superblock is not bound by compressBound: a size of a raw block
@@ -399,7 +405,7 @@ fn compressBlockTargetCBlockSize(c: *Ctx, out: []u8, src: []const u8, last_block
     // Superblock compression failed, attempt to emit a single no compress
     // block. The decoder will be able to stream this block since it is
     // uncompressed.
-    return emitBlock(out, src, 0, last_block);
+    return try emitBlock(out, src, 0, last_block);
 }
 
 /// `ZSTD_compressBlock_splitBlock`: one block of input, emitted as one or
@@ -409,7 +415,7 @@ fn compressBlockSplit(c: *Ctx, out: []u8, src: []const u8, last_block: u32) Bloc
     if (!try buildSeqStore(c, src)) {
         offcodeValidToCheck(c);
         if (c.collector != null) return error.SequenceProducerFailed; // Uncompressible block
-        return emitBlock(out, src, 0, last_block);
+        return try emitBlock(out, src, 0, last_block);
     }
 
     const prev: blocksplit.Entropy = .{ .huf = &c.prev.huf, .fse = &c.prev.fse };
@@ -800,7 +806,7 @@ pub const Compressor = struct {
             error.SrcSizeWrong => unreachable, // pledged is src.len
             else => |e| return e,
         };
-        const m = comp.writeEpilogue(out[n..]);
+        const m = try comp.writeEpilogue(out[n..]);
         if (opts.overflow_corrections) |oc| oc.* = .{ comp.c.ms.n_overflow_corrections, if (comp.c.ldm) |ls| ls.n_overflow_corrections else 0 };
         return n + m;
     }
@@ -1300,6 +1306,7 @@ pub const Compressor = struct {
     pub fn compressContinue(comp: *Compressor, dst: []u8, chunk: []const u8, last_chunk: bool) (SizeError || BlockError)!usize {
         var fh_size: usize = 0;
         if (comp.stage == .init) {
+            if (dst.len < frame_header_size_max) return error.DstSizeTooSmall;
             fh_size = writeFrameHeader(dst, comp.cp, comp.headerContentSize(comp.pledged), comp.checksum, comp.format, comp.dict_id, comp.no_dict_id);
             comp.stage = .ongoing;
         }
@@ -1330,7 +1337,7 @@ pub const Compressor = struct {
             const remaining = chunk.len - ip;
             const block_size = presplit.optimalBlockSize(chunk[ip..], comp.block_size_max, c.pre_split_level, c.strategy, savings, comp.split_ws);
             const last_block: u32 = @intFromBool(last_chunk and block_size == remaining);
-            std.debug.assert(out.len - op >= block_header_size + min_cblock_size + 1);
+            if (out.len - op < block_header_size + min_cblock_size + 1) return error.DstSizeTooSmall; // not enough space to store compressed block
             const block = chunk[ip..][0..block_size];
 
             const bi = c.index(block);
@@ -1345,7 +1352,7 @@ pub const Compressor = struct {
             else if (c.split_blocks)
                 try compressBlockSplit(c, out[op..], block, last_block)
             else
-                emitBlock(out[op..], block, try compressBlock(c, out[op + block_header_size ..], block), last_block);
+                try emitBlock(out[op..], block, try compressBlock(c, out[op + block_header_size ..], block), last_block);
             savings += @as(i64, @intCast(block_size)) - @as(i64, @intCast(c_size));
             ip += block_size;
             op += c_size;
@@ -1362,20 +1369,23 @@ pub const Compressor = struct {
     }
 
     /// `ZSTD_writeEpilogue`: a last empty block unless the last chunk ended
-    /// the frame, then the checksum. `dst` has room for 7 bytes.
-    pub fn writeEpilogue(comp: *Compressor, dst: []u8) usize {
+    /// the frame, then the checksum.
+    pub fn writeEpilogue(comp: *Compressor, dst: []u8) error{DstSizeTooSmall}!usize {
         var op: usize = 0;
         if (comp.stage == .init) {
             // special case: empty frame (libzstd passes dictID 0 here)
+            if (dst.len < frame_header_size_max) return error.DstSizeTooSmall;
             op += writeFrameHeader(dst, comp.cp, comp.headerContentSize(0), comp.checksum, comp.format, 0, comp.no_dict_id);
             comp.stage = .ongoing;
         }
         if (comp.stage != .ending) {
             // write one last empty block, make it the "last" block
+            if (dst.len - op < 3) return error.DstSizeTooSmall; // no room for epilogue
             writeBlockHeader(dst[op..], 1 + (bt_raw << 1));
             op += block_header_size;
         }
         if (comp.checksum) {
+            if (dst.len - op < 4) return error.DstSizeTooSmall; // no room for checksum
             const h: u32 = @truncate(comp.xxh.final());
             std.mem.writeInt(u32, dst[op..][0..4], h, .little);
             op += 4;
@@ -1435,7 +1445,6 @@ pub const Compressor = struct {
     /// check the error it returns there and goes on at a wild position;
     /// here it is `error.DstSizeTooSmall`.)
     fn writeSeqFrameHeader(comp: *Compressor, dst: []u8, content_size: u64) error{DstSizeTooSmall}!usize {
-        const frame_header_size_max = 18;
         if (dst.len < frame_header_size_max) return error.DstSizeTooSmall;
         return writeFrameHeader(dst, comp.cp, comp.headerContentSize(content_size), comp.checksum, comp.format, comp.dict_id, comp.no_dict_id);
     }
@@ -1492,12 +1501,12 @@ pub const Compressor = struct {
                 c_block_size = try noCompressBlock(out, src[ip..][0..block_size], last_block);
             } else if (c_seqs_size == 1) {
                 if (out.len < 4) return error.DstSizeTooSmall;
-                c_block_size = emitBlock(out, src[ip..][0..block_size], 1, last_block);
+                c_block_size = try emitBlock(out, src[ip..][0..block_size], 1, last_block);
             } else {
                 // Error checking and repcodes update
                 std.mem.swap(*BlockState, &c.prev, &c.next); // confirm repcodes and entropy tables
                 offcodeValidToCheck(c);
-                c_block_size = emitBlock(out, src[ip..][0..block_size], c_seqs_size, last_block);
+                c_block_size = try emitBlock(out, src[ip..][0..block_size], c_seqs_size, last_block);
             }
             c_size += c_block_size;
             if (last_block != 0) break;
@@ -1513,7 +1522,7 @@ pub const Compressor = struct {
     fn noCompressBlock(out: []u8, src: []const u8, last_block: u32) error{DstSizeTooSmall}!usize {
         // dst buf too small for uncompressed block
         if (src.len + block_header_size > out.len) return error.DstSizeTooSmall;
-        return emitBlock(out, src, 0, last_block);
+        return try emitBlock(out, src, 0, last_block);
     }
 
     /// `ZSTD_entropyCompressSeqStore` with libzstd's capacity rule: out of

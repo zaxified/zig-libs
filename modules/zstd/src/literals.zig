@@ -40,8 +40,10 @@ pub fn noCompress(dst: []u8, src: []const u8) Error!usize {
 }
 
 /// `ZSTD_compressRleLiteralsBlock`.
-pub fn rle(dst: []u8, src: []const u8) usize {
+pub fn rle(dst: []u8, src: []const u8) Error!usize {
     const fl_size: usize = 1 + @as(usize, @intFromBool(src.len > 31)) + @intFromBool(src.len > 4095);
+    // (libzstd only asserts 4 bytes of room; a superblock can pass less)
+    if (dst.len < fl_size + 1) return error.DstSizeTooSmall;
     const n: u32 = @intCast(src.len);
     switch (fl_size) {
         1 => dst[0] = @truncate(set_rle + (n << 3)),
@@ -118,7 +120,7 @@ pub fn compress(dst: []u8, src: []const u8, prev: *const HufState, next: *HufSta
         // A single symbol: an RLE literals section is smaller.
         if (src.len >= 8 or allBytesIdentical(src)) {
             next.* = prev.*;
-            return rle(dst, src);
+            return try rle(dst, src);
         }
     }
     if (h_type == set_compressed) next.repeat = .check; // a newly built table

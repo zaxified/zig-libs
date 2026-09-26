@@ -31,10 +31,8 @@ jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
 (`OptimizeParams.nb_threads`, the single-threaded result for any count),
 and so is the **sequence-level API** (`compressSequences`,
 `generateSequences`, a block-level `SequenceProducer` in place of the match
-finder: libzstd's bytes and errors for the same sequences). A stable
-output buffer with less room than `compressBound` is refused where libzstd
-would try; that and the rest are queued in [SPEC.md](SPEC.md) (*Backlog /
-deferred*, with costs).
+finder: libzstd's bytes and errors for the same sequences). The rest is
+queued in [SPEC.md](SPEC.md) (*Backlog / deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its

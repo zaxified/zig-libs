@@ -230,7 +230,7 @@ const Job = struct {
             last_c.* = if (job.last) blk: {
                 // ZSTD_compressEnd_public
                 const n = try cctx.compressContinue(dst[op..], chunk, true);
-                const m = cctx.writeEpilogue(dst[op + n ..]);
+                const m = try cctx.writeEpilogue(dst[op + n ..]);
                 if (cctx.pledged) |p| if (p != cctx.consumed) return error.SrcSizeWrong;
                 break :blk n + m;
             } else try cctx.compressContinue(dst[op..], chunk, false);

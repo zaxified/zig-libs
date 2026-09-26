@@ -412,6 +412,27 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "words-262144", .schedule = "stableInBuffer=1,c131072,c131072,e0", .levels = &.{ 1, 3 } },
     .{ .case = "csv-200000-0", .schedule = "stableInBuffer=1,o1000,c150000,e*", .levels = &.{ 1, 3 } },
     .{ .case = "csv-600000", .schedule = "stableInBuffer=1,nbWorkers=2,jobSize=524288,c5000,c*,e0", .levels = &.{ 1, 3 } },
+    // a stable output of exactly the least room libzstd succeeds in (found
+    // by bisection against zstream, with the checksum): each block is
+    // compressed into what is left, which needs a little more than the
+    // frame it ends up as; one byte less is dstSize_tooSmall (stream_test)
+    .{ .case = "csv-600000", .schedule = "stableOutBuffer=1,o207433,c*,e0", .levels = &.{1} },
+    .{ .case = "csv-600000", .schedule = "stableOutBuffer=1,o228914,c50000,f0,c*,e0", .levels = &.{3} },
+    .{ .case = "csv-600000", .schedule = "stableOutBuffer=1,o178515,c*,e0", .levels = &.{16} },
+    .{ .case = "mix-300000-9", .schedule = "stableOutBuffer=1,o84494,c*,e0", .levels = &.{19} },
+    .{ .case = "mix-300000-9", .schedule = "stableOutBuffer=1,o90250,targetCBlockSize=1340,c*,e0", .levels = &.{3} },
+    .{ .case = "words-262145", .schedule = "stableOutBuffer=1,o56275,maxBlockSize=4096,c*,e0", .levels = &.{5} },
+    .{ .case = "far-repeat", .schedule = "stableOutBuffer=1,o294361,stableInBuffer=1,c100000,c*,e0", .levels = &.{1} },
+    .{ .case = "long-literals", .schedule = "stableOutBuffer=1,o100408,c*,e0", .levels = &.{3} },
+    // ... at each check's own edge: a raw block that just fits, RLE blocks
+    // after the first (4 bytes each, 6 asked before each), a frame header's
+    // 18 bytes for a frame of 16, the empty frame's header in the
+    // epilogue, and the epilogue's empty last block and checksum
+    .{ .case = "random-5000", .schedule = "stableOutBuffer=1,o5013,c*,e0", .levels = &.{3} },
+    .{ .case = "zeros-300000", .schedule = "stableOutBuffer=1,o43,c*,e0", .levels = &.{3} },
+    .{ .case = "seven", .schedule = "stableOutBuffer=1,o20,c*,e0", .levels = &.{3} },
+    .{ .case = "empty", .schedule = "stableOutBuffer=1,o18,c*,e0", .levels = &.{3} },
+    .{ .case = "words-16385", .schedule = "stableOutBuffer=1,o3604,c*,f0,e0", .levels = &.{3} },
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };

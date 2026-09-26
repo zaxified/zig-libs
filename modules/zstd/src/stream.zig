@@ -303,7 +303,7 @@ pub const Stream = struct {
     /// pledged-size check.
     fn compressEnd(s: *Stream, dst: []u8, chunk: []const u8) Error!usize {
         const n = try s.comp.compressContinue(dst, chunk, true);
-        const m = s.comp.writeEpilogue(dst[n..]);
+        const m = try s.comp.writeEpilogue(dst[n..]);
         if (s.comp.pledged) |p| if (p != s.comp.consumed) return error.SrcSizeWrong;
         return n + m;
     }
@@ -348,11 +348,9 @@ pub const Stream = struct {
             .init, .mt => unreachable,
             .load => {
                 // (or, with a stable output, allowed to fail with
-                // dstSize_tooSmall -- which this port does short of
-                // compressBound, see `roomFor`)
+                // dstSize_tooSmall)
                 if (end_op == .end and (oend - op >= frame.compressBound(iend - ip) or stable_out) and s.in_buff_pos == 0) {
                     // shortcut to compression pass directly into output buffer
-                    try roomFor(oend - op, iend - ip);
                     const c_size = try s.compressEnd(output.dst[op..], input.src[ip..iend]);
                     ip = iend;
                     op += c_size;
@@ -387,7 +385,6 @@ pub const Stream = struct {
                 // the middle)
                 const i_size = if (stable_in) @min(iend - ip, s.comp.block_size_max) else s.in_buff_pos - s.in_to_compress;
                 const direct = oend - op >= frame.compressBound(i_size) or stable_out;
-                if (stable_out) try roomFor(oend - op, i_size);
                 const c_dst = if (direct) output.dst[op..] else out_buff;
                 if (!stable_in) {
                     const chunk = in_buff[s.in_to_compress..s.in_buff_pos];
@@ -438,16 +435,6 @@ pub const Stream = struct {
         };
     }
 };
-
-/// With `stable_out_buffer` libzstd compresses into whatever room the
-/// caller's buffer has left, storing a block raw when its compressed form
-/// does not fit and failing with `dstSize_tooSmall` when neither does. This
-/// port compresses only into room for `compressBound` of the input and is
-/// `error.DstSizeTooSmall` short of it (SPEC.md, *Deviations*): the bytes
-/// are libzstd's whenever it succeeds.
-fn roomFor(room: usize, src_size: usize) Error!void {
-    if (room < frame.compressBound(src_size)) return error.DstSizeTooSmall;
-}
 
 /// The parameters of a stream's frame: sized for its pledged size, else
 /// for the size hint (`ZSTD_getCParamsFromCCtxParams`), else unknown.

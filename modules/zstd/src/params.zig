@@ -486,12 +486,13 @@ pub const Advanced = struct {
     /// A call that breaks the contract is
     /// `error.StabilityConditionNotRespected`.
     stable_in_buffer: bool = false,
-    /// `ZSTD_c_stableOutBuffer` (`Stream` only): the caller keeps one output
-    /// buffer, never moving `dst` or the room left (`dst.len - pos`)
-    /// between calls; blocks are compressed straight into it (no output
-    /// buffer in the workspace), and a block that does not fit is
-    /// `error.DstSizeTooSmall` rather than held back. The bytes are the
-    /// buffered mode's.
+    /// `ZSTD_c_stableOutBuffer` (`Stream` only): the caller keeps the room
+    /// left in its output buffer (`dst.len - pos`) from call to call; blocks
+    /// are compressed straight into it (no output buffer in the workspace),
+    /// in whatever room there is: a block whose compressed form does not
+    /// fit is stored raw, and one that does not fit either way is
+    /// `error.DstSizeTooSmall` rather than held back -- as libzstd. With
+    /// room for `compressBound` the bytes are the buffered mode's.
     stable_out_buffer: bool = false,
     /// `ZSTD_c_blockDelimiters`: whether the sequences given to
     /// `Compressor.compressSequences` end each block with a delimiter.

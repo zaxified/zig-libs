@@ -196,8 +196,11 @@ fn compressLiterals(table: *const huf.CTable, meta: *const Metadata, lits: []con
     if (lits.len == 0 or meta.huf.h_type == .basic) {
         return literals.noCompress(dst, lits) catch error.DstSizeTooSmall;
     } else if (meta.huf.h_type == .rle) {
-        return literals.rle(dst, lits);
+        return literals.rle(dst, lits) catch error.DstSizeTooSmall;
     }
+    // (libzstd writes the header and the table description unchecked, past
+    // the end of a smaller destination: undefined, refused here)
+    if (dst.len < lh_size + if (write_entropy and meta.huf.h_type == .compressed) meta.huf.des_size else 0) return error.DstSizeTooSmall;
     var op = lh_size;
     var c_lit_size: usize = 0;
     if (write_entropy and meta.huf.h_type == .compressed) {
@@ -267,6 +270,8 @@ fn compressSequences(fse_tables: *const sequences.FseTables, meta: *const Metada
     const seq_head = op;
     op += 1;
     if (write_entropy) {
+        // (unchecked in libzstd: undefined past the end, refused here)
+        if (dst.len - op < meta.fse_tables_size) return error.DstSizeTooSmall;
         dst[seq_head] = (@as(u8, @intFromEnum(meta.ll_type)) << 6) + (@as(u8, @intFromEnum(meta.of_type)) << 4) + (@as(u8, @intFromEnum(meta.ml_type)) << 2);
         @memcpy(dst[op..][0..meta.fse_tables_size], meta.fse_tables[0..meta.fse_tables_size]);
         op += meta.fse_tables_size;
@@ -293,6 +298,8 @@ fn compressSequences(fse_tables: *const sequences.FseTables, meta: *const Metada
 /// store `sub`) and literals `lits`, header included. 0 when it does not
 /// compress.
 fn compressSubBlock(next: State, meta: *const Metadata, sub: *const SeqStore, lits: []const u8, dst: []u8, write_lit_entropy: bool, write_seq_entropy: bool, lit_entropy_written: *bool, seq_entropy_written: *bool, last_block: u32) Error!usize {
+    // (libzstd starts past the block header unchecked: undefined below it)
+    if (dst.len < block_header_size) return error.DstSizeTooSmall;
     var op: usize = block_header_size;
     {
         const c_lit_size = try compressLiterals(&next.huf.table, meta, lits, dst[op..], write_lit_entropy, lit_entropy_written);

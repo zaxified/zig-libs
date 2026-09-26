@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — **BEHAVIOURAL, not breaking**: a `Stream` with
+  `Advanced.stable_out_buffer` compresses into whatever room the caller's
+  buffer has left, as libzstd 1.5.7 does (SPEC backlog Z1d): a block whose
+  compressed form does not fit is stored raw, and only what fits neither
+  way is `error.DstSizeTooSmall` -- it used to be refused below
+  `compressBound`. Where libzstd would write past the end (sub-blocks with
+  `targetCBlockSize`) the call fails instead.
+
 - **2026-09-26** — `Advanced.stable_in_buffer` / `stable_out_buffer`
   (`ZSTD_c_stableInBuffer` / `ZSTD_c_stableOutBuffer`, SPEC backlog Z1):
   a `Stream` compresses straight from the caller's input and into the
