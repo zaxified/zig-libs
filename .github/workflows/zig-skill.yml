@@ -1,0 +1,51 @@
+name: zig-skill
+
+# The zig skill in .claude/skills/zig is vendored from an audited release of
+# https://github.com/zaxified/zig-skills (cloud sessions load only what is
+# committed). This checks it is byte for byte the release its manifest names:
+# the tag must point at the recorded commit, and no file may be edited, added
+# or removed. Update it only with that repository's scripts/install.py.
+on:
+  push:
+    paths: [".claude/skills/zig/**", ".github/workflows/zig-skill.yml"]
+  pull_request:
+    paths: [".claude/skills/zig/**", ".github/workflows/zig-skill.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Vendored skill equals its audited release
+        run: |
+          python3 - <<'PY'
+          import filecmp, json, os, subprocess, sys
+          d = ".claude/skills/zig"
+          m = json.load(open(os.path.join(d, ".zig-skills-source.json")))
+          tag, commit = m["tag"], m["commit"]
+          if not tag.startswith("v"):
+              sys.exit(f"manifest tag {tag!r} is not a release tag")
+          subprocess.run(["git", "clone", "--quiet", "--depth", "1", "--branch", tag,
+                          "https://github.com/zaxified/zig-skills", "/tmp/zig-skills"], check=True)
+          head = subprocess.run(["git", "-C", "/tmp/zig-skills", "rev-parse", "HEAD"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+          if head != commit:
+              sys.exit(f"{tag} is {head}, manifest says {commit}")
+          src = "/tmp/zig-skills/skills/zig"
+          def files(root):
+              return {os.path.relpath(os.path.join(r, f), root).replace(os.sep, "/")
+                      for r, _, fs in os.walk(root) for f in fs} - {".zig-skills-source.json"}
+          ours, theirs = files(d), files(src)
+          bad = [f"not in {tag}: {p}" for p in sorted(ours - theirs)]
+          bad += [f"missing: {p}" for p in sorted(theirs - ours)]
+          bad += [f"modified: {p}" for p in sorted(ours & theirs)
+                  if not filecmp.cmp(os.path.join(d, p), os.path.join(src, p), shallow=False)]
+          print("\n".join(bad) or f"{d} = {tag} ({commit[:12]}), {len(ours)} files")
+          sys.exit(1 if bad else 0)
+          PY

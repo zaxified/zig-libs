@@ -1,0 +1,256 @@
+{
+  "repository": "https://github.com/zaxified/zig-skills",
+  "tag": "v0.16.0-r2",
+  "commit": "be65603a77b62795aa02a38b81192c280cadb09f",
+  "content_id": "fa9263ca904fac2618b12a79f9abb4159652157da46253b7eeb4b8309f617798",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "sha256": "ad95f1dba24b2981fc7f1df9a6c0dc5cb58e7f71a70ef5e9b8a92e71c6274782"
+    },
+    {
+      "path": "references/builtins.md",
+      "sha256": "6aa0a953506e2ed27dd5fddc2ad517daffbd2e107e6a465c736138a86da8f9a3"
+    },
+    {
+      "path": "references/c-interop.md",
+      "sha256": "33727f2462f633d442ac1e52fd6d677a0b8b624b823372783818dbffea269597"
+    },
+    {
+      "path": "references/code-review.md",
+      "sha256": "617d96e5abc5eff21a861caca42334a72135f070a7d7c0b0aab1ecb85b019121"
+    },
+    {
+      "path": "references/comptime.md",
+      "sha256": "0e3804e41333dad865fbb858cf744ef1fef05e98f6d9bbd96a8c079e8ec53427"
+    },
+    {
+      "path": "references/data-oriented-design.md",
+      "sha256": "7790c9336c57e58356f060cbfd1392c6e95aa25df760d98d825036cddcfb01c8"
+    },
+    {
+      "path": "references/language.md",
+      "sha256": "81ac5e91a5f8566e7db1324b6386f38da3761f2c86f7e82eb5da58d6949c7731"
+    },
+    {
+      "path": "references/mcp-server-patterns.md",
+      "sha256": "30b572445498b76bf99c00fae17f7c77e86f26f27ba15c130bbd775d2c4eda91"
+    },
+    {
+      "path": "references/patterns.md",
+      "sha256": "f563e5b5d9724e395df1e982f9fa50e8c5e6c17159d8a0b461150374111e93b6"
+    },
+    {
+      "path": "references/production-patterns.md",
+      "sha256": "581e751d014df6080872d4ad146b472753756c900bd39e78b74d21ae6d42f946"
+    },
+    {
+      "path": "references/quality-tooling.md",
+      "sha256": "f410a63398d417247a20eb7f57874b57c3b10864e2750908c0c7c36879c4cd65"
+    },
+    {
+      "path": "references/simd-intrinsics.md",
+      "sha256": "8831ffdc04dd0109163d261388f3b6a24aa63bc6097187b343f55792d5522e33"
+    },
+    {
+      "path": "references/std-allocators.md",
+      "sha256": "7e669fce4e198044428cea78fe7bbc9ef13398826a29102ab0482f61dce674e9"
+    },
+    {
+      "path": "references/std-array-hash-map.md",
+      "sha256": "8400d763ea028d804f4c37b2f06da3d13298dd988701936feb8dab8c4612bbc2"
+    },
+    {
+      "path": "references/std-arraylist.md",
+      "sha256": "bb21c45a01fb316a2af22f6cbcace6df5b777ad4366d87c342e6a1c671587b50"
+    },
+    {
+      "path": "references/std-ascii.md",
+      "sha256": "625f5e2a00035c3dcb0abf6d8f03527c6c30023f06822b6ee2f2d2ecb3ce6128"
+    },
+    {
+      "path": "references/std-atomic.md",
+      "sha256": "8402caa83309352db5083c8c1e080b425c2bb2e6f427793d70cb5a272d0eaca6"
+    },
+    {
+      "path": "references/std-base64.md",
+      "sha256": "43cba009d61b0dd71b98098591af28f30831064c218e2f57f1225fefc3cf2bf0"
+    },
+    {
+      "path": "references/std-bit-set.md",
+      "sha256": "70284a64fabef45d512c41a01c394e463446dd58ffe234a66f49e4da2225ad55"
+    },
+    {
+      "path": "references/std-buf-map.md",
+      "sha256": "daea28d6099309fd9c7fd10e854cd8b38e0eb68ef0d50230d547e84771026736"
+    },
+    {
+      "path": "references/std-build.md",
+      "sha256": "d11183ffa5b128fa57c0f2bf3fd5523dd4896d62f44b263251738ae4ef4d3853"
+    },
+    {
+      "path": "references/std-c.md",
+      "sha256": "fe4da70b789cf0ba3d4098d444ac48518cdc7f058937726cae1f67b9ae9a070e"
+    },
+    {
+      "path": "references/std-compress.md",
+      "sha256": "c466a4735f429bd390aa13dd1d84b065a307016e1c4360644b98e5fdaf389a73"
+    },
+    {
+      "path": "references/std-crypto.md",
+      "sha256": "22ce6387be99b2090d988a30d0d292c4642bf62bbdbf552861c1369cd505bc83"
+    },
+    {
+      "path": "references/std-debug.md",
+      "sha256": "2b42d363674dc39dc1ef75994ef0623bc87a5ef9a650b8dd23126b01a42c8b5a"
+    },
+    {
+      "path": "references/std-enums.md",
+      "sha256": "b6e3b99551b703951f81a42778a100460285c789f303c544d98e23b055a2024d"
+    },
+    {
+      "path": "references/std-fmt.md",
+      "sha256": "81b80a5097bf56443475da6def075f7b11414159e925f3c18f3d754c09a9e61f"
+    },
+    {
+      "path": "references/std-fs.md",
+      "sha256": "adac91e5d9a15023f23ea3bb069041154055abe77638df82042374ebd88bf100"
+    },
+    {
+      "path": "references/std-hash.md",
+      "sha256": "cfa6aa4156e34a496e170e828f82bb57de5848cd8812e9c186956bdb9eaf1675"
+    },
+    {
+      "path": "references/std-hashmap.md",
+      "sha256": "48d587b2ceaf877fd3be0809720bc4baeb983b8cfc33aa5367a4aae1ea60a2df"
+    },
+    {
+      "path": "references/std-http.md",
+      "sha256": "8c08d28e810baa76887b733122109e79044eeecdd114459a8a862609d32c7642"
+    },
+    {
+      "path": "references/std-io.md",
+      "sha256": "d93b5fb8ab2356640dbe4cfed9d85b2fb0d0066d04a8681113b51a02ff1b0df9"
+    },
+    {
+      "path": "references/std-json.md",
+      "sha256": "b11f5b44c482fdf356e8a71c0356642fdecbf6f026985bda5bce6025b807acf6"
+    },
+    {
+      "path": "references/std-linked-list.md",
+      "sha256": "2aa1e4876c02d7d28999b410f06fea5ef41e5fa4ed2af4caabc3228e09f6570f"
+    },
+    {
+      "path": "references/std-log.md",
+      "sha256": "b1ff2c4067b6f5d0423473d82f5dde813ee2a4e6982bf6cc4f41e99b39a5d0fc"
+    },
+    {
+      "path": "references/std-math.md",
+      "sha256": "c7eb5cbc0ba32f159c223c35442894206b51c177eab2c24a16c74da5b253b3fb"
+    },
+    {
+      "path": "references/std-mem.md",
+      "sha256": "1bf728c15adb961830b21a40ae0a38a7e438bbb32610f2bdb5db738533b8fe5b"
+    },
+    {
+      "path": "references/std-meta.md",
+      "sha256": "033590bbaf9e5eee45dce1bcff48684091a0d09bfc27e8e3c4021aeb1b782803"
+    },
+    {
+      "path": "references/std-multi-array-list.md",
+      "sha256": "f5ea44050593d7b00e1eb720246dc9fc7e50cea4ced6faa7beeed9c77e69a0bd"
+    },
+    {
+      "path": "references/std-net.md",
+      "sha256": "0aa9ae3b705c97bd2f2d69d8e9b5917144980b36682058a48b452e4933cd4aab"
+    },
+    {
+      "path": "references/std-os.md",
+      "sha256": "b472b535b044cc96dbdffe20b5cb01a5c38c4dc53e550450fabe9395226ed1f6"
+    },
+    {
+      "path": "references/std-priority-dequeue.md",
+      "sha256": "f9462844c8abc47ae336de8cb8e858fa6f313fbe0c7b05e8db7f531828aef680"
+    },
+    {
+      "path": "references/std-priority-queue.md",
+      "sha256": "e7b7876c689950d695146480f03a257bbc8c2edd78867a6e59e01fa4d1a97bb7"
+    },
+    {
+      "path": "references/std-process.md",
+      "sha256": "28bb288ee6a1897f052f77557756fe5798e8089f58cfd82b196b0821f1e91c56"
+    },
+    {
+      "path": "references/std-random.md",
+      "sha256": "20236be5c07bf10cc7f2ef77ef8b82bb13cdce7b9107d86a4599d55b8e102a1f"
+    },
+    {
+      "path": "references/std-segmented-list.md",
+      "sha256": "c5af41dfd78f47cdb1f10702564f20e2054e9388a9c643c4d4a12f2d729f3fa7"
+    },
+    {
+      "path": "references/std-simd.md",
+      "sha256": "c62a1421c1de8d2c9ead7b9a76c74b11e0441a814de37f571e8420106336589a"
+    },
+    {
+      "path": "references/std-sort.md",
+      "sha256": "e724cbabe48c8f7be1c73ba746f4a95424f5364c947de394759e96086feaddd3"
+    },
+    {
+      "path": "references/std-static-string-map.md",
+      "sha256": "52be57c62161d3968097bf37e2bb68b6f08578f68f7310728b26fef3bcb1584c"
+    },
+    {
+      "path": "references/std-tar.md",
+      "sha256": "05a362701f7ccf08915c83b95f625d990aa95d988562b2b6875ca00f88030461"
+    },
+    {
+      "path": "references/std-testing.md",
+      "sha256": "91a634909d44bcbe4875a20edd3c782a657a91c2844410d823b086ca0804a1b5"
+    },
+    {
+      "path": "references/std-thread.md",
+      "sha256": "2058b72b4aa8aca075fc36f554bda0c9c62844c0c124678c46a750a9095b5853"
+    },
+    {
+      "path": "references/std-time.md",
+      "sha256": "8bfb23b9d47034b805303c5aa771c8622efd9a790244aabcbaabdcfd19c4f3b7"
+    },
+    {
+      "path": "references/std-treap.md",
+      "sha256": "f8b8e300775d75ef8b13432dd355250f3b27178e9afe5917bdc5b63b87e62606"
+    },
+    {
+      "path": "references/std-tz.md",
+      "sha256": "396f7867b699c85e7b928b9ec00caf2d23762305f36158c5673a18125d05e7ad"
+    },
+    {
+      "path": "references/std-unicode.md",
+      "sha256": "cdae2d34ae63ed0507fdfa13189f7953a5fdbc506a84462146b1c9d623f21a34"
+    },
+    {
+      "path": "references/std-uri.md",
+      "sha256": "b06453033110d5c46ffc0588d8bade56b8443fd284f17cd601dc9a4f863f73b5"
+    },
+    {
+      "path": "references/std-zig.md",
+      "sha256": "3da202e032eaef42586003ccb0da8a959bd60d974b2545eaec80afe434dc119c"
+    },
+    {
+      "path": "references/std-zip.md",
+      "sha256": "182271e54d558b1613f957222044fbf750246d1314c9d0dec0c3e751af135bfd"
+    },
+    {
+      "path": "references/std-zon.md",
+      "sha256": "9ffb77b1dbebebfdae655960331bb1eb62e273c10ce223573d9c70d35a6341c0"
+    },
+    {
+      "path": "references/style-guide.md",
+      "sha256": "43e387c2b79f7bd35fe7ba3e7a0d26ae60e803eb83d13e0b664316ab99446cc6"
+    },
+    {
+      "path": "references/zig-016-gotchas.md",
+      "sha256": "df6e79b7e25f1ce313ae206a17886e2a7c9dae8ab788b7148a4be1fed1e13a80"
+    }
+  ]
+}
