@@ -2642,6 +2642,17 @@ dictionaries are undecided.
   workspace (`ZSTD_initStaticCCtx`), and a stream's later frames and
   `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
   `CDict` attached or copied into a reused context.
+- **Z14 — A `StreamWriter` that serves many frames without allocating.**
+  BACKLOG (2026-09-26, found by qap). `StreamWriter.init` builds a fresh
+  `Stream` and allocates a `compressBound(128 KB)` scratch every time, and
+  `finish` leaves the writer failing; an HTTP server encodes one frame per
+  response and wants the context kept (libzstd's `ZSTD_CCtx` reused with
+  `ZSTD_CCtx_reset`, as Go's `zstd.Encoder.Reset(w)` does). Wanted:
+  `StreamWriter.reset(output, opts)` (a new frame on the same `Stream`,
+  pledged size per frame) and `initStatic`/caller-owned scratch. qap wrote
+  the 60 lines itself over `Stream.reset` + `compressStream2`
+  (`src/compression_zstd.zig`, a 16 KiB output scratch). Small; no new
+  bytes to anchor (the frames are `Stream`'s).
 
 Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7, Z11, Z8 done) Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
