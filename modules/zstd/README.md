@@ -189,6 +189,21 @@ The frame depends on where the flushes fall, not on how the writes were cut
 or on the buffer's length. On `error.WriteFailed`, `sw.err` names the
 stream's own cause; null means `out` failed.
 
+One writer serves frame after frame (an HTTP server, one frame per
+response): `reset` starts the next frame on the same stream and keeps its
+workspace, so a warm writer does not allocate; `initScratch` takes the
+caller's scratch instead of allocating one, and `initStatic` runs in the
+caller's workspace (`estimateStreamSize`) with no allocator at all:
+
+```zig
+var sw: zstd.StreamWriter = try .initScratch(gpa, out, &buf, &scratch, opts);
+defer sw.deinit();
+// per response:
+try sw.reset(out, .{ .level = 3, .pledged_size = body_len });
+try sw.writer.writeAll(body);
+try sw.finish();
+```
+
 Or one independent frame per buffer fill and per flush:
 
 ```zig

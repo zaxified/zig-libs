@@ -9,7 +9,15 @@
 //! on how the writes were cut, nor on the buffer's length, only on where the
 //! flushes fall: the output goes through a scratch of `compressBound` of one
 //! block, so libzstd's shortcut for an `end` with room for all of it takes
-//! at most one block, which is also what the ordinary path makes of it.
+//! at most one block, which is also what the ordinary path makes of it. A
+//! smaller scratch (`initScratch`, `initStatic`) only takes that shortcut
+//! for less input, so it gives the same bytes too.
+//!
+//! One writer serves frame after frame: `reset` starts the next one on the
+//! same `Stream` (libzstd's `ZSTD_CCtx_reset`), keeping its workspace, so a
+//! warm writer allocates only when a frame needs a larger workspace (or,
+//! as in libzstd, to shrink one three times too big for 128 frames) --
+//! and `initStatic` never.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -28,39 +36,86 @@ pub const StreamWriter = struct {
     writer: Writer,
     output: *Writer,
     s: stream.Stream,
+    /// The buffer given at init, for `reset` (`finish` takes it off
+    /// `writer`).
+    buffer: []u8,
     /// Where compressed bytes go before `output`.
     scratch: []u8,
-    gpa: std.mem.Allocator,
+    /// The allocator `scratch` came from, when the writer owns it (`init`).
+    scratch_gpa: ?std.mem.Allocator,
     /// Why the last `error.WriteFailed` came from here rather than from
     /// `output` (`Writer.Error` has room for one error only). Null when
     /// `output` failed.
     err: ?stream.Error = null,
 
+    const vtable: Writer.VTable = .{ .drain = drain, .flush = flush };
+
     /// `buffer` must be nonempty. `gpa` holds the stream's workspace
     /// (allocated at its first call) and a scratch of
     /// `compressBound(128 KB)` bytes for the writer's life.
     pub fn init(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, opts: stream.Options) InitError!StreamWriter {
-        std.debug.assert(buffer.len != 0);
-        if (opts.advanced.stable_in_buffer or opts.advanced.stable_out_buffer) return error.ParameterCombinationUnsupported;
-        var s: stream.Stream = try .init(gpa, opts);
-        errdefer s.deinit();
+        try checkModes(opts);
+        const scratch = try gpa.alloc(u8, frame.compressBound(128 * 1024));
+        errdefer gpa.free(scratch);
+        var sw = try initScratch(gpa, output, buffer, scratch, opts);
+        sw.scratch_gpa = gpa;
+        return sw;
+    }
+
+    /// `init` with the caller's `scratch` (nonempty, any length; the bytes
+    /// do not depend on it) instead of an allocated one; `gpa` holds only
+    /// the stream's workspace. Both buffers must outlive the writer.
+    pub fn initScratch(gpa: std.mem.Allocator, output: *Writer, buffer: []u8, scratch: []u8, opts: stream.Options) InitError!StreamWriter {
+        try checkModes(opts);
+        return fromStream(try .init(gpa, opts), output, buffer, scratch);
+    }
+
+    /// Allocates nothing, ever: the stream lives in the caller's
+    /// `workspace` (`Stream.initStatic`, libzstd's `ZSTD_initStaticCCtx`),
+    /// and a frame that needs more than it holds (`estimateStreamSize`)
+    /// fails its write with `err` = `error.OutOfMemory`.
+    pub fn initStatic(workspace: frame.Workspace, output: *Writer, buffer: []u8, scratch: []u8, opts: stream.Options) InitError!StreamWriter {
+        try checkModes(opts);
+        return fromStream(try .initStatic(workspace, opts), output, buffer, scratch);
+    }
+
+    fn fromStream(s: stream.Stream, output: *Writer, buffer: []u8, scratch: []u8) StreamWriter {
+        std.debug.assert(buffer.len != 0 and scratch.len != 0);
         return .{
-            .writer = .{ .buffer = buffer, .vtable = &.{ .drain = drain, .flush = flush } },
+            .writer = .{ .buffer = buffer, .vtable = &vtable },
             .output = output,
             .s = s,
-            .scratch = try gpa.alloc(u8, frame.compressBound(128 * 1024)),
-            .gpa = gpa,
+            .buffer = buffer,
+            .scratch = scratch,
+            .scratch_gpa = null,
         };
+    }
+
+    fn checkModes(opts: stream.Options) InitError!void {
+        if (opts.advanced.stable_in_buffer or opts.advanced.stable_out_buffer) return error.ParameterCombinationUnsupported;
     }
 
     pub fn deinit(sw: *StreamWriter) void {
         sw.s.deinit();
-        sw.gpa.free(sw.scratch);
+        if (sw.scratch_gpa) |gpa| gpa.free(sw.scratch);
         sw.* = undefined;
     }
 
+    /// The next frame, to `output` with `opts` (its own `pledged_size`
+    /// included): `Stream.reset`, the workspace kept. A frame not yet
+    /// finished is abandoned, what was buffered for it dropped. Works after
+    /// `finish` and after a failed write alike. On an error the writer is
+    /// as it was.
+    pub fn reset(sw: *StreamWriter, output: *Writer, opts: stream.Options) InitError!void {
+        try checkModes(opts);
+        try sw.s.reset(opts);
+        sw.output = output;
+        sw.err = null;
+        sw.writer = .{ .buffer = sw.buffer, .vtable = &vtable };
+    }
+
     /// End the frame with what is buffered (`ZSTD_e_end`) and stop accepting
-    /// writes. With nothing written at all, the empty frame. `output` is not
+    /// writes until `reset`. With nothing written at all, the empty frame. `output` is not
     /// flushed.
     pub fn finish(sw: *StreamWriter) Writer.Error!void {
         defer sw.writer = .failing;
@@ -257,4 +312,155 @@ test "stable buffer modes are refused; failures keep their cause" {
     try sw2.writer.writeAll("more than four bytes of frame");
     try testing.expectError(error.WriteFailed, sw2.finish());
     try testing.expectEqual(null, sw2.err);
+}
+
+/// What the writer must give for `src` written without a flush through a
+/// buffer of `buf_len`: a body that never left the buffer reaches the stream
+/// as one `end` (the size in the header, as a one-shot compression gives it),
+/// a longer one as `expected` says.
+fn expectedFrame(src: []const u8, opts: stream.Options, buf_len: usize) ![]u8 {
+    if (src.len <= buf_len) {
+        std.debug.assert(!opts.checksum and opts.pledged_size == null);
+        return zstd.compressAlloc(testing.allocator, src, .{ .level = opts.level });
+    }
+    return expected(src, opts, &.{});
+}
+
+/// `src` cut into `writeAll`s of `step`, then `finish`.
+fn writeFrame(sw: *StreamWriter, src: []const u8, step: usize) !void {
+    var i: usize = 0;
+    while (i < src.len) : (i += step) try sw.writer.writeAll(src[i..@min(i + step, src.len)]);
+    try sw.finish();
+}
+
+test "reset: frame after frame, each the bytes a fresh stream gives" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 300_000);
+    defer gpa.free(src);
+    text(src);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [4096]u8 = undefined;
+    var sw: StreamWriter = try .init(gpa, &out.writer, &buf, .{ .level = 3 });
+    defer sw.deinit();
+    const frames = [_]struct { n: usize, opts: stream.Options }{
+        .{ .n = 300_000, .opts = .{ .level = 3 } },
+        .{ .n = 5_000, .opts = .{ .level = 3, .pledged_size = 5_000 } },
+        .{ .n = 300_000, .opts = .{ .level = 7, .checksum = true } },
+        .{ .n = 0, .opts = .{} },
+        .{ .n = 120_000, .opts = .{ .level = -2, .pledged_size = 120_000 } },
+        .{ .n = 300_000, .opts = .{ .level = 3 } },
+    };
+    for (frames, 0..) |f, i| {
+        var o: Writer.Allocating = .init(gpa);
+        defer o.deinit();
+        if (i != 0) try sw.reset(&o.writer, f.opts) else sw.output = &o.writer;
+        try writeFrame(&sw, src[0..f.n], 7_001);
+        const want = try expectedFrame(src[0..f.n], f.opts, buf.len);
+        defer gpa.free(want);
+        try testing.expectEqualSlices(u8, want, o.written());
+    }
+}
+
+test "reset abandons a frame mid-way and clears a failure" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 200_000);
+    defer gpa.free(src);
+    text(src);
+    const want = try expected(src, .{ .level = 5 }, &.{});
+    defer gpa.free(want);
+    var junk: Writer.Allocating = .init(gpa);
+    defer junk.deinit();
+    var buf: [1000]u8 = undefined;
+    var sw: StreamWriter = try .init(gpa, &junk.writer, &buf, .{ .level = 5 });
+    defer sw.deinit();
+    // half a frame, then a new one
+    try sw.writer.writeAll(src[0..150_000]);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try sw.reset(&out.writer, .{ .level = 5 });
+    try writeFrame(&sw, src, 3_000);
+    try testing.expectEqualSlices(u8, want, out.written());
+    // more than pledged fails; a reset starts clean
+    try sw.reset(&junk.writer, .{ .level = 5, .pledged_size = 3 });
+    try sw.writer.writeAll("four");
+    try testing.expectError(error.WriteFailed, sw.writer.flush());
+    try testing.expectEqual(error.SrcSizeWrong, sw.err.?);
+    out.clearRetainingCapacity();
+    try sw.reset(&out.writer, .{ .level = 5 });
+    try testing.expectEqual(null, sw.err);
+    try writeFrame(&sw, src, 200_000);
+    try testing.expectEqualSlices(u8, want, out.written());
+    // refused options leave the writer as it was
+    try testing.expectError(error.LevelUnsupported, sw.reset(&junk.writer, .{ .level = 23 }));
+    try testing.expectError(error.ParameterCombinationUnsupported, sw.reset(&junk.writer, .{ .advanced = .{ .stable_in_buffer = true } }));
+    try testing.expectError(error.WriteFailed, sw.writer.writeAll("finished"));
+}
+
+test "the scratch's length does not change the bytes" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 250_000);
+    defer gpa.free(src);
+    text(src);
+    for ([_]usize{ 0, 40, 250_000 }) |n| {
+        const opts: stream.Options = .{ .level = 4 };
+        const want = try expectedFrame(src[0..n], opts, 512);
+        defer gpa.free(want);
+        for ([_]usize{ 1, 17, 16 * 1024, frame.compressBound(n) }) |slen| {
+            const scratch = try gpa.alloc(u8, slen);
+            defer gpa.free(scratch);
+            var out: Writer.Allocating = .init(gpa);
+            defer out.deinit();
+            var buf: [512]u8 = undefined;
+            var sw: StreamWriter = try .initScratch(gpa, &out.writer, &buf, scratch, opts);
+            defer sw.deinit();
+            try writeFrame(&sw, src[0..n], 100_000);
+            try testing.expectEqualSlices(u8, want, out.written());
+        }
+    }
+}
+
+test "a warm writer allocates nothing per frame; a static one never" {
+    const gpa = testing.allocator;
+    const src = try gpa.alloc(u8, 100_000);
+    defer gpa.free(src);
+    text(src);
+    const opts: stream.Options = .{ .level = 3, .pledged_size = src.len };
+    const want = try expected(src, opts, &.{});
+    defer gpa.free(want);
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var buf: [16 * 1024]u8 = undefined;
+    var scratch: [16 * 1024]u8 = undefined;
+
+    var counting: std.testing.FailingAllocator = .init(gpa, .{});
+    var sw: StreamWriter = try .initScratch(counting.allocator(), &out.writer, &buf, &scratch, opts);
+    defer sw.deinit();
+    try writeFrame(&sw, src, 10_000);
+    const warm = counting.allocations;
+    try testing.expect(warm != 0);
+    for (0..5) |_| {
+        out.clearRetainingCapacity();
+        try sw.reset(&out.writer, opts);
+        try writeFrame(&sw, src, 10_000);
+        try testing.expectEqualSlices(u8, want, out.written());
+    }
+    try testing.expectEqual(warm, counting.allocations);
+
+    const need = try zstd.estimateStreamSize(opts);
+    const ws = try gpa.alignedAlloc(u8, .fromByteUnits(frame.workspace_alignment), need);
+    defer gpa.free(ws);
+    var st: StreamWriter = try .initStatic(ws, &out.writer, &buf, &scratch, opts);
+    defer st.deinit();
+    for (0..3) |_| {
+        out.clearRetainingCapacity();
+        try st.reset(&out.writer, opts);
+        try writeFrame(&st, src, 10_000);
+        try testing.expectEqualSlices(u8, want, out.written());
+    }
+    // a frame the workspace cannot hold: the stream's error, kept
+    var st_short: StreamWriter = try .initStatic(ws[0 .. need / 2], &out.writer, &buf, &scratch, opts);
+    defer st_short.deinit();
+    try testing.expectError(error.WriteFailed, writeFrame(&st_short, src, 10_000));
+    try testing.expectEqual(error.OutOfMemory, st_short.err.?);
 }

@@ -238,6 +238,14 @@ on where the flushes fall, not on how the writes were cut or on the
 buffer's length. When nothing reached the stream before `finish`, that one
 `end` records the size in the header. Stable buffers are refused
 (`error.ParameterCombinationUnsupported`): the writer's buffer is reused.
+A smaller scratch of the caller's (`initScratch`, `initStatic`, any
+nonempty length) only takes the one-pass `end` for less input, so the bytes
+do not change with it (tested from 1 byte up). `reset(output, opts)` is the
+next frame on the same `Stream` (`ZSTD_CCtx_reset` with the new
+parameters and pledged size): an unfinished frame is abandoned, a failure
+cleared, the workspace kept, so frame after frame allocates nothing once
+warm (libzstd's shrinking of a workspace three times too big aside), and
+`initStatic` (the stream in the caller's workspace) never does (Z14).
 
 A chunk that does not follow the previous one in memory (the buffer
 wrapped, or the end came from the caller's input) makes the window two
@@ -2642,17 +2650,10 @@ dictionaries are undecided.
   workspace (`ZSTD_initStaticCCtx`), and a stream's later frames and
   `ZSTD_CCtx_reset`. With dictionaries (Z4) reuse matters again: a
   `CDict` attached or copied into a reused context.
-- **Z14 — A `StreamWriter` that serves many frames without allocating.**
-  BACKLOG (2026-09-26, found by qap). `StreamWriter.init` builds a fresh
-  `Stream` and allocates a `compressBound(128 KB)` scratch every time, and
-  `finish` leaves the writer failing; an HTTP server encodes one frame per
-  response and wants the context kept (libzstd's `ZSTD_CCtx` reused with
-  `ZSTD_CCtx_reset`, as Go's `zstd.Encoder.Reset(w)` does). Wanted:
-  `StreamWriter.reset(output, opts)` (a new frame on the same `Stream`,
-  pledged size per frame) and `initStatic`/caller-owned scratch. qap wrote
-  the 60 lines itself over `Stream.reset` + `compressStream2`
-  (`src/compression_zstd.zig`, a 16 KiB output scratch). Small; no new
-  bytes to anchor (the frames are `Stream`'s).
+- ~~**Z14 — A `StreamWriter` that serves many frames without allocating.**~~
+  Done 2026-09-26 (found by qap), see *Algorithm* (`StreamWriter`):
+  `StreamWriter.reset(output, opts)`, the caller's scratch
+  (`initScratch`) and no allocator at all (`initStatic`).
 
 Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7, Z11, Z8 done) Z4 + Z5
 (once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:

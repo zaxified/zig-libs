@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — `StreamWriter` serves frame after frame (SPEC backlog
+  Z14, asked for by qap): `reset(output, opts)` starts the next frame on
+  the same stream, keeping its workspace (`ZSTD_CCtx_reset`);
+  `initScratch` takes the caller's scratch buffer, and `initStatic` the
+  caller's workspace, so nothing is allocated at all. The bytes do not
+  depend on the scratch's length. **BREAKING (a field only):**
+  `StreamWriter.gpa` is now `scratch_gpa: ?Allocator` (null when the
+  caller owns the scratch); new field `buffer`.
+
 - **2026-09-26** — **BEHAVIOURAL, not breaking**: a `Stream` with
   `Advanced.stable_out_buffer` compresses into whatever room the caller's
   buffer has left, as libzstd 1.5.7 does (SPEC backlog Z1d): a block whose
