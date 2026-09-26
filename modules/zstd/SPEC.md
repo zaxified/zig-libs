@@ -628,7 +628,9 @@ dictionary goldens run through one context and one stream.
 `ZSTD_compress2` with `ZSTD_CCtx_loadDictionary` sizes that call's internal
 CDict; `Options` has no size hint (`StreamOptions` does, and `CDict.
 initAdvanced` takes one). `estimateCompressorSize` / `estimateStreamSize`
-leave dictionaries out (a copied CDict brings its own table sizes; a
+leave dictionaries out (a copied CDict brings its own table sizes --
+`CDict.estimateSize(dict_size, opts, copied)`, `ZSTD_estimateCDictSize`
+for this port's layout, is exactly what `CDict.memorySize` then reports; a
 `.raw` dictionary allocates a CDict per call or per stream; a static
 context cannot make one: `error.OutOfMemory`). libzstd reads the FSE
 entries past a dictionary table's last symbol when seeding the optimal
@@ -946,9 +948,16 @@ ended is `error.StageWrong` (libzstd's `stage_wrong`); `nb_workers` above
 256, `job_size` above 1 GiB and `overlap_log` above 9 are
 `error.ParameterOutOfBound` where libzstd clamps; a frame abandoned with a
 job prepared but not posted does not leave it for the next frame (libzstd
-keeps `jobReady`). `estimateCompressorSize` / `estimateStreamSize` size the
-single-threaded context only (libzstd refuses to estimate with workers);
-`MtCtx.memorySize` reports what a multithreaded context holds.
+keeps `jobReady`). With workers, `estimateCompressorSize` /
+`estimateStreamSize` count them where libzstd refuses to estimate
+(`zstdmt.estimateSize`): the round buffer, the LDM tables, one workspace
+per worker (the larger of a first job's, sized for the frame, and a later
+job's, sized for a section) and the job table's output and sequence
+buffers -- exactly what `MtCtx.memorySize` reports once every worker and
+job slot has served (tested equal), an upper bound before. An input of at
+most `ZSTDMT_JOBSIZE_MIN` stays on the calling thread and is estimated as
+such; with no pledged size both kinds of frame may come and the estimate
+is their sum, as the stream keeps both.
 
 **`rsyncable`** (Z9b, `ZSTD_c_rsyncable`, `Advanced.rsyncable`): while
 input is copied into the round buffer, `findSynchronizationPoint` rolls a
@@ -1638,7 +1647,8 @@ offsets btopt surcharges), and 33 survive:
 | literal price cap `>` → `>=`; `insertBt1` `bestLength > 384` → `>=` and its initial 8 → 7; post-split `nbSeq <= 4` → `< 4`; `writeLitEntropy` always; a long length at exactly a chunk's end (`> endIdx` → `>=`); optimal depth breaking at `guess >= minTableLog`; DUBT `btMask >= curr` → `>` | equivalent: equality stores the same value (cap; `bestLength` 384 gives 0 skipped positions, and the initial value feeds nothing else); 4 sequences are under the 300 a split needs anyway; the header size is 0 unless the table is new; a long length at the end index is never read by that chunk and its stray code is recomputed by the next; at the minimum log a shallower natural tree is the same tree at any larger log; `btMask == curr` gives `btLow` 0 either way |
 | predefined prices (literal 6 bits, offset `16 +`), the `srcSize <= 8` switch to them, `btultra2`'s `srcSize > 8` seeding pass; `ZSTD_BLOCKSIZE_MAX` literal length | unreachable: prices are predefined only for a first block of 8 bytes or less, where the parser (which stops 8 bytes before the end) never runs; a literal run of a whole 128 KB block likewise never reaches the parser |
 | `sufficient_len` cap 4095 → 4094; split estimate error `nbSeq * 10`; 196 → 195 splits; sequence buffer sized `/4` for `minMatch` 3 | unreachable: `targetLength` is at most 999; a table the estimate just built from the same counts represents every symbol; 196 profitable splits need ~30 000 sequences in one block; more than `blockSize / 4` sequences need matches under 4 bytes on average — the last only sizes a buffer (an overrun is a bounds panic, not a different frame) |
-| `insertBt1`'s window low at `curr` instead of `target`; DUBT insertion `matchIndex > windowLow` → `>=`; DUBT `maxDistance` − 1 | reached only when the input outgrows the window, which at the optimal levels takes > 4 MB (the golden set stops at 600 KB there, bar `far-mix-5`, whose window is 4 MB); checked instead against `zref` on 8–13 MB inputs at levels 13, 16 and 19 |
+| DUBT insertion `matchIndex > windowLow` → `>=`; DUBT `maxDistance` − 1 | equivalent without a dictionary (re-examined 2026-09-26, the size had been thought the obstacle): the parameters keep `chainLog <= windowLog + 1` (`ZSTD_adjustCParams`' cycle log), so `btLow = curr − (2^windowLog − 1)` already stops the tree at the window's last index; the node `>=` would link lies below every later search's own window. Only a dictionary (`dictAndWindowLog`) lets `chainLog` past that; not hunted there |
+| `insertBt1`'s window low at `curr` instead of `target` | reachable in principle: the extra node (older than the window at `target`) is cut off by every later search's window, so only its effect on `insertBt1`'s returned skip (a match over 384 bytes with it) could change the frame. Three constructed inputs (period 65 535 / 65 500 noise under `windowLog` 16, edits 1 in 64 and 1 in 2048, levels 13, 16, 19; libzstd's frames matched) did not show it. **Uncovered.** |
 | tree low end `matchIndex <= btLow` → `<` (insertion, both sides — `insertBt1` and DUBT); DUBT `unsortLimit` → `btLow` (differs only for a candidate at index 2); a 3-byte-hash match of exactly `targetLength`; a tree match of exactly 4096 bytes (`> ZSTD_OPT_NUM` → `>=`); split literal estimate thresholds (`largest <= n/128 + 4`, repeat when `old < n`, `hSize + 12 >= n`, `old <= hSize + new`); estimate header sizes at 1024 literals and 128 sequences | reachable in principle, each at an equality; ten minutes of seed search per mutation (tens of thousands of inputs of 70 KB–600 KB at the levels concerned) did not hit one. **Uncovered.** |
 
 Long-distance matching (level 22) got its own sweep on 2026-09-22: 47
@@ -1898,8 +1908,7 @@ as libzstd does; a header test pins it now.) The rest survive:
 | FSE `fastMode` at `count >= tableSize/2` → `>` | equivalent: at exactly half the table no state consumes 0 bits |
 | `FSE_readNCount` `count >= threshold` → `>`, `bitCount > 32` → `>=` | reachable only in damaged headers (no encoder writes the value `threshold`); 45 000 frames did not produce one |
 | Huffman fast-loop and X2 tail limits (`p_end - p > 3`, `op[3] >= oend`, `dtLog <= 11`, X2 level-2 fill rounding), `HUF_selectDecoder`'s weighting, raw literals read in place vs copied, `total_bits >= 31` reload, last-literals bound, the checksum computed when ignored, the frame-size precheck | equivalent: each changes only which of two equal paths runs |
-| 4 streams with exactly 6 literals refused; an RLE table of the largest code refused | **uncovered**: valid by the format, but no encoder emits either (libzstd uses one stream below 256 literals, and RLE tables only for three or more sequences, which the largest codes cannot fit in a block) |
-| `nbSeq` ≥ 0x7F00 (3-byte count) off by one | **uncovered**: needs a block of more than 32 512 sequences; generated token streams reached 31 106 |
+| 4 streams with exactly 6 literals refused (X1 and X2); an RLE table of the largest code refused; `nbSeq`'s 3-byte form off by one either way, or taken for `0xFE` | covered since 2026-09-26 by frames no encoder writes, built byte by byte in `decoder_test.zig` ("frames no encoder writes"): 4 one-byte Huffman streams of 2, 2, 2 and 0 symbols (X2 through a treeless block after one whose literals chose it), one sequence with RLE literal-length code 35 or match-length code 52, and 0x7EFF / 0x7F00 / 0x7F01 sequences of 1 literal and a 3-byte repeat match. libzstd decodes each (one-shot and both streamed plans of `zdec`); the test pins each frame's FNV-1a and libzstd's output. All 6 mutations killed |
 
 **Streaming decoder (Z2b, 2026-09-23).** `dstream_test.zig` replays
 libzstd's `ZSTD_decompressStream` call by call on the same frames — return
@@ -2223,6 +2232,11 @@ min of 3 runs on a pinned core, user-mode cycles and instructions
 |---|---|---|
 | cycles | 0.87–1.15× (1.03–1.07× at 1–7 on a quieter run) | 0.99–1.10× |
 | instructions | 0.95–1.15× | 0.97–1.12× |
+
+Re-measured one-shot on 2026-09-26, after dictionaries, multithreading,
+the sequence API and Z1d had touched the match finders and the frame path
+(same method, same kinds of input, levels −5, 1, 3, 5, 7, 9, 12, 16, 19):
+cycles 0.77–1.13×, instructions 0.94–1.14× -- unchanged.
 
 Before Z11 (2026-09-24) the same measurement gave 1.2–1.4× at levels
 −5…3 and 1.3–2.0× at 5–12. What closed it:
@@ -2661,9 +2675,6 @@ roughly 17–22 sessions.
 
 ## Open
 
-- Decoder: three reachable decisions without a case (see *Anchoring*):
-  a block of ≥ 0x7F00 sequences, four-stream literals of exactly 6 bytes, an
-  RLE sequence table of the largest code.
 - Sequences (Z10): a producer that fills its whole buffer with a
   trailing delimiter, and a literal length of exactly 65 536 in
   `generateSequences`, have no case (see *Anchoring*).

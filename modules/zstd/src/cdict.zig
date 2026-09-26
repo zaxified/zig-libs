@@ -391,23 +391,60 @@ pub const CDict = struct {
         return .{ params.getFromCCtxParams(opts.level, size_hint, dict_size, .create_cdict, opts.advanced), false };
     }
 
+    /// What `memorySize` will report for a CDict of `dict_size` bytes made
+    /// with `opts` (`ZSTD_estimateCDictSize_advanced`, for this port's
+    /// layout): `init(gpa, dict, level)` is `.{ .level = level }` and
+    /// copied, `initReference` not copied.
+    pub fn estimateSize(dict_size: usize, opts: Options, copied: bool) InitError!usize {
+        if (opts.level > params.max_level) return error.LevelUnsupported;
+        try opts.advanced.check();
+        const t = Tables.of(dict_size, opts);
+        return (t.hash_len + t.chain_len) * @sizeOf(u32) + t.tag_len + if (copied) dict_size else 0;
+    }
+
+    /// The table lengths a CDict gets.
+    const Tables = struct {
+        cp: params.CParams,
+        dds: bool,
+        use_row: bool,
+        hash_len: usize,
+        chain_len: usize,
+        tag_len: usize,
+
+        fn of(dict_size: usize, opts: Options) Tables {
+            const cp, const dds = resolveParams(dict_size, opts);
+            const use_row = params.resolveRowMatchFinder(opts.advanced.row_match_finder, cp);
+            const hash_len: usize = @as(usize, 1) << @intCast(cp.hash_log);
+            return .{
+                .cp = cp,
+                .dds = dds,
+                .use_row = use_row,
+                .hash_len = hash_len,
+                // ZSTD_allocateChainTable: not for fast, not with the row
+                // match finder -- always for the dedicated search, whose
+                // table layout lives in it
+                .chain_len = if (dds or (cp.strategy != .fast and !use_row)) @as(usize, 1) << @intCast(cp.chain_log) else 0,
+                .tag_len = if (use_row) hash_len else 0,
+            };
+        }
+    };
+
     fn create(gpa: std.mem.Allocator, dict: []const u8, opts: Options, copy: bool) InitError!CDict {
         if (opts.level > params.max_level) return error.LevelUnsupported;
         try opts.advanced.check();
-        const cp, const dds = resolveParams(dict.len, opts);
-        const use_row = params.resolveRowMatchFinder(opts.advanced.row_match_finder, cp);
-        // ZSTD_allocateChainTable: not for fast, not with the row match
-        // finder -- always for the dedicated search, whose table layout
-        // lives in it
-        const chain_len: usize = if (dds or (cp.strategy != .fast and !use_row)) @as(usize, 1) << @intCast(cp.chain_log) else 0;
-        const hash_len: usize = @as(usize, 1) << @intCast(cp.hash_log);
+        const t = Tables.of(dict.len, opts);
+        const cp = t.cp;
+        const dds = t.dds;
+        const use_row = t.use_row;
+        const chain_len = t.chain_len;
+        const hash_len = t.hash_len;
 
         const owned: ?[]u8 = if (copy and dict.len != 0) try gpa.dupe(u8, dict) else null;
         errdefer if (owned) |o| gpa.free(o);
         const tables = try gpa.alloc(u32, hash_len + chain_len);
         errdefer gpa.free(tables);
         @memset(tables, 0);
-        const tag_table = try gpa.alloc(u8, if (use_row) hash_len else 0);
+        const tag_table = try gpa.alloc(u8, t.tag_len);
         errdefer gpa.free(tag_table);
         @memset(tag_table, 0);
 
@@ -663,4 +700,27 @@ test "the dedicated dictionary search's support and parameters are libzstd's" {
     const bt_hash = bt.hash_log;
     ddsRevertCParams(&bt);
     try std.testing.expectEqual(bt_hash, bt.hash_log);
+}
+
+test "estimateSize is what a CDict holds" {
+    const gpa = std.testing.allocator;
+    const dict = try gpa.alloc(u8, 120_000);
+    defer gpa.free(dict);
+    var prng: std.Random.DefaultPrng = .init(0xcd1c7);
+    for (dict) |*b| b.* = "abcdefgh ,;\n"[prng.random().uintLessThan(usize, 12)];
+    for ([_]usize{ 0, 100, 9_000, 120_000 }) |n| for ([_]i32{ -5, 1, 3, 6, 9, 16, 19 }) |level| {
+        for ([_]params.Advanced{ .{}, .{ .enable_dedicated_dict_search = true }, .{ .row_match_finder = .disable } }) |adv| {
+            const opts: CDict.Options = .{ .level = level, .advanced = adv };
+            var a = try CDict.initAdvanced(gpa, dict[0..n], opts);
+            defer a.deinit();
+            try std.testing.expectEqual(a.memorySize(), try CDict.estimateSize(n, opts, true));
+            var r = try CDict.initReference(gpa, dict[0..n], opts);
+            defer r.deinit();
+            try std.testing.expectEqual(r.memorySize(), try CDict.estimateSize(n, opts, false));
+        }
+        var p = try CDict.init(gpa, dict[0..n], level);
+        defer p.deinit();
+        try std.testing.expectEqual(p.memorySize(), try CDict.estimateSize(n, .{ .level = level }, true));
+    };
+    try std.testing.expectError(error.LevelUnsupported, CDict.estimateSize(10, .{ .level = 23 }, true));
 }

@@ -1060,6 +1060,55 @@ pub const MtCtx = struct {
     }
 };
 
+/// The most a multithreaded context holds for frames of `pledged` bytes
+/// (null: unknown) with `opts`: `memorySize` once every worker's context
+/// and every job slot has served a job -- the round buffer, the LDM tables,
+/// `nb_workers` workspaces (each the larger of a first job's, sized for the
+/// whole frame, and a later job's, sized for one section) and a job
+/// table's output and sequence buffers. Sized by the formulas `initFrame`
+/// and `slotBuffers` allocate by. Without a dictionary.
+pub fn estimateSize(opts: frame.Options, pledged: ?u64, size_hint: ?u32) usize {
+    const adv = opts.advanced;
+    std.debug.assert(adv.nb_workers >= 1);
+    const size: u64 = pledged orelse if (size_hint) |h| h else params.unknown_size;
+    const cp = params.getFromCCtxParams(opts.level, size, 0, .no_attach_dict, adv);
+    const ldm_on = ldm.resolve(adv.long_distance_matching, cp);
+    var job_size: usize = adv.job_size;
+    if (job_size != 0 and job_size < job_size_min) job_size = job_size_min;
+    if (job_size > job_size_max) job_size = job_size_max;
+    const prefix_size = computeOverlapSize(cp, adv.overlap_log, ldm_on);
+    var section = if (job_size != 0) job_size else @as(usize, 1) << @intCast(computeTargetJobLog(cp, ldm_on));
+    section = @max(section, prefix_size);
+    const n: usize = adv.nb_workers;
+
+    const window_size: usize = if (ldm_on) @as(usize, 1) << @intCast(cp.window_log) else 0;
+    const slack = section * (@as(usize, 2) + @intFromBool(prefix_size > 0));
+    var total: usize = @max(window_size, section * n) + slack + 64;
+
+    var seq_capacity: usize = 0;
+    if (ldm_on) {
+        const lp = ldm.adjustParameters(cp, adv);
+        total += (@as(usize, 1) << @intCast(lp.hash_log)) * @sizeOf(ldm.Entry);
+        total += @as(usize, 1) << @intCast(lp.hash_log - lp.bucket_size_log);
+        seq_capacity = ldm.maxNbSeq(lp, section);
+    }
+
+    // Job.compress: no LDM (it ran on the calling thread), no dictionary
+    var o = opts;
+    o.advanced.long_distance_matching = .disable;
+    o.dict = .none;
+    const first = frame.workspaceSize(cp, pledged, o, false);
+    o.checksum = false;
+    o.advanced.force_max_window = true;
+    const later = frame.workspaceSize(cp, section, o, false);
+    total += n * @max(first, later);
+
+    const nb_jobs: u32 = adv.nb_workers + 2;
+    const table_len = @as(usize, 1) << @intCast(std.math.log2_int(u32, nb_jobs) + 1);
+    total += table_len * (frame.compressBound(section) + 4 + seq_capacity * @sizeOf(ldm.RawSeq));
+    return total;
+}
+
 /// `ZSTDMT_computeTargetJobLog`: four windows (at least 1 MB); with LDM,
 /// whose window is typically oversized, from the cycle log instead.
 fn computeTargetJobLog(cp: params.CParams, ldm_on: bool) u32 {

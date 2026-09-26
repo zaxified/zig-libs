@@ -447,10 +447,22 @@ fn frameParams(opts: Options, pledged: ?u64) params.CParams {
 /// `opts.pledged_size` or `opts.src_size_hint` is set; with neither, the
 /// most any of its frames can need, whatever the input and however it
 /// arrives. Without the dictionary: a copied `CDict` brings its own table
-/// sizes.
+/// sizes. With `Advanced.nb_workers`, a frame over `zstdmt.job_size_min`
+/// goes to the workers (`zstdmt.estimateSize`, the most they hold); with
+/// no pledged size both kinds of frame may come, and the stream keeps both.
 pub fn estimateSize(opts: Options) Error!usize {
     try Stream.checkOptions(opts);
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
+    if (opts.advanced.nb_workers > 0) {
+        if (opts.pledged_size) |p| {
+            if (p > zstdmt.job_size_min) return zstdmt.estimateSize(fo, p, opts.src_size_hint);
+        } else return estimateSingle(opts, fo) + zstdmt.estimateSize(fo, null, opts.src_size_hint);
+    }
+    return estimateSingle(opts, fo);
+}
+
+/// `estimateSize` for the calling thread's own context.
+fn estimateSingle(opts: Options, fo: frame.Options) usize {
     if (opts.pledged_size != null or opts.src_size_hint != null)
         return frame.workspaceSize(frameParams(opts, opts.pledged_size), opts.pledged_size, fo, true);
     // Unknown, or known at the first call (which ends the frame): the need

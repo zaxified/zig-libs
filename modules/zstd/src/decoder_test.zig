@@ -288,3 +288,209 @@ test "damaged frames give libzstd's verdict (mutation-sweep fixtures)" {
     try std.testing.expectEqual(@as(usize, 0), failures);
     try std.testing.expectEqual(@as(usize, 11), kats.len);
 }
+
+/// Frames no encoder writes, built byte by byte (Z2 *Anchoring*, the
+/// decoder's three uncovered decisions): each is valid by the format and
+/// libzstd 1.5.7 decodes it (one-shot, and streamed whole and byte by byte
+/// through `tools/zdec.c`, 2026-09-26). The frames are generated here; the
+/// FNV-1a of each pins the bytes libzstd judged.
+const Crafted = struct {
+    frame: []u8,
+
+    fn fnv(b: []const u8) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        for (b) |x| {
+            h ^= x;
+            h *%= 0x100000001b3;
+        }
+        return h;
+    }
+
+    /// An LCG's top bytes: the literals.
+    fn literals(buf: []u8, seed: u64) void {
+        var s = seed;
+        for (buf) |*b| {
+            s = s *% 6364136223846793005 +% 1442695040888963407;
+            b.* = @truncate(s >> 56);
+        }
+    }
+
+    /// A frame with a 128 KB window (a block may be larger than the
+    /// content), a 4-byte content size and one last compressed block; the
+    /// block is `lits_header ++ lits ++ seqs`.
+    fn build(content_size: u32, lits_header: []const u8, lits: []const u8, seqs: []const u8) !Crafted {
+        const block_len = lits_header.len + lits.len + seqs.len;
+        var f: std.ArrayList(u8) = .empty;
+        errdefer f.deinit(gpa);
+        try f.appendSlice(gpa, &magic ++ [_]u8{ 0x80, 0x38 });
+        try f.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, content_size)));
+        const bh: u32 = 1 | (2 << 1) | (@as(u32, @intCast(block_len)) << 3);
+        try f.appendSlice(gpa, std.mem.asBytes(&std.mem.nativeToLittle(u32, bh))[0..3]);
+        try f.appendSlice(gpa, lits_header);
+        try f.appendSlice(gpa, lits);
+        try f.appendSlice(gpa, seqs);
+        return .{ .frame = try f.toOwnedSlice(gpa) };
+    }
+
+    /// Raw literals with a 3-byte header (20-bit size).
+    fn rawHeader(n: usize) [3]u8 {
+        const v: u32 = (3 << 2) | (@as(u32, @intCast(n)) << 4);
+        return .{ @truncate(v), @truncate(v >> 8), @truncate(v >> 16) };
+    }
+
+    /// `n` raw literals, then sequences with RLE tables for every code
+    /// (`nb_seq` as encoded, the three symbols, the bitstream).
+    fn rleSeqs(content_size: u32, n: usize, seed: u64, nb_seq: []const u8, ll: u8, of: u8, ml: u8, bits: []const u8) !Crafted {
+        const lits = try gpa.alloc(u8, n);
+        defer gpa.free(lits);
+        literals(lits, seed);
+        var seqs: std.ArrayList(u8) = .empty;
+        defer seqs.deinit(gpa);
+        try seqs.appendSlice(gpa, nb_seq);
+        try seqs.appendSlice(gpa, &.{ 0x54, ll, of, ml });
+        try seqs.appendSlice(gpa, bits);
+        const h = rawHeader(n);
+        return build(content_size, &h, lits, seqs.items);
+    }
+
+    /// One Huffman stream of 1-bit symbols (0 or 1): the marker bit, then
+    /// the symbols from the top down, as the decoder reads them.
+    fn stream(out: *std.ArrayList(u8), syms: []const u8) !void {
+        const k = syms.len;
+        var bytes = try gpa.alloc(u8, (k + 8) / 8);
+        defer gpa.free(bytes);
+        @memset(bytes, 0);
+        bytes[k / 8] |= @as(u8, 1) << @intCast(k % 8);
+        for (syms, 0..) |sym, i| {
+            const bit = k - 1 - i;
+            bytes[bit / 8] |= sym << @intCast(bit % 8);
+        }
+        try out.appendSlice(gpa, bytes);
+    }
+
+    /// Four streams of `syms` behind their jump table.
+    fn fourStreams(out: *std.ArrayList(u8), syms: []const u8) !void {
+        const seg = (syms.len + 3) / 4;
+        var parts: [4]std.ArrayList(u8) = @splat(.empty);
+        defer for (&parts) |*p| p.deinit(gpa);
+        for (&parts, 0..) |*p, i| try stream(p, syms[@min(i * seg, syms.len)..@min((i + 1) * seg, syms.len)]);
+        for (parts[0..3]) |p| try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u16, @intCast(p.items.len))));
+        for (parts) |p| try out.appendSlice(gpa, p.items);
+    }
+
+    /// A first block of 64 000 literals of symbols 0/1 (1 bit each), which
+    /// makes the double-symbol decoder (X2) the literals' table, then a
+    /// treeless block of the 6 literals `huf4x_6` has, in 4 streams, that
+    /// reuses it.
+    fn x2Six() !Crafted {
+        const n = 64000;
+        const syms = try gpa.alloc(u8, n);
+        defer gpa.free(syms);
+        literals(syms, 3);
+        for (syms) |*b| b.* >>= 7;
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(gpa);
+        try body.appendSlice(gpa, &.{ 0x80, 0x10 });
+        try fourStreams(&body, syms);
+        var body2: std.ArrayList(u8) = .empty;
+        defer body2.deinit(gpa);
+        try fourStreams(&body2, &.{ 0, 1, 1, 0, 1, 1 });
+
+        var f: std.ArrayList(u8) = .empty;
+        errdefer f.deinit(gpa);
+        try f.appendSlice(gpa, &magic ++ [_]u8{ 0x80, 0x38 });
+        try f.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, n + 6)));
+        const h1: u64 = 2 | (3 << 2) | (@as(u64, n) << 4) | (@as(u64, body.items.len) << 22);
+        const blk1_len = 5 + body.items.len + 1;
+        const h2: u32 = 3 | (1 << 2) | (6 << 4) | (@as(u32, @intCast(body2.items.len)) << 14);
+        const blk2_len = 3 + body2.items.len + 1;
+        for ([_]struct { last: u32, len: usize }{ .{ .last = 0, .len = blk1_len }, .{ .last = 1, .len = blk2_len } }, 0..) |b, i| {
+            const bh: u32 = b.last | (2 << 1) | (@as(u32, @intCast(b.len)) << 3);
+            try f.appendSlice(gpa, std.mem.asBytes(&std.mem.nativeToLittle(u32, bh))[0..3]);
+            if (i == 0) {
+                try f.appendSlice(gpa, std.mem.asBytes(&std.mem.nativeToLittle(u64, h1))[0..5]);
+                try f.appendSlice(gpa, body.items);
+            } else {
+                try f.appendSlice(gpa, std.mem.asBytes(&std.mem.nativeToLittle(u32, h2))[0..3]);
+                try f.appendSlice(gpa, body2.items);
+            }
+            try f.append(gpa, 0); // no sequences
+        }
+        return .{ .frame = try f.toOwnedSlice(gpa) };
+    }
+
+    fn deinit(c: Crafted) void {
+        gpa.free(c.frame);
+    }
+};
+
+test "frames no encoder writes decode as in libzstd (4 streams of 6 literals, X1 and X2; RLE of the largest code; 0x7F00 sequences)" {
+    const Case = struct { name: []const u8, frame_fnv: u64, len: usize, out_fnv: u64 };
+    const cases = [_]Case{
+        // 4 Huffman streams for exactly 6 literals (libzstd's minimum):
+        // symbols 0 and 1 of 1 bit each, streams of 2, 2, 2 and 0 symbols
+        .{ .name = "huf4x_6", .frame_fnv = 0x2bcf8a5b611ede48, .len = 6, .out_fnv = 0x6b2d60d80280e1f5 },
+        // the same, decoded by the double-symbol decoder: a treeless block
+        // after one whose literals chose it
+        .{ .name = "huf4x2_6", .frame_fnv = 0x32cd5cebffc9595a, .len = 64006, .out_fnv = 0xdd4e985454c2c140 },
+        // RLE literal-length table of code 35 (65 536 + 7 literals)
+        .{ .name = "rle_ll35", .frame_fnv = 0x2a84cbf41824431f, .len = 65546, .out_fnv = 0x83d43d07bab6c9bb },
+        // RLE match-length table of code 52 (a match of 65 539 + 5)
+        .{ .name = "rle_ml52", .frame_fnv = 0xf970a77cf6d73d1b, .len = 65545, .out_fnv = 0xdb783649dc0ec18d },
+        // the sequence count's 2-byte maximum and the 3-byte form's first two
+        .{ .name = "nbseq_7eff", .frame_fnv = 0x6e912908029bed15, .len = 4 * 0x7EFF, .out_fnv = 0xfbaa2432cbdf8c95 },
+        .{ .name = "nbseq_7f00", .frame_fnv = 0x4d3bf4596a1a4ab1, .len = 4 * 0x7F00, .out_fnv = 0xfa1d77dfdb1f8fd5 },
+        .{ .name = "nbseq_7f01", .frame_fnv = 0x08d0d87a96e6511f, .len = 4 * 0x7F01, .out_fnv = 0xe71a590181d72aa9 },
+    };
+    var d = try zstd.Decompressor.init(gpa, .{});
+    defer d.deinit();
+    for (cases) |cs| {
+        const c: Crafted = if (std.mem.eql(u8, cs.name, "huf4x_6")) blk: {
+            // weights given directly (header 0x80: one weight, 1; the
+            // second implied), a jump table of 1-byte streams: [0,1] [1,0]
+            // [1,1] [] -- each byte the marker bit above its symbols' bits
+            const huf = [_]u8{ 0x80, 0x10, 1, 0, 1, 0, 1, 0, 0x05, 0x06, 0x07, 0x01 };
+            const v: u32 = 2 | (1 << 2) | (6 << 4) | (@as(u32, huf.len) << 14);
+            const hdr = [3]u8{ @truncate(v), @truncate(v >> 8), @truncate(v >> 16) };
+            break :blk try Crafted.build(6, &hdr, &huf, &.{0});
+        } else if (std.mem.eql(u8, cs.name, "huf4x2_6"))
+            try Crafted.x2Six()
+        else if (std.mem.eql(u8, cs.name, "rle_ll35"))
+            // one sequence: 16 extra bits of literal length (7), a 3-byte
+            // match at repeat offset 1; the marker bit above
+            try Crafted.rleSeqs(65546, 65543, 1, &.{1}, 35, 0, 0, &.{ 7, 0, 1 })
+        else if (std.mem.eql(u8, cs.name, "rle_ml52")) blk: {
+            // one literal, then 16 extra bits of match length (5)
+            const huf_less = [_]u8{0x5a};
+            break :blk try Crafted.build(65545, &.{1 << 3}, &huf_less, &.{ 1, 0x54, 1, 0, 52, 5, 0, 1 });
+        } else blk: {
+            // every sequence one literal and a 3-byte match at offset 1,
+            // no bits at all: the bitstream is its marker byte
+            const n: u32 = std.fmt.parseInt(u32, cs.name[6..], 16) catch unreachable;
+            const nb_seq: []const u8 = if (n < 0x7F00) &.{ 0x80 + @as(u8, @intCast(n >> 8)), @truncate(n) } else &.{ 0xff, @truncate(n - 0x7F00), @truncate((n - 0x7F00) >> 8) };
+            break :blk try Crafted.rleSeqs(4 * n, n, 2, nb_seq, 1, 0, 0, &.{1});
+        };
+        defer c.deinit();
+        try std.testing.expectEqual(cs.frame_fnv, Crafted.fnv(c.frame));
+        // one-shot
+        const out = try gpa.alloc(u8, cs.len);
+        defer gpa.free(out);
+        const n = try d.decompress(out, c.frame);
+        try std.testing.expectEqual(cs.len, n);
+        try std.testing.expectEqual(cs.out_fnv, Crafted.fnv(out));
+        // streamed, the whole frame in, the output through 997 bytes
+        var s = try zstd.DecompressStream.init(gpa, .{});
+        defer s.deinit();
+        var in: zstd.InBuffer = .{ .src = c.frame };
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(gpa);
+        var obuf: [997]u8 = undefined;
+        while (true) {
+            var o: zstd.OutBuffer = .{ .dst = &obuf };
+            const hint = try s.decompressStream(&o, &in);
+            try got.appendSlice(gpa, obuf[0..o.pos]);
+            if (hint == 0) break;
+        }
+        try std.testing.expectEqual(cs.out_fnv, Crafted.fnv(got.items));
+    }
+}

@@ -318,19 +318,32 @@ pub const workspace_alignment = frame.workspace_alignment;
 /// The exact workspace a `Compressor` allocates to compress `src_size`
 /// bytes with `opts` (`ZSTD_estimateCCtxSize_usingCCtxParams`, for this
 /// port's layout, not libzstd's number); null for the most that any input
-/// size needs (`ZSTD_estimateCCtxSize`).
+/// size needs (`ZSTD_estimateCCtxSize`). With `Advanced.nb_workers`, an
+/// input over `zstdmt.job_size_min` goes to the workers: the most they hold
+/// (`zstdmt.estimateSize`; libzstd refuses to estimate with workers); null
+/// counts both kinds of input, which one context keeps side by side.
 pub fn estimateCompressorSize(src_size: ?u64, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
     try opts.advanced.check();
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
-    if (src_size) |n| return frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced), n, fo, false);
+    if (opts.advanced.nb_workers > 0) {
+        if (src_size) |n| {
+            if (n > zstdmt.job_size_min) return zstdmt.estimateSize(fo, n, null);
+        } else return estimateCompressorSingle(null, fo) + zstdmt.estimateSize(fo, null, null);
+    }
+    return estimateCompressorSingle(src_size, fo);
+}
+
+/// `estimateCompressorSize` for the calling thread's own context.
+fn estimateCompressorSingle(src_size: ?u64, fo: frame.Options) usize {
+    if (src_size) |n| return frame.workspaceSize(params.getOverridden(fo.level, n, fo.advanced), n, fo, false);
     // The need grows with the size within each size class; past the last
     // class it stops growing once the window no longer shrinks to the
     // input, which the largest size stands for.
     const largest = params.unknown_size - 1;
-    var most = frame.workspaceSize(params.getOverridden(opts.level, largest, opts.advanced), largest, fo, false);
+    var most = frame.workspaceSize(params.getOverridden(fo.level, largest, fo.advanced), largest, fo, false);
     for (params.size_class_bounds) |n|
-        most = @max(most, frame.workspaceSize(params.getOverridden(opts.level, n, opts.advanced), n, fo, false));
+        most = @max(most, frame.workspaceSize(params.getOverridden(fo.level, n, fo.advanced), n, fo, false));
     return most;
 }
 

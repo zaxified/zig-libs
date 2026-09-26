@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — **BEHAVIOURAL, not breaking**: `estimateCompressorSize`
+  / `estimateStreamSize` with `Advanced.nb_workers` count the workers (the
+  round buffer, LDM tables, each worker's workspace, the job buffers) --
+  they used to return the single-threaded size, far below what the
+  compression then held; libzstd refuses to estimate there. New
+  `CDict.estimateSize(dict_size, opts, copied)` (`ZSTD_estimateCDictSize`,
+  this port's layout). The decoder's three decisions no encoder reaches
+  (4 Huffman streams of 6 literals, an RLE table of the largest code, 0x7F00
+  sequences and more) are pinned by frames built byte by byte.
+
 - **2026-09-26** — `StreamWriter` serves frame after frame (SPEC backlog
   Z14, asked for by qap): `reset(output, opts)` starts the next frame on
   the same stream, keeping its workspace (`ZSTD_CCtx_reset`);

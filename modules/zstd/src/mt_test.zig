@@ -297,3 +297,65 @@ test "a prefix serves one multithreaded frame only" {
     try std.testing.expect(!std.mem.eql(u8, frames[0], frames[1]));
     try std.testing.expectEqualSlices(u8, frames[2], frames[1]);
 }
+
+/// What a multithreaded compression holds: the workers' side and the
+/// calling thread's own workspace.
+fn held(mt: ?*zstdmt.MtCtx, own: usize) usize {
+    return own + if (mt) |m| m.memorySize() else 0;
+}
+
+test "the size estimates count the workers, and hold as a bound" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 10 * zstdmt.job_size_min + 1000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 9 }, src);
+    const out = try gpa.alloc(u8, zstd.compressBound(src.len));
+    defer gpa.free(out);
+    const Case = struct { level: i32, n: u32, job: u32 = zstdmt.job_size_min, len: usize, ldm: bool = false, tight: bool = false };
+    const cases = [_]Case{
+        // more jobs than slots and workers: every one has served, the bound is reached
+        .{ .level = 1, .n = 2, .len = src.len, .tight = true },
+        .{ .level = 3, .n = 4, .len = src.len, .tight = true },
+        .{ .level = 3, .n = 2, .len = src.len, .ldm = true },
+        .{ .level = 6, .n = 3, .job = 0, .len = 3 * zstdmt.job_size_min },
+        .{ .level = 16, .n = 2, .len = 2 * zstdmt.job_size_min },
+    };
+    for (cases) |cs| {
+        const adv: zstd.Advanced = .{ .nb_workers = cs.n, .job_size = cs.job, .long_distance_matching = if (cs.ldm) .enable else .auto };
+        // one-shot
+        var c: zstd.Compressor = .init(gpa);
+        defer c.deinit();
+        _ = try c.compress(out, src[0..cs.len], .{ .level = cs.level, .advanced = adv });
+        const est_c = try zstd.estimateCompressorSize(cs.len, .{ .level = cs.level, .advanced = adv });
+        const got_c = held(c.mt, c.workspaceSize());
+        try std.testing.expect(got_c <= est_c);
+        if (cs.tight) try std.testing.expect(est_c - got_c <= est_c / 10);
+        // streamed, pledged
+        var s = try zstd.Stream.init(gpa, .{ .level = cs.level, .pledged_size = cs.len, .advanced = adv });
+        defer s.deinit();
+        var o: zstd.OutBuffer = .{ .dst = out };
+        var in: zstd.InBuffer = .{ .src = src[0..cs.len] };
+        while (try s.compressStream2(&o, &in, .end) != 0) {}
+        const est_s = try zstd.estimateStreamSize(.{ .level = cs.level, .pledged_size = cs.len, .advanced = adv });
+        const got_s = held(s.mt, s.workspaceSize());
+        try std.testing.expect(got_s <= est_s);
+        if (cs.tight) try std.testing.expect(est_s - got_s <= est_s / 10);
+    }
+    // no pledged size: a small frame on the calling thread, then a large
+    // one on the workers -- the stream keeps both, and so does the bound
+    const opts: zstd.StreamOptions = .{ .level = 3, .advanced = .{ .nb_workers = 2, .job_size = zstdmt.job_size_min } };
+    var s = try zstd.Stream.init(gpa, opts);
+    defer s.deinit();
+    for ([_]usize{ 100_000, src.len }) |len| {
+        var o: zstd.OutBuffer = .{ .dst = out };
+        var in: zstd.InBuffer = .{ .src = src[0..len] };
+        while (try s.compressStream2(&o, &in, .end) != 0) {}
+    }
+    try std.testing.expect(s.mt != null and s.workspaceSize() != 0);
+    try std.testing.expect(held(s.mt, s.workspaceSize()) <= try zstd.estimateStreamSize(opts));
+    // up to 512 KB stays on the calling thread: the estimate is that one's
+    try std.testing.expectEqual(
+        try zstd.estimateStreamSize(.{ .level = 3, .pledged_size = zstdmt.job_size_min }),
+        try zstd.estimateStreamSize(.{ .level = 3, .pledged_size = zstdmt.job_size_min, .advanced = .{ .nb_workers = 2 } }),
+    );
+}

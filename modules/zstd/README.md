@@ -169,7 +169,9 @@ var c: zstd.Compressor = .initStatic(ws);
 
 `estimateStreamSize(opts)` and `Stream.initStatic(ws, opts)` do the same
 for a stream (exact for a pledged size or a size hint; without either, the
-most any frame can need).
+most any frame can need). With `advanced.nb_workers` both count the workers'
+memory too (libzstd refuses to estimate that), and
+`CDict.estimateSize(dict.len, opts, true)` gives a dictionary's.
 
 Streaming into any `std.Io.Writer` (an HTTP body, a file) as libzstd
 streams -- one frame, history kept across flushes, the bytes
