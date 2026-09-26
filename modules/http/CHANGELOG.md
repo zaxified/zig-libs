@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — **The serving loops negotiate a second coding next to gzip: `encoder_provider`.**
+  New `Server.EncoderProvider` (a `Content-Encoding` token, `acquire(ctx) ?Encoder`,
+  `release(ctx, Encoder)`) as `Options.encoder_provider`, `StreamOptions.encoder_provider` and
+  `h2_server.Options.encoder_provider`: `serve`, `serveStream` and h2 pick it per request when
+  `Accept-Encoding` gives it at least gzip's q-value (tie → it; absent header → nothing), acquire an
+  encoder only for a response past the eligibility gate, fall back to gzip or identity when none is
+  free, and release it when the request is over. Rides on `compression` (inert without it). No codec
+  is linked here. `ResponseWriter.InitOptions` gains `encoder_provider` and `accept_encoding`, and
+  `ResponseWriter.releaseEncoder` for an embedder driving the writer by hand. Not breaking.
+
 - **2026-09-26** — **`ResponseWriter.encoder`: a caller's content-coding in place of gzip.** New
   `Server.Encoder` (a `Content-Encoding` token, `begin(ctx, dst, plain_len) -> *Writer`,
   `finish(ctx)`) and `InitOptions.encoder`: an embedder that negotiated zstd or br itself gets the

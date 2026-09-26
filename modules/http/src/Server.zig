@@ -88,6 +88,7 @@ const h1 = @import("h1.zig");
 const h2 = @import("h2.zig");
 const h2s = @import("h2_server.zig");
 const gzip = @import("gzip.zig");
+const conneg = @import("conneg.zig");
 const bufpool = @import("bufpool.zig");
 // The branchless civil-from-days calendar, for the `Date` header. std has one
 // too, and it walks a year at a time from 1970 -- see `formatHttpDate`.
@@ -295,6 +296,52 @@ pub const Encoder = struct {
     finish: *const fn (ctx: *anyopaque) Writer.Error!void,
 };
 
+/// A second response coding next to gzip (zstd, br) that the serving loops
+/// negotiate themselves: `Options.encoder_provider`, `StreamOptions`' and
+/// `h2_server.Options`' of the same name. Like `Encoder`, a table of
+/// functions -- the codec and its memory are the caller's, so this module
+/// links none.
+///
+/// Negotiated per request against `Accept-Encoding` (RFC 9110 §12.5.3):
+/// the provider's coding wins when its q-value is at least gzip's (a tie
+/// goes to it, as nginx, Caddy and Go's `klauspost/compress` handlers pick
+/// zstd over gzip) or gzip is not acceptable; an absent header admits
+/// nothing (`gzip.acceptsGzip`'s posture). Everything else is
+/// `Options.compression`'s, which the provider rides on: without it
+/// nothing is compressed at all.
+///
+/// An encoder is acquired only once a response has passed the whole
+/// eligibility gate (type, `min_size`, status, ...), so a small or binary
+/// answer never touches the pool, and released when the serving loop is
+/// done with the request -- detached responses included, whose writer
+/// is gone by then too.
+pub const EncoderProvider = struct {
+    /// The `Content-Encoding` token every encoder of this provider
+    /// produces, e.g. "zstd" (lowercase). Must outlive the server.
+    name: []const u8,
+    ctx: *anyopaque,
+    /// One encoder for one response, or null (none free, out of memory):
+    /// the response then falls back to gzip when the request admits it,
+    /// else identity -- never an error. Called from whatever thread or
+    /// fiber serves the request; a provider shared by several must be safe
+    /// for that.
+    acquire: *const fn (ctx: *anyopaque) ?Encoder,
+    /// Give back an encoder `acquire` returned, once its response is over
+    /// (finished, failed or abandoned mid-frame).
+    release: *const fn (ctx: *anyopaque, enc: Encoder) void,
+
+    /// Whether `accept_encoding` prefers this provider's coding to gzip;
+    /// see the type doc for the rule.
+    pub fn preferredBy(p: EncoderProvider, accept_encoding: ?[]const u8) bool {
+        const raw = accept_encoding orelse return false;
+        if (std.mem.trim(u8, raw, " \t").len == 0) return false;
+        const q = conneg.encodingQuality(raw, p.name) orelse return false;
+        const gq = conneg.encodingQuality(raw, "gzip") orelse
+            conneg.encodingQuality(raw, "x-gzip") orelse return true;
+        return q >= gq;
+    }
+};
+
 /// Working memory for the inbound gzip request-body decoder (Task 1): the
 /// flate decoder + its 64 KiB history window (~68 KiB). One per connection
 /// while `Options.max_decompressed_request_bytes` is nonzero; the serving
@@ -435,6 +482,10 @@ pub const Options = struct {
     /// enabled every response carries `Vary: Accept-Encoding`, and each
     /// connection costs an extra ~290 KiB of encoder state.
     compression: ?Compression = null,
+    /// A second coding (zstd, br) negotiated next to gzip; see
+    /// `EncoderProvider`. Active only while `compression` is set. Reaches
+    /// the h1 loop and h2c alike.
+    encoder_provider: ?EncoderProvider = null,
     /// Transparent inbound gzip request-body decoding (Task 1): when a
     /// request carries `Content-Encoding: gzip`, the body the handler reads
     /// via `req.reader()` is decompressed on the fly, capped at this many
@@ -1040,6 +1091,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
                 .response_buffer_size = o.response_buffer_size,
                 .compression = o.compression,
                 .gzip_scratch = gz,
+                .encoder_provider = o.encoder_provider,
                 .on_conn_state = o.on_conn_state,
                 .on_conn_state_ctx = o.on_conn_state_ctx,
                 // Deliberately not forwarded: the h2 codec's working memory
@@ -1067,6 +1119,7 @@ fn connMain(s: *Server, stream: net.Stream) void {
         .on_conn_state_ctx = o.on_conn_state_ctx,
         .buffers_provider = o.buffers_provider,
         .compression = o.compression,
+        .encoder_provider = o.encoder_provider,
         .max_decompressed_request_bytes = o.max_decompressed_request_bytes,
         .max_requests_per_conn = o.max_requests_per_conn,
     }, &tr.reader, &tw.writer, bufs, &tr);
@@ -1409,6 +1462,8 @@ pub const StreamOptions = struct {
     /// Negotiated gzip response compression (see `Options.compression`);
     /// active only when `StreamBuffers.gzip` is also provided. null = off.
     compression: ?Compression = null,
+    /// See `Options.encoder_provider`; active only while compression is.
+    encoder_provider: ?EncoderProvider = null,
     /// Transparent inbound gzip request-body decoding (see
     /// `Options.max_decompressed_request_bytes`); active only when
     /// `StreamBuffers.gunzip` is also provided. 0 = off (a gzip-encoded
@@ -1805,8 +1860,13 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .compression = if (compression_on) opts.compression else null,
         .gzip_scratch = if (compression_on) bufs.gzip else null,
         .accept_gzip = compression_on and gzip.acceptsGzip(head.header("accept-encoding")),
+        .encoder_provider = if (compression_on and opts.encoder_provider != null) &opts.encoder_provider.? else null,
+        .accept_encoding = head.header("accept-encoding"),
         .upgradable = !has_body and !head.http1_0,
     });
+    // Every return below, a detached response's included: its writer is
+    // this frame's, so nothing can reach the encoder once we are gone.
+    defer rw.releaseEncoder();
 
     // Compiled out entirely outside the test build; see `frame_probe`.
     if (builtin.is_test) frame_probe.record();
@@ -2261,6 +2321,15 @@ pub const ResponseWriter = struct {
     /// takes effect only while `compression` is set, and wins over
     /// `accept_gzip`.
     encoder: ?Encoder = null,
+    /// Where a coding preferred to gzip comes from when `encoder` is null
+    /// (see `EncoderProvider`); asked only once a response is eligible.
+    /// A pointer, not a copy: this struct lives in every serving frame.
+    encoder_provider: ?*const EncoderProvider = null,
+    /// The request prefers `encoder_provider`'s coding to gzip.
+    provider_preferred: bool = false,
+    /// `encoder` came from `encoder_provider` and is owed back
+    /// (`releaseEncoder`).
+    encoder_acquired: bool = false,
     /// Compression engaged: the `Content-Encoding` token to emit with the
     /// head ("gzip", or `encoder.name`); null = identity.
     content_encoding: ?[]const u8 = null,
@@ -2378,6 +2447,13 @@ pub const ResponseWriter = struct {
         gzip_scratch: ?*GzipScratch = null,
         /// A coding negotiated in place of gzip; see `Encoder`.
         encoder: ?Encoder = null,
+        /// A coding the writer negotiates itself; see `EncoderProvider`.
+        /// Ignored while `encoder` is set. The serving loops set it only
+        /// while compression is on, and release with `releaseEncoder`.
+        /// Must outlive the writer.
+        encoder_provider: ?*const EncoderProvider = null,
+        /// The request's `Accept-Encoding`, for `encoder_provider`.
+        accept_encoding: ?[]const u8 = null,
         /// Hand the head over as fields instead of text; see `FieldSink`.
         field_sink: ?FieldSink = null,
         /// The request's Accept-Encoding admits gzip (`gzip.acceptsGzip`)
@@ -2405,6 +2481,9 @@ pub const ResponseWriter = struct {
             .gzip_scratch = opts.gzip_scratch,
             .accept_gzip = opts.accept_gzip,
             .encoder = opts.encoder,
+            .encoder_provider = if (opts.encoder == null) opts.encoder_provider else null,
+            .provider_preferred = opts.encoder == null and opts.compression != null and
+                if (opts.encoder_provider) |p| p.preferredBy(opts.accept_encoding) else false,
             .field_sink = opts.field_sink,
             .upgradable = opts.upgradable,
             .interface = .{
@@ -3056,9 +3135,13 @@ pub const ResponseWriter = struct {
     /// body size when known (fully buffered, or declared) and must reach
     /// `min_size`; null = size unknown at streaming time → compress
     /// (nginx's behavior for unknown-length responses).
-    fn shouldCompress(rw: *const ResponseWriter, known_len: ?u64) bool {
+    ///
+    /// Last, when the request prefers `encoder_provider`'s coding, this is
+    /// where an encoder is acquired -- only for a response that is going to
+    /// be encoded; none free falls back to gzip, or to identity.
+    fn shouldCompress(rw: *ResponseWriter, known_len: ?u64) bool {
         const cfg = rw.compression orelse return false;
-        if (!rw.accept_gzip and rw.encoder == null) return false;
+        if (!rw.accept_gzip and rw.encoder == null and !rw.provider_preferred) return false;
         if (rw.http1_0) return false;
         if (rw.noBody()) return false;
         // A1 http/staticfiles F6: 206 describes a byte range of the
@@ -3082,7 +3165,27 @@ pub const ResponseWriter = struct {
             if (std.ascii.eqlIgnoreCase(hd.name, "content-type")) content_type = hd.value;
         }
         const ct = content_type orelse return false;
-        return gzip.contentTypeCompressible(ct, cfg.content_types);
+        if (!gzip.contentTypeCompressible(ct, cfg.content_types)) return false;
+        if (rw.encoder == null and rw.provider_preferred) {
+            const p = rw.encoder_provider.?;
+            if (p.acquire(p.ctx)) |enc| {
+                rw.encoder = enc;
+                rw.encoder_acquired = true;
+            } else if (!rw.accept_gzip) return false;
+        }
+        return true;
+    }
+
+    /// Give back an encoder this writer acquired from its
+    /// `encoder_provider` (a no-op when it acquired none). The serving
+    /// loops call it once the request is over; an embedder driving a
+    /// `ResponseWriter` with a provider by hand does the same after `end`.
+    pub fn releaseEncoder(rw: *ResponseWriter) void {
+        if (!rw.encoder_acquired) return;
+        const p = rw.encoder_provider.?;
+        p.release(p.ctx, rw.encoder.?);
+        rw.encoder = null;
+        rw.encoder_acquired = false;
     }
 
     /// Put the head on the wire (`Content-Encoding` + chunked framing) and
@@ -3831,6 +3934,7 @@ const StreamTweaks = struct {
     on_conn_state: ?ConnStateFn = null,
     on_conn_state_ctx: ?*anyopaque = null,
     compression: ?Compression = null,
+    encoder_provider: ?EncoderProvider = null,
     max_decompressed_request_bytes: u64 = 0,
     max_requests_per_conn: u32 = 0,
     /// Matches `runStream`'s historical fixed value; override to null to
@@ -3871,6 +3975,7 @@ fn runStreamWith(tweaks: StreamTweaks, ctx: ?*anyopaque, wire: []const u8, out_b
         .on_conn_state = tweaks.on_conn_state,
         .on_conn_state_ctx = tweaks.on_conn_state_ctx,
         .compression = tweaks.compression,
+        .encoder_provider = tweaks.encoder_provider,
         .max_decompressed_request_bytes = tweaks.max_decompressed_request_bytes,
         .max_requests_per_conn = tweaks.max_requests_per_conn,
     }, &in, &out, .{
@@ -5441,6 +5546,122 @@ test "Encoder: a streamed body with a declared length hands over that length and
     const res = try splitChunked(out2.buffered(), &head_buf, &bw);
     try testing.expectEqualStrings("x-test", res.header("content-encoding").?);
     try testing.expectEqualStrings("[18:{\"A\":\"BCDEFGHIJK\"}]", bw.buffered());
+}
+
+// ── tests (offline — the serving loops negotiate a provider's coding) ──────
+
+/// One `TestEncoder` behind an `EncoderProvider`, counting loans; `none`
+/// makes every `acquire` come back empty (a pool that is all out).
+const TestProvider = struct {
+    enc: TestEncoder = .{},
+    out: bool = false,
+    none: bool = false,
+    acquired: u32 = 0,
+    released: u32 = 0,
+
+    fn provider(t: *TestProvider) EncoderProvider {
+        return .{ .name = "x-test", .ctx = t, .acquire = acquire, .release = release };
+    }
+
+    fn acquire(ctx: *anyopaque) ?Encoder {
+        const t: *TestProvider = @ptrCast(@alignCast(ctx));
+        if (t.none or t.out) return null;
+        t.out = true;
+        t.acquired += 1;
+        return t.enc.encoder();
+    }
+
+    fn release(ctx: *anyopaque, enc: Encoder) void {
+        const t: *TestProvider = @ptrCast(@alignCast(ctx));
+        std.debug.assert(t.out and enc.ctx == @as(*anyopaque, &t.enc));
+        t.out = false;
+        t.released += 1;
+    }
+};
+
+test "EncoderProvider.preferredBy: q-values pick, a tie goes to the provider, absence admits nothing" {
+    var t: TestProvider = .{};
+    const p = t.provider();
+    const cases = [_]struct { ae: ?[]const u8, want: bool }{
+        .{ .ae = "gzip, x-test", .want = true }, // tie
+        .{ .ae = "x-test", .want = true }, // gzip not acceptable
+        .{ .ae = "gzip;q=1, x-test;q=0.5", .want = false },
+        .{ .ae = "gzip;q=0.4, X-Test;q=0.5", .want = true },
+        .{ .ae = "x-gzip, x-test;q=0.9", .want = false }, // the gzip alias counts
+        .{ .ae = "gzip, x-test;q=0", .want = false },
+        .{ .ae = "*", .want = true }, // both via *, a tie
+        .{ .ae = "gzip", .want = false },
+        .{ .ae = "", .want = false },
+        .{ .ae = null, .want = false },
+    };
+    for (cases) |c| try testing.expectEqual(c.want, p.preferredBy(c.ae));
+}
+
+/// The de-chunked body and `Content-Encoding` of one raw response.
+fn encodedAnswer(raw: []const u8, body: *Writer) !?[]const u8 {
+    var head_buf: [1024]u8 = undefined;
+    const res = try splitChunked(raw, &head_buf, body);
+    return res.header("content-encoding");
+}
+
+test "serveStream EncoderProvider: the preferred coding is negotiated, acquired once and given back" {
+    var t: TestProvider = .{};
+    var out_buf: [8192]u8 = undefined;
+    const got = runStreamWith(.{ .compression = gz_on, .encoder_provider = t.provider() }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip, x-test\r\nConnection: close\r\n\r\n", &out_buf);
+    var body_out: [8192]u8 = undefined;
+    var bw: Writer = .fixed(&body_out);
+    try testing.expectEqualStrings("x-test", (try encodedAnswer(got, &bw)).?);
+    try testing.expect(std.mem.startsWith(u8, bw.buffered(), "["));
+    try testing.expectEqual(@as(u32, 1), t.acquired);
+    try testing.expectEqual(@as(u32, 1), t.released);
+    try testing.expectEqual(@as(u32, 1), t.enc.finished);
+}
+
+test "serveStream EncoderProvider: a response the gate refuses never touches the pool" {
+    for ([_][]const u8{ "/hello", "/bin", "/nocontent" }) |path| {
+        var t: TestProvider = .{};
+        var out_buf: [8192]u8 = undefined;
+        var req_buf: [256]u8 = undefined;
+        const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nAccept-Encoding: x-test\r\nConnection: close\r\n\r\n", .{path});
+        const got = runStreamWith(.{ .compression = gz_on, .encoder_provider = t.provider() }, null, req, &out_buf);
+        try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 "));
+        try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+        try testing.expectEqual(@as(u32, 0), t.acquired);
+    }
+}
+
+test "serveStream EncoderProvider: none free falls back to gzip, or to identity; gzip preferred leaves it alone" {
+    {
+        var t: TestProvider = .{ .none = true };
+        var out_buf: [8192]u8 = undefined;
+        const got = runStreamWith(.{ .compression = gz_on, .encoder_provider = t.provider() }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip, x-test\r\nConnection: close\r\n\r\n", &out_buf);
+        try expectGzipResponse(got, json_body);
+        try testing.expectEqual(@as(u32, 0), t.released);
+    }
+    {
+        var t: TestProvider = .{ .none = true };
+        var out_buf: [8192]u8 = undefined;
+        const got = runStreamWith(.{ .compression = gz_on, .encoder_provider = t.provider() }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: x-test\r\nConnection: close\r\n\r\n", &out_buf);
+        var body_out: [8192]u8 = undefined;
+        var bw: Writer = .fixed(&body_out);
+        try testing.expectEqual(@as(?[]const u8, null), try encodedAnswer(got, &bw));
+        try testing.expectEqualStrings(json_body, bw.buffered());
+    }
+    {
+        var t: TestProvider = .{};
+        var out_buf: [8192]u8 = undefined;
+        const got = runStreamWith(.{ .compression = gz_on, .encoder_provider = t.provider() }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip, x-test;q=0.5\r\nConnection: close\r\n\r\n", &out_buf);
+        try expectGzipResponse(got, json_body);
+        try testing.expectEqual(@as(u32, 0), t.acquired);
+    }
+    {
+        // Without `compression` the provider is inert.
+        var t: TestProvider = .{};
+        var out_buf: [8192]u8 = undefined;
+        const got = runStreamWith(.{ .encoder_provider = t.provider() }, null, "GET /jsonbig HTTP/1.1\r\nHost: t\r\nAccept-Encoding: x-test\r\nConnection: close\r\n\r\n", &out_buf);
+        try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding") == null);
+        try testing.expectEqual(@as(u32, 0), t.acquired);
+    }
 }
 
 test "Encoder: wins over gzip; ignored without compression; the gate still applies" {

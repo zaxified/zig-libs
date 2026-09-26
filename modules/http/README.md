@@ -574,9 +574,23 @@ wins over `accept_gzip`; it does nothing while `compression` is null). The
 eligibility gate, chunked framing, declared-length enforcement, weak `ETag`
 and `Vary` are the gzip pipeline's, unchanged; `plain_len` is the plain
 body's exact size when known (buffered, or declared). This module links no
-codec for it -- a server that never builds an `Encoder` carries none. The
-serving loops here (`serve`, `h2_server`) do not negotiate one yet (SPEC
-backlog); an embedder that builds its `ResponseWriter` itself does.
+codec for it -- a server that never builds an `Encoder` carries none.
+
+**The serving loops negotiate one themselves: `encoder_provider`.** Give
+`Options` (or `StreamOptions`, `h2_server.Options`) a
+`Server.EncoderProvider` -- the coding's token plus `acquire(ctx) ?Encoder`
+and `release(ctx, Encoder)` over the caller's own pool -- and `serve`,
+`serveStream` and h2 pick it per request from `Accept-Encoding`: it wins when
+its q-value is at least gzip's (a tie goes to it, as nginx, Caddy and Go's
+`klauspost/compress` handlers choose zstd), or when gzip is not acceptable; an
+absent header admits nothing. It rides on `compression`: inert without it, and
+the same eligibility gate decides. An encoder is acquired only for a response
+that passed the gate -- a small or binary answer never touches the pool -- and
+given back when the request is over, a detached one included. `acquire`
+returning null (pool empty) falls back to gzip, else identity. With streams
+served concurrently (a threaded `serve`, the h2 dispatcher or fibers) the
+provider is called concurrently too. For zstd, zig-libs `zstd.StreamWriter`
+(`initScratch` + `reset` per response) is such an encoder.
 
 ## Client behavior notes
 

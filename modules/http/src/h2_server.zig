@@ -240,6 +240,11 @@ pub const Options = struct {
     /// Negotiated gzip response compression; requires `gzip_scratch`.
     compression: ?gzip.Compression = null,
     gzip_scratch: ?*gzip.Scratch = null,
+    /// A second coding next to gzip; see `Server.EncoderProvider`. Active
+    /// only while compression is. Acquired per stream, so with streams
+    /// served concurrently (`dispatcher`, h2 fibers) the provider must be
+    /// safe for that.
+    encoder_provider: ?Server.EncoderProvider = null,
     /// Lifecycle observer (see `Server.ConnState`): .new/.closed per
     /// connection, .active/.idle around each request stream served.
     on_conn_state: ?Server.ConnStateFn = null,
@@ -1831,10 +1836,15 @@ const Session = struct {
             .gzip_scratch = if (compression_on) s.opts.gzip_scratch else null,
             .accept_gzip = compression_on and
                 gzip.acceptsGzip(head.header("accept-encoding")),
+            .encoder_provider = if (compression_on and s.opts.encoder_provider != null) &s.opts.encoder_provider.? else null,
+            .accept_encoding = head.header("accept-encoding"),
             // The head crosses as fields: it never becomes HTTP/1.1 text, and
             // nothing parses it back (worth 6,354 instructions per response).
             .field_sink = framer.sink(),
         });
+        // Every return below, a detached stream's included: the writer is
+        // this frame's, and `Detached` pushes raw DATA, never through it.
+        defer rw.releaseEncoder();
         sb.req = &req;
         var failed = false;
         s.opts.handler(&req, &rw) catch {
@@ -3152,6 +3162,63 @@ test "h2c serve: GET and POST round-trip through the shared handler (offline)" {
     try testing.expectEqual(h2.StreamState.closed, peer.conn.stream(sid_get).?.state);
     try testing.expectEqual(h2.StreamState.closed, peer.conn.stream(sid_post).?.state);
     try testing.expectEqual(@as(?h2.ErrorCode, null), peer.goaway);
+}
+
+test "h2c serve: an EncoderProvider's coding is negotiated per stream and given back (offline)" {
+    // A pass-through coding: what is under test is the negotiation and the
+    // loan, not a codec -- `Server.zig`'s tests cover the pipeline itself.
+    const Pass = struct {
+        acquired: u32 = 0,
+        released: u32 = 0,
+        finished: u32 = 0,
+        fn begin(_: *anyopaque, dst: *Writer, _: ?u64) Writer.Error!*Writer {
+            return dst;
+        }
+        fn finish(ctx: *anyopaque) Writer.Error!void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.finished += 1;
+        }
+        fn acquire(ctx: *anyopaque) ?Server.Encoder {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.acquired += 1;
+            return .{ .name = "x-pass", .ctx = ctx, .begin = begin, .finish = finish };
+        }
+        fn release(ctx: *anyopaque, _: Server.Encoder) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.released += 1;
+        }
+    };
+    const gpa = testing.allocator;
+    var pass: Pass = .{};
+    var peer: TestPeer = .init(gpa, .{});
+    defer peer.deinit();
+    try peer.conn.sendPreface(&peer.wire);
+    const base = fieldsFor("GET", "/hello");
+    const wants = base ++ [_]hpack.Field{.{ .name = "accept-encoding", .value = "gzip, x-pass" }};
+    const prefers_gzip = base ++ [_]hpack.Field{.{ .name = "accept-encoding", .value = "gzip, x-pass;q=0.1" }};
+    const sid_pass = try peer.conn.startStream(&peer.wire, &wants, true);
+    const sid_gzip = try peer.conn.startStream(&peer.wire, &prefers_gzip, true);
+    const sid_none = try peer.conn.startStream(&peer.wire, &base, true);
+
+    const scratch = try gpa.create(gzip.Scratch);
+    defer gpa.destroy(scratch);
+    var out_buf: [8192]u8 = undefined;
+    try runOffline(&peer, .{
+        .handler = testHandler,
+        .compression = .{ .min_size = 1 },
+        .gzip_scratch = scratch,
+        .encoder_provider = .{ .name = "x-pass", .ctx = &pass, .acquire = Pass.acquire, .release = Pass.release },
+    }, &out_buf);
+
+    const r = peer.resp(sid_pass);
+    try testing.expectEqual(@as(u16, 200), r.status);
+    try testing.expectEqualStrings("x-pass", r.header("content-encoding").?);
+    try testing.expectEqualStrings("hello", r.body.items);
+    try testing.expectEqualStrings("gzip", peer.resp(sid_gzip).header("content-encoding").?);
+    try testing.expectEqual(@as(?[]const u8, null), peer.resp(sid_none).header("content-encoding"));
+    try testing.expectEqual(@as(u32, 1), pass.acquired);
+    try testing.expectEqual(@as(u32, 1), pass.released);
+    try testing.expectEqual(@as(u32, 1), pass.finished);
 }
 
 test "h2c serve: handler error → 500; 404 and HEAD framing (offline)" {
