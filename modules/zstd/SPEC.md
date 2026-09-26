@@ -2550,7 +2550,8 @@ below is this module's own, beyond that gate:
 - **Matching the `zstd` CLI as such.** The CLI drives the streaming API with
   its own buffer sizes; `Stream` matches `ZSTD_compressStream2`, so the same
   chunking reproduces the CLI's frames, but the CLI (argv, file handling) is
-  not this module's contract. *Never.*
+  not this module's contract. *Never.* (A CLI at parity as an example
+  program, a consumer of the library, is Z26.)
 
 ## Backlog / deferred
 
@@ -2703,6 +2704,42 @@ suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
   Never measured. Low priority until a consumer uses dictionaries.
 - **Z20 — Stale text:** Z2c above, and *Decoder*'s "dictionary decoding was
   not separately measured (… Z4)" and its speed figure (with Z16).
+
+From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
+`lib/`, pinned core, the same bytes at every level):
+
+- **Z21 — Small frames: zero tables without byte-wise `memset`.** At 1–4 KB
+  per frame (level 3, reused context) compression runs at 0.74–0.79× and
+  decoding at 0.77× libzstd's speed. `compiler_rt.memset` is 11 % of the
+  profile there (libzstd's glibc `memset`: 1 %): Zig without libc clears
+  byte by byte, and every block clears small tables — `huf.buildCTable`
+  5.3 %, the sequence statistics, the FSE tables, `compressWeights`.
+- **Z22 — CPU features.** libzstd picks its BMI2 paths at run time; this
+  port gets them only from the build's target. Built for baseline x86-64,
+  compression takes 1.15–1.25× libzstd's cycles (1.05–1.09× with
+  `-mcpu=native`) and decoding 893 vs 1043 MB/s. Zig 0.16 has no
+  per-function target features, so for now: say so in the README (build
+  with `-mcpu=x86_64_v3` or `native`); revisit dispatch when Zig can.
+- **Z23 — Seekable format** (libzstd's `contrib/seekable_format`):
+  independent frames plus a seek table in a skippable frame, for random
+  access and parallel decoding of archives. Beyond libzstd's library.
+- **Z24 — Adaptive level** (`zstd --adapt`, CLI-only in libzstd): a stream
+  that moves its level with how fast its output drains.
+- **Z25 — API gaps, on a consumer's request:** a shared thread pool
+  (`ZSTD_CCtx_refThreadPool`), MT progress (`ZSTD_getFrameProgression`,
+  `ZSTD_toFlushNow`), the decoder in a caller's workspace with exact
+  estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
+  `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
+  `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
+  `getCParams` / `adjustCParams`, `ZSTD_versionNumber`.
+- **Z26 — `example/zstd-cli`: the `zstd` command at parity** (as zig-fping
+  is to fping): libzstd 1.5.7's `programs/` options, file handling and
+  output, checked against the real CLI. The module's contract stays the
+  library API (*What is deliberately not done*); the example is its first
+  full consumer.
+- **Z27 — `example/zstd-bench`**: the measurement used for Z16/Z21/Z22
+  (one-shot, chunked, streaming, decode; this port vs libzstd), runnable
+  against `zstd -b` as the reference.
 
 ## Open
 
