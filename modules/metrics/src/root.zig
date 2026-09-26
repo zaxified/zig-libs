@@ -999,7 +999,7 @@ fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
         // the branch had no coverage, not necessarily a wrong unwrap).
         .identity => res.declared_len.?,
         .discard => 0, // HEAD / 204 / 304: no body on the wire
-        .chunked, .until_close, .gzip => null, // streamed; no running total kept
+        .chunked, .until_close, .encoded => null, // streamed; no running total kept
     };
 }
 

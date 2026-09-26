@@ -295,6 +295,14 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+**zstd/br negotiated by the serving loops** — BACKLOG (2026-09-26, found by qap). `ResponseWriter.encoder`
+carries any coding an embedder negotiates, but `serve`/`serveStream` and `h2_server` still offer
+only gzip: nginx (`zstd` module), Caddy (`encode zstd gzip`) and Go (`klauspost/compress`
+handlers) negotiate zstd next to gzip. Wanted: an `Options` field taking a caller-built encoder
+provider (acquire/release per response, so this module still links no codec) and the q-value
+choice between it and gzip (`conneg.encodingQuality`; a tie goes to the provider's coding).
+qap does it itself today over its own engine (`src/compression.zig`).
+
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for qap's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 **Query-string parameters and path percent-decoding** — BACKLOG (2026-09-22, found by qap).

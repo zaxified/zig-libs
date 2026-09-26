@@ -628,7 +628,7 @@ fn responseBytesOf(res: *const http.Server.ResponseWriter) ?u64 {
         .buffering => res.declared_len orelse res.interface.end,
         .identity => res.declared_len.?,
         .discard => 0,
-        .chunked, .until_close, .gzip => null,
+        .chunked, .until_close, .encoded => null,
     };
 }
 

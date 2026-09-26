@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — **`ResponseWriter.encoder`: a caller's content-coding in place of gzip.** New
+  `Server.Encoder` (a `Content-Encoding` token, `begin(ctx, dst, plain_len) -> *Writer`,
+  `finish(ctx)`) and `InitOptions.encoder`: an embedder that negotiated zstd or br itself gets the
+  gzip pipeline's gate, chunked framing, length enforcement, weak `ETag` and `Vary` for it. No codec
+  is linked here. ⚠ Breaking for code that touched the writer's fields directly:
+  `content_encoding_gzip: bool` is now `content_encoding: ?[]const u8`, the `body` tag `.gzip` is
+  `.encoded` (accesslog and metrics switch on it; updated), and `init` asserts
+  `accept_gzip ⇒ gzip_scratch` instead of `compression ⇒ gzip_scratch`.
+
 - **2026-09-25** — **`h2_server`: the codec's own error answers carry `date` and `server`.** The
   400/413/500/501 an h2 stream gets without reaching a handler went out with `:status`,
   `content-type` and `content-length` only, while h1's (`writeErrorResponse`) carry `Date` and

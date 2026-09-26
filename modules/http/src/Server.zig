@@ -265,6 +265,36 @@ pub const Compression = gzip.Compression;
 /// memory, nothing else.
 pub const GzipScratch = gzip.Scratch;
 
+/// A response content-coding other than the built-in gzip (zstd, br), put
+/// in by the caller: `ResponseWriter.encoder`. This module negotiates
+/// nothing for it and links no codec for it -- the embedder that armed it
+/// decided the request admits the coding and prefers it over gzip, and owns
+/// the codec's memory. Everything else is the gzip pipeline's, unchanged:
+/// `Compression`'s eligibility gate (types, `min_size`, HEAD/1xx/204/304/206,
+/// HTTP/1.0, a handler-set `Content-Encoding`), chunked framing, the plain
+/// byte count enforced against a declared `Content-Length`, the weakened
+/// `ETag`, `Vary: Accept-Encoding`.
+///
+/// Why a table of functions rather than a zstd dependency: this module is
+/// every web module's base, and a codec here would be compiled into every
+/// server that answers HTTP. Behind a pointer, only a binary that builds an
+/// `Encoder` carries one.
+pub const Encoder = struct {
+    /// The `Content-Encoding` token this encoder produces, e.g. "zstd"
+    /// (RFC 9110 §8.4.1, lowercase). Must outlive the response.
+    name: []const u8,
+    ctx: *anyopaque,
+    /// Start one body. Compressed bytes go to `dst`, which stays at its
+    /// address until `finish`; the result is the writer the plain body is
+    /// written into, valid until `finish`. `plain_len` is the plain body's
+    /// exact size when known (fully buffered, or declared), for a codec
+    /// that records it in its header or sizes its state by it.
+    begin: *const fn (ctx: *anyopaque, dst: *Writer, plain_len: ?u64) Writer.Error!*Writer,
+    /// Everything written so far, and the coding's own end, into `dst`.
+    /// `dst` itself is not flushed.
+    finish: *const fn (ctx: *anyopaque) Writer.Error!void,
+};
+
 /// Working memory for the inbound gzip request-body decoder (Task 1): the
 /// flate decoder + its 64 KiB history window (~68 KiB). One per connection
 /// while `Options.max_decompressed_request_bytes` is nonzero; the serving
@@ -2227,8 +2257,13 @@ pub const ResponseWriter = struct {
     gzip_scratch: ?*GzipScratch = null,
     /// The request's Accept-Encoding admits gzip (negotiation input).
     accept_gzip: bool = false,
-    /// Compression engaged: emit `Content-Encoding: gzip` with the head.
-    content_encoding_gzip: bool = false,
+    /// A coding the caller negotiated in place of gzip (see `Encoder`);
+    /// takes effect only while `compression` is set, and wins over
+    /// `accept_gzip`.
+    encoder: ?Encoder = null,
+    /// Compression engaged: the `Content-Encoding` token to emit with the
+    /// head ("gzip", or `encoder.name`); null = identity.
+    content_encoding: ?[]const u8 = null,
     status: u16 = 200,
     headers: [max_response_headers]http.Header = undefined,
     headers_len: usize = 0,
@@ -2305,16 +2340,19 @@ pub const ResponseWriter = struct {
         until_close,
         /// HEAD / 204 / 304: body writes are dropped.
         discard,
-        /// Compressed streaming: plain handler bytes → gzip encoder →
-        /// chunked framing (Phase 2.2).
-        gzip: GzipBody,
+        /// Compressed streaming: plain handler bytes → gzip encoder (or the
+        /// caller's `Encoder`) → chunked framing (Phase 2.2).
+        encoded: EncodedBody,
     };
 
-    const GzipBody = struct {
+    const EncodedBody = struct {
         /// Chunked encoder the compressed bytes feed (owns `chunk_buf`).
         chunked: h1.ChunkedWriter,
-        /// The flate gzip encoder; its state lives in `gzip_scratch`.
-        compress: *flate.Compress,
+        /// Where the plain body goes: the flate encoder's writer (its state
+        /// lives in `gzip_scratch`), or what `Encoder.begin` returned.
+        plain: *Writer,
+        /// Null: gzip, ended by `gzip_scratch.compress.finish`.
+        encoder: ?Encoder,
         /// Plain-body bytes still owed against a declared Content-Length
         /// (enforced exactly like the identity sink, though the length
         /// itself never reaches the wire); null = no declared length.
@@ -2338,6 +2376,8 @@ pub const ResponseWriter = struct {
         compression: ?Compression = null,
         /// Working memory for the gzip encoder (usually per-connection).
         gzip_scratch: ?*GzipScratch = null,
+        /// A coding negotiated in place of gzip; see `Encoder`.
+        encoder: ?Encoder = null,
         /// Hand the head over as fields instead of text; see `FieldSink`.
         field_sink: ?FieldSink = null,
         /// The request's Accept-Encoding admits gzip (`gzip.acceptsGzip`)
@@ -2352,7 +2392,7 @@ pub const ResponseWriter = struct {
     /// `body_buf` is the buffering/auto-Content-Length threshold;
     /// `chunk_buf` is small scratch for the chunked encoder (non-empty).
     pub fn init(out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: InitOptions) ResponseWriter {
-        std.debug.assert(opts.compression == null or opts.gzip_scratch != null);
+        std.debug.assert(!opts.accept_gzip or opts.gzip_scratch != null);
         return .{
             .out = out,
             .chunk_buf = chunk_buf,
@@ -2364,6 +2404,7 @@ pub const ResponseWriter = struct {
             .compression = opts.compression,
             .gzip_scratch = opts.gzip_scratch,
             .accept_gzip = opts.accept_gzip,
+            .encoder = opts.encoder,
             .field_sink = opts.field_sink,
             .upgradable = opts.upgradable,
             .interface = .{
@@ -2783,7 +2824,7 @@ pub const ResponseWriter = struct {
         try rw.interface.flush(); // interface buffer → sink (begins streaming)
         switch (rw.body) {
             .chunked => |*cw| try cw.writer.flush(), // chunk buffer → rw.out
-            .gzip => |*g| try g.chunked.writer.flush(),
+            .encoded => |*g| try g.chunked.writer.flush(),
             else => {},
         }
         try rw.out.flush(); // connection writer → socket
@@ -2882,7 +2923,7 @@ pub const ResponseWriter = struct {
         }
         if (rw.body == .buffering and rw.shouldCompress(rw.interface.buffered().len)) {
             // Fully buffered body, eligible: compress it through the
-            // streaming pipeline (single encoding path — see beginGzip).
+            // streaming pipeline (single encoding path — see beginEncoded).
             const body_bytes = rw.interface.buffered();
             defer rw.interface.end = 0;
             const n = rw.declared_len orelse body_bytes.len;
@@ -2890,9 +2931,9 @@ pub const ResponseWriter = struct {
                 rw.failed = true; // body ≠ declared Content-Length
                 return error.WriteFailed;
             }
-            try rw.beginGzip(null); // length already validated above
-            try rw.body.gzip.compress.writer.writeAll(body_bytes);
-            return rw.finishGzip();
+            try rw.beginEncoded(null, body_bytes.len); // length already validated above
+            try rw.body.encoded.plain.writeAll(body_bytes);
+            return rw.finishEncoded();
         }
         switch (rw.body) {
             .buffering => {
@@ -2937,9 +2978,9 @@ pub const ResponseWriter = struct {
                     return error.WriteFailed;
                 }
             },
-            .gzip => {
+            .encoded => {
                 try rw.interface.flush();
-                try rw.finishGzip();
+                try rw.finishEncoded();
             },
             .until_close, .discard => try rw.interface.flush(),
         }
@@ -2984,7 +3025,7 @@ pub const ResponseWriter = struct {
         rw.trailers_len = 0;
         rw.ended = false;
         rw.failed = false;
-        rw.content_encoding_gzip = false;
+        rw.content_encoding = null;
         rw.body = .buffering;
         rw.interface.end = 0;
     }
@@ -3017,7 +3058,7 @@ pub const ResponseWriter = struct {
     /// (nginx's behavior for unknown-length responses).
     fn shouldCompress(rw: *const ResponseWriter, known_len: ?u64) bool {
         const cfg = rw.compression orelse return false;
-        if (!rw.accept_gzip) return false;
+        if (!rw.accept_gzip and rw.encoder == null) return false;
         if (rw.http1_0) return false;
         if (rw.noBody()) return false;
         // A1 http/staticfiles F6: 206 describes a byte range of the
@@ -3044,20 +3085,39 @@ pub const ResponseWriter = struct {
         return gzip.contentTypeCompressible(ct, cfg.content_types);
     }
 
-    /// Put the head on the wire (`Content-Encoding: gzip` + chunked
-    /// framing) and stand up the compression pipeline: handler bytes →
-    /// gzip encoder (state + window in `gzip_scratch`) → chunked encoder
-    /// → `out`. A declared Content-Length is dropped from the wire but
-    /// still enforced via `plain_remaining` (pass null when the byte
-    /// count was already validated).
-    fn beginGzip(rw: *ResponseWriter, plain_remaining: ?u64) Writer.Error!void {
+    /// Put the head on the wire (`Content-Encoding` + chunked framing) and
+    /// stand up the compression pipeline: handler bytes → the caller's
+    /// `encoder` when set, else the gzip encoder (state + window in
+    /// `gzip_scratch`) → chunked encoder → `out`. A declared Content-Length
+    /// is dropped from the wire but still enforced via `plain_remaining`
+    /// (pass null when the byte count was already validated); `plain_len`
+    /// is the size handed to an `Encoder`, when known.
+    fn beginEncoded(rw: *ResponseWriter, plain_remaining: ?u64, plain_len: ?u64) Writer.Error!void {
         std.debug.assert(!rw.sent_head);
+        if (rw.encoder) |enc| {
+            rw.content_encoding = enc.name;
+            try rw.writeHead(.chunked);
+            rw.body = .{ .encoded = .{
+                .chunked = .init(rw.out, rw.chunk_buf),
+                .plain = undefined,
+                .encoder = enc,
+                .plain_remaining = plain_remaining,
+            } };
+            // After the body is in place: `begin` keeps a pointer to the
+            // chunked writer.
+            rw.body.encoded.plain = enc.begin(enc.ctx, &rw.body.encoded.chunked.writer, plain_len) catch |e| {
+                rw.failed = true;
+                return e;
+            };
+            return;
+        }
         const scratch = rw.gzip_scratch.?;
-        rw.content_encoding_gzip = true;
+        rw.content_encoding = "gzip";
         try rw.writeHead(.chunked);
-        rw.body = .{ .gzip = .{
+        rw.body = .{ .encoded = .{
             .chunked = .init(rw.out, rw.chunk_buf),
-            .compress = &scratch.compress,
+            .plain = &scratch.compress.writer,
+            .encoder = null,
             .plain_remaining = plain_remaining,
         } };
         // Emits the 10-byte gzip container header — it lands in the
@@ -3066,7 +3126,7 @@ pub const ResponseWriter = struct {
         // encoder keeps a pointer to it).
         try gzip.initCompress(
             &scratch.compress,
-            &rw.body.gzip.chunked.writer,
+            &rw.body.encoded.chunked.writer,
             &scratch.window,
             .gzip,
             gzip.levelOptions(rw.compression.?.level),
@@ -3074,16 +3134,22 @@ pub const ResponseWriter = struct {
     }
 
     /// Terminate a compressed body: enforce a declared length, flush the
-    /// deflate tail + gzip footer, then the chunked 0-terminator.
-    fn finishGzip(rw: *ResponseWriter) Writer.Error!void {
-        const g = &rw.body.gzip;
+    /// coding's tail (deflate tail + gzip footer, or `Encoder.finish`),
+    /// then the chunked 0-terminator.
+    fn finishEncoded(rw: *ResponseWriter) Writer.Error!void {
+        const g = &rw.body.encoded;
         if (g.plain_remaining) |rem| {
             if (rem != 0) {
                 rw.failed = true; // under-delivered declared length
                 return error.WriteFailed;
             }
         }
-        try g.compress.finish();
+        if (g.encoder) |enc| {
+            enc.finish(enc.ctx) catch |e| {
+                rw.failed = true;
+                return e;
+            };
+        } else try rw.gzip_scratch.?.compress.finish();
         try rw.finishChunked(&g.chunked);
     }
 
@@ -3138,7 +3204,7 @@ pub const ResponseWriter = struct {
             // on the WIRE, only when this response is actually being
             // gzipped; the handler's own stored value (and what it reads
             // back) is untouched.
-            if (rw.content_encoding_gzip and std.ascii.eqlIgnoreCase(hd.name, "etag") and
+            if (rw.content_encoding != null and std.ascii.eqlIgnoreCase(hd.name, "etag") and
                 !std.mem.startsWith(u8, hd.value, "W/"))
             {
                 try out.print("{s}: W/{s}\r\n", .{ hd.name, hd.value });
@@ -3155,7 +3221,7 @@ pub const ResponseWriter = struct {
         // handler-set one covering other headers).
         if (rw.compression != null and !vary_covered)
             try out.writeAll("Vary: Accept-Encoding\r\n");
-        if (rw.content_encoding_gzip) try out.writeAll("Content-Encoding: gzip\r\n");
+        if (rw.content_encoding) |ce| try out.print("Content-Encoding: {s}\r\n", .{ce});
         if (rw.close_connection) try out.writeAll("Connection: close\r\n");
         switch (framing) {
             .none => {},
@@ -3217,7 +3283,7 @@ pub const ResponseWriter = struct {
             if (std.ascii.eqlIgnoreCase(hd.name, "vary") and
                 (h1.tokenListContains(hd.value, "accept-encoding") or
                     h1.tokenListContains(hd.value, "*"))) vary_covered = true;
-            if (rw.content_encoding_gzip and std.ascii.eqlIgnoreCase(hd.name, "etag") and
+            if (rw.content_encoding != null and std.ascii.eqlIgnoreCase(hd.name, "etag") and
                 !std.mem.startsWith(u8, hd.value, "W/"))
             {
                 // The weakened form needs bytes that outlive this call, and the
@@ -3238,7 +3304,7 @@ pub const ResponseWriter = struct {
         if (!saw_server) if (rw.server_name) |sn| try sink.put(sink.ctx, "server", sn);
         if (rw.compression != null and !vary_covered)
             try sink.put(sink.ctx, "vary", "Accept-Encoding");
-        if (rw.content_encoding_gzip) try sink.put(sink.ctx, "content-encoding", "gzip");
+        if (rw.content_encoding) |ce| try sink.put(sink.ctx, "content-encoding", ce);
         // `connection: close` is §8.2.2-forbidden in h2 and the framer drops it
         // anyway, so it is not offered here.
         try sink.head_done(sink.ctx, rw.status, framing == .chunked, switch (framing) {
@@ -3259,7 +3325,7 @@ pub const ResponseWriter = struct {
         } else if (rw.shouldCompress(rw.declared_len)) {
             // Streaming body: the size is the declared length when there
             // is one, else unknown (already outgrew the buffer).
-            try rw.beginGzip(rw.declared_len);
+            try rw.beginEncoded(rw.declared_len, rw.declared_len);
         } else if (rw.declared_len) |n| {
             try rw.writeHead(.{ .content_length = n });
             rw.body = .{ .identity = n };
@@ -3282,7 +3348,7 @@ pub const ResponseWriter = struct {
             .buffering => unreachable,
             .chunked => |*cw| return forwardDrain(w, &cw.writer, data, splat),
             .until_close => return forwardDrain(w, rw.out, data, splat),
-            .gzip => |*g| {
+            .encoded => |*g| {
                 if (g.plain_remaining) |rem| {
                     // Same over-delivery guard as the identity sink —
                     // counted in plain bytes, pre-compression.
@@ -3293,11 +3359,11 @@ pub const ResponseWriter = struct {
                         rw.failed = true;
                         return error.WriteFailed;
                     }
-                    const consumed = try forwardDrain(w, &g.compress.writer, data, splat);
+                    const consumed = try forwardDrain(w, g.plain, data, splat);
                     g.plain_remaining = rem - total;
                     return consumed;
                 }
-                return forwardDrain(w, &g.compress.writer, data, splat);
+                return forwardDrain(w, g.plain, data, splat);
             },
             .identity => {
                 var total: u64 = w.end;
@@ -5245,6 +5311,213 @@ test "ResponseWriter: a gzip-compressed body still carries its trailers" {
     try testing.expect(std.mem.indexOf(u8, got, "Content-Encoding: gzip\r\n") != null);
     try testing.expect(std.mem.indexOf(u8, got, "Trailer: X-Checksum, X-Rows\r\n") != null);
     try testing.expect(std.mem.endsWith(u8, got, "0\r\nX-Checksum: deadbeef\r\nX-Rows: 3\r\n\r\n"));
+}
+
+// ── tests (offline — a caller's Encoder in place of gzip) ───────────────────
+
+/// A toy coding, "x-test": `[<plain_len or ?>:` + the plain bytes uppercased
+/// + `]`, through a writer of its own with a 5-byte buffer, so a body always
+/// crosses several drains on its way to `dst`.
+const TestEncoder = struct {
+    dst: ?*Writer = null,
+    buf: [5]u8 = undefined,
+    w: Writer = undefined,
+    plain_len: ?u64 = null,
+    begun: u32 = 0,
+    finished: u32 = 0,
+    fail_begin: bool = false,
+
+    fn encoder(t: *TestEncoder) Encoder {
+        return .{ .name = "x-test", .ctx = t, .begin = begin, .finish = finish };
+    }
+
+    fn begin(ctx: *anyopaque, dst: *Writer, plain_len: ?u64) Writer.Error!*Writer {
+        const t: *TestEncoder = @ptrCast(@alignCast(ctx));
+        if (t.fail_begin) return error.WriteFailed;
+        t.begun += 1;
+        t.dst = dst;
+        t.plain_len = plain_len;
+        t.w = .{ .buffer = &t.buf, .vtable = &.{ .drain = drain } };
+        if (plain_len) |n| try dst.print("[{d}:", .{n}) else try dst.writeAll("[?:");
+        return &t.w;
+    }
+
+    fn put(t: *TestEncoder, bytes: []const u8) Writer.Error!void {
+        for (bytes) |c| try t.dst.?.writeByte(std.ascii.toUpper(c));
+    }
+
+    fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const t: *TestEncoder = @alignCast(@fieldParentPtr("w", w));
+        try t.put(w.buffered());
+        w.end = 0;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try t.put(d);
+            n += d.len;
+        }
+        for (0..splat) |_| try t.put(data[data.len - 1]);
+        return n + data[data.len - 1].len * splat;
+    }
+
+    fn finish(ctx: *anyopaque) Writer.Error!void {
+        const t: *TestEncoder = @ptrCast(@alignCast(ctx));
+        t.finished += 1;
+        try t.put(t.w.buffered());
+        t.w.end = 0;
+        try t.dst.?.writeAll("]");
+    }
+};
+
+/// The head and the de-chunked body of a raw response in `raw`.
+fn splitChunked(raw: []const u8, head_buf: []u8, body: *Writer) !h1.ResponseHead {
+    var r: Reader = .fixed(raw);
+    const res = try h1.ResponseHead.parse(try h1.readHead(&r, head_buf));
+    try testing.expect(res.chunked);
+    try testing.expectEqual(@as(?u64, null), res.content_length);
+    var cbuf: [128]u8 = undefined;
+    var cr: h1.ChunkedReader = .init(&r, &cbuf);
+    _ = try cr.reader.streamRemaining(body);
+    return res;
+}
+
+test "Encoder: a buffered body goes through the caller's coding, with its size" {
+    var t: TestEncoder = .{};
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .encoder = t.encoder(),
+    });
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.setHeader("ETag", "\"v1\"");
+    try rw.interface.writeAll("hello, encoder");
+    try rw.end();
+    var head_buf: [1024]u8 = undefined;
+    var body_out: [256]u8 = undefined;
+    var bw: Writer = .fixed(&body_out);
+    const res = try splitChunked(out.buffered(), &head_buf, &bw);
+    try testing.expectEqualStrings("x-test", res.header("content-encoding").?);
+    try testing.expectEqualStrings("Accept-Encoding", res.header("vary").?);
+    try testing.expectEqualStrings("W/\"v1\"", res.header("etag").?);
+    try testing.expectEqualStrings("[14:HELLO, ENCODER]", bw.buffered());
+    try testing.expectEqual(@as(u32, 1), t.begun);
+    try testing.expectEqual(@as(u32, 1), t.finished);
+}
+
+test "Encoder: a streamed body with a declared length hands over that length and is held to it" {
+    var t: TestEncoder = .{};
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [8]u8 = undefined; // the body outgrows it: streaming path
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .encoder = t.encoder(),
+    });
+    try rw.setHeader("Content-Type", "application/json");
+    try rw.setHeader("Content-Length", "20");
+    try rw.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+    // 18 of the 20 declared bytes: the end fails, the coding is not finished.
+    try testing.expectError(error.WriteFailed, rw.end());
+    try testing.expect(rw.connectionMustClose());
+    try testing.expectEqual(@as(?u64, 20), t.plain_len);
+    try testing.expectEqual(@as(u32, 0), t.finished);
+
+    var t2: TestEncoder = .{};
+    var out2: Writer = .fixed(&out_buf);
+    var rw2: ResponseWriter = .init(&out2, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .encoder = t2.encoder(),
+    });
+    try rw2.setHeader("Content-Type", "application/json");
+    try rw2.setHeader("Content-Length", "18");
+    try rw2.interface.writeAll("{\"a\":\"bcdefghijk\"}");
+    try rw2.end();
+    var head_buf: [1024]u8 = undefined;
+    var body_out: [256]u8 = undefined;
+    var bw: Writer = .fixed(&body_out);
+    const res = try splitChunked(out2.buffered(), &head_buf, &bw);
+    try testing.expectEqualStrings("x-test", res.header("content-encoding").?);
+    try testing.expectEqualStrings("[18:{\"A\":\"BCDEFGHIJK\"}]", bw.buffered());
+}
+
+test "Encoder: wins over gzip; ignored without compression; the gate still applies" {
+    const Case = struct { compression: ?Compression, ct: []const u8, body: []const u8, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .compression = .{ .min_size = 4 }, .ct = "text/plain", .body = "plain text", .want = "x-test" },
+        .{ .compression = null, .ct = "text/plain", .body = "plain text", .want = null },
+        .{ .compression = .{ .min_size = 4 }, .ct = "image/png", .body = "plain text", .want = null },
+        .{ .compression = .{ .min_size = 64 }, .ct = "text/plain", .body = "plain text", .want = null },
+    };
+    const scratch = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(scratch);
+    for (cases) |c| {
+        var t: TestEncoder = .{};
+        var out_buf: [1024]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [256]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+            .compression = c.compression,
+            .gzip_scratch = scratch,
+            .accept_gzip = true,
+            .encoder = t.encoder(),
+        });
+        try rw.setHeader("Content-Type", c.ct);
+        try rw.interface.writeAll(c.body);
+        try rw.end();
+        var r: Reader = .fixed(out.buffered());
+        var head_buf: [1024]u8 = undefined;
+        const res = try h1.ResponseHead.parse(try h1.readHead(&r, &head_buf));
+        const ce = res.header("content-encoding");
+        if (c.want) |w| try testing.expectEqualStrings(w, ce.?) else try testing.expectEqual(@as(?[]const u8, null), ce);
+        try testing.expectEqual(@as(u32, if (c.want != null) 1 else 0), t.begun);
+    }
+}
+
+test "Encoder: a begin that fails fails the response, after the head" {
+    var t: TestEncoder = .{ .fail_begin = true };
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .encoder = t.encoder(),
+    });
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.interface.writeAll("hello, encoder");
+    try testing.expectError(error.WriteFailed, rw.end());
+    try testing.expect(rw.connectionMustClose());
+}
+
+test "Encoder: the h2 field sink names the caller's coding" {
+    const Sink = struct {
+        ce: ?[]const u8 = null,
+        fn put(ctx: *anyopaque, name: []const u8, value: []const u8) Writer.Error!void {
+            const s: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, name, "content-encoding")) s.ce = value;
+        }
+        fn headDone(_: *anyopaque, _: u16, _: bool, _: ?u64) Writer.Error!void {}
+    };
+    var sink: Sink = .{};
+    var t: TestEncoder = .{};
+    var out_buf: [1024]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [256]u8 = undefined;
+    var chunk_buf: [32]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{ .min_size = 4 },
+        .encoder = t.encoder(),
+        .field_sink = .{ .ctx = &sink, .put = Sink.put, .head_done = Sink.headDone },
+    });
+    try rw.setHeader("Content-Type", "text/plain");
+    try rw.interface.writeAll("hello, encoder");
+    try rw.end();
+    try testing.expectEqualStrings("x-test", sink.ce.?);
+    try testing.expectEqual(@as(u32, 1), t.finished);
 }
 
 // ── tests (offline — Task 1: inbound gzip request-body decoding) ────────────

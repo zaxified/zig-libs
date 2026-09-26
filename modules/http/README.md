@@ -564,8 +564,19 @@ correctly for clients that didn't opt in (added next to a handler-set
 at connection admission, reused across keep-alive requests. Socket-free
 `serveStream` callers pass it via `StreamBuffers.gzip`
 (`Server.GzipScratch`); without it, `StreamOptions.compression` stays
-inert. `deflate` and `brotli` response codings are not implemented (gzip
-covers the client population; `deflate` adds nothing over it).
+inert. `deflate` is not implemented (it adds nothing over gzip).
+
+**Other codings (zstd, br): `ResponseWriter.encoder`.** An embedder that
+negotiates a coding itself arms `encoder: ?Server.Encoder` -- a token for
+`Content-Encoding` plus `begin(ctx, dst, plain_len) -> *Writer` and
+`finish(ctx)` -- and eligible responses go through it instead of gzip (it
+wins over `accept_gzip`; it does nothing while `compression` is null). The
+eligibility gate, chunked framing, declared-length enforcement, weak `ETag`
+and `Vary` are the gzip pipeline's, unchanged; `plain_len` is the plain
+body's exact size when known (buffered, or declared). This module links no
+codec for it -- a server that never builds an `Encoder` carries none. The
+serving loops here (`serve`, `h2_server`) do not negotiate one yet (SPEC
+backlog); an embedder that builds its `ResponseWriter` itself does.
 
 ## Client behavior notes
 
