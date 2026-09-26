@@ -19,6 +19,7 @@
 //! with little room left) is not, which again changes only the error.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 const dbits = @import("dbits.zig");
 const huf = @import("huf_dec.zig");
 const seqs = @import("sequences.zig");
@@ -127,7 +128,7 @@ pub fn buildFseTable(dt: *SeqTable, norm: []const i16, max_sv: u32, base: []cons
         var s: u32 = 0;
         while (s < max_sv1) : (s += 1) {
             const n: usize = @intCast(norm[s]);
-            @memset(spread[pos..][0..n], @intCast(s));
+            fill.run(&spread, pos, n, @intCast(s));
             pos += n;
         }
         var position: u32 = 0;
@@ -332,7 +333,7 @@ fn decodeLiterals(st: *State, src: []const u8, dst_capacity: usize) Error!usize 
             }
             if (lit_size > bsm) return error.CorruptionDetected;
             if (expected_write_size < lit_size) return error.DstSizeTooSmall;
-            @memset(st.lit_buf[0..lit_size], src[lh_size]);
+            fill.bytes(st.lit_buf[0..lit_size], src[lh_size]);
             st.lit_src = &st.lit_buf;
             st.lit_pos = 0;
             st.lit_end = lit_size;

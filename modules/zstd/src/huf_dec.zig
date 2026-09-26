@@ -12,6 +12,7 @@
 //! it decides which damaged blocks are refused, and it is kept.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 const builtin = @import("builtin");
 const dbits = @import("dbits.zig");
 const DStream = dbits.DStream;
@@ -80,7 +81,7 @@ pub fn readStats(weights: *[symbol_value_max + 1]u8, rank_stats: *[tablelog_max 
         o_size = try dbits.decompressWeights(weights[0 .. hw_size - 1], src[1..][0..i_size], 6);
     }
 
-    @memset(rank_stats, 0);
+    fill.zero(u32, rank_stats);
     var weight_total: u32 = 0;
     for (weights[0..o_size]) |w| {
         if (w > tablelog_max) return error.CorruptionDetected;

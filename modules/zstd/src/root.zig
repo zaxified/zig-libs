@@ -484,6 +484,7 @@ pub fn compressAlloc(gpa: std.mem.Allocator, src: []const u8, opts: Options) Err
 
 test {
     _ = @import("bitstream.zig");
+    _ = @import("fill.zig");
     _ = @import("hist.zig");
     _ = @import("fse.zig");
     _ = @import("huf.zig");

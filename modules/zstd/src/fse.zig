@@ -10,6 +10,7 @@
 //! the values stored in it matter to the output.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 const CStream = @import("bitstream.zig").CStream;
 
 pub const Error = error{ DstSizeTooSmall, Generic };
@@ -334,12 +335,12 @@ pub const CTable = struct {
             // No low-probability symbols: lay each symbol out `norm` times in a
             // row, then scatter the run with the table step. Same assignment as
             // libzstd's 8-byte-at-a-time spread.
-            var spread: [1 << table_log_cap]u8 = undefined;
+            var spread: [(1 << table_log_cap) + 8]u8 = undefined;
             var pos: usize = 0;
             var s: u32 = 0;
             while (s < max_sv1) : (s += 1) {
                 const n: usize = @intCast(norm[s]);
-                @memset(spread[pos .. pos + n], @intCast(s));
+                fill.run(&spread, pos, n, @intCast(s));
                 pos += n;
             }
             var k: u32 = 0;

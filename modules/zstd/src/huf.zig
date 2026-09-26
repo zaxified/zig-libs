@@ -9,6 +9,7 @@
 //! reaches the output bytes.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 const bitstream = @import("bitstream.zig");
 const fse = @import("fse.zig");
 const hist = @import("hist.zig");
@@ -34,6 +35,13 @@ pub const CTable = struct {
     table_log: u32 = 0,
     max_symbol: u32 = 0,
     elt: [symbol_value_max + 1]CElt = [_]CElt{.{}} ** (symbol_value_max + 1),
+
+    /// `ct.* = .{}` without the memset call (`fill.zig`).
+    pub fn clear(ct: *CTable) void {
+        ct.table_log = 0;
+        ct.max_symbol = 0;
+        fill.zero(CElt, &ct.elt);
+    }
 };
 
 pub const Flags = struct {
@@ -119,7 +127,8 @@ fn simpleQuickSort(arr: []Node, low_in: i32, high_in: i32) void {
 /// `HUF_sort`: descending by count; exact counts below the cutoff are bucketed
 /// stably (by symbol), larger counts share log buckets and are quicksorted.
 fn sort(huff_node: []Node, counts: []const u32, max_symbol: u32) void {
-    var rank_position = [_]RankPos{.{}} ** rank_position_table_size;
+    var rank_position: [rank_position_table_size]RankPos = undefined;
+    fill.zero(RankPos, &rank_position);
     const max_sv1 = max_symbol + 1;
     var n: u32 = 0;
     while (n < max_sv1) : (n += 1) {
@@ -297,7 +306,7 @@ fn buildCTableFromTree(ct: *CTable, hn: []const Node, non_null_rank: i32, max_sy
     }
     // Entries above the alphabet are never read (every reader stops at
     // `max_symbol`); clear them rather than carry stale codes.
-    while (s <= symbol_value_max) : (s += 1) ct.elt[s] = .{};
+    fill.zero(CElt, ct.elt[s..]);
     ct.table_log = max_nb_bits;
     ct.max_symbol = max_symbol;
 }
@@ -307,7 +316,8 @@ pub fn buildCTable(ct: *CTable, counts: []const u32, max_symbol: u32, max_nb_bit
     var max_nb_bits = max_nb_bits_in;
     if (max_nb_bits == 0) max_nb_bits = table_log_default;
     if (max_symbol > symbol_value_max) return error.Generic;
-    var node0 = [_]Node{.{}} ** node_table_len;
+    var node0: [node_table_len]Node = undefined;
+    fill.zero(Node, &node0);
     const hn = node0[1..];
     sort(hn, counts, max_symbol);
     const non_null_rank = buildTree(&node0, max_symbol);
@@ -346,7 +356,8 @@ pub fn optimalTableLog(max_table_log: u32, src_len: usize, max_symbol: u32, coun
     var guess = min_table_log;
     // Search until size increases
     while (guess <= max_table_log) : (guess += 1) {
-        var ct: CTable = .{};
+        var ct: CTable = undefined;
+        ct.clear();
         const max_bits = buildCTable(&ct, counts, max_symbol, guess) catch continue;
         if (max_bits < guess and guess > min_table_log) break;
         var header: [1024]u8 = undefined;
@@ -562,7 +573,8 @@ pub fn compress(dst: []u8, src: []const u8, huff_log_in: u32, streams: Streams, 
     if (flags.prefer_repeat and repeat.* != .none) return compressWithTable(dst, 0, src, streams, old);
 
     huff_log = optimalTableLog(huff_log, src.len, max_symbol, &counts, flags.optimal_depth);
-    var ct: CTable = .{};
+    var ct: CTable = undefined;
+    ct.clear();
     huff_log = try buildCTable(&ct, &counts, max_symbol, huff_log);
 
     const h_size = try writeCTable(dst, &ct, max_symbol, huff_log);

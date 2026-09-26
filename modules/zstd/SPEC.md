@@ -2273,6 +2273,19 @@ level 3, 1 worker 0.17–0.21 s wall (libzstd 0.15–0.21), 4 workers 0.09 s
 5.1 s wall, 16.7 s CPU (4.8, 15.4). At level 19's default job size (32 MB)
 that input is one job and 4 workers gain nothing, as in libzstd.
 
+**Small frames** (Z21, 2026-09-26; the 20 MB tar of Zig's `lib/` cut
+into frames, level 3, one reused context each way, compress then decode,
+cycles, `-mcpu=native`): libzstd's glibc `memset` is vectorised, Zig 0.16's
+`compiler_rt.memset` without libc stores byte by byte, and every block
+clears a few KB of tables. `fill.zig` clears them, and the decoder's RLE
+blocks and literals, in 32-byte stores, and the FSE spread writes 8 bytes
+at a time (libzstd's `FSE_buildCTable_wksp` / `FSE_buildDTable`): 1 KB
+frames went from 1.50× to 1.27× libzstd's cycles, 4 KB from 1.33× to
+1.21× (64 KB: 1.13×, unchanged); decoding an RLE-heavy input −20 %. What is left at
+1 KB is the table building itself (`huf.buildCTable`, `fse.CTable.build`,
+`huf_dec.readDTableX1`). `fill.zig` goes when Zig's `memset` is
+vectorised (upstream, after 0.16).
+
 What is left above 1.0×: a few percent of instructions in `fast`'s search
 loop and `btopt`'s (levels 13–16, 1.13–1.15× instructions at equal
 cycles). The entropy stage (literals, sequences) already costs what
@@ -2708,7 +2721,9 @@ suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
 From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
 `lib/`, pinned core, the same bytes at every level):
 
-- **Z21 — Small frames: zero tables without byte-wise `memset`.** At 1–4 KB
+- ~~**Z21 — Small frames: zero tables without byte-wise `memset`.**~~
+  Done 2026-09-26, see *Speed* ("Small frames"); the rest of the gap at
+  1 KB is the table building, not clearing. At 1–4 KB
   per frame (level 3, reused context) compression runs at 0.74–0.79× and
   decoding at 0.77× libzstd's speed. `compiler_rt.memset` is 11 % of the
   profile there (libzstd's glibc `memset`: 1 %): Zig without libc clears

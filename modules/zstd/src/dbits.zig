@@ -12,6 +12,7 @@
 //! refuses the same ones libzstd does.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 
 pub const Error = error{
     CorruptionDetected,
@@ -176,7 +177,7 @@ pub fn readNCount(norm: []i16, max_sv: *u32, table_log: *u32, header: []const u8
     const max_sv1 = max_sv.* + 1;
     var previous0 = false;
 
-    @memset(norm[0..max_sv1], 0);
+    fill.zero(i16, norm[0..max_sv1]);
     var bit_stream: u32 = readLE32(header, ip);
     var nb_bits: i32 = @as(i32, @intCast(bit_stream & 0xF)) + min_tablelog;
     if (nb_bits > tablelog_absolute_max) return error.TableLogTooLarge;
@@ -324,7 +325,7 @@ fn buildDTable(dt: *FseDTable, norm: []const i16, max_sv: u32, table_log: u32) E
         var s: u32 = 0;
         while (s < max_sv1) : (s += 1) {
             const n: usize = @intCast(norm[s]);
-            @memset(spread[pos..][0..n], @intCast(s));
+            fill.run(&spread, pos, n, @intCast(s));
             pos += n;
         }
         var position: u32 = 0;

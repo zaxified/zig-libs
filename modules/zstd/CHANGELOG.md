@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — Small frames faster (SPEC backlog Z21): the tables
+  cleared for every block (Huffman nodes and code table, histograms, FSE
+  normalized counts) and the decoder's RLE blocks and literals no longer
+  go through `compiler_rt.memset`, which Zig 0.16 without libc runs byte by
+  byte, and the FSE symbol spread writes 8 bytes at a time, as libzstd's
+  does. Level 3, reused contexts, compress + decode: 1 KB frames −15 %
+  cycles, 4 KB −9 %; decoding RLE-heavy input −20 %; large inputs
+  unchanged. The same bytes.
+
 - **2026-09-26** — `Advanced.prefetch_cdict_tables`
   (`ZSTD_c_prefetchCDictTables`): prefetch an attached `CDict`'s hash
   tables before each `fast` / `dfast` block, for cold dictionaries. Speed

@@ -13,6 +13,7 @@
 //! refuses any block over the maximum.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 const dbits = @import("dbits.zig");
 const dblock = @import("dblock.zig");
 const ddict_mod = @import("ddict.zig");
@@ -717,7 +718,7 @@ pub const Decompressor = struct {
                 },
                 1 => blk: {
                     if (bp.orig_size > cap) return error.DstSizeTooSmall;
-                    @memset(dst[op..][0..bp.orig_size], block[0]);
+                    fill.bytes(dst[op..][0..bp.orig_size], block[0]);
                     break :blk bp.orig_size;
                 },
                 else => return error.CorruptionDetected,
@@ -872,7 +873,7 @@ pub const Decompressor = struct {
                     },
                     1 => {
                         if (d.rle_size > dst.len) return error.DstSizeTooSmall;
-                        @memset(dst[0..d.rle_size], src[0]);
+                        fill.bytes(dst[0..d.rle_size], src[0]);
                         r_size = d.rle_size;
                         d.expected = 0;
                     },

@@ -6,6 +6,7 @@
 //! largest count, so one implementation serves every call site here.
 
 const std = @import("std");
+const fill = @import("fill.zig");
 
 /// Count the bytes of `src` into `count[0..max_symbol.*+1]`, trim `max_symbol`
 /// down to the largest symbol present, and return the largest count.
@@ -13,7 +14,7 @@ const std = @import("std");
 /// `max_symbol` to 0 and returns 0 (`HIST_count_simple`).
 pub fn count(counts: []u32, max_symbol: *u32, src: []const u8) u32 {
     const max_in = max_symbol.*;
-    @memset(counts[0 .. max_in + 1], 0);
+    fill.zero(u32, counts[0 .. max_in + 1]);
     if (src.len == 0) {
         max_symbol.* = 0;
         return 0;
