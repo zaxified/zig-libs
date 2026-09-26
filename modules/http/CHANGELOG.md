@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — **`EncoderProvider` negotiates through its own `prefers` pointer; build one with
+  `EncoderProvider.init`.** The serving loops called `preferredBy` directly, which linked
+  `conneg` into every server that uses them, provider or not -- qap's precompressed absence check
+  found it in a bare build. The rule is now a field set by `init` (no default: a default value is
+  compiled with the type, which the same check caught too). **BREAKING** for a provider built as a
+  struct literal an hour after it shipped: add `.prefers = EncoderProvider.preferredBy`, or use
+  `init`.
+
 - **2026-09-26** — **The serving loops negotiate a second coding next to gzip: `encoder_provider`.**
   New `Server.EncoderProvider` (a `Content-Encoding` token, `acquire(ctx) ?Encoder`,
   `release(ctx, Encoder)`) as `Options.encoder_provider`, `StreamOptions.encoder_provider` and

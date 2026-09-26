@@ -329,10 +329,27 @@ pub const EncoderProvider = struct {
     /// Give back an encoder `acquire` returned, once its response is over
     /// (finished, failed or abandoned mid-frame).
     release: *const fn (ctx: *anyopaque, enc: Encoder) void,
+    /// The negotiation: `preferredBy` (what `init` sets), or the caller's
+    /// own rule. Behind a pointer, and with no default, so that a server
+    /// which never builds a provider links none of it -- the serving loops
+    /// are every embedder's codec. A qap absence check caught `conneg` in a
+    /// bare build twice: with a direct call, and with this field defaulting
+    /// to `preferredBy` (a default value is compiled with the type).
+    prefers: *const fn (p: *const EncoderProvider, accept_encoding: ?[]const u8) bool,
+
+    /// A provider with the standard negotiation (`preferredBy`).
+    pub fn init(
+        name: []const u8,
+        ctx: *anyopaque,
+        acquire: *const fn (ctx: *anyopaque) ?Encoder,
+        release: *const fn (ctx: *anyopaque, enc: Encoder) void,
+    ) EncoderProvider {
+        return .{ .name = name, .ctx = ctx, .acquire = acquire, .release = release, .prefers = preferredBy };
+    }
 
     /// Whether `accept_encoding` prefers this provider's coding to gzip;
     /// see the type doc for the rule.
-    pub fn preferredBy(p: EncoderProvider, accept_encoding: ?[]const u8) bool {
+    pub fn preferredBy(p: *const EncoderProvider, accept_encoding: ?[]const u8) bool {
         const raw = accept_encoding orelse return false;
         if (std.mem.trim(u8, raw, " \t").len == 0) return false;
         const q = conneg.encodingQuality(raw, p.name) orelse return false;
@@ -2483,7 +2500,7 @@ pub const ResponseWriter = struct {
             .encoder = opts.encoder,
             .encoder_provider = if (opts.encoder == null) opts.encoder_provider else null,
             .provider_preferred = opts.encoder == null and opts.compression != null and
-                if (opts.encoder_provider) |p| p.preferredBy(opts.accept_encoding) else false,
+                if (opts.encoder_provider) |p| p.prefers(p, opts.accept_encoding) else false,
             .field_sink = opts.field_sink,
             .upgradable = opts.upgradable,
             .interface = .{
@@ -5560,7 +5577,7 @@ const TestProvider = struct {
     released: u32 = 0,
 
     fn provider(t: *TestProvider) EncoderProvider {
-        return .{ .name = "x-test", .ctx = t, .acquire = acquire, .release = release };
+        return .init("x-test", t, acquire, release);
     }
 
     fn acquire(ctx: *anyopaque) ?Encoder {

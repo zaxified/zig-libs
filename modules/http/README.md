@@ -578,8 +578,9 @@ codec for it -- a server that never builds an `Encoder` carries none.
 
 **The serving loops negotiate one themselves: `encoder_provider`.** Give
 `Options` (or `StreamOptions`, `h2_server.Options`) a
-`Server.EncoderProvider` -- the coding's token plus `acquire(ctx) ?Encoder`
-and `release(ctx, Encoder)` over the caller's own pool -- and `serve`,
+`Server.EncoderProvider.init(name, ctx, acquire, release)` -- the coding's
+token plus `acquire(ctx) ?Encoder` and `release(ctx, Encoder)` over the
+caller's own pool -- and `serve`,
 `serveStream` and h2 pick it per request from `Accept-Encoding`: it wins when
 its q-value is at least gzip's (a tie goes to it, as nginx, Caddy and Go's
 `klauspost/compress` handlers choose zstd), or when gzip is not acceptable; an

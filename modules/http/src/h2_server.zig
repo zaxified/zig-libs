@@ -3207,7 +3207,7 @@ test "h2c serve: an EncoderProvider's coding is negotiated per stream and given 
         .handler = testHandler,
         .compression = .{ .min_size = 1 },
         .gzip_scratch = scratch,
-        .encoder_provider = .{ .name = "x-pass", .ctx = &pass, .acquire = Pass.acquire, .release = Pass.release },
+        .encoder_provider = .init("x-pass", &pass, Pass.acquire, Pass.release),
     }, &out_buf);
 
     const r = peer.resp(sid_pass);
