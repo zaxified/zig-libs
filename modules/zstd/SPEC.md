@@ -2673,9 +2673,36 @@ dictionaries are undecided.
   `StreamWriter.reset(output, opts)`, the caller's scratch
   (`initScratch`) and no allocator at all (`initStatic`).
 
-Suggested order: (Z1a, Z1-1, Z1b, Z1c, Z3, Z2a, Z2b, Z6, Z13, Z7, Z11, Z8 done) Z4 + Z5
-(once dictionaries are decided) → Z9 → Z10 → Z12. Z1 through Z13 together:
-roughly 17–22 sessions.
+Z1 through Z14 are done. Found by the post-port audit (2026-09-26), in the
+suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
+
+- **Z15 — Coverage-guided fuzzing of the decoder.** The only decoder
+  harness is one-shot `decompress` on arbitrary bytes; `DecompressStream`
+  (the ring and `checkContinuity`'s address history), `DDict.init` on
+  arbitrary bytes, decoding with a dictionary and magicless frames have
+  none, and no `scripts/fuzz-sweep.sh zstd` has run. A differential run on
+  2026-09-23 did trip a safety check in `decompressSequences` (fixed the
+  same day), so the layer has had such bugs. Harnesses after libzstd's
+  `tests/fuzz/` (`simple_decompress`, `stream_decompress`,
+  `dictionary_decompress`), then one sweep under a memory cap.
+- **Z16 — Decoder speed parity.** Measured 2026-09-26: 1.13–1.27× libzstd's
+  time (Zig std sources as a 20 MB and a 120 MB tar, levels 3 and 19,
+  `--long=27`, 178 small frames with a dictionary; one-shot and stream;
+  `perf`: 1.17× cycles, 1.18× instructions), where *Decoder* says
+  1.04–1.05× (2026-09-23, system binaries). Hot spots: the sequence loop,
+  Huffman literals (libzstd uses `huf_decompress_amd64.S`), and
+  `compiler_rt.memset` (byte by byte without libc, 1.7 %).
+- **Z17 — Document that `nb_workers > 0` needs a thread-safe allocator.**
+  Workers call `beginInternal`, which allocates from the caller's `gpa`
+  (`frame.zig`, the workspace resize); only the trainers say so today.
+- **Z18 — A case for a dictionary's repeat offsets in the decoder.**
+  Dropping `applyEntropy`'s `st.rep = e.rep` survives (see *Open*); a
+  hand-built frame (`tools/crafted-frames.py`) whose first sequence uses a
+  repeat code kills it.
+- **Z19 — Measure dictionary compression and training against libzstd.**
+  Never measured. Low priority until a consumer uses dictionaries.
+- **Z20 — Stale text:** Z2c above, and *Decoder*'s "dictionary decoding was
+  not separately measured (… Z4)" and its speed figure (with Z16).
 
 ## Open
 
