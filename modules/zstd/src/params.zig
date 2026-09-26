@@ -452,6 +452,12 @@ pub const Advanced = struct {
     /// ignores it (another strategy, a hash log not above the chain log, or
     /// a chain log above 24); it changes nothing without a dictionary.
     enable_dedicated_dict_search: bool = false,
+    /// `ZSTD_c_prefetchCDictTables`: before each block, prefetch an
+    /// attached `CDict`'s hash tables into the cache (`fast` and `dfast`,
+    /// the strategies that search them in place without a chain) -- for a
+    /// cold dictionary on inputs too small for a copy to pay. Speed only,
+    /// the bytes are the same. `.auto` is `.disable`, as in libzstd 1.5.7.
+    prefetch_cdict_tables: Switch = .auto,
     /// `ZSTD_c_nbWorkers`, 0..256: 0 compresses on the calling thread; from
     /// 1, a frame of more than 512 KB (or of unknown size, as a stream) is
     /// cut into jobs compressed by this many threads (`zstdmt.zig`). The

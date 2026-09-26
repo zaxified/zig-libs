@@ -391,8 +391,12 @@ sub-block: a superblock of a raw block's size or more is replaced by the
 raw block, as libzstd does.
 
 The five dictionary parameters are described in *Dictionaries*, the four
-sequence parameters in *Sequences*. Not here, each with its backlog item:
-`prefetchCDictTables` (Z4; it changes speed only). `stableInBuffer` and
+sequence parameters in *Sequences*. `prefetchCDictTables`
+(`prefetch_cdict_tables`, 2026-09-26) prefetches an attached CDict's hash
+tables (`PREFETCH_AREA`, towards L2) at the start of each `fast` and `dfast`
+dictMatchState block, as libzstd does, for a cold dictionary; `.auto` is
+`.disable`, as in 1.5.7. It changes speed only: the bytes with it are the
+bytes without (tested, stream and one-shot). `stableInBuffer` and
 `stableOutBuffer` (`stable_in_buffer`, `stable_out_buffer`) apply to
 `Stream` only, see *Algorithm*.
 
@@ -2612,7 +2616,7 @@ dictionaries are undecided.
     attach variant"); `hasDictMatchStateVariant` is exhaustively `true`.
   - ~~**D4** dedicated dictionary search (`enableDedicatedDictSearch`)~~
     done 2026-09-25 (*Dictionaries*, "The dedicated dictionary search").
-  - `prefetchCDictTables` (speed only).
+  - ~~`prefetchCDictTables`~~ done 2026-09-26 (*Advanced parameters*).
 - ~~**Z5 — Dictionary training.**~~ ~~**Z5a**~~ done 2026-09-24 (content
   selection, the optimizers' grid, memory estimates and a ceiling);
   ~~**Z5b**~~ done 2026-09-25: finalization, `COVER_selectDict` (with

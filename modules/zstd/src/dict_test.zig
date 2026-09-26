@@ -401,3 +401,44 @@ test "a dedicated-search CDict: greedy..lazy2 only, bucketed, always attached" {
     defer cd.deinit();
     try std.testing.expect(!cd.dedicated_dict_search);
 }
+
+/// `src` streamed in 1 KB blocks with `cd` attached (an unknown size),
+/// with `prefetch` as the switch; returns the frame's length in `dst`.
+fn streamAttached(dst: []u8, src: []const u8, level: i32, cd: *const zstd.CDict, prefetch: zstd.Switch) !usize {
+    var s = try zstd.Stream.init(std.testing.allocator, .{ .level = level, .advanced = .{ .prefetch_cdict_tables = prefetch, .max_block_size = 1024 }, .dictionary = .{ .cdict = cd } });
+    defer s.deinit();
+    var in: zstd.InBuffer = .{ .src = src };
+    var out: zstd.OutBuffer = .{ .dst = dst };
+    while (in.pos < in.src.len) _ = try s.compressStream2(&out, &in, .@"continue");
+    while (try s.compressStream2(&out, &in, .end) != 0) {}
+    try std.testing.expect(s.comp.c.ms.dict_match_state != null);
+    try std.testing.expectEqual(prefetch == .enable, s.comp.c.ms.prefetch_cdict_tables);
+    return out.pos;
+}
+
+test "prefetching an attached CDict's tables changes no byte" {
+    // `ZSTD_c_prefetchCDictTables` is speed only; the block functions that
+    // read it (fast and dfast attached) must still give libzstd's bytes,
+    // which the frames without it are pinned to.
+    const gpa = std.testing.allocator;
+    const dict = trained("zd-words");
+    var src: [6000]u8 = undefined;
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 14 }, &src);
+    var a: [8192]u8 = undefined;
+    var b: [8192]u8 = undefined;
+    var ctx: zstd.Compressor = .init(gpa);
+    defer ctx.deinit();
+    for ([_]i32{ -3, 1, 2, 3, 4, 5 }) |level| {
+        var cd = try zstd.CDict.init(gpa, dict, level);
+        defer cd.deinit();
+        const na = try ctx.compress(&a, &src, .{ .level = level, .advanced = .{ .force_attach_dict = .attach }, .dictionary = .{ .cdict = &cd } });
+        try std.testing.expect(!ctx.ctx.c.ms.prefetch_cdict_tables);
+        const nb = try ctx.compress(&b, &src, .{ .level = level, .advanced = .{ .force_attach_dict = .attach, .prefetch_cdict_tables = .enable }, .dictionary = .{ .cdict = &cd } });
+        try std.testing.expect(ctx.ctx.c.ms.dict_match_state != null and ctx.ctx.c.ms.prefetch_cdict_tables);
+        try std.testing.expectEqualSlices(u8, a[0..na], b[0..nb]);
+        // and through a stream, block by block
+        const sa = try streamAttached(&a, &src, level, &cd, .enable);
+        const sb = try streamAttached(&b, &src, level, &cd, .auto);
+        try std.testing.expectEqualSlices(u8, b[0..sb], a[0..sa]);
+    }
+}

@@ -1230,6 +1230,7 @@ pub const Compressor = struct {
                 .hash_table3 = tables[l.hash_len + l.chain_len ..],
                 .hash_log3 = l.hash_log3,
                 .opt = opt_state,
+                .prefetch_cdict_tables = opts.advanced.prefetch_cdict_tables == .enable,
             },
             .ss = .{
                 .seqs = slice(sequences.SeqDef, ws, l.seqs, n),

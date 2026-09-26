@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — `Advanced.prefetch_cdict_tables`
+  (`ZSTD_c_prefetchCDictTables`): prefetch an attached `CDict`'s hash
+  tables before each `fast` / `dfast` block, for cold dictionaries. Speed
+  only, the same bytes; `.auto` is off, as in libzstd 1.5.7.
+
 - **2026-09-26** — **BEHAVIOURAL, not breaking**: `estimateCompressorSize`
   / `estimateStreamSize` with `Advanced.nb_workers` count the workers (the
   round buffer, LDM tables, each worker's workspace, the job buffers) --

@@ -101,6 +101,9 @@ pub const MatchState = struct {
     /// follows the window in memory (`Advanced.deterministic_ref_prefix`
     /// after a dictionary was loaded).
     force_non_contiguous: bool = false,
+    /// `prefetchCDictTables`: the `dictMatchState` blocks of `fast` and
+    /// `dfast` prefetch the attached CDict's tables first.
+    prefetch_cdict_tables: bool = false,
 
     pub inline fn at(ms: *const MatchState, idx: usize) u8 {
         return ms.src[idx - ms.src_base];
@@ -1437,6 +1440,13 @@ fn countAcrossDict(w: Base, dms: *const MatchState, p_in: usize, p_match: usize,
     return n + w.count(p_in + n, i_start, i_end);
 }
 
+/// `PREFETCH_AREA`: every cache line of `area` towards L2
+/// (`PREFETCH_L2`, locality 2).
+fn prefetchArea(area: []const u8) void {
+    var pos: usize = 0;
+    while (pos < area.len) : (pos += 64) @prefetch(area.ptr + pos, .{ .locality = 2 });
+}
+
 /// `ZSTD_compressBlock_fast_dictMatchState_generic`: as `fastBlock`, but
 /// beside the window's own hash table also searches the attached CDict's
 /// tagged one (`ms.dict_match_state`, `dms`). `dms`'s own indices (below
@@ -1464,6 +1474,7 @@ fn fastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart:
 
     const dms = ms.dict_match_state.?;
     const dict_hash_table = dms.hash_table;
+    if (ms.prefetch_cdict_tables) prefetchArea(std.mem.sliceAsBytes(dict_hash_table));
     const dict_start_index: u32 = dms.dict_limit;
     const dict_end_index: u32 = dms.src_base + @as(u32, @intCast(dms.src.len));
     const dict_index_delta: u32 = prefix_start_index -% dict_end_index;
@@ -1640,6 +1651,10 @@ fn dfastDictMatchStateBlock(ms: *MatchState, ss: *SeqStore, rep: *[3]u32, istart
     const dms = ms.dict_match_state.?;
     const dict_hash_long = dms.hash_table;
     const dict_hash_small = dms.chain_table;
+    if (ms.prefetch_cdict_tables) {
+        prefetchArea(std.mem.sliceAsBytes(dict_hash_long));
+        prefetchArea(std.mem.sliceAsBytes(dict_hash_small));
+    }
     const dict_start_index: u32 = dms.dict_limit;
     const dict_end_index: u32 = dms.src_base + @as(u32, @intCast(dms.src.len));
     const dict_index_delta: u32 = prefix_lowest_index -% dict_end_index;
