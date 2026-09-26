@@ -50,6 +50,10 @@ pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, l
     var ext_dict_blocks: u32 = 0;
     var overflow_corrections: u32 = 0;
     var ldm_ext_dict_chunks: u32 = 0;
+    var sin: stream.InBuffer = .{ .src = src[0..0] };
+    var sout: ?stream.OutBuffer = null;
+    defer if (sout) |so| gpa.free(so.dst);
+    var written: usize = 0;
     var it = std.mem.tokenizeScalar(u8, schedule, ',');
     while (it.next()) |tok| {
         if (std.mem.eql(u8, tok, "x")) {
@@ -92,14 +96,27 @@ pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, l
             }
             s.?.overflow_correct_frequently = ocf;
         }
+        // stable input: one buffer, grown by each token, pos kept; stable
+        // output: one buffer for the whole schedule, never drained
+        if (advanced.stable_out_buffer and sout == null) sout = .{ .dst = try gpa.alloc(u8, ocap) };
         const obuf = try gpa.alloc(u8, ocap);
         defer gpa.free(obuf);
         var in: stream.InBuffer = .{ .src = src[fed..][0..num] };
+        const inp = if (advanced.stable_in_buffer) &sin else &in;
+        if (advanced.stable_in_buffer) sin.src = src[0 .. fed + num];
         while (true) {
             var o: stream.OutBuffer = .{ .dst = obuf };
-            const remaining = try s.?.compressStream2(&o, &in, dir);
+            const outp = if (sout) |*so| so else &o;
+            const remaining = try s.?.compressStream2(outp, inp, dir);
+            if (sout) |so| {
+                try out.appendSlice(gpa, so.dst[written..so.pos]);
+                written = so.pos;
+                if (if (dir == .@"continue") inp.pos == inp.src.len else remaining == 0) break;
+                if (so.pos == so.dst.len) return error.StableOutputFull;
+                continue;
+            }
             try out.appendSlice(gpa, obuf[0..o.pos]);
-            if (if (dir == .@"continue") in.pos == in.src.len else remaining == 0) break;
+            if (if (dir == .@"continue") inp.pos == inp.src.len else remaining == 0) break;
         }
         fed += num;
         if (dir == .end) {
@@ -336,4 +353,136 @@ test "streams round-trip through std's decoder" {
         _ = try d.reader.streamRemaining(&out.writer);
         try std.testing.expectEqualSlices(u8, src, out.written());
     }
+}
+
+test "stable input: calls under one block wait, pretending to consume; the contract is checked" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 300_000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 7 }, src);
+    var out: [1 << 17]u8 = undefined;
+    inline for (.{ params_zstd1, params_magicless }) |p| {
+        var s: stream.Stream = try .init(gpa, .{ .advanced = p.adv });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src[0..1000] };
+        var o: stream.OutBuffer = .{ .dst = &out };
+        // ZSTD_FRAMEHEADERSIZE_MIN: nothing written, all "consumed"
+        try std.testing.expectEqual(@as(usize, p.hint), try s.compressStream2(&o, &in, .@"continue"));
+        try std.testing.expectEqual(@as(usize, 1000), in.pos);
+        try std.testing.expectEqual(@as(usize, 0), o.pos);
+        // the same buffer, grown: fine; moved or with pos changed: refused
+        in.src = src[0..2000];
+        _ = try s.compressStream2(&o, &in, .@"continue");
+        var moved: stream.InBuffer = .{ .src = src[1..3001], .pos = 2000 };
+        try std.testing.expectError(error.StabilityConditionNotRespected, s.compressStream2(&o, &moved, .@"continue"));
+        var rewound: stream.InBuffer = .{ .src = src[0..3000], .pos = 1000 };
+        try std.testing.expectError(error.StabilityConditionNotRespected, s.compressStream2(&o, &rewound, .@"continue"));
+        // past one block the frame starts; after that, too
+        in.src = src[0..200_000];
+        _ = try s.compressStream2(&o, &in, .@"continue");
+        try std.testing.expect(o.pos > 0);
+        var moved2: stream.InBuffer = .{ .src = src[1..250_000], .pos = in.pos };
+        try std.testing.expectError(error.StabilityConditionNotRespected, s.compressStream2(&o, &moved2, .@"continue"));
+        var rewound2: stream.InBuffer = .{ .src = src[0..250_000], .pos = in.pos - 1 };
+        try std.testing.expectError(error.StabilityConditionNotRespected, s.compressStream2(&o, &rewound2, .@"continue"));
+    }
+    // exactly one block in the first call: the frame starts there
+    {
+        var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_in_buffer = true } });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src[0 .. 128 * 1024] };
+        var o: stream.OutBuffer = .{ .dst = &out };
+        _ = try s.compressStream2(&o, &in, .@"continue");
+        try std.testing.expect(o.pos > 6);
+    }
+    // a reset drops what a waiting frame held back: the next frame, from
+    // another buffer, is a fresh stream's
+    {
+        var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_in_buffer = true } });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src[0..1000] };
+        var o: stream.OutBuffer = .{ .dst = &out };
+        _ = try s.compressStream2(&o, &in, .@"continue");
+        try s.reset(.{ .advanced = .{ .stable_in_buffer = true } });
+        var in2: stream.InBuffer = .{ .src = src[5000..9000] };
+        var o2: stream.OutBuffer = .{ .dst = &out };
+        _ = try s.compressStream2(&o2, &in2, .end);
+        const one = try zstd.compressAlloc(gpa, src[5000..9000], .{});
+        defer gpa.free(one);
+        try std.testing.expectEqualSlices(u8, one, out[0..o2.pos]);
+    }
+}
+
+const params_zstd1 = .{ .adv = zstd.Advanced{ .stable_in_buffer = true }, .hint = 6 };
+const params_magicless = .{ .adv = zstd.Advanced{ .stable_in_buffer = true, .format = .magicless }, .hint = 2 };
+
+test "stable output: the room left is checked; short of compressBound it is refused (a deviation)" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 200_000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 8 }, src);
+    var out: [1 << 18]u8 = undefined;
+    {
+        var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_out_buffer = true } });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src[0..150_000] };
+        var o: stream.OutBuffer = .{ .dst = &out };
+        _ = try s.compressStream2(&o, &in, .@"continue");
+        var other: stream.OutBuffer = .{ .dst = out[0 .. out.len - 1], .pos = o.pos };
+        try std.testing.expectError(error.StabilityConditionNotRespected, s.compressStream2(&other, &in, .flush));
+        // (moving the buffer with the same room left is allowed, as in libzstd)
+        var moved: stream.OutBuffer = .{ .dst = out[1..], .pos = o.pos - 1 };
+        _ = try s.compressStream2(&moved, &in, .flush);
+    }
+    {
+        // 1000 bytes of room for a 150 000-byte block: libzstd would try
+        // (and fail here too); this port refuses up front
+        var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_out_buffer = true } });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src };
+        var o: stream.OutBuffer = .{ .dst = out[0..1000] };
+        try std.testing.expectError(error.DstSizeTooSmall, s.compressStream2(&o, &in, .end));
+    }
+    {
+        // a full block through `continue`, the same
+        var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_out_buffer = true } });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src };
+        var o: stream.OutBuffer = .{ .dst = out[0..1000] };
+        try std.testing.expectError(error.DstSizeTooSmall, s.compressStream2(&o, &in, .@"continue"));
+    }
+    {
+        // room for a block but not for all of it: libzstd ends the frame
+        // in one pass (its shortcut), so this port refuses rather than
+        // cut blocks libzstd would not
+        var s: stream.Stream = try .init(gpa, .{ .advanced = .{ .stable_out_buffer = true } });
+        defer s.deinit();
+        var in: stream.InBuffer = .{ .src = src };
+        var o: stream.OutBuffer = .{ .dst = out[0..150_000] };
+        try std.testing.expectError(error.DstSizeTooSmall, s.compressStream2(&o, &in, .end));
+    }
+}
+
+test "stable buffers leave the stream's own out of the workspace, as estimated" {
+    const gpa = std.testing.allocator;
+    const src = try gpa.alloc(u8, 300_000);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = src.len, .kind = .words, .seed = 9 }, src);
+    var sizes: [4]usize = undefined;
+    for ([_]zstd.Advanced{ .{}, .{ .stable_in_buffer = true }, .{ .stable_out_buffer = true }, .{ .stable_in_buffer = true, .stable_out_buffer = true } }, 0..) |adv, i| {
+        const opts: stream.Options = .{ .level = 3, .pledged_size = src.len, .advanced = adv };
+        var s: stream.Stream = try .init(gpa, opts);
+        defer s.deinit();
+        var out: [1 << 19]u8 = undefined;
+        var in: stream.InBuffer = .{ .src = src };
+        var o: stream.OutBuffer = .{ .dst = &out };
+        _ = try s.compressStream2(&o, &in, .flush);
+        sizes[i] = s.workspaceSize();
+        try std.testing.expectEqual(try zstd.estimateStreamSize(opts), sizes[i]);
+    }
+    // the input buffer holds the window (the pledged 300 000 bytes) and a
+    // block; the output buffer a compressed block
+    try std.testing.expect(sizes[0] - sizes[1] >= 300_000 + (1 << 17));
+    try std.testing.expect(sizes[0] - sizes[2] >= 1 << 17);
+    try std.testing.expect(sizes[3] < sizes[1] and sizes[3] < sizes[2]);
 }

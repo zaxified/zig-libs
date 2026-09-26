@@ -388,6 +388,30 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "drift-300000-8", .schedule = "targetCBlockSize=1340,literalCompressionMode=2,w12,o4072,f179089,c62647,c143,c21137,c17859,f76,f371,c4148,c95,f13305,c414,c31,f585,c15,f63,c3,c18,f0,f0,c1,e*", .levels = &.{-8} }, // the last sub-block exactly as long as it decodes to: the rest goes raw
     .{ .case = "ocf-ldm-mix-600000-9-w15", .schedule = "targetCBlockSize=1340,windowLog=13,c43458,c1546,f222273,c34063,c4968,c4479,c3902,c67154,c1427,c49105,c80,c1244,c31285,c131867,c55,c613,f1653,c54,c590,c160,c5,c13,c0,c4,c0,c2,e*", .levels = &.{-9} }, // ... and the repeat offsets go back to those of the sub-blocks emitted
     .{ .case = "long-match", .schedule = "targetCBlockSize=2000,maxBlockSize=65536,w11,c55789,c70384,c2304,c1276,c20498,f678,f24,c74,c29,c851,c48,c43,c1,c0,c1,e*", .levels = &.{-10} }, // an RLE block needs fewer than 10 literals
+    // stable input (ZSTD_c_stableInBuffer): blocks straight from the
+    // caller's buffer, the window that buffer in one piece; the first
+    // calls under one block wait (pretending to consume) to size the frame
+    .{ .case = "words-262145", .schedule = "stableInBuffer=1,c1000,c50000,f0,c*,e0" },
+    .{ .case = "words-262145", .schedule = "stableInBuffer=1,c70000,f0,c70000,f0,c*,e0", .levels = lazy_only_levels },
+    .{ .case = "words-262145", .schedule = "stableInBuffer=1,c131072,c131071,c1,e*", .levels = &.{ 1, 3, 7 } }, // exactly one block, one byte short of another
+    .{ .case = "words-16385", .schedule = "stableInBuffer=1,c5000,e*", .levels = &.{ 1, 3, 9 } }, // waited, then ended: the size in the header
+    .{ .case = "words-262145", .schedule = "stableInBuffer=1,p262145,c100,c*,e0", .levels = &.{ 1, 5 } },
+    .{ .case = "csv-600000", .schedule = "stableInBuffer=1,w15,c100000,c100000,c*,e0", .levels = &.{ -5, 1, 3, 7, 16 } }, // no second segment: the caller's buffer is the window
+    .{ .case = "far-repeat", .schedule = "stableInBuffer=1,l,w17,c300000,c*,e0", .levels = &.{ 1, 16 } },
+    // stable output (ZSTD_c_stableOutBuffer): straight into the caller's
+    // buffer, the buffered mode's bytes
+    .{ .case = "csv-600000", .schedule = "stableOutBuffer=1,c100000,f0,c*,e0", .levels = &.{ 1, 5, 19 } },
+    .{ .case = "mix-300000-9", .schedule = "stableInBuffer=1,stableOutBuffer=1,w17,c200000,f0,c*,e0", .levels = &.{ 3, 9, 16 } },
+    .{ .case = "words-16385", .schedule = "stableInBuffer=1,stableOutBuffer=1,e*", .levels = &.{3} }, // the one-call shortcut
+    // (from the mutation sweep) exactly one block left by a continue is
+    // compressed there, so an empty end adds the empty last block; an end
+    // through a small output buffer takes the block path, its block the
+    // last (a rest under one block, more than the output holds, so no
+    // one-pass end); the input held back before the frame started, handed
+    // to workers
+    .{ .case = "words-262144", .schedule = "stableInBuffer=1,c131072,c131072,e0", .levels = &.{ 1, 3 } },
+    .{ .case = "csv-200000-0", .schedule = "stableInBuffer=1,o1000,c150000,e*", .levels = &.{ 1, 3 } },
+    .{ .case = "csv-600000", .schedule = "stableInBuffer=1,nbWorkers=2,jobSize=524288,c5000,c*,e0", .levels = &.{ 1, 3 } },
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };

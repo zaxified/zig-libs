@@ -21,6 +21,12 @@
  *   name=value  an advanced parameter by libzstd's name (`hashLog=12`,
  *        `srcSizeHint=5000`; switches 0 auto, 1 enable, 2 disable), before
  *        any call: the module's `StreamOptions.advanced` / `src_size_hint`
+ *   stableInBuffer=1  every call gets the same input buffer, its size grown
+ *        by the token's bytes and its pos where the last call left it
+ *        (the contract of ZSTD_c_stableInBuffer)
+ *   stableOutBuffer=1  one output buffer of `oN` bytes for the whole
+ *        schedule, never drained (ZSTD_c_stableOutBuffer): exit 9 when a
+ *        flush or end cannot finish in it
  * `dict` is `<mode>:<content type>:<file>`, a dictionary set before the first
  * call (after the schedule's parameters): `load`
  * (ZSTD_CCtx_loadDictionary_advanced), `cdict` (ZSTD_createCDict(level) +
@@ -79,6 +85,8 @@ static struct { char const* name; ZSTD_cParameter p; } const params[] = {
     { "jobSize", ZSTD_c_jobSize },
     { "overlapLog", ZSTD_c_overlapLog },
     { "rsyncable", ZSTD_c_rsyncable },
+    { "stableInBuffer", ZSTD_c_stableInBuffer },
+    { "stableOutBuffer", ZSTD_c_stableOutBuffer },
 };
 
 /* Set one `name=value` token on `cctx` (and on `cparams` when given); 0
@@ -152,6 +160,11 @@ int main(int argc, char** argv)
     size_t ocap = (size_t)1 << 24;
     char* obuf = malloc(ocap);
     size_t fed = 0;
+    int const stableIn = strstr(argv[5], "stableInBuffer=1") != NULL;
+    int const stableOut = strstr(argv[5], "stableOutBuffer=1") != NULL;
+    ZSTD_inBuffer sin = { src, 0, 0 };  /* stableInBuffer: the one input buffer */
+    ZSTD_outBuffer sout = { NULL, 0, 0 }; /* stableOutBuffer: the one output buffer */
+    size_t written = 0;
     char* const sched = strdup(argv[5]);
     for (char* tok = strtok(sched, ","); tok; tok = strtok(NULL, ",")) {
         {   /* before the one-letter tokens: a name may start with any of them */
@@ -196,13 +209,24 @@ int main(int argc, char** argv)
             } else { fprintf(stderr, "unknown dict mode %s\n", mode); return 2; }
             if (ZSTD_isError(e)) { fprintf(stderr, "%s\n", ZSTD_getErrorName(e)); return 5; }
         }
+        if (stableOut && !sout.dst) sout = (ZSTD_outBuffer){ obuf, ocap, 0 };
         ZSTD_inBuffer in = { src + fed, num, 0 };
+        ZSTD_inBuffer* const ip = stableIn ? &sin : &in;
+        if (stableIn) sin.size = fed + num;
         for (;;) {
             ZSTD_outBuffer o = { obuf, ocap, 0 };
-            size_t const r = ZSTD_compressStream2(cctx, &o, &in, dir);
+            ZSTD_outBuffer* const outp = stableOut ? &sout : &o;
+            size_t const r = ZSTD_compressStream2(cctx, outp, ip, dir);
             if (ZSTD_isError(r)) { fprintf(stderr, "%s\n", ZSTD_getErrorName(r)); return 5; }
+            if (stableOut) {
+                fwrite(obuf + written, 1, sout.pos - written, out);
+                written = sout.pos;
+                if (dir == ZSTD_e_continue ? ip->pos == ip->size : r == 0) break;
+                if (sout.pos == sout.size) { fprintf(stderr, "stable output buffer full\n"); return 9; }
+                continue;
+            }
             fwrite(obuf, 1, o.pos, out);
-            if (dir == ZSTD_e_continue ? in.pos == in.size : r == 0) break;
+            if (dir == ZSTD_e_continue ? ip->pos == ip->size : r == 0) break;
         }
         fed += num;
         if (op == 'e') break;

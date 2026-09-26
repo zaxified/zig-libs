@@ -5,6 +5,18 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-26** — `Advanced.stable_in_buffer` / `stable_out_buffer`
+  (`ZSTD_c_stableInBuffer` / `ZSTD_c_stableOutBuffer`, SPEC backlog Z1):
+  a `Stream` compresses straight from the caller's input and into the
+  caller's output, without buffers of its own, byte-identical to libzstd
+  1.5.7 for the same calls (a stable input makes the window one piece);
+  a call that breaks the contract is the new
+  `error.StabilityConditionNotRespected`, and a stable output with less
+  room than `compressBound` is `error.DstSizeTooSmall` where libzstd
+  would try (backlog Z1d). New `zstd.StreamWriter`: a `std.Io.Writer`
+  over `Stream` with libzstd's bytes, one frame for everything written.
+  `StreamError` gains `StabilityConditionNotRespected`.
+
 - **2026-09-26** — Portability (SPEC backlog Z12): `meta.targets` gains
   `.linux32` and `.windows`; the test suite runs green under qemu on i386,
   ARM, s390x (big-endian) and mips (32-bit big-endian, soft-float), and

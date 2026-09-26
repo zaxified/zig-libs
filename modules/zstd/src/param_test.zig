@@ -88,6 +88,10 @@ pub fn applyParam(adv: *zstd.Advanced, hint: *?u32, tok: []const u8) !bool {
         adv.overlap_log = v;
     } else if (Eq.f(name, "rsyncable")) {
         adv.rsyncable = v != 0;
+    } else if (Eq.f(name, "stableInBuffer")) {
+        adv.stable_in_buffer = v != 0;
+    } else if (Eq.f(name, "stableOutBuffer")) {
+        adv.stable_out_buffer = v != 0;
     } else if (Eq.f(name, "blockDelimiters")) {
         adv.block_delimiters = if (v == 1) .explicit else .none;
     } else if (Eq.f(name, "validateSequences")) {

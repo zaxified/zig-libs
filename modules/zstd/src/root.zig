@@ -368,10 +368,15 @@ pub fn writeSkippableFrame(dst: []u8, src: []const u8, magic_variant: u32) Skipp
 }
 
 /// A `std.Io.Writer` that emits one frame per buffer fill and per flush
-/// (see frame_writer.zig): streaming output, not yet libzstd's streaming
-/// bytes.
+/// (see frame_writer.zig): independent frames, not libzstd's streaming
+/// bytes -- `StreamWriter` gives those.
 pub const FrameWriter = frame_writer.FrameWriter;
 pub const FrameWriterOptions = frame_writer.Options;
+
+/// A `std.Io.Writer` over `Stream`: one frame, libzstd's
+/// `ZSTD_compressStream2` bytes for writes as `continue`, `flush` as flush
+/// and `finish` as end (see stream_writer.zig).
+pub const StreamWriter = @import("stream_writer.zig").StreamWriter;
 
 /// Streaming compression, byte-identical to libzstd's `ZSTD_compressStream2`
 /// for the same sequence of calls (see stream.zig), frame after frame on
@@ -485,6 +490,7 @@ test {
     _ = @import("cdict.zig");
     _ = @import("dict_test.zig");
     _ = @import("frame_writer.zig");
+    _ = @import("stream_writer.zig");
     _ = @import("stream.zig");
     _ = @import("stream_test.zig");
     _ = @import("zstdmt.zig");

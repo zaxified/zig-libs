@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause AND MIT (port of libzstd 1.5.7 -- see ../NOTICE)
 //! Streaming compression (port of `ZSTD_compressStream2` and
 //! `ZSTD_compressStream_generic`, lib/compress/zstd_compress.c, v1.5.7, with
-//! buffered input and output — libzstd's default buffer modes).
+//! buffered input and output — libzstd's default buffer modes — or the
+//! caller's own, `Advanced.stable_in_buffer` / `stable_out_buffer`).
 //!
 //! The bytes a stream produces depend on how its input arrives: libzstd
 //! copies input into a buffer of one window plus one block and compresses a
@@ -85,7 +86,11 @@ pub const Error = error{
     InvalidBuffer,
     /// With workers: `continue` while a frame is being ended (`stage_wrong`).
     StageWrong,
-} || frame.BlockError; // with a sequence producer only
+    /// `Advanced.stable_in_buffer`: another `src` or `pos` than the last
+    /// call left; `stable_out_buffer`: another room left in `dst`
+    /// (`stabilityCondition_notRespected`).
+    StabilityConditionNotRespected,
+} || frame.BlockError; // with a sequence producer, or `stable_out_buffer`
 
 /// A compression context in streaming mode (`ZSTD_CCtx` driven by
 /// `ZSTD_compressStream2`). Once a frame has ended, the next call starts
@@ -107,6 +112,13 @@ pub const Stream = struct {
     out_content: usize = 0,
     out_flushed: usize = 0,
     frame_ended: bool = false,
+    /// `stable_in_buffer`: input reported consumed but not yet compressed
+    /// (`stableIn_notConsumed`), at the end of the caller's buffer.
+    stable_in_not_consumed: usize = 0,
+    /// `ZSTD_setBufferExpectations`: the input buffer (`src` and `pos`)
+    /// and the room left in the output buffer the next call must bring.
+    expected_in: struct { ptr: [*]const u8 = undefined, len: usize = 0, pos: usize = 0 } = .{},
+    expected_out_room: usize = 0,
     /// The stream's own `CDict` for a `.raw` dictionary (`localDict`).
     local_cdict: ?cdict_mod.CDict = null,
     /// Test seam, set before the first call: index overflow corrected as
@@ -162,6 +174,8 @@ pub const Stream = struct {
         s.opts = opts;
         s.pledged = opts.pledged_size;
         s.stage = .init;
+        // (libzstd keeps it, and would take it off the next frame's input)
+        s.stable_in_not_consumed = 0;
     }
 
     /// The bytes the stream's workspace holds (`ZSTD_sizeof_CCtx` less the
@@ -176,18 +190,62 @@ pub const Stream = struct {
     /// until it is 0 — for `end`, the frame is then complete).
     pub fn compressStream2(s: *Stream, output: *OutBuffer, input: *InBuffer, end_op: EndDirective) Error!usize {
         if (output.pos > output.dst.len or input.pos > input.src.len) return error.InvalidBuffer;
-        if (s.stage == .init) try s.begin(end_op, input.src.len - input.pos);
+        // transparent initialization stage
+        if (s.stage == .init) {
+            const input_size = input.src.len - input.pos;
+            const total_input_size = input_size + s.stable_in_not_consumed;
+            // input presumed stable across calls, no flush requested, not
+            // even one block yet: wait for more, for better parameters
+            if (s.opts.advanced.stable_in_buffer and end_op == .@"continue" and total_input_size < params.block_size_max_abs) {
+                if (s.stable_in_not_consumed != 0) { // not the first time
+                    if (input.src.ptr != s.expected_in.ptr) return error.StabilityConditionNotRespected;
+                    if (input.pos != s.expected_in.len) return error.StabilityConditionNotRespected;
+                }
+                // pretend the input was consumed, and keep track of where
+                // compression resumes
+                input.pos = input.src.len;
+                s.expected_in = .{ .ptr = input.src.ptr, .len = input.src.len, .pos = input.pos };
+                s.stable_in_not_consumed += input_size;
+                return if (s.opts.advanced.format == .zstd1) 6 else 2; // ZSTD_FRAMEHEADERSIZE_MIN
+            }
+            try s.begin(end_op, total_input_size);
+            s.setBufferExpectations(output, input);
+        }
+        try s.checkBufferStability(output, input);
         if (s.stage == .mt) {
+            if (s.stable_in_not_consumed != 0) {
+                // some early data was skipped: make it available
+                input.pos -= s.stable_in_not_consumed;
+                s.stable_in_not_consumed = 0;
+            }
             const flush_min = s.mt.?.compressStream2(output, input, end_op) catch |e| {
                 s.endFrame();
                 return e;
             };
             // compression completed
             if (end_op == .end and flush_min == 0) s.endFrame();
+            s.setBufferExpectations(output, input);
             return flush_min;
         }
         try s.generic(output, input, end_op);
+        s.setBufferExpectations(output, input);
         return s.out_content - s.out_flushed; // remaining to flush
+    }
+
+    /// `ZSTD_setBufferExpectations`.
+    fn setBufferExpectations(s: *Stream, output: *const OutBuffer, input: *const InBuffer) void {
+        if (s.opts.advanced.stable_in_buffer) s.expected_in = .{ .ptr = input.src.ptr, .len = input.src.len, .pos = input.pos };
+        if (s.opts.advanced.stable_out_buffer) s.expected_out_room = output.dst.len - output.pos;
+    }
+
+    /// `ZSTD_checkBufferStability`.
+    fn checkBufferStability(s: *const Stream, output: *const OutBuffer, input: *const InBuffer) Error!void {
+        if (s.opts.advanced.stable_in_buffer) {
+            if (s.expected_in.ptr != input.src.ptr or s.expected_in.pos != input.pos) return error.StabilityConditionNotRespected;
+        }
+        if (s.opts.advanced.stable_out_buffer) {
+            if (s.expected_out_room != output.dst.len - output.pos) return error.StabilityConditionNotRespected;
+        }
     }
 
     /// `ZSTD_CCtx_init_compressStream2`: parameters from the pledged size
@@ -250,11 +308,34 @@ pub const Stream = struct {
         return n + m;
     }
 
+    /// After a block: written straight into the output (done when it ended
+    /// the frame), or held for the flush stage. True when the call is done.
+    fn afterBlock(s: *Stream, direct: bool, c_size: usize, op: *usize) bool {
+        if (direct) { // no need to flush
+            op.* += c_size;
+            if (s.frame_ended) {
+                s.endFrame();
+                return true;
+            }
+            return false;
+        }
+        s.out_content = c_size;
+        s.out_flushed = 0;
+        s.stage = .flush; // pass-through to flush stage
+        return false;
+    }
+
     /// `ZSTD_compressStream_generic`.
     fn generic(s: *Stream, output: *OutBuffer, input: *InBuffer, end_op: EndDirective) Error!void {
         const in_buff = s.comp.in_buff;
         const out_buff = s.comp.out_buff;
+        const stable_in = s.opts.advanced.stable_in_buffer;
+        const stable_out = s.opts.advanced.stable_out_buffer;
         const iend = input.src.len;
+        if (stable_in) {
+            input.pos -= s.stable_in_not_consumed;
+            s.stable_in_not_consumed = 0;
+        }
         var ip = input.pos;
         const oend = output.dst.len;
         var op = output.pos;
@@ -266,8 +347,12 @@ pub const Stream = struct {
         while (true) switch (s.stage) {
             .init, .mt => unreachable,
             .load => {
-                if (end_op == .end and oend - op >= frame.compressBound(iend - ip) and s.in_buff_pos == 0) {
+                // (or, with a stable output, allowed to fail with
+                // dstSize_tooSmall -- which this port does short of
+                // compressBound, see `roomFor`)
+                if (end_op == .end and (oend - op >= frame.compressBound(iend - ip) or stable_out) and s.in_buff_pos == 0) {
                     // shortcut to compression pass directly into output buffer
+                    try roomFor(oend - op, iend - ip);
                     const c_size = try s.compressEnd(output.dst[op..], input.src[ip..iend]);
                     ip = iend;
                     op += c_size;
@@ -275,47 +360,64 @@ pub const Stream = struct {
                     s.endFrame();
                     return;
                 }
-                // complete loading into inBuffer
-                const to_load = s.in_buff_target - s.in_buff_pos;
-                const loaded = @min(to_load, iend - ip);
-                @memcpy(in_buff[s.in_buff_pos..][0..loaded], input.src[ip..][0..loaded]);
-                s.in_buff_pos += loaded;
-                ip += loaded;
-                // not enough input to fill full block: stop here
-                if (end_op == .@"continue" and s.in_buff_pos < s.in_buff_target) return;
-                // empty
-                if (end_op == .flush and s.in_buff_pos == s.in_to_compress) return;
+                if (!stable_in) {
+                    // complete loading into inBuffer
+                    const to_load = s.in_buff_target - s.in_buff_pos;
+                    const loaded = @min(to_load, iend - ip);
+                    @memcpy(in_buff[s.in_buff_pos..][0..loaded], input.src[ip..][0..loaded]);
+                    s.in_buff_pos += loaded;
+                    ip += loaded;
+                    // not enough input to fill full block: stop here
+                    if (end_op == .@"continue" and s.in_buff_pos < s.in_buff_target) return;
+                    // empty
+                    if (end_op == .flush and s.in_buff_pos == s.in_to_compress) return;
+                } else {
+                    // can't compress a full block: stop here, pretending
+                    // to have consumed the input
+                    if (end_op == .@"continue" and iend - ip < s.comp.block_size_max) {
+                        s.stable_in_not_consumed = iend - ip;
+                        ip = iend;
+                        return;
+                    }
+                    // empty
+                    if (end_op == .flush and ip == iend) return;
+                }
 
                 // compress current block (this stage cannot be stopped in
                 // the middle)
-                const i_size = s.in_buff_pos - s.in_to_compress;
-                const direct = oend - op >= frame.compressBound(i_size);
+                const i_size = if (stable_in) @min(iend - ip, s.comp.block_size_max) else s.in_buff_pos - s.in_to_compress;
+                const direct = oend - op >= frame.compressBound(i_size) or stable_out;
+                if (stable_out) try roomFor(oend - op, i_size);
                 const c_dst = if (direct) output.dst[op..] else out_buff;
-                const chunk = in_buff[s.in_to_compress..s.in_buff_pos];
-                const last_block = end_op == .end and ip == iend;
+                if (!stable_in) {
+                    const chunk = in_buff[s.in_to_compress..s.in_buff_pos];
+                    const last_block = end_op == .end and ip == iend;
+                    const c_size = if (last_block)
+                        try s.compressEnd(c_dst, chunk)
+                    else
+                        try s.comp.compressContinue(c_dst, chunk, false);
+                    s.frame_ended = last_block;
+                    // prepare next block
+                    s.in_buff_target = s.in_buff_pos + s.comp.block_size_max;
+                    if (s.in_buff_target > in_buff.len) {
+                        s.in_buff_pos = 0;
+                        s.in_buff_target = s.comp.block_size_max;
+                    }
+                    s.in_to_compress = s.in_buff_pos;
+                    if (s.afterBlock(direct, c_size, &op)) return;
+                    continue;
+                }
+                const chunk = input.src[ip..][0..i_size];
+                const last_block = end_op == .end and ip + i_size == iend;
+                // consume the input before the error check, as libzstd does
+                // (mirroring the buffered mode)
+                ip += i_size;
                 const c_size = if (last_block)
                     try s.compressEnd(c_dst, chunk)
                 else
                     try s.comp.compressContinue(c_dst, chunk, false);
                 s.frame_ended = last_block;
-                // prepare next block
-                s.in_buff_target = s.in_buff_pos + s.comp.block_size_max;
-                if (s.in_buff_target > in_buff.len) {
-                    s.in_buff_pos = 0;
-                    s.in_buff_target = s.comp.block_size_max;
-                }
-                s.in_to_compress = s.in_buff_pos;
-                if (direct) { // no need to flush
-                    op += c_size;
-                    if (s.frame_ended) {
-                        s.endFrame();
-                        return;
-                    }
-                    continue;
-                }
-                s.out_content = c_size;
-                s.out_flushed = 0;
-                s.stage = .flush; // pass-through to flush stage
+                if (s.afterBlock(direct, c_size, &op)) return;
             },
             .flush => {
                 const to_flush = s.out_content - s.out_flushed;
@@ -336,6 +438,16 @@ pub const Stream = struct {
         };
     }
 };
+
+/// With `stable_out_buffer` libzstd compresses into whatever room the
+/// caller's buffer has left, storing a block raw when its compressed form
+/// does not fit and failing with `dstSize_tooSmall` when neither does. This
+/// port compresses only into room for `compressBound` of the input and is
+/// `error.DstSizeTooSmall` short of it (SPEC.md, *Deviations*): the bytes
+/// are libzstd's whenever it succeeds.
+fn roomFor(room: usize, src_size: usize) Error!void {
+    if (room < frame.compressBound(src_size)) return error.DstSizeTooSmall;
+}
 
 /// The parameters of a stream's frame: sized for its pledged size, else
 /// for the size hint (`ZSTD_getCParamsFromCCtxParams`), else unknown.

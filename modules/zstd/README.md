@@ -9,8 +9,9 @@ leaves checksum verification as a TODO panic and defaults to an 8 MB window.
 
 Not yet a full libzstd replacement — that is the goal: one-shot
 compression is complete, streaming (`Stream`, `ZSTD_compressStream2`'s bytes
-for the same calls) covers every level too, and `FrameWriter` is a
-`std.Io.Writer` that emits one frame per flush, and libzstd's advanced
+for the same calls, buffered or with the caller's stable buffers) covers
+every level too, `StreamWriter` is a `std.Io.Writer` with those bytes and
+`FrameWriter` one that emits an independent frame per flush, and libzstd's advanced
 parameters (`zstd.Advanced`: explicit window/hash/chain/search/strategy,
 frame flags, magicless frames, the splitters, the row match finder, literal
 compression, block size) give libzstd's bytes for the same settings, and so
@@ -30,9 +31,10 @@ jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
 (`OptimizeParams.nb_threads`, the single-threaded result for any count),
 and so is the **sequence-level API** (`compressSequences`,
 `generateSequences`, a block-level `SequenceProducer` in place of the match
-finder: libzstd's bytes and errors for the same sequences). The
-stable-buffer part of the streaming API is queued in [SPEC.md](SPEC.md)
-(*Backlog / deferred*, with costs).
+finder: libzstd's bytes and errors for the same sequences). A stable
+output buffer with less room than `compressBound` is refused where libzstd
+would try; that and the rest are queued in [SPEC.md](SPEC.md) (*Backlog /
+deferred*, with costs).
 
 It is a port of every libzstd strategy: `fast`, `dfast`, `greedy`, `lazy`,
 `lazy2` (with both the hash-chain and the row-based search), `btlazy2` (its
@@ -171,8 +173,25 @@ var c: zstd.Compressor = .initStatic(ws);
 for a stream (exact for a pledged size or a size hint; without either, the
 most any frame can need).
 
-Streaming into any `std.Io.Writer` (an HTTP body, a file), one independent
-frame per buffer fill and per flush:
+Streaming into any `std.Io.Writer` (an HTTP body, a file) as libzstd
+streams -- one frame, history kept across flushes, the bytes
+`ZSTD_compressStream2` gives for the writes as `continue`, `flush` as flush
+and `finish` as end:
+
+```zig
+var buf: [64 * 1024]u8 = undefined;
+var sw: zstd.StreamWriter = try .init(gpa, out, &buf, .{ .level = 3 });
+defer sw.deinit();
+try sw.writer.writeAll(chunk);
+try sw.writer.flush(); // everything so far is on `out`, as whole blocks
+try sw.finish(); // ends the frame; `out` itself is not flushed
+```
+
+The frame depends on where the flushes fall, not on how the writes were cut
+or on the buffer's length. On `error.WriteFailed`, `sw.err` names the
+stream's own cause; null means `out` failed.
+
+Or one independent frame per buffer fill and per flush:
 
 ```zig
 var buf: [64 * 1024]u8 = undefined; // frame size when nobody flushes
@@ -211,6 +230,14 @@ while (true) {
     if (left == 0) break;
 }
 ```
+
+With `.advanced = .{ .stable_in_buffer = true }` the stream compresses
+straight from the caller's input, which must stay one buffer for the frame
+(the same address, only growing, `pos` untouched between calls); with
+`.stable_out_buffer = true` straight into the caller's output, whose room
+left must not change between calls -- as libzstd's `ZSTD_c_stableInBuffer`
+/ `ZSTD_c_stableOutBuffer`, and with libzstd's bytes (a stable input makes
+the window one piece, so they differ from the buffered mode's).
 
 Once a frame has ended, the next call starts another on the same context
 with the same options and an unknown size, as libzstd does;

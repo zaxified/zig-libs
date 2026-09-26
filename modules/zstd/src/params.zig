@@ -475,6 +475,24 @@ pub const Advanced = struct {
     /// the calling thread ignores it, as libzstd does); costs a little
     /// ratio and caps the speed near 400 MB/s.
     rsyncable: bool = false,
+    /// `ZSTD_c_stableInBuffer` (`Stream` only): the caller keeps one input
+    /// buffer for the whole frame -- the same `src` pointer, only ever
+    /// longer, `pos` where the last call left it -- and the stream
+    /// compresses straight from it instead of copying into a buffer of its
+    /// own (no window-sized input buffer in the workspace). The window is
+    /// then the caller's buffer, in one piece, so the bytes can differ from
+    /// the buffered mode's (as in libzstd). `continue` compresses only full
+    /// blocks and reports the rest consumed (it still needs the bytes).
+    /// A call that breaks the contract is
+    /// `error.StabilityConditionNotRespected`.
+    stable_in_buffer: bool = false,
+    /// `ZSTD_c_stableOutBuffer` (`Stream` only): the caller keeps one output
+    /// buffer, never moving `dst` or the room left (`dst.len - pos`)
+    /// between calls; blocks are compressed straight into it (no output
+    /// buffer in the workspace), and a block that does not fit is
+    /// `error.DstSizeTooSmall` rather than held back. The bytes are the
+    /// buffered mode's.
+    stable_out_buffer: bool = false,
     /// `ZSTD_c_blockDelimiters`: whether the sequences given to
     /// `Compressor.compressSequences` end each block with a delimiter.
     block_delimiters: BlockDelimiters = .none,

@@ -636,10 +636,13 @@ const Layout = struct {
         l.seqs = place(&off, sequences.SeqDef, l.max_n_seq, @alignOf(sequences.SeqDef));
         l.codes = place(&off, u8, 3 * l.max_n_seq, 1);
         l.lits = place(&off, u8, block_size_max, 1);
-        if (buffered) {
-            // one window plus one block in, one compressed block out
+        // one window plus one block in, one compressed block out -- unless
+        // the caller's buffers stand in (`stable_in_buffer`, `stable_out_buffer`)
+        if (buffered and !opts.advanced.stable_in_buffer) {
             l.in_buff_len = window_size + block_size_max;
             l.in_buff = place(&off, u8, l.in_buff_len, 1);
+        }
+        if (buffered and !opts.advanced.stable_out_buffer) {
             l.out_buff_len = compressBound(block_size_max) + 1;
             l.out_buff = place(&off, u8, l.out_buff_len, 1);
         }

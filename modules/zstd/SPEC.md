@@ -35,10 +35,14 @@ Not here yet, and a reader might expect it (each is a backlog item):
   dictionary this module was not given is `error.DictionaryWrong`. Of
   training, the content selection is here (*Dictionary training*);
   finalization is not.
-- **The rest of the streaming API.** `Stream` (see *Algorithm*) does
-  libzstd's default buffered modes, frame after frame on one context; not
-  the stable-buffer modes (Z1) or a `std.Io.Writer` over it. `FrameWriter` (Z1a) — a `std.Io.Writer` of
-  independent one-shot frames — takes every level.
+- **The whole streaming API.** `Stream` (see *Algorithm*) does libzstd's
+  buffered modes and the stable-buffer ones (`ZSTD_c_stableInBuffer`,
+  `ZSTD_c_stableOutBuffer`), frame after frame on one context;
+  `StreamWriter` is a `std.Io.Writer` over it (libzstd's bytes), and
+  `FrameWriter` (Z1a) a `std.Io.Writer` of independent one-shot frames.
+  A stable output buffer with less room than `compressBound` of what is
+  compressed into it is refused where libzstd would try (*Limits and
+  refusals*; backlog Z1d).
 
 ## Algorithm
 
@@ -193,6 +197,45 @@ caller's input. The output goes straight into the caller's buffer when it
 has room for `compressBound` of the chunk, else through a buffer of one
 compressed block that later calls drain; the bytes are the same either way.
 
+**Stable buffers** (`Advanced.stable_in_buffer`, `stable_out_buffer`;
+`ZSTD_c_stableInBuffer`, `ZSTD_c_stableOutBuffer`). With a stable input
+the caller keeps one buffer for the frame -- the same address, only ever
+longer, `pos` where the last call left it (checked at every call, as
+libzstd checks it: `error.StabilityConditionNotRespected`) -- and there is
+no input buffer: `continue` compresses whole blocks straight from the
+caller's bytes (`min(rest, blockSizeMax)` each) and reports the rest
+consumed while it is still needed; `flush` and `end` compress what is left.
+The window is then the caller's buffer, in one piece (no second segment),
+so the bytes differ from the buffered mode's for the same calls, as
+libzstd's do. Before the frame starts, calls with less than one block in
+all (`ZSTD_BLOCKSIZE_MAX`) only record it -- pretending to consume it, and
+returning the smallest frame header as the hint -- so that the parameters
+are chosen once more input, a flush or the end has come; the held-back
+bytes go to the workers too with `nb_workers`. With a stable output there
+is no output buffer: every block goes straight into the caller's buffer
+(`end`'s one-pass shortcut is taken whatever the room), and the caller may
+not change the room left between calls (it may move the buffer). libzstd
+then compresses into whatever room there is, storing a block raw when its
+compressed form does not fit and failing when neither does; this port
+compresses only into room for `compressBound` of the input and is
+`error.DstSizeTooSmall` short of it (*Limits and refusals*), so the bytes are
+libzstd's whenever it succeeds. The workspace leaves out the buffers the
+caller's stand in for, and `estimateStreamSize` with it.
+`ZSTD_CCtx_reset` leaves the input a waiting frame held back on the
+context (the next frame would take it off its own input); `reset` drops it.
+
+**`StreamWriter`** (`stream_writer.zig`) is a `std.Io.Writer` over a
+`Stream` in the buffered modes: each drain of the writer's buffer (and what
+did not fit in it) is `continue`, `flush` is `flush`, `finish` sends what
+is buffered as `end` -- the bytes libzstd gives for those calls. The
+compressed bytes go to the output writer through a scratch of
+`compressBound` of one block, so libzstd's one-pass `end` takes at most one
+block, which is also what its ordinary path makes of it: the frame depends
+on where the flushes fall, not on how the writes were cut or on the
+buffer's length. When nothing reached the stream before `finish`, that one
+`end` records the size in the header. Stable buffers are refused
+(`error.ParameterCombinationUnsupported`): the writer's buffer is reused.
+
 A chunk that does not follow the previous one in memory (the buffer
 wrapped, or the end came from the caller's input) makes the window two
 segments (`ZSTD_window_update`): the old prefix becomes the *extDict*, the
@@ -338,8 +381,9 @@ raw block, as libzstd does.
 
 The five dictionary parameters are described in *Dictionaries*, the four
 sequence parameters in *Sequences*. Not here, each with its backlog item:
-`prefetchCDictTables` (Z4; it changes speed only); `stableInBuffer` /
-`stableOutBuffer` (Z1).
+`prefetchCDictTables` (Z4; it changes speed only). `stableInBuffer` and
+`stableOutBuffer` (`stable_in_buffer`, `stable_out_buffer`) apply to
+`Stream` only, see *Algorithm*.
 
 ## Contexts: reuse and sizing
 
@@ -1473,7 +1517,8 @@ equality (a smaller dictionary with exactly the full one's total).
 | stream level | as one-shot (`stream_max_level` = `max_level`) | level 22 without a pledged size uses a 128 MB window and long-distance matching (window log 27, as libzstd), ≈ 1 GB |
 | advanced parameters | libzstd's bounds (see *Advanced parameters*), else `error.ParameterOutOfBound` | `ZSTD_cParam_getBounds`, 64-bit |
 | stream size | a pledged size must be met exactly, else `error.SrcSizeWrong` (more input at the chunk that passes it, less at the end) | `srcSize_wrong` |
-| stream memory | one window plus one block of input buffer, `compressBound(block) + 1` of output buffer, and the level's tables | `ZSTD_resetCCtx_internal` |
+| stream memory | one window plus one block of input buffer (none with `stable_in_buffer`), `compressBound(block) + 1` of output buffer (none with `stable_out_buffer`), and the level's tables | `ZSTD_resetCCtx_internal` |
+| stable output room | ≥ `compressBound` of each chunk compressed into it, else `error.DstSizeTooSmall` | libzstd tries any room (a raw block, or `dstSize_tooSmall`); the port's block path assumes the bound (backlog Z1d) |
 | context memory | one workspace, exactly `estimateCompressorSize` / `estimateStreamSize`; a static one is never exceeded (`error.OutOfMemory`) | `ZSTD_estimateCCtxSize*`, `ZSTD_initStaticCCtx` |
 | decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header on 64-bit, ≤ 30 on 32-bit -- *Portability* -- else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (`_64`/`_32` by `sizeof(size_t)`); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
 | decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), plus the ≈ 190 KB context | `ZSTD_decodingBufferSize_min` |
@@ -1663,6 +1708,35 @@ the plain variant — a first version counted windows that merely had an
 extDict and was blind: with a window of 128 KB or less a full block reaches
 back exactly one window, the extDict is out of reach and the plain variant
 runs), and for `x` cases a nonzero correction count.
+
+**Stable buffers and `StreamWriter`** (Z1, 2026-09-26): 13 more
+`corpus.stream_cases` (78 rows) with `stableInBuffer`/`stableOutBuffer`
+through `tools/zstream.c`, which keeps libzstd's contract (one input buffer
+grown by each token, `pos` kept; one output buffer never drained, exit 9
+when full): the wait under one block, exactly one block, a wait then an
+end, pledged, a small window (one segment), LDM, a flush between, a
+block's rest compressed where it lies before an empty end, the block path
+of an end through a small output buffer, the held-back input handed to
+workers, a stable output alone and both together. Before them 1 260 random
+runs against `zstream` (both modes and each alone, 0–2.5 MB of source,
+binaries, text, noise and generated mixes; levels −5…19, window, pledged
+size, size hint, block size, workers, flushes and chunkings up to
+600 KB): 1 155 identical, 98 refused alike (a stable output that fills),
+7 where a stable output below `compressBound` was refused and libzstd went
+on (the deviation above), none different. Unit tests pin the contract
+checks one condition at a time (address, `pos`, room left), the wait's
+hint and pretended consumption, exactly one block starting the frame, a
+reset dropping a waiting frame's input, both refusals short of
+`compressBound`, and the workspace without the caller's buffers matching
+`estimateStreamSize`. `StreamWriter` against `Stream` driven with the
+schedule the test spells out, over 4 buffer lengths × 4 write sizes (and
+splats), the one-call frame and the empty one. Mutation sweep, 33 mutants
+of `stream.zig`, `stream_writer.zig` and the workspace layout: 31 caught
+(11 after the tests and cases above), 1 equivalent -- `or stable_out` in
+the block path's direct test, always true behind the `compressBound`
+refusal -- and 1 whose code went (`StreamWriter` sent `finish` as
+`continue` plus an empty `end` once anything had been written; the
+one-block scratch makes one `end` the same bytes).
 
 59 mutations of the new code (`windowUpdate`, `count2Segments`, the `fast`
 and `dfast` extDict variants, overflow correction of two segments,
@@ -2444,11 +2518,20 @@ dictionaries are undecided.
     tree of the optimal parsers and the 3-byte hash across both segments,
     and long-distance matching over its own two-segment window; streams at
     every level.
-  - **Later:** the stable-input / stable-output buffer modes
-    (`ZSTD_c_stableInBuffer`, which compresses straight from the caller's
-    buffer and waits for a full block), a `std.Io.Writer` over `Stream`
-    (replacing `FrameWriter` for callers that want libzstd's bytes).
-    (`ZSTD_CCtx_reset` and frames after the first: done with Z13.)
+  - ~~**Stable buffers and a writer.**~~ done 2026-09-26: the stable-input
+    and stable-output modes (`ZSTD_c_stableInBuffer`,
+    `ZSTD_c_stableOutBuffer`) and `StreamWriter`, a `std.Io.Writer` over
+    `Stream` with libzstd's bytes; see *Algorithm*. (`ZSTD_CCtx_reset` and
+    frames after the first: done with Z13.)
+  - **Z1d — compression into less room than `compressBound`.** libzstd
+    compresses a block into whatever room the destination has, storing it
+    raw when the compressed form does not fit and failing only when that
+    does not fit either; this port's block path (`frameChunk`, the
+    superblock, the epilogue) assumes room for `compressBound` and asserts
+    it, so a stable output buffer short of it is refused up front. Porting
+    libzstd's capacity checks there would let a stable output (and a
+    one-shot destination below the bound) succeed where libzstd does.
+    **~0.5 session**, with a diff over tight destinations.
 - **Z2 — Decoder.** ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
   checksum verification, concatenated and skippable frames and the frame
   utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
