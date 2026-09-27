@@ -3118,3 +3118,58 @@ test "Snapshot.open refuses what it would not serve right: symlink following, li
     var ok = try Snapshot.open(gpa, io, root, .{ .max_files = 2, .max_depth = 2 });
     ok.deinit(io);
 }
+
+test "Snapshot: a file the walk cannot open is left out, not an error; deinit closes every descriptor" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "A" });
+    try root.writeFile(io, .{ .sub_path = "b.txt", .data = "B" });
+    try root.writeFile(io, .{ .sub_path = "locked.txt", .data = "L" });
+
+    const fds = struct {
+        fn count() !usize {
+            var d = try Dir.cwd().openDir(testing.io, "/proc/self/fd", .{ .iterate = true });
+            defer d.close(testing.io);
+            var n: usize = 0;
+            var it = d.iterate();
+            while (try it.next(testing.io)) |_| n += 1;
+            return n;
+        }
+    };
+    const before = try fds.count();
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    try testing.expectEqual(before + 3, try fds.count());
+    snap.deinit(io);
+    try testing.expectEqual(before, try fds.count());
+
+    // Unreadable: the open fails (EACCES → Forbidden) and the walk goes on.
+    if (linux.geteuid() == 0) return; // root reads it anyway
+    try testing.expectEqual(@as(usize, 0), linux.fchmodat(root.handle, "locked.txt", 0));
+    var partial = try Snapshot.open(testing.allocator, io, root, .{});
+    defer partial.deinit(io);
+    try testing.expectEqual(@as(usize, 2), partial.count());
+    const ctx: SnapshotCtx = .{ .snap = &partial };
+    var b: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 404), statusOf(snapGet(&ctx, "/locked.txt", "", &b)));
+}
+
+test "Snapshot: redirect_to_trailing_slash = false serves a directory's index at both URLs" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    _ = try root.createDirPathOpen(io, "docs", .{});
+    try root.writeFile(io, .{ .sub_path = "docs/index.html", .data = "DOCS" });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{ .serve = .{ .redirect_to_trailing_slash = false } });
+    defer snap.deinit(io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+    var b1: [4096]u8 = undefined;
+    const bare = snapGet(&ctx, "/docs", "", &b1);
+    try testing.expectEqual(@as(u16, 200), statusOf(bare));
+    try testing.expectEqualStrings("DOCS", bodyOf(bare));
+}
