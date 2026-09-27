@@ -98,6 +98,15 @@ rsyslog source was read or consulted (root `NOTICE` §0, the same relationship
 as `icmp`/`genetlink`/`nftables`/`traceroute`).
 
 ## Backlog / deferred
+
+- **Local delivery** (from ttydesk, 2026-09-27). Only UDP/TCP today. Wanted: `UnixEmitter.open(
+  "/dev/log")` (unix datagram) with the existing 3164/5424 encoders, and the journald native
+  protocol -- `journal.send(fields)` over `/run/systemd/journal/socket`, `KEY=value` fields, the
+  binary form for values with newlines, sd_journal's field-name and size rules -- so structured
+  fields stay queryable (`journalctl TTYDESK_ACTION=…`). ttydesk sends journald datagrams itself
+  (`src/audit.zig`, marked `zig-libs request: syslog — local delivery`). Precedent: Go
+  `log/syslog` dials the local socket by default, Python `SysLogHandler("/dev/log")`,
+  `systemd.journal.send`, go-systemd `journal`.
 Parser/receiver side (RFC 5424 and RFC 3164 message parsing); TLS transport (RFC 5425, BYO-TLS seam);
 reliable delivery (reconnect/retry/backpressure for TCP); full RFC 3164 parsing tolerance (encoder
 only is provided today). (README "Not implemented (DEFER)".)

@@ -46,6 +46,18 @@ asserting none are accepted, and `Argv` tests (validated build; a rejected `push
 poisons `slice()`). Green in Debug and ReleaseFast; `zig fmt --check` clean.
 
 ## Backlog / deferred
+
+- **argv template filled from a trusted config** (from ttydesk, 2026-09-27). `Argv.push` takes
+  only comptime literals and `buildValidatedArgv` checks every argument with one predicate, so a
+  runner whose command lines come from an admin-written config (`["systemctl", "restart",
+  "{unit}"]`, one `CharClass` per hole) cannot use the builder. Wanted: `Template.parse(tokens,
+  holes: []const Hole{ name, class })` → `fill(gpa, values)` returning the argv or
+  `refused{ hole, why }` -- literal tokens trusted (the template is config), values checked per
+  hole, holes allowed inside a token (`--name={n}`) but never as argv[0]. Plus
+  `CharClass.explain(s) ?Reason` (empty, too_long, leading_dash, substring, control, char) so a UI
+  can say why without re-implementing `check`. ttydesk fills and explains itself today
+  (`src/actions.zig`, marked `zig-libs request: argsafe — argv template`). Precedent: Ansible,
+  systemd `ExecStart=` specifiers, Rundeck/StackStorm actions.
 Windows argv quoting and environment-variable-injection allowlisting are explicitly out of scope for
 v1 (see Threat model). No other deferred items in README beyond the general pre-public
 review pass.

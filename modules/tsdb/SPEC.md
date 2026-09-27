@@ -232,6 +232,18 @@ section is its citation.
 
 ## 9. Backlog — deliberate v1 non-goals
 
+- **Series listing, multi-series batches, a size budget** (from ttydesk, 2026-09-27). (1) No way
+  to enumerate series: a reader that does not know label values up front cannot find them --
+  wanted `Db.seriesIterator()` (id + parsed descriptor) and `Db.findSeries(name, label filter)`.
+  (2) `appendMany` commits per series, so flushing N series is N transactions (N fsyncs) --
+  wanted `Db.appendBatch([]const struct{ series, points })` in one transaction. (3) Retention is
+  by age only and kvtree never shrinks the file -- wanted `sweepToBudget(max_bytes)` (oldest
+  points first, by live data size) and a way to read the live size. ttydesk walks series ids
+  1, 2, 3 … until one is missing, flushes on its own thread, and halves its retention window
+  while over a cap (`src/diskhist.zig`, marked `zig-libs request: tsdb — …`). Precedent:
+  Prometheus TSDB label matchers and `--storage.tsdb.retention.size`, VictoriaMetrics/InfluxDB
+  multi-series writes; the wgs lesson (13 GB in an afternoon) is (3).
+
 Named as scope decisions, not omissions.
 
 - **Sample compression.** Gorilla-style delta-of-delta timestamps + XOR'd
