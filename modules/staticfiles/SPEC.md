@@ -192,6 +192,34 @@ internal call site. Status-mapping for a *failed* resolve is entirely the caller
 `sendFile` starts from an already-successful `Opened` and only covers what `serve` does from that
 point on.
 
+## 3.6. `Snapshot` — a root opened once
+
+`Snapshot.open(gpa, io, root, opts)` walks `root` once (dotfiles skipped unless `serve_dotfiles`,
+depth ≤ `max_depth`), opens every regular file through `openWithinRoot` — the same layer-2 walk a
+request takes — and keeps the descriptors, their `stat` and a path table. `serve(io, req, rw,
+raw_path)` then does `sanitizePath` (layer 1, unchanged), one table lookup, and `sendFile` through
+the `Io` it is given: **no `openat`/`stat`/`getdents` after `open`.** For a process that sandboxes
+path-based opens (Landlock re-checks every open, even relative to a directory fd opened before) or
+an event loop whose file opens would block a shared thread.
+
+Differences from `Handler`, all by construction: a symlink (any non-regular entry) is not in the
+table — 404, where `Handler` answers 403; a directory whose index is a symlink is a directory
+with no index (301 then 403, where `Handler` answers 403). No directory listing, no
+`follow_symlinks` (`error.Unsupported` at `open`). A file created after `open` is a 404; one
+replaced by rename keeps serving the old inode until the next snapshot. `max_files` bounds the
+descriptors (`error.TooManyFiles`, never a partial table). A test serves one fixture tree through
+both and requires the same status, body, `Location` and `ETag` for every non-symlink path,
+traversal vectors included.
+
+**Precompressed variants.** `name.br`, `name.zst`, `name.gz` found next to `name` are its variants
+(`SnapshotOptions.precompressed`, all on by default). A request for `name` gets one when
+`Accept-Encoding` (via `http.conneg.negotiateEncoding`, ties → br, zstd, gzip) prefers it over
+`identity` (`encodingQuality(…, "identity")`): the variant's bytes, `Content-Encoding`, `name`'s
+`Content-Type`, the variant's own `ETag`/`Last-Modified` (so 304 and Range apply to the encoded
+bytes, as nginx `gzip_static` does). No `Accept-Encoding` → identity. Every answer for a name that
+has variants carries `Vary: Accept-Encoding` (not best-effort: without it a shared cache serves one
+client's coding to another). Variants remain servable under their own names.
+
 ## 4. Concurrency & memory
 
 A `Handler` is created once and shared read-only across the server's connection threads; it holds

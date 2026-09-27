@@ -93,6 +93,21 @@ try server.listen();
   to `sendFile`. `sendFile` only borrows `opened` — closing it (`opened.close(io)`) stays the
   caller's job, exactly as it is for `serve`'s own internal call.
 
+## Snapshot — no filesystem calls per request
+
+```zig
+var snap = try staticfiles.Snapshot.open(gpa, io, root_dir, .{ .serve = .{ .cache_control = "public, max-age=3600" } });
+defer snap.deinit(io);
+// per request, `rest` = the path below the mount:
+try snap.serve(io, req, rw, rest);
+```
+
+Every regular file under the root is opened once at `open`; a request is a table lookup plus
+positional reads — for sandboxed processes and event loops where a per-request `openat` is not
+allowed or would block. Serves `name.br` / `name.zst` / `name.gz` in place of `name` when the
+client prefers them (with `Content-Encoding` and `Vary`). See SPEC §3.6 for what differs from
+`Handler` (symlinks absent, no listing, no files added after `open`).
+
 ## Options
 
 | Field | Default | Meaning |

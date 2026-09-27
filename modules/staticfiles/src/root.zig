@@ -1094,6 +1094,241 @@ fn writeHtmlEscaped(w: *Writer, s: []const u8) Writer.Error!void {
     };
 }
 
+// ── Snapshot: a root opened once, served without opening anything ───────────
+
+/// Precompressed siblings a `Snapshot` serves in place of a file, in server
+/// preference order (a tie in the client's weights goes to the earlier one):
+/// `name.br`, `name.zst`, `name.gz` next to `name`.
+pub const Precompressed = struct {
+    br: bool = true,
+    zstd: bool = true,
+    gzip: bool = true,
+};
+
+pub const SnapshotOptions = struct {
+    /// The rules `Handler` applies -- index, dotfiles, validators,
+    /// `Cache-Control`, MIME, the trailing-slash redirect. A snapshot never
+    /// follows a symlink and never lists a directory: `follow_symlinks` or
+    /// `directory_listing` set is `error.Unsupported`.
+    serve: Options = .{},
+    precompressed: Precompressed = .{},
+    /// Most regular files held -- one open descriptor each. A larger tree is
+    /// `error.TooManyFiles`, never a silently partial snapshot.
+    max_files: usize = 4096,
+    /// Deepest directory nesting walked; deeper is `error.TooDeep`.
+    max_depth: usize = 32,
+};
+
+pub const SnapshotError = error{
+    /// `SnapshotOptions.serve` asks for something a snapshot does not do.
+    Unsupported,
+    TooManyFiles,
+    TooDeep,
+    IoError,
+    OutOfMemory,
+};
+
+/// A root directory opened once -- every regular file under it, stat'ed and
+/// held open -- and served from memory afterwards: **no `openat`, `stat` or
+/// `getdents` per request.** For where those cannot run: a process that
+/// sandboxes path-based opens away after startup (Landlock checks every
+/// open, even one relative to a directory opened before), or an event loop
+/// whose file opens would block the thread every connection shares. Only
+/// positional reads of the held descriptors remain, through the `Io` each
+/// `serve` call is given.
+///
+/// What is served is what existed when `open` walked the tree: a file added
+/// later is a 404 until the next snapshot, and one replaced by a rename keeps
+/// serving the old inode. Symlinks and every other non-regular entry are
+/// absent (404) rather than refused (`Handler` answers 403 for a symlink).
+/// Otherwise the answers are `Handler.serve`'s -- the same sanitizer, the same
+/// open checks (`openWithinRoot` per file), the same `sendFile` -- which a
+/// test holds side by side over one tree.
+///
+/// Precompressed variants: when `app.js.br` / `.zst` / `.gz` exist next to
+/// `app.js`, a request for `app.js` whose `Accept-Encoding` prefers one of
+/// them over identity gets its bytes with `Content-Encoding`, `app.js`'s
+/// `Content-Type` and the variant's own `ETag`; every answer for a file that
+/// has variants carries `Vary: Accept-Encoding`. No `Accept-Encoding` is
+/// identity. The variants stay reachable under their own names too.
+pub const Snapshot = struct {
+    gpa: std.mem.Allocator,
+    options: SnapshotOptions,
+    /// Path bytes of every entry.
+    arena: std.heap.ArenaAllocator,
+    files: std.ArrayListUnmanaged(Opened) = .empty,
+    /// Per file: its precompressed siblings' ids, in `codings` order.
+    variants: std.ArrayListUnmanaged([codings.len]?u32) = .empty,
+    /// Sanitized root-relative path ("" is the root) → file id, or a
+    /// directory and its index file's id.
+    paths: std.StringHashMapUnmanaged(Node) = .empty,
+
+    const Node = union(enum) { file: u32, dir: ?u32 };
+
+    const Coding = struct { token: []const u8, suffix: []const u8 };
+    const codings = [_]Coding{
+        .{ .token = "br", .suffix = ".br" },
+        .{ .token = "zstd", .suffix = ".zst" },
+        .{ .token = "gzip", .suffix = ".gz" },
+    };
+
+    /// Walk `root` and open every regular file under it. `root` must be
+    /// opened with `.iterate = true`; the caller keeps it, and the snapshot
+    /// never touches it again once this returns.
+    pub fn open(gpa: std.mem.Allocator, io: Io, root: Dir, opts: SnapshotOptions) SnapshotError!Snapshot {
+        if (opts.serve.follow_symlinks or opts.serve.directory_listing) return error.Unsupported;
+        var s: Snapshot = .{ .gpa = gpa, .options = opts, .arena = .init(gpa) };
+        errdefer s.deinit(io);
+        try s.paths.put(gpa, "", .{ .dir = null });
+        try s.walk(io, root, root, "", 0);
+
+        // Directories find their index, files their variants.
+        const index = opts.serve.index;
+        var it = s.paths.iterator();
+        while (it.next()) |e| switch (e.value_ptr.*) {
+            .dir => |*idx| if (index.len != 0) {
+                const key = try s.join(e.key_ptr.*, index);
+                if (s.paths.get(key)) |n| switch (n) {
+                    .file => |id| idx.* = id,
+                    .dir => {},
+                };
+            },
+            .file => |id| {
+                const enabled = [codings.len]bool{ opts.precompressed.br, opts.precompressed.zstd, opts.precompressed.gzip };
+                for (codings, enabled, 0..) |c, on, i| {
+                    if (!on) continue;
+                    const key = try std.mem.concat(s.arena.allocator(), u8, &.{ e.key_ptr.*, c.suffix });
+                    if (s.paths.get(key)) |n| switch (n) {
+                        .file => |vid| s.variants.items[id][i] = vid,
+                        .dir => {},
+                    };
+                }
+            },
+        };
+        return s;
+    }
+
+    pub fn deinit(s: *Snapshot, io: Io) void {
+        for (s.files.items) |*o| o.close(io);
+        s.files.deinit(s.gpa);
+        s.variants.deinit(s.gpa);
+        s.paths.deinit(s.gpa);
+        s.arena.deinit();
+    }
+
+    /// How many regular files the snapshot holds.
+    pub fn count(s: *const Snapshot) usize {
+        return s.files.items.len;
+    }
+
+    fn join(s: *Snapshot, dir: []const u8, name: []const u8) error{OutOfMemory}![]const u8 {
+        if (dir.len == 0) return s.arena.allocator().dupe(u8, name);
+        return std.mem.concat(s.arena.allocator(), u8, &.{ dir, "/", name });
+    }
+
+    fn walk(s: *Snapshot, io: Io, root: Dir, dir: Dir, prefix: []const u8, depth: usize) SnapshotError!void {
+        var it = dir.iterate();
+        while (it.next(io) catch return error.IoError) |entry| {
+            if (!s.options.serve.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
+            switch (entry.kind) {
+                .file => {
+                    if (s.files.items.len == s.options.max_files) return error.TooManyFiles;
+                    const rel = try s.join(prefix, entry.name);
+                    // The per-request open, once: component by component,
+                    // no symlink, a regular file or nothing.
+                    const opened = openWithinRoot(root, io, rel, s.options.serve) catch |e| switch (e) {
+                        error.NotFound, error.Forbidden, error.IsDir => continue, // changed under the walk
+                        error.IoError => return error.IoError,
+                    };
+                    const id: u32 = @intCast(s.files.items.len);
+                    s.files.append(s.gpa, opened) catch |e| {
+                        var o = opened;
+                        o.close(io);
+                        return e;
+                    };
+                    try s.variants.append(s.gpa, @splat(null));
+                    try s.paths.put(s.gpa, rel, .{ .file = id });
+                },
+                .directory => {
+                    if (depth + 1 > s.options.max_depth) return error.TooDeep;
+                    var sub = dir.openDir(io, entry.name, .{ .follow_symlinks = false, .iterate = true }) catch |e| switch (e) {
+                        error.FileNotFound, error.NotDir, error.SymLinkLoop => continue, // changed under the walk
+                        else => return error.IoError,
+                    };
+                    defer sub.close(io);
+                    const rel = try s.join(prefix, entry.name);
+                    try s.paths.put(s.gpa, rel, .{ .dir = null });
+                    try s.walk(io, root, sub, rel, depth + 1);
+                },
+                else => {}, // symlinks, sockets, devices: never served
+            }
+        }
+    }
+
+    /// Answer `req` for `raw_path` -- the part of the request path below
+    /// wherever the snapshot is mounted (the whole `req.path` when it serves
+    /// the site root) -- reading file bytes through `io`. Same status mapping
+    /// and never-panics contract as `Handler.serve`; directory redirects use
+    /// `req.path`, so they stay right under a mount.
+    pub fn serve(s: *const Snapshot, io: Io, req: *http.Server.Request, rw: *http.Server.ResponseWriter, raw_path: []const u8) Writer.Error!void {
+        if (req.method != .get and req.method != .head) {
+            rw.setStatus(405);
+            rw.setHeader("Allow", "GET, HEAD") catch {};
+            return;
+        }
+        var buf: [max_path_bytes]u8 = undefined;
+        const rel = sanitizePath(raw_path, &buf, .{ .allow_dotfiles = s.options.serve.serve_dotfiles }) catch |e| switch (e) {
+            error.Traversal, error.DotfileForbidden, error.InvalidByte => return sendStatus(rw, 403),
+            error.Malformed => return sendStatus(rw, 400),
+            error.TooLong => return sendStatus(rw, 414),
+        };
+        const node = s.paths.get(rel) orelse return sendStatus(rw, 404);
+        const id = switch (node) {
+            .file => |id| id,
+            .dir => |index| blk: {
+                if (s.options.serve.redirect_to_trailing_slash and
+                    (req.path.len == 0 or req.path[req.path.len - 1] != '/'))
+                    return redirectTrailingSlash(req, rw);
+                break :blk index orelse return sendStatus(rw, 403);
+            },
+        };
+        const h: Handler = .init(io, undefined, s.options.serve);
+        const vars = s.variants.items[id];
+        var any = false;
+        for (vars) |v| any = any or v != null;
+        if (any) {
+            // A cache that is not told serves one client's coding to another.
+            rw.setHeader("Vary", "Accept-Encoding") catch return failUnsafeResponse(rw);
+            if (pickVariant(req, vars)) |c| {
+                var o = s.files.items[vars[c].?];
+                o.setMimeName(s.files.items[id].mimeName());
+                rw.setHeader("Content-Encoding", codings[c].token) catch return failUnsafeResponse(rw);
+                return h.sendFile(req, rw, &o);
+            }
+        }
+        var o = s.files.items[id];
+        return h.sendFile(req, rw, &o);
+    }
+
+    /// The `codings` index of the variant this request prefers to identity,
+    /// or null. No `Accept-Encoding` is identity: a client that said nothing
+    /// gets the bytes every client can read.
+    fn pickVariant(req: *const http.Server.Request, vars: [codings.len]?u32) ?usize {
+        const ae = req.header("accept-encoding") orelse return null;
+        var offers: [codings.len][]const u8 = undefined;
+        var which: [codings.len]usize = undefined;
+        var n: usize = 0;
+        for (codings, vars, 0..) |c, v, i| if (v != null) {
+            offers[n] = c.token;
+            which[n] = i;
+            n += 1;
+        };
+        const best = http.conneg.negotiateEncoding(ae, offers[0..n]) orelse return null;
+        if (http.conneg.encodingQuality(ae, "identity")) |q| if (q > best.weight) return null;
+        return which[best.index];
+    }
+};
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -2660,4 +2895,226 @@ test "buildETag / setContentLength: the widest possible values still fit" {
     var clen_buf: [20]u8 = undefined;
     const n = try std.fmt.bufPrint(&clen_buf, "{d}", .{@as(u64, std.math.maxInt(u64))});
     try std.testing.expectEqualStrings("18446744073709551615", n);
+}
+
+// ── Snapshot tests ──────────────────────────────────────────────────────────
+
+/// What a test's request is served by: a snapshot mounted at `prefix`.
+const SnapshotCtx = struct {
+    snap: *const Snapshot,
+    prefix: []const u8 = "",
+
+    fn handler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+        const c: *const SnapshotCtx = @ptrCast(@alignCast(req.context.?));
+        const rest = if (mem.startsWith(u8, req.path, c.prefix)) req.path[c.prefix.len..] else return error.NotMounted;
+        return c.snap.serve(testing.io, req, rw, rest);
+    }
+};
+
+fn runSnapshot(ctx: *const SnapshotCtx, wire: []const u8, out_buf: []u8) []const u8 {
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{
+        .handler = SnapshotCtx.handler,
+        .context = @constCast(ctx),
+        .server_name = "test",
+    }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+fn snapGet(ctx: *const SnapshotCtx, path: []const u8, extra: []const u8, out_buf: []u8) []const u8 {
+    var wire_buf: [1024]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\n{s}Connection: close\r\n\r\n", .{ path, extra }) catch unreachable;
+    return runSnapshot(ctx, wire, out_buf);
+}
+
+fn bodyOf(resp: []const u8) []const u8 {
+    const at = mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+    return resp[at + 4 ..];
+}
+
+fn headerOf(resp: []const u8, name: []const u8) ?[]const u8 {
+    const end = mem.indexOf(u8, resp, "\r\n\r\n") orelse return null;
+    var lines = mem.splitSequence(u8, resp[0..end], "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return mem.trim(u8, line[colon + 1 ..], " ");
+    }
+    return null;
+}
+
+test "Snapshot: every path answers as Handler does, except a symlink is absent rather than refused" {
+    var f = try Fixture.init();
+    defer f.deinit();
+    var h = Handler.init(testing.io, f.root, .{});
+    var snap = try Snapshot.open(testing.allocator, testing.io, f.root, .{});
+    defer snap.deinit(testing.io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+
+    // `symlink`: Handler refuses (403), the snapshot has no such entry --
+    // `snap` is what it answers instead (404, or 301 for a directory whose
+    // index is a symlink: to the snapshot a directory with no index).
+    const Case = struct { path: []const u8, symlink: bool = false, snap: u16 = 404 };
+    const corpus = [_]Case{
+        .{ .path = "/" },                           .{ .path = "/index.html" },
+        .{ .path = "/hello.txt" },                  .{ .path = "/sub/dir/file.txt" },
+        .{ .path = "/sub" },                        .{ .path = "/sub/" },
+        .{ .path = "/sub/dir" },                    .{ .path = "/sub/dir/" },
+        .{ .path = "/missing.txt" },                .{ .path = "/sub/missing/x" },
+        .{ .path = "/.env" },                       .{ .path = "/sub/.hidden" },
+        .{ .path = "/../secret.txt" },              .{ .path = "/..%2fsecret.txt" },
+        .{ .path = "/%2e%2e/secret.txt" },          .{ .path = "/sub/../../secret.txt" },
+        .{ .path = "/foo%00.txt" },                 .{ .path = "/..\\..\\secret.txt" },
+        .{ .path = "/%zz" },                        .{ .path = "/hello.txt?x=1" },
+        .{ .path = "/symidx/" },                    .{ .path = "/symidx", .symlink = true, .snap = 301 },
+        .{ .path = "/escape", .symlink = true },    .{ .path = "/inside_link", .symlink = true },
+        .{ .path = "/linkdir/", .symlink = true },  .{ .path = "/linkdir/loot.txt", .symlink = true },
+        .{ .path = "/linklist/", .symlink = true },
+    };
+    for (corpus) |c| {
+        var a_buf: [4096]u8 = undefined;
+        var b_buf: [4096]u8 = undefined;
+        const a = get(&h, c.path, &a_buf);
+        const b = snapGet(&ctx, c.path, "", &b_buf);
+        errdefer std.debug.print("{s}: Handler {d}, Snapshot {d}\n", .{ c.path, statusOf(a), statusOf(b) });
+        try testing.expect(mem.indexOf(u8, b, "SECRET") == null and mem.indexOf(u8, b, "LEAK") == null);
+        if (c.symlink) {
+            try testing.expectEqual(@as(u16, 403), statusOf(a));
+            try testing.expectEqual(c.snap, statusOf(b));
+            continue;
+        }
+        try testing.expectEqual(statusOf(a), statusOf(b));
+        try testing.expectEqualStrings(bodyOf(a), bodyOf(b));
+        if (headerOf(a, "location")) |loc| try testing.expectEqualStrings(loc, headerOf(b, "location").?);
+        if (headerOf(a, "etag")) |tag| try testing.expectEqualStrings(tag, headerOf(b, "etag").?);
+    }
+    // The fixture's three regular files outside dotfiles and symlinks.
+    try testing.expectEqual(@as(usize, 3), snap.count());
+}
+
+test "Snapshot: precompressed siblings -- the client's preference over identity, Vary on every answer, Range and 304 on the variant" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "app.js", .data = "console.log(1)" });
+    try root.writeFile(io, .{ .sub_path = "app.js.gz", .data = "GZ-BYTES" });
+    try root.writeFile(io, .{ .sub_path = "app.js.br", .data = "BR-BYTES!" });
+    try root.writeFile(io, .{ .sub_path = "plain.txt", .data = "plain" });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap.deinit(io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+
+    const Case = struct { ae: []const u8, body: []const u8, ce: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .ae = "", .body = "console.log(1)", .ce = null }, // no header: identity
+        .{ .ae = "Accept-Encoding: gzip\r\n", .body = "GZ-BYTES", .ce = "gzip" },
+        .{ .ae = "Accept-Encoding: gzip, br\r\n", .body = "BR-BYTES!", .ce = "br" }, // tie → server preference
+        .{ .ae = "Accept-Encoding: br;q=0.5, gzip\r\n", .body = "GZ-BYTES", .ce = "gzip" },
+        .{ .ae = "Accept-Encoding: gzip;q=0.1\r\n", .body = "console.log(1)", .ce = null }, // identity implicit at q=1
+        .{ .ae = "Accept-Encoding: zstd\r\n", .body = "console.log(1)", .ce = null }, // no such sibling
+        .{ .ae = "Accept-Encoding: *\r\n", .body = "BR-BYTES!", .ce = "br" },
+    };
+    for (cases) |c| {
+        var buf: [4096]u8 = undefined;
+        const r = snapGet(&ctx, "/app.js", c.ae, &buf);
+        errdefer std.debug.print("{s}-> {s}\n", .{ c.ae, r });
+        try testing.expectEqual(@as(u16, 200), statusOf(r));
+        try testing.expectEqualStrings(c.body, bodyOf(r));
+        try testing.expectEqualStrings("Accept-Encoding", headerOf(r, "vary").?);
+        try testing.expectEqualStrings("text/javascript; charset=utf-8", headerOf(r, "content-type").?);
+        if (c.ce) |ce| try testing.expectEqualStrings(ce, headerOf(r, "content-encoding").?) else try testing.expect(headerOf(r, "content-encoding") == null);
+    }
+
+    // The variant's own validator, and a range over its bytes.
+    var b1: [4096]u8 = undefined;
+    const gz = snapGet(&ctx, "/app.js", "Accept-Encoding: gzip\r\n", &b1);
+    var b0: [4096]u8 = undefined;
+    const plain_js = snapGet(&ctx, "/app.js", "", &b0);
+    try testing.expect(!mem.eql(u8, headerOf(gz, "etag").?, headerOf(plain_js, "etag").?));
+    var inm_buf: [256]u8 = undefined;
+    const inm = try std.fmt.bufPrint(&inm_buf, "Accept-Encoding: gzip\r\nIf-None-Match: {s}\r\n", .{headerOf(gz, "etag").?});
+    var b2: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 304), statusOf(snapGet(&ctx, "/app.js", inm, &b2)));
+    var b3: [4096]u8 = undefined;
+    const part = snapGet(&ctx, "/app.js", "Accept-Encoding: gzip\r\nRange: bytes=0-1\r\n", &b3);
+    try testing.expectEqual(@as(u16, 206), statusOf(part));
+    try testing.expectEqualStrings("GZ", bodyOf(part));
+
+    // A file with no siblings says nothing about encodings; a sibling is a
+    // file of its own under its own name.
+    var b4: [4096]u8 = undefined;
+    const plain = snapGet(&ctx, "/plain.txt", "Accept-Encoding: gzip\r\n", &b4);
+    try testing.expect(headerOf(plain, "vary") == null);
+    var b5: [4096]u8 = undefined;
+    const raw = snapGet(&ctx, "/app.js.gz", "Accept-Encoding: gzip\r\n", &b5);
+    try testing.expectEqualStrings("application/gzip", headerOf(raw, "content-type").?);
+    try testing.expect(headerOf(raw, "content-encoding") == null);
+
+    // Switched off: identity only, no Vary.
+    var snap_off = try Snapshot.open(testing.allocator, io, root, .{ .precompressed = .{ .br = false, .zstd = false, .gzip = false } });
+    defer snap_off.deinit(io);
+    const ctx_off: SnapshotCtx = .{ .snap = &snap_off };
+    var b6: [4096]u8 = undefined;
+    const off = snapGet(&ctx_off, "/app.js", "Accept-Encoding: gzip, br\r\n", &b6);
+    try testing.expectEqualStrings("console.log(1)", bodyOf(off));
+    try testing.expect(headerOf(off, "vary") == null);
+}
+
+test "Snapshot: what exists at open is what is served; mounted, a redirect keeps the mount" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "A" });
+    _ = try root.createDirPathOpen(io, "docs", .{});
+    try root.writeFile(io, .{ .sub_path = "docs/index.html", .data = "DOCS" });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap.deinit(io);
+    try root.writeFile(io, .{ .sub_path = "late.txt", .data = "LATE" });
+
+    const ctx: SnapshotCtx = .{ .snap = &snap, .prefix = "/assets" };
+    var b1: [4096]u8 = undefined;
+    try testing.expectEqualStrings("A", bodyOf(snapGet(&ctx, "/assets/a.txt", "", &b1)));
+    var b2: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 404), statusOf(snapGet(&ctx, "/assets/late.txt", "", &b2)));
+    var b3: [4096]u8 = undefined;
+    const redirect = snapGet(&ctx, "/assets/docs?v=1", "", &b3);
+    try testing.expectEqual(@as(u16, 301), statusOf(redirect));
+    try testing.expectEqualStrings("/assets/docs/?v=1", headerOf(redirect, "location").?);
+    var b4: [4096]u8 = undefined;
+    try testing.expectEqualStrings("DOCS", bodyOf(snapGet(&ctx, "/assets/docs/", "", &b4)));
+    var b5: [4096]u8 = undefined;
+    const post = runSnapshot(&ctx, "POST /assets/a.txt HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", &b5);
+    try testing.expectEqual(@as(u16, 405), statusOf(post));
+}
+
+test "Snapshot.open refuses what it would not serve right: symlink following, listings, too many files, too deep" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "A" });
+    try root.writeFile(io, .{ .sub_path = "b.txt", .data = "B" });
+    _ = try root.createDirPathOpen(io, "x/y", .{});
+    const gpa = testing.allocator;
+    try testing.expectError(error.Unsupported, Snapshot.open(gpa, io, root, .{ .serve = .{ .follow_symlinks = true } }));
+    try testing.expectError(error.Unsupported, Snapshot.open(gpa, io, root, .{ .serve = .{ .directory_listing = true } }));
+    try testing.expectError(error.TooManyFiles, Snapshot.open(gpa, io, root, .{ .max_files = 1 }));
+    try testing.expectError(error.TooDeep, Snapshot.open(gpa, io, root, .{ .max_depth = 1 }));
+    var ok = try Snapshot.open(gpa, io, root, .{ .max_files = 2, .max_depth = 2 });
+    ok.deinit(io);
 }

@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **`Snapshot`: a root opened once, served without filesystem calls.** `open` walks
+  the root and opens every regular file through `openWithinRoot`; `serve(io, req, rw, raw_path)` is
+  `sanitizePath` + a table lookup + `sendFile` — no `openat`/`stat`/`getdents` per request, for
+  Landlock-sandboxed processes and io_uring loops (found by qap, plan M11.6). Precompressed siblings
+  (`.br`, `.zst`, `.gz`) served by `Accept-Encoding` with `Content-Encoding` + `Vary`. Symlinks are
+  absent (404) rather than refused; no listing; `max_files`/`max_depth` bounds. Tested side by side
+  with `Handler` over the fixture tree. `Handler` is unchanged.
 - **2026-09-11** — A1 fix campaign round 2, F5/F13/F17. BEHAVIOURAL (all three).
   - **F5 (round-2 Q8):** `ETag` is now **weak** (`W/` prefix) by default —
     `Options.strong_etag = true` reverts to the pre-fix strong form. `mtime`'s one-second
