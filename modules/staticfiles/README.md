@@ -108,6 +108,19 @@ allowed or would block. Serves `name.br` / `name.zst` / `name.gz` in place of `n
 client prefers them (with `Content-Encoding` and `Vary`). See SPEC §3.6 for what differs from
 `Handler` (symlinks absent, no listing, no files added after `open`).
 
+## Live — follow the directory while serving
+
+```zig
+var live = try staticfiles.Live.open(gpa, io, root_dir, .{ .rescan_ms = 2000 });
+defer live.deinit(io);
+try live.start(blocking_io);          // a rescan thread; or call live.reload(io) yourself
+try live.serve(io, req, rw, rest);    // per request: a held generation, no filesystem call
+```
+
+A rescan stats every file (no open) and reopens + rehashes only what moved; unchanged files keep
+their descriptor and their content tag (a strong `ETag` from SHA-256). A download that started
+before an edit finishes with the bytes it started with. Replace files by rename, not in place.
+
 ## Options
 
 | Field | Default | Meaning |

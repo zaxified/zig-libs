@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **`Live`: a snapshot that follows its directory; content tags.** `Live.reload` /
+  `start` (a rescan thread) publish a new generation when a file is edited, added or removed:
+  unchanged files (same inode, size, mtime) hand their descriptor on, changed ones are reopened and
+  rehashed off the request path; requests hold their generation for the whole answer (two reader
+  counters + a per-generation hold count; retired generations freed unheld and oldest first).
+  `SnapshotOptions.fingerprint` (default **on**): a strong `ETag` from the file's SHA-256 instead of
+  size+mtime — `If-Range` now resumes; `Snapshot.open` reads every file once. New
+  `Handler.sendFileTagged`. Found by qap (static files changeable at runtime, plan M11.6).
 - **2026-09-27** — **`Snapshot`: a root opened once, served without filesystem calls.** `open` walks
   the root and opens every regular file through `openWithinRoot`; `serve(io, req, rw, raw_path)` is
   `sanitizePath` + a table lookup + `sendFile` — no `openat`/`stat`/`getdents` per request, for

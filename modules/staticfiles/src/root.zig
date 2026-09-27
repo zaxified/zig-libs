@@ -679,6 +679,15 @@ pub const Handler = struct {
     /// responsibility — this only covers what happens after a resolve
     /// already succeeded.
     pub fn sendFile(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, opened: *Opened) Writer.Error!void {
+        return h.sendFileTagged(req, rw, opened, null);
+    }
+
+    /// `sendFile` with the entity tag given rather than derived from size
+    /// and mtime -- a content hash, say, which is a STRONG validator in the
+    /// full RFC 9110 §8.8.1 sense (it changes exactly when the bytes do), so
+    /// it may authorize `If-Range`. `etag` includes its quotes (and `W/` if
+    /// weak); null is `sendFile`'s own tag.
+    pub fn sendFileTagged(h: *const Handler, req: *http.Server.Request, rw: *http.Server.ResponseWriter, opened: *Opened, etag_in: ?[]const u8) Writer.Error!void {
         const total = opened.stat.size;
         const mtime_s = opened.stat.mtime.toSeconds();
         // Locals, not thread-locals: setHeader copies the bytes into its own
@@ -686,7 +695,7 @@ pub const Handler = struct {
         // below, not the response.
         var etag_buf: [etag_max]u8 = undefined;
         var lastmod_buf: [http.Server.http_date_len]u8 = undefined;
-        const etag = buildETag(&etag_buf, total, mtime_s, !h.options.strong_etag);
+        const etag = etag_in orelse buildETag(&etag_buf, total, mtime_s, !h.options.strong_etag);
 
         // Validators first, so a 304/412 short-circuit carries ETag +
         // Last-Modified + Cache-Control (and nothing representation-specific).
@@ -1117,6 +1126,14 @@ pub const SnapshotOptions = struct {
     max_files: usize = 4096,
     /// Deepest directory nesting walked; deeper is `error.TooDeep`.
     max_depth: usize = 32,
+    /// Tag every file by its content: SHA-256 of its bytes, read once when
+    /// the file enters the snapshot, as a STRONG `ETag` (`"` + the first 128
+    /// bits in hex + `"`). A content tag changes exactly when the bytes do --
+    /// a same-second, same-size edit included, the case `Options.strong_etag`
+    /// warns about -- so it may authorize `If-Range` and resumed downloads
+    /// work; a rewrite with the same bytes keeps its tag. Off: `Handler`'s
+    /// size+mtime tag. `Live` compares generations by it either way.
+    fingerprint: bool = true,
 };
 
 pub const SnapshotError = error{
@@ -1128,6 +1145,9 @@ pub const SnapshotError = error{
     OutOfMemory,
 };
 
+/// A content tag: `"` + 32 hex digits + `"`.
+const tag_len = 34;
+
 /// A root directory opened once -- every regular file under it, stat'ed and
 /// held open -- and served from memory afterwards: **no `openat`, `stat` or
 /// `getdents` per request.** For where those cannot run: a process that
@@ -1135,7 +1155,8 @@ pub const SnapshotError = error{
 /// open, even one relative to a directory opened before), or an event loop
 /// whose file opens would block the thread every connection shares. Only
 /// positional reads of the held descriptors remain, through the `Io` each
-/// `serve` call is given.
+/// `serve` call is given. For a tree that changes while it is served, see
+/// `Live`.
 ///
 /// What is served is what existed when `open` walked the tree: a file added
 /// later is a 404 until the next snapshot, and one replaced by a rename keeps
@@ -1157,11 +1178,22 @@ pub const Snapshot = struct {
     /// Path bytes of every entry.
     arena: std.heap.ArenaAllocator,
     files: std.ArrayListUnmanaged(Opened) = .empty,
+    /// Per file: its content tag, with `fingerprint`.
+    tags: std.ArrayListUnmanaged([tag_len]u8) = .empty,
+    /// Per file: whether this snapshot closes it. A `Live` generation hands
+    /// an unchanged file's descriptor on to the next one instead of reopening
+    /// it; the one that holds it last closes it.
+    owned: std.ArrayListUnmanaged(bool) = .empty,
+    /// Per file: its id in the snapshot it was taken over from -- so a build
+    /// that fails half-way can hand every descriptor back.
+    reused: std.ArrayListUnmanaged(?u32) = .empty,
     /// Per file: its precompressed siblings' ids, in `codings` order.
     variants: std.ArrayListUnmanaged([codings.len]?u32) = .empty,
     /// Sanitized root-relative path ("" is the root) → file id, or a
     /// directory and its index file's id.
     paths: std.StringHashMapUnmanaged(Node) = .empty,
+    /// Files opened (and hashed) by this build rather than taken over.
+    fresh: usize = 0,
 
     const Node = union(enum) { file: u32, dir: ?u32 };
 
@@ -1176,11 +1208,18 @@ pub const Snapshot = struct {
     /// opened with `.iterate = true`; the caller keeps it, and the snapshot
     /// never touches it again once this returns.
     pub fn open(gpa: std.mem.Allocator, io: Io, root: Dir, opts: SnapshotOptions) SnapshotError!Snapshot {
+        return build(gpa, io, root, opts, null);
+    }
+
+    /// `open`, taking over from `prev` every file whose `stat` (inode, size,
+    /// mtime) is unchanged: its descriptor, stat and tag, with no open and no
+    /// read. On failure every taken-over descriptor is handed back to `prev`.
+    fn build(gpa: std.mem.Allocator, io: Io, root: Dir, opts: SnapshotOptions, prev: ?*Snapshot) SnapshotError!Snapshot {
         if (opts.serve.follow_symlinks or opts.serve.directory_listing) return error.Unsupported;
         var s: Snapshot = .{ .gpa = gpa, .options = opts, .arena = .init(gpa) };
-        errdefer s.deinit(io);
+        errdefer s.abandon(io, prev);
         try s.paths.put(gpa, "", .{ .dir = null });
-        try s.walk(io, root, root, "", 0);
+        try s.walk(io, root, root, "", 0, prev);
 
         // Directories find their index, files their variants.
         const index = opts.serve.index;
@@ -1209,11 +1248,24 @@ pub const Snapshot = struct {
     }
 
     pub fn deinit(s: *Snapshot, io: Io) void {
-        for (s.files.items) |*o| o.close(io);
+        for (s.files.items, s.owned.items) |*o, own| if (own) o.close(io);
         s.files.deinit(s.gpa);
+        s.tags.deinit(s.gpa);
+        s.owned.deinit(s.gpa);
+        s.reused.deinit(s.gpa);
         s.variants.deinit(s.gpa);
         s.paths.deinit(s.gpa);
         s.arena.deinit();
+    }
+
+    /// A failed or unwanted build: descriptors taken over go back to `prev`,
+    /// the ones this build opened are closed.
+    fn abandon(s: *Snapshot, io: Io, prev: ?*Snapshot) void {
+        if (prev) |p| for (s.reused.items, 0..) |r, id| if (r) |pid| {
+            p.owned.items[pid] = true;
+            s.owned.items[id] = false;
+        };
+        s.deinit(io);
     }
 
     /// How many regular files the snapshot holds.
@@ -1221,12 +1273,44 @@ pub const Snapshot = struct {
         return s.files.items.len;
     }
 
+    /// Whether `s` serves exactly what `prev` did: every file taken over
+    /// unchanged, and the same directories.
+    fn sameAs(s: *const Snapshot, prev: *const Snapshot) bool {
+        if (s.fresh != 0 or s.files.items.len != prev.files.items.len or s.paths.count() != prev.paths.count()) return false;
+        var it = s.paths.iterator();
+        while (it.next()) |e| {
+            const p = prev.paths.get(e.key_ptr.*) orelse return false;
+            if (std.meta.activeTag(p) != std.meta.activeTag(e.value_ptr.*)) return false;
+        }
+        return true;
+    }
+
     fn join(s: *Snapshot, dir: []const u8, name: []const u8) error{OutOfMemory}![]const u8 {
         if (dir.len == 0) return s.arena.allocator().dupe(u8, name);
         return std.mem.concat(s.arena.allocator(), u8, &.{ dir, "/", name });
     }
 
-    fn walk(s: *Snapshot, io: Io, root: Dir, dir: Dir, prefix: []const u8, depth: usize) SnapshotError!void {
+    fn sameStat(a: File.Stat, b: File.Stat) bool {
+        return a.inode == b.inode and a.size == b.size and std.meta.eql(a.mtime, b.mtime);
+    }
+
+    fn add(s: *Snapshot, rel: []const u8, opened: Opened, tag: [tag_len]u8, from: ?u32) SnapshotError!void {
+        const id: u32 = @intCast(s.files.items.len);
+        try s.files.ensureUnusedCapacity(s.gpa, 1);
+        try s.tags.ensureUnusedCapacity(s.gpa, 1);
+        try s.owned.ensureUnusedCapacity(s.gpa, 1);
+        try s.reused.ensureUnusedCapacity(s.gpa, 1);
+        try s.variants.ensureUnusedCapacity(s.gpa, 1);
+        try s.paths.ensureUnusedCapacity(s.gpa, 1);
+        s.files.appendAssumeCapacity(opened);
+        s.tags.appendAssumeCapacity(tag);
+        s.owned.appendAssumeCapacity(true);
+        s.reused.appendAssumeCapacity(from);
+        s.variants.appendAssumeCapacity(@splat(null));
+        s.paths.putAssumeCapacity(rel, .{ .file = id });
+    }
+
+    fn walk(s: *Snapshot, io: Io, root: Dir, dir: Dir, prefix: []const u8, depth: usize, prev: ?*Snapshot) SnapshotError!void {
         var it = dir.iterate();
         while (it.next(io) catch return error.IoError) |entry| {
             if (!s.options.serve.serve_dotfiles and entry.name.len != 0 and entry.name[0] == '.') continue;
@@ -1234,20 +1318,36 @@ pub const Snapshot = struct {
                 .file => {
                     if (s.files.items.len == s.options.max_files) return error.TooManyFiles;
                     const rel = try s.join(prefix, entry.name);
+                    // Unchanged since `prev`: take its descriptor over --
+                    // one `fstatat`, no open, no read.
+                    if (prev) |p| if (p.paths.get(rel)) |n| switch (n) {
+                        .file => |pid| if (p.owned.items[pid]) {
+                            if (dir.statFile(io, entry.name, .{ .follow_symlinks = false })) |st| {
+                                if (sameStat(st, p.files.items[pid].stat)) {
+                                    try s.add(rel, p.files.items[pid], p.tags.items[pid], pid);
+                                    p.owned.items[pid] = false;
+                                    continue;
+                                }
+                            } else |_| {}
+                        },
+                        .dir => {},
+                    };
                     // The per-request open, once: component by component,
                     // no symlink, a regular file or nothing.
-                    const opened = openWithinRoot(root, io, rel, s.options.serve) catch |e| switch (e) {
+                    var opened = openWithinRoot(root, io, rel, s.options.serve) catch |e| switch (e) {
                         error.NotFound, error.Forbidden, error.IsDir => continue, // changed under the walk
                         error.IoError => return error.IoError,
                     };
-                    const id: u32 = @intCast(s.files.items.len);
-                    s.files.append(s.gpa, opened) catch |e| {
-                        var o = opened;
-                        o.close(io);
+                    var tag: [tag_len]u8 = @splat(0);
+                    if (s.options.fingerprint) contentTag(io, opened.file, &tag) catch {
+                        opened.close(io);
+                        return error.IoError;
+                    };
+                    s.add(rel, opened, tag, null) catch |e| {
+                        opened.close(io);
                         return e;
                     };
-                    try s.variants.append(s.gpa, @splat(null));
-                    try s.paths.put(s.gpa, rel, .{ .file = id });
+                    s.fresh += 1;
                 },
                 .directory => {
                     if (depth + 1 > s.options.max_depth) return error.TooDeep;
@@ -1258,11 +1358,29 @@ pub const Snapshot = struct {
                     defer sub.close(io);
                     const rel = try s.join(prefix, entry.name);
                     try s.paths.put(s.gpa, rel, .{ .dir = null });
-                    try s.walk(io, root, sub, rel, depth + 1);
+                    try s.walk(io, root, sub, rel, depth + 1, prev);
                 },
                 else => {}, // symlinks, sockets, devices: never served
             }
         }
+    }
+
+    /// SHA-256 of the whole file, as `"` + the first 128 bits in hex + `"`.
+    fn contentTag(io: Io, file: File, out: *[tag_len]u8) !void {
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        var buf: [64 * 1024]u8 = undefined;
+        var off: u64 = 0;
+        while (true) {
+            const n = try file.readPositionalAll(io, &buf, off);
+            if (n == 0) break;
+            h.update(buf[0..n]);
+            off += n;
+            if (n < buf.len) break;
+        }
+        const digest = h.finalResult();
+        out[0] = '"';
+        _ = std.fmt.bufPrint(out[1 .. tag_len - 1], "{x}", .{digest[0..16]}) catch unreachable;
+        out[tag_len - 1] = '"';
     }
 
     /// Answer `req` for `raw_path` -- the part of the request path below
@@ -1300,14 +1418,19 @@ pub const Snapshot = struct {
             // A cache that is not told serves one client's coding to another.
             rw.setHeader("Vary", "Accept-Encoding") catch return failUnsafeResponse(rw);
             if (pickVariant(req, vars)) |c| {
-                var o = s.files.items[vars[c].?];
+                const vid = vars[c].?;
+                var o = s.files.items[vid];
                 o.setMimeName(s.files.items[id].mimeName());
                 rw.setHeader("Content-Encoding", codings[c].token) catch return failUnsafeResponse(rw);
-                return h.sendFile(req, rw, &o);
+                return h.sendFileTagged(req, rw, &o, s.tagOf(vid));
             }
         }
         var o = s.files.items[id];
-        return h.sendFile(req, rw, &o);
+        return h.sendFileTagged(req, rw, &o, s.tagOf(id));
+    }
+
+    fn tagOf(s: *const Snapshot, id: u32) ?[]const u8 {
+        return if (s.options.fingerprint) &s.tags.items[id] else null;
     }
 
     /// The `codings` index of the variant this request prefers to identity,
@@ -1326,6 +1449,198 @@ pub const Snapshot = struct {
         const best = http.conneg.negotiateEncoding(ae, offers[0..n]) orelse return null;
         if (http.conneg.encodingQuality(ae, "identity")) |q| if (q > best.weight) return null;
         return which[best.index];
+    }
+};
+
+// ── Live: a snapshot that follows its directory ─────────────────────────────
+
+pub const LiveOptions = struct {
+    /// The snapshots' rules. `fingerprint` is forced on: generations are
+    /// compared, and tagged, by content.
+    snapshot: SnapshotOptions = .{},
+    /// How often `start`'s thread rescans the root, in milliseconds. Each
+    /// rescan is one `getdents` per directory and one `fstatat` per file; a
+    /// file whose inode, size or mtime moved is reopened and rehashed.
+    rescan_ms: u32 = 2000,
+};
+
+/// A `Snapshot` that follows its directory while it is served: a rescan --
+/// by `start`'s thread every `rescan_ms`, or an explicit `reload` -- builds a
+/// new generation when anything changed (a file edited, added, removed, a
+/// directory added or removed) and publishes it, and requests move to it at
+/// once. A request never opens, stats or hashes anything: it takes the
+/// current generation, serves from its held descriptors, and lets go.
+///
+/// A generation is built from the previous one, not from scratch: a file
+/// whose `stat` is unchanged hands its descriptor and content tag on as they
+/// are; only what moved is reopened and hashed, off the request path. A
+/// rewrite with the same bytes keeps its tag (the tag is the content's).
+///
+/// Reclamation: a request holds its generation (a counter on it) for the
+/// whole answer, so a download that started before an edit finishes with the
+/// bytes it started with. A retired generation closes its descriptors only
+/// when no request holds it -- and generations are freed oldest first, so a
+/// descriptor handed on from an older one is never closed while that older
+/// one still serves it. Taking a generation is two counters and a pointer
+/// load; the only wait is the publisher's, for requests caught between
+/// reading which counter to use and taking the generation (nanoseconds).
+///
+/// **Replace a served file atomically** -- write it under another name and
+/// rename it over the old one (what `rsync`, `install` and most deploy tools
+/// do). A request reads the descriptor its generation holds, and a rename
+/// leaves that descriptor on the old inode: requests in flight finish the
+/// old bytes, later ones get the new. A rewrite IN PLACE changes the very
+/// inode those descriptors read, so until the next rescan a request may see
+/// the file half-written (and a length that no longer matches) -- the same
+/// as any file server that reads files as it sends them.
+///
+/// The rescan opens files by path after startup: a sandboxed process must
+/// leave the root readable (Landlock: a read rule on it), and its thread
+/// must be one the sandbox covers -- start it after sandboxing.
+pub const Live = struct {
+    gpa: std.mem.Allocator,
+    root: Dir,
+    options: LiveOptions,
+    current: std.atomic.Value(*Gen),
+    /// Which of `readers` a request entering now counts itself in.
+    side: std.atomic.Value(u8) = .init(0),
+    /// Requests between reading `side` and taking a generation.
+    readers: [2]std.atomic.Value(u32) = .{ .init(0), .init(0) },
+    /// Replaced generations, oldest first; freed when unheld, in order.
+    retired: std.ArrayListUnmanaged(*Gen) = .empty,
+    /// Generations published since `open`, the first included.
+    generations: std.atomic.Value(u64) = .init(1),
+    /// Rescans that failed (the current generation stays).
+    failures: std.atomic.Value(u64) = .init(0),
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    pub const Gen = struct {
+        snap: Snapshot,
+        holds: std.atomic.Value(u32) = .init(0),
+    };
+
+    /// Snapshot `root` (opened with `.iterate = true`; the `Live` owns it
+    /// from here and closes it in `deinit`).
+    pub fn open(gpa: std.mem.Allocator, io: Io, root: Dir, opts: LiveOptions) SnapshotError!Live {
+        var o = opts;
+        o.snapshot.fingerprint = true;
+        const g = try gpa.create(Gen);
+        errdefer gpa.destroy(g);
+        g.* = .{ .snap = try Snapshot.open(gpa, io, root, o.snapshot) };
+        return .{ .gpa = gpa, .root = root, .options = o, .current = .init(g) };
+    }
+
+    /// Stop the thread if it runs, then free every generation. No request
+    /// may be in flight.
+    pub fn deinit(l: *Live, io: Io) void {
+        l.stop();
+        for (l.retired.items) |g| l.free(io, g);
+        l.retired.deinit(l.gpa);
+        l.free(io, l.current.raw);
+        l.root.close(io);
+    }
+
+    fn free(l: *Live, io: Io, g: *Gen) void {
+        g.snap.deinit(io);
+        l.gpa.destroy(g);
+    }
+
+    /// The generation requests are served from now. Pair with `release`.
+    pub fn acquire(l: *Live) *Gen {
+        const side = l.side.load(.seq_cst);
+        _ = l.readers[side].fetchAdd(1, .seq_cst);
+        const g = l.current.load(.seq_cst);
+        _ = g.holds.fetchAdd(1, .seq_cst);
+        _ = l.readers[side].fetchSub(1, .seq_cst);
+        return g;
+    }
+
+    pub fn release(_: *Live, g: *Gen) void {
+        _ = g.holds.fetchSub(1, .seq_cst);
+    }
+
+    /// `Snapshot.serve` on the current generation, held for the answer.
+    pub fn serve(l: *Live, io: Io, req: *http.Server.Request, rw: *http.Server.ResponseWriter, raw_path: []const u8) Writer.Error!void {
+        const g = l.acquire();
+        defer l.release(g);
+        return g.snap.serve(io, req, rw, raw_path);
+    }
+
+    /// Rescan now: true when a new generation was published. One caller at
+    /// a time (`start`'s thread, or the owner when it runs none). `io` must
+    /// be one that may block -- this opens, stats and reads files.
+    pub fn reload(l: *Live, io: Io) SnapshotError!bool {
+        defer l.reclaim(io);
+        const prev = l.current.load(.seq_cst);
+        var next = Snapshot.build(l.gpa, io, l.root, l.options.snapshot, &prev.snap) catch |e| {
+            _ = l.failures.fetchAdd(1, .monotonic);
+            return e;
+        };
+        if (next.sameAs(&prev.snap)) {
+            next.abandon(io, &prev.snap);
+            return false;
+        }
+        const g = l.gpa.create(Gen) catch {
+            next.abandon(io, &prev.snap);
+            return error.OutOfMemory;
+        };
+        g.* = .{ .snap = next };
+        l.retired.append(l.gpa, prev) catch {
+            g.snap.abandon(io, &prev.snap);
+            l.gpa.destroy(g);
+            return error.OutOfMemory;
+        };
+        l.publish(g);
+        _ = l.generations.fetchAdd(1, .monotonic);
+        return true;
+    }
+
+    /// Make `g` current. Afterwards no request can take the old generation:
+    /// one that read the old `side` before the flip is waited out here, and
+    /// every later one reads `current` after the swap.
+    fn publish(l: *Live, g: *Gen) void {
+        _ = l.current.swap(g, .seq_cst);
+        const side = l.side.load(.seq_cst);
+        l.side.store(1 - side, .seq_cst);
+        while (l.readers[side].load(.seq_cst) != 0) std.Thread.yield() catch {};
+    }
+
+    /// Free retired generations nobody holds, oldest first, stopping at the
+    /// first still held: a descriptor it handed on may be closed only by the
+    /// generation that holds it last, after every older one is gone.
+    fn reclaim(l: *Live, io: Io) void {
+        var n: usize = 0;
+        while (n < l.retired.items.len and l.retired.items[n].holds.load(.seq_cst) == 0) : (n += 1)
+            l.free(io, l.retired.items[n]);
+        if (n != 0) l.retired.replaceRangeAssumeCapacity(0, n, &.{});
+    }
+
+    /// Rescan every `options.rescan_ms` on a thread of its own, until `stop`.
+    /// `io` must be one a plain thread may block on (`std.Io.Threaded`'s).
+    pub fn start(l: *Live, io: Io) std.Thread.SpawnError!void {
+        std.debug.assert(l.thread == null);
+        l.stopping.store(false, .seq_cst);
+        l.thread = try std.Thread.spawn(.{}, run, .{ l, io });
+    }
+
+    pub fn stop(l: *Live) void {
+        const t = l.thread orelse return;
+        l.stopping.store(true, .seq_cst);
+        t.join();
+        l.thread = null;
+    }
+
+    fn run(l: *Live, io: Io) void {
+        const step_ms: u32 = 50;
+        var waited: u32 = 0;
+        while (!l.stopping.load(.seq_cst)) {
+            io.sleep(.fromMilliseconds(step_ms), .awake) catch {};
+            waited += step_ms;
+            if (waited < l.options.rescan_ms) continue;
+            waited = 0;
+            _ = l.reload(io) catch {};
+        }
     }
 };
 
@@ -2957,7 +3272,8 @@ test "Snapshot: every path answers as Handler does, except a symlink is absent r
     var f = try Fixture.init();
     defer f.deinit();
     var h = Handler.init(testing.io, f.root, .{});
-    var snap = try Snapshot.open(testing.allocator, testing.io, f.root, .{});
+    // Handler's size+mtime tag, to compare tags too; content tags are below.
+    var snap = try Snapshot.open(testing.allocator, testing.io, f.root, .{ .fingerprint = false });
     defer snap.deinit(testing.io);
     const ctx: SnapshotCtx = .{ .snap = &snap };
 
@@ -3172,4 +3488,264 @@ test "Snapshot: redirect_to_trailing_slash = false serves a directory's index at
     const bare = snapGet(&ctx, "/docs", "", &b1);
     try testing.expectEqual(@as(u16, 200), statusOf(bare));
     try testing.expectEqualStrings("DOCS", bodyOf(bare));
+}
+
+// ── fingerprints and Live ────────────────────────────────────────────────────
+
+fn writeTree(root: Dir, files: []const [2][]const u8) !void {
+    for (files) |f| try root.writeFile(testing.io, .{ .sub_path = f[0], .data = f[1] });
+}
+
+test "Snapshot fingerprint: a strong content tag -- same bytes, same tag; If-Range resumes" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "a.txt", "same bytes" }, .{ "b.txt", "same bytes" }, .{ "c.txt", "other bytes" } });
+    var snap = try Snapshot.open(testing.allocator, io, root, .{});
+    defer snap.deinit(io);
+    const ctx: SnapshotCtx = .{ .snap = &snap };
+
+    var ba: [4096]u8 = undefined;
+    var bb: [4096]u8 = undefined;
+    var bc: [4096]u8 = undefined;
+    const ta = headerOf(snapGet(&ctx, "/a.txt", "", &ba), "etag").?;
+    const tb = headerOf(snapGet(&ctx, "/b.txt", "", &bb), "etag").?;
+    const tc = headerOf(snapGet(&ctx, "/c.txt", "", &bc), "etag").?;
+    try testing.expectEqualStrings(ta, tb); // the content's tag, not the file's
+    try testing.expect(!mem.eql(u8, ta, tc));
+    try testing.expectEqual(@as(usize, tag_len), ta.len);
+    try testing.expect(ta[0] == '"'); // strong: no W/
+
+    // A strong tag authorizes If-Range: the range is served, not the whole.
+    var extra: [256]u8 = undefined;
+    const hdrs = try std.fmt.bufPrint(&extra, "Range: bytes=0-3\r\nIf-Range: {s}\r\n", .{ta});
+    var br: [4096]u8 = undefined;
+    const part = snapGet(&ctx, "/a.txt", hdrs, &br);
+    try testing.expectEqual(@as(u16, 206), statusOf(part));
+    try testing.expectEqualStrings("same", bodyOf(part));
+}
+
+/// A request through a `Live` mounted at the root.
+const LiveCtx = struct {
+    live: *Live,
+    fn handler(req: *http.Server.Request, rw: *http.Server.ResponseWriter) anyerror!void {
+        const c: *const LiveCtx = @ptrCast(@alignCast(req.context.?));
+        return c.live.serve(testing.io, req, rw, req.path);
+    }
+};
+
+fn liveGet(live: *Live, path: []const u8, out_buf: []u8) []const u8 {
+    var ctx: LiveCtx = .{ .live = live };
+    var wire_buf: [512]u8 = undefined;
+    const wire = std.fmt.bufPrint(&wire_buf, "GET {s} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", .{path}) catch unreachable;
+    var in: std.Io.Reader = .fixed(wire);
+    var out: std.Io.Writer = .fixed(out_buf);
+    var head_buf: [4096]u8 = undefined;
+    var request_body_buf: [256]u8 = undefined;
+    var response_body_buf: [256]u8 = undefined;
+    var chunk_buf: [512]u8 = undefined;
+    http.Server.serveStream(.{ .handler = LiveCtx.handler, .context = &ctx, .server_name = "test" }, &in, &out, .{
+        .head = &head_buf,
+        .request_body = &request_body_buf,
+        .response_body = &response_body_buf,
+        .chunk = &chunk_buf,
+    });
+    return out.buffered();
+}
+
+fn openLive(tmp: *testing.TmpDir) !Live {
+    const root = try tmp.dir.openDir(testing.io, "root", .{ .iterate = true });
+    return Live.open(testing.allocator, testing.io, root, .{});
+}
+
+/// An mtime the rescan cannot mistake for the old one, whatever the
+/// filesystem's timestamp granularity.
+fn bumpMtime(root: Dir, name: []const u8, secs: i64) !void {
+    const f = try root.openFile(testing.io, name, .{ .mode = .read_write });
+    defer f.close(testing.io);
+    const st = try f.stat(testing.io);
+    const t: Io.Timestamp = .{ .nanoseconds = st.mtime.nanoseconds + @as(i96, secs) * std.time.ns_per_s };
+    try f.setTimestamps(testing.io, .{ .access_timestamp = .{ .new = t }, .modify_timestamp = .{ .new = t } });
+}
+
+test "Live.reload: an edit, a new file, a removal and a new directory are served after the next rescan; nothing changed publishes nothing" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "a.txt", "one" }, .{ "gone.txt", "bye" } });
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("one", bodyOf(liveGet(&live, "/a.txt", &b)));
+    const tag1 = try testing.allocator.dupe(u8, headerOf(liveGet(&live, "/a.txt", &b), "etag").?);
+    defer testing.allocator.free(tag1);
+    try testing.expect(!try live.reload(io)); // nothing moved
+    try testing.expectEqual(@as(u64, 1), live.generations.load(.monotonic));
+
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "two!" });
+    try bumpMtime(root, "a.txt", 5);
+    try root.writeFile(io, .{ .sub_path = "new.txt", .data = "fresh" });
+    try root.deleteFile(io, "gone.txt");
+    _ = try root.createDirPathOpen(io, "docs", .{});
+    try root.writeFile(io, .{ .sub_path = "docs/index.html", .data = "DOCS" });
+    try testing.expect(try live.reload(io));
+    try testing.expectEqual(@as(u64, 2), live.generations.load(.monotonic));
+
+    try testing.expectEqualStrings("two!", bodyOf(liveGet(&live, "/a.txt", &b)));
+    try testing.expect(!mem.eql(u8, tag1, headerOf(liveGet(&live, "/a.txt", &b), "etag").?));
+    try testing.expectEqualStrings("fresh", bodyOf(liveGet(&live, "/new.txt", &b)));
+    try testing.expectEqual(@as(u16, 404), statusOf(liveGet(&live, "/gone.txt", &b)));
+    try testing.expectEqualStrings("DOCS", bodyOf(liveGet(&live, "/docs/", &b)));
+}
+
+test "Live.reload: a rewrite with the same bytes keeps the tag; a held generation keeps its bytes until released" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "version-1" }});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+
+    var b: [4096]u8 = undefined;
+    const tag1 = try testing.allocator.dupe(u8, headerOf(liveGet(&live, "/a.txt", &b), "etag").?);
+    defer testing.allocator.free(tag1);
+    // Same bytes, new mtime (a redeploy of an unchanged file): reopened,
+    // rehashed -- and the same tag, so clients keep their 304s.
+    try root.writeFile(io, .{ .sub_path = "a.txt", .data = "version-1" });
+    try bumpMtime(root, "a.txt", 5);
+    _ = try live.reload(io);
+    try testing.expectEqualStrings(tag1, headerOf(liveGet(&live, "/a.txt", &b), "etag").?);
+
+    // A request in flight across an edit: it holds its generation, and that
+    // generation's descriptor, until it lets go.
+    const held = live.acquire();
+    // Replaced by rename: a new inode, the old one alive only through `held`.
+    try tmp.dir.writeFile(io, .{ .sub_path = "next.txt", .data = "version-2" });
+    try Dir.rename(tmp.dir, "next.txt", root, "a.txt", io);
+    try testing.expect(try live.reload(io));
+    try testing.expectEqualStrings("version-2", bodyOf(liveGet(&live, "/a.txt", &b)));
+    try testing.expectEqual(@as(usize, 1), live.retired.items.len); // held: not freed
+    var ctx: SnapshotCtx = .{ .snap = &held.snap };
+    try testing.expectEqualStrings("version-1", bodyOf(snapGet(&ctx, "/a.txt", "", &b)));
+    live.release(held);
+    _ = try live.reload(io); // nothing new; reclaims
+    try testing.expectEqual(@as(usize, 0), live.retired.items.len);
+}
+
+test "Live: descriptors handed on are closed once, by the last holder, oldest generation first" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "keep.txt", "K" }, .{ "edit.txt", "E1" } });
+    const fds = struct {
+        fn count() !usize {
+            var d = try Dir.cwd().openDir(testing.io, "/proc/self/fd", .{ .iterate = true });
+            defer d.close(testing.io);
+            var n: usize = 0;
+            var it = d.iterate();
+            while (try it.next(testing.io)) |_| n += 1;
+            return n;
+        }
+    };
+    const before = try fds.count();
+    var live = try openLive(&tmp);
+    // root + two files
+    try testing.expectEqual(before + 3, try fds.count());
+    const g1 = live.acquire(); // generation 1 stays held
+    for (0..3) |i| {
+        try root.writeFile(io, .{ .sub_path = "edit.txt", .data = if (i % 2 == 0) "E2" else "E3" });
+        try bumpMtime(root, "edit.txt", @intCast(10 * (i + 1)));
+        try testing.expect(try live.reload(io));
+    }
+    // keep.txt's descriptor went from generation to generation (one fd);
+    // every edit added one, and nothing was freed behind the held oldest.
+    try testing.expectEqual(before + 3 + 3, try fds.count());
+    try testing.expectEqual(@as(usize, 3), live.retired.items.len);
+    var b: [4096]u8 = undefined;
+    var ctx: SnapshotCtx = .{ .snap = &g1.snap };
+    try testing.expectEqualStrings("K", bodyOf(snapGet(&ctx, "/keep.txt", "", &b)));
+    live.release(g1);
+    _ = try live.reload(io);
+    try testing.expectEqual(@as(usize, 0), live.retired.items.len);
+    try testing.expectEqual(before + 3, try fds.count());
+    try testing.expectEqualStrings("K", bodyOf(liveGet(&live, "/keep.txt", &b)));
+    live.deinit(io);
+    try testing.expectEqual(before, try fds.count());
+}
+
+test "Live: a failed rescan keeps serving the current generation, every descriptor intact" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "a.txt", "A" }, .{ "b.txt", "B" } });
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .snapshot = .{ .max_files = 2 } });
+    defer live.deinit(io);
+    try root.writeFile(io, .{ .sub_path = "c.txt", .data = "C" }); // one over the cap
+    try testing.expectError(error.TooManyFiles, live.reload(io));
+    try testing.expectEqual(@as(u64, 1), live.failures.load(.monotonic));
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("A", bodyOf(liveGet(&live, "/a.txt", &b)));
+    try testing.expectEqualStrings("B", bodyOf(liveGet(&live, "/b.txt", &b)));
+    try root.deleteFile(io, "c.txt");
+    try testing.expect(!try live.reload(io)); // back to what is served
+}
+
+test "Live.start: the thread picks up an edit; readers on other threads always see one whole version" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    const v1 = "v1:" ++ "a" ** 3000;
+    const v2 = "v2:" ++ "b" ** 5000;
+    try writeTree(root, &.{.{ "f.txt", v1 }});
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .rescan_ms = 50 });
+    defer live.deinit(io);
+
+    const Reader = struct {
+        live: *Live,
+        stop: *std.atomic.Value(bool),
+        bad: std.atomic.Value(u32) = .init(0),
+        seen_v2: std.atomic.Value(bool) = .init(false),
+        fn go(rd: *@This()) void {
+            var buf: [16 * 1024]u8 = undefined;
+            while (!rd.stop.load(.acquire)) {
+                const body = bodyOf(liveGet(rd.live, "/f.txt", &buf));
+                if (mem.eql(u8, body, v2)) {
+                    rd.seen_v2.store(true, .release);
+                } else if (!mem.eql(u8, body, v1)) _ = rd.bad.fetchAdd(1, .acq_rel);
+            }
+        }
+    };
+    var stop: std.atomic.Value(bool) = .init(false);
+    var readers: [3]Reader = @splat(.{ .live = &live, .stop = &stop });
+    var threads: [3]std.Thread = undefined;
+    for (&readers, &threads) |*rd, *t| t.* = try std.Thread.spawn(.{}, Reader.go, .{rd});
+    try live.start(io);
+    // Replaced atomically -- the supported way to change a served file (see
+    // `Live`): an in-place rewrite changes the inode the held descriptors
+    // point to, under requests already reading it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.next", .data = v2 });
+    try Dir.rename(tmp.dir, "f.next", root, "f.txt", io);
+    var waited: u32 = 0;
+    while (waited < 5000 and !readers[0].seen_v2.load(.acquire)) : (waited += 10) try io.sleep(.fromMilliseconds(10), .awake);
+    live.stop();
+    stop.store(true, .release);
+    for (threads) |t| t.join();
+    for (readers) |rd| try testing.expectEqual(@as(u32, 0), rd.bad.load(.acquire));
+    try testing.expect(readers[0].seen_v2.load(.acquire));
 }

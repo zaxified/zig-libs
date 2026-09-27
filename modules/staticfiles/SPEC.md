@@ -220,6 +220,36 @@ bytes, as nginx `gzip_static` does). No `Accept-Encoding` → identity. Every an
 has variants carries `Vary: Accept-Encoding` (not best-effort: without it a shared cache serves one
 client's coding to another). Variants remain servable under their own names.
 
+## 3.7. Content tags, and `Live` — a snapshot that follows its directory
+
+`SnapshotOptions.fingerprint` (default on): every file is hashed once when it enters a snapshot
+(SHA-256), and its `ETag` is `"` + the first 128 bits in hex + `"` — a **strong** validator in the
+full §8.8.1 sense, since it changes exactly when the bytes do, so `If-Range` may authorize a range
+(resumed downloads work, unlike with the weak size+mtime tag) and a rewrite with identical bytes
+keeps its tag. `Handler.sendFileTagged` takes the tag; `sendFile` is it with null.
+
+`Live` rescans (`reload`, or `start`'s thread every `rescan_ms`) and publishes a new generation when
+anything changed. A generation is built from the previous one: a file whose `fstatat` (no follow)
+shows the same inode, size and mtime hands its descriptor and tag on — no open, no read; anything
+else is opened through `openWithinRoot` and hashed. No change → nothing published. A failed rescan
+(`TooManyFiles`, I/O) hands every taken-over descriptor back and keeps the current generation.
+
+Publication and reclamation (single publisher, many readers): a request increments
+`readers[side]`, loads `current`, increments that generation's `holds`, decrements
+`readers[side]` — and holds the generation for the whole answer. The publisher swaps `current`,
+flips `side`, and waits for the old side's readers to drain; after that no request can take the
+old generation (a reader that read the old side before the flip was waited for; any later one
+loads `current` after the swap). Retired generations are freed only unheld and **oldest first**,
+because a descriptor handed on is closed by the generation holding it last — freeing a younger one
+before an older one that still serves the same descriptor would close it under that request.
+Tested: a held generation keeps serving its bytes across an edit; descriptor counts in
+`/proc/self/fd` return exactly to baseline; three reader threads never see anything but one whole
+version while the rescan thread swaps.
+
+**Replace files atomically** (write + rename). A rename leaves held descriptors on the old inode; a
+rewrite in place changes the inode they read, so until the next rescan a request may see it
+half-written — inherent to serving from open files, documented, not detected.
+
 ## 4. Concurrency & memory
 
 A `Handler` is created once and shared read-only across the server's connection threads; it holds
