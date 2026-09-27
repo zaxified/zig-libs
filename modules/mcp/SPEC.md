@@ -256,6 +256,15 @@ consumer needs it: sampling-with-tools is the largest remaining piece (a multi-t
 `URLElicitationRequiredError` (-32042) is exposed as a code but not as a helper that builds its
 `data.elicitations` payload.
 
+- **`clientInfo` is not recorded per peer** (2026-09-27, ttydesk). `initialize` parses only the
+  capabilities and the version into `PeerState`; the client's `clientInfo` (`name`, `version`,
+  optional `title`) is dropped. A server that audits what its tools do (ttydesk runs actions
+  on behalf of an AI client and writes who asked to the journal) wants to name the client.
+  ttydesk works around it by reading `clientInfo.name` from the `initialize` line itself
+  before `handleMessage` (`src/mcpserve.zig`). Ideal: `PeerState.client: ?ClientInfo` with
+  `name`/`version`/`title` copied into server-owned memory, readable as
+  `server.clientInfo(peer)` and `call.clientInfo()`; freed on `forgetPeer`.
+
 ## Status
 
 `extract · any · server · reentrant` + deps: none (std only — `std.json` + `std.Io`) — canonical
