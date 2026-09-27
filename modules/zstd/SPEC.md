@@ -2846,6 +2846,14 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
 - ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
   *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
   `contrib/seekable_format`.
+- **Z28 — `Seekable` over another source, keeping its buffers** (asked for by
+  seglog, 2026-09-27): `Seekable.init` allocates its 2 × 128 KiB buffers and a
+  `DecompressStream` every time, and seglog opens one per read of a compressed
+  segment (`seekTime` opens every segment twice) — most of a fuzz run's time
+  was those allocations. Ideal: `Seekable.reset(src: Source)` that loads a new
+  table and keeps the buffers and decoder, or a `SeekableContext` shared by
+  several `Seekable`s. Today seglog allocates per open
+  (`egw-hub/seglog/src/root.zig`, `SegStore.openZst`).
 - **Z24 — Adaptive level** (`zstd --adapt`, CLI-only in libzstd): a stream
   that moves its level with how fast its output drains.
 - **Z25 — API gaps, on a consumer's request:** a shared thread pool
