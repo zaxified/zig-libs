@@ -170,6 +170,7 @@ const module_list = [_]Module{
     .{ .name = "mcp", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp" }, .test_deps = &.{"testkit"} },
     .{ .name = "coap", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
+    .{ .name = "crc32c", .libs = &.{ "format", "storage" } },
     .{ .name = "kv", .libs = &.{"storage"} },
     .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{"kv"} },
     .{ .name = "blobmsg", .libs = &.{"format"}, .test_deps = &.{"testkit"} },

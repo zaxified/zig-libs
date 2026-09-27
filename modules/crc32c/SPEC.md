@@ -1,0 +1,85 @@
+# `crc32c` — specification
+
+## What this module is, and what it is not
+
+CRC-32C and nothing else: one-shot, streaming (`Crc32c`), `extend` from a
+known prefix checksum, and `combine` of two checksums without their bytes.
+It is **not** a general CRC engine — other polynomials (CRC-32/ISO-HDLC,
+CRC-64) belong to `std.hash.crc`, whose generic `Crc` covers them bytewise;
+a hardware CRC-32 (the zlib polynomial) would need PCLMULQDQ folding, not the
+`crc32` instruction, and is not here (see *Deliberately not done*).
+
+## Algorithm
+
+CRC-32C: polynomial 0x1EDC6F41, reflected (0x82F63B78), initial register
+0xFFFFFFFF, final XOR 0xFFFFFFFF (RFC 3720 §12.1, appendix B.4; RFC 9260
+appendix A). All backends compute the register update `reg(bytes, r)`
+without the conditioning; `extend(c, b) = ~reg(b, ~c)`.
+
+- **`.table`** — slicing-by-8: eight 256-entry tables, `t[0]` the bytewise
+  table and `t[k][i] = (t[k−1][i] >> 8) ⊕ t[0][t[k−1][i] & 0xff]`; eight
+  bytes per step, the rest bytewise.
+- **`.sse42` / `.armv8`** — the `crc32q` / `crc32cx` instruction, 8 bytes at
+  a time. While at least 3 × 8192 bytes remain, three independent chains run
+  over three consecutive 8192-byte blocks A, B, C (the first from the running
+  register, the others from 0), then join:
+  `r = S(S(rA) ⊕ rB) ⊕ rC`, where `S` appends 8192 zero bytes, i.e.
+  multiplies by x^(8·8192) mod P. Then the same with 256-byte blocks, then
+  single 8-byte steps, then at most 7 bytes by table. `S` is a linear map on
+  32 bits, stored as four 256-entry tables (one per register byte), built at
+  compile time from `multModP`.
+- **`combine(a, b, n)`** = `multModP(x^(8n) mod P, a) ⊕ b` — valid on the
+  conditioned values because the conditioning of `a ‖ b` and of its parts
+  cancels; `x^(8n)` by square-and-multiply over `x^(2^k)`, as zlib 1.2.12+.
+
+**Dispatch.** If the build target has `sse4_2` (x86-64) or `crc` (aarch64),
+that backend is fixed at compile time. Otherwise the first call detects it —
+CPUID leaf 1 ECX bit 20 (Intel SDM vol. 2A, CPUID), or `getauxval(AT_HWCAP)`
+bit 7 `HWCAP_CRC32` on Linux arm64 — and caches it in one atomic byte.
+Detection is idempotent, so a race stores the same value twice. The last
+bytes go through the table because Zig 0.16's self-hosted x86 backend (Debug)
+cannot encode the byte-wide `crc32b` form.
+
+## Limits and refusals
+
+None: every length, every alignment (loads are unaligned `readInt`s), and
+`combine` for any `u64` length.
+
+## Anchoring
+
+- **External** — the check value of CRC-32/ISCSI in the reveng CRC catalogue
+  (`"123456789"` → 0xE3069283) and the four 32-byte vectors of RFC 3720
+  appendix B.4 (zeros, ones, ascending, descending), through every backend
+  this CPU has. Test `published vectors`.
+- **Re-derived** — `std.hash.crc.Crc32Iscsi`, an independent bytewise
+  implementation, over every length 0 … 808, ±24 bytes around one and three
+  long blocks and six long blocks, at 16 alignments (a subset for the long
+  ones), per available backend. It fails, among others, a long-block join
+  with the short shift table, two swapped slicing tables and a combine by
+  x^(4n) (mutations run 2026-09-27, all red). The shift tables are also held
+  to the plain table update over real zero bytes.
+- **The hardware paths** run on x86-64 locally and in CI; arm64 in CI's arm64
+  lane and locally under `qemu-aarch64` (both the run-time-detected and the
+  `+crc` static build, 2026-09-27). The test fails if an x86-64 or arm64 run
+  never took a hardware path.
+
+**Anchor grade:** class B · oracle MIXED
+
+## Speed
+
+See README. Single-chain hardware is bound by the instruction's latency
+(~7 GB/s here); three chains reach ~20 GB/s from 4 KiB up. Below 768 bytes
+only the single chain runs.
+
+## What is deliberately not done
+
+- **PCLMULQDQ / PMULL folding** (Linux `crc32c-pcl-intel`, ~2× more on very
+  long inputs). Not now: the three-chain path is already ~45× std, and a
+  folding kernel needs vector target features Zig 0.16 cannot enable per
+  function — it would be baseline-hostile or compile-time-only.
+- **Other polynomials.** Refused: std's generic `Crc` has them.
+
+## Open
+
+- A caller wanting to force the table path (benchmarks, bit-exact audits)
+  uses `hashWith(.table, …)`; there is no global override.
