@@ -1,0 +1,64 @@
+zstd-cli — third-party attribution
+
+This file carries a CONDITION. `src/main.zig`, `src/fileio.zig`, `src/list.zig`
+and `src/display.zig` are a translation of C source from libzstd's command-line
+program (github.com/facebook/zstd, tag v1.5.7, commit
+f8745da6ff1ad1e7bab384bd1f9d742439278e99) into Zig. The BSD licence that source
+is offered under requires its copyright notice, conditions and disclaimer to
+travel with redistributions of the source and to be reproduced with binary
+redistributions. They are reproduced in full below. The compression library
+this command links, zig-libs' `zstd` module, carries its own NOTICE
+(`modules/zstd/NOTICE` in the zig-libs package) for the same reason.
+
+**Copyleft:** NONE-SHIPPED — libzstd is dual-licensed "BSD-style OR GPLv2" at
+the recipient's option. This port is taken under the BSD licence only; no text
+of it is offered under, or relies on, the GPLv2.
+
+WHAT WAS TAKEN
+
+Translated (restructured into Zig, decision-for-decision the same, the
+messages verbatim):
+
+  programs/zstdcli.c     options, defaults, program-name behaviours,
+                         stdin/stdout decisions, usage text          -> src/main.zig
+  programs/fileio.c      FIO_* compression, decompression, test and
+                         list of files; destination names; overwrite,
+                         --rm and permission handling; messages      -> src/fileio.zig, src/list.zig
+  programs/util.c        UTIL_makeHumanReadableSize,
+                         UTIL_requireUserConfirmation                -> src/display.zig, src/fileio.zig
+
+Not taken: programs/benchzstd.c, dibio.c, fileio_asyncio.c, lorem.c,
+timefn.c, and the gzip/xz/lz4 paths of fileio.c.
+
+LICENSE TEXT (libzstd `LICENSE`, verbatim)
+
+BSD License
+
+For Zstandard software
+
+Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+ * Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+ * Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+ * Neither the name Facebook, nor Meta, nor the names of its contributors may
+   be used to endorse or promote products derived from this software without
+   specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

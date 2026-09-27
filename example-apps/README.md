@@ -19,6 +19,7 @@ nothing else.
 | [`http-service`](http-service/) | A hardened task-tracking JSON API — API-key and HMAC-signed webhook clients, behind the composed middleware chain. | `http`, `router`, and 16 more |
 | [`timecapsule`](timecapsule/) | Encrypt a file openable only AFTER a chosen time (drand timelock) and only BY a chosen recipient (HQC post-quantum KEM) — two locks, both required. | `timelock_envelope`, `drand`, `hqc`, `http`, `datefmt` |
 | [`raft-kv`](raft-kv/) | Replicated KV store over the raft module's model-checked kernel — survives leader kill, catches up after restart, refuses writes without a majority. | `raft`, `kv`, `framing`, `lockfree` |
+| [`zstd-cli`](zstd-cli/) | The `zstd` command, ported from libzstd 1.5.7's `programs/` — the same frames, byte for byte, and the same messages as the C command, checked against it by `smoke.sh`. | `zstd` |
 
 ## How this differs from `modules/<name>/example/`
 

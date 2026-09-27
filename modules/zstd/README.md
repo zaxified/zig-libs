@@ -74,6 +74,10 @@ libc.
   state.
 - **Platform:** any (no OS calls). **Role:** codec. **Concurrency:** reentrant.
 
+A whole program on it: [`example-apps/zstd-cli`](../../example-apps/zstd-cli/),
+the `zstd` command ported from libzstd's `programs/`, whose frames and
+messages match the C command's.
+
 Provenance: a translation of libzstd v1.5.7 C source (BSD licence), so this
 module carries the required attribution in [`NOTICE`](NOTICE). The byte-exactness
 claim rests on libzstd itself, run by the recipe in [`tools/`](tools/README.md).

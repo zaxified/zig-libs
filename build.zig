@@ -1606,6 +1606,7 @@ const example_apps = [_]struct {
     .{ .name = "mls-chat", .modules = &.{ "mls", "framing", "lockfree" } },
     .{ .name = "timecapsule", .modules = &.{ "timelock_envelope", "drand", "hqc", "http", "datefmt" } },
     .{ .name = "raft-kv", .modules = &.{ "raft", "kv", "framing", "lockfree" } },
+    .{ .name = "zstd-cli", .modules = &.{"zstd"} },
     .{ .name = "http-service", .modules = &.{
         "http",       "router",    "cors",        "security-headers",
         "ratelimit",  "requestid", "health",      "throttle",
