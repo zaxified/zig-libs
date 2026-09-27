@@ -255,6 +255,13 @@ not something this formatter can detect).
 
 ## Backlog / deferred
 
+- **`response_bytes` for a streamed body** (from qap M11.5c, 2026-09-27). `responseBytesOf` answers
+  null for `.chunked`, `.until_close` and `.encoded`, so every response written past the
+  `ResponseWriter` buffer -- a streamed export, any compressed answer -- logs `-` / no bytes, which
+  is exactly the traffic an operator most wants counted. Needs `http`: a running count of body
+  octets on the wire (after encoding, without chunk framing; `%b`'s meaning) kept by
+  `ResponseWriter` and by the h2 framer, read here instead of `null`. qap works around nothing
+  today: its streamed reads (`Route.getStream`) simply log no size.
 - ~~**`%u` — the authenticated user**~~ — DONE 2026-09-25: `Entry.user` (Combined `%u` with every
   Combined delimiter hex-escaped, a `user` key in JSON Lines/logfmt written only when set, so
   output with `user = null` is byte-identical to before).
