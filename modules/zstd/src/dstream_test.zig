@@ -136,6 +136,17 @@ test "the window limit: refused above it, taken when raised" {
     gpa.free(back2);
 }
 
+test "a window limit in bytes (setMaxWindowSize): exact, and over window_log_max" {
+    // window byte exponent 18, mantissa 4: 2^28 + 4 * 2^25 = 402 653 184
+    // bytes, which no power of two bounds exactly
+    const f = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x00, 18 << 3 | 4, 0x01, 0x00, 0x00 };
+    const size: u64 = (1 << 28) + 4 * (1 << 25);
+    try std.testing.expectError(error.FrameParameterWindowTooLarge, streamDecode(&f, .{ .in_max = 100, .out_max = 100 }, 0, .{ .max_window_size = size - 1 }));
+    try std.testing.expectError(error.FrameParameterWindowTooLarge, streamDecode(&f, .{ .in_max = 100, .out_max = 100 }, 0, .{ .window_log_max = 28 }));
+    const back = try streamDecode(&f, .{ .in_max = 100, .out_max = 100 }, 0, .{ .window_log_max = 28, .max_window_size = size });
+    gpa.free(back);
+}
+
 test "stable output: straight into the caller's buffer, which must not move" {
     const src = "stable output " ** 500;
     const z = try zstd.compressAlloc(gpa, src, .{ .level = 3 });

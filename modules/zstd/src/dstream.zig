@@ -44,6 +44,11 @@ pub const Options = struct {
     /// (`ZSTD_d_windowLogMax`; below 10 counts as 10); null is libzstd's
     /// default, 2^27 + 1 bytes (exactly 2^27 allowed).
     window_log_max: ?u5 = null,
+    /// Refuse frames whose window exceeds this many bytes
+    /// (`ZSTD_DCtx_setMaxWindowSize`), for a limit that is not a power of
+    /// two, as the `zstd` command's `--memory=#`. Wins over
+    /// `window_log_max`; below 1 KiB counts as 1 KiB (libzstd refuses it).
+    max_window_size: ?u64 = null,
     /// The caller keeps the same output buffer between calls and only lets
     /// `pos` grow (`ZSTD_d_stableOutBuffer`): blocks are decoded straight
     /// into it and no output ring is allocated. A frame whose content size
@@ -123,7 +128,12 @@ pub const DecompressStream = struct {
                 .ddicts = options.ddicts,
                 .prefix_once = options.prefix,
             }),
-            .max_window_size = if (options.window_log_max) |l| @as(u64, 1) << @max(l, dec.window_log_absolute_min) else (@as(u64, 1) << window_log_limit_default) + 1,
+            .max_window_size = if (options.max_window_size) |m|
+                @max(m, @as(u64, 1) << dec.window_log_absolute_min)
+            else if (options.window_log_max) |l|
+                @as(u64, 1) << @max(l, dec.window_log_absolute_min)
+            else
+                (@as(u64, 1) << window_log_limit_default) + 1,
             .stable_output = options.stable_output,
             .owned_ddict = owned,
         };

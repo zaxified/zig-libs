@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — `DecompressStreamOptions.max_window_size`: a window
+  limit in bytes (`ZSTD_DCtx_setMaxWindowSize`), for a limit that is not a
+  power of two such as the `zstd` command's `--memory=#`; wins over
+  `window_log_max`. First consumer: `example-apps/zstd-cli`, the `zstd`
+  command ported onto this module (SPEC backlog Z26).
 - **2026-09-27** — **NO CONSUMER-VISIBLE CHANGE:** two decoder fuzz
   targets in `src/fuzz_test.zig` (streamed, and with a dictionary /
   `DDict.init` on arbitrary bytes, magicless too; SPEC backlog Z15) — test

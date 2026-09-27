@@ -1550,7 +1550,7 @@ equality (a smaller dictionary with exactly the full one's total).
 | stream memory | one window plus one block of input buffer (none with `stable_in_buffer`), `compressBound(block) + 1` of output buffer (none with `stable_out_buffer`), and the level's tables | `ZSTD_resetCCtx_internal` |
 | stable output room | any: blocks go into what is left, raw when the compressed form does not fit, else `error.DstSizeTooSmall`; where libzstd would write past the end (sub-blocks), `error.DstSizeTooSmall` | `ZSTD_c_stableOutBuffer`: libzstd's own capacity checks (Z1d) |
 | context memory | one workspace, exactly `estimateCompressorSize` / `estimateStreamSize`; a static one is never exceeded (`error.OutOfMemory`) | `ZSTD_estimateCCtxSize*`, `ZSTD_initStaticCCtx` |
-| decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header on 64-bit, ≤ 30 on 32-bit -- *Portability* -- else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max`, default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (`_64`/`_32` by `sizeof(size_t)`); `ZSTD_d_windowLogMax` and its default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
+| decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header on 64-bit, ≤ 30 on 32-bit -- *Portability* -- else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max` or, in bytes, `max_window_size` (which wins; below 1 KiB counts as 1 KiB where libzstd refuses), default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (`_64`/`_32` by `sizeof(size_t)`); `ZSTD_d_windowLogMax`, `ZSTD_DCtx_setMaxWindowSize` and the default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
 | decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), plus the ≈ 190 KB context | `ZSTD_decodingBufferSize_min` |
 | decode destination | the whole output; too small is `error.DstSizeTooSmall`. `decompressAlloc` sizes from the headers, else `decompressBound`, never above its `max_size` | `ZSTD_decompress` |
 | training memory | `estimateCoverMemory` / `estimateFastCoverMemory` ≤ `memory_limit` (default 256 MiB), else `error.MemoryLimitExceeded` before any allocation | libzstd has none (cover ≈ 8 B per sample byte, fastCover 6 · 2^f B) |
@@ -2770,11 +2770,20 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
   `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
   `getCParams` / `adjustCParams`, `ZSTD_versionNumber`.
-- **Z26 — `example/zstd-cli`: the `zstd` command at parity** (as zig-fping
-  is to fping): libzstd 1.5.7's `programs/` options, file handling and
-  output, checked against the real CLI. The module's contract stays the
-  library API (*What is deliberately not done*); the example is its first
-  full consumer.
+- **Z26 — `example-apps/zstd-cli`: the `zstd` command at parity**:
+  libzstd 1.5.7's `programs/` options, file handling and output, checked
+  against the real CLI. The module's contract stays the library API (*What
+  is deliberately not done*); the app is its first full consumer. Stage 1
+  done 2026-09-27: compress, decompress, `-t`, `-l`/`-lv`, `-D`, the stream
+  and MT options, overwrite/`--rm`/permissions/links, program names
+  (`unzstd`, `zstdcat`, `zstdmt`); 226 option/input combinations
+  byte-identical to `/usr/bin/zstd` 1.5.7 and 71 message scenarios equal,
+  `smoke.sh` re-checks a subset in CI when a 1.5.7 `zstd` is installed. It
+  asked the module for `DecompressStream.Options.max_window_size`
+  (`ZSTD_DCtx_setMaxWindowSize`, for `--memory=#`), added the same day.
+  Left (refused by name today): `-b` (Z27), `--train*`, `--adapt` (needs
+  `getFrameProgression`, see Z24/Z25), `--patch-from`, `--zstd=`, `-r`,
+  `--filelist`, `--output-dir-*`, the progress counter.
 - **Z27 — `example/zstd-bench`**: the measurement used for Z16/Z21/Z22
   (one-shot, chunked, streaming, decode; this port vs libzstd), runnable
   against `zstd -b` as the reference.
