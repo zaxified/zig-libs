@@ -246,6 +246,10 @@ Tested: a held generation keeps serving its bytes across an edit; descriptor cou
 `/proc/self/fd` return exactly to baseline; three reader threads never see anything but one whole
 version while the rescan thread swaps.
 
+`LiveOptions.observer` is told each rescan's outcome (`unchanged` / `published` with the
+generation and fresh-file count / `failed`) on the thread that ran it — for logs, and for a sandbox
+probe that must run code on that thread.
+
 **Replace files atomically** (write + rename). A rename leaves held descriptors on the old inode; a
 rewrite in place changes the inode they read, so until the next rescan a request may see it
 half-written — inherent to serving from open files, documented, not detected.
