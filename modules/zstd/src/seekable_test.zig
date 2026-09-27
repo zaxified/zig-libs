@@ -283,3 +283,47 @@ test "damaged streams are refused as libzstd refuses them" {
     // truncated: the table is gone
     try std.testing.expectError(error.PrefixUnknown, seekable.Seekable.init(gpa, .{ .bytes = bad[0 .. bad.len - 20] }));
 }
+
+const MemSource = struct {
+    bytes: []const u8,
+    fn readAt(ctx: *anyopaque, buf: []u8, off: u64) error{ReadFailed}!void {
+        const m: *MemSource = @ptrCast(@alignCast(ctx));
+        if (off > m.bytes.len or buf.len > m.bytes.len - off) return error.ReadFailed;
+        @memcpy(buf, m.bytes[@intCast(off)..][0..buf.len]);
+    }
+};
+
+test "a seek table whose frame sizes disagree with the frames is refused, never looped on" {
+    // Not libzstd's behaviour: its ZSTD_seekable_decompress restarts a frame
+    // that ended before the offset its table promised, forever (found by
+    // seglog's fuzz driver, 2026-09-27). A frame that decodes to more than
+    // its table size would hand its extra bytes out as the next frame's.
+    const case = findCase("words-16385");
+    const src = try gpa.alloc(u8, case.len);
+    defer gpa.free(src);
+    corpus.generate(case, src);
+    for ([_]bool{ false, true }) |checksums| {
+        const z = try seekable.compressAlloc(gpa, src, .{ .max_frame_size = 4096, .frame_checksums = checksums });
+        defer gpa.free(z);
+        const esz: usize = if (checksums) 12 else 8;
+        const d0 = z.len - 9 - esz * 5 + 4; // frame 0's decompressed size
+        for ([_]i64{ 1, -1, 4000 }) |delta| {
+            const bad = try gpa.dupe(u8, z);
+            defer gpa.free(bad);
+            const was = std.mem.readInt(u32, bad[d0..][0..4], .little);
+            std.mem.writeInt(u32, bad[d0..][0..4], @intCast(@as(i64, was) + delta), .little);
+            var mem: MemSource = .{ .bytes = bad };
+            const sources = [_]seekable.Source{
+                .{ .bytes = bad },
+                .{ .custom = .{ .context = &mem, .size = bad.len, .readAt = MemSource.readAt } },
+            };
+            for (sources) |source| {
+                var r = try seekable.Seekable.init(gpa, source);
+                defer r.deinit();
+                var back: [20000]u8 = undefined;
+                const got = r.decompress(&back, 0);
+                try std.testing.expectError(error.CorruptionDetected, got);
+            }
+        }
+    }
+}

@@ -519,15 +519,27 @@ pub const Seekable = struct {
                 s.dstream.reset();
                 if (s.mem_size) |m| if (src_read > m) return error.SeekableIO;
             }
+            // Where the table says this frame's content ends. The frame may
+            // not write past it (its bytes would stand in for the next
+            // frame's) nor end before it (the offset would never be reached:
+            // the C loops forever there on a forged table). Both are
+            // `CorruptionDetected`.
+            const frame_end = s.table.entries[s.cur_frame + 1].d_offset;
             while (s.decompressed_offset < end) {
                 var out: OutBuffer = if (s.decompressed_offset < offset)
                     .{ .dst = s.out_buf[0..@intCast(@min(buff_size, offset - s.decompressed_offset))] }
                 else
-                    .{ .dst = dst[0..len], .pos = @intCast(s.decompressed_offset - offset) };
+                    .{ .dst = dst[0..@intCast(@min(len, frame_end - offset))], .pos = @intCast(s.decompressed_offset - offset) };
                 const prev_out = out.pos;
                 const prev_in = s.in_pos;
                 var in: InBuffer = .{ .src = s.in_buf[0..s.in_len], .pos = s.in_pos };
-                var to_read = try s.dstream.decompressStream(&out, &in);
+                var to_read = s.dstream.decompressStream(&out, &in) catch |e| {
+                    // Out of room exactly at the table's end of the frame:
+                    // the frame holds more than its table entry says.
+                    if (e == error.NoForwardProgressDestFull and s.decompressed_offset + (out.pos - prev_out) == frame_end)
+                        return error.CorruptionDetected;
+                    return e;
+                };
                 s.in_pos = in.pos;
                 if (s.table.checksum_flag) s.xxh.update(out.dst[prev_out..out.pos]);
                 const progress = out.pos - prev_out;
@@ -538,6 +550,7 @@ pub const Seekable = struct {
                 s.decompressed_offset += progress;
                 src_read += s.in_pos - prev_in;
                 if (to_read == 0) {
+                    if (s.decompressed_offset != frame_end) return error.CorruptionDetected;
                     if (s.table.checksum_flag and @as(u32, @truncate(s.xxh.final())) != s.table.entries[target].checksum)
                         return error.CorruptionDetected;
                     if (s.decompressed_offset < end) target = s.table.offsetToFrameIndex(s.decompressed_offset);

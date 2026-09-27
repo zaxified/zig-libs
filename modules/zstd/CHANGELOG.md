@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **BEHAVIOURAL, not breaking:** `Seekable.decompress` refuses a
+  frame whose decoded size differs from its seek-table entry with
+  `CorruptionDetected`. Before, a table claiming a frame longer than it is made
+  `decompress` loop forever (as libzstd's does), and one claiming it shorter
+  returned the frame's excess as the next frame's bytes. Well-formed streams read
+  exactly as before.
 - **2026-09-27** — `zstd.seekable`: the seekable format (libzstd's
   `contrib/seekable_format`) — `SeekableStream` / `compressAlloc` write the
   same bytes as `ZSTD_seekable_CStream`, `Seekable` reads any byte range from

@@ -1580,7 +1580,13 @@ every frame query refuses an index at or past the frame count (the C's
 for the count itself); the table's size is computed in 64 bits (the C's
 32-bit product wraps for a forged frame count — the file is refused either
 way, `SeekableIO` when the table would be larger than the source,
-`PrefixUnknown` when its header is not where the footer says).
+`PrefixUnknown` when its header is not where the footer says). And one
+that does change a verdict, on a forged table only: a frame must decode to
+exactly the size its table entry gives, else `CorruptionDetected`. The C
+restarts a frame that ends short of the offset its table promised — forever
+(no output-progress guard trips, since every pass has output) — and hands a
+frame's excess bytes out as the next frame's (found 2026-09-27 by seglog's
+fuzz driver: a reader stuck on one damaged `.zst`).
 
 ## Limits and refusals
 
