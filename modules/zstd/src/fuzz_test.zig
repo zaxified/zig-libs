@@ -261,6 +261,29 @@ fn fuzzDecodeDictionary(_: void, smith: *std.testing.Smith) !void {
     decodeWithDictionary(buf[0..len]);
 }
 
+/// A seekable stream from arbitrary bytes (`seekable.Seekable`): the table
+/// loaded, then ranges read -- the whole, a middle range, one frame, and a
+/// read continuing the last -- any result or error, never a panic or a
+/// hang. The ranges come from the input's length, so a seed arrives intact.
+fn seekableAnything(input: []const u8) void {
+    const gpa = std.testing.allocator;
+    var r = zstd.seekable.Seekable.init(gpa, .{ .bytes = input }) catch return;
+    defer r.deinit();
+    var out: [1 << 16]u8 = undefined;
+    const size = r.table.decompressedSize();
+    const mid = size / 3;
+    _ = r.decompress(&out, 0) catch {};
+    _ = r.decompress(out[0..@min(out.len, 1000)], mid) catch {};
+    _ = r.decompress(out[0..@min(out.len, 700)], mid + 1000) catch {};
+    if (r.numFrames() > 0) _ = r.decompressFrame(&out, (@as(u32, @truncate(input.len)) % r.numFrames())) catch {};
+}
+
+fn fuzzSeekable(_: void, smith: *std.testing.Smith) !void {
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    seekableAnything(buf[0..len]);
+}
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
@@ -357,6 +380,37 @@ const decode_stream_seed_corpus = [_][]const u8{
     inlineSeed(7 << 3, kats.full_dict2, kats.frame2_full_l3),
     inlineSeed(1 << 3, &dict_reps, &frame_reps),
 };
+
+/// Seekable seeds: libzstd's own seekable streams (tools/zseekable.c), so a
+/// mutation starts from a valid table.
+const seekable_seed_corpus = [_][]const u8{
+    fuzzSeed(""),
+    fuzzSeed(&seekable_empty),
+    fuzzSeed(&seekable_two),
+};
+/// "" with frame checksums (`zseekable c 3 1 0 ... e`).
+const seekable_empty = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00, 0x5e, 0x2a, 0x4d, 0x18, 0x15, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0xe9, 0xd8, 0x51, 0x01, 0x00, 0x00, 0x00, 0x80, 0xb1, 0xea, 0x92, 0x8f };
+/// "abcdef" in frames of 3 bytes, checksums on (`zseekable c 3 1 3 ... c*,e`).
+const seekable_two = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x19, 0x00, 0x00, 0x61, 0x62, 0x63, 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x19, 0x00, 0x00, 0x64, 0x65, 0x66, 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00, 0x5e, 0x2a, 0x4d, 0x18, 0x2d, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x99, 0x09, 0x77, 0xad, 0x0c, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0xa8, 0xd5, 0x53, 0xdb, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x99, 0xe9, 0xd8, 0x51, 0x03, 0x00, 0x00, 0x00, 0x80, 0xb1, 0xea, 0x92, 0x8f };
+
+test "seekable fuzz seeds arrive intact and read as libzstd wrote them" {
+    for (seekable_seed_corpus[1..]) |sd| {
+        var smith: std.testing.Smith = .{ .in = sd };
+        var buf: [fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        try std.testing.expectEqual(sd.len - 4, len);
+        var r = try zstd.seekable.Seekable.init(std.testing.allocator, .{ .bytes = buf[0..len] });
+        defer r.deinit();
+        var out: [16]u8 = undefined;
+        const n = try r.decompress(&out, 0);
+        try std.testing.expectEqualStrings(if (len == seekable_two.len) "abcdef" else "", out[0..n]);
+        seekableAnything(buf[0..len]);
+    }
+}
+
+test "fuzz: arbitrary bytes never crash the seekable reader" {
+    try std.testing.fuzz({}, fuzzSeekable, .{ .corpus = &seekable_seed_corpus });
+}
 
 test "fuzz: arbitrary bytes never crash the stream decoder (with a dictionary, magicless)" {
     try std.testing.fuzz({}, fuzzDecodeStream, .{ .corpus = &decode_stream_seed_corpus });

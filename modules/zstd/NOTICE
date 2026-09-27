@@ -100,6 +100,11 @@ Translated (source, restructured into Zig but decision-for-decision the same):
                                       ZDICT_addEntropyTablesFromBuffer),
                                       ZDICT_getDictID / getDictHeaderSize;
                                       not the legacy trainer                -> src/zdict.zig
+  contrib/seekable_format/zstdseek_compress.c, zstdseek_decompress.c,
+  zstd_seekable.h                     the seekable format: frame log, seek
+                                      table writer, CStream, table loader,
+                                      offset-to-frame search, ranged
+                                      decompression                         -> src/seekable.zig
 
 Each of those files says so in its first line
 (`SPDX-License-Identifier: BSD-3-Clause AND MIT`). `src/root.zig`, the tests

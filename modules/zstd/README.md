@@ -423,6 +423,35 @@ candidates in flight: fewer run at once rather than the answer changing. Other e
 finalized), `LevelUnsupported` (above 22: libzstd clamps). Nothing is
 printed (libzstd's `notificationLevel`).
 
+### Seekable format (`zstd.seekable`)
+
+libzstd's `contrib/seekable_format`: the data cut into independent frames
+of at most `max_frame_size` bytes, and a seek table in a skippable frame at
+the end. Any zstd decoder reads the whole (`zstd -d` gives the input back);
+`Seekable` reads any byte range by decoding only the frames it touches. The
+bytes written are `ZSTD_seekable_CStream`'s for the same calls.
+
+```zig
+const sk = zstd.seekable;
+// one call: frames of 256 KiB, each checked by an XXH64 in the table
+const z = try sk.compressAlloc(gpa, data, .{ .level = 19, .max_frame_size = 256 << 10, .frame_checksums = true });
+defer gpa.free(z);
+// or streamed: SeekableStream.compressStream / endFrame / endStream
+
+var r = try sk.Seekable.init(gpa, .{ .bytes = z }); // or .{ .file = .{ .file = f, .io = io } }
+defer r.deinit();
+var buf: [4096]u8 = undefined;
+const n = try r.decompress(&buf, 1_000_000); // bytes 1_000_000.. of `data`
+```
+
+`FrameLog` writes a seek table for frames made elsewhere
+(`ZSTD_seekable_logFrame`, `writeSeekTable`); `r.table` answers the
+frame queries (`numFrames`, `frameCompressedOffset`, `offsetToFrameIndex`,
+...). Errors: `SeekableIO` (the source could not deliver), `PrefixUnknown`
+(no seek table), `CorruptionDetected` (reserved bits, or a frame whose
+content does not match its checksum), `FrameIndexTooLarge`,
+`DstSizeTooSmall`, and the decoder's.
+
 ## Tests
 
 `zig build test-zstd` (all three release lanes). The load-bearing one is

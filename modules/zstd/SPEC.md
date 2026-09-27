@@ -1535,6 +1535,53 @@ candidate's buffer re-sliced. Unreached: the padding check at `hSize + 8
 code limit at 30 vs 29 (a content of 1 GiB), the shrink tolerance at
 equality (a smaller dictionary with exactly the full one's total).
 
+## Seekable format
+
+`seekable.zig` ports libzstd 1.5.7's `contrib/seekable_format`
+(`zstdseek_compress.c`, `zstdseek_decompress.c`, format 0.1.0): the data
+cut into independent zstd frames, then one skippable frame (magic
+`0x184D2A5E`) holding the seek table — per frame its compressed size, its
+decompressed size and, with the checksum flag, the low 32 bits of the XXH64
+of its content — ending in a 9-byte footer (frame count, descriptor, magic
+`0x8F92EAB1`). A plain decoder reads it as frames plus a skippable frame.
+
+**Writing** (`SeekableStream`, `ZSTD_seekable_CStream`): a single-threaded
+`Stream` at the level with `src_size_hint = max_frame_size` (the C sets
+`ZSTD_c_srcSizeHint` before every call, to the same value); `compressStream`
+takes at most what fills the current frame (`continue`) and, when the frame
+is full, ends it; `endFrame` is `ZSTD_endStream` repeated until flushed,
+then the frame is logged and the context reset (session only); `endStream`
+ends the last frame — an empty one too, as the C does when the input
+filled the previous frame exactly — and writes the table. The table
+writer resumes a word at a time into output buffers of any size, down to
+one byte. `max_frame_size` 0 is 1 GiB; above 1 GiB is refused
+(`frameParameter_unsupported`); more than `0x8000000` frames is
+`FrameIndexTooLarge`. `FrameLog` alone logs frames made elsewhere and
+writes their table. `compressAlloc` is the whole input in one
+`compressStream` loop, then `endStream`.
+
+**Reading** (`Seekable`, `ZSTD_seekable`): the table is read from the end
+of the source (bytes in memory, a file through `std.Io` positional reads,
+or the caller's `readAt`); `decompress(dst, offset)` finds the frame with
+a binary search over the cumulative offsets, decodes from its start —
+into a scratch buffer up to `offset`, then into `dst` — and moves on frame
+by frame; a read starting where the last one stopped continues the frame
+instead of decoding it again. With the checksum flag every frame that
+completes is checked (a read that stops inside a frame checks nothing).
+The C's guards are kept: 17 calls in a row without output are
+`SeekableIO`, and in memory, reading more compressed bytes than the source
+holds is `SeekableIO`.
+
+**Deliberately different** (neither changes a verdict on a well-formed
+stream): an `offset` at or past the end reads nothing and returns 0 (the
+C computes `eos - offset` in `size_t`, which wraps, and returns that);
+every frame query refuses an index at or past the frame count (the C's
+`getFrameDecompressedSize` checks `>` and reads one entry past its table
+for the count itself); the table's size is computed in 64 bits (the C's
+32-bit product wraps for a forged frame count — the file is refused either
+way, `SeekableIO` when the table would be larger than the source,
+`PrefixUnknown` when its header is not where the footer says).
+
 ## Limits and refusals
 
 | limit | value | source |
@@ -1940,6 +1987,38 @@ goldens) inside a 300-second window and reported HANG — so the run was
 `zig build test-zstd --release=safe -Dtest-filter="never crash" --fuzz=N`.
 The sweep now builds only the harnesses (one `-Dtest-filter` per fuzz
 test), and `fuzz-sweep.sh zstd` works (2000/harness: 11 644 runs, 38 s).
+
+**Seekable format** (Z23, 2026-09-27): `testdata/seekable_goldens.zig`,
+26 rows from `tools/gen-seekable-goldens.sh` (libzstd's
+`contrib/seekable_format` through `tools/zseekable.c`): 13 corpus cases,
+levels −5…19, with and without frame checksums, frames of 1 byte to the
+1 GiB default, explicit `endFrame`s, input handed over in pieces, output
+buffers of 1, 3, 7 and 4096 bytes (the table written across calls), the
+empty input with and without empty frames. `seekable_test.zig` drives
+`SeekableStream` by each schedule and must give the recorded bytes — all
+26 matched at the first run — then reads every stream back through
+`Seekable` (whole, frame by frame, 40 scattered ranges plus a continuing
+read each, past the end) and through the plain decoder; `compressAlloc`
+and a reused stream give the same bytes; a `FrameLog` table over frames
+from `compressAlloc`, written 5 bytes at a time, reads back; a file source
+reads a range. Damaged tables (magic, a reserved bit, the skippable size, a
+frame count inside and past the file, a frame checksum, a truncation) get
+libzstd's verdicts, confirmed with `zseekable d`. A fourth fuzz target
+(`seekable reader`, seeds from `zseekable`) found at once a panic in
+`DecompressStream` itself: a skippable frame longer than the 4-byte input
+buffer of a stream it begins, fed across calls, was handed to the skip
+stage as a slice past that buffer (libzstd passes a pointer the stage never
+reads); fixed with the stage's effect done directly, pinned by a
+`dstream_test.zig` case that panicked before the fix; 300 000 runs clean
+after it, and the three decoder targets 300 000 more. A mutation sweep of
+`seekable.zig` (14 mutants in one schemata build: the descriptor bit, the
+frame search boundary, the frame cut, the continuing-read reset, the checksum
+check, a partial table word, the reserved bits, the table's checksum field,
+logging an unflushed frame, the no-progress guard, the table-size check, the
+past-end frame index, ending a full frame, the past-end read) killed 12 at
+once (three of them as hangs the tests cannot pass); the two survivors were
+gaps — `offsetToFrameIndex` past the end and a read starting past the end
+were never asked — and are now pinned in `readBack`; 14/14.
 
 **Streaming decoder (Z2b, 2026-09-23).** `dstream_test.zig` replays
 libzstd's `ZSTD_decompressStream` call by call on the same frames — return
@@ -2758,9 +2837,9 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   per-function target features, so ~~say so in the README~~ (done
   2026-09-27: *Speed* bullet, build with `-Dcpu=x86_64_v3` or `native`);
   still open: revisit run-time dispatch when Zig can.
-- **Z23 — Seekable format** (libzstd's `contrib/seekable_format`):
-  independent frames plus a seek table in a skippable frame, for random
-  access and parallel decoding of archives. Beyond libzstd's library.
+- ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
+  *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
+  `contrib/seekable_format`.
 - **Z24 — Adaptive level** (`zstd --adapt`, CLI-only in libzstd): a stream
   that moves its level with how fast its output drains.
 - **Z25 — API gaps, on a consumer's request:** a shared thread pool
@@ -2781,12 +2860,16 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `smoke.sh` re-checks a subset in CI when a 1.5.7 `zstd` is installed. It
   asked the module for `DecompressStream.Options.max_window_size`
   (`ZSTD_DCtx_setMaxWindowSize`, for `--memory=#`), added the same day.
-  Left (refused by name today): `-b` (Z27), `--train*`, `--adapt` (needs
+  Left (refused by name today): `--train*`, `--adapt` (needs
   `getFrameProgression`, see Z24/Z25), `--patch-from`, `--zstd=`, `-r`,
   `--filelist`, `--output-dir-*`, the progress counter.
-- **Z27 — `example/zstd-bench`**: the measurement used for Z16/Z21/Z22
-  (one-shot, chunked, streaming, decode; this port vs libzstd), runnable
-  against `zstd -b` as the reference.
+- ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
+  (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
+  command's blocks, timed runs and output, so `zstd -b` and
+  `zig-out/bin/zstd -b` print the same columns — equal sizes and ratios
+  (checked in `smoke.sh`, with dictionaries digested once per run as
+  `ZSTD_initLocalDict` does), the speeds being the comparison. Not ported:
+  `-b` without a file (lorem ipsum / `-P#` synthetic data).
 
 ## Open
 

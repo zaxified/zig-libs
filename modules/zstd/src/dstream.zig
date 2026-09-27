@@ -348,6 +348,25 @@ pub const DecompressStream = struct {
                     }
                     // decode the loaded input
                     s.in_pos = 0;
+                    if (d.stage == .skip_frame) {
+                        // The skipped bytes were never copied, and the input
+                        // buffer can be shorter than them (4 bytes when a
+                        // skippable frame comes first): libzstd hands
+                        // `ZSTD_decompressContinue` its buffer pointer, which
+                        // the skip stage does not read. Its effect, without
+                        // a slice past the buffer: the frame is over, nothing
+                        // was decoded.
+                        std.debug.assert(needed == d.expected);
+                        d.expected = 0;
+                        d.stage = .get_frame_header_size;
+                        if (s.stable_output) {
+                            s.stage = .read;
+                        } else {
+                            s.out_end = s.out_start;
+                            s.stage = .flush;
+                        }
+                        continue;
+                    }
                     try s.continueStream(out, &op, s.inBuff()[0..needed]);
                     continue;
                 },

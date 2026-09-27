@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — `zstd.seekable`: the seekable format (libzstd's
+  `contrib/seekable_format`) — `SeekableStream` / `compressAlloc` write the
+  same bytes as `ZSTD_seekable_CStream`, `Seekable` reads any byte range from
+  bytes, a file or a caller's reader, `FrameLog` adds a table to frames made
+  elsewhere (SPEC backlog Z23, asked for by seglog).
+- **2026-09-27** — **BEHAVIOURAL, not breaking:** `DecompressStream` no
+  longer panics (ReleaseSafe/Debug; ReleaseFast was unaffected) on a
+  skippable frame longer than its input buffer that arrives across calls —
+  e.g. 45 bytes of user data as the first frame of a stream. Found by the
+  seekable reader's fuzz target: a seek table is such a frame.
 - **2026-09-27** — `DecompressStreamOptions.max_window_size`: a window
   limit in bytes (`ZSTD_DCtx_setMaxWindowSize`), for a limit that is not a
   power of two such as the `zstd` command's `--memory=#`; wins over

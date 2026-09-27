@@ -136,6 +136,23 @@ test "the window limit: refused above it, taken when raised" {
     gpa.free(back2);
 }
 
+test "a skippable frame longer than the input buffer, fed in pieces" {
+    // The first frame is skippable, so the input buffer is the minimum 4
+    // bytes; its 45 bytes of user data arrive 5 at a time and are skipped,
+    // never copied (found by the seekable reader's fuzz target: a seek table
+    // is such a frame). Then an ordinary frame.
+    const a = try zstd.compressAlloc(gpa, "after the skippable frame", .{});
+    defer gpa.free(a);
+    const skip = [_]u8{ 0x5e, 0x2a, 0x4d, 0x18, 45, 0, 0, 0 } ++ [_]u8{0xab} ** 45;
+    const z = try std.mem.concat(gpa, u8, &.{ &skip, a });
+    defer gpa.free(z);
+    for (0..4) |seed| {
+        const back = try streamDecode(z, .{ .in_max = 5, .out_max = 7 }, seed, .{});
+        defer gpa.free(back);
+        try std.testing.expectEqualStrings("after the skippable frame", back);
+    }
+}
+
 test "a window limit in bytes (setMaxWindowSize): exact, and over window_log_max" {
     // window byte exponent 18, mantissa 4: 2^28 + 4 * 2^25 = 402 653 184
     // bytes, which no power of two bounds exactly

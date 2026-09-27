@@ -58,6 +58,11 @@ const seqapi = @import("seqapi.zig");
 /// optimizers, `ZDICT_trainFromBuffer` and finalization, giving the same
 /// finished dictionaries; see dict_builder.zig.
 pub const dict_builder = @import("dict_builder.zig");
+/// The seekable format (libzstd's `contrib/seekable_format`): independent
+/// frames plus a seek table in a skippable frame, for reading any byte
+/// range without decoding the rest. `SeekableStream` writes it (the same
+/// bytes as `ZSTD_seekable_CStream`), `Seekable` reads it.
+pub const seekable = @import("seekable.zig");
 
 pub const meta = .{
     .doc = "Zstandard (RFC 8878) compressor, levels 1-22 and negative levels — byte-identical to libzstd 1.5.7 `ZSTD_compress2` and `ZSTD_compressStream2`, with libzstd's advanced parameters (magicless frames, explicit window/strategy, splitters, block size, long-distance matching as `--long`, targetCBlockSize superblocks), the sequence-level API (compressSequences, generateSequences, a block-level sequence producer) and reusable contexts in one workspace of exactly estimated size, caller-provided if wanted — and a decoder ported from libzstd's, one-shot and streaming (`ZSTD_decompressStream`, a `std.Io.Reader`), checksums, concatenated and skippable frames, frame queries",
@@ -516,6 +521,7 @@ test {
     _ = @import("decompress.zig");
     _ = @import("dstream.zig");
     _ = @import("dstream_test.zig");
+    _ = @import("seekable_test.zig");
     _ = @import("decoder_test.zig");
     _ = @import("decoder_dict_test.zig");
     _ = @import("golden_test.zig");
