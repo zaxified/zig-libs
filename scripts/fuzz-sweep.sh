@@ -165,7 +165,9 @@ OUT="$BASE/run-$RUN_ID"
 mkdir -p "$OUT"
 : > "$OUT/summary.tsv"
 : > "$OUT/findings.txt"
-ln -sfn "$OUT" "$BASE/latest"
+# The link lives in $BASE, so its target is relative to $BASE: "$OUT" (itself
+# $BASE-relative) pointed at $BASE/$BASE/run-… and `latest` never resolved.
+ln -sfn "run-$RUN_ID" "$BASE/latest"
 printf '%s\t%s\t%s\t%s\n' "$RUN_ID" "started" "iters=$ITERS" "targets=$*" >> "$BASE/runs.tsv"
 echo "run $RUN_ID -> $OUT   (also reachable as $BASE/latest)"
 
@@ -270,6 +272,22 @@ harnessesOf() { # $1 = module
     ' modules/"$1"/src/*.zig 2>/dev/null
 }
 
+# ⭐ BUILD ONLY THE FUZZ TESTS. A plain `zig build test-<m> --fuzz=N` compiles the
+# module's WHOLE test binary and, before fuzzing, runs every unit test in it.
+# For a module with a heavy suite that fixed cost alone overruns CAL_WALL, so
+# even `--fuzz=1` cannot finish and the module is filed HANG at the calibration
+# floor without one harness having run — a verdict about the suite, not the
+# code. `zstd` (2026-09-27): a ~2 min instrumented compile plus ~4 min of
+# goldens against 300 s; warm, calibration at 1000/100/10/1 all timed out, while
+# the same three decoder harnesses filtered by name did 165 483 runs in 114 s.
+# So every fuzz invocation carries one `-Dtest-filter=<harness test name>` per
+# harness (the option is repeatable). A module whose harness names cannot be
+# read (a `testing.fuzz(` outside any `test "..."`) gets no filter and runs as
+# before, so a parsing miss can never drop a harness from the sweep.
+filterArgs() { # $1 = module; prints one -Dtest-filter=<name> per line
+    harnessesOf "$1" | cut -f2 | sort -u | sed 's/^/-Dtest-filter=/'
+}
+
 # ⭐ WHY ITERATIONS (1/2) — WARMING IS STILL NEEDED, BUT NO LONGER LOAD-BEARING.
 # Under the old seconds-per-module budget a cold ReleaseSafe compile ate the
 # window and the module reported "clean" for a sweep that barely ran (measured
@@ -309,7 +327,8 @@ fi
 echo "warming $total instrumented builds so calibration times the target, not the compiler..."
 warm_start=$(date +%s)
 for m in "${MODS[@]}"; do
-    timeout "$CAL_WALL" ./scripts/lib/capped zig build "test-$m" --release=safe --fuzz=1 > /dev/null 2>&1 || {
+    mapfile -t FILT < <(filterArgs "$m")
+    timeout "$CAL_WALL" ./scripts/lib/capped zig build "test-$m" --release=safe "${FILT[@]}" --fuzz=1 > /dev/null 2>&1 || {
         echo "  warm FAILED or timed out: $m (calibration will re-time it and can report HANG)"
         reapOrphans "$m"
     }
@@ -337,6 +356,7 @@ for m in "${MODS[@]}"; do
     log="$OUT/$m.log"
     mapfile -t HARNESS < <(harnessesOf "$m")
     nh=${#HARNESS[@]}
+    mapfile -t FILT < <(filterArgs "$m")
 
     # Calibrate on a small budget to learn this module's own throughput, so the
     # hang ceiling below is derived from the target rather than guessed.
@@ -372,7 +392,7 @@ for m in "${MODS[@]}"; do
         cal_start=$(date +%s)
         stamp_before=$(crashStamp)
         timeout "$CAL_WALL" ./scripts/lib/capped zig build "test-$m" --release=safe \
-            --fuzz="$cal_budget" > "$log.cal" 2>&1
+            "${FILT[@]}" --fuzz="$cal_budget" > "$log.cal" 2>&1
         cal_rc=$?
         cal_dur=$(( $(date +%s) - cal_start ))
         cal_delta=$(runsDelta "$log.cal")
@@ -454,7 +474,7 @@ for m in "${MODS[@]}"; do
     start=$(date +%s)
     stamp_before=$(crashStamp)
     timeout "$wall" ./scripts/lib/capped zig build "test-$m" --release=safe \
-        --fuzz="$budget" > "$log" 2>&1
+        "${FILT[@]}" --fuzz="$budget" > "$log" 2>&1
     rc=$?
     dur=$(( $(date +%s) - start ))
     [[ $rc -eq 124 ]] && reapOrphans "$m"
