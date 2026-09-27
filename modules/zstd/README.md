@@ -488,6 +488,8 @@ unknown size), a static workspace's bound, the workspace being replaced
 when too small or long too big, and indexing restarting near its limit.
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder and
-this one, and feeds the decoder arbitrary bytes; unit
+this one, and feeds the decoder arbitrary bytes one-shot, streamed and
+with dictionaries (a digested one, raw bytes, a prefix, one built from the
+input), magicless too; unit
 tests cover the FSE normalisation, Huffman depth limiting, bit writer and
 parameter selection.

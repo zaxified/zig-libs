@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **NO CONSUMER-VISIBLE CHANGE:** two decoder fuzz
+  targets in `src/fuzz_test.zig` (streamed, and with a dictionary /
+  `DDict.init` on arbitrary bytes, magicless too; SPEC backlog Z15) — test
+  code only; 1.7 M coverage-guided runs found nothing to fix.
 - **2026-09-26** — Small frames faster (SPEC backlog Z21): the tables
   cleared for every block (Huffman nodes and code table, histograms, FSE
   normalized counts) and the decoder's RLE blocks and literals no longer

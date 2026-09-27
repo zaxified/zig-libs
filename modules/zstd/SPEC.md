@@ -1917,6 +1917,25 @@ as libzstd does; a header test pins it now.) The rest survive:
 | Huffman fast-loop and X2 tail limits (`p_end - p > 3`, `op[3] >= oend`, `dtLog <= 11`, X2 level-2 fill rounding), `HUF_selectDecoder`'s weighting, raw literals read in place vs copied, `total_bits >= 31` reload, last-literals bound, the checksum computed when ignored, the frame-size precheck | equivalent: each changes only which of two equal paths runs |
 | 4 streams with exactly 6 literals refused (X1 and X2); an RLE table of the largest code refused; `nbSeq`'s 3-byte form off by one either way, or taken for `0xFE` | covered since 2026-09-26 by frames no encoder writes, built byte by byte in `decoder_test.zig` ("frames no encoder writes"): 4 one-byte Huffman streams of 2, 2, 2 and 0 symbols (X2 through a treeless block after one whose literals chose it), one sequence with RLE literal-length code 35 or match-length code 52, and 0x7EFF / 0x7F00 / 0x7F01 sequences of 1 literal and a 3-byte repeat match. libzstd decodes each (one-shot and both streamed plans of `zdec`); the test pins each frame's FNV-1a and libzstd's output. All 6 mutations killed |
 
+**Decoder fuzzing** (Z15, 2026-09-27). `fuzz_test.zig` has three decoder
+targets after libzstd's `tests/fuzz/`: arbitrary bytes one-shot
+(`simple_decompress`); through `DecompressStream` (`stream_decompress`),
+fed 1, 13, 4096 bytes or all at once into 7-, 997- or 16 384-byte output
+buffers or one stable buffer, under `window_log_max` 20; and one-shot with
+a dictionary (`dictionary_decompress`) as raw bytes, as a `DDict` and as a
+prefix, the dictionary itself also through `DDict.init` and
+`initByReference` of every content type (`dictionary_loader`). The first
+input byte picks the setup: none, `full_dict`, `raw_dict` as raw content,
+or a dictionary carried in the input; magicless or not; the buffer
+schedule. Seeds are libzstd's own dictionary frames (`dict_kats.zig`, with
+and without magic, `dict_reps`), and a test checks they arrive intact and
+decode to their content. One coverage-guided run (ReleaseSafe, under the
+`scripts/lib/capped` cgroup): 1 725 498 runs, 7 936 unique, no crash.
+`scripts/fuzz-sweep.sh zstd` cannot run it — its calibration replays the
+whole test binary (a 2-minute compile and 4 minutes of goldens) inside a
+300-second window and reports HANG — so the run was
+`zig build test-zstd --release=safe -Dtest-filter="never crash" --fuzz=N`.
+
 **Streaming decoder (Z2b, 2026-09-23).** `dstream_test.zig` replays
 libzstd's `ZSTD_decompressStream` call by call on the same frames — return
 hints (header in pieces, the next block header counted, the checksum read
@@ -2693,15 +2712,9 @@ dictionaries are undecided.
 Z1 through Z14 are done. Found by the post-port audit (2026-09-26), in the
 suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
 
-- **Z15 — Coverage-guided fuzzing of the decoder.** The only decoder
-  harness is one-shot `decompress` on arbitrary bytes; `DecompressStream`
-  (the ring and `checkContinuity`'s address history), `DDict.init` on
-  arbitrary bytes, decoding with a dictionary and magicless frames have
-  none, and no `scripts/fuzz-sweep.sh zstd` has run. A differential run on
-  2026-09-23 did trip a safety check in `decompressSequences` (fixed the
-  same day), so the layer has had such bugs. Harnesses after libzstd's
-  `tests/fuzz/` (`simple_decompress`, `stream_decompress`,
-  `dictionary_decompress`), then one sweep under a memory cap.
+- ~~**Z15 — Coverage-guided fuzzing of the decoder.**~~ Done 2026-09-27,
+  see *Anchoring* (*Decoder fuzzing*): stream and dictionary targets after
+  libzstd's `tests/fuzz/`, 1.7 M runs, no finding.
 - **Z16 — Decoder speed parity.** Measured 2026-09-26: 1.13–1.27× libzstd's
   time (Zig std sources as a 20 MB and a 120 MB tar, levels 3 and 19,
   `--long=27`, 178 small frames with a dictionary; one-shot and stream;

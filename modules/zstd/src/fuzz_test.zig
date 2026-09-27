@@ -13,9 +13,19 @@
 //! derived from the input length, so a seed's bytes arrive intact and the
 //! corpus below is what the ordinary lane actually runs (see the brotli
 //! harness for what a draw before the bytes cost that module).
+//!
+//! The decoder has three more targets after libzstd's `tests/fuzz/`
+//! (`stream_decompress`, `dictionary_decompress`, `dictionary_loader`), in
+//! which the first input byte picks the setup (a dictionary, the magicless
+//! format, the buffer schedule) and the rest is the frame: arbitrary bytes
+//! through `DecompressStream`, through the one-shot decoder with a
+//! dictionary, and through `DDict.init` itself. Their seeds are the frames
+//! libzstd wrote with `testdata/dict_kats.zig`'s dictionaries, so a mutation
+//! starts deep in the entropy and sequence decoding.
 
 const std = @import("std");
 const zstd = @import("root.zig");
+const kats = @import("testdata/dict_kats.zig");
 const fuzzSeed = @import("testkit").fuzz.seed;
 
 const fuzz_buf_len = 1 << 16;
@@ -102,6 +112,155 @@ fn decodeAnything(input: []const u8) void {
     _ = zstd.findDecompressedSize(input) catch {};
 }
 
+/// The setup byte of the decoder targets below: bits 0-1 the dictionary
+/// (none; `kats.full_dict`; `kats.raw_dict` as raw content; one from the
+/// input itself, its 2-byte length first), bit 2 the magicless format,
+/// bits 3-5 the stream's buffer schedule.
+const Setup = struct {
+    dict: enum { none, full, raw, inline_ } = .none,
+    magicless: bool = false,
+    schedule: u3 = 0,
+    frame: []const u8,
+    dict_bytes: ?[]const u8 = null,
+
+    fn parse(input: []const u8) ?Setup {
+        if (input.len == 0) return null;
+        const b = input[0];
+        var su: Setup = .{
+            .dict = @enumFromInt(b & 3),
+            .magicless = b & 4 != 0,
+            .schedule = @truncate(b >> 3),
+            .frame = input[1..],
+        };
+        switch (su.dict) {
+            .none => {},
+            .full => su.dict_bytes = kats.full_dict,
+            .raw => su.dict_bytes = kats.raw_dict,
+            .inline_ => {
+                if (su.frame.len < 2) return null;
+                const n = @min(std.mem.readInt(u16, su.frame[0..2], .little), su.frame.len - 2);
+                su.dict_bytes = su.frame[2..][0..n];
+                su.frame = su.frame[2 + n ..];
+            },
+        }
+        return su;
+    }
+
+    fn format(su: Setup) zstd.Format {
+        return if (su.magicless) .magicless else .zstd1;
+    }
+
+    fn contentType(su: Setup) zstd.DictContentType {
+        return switch (su.dict) {
+            .raw => .raw_content,
+            .full => .full,
+            else => .auto,
+        };
+    }
+};
+
+/// `dictionary_loader`: arbitrary bytes as a dictionary of each content
+/// type, digested and by reference -- a result or an error, never a panic.
+fn loadAnyDictionary(bytes: []const u8) void {
+    const gpa = std.testing.allocator;
+    for ([_]zstd.DictContentType{ .auto, .raw_content, .full }) |ct| {
+        if (zstd.DDict.init(gpa, bytes, ct)) |dd| {
+            var d = dd;
+            _ = d.dictId();
+            d.deinit(gpa);
+        } else |_| {}
+        _ = zstd.DDict.initByReference(bytes, ct) catch {};
+    }
+    _ = zstd.getDictId(bytes);
+}
+
+/// `dictionary_decompress`: the frame one-shot with the setup's dictionary,
+/// as raw bytes (`dictionary`) and digested (`ddict`), and as a prefix.
+fn decodeWithDictionary(input: []const u8) void {
+    const gpa = std.testing.allocator;
+    const su = Setup.parse(input) orelse return;
+    var out: [1 << 17]u8 = undefined;
+    if (su.dict == .inline_) loadAnyDictionary(su.dict_bytes.?);
+    {
+        var d = zstd.Decompressor.init(gpa, .{ .format = su.format(), .dictionary = su.dict_bytes }) catch return;
+        defer d.deinit();
+        _ = d.decompress(&out, su.frame) catch {};
+    }
+    const bytes = su.dict_bytes orelse return;
+    if (zstd.DDict.init(gpa, bytes, su.contentType())) |dd| {
+        var ddict = dd;
+        defer ddict.deinit(gpa);
+        var d = zstd.Decompressor.init(gpa, .{ .format = su.format(), .ddict = &ddict }) catch return;
+        defer d.deinit();
+        _ = d.decompress(&out, su.frame) catch {};
+    } else |_| {}
+    {
+        var d = zstd.Decompressor.init(gpa, .{ .format = su.format(), .prefix_once = bytes }) catch return;
+        defer d.deinit();
+        _ = d.decompress(&out, su.frame) catch {};
+    }
+}
+
+/// `stream_decompress`: the frame through `DecompressStream` with the
+/// setup's dictionary (a `DDict`, or the raw bytes as a prefix), fed and
+/// drained by the schedule: input chunks of 1, 13, 4096 bytes or all at
+/// once, output through 7, 997 or 16 384 bytes, or one stable 128 KB buffer
+/// whose `pos` only grows. A 1 MB window cap (`window_log_max` 20) keeps a
+/// header from asking for 128 MB; the whole output is capped at 1 MB.
+fn decodeStreamAnything(input: []const u8) void {
+    const gpa = std.testing.allocator;
+    const su = Setup.parse(input) orelse return;
+    const in_chunk = ([_]usize{ 1, 13, 4096, std.math.maxInt(usize) })[su.schedule & 3];
+    const stable = su.schedule & 4 != 0;
+    const out_len: usize = if (stable) 1 << 17 else ([_]usize{ 7, 997, 1 << 14, 997 })[su.schedule & 3];
+
+    var ddict: ?zstd.DDict = null;
+    defer if (ddict) |*dd| dd.deinit(gpa);
+    if (su.dict_bytes) |bytes| {
+        if (su.dict != .raw) ddict = zstd.DDict.init(gpa, bytes, su.contentType()) catch null;
+    }
+    var s = zstd.DecompressStream.init(gpa, .{
+        .format = su.format(),
+        .window_log_max = 20,
+        .stable_output = stable,
+        .ddict = if (ddict) |*dd| dd else null,
+        .prefix = if (su.dict == .raw) su.dict_bytes else null,
+    }) catch return;
+    defer s.deinit();
+
+    var obuf: [1 << 17]u8 = undefined;
+    var stable_out: zstd.OutBuffer = .{ .dst = &obuf };
+    var fed: usize = 0;
+    var total: usize = 0;
+    while (total < 1 << 20) {
+        const end = fed + @min(in_chunk, su.frame.len - fed);
+        var in: zstd.InBuffer = .{ .src = su.frame[0..end], .pos = fed };
+        var ob: zstd.OutBuffer = .{ .dst = obuf[0..out_len] };
+        const o = if (stable) &stable_out else &ob;
+        const before = o.pos;
+        const hint = s.decompressStream(o, &in) catch return;
+        const made = o.pos - before;
+        total += made;
+        const ate = in.pos - fed;
+        fed = in.pos;
+        if (stable and o.pos == o.dst.len) return;
+        if (hint == 0 and fed == su.frame.len) return;
+        if (made == 0 and ate == 0 and fed == su.frame.len) return;
+    }
+}
+
+fn fuzzDecodeStream(_: void, smith: *std.testing.Smith) !void {
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    decodeStreamAnything(buf[0..len]);
+}
+
+fn fuzzDecodeDictionary(_: void, smith: *std.testing.Smith) !void {
+    var buf: [fuzz_buf_len]u8 = undefined;
+    const len: usize = smith.slice(&buf);
+    decodeWithDictionary(buf[0..len]);
+}
+
 fn fuzzDecode(_: void, smith: *std.testing.Smith) !void {
     var buf: [fuzz_buf_len]u8 = undefined;
     const len: usize = smith.slice(&buf);
@@ -157,6 +316,87 @@ const decode_seed_corpus = [_][]const u8{
     fuzzSeed(&.{ 0x50, 0x2a, 0x4d, 0x18, 0x02, 0x00, 0x00, 0x00, 'h', 'i', 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 }),
     fuzzSeed(&seed_noise),
 };
+
+/// Decoder-target seeds: a setup byte, then a frame libzstd wrote (with and
+/// without its magic number), or a dictionary carried inline.
+fn setupSeed(comptime setup: u8, comptime frame: []const u8) []const u8 {
+    return fuzzSeed(&[_]u8{setup} ++ frame[0..frame.len].*);
+}
+fn inlineSeed(comptime setup: u8, comptime dict: []const u8, comptime frame: []const u8) []const u8 {
+    return fuzzSeed(&[_]u8{ setup | 3, @truncate(dict.len), @truncate(dict.len >> 8) } ++ dict[0..dict.len].* ++ frame[0..frame.len].*);
+}
+/// `full_dict` with its repeat offsets 50/60/70, and a frame opening on
+/// them (`decoder_dict_test.zig`, `tools/crafted-frames.py` `dict_reps`).
+const dict_reps = kats.full_dict[0..97].* ++ [_]u8{ 50, 0, 0, 0, 60, 0, 0, 0, 70, 0, 0, 0 } ++ kats.full_dict[109..].*;
+const frame_reps = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x83, 0x38, 0xca, 0x6d, 0xe4, 0x27, 0x0c, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x3c, 0x00, 0x00, 0x75, 0xbb, 0xc7, 0x03, 0x54, 0x01, 0x01, 0x00, 0x0b };
+
+const decode_dict_seed_corpus = [_][]const u8{
+    fuzzSeed(""),
+    setupSeed(0, &.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x05, 0x29, 0x00, 0x00, 'h', 'e', 'l', 'l', 'o' }),
+    setupSeed(1, kats.frame_full_l3),
+    setupSeed(1, kats.frame_full_l19),
+    setupSeed(1, kats.lit_repeat_frame),
+    setupSeed(1 | 4, kats.frame_full_l19[4..]),
+    setupSeed(2, kats.frame_raw_l5),
+    setupSeed(2 | 4, kats.frame_raw_l5[4..]),
+    inlineSeed(0, kats.small_raw_a, kats.small_frame),
+    inlineSeed(0, kats.full_dict2, kats.frame2_full_l3),
+    inlineSeed(0, &dict_reps, &frame_reps),
+};
+
+const decode_stream_seed_corpus = [_][]const u8{
+    fuzzSeed(""),
+    setupSeed(0 << 3, &.{ 0x50, 0x2a, 0x4d, 0x18, 0x02, 0x00, 0x00, 0x00, 'h', 'i', 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 }),
+    setupSeed(1 | 0 << 3, kats.frame_full_l19),
+    setupSeed(1 | 1 << 3, kats.frame_full_l3),
+    setupSeed(1 | 2 << 3, kats.lit_repeat_frame),
+    setupSeed(1 | 4 | 3 << 3, kats.frame_full_l19[4..]),
+    setupSeed(1 | 4 << 3, kats.concat_full_l3_then_frame2),
+    setupSeed(2 | 5 << 3, kats.frame_raw_l5),
+    setupSeed(2 | 4 | 6 << 3, kats.frame_raw_l5[4..]),
+    inlineSeed(7 << 3, kats.full_dict2, kats.frame2_full_l3),
+    inlineSeed(1 << 3, &dict_reps, &frame_reps),
+};
+
+test "fuzz: arbitrary bytes never crash the stream decoder (with a dictionary, magicless)" {
+    try std.testing.fuzz({}, fuzzDecodeStream, .{ .corpus = &decode_stream_seed_corpus });
+}
+
+test "fuzz: arbitrary frames and dictionaries never crash dictionary decoding" {
+    try std.testing.fuzz({}, fuzzDecodeDictionary, .{ .corpus = &decode_dict_seed_corpus });
+}
+
+test "decoder fuzz seeds decode as libzstd wrote them" {
+    // The seeds must reach the decoder intact and set it up as meant: each
+    // frame decodes through the setup its byte names (none fails for
+    // lack of the dictionary, which is not a seed here).
+    const gpa = std.testing.allocator;
+    const Want = struct { seed: []const u8, content: []const u8 };
+    const wants = [_]Want{
+        .{ .seed = decode_dict_seed_corpus[2], .content = kats.in1_content },
+        .{ .seed = decode_dict_seed_corpus[5], .content = kats.in1_content },
+        .{ .seed = decode_dict_seed_corpus[8], .content = kats.small_in_content },
+        .{ .seed = decode_dict_seed_corpus[9], .content = kats.in2b_content },
+        .{ .seed = decode_stream_seed_corpus[5], .content = kats.in1_content },
+        .{ .seed = decode_stream_seed_corpus[9], .content = kats.in2b_content },
+    };
+    for (wants) |w| {
+        var smith: std.testing.Smith = .{ .in = w.seed };
+        var buf: [fuzz_buf_len]u8 = undefined;
+        const len: usize = smith.slice(&buf);
+        try std.testing.expectEqual(w.seed.len - 4, len);
+        const su = Setup.parse(buf[0..len]).?;
+        var ddict = try zstd.DDict.init(gpa, su.dict_bytes.?, su.contentType());
+        defer ddict.deinit(gpa);
+        var d = try zstd.Decompressor.init(gpa, .{ .format = su.format(), .ddict = &ddict });
+        defer d.deinit();
+        var out: [1024]u8 = undefined;
+        const n = try d.decompress(&out, su.frame);
+        try std.testing.expectEqualStrings(w.content, out[0..n]);
+    }
+    for (decode_dict_seed_corpus) |sd| decodeWithDictionary(sd[4..]);
+    for (decode_stream_seed_corpus) |sd| decodeStreamAnything(sd[4..]);
+}
 
 test "fuzz: every input round-trips through std's decoder" {
     try std.testing.fuzz({}, fuzzCompress, .{ .corpus = &fuzz_seed_corpus });
