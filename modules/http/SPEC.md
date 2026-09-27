@@ -295,7 +295,7 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
-- **Lazy `100 Continue` on h1** (from qap M11.5a, 2026-09-27) — `Server.serveStream` writes
+- ~~**Lazy `100 Continue` on h1**~~ — **DONE 2026-09-27** (`Request.reader` sends it; unread → the response closes). Was: (from qap M11.5a, 2026-09-27) — `Server.serveStream` writes
   `HTTP/1.1 100 Continue` right after the head checks, before the handler runs
   (`Server.zig`, the `head.expect_continue` block after the 415 check). A handler that refuses the
   request on its own terms — a per-route body cap below `max_body_bytes`, auth, a 415 of its own —

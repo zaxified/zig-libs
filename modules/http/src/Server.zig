@@ -1830,13 +1830,6 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         return respondError(opts, out, date, 415);
 
     const has_body = head.chunked or (head.content_length orelse 0) != 0;
-    // RFC 9110 §10.1.1: an HTTP/1.0 client never sent the expectation on
-    // purpose -- 1.0 has no 1xx -- and a 100 it does not understand is read
-    // as the response.
-    if (head.expect_continue and has_body and !head.http1_0) {
-        out.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch return .close;
-        out.flush() catch return .close;
-    }
 
     var body: RequestBody = if (opts.max_body_bytes) |max|
         .initCappedWithTrailers(&head, in, bufs.request_body, max, bufs.trailers)
@@ -1868,7 +1861,9 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
     // Compression is considered only when configured AND the working
     // memory is there; the Accept-Encoding negotiation is per request.
     const compression_on = opts.compression != null and bufs.gzip != null;
-    var rw: ResponseWriter = .init(out, bufs.response_body, bufs.chunk, .{
+    const continue_pending = head.expect_continue and has_body and !head.http1_0;
+    var rw: ResponseWriter = undefined;
+    rw.initAt(out, bufs.response_body, bufs.chunk, .{
         .head_request = method == .head,
         .http1_0 = head.http1_0,
         .date = date,
@@ -1880,7 +1875,25 @@ fn serveOne(opts: StreamOptions, in: *Reader, out: *Writer, bufs: StreamBuffers,
         .encoder_provider = if (compression_on and opts.encoder_provider != null) &opts.encoder_provider.? else null,
         .accept_encoding = head.header("accept-encoding"),
         .upgradable = !has_body and !head.http1_0,
+        .continue_pending = continue_pending,
     });
+    // `Expect: 100-continue` is answered LAZILY: the interim `100 Continue`
+    // goes out when the handler first asks for the body (`Request.reader`),
+    // not before it runs -- a handler that refuses the request on its own
+    // terms (a route's smaller body cap, auth, a media type) then answers
+    // without having invited the body onto the wire. Go's net/http does the
+    // same (`expectContinueReader`); RFC 9110 §10.1.1 allows either. Until
+    // then the response closes the connection (`continue_pending`): a client
+    // that was never invited may still send the body, or may not, so neither
+    // draining it nor parsing a next request is safe. An HTTP/1.0 client
+    // never sent the expectation on purpose -- 1.0 has no 1xx.
+    //
+    //
+    // ⚠ Set through `init`'s options, never by writing `rw` after `init`:
+    // that write made the compiler build `rw` in a temporary and copy all
+    // 6,192 B of it into place -- a second ResponseWriter on this frame
+    // (16,400 B -> 22,592 B, measured in ReleaseSafe).
+    if (continue_pending) req.continue_rw = &rw;
     // Every return below, a detached response's included: its writer is
     // this frame's, so nothing can reach the encoder once we are gone.
     defer rw.releaseEncoder();
@@ -2000,6 +2013,11 @@ pub const Request = struct {
     peer: ?net.IpAddress = null,
     /// 0-based request ordinal on this connection — see `connRequestIndex`.
     conn_request_index: u32 = 0,
+    /// A pending `100 Continue` (h1 `Expect: 100-continue`): the response
+    /// writer whose `continue_pending` the first `reader()` call answers --
+    /// the interim line goes out on `rw.out` unless the final head already
+    /// has. Null on every request that did not ask for one. See `serveOne`.
+    continue_rw: ?*ResponseWriter = null,
     /// HTTP/2 only: the request's stream id, so a handler that detaches its
     /// response (`ResponseWriter.detach`) can name the stream to
     /// `h2_server.Detached.push` later. Null on HTTP/1.1.
@@ -2035,8 +2053,23 @@ pub const Request = struct {
     /// is enabled) a `Content-Encoding: gzip` body transparently
     /// decompressed; end-of-stream at the end of the body (immediately for
     /// bodyless requests).
+    ///
+    /// The first call answers a pending `Expect: 100-continue` with the
+    /// interim `100 Continue` -- asking for the body is what invites it.
     pub fn reader(req: *Request) *Reader {
+        if (req.continue_rw) |rw| if (rw.continue_pending) {
+            rw.continue_pending = false;
+            // A 100 after the final head would be a protocol error; a failed
+            // write surfaces as the connection failing on the next read.
+            if (!rw.sent_head) sendContinue(rw.out);
+        };
         return req.decoded orelse req.body.reader();
+    }
+
+    /// Out of line: the serving frame is budgeted (`frame_probe`).
+    noinline fn sendContinue(out: *Writer) void {
+        out.writeAll("HTTP/1.1 100 Continue\r\n\r\n") catch {};
+        out.flush() catch {};
     }
 
     /// Incoming chunked **trailer** fields (RFC 7230 §4.1.2), captured when
@@ -2328,6 +2361,10 @@ pub const ResponseWriter = struct {
     head_request: bool,
     http1_0: bool,
     close_connection: bool,
+    /// An `Expect: 100-continue` the handler has not answered by asking for
+    /// the body (`Request.reader`): the response closes the connection. See
+    /// `serveOne`.
+    continue_pending: bool = false,
     /// Compression config; null = this response never compresses.
     compression: ?Compression = null,
     /// Gzip working memory; present whenever `compression` is set.
@@ -2456,6 +2493,9 @@ pub const ResponseWriter = struct {
         server_name: ?[]const u8 = null,
         /// Emit `Connection: close` (the connection won't be reused).
         close_connection: bool = false,
+        /// An `Expect: 100-continue` awaiting the handler's first body read;
+        /// see `ResponseWriter.continue_pending`.
+        continue_pending: bool = false,
         /// Negotiated gzip response compression (Phase 2.2); null = off.
         /// Requires `gzip_scratch`, and `chunk_buf` of at least 9 bytes.
         /// While set, every response carries `Vary: Accept-Encoding`.
@@ -2485,8 +2525,18 @@ pub const ResponseWriter = struct {
     /// `body_buf` is the buffering/auto-Content-Length threshold;
     /// `chunk_buf` is small scratch for the chunked encoder (non-empty).
     pub fn init(out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: InitOptions) ResponseWriter {
+        var rw: ResponseWriter = undefined;
+        initAt(&rw, out, body_buf, chunk_buf, opts);
+        return rw;
+    }
+
+    /// `init`, built in place. The serving loop uses this: `init`'s result
+    /// went through a temporary and a 6,192-byte copy onto its frame -- a
+    /// second ResponseWriter, 16,400 -> 22,592 B (measured in ReleaseSafe
+    /// once the lazy `100 Continue` state was added).
+    pub fn initAt(rw: *ResponseWriter, out: *Writer, body_buf: []u8, chunk_buf: []u8, opts: InitOptions) void {
         std.debug.assert(!opts.accept_gzip or opts.gzip_scratch != null);
-        return .{
+        rw.* = .{
             .out = out,
             .chunk_buf = chunk_buf,
             .date = opts.date,
@@ -2494,6 +2544,7 @@ pub const ResponseWriter = struct {
             .head_request = opts.head_request,
             .http1_0 = opts.http1_0,
             .close_connection = opts.close_connection,
+            .continue_pending = opts.continue_pending,
             .compression = opts.compression,
             .gzip_scratch = opts.gzip_scratch,
             .accept_gzip = opts.accept_gzip,
@@ -2994,7 +3045,7 @@ pub const ResponseWriter = struct {
     /// Whether the connection must close after this response (explicit
     /// Connection: close, HTTP/1.0 until-close body, or broken framing).
     pub fn connectionMustClose(rw: *const ResponseWriter) bool {
-        return rw.failed or rw.close_connection;
+        return rw.failed or rw.close_connection or rw.continue_pending;
     }
 
     /// Finish the response: emits the head with an exact Content-Length when
@@ -3342,7 +3393,7 @@ pub const ResponseWriter = struct {
         if (rw.compression != null and !vary_covered)
             try out.writeAll("Vary: Accept-Encoding\r\n");
         if (rw.content_encoding) |ce| try out.print("Content-Encoding: {s}\r\n", .{ce});
-        if (rw.close_connection) try out.writeAll("Connection: close\r\n");
+        if (rw.close_connection or rw.continue_pending) try out.writeAll("Connection: close\r\n");
         switch (framing) {
             .none => {},
             .content_length => |n| try out.print("Content-Length: {d}\r\n", .{n}),
@@ -3803,6 +3854,14 @@ fn testHandler(req: *Request, rw: *ResponseWriter) anyerror!void {
         try rw.setHeader("Content-Type", "text/plain");
         if (req.query.len != 0) try rw.setHeader("X-Query", req.query);
         try rw.writeAll("hello");
+    } else if (std.mem.eql(u8, req.path, "/answer-then-read")) {
+        // The final head goes out first, the body is read after: a pending
+        // `100 Continue` must not follow a final response.
+        try rw.writeAll("early");
+        try rw.flush();
+        var buf: [64]u8 = undefined;
+        var w: Writer = .fixed(&buf);
+        _ = try req.reader().streamRemaining(&w);
     } else if (std.mem.eql(u8, req.path, "/echo")) {
         var buf: [512]u8 = undefined;
         var w: Writer = .fixed(&buf);
@@ -4172,6 +4231,45 @@ test "serveStream: Expect: 100-continue is acknowledged before the body read" {
     const got = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello", &out_buf);
     try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"));
     try testing.expect(std.mem.endsWith(u8, got, "\r\n\r\nhello"));
+}
+
+test "serveStream: Expect: 100-continue is lazy -- a handler that never reads sends no 100, and the connection closes" {
+    var hits: Hits = .init(0);
+    var out_buf: [4096]u8 = undefined;
+    // `/hello` answers without touching the body. The client was never
+    // invited to send it, so what follows on the wire is not a request qap
+    // may parse: the second request must not be served.
+    const got = runStream(&hits, "POST /hello HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "100 Continue") == null);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+    // The client is told the connection ends here.
+    try testing.expect(std.mem.indexOf(u8, got, "Connection: close\r\n") != null);
+    try testing.expectEqual(@as(u32, 1), hits.load(.monotonic));
+}
+
+test "serveStream: Expect: 100-continue -- no 100 after the final head, if the handler reads only then" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "POST /answer-then-read HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello", &out_buf);
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.indexOf(u8, got, "100 Continue") == null);
+}
+
+test "serveStream: Expect: 100-continue on a request with no body -- nothing to invite, the connection keeps alive" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "GET /hello HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\n\r\n" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expect(std.mem.indexOf(u8, got, "100 Continue") == null);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK\r\n"));
+}
+
+test "serveStream: Expect: 100-continue -- a handler that reads gets its 100, and the connection keeps alive" {
+    var out_buf: [4096]u8 = undefined;
+    const got = runStream(null, "POST /echo HTTP/1.1\r\nHost: t\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello" ++
+        "GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n", &out_buf);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "HTTP/1.1 100 Continue\r\n\r\n"));
+    try testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, got, "HTTP/1.1 200 OK\r\n"));
 }
 
 test "serveStream: malformed request line → golden 400, connection closes" {
@@ -6958,8 +7056,13 @@ test "formatHttpDate: the calendar, and the year that used to panic" {
 /// DOUBLES, not to police a hundred bytes, and a change that needs more room
 /// should raise it in the same commit that spends it -- with the number it
 /// measured. Measured 2026-08-30: 12,496 B at ReleaseFast, down from 18,640
-/// when `max_normalized_path` was 8 KiB.
-const codec_frame_budget = 16 * 1024;
+/// when `max_normalized_path` was 8 KiB. Measured 2026-09-27 in ReleaseSafe:
+/// 16,384 B -- exactly on the old 16 KiB line, so no longer loose -- and
+/// 16,400 B with the lazy `100 Continue` (`Request.continue_rw`); raised to
+/// 20 KiB, which still catches a doubling. (That change first measured
+/// 22,592 B: `ResponseWriter.init`'s result copied through a temporary --
+/// see `initAt`.)
+const codec_frame_budget = 20 * 1024;
 
 test "the serving frame stays inside its budget" {
     var out_buf: [4096]u8 = undefined;

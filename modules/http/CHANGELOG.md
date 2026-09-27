@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **h1 answers `Expect: 100-continue` lazily.** The interim `100 Continue` goes
+  out on the handler's first `Request.reader()` call, not before the handler runs (Go's
+  `expectContinueReader`), so a handler that refuses on its own terms -- a route's smaller body cap,
+  auth, a media type -- answers without having invited the body. A handler that never asks for the
+  body gets no 100 and its response closes the connection (`Connection: close`): the client may
+  still send the body, or may not. No 100 after the final head; none for HTTP/1.0 or a request
+  with no body. New `ResponseWriter.initAt` (in-place `init`; the serving loop uses it -- `init`'s
+  result went through a 6,192-byte temporary copy once the new state was added). Serving-frame
+  budget 16 → 20 KiB: ReleaseSafe measured 16,384 B before (exactly on the line) and 16,400 B after.
+  Found by qap (per-route body caps, plan M11.5a).
 - **2026-09-26** — **`EncoderProvider` negotiates through its own `prefers` pointer; build one with
   `EncoderProvider.init`.** The serving loops called `preferredBy` directly, which linked
   `conneg` into every server that uses them, provider or not -- qap's precompressed absence check
