@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
 //! Decoding with a dictionary: `DDict`, raw-content and zstd-format
 //! dictionaries, one-shot and streaming, the dictID check, and
-//! `ZSTD_d_refMultipleDDicts`. Every frame here is one libzstd 1.5.7
-//! actually emits with `ZSTD_compress_usingDict` (`testdata/dict_kats.zig`,
-//! `tools/gen-dict-testdata.sh`) -- this module's own compressor does not
-//! support dictionaries yet (Z4).
+//! `ZSTD_d_refMultipleDDicts`. Every frame here but one is one libzstd
+//! 1.5.7 actually emits with `ZSTD_compress_usingDict`
+//! (`testdata/dict_kats.zig`, `tools/gen-dict-testdata.sh`); the one that
+//! opens on the dictionary's repeat offsets is built by hand
+//! (`tools/crafted-frames.py`).
 
 const std = @import("std");
 const zstd = @import("root.zig");
@@ -317,6 +318,55 @@ test "mutation-sweep KAT: a repeat offset of exactly 0 is rejected" {
     // identical, so content size is unaffected and still > 0); libzstd
     // rejects this too (dictionary_corrupted), confirmed via tools/zdec.c.
     try std.testing.expectError(error.DictionaryCorrupted, zstd.DDict.init(gpa, kats.full_dict_rep0_zero, .full));
+}
+
+test "a frame that opens on repeat codes copies from the dictionary's repeat offsets" {
+    // No encoder opens a frame on a repeat code, so no frame libzstd
+    // writes can tell a dictionary's repeat offsets from the default
+    // 1/4/8 (a mutant that dropped them survived every encoder-made case,
+    // SPEC.md, Anchoring). tools/crafted-frames.py: full_dict with its
+    // repeat offsets patched to 50/60/70, and three sequences of 1 literal
+    // + 3 bytes at repeat codes 2, 3, 3 -- 60, 70 and 50 bytes back, into
+    // the dictionary's content. libzstd (tools/zdec.c, modes 0-2) decodes
+    // it to these 12 bytes; with the default offsets it gives others.
+    const reps_at = 97;
+    const default_reps = [_]u8{ 1, 0, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0 };
+    try std.testing.expectEqualSlices(u8, &default_reps, kats.full_dict[reps_at..][0..12]);
+    const dict = try gpa.dupe(u8, kats.full_dict);
+    defer gpa.free(dict);
+    @memcpy(dict[reps_at..][0..12], &[_]u8{ 50, 0, 0, 0, 60, 0, 0, 0, 70, 0, 0, 0 });
+    const frame = [_]u8{
+        0x28, 0xb5, 0x2f, 0xfd, 0x83, 0x38, 0xca, 0x6d, 0xe4, 0x27, // header, dictID 0x27e46dca
+        0x0c, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, // content size 12, last compressed block
+        0x3c, 0x00, 0x00, 0x75, 0xbb, 0xc7, // 3 raw literals
+        0x03, 0x54, 0x01, 0x01, 0x00, // 3 sequences, RLE codes LL 1, OF 1, ML 0
+        0x0b, // the marker, then offset bits 0, 1, 1
+    };
+    const want = [_]u8{ 0x75, 'v', 'e', 'n', 0xbb, ']', '}', '\n', 0xc7, 'a', 'm', 'm' };
+
+    var out: [64]u8 = undefined;
+    const n = try decodeOpts(&out, &frame, .{ .dictionary = dict });
+    try std.testing.expectEqualSlices(u8, &want, out[0..n]);
+
+    var dd = try zstd.DDict.init(gpa, dict, .full);
+    defer dd.deinit(gpa);
+    const n2 = try decodeOpts(&out, &frame, .{ .ddict = &dd });
+    try std.testing.expectEqualSlices(u8, &want, out[0..n2]);
+
+    // streamed one byte at a time (no single-pass shortcut)
+    var stream = try zstd.DecompressStream.init(gpa, .{ .ddict = &dd });
+    defer stream.deinit();
+    var got: std.ArrayList(u8) = .empty;
+    defer got.deinit(gpa);
+    for (0..frame.len) |i| {
+        var in: zstd.InBuffer = .{ .src = frame[0 .. i + 1], .pos = i };
+        while (in.pos < in.src.len) {
+            var ob: zstd.OutBuffer = .{ .dst = &out };
+            _ = try stream.decompressStream(&ob, &in);
+            try got.appendSlice(gpa, out[0..ob.pos]);
+        }
+    }
+    try std.testing.expectEqualSlices(u8, &want, got.items);
 }
 
 test "refMultipleDDicts: a dictID-0 frame matches a raw-content dictionary too, one-shot" {

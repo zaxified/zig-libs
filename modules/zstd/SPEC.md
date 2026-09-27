@@ -2712,10 +2712,9 @@ suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
 - ~~**Z17 — Document that `nb_workers > 0` needs a thread-safe allocator.**~~
   Done 2026-09-27: `Advanced.nb_workers`, `zstdmt.zig` and
   *Multithreading* say so.
-- **Z18 — A case for a dictionary's repeat offsets in the decoder.**
-  Dropping `applyEntropy`'s `st.rep = e.rep` survives (see *Open*); a
-  hand-built frame (`tools/crafted-frames.py`) whose first sequence uses a
-  repeat code kills it.
+- ~~**Z18 — A case for a dictionary's repeat offsets in the decoder.**~~
+  Done 2026-09-27: a hand-built frame (`tools/crafted-frames.py`,
+  `dict_reps`) kills dropping `st.rep = e.rep` (see *Open*).
 - **Z19 — Measure dictionary compression and training against libzstd.**
   Never measured. Low priority until a consumer uses dictionaries.
 - **Z20 — Stale text:** Z2c above, and *Decoder*'s "dictionary decoding was
@@ -2830,24 +2829,13 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `prefix_addr == prev_end_addr` whenever `content.len == 0` regardless of
   which address they hold.
 
-  One mutation was hunted and not found: dropping `applyEntropy`'s
-  `st.rep = e.rep` (the dictionary's repeat offsets never actually reach
-  the decoder) survived every attempt — a hand-built dictionary with
-  distinctive repeat offsets (50/60/70, in place of the default 1/4/8
-  every `ZDICT_trainFromBuffer` dictionary here has) decoded through
-  `tools/zdec.c` identically regardless of which repeat offsets were
-  active, across 5 corpus inputs × 5 levels × content styled to match the
-  dictionary's own training vocabulary, and again through this port's own
-  differential tool across a further 150 (input, level) combinations.
-  Contrast with `lit_entropy` above (a structurally similar mutation,
-  found within roughly 50 attempts by the same kind of hunt): a dictionary
-  match landing at one of the dictionary's own specific repeat-offset
-  values, as the very first sequence of a freshly attached dictionary
-  compression, appears not to happen for `ZSTD_compress_usingDict` at any
-  level on content of the sizes tried here — plausibly because it needs
-  the encoder's very first match to coincide exactly with one of three
-  fixed distances into unrelated dictionary bytes, unlike Huffman-table
-  reuse, which the cost model can choose deliberately. Confirming this
-  would need a hand-encoded sequence bitstream (bypassing the compressor
-  entirely) rather than a compression-based hunt; not attempted this
-  round.
+  Dropping `applyEntropy`'s `st.rep = e.rep` (the dictionary's repeat
+  offsets never reach the decoder) survived every encoder-made frame: a
+  dictionary with repeat offsets 50/60/70 in place of 1/4/8 decoded the
+  same under both across 5 corpus inputs × 5 levels and 150 more (input,
+  level) pairs, because no encoder opens a frame on a repeat code. It is
+  killed since 2026-09-27 (Z18) by a hand-built frame
+  (`tools/crafted-frames.py`, `dict_reps`): that dictionary and three
+  sequences at repeat codes 2, 3, 3, i.e. 60, 70 and 50 bytes back into the
+  dictionary's content; libzstd (`tools/zdec.c`, modes 0–2) gives the
+  12 bytes `decoder_dict_test.zig` pins, and 1/4/8 would give others.

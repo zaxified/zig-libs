@@ -10,7 +10,9 @@
 Every frame is valid by the format but no encoder writes it: 4 Huffman
 streams of exactly 6 literals (X1, and X2 through a treeless block after
 one whose literals chose X2), an RLE table of the largest literal-length
-(35) or match-length (52) code, and 0x7EFF / 0x7F00 / 0x7F01 sequences. The
+(35) or match-length (52) code, 0x7EFF / 0x7F00 / 0x7F01 sequences, and
+one that opens on a dictionary's repeat offsets (`dict_reps`, pinned by
+`decoder_dict_test.zig`, decoded with `full:dict_reps.zdict`). The
 test's Zig builder must give the same bytes (it checks the FNV-1a printed
 here); `zdec` gives libzstd's `OK <size> <fnv1a64>` the test expects.
 """
@@ -74,3 +76,22 @@ blk2=le(3|(1<<2)|(6<<4)|(len(body2)<<14),3)+body2+b'\x00'
 f=b'\x28\xb5\x2f\xfd'+bytes([0x80,0x38])+le(N+6,4)+le(0|(2<<1)|(len(blk1)<<3),3)+blk1+le(1|(2<<1)|(len(blk2)<<3),3)+blk2
 open(os.path.join(out_dir, 'huf4x2_6.zst'),'wb').write(f)
 print('huf4x2_6', len(f), '0x%016x'%fnv(f))
+# A dictionary's repeat offsets: full_dict (testdata/dict_kats.zig) with its
+# repeat offsets patched from 1/4/8 to 50/60/70, and a frame naming it whose
+# three sequences (1 literal + 3 bytes each, RLE codes: LL 1, OF 1, ML 0)
+# carry offset values 2, 3, 3 -- repeat codes 2, 3, 3 -- so they copy from
+# 60, 70 and 50 bytes back, all three into the dictionary's content. No
+# encoder opens a frame on a repeat code; with 1/4/8 the bytes would differ.
+#   zdec dict_reps.zst - M full:dict_reps.zdict
+import re
+kats = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src', 'testdata', 'dict_kats.zig')).read()
+full = bytes(int(x, 16) for x in re.search(r'pub const full_dict: \[\]const u8 = &\.\{([^}]*)\}', kats).group(1).split(','))
+reps_at = full.index(le(1,4) + le(4,4) + le(8,4))
+d = full[:reps_at] + le(50,4) + le(60,4) + le(70,4) + full[reps_at+12:]
+lits = lit(3, 4)
+blk = raw_lits(lits) + b'\x03' + bytes([0x54, 1, 1, 0]) + bytes([0x08 | 0b011])
+f = b'\x28\xb5\x2f\xfd' + bytes([0x83, 0x38]) + d[4:8] + le(12,4) + le(1|(2<<1)|(len(blk)<<3),3) + blk
+open(os.path.join(out_dir, 'dict_reps.zdict'),'wb').write(d)
+open(os.path.join(out_dir, 'dict_reps.zst'),'wb').write(f)
+print('dict_reps.zdict', len(d), '0x%016x'%fnv(d), 'reps at', reps_at)
+print('dict_reps', len(f), '0x%016x'%fnv(f))
