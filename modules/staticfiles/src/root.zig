@@ -1497,6 +1497,10 @@ pub const LiveOptions = struct {
 /// The rescan opens files by path after startup: a sandboxed process must
 /// leave the root readable (Landlock: a read rule on it), and its thread
 /// must be one the sandbox covers -- start it after sandboxing.
+/// Test-only seam in `Live.acquire`; see the test that sets it.
+var test_acquire_pause: if (@import("builtin").is_test) ?*const fn () void else void =
+    if (@import("builtin").is_test) null else {};
+
 pub const Live = struct {
     gpa: std.mem.Allocator,
     root: Dir,
@@ -1551,6 +1555,9 @@ pub const Live = struct {
         const side = l.side.load(.seq_cst);
         _ = l.readers[side].fetchAdd(1, .seq_cst);
         const g = l.current.load(.seq_cst);
+        // Test-only: a request stopped exactly where a publisher that did not
+        // wait for it would free the generation it just read.
+        if (@import("builtin").is_test) if (test_acquire_pause) |pause| pause();
         _ = g.holds.fetchAdd(1, .seq_cst);
         _ = l.readers[side].fetchSub(1, .seq_cst);
         return g;
@@ -3748,4 +3755,165 @@ test "Live.start: the thread picks up an edit; readers on other threads always s
     for (threads) |t| t.join();
     for (readers) |rd| try testing.expectEqual(@as(u32, 0), rd.bad.load(.acquire));
     try testing.expect(readers[0].seen_v2.load(.acquire));
+}
+
+test "Live: a file swapped for another of the same size and mtime is still seen (the inode tells them apart)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "AAAA" }});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+    const old = try root.statFile(io, "a.txt", .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.next", .data = "BBBB" });
+    const f = try tmp.dir.openFile(io, "b.next", .{ .mode = .read_write });
+    try f.setTimestamps(io, .{ .access_timestamp = .{ .new = old.mtime }, .modify_timestamp = .{ .new = old.mtime } });
+    f.close(io);
+    try Dir.rename(tmp.dir, "b.next", root, "a.txt", io);
+    try testing.expect(try live.reload(io));
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("BBBB", bodyOf(liveGet(&live, "/a.txt", &b)));
+}
+
+test "Live: a renamed empty directory is a change (no file moved)" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A" }});
+    _ = try root.createDirPathOpen(io, "empty", .{});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+    try Dir.rename(root, "empty", root, "moved", io);
+    try testing.expect(try live.reload(io));
+    var b: [4096]u8 = undefined;
+    try testing.expectEqual(@as(u16, 404), statusOf(liveGet(&live, "/empty/", &b)));
+    try testing.expectEqual(@as(u16, 403), statusOf(liveGet(&live, "/moved/", &b))); // a directory, no index
+}
+
+test "Snapshot fingerprint: the whole file is hashed, not its first chunk" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    const gpa = testing.allocator;
+    const x = try gpa.alloc(u8, 200 * 1024);
+    defer gpa.free(x);
+    @memset(x, 'x');
+    try root.writeFile(io, .{ .sub_path = "one.bin", .data = x });
+    x[x.len - 1] = 'y'; // differs only in the last octet, far past 64 KiB
+    try root.writeFile(io, .{ .sub_path = "two.bin", .data = x });
+    var snap = try Snapshot.open(gpa, io, root, .{});
+    defer snap.deinit(io);
+    const one = snap.paths.get("one.bin").?.file;
+    const two = snap.paths.get("two.bin").?.file;
+    try testing.expect(!mem.eql(u8, &snap.tags.items[one], &snap.tags.items[two]));
+}
+
+test "Live.open tags by content even when the snapshot options say otherwise" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A" }});
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .snapshot = .{ .fingerprint = false } });
+    defer live.deinit(io);
+    var b: [4096]u8 = undefined;
+    const tag = headerOf(liveGet(&live, "/a.txt", &b), "etag").?;
+    try testing.expectEqual(@as(usize, tag_len), tag.len);
+    try testing.expect(tag[0] == '"');
+}
+
+test "Live.start: the thread keeps to rescan_ms" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "A" }});
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .rescan_ms = 1500 });
+    defer live.deinit(io);
+    try live.start(io);
+    try root.writeFile(io, .{ .sub_path = "new.txt", .data = "N" });
+    try io.sleep(.fromMilliseconds(600), .awake);
+    try testing.expectEqual(@as(u64, 1), live.generations.load(.monotonic)); // not yet
+    var waited: u32 = 0;
+    while (waited < 5000 and live.generations.load(.monotonic) == 1) : (waited += 50) try io.sleep(.fromMilliseconds(50), .awake);
+    live.stop();
+    try testing.expectEqual(@as(u64, 2), live.generations.load(.monotonic));
+}
+
+/// For the test below: the acquiring thread stops in `acquire`'s window
+/// until the main thread lets it go.
+const PauseGate = struct {
+    var paused = std.atomic.Value(bool).init(false);
+    var go = std.atomic.Value(bool).init(false);
+    fn pause() void {
+        paused.store(true, .seq_cst);
+        while (!go.load(.seq_cst)) std.Thread.yield() catch {};
+    }
+};
+
+test "Live: publishing waits for a request caught between reading the generation and holding it" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{.{ "a.txt", "old" }});
+    var live = try openLive(&tmp);
+    defer live.deinit(io);
+    const side_before = live.side.load(.seq_cst);
+
+    PauseGate.paused.store(false, .seq_cst);
+    PauseGate.go.store(false, .seq_cst);
+    test_acquire_pause = PauseGate.pause;
+    defer test_acquire_pause = null;
+    const Req = struct {
+        live: *Live,
+        body: [16]u8 = undefined,
+        len: usize = 0,
+        fn go(q: *@This()) void {
+            const g = q.live.acquire(); // stops in the window
+            defer q.live.release(g);
+            var buf: [4096]u8 = undefined;
+            var ctx: SnapshotCtx = .{ .snap = &g.snap };
+            const body = bodyOf(snapGet(&ctx, "/a.txt", "", &buf));
+            @memcpy(q.body[0..body.len], body);
+            q.len = body.len;
+        }
+    };
+    var req: Req = .{ .live = &live };
+    const t = try std.Thread.spawn(.{}, Req.go, .{&req});
+    while (!PauseGate.paused.load(.seq_cst)) std.Thread.yield() catch {};
+
+    // The request holds the OLD generation's pointer but no hold on it yet.
+    // Let it go only after a while, from another thread; the publisher must
+    // still be waiting for it then, or it would free what the request holds.
+    const Releaser = struct {
+        fn go() void {
+            std.Io.sleep(testing.io, .fromMilliseconds(150), .awake) catch {};
+            PauseGate.go.store(true, .seq_cst);
+        }
+    };
+    const rel = try std.Thread.spawn(.{}, Releaser.go, .{});
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.next", .data = "new" });
+    try Dir.rename(tmp.dir, "a.next", root, "a.txt", io);
+    test_acquire_pause = null; // only the request in flight pauses
+    try testing.expect(try live.reload(io));
+    // Returned only once the request left the window.
+    try testing.expect(PauseGate.go.load(.seq_cst));
+    rel.join();
+    t.join();
+    try testing.expectEqualStrings("old", req.body[0..req.len]); // served whole from the generation it took
+    try testing.expect(live.side.load(.seq_cst) != side_before); // the next requests count on the other side
+    var b: [4096]u8 = undefined;
+    try testing.expectEqualStrings("new", bodyOf(liveGet(&live, "/a.txt", &b)));
 }
