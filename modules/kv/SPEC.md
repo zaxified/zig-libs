@@ -156,6 +156,8 @@ self-test (≥10/12 runs catch a data-losing recovery). Run: `zig build test-kv`
   still reproduces; a test shows it cuts a failing sabotage trace to a strictly smaller reproducer.
 
 ## Backlog / deferred
+**Exclusive create (`O_EXCL`) in `Storage.OpenMode`** — GAP (2026-09-27, energomonitor egw-hub seglog, audit L1). The three modes (`open_or_create`, `create_truncate`, `read_only`) cannot say "create, refuse if it exists". seglog's `rotate` must never truncate a segment file left behind by a lost MANIFEST; today it probes with `.read_only` and then `.create_truncate` (egw-hub `seglog/src/root.zig`, `Log.rotate`, comment `zig-libs request: kv`) — fine for a single writer, not atomic for concurrent creators. Wanted: a fourth mode `create_new` → `O_CREAT|O_EXCL` on POSIX, `error.AlreadyExists` otherwise; the sim storage models it too. Every mainstream API has it (POSIX `O_EXCL`, Win32 `CREATE_NEW`, Rust `OpenOptions::create_new`, Python `"x"`).
+
 - **On-disk/MVCC/txn/ordered-scans → DON'T-BUILD-YET** (ecosystem-scanned): multi-week+
   build (B-tree + WAL + MVCC + crash-proof + VOPR sweep) with zero current consumers demanding
   scans/txn. When greenlit: steal-patterns from `xitdb` (HAMT/B-tree + immutable-snapshot-as-MVCC
