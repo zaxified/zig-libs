@@ -295,6 +295,17 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **Lazy `100 Continue` on h1** (from qap M11.5a, 2026-09-27) — `Server.serveStream` writes
+  `HTTP/1.1 100 Continue` right after the head checks, before the handler runs
+  (`Server.zig`, the `head.expect_continue` block after the 415 check). A handler that refuses the
+  request on its own terms — a per-route body cap below `max_body_bytes`, auth, a 415 of its own —
+  then answers after the client was already invited to send the body. Go's `net/http` sends it on
+  the handler's first body read (`expectContinueReader`); do the same: the request body reader
+  writes the interim line on its first read, and a handler that answers without reading never
+  sends it (RFC 9110 §10.1.1 allows either). qap works around nothing today — its small-route 413
+  on a declared length follows the interim 100 (`qap/src/stream_test.zig` pins `interim == 1`,
+  comment `zig-libs request: http — lazy 100-continue`).
+
 ~~**zstd/br negotiated by the serving loops**~~ — DONE 2026-09-26 (found by qap):
 `Server.EncoderProvider` (`acquire`/`release` per response, no codec linked here) in `Options`,
 `StreamOptions` and `h2_server.Options` as `encoder_provider`; `preferredBy` is the q-value choice
