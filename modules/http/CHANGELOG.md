@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **`multipart.Reader`: `multipart/form-data` streamed part by part.** Over a
+  `*std.Io.Reader` instead of a whole body in memory: `nextPart` yields the part's `name`,
+  `filename`, `content_type` and `headers_raw` (in a caller's `header_buf`, `header_buf_len` for the
+  default limits) and a `body` reader that ends at the next delimiter; `nextPart` again skips what
+  was left unread. Memory is one header block plus the underlying reader's buffer, which must hold a
+  delimiter (`boundary.len + 4`; `init` refuses a boundary it cannot hold, or one RFC 2046 forbids).
+  Same grammar, `Limits` and refusals as `parse`, plus `ReadFailed` for the underlying reader
+  (`StreamError`); a failed body read sets `Reader.err`. Failures are sticky. `parse` is unchanged.
+  Found by qap (streamed form uploads, plan M11.5b).
 - **2026-09-27** — **h1 answers `Expect: 100-continue` lazily.** The interim `100 Continue` goes
   out on the handler's first `Request.reader()` call, not before the handler runs (Go's
   `expectContinueReader`), so a handler that refuses on its own terms -- a route's smaller body cap,

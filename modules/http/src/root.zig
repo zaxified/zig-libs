@@ -135,7 +135,8 @@ pub const body = @import("body.zig");
 
 /// `multipart/form-data` body parser (RFC 7578): iterate a form's parts —
 /// field `name`, optional `filename`, `Content-Type`, and raw (binary-safe)
-/// value — from a size-bounded in-memory body.
+/// value — from a size-bounded in-memory body (`parse`), or streamed part by
+/// part from a `*std.Io.Reader` for uploads too large to hold (`Reader`).
 pub const multipart = @import("multipart.zig");
 
 /// Server-Sent Events (`text/event-stream`) encoder over a streaming

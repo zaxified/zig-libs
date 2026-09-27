@@ -260,7 +260,9 @@ static).
 **Fuzz harnesses (HD1):** every untrusted-wire parser has a `std.testing.fuzz` harness asserting
 "typed error or valid result, never a panic" — `h1.RequestHead.parse`/`ResponseHead.parse`/
 `ChunkedReader` (request/status line, header block, chunked framing), `body.ContentType.parse`/
-`urlencoded` (Content-Type + form body), `multipart.parse` (form-data boundary/part parse),
+`urlencoded` (Content-Type + form body), `multipart.parse` (form-data boundary/part parse) and
+`multipart.Reader` (the streaming parser, fuzzed differentially against `parse` over arbitrary read
+sizes and buffer lengths: same parts, same end),
 `range.parse` (Range header), `hpack.Decoder.decodeBlock` (HPACK header-block decode), and
 `h2.parseFrame`/`h2.Connection.recv` (HTTP/2 frame decode, both pre- and post-handshake). They run
 as a deterministic empty-input smoke test under plain `zig build test` and as real continuous fuzzing
@@ -294,6 +296,12 @@ extra — the perf gap being traded away is small next to what a missed bounds c
 directly-exposed parser.
 
 ## Backlog / deferred
+
+- ~~**Streaming multipart**~~ — **DONE 2026-09-27** (`multipart.Reader`, from qap M11.5b). The
+  buffered `parse` needs the whole body in memory; `Reader` reads a `*std.Io.Reader` part by part,
+  each part body a reader that ends at the next delimiter (Go's `mime/multipart.Reader` shape).
+  Same grammar, limits and refusals as `parse` — one pair differs by design: a header block over the
+  cap that never ends is `HeadersTooLarge` (the reader stops at the cap), `MalformedBody` to `parse`.
 
 - ~~**Lazy `100 Continue` on h1**~~ — **DONE 2026-09-27** (`Request.reader` sends it; unread → the response closes). Was: (from qap M11.5a, 2026-09-27) — `Server.serveStream` writes
   `HTTP/1.1 100 Continue` right after the head checks, before the handler runs
