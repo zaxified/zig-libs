@@ -117,20 +117,13 @@ the outcome); `Manager.persist` exposes the CAS result as a `bool` so a handler 
 A future distributed `Store` (Redis) implements the same CAS via a Lua script or `WATCH`/`MULTI` on
 the generation.
 
-**Known limitation — thread-per-connection assumption for the `Set-Cookie` buffer:** `writeCookie`
-stages the `Set-Cookie` value in a **threadlocal** buffer (`cookie_buf`) because `http.Server`'s
-response writer keeps the header slice uncopied and serializes it lazily at `writeHead`, after the
-middleware itself has already returned — a stack buffer would dangle by then. This is only safe
-under a **thread-per-connection (blocking)** `std.Io` backend (e.g. `std.Io.Threaded`), where one
-OS thread serves exactly one connection's request at a time, so the threadlocal is never shared. A
-**cooperative/fiber `Io` backend** that multiplexes multiple connections onto one OS thread (e.g. an
-event-loop or green-thread scheduler) would let one connection's handler run, stage its
-`Set-Cookie` into `cookie_buf`, yield, and have a *different* connection's request run on the same
-OS thread before the first one's header is serialized — bleeding one user's `Set-Cookie` (and
-therefore session id) into another user's response. Callers **must** use a blocking, one-thread-
-per-connection `std.Io` implementation (or an equivalent scheduling guarantee) with this module;
-this is not currently enforced in code (there is no portable way to introspect the `Io`
-implementation's scheduling model from here), only documented.
+**No longer a limitation — the `Set-Cookie` buffer (corrected 2026-09-27).** This section used to
+say `writeCookie` staged the value in a **threadlocal** buffer, unsafe under a fiber `Io` that
+multiplexes connections on one thread. The code no longer does: `writeCookie` and `Csrf.issue`
+format into a stack local and hand it to `ResponseWriter.addSetCookie`, which copies the value into
+the writer's own header storage (`rw.dupe`) before returning. Nothing outlives the call, so any
+`Io` scheduling model is safe. Verified by reading both call sites before qap (a fiber-per-
+connection server) built its `Config.sessions` on them.
 
 ## Verification
 
@@ -174,6 +167,11 @@ pulling in `csrf.zig`. Run: `zig build test-sessions`.
   concurrent data writes.
 - **Automatic CSRF body form-field extraction** — deliberately not done in the middleware (see
   design notes); callers use `Csrf.verify` directly.
+- **Public `Csrf.presented(req)`** (from qap M11.4, 2026-09-27) — the header-then-query token
+  extraction is the private `presentedToken`, so a caller that uses the core without the `router`
+  middleware (qap's `src/sessions.zig` `presentedToken`) has to copy it. Expose it, and a
+  `Csrf.check(req) bool` (session cookie + presented token + `verify`), which is the whole guard
+  minus the middleware's 403.
 
 ## Status
 
