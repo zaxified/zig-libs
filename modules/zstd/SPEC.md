@@ -873,7 +873,10 @@ frame pledges its input), and for one-shot `compress` of more than 512 KB
 calling thread and give nbWorkers 0's bytes. From one worker up the frame
 differs from nbWorkers 0's, and **does not depend on the worker count**:
 the goldens are made with 3 workers, checked equal with 1 by the recipe,
-and the test compares 1, 2, 4 and 8.
+and the test compares 1, 2, 4 and 8. **The allocator must be
+thread-safe:** each worker's context grows its workspace from the
+caller's `gpa` on the worker's own thread (`beginInternal`), as libzstd's
+workers call its `customMem` (Z17).
 
 **Jobs.** The input is copied into a round buffer and cut into jobs of
 `targetSectionSize` bytes: `Advanced.job_size` (`ZSTD_c_jobSize`, a value
@@ -2706,9 +2709,9 @@ suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
   1.04–1.05× (2026-09-23, system binaries). Hot spots: the sequence loop,
   Huffman literals (libzstd uses `huf_decompress_amd64.S`), and
   `compiler_rt.memset` (byte by byte without libc, 1.7 %).
-- **Z17 — Document that `nb_workers > 0` needs a thread-safe allocator.**
-  Workers call `beginInternal`, which allocates from the caller's `gpa`
-  (`frame.zig`, the workspace resize); only the trainers say so today.
+- ~~**Z17 — Document that `nb_workers > 0` needs a thread-safe allocator.**~~
+  Done 2026-09-27: `Advanced.nb_workers`, `zstdmt.zig` and
+  *Multithreading* say so.
 - **Z18 — A case for a dictionary's repeat offsets in the decoder.**
   Dropping `applyEntropy`'s `st.rep = e.rep` survives (see *Open*); a
   hand-built frame (`tools/crafted-frames.py`) whose first sequence uses a

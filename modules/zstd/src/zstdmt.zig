@@ -28,7 +28,9 @@
 //! atomics plus the futex of `std.Io` (through the process-global
 //! `std.Io.Threaded` instance, whose futex calls are stateless), so the
 //! module needs neither libc nor an `Io` from its caller. See SPEC.md,
-//! *Multithreading*, for the choice against `workerpool`.
+//! *Multithreading*, for the choice against `workerpool`. A worker's
+//! context allocates from the caller's `gpa` when a job's workspace grows
+//! (`beginInternal`), so that allocator must be thread-safe.
 //!
 //! With `ZSTD_c_rsyncable` (`Advanced.rsyncable`), a rolling hash over the
 //! last 32 input bytes also cuts a job wherever its low bits are all ones

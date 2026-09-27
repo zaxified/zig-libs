@@ -462,6 +462,8 @@ pub const Advanced = struct {
     /// 1, a frame of more than 512 KB (or of unknown size, as a stream) is
     /// cut into jobs compressed by this many threads (`zstdmt.zig`). The
     /// bytes are the same for any count from 1 up (and differ from 0's).
+    /// From 1, the workers allocate from the context's `gpa` (a job's
+    /// workspace grows on its own thread), so `gpa` must be thread-safe.
     nb_workers: u32 = 0,
     /// `ZSTD_c_jobSize`, 0..1 GiB: the input of one job; 0 derives it from
     /// the window (4 window sizes, at least 1 MB), and a value under 512 KB
