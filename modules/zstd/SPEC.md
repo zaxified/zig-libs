@@ -1263,12 +1263,16 @@ path (13/4000 random single-byte-flip corruptions of dictionary-compressed
 frames in a throwaway differential run hit this; every other corrupted
 input and every valid one, output and error class alike, matched).
 
-Speed: 1.13–1.27× libzstd's decode time (2026-09-26: Zig's std sources as
-a 20 MB and a 120 MB tar at levels 3 and 19 and `--long=27`, and 178 small
-frames compressed with a dictionary; one-shot and streamed; `perf` 1.17×
-the cycles, 1.18× the instructions), where the first measurement
-(2026-09-23, 200 MB of system binaries at levels 3 and 19, decode only,
-best of 5, ReleaseFast) gave 1.04–1.05×; closing the gap is backlog Z16.
+Speed: 0.91–1.04× libzstd's cycles (2026-09-27, `zstd -dc` of
+`example-apps/zstd-cli` against `/usr/bin/zstd` 1.5.7, `-Dcpu=native`,
+pinned core, best of 3: Zig's std sources as a 20 MB and a 120 MB tar at
+levels 3 and 19 and `--long=27`, an RLE-heavy 20 MB, and 178 small frames
+with a dictionary; one-shot `-b -d` 0.97–1.02× the time). The 2026-09-26
+measurement (1.13–1.27×) had two causes, both fixed (Z16): the overlapping
+match copy went through `std.mem.copyForwards`, a byte loop where libzstd's
+`ZSTD_copy8` is one load and one store (the copies are at least 8 bytes
+apart once `overlapCopy8` has spread the offset), and the command copied
+each decoded buffer through its writer's buffer.
 std's decoder takes 30× libzstd's time on the same frames, which is why
 this is a port and not an extension of it.
 
@@ -2806,13 +2810,10 @@ suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
 - ~~**Z15 — Coverage-guided fuzzing of the decoder.**~~ Done 2026-09-27,
   see *Anchoring* (*Decoder fuzzing*): stream and dictionary targets after
   libzstd's `tests/fuzz/`, 1.7 M runs, no finding.
-- **Z16 — Decoder speed parity.** Measured 2026-09-26: 1.13–1.27× libzstd's
-  time (Zig std sources as a 20 MB and a 120 MB tar, levels 3 and 19,
-  `--long=27`, 178 small frames with a dictionary; one-shot and stream;
-  `perf`: 1.17× cycles, 1.18× instructions), where *Decoder* says
-  1.04–1.05× (2026-09-23, system binaries). Hot spots: the sequence loop,
-  Huffman literals (libzstd uses `huf_decompress_amd64.S`), and
-  `compiler_rt.memset` (byte by byte without libc, 1.7 %).
+- ~~**Z16 — Decoder speed parity.**~~ Done 2026-09-27: 0.91–1.04× libzstd's
+  cycles, see *Decoder*. The gap measured 2026-09-26 (1.13–1.27×) was a
+  byte-by-byte overlapping match copy and, in the command, a copy through
+  the writer's buffer; neither the Huffman `asm` nor `memset` mattered.
 - ~~**Z17 — Document that `nb_workers > 0` needs a thread-safe allocator.**~~
   Done 2026-09-27: `Advanced.nb_workers`, `zstdmt.zig` and
   *Multithreading* say so.

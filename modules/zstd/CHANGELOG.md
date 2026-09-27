@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **NO CONSUMER-VISIBLE CHANGE:** the decoder's
+  overlapping match copy (offset < 16) moves 8 bytes per load/store instead
+  of one byte at a time, as libzstd's `ZSTD_copy8` does: RLE-heavy input
+  decodes 1.37× → 1.03× libzstd's time, typical input 1.0× (SPEC backlog
+  Z16). Output bytes unchanged.
 - **2026-09-27** — **BEHAVIOURAL, not breaking:** `Seekable.decompress` refuses a
   frame whose decoded size differs from its seek-table entry with
   `CorruptionDetected`. Before, a table claiming a frame longer than it is made

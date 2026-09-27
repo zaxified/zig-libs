@@ -304,9 +304,18 @@ const Dst = struct {
     written: u64 = 0,
 
     fn write(d: *Dst, bytes: []const u8) void {
-        d.w.interface.writeAll(bytes) catch fatal(70, "Write error : cannot write block : {s}", .{strerror(d.w.err orelse error.InputOutput)});
+        if (bytes.len >= direct_write_min) {
+            // a whole decoder or encoder output buffer: straight from it, as
+            // `fileio.c` does, not copied through `dst_buf` first
+            d.w.interface.flush() catch fatal(70, "Write error : cannot write block : {s}", .{strerror(d.w.err orelse error.InputOutput)});
+            d.file.writeStreamingAll(d.w.io, bytes) catch |e| fatal(70, "Write error : cannot write block : {s}", .{strerror(e)});
+        } else {
+            d.w.interface.writeAll(bytes) catch fatal(70, "Write error : cannot write block : {s}", .{strerror(d.w.err orelse error.InputOutput)});
+        }
         d.written += bytes.len;
     }
+
+    const direct_write_min = 64 << 10;
 
     /// Flushes and, for a created file, closes it -- after giving it the
     /// source's permissions and times when `st` is set (`UTIL_setFDStat`,

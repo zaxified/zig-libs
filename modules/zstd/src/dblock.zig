@@ -506,6 +506,12 @@ inline fn copy8(out: []u8, op: usize, src: []const u8, ip: usize) void {
 inline fn copy16(out: []u8, op: usize, src: []const u8, ip: usize) void {
     @memcpy(out[op..][0..16], src[ip..][0..16]);
 }
+/// `ZSTD_copy8`/`ZSTD_copy4` within `out` for ranges at least `N` apart:
+/// one load, one store. `std.mem.copyForwards` would be a byte loop.
+inline fn copyWithin(comptime N: usize, out: []u8, op: usize, ip: usize) void {
+    const T = std.meta.Int(.unsigned, N * 8);
+    std.mem.writeInt(T, out[op..][0..N], std.mem.readInt(T, out[ip..][0..N], .little), .little);
+}
 
 /// `ZSTD_wildcopy`, no overlap: `src` and `out` are different buffers or
 /// at least 16 bytes apart. May write up to 32 bytes past `op + length`.
@@ -536,7 +542,7 @@ inline fn wildcopyOverlap(out: []u8, op_in: usize, ip_in: usize, length: usize) 
         var ip = ip_in;
         const oend = op + length;
         while (true) {
-            std.mem.copyForwards(u8, out[op..][0..8], out[ip..][0..8]);
+            copyWithin(8, out, op, ip);
             op += 8;
             ip += 8;
             if (op >= oend) break;
@@ -558,12 +564,12 @@ inline fn overlapCopy8(out: []u8, op: *usize, ip: *usize, offset: usize) void {
         out[op.* + 2] = out[ip.* + 2];
         out[op.* + 3] = out[ip.* + 3];
         ip.* += dec32[offset];
-        std.mem.copyForwards(u8, out[op.* + 4 ..][0..4], out[ip.*..][0..4]);
+        copyWithin(4, out, op.* + 4, ip.*);
         // C steps back by sub2 and then forward by 8; the pointer may dip
         // below the buffer in between, an index may not
         ip.* = ip.* + 8 - sub2;
     } else {
-        std.mem.copyForwards(u8, out[op.*..][0..8], out[ip.*..][0..8]);
+        copyWithin(8, out, op.*, ip.*);
         ip.* += 8;
     }
     op.* += 8;
