@@ -64,6 +64,11 @@ head -c 1000 a.zst > trunc.zst
 if "$BIN" -q -t trunc.zst 2>/dev/null; then fail "a truncated frame tested good"; fi
 ok; ok; ok; ok; ok
 
+# ------------------------------------------------------------------ benchmark
+"$BIN" -q -i0 -b3 text | grep -q '^-3 ' || fail "-b printed no result line"
+"$BIN" -i0 -b2 -d a.zst 2>/dev/null | tr '\r' '\n' | grep -q '^ 0#$' || fail "-b -d (decode only) did not finish"
+ok; ok
+
 # ------------------------------------------------ parity with the real command
 REF="$(command -v zstd || true)"
 if [ -n "$REF" ] && [ "$(readlink -f "$REF")" != "$(readlink -f "$BIN")" ] && [ "$("$REF" -qV 2>/dev/null)" = "1.5.7" ]; then
@@ -102,6 +107,12 @@ if [ -n "$REF" ] && [ "$(readlink -f "$REF")" != "$(readlink -f "$BIN")" ] && [ 
     (cd ref && "$REF" -l t19.zst plain.zst > ../list.ref 2>&1 || true)
     (cd ours && "$BIN" -l t19.zst plain.zst > ../list.ours 2>&1 || true)
     cmp -s list.ref list.ours || { diff list.ref list.ours >&2 || true; fail "--list output differs"; }
+    ok
+    # -b: the same sizes and ratios (the speeds are measurements)
+    cols() { awk '/^-/ { print $1, $2, $3, $NF }'; }
+    "$REF" -q -i0 -b1 -e3 -B64K text | cols > bench.ref
+    "$BIN" -q -i0 -b1 -e3 -B64K text | cols > bench.ours
+    [ -s bench.ref ] && cmp -s bench.ref bench.ours || { diff bench.ref bench.ours >&2 || true; fail "-b sizes differ from zstd 1.5.7"; }
     ok
     echo "smoke: parity with $REF (1.5.7) checked"
 else

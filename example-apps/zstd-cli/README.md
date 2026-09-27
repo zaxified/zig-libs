@@ -56,6 +56,25 @@ their `--long=`/`--memory=` advice, `zstdcat`/`unzstd`, bad options, the
 with the same stderr, stdout, exit code and resulting files, but for the
 differences below.
 
+## Benchmark mode (`-b`)
+
+`zstd -b#` with the C command's options (`-e#` last level, `-i#` seconds,
+`-B#` blocks, `-S` per file, `-d` decode only, `-D`, `-T#`, `--long`) and
+its output, line for line: the input cut into blocks, each compressed by a
+reused context and decompressed by a stream, timed in runs of about a
+second, the fastest run kept. The compressed sizes and ratios equal the C
+command's (`smoke.sh` checks them); the speeds are the comparison:
+
+```sh
+zstd -q -b1 -e19 -i5 big.tar            # libzstd 1.5.7
+./zig-out/bin/zstd -q -b1 -e19 -i5 big.tar   # this port, same columns
+```
+
+Build with `-Dcpu=native` (or `x86_64_v3`) for a fair comparison: libzstd
+picks its BMI2 code at run time, the port at compile time. Not ported:
+`-b` without an input file (the C command's synthetic lorem-ipsum and
+`-P#` data).
+
 ## Deliberately different
 
 - **The banner** (`-V`, `-v`) says `zig-libs port` where the C command names
@@ -71,8 +90,7 @@ differences below.
 ## Not ported yet
 
 Refused by name (`zstd: X is not supported by this port yet`), never parsed
-and ignored: benchmark mode `-b` (with `-e`, `-i`, `-S`, `-P` read as the C
-command reads them), dictionary training (`--train*`, `--maxdict`,
+and ignored: `-b` without an input file, `-p` (pause), dictionary training (`--train*`, `--maxdict`,
 `--dictID`, `-s`), `--adapt`, `--patch-from`, `--zstd=`, `--max`, `-r` and
 `--filelist`, `--output-dir-*`, `--show-default-cparams`, `--trace`, the
 progress counter (stderr on a terminal) and the `--fake-*-is-console`

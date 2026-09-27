@@ -16,6 +16,7 @@ const zstd = @import("zstd");
 const disp = @import("display.zig");
 const fio = @import("fileio.zig");
 const list = @import("list.zig");
+const bench = @import("bench.zig");
 
 const version = "v1.5.7";
 const version_string = "1.5.7";
@@ -50,6 +51,12 @@ const Cli = struct {
     mem_limit: u32 = 0,
     ldm: bool = false,
     adapt: bool = false,
+    bench: bench.Params = .{},
+    /// `-e#`: the last level benchmarked; below the first means just it.
+    level_last: i32 = std.math.minInt(i32),
+    separate_files: bool = false,
+    /// `-P#`: a synthetic input of this compressibility (not ported).
+    compressibility: ?u32 = null,
 };
 
 const Env = fio.Env;
@@ -304,6 +311,38 @@ fn defaultThreads(environ: std.process.Environ) u32 {
 
 fn isConsole(io: std.Io, f: std.Io.File) bool {
     return f.isTty(io) catch false;
+}
+
+/// The benchmark branch of `main` in zstdcli.c.
+fn runBench(env: Env, c: *Cli, nb_workers: u32) u8 {
+    c.bench.block_size = c.prefs.block_size;
+    c.bench.target_cblock_size = c.prefs.target_cblock_size;
+    c.bench.nb_workers = nb_workers;
+    c.bench.ldm = c.ldm;
+    c.bench.ldm_min_match = c.prefs.ldm_min_match;
+    c.bench.ldm_hash_log = c.prefs.ldm_hash_log;
+    c.bench.row_match_finder = c.prefs.row_match_finder;
+    c.bench.literal_compression = c.prefs.literal_compression;
+    var first = c.level;
+    var last = c.level_last;
+    if (c.bench.mode == .decode_only) {
+        first = 0;
+        last = 0;
+    }
+    if (first > zstd.max_level) first = zstd.max_level;
+    if (last > zstd.max_level) last = zstd.max_level;
+    if (last < first) last = first;
+    disp.at(3, "Benchmarking ", .{});
+    if (c.names.items.len > 1) disp.at(3, "{d} files ", .{c.names.items.len});
+    if (last > first) disp.at(3, "from level {d} to {d} ", .{ first, last }) else disp.at(3, "at level {d} ", .{first});
+    disp.at(3, "using {d} threads \n", .{nb_workers});
+    if (c.names.items.len == 0) return unsupported("a benchmark without an input file (synthetic data)");
+    if (c.separate_files) {
+        var r: u8 = 0;
+        for (c.names.items) |n| r = bench.benchFiles(env, &.{n}, c.dict_name, first, last, c.cp, &c.bench);
+        return r;
+    }
+    return bench.benchFiles(env, c.names.items, c.dict_name, first, last, c.cp, &c.bench);
 }
 
 fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: std.process.Environ) u8 {
@@ -610,6 +649,7 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                     a = a[1..];
                 },
                 'd' => {
+                    c.bench.mode = .decode_only;
                     if (c.operation == .bench) {
                         a = a[1..];
                     } else {
@@ -668,13 +708,26 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                     a = a[1..];
                 },
                 'r' => return unsupported("-r"),
-                'b' => return unsupported("benchmark mode (-b)"),
-                // benchmark-only settings: read, and without -b of no effect
-                'e', 'i', 'P' => {
+                'b' => {
+                    c.operation = .bench;
                     a = a[1..];
-                    _ = readU32(&a);
                 },
-                'S' => a = a[1..],
+                'e' => {
+                    a = a[1..];
+                    c.level_last = @intCast(@min(readU32(&a), std.math.maxInt(i32)));
+                },
+                'i' => {
+                    a = a[1..];
+                    c.bench.nb_seconds = readU32(&a);
+                },
+                'S' => {
+                    c.separate_files = true;
+                    a = a[1..];
+                },
+                'P' => {
+                    a = a[1..];
+                    c.compressibility = readU32(&a);
+                },
                 'B' => {
                     a = a[1..];
                     c.prefs.block_size = readU32(&a);
@@ -684,7 +737,12 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                     c.nb_workers = readU32(&a);
                 },
                 's' => return unsupported("dictionary training"),
-                'p' => return unsupported("-p"),
+                'p' => {
+                    a = a[1..];
+                    if (a.len > 0 and a[0] >= '0' and a[0] <= '9') {
+                        c.bench.additional_param = @intCast(@min(readU32(&a), std.math.maxInt(i32)));
+                    } else return unsupported("-p (pause at the end)");
+                },
                 else => {
                     const short = [2]u8{ '-', a[0] };
                     return badUsage(program, &short);
@@ -725,6 +783,8 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
     if (c.operation == .list) {
         return list.listMultiple(env, c.names.items, disp.level, isConsole(env.io, std.Io.File.stdin()));
     }
+
+    if (c.operation == .bench) return runBench(env, &c, nb_workers);
 
     if (c.operation == .@"test") {
         c.prefs.test_mode = true;
