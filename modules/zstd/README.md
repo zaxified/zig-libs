@@ -60,7 +60,11 @@ libc.
   streaming: 0.87–1.15× its CPU cycles (min of 3 runs on a pinned core,
   ReleaseFast, 3–12 MB text/CSV/ELF inputs, levels −5…19; the upper end on
   a loaded machine, 1.03–1.07× on a quieter one) and 0.95–1.15× its
-  instructions (see SPEC.md, *Speed*). Level 19 compresses about
+  instructions (see SPEC.md, *Speed*). **Build for the CPU you run on**
+  (`-Dcpu=x86_64_v3` or `native`): libzstd picks its BMI2 paths at run time,
+  this port only at compile time, so a baseline x86-64 build compresses in
+  1.15–1.25× libzstd's cycles and decodes at 893 MB/s where a `native` one
+  decodes at 1043 (libzstd 1174). Level 19 compresses about
   2 MB/s; level 22 about 2.4 MB/s on a 70 MB input (libzstd: 2.5). Memory:
   the match tables for the chosen level, allocated per call and freed before
   it returns — 64 + 16 MiB at level 19 on inputs over 256 KB, up to 256 +

@@ -1263,11 +1263,14 @@ path (13/4000 random single-byte-flip corruptions of dictionary-compressed
 frames in a throwaway differential run hit this; every other corrupted
 input and every valid one, output and error class alike, matched).
 
-Speed: 1.04–1.05× libzstd's decode time on 200 MB of system binaries
-compressed at levels 3 and 19 (decode only, best of 5, ReleaseFast). std's
-decoder takes 30× libzstd's time on the same frames, which is why this is a
-port and not an extension of it. Dictionary decoding was not separately
-measured (no compressor support yet to produce a realistic corpus, Z4).
+Speed: 1.13–1.27× libzstd's decode time (2026-09-26: Zig's std sources as
+a 20 MB and a 120 MB tar at levels 3 and 19 and `--long=27`, and 178 small
+frames compressed with a dictionary; one-shot and streamed; `perf` 1.17×
+the cycles, 1.18× the instructions), where the first measurement
+(2026-09-23, 200 MB of system binaries at levels 3 and 19, decode only,
+best of 5, ReleaseFast) gave 1.04–1.05×; closing the gap is backlog Z16.
+std's decoder takes 30× libzstd's time on the same frames, which is why
+this is a port and not an extension of it.
 
 `Decompressor` holds the tables and a 128 KB literal buffer (≈ 190 KB) on
 the heap; `decompress` allocates one per call. A `DDict` adds its content
@@ -1931,10 +1934,12 @@ schedule. Seeds are libzstd's own dictionary frames (`dict_kats.zig`, with
 and without magic, `dict_reps`), and a test checks they arrive intact and
 decode to their content. One coverage-guided run (ReleaseSafe, under the
 `scripts/lib/capped` cgroup): 1 725 498 runs, 7 936 unique, no crash.
-`scripts/fuzz-sweep.sh zstd` cannot run it — its calibration replays the
-whole test binary (a 2-minute compile and 4 minutes of goldens) inside a
-300-second window and reports HANG — so the run was
+`scripts/fuzz-sweep.sh zstd` could not run it then — its calibration
+replayed the whole test binary (a 2-minute compile and 4 minutes of
+goldens) inside a 300-second window and reported HANG — so the run was
 `zig build test-zstd --release=safe -Dtest-filter="never crash" --fuzz=N`.
+The sweep now builds only the harnesses (one `-Dtest-filter` per fuzz
+test), and `fuzz-sweep.sh zstd` works (2000/harness: 11 644 runs, 38 s).
 
 **Streaming decoder (Z2b, 2026-09-23).** `dstream_test.zig` replays
 libzstd's `ZSTD_decompressStream` call by call on the same frames — return
@@ -2624,15 +2629,16 @@ dictionaries are undecided.
     `compressBound` (`error.NoSpaceLeft`): its callers get the whole frame
     or nothing, and libzstd's `ZSTD_compress2` below the bound is left for
     a caller that asks.
-- **Z2 — Decoder.** ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
+- ~~**Z2 — Decoder.**~~ ~~**Z2a**~~ done 2026-09-23: the one-shot decoder,
   checksum verification, concatenated and skippable frames and the frame
   utilities, ported from libzstd (std's decoder takes 30× libzstd's time,
-  so it was not the base); see *Decoder*. Left:
+  so it was not the base); see *Decoder*.
   - ~~**Z2b — streaming**~~ done 2026-09-23: `DecompressStream`
     (`ZSTD_decompressStream`), `decompressContinue`, `DecompressReader`.
-  - **Z2c — dictionaries**: raw-content and zstd-format (`ZSTD_loadDEntropy`:
-    entropy tables, repcodes, content as history), a reusable `DDict`, and
-    the multiple-dictionary table. **~1 session**; together with Z4.
+  - ~~**Z2c — dictionaries**~~ done 2026-09-24: raw-content and
+    zstd-format (`ZSTD_loadDEntropy`: entropy tables, repcodes, content as
+    history), a reusable `DDict`, and the multiple-dictionary table; see
+    *Decoder* (*Dictionaries*).
   Legacy (pre-v0.8) formats: no. Magicless frames: done with Z6.
 - ~~**Z3 — Index overflow correction.**~~ Done 2026-09-23, see
   *Algorithm*. (The row tag table needs no reduction: it holds tags and
@@ -2730,8 +2736,9 @@ suggested order Z17 → Z18 → Z15 → Z16, Z20 along the way:
   `dict_reps`) kills dropping `st.rep = e.rep` (see *Open*).
 - **Z19 — Measure dictionary compression and training against libzstd.**
   Never measured. Low priority until a consumer uses dictionaries.
-- **Z20 — Stale text:** Z2c above, and *Decoder*'s "dictionary decoding was
-  not separately measured (… Z4)" and its speed figure (with Z16).
+- ~~**Z20 — Stale text:**~~ Done 2026-09-27: Z2c struck, *Decoder*'s speed
+  paragraph carries the 2026-09-26 measurement (dictionary frames
+  included).
 
 From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
 `lib/`, pinned core, the same bytes at every level):
@@ -2748,8 +2755,9 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   port gets them only from the build's target. Built for baseline x86-64,
   compression takes 1.15–1.25× libzstd's cycles (1.05–1.09× with
   `-mcpu=native`) and decoding 893 vs 1043 MB/s. Zig 0.16 has no
-  per-function target features, so for now: say so in the README (build
-  with `-mcpu=x86_64_v3` or `native`); revisit dispatch when Zig can.
+  per-function target features, so ~~say so in the README~~ (done
+  2026-09-27: *Speed* bullet, build with `-Dcpu=x86_64_v3` or `native`);
+  still open: revisit run-time dispatch when Zig can.
 - **Z23 — Seekable format** (libzstd's `contrib/seekable_format`):
   independent frames plus a seek table in a skippable frame, for random
   access and parallel decoding of archives. Beyond libzstd's library.
