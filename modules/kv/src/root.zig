@@ -233,6 +233,15 @@ pub const Storage = struct {
         /// Hand a `Ref` back. Must be non-null whenever `preadRef` is.
         releaseRef: ?*const fn (ctx: *anyopaque, ref: Ref) void = null,
 
+        /// Optional preallocation (`Storage.allocate`). `null` (the default)
+        /// means this backend cannot reserve space; a backend that can in
+        /// general but not on this particular file or filesystem returns
+        /// `false`. Defaulted for the same reason as `preadRef`.
+        allocate: ?*const fn (ctx: *anyopaque, h: Handle, len: u64) Error!bool = null,
+        /// Optional data-only sync (`Storage.syncData`). `null` means the
+        /// backend has none, and `syncData` falls back to `sync`.
+        syncData: ?*const fn (ctx: *anyopaque, h: Handle) Error!void = null,
+
         /// Self-check for a backend author: true iff `preadRef` and
         /// `releaseRef` are either both set or both null. `Storage.releaseRef`
         /// panics at the first borrow release if this is false — call this
@@ -306,6 +315,39 @@ pub const Storage = struct {
     }
     pub fn truncate(s: Storage, h: Handle, len: u64) Error!void {
         return s.vtable.truncate(s.ctx, h, len);
+    }
+
+    /// Make the file at least `len` bytes long with its blocks reserved, the
+    /// added range reading as zeros — `fallocate(fd, 0, 0, len)`. Never
+    /// shrinks a file and never changes a byte already in it. Returns
+    /// `false`, having done nothing, when the backend or the filesystem
+    /// cannot preallocate; that is not an error, because nothing that
+    /// follows depends on it for correctness.
+    ///
+    /// What it is for: writes into a reserved range cannot fail for lack of
+    /// space, and they do not change the file's size, so `syncData` after
+    /// them has no size to record — on ext4 that took an append-and-sync
+    /// loop from about 305 to about 850 per second (2026-09-27, NVMe). It
+    /// needs the size-extending form: reserving with `FALLOC_FL_KEEP_SIZE`
+    /// measured no faster than not reserving at all.
+    ///
+    /// ⚠ The new length, like a write, is durable only after `sync` (or
+    /// `syncData`). And a reader of the file now sees zeros past the data:
+    /// a format written this way must recognise a zero tail as "no more
+    /// data yet", not as a torn record.
+    pub fn allocate(s: Storage, h: Handle, len: u64) Error!bool {
+        const f = s.vtable.allocate orelse return false;
+        return f(s.ctx, h, len);
+    }
+
+    /// Make the file's data durable, and its metadata only as far as reading
+    /// that data back needs it (`fdatasync`): the size when it changed, not
+    /// the modification time. The same guarantee for the bytes as `sync`,
+    /// cheaper when the size did not change (see `allocate`). A backend
+    /// without it does a full `sync` — a stronger promise, never a weaker one.
+    pub fn syncData(s: Storage, h: Handle) Error!void {
+        if (s.vtable.syncData) |f| return f(s.ctx, h);
+        return s.vtable.sync(s.ctx, h);
     }
     pub fn close(s: Storage, h: Handle) void {
         s.vtable.close(s.ctx, h);
@@ -449,7 +491,11 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             .delete = vDelete,
             .syncDir = vSyncDir,
             .tryLockExclusive = vTryLockExclusive,
+            .allocate = if (is_linux) vAllocate else null,
+            .syncData = if (is_linux) vSyncData else null,
         };
+
+        const is_linux = @import("builtin").os.tag == .linux;
 
         fn cast(ctx: *anyopaque) *Self {
             return @ptrCast(@alignCast(ctx));
@@ -518,6 +564,42 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             const self = cast(ctx);
             if (self.read_only[h]) return error.AccessDenied;
             self.fileOf(h).setLength(self.io, len) catch |e| return mapErr(e);
+        }
+
+        /// `fallocate(fd, 0, 0, len)`, straight to the syscall: `std.Io.File`
+        /// has no preallocation. A filesystem without it (`EOPNOTSUPP`) is
+        /// `false`, not an error.
+        fn vAllocate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!bool {
+            const self = cast(ctx);
+            if (self.read_only[h]) return error.AccessDenied;
+            const fd = self.fileOf(h).handle;
+            const signed_len = std.math.cast(i64, len) orelse return error.NoSpaceLeft;
+            while (true) {
+                switch (linux.errno(linux.fallocate(fd, 0, 0, signed_len))) {
+                    .SUCCESS => return true,
+                    .INTR => continue,
+                    .OPNOTSUPP, .NOSYS => return false,
+                    .NOSPC, .DQUOT, .FBIG => return error.NoSpaceLeft,
+                    .IO => return error.InputOutput,
+                    .BADF, .PERM, .ACCES, .ROFS, .TXTBSY => return error.AccessDenied,
+                    else => return error.Unexpected,
+                }
+            }
+        }
+
+        /// `fdatasync(fd)`, straight to the syscall: `std.Io.File` has only
+        /// `sync`.
+        fn vSyncData(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
+            const self = cast(ctx);
+            while (true) {
+                switch (linux.errno(linux.fdatasync(self.fileOf(h).handle))) {
+                    .SUCCESS => return,
+                    .INTR => continue,
+                    .IO => return error.InputOutput,
+                    .NOSPC, .DQUOT => return error.NoSpaceLeft,
+                    else => return error.Unexpected,
+                }
+            }
         }
 
         fn vClose(ctx: *anyopaque, h: Storage.Handle) void {
@@ -2074,4 +2156,47 @@ test "lock: the lock dies with the holding process (SIGKILL, zero cleanup)" {
     // ...and the dead process's durable write is there, which also proves it
     // really was operating on THIS store and not a private copy.
     try expectGet(&db, "owner", "child");
+}
+
+test "FsStorage: allocate reserves zeros past the data; syncData makes writes into them durable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs = FsStorage.init(std.testing.io, tmp.dir);
+    const st = fs.storage();
+    const h = try st.open("f", .create_truncate);
+    defer st.close(h);
+    try st.writeAll(h, "hello", 0);
+    if (!try st.allocate(h, 4096)) return error.SkipZigTest; // a filesystem without fallocate
+    try std.testing.expectEqual(@as(u64, 4096), try st.size(h));
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 16), try st.pread(h, &buf, 0));
+    try std.testing.expectEqualSlices(u8, "hello" ++ "\x00" ** 11, &buf);
+
+    try st.writeAll(h, "world", 5);
+    try st.syncData(h);
+    try std.testing.expectEqual(@as(u64, 4096), try st.size(h)); // still the reservation
+    try std.testing.expectEqual(@as(usize, 16), try st.pread(h, &buf, 0));
+    try std.testing.expectEqualSlices(u8, "helloworld" ++ "\x00" ** 6, &buf);
+    try std.testing.expect(try st.allocate(h, 100)); // never shrinks
+    try std.testing.expectEqual(@as(u64, 4096), try st.size(h));
+
+    const ro = try st.open("f", .read_only);
+    defer st.close(ro);
+    try std.testing.expectError(error.AccessDenied, st.allocate(ro, 8192));
+}
+
+test "Storage: a backend without allocate answers false; syncData falls back to sync" {
+    var sim = SimStorage.init(std.testing.allocator);
+    defer sim.deinit();
+    var vt = sim.storage().vtable.*;
+    vt.allocate = null;
+    vt.syncData = null;
+    const st: Storage = .{ .ctx = &sim, .vtable = &vt };
+    const h = try st.open("f", .open_or_create);
+    try std.testing.expect(!try st.allocate(h, 100));
+    try std.testing.expectEqual(@as(u64, 0), try st.size(h)); // and did nothing
+    try st.writeAll(h, "x", 0);
+    const before = sim.ops_seen;
+    try st.syncData(h);
+    try std.testing.expectEqual(before + 1, sim.ops_seen); // the full sync ran
 }

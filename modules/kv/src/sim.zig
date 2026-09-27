@@ -62,8 +62,8 @@
 //!     (WASI, some FUSE/network mounts) → `error.LockUnsupported`.
 //!
 //! Injection points (side effects that count toward `ops_until_crash`):
-//! `open`, `writeAll`, `sync`, `truncate`, `rename`, `delete`, `syncDir`,
-//! `tryLockExclusive`. Pure reads (`pread`, `size`) and `close` are not side
+//! `open`, `writeAll`, `sync` (and `syncData`), `allocate`, `truncate`,
+//! `rename`, `delete`, `syncDir`, `tryLockExclusive`. Pure reads (`pread`, `size`) and `close` are not side
 //! effects — crashing "at" them is indistinguishable from crashing before
 //! the next side effect.
 
@@ -163,6 +163,8 @@ pub const SimStorage = struct {
         /// The file's length immediately before this write. Undoing in reverse
         /// order restores both the bytes and the length exactly.
         old_file_len: usize = 0,
+        /// An `allocate` (zeros added past the end), not a write.
+        alloc: bool = false,
     };
 
     /// Sentinel lock holder standing for "a different process holds it" —
@@ -173,6 +175,14 @@ pub const SimStorage = struct {
     const SimFile = struct {
         content: std.ArrayListUnmanaged(u8) = .empty,
         durable_len: usize = 0,
+        /// Where the written data ends. Past it, up to `content.len`, lies
+        /// only what `allocate` added: zeros nothing has written. Equal to
+        /// `content.len` for a file never preallocated. A write there is an
+        /// append into reserved space, not an overwrite — and, unsynced, it
+        /// is lost to zeros by a crash, although it did not grow the file.
+        data_len: usize = 0,
+        /// `data_len` at the last durability barrier.
+        durable_data_len: usize = 0,
         /// Byte-ranges written (in issue order) since the last `sync` /
         /// `truncate` / `create_truncate` on this file. Consumed by
         /// `.reorder_unsynced` to drop a subset; cleared by every barrier.
@@ -244,6 +254,8 @@ pub const SimStorage = struct {
         const f = self.names.get(path).?;
         try f.content.appendSlice(self.gpa, bytes);
         f.durable_len = f.content.items.len;
+        f.data_len = f.content.items.len;
+        f.durable_data_len = f.data_len;
         self.clearUnsynced(f); // all content is now durable
     }
 
@@ -275,6 +287,8 @@ pub const SimStorage = struct {
         const f = try self.newFile();
         try f.content.appendSlice(self.gpa, bytes);
         f.durable_len = bytes.len;
+        f.data_len = bytes.len;
+        f.durable_data_len = bytes.len;
         try putName(self.gpa, &self.names, path, f);
         try putName(self.gpa, &self.durable_names, path, f);
     }
@@ -311,17 +325,15 @@ pub const SimStorage = struct {
                 // meta record). It stays optimistic about an in-place
                 // overwrite; `.lose_unsynced` is the mode that proves fsync
                 // discipline, and that is the one that changed.
-                .torn_tail => {
-                    const keep = f.durable_len + (f.content.items.len - f.durable_len) / 2;
-                    f.content.shrinkRetainingCapacity(keep);
-                    f.durable_len = keep;
-                },
+                .torn_tail => self.crashTorn(f),
                 .reorder_unsynced => self.crashReorder(f),
             }
             // The surviving content is now what is on media; the un-synced
             // window is consumed. (Post-crash the machine is dead until
             // `reboot`, after which a fresh `open` reads only `content`.)
             f.durable_len = f.content.items.len;
+            f.data_len = @min(f.data_len, f.content.items.len);
+            f.durable_data_len = f.data_len;
             self.clearUnsynced(f);
             // Our descriptors die with the process, so the kernel drops every
             // advisory lock we held — the reason a crashed writer can never
@@ -338,6 +350,29 @@ pub const SimStorage = struct {
             .lose_unsynced, .torn_tail, .reorder_unsynced => copyNames(self.gpa, &self.names, &self.durable_names),
         }
         self.crashed = true;
+    }
+
+    /// `.torn_tail` collapse for one file: half of the un-synced growth
+    /// survives. Writes into preallocated zeros do not grow the file, so the
+    /// length rule alone would keep every one of them — more durable than a
+    /// disk, in the direction that hides a missing sync. They are torn the
+    /// same way: the first half of the un-synced written data inside the
+    /// reserved range survives, the rest is zeros again.
+    fn crashTorn(self: *SimStorage, f: *SimFile) void {
+        _ = self;
+        const reserved = f.durable_len; // what was durably there, zeros included
+        const keep = reserved + (f.content.items.len - reserved) / 2;
+        f.content.shrinkRetainingCapacity(keep);
+        const lo = f.durable_data_len;
+        const hi = @min(f.data_len, reserved);
+        if (hi > lo) {
+            const keep_data = lo + (hi - lo) / 2;
+            @memset(f.content.items[keep_data..hi], 0);
+            // Anything the length rule kept past the reserved range is data.
+            f.data_len = if (keep > reserved) keep else keep_data;
+        } else {
+            f.data_len = @min(f.data_len, keep);
+        }
     }
 
     /// `.reorder_unsynced` collapse for one file: keep the fsync'd durable
@@ -386,6 +421,14 @@ pub const SimStorage = struct {
         }
         f.content.shrinkRetainingCapacity(new_len);
         if (punched) self.holes_punched += 1;
+        // Written data ends at the last surviving write (an allocation is
+        // not data).
+        var s3 = self.reorder_seed;
+        var data_end: usize = @min(f.durable_data_len, new_len);
+        for (ranges) |r| {
+            if (splitmix(&s3) & 1 == 0 and !r.alloc) data_end = @max(data_end, @min(r.off + r.len, new_len));
+        }
+        f.data_len = data_end;
     }
 
     fn newFile(self: *SimStorage) !*SimFile {
@@ -438,6 +481,12 @@ pub const SimStorage = struct {
         .delete = vDelete,
         .syncDir = vSyncDir,
         .tryLockExclusive = vTryLockExclusive,
+        .allocate = vAllocate,
+        // The simulator makes no difference between `fdatasync` and `fsync`:
+        // for the bytes they promise the same, and the size — the metadata
+        // `fdatasync` may skip — is needed to read the bytes back, so it
+        // persists too. What `fdatasync` really skips (times) is not modelled.
+        .syncData = vSync,
     };
 
     fn cast(ctx: *anyopaque) *SimStorage {
@@ -456,6 +505,8 @@ pub const SimStorage = struct {
                         // Model O_TRUNC as immediately effective (see module doc).
                         existing.content.clearRetainingCapacity();
                         existing.durable_len = 0;
+                        existing.data_len = 0;
+                        existing.durable_data_len = 0;
                         self.clearUnsynced(existing);
                     },
                 }
@@ -515,7 +566,8 @@ pub const SimStorage = struct {
         // The kv store never overwrites already-durable bytes (append-only +
         // truncate-first discipline) — a violation is a store bug. Consumers
         // with an overwriting page model opt out via `allow_overwrite`.
-        std.debug.assert(self.allow_overwrite or off >= f.durable_len or self.crash_mode == .keep_unsynced);
+        // Reserved zeros past the written data are not an overwrite.
+        std.debug.assert(self.allow_overwrite or off >= @min(f.durable_len, f.data_len) or self.crash_mode == .keep_unsynced);
         self.ops_seen += 1;
         if (self.ops_until_crash) |*n| {
             if (n.* == 0) {
@@ -550,7 +602,10 @@ pub const SimStorage = struct {
         // store has nothing under the write, and pays neither the copy nor the
         // allocation.
         var undo: []u8 = &.{};
-        if (self.allow_overwrite and start < old_file_len) {
+        // A write into reserved zeros is undone too: without it a crash
+        // would keep a write that never reached the disk.
+        const into_reserved = start >= f.data_len;
+        if ((self.allow_overwrite or into_reserved) and start < old_file_len) {
             undo = try self.gpa.dupe(u8, f.content.items[start..@min(end, old_file_len)]);
         }
         errdefer self.gpa.free(undo);
@@ -569,6 +624,24 @@ pub const SimStorage = struct {
             .old = undo,
             .old_file_len = old_file_len,
         });
+        f.data_len = @max(f.data_len, end);
+    }
+
+    fn vAllocate(ctx: *anyopaque, h: Storage.Handle, len: u64) Storage.Error!bool {
+        const self = cast(ctx);
+        if (self.crashed) return error.Crashed;
+        if (self.handle_read_only.items[h]) return error.AccessDenied;
+        if (self.inject()) return error.Crashed;
+        const f = self.fileOf(h);
+        const want = std.math.cast(usize, len) orelse return error.NoSpaceLeft;
+        const old = f.content.items.len;
+        if (want <= old) return true; // never shrinks, never touches data
+        f.unsynced_writes.ensureUnusedCapacity(self.gpa, 1) catch return error.OutOfMemory;
+        f.content.resize(self.gpa, want) catch return error.OutOfMemory;
+        @memset(f.content.items[old..want], 0);
+        // Volatile until the next sync, like a write that grows the file.
+        f.unsynced_writes.appendAssumeCapacity(.{ .off = old, .len = want - old, .old_file_len = old, .alloc = true });
+        return true;
     }
 
     fn vSync(ctx: *anyopaque, h: Storage.Handle) Storage.Error!void {
@@ -577,6 +650,7 @@ pub const SimStorage = struct {
         if (self.inject()) return error.Crashed; // crash BEFORE durability advances
         const f = self.fileOf(h);
         f.durable_len = f.content.items.len;
+        f.durable_data_len = f.data_len;
         self.clearUnsynced(f); // barrier: all writes durable
     }
 
@@ -589,6 +663,8 @@ pub const SimStorage = struct {
         std.debug.assert(len <= f.content.items.len);
         f.content.shrinkRetainingCapacity(@intCast(len));
         f.durable_len = @min(f.durable_len, f.content.items.len);
+        f.data_len = @min(f.data_len, f.content.items.len);
+        f.durable_data_len = @min(f.durable_data_len, f.content.items.len);
         self.dropUnsyncedAbove(f, @intCast(len)); // ranges past the cut are gone
     }
 
@@ -631,6 +707,7 @@ pub const SimStorage = struct {
         // Belt: the window began at a barrier, so undoing all of it must land
         // exactly on the durable length.
         std.debug.assert(f.content.items.len == f.durable_len or f.unsynced_writes.items.len == 0);
+        f.data_len = @min(f.durable_data_len, f.content.items.len);
         self.clearUnsynced(f);
     }
 
@@ -731,6 +808,146 @@ test "sim: write is volatile until sync; crash loses unsynced tail" {
     var buf: [7]u8 = undefined;
     try testing.expectEqual(@as(usize, 7), try st.pread(h2, &buf, 0));
     try testing.expectEqualStrings("durable", &buf);
+}
+
+test "sim: allocate adds zeros that are volatile until sync, and never shrinks or touches data" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    try st.writeAll(h, "abc", 0);
+    try st.sync(h);
+    try st.syncDir();
+    try testing.expect(try st.allocate(h, 10));
+    try testing.expectEqual(@as(u64, 10), try st.size(h));
+    try testing.expectEqualSlices(u8, "abc\x00\x00\x00\x00\x00\x00\x00", sim.fileContent("f").?);
+    try testing.expect(try st.allocate(h, 5)); // shorter than the file: nothing changes
+    try testing.expectEqual(@as(u64, 10), try st.size(h));
+
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.sync(h));
+    sim.reboot();
+    try testing.expectEqualSlices(u8, "abc", sim.fileContent("f").?); // the allocation was never synced
+
+    const h2 = try st.open("f", .open_or_create);
+    try testing.expect(try st.allocate(h2, 10));
+    try st.sync(h2);
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.sync(h2));
+    sim.reboot();
+    try testing.expectEqual(@as(usize, 10), sim.fileContent("f").?.len); // now it was
+}
+
+/// "abc" written and a 16-byte reservation, both synced; then `bytes` written
+/// at 3 without a sync, and a crash in `mode`. Returns the surviving content.
+fn reservedWriteThenCrash(sim: *SimStorage, mode: CrashMode, bytes: []const u8, sync_first: bool) ![]u8 {
+    sim.crash_mode = mode;
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    try st.writeAll(h, "abc", 0);
+    try testing.expect(try st.allocate(h, 16));
+    try st.sync(h);
+    try st.syncDir();
+    // Below the durable length, but into zeros nothing wrote: an append into
+    // reserved space, which the overwrite tripwire must let through.
+    try st.writeAll(h, bytes, 3);
+    try testing.expectEqual(@as(u64, 16), try st.size(h)); // the file did not grow
+    if (sync_first) try st.syncData(h);
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.syncDir());
+    sim.reboot();
+    return sim.fileContent("f").?;
+}
+
+test "sim: a write into reserved zeros is lost to zeros by a crash before its sync, and kept after" {
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const got = try reservedWriteThenCrash(&sim, .lose_unsynced, "XYZ", false);
+        try testing.expectEqualSlices(u8, "abc" ++ "\x00" ** 13, got);
+    }
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const got = try reservedWriteThenCrash(&sim, .lose_unsynced, "XYZ", true);
+        try testing.expectEqualSlices(u8, "abcXYZ" ++ "\x00" ** 10, got);
+    }
+    {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const got = try reservedWriteThenCrash(&sim, .keep_unsynced, "XYZ", false);
+        try testing.expectEqualSlices(u8, "abcXYZ" ++ "\x00" ** 10, got);
+    }
+    {
+        // Torn: the first half of the un-synced data survives — as it would
+        // had the write grown the file.
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        const got = try reservedWriteThenCrash(&sim, .torn_tail, "12345678", false);
+        try testing.expectEqualSlices(u8, "abc1234" ++ "\x00" ** 9, got);
+    }
+}
+
+test "sim: reorder over reserved zeros keeps or zeroes each write whole, and the size" {
+    var saw_hole = false;
+    for (0..32) |seed| {
+        var sim = SimStorage.init(testing.allocator);
+        defer sim.deinit();
+        sim.crash_mode = .reorder_unsynced;
+        sim.reorder_seed = seed;
+        const st = sim.storage();
+        const h = try st.open("f", .open_or_create);
+        try testing.expect(try st.allocate(h, 12));
+        try st.sync(h);
+        try st.syncDir();
+        try st.writeAll(h, "1111", 0);
+        try st.writeAll(h, "2222", 4);
+        try st.writeAll(h, "3333", 8);
+        sim.ops_until_crash = 0;
+        try testing.expectError(error.Crashed, st.sync(h));
+        sim.reboot();
+        const got = sim.fileContent("f").?;
+        try testing.expectEqual(@as(usize, 12), got.len);
+        for (0..3) |i| {
+            const part = got[i * 4 ..][0..4];
+            const digit: u8 = '1' + @as(u8, @intCast(i));
+            try testing.expect(std.mem.allEqual(u8, part, digit) or std.mem.allEqual(u8, part, 0));
+        }
+        if (got[0] == 0 and got[8] != 0) saw_hole = true;
+    }
+    try testing.expect(saw_hole);
+}
+
+test "sim: truncate cuts reserved space too, and writing on from the cut is an append" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    try st.writeAll(h, "abcdef", 0);
+    try testing.expect(try st.allocate(h, 16));
+    try st.sync(h);
+    try st.truncate(h, 3);
+    try st.sync(h);
+    try testing.expectEqualSlices(u8, "abc", sim.fileContent("f").?);
+    try st.writeAll(h, "Z", 3); // at the new end: allowed
+    try st.syncData(h);
+    try testing.expectEqualSlices(u8, "abcZ", sim.fileContent("f").?);
+}
+
+test "sim: syncData is a durability barrier, like sync" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+    const h = try st.open("f", .open_or_create);
+    try st.syncDir();
+    try st.writeAll(h, "data", 0);
+    const before = sim.ops_seen;
+    try st.syncData(h);
+    try testing.expectEqual(before + 1, sim.ops_seen); // a side effect the sweeps crash at
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.syncDir());
+    sim.reboot();
+    try testing.expectEqualSlices(u8, "data", sim.fileContent("f").?);
 }
 
 test "sim: keep_unsynced crash keeps everything written" {

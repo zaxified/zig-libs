@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — `Storage.allocate` (`fallocate`, returns `false` when the backend or
+  filesystem cannot) and `Storage.syncData` (`fdatasync`, `sync` where absent): optional
+  vtable slots defaulting to `null`, so no implementer has to change. `FsStorage` has
+  both on Linux. `SimStorage` models reserved zeros: a write into them is not an
+  overwrite for the tripwire, and is lost, torn or reordered by a crash like any
+  un-synced write although it did not grow the file. Measured: appends into reserved
+  space + `fdatasync` 2.7× the rate of growing the file (ext4, NVMe).
 - **2026-09-22** — `Storage.OpenMode.read_only`: open an existing file for reading
   only — never created (`error.FileNotFound`), emptied or written (`writeAll`/`truncate`
   → `error.AccessDenied`, refused by the backend). ⚠ Implementers of `Storage` must

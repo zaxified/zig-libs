@@ -175,6 +175,12 @@ does the backend guarantees the bytes neither move nor change nor are freed.
 `pagecache` is the implementor today and `kvtree`'s read descent the caller; see
 `SPEC.md`.
 
+Two more optional slots: `allocate` (`fallocate`: reserve space; the file reads
+as zeros past its data) and `syncData` (`fdatasync`; `sync` where absent). With
+both, an append-and-sync loop into reserved space ran 2.7× faster on ext4 than
+growing the file. `FsStorage` has them on Linux; `SimStorage` models reserved
+zeros faithfully across all four crash modes. See `SPEC.md`.
+
 ## VOPR extras: pluggable fault scheduling + failing-seed search
 
 Beyond the fixed sweep, `vopr.zig` runs thousands of *randomized* fault

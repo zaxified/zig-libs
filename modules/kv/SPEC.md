@@ -42,6 +42,48 @@ to `releaseRef` exactly once; between the two, the backend guarantees the bytes
 neither move nor change nor are freed. `pagecache` is the implementor today
 (it holds page bytes in its own memory); `kvtree`'s read descent is the caller.
 
+## Optional preallocation and data-only sync
+
+`allocate` and `syncData` are two more `?*const fn` slots defaulting to `null`
+(2026-09-27, asked for by `seglog`).
+
+- `Storage.allocate(h, len) → bool` is `fallocate(fd, 0, 0, len)`: the file
+  becomes at least `len` long with its blocks reserved, reading as zeros past the
+  data; it never shrinks a file or changes a byte. `false` — nothing done — when
+  the backend has no slot or the filesystem refuses (`EOPNOTSUPP`). It is not a
+  correctness feature, so "no" is an answer, not an error.
+- `Storage.syncData(h)` is `fdatasync`; without a slot it is `sync`, a stronger
+  promise. The same guarantee for the bytes; cheaper when the size did not change.
+
+Why both: writes into reserved space do not change the size, so `fdatasync`
+after them records no metadata. Measured 2026-09-27 on NVMe ext4, 180-byte
+appends each followed by a sync: growing the file ~305/s with either sync;
+reserved with `FALLOC_FL_KEEP_SIZE` ~309/s (the size still changes); reserved
+with the size extended + `fdatasync` 800–910/s. Only the last form is offered.
+
+`FsStorage` implements both on Linux, by the raw syscalls (`std.Io.File` has
+neither), and leaves them `null` elsewhere.
+
+**How `SimStorage` models it.** A file has a *data length* besides its length:
+bytes past it, up to the length, are zeros `allocate` added and nothing wrote.
+An allocation is volatile until the next sync, like a write that grows the
+file. A write into those zeros is an **append into reserved space**, not an
+overwrite: the append-only tripwire allows it (it trips only below
+`min(durable length, data length)`). And a crash treats it as the un-synced
+write it is, although it did not grow the file — the thing a length-based
+model would miss, keeping every such write and hiding a missing sync:
+`.lose_unsynced` restores the zeros (an undo record, as for an overwrite),
+`.torn_tail` keeps the first half of the un-synced written data inside the
+reserved range and zeroes the rest, `.reorder_unsynced` keeps or zeroes each
+write whole. `syncData` is `sync` in the simulator: for the bytes they promise
+the same, and the size, which `fdatasync` may skip, is needed to read the bytes
+back, so it persists too. Tests: `sim: allocate …`, `sim: a write into reserved
+zeros …`, `sim: reorder over reserved zeros …`, `sim: truncate cuts reserved
+space …`, `sim: syncData is a durability barrier …`, and on the real
+filesystem `FsStorage: allocate reserves zeros …`. The undo for reserved
+writes and the torn-tail tearing were each removed on purpose, and a test
+failed each time.
+
 ## Threat model / out of scope
 
 Reliability, not adversarial security:
