@@ -101,6 +101,14 @@ spawning anything** alongside an accept-and-actually-run case. Run: `zig build t
 
 ## Backlog / deferred
 
+- **Cancelling `run`/`runTimeout` from another thread** (2026-09-27, ttydesk). A blocking run
+  offers no handle: a program that fetches data on worker threads cannot stop the children
+  when it quits, so it waits out the slowest one (ttydesk: up to its own 2 s cap, see
+  `ttydesk/src/data.zig` `Service.quiesce`). Other runtimes have it (Go
+  `exec.CommandContext`, Python `Popen.kill`, Rust `Child::kill`). Ideal: a `Cancel` token in
+  `Spec` (or an argument) that another thread sets — `runTimeout` then kills the child (the
+  group with `new_process_group`) and returns `error.Canceled` with what was read; or a
+  `std.Io` cancelation honoured by the blocking wait. Still open.
 - **Line-delimited / NDJSON stdout mode** — v1 delivers raw pipe chunks only; a framed/line mode
   would spare consumers reassembly. Still open.
 - **Windows reap-race coverage** — the `TerminateProcess`/`create_no_window` branch compiles but is
