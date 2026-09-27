@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-27** — **`LiveOptions.observer`**: told every rescan's outcome — `unchanged`, `published`
+  (the generation and how many files were opened anew) or `failed` — on the thread that ran it (`start`'s,
+  or `reload`'s caller). For logging reloads, and for a sandbox probe that must run code on that thread.
 - **2026-09-27** — **`Live`: a snapshot that follows its directory; content tags.** `Live.reload` /
   `start` (a rescan thread) publish a new generation when a file is edited, added or removed:
   unchanged files (same inode, size, mtime) hand their descriptor on, changed ones are reopened and

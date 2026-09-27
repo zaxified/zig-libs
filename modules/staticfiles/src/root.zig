@@ -1462,6 +1462,24 @@ pub const LiveOptions = struct {
     /// rescan is one `getdents` per directory and one `fstatat` per file; a
     /// file whose inode, size or mtime moved is reopened and rehashed.
     rescan_ms: u32 = 2000,
+    /// Told after every rescan, on the thread that ran it (`start`'s, or
+    /// `reload`'s caller) -- to log a published generation or a failure.
+    observer: ?Observer = null,
+
+    pub const Observer = struct {
+        ctx: ?*anyopaque = null,
+        rescanned: *const fn (ctx: ?*anyopaque, outcome: Outcome) void,
+    };
+
+    pub const Outcome = union(enum) {
+        /// Nothing moved; nothing was published.
+        unchanged,
+        /// A new generation is being served: its number (the first is 1)
+        /// and how many of its files were opened and hashed anew.
+        published: struct { generation: u64, fresh: usize },
+        /// The rescan failed; the current generation stays.
+        failed: SnapshotError,
+    };
 };
 
 /// A `Snapshot` that follows its directory while it is served: a rescan --
@@ -1578,6 +1596,26 @@ pub const Live = struct {
     /// a time (`start`'s thread, or the owner when it runs none). `io` must
     /// be one that may block -- this opens, stats and reads files.
     pub fn reload(l: *Live, io: Io) SnapshotError!bool {
+        const published = l.rescan(io) catch |e| {
+            l.tell(.{ .failed = e });
+            return e;
+        };
+        if (published) |fresh| {
+            l.tell(.{ .published = .{ .generation = l.generations.load(.monotonic), .fresh = fresh } });
+            return true;
+        }
+        l.tell(.unchanged);
+        return false;
+    }
+
+    fn tell(l: *Live, outcome: LiveOptions.Outcome) void {
+        const o = l.options.observer orelse return;
+        o.rescanned(o.ctx, outcome);
+    }
+
+    /// `reload` without the report: the new generation's fresh-file count,
+    /// or null when nothing changed.
+    fn rescan(l: *Live, io: Io) SnapshotError!?usize {
         defer l.reclaim(io);
         const prev = l.current.load(.seq_cst);
         var next = Snapshot.build(l.gpa, io, l.root, l.options.snapshot, &prev.snap) catch |e| {
@@ -1586,7 +1624,7 @@ pub const Live = struct {
         };
         if (next.sameAs(&prev.snap)) {
             next.abandon(io, &prev.snap);
-            return false;
+            return null;
         }
         const g = l.gpa.create(Gen) catch {
             next.abandon(io, &prev.snap);
@@ -1600,7 +1638,7 @@ pub const Live = struct {
         };
         l.publish(g);
         _ = l.generations.fetchAdd(1, .monotonic);
-        return true;
+        return g.snap.fresh;
     }
 
     /// Make `g` current. Afterwards no request can take the old generation:
@@ -3916,4 +3954,39 @@ test "Live: publishing waits for a request caught between reading the generation
     try testing.expect(live.side.load(.seq_cst) != side_before); // the next requests count on the other side
     var b: [4096]u8 = undefined;
     try testing.expectEqualStrings("new", bodyOf(liveGet(&live, "/a.txt", &b)));
+}
+
+test "Live observer: told unchanged, published (with the generation and fresh files), failed" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    var root = try tmp.dir.createDirPathOpen(io, "root", .{ .open_options = .{ .iterate = true } });
+    defer root.close(io);
+    try writeTree(root, &.{ .{ "a.txt", "A" }, .{ "b.txt", "B" } });
+    const Log = struct {
+        seen: [4]LiveOptions.Outcome = undefined,
+        n: usize = 0,
+        fn rescanned(ctx: ?*anyopaque, o: LiveOptions.Outcome) void {
+            const log: *@This() = @ptrCast(@alignCast(ctx.?));
+            log.seen[log.n] = o;
+            log.n += 1;
+        }
+    };
+    var log: Log = .{};
+    const r = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    var live = try Live.open(testing.allocator, io, r, .{ .snapshot = .{ .max_files = 2 }, .observer = .{ .ctx = &log, .rescanned = Log.rescanned } });
+    defer live.deinit(io);
+    _ = try live.reload(io);
+    try root.writeFile(io, .{ .sub_path = "c.txt", .data = "C" });
+    try testing.expectError(error.TooManyFiles, live.reload(io));
+    try root.deleteFile(io, "c.txt");
+    try root.deleteFile(io, "b.txt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.next", .data = "A2" });
+    try Dir.rename(tmp.dir, "a.next", root, "a.txt", io);
+    try testing.expect(try live.reload(io));
+    try testing.expectEqual(@as(usize, 3), log.n);
+    try testing.expect(log.seen[0] == .unchanged);
+    try testing.expectEqual(error.TooManyFiles, log.seen[1].failed);
+    try testing.expectEqual(@as(u64, 2), log.seen[2].published.generation);
+    try testing.expectEqual(@as(usize, 1), log.seen[2].published.fresh);
 }
