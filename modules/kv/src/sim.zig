@@ -501,6 +501,9 @@ pub const SimStorage = struct {
             if (self.names.get(path)) |existing| {
                 switch (mode) {
                     .open_or_create, .read_only => {},
+                    // O_EXCL: the name is taken, whether or not it is durable
+                    // yet — the kernel sees the directory entry, not the disk.
+                    .create_new => return error.PathAlreadyExists,
                     .create_truncate => {
                         // Model O_TRUNC as immediately effective (see module doc).
                         existing.content.clearRetainingCapacity();
@@ -513,7 +516,7 @@ pub const SimStorage = struct {
                 break :blk existing;
             }
             switch (mode) {
-                .open_or_create, .create_truncate => {},
+                .open_or_create, .create_truncate, .create_new => {},
                 .read_only => return error.FileNotFound,
             }
             const f = self.newFile() catch return error.OutOfMemory;
@@ -808,6 +811,35 @@ test "sim: write is volatile until sync; crash loses unsynced tail" {
     var buf: [7]u8 = undefined;
     try testing.expectEqual(@as(usize, 7), try st.pread(h2, &buf, 0));
     try testing.expectEqualStrings("durable", &buf);
+}
+
+test "sim: create_new refuses a taken name, durable or not, and never empties it" {
+    var sim = SimStorage.init(testing.allocator);
+    defer sim.deinit();
+    const st = sim.storage();
+
+    const h = try st.open("seg", .create_new);
+    try st.writeAll(h, "keep", 0);
+    try st.sync(h);
+    // Name not yet durable (no syncDir): still taken for O_EXCL.
+    try testing.expectError(error.PathAlreadyExists, st.open("seg", .create_new));
+    try testing.expectEqualSlices(u8, "keep", sim.fileContent("seg").?);
+
+    // A crash loses the undurable name — and with it the claim.
+    sim.crash_mode = .lose_unsynced;
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.syncDir());
+    sim.reboot();
+    try testing.expect(sim.fileContent("seg") == null);
+    const h2 = try st.open("seg", .create_new);
+    try st.writeAll(h2, "again", 0);
+    try st.sync(h2);
+    try st.syncDir();
+    sim.ops_until_crash = 0;
+    try testing.expectError(error.Crashed, st.sync(h2));
+    sim.reboot();
+    try testing.expectError(error.PathAlreadyExists, st.open("seg", .create_new));
+    try testing.expectEqualSlices(u8, "again", sim.fileContent("seg").?);
 }
 
 test "sim: allocate adds zeros that are volatile until sync, and never shrinks or touches data" {

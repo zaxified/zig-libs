@@ -151,6 +151,12 @@ pub const Storage = struct {
     ///
     ///   * `open_or_create` — read-write; creates an empty file if absent.
     ///   * `create_truncate` — read-write; creates, or empties an existing file.
+    ///   * `create_new` — read-write; creates the file, and fails with
+    ///     `error.PathAlreadyExists` if the path already exists (`O_CREAT|O_EXCL`,
+    ///     Win32 `CREATE_NEW`). The check and the creation are one atomic step,
+    ///     so of several concurrent creators exactly one wins — and a file
+    ///     that must never be emptied (a segment a lost manifest no longer
+    ///     lists) cannot be truncated by mistake.
     ///   * `read_only` — the file must already exist (`error.FileNotFound`
     ///     otherwise) and is never created, emptied or written. `writeAll` and
     ///     `truncate` on such a handle fail with `error.AccessDenied` — every
@@ -163,7 +169,7 @@ pub const Storage = struct {
     /// `mode == .create_truncate` silently treats every other mode — this one
     /// included — as `open_or_create`, i.e. creates the file a reader expected
     /// to find.
-    pub const OpenMode = enum { open_or_create, create_truncate, read_only };
+    pub const OpenMode = enum { open_or_create, create_truncate, create_new, read_only };
 
     /// A **borrowed** run of bytes owned by the backend — the zero-copy read
     /// path (`preadRef`). `bytes` stays valid, and stays the bytes that were
@@ -187,6 +193,8 @@ pub const Storage = struct {
         /// SimStorage only: the simulated machine died at this operation.
         Crashed,
         FileNotFound,
+        /// `open` with `.create_new` on a path that already exists.
+        PathAlreadyExists,
         AccessDenied,
         NoSpaceLeft,
         InputOutput,
@@ -505,6 +513,7 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
             return switch (e) {
                 error.FileLocksUnsupported => error.LockUnsupported,
                 error.FileNotFound => error.FileNotFound,
+                error.PathAlreadyExists => error.PathAlreadyExists,
                 error.AccessDenied, error.PermissionDenied => error.AccessDenied,
                 error.NoSpaceLeft, error.DiskQuota => error.NoSpaceLeft,
                 error.InputOutput => error.InputOutput,
@@ -524,9 +533,10 @@ pub fn FsStorageCapacity(comptime max_handles: usize) type {
                 if (f == null) break i;
             } else return error.HandleTableFull;
             const file = switch (mode) {
-                .open_or_create, .create_truncate => self.dir.createFile(self.io, path, .{
+                .open_or_create, .create_truncate, .create_new => self.dir.createFile(self.io, path, .{
                     .read = true,
                     .truncate = mode == .create_truncate,
+                    .exclusive = mode == .create_new,
                 }),
                 .read_only => self.dir.openFile(self.io, path, .{ .mode = .read_only }),
             } catch |e| return mapErr(e);
@@ -1756,6 +1766,35 @@ test "Storage.VTable.consistent: catches a backend that sets preadRef without re
     var bad = base;
     bad.preadRef = Stub.preadRef;
     try testing.expect(!bad.consistent());
+}
+
+test "real filesystem: create_new creates once and never empties an existing file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var fs_store = FsStorage.init(testing.io, tmp.dir);
+    const st = fs_store.storage();
+
+    const h = try st.open("seg", .create_new);
+    try st.writeAll(h, "keep", 0);
+    try st.sync(h);
+
+    // The second creator loses — the open fails, the bytes stay, and no
+    // handle slot is consumed by the refused open.
+    try testing.expectError(error.PathAlreadyExists, st.open("seg", .create_new));
+    var buf: [8]u8 = undefined;
+    try testing.expectEqualStrings("keep", buf[0..try st.pread(h, &buf, 0)]);
+    st.close(h);
+    try testing.expectError(error.PathAlreadyExists, st.open("seg", .create_new));
+    const r = try st.open("seg", .read_only);
+    try testing.expectEqual(h, r);
+    try testing.expectEqualStrings("keep", buf[0..try st.pread(r, &buf, 0)]);
+    st.close(r);
+
+    // Once the name is gone it can be claimed again, as an empty file.
+    try st.delete("seg");
+    const n = try st.open("seg", .create_new);
+    defer st.close(n);
+    try testing.expectEqual(@as(u64, 0), try st.size(n));
 }
 
 test "real filesystem: read_only neither creates, empties nor writes" {

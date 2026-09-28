@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `Storage.OpenMode.create_new`: create the file or fail with the new
+  `error.PathAlreadyExists` (`O_CREAT|O_EXCL`), atomically, never emptying an existing
+  file. `SimStorage` models it (an un-synced name is taken until a crash loses it).
+  ⚠ Implementers of `Storage` that switch on `OpenMode` must handle the new mode; the
+  added error widens `Storage.Error`.
 - **2026-09-27** — `Storage.allocate` (`fallocate`, returns `false` when the backend or
   filesystem cannot) and `Storage.syncData` (`fdatasync`, `sync` where absent): optional
   vtable slots defaulting to `null`, so no implementer has to change. `FsStorage` has
