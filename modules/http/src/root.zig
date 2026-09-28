@@ -133,6 +133,11 @@ pub const conditional = @import("conditional.zig");
 /// parser lives in `multipart`.
 pub const body = @import("body.zig");
 
+/// Query-string parameters (`param`, `QueryIterator`) and strict path
+/// percent-decoding (`decodePath`: refuses `%2F`, `%00` and malformed
+/// escapes) over `Server.Request.query` / `.path`, into caller buffers.
+pub const url = @import("url.zig");
+
 /// `multipart/form-data` body parser (RFC 7578): iterate a form's parts —
 /// field `name`, optional `filename`, `Content-Type`, and raw (binary-safe)
 /// value — from a size-bounded in-memory body (`parse`), or streamed part by
@@ -490,6 +495,7 @@ test {
     _ = proxy;
     _ = conditional;
     _ = body;
+    _ = url;
     _ = multipart;
     _ = sse;
     _ = range;

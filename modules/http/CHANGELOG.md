@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — New `http.url`: query-string parameters (`param`, `paramRaw`,
+  `QueryIterator`, `decodeComponent`) and strict path percent-decoding (`decodePath` refuses
+  `%2F`, `%00` and malformed escapes), over `Request.query`/`.path`, into caller buffers.
+  Additive only. Wanted by qap, which wrote its own (`src/inputs.zig`).
+
 - **2026-09-27** — **`multipart.Reader`: `multipart/form-data` streamed part by part.** Over a
   `*std.Io.Reader` instead of a whole body in memory: `nextPart` yields the part's `name`,
   `filename`, `content_type` and `headers_raw` (in a caller's `header_buf`, `header_buf_len` for the

@@ -323,14 +323,15 @@ eligibility gate, released when the request is over, none free → gzip or ident
 
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/http.zig` (httpz) is an HTTP/1.1 server. Feed the same raw request bytes to both parsers and compare accept vs reject (smuggling-shaped framing, obs-fold, bad chunk sizes, over-long headers). It is also a reference point for qap's h1 benchmark. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
-**Query-string parameters and path percent-decoding** — BACKLOG (2026-09-22, found by qap).
-`Request` exposes the raw `path` and `query` but nothing that reads a parameter out of the query
-or decodes the path; `body.zig` already has the `application/x-www-form-urlencoded` decoder for
-*bodies*, and Go's `URL.Query()`/`PathUnescape` or Rust's `form_urlencoded` are the equivalents a
-consumer expects. qap wrote its own (`src/inputs.zig`: first-match `param` with decoded keys,
-`+`→space, and a strict path decoder that refuses `%2F`, `%00` and malformed escapes so an
-encoded separator can never reach a router). Wanted here, shared with `router`, so the rule that
-decides what a path segment is lives in one place.
+**Query-string parameters and path percent-decoding** — DONE 2026-09-28 (found by qap,
+2026-09-22): `http.url` — `param`/`paramRaw` (first match, keys compared decoded, `+` → space),
+`QueryIterator` (every raw pair, nothing decoded), `decodeComponent`, and a strict `decodePath`
+that refuses a decoded `/` or NUL and any malformed escape, so an encoded separator can never
+reach a router. A malformed escape is refused in a query component too (as Go's
+`url.ParseQuery` does), unlike the lenient WHATWG body decoder `body.urlencoded`, which a router
+never sees. Caller buffers, no allocation. `router` still matches raw bytes by design (its own
+SPEC); if it ever decodes, `decodePath` is the rule to use. `validate.parseQueryLeaky` keeps its
+own lenient decoder for now.
 
 **PROXY protocol v1/v2 (server side)** — BACKLOG (2026-09-24, found by qap plan M5.1). A server
 behind a load balancer learns the real client only from the haproxy PROXY header the balancer
