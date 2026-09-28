@@ -37,6 +37,7 @@ pub const scalar = @import("scalar.zig");
 pub const sign = @import("sign.zig");
 pub const gate = @import("gate.zig");
 pub const fast_core = @import("fast_core.zig");
+pub const modinv = @import("modinv.zig");
 
 /// The P-256 base field element (over `p = 2^256 − 2^224 + 2^192 + 2^96 − 1`).
 pub const Fe = field.Fe;
@@ -82,6 +83,7 @@ test {
     _ = field;
     _ = group;
     _ = scalar;
+    _ = modinv;
     _ = sign;
     _ = @import("kat_vectors.zig");
     _ = @import("kat_test.zig");

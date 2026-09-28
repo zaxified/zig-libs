@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-//! gate — the two switches that select the **irreducible Fable cores**. Both
-//! cores are IMPLEMENTED and both flags are `true`: the core-vs-portable
+//! gate — the switches that select the **irreducible Fable cores** (two) and
+//! the constant-time inversion (`fast_invert_implemented`, 2026-09-28). All
+//! cores are IMPLEMENTED and every flag is `true`: the core-vs-portable
 //! differential harness in `oracle_test.zig` is LIVE. The portable path —
 //! byte-exact against `std.crypto.ecc.P256` + the ECDSA-P256 anchors — is the
 //! correctness ORACLE and the permanent fallback for non-amd64 targets (and
@@ -20,9 +21,11 @@
 //!     `mul`, the fixed-base `combMulBase`, and the variable-time `mulPublic` /
 //!     `mulDoubleBasePublic` the verifier uses. Byte-exact vs std at the point
 //!     level.
-//!   - `scalar.zig` — the scalar field (re-exported from std; NOT on the accel
-//!     critical path, see SPEC "Scope"). P-256 has NO efficiently-computable
-//!     endomorphism, so — unlike k256 — there is no GLV decomposition here.
+//!   - `scalar.zig` — the scalar field: std's fiat arithmetic wrapped, with
+//!     this module's inverse (`modinv.zig`) — the inverse WAS on the critical
+//!     path, 45 % of a signature, see SPEC "Scope". P-256 has NO
+//!     efficiently-computable endomorphism, so — unlike k256 — there is no GLV
+//!     decomposition here.
 //!   - `kat_test.zig` / `oracle_test.zig` — the differential-vs-std harness, the
 //!     official RFC 6979 ECDSA-P256 vectors, the std-signer ECDSA differential,
 //!     and a deliberately-broken positive control (a wrong reduction constant)
@@ -65,3 +68,12 @@ pub const field_asm_implemented = true;
 /// portable double-and-add ladder + std by the gated differentials. Flipping
 /// back to `false` restores the plain constant-time double-and-add fallbacks.
 pub const fast_scalarmul_implemented = true;
+
+/// Selects the constant-time safegcd inversion (`modinv.zig`, Bernstein–Yang
+/// divsteps in 62-bit batches) for BOTH `Fe.invert` (base field) and
+/// `Scalar.invert` (scalar field). Portable (no asm), so it is on for every
+/// target. Flipping back to `false` restores the two oracles the differentials
+/// pin it to: the Fermat inverse `a^(p−2)` (`Fe.invertFermat`) and std's fiat
+/// scalar inverse. Measured 2026-09-28 on the i7-7920HQ: Fe.invert 12.1 µs →
+/// ~3 µs, Scalar.invert 40.7 µs → ~3 µs (see SPEC "Performance status").
+pub const fast_invert_implemented = true;

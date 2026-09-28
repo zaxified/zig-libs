@@ -26,6 +26,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const gate = @import("gate.zig");
 const fast_core = @import("fast_core.zig");
+const modinv = @import("modinv.zig");
 
 const NonCanonicalError = std.crypto.errors.NonCanonicalError;
 const NotSquareError = std.crypto.errors.NotSquareError;
@@ -44,6 +45,9 @@ const m_fold: u256 = (1 << 224) - (1 << 192) - (1 << 96) + 1;
 /// than the portable Solinas reduction — i.e. on x86-64 with ADX+BMI2 now that
 /// the gate is on; portable everywhere else.
 pub const field_asm_active = fast_core.supported and gate.field_asm_implemented;
+
+/// The safegcd constants for `p` (see `modinv.zig`).
+const field_modinfo = modinv.ModInfo.init(field_order);
 
 // ── constant-time barrier ───────────────────────────────────────────────────
 //
@@ -318,9 +322,23 @@ pub const Fe = struct {
     }
 
     /// `(a + b) mod p`, constant-time.
+    ///
+    /// Both inputs are canonical, so `a + b < 2p < 2^257` and ONE conditional
+    /// subtract of `p` lands the sum in `[0, p)`: keep the raw sum iff it did
+    /// not carry out of 2^256 AND the subtract borrowed (sum `< p`). This
+    /// replaced the general `normalize` (two 2^256 ≡ M folds plus the same
+    /// subtract) on 2026-09-28: 10.5 ns → ~3.5 ns per add, and a point
+    /// double/add has ~15 of them, so every scalar multiply gained ~15 %.
+    /// `normalize` is still what the wide reduction feeds, where a full fold
+    /// is needed. The 0/1 keep bit is laundered through `blackBox` so the
+    /// masked select cannot become a branch (see the barrier note above).
     pub fn add(a: Fe, b: Fe) Fe {
         const s = @addWithOverflow(a.value(), b.value());
-        return .{ .limbs = normalize(s[0], s[1]) };
+        const d = @subWithOverflow(s[0], field_order);
+        // keep the sum iff no carry and a borrow (i.e. the true sum is < p).
+        const keep_bit: u64 = @as(u64, d[1]) & ~@as(u64, s[1]);
+        const keep: u256 = @as(u256, 0) -% @as(u256, blackBox(keep_bit));
+        return .{ .limbs = fromU256((s[0] & keep) | (d[0] & ~keep)) };
     }
 
     /// `2a mod p`.
@@ -391,14 +409,23 @@ pub const Fe = struct {
         return result;
     }
 
-    /// Multiplicative inverse via Fermat's little theorem: `a^(p−2) mod p`
-    /// (`invert(0) == 0`, matching std). Constant-time in `a`.
-    ///
-    /// A short addition chain (the P-256 chain std's fiat-inverse encodes) is the
-    /// fast path a later phase can substitute; this scaffold uses the
-    /// straightforward public-exponent square-and-multiply — correctness over
-    /// cleverness, since inversion is amortised (one per affine conversion).
+    /// Multiplicative inverse, `invert(0) == 0` (matching std). Constant-time
+    /// in `a`. Dispatches to the constant-time safegcd (`modinv.zig`) when
+    /// `gate.fast_invert_implemented`, else the Fermat oracle below. Measured
+    /// 2026-09-28 (i7-7920HQ, ReleaseFast): 12.1 µs (Fermat, 384 multiplies)
+    /// → ~3 µs (590 divsteps in ten 62-bit batches).
     pub fn invert(a: Fe) Fe {
+        if (comptime gate.fast_invert_implemented) {
+            return .{ .limbs = modinv.invert(a.limbs, field_modinfo) };
+        }
+        return a.invertFermat();
+    }
+
+    /// The inverse via Fermat's little theorem, `a^(p−2) mod p`: a public
+    /// fixed-exponent square-and-multiply, constant-time in `a`. This is the
+    /// correctness ORACLE the safegcd inverse is pinned to (and the fallback
+    /// with the gate off). `pub` for the differential + bench.
+    pub fn invertFermat(a: Fe) Fe {
         return a.powConst(field_order - 2);
     }
 
@@ -483,6 +510,37 @@ test "differential vs std.Fe: mul/sq/add/sub/neg/invert on random inputs" {
         try std.testing.expectEqualSlices(u8, &a.s.sub(b.s).toBytes(.big), &a.k.sub(b.k).toBytes(.big));
         try std.testing.expectEqualSlices(u8, &a.s.neg().toBytes(.big), &a.k.neg().toBytes(.big));
         try std.testing.expectEqualSlices(u8, &a.s.invert().toBytes(.big), &a.k.invert().toBytes(.big));
+    }
+}
+
+test "safegcd inverse == Fermat inverse == std, random + edges (0 → 0)" {
+    // The gated inverse against BOTH oracles: the module's own Fermat chain
+    // (algorithmically independent — a fixed-exponent power, not a gcd) and
+    // std's fiat Bernstein–Yang inverse. Random draws plus the values a
+    // divstep implementation gets wrong first: 0 (must give 0, not garbage or
+    // a hang), 1, p−1, p−2, single-bit values, and values just below/above
+    // the 62-bit limb seams.
+    var prng = std.Random.DefaultPrng.init(0x1AF_E6CD_9256);
+    const rand = prng.random();
+    const edges = [_]u256{
+        0,          1,              2,         3,              field_order - 1,  field_order - 2,
+        1 << 62,    (1 << 62) - 1,  1 << 124,  (1 << 124) - 1, 1 << 186,         1 << 248,
+        (1 << 255), (1 << 255) - 1, (1 << 64), (1 << 128) - 1, field_order >> 1, (field_order >> 1) + 1,
+    };
+    for (edges) |x| {
+        const a = Fe{ .limbs = fromU256(x) };
+        const sa = StdFe.fromBytes(a.toBytes(.big), .big) catch unreachable;
+        const got = a.invert();
+        try std.testing.expectEqualSlices(u8, &a.invertFermat().toBytes(.big), &got.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &sa.invert().toBytes(.big), &got.toBytes(.big));
+        if (x != 0) try std.testing.expect(a.mul(got).equivalent(Fe.one));
+    }
+    try std.testing.expect(Fe.zero.invert().isZero());
+    for (0..field_diff_iters) |_| {
+        const a = randFe(rand);
+        const got = a.k.invert();
+        try std.testing.expectEqualSlices(u8, &a.k.invertFermat().toBytes(.big), &got.toBytes(.big));
+        try std.testing.expectEqualSlices(u8, &a.s.invert().toBytes(.big), &got.toBytes(.big));
     }
 }
 

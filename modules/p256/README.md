@@ -33,8 +33,16 @@ and a JWT issuer runs once per token:
 |---|---|---|
 | `std.crypto.sign.ecdsa.EcdsaP256Sha256` | 394 | 16.0× |
 | `p256.EcdsaP256Sha256`, **before** the comb was reachable | 252 | 10.2× |
-| `p256.EcdsaP256Sha256`, today | **102** | 4.2× |
+| `p256.EcdsaP256Sha256`, 2026-08-25 | 102 | 4.2× |
+| `p256.EcdsaP256Sha256`, **2026-09-28** (safegcd inverses, w = 6 affine comb) | **37** | 1.5× |
 | OpenSSL 3.5.5 `nistz256` (`openssl speed ecdsap256`) | 24.6 | 1.0× |
+
+The 2026-09-28 row was measured on a loaded host; OpenSSL measured the same day
+under the same load gave 36.8 µs, i.e. parity within noise. Verify the same day:
+`EcdsaP256Sha256.verify` 413 → 125 µs (std's generic verifier now hits the
+fixed-base table through `basePoint.mulPublic`), `sign.ecdsaVerify` 261 → 128 µs,
+against 128 µs for nistz256. Full component table in `SPEC.md`
+§ "Performance status".
 
 ⚠ **The step from 252 to 102 was not new code — it was connecting code that was
 already here.** `std.crypto.sign.ecdsa.Ecdsa.sign` computes `R` as
@@ -46,11 +54,11 @@ all**. `combMulBase` was reached only from `xmldsig`, which calls it by name.
 `P256.mul` now recognises the base point and redirects (235 µs → 56 µs on that
 multiply alone).
 
-The remaining 4.2× against nistz256 is not the field core, which is on
-(`field_asm_active`); it is the rest of the sign path — the scalar inversion
-and the RFC 6979 nonce — plus whatever nistz256's own comb does better. The
-stated 2–3× target is therefore **not met yet**, and this table is what to
-measure against rather than the target.
+The step from 102 to 37 was two things the profile named: the scalar
+inversion `k⁻¹ mod n` through std's fiat divstep was 45 % of a signature (it is
+now this module's constant-time safegcd, `modinv.zig`, shared with `Fe.invert`),
+and the comb gained an affine w = 6 table with a complete mixed addition. What
+remains against nistz256 is the field multiply itself (`SPEC.md` backlog 8).
 
 ## Status: cores IMPLEMENTED (both gates on) + vartime wNAF verify
 
@@ -64,11 +72,13 @@ to `false` restores the proven portable fallback:
 | Gate flag | Core (implemented) | Portable fallback (the oracle it matches bit-for-bit) |
 |---|---|---|
 | `gate.field_asm_implemented` | `fast_core.fieldMul` / `fast_core.fieldSq` — amd64 `MULX/ADX` product + the signed **NIST word-shuffle** Solinas reduction (HMV Alg. 2.29) | `field.mulPortable` / `field.sqPortable` (wide-int Solinas) |
-| `gate.fast_scalarmul_implemented` | `group.combMulBaseFast` (fixed-base comb `k·G`) + `group.mulCtWindowed` (CT windowed variable-base) — `blackBox`-guarded masked CT gather | `group.mulDoubleAddCt` / `basePoint.mulDoubleAddCt` |
+| `gate.fast_scalarmul_implemented` | `group.combMulBaseFast` (fixed-base comb `k·G` over a comptime affine table, w = 6) + `group.mulCtWindowed` (CT windowed variable-base) — `blackBox`-guarded masked CT gather | `group.mulDoubleAddCt` / `basePoint.mulDoubleAddCt` |
+| `gate.fast_invert_implemented` | `modinv.invert` — constant-time Bernstein–Yang safegcd (62-bit batches), shared by `Fe.invert` and `Scalar.invert` | `Fe.invertFermat` (`a^(p−2)`) / std's fiat scalar inverse |
 
-The PUBLIC verify path (`mulPublic` / `mulDoubleBasePublic`) additionally uses an
-**interleaved wNAF (Straus–Shamir)** double-scalar mult (vartime, public inputs
-only) — byte-exact vs the plain ladder + std, ~5.0× → ~3.0× nistz256 on verify.
+The PUBLIC verify path (`mulPublic` / `mulDoubleBasePublic`) additionally runs in
+Jacobian coordinates (vartime, public inputs only): `u1·G` from the same
+fixed-base table with no doublings, `u2·Q` by wNAF over a batch-normalised
+affine table — byte-exact vs the plain ladder + std at the point level.
 
 ## Usage
 
