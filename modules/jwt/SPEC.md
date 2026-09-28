@@ -184,22 +184,12 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
   default to, so `claim_opts.issuer = .provider` fails `init` (`error.IssuerNotConfigured`).
 - No other module-local backlog recorded (README has no Deferred section).
 
-- **Refuse a plain-HTTP key source** (from qap M11.8, 2026-09-28). `discover` accepts an
-  `http://` issuer and returns whatever `jwks_uri` the document names, `http://` included, and
-  `fetchJwks`/`Provider` fetch it: anyone on the path could then serve their own keys and mint any
-  token. qap checks the scheme itself (`RemoteOptions.allow_plain_http`, `src/auth_jwt.zig`
-  `checkScheme`, after discovery too). Ideal: `discover`/`fetchJwks`/`ProviderOptions` refuse
-  `http://` (`error.InsecureKeySource`) unless `allow_plain_http = true` (tests, a local issuer).
-
-## Status
-
-`gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256` —
-canonical source is `pub const meta` in src/root.zig.
-
-## Anchoring
-
-**Anchor grade:** class A · oracle EXTERNAL
-
+- ~~**Refuse a plain-HTTP key source**~~ — DONE 2026-09-28 (from qap M11.8): `discover`,
+  `fetchJwks` and `Provider` refuse an `http://` (or scheme-less) issuer, discovered `jwks_uri` or
+  configured `jwks_uri` with `error.InsecureKeySource`, before any fetch — anyone on a plain-HTTP
+  path could serve their own keys and mint any token. `KeySourceOptions.allow_plain_http` /
+  `ProviderOptions.allow_plain_http` opt out (tests, a loopback issuer), through the new
+  `discoverWith`/`fetchJwksWith`; the three-argument calls keep their signatures.
 - **Class A** — wire/interop format — other implementations must byte-agree with it.
 - **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
 

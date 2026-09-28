@@ -5,6 +5,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — ⚠ **Plain-HTTP key sources are refused**: `discover`, `fetchJwks` and
+  `Provider.refresh` return `error.InsecureKeySource` for an `http://` (or scheme-less) issuer or
+  `jwks_uri`, including a `jwks_uri` named by an https discovery document. Opt out with the new
+  `discoverWith`/`fetchJwksWith` (`KeySourceOptions.allow_plain_http`) or
+  `ProviderOptions.allow_plain_http`. Signatures unchanged; the error sets gain
+  `InsecureKeySource`. Wanted by qap M11.8, which checked the scheme itself.
+
 - **2026-09-28** — `Guard` over a static `JwkSet`: `Guard.Options.jwks` as an alternative to
   `provider` (now optional; exactly one must be set, `error.InvalidKeySource` otherwise). The
   guard's `provider` field became `source: Guard.KeySource`. `Guard.InitError` gains

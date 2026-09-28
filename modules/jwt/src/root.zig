@@ -1535,8 +1535,30 @@ fn mapFetchError(err: http.Client.Error) FetchError {
     };
 }
 
+/// Where a key source may be fetched from. Keys fetched over plain HTTP
+/// can be replaced by anyone on the path, who can then mint any token the
+/// verifier will accept — so `https://` is required unless a caller
+/// consciously allows `http://` (a test, an issuer on the loopback).
+pub const KeySourceOptions = struct {
+    /// Also accept `http://` issuer, discovery and JWKS URLs.
+    allow_plain_http: bool = false,
+};
+
+/// Refuse a key-source URL that is not `https://` (or `http://` when
+/// allowed). Case-insensitive scheme, as URLs are (RFC 3986 §3.1).
+fn checkKeySourceUrl(url: []const u8, opts: KeySourceOptions) error{InsecureKeySource}!void {
+    if (std.ascii.startsWithIgnoreCase(url, "https://")) return;
+    if (opts.allow_plain_http and std.ascii.startsWithIgnoreCase(url, "http://")) return;
+    return error.InsecureKeySource;
+}
+
 /// Errors from `discover`.
 pub const DiscoverError = FetchError || error{
+    /// The issuer, or the `jwks_uri` its document names, is not `https://`
+    /// (and `KeySourceOptions.allow_plain_http` is off). The document is
+    /// not trusted for a key location it could only have been served over
+    /// an unauthenticated channel, or that is itself one.
+    InsecureKeySource,
     /// The well-known endpoint answered with a non-200 status.
     HttpStatus,
     /// The response is not a usable discovery document: not JSON, not an
@@ -1586,13 +1608,28 @@ pub const Metadata = struct {
 /// (stripped before deriving the URL and before the issuer comparison —
 /// several real IdPs are sloppy about it); otherwise the returned `issuer`
 /// must be identical to the requested one (`IssuerMismatch`).
+///
+/// Refuses an `http://` issuer and a document naming an `http://`
+/// `jwks_uri` (`error.InsecureKeySource`, since 2026-09-28) — see
+/// `discoverWith` to allow them.
 pub fn discover(
     gpa: std.mem.Allocator,
     fetcher: Fetcher,
     issuer: []const u8,
 ) DiscoverError!Metadata {
+    return discoverWith(gpa, fetcher, issuer, .{});
+}
+
+/// `discover` with an explicit `KeySourceOptions`.
+pub fn discoverWith(
+    gpa: std.mem.Allocator,
+    fetcher: Fetcher,
+    issuer: []const u8,
+    opts: KeySourceOptions,
+) DiscoverError!Metadata {
     const want_issuer = std.mem.trimEnd(u8, issuer, "/");
     if (want_issuer.len == 0) return error.DiscoveryFailed;
+    try checkKeySourceUrl(issuer, opts);
     var url_buf: [max_url_len]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}" ++ well_known_path, .{want_issuer}) catch
         return error.DiscoveryFailed;
@@ -1622,6 +1659,7 @@ pub fn discover(
     const jwks_uri = stringMember(obj, "jwks_uri") orelse return error.DiscoveryFailed;
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, doc_issuer, "/"), want_issuer))
         return error.IssuerMismatch;
+    try checkKeySourceUrl(jwks_uri, opts);
 
     // Optional (P7): present in any OP that offers the authorization code
     // flow, but this struct's original P5 (resource-server) scope never
@@ -1673,17 +1711,35 @@ fn stringMember(obj: std.json.ObjectMap, name: []const u8) ?[]const u8 {
 
 /// Errors from `fetchJwks`: the fetch seam's, a non-200 status, or the P4
 /// parse errors (`InvalidJson`/`NotAJwks`) verbatim.
-pub const FetchJwksError = FetchError || JwksError || error{HttpStatus};
+pub const FetchJwksError = FetchError || JwksError || error{
+    HttpStatus,
+    /// `jwks_uri` is not `https://` — see `KeySourceOptions`.
+    InsecureKeySource,
+};
 
 /// GET `jwks_uri` and parse the body via `parseJwksSource(…, .network)` (P4):
 /// the fetched set is trusted for asymmetric keys only — `kty:"oct"` entries
 /// are refused (`oct_from_network`). The returned set owns arena copies of
 /// everything — the transfer buffer dies here.
+///
+/// Refuses an `http://` `jwks_uri` (`error.InsecureKeySource`, since
+/// 2026-09-28) — see `fetchJwksWith` to allow it.
 pub fn fetchJwks(
     gpa: std.mem.Allocator,
     fetcher: Fetcher,
     jwks_uri: []const u8,
 ) FetchJwksError!JwkSet {
+    return fetchJwksWith(gpa, fetcher, jwks_uri, .{});
+}
+
+/// `fetchJwks` with an explicit `KeySourceOptions`.
+pub fn fetchJwksWith(
+    gpa: std.mem.Allocator,
+    fetcher: Fetcher,
+    jwks_uri: []const u8,
+    opts: KeySourceOptions,
+) FetchJwksError!JwkSet {
+    try checkKeySourceUrl(jwks_uri, opts);
     const body_buf = try gpa.alloc(u8, max_response_bytes);
     defer gpa.free(body_buf);
     const res = try fetcher.fetch(jwks_uri, body_buf);
@@ -1699,6 +1755,11 @@ pub fn fetchJwks(
 /// finer-grained anyway); `discover`/`fetchJwks` keep the detailed sets for
 /// callers who drive the steps themselves.
 pub const RefreshError = error{
+    /// The issuer, discovered `jwks_uri` or configured `jwks_uri` is not
+    /// `https://` and `ProviderOptions.allow_plain_http` is off. Kept apart
+    /// from the two failures below because it is a configuration (or
+    /// discovery-document) fault that retrying cannot fix.
+    InsecureKeySource,
     /// OIDC discovery failed (fetch, status, malformed document, issuer
     /// mismatch) — only for issuer-configured providers.
     DiscoveryFailed,
@@ -1754,6 +1815,10 @@ pub const Provider = struct {
         /// `kid`), measured from the last attempt of any kind. Lazy-load and
         /// TTL refreshes are not gated — they are already bounded by `ttl_s`.
         min_refresh_interval_s: u32 = 30,
+        /// Accept `http://` issuer / JWKS URLs (see `KeySourceOptions`).
+        /// Off: a plain-HTTP key source fails every refresh with
+        /// `error.InsecureKeySource`.
+        allow_plain_http: bool = false,
     };
 
     /// How `Provider.verify` decides the expected `iss`. Unlike the low-level
@@ -1802,6 +1867,10 @@ pub const Provider = struct {
         return .{ .gpa = gpa, .fetcher = fetcher, .options = options };
     }
 
+    fn keySourceOptions(p: *const Provider) KeySourceOptions {
+        return .{ .allow_plain_http = p.options.allow_plain_http };
+    }
+
     pub fn deinit(p: *Provider) void {
         if (p.metadata) |*m| m.deinit();
         if (p.jwks) |*s| s.deinit();
@@ -1816,16 +1885,18 @@ pub const Provider = struct {
         p.last_attempt_s = now_s;
         const jwks_uri = p.options.jwks_uri orelse blk: {
             if (p.metadata == null) {
-                p.metadata = discover(p.gpa, p.fetcher, p.options.issuer.?) catch |err|
+                p.metadata = discoverWith(p.gpa, p.fetcher, p.options.issuer.?, p.keySourceOptions()) catch |err|
                     switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
+                        error.InsecureKeySource => return error.InsecureKeySource,
                         else => return error.DiscoveryFailed,
                     };
             }
             break :blk p.metadata.?.jwks_uri;
         };
-        const fresh = fetchJwks(p.gpa, p.fetcher, jwks_uri) catch |err| switch (err) {
+        const fresh = fetchJwksWith(p.gpa, p.fetcher, jwks_uri, p.keySourceOptions()) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.InsecureKeySource => return error.InsecureKeySource,
             else => return error.JwksFetchFailed,
         };
         if (p.jwks) |*old| old.deinit();
@@ -5926,6 +5997,40 @@ test "discover: non-200, garbage JSON, missing/mistyped members → typed errors
         discover(gpa, dead.fetcher(), "https://issuer.example"),
     );
     try testing.expectError(error.DiscoveryFailed, discover(gpa, dead.fetcher(), "///"));
+}
+
+test "key sources: plain HTTP is refused unless allowed, before anything is fetched" {
+    const gpa = testing.allocator;
+    const http_doc =
+        \\{"issuer":"https://issuer.example","jwks_uri":"http://issuer.example/jwks"}
+    ;
+    // An http:// issuer: refused without a fetch (the stub has no script).
+    var none: ScriptFetcher = .{ .script = &.{} };
+    try testing.expectError(error.InsecureKeySource, discover(gpa, none.fetcher(), "http://issuer.example"));
+    try testing.expectError(error.InsecureKeySource, discover(gpa, none.fetcher(), "issuer.example"));
+    try testing.expectError(error.InsecureKeySource, fetchJwks(gpa, none.fetcher(), "http://issuer.example/jwks"));
+    try testing.expectEqual(@as(usize, 0), none.calls);
+
+    // An https:// issuer whose document names an http:// jwks_uri.
+    var s1: ScriptFetcher = .{ .script = &.{.{ .url = test_wellknown_url, .body = http_doc }} };
+    try testing.expectError(error.InsecureKeySource, discover(gpa, s1.fetcher(), "https://issuer.example"));
+
+    // Allowed on purpose: the same document is accepted, and the scheme is
+    // matched case-insensitively.
+    var s2: ScriptFetcher = .{ .script = &.{.{ .url = test_wellknown_url, .body = http_doc }} };
+    var md = try discoverWith(gpa, s2.fetcher(), "https://issuer.example", .{ .allow_plain_http = true });
+    md.deinit();
+    try checkKeySourceUrl("HTTPS://issuer.example/jwks", .{});
+    try testing.expectError(error.InsecureKeySource, checkKeySourceUrl("ftp://issuer.example/jwks", .{ .allow_plain_http = true }));
+
+    // The Provider surfaces it as its own error, not a generic fetch failure.
+    var p = Provider.init(gpa, none.fetcher(), .{ .jwks_uri = "http://issuer.example/jwks" });
+    defer p.deinit();
+    try testing.expectError(error.InsecureKeySource, p.refresh(1000));
+    var s3: ScriptFetcher = .{ .script = &.{.{ .url = "http://issuer.example/jwks", .body = rs_jwks_json }} };
+    var p2 = Provider.init(gpa, s3.fetcher(), .{ .jwks_uri = "http://issuer.example/jwks", .allow_plain_http = true });
+    defer p2.deinit();
+    try p2.refresh(1000);
 }
 
 test "fetchJwks: 200 parses (network source); oct keys refused; non-200 and garbage → typed errors" {
