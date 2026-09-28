@@ -185,6 +185,13 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
   is either a Provider or a caller-held `*const JwkSet`.
 - No other module-local backlog recorded (README has no Deferred section).
 
+- **Refuse a plain-HTTP key source** (from qap M11.8, 2026-09-28). `discover` accepts an
+  `http://` issuer and returns whatever `jwks_uri` the document names, `http://` included, and
+  `fetchJwks`/`Provider` fetch it: anyone on the path could then serve their own keys and mint any
+  token. qap checks the scheme itself (`RemoteOptions.allow_plain_http`, `src/auth_jwt.zig`
+  `checkScheme`, after discovery too). Ideal: `discover`/`fetchJwks`/`ProviderOptions` refuse
+  `http://` (`error.InsecureKeySource`) unless `allow_plain_http = true` (tests, a local issuer).
+
 ## Status
 
 `gap · any · both · reentrant (Provider: externally synced)` + deps `http`, `router`, `p256` —
@@ -206,9 +213,3 @@ the RFC's private seed is 32 zero bytes and the module can regenerate all three 
 itself — so internal evidence alone cannot tell a genuine RFC vector from a self-generated one.
 The audit that added this line fetched the RFC and compared character by character (and
 recomputed each `kid` as the RFC 7638 thumbprint over `{alg, kty, pub}`); all three match.
-- **Refuse a plain-HTTP key source** (from qap M11.8, 2026-09-28). `discover` accepts an
-  `http://` issuer and returns whatever `jwks_uri` the document names, `http://` included, and
-  `fetchJwks`/`Provider` fetch it: anyone on the path could then serve their own keys and mint any
-  token. qap checks the scheme itself (`RemoteOptions.allow_plain_http`, `src/auth_jwt.zig`
-  `checkScheme`, after discovery too). Ideal: `discover`/`fetchJwks`/`ProviderOptions` refuse
-  `http://` (`error.InsecureKeySource`) unless `allow_plain_http = true` (tests, a local issuer).
