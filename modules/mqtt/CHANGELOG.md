@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Broker, egw audit S1 fixes. **The Will is ACL-checked**: `authorizeFn` sees
+  the Will topic as a publish at CONNECT, and a denial refuses the CONNECT (`not_authorized`);
+  `AuthRequest.will` (new `WillInfo`) carries it to authentication. **Retained store bounded in
+  bytes**: `Config.max_retained_store_bytes` (64 MiB default), `retainedRefusals()`,
+  `retainedBytes()`. **Sessions belong to their username**: a CONNECT under another account's
+  client id is refused (`not_authorized`) instead of resuming, taking over or discarding the
+  session. ⚠ `restoreSession` takes the owner as a new second argument
+  (`client_id, username, subs, offline_since_ms`) and returns `error.InvalidUsername` for one
+  longer than `max_username`; `SessionState.username` reports it. ⚠ A deployment whose ACL denies
+  a client's Will topic now sees that client's CONNECT refused.
+
 - **2026-09-28** — Broker: `SessionState.offline_since_ms` — since when a session has been
   offline (null while online), on the caller's clock, i.e. what `expireSessions` measures from.
   Handed back as `restoreSession`'s last argument (renamed from `now`, same meaning) it carries

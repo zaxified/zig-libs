@@ -394,6 +394,12 @@ const Message = struct {
 pub const Session = struct {
     client_id_buf: [max_client_id]u8 = undefined,
     client_id_len: usize = 0,
+    /// The username of the connection that created the session (null =
+    /// none given). Only a CONNECT with the same username may resume it,
+    /// take over its live connection, or discard it — see `handleConnect`.
+    owner_buf: [max_username]u8 = undefined,
+    owner_len: usize = 0,
+    has_owner: bool = false,
 
     // Guarded by `Broker.mutex`.
     /// Owned filter strings; the index references this session by pointer.
@@ -427,6 +433,17 @@ pub const Session = struct {
 
     pub fn clientId(s: *const Session) []const u8 {
         return s.client_id_buf[0..s.client_id_len];
+    }
+
+    pub fn ownerOpt(x: *const Session) ?[]const u8 {
+        return if (x.has_owner) x.owner_buf[0..x.owner_len] else null;
+    }
+
+    fn setOwner(x: *Session, username: ?[]const u8) void {
+        const u = username orelse return;
+        @memcpy(x.owner_buf[0..u.len], u);
+        x.owner_len = u.len;
+        x.has_owner = true;
     }
 
     fn queuedLen(s: *const Session) usize {
@@ -713,6 +730,11 @@ const Index = struct {
     }
 };
 
+fn optEql(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
 // ── the broker ──────────────────────────────────────────────────────────────
 
 /// One retained message: topic + payload copies the broker owns, plus the QoS
@@ -738,6 +760,22 @@ pub const AuthRequest = struct {
     client_id: []const u8,
     username: ?[]const u8,
     password: ?[]const u8,
+    /// The Will the CONNECT registers, if any — so an authentication policy
+    /// can weigh it (refuse a retained Will, a large one, one from an
+    /// account that should have none). `topic` is as sent, not yet
+    /// validated, and points into the receive buffer: valid only for the
+    /// call. Its topic is ACL-checked separately, after this hook allows
+    /// the connection (see `Config.authorizeFn`). Defaulted so a request
+    /// built by hand still compiles.
+    will: ?WillInfo = null,
+};
+
+/// What `AuthRequest.will` says about a CONNECT's Will.
+pub const WillInfo = struct {
+    topic: []const u8,
+    qos: QoS,
+    retain: bool,
+    payload_len: usize,
 };
 
 /// The operation an ACL check authorizes.
@@ -773,6 +811,17 @@ pub const Config = struct {
     /// Hard cap on distinct retained topics; a genuinely new topic past this
     /// is refused (existing retained topics may still be updated in place).
     max_retained: usize = 8192,
+    /// Hard cap on the bytes (topic + payload) the retained store holds.
+    /// `max_retained` counts topics only, so it bounded nothing once
+    /// `max_packet_size` was raised: 8192 Wills of 60 KB took a hub from
+    /// 2 MB to 494 MB RSS (egw audit S1). Past the cap a new topic is
+    /// refused, and an update that would cross it REMOVES the topic's old
+    /// value rather than keep one its publisher has since replaced. Both
+    /// count in `Broker.retainedRefusals()`, as does a topic refused by
+    /// `max_retained`; the live fan-out happens either way. The default is
+    /// `max_retained` × the default `max_packet_size`, so a broker at the
+    /// default packet size is never bound by it.
+    max_retained_store_bytes: usize = 64 << 20,
     /// Bounded idle window (ms) a connection is given to send its CONNECT
     /// before the accept loop drops it. Only consulted by `TcpServer`.
     connect_timeout_ms: u32 = 10_000,
@@ -838,6 +887,15 @@ pub const Config = struct {
     /// A denied SUBSCRIBE yields per-filter SUBACK 0x80; a denied PUBLISH is
     /// silently dropped (not fanned out, not retained) while the publisher is
     /// still PUBACKed (QoS 1) so it stays well-behaved.
+    ///
+    /// A CONNECT's Will is checked here too, as a publish (`retain` = the
+    /// Will's), once the connection is authenticated: a Will is a message
+    /// the broker publishes on the client's behalf later, and without the
+    /// check any account could publish anything, retained, anywhere by
+    /// dropping its socket (egw audit S1 R1). A denied Will refuses the
+    /// CONNECT with `not_authorized`, as mosquitto does — refusing it at
+    /// death instead would tell the client nothing. The decision is taken
+    /// once, at CONNECT.
     authorizeFn: ?*const fn (ctx: ?*anyopaque, req: AclRequest) bool = null,
     acl_ctx: ?*anyopaque = null,
 
@@ -949,6 +1007,11 @@ pub const Broker = struct {
     /// Count of SUBSCRIBEs whose retained walk was truncated at
     /// `Config.max_retained_deliveries` / `max_retained_bytes`.
     retained_truncations: std.atomic.Value(usize) = .init(0),
+    /// Count of retained values the store refused or dropped at
+    /// `Config.max_retained` / `max_retained_store_bytes`.
+    retained_refusals: std.atomic.Value(usize) = .init(0),
+    /// Bytes (topic + payload) held by `retained`. Guarded by `mutex`.
+    retained_bytes: usize = 0,
     /// Count of QoS 1 messages dropped because a subscriber's in-flight pool
     /// was full — i.e. that subscriber has stopped answering PUBACKs.
     qos1_drops: std.atomic.Value(usize) = .init(0),
@@ -1009,6 +1072,20 @@ pub const Broker = struct {
         return b.retained_truncations.load(.monotonic);
     }
 
+    /// How many retained values the store refused (a new topic past
+    /// `Config.max_retained` or `max_retained_store_bytes`) or dropped (an
+    /// update that would cross `max_retained_store_bytes`).
+    pub fn retainedRefusals(b: *const Broker) u64 {
+        return b.retained_refusals.load(.monotonic);
+    }
+
+    /// Bytes (topic + payload) the retained store holds now.
+    pub fn retainedBytes(b: *Broker) usize {
+        b.mutex.lock();
+        defer b.mutex.unlock();
+        return b.retained_bytes;
+    }
+
     /// How many QoS 1 deliveries have been dropped for a subscriber whose
     /// in-flight pool was full. Non-zero means a subscriber has stopped
     /// answering PUBACKs and is silently losing messages.
@@ -1059,6 +1136,9 @@ pub const Broker = struct {
     /// What a persistent session holds, as of one instant.
     pub const SessionState = struct {
         client_id: []const u8,
+        /// The account that owns the session (`Session.ownerOpt`); hand it
+        /// back to `restoreSession`.
+        username: ?[]const u8 = null,
         online: bool,
         /// Since when the session has been offline, on the caller's clock
         /// (the `now` given to `process`, or to `restoreSession`); null while
@@ -1099,6 +1179,7 @@ pub const Broker = struct {
             defer x.lock.unlock();
             o.* = .{
                 .client_id = try arena.dupe(u8, x.clientId()),
+                .username = if (x.ownerOpt()) |u| try arena.dupe(u8, u) else null,
                 .online = x.conn != null,
                 .offline_since_ms = if (x.conn == null) x.offline_since_ms else null,
                 .queued = x.queuedLen(),
@@ -1117,6 +1198,8 @@ pub const Broker = struct {
         SessionLimitReached,
         /// A client id longer than the broker keeps, or empty.
         InvalidClientId,
+        /// A username longer than `max_username`.
+        InvalidUsername,
         /// A filter that is not one (4.7), one nested past the broker's
         /// limit, or a QoS above 1 — nothing a SUBSCRIBE could have granted.
         InvalidSubscription,
@@ -1141,10 +1224,14 @@ pub const Broker = struct {
     /// `SessionState.offline_since_ms`, so the expiry clock carries over the
     /// restart, or the restart's own `now` for a session that was online
     /// (the server's death took it offline, at an instant it cannot know).
+    ///
+    /// `username` is the session's owner (`SessionState.username`): only a
+    /// CONNECT with that username resumes it. null = one that gave none.
     /// ⚠ A kept value only means something if that clock survives a restart
     /// — wall time, not a monotonic counter that starts again at zero.
-    pub fn restoreSession(b: *Broker, client_id: []const u8, subs: []const SessionSub, offline_since_ms: i64) RestoreError!void {
+    pub fn restoreSession(b: *Broker, client_id: []const u8, username: ?[]const u8, subs: []const SessionSub, offline_since_ms: i64) RestoreError!void {
         if (client_id.len == 0 or client_id.len > max_client_id) return error.InvalidClientId;
+        if (username) |u| if (u.len > max_username) return error.InvalidUsername;
         if (subs.len > b.config.max_subscriptions_per_conn) return error.TooManySubscriptions;
         for (subs) |sub| {
             if (@intFromEnum(sub.qos) > 1) return error.InvalidSubscription;
@@ -1156,7 +1243,7 @@ pub const Broker = struct {
         if (b.findSession(client_id) != null) return error.SessionExists;
         if (b.sessions.items.len >= b.config.max_sessions) return error.SessionLimitReached;
         if (b.subscriptions_total + subs.len > b.config.max_subscriptions_total) return error.TooManySubscriptions;
-        const x = b.createSession(client_id) catch return error.OutOfMemory;
+        const x = b.createSession(client_id, username) catch return error.OutOfMemory;
         x.offline_since_ms = offline_since_ms;
         for (subs) |sub| {
             if (b.hasSessionSub(x, sub.filter)) {
@@ -1545,6 +1632,12 @@ pub const Broker = struct {
                 .client_id = conn.clientId(),
                 .username = conn.usernameOpt(),
                 .password = c.password,
+                .will = if (c.will) |w| .{
+                    .topic = w.topic,
+                    .qos = w.qos,
+                    .retain = w.retain,
+                    .payload_len = w.message.len,
+                } else null,
             });
             const rc: ?packet.ConnectReturnCode = switch (decision) {
                 .allow => null,
@@ -1574,6 +1667,16 @@ pub const Broker = struct {
             // client id for a fault that is in its will topic. §3.1.4-1 wants
             // the connection closed for a CONNECT that fails validation.
             topic.validateName(w.topic) catch return error.ProtocolViolation;
+            // The Will is published for this client later, so it needs the
+            // right to publish there now (see `Config.authorizeFn`).
+            if (!b.aclAllows(conn, w.topic, .publish, w.retain)) {
+                var cbuf: [4]u8 = undefined;
+                try conn.lockedWrite(try packet.encodeConnack(&cbuf, .{
+                    .session_present = false,
+                    .return_code = .not_authorized,
+                }));
+                return .close;
+            }
             const wt = try b.allocator.dupe(u8, w.topic);
             errdefer b.allocator.free(wt);
             const wp = try b.allocator.dupe(u8, w.message);
@@ -1603,6 +1706,20 @@ pub const Broker = struct {
             b.mutex.lock();
             defer b.mutex.unlock();
             const existing = b.findSession(conn.clientId());
+            // ⛔ A client id is not an identity (egw audit S1 R3): another
+            // account that knows it would otherwise resume the session —
+            // its subscriptions and queue, never ACL-checked for this
+            // account — take over the live connection, or discard it all
+            // with clean session 1. Refused before anything changes hands.
+            if (b.claimedByAnother(conn, existing)) {
+                b.dropWill(conn);
+                var cbuf: [4]u8 = undefined;
+                try conn.write(try packet.encodeConnack(&cbuf, .{
+                    .session_present = false,
+                    .return_code = .not_authorized,
+                }));
+                return .close;
+            }
             if (!c.clean_session and existing == null and b.sessions.items.len >= b.config.max_sessions) {
                 // Refused before anything changed hands, so a live session
                 // under this id — there is none — is not disturbed either.
@@ -1616,7 +1733,7 @@ pub const Broker = struct {
             }
             // Allocated before the take-over, so running out of memory here
             // leaves the earlier connection alone.
-            const fresh: ?*Session = if (!c.clean_session and existing == null) try b.createSession(conn.clientId()) else null;
+            const fresh: ?*Session = if (!c.clean_session and existing == null) try b.createSession(conn.clientId(), conn.usernameOpt()) else null;
             b.takeover(conn);
             if (existing) |x| {
                 if (c.clean_session) b.discardSession(x) else {
@@ -1654,12 +1771,13 @@ pub const Broker = struct {
     }
 
     /// A new, registered, unattached session. Caller holds `mutex`.
-    fn createSession(b: *Broker, client_id: []const u8) Error!*Session {
+    fn createSession(b: *Broker, client_id: []const u8, owner: ?[]const u8) Error!*Session {
         const x = try b.allocator.create(Session);
         errdefer b.allocator.destroy(x);
         x.* = .{};
         @memcpy(x.client_id_buf[0..client_id.len], client_id);
         x.client_id_len = client_id.len;
+        x.setOwner(owner);
         try x.inflight.ensureTotalCapacity(b.allocator, max_in_flight);
         errdefer x.inflight.deinit(b.allocator);
         try b.sessions.append(b.allocator, x);
@@ -1811,6 +1929,22 @@ pub const Broker = struct {
 
     /// Caller holds `mutex`. Supersede any live connection sharing the new
     /// connection's client-id.
+    /// True when `conn`'s client id belongs to a different username: the
+    /// persistent session `existing`, or a live connection `takeover` would
+    /// end. Caller holds `mutex`.
+    fn claimedByAnother(b: *Broker, conn: *Connection, existing: ?*Session) bool {
+        const mine = conn.usernameOpt();
+        if (existing) |x| if (!optEql(x.ownerOpt(), mine)) return true;
+        for (b.connections.items) |other| {
+            // Only an established connection holds the id: one still in (or
+            // refused at) its own CONNECT has not claimed anything.
+            if (other == conn or other.state != .connected) continue;
+            if (!std.mem.eql(u8, other.clientId(), conn.clientId())) continue;
+            if (!optEql(other.usernameOpt(), mine)) return true;
+        }
+        return false;
+    }
+
     fn takeover(b: *Broker, newconn: *Connection) void {
         const id = newconn.clientId();
         for (b.connections.items) |other| {
@@ -2231,27 +2365,44 @@ pub const Broker = struct {
     /// Store (or update) one retained topic. Caller holds `mutex`. Past
     /// `Config.max_retained` a genuinely new topic is refused (the live fan-out
     /// still happens; only the retained copy is dropped).
+    /// Past `Config.max_retained_store_bytes` a new topic is refused and an
+    /// update that would cross it drops the old value (see there).
     fn storeRetained(b: *Broker, topic_name: []const u8, payload: []const u8, qos: QoS) Error!void {
+        const cap = b.config.max_retained_store_bytes;
         for (b.retained.items) |*r| {
             if (std.mem.eql(u8, r.topic, topic_name)) {
+                if (b.retained_bytes - r.payload.len + payload.len > cap) {
+                    _ = b.retained_refusals.fetchAdd(1, .monotonic);
+                    b.clearRetained(topic_name);
+                    return;
+                }
                 const new_payload = try b.allocator.dupe(u8, payload);
+                b.retained_bytes = b.retained_bytes - r.payload.len + payload.len;
                 b.allocator.free(r.payload);
                 r.payload = new_payload;
                 r.qos = qos;
                 return;
             }
         }
-        if (b.retained.items.len >= b.config.max_retained) return; // cap: refuse new topic
+        // cap: refuse new topic
+        if (b.retained.items.len >= b.config.max_retained or
+            b.retained_bytes + topic_name.len + payload.len > cap)
+        {
+            _ = b.retained_refusals.fetchAdd(1, .monotonic);
+            return;
+        }
         const owned_topic = try b.allocator.dupe(u8, topic_name);
         errdefer b.allocator.free(owned_topic);
         const owned_payload = try b.allocator.dupe(u8, payload);
         errdefer b.allocator.free(owned_payload);
         try b.retained.append(b.allocator, .{ .topic = owned_topic, .payload = owned_payload, .qos = qos });
+        b.retained_bytes += topic_name.len + payload.len;
     }
 
     fn clearRetained(b: *Broker, topic_name: []const u8) void {
         for (b.retained.items, 0..) |r, i| {
             if (std.mem.eql(u8, r.topic, topic_name)) {
+                b.retained_bytes -= r.topic.len + r.payload.len;
                 b.allocator.free(r.topic);
                 b.allocator.free(r.payload);
                 _ = b.retained.swapRemove(i);
@@ -3413,7 +3564,7 @@ test "sessionStates reports subscriptions, queue, flight and drops of every sess
 test "a restored session queues from the start, and its client resumes it" {
     var b = Broker.init(testing.allocator, .{});
     defer b.deinit();
-    try b.restoreSession("web", &.{ .{ .filter = "egw/#", .qos = .at_least_once }, .{ .filter = "q0", .qos = .at_most_once } }, 100);
+    try b.restoreSession("web", null, &.{ .{ .filter = "egw/#", .qos = .at_least_once }, .{ .filter = "q0", .qos = .at_most_once } }, 100);
     try testing.expectEqual(@as(usize, 1), b.sessionCount());
     try testing.expectEqual(@as(usize, 2), b.subscriptionCount());
     try b.publish("egw/1/t", "20.5", .at_least_once, false);
@@ -3436,17 +3587,17 @@ test "restoreSession refuses what a SUBSCRIBE could not have granted, and leaves
     var b = Broker.init(testing.allocator, .{ .max_sessions = 1, .max_subscriptions_per_conn = 2 });
     defer b.deinit();
     const ok: []const Broker.SessionSub = &.{.{ .filter = "a", .qos = .at_least_once }};
-    try testing.expectError(error.InvalidClientId, b.restoreSession("", ok, 0));
-    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", &.{.{ .filter = "a/#/b", .qos = .at_least_once }}, 0));
-    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", &.{.{ .filter = "a", .qos = .exactly_once }}, 0));
-    try testing.expectError(error.TooManySubscriptions, b.restoreSession("x", &.{
+    try testing.expectError(error.InvalidClientId, b.restoreSession("", null, ok, 0));
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", null, &.{.{ .filter = "a/#/b", .qos = .at_least_once }}, 0));
+    try testing.expectError(error.InvalidSubscription, b.restoreSession("x", null, &.{.{ .filter = "a", .qos = .exactly_once }}, 0));
+    try testing.expectError(error.TooManySubscriptions, b.restoreSession("x", null, &.{
         .{ .filter = "a", .qos = .at_least_once }, .{ .filter = "b", .qos = .at_least_once }, .{ .filter = "c", .qos = .at_least_once },
     }, 0));
     try testing.expectEqual(@as(usize, 0), b.sessionCount());
     try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
-    try b.restoreSession("x", ok, 0);
-    try testing.expectError(error.SessionExists, b.restoreSession("x", ok, 0));
-    try testing.expectError(error.SessionLimitReached, b.restoreSession("y", ok, 0));
+    try b.restoreSession("x", null, ok, 0);
+    try testing.expectError(error.SessionExists, b.restoreSession("x", null, ok, 0));
+    try testing.expectError(error.SessionLimitReached, b.restoreSession("y", null, ok, 0));
 }
 
 test "offline_since_ms survives a restart: sessionStates to restoreSession keeps the expiry clock" {
@@ -3473,17 +3624,81 @@ test "offline_since_ms survives a restart: sessionStates to restoreSession keeps
     // The server restarts at 1500: the session is due at 1700, not 2500.
     var b2 = Broker.init(testing.allocator, .{ .session_expiry_ms = 1000 });
     defer b2.deinit();
-    try b2.restoreSession("away", &.{.{ .filter = "a", .qos = .at_least_once }}, kept.?);
+    try b2.restoreSession("away", null, &.{.{ .filter = "a", .qos = .at_least_once }}, kept.?);
     const again = (try b2.sessionStates(arena.allocator()))[0];
     try testing.expectEqual(@as(?i64, 700), again.offline_since_ms);
     try testing.expectEqual(@as(usize, 0), b2.expireSessions(1699));
     try testing.expectEqual(@as(usize, 1), b2.expireSessions(1700));
 }
 
+test "a session belongs to its username: another account cannot resume, take over or discard it" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+
+    // alice's persistent session, online, subscribed.
+    var ta: TestTransport = .{};
+    const alice = try connectRaw(&b, &ta, .{ .client_id = "dev", .username = "alice", .clean_session = false, .keep_alive_s = 60 });
+    _ = (try ta.next()).?; // CONNACK
+    try feedSubscribe(&b, alice, 1, &.{.{ .filter = "a", .qos = .at_least_once }});
+    _ = (try ta.next()).?; // SUBACK
+
+    // mallory with the same client id: resume, clean take-over, anonymous — all refused.
+    const tries = [_]packet.Connect{
+        .{ .client_id = "dev", .username = "mallory", .clean_session = false },
+        .{ .client_id = "dev", .username = "mallory", .clean_session = true },
+        .{ .client_id = "dev", .clean_session = false },
+    };
+    for (tries) |c| {
+        var tm: TestTransport = .{};
+        try testing.expectError(error.Refused, connectRaw(&b, &tm, c));
+        try testing.expectEqual(packet.ConnectReturnCode.not_authorized, (try tm.next()).?.connack.return_code);
+    }
+    // alice is untouched: still connected, still subscribed.
+    try testing.expectEqual(Connection.State.connected, alice.state);
+    try testing.expectEqual(@as(usize, 1), b.subscriptionCount());
+
+    // Offline, the session is still hers alone.
+    b.remove(alice);
+    var tm: TestTransport = .{};
+    try testing.expectError(error.Refused, connectRaw(&b, &tm, .{ .client_id = "dev", .username = "mallory", .clean_session = false }));
+    try testing.expectEqual(@as(?usize, 0), b.sessionQueued("dev"));
+    var ta2: TestTransport = .{};
+    const back = try connectSessionAs(&b, &ta2, "dev", "alice");
+    try testing.expect(back.present);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try testing.expectEqualStrings("alice", (try b.sessionStates(arena.allocator()))[0].username.?);
+}
+
+fn connectSessionAs(b: *Broker, tt: *TestTransport, client_id: []const u8, username: ?[]const u8) !struct { conn: *Connection, present: bool } {
+    const conn = try b.accept(tt.transport());
+    var buf: [128]u8 = undefined;
+    try b.feed(conn, try packet.encodeConnect(&buf, .{ .client_id = client_id, .username = username, .clean_session = false, .keep_alive_s = 60 }));
+    try testing.expectEqual(Disposition.keep, try b.process(conn, 0));
+    const p = (try tt.next()).?;
+    try testing.expectEqual(packet.ConnectReturnCode.accepted, p.connack.return_code);
+    return .{ .conn = conn, .present = p.connack.session_present };
+}
+
+test "a restored session keeps its owner" {
+    var b = Broker.init(testing.allocator, .{});
+    defer b.deinit();
+    try b.restoreSession("web", "hub-reader", &.{.{ .filter = "egw/#", .qos = .at_least_once }}, 0);
+    var t1: TestTransport = .{};
+    try testing.expectError(error.Refused, connectRaw(&b, &t1, .{ .client_id = "web", .username = "other", .clean_session = false }));
+    var t2: TestTransport = .{};
+    const s = try connectSessionAs(&b, &t2, "web", "hub-reader");
+    try testing.expect(s.present);
+    var long: [max_username + 1]u8 = undefined;
+    @memset(&long, 'u');
+    try testing.expectError(error.InvalidUsername, b.restoreSession("x", &long, &.{}, 0));
+}
+
 test "a restored session expires like any offline one, from the restore" {
     var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 1000 });
     defer b.deinit();
-    try b.restoreSession("web", &.{.{ .filter = "a", .qos = .at_least_once }}, 5000);
+    try b.restoreSession("web", null, &.{.{ .filter = "a", .qos = .at_least_once }}, 5000);
     try testing.expectEqual(@as(usize, 0), b.expireSessions(5999));
     try testing.expectEqual(@as(usize, 1), b.expireSessions(6000));
     try testing.expectEqual(@as(usize, 0), b.subscriptionCount());
@@ -4965,6 +5180,110 @@ test "a bridge can read the keep-alive and the Will it has to replay" {
     try testing.expectEqual(QoS.at_most_once, w.qos);
 
     b.remove(conn);
+}
+
+fn willAcl(ctx: ?*anyopaque, req: AclRequest) bool {
+    _ = ctx;
+    // Nothing under "secret/"; "cmd/" may be published, never retained.
+    if (std.mem.startsWith(u8, req.topic, "secret/")) return false;
+    if (std.mem.startsWith(u8, req.topic, "cmd/") and req.retain) return false;
+    return true;
+}
+
+test "Will: a topic the ACL denies refuses the CONNECT and registers nothing" {
+    var b = Broker.init(testing.allocator, .{ .authorizeFn = willAcl });
+    defer b.deinit();
+    var watcher_tt: TestTransport = .{};
+    const watcher = try connectClient(&b, &watcher_tt, "watcher", 0, 0);
+    try feedSubscribe(&b, watcher, 1, &.{.{ .filter = "#", .qos = .at_most_once }});
+    _ = try watcher_tt.next(); // SUBACK
+
+    const refused = [_]packet.Will{
+        .{ .topic = "secret/x", .message = "boom", .retain = true },
+        .{ .topic = "cmd/reboot", .message = "now", .retain = true }, // publishable, not retainable
+    };
+    for (refused) |w| {
+        var tt: TestTransport = .{};
+        try testing.expectError(error.Refused, connectRaw(&b, &tt, .{ .client_id = "evil", .will = w }));
+        const ack = (try tt.next()).?;
+        try testing.expectEqual(packet.ConnectReturnCode.not_authorized, ack.connack.return_code);
+    }
+    // Every refused connection is torn down the ungraceful way — the path
+    // that publishes a Will — and none reaches the watcher or the store.
+    var i: usize = b.connections.items.len;
+    while (i > 0) {
+        i -= 1;
+        const c = b.connections.items[i];
+        if (c != watcher) b.remove(c);
+    }
+    try testing.expect((try watcher_tt.next()) == null);
+    try testing.expectEqual(@as(usize, 0), b.retained.items.len);
+
+    // The same Will unretained is allowed, and is published at death.
+    var ok_tt: TestTransport = .{};
+    const ok = try connectWithWill(&b, &ok_tt, "ok", .{ .topic = "cmd/reboot", .message = "now" });
+    b.remove(ok);
+    const got = (try watcher_tt.next()).?.publish;
+    try testing.expectEqualStrings("cmd/reboot", got.topic);
+    b.remove(watcher);
+}
+
+fn willAuth(ctx: ?*anyopaque, req: AuthRequest) AuthDecision {
+    const seen: *?WillInfo = @ptrCast(@alignCast(ctx.?));
+    seen.* = req.will;
+    if (req.will) |w| if (w.payload_len > 8) return .deny_not_authorized;
+    return .allow;
+}
+
+test "Will: AuthRequest carries it, so authentication can weigh it" {
+    var seen: ?WillInfo = null;
+    var b = Broker.init(testing.allocator, .{ .authenticateFn = willAuth, .auth_ctx = &seen });
+    defer b.deinit();
+
+    var t1: TestTransport = .{};
+    const plain = try connectClient(&b, &t1, "plain", 0, 0);
+    try testing.expectEqual(@as(?WillInfo, null), seen);
+    b.remove(plain);
+
+    var t2: TestTransport = .{};
+    try testing.expectError(error.Refused, connectRaw(&b, &t2, .{
+        .client_id = "big",
+        .will = .{ .topic = "st/big", .message = "0123456789", .qos = .at_least_once, .retain = true },
+    }));
+    const w = seen.?;
+    try testing.expectEqual(@as(usize, 10), w.payload_len);
+    try testing.expect(w.retain);
+    try testing.expectEqual(QoS.at_least_once, w.qos);
+    try testing.expectEqual(packet.ConnectReturnCode.not_authorized, (try t2.next()).?.connack.return_code);
+}
+
+test "retained store: max_retained_store_bytes refuses new topics and drops an oversized update" {
+    var b = Broker.init(testing.allocator, .{ .max_retained_store_bytes = 20 });
+    defer b.deinit();
+
+    try b.publish("a", "0123456789", .at_most_once, true); // 11 bytes
+    try testing.expectEqual(@as(usize, 11), b.retainedBytes());
+    try b.publish("b", "0123456789", .at_most_once, true); // would be 22: refused
+    try testing.expectEqual(@as(usize, 1), b.retained.items.len);
+    try testing.expectEqual(@as(u64, 1), b.retainedRefusals());
+
+    try b.publish("a", "0123456789012345678", .at_most_once, true); // 20: fits exactly
+    try testing.expectEqual(@as(usize, 20), b.retainedBytes());
+    try b.publish("a", "01234567890123456789", .at_most_once, true); // 21: the old value goes
+    try testing.expectEqual(@as(usize, 0), b.retained.items.len);
+    try testing.expectEqual(@as(usize, 0), b.retainedBytes());
+    try testing.expectEqual(@as(u64, 2), b.retainedRefusals());
+
+    try b.publish("b", "xy", .at_most_once, true);
+    try testing.expectEqual(@as(usize, 3), b.retainedBytes());
+    try b.publish("b", "", .at_most_once, true); // empty payload clears
+    try testing.expectEqual(@as(usize, 0), b.retainedBytes());
+
+    var c = Broker.init(testing.allocator, .{ .max_retained = 1 });
+    defer c.deinit();
+    try c.publish("a", "x", .at_most_once, true);
+    try c.publish("b", "x", .at_most_once, true); // the topic cap counts too
+    try testing.expectEqual(@as(u64, 1), c.retainedRefusals());
 }
 
 test "willOpt is null for a connection that registered none" {

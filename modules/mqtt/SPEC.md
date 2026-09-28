@@ -265,11 +265,37 @@ and cross-checked with a **valgrind `memcheck` pass (no errors, no leaks, no inv
 use-after-free in the reference-counted teardown). No race, deadlock, or UAF was found; the hardening is
 confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
 
+## Egw audit S1 fixes (2026-09-28)
+
+**The Will is ACL-checked** (S1 R1). Before, any authenticated account could publish anything,
+retained, anywhere by dropping its socket: the Will went through `fanout` with no ACL. Now, once
+the CONNECT is authenticated, `authorizeFn` sees the Will topic as a publish (`retain` = the
+Will's), and a denial refuses the CONNECT with `not_authorized`, as mosquitto does; nothing is
+registered. The decision is taken once, at CONNECT. `AuthRequest.will` (`WillInfo`: topic, QoS,
+retain, payload length) lets authentication weigh the Will too. The tap (`onPublishFn`) still
+does not see Wills.
+
+**The retained store is bounded in bytes**: `Config.max_retained_store_bytes` (default 64 MiB =
+`max_retained` × the default `max_packet_size`). `max_retained` counts topics only, so it bounded
+nothing once the packet size was raised (8192 Wills of 60 KB took a hub from 2 MB to 494 MB RSS).
+Past the cap a new topic is refused and an update that would cross it removes the old value
+(never keep a value its publisher has replaced); both, and a `max_retained` refusal, count in
+`retainedRefusals()`. `retainedBytes()` reports the store's size. Not to be confused with
+`max_retained_bytes`, the per-SUBSCRIBE delivery envelope.
+
+**A session belongs to its username** (S1 R3). Take-over and resume went by client id alone, so
+another account that knew the id resumed the session (subscriptions and queue, never ACL-checked
+for it), took over the live connection, or discarded everything with clean session 1. `Session`
+now records the username that created it; a CONNECT whose username differs from the session's
+owner, or from a `.connected` connection holding the id, is refused with `not_authorized` before
+anything changes hands. `sessionStates` reports the owner (`SessionState.username`) and
+`restoreSession(client_id, username, subs, offline_since_ms)` takes it back. The binding holds
+with or without an `authenticateFn`; without one, the username is only what clients claim.
+
+Mutants (one schemata build): skipping the Will ACL, the owner check, and the byte cap on an
+update and on a new topic — each caught by its own test.
+
 ## Backlog / deferred
-**Will topic is not ACL-checked** — GAP (2026-09-27, egw audit S1 R1, measured). The broker registers a CONNECT's Will after authentication with only `validateName` (`broker.zig` ~1556–1570); `publishWill` → `fanout` runs neither `authorizeFn` nor any publish hook, and `AuthRequest` does not carry the Will. Any authenticated account can therefore publish anything, retained, anywhere by dropping its socket. Wanted: at CONNECT, run `authorizeFn` for the Will topic (operation publish, `retain` = will_retain) and refuse with `not_authorized` as Mosquitto does; put the Will (topic, qos, retain, payload length) in `AuthRequest`. Related: the retained store is bounded by count (`max_retained`) but not by bytes — add `max_retained_bytes` (8192 × 60 KB Wills took a hub 2 MB → 494 MB RSS).
-
-**Sessions are not bound to the account that created them** — GAP (2026-09-27, egw audit S1 R3, measured). Take-over and resume go by client id alone (`broker.zig` ~1587–1620); the `Session` keeps no username, so another account connecting with the same client id resumes the session (inheriting its subscriptions and queue, bypassing the ACL it would get on SUBSCRIBE) or discards it with clean 1. Wanted: record the authenticated username on the `Session` (and in `sessionStates`/`restoreSession`), and refuse a resume or take-over by a different username (CONNACK `not_authorized`), as Mosquitto's `check_client_id`-style plugins do.
-
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/mqttz` is a client only. Drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so our broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 Broker: QoS 2, sessions persisted across a broker restart, DUP retransmit to clean-session subscribers,
