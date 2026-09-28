@@ -23,14 +23,16 @@
 //! step in the workers, waiting for its turn; this port runs it on the
 //! calling thread when it prepares the job, which is the same order.
 //!
-//! Threads: a fixed pool of `nb_workers` `std.Thread`s, each with its own
+//! Threads: a `ThreadPool` (`ZSTD_threadPool`), the context's own of
+//! `nb_workers` threads or a caller's shared one, each thread with its own
 //! compression context, fed through a small queue. Synchronisation is
-//! atomics plus the futex of `std.Io` (through the process-global
-//! `std.Io.Threaded` instance, whose futex calls are stateless), so the
-//! module needs neither libc nor an `Io` from its caller. See SPEC.md,
-//! *Multithreading*, for the choice against `workerpool`. A worker's
-//! context allocates from the caller's `gpa` when a job's workspace grows
-//! (`beginInternal`), so that allocator must be thread-safe.
+//! atomics plus a futex: the pool's `std.Io` when it was made with one
+//! (its workers are then that `Io`'s concurrent tasks), else the
+//! process-global `std.Io.Threaded` instance's, whose futex calls are
+//! stateless, so the module needs neither libc nor an `Io` from its caller.
+//! See SPEC.md, *Multithreading*, for the choice against `workerpool`. A
+//! worker's context allocates from the pool's `gpa` when a job's workspace
+//! grows (`beginInternal`), so that allocator must be thread-safe.
 //!
 //! With `ZSTD_c_rsyncable` (`Advanced.rsyncable`), a rolling hash over the
 //! last 32 input bytes also cuts a job wherever its low bits are all ones
@@ -118,20 +120,6 @@ const RawBuf = struct {
     }
 };
 
-/// The futex, from the process-global `std.Io.Threaded`: its futex calls
-/// use no state of the instance (Linux futex, or the parking futex).
-const Futex = struct {
-    fn io() std.Io {
-        return std.Io.Threaded.global_single_threaded.io();
-    }
-    fn wait(word: *const std.atomic.Value(u32), expected: u32) void {
-        io().futexWaitUncancelable(u32, &word.raw, expected);
-    }
-    fn wake(word: *const std.atomic.Value(u32), n: u32) void {
-        io().futexWake(u32, &word.raw, n);
-    }
-};
-
 /// `ZSTDMT_jobDescription`. The main thread sets the first group and posts
 /// the job; the worker publishes its progress through `c_size` and
 /// `consumed` (a job is complete when `consumed == src.len`), bumping
@@ -166,27 +154,28 @@ const Job = struct {
     frame_checksum_needed: bool = false,
 
     /// Worker side: publish a chunk's output and progress.
-    fn publish(job: *Job, c_add: usize, consumed: usize) void {
+    fn publish(job: *Job, pool: *const ThreadPool, c_add: usize, consumed: usize) void {
         _ = job.c_size.fetchAdd(c_add, .release);
         job.consumed.store(consumed, .release);
         _ = job.progress.fetchAdd(1, .release);
-        Futex.wake(&job.progress, 1);
+        pool.wake(&job.progress, 1);
     }
 
-    /// `ZSTDMT_compressionJob`, on `cctx`. `finished` counts the pool's
-    /// completed jobs (bumped before the job is published complete).
-    fn run(job: *Job, cctx: *frame.Compressor, finished: ?*std.atomic.Value(u32)) void {
+    /// `ZSTDMT_compressionJob`, on `cctx`, one of `pool`'s. `finished`
+    /// counts the pool's completed jobs (bumped before the job is published
+    /// complete; not for a job run inline).
+    fn run(job: *Job, pool: *ThreadPool, cctx: *frame.Compressor, finished: ?*std.atomic.Value(u32)) void {
         var last_c: usize = 0;
-        job.compress(cctx, &last_c) catch |e| {
+        job.compress(pool, cctx, &last_c) catch |e| {
             job.err = e;
             last_c = 0;
         };
         if (finished) |f| _ = f.fetchAdd(1, .release);
         // when consumed == src.len, the compression job is presumed completed
-        job.publish(last_c, job.src.len);
+        job.publish(pool, last_c, job.src.len);
     }
 
-    fn compress(job: *Job, cctx: *frame.Compressor, last_c: *usize) JobError!void {
+    fn compress(job: *Job, pool: *const ThreadPool, cctx: *frame.Compressor, last_c: *usize) JobError!void {
         var o = job.opts;
         // Don't compute the checksum for chunks, since we compute it
         // externally, but write it in the header.
@@ -222,7 +211,7 @@ const Job = struct {
             const c_size = try cctx.compressContinue(dst[op..], src[ip..][0..chunk_size], false);
             ip += chunk_size;
             op += c_size;
-            job.publish(c_size, chunk_size * chunk_nb);
+            job.publish(pool, c_size, chunk_size * chunk_nb);
         }
         // last block
         if (nb_chunks > 0 or job.last) { // must output a "last block" flag
@@ -240,90 +229,230 @@ const Job = struct {
     }
 };
 
-/// A fixed set of worker threads, each with its own compression context,
-/// taking posted jobs in order. At most one job per thread is in flight:
-/// `tryAdd` refuses a job when every thread is busy (`POOL_tryAdd` on a
-/// pool with no queue), and the caller keeps it ready (`jobReady`).
-const Pool = struct {
+/// `ZSTD_threadPool` (`POOL_ctx`): a fixed set of worker threads, each with
+/// its own compression context, taking posted jobs in order. At most one
+/// job per thread is in flight: `tryAdd` refuses a job when every thread
+/// is busy (`POOL_tryAdd` on a pool with no queue), and the multithreaded
+/// context keeps it ready (`jobReady`). A context makes one of its own
+/// (`nb_workers` threads, resized with it), or is handed a shared one
+/// (`ZSTD_CCtx_refThreadPool`), which any number of contexts, on any
+/// threads, post to at once; the bytes are the same either way.
+///
+/// The threads and the futex: with an `io`, the workers are `io`'s
+/// concurrent tasks (`Io.Group.concurrent`) and every wait and wake goes
+/// through `io`'s futex. Without one, they are `std.Thread`s and the futex
+/// is that of the process-global `std.Io.Threaded` instance, whose futex
+/// calls use no state of the instance (Linux futex, or the parking futex),
+/// so the module needs neither libc nor an `Io` from its caller.
+pub const ThreadPool = struct {
+    gpa: std.mem.Allocator,
+    io: ?std.Io,
+    /// Test seam (and `builtin.single_threaded`): no threads at all; a job
+    /// runs on the posting thread, on `cctxs[0]`. Private pools only.
+    run_inline: bool = false,
+    n_threads: u32 = 0,
+    /// Without an `io`: the threads to join.
     threads: []std.Thread = &.{},
+    /// With an `io`: the workers' group.
+    group: std.Io.Group = .init,
     queue: []*Job = &.{},
+    /// Serializes posting: a shared pool has many posting threads.
+    post_lock: std.Io.Mutex = .init,
     // `unsigned` (32-bit) in libzstd's own `nextJobID`/`doneJobID`
     // (`zstdmt_compress.c`) -- not just matching that width but required by
     // it: a 32-bit target (`check-portable`'s `.linux32`) has no native
     // 64-bit atomic ops, and `std.atomic.Value(u64)` fails to compile there
     // (`std/atomic.zig`'s `@atomicLoad`/`Store`/`Rmw` need <= register
     // width). A `u32` sequence wrapping around would need over 4 billion
-    // jobs in one compression -- unreachable at any realistic job size.
+    // jobs in one pool's life -- unreachable at any realistic job size.
     posted: std.atomic.Value(u32) = .init(0),
     taken: std.atomic.Value(u32) = .init(0),
     finished: std.atomic.Value(u32) = .init(0),
     /// The futex word idle workers sleep on.
     wake_seq: std.atomic.Value(u32) = .init(0),
     shutdown: std.atomic.Value(bool) = .init(false),
+    /// One per thread (one when inline), each allocating its workspace
+    /// from `gpa` on its thread as a job needs it.
     cctxs: []frame.Compressor = &.{},
 
-    /// `queue.len` is the worker count -- a handful, always representable
-    /// in `u32` -- so a sequence number's slot is a `u32 % u32` (matching
-    /// `posted`/`taken`/`finished`'s own width), cast to `usize` only at
-    /// the very end, for the index.
-    fn slot(pool: *Pool, seq_no: u32) usize {
+    pub const Options = struct {
+        /// The `Io` whose concurrency runs the workers and whose futex
+        /// they and the posting threads wait on; null: `std.Thread`s and
+        /// the process-global futex.
+        io: ?std.Io = null,
+    };
+
+    pub const CreateError = error{
+        OutOfMemory,
+        /// A thread could not be started (`std.Thread.spawn`), or `io` has
+        /// no concurrency to give (`error.ConcurrencyUnavailable`).
+        ConcurrencyUnavailable,
+        /// No threads (`ZSTD_createThreadPool(0)` returns NULL).
+        ParameterOutOfBound,
+    };
+
+    /// `ZSTD_createThreadPool`: `n_threads` workers, each with a
+    /// compression context whose workspace grows from `gpa` on the
+    /// worker's own thread -- so `gpa` must be thread-safe. Heap-allocated
+    /// (its threads point at it); `destroy` joins them. It must outlive
+    /// every context it is handed to.
+    pub fn create(gpa: std.mem.Allocator, n_threads: u32, opts: Options) CreateError!*ThreadPool {
+        return createInternal(gpa, n_threads, opts.io, false);
+    }
+
+    fn createInternal(gpa: std.mem.Allocator, n_threads: u32, io: ?std.Io, run_inline: bool) CreateError!*ThreadPool {
+        if (n_threads == 0) return error.ParameterOutOfBound;
+        const pool = try gpa.create(ThreadPool);
+        errdefer gpa.destroy(pool);
+        pool.* = .{ .gpa = gpa, .io = io, .run_inline = run_inline or builtin.single_threaded };
+        errdefer pool.freeAll();
+        try pool.resize(n_threads);
+        return pool;
+    }
+
+    /// `ZSTD_freeThreadPool`: joins the threads (idle: every context using
+    /// the pool has finished its frames or been destroyed).
+    pub fn destroy(pool: *ThreadPool) void {
+        const gpa = pool.gpa;
+        pool.freeAll();
+        gpa.destroy(pool);
+    }
+
+    fn freeAll(pool: *ThreadPool) void {
+        const gpa = pool.gpa;
+        if (pool.queue.len != 0) pool.stop();
+        for (pool.cctxs) |*c| c.deinit();
+        gpa.free(pool.cctxs);
+        pool.cctxs = &.{};
+    }
+
+    /// The workers' workspaces (`POOL_sizeof` counts only the structure;
+    /// libzstd's workspaces belong to each context's CCtx pool). Read it
+    /// while no job runs.
+    pub fn memorySize(pool: *const ThreadPool) usize {
+        var n: usize = 0;
+        for (pool.cctxs) |c| n += c.ws.len;
+        return n;
+    }
+
+    /// The sync backend: the pool's `io`, or the process-global one.
+    fn sync(pool: *const ThreadPool) std.Io {
+        return pool.io orelse std.Io.Threaded.global_single_threaded.io();
+    }
+
+    fn wait(pool: *const ThreadPool, word: *const std.atomic.Value(u32), expected: u32) void {
+        pool.sync().futexWaitUncancelable(u32, &word.raw, expected);
+    }
+
+    fn wake(pool: *const ThreadPool, word: *const std.atomic.Value(u32), n: u32) void {
+        pool.sync().futexWake(u32, &word.raw, n);
+    }
+
+    /// `queue.len` is the thread count, always representable in `u32`, so
+    /// a sequence number's slot is a `u32 % u32` (matching `posted`/
+    /// `taken`/`finished`'s own width), cast to `usize` only at the end.
+    fn slot(pool: *const ThreadPool, seq_no: u32) usize {
         return seq_no % @as(u32, @intCast(pool.queue.len));
     }
 
-    fn worker(pool: *Pool, idx: usize) void {
+    fn worker(pool: *ThreadPool, idx: usize) void {
         while (true) {
             const seq = pool.wake_seq.load(.acquire);
             if (pool.shutdown.load(.acquire)) return;
             const t = pool.taken.load(.acquire);
             if (t < pool.posted.load(.acquire)) {
+                // Read the job before claiming it: once claimed, its slot
+                // may be posted to again as soon as `finished` passes it,
+                // which a later job finishing first can make happen.
+                const job = @atomicLoad(*Job, &pool.queue[pool.slot(t)], .monotonic);
                 if (pool.taken.cmpxchgWeak(t, t + 1, .acq_rel, .monotonic) == null)
-                    pool.queue[pool.slot(t)].run(&pool.cctxs[idx], &pool.finished);
+                    job.run(pool, &pool.cctxs[idx], &pool.finished);
                 continue;
             }
-            Futex.wait(&pool.wake_seq, seq);
+            pool.wait(&pool.wake_seq, seq);
         }
     }
 
-    fn tryAdd(pool: *Pool, job: *Job) bool {
+    /// `POOL_tryAdd`: post `job` if a thread is free for it.
+    fn tryAdd(pool: *ThreadPool, job: *Job) bool {
+        if (pool.run_inline) {
+            job.run(pool, &pool.cctxs[0], null);
+            return true;
+        }
+        const io = pool.sync();
+        pool.post_lock.lockUncancelable(io);
+        defer pool.post_lock.unlock(io);
         const p = pool.posted.load(.monotonic);
-        if (p - pool.finished.load(.acquire) >= @as(u32, @intCast(pool.threads.len))) return false;
-        pool.queue[pool.slot(p)] = job;
+        if (p - pool.finished.load(.acquire) >= pool.n_threads) return false;
+        @atomicStore(*Job, &pool.queue[pool.slot(p)], job, .monotonic);
         pool.posted.store(p + 1, .release);
         _ = pool.wake_seq.fetchAdd(1, .release);
-        Futex.wake(&pool.wake_seq, 1);
+        pool.wake(&pool.wake_seq, 1);
         return true;
     }
 
-    fn start(pool: *Pool, gpa: std.mem.Allocator, n: usize) error{OutOfMemory}!void {
-        std.debug.assert(pool.threads.len == 0);
-        const queue = try gpa.alloc(*Job, n);
-        const threads = gpa.alloc(std.Thread, n) catch |e| {
-            gpa.free(queue);
-            return e;
-        };
-        pool.queue = queue;
+    /// `POOL_resize` (between frames: no job in flight): `n` threads, each
+    /// with a context (contexts beyond `n` are freed, the first `n` kept).
+    fn resize(pool: *ThreadPool, n: u32) CreateError!void {
+        const gpa = pool.gpa;
+        if (pool.queue.len != 0) pool.stop();
+        const n_ctx: usize = if (pool.run_inline) 1 else n;
+        if (pool.cctxs.len != n_ctx) {
+            const old = pool.cctxs;
+            const cctxs = try gpa.alloc(frame.Compressor, n_ctx);
+            for (cctxs, 0..) |*c, i| c.* = if (i < old.len) old[i] else .initEmpty(gpa);
+            if (old.len > n_ctx) for (old[n_ctx..]) |*c| c.deinit();
+            gpa.free(old);
+            pool.cctxs = cctxs;
+        }
+        pool.n_threads = n;
+        if (!pool.run_inline) try pool.start(n);
+    }
+
+    fn start(pool: *ThreadPool, n: usize) CreateError!void {
+        const gpa = pool.gpa;
+        std.debug.assert(pool.queue.len == 0);
+        pool.queue = try gpa.alloc(*Job, n);
         pool.shutdown.store(false, .release);
         pool.posted.store(0, .monotonic);
         pool.taken.store(0, .monotonic);
         pool.finished.store(0, .monotonic);
+        if (pool.io) |io| {
+            for (0..n) |i| pool.group.concurrent(io, worker, .{ pool, i }) catch {
+                pool.stop();
+                return error.ConcurrencyUnavailable;
+            };
+            return;
+        }
+        const threads = gpa.alloc(std.Thread, n) catch |e| {
+            gpa.free(pool.queue);
+            pool.queue = &.{};
+            return e;
+        };
         for (threads, 0..) |*t, i| {
             t.* = std.Thread.spawn(.{}, worker, .{ pool, i }) catch {
                 pool.threads = threads[0..i];
-                pool.stop(gpa);
+                pool.stop();
                 gpa.free(threads);
-                return error.OutOfMemory;
+                return error.ConcurrencyUnavailable;
             };
         }
         pool.threads = threads;
     }
 
-    /// Joins the threads (idle ones: the caller waited for every job).
-    fn stop(pool: *Pool, gpa: std.mem.Allocator) void {
+    /// Joins the workers (idle ones: every job posted has finished).
+    fn stop(pool: *ThreadPool) void {
+        const gpa = pool.gpa;
         pool.shutdown.store(true, .release);
         _ = pool.wake_seq.fetchAdd(1, .release);
-        Futex.wake(&pool.wake_seq, std.math.maxInt(u32));
-        for (pool.threads) |t| t.join();
-        if (pool.threads.len == pool.queue.len) gpa.free(pool.threads);
+        pool.wake(&pool.wake_seq, std.math.maxInt(u32));
+        if (pool.io) |io| {
+            // (the workers take no cancelation; await waits for them)
+            pool.group.await(io) catch {};
+        } else {
+            for (pool.threads) |t| t.join();
+            if (pool.threads.len == pool.queue.len) gpa.free(pool.threads);
+        }
         gpa.free(pool.queue);
         pool.threads = &.{};
         pool.queue = &.{};
@@ -337,9 +466,12 @@ pub const MtCtx = struct {
     gpa: std.mem.Allocator,
     n_workers: u32 = 0,
     /// Test seam: run each job on the calling thread when it is posted,
-    /// with no threads at all. The bytes are the same.
+    /// with no threads at all (a private pool only). The bytes are the same.
     run_inline: bool = false,
-    pool: Pool = .{},
+    /// The workers: the context's own pool (`nb_workers` threads, resized
+    /// with it), or a caller's shared one (`ZSTD_CCtx_refThreadPool`).
+    pool: *ThreadPool = undefined,
+    own_pool: bool = false,
 
     jobs: []Job = &.{},
     job_mask: u32 = 0,
@@ -389,16 +521,40 @@ pub const MtCtx = struct {
     xxh: std.hash.XxHash64 = .init(0),
     serial_checksum: bool = false,
 
-    /// `ZSTDMT_createCCtx_advanced`: a context for `n_workers` threads
-    /// (at least 1). With `run_inline`, no thread is started.
-    pub fn create(gpa: std.mem.Allocator, n_workers: u32, run_inline: bool) error{OutOfMemory}!*MtCtx {
+    /// `ZSTDMT_createCCtx_advanced`: a context for `n_workers` workers (at
+    /// least 1), on `shared` (`ZSTD_CCtx_refThreadPool`) or, when null, on
+    /// a pool of its own. With `run_inline`, a pool of its own starts no
+    /// thread.
+    pub fn create(gpa: std.mem.Allocator, n_workers: u32, run_inline: bool, shared: ?*ThreadPool) error{OutOfMemory}!*MtCtx {
         std.debug.assert(n_workers >= 1);
         const mt = try gpa.create(MtCtx);
         errdefer gpa.destroy(mt);
         mt.* = .{ .gpa = gpa, .run_inline = run_inline or builtin.single_threaded };
         errdefer mt.freeAll();
+        try mt.usePool(shared, n_workers);
         try mt.resize(n_workers);
         return mt;
+    }
+
+    /// Between frames: work on `shared`, or on a pool of the context's own
+    /// when null (made for `n_workers` threads). libzstd binds the pool once,
+    /// when it makes its multithreaded context, and ignores a later
+    /// `ZSTD_CCtx_refThreadPool`; here the next frame uses the new one.
+    pub fn usePool(mt: *MtCtx, shared: ?*ThreadPool, n_workers: u32) error{OutOfMemory}!void {
+        if (shared) |p| {
+            if (!mt.own_pool and mt.n_workers != 0 and mt.pool == p) return;
+        } else if (mt.own_pool) return;
+        if (mt.own_pool) mt.pool.destroy();
+        mt.own_pool = false;
+        if (shared) |p| {
+            mt.pool = p;
+        } else {
+            mt.pool = ThreadPool.createInternal(mt.gpa, n_workers, null, mt.run_inline) catch |e| switch (e) {
+                error.OutOfMemory, error.ConcurrencyUnavailable => return error.OutOfMemory,
+                error.ParameterOutOfBound => unreachable, // n_workers >= 1
+            };
+            mt.own_pool = true;
+        }
     }
 
     pub fn destroy(mt: *MtCtx) void {
@@ -410,10 +566,8 @@ pub const MtCtx = struct {
 
     fn freeAll(mt: *MtCtx) void {
         const gpa = mt.gpa;
-        if (mt.pool.threads.len != 0) mt.pool.stop(gpa);
-        for (mt.pool.cctxs) |*c| c.deinit();
-        gpa.free(mt.pool.cctxs);
-        mt.pool.cctxs = &.{};
+        if (mt.own_pool) mt.pool.destroy();
+        mt.own_pool = false;
         mt.freeJobs();
         RawBuf.free(gpa, mt.round_alloc);
         mt.round_alloc = &.{};
@@ -434,31 +588,28 @@ pub const MtCtx = struct {
         mt.jobs = &.{};
     }
 
-    /// The workers' contexts' workspaces and every buffer held
-    /// (`ZSTDMT_sizeof_CCtx` less the structures).
+    /// The workers' contexts' workspaces (with a pool of its own; a shared
+    /// pool's are the pool's, `ThreadPool.memorySize`) and every buffer
+    /// held (`ZSTDMT_sizeof_CCtx` less the structures).
     pub fn memorySize(mt: *const MtCtx) usize {
         var n: usize = mt.round_alloc.len + mt.ldm_table.len * @sizeOf(ldm.Entry) + mt.ldm_buckets.len;
-        for (mt.pool.cctxs) |c| n += c.ws.len;
+        if (mt.own_pool) n += mt.pool.memorySize();
         for (mt.jobs) |j| n += j.dst_buf.len + j.seq_buf.len * @sizeOf(ldm.RawSeq);
         if (mt.cdict_local) |*l| n += l.memorySize();
         return n;
     }
 
-    /// `ZSTDMT_resize` / `ZSTDMT_expandJobsTable` / the CCtx pool: `n`
-    /// threads, each with a context, and a job table of a power of two
-    /// above `n + 2`. Only between frames.
+    /// `ZSTDMT_resize` / `ZSTDMT_expandJobsTable`: `n` workers -- a pool
+    /// of its own resized to `n` threads, each with a context (a shared
+    /// pool is left as it is: libzstd's `POOL_resize` would resize it for
+    /// every context using it) -- and a job table of a power of two above
+    /// `n + 2`. Only between frames.
     fn resize(mt: *MtCtx, n: u32) error{OutOfMemory}!void {
         const gpa = mt.gpa;
-        if (mt.pool.threads.len != 0) mt.pool.stop(gpa);
-        const n_ctx: usize = if (mt.run_inline) 1 else n;
-        if (mt.pool.cctxs.len != n_ctx) {
-            const old = mt.pool.cctxs;
-            const cctxs = try gpa.alloc(frame.Compressor, n_ctx);
-            for (cctxs, 0..) |*c, i| c.* = if (i < old.len) old[i] else .initEmpty(gpa);
-            if (old.len > n_ctx) for (old[n_ctx..]) |*c| c.deinit();
-            gpa.free(old);
-            mt.pool.cctxs = cctxs;
-        }
+        if (mt.own_pool and mt.pool.n_threads != n) mt.pool.resize(n) catch |e| switch (e) {
+            error.OutOfMemory, error.ConcurrencyUnavailable => return error.OutOfMemory,
+            error.ParameterOutOfBound => unreachable, // n >= 1
+        };
         // ZSTDMT_createJobsTable: 2^(highbit32(nbJobs) + 1) slots
         const nb_jobs: u32 = n + 2;
         const table_len = @as(usize, 1) << @intCast(std.math.log2_int(u32, nb_jobs) + 1);
@@ -468,14 +619,13 @@ pub const MtCtx = struct {
             for (mt.jobs) |*j| j.* = .{};
             mt.job_mask = @intCast(table_len - 1);
         }
-        if (!mt.run_inline) try mt.pool.start(gpa, n);
         mt.n_workers = n;
     }
 
     /// `ZSTDMT_initCStream_internal`: set up a frame from what
     /// `ZSTD_CCtx_init_compressStream2` settled (`setup`), of `pledged`
-    /// bytes (null: unknown).
-    pub fn initFrame(mt: *MtCtx, setup: frame.Compressor.StreamSetup, pledged: ?u64) CDict.InitError!void {
+    /// bytes (null: unknown), on `shared` (null: a pool of its own).
+    pub fn initFrame(mt: *MtCtx, setup: frame.Compressor.StreamSetup, pledged: ?u64, shared: ?*ThreadPool) CDict.InitError!void {
         const gpa = mt.gpa;
         const adv = setup.opts.advanced;
         std.debug.assert(adv.nb_workers >= 1);
@@ -483,7 +633,8 @@ pub const MtCtx = struct {
             mt.waitForAllJobsCompleted();
             mt.releaseAllJobResources();
         }
-        if (adv.nb_workers != mt.n_workers) try mt.resize(adv.nb_workers);
+        try mt.usePool(shared, adv.nb_workers);
+        if (adv.nb_workers != mt.n_workers or (mt.own_pool and mt.pool.n_threads != adv.nb_workers)) try mt.resize(adv.nb_workers);
 
         var job_size: usize = adv.job_size;
         if (job_size != 0 and job_size < job_size_min) job_size = job_size_min;
@@ -691,7 +842,7 @@ pub const MtCtx = struct {
             while (true) {
                 const seq = job.progress.load(.acquire);
                 if (job.consumed.load(.acquire) >= job.src.len) break;
-                Futex.wait(&job.progress, seq);
+                mt.pool.wait(&job.progress, seq);
             }
         }
     }
@@ -1051,10 +1202,6 @@ pub const MtCtx = struct {
     }
 
     fn post(mt: *MtCtx, job: *Job) bool {
-        if (mt.run_inline) {
-            job.run(&mt.pool.cctxs[0], null);
-            return true;
-        }
         return mt.pool.tryAdd(job);
     }
 
@@ -1072,7 +1219,7 @@ pub const MtCtx = struct {
                     if (job.dst_flushed != job.c_size.load(.acquire)) break;
                     // job is completely consumed: there will be no signal
                     if (consumed == job.src.len) break;
-                    Futex.wait(&job.progress, seq);
+                    mt.pool.wait(&job.progress, seq);
                 }
             }
 
@@ -1130,8 +1277,9 @@ pub const MtCtx = struct {
 /// `nb_workers` workspaces (each the larger of a first job's, sized for the
 /// whole frame, and a later job's, sized for one section) and a job
 /// table's output and sequence buffers. Sized by the formulas `initFrame`
-/// and `slotBuffers` allocate by. Without a dictionary.
-pub fn estimateSize(opts: frame.Options, pledged: ?u64, size_hint: ?u32) usize {
+/// and `slotBuffers` allocate by. Without a dictionary. On a `shared` pool
+/// the workspaces are the pool's and not counted.
+pub fn estimateSize(opts: frame.Options, pledged: ?u64, size_hint: ?u32, shared: bool) usize {
     const adv = opts.advanced;
     std.debug.assert(adv.nb_workers >= 1);
     const size: u64 = pledged orelse if (size_hint) |h| h else params.unknown_size;
@@ -1165,7 +1313,7 @@ pub fn estimateSize(opts: frame.Options, pledged: ?u64, size_hint: ?u32) usize {
     o.checksum = false;
     o.advanced.force_max_window = true;
     const later = frame.workspaceSize(cp, section, o, false);
-    total += n * @max(first, later);
+    if (!shared) total += n * @max(first, later);
 
     const nb_jobs: u32 = adv.nb_workers + 2;
     const table_len = @as(usize, 1) << @intCast(std.math.log2_int(u32, nb_jobs) + 1);

@@ -83,6 +83,9 @@ pub const Options = struct {
     dictionary: frame.Dict = .none,
     /// `ZSTD_registerSequenceProducer`: see `zstd.SequenceProducer`.
     sequence_producer: ?frame.SequenceProducer = null,
+    /// `ZSTD_CCtx_refThreadPool`: see `zstd.Options.thread_pool`. Taken at
+    /// each frame's start.
+    thread_pool: ?*zstdmt.ThreadPool = null,
 };
 
 /// The highest level a stream accepts: every level, as one-shot.
@@ -330,9 +333,9 @@ pub const Stream = struct {
             const setup = try s.comp.setupStream2(s.frameOptions(), pledged, s.opts.src_size_hint, &s.local_cdict);
             if (s.mt == null) {
                 const gpa = s.comp.gpa orelse return error.OutOfMemory; // a static context
-                s.mt = try zstdmt.MtCtx.create(gpa, s.opts.advanced.nb_workers, s.mt_run_inline);
+                s.mt = try zstdmt.MtCtx.create(gpa, s.opts.advanced.nb_workers, s.mt_run_inline, s.opts.thread_pool);
             }
-            try s.mt.?.initFrame(setup, pledged);
+            try s.mt.?.initFrame(setup, pledged, s.opts.thread_pool);
             if (s.opts.dictionary == .prefix) s.opts.dictionary = .none;
             s.stage = .mt;
             s.applied_mt = true;
@@ -526,10 +529,11 @@ fn frameParams(opts: Options, pledged: ?u64) params.CParams {
 pub fn estimateSize(opts: Options) Error!usize {
     try Stream.checkOptions(opts);
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
+    const shared = opts.thread_pool != null;
     if (opts.advanced.nb_workers > 0) {
         if (opts.pledged_size) |p| {
-            if (p > zstdmt.job_size_min) return zstdmt.estimateSize(fo, p, opts.src_size_hint);
-        } else return estimateSingle(opts, fo) + zstdmt.estimateSize(fo, null, opts.src_size_hint);
+            if (p > zstdmt.job_size_min) return zstdmt.estimateSize(fo, p, opts.src_size_hint, shared);
+        } else return estimateSingle(opts, fo) + zstdmt.estimateSize(fo, null, opts.src_size_hint, shared);
     }
     return estimateSingle(opts, fo);
 }
