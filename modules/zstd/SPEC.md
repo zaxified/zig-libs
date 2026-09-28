@@ -1303,11 +1303,84 @@ each decoded buffer through its writer's buffer.
 std's decoder takes 30× libzstd's time on the same frames, which is why
 this is a port and not an extension of it.
 
-`Decompressor` holds the tables and a 128 KB literal buffer (≈ 190 KB) on
-the heap; `decompress` allocates one per call. A `DDict` adds its content
-buffer (by copy or by reference) and, when a zstd-format dictionary's
-entropy is present, the same three FSE tables and one Huffman table
-`Decompressor` itself holds (a few KB).
+**Memory.** `Decompressor` holds the tables and a 128 KB literal buffer
+(159 888 bytes on x86-64, `estimateDecompressorSize`, libzstd's
+`ZSTD_estimateDCtxSize`) on the heap; `decompress` allocates one per call.
+A `DecompressStream` adds one allocation of an input buffer of one block and
+an output ring (above), laid out per frame. A `DDict` adds its content when
+copied; its entropy tables (the same three FSE tables and one Huffman table
+`Decompressor` holds) are in the `DDict` value itself. As for the
+compressor (*Contexts*), every estimate is this port's exact number, not
+libzstd's (which counts its C structs: 95 992 for the context, 27 352 for a
+`ZSTD_DDict`), and none counts the handle the caller holds:
+
+- `estimateDecompressStreamSize(window_size, opts)` (`ZSTD_estimateDStreamSize`)
+  is what the stream allocates for a frame of that window and unknown
+  content size -- the context, `max(b, 4)` of input buffer and `window +
+  2b + 64` of ring, `b` the block maximum (`min(window, 128 KB,
+  max_block_size)`); no ring with `stable_output` -- and an upper bound for
+  every frame with a smaller window. A window under 1 KB counts as 1 KB, as
+  the stream counts it. The window limit is not consulted (libzstd's takes
+  no limit either).
+- `estimateDecompressStreamSizeFromFrame(src, opts)` is exactly what the
+  stream allocates for the frame whose header starts `src`, its content size
+  included (libzstd's uses the window alone), and refuses what the stream
+  refuses for its window (libzstd's checks 2^31, not the stream's limit).
+  A skippable frame gets buffers too, as in libzstd.
+- `DDict.estimateSize(dict_size, copied)` is the content when copied, else
+  0 (`ZSTD_estimateDDictSize`).
+
+`initStatic` puts each in a caller's workspace (`zstd.Workspace`, 64-byte
+aligned, the compressor's type), which it never frees or outgrows:
+`Decompressor.initStatic` (`ZSTD_initStaticDCtx`) and
+`DecompressStream.initStatic` (`ZSTD_initStaticDStream`) take the tables
+from its start -- less than `estimateDecompressorSize` is
+`error.OutOfMemory` at once, as libzstd returns NULL -- and the stream lays
+its buffers out behind them for each frame, a frame needing more failing
+with `error.OutOfMemory` (`memory_allocation`); `DDict.initStatic(ws,
+dict, content_type, copied)` (`ZSTD_initStaticDDict`, `ZSTD_dlm_byCopy` /
+`byRef`) copies the content into it. A static stream cannot take raw
+dictionary bytes (`Options.dictionary`, digested into an allocated `DDict`):
+`error.OutOfMemory`, libzstd's "Limitation 1" -- digest it with
+`DDict.initStatic` and pass `ddict`. `ddicts` stays allowed: libzstd refuses
+`ZSTD_d_refMultipleDDicts` on a static context because its hash set would
+allocate, and this port's list is the caller's. `workspaceSize()`
+(`ZSTD_sizeof_DCtx`/`DStream` less the handle and a loaded raw dictionary)
+and `DDict.memorySize()` report what is held. `dctx_test.zig` pins each
+estimate at a workspace of exactly it (the frame decodes) and one byte less
+(`error.OutOfMemory`): every header window 2^10..2^31 × 8 mantissas (over
+2^31 refused) × five
+block maxima × ring or none from the header, and real frames of unknown
+size over windows 2^10..2^20 with mantissas, decoded in pieces, allocating
+and static.
+
+**`max_block_size`** (`ZSTD_d_maxBlockSize`, 1 KB..128 KB, else
+`error.ParameterOutOfBound` at the first decoding call where libzstd refuses
+it when set; null where libzstd takes 0) lowers the frame's block maximum
+after its header, where the block decoder reads it (`ZSTD_blockSizeMax`):
+in the one-shot decoder (libzstd's `ZSTD_decompressFrame`) and the stream
+(`ZSTD_decompressStream`, whose buffers shrink with it) -- not in the
+piecewise `decompressContinue`, as libzstd's `ZSTD_decompressContinue`
+does not apply it. Which frames are refused follows: the stream refuses a
+larger block (`corruption_detected`); the one-shot decoder, which bounds no
+raw or RLE block, refuses a larger compressed block (`srcSize_wrong`) and,
+by where libzstd puts the literals, a block writing past `max_block_size +
+32` when the output has room for them behind it (`dstSize_tooSmall`). `testdata/mbs_kats.zig` (`tools/gen-mbs-kats.sh`)
+pins libzstd's verdict on 48 libzstd-made frames (6 corpus inputs, levels 1
+and 19, `ZSTD_c_maxBlockSize` none/64 K/4 K/1 K) under five decoder maxima,
+one-shot, streamed whole and one byte at a time -- and the stream's buffer
+bytes (`ZSTD_sizeof_DStream` less the context) -- 240 rows, all equal.
+
+**`copyFrom`** (`ZSTD_copyDCtx`, deprecated in libzstd): copies a context's
+options (format, checksum handling, `max_block_size`, which dictionary),
+entropy tables, repeat offsets, piecewise stage, frame header, dictionary ID
+and checksum state; what the options and the history point at -- the
+dictionary bytes, `DDict`s, the previous output -- is shared, and the
+destination keeps its own memory and literal buffer. libzstd copies its
+struct up to the buffers, so a copy's table pointers still point into the
+source; here they point into the copy's own tables (a difference only if the
+source changes or goes away first), and the frame header buffer, which
+libzstd leaves out, is copied too.
 
 ## Dictionary training
 
@@ -1659,16 +1732,17 @@ fuzz driver: a reader stuck on one damaged `.zst`).
 | stable output room | any: blocks go into what is left, raw when the compressed form does not fit, else `error.DstSizeTooSmall`; where libzstd would write past the end (sub-blocks), `error.DstSizeTooSmall` | `ZSTD_c_stableOutBuffer`: libzstd's own capacity checks (Z1d) |
 | context memory | one workspace, exactly `estimateCompressorSize` / `estimateStreamSize`; a static one is never exceeded (`error.OutOfMemory`) | `ZSTD_estimateCCtxSize*`, `ZSTD_initStaticCCtx` |
 | decode window | one-shot: none, the whole output is history (window log ≤ 31 in the header on 64-bit, ≤ 30 on 32-bit -- *Portability* -- else `error.FrameParameterWindowTooLarge`); streaming: `window_log_max` or, in bytes, `max_window_size` (which wins; below 1 KiB counts as 1 KiB where libzstd refuses), default 2^27 + 1 bytes, else `error.FrameParameterWindowTooLarge` | `ZSTD_WINDOWLOG_MAX` (`_64`/`_32` by `sizeof(size_t)`); `ZSTD_d_windowLogMax`, `ZSTD_DCtx_setMaxWindowSize` and the default `ZSTD_WINDOWLOG_LIMIT_DEFAULT` |
-| decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), plus the ≈ 190 KB context | `ZSTD_decodingBufferSize_min` |
+| decode stream memory | input buffer of one block, output ring of one window + two blocks + 64 bytes (none with `stable_output`), the block being at most `max_block_size`, plus the ≈ 160 KB context; exactly `estimateDecompressStreamSize*`, a static one never exceeded (`error.OutOfMemory`) | `ZSTD_decodingBufferSize_min`, `ZSTD_estimateDStreamSize*`, `ZSTD_initStaticDStream` |
 | decode destination | the whole output; too small is `error.DstSizeTooSmall`. `decompressAlloc` sizes from the headers, else `decompressBound`, never above its `max_size` | `ZSTD_decompress` |
 | training memory | `estimateCoverMemory` / `estimateFastCoverMemory` ≤ `memory_limit` (default 256 MiB), else `error.MemoryLimitExceeded` before any allocation | libzstd has none (cover ≈ 8 B per sample byte, fastCover 6 · 2^f B) |
 | training samples | total below 4 GiB and at least `max(d, 8)` bytes, ≥ 5 training samples, sizes within the buffer, else `error.SrcSizeWrong` | `COVER_MAX_SAMPLES_SIZE`, `COVER_ctx_init` |
-| decode block | streaming: decoded size ≤ `Block_Maximum_Size`; one-shot: as libzstd, only a compressed block's output is bounded (see *Decoder*) | RFC 8878; `ZSTD_decompressContinue` / `ZSTD_decompressFrame` |
+| decode block | streaming: decoded size ≤ `Block_Maximum_Size`, lowered to `max_block_size`; one-shot: as libzstd, only a compressed block is bounded (see *Decoder*) | RFC 8878; `ZSTD_decompressContinue` / `ZSTD_decompressFrame`; `ZSTD_d_maxBlockSize` |
 
 `golden_test.zig` pins all of the above through the output; `root.zig` tests
 pin the level refusal and the destination bound, `stream_test.zig` the
 stream's level refusal, the pledged size both ways and the frame after the
-end, `context_test.zig` the estimates and a static workspace's bound.
+end, `context_test.zig` the estimates and a static workspace's bound,
+`dctx_test.zig` the decoder's.
 `FrameWriter` takes a nonempty buffer and holds `compressBound(buffer.len)`
 of scratch and its context's workspace for its life.
 
@@ -2942,7 +3016,12 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
   `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
   `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
-  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 for `zstd-cli`:
+  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28, the decoder
+  half (see *Decoder*, **Memory**): `Decompressor` / `DecompressStream` /
+  `DDict.initStatic`, the exact `estimateDecompressorSize`,
+  `estimateDecompressStreamSize[FromFrame]` and `DDict.estimateSize`,
+  `max_block_size` (`ZSTD_d_maxBlockSize`, 240 KATs from libzstd) and
+  `Decompressor.copyFrom` (`ZSTD_copyDCtx`). Done 2026-09-28 for `zstd-cli`:
   `getCParams` (`ZSTD_getCParams`) and `limits` (`ZSTD_WINDOWLOG_MAX` and
   the other bounds); `Stream.frameProgression` (`ZSTD_getFrameProgression`,
   with and without workers) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),
