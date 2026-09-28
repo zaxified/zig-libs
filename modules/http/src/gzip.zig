@@ -240,6 +240,87 @@ pub fn requestContentEncoding(content_encoding: ?[]const u8) RequestEncoding {
     return .unsupported;
 }
 
+/// RFC 1952 §2.3.1 FLG bits that gate a variable-length header field
+/// (`skipGzipHeader`); the top 3 bits are reserved and must be zero.
+const flg_fhcrc: u8 = 0b0000_0010;
+const flg_fextra: u8 = 0b0000_0100;
+const flg_fname: u8 = 0b0000_1000;
+const flg_fcomment: u8 = 0b0001_0000;
+const flg_reserved: u8 = 0b1110_0000;
+
+/// `skipGzipHeader`'s own error, beyond a plain `std.Io.Reader.Error` (a
+/// short read): magic bytes, CM (compression method — only 8/DEFLATE is
+/// defined), or a reserved FLG bit did not match RFC 1952. The one call
+/// site (`Server.GunzipBody`, behind `Options.verify_inbound_trailer`)
+/// folds it into the same `error.ReadFailed` an undecodable body already
+/// produces today.
+pub const HeaderError = error{BadHeader};
+
+/// `checkTrailer`'s own error, beyond a plain `std.Io.Reader.Error` (a
+/// short trailer). Same fold-into-`ReadFailed` note as `HeaderError`.
+pub const TrailerCheckError = error{
+    /// The trailer's CRC-32 does not match the plain bytes actually read.
+    CrcMismatch,
+    /// The trailer's ISIZE does not match the plain byte count (mod 2^32)
+    /// actually read.
+    SizeMismatch,
+};
+
+/// Parse and consume one RFC 1952 gzip member header from `in`: the fixed
+/// 10-byte base (magic `1f 8b`, CM, FLG, MTIME, XFL, OS), then whichever of
+/// FEXTRA / FNAME / FCOMMENT / FHCRC the FLG byte declares — in that wire
+/// order, the only order a conforming encoder writes them in (RFC 1952
+/// §2.3.1). This file's own encoder (`Scratch.begin`) only ever writes the
+/// bare 10-byte form, but an interoperating client's gzip library may set
+/// any of them, so the inbound side (`Options.verify_inbound_trailer`) must
+/// be able to skip them.
+///
+/// Consumes exactly the header bytes; the raw deflate stream starts
+/// immediately after on the same `in` — decode it with
+/// `flate.Decompress.init(in, .raw, window)`. A reserved FLG bit set, or a
+/// magic/CM mismatch, is `error.BadHeader`. The FHCRC field (a CRC-16 of
+/// the header, present when its FLG bit is set) is consumed but not
+/// verified — zlib and Go's `compress/gzip` do not check it either.
+pub fn skipGzipHeader(in: *std.Io.Reader) (std.Io.Reader.Error || HeaderError)!void {
+    if (try in.takeByte() != 0x1f) return error.BadHeader;
+    if (try in.takeByte() != 0x8b) return error.BadHeader;
+    if (try in.takeByte() != 8) return error.BadHeader; // CM: only DEFLATE is defined
+    const flg = try in.takeByte();
+    if (flg & flg_reserved != 0) return error.BadHeader;
+    try in.discardAll(6); // MTIME(4) + XFL(1) + OS(1)
+    if (flg & flg_fextra != 0) {
+        const xlen = try in.takeInt(u16, .little);
+        try in.discardAll(xlen);
+    }
+    if (flg & flg_fname != 0) try skipCString(in);
+    if (flg & flg_fcomment != 0) try skipCString(in);
+    if (flg & flg_fhcrc != 0) try in.discardAll(2);
+}
+
+/// Consume one NUL-terminated field (FNAME or FCOMMENT) byte at a time —
+/// never bounded by the reader's buffer capacity the way
+/// `takeDelimiter`/`takeSentinel` are, since a header field has no
+/// business tripping `error.StreamTooLong`.
+fn skipCString(in: *std.Io.Reader) std.Io.Reader.Error!void {
+    while (try in.takeByte() != 0) {}
+}
+
+/// Read the 8-byte RFC 1952 trailer from `in` (CRC-32 then ISIZE, both
+/// little-endian — immediately after the raw deflate stream `in` was
+/// decoding) and check both against `crc`/`size`: the running
+/// `crc32.extend` and (mod 2^32) byte count a caller accumulated over the
+/// plain bytes as `flate.Decompress` (`.raw`) produced them — the read-side
+/// counterpart of what `Member.take` keeps on the encoder above. A mismatch
+/// or a short trailer fails without touching anything past the 8 bytes: a
+/// second member (RFC 1952 allows concatenated members back to back) is
+/// out of scope here.
+pub fn checkTrailer(in: *std.Io.Reader, crc: u32, size: u32) (std.Io.Reader.Error || TrailerCheckError)!void {
+    const want_crc = try in.takeInt(u32, .little);
+    const want_size = try in.takeInt(u32, .little);
+    if (want_crc != crc) return error.CrcMismatch;
+    if (want_size != size) return error.SizeMismatch;
+}
+
 /// Whether a request `Accept-Encoding` value admits gzip (RFC 9110
 /// §12.5.3): an explicit `gzip` (or its `x-gzip` alias) entry wins over a
 /// `*` wildcard; `q=0` on the winning entry is a refusal; an **absent
@@ -567,4 +648,108 @@ test "initCompress: the same state as std's Compress.init, field by field" {
         try y.finish();
         try testing.expectEqualSlices(u8, out_a.written(), out_b.written());
     }
+}
+
+// ── tests (offline — inbound trailer verification, backlog 2026-09-28) ─────
+
+test "skipGzipHeader: the bare 10-byte header this file's own encoder writes" {
+    const header = comptime flate.Container.gzip.header();
+    var bytes: [header.len + 5]u8 = undefined;
+    @memcpy(bytes[0..header.len], header);
+    @memcpy(bytes[header.len..], "AFTER");
+    var in: std.Io.Reader = .fixed(&bytes);
+    try skipGzipHeader(&in);
+    var rest: [5]u8 = undefined;
+    try in.readSliceAll(&rest);
+    try testing.expectEqualStrings("AFTER", &rest);
+}
+
+test "skipGzipHeader: FEXTRA/FNAME/FCOMMENT/FHCRC variants parse and land exactly after the header" {
+    const gpa = testing.allocator;
+    const Case = struct {
+        flg: u8,
+        extra: []const u8 = "",
+        name: ?[]const u8 = null,
+        comment: ?[]const u8 = null,
+        fhcrc: bool = false,
+    };
+    const cases = [_]Case{
+        .{ .flg = flg_fextra, .extra = "xtra-bytes" },
+        .{ .flg = flg_fname, .name = "notes.txt" },
+        .{ .flg = flg_fcomment, .comment = "a comment" },
+        .{ .flg = flg_fhcrc, .fhcrc = true },
+        // Every optional field at once, in RFC order.
+        .{ .flg = flg_fextra | flg_fname | flg_fcomment | flg_fhcrc, .extra = "ab", .name = "n", .comment = "c", .fhcrc = true },
+        // FEXTRA present but empty (XLEN = 0) is legal.
+        .{ .flg = flg_fextra, .extra = "" },
+    };
+    for (cases) |c| {
+        var header: std.ArrayList(u8) = .empty;
+        defer header.deinit(gpa);
+        try header.appendSlice(gpa, &[_]u8{ 0x1f, 0x8b, 0x08, c.flg, 0, 0, 0, 0, 0, 0x03 });
+        if (c.flg & flg_fextra != 0) {
+            var len_buf: [2]u8 = undefined;
+            std.mem.writeInt(u16, &len_buf, @intCast(c.extra.len), .little);
+            try header.appendSlice(gpa, &len_buf);
+            try header.appendSlice(gpa, c.extra);
+        }
+        if (c.flg & flg_fname != 0) {
+            try header.appendSlice(gpa, c.name.?);
+            try header.append(gpa, 0);
+        }
+        if (c.flg & flg_fcomment != 0) {
+            try header.appendSlice(gpa, c.comment.?);
+            try header.append(gpa, 0);
+        }
+        if (c.flg & flg_fhcrc != 0) try header.appendSlice(gpa, &[_]u8{ 0xab, 0xcd }); // unverified, any value
+        try header.appendSlice(gpa, "AFTER"); // sentinel proving exact consumption
+
+        var in: std.Io.Reader = .fixed(header.items);
+        try skipGzipHeader(&in);
+        var rest: [5]u8 = undefined;
+        try in.readSliceAll(&rest);
+        try testing.expectEqualStrings("AFTER", &rest);
+    }
+}
+
+test "skipGzipHeader: bad magic, bad CM, and reserved FLG bits all refuse" {
+    var in1: std.Io.Reader = .fixed(&[_]u8{ 0x1f, 0x8c, 0x08, 0, 0, 0, 0, 0, 0, 0x03 }); // ID2 wrong
+    try testing.expectError(error.BadHeader, skipGzipHeader(&in1));
+
+    var in2: std.Io.Reader = .fixed(&[_]u8{ 0x1f, 0x8b, 0x09, 0, 0, 0, 0, 0, 0, 0x03 }); // CM != 8
+    try testing.expectError(error.BadHeader, skipGzipHeader(&in2));
+
+    var in3: std.Io.Reader = .fixed(&[_]u8{ 0x1f, 0x8b, 0x08, 0b0010_0000, 0, 0, 0, 0, 0, 0x03 }); // reserved bit
+    try testing.expectError(error.BadHeader, skipGzipHeader(&in3));
+}
+
+test "skipGzipHeader: a header cut short is EndOfStream, not BadHeader" {
+    var in: std.Io.Reader = .fixed(&[_]u8{ 0x1f, 0x8b, 0x08 }); // FLG onward missing
+    try testing.expectError(error.EndOfStream, skipGzipHeader(&in));
+}
+
+test "checkTrailer: matches, CRC mismatch, ISIZE mismatch, truncated" {
+    const plain = "hello, trailer";
+    const crc = std.hash.Crc32.hash(plain);
+    const size: u32 = @truncate(plain.len);
+
+    var good: [8]u8 = undefined;
+    std.mem.writeInt(u32, good[0..4], crc, .little);
+    std.mem.writeInt(u32, good[4..8], size, .little);
+
+    var in_ok: std.Io.Reader = .fixed(&good);
+    try checkTrailer(&in_ok, crc, size);
+
+    var bad_crc = good;
+    bad_crc[0] ^= 0x01; // one flipped bit in the stored CRC-32
+    var in_crc: std.Io.Reader = .fixed(&bad_crc);
+    try testing.expectError(error.CrcMismatch, checkTrailer(&in_crc, crc, size));
+
+    var bad_size = good;
+    std.mem.writeInt(u32, bad_size[4..8], size + 1, .little); // ISIZE off by one
+    var in_size: std.Io.Reader = .fixed(&bad_size);
+    try testing.expectError(error.SizeMismatch, checkTrailer(&in_size, crc, size));
+
+    var in_short: std.Io.Reader = .fixed(good[0 .. good.len - 1]); // trailer missing its last byte
+    try testing.expectError(error.EndOfStream, checkTrailer(&in_short, crc, size));
 }

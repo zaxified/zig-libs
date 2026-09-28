@@ -5,6 +5,19 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Inbound gzip trailer verification, opt-in.** `Options.verify_inbound_trailer`
+  (mirrored on `StreamOptions`, off by default): checks the RFC 1952 trailer's CRC-32 and ISIZE of
+  a decompressed request body against the plain bytes actually produced, failing the body read on
+  a mismatch or a truncated trailer. std's `flate.Decompress` reads the trailer but never compares
+  it, so a corrupt-trailer body was accepted before this as long as the deflate stream itself
+  parsed — zlib, Go's `compress/gzip` and Python's `gzip` all refuse it. When on,
+  `Server.GunzipBody` decodes `.raw` deflate instead of `.gzip` and parses the header itself
+  (`gzip.skipGzipHeader` — FEXTRA/FNAME/FCOMMENT/FHCRC skipped in RFC order, a reserved FLG bit or
+  bad magic/CM refused) and checks the trailer once decoding ends (`gzip.checkTrailer`), CRCing the
+  plain bytes with the same `crc32` module the encoder side already uses. A behaviour change
+  (refuses bodies accepted before), hence off by default; no dedicated status for the refusal — it
+  falls through to the same generic 500 any other undecodable body already got. Additive.
+
 - **2026-09-28** — **Faster gzip, same bytes.** Response compression now runs std's deflate in
   its `.raw` container and writes the gzip header and CRC-32/ISIZE trailer itself
   (`Scratch.begin` / `Scratch.finish`, new), with the CRC from the new `crc32` module instead of

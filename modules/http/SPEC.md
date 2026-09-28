@@ -157,7 +157,16 @@ Hardened for direct internet exposure (no reverse proxy required):
   resets on every successful write — it drops a peer that stops reading outright, but not one that
   keeps draining a response a trickle at a time (RUDY-style slow-read); see `TimeoutWriter`'s doc
   comment. Size caps (413/431/414); per-connection request-count cap; inbound gzip is
-  zip-bomb-capped (`max_decompressed_request_bytes` → 413). A chunked request's trailer section is
+  zip-bomb-capped (`max_decompressed_request_bytes` → 413). **Inbound gzip trailer verification**
+  (`Options.verify_inbound_trailer`, off by default — DONE 2026-09-28, see backlog strikethrough
+  below): std's `flate.Decompress` reads the RFC 1952 trailer but never checks its CRC-32/ISIZE, so
+  a corrupt-trailer body decodes and reaches the handler as long as the deflate stream itself
+  parses. When on, `Server.GunzipBody` decodes `.raw` deflate instead (`gzip.skipGzipHeader` parses
+  the header itself — FEXTRA/FNAME/FCOMMENT/FHCRC skipped in RFC order, a reserved FLG bit or a
+  magic/CM mismatch refused), CRCs the plain bytes as they are read (`crc32.extend`, the same
+  module the encoder side uses), and checks both against the trailer once the deflate stream ends
+  (`gzip.checkTrailer`) — a mismatch or a short trailer fails the body read, same as any other
+  undecodable body (a generic 500, no dedicated status). A chunked request's trailer section is
   bounded too — `h1.ChunkedReader.max_trailer_bytes` (32 KiB default), charged against BOTH one
   line's length and the number of lines, whether the trailers are captured or discarded (A1 http
   F5, 2026-09-11 — before that `max_body_bytes` covered decoded body bytes only; the trailer
@@ -297,14 +306,15 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
-- **Inbound gzip: verify the trailer** (found 2026-09-28 wiring `crc32` into `gzip.zig`). std's
-  `flate.Decompress` reads the gzip trailer but never checks its CRC-32 or ISIZE, so a request body
-  with a corrupt trailer is accepted as long as the deflate stream itself parses. zlib, Go's
-  `compress/gzip` and Python's `gzip` all refuse it (`ErrChecksum`). Fix: inflate `.raw`, parse
-  the RFC 1952 header ourselves (as the encoder now writes it), and check CRC-32 (`crc32.extend` over
-  the plain bytes as they are read) and ISIZE at the end, failing the body read. A behaviour change
-  (refuses bodies accepted today), so it lands behind `Compression.verify_inbound_trailer`, off
-  until a consumer asks.
+- ~~**Inbound gzip: verify the trailer**~~ — **DONE 2026-09-28** (found the same day wiring
+  `crc32` into `gzip.zig`). std's `flate.Decompress` reads the gzip trailer but never checks its
+  CRC-32 or ISIZE, so a request body with a corrupt trailer was accepted as long as the deflate
+  stream itself parsed. zlib, Go's `compress/gzip` and Python's `gzip` all refuse it
+  (`ErrChecksum`). Landed as `Options.verify_inbound_trailer` (not `Compression` — that struct is
+  the response-*encoding* config; the inbound decode knobs live flat on `Options`/`StreamOptions`
+  next to `max_decompressed_request_bytes`, so the new one joined them there), off by default (a
+  behaviour change — refuses bodies accepted before this). See the design note above and
+  `gzip.skipGzipHeader` / `gzip.checkTrailer`.
 
 - ~~**Streaming multipart**~~ — **DONE 2026-09-27** (`multipart.Reader`, from qap M11.5b). The
   buffered `parse` needs the whole body in memory; `Reader` reads a `*std.Io.Reader` part by part,
