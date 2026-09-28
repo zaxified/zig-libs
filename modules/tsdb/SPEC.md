@@ -182,12 +182,14 @@ for every series in it (not just the one it failed in), and a `kv.SimStorage` cr
 batch of three series asserts all three end up with the SAME point count (0 or the full batch) —
 never a partial set.
 
-**A size budget (`Db.liveSize`, `Db.sweepToBudget`).** kvtree never shrinks its file — recycled
-pages are reused (COW) but the high-water mark only grows, and it exposes no compaction/vacuum
-operation that would repack the file smaller (checked directly against `kvtree.Db`'s public API:
-there is none). So a byte BUDGET can only ever be a budget on LIVE data, never on file size — a
-distinction ttydesk's own comment already states ("kvtree reuses freed pages but does not shrink
-the file"). `liveSize()` counts point entries only (not the tiny, retention-untouched series
+**A size budget (`Db.liveSize`, `Db.sweepToBudget`).** kvtree never shrinks its file — the
+high-water mark only grows, and it exposes no compaction/vacuum operation that would repack the
+file smaller (checked directly against `kvtree.Db`'s public API: there is none). So a byte BUDGET
+can only ever be a budget on LIVE data, never on file size. ⚠ Nor does retention stop the file
+growing today (2026-09-28, measured adopting this in ttydesk): kvtree keeps leaves that deletes
+emptied (no node merge), and a time series never writes those key ranges again, so their pages
+are never recycled — ~60 KiB of file per 1000 points appended and swept, linearly, at any live
+size. Fix belongs to kvtree (backlog: node merge / removing emptied leaves). `liveSize()` counts point entries only (not the tiny, retention-untouched series
 index/reverse-index, and not kvtree's own page/freelist overhead) and is EXACT, not an estimate:
 every point key and value is fixed-width (`codec.point_entry_bytes` = 25), so a point count
 converts to a byte count with no rounding.

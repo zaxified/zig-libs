@@ -211,6 +211,18 @@ library). Cross-*process* exclusion is not provided (one `Db` per store).
   key in place — underflowed and empty leaves persist until overwritten, which
   wastes space but never corrupts; merging and borrowing from a fuller sibling
   are mechanical additions).
+  ⚠ **Priority raised (2026-09-28, found adopting tsdb in ttydesk):** "until
+  overwritten" never happens for a key range that only moves forward — tsdb's
+  time series (append at the right, retention deletes at the left). The
+  emptied leaves stay in the tree and are never recycled, so retention does
+  NOT bound the file: measured on one series, 1000 points appended + 1000
+  swept per commit round grows the file ~60 KiB per round, linearly, whatever
+  the live size (8–64 KiB live all grow alike; same with `sweep` and
+  `sweepToBudget`). Minimum fix: a delete that empties a leaf removes it from
+  its parent (and collapses a branch left with one child), so the page goes to
+  the freelist; merge/borrow on underflow is the full version. ttydesk
+  (`src/diskhist.zig`, `zig-libs request: kvtree`) latches its history off at
+  the file cap meanwhile.
 - **Automatic freelist/space reclamation thresholds** and an in-memory page
   cache (compose with `ramcache`).
 

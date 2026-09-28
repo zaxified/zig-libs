@@ -148,10 +148,15 @@ current-oldest candidate in a min-heap ordered by timestamp rather than rescanni
 per decision. Its crash-safety is narrower than `sweep`'s: each chunk of deletions commits
 atomically, but there is no persisted resume record, so an interrupted call's progress is not
 resumed — the next call just recomputes and reseeds (still correct, just not linear). **kvtree
-never shrinks its file** (freed pages are recycled, not released back to the filesystem) and
-exposes no compaction/vacuum — so `liveSize`/`sweepToBudget` are a budget on the point data
-retention can actually reclaim, never on `stat().size` (which a caller reads for itself, e.g. via
-its own `Io.Dir.statFile`, the way ttydesk's own workaround already did).
+never shrinks its file** and exposes no compaction/vacuum — so `liveSize`/`sweepToBudget` are a
+budget on the point data, never on `stat().size` (which a caller reads for itself, e.g. via its
+own `Io.Dir.statFile`).
+
+⚠ **Retention does not yet bound the file either.** kvtree keeps a leaf that deletes have emptied
+(no node merge yet), and time-series keys only move forward, so those leaves are never written
+again: a store that appends and sweeps at the same rate still grows (~60 KiB per 1000 points in
+and out, measured 2026-09-28). The fix is in kvtree's backlog (node merge / removing emptied
+leaves); until then a long-running store needs a cap on the file of its own.
 
 ## Not in v1 (deliberate, see `SPEC.md`)
 
