@@ -26,6 +26,12 @@
  *   prefix:PATH   ZSTD_DCtx_refPrefix(dctx, ...) (raw content, one frame)
  *   legacy:PATH   ZSTD_decompress_usingDict(dctx, ..., buf, size) -- mode 0
  *                 only, exclusive with every other dict-spec.
+ *   mbs:N         not a dictionary: ZSTD_d_maxBlockSize N (any mode; the
+ *                 counterpart of `max_block_size`).
+ *   bufs:1        not a dictionary: modes 1/2 print "BUF <n>" first, the
+ *                 bytes of the stream's input buffer and output ring at the
+ *                 end (ZSTD_sizeof_DStream less ZSTD_estimateDCtxSize; the
+ *                 counterpart of `workspaceSize` less `estimateDecompressorSize`).
  * More than one auto/raw/full/prefix spec sets ZSTD_d_refMultipleDDicts
  * before the refDDict calls (libzstd requires the parameter set first).
  *
@@ -102,6 +108,8 @@ int main(int argc, char** argv)
     ZSTD_DDict* ddicts[MAX_DICTS];
     int nDDict = 0;
     const char* prefixPath = NULL;
+    int maxBlockSize = -1;
+    int printBufs = 0;
     ZSTD_customMem const cmem = { NULL, NULL, NULL };
 
     {
@@ -120,6 +128,14 @@ int main(int argc, char** argv)
             }
             if (strncmp(spec, "prefix", typeLen) == 0 && typeLen == 6) {
                 prefixPath = path;
+                continue;
+            }
+            if (strncmp(spec, "mbs", typeLen) == 0 && typeLen == 3) {
+                maxBlockSize = atoi(path);
+                continue;
+            }
+            if (strncmp(spec, "bufs", typeLen) == 0 && typeLen == 4) {
+                printBufs = atoi(path);
                 continue;
             }
             dbuf = readFile(path, &dsize);
@@ -169,6 +185,10 @@ int main(int argc, char** argv)
     char* legacyBuf = NULL;
     if (legacyPath) legacyBuf = readFile(legacyPath, &legacySize);
 
+    if (maxBlockSize >= 0) {
+        size_t const r = ZSTD_DCtx_setParameter(dctx, ZSTD_d_maxBlockSize, maxBlockSize);
+        if (ZSTD_isError(r)) return fail(r);
+    }
     if (nDDict > 1) {
         ZSTD_DCtx_setParameter(dctx, ZSTD_d_refMultipleDDicts, ZSTD_rmd_refMultipleDDicts);
     }
@@ -225,7 +245,10 @@ int main(int argc, char** argv)
         for (;;) {
             ZSTD_outBuffer o = { buf, ochunk, 0 };
             r = ZSTD_decompressStream(dctx, &o, &in);
-            if (ZSTD_isError(r)) return fail(r);
+            if (ZSTD_isError(r)) {
+                if (printBufs) printf("BUF %zu\n", ZSTD_sizeof_DStream(dctx) - ZSTD_estimateDCtxSize());
+                return fail(r);
+            }
             if (outSize + o.pos > cap) {
                 while (outSize + o.pos > cap) cap *= 2;
                 out = realloc(out, cap);
@@ -238,6 +261,7 @@ int main(int argc, char** argv)
         /* input ended inside a frame: same class libzstd uses for any
          * other "not enough input" case (srcSize_wrong), so print it the
          * same way `fail()` would rather than a placeholder string. */
+        if (printBufs) printf("BUF %zu\n", ZSTD_sizeof_DStream(dctx) - ZSTD_estimateDCtxSize());
         if (r != 0) { printf("ERR %d\n", (int)ZSTD_error_srcSize_wrong); return 1; }
     }
 
