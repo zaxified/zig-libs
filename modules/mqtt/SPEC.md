@@ -296,6 +296,7 @@ Mutants (one schemata build): skipping the Will ACL, the owner check, and the by
 update and on a new topic — each caught by its own test.
 
 ## Backlog / deferred
+**`Broker.rxRoom(conn)`: how much `feed` takes now** — GAP (2026-09-28, egw-hub audit R13). `feed` refuses a slice that overflows the receive buffer (`RxBufferFull`) without saying how much would fit, so a server reading in fixed chunks drops a client whose read holds the tail of one large packet and the head of the next, though `process` would consume the complete one first. egw-hub feeds in slices sized from `Connection`'s `rx_buf.len - (rx_len - rx_consumed)` (`egw-hub/src/loop.zig`, `rxRoom`, comment `zig-libs request: mqtt`), which reads internals. Wanted: `pub fn rxRoom(b, conn) usize` (the room after compaction), or `feed` returning how many bytes it took. Every buffered-stream API reports this (a writer's free space, `SSL_write` partial counts).
 **Differential oracle against karlseguin's library** — IDEA (2026-09-24, CML review of karlseguin's Zig libraries; not scheduled). `karlseguin/mqttz` is a client only. Drive our broker with it (CONNECT/SUBSCRIBE/PUBLISH at QoS 0 and 1, retain, wills, keepalive) so our broker is checked by a client we did not write. It would live in `tools/` as a differential oracle (CONVENTIONS §9); the library is MIT and targets Zig 0.16, so no copyleft or version barrier.
 
 Broker: QoS 2, sessions persisted across a broker restart, DUP retransmit to clean-session subscribers,
