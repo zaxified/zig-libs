@@ -25,7 +25,9 @@
 //! them), i.e. on one of `std.Io.Threaded`'s pool threads, not on the
 //! thread that called `request`. A per-thread confinement (Landlock,
 //! `setuid`, seccomp) applied after that pool started does not cover it.
-//! Make the `Io` after the sandbox, or set `Options.inline_blocking`. The
+//! Make the `Io` after the sandbox, or set `Options.inline_blocking` (which
+//! also bypasses `std.Io.net.HostName.connect`: that one starts the lookup
+//! and every connect as tasks of its own). The
 //! CA bundle is read from the filesystem on the first HTTPS request; load it
 //! before confining with `loadCaBundle` or a shared `CaBundle`.
 //!
@@ -195,7 +197,10 @@ pub const Options = struct {
     /// make the `Io` after the sandbox, or set this. The price:
     /// `connect_timeout_ms` and `total_timeout_ms` no longer interrupt a
     /// blocked phase (nothing can cancel a syscall on the caller's own
-    /// thread); only the checks between phases remain.
+    /// thread); only the checks between phases remain. Name resolution goes
+    /// around `std.Io.net.HostName.connect` too, which would otherwise start
+    /// the lookup and the connects as tasks of the `Io` by itself; the
+    /// resolved addresses are then tried one at a time, not in parallel.
     inline_blocking: bool = false,
     /// h1 keep-alive connection pooling (see the module doc). Defaults on;
     /// set `.enabled = false` for the old one-connection-per-request
@@ -1831,7 +1836,46 @@ fn connectStreamBlocking(c: *Client, url: http.Url) Error!net.Stream {
         return addr.connect(c.io, copts) catch |err| mapConnectError(err);
     }
     const host_name = net.HostName.init(url.host) catch return error.BadUrl;
+    if (c.options.inline_blocking) return c.connectHostInline(host_name, url.port, copts);
     return host_name.connect(c.io, url.port, copts) catch |err| mapConnectError(err);
+}
+
+/// `HostName.connect` for `Options.inline_blocking`, on the calling thread.
+///
+/// std's `HostName.connect` does not run where it is called: it starts the
+/// lookup and one connect per address as tasks (`io.async` + an `Io.Group`),
+/// so with `std.Io.Threaded` they run on the pool -- outside a sandbox the
+/// calling thread is in, whatever `runBounded` does (found by qap's jwks
+/// probe: a Landlocked refresh thread still read `/etc/hosts`). Here the
+/// lookup is called directly (`Threaded`'s resolver is synchronous: hosts
+/// file, then DNS over a socket) into a local queue, and the addresses are
+/// tried one after another. What is lost is std's parallel connect (the first
+/// address to answer wins); what an unreachable first address costs is its
+/// connect error, or its SYN timeout -- the price `inline_blocking` already
+/// names.
+///
+/// The queue holds 256 results. `lookup` is documented not to block with 16,
+/// but std 0.16's hosts-file reader puts one result per matching line with no
+/// cap, and nothing drains the queue while `lookup` runs on this thread: a
+/// name listed on more than 255 hosts-file lines would block here for good.
+fn connectHostInline(c: *Client, host_name: net.HostName, port: u16, copts: net.IpAddress.ConnectOptions) Error!net.Stream {
+    var results_buf: [256]net.HostName.LookupResult = undefined;
+    var results: std.Io.Queue(net.HostName.LookupResult) = .init(&results_buf);
+    host_name.lookup(c.io, &results, .{ .port = port }) catch |err| return mapConnectError(err);
+    var last_err: ?Error = null;
+    while (results.getOne(c.io)) |r| switch (r) {
+        .address => |addr| {
+            if (addr.connect(c.io, copts)) |stream| return stream else |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => last_err = mapConnectError(err),
+            }
+        },
+        .canonical_name => {},
+    } else |err| switch (err) {
+        error.Closed => {},
+        error.Canceled => return error.Canceled,
+    }
+    return last_err orelse error.UnknownHostName;
 }
 
 fn mapConnectError(err: anyerror) Error {
@@ -4941,6 +4985,79 @@ test "runBounded: inline_only takes the caller's-thread path without starting a 
     try testing.expect(!Probe.ran);
     try testing.expectEqual(@as(u8, 7), try runBounded(io, false, null, Probe.f, .{}));
     try testing.expect(Probe.ran);
+}
+
+/// A `std.Io.Threaded` whose every task start -- `async`, `concurrent`,
+/// `groupAsync`, `groupConcurrent` -- is counted and then done as usual:
+/// "did this work stay on the calling thread" as a number.
+const TaskCountingIo = struct {
+    var inner: *const std.Io.VTable = undefined;
+    var starts: std.atomic.Value(usize) = .init(0);
+
+    fn wrap(threaded: *std.Io.Threaded, vtable: *std.Io.VTable) std.Io {
+        const io = threaded.io();
+        inner = io.vtable;
+        vtable.* = io.vtable.*;
+        vtable.async = async_;
+        vtable.concurrent = concurrent;
+        vtable.groupAsync = groupAsync;
+        vtable.groupConcurrent = groupConcurrent;
+        starts.store(0, .monotonic);
+        return .{ .userdata = io.userdata, .vtable = vtable };
+    }
+    fn async_(ud: ?*anyopaque, r: []u8, ra: std.mem.Alignment, ctx: []const u8, ca: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) ?*std.Io.AnyFuture {
+        _ = starts.fetchAdd(1, .monotonic);
+        return inner.async(ud, r, ra, ctx, ca, start);
+    }
+    fn concurrent(ud: ?*anyopaque, rl: usize, ra: std.mem.Alignment, ctx: []const u8, ca: std.mem.Alignment, start: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+        _ = starts.fetchAdd(1, .monotonic);
+        return inner.concurrent(ud, rl, ra, ctx, ca, start);
+    }
+    fn groupAsync(ud: ?*anyopaque, g: *std.Io.Group, ctx: []const u8, ca: std.mem.Alignment, start: *const fn (*const anyopaque) void) void {
+        _ = starts.fetchAdd(1, .monotonic);
+        inner.groupAsync(ud, g, ctx, ca, start);
+    }
+    fn groupConcurrent(ud: ?*anyopaque, g: *std.Io.Group, ctx: []const u8, ca: std.mem.Alignment, start: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
+        _ = starts.fetchAdd(1, .monotonic);
+        return inner.groupConcurrent(ud, g, ctx, ca, start);
+    }
+};
+
+test "inline_blocking: resolving and connecting a host name starts no task on the Io" {
+    // qap's jwks probe (2026-09-28): with `inline_blocking`, a Landlocked
+    // thread still resolved a name it had no grant for, because std's
+    // `HostName.connect` runs the lookup and the connects as tasks. Counted
+    // here instead of sandboxed: zero task starts is "all on this thread".
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    var vtable: std.Io.VTable = undefined;
+    const io = TaskCountingIo.wrap(&threaded, &vtable);
+
+    const addr = try net.IpAddress.parse("127.0.0.1", 0);
+    var listener = addr.listen(io, .{}) catch return error.SkipZigTest;
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+    var url_buf: [64]u8 = undefined;
+    // "localhost" is a NAME (it goes through the resolver), and on most hosts
+    // it resolves to ::1 first, where nothing listens: the one-at-a-time
+    // fallback to 127.0.0.1 is exercised too.
+    const url = try http.Url.parse(try std.fmt.bufPrint(&url_buf, "http://localhost:{d}/", .{port}));
+
+    var inline_client = Client.init(io, testing.allocator, .{ .inline_blocking = true });
+    defer inline_client.deinit();
+    TaskCountingIo.starts.store(0, .monotonic);
+    const s = try inline_client.connectStream(url);
+    s.close(io);
+    try testing.expectEqual(@as(usize, 0), TaskCountingIo.starts.load(.monotonic));
+
+    // Control: without it, the same connect does start tasks -- so the zero
+    // above is the option's doing, not a counter that never counts.
+    var pooled = Client.init(io, testing.allocator, .{});
+    defer pooled.deinit();
+    TaskCountingIo.starts.store(0, .monotonic);
+    const s2 = try pooled.connectStream(url);
+    s2.close(io);
+    try testing.expect(TaskCountingIo.starts.load(.monotonic) > 0);
 }
 
 test "CaBundle: shared by two clients, loaded once, never freed by a client" {

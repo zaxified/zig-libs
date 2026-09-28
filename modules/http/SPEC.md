@@ -377,17 +377,18 @@ pending a native std TLS server.
   `Options.inline_blocking` runs every blocking phase on the calling thread (the timeouts then
   cannot interrupt a blocked phase).
 
-- **BUG: `Options.inline_blocking` does not keep the work on the calling thread** (qap, 2026-09-28,
-  found by qap's jwks hardening probe). With it set, a qap refresh thread under Landlock still
-  resolved a host name it had no read grant for (`/etc/hosts` denied): std's
-  `Io.net.HostName.connect` itself runs `lookup` and `connectMany` through `io.async` and an
-  `Io.Group` (lib/std/Io/net/HostName.zig ~283/343/349), i.e. on the pool of the `Io`, whatever
-  `runBounded` does. So the module doc's "make the `Io` after the sandbox, or set
-  `inline_blocking`" is wrong in its second half. qap went back to its own `std.Io.Threaded` made on
-  the confined thread (`src/auth_jwt.zig` `Remote.run`). Fix options: doc only (drop the claim;
-  "inline" = the client's phases, not std's resolver), or an inline connect path (`HostName.lookup`
-  into a local queue + sequential `connect`, no `io.async`), or document `Threaded` with
-  `async_limit = .nothing` as the way to get it.
+- ~~**BUG: `Options.inline_blocking` does not keep the work on the calling thread**~~ — FIXED
+  2026-09-28 (found by qap's jwks hardening probe: a Landlocked refresh thread still resolved a
+  name it had no `/etc/hosts` grant for). std's `Io.net.HostName.connect` starts the lookup and one
+  connect per address as tasks (`io.async` + `Io.Group`), so skipping `runBounded` was not enough.
+  With `inline_blocking` the client now calls `HostName.lookup` directly — `Threaded`'s resolver
+  is synchronous — into a 256-entry local queue and tries the addresses one at a time
+  (`connectHostInline`). Lost: std's parallel connect. Residual: std documents that `lookup`
+  does not block with a 16-entry queue, but its hosts-file reader puts one result per matching
+  line uncapped, so a name on more than 255 hosts lines would block the caller (nothing drains the
+  queue while `lookup` runs on the same thread). Pinned by `inline_blocking: resolving and
+  connecting a host name starts no task on the Io` (an `Io` whose vtable counts every task start:
+  0 with the option, >0 without; 4 before the fix).
 
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr`, `tlsclient` (+ `std.Io.net`,

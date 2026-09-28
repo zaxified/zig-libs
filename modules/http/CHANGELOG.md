@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Fix: `Options.inline_blocking` now keeps name resolution on the calling
+  thread too** (found by qap). std's `HostName.connect` starts the lookup and the connects as
+  tasks of the `Io`, so with `std.Io.Threaded` they ran on the pool — outside a per-thread sandbox
+  — even with the option set. The client now resolves with `HostName.lookup` directly and tries
+  the addresses one after another (no parallel connect in this mode). No API change.
 - **2026-09-28** — `Client.loadCaBundle()` (eager CA load), `Client.CaBundle` shared between
   clients via `Options.shared_ca` (borrowed), and `Options.inline_blocking` (blocking phases on
   the calling thread, not the `Io` pool — for per-thread sandboxes; timeouts then only between
