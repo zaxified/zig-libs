@@ -2821,22 +2821,32 @@ cell the range over the two inputs and the two dictionaries:
 
 | call, level | 100 B | 1 KB | 4 KB | 16 KB |
 |---|---|---|---|---|
-| `CDict` reused (`compressUsingCDict`), 1 | 1.08–1.23 / 1.00–1.25 | 1.15–1.26 / 1.02–1.12 | 1.16–1.18 / 1.03–1.06 | 1.00–1.02 / 1.05–1.09 |
-| 3 | 1.08–1.27 / 1.03–1.28 | 1.18–1.24 / 1.07–1.22 | 1.13–1.19 / 1.09–1.16 | 1.09–1.13 / 1.07–1.15 |
-| 9 | 1.30–1.35 / 1.15–1.28 | 1.44–1.59 / 1.19–1.43 | 1.48–1.53 / 1.20–1.39 | 1.37–1.49 / 1.16–1.31 |
-| 19 | 1.05–1.23 / 1.07–1.19 | 1.14–1.24 / 1.03–1.13 | 1.03–1.08 / 1.00–1.10 | 1.06–1.29 / 0.96–1.05 |
+| `CDict` reused (`compressUsingCDict`), 1 † | 1.01–1.15 / 0.98–1.21 | 1.07–1.15 / 1.00–1.09 | 1.07–1.19 / 1.00–1.04 | 0.93–1.00 / 1.02–1.08 |
+| 3 † | 0.72–1.18 / 1.01–1.24 | 0.83–1.15 / 1.04–1.19 | 1.07–1.12 / 1.05–1.14 | 0.85–1.10 / 1.04–1.13 |
+| 9 † | 1.06–1.35 / 1.04–1.09 | 0.78–1.61 / 1.06–1.09 | 0.93–1.73 / 1.06–1.09 | 0.81–1.14 / 1.05–1.07 |
+| 19 † | 1.05–1.15 / 1.05–1.12 | 0.98–1.07 / 1.01–1.04 | 0.93–1.31 / 0.98–1.04 | 0.70–1.02 / 0.96–1.02 |
 | `CDict` forced copy (`.cdict`, `force_attach_dict = .copy`), 1 | 2.17–2.91 / 1.74–2.25 | 1.47–2.33 / 1.31–1.61 | 1.23–1.32 / 1.17–1.28 | 1.06–1.07 / 1.08–1.10 |
 | 3 | 2.06–2.17 / 2.17–2.25 | 1.81–1.92 / 1.87–2.11 | 1.35–1.66 / 1.57–1.88 | 1.01–1.34 / 1.27–1.50 |
-| 9 | 1.26–1.31 / 2.65–2.90 | 1.23–1.39 / 1.47–1.71 | 1.35–1.39 / 1.33–1.51 | 1.25–1.28 / 1.23–1.36 |
+| 9 † | 1.23–1.29 / 2.53–2.74 | 1.11–1.17 / 1.34–1.43 | 0.96–1.24 / 1.21–1.26 | 1.00–1.09 / 1.17–1.19 |
 | 19 | 2.42–3.04 / 3.92–7.32 | 1.32–1.79 / 1.20–1.56 | 1.11–1.30 / 1.00–1.16 | 1.02–1.20 / 0.96–1.05 |
-| bytes each call (`compressUsingDict`), 1 | 1.73–1.90 / 1.41–1.55 | 1.61–1.76 / 1.38–1.49 | 1.43–1.53 / 1.32–1.42 | 1.18–1.33 / 1.20–1.28 |
+| bytes each call (`compressUsingDict`), 1 † | 0.85–0.98 / 0.76–0.79 | 0.75–0.97 / 0.79–0.81 | 0.87–0.92 / 0.82–0.87 | 0.57–0.99 / 0.86–0.96 |
 | 3 | 0.95–1.11 / 1.14–1.18 | 0.95–1.09 / 1.13–1.17 | 0.96–1.07 / 1.12–1.17 | 0.96–1.03 / 1.08–1.14 |
-| 9 | 1.10–1.24 / 1.05–1.14 | 1.09–1.16 / 1.07–1.17 | 1.16–1.33 / 1.11–1.19 | 1.18–1.25 / 1.17–1.19 |
+| 9 † | 0.98–1.27 / 1.05–1.14 | 0.73–1.21 / 1.06–1.15 | 1.03–1.38 / 1.08–1.15 | 0.71–1.09 / 1.10–1.15 |
 | 19 | 0.99–1.02 / 1.25–1.27 | 1.01–1.09 / 1.22–1.25 | 0.98–1.03 / 1.11–1.22 | 0.99–1.04 / 1.00–1.17 |
-| `.raw` each call (a `CDict` per call), 1 | 1.59–1.64 / 1.43–1.48 | 1.57–1.68 / 1.42–1.46 | 1.55–1.62 / 1.37–1.43 | 1.38–1.45 / 1.29–1.37 |
-| 3 | 1.48–1.96 / 1.34–1.67 | 1.43–1.81 / 1.34–1.66 | 1.47–1.85 / 1.33–1.64 | 1.40–1.78 / 1.30–1.56 |
-| 9 | 1.64–2.58 / 1.41–1.97 | 1.67–2.35 / 1.38–1.86 | 1.62–1.96 / 1.35–1.69 | 1.56–1.89 / 1.27–1.44 |
+| `.raw` each call (a `CDict` per call), 1 † | 0.92–1.04 / 0.85–0.88 | 1.04–1.07 / 0.86–0.88 | 1.05–1.11 / 0.87–0.89 | 0.98–1.03 / 0.90–0.95 |
+| 3 † | 1.17–1.84 / 0.92–1.27 | 1.03–1.86 / 0.92–1.27 | 0.87–1.89 / 0.93–1.26 | 0.85–1.27 / 0.93–1.23 |
+| 9 † | 1.44–2.12 / 1.41–1.97 | 1.40–2.35 / 1.37–1.84 | 0.95–2.09 / 1.31–1.64 | 1.35–1.67 / 1.19–1.38 |
 | 19 | 1.04–1.27 / 1.29–1.39 | 1.04–1.19 / 1.28–1.33 | 1.04–1.11 / 1.19–1.29 | 1.02–1.50 / 1.03–1.22 |
+
+† Re-measured 2026-09-28 after Z32's word-wise dictionary counts and
+specialised table fills, with the same method on a busier machine (2–4 of
+the build slots taken by other sessions' jobs): cycles then varied by up to
+±40 % between runs at equal instructions, so compare the instruction
+ratios. Before, in the same runs (instructions): reused `CDict` at level 9
+1.14–1.43×, forced copy at 9 1.23–2.81×, bytes each call at 1 1.20–1.55×,
+`.raw` at 1, 3 and 9 1.29–1.47×, 1.30–1.67× and 1.27–1.97×. Every frame of
+every re-measured case was byte-identical to libzstd's and to the build
+before.
 
 libzstd's calls: `ZSTD_compress_usingCDict` on a `ZSTD_createCDict`;
 `ZSTD_CCtx_refCDict` with `ZSTD_c_forceAttachDict = ZSTD_dictForceCopy`
@@ -2878,16 +2888,18 @@ equalled its single-threaded one on these inputs too.
 
 **Where the gaps are** (`perf record`, the worst cases):
 
-- **Match lengths into the dictionary are counted a byte at a time.**
-  Every count whose match side is the dictionary -- extDict
-  (`MatchState.countDict`, `countInDict`, `Base.count2Segments`) and
-  attached (`lazy.countDms`, `match.zig`'s `countAcrossDict`,
-  `opt.count2SegmentsDms`) -- goes through `std.mem.indexOfDiff`, a byte
-  loop, where libzstd's `ZSTD_count_2segments` runs `ZSTD_count`'s 8-byte
-  compare, as the port's own in-prefix `count` does. The hottest loop of
-  an attached `CDict` at level 9 (`lazy.rowFindBestMatchT`, 77 % of the
-  cycles against libzstd's 74 % in `ZSTD_RowFindBestMatch_dictMatchState`)
-  is that byte compare: 1.44–1.59×.
+- ~~**Match lengths into the dictionary are counted a byte at a time.**~~
+  Fixed 2026-09-28 (Z32): every count whose match side is the dictionary
+  -- extDict (`MatchState.countDict`, `countInDict`,
+  `Base.count2Segments`) and attached (`lazy.countDms`, `match.zig`'s
+  `countAcrossDict`, `opt.count2SegmentsDms`) -- went through
+  `std.mem.indexOfDiff`, a byte loop, where libzstd's
+  `ZSTD_count_2segments` runs `ZSTD_count`'s 8-byte compare. They now
+  share `match.countRuns`, the port's `count` over two runs, reading no
+  further than `ZSTD_count` does. The hottest loop of an attached `CDict`
+  at level 9 (`lazy.rowFindBestMatchT`) was that byte compare; its
+  instructions went from 1.14–1.43× libzstd's to 1.04–1.09× (cycles
+  below).
 - **`Compressor.compress` clears 5.8 KB byte by byte on every call**:
   `var local: ?CDict = null` (`frame.Compressor.compressFrame`, and
   `root.Compressor.compressMt`) becomes a `compiler_rt.memset` of the whole
@@ -2906,12 +2918,17 @@ equalled its single-threaded one on these inputs too.
   (libzstd: `memset` 6.5 %). Its wall time is 2–4× libzstd's against
   1.6–2.6× in cycles: `smp_allocator` maps a CDict's tables fresh on every
   call (page faults, kernel time), where glibc reuses the freed block.
-- **`fillHashTableFor`** (a dictionary loaded into the context at levels
-  1–2, `compressUsingDict`: 88–94 % of the time on both sides) runs ~1.8×
-  libzstd's `ZSTD_fillHashTableForCCtx`: `min_match` is switched through
-  a jump table at every position, the window's base is reloaded from the
-  `MatchState` after each table store (Z11's aliasing, fixed in the
-  searches, not here), and the tagged/`dtlm` choices are run-time.
+- ~~**`fillHashTableFor`**~~ Fixed 2026-09-28 (Z32): a dictionary loaded
+  into the context at levels 1–2 (`compressUsingDict`: 88–94 % of the time
+  on both sides) ran ~1.8× libzstd's `ZSTD_fillHashTableForCCtx`:
+  `min_match` was switched through a jump table at every position, the
+  window's base reloaded from the `MatchState` after each table store
+  (Z11's aliasing), and the tagged/`dtlm` choices were run-time. It and
+  `fillDoubleHashTableFor` are now specialised at compile time on
+  `min_match`, `dtlm` and `tfp` and read through a `match.Base`: 0.76–0.96×
+  libzstd's instructions for `compressUsingDict` at level 1, a
+  `CDict` per call 0.85–0.95× at level 1 and 0.92–1.27× at level 3 (was
+  1.29–1.67×).
 - **The decoder copies a `DDict`'s entropy tables into the context for
   every frame** (`Decompressor.applyEntropy`: 27 KB), where libzstd's
   `ZSTD_copyDDictParameters` points the context at the `DDict`'s: 64 % of
@@ -3464,6 +3481,16 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   tag table); `fillHashTableFor` specialised on `min_match` and the table
   kind, on a `match.Base`; the decoder pointing at a `DDict`'s entropy
   tables instead of copying them each frame. Re-measure with Z19's method.
+  Done 2026-09-28, the match finders' part (*Speed*, "Where the gaps
+  are"): the dictionary-side counts share `match.countRuns`, the fills are
+  specialised, and `btultra2`'s first pass (`ZSTD_initStats_ultra`) moves
+  the window's base as libzstd does instead of clearing the hash, tree and
+  3-byte tables (`@memset`, byte by byte) on every frame whose first block
+  is over 8 bytes: −0.6–1.9 % instructions, −1–3.5 % cycles at levels
+  16–22 without a dictionary. Clearing `rescaleFreqs`' `lit_freq` (1 KB per
+  frame at `btopt` and up) through `fill.zig` was tried and dropped: 0.1 %
+  of the instructions at level 16 on 1 KB frames, and the code it moved
+  cost 7 % of the cycles at level 19 (equal instructions, a layout effect).
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and
