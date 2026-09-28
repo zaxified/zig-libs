@@ -169,13 +169,17 @@ broker has no clock. QoS 0 is not queued (3.1.2.4 leaves it optional).
 ⚠ Not persisted by the broker: sessions are memory. A server that keeps them across its own
 restart does it with two calls (2026-09-21): `sessionStates(arena)` copies out every session —
 client id, subscriptions with their granted QoS, queued, in flight, and a per-session `drops`
-count — under one lock, and `restoreSession(client_id, subs, now)` recreates one offline, all or
+count — under one lock, and `restoreSession(client_id, subs, offline_since_ms)` recreates one offline, all or
 nothing, before clients connect. What goes back into the restored queue is the server's business
 (its own replay source); the broker's part is the fact that makes that possible: a message is
 queued by the `publish` that fans it out, so `queued + inflight == 0` at an instant means every
 message published to the session before it has been acknowledged. `restoreSession` applies no
 ACL (as `publish` does not — no client is asking) and refuses what no SUBSCRIBE could have been
 granted: an invalid or too-deep filter, QoS 2, past `max_subscriptions_per_conn`/`_total`.
+The expiry clock carries over too (2026-09-28, egw audit R5): `SessionState.offline_since_ms` is
+when an offline session went offline (null while online) on the caller's clock, and
+`restoreSession`'s last argument takes it back — for a session that was online, the restart's
+own `now`. Only meaningful if that clock is wall time, which survives the restart.
 
 ## Verification
 **External anchor (`external_goldens.zig`).** Every KAT below this point is hand-authored from the
@@ -262,8 +266,6 @@ use-after-free in the reference-counted teardown). No race, deadlock, or UAF was
 confirmed. Run: `zig build test-mqtt` (also green under `-Doptimize=ReleaseFast`).
 
 ## Backlog / deferred
-**`sessionStates` does not say since when a session has been offline** — GAP (2026-09-27, egw audit R5). A server that persists sessions across restarts (`sessionStates`/`restoreSession`) cannot carry the expiry clock over: the broker knows when each session went offline but does not export it, so egw-hub infers it round by round (`egw-hub/src/egw.zig`, comment `zig-libs request: mqtt`). Wanted: `offline_since_ms` in each `SessionState` and accepted by `restoreSession`, so expiry survives a restart without the embedder guessing.
-
 **Will topic is not ACL-checked** — GAP (2026-09-27, egw audit S1 R1, measured). The broker registers a CONNECT's Will after authentication with only `validateName` (`broker.zig` ~1556–1570); `publishWill` → `fanout` runs neither `authorizeFn` nor any publish hook, and `AuthRequest` does not carry the Will. Any authenticated account can therefore publish anything, retained, anywhere by dropping its socket. Wanted: at CONNECT, run `authorizeFn` for the Will topic (operation publish, `retain` = will_retain) and refuse with `not_authorized` as Mosquitto does; put the Will (topic, qos, retain, payload length) in `AuthRequest`. Related: the retained store is bounded by count (`max_retained`) but not by bytes — add `max_retained_bytes` (8192 × 60 KB Wills took a hub 2 MB → 494 MB RSS).
 
 **Sessions are not bound to the account that created them** — GAP (2026-09-27, egw audit S1 R3, measured). Take-over and resume go by client id alone (`broker.zig` ~1587–1620); the `Session` keeps no username, so another account connecting with the same client id resumes the session (inheriting its subscriptions and queue, bypassing the ACL it would get on SUBSCRIBE) or discards it with clean 1. Wanted: record the authenticated username on the `Session` (and in `sessionStates`/`restoreSession`), and refuse a resume or take-over by a different username (CONNACK `not_authorized`), as Mosquitto's `check_client_id`-style plugins do.

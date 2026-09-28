@@ -1060,6 +1060,12 @@ pub const Broker = struct {
     pub const SessionState = struct {
         client_id: []const u8,
         online: bool,
+        /// Since when the session has been offline, on the caller's clock
+        /// (the `now` given to `process`, or to `restoreSession`); null while
+        /// it is online. What `expireSessions` measures from — hand it back
+        /// to `restoreSession` and expiry carries over a restart exactly.
+        /// Defaulted so a stand-in that builds these by hand keeps compiling.
+        offline_since_ms: ?i64 = null,
         /// QoS 1 messages waiting for a delivery window.
         queued: usize,
         /// Sent and not yet acknowledged.
@@ -1094,6 +1100,7 @@ pub const Broker = struct {
             o.* = .{
                 .client_id = try arena.dupe(u8, x.clientId()),
                 .online = x.conn != null,
+                .offline_since_ms = if (x.conn == null) x.offline_since_ms else null,
                 .queued = x.queuedLen(),
                 .inflight = x.inflight.items.len,
                 .drops = x.drops,
@@ -1127,9 +1134,16 @@ pub const Broker = struct {
     /// No ACL call — the subscriptions were granted to a client once, and the
     /// server's own restore is not a client asking again (the same reason
     /// `publish` skips it). A server whose rules may have changed since
-    /// checks them before calling this. `now` is the caller clock
-    /// `expireSessions` measures from: the session is offline since `now`.
-    pub fn restoreSession(b: *Broker, client_id: []const u8, subs: []const SessionSub, now: i64) RestoreError!void {
+    /// checks them before calling this.
+    ///
+    /// `offline_since_ms` is when the session went offline, on the caller
+    /// clock `expireSessions` measures from: the kept
+    /// `SessionState.offline_since_ms`, so the expiry clock carries over the
+    /// restart, or the restart's own `now` for a session that was online
+    /// (the server's death took it offline, at an instant it cannot know).
+    /// ⚠ A kept value only means something if that clock survives a restart
+    /// — wall time, not a monotonic counter that starts again at zero.
+    pub fn restoreSession(b: *Broker, client_id: []const u8, subs: []const SessionSub, offline_since_ms: i64) RestoreError!void {
         if (client_id.len == 0 or client_id.len > max_client_id) return error.InvalidClientId;
         if (subs.len > b.config.max_subscriptions_per_conn) return error.TooManySubscriptions;
         for (subs) |sub| {
@@ -1143,7 +1157,7 @@ pub const Broker = struct {
         if (b.sessions.items.len >= b.config.max_sessions) return error.SessionLimitReached;
         if (b.subscriptions_total + subs.len > b.config.max_subscriptions_total) return error.TooManySubscriptions;
         const x = b.createSession(client_id) catch return error.OutOfMemory;
-        x.offline_since_ms = now;
+        x.offline_since_ms = offline_since_ms;
         for (subs) |sub| {
             if (b.hasSessionSub(x, sub.filter)) {
                 b.index.updateQos(sub.filter, .{ .session = x }, sub.qos);
@@ -3433,6 +3447,37 @@ test "restoreSession refuses what a SUBSCRIBE could not have granted, and leaves
     try b.restoreSession("x", ok, 0);
     try testing.expectError(error.SessionExists, b.restoreSession("x", ok, 0));
     try testing.expectError(error.SessionLimitReached, b.restoreSession("y", ok, 0));
+}
+
+test "offline_since_ms survives a restart: sessionStates to restoreSession keeps the expiry clock" {
+    var b = Broker.init(testing.allocator, .{ .session_expiry_ms = 1000 });
+    defer b.deinit();
+    var t1 = TestTransport{};
+    var t2 = TestTransport{};
+    // Its last packet is the CONNECT at 700 (`feedSubscribe` runs at 1).
+    const away = try connectSession(&b, &t1, "away", false, 700);
+    b.remove(away.conn);
+    _ = try connectSession(&b, &t2, "here", false, 900);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const states = try b.sessionStates(arena.allocator());
+    var kept: ?i64 = null;
+    for (states) |st| {
+        if (std.mem.eql(u8, st.client_id, "here")) {
+            try testing.expectEqual(@as(?i64, null), st.offline_since_ms);
+        } else kept = st.offline_since_ms;
+    }
+    try testing.expectEqual(@as(?i64, 700), kept);
+
+    // The server restarts at 1500: the session is due at 1700, not 2500.
+    var b2 = Broker.init(testing.allocator, .{ .session_expiry_ms = 1000 });
+    defer b2.deinit();
+    try b2.restoreSession("away", &.{.{ .filter = "a", .qos = .at_least_once }}, kept.?);
+    const again = (try b2.sessionStates(arena.allocator()))[0];
+    try testing.expectEqual(@as(?i64, 700), again.offline_since_ms);
+    try testing.expectEqual(@as(usize, 0), b2.expireSessions(1699));
+    try testing.expectEqual(@as(usize, 1), b2.expireSessions(1700));
 }
 
 test "a restored session expires like any offline one, from the restore" {

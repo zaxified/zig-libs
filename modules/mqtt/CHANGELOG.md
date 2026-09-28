@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Broker: `SessionState.offline_since_ms` — since when a session has been
+  offline (null while online), on the caller's clock, i.e. what `expireSessions` measures from.
+  Handed back as `restoreSession`'s last argument (renamed from `now`, same meaning) it carries
+  the expiry clock over a server restart instead of restarting it. Defaults to null, so a
+  `SessionState` built by hand still compiles. Wanted by the egw-hub audit (R5).
+
 - **2026-09-22** — Broker hooks: `AclRequest.retain` carries the PUBLISH's RETAIN flag (false for
   SUBSCRIBE), so an ACL can deny a retained publish — e.g. to a command topic, where a stored
   command would reach every future subscriber — while allowing the plain one; mosquitto's ACL sees
