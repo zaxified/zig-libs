@@ -39,6 +39,10 @@ Design + threat notes for auditors. Usage: see ./README.md. Attribution/provenan
   empty context per RFC 9964). Every algorithm is tested by a round trip through
   `parseAndVerify`.
 
+- **Verified-token cache** (2026-09-28, requested by qap): `VerifiedCache(Value)` in
+  `cache.zig`, opt-in. See § "Verified-token cache" below for the argument that a hit answers
+  exactly what verifying again would.
+
 ## Threat model / out of scope
 
 This is the security core; the defenses are the point:
@@ -140,6 +144,118 @@ This is the security core; the defenses are the point:
   unchanged — only a wrong JSON *type* (not absence) is an error, matching
   `id_token_signing_alg_values_supported`'s existing rule.
 
+## Verified-token cache
+
+`VerifiedCache(Value)` remembers a token that verified until its `exp`, so a repeat skips the
+signature. Measured motive (qap audit): ES256 through `p256` ~1.6 k verifications/s per core
+under load (~4 k quiet), RS256 slower through std's bignum — a JWT API is capped at a few
+thousand requests per second per core by verification alone, while a client sends the same
+access token on every request.
+
+**Contract: a hit answers exactly what `parseVerifyJwks` (+ the caller's `derive`) would.**
+`parseVerifyJwks` is a deterministic function of (token bytes, key set, `Options`); the cache
+fixes the first two and every part of the third except the clock, and re-evaluates the clock:
+
+- **Key = SipHash-2-4-128 under a per-cache secret key, over (domain tag ‖ policy ‖ context ‖
+  token).** The policy is every `Options` field but `now_s` (`leeway_s`, `issuer`, `audience`,
+  `require_exp`, `reject_future_iat`), length-prefixed, with the token last; a comptime check
+  fails the build when a field is added to `Options` without being folded in or excluded. So the
+  same token under another audience, issuer or leeway is another entry — one cache may even be
+  shared between verifiers. The 16-byte MAC key is drawn at `init` with `io.randomSecure`
+  (fail-closed, CONVENTIONS §2.2) and wiped at `deinit`. Without it an attacker cannot compute a
+  single tag offline, and a request whose bytes differ from a cached token's hits only if the two
+  tags collide — 2^-128 per request, and each attempt is an online request that learns one bit
+  (hit or miss). That is the sense in which a hit implies these exact bytes verified before.
+  *Why keyed and not SHA-256/BLAKE3 (measured, table below):* on this host (no SHA extensions)
+  hashing a 682-byte token costs SHA-256 ≈ 3.1–4.2 µs and BLAKE3 ≈ 2.3–3.0 µs against SipHash-2-4
+  ≈ 0.37–0.51 µs, and the digest is almost the whole hit path: the first version of this cache
+  used BLAKE3 and its ES256 hit measured 2.6–3.5 µs, the keyed one 0.70 µs. The price is one
+  assumption: **the key must stay secret.** An attacker who can read the process's memory (the
+  key and a stored tag) could search offline for a byte string with the same tag — SipHash is a
+  PRF, not collision-resistant under a known key — and a hit never parses, so such a string
+  would authenticate as that entry's principal until its `exp`. An attacker with that read
+  already holds every bearer token passing through the process's buffers, so this widens an
+  existing compromise rather than opening a new one; a consumer who must not accept even that
+  should not enable the cache.
+- **Bound to `JwkSet.id`.** Every set `parseJwksSource` builds (so every `fetchJwks` result and
+  every `Provider` refresh) takes the next value of a process-wide counter, never reused; a hit
+  requires the entry's id to equal the set passed in. Replacing the set therefore invalidates
+  everything verified under the old one — no generation to bump by hand, no ABA from a freed
+  set's address being reused, and "a key the set drops stops verifying at the next fetch" holds.
+  A set with `id == 0` (assembled by hand) is never cached. A set is immutable after parse (its
+  `keys` are `[]const`), which is what makes the id a sound stand-in for its contents.
+- **Time claims re-checked on every hit** by `checkTimes`, the same function `validateClaims`
+  runs (it was factored out for this), against the caller's `now_s`. `validateClaims` checks
+  `exp`, `nbf`, `iat` before `iss`/`aud`, and `iss`/`aud` are fixed by the key, so the first
+  failure a hit reports is the one a fresh verify would report. An `Expired` entry is evicted;
+  a `NotYetValid` one (a clock stepped back) stays, since it may pass again.
+- **Only successes are stored.** A failure is never cached: caching one would let an attacker
+  pin a refusal on a token or fill the table with junk. `verifyJwks` stores only after
+  `parseVerifyJwks` and `derive` both succeed; the public `insert` additionally refuses a
+  `parsed` that is not `token`'s parse (signing input must be the token's prefix) and claims
+  that fail `validateClaims` now. The signature precondition of `insert` cannot be re-checked
+  cheaply and is the caller's (documented) — `verifyJwks` is the entry point that needs no trust.
+- **What is stored is the caller's `Value`, not claims.** `Value` is plain data, rejected at
+  compile time if it contains a pointer or slice (it outlives the parsed token). This keeps the
+  hit path allocation-free and bounds an entry: a token whose claims do not fit the caller's
+  `Value` is refused by `derive` and simply not cached. `derive` must be a pure function of the
+  token; what else it reads (which claim names the principal, which scopes map to which bits)
+  goes into `Config.context`, which is folded into the key.
+
+**Residual differences — none in the answer, under one assumption.** With the MAC key secret, a
+hit returns what verifying again would, except with probability 2^-128 per request. What does
+differ, deliberately:
+(1) the key-secrecy assumption itself (above): a disclosure of process memory becomes forgeable
+hits for cached principals until their `exp`. (2) Timing: a hit is faster, so someone who can
+already present a token can tell whether it was recently verified; learning that needs the token
+itself. (3) Residency: each cached token's tag and derived `Value` stay in memory until evicted or
+`deinit` (both wipe); the token itself is never stored. (4) Staleness of the key *source* stays
+the caller's: a remote set too old to use must still be refused before the lookup (qap's
+`Remote.acquire` returns null), exactly as before. None of these changes an accept/refuse
+decision, so a consumer may enable the cache by default; one whose threat model counts a memory
+disclosure as survivable for bearer tokens not currently in flight should leave it off.
+
+**Concurrency.** A 4-way set-associative table of power-of-two buckets, each with its own
+spin lock (`std.atomic.Mutex`, cache-line aligned). The MAC is computed before the lock is
+taken and the signature is verified after it is released, so the lock covers a probe of four
+16-byte tags and one copy of `Value` — nothing that blocks or allocates. Per-bucket striping
+makes two workers contend only when their tokens hash to the same bucket. Per-thread caches
+were rejected: they divide the hit rate by the worker count (a client's connections spread over
+workers), multiply memory, and need thread identity plumbed through the caller; a sharded table
+costs one uncontended atomic swap on the hit path. There are deliberately no shared hit/miss
+counters — one atomic incremented by every worker on every request is exactly the cache line
+the striping exists to avoid; a caller counts per worker. Tested by four threads hammering an
+8-entry table with 24 tokens and 200-byte values (a torn copy would show as mixed bytes); a
+mutant that reads without the lock fails it.
+
+**Eviction.** A bucket's victim is, in order: the same token's slot (another set, a racing
+insert), a free slot, a slot past its `exp + leeway`, else CLOCK — the first slot from the
+bucket's hand whose second-chance bit (set on each hit) is clear, clearing bits as it passes.
+Capacity is the caller's (`Config.capacity`, rounded up to a power-of-two bucket count × 4).
+
+**Flooding.** Only tokens that verified can occupy slots. An attacker holding one valid token
+can make a handful of distinct-byte variants that still verify (ECDSA `s ↔ n−s`, unused
+base64url tail bits) — each costs a full verification before it is stored, and filling the
+table only evicts other clients' entries, which then re-verify: the worst case is the cost
+without a cache, never a wrong answer.
+
+**Measured** (ReleaseFast, `taskset -c 1`, this host — i7-7920HQ, no SHA extensions — under
+other jobs' load; µs per Bearer verify, `parseVerifyJwks` vs the cache):
+
+| | `parseVerifyJwks` | cache miss (MAC + verify + insert) | **cache hit** |
+|---|---|---|---|
+| ES256, 682-byte token, `p256` | 313–435 µs | 402–449 µs | **0.70–0.73 µs** |
+| RS256, RFC 7515 A.2 (2048-bit), 458 bytes | 218–317 µs | 209–297 µs | **0.42–0.55 µs** |
+
+Three runs each; the machine was running other jobs (load average 4–12), so the verify columns
+are noisy and the miss/no-cache difference (one MAC and one insert, < 1 µs) is inside that noise.
+A hit is two to three orders of magnitude cheaper than a verify. Digest candidates over the same
+682 bytes, same runs: SHA-256 3.1–4.2 µs, BLAKE3 2.3–3.0 µs, SipHash-1-3-128 0.20–0.25 µs,
+SipHash-2-4-128 0.37–0.51 µs (the standard parameters were kept; 1-3 would save ~0.2 µs). The
+bench was a throwaway test in the worktree's `.zig-cache`, deleted after.
+
+Not wired into `Provider`/`Guard`/`ResourceServer` — see Backlog.
+
 ## Verification
 
 RFC known-answer vectors transcribed from the RFCs: JWS 7515 A.1 (HS256) / A.2 (RS256) / A.3
@@ -147,7 +263,14 @@ RFC known-answer vectors transcribed from the RFCs: JWS 7515 A.1 (HS256) / A.2 (
 byte-exact); plus adversarial negatives (alg=none, alg-confusion downgrade, kid mismatch,
 embedded-jwk ignored, expired/nbf, tampered signature, mandatory-audience confused-deputy
 rejection, oct-from-network refusal, ID-token nonce-mismatch positive control, azp/iss/aud/exp
-rejection) and Provider cache/rotation/TTL tests behind a scripted fetcher. The P6 resource-server
+rejection) and Provider cache/rotation/TTL tests behind a scripted fetcher. `VerifiedCache`: hit/miss
+(derive count), `exp` crossing while cached (same error as a fresh verify, then evicted), `nbf`/`iat`
+re-check, set replacement and key rotation, policy/context separation, one-byte-different tokens,
+failures never stored (bad signature, expired, underivable, misused `insert`, id-less set),
+capacity/CLOCK eviction, four-thread hammering, ES256 end to end. Mutation check at landing (mutant schemata,
+one ReleaseSafe build): ten mutants — set-id check dropped, time re-check dropped, audience not folded
+into the key, context not folded into the key, CLOCK bit ignored, expired entry not evicted, `insert`
+prefix guard dropped, both locks dropped, lookup without the lock, MAC key not wiped — all killed. The P6 resource-server
 guard adds self-constructed policy tests (own signer, not external interop KATs — the correct
 approach for policy logic): `Guard.authenticate` valid/missing/garbage/expired/insufficient/
 alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp` scope helpers
@@ -182,6 +305,11 @@ alg=none/RS→HS-confusion decisions, RFC 9068 `at+jwt` typ on/off, `scope`+`scp
   extraction, `at+jwt` check, scope policy and RFC 6750 challenges over a caller-held set;
   nothing is fetched, so an unknown `kid` is refused at once. A static set has no issuer to
   default to, so `claim_opts.issuer = .provider` fails `init` (`error.IssuerNotConfigured`).
+- **`VerifiedCache` behind `Provider`/`Guard`/`ResourceServer`** — not wired. `Provider.verify`
+  returns an owned `ParsedToken`, which a hit cannot produce without allocating, and its TTL
+  refresh must run before a lookup (else a hit would outlive a dropped key). The fit is a
+  `derive`-style entry point on `Provider` that refreshes first and then calls
+  `VerifiedCache.verifyJwks` with its current set. Add it when a consumer of those types asks.
 - No other module-local backlog recorded (README has no Deferred section).
 
 - ~~**Refuse a plain-HTTP key source**~~ — DONE 2026-09-28 (from qap M11.8): `discover`,

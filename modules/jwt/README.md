@@ -147,6 +147,9 @@ ID-token acceptance).
 | `JwkSet.selectKey(header) ?ResolvedKey` | header-aware selection: by `kid` (honoring `use` + pinned `alg`), or the single usable key when the token has no `kid` |
 | `verifyWithJwks(&parsed, jwks) VerifyError!void` | `selectKey` → `verify`; no usable key → `NoMatchingKey` |
 | `parseVerifyJwks(gpa, token, jwks, Options) !ParsedToken` | the one-call JWKS API: parse → resolve by `kid` + verify → validateClaims |
+| `JwkSet.id` | the set's process-unique identity (stamped by `parseJwks`/`fetchJwks`, never reused; 0 on a hand-built set) — what binds a `VerifiedCache` entry to the set it verified under |
+| `VerifiedCache(Value).init(gpa, io, .{ .capacity, .context })` (+ `deinit`, `clear`, `capacity`) | opt-in, bounded, thread-safe cache of tokens that verified, until their `exp`; `Value` is plain data the caller derives from the token (a principal, scope bits) — see "Verified-token cache" below |
+| `VerifiedCache.verifyJwks(scratch, token, &set, Options, deriver) !Value` | `parseVerifyJwks` with the cache in front: a hit returns the stored value, a miss verifies, calls `deriver.derive(*const ParsedToken) ?Value` and stores it; `lookup` / `insert` are the two halves |
 | `Fetcher` / `HttpFetcher` | GET-a-URL seam (offline-testable); `HttpFetcher` adapts `http.Client` |
 | `discover(gpa, fetcher, issuer) !Metadata` · `fetchJwks(gpa, fetcher, url) !JwkSet` | OIDC discovery + JWKS fetch |
 | `Provider.init(gpa, fetcher, .{issuer OR jwks_uri, ttl_s, min_refresh_interval_s})` | cached, rotation-aware key source |
@@ -308,6 +311,55 @@ var id_token = try jwt.acceptIdToken(gpa, token_resp.id_token.?, .{ .hmac = secr
 });
 defer id_token.deinit();
 ```
+
+### Verified-token cache
+
+Verifying the signature is what a Bearer request costs: ES256 runs at a few
+thousand verifications per second per core, RS256 slower. A client sends the
+same access token until it expires, so `VerifiedCache` remembers the ones that
+verified and answers the repeat with a MAC and a table probe (~0.7 µs for an
+ES256 token against ~300–400 µs to verify it; numbers in SPEC.md).
+
+```zig
+const Principal = struct { id_buf: [128]u8 = undefined, id_len: u8 = 0, scopes: u64 = 0 };
+const Derive = struct {
+    pub fn derive(_: @This(), t: *const jwt.ParsedToken) ?Principal {
+        const sub = t.claims.claimStr("sub") orelse return null;
+        if (sub.len > 128) return null; // does not fit: refused, and not cached
+        var p: Principal = .{ .id_len = @intCast(sub.len) };
+        @memcpy(p.id_buf[0..sub.len], sub);
+        if (jwt.scopeGranted(t.claims, "read")) p.scopes |= 1;
+        return p;
+    }
+};
+
+var cache: jwt.VerifiedCache(Principal) = try .init(gpa, io, .{ .capacity = 4096, .context = "sub;read" });
+defer cache.deinit();
+// per request, with the set in use (a refresh gives a new set, and so a new `id`):
+const who = cache.verifyJwks(scratch, bearer, &jwks, .{
+    .now_s = now_seconds,
+    .issuer = .{ .required = "https://issuer.example" },
+    .audience = .{ .required = "api://my-service" },
+}, Derive{}) catch |err| return refuse(err);
+```
+
+It returns exactly what `parseVerifyJwks` followed by `derive` would:
+
+- the key is a SipHash-2-4-128 MAC, under a random key drawn per cache, over
+  the **exact token bytes**, the claim policy (every `Options` field but
+  `now_s`) and `Config.context`, so another audience, issuer, leeway or derive
+  configuration never shares an entry (the key must stay secret — SPEC.md
+  says what a process-memory disclosure would allow);
+- each entry is bound to `JwkSet.id`: a replaced set (refresh, rotation) makes
+  every entry verified under the old one a miss;
+- a hit re-runs the `exp`/`nbf`/`iat` checks against `now_s` (the same code
+  `validateClaims` runs) and refuses with the same error; an expired entry is
+  evicted;
+- only successes are stored; a failure is never cached.
+
+`derive` must be a pure function of the token — anything else it depends on
+goes into `Config.context`. Nothing in the module uses the cache on its own;
+`Provider`, `Guard` and `ResourceServer` are unchanged.
 
 ## Semantics notes
 
