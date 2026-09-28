@@ -5,6 +5,20 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — The decoder in a caller's memory, with exact sizes
+  (Z25): `Decompressor.initStatic` / `DecompressStream.initStatic`
+  (`ZSTD_initStaticDCtx`/`DStream`, in a `zstd.Workspace`, never
+  allocating) and `DDict.initStatic` (`ZSTD_initStaticDDict`, by copy or by
+  reference); `zstd.estimateDecompressorSize`,
+  `estimateDecompressStreamSize(window_size, opts)`,
+  `estimateDecompressStreamSizeFromFrame(src, opts)`, `DDict.estimateSize`
+  (`ZSTD_estimate*`, this port's exact numbers) and `workspaceSize` /
+  `memorySize`. `DecompressOptions.max_block_size` /
+  `DecompressStreamOptions.max_block_size` (`ZSTD_d_maxBlockSize`: frames
+  with larger blocks refused where libzstd refuses them, stream buffers
+  shrunk as libzstd's; out of 1 KiB..128 KiB is
+  `error.ParameterOutOfBound`, a new member of `DecompressError`), and
+  `Decompressor.copyFrom` (`ZSTD_copyDCtx`).
 - **2026-09-28** — `Stream.setLevel` (`ZSTD_CCtx_setParameter(
   ZSTD_c_compressionLevel)` at any time): with workers, the jobs created
   after the next call take the new level, as libzstd's

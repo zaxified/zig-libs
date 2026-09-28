@@ -28,6 +28,10 @@ pub const Error = dblock.Error || error{
     FrameParameterUnsupported,
     FrameParameterWindowTooLarge,
     DictionaryWrong,
+    /// `Options.max_block_size` outside `block_size_max_min` ..
+    /// `block_size_max` (`parameter_outOfBound`: libzstd refuses it when
+    /// set, this port at the first call that decodes with it).
+    ParameterOutOfBound,
 };
 
 pub const magic_number: u32 = 0xFD2FB528;
@@ -46,6 +50,14 @@ pub const window_log_absolute_min = 10;
 /// configurable cap) is even consulted.
 pub const window_log_max = if (@sizeOf(usize) == 4) 30 else 31;
 pub const block_size_max = dblock.block_size_max;
+/// `ZSTD_BLOCKSIZE_MAX_MIN`: the smallest `Options.max_block_size`.
+pub const block_size_max_min = 1 << 10;
+
+/// The alignment of a caller's workspace (`Decompressor.initStatic`,
+/// `DecompressStream.initStatic`): the compressor's (`zstd.Workspace`), so
+/// one type serves both directions.
+pub const workspace_alignment = 64;
+pub const Workspace = []align(workspace_alignment) u8;
 
 const did_field_size = [4]usize{ 0, 1, 2, 4 };
 const fcs_field_size = [4]usize{ 0, 2, 4, 8 };
@@ -427,6 +439,22 @@ pub const Options = struct {
     /// about it is stream-specific). Takes priority over `dictionary` /
     /// `ddict` / `ddicts` while set.
     prefix_once: ?[]const u8 = null,
+    /// `ZSTD_d_maxBlockSize`, `block_size_max_min` .. `block_size_max`
+    /// (null: `block_size_max`): the largest block a frame may have. The
+    /// frame's own maximum (its window, at most 128 KB) is lowered to it
+    /// after the header is read, so a larger block is refused as libzstd
+    /// refuses it -- by the one-shot decoder (`decompress`, where libzstd
+    /// does not bound raw and RLE blocks at all, only compressed ones and
+    /// their literals) and by `DecompressStream`, whose buffers shrink with
+    /// it. The piecewise `decompressContinue` ignores it, as libzstd's
+    /// `ZSTD_decompressContinue` does. Out of range:
+    /// `error.ParameterOutOfBound`.
+    max_block_size: ?u32 = null,
+
+    /// `ZSTD_dParam_getBounds` for the parameters that have bounds.
+    pub fn check(o: Options) error{ParameterOutOfBound}!void {
+        if (o.max_block_size) |m| if (m < block_size_max_min or m > block_size_max) return error.ParameterOutOfBound;
+    }
 };
 
 /// `ZSTD_dStage`: where `decompressContinue` is within a frame.
@@ -442,9 +470,11 @@ pub const Stage = enum {
 };
 
 /// A decoding context (`ZSTD_DCtx`). Its tables and literal buffer (about
-/// 190 KB) live on the heap, so the handle itself can be moved freely.
+/// 160 KB, `estimateDCtxSize`) live on the heap or in a caller's workspace
+/// (`initStatic`), so the handle itself can be moved freely.
 pub const Decompressor = struct {
-    gpa: std.mem.Allocator,
+    /// Null for a caller's workspace (`initStatic`), which is never freed.
+    gpa: ?std.mem.Allocator,
     st: *dblock.State,
     options: Options,
     /// The frame header of the frame being decoded.
@@ -474,6 +504,21 @@ pub const Decompressor = struct {
 
     pub fn init(gpa: std.mem.Allocator, options: Options) error{OutOfMemory}!Decompressor {
         const st = try gpa.create(dblock.State);
+        return fromState(gpa, st, options);
+    }
+
+    /// A context in the caller's `workspace` (`ZSTD_initStaticDCtx`), which
+    /// it never frees: its tables and literal buffer take the first
+    /// `estimateDCtxSize()` bytes, and a smaller workspace is
+    /// `error.OutOfMemory`. Nothing is allocated, ever -- the one-shot
+    /// decoder needs nothing more, a dictionary included.
+    pub fn initStatic(workspace: Workspace, options: Options) error{OutOfMemory}!Decompressor {
+        comptime std.debug.assert(@alignOf(dblock.State) <= workspace_alignment);
+        if (workspace.len < estimateDCtxSize()) return error.OutOfMemory;
+        return fromState(null, @ptrCast(workspace.ptr), options);
+    }
+
+    fn fromState(gpa: ?std.mem.Allocator, st: *dblock.State, options: Options) Decompressor {
         st.* = .{};
         // the slack behind the literals is read (and overwritten) by wildcopy
         @memset(st.lit_buf[block_size_max..], 0);
@@ -481,8 +526,51 @@ pub const Decompressor = struct {
     }
 
     pub fn deinit(d: *Decompressor) void {
-        d.gpa.destroy(d.st);
+        if (d.gpa) |gpa| gpa.destroy(d.st);
         d.* = undefined;
+    }
+
+    /// The bytes the context's tables and literal buffer take
+    /// (`ZSTD_sizeof_DCtx` less the handle): `estimateDCtxSize()`.
+    pub fn workspaceSize(_: *const Decompressor) usize {
+        return estimateDCtxSize();
+    }
+
+    /// `ZSTD_copyDCtx`: makes `d` a copy of `src` -- typically a context
+    /// prepared once (options, dictionary, `begin`) and copied before each
+    /// frame. Copied: the options (format, checksum handling,
+    /// `max_block_size`, and which dictionary), the entropy tables, repeat
+    /// offsets and their validity, the piecewise decoder's stage, frame
+    /// header, dictionary ID and checksum state. Shared, not copied: what
+    /// the options and the history refer to -- the dictionary bytes, the
+    /// `DDict`s and the previous output, which must outlive both contexts.
+    /// `d` keeps its own memory (allocator or workspace) and literal
+    /// buffer, which holds nothing between blocks. libzstd copies the
+    /// struct up to its buffers, table pointers included, so a copy's
+    /// tables stay those of `src`; here they point into `d`'s own copy,
+    /// which differs only if `src` changes or goes away first. It leaves
+    /// out the frame header buffer, which this copies too (a copy taken
+    /// in the middle of a header goes on with it here).
+    pub fn copyFrom(d: *Decompressor, src: *const Decompressor) void {
+        if (d == src) return;
+        const st = d.st;
+        const s = src.st;
+        st.ll = s.ll;
+        st.of = s.of;
+        st.ml = s.ml;
+        st.huf = s.huf;
+        st.rep = s.rep;
+        st.ll_ptr = if (s.ll_ptr == &s.ll) &st.ll else s.ll_ptr;
+        st.of_ptr = if (s.of_ptr == &s.of) &st.of else s.of_ptr;
+        st.ml_ptr = if (s.ml_ptr == &s.ml) &st.ml else s.ml_ptr;
+        st.huf_ptr = &st.huf;
+        st.lit_entropy = s.lit_entropy;
+        st.fse_entropy = s.fse_entropy;
+        st.block_size_max = s.block_size_max;
+        const gpa = d.gpa;
+        d.* = src.*;
+        d.gpa = gpa;
+        d.st = st;
     }
 
     /// `ZSTD_decompressBegin`.
@@ -673,6 +761,17 @@ pub const Decompressor = struct {
         d.st.block_size_max = d.fparams.block_size_max;
     }
 
+    /// `ZSTD_d_maxBlockSize`: lowers the frame's block maximum, where the
+    /// block decoder reads it too (`ZSTD_blockSizeMax`). libzstd does this
+    /// after the header in `ZSTD_decompressFrame` and `ZSTD_decompressStream`
+    /// only, not in `ZSTD_decompressContinue`.
+    pub fn applyMaxBlockSize(d: *Decompressor) void {
+        if (d.options.max_block_size) |m| {
+            d.fparams.block_size_max = @min(d.fparams.block_size_max, m);
+            d.st.block_size_max = d.fparams.block_size_max;
+        }
+    }
+
     /// `ZSTD_decompressFrame`: decodes the frame at `src[ip.*..]` into
     /// `dst[op0..]`, advancing `ip`. Returns the decoded size. `apply_content`
     /// is `decodeFrameHeaderImpl`'s (one-shot `decompress` passes `false`:
@@ -690,6 +789,7 @@ pub const Decompressor = struct {
             ip.* += fhs;
             remaining -= fhs;
         }
+        d.applyMaxBlockSize();
         // after the dictionary (if any) is applied above, not before: a
         // dictionary's content is set up as history the same way this
         // does, through `d.prefix_addr`/`d.prev_end_addr` (see
@@ -764,6 +864,7 @@ pub const Decompressor = struct {
     /// `Options.ddict` if set, else the *last* entry of `Options.ddicts`
     /// (mirroring "last ref'd"), else none, fixed for the whole call.
     pub fn decompress(d: *Decompressor, dst: []u8, src: []const u8) Error!usize {
+        try d.options.check();
         var ip: usize = 0;
         var op: usize = 0;
         var more_than_1_frame = false;
@@ -925,6 +1026,14 @@ pub const Decompressor = struct {
         }
     }
 };
+
+/// `ZSTD_estimateDCtxSize`: the memory a `Decompressor` takes besides its
+/// handle -- its tables and literal buffer -- and so the smallest workspace
+/// `Decompressor.initStatic` takes. Exact for this port (libzstd's number
+/// counts its own struct: 95 992 bytes on x86-64).
+pub fn estimateDCtxSize() usize {
+    return @sizeOf(dblock.State);
+}
 
 test "frame header of the empty frame" {
     const r = try getFrameHeader(&.{ 0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00 });

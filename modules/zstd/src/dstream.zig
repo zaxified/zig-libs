@@ -79,7 +79,87 @@ pub const Options = struct {
     /// dictionary ID from this set (falling back to `ddict`, then to no
     /// dictionary). Must outlive the `DecompressStream`.
     ddicts: []const *const ddict_mod.DDict = &.{},
+    /// `ZSTD_d_maxBlockSize`, as `DecompressOptions.max_block_size`: a
+    /// frame with a larger block is refused, and the input buffer and the
+    /// output ring are sized for blocks of at most this many bytes.
+    max_block_size: ?u32 = null,
+
+    /// The largest window a frame may ask for (`dctx->maxWindowSize`).
+    fn maxWindowSize(o: Options) u64 {
+        return if (o.max_window_size) |m|
+            @max(m, @as(u64, 1) << dec.window_log_absolute_min)
+        else if (o.window_log_max) |l|
+            @as(u64, 1) << @max(l, dec.window_log_absolute_min)
+        else
+            (@as(u64, 1) << window_log_limit_default) + 1;
+    }
 };
+
+/// The input buffer and output ring a frame needs, from its header as the
+/// stream sees it (window raised to 1 KB, block maximum lowered to
+/// `max_block_size`): `ZSTD_decompressStream`'s "Adapt buffer sizes".
+const BufferSizes = struct {
+    in: usize,
+    out: usize,
+
+    fn of(window_size: u64, content_size: ?u64, block_size_max: usize, stable_output: bool) Error!BufferSizes {
+        return .{
+            .in = @max(block_size_max, 4),
+            .out = if (stable_output) 0 else try decodingBufferSize(window_size, content_size, block_size_max),
+        };
+    }
+};
+
+/// `ZSTD_decodingBufferSize_internal`.
+fn decodingBufferSize(window_size: u64, content_size: ?u64, block_size_max: usize) Error!usize {
+    const block_size: u64 = @min(@min(window_size, dec.block_size_max), block_size_max);
+    const needed_rb = window_size + block_size * 2 + 32 * 2;
+    const needed = @min(content_size orelse std.math.maxInt(u64), needed_rb);
+    return std.math.cast(usize, needed) orelse error.FrameParameterWindowTooLarge;
+}
+
+/// `ZSTD_estimateDStreamSize`: the memory a `DecompressStream` with
+/// `options` takes besides its handle -- the decoder's tables
+/// (`dec.estimateDCtxSize`), an input buffer of one block and an output
+/// ring of one window plus two blocks -- for any frame whose window is at
+/// most `window_size` bytes, whatever its content size (a frame that
+/// declares a smaller content size needs less). Exact: it is what the
+/// stream allocates for such a frame of unknown size, and the smallest
+/// workspace `DecompressStream.initStatic` decodes it in. Used are
+/// `max_block_size` and `stable_output` (no ring); the window limit is
+/// not -- set `max_window_size` to `window_size` to have a larger frame
+/// refused rather than fail for memory. A window under 1 KB counts as
+/// 1 KB, as the stream counts it. A dictionary loaded from raw bytes
+/// (`Options.dictionary`) is extra (`DDict.estimateSize`), as in libzstd.
+pub fn estimateSize(window_size: u64, options: Options) error{ FrameParameterWindowTooLarge, ParameterOutOfBound }!usize {
+    try (dec.Options{ .max_block_size = options.max_block_size }).check();
+    const w = @max(window_size, @as(u64, 1) << dec.window_log_absolute_min);
+    const bsm: usize = @intCast(@min(w, options.max_block_size orelse dec.block_size_max, dec.block_size_max));
+    const b = BufferSizes.of(w, null, bsm, options.stable_output) catch return error.FrameParameterWindowTooLarge;
+    return dec.estimateDCtxSize() + b.in + b.out;
+}
+
+/// `ZSTD_estimateDStreamSize_fromFrame`: the memory a `DecompressStream`
+/// with `options` takes for the frame whose header starts `src` (at least
+/// the header: `error.SrcSizeWrong` otherwise) -- exactly what it
+/// allocates for that frame (content size and all), and the smallest
+/// workspace `DecompressStream.initStatic` decodes it in. A frame the
+/// stream refuses for its window is refused here too
+/// (`error.FrameParameterWindowTooLarge`; libzstd checks against
+/// 2^`window_log_max`, not the stream's limit). A skippable frame needs
+/// buffers too, as in libzstd.
+pub fn estimateSizeFromFrame(src: []const u8, options: Options) Error!usize {
+    try (dec.Options{ .max_block_size = options.max_block_size }).check();
+    const h = switch (try dec.getFrameHeaderAdvanced(src, options.format)) {
+        .need => return error.SrcSizeWrong,
+        .header => |h| h,
+    };
+    const w = @max(h.window_size, @as(u64, 1) << dec.window_log_absolute_min);
+    if (w > options.maxWindowSize()) return error.FrameParameterWindowTooLarge;
+    const bsm: usize = if (options.max_block_size) |m| @min(h.block_size_max, m) else h.block_size_max;
+    const b = try BufferSizes.of(w, h.content_size, bsm, options.stable_output);
+    return dec.estimateDCtxSize() + b.in + b.out;
+}
 
 const StreamStage = enum { init, load_header, read, load, flush };
 
@@ -107,6 +187,9 @@ pub const DecompressStream = struct {
     /// points at survives `DecompressStream` itself being moved after
     /// `init` returns.
     owned_ddict: ?*ddict_mod.DDict = null,
+    /// A static stream's room for its buffers: the workspace past the
+    /// decoder's tables (`initStatic`).
+    static_room: []u8 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, options: Options) (error{OutOfMemory} || ddict_mod.Error)!DecompressStream {
         var owned: ?*ddict_mod.DDict = null;
@@ -120,33 +203,65 @@ pub const DecompressStream = struct {
             dd.deinit(gpa);
             gpa.destroy(dd);
         };
+        return fromDecompressor(try dec.Decompressor.init(gpa, decoderOptions(options, owned)), options, owned);
+    }
+
+    /// A stream in the caller's `workspace` (`ZSTD_initStaticDStream`),
+    /// which it never frees or outgrows: the decoder's tables take its
+    /// first `dec.estimateDCtxSize()` bytes (less is `error.OutOfMemory`),
+    /// the input buffer and output ring the rest, laid out anew for each
+    /// frame; a frame needing more (`estimateSize`) fails with
+    /// `error.OutOfMemory`. Nothing is allocated, ever, so a dictionary in
+    /// raw bytes (`Options.dictionary`, which would be digested into an
+    /// allocated `DDict`) is `error.OutOfMemory` too, as libzstd cannot
+    /// either: digest it into a `DDict` (`DDict.initStatic`) and pass
+    /// `ddict`.
+    pub fn initStatic(workspace: dec.Workspace, options: Options) error{OutOfMemory}!DecompressStream {
+        if (options.dictionary != null) return error.OutOfMemory;
+        var s = fromDecompressor(try dec.Decompressor.initStatic(workspace, decoderOptions(options, null)), options, null);
+        s.static_room = workspace[dec.estimateDCtxSize()..];
+        return s;
+    }
+
+    fn decoderOptions(options: Options, owned: ?*ddict_mod.DDict) dec.Options {
         return .{
-            .d = try dec.Decompressor.init(gpa, .{
-                .ignore_checksum = options.ignore_checksum,
-                .format = options.format,
-                .ddict = if (owned) |dd| dd else options.ddict,
-                .ddicts = options.ddicts,
-                .prefix_once = options.prefix,
-            }),
-            .max_window_size = if (options.max_window_size) |m|
-                @max(m, @as(u64, 1) << dec.window_log_absolute_min)
-            else if (options.window_log_max) |l|
-                @as(u64, 1) << @max(l, dec.window_log_absolute_min)
-            else
-                (@as(u64, 1) << window_log_limit_default) + 1,
+            .ignore_checksum = options.ignore_checksum,
+            .format = options.format,
+            .ddict = if (owned) |dd| dd else options.ddict,
+            .ddicts = options.ddicts,
+            .prefix_once = options.prefix,
+            .max_block_size = options.max_block_size,
+        };
+    }
+
+    fn fromDecompressor(d: dec.Decompressor, options: Options, owned: ?*ddict_mod.DDict) DecompressStream {
+        return .{
+            .d = d,
+            .max_window_size = options.maxWindowSize(),
             .stable_output = options.stable_output,
             .owned_ddict = owned,
         };
     }
 
     pub fn deinit(s: *DecompressStream) void {
-        s.d.gpa.free(s.buf);
-        if (s.owned_ddict) |dd| {
-            dd.deinit(s.d.gpa);
-            s.d.gpa.destroy(dd);
+        if (s.d.gpa) |gpa| {
+            gpa.free(s.buf);
+            if (s.owned_ddict) |dd| {
+                dd.deinit(gpa);
+                gpa.destroy(dd);
+            }
         }
         s.d.deinit();
         s.* = undefined;
+    }
+
+    /// The bytes the decoder's tables and the stream's buffers take now
+    /// (`ZSTD_sizeof_DStream` less the handle and a dictionary loaded from
+    /// raw bytes); after a frame, what `estimateSizeFromFrame` gives for it
+    /// (until a smaller frame keeps the larger buffers). For a stream in a
+    /// workspace, the part of it in use.
+    pub fn workspaceSize(s: *const DecompressStream) usize {
+        return dec.estimateDCtxSize() + s.in_buff_size + s.out_buff_size;
     }
 
     /// `ZSTD_DCtx_reset(ZSTD_reset_session_only)`: abandon the frame in
@@ -183,14 +298,6 @@ pub const DecompressStream = struct {
         }
     }
 
-    /// `ZSTD_decodingBufferSize_internal`.
-    fn decodingBufferSize(window_size: u64, content_size: ?u64, block_size_max: usize) Error!usize {
-        const block_size: u64 = @min(@min(window_size, dec.block_size_max), block_size_max);
-        const needed_rb = window_size + block_size * 2 + 32 * 2;
-        const needed = @min(content_size orelse std.math.maxInt(u64), needed_rb);
-        return std.math.cast(usize, needed) orelse error.FrameParameterWindowTooLarge;
-    }
-
     /// `ZSTD_decompressStream`: consumes what it can of `in`, writes what
     /// it can to `out`. Returns 0 when a frame is completely decoded and
     /// flushed, else a hint of how many more input bytes the frame needs.
@@ -203,6 +310,7 @@ pub const DecompressStream = struct {
         const ostart = out.pos;
         const oend = out.dst.len;
         var op = ostart;
+        try d.options.check();
         if (in.pos > in.src.len) return error.SrcSizeWrong;
         if (out.pos > out.dst.len) return error.DstSizeTooSmall;
         if (s.stable_output and s.stage != .init) {
@@ -287,9 +395,11 @@ pub const DecompressStream = struct {
                     // control memory usage
                     d.fparams.window_size = @max(d.fparams.window_size, @as(u64, 1) << dec.window_log_absolute_min);
                     if (d.fparams.window_size > s.max_window_size) return error.FrameParameterWindowTooLarge;
+                    d.applyMaxBlockSize();
                     {
-                        const needed_in: usize = @max(d.fparams.block_size_max, 4);
-                        const needed_out: usize = if (s.stable_output) 0 else try decodingBufferSize(d.fparams.window_size, d.fparams.content_size, d.fparams.block_size_max);
+                        const needed = try BufferSizes.of(d.fparams.window_size, d.fparams.content_size, d.fparams.block_size_max, s.stable_output);
+                        const needed_in = needed.in;
+                        const needed_out = needed.out;
                         // ZSTD_DCtx_updateOversizedDuration
                         if (s.in_buff_size + s.out_buff_size >= (needed_in + needed_out) * workspace_too_large_factor)
                             s.oversized_duration += 1
@@ -298,11 +408,17 @@ pub const DecompressStream = struct {
                         const too_small = s.in_buff_size < needed_in or s.out_buff_size < needed_out;
                         const too_large = s.oversized_duration >= workspace_too_large_max_duration;
                         if (too_small or too_large) {
-                            d.gpa.free(s.buf);
-                            s.buf = &.{};
-                            s.in_buff_size = 0;
-                            s.out_buff_size = 0;
-                            s.buf = try d.gpa.alloc(u8, needed_in + needed_out);
+                            if (d.gpa) |gpa| {
+                                gpa.free(s.buf);
+                                s.buf = &.{};
+                                s.in_buff_size = 0;
+                                s.out_buff_size = 0;
+                                s.buf = try gpa.alloc(u8, needed_in + needed_out);
+                            } else {
+                                // a static stream lays its buffers out anew
+                                if (needed_in + needed_out > s.static_room.len) return error.OutOfMemory;
+                                s.buf = s.static_room[0 .. needed_in + needed_out];
+                            }
                             s.in_buff_size = needed_in;
                             s.out_buff_size = needed_out;
                         }
@@ -436,7 +552,7 @@ pub const DecompressStream = struct {
 /// `input` (concatenated and skippable frames included), through a
 /// `DecompressStream`. Memory: one window plus two blocks of output ring
 /// (at most `window_log_max`), one block of input buffer, and the
-/// decoder's ~190 KB of tables.
+/// decoder's ~160 KB of tables.
 pub const Reader = struct {
     s: DecompressStream,
     input: *std.Io.Reader,

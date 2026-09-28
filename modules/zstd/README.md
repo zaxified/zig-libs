@@ -99,7 +99,7 @@ const n = try zstd.compress(gpa, buf, data, .{ .level = 1, .checksum = true });
 // Decode: into a new buffer sized from the header (at most max_size) ...
 const back = try zstd.decompressAlloc(gpa, frame, 1 << 30);
 defer gpa.free(back);
-// ... or into your own; reuse a Decompressor to keep its ~190 KB of tables.
+// ... or into your own; reuse a Decompressor to keep its ~160 KB of tables.
 var dec = try zstd.Decompressor.init(gpa, .{});
 defer dec.deinit();
 const out = try gpa.alloc(u8, data.len);
