@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: MIT
 //! syslog — RFC 5424 syslog message formatter + emitter (UDP / TCP with
-//! RFC 6587 octet framing), plus a legacy RFC 3164 (BSD) encoder.
+//! RFC 6587 octet framing), plus a legacy RFC 3164 (BSD) encoder, plus local
+//! delivery (`UnixEmitter` over `/dev/log`, `journal` for systemd's native
+//! protocol over `/run/systemd/journal/socket` — Linux only, raw AF_UNIX
+//! syscalls; see `unix.zig`).
 //!
 //! Pure codec at the core: build a `Message`, call `.format(writer)` (or
 //! `{f}`) to get the exact wire line — correct RFC 3339 millisecond
 //! timestamps, real structured-data escaping, per-field RFC 5424 length
 //! limits. Timestamps are *injected* (`Timestamp{ .unix_ms }`) so formatting
 //! is deterministic and testable with no clock; `nowTimestamp` is the live
-//! helper for real use. The `std.Io.net` emitters only touch the network when
-//! a caller constructs one.
+//! helper for real use. The `std.Io.net` and unix-socket emitters only touch
+//! the network/filesystem when a caller constructs one.
 //!
 //!   const syslog = @import("syslog");
 //!   var buf: [1024]u8 = undefined;
@@ -24,18 +27,19 @@ const std = @import("std");
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing",
+    .doc = "RFC 5424 syslog formatter + emitter, RFC 3164 legacy encoder, RFC 6587 TCP octet framing, local delivery (unix socket, journald native protocol)",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
-    .platform_note = "any",
+    .platform_note = "any (local delivery: linux)",
     .targets = .{.linux64},
     .platform = .any,
     // `.client`, not `.both`: this module FORMATS and SENDS syslog messages
     // and has no receiver — there is no parser and no listener in its public
-    // surface (`Message`/`bufPrint`/`UdpEmitter`/`TcpEmitter`/`bsd`). It was
-    // classified `.both`, which reads as "also a syslog server" and would put
-    // it on the wrong side of any client/server survey.
+    // surface (`Message`/`bufPrint`/`UdpEmitter`/`TcpEmitter`/`bsd`/
+    // `UnixEmitter`/`journal`). It was classified `.both`, which reads as
+    // "also a syslog server" and would put it on the wrong side of any
+    // client/server survey.
     .role = .client,
     .concurrency = .reentrant,
     .model_after = "RFC 5424 (+ RFC 6587 framing); design after joelreymont/pz",
@@ -47,6 +51,7 @@ pub const meta = .{
 const message = @import("message.zig");
 const bsd_mod = @import("bsd.zig");
 const transport = @import("transport.zig");
+const unix = @import("unix.zig");
 
 // ── RFC 5424 core (default surface) ─────────────────────────────────────────
 
@@ -86,6 +91,11 @@ pub const writeOctetCounted = transport.writeOctetCounted;
 pub const Options = transport.Options;
 pub const default_udp_limit = transport.default_udp_limit;
 
+// ── local delivery: unix socket (this module's own encoders) + journald ────
+
+pub const UnixEmitter = unix.UnixEmitter;
+pub const journal = unix.journal;
+
 // ── live clock helper ───────────────────────────────────────────────────────
 
 /// Current wall-clock instant as a `Timestamp` (UTC, `Z`). Uses the posix
@@ -106,6 +116,7 @@ test {
     _ = @import("message.zig");
     _ = @import("bsd.zig");
     _ = @import("transport.zig");
+    _ = @import("unix.zig");
 }
 
 test "meta is well-formed" {

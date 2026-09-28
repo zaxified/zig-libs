@@ -18,6 +18,38 @@ RFC 6587 octet-counted framing (`"<len> <msg>"`). Reentrant — no shared state.
 RFC 3339-ms timestamps, SD escaping, field-length validation, octet framing) is referenced from
 `joelreymont/pz` (MIT) — design only, no code copied — see NOTICE.
 
+**Local delivery** (requested by ttydesk, 2026-09-28; `src/unix.zig`, Linux only — raw AF_UNIX
+syscalls, since `std.Io.net.UnixAddress` has no datagram-socket API, only `SOCK_STREAM`
+`connect`/`listen`). Two emitters, neither binding or listening — both dial a well-known path, same
+as every reference client named below:
+- `UnixEmitter` sends this module's own RFC 5424/RFC 3164 output as one datagram to a unix
+  `SOCK_DGRAM` socket, default `"/dev/log"` — the path glibc's `syslog()`, Python's
+  `SysLogHandler("/dev/log")` and Go's `log/syslog` all dial by default.
+- `journal` speaks the systemd **Journal Native Protocol**
+  (https://systemd.io/JOURNAL_NATIVE_PROTOCOL/) over `"/run/systemd/journal/socket"`: one datagram
+  of `KEY=value\n` fields, or — required whenever a value contains a newline — the binary form
+  (`KEY\n` + 8-byte little-endian length + value + `\n`). `journal.validFieldName` enforces
+  `sd_journal_send`'s rule (uppercase `A`-`Z`, `0`-`9`, `_`; not starting with a digit or `_` — a
+  leading `_` is reserved for the fields journald itself attaches, e.g. `_PID`; ≤64 bytes),
+  checked for every field before anything is sent, so an invalid name can neither corrupt the wire
+  framing (a name containing `=` or `\n` would misparse exactly like an unescaped RFC 5424
+  structured-data value would) nor go out partially — the whole `send` call is refused instead.
+  `journal.Emitter.send` is genuinely zero-copy for field values: it builds a `sendmsg`
+  scatter-gather list pointing straight at the caller's own slices, so there is no internal buffer
+  size to silently cap or truncate a value against — only the kernel's own per-datagram limit
+  applies (`EMSGSIZE`, surfaced as `error.MessageTooLarge`). journald's own fallback past that
+  limit — passing the payload through a `memfd` via `SCM_RIGHTS` instead of the datagram body — is
+  **not implemented** (explicitly optional in the request); a caller that needs it must reduce or
+  chunk the payload itself, never silently truncated here. Both emitters use an UNCONNECTED
+  datagram socket + `sendto`/`sendmsg` addressed fresh on every call rather than `connect`-once:
+  a unix-domain `connect()` binds to the specific socket object live at that path *at connect
+  time*, so a sender that connected once and then kept using `write()` would get `ECONNREFUSED`
+  forever after journald/rsyslogd restarts and re-binds the same path -- addressing fresh every
+  send avoids that failure mode entirely, at the cost of one extra syscall argument. Model: glibc's
+  `syslog()` local-delivery path for
+  `UnixEmitter` (design only — no source read; this repo never links libc), the protocol document
+  above plus `sd_journal_send`'s field-name rule for `journal`.
+
 ## Threat model / out of scope
 Not a security boundary; this is a formatter/emitter, not a parser of untrusted input (it only ever
 formats caller-supplied structured data, escaping the three characters that would otherwise break the
@@ -40,6 +72,15 @@ timezone-offset timestamps, field truncation at the length limits, and the RFC 6
 prefix. The real UDP/TCP send paths are compile-checked only and gated behind runtime construction /
 `error.SkipZigTest`. Run: `zig build
 test-syslog` (Debug and `-Doptimize=ReleaseFast`).
+
+**Local delivery (`unix.zig`) is exercised over a real kernel socket, not compile-checked only** —
+unlike UDP/TCP, a unix datagram socket needs no privileged listener or network access to test for
+real: each test binds its own throwaway `AF_UNIX SOCK_DGRAM` socket under `.zig-cache/tmp/` (never
+`/tmp`) and asserts the exact bytes a real receiver would see, for both `UnixEmitter` (RFC 5424 and
+RFC 3164) and `journal.Emitter` (text-form fields, the binary form triggered by an embedded
+newline, the `sendMessage` convenience, field-name validation refusing the whole send before
+anything goes out, `TooManyFields`, and `MessageTooLarge` from a deliberately shrunk `SO_SNDBUF`
+forcing a real kernel `EMSGSIZE` regardless of the host's actual defaults).
 
 ### External-anchor investigation: a real rsyslogd (2026-08-01, done)
 
@@ -99,14 +140,6 @@ as `icmp`/`genetlink`/`nftables`/`traceroute`).
 
 ## Backlog / deferred
 
-- **Local delivery** (from ttydesk, 2026-09-27). Only UDP/TCP today. Wanted: `UnixEmitter.open(
-  "/dev/log")` (unix datagram) with the existing 3164/5424 encoders, and the journald native
-  protocol -- `journal.send(fields)` over `/run/systemd/journal/socket`, `KEY=value` fields, the
-  binary form for values with newlines, sd_journal's field-name and size rules -- so structured
-  fields stay queryable (`journalctl TTYDESK_ACTION=…`). ttydesk sends journald datagrams itself
-  (`src/audit.zig`, marked `zig-libs request: syslog — local delivery`). Precedent: Go
-  `log/syslog` dials the local socket by default, Python `SysLogHandler("/dev/log")`,
-  `systemd.journal.send`, go-systemd `journal`.
 Parser/receiver side (RFC 5424 and RFC 3164 message parsing); TLS transport (RFC 5425, BYO-TLS seam);
 reliable delivery (reconnect/retry/backpressure for TCP); full RFC 3164 parsing tolerance (encoder
 only is provided today). (README "Not implemented (DEFER)".)
@@ -122,16 +155,18 @@ only is provided today). (README "Not implemented (DEFER)".)
 This module formats and sends syslog messages; it never parses one — the
 module doc, the `Threat model / out of scope` section above, and `meta.role
 = .client` all already say so ("no receiver — there is no parser and no
-listener in its public surface"). Its one byte-accepting public function
+listener in its public surface"). Its byte-accepting public functions
 (`writeOctetCounted(w, payload: []const u8)`, the RFC 6587 `"<len> <msg>"`
-TCP framer) never interprets structure in `payload` — it length-prefixes
-whatever bytes it is handed, and every call site in this module's own tests
-and the README example passes it *this module's own* `bufPrint`/`format`
-output, not bytes read off a socket or out of a file. `buildDatagram` and
-`bufPrint` take a caller-built `Message`/output buffer, not raw wire bytes,
-so they do not even match the gate's byte-accepting-parameter scan. Overturn
-this exemption the moment a `syslog` message PARSER (the "Backlog / deferred"
-item above) lands.
+TCP framer; `UnixEmitter.sendRaw(bytes)`; `journal.Emitter.send(fields)`,
+whose `Field.value` is caller bytes) never interpret structure in what they
+are handed — they length-prefix, or write verbatim (with a name check on the
+field NAME, never the value), whatever bytes they are given, and every call
+site in this module's own tests and the README example passes them *this
+module's own* `bufPrint`/`format` output or a literal test string, not bytes
+read off a socket or out of a file. `buildDatagram` and `bufPrint` take a
+caller-built `Message`/output buffer, not raw wire bytes, so they do not even
+match the gate's byte-accepting-parameter scan. Overturn this exemption the
+moment a `syslog` message PARSER (the "Backlog / deferred" item above) lands.
 
 ## Anchoring
 

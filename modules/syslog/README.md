@@ -1,20 +1,27 @@
 # syslog
 
 **RFC 5424** syslog message formatter + emitter, with a legacy **RFC 3164**
-(BSD) encoder and **RFC 6587** octet-counting TCP framing.
+(BSD) encoder, **RFC 6587** octet-counting TCP framing, and **local
+delivery** (a unix-socket emitter and the systemd journal's native protocol).
 
 - No spec-correct, I/O-agnostic RFC 5424 formatter in the
   Zig ecosystem (the one correct reference is in another project; the popular
   `logly.zig` formatter emits a non-conformant timestamp).
 - **Model after:** RFC 5424 (message + wire format), RFC 6587 (transport
-  framing), RFC 3164 (legacy BSD format). Design mirrors the `Message` /
-  emitter split of `joelreymont/pz` `src/core/syslog.zig` (MIT).
-- **Platform:** any (pure codec core; the optional `UdpEmitter`/`TcpEmitter`
-  use `std.Io.net`, `nowTimestamp` uses posix `clock_gettime`).
+  framing), RFC 3164 (legacy BSD format), the systemd Journal Native Protocol
+  (https://systemd.io/JOURNAL_NATIVE_PROTOCOL/) for `journal`. Design mirrors
+  the `Message` / emitter split of `joelreymont/pz` `src/core/syslog.zig`
+  (MIT).
+- **Platform:** any for the codec + `UdpEmitter`/`TcpEmitter` (`std.Io.net`,
+  `nowTimestamp` uses posix `clock_gettime`); **Linux only** for local
+  delivery (`UnixEmitter`/`journal`, raw `AF_UNIX` syscalls — `std.Io.net` has
+  no unix-*datagram*-socket API).
   **Role:** client (the canonical value is `meta.role` in src/root.zig, which
   explains why this is deliberately not `both`: `both` reads as "also a syslog
   server" and would sit on the wrong side of a client/server survey). **Concurrency:** reentrant (no shared
-  state). **Allocation:** none — fixed buffers throughout.
+  state). **Allocation:** none — fixed buffers throughout (`journal.Emitter.send`
+  references a caller's field values zero-copy via `sendmsg` scatter-gather,
+  rather than copying them into a buffer at all).
 
 Provenance: clean-room from RFC 5424 (syslog protocol), RFC 6587 (TCP octet
 framing) and RFC 3164 (BSD legacy). The `Message`/`Sender` *design* (a pure
@@ -74,6 +81,30 @@ try udp.send(&msg);
 var tcp = try syslog.TcpEmitter.connect(io, peer);
 defer tcp.close();
 try tcp.send(&msg);
+
+// ── local delivery (Linux only; no `io` needed -- raw AF_UNIX syscalls) ──
+// unix socket, this module's own RFC 5424/3164 encoders, default "/dev/log":
+var ulog = try syslog.UnixEmitter.openDefault();
+defer ulog.close();
+try ulog.send(&msg); // or .sendBsd(&bmsg)
+
+// systemd journal native protocol, default
+// "/run/systemd/journal/socket" -- structured fields stay queryable
+// (`journalctl TTYDESK_ACTION=unit.restart`) instead of being flattened
+// into free text.
+var jrnl = try syslog.journal.Emitter.openDefault();
+defer jrnl.close();
+try jrnl.sendMessage(.{
+    .message = "unit restarted",
+    .priority = .notice, // journal PRIORITY=5
+    .identifier = "ttydesk", // SYSLOG_IDENTIFIER=ttydesk
+    .fields = &.{.{ .name = "TTYDESK_ACTION", .value = "unit.restart" }},
+});
+// or build the field list yourself for full control:
+try jrnl.send(&.{
+    .{ .name = "MESSAGE", .value = "multi-line\nvalues switch to the binary form automatically" },
+    .{ .name = "PRIORITY", .value = "6" },
+});
 ```
 
 ## Wire format (RFC 5424 §6)
@@ -91,6 +122,28 @@ try tcp.send(&msg);
   ≤ 48, PROCID ≤ 128, MSGID ≤ 32) and non-printable bytes map to `-`.
 - Structured-data param values escape `"` → `\"`, `\` → `\\`, `]` → `\]`.
 
+## Local delivery
+
+- **`UnixEmitter`** — `open(path)` / `openDefault()` (`"/dev/log"`) / `close()` / `send(msg)` (RFC
+  5424) / `sendBsd(msg)` (RFC 3164) / `sendRaw(bytes)` (already-formatted bytes, no internal size
+  cap). One datagram per call to a unix `SOCK_DGRAM` socket. `error.NoSpaceLeft` if `send`/`sendBsd`'s
+  internal formatting buffer is too small (use `sendRaw` with your own buffer instead);
+  `error.MessageTooLarge` if the kernel itself rejects the datagram as too large (`EMSGSIZE`).
+- **`journal`** — the systemd Journal Native Protocol. `Emitter.open(path)` /
+  `openDefault()` (`"/run/systemd/journal/socket"`) / `close()` / `send(fields)` /
+  `sendMessage(.{ .message, .priority, .identifier, .fields })` (the `MESSAGE`/`PRIORITY`/
+  `SYSLOG_IDENTIFIER` convenience). `Field = struct { name, value }`; a value containing a newline
+  is sent in the protocol's binary form automatically, otherwise as plain `NAME=value\n`.
+  `validFieldName(name)` is `sd_journal_send`'s own rule (uppercase `A`-`Z`, `0`-`9`, `_`; not
+  starting with a digit or `_`; ≤ 64 bytes) — `send` checks every field name before writing
+  anything, so one bad name refuses the whole call rather than half-sending it.
+  `error.TooManyFields` past `journal.max_fields` (64); `error.MessageTooLarge` on `EMSGSIZE`
+  (journald's own `memfd`/`SCM_RIGHTS` fallback past that limit is not implemented here).
+
+Both are **Linux only** — raw `AF_UNIX` syscalls, since `std.Io.net` has no unix-*datagram*-socket
+API — and neither binds or listens; they dial the well-known path like every other local syslog/
+journal client.
+
 ## Tests
 
 Offline golden-byte tests (no live socket): a full message with structured
@@ -98,7 +151,9 @@ data, a minimal all-NILVALUE message, SD escaping of `"`/`\`/`]`, PRI for
 several facility/severity pairs, timezone-offset timestamps, field truncation
 at the length limits, and the RFC 6587 octet-count prefix. The real UDP/TCP
 send paths are compile-checked only and gated behind runtime construction /
-`error.SkipZigTest`.
+`error.SkipZigTest`. Local delivery (`UnixEmitter`/`journal`) is tested for
+real instead, over throwaway `AF_UNIX` sockets bound in `.zig-cache/tmp/` —
+no daemon needed, see SPEC.md.
 
 ```
 zig build test-syslog                          # Debug

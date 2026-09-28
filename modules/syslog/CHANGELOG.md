@@ -5,6 +5,24 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **New local delivery (Additive, requested by ttydesk)**: `UnixEmitter`
+  (`src/unix.zig`) sends this module's existing RFC 5424/RFC 3164 encoders as one datagram to a
+  unix `SOCK_DGRAM` socket, default `"/dev/log"` (`open`/`openDefault`, `send`/`sendBsd`, plus
+  `sendRaw` for a caller with its own larger pre-formatted buffer — `error.NoSpaceLeft` rather
+  than truncation if the convenience path's internal buffer is too small). `journal` speaks
+  systemd's native protocol (`Emitter.open`/`send`/`sendMessage`) over
+  `"/run/systemd/journal/socket"`: `KEY=value\n` text fields, the binary form
+  (`KEY\n` + 8-byte little-endian length + value + `\n`) automatically for any value containing a
+  newline, and `validFieldName` enforcing `sd_journal_send`'s field-name rule (uppercase, digits,
+  `_`; not starting with a digit or `_`; ≤64 bytes) — an invalid name refuses the WHOLE send before
+  anything is written, never a partial datagram. Field values are referenced zero-copy via a
+  `sendmsg` scatter-gather list, so there is no internal size cap on a value; a datagram the kernel
+  itself rejects as too large (`EMSGSIZE`) is `error.MessageTooLarge` — journald's own memfd/
+  `SCM_RIGHTS` fallback past that limit is not implemented (optional per the request). Linux only
+  (raw `AF_UNIX` syscalls — `std.Io.net.UnixAddress` has no datagram-socket API). Lets ttydesk
+  delete its own workaround (`src/audit.zig`'s `toJournal`/`field`/`sendDatagram`, marked
+  `zig-libs request: syslog — local delivery`) once it switches over. Tested over a real kernel
+  unix socket (no daemon needed — see SPEC.md's Verification section), not compile-checked only.
 - **2026-09-10** — A1 audit fix (P1: 0 consumers in the repo). `bsd.Message.format`
   wrote HOSTNAME/TAG/PID verbatim, so an untrusted field containing `\n` could
   forge a second RFC 3164 record for a receiver that frames on newline (RFC 3164
