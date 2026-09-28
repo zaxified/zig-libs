@@ -187,13 +187,15 @@ const comb_control_min_disagree: usize = comb_control_iters * 4 / 5;
 test "comb positive control: a corrupted table DISAGREES with std (harness has teeth)" {
     if (!gate.fast_scalarmul_implemented) return error.SkipZigTest; // core not filled
 
-    // Drop a whole window (window 10 → all teeth = identity), i.e. digit 10
-    // contributes nothing no matter its value. Any scalar with a nonzero
-    // digit-10 (~15/16 of them) then yields the wrong point — so this must
-    // diverge from std on the large majority of inputs. Proves the comb
-    // differential would catch a dropped-digit / wrong-table comb.
-    var bad = group.comb_table;
-    for (&bad[10]) |*e| e.* = P256.identityElement;
+    // Corrupt a whole window (window 10 → every tooth = G itself, a valid
+    // affine point in the wrong place), i.e. digit 10 contributes ±G instead
+    // of ±m·2^60·G no matter its value. Any scalar with a nonzero digit-10
+    // (~63/64 of them) then yields the wrong point — so this must diverge
+    // from std on the large majority of inputs. Proves the comb differential
+    // would catch a wrong-table comb. (The table is affine now, so "identity"
+    // is not an expressible corruption; a misplaced point is the realistic one.)
+    var bad = group.base_table;
+    for (&bad[10]) |*e| e.* = group.base_table[0][0];
 
     var prng = std.Random.DefaultPrng.init(0xBADC_0FFE_9256);
     const rand = prng.random();

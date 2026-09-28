@@ -62,7 +62,7 @@ pub const P256 = struct {
     /// The scalar field (mod the group order `n`), exposed as `P256.scalar` to
     /// mirror `std.crypto.ecc.P256.scalar` (std's constant-time scalar field
     /// verbatim; see `scalar.zig`'s scope note).
-    pub const scalar = scalarmod.scalar;
+    pub const scalar = scalarmod;
 
     /// The standard base point `G`.
     pub const basePoint = P256{
@@ -254,6 +254,54 @@ pub const P256 = struct {
         return .{ .x = X3, .y = Y3, .z = Z3 };
     }
 
+    /// Mixed addition `P + Q` with `Q` AFFINE — RCB Algorithm 5 (`a = −3`),
+    /// complete for every projective `P` (the identity included) and every
+    /// affine `Q` (an affine point is never the identity). It is Algorithm 4
+    /// with `Z2 = 1` folded in: `t2 = Z1`, `(Y1+Z1)(Y2+1) − t1 − Z1 = Y1 + Y2·Z1`
+    /// and `(X1+Z1)(X2+1) − t0 − Z1 = X1 + X2·Z1`, so 11M + 2·m_b instead of
+    /// 12M + 2·m_b — and, more to the point, it lets the fixed-base table be
+    /// stored affine. Fixed schedule, no branch: constant-time, used by the
+    /// SECRET comb. Pinned to `add` by the differential below.
+    pub fn addMixed(p: P256, q: AffineCoordinates) P256 {
+        var t0 = p.x.mul(q.x);
+        var t1 = p.y.mul(q.y);
+        var t3 = q.x.add(q.y);
+        var t4 = p.x.add(p.y);
+        t3 = t3.mul(t4);
+        t4 = t0.add(t1);
+        t3 = t3.sub(t4);
+        t4 = q.y.mul(p.z);
+        t4 = t4.add(p.y);
+        var Y3 = q.x.mul(p.z);
+        Y3 = Y3.add(p.x);
+        var Z3 = B.mul(p.z);
+        var X3 = Y3.sub(Z3);
+        Z3 = X3.dbl();
+        X3 = X3.add(Z3);
+        Z3 = t1.sub(X3);
+        X3 = t1.add(X3);
+        Y3 = B.mul(Y3);
+        t1 = p.z.dbl();
+        var t2 = t1.add(p.z);
+        Y3 = Y3.sub(t2);
+        Y3 = Y3.sub(t0);
+        t1 = Y3.dbl();
+        Y3 = t1.add(Y3);
+        t1 = t0.dbl();
+        t0 = t1.add(t0);
+        t0 = t0.sub(t2);
+        t1 = t4.mul(Y3);
+        t2 = t0.mul(Y3);
+        Y3 = X3.mul(Z3);
+        Y3 = Y3.add(t2);
+        X3 = t3.mul(X3);
+        X3 = X3.sub(t1);
+        Z3 = t4.mul(Z3);
+        t1 = t3.mul(t0);
+        Z3 = Z3.add(t1);
+        return .{ .x = X3, .y = Y3, .z = Z3 };
+    }
+
     /// Subtract points.
     pub fn sub(p: P256, q: P256) P256 {
         return p.add(q.neg());
@@ -364,6 +412,9 @@ pub const P256 = struct {
     /// per-digit gather is a `blackBox`-guarded masked linear scan over ALL
     /// eight entries at fixed offsets (never secret-indexed — the k256/powMont
     /// lesson), and the digit sign is applied by a masked point negation.
+    /// Stays on the complete projective formulas (full `add`, projective
+    /// runtime table): its table is built per call from a secret-derived
+    /// point, so there is no comptime affine table to gather from.
     /// Pinned bit-for-bit to `mulDoubleAddCt` by the gated differential.
     pub fn mulCtWindowed(p: P256, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         const k = scalarValue(s_, endian);
@@ -445,16 +496,16 @@ pub const P256 = struct {
     }
 
     /// GATED Fable core #2b — the fixed-base comb for `k·G` (the fast signing
-    /// path). The comptime-generated comb table (`comb_table`: magnitudes
-    /// `{1..2^{w−1}}·2^{w·i}·G`, stored projective) makes the online phase
-    /// `comb_t` point additions with NO doublings — each window's table already
-    /// carries the `2^{w·i}` factor. The signed-digit recoding is branch-free
-    /// and the table gather is the same `blackBox`-guarded masked linear scan
-    /// as `mulCtWindowed` (see the comb section below for the CT contract).
-    /// Pinned to `basePoint.mulDoubleAddCt` + std by the gated differential.
-    /// `error.IdentityElement` iff `s ≡ 0 (mod n)`.
+    /// path). The comptime-generated AFFINE table (`base_table`: magnitudes
+    /// `{1..2^{w−1}}·2^{w·i}·G`, `w = 6`, 43 windows) makes the online phase
+    /// `fb_t` mixed point additions with NO doublings — each window's table
+    /// already carries the `2^{w·i}` factor. The signed-digit recoding is
+    /// branch-free and the table gather is the same `blackBox`-guarded masked
+    /// linear scan as `mulCtWindowed` (see the table section below for the CT
+    /// contract). Pinned to `basePoint.mulDoubleAddCt` + std by the gated
+    /// differential. `error.IdentityElement` iff `s ≡ 0 (mod n)`.
     pub fn combMulBaseFast(s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
-        return combMulBaseFastWithTable(&comb_table, s_, endian);
+        return combMulBaseFastWithTable(&base_table, s_, endian);
     }
 
     /// `combMulBaseFast` parameterised on the table, so the positive-control
@@ -462,26 +513,25 @@ pub const P256 = struct {
     /// prove the differential has teeth. The table index `[i][j]` is driven
     /// only by the PUBLIC loop counters — never by a secret — so this stays
     /// constant-time for any table. `pub` for that harness.
-    pub fn combMulBaseFastWithTable(tab: *const CombTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
+    pub fn combMulBaseFastWithTable(tab: *const BaseTable, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         const k = scalarValue(s_, endian);
-        const half: u64 = 1 << (comb_w - 1); // 2^(w−1)
-        const twow: u64 = 1 << comb_w; // 2^w
-        const wmask: u64 = twow - 1;
 
         var acc = P256.identityElement;
         // Signed-digit (Booth-style) recoding with a running carry, folded into
         // the same loop that consumes the digits — fully branchless in `k`.
         // Digit d_i ∈ [−2^(w−1), 2^(w−1)−1], so Σ d_i·2^(w·i) = k exactly and
-        // the magnitude |d_i| ∈ [0, 2^(w−1)] indexes the half-size table.
+        // the magnitude |d_i| ∈ [0, 2^(w−1)] indexes the half-size table. The
+        // top window holds only 256 − 42·6 = 4 scalar bits, so `x ≤ 16 < 32`
+        // there and no carry escapes (asserted at comptime below the table).
         var carry: u64 = 0;
         var i: usize = 0;
-        while (i < comb_t) : (i += 1) {
-            const shift: usize = i * comb_w; // PUBLIC (loop-derived) shift
-            const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & wmask) else 0;
+        while (i < fb_t) : (i += 1) {
+            const shift: usize = i * fb_w; // PUBLIC (loop-derived) shift
+            const wv: u64 = if (shift < 256) (@as(u64, @truncate(k >> @intCast(shift))) & fb_wmask) else 0;
             const x = wv + carry; // 0 .. 2^w
             // is_neg ⟺ x ≥ 2^(w−1): then d = x − 2^w (< 0) and carry propagates.
             // A `>=` compare lowers to setcc (data-independent), not a branch.
-            const is_neg: u64 = @intFromBool(x >= half);
+            const is_neg: u64 = @intFromBool(x >= fb_half);
             carry = is_neg;
             // The select mask is laundered through `blackBox`: without it LLVM
             // recovers `is_neg = (x >= half)` and lowers the select to a CMOV
@@ -489,7 +539,7 @@ pub const P256 = struct {
             // barrier was added.
             const negmask: u64 = blackBox(0 -% is_neg);
             // |d| = is_neg ? (2^w − x) : x  — masked, no branch.
-            const m = ((twow - x) & negmask) | (x & ~negmask); // 0 .. 2^(w−1)
+            const m = ((fb_twow - x) & negmask) | (x & ~negmask); // 0 .. 2^(w−1)
 
             // CONSTANT-TIME gather of the table entry for magnitude `m`: a
             // masked linear scan touching EVERY entry of window `i`. The
@@ -497,15 +547,15 @@ pub const P256 = struct {
             // cannot recover "pick the entry where j+1 == m" and lower it to a
             // secret-indexed jump table (`jmp *tbl(,%reg,8)`) — the exact
             // powMont-gather leak class (montint b199192). `m == 0` (digit 0)
-            // matches no entry, leaving `g` the neutral element (adds nothing).
-            var g = P256.identityElement;
+            // matches no entry and leaves `g = (0, 0)`, which is NOT a curve
+            // point — so that case is undone by the masked blend at the end.
+            var g = AffineCoordinates{ .x = Fe.zero, .y = Fe.zero };
             var j: usize = 0;
-            while (j < comb_teeth) : (j += 1) {
+            while (j < fb_teeth) : (j += 1) {
                 const match: u64 = @intFromBool(@as(u64, j + 1) == m);
                 const mask = blackBox(0 -% match);
                 blendLimbs(&g.x, tab[i][j].x, mask);
                 blendLimbs(&g.y, tab[i][j].y, mask);
-                blendLimbs(&g.z, tab[i][j].z, mask);
             }
             // Signed digit ⇒ conditional point negation as a masked blend of
             // the unconditionally-computed −y, with the sign mask laundered
@@ -516,71 +566,256 @@ pub const P256 = struct {
             const smask = blackBox(0 -% is_neg);
             blendLimbs(&g.y, yneg, smask);
 
-            acc = acc.add(g);
+            // Always add (fixed schedule), keep the sum iff the digit was
+            // nonzero. The mixed complete formula handles `acc = identity`.
+            const sum = acc.addMixed(g);
+            const nonzero: u64 = @intFromBool(m != 0);
+            const keep = blackBox(0 -% nonzero);
+            blendLimbs(&acc.x, sum.x, keep);
+            blendLimbs(&acc.y, sum.y, keep);
+            blendLimbs(&acc.z, sum.z, keep);
         }
         try acc.rejectIdentity();
         return acc;
     }
 
-    /// VARIABLE-TIME scalar multiply for a PUBLIC scalar (verification) via a
-    /// width-`wnaf_w` NAF: ~`l/(w+1)` additions instead of ~`l/2`. All inputs
-    /// public, so plain branches are fine. `error.IdentityElement` if the input
-    /// or result is the neutral element. Matches `mulDoubleAddCt`/std exactly.
+    /// VARIABLE-TIME scalar multiply for a PUBLIC scalar (verification). All
+    /// inputs public, so plain branches are fine. `error.IdentityElement` if
+    /// the input or result is the neutral element. Matches `mulDoubleAddCt`/std
+    /// exactly (same point; the projective representation differs).
+    ///
+    /// Two paths, both in Jacobian coordinates (`Jac` below):
+    ///   * `p` IS the base point (the structural `isBasePointRepr` test, the
+    ///     same public-point test `mul` uses) → the fixed-base table: one
+    ///     mixed addition per nonzero signed digit, NO doublings. This is the
+    ///     `u1·G` of every ECDSA verify, including std's generic `Ecdsa`
+    ///     verifier over this curve, which calls exactly `basePoint.mulPublic`.
+    ///   * otherwise → width-`wnaf_w` NAF with a batch-normalised affine
+    ///     odd-multiple table: 256 doublings + ~`l/(w+1)` mixed additions.
     pub fn mulPublic(p: P256, s_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         try p.rejectIdentity();
         const s = scalarValue(s_, endian);
-        var naf: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
-        const l = computeWnaf(s, &naf);
-        const tab = precompOdd(p);
-
-        var q = P256.identityElement;
-        var i: usize = l;
-        while (i > 0) {
-            i -= 1;
-            q = q.dbl();
-            if (naf[i] != 0) q = q.add(wnafPoint(&tab, naf[i]));
-        }
-        try q.rejectIdentity();
-        return q;
+        const q = if (p.isBasePointRepr()) mulBasePublicJac(s) else mulPublicJac(p, s);
+        const r = q.toProjective();
+        try r.rejectIdentity();
+        return r;
     }
 
     /// VARIABLE-TIME double-base multiply `s1·p1 + s2·p2` for PUBLIC scalars —
-    /// the verifier's `u1·G + u2·Q` workhorse (JWT ES256 verify hot path). Uses
-    /// **interleaved wNAF (Straus–Shamir)**: a single shared doubling chain, one
-    /// precomputed odd-multiple table per base, and ~`l/(w+1)` additions per
-    /// scalar. Vartime (all inputs public); plain branches. `error.IdentityElement`
-    /// if the result is neutral. Byte-exact vs the plain ladder + std.
+    /// the verifier's `u1·G + u2·Q` workhorse (JWT ES256 verify hot path).
+    /// Vartime (all inputs public); plain branches. `error.IdentityElement`
+    /// if an input or the result is neutral. Byte-exact vs the plain ladder +
+    /// std at the point level.
+    ///
+    /// When one base is `G` its share comes from the fixed-base table (no
+    /// doublings at all) and is added to the other base's wNAF result — that
+    /// beats sharing one doubling chain, because the fixed-base side then
+    /// costs nothing but its ~43 mixed additions. Two arbitrary bases take
+    /// the interleaved wNAF (Straus–Shamir): one shared doubling chain, one
+    /// affine odd-multiple table per base.
     pub fn mulDoubleBasePublic(p1: P256, s1_: [32]u8, p2: P256, s2_: [32]u8, endian: std.builtin.Endian) IdentityElementError!P256 {
         try p1.rejectIdentity();
         try p2.rejectIdentity();
         const s1 = scalarValue(s1_, endian);
         const s2 = scalarValue(s2_, endian);
+        const q = if (p1.isBasePointRepr())
+            mulBasePublicJac(s1).add(mulPublicJac(p2, s2))
+        else if (p2.isBasePointRepr())
+            mulBasePublicJac(s2).add(mulPublicJac(p1, s1))
+        else
+            mulDoubleBaseJac(p1, s1, p2, s2);
+        const r = q.toProjective();
+        try r.rejectIdentity();
+        return r;
+    }
 
+    /// `s·G` from the fixed-base affine table, vartime: skips zero digits.
+    fn mulBasePublicJac(s: u256) Jac {
+        var acc = Jac.identity;
+        var carry: u64 = 0;
+        var i: usize = 0;
+        while (i < fb_t) : (i += 1) {
+            const shift: usize = i * fb_w;
+            const wv: u64 = if (shift < 256) (@as(u64, @truncate(s >> @intCast(shift))) & fb_wmask) else 0;
+            const x = wv + carry;
+            const is_neg = x >= fb_half;
+            carry = @intFromBool(is_neg);
+            const m = if (is_neg) fb_twow - x else x;
+            if (m == 0) continue;
+            var q = base_table[i][m - 1];
+            if (is_neg) q.y = q.y.neg();
+            acc = acc.addMixed(q);
+        }
+        return acc;
+    }
+
+    /// `s·p` by width-`wnaf_w` NAF over a batch-normalised affine table of the
+    /// odd multiples. `p` must not be the identity (caller-checked).
+    fn mulPublicJac(p: P256, s: u256) Jac {
+        var naf: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
+        const l = computeWnaf(s, &naf);
+        const tab = oddMultiplesAffine(p);
+        var q = Jac.identity;
+        var i: usize = l;
+        while (i > 0) {
+            i -= 1;
+            q = q.dbl();
+            if (naf[i] != 0) q = q.addMixed(wnafPoint(&tab, naf[i]));
+        }
+        return q;
+    }
+
+    /// Interleaved wNAF (Straus–Shamir) for two arbitrary non-identity bases.
+    fn mulDoubleBaseJac(p1: P256, s1: u256, p2: P256, s2: u256) Jac {
         var naf1: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
         var naf2: [wnaf_len]i8 = [_]i8{0} ** wnaf_len;
         const l1 = computeWnaf(s1, &naf1);
         const l2 = computeWnaf(s2, &naf2);
         const l = @max(l1, l2);
-        const t1 = precompOdd(p1);
-        const t2 = precompOdd(p2);
-
-        var q = P256.identityElement;
+        const t1 = oddMultiplesAffine(p1);
+        const t2 = oddMultiplesAffine(p2);
+        var q = Jac.identity;
         var i: usize = l;
         while (i > 0) {
             i -= 1;
             q = q.dbl();
-            if (naf1[i] != 0) q = q.add(wnafPoint(&t1, naf1[i]));
-            if (naf2[i] != 0) q = q.add(wnafPoint(&t2, naf2[i]));
+            if (naf1[i] != 0) q = q.addMixed(wnafPoint(&t1, naf1[i]));
+            if (naf2[i] != 0) q = q.addMixed(wnafPoint(&t2, naf2[i]));
         }
-        try q.rejectIdentity();
         return q;
     }
 };
 
-// ── vartime wNAF (Straus–Shamir) helpers for the PUBLIC verify path ──────────
+// ── Jacobian coordinates for the VARIABLE-TIME public paths ──────────────────
 //
-// P-256 has no endomorphism, so the verifier's `u1·G + u2·Q` is accelerated with
-// a plain interleaved wNAF: each public scalar is recoded into signed digits
+// Affine `(X/Z², Y/Z³)`, identity ⟺ `Z = 0`. Cheaper than the complete
+// projective formulas the rest of the file uses (doubling 3M+5S vs 8M+3S+2m_b;
+// mixed addition 7M+4S vs 11M+2m_b — measured 2026-09-28: verify's 256
+// doublings went from ~540 ns to ~340 ns each) but NOT exception-free:
+// `add`/`addMixed` branch on the identity and the `P = ±Q` cases. That is
+// fine here because every input is PUBLIC (verification), and it is exactly
+// why the SECRET paths (`mul`, `combMulBase`) never touch this type — they
+// stay on the complete formulas.
+const Jac = struct {
+    x: field.Fe,
+    y: field.Fe,
+    z: field.Fe,
+
+    const identity = Jac{ .x = field.Fe.one, .y = field.Fe.one, .z = field.Fe.zero };
+
+    fn isIdentity(p: Jac) bool {
+        return p.z.isZero();
+    }
+
+    /// Projective `(X : Y : Z)` → Jacobian with the same `Z`: `(X·Z : Y·Z² : Z)`.
+    fn fromProjective(p: P256) Jac {
+        const z2 = p.z.sq();
+        return .{ .x = p.x.mul(p.z), .y = p.y.mul(z2), .z = p.z };
+    }
+
+    fn fromAffine(a: AffineCoordinates) Jac {
+        return .{ .x = a.x, .y = a.y, .z = field.Fe.one };
+    }
+
+    /// Jacobian → projective: `(X·Z : Y : Z³)`; the identity maps to std's
+    /// `(0 : 1 : 0)`.
+    fn toProjective(p: Jac) P256 {
+        if (p.isIdentity()) return P256.identityElement;
+        const z2 = p.z.sq();
+        return .{ .x = p.x.mul(p.z), .y = p.y, .z = z2.mul(p.z) };
+    }
+
+    /// Doubling, `a = −3` (EFD dbl-2001-b): 3M + 5S. `Z = 0` stays `Z = 0`.
+    fn dbl(p: Jac) Jac {
+        const delta = p.z.sq();
+        const gamma = p.y.sq();
+        const beta = p.x.mul(gamma);
+        var alpha = p.x.sub(delta).mul(p.x.add(delta));
+        alpha = alpha.dbl().add(alpha); // 3·(X − δ)·(X + δ)
+        const beta4 = beta.dbl().dbl();
+        const x3 = alpha.sq().sub(beta4.dbl()); // α² − 8β
+        const z3 = p.y.add(p.z).sq().sub(gamma).sub(delta);
+        const gamma2_8 = gamma.sq().dbl().dbl().dbl(); // 8γ²
+        const y3 = alpha.mul(beta4.sub(x3)).sub(gamma2_8);
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    /// Mixed addition, `Q` affine (EFD madd-2007-bl): 7M + 4S, plus the
+    /// exceptional cases (`P = O`, `P = Q`, `P = −Q`) as vartime branches.
+    fn addMixed(p: Jac, q: AffineCoordinates) Jac {
+        if (p.isIdentity()) return fromAffine(q);
+        const z1z1 = p.z.sq();
+        const uu2 = q.x.mul(z1z1);
+        const s2 = q.y.mul(p.z).mul(z1z1);
+        const h = uu2.sub(p.x);
+        const r = s2.sub(p.y).dbl();
+        if (h.isZero()) {
+            if (r.isZero()) return p.dbl(); // P = Q
+            return identity; // P = −Q
+        }
+        const hh = h.sq();
+        const i = hh.dbl().dbl(); // 4·HH
+        const j = h.mul(i);
+        const v = p.x.mul(i);
+        const x3 = r.sq().sub(j).sub(v.dbl());
+        const y3 = r.mul(v.sub(x3)).sub(p.y.mul(j).dbl());
+        const z3 = p.z.add(h).sq().sub(z1z1).sub(hh);
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+
+    /// General addition (EFD add-2007-bl): 11M + 5S, plus the exceptional
+    /// cases. Used to build the odd-multiple tables and to join the two
+    /// halves of a double-base multiply — a handful of calls per multiply.
+    fn add(p: Jac, q: Jac) Jac {
+        if (p.isIdentity()) return q;
+        if (q.isIdentity()) return p;
+        const z1z1 = p.z.sq();
+        const z2z2 = q.z.sq();
+        const uu1 = p.x.mul(z2z2);
+        const uu2 = q.x.mul(z1z1);
+        const s1 = p.y.mul(q.z).mul(z2z2);
+        const s2 = q.y.mul(p.z).mul(z1z1);
+        const h = uu2.sub(uu1);
+        const r = s2.sub(s1).dbl();
+        if (h.isZero()) {
+            if (r.isZero()) return p.dbl(); // P = Q
+            return identity; // P = −Q
+        }
+        const i = h.dbl().sq(); // (2H)²
+        const j = h.mul(i);
+        const v = uu1.mul(i);
+        const x3 = r.sq().sub(j).sub(v.dbl());
+        const y3 = r.mul(v.sub(x3)).sub(s1.mul(j).dbl());
+        const z3 = p.z.add(q.z).sq().sub(z1z1).sub(z2z2).mul(h);
+        return .{ .x = x3, .y = y3, .z = z3 };
+    }
+};
+
+/// Convert `n` NON-identity Jacobian points to affine with ONE field
+/// inversion (Montgomery's trick): prefix products of the `Z`s, one inverse,
+/// then peel it back. Vartime (public points).
+fn batchToAffine(comptime n: usize, pts: [n]Jac) [n]AffineCoordinates {
+    var prefix: [n]field.Fe = undefined; // prefix[i] = z_0 ⋯ z_i
+    prefix[0] = pts[0].z;
+    var i: usize = 1;
+    while (i < n) : (i += 1) prefix[i] = prefix[i - 1].mul(pts[i].z);
+    var inv = prefix[n - 1].invert(); // (z_0 ⋯ z_{n−1})⁻¹
+    var out: [n]AffineCoordinates = undefined;
+    i = n;
+    while (i > 0) {
+        i -= 1;
+        const zinv = if (i == 0) inv else inv.mul(prefix[i - 1]); // z_i⁻¹
+        if (i > 0) inv = inv.mul(pts[i].z); // → (z_0 ⋯ z_{i−1})⁻¹
+        const zinv2 = zinv.sq();
+        out[i] = .{ .x = pts[i].x.mul(zinv2), .y = pts[i].y.mul(zinv2).mul(zinv) };
+    }
+    return out;
+}
+
+// ── vartime wNAF helpers for the PUBLIC paths ────────────────────────────────
+//
+// P-256 has no endomorphism, so a variable-base public multiply is a plain
+// wNAF: the public scalar is recoded into signed digits
 // d ∈ {0, ±1, ±3, …, ±(2^(w−1)−1)} with ≥ w−1 zeros between nonzeros, so the
 // online phase averages one addition every `w+1` positions (vs every 2 for
 // double-and-add). This path handles only PUBLIC values (public key, signature,
@@ -588,6 +823,8 @@ pub const P256 = struct {
 // SECRET paths (`mul`/`combMulBase`) never touch this code.
 
 /// wNAF window width (bits). w = 5 ⇒ digits {±1,±3,…,±15}, table of 8 points.
+/// Measured against w = 6 for one 256-bit scalar: the 8 extra table points
+/// (full Jacobian adds + normalisation) cost more than the 6 additions saved.
 const wnaf_w: usize = 5;
 /// Odd-multiple table length per base: {1,3,…,2^(w−1)−1}·p ⇒ 2^(w−2) entries.
 const wnaf_tab_len: usize = 1 << (wnaf_w - 2); // 8
@@ -633,84 +870,123 @@ fn computeWnaf(s: u256, out: *[wnaf_len]i8) usize {
     return i;
 }
 
-/// Odd multiples `1·p, 3·p, …, (2·wnaf_tab_len−1)·p` (projective). Vartime.
-fn precompOdd(p: P256) [wnaf_tab_len]P256 {
-    var tab: [wnaf_tab_len]P256 = undefined;
-    tab[0] = p; // 1·p
-    const p2 = p.dbl(); // 2·p
+/// Odd multiples `1·p, 3·p, …, (2·wnaf_tab_len−1)·p`, batch-normalised to
+/// affine. `p` must not be the identity (then no odd multiple is either, the
+/// group order being prime). Vartime.
+fn oddMultiplesAffine(p: P256) [wnaf_tab_len]AffineCoordinates {
+    var jac: [wnaf_tab_len]Jac = undefined;
+    jac[0] = Jac.fromProjective(p);
+    const p2 = jac[0].dbl();
     var i: usize = 1;
-    while (i < wnaf_tab_len) : (i += 1) tab[i] = tab[i - 1].add(p2); // (2i+1)·p
-    return tab;
+    while (i < wnaf_tab_len) : (i += 1) jac[i] = jac[i - 1].add(p2); // (2i+1)·p
+    return batchToAffine(wnaf_tab_len, jac);
 }
 
-/// The curve point for a NONZERO wNAF digit: `tab[(|d|−1)/2]`, negated iff `d<0`.
-inline fn wnafPoint(tab: *const [wnaf_tab_len]P256, digit: i8) P256 {
+/// The affine point for a NONZERO wNAF digit: `tab[(|d|−1)/2]`, negated iff `d<0`.
+inline fn wnafPoint(tab: *const [wnaf_tab_len]AffineCoordinates, digit: i8) AffineCoordinates {
     const mag: usize = @intCast(if (digit < 0) -@as(i32, digit) else digit);
     const pt = tab[(mag - 1) / 2];
     return if (digit < 0) pt.neg() else pt;
 }
 
-// ── fixed-base comb table (CONSTANT-TIME base-point multiply k·G) ────────────
+// ── fixed-base table (CT comb `k·G` AND vartime `u1·G`) ─────────────────────
 //
 // The signing path multiplies the FIXED base point G by a secret scalar twice
-// per signature (the nonce commitment R = k·G and the pubkey P = d·G). A naive
-// constant-time double-and-add pays 256 doublings + 256 conditional adds; the
-// fixed-base **windowed comb** replaces that with a precomputed table so the
-// online phase does NO doublings at all — just `comb_t` point additions, one
-// per signed digit, gathered constant-time from the table (the technique behind
-// OpenSSL nistz256's and libsecp256k1's fixed-base multiplies). P-256 has no
-// endomorphism, so — unlike k256 — the comb is the ONLY structural speedup for
-// `k·G`; there is no GLV split on top.
+// per signature (the nonce commitment R = k·G and the pubkey P = d·G); the
+// verifying path multiplies it by a public one (u1·G). A naive double-and-add
+// pays 256 doublings + 256 conditional adds; a precomputed table of window
+// multiples removes every doubling — the online phase is one addition per
+// window (the technique behind OpenSSL nistz256's and libsecp256k1's
+// fixed-base multiplies). P-256 has no endomorphism, so — unlike k256 — the
+// table is the ONLY structural speedup for `k·G`; there is no GLV split on top.
 //
-// Design (w = 4): the scalar is recoded into `comb_t` signed digits of `w`
+// Design (w = 6): the scalar is recoded into `fb_t = 43` signed digits of `w`
 // bits, d_i ∈ [−2^(w−1), 2^(w−1)−1] (a running-carry Booth recoding, so
-// Σ d_i·2^(w·i) = k exactly, including the raw-scalar range up to 2^256−1 — the
-// extra window absorbs the final carry). Window `i` owns a table of the
-// magnitudes {1,2,…,2^(w−1)}·2^(w·i)·G; the sign of a digit is applied by a
-// masked point negation, which halves the table. Online cost = comb_t adds.
+// Σ d_i·2^(w·i) = k exactly for every raw 256-bit scalar: the top window holds
+// only 4 scalar bits, so its digit is at most 16 and never carries out).
+// Window `i` owns the magnitudes {1,…,2^(w−1)}·2^(w·i)·G; the sign of a digit
+// is applied by a masked point negation, which halves the table. Entries are
+// stored AFFINE (batch-normalised at comptime with one inversion), so the
+// online addition is the mixed form (RCB Algorithm 5 for the CT comb, Jacobian
+// madd for the vartime path) and each entry is 64 B, not 96.
 //
-//   memory: comb_t · comb_teeth projective points
-//         = 65 · 8 · (3 × 32 B) = 48.75 KiB of .rodata (a comptime constant).
+//   memory: fb_t · fb_teeth affine points = 43 · 32 · 64 B = 88 064 B of
+//   .rodata (was 65 · 8 · 96 B = 49 920 B with w = 4 projective). Measured
+//   2026-09-28: CT `k·G` 41 µs → ~27 µs; the table also serves verify's
+//   `u1·G` at ~43 mixed additions and no doublings.
 //
 // The table is generated at COMPTIME (via the portable field path — the
 // `@inComptime()` guard in `field.zig` keeps the runtime asm core out of the
-// comptime interpreter), stored PROJECTIVE so no comptime field inversions are
-// needed (affine conversion would run a Fermat inverse per entry).
+// comptime interpreter), on the complete projective formulas, then converted
+// to affine with ONE comptime inversion (Montgomery's trick).
 
-/// Comb window width in bits. `256 % comb_w == 0` keeps the window layout exact.
+/// Fixed-base window width in bits.
+const fb_w: usize = 6;
+/// Table entries per window: magnitudes 1..2^(w−1).
+const fb_teeth: usize = 1 << (fb_w - 1); // 32
+/// Number of windows covering 256 bits (the last one partial).
+const fb_t: usize = (256 + fb_w - 1) / fb_w; // 43
+const fb_half: u64 = 1 << (fb_w - 1); // 32
+const fb_twow: u64 = 1 << fb_w; // 64
+const fb_wmask: u64 = fb_twow - 1;
+
+comptime {
+    // No carry can leave the top window: its raw value plus the incoming
+    // carry must stay below 2^(w−1). Otherwise `fb_t` needs one more window.
+    std.debug.assert((@as(u64, 1) << @intCast(256 - (fb_t - 1) * fb_w)) <= fb_half);
+}
+
+/// Window width of the CT variable-base core `mulCtWindowed` (its runtime
+/// magnitude table is {1..8}·p, built per call — a wider window would cost
+/// more in table construction than it saves).
 const comb_w: usize = 4;
-/// Table entries per window: magnitudes 1..2^(w−1) (the signed digit folds the
-/// sign out, halving the table). Also the table size of `mulCtWindowed`.
 const comb_teeth: usize = 1 << (comb_w - 1); // 8
-/// Number of windows: 256/w low windows plus one to absorb the recoding carry.
 const comb_t: usize = (256 / comb_w) + 1; // 65
 
-/// The precomputed comb table type: `[window][magnitude−1]` projective points.
-pub const CombTable = [comb_t][comb_teeth]P256;
+/// The precomputed fixed-base table type: `[window][magnitude−1]` affine points.
+pub const BaseTable = [fb_t][fb_teeth]AffineCoordinates;
 
-/// Build the comb table at comptime. `tab[i][j] = (j+1)·2^(w·i)·G`, projective.
-fn buildCombTable() CombTable {
+/// Build the fixed-base table at comptime. `tab[i][j] = (j+1)·2^(w·i)·G`.
+fn buildBaseTable() BaseTable {
     @setEvalBranchQuota(100_000_000);
-    var tab: CombTable = undefined;
+    const n = fb_t * fb_teeth;
+    var proj: [n]P256 = undefined;
     var base = P256.basePoint; // 2^(w·i)·G, starting at G
     var i: usize = 0;
-    while (i < comb_t) : (i += 1) {
-        var acc = base; // 1·base
-        tab[i][0] = acc;
+    while (i < fb_t) : (i += 1) {
+        proj[i * fb_teeth] = base;
         var j: usize = 1;
-        while (j < comb_teeth) : (j += 1) {
-            acc = acc.add(base); // (j+1)·base
-            tab[i][j] = acc;
+        while (j < fb_teeth) : (j += 1) {
+            // (j+1)·base: even multiples as a doubling of the half, odd ones as
+            // one more addition of `base` — fewer comptime field multiplies.
+            proj[i * fb_teeth + j] = if ((j + 1) % 2 == 0)
+                proj[i * fb_teeth + (j + 1) / 2 - 1].dbl()
+            else
+                proj[i * fb_teeth + j - 1].add(base);
         }
-        // base ← 2^w · base for the next window.
         var d: usize = 0;
-        while (d < comb_w) : (d += 1) base = base.dbl();
+        while (d < fb_w) : (d += 1) base = base.dbl();
+    }
+    // Batch-normalise (projective: affine = (X/Z, Y/Z)) with one inversion.
+    var prefix: [n]field.Fe = undefined;
+    prefix[0] = proj[0].z;
+    i = 1;
+    while (i < n) : (i += 1) prefix[i] = prefix[i - 1].mul(proj[i].z);
+    var inv = prefix[n - 1].invert();
+    var tab: BaseTable = undefined;
+    i = n;
+    while (i > 0) {
+        i -= 1;
+        const zinv = if (i == 0) inv else inv.mul(prefix[i - 1]);
+        if (i > 0) inv = inv.mul(proj[i].z);
+        tab[i / fb_teeth][i % fb_teeth] = .{ .x = proj[i].x.mul(zinv), .y = proj[i].y.mul(zinv) };
     }
     return tab;
 }
 
-/// The fixed-base comb table for G (public constant; see `combMulBaseFast`).
-pub const comb_table: CombTable = buildCombTable();
+/// The fixed-base table for G (public constant; see `combMulBaseFast`,
+/// `mulPublic`).
+pub const base_table: BaseTable = buildBaseTable();
 
 /// Optimization barrier (montint `b199192`): launder a value through an empty
 /// inline-asm so LLVM loses all equality/range knowledge about it. Applied to
@@ -801,6 +1077,109 @@ test "wNAF: the top of the scalar range recodes without wrapping" {
         try eqAffine(got, want_std);
         try eqAffine(want_ct, want_std);
     }
+}
+
+test "addMixed (RCB Alg. 5) == add (RCB Alg. 4) with Z2 = 1, incl. O, P = Q, P = −Q" {
+    var prng = std.Random.DefaultPrng.init(0xA11_F1E5_9256);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var s1b: [32]u8 = undefined;
+        var s2b: [32]u8 = undefined;
+        rand.bytes(&s1b);
+        rand.bytes(&s2b);
+        const p = P256.combMulBase(s1b, .big) catch continue;
+        const q = P256.combMulBase(s2b, .big) catch continue;
+        const qa = q.affineCoordinates();
+        const q1 = P256{ .x = qa.x, .y = qa.y, .z = field.Fe.one };
+        // Random P (non-trivial Z) + affine Q.
+        try std.testing.expect(p.addMixed(qa).equivalent(p.add(q1)));
+        // The identity, P = Q, P = −Q — the cases an incomplete formula breaks on.
+        try std.testing.expect(P256.identityElement.addMixed(qa).equivalent(q));
+        try std.testing.expect(q.addMixed(qa).equivalent(q.dbl()));
+        try std.testing.expectError(error.IdentityElement, q.neg().addMixed(qa).rejectIdentity());
+        // Projective result must be exactly Alg. 4's for the same inputs
+        // (the same formula with Z2 = 1 folded in), not just the same point.
+        const a = p.addMixed(qa);
+        const b = p.add(q1);
+        try std.testing.expectEqual(a.x.limbs, b.x.limbs);
+        try std.testing.expectEqual(a.y.limbs, b.y.limbs);
+        try std.testing.expectEqual(a.z.limbs, b.z.limbs);
+    }
+}
+
+test "basePoint.mulPublic takes the fixed-base table and agrees with std + the CT comb" {
+    // The vartime `u1·G` path of every ECDSA verify — std's generic verifier
+    // included — never appeared in the differential above, whose `mulPublic`
+    // base is a random point. Random scalars plus the edges of the recoding:
+    // 1, 2, n−1, n, 2^256−1, 2^256−k (the carry chain at the top window), and
+    // every single-window value.
+    var prng = std.Random.DefaultPrng.init(0xF1_BA5E_9256);
+    const rand = prng.random();
+    const n = scalarmod.field_order;
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var sb: [32]u8 = undefined;
+        rand.bytes(&sb);
+        const got = P256.basePoint.mulPublic(sb, .big) catch continue;
+        try eqAffine(got, try Std.basePoint.mul(sb, .big));
+        try std.testing.expect(got.equivalent(try P256.combMulBase(sb, .big)));
+    }
+    const edges = [_]u256{ 1, 2, 3, 31, 32, 33, 63, 64, 65, n - 1, n, n + 1, (1 << 255), (1 << 256) - 1, (1 << 256) - 17, (1 << 252) - 1, 1 << 252, (1 << 252) + 1 };
+    for (edges) |s| {
+        var sb: [32]u8 = undefined;
+        std.mem.writeInt(u256, &sb, s, .big);
+        // `n·G` is the identity: both sides must refuse it, everything else
+        // must agree.
+        const got = P256.basePoint.mulPublic(sb, .big);
+        if (Std.basePoint.mul(sb, .big)) |want| {
+            try eqAffine(try got, want);
+        } else |_| {
+            try std.testing.expectError(error.IdentityElement, got);
+        }
+    }
+    // Zero → the identity → rejected, like std.
+    try std.testing.expectError(error.IdentityElement, P256.basePoint.mulPublic([_]u8{0} ** 32, .big));
+    try std.testing.expectError(error.IdentityElement, Std.basePoint.mul([_]u8{0} ** 32, .big));
+}
+
+test "mulDoubleBasePublic with G in either slot, and with neither, matches std" {
+    var prng = std.Random.DefaultPrng.init(0xD0B_1E_9256);
+    const rand = prng.random();
+    var i: usize = 0;
+    while (i < 150) : (i += 1) {
+        var s1b: [32]u8 = undefined;
+        var s2b: [32]u8 = undefined;
+        var s3b: [32]u8 = undefined;
+        rand.bytes(&s1b);
+        rand.bytes(&s2b);
+        rand.bytes(&s3b);
+        const q = P256.combMulBase(s3b, .big) catch continue;
+        const sq = Std.basePoint.mul(s3b, .big) catch continue;
+        const g1 = P256.mulDoubleBasePublic(P256.basePoint, s1b, q, s2b, .big) catch continue;
+        try eqAffine(g1, try Std.mulDoubleBasePublic(Std.basePoint, s1b, sq, s2b, .big));
+        const g2 = P256.mulDoubleBasePublic(q, s2b, P256.basePoint, s1b, .big) catch continue;
+        try eqAffine(g2, try Std.mulDoubleBasePublic(sq, s2b, Std.basePoint, s1b, .big));
+        // The Jacobian join's exceptional cases: s1·G = ±s2·Q, i.e. Q = G with
+        // s2 = ±s1 (mod n) — sum 2·s1·G, or the identity (rejected).
+        const g_dup = try P256.mulDoubleBasePublic(P256.basePoint, s1b, P256.basePoint.dbl(), s1b, .big);
+        try eqAffine(g_dup, try Std.mulDoubleBasePublic(Std.basePoint, s1b, Std.basePoint.dbl(), s1b, .big));
+    }
+    // s·G + (n−s)·G = O → error, both sides.
+    const n = scalarmod.field_order;
+    var s: u256 = 0x1234_5678_9abc_def0;
+    var sb: [32]u8 = undefined;
+    var nb: [32]u8 = undefined;
+    std.mem.writeInt(u256, &sb, s, .big);
+    std.mem.writeInt(u256, &nb, n - s, .big);
+    try std.testing.expectError(error.IdentityElement, P256.mulDoubleBasePublic(P256.basePoint, sb, P256.basePoint.dbl().add(P256.basePoint.neg()), nb, .big));
+    // And s·G + s·G (Q given as another representation of G) = 2s·G.
+    s = 7;
+    std.mem.writeInt(u256, &sb, s, .big);
+    const g_other = P256.basePoint.dbl().add(P256.basePoint.neg()); // G, but not `isBasePointRepr`
+    try std.testing.expect(!g_other.isBasePointRepr());
+    const got = try P256.mulDoubleBasePublic(P256.basePoint, sb, g_other, sb, .big);
+    try eqAffine(got, try Std.basePoint.mul([_]u8{0} ** 31 ++ [_]u8{14}, .big));
 }
 
 // Debug: this test (7 std-touching point ops per draw: two basePoint muls,

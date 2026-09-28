@@ -5,6 +5,69 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Performance: ECDSA sign 97 → 29 µs, verify 261 → 128 µs
+  (std's generic `EcdsaP256Sha256.verify` over this group 413 → 125 µs)**, same
+  core, interleaved before/after, ReleaseFast. No API removed or changed; three
+  additions. Profile first (`perf`, `--call-graph lbr`): a signature was 46 %
+  fixed-base comb, **45 % `Scalar.invert`** (std's fiat divstep, one divstep per
+  5-limb call, 741 calls, ~40 µs — the same symbol is 9.7 % of a whole qap TLS
+  handshake) and 13 % Fermat `Fe.invert`; a verify was 73 % the projective RCB
+  double-base multiply. SPEC's "scalar field NOT on the critical path" was wrong
+  by half a signature and is rewritten.
+  1. `src/modinv.zig` (new): constant-time Bernstein–Yang safegcd, 590 divsteps
+     in ten 62-bit batches (libsecp256k1 `modinv64` shape), generic over the
+     modulus. `Fe.invert` 12.5 → 2.3 µs, `Scalar.invert` 31–41 → 2.2 µs. Gated by
+     the new `gate.fast_invert_implemented`; the oracles stay (`Fe.invertFermat`,
+     `Scalar.invertStd`, both new `pub`) and pin it on random draws + edges (0 → 0,
+     1, `m−1`, `m−2`, limb seams) for both moduli, plus `x·x⁻¹ ≡ 1` under a
+     bignum `% m`. ⚠ Found during bring-up: the correction factor must be `+m⁻¹
+     mod 2^62`, not `−m⁻¹`; with the wrong sign 20 of 44 tests went red (RFC 6979
+     and Wycheproof included) — the harness has teeth.
+  2. `src/scalar.zig`: `P256.scalar` is now this module's namespace — a wrapper
+     over std's scalar with the same surface (`Scalar`, `CompressedScalar`,
+     `rejectNonCanonical`, `reduce48`, …; every consumer spelling checked: jwt,
+     jwe, xmldsig, webauthn, hpke, spake2plus, ctap2pin, ocsp) — so std's generic
+     `Ecdsa(P256, Sha256)` signer reaches the fast inverse. `Scalar` is a new
+     type; nothing compared it to std's by identity. A test pins that every
+     forwarded operation still matches std byte for byte.
+  3. `src/field.zig`: `Fe.add` does one conditional subtract (inputs are
+     canonical, so `a + b < 2p`) instead of the two-fold `normalize`: 10.0 → 5.3
+     ns; a point operation has ~15 of them (RCB dbl 536 → 468 ns).
+  4. `src/group.zig`: `P256.addMixed` (new `pub`, RCB Algorithm 5, complete,
+     limb-identical to `add` with `Z2 = 1` — tested so); the fixed-base table is
+     now `base_table` / `BaseTable` (was `comb_table` / `CombTable`; both were
+     `pub` but had no consumer outside `oracle_test.zig`): 43 windows × 32 affine
+     entries (w = 6, 88 064 B `.rodata`, was 49 920 B), batch-normalised at
+     comptime with one inversion; CT `k·G` 40 → 25 µs, same `blackBox`-laundered
+     masked gather (digit 0 is undone by a masked blend, since `(0, 0)` is not a
+     point). Vartime verify paths moved to Jacobian coordinates (`Jac`, private:
+     dbl 3M+5S, mixed add 7M+4S, exceptional cases as branches on PUBLIC data
+     only); `basePoint.mulPublic` is served from the fixed-base table with no
+     doublings (this is what std's generic verifier calls), `Q.mulPublic` is a
+     w = 5 wNAF over a batch-normalised affine odd-multiple table, and
+     `mulDoubleBasePublic` with `G` in either slot joins the two. Results are the
+     same points as before and as std (affine-compared everywhere); their
+     projective representation differs. New tests: `basePoint.mulPublic` vs std +
+     the comb on random scalars and every recoding edge (`n` → refused, `2^256−k`,
+     the top-window boundary); double-base with `G` in either slot, with a
+     second representation of `G`, and the join's `P = ±Q` cases. The corrupted-
+     table positive control now plants `G` in window 10 (an affine table has no
+     identity to plant). Mutants (Jacobian doubling `8β → 4β`, mixed add
+     `3·Z1 → 2·Z1`, in a copy under `.zig-cache`): 18 of 47 tests red, including
+     each new one.
+  Verified: `modtest p256` ReleaseFast + ReleaseSafe 46 pass / 1 skip (was 37);
+  `-Dtarget=aarch64-linux -fqemu` 45 pass / 2 skip (portable field, `i128`
+  safegcd, comptime table all exercised); dependents ReleaseFast: jwt 118,
+  xmldsig 51, jwe 62, webauthn 74, hpke 84, spake2plus 37, ctap2pin 42, ocsp 37;
+  `scripts/checks/ctgrind.sh --check p256` OK — `comb` 2 in-file (the
+  `rejectIdentity` check, now two jumps), `sign` ≤ 12 (2 × 2 comb + std's five
+  canonicality compares + one of the same class in `Scalar.invert`'s
+  re-encoding + `isZero` on `r`/`s`), controls and traps 0; the `sign` row's
+  output digest is unchanged (byte-identical signatures). `--check hpke` OK.
+  Backlog: the word-shuffle reduce bounds `Fe.mul` at ~33 ns (`Fe.sq` gains
+  nothing over it); a Montgomery-domain core is the next ~0.7× and is written up
+  with its estimate in SPEC backlog 8.
+
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** the test that claimed to catch a deleted
   `basePoint.mul` → `combMulBase` redirect did not: with the redirect line removed all 37 tests
   passed, because it asserted only the predicate `isBasePointRepr`, which answers correctly with

@@ -78,11 +78,15 @@ second):
 
 Either way `field.reduceWide` is the bit-exact oracle the differential pins to.
 
-Inversion is Fermat (`a^(p−2)`) via a runtime square-and-multiply over the PUBLIC
-exponent (constant-time in the secret element `a`). A short addition chain — the
-one std's fiat inverse encodes — is the fast path a later phase can drop in;
-inversion is amortised (one per affine conversion), so the scaffold favours obvious
-correctness. Square roots use `a^((p+1)/4)` (valid because `p ≡ 3 (mod 4)`).
+Inversion (`Fe.invert`, gated by `gate.fast_invert_implemented`) is the
+constant-time Bernstein–Yang safegcd in `modinv.zig`: 590 divsteps in ten batches
+of 59, each batch run on the low 64 bits of `(f, g)` and applied once as a 2×2
+matrix to 5-limb signed-62 vectors — the libsecp256k1 `modinv64` shape, generic
+over the modulus so the scalar field shares it. The Fermat inverse `a^(p−2)`
+(`Fe.invertFermat`) stays as the oracle the differential pins it to and as the
+gate-off fallback. Measured 2026-09-28: 12.1 µs → ~2.4 µs. Square roots use
+`a^((p+1)/4)` (valid because `p ≡ 3 (mod 4)`); they are only reached by
+compressed-point decoding, so they stay on the exponentiation.
 
 ## Point representation & scalar multiplication
 
@@ -95,20 +99,34 @@ byte-exact vs std at the point level. P-256 has prime order (cofactor 1), so the
 formulas are complete for all inputs (identity, equal points, inverses) — which is
 what lets the constant-time ladder run with no special cases.
 
+`addMixed` is RCB **Algorithm 5** (mixed addition, `Q` affine): Algorithm 4 with
+`Z2 = 1` folded in, complete for every projective `P` and every affine `Q`, and the
+reason the fixed-base table can be stored affine.
+
 Scalar multiply variants (**NO GLV** — see below):
 
 - **`mul`** — CONSTANT-TIME variable-base multiply (secret scalars: key
   derivation). Scaffold: fixed 256-bit double-and-add with a branch-free `cMov`
-  bit select. Gated fast core: `mulCtWindowed`.
+  bit select. Gated fast core: `mulCtWindowed`. `mul` on the base point itself
+  (std's ECDSA signer calls `basePoint.mul`) redirects to `combMulBase`.
 - **`combMulBase`** — CONSTANT-TIME fixed-base `s·G` (the ECDSA signing path:
   nonce commitment `k·G` + pubkey `d·G`). Scaffold: falls back to the double-and-add
-  ladder over `G`. Gated fast core: `combMulBaseFast` (fixed-base comb).
+  ladder over `G`. Gated fast core: `combMulBaseFast` — 43 windows of 6 bits over a
+  comptime AFFINE table (`base_table`, 43 × 32 × 64 B = 88 064 B), one masked
+  gather + one complete mixed addition per window, no doublings.
 - **`mulPublic` / `mulDoubleBasePublic`** — VARIABLE-TIME public-scalar multiplies
-  (verification's `u1·G + u2·Q`). Accelerated with an **interleaved wNAF
-  (Straus–Shamir)** double-scalar mult: one shared doubling chain + a precomputed
-  odd-multiple table per base (width `w = 5` ⇒ 8 points), ~`l/(w+1)` additions per
-  scalar instead of ~`l/2`. Vartime (all inputs public); byte-exact vs the plain
-  double-and-add ladder + std.
+  (verification's `u1·G + u2·Q`), in **Jacobian coordinates** (`group.Jac`: dbl
+  3M+5S, mixed add 7M+4S — not exception-free, so the identity and `P = ±Q` are
+  vartime branches, which is fine only because every input here is public). The
+  base point is recognised structurally (`isBasePointRepr`, the same public test
+  `mul` uses) and served from the shared fixed-base table with no doublings — this
+  covers std's generic verifier, which calls `basePoint.mulPublic`; any other base
+  takes a width-5 wNAF over a batch-normalised affine odd-multiple table (one
+  inversion for the eight points). A double-base multiply with `G` in either slot
+  is the fixed-base sum plus the other base's wNAF, joined by one Jacobian
+  addition; two arbitrary bases take the interleaved wNAF (Straus–Shamir) with
+  one shared doubling chain. Byte-exact vs the plain ladder + std at the point
+  level (the projective representation of the result differs).
 
 ### No GLV — the biggest structural difference from k256
 
@@ -146,7 +164,15 @@ jumps and zero secret-indexed loads before the core is declared done.
   fallback `mulDoubleAddCt` is a fixed 256-iteration double-and-add with `cMov`.
   `mulPublic`/`mulDoubleBasePublic` are explicitly VARIABLE-TIME and only for
   PUBLIC scalars (verification), matching std's contract.
-- **Scalar**: inherited from std (constant-time fiat field), re-exported.
+- **Scalar**: `mul`/`add`/`sub`/codecs are std's constant-time fiat field, wrapped;
+  `invert` is this module's safegcd (`modinv.zig`, fixed 590 divsteps, every
+  decision a `blackBox`-laundered mask), re-encoded through std's branch-free
+  reducing codec (`fromBytes48`), not `fromBytes` (whose canonicality compare
+  branches on the value).
+- **Inversion** (`modinv.zig`): fixed trip counts; the divstep decisions
+  (`zeta < 0`, `g` odd), the signs of `d`/`e`/`f` and the two conditional modulus
+  adds in `normalize` are masked selects with laundered masks; `i64×i64→i128`
+  multiplies only. The only branch is on the comptime modulus limbs.
 - **Gated cores** carry the same contract: the `MULX/ADX` field fold's trip count
   derives only from the public limb count; the comb/windowed gather must stay the
   `blackBox`-guarded masked scan.
@@ -155,14 +181,18 @@ The SCAFFOLD's portable path is the correctness reference, not a hardened
 production target on its own; hardware side-channel review (esp. of the eventual
 addition-chain inverse and the comb gather) is a later-phase obligation.
 
-## Scope — the scalar field is intentionally std's
+## Scope — the scalar field is std's arithmetic with this module's inverse
 
-p256 accelerates the **field** and the **point multiply** (the ~hundreds of
-base-field multiplies per scalar multiply). Scalar-field arithmetic mod `n` is a
-handful of ops per signature — negligible against the point multiply — and `n` has
-no exploitable special form. So `scalar.zig` re-exports std's constant-time scalar
-field verbatim, keeping the complexity budget where the cost is. Unlike k256 there
-are no GLV constants to own here.
+Scalar-field `mul`/`add`/`sub` mod `n` are a handful of ~80 ns operations per
+signature and `n` has no exploitable special form, so `scalar.zig` wraps std's
+constant-time fiat scalar with the same public surface. ⭐ **The inverse is the
+exception, and this section claimed otherwise until 2026-09-28.** std's
+`Scalar.invert` is Bernstein–Yang too, but fiat's `divstep` is one divstep per
+call over the full 5-limb vectors, 741 calls: measured 40.7 µs against ~41 µs for
+the entire constant-time `k·G` — 45 % of a signature, and 9.7 % of a whole qap
+TLS handshake in `perf` (`p256_scalar_64.divstep`). `Scalar.invert` therefore
+runs `modinv.zig` (~3 µs), pinned to std's inverse by a differential. Unlike k256
+there are no GLV constants to own here.
 
 ## Verification
 
@@ -185,10 +215,25 @@ are no GLV constants to own here.
 - **Broken positive control** (`kat_test.zig`): a Solinas fold with the wrong
   constant `M − 1` disagrees with std on >400/500 random inputs — proving the
   reduction constant is load-bearing and the equality checks have teeth.
-- **Gated differentials** (`oracle_test.zig`): LIVE (both gates on) — they pin
+- **Gated differentials** (`oracle_test.zig`): LIVE (all gates on) — they pin
   each core bit-for-bit to the portable path (and the comb also to std), plus a
-  corrupted-comb-table positive control. On non-amd64 the field one skips
-  (core not present there).
+  corrupted-comb-table positive control (window 10 replaced by `G`; the table is
+  affine, so "identity" is not an expressible corruption). On non-amd64 the
+  field one skips (core not present there).
+- **Inversion differentials**: `modinv.invert` vs `x·x⁻¹ ≡ 1` under a bignum
+  `% m` for both moduli (`modinv.zig`); `Fe.invert` vs `Fe.invertFermat` AND
+  std's field inverse; `Scalar.invert` vs std's scalar inverse — each on random
+  draws plus 0 (→ 0), 1, 2, `m−1`, `m−2`, single bits at the 62-bit limb seams,
+  `m/2`. Positive control seen once, unplanned: with the correction factor's sign
+  wrong (`−m⁻¹` for `m⁻¹`) 20 of 44 tests went red, including RFC 6979 and
+  Wycheproof.
+- **Group formula differentials** (`group.zig`): `addMixed` vs `add` with
+  `Z2 = 1` — same limbs, not just the same point — plus the identity, `P = Q`,
+  `P = −Q`; `basePoint.mulPublic` (fixed-base vartime) vs std + the CT comb on
+  random scalars and every recoding edge (1, 2, `n−1`, `n` → refused, `2^256−1`,
+  `2^256−17`, the top-window boundary); `mulDoubleBasePublic` with `G` in either
+  slot, with a second representation of `G` (misses the redirect on purpose),
+  and the Jacobian join's `P = ±Q` cases.
 
 ## Performance status
 
@@ -226,6 +271,47 @@ square-and-multiply inverse in `affineCoordinates` is now ~9 % of verify, so it
 buys only ~1–2 % more; deferred as low-value. Measured before/after on this host:
 `mulPublic` ~211 µs → ~167 µs, ECDSA verify ~341 µs → ~241 µs.
 
+**Sign/verify phase (2026-09-28)** — same host, ReleaseFast `-mcpu=native`,
+`taskset -c 1`, HEAD and new binaries interleaved twice back to back (the host
+was loaded by other sessions; best of two per row, so read them as ratios):
+
+| op | before | after | what changed |
+|---|---|---|---|
+| `Fe.add` | 10.0 ns | 5.3 ns | one conditional subtract instead of the two-fold `normalize` |
+| `Fe.invert` | 12.5 µs | 2.3 µs | safegcd (`modinv.zig`) for Fermat |
+| `Scalar.invert` | 31.7–40.7 µs | 2.2 µs | safegcd for std's one-divstep-per-call fiat |
+| `P256.dbl` / `add` (RCB, CT paths) | 536 / 622 ns | 468 / 516 ns | `Fe.add` |
+| CT `k·G` (`combMulBase`) | 40.3 µs | 25.1 µs | w = 6 affine table + mixed complete add |
+| `mulCtWindowed` (CT `k·P`) | 202 µs | 163 µs | `Fe.add` only |
+| `mulPublic` (`Q`, vartime) | 170 µs | 107 µs | Jacobian wNAF, affine table |
+| `mulDoubleBasePublic` (`G`, `Q`) | 212 µs | 125 µs | fixed-base `u1·G` + Jacobian wNAF `u2·Q` |
+| `sign.ecdsaSign` | 97.3 µs | 29.2 µs | |
+| `sign.ecdsaVerify` | 261 µs | 128 µs | |
+| `EcdsaP256Sha256.sign` (std generic over this group — qap TLS) | 94.5 µs | 37.1 µs | the 8 µs over `ecdsaSign` is std's nonce derivation + codecs |
+| `EcdsaP256Sha256.verify` (std generic — two `mulPublic` + `add`) | 413 µs | 125 µs | `basePoint.mulPublic` redirect |
+
+Profile BEFORE (`perf record --call-graph lbr` + the component bench, same
+session): a signature was `k·G` comb 41 µs (46 %) + **`Scalar.invert` 40 µs
+(45 %)** + `Fe.invert` 12 µs (13 %); a verify was the double-base multiply
+258 µs (73 %: 256 RCB doublings ≈ 139 µs, ~90 RCB additions ≈ 55 µs, tables
+and recoding the rest) + `Scalar.invert` 40 µs + `Fe.invert` ~14 µs; SHA-256,
+SEC1 decoding and the scalar codecs were under 1 %. So the SPEC's earlier
+"scalar field NOT on the accel critical path" was wrong by half a signature —
+the same `p256_scalar_64.divstep` showed as 9.7 % of an entire qap TLS
+handshake. `Fe.sq` costs the same as `Fe.mul` (30 vs 33 ns) because the
+word-shuffle reduction, not the product, dominates the asm core — which bounds
+what the point formulas can gain and is the largest remaining lever (backlog 8).
+
+OpenSSL 3.5.5 `nistz256` on this host the same day (loaded): 36.8 µs sign,
+128 µs verify. `EcdsaP256Sha256.sign` 37 µs and `.verify` 125 µs are within
+measurement noise of that — the 2–3× target band is passed; parity with the
+asm-grade reference remains explicitly a non-goal, and the loaded-host caveat
+applies to both columns.
+
+Binary size: the fixed-base table grew from 49 920 B (65 × 8 projective) to
+88 064 B (43 × 32 affine) of `.rodata`; `zig build test-p256` compile time
+grew ~40 s → ~50 s (the comptime table build + one comptime batch inversion).
+
 ## Backlog
 
 1. ~~`fast_core.fieldMul`/`fieldSq`~~ — **DONE (Fable core phase)**: `MULX/ADX`
@@ -241,8 +327,10 @@ buys only ~1–2 % more; deferred as low-value. Measured before/after on this ho
    one shared doubling chain + an odd-multiple table per base. Vartime/public
    only; byte-exact vs the plain ladder + std. Verify ~392 µs → ~241 µs
    (~5.0× → ~3.0× nistz256).
-5. Addition-chain field inverse (the P-256 chain std's fiat-inverse encodes);
-   the Fermat square-and-multiply inverse is now a visible slice of sign time.
+5. ~~Addition-chain field inverse~~ — **DONE differently (2026-09-28)**: a
+   constant-time safegcd (`modinv.zig`) replaces the Fermat inverse for BOTH
+   fields (12.5 → 2.3 µs base, 31–41 → 2.2 µs scalar); an addition chain would
+   have reached ~9 µs.
 6. Rewire the P-256 consumers (jwt ES256, ctap2pin, spake2plus, hpke/voprf/mls/jwe)
    from `std.crypto.ecc.P256` to p256.
 7. Side-channel review of the CT paths (inverse, comb/windowed gather). Note:
@@ -250,6 +338,29 @@ buys only ~1–2 % more; deferred as low-value. Measured before/after on this ho
    scalarmul cores (masked gather at fixed offsets, public-index loops only) was
    done in the core phase; the recoding/negation selects required `blackBox`
    laundering — without it LLVM lowered them to a secret-dependent CMOV/branch.
+   2026-09-28: the w = 6 comb's ReleaseFast disasm (`combMulBase`, 5 052
+   instructions with everything inlined) has zero indirect jumps, zero CMOVs,
+   two public loop back-edges (the 0x800-byte vectorised gather over a window,
+   the window loop) and the two `je` of `rejectIdentity`; ctgrind: `comb` 2
+   in-file contexts (that identity check, now two jumps), `sign` 12 (2 × 2
+   comb + std's five scalar canonicality compares + one more of the same class
+   in `Scalar.invert`'s re-encoding + `isZero` on `r`/`s`), controls/traps 0,
+   `--check` OK.
+8. **Montgomery-domain field core** — measured headroom, not done: `Fe.mul`
+   33 ns / `Fe.sq` 30 ns are bounded by the ~130-instruction word-shuffle
+   reduce (the MULX product is ~50). nistz256's interleaved Montgomery reduce
+   exploits `p₀⁻¹ ≡ 1 (mod 2^64)` and `p`'s shape at ~8 instructions per round;
+   an estimated ~22 ns multiply would take every point-level number above to
+   ~0.7× (sign ~29 → ~21 µs, verify ~128 → ~90 µs). It changes the field
+   representation (constants, codecs, the comptime table, every differential's
+   `toBytes` still works) — days, not hours, with a new asm core to prove; do
+   it as its own gated phase with the portable oracle kept in normal domain.
+9. Smaller levers, each measured or estimated 2026-09-28: comb w = 7 (37
+   windows, 151 KB table) ≈ −3 µs on sign for +63 KB; an addition chain for
+   `sqrt` (compressed-key decoding, 10.5 µs) ≈ −2 µs; `mulCtWindowed` at w = 5
+   ≈ −15 µs on the ECDH-style `P256.mul` (hpke/spake2plus/ctap2pin, not on the
+   qap/jwt path); std's `EcdsaP256Sha256.sign` spends ~8 µs over `ecdsaSign` in
+   its generic nonce derivation and codecs, which this module cannot reach.
 
 ## Anchoring
 
