@@ -485,6 +485,50 @@ never freed or replaced, and a frame that needs more is
 size pledged, 3.7 MB for an unknown size; level 19 on 1 MB, 18 MB; the
 most any input needs at level 22, 740 MB one-shot and 874 MB streaming.
 
+**Buffer-less compression** (Z25, 2026-09-28). `Compressor.begin`
+(`zstd.Begin`: `.level` is `ZSTD_compressBegin_usingDict`, and
+`ZSTD_compressBegin` without a dictionary; `.advanced`
+`ZSTD_compressBegin_advanced`; `.cdict` `ZSTD_compressBegin_usingCDict_advanced`,
+and `ZSTD_compressBegin_usingCDict` with its defaults), `compressContinue`
+and `compressEnd` are libzstd's buffer-less API, deprecated there in favour
+of the streaming one, ported because `ZSTD_copyCCtx` copies a context in the
+stage only a `begin` leaves it in. They drive `frame.Compressor` as `Stream`
+does (`compressContinue`, `writeEpilogue`), so they take any room, too
+little being `error.DstSizeTooSmall` (Z1d). The stages are libzstd's
+(`created`, `init` after a `begin`, ongoing, ending, `created` again after
+the epilogue): a call without a `begin` is `error.StageWrong`; a pledged
+size is held to exactly (`error.SrcSizeWrong`). `.level` sizes the
+parameters for an unknown size and a dictionary of that length and records
+no content size; `.advanced` takes the parameters as they are (bounds
+checked, `ZSTD_checkCParams`), every other parameter zero, i.e. its default
+(`ZSTD_CCtxParams_init_internal`); `.cdict` chooses as `compressUsingCDict`
+does, by the size. A dictionary is loaded by reference (`ZSTD_dtlm_fast`
+on the caller's bytes).
+
+**Copies** (`ZSTD_copyCCtx`, Z25, 2026-09-28): `Compressor.copyFrom(prepared,
+pledged_size)`, deprecated in libzstd as "misleading and [of] very limited
+utility" and ported to the letter, which is where its limits come from. The
+copy is reset (`ZSTD_resetCCtx_internal`, tables left dirty) with the
+original's table parameters -- `cParams`, the resolved row match finder,
+post-splitter and LDM parameters, `maxBlockSize` -- and every other
+parameter from the destination's requested ones, here the defaults of a
+new libzstd context (this module keeps no parameters on a context); frame
+parameters: the content size when the size is known (0, as in libzstd, is
+unknown), no checksum, the dictionary ID. Then the hash, chain and 3-byte
+hash tables, the window with `nextToUpdate` and `loadedDictEnd`, the
+dictionary ID and content size and the block state (entropy tables,
+repcodes) are copied. Not copied, so a copy's frames can differ from the
+original's: the row match finder's tag table and hash salt (the copy's
+context keeps its own -- zeros when new, else whatever its earlier frames
+left there, libzstd's init-once space, so two copies on one context can
+differ, which a golden pins), an attached `CDict` (`dictMatchState` is
+cleared; the window placed after the CDict and `loadedDictEnd` stay), the
+LDM table and window (fresh). The original must be in the `init` stage
+(`error.StageWrong` after any input, and after a one-shot frame, as in
+libzstd). The copy references what the original does (the dictionary's
+bytes, a CDict's content). Its workspace follows the context's policy; a
+static one too small is `error.OutOfMemory`.
+
 ## Dictionaries
 
 Compression with a dictionary is libzstd's (`zstd_compress.c`): a
@@ -2364,6 +2408,28 @@ for an unknown size differ outside the binary tree's equivalence -- level
 equivalent under a 2 MB window). Equivalent, not run: clearing the mark
 after the hand-over (handing over again gives the same parameters).
 
+**Buffer-less compression and copies** (Z25, 2026-09-28):
+`testdata/copy_goldens.zig`, 28 call plans of `tools/zcopy.c` (recipe
+`tools/gen-copy-goldens.sh`), each a context begun one of the four ways,
+copied twice into one new context (each copy compressing the input in 1-3
+pieces), then compressing it itself -- 84 frames or errors, libzstd's, and
+`ZSTD_copyCCtx` of the used original refused. The plans cover levels
+-5..19 and `btopt`/`btultra2` with long-distance matching (a 2^27 window
+over small explicit tables), trained and raw dictionaries loaded, a `CDict`
+copied, attached and reloaded by the size, sizes known, unknown, 0 and
+wrong, frame parameters, too little room; in 19 of them the copy's frame
+is not the original's, in one the second copy's is not the first's (tags
+kept by the copy's context). Before the goldens, 1 400 random plans against
+libzstd (inputs 0-600 KB of text, noise, runs and words; no, raw and
+trained dictionaries; the four `begin`s at levels -7..22; the copy's size
+right, unknown, 0, one off either way; 1-5 pieces; random frame parameters;
+15 % with a random, often too small, capacity; 30 % of `.advanced` with
+random explicit parameters, 200 of them with a 2^27 window and the optimal
+parsers, i.e. long-distance matching), and a grid of 324 (the four
+`begin`s, 9 levels from -3 to 22, 3 dictionaries, 3 copy sizes): 3 921
+frames and every error the same. A copy's independence from its original, the stages, the pledged
+size and a static workspace have tests of their own (`copy_test.zig`).
+
 **Shared thread pool** (Z25, 2026-09-28) has no goldens of its own: the
 bytes do not depend on the pool, so `mt_test.zig` runs every
 multithreaded golden row again on shared pools -- 2 threads for 3 workers,
@@ -2987,7 +3053,9 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
   `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
   `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 (compressor
-  side): the shared thread pool (`ThreadPool`,
+  side): `ZSTD_copyCCtx` (`Compressor.copyFrom`) with the buffer-less API
+  it needs (`Compressor.begin` / `compressContinue` / `compressEnd`, see
+  *Contexts*), and the shared thread pool (`ThreadPool`,
   `Options.thread_pool`, `ZSTD_CCtx_refThreadPool`; see *Multithreading*),
   which runs on a caller's `std.Io` when given one -- the 2026-09-26 MT
   futex decision stands as the default. Done 2026-09-28 for `zstd-cli`:

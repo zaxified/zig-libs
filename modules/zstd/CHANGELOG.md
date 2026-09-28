@@ -16,6 +16,13 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   workspaces to the pool (`ThreadPool.memorySize`). Fixed: a worker could
   run the wrong job when a later one finished first between its claiming a
   queue slot and reading it (a race, not seen in a test).
+- **2026-09-28** — `Compressor.copyFrom` (`ZSTD_copyCCtx`) and the
+  buffer-less API it needs, `Compressor.begin` (`zstd.Begin`:
+  `ZSTD_compressBegin`, `_usingDict`, `_advanced`, `_usingCDict`,
+  `_usingCDict_advanced`), `compressContinue`, `compressEnd`,
+  `zstd.BufferlessError` -- libzstd's frames, the copies' included (which
+  libzstd makes without the row match finder's tags, an attached CDict or
+  the LDM table). 28 new goldens (`tools/zcopy.c`).
 - **2026-09-28** — `Stream.setLevel` (`ZSTD_CCtx_setParameter(
   ZSTD_c_compressionLevel)` at any time): with workers, the jobs created
   after the next call take the new level, as libzstd's

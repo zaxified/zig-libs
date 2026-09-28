@@ -194,6 +194,23 @@ const n = try c.compress(buf, big, .{ .level = 3, .advanced = .{ .nb_workers = 4
 var s = try zstd.Stream.init(gpa, .{ .advanced = .{ .nb_workers = 2 }, .thread_pool = pool });
 ```
 
+libzstd's buffer-less API and `ZSTD_copyCCtx`, both deprecated there, are
+here too: `Compressor.begin` (`ZSTD_compressBegin*`, a `zstd.Begin`),
+`compressContinue`, `compressEnd`, and `copyFrom` -- a context begun once
+with a dictionary, copied for each frame to skip loading it again (the
+copy's frames are libzstd's copy's, which differ from the original's in
+libzstd's ways; see SPEC.md, *Contexts*):
+
+```zig
+var primed: zstd.Compressor = .init(gpa);
+try primed.begin(.{ .level = .{ .level = 3, .dict = dict_bytes } });
+for (messages) |m| {
+    try c.copyFrom(&primed, m.len); // ZSTD_copyCCtx
+    const n = try c.compressEnd(buf, m);
+    try sink.writeAll(buf[0..n]);
+}
+```
+
 Streaming into any `std.Io.Writer` (an HTTP body, a file) as libzstd
 streams -- one frame, history kept across flushes, the bytes
 `ZSTD_compressStream2` gives for the writes as `continue`, `flush` as flush
@@ -545,7 +562,11 @@ libzstd's, or failing with libzstd's error (`src/testdata/seq_goldens.zig`,
 unknown size), a static workspace's bound, the workspace being replaced
 when too small or long too big, and indexing restarting near its limit.
 
-`src/mt_test.zig` runs
+`src/copy_test.zig` does it for the buffer-less API and `copyFrom`: 28 call
+plans (every `begin`, dictionaries loaded, copied, attached, reloaded,
+long-distance matching, sizes right, unknown, 0 and wrong, too little
+room), each copy's and the original's frame or error equal to libzstd's
+(`src/testdata/copy_goldens.zig`, `tools/zcopy.c`). `src/mt_test.zig` runs
 the multithreaded goldens on shared thread pools too, smaller and larger
 than `nb_workers`, posted to from three threads at once, and on a pool
 running on a `std.Io.Threaded`.
