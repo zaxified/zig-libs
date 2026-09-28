@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Query-string parameters and path percent-decoding, over the raw `path`
 //! and `query` slices `Server.Request` carries.
 //!

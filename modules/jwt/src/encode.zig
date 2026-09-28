@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Token issuance: `encode` / `encodeJson` build a compact JWS
 //! (`header.payload.signature`, RFC 7515 §7.1) for the algorithms `verify`
 //! checks.
