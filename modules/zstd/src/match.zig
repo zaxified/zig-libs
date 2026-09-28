@@ -594,27 +594,42 @@ inline fn comparePackedTags(a: usize, b: usize) bool {
 /// `end` into the `fast` hash table (with `.full`, the others too where
 /// their slot is empty); tagged for a `CDict`. Long-distance matching calls
 /// it (`.fast`, `.for_cctx`) before it runs `fast` on a stretch of
-/// literals; a dictionary's content is loaded with it.
+/// literals; a dictionary's content is loaded with it. Specialised on
+/// `min_match`, `dtlm` and `tfp` (libzstd's `ZSTD_fillHashTableForCDict`
+/// and `ZSTD_fillHashTableForCCtx`, whose `ZSTD_hashPtr` switch the C
+/// compiler hoists out of the loop).
 pub fn fillHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp: FillPurpose) void {
+    switch (dtlm) {
+        inline else => |d| switch (tfp) {
+            inline else => |t| switch (ms.cp.min_match) {
+                inline 5, 6, 7, 8 => |m| fillHashTableT(ms, end, d, t, m),
+                else => fillHashTableT(ms, end, d, t, 4),
+            },
+        },
+    }
+}
+
+fn fillHashTableT(ms: *MatchState, end: usize, comptime dtlm: TableLoad, comptime tfp: FillPurpose, comptime mls: u32) void {
     const tagged = tfp == .for_cdict;
+    // the input through a local base: a store into `hash_table` may alias
+    // `ms.src` (see `Base`)
+    const b: Base = .of(ms);
     const hash_table = ms.hash_table;
     const h_bits = ms.cp.hash_log + if (tagged) @as(u32, tag_bits) else 0;
-    const mls = ms.cp.min_match;
     const fill_step = 3;
     var ip: usize = ms.next_to_update;
     // `ip + fastHashFillStep < iend + 2`, iend = end - HASH_READ_SIZE
     while (ip + fill_step + hash_read_size < end + 2) : (ip += fill_step) {
         const curr: u32 = @intCast(ip);
-        const h0 = ms.hash(ip, h_bits, mls);
+        const h0 = b.hash(ip, h_bits, mls);
         if (tagged) writeTaggedIndex(hash_table, h0, curr) else hash_table[h0] = curr;
         if (dtlm == .fast) continue;
         // Only load extra positions for ZSTD_dtlm_full
-        var p: u32 = 1;
-        while (p < fill_step) : (p += 1) {
-            const h = ms.hash(ip + p, h_bits, mls);
+        inline for (1..fill_step) |p| {
+            const h = b.hash(ip + p, h_bits, mls);
             if (tagged) {
-                if (hash_table[h >> tag_bits] == 0) writeTaggedIndex(hash_table, h, curr + p); // not yet filled
-            } else if (hash_table[h] == 0) hash_table[h] = curr + p;
+                if (hash_table[h >> tag_bits] == 0) writeTaggedIndex(hash_table, h, curr + @as(u32, p)); // not yet filled
+            } else if (hash_table[h] == 0) hash_table[h] = curr + @as(u32, p);
         }
     }
 }
@@ -627,12 +642,24 @@ pub fn fillHashTable(ms: *MatchState, end: usize) void {
 /// `ZSTD_fillDoubleHashTable`: every third position from `next_to_update`
 /// up to `end` into both of `dfast`'s tables (with `.full`, the two after
 /// it into the long table where their slot is empty); tagged for a
-/// `CDict`.
+/// `CDict`. Specialised as `fillHashTableFor` is
+/// (`ZSTD_fillDoubleHashTableForCDict`, `ZSTD_fillDoubleHashTableForCCtx`).
 pub fn fillDoubleHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp: FillPurpose) void {
+    switch (dtlm) {
+        inline else => |d| switch (tfp) {
+            inline else => |t| switch (ms.cp.min_match) {
+                inline 5, 6, 7, 8 => |m| fillDoubleHashTableT(ms, end, d, t, m),
+                else => fillDoubleHashTableT(ms, end, d, t, 4),
+            },
+        },
+    }
+}
+
+fn fillDoubleHashTableT(ms: *MatchState, end: usize, comptime dtlm: TableLoad, comptime tfp: FillPurpose, comptime mls: u32) void {
     const tagged = tfp == .for_cdict;
+    const b: Base = .of(ms);
     const hash_large = ms.hash_table;
     const h_bits_l = ms.cp.hash_log + if (tagged) @as(u32, tag_bits) else 0;
-    const mls = ms.cp.min_match;
     const hash_small = ms.chain_table;
     const h_bits_s = ms.cp.chain_log + if (tagged) @as(u32, tag_bits) else 0;
     const fill_step = 3;
@@ -640,19 +667,17 @@ pub fn fillDoubleHashTableFor(ms: *MatchState, end: usize, dtlm: TableLoad, tfp:
     // `ip + fastHashFillStep - 1 <= iend`, iend = end - HASH_READ_SIZE
     while (ip + fill_step - 1 + hash_read_size <= end) : (ip += fill_step) {
         const curr: u32 = @intCast(ip);
-        var i: u32 = 0;
-        while (i < fill_step) : (i += 1) {
-            const sm = ms.hash(ip + i, h_bits_s, mls);
-            const lg = ms.hash(ip + i, h_bits_l, 8);
+        // only load extra positions for ZSTD_dtlm_full
+        inline for (0..if (dtlm == .fast) 1 else fill_step) |i| {
+            const sm = b.hash(ip + i, h_bits_s, mls);
+            const lg = b.hash(ip + i, h_bits_l, 8);
             if (tagged) {
-                if (i == 0) writeTaggedIndex(hash_small, sm, curr + i);
-                if (i == 0 or hash_large[lg >> tag_bits] == 0) writeTaggedIndex(hash_large, lg, curr + i);
+                if (i == 0) writeTaggedIndex(hash_small, sm, curr);
+                if (i == 0 or hash_large[lg >> tag_bits] == 0) writeTaggedIndex(hash_large, lg, curr + @as(u32, i));
             } else {
-                if (i == 0) hash_small[sm] = curr + i;
-                if (i == 0 or hash_large[lg] == 0) hash_large[lg] = curr + i;
+                if (i == 0) hash_small[sm] = curr;
+                if (i == 0 or hash_large[lg] == 0) hash_large[lg] = curr + @as(u32, i);
             }
-            // Only load extra positions for ZSTD_dtlm_full
-            if (dtlm == .fast) break;
         }
     }
 }
