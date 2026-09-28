@@ -1,0 +1,105 @@
+# `ini` — specification
+
+## What this module is, and what it is not
+
+A reader for INI files: sections, `key = value` entries and comment lines,
+parsed into a `Document` that keeps everything in file order with line numbers
+and answers lookups with the rule every INI reader shares (a later value wins,
+a section named twice is one section). INI has no standard; this module has one
+grammar with a few `Options`, and two presets that agree with a real
+implementation each on every text in the golden corpus.
+
+**Not here, and why:**
+
+- **No writer.** Nobody asked; round-tripping comments and layout is its own
+  design. *Not now.*
+- **No interpolation** (`%(name)s`, `${section:key}`) and **no `[DEFAULT]`
+  inheritance** — Python-specific semantics layered on top of the syntax; the
+  `.python` preset is `RawConfigParser` without them. *Never*, unless a
+  consumer needs it.
+- **No git-config** (`[remote "origin"]` subsections, bare boolean keys,
+  `include`) and **no PHP backslash continuation** — separate dialects; each
+  would be its own preset with its own oracle. *Not now.*
+- **Values are raw.** Neither reference unquotes or unescapes on read
+  (`configparser.get(raw=True)`, `GKeyFile.get_value`), and which quoting a
+  file means depends on who wrote it, so it is the caller's call: `unquote`,
+  `unescapeDesktop`. Only `getBool` interprets a value.
+
+## Grammar
+
+The input is split on `\n`; one trailing `\r` is dropped from every line; a
+leading UTF-8 BOM is skipped. Leading and trailing spaces/tabs are set aside,
+and the rest of the line (`content`) is classified, **in this order** — the
+order is load-bearing, it is the one measured on configparser:
+
+1. **Blank** (empty `content`): skipped; ends a continued value.
+2. **Comment** — `content[0]` is in `comment_chars`: skipped; ends a continued
+   value (`k=v`, `  # c`, `  more` is an error in configparser, measured).
+3. **Continuation** (`continuation_lines`): a line indented deeper than the
+   line of the last entry (counted in bytes of leading blanks) appends
+   `"\n" + content` to that entry's value. Checked before headers, so an
+   indented `[b]` there is value text, as in configparser.
+4. **Header** — `content` starts with `[` and has a `]` at index ≥ 2. The name
+   is everything between, **not trimmed** (`[ a ]` is `" a "` in both
+   references). With `header_trailing_text` (`.python`) it ends at the last `]`
+   and anything after is ignored (`[a]b] x` is `a]b`); without, the `]` must end
+   `content` and the name may not contain `[` or `]` (GKeyFile). A line that
+   fails this is not a header and falls through to 5, which is how both
+   references read `[a=b` (key `[a`) and `[a` (no separator).
+5. **Entry** — split at the first byte in `separators`. The key is trimmed and
+   must not be empty (`EmptyKey`); with `locale_keys` it may contain brackets
+   only as a trailing `[locale]` after a non-empty name, the locale free of
+   blanks and brackets (`InvalidKey`; `Name[cs]` and even `Name[]` pass —
+   GKeyFile's rule, measured key by key). The value is left-trimmed; with
+   `inline_comments` it ends at a comment character that follows a blank;
+   with `trim_values` it is right-trimmed. Before any header it goes into a
+   section `""` (`global_entries`) or is `EntryOutsideSection`.
+6. Anything else — no separator — is `MissingSeparator`.
+
+A strict parse stops at the first such error and reports its line in
+`ErrorInfo`; a lenient one skips the line and records it in
+`Document.skipped`. The fuzz invariant ties the two together: where strict
+succeeds, lenient yields the same document and skips nothing.
+
+**Deliberate divergences** (not in the golden corpus, pinned by unit tests):
+a UTF-8 BOM is skipped, where both references refuse the text (Windows tools
+write one, and refusing a config over it helps no one); the default preset
+allows entries before the first section, which neither reference does.
+
+## Limits and refusals
+
+No limit of its own: memory is O(input) — one arena holding a copy of every
+name and value plus the section and entry lists. A value continued over many
+lines grows one buffer (linear; pinned by the 100 000-line test — the first
+version concatenated per line, which was quadratic and allocated ~10 GB for
+that input). Line numbers are `usize`. Lookups are linear scans over the
+sections and entries, fine at config sizes; a caller doing thousands of
+lookups on a huge file should index `doc.sections` itself.
+
+## Anchoring
+
+**Anchor grade:** class A · oracle EXTERNAL
+
+- **Class A** — wire/interop format — other implementations must byte-agree with it.
+- **Oracle EXTERNAL** — published vectors, goldens captured from a foreign implementation, or a test run against a live foreign peer.
+
+`src/testdata/goldens.zig` holds what CPython 3.14.4 `configparser` and GLib
+2.88.0 `GKeyFile` made of 905 texts: 52 probes (every rule above) and 900
+seeded random INI-shaped texts, 600 of them mostly well-formed and 300 of any
+shape (`tools/gen_goldens.py`, which records its versions). `src/oracle_test.zig`
+renders `Options.python` / `Options.desktop` documents into the same merged
+view and requires equality for every text, and failure where the reference
+refused; it pins the case count and the refusals (python 293, desktop 377), so
+both the accept and the refuse half stay exercised. The first run disagreed on
+three texts — GKeyFile's bracket rule for keys — which is what `locale_keys`
+is. GLib is LGPL and was only run, never read (`tools/README.md`).
+
+The rest — `unquote`, `unescapeDesktop` (Desktop Entry Specification,
+"Possible value types"), `getBool` (configparser's `BOOLEAN_STATES`), the
+default preset, lenient mode — is checked by hand-written expectations.
+
+## Open
+
+- `unescapeDesktop` is checked against the specification's list, not against
+  `GKeyFile.get_string`; the two may differ on an invalid escape.
+- `.targets` is `linux64` only until a `portable-ini-*` build is run.

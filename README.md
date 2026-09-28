@@ -14,7 +14,7 @@ cross-project-reusable capability — a production-grade implementation of a pro
 or a fill for a genuine gap in the Zig ecosystem. zig-libs is the canonical home for these; the
 authors' other projects depend on it, not the reverse.
 
-**Status:** 233 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
+**Status:** 234 modules (Zig 0.16, tests green in `ReleaseSafe` and `ReleaseFast`, compiling
 clean in `-Dstrict-debug`) · **MIT** (see `LICENSE`). `NOTICE` answers one question —
 whether consuming zig-libs obliges you to anything beyond MIT — and lists the modules that
 carry their own attribution; it does not catalogue provenance.
@@ -240,7 +240,7 @@ those crypto and format modules are yours too without going looking.
 | `net` | 74 | [`http`](modules/http/README.md) (web) · [`ramcache`](modules/ramcache/README.md) (storage) · [`resilience`](modules/resilience/README.md) (web) · [`kvtree`](modules/kvtree/README.md) (storage) · [`rsa`](modules/rsa/README.md) (crypto) · [`xml`](modules/xml/README.md) (web) · [`x509`](modules/x509/README.md) (crypto) · [`tlsclient`](modules/tlsclient/README.md) (crypto) · [`sphinx`](modules/sphinx/README.md) (crypto) |
 | `storage` | 15 | [`zstd`](modules/zstd/README.md) (format) · [`crc32c`](modules/crc32c/README.md) (format) · [`hashdigest`](modules/hashdigest/README.md) (crypto) |
 | `crypto` | 76 | [`http`](modules/http/README.md) (web) · [`aescbc`](modules/aescbc/README.md) (web) |
-| `format` | 21 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
+| `format` | 22 | [`http`](modules/http/README.md) (web) · [`decimal`](modules/decimal/README.md) (storage) |
 | `os` | 12 | [`framing`](modules/framing/README.md) (format) |
 <!-- END GENERATED: check-libs-table -->
 
@@ -251,7 +251,7 @@ Every module is imported by its `name` (`@import("http")`); hyphenated names wor
 <!-- BEGIN GENERATED: check-portable-table (source: build.zig; regenerate with `zig build gen-portable-table`; do not hand-edit) -->
 ### Portability — claimed vs. verified
 
-Every one of the 233 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 233 modules — a linux64-only module has nothing further to show here.
+Every one of the 234 modules above claims `.linux64` (Linux, amd64 or arm64) — the collection's mandatory baseline (CONVENTIONS.md §4), and the one target actually **run**, not merely compiled: the CI matrix executes every module's tests in `ReleaseSafe`, `ReleaseFast` and `-Dstrict-debug`, plus a separate arm64 lane. That claim is not repeated below for all 234 modules — a linux64-only module has nothing further to show here.
 
 39 of them additionally claim a cross-compile target in `meta.targets` (CONVENTIONS.md §4). `zig build check-portable` *compiles* (never runs — none of these targets has a host to run on here) each declared pair TWICE — the test binary, and a second root that takes a reference to every non-generic public declaration, because Zig analyses a body only when something references it and a `pub fn` no test reaches would otherwise never meet this target at all — and checks the result against [`scripts/checks/portable-known-failures.tsv`](scripts/checks/portable-known-failures.tsv): of 41 declared pairs, 40 currently compile clean and 1 are known-failing, tracked there with the real compiler error rather than silently dropped.
 
@@ -590,6 +590,7 @@ way to recognise it.
 | [`datefmt`](modules/datefmt/README.md) | Civil calendar plus token-based date/time parse/format and calendar arithmetic, correct before 1970. | any | — |
 | [`encoding`](modules/encoding/README.md) | Legacy single-byte code page ↔ UTF-8 transcoding (5 European code pages: windows-125x, ISO-8859-1/2/15). | any | — |
 | [`framing`](modules/framing/README.md) | Length-prefixed stream framing (`writeFrame`/`readFrame`) plus a generic JSON tagged-union envelope codec. | any | — |
+| [`ini`](modules/ini/README.md) | INI reader — sections, key = value, comments; Python configparser and Desktop Entry (GKeyFile) dialects. | any | — |
 | [`jinja`](modules/jinja/README.md) | Jinja2-compatible template engine — expressions, control flow, template inheritance/macros/imports, over a symlink-contained loader. | any | — |
 | [`json5`](modules/json5/README.md) | Single-pass JSON5→JSON preprocessor (comments, unquoted keys, trailing commas, single-quoted strings). | any | — |
 | [`linkheader`](modules/linkheader/README.md) | Web Linking (RFC 8288) `Link` header build + parse (rel/title/type), plus `pagination` helpers and `find(rel)`; zero-alloc. | any | — |
