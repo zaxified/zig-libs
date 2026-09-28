@@ -180,4 +180,13 @@ pub const rows = [_]Golden{
     .{ .case = "prod-fallback-reps-1", .level = 16, .len = 30088, .sha256 = "deb6082999aca276d4cd74a09b7bbfd310e57272a51f602ffe725fbbcf20c6a2" },
     .{ .case = "sprod-fail-fallback", .level = 1, .len = 234611, .sha256 = "769430a5484fae9440a990bd630166fcc7ca43d348628a9ff6b2d0decbe3ad7d" },
     .{ .case = "sprod-fail-fallback", .level = 7, .len = 236395, .sha256 = "21b483ea71139ce08c4c17f02fbaf00ae72147a12d10c90c1035d83fac602816" },
+    .{ .case = "prod-full-buffer", .level = 3, .len = 4118, .sha256 = "5cc2a93a21a8c22d35dc3dd612825213f8a3b398fce83a5dbd03aef856a15a5c" },
+    .{ .case = "gen-ll-65536", .level = 13, .len = 64, .sha256 = "063de9a10c7d43a2ec4a65c833b972f90efc59eed08ce822ee6c83c4f8fabe93" },
+    .{ .case = "cseq-ml-most-frequent-edge", .level = 1, .len = 5742, .sha256 = "fb2eb75ba93b46a1b3e5e632dfe90a822ed3608ee5561b34dddd9857a22929e6" },
+    .{ .case = "cseq-ncount-2048", .level = 12, .len = 101007, .sha256 = "0a01b759acfe9834228942d73204a417330359fb0c3053fb695106669cacd9d1" },
+    .{ .case = "prod-split-largest", .level = 3, .len = 29306, .sha256 = "ffde7f0ab505a74cc93a24c51395ebae832b5a5bf4054d9a3f2115dcf26b822c" },
+    .{ .case = "prod-split-1024", .level = 3, .len = 1246, .sha256 = "9eb04c40db73a6635efdeb8d858e64ef47d6dfcf91c00f3a3117ad0259aa875b" },
+    .{ .case = "prod-split-repeat", .level = 3, .len = 5180, .sha256 = "bd6d8b6dcf38c177fc62ddb461c3cf7e41b0c6c636d38df86208ed1bf0d88f24" },
+    .{ .case = "prod-superblock-repeat", .level = 3, .len = 5372, .sha256 = "ea927a5344f5aa61d32068c5e70bf905f9ef61308e9345eb8232d39466205c7d" },
+    .{ .case = "prod-superblock-h12", .level = 3, .len = 40, .sha256 = "e7ad7067ff2afdcdaaac541ada1f39a30ca2ae236afd0b6f5a0f286daf81de3a" },
 };

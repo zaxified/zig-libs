@@ -156,8 +156,11 @@ static void writeSeqs(char const* path, ZSTD_Sequence const* s, size_t n)
  *   9    last literals one byte short (sum below the block)
  *   10   the first match's offset 2^20 too large
  *   11   matches cut to 3 bytes
+ *   12   the rest of the buffer filled with empty delimiters (returns cap)
+ *   13   replay <seqs> instead of matching: each call returns the next
+ *        sequences up to and including a delimiter
  * The module's `ExampleProducer` (src/seq_test.zig) is the same function. */
-typedef struct { unsigned mode; unsigned calls; } Producer;
+typedef struct { unsigned mode; unsigned calls; ZSTD_Sequence const* list; size_t nlist, pos; } Producer;
 
 static size_t produce(void* state, ZSTD_Sequence* out, size_t cap, void const* srcv, size_t n,
                       void const* dict, size_t dictSize, int level, size_t windowSize)
@@ -170,6 +173,15 @@ static size_t produce(void* state, ZSTD_Sequence* out, size_t cap, void const* s
     if (period && p->calls % period == 0) return ZSTD_SEQUENCE_PRODUCER_ERROR;
     if (p->mode & 32) return 0;
     if (p->mode & 64) return cap + 1;
+    if (p->mode & 8192) {
+        size_t ns = 0;
+        while (p->pos < p->nlist && ns < cap) {
+            ZSTD_Sequence const s = p->list[p->pos++];
+            out[ns++] = s;
+            if (s.offset == 0 && s.matchLength == 0) break;
+        }
+        return ns;
+    }
     static uint32_t table[4096];
     for (size_t i = 0; i < 4096; i++) table[i] = 0xFFFFFFFFu;
     size_t const mm = (p->mode & 256) ? 3 : 4;
@@ -205,6 +217,8 @@ static size_t produce(void* state, ZSTD_Sequence* out, size_t cap, void const* s
         out[ns].rep = 0;
         ns++;
     }
+    if (p->mode & 4096)
+        for (; ns < cap; ns++) memset(&out[ns], 0, sizeof(out[ns]));
     return ns;
 }
 
@@ -272,7 +286,7 @@ int main(int argc, char** argv)
     size_t const cap = capArg ? capArg : ZSTD_compressBound(n) + 4 * nseq + 32;
     char* const dst = malloc(cap + 1);
     size_t r;
-    Producer prod = { 0, 0 };
+    Producer prod = { 0, 0, seqs, nseq, 0 };
     if (!strcmp(cmd, "cseq")) {
         r = ZSTD_compressSequences(cctx, dst, cap, seqs, nseq, src, n);
     } else if (!strcmp(cmd, "clit")) {

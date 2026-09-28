@@ -375,6 +375,7 @@ const module_list = [_]Module{
     .{ .name = "tfhe", .libs = &.{"crypto"}, .deps = &.{"entropy"}, .heavy = true },
     .{ .name = "montint", .libs = &.{"crypto"}, .heavy = true, .test_deps = &.{"testkit"} },
     .{ .name = "chachapoly", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },
+    .{ .name = "aesgcm", .libs = &.{ "crypto", "net" } },
     .{ .name = "k256", .libs = &.{"crypto"} },
     .{ .name = "p256", .libs = &.{ "crypto", "web" } },
     .{ .name = "ripemd160", .libs = &.{"crypto"}, .test_deps = &.{"testkit"} },

@@ -65,6 +65,7 @@ pub const Kind = enum {
     dict_boundary_echo, // hunted (D1): a dictMatchState match reaches exactly the CDict's end and continues into the prefix
     survivor_literal, // hunted (D1): a mutation-sweep survivor's killing case; `seed` indexes `survivor_inputs`
     rsync_marks, // words with rsyncable synchronization points placed by hand: `seed` indexes `rsync_mark_sets`
+    laid_out, // pieces laid out by hand to reach one boundary (SPEC.md, *Anchoring*): `seed` picks the layout in `laidOut`
 };
 
 pub const cases = [_]Case{
@@ -178,6 +179,16 @@ pub const cases = [_]Case{
     .{ .name = "ocf-mix-20000-128-w12", .len = 20000, .kind = .mix, .seed = 128, .only_levels = &.{11}, .window_log = 12, .ocf = true }, // btlazy2's unsorted mark must survive the reduction
     .{ .name = "ocf-ldm-mix-600000-244-w13", .len = 600000, .kind = .mix, .seed = 244, .only_levels = &.{18}, .ldm = true, .window_log = 13, .ocf = true }, // the LDM table is reduced with the window
     .{ .name = "ocf-ldm-mix-600000-67-w11", .len = 600000, .kind = .mix, .seed = 67, .only_levels = &.{19}, .ldm = true, .window_log = 11, .ocf = true }, // ... and its offsets below the correction become 0
+    // Laid out by hand for one boundary each (Z25 bound, SPEC.md *Anchoring*)
+    .{ .name = "ll-65536", .len = 67786, .kind = .laid_out, .seed = 0, .only_levels = &.{13} }, // generateSequences: a literal length of exactly 65 536 before a repcode
+    .{ .name = "tree-4096", .len = 17596, .kind = .laid_out, .seed = 1, .only_levels = &.{13} }, // btopt: a tree match of exactly ZSTD_OPT_NUM goes on searching
+    .{ .name = "hash3-target", .len = 50000, .kind = .laid_out, .seed = 2, .only_levels = &.{14} }, // btopt: a 3-byte-hash match of exactly targetLength goes on into the tree
+    .{ .name = "insertbt1-window", .len = 23150, .kind = .laid_out, .seed = 3, .only_levels = &.{13} }, // insertBt1's window from the target (param_cases, windowLog 10)
+    .{ .name = "split-largest", .len = 34820, .kind = .laid_out, .seed = 4, .only_levels = &.{3} }, // seq_cases: the post-splitter's "no gain" test at equality
+    .{ .name = "split-1024", .len = 3417, .kind = .laid_out, .seed = 5, .only_levels = &.{3} }, // seq_cases: a split half of exactly 1024 literals
+    .{ .name = "split-repeat", .len = 131072 + 1396, .kind = .laid_out, .seed = 6, .only_levels = &.{3} }, // seq_cases: literals costing exactly 8 bits under the previous table
+    .{ .name = "superblock-repeat", .len = 131072 + 1500, .kind = .laid_out, .seed = 7, .only_levels = &.{3} }, // seq_cases: the previous table exactly as good as a new one
+    .{ .name = "superblock-h12", .len = 19 * 5, .kind = .laid_out, .seed = 8, .only_levels = &.{3} }, // seq_cases: a table header exactly 12 bytes under the literals
 };
 
 /// Goldens with libzstd's advanced parameters (`zstd.Advanced`): corpus case
@@ -206,6 +217,12 @@ pub const param_cases = [_]ParamCase{
     .{ .case = "words-262145", .params = "strategy=1", .levels = &.{19} }, // fast on level 19's: minMatch 3, a 256 step
     .{ .case = "far-repeat", .params = "windowLog=21", .levels = &.{1} }, // a wider window than the level's
     .{ .case = "csv-600000", .params = "strategy=6,windowLog=20", .levels = &.{3} }, // btlazy2 over a 1 MB window
+    // boundaries constructed for (Z25 bound; SPEC.md, *Anchoring*): small
+    // trees and windows put the tree's low end and the window's in play
+    .{ .case = "two-symbols-16384-0", .params = "strategy=6,windowLog=10,chainLog=6,searchLog=3", .levels = &.{12} }, // DUBT insertion stops at the tree's low end (`<=`), both sides
+    .{ .case = "two-symbols-16384-0", .params = "strategy=7,windowLog=10,chainLog=6,targetLength=4,minMatch=4", .levels = &.{16} }, // ... and so does insertBt1
+    .{ .case = "insertbt1-window", .params = "windowLog=10,targetLength=4", .levels = &.{13} }, // insertBt1's window is the target's
+    .{ .case = "words-16384", .params = "enableLongDistanceMatching=1,windowLog=11,maxBlockSize=1500,ldmHashRateLog=1,ldmMinMatch=4", .levels = &.{1} }, // LDM with splits at almost every byte, 1.5 KB blocks and a 2 KB window: nine boundaries of ZSTD_ldm_generateSequences_internal
     // the row match finder
     .{ .case = "words-16384", .params = "useRowMatchFinder=1", .levels = &.{ 4, 5, 6, 7, 8 } }, // rows in a 16 KB window
     .{ .case = "csv-600000", .params = "useRowMatchFinder=2", .levels = &.{ 5, 7, 8 } }, // the hash chain in a 2 MB one
@@ -433,6 +450,11 @@ pub const stream_cases = [_]StreamCase{
     .{ .case = "seven", .schedule = "stableOutBuffer=1,o20,c*,e0", .levels = &.{3} },
     .{ .case = "empty", .schedule = "stableOutBuffer=1,o18,c*,e0", .levels = &.{3} },
     .{ .case = "words-16385", .schedule = "stableOutBuffer=1,o3604,c*,f0,e0", .levels = &.{3} },
+    // (Z25 bound) a second frame on the same stream, btlazy2 with a small
+    // window: the unsorted-candidate walk stops at the window's low end
+    // too, not only at the tree's, and so never reaches the first frame's
+    // stale entries below it
+    .{ .case = "words-16384", .schedule = "strategy=6,chainLog=11,windowLog=10,searchLog=1,e8192,e*", .levels = &.{12} },
 };
 
 pub const levels = [_]i32{ -5, -1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22 };
@@ -632,6 +654,7 @@ pub fn generate(case: Case, out: []u8) void {
         .dict_boundary_echo => @memcpy(out, &dict_boundary_echo_input),
         .survivor_literal => @memcpy(out, survivor_inputs[@as(usize, @intCast(case.seed))]),
         .rsync_marks => rsyncMarks(&r, out, rsync_mark_sets[@as(usize, @intCast(case.seed))]),
+        .laid_out => laidOut(&r, out, case.seed),
         .sparse_matches => {
             const phrases = [_][]const u8{ "<record id=\"", "\" type=\"sample\">", "</record>\n", "timestamp=" };
             var i: usize = 0;
@@ -3183,6 +3206,235 @@ pub const rsync_mark_sets = [_][]const usize{
     },
 };
 
+/// Inputs laid out piece by piece so that one boundary of the compressor
+/// is met exactly (SPEC.md, *Anchoring*); `layout` is the case's `seed`.
+fn laidOut(r: *Rng, out: []u8, layout: u64) void {
+    switch (layout) {
+        // A literal run of exactly 65 536 bytes before a repcode match
+        // (`ll-65536`): 1000 bytes of noise, 500 of them again (offset
+        // 1000), 65 536 bytes of noise, 300 bytes from 1000 back (repeat
+        // offset 1, 65 536 literals), 50 bytes of noise, 300 bytes from 1000
+        // back again (repeat offset 1, 50 literals), 100 bytes of noise.
+        // At level 13 (btopt, minMatch 4) the parser takes exactly these
+        // matches (from level 14 on, minMatch 3 finds 3-byte ones in the
+        // noise); `ZSTD_generateSequences`
+        // updates its offset history from the 16 bits the sequence store
+        // keeps of 65 536 -- a literal length of 0 -- and so reports the
+        // second repeat's offset as 1 rather than 1000.
+        0 => {
+            random(r, out);
+            @memcpy(out[1000..1500], out[0..500]);
+            const q = 1500 + 65536;
+            for (out[q..][0..300], q..) |*b, i| b.* = out[i - 1000];
+            const q2 = q + 300 + 50;
+            for (out[q2..][0..300], q2..) |*b, i| b.* = out[i - 1000];
+            // each match starts and ends exactly there
+            for ([_]usize{ 1500, q - 1, q + 300, q2 - 1, q2 + 300 }) |i| {
+                if (out[i] == out[i - 1000]) out[i] +%= 1;
+            }
+        },
+        // A binary-tree match of exactly `ZSTD_OPT_NUM` (4096) bytes
+        // (`tree-4096`): 6000 bytes of noise X, its first 4096 bytes again
+        // (Y, a 4096-byte match), 2000 bytes of noise, X's first 5000 bytes
+        // (P), 500 bytes of noise. At 4096 the search goes on (`>`, not
+        // `>=`), so Y's insertion links X below it and P, whose tree walk
+        // starts at Y, reaches X's 5000 bytes through it.
+        1 => {
+            random(r, out);
+            @memcpy(out[6000..10096], out[0..4096]);
+            const p = 12096;
+            @memcpy(out[p..][0..5000], out[0..5000]);
+            if (out[10096] == out[4096]) out[10096] +%= 1;
+            if (out[p + 5000] == out[5000]) out[p + 5000] +%= 1;
+        },
+        // A 3-byte-hash match of exactly `targetLength` (32 at level 14,
+        // `hash3-target`): noise with A (100 bytes at 1000), B = A's first
+        // 40 bytes (1600), C = A's first 32 (2140), E = A's first 3
+        // (2872), D = C's first 100 bytes (3425), then 30 000 zeros so the
+        // block is compressed. At C the 3-byte hash finds B, exactly 32
+        // bytes: the search goes on into the tree (`>`, not `>=`) and so
+        // inserts C, which D -- whose 3-byte hash finds only E -- then
+        // reaches through the tree for 100 bytes.
+        2 => {
+            random(r, out[0..20000]);
+            @memset(out[20000..], 0);
+            @memcpy(out[1600..][0..40], out[1000..][0..40]);
+            @memcpy(out[2140..][0..32], out[1000..][0..32]);
+            if (out[2140 + 32] == out[1000 + 32]) out[2140 + 32] +%= 1;
+            if (out[1600 + 40] == out[1000 + 40]) out[1600 + 40] +%= 1;
+            @memcpy(out[2872..][0..3], out[1000..][0..3]);
+            if (out[2872 + 3] == out[1000 + 3]) out[2872 + 3] +%= 1;
+            @memcpy(out[3425..][0..100], out[2140..][0..100]);
+        },
+        // `insertBt1`'s window from the insertion target, not from each
+        // inserted position (`insertbt1-window`, with windowLog 10): 1000
+        // bytes of noise, 2000 bytes repeating from 700 back, 10 bytes of
+        // noise, 40 bytes from 400 before the repeat's end, 100 bytes of
+        // noise, 20 000 zeros. The long match makes the tree update insert
+        // the repeat's last 708 positions at once; the window at the
+        // target, 1 KB below the repeat's end, excludes each one's twin 700
+        // back, which the window at the position itself would include --
+        // a match over 384 bytes that would skip the later insertions the
+        // 40-byte copy then finds.
+        3 => {
+            random(r, out[0..3150]);
+            @memset(out[3150..], 0);
+            for (out[1000..3000], 1000..) |*b, i| b.* = out[i - 700];
+            @memcpy(out[3010..][0..40], out[2600..][0..40]);
+        },
+        // The inputs of the replayed sequence lists below (`seq_cases`):
+        // each list's literals taken from a literal stream, each match
+        // copied from its offset.
+        4 => fromSequences(out, &split_largest_seqs, &splitLargestLits()),
+        5 => fromSequences(out, &split_1024_seqs, &split1024Lits()),
+        6 => fromSequences(out, &(entropy_table_block ++ split_repeat_block), &(entropyTableLits() ++ split_repeat_lits.*)),
+        7 => fromSequences(out, &(entropy_table_block ++ superblock_repeat_block), &(entropyTableLits() ++ superblock_repeat_lits.*)),
+        8 => fromSequences(out, &superblock_h12_seqs, superblock_h12_lits),
+        else => unreachable,
+    }
+}
+
+/// The input of a replayed sequence list: each sequence's literals taken
+/// in turn from `lits`, then its match copied from `offset` back.
+fn fromSequences(out: []u8, seqs: []const seqgen.Seq, lits: []const u8) void {
+    var op: usize = 0;
+    var lp: usize = 0;
+    for (seqs) |s| {
+        @memcpy(out[op..][0..s.lit_length], lits[lp..][0..s.lit_length]);
+        op += s.lit_length;
+        lp += s.lit_length;
+        for (0..s.match_length) |_| {
+            out[op] = out[op - s.offset];
+            op += 1;
+        }
+    }
+    std.debug.assert(op == out.len and lp == lits.len);
+}
+
+/// `n` copies of `s`.
+fn seqRun(comptime n: usize, comptime s: seqgen.Seq) [n]seqgen.Seq {
+    return [_]seqgen.Seq{s} ** n;
+}
+
+/// Round robin over the symbols 0.. (symbol `s` `counts[s]` times): the
+/// literal stream of a histogram.
+fn roundRobin(comptime counts: []const u16) [countSum(counts)]u8 {
+    @setEvalBranchQuota(10_000_000);
+    var out: [countSum(counts)]u8 = undefined;
+    var n: usize = 0;
+    var round: usize = 0;
+    while (n < out.len) : (round += 1) {
+        for (counts, 0..) |c, sym| if (round < c) {
+            out[n] = @intCast(sym);
+            n += 1;
+        };
+    }
+    return out;
+}
+
+// The post-splitter's "no gain" test at equality (`split-largest`): 512
+// sequences of 64 literals and a 4-byte match at offset 1, then 4 literal
+// zeros. Symbols 0..63 occur 133 times in the first half and 123 in the
+// second, 64..127 the other way round: the whole block's most frequent
+// literal (0, 260 times) is exactly 32 772 / 128 + 4, stored raw, while
+// each half is Huffman-coded; with Huffman for the whole block too, the
+// split would not pay.
+const split_largest_seqs = seqRun(512, .{ .offset = 1, .lit_length = 64, .match_length = 4 }) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 4, .match_length = 0 }};
+fn splitLargestLits() [32772]u8 {
+    const a = comptime roundRobin(&(.{133} ** 64 ++ .{123} ** 64));
+    const b = comptime roundRobin(&(.{123} ** 64 ++ .{133} ** 64));
+    return a ++ b ++ [_]u8{0} ** 4;
+}
+
+// A split half of exactly 1024 literals (`split-1024`): 160 sequences with
+// 1024 literals over 16 symbols, 160 with 1113 over 16 others (one
+// shifted), matches of 4 at offset 1. The split then saves nothing: the
+// estimates of the halves and the whole add up exactly, and the half's
+// literal header of 4 bytes (3 below 1024) decides.
+const split_1024_seqs = seqRun(64, .{ .offset = 1, .lit_length = 7, .match_length = 4 }) ++ seqRun(96, .{ .offset = 1, .lit_length = 6, .match_length = 4 }) ++
+    seqRun(153, .{ .offset = 1, .lit_length = 7, .match_length = 4 }) ++ seqRun(7, .{ .offset = 1, .lit_length = 6, .match_length = 4 }) ++
+    [_]seqgen.Seq{.{ .offset = 0, .lit_length = 0, .match_length = 0 }};
+fn split1024Lits() [1024 + 1113]u8 {
+    var out: [1024 + 1113]u8 = undefined;
+    for (out[0..1024], 0..) |*b, i| b.* = @intCast(65 + i % 16);
+    for (out[1024..], 0..) |*b, i| b.* = @intCast(66 + i % 16);
+    return out;
+}
+
+// A first block that leaves a Huffman table of dyadic code lengths for the
+// next: 8192 literals, symbol 0 half of them (1 bit), 1..32 at 7 bits,
+// 33..64 at 8, 65..128 at 9; 256 sequences of 32 literals and a 480-byte
+// match at offset 1.
+const entropy_table_block = seqRun(256, .{ .offset = 1, .lit_length = 32, .match_length = 480 }) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 0, .match_length = 0 }};
+fn entropyTableLits() [8192]u8 {
+    return comptime roundRobin(&(.{4096} ++ .{64} ** 32 ++ .{32} ** 32 ++ .{16} ** 64));
+}
+
+// Then (`split-repeat`) 320 sequences, 70 of them with a literal (the
+// rest none), whose 70 literals cost exactly 8 bits each under that table
+// (20 of 7 bits, 20 of 9, 30 of 8) and would not shrink under a table of
+// their own: the whole block is estimated raw rather than priced with the
+// previous table (`<`, not `<=`). Of the second half's matches, 46 are 5
+// bytes rather than 4 -- the knob that sets the halves' estimates 1 byte
+// above the whole's (no split); the previous table's estimate would add 3
+// bytes to the whole, and the block would be split.
+const split_repeat_block = blk: {
+    var out: [321]seqgen.Seq = undefined;
+    for (0..320) |i| out[i] = .{
+        .offset = 1,
+        .lit_length = if (i % 160 < 35) 1 else 0,
+        .match_length = if (i >= 160 and i < 160 + 46) 5 else 4,
+    };
+    out[320] = .{ .offset = 0, .lit_length = 0, .match_length = 0 };
+    break :blk out;
+};
+/// (found by search over shuffles: the first half's 35, then the second's)
+const split_repeat_lits: *const [70]u8 =
+    "\x52\x47\x03\x4e\x44\x4b\x48\x42\x51\x0b\x0c\x43\x06\x02\x0a\x50" ++
+    "\x21\x4d\x46\x0e\x4a\x01\x4c\x04\x07\x0d\x45\x4f\x0f\x49\x10\x08" ++
+    "\x41\x05\x09\x32\x12\x2c\x31\x53\x28\x13\x27\x22\x21\x21\x24\x2f" ++
+    "\x2b\x38\x2a\x2e\x54\x14\x36\x25\x11\x21\x3a\x30\x33\x2d\x35\x23" ++
+    "\x21\x29\x37\x34\x26\x39";
+
+// Then (`superblock-repeat`, with a target block size: the superblock
+// path uses the same literal statistics) 300 sequences of one literal and
+// a 4-byte match, whose literals the previous table codes in exactly the
+// bytes a new table and its header take: the previous one is kept
+// (`<=`), and a new one would be written.
+const superblock_repeat_block = seqRun(300, .{ .offset = 1, .lit_length = 1, .match_length = 4 }) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 0, .match_length = 0 }};
+/// (found by search over draws weighted like the table)
+const superblock_repeat_lits: *const [300]u8 =
+    "\x70\x34\x27\x08\x54\x03\x1c\x06\x18\x12\x1c\x36\x23\x0e\x41\x3a" ++
+    "\x4d\x00\x2e\x60\x0f\x0a\x49\x17\x1a\x49\x18\x0a\x0c\x16\x35\x17" ++
+    "\x3f\x00\x0f\x30\x1e\x20\x6e\x0f\x09\x00\x1e\x12\x1d\x00\x00\x17" ++
+    "\x3e\x12\x63\x27\x1a\x41\x0d\x2a\x52\x23\x13\x00\x27\x09\x17\x23" ++
+    "\x70\x33\x21\x55\x12\x19\x33\x24\x0c\x1b\x4b\x0e\x35\x00\x74\x34" ++
+    "\x13\x7b\x44\x00\x0f\x1f\x80\x06\x00\x12\x00\x1b\x23\x1c\x06\x00" ++
+    "\x46\x1c\x1e\x1d\x34\x61\x4d\x39\x15\x09\x00\x55\x00\x25\x63\x13" ++
+    "\x19\x1b\x71\x34\x51\x00\x3a\x1c\x1a\x49\x3a\x63\x3a\x63\x1c\x24" ++
+    "\x42\x1d\x06\x28\x59\x59\x03\x18\x0d\x16\x76\x1c\x12\x0f\x1c\x33" ++
+    "\x16\x09\x0c\x0f\x62\x09\x3d\x02\x42\x0f\x42\x1c\x00\x00\x44\x23" ++
+    "\x1e\x17\x34\x1e\x00\x2a\x12\x52\x24\x3f\x03\x35\x2c\x53\x5e\x24" ++
+    "\x28\x3f\x0f\x23\x42\x28\x23\x55\x79\x0f\x00\x2d\x07\x78\x1d\x21" ++
+    "\x49\x59\x07\x1d\x09\x1d\x04\x5d\x17\x19\x60\x4b\x15\x20\x33\x09" ++
+    "\x05\x55\x07\x35\x3a\x28\x16\x55\x42\x00\x60\x31\x12\x09\x00\x48" ++
+    "\x52\x16\x09\x00\x1b\x12\x00\x12\x4a\x00\x1a\x20\x07\x00\x00\x07" ++
+    "\x79\x56\x35\x61\x13\x0f\x59\x2a\x6a\x17\x1b\x38\x5e\x08\x0f\x00" ++
+    "\x24\x6a\x25\x07\x34\x32\x02\x63\x32\x1f\x16\x07\x1d\x17\x0d\x32" ++
+    "\x33\x74\x78\x1d\x38\x17\x1c\x25\x7b\x00\x1d\x15\x47\x74\x1d\x00" ++
+    "\x28\x28\x34\x40\x1d\x24\x3f\x00\x0e\x34\x7a\x70";
+
+// A table header exactly 12 bytes short of the literals
+// (`superblock-h12`): 19 sequences of one literal and a 4-byte match under
+// a full dictionary (its Huffman table valid, so literals from 7 bytes up
+// are considered), whose 19 literals a new table codes in 3 bytes with a
+// 7-byte header while the dictionary's takes 13: the dictionary's is kept
+// only because the header is that large (`>=`, not `>`). Without a
+// dictionary this is unreachable (the literals would need 64 bytes and a
+// header of 52 for a table that codes them in 11).
+const superblock_h12_seqs = seqRun(19, .{ .offset = 1, .lit_length = 1, .match_length = 4 }) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 0, .match_length = 0 }};
+const superblock_h12_lits: *const [19]u8 = "ouoouooooooduooodoo";
+
 /// Words with `rsync_trigger` ending at each of `marks`, and no other
 /// 32-byte window whose rolling hash has its low 19 bits set (the smallest
 /// mask, 512 KB jobs): where such a window ends, its last byte is changed
@@ -3371,7 +3623,8 @@ pub const seqgen = @import("seqgen.zig");
 /// (`gen`, `merge`, `cseq`, `clit`, `prod:<mode>`, `sprod:<mode>:<chunk>`)
 /// over the `cases` input `input` with the parameters `params` (zref's
 /// `name=value` list), at each of `levels`. The sequences `merge`, `cseq`
-/// and `clit` read are `seqgen.generate(input, gen)`. The golden is the
+/// and `clit` read are `seqgen.generate(input, gen)`; a producer given a
+/// hand-made `gen.list` replays it block by block (mode bit 13). The golden is the
 /// length and SHA-256 of the output (a frame, or the sequences as 16-byte
 /// records), or libzstd's error.
 pub const SeqCase = struct {
@@ -3596,6 +3849,79 @@ pub const seq_cases = [_]SeqCase{
     .{ .name = "prod-fallback-reps-2", .input = "ldm-far-mix-300000-3", .cmd = "prod:2", .params = "maxBlockSize=2048,enableSeqProducerFallback=1,repcodeResolution=2", .levels = &.{16} },
     .{ .name = "prod-fallback-reps-1", .input = "ldm-far-mix-200000-20", .cmd = "prod:2", .params = "maxBlockSize=1024,enableSeqProducerFallback=1,repcodeResolution=2", .levels = &.{16} },
     .{ .name = "sprod-fail-fallback", .input = "csv-600000", .cmd = "sprod:3:70000", .params = "enableSeqProducerFallback=1", .levels = &.{ 1, 7 } },
+
+    // Boundaries constructed rather than searched for (Z25 bound; SPEC.md,
+    // *Anchoring*). A producer that fills its whole buffer, the last
+    // sequence a delimiter (it pads its parse with empty delimiters, which
+    // libzstd reads past the first one): kept as it is, not refused.
+    .{ .name = "prod-full-buffer", .input = "words-16384", .cmd = "prod:4096" },
+    // A literal length of exactly 65 536 before a repcode match: the
+    // collector's offset history reads the 16 bits the store keeps (0).
+    .{ .name = "gen-ll-65536", .input = "ll-65536", .cmd = "gen", .levels = &.{13} },
+    // Below `lazy`, a table is predefined when its most frequent code
+    // occurs fewer than nbSeq >> (log - 1) times: 320 sequences whose
+    // match-length codes 1..32 occur 10 times each, exactly 320 >> 5.
+    .{ .name = "cseq-ml-most-frequent-edge", .input = "words-16384", .cmd = "cseq", .params = explicit, .levels = &.{1}, .gen = .{ .list = &mlCodeBlock(&(.{0} ++ .{10} ** 32), 16384) } },
+    // From `lazy` up, `ZSTD_NCountCost` prices a table normalized with
+    // low-probability counts of -1 from exactly 2048 sequences on: a block
+    // of 2048 whose match-length table header is one byte shorter that way,
+    // which is what makes a new table cheaper than the predefined one
+    // (11 336 bits against 11 339; with counts of 1, 11 344).
+    .{ .name = "cseq-ncount-2048", .input = "words-262144", .cmd = "cseq", .params = explicit, .levels = &.{12}, .gen = .{ .list = &(mlCodeBlock(&ncount_2048_counts, 131072) ++ [_]seqgen.Seq{.{ .offset = 0, .lit_length = 131072, .match_length = 0 }}) } },
+    // The literal statistics of the post-splitter's estimates and of
+    // superblocks at their equalities, on hand-made sequences a producer
+    // replays over the inputs laid out for them (`laidOut`, which says
+    // how each works): "no gain" at exactly n / 128 + 4, a half of exactly
+    // 1024 literals, the previous table at exactly n bytes, at exactly the
+    // new table's size, and a header exactly 12 bytes short (with a full
+    // dictionary: unreachable without one).
+    .{ .name = "prod-split-largest", .input = "split-largest", .cmd = "prod:8192", .params = "splitAfterSequences=1", .gen = .{ .list = &split_largest_seqs } },
+    .{ .name = "prod-split-1024", .input = "split-1024", .cmd = "prod:8192", .params = "splitAfterSequences=1", .gen = .{ .list = &split_1024_seqs } },
+    .{ .name = "prod-split-repeat", .input = "split-repeat", .cmd = "prod:8192", .params = "splitAfterSequences=1", .gen = .{ .list = &(entropy_table_block ++ split_repeat_block) } },
+    .{ .name = "prod-superblock-repeat", .input = "superblock-repeat", .cmd = "prod:8192", .params = "targetCBlockSize=1340", .gen = .{ .list = &(entropy_table_block ++ superblock_repeat_block) } },
+    .{ .name = "prod-superblock-h12", .input = "superblock-h12", .cmd = "prod:8192", .params = "targetCBlockSize=1340", .gen = .{ .list = &superblock_h12_seqs }, .dict = .{ .mode = "load", .trained = "zd-words", .content_type = 0 } },
+};
+
+/// The shortest match length of each match-length code 0..45 (`ML_base`
+/// of the format, plus `MINMATCH`).
+const ml_code_min = [_]u32{
+    3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14,  15,  16,  17, 18,
+    19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,  31,  32,  33, 34,
+    35, 37, 39, 41, 43, 47, 51, 59, 67, 83, 99, 131, 259, 515,
+};
+
+fn countSum(comptime counts: []const u16) usize {
+    var n: usize = 0;
+    for (counts) |c| n += c;
+    return n;
+}
+
+/// One block of sequences with the match-length code histogram `counts`
+/// (code `c` `counts[c]` times, in code order, each its shortest match
+/// after 1 literal at offset 1), closed by a delimiter whose literals make
+/// the block `block_len` bytes.
+fn mlCodeBlock(comptime counts: []const u16, comptime block_len: u32) [countSum(counts) + 1]seqgen.Seq {
+    @setEvalBranchQuota(100_000);
+    var out: [countSum(counts) + 1]seqgen.Seq = undefined;
+    var i: usize = 0;
+    var used: u32 = 0;
+    for (counts, 0..) |n, c| for (0..n) |_| {
+        out[i] = .{ .offset = 1, .lit_length = 1, .match_length = ml_code_min[c] };
+        used += 1 + ml_code_min[c];
+        i += 1;
+    };
+    out[i] = .{ .offset = 0, .lit_length = block_len - used, .match_length = 0 };
+    return out;
+}
+
+/// Match-length code counts over 2048 sequences (codes 0..45) for which
+/// `ZSTD_NCountCost`'s low-probability rule decides between the predefined
+/// and a new table (found by a search over histograms, costs computed with
+/// the module's own functions, then checked against libzstd).
+const ncount_2048_counts = [_]u16{
+    45, 183, 95, 89, 60, 60, 103, 45, 75, 48, 13, 31, 25, 38, 19, 30,
+    44, 31,  51, 56, 44, 35, 24,  40, 49, 26, 24, 45, 50, 14, 29, 22,
+    66, 31,  29, 55, 53, 47, 17,  54, 44, 11, 6,  32, 13, 47,
 };
 
 /// Goldens for a destination below `compressBound` (Z29): corpus case
