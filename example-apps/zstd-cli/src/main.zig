@@ -17,6 +17,8 @@ const disp = @import("display.zig");
 const fio = @import("fileio.zig");
 const list = @import("list.zig");
 const bench = @import("bench.zig");
+const util = @import("util.zig");
+const dibio = @import("dibio.zig");
 
 const version = "v1.5.7";
 const version_string = "1.5.7";
@@ -55,8 +57,24 @@ const Cli = struct {
     /// `-e#`: the last level benchmarked; below the first means just it.
     level_last: i32 = std.math.minInt(i32),
     separate_files: bool = false,
-    /// `-P#`: a synthetic input of this compressibility (not ported).
-    compressibility: ?u32 = null,
+    /// `-P#`: the synthetic input's compressibility, instead of lorem ipsum.
+    compressibility: ?f64 = null,
+    show_default_cparams: bool = false,
+    recursive: bool = false,
+    /// `--filelist`: files whose lines are more input names.
+    file_lists: std.ArrayList([]const u8) = .empty,
+    out_dir: ?[]const u8 = null,
+    out_mirror_dir: ?[]const u8 = null,
+    patch_from_name: ?[]const u8 = null,
+    /// `dict`, `coverParams` / `fastCoverParams`: the trainer `--train*`
+    /// runs.
+    train: dibio.Method = .{ .fast_cover = dibio.Params.default_fast_cover },
+    /// `dictCLevel`: set by `-#` and `--fast=#`, not by `ZSTD_CLEVEL`.
+    dict_level: i32 = 3,
+    max_dict_size: u32 = 110 << 10,
+    dict_id: u32 = 0,
+    /// `-s#`: the legacy trainer's selectivity (that trainer is not here).
+    dict_select: u32 = 9,
 };
 
 const Env = fio.Env;
@@ -78,7 +96,20 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     const arena = arena_state.allocator();
     const argv = try init.args.toSlice(arena);
     const env: Env = .{ .gpa = gpa, .io = io };
-    return run(env, arena, argv, init.environ);
+    const r = run(env, arena, argv, init.environ);
+    if (main_pause) waitEnter(io);
+    return r;
+}
+
+/// `-p`: wait for Enter at the end (`main_pause`), whatever the result --
+/// except after an exit on the spot, as in C.
+var main_pause = false;
+
+/// `waitEnter`.
+fn waitEnter(io: std.Io) void {
+    disp.always("Press enter to continue... \n", .{});
+    var b: [1]u8 = undefined;
+    _ = std.Io.File.stdin().readStreaming(io, &.{&b}) catch 0;
 }
 
 fn lastNameFromPath(path: []const u8) []const u8 {
@@ -114,6 +145,180 @@ fn readU32Checked(s: *[]const u8) ?u32 {
         if (s.len > 0 and s.*[0] == 'B') s.* = s.*[1..];
     }
     return r;
+}
+
+/// `parseCompressionParameters`: `--zstd=` into `cp` and the long-distance
+/// and overlap settings; false when malformed. Values are not checked here:
+/// the compressor refuses what is out of bounds.
+fn parseCompressionParameters(s_in: []const u8, cp: *fio.CParams, prefs: *fio.Prefs) bool {
+    var s = s_in;
+    while (true) {
+        if (longCommandWArg(&s, "windowLog=") or longCommandWArg(&s, "wlog=")) {
+            cp.window_log = readU32(&s);
+        } else if (longCommandWArg(&s, "chainLog=") or longCommandWArg(&s, "clog=")) {
+            cp.chain_log = readU32(&s);
+        } else if (longCommandWArg(&s, "hashLog=") or longCommandWArg(&s, "hlog=")) {
+            cp.hash_log = readU32(&s);
+        } else if (longCommandWArg(&s, "searchLog=") or longCommandWArg(&s, "slog=")) {
+            cp.search_log = readU32(&s);
+        } else if (longCommandWArg(&s, "minMatch=") or longCommandWArg(&s, "mml=")) {
+            cp.min_match = readU32(&s);
+        } else if (longCommandWArg(&s, "targetLength=") or longCommandWArg(&s, "tlen=")) {
+            cp.target_length = readU32(&s);
+        } else if (longCommandWArg(&s, "strategy=") or longCommandWArg(&s, "strat=")) {
+            cp.strategy = readU32(&s);
+        } else if (longCommandWArg(&s, "overlapLog=") or longCommandWArg(&s, "ovlog=")) {
+            prefs.overlap_log = readU32(&s);
+        } else if (longCommandWArg(&s, "ldmHashLog=") or longCommandWArg(&s, "lhlog=")) {
+            prefs.ldm_hash_log = readU32(&s);
+        } else if (longCommandWArg(&s, "ldmMinMatch=") or longCommandWArg(&s, "lmml=")) {
+            prefs.ldm_min_match = readU32(&s);
+        } else if (longCommandWArg(&s, "ldmBucketSizeLog=") or longCommandWArg(&s, "lblog=")) {
+            prefs.ldm_bucket_size_log = readU32(&s);
+        } else if (longCommandWArg(&s, "ldmHashRateLog=") or longCommandWArg(&s, "lhrlog=")) {
+            prefs.ldm_hash_rate_log = readU32(&s);
+        } else {
+            disp.at(4, "invalid compression parameter \n", .{});
+            return false;
+        }
+        if (s.len > 0 and s[0] == ',') {
+            s = s[1..];
+            continue;
+        }
+        break;
+    }
+    return s.len == 0; // check the end of string
+}
+
+/// `parseCoverParameters` / `parseFastCoverParameters`: the fields not given
+/// are 0; false when malformed.
+fn parseTrainParameters(s_in: []const u8, fast: bool, p: *dibio.Params) bool {
+    var s = s_in;
+    p.* = .{};
+    while (true) {
+        if (longCommandWArg(&s, "k=")) {
+            p.k = readU32(&s);
+        } else if (longCommandWArg(&s, "d=")) {
+            p.d = readU32(&s);
+        } else if (fast and longCommandWArg(&s, "f=")) {
+            p.f = readU32(&s);
+        } else if (longCommandWArg(&s, "steps=")) {
+            p.steps = readU32(&s);
+        } else if (fast and longCommandWArg(&s, "accel=")) {
+            p.accel = readU32(&s);
+        } else if (longCommandWArg(&s, "split=")) {
+            p.split_point = @as(f64, @floatFromInt(readU32(&s))) / 100.0;
+        } else if (longCommandWArg(&s, "shrink")) {
+            p.shrink_max_regression = 1; // kDefaultRegression
+            p.shrink = true;
+            if (s.len > 0 and s[0] == '=') {
+                s = s[1..];
+                p.shrink_max_regression = readU32(&s);
+            }
+        } else return false;
+        if (s.len > 0 and s[0] == ',') {
+            s = s[1..];
+            continue;
+        }
+        break;
+    }
+    if (s.len != 0) return false;
+    const split: u32 = @intFromFloat(p.split_point * 100);
+    if (fast)
+        disp.at(4, "cover: k={d}\nd={d}\nf={d}\nsteps={d}\nsplit={d}\naccel={d}\nshrink={d}\n", .{ p.k, p.d, p.f, p.steps, split, p.accel, p.shrink_max_regression })
+    else
+        disp.at(4, "cover: k={d}\nd={d}\nsteps={d}\nsplit={d}\nshrink{d}\n", .{ p.k, p.d, p.steps, split, p.shrink_max_regression });
+    return true;
+}
+
+/// `setMaxCompression`.
+fn setMaxCompression(cp: *fio.CParams, prefs: *fio.Prefs) void {
+    const L = zstd.limits;
+    cp.* = .{
+        .window_log = L.window_log_max,
+        .chain_log = L.chain_log_max,
+        .hash_log = L.hash_log_max,
+        .search_log = L.search_log_max,
+        .min_match = L.min_match_min,
+        .target_length = L.target_length_max,
+        .strategy = @intFromEnum(zstd.Strategy.btultra2),
+    };
+    prefs.overlap_log = L.overlap_log_max;
+    prefs.ldm_hash_log = L.ldm_hash_log_max;
+    prefs.ldm_hash_rate_log = 0; // automatically derived
+    prefs.ldm_min_match = 16; // heuristic
+    prefs.ldm_bucket_size_log = L.ldm_bucket_size_log_max;
+}
+
+/// `ZSTD_strategyMap`.
+fn strategyName(s: zstd.Strategy) []const u8 {
+    return switch (s) {
+        inline else => |t| "ZSTD_" ++ @tagName(t),
+    };
+}
+
+/// `UTIL_getFileSize`: null unless a regular file.
+fn fileSize(env: Env, name: []const u8) ?u64 {
+    const st = fio.stat(env, name) orelse return null;
+    return if (st.kind == .file) st.size else null;
+}
+
+/// `UTIL_getFileSize` of the dictionary as a `size_t`: an unknown size is
+/// `UTIL_FILESIZE_UNKNOWN`, as the C command passes it on.
+fn dictFileSize(env: Env, name: ?[]const u8) u64 {
+    const n = name orelse return 0;
+    return fileSize(env, n) orelse std.math.maxInt(u64);
+}
+
+/// `printDefaultCParams`.
+fn printDefaultCParams(env: Env, name: []const u8, dict_name: ?[]const u8, level: i32) void {
+    const size = fileSize(env, name);
+    const cp = zstd.getCParams(level, size, dictFileSize(env, dict_name));
+    if (size) |n| disp.always("{s} ({d} bytes)\n", .{ name, n }) else disp.always("{s} (src size unknown)\n", .{name});
+    disp.always(" - windowLog     : {d}\n", .{cp.window_log});
+    disp.always(" - chainLog      : {d}\n", .{cp.chain_log});
+    disp.always(" - hashLog       : {d}\n", .{cp.hash_log});
+    disp.always(" - searchLog     : {d}\n", .{cp.search_log});
+    disp.always(" - minMatch      : {d}\n", .{cp.min_match});
+    disp.always(" - targetLength  : {d}\n", .{cp.target_length});
+    disp.always(" - strategy      : {s} ({d})\n", .{ strategyName(cp.strategy), @intFromEnum(cp.strategy) });
+}
+
+/// `printActualCParams`: the level's parameters with the explicit ones over
+/// them.
+fn printActualCParams(env: Env, name: []const u8, dict_name: ?[]const u8, level: i32, cp: fio.CParams) void {
+    const d = zstd.getCParams(level, fileSize(env, name), dictFileSize(env, dict_name));
+    const pick = struct {
+        fn f(explicit: u32, default: u32) u32 {
+            return if (explicit == 0) default else explicit;
+        }
+    }.f;
+    disp.always("--zstd=wlog={d},clog={d},hlog={d},slog={d},mml={d},tlen={d},strat={d}\n", .{
+        pick(cp.window_log, d.window_log),           pick(cp.chain_log, d.chain_log),
+        pick(cp.hash_log, d.hash_log),               pick(cp.search_log, d.search_log),
+        pick(cp.min_match, d.min_match),             pick(cp.target_length, d.target_length),
+        pick(cp.strategy, @intFromEnum(d.strategy)),
+    });
+}
+
+/// `FIO_displayCompressionParameters`. The row match finder's words are
+/// indexed as in C, `ZSTD_ps_enable` (1) printing `--no-row-match-finder`.
+fn displayCompressionParameters(prefs: *const fio.Prefs) void {
+    const check = [3][]const u8{ " --no-check", "", " --check" };
+    const row = [3][]const u8{ "", " --no-row-match-finder", " --row-match-finder" };
+    const lit = [3][]const u8{ "", " --compress-literals", " --no-compress-literals" };
+    disp.always("--format=.zst --no-sparse{s}{s} --block-size={d}", .{ if (prefs.dict_id) "" else " --no-dictID", check[prefs.checksum], prefs.block_size });
+    disp.always("{s}{s}", .{ row[@intFromEnum(prefs.row_match_finder)], if (prefs.rsyncable) " --rsyncable" else "" });
+    if (prefs.stream_src_size != 0) disp.always(" --stream-size={d}", .{@as(u32, @truncate(prefs.stream_src_size))});
+    if (prefs.src_size_hint != 0) disp.always(" --size-hint={d}", .{@as(i32, @bitCast(prefs.src_size_hint))});
+    if (prefs.target_cblock_size != 0) disp.always(" --target-compressed-block-size={d}", .{prefs.target_cblock_size});
+    disp.always("{s} --memory={d} --threads={d}{s} --{s}content-size\n", .{
+        lit[@intFromEnum(prefs.literal_compression)],
+        if (prefs.mem_limit != 0) prefs.mem_limit else 128 << 20,
+        prefs.nb_workers,
+        if (prefs.exclude_compressed) " --exclude-compressed" else "",
+        if (prefs.content_size) "" else "no-",
+    });
 }
 
 /// `errorOut`.
@@ -185,6 +390,8 @@ fn usage(w: *std.Io.Writer, program: []const u8) void {
 }
 
 fn usageAdvanced(program: []const u8) void {
+    // C's text, less what this port does not have: `--trace`, `--adapt`,
+    // the gzip/xz/lzma/lz4 formats and the legacy trainer
     const w = disp.out();
     welcome(w);
     w.writeAll("\n") catch {};
@@ -199,6 +406,11 @@ fn usageAdvanced(program: []const u8) void {
         \\  --[no-]progress               Forcibly show/hide the progress counter. NOTE: Any (de)compressed
         \\                                output to terminal will mix with progress counter text.
         \\
+        \\  -r                            Operate recursively on directories.
+        \\  --filelist LIST               Read a list of files to operate on from LIST.
+        \\  --output-dir-flat DIR         Store processed files in DIR.
+        \\  --output-dir-mirror DIR       Store processed files in DIR, respecting original directory structure.
+        \\  --[no-]asyncio                Use asynchronous IO. [Default: Enabled]
         \\
         \\  --[no-]check                  Add XXH64 integrity checksums during compression. [Default: Add, Validate]
         \\                                If `-d` is present, ignore/validate checksums during decompression.
@@ -212,8 +424,13 @@ fn usageAdvanced(program: []const u8) void {
     w.print("  --fast[=#]                    Use to very fast compression levels. [Default: {d}]\n", .{1}) catch {};
     w.print("  --long[=#]                    Enable long distance matching with window log #. [Default: {d}]\n", .{default_max_window_log}) catch {};
     w.writeAll(
+        \\  --patch-from=REF              Use REF as the reference point for Zstandard's diff engine. 
+        \\
         \\  -T#                           Spawn # compression threads. [Default: 1; pass 0 for core count.]
         \\  --single-thread               Share a single thread for I/O and compression (slightly different than `-T1`).
+        \\  --auto-threads={physical|logical}
+        \\                                Use physical/logical cores when using `-T0`. [Default: Physical]
+        \\
         \\  -B#                           Set job size to #. [Default: 0 (automatic)]
         \\
     ) catch {};
@@ -233,12 +450,35 @@ fn usageAdvanced(program: []const u8) void {
         \\                                the 'greedy', 'lazy', and 'lazy2' strategies.
         \\
         \\  --format=zstd                 Compress files to the `.zst` format. [Default]
+        \\  --[no-]mmap-dict              Memory-map dictionary file rather than mallocing and loading all at once
         \\
         \\Advanced decompression options:
         \\  -l                            Print information about Zstandard-compressed files.
         \\  --test                        Test compressed file integrity.
         \\  -M#                           Set the memory usage limit to # megabytes.
+        \\  --[no-]sparse                 Enable sparse mode. [Default: Enabled for files, disabled for STDOUT.]
         \\  --[no-]pass-through           Pass through uncompressed files as-is. [Default: Disabled]
+        \\
+        \\Dictionary builder:
+        \\  --train                       Create a dictionary from a training set of files.
+        \\
+        \\  --train-cover[=k=#,d=#,steps=#,split=#,shrink[=#]]
+        \\                                Use the cover algorithm (with optional arguments).
+        \\  --train-fastcover[=k=#,d=#,f=#,steps=#,split=#,accel=#,shrink[=#]]
+        \\                                Use the fast cover algorithm (with optional arguments).
+        \\
+        \\  -o NAME                       Use NAME as dictionary name. [Default: dictionary]
+        \\  --maxdict=#                   Limit dictionary to specified size #. [Default: 112640]
+        \\  --dictID=#                    Force dictionary ID to #. [Default: Random]
+        \\
+        \\Benchmark options:
+        \\  -b#                           Perform benchmarking with compression level #. [Default: 3]
+        \\  -e#                           Test all compression levels up to #; starting level is `-b#`. [Default: 1]
+        \\  -i#                           Set the minimum evaluation to time # seconds. [Default: 3]
+        \\  -B#                           Cut file into independent chunks of size #. [Default: No chunking]
+        \\  -S                            Output one benchmark result per input file. [Default: Consolidated result]
+        \\  -D dictionary                 Benchmark using dictionary 
+        \\  --priority=rt                 Set process priority to real-time.
         \\
     ) catch {};
     disp.flush();
@@ -309,7 +549,11 @@ fn defaultThreads(environ: std.process.Environ) u32 {
     return def;
 }
 
+/// `UTIL_isConsole`, with the `--fake-*-is-console` hooks.
 fn isConsole(io: std.Io, f: std.Io.File) bool {
+    if (f.handle == std.Io.File.stdin().handle and disp.fake_console.stdin) return true;
+    if (f.handle == std.Io.File.stderr().handle and disp.fake_console.stderr) return true;
+    if (f.handle == std.Io.File.stdout().handle and disp.fake_console.stdout) return true;
     return f.isTty(io) catch false;
 }
 
@@ -321,6 +565,8 @@ fn runBench(env: Env, c: *Cli, nb_workers: u32) u8 {
     c.bench.ldm = c.ldm;
     c.bench.ldm_min_match = c.prefs.ldm_min_match;
     c.bench.ldm_hash_log = c.prefs.ldm_hash_log;
+    if (c.prefs.ldm_bucket_size_log) |v| c.bench.ldm_bucket_size_log = v;
+    if (c.prefs.ldm_hash_rate_log) |v| c.bench.ldm_hash_rate_log = v;
     c.bench.row_match_finder = c.prefs.row_match_finder;
     c.bench.literal_compression = c.prefs.literal_compression;
     var first = c.level;
@@ -336,7 +582,7 @@ fn runBench(env: Env, c: *Cli, nb_workers: u32) u8 {
     if (c.names.items.len > 1) disp.at(3, "{d} files ", .{c.names.items.len});
     if (last > first) disp.at(3, "from level {d} to {d} ", .{ first, last }) else disp.at(3, "at level {d} ", .{first});
     disp.at(3, "using {d} threads \n", .{nb_workers});
-    if (c.names.items.len == 0) return unsupported("a benchmark without an input file (synthetic data)");
+    if (c.names.items.len == 0) return bench.syntheticTest(env, c.compressibility, first, last, c.cp, &c.bench);
     if (c.separate_files) {
         var r: u8 = 0;
         for (c.names.items) |n| r = bench.benchFiles(env, &.{n}, c.dict_name, first, last, c.cp, &c.bench);
@@ -476,7 +722,16 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 c.prefs.checksum = 0;
                 continue;
             }
-            if (eq(u8, a, "--sparse") or eq(u8, a, "--no-sparse")) continue; // output bytes are the same; no sparse writes here
+            // output bytes are the same; no sparse writes here, the
+            // setting only picks the notes at level 4
+            if (eq(u8, a, "--sparse")) {
+                fio.sparse = 2;
+                continue;
+            }
+            if (eq(u8, a, "--no-sparse")) {
+                fio.sparse = 0;
+                continue;
+            }
             if (eq(u8, a, "--pass-through")) {
                 c.prefs.pass_through = true;
                 continue;
@@ -490,7 +745,11 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 continue;
             }
             if (eq(u8, a, "--asyncio") or eq(u8, a, "--no-asyncio")) continue; // I/O is synchronous here
-            if (eq(u8, a, "--train")) return unsupported("--train");
+            if (eq(u8, a, "--train")) {
+                c.operation = .train;
+                if (c.out_name == null) c.out_name = "dictionary";
+                continue;
+            }
             if (eq(u8, a, "--no-dictID")) {
                 c.prefs.dict_id = false;
                 continue;
@@ -504,7 +763,10 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 continue;
             }
             if (eq(u8, a, "--priority=rt")) continue;
-            if (eq(u8, a, "--show-default-cparams")) return unsupported("--show-default-cparams");
+            if (eq(u8, a, "--show-default-cparams")) {
+                c.show_default_cparams = true;
+                continue;
+            }
             if (eq(u8, a, "--content-size")) {
                 c.prefs.content_size = true;
                 continue;
@@ -556,11 +818,44 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 c.prefs.exclude_compressed = true;
                 continue;
             }
-            if (eq(u8, a, "--fake-stdin-is-console") or eq(u8, a, "--fake-stdout-is-console") or eq(u8, a, "--fake-stderr-is-console") or eq(u8, a, "--trace-file-stat"))
-                return unsupported(a);
-            if (eq(u8, a, "--max")) return unsupported("--max");
+            if (eq(u8, a, "--fake-stdin-is-console")) {
+                disp.fake_console.stdin = true;
+                continue;
+            }
+            if (eq(u8, a, "--fake-stdout-is-console")) {
+                disp.fake_console.stdout = true;
+                continue;
+            }
+            if (eq(u8, a, "--fake-stderr-is-console")) {
+                disp.fake_console.stderr = true;
+                continue;
+            }
+            if (eq(u8, a, "--trace-file-stat")) return unsupported(a);
+            if (eq(u8, a, "--max")) {
+                if (@sizeOf(usize) == 4) {
+                    disp.at(2, "--max is incompatible with 32-bit mode \n", .{});
+                    return badUsage(program, original);
+                }
+                c.ultra = true;
+                c.ldm = true;
+                setMaxCompression(&c.cp, &c.prefs);
+                continue;
+            }
 
-            if (std.mem.startsWith(u8, a, "--train-")) return unsupported(a);
+            if (longCommandWArg(&a, "--train-cover") or longCommandWArg(&a, "--train-fastcover")) {
+                const fast = std.mem.startsWith(u8, original, "--train-fastcover");
+                c.operation = .train;
+                if (c.out_name == null) c.out_name = "dictionary";
+                var p: dibio.Params = .{};
+                // with no `=`, every parameter left to the optimizer
+                if (a.len != 0) {
+                    if (a[0] != '=') return badUsage(program, original);
+                    if (!parseTrainParameters(a[1..], fast, &p)) return badUsage(program, original);
+                }
+                c.train = if (fast) .{ .fast_cover = p } else .{ .cover = p };
+                continue;
+            }
+            if (std.mem.startsWith(u8, a, "--train-legacy")) return unsupported("--train-legacy");
             if (longCommandWArg(&a, "--threads")) {
                 c.nb_workers = Field.nextU32(argv, &i, &a) orelse return 1;
                 continue;
@@ -573,8 +868,18 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 c.prefs.block_size = @intCast(@min(Field.nextSize(argv, &i, &a) orelse return 1, std.math.maxInt(u32)));
                 continue;
             }
-            if (longCommandWArg(&a, "--maxdict") or longCommandWArg(&a, "--dictID")) return unsupported("dictionary training");
-            if (longCommandWArg(&a, "--zstd=")) return unsupported("--zstd=");
+            if (longCommandWArg(&a, "--maxdict")) {
+                c.max_dict_size = Field.nextU32(argv, &i, &a) orelse return 1;
+                continue;
+            }
+            if (longCommandWArg(&a, "--dictID")) {
+                c.dict_id = Field.nextU32(argv, &i, &a) orelse return 1;
+                continue;
+            }
+            if (longCommandWArg(&a, "--zstd=")) {
+                if (!parseCompressionParameters(a, &c.cp, &c.prefs)) return badUsage(program, original);
+                continue;
+            }
             if (longCommandWArg(&a, "--stream-size")) {
                 c.prefs.stream_src_size = Field.nextSize(argv, &i, &a) orelse return 1;
                 continue;
@@ -587,13 +892,32 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 c.prefs.src_size_hint = @intCast(@min(Field.nextSize(argv, &i, &a) orelse return 1, std.math.maxInt(u32)));
                 continue;
             }
-            if (longCommandWArg(&a, "--output-dir-flat") or longCommandWArg(&a, "--output-dir-mirror")) return unsupported("--output-dir-*");
+            if (longCommandWArg(&a, "--output-dir-flat")) {
+                c.out_dir = Field.next(argv, &i, &a) orelse return 1;
+                if (c.out_dir.?.len == 0) {
+                    disp.at(1, "error: output dir cannot be empty string (did you mean to pass '.' instead?)\n", .{});
+                    return 1;
+                }
+                continue;
+            }
             if (longCommandWArg(&a, "--auto-threads")) {
                 _ = Field.next(argv, &i, &a) orelse return 1;
                 continue;
             }
             if (longCommandWArg(&a, "--trace")) return unsupported("--trace");
-            if (longCommandWArg(&a, "--patch-from")) return unsupported("--patch-from");
+            if (longCommandWArg(&a, "--output-dir-mirror")) {
+                c.out_mirror_dir = Field.next(argv, &i, &a) orelse return 1;
+                if (c.out_mirror_dir.?.len == 0) {
+                    disp.at(1, "error: output dir cannot be empty string (did you mean to pass '.' instead?)\n", .{});
+                    return 1;
+                }
+                continue;
+            }
+            if (longCommandWArg(&a, "--patch-from")) {
+                c.patch_from_name = Field.next(argv, &i, &a) orelse return 1;
+                c.ultra = true;
+                continue;
+            }
             if (longCommandWArg(&a, "--long")) {
                 var wlog: u32 = default_max_window_log;
                 c.ldm = true;
@@ -612,6 +936,7 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                     const f = @min(readU32(&a), max_fast);
                     if (f == 0) return badUsage(program, original);
                     c.level = -@as(i32, @intCast(f));
+                    c.dict_level = c.level;
                 } else if (a.len != 0) {
                     return badUsage(program, original);
                 } else {
@@ -619,7 +944,11 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 }
                 continue;
             }
-            if (longCommandWArg(&a, "--filelist")) return unsupported("--filelist");
+            if (longCommandWArg(&a, "--filelist")) {
+                const list_name = Field.next(argv, &i, &a) orelse return 1;
+                c.file_lists.append(arena, list_name) catch return 1;
+                continue;
+            }
             return badUsage(program, original);
         }
 
@@ -628,6 +957,7 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
         while (a.len > 0) {
             if (a[0] >= '0' and a[0] <= '9') {
                 c.level = @intCast(@min(readU32(&a), std.math.maxInt(i32)));
+                c.dict_level = c.level;
                 continue;
             }
             switch (a[0]) {
@@ -707,7 +1037,10 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                     c.operation = .list;
                     a = a[1..];
                 },
-                'r' => return unsupported("-r"),
+                'r' => {
+                    c.recursive = true;
+                    a = a[1..];
+                },
                 'b' => {
                     c.operation = .bench;
                     a = a[1..];
@@ -726,7 +1059,7 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 },
                 'P' => {
                     a = a[1..];
-                    c.compressibility = readU32(&a);
+                    c.compressibility = @as(f64, @floatFromInt(readU32(&a))) / 100;
                 },
                 'B' => {
                     a = a[1..];
@@ -736,12 +1069,15 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                     a = a[1..];
                     c.nb_workers = readU32(&a);
                 },
-                's' => return unsupported("dictionary training"),
+                's' => {
+                    a = a[1..];
+                    c.dict_select = readU32(&a);
+                },
                 'p' => {
                     a = a[1..];
                     if (a.len > 0 and a[0] >= '0' and a[0] <= '9') {
                         c.bench.additional_param = @intCast(@min(readU32(&a), std.math.maxInt(i32)));
-                    } else return unsupported("-p (pause at the end)");
+                    } else main_pause = true;
                 },
                 else => {
                     const short = [2]u8{ '-', a[0] };
@@ -780,11 +1116,29 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
         c.names.shrinkRetainingCapacity(kept);
     }
 
+    // read names from a file
+    for (c.file_lists.items) |list_name| {
+        const more = util.readFileList(env, arena, list_name) orelse {
+            disp.at(1, "zstd: error reading {s} \n", .{list_name});
+            return 1;
+        };
+        c.names.appendSlice(arena, more) catch return 1;
+    }
+
+    const nb_input_names = c.names.items.len;
+    if (c.recursive) {
+        const expanded = util.expand(env, arena, c.names.items, c.follow_links);
+        c.names = .fromOwnedSlice(@constCast(expanded));
+    }
+
     if (c.operation == .list) {
         return list.listMultiple(env, c.names.items, disp.level, isConsole(env.io, std.Io.File.stdin()));
     }
 
     if (c.operation == .bench) return runBench(env, &c, nb_workers);
+
+    if (c.operation == .train)
+        return dibio.trainFromFiles(env, c.out_name.?, c.max_dict_size, c.names.items, c.prefs.block_size, c.train, c.dict_level, c.dict_id, nb_workers, c.mem_limit);
 
     if (c.operation == .@"test") {
         c.prefs.test_mode = true;
@@ -792,7 +1146,14 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
         c.prefs.remove_src = false;
     }
 
-    if (c.names.items.len == 0) c.names.append(arena, fio.stdinmark) catch return 1;
+    if (c.names.items.len == 0) {
+        // the input may have been only empty directories: then not stdin
+        if (nb_input_names > 0) {
+            disp.at(1, "please provide correct input file(s) or non-empty directories -- ignored \n", .{});
+            return 0;
+        }
+        c.names.append(arena, fio.stdinmark) catch return 1;
+    }
     if (c.names.items.len == 1 and std.mem.eql(u8, c.names.items[0], fio.stdinmark) and c.out_name == null)
         c.out_name = fio.stdoutmark;
 
@@ -818,6 +1179,20 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
         }
     }
 
+    if (c.show_default_cparams and c.operation == .decompress) {
+        disp.at(1, "error : can't use --show-default-cparams in decompression mode \n", .{});
+        return 1;
+    }
+
+    if (c.dict_name != null and c.patch_from_name != null) {
+        disp.at(1, "error : can't use -D and --patch-from=# at the same time \n", .{});
+        return 1;
+    }
+    if (c.patch_from_name != null and c.names.items.len > 1) {
+        disp.at(1, "error : can't use --patch-from=# on multiple files \n", .{});
+        return 1;
+    }
+
     const has_stdout = c.out_name != null and std.mem.eql(u8, c.out_name.?, fio.stdoutmark);
     if (has_stdout and disp.level == 2) disp.level = 1;
     if (!isConsole(env.io, std.Io.File.stderr()) and disp.progress != .always) disp.progress = .never;
@@ -834,20 +1209,30 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
     if (c.mem_limit == 0) {
         c.mem_limit = if (c.cp.window_log == 0) @as(u32, 1) << default_max_window_log else @as(u32, 1) << @intCast(c.cp.window_log & 31);
     }
+    if (c.patch_from_name) |n| c.dict_name = n;
+    c.prefs.patch_from = c.patch_from_name != null;
     c.prefs.mem_limit = c.mem_limit;
 
     const result: u1 = switch (c.operation) {
         .compress => blk: {
             c.prefs.nb_workers = nb_workers;
             c.prefs.ldm = c.ldm;
+            fio.sparse = 0; // FIO_setSparseWrite(prefs, 0)
+            if (c.show_default_cparams or disp.level >= 4) {
+                for (c.names.items) |n| {
+                    if (c.show_default_cparams) printDefaultCParams(env, n, c.dict_name, c.level);
+                    if (disp.level >= 4) printActualCParams(env, n, c.dict_name, c.level, c.cp);
+                }
+            }
+            if (disp.level >= 4) displayCompressionParameters(&c.prefs);
             if (c.names.items.len == 1 and c.out_name != null)
                 break :blk fio.compressFilename(env, &ctx, &c.prefs, c.out_name.?, c.names.items[0], c.dict_name, c.level, c.cp);
-            break :blk fio.compressMultiple(env, &ctx, &c.prefs, c.names.items, c.out_name, c.suffix, c.dict_name, c.level, c.cp);
+            break :blk fio.compressMultiple(env, &ctx, &c.prefs, c.names.items, c.out_mirror_dir, c.out_dir, c.out_name, c.suffix, c.dict_name, c.level, c.cp);
         },
         .decompress, .@"test" => blk: {
             if (c.names.items.len == 1 and c.out_name != null)
                 break :blk fio.decompressFilename(env, &ctx, &c.prefs, c.out_name.?, c.names.items[0], c.dict_name);
-            break :blk fio.decompressMultiple(env, &ctx, &c.prefs, c.names.items, c.out_name, c.dict_name);
+            break :blk fio.decompressMultiple(env, &ctx, &c.prefs, c.names.items, c.out_mirror_dir, c.out_dir, c.out_name, c.dict_name);
         },
         .bench, .train, .list => unreachable,
     };
@@ -856,4 +1241,6 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
 
 test {
     _ = disp;
+    _ = util;
+    _ = dibio;
 }

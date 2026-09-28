@@ -68,6 +68,32 @@ pub fn summary(comptime fmt: []const u8, args: anytype) void {
     if (shouldSummary()) at(1, fmt, args);
 }
 
+/// `UTIL_fakeStdinIsConsole` & co. (`--fake-*-is-console`): test hooks
+/// that make the command treat a stream as a terminal.
+pub var fake_console: struct { stdin: bool = false, stdout: bool = false, stderr: bool = false } = .{};
+
+/// `g_displayClock`: when a progress update was last shown; 0 (never)
+/// lets the first one through at once.
+var display_clock: i96 = 0;
+
+/// `READY_FOR_UPDATE()`: every 1/6 s, or always from level 4.
+pub fn readyForUpdate(io: std.Io) bool {
+    return level >= 4 or std.Io.Timestamp.now(io, .awake).nanoseconds - display_clock > std.time.ns_per_s / 6;
+}
+
+/// `DELAY_NEXT_UPDATE()`.
+pub fn delayNextUpdate(io: std.Io) void {
+    display_clock = std.Io.Timestamp.now(io, .awake).nanoseconds;
+}
+
+/// `DISPLAYUPDATE_PROGRESS(...)`.
+pub fn updateProgress(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    if (!shouldProgress() or level < 1 or progress == .never) return;
+    if (!readyForUpdate(io)) return;
+    delayNextUpdate(io);
+    always(fmt, args);
+}
+
 /// `DISPLAY_PROGRESS("\r%79s\r", "")`: clear the progress line.
 pub fn clearProgress() void {
     if (shouldProgress()) at(1, "\r" ++ " " ** 79 ++ "\r", .{});

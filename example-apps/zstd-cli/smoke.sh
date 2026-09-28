@@ -6,7 +6,9 @@
 # Always: round trips at several levels, thread counts and window sizes,
 # several files at once, --test, --list, and the verdicts on bad input
 # (an existing output without -f, an unknown suffix, trailing garbage, a
-# truncated frame). When a `zstd` of version 1.5.7 is on PATH, also the
+# truncated frame); -r, --filelist, --output-dir-*, --patch-from, --zstd=,
+# a trained dictionary and -b without a file. When a `zstd` of version
+# 1.5.7 is on PATH, also the
 # claim this app is built on: the same frames, byte for byte, and the same
 # messages as that command, for the same options.
 set -euo pipefail
@@ -67,7 +69,32 @@ ok; ok; ok; ok; ok
 # ------------------------------------------------------------------ benchmark
 "$BIN" -q -i0 -b3 text | grep -q '^-3 ' || fail "-b printed no result line"
 "$BIN" -i0 -b2 -d a.zst 2>/dev/null | tr '\r' '\n' | grep -q '^ 0#$' || fail "-b -d (decode only) did not finish"
-ok; ok
+"$BIN" -q -i0 -b1 -B100K | grep -q 'Lorem ipsum' || fail "-b without a file (lorem ipsum)"
+ok; ok; ok
+
+# ------------------------------------------------- directories and file lists
+mkdir -p tree/sub; cp text tree/t; cp noise tree/sub/n
+"$BIN" -q -r tree --output-dir-mirror mirror || fail "-r --output-dir-mirror"
+[ -f mirror/tree/t.zst ] && [ -f mirror/tree/sub/n.zst ] || fail "mirrored files not written"
+mkdir flat; "$BIN" -q -d -r mirror --output-dir-flat flat || fail "-d -r --output-dir-flat"
+cmp -s flat/t text && cmp -s flat/n noise || fail "flat files back"
+printf 'tree/t\ntree/sub/n\n' > list
+"$BIN" -q -c --filelist list > listed.zst || fail "--filelist"
+"$BIN" -q -d -c listed.zst | cmp -s - <(cat text noise) || fail "--filelist round trip"
+ok; ok; ok; ok
+
+# ------------------------------------------- --patch-from, --zstd=, --train
+{ head -c 200000 text; printf 'CHANGED'; tail -c +200001 text; } > text2
+"$BIN" -q --patch-from=text text2 -o p.zst || fail "--patch-from"
+"$BIN" -q -d --patch-from=text p.zst -o p.back && cmp -s p.back text2 || fail "--patch-from round trip"
+[ "$(stat -c %s p.zst)" -lt 2000 ] || fail "--patch-from made no small patch"
+"$BIN" -q -c --zstd=wlog=18,clog=15,hlog=16,slog=4,mml=5,tlen=32,strat=5 text > zp.zst || fail "--zstd="
+"$BIN" -q -d -c zp.zst | cmp -s - text || fail "--zstd= round trip"
+"$BIN" --show-default-cparams -c text 2>&1 >/dev/null | grep -q 'strategy      : ZSTD_dfast (2)' || fail "--show-default-cparams"
+mkdir samples; (cd samples && split -l 60 ../text s)
+"$BIN" -q --train -r samples -o dict --maxdict=8K -T1 || fail "--train"
+"$BIN" -q -D dict -c samples/saa > sd.zst && "$BIN" -q -d -D dict -c sd.zst | cmp -s - samples/saa || fail "trained dictionary round trip"
+ok; ok; ok; ok; ok; ok; ok
 
 # ------------------------------------------------ parity with the real command
 REF="$(command -v zstd || true)"
@@ -114,6 +141,28 @@ if [ -n "$REF" ] && [ "$(readlink -f "$REF")" != "$(readlink -f "$BIN")" ] && [ 
     "$BIN" -q -i0 -b1 -e3 -B64K text | cols > bench.ours
     [ -s bench.ref ] && cmp -s bench.ref bench.ours || { diff bench.ref bench.ours >&2 || true; fail "-b sizes differ from zstd 1.5.7"; }
     ok
+    # the stage-2 options: patches, parameters, dictionaries, directories
+    "$REF" -q --patch-from=text text2 -o p.ref; "$BIN" -q -f --patch-from=text text2 -o p.ours
+    cmp -s p.ref p.ours || fail "--patch-from frame differs from zstd 1.5.7"
+    "$REF" -q -c --zstd=wlog=18,strat=4,ovlog=3 -T2 text > r.zst; "$BIN" -q -c --zstd=wlog=18,strat=4,ovlog=3 -T2 text > o.zst
+    cmp -s r.zst o.zst || fail "--zstd= frame differs from zstd 1.5.7"
+    "$REF" -q --train-cover=d=8,steps=4 -r samples -o dict.ref --maxdict=8K -T1; "$BIN" -q --train-cover=d=8,steps=4 -r samples -o dict.ours --maxdict=8K -T1
+    cmp -s dict.ref dict.ours || fail "trained dictionary differs from zstd 1.5.7"
+    "$REF" -q -c -r tree > r.zst; "$BIN" -q -c -r tree > o.zst
+    cmp -s r.zst o.zst || fail "-r -c output differs from zstd 1.5.7"
+    for d in ref ours; do cp -r samples "$d/"; done
+    same '"$REF" --show-default-cparams -19 -c t'
+    same '"$REF" --train -r samples -o d --maxdict=8K -T1'
+    same '"$REF" --zstd=strat=10 t -o x'
+    same '"$REF" --patch-from=t -D t t19.zst'
+    for p in "" -P50; do
+        # shellcheck disable=SC2086
+        "$REF" -q -i0 -b1 -B100K $p | cols > syn.ref
+        # shellcheck disable=SC2086
+        "$BIN" -q -i0 -b1 -B100K $p | cols > syn.ours
+        [ -s syn.ref ] && cmp -s syn.ref syn.ours || { diff syn.ref syn.ours >&2 || true; fail "-b $p (synthetic) sizes differ from zstd 1.5.7"; }
+    done
+    ok; ok; ok; ok; ok; ok
     echo "smoke: parity with $REF (1.5.7) checked"
 else
     echo "smoke: no zstd 1.5.7 on PATH — parity with the real command NOT checked (round trips and verdicts only)"

@@ -14,6 +14,7 @@
 const std = @import("std");
 const zstd = @import("zstd");
 const disp = @import("display.zig");
+const synthetic = @import("synthetic.zig");
 const fio = @import("fileio.zig");
 
 const Io = std.Io;
@@ -31,6 +32,8 @@ pub const Params = struct {
     ldm: bool = false,
     ldm_min_match: u32 = 0,
     ldm_hash_log: u32 = 0,
+    ldm_bucket_size_log: u32 = 0,
+    ldm_hash_rate_log: u32 = 0,
     literal_compression: zstd.Switch = .auto,
     row_match_finder: zstd.Switch = .auto,
 };
@@ -92,11 +95,14 @@ fn compressOptions(c: *Ctx) zstd.Options {
     return .{
         .level = c.level,
         .advanced = .{
-            .nb_workers = if (c.params.nb_workers == 1) 0 else c.params.nb_workers,
+            // libzstd clamps the number of workers where the module refuses it
+            .nb_workers = if (c.params.nb_workers == 1) 0 else @min(c.params.nb_workers, zstd.limits.nb_workers_max),
             .row_match_finder = c.params.row_match_finder,
             .long_distance_matching = if (c.params.ldm) .enable else .auto,
             .ldm_min_match = nz(c.params.ldm_min_match),
             .ldm_hash_log = nz(c.params.ldm_hash_log),
+            .ldm_bucket_size_log = nz(c.params.ldm_bucket_size_log),
+            .ldm_hash_rate_log = nz(c.params.ldm_hash_rate_log),
             .window_log = nz(c.cp.window_log),
             .hash_log = nz(c.cp.hash_log),
             .chain_log = nz(c.cp.chain_log),
@@ -104,10 +110,44 @@ fn compressOptions(c: *Ctx) zstd.Options {
             .min_match = nz(c.cp.min_match),
             .target_length = nz(c.cp.target_length),
             .literal_compression = c.params.literal_compression,
-            .strategy = if (c.cp.strategy != 0) @enumFromInt(c.cp.strategy) else null,
+            .strategy = fio.strategyOf(c.cp.strategy) catch unreachable, // checkParams
+
             .target_c_block_size = nz(c.params.target_cblock_size),
         },
         .dictionary = if (c.cdict) |*cd| .{ .cdict = cd } else .none,
+    };
+}
+
+/// The bounds `BMK_initCCtx`'s `CHECK_Z(ZSTD_CCtx_setParameter(...))`
+/// calls enforce, in their order, each failure named by the call's text as
+/// the C command prints it.
+fn checkParams(c: *Ctx) void {
+    const L = zstd.limits;
+    const p = c.params;
+    const in = struct {
+        /// 0 is "not set" (`ZSTD_c_ldm*`, the cParams, the strategy)
+        fn opt(v: u32, lo: u32, hi: u32) bool {
+            return v == 0 or (v >= lo and v <= hi);
+        }
+    }.opt;
+    const checks = [_]struct { ok: bool, call: []const u8 }{
+        .{ .ok = in(p.ldm_min_match, L.ldm_min_match_min, L.ldm_min_match_max), .call = "ZSTD_CCtx_setParameter(ctx, ZSTD_c_ldmMinMatch, adv->ldmMinMatch)" },
+        .{ .ok = in(p.ldm_hash_log, L.hash_log_min, L.ldm_hash_log_max), .call = "ZSTD_CCtx_setParameter(ctx, ZSTD_c_ldmHashLog, adv->ldmHashLog)" },
+        .{ .ok = in(p.ldm_bucket_size_log, L.ldm_bucket_size_log_min, L.ldm_bucket_size_log_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_ldmBucketSizeLog, adv->ldmBucketSizeLog)" },
+        .{ .ok = p.ldm_hash_rate_log <= L.ldm_hash_rate_log_max, .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_ldmHashRateLog, adv->ldmHashRateLog)" },
+        .{ .ok = in(c.cp.window_log, L.window_log_min, L.window_log_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_windowLog, (int)comprParams->windowLog)" },
+        .{ .ok = in(c.cp.hash_log, L.hash_log_min, L.hash_log_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_hashLog, (int)comprParams->hashLog)" },
+        .{ .ok = in(c.cp.chain_log, L.chain_log_min, L.chain_log_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_chainLog, (int)comprParams->chainLog)" },
+        .{ .ok = in(c.cp.search_log, L.search_log_min, L.search_log_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_searchLog, (int)comprParams->searchLog)" },
+        .{ .ok = in(c.cp.min_match, L.min_match_min, L.min_match_max), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_minMatch, (int)comprParams->minMatch)" },
+        .{ .ok = c.cp.target_length <= L.target_length_max, .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_targetLength, (int)comprParams->targetLength)" },
+        .{ .ok = c.cp.strategy <= @intFromEnum(zstd.Strategy.btultra2), .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_strategy, (int)comprParams->strategy)" },
+        .{ .ok = p.target_cblock_size <= L.target_length_max, .call = "ZSTD_CCtx_setParameter( ctx, ZSTD_c_targetCBlockSize, (int)adv->targetCBlockSize)" },
+    };
+    for (checks) |k| if (!k.ok) {
+        disp.always("Error : {s} failed : {s} \n", .{ k.call, fio.zstdErrorName(error.ParameterOutOfBound) });
+        disp.flush();
+        std.process.exit(1);
     };
 }
 
@@ -116,6 +156,7 @@ fn compressOptions(c: *Ctx) zstd.Options {
 /// context's bytes anyway), and the dictionary digested once for the run
 /// (`ZSTD_CCtx_loadDictionary`, digested at the run's first frame).
 fn initCompress(c: *Ctx) void {
+    checkParams(c);
     if (c.cdict) |*cd| cd.deinit();
     c.cdict = null;
     // as `ZSTD_initLocalDict` digests it: the context's level and
@@ -458,4 +499,22 @@ pub fn benchFiles(env: fio.Env, names: []const []const u8, dict_name: ?[]const u
     var mf: [20]u8 = undefined;
     const display_name = if (names.len > 1) std.fmt.bufPrint(&mf, " {d} files", .{names.len}) catch unreachable else names[0];
     return benchLevels(env, buf.items, sizes, start, end, cp, dict, display_name, params);
+}
+
+/// `BMK_syntheticTest`: lorem ipsum, or with a compressibility (`-P#`)
+/// datagen's data, of the block size or 10 MB.
+pub fn syntheticTest(env: fio.Env, compressibility: ?f64, start: i32, end: i32, cp: fio.CParams, params: *const Params) u8 {
+    const size: usize = if (params.block_size != 0) params.block_size else 10_000_000;
+    const src = env.gpa.alloc(u8, size) catch {
+        disp.at(1, "allocation error : not enough memory \n", .{});
+        return 16;
+    };
+    defer env.gpa.free(src);
+    var name_buf: [20]u8 = undefined;
+    var name: []const u8 = "Lorem ipsum";
+    if (compressibility) |c| {
+        synthetic.datagen(src, c, 0);
+        name = std.fmt.bufPrint(&name_buf, "Synthetic {d}%", .{@as(u32, @intFromFloat(c * 100))}) catch unreachable;
+    } else synthetic.lorem(src, 0);
+    return benchLevels(env, src, &.{size}, start, end, cp, null, name, params);
 }

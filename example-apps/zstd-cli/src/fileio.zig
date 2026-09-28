@@ -18,6 +18,7 @@
 const std = @import("std");
 const zstd = @import("zstd");
 const disp = @import("display.zig");
+const util = @import("util.zig");
 
 const Io = std.Io;
 const File = Io.File;
@@ -30,8 +31,16 @@ pub const nulmark = "/dev/null";
 const in_chunk = 128 * 1024;
 /// `ZSTD_DStreamInSize()`.
 const din_size = 128 * 1024 + 3;
-/// `ZSTD_CStreamOutSize()` / `ZSTD_DStreamOutSize()`.
-const out_size = 128 * 1024 + 1024;
+/// `ZSTD_CStreamOutSize()`: a block's bound, its header and a checksum.
+const cout_size = zstd.compressBound(128 * 1024) + 3 + 4;
+/// `ZSTD_DStreamOutSize()`: one block.
+const dout_size = 128 * 1024;
+
+/// `prefs->sparseFileSupport`: 0 `--no-sparse` (and compression), 1 the
+/// default, 2 `--sparse`. This port never writes sparsely; the setting
+/// only decides the notes at level 4, as C's does once, at the first
+/// output it opens.
+pub var sparse: u2 = 1;
 /// `DICTSIZE_MAX`.
 const dict_size_max = 32 << 20;
 
@@ -65,6 +74,8 @@ pub const Prefs = struct {
     /// null: on when `-f` writes to stdout (`passThrough == -1`).
     pass_through: ?bool = null,
     content_size: bool = true,
+    /// `--patch-from`: the dictionary is a prefix, the file to diff from.
+    patch_from: bool = false,
 };
 
 /// `FIO_ctx_t`.
@@ -344,6 +355,10 @@ fn openDst(env: Env, ctx: *const Ctx, prefs: *const Prefs, src_name: ?[]const u8
     if (prefs.test_mode) return null;
     if (isStdout(dst_name)) {
         disp.at(4, "Using stdout for output \n", .{});
+        if (sparse == 1) {
+            sparse = 0;
+            disp.at(4, "Sparse File Support is automatically disabled on stdout ; try --sparse \n", .{});
+        }
         const f = File.stdout();
         return .{ .file = f, .owned = false, .w = f.writerStreaming(env.io, &dst_buf) };
     }
@@ -354,6 +369,11 @@ fn openDst(env: Env, ctx: *const Ctx, prefs: *const Prefs, src_name: ?[]const u8
                 return null;
             };
         }
+    }
+    const is_reg_file = if (stat(env, dst_name)) |st| st.kind == .file else false;
+    if (sparse == 1 and !is_reg_file) {
+        sparse = 0;
+        disp.at(4, "Sparse File Support is disabled when output is not a file \n", .{});
     }
     if (stat(env, dst_name)) |st| if (st.kind == .file) {
         if (std.mem.eql(u8, dst_name, nulmark))
@@ -400,14 +420,79 @@ fn requireConfirmation(env: Env, prompt: []const u8, abort_msg: []const u8, lett
 
 // ------------------------------------------------------------ dictionary
 
-/// `FIO_initDict` (malloc'd): the whole file, at most 32 MiB.
-pub fn loadDict(env: Env, name: ?[]const u8) ?[]u8 {
-    const n = name orelse return null;
+/// `FIO_getDictFileStat`: the dictionary's size, which must be a regular
+/// file's.
+fn dictFileSize(env: Env, name: ?[]const u8) u64 {
+    const n = name orelse return 0;
     const st = stat(env, n) orelse fatal(31, "Stat failed on dictionary file {s}: {s}", .{ n, "No such file or directory" });
     if (st.kind != .file) fatal(32, "Dictionary {s} must be a regular file.", .{n});
-    if (st.size > dict_size_max) fatal(34, "Dictionary file {s} is too large (> {d} bytes)", .{ n, dict_size_max });
-    return Io.Dir.cwd().readFileAlloc(env.io, n, env.gpa, .limited(dict_size_max + 1)) catch |e|
+    return st.size;
+}
+
+/// `FIO_initDict` (malloc'd): the whole file, at most 32 MiB -- or, for
+/// `--patch-from`, at most the memory limit.
+pub fn loadDict(env: Env, prefs: *const Prefs, name: ?[]const u8) ?[]u8 {
+    const n = name orelse return null;
+    const size = dictFileSize(env, n);
+    const max: u64 = if (prefs.patch_from) prefs.mem_limit else dict_size_max;
+    if (size > max) fatal(34, "Dictionary file {s} is too large (> {d} bytes)", .{ n, max });
+    return Io.Dir.cwd().readFileAlloc(env.io, n, env.gpa, .limited(@intCast(max + 1))) catch |e|
         fatal(33, "Couldn't open dictionary {s}: {s}", .{ n, strerror(e) });
+}
+
+/// `FIO_highbit64`: 0 for 0, where C asserts.
+fn highbit64(v: u64) u32 {
+    return if (v == 0) 0 else 63 - @clz(v);
+}
+
+/// `FIO_adjustMemLimitForPatchFromMode`: the limit grows to the larger of
+/// the dictionary and the input.
+fn adjustMemLimitForPatchFrom(prefs: *Prefs, dict_size: u64, max_src_size: u64) void {
+    const max_size = @max(prefs.mem_limit, dict_size, max_src_size);
+    const max_window_size: u64 = @as(u64, 1) << zstd.limits.window_log_max;
+    if (max_size == unknown_size) fatal(42, "Using --patch-from with stdin requires --stream-size", .{});
+    if (max_size > max_window_size) fatal(42, "Can't handle files larger than {d} GB\n", .{max_window_size / (1 << 30)});
+    prefs.mem_limit = @intCast(max_size);
+}
+
+/// `FIO_adjustParamsForPatchFromMode`: a window covering the input, and
+/// long-distance matching when the level's tables do not reach that far.
+fn adjustParamsForPatchFrom(prefs: *Prefs, cp: *CParams, dict_size: u64, max_src_size: u64, level: i32) void {
+    const L = zstd.limits;
+    const file_window_log = highbit64(max_src_size) + 1;
+    const d = zstd.getCParams(level, max_src_size, dict_size);
+    adjustMemLimitForPatchFrom(prefs, dict_size, max_src_size);
+    if (file_window_log > L.window_log_max)
+        disp.at(1, "Max window log exceeded by file (compression ratio will suffer)\n", .{});
+    cp.window_log = @max(L.window_log_min, @min(L.window_log_max, file_window_log));
+    // `ZSTD_cycleLog`
+    const cycle_log = d.chain_log - @intFromBool(@intFromEnum(d.strategy) >= @intFromEnum(zstd.Strategy.btlazy2));
+    if (file_window_log > cycle_log) {
+        if (!prefs.ldm) disp.at(2, "long mode automatically triggered\n", .{});
+        prefs.ldm = true;
+    }
+    if (@intFromEnum(d.strategy) >= @intFromEnum(zstd.Strategy.btopt)) {
+        disp.at(4, "[Optimal parser notes] Consider the following to improve patch size at the cost of speed:\n", .{});
+        disp.at(4, "- Set a larger targetLength (e.g. --zstd=targetLength=4096)\n", .{});
+        disp.at(4, "- Set a larger chainLog (e.g. --zstd=chainLog={d})\n", .{L.chain_log_max});
+        disp.at(4, "- Set a larger LDM hashLog (e.g. --zstd=ldmHashLog={d})\n", .{L.ldm_hash_log_max});
+        disp.at(4, "- Set a smaller LDM rateLog (e.g. --zstd=ldmHashRateLog={d})\n", .{0});
+        disp.at(4, "Also consider playing around with searchLog and hashLog\n", .{});
+    }
+}
+
+/// `UTIL_FILESIZE_UNKNOWN`.
+const unknown_size = std.math.maxInt(u64);
+
+/// `FIO_getLargestFileSize`: an unknown size is the largest.
+fn largestFileSize(env: Env, names: []const []const u8) u64 {
+    var max: u64 = 0;
+    for (names) |n| {
+        const st = stat(env, n);
+        const size = if (st != null and st.?.kind == .file) st.?.size else unknown_size;
+        max = @max(max, size);
+    }
+    return max;
 }
 
 // ------------------------------------------------------------ compression
@@ -424,9 +509,16 @@ pub const CRess = struct {
     /// A destination shared by every file (`-o`/`-c` with several inputs).
     shared: ?*Dst = null,
 
-    /// `FIO_createCResources`.
-    pub fn init(env: Env, prefs: *const Prefs, dict_name: ?[]const u8, level: i32, cp: CParams) CRess {
-        const dict = loadDict(env, dict_name);
+    /// `FIO_createCResources`. `max_src_size`: the largest input's size,
+    /// for `--patch-from`.
+    pub fn init(env: Env, prefs: *Prefs, dict_name: ?[]const u8, max_src_size: u64, level: i32, cp_in: CParams) CRess {
+        var cp = cp_in;
+        // the limit is updated before the dictionary is read: it checks it
+        if (prefs.patch_from) {
+            const dict_size = dictFileSize(env, dict_name);
+            adjustParamsForPatchFrom(prefs, &cp, dict_size, if (prefs.stream_src_size > 0) prefs.stream_src_size else max_src_size, level);
+        }
+        const dict = loadDict(env, prefs, dict_name);
         var adv: zstd.Advanced = .{
             .content_size = prefs.content_size,
             .dict_id_flag = prefs.dict_id,
@@ -443,20 +535,25 @@ pub const CRess = struct {
             .search_log = nz(cp.search_log),
             .min_match = nz(cp.min_match),
             .target_length = nz(cp.target_length),
-            .strategy = if (cp.strategy != 0) @enumFromInt(cp.strategy) else null,
+            .strategy = strategyOf(cp.strategy) catch fatal(11, "{s}", .{zstdErrorName(error.ParameterOutOfBound)}),
             .literal_compression = prefs.literal_compression,
             .enable_dedicated_dict_search = true,
-            .nb_workers = prefs.nb_workers,
-            .job_size = prefs.block_size,
+            // libzstd clamps these two where the module refuses them
+            .nb_workers = @min(prefs.nb_workers, zstd.limits.nb_workers_max),
+            .job_size = @min(prefs.block_size, zstd.limits.job_size_max),
             .rsyncable = prefs.rsyncable,
         };
-        if (prefs.overlap_log) |o| adv.overlap_log = o;
+        // libzstd clamps the overlap log where the module refuses it
+        if (prefs.overlap_log) |o| adv.overlap_log = @min(o, zstd.limits.overlap_log_max);
         const opts: zstd.StreamOptions = .{
             .level = level,
             .checksum = prefs.checksum != 0,
             .src_size_hint = if (prefs.src_size_hint != 0) prefs.src_size_hint else null,
             .advanced = adv,
-            .dictionary = if (dict) |d| .{ .raw = .{ .bytes = d } } else .none,
+            .dictionary = if (dict) |d|
+                (if (prefs.patch_from) .{ .prefix = .{ .bytes = d } } else .{ .raw = .{ .bytes = d } })
+            else
+                .none,
         };
         const stream = zstd.Stream.init(env.gpa, opts) catch |e| fatal(11, "{s}", .{zstdErrorName(e)});
         return .{
@@ -466,7 +563,7 @@ pub const CRess = struct {
             .dict_name = dict_name,
             .dict_stat = if (dict_name) |n| stat(env, n) else null,
             .in_buf = env.gpa.alloc(u8, in_chunk) catch fatal(21, "Allocation error : not enough memory", .{}),
-            .out_buf = env.gpa.alloc(u8, out_size) catch fatal(21, "Allocation error : not enough memory", .{}),
+            .out_buf = env.gpa.alloc(u8, cout_size) catch fatal(21, "Allocation error : not enough memory", .{}),
         };
     }
 
@@ -478,12 +575,18 @@ pub const CRess = struct {
     }
 };
 
+/// `--zstd=strat=#`: 0 is "not set", above `btultra2` out of bounds.
+pub fn strategyOf(v: u32) error{ParameterOutOfBound}!?zstd.Strategy {
+    if (v == 0) return null;
+    return std.enums.fromInt(zstd.Strategy, v) orelse error.ParameterOutOfBound;
+}
+
 fn nz(v: u32) ?u32 {
     return if (v == 0) null else v;
 }
 
 /// `FIO_compressZstdFrame`: returns the compressed size.
-fn compressFrame(env: Env, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, src: Src, readsize: *u64) u64 {
+fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, src: Src, src_name: []const u8, readsize: *u64) u64 {
     const file_size = src.size();
     var opts = ress.opts;
     opts.pledged_size = file_size orelse if (prefs.stream_src_size > 0) prefs.stream_src_size else null;
@@ -504,6 +607,14 @@ fn compressFrame(env: Env, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, src: S
                 if (dst) |d| d.write(ress.out_buf[0..out.pos]);
                 compressed += out.pos;
             }
+            // display notification
+            if (disp.shouldProgress() and disp.readyForUpdate(env.io)) {
+                // zig-libs: SPEC backlog Z25 (`getFrameProgression`) -- until
+                // the stream reports what it holds, "consumed" is what it
+                // was given and nothing counts as buffered
+                const consumed = readsize.* - (in.src.len - in.pos);
+                showCompressProgress(env.io, ctx, ress.opts.level, src_name, file_size, 0, consumed, compressed);
+            }
         }
         rb.consume(rb.end - rb.start);
     }
@@ -512,11 +623,61 @@ fn compressFrame(env: Env, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, src: S
     return compressed;
 }
 
+/// The progress line of `FIO_compressZstdFrame`.
+fn showCompressProgress(io: Io, ctx: *const Ctx, level: i32, src_name: []const u8, file_size: ?u64, buffered: u64, consumed: u64, produced: u64) void {
+    const c_share = @as(f64, @floatFromInt(produced)) / @as(f64, @floatFromInt(consumed + @intFromBool(consumed == 0))) * 100;
+    const b = disp.hrs(buffered);
+    const c = disp.hrs(consumed);
+    const p = disp.hrs(produced);
+    disp.delayNextUpdate(io);
+    disp.clearProgress(); // clear out the current displayed line
+    if (!disp.shouldProgress() or disp.level < 1) return;
+    const w = disp.err();
+    if (disp.level >= 3) {
+        // verbose progress update
+        w.print("(L{d}) Buffered:", .{level}) catch {};
+        disp.fixed(w, b.value, 5, b.precision) catch {};
+        w.print("{s} - Consumed:", .{b.suffix}) catch {};
+        disp.fixed(w, c.value, 5, c.precision) catch {};
+        w.print("{s} - Compressed:", .{c.suffix}) catch {};
+        disp.fixed(w, p.value, 5, p.precision) catch {};
+        w.print("{s} => ", .{p.suffix}) catch {};
+        disp.fixed(w, c_share, 0, 2) catch {};
+        w.writeAll("% ") catch {};
+    } else {
+        if (ctx.nb_files_total > 1) {
+            // roughly the same width each time
+            w.print("Compress: {d}/{d} files. Current: ", .{ ctx.curr_file_idx + 1, ctx.nb_files_total }) catch {};
+            if (src_name.len > 18) {
+                w.print("...{s} ", .{src_name[src_name.len - 15 ..]}) catch {};
+            } else {
+                // `%*s` with a width of 18 - length, as C has it
+                disp.right(w, src_name, 18 - src_name.len) catch {};
+                w.writeAll(" ") catch {};
+            }
+        }
+        w.writeAll("Read:") catch {};
+        disp.fixed(w, c.value, 6, c.precision) catch {};
+        disp.right(w, c.suffix, 4) catch {};
+        w.writeAll(" ") catch {};
+        if (file_size) |fs| {
+            const f = disp.hrs(fs);
+            w.writeAll("/") catch {};
+            disp.fixed(w, f.value, 6, f.precision) catch {};
+            disp.right(w, f.suffix, 4) catch {};
+        }
+        w.writeAll(" ==> ") catch {};
+        disp.fixed(w, c_share, 2, 0) catch {};
+        w.writeAll("%") catch {};
+    }
+    disp.flush();
+}
+
 /// `FIO_compressFilename_internal`.
 fn compressInternal(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, dst_name: []const u8, src: Src, src_name: []const u8) void {
     var readsize: u64 = 0;
     disp.at(5, "{s}: {d} bytes \n", .{ src_name, src.size() orelse std.math.maxInt(u64) });
-    const compressed = compressFrame(env, prefs, ress, dst, src, &readsize);
+    const compressed = compressFrame(env, ctx, prefs, ress, dst, src, src_name, &readsize);
     ctx.total_in += readsize;
     ctx.total_out += compressed;
     disp.clearProgress();
@@ -613,8 +774,8 @@ fn compressSrcFile(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst_n
 }
 
 /// `FIO_compressFilename`.
-pub fn compressFilename(env: Env, ctx: *Ctx, prefs: *const Prefs, dst_name: []const u8, src_name: []const u8, dict_name: ?[]const u8, level: i32, cp: CParams) u1 {
-    var ress: CRess = .init(env, prefs, dict_name, level, cp);
+pub fn compressFilename(env: Env, ctx: *Ctx, prefs: *Prefs, dst_name: []const u8, src_name: []const u8, dict_name: ?[]const u8, level: i32, cp: CParams) u1 {
+    var ress: CRess = .init(env, prefs, dict_name, largestFileSize(env, &.{src_name}), level, cp);
     defer ress.deinit(env);
     return compressSrcFile(env, ctx, prefs, &ress, dst_name, src_name);
 }
@@ -650,8 +811,8 @@ fn multiFilesConcatWarning(env: Env, ctx: *const Ctx, prefs: *Prefs, out_name: [
 }
 
 /// `FIO_compressMultipleFilenames`.
-pub fn compressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []const u8, out_name: ?[]const u8, suffix: []const u8, dict_name: ?[]const u8, level: i32, cp: CParams) u1 {
-    var ress: CRess = .init(env, prefs, dict_name, level, cp);
+pub fn compressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []const u8, mirror_root: ?[]const u8, out_dir: ?[]const u8, out_name: ?[]const u8, suffix: []const u8, dict_name: ?[]const u8, level: i32, cp: CParams) u1 {
+    var ress: CRess = .init(env, prefs, dict_name, largestFileSize(env, names[0..ctx.nb_files_total]), level, cp);
     defer ress.deinit(env);
     var err: u1 = 0;
     if (out_name) |o| {
@@ -669,14 +830,27 @@ pub fn compressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []con
             if (dst) |*d| if (!d.close(env.io, null)) fatal(29, "Write error (Input/output error) : cannot properly close {s}", .{o});
         }
     } else {
+        var arena_state: std.heap.ArenaAllocator = .init(env.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        if (mirror_root) |root| util.mirrorSourceFilesDirectories(env, arena, names[0..ctx.nb_files_total], root);
         while (ctx.curr_file_idx < ctx.nb_files_total) : (ctx.curr_file_idx += 1) {
             const src_name = names[ctx.curr_file_idx];
-            const dst_name = compressedName(env.gpa, src_name, suffix);
+            var dir = out_dir;
+            if (mirror_root) |root| {
+                dir = util.mirroredDestDirName(arena, src_name, root) orelse {
+                    disp.at(2, "zstd: --output-dir-mirror cannot compress '{s}' into '{s}' \n", .{ src_name, root });
+                    err = 1;
+                    continue;
+                };
+            }
+            const dst_name = compressedName(env.gpa, src_name, dir, suffix);
             defer if (!isStdout(dst_name)) env.gpa.free(dst_name);
             const status = compressSrcFile(env, ctx, prefs, &ress, dst_name, src_name);
             if (status == 0) ctx.nb_files_processed += 1;
             err |= status;
         }
+        if (out_dir != null) checkFilenameCollisions(env.gpa, names[0..ctx.nb_files_total]);
     }
     if (ctx.multiSummary()) {
         const hi = disp.hrs(ctx.total_in);
@@ -706,9 +880,37 @@ pub fn compressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []con
 }
 
 /// `FIO_determineCompressedName`.
-fn compressedName(gpa: std.mem.Allocator, src_name: []const u8, suffix: []const u8) []const u8 {
+fn compressedName(gpa: std.mem.Allocator, src_name: []const u8, out_dir: ?[]const u8, suffix: []const u8) []const u8 {
     if (isStdin(src_name)) return stdoutmark;
-    return std.mem.concat(gpa, u8, &.{ src_name, suffix }) catch fatal(30, "zstd: Cannot allocate memory", .{});
+    const parts = fromOutDir(src_name, out_dir);
+    return std.mem.concat(gpa, u8, &.{ parts[0], parts[1], parts[2], suffix }) catch fatal(30, "zstd: Cannot allocate memory", .{});
+}
+
+/// `FIO_createFilename_fromOutDir` as three pieces: the directory, a `/`
+/// unless it ends with one, and the source's file name. Without a
+/// directory, the source name as it is (last).
+fn fromOutDir(src_name: []const u8, out_dir: ?[]const u8) [3][]const u8 {
+    const d = out_dir orelse return .{ "", "", src_name };
+    const base = if (std.mem.lastIndexOfScalar(u8, src_name, '/')) |i| src_name[i + 1 ..] else src_name;
+    return .{ d, if (d[d.len - 1] == '/') "" else "/", base };
+}
+
+/// `FIO_checkFilenameCollisions`: a warning for each file name (the part
+/// after the last `/`) met twice, in sorted order.
+fn checkFilenameCollisions(gpa: std.mem.Allocator, names: []const []const u8) void {
+    const sorted = gpa.alloc([]const u8, names.len) catch {
+        disp.at(1, "Allocation error during filename collision checking \n", .{});
+        return;
+    };
+    defer gpa.free(sorted);
+    for (names, sorted) |n, *s| s.* = if (std.mem.lastIndexOfScalar(u8, n, '/')) |i| n[i + 1 ..] else n;
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+    for (sorted[1..], 0..) |n, k| if (std.mem.eql(u8, sorted[k], n))
+        disp.at(2, "WARNING: Two files have same filename: {s}\n", .{sorted[k]});
 }
 
 // ---------------------------------------------------------- decompression
@@ -722,18 +924,21 @@ pub const DRess = struct {
     shared: ?*Dst = null,
 
     /// `FIO_createDResources`.
-    pub fn init(env: Env, prefs: *const Prefs, dict_name: ?[]const u8) DRess {
-        const dict = loadDict(env, dict_name);
+    pub fn init(env: Env, prefs: *Prefs, dict_name: ?[]const u8) DRess {
+        if (prefs.patch_from) adjustMemLimitForPatchFrom(prefs, dictFileSize(env, dict_name), 0);
+        const dict = loadDict(env, prefs, dict_name);
         const stream = zstd.DecompressStream.init(env.gpa, .{
             .max_window_size = prefs.mem_limit,
             .ignore_checksum = prefs.checksum == 0,
-            .dictionary = dict,
+            .dictionary = if (prefs.patch_from) null else dict,
+            // `ZSTD_DCtx_refPrefix`: the first frame only
+            .prefix = if (prefs.patch_from) dict else null,
         }) catch |e| fatal(11, "{s}", .{zstdErrorName(e)});
         return .{
             .stream = stream,
             .dict = dict,
             .rb_buf = env.gpa.alloc(u8, 2 * din_size) catch fatal(21, "Allocation error : not enough memory", .{}),
-            .out_buf = env.gpa.alloc(u8, out_size) catch fatal(21, "Allocation error : not enough memory", .{}),
+            .out_buf = env.gpa.alloc(u8, dout_size) catch fatal(21, "Allocation error : not enough memory", .{}),
         };
     }
 
@@ -765,8 +970,10 @@ fn zstdErrorHelp(prefs: *const Prefs, e: anyerror, loaded: []const u8, src_name:
 }
 
 /// `FIO_decompressZstdFrame`: the frame's size, or null on an error.
-fn decompressFrame(env: Env, prefs: *const Prefs, ress: *DRess, rb: *ReadBuf, dst: ?*Dst, src_name: []const u8) ?u64 {
+fn decompressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *DRess, rb: *ReadBuf, dst: ?*Dst, src_name: []const u8, already_decoded: u64) ?u64 {
     var frame_size: u64 = 0;
+    // display the last 20 characters only when not --verbose
+    const name20 = if (src_name.len > 20 and disp.level < 3) src_name[src_name.len - 20 ..] else src_name;
     ress.stream.reset();
     _ = rb.fill(env.io, 18); // ZSTD_FRAMEHEADERSIZE_MAX
     while (true) {
@@ -777,8 +984,11 @@ fn decompressFrame(env: Env, prefs: *const Prefs, ress: *DRess, rb: *ReadBuf, ds
             zstdErrorHelp(prefs, e, rb.loaded(), src_name);
             return null;
         };
+        // the size before this block's output, as C computes it
+        const h = disp.hrs(already_decoded + frame_size);
         if (dst) |d| d.write(ress.out_buf[0..out.pos]);
         frame_size += out.pos;
+        if (disp.shouldProgress() and disp.readyForUpdate(env.io)) showDecompressProgress(env.io, ctx, name20, h);
         rb.consume(in.pos);
         if (hint == 0) break;
         const to_decode = @min(hint, din_size);
@@ -790,6 +1000,31 @@ fn decompressFrame(env: Env, prefs: *const Prefs, ress: *DRess, rb: *ReadBuf, ds
         }
     }
     return frame_size;
+}
+
+/// The progress line of `FIO_decompressZstdFrame`: `%.*f%s` of the size.
+fn showDecompressProgress(io: Io, ctx: *const Ctx, name20: []const u8, h: disp.Hrs) void {
+    if (disp.level < 1 or disp.progress == .never) return;
+    disp.delayNextUpdate(io);
+    const w = disp.err();
+    if (ctx.nb_files_total > 1) {
+        w.writeAll("\rDecompress: ") catch {};
+        var nb: [24]u8 = undefined;
+        disp.right(w, std.fmt.bufPrint(&nb, "{d}", .{ctx.curr_file_idx + 1}) catch unreachable, 2) catch {};
+        w.writeAll("/") catch {};
+        disp.right(w, std.fmt.bufPrint(&nb, "{d}", .{ctx.nb_files_total}) catch unreachable, 2) catch {};
+        w.print(" files. Current: {s} : ", .{name20}) catch {};
+        disp.fixed(w, h.value, 0, h.precision) catch {};
+        w.print("{s}...    ", .{h.suffix}) catch {};
+    } else {
+        w.writeAll("\r") catch {};
+        // `%-20.20s`
+        disp.left(w, name20[0..@min(name20.len, 20)], 20) catch {};
+        w.writeAll(" : ") catch {};
+        disp.fixed(w, h.value, 0, h.precision) catch {};
+        w.print("{s}...     ", .{h.suffix}) catch {};
+    }
+    disp.flush();
 }
 
 /// `FIO_passThrough`.
@@ -828,7 +1063,7 @@ fn decompressFrames(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *DRess, src:
             return 1;
         }
         if (zstd.isFrame(buf)) {
-            const fs = decompressFrame(env, prefs, ress, &rb, dst, src_name) orelse return 1;
+            const fs = decompressFrame(env, ctx, prefs, ress, &rb, dst, src_name, filesize) orelse return 1;
             filesize += fs;
         } else if (buf[0] == 31 and buf[1] == 139) {
             disp.at(1, "zstd: {s}: gzip file cannot be uncompressed (zstd compiled without HAVE_ZLIB) -- ignored \n", .{src_name});
@@ -894,7 +1129,7 @@ fn decompressSrcFile(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *DRess, dst
 }
 
 /// `FIO_decompressFilename`.
-pub fn decompressFilename(env: Env, ctx: *Ctx, prefs: *const Prefs, dst_name: []const u8, src_name: []const u8, dict_name: ?[]const u8) u1 {
+pub fn decompressFilename(env: Env, ctx: *Ctx, prefs: *Prefs, dst_name: []const u8, src_name: []const u8, dict_name: ?[]const u8) u1 {
     var ress: DRess = .init(env, prefs, dict_name);
     defer ress.deinit(env);
     return decompressSrcFile(env, ctx, prefs, &ress, dst_name, src_name);
@@ -904,7 +1139,7 @@ const suffix_list = [_][]const u8{ ".zst", ".tzst", ".zstd" };
 const suffix_list_str = ".zst/.tzst";
 
 /// `FIO_determineDstName`: null when the suffix is unknown.
-fn dstName(gpa: std.mem.Allocator, src_name: []const u8) ?[]const u8 {
+fn dstName(gpa: std.mem.Allocator, src_name: []const u8, out_dir: ?[]const u8) ?[]const u8 {
     if (isStdin(src_name)) return stdoutmark;
     const dot = std.mem.lastIndexOfScalar(u8, src_name, '.') orelse {
         disp.at(1, "zstd: {s}: unknown suffix ({s} expected). Can't derive the output file name. Specify it with -o dstFileName. Ignoring.\n", .{ src_name, suffix_list_str });
@@ -921,11 +1156,14 @@ fn dstName(gpa: std.mem.Allocator, src_name: []const u8) ?[]const u8 {
         return null;
     }
     const tail: []const u8 = if (matched.?[1] == 't') ".tar" else "";
-    return std.mem.concat(gpa, u8, &.{ src_name[0..dot], tail }) catch fatal(74, "Cannot allocate memory : not enough memory for dstFileName", .{});
+    const parts = fromOutDir(src_name, out_dir);
+    // the suffix is the end of the file name, so of `parts[2]` too
+    const stem = parts[2][0 .. parts[2].len - suffix.len];
+    return std.mem.concat(gpa, u8, &.{ parts[0], parts[1], stem, tail }) catch fatal(74, "Cannot allocate memory : not enough memory for dstFileName", .{});
 }
 
 /// `FIO_decompressMultipleFilenames`.
-pub fn decompressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []const u8, out_name: ?[]const u8, dict_name: ?[]const u8) u1 {
+pub fn decompressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []const u8, mirror_root: ?[]const u8, out_dir: ?[]const u8, out_name: ?[]const u8, dict_name: ?[]const u8) u1 {
     var ress: DRess = .init(env, prefs, dict_name);
     defer ress.deinit(env);
     var err: u1 = 0;
@@ -943,9 +1181,21 @@ pub fn decompressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []c
         }
         if (dst) |*d| if (!d.close(env.io, null)) fatal(72, "Write error : Input/output error : cannot properly close output file", .{});
     } else {
+        var arena_state: std.heap.ArenaAllocator = .init(env.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        if (mirror_root) |root| util.mirrorSourceFilesDirectories(env, arena, names[0..ctx.nb_files_total], root);
         while (ctx.curr_file_idx < ctx.nb_files_total) : (ctx.curr_file_idx += 1) {
             const src_name = names[ctx.curr_file_idx];
-            const dst_name = dstName(env.gpa, src_name) orelse {
+            var dir = out_dir;
+            if (mirror_root) |root| {
+                dir = util.mirroredDestDirName(arena, src_name, root) orelse {
+                    disp.at(2, "zstd: --output-dir-mirror cannot decompress '{s}' into '{s}'\n", .{ src_name, root });
+                    err = 1;
+                    continue;
+                };
+            }
+            const dst_name = dstName(env.gpa, src_name, dir) orelse {
                 err = 1;
                 continue;
             };
@@ -954,6 +1204,7 @@ pub fn decompressMultiple(env: Env, ctx: *Ctx, prefs: *Prefs, names: []const []c
             if (status == 0) ctx.nb_files_processed += 1;
             err |= status;
         }
+        if (out_dir != null) checkFilenameCollisions(env.gpa, names[0..ctx.nb_files_total]);
     }
     if (ctx.multiSummary()) {
         disp.clearProgress();

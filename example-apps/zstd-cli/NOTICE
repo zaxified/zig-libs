@@ -1,7 +1,8 @@
 zstd-cli — third-party attribution
 
 This file carries a CONDITION. `src/main.zig`, `src/fileio.zig`, `src/list.zig`,
-`src/bench.zig` and `src/display.zig` are a translation of C source from libzstd's command-line
+`src/bench.zig`, `src/display.zig`, `src/util.zig`, `src/dibio.zig` and
+`src/synthetic.zig` are a translation of C source from libzstd's command-line
 program (github.com/facebook/zstd, tag v1.5.7, commit
 f8745da6ff1ad1e7bab384bd1f9d742439278e99) into Zig. The BSD licence that source
 is offered under requires its copyright notice, conditions and disclaimer to
@@ -26,11 +27,16 @@ messages verbatim):
                          --rm and permission handling; messages      -> src/fileio.zig, src/list.zig
   programs/util.c        UTIL_makeHumanReadableSize,
                          UTIL_requireUserConfirmation                -> src/display.zig, src/fileio.zig
+                         the file-name tables (-r, --filelist) and
+                         the --output-dir-mirror directories         -> src/util.zig
   programs/benchzstd.c,  the -b benchmark: blocks, timed runs,
   programs/benchfn.c     output                                      -> src/bench.zig
+  programs/dibio.c       --train: samples, shuffle, messages         -> src/dibio.zig
+  programs/lorem.c,      the synthetic inputs of -b without a
+  programs/datagen.c     file                                        -> src/synthetic.zig
 
-Not taken: programs/dibio.c, fileio_asyncio.c, lorem.c, datagen.c,
-timefn.c, and the gzip/xz/lz4 paths of fileio.c.
+Not taken: fileio_asyncio.c, timefn.c, zstdcli_trace.c, and the gzip/xz/lz4
+paths of fileio.c.
 
 LICENSE TEXT (libzstd `LICENSE`, verbatim)
 
