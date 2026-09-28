@@ -94,6 +94,26 @@ point of each, rather than only the one hand-picked split ("A€B" cut mid-codep
 used to rely on as its sole proof that deferred validation doesn't false-positive on legitimate
 fragmentation — an attacker choosing where to split a message is not obliged to pick that split.
 
+**Within one frame, too** (2026-09-28, from qap's Autobahn lane: §6.4.3-4 — one text frame
+delivered in TCP chops, invalid from an early chop — were still NON-STRICT after the per-fragment
+fix, because `receive` consumes whole frames only; autobahn-python and gorilla fail at the chop).
+When `parseFrame` says `.need_more` with the header complete and the frame is text (a new text
+frame, or a continuation of a text message), `receive` validates the payload bytes that did arrive
+before returning `.need_more` — starting from a fresh `IncrementalUtf8` for a text frame, or from
+the message's `text_utf8` for a continuation. The caller's buffer is not touched: the masked bytes
+are unmasked into a 256-byte stack copy with the mask key rotated to the byte offset, because
+`parseFrame` unmasks in place once the frame completes and must still find them masked. The
+progress (bytes checked, validator state) is kept in `Connection.partial_text`, keyed by the
+frame's header bytes, so a caller retrying with a growing buffer — the `.need_more` contract —
+costs one pass over the payload, not one per retry; a retry whose header bytes differ starts over
+from byte 0. The partial state can only make `receive` fail **earlier**: once the frame is
+complete its whole payload is validated again from `text_utf8`, exactly as before, so nothing a
+caller does with partial buffers can make an invalid message pass (cost: text frames that arrive in
+pieces are UTF-8-scanned twice). Frames that will fail anyway once complete — a text frame inside a
+fragmented message, a continuation with nothing to continue, data after close — are not checked
+early, so the error they fail with does not change. The header decode this needs is public as
+`frame.parseHeader` (`parseFrame` = `parseHeader` + "is the whole payload there" + unmask).
+
 ## Threat model / out of scope
 
 This module parses untrusted network input end to end (the handshake request/response headers and
@@ -346,14 +366,6 @@ The RED comes from the foreign corpus and from nothing else.
 
 - permessage-deflate (RFC 7692) extension negotiation + DEFLATE framing — see "Out of scope" above.
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller.
-- **Fail fast on invalid UTF-8 within one frame** (from qap's Autobahn lane, 2026-09-28).
-  `83b2552a` validates per fragment, so §6.4.1-2 pass; §6.4.3-4 (one text frame delivered in TCP
-  chops, invalid from an early chop) are still NON-STRICT: `Connection.receive` consumes whole
-  frames only, so the payload is checked once the frame is complete. autobahn-python and gorilla
-  fail at the chop. Would need `receive` to take a partial data frame -- unmask and feed
-  `IncrementalUtf8` with the bytes so far, keep the mask offset -- or a separate
-  `peekText(partial)` a caller runs on a partial frame. qap baselines the two cases
-  (`scripts/conformance-baseline/autobahn.tsv`).
 
 ## Anchoring
 

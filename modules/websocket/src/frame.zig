@@ -210,6 +210,53 @@ fn applyMaskScalarRef(payload: []u8, key: [4]u8) void {
 /// any payload bytes need to be present), so an oversized frame is
 /// rejected without waiting to buffer it.
 pub fn parseFrame(buf: []u8, role: Role, max_frame_size: u64) FrameError!ParseResult {
+    const h = switch (try parseHeader(buf, role, max_frame_size)) {
+        .need_more => return .need_more,
+        .header => |h| h,
+    };
+    const total: u64 = @as(u64, h.len) + h.payload_len;
+    if (total > buf.len) return .need_more;
+    const total_usize: usize = @intCast(total);
+
+    const payload = buf[h.len..total_usize];
+    if (h.mask_key) |key| applyMask(payload, key);
+
+    return .{ .frame = .{
+        .fin = h.fin,
+        .opcode = h.opcode,
+        .masked = h.mask_key != null,
+        .payload = payload,
+        .consumed = total_usize,
+    } };
+}
+
+/// A frame's header (§5.2), decoded and checked, with none of its payload
+/// needed yet. `parseFrame` is `parseHeader` plus "is the whole payload
+/// there"; `Connection` uses it alone to look at the part of a text frame's
+/// payload that has already arrived ("fail fast on invalid UTF-8 within one
+/// frame", 2026-09-28).
+pub const Header = struct {
+    fin: bool,
+    opcode: Opcode,
+    /// Non-null iff the frame is masked. The payload bytes in the buffer
+    /// are still masked — `parseHeader` does not touch them.
+    mask_key: ?[4]u8,
+    /// Header length in bytes (2..14): the payload starts at `buf[len]`.
+    len: u8,
+    payload_len: u64,
+};
+
+pub const HeaderResult = union(enum) {
+    header: Header,
+    /// `buf` does not yet hold the whole header.
+    need_more,
+};
+
+/// Decode and check the header at the front of `buf` — every check
+/// `parseFrame` makes before it needs payload bytes (RSV bits, opcode,
+/// masking direction, minimal length encoding, control-frame limits,
+/// `max_frame_size`). Never reads or modifies payload bytes.
+pub fn parseHeader(buf: []const u8, role: Role, max_frame_size: u64) FrameError!HeaderResult {
     if (buf.len < 2) return .need_more;
 
     const b0 = buf[0];
@@ -250,27 +297,20 @@ pub fn parseFrame(buf: []u8, role: Role, max_frame_size: u64) FrameError!ParseRe
     }
     if (payload_len > max_frame_size) return error.FrameTooLarge;
 
-    var mask_key: [4]u8 = undefined;
-    const mask_start = header_len;
+    var mask_key: ?[4]u8 = null;
     if (masked) {
+        const mask_start = header_len;
         header_len += 4;
         if (buf.len < header_len) return .need_more;
         mask_key = buf[mask_start..][0..4].*;
     }
 
-    const total: u64 = @as(u64, header_len) + payload_len;
-    if (total > buf.len) return .need_more;
-    const total_usize: usize = @intCast(total);
-
-    const payload = buf[header_len..total_usize];
-    if (masked) applyMask(payload, mask_key);
-
-    return .{ .frame = .{
+    return .{ .header = .{
         .fin = fin,
         .opcode = opcode,
-        .masked = masked,
-        .payload = payload,
-        .consumed = total_usize,
+        .mask_key = mask_key,
+        .len = @intCast(header_len),
+        .payload_len = payload_len,
     } };
 }
 

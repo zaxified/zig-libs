@@ -47,7 +47,8 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
 - **`frame`** — `Opcode` (continuation/text/binary/close/ping/pong), `Frame`, `Role` (`.server` /
   `.client` — which masking direction to enforce on parse), `parseFrame(buf, role,
   max_frame_size) FrameError!ParseResult` (streaming: `.frame`, `.need_more`, or a typed error —
-  never blocks or panics on a truncated buffer), `writeFrame(w, WriteOptions) WriteError!void`
+  never blocks or panics on a truncated buffer), `parseHeader(buf, role, max_frame_size)` (the
+  same checks, header only, payload untouched), `writeFrame(w, WriteOptions) WriteError!void`
   (refuses a fragmented or over-125-byte control frame with the same error names the parser uses,
   before writing anything). `mask_key: ?[4]u8`
   on `WriteOptions` is the entire masking decision — null = unmasked, a key = masked with that
@@ -57,7 +58,8 @@ const result = try websocket.handshake.verifyResponse(response_head, &key, &.{})
   `receive(buf) Error!Result`: an optional small state machine that reassembles fragmented
   messages into `message_buf` (whose length is the aggregate max-message-size cap, alongside
   `max_fragments`, a per-message frame-count cap), lets control frames interleave
-  mid-fragmentation, validates UTF-8 on the complete text message, and surfaces the close
+  mid-fragmentation, validates a text message's UTF-8 as it arrives (per fragment, and
+  within a frame that is still incomplete), and surfaces the close
   handshake: `close_received` is set automatically on receipt; `close_sent` is a plain field the
   caller sets itself after writing its own close frame (this module does no I/O, so it cannot see
   that write); `bothClosed()` reflects both.

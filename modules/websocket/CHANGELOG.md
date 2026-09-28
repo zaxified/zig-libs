@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **BEHAVIOURAL, not breaking** (found by qap's Autobahn lane): invalid UTF-8 is
+  now refused **within one frame** that has not fully arrived. When `Connection.receive` returns
+  `.need_more` for an incomplete text frame (or a continuation of a text message), the payload
+  bytes that did arrive have been validated; an invalid one is `error.InvalidUtf8` (close 1007) at
+  that read, not after the rest of the frame is in — Autobahn §6.4.3-4, previously NON-STRICT. The
+  caller's buffer is not modified; progress is kept per frame (`Connection.partial_text`, keyed by
+  the header bytes), so a growing-buffer retry scans each byte once. Every message keeps the
+  verdict it had: the complete frame is still validated in full, the partial check can only fail
+  earlier. New public `frame.parseHeader` / `frame.Header` / `frame.HeaderResult` (the header
+  half of `parseFrame`, payload untouched).
+
 - **2026-09-28** — **BEHAVIOURAL, not breaking** (found by qap's Autobahn lane, 2026-09-26):
   `Connection.receive` now validates a text message's UTF-8 (§5.6) incrementally, per fragment, via
   the new `IncrementalUtf8` (`connection.zig`) — invalid UTF-8 in an early fragment is now refused

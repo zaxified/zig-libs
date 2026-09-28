@@ -190,6 +190,30 @@ pub const Connection = struct {
     /// UTF-8 in an early fragment is caught at that fragment instead of
     /// only once the whole message has been reassembled.
     text_utf8: IncrementalUtf8 = .{},
+    /// "Fail fast on invalid UTF-8 within one frame", 2026-09-28: how far
+    /// into a text frame that has not fully arrived yet `receive` has
+    /// already checked (see `checkPartialText`).
+    partial_text: PartialText = .{},
+
+    /// The part of an incomplete text (or text-continuation) frame that
+    /// `receive` has already run through UTF-8 validation, so a caller that
+    /// retries with a growing buffer (the `.need_more` contract) costs one
+    /// pass over the payload, not one per retry. `header` identifies the
+    /// frame the progress belongs to: a retry that starts with different
+    /// header bytes (caller broke the contract, or the frame is a new one)
+    /// starts over from byte 0 instead of reusing another frame's state.
+    ///
+    /// Only ever makes `receive` fail EARLIER: when the frame completes, its
+    /// whole payload is validated again from `text_utf8`, exactly as before
+    /// this existed, so nothing here can make an invalid message pass.
+    const PartialText = struct {
+        header: [14]u8 = undefined,
+        /// 0 = no frame in progress.
+        header_len: u8 = 0,
+        /// Payload bytes already fed to `utf8`.
+        checked: usize = 0,
+        utf8: IncrementalUtf8 = .{},
+    };
 
     pub fn init(role: frame.Role, message_buf: []u8, max_frame_size: u64) Connection {
         return .{ .role = role, .max_frame_size = max_frame_size, .message_buf = message_buf };
@@ -199,6 +223,9 @@ pub const Connection = struct {
 
     pub const Event = union(enum) {
         /// `buf` did not contain a complete frame; read more and retry.
+        /// The part of a text frame that did arrive has already been
+        /// checked: invalid UTF-8 in it is `error.InvalidUtf8` now, not
+        /// once the rest of the frame is in.
         need_more,
         /// A non-final fragment was consumed; no message is ready yet.
         frame_consumed,
@@ -276,11 +303,16 @@ pub const Connection = struct {
             self.message_len = 0;
             self.fragment_count = 0;
             self.text_utf8 = .{};
+            self.partial_text = .{};
         }
         const parsed = switch (try frame.parseFrame(buf, self.role, self.max_frame_size)) {
-            .need_more => return .{ .event = .need_more, .consumed = 0 },
+            .need_more => {
+                try self.checkPartialText(buf);
+                return .{ .event = .need_more, .consumed = 0 };
+            },
             .frame => |f| f,
         };
+        self.partial_text = .{};
 
         // F9 remainder: bound frames of ANY kind (control included) once
         // the peer has already told us it is closing. Checked before
@@ -382,6 +414,61 @@ pub const Connection = struct {
                 return .{ .event = .frame_consumed, .consumed = parsed.consumed };
             },
             else => unreachable, // control opcodes handled above
+        }
+    }
+
+    /// "Fail fast on invalid UTF-8 within one frame" (Autobahn §6.4.3-4,
+    /// found by qap's Autobahn lane, 2026-09-28). `buf` holds a frame that
+    /// has not fully arrived; if it is text -- a new text frame, or a
+    /// continuation of a text message -- the payload bytes that did arrive
+    /// are validated now, so a byte that can never be valid UTF-8 fails the
+    /// connection at the TCP chop it came in, not only after the rest of a
+    /// possibly huge frame has been read. `buf` is not modified: the bytes
+    /// are unmasked into a small copy (`parseFrame` unmasks in place once,
+    /// when the frame completes, and must still find them masked).
+    ///
+    /// Frames that will fail anyway once complete (a text frame inside a
+    /// fragmented message, a continuation with nothing to continue, data
+    /// after close) are left to that check, so the error they fail with
+    /// does not change.
+    fn checkPartialText(self: *Connection, buf: []const u8) Error!void {
+        const h = switch (try frame.parseHeader(buf, self.role, self.max_frame_size)) {
+            .need_more => return,
+            .header => |h| h,
+        };
+        if (self.close_received) return;
+        const start: IncrementalUtf8 = switch (h.opcode) {
+            .text => if (self.fragment_opcode == null) .{} else return,
+            .continuation => if (self.fragment_opcode == .text) self.text_utf8 else return,
+            else => return,
+        };
+        // `parseFrame` said `.need_more` with the whole header present, so
+        // the payload is incomplete: `arrived.len < h.payload_len`.
+        const arrived = buf[h.len..];
+
+        const p = &self.partial_text;
+        const same_frame = p.header_len == h.len and
+            std.mem.eql(u8, p.header[0..h.len], buf[0..h.len]) and
+            p.checked <= arrived.len;
+        if (!same_frame) {
+            p.* = .{ .header_len = h.len, .utf8 = start };
+            @memcpy(p.header[0..h.len], buf[0..h.len]);
+        }
+
+        var chunk: [256]u8 = undefined;
+        while (p.checked < arrived.len) {
+            const n = @min(chunk.len, arrived.len - p.checked);
+            const bytes = chunk[0..n];
+            @memcpy(bytes, arrived[p.checked..][0..n]);
+            if (h.mask_key) |key| {
+                // Payload byte j was masked with key[j % 4]; rotate the key
+                // so `applyMask`'s index 0 lines up with byte `checked`.
+                var rotated: [4]u8 = undefined;
+                for (&rotated, 0..) |*r, i| r.* = key[(p.checked + i) % 4];
+                frame.applyMask(bytes, rotated);
+            }
+            try p.utf8.feed(bytes);
+            p.checked += n;
         }
     }
 
@@ -974,6 +1061,217 @@ test "a message ending mid-code-point (FIN with a pending sequence) is rejected 
     var wire2 = [_]u8{ 0x80, 0x00 }; // continuation, fin=1, EMPTY -- nothing left to complete it
     try testing.expectError(error.InvalidUtf8, conn.receive(&wire2));
     try testing.expectEqual(@as(u16, 1007), frame.closeCode(error.InvalidUtf8));
+}
+
+// ── fail fast on invalid UTF-8 within one frame (2026-09-28) ───────────────
+//
+// Autobahn §6.4.3-4, from qap's lane: one text frame delivered in TCP chops,
+// invalid from an early chop. `receive` used to validate only once the frame
+// was complete, so the rest of the frame was read first (NON-STRICT);
+// autobahn-python and gorilla fail at the chop.
+
+/// A masked client→server frame (first octet `b0`), as a server-role
+/// `Connection` receives it.
+fn maskedFrame(out: []u8, b0: u8, payload: []const u8, key: [4]u8) []u8 {
+    out[0] = b0;
+    var n: usize = 2;
+    if (payload.len <= 125) {
+        out[1] = 0x80 | @as(u8, @intCast(payload.len));
+    } else {
+        out[1] = 0x80 | 126;
+        std.mem.writeInt(u16, out[2..4], @intCast(payload.len), .big);
+        n = 4;
+    }
+    @memcpy(out[n..][0..4], &key);
+    n += 4;
+    @memcpy(out[n..][0..payload.len], payload);
+    frame.applyMask(out[n..][0..payload.len], key);
+    return out[0 .. n + payload.len];
+}
+
+const test_mask: [4]u8 = .{ 0x37, 0xfa, 0x21, 0x3d };
+
+test "Autobahn 6.4.3 shape: a text frame invalid from its second chop fails at that chop" {
+    // The case's own payload: "κόσμε", then U+110000 (never valid: 0xF4
+    // must be followed by 0x80-0x8F), then "edited" -- one FIN text frame.
+    const p1 = "\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5";
+    const p2 = "\xf4\x90\x80\x80";
+    const p3 = "edited";
+    var wire_buf: [64]u8 = undefined;
+    const wire = maskedFrame(&wire_buf, 0x81, p1 ++ p2 ++ p3, test_mask);
+    const hlen = 6;
+
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.server, &scratch, 1 << 20);
+    try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0 .. hlen + p1.len])).event);
+    try testing.expectError(error.InvalidUtf8, conn.receive(wire[0 .. hlen + p1.len + p2.len]));
+}
+
+/// Index of the first byte at which `bytes` can no longer be valid UTF-8,
+/// or null if no single byte decides it (valid, or only truncated at the end).
+fn firstInvalidByte(bytes: []const u8) ?usize {
+    var v: IncrementalUtf8 = .{};
+    for (bytes, 0..) |_, i| v.feed(bytes[i .. i + 1]) catch return i;
+    return null;
+}
+
+/// Feed `wire` (one frame, header `hlen` bytes) to `conn` one byte more per
+/// call, as a reader that gets one byte per `read` would. The frame must
+/// fail on the call whose prefix first contains its first invalid payload
+/// byte (`early`, relative to the payload; it must not be the frame's last
+/// byte) and not one call earlier -- returns true then. With no such byte,
+/// every incomplete prefix must be `.need_more` and it returns false,
+/// leaving the complete frame to the caller (whose `receive` unmasks it in
+/// place, so that call can only be made once).
+fn expectFailFastByPrefix(conn: *Connection, wire: []u8, hlen: usize, early: ?usize) !bool {
+    if (early) |i| std.debug.assert(hlen + i + 1 < wire.len);
+    for (0..wire.len) |len| {
+        const r = conn.receive(wire[0..len]);
+        if (early != null and len == hlen + early.? + 1) {
+            try testing.expectError(error.InvalidUtf8, r);
+            return true;
+        }
+        try testing.expectEqual(Connection.Event.need_more, (try r).event);
+    }
+    return false;
+}
+
+/// `firstInvalidByte`, unless that byte is the last one (which only a
+/// complete frame can show).
+fn earlyInvalidByte(payload: []const u8) ?usize {
+    const i = firstInvalidByte(payload) orelse return null;
+    return if (i + 1 < payload.len) i else null;
+}
+
+test "a text frame fed byte by byte fails exactly at its first invalid byte (Kuhn corpus)" {
+    var scratch: [64]u8 = undefined;
+    for (kuhn_utf8_vectors) |v| {
+        var wire_buf: [64]u8 = undefined;
+        const wire = maskedFrame(&wire_buf, 0x81, v.bytes, test_mask);
+        var conn: Connection = .init(.server, &scratch, 1 << 20);
+        const failed = expectFailFastByPrefix(&conn, wire, 6, earlyInvalidByte(v.bytes)) catch |e| {
+            std.debug.print("{s}: {t}\n", .{ v.label, e });
+            return e;
+        };
+        if (failed) continue;
+        const r = conn.receive(wire);
+        if (v.valid) {
+            try testing.expectEqualSlices(u8, v.bytes, (try r).event.message.payload);
+        } else {
+            try testing.expectError(error.InvalidUtf8, r);
+        }
+    }
+}
+
+test "a continuation frame fed byte by byte fails at its first invalid byte, carrying the message's state" {
+    // Every vector split at every point into a complete first fragment and a
+    // continuation that arrives byte by byte: the continuation's partial
+    // check has to start from the state the first fragment left (a code
+    // point split across the two frames is fine, a byte invalid given the
+    // previous frame's tail is not).
+    var scratch: [64]u8 = undefined;
+    for (kuhn_utf8_vectors) |v| {
+        for (0..v.bytes.len + 1) |split| {
+            var conn: Connection = .init(.server, &scratch, 1 << 20);
+            var first_buf: [64]u8 = undefined;
+            const first = maskedFrame(&first_buf, 0x01, v.bytes[0..split], test_mask);
+            const fail_at = firstInvalidByte(v.bytes);
+            if (fail_at != null and fail_at.? < split) {
+                try testing.expectError(error.InvalidUtf8, conn.receive(first));
+                continue;
+            }
+            try testing.expectEqual(Connection.Event.frame_consumed, (try conn.receive(first)).event);
+
+            var cont_buf: [64]u8 = undefined;
+            const cont = maskedFrame(&cont_buf, 0x80, v.bytes[split..], test_mask);
+            const early = if (fail_at) |i| (if (i + 1 < v.bytes.len) i - split else null) else null;
+            const failed = expectFailFastByPrefix(&conn, cont, 6, early) catch |e| {
+                std.debug.print("{s} split={d}: {t}\n", .{ v.label, split, e });
+                return e;
+            };
+            if (failed) continue;
+            const r = conn.receive(cont);
+            if (v.valid) {
+                try testing.expectEqualSlices(u8, v.bytes, (try r).event.message.payload);
+            } else {
+                try testing.expectError(error.InvalidUtf8, r);
+            }
+        }
+    }
+}
+
+test "partial check across 256-byte chunks and odd chops: valid text passes, one bad byte fails at its chop" {
+    // 233 x '€' (3 bytes each, 699 bytes): code points straddle the partial
+    // check's 256-byte chunks and every chop below, and the mask phase is
+    // rotated at each odd offset -- a wrong rotation shows as a false
+    // rejection here.
+    var payload: [699]u8 = undefined;
+    for (0..233) |k| @memcpy(payload[k * 3 ..][0..3], "\xE2\x82\xAC");
+    var wire_buf: [8 + 699]u8 = undefined;
+    var msg: [1024]u8 = undefined;
+    {
+        const wire = maskedFrame(&wire_buf, 0x81, &payload, test_mask);
+        var conn: Connection = .init(.server, &msg, 1 << 20);
+        var len: usize = 0;
+        while (len + 7 < wire.len) : (len += 7)
+            try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0..len])).event);
+        try testing.expectEqualSlices(u8, &payload, (try conn.receive(wire)).event.message.payload);
+    }
+    {
+        payload[600] = 0xFF;
+        const wire = maskedFrame(&wire_buf, 0x81, &payload, test_mask);
+        var conn: Connection = .init(.server, &msg, 1 << 20);
+        try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0 .. 8 + 300])).event);
+        try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0 .. 8 + 600])).event);
+        try testing.expectError(error.InvalidUtf8, conn.receive(wire[0 .. 8 + 601]));
+    }
+}
+
+test "partial check leaves binary frames, and text frames that will fail otherwise, alone" {
+    var scratch: [64]u8 = undefined;
+    var wire_buf: [64]u8 = undefined;
+    // Binary: no UTF-8 rule at all.
+    {
+        var conn: Connection = .init(.server, &scratch, 1 << 20);
+        const wire = maskedFrame(&wire_buf, 0x82, "\xFF\xFE\xFD\xFC", test_mask);
+        try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0 .. wire.len - 1])).event);
+    }
+    // A continuation of a BINARY message.
+    {
+        var conn: Connection = .init(.server, &scratch, 1 << 20);
+        var first_buf: [16]u8 = undefined;
+        _ = try conn.receive(maskedFrame(&first_buf, 0x02, "ab", test_mask));
+        const wire = maskedFrame(&wire_buf, 0x80, "\xFF\xFE\xFD\xFC", test_mask);
+        try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0 .. wire.len - 1])).event);
+    }
+    // A text frame inside a fragmented message keeps failing with
+    // InvalidFragmentation once complete, not with InvalidUtf8 earlier.
+    {
+        var conn: Connection = .init(.server, &scratch, 1 << 20);
+        var first_buf: [16]u8 = undefined;
+        _ = try conn.receive(maskedFrame(&first_buf, 0x01, "ab", test_mask));
+        const wire = maskedFrame(&wire_buf, 0x81, "\xFF\xFE\xFD\xFC", test_mask);
+        try testing.expectEqual(Connection.Event.need_more, (try conn.receive(wire[0 .. wire.len - 1])).event);
+        try testing.expectError(error.InvalidFragmentation, conn.receive(wire));
+    }
+}
+
+test "partial check progress belongs to one frame: a retry with other header bytes starts over" {
+    // The `.need_more` contract is "retry with a longer slice starting at the
+    // same offset". A caller that instead retries with a different frame must
+    // not have that frame judged by the first one's leftover state: 0xE2
+    // (an unfinished '€') followed by 'A' would be invalid, but 'A' starts a
+    // different frame here.
+    var scratch: [64]u8 = undefined;
+    var conn: Connection = .init(.server, &scratch, 1 << 20);
+    var a_buf: [16]u8 = undefined;
+    const a = maskedFrame(&a_buf, 0x81, "\xE2\x82\xAC!", test_mask);
+    try testing.expectEqual(Connection.Event.need_more, (try conn.receive(a[0 .. 6 + 1])).event);
+
+    var b_buf: [16]u8 = undefined;
+    const b = maskedFrame(&b_buf, 0x81, "ABCDE", .{ 1, 2, 3, 4 }); // same opcode, other length + key
+    try testing.expectEqual(Connection.Event.need_more, (try conn.receive(b[0 .. 6 + 2])).event);
+    try testing.expectEqualStrings("ABCDE", (try conn.receive(b)).event.message.payload);
 }
 
 test "close frame surfaces code + reason and updates close_received" {
