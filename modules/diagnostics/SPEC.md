@@ -25,14 +25,30 @@ message/suggest memory before reading the collector back gets a dangling-slice b
 caller's responsibility, not this module's.
 
 ## Verification
-Tests cover: append + count/countBySeverity accounting across severities, the doc-comment usage
+Tests cover: rendering in both styles against exact expected text (missing fields left out, caret
+alignment after tabs and multi-byte UTF-8, multi-line and clamped spans, the source picked by file
+or as the only one, control characters escaped), stable sorting with unknown positions, JSON output
+read back by `std.json`; append + count/countBySeverity accounting across severities, the doc-comment usage
 pattern (arena-lifetime append then read), and structural field coverage (path/line/col/end/
 byte-offset/code/message/suggest all round-trip through `items`). Run: `zig build test-diagnostics`.
 
+**Rendering, JSON, order** (2026-09-28, requested by ttydesk, which rendered findings itself and
+smuggled the file name into `path` as `file:path`). `Diagnostic.file` (optional) names the source.
+`renderOne`/`Diagnostics.render` write `short` (one compiler-style line: `file:line:col:
+severity[code]: message (at path); suggestion`) or `snippet` (rustc style: header, `-->` location,
+the quoted source line with carets, `= at:`/`= help:` notes). Two decisions worth knowing: every
+string from a finding is written with control characters escaped (`\n`, `\x1b`, ...), and the
+quoted source line shows them as `?`, because findings quote the input under validation and are
+printed to terminals -- an attacker-chosen key name must not carry an escape sequence through, and
+`short` must stay one line; carets are indented by copying the line's tabs and emitting one space per
+UTF-8 code point, so they align on any tab width (double-width glyphs are not measured). Positions
+are 1-based with `col` in bytes; `end_*` is exclusive, LSP-style; a span ending on a later line
+underlines to the end of the quoted one; a column past the line clamps to its end. `writeJson` is
+`std.json.Stringify` over the items with nulls omitted (field names as keys, severity as a string).
+`sortByPosition` is `std.mem.sort` (stable): file, line, col, each with unknowns last.
+
 ## Backlog / deferred
-Deferred from v1, per the module README: rendering to a human-readable string
-(rustc-style caret/source-snippet output); JSON serialization of diagnostics; sorting diagnostics by
-source position. The sibling `json5` module additionally intends to formalize its
+The sibling `json5` module additionally intends to formalize its
 `AnnotatedResult` against this module (a `json5`-side integration task, not a `diagnostics` gap).
 
 ## Status

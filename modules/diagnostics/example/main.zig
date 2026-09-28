@@ -23,8 +23,19 @@ fn must(ok: bool, src: std.builtin.SourceLocation) void {
     if (!ok) std.debug.panic("example check failed at {s}:{d}", .{ src.file, src.line });
 }
 
-/// One raw config field as a loader would see it, before validation.
-const RawField = struct { path: []const u8, key: []const u8, value: []const u8 };
+/// One raw config field as a loader would see it, before validation, with
+/// where its key sits in the file.
+const RawField = struct { path: []const u8, key: []const u8, value: []const u8, line: u32, col: u32 };
+
+/// The file the fields below were read from -- the renderer quotes it.
+const config_name = "export.json5";
+const config_text =
+    \\{
+    \\  data_dir: '',
+    \\  file_patern_in: '*.csv',
+    \\  maps: {},
+    \\}
+;
 
 const known_keys = [_][]const u8{ "data_dir", "file_pattern_in", "maps" };
 
@@ -40,15 +51,18 @@ pub fn main() !void {
     defer diag.deinit();
 
     const fields = [_]RawField{
-        .{ .path = "conversion_templates.export.data_dir", .key = "data_dir", .value = "" },
-        .{ .path = "conversion_templates.export.file_patern_in", .key = "file_patern_in", .value = "*.csv" }, // typo
-        .{ .path = "conversion_templates.export.maps", .key = "maps", .value = "" },
+        .{ .path = "conversion_templates.export.data_dir", .key = "data_dir", .value = "", .line = 2, .col = 3 },
+        .{ .path = "conversion_templates.export.file_patern_in", .key = "file_patern_in", .value = "*.csv", .line = 3, .col = 3 }, // typo
+        .{ .path = "conversion_templates.export.maps", .key = "maps", .value = "", .line = 4, .col = 3 },
     };
 
     for (fields) |f| {
         if (std.mem.eql(u8, f.key, "data_dir") and f.value.len == 0) {
             try diag.append(.{
                 .path = f.path,
+                .file = config_name,
+                .line = f.line,
+                .col = f.col,
                 .severity = .@"error",
                 .code = "config.empty_required",
                 .message = "data_dir must not be empty",
@@ -68,16 +82,24 @@ pub fn main() !void {
             };
             try diag.append(.{
                 .path = f.path,
+                .file = config_name,
+                .line = f.line,
+                .col = f.col,
+                .end_line = f.line,
+                .end_col = f.col + @as(u32, @intCast(f.key.len)),
                 .severity = .warning,
                 .code = "config.unknown_key",
                 .message = msg,
-                .suggest = closestKnownKey(f.key),
+                .suggest = if (closestKnownKey(f.key)) |k| try std.fmt.allocPrint(arena, "did you mean '{s}'?", .{k}) else null,
             });
             continue;
         }
         if (std.mem.eql(u8, f.key, "maps") and f.value.len == 0) {
             try diag.append(.{
                 .path = f.path,
+                .file = config_name,
+                .line = f.line,
+                .col = f.col,
                 .severity = .info,
                 .code = "config.empty_optional",
                 .message = "empty map; no remapping will occur",
@@ -91,11 +113,16 @@ pub fn main() !void {
         diag.countBySeverity(.warning),
         diag.countBySeverity(.info),
     });
-    for (diag.items.items) |d| {
-        std.debug.print("  [{s}] {s}: {s}", .{ @tagName(d.severity), d.path, d.message });
-        if (d.suggest) |s| std.debug.print(" (did you mean '{s}'?)", .{s});
-        std.debug.print("\n", .{});
-    }
+    // One line per finding (for a log or an editor's jump list), then the
+    // same findings quoting the file, rustc style.
+    var out_buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    diag.sortByPosition();
+    try diag.render(&out, .{});
+    try diag.render(&out, .{ .style = .snippet, .sources = &.{.{ .file = config_name, .text = config_text }} });
+    std.debug.print("{s}", .{out.buffered()});
+    must(std.mem.indexOf(u8, out.buffered(), "export.json5:3:3: warning[config.unknown_key]: unknown key 'file_patern_in'") != null, @src());
+    must(std.mem.indexOf(u8, out.buffered(), "3 |   file_patern_in: '*.csv',\n  |   ^^^^^^^^^^^^^^\n") != null, @src());
 
     // The pre-save guard: only `.@"error"` blocks a save.
     if (diag.countBySeverity(.@"error") > 0) {
