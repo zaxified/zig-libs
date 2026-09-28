@@ -14,6 +14,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
   output. The `DDict` value itself (not only its content) must now stay
   alive and unmoved while a frame that uses it decodes; a
   `Decompressor.copyFrom` taken inside such a frame reads the same `DDict`.
+- **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** tests only -- 9 more
+  `ZSTD_copyCCtx` goldens (`testdata/copy_goldens.zig` gains a `params`
+  column for zcopy's new mode `F`), decoder-copy and shared-pool tests, from
+  a mutation sweep of the Z25/Z29 additions; no code under `src/` beyond
+  tests and test data changed.
 - **2026-09-28** — The decoder in a caller's memory, with exact sizes
   (Z25): `Decompressor.initStatic` / `DecompressStream.initStatic`
   (`ZSTD_initStaticDCtx`/`DStream`, in a `zstd.Workspace`, never

@@ -2136,6 +2136,12 @@ past the end of 18-19 bytes of room (`ZSTD_compressSubBlock_literal`'s
 unchecked copy of the Huffman description, with `targetCBlockSize`) and
 this port refuses, as Z1d recorded. A context that ran out of room gives
 the next frame as a fresh one (unit test, with and without workers).
+Mutation sweep, 4 mutants: the bound refusal put back and the workers'
+`DstSizeTooSmall` dropped, both caught; 2 equivalent -- `abandon` dropped
+after the workers ran out of room (the next `initFrame` waits for and
+releases the jobs itself, as `destroy` does), and `dst` cut to
+`compressBound` when longer (with that much room no capacity check
+decides anything).
 
 59 mutations of the new code (`windowUpdate`, `count2Segments`, the `fast`
 and `dfast` extDict variants, overflow correction of two segments,
@@ -2561,8 +2567,30 @@ for an unknown size differ outside the binary tree's equivalence -- level
 equivalent under a 2 MB window). Equivalent, not run: clearing the mark
 after the hand-over (handing over again gives the same parameters).
 
+**Decoder memory, `max_block_size`, `copyFrom`** (Z25, 2026-09-28): the
+estimates, static workspaces and `max_block_size` are pinned as *Decoder*
+describes (`dctx_test.zig`, `testdata/mbs_kats.zig`). Mutation sweep
+(mutant schemata, 46 mutants of `decompress.zig`, `dstream.zig` and
+`ddict.zig`: the bounds check and where it runs, every size in the
+estimates, the workspace-too-small checks, `applyMaxBlockSize` and its two
+call sites, the stream's buffer layout, the `DDict` copy flag, every field
+`copyFrom` copies and the table pointers it rebinds): 45 caught, 13 of them
+only after three tests were added -- the stream's own bounds check (one
+input byte, before the one-shot decoder's shortcut can check it); a copy
+taken at every block boundary of 1 KB-block frames (text and csv, levels
+1, 5, 19) and decoded after the original has finished and decoded another
+frame, so every table, repeat offset and validity flag the copy does not
+hold itself shows (the original test's copy point, one 128 KB block into a
+level-5 frame, was followed by blocks with fresh tables and no repeat
+offset used); and a damaged frame (1 KB window, 2000 RLE literals) whose
+literals the frame's block bound refuses as corrupt before the room would
+refuse them, in the original and in a copy taken after the header. 1
+equivalent: the window raised to 1 KB in `estimateSizeFromFrame` -- a
+header declares less only for a single-segment frame, whose window is its
+content size, and the ring is capped at the content size either way.
+
 **Buffer-less compression and copies** (Z25, 2026-09-28):
-`testdata/copy_goldens.zig`, 28 call plans of `tools/zcopy.c` (recipe
+`testdata/copy_goldens.zig`, 37 call plans of `tools/zcopy.c` (recipe
 `tools/gen-copy-goldens.sh`), each a context begun one of the four ways,
 copied twice into one new context (each copy compressing the input in 1-3
 pieces), then compressing it itself -- 84 frames or errors, libzstd's, and
@@ -2582,6 +2610,25 @@ parsers, i.e. long-distance matching), and a grid of 324 (the four
 `begin`s, 9 levels from -3 to 22, 3 dictionaries, 3 copy sizes): 3 921
 frames and every error the same. A copy's independence from its original, the stages, the pledged
 size and a static workspace have tests of their own (`copy_test.zig`).
+Mutation sweep (37 mutants of `copyFrom`, the `begin`s, the stage checks and
+the pledged size): 33 caught, 10 of them only after 9 plans were added --
+a `CDict` begun for a size under 128 KB whose window then grows past 14
+and 16 (the switches resolved on the `CDict`'s parameters, which the copy
+must keep: row match finder, post-splitter); an input right behind its
+dictionary in one buffer (the window goes on from the dictionary, so the
+copy's `nextToUpdate` and window limits count); and zcopy's new mode `F`,
+a context left begun by a one-shot frame refused for room on its header
+(`ZSTD_compress2` into 17 bytes), the one way a copy's original carries
+parameters no `begin` sets -- a block size, an explicit row match finder or
+post-splitter, long-distance matching switched on with its own four
+parameters. 2 equivalent: the content-size flag set for an unknown copy
+size (the header records no size without one), and `ZSTD_cpm_unknown` for
+`noAttachDict` in `beginUsingDict` (the two modes size alike). 2 not
+reachable: long-distance matching explicitly off in the original where auto
+would switch it on (only through a failed one-shot of over 64 MB: a
+one-shot window shrinks to the input, and a `begin` resolves it as the copy
+would) and the overflow-correction count (a context just begun has made
+none).
 
 **Shared thread pool** (Z25, 2026-09-28) has no goldens of its own: the
 bytes do not depend on the pool, so `mt_test.zig` runs every
@@ -2592,6 +2639,31 @@ at once (2, 3 and 4 workers, each a third of the rows through its own
 the workers as tasks of a `std.Io.Threaded`; plus a context moving between
 its own pool and two shared ones frame by frame, the pools keeping their
 sizes, and the estimates leaving the workers' workspaces to the pool.
+Mutation sweep (19 deterministic mutants: the pool's sizing and
+`memorySize`, `create(0)`, the choice of pool per frame, resizing, the
+estimates with a shared pool, what `Compressor` and `Stream` pass on): 17
+caught, 5 of them after that test grew -- straight from one shared pool to
+another, the context's own pool kept from frame to frame and resized both
+ways (a shrink leaked its contexts), and a `Stream` on a shared pool with
+its estimate. 2 equivalent: `initFrame` resizing a pool of its own whose
+thread count differs from the worker count (never: it is made and resized
+with it), and `MtCtx.create` given no pool by `Stream` (the frame's
+`initFrame` moves it to the shared pool before any job). Not run, because
+no test can make them show deterministically: a worker claiming its job
+before reading it (the race `909bc87d` fixed), `tryAdd` letting one more
+job in than there are threads (it overwrites a slot only if no worker read
+it yet), the posting lock, the atomics' orderings and the futex wake
+counts.
+
+**Parameter queries** (Z25, 2026-09-28): mutation sweep, 12 mutants of
+`clampCParams` (each field left unclamped, compared unsigned),
+`adjustCParams` (no clamp, a size of 0 as known) and `dictAndWindowLog`'s
+wrapping sums: 11 caught by the 100 000 answers above and the clamping
+test, 1 equivalent -- the last line's truncating cast made saturating: it
+only sees sums under 2^31 (larger ones return the maximum), where the two
+agree, the wrapped 0 included. `chain_log_max`'s 32-bit value is not
+testable on the 64-bit test host (`check-portable` compiles 32-bit
+targets without running them).
 
 **Multithreaded optimizers** (Z9b, 2026-09-25): `dict_golden_test.zig`
 runs every optimizer row of the finished-dictionary goldens with 2, 3 and

@@ -163,6 +163,13 @@ test "max_block_size out of libzstd's bounds is refused" {
         var in: zstd.InBuffer = .{ .src = z };
         var o: zstd.OutBuffer = .{ .dst = &out };
         try std.testing.expectError(error.ParameterOutOfBound, s.decompressStream(&o, &in));
+        // the stream's own check, not the one-shot decoder's behind its
+        // single-pass shortcut: one byte, no header yet
+        var s1 = try zstd.DecompressStream.init(gpa, .{ .max_block_size = m });
+        defer s1.deinit();
+        var in1: zstd.InBuffer = .{ .src = z[0..1] };
+        var o1: zstd.OutBuffer = .{ .dst = &out };
+        try std.testing.expectError(error.ParameterOutOfBound, s1.decompressStream(&o1, &in1));
         try std.testing.expectError(error.ParameterOutOfBound, zstd.estimateDecompressStreamSize(1 << 20, .{ .max_block_size = m }));
         try std.testing.expectError(error.ParameterOutOfBound, zstd.estimateDecompressStreamSizeFromFrame(z, .{ .max_block_size = m }));
     }
@@ -479,5 +486,93 @@ test "copyFrom (ZSTD_copyDCtx) mid-frame with a DDict: the copy reads the same D
         }
         try std.testing.expectEqual(z.len, xi);
         try std.testing.expectEqualStrings(dict_kats.lit_repeat_content, out[0..xo]);
+    }
+}
+
+test "copyFrom (ZSTD_copyDCtx) at every block boundary: each copy goes on as its original would" {
+    // 1 KB blocks, so later blocks lean on earlier ones: repeat offsets
+    // carried over, Huffman and FSE tables repeated. The copies are decoded
+    // only after the original has finished its frame and then decoded
+    // another one (other content: every table rebuilt), so a copy sharing
+    // the original's tables rather than holding its own, or missing its
+    // repeat offsets or their validity, decodes wrongly or refuses.
+    const other_src = try corpusInput("mix-10086");
+    defer gpa.free(other_src);
+    const other = try zstd.compressAlloc(gpa, other_src[0..65536], .{ .level = 3 });
+    defer gpa.free(other);
+    const other_out = try gpa.alloc(u8, 65536);
+    defer gpa.free(other_out);
+    const Copy = struct { d: zstd.Decompressor, ip: usize, op: usize };
+    var copies: [48]Copy = undefined;
+    for ([_][]const u8{ "words-16385", "csv-131073" }) |name| {
+        const whole = try corpusInput(name);
+        defer gpa.free(whole);
+        const src = whole[0..@min(whole.len, 32768)];
+        const out = try gpa.alloc(u8, src.len);
+        defer gpa.free(out);
+        const out2 = try gpa.alloc(u8, src.len);
+        defer gpa.free(out2);
+        for ([_]i32{ 1, 5, 19 }) |level| {
+            const z = try zstd.compressAlloc(gpa, src, .{ .level = level, .checksum = true, .advanced = .{ .max_block_size = 1024 } });
+            defer gpa.free(z);
+            var n: usize = 0;
+            defer for (copies[0..n]) |*c| c.d.deinit();
+            var a = try zstd.Decompressor.init(gpa, .{});
+            defer a.deinit();
+            a.begin();
+            var ip: usize = 0;
+            var op: usize = 0;
+            while (a.nextSrcSizeToDecompress() != 0) {
+                if (a.stage == .decode_block_header and n < copies.len) {
+                    copies[n] = .{ .d = try zstd.Decompressor.init(gpa, .{}), .ip = ip, .op = op };
+                    n += 1;
+                    copies[n - 1].d.copyFrom(&a);
+                }
+                const k = a.nextSrcSizeToDecompress();
+                op += try a.decompressContinue(out[op..], z[ip..][0..k]);
+                ip += k;
+            }
+            try std.testing.expectEqualSlices(u8, src, out[0..op]);
+            try std.testing.expect(n >= 16);
+            try std.testing.expectEqual(other_out.len, try a.decompress(other_out, other));
+            for (copies[0..n]) |*c| {
+                var xi = c.ip;
+                var xo = c.op;
+                while (c.d.nextSrcSizeToDecompress() != 0) {
+                    const k = c.d.nextSrcSizeToDecompress();
+                    xo += try c.d.decompressContinue(out2[xo..], z[xi..][0..k]);
+                    xi += k;
+                }
+                try std.testing.expectEqual(z.len, xi);
+                try std.testing.expectEqualSlices(u8, src[c.op..], out2[c.op..xo]);
+            }
+        }
+    }
+}
+
+test "copyFrom (ZSTD_copyDCtx) keeps the frame's block bound" {
+    // A damaged frame: a 1 KB window, then a 4-byte compressed block of
+    // 2000 RLE literals. The literals are bounded by the frame's block size
+    // (`ZSTD_decodeLiteralsBlock`: litSize > blockSizeMax is
+    // corruption_detected), before the room (1500 bytes here: a decoder
+    // bounding them by 128 KB would say dstSize_tooSmall), so the original
+    // refuses them as corrupt -- and so must a copy taken after the header.
+    const z = [_]u8{ 0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x00, 0x25, 0x00, 0x00, 0x05, 0x7d, 'x', 0x00 };
+    var a = try zstd.Decompressor.init(gpa, .{});
+    defer a.deinit();
+    var b = try zstd.Decompressor.init(gpa, .{});
+    defer b.deinit();
+    var out: [4096]u8 = undefined;
+    a.begin();
+    var ip: usize = 0;
+    while (a.stage != .decode_block_header) {
+        const k = a.nextSrcSizeToDecompress();
+        _ = try a.decompressContinue(&out, z[ip..][0..k]);
+        ip += k;
+    }
+    b.copyFrom(&a);
+    for ([_]*zstd.Decompressor{ &a, &b }) |x| {
+        _ = try x.decompressContinue(&out, z[ip..][0..3]);
+        try std.testing.expectError(error.CorruptionDetected, x.decompressContinue(out[0..1500], z[ip + 3 ..]));
     }
 }
