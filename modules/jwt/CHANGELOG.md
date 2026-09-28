@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Verified-token cache** (opt-in): `VerifiedCache(Value)` remembers a token
+  that verified until its `exp`, keyed by a SipHash-2-4-128 MAC (random per-cache key from
+  `io.randomSecure`, so `init` takes an `Io`) over the exact token bytes and the claim policy,
+  bound to the key set it verified under, re-checking `exp`/`nbf`/`iat` on every hit and storing
+  only successes; `verifyJwks` puts it in front of `parseVerifyJwks`, `lookup`/`insert` are the
+  halves. New `JwkSet.id` (process-unique, stamped by `parseJwks`/`fetchJwks`; 0 on a hand-built
+  set, which is never cached) is what invalidates entries when a set is replaced. Additive:
+  `validateClaims` behaves as before (its time checks moved into a shared helper). Wanted by
+  qap, whose ES256/RS256 verification capped a JWT API at a few thousand requests/s per core.
+
 - **2026-09-28** — ⚠ **Plain-HTTP key sources are refused**: `discover`, `fetchJwks` and
   `Provider.refresh` return `error.InsecureKeySource` for an `http://` (or scheme-less) issuer or
   `jwks_uri`, including a `jwks_uri` named by an https discovery document. Opt out with the new

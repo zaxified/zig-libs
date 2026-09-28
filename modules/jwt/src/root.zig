@@ -37,6 +37,12 @@
 //! `verify`/`Provider` machinery P2-P5 already built — no duplicated crypto.
 //! DPoP (RFC 9449) is DEFERRED; see SPEC.md.
 //!
+//! Opt-in on top: `VerifiedCache` (`cache.zig`) remembers tokens that
+//! verified until their `exp` — keyed by a MAC of the exact bytes and the
+//! claim policy, bound to the `JwkSet.id` they verified under, time claims
+//! re-checked on every hit — so a Bearer repeat costs a hash, not a
+//! signature. It answers exactly what verifying again would (SPEC.md).
+//!
 //! ## SECURITY — `parse()` alone does NOT verify signatures
 //!
 //! `parse()` only *decodes* a token. A `ParsedToken` is **UNTRUSTED,
@@ -197,7 +203,7 @@ pub const meta = .{
     .targets = .{.linux64},
     .platform = .any, // pure logic over the Fetcher seam; HttpFetcher uses `http`
     .role = .both, // P6 = a `router` middleware guarding routes (server); P7 = an OAuth2/OIDC client building auth/token requests and accepting ID Tokens (relying party).
-    .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server)
+    .concurrency = .reentrant, // except Provider — one mutable cache, external sync (inject ResourceServer.lock under a threaded server); VerifiedCache is internally synchronized
     .model_after = "RFC 7515 (JWS) + RFC 7519 (JWT) + RFC 7518 (JWA) verify incl. RS256 (RSASSA-PKCS1-v1_5, RFC 8017) + RFC 7517 (JWK/JWKS key sets), RFC 8725 hardening + OpenID Connect Discovery 1.0 / RFC 8414 (issuer metadata -> jwks_uri/authorization_endpoint/token_endpoint) with cached, rotation-aware Provider; RFC 6750 Bearer resource-server middleware; RFC 7636 PKCE + OIDC Core 1.0 §3.1 authorization code flow + §3.1.3.7 ID Token validation; OAuth2/OIDC resource server AND relying party",
     .deps = .{ "http", "router", "p256" }, // p256 supplies the fast ES256 curve (byte-exact to std.crypto.sign.ecdsa.EcdsaP256Sha256)
 };
@@ -613,20 +619,9 @@ pub const Options = struct {
 /// the signature must also be verified (Part 2). Check order: exp, nbf,
 /// iat, iss, aud; the first failure is returned.
 pub fn validateClaims(claims: Claims, opts: Options) ValidateError!void {
-    const leeway: i64 = opts.leeway_s;
-    if (claims.exp) |exp| {
-        if (exp +| leeway < opts.now_s) return error.Expired;
-    } else if (opts.require_exp) {
-        return error.MissingExp;
-    }
-    if (claims.nbf) |nbf| {
-        if (nbf -| leeway > opts.now_s) return error.NotYetValid;
-    }
-    if (opts.reject_future_iat) {
-        if (claims.iat) |iat| {
-            if (iat -| leeway > opts.now_s) return error.IssuedInFuture;
-        }
-    }
+    // The time-based checks live in `cache.zig` so a `VerifiedCache` hit and
+    // this function run the SAME code: they cannot drift apart.
+    try cache_mod.checkTimes(.{ .exp = claims.exp, .nbf = claims.nbf, .iat = claims.iat }, opts);
     switch (opts.issuer) {
         .required => |want| {
             const iss = claims.iss orelse return error.IssuerMismatch;
@@ -889,6 +884,15 @@ pub const encode = encode_mod.encode;
 pub const encodeJson = encode_mod.encodeJson;
 const encode_mod = @import("encode.zig");
 
+/// A bounded, thread-safe cache of tokens that verified, keyed by a MAC of
+/// the exact token bytes, the claim policy and the key set's `id`, and good
+/// until the token's `exp` (`cache.zig`). Opt-in: nothing else in the module
+/// uses it. Wanted by qap, where ES256/RS256 verification capped a JWT API at
+/// a few thousand requests per second per core.
+pub const VerifiedCache = cache_mod.VerifiedCache;
+pub const VerifiedCacheConfig = cache_mod.Config;
+const cache_mod = @import("cache.zig");
+
 /// Errors from the one-call `parseAndVerify`.
 pub const ParseAndVerifyError = ParseError || VerifyError || ValidateError;
 
@@ -1087,6 +1091,14 @@ pub const JwkSet = struct {
     keys: []const Jwk,
     /// JWKs that could not be used, with reasons (see `JwkSkipReason`).
     skipped: []const SkippedJwk,
+    /// This set's identity, unique within the process and never reused:
+    /// `parseJwks`/`parseJwksSource` (and so `fetchJwks` and `Provider`)
+    /// stamp every set they build with the next value of a process-wide
+    /// counter. A `VerifiedCache` entry is bound to it, so replacing the set
+    /// (a JWKS refresh, a rotation, a consumer swapping its static set)
+    /// invalidates every token verified under the old one. 0 means "no
+    /// identity" -- a set assembled by hand -- and such a set is never cached.
+    id: u64 = 0,
 
     arena: *std.heap.ArenaAllocator,
 
@@ -1210,9 +1222,15 @@ pub fn parseJwksSource(gpa: std.mem.Allocator, json: []const u8, source: JwkSour
     return .{
         .keys = try keys.toOwnedSlice(arena),
         .skipped = try skipped.toOwnedSlice(arena),
+        .id = next_set_id.fetchAdd(1, .monotonic),
         .arena = arena_state,
     };
 }
+
+/// Source of `JwkSet.id`. A process-wide counter, not hidden state: it only
+/// names sets apart and changes no result. Starts at 1 (0 = no identity);
+/// 64 bits do not wrap at any plausible parse rate.
+var next_set_id: std.atomic.Value(u64) = .init(1);
 
 /// Verify `parsed`'s signature against a JWKS: resolve the key via
 /// `JwkSet.selectKey` (kid + `use`/`alg` constraints), then run the
@@ -4396,6 +4414,7 @@ test "verify: EdDSA generated round-trip through a full token" {
 test {
     _ = @import("rfc9964_vectors.zig");
     _ = @import("encode.zig");
+    _ = @import("cache.zig");
 }
 
 test "verify: ML-DSA-65 round-trip through a full token (RFC 9964)" {

@@ -39,7 +39,7 @@ const bearer_token =
 // resource server share out of band; a consumer would load it from config.
 const hmac_key_b64 = "AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow";
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
@@ -100,7 +100,7 @@ pub fn main() !void {
         else => return err,
     };
 
-    try postQuantum(gpa);
+    try postQuantum(gpa, init.io);
 }
 
 /// The RFC 9964 path, end to end over the published surface: mint an ML-DSA-65
@@ -110,7 +110,7 @@ pub fn main() !void {
 /// its key from a CSPRNG and never lets the private half near the JWKS —
 /// which `parseJwksSource(.network)` now enforces, refusing any published key
 /// that carries `d` or `priv`.
-fn postQuantum(gpa: std.mem.Allocator) !void {
+fn postQuantum(gpa: std.mem.Allocator, io: std.Io) !void {
     const kp = try jwt.MlDsa65.KeyPair.generateDeterministic([_]u8{0x5a} ** 32);
 
     // The issuer's side: sign `header.payload` with the raw FIPS-204
@@ -151,6 +151,8 @@ fn postQuantum(gpa: std.mem.Allocator) !void {
     defer pq.deinit();
     std.debug.print("accepted: ML-DSA-65 token by kid, iss={s}\n", .{pq.claims.iss.?});
 
+    try cached(gpa, io, pq_token, &jwks);
+
     // The same JWKS with the issuer's private seed left in it. Published, that
     // seed lets anyone mint tokens for this issuer, so the key is refused and
     // the reason says which — a misconfiguration that must not verify quietly.
@@ -166,4 +168,47 @@ fn postQuantum(gpa: std.mem.Allocator) !void {
         leaked.keys.len,
         @tagName(leaked.skipped[0].reason),
     });
+}
+
+/// What a resource server keeps per request once verification is the
+/// bottleneck: `VerifiedCache` in front of `parseVerifyJwks`. The first call
+/// verifies and derives; the repeat is a hit that never touches the
+/// signature; a replaced key set (every refresh is a new `JwkSet.id`) makes
+/// it verify again.
+const Caller = struct { iss_len: u8 = 0, iss_buf: [64]u8 = undefined };
+
+const DeriveCaller = struct {
+    calls: usize = 0,
+
+    pub fn derive(d: *DeriveCaller, t: *const jwt.ParsedToken) ?Caller {
+        d.calls += 1;
+        const iss = t.claims.iss orelse return null;
+        if (iss.len > 64) return null; // does not fit: refused, never cached
+        var c: Caller = .{ .iss_len = @intCast(iss.len) };
+        @memcpy(c.iss_buf[0..iss.len], iss);
+        return c;
+    }
+};
+
+fn cached(gpa: std.mem.Allocator, io: std.Io, token: []const u8, jwks: *const jwt.JwkSet) !void {
+    var cache: jwt.VerifiedCache(Caller) = try .init(gpa, io, .{ .capacity = 256, .context = "iss" });
+    defer cache.deinit();
+    const opts: jwt.Options = .{
+        .now_s = 1_700_000_000,
+        .issuer = .{ .required = "https://op.example" },
+        .audience = .{ .required = "api://svc" },
+    };
+    var d: DeriveCaller = .{};
+    _ = try cache.verifyJwks(gpa, token, jwks, opts, &d);
+    const again = try cache.verifyJwks(gpa, token, jwks, opts, &d);
+    std.debug.print("cached: iss={s}, verified {d} time(s) for 2 requests\n", .{ again.iss_buf[0..again.iss_len], d.calls });
+
+    // Past `exp` (2000000000) the hit refuses exactly as a fresh verify does.
+    var late = opts;
+    late.now_s = 2_000_000_100;
+    _ = cache.verifyJwks(gpa, token, jwks, late, &d) catch |err| switch (err) {
+        error.Expired => std.debug.print("rejected: Expired, from the cache\n", .{}),
+        else => return err,
+    };
+    if (d.calls != 1) return error.CacheMissedARepeat;
 }
