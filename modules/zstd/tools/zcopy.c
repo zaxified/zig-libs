@@ -13,11 +13,18 @@
  *         C  ZSTD_compressBegin_usingCDict_advanced, the CDict made by
  *            ZSTD_createCDict(dict, level), frame parameters of <flags>
  *         c  ZSTD_compressBegin_usingCDict (no frame parameters, unknown size)
+ *         F  a ZSTD_compress2 at <level> with the parameters <cparams> (a
+ *            zref-style "name=value,..." list) that fails for room on its
+ *            frame header (17 bytes), which leaves the context begun: the
+ *            one way to copy a context with any parameter set; no dictionary
  * <flags> bit 0 checksum, bit 1 no dictionary ID, bit 2 no content size
- *         (A and C only)
- * <cparams> (A only) "wlog,clog,hlog,slog,minmatch,tlen,strategy" in place
+ *         (A and C only); bit 3: the input follows the dictionary in one
+ *         buffer, so the window goes on from the dictionary loaded by
+ *         reference (L and A)
+ * <cparams> (A) "wlog,clog,hlog,slog,minmatch,tlen,strategy" in place
  *         of ZSTD_getCParams' -- e.g. a 2^27 window over small tables, which
- *         switches long-distance matching on without a gigabyte of tables
+ *         switches long-distance matching on without a gigabyte of tables;
+ *         (F) the parameter list
  *
  * One context ("src") is begun as <mode> says. A second one ("dst") is then
  * made its copy with <copy pledged> (ZSTD_copyCCtx; "-" is
@@ -70,6 +77,46 @@ static void spill(const char* prefix, const char* ext, const char* p, size_t n)
     fclose(f);
 }
 
+/* The advanced parameters mode F takes, by libzstd's names (as zref's). */
+static struct { char const* name; ZSTD_cParameter p; } const params[] = {
+    { "windowLog", ZSTD_c_windowLog },
+    { "hashLog", ZSTD_c_hashLog },
+    { "chainLog", ZSTD_c_chainLog },
+    { "searchLog", ZSTD_c_searchLog },
+    { "minMatch", ZSTD_c_minMatch },
+    { "targetLength", ZSTD_c_targetLength },
+    { "strategy", ZSTD_c_strategy },
+    { "useRowMatchFinder", ZSTD_c_useRowMatchFinder },
+    { "splitAfterSequences", ZSTD_c_splitAfterSequences },
+    { "maxBlockSize", ZSTD_c_maxBlockSize },
+    { "enableLongDistanceMatching", ZSTD_c_enableLongDistanceMatching },
+    { "ldmHashLog", ZSTD_c_ldmHashLog },
+    { "ldmMinMatch", ZSTD_c_ldmMinMatch },
+    { "ldmBucketSizeLog", ZSTD_c_ldmBucketSizeLog },
+    { "ldmHashRateLog", ZSTD_c_ldmHashRateLog },
+};
+
+/* Set each `name=value` of the comma-separated `list` on `cctx`; exits on
+ * an unknown name or a value libzstd refuses. */
+static void setParams(ZSTD_CCtx* cctx, char const* list)
+{
+    char* const copy = strdup(list);
+    char* tok;
+    for (tok = strtok(copy, ","); tok; tok = strtok(NULL, ",")) {
+        char const* const eq = strchr(tok, '=');
+        size_t i, found = 0;
+        for (i = 0; eq && i < sizeof(params) / sizeof(params[0]); i++) {
+            if (strlen(params[i].name) == (size_t)(eq - tok) && !strncmp(tok, params[i].name, (size_t)(eq - tok))) {
+                size_t const r = ZSTD_CCtx_setParameter(cctx, params[i].p, atoi(eq + 1));
+                if (ZSTD_isError(r)) { fprintf(stderr, "%s: %s\n", tok, ZSTD_getErrorName(r)); exit(2); }
+                found = 1;
+            }
+        }
+        if (!found) { fprintf(stderr, "unknown parameter %s\n", tok); exit(2); }
+    }
+    free(copy);
+}
+
 static void check(size_t r, const char* what)
 {
     if (ZSTD_isError(r)) {
@@ -100,7 +147,7 @@ static size_t run(ZSTD_CCtx* c, const char* name, char* dst, size_t cap, const c
 int main(int argc, char** argv)
 {
     size_t n, dict_len = 0, cap, out_len;
-    char *src, *dict = NULL, *dst;
+    char *src, *dict = NULL, *dst, *joined = NULL;
     char mode;
     int level;
     unsigned long long pledged, copy_pledged = ZSTD_CONTENTSIZE_UNKNOWN;
@@ -110,7 +157,7 @@ int main(int argc, char** argv)
     ZSTD_CDict* cdict = NULL;
     ZSTD_frameParameters fp;
     if (argc < 10) {
-        fprintf(stderr, "usage: zcopy <input> <dict|-> <L|A|C|c> <level> <pledged|-> <copy pledged|-|none> <chunks> <flags> <out prefix> [<capacity>|- [<cparams>]]\n");
+        fprintf(stderr, "usage: zcopy <input> <dict|-> <L|A|C|c|F> <level> <pledged|-> <copy pledged|-|none> <chunks> <flags> <out prefix> [<capacity>|- [<cparams>]]\n");
         return 2;
     }
     src = slurp(argv[1], &n);
@@ -128,6 +175,16 @@ int main(int argc, char** argv)
     fp.contentSizeFlag = !(flags & 4);
     fp.checksumFlag = flags & 1;
     fp.noDictIDFlag = (flags >> 1) & 1;
+    if (flags & 8) {
+        /* the input right behind the dictionary, in one buffer */
+        joined = malloc(dict_len + n + 1);
+        if (dict_len) memcpy(joined, dict, dict_len);
+        if (n) memcpy(joined + dict_len, src, n);
+        free(dict);
+        free(src);
+        dict = dict_len ? joined : NULL;
+        src = joined + dict_len;
+    }
 
     s = ZSTD_createCCtx();
     d = ZSTD_createCCtx();
@@ -163,6 +220,19 @@ int main(int argc, char** argv)
     case 'c':
         check(ZSTD_compressBegin_usingCDict(s, cdict), "begin");
         break;
+    case 'F': {
+        char tiny[17];
+        size_t r;
+        if (dict) { fprintf(stderr, "F takes no dictionary\n"); return 2; }
+        check(ZSTD_CCtx_setParameter(s, ZSTD_c_compressionLevel, level), "level");
+        if (argc > 11) setParams(s, argv[11]);
+        r = ZSTD_compress2(s, tiny, sizeof tiny, src, n);
+        if (!ZSTD_isError(r) || ZSTD_getErrorCode(r) != ZSTD_error_dstSize_tooSmall) {
+            fprintf(stderr, "F: ZSTD_compress2 into 17 bytes did not fail for room\n");
+            return 2;
+        }
+        break;
+    }
     default:
         fprintf(stderr, "bad mode\n");
         return 2;
@@ -192,7 +262,11 @@ int main(int argc, char** argv)
     ZSTD_freeCCtx(s);
     ZSTD_freeCCtx(d);
     free(dst);
-    free(dict);
-    free(src);
+    if (joined) {
+        free(joined);
+    } else {
+        free(dict);
+        free(src);
+    }
     return 0;
 }

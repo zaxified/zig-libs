@@ -299,7 +299,7 @@ test "mutation-sweep KAT: a dictID-0 frame decodes with an unrelated dictionary 
 test "mutation-sweep KAT: a frame whose literals reuse the dictionary's Huffman table" {
     // found by hunting: most frames here don't exercise set_repeat
     // literals against the dictionary's own table at all, so a mutation
-    // that stops applyEntropy from marking it reusable went uncaught
+    // that stops applyDDictEntropy from marking it reusable went uncaught
     // until this one (level 1, a 106-byte input -- see
     // tools/gen-dict-testdata.sh's history for how it was found).
     var dd = try zstd.DDict.init(gpa, kats.full_dict, .auto);

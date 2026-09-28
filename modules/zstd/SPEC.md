@@ -1335,6 +1335,17 @@ content size that follows (`rep == 0 or rep > content_size` is
 `error.DictionaryCorrupted`); `.raw_content` skips all of that, `.full`
 requires it (`error.DictionaryCorrupted` otherwise), `.auto` falls back to
 raw content when the magic number is absent or the buffer is under 8 bytes.
+A frame decoded with a `DDict` reads its tables in place: as
+`ZSTD_copyDDictParameters` points `LLTptr`/`OFTptr`/`MLTptr`/`HUFptr` at
+the `DDict`'s, the context's `ll_ptr`/`of_ptr`/`ml_ptr`/`huf_ptr` point
+into it and only the repeat offsets are copied (Z32; the 27 KB of tables
+were copied per frame before). A block that builds a table of its own
+points back at the context's, a `repeat` block keeps what is pointed at,
+and `Decompressor.copyFrom` taken inside such a frame points at the same
+`DDict`, as `ZSTD_copyDCtx`'s copy does. So the `DDict` value, which holds
+the tables, must stay alive and unmoved while a frame that uses it is
+decoded. The undigested `Options.dictionary` loads its tables into the
+context's own (`ZSTD_loadDEntropy(&dctx->entropy, ...)`).
 
 **A dictionary's content becomes history the same way this port's history
 already works: as an address range `checkContinuity` can compare against a
@@ -2125,6 +2136,12 @@ past the end of 18-19 bytes of room (`ZSTD_compressSubBlock_literal`'s
 unchecked copy of the Huffman description, with `targetCBlockSize`) and
 this port refuses, as Z1d recorded. A context that ran out of room gives
 the next frame as a fresh one (unit test, with and without workers).
+Mutation sweep, 4 mutants: the bound refusal put back and the workers'
+`DstSizeTooSmall` dropped, both caught; 2 equivalent -- `abandon` dropped
+after the workers ran out of room (the next `initFrame` waits for and
+releases the jobs itself, as `destroy` does), and `dst` cut to
+`compressBound` when longer (with that much room no capacity check
+decides anything).
 
 59 mutations of the new code (`windowUpdate`, `count2Segments`, the `fast`
 and `dfast` extDict variants, overflow correction of two segments,
@@ -2550,8 +2567,30 @@ for an unknown size differ outside the binary tree's equivalence -- level
 equivalent under a 2 MB window). Equivalent, not run: clearing the mark
 after the hand-over (handing over again gives the same parameters).
 
+**Decoder memory, `max_block_size`, `copyFrom`** (Z25, 2026-09-28): the
+estimates, static workspaces and `max_block_size` are pinned as *Decoder*
+describes (`dctx_test.zig`, `testdata/mbs_kats.zig`). Mutation sweep
+(mutant schemata, 46 mutants of `decompress.zig`, `dstream.zig` and
+`ddict.zig`: the bounds check and where it runs, every size in the
+estimates, the workspace-too-small checks, `applyMaxBlockSize` and its two
+call sites, the stream's buffer layout, the `DDict` copy flag, every field
+`copyFrom` copies and the table pointers it rebinds): 45 caught, 13 of them
+only after three tests were added -- the stream's own bounds check (one
+input byte, before the one-shot decoder's shortcut can check it); a copy
+taken at every block boundary of 1 KB-block frames (text and csv, levels
+1, 5, 19) and decoded after the original has finished and decoded another
+frame, so every table, repeat offset and validity flag the copy does not
+hold itself shows (the original test's copy point, one 128 KB block into a
+level-5 frame, was followed by blocks with fresh tables and no repeat
+offset used); and a damaged frame (1 KB window, 2000 RLE literals) whose
+literals the frame's block bound refuses as corrupt before the room would
+refuse them, in the original and in a copy taken after the header. 1
+equivalent: the window raised to 1 KB in `estimateSizeFromFrame` -- a
+header declares less only for a single-segment frame, whose window is its
+content size, and the ring is capped at the content size either way.
+
 **Buffer-less compression and copies** (Z25, 2026-09-28):
-`testdata/copy_goldens.zig`, 28 call plans of `tools/zcopy.c` (recipe
+`testdata/copy_goldens.zig`, 37 call plans of `tools/zcopy.c` (recipe
 `tools/gen-copy-goldens.sh`), each a context begun one of the four ways,
 copied twice into one new context (each copy compressing the input in 1-3
 pieces), then compressing it itself -- 84 frames or errors, libzstd's, and
@@ -2571,6 +2610,25 @@ parsers, i.e. long-distance matching), and a grid of 324 (the four
 `begin`s, 9 levels from -3 to 22, 3 dictionaries, 3 copy sizes): 3 921
 frames and every error the same. A copy's independence from its original, the stages, the pledged
 size and a static workspace have tests of their own (`copy_test.zig`).
+Mutation sweep (37 mutants of `copyFrom`, the `begin`s, the stage checks and
+the pledged size): 33 caught, 10 of them only after 9 plans were added --
+a `CDict` begun for a size under 128 KB whose window then grows past 14
+and 16 (the switches resolved on the `CDict`'s parameters, which the copy
+must keep: row match finder, post-splitter); an input right behind its
+dictionary in one buffer (the window goes on from the dictionary, so the
+copy's `nextToUpdate` and window limits count); and zcopy's new mode `F`,
+a context left begun by a one-shot frame refused for room on its header
+(`ZSTD_compress2` into 17 bytes), the one way a copy's original carries
+parameters no `begin` sets -- a block size, an explicit row match finder or
+post-splitter, long-distance matching switched on with its own four
+parameters. 2 equivalent: the content-size flag set for an unknown copy
+size (the header records no size without one), and `ZSTD_cpm_unknown` for
+`noAttachDict` in `beginUsingDict` (the two modes size alike). 2 not
+reachable: long-distance matching explicitly off in the original where auto
+would switch it on (only through a failed one-shot of over 64 MB: a
+one-shot window shrinks to the input, and a `begin` resolves it as the copy
+would) and the overflow-correction count (a context just begun has made
+none).
 
 **Shared thread pool** (Z25, 2026-09-28) has no goldens of its own: the
 bytes do not depend on the pool, so `mt_test.zig` runs every
@@ -2581,6 +2639,31 @@ at once (2, 3 and 4 workers, each a third of the rows through its own
 the workers as tasks of a `std.Io.Threaded`; plus a context moving between
 its own pool and two shared ones frame by frame, the pools keeping their
 sizes, and the estimates leaving the workers' workspaces to the pool.
+Mutation sweep (19 deterministic mutants: the pool's sizing and
+`memorySize`, `create(0)`, the choice of pool per frame, resizing, the
+estimates with a shared pool, what `Compressor` and `Stream` pass on): 17
+caught, 5 of them after that test grew -- straight from one shared pool to
+another, the context's own pool kept from frame to frame and resized both
+ways (a shrink leaked its contexts), and a `Stream` on a shared pool with
+its estimate. 2 equivalent: `initFrame` resizing a pool of its own whose
+thread count differs from the worker count (never: it is made and resized
+with it), and `MtCtx.create` given no pool by `Stream` (the frame's
+`initFrame` moves it to the shared pool before any job). Not run, because
+no test can make them show deterministically: a worker claiming its job
+before reading it (the race `909bc87d` fixed), `tryAdd` letting one more
+job in than there are threads (it overwrites a slot only if no worker read
+it yet), the posting lock, the atomics' orderings and the futex wake
+counts.
+
+**Parameter queries** (Z25, 2026-09-28): mutation sweep, 12 mutants of
+`clampCParams` (each field left unclamped, compared unsigned),
+`adjustCParams` (no clamp, a size of 0 as known) and `dictAndWindowLog`'s
+wrapping sums: 11 caught by the 100 000 answers above and the clamping
+test, 1 equivalent -- the last line's truncating cast made saturating: it
+only sees sums under 2^31 (larger ones return the maximum), where the two
+agree, the wrapped 0 included. `chain_log_max`'s 32-bit value is not
+testable on the 64-bit test host (`check-portable` compiles 32-bit
+targets without running them).
 
 **Multithreaded optimizers** (Z9b, 2026-09-25): `dict_golden_test.zig`
 runs every optimizer row of the finished-dictionary goldens with 2, 3 and
@@ -2881,13 +2964,22 @@ levels:
 | call | 100 B | 1 KB | 4 KB | 16 KB |
 |---|---|---|---|---|
 | `DDict` reused, raw content | 0.88–1.07 / 0.90–1.03 | 1.18–1.22 / 1.14–1.15 | 0.98–1.13 / 1.15–1.19 | 1.03–1.10 / 1.19–1.21 |
-| `DDict` reused, trained | 2.47–3.54 / 2.02–2.12 | 1.43–1.78 / 1.46–1.52 | 0.95–1.27 / 1.32–1.36 | 1.00–1.15 / 1.23–1.30 |
+| `DDict` reused, trained | 0.58–1.09 / 1.00–1.03 | 0.90–1.14 / 1.21–1.26 | 1.05–1.13 / 1.23–1.26 | 0.95–1.20 / 1.20–1.25 |
 | bytes each call, raw content | 0.81–1.20 / 0.91–1.04 | 1.13–1.69 / 1.15–1.16 | 1.07–1.56 / 1.15–1.19 | 1.00–1.35 / 1.19–1.21 |
-| bytes each call, trained | 1.11–1.57 / 1.20–1.21 | 1.20–1.65 / 1.21–1.22 | 1.13–1.28 / 1.21–1.23 | 1.02–1.19 / 1.21–1.24 |
+| bytes each call, trained | 0.79–1.21 / 1.13–1.14 | 1.02–1.58 / 1.14–1.16 | 0.72–1.05 / 1.16–1.19 | 1.08–1.22 / 1.17–1.20 |
 
 (`ZSTD_decompress_usingDDict` on a `ZSTD_createDDict`,
 `ZSTD_decompress_usingDict`; `Decompressor` with `.ddict` or
-`.dictionary`.)
+`.dictionary`.) The two trained rows are Z32's (2026-09-28, the same
+method, the base build measured alongside): the context now points at a
+`DDict`'s entropy tables instead of copying them per frame, and an
+undigested dictionary's tables are read straight into the context's.
+Against the build before, instructions (the cycles moved by up to ±30 %
+at equal instructions again) for the reused trained `DDict`: −51–54 % at
+100 B (cycles 0.24–0.33×; before 2.29–3.32 / 2.08–2.19 against libzstd),
+−15–20 % at 1 KB, −4–9 % at 4 KB, −1–3 % at 16 KB; bytes each call,
+trained: −3–6 %. Raw-content dictionaries and decoding without one: the
+same instructions (±0.03 %).
 
 Training, 1 KB samples of the training halves (1.7 MB and 2 MB), cycles
 port ÷ libzstd (CSV, JSON), wall seconds libzstd → port: `train`
@@ -2941,11 +3033,10 @@ equalled its single-threaded one on these inputs too.
   a jump table at every position, the window's base is reloaded from the
   `MatchState` after each table store (Z11's aliasing, fixed in the
   searches, not here), and the tagged/`dtlm` choices are run-time.
-- **The decoder copies a `DDict`'s entropy tables into the context for
-  every frame** (`Decompressor.applyEntropy`: 27 KB), where libzstd's
-  `ZSTD_copyDDictParameters` points the context at the `DDict`'s: 64 % of
-  the cycles (`memmove`) for 100 B frames with a trained dictionary, gone
-  in the noise from 4 KB. A raw-content `DDict` has no tables: 0.9–1.2×.
+- ~~**The decoder copies a `DDict`'s entropy tables into the context for
+  every frame**~~ (27 KB, 64 % of the cycles for 100 B frames with a
+  trained dictionary): closed by Z32, the context points at them as
+  libzstd's `ZSTD_copyDDictParameters` does (the table above).
 
 None of these changes a byte. Closing them is Z32.
 
@@ -3520,9 +3611,11 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   byte-wise per frame at `btopt` and up: `rescaleFreqs`' `@memset` of
   `lit_freq` (1 KB) and `initStatsUltra`'s of the three tables (`btultra2`,
   every frame's first block over 8 bytes; libzstd's `ZSTD_initStats_ultra`
-  moves the window instead of clearing); `fillHashTableFor` specialised on `min_match` and the table
-  kind, on a `match.Base`; the decoder pointing at a `DDict`'s entropy
-  tables instead of copying them each frame. Re-measure with Z19's method.
+  moves the window instead of clearing); `fillHashTableFor` specialised on
+  `min_match` and the table kind, on a `match.Base`; ~~the decoder pointing
+  at a `DDict`'s entropy tables instead of copying them each frame~~ (done
+  2026-09-28, *Speed*, "Dictionaries", and *Decoder*, "Dictionaries").
+  Re-measure with Z19's method.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and
@@ -3595,7 +3688,8 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `prefix_addr == prev_end_addr` whenever `content.len == 0` regardless of
   which address they hold.
 
-  Dropping `applyEntropy`'s `st.rep = e.rep` (the dictionary's repeat
+  Dropping `applyEntropy`'s `st.rep = e.rep` (since Z32 in
+  `applyDDictEntropy`; `applyRawDictionary` loads them) (the dictionary's repeat
   offsets never reach the decoder) survived every encoder-made frame: a
   dictionary with repeat offsets 50/60/70 in place of 1/4/8 decoded the
   same under both across 5 corpus inputs × 5 levels and 150 more (input,

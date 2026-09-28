@@ -185,6 +185,11 @@ pub const State = struct {
     ml: SeqTable = .{},
     huf: huf.DTable = .{},
     rep: [3]u32 = .{ 1, 4, 8 },
+    /// The tables the next block decodes through (libzstd's `LLTptr`,
+    /// `OFTptr`, `MLTptr`, `HUFptr`): the context's own above, the
+    /// predefined ones, or a `DDict`'s, pointed at in place for a frame
+    /// (`ZSTD_copyDDictParameters`). A block that builds a table points
+    /// back at the context's own; `repeat` keeps what is pointed at.
     ll_ptr: *const SeqTable = &ll_default,
     of_ptr: *const SeqTable = &of_default,
     ml_ptr: *const SeqTable = &ml_default,

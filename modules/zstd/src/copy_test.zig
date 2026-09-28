@@ -10,7 +10,12 @@
 //! libzstd's. The rows cover the four `begin`s, a dictionary loaded, copied
 //! from a `CDict`, attached, and reloaded, the strategies from `fast` to
 //! `btultra2` and long-distance matching, pledged sizes (known, unknown, 0,
-//! wrong), frame parameters, and too little output room. Where libzstd's
+//! wrong), frame parameters, and too little output room; an input right
+//! behind its dictionary in memory (the window goes on from it); and, mode
+//! `F`, a context left begun by a one-shot frame that failed for room on its
+//! header -- the one way a copy's original carries parameters no `begin`
+//! sets (a block size, explicit switches, long-distance matching's own
+//! parameters), which the copy keeps. Where libzstd's
 //! copy leaves something behind (the row match finder's tags, an attached
 //! `CDict`, the LDM table, the frame parameters), its frames differ from the
 //! original's, and so must this port's.
@@ -19,6 +24,7 @@ const std = @import("std");
 const zstd = @import("root.zig");
 const corpus = @import("testdata/corpus.zig");
 const goldens = @import("testdata/copy_goldens.zig");
+const param_test = @import("param_test.zig");
 
 const trained_files = .{
     .{ "zd-words", @embedFile("testdata/zd-words.zdict") },
@@ -66,7 +72,7 @@ fn expectFrame(want: goldens.Frame, got: zstd.BufferlessError![]const u8, what: 
     return error.TestUnexpectedResult;
 }
 
-fn begin(c: *zstd.Compressor, r: goldens.Row, dict: []const u8, cdict: ?*const zstd.CDict) !void {
+fn begin(c: *zstd.Compressor, r: goldens.Row, src: []const u8, dict: []const u8, cdict: ?*const zstd.CDict) !void {
     const fp: zstd.FrameParams = .{ .content_size = r.flags & 4 == 0, .checksum = r.flags & 1 != 0, .dict_id = r.flags & 2 == 0 };
     switch (r.mode) {
         'L' => try c.begin(.{ .level = .{ .level = r.level, .dict = dict } }),
@@ -77,6 +83,15 @@ fn begin(c: *zstd.Compressor, r: goldens.Row, dict: []const u8, cdict: ?*const z
         },
         'C' => try c.begin(.{ .cdict = .{ .cdict = cdict.?, .frame = fp, .pledged_size = r.pledged } }),
         'c' => try c.begin(.{ .cdict = .{ .cdict = cdict.? } }),
+        'F' => {
+            // zcopy: ZSTD_compress2 into 17 bytes, refused on the header
+            var adv: zstd.Advanced = .{};
+            var hint: ?u32 = null;
+            var it = std.mem.tokenizeScalar(u8, r.params.?, ',');
+            while (it.next()) |tok| try std.testing.expect(try param_test.applyParam(&adv, &hint, tok));
+            var tiny: [17]u8 = undefined;
+            try std.testing.expectError(error.DstSizeTooSmall, c.compress(&tiny, src, .{ .level = r.level, .advanced = adv }));
+        },
         else => unreachable,
     }
 }
@@ -91,18 +106,27 @@ test "buffer-less frames and their copies are libzstd's" {
         defer copy.deinit();
         var orig: zstd.Compressor = .init(gpa);
         defer orig.deinit();
-        const src = try input(gpa, r.case);
-        defer gpa.free(src);
+        const src_only = try input(gpa, r.case);
+        defer gpa.free(src_only);
         const dict_buf = try gpa.alloc(u8, if (r.dict) |name| corpus.dictLen(corpus.findDict(name), &trained) else 0);
         defer gpa.free(dict_buf);
-        const dict = if (r.dict) |name| dict_buf[0..corpus.buildDict(corpus.findDict(name), &trained, dict_buf)] else dict_buf;
+        const dict_only = if (r.dict) |name| dict_buf[0..corpus.buildDict(corpus.findDict(name), &trained, dict_buf)] else dict_buf;
+        // flag 8: the input right behind the dictionary, in one buffer
+        const joined = try gpa.alloc(u8, if (r.flags & 8 != 0) dict_only.len + src_only.len else 0);
+        defer gpa.free(joined);
+        if (r.flags & 8 != 0) {
+            @memcpy(joined[0..dict_only.len], dict_only);
+            @memcpy(joined[dict_only.len..], src_only);
+        }
+        const dict = if (r.flags & 8 != 0) joined[0..dict_only.len] else dict_only;
+        const src = if (r.flags & 8 != 0) joined[dict_only.len..] else src_only;
         var cdict: ?zstd.CDict = null;
         defer if (cdict) |*c| c.deinit();
         if (r.mode == 'C' or r.mode == 'c') cdict = try zstd.CDict.init(gpa, dict, r.level);
         const dst = try gpa.alloc(u8, r.capacity orelse zstd.compressBound(src.len) + 18);
         defer gpa.free(dst);
 
-        try begin(&orig, r, dict, if (cdict) |*c| c else null);
+        try begin(&orig, r, src, dict, if (cdict) |*c| c else null);
         for ([_]goldens.Frame{ r.copy1, r.copy2 }, [_][]const u8{ "copy1", "copy2" }) |want, what| {
             try copy.copyFrom(&orig, r.copy_pledged);
             try expectFrame(want, run(&copy, dst, src, r.chunks), what, i);
