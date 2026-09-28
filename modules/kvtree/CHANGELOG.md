@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **NO CONSUMER-VISIBLE CHANGE:** the meta-page CRC-32 comes from the new
+  `crc32` module instead of `std.hash.Crc32` — the same values, so the on-disk format is
+  unchanged. New dependency: `crc32`.
+
 - **2026-09-28** — **BEHAVIOURAL, not breaking: a node left empty by deletes leaves the tree**
   (found adopting `tsdb` in ttydesk). A commit that empties a leaf drops it from its parent with its
   separator, a branch left with no children goes too, and the root collapses while it is a branch

@@ -26,6 +26,7 @@
 //! variable-length cells packed from the end of the page toward the front.
 
 const std = @import("std");
+const crc32 = @import("crc32");
 const Allocator = std.mem.Allocator;
 
 pub const page_size: usize = 4096;
@@ -104,7 +105,7 @@ pub const Meta = struct {
         std.mem.writeInt(u32, page[24..28], self.free_root, .little);
         std.mem.writeInt(u64, page[28..36], self.free_count, .little);
         std.mem.writeInt(u64, page[36..44], self.high_water, .little);
-        const crc = std.hash.Crc32.hash(page[0..crc_off]);
+        const crc = crc32.hash(page[0..crc_off]);
         std.mem.writeInt(u32, page[crc_off .. crc_off + 4][0..4], crc, .little);
     }
 
@@ -117,7 +118,7 @@ pub const Meta = struct {
         if (std.mem.readInt(u32, page[4..8], .little) != format_version) return null;
         if (std.mem.readInt(u32, page[8..12], .little) != page_size) return null;
         const want = std.mem.readInt(u32, page[crc_off .. crc_off + 4][0..4], .little);
-        if (std.hash.Crc32.hash(page[0..crc_off]) != want) return null;
+        if (crc32.hash(page[0..crc_off]) != want) return null;
         return .{
             .txn_id = std.mem.readInt(u64, page[12..20], .little),
             .root = std.mem.readInt(u32, page[20..24], .little),

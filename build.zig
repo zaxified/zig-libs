@@ -130,7 +130,7 @@ const module_list = [_]Module{
     // wire a real `workerpool.WorkerPool` into that seam because the five
     // concurrency invariants can only be exercised by real threads.
     // `zig build check-testonly` proves the published module never needs it.
-    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient" }, .test_deps = &.{ "testkit", "workerpool" } },
+    .{ .name = "http", .libs = &.{ "web", "crypto", "format", "net" }, .deps = &.{ "netaddr", "datefmt", "tlsclient", "crc32" }, .test_deps = &.{ "testkit", "workerpool" } },
     .{ .name = "websocket", .libs = &.{"web"}, .deps = &.{"http"}, .test_deps = &.{"testkit"} },
     .{ .name = "accesslog", .libs = &.{"web"}, .deps = &.{"http"} },
     .{ .name = "staticfiles", .libs = &.{"web"}, .deps = &.{"http"} },
@@ -171,9 +171,10 @@ const module_list = [_]Module{
     .{ .name = "mcp", .libs = &.{"os"}, .test_deps = &.{"testkit"} },
     .{ .name = "mcp-http", .libs = &.{"os"}, .deps = &.{ "router", "http", "mcp" }, .test_deps = &.{"testkit"} },
     .{ .name = "coap", .libs = &.{"net"}, .test_deps = &.{"testkit"} },
+    .{ .name = "crc32", .libs = &.{ "format", "storage" } },
     .{ .name = "crc32c", .libs = &.{ "format", "storage" } },
     .{ .name = "kv", .libs = &.{"storage"} },
-    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{"kv"} },
+    .{ .name = "kvtree", .libs = &.{ "storage", "net" }, .deps = &.{ "kv", "crc32" } },
     .{ .name = "blobmsg", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "tar", .libs = &.{"format"}, .test_deps = &.{"testkit"} },
     .{ .name = "latency-stats", .libs = &.{"net"} },
