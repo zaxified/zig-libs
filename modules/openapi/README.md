@@ -77,13 +77,13 @@ defer gpa.free(json2);
 | Paths | router patterns → templates: `:id` → `{id}`, `*rest` → `{rest}`; methods grouped per path |
 | Determinism | paths in first-registration order; methods per path in `http.Method` declaration order; fixed key order; minified |
 | Path params | always `required: true`, `schema: {type: "string"}` (router captures raw path bytes); a `*wildcard` becomes a plain `{param}` (OpenAPI has no cross-segment template — FastAPI's `:path` compromise) |
-| `RouteDoc` | surfaces `summary`/`description`/`tags`/`requestBody`/`responses`/`deprecated`; `request_schema` is JSON-validated and re-emitted normalized under `requestBody.content."application/json".schema` (malformed → `error.InvalidRequestSchema`) |
+| `RouteDoc` | surfaces `summary`/`description`/`tags`/`requestBody`/`responses`/`deprecated`; `request_schema` is JSON-validated and re-emitted normalized under `requestBody.content."application/json".schema` (malformed → `error.InvalidRequestSchema`); `query_schema` (an object schema) becomes one `in: query` parameter per property (malformed → `error.InvalidQuerySchema`) |
 | `operationId` | deterministic: lowercase method + `_` + the converted path's segments joined by `_` (`GET /users/{id}` → `get_users_id`); unique by construction (see `error.PathCollision` below) |
 | Undocumented routes | minimal operation with default `responses: {"200": {"description": "Successful Response"}}` (FastAPI's default) |
 | Excluding a route | `Info.include: ?*const fn (router.Route) bool` — return `false` to omit a route from the document entirely (FastAPI's `include_in_schema=False`); `null` (default) includes everything |
 | Not emitted | the implicit HEAD→GET auto-route, 404/405 fallbacks |
 | Self-check | `Generator.build` parses its own output back and runs `validateOpenApi31` on it before returning — a malformed document is a `BuildError`, never served |
-| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, plus every `ConformanceError` variant (the self-check above) |
+| `BuildError` | `InvalidRequestSchema` (bad `request_schema`), `InvalidQuerySchema` (bad `query_schema`), `InvalidUtf8` (metadata/pattern isn't valid UTF-8 — JSON text must be), `PathCollision` (two different routes convert to the same `(path, method)`, e.g. `/f/:p` and `/f/*p` both → `/f/{p}`), `SelfCheckMalformed`, plus every `ConformanceError` variant (the self-check above) |
 
 **Endpoint** is an *intercepting* `router.Middleware` (the
 `metrics.Endpoint` pattern — `router.Handler` is a stateless fn pointer and

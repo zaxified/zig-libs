@@ -42,6 +42,11 @@
 //!   parsing and re-emitted normalized (minified) under
 //!   `requestBody.content."application/json".schema`, `required: true`;
 //!   malformed text fails `build` with `error.InvalidRequestSchema`.
+//! - `RouteDoc.query_schema` (an object schema as text, or `allOf` of
+//!   them) becomes one `in: query` parameter per property, after the path
+//!   parameters, with `required` from the `required` lists and the
+//!   property's schema as its `schema`; anything else fails with
+//!   `error.InvalidQuerySchema`.
 //! - `operationId` is omitted (optional in OpenAPI; no stable naming
 //!   source in a fn-pointer table).
 //! - Routes whose *converted* path collides (only possible with a literal
@@ -103,6 +108,9 @@ pub const BuildError = error{
     InvalidRequestSchema,
     /// A `RouteDoc.Response.schema` is not valid JSON.
     InvalidResponseSchema,
+    /// A `RouteDoc.query_schema` is not an object schema whose
+    /// `properties` are the parameters (see `writeQueryParameters`).
+    InvalidQuerySchema,
     /// Route/document metadata (`Info` field, `RouteDoc` field, or a route
     /// pattern) is not valid UTF-8 (audit finding openapi-F4). JSON text
     /// MUST be valid UTF-8 (RFC 8259 §8.1); `std.json.Stringify.write`
@@ -373,7 +381,7 @@ fn writeOperation(
         }
     }
     try writeOperationId(jw, arena, rt.method, converted_path);
-    try writePathParameters(jw, rt.pattern);
+    try writeParameters(jw, arena, rt);
     if (rt.doc) |d| {
         if (d.request_schema) |schema_text| {
             const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{}) catch |err| switch (err) {
@@ -504,9 +512,8 @@ fn writeOperationId(
 /// live caller can reach this anymore — the capped array of seen names
 /// below (path segments are bounded in practice; router patterns are
 /// short) stays as defense in depth, deduping without allocating.
-fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Error!void {
+fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8, any: *bool) Writer.Error!void {
     var it = std.mem.splitScalar(u8, pattern, '/');
-    var any = false;
     var seen_buf: [64][]const u8 = undefined;
     var seen_count: usize = 0;
     while (it.next()) |seg| {
@@ -520,11 +527,7 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Erro
             seen_buf[seen_count] = name;
             seen_count += 1;
         }
-        if (!any) {
-            try jw.objectField("parameters");
-            try jw.beginArray();
-            any = true;
-        }
+        try openParameters(jw, any);
         try jw.beginObject();
         try jw.objectField("name");
         try jw.write(name);
@@ -539,7 +542,105 @@ fn writePathParameters(jw: *std.json.Stringify, pattern: []const u8) Writer.Erro
         try jw.endObject();
         try jw.endObject();
     }
+}
+
+/// `parameters`: the pattern's path parameters, then one `in: query`
+/// parameter per property of `RouteDoc.query_schema`, in the schema's
+/// order, `required` from the schema's `required` list. Nothing when there
+/// are neither.
+fn writeParameters(jw: *std.json.Stringify, arena: Allocator, rt: router.Route) (BuildError || Writer.Error)!void {
+    var any = false;
+    try writePathParameters(jw, rt.pattern, &any);
+    if (rt.doc) |d| if (d.query_schema) |text| try writeQueryParameters(jw, arena, text, &any);
     if (any) try jw.endArray();
+}
+
+fn openParameters(jw: *std.json.Stringify, any: *bool) Writer.Error!void {
+    if (any.*) return;
+    try jw.objectField("parameters");
+    try jw.beginArray();
+    any.* = true;
+}
+
+/// A query schema is an object schema -- `properties` names the parameters
+/// (each one's schema re-emitted normalized), `required`, if present, an
+/// array of names -- or `allOf` of such schemas, which is what
+/// `validate.writeJsonSchemaFor(T)` writes when `T` declares
+/// `validate_rules` (the derived rules, then the declared ones). Parameters
+/// come in order of first appearance; one named by several parts gets
+/// `allOf` of its schemas, and is required when any part requires it. An
+/// object with no `properties` is no parameters. Anything else is
+/// `error.InvalidQuerySchema`, including a `required` name no part
+/// describes (a parameter the document would promise and not describe).
+/// Duplicate property names within one part cannot occur: the parse
+/// refuses them.
+fn writeQueryParameters(jw: *std.json.Stringify, arena: Allocator, text: []const u8, any: *bool) (BuildError || Writer.Error)!void {
+    const schema = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidQuerySchema,
+    };
+    if (schema != .object) return error.InvalidQuerySchema;
+    const parts: []const std.json.Value = if (schema.object.get("allOf")) |all| switch (all) {
+        .array => |a| a.items,
+        else => return error.InvalidQuerySchema,
+    } else (&schema)[0..1];
+
+    const Param = struct { name: []const u8, schemas: std.ArrayList(std.json.Value) = .empty, required: bool = false };
+    var params: std.ArrayList(Param) = .empty;
+    for (parts) |part| {
+        if (part != .object) return error.InvalidQuerySchema;
+        const props = if (part.object.get("properties")) |pv| switch (pv) {
+            .object => |o| o,
+            else => return error.InvalidQuerySchema,
+        } else null;
+        if (props) |o| {
+            var it = o.iterator();
+            while (it.next()) |e| {
+                const slot = try paramSlot(Param, arena, &params, e.key_ptr.*);
+                try slot.schemas.append(arena, e.value_ptr.*);
+            }
+        }
+    }
+    for (parts) |part| {
+        const required = part.object.get("required") orelse continue;
+        if (required != .array) return error.InvalidQuerySchema;
+        for (required.array.items) |r| {
+            if (r != .string) return error.InvalidQuerySchema;
+            const slot = for (params.items) |*q| {
+                if (std.mem.eql(u8, q.name, r.string)) break q;
+            } else return error.InvalidQuerySchema;
+            slot.required = true;
+        }
+    }
+    for (params.items) |q| {
+        try openParameters(jw, any);
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(q.name);
+        try jw.objectField("in");
+        try jw.write("query");
+        try jw.objectField("required");
+        try jw.write(q.required);
+        try jw.objectField("schema");
+        if (q.schemas.items.len == 1) {
+            try jw.write(q.schemas.items[0]);
+        } else {
+            try jw.beginObject();
+            try jw.objectField("allOf");
+            try jw.write(q.schemas.items);
+            try jw.endObject();
+        }
+        try jw.endObject();
+    }
+}
+
+/// The entry for parameter `name`, appended when it is new.
+fn paramSlot(comptime P: type, arena: Allocator, params: *std.ArrayList(P), name: []const u8) Allocator.Error!*P {
+    for (params.items) |*q| {
+        if (std.mem.eql(u8, q.name, name)) return q;
+    }
+    try params.append(arena, .{ .name = name });
+    return &params.items[params.items.len - 1];
 }
 
 // ── the /openapi.json endpoint ──────────────────────────────────────────────
@@ -1095,6 +1196,91 @@ test "generate: method grouping is deterministic (enum order, not registration o
         "\"get\":{\"operationId\":\"get_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}," ++
         "\"post\":{\"operationId\":\"post_thing\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}" ++
         "}}}", json);
+}
+
+/// What `validate.writeJsonSchemaFor(T)` writes for a query struct
+/// `{ q: []const u8, limit: u8 = 20 }` -- the text a consumer passes.
+const query_schema_text =
+    \\{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer","minimum":0,"maximum":255}},"required":["q"]}
+;
+
+// External anchor, frozen 2026-09-28: the document this test expects,
+// verbatim, is `OK` to `openapi-spec-validator --schema 3.1`; the same
+// document with a parameter repeated is refused ("Duplicate parameter `x`"),
+// and with `in: "querystring"` refused by the schema -- the validator does
+// read the parameters, so its OK is about them.
+test "generate: query_schema becomes in:query parameters after the path's, required from the schema" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    try r.addDoc(.get, "/orgs/:org/search", hOk, .{ .query_schema = query_schema_text });
+    try r.addDoc(.get, "/all", hOk, .{ .query_schema = "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"boolean\"}}}" });
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"}," ++
+        "\"paths\":{" ++
+        "\"/orgs/{org}/search\":{\"get\":{\"operationId\":\"get_orgs_org_search\",\"parameters\":[" ++
+        "{\"name\":\"org\",\"in\":\"path\",\"required\":true,\"schema\":{\"type\":\"string\"}}," ++
+        "{\"name\":\"q\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\"}}," ++
+        "{\"name\":\"limit\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":255}}" ++
+        "],\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
+        "\"/all\":{\"get\":{\"operationId\":\"get_all\",\"parameters\":[" ++
+        "{\"name\":\"x\",\"in\":\"query\",\"required\":false,\"schema\":{\"type\":\"boolean\"}}" ++
+        "],\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}" ++
+        "}}", json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+}
+
+// External anchor, frozen 2026-09-28: the document this test expects is `OK`
+// to `openapi-spec-validator --schema 3.1`.
+test "generate: an allOf query_schema (derived + declared rules) merges parameters by name" {
+    var r = router.Router.init(testing.allocator);
+    defer r.deinit();
+    // What `validate.writeJsonSchemaFor` writes for a `T` with
+    // `validate_rules`: the declared part may add a bound, a requirement, or
+    // a parameter `T` does not decode.
+    try r.addDoc(.get, "/s", hOk, .{ .query_schema =
+        \\{"allOf":[{"type":"object","properties":{"q":{"type":"string"},"limit":{"type":"integer","minimum":0,"maximum":255}},"required":["q"]},{"properties":{"limit":{"type":"integer","maximum":100},"token":{"type":"string"}},"required":["token"]}]}
+    });
+    // A struct with no fields: an object with no properties, no parameters.
+    try r.addDoc(.get, "/none", hOk, .{ .query_schema = "{\"type\":\"object\"}" });
+    const json = try Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" });
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("{\"openapi\":\"3.1.0\",\"info\":{\"title\":\"T\",\"version\":\"1\"}," ++
+        "\"paths\":{" ++
+        "\"/s\":{\"get\":{\"operationId\":\"get_s\",\"parameters\":[" ++
+        "{\"name\":\"q\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\"}}," ++
+        "{\"name\":\"limit\",\"in\":\"query\",\"required\":false,\"schema\":{\"allOf\":[" ++
+        "{\"type\":\"integer\",\"minimum\":0,\"maximum\":255},{\"type\":\"integer\",\"maximum\":100}]}}," ++
+        "{\"name\":\"token\",\"in\":\"query\",\"required\":true,\"schema\":{\"type\":\"string\"}}" ++
+        "],\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}," ++
+        "\"/none\":{\"get\":{\"operationId\":\"get_none\",\"responses\":{\"200\":{\"description\":\"Successful Response\"}}}}" ++
+        "}}", json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try validateOpenApi31(parsed.value);
+}
+
+test "generate: a query_schema that does not name parameters is error.InvalidQuerySchema" {
+    const bad = [_][]const u8{
+        "{nope",
+        "[]",
+        "{\"allOf\":{}}",
+        "{\"allOf\":[1]}",
+        "{\"allOf\":[{\"properties\":{\"a\":{}}},{\"required\":[\"b\"]}]}",
+        "{\"properties\":[]}",
+        "{\"properties\":{},\"required\":\"q\"}",
+        "{\"properties\":{\"a\":{}},\"required\":[\"b\"]}",
+        "{\"properties\":{\"a\":{}},\"required\":[1]}",
+        "{\"properties\":{\"a\":{},\"a\":{}}}",
+    };
+    for (bad) |text| {
+        var r = router.Router.init(testing.allocator);
+        defer r.deinit();
+        try r.addDoc(.get, "/x", hOk, .{ .query_schema = text });
+        try testing.expectError(error.InvalidQuerySchema, Generator.build(testing.allocator, &r, .{ .title = "T", .version = "1" }));
+    }
 }
 
 test "generate: colliding (method, path) from two different patterns is a build error, not a silent drop (F5)" {
@@ -1762,7 +1948,9 @@ test "generate: writePathParameters dedupes a repeated capture name (F6) — def
     var aw: Writer = .fixed(&buf);
     var jw: std.json.Stringify = .{ .writer = &aw, .options = .{} };
     try jw.beginObject();
-    try writePathParameters(&jw, "/a/:id/b/:id");
+    var any = false;
+    try writePathParameters(&jw, "/a/:id/b/:id", &any);
+    try jw.endArray();
     try jw.endObject();
 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.buffered(), .{});

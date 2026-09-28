@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `RouteDoc` gains `query_schema: ?[]const u8 = null` (JSON Schema text of the
+  query string as an object; `openapi` turns its properties into `in: query` parameters).
+  **Fix:** `Router.addDoc` copied a `RouteDoc` field by field and dropped `Response.schema` and
+  `Response.media_type` (added 2026-09-22), so a response schema registered through a `Router` never
+  reached `openapi`; `router.Static` and `Generator.buildRoutes` callers were not affected.
+
 - **2026-09-22** — `RouteDoc.Response` gains `schema: ?[]const u8 = null` (JSON Schema text of
   the response body) and `media_type = "application/json"`, for `openapi` to describe response
   bodies. Defaults keep every existing `RouteDoc` literal meaning what it meant.

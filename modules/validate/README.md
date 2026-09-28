@@ -97,6 +97,13 @@ if (!report.ok()) ...;                      // report.errors = []{path,code,mess
 //       validateQuery (raw query string), validateParams (path params: any
 //       value with get(name) ?[]const u8 -- router.Params or your own).
 
+// Typed query string: decoded into a struct, rules from its fields.
+const Search = struct { q: []const u8, limit: u8 = 20, sort: enum { asc, desc } = .asc };
+switch (try validate.parseQueryLeaky(Search, arena, req.query, .{})) {
+    .ok => |s| ...,                          // s.q, s.limit, s.sort
+    .invalid => |report| ...,                // missing / int_parsing / enum / bounds
+}
+
 // As an RFC 9457 problem (Content-Type: http.problem.content_type):
 try report.writeProblem(w, .{ .status = 422 });
 // {"type":"about:blank","status":422,"title":"Unprocessable Content","errors":[…]}

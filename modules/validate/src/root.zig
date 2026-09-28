@@ -1136,14 +1136,17 @@ fn isLeapYear(y: u32) bool {
 pub fn validateQuery(gpa: Allocator, query: []const u8, schema: []const Rule) Allocator.Error!Report {
     var b = Builder.init(gpa);
     errdefer b.abort();
-    for (schema) |*rule| {
-        if (try findQueryParam(b.a(), query, rule.field)) |raw| {
-            try checkCoerced(&b, rule.field, raw, rule);
-        } else if (rule.required) {
-            try b.append(rule.field, "missing", "Field required");
-        }
-    }
+    for (schema) |*rule| try checkQueryValue(&b, rule, try findQueryParam(b.a(), query, rule.field));
     return b.finish();
+}
+
+/// One query value (decoded, or null when absent) against its rule.
+fn checkQueryValue(b: *Builder, rule: *const Rule, value: ?[]const u8) Allocator.Error!void {
+    if (value) |s| {
+        try checkCoerced(b, rule.field, s, rule);
+    } else if (rule.required) {
+        try b.append(rule.field, "missing", "Field required");
+    }
 }
 
 /// Validate the path params of a matched route. Values are the raw path
@@ -1248,10 +1251,34 @@ const QueryIter = struct {
 fn findQueryParam(a: Allocator, query: []const u8, name: []const u8) Allocator.Error!?[]const u8 {
     var it = QueryIter.init(query);
     while (it.next()) |p| {
-        if (std.mem.eql(u8, try decodeComponent(a, p.name), name))
-            return try decodeComponent(a, p.value);
+        if (componentEql(p.name, name)) return try decodeComponent(a, p.value);
     }
     return null;
+}
+
+/// True iff the raw query component `raw` decodes (as `decodeComponent`
+/// does) to exactly `name` -- compared as it decodes, so a query with many
+/// keys costs no allocation per key.
+fn componentEql(raw: []const u8, name: []const u8) bool {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < raw.len) : (n += 1) {
+        if (n == name.len) return false;
+        var c = raw[i];
+        i += 1;
+        if (c == '+') {
+            c = ' ';
+        } else if (c == '%' and i + 1 < raw.len) {
+            const hi = std.fmt.charToDigit(raw[i], 16) catch 255;
+            const lo = std.fmt.charToDigit(raw[i + 1], 16) catch 255;
+            if (hi != 255 and lo != 255) {
+                c = @intCast(hi * 16 + lo);
+                i += 2;
+            }
+        }
+        if (c != name[n]) return false;
+    }
+    return n == name.len;
 }
 
 /// Percent-decode a query component: '+' → space, %XX → byte; an invalid or
@@ -1451,6 +1478,119 @@ pub fn parseIntoLimited(comptime T: type, gpa: Allocator, body: []const u8, limi
         },
     };
     return .{ .ok = typed };
+}
+
+/// The typed query style: decode an `http.Server.Request.query` string
+/// ("a=1&b=x", no leading '?') into struct `T`, validated against the rules
+/// `parseInto` derives (`rulesFor(T)` plus `T.validate_rules`), with the
+/// decoding and coercion of `validateQuery`: names and values
+/// percent-decoded ('+' = space, a malformed escape passes through
+/// literally), the first of duplicate keys wins, unknown keys are ignored,
+/// an unparseable value is `int_parsing`/`float_parsing`/`bool_parsing`.
+///
+/// `T`'s fields are what a query string can spell: `bool`, integers, floats,
+/// enums (by field name), `[]const u8`, `[N]u8` (exactly N bytes), and `?U`
+/// of those; anything else is a compile error. A field is optional when it
+/// has a default -- `?U` alone is still required, as it is for `parseInto`,
+/// and a query has no way to spell null: `limit: ?u32 = null` is the
+/// optional-without-a-value spelling.
+///
+/// Like `parseIntoLeaky`, `arena` is arena-like (nothing is freed
+/// piecemeal) and a decoded string points into `query` when it needed no
+/// decoding, into `arena` otherwise -- both must outlive the value. The
+/// query is walked once; what is allocated is the decoded values of `T`'s
+/// fields (at most the query's length) and, when invalid, the report. Of
+/// `limits`, only `max_errors` applies.
+pub fn parseQueryLeaky(comptime T: type, arena: Allocator, query: []const u8, limits: Limits) Allocator.Error!LeakyResult(T) {
+    comptime assertQueryStruct(T);
+    const fields = @typeInfo(T).@"struct".fields;
+    const schema = comptime rulesFor(T);
+    const extra: []const Rule = if (@hasDecl(T, "validate_rules")) T.validate_rules else &.{};
+
+    // One walk: the first raw value of every field.
+    var raw: [fields.len]?[]const u8 = @splat(null);
+    var it = QueryIter.init(query);
+    while (it.next()) |p| {
+        inline for (fields, 0..) |f, i| {
+            if (raw[i] == null and componentEql(p.name, f.name)) raw[i] = p.value;
+        }
+    }
+    var values: [fields.len]?[]const u8 = undefined;
+    for (raw, &values) |r, *v| v.* = if (r) |s| try decodeComponent(arena, s) else null;
+
+    // Scoped so the builder's `errdefer` ends with it (see `parseIntoLimited`).
+    {
+        var b = Builder.initCapped(arena, limits.max_errors);
+        errdefer b.abort();
+        for (schema, values) |*rule, v| try checkQueryValue(&b, rule, v);
+        const first_pass_len = b.list.items.len;
+        for (extra) |*rule| {
+            const v = for (std.meta.fieldNames(T), values) |name, fv| {
+                if (std.mem.eql(u8, name, rule.field)) break fv;
+            } else try findQueryParam(arena, query, rule.field);
+            try checkQueryValue(&b, rule, v);
+        }
+        b.dedupeFrom(first_pass_len);
+        if (b.list.items.len != 0) return .{ .invalid = b.finish() };
+        b.abort();
+    }
+
+    var out: T = undefined;
+    inline for (fields, 0..) |f, i| {
+        if (values[i]) |s| {
+            @field(out, f.name) = queryScalar(f.type, s) orelse return .{ .invalid = try undecodable(arena, f.name) };
+        } else if (f.defaultValue()) |d| {
+            @field(out, f.name) = d;
+        } else {
+            // Unreachable while the derived rule is `required` (it said
+            // "missing" above); defensive, never `undefined` in a field.
+            return .{ .invalid = try undecodable(arena, f.name) };
+        }
+    }
+    return .{ .ok = out };
+}
+
+/// Compile error unless every field of `T` is a type `parseQueryLeaky` can
+/// decode from one query value.
+fn assertQueryStruct(comptime T: type) void {
+    if (@typeInfo(T) != .@"struct")
+        @compileError("validate.parseQueryLeaky: " ++ @typeName(T) ++ " is not a struct");
+    for (@typeInfo(T).@"struct".fields) |f| {
+        const U = switch (@typeInfo(f.type)) {
+            .optional => |o| o.child,
+            else => f.type,
+        };
+        const ok = switch (@typeInfo(U)) {
+            .bool, .int, .float, .@"enum" => true,
+            .array => |a| a.child == u8,
+            else => U == []const u8,
+        };
+        if (!ok) @compileError("validate.parseQueryLeaky: field `" ++ f.name ++ "` of " ++ @typeName(T) ++
+            " is " ++ @typeName(f.type) ++ ", which one query value cannot spell -- " ++
+            "bool, integers, floats, enums, []const u8, [N]u8, and ?U of those");
+    }
+}
+
+/// One decoded query value as `U` (already validated by its derived rule);
+/// null only when the rule could not see the failure.
+fn queryScalar(comptime U: type, s: []const u8) ?U {
+    return switch (@typeInfo(U)) {
+        .optional => |o| if (queryScalar(o.child, s)) |v| v else null,
+        .bool => parseBool(s),
+        .int => std.fmt.parseInt(U, s, 10) catch null,
+        .float => std.fmt.parseFloat(U, s) catch null,
+        .@"enum" => std.meta.stringToEnum(U, s),
+        .array => |a| if (s.len == a.len) s[0..a.len].* else null,
+        else => s,
+    };
+}
+
+/// The defensive answer when a validated value still does not decode.
+fn undecodable(arena: Allocator, path: []const u8) Allocator.Error!Report {
+    var b = Builder.init(arena);
+    errdefer b.abort();
+    try b.append(path, "invalid", "Input could not be decoded");
+    return b.finish();
 }
 
 // ── the streaming path: no value tree ───────────────────────────────────────
@@ -3621,6 +3761,131 @@ test "query: percent-decoding, '+' → space, first duplicate wins, valueless ke
     var l = try validateQuery(testing.allocator, "v=%zz%4", &lenient);
     defer l.deinit();
     try testing.expect(l.ok());
+}
+
+const TypedQuery = struct {
+    q: []const u8,
+    limit: u8 = 20,
+    offset: ?u32 = null,
+    ratio: f32 = 1.0,
+    exact: bool = false,
+    sort: enum { asc, desc } = .asc,
+    code: [2]u8 = "cz".*,
+
+    pub const validate_rules: []const Rule = &.{
+        .{ .field = "q", .kind = .string, .min_len = 2 },
+        .{ .field = "limit", .kind = .int, .min = 1, .max = 100 },
+    };
+};
+
+test "parseQueryLeaky: every field kind decodes; defaults fill the rest" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const query = "q=zig&limit=50&offset=7&ratio=0.5&exact=true&sort=desc&code=de";
+    const r = try parseQueryLeaky(TypedQuery, arena.allocator(), query, .{});
+    const v = r.ok;
+    try testing.expectEqualStrings("zig", v.q);
+    // Needed no decoding: borrowed from the query, not copied.
+    try testing.expect(v.q.ptr == query[2..].ptr);
+    try testing.expectEqual(@as(u8, 50), v.limit);
+    try testing.expectEqual(@as(?u32, 7), v.offset);
+    try testing.expectEqual(@as(f32, 0.5), v.ratio);
+    try testing.expect(v.exact);
+    try testing.expectEqual(.desc, v.sort);
+    try testing.expectEqualStrings("de", &v.code);
+
+    const d = (try parseQueryLeaky(TypedQuery, arena.allocator(), "q=zig", .{})).ok;
+    try testing.expectEqual(@as(u8, 20), d.limit);
+    try testing.expectEqual(@as(?u32, null), d.offset);
+    try testing.expectEqual(@as(f32, 1.0), d.ratio);
+    try testing.expect(!d.exact);
+    try testing.expectEqual(.asc, d.sort);
+    try testing.expectEqualStrings("cz", &d.code);
+}
+
+test "parseQueryLeaky: decoding, first duplicate wins, encoded key, unknown keys ignored" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const v = (try parseQueryLeaky(TypedQuery, arena.allocator(), "x=1&%71=John+Doe%21&limit=3&limit=9&&flag", .{})).ok;
+    try testing.expectEqualStrings("John Doe!", v.q);
+    try testing.expectEqual(@as(u8, 3), v.limit);
+}
+
+test "parseQueryLeaky: every broken field is reported, derived and declared rules deduped" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const r = (try parseQueryLeaky(TypedQuery, arena.allocator(), "limit=300&offset=-1&ratio=x&exact=maybe&sort=up&code=abc", .{})).invalid;
+    try testing.expectEqual(@as(usize, 7), r.errors.len);
+    try expectError(&r, "q", "missing");
+    // 300 breaks the derived bound (255) and the declared one (100) alike:
+    // one error, not two.
+    try expectError(&r, "limit", "less_than_equal");
+    try expectError(&r, "offset", "greater_than_equal");
+    try expectError(&r, "ratio", "float_parsing");
+    try expectError(&r, "exact", "bool_parsing");
+    try expectError(&r, "sort", "enum");
+    try expectError(&r, "code", "string_bytes_too_long");
+
+    // `validate_rules` runs too; a field failing both passes the same way
+    // is one error.
+    const short = (try parseQueryLeaky(TypedQuery, arena.allocator(), "q=z&limit=0", .{})).invalid;
+    try testing.expectEqual(@as(usize, 2), short.errors.len);
+    try expectError(&short, "q", "string_too_short");
+    try expectError(&short, "limit", "greater_than_equal");
+
+    // `?U` without a default is required, as it is for `parseInto`.
+    const Opt = struct { page: ?u32 };
+    const missing = (try parseQueryLeaky(Opt, arena.allocator(), "", .{})).invalid;
+    try expectError(&missing, "page", "missing");
+
+    const capped = (try parseQueryLeaky(TypedQuery, arena.allocator(), "ratio=x&exact=maybe", .{ .max_errors = 1 })).invalid;
+    try testing.expectEqual(@as(usize, 1), capped.errors.len);
+}
+
+test "parseQueryLeaky: a declared rule for a parameter T does not decode still checks it" {
+    const Paged = struct {
+        page: u32 = 1,
+        pub const validate_rules: []const Rule = &.{
+            .{ .field = "token", .kind = .string, .required = true, .min_len = 8 },
+        };
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const missing = (try parseQueryLeaky(Paged, arena.allocator(), "page=2", .{})).invalid;
+    try expectError(&missing, "token", "missing");
+    const short = (try parseQueryLeaky(Paged, arena.allocator(), "t%6Fken=abc", .{})).invalid;
+    try expectError(&short, "token", "string_too_short");
+    const v = (try parseQueryLeaky(Paged, arena.allocator(), "token=abcdefgh&page=2", .{})).ok;
+    try testing.expectEqual(@as(u32, 2), v.page);
+}
+
+test "parseQueryLeaky: runs in a fixed buffer, and says so when it does not fit" {
+    var buf: [256]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const v = (try parseQueryLeaky(TypedQuery, fba.allocator(), "q=a%20b", .{})).ok;
+    try testing.expectEqualStrings("a b", v.q);
+
+    var tiny: [4]u8 = undefined;
+    var small: std.heap.FixedBufferAllocator = .init(&tiny);
+    try testing.expectError(error.OutOfMemory, parseQueryLeaky(TypedQuery, small.allocator(), "q=%61%62%63%64%65", .{}));
+}
+
+test "componentEql agrees with decodeComponent" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const raws = [_][]const u8{ "", "a", "a+b", "%41", "%4", "%", "%zz", "a%2", "%2B+", "user%5Fid", "%%41", "x%41%" };
+    for (raws) |raw| {
+        const decoded = try decodeComponent(arena.allocator(), raw);
+        try testing.expect(componentEql(raw, decoded));
+        const longer = try std.mem.concat(arena.allocator(), u8, &.{ decoded, "z" });
+        try testing.expect(!componentEql(raw, longer));
+        if (decoded.len != 0) {
+            try testing.expect(!componentEql(raw, decoded[0 .. decoded.len - 1]));
+            const other = try arena.allocator().dupe(u8, decoded);
+            other[other.len - 1] +%= 1;
+            try testing.expect(!componentEql(raw, other));
+        }
+    }
 }
 
 test "params: validateParams over router.Params (raw segments, coerce+check)" {

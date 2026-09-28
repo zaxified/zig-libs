@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **New: `parseQueryLeaky(T, arena, query, limits)`** — the typed query style: a
+  query string decoded into struct `T`, validated against `rulesFor(T)` plus `T.validate_rules`
+  (a declared rule may name a parameter `T` does not decode; it is checked all the same), with
+  `validateQuery`'s decoding and coercion. Fields: bool, integers, floats, enums, `[]const u8`,
+  `[N]u8`, `?U` of those -- anything else is a compile error; a field with a default is optional.
+  One walk over the query; keys are compared as they decode, so `validateQuery` no longer
+  allocates a decoded copy of every key either. (qap M11.7.)
+
 - **2026-09-26** — **`parseIntoLeaky` validates and decodes in one tokenization.** The streaming
   walker is push-shaped now (an explicit frame stack fed whole tokens), and `std.json`'s typed
   decoder pulls the tokens through a tap that feeds each to it, with the structural limits

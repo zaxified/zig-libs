@@ -19,7 +19,10 @@ cross-segment template, matching FastAPI's own `:path` compromise); undocumented
 minimal 200-only operation; implicit HEAD→GET auto-route and 404/405 fallbacks are not emitted (they
 are dispatch behavior, not operations). `RouteDoc.request_schema` (JSON Schema as text) is parsed
 and re-emitted normalized/minified; malformed text is a typed `error.InvalidRequestSchema`, never a
-panic or silent drop.
+panic or silent drop. `RouteDoc.query_schema` (an object schema as text, or `allOf` of them, 2026-09-28) becomes one
+`in: query` parameter per property after the path parameters, required when any part requires it,
+`allOf` of its schemas when several parts describe it; a schema that does not name parameters that
+way is `error.InvalidQuerySchema`.
 
 **`operationId` (audit finding openapi-F13, reversing a prior "deliberately omitted" decision):**
 now always emitted, deterministically — lowercase method + `_` + the converted path's segments

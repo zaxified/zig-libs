@@ -381,6 +381,12 @@ pub const RouteDoc = struct {
     /// and embeds it (normalized) under
     /// `requestBody.content."application/json".schema`.
     request_schema: ?[]const u8 = null,
+    /// JSON Schema of the query string, as JSON text: an object schema whose
+    /// `properties` are the query parameters and whose `required` lists the
+    /// required ones, or `allOf` of such -- what `validate.writeJsonSchemaFor(T)`
+    /// writes for the `T` of `validate.parseQueryLeaky`. `openapi` emits one
+    /// `in: query` parameter per property.
+    query_schema: ?[]const u8 = null,
     /// Documented responses; empty ⇒ consumers fall back to a default 200.
     responses: []const Response = &.{},
     deprecated: bool = false,
@@ -749,6 +755,8 @@ pub const Router = struct {
         for (responses, d.responses) |*slot, resp| slot.* = .{
             .status = resp.status,
             .description = try a.dupe(u8, resp.description),
+            .schema = if (resp.schema) |s| try a.dupe(u8, s) else null,
+            .media_type = try a.dupe(u8, resp.media_type),
         };
         const copy = try a.create(RouteDoc);
         copy.* = .{
@@ -756,6 +764,7 @@ pub const Router = struct {
             .description = if (d.description) |s| try a.dupe(u8, s) else null,
             .tags = tags,
             .request_schema = if (d.request_schema) |s| try a.dupe(u8, s) else null,
+            .query_schema = if (d.query_schema) |s| try a.dupe(u8, s) else null,
             .responses = responses,
             .deprecated = d.deprecated,
         };
@@ -2618,7 +2627,8 @@ test "routes(): registration-order enumeration with docs and group prefixes" {
         .description = "Creates one user.",
         .tags = &.{ "users", "write" },
         .request_schema = "{\"type\":\"object\"}",
-        .responses = &.{.{ .status = 201, .description = "Created" }},
+        .query_schema = "{\"type\":\"object\",\"properties\":{}}",
+        .responses = &.{.{ .status = 201, .description = "Created", .schema = "{\"type\":\"string\"}", .media_type = "text/plain" }},
     });
     const api = try r.group("/api");
     try api.get("/things/:id", hUser);
@@ -2643,6 +2653,11 @@ test "routes(): registration-order enumeration with docs and group prefixes" {
     try testing.expectEqual(@as(usize, 1), doc.responses.len);
     try testing.expectEqual(@as(u16, 201), doc.responses[0].status);
     try testing.expectEqualStrings("Created", doc.responses[0].description);
+    // Every field survives the copy -- `query_schema`, `schema` and
+    // `media_type` were once dropped by it.
+    try testing.expectEqualStrings("{\"type\":\"object\",\"properties\":{}}", doc.query_schema.?);
+    try testing.expectEqualStrings("{\"type\":\"string\"}", doc.responses[0].schema.?);
+    try testing.expectEqualStrings("text/plain", doc.responses[0].media_type);
     try testing.expect(!doc.deprecated);
 
     // Group routes carry the full prefixed pattern.

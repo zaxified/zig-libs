@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Query parameters.** `RouteDoc.query_schema` (an object schema, or `allOf` of
+  them -- what `validate.writeJsonSchemaFor(T)` writes, `allOf` when `T` declares
+  `validate_rules`) becomes one `in: query` parameter per property, after the path parameters,
+  `required` when any part requires it, the property's schema as its `schema` (`allOf` of them when
+  several parts describe it). A schema that does not name parameters that way (not an object,
+  `properties` not an object, a `required` that is not an array of described names) → new
+  `error.InvalidQuerySchema`. The output
+  passes `openapi-spec-validator --schema 3.1` (verdict frozen next to the test).
+
 - **2026-09-22** — **Response bodies and bearer auth.** A `RouteDoc.Response` with a `schema`
   is emitted with `content."<media_type>".schema` (validated and re-emitted like
   `request_schema`; malformed text → new `error.InvalidResponseSchema`). `Info.bearer_auth`
