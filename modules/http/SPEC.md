@@ -377,6 +377,18 @@ pending a native std TLS server.
   `Options.inline_blocking` runs every blocking phase on the calling thread (the timeouts then
   cannot interrupt a blocked phase).
 
+- **BUG: `Options.inline_blocking` does not keep the work on the calling thread** (qap, 2026-09-28,
+  found by qap's jwks hardening probe). With it set, a qap refresh thread under Landlock still
+  resolved a host name it had no read grant for (`/etc/hosts` denied): std's
+  `Io.net.HostName.connect` itself runs `lookup` and `connectMany` through `io.async` and an
+  `Io.Group` (lib/std/Io/net/HostName.zig ~283/343/349), i.e. on the pool of the `Io`, whatever
+  `runBounded` does. So the module doc's "make the `Io` after the sandbox, or set
+  `inline_blocking`" is wrong in its second half. qap went back to its own `std.Io.Threaded` made on
+  the confined thread (`src/auth_jwt.zig` `Remote.run`). Fix options: doc only (drop the claim;
+  "inline" = the client's phases, not std's resolver), or an inline connect path (`HostName.lookup`
+  into a local queue + sequential `connect`, no `io.async`), or document `Threaded` with
+  `async_limit = .nothing` as the way to get it.
+
 ## Status
 `extract+gap · any · both · single_owner` · deps: `netaddr`, `tlsclient` (+ `std.Io.net`,
 `std.compress.flate`) — canonical source is `pub const meta` in src/root.zig.
