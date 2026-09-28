@@ -94,7 +94,9 @@ pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, l
             if (window_log) |w| advanced.window_log = w;
             const opts: stream.Options = .{ .level = lvl, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced, .dictionary = dictionary };
             if (reused) |r| {
-                try r.reset(opts);
+                var o = opts;
+                o.thread_pool = r.opts.thread_pool; // (the stream's own, kept)
+                try r.reset(o);
                 s = r;
             } else {
                 own = try stream.Stream.init(gpa, opts);

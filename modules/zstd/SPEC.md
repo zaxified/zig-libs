@@ -881,8 +881,9 @@ differs from nbWorkers 0's, and **does not depend on the worker count**:
 the goldens are made with 3 workers, checked equal with 1 by the recipe,
 and the test compares 1, 2, 4 and 8. **The allocator must be
 thread-safe:** each worker's context grows its workspace from the
-caller's `gpa` on the worker's own thread (`beginInternal`), as libzstd's
-workers call its `customMem` (Z17).
+caller's `gpa` (a shared pool's own, `ThreadPool.create`'s) on the worker's
+own thread (`beginInternal`), as libzstd's workers call its `customMem`
+(Z17).
 
 **Jobs.** The input is copied into a round buffer and cut into jobs of
 `targetSectionSize` bytes: `Advanced.job_size` (`ZSTD_c_jobSize`, a value
@@ -933,21 +934,54 @@ by reference with the frame's parameters and no level (libzstd's
 jobs see only their predecessor's tail.
 
 **Threads.** `Stream` and `Compressor` make a `zstdmt.MtCtx` at their
-first multithreaded frame and keep it: `nb_workers` `std.Thread`s, each
-with its own compression context (reused frame after frame, as libzstd's
-CCtx pool), a job table of a power of two above `nb_workers + 2`, the round
-buffer, each job slot's output and sequence buffers, and the LDM table. A
-job is posted only while a thread is free (`POOL_tryAdd` on a pool without
-a queue); otherwise it waits prepared (`jobReady`) and the input is not
-read further. `flush` and `end` wait for the oldest job's next output when
-no input could be taken. Synchronisation is atomics plus the futex of
-`std.Io` through the process-global `std.Io.Threaded` instance, whose
-futex calls touch no state of the instance, so the module needs neither
-libc (zig-libs policy) nor an `Io` from its caller. Not `workerpool`: it
-needs the caller's `Io`, boxes every job on the heap and queues without
-bound, where this needs a fixed set of threads each owning a context and
-at most one job each. With `builtin.single_threaded`, or the test seam
-`run_inline`, the jobs run on the calling thread when posted — the same
+first multithreaded frame and keep it: a job table of a power of two above
+`nb_workers + 2`, the round buffer, each job slot's output and sequence
+buffers, the LDM table -- and the workers, a `ThreadPool` (`ZSTD_threadPool`,
+libzstd's `POOL_ctx`): one of its own with `nb_workers` threads, resized
+with it (`ZSTDMT_resize`), or a caller's shared one (`Options.thread_pool`,
+`StreamOptions.thread_pool`: `ZSTD_CCtx_refThreadPool`;
+`ThreadPool.create`/`destroy` are `ZSTD_createThreadPool`/
+`ZSTD_freeThreadPool`; it must outlive the contexts it serves). Each pool
+thread owns a compression context, reused job after job whichever context
+posted the job (libzstd's per-context CCtx pool; a reused context gives a
+fresh one's bytes), growing its workspace from the pool's allocator. A job
+is posted only while a thread is free (`POOL_tryAdd` on a pool without a
+queue); otherwise it waits prepared (`jobReady`) and the input is not read
+further. `flush` and `end` wait for the oldest job's next output when no
+input could be taken. On a shared pool the rule holds across every context
+posting to it, from any thread (posting is serialized by a mutex):
+`nb_workers` sizes the job table and the round buffer, the pool's threads
+bound how many jobs run at once -- fewer than `nb_workers` wait longer, more
+run more at once (libzstd then borrows more CCtxs than it keeps). The
+bytes are the same (*Anchoring*). Deviations, none visible in the bytes:
+libzstd resizes a shared pool to a context's `nb_workers` when that changes
+between frames (`ZSTDMT_resize` calls `POOL_resize` on a provided pool
+too), for every other user of the pool; here a shared pool keeps its size.
+libzstd binds the pool when it makes the multithreaded context and ignores
+a later `ZSTD_CCtx_refThreadPool`; here each frame takes the pool its
+options name (between frames). The workers' workspaces are the pool's:
+`estimate*` leave them out when `thread_pool` is set, `MtCtx.memorySize`
+counts them only for a pool of its own, and `ThreadPool.memorySize`
+reports them.
+
+**Synchronisation and `std.Io`.** Atomics plus a futex. A pool created with
+an `io` (`ThreadPool.create(gpa, n, .{ .io = io })`) runs its workers as
+`io`'s concurrent tasks (`std.Io.Group.concurrent`: a dedicated thread each
+with `std.Io.Threaded`) and every wait and wake -- the workers', the posting
+threads' and the posting mutex's -- goes through `io`'s futex. Without one
+(a context's own pool, or a shared pool made without `io`) the workers are
+`std.Thread`s and the futex is that of the process-global
+`std.Io.Threaded` instance, whose futex calls touch no state of the
+instance, so the module needs neither libc (zig-libs policy) nor an `Io`
+from its caller. (Decided 2026-09-26: the global futex, `io` when a caller
+asks; Z25 adds the `io` as the pool's, keeping the default.) Not
+`workerpool`: it needs the caller's `Io`, boxes every job on the heap and
+queues without bound, where this needs a fixed set of threads each owning
+a context and at most one job each. A worker reads a posted job's pointer
+before claiming it: claimed first, its queue slot could be posted to again
+by the time it reads, once a later job finished first (fixed 2026-09-28).
+With `builtin.single_threaded`, or the test seam `run_inline` (a context's
+own pool only), the jobs run on the calling thread when posted -- the same
 bytes. The large buffers (the round buffer, up to `max(window,
 nb_workers × job) + 3 jobs`; each job's output, `compressBound(job)`) come
 from the allocator's `rawAlloc`, so a safe build does not fill them with
@@ -2330,6 +2364,16 @@ for an unknown size differ outside the binary tree's equivalence -- level
 equivalent under a 2 MB window). Equivalent, not run: clearing the mark
 after the hand-over (handing over again gives the same parameters).
 
+**Shared thread pool** (Z25, 2026-09-28) has no goldens of its own: the
+bytes do not depend on the pool, so `mt_test.zig` runs every
+multithreaded golden row again on shared pools -- 2 threads for 3 workers,
+8 threads for 1 -- and on one pool of 3 threads that three threads post to
+at once (2, 3 and 4 workers, each a third of the rows through its own
+`Compressor` and `Stream`), once with `std.Thread` workers and once with
+the workers as tasks of a `std.Io.Threaded`; plus a context moving between
+its own pool and two shared ones frame by frame, the pools keeping their
+sizes, and the estimates leaving the workers' workspaces to the pool.
+
 **Multithreaded optimizers** (Z9b, 2026-09-25): `dict_golden_test.zig`
 runs every optimizer row of the finished-dictionary goldens with 2, 3 and
 8 threads: libzstd's single-threaded dictionary, k and d each time; a
@@ -2942,7 +2986,11 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   estimates (`ZSTD_initStaticDCtx`, `ZSTD_estimateDCtxSize`,
   `ZSTD_estimateDStreamSize*`, the `DDict` equivalents),
   `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
-  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 for `zstd-cli`:
+  `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 (compressor
+  side): the shared thread pool (`ThreadPool`,
+  `Options.thread_pool`, `ZSTD_CCtx_refThreadPool`; see *Multithreading*),
+  which runs on a caller's `std.Io` when given one -- the 2026-09-26 MT
+  futex decision stands as the default. Done 2026-09-28 for `zstd-cli`:
   `getCParams` (`ZSTD_getCParams`) and `limits` (`ZSTD_WINDOWLOG_MAX` and
   the other bounds); `Stream.frameProgression` (`ZSTD_getFrameProgression`,
   with and without workers) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),

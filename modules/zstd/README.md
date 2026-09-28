@@ -27,7 +27,8 @@ libzstd), and so is **multithreaded** compression
 (`Advanced.nb_workers`, `job_size`, `overlap_log`, `rsyncable`: libzstd's
 jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
 — the same bytes as libzstd's for any worker count, on a small pool of
-`std.Thread`s without libc), the optimizers train on several threads
+`std.Thread`s without libc, or on a `ThreadPool` shared by many contexts,
+`ZSTD_CCtx_refThreadPool`, which may run on a caller's `std.Io`), the optimizers train on several threads
 (`OptimizeParams.nb_threads`, the single-threaded result for any count),
 and so is the **sequence-level API** (`compressSequences`,
 `generateSequences`, a block-level `SequenceProducer` in place of the match
@@ -178,8 +179,20 @@ var c: zstd.Compressor = .initStatic(ws);
 `estimateStreamSize(opts)` and `Stream.initStatic(ws, opts)` do the same
 for a stream (exact for a pledged size or a size hint; without either, the
 most any frame can need). With `advanced.nb_workers` both count the workers'
-memory too (libzstd refuses to estimate that), and
+memory too (libzstd refuses to estimate that; with a shared `thread_pool`,
+the workers' workspaces are the pool's), and
 `CDict.estimateSize(dict.len, opts, true)` gives a dictionary's.
+
+Several compressors and streams with workers can share one pool of
+threads (`ZSTD_createThreadPool`, `ZSTD_CCtx_refThreadPool`); the bytes do
+not depend on it:
+
+```zig
+const pool = try zstd.ThreadPool.create(gpa, 4, .{}); // .{ .io = io }: workers and futex from your std.Io
+defer pool.destroy(); // after every context using it
+const n = try c.compress(buf, big, .{ .level = 3, .advanced = .{ .nb_workers = 4 }, .thread_pool = pool });
+var s = try zstd.Stream.init(gpa, .{ .advanced = .{ .nb_workers = 2 }, .thread_pool = pool });
+```
 
 Streaming into any `std.Io.Writer` (an HTTP body, a file) as libzstd
 streams -- one frame, history kept across flushes, the bytes
@@ -531,6 +544,11 @@ libzstd's, or failing with libzstd's error (`src/testdata/seq_goldens.zig`,
 `src/context_test.zig` pins the estimates (exact, and the largest for an
 unknown size), a static workspace's bound, the workspace being replaced
 when too small or long too big, and indexing restarting near its limit.
+
+`src/mt_test.zig` runs
+the multithreaded goldens on shared thread pools too, smaller and larger
+than `nb_workers`, posted to from three threads at once, and on a pool
+running on a `std.Io.Threaded`.
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder and
 this one, and feeds the decoder arbitrary bytes one-shot, streamed and

@@ -96,7 +96,22 @@ pub const Options = struct {
     /// `advanced.enable_seq_producer_fallback`, the match finder still runs
     /// for the blocks it fails on.
     sequence_producer: ?SequenceProducer = null,
+    /// `ZSTD_CCtx_refThreadPool`: with `advanced.nb_workers`, the jobs run
+    /// on this shared pool instead of a pool of the context's own; null
+    /// (`ZSTD_CCtx_refThreadPool(cctx, NULL)`) is the context's own. The
+    /// bytes are the same. The pool must outlive the context.
+    thread_pool: ?*ThreadPool = null,
 };
+
+/// `ZSTD_threadPool`: worker threads, each with a compression context,
+/// that any number of compressors and streams with `Advanced.nb_workers`
+/// share (`Options.thread_pool`, `StreamOptions.thread_pool`) --
+/// `ZSTD_createThreadPool` is `ThreadPool.create`, `ZSTD_freeThreadPool`
+/// `destroy`. A context with `nb_workers` above the pool's thread count
+/// runs as many jobs at once as there are threads free. Built on a
+/// caller's `std.Io` when given one (its concurrency and futex), else on
+/// `std.Thread`s. See SPEC.md, *Multithreading*.
+pub const ThreadPool = zstdmt.ThreadPool;
 
 /// `ZSTD_Sequence`: a match and the literals before it, as the
 /// sequence-level API (`Compressor.compressSequences`,
@@ -256,13 +271,13 @@ pub const Compressor = struct {
         const fo = frameOptions(opts);
         // ZSTD_compress2 goes through ZSTD_compressStream2, which leaves an
         // input of up to ZSTDMT_JOBSIZE_MIN to the calling thread
-        if (opts.advanced.nb_workers > 0 and src.len > zstdmt.job_size_min) return c.compressMt(dst, src, fo);
+        if (opts.advanced.nb_workers > 0 and src.len > zstdmt.job_size_min) return c.compressMt(dst, src, fo, opts.thread_pool);
         return c.ctx.compressFrame(dst, src, fo);
     }
 
     /// `ZSTD_compress2` with workers: one `ZSTD_e_end` call over the whole
     /// input.
-    fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options) Error!usize {
+    fn compressMt(c: *Compressor, dst: []u8, src: []const u8, fo: frame.Options, pool: ?*ThreadPool) Error!usize {
         const bound = compressBound(src.len);
         if (dst.len < bound) return error.NoSpaceLeft;
         try fo.advanced.check();
@@ -271,10 +286,10 @@ pub const Compressor = struct {
         const setup = try c.ctx.setupStream2(fo, src.len, null, &local);
         if (c.mt == null) {
             const gpa = c.ctx.gpa orelse return error.OutOfMemory; // a static context
-            c.mt = try zstdmt.MtCtx.create(gpa, fo.advanced.nb_workers, c.mt_run_inline);
+            c.mt = try zstdmt.MtCtx.create(gpa, fo.advanced.nb_workers, c.mt_run_inline, pool);
         }
         const mt = c.mt.?;
-        try mt.initFrame(setup, src.len);
+        try mt.initFrame(setup, src.len, pool);
         var in: stream.InBuffer = .{ .src = src };
         var out: stream.OutBuffer = .{ .dst = dst[0..bound] };
         const left = mt.compressStream2(&out, &in, .end) catch |e| switch (e) {
@@ -372,16 +387,18 @@ pub const workspace_alignment = frame.workspace_alignment;
 /// port's layout, not libzstd's number); null for the most that any input
 /// size needs (`ZSTD_estimateCCtxSize`). With `Advanced.nb_workers`, an
 /// input over `zstdmt.job_size_min` goes to the workers: the most they hold
-/// (`zstdmt.estimateSize`; libzstd refuses to estimate with workers); null
-/// counts both kinds of input, which one context keeps side by side.
+/// (`zstdmt.estimateSize`; libzstd refuses to estimate with workers) -- with
+/// `opts.thread_pool`, less the workers' workspaces, which are the pool's;
+/// null counts both kinds of input, which one context keeps side by side.
 pub fn estimateCompressorSize(src_size: ?u64, opts: Options) Error!usize {
     if (opts.level > max_level) return error.LevelUnsupported;
     try opts.advanced.check();
     const fo: frame.Options = .{ .level = opts.level, .checksum = opts.checksum, .advanced = opts.advanced, .sequence_producer = opts.sequence_producer };
+    const shared = opts.thread_pool != null;
     if (opts.advanced.nb_workers > 0) {
         if (src_size) |n| {
-            if (n > zstdmt.job_size_min) return zstdmt.estimateSize(fo, n, null);
-        } else return estimateCompressorSingle(null, fo) + zstdmt.estimateSize(fo, null, null);
+            if (n > zstdmt.job_size_min) return zstdmt.estimateSize(fo, n, null, shared);
+        } else return estimateCompressorSingle(null, fo) + zstdmt.estimateSize(fo, null, null, shared);
     }
     return estimateCompressorSingle(src_size, fo);
 }

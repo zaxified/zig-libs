@@ -5,6 +5,17 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `zstd.ThreadPool` (`ZSTD_createThreadPool`,
+  `ZSTD_freeThreadPool`) and `Options.thread_pool` /
+  `StreamOptions.thread_pool` (`ZSTD_CCtx_refThreadPool`): contexts with
+  `nb_workers` share one pool of threads, of any size; the same bytes as
+  with a pool of their own. `ThreadPool.create(gpa, n, .{ .io = io })` runs
+  the workers as `io`'s concurrent tasks on `io`'s futex; without `io`, and
+  for a context's own pool, `std.Thread`s and the process-global futex as
+  before. With a shared pool the size estimates leave the workers'
+  workspaces to the pool (`ThreadPool.memorySize`). Fixed: a worker could
+  run the wrong job when a later one finished first between its claiming a
+  queue slot and reading it (a race, not seen in a test).
 - **2026-09-28** — `Stream.setLevel` (`ZSTD_CCtx_setParameter(
   ZSTD_c_compressionLevel)` at any time): with workers, the jobs created
   after the next call take the new level, as libzstd's
