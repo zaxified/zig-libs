@@ -106,7 +106,9 @@ fn reloadVolatile(s: *const [32]u8) [32]u8 {
 /// `msm` — `mulMultiRistretto` over 9 terms (one full chunk of 8 plus one),
 ///   every scalar derived from the tainted secret, public runtime points
 ///   (audit `bulletproofs` B9: the prove-side MSM).
-const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm };
+/// `x25519` — `X25519.recoverPublicKey`: the comb plus the Edwards→Montgomery
+///   map (one `Fe.invert`), the tainted seed as the secret key.
+const Target = enum { ct25519, std_mul, comb, ladderbase, ladder, msm, x25519 };
 const Taint = enum { yes, no };
 
 fn parseTarget(s: []const u8) !Target {
@@ -116,6 +118,7 @@ fn parseTarget(s: []const u8) !Target {
     if (std.mem.eql(u8, s, "ladderbase")) return .ladderbase;
     if (std.mem.eql(u8, s, "ladder")) return .ladder;
     if (std.mem.eql(u8, s, "msm")) return .msm;
+    if (std.mem.eql(u8, s, "x25519")) return .x25519;
     return error.UnknownTarget;
 }
 
@@ -184,6 +187,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .ladder => {
             const q = ct25519.mulRistretto(var_point, sec);
             out_bytes = q.toBytes();
+        },
+        .x25519 => {
+            out_bytes = ct25519.X25519.recoverPublicKey(sec) catch @panic("identity: impossible for a clamped scalar");
         },
         .msm => {
             var scalars: [9][32]u8 = undefined;

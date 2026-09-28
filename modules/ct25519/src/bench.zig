@@ -18,6 +18,7 @@
 //! - `mulBase` (fixed-base comb, C3) vs `mul(basePoint, s)` — the window
 //!   ladder over the comptime table, which IS the pre-C3 `mulBase`;
 //! - `mulRistrettoBase` (comb) vs `mulRistretto(basePoint, s)` (ladder);
+//! - `X25519.recoverPublicKey` (comb + one inversion) vs std's Montgomery ladder;
 //! - `mulRistretto` over a runtime point (ladder, unchanged by C3) vs std's
 //!   `Ristretto255.mul` — the control pair: C3 changed neither side, so its
 //!   ratio should sit near 1 and a drift there says the machine moved.
@@ -45,7 +46,7 @@ fn lessThan(_: void, a: f64, b: f64) bool {
 const rounds = 7;
 const nscalars = 64;
 
-const Op = enum { comb_base, ladder_base, comb_ristretto, ladder_ristretto, ladder_var, std_var };
+const Op = enum { comb_base, ladder_base, comb_ristretto, ladder_ristretto, ladder_var, std_var, x25519_comb, x25519_std };
 
 fn run(op: Op, iters: usize, scalars: *const [nscalars][32]u8, pv: Ristretto255) u8 {
     var acc: u8 = 0;
@@ -58,6 +59,8 @@ fn run(op: Op, iters: usize, scalars: *const [nscalars][32]u8, pv: Ristretto255)
             .ladder_ristretto => ct.mulRistretto(Ristretto255.basePoint, s).toBytes(),
             .ladder_var => ct.mulRistretto(pv, s).toBytes(),
             .std_var => (pv.mul(s) catch unreachable).toBytes(),
+            .x25519_comb => ct.X25519.recoverPublicKey(s) catch unreachable,
+            .x25519_std => std.crypto.dh.X25519.recoverPublicKey(s) catch unreachable,
         };
         acc ^= b[i % 32];
     }
@@ -104,5 +107,6 @@ test "bench (opt-in via CT25519_BENCH)" {
     chk ^= pair("base point, Edwards", .comb_base, .ladder_base, iters, &scalars, pv);
     chk ^= pair("base point, ristretto255", .comb_ristretto, .ladder_ristretto, iters, &scalars, pv);
     chk ^= pair("runtime point (control)", .ladder_var, .std_var, iters, &scalars, pv);
+    chk ^= pair("X25519 public key", .x25519_comb, .x25519_std, iters, &scalars, pv);
     std.debug.print("checksum={d}\n", .{chk});
 }

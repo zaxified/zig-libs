@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **New `X25519`: std's `X25519` shape with key generation
+  on the C3 comb.** Additive API. `recoverPublicKey` = `clamp(sk)·B` on the
+  fixed-base comb, then `u = (Z + Y)/(Z − Y)` (one inversion); `scalarmult`
+  is std's ladder re-exported. No identity branch (unreachable for a clamped
+  scalar, proof in `SPEC.md`). Bit-exact with std over RFC 7748 §6.1 and 512
+  raw seeds; ctgrind target `x25519` 2 contexts / 0 in-module, as `comb`.
+  ReleaseFast bench: public key 51.6 → 21.8 µs (2.36×). First consumer: qap's
+  TLS fork (`-Dfast-x25519`), where the ephemeral key pair was half of X25519's
+  ~28 % of a handshake.
 - **2026-09-15** — **New `mulMultiRistretto`: constant-time `Σ s_i·P_i` by
   Straus's interleaving (audit `bulletproofs` B9).** Additive API. All terms
   share one chain of doublings; every term pays one `pcSelect` and one add per

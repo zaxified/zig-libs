@@ -166,7 +166,7 @@ declare -A TARGETS=(
     # window ladder over the comptime table, still reachable as
     # `mul(basePoint, s)`) and `ladder` (C4: runtime-decoded point, runtime
     # `precompute` table) added 2026-09-16; see modules/ct25519/SPEC.md § C3.
-    [ct25519]="ct25519 std comb ladderbase ladder msm"
+    [ct25519]="ct25519 std comb ladderbase ladder msm x25519"
     [decaf448]="scalarmul"
     [bn254]="field scalarmul"
     # `verify` (A1 E15) added 2026-09-16 is DOCUMENTARY: verify has no secret,
@@ -351,6 +351,7 @@ declare -A PATTERN=(
     [ct25519/ladderbase]='root[.]zig'
     [ct25519/ladder]='root[.]zig'
     [ct25519/msm]='root[.]zig'
+    [ct25519/x25519]='root[.]zig|field[.]zig'
     [decaf448/scalarmul]='element[.]zig|ed448[.]zig|field[.]zig|scalar[.]zig'
     [ecvrf/prove]='ecvrf[.]zig'
     [ecvrf/verify]='ecvrf[.]zig'
@@ -590,6 +591,7 @@ declare -A LABEL=(
     [ct25519/ladderbase]='ct25519 ladder B'
     [ct25519/ladder]='ct25519 ladder var'
     [ct25519/msm]='ct25519 straus msm'
+    [ct25519/x25519]='ct25519 X25519 pubkey comb'
     [decaf448/scalarmul]='decaf448+ed448'
     [ecvrf/prove]='ecvrf KeyPair (sk; Y declassified)'
     [ecvrf/verify]='ecvrf verify (public alpha; DOCUMENTARY)'

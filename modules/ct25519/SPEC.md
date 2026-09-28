@@ -245,6 +245,59 @@ mismatch panics: an error union is the shape this module refuses, and
    primitive is ~40 lines that reuse `precompute`/`pcSelect` unchanged, held
    byte-exact to the loop it replaces.
 
+## X25519 key generation on the comb (2026-09-28)
+
+**Why.** qap's TLS server profile (churn lane, `perf record`, 2026-09-28) had
+X25519 at ~28 % of the handshake's CPU, split evenly between the ephemeral
+key pair and the shared secret: `std.crypto.dh.X25519.recoverPublicKey` runs
+the same 255-step Montgomery ladder over `u = 9` as `scalarmult` runs over a
+peer's point. Only 1.15× behind OpenSSL's ladder, so an asm field core would
+buy little; the base-point half is a fixed-base multiply, which is what C3's
+comb is for.
+
+**What.** `X25519` — `std.crypto.dh.X25519`'s declarations (`Curve`, the
+four lengths, `KeyPair` with `generateDeterministic`/`generate`,
+`recoverPublicKey`, `scalarmult`) — with `recoverPublicKey` as
+`clamp(sk)·B` on the comb followed by the birational map to Montgomery `u`
+(RFC 7748 §4.1): `u = (1 + y)/(1 − y) = (Z + Y)/(Z − Y)` in extended
+coordinates, one `Fe.invert` (std's `Curve25519.fromEdwards25519` spends two).
+`scalarmult` IS std's, re-exported. Clamping is std's `scalar.clamp`, so the
+bytes are std's bytes.
+
+**No identity branch.** std's `recoverPublicKey` ends in `rejectIdentity`.
+Here the result is returned unconditionally: for a clamped scalar
+`k ∈ [2^254, 2^255)` with `8 | k`, `k·B = O` iff `L | k`, and the multiples
+of `L` in that range are `4L..7L`, none divisible by 8. The
+`IdentityElementError` in the signatures is std's shape kept for drop-in use
+(qap's TLS fork binds the type by one declaration); it is never produced.
+
+**Evidence.**
+- `X25519: RFC 7748 §6.1's published key pairs and shared secret` — Alice's
+  and Bob's public keys re-derived byte-exactly, the shared secret both ways
+  through `scalarmult`.
+- `X25519: recoverPublicKey is bit-exact with std over random and edge seeds`
+  — 512 SHA-512-derived RAW seeds (not reduced: every bit pattern is a legal
+  secret, so bits 254/255 and the low three are exercised through the clamp)
+  plus all-zero, all-one and single-bit edges.
+- `X25519: a key pair from the comb agrees with a std key pair on the shared
+  secret` — mixed key pairs, and `generate(io)` has the type's shape.
+- ctgrind target `x25519` (`scripts/checks/ctgrind.sh ct25519`, 2026-09-28):
+  tainted seed **2 contexts, 0 in this module's code** — the same two
+  out-of-file contexts `comb` shows (std's `Fe.toBytes` final reduction and
+  the harness print); untainted control 0, no-`-fvalgrind` trap 0. With the
+  identity branch still in (first draft) it was 3 contexts, the third at the
+  `isZero` compare in `recoverPublicKey` — the branch was removed for that.
+- Bench (`CT25519_BENCH=1`, ReleaseFast, `taskset -c 1`, 7 interleaved
+  rounds, µs/op CPU time, median [min..max]): `X25519.recoverPublicKey`
+  **21.8 [21.4..22.3]** vs std **51.6 [50.3..56.1]**, paired **2.36×**
+  [2.28..2.62]; `mulBase` comb 21.x vs ladder 55 in the same run, so the map
+  costs under a microsecond.
+
+**Limits.** Only key generation changes; the shared secret is still std's
+ladder, and a faster variable-base X25519 would be a field-core question
+(backlog, not planned: 1.15× headroom). A consumer that needs
+`KeyPair.fromEd25519`/`publicKeyFromEd25519` takes them from std.
+
 ## Threat model / limits
 
 - **The claim.** `mul`/`mulBase`/`mulRistretto`/`mulRistrettoBase` execute

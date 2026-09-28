@@ -101,7 +101,7 @@ const Fe = Edwards25519.Fe;
 pub const meta = .{
     // The module catalog's one-line entry. This IS the source of truth:
     // README.md's table is rendered from it by `zig build gen-catalog`.
-    .doc = "Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points.",
+    .doc = "Constant-time-on-secrets scalar multiplication for Edwards25519/Ristretto255 — drops std's secret-dependent `rejectIdentity` branch. Caller must validate points. `X25519` with key generation on the fixed-base comb (2.4× std).",
     // The catalog's Platform cell. Prose, because it carries nuance the
     // `platform` enum below cannot -- "any (packer: linux)", "amd64 asm +
     // portable fallback". Rendered by `gen-catalog` alongside `doc`.
@@ -337,6 +337,96 @@ pub fn mulRistretto(p: Ristretto255, s: [32]u8) Ristretto255 {
     defer std.crypto.secureZero(u8, &sc);
     return .{ .p = mul(p.p, sc) };
 }
+
+// ── X25519 key generation on the comb ────────────────────────────────────
+//
+// `std.crypto.dh.X25519` derives a public key with the Montgomery ladder over
+// the base point `u = 9` — 255 ladder steps, the same work as a shared-secret
+// computation against a peer's point. A TLS server pays both per handshake
+// (ephemeral key pair, then the shared secret), so the base-point half was
+// measured at ~28 %/2 of a qap ECDHE handshake's CPU (2026-09-28). The base
+// point is fixed, and the fixed-base comb above already computes `s·B` on
+// Edwards25519 in a third of the ladder's time; Montgomery `u = 9` IS
+// Edwards `B` under the birational map (RFC 7748 §4.1), so the X25519
+// public key is `u = (1 + y) / (1 - y)` of the comb's result — in extended
+// coordinates `(Z + Y) / (Z - Y)`, one field inversion. std's own
+// `Curve25519.fromEdwards25519` does the same map with two inversions.
+//
+// The scalar is clamped exactly as std clamps it (`scalar.clamp`: bits 0-2
+// cleared, bit 255 cleared, bit 254 set), so the public key is bit-exact
+// with `std.crypto.dh.X25519.recoverPublicKey` — a differential test below
+// holds that over random seeds, and RFC 7748 §6.1's vectors pin it.
+//
+// Constant time: the comb is the C3-audited path; the map is field
+// arithmetic with a fixed-chain `Fe.invert`, and there is NO identity check
+// on the result — std's `recoverPublicKey` branches on `rejectIdentity`
+// (ctgrind sees it: a third context, `curve25519.zig`), this one does not,
+// because the identity is **unreachable for a clamped scalar**:
+// `k ∈ [2^254, 2^255)` with `8 | k`, and `k·B = O` iff `L | k`; the only
+// multiples of `L` in that range are `4L`..`7L`, none divisible by 8 (`L`
+// is odd). The `IdentityElementError` in the signatures is kept so the type
+// is a drop-in for std's, whose `KeyPair.generateDeterministic` can fail;
+// this module never produces it. ctgrind target `x25519` (SPEC.md § "X25519
+// key generation") shows the same two out-of-file contexts as `comb`.
+
+/// `std.crypto.dh.X25519` with key generation on the fixed-base comb.
+///
+/// Same declarations, lengths and byte formats as std's `X25519`;
+/// `scalarmult` (the shared secret against a peer's public key) IS std's
+/// ladder, unchanged. Only `recoverPublicKey` — and through it
+/// `KeyPair.generateDeterministic` / `generate` — takes the comb.
+pub const X25519 = struct {
+    const Std = std.crypto.dh.X25519;
+
+    pub const Curve = Std.Curve;
+    pub const secret_length = Std.secret_length;
+    pub const public_length = Std.public_length;
+    pub const shared_length = Std.shared_length;
+    pub const seed_length = Std.seed_length;
+
+    pub const IdentityElementError = std.crypto.errors.IdentityElementError;
+
+    pub const KeyPair = struct {
+        public_key: [public_length]u8,
+        secret_key: [secret_length]u8,
+
+        /// Deterministically derive a key pair from a cryptographically
+        /// secure secret seed — std's `generateDeterministic`, on the comb.
+        pub fn generateDeterministic(seed: [seed_length]u8) IdentityElementError!KeyPair {
+            return .{
+                .public_key = try X25519.recoverPublicKey(seed),
+                .secret_key = seed,
+            };
+        }
+
+        /// Generate a new, random key pair.
+        pub fn generate(io: std.Io) KeyPair {
+            var random_seed: [seed_length]u8 = undefined;
+            while (true) {
+                io.random(&random_seed);
+                return generateDeterministic(random_seed) catch {
+                    @branchHint(.unlikely);
+                    continue;
+                };
+            }
+        }
+    };
+
+    /// Compute the public key for a given private key — `clamp(sk)·B` as the
+    /// Montgomery `u`-coordinate, byte-exact with std's `recoverPublicKey`.
+    pub fn recoverPublicKey(secret_key: [secret_length]u8) IdentityElementError![public_length]u8 {
+        var sc = secret_key;
+        defer std.crypto.secureZero(u8, &sc);
+        Edwards25519.scalar.clamp(&sc);
+        const q = combMulBase(&sc);
+        // u = (1 + y) / (1 - y) with y = Y / Z, i.e. (Z + Y) / (Z - Y). No
+        // identity branch: unreachable for a clamped scalar (see above).
+        return q.z.add(q.y).mul(q.z.sub(q.y).invert()).toBytes();
+    }
+
+    /// Compute the X25519 shared secret — std's ladder, unchanged.
+    pub const scalarmult = Std.scalarmult;
+};
 
 /// `s * B` over Ristretto255 against the ristretto255 base point — the
 /// fixed-base comb of `mulBase` (ristretto255's base point IS Edwards25519's,
@@ -826,4 +916,55 @@ test "mul: is additively homomorphic in the scalar (fold-boundary sanity)" {
         const rhs = mulBase(a).add(mulBase(b));
         try testing.expectEqualSlices(u8, &lhs.toBytes(), &rhs.toBytes());
     }
+}
+
+// ── X25519 on the comb ───────────────────────────────────────────────────
+
+test "X25519: RFC 7748 §6.1's published key pairs and shared secret" {
+    const alice_sk = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    const alice_pk = hex32("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+    const bob_sk = hex32("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    const bob_pk = hex32("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+    const shared = hex32("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+
+    const alice = try X25519.KeyPair.generateDeterministic(alice_sk);
+    const bob = try X25519.KeyPair.generateDeterministic(bob_sk);
+    try testing.expectEqualSlices(u8, &alice_pk, &alice.public_key);
+    try testing.expectEqualSlices(u8, &bob_pk, &bob.public_key);
+    try testing.expectEqualSlices(u8, &alice_sk, &alice.secret_key);
+    try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(alice.secret_key, bob.public_key)));
+    try testing.expectEqualSlices(u8, &shared, &(try X25519.scalarmult(bob.secret_key, alice.public_key)));
+}
+
+test "X25519: recoverPublicKey is bit-exact with std over random and edge seeds" {
+    // Raw 32-byte seeds, NOT reduced: X25519 clamps, so every bit pattern is a
+    // legal secret and the top bits are exercised (bit 255 cleared, 254 set).
+    var seed: [32]u8 = undefined;
+    var n: u32 = 0;
+    while (n < 512) : (n += 1) {
+        var wide: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(std.mem.asBytes(&n), &wide, .{});
+        seed = wide[0..32].*;
+        try testing.expectEqualSlices(u8, &(try std.crypto.dh.X25519.recoverPublicKey(seed)), &(try X25519.recoverPublicKey(seed)));
+    }
+    for ([_][32]u8{ @splat(0), @splat(0xff), [_]u8{1} ++ [_]u8{0} ** 31, [_]u8{0} ** 31 ++ [_]u8{0x80}, [_]u8{7} ++ [_]u8{0} ** 30 ++ [_]u8{0x40} }) |s| {
+        try testing.expectEqualSlices(u8, &(try std.crypto.dh.X25519.recoverPublicKey(s)), &(try X25519.recoverPublicKey(s)));
+    }
+}
+
+test "X25519: a key pair from the comb agrees with a std key pair on the shared secret" {
+    const seed_a: [32]u8 = @splat(0x42);
+    const seed_b: [32]u8 = @splat(0x24);
+    const ours = try X25519.KeyPair.generateDeterministic(seed_a);
+    const theirs = try std.crypto.dh.X25519.KeyPair.generateDeterministic(seed_b);
+    const k1 = try X25519.scalarmult(ours.secret_key, theirs.public_key);
+    const k2 = try std.crypto.dh.X25519.scalarmult(theirs.secret_key, ours.public_key);
+    try testing.expectEqualSlices(u8, &k1, &k2);
+    try testing.expectEqual(X25519.KeyPair, @TypeOf(X25519.KeyPair.generate(testing.io)));
+}
+
+fn hex32(comptime h: *const [64]u8) [32]u8 {
+    var out: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&out, h) catch unreachable;
+    return out;
 }

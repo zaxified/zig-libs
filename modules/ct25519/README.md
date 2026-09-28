@@ -33,6 +33,8 @@ chain of doublings instead of one ladder per term, constant-time in every
 scalar, the same group element as summing `mulRistretto` (since 2026-09-16,
 audit `bulletproofs` B9; SPEC.md § B9).
 
+**`X25519`** — `std.crypto.dh.X25519`'s shape (`KeyPair.generateDeterministic`/`generate`, `recoverPublicKey`, `scalarmult`, the lengths) with key generation on the comb plus the Edwards→Montgomery map, 2.36× std's ladder (21.8 vs 51.6 µs); `scalarmult` is std's. Bit-exact with std (RFC 7748 §6.1 vectors, 512-seed differential); ctgrind target `x25519`. SPEC.md § "X25519 key generation on the comb".
+
 **`mulBase`/`mulRistrettoBase` are a fixed-base comb, not the ladder (since
 2026-09-16, audit C3).** The base point used to run the same 16-entry window
 ladder as any point, spending 71 % of its time in 252 doublings. It now uses
