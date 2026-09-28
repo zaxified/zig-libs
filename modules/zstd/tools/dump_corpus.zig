@@ -23,7 +23,11 @@
 //!
 //! The multithreaded set (`corpus.mt_cases`) goes to `mt-in-<case>` and one
 //! "case level checksum params schedule dict path content-type" line each
-//! (params, schedule and dict "-" when none).
+//! (params, schedule and dict "-" when none). After the sequence manifest,
+//! optionally: the least-room set (`corpus.room_cases`, one "name input
+//! level checksum params dict path" line each; an input of its own goes to
+//! `room-in-<name>`) and the parameter-query grid
+//! (`corpus.cparamsSample`, `tools/zparams.c`'s input).
 
 const std = @import("std");
 const corpus = @import("corpus");
@@ -201,6 +205,33 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = seq_manifest_path, .data = seq_manifest.items });
+
+    // the least-room goldens (`corpus.room_cases`; inputs and dictionaries
+    // are the files above): "name input level checksum params dict path"
+    const room_manifest_path = args.next() orelse return;
+    var room_manifest: std.ArrayList(u8) = .empty;
+    defer room_manifest.deinit(gpa);
+    for (corpus.room_cases) |rc| {
+        var in_name: []const u8 = rc.input;
+        var own: [96]u8 = undefined;
+        if (rc.gen) |g| {
+            const buf = try gpa.alloc(u8, g.len);
+            defer gpa.free(buf);
+            corpus.generate(g, buf);
+            in_name = try std.fmt.bufPrint(&own, "room-in-{s}", .{rc.name});
+            try dir.writeFile(io, .{ .sub_path = in_name, .data = buf });
+        } else _ = findCase(rc.input);
+        try room_manifest.print(gpa, "{s} {s} {d} {d} {s} {s} {t}\n", .{ rc.name, in_name, rc.level, @intFromBool(rc.checksum), rc.params, rc.dict orelse "-", rc.path });
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = room_manifest_path, .data = room_manifest.items });
+
+    // the parameter queries `tools/zparams.c` answers (`corpus.cparamsSample`)
+    const cparams_path = args.next() orelse return;
+    var grid: std.ArrayList(u8) = .empty;
+    defer grid.deinit(gpa);
+    var line: [256]u8 = undefined;
+    for (0..corpus.cparams_samples) |i| try grid.print(gpa, "{s}\n", .{corpus.cparamsSample(i, &line)});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = cparams_path, .data = grid.items });
 }
 
 fn findCase(name: []const u8) corpus.Case {

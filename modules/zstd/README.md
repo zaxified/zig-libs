@@ -27,7 +27,8 @@ libzstd), and so is **multithreaded** compression
 (`Advanced.nb_workers`, `job_size`, `overlap_log`, `rsyncable`: libzstd's
 jobs, overlap, long-distance matching across jobs, rsync-friendly job cuts
 — the same bytes as libzstd's for any worker count, on a small pool of
-`std.Thread`s without libc), the optimizers train on several threads
+`std.Thread`s without libc, or on a `ThreadPool` shared by many contexts,
+`ZSTD_CCtx_refThreadPool`, which may run on a caller's `std.Io`), the optimizers train on several threads
 (`OptimizeParams.nb_threads`, the single-threaded result for any count),
 and so is the **sequence-level API** (`compressSequences`,
 `generateSequences`, a block-level `SequenceProducer` in place of the match
@@ -92,15 +93,16 @@ const zstd = @import("zstd");
 const frame = try zstd.compressAlloc(gpa, data, .{ .level = 3 });
 defer gpa.free(frame);
 
-// Or into your own buffer, which must hold compressBound(data.len) bytes.
+// Or into your own buffer: compressBound(data.len) bytes always suffice.
 var buf = try gpa.alloc(u8, zstd.compressBound(data.len));
 const n = try zstd.compress(gpa, buf, data, .{ .level = 1, .checksum = true });
-// buf[0..n] is the frame.
+// buf[0..n] is the frame. A smaller buffer works as with ZSTD_compress2:
+// libzstd's frame for that room, or error.DstSizeTooSmall where libzstd fails.
 
 // Decode: into a new buffer sized from the header (at most max_size) ...
 const back = try zstd.decompressAlloc(gpa, frame, 1 << 30);
 defer gpa.free(back);
-// ... or into your own; reuse a Decompressor to keep its ~190 KB of tables.
+// ... or into your own; reuse a Decompressor to keep its ~160 KB of tables.
 var dec = try zstd.Decompressor.init(gpa, .{});
 defer dec.deinit();
 const out = try gpa.alloc(u8, data.len);
@@ -151,6 +153,26 @@ returns 0 when a frame is fully decoded and flushed. It keeps one window
 plus two blocks of output ring and refuses frames asking for more than a
 128 MB window unless `window_log_max` says otherwise (libzstd's default);
 `stable_output` decodes straight into a caller's buffer that stays put.
+`max_block_size` (`ZSTD_d_maxBlockSize`, 1 KiB..128 KiB, both decoders)
+refuses frames with larger blocks, as libzstd does, and shrinks the
+stream's buffers to match -- for frames made with the compressor's
+`advanced.max_block_size`.
+
+The decoder's memory is known in advance, exactly, and can be the caller's
+(`ZSTD_initStaticDCtx` / `DStream` / `DDict`) -- nothing is allocated, and a
+frame needing more is `error.OutOfMemory`:
+
+```zig
+const opts: zstd.DecompressStreamOptions = .{ .max_window_size = 1 << 20 };
+const size = try zstd.estimateDecompressStreamSize(1 << 20, opts); // any frame up to a 1 MiB window
+const ws = try gpa.alignedAlloc(u8, .fromByteUnits(zstd.workspace_alignment), size);
+var s = try zstd.DecompressStream.initStatic(ws, opts);
+// one-shot: zstd.Decompressor.initStatic(ws, .{}) in estimateDecompressorSize() bytes;
+// a dictionary: zstd.DDict.initStatic(dws, dict, .auto, true) in DDict.estimateSize(dict.len, true)
+```
+
+`estimateDecompressStreamSizeFromFrame(header, opts)` sizes for one frame
+exactly; `Decompressor.copyFrom` is `ZSTD_copyDCtx`.
 
 `gpa` backs only the per-call match tables and block buffers; everything is
 freed before `compress` returns. For many frames, keep a context — its one
@@ -179,8 +201,37 @@ var c: zstd.Compressor = .initStatic(ws);
 `estimateStreamSize(opts)` and `Stream.initStatic(ws, opts)` do the same
 for a stream (exact for a pledged size or a size hint; without either, the
 most any frame can need). With `advanced.nb_workers` both count the workers'
-memory too (libzstd refuses to estimate that), and
+memory too (libzstd refuses to estimate that; with a shared `thread_pool`,
+the workers' workspaces are the pool's), and
 `CDict.estimateSize(dict.len, opts, true)` gives a dictionary's.
+
+Several compressors and streams with workers can share one pool of
+threads (`ZSTD_createThreadPool`, `ZSTD_CCtx_refThreadPool`); the bytes do
+not depend on it:
+
+```zig
+const pool = try zstd.ThreadPool.create(gpa, 4, .{}); // .{ .io = io }: workers and futex from your std.Io
+defer pool.destroy(); // after every context using it
+const n = try c.compress(buf, big, .{ .level = 3, .advanced = .{ .nb_workers = 4 }, .thread_pool = pool });
+var s = try zstd.Stream.init(gpa, .{ .advanced = .{ .nb_workers = 2 }, .thread_pool = pool });
+```
+
+libzstd's buffer-less API and `ZSTD_copyCCtx`, both deprecated there, are
+here too: `Compressor.begin` (`ZSTD_compressBegin*`, a `zstd.Begin`),
+`compressContinue`, `compressEnd`, and `copyFrom` -- a context begun once
+with a dictionary, copied for each frame to skip loading it again (the
+copy's frames are libzstd's copy's, which differ from the original's in
+libzstd's ways; see SPEC.md, *Contexts*):
+
+```zig
+var primed: zstd.Compressor = .init(gpa);
+try primed.begin(.{ .level = .{ .level = 3, .dict = dict_bytes } });
+for (messages) |m| {
+    try c.copyFrom(&primed, m.len); // ZSTD_copyCCtx
+    const n = try c.compressEnd(buf, m);
+    try sink.writeAll(buf[0..n]);
+}
+```
 
 Streaming into any `std.Io.Writer` (an HTTP body, a file) as libzstd
 streams -- one frame, history kept across flushes, the bytes
@@ -307,6 +358,14 @@ unknown size chosen as for about that many bytes), and so does
 `error.ParameterOutOfBound`. `writeSkippableFrame` writes a skippable frame
 (`ZSTD_writeSkippableFrame`).
 
+`zstd.getCParams(level, src_size, dict_size)` gives the parameters a level
+resolves to (`ZSTD_getCParams`) and `zstd.adjustCParams(cp, src_size,
+dict_size)` clamps and shrinks explicit ones for an input and dictionary
+size (`ZSTD_adjustCParams`), both answering as libzstd does; `zstd.limits`
+holds the parameter bounds (`ZSTD_WINDOWLOG_MAX` ...), and
+`zstd.version_number` (10507) / `zstd.version_string` ("1.5.7") the libzstd
+release reproduced (`ZSTD_versionNumber`, `ZSTD_versionString`).
+
 Compressing with a dictionary — the same bytes as libzstd with the
 dictionary set the same way:
 
@@ -376,8 +435,8 @@ call fails instead. Errors: `ExternalSequencesInvalid`,
 `ParameterCombinationUnsupported` (a producer with LDM or workers). See
 SPEC.md, *Sequences*.
 
-Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `NoSpaceLeft`
-(`dst` below `compressBound`), `OutOfMemory`, and with a dictionary
+Errors: `LevelUnsupported` (level > 22), `ParameterOutOfBound`, `DstSizeTooSmall`
+(the frame does not fit in `dst`, libzstd's `dstSize_tooSmall`), `OutOfMemory`, and with a dictionary
 `DictionaryCorrupted`, `DictionaryWrong`, `DictAttachUnsupported`. There is no input size limit: past 3500 MiB
 the indices are rescaled as libzstd does (the whole input still has to be in
 memory, and so does its `compressBound`).
@@ -532,6 +591,20 @@ libzstd's, or failing with libzstd's error (`src/testdata/seq_goldens.zig`,
 `src/context_test.zig` pins the estimates (exact, and the largest for an
 unknown size), a static workspace's bound, the workspace being replaced
 when too small or long too big, and indexing restarting near its limit.
+`src/dctx_test.zig` does it for the decoder (a workspace of each estimate
+decodes, one byte less does not, over the window and block-size grid),
+and pins `max_block_size` against libzstd: 240 verdicts and buffer sizes
+on libzstd-made frames (`src/testdata/mbs_kats.zig`,
+`tools/gen-mbs-kats.sh`), and `copyFrom`.
+
+`src/copy_test.zig` does it for the buffer-less API and `copyFrom`: 28 call
+plans (every `begin`, dictionaries loaded, copied, attached, reloaded,
+long-distance matching, sizes right, unknown, 0 and wrong, too little
+room), each copy's and the original's frame or error equal to libzstd's
+(`src/testdata/copy_goldens.zig`, `tools/zcopy.c`). `src/mt_test.zig` runs
+the multithreaded goldens on shared thread pools too, smaller and larger
+than `nb_workers`, posted to from three threads at once, and on a pool
+running on a `std.Io.Threaded`.
 
 `src/fuzz_test.zig` round-trips arbitrary input through std's decoder and
 this one, and feeds the decoder arbitrary bytes one-shot, streamed and
