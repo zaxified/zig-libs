@@ -60,7 +60,8 @@
 //! responses — the request's Accept-Encoding admits gzip, the
 //! content-type is on the allowlist, the body is worth it — are
 //! compressed transparently (handler code unchanged), **streaming**:
-//! handler bytes → `std.compress.flate` gzip encoder → the existing
+//! handler bytes → gzip encoder (`std.compress.flate` raw deflate, framed
+//! and CRC-32-checksummed by `gzip.Scratch`) → the existing
 //! chunked framing (an explicit Content-Length is dropped from the wire,
 //! like Go's gzip middleware / nginx — the byte count is still
 //! enforced). `Vary: Accept-Encoding` goes on every response while
@@ -2474,10 +2475,10 @@ pub const ResponseWriter = struct {
     const EncodedBody = struct {
         /// Chunked encoder the compressed bytes feed (owns `chunk_buf`).
         chunked: h1.ChunkedWriter,
-        /// Where the plain body goes: the flate encoder's writer (its state
+        /// Where the plain body goes: the gzip member's writer (its state
         /// lives in `gzip_scratch`), or what `Encoder.begin` returned.
         plain: *Writer,
-        /// Null: gzip, ended by `gzip_scratch.compress.finish`.
+        /// Null: gzip, ended by `gzip_scratch.finish`.
         encoder: ?Encoder,
         /// Plain-body bytes still owed against a declared Content-Length
         /// (enforced exactly like the identity sink, though the length
@@ -3312,20 +3313,16 @@ pub const ResponseWriter = struct {
         try rw.writeHead(.chunked);
         rw.body = .{ .encoded = .{
             .chunked = .init(rw.out, rw.chunk_buf),
-            .plain = &scratch.compress.writer,
+            .plain = undefined,
             .encoder = null,
             .plain_remaining = plain_remaining,
         } };
-        // Emits the 10-byte gzip container header — it lands in the
-        // chunked encoder's buffer, safely after the response head. The
-        // chunked writer must be at its final address by now (the
-        // encoder keeps a pointer to it).
-        try gzip.initCompress(
-            &scratch.compress,
+        // Emits the 10-byte gzip header — it lands in the chunked encoder's
+        // buffer, safely after the response head. The chunked writer must
+        // be at its final address by now (the encoder keeps a pointer to it).
+        rw.body.encoded.plain = try scratch.begin(
             &rw.body.encoded.chunked.writer,
-            &scratch.window,
-            .gzip,
-            gzip.levelOptions(rw.compression.?.level),
+            rw.compression.?.level,
         );
     }
 
@@ -3345,7 +3342,7 @@ pub const ResponseWriter = struct {
                 rw.failed = true;
                 return e;
             };
-        } else try rw.gzip_scratch.?.compress.finish();
+        } else try rw.gzip_scratch.?.finish();
         try rw.finishChunked(&g.chunked);
     }
 

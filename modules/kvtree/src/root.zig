@@ -51,7 +51,7 @@ pub const meta = .{
     // design). Reader/writer coordination safety = the gated reclaim invariant.
     .concurrency = .single_owner,
     .model_after = "LMDB / BoltDB (COW B-tree, meta double-buffer); VOPR = TigerBeetle",
-    .deps = .{"kv"},
+    .deps = .{ "kv", "crc32" },
 };
 
 const format = @import("format.zig");

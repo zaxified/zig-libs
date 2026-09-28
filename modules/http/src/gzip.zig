@@ -8,12 +8,13 @@
 //! compressing (`min_size`).
 //!
 //! This file owns the pure, offline-testable pieces — negotiation,
-//! eligibility and configuration; the wire-side integration (routing the
-//! response body through `std.compress.flate` into the chunked framing)
-//! lives in `Server.zig`'s `ResponseWriter`.
+//! eligibility, configuration and the gzip member itself (`Scratch.begin` /
+//! `Scratch.finish`); the wire-side integration (routing the response body
+//! into the chunked framing) lives in `Server.zig`'s `ResponseWriter`.
 
 const std = @import("std");
 const flate = std.compress.flate;
+const crc32 = @import("crc32");
 
 /// Configuration for negotiated gzip response compression
 /// (`Server.Options.compression`; null there = off, `.{}` = these safe
@@ -52,9 +53,86 @@ pub const default_content_types = [_][]const u8{
 /// zlib's deflate_state). The serving loop allocates one per connection
 /// while compression is enabled; the `ResponseWriter` re-initializes it
 /// per response, so the owner only provides the memory (no init/deinit).
+///
+/// One gzip member (RFC 1952) is `begin` → writes into the returned writer →
+/// `finish`. The deflate stream is std's (`flate.Compress`, `.raw`); the
+/// 10-byte header and the CRC-32/ISIZE trailer are written here, byte for
+/// byte what std's `.gzip` container writes, with the CRC from the `crc32`
+/// module — std's container CRCs the plain bytes one table lookup at a time,
+/// about 14 % of deflate's time at 16 KiB.
 pub const Scratch = struct {
     compress: flate.Compress,
     window: [flate.max_window_len]u8,
+    /// The plain side of the current member; set by `begin`.
+    member: Member = undefined,
+
+    /// Start a gzip member into `output`: the gzip header, then a raw
+    /// deflate stream at `level` (as `levelOptions`). The plain body goes to
+    /// the returned writer, which stays valid until `finish`. `output` must
+    /// stay at its address until then (the encoder keeps a pointer to it) and
+    /// have a buffer of more than 8 bytes.
+    pub fn begin(s: *Scratch, output: *std.Io.Writer, level: u4) std.Io.Writer.Error!*std.Io.Writer {
+        try output.writeAll(flate.Container.gzip.header());
+        try initCompress(&s.compress, output, &s.window, .raw, levelOptions(level));
+        s.member = .{ .writer = .{ .buffer = &.{}, .vtable = &Member.vtable }, .crc = 0, .size = 0 };
+        return &s.member.writer;
+    }
+
+    /// End the member: the deflate tail, then CRC-32 and ISIZE (the plain
+    /// length mod 2^32), both little-endian. `output` itself is not flushed.
+    pub fn finish(s: *Scratch) std.Io.Writer.Error!void {
+        try s.compress.finish();
+        s.member.writer = .failing;
+        const out = s.compress.bit_writer.output;
+        try out.writeInt(u32, s.member.crc, .little);
+        try out.writeInt(u32, s.member.size, .little);
+    }
+};
+
+/// The writer in front of the deflate encoder: it has no buffer of its own,
+/// so every plain byte passes through `drain` exactly once, in order — which
+/// is what the trailer's CRC-32 and ISIZE must cover.
+pub const Member = struct {
+    writer: std.Io.Writer,
+    /// CRC-32 of the plain bytes so far.
+    crc: u32,
+    /// Plain bytes so far, mod 2^32 (RFC 1952 ISIZE).
+    size: u32,
+
+    const vtable: std.Io.Writer.VTable = .{ .drain = drain, .flush = flush };
+
+    fn scratch(w: *std.Io.Writer) *Scratch {
+        const m: *Member = @alignCast(@fieldParentPtr("writer", w));
+        return @alignCast(@fieldParentPtr("member", m));
+    }
+
+    fn take(m: *Member, bytes: []const u8) void {
+        m.crc = crc32.extend(m.crc, bytes);
+        m.size +%= @truncate(bytes.len);
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const s = scratch(w);
+        const inner = &s.compress.writer;
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |d| {
+            try inner.writeAll(d);
+            s.member.take(d);
+            n += d.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            try inner.writeAll(last);
+            s.member.take(last);
+        }
+        return n + last.len * splat;
+    }
+
+    /// A flush reaches the deflate encoder (a sync flush: everything so far
+    /// decodable), exactly as flushing `compress.writer` directly did.
+    fn flush(w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try scratch(w).compress.writer.flush();
+    }
 };
 
 /// `c.* = try flate.Compress.init(output, buffer, container, opts)`, built in
@@ -332,13 +410,106 @@ test "gzip round-trip through a Scratch (compress, then flate decompress)" {
 
     var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
     defer aw.deinit();
-    try initCompress(&scratch.compress, &aw.writer, &scratch.window, .gzip, levelOptions(6));
-    try scratch.compress.writer.writeAll(plain);
-    try scratch.compress.finish();
+    const w = try scratch.begin(&aw.writer, 6);
+    try w.writeAll(plain);
+    try scratch.finish();
     const compressed = aw.written();
     try testing.expect(compressed.len < plain.len); // repetitive JSON shrinks
 
     var in: std.Io.Reader = .fixed(compressed);
+    var dc: flate.Decompress = .init(&in, .gzip, &.{});
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    _ = try dc.reader.streamRemaining(&out.writer);
+    try testing.expectEqualStrings(plain, out.written());
+    // std's decoder reads the trailer but does not check it; check it here.
+    try testing.expectEqual(std.hash.Crc32.hash(plain), dc.container_metadata.gzip.crc);
+    try testing.expectEqual(@as(u32, plain.len), dc.container_metadata.gzip.count);
+}
+
+/// The gzip member std's `.gzip` container produces for `plain` written in
+/// `pieces`-sized writes — the output this module's encoder must reproduce.
+fn stdGzip(gpa: std.mem.Allocator, plain: []const u8, level: u4, piece: usize) ![]u8 {
+    const s = try gpa.create(Scratch);
+    defer gpa.destroy(s);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    errdefer aw.deinit();
+    try initCompress(&s.compress, &aw.writer, &s.window, .gzip, levelOptions(level));
+    var at: usize = 0;
+    while (at < plain.len) : (at += piece) try s.compress.writer.writeAll(plain[at..@min(plain.len, at + piece)]);
+    try s.compress.finish();
+    return aw.toOwnedSlice();
+}
+
+test "Scratch.begin/finish: byte-identical to std's .gzip container, and it round-trips" {
+    // The same deflate encoder in both; only the container differs (std's
+    // hashes inside flate, ours in `Member`), so the bytes must match for
+    // any input, level and write pattern.
+    const gpa = testing.allocator;
+    const scratch = try gpa.create(Scratch);
+    defer gpa.destroy(scratch);
+
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(gpa);
+    var i: usize = 0;
+    while (json.items.len < 16 * 1024) : (i += 1)
+        try json.print(gpa, "{{\"id\":{d},\"name\":\"item-{d}\",\"tags\":[\"a\",\"b\"],\"ok\":{}}},", .{ i, i * 7, i % 3 == 0 });
+    const noise = try gpa.alloc(u8, 100_000);
+    defer gpa.free(noise);
+    var prng = std.Random.DefaultPrng.init(42);
+    prng.random().bytes(noise);
+
+    const inputs = [_][]const u8{ "", "a", "hello, gzip", json.items, noise };
+    for (inputs) |plain| {
+        for ([_]u4{ 1, 6, 9 }) |level| {
+            for ([_]usize{ 1 << 30, 1000, 7 }) |piece| {
+                if (piece == 7 and plain.len > 20_000) continue; // byte-dribbling 100 KB is slow in Debug
+                const want = try stdGzip(gpa, plain, level, piece);
+                defer gpa.free(want);
+
+                var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+                defer aw.deinit();
+                const w = try scratch.begin(&aw.writer, level);
+                var at: usize = 0;
+                while (at < plain.len) : (at += piece) try w.writeAll(plain[at..@min(plain.len, at + piece)]);
+                try scratch.finish();
+                try testing.expectEqualSlices(u8, want, aw.written());
+
+                // And the trailer is the CRC-32 and length of the plain bytes.
+                const got = aw.written();
+                try testing.expectEqual(std.hash.Crc32.hash(plain), std.mem.readInt(u32, got[got.len - 8 ..][0..4], .little));
+                try testing.expectEqual(@as(u32, @truncate(plain.len)), std.mem.readInt(u32, got[got.len - 4 ..][0..4], .little));
+
+                var in: std.Io.Reader = .fixed(got);
+                var dc: flate.Decompress = .init(&in, .gzip, &.{});
+                var out: std.Io.Writer.Allocating = .init(gpa);
+                defer out.deinit();
+                _ = try dc.reader.streamRemaining(&out.writer);
+                try testing.expectEqualSlices(u8, plain, out.written());
+            }
+        }
+    }
+}
+
+test "Scratch.begin: splatted and vectored writes are counted once each" {
+    const gpa = testing.allocator;
+    const scratch = try gpa.create(Scratch);
+    defer gpa.destroy(scratch);
+    var aw: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+    defer aw.deinit();
+    const w = try scratch.begin(&aw.writer, 6);
+    var splat = [_][]const u8{ "head-", "ab" };
+    try w.writeSplatAll(&splat, 5); // "head-ababababab"
+    var vec = [_][]const u8{ "x", "", "yz" };
+    try w.writeVecAll(&vec);
+    try w.flush(); // a sync flush mid-member is legal and changes nothing decoded
+    try w.writeAll("tail");
+    try scratch.finish();
+    const plain = "head-abababababxyztail";
+    const got = aw.written();
+    try testing.expectEqual(std.hash.Crc32.hash(plain), std.mem.readInt(u32, got[got.len - 8 ..][0..4], .little));
+    try testing.expectEqual(@as(u32, plain.len), std.mem.readInt(u32, got[got.len - 4 ..][0..4], .little));
+    var in: std.Io.Reader = .fixed(got);
     var dc: flate.Decompress = .init(&in, .gzip, &.{});
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();

@@ -5,6 +5,15 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Faster gzip, same bytes.** Response compression now runs std's deflate in
+  its `.raw` container and writes the gzip header and CRC-32/ISIZE trailer itself
+  (`Scratch.begin` / `Scratch.finish`, new), with the CRC from the new `crc32` module instead of
+  std's bytewise CRC (~14 % of deflate time at 16 KiB). The output is byte-identical to the old
+  `.gzip`-container encoder (tested over inputs, levels and write patterns). `Scratch` gains a
+  `member` field; code that drove `scratch.compress` with `initCompress(…, .gzip, …)` directly
+  still works unchanged. New dependency: `crc32`. The inbound decoder is untouched: std's
+  `flate.Decompress` never verified the gzip CRC, so there was nothing to speed up there.
+
 - **2026-09-28** — **Fix: `Options.inline_blocking` now keeps name resolution on the calling
   thread too** (found by qap). std's `HostName.connect` starts the lookup and the connects as
   tasks of the `Io`, so with `std.Io.Threaded` they ran on the pool — outside a per-thread sandbox
