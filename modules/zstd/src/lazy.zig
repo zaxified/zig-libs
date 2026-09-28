@@ -1048,7 +1048,7 @@ inline fn countDms(w: Base, d: Base, p_in: usize, p_match: usize, i_end: usize, 
     var n: usize = 0;
     if (v_end > p_in) {
         const len = v_end - p_in;
-        n = std.mem.indexOfDiff(u8, w.bytes(p_in, v_end), d.bytes(p_match, p_match + len)) orelse len;
+        n = match.countRuns(w.bytes(p_in, v_end), d.bytes(p_match, p_match + len));
     }
     if (p_match + n != m_end) return n;
     return n + w.count(p_in + n, i_start, i_end);

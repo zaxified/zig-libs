@@ -173,18 +173,14 @@ pub const MatchState = struct {
     pub fn countInDict(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
         const n = p_limit - p_in;
-        const a = ms.dict[p_in - ms.dict_base ..][0..n];
-        const b = ms.dict[p_match - ms.dict_base ..][0..n];
-        return std.mem.indexOfDiff(u8, a, b) orelse n;
+        return countRuns(ms.dict[p_in - ms.dict_base ..][0..n], ms.dict[p_match - ms.dict_base ..][0..n]);
     }
 
     /// `ZSTD_count` with the match side in the extDict.
     fn countDict(ms: *const MatchState, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
         const n = p_limit - p_in;
-        const a = ms.src[p_in - ms.src_base ..][0..n];
-        const b = ms.dict[p_match - ms.dict_base ..][0..n];
-        return std.mem.indexOfDiff(u8, a, b) orelse n;
+        return countRuns(ms.src[p_in - ms.src_base ..][0..n], ms.dict[p_match - ms.dict_base ..][0..n]);
     }
 
     /// `ZSTD_count`: length of the common run at `p_in` and `p_match`,
@@ -415,6 +411,24 @@ pub fn reduceTable(table: []u32, reducer: u32, preserve_mark: bool) void {
     }
 }
 
+/// `ZSTD_count` over two runs of equal length that lie in different
+/// segments (the prefix against the extDict or an attached `CDict`, as
+/// `ZSTD_count_2segments` counts to `vEnd`): how many leading bytes agree,
+/// compared 8 at a time as `ZSTD_count` does, then byte by byte. Neither
+/// run is read past its end -- the 8-byte reads stop where `ZSTD_count`'s
+/// stop, at `pInLoopLimit`.
+pub inline fn countRuns(in: []const u8, m: []const u8) usize {
+    std.debug.assert(in.len == m.len);
+    const n = in.len;
+    var i: usize = 0;
+    while (i + 8 <= n) : (i += 8) {
+        const d = std.mem.readInt(u64, in[i..][0..8], .little) ^ std.mem.readInt(u64, m[i..][0..8], .little);
+        if (d != 0) return i + (@ctz(d) >> 3);
+    }
+    while (i < n and in[i] == m[i]) i += 1;
+    return i;
+}
+
 /// libzstd's `window.base` for the prefix: index `i` is the byte at
 /// `addr + i`. The match finders' inner loops read through it rather than
 /// through `MatchState.src`, whose fields the compiler must reload after
@@ -468,7 +482,7 @@ pub const Base = struct {
         var n: usize = 0;
         if (v_end > p_in) {
             const len = v_end - p_in;
-            n = std.mem.indexOfDiff(u8, b.ptr(p_in, len)[0..len], b.dictPtr(p_match, len)[0..len]) orelse len;
+            n = countRuns(b.ptr(p_in, len)[0..len], b.dictPtr(p_match, len)[0..len]);
         }
         if (p_match + n != m_end) return n;
         return n + b.count(p_in + n, i_start, i_end);
@@ -501,7 +515,7 @@ pub const Base = struct {
     pub inline fn countInDict(b: Base, p_in: usize, p_match: usize, p_limit: usize) usize {
         if (p_limit <= p_in) return 0;
         const n = p_limit - p_in;
-        return std.mem.indexOfDiff(u8, b.dictPtr(p_in, n)[0..n], b.dictPtr(p_match, n)[0..n]) orelse n;
+        return countRuns(b.dictPtr(p_in, n)[0..n], b.dictPtr(p_match, n)[0..n]);
     }
     /// `ZSTD_hashPtr` for `mls` in 4..8.
     pub inline fn hash(b: Base, idx: usize, h_bits: u32, comptime mls: u32) usize {
@@ -1434,7 +1448,7 @@ fn countAcrossDict(w: Base, dms: *const MatchState, p_in: usize, p_match: usize,
     var n: usize = 0;
     if (v_end > p_in) {
         const len = v_end - p_in;
-        n = std.mem.indexOfDiff(u8, w.bytes(p_in, v_end), dms.bytes(p_match, p_match + len)) orelse len;
+        n = countRuns(w.bytes(p_in, v_end), dms.bytes(p_match, p_match + len));
     }
     if (p_match + n != m_end) return n;
     return n + w.count(p_in + n, i_start, i_end);
@@ -1901,4 +1915,22 @@ test "current_max matches libzstd's ZSTD_CURRENT_MAX for this target's usize wid
     // formula, so a change to one side cannot silently agree with itself.
     const want: u32 = if (@sizeOf(usize) == 4) 2000 << 20 else 3500 << 20;
     try std.testing.expectEqual(want, current_max);
+}
+
+test "countRuns counts the common head of two runs, at every length and every first difference" {
+    // runs of 0..40 bytes (the word loop, its tail, and both), differing
+    // at each position or nowhere; the answer is the byte loop's
+    var a: [40]u8 = undefined;
+    for (&a, 0..) |*x, i| x.* = @truncate(i *% 37 +% 11);
+    var b = a;
+    for (0..a.len + 1) |n| {
+        try std.testing.expectEqual(n, countRuns(a[0..n], b[0..n]));
+        for (0..n) |d| {
+            b[d] ^= 0x80;
+            try std.testing.expectEqual(d, countRuns(a[0..n], b[0..n]));
+            b[d] = a[d] ^ @as(u8, 1) << @as(u3, @intCast(d % 8)); // a one-bit difference
+            try std.testing.expectEqual(d, countRuns(a[0..n], b[0..n]));
+            b[d] = a[d];
+        }
+    }
 }

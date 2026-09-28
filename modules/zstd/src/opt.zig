@@ -478,9 +478,7 @@ fn count2SegmentsDms(ms: *const MatchState, dms: *const MatchState, p_in: usize,
     var match_length: usize = 0;
     if (v_end > p_in) {
         const n = v_end - p_in;
-        const a = ms.src[p_in - ms.src_base ..][0..n];
-        const b = dms.src[p_match - dms.src_base ..][0..n];
-        match_length = std.mem.indexOfDiff(u8, a, b) orelse n;
+        match_length = match.countRuns(ms.src[p_in - ms.src_base ..][0..n], dms.src[p_match - dms.src_base ..][0..n]);
     }
     if (p_match + match_length != m_end) return match_length;
     return match_length + ms.count(p_in + match_length, i_start, i_end);

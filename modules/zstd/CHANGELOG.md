@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Faster with a dictionary, the same bytes (Z32): match
+  lengths into a dictionary (extDict or an attached `CDict`) are counted 8
+  bytes at a time, as without one -- level 9 with a reused `CDict` from
+  1.14–1.43× libzstd's instructions to 1.04–1.09×.
 - **2026-09-28** — The decoder in a caller's memory, with exact sizes
   (Z25): `Decompressor.initStatic` / `DecompressStream.initStatic`
   (`ZSTD_initStaticDCtx`/`DStream`, in a `zstd.Workspace`, never
