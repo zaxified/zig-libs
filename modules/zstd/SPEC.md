@@ -2792,6 +2792,28 @@ frames went from 1.50× to 1.27× libzstd's cycles, 4 KB from 1.33× to
 `huf_dec.readDTableX1`). `fill.zig` goes when Zig's `memset` is
 vectorised (upstream, after 0.16).
 
+Z32 (2026-09-28) found more of the same, per call rather than per block:
+Zig 0.16 lowers `var x: ?T = null` for a large `T`, and any `.{}` whose
+field defaults include an `undefined` or a zero array, to a `memset` of the
+whole value -- checked in the generated code; an explicit
+`.{ .field = undefined }` is not cleared. `Compressor.compress` cleared its
+5.8 KB local-`CDict` slot on every call (`frame.LocalCDict` now), `begin`
+the `btopt` frequency tables (1.5 KB; `rescaleFreqs` writes them on the
+first block, as libzstd's), and every Huffman table header its FSE table
+(1.4 KB). With Z19's method (below: `oui.csv` and `validusage.json`
+records, one reused context, `Compressor.compress` against
+`ZSTD_compress2`, no dictionary), port ÷ libzstd cycles / instructions,
+before → after, ranges over the two inputs:
+
+| level | 100 B | 1 KB |
+|---|---|---|
+| 1 | 1.63–1.71 / 1.21–1.28 → 1.03–1.06 / 0.89–0.91 | 1.38–1.44 / 1.07–1.10 → 1.08–1.17 / 0.93 |
+| 3 | 1.65–1.78 / 1.19–1.24 → 1.06–1.11 / 0.88–0.90 | 1.44–1.55 / 1.03–1.06 → 1.15–1.33 / 0.91 |
+| 19 | 1.41–1.54 / 1.17–1.24 → 1.20–1.37 / 1.05–1.10 | 0.99–1.10 / 0.95–1.02 → 1.00–1.07 / 0.94–1.01 |
+
+1 MB records at levels 1, 3 and 19: the same instructions before and after
+(±0.1 %).
+
 What is left above 1.0×: a few percent of instructions in `fast`'s search
 loop and `btopt`'s (levels 13–16, 1.13–1.15× instructions at equal
 cycles). The entropy stage (literals, sequences) already costs what
@@ -2817,7 +2839,9 @@ compression cases, both builds), every decoded record equal to its
 input, every trained dictionary equal to libzstd's.
 
 Compression, port ÷ libzstd, cycles / instructions, native build; each
-cell the range over the two inputs and the two dictionaries:
+cell the range over the two inputs and the two dictionaries (Z19's
+numbers; the forced copy and `.raw` after Z32 are under **Z32, clearing**
+below):
 
 | call, level | 100 B | 1 KB | 4 KB | 16 KB |
 |---|---|---|---|---|
@@ -2888,24 +2912,29 @@ equalled its single-threaded one on these inputs too.
   an attached `CDict` at level 9 (`lazy.rowFindBestMatchT`, 77 % of the
   cycles against libzstd's 74 % in `ZSTD_RowFindBestMatch_dictMatchState`)
   is that byte compare: 1.44–1.59×.
-- **`Compressor.compress` clears 5.8 KB byte by byte on every call**:
-  `var local: ?CDict = null` (`frame.Compressor.compressFrame`, and
-  `root.Compressor.compressMt`) becomes a `compiler_rt.memset` of the whole
-  optional (Z21's non-vectorised `memset`), with a dictionary or without:
-  24–29 % of the cycles for 100 B records through `.cdict`, and without
-  any dictionary 100 B records at level 1 take 1.59× libzstd's cycles
-  (`ZSTD_compress2`), `compiler_rt.memset` 36 % of them.
-- **The copy path clears the 3-byte hash table with `@memset`**
-  (`resetByCopyingCDict`, `ZSTD_resetCCtx_byCopyingCDict` uses `memset`
-  too, but glibc's): 52–60 % of the cycles at level 19 for 100 B (libzstd
-  9 %), the 7× instructions. Copying the tables is `compiler_rt.memcpy`
-  against glibc's AVX `memmove`, and the tagged tables' `>> 8` is the same
-  work as libzstd's.
-- **A new `CDict` clears its tables with `@memset`** (`CDict.create`, the
-  row tag table on load): half of the cycles of `.raw` each call at level 9
-  (libzstd: `memset` 6.5 %). Its wall time is 2–4× libzstd's against
-  1.6–2.6× in cycles: `smp_allocator` maps a CDict's tables fresh on every
-  call (page faults, kernel time), where glibc reuses the freed block.
+- ~~**`Compressor.compress` clears 5.8 KB byte by byte on every call**~~
+  (closed by Z32, below): `var local: ?CDict = null`
+  (`frame.Compressor.compressFrame`, and `root.Compressor.compressMt`)
+  became a `compiler_rt.memset` of the whole optional (Z21's non-vectorised
+  `memset`), with a dictionary or without: 24–29 % of the cycles for 100 B
+  records through `.cdict`, and without any dictionary 100 B records at
+  level 1 took 1.59× libzstd's cycles (`ZSTD_compress2`),
+  `compiler_rt.memset` 36 % of them.
+- ~~**The copy path clears the 3-byte hash table with `@memset`**~~ (closed
+  by Z32): `resetByCopyingCDict`; `ZSTD_resetCCtx_byCopyingCDict` uses
+  `memset` too, but glibc's: 52–60 % of the cycles at level 19 for 100 B
+  (libzstd 9 %), the 7× instructions. Also closed: the tagged tables' `>> 8`
+  (`copyCDictTable`) ran scalar where gcc vectorises libzstd's loop -- 2×
+  libzstd's cycles for 100 B at levels 1–3. Copying the untagged tables is
+  still `compiler_rt.memcpy` against glibc's `rep movsb` (below).
+- ~~**A new `CDict` clears its tables with `@memset`**~~ (closed by Z32):
+  `CDict.create`, the row tag table on load, half of the cycles of `.raw`
+  each call at level 9 (libzstd: `memset` 6.5 %). libzstd clears the same
+  (`ZSTD_reset_matchState` with `ZSTDcrp_makeClean`, the tag table again in
+  `ZSTD_loadDictionaryContent`); the port now clears through `fill.zig`.
+  The wall time stays above the cycles: `smp_allocator` maps a CDict's
+  tables fresh on every call (page faults, kernel time), where glibc reuses
+  the freed block.
 - **`fillHashTableFor`** (a dictionary loaded into the context at levels
   1–2, `compressUsingDict`: 88–94 % of the time on both sides) runs ~1.8×
   libzstd's `ZSTD_fillHashTableForCCtx`: `min_match` is switched through
@@ -2919,6 +2948,30 @@ equalled its single-threaded one on these inputs too.
   in the noise from 4 KB. A raw-content `DDict` has no tables: 0.9–1.2×.
 
 None of these changes a byte. Closing them is Z32.
+
+**Z32, clearing** (2026-09-28): the three struck items above, measured as
+Z19 but with the raw-content dictionary only (the training half's last
+110 KB), min of 7 runs interleaved with libzstd, every frame byte-identical
+to libzstd's before it was timed. Port ÷ libzstd cycles / instructions,
+before → after, ranges over the two inputs:
+
+| call, level | 100 B | 1 KB |
+|---|---|---|
+| `CDict` forced copy, 1 | 2.12–2.37 / 1.71–1.84 → 0.95–0.96 / 0.84 | |
+| 3 | 2.04–2.11 / 2.16–2.18 → 0.96–0.98 / 0.70 | |
+| 9 | 1.29–1.30 / 2.54–2.77 → 1.22 / 2.36–2.57 | |
+| 19 | 2.92–3.09 / 5.57–6.47 → 1.21 / 2.32–2.47 | 1.42–1.64 / 1.36–1.56 → 1.08–1.10 / 1.16–1.20 |
+| `.raw` each call, 1 | 1.60 / 1.46–1.48 → 1.37–1.46 / 1.40–1.41 | 1.67 / 1.43–1.46 → 1.42–1.43 / 1.37–1.40 |
+| 3 | 1.66–1.74 / 1.36–1.37 → 1.26–1.27 / 1.13–1.14 | |
+| 9 | 1.66–1.78 / 1.42 → 1.08–1.14 / 1.04–1.05 | |
+| 19 | 1.06–1.08 / 1.29–1.31 → 1.01–1.02 / 1.25 | |
+
+What is left there: the forced copy at levels 9 and 19 is the tables'
+copy (`compiler_rt.memcpy.memcpyFast`, 79 % at level 9, against glibc's
+`rep movsb`, 72 %: the instructions, not the cycles) and, at 19, clearing
+the 512 KB 3-byte hash table in 32-byte stores against glibc's `rep stosb`;
+`.raw` at levels 1–2 is `fillHashTableFor` (above), the rest page faults.
+The no-dictionary numbers are in *Small frames* above.
 
 ## Portability
 
@@ -3456,12 +3509,18 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
 - **Z32 — The speed gaps Z19 found** (*Speed*, "Dictionaries"; none
   changes a byte): count dictionary-side match lengths 8 bytes at a time
   like `count` (`countDict`, `countInDict`, `Base.count2Segments`,
-  `lazy.countDms`, `countAcrossDict`, `opt.count2SegmentsDms`); keep
-  `Compressor.compress`'s local `?CDict` from being cleared on every call
-  (it costs small frames without a dictionary too); clear through
+  `lazy.countDms`, `countAcrossDict`, `opt.count2SegmentsDms`);
+  ~~keep `Compressor.compress`'s local `?CDict` from being cleared on every
+  call (it costs small frames without a dictionary too); clear through
   `fill.zig` what is still `@memset` per frame or per `CDict`
   (`resetByCopyingCDict`'s 3-byte hash table, `CDict.create`'s tables and
-  tag table); `fillHashTableFor` specialised on `min_match` and the table
+  tag table)~~ -- done 2026-09-28 (*Speed*, *Small frames* and **Z32,
+  clearing**), with the `btopt` frequency tables, the Huffman header's FSE
+  table and the copy path's tag shift (vectorised); left in `opt.zig`,
+  byte-wise per frame at `btopt` and up: `rescaleFreqs`' `@memset` of
+  `lit_freq` (1 KB) and `initStatsUltra`'s of the three tables (`btultra2`,
+  every frame's first block over 8 bytes; libzstd's `ZSTD_initStats_ultra`
+  moves the window instead of clearing); `fillHashTableFor` specialised on `min_match` and the table
   kind, on a `match.Base`; the decoder pointing at a `DDict`'s entropy
   tables instead of copying them each frame. Re-measure with Z19's method.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`

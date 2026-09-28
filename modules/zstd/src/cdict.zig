@@ -27,6 +27,7 @@ const frame = @import("frame.zig");
 const huf = @import("huf.zig");
 const fse = @import("fse.zig");
 const sequences = @import("sequences.zig");
+const fill = @import("fill.zig");
 const dbits = @import("dbits.zig");
 
 /// `ZSTD_dictContentType_e`.
@@ -281,7 +282,7 @@ pub fn loadDictionaryContent(ms: *match.MatchState, ls: ?*ldm.State, content: []
             std.debug.assert(ms.chain_table.len != 0);
             lazy.ddsLoadDictionary(ms, iend - match.hash_read_size);
         } else if (ms.use_row) {
-            @memset(ms.tag_table, 0);
+            fill.bytes(ms.tag_table, 0);
             lazy.rowUpdateDictionary(ms, iend - match.hash_read_size);
         } else {
             lazy.insertDictionary(ms, iend - match.hash_read_size);
@@ -441,12 +442,17 @@ pub const CDict = struct {
 
         const owned: ?[]u8 = if (copy and dict.len != 0) try gpa.dupe(u8, dict) else null;
         errdefer if (owned) |o| gpa.free(o);
+        // ZSTD_reset_matchState(..., ZSTDcrp_makeClean, ...,
+        // ZSTD_resetTarget_CDict) clears the tables and the tag table (the
+        // dictionary fills only some slots; the rest must read as index 0),
+        // word-wise here (Z32: `@memset` was half the cycles of a `CDict`
+        // per call at level 9)
         const tables = try gpa.alloc(u32, hash_len + chain_len);
         errdefer gpa.free(tables);
-        @memset(tables, 0);
+        fill.zero(u32, tables);
         const tag_table = try gpa.alloc(u8, t.tag_len);
         errdefer gpa.free(tag_table);
-        @memset(tag_table, 0);
+        fill.bytes(tag_table, 0);
 
         var cd: CDict = .{
             .gpa = gpa,

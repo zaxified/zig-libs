@@ -17,6 +17,7 @@ const superblock = @import("superblock.zig");
 const cdict_mod = @import("cdict.zig");
 const CDict = cdict_mod.CDict;
 const seqapi = @import("seqapi.zig");
+const fill = @import("fill.zig");
 pub const SequenceProducer = seqapi.SequenceProducer;
 
 /// What a one-shot frame can fail with; `error.DstSizeTooSmall` (in
@@ -515,6 +516,28 @@ pub const RawDict = struct {
     content_type: cdict_mod.ContentType = .auto,
 };
 
+/// `localDict.cdict`: the `CDict` a context makes of a `.raw` dictionary on
+/// first use (`ZSTD_initLocalDict`), kept by the caller for the frames
+/// after. Not a `?CDict`: Zig 0.16 stores `null` into an optional of a
+/// large payload by clearing all of it, and `compiler_rt.memset` does that
+/// a byte at a time -- 5.8 KB on every `Compressor.compress`, with no
+/// dictionary too (Z32). Start one as `.{ .cdict = undefined, .made =
+/// false }`: then only `made` is written, and `cdict` is read only when
+/// `made` says it holds one. (No field defaults on purpose: `.{}` from
+/// defaults, even an `undefined` one, is lowered to the same clearing
+/// `memset` of the whole struct in Zig 0.16 -- checked in the generated
+/// code -- while the explicit `undefined` is not.)
+pub const LocalCDict = struct {
+    cdict: CDict,
+    made: bool,
+
+    /// Free the `CDict`, if one was made; `l` is empty after.
+    pub fn deinit(l: *LocalCDict) void {
+        if (l.made) l.cdict.deinit();
+        l.made = false;
+    }
+};
+
 /// `ZSTD_USE_CDICT_PARAMS_SRCSIZE_CUTOFF`, `ZSTD_USE_CDICT_PARAMS_DICTSIZE_MULTIPLIER`:
 /// up to 128 KB of input, or six times the dictionary, a `CDict` is used
 /// with its own tables (attached or copied); above, a CDict with a level is
@@ -815,8 +838,8 @@ pub const Compressor = struct {
     /// holds a partial frame). `compressBound(src.len)` always suffices.
     pub fn compressFrame(comp: *Compressor, dst: []u8, src: []const u8, opts: Options) Error!usize {
         try opts.advanced.check();
-        var local: ?CDict = null;
-        defer if (local) |*l| l.deinit();
+        var local: LocalCDict = .{ .cdict = undefined, .made = false };
+        defer local.deinit();
         try comp.initStream2(opts, src.len, null, false, &local);
         return comp.finishFrame(dst, src, opts);
     }
@@ -1021,7 +1044,7 @@ pub const Compressor = struct {
     /// dictionary's size, then `ZSTD_compressBegin_internal`. `local` holds
     /// the context's own `CDict` for a `.raw` dictionary, made on first use
     /// and kept by the caller for the frames after.
-    pub fn initStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, buffered: bool, local: *?CDict) BeginError!void {
+    pub fn initStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, buffered: bool, local: *LocalCDict) BeginError!void {
         const s = try comp.setupStream2(opts, pledged, size_hint, local);
         try comp.beginInternal(s.prefix, s.cdict, s.cp, pledged, s.opts, buffered);
         // the external sequences' offsets may reach into a CDict's content
@@ -1041,7 +1064,7 @@ pub const Compressor = struct {
 
     /// The first half of `initStream2`, which multithreaded compression
     /// shares (it hands the frame to its jobs instead of beginning it here).
-    pub fn setupStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, local: *?CDict) BeginError!StreamSetup {
+    pub fn setupStream2(comp: *Compressor, opts: Options, pledged: ?u64, size_hint: ?u32, local: *LocalCDict) BeginError!StreamSetup {
         const adv = opts.advanced;
         var level = opts.level;
         var cdict: ?*const CDict = null;
@@ -1050,16 +1073,17 @@ pub const Compressor = struct {
             .none => {},
             // 0 bytes are no dictionary (ZSTD_CCtx_loadDictionary, refPrefix)
             .raw => |r| if (r.bytes.len != 0) {
-                if (local.* == null) {
+                if (!local.made) {
                     const gpa = comp.gpa orelse return error.OutOfMemory;
                     // ZSTD_CCtx_loadDictionary copies the dictionary
                     // (ZSTD_dlm_byCopy) and ZSTD_initLocalDict digests that
                     // copy: the window must not end in the caller's memory,
                     // or an input placed right after the dictionary would
                     // continue it (one segment instead of an extDict).
-                    local.* = try CDict.initAdvanced(gpa, r.bytes, .{ .level = level, .content_type = r.content_type, .advanced = adv, .src_size_hint = size_hint });
+                    local.cdict = try CDict.initAdvanced(gpa, r.bytes, .{ .level = level, .content_type = r.content_type, .advanced = adv, .src_size_hint = size_hint });
+                    local.made = true;
                 }
-                cdict = &local.*.?;
+                cdict = &local.cdict;
             },
             .cdict => |c| {
                 // Let the cdict's compression level take priority over the
@@ -1146,8 +1170,10 @@ pub const Compressor = struct {
             @memcpy(ms.tag_table, cdict.ms.tag_table);
             ms.hash_salt = cdict.ms.hash_salt;
         }
-        // Zero the hashTable3, since the cdict never fills it
-        @memset(ms.hash_table3, 0);
+        // Zero the hashTable3, since the cdict never fills it (libzstd's
+        // `memset` too; this one word-wise, Z32: `@memset` here was 52-60 %
+        // of the cycles of a 100 B frame at level 19)
+        fill.zero(u32, ms.hash_table3);
         // copy dictionary offsets
         ms.src = cdict.ms.src;
         ms.src_base = cdict.ms.src_base;
@@ -1168,8 +1194,19 @@ pub const Compressor = struct {
     /// `ZSTD_copyCDictTableIntoCCtx`: a `fast`/`dfast` CDict's entries lose
     /// their tag.
     fn copyCDictTable(dst: []u32, src: []const u32, cdict_cp: params.CParams) void {
+        std.debug.assert(dst.len == src.len);
         if (params.cdictIndicesAreTagged(cdict_cp)) {
-            for (dst, src) |*d, t| d.* = t >> params.short_cache_tag_bits;
+            // In vectors by hand: LLVM left the plain loop scalar (it cannot
+            // tell the slices apart), where gcc vectorises libzstd's --
+            // 2x libzstd's cycles for a 100 B frame at levels 1-3 (Z32).
+            const V = @Vector(8, u32);
+            const shift: V = @splat(params.short_cache_tag_bits);
+            var i: usize = 0;
+            while (i + 8 <= dst.len) : (i += 8) {
+                const v: V = src[i..][0..8].*;
+                dst[i..][0..8].* = v >> shift;
+            }
+            for (dst[i..], src[i..]) |*d, t| d.* = t >> params.short_cache_tag_bits;
         } else @memcpy(dst, src);
     }
 
@@ -1277,7 +1314,20 @@ pub const Compressor = struct {
         const states = &slice(BlockState, ws, l.states, 2)[0..2].*;
         states.* = .{ .{}, .{} };
         const opt_state: ?*opt.State = if (@intFromEnum(cp.strategy) >= @intFromEnum(params.Strategy.btopt)) &slice(opt.State, ws, l.opt_state, 1)[0] else null;
-        if (opt_state) |p| p.* = .{ .compressed_literals = adv.literal_compression != .disable };
+        // ZSTD_invalidateMatchState: `litLengthSum` 0 forces a reset of the
+        // statistics. The frequency tables are left as they are (libzstd's
+        // too): the first block's `rescaleFreqs` writes all four whenever
+        // `lit_length_sum` is 0 (`lit_freq` only with compressed literals,
+        // the only case anything reads it), before any price is taken.
+        // Their `@splat(0)` defaults were a byte-wise `memset` of 1.5 KB
+        // for every frame at `btopt` and up (Z32).
+        if (opt_state) |p| p.* = .{
+            .compressed_literals = adv.literal_compression != .disable,
+            .lit_freq = undefined,
+            .lit_length_freq = undefined,
+            .match_length_freq = undefined,
+            .off_code_freq = undefined,
+        };
 
         // ZSTD_resetCCtx_internal: the LDM hash table, bucket offsets and
         // sequence buffer, and its own window from scratch
@@ -1535,8 +1585,8 @@ pub const Compressor = struct {
     /// little room is `error.DstSizeTooSmall` where libzstd says so.
     pub fn compressSequences(comp: *Compressor, dst: []u8, seqs: []const seqapi.Sequence, src: []const u8, opts: Options) SequenceError!usize {
         try opts.advanced.check();
-        var local: ?CDict = null;
-        defer if (local) |*l| l.deinit();
+        var local: LocalCDict = .{ .cdict = undefined, .made = false };
+        defer local.deinit();
         try comp.initStream2(opts, src.len, null, false, &local);
         const n = try comp.writeSeqFrameHeader(dst, src.len);
         var c_size = n;
@@ -1661,8 +1711,8 @@ pub const Compressor = struct {
     /// needs no such check.)
     pub fn compressSequencesAndLiterals(comp: *Compressor, dst: []u8, seqs: []const seqapi.Sequence, lits: []const u8, decompressed_size: usize, opts: Options) SequenceError!usize {
         try opts.advanced.check();
-        var local: ?CDict = null;
-        defer if (local) |*l| l.deinit();
+        var local: LocalCDict = .{ .cdict = undefined, .made = false };
+        defer local.deinit();
         try comp.initStream2(opts, decompressed_size, null, false, &local);
         // This mode is only compatible with explicit delimiters
         if (comp.c.seq.block_delimiters == .none) return error.FrameParameterUnsupported;

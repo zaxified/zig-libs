@@ -5,6 +5,16 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Faster small frames and dictionary set-up (Z32, the
+  same bytes): `Compressor.compress` no longer clears 5.8 KB per call, nor
+  `begin` the `btopt` statistics, nor each Huffman header its FSE table;
+  the copy path clears the 3-byte hash table word-wise and shifts the
+  tagged tables in vectors, and `CDict` creation clears word-wise. 100 B
+  frames without a dictionary at levels 1–3 take 1.03–1.11× libzstd's
+  cycles (were 1.63–1.78×), through a copied `CDict` 0.95–1.21× (were
+  2.0–3.1×), a `.raw` dictionary at level 9 1.08–1.14× (were 1.66–1.78×).
+  `frame.Compressor.initStream2` / `setupStream2` take a
+  `*frame.LocalCDict` instead of a `*?CDict` (module-internal callers).
 - **2026-09-28** — The decoder in a caller's memory, with exact sizes
   (Z25): `Decompressor.initStatic` / `DecompressStream.initStatic`
   (`ZSTD_initStaticDCtx`/`DStream`, in a `zstd.Workspace`, never

@@ -308,7 +308,7 @@ test "a copied CDict's tagged tables lose their tags" {
         defer cd.deinit();
         var comp: frame.Compressor = .initEmpty(gpa);
         defer comp.deinit();
-        var local: ?zstd.CDict = null;
+        var local: frame.LocalCDict = .{ .cdict = undefined, .made = false };
         try comp.initStream2(.{ .level = level, .checksum = false, .dict = .{ .cdict = &cd }, .advanced = .{ .force_attach_dict = .copy } }, 50000, null, false, &local);
         try std.testing.expectEqual(@as(u32, 1), comp.n_cdict_copies);
         for (comp.c.ms.hash_table, cd.ms.hash_table) |c, t| try std.testing.expectEqual(t >> 8, c);
@@ -389,7 +389,7 @@ test "a dedicated-search CDict: greedy..lazy2 only, bucketed, always attached" {
         try std.testing.expect(frame.shouldAttachDict(&cd, .{ .force_max_window = true }, 1));
         var comp: frame.Compressor = .initEmpty(gpa);
         defer comp.deinit();
-        var local: ?zstd.CDict = null;
+        var local: frame.LocalCDict = .{ .cdict = undefined, .made = false };
         try comp.initStream2(.{ .level = lw[0], .checksum = false, .dict = .{ .cdict = &cd }, .advanced = .{ .force_attach_dict = .copy } }, 1 << 20, null, false, &local);
         try std.testing.expectEqual(@as(u32, 0), comp.n_cdict_copies);
         try std.testing.expectEqual(@as(?*const match.MatchState, &cd.ms), comp.c.ms.dict_match_state);
