@@ -297,6 +297,15 @@ directly-exposed parser.
 
 ## Backlog / deferred
 
+- **Inbound gzip: verify the trailer** (found 2026-09-28 wiring `crc32` into `gzip.zig`). std's
+  `flate.Decompress` reads the gzip trailer but never checks its CRC-32 or ISIZE, so a request body
+  with a corrupt trailer is accepted as long as the deflate stream itself parses. zlib, Go's
+  `compress/gzip` and Python's `gzip` all refuse it (`ErrChecksum`). Fix: inflate `.raw`, parse
+  the RFC 1952 header ourselves (as the encoder now writes it), and check CRC-32 (`crc32.extend` over
+  the plain bytes as they are read) and ISIZE at the end, failing the body read. A behaviour change
+  (refuses bodies accepted today), so it lands behind `Compression.verify_inbound_trailer`, off
+  until a consumer asks.
+
 - ~~**Streaming multipart**~~ — **DONE 2026-09-27** (`multipart.Reader`, from qap M11.5b). The
   buffered `parse` needs the whole body in memory; `Reader` reads a `*std.Io.Reader` part by part,
   each part body a reader that ends at the next delimiter (Go's `mime/multipart.Reader` shape).
