@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `Stream.frameProgression` (`ZSTD_getFrameProgression`:
+  ingested, consumed, produced, flushed, and with workers the current job
+  and the active ones) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),
+  `zstd.FrameProgression`. First consumer: `zstd-cli`'s progress counter.
 - **2026-09-28** — **BEHAVIOURAL, not breaking:** `Dictionary.prefix` takes
   a `zstd.Prefix`, whose content type defaults to raw -- `ZSTD_CCtx_refPrefix`,
   as its documentation always said -- where it shared `.raw`'s `.auto`. The

@@ -450,6 +450,7 @@ pub const Stream = stream.Stream;
 pub const StreamOptions = stream.Options;
 pub const StreamError = stream.Error;
 pub const EndDirective = stream.EndDirective;
+pub const FrameProgression = stream.FrameProgression;
 pub const InBuffer = stream.InBuffer;
 pub const OutBuffer = stream.OutBuffer;
 pub const stream_max_level = stream.max_level;

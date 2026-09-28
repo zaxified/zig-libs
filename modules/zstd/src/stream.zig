@@ -19,6 +19,24 @@ const params = @import("params.zig");
 const cdict_mod = @import("cdict.zig");
 const zstdmt = @import("zstdmt.zig");
 
+/// `ZSTD_frameProgression`: how far the current frame (or, between frames,
+/// the last one) has got. Without workers `flushed` is `produced` and the
+/// last two are 0, as in libzstd.
+pub const FrameProgression = struct {
+    /// Input read and buffered.
+    ingested: u64,
+    /// Input actually compressed.
+    consumed: u64,
+    /// Compressed bytes made (the stream may still hold some of them).
+    produced: u64,
+    /// Compressed bytes written out (workers only; else `produced`).
+    flushed: u64,
+    /// Workers: the latest job started.
+    current_job_id: u32,
+    /// Workers: jobs compressing when asked.
+    nb_active_workers: u32,
+};
+
 pub const EndDirective = enum {
     /// Buffer the input; compress only full blocks (`ZSTD_e_continue`).
     @"continue",
@@ -132,6 +150,9 @@ pub const Stream = struct {
     /// Test seam, set before the first call: the workers' jobs run on the
     /// calling thread (`zstdmt.MtCtx.run_inline`); the bytes are the same.
     mt_run_inline: bool = false,
+    /// The current or last frame went to the workers
+    /// (`appliedParams.nbWorkers > 0`: not when its input was too small).
+    applied_mt: bool = false,
 
     /// Nothing is allocated until the first `compressStream2`, which knows
     /// whether that call ends the frame (and so the size).
@@ -232,6 +253,31 @@ pub const Stream = struct {
         return s.out_content - s.out_flushed; // remaining to flush
     }
 
+    /// `ZSTD_getFrameProgression`: may be asked at any time, from the
+    /// thread that drives the stream. With workers the numbers are a
+    /// snapshot of jobs still running.
+    pub fn frameProgression(s: *const Stream) FrameProgression {
+        if (s.applied_mt) if (s.mt) |m| return m.frameProgression();
+        const buffered = s.in_buff_pos - s.in_to_compress;
+        return .{
+            .ingested = s.comp.consumed + buffered,
+            .consumed = s.comp.consumed,
+            .produced = s.comp.produced,
+            // simplified; some data might still be left within the
+            // streaming output buffer
+            .flushed = s.comp.produced,
+            .current_job_id = 0,
+            .nb_active_workers = 0,
+        };
+    }
+
+    /// `ZSTD_toFlushNow`: with workers, the compressed bytes of the oldest
+    /// job not yet written out that could be written now; 0 without.
+    pub fn toFlushNow(s: *const Stream) usize {
+        if (s.applied_mt) if (s.mt) |m| return m.toFlushNow();
+        return 0;
+    }
+
     /// `ZSTD_setBufferExpectations`.
     fn setBufferExpectations(s: *Stream, output: *const OutBuffer, input: *const InBuffer) void {
         if (s.opts.advanced.stable_in_buffer) s.expected_in = .{ .ptr = input.src.ptr, .len = input.src.len, .pos = input.pos };
@@ -264,9 +310,11 @@ pub const Stream = struct {
             try s.mt.?.initFrame(setup, pledged);
             if (s.opts.dictionary == .prefix) s.opts.dictionary = .none;
             s.stage = .mt;
+            s.applied_mt = true;
             return;
         }
         try s.comp.initStream2(s.frameOptions(), pledged, s.opts.src_size_hint, true, &s.local_cdict);
+        s.applied_mt = false;
         // a prefix is single usage
         if (s.opts.dictionary == .prefix) s.opts.dictionary = .none;
         const block_size = s.comp.block_size_max;

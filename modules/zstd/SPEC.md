@@ -2889,9 +2889,10 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `ZSTD_d_maxBlockSize`, `ZSTD_copyCCtx` / `ZSTD_copyDCtx`, public
   `adjustCParams`, `ZSTD_versionNumber`. Done 2026-09-28 for `zstd-cli`:
   `getCParams` (`ZSTD_getCParams`) and `limits` (`ZSTD_WINDOWLOG_MAX` and
-  the other bounds). ⏭ `getFrameProgression` is the next one a consumer
-  wants: `zstd-cli`'s progress counter shows what it handed to the stream
-  in its place (its README).
+  the other bounds); `Stream.frameProgression` (`ZSTD_getFrameProgression`,
+  with and without workers) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),
+  whose single-threaded numbers `zstd-cli -vvvv --progress` prints equal
+  to the C command's (its `smoke.sh` compares them).
 - **Z26 — `example-apps/zstd-cli`: the `zstd` command at parity**:
   libzstd 1.5.7's `programs/` options, file handling and output, checked
   against the real CLI. The module's contract stays the library API (*What

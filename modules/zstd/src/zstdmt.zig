@@ -622,6 +622,47 @@ pub const MtCtx = struct {
         }
     }
 
+    /// `ZSTDMT_getFrameProgression`: the flushed jobs' totals, the input
+    /// still buffered, and every job not yet flushed as it stands (libzstd
+    /// reads each under its mutex; here its atomics, the error only once
+    /// the job says it is done).
+    pub fn frameProgression(mt: *const MtCtx) stream.FrameProgression {
+        var fp: stream.FrameProgression = .{
+            .ingested = mt.consumed + mt.in_filled,
+            .consumed = mt.consumed,
+            .produced = mt.produced,
+            .flushed = mt.produced,
+            .current_job_id = mt.next_job_id,
+            .nb_active_workers = 0,
+        };
+        const last = mt.next_job_id + @intFromBool(mt.job_ready);
+        var id = mt.done_job_id;
+        while (id < last) : (id += 1) {
+            const job = &mt.jobs[id & mt.job_mask];
+            const consumed = job.consumed.load(.acquire);
+            const failed = consumed == job.src.len and job.err != null;
+            const produced: usize = if (failed) 0 else job.c_size.load(.acquire);
+            const flushed: usize = if (failed) 0 else job.dst_flushed;
+            std.debug.assert(flushed <= produced);
+            fp.ingested += job.src.len;
+            fp.consumed += consumed;
+            fp.produced += produced;
+            fp.flushed += flushed;
+            fp.nb_active_workers += @intFromBool(consumed < job.src.len);
+        }
+        return fp;
+    }
+
+    /// `ZSTDMT_toFlushNow`: what the oldest job not fully flushed has
+    /// ready; 0 with no job in flight.
+    pub fn toFlushNow(mt: *const MtCtx) usize {
+        if (mt.done_job_id == mt.next_job_id) return 0; // no active job => nothing to flush
+        const job = &mt.jobs[mt.done_job_id & mt.job_mask];
+        const consumed = job.consumed.load(.acquire);
+        if (consumed == job.src.len and job.err != null) return 0;
+        return job.c_size.load(.acquire) - job.dst_flushed;
+    }
+
     /// `ZSTDMT_waitForAllJobsCompleted`.
     fn waitForAllJobsCompleted(mt: *MtCtx) void {
         while (mt.done_job_id < mt.next_job_id) : (mt.done_job_id += 1) {

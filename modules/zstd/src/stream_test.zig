@@ -626,3 +626,50 @@ test "stable output: the epilogue's empty last block and checksum ask their own 
         try std.testing.expectError(error.DstSizeTooSmall, run(gpa, src, 3, cr[0], try std.fmt.bufPrint(&buf, "stableOutBuffer=1,o{d},c*,f0,e0", .{cr[1] - 1})));
     }
 }
+
+test "frameProgression and toFlushNow tell what libzstd's do" {
+    // End-of-frame values as libzstd 1.5.7 gives them (checked with its
+    // ZSTD_getFrameProgression on the same kind of stream): single-threaded,
+    // `produced` stops before the checksum; with workers it is the frame.
+    const gpa = std.testing.allocator;
+    const n = 3_000_000;
+    const src = try gpa.alloc(u8, n);
+    defer gpa.free(src);
+    corpus.generate(.{ .name = "", .len = n, .kind = .words, .seed = 4 }, src);
+    const dst = try gpa.alloc(u8, zstd.compressBound(n));
+    defer gpa.free(dst);
+    for ([_]u32{ 0, 2 }) |workers| for ([_]bool{ false, true }) |ck| {
+        var s = try zstd.Stream.init(gpa, .{ .checksum = ck, .pledged_size = n, .advanced = .{ .nb_workers = workers } });
+        defer s.deinit();
+        // before any frame: nothing
+        try std.testing.expectEqual(zstd.FrameProgression{ .ingested = 0, .consumed = 0, .produced = 0, .flushed = 0, .current_job_id = 0, .nb_active_workers = 0 }, s.frameProgression());
+        var out: zstd.OutBuffer = .{ .dst = dst };
+        var fed: usize = 0;
+        while (fed < n) {
+            var in: zstd.InBuffer = .{ .src = src[fed..@min(n, fed + 100_000)] };
+            _ = try s.compressStream2(&out, &in, .@"continue");
+            fed += in.pos;
+            const fp = s.frameProgression();
+            try std.testing.expect(fp.consumed <= fp.ingested and fp.ingested <= fed);
+            try std.testing.expect(fp.flushed <= fp.produced);
+            if (workers == 0) {
+                // all taken input is buffered or compressed, a block at a time
+                try std.testing.expectEqual(@as(u64, fed), fp.ingested);
+                try std.testing.expect(fp.ingested - fp.consumed <= 128 << 10);
+                try std.testing.expectEqual(@as(u32, 0), fp.current_job_id);
+                try std.testing.expectEqual(@as(usize, 0), s.toFlushNow());
+            }
+        }
+        var none: zstd.InBuffer = .{ .src = &.{} };
+        while (try s.compressStream2(&out, &none, .end) != 0) {}
+        const fp = s.frameProgression();
+        try std.testing.expectEqual(@as(u64, n), fp.ingested);
+        try std.testing.expectEqual(@as(u64, n), fp.consumed);
+        const want: u64 = if (workers == 0 and ck) out.pos - 4 else out.pos;
+        try std.testing.expectEqual(want, fp.produced);
+        try std.testing.expectEqual(want, fp.flushed);
+        try std.testing.expectEqual(@as(u32, 0), fp.nb_active_workers);
+        try std.testing.expectEqual(@as(usize, 0), s.toFlushNow());
+        if (workers != 0) try std.testing.expect(fp.current_job_id >= 1);
+    };
+}
