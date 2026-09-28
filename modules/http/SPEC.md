@@ -424,3 +424,17 @@ request phases ARE bounded; do not read that as the whole client being bounded.
 **What the tests actually contain.** HPACK RFC7541 vectors + curl/nghttp2 live interop; h1/smuggling goldens self
 
 **How it got there.** The anchoring work landed. DONE 9dee82e: h11 on framing; fixed a misquoted RFC 9112 2.2 in comments
+
+- **`Client`: hand a CA bundle loaded earlier to another client** (from qap M11.8, 2026-09-28).
+  The bundle is loaded lazily on the first HTTPS request (`ensureCaBundle`). A consumer that
+  confines itself after startup (Landlock) needs it loaded before and then used by a client made
+  later, on another thread. qap `src/auth_jwt.zig` (`Remote.open` / `Remote.run`) moves
+  `ca_bundle` + `ca_scanned` by field between two clients. Ideal: `Client.loadCaBundle()` (public,
+  eager) and `Options.ca_bundle: ?*const std.crypto.Certificate.Bundle` (borrowed, not freed by
+  `deinit`).
+- **`Client`: say that the blocking phases run on the `Io`'s pool** (same source). `runBounded`
+  puts name resolution + `connect` (and the TLS handshake / head read) on `io.concurrent`. Under a
+  per-thread sandbox (Landlock, `setuid`) a pool spawned before confinement runs that work
+  unconfined, whatever thread called `request`. qap found it with a probe whose control fetched
+  without the file grant it needed. Wanted: a paragraph in the module doc ("make the `Io` after
+  the sandbox"), maybe `Options.inline_blocking` for callers that want no pool thread at all.
