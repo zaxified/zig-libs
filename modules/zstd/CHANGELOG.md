@@ -5,6 +5,12 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `seekable.Seekable.reset(src)`: read another source
+  keeping the buffers and the decoder (the new seek table is the only
+  allocation; on an error the previous source stays readable). First
+  consumer: seglog, which opened a reader per read of a compressed segment.
+  Fixed: `Seekable.init` leaked its decoder when the source's length could
+  not be read after the table was.
 - **2026-09-28** — `Stream.frameProgression` (`ZSTD_getFrameProgression`:
   ingested, consumed, produced, flushed, and with workers the current job
   and the active ones) and `Stream.toFlushNow` (`ZSTD_toFlushNow`),

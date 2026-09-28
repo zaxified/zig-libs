@@ -1598,7 +1598,13 @@ instead of decoding it again. With the checksum flag every frame that
 completes is checked (a read that stops inside a frame checks nothing).
 The C's guards are kept: 17 calls in a row without output are
 `SeekableIO`, and in memory, reading more compressed bytes than the source
-holds is `SeekableIO`.
+holds is `SeekableIO`. `reset(src)` (Z28, not in the C, where calling
+`ZSTD_seekable_initAdvanced` again on a used object leaks its table) moves
+a `Seekable` to another source: it loads the new table into a new
+allocation — the only one; the 2 × 128 KiB buffers and the decoder are
+kept — and only then frees the old one, so a failed `reset` leaves the
+previous source readable. The next read starts its frame afresh, and the
+in-memory guard follows the new source.
 
 **Deliberately different** (neither changes a verdict on a well-formed
 stream): an `offset` at or past the end reads nothing and returns 0 (the
@@ -2037,7 +2043,14 @@ and a reused stream give the same bytes; a `FrameLog` table over frames
 from `compressAlloc`, written 5 bytes at a time, reads back; a file source
 reads a range. Damaged tables (magic, a reserved bit, the skippable size, a
 frame count inside and past the file, a frame checksum, a truncation) get
-libzstd's verdicts, confirmed with `zseekable d`. A fourth fuzz target
+libzstd's verdicts, confirmed with `zseekable d`; so does a table whose
+frames share their bytes (read three times through a custom source,
+`SeekableIO` in memory — 2026-09-28). `reset` (Z28) is checked from a
+reader stopped inside a frame to a larger source through a custom reader
+(a read in the same frame index past where the old one stopped, the
+whole), through two failed resets (a missing table, out of memory) that
+leave it reading, and back, with checksums checked again; it allocates
+exactly the new table. 7/7 schemata mutants of `init`/`reset` killed. A fourth fuzz target
 (`seekable reader`, seeds from `zseekable`) found at once a panic in
 `DecompressStream` itself: a skippable frame longer than the 4-byte input
 buffer of a stream it begins, fed across calls, was handed to the skip
@@ -2871,13 +2884,11 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
 - ~~**Z23 — Seekable format**~~ Done 2026-09-27 (asked for by seglog), see
   *Seekable format*: `zstd.seekable`, the same bytes as libzstd's
   `contrib/seekable_format`.
-- **Z28 — `Seekable` over another source, keeping its buffers** (asked for by
-  seglog, 2026-09-27): `Seekable.init` allocates its 2 × 128 KiB buffers and a
-  `DecompressStream` every time, and seglog opens one per read of a compressed
-  segment (`seekTime` opens every segment twice) — most of a fuzz run's time
-  was those allocations. Ideal: `Seekable.reset(src: Source)` that loads a new
-  table and keeps the buffers and decoder, or a `SeekableContext` shared by
-  several `Seekable`s. Today seglog allocates per open
+- ~~**Z28 — `Seekable` over another source, keeping its buffers**~~ Done
+  2026-09-28 (asked for by seglog, 2026-09-27: `Seekable.init` allocated its
+  2 × 128 KiB buffers and a `DecompressStream` per open of a compressed
+  segment, most of a fuzz run's time): `Seekable.reset(src)`, see *Seekable
+  format*. seglog can keep closed readers and reset one on the next open
   (`egw-hub/seglog/src/root.zig`, `SegStore.openZst`).
 - **Z24 — Adaptive level** (`zstd --adapt`, CLI-only in libzstd): a stream
   that moves its level with how fast its output drains.

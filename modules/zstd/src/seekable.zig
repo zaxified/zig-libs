@@ -470,6 +470,7 @@ pub const Seekable = struct {
     pub fn init(gpa: std.mem.Allocator, src: Source) ReadError!Seekable {
         var table = try SeekTable.load(gpa, src);
         errdefer table.deinit(gpa);
+        const src_size = src.length() catch return error.SeekableIO;
         const bufs = try gpa.alloc(u8, 2 * buff_size);
         errdefer gpa.free(bufs);
         return .{
@@ -477,12 +478,32 @@ pub const Seekable = struct {
             .dstream = try .init(gpa, .{}),
             .table = table,
             .src = src,
-            .src_size = src.length() catch return error.SeekableIO,
+            .src_size = src_size,
             .bufs = bufs,
             .in_buf = bufs[0..buff_size],
             .out_buf = bufs[buff_size..],
             .mem_size = if (src == .bytes) src.bytes.len else null,
         };
+    }
+
+    /// Reads from another source, keeping the buffers and the decoder: the
+    /// only allocation is the new seek table (one entry per frame), so a
+    /// caller opening many seekable streams one after another does not
+    /// allocate a decoder for each. On an error nothing changes and the
+    /// previous source is still read. (Calling `ZSTD_seekable_initAdvanced`
+    /// again on a used `ZSTD_seekable` leaks its table in the C.)
+    pub fn reset(s: *Seekable, src: Source) ReadError!void {
+        var table = try SeekTable.load(s.gpa, src);
+        errdefer table.deinit(s.gpa);
+        const src_size = src.length() catch return error.SeekableIO;
+        s.table.deinit(s.gpa);
+        s.table = table;
+        s.src = src;
+        s.src_size = src_size;
+        s.mem_size = if (src == .bytes) src.bytes.len else null;
+        // No frame is under way: the next read starts one afresh (input
+        // buffer, checksum, decoder, `decompressed_offset`).
+        s.cur_frame = std.math.maxInt(u32);
     }
 
     pub fn deinit(s: *Seekable) void {

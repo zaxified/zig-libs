@@ -446,6 +446,7 @@ var r = try sk.Seekable.init(gpa, .{ .bytes = z }); // or .{ .file = .{ .file = 
 defer r.deinit();
 var buf: [4096]u8 = undefined;
 const n = try r.decompress(&buf, 1_000_000); // bytes 1_000_000.. of `data`
+try r.reset(.{ .bytes = other }); // another stream, same buffers and decoder
 ```
 
 `FrameLog` writes a seek table for frames made elsewhere

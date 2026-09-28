@@ -293,6 +293,106 @@ const MemSource = struct {
     }
 };
 
+test "reset reads another source with the same buffers and decoder" {
+    // a: small, in memory, checksums; b: larger, through a custom reader,
+    // with frames of another size
+    const ca = findCase("words-16385");
+    const src_a = try gpa.alloc(u8, ca.len);
+    defer gpa.free(src_a);
+    corpus.generate(ca, src_a);
+    const za = try seekable.compressAlloc(gpa, src_a, .{ .max_frame_size = 4096, .frame_checksums = true });
+    defer gpa.free(za);
+    const cb = findCase("csv-131073");
+    const src_b = try gpa.alloc(u8, cb.len);
+    defer gpa.free(src_b);
+    corpus.generate(cb, src_b);
+    const zb = try seekable.compressAlloc(gpa, src_b, .{ .max_frame_size = 20000 });
+    defer gpa.free(zb);
+    try std.testing.expect(zb.len > za.len);
+    var mem: MemSource = .{ .bytes = zb };
+    const source_b: seekable.Source = .{ .custom = .{ .context = &mem, .size = zb.len, .readAt = MemSource.readAt } };
+
+    var fa: std.testing.FailingAllocator = .init(gpa, .{});
+    var r = try seekable.Seekable.init(fa.allocator(), .{ .bytes = za });
+    defer r.deinit();
+    const back = try gpa.alloc(u8, src_b.len);
+    defer gpa.free(back);
+    // stop in the middle of a's frame 1
+    try std.testing.expectEqual(@as(usize, 100), try r.decompress(back[0..100], 5000));
+
+    // the only allocation is b's seek table; a's is freed
+    const allocs = fa.allocations;
+    const frees = fa.deallocations;
+    try r.reset(source_b);
+    try std.testing.expectEqual(allocs + 1, fa.allocations);
+    try std.testing.expectEqual(frees + 1, fa.deallocations);
+    try std.testing.expectEqual(@as(u64, src_b.len), r.table.decompressedSize());
+    try std.testing.expect(!r.table.checksum_flag);
+    // b's frame 1 at an offset past where a stopped: read from b's start
+    // of that frame, not on from a's
+    try std.testing.expectEqual(@as(usize, 300), try r.decompress(back[0..300], 25000));
+    try std.testing.expectEqualSlices(u8, src_b[25000..][0..300], back[0..300]);
+    // the whole of b, larger than a
+    try std.testing.expectEqual(src_b.len, try r.decompress(back, 0));
+    try std.testing.expectEqualSlices(u8, src_b, back);
+
+    // a failed reset changes nothing: b still reads
+    try std.testing.expectError(error.PrefixUnknown, r.reset(.{ .bytes = za[0 .. za.len - 1] }));
+    fa.fail_index = fa.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, r.reset(.{ .bytes = za }));
+    fa.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 500), try r.decompress(back[0..500], 60000));
+    try std.testing.expectEqualSlices(u8, src_b[60000..][0..500], back[0..500]);
+
+    // and back to a, checksums checked again
+    try r.reset(.{ .bytes = za });
+    try std.testing.expectEqual(src_a.len, try r.decompress(back[0..src_a.len], 0));
+    try std.testing.expectEqualSlices(u8, src_a, back[0..src_a.len]);
+    const bad = try gpa.dupe(u8, za);
+    defer gpa.free(bad);
+    bad[bad.len - (8 + 12 * 5 + 9) + 8 + 12 * 2 + 8] ^= 0x80; // frame 2's checksum
+    try r.reset(.{ .bytes = bad });
+    try std.testing.expectError(error.CorruptionDetected, r.decompress(back[0..src_a.len], 8000));
+}
+
+test "frames sharing their bytes: refused in memory, read through another source, as libzstd" {
+    // Frames 0 and 1 have a compressed size of 0, so all three start at the
+    // same frame and one read decodes it three times: more input than the
+    // buffer holds. libzstd's in-memory reader refuses that (seekableIO);
+    // through a file it reads (tools/zseekable.c `d`, 2026-09-28).
+    var raw: [1000]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(1);
+    for (&raw) |*b| b.* = 'a' + prng.random().uintLessThan(u8, 26);
+    const f = try zstd.compressAlloc(gpa, &raw, .{ .level = 3 });
+    defer gpa.free(f);
+    var z: std.ArrayList(u8) = .empty;
+    defer z.deinit(gpa);
+    try z.appendSlice(gpa, f);
+    var word: [4]u8 = undefined;
+    for ([_]u32{ seekable.skippable_magic, 8 * 3 + seekable.footer_size, 0, 1000, 0, 1000, @intCast(f.len), 1000, 3 }) |w| {
+        std.mem.writeInt(u32, &word, w, .little);
+        try z.appendSlice(gpa, &word);
+    }
+    try z.append(gpa, 0);
+    std.mem.writeInt(u32, &word, seekable.magic_number, .little);
+    try z.appendSlice(gpa, &word);
+    try std.testing.expect(2 * f.len > z.items.len);
+
+    var mem: MemSource = .{ .bytes = z.items };
+    var back: [3000]u8 = undefined;
+    var r = try seekable.Seekable.init(gpa, .{ .custom = .{ .context = &mem, .size = z.items.len, .readAt = MemSource.readAt } });
+    defer r.deinit();
+    try std.testing.expectEqual(@as(usize, 3000), try r.decompress(&back, 0));
+    for (0..3) |i| try std.testing.expectEqualSlices(u8, &raw, back[i * 1000 ..][0..1000]);
+    {
+        var m = try seekable.Seekable.init(gpa, .{ .bytes = z.items });
+        defer m.deinit();
+        try std.testing.expectError(error.SeekableIO, m.decompress(&back, 0));
+    }
+    try r.reset(.{ .bytes = z.items });
+    try std.testing.expectError(error.SeekableIO, r.decompress(&back, 0));
+}
+
 test "a seek table whose frame sizes disagree with the frames is refused, never looped on" {
     // Not libzstd's behaviour: its ZSTD_seekable_decompress restarts a frame
     // that ended before the offset its table promised, forever (found by
