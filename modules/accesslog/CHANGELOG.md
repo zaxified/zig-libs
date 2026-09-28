@@ -5,6 +5,10 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `response_bytes` is now known for streamed responses (chunked, compressed,
+  HTTP/1.0 until-close), from `http`'s `ResponseWriter.bodyBytesSent`; they logged `-` before.
+  Wanted by qap M11.5c.
+
 - **2026-09-25** — **New `Entry.user`: the authenticated caller.** Combined writes it as `%u`
   (was always `-`); JSON Lines and logfmt gain a `user` key. `%u` is unquoted, so a space, `"`,
   `[` or `]` in it is hex-escaped (`\xHH`) on top of the usual escaping, and an empty user is

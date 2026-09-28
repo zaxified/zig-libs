@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `AccessEntry.bytes` is now known for streamed bodies (chunked, compressed,
+  until-close) via `http`'s `ResponseWriter.bodyBytesSent`; it was null for them.
+
 - **2026-09-18** — **BEHAVIOURAL, not breaking (performance under load):** an
   `AccessLog.log` call waiting for a full batch no longer re-takes the lock on every
   spin. It watches a progress counter, bumped when the batch is swapped out or the

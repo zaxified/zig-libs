@@ -2449,6 +2449,9 @@ pub const ResponseWriter = struct {
     /// request that carries no body.
     upgradable: bool = false,
     body: BodySink = .buffering,
+    /// Body octets written through the `.until_close` sink (see
+    /// `bodyBytesSent`); the chunked sinks count their own.
+    until_close_len: u64 = 0,
     interface: Writer,
 
     const BodySink = union(enum) {
@@ -3133,6 +3136,28 @@ pub const ResponseWriter = struct {
         }
     }
 
+    /// Body octets of this response — after any content coding, without
+    /// chunk framing: what `%b` means in an access log. A HEAD / 204 / 304
+    /// answers 0. Exact at any point, bytes still buffered included, for
+    /// every body but a compressed one; that one is exact after `end`, and
+    /// before it counts only what the encoder has emitted (how many coded
+    /// bytes the not-yet-coded rest becomes cannot be known in advance).
+    ///
+    /// Before 2026-09-28 a streamed body (chunked, compressed, HTTP/1.0
+    /// until-close) had no count at all, so exactly the largest responses
+    /// logged no size (accesslog, found by qap M11.5c). The h2 path frames
+    /// through the same sinks, so it is counted the same way.
+    pub fn bodyBytesSent(rw: *const ResponseWriter) ?u64 {
+        return switch (rw.body) {
+            .buffering => rw.declared_len orelse rw.interface.end,
+            .identity => rw.declared_len.?,
+            .discard => 0,
+            .chunked => |*cw| cw.payload_len + cw.writer.end + rw.interface.end,
+            .encoded => |*g| g.chunked.payload_len + g.chunked.writer.end,
+            .until_close => rw.until_close_len + rw.interface.end,
+        };
+    }
+
     pub const ResetError = error{HeadersSent};
 
     /// Discard everything composed so far and start the response over —
@@ -3518,7 +3543,12 @@ pub const ResponseWriter = struct {
         switch (rw.body) {
             .buffering => unreachable,
             .chunked => |*cw| return forwardDrain(w, &cw.writer, data, splat),
-            .until_close => return forwardDrain(w, rw.out, data, splat),
+            .until_close => {
+                const buffered = w.end;
+                const consumed = try forwardDrain(w, rw.out, data, splat);
+                rw.until_close_len += buffered + consumed;
+                return consumed;
+            },
             .encoded => |*g| {
                 if (g.plain_remaining) |rem| {
                     // Same over-delivery guard as the identity sink —
@@ -5342,6 +5372,67 @@ test "serveStream: trailers on a streamed body arrive after the last chunk" {
     // The body really did stream (multiple chunks), so the head was on the
     // wire well before `setTrailer` ran.
     try testing.expect(std.mem.count(u8, got, "\r\n") > 8);
+}
+
+test "ResponseWriter.bodyBytesSent: chunked and until-close count body octets, not framing" {
+    const body = "0123456789" ** 10; // 100 bytes, past the 16-byte body buffer
+    {
+        var out_buf: [512]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [16]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+        try rw.writeAll(body);
+        try testing.expectEqual(@as(?u64, 100), rw.bodyBytesSent()); // mid-stream: buffered bytes included
+        try rw.end();
+        try testing.expect(rw.body == .chunked);
+        try testing.expectEqual(@as(?u64, 100), rw.bodyBytesSent());
+        try testing.expect(std.mem.indexOf(u8, out.buffered(), "\r\n0\r\n\r\n") != null);
+    }
+    {
+        var out_buf: [512]u8 = undefined;
+        var out: Writer = .fixed(&out_buf);
+        var body_buf: [16]u8 = undefined;
+        var chunk_buf: [32]u8 = undefined;
+        var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{ .http1_0 = true });
+        try rw.writeAll(body);
+        try testing.expectEqual(@as(?u64, 100), rw.bodyBytesSent()); // mid-stream, part still buffered
+        try rw.end();
+        try testing.expect(rw.body == .until_close);
+        try testing.expectEqual(@as(?u64, 100), rw.bodyBytesSent());
+    }
+}
+
+test "ResponseWriter.bodyBytesSent: a compressed body counts the coded octets" {
+    const gz = try testing.allocator.create(GzipScratch);
+    defer testing.allocator.destroy(gz);
+    var out_buf: [4096]u8 = undefined;
+    var out: Writer = .fixed(&out_buf);
+    var body_buf: [64]u8 = undefined;
+    var chunk_buf: [64]u8 = undefined;
+    var rw: ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{
+        .compression = .{},
+        .gzip_scratch = gz,
+        .accept_gzip = true,
+    });
+    try rw.setHeader("Content-Type", "text/plain");
+    const plain = "all work and no play makes a dull log line\n" ** 40; // compresses well
+    try rw.writeAll(plain);
+    try rw.end();
+    try testing.expect(rw.body == .encoded);
+    const sent = rw.bodyBytesSent().?;
+    try testing.expect(sent > 0 and sent < plain.len);
+    // The octets counted are exactly the gzip member on the wire, de-chunked.
+    var rr: Reader = .fixed(out.buffered());
+    var head_buf: [1024]u8 = undefined;
+    const head = try h1.ResponseHead.parse(try h1.readHead(&rr, &head_buf));
+    try testing.expect(head.chunked);
+    var scratch: [256]u8 = undefined;
+    var cr: h1.ChunkedReader = .init(&rr, &scratch);
+    var coded: [4096]u8 = undefined;
+    var cw: Writer = .fixed(&coded);
+    _ = try cr.reader.streamRemaining(&cw);
+    try testing.expectEqual(@as(u64, cw.buffered().len), sent);
 }
 
 test "ResponseWriter: our own chunked reader recovers the written trailers" {

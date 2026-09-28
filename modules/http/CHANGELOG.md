@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `ResponseWriter.bodyBytesSent`: body octets on the wire after any content
+  coding, without chunk framing (`%b`), for every body mode incl. chunked, compressed and
+  until-close; `h1.ChunkedWriter.payload_len` counts chunk payload. Additive. For accesslog and
+  metrics, which logged no size for streamed bodies.
+
 - **2026-09-28** — New `http.url`: query-string parameters (`param`, `paramRaw`,
   `QueryIterator`, `decodeComponent`) and strict path percent-decoding (`decodePath` refuses
   `%2F`, `%00` and malformed escapes), over `Request.query`/`.path`, into caller buffers.

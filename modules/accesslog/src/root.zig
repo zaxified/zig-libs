@@ -584,10 +584,11 @@ pub const FromRequestOptions = struct {
 /// textual form (`"[xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:xxxx]:65535"`, 47
 /// bytes). `addr_buf` must outlive the returned `Entry`.
 ///
-/// `response_bytes` uses the same best-effort contract as
-/// `metrics.AccessEntry.bytes`: exact for a buffered or declared-length
-/// body, `0` for HEAD/204/304 (`.discard`), `null` for chunked/
-/// until-close/compressed streaming responses (no running total is kept).
+/// `response_bytes` is `ResponseWriter.bodyBytesSent`: body octets on the
+/// wire after any content coding, without chunk framing (`%b`) — exact for
+/// a buffered, declared-length, chunked, until-close or compressed body
+/// (the streamed ones counted since 2026-09-28; they used to log `-`), `0`
+/// for HEAD/204/304 (`.discard`).
 pub fn entryFromRequest(
     req: *const http.Server.Request,
     res: *const http.Server.ResponseWriter,
@@ -624,12 +625,7 @@ pub fn entryFromRequest(
 
 /// See `entryFromRequest`'s doc for the exact contract.
 fn responseBytesOf(res: *const http.Server.ResponseWriter) ?u64 {
-    return switch (res.body) {
-        .buffering => res.declared_len orelse res.interface.end,
-        .identity => res.declared_len.?,
-        .discard => 0,
-        .chunked, .until_close, .encoded => null,
-    };
+    return res.bodyBytesSent();
 }
 
 // ── tests ────────────────────────────────────────────────────────────────
@@ -1120,6 +1116,24 @@ test "entryFromRequest: 204 response streamed through .discard maps response_byt
     var addr_buf: [64]u8 = undefined;
     const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1 });
     try testing.expectEqual(@as(?u64, 0), entry.response_bytes);
+}
+
+test "entryFromRequest: a chunked (streamed) response logs its body octets, not null" {
+    var body: http.Server.RequestBody = .{ .none = .fixed("") };
+    const req = testRequest("", "/", false, &body, null);
+
+    var out_buf: [512]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var chunk_buf: [16]u8 = undefined;
+    var body_buf: [16]u8 = undefined;
+    var res: http.Server.ResponseWriter = .init(&out, &body_buf, &chunk_buf, .{});
+    res.setStatus(200);
+    try res.writeAll("x" ** 100); // outgrows the buffer: chunked
+    try res.end();
+
+    var addr_buf: [64]u8 = undefined;
+    const entry = entryFromRequest(&req, &res, &addr_buf, .{ .timestamp_ns = 1 });
+    try testing.expectEqual(@as(?u64, 100), entry.response_bytes);
 }
 
 test "entryFromRequest: identity-framed response maps response_bytes to the declared Content-Length" {

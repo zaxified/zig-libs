@@ -114,7 +114,7 @@ Names, help, buckets, status granularity and the clock are configurable via
 hook, not a logger: format/ship it yourself, keep it fast and thread-safe.
 `path` is borrowed (copy to retain); `bytes` is the response body size when
 knowable (exact for buffered bodies, declared Content-Length for identity
-streams, 0 for HEAD/204/304, null for chunked streams).
+streams, 0 for HEAD/204/304, the octets sent so far for a chunked or compressed stream).
 
 ## Exposition format
 

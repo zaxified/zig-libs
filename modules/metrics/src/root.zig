@@ -796,8 +796,9 @@ pub const AccessEntry = struct {
     duration_ns: u64,
     /// Response body bytes when knowable: exact for buffered bodies,
     /// the declared Content-Length for identity streams, 0 for
-    /// HEAD/204/304, null for chunked/until-close streams (the response
-    /// writer keeps no running total).
+    /// HEAD/204/304, the body octets sent so far for a streamed body
+    /// (`ResponseWriter.bodyBytesSent`; a compressed one counts what the
+    /// encoder has emitted by then).
     bytes: ?u64,
 };
 
@@ -981,26 +982,11 @@ fn requestRun(state: ?*anyopaque, ctx: *router.Ctx, next: router.Next) anyerror!
 /// Best-effort response body size for the access-log hook — see
 /// `AccessEntry.bytes` for the exact contract.
 fn responseBytes(res: *const http.Server.ResponseWriter) ?u64 {
-    return switch (res.body) {
-        // Handler done, nothing drained yet: the buffer holds the whole
-        // body (a declared Content-Length is enforced against it at end()).
-        .buffering => res.declared_len orelse res.interface.end,
-        // Streaming against a declared length. `res.declared_len.?` is
-        // deliberate, not `res.body.identity`: the latter looks like the
-        // declared total but is actually `http`'s *remaining*-bytes budget
-        // for the over/under-delivery guard — it decrements as the handler
-        // writes and is mid-flight (not the declared length, and not 0
-        // either) at the point this runs, still inside the handler's own
-        // middleware frame, before `end()`'s final flush. Measured: reading
-        // `res.body.identity` here for a declared 5000-byte body reported
-        // 392. `declared_len` is the one field that stays the declared
-        // total for the life of the response (see the module's audit, F11,
-        // where the missing test for this branch let a mutation survive —
-        // the branch had no coverage, not necessarily a wrong unwrap).
-        .identity => res.declared_len.?,
-        .discard => 0, // HEAD / 204 / 304: no body on the wire
-        .chunked, .until_close, .encoded => null, // streamed; no running total kept
-    };
+    // One definition with accesslog's `%b`: `http` owns it, including the
+    // `declared_len` (not the remaining-bytes budget) rule for an identity
+    // body that audit F11 pinned. Streamed bodies are counted since
+    // 2026-09-28; this used to answer null for them.
+    return res.bodyBytesSent();
 }
 
 // ── default access-log writer ───────────────────────────────────────────────

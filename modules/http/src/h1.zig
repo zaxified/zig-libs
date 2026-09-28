@@ -850,6 +850,9 @@ pub const ContentLengthReader = struct {
 pub const ChunkedWriter = struct {
     out: *Writer,
     writer: Writer,
+    /// Payload octets framed so far — chunk data only, no size lines or
+    /// CRLFs: what an access log's `%b` counts for a chunked body.
+    payload_len: u64 = 0,
 
     pub fn init(out: *Writer, buffer: []u8) ChunkedWriter {
         std.debug.assert(buffer.len > 0);
@@ -882,6 +885,7 @@ pub const ChunkedWriter = struct {
         consumed += last.len * splat;
         try c.out.writeAll("\r\n");
         w.end = 0;
+        c.payload_len += total;
         return consumed;
     }
 
