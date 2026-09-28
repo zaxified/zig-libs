@@ -8,6 +8,7 @@
 //! test binary:
 //!
 //!     <PREFIX>=<runs>[,<first seed>]   run, else the test is skipped
+//!                                      (a harness runs `runs / Options.scale`)
 //!     <PREFIX>_ONLY=<substring>        only harnesses whose name contains it
 //!     <PREFIX>_MS=<limit per input>    default 2000
 //!     <PREFIX>_SEEDFILE=<path>         the current seed, for a crash
@@ -75,6 +76,11 @@ pub const Options = struct {
     /// This harness's name: what `FAIL`/`HANG` print and `_ONLY` selects by.
     name: []const u8,
     default_limit_ms: u64 = 2000,
+    /// How many of the budget's runs one run of this harness is worth. A
+    /// runner hands every harness the same `<PREFIX>=<runs>`; a harness whose
+    /// run is a whole protocol exchange rather than one parse says so here and
+    /// gets `runs / scale` of them (at least one), so one budget suits both.
+    scale: u64 = 1,
 };
 
 // ── reach counters ───────────────────────────────────────────────────────────
@@ -191,7 +197,7 @@ pub fn run(comptime harness: anytype, opts: Options) !void {
 
     const spec = env(&kb, opts.prefix, "") orelse return error.SkipZigTest;
     var parts = std.mem.splitScalar(u8, spec, ',');
-    const runs = try std.fmt.parseInt(u64, parts.next().?, 10);
+    const runs = @max(1, try std.fmt.parseInt(u64, parts.next().?, 10) / @max(1, opts.scale));
     const first = if (parts.next()) |f| try std.fmt.parseInt(u64, f, 10) else 0;
     const seed_fd: ?i32 = if (env(&kb, opts.prefix, "_SEEDFILE")) |path|
         openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644)

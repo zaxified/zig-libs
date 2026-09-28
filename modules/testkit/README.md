@@ -75,7 +75,7 @@ test "fuzz driver: the parser" {                // the verdict
 }
 ```
 
-`MOD_FUZZ=<runs>[,<first seed>]` runs it (unset: skipped), `MOD_FUZZ_ONLY`
+`MOD_FUZZ=<runs>[,<first seed>]` runs it (unset: skipped; a harness with `.scale = N` runs `runs / N`, so one budget suits a parser and a whole protocol exchange), `MOD_FUZZ_ONLY`
 selects harnesses by name, `MOD_FUZZ_MS` is the limit per input (2000),
 `MOD_FUZZ_SEEDFILE` holds the current harness and seed for a crash,
 `MOD_FUZZ_INPUT` replays a saved `--fuzz` input. Output: `runs …` about once a
