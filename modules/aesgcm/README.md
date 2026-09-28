@@ -6,8 +6,8 @@ drop-in for `std.crypto.aead.aes_gcm` and faster than it in two ways: a
 TLS connection derives them once per key instead of once per record; and on
 x86-64 with AES-NI and PCLMULQDQ a **one-pass, stitched kernel** runs the AES
 rounds of eight counter blocks while it multiplies eight ciphertext blocks
-into GHASH, where std makes two passes. 1.8× std on 16 KiB records, 2.2× on
-480-byte ones, 3.2× on 64-byte ones; on par with OpenSSL's AES-NI code on the
+into GHASH, where std makes two passes. 1.6–1.8× std on 16 KiB records, 2.0–2.2× on
+480-byte ones, ~3× on 64-byte ones; on par with OpenSSL's AES-NI code on the
 development machine (table below).
 
 - **Status:** gap — std's AES-GCM is two-pass and stateless; in qap's TLS
@@ -41,8 +41,11 @@ try Gcm.decrypt(plaintext, ciphertext, tag, ad, nonce, key);
 _ = aesgcm.backend(); // .aesni or .generic
 ```
 
-- **In place:** `c` may be `m` (and `m` may be `c`) — the same slice, exactly
-  as std allows. Any other overlap is not supported (std's is not either).
+- **In place:** the output may be the input (the same slice), or start
+  *before* it in the same buffer — e.g. a TLS record decrypted over its own
+  5-byte header, which `tls.zig`'s client does. Both work with std too (its CTR
+  runs front to back); here they are tested. An output starting *after* the
+  input and overlapping it is not supported.
 - **On authentication failure** every byte of the output is zeroed (the x86
   kernel decrypts in the same pass as it authenticates, so plaintext was
   written); in place, the ciphertext is gone with it — as with std, whose

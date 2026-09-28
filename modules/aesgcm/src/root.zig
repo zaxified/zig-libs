@@ -120,8 +120,9 @@ fn AesGcm(comptime key_bits: u16) type {
 
             /// `c` ← AES-GCM encryption of `m`, `tag` ← its tag over `ad`
             /// and `c`. Asserts `c.len == m.len` and `m.len ≤ 2^36 − 32`.
-            /// `c` may be `m` itself (in-place), but must not overlap it
-            /// any other way — the same rule as std's `encrypt`.
+            /// `c` may be `m` itself (in place), or start before it inside
+            /// the same buffer (`c.ptr < m.ptr`); it must not start after
+            /// it and overlap.
             pub fn encrypt(ctx: *const Context, c: []u8, tag: *[tag_length]u8, m: []const u8, ad: []const u8, npub: [nonce_length]u8) void {
                 assert(c.len == m.len);
                 assert(m.len <= max_message_len);
@@ -134,8 +135,9 @@ fn AesGcm(comptime key_bits: u16) type {
             /// `m` ← decryption of `c` if `tag` authenticates `ad` and `c`
             /// under this key and `npub`; else `error.AuthenticationFailed`
             /// with every byte of `m` zeroed. Asserts `c.len == m.len`. `m`
-            /// may be `c` itself (in-place, as with std); on failure the
-            /// ciphertext is then gone too.
+            /// may be `c` itself (in place) or start before it inside the
+            /// same buffer — a record decrypted over its own header; on
+            /// failure the overlapped ciphertext is gone too.
             pub fn decrypt(ctx: *const Context, m: []u8, c: []const u8, tag: [tag_length]u8, ad: []const u8, npub: [nonce_length]u8) AuthenticationError!void {
                 assert(c.len == m.len);
                 assert(m.len <= max_message_len);
@@ -998,6 +1000,46 @@ test "differential against std: random lengths up to 20 000" {
             @min(max, 128 * rnd.uintAtMost(usize, 40) + rnd.uintAtMost(usize, 32) -| 16);
         const ad_len = rnd.uintAtMost(usize, 128);
         if (i % 2 == 0) try diffOne(Aes128Gcm, rnd, buf, n, ad_len) else try diffOne(Aes256Gcm, rnd, buf, n, ad_len);
+    }
+}
+
+test "the output may start before the input: a record decrypted over its own header" {
+    // `tls.zig`'s client decrypts a record into the buffer that starts at
+    // the record's 5-byte header (`handshake_client.zig`, `@constCast(rec.
+    // buffer)`), i.e. `m` = `c` − 5. Every path reads input before it writes
+    // the output behind it, so such a forward overlap works — as it does in
+    // std, whose CTR runs front to back — for both directions.
+    var prng = std.Random.DefaultPrng.init(0x0e1a9);
+    const rnd = prng.random();
+    var key: [32]u8 = undefined;
+    var iv: [12]u8 = undefined;
+    var ad: [13]u8 = undefined;
+    rnd.bytes(&key);
+    rnd.bytes(&iv);
+    rnd.bytes(&ad);
+    var m: [700]u8 = undefined;
+    rnd.bytes(&m);
+    var want_c: [700]u8 = undefined;
+    var buf: [720]u8 = undefined;
+    for ([_]usize{ 0, 1, 15, 16, 100, 128, 255, 256, 300, 700 }) |n| {
+        var want_t: [16]u8 = undefined;
+        crypto.aead.aes_gcm.Aes256Gcm.encrypt(want_c[0..n], &want_t, m[0..n], &ad, iv, key);
+        for ([_]usize{ 1, 5, 16, 17 }) |shift| {
+            for (all_backends) |b| {
+                var ctx = Aes256Gcm.initWith(b, key) orelse continue;
+                defer ctx.wipe();
+                // Decrypt: ciphertext at `shift`, plaintext to 0.
+                @memcpy(buf[shift..][0..n], want_c[0..n]);
+                try ctx.decrypt(buf[0..n], buf[shift..][0..n], want_t, &ad, iv);
+                try testing.expectEqualSlices(u8, m[0..n], buf[0..n]);
+                // Encrypt: plaintext at `shift`, ciphertext to 0.
+                @memcpy(buf[shift..][0..n], m[0..n]);
+                var t: [16]u8 = undefined;
+                ctx.encrypt(buf[0..n], &t, buf[shift..][0..n], &ad, iv);
+                try testing.expectEqualSlices(u8, want_c[0..n], buf[0..n]);
+                try testing.expectEqualSlices(u8, &want_t, &t);
+            }
+        }
     }
 }
 

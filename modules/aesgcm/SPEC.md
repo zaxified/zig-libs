@@ -86,9 +86,16 @@ build target has `aes`, as for std itself.
 `.aesni` with only the GHASH powers the lengths need (`powersFor`: the largest
 aggregated group, ≤ 8) — and wipe it. `.generic` stateless calls std directly.
 
-**In-place**: `c.ptr == m.ptr` is supported both ways, as by std; any other
-overlap is not (std's `modes.ctr` does not support it either). Every step reads
-the input blocks it needs before writing their outputs.
+**In-place**: the output may equal the input, or start before it in the same
+buffer (`out.ptr < in.ptr`, a forward shift — `tls.zig`'s client decrypts a
+record over its own header this way), in both directions and on both
+backends; test `the output may start before the input` pins shifts of 1, 5, 16
+and 17 bytes across every path. It holds because every step reads the input
+blocks it needs before it writes output at or below them: a batch loads block
+j of the input only after storing block j − 1 of the output, the decrypt
+read-ahead touches only input beyond the batch being written, and the tail is
+copied into a local buffer first. An output starting after the input and
+overlapping it is not supported (nor is it by std's `modes.ctr`).
 
 ## Constant-time contract
 
