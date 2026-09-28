@@ -12,8 +12,7 @@
 //! and messages.
 //!
 //! Not here (yet): gzip/xz/lz4 formats (as a libzstd built without zlib,
-//! lzma and lz4), `--adapt`, `--patch-from`, sparse output, asynchronous
-//! I/O, progress counters, `--output-dir-*`.
+//! lzma and lz4), sparse output, asynchronous I/O.
 
 const std = @import("std");
 const zstd = @import("zstd");
@@ -63,6 +62,11 @@ pub const Prefs = struct {
     ldm_bucket_size_log: ?u32 = null,
     ldm_hash_rate_log: ?u32 = null,
     rsyncable: bool = false,
+    /// `--adapt`: the level follows the output's and the input's speed,
+    /// within `adapt_min..adapt_max`.
+    adaptive: bool = false,
+    adapt_min: i32 = -50,
+    adapt_max: i32 = 22,
     stream_src_size: u64 = 0,
     target_cblock_size: u32 = 0,
     src_size_hint: u32 = 0,
@@ -481,6 +485,9 @@ fn adjustParamsForPatchFrom(prefs: *Prefs, cp: *CParams, dict_size: u64, max_src
     }
 }
 
+/// `ADAPT_WINDOWLOG_DEFAULT`: 8 MB, unless the window is set or `--long`.
+const adapt_window_log_default = 23;
+
 /// `UTIL_FILESIZE_UNKNOWN`.
 const unknown_size = std.math.maxInt(u64);
 
@@ -500,7 +507,13 @@ fn largestFileSize(env: Env, names: []const []const u8) u64 {
 /// `cRess_t`: one stream reused for every file, its buffers, the dictionary.
 pub const CRess = struct {
     stream: zstd.Stream,
+    /// The stream's options (`requestedParams`): `--adapt` moves their
+    /// level, and the next file starts from where the last one left it,
+    /// as the C's context does.
     opts: zstd.StreamOptions,
+    /// The command line's level, where each file's adaptation starts
+    /// (`FIO_compressZstdFrame`'s `compressionLevel`).
+    level: i32,
     dict: ?[]u8,
     dict_name: ?[]const u8,
     dict_stat: ?File.Stat,
@@ -520,6 +533,7 @@ pub const CRess = struct {
             adjustParamsForPatchFrom(prefs, &cp, dict_size, if (prefs.stream_src_size > 0) prefs.stream_src_size else max_src_size, level);
         }
         const dict = loadDict(env, prefs, dict_name);
+        if (prefs.adaptive and !prefs.ldm and cp.window_log == 0) cp.window_log = adapt_window_log_default;
         var adv: zstd.Advanced = .{
             .content_size = prefs.content_size,
             .dict_id_flag = prefs.dict_id,
@@ -564,12 +578,19 @@ pub const CRess = struct {
         return .{
             .stream = stream,
             .opts = opts,
+            .level = level,
             .dict = dict,
             .dict_name = dict_name,
             .dict_stat = if (dict_name) |n| stat(env, n) else null,
             .in_buf = env.gpa.alloc(u8, in_chunk) catch fatal(21, "Allocation error : not enough memory", .{}),
             .out_buf = env.gpa.alloc(u8, cout_size) catch fatal(21, "Allocation error : not enough memory", .{}),
         };
+    }
+
+    /// `ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)`.
+    fn setLevel(r: *CRess, level: i32) void {
+        r.stream.setLevel(level) catch {};
+        r.opts.level = level;
     }
 
     pub fn deinit(r: *CRess, env: Env) void {
@@ -603,7 +624,7 @@ fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, d
         const window_log: u32 = opts.advanced.window_log orelse if (prefs.ldm)
             27 // ZSTD_WINDOWLOG_LIMIT_DEFAULT
         else
-            zstd.getCParams(opts.level, file_size orelse unknown_size, 0).window_log;
+            zstd.getCParams(ress.level, file_size orelse unknown_size, 0).window_log;
         const pledged = opts.pledged_size orelse unknown_size;
         const h = disp.hrs(@max(1, @min(@as(u64, 1) << @intCast(window_log), pledged)));
         if (disp.level >= 4) {
@@ -615,6 +636,7 @@ fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, d
         }
     }
     var compressed: u64 = 0;
+    var adapt: Adapt = .{ .level = ress.level, .last_time = now(env.io) };
     var rb: ReadBuf = .{ .file = src.file, .buf = ress.in_buf };
     var directive: zstd.EndDirective = .@"continue";
     while (directive != .end) {
@@ -625,17 +647,30 @@ fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, d
         var in: zstd.InBuffer = .{ .src = rb.loaded() };
         var still: usize = 1;
         while (in.pos != in.src.len or (directive == .end and still != 0)) {
+            const old_ipos = in.pos;
             var out: zstd.OutBuffer = .{ .dst = ress.out_buf };
+            const to_flush_now = ress.stream.toFlushNow();
             still = ress.stream.compressStream2(&out, &in, directive) catch |e| fatal(11, "{s}", .{zstdErrorName(e)});
+            // count stats
+            adapt.input_presented += 1;
+            // the input buffer is full and can't take any more: input
+            // speed is faster than consumption rate
+            if (old_ipos == in.pos) adapt.input_blocked += 1;
+            if (to_flush_now == 0) adapt.flush_waiting = true;
             disp.at(6, "ZSTD_compress_generic(end:{d}) => input pos({d})<=({d})size ; output generated {d} bytes \n", .{ @intFromEnum(directive), in.pos, in.src.len, out.pos });
             if (out.pos != 0) {
                 if (dst) |d| d.write(ress.out_buf[0..out.pos]);
                 compressed += out.pos;
             }
+            // adaptive mode: statistics measurement and speed correction
+            if (prefs.adaptive and @divTrunc(now(env.io) - adapt.last_time, std.time.ns_per_us) > adapt_every_us) {
+                adapt.last_time = now(env.io);
+                adapt.correct(prefs, ress);
+            }
             // display notification
             if (disp.shouldProgress() and disp.readyForUpdate(env.io)) {
                 const fp = ress.stream.frameProgression();
-                showCompressProgress(env.io, ctx, ress.opts.level, src_name, file_size, fp.ingested - fp.consumed, fp.consumed, fp.produced);
+                showCompressProgress(env.io, ctx, adapt.level, src_name, file_size, fp.ingested - fp.consumed, fp.consumed, fp.produced);
             }
         }
         rb.consume(rb.end - rb.start);
@@ -644,6 +679,113 @@ fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, d
         fatal(27, "Read error : Incomplete read : {d} / {d} B", .{ readsize.*, fs });
     return compressed;
 }
+
+fn now(io: Io) i96 {
+    return Io.Timestamp.now(io, .awake).nanoseconds;
+}
+
+/// `REFRESH_RATE`: how often `--adapt` looks at the stream.
+const adapt_every_us = std.time.us_per_s / 6;
+
+/// `--adapt`'s statistics in `FIO_compressZstdFrame`, and its correction:
+/// with workers, the level goes up by one when the compression outruns
+/// the output or waits for input, and down by one when the input is
+/// blocked often while everything produced is flushed and the input keeps
+/// up -- at most once per job completed. Only its outcome can be compared
+/// with the C command's, never its bytes: both depend on timing.
+const Adapt = struct {
+    /// `compressionLevel`: the frame's own, from the command line's.
+    level: i32,
+    last_time: i96,
+    speed_change: enum { no_change, slower, faster } = .no_change,
+    prev_update: zstd.FrameProgression = zero_progression,
+    prev_correction: zstd.FrameProgression = zero_progression,
+    flush_waiting: bool = false,
+    input_presented: u32 = 0,
+    input_blocked: u32 = 0,
+    last_job_id: u32 = 0,
+
+    const zero_progression: zstd.FrameProgression = .{ .ingested = 0, .consumed = 0, .produced = 0, .flushed = 0, .current_job_id = 0, .nb_active_workers = 0 };
+
+    fn correct(a: *Adapt, prefs: *const Prefs, ress: *CRess) void {
+        const zfp = ress.stream.frameProgression();
+        // check output speed
+        if (zfp.current_job_id > 1) { // only possible if nbWorkers >= 1
+            std.debug.assert(zfp.produced >= a.prev_update.produced);
+            std.debug.assert(prefs.nb_workers >= 1);
+            const newly_produced = zfp.produced - a.prev_update.produced;
+            const newly_flushed = zfp.flushed - a.prev_update.flushed;
+            // test if compression is blocked, either because output is
+            // slow and all buffers are full, or because input is slow and
+            // no job can start while waiting for at least one buffer to be
+            // filled. note: exclude starting part, since currentJobID > 1
+            if (zfp.consumed == a.prev_update.consumed // no data compressed: no data available, or no more buffer to compress to, OR compression is really slow (compression of a single block is slower than update rate)
+            and zfp.nb_active_workers == 0) { // confirmed: no compression ongoing
+                disp.at(6, "all buffers full : compression stopped => slow down \n", .{});
+                a.speed_change = .slower;
+            }
+            a.prev_update = zfp;
+            if (newly_produced > newly_flushed * 9 / 8 // compression produces more data than output can flush (though production can be spiky, due to work unit: (N==4)*block sizes)
+            and !a.flush_waiting) { // flush speed was never slowed by lack of production, so it's operating at max capacity
+                disp.at(6, "compression faster than flush ({d} > {d}), and flushed was never slowed down by lack of production => slow down \n", .{ newly_produced, newly_flushed });
+                a.speed_change = .slower;
+            }
+            a.flush_waiting = false;
+        }
+        // course correct only if there is at least one new job completed
+        if (zfp.current_job_id > a.last_job_id) {
+            disp.at(6, "compression level adaptation check \n", .{});
+            // check input speed
+            if (zfp.current_job_id > prefs.nb_workers + 1) { // warm up period, to fill all workers
+                if (a.input_blocked == 0) {
+                    disp.at(6, "input is never blocked => input is slower than ingestion \n", .{});
+                    a.speed_change = .slower;
+                } else if (a.speed_change == .no_change) {
+                    const newly_ingested = zfp.ingested - a.prev_correction.ingested;
+                    const newly_consumed = zfp.consumed - a.prev_correction.consumed;
+                    const newly_produced = zfp.produced - a.prev_correction.produced;
+                    const newly_flushed = zfp.flushed - a.prev_correction.flushed;
+                    a.prev_correction = zfp;
+                    std.debug.assert(a.input_presented > 0);
+                    disp.at(6, "input blocked {d}/{d}({d:.2}) - ingested:{d} vs {d}:consumed - flushed:{d} vs {d}:produced \n", .{
+                        a.input_blocked,
+                        a.input_presented,
+                        @as(f64, @floatFromInt(a.input_blocked)) / @as(f64, @floatFromInt(a.input_presented)) * 100,
+                        @as(u32, @truncate(newly_ingested)),
+                        @as(u32, @truncate(newly_consumed)),
+                        @as(u32, @truncate(newly_flushed)),
+                        @as(u32, @truncate(newly_produced)),
+                    });
+                    if (a.input_blocked > a.input_presented / 8 // input is waiting often, because input buffers is full: compression or output too slow
+                    and newly_flushed * 33 / 32 > newly_produced // flush everything that is produced
+                    and newly_ingested * 33 / 32 > newly_consumed) { // input speed as fast or faster than compression speed
+                        disp.at(6, "recommend faster as in({d}) >= ({d})comp({d}) <= out({d}) \n", .{ newly_ingested, newly_consumed, newly_produced, newly_flushed });
+                        a.speed_change = .faster;
+                    }
+                }
+                a.input_blocked = 0;
+                a.input_presented = 0;
+            }
+            if (a.speed_change == .slower) {
+                disp.at(6, "slower speed , higher compression \n", .{});
+                a.level += 1;
+                if (a.level > zstd.max_level) a.level = zstd.max_level;
+                if (a.level > prefs.adapt_max) a.level = prefs.adapt_max;
+                a.level += @intFromBool(a.level == 0); // skip 0
+                ress.setLevel(a.level);
+            }
+            if (a.speed_change == .faster) {
+                disp.at(6, "faster speed , lighter compression \n", .{});
+                a.level -= 1;
+                if (a.level < prefs.adapt_min) a.level = prefs.adapt_min;
+                a.level -= @intFromBool(a.level == 0); // skip 0
+                ress.setLevel(a.level);
+            }
+            a.speed_change = .no_change;
+            a.last_job_id = zfp.current_job_id;
+        }
+    }
+};
 
 /// The progress line of `FIO_compressZstdFrame`.
 fn showCompressProgress(io: Io, ctx: *const Ctx, level: i32, src_name: []const u8, file_size: ?u64, buffered: u64, consumed: u64, produced: u64) void {

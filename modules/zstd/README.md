@@ -265,7 +265,10 @@ the window one piece, so they differ from the buffered mode's).
 Once a frame has ended, the next call starts another on the same context
 with the same options and an unknown size, as libzstd does;
 `s.reset(opts)` abandons a frame or changes the options (pledged size
-included). Its memory is the level's tables plus an input buffer of one
+included). `s.setLevel(level)` may come at any time: the next frames'
+level, and with workers that of the frame's jobs from the next call on
+(`ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)`, what `zstd --adapt`
+uses; see SPEC *Multithreading*). Its memory is the level's tables plus an input buffer of one
 window and one block (3.7 MB at level 3 with an unknown size; at level 22
 without a pledged size the window is 128 MB and long-distance matching is
 on, about 1 GB in all, as libzstd). Errors: `LevelUnsupported`,

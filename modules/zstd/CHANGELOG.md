@@ -5,6 +5,11 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — `Stream.setLevel` (`ZSTD_CCtx_setParameter(
+  ZSTD_c_compressionLevel)` at any time): with workers, the jobs created
+  after the next call take the new level, as libzstd's
+  `ZSTDMT_updateCParams_whileCompressing` -- byte-identical, 8 new
+  multithreaded goldens. First consumer: `zstd-cli --adapt` (Z24).
 - **2026-09-28** — `seekable.Seekable.reset(src)`: read another source
   keeping the buffers and the decoder (the new seek table is the only
   allocation; on an error the previous source stays readable). First

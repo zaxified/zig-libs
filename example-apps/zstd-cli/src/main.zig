@@ -53,6 +53,9 @@ const Cli = struct {
     mem_limit: u32 = 0,
     ldm: bool = false,
     adapt: bool = false,
+    /// `--adapt=min=#,max=#` (`MINCLEVEL`, `MAXCLEVEL` when not given).
+    adapt_min: i32 = zstd.min_level,
+    adapt_max: i32 = zstd.max_level,
     bench: bench.Params = .{},
     /// `-e#`: the last level benchmarked; below the first means just it.
     level_last: i32 = std.math.minInt(i32),
@@ -308,6 +311,7 @@ fn displayCompressionParameters(prefs: *const fio.Prefs) void {
     const row = [3][]const u8{ "", " --no-row-match-finder", " --row-match-finder" };
     const lit = [3][]const u8{ "", " --compress-literals", " --no-compress-literals" };
     disp.always("--format=.zst --no-sparse{s}{s} --block-size={d}", .{ if (prefs.dict_id) "" else " --no-dictID", check[prefs.checksum], prefs.block_size });
+    if (prefs.adaptive) disp.always(" --adapt=min={d},max={d}", .{ prefs.adapt_min, prefs.adapt_max });
     disp.always("{s}{s}", .{ row[@intFromEnum(prefs.row_match_finder)], if (prefs.rsyncable) " --rsyncable" else "" });
     if (prefs.stream_src_size != 0) disp.always(" --stream-size={d}", .{@as(u32, @truncate(prefs.stream_src_size))});
     if (prefs.src_size_hint != 0) disp.always(" --size-hint={d}", .{@as(i32, @bitCast(prefs.src_size_hint))});
@@ -355,6 +359,46 @@ fn readSizeT(s: *[]const u8) u64 {
     return r;
 }
 
+/// `readIntFromChar`: an optional `-`, then `readU32FromChar`.
+fn readInt(s: *[]const u8) i32 {
+    var sign: i32 = 1;
+    if (s.len > 0 and s.*[0] == '-') {
+        s.* = s.*[1..];
+        sign = -1;
+    }
+    return @as(i32, @bitCast(readU32(s))) *% sign;
+}
+
+/// `parseAdaptParameters`: `min=#` and `max=#`, comma-separated, in any
+/// order; false when malformed or when min is above max.
+fn parseAdaptParameters(s_in: []const u8, min: *i32, max: *i32) bool {
+    var s = s_in;
+    while (true) {
+        if (longCommandWArg(&s, "min=")) {
+            min.* = readInt(&s);
+            if (s.len > 0 and s[0] == ',') {
+                s = s[1..];
+                continue;
+            } else break;
+        }
+        if (longCommandWArg(&s, "max=")) {
+            max.* = readInt(&s);
+            if (s.len > 0 and s[0] == ',') {
+                s = s[1..];
+                continue;
+            } else break;
+        }
+        disp.at(4, "invalid compression parameter \n", .{});
+        return false;
+    }
+    if (s.len != 0) return false; // check the end of string
+    if (min.* > max.*) {
+        disp.at(4, "incoherent adaptation limits \n", .{});
+        return false;
+    }
+    return true;
+}
+
 /// `longCommandWArg`: `arg` starts with `cmd`; advances past it.
 fn longCommandWArg(arg: *[]const u8, cmd: []const u8) bool {
     if (!std.mem.startsWith(u8, arg.*, cmd)) return false;
@@ -390,7 +434,7 @@ fn usage(w: *std.Io.Writer, program: []const u8) void {
 }
 
 fn usageAdvanced(program: []const u8) void {
-    // C's text, less what this port does not have: `--trace`, `--adapt`,
+    // C's text, less what this port does not have: `--trace`,
     // the gzip/xz/lzma/lz4 formats and the legacy trainer
     const w = disp.out();
     welcome(w);
@@ -422,6 +466,7 @@ fn usageAdvanced(program: []const u8) void {
     ) catch {};
     w.print("  --ultra                       Enable levels beyond {d}, up to {d}; requires more memory.\n", .{ clevel_max, zstd.max_level }) catch {};
     w.print("  --fast[=#]                    Use to very fast compression levels. [Default: {d}]\n", .{1}) catch {};
+    w.writeAll("  --adapt                       Dynamically adapt compression level to I/O conditions.\n") catch {};
     w.print("  --long[=#]                    Enable long distance matching with window log #. [Default: {d}]\n", .{default_max_window_log}) catch {};
     w.writeAll(
         \\  --patch-from=REF              Use REF as the reference point for Zstandard's diff engine. 
@@ -775,7 +820,15 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
                 c.prefs.content_size = false;
                 continue;
             }
-            if (eq(u8, a, "--adapt") or std.mem.startsWith(u8, a, "--adapt=")) return unsupported("--adapt");
+            if (eq(u8, a, "--adapt")) {
+                c.adapt = true;
+                continue;
+            }
+            if (longCommandWArg(&a, "--adapt=")) {
+                c.adapt = true;
+                if (!parseAdaptParameters(a, &c.adapt_min, &c.adapt_max)) return badUsage(program, original);
+                continue;
+            }
             if (eq(u8, a, "--no-row-match-finder")) {
                 c.prefs.row_match_finder = .disable;
                 continue;
@@ -1216,8 +1269,18 @@ fn run(env: Env, arena: std.mem.Allocator, argv: []const [:0]const u8, environ: 
     const result: u1 = switch (c.operation) {
         .compress => blk: {
             c.prefs.nb_workers = nb_workers;
+            if (c.prefs.overlap_log) |o| if (o != 0 and nb_workers == 0)
+                disp.at(2, "Setting overlapLog is useless in single-thread mode \n", .{});
             c.prefs.ldm = c.ldm;
+            // FIO_setAdaptiveMode, FIO_setAdaptMin/Max, FIO_setRsyncable
+            if (c.adapt and nb_workers == 0) fio.fatal(1, "Adaptive mode is not compatible with single thread mode \n", .{});
+            c.prefs.adaptive = c.adapt;
+            c.prefs.adapt_min = c.adapt_min;
+            c.prefs.adapt_max = c.adapt_max;
+            if (c.prefs.rsyncable and nb_workers == 0) fio.fatal(1, "Rsyncable mode is not compatible with single thread mode \n", .{});
             fio.sparse = 0; // FIO_setSparseWrite(prefs, 0)
+            if (c.adapt_min > c.level) c.level = c.adapt_min;
+            if (c.adapt_max < c.level) c.level = c.adapt_max;
             if (c.show_default_cparams or disp.level >= 4) {
                 for (c.names.items) |n| {
                     if (c.show_default_cparams) printDefaultCParams(env, n, c.dict_name, c.level);

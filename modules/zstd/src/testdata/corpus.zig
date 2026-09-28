@@ -3284,6 +3284,27 @@ pub const mt_cases = [_]MtCase{
     .{ .name = "mt-empty-last-job", .input = mt_in_csv, .schedule = "c*,f0,e0", .levels = &.{3}, .checksums = &.{true} },
     .{ .name = "mt-pledged", .input = mt_in_alternating, .schedule = "p1000000,jobSize=524288,c*,e0", .levels = &.{3}, .checksums = &.{true} },
     .{ .name = "mt-stream-ldm", .input = mt_in_far_mix, .schedule = "jobSize=524288,enableLongDistanceMatching=1,windowLog=19,c700000,f0,c*,e0", .levels = &.{4} },
+    // (Z24) the level changed during a frame (`L`, `Stream.setLevel`),
+    // where the flushes make the job it reaches certain: the jobs after it
+    // get the new level's parameters for an unknown size, the frame's
+    // window, and the row match finder and block splitter the frame
+    // resolved (fast/dfast -> lazy without rows, dfast -> btultra2
+    // without the splitter)
+    .{ .name = "mt-level-flush", .input = mt_in_far_repeat, .schedule = "jobSize=524288,c600000,f0,L7,c500000,f0,L-1,c*,e0", .levels = &.{ 1, 3 } },
+    .{ .name = "mt-level-btultra", .input = mt_in_far_mix, .schedule = "jobSize=524288,windowLog=20,c600000,f0,L19,c*,e0", .levels = &.{5} },
+    // ... under the explicit parameters, sized by the hint
+    .{ .name = "mt-level-hint", .input = mt_in_alternating, .schedule = "jobSize=524288,srcSizeHint=60000,hashLog=16,c600000,f0,L9,c*,e0", .levels = &.{3} },
+    // before any job: the whole frame at the new level's parameters
+    .{ .name = "mt-level-early", .input = mt_in_alternating, .schedule = "jobSize=524288,c100000,L7,c*,e0", .levels = &.{1} },
+    // before the first call: the frame's level; between frames: the next
+    // frame's, sized by its input (550 KB: level 12 for an unknown size
+    // would keep chain log 22 and hash log 23, not 20 and 21)
+    .{ .name = "mt-level-init", .input = mt_in_csv, .schedule = "L5,c300000,f0,c*,e0", .levels = &.{1} },
+    .{ .name = "mt-level-between", .input = mt_in_csv, .schedule = "jobSize=524288,c50000,e0,L12,e*", .levels = &.{3} },
+    // set during a single-threaded frame (50 KB pledged), taken by the
+    // next frame's first call on workers: that frame, 550 KB in one call,
+    // gets level 12 for an unknown size (chain log 22, hash log 23)
+    .{ .name = "mt-level-carried", .input = mt_in_csv, .schedule = "jobSize=524288,p50000,c20000,L12,c30000,e0,e*", .levels = &.{3} },
     // dictionaries: only the first job has one
     .{ .name = "mt-dict-load", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "zd-words", .path = .load, .levels = &.{ 3, 9 } },
     .{ .name = "mt-dict-prefix-raw", .input = mt_in_far_repeat, .params = "jobSize=524288", .dict = "raw-words-8000", .path = .prefix, .content_type = 1, .levels = &.{ 3, 13 } },

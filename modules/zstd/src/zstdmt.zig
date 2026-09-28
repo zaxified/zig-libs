@@ -493,6 +493,11 @@ pub const MtCtx = struct {
         const ldm_on = ldm.resolve(adv.long_distance_matching, cp);
         mt.cp = cp;
         mt.opts = setup.opts;
+        // the switches ZSTD_CCtx_init_compressStream2 resolved on the
+        // frame's parameters: a level changed during the frame
+        // (`updateLevel`) gives the jobs other parameters, not these
+        mt.opts.advanced.row_match_finder = switchOf(params.resolveRowMatchFinder(adv.row_match_finder, cp));
+        mt.opts.advanced.split_after_sequences = switchOf(params.resolveSplitAfterSequences(adv.split_after_sequences, cp));
         mt.frame_content_size = pledged;
 
         mt.target_prefix_size = computeOverlapSize(cp, adv.overlap_log, ldm_on);
@@ -563,6 +568,22 @@ pub const MtCtx = struct {
         } else mt.cdict = setup.cdict;
 
         try mt.serialReset(ldm_on, raw_prefix);
+    }
+
+    fn switchOf(on: bool) params.Switch {
+        return if (on) .enable else .disable;
+    }
+
+    /// `ZSTDMT_updateCParams_whileCompressing`: the jobs created from now
+    /// on get `level`'s parameters for an unknown size (or the size hint),
+    /// the explicit ones of `adv` over them, and this frame's window. (The
+    /// C also stores the level; the jobs, with parameters set, never read
+    /// it.)
+    pub fn updateLevel(mt: *MtCtx, level: i32, size_hint: ?u32, adv: params.Advanced) void {
+        const saved_wlog = mt.cp.window_log; // do not modify windowLog while compressing
+        var cp = params.getFromCCtxParams(level, if (size_hint) |h| h else params.unknown_size, 0, .no_attach_dict, adv);
+        cp.window_log = saved_wlog;
+        mt.cp = cp;
     }
 
     /// The parameters `cp` set explicitly (`ZSTD_createCDict_advanced`).

@@ -11,7 +11,11 @@
  *   oN   later calls get an output buffer of N bytes (default: 1 << 24)
  *   cN   ZSTD_e_continue with the next N input bytes ("c*": all the rest)
  *   fN   ZSTD_e_flush, likewise
- *   eN   ZSTD_e_end, likewise; ends the schedule
+ *   eN   ZSTD_e_end, likewise; the tokens after it make the next frame
+ *   LN   ZSTD_c_compressionLevel set to N (may be negative) wherever it
+ *        stands: before any call the frame's level, during a frame what
+ *        ZSTD_CCtx_setParameter makes of it (the module's
+ *        `Stream.setLevel`)
  *   l    long-distance matching switched on by hand
  *        (ZSTD_c_enableLongDistanceMatching; the module's
  *        `Advanced.long_distance_matching = .enable`)
@@ -185,6 +189,11 @@ int main(int argc, char** argv)
             ZSTD_CCtxParams_setParameter(cparams, ZSTD_c_enableLongDistanceMatching, 1);
             continue;
         }
+        if (op == 'L') {
+            size_t const r = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, atoi(tok + 1));
+            if (ZSTD_isError(r)) { fprintf(stderr, "%s: %s\n", tok, ZSTD_getErrorName(r)); return 7; }
+            continue;
+        }
         size_t const num = tok[1] == '*' ? (size_t)n - fed : (size_t)strtoull(tok + 1, NULL, 10);
         if (op == 'p') { ZSTD_CCtx_setPledgedSrcSize(cctx, num); continue; }
         if (op == 'w') {
@@ -229,7 +238,6 @@ int main(int argc, char** argv)
             if (dir == ZSTD_e_continue ? ip->pos == ip->size : r == 0) break;
         }
         fed += num;
-        if (op == 'e') break;
     }
     fclose(out);
     if (dict) { /* decode it back with the dictionary */

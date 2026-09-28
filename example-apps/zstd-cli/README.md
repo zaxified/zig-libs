@@ -69,6 +69,28 @@ default, cover and fastCover with and without parameters, every refusal,
 byte-identical; 16 of the progress counter and `--fake-*-is-console`; 16 of
 `-b` without a file and `-p`.
 
+## Adaptive level (`--adapt`)
+
+`--adapt[=min=#,max=#]` moves the level while it compresses, as the C
+command does (`FIO_compressZstdFrame`): every sixth of a second it reads the
+stream's progress, and once per completed job it goes one level up when the
+compression outruns the output or waits for input, one down when the input
+is often blocked while the output keeps up -- within `min..max` and skipping
+0, with workers only (`--single-thread` is refused with the C command's
+error), an 8 MB window unless one is set or `--long`. The module applies a
+new level to the jobs created after it, exactly as libzstd does
+(`Stream.setLevel`). Which level a job gets depends on timing, so an
+adaptive frame is never byte-comparable -- the C command's is not
+reproducible either; held at one level (`--adapt=min=5,max=5`) it is, and
+it equals the C command's (`smoke.sh` checks it). Checked on 2026-09-28: 26
+scenarios equal (parsing and its refusals, the level clamped by `min`/`max`,
+`-vv` and `-vvvv` output, `--long`, a set window, stdin, 12 MB inputs held
+at one level with 2 and 3 workers and `-B1M`), and under a slow reader or a
+slow compressor both commands move the level alike (60 MB with 1 MB jobs
+behind a 3 MB/s pipe: 7 steps up each). The input here is read on the
+compressing thread, where the C command reads ahead on another, which can
+change how often the input counts as blocked.
+
 ## Benchmark mode (`-b`)
 
 `zstd -b#` with the C command's options (`-e#` last level, `-i#` seconds,
@@ -125,8 +147,7 @@ command's, byte for byte.
 ## Not ported yet
 
 Refused by name (`zstd: X is not supported by this port yet`), never parsed
-and ignored: `--adapt` (it needs the compressor's progress, SPEC backlog
-Z24/Z25 of the module), `--train-legacy` (the module has no legacy trainer;
+and ignored: `--train-legacy` (the module has no legacy trainer;
 `-s#`, its selectivity, is accepted and unused, as it is by the other
 trainers), `--trace` and `--trace-file-stat`. `-M` / `--memory=` below
 1 KiB counts as 1 KiB, where libzstd refuses it.

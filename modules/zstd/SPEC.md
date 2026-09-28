@@ -989,6 +989,27 @@ a frame kept on the calling thread ignores it. The one branch never
 taken: "fewer than 32 bytes to hash" (it needs a buffer under 32 bytes
 with 128 KB in view, which the section size of 512 KB and up rules out).
 
+**The level changed during a frame** (Z24, `Stream.setLevel`,
+`ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)`, what `zstd --adapt`
+drives): a change made while a frame is under way marks the parameters
+changed (`cParamsChanged`); the next call that compresses on workers hands
+them over (`ZSTDMT_updateCParams_whileCompressing`) and every job created
+from then on gets the level's parameters for an unknown size (or
+`src_size_hint`), under the explicit ones of `advanced`, with the frame's
+window. The jobs keep the row match finder and the post-splitter the
+frame resolved on its own parameters (`MtCtx.initFrame` stores them
+resolved, as `ZSTD_CCtx_init_compressStream2` does): a frame begun at a
+`fast` level and moved to a `lazy` one searches hash chains, not rows. A
+single-threaded frame keeps its parameters; between frames the change is
+simply the next frame's level. As in libzstd, nothing but a call on
+workers clears the mark -- not the end of the frame, not `reset` -- so a
+change made during a single-threaded frame redoes the next worker frame's
+parameters for an unknown size at its first call (for 550 KB at level 12:
+chain log 22 and hash log 23 instead of 20 and 21). Which job a change
+reaches depends on when that job is created, which with free job slots
+depends only on the calls, and otherwise on the workers' timing -- in
+libzstd too; after a completed flush it is certain.
+
 ## Sequences
 
 The sequence-level API (`seqapi.zig`, with its drivers at the end of
@@ -2292,6 +2313,23 @@ equivalent: the "too little to hash" return (unreachable, see
 read); the missing `break` after a hit (the loop bound is the new
 `to_load`, so it ends anyway).
 
+**Level changes** (Z24, 2026-09-28): 8 more `mt_cases` whose schedules
+change the level (`L#`, which `zstream.c` sends as
+`ZSTD_CCtx_setParameter` and `stream_test.zig` as `setLevel`; a schedule
+may now go on after `e`, into the next frame): after a completed flush,
+from `fast` and `dfast` to `lazy` (rows stay off) and to a negative level,
+from `lazy` to `btultra2` with a 1 MB window (the splitter stays off),
+under an explicit hash log and a size hint, before any job, before the
+first call, between frames, and during a single-threaded frame, carried
+into the next frame on workers. All matched libzstd at the first run (the
+recipe checks 1 worker against 3). Schemata mutants, 10: all killed, 2 of
+them after the cases they asked for (a mark set between frames, and one
+cleared at a frame's end, need a level whose parameters for the size and
+for an unknown size differ outside the binary tree's equivalence -- level
+12 at 550 KB, not 19 at 1.1 MB, where chain log 24 against 22 is
+equivalent under a 2 MB window). Equivalent, not run: clearing the mark
+after the hand-over (handing over again gives the same parameters).
+
 **Multithreaded optimizers** (Z9b, 2026-09-25): `dict_golden_test.zig`
 runs every optimizer row of the finished-dictionary goldens with 2, 3 and
 8 threads: libzstd's single-threaded dictionary, k and d each time; a
@@ -2890,8 +2928,11 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   segment, most of a fuzz run's time): `Seekable.reset(src)`, see *Seekable
   format*. seglog can keep closed readers and reset one on the next open
   (`egw-hub/seglog/src/root.zig`, `SegStore.openZst`).
-- **Z24 — Adaptive level** (`zstd --adapt`, CLI-only in libzstd): a stream
-  that moves its level with how fast its output drains.
+- ~~**Z24 — Adaptive level**~~ Done 2026-09-28: the module's part is
+  `Stream.setLevel` (*Multithreading*, "The level changed during a
+  frame"); the adaptation itself -- `FIO_compressZstdFrame`'s statistics
+  over `frameProgression`/`toFlushNow` -- is `zstd-cli`'s `--adapt`, as it
+  is libzstd's command's.
 - **Z25 — API gaps, on a consumer's request:** a shared thread pool
   (`ZSTD_CCtx_refThreadPool`), MT progress (`ZSTD_getFrameProgression`,
   `ZSTD_toFlushNow`), the decoder in a caller's workspace with exact
@@ -2921,9 +2962,9 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   trainers' messages, *Dictionary training*), the progress counter,
   `--fake-*-is-console`, `-b` without a file, `-p`; about 220 more
   scenarios equal to the C command (the app's README). It found the
-  prefix's default content type (*Dictionaries*). Left (refused by name):
-  `--adapt` (Z24, and `getFrameProgression` of Z25), `--train-legacy` (no
-  legacy trainer here), `--trace`.
+  prefix's default content type (*Dictionaries*). `--adapt` done
+  2026-09-28 (Z24). Left (refused by name): `--train-legacy` (no legacy
+  trainer here), `--trace`.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and

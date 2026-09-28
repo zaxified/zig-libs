@@ -7,7 +7,7 @@
 # several files at once, --test, --list, and the verdicts on bad input
 # (an existing output without -f, an unknown suffix, trailing garbage, a
 # truncated frame); -r, --filelist, --output-dir-*, --patch-from, --zstd=,
-# a trained dictionary and -b without a file. When a `zstd` of version
+# a trained dictionary, -b without a file and --adapt. When a `zstd` of version
 # 1.5.7 is on PATH, also the
 # claim this app is built on: the same frames, byte for byte, and the same
 # messages as that command, for the same options.
@@ -95,6 +95,11 @@ mkdir samples; (cd samples && split -l 60 ../text s)
 "$BIN" -q --train -r samples -o dict --maxdict=8K -T1 || fail "--train"
 "$BIN" -q -D dict -c samples/saa > sd.zst && "$BIN" -q -d -D dict -c sd.zst | cmp -s - samples/saa || fail "trained dictionary round trip"
 ok; ok; ok; ok; ok; ok; ok
+# --adapt: the level moves with the I/O, the frame still decodes; workers only
+for i in $(seq 20); do cat text; done > big
+"$BIN" -q -c --adapt -T2 -B1M big | "$BIN" -q -d -c | cmp -s - big || fail "--adapt round trip"
+if "$BIN" -q -c --adapt --single-thread text > /dev/null 2>&1; then fail "--adapt accepted with --single-thread"; fi
+ok; ok
 
 # ------------------------------------------------ parity with the real command
 REF="$(command -v zstd || true)"
@@ -155,6 +160,11 @@ if [ -n "$REF" ] && [ "$(readlink -f "$REF")" != "$(readlink -f "$BIN")" ] && [ 
     same '"$REF" --train -r samples -o d --maxdict=8K -T1'
     same '"$REF" --zstd=strat=10 t -o x'
     same '"$REF" --patch-from=t -D t t19.zst'
+    same '"$REF" --adapt --single-thread t'
+    same '"$REF" --adapt=min=5,max=3 t'
+    # --adapt held at one level: the frame no longer depends on timing
+    "$REF" -q -c --adapt=min=5,max=5 -T2 big > r.zst; "$BIN" -q -c --adapt=min=5,max=5 -T2 big > o.zst
+    cmp -s r.zst o.zst || fail "--adapt=min=5,max=5 frame differs from zstd 1.5.7"
     for p in "" -P50; do
         # shellcheck disable=SC2086
         "$REF" -q -i0 -b1 -B100K $p | cols > syn.ref
@@ -166,7 +176,7 @@ if [ -n "$REF" ] && [ "$(readlink -f "$REF")" != "$(readlink -f "$BIN")" ] && [ 
     # update shown at -vvvv, single-threaded for determinism
     prog() { "$1" -vvvv --progress --single-thread -c text 2>&1 >/dev/null | tr '\r' '\n' | grep 'Buffered:'; }
     [ "$(prog "$REF")" = "$(prog "$BIN")" ] || fail "progress numbers differ from zstd 1.5.7"
-    ok; ok; ok; ok; ok; ok; ok
+    ok; ok; ok; ok; ok; ok; ok; ok
     echo "smoke: parity with $REF (1.5.7) checked"
 else
     echo "smoke: no zstd 1.5.7 on PATH — parity with the real command NOT checked (round trips and verdicts only)"

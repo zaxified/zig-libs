@@ -153,6 +153,10 @@ pub const Stream = struct {
     /// The current or last frame went to the workers
     /// (`appliedParams.nbWorkers > 0`: not when its input was too small).
     applied_mt: bool = false,
+    /// `cParamsChanged`: `setLevel` during a frame, not yet handed to the
+    /// workers. Only a call compressing on workers clears it -- not the end
+    /// of a frame, not `reset` -- as in libzstd.
+    params_changed: bool = false,
 
     /// Nothing is allocated until the first `compressStream2`, which knows
     /// whether that call ends the frame (and so the size).
@@ -199,6 +203,23 @@ pub const Stream = struct {
         s.stable_in_not_consumed = 0;
     }
 
+    /// `ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)`, allowed at any
+    /// time: the level of the frames to come and, in a frame compressed by
+    /// workers, of the jobs it starts from the next call on
+    /// (`ZSTDMT_updateCParams_whileCompressing`): the level's parameters
+    /// for an unknown size (or `src_size_hint`) under the explicit ones of
+    /// `advanced`, with the frame's window, and the frame's resolved
+    /// switches (row match finder, block splitter). A single-threaded frame
+    /// keeps its parameters. As in libzstd, a change made during a frame
+    /// that did not go to the workers waits for the next call on workers,
+    /// in whichever later frame that is, and redoes that frame's
+    /// parameters for an unknown size. What `zstd --adapt` drives.
+    pub fn setLevel(s: *Stream, level: i32) Error!void {
+        if (level > max_level) return error.LevelUnsupported;
+        if (s.stage != .init) s.params_changed = true;
+        s.opts.level = level;
+    }
+
     /// The bytes the stream's workspace holds (`ZSTD_sizeof_CCtx` less the
     /// context itself).
     pub fn workspaceSize(s: *const Stream) usize {
@@ -234,6 +255,10 @@ pub const Stream = struct {
         }
         try s.checkBufferStability(output, input);
         if (s.stage == .mt) {
+            if (s.params_changed) {
+                s.mt.?.updateLevel(s.opts.level, s.opts.src_size_hint, s.opts.advanced);
+                s.params_changed = false;
+            }
             if (s.stable_in_not_consumed != 0) {
                 // some early data was skipped: make it available
                 input.pos -= s.stable_in_not_consumed;

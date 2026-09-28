@@ -37,6 +37,7 @@ fn run(gpa: std.mem.Allocator, src: []const u8, level: i32, checksum: bool, sche
 pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, level: i32, checksum: bool, schedule: []const u8, dictionary: zstd.Dictionary) !Run {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
+    var lvl = level; // an `L` token before the first call
     var pledged: ?u64 = null;
     var window_log: ?u32 = null;
     var ocap: usize = 1 << 24;
@@ -65,6 +66,11 @@ pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, l
             continue;
         }
         if (try param_test.applyParam(&advanced, &src_size_hint, tok)) continue;
+        if (tok[0] == 'L') {
+            const l = try std.fmt.parseInt(i32, tok[1..], 10);
+            if (s) |st| try st.setLevel(l) else lvl = l;
+            continue;
+        }
         const num: usize = if (tok[1] == '*') src.len - fed else try std.fmt.parseInt(usize, tok[1..], 10);
         const dir: stream.EndDirective = switch (tok[0]) {
             'p' => {
@@ -86,7 +92,7 @@ pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, l
         };
         if (s == null) {
             if (window_log) |w| advanced.window_log = w;
-            const opts: stream.Options = .{ .level = level, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced, .dictionary = dictionary };
+            const opts: stream.Options = .{ .level = lvl, .checksum = checksum, .pledged_size = pledged, .src_size_hint = src_size_hint, .advanced = advanced, .dictionary = dictionary };
             if (reused) |r| {
                 try r.reset(opts);
                 s = r;
@@ -126,7 +132,6 @@ pub fn runOn(gpa: std.mem.Allocator, reused: ?*stream.Stream, src: []const u8, l
                 ldm_ext_dict_chunks = ls.n_ext_dict_chunks;
                 overflow_corrections += ls.n_overflow_corrections;
             }
-            break;
         }
     }
     return .{ .out = try out.toOwnedSlice(gpa), .ext_dict_blocks = ext_dict_blocks, .overflow_corrections = overflow_corrections, .ldm_ext_dict_chunks = ldm_ext_dict_chunks };
@@ -672,4 +677,14 @@ test "frameProgression and toFlushNow tell what libzstd's do" {
         try std.testing.expectEqual(@as(usize, 0), s.toFlushNow());
         if (workers != 0) try std.testing.expect(fp.current_job_id >= 1);
     };
+}
+
+test "setLevel refuses a level above the highest and keeps the one it has" {
+    const gpa = std.testing.allocator;
+    var s = try stream.Stream.init(gpa, .{ .level = 3 });
+    defer s.deinit();
+    try std.testing.expectError(error.LevelUnsupported, s.setLevel(stream.max_level + 1));
+    try std.testing.expectEqual(@as(i32, 3), s.opts.level);
+    try s.setLevel(stream.max_level);
+    try std.testing.expectEqual(stream.max_level, s.opts.level);
 }
