@@ -24,6 +24,41 @@ Usage: see ./README.md. Attribution/provenance: see this module's README "Proven
     implementation detail and only ever go through `push`/`pushChecked`/`pushIf`/`slice`/`deinit`. A
     future refactor should consider a stronger encapsulation (e.g. an opaque handle plus an
     accessor in a separate file) to make the invariant harder to violate by accident.
+- **`CharClass.explain(s) ?Reason` — DONE 2026-09-28** (requested by ttydesk). `check` is now
+  `explain(s) == null`, not a second hand-written copy of the same conditions — the two cannot
+  drift apart because there is only one implementation. `Reason` names which condition failed
+  (`too_short`, `too_long`, `nul_byte`, `leading_dash`, `forbidden_substring`, `bad_first_char`,
+  `control_byte`, `bad_byte`), tested in the exact order `check` always tested them in, so a caller
+  (a UI, a config-validation error) can say *why* a value was rejected without re-implementing
+  `check`'s rules.
+- **`Template` — an argv shape from a trusted config, holes filled from untrusted values — DONE
+  2026-09-28** (requested by ttydesk, ideal API sketched in the former backlog entry below).
+  `Template.parse(tokens, holes: []const Hole{ name, class })` validates a template
+  (`["systemctl", "restart", "{unit}"]`-shaped) up front, allocating nothing (`tokens`/`holes` are
+  borrowed — the template is config, trusted to outlive every `fill`). It fails closed on a config
+  error: an unknown hole name in a token (`error.UnknownHole` — a typo, never a per-value `fill`
+  refusal), a hole anywhere in `argv[0]` (`error.HoleInArgv0` — the program that runs must be fixed
+  by the template alone, valid-or-not name makes no difference), unbalanced `{`/`}` after
+  accounting for the `{{`/`}}` literal-brace escape (`error.UnbalancedBrace`), two holes sharing a
+  name (`error.DuplicateHoleName`), or no tokens at all (`error.EmptyTemplate`). A hole may sit
+  anywhere inside a token (`"--unit={unit}"`) or be the whole token, and the same hole may be
+  **reused** — every occurrence, in one token or across several, substitutes the identical value;
+  this is a deliberate design decision (not an oversight) documented in `Template`'s doc comment.
+  `Template.fill(gpa, values)` (positional: `values[i]` is `holes[i]`'s value) checks every value
+  with `hole.class.explain(value)` **before** building anything — the exact same predicate
+  `Argv.pushChecked` runs, so a templated value is held to identical rules, and returns a tagged
+  `FillOutcome`: `.ok` (a `Filled` owning its argv in one arena, freed by `Filled.deinit`) or
+  `.refused = .{ hole, why: CharClass.Reason }` naming which hole and why. **Flag injection**: a
+  value's own leading `-` is refused by `explain` regardless of where its hole sits in the token
+  (not just when the hole is the whole token) — deliberately position-independent, so the same hole
+  can't be "safe" in one token and "dangerous" in another depending on where the template author
+  put the braces; a hole a caller KNOWS is always embedded safely can opt out via
+  `.{ .reject_leading_dash = false }` on that hole's `CharClass`, the same escape hatch `CharClass`
+  already documents for a value passed after a `--` end-of-options marker. Empty values, NUL and
+  control bytes need no template-specific handling: they are already `min_len`/always-on
+  NUL-rejection/`reject_control` in `CharClass`, so a hole with the default class refuses them the
+  same way every convenience predicate already does.
+    accessor in a separate file) to make the invariant harder to violate by accident.
 - Pure, reentrant, no shared state; every function is pure over its arguments. Std-only.
 
 ## Threat model / out of scope
@@ -43,21 +78,22 @@ base64 exactly-44 with 43/45 rejected, `isSafePath` rejecting `..`,
 `isSafeCidrList` rejecting a leading dash even when the caller's `sep` is `'-'` itself), a
 property-style adversarial sweep feeding every predicate a raw NUL/`\n`/leading-`-`/`..`/DEL/ESC and
 asserting none are accepted, and `Argv` tests (validated build; a rejected `pushChecked`/`pushIf`
-poisons `slice()`). Green in Debug and ReleaseFast; `zig fmt --check` clean.
+poisons `slice()`). `CharClass.explain`/`check` agreement over a representative sweep of classes and
+inputs, plus each `Reason` shown reachable. `Template`: every `ParseError` (unknown hole, a hole in
+argv[0] — including an unknown name there, still `HoleInArgv0` not `UnknownHole` — unbalanced
+braces both unclosed and a stray close, duplicate hole names, an empty template), a successful fill
+with a hole as the whole token and one embedded mid-token, a hole reused twice (same token and
+across tokens) substituting consistently, `{{`/`}}` literal-brace escaping, every refusal `Reason`
+surfacing with the correct hole name, a flag-injection attempt (leading `-`) refused by default, and
+the `reject_leading_dash = false` opt-out allowing it. Green in Debug and ReleaseFast; `zig fmt
+--check` clean.
 
 ## Backlog / deferred
 
-- **argv template filled from a trusted config** (from ttydesk, 2026-09-27). `Argv.push` takes
-  only comptime literals and `buildValidatedArgv` checks every argument with one predicate, so a
-  runner whose command lines come from an admin-written config (`["systemctl", "restart",
-  "{unit}"]`, one `CharClass` per hole) cannot use the builder. Wanted: `Template.parse(tokens,
-  holes: []const Hole{ name, class })` → `fill(gpa, values)` returning the argv or
-  `refused{ hole, why }` -- literal tokens trusted (the template is config), values checked per
-  hole, holes allowed inside a token (`--name={n}`) but never as argv[0]. Plus
-  `CharClass.explain(s) ?Reason` (empty, too_long, leading_dash, substring, control, char) so a UI
-  can say why without re-implementing `check`. ttydesk fills and explains itself today
-  (`src/actions.zig`, marked `zig-libs request: argsafe — argv template`). Precedent: Ansible,
-  systemd `ExecStart=` specifiers, Rundeck/StackStorm actions.
+~~**argv template filled from a trusted config**~~ — **DONE 2026-09-28**, see the "Design &
+invariants" `Template`/`CharClass.explain` bullets above. Precedent this design followed: Ansible,
+systemd `ExecStart=` specifiers, Rundeck/StackStorm actions.
+
 Windows argv quoting and environment-variable-injection allowlisting are explicitly out of scope for
 v1 (see Threat model). No other deferred items in README beyond the general pre-public
 review pass.

@@ -89,6 +89,54 @@ There is no public raw-append. A rejected push **poisons** the builder, so
 `slice()` returns `error.Rejected` even if the caller swallowed the earlier
 error — a validation failure can never silently ship a short argv.
 
+### `Template` — an argv shape from a trusted config, holes filled from untrusted values
+
+```zig
+const holes = [_]argsafe.Hole{
+    .{ .name = "unit", .class = .{ .extra = "_-.@", .first_char = .alnum } },
+};
+const t = try argsafe.Template.parse(&.{ "systemctl", "restart", "{unit}" }, &holes);
+
+var out = try t.fill(gpa, &.{unit_value}); // one value per hole, same order as `holes`
+switch (out) {
+    .ok => |*filled| {
+        defer filled.deinit();
+        const res = try std.process.run(gpa, io, .{ .argv = filled.argv });
+    },
+    .refused => |r| std.log.warn("{s}: refused ({})", .{ r.hole, r.why }),
+}
+```
+
+For a runner whose command lines come from an admin-written config
+(`["systemctl", "restart", "{unit}"]`, one `CharClass` per named hole) rather
+than being built in Zig source. `Template.parse` validates up front and
+allocates nothing — `tokens`/`holes` are borrowed, so the config must outlive
+every `fill` call. It fails closed on a config error, never a per-value
+refusal: `error.UnknownHole` (a `{name}` not in `holes`), `error.HoleInArgv0`
+(any hole in the program name, valid or not), `error.UnbalancedBrace`, or
+`error.DuplicateHoleName`. A hole may be the whole token or sit inside one
+(`"--unit={unit}"`), and the same hole may be **reused** — every occurrence
+substitutes the identical value. Write a literal `{`/`}` doubled — `{{`/`}}`
+— the same convention as `std.fmt`/Python `str.format`.
+
+`fill` checks every value with `hole.class.explain(value)` — the exact same
+rule `pushChecked` runs — **before** building anything, so a templated value
+is held to identical rules as a hand-built `Argv`. A leading `-` is refused
+regardless of where the hole sits in its token (not just when the hole is the
+whole token) — deliberately position-independent, so the same hole can't be
+"safe" in one token and "dangerous" in another depending on where the braces
+land; opt out per-hole with `.{ .reject_leading_dash = false }` when a hole is
+known to sit somewhere a leading `-` can't reach argv-token start (the same
+escape hatch `CharClass` already documents for a value passed after `--`).
+The result is a tagged `FillOutcome`: `.ok` (a `Filled` owning its argv in one
+arena — `Filled.deinit` frees it) or `.refused = .{ hole, why: CharClass.Reason }`.
+
+`CharClass.explain(s) ?CharClass.Reason` backs the refusal: `check(s)` is now
+just `explain(s) == null`, so the two can never disagree. `Reason` names which
+rule failed (`too_short`, `too_long`, `nul_byte`, `leading_dash`,
+`forbidden_substring`, `bad_first_char`, `control_byte`, `bad_byte`) for a UI
+that wants to say why without re-implementing `check`.
+
 ## Boundaries (deferred — out of scope for v1)
 
 - **Windows `CommandLineToArgvW` quoting.** This module is POSIX-argv only. On
