@@ -346,6 +346,14 @@ The RED comes from the foreign corpus and from nothing else.
 
 - permessage-deflate (RFC 7692) extension negotiation + DEFLATE framing — see "Out of scope" above.
 - No automatic keepalive/ping-interval scheduling — event-loop-specific, left to the caller.
+- **Fail fast on invalid UTF-8 within one frame** (from qap's Autobahn lane, 2026-09-28).
+  `83b2552a` validates per fragment, so §6.4.1-2 pass; §6.4.3-4 (one text frame delivered in TCP
+  chops, invalid from an early chop) are still NON-STRICT: `Connection.receive` consumes whole
+  frames only, so the payload is checked once the frame is complete. autobahn-python and gorilla
+  fail at the chop. Would need `receive` to take a partial data frame -- unmask and feed
+  `IncrementalUtf8` with the bytes so far, keep the mask offset -- or a separate
+  `peekText(partial)` a caller runs on a partial frame. qap baselines the two cases
+  (`scripts/conformance-baseline/autobahn.tsv`).
 
 ## Anchoring
 
