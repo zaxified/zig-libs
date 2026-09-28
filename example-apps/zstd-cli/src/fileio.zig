@@ -512,6 +512,7 @@ pub const CRess = struct {
     /// `FIO_createCResources`. `max_src_size`: the largest input's size,
     /// for `--patch-from`.
     pub fn init(env: Env, prefs: *Prefs, dict_name: ?[]const u8, max_src_size: u64, level: i32, cp_in: CParams) CRess {
+        disp.at(6, "FIO_createCResources \n", .{});
         var cp = cp_in;
         // the limit is updated before the dictionary is read: it checks it
         if (prefs.patch_from) {
@@ -544,7 +545,11 @@ pub const CRess = struct {
             .rsyncable = prefs.rsyncable,
         };
         // libzstd clamps the overlap log where the module refuses it
-        if (prefs.overlap_log) |o| adv.overlap_log = @min(o, zstd.limits.overlap_log_max);
+        disp.at(5, "set nb workers = {d} \n", .{prefs.nb_workers});
+        if (prefs.overlap_log) |o| {
+            disp.at(3, "set overlapLog = {d} \n", .{o});
+            adv.overlap_log = @min(o, zstd.limits.overlap_log_max);
+        }
         const opts: zstd.StreamOptions = .{
             .level = level,
             .checksum = prefs.checksum != 0,
@@ -589,13 +594,32 @@ fn nz(v: u32) ?u32 {
 fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, src: Src, src_name: []const u8, readsize: *u64) u64 {
     const file_size = src.size();
     var opts = ress.opts;
+    disp.at(6, "compression using zstd format \n", .{});
     opts.pledged_size = file_size orelse if (prefs.stream_src_size > 0) prefs.stream_src_size else null;
     ress.stream.reset(opts) catch |e| fatal(11, "{s}", .{zstdErrorName(e)});
+    {
+        // the window the decoder will need: the explicit one, long mode's
+        // default, or the level's for the size
+        const window_log: u32 = opts.advanced.window_log orelse if (prefs.ldm)
+            27 // ZSTD_WINDOWLOG_LIMIT_DEFAULT
+        else
+            zstd.getCParams(opts.level, file_size orelse unknown_size, 0).window_log;
+        const pledged = opts.pledged_size orelse unknown_size;
+        const h = disp.hrs(@max(1, @min(@as(u64, 1) << @intCast(window_log), pledged)));
+        if (disp.level >= 4) {
+            const w = disp.err();
+            w.writeAll("Decompression will require ") catch {};
+            disp.fixed(w, h.value, 0, h.precision) catch {};
+            w.print("{s} of memory\n", .{h.suffix}) catch {};
+            disp.flush();
+        }
+    }
     var compressed: u64 = 0;
     var rb: ReadBuf = .{ .file = src.file, .buf = ress.in_buf };
     var directive: zstd.EndDirective = .@"continue";
     while (directive != .end) {
         const n = rb.readJob(env.io);
+        disp.at(6, "fread {d} bytes from source \n", .{n});
         readsize.* += n;
         if (n == 0 or (file_size != null and readsize.* == file_size.?)) directive = .end;
         var in: zstd.InBuffer = .{ .src = rb.loaded() };
@@ -603,17 +627,15 @@ fn compressFrame(env: Env, ctx: *const Ctx, prefs: *const Prefs, ress: *CRess, d
         while (in.pos != in.src.len or (directive == .end and still != 0)) {
             var out: zstd.OutBuffer = .{ .dst = ress.out_buf };
             still = ress.stream.compressStream2(&out, &in, directive) catch |e| fatal(11, "{s}", .{zstdErrorName(e)});
+            disp.at(6, "ZSTD_compress_generic(end:{d}) => input pos({d})<=({d})size ; output generated {d} bytes \n", .{ @intFromEnum(directive), in.pos, in.src.len, out.pos });
             if (out.pos != 0) {
                 if (dst) |d| d.write(ress.out_buf[0..out.pos]);
                 compressed += out.pos;
             }
             // display notification
             if (disp.shouldProgress() and disp.readyForUpdate(env.io)) {
-                // zig-libs: SPEC backlog Z25 (`getFrameProgression`) -- until
-                // the stream reports what it holds, "consumed" is what it
-                // was given and nothing counts as buffered
-                const consumed = readsize.* - (in.src.len - in.pos);
-                showCompressProgress(env.io, ctx, ress.opts.level, src_name, file_size, 0, consumed, compressed);
+                const fp = ress.stream.frameProgression();
+                showCompressProgress(env.io, ctx, ress.opts.level, src_name, file_size, fp.ingested - fp.consumed, fp.consumed, fp.produced);
             }
         }
         rb.consume(rb.end - rb.start);
@@ -676,6 +698,8 @@ fn showCompressProgress(io: Io, ctx: *const Ctx, level: i32, src_name: []const u
 /// `FIO_compressFilename_internal`.
 fn compressInternal(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst: ?*Dst, dst_name: []const u8, src: Src, src_name: []const u8) void {
     var readsize: u64 = 0;
+    const time_start = Io.Timestamp.now(env.io, .awake).nanoseconds;
+    const cpu_start = Io.Timestamp.now(env.io, .cpu_process).nanoseconds;
     disp.at(5, "{s}: {d} bytes \n", .{ src_name, src.size() orelse std.math.maxInt(u64) });
     const compressed = compressFrame(env, ctx, prefs, ress, dst, src, src_name, &readsize);
     ctx.total_in += readsize;
@@ -699,6 +723,19 @@ fn compressInternal(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst:
         w.print("{s}, {s}) \n", .{ ho.suffix, dst_name }) catch {};
         disp.flush();
     }
+    // elapsed time and CPU load
+    if (disp.level >= 4) {
+        const cpu_s = @as(f64, @floatFromInt(Io.Timestamp.now(env.io, .cpu_process).nanoseconds - cpu_start)) / 1e9;
+        const time_s = @as(f64, @floatFromInt(Io.Timestamp.now(env.io, .awake).nanoseconds - time_start)) / 1e9;
+        const w = disp.err();
+        disp.left(w, src_name, 20) catch {};
+        w.writeAll(" : Completed in ") catch {};
+        disp.fixed(w, time_s, 0, 2) catch {};
+        w.writeAll(" sec  (cpu load : ") catch {};
+        disp.fixed(w, cpu_s / time_s * 100, 0, 0) catch {};
+        w.writeAll("%)\n") catch {};
+        disp.flush();
+    }
 }
 
 /// `FIO_compressFilename_dstFile`: 0 ok, 1 failed.
@@ -708,6 +745,7 @@ fn compressDstFile(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst_n
         return 0;
     }
     const transfer = !isStdin(src_name) and !isStdout(dst_name) and src.st != null and src.st.?.kind == .file;
+    disp.at(6, "FIO_compressFilename_dstFile: opening dst: {s} \n", .{dst_name});
     var dst = openDst(env, ctx, prefs, src_name, dst_name, if (transfer) 0o600 else 0o666) orelse
         return if (prefs.test_mode) blk: {
             compressInternal(env, ctx, prefs, ress, null, dst_name, src, src_name);
@@ -715,6 +753,7 @@ fn compressDstFile(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst_n
         } else 1;
     compressInternal(env, ctx, prefs, ress, &dst, dst_name, src, src_name);
     var result: u1 = 0;
+    disp.at(6, "FIO_compressFilename_dstFile: closing dst: {s} \n", .{dst_name});
     if (!dst.close(env.io, if (transfer) src.st.? else null)) {
         disp.at(1, "zstd: {s}: {s} \n", .{ dst_name, "Input/output error" });
         result = 1;
@@ -748,6 +787,7 @@ fn isCompressedFile(name: []const u8) bool {
 
 /// `FIO_compressFilename_srcFile`: 0 ok, 1 failed.
 fn compressSrcFile(env: Env, ctx: *Ctx, prefs: *const Prefs, ress: *CRess, dst_name: []const u8, src_name: []const u8) u1 {
+    disp.at(6, "FIO_compressFilename_srcFile: {s} \n", .{src_name});
     if (!isStdin(src_name)) {
         if (stat(env, src_name)) |st| {
             if (st.kind == .directory) {

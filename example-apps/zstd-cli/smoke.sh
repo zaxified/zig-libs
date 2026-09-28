@@ -162,7 +162,11 @@ if [ -n "$REF" ] && [ "$(readlink -f "$REF")" != "$(readlink -f "$BIN")" ] && [ 
         "$BIN" -q -i0 -b1 -B100K $p | cols > syn.ours
         [ -s syn.ref ] && cmp -s syn.ref syn.ours || { diff syn.ref syn.ours >&2 || true; fail "-b $p (synthetic) sizes differ from zstd 1.5.7"; }
     done
-    ok; ok; ok; ok; ok; ok
+    # the progress counter's numbers (ZSTD_getFrameProgression), every
+    # update shown at -vvvv, single-threaded for determinism
+    prog() { "$1" -vvvv --progress --single-thread -c text 2>&1 >/dev/null | tr '\r' '\n' | grep 'Buffered:'; }
+    [ "$(prog "$REF")" = "$(prog "$BIN")" ] || fail "progress numbers differ from zstd 1.5.7"
+    ok; ok; ok; ok; ok; ok; ok
     echo "smoke: parity with $REF (1.5.7) checked"
 else
     echo "smoke: no zstd 1.5.7 on PATH — parity with the real command NOT checked (round trips and verdicts only)"

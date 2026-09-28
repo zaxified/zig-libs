@@ -113,15 +113,14 @@ command's, byte for byte.
 - **Two inputs the C command aborts on** (a failed `assert`, exit 134) are
   handled: `--patch-from` with an empty input writes its (empty) frame, and
   `--train` with `-B#` above 128 KiB cuts the samples to that size.
+- **From `-vvv` up (level 5)** the C command's fatal errors also name the
+  failing call and its own source line (`Error defined at fileio.c, line
+  1565`); this port's do not. Every other debug line is there.
 - **Training's percentages.** libzstd's trainers print `NN%` progress at
   most every 150 ms of CPU time; they are not printed here (every other
   trainer message is). With several threads, of two equally good candidate
   dictionaries libzstd keeps whichever finished first; this port always the
   first in its search order -- libzstd's single-threaded choice.
-- **The progress counter while compressing** shows as read what the command
-  has handed to the compressor; libzstd reports what it has compressed so
-  far (`ZSTD_getFrameProgression`, not in the module yet), and `-v`'s
-  "Buffered" is 0 here.
 
 ## Not ported yet
 
