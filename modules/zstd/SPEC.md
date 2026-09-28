@@ -3010,6 +3010,24 @@ below is this module's own, beyond that gate:
   not this module's contract. *Never.* (A CLI at parity as an example
   program, a consumer of the library, is Z26.)
 
+- **Legacy frame formats v0.5–v0.7 (Z30).** libzstd 1.5.7 decodes them by
+  default (`ZSTD_LEGACY_SUPPORT=5`); this decoder refuses them
+  (`error.PrefixUnknown`, as a libzstd built without legacy support).
+  They are the formats of 2015–2016, before the format was frozen in
+  v0.8 / 1.0; no producer has written them for a decade, and supporting
+  them would mean porting ~12 600 lines of C (`zstd_v05.c`–`zstd_v07.c`),
+  a second decoder per version to keep and fuzz, for frames nobody
+  sends. *Never*, unless a real archive of such frames turns up.
+- **The legacy dictionary trainer and `--trace` (Z31).**
+  `ZDICT_trainFromBuffer_legacy` (`zstd --train-legacy`) is libzstd's
+  static, experimental suffix-array trainer (divsufsort, ~1 900 lines
+  more): slower than and not better than the cover and fastCover trainers
+  this module has, which libzstd's own command uses by default. `--trace`
+  writes libzstd's `ZSTD_TRACE` hook data as a per-file CSV, a
+  profiling aid of libzstd's own build with no bearing on the bytes.
+  `zstd-cli` refuses both by name. *Never*, both decided by the user
+  2026-09-28.
+
 ## Backlog / deferred
 
 Toward the goal above. "Session" ≈ one working session of the size of the
@@ -3241,15 +3259,10 @@ From the port-vs-libzstd comparison (2026-09-26; a 20 MB tar of Zig's
   `compressUsingDict` and `compressUsingCDict` take any `dst`, with
   libzstd's frame for that room or `error.DstSizeTooSmall` where libzstd
   fails (`error.NoSpaceLeft` is gone from `zstd.Error`).
-- **Z30 — Legacy frame formats (pre-v0.8).** libzstd 1.5.7 is built by
-  default with `ZSTD_LEGACY_SUPPORT=5` and decodes v0.5–v0.7 frames
-  (2015–2016, before the format was frozen); this decoder refuses them.
-  Written down as "no" in Z2 without a reason: to decide.
-- **Z31 — What `zstd-cli` refuses by name:** `--train-legacy` (needs
-  libzstd's legacy trainer, `ZDICT_trainFromBuffer_legacy`, over
-  divsufsort -- written down as "no" in Z5 without a reason) and
-  `--trace` (libzstd's `ZSTD_TRACE` hooks writing a per-file CSV). To
-  decide.
+- ~~**Z30 — Legacy frame formats (pre-v0.8).**~~ Decided 2026-09-28: no,
+  see *What is deliberately not done*.
+- ~~**Z31 — What `zstd-cli` refuses by name**~~ (`--train-legacy`,
+  `--trace`). Decided 2026-09-28: no, see *What is deliberately not done*.
 - ~~**Z27 — the measurement tool**~~ Done 2026-09-27 as `zstd-cli`'s `-b`
   (a port of `benchzstd.c`/`benchfn.c`, not a separate example): the C
   command's blocks, timed runs and output, so `zstd -b` and
