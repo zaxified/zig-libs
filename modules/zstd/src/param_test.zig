@@ -213,7 +213,8 @@ test "parameters outside libzstd's bounds are refused, its edges accepted" {
         // edge.
         .{ .ok = &.{ .{ .window_log = 10 }, .{ .window_log = params.window_log_max } }, .bad = &.{ .{ .window_log = 9 }, .{ .window_log = params.window_log_max + 1 } } },
         .{ .ok = &.{ .{ .hash_log = 6 }, .{ .hash_log = 30 } }, .bad = &.{ .{ .hash_log = 5 }, .{ .hash_log = 31 } } },
-        .{ .ok = &.{ .{ .chain_log = 6 }, .{ .chain_log = 30 } }, .bad = &.{ .{ .chain_log = 5 }, .{ .chain_log = 31 } } },
+        // `params.chain_log_max`: `ZSTD_CHAINLOG_MAX_32` is 29
+        .{ .ok = &.{ .{ .chain_log = 6 }, .{ .chain_log = params.chain_log_max } }, .bad = &.{ .{ .chain_log = 5 }, .{ .chain_log = params.chain_log_max + 1 } } },
         // `params.search_log_max` (`ZSTD_SEARCHLOG_MAX` =
         // `ZSTD_WINDOWLOG_MAX - 1`): 29 on a 32-bit target, not the
         // 64-bit-only bare `30`.
@@ -445,6 +446,9 @@ fn answerQuery(line: []const u8) ![7]u32 {
 }
 
 test "adjustCParams and getCParams answer as ZSTD_adjustCParams and ZSTD_getCParams" {
+    // libzstd's answers for a 64-bit `size_t`: a 32-bit one has other
+    // bounds (`ZSTD_WINDOWLOG_MAX_32`, `ZSTD_CHAINLOG_MAX_32`)
+    if (@sizeOf(usize) != 8) return error.SkipZigTest;
     const want = @import("testdata/cparams_goldens.zig");
     try std.testing.expectEqual(@as(usize, corpus.cparams_samples), want.count);
     var h: std.crypto.hash.sha2.Sha256 = .init(.{});

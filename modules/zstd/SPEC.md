@@ -2700,9 +2700,11 @@ the test's expectation assumed 64-bit; now `* @sizeOf(usize)`. And
 1`, 29 not 30) and `ldm_hash_rate_log` (`params.ldm_hash_rate_log_max` =
 `ZSTD_LDM_HASHRATELOG_MAX` = `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`, 24
 not 25) -- all three confirmed against libzstd's own `zstd.h`.
-`hash_log`/`chain_log`'s edges (30/31) needed no change: their bound is a
-fixed `ZSTD_HASHLOG_MAX`/`ZSTD_CHAINLOG_MAX` = 30, not derived from
-`ZSTD_WINDOWLOG_MAX`.
+`hash_log`'s edges (30/31) needed no change: `ZSTD_HASHLOG_MAX` is 30 at
+either width. `chain_log`'s did, found only on 2026-09-28 (Z25's
+`adjustCParams` clamp): `ZSTD_CHAINLOG_MAX` is `ZSTD_CHAINLOG_MAX_32` = 29
+on a 32-bit `size_t`, not 30, so a 32-bit build accepted
+`chain_log = 30`, which libzstd refuses; now `params.chain_log_max`.
 
 **Anchoring.** `check-portable`'s own claim is compile-only
 (`build.zig`'s comment on why: `addTest`, never run, on every

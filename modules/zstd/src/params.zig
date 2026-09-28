@@ -629,10 +629,12 @@ pub const ldm_bucket_size_log_min = 1;
 pub const ldm_bucket_size_log_max = 8;
 /// `ZSTD_LDM_HASHRATELOG_MAX`: `ZSTD_WINDOWLOG_MAX - ZSTD_HASHLOG_MIN`.
 pub const ldm_hash_rate_log_max = window_log_max - hash_log_min;
-/// `ZSTD_HASHLOG_MAX`, `ZSTD_CHAINLOG_MAX` (64-bit).
+/// `ZSTD_HASHLOG_MAX`: 30 at either width.
 pub const hash_log_max = 30;
 pub const chain_log_min = 6;
-pub const chain_log_max = 30;
+/// `ZSTD_CHAINLOG_MAX`: `ZSTD_CHAINLOG_MAX_64` (30), or
+/// `ZSTD_CHAINLOG_MAX_32` (29) on a 32-bit `usize`.
+pub const chain_log_max = if (@sizeOf(usize) == 4) 29 else 30;
 pub const search_log_min = 1;
 /// `ZSTD_SEARCHLOG_MAX`: `ZSTD_WINDOWLOG_MAX` - 1.
 pub const search_log_max = window_log_max - 1;

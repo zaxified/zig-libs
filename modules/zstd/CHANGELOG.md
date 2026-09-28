@@ -5,6 +5,9 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — Fixed (32-bit targets only): `Advanced.chain_log` and
+  `limits.chain_log_max` allowed 30 where libzstd's bound is
+  `ZSTD_CHAINLOG_MAX_32` = 29; now `error.ParameterOutOfBound`, as libzstd.
 - **2026-09-28** — **BREAKING (error name):** one-shot compression takes a
   destination of any size, as `ZSTD_compress2` does (Z29): `compress`,
   `Compressor.compress` (with workers too), `compressUsingDict` and
