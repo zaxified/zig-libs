@@ -25,6 +25,9 @@ pub const ExampleProducer = struct {
     mode: u32,
     calls: u32 = 0,
     table: [4096]u32 = undefined,
+    /// The sequences mode bit 13 replays.
+    list: []const zstd.Sequence = &.{},
+    pos: usize = 0,
 
     pub fn producer(p: *ExampleProducer) zstd.SequenceProducer {
         return .{ .context = p, .produce = produce };
@@ -40,6 +43,17 @@ pub const ExampleProducer = struct {
         if (period != 0 and p.calls % period == 0) return error.SequenceProducerFailed;
         if (p.mode & 32 != 0) return 0;
         if (p.mode & 64 != 0) return out.len + 1;
+        if (p.mode & 8192 != 0) {
+            var ns: usize = 0;
+            while (p.pos < p.list.len and ns < out.len) {
+                const s = p.list[p.pos];
+                p.pos += 1;
+                out[ns] = s;
+                ns += 1;
+                if (s.offset == 0 and s.match_length == 0) break;
+            }
+            return ns;
+        }
         @memset(&p.table, 0xFFFFFFFF);
         const mm: usize = if (p.mode & 256 != 0) 3 else 4;
         const n = src.len;
@@ -72,6 +86,9 @@ pub const ExampleProducer = struct {
             out[ns] = .{ .offset = 0, .lit_length = ll, .match_length = 0 };
             ns += 1;
         }
+        if (p.mode & 4096 != 0) while (ns < out.len) : (ns += 1) {
+            out[ns] = .{ .offset = 0, .lit_length = 0, .match_length = 0 };
+        };
         return ns;
     }
 };
@@ -187,7 +204,7 @@ fn runCase(gpa: std.mem.Allocator, comp: *zstd.Compressor, sc: corpus.SeqCase, l
     } else blk: {
         var it = std.mem.splitScalar(u8, sc.cmd, ':');
         const kind = it.next().?;
-        var prod: ExampleProducer = .{ .mode = try std.fmt.parseInt(u32, it.next().?, 10) };
+        var prod: ExampleProducer = .{ .mode = try std.fmt.parseInt(u32, it.next().?, 10), .list = seqs };
         opts.sequence_producer = prod.producer();
         if (std.mem.eql(u8, kind, "prod")) break :blk comp.compress(dst, src, opts) catch |e| {
             gpa.free(dst);
@@ -217,7 +234,7 @@ fn runCase(gpa: std.mem.Allocator, comp: *zstd.Compressor, sc: corpus.SeqCase, l
 
 /// The sequences a case reads (`seqgen`, as the recipe dumps them).
 fn caseSequences(gpa: std.mem.Allocator, sc: corpus.SeqCase, src: []const u8) ![]zstd.Sequence {
-    const reads = std.mem.eql(u8, sc.cmd, "merge") or std.mem.eql(u8, sc.cmd, "cseq") or std.mem.eql(u8, sc.cmd, "clit");
+    const reads = std.mem.eql(u8, sc.cmd, "merge") or std.mem.eql(u8, sc.cmd, "cseq") or std.mem.eql(u8, sc.cmd, "clit") or sc.gen.list.len != 0;
     if (!reads) return gpa.alloc(zstd.Sequence, 0);
     const table = try gpa.create([1 << 16]u32);
     defer gpa.destroy(table);
@@ -296,7 +313,11 @@ test "the sequence-level API is byte-identical to libzstd 1.5.7, errors included
                     }
                     // generated sequences rebuild their input; frames from
                     // valid sequences decode back to it
-                    if (std.mem.eql(u8, sc.cmd, "gen") and sc.dict == null) {
+                    // (`gen-ll-65536` excepted: libzstd reports a wrong
+                    // offset after a literal length of exactly 65 536, and
+                    // so does the port -- see SPEC.md, *Anchoring*)
+                    if (std.mem.eql(u8, sc.cmd, "gen")) {
+                        if (sc.dict != null or std.mem.eql(u8, sc.name, "gen-ll-65536")) continue;
                         const back = try gpa.alloc(u8, src.len);
                         defer gpa.free(back);
                         // (the records are little-endian, as the goldens are)

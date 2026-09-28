@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
         const src = try gpa.alloc(u8, findCase(sc.input).len);
         defer gpa.free(src);
         corpus.generate(findCase(sc.input), src);
-        const reads = std.mem.eql(u8, sc.cmd, "merge") or std.mem.eql(u8, sc.cmd, "cseq") or std.mem.eql(u8, sc.cmd, "clit");
+        const reads = std.mem.eql(u8, sc.cmd, "merge") or std.mem.eql(u8, sc.cmd, "cseq") or std.mem.eql(u8, sc.cmd, "clit") or sc.gen.list.len != 0;
         const seq_name = try std.fmt.allocPrint(gpa, "seq-{s}.seq", .{sc.name});
         defer gpa.free(seq_name);
         if (reads) {
