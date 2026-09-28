@@ -246,6 +246,9 @@ declare -A TARGETS=(
     # (see each harness's module doc comment).
     [opaque]="register login serverke2"
     [bip32]="master derive seed mnemonic"
+    # ── 2026-09-28: aesgcm (stitched AES-NI kernel + std-primitive backend) ─
+    # Key AND plaintext tainted; see modules/aesgcm/src/ctgrind_harness.zig.
+    [aesgcm]="ctx stateless generic"
 )
 declare -A MODES=(
     [bolt8]="ReleaseFast"
@@ -292,6 +295,7 @@ declare -A MODES=(
     [pir]="ReleaseFast"
     [opaque]="ReleaseFast"
     [bip32]="ReleaseFast"
+    [aesgcm]="ReleaseFast"
 )
 # Keyed "<module>/<target>".
 declare -A PATTERN=(
@@ -511,6 +515,12 @@ declare -A PATTERN=(
     [bip32/derive]='bip32[.]zig'
     [bip32/seed]='bip39[.]zig'
     [bip32/mnemonic]='bip39[.]zig'
+    # aesgcm's kernel is its own root.zig; the `generic` backend is std's
+    # AES/CTR/GHASH with the key schedule cached, so std's files are named
+    # for it -- their constant-time property IS that backend's.
+    [aesgcm/ctx]='root[.]zig'
+    [aesgcm/stateless]='root[.]zig'
+    [aesgcm/generic]='root[.]zig|aes[.]zig|aesni[.]zig|soft[.]zig|ghash_polyval[.]zig|modes[.]zig|aes_gcm[.]zig|timing_safe[.]zig'
     [threshold_ecdsa/nonce]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
     [threshold_ecdsa/betaprime]='signing[.]zig|root[.]zig|mta[.]zig|zkproofs[.]zig|montint[.]zig|asm_core[.]zig|limbs[.]zig|ff[.]zig|secp256k1[.]zig|secp256k1_64[.]zig|secp256k1_scalar_64[.]zig|common[.]zig|ecdsa[.]zig|scalar[.]zig|mem[.]zig|int[.]zig|math[.]zig|memcpy[.]zig|memmove[.]zig|compiler_rt[.]zig'
 )
@@ -650,6 +660,9 @@ declare -A LABEL=(
     [bip32/derive]='bip32 derivePath (master scalar)+k256'
     [bip32/seed]='bip39 mnemonicToSeed (PBKDF2)'
     [bip32/mnemonic]='bip39 mnemonicToEntropy (wordIndex search)'
+    [aesgcm/ctx]='aesgcm Context aesni (key+pt)'
+    [aesgcm/stateless]='aesgcm stateless aesni (key+pt)'
+    [aesgcm/generic]='aesgcm Context generic+std (key+pt)'
 )
 
 # ── measurement ────────────────────────────────────────────────────────────

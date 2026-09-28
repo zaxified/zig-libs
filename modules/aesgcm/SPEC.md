@@ -115,10 +115,41 @@ tag, and whether the tag verified.
   (x86-64 with `aes`+`avx` in the target, arm64 with `aes`); on other targets
   std's software AES and GHASH, whose side-channel posture is std's.
 
-This rests on reading the code and the generated assembly
-(`zig build-obj -femit-asm`, ReleaseFast, 2026-09-28: the stitched loop is
-`vaesenc`/`vpclmulqdq`/`vpshufb`/`vpxor` and loads/stores with no branch
-inside); there is no ctgrind harness yet (see *Open*).
+**Measured** with valgrind/memcheck (`scripts/checks/ctgrind.sh aesgcm`,
+harness `src/ctgrind_harness.zig`, ReleaseFast, 2026-09-28, valgrind 3.26,
+i7-7920HQ). The key AND the plaintext are marked undefined, so round keys, H
+and its powers, keystream, ciphertext, `E(K, J0)` and the tag are all
+secret-derived to memcheck; nonce, AD and lengths stay defined. Each target
+seals, opens the genuine record and opens a forged one, for AES-128 and
+AES-256, at lengths reaching every path (short single group, AD-then-tail,
+one batch plus delayed GHASH, the stitched loop with a partial block):
+
+| target | what | in-file | witness | untainted | no `-fvalgrind` |
+|---|---|---:|---:|---:|---:|
+| `ctx` | `Context` on `.aesni` | 4 | 4 | 0 | 0 |
+| `stateless` | `Gcm.encrypt/decrypt(…, key)` on `.aesni` | 4 | 4 | 0 | 0 |
+| `generic` | `Context` on `.generic` (std's AES/CTR/GHASH counted as ours) | 4 | 4 | 0 | 0 |
+
+All four in-file contexts of a row are ONE source line — the tag-check branch
+`if (!timing_safe.eql(computed, tag))` (`NiKey.open`, resp. `Generic.open`),
+reached from the harness's genuine and forged `open` for each key size. That
+branch is the pass/fail bit the API returns; nothing else — key schedule,
+stitched batch, tail, GHASH, `seal` — branches on or indexes by a secret.
+The witness contexts are the harness printing the tags (proof the taint
+arrived). Pinned in `scripts/checks/ctgrind-expected.tsv` (counts, source and
+output digests); `--check` is green.
+
+**Positive controls** (injected, measured, reverted): a branch on a keystream
+byte inside the stitched `batch` plus one on a plaintext byte in `sealTail`
+took `ctx`/`stateless` from 4 to 54 in-file; a branch on a ciphertext byte in
+`Generic.seal` took `generic` from 4 to 6. Replacing `timing_safe.eql` with
+`mem.eql` does *not* move the count — LLVM compiles a fixed 16-byte `mem.eql`
+to one vector compare and one branch — which is why the comparison is also
+pinned by `scripts/checks/check-ct-compare.py`, not by ctgrind.
+
+Not measured: the `.generic` stateless path (it is `std.crypto.aead.aes_gcm`
+itself, reachable only on a CPU without AES-NI), and the legacy-SSE encodings
+of a baseline-x86 build (memcheck sees the same instruction classes).
 
 **Wiping** (`CONVENTIONS.md` §2.1): a `Context` is Z2 — the caller's, wiped by
 `wipe()`, which zeroes every byte of it. The stateless path's stack context
@@ -205,9 +236,6 @@ review, as §2.1 says they must be.
 
 ## Open
 
-- A ctgrind harness (`src/ctgrind_harness.zig`) marking key and plaintext
-  undefined through one seal/open, to turn the constant-time review above into
-  a measurement.
 - The x86 path on a CPU without AVX has been exercised only by building for
   `-Dcpu=x86_64` on an AVX machine (the legacy encodings ran; the absence of
   AVX elsewhere in the binary was not tested on real pre-AVX hardware).

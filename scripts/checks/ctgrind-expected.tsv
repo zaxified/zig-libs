@@ -642,3 +642,21 @@ bip32	ReleaseFast	master	1	1	da144758a15f2f06	7e14466ed98567fa
 bip32	ReleaseFast	derive	1	5	da144758a15f2f06	8b410bdbd3955f08
 bip32	ReleaseFast	seed	1	0	008c60b09bb381e3	9e74b23db4ad7bdc
 bip32	ReleaseFast	mnemonic	1	3	008c60b09bb381e3	d42db8cf9cdc2200
+# aesgcm — added 2026-09-28. Key AND plaintext tainted (so round keys, H
+# powers, keystream, ciphertext and tag are all secret-derived to memcheck).
+# The 4 in-file contexts per row are ONE line, the tag-check branch
+# `if (!timing_safe.eql(computed, tag))` -- root.zig NiKey.open for ctx and
+# stateless, Generic.open for generic -- reached from two harness call sites
+# (genuine and forged record) for each of AES-128 and AES-256. Branching on the
+# ANSWER is the API; the comparison producing it is branch-free. Nothing in
+# `seal`, the stitched batch, the tail or the key schedule branches on a
+# secret. Positive controls (2026-09-28, then reverted): a branch on a
+# keystream byte in `batch` and on a plaintext byte in `sealTail` took
+# ctx/stateless from 4 to 54 in-file; a branch on a ciphertext byte in
+# `Generic.seal` took generic from 4 to 6. (Swapping `timing_safe.eql` for
+# `mem.eql` does NOT move the count: LLVM compiles a fixed 16-byte `mem.eql`
+# to one vector compare and one branch -- the same single context.)
+# The three out_sha are equal on purpose: the three paths compute the same tags.
+aesgcm	ReleaseFast	ctx	1	4	fcbaf5fdaad0b6e4	beb9b7dd29864dad
+aesgcm	ReleaseFast	stateless	1	4	fcbaf5fdaad0b6e4	beb9b7dd29864dad
+aesgcm	ReleaseFast	generic	1	4	fcbaf5fdaad0b6e4	beb9b7dd29864dad

@@ -12,6 +12,7 @@
 # looks like and what a refactor usually does not.
 modules/aaa-gate/src/root.zig	4	2
 modules/aeadframe/src/channel.zig	1	5
+modules/aesgcm/src/root.zig	2	1
 modules/aeskw/src/root.zig	1	0
 modules/blindrsa/src/root.zig	1	1
 modules/chachapoly/src/root.zig	1	0
