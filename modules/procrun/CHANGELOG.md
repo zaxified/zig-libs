@@ -5,6 +5,14 @@ release tag each entry shipped in, and `CONVENTIONS.md` §8 for the policy.
 
 ## Unreleased
 
+- **2026-09-28** — **Cancel a blocking run from another thread**: new `Cancel` token, passed as
+  `Spec.cancel`. `Cancel.request` makes `run`/`runTimeout` SIGKILL the child (the group with
+  `new_process_group`) and return what was captured with the new `Output.canceled` set,
+  bounded by a 250 ms grace even if a descendant holds a pipe; a token requested before the
+  call spawns nothing and returns `error.Canceled`. One token may stop many concurrent runs.
+  Both new fields default (`null`, `false`), so existing callers are unchanged. Wanted by
+  ttydesk (quit without waiting out the slowest fetch).
+
 - **2026-09-18** — **NO CONSUMER-VISIBLE CHANGE:** `killerLoop` gains a
   test-only wakeup counter (`void` outside a test build, so the increment
   compiles to nothing there). F4's regression test now counts how many times

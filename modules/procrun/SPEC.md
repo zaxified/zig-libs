@@ -60,6 +60,19 @@ killed child's own descendants (e.g. a shell's `&`-backgrounded jobs) are reacha
 only covers descendants that stayed in the group the kernel assigns at fork; a descendant that
 calls `setsid`/`setpgid` itself escapes it, same as any POSIX process-group signal.
 
+**Cancelling a blocking run (2026-09-28, requested by ttydesk).** `Spec.cancel` borrows a
+`Cancel` token; `Cancel.request` (any thread, sticky, one token may serve many concurrent runs)
+makes every run carrying it SIGKILL its child — the group with `new_process_group` — and return
+the captured output with `Output.canceled` set. A token already requested at the call spawns
+nothing and returns `error.Canceled`. The machinery is `runTimeout`'s: `run` with a token takes the
+same path with no deadline, so it gains the killer thread only when a token is present. After the
+kill the drain threads get a late deadline (now + the 250 ms `pump_grace_ns`), so a descendant
+outside the group that holds a pipe cannot hold the return either (`*_deadline_stopped` set, as
+for F1). Being set after the drainers started, that deadline is read between `poll` slices of at
+most 50 ms — a cost paid only by a run with a token, only while its child is silent. `request`
+wakes each run's killer through an intrusive list under a mutex; the flag is stored first, so a
+run registering concurrently either is woken or finds it set.
+
 **Signalling a pid we may no longer own (PID reuse).** The premise of this module — a sibling
 thread's `wait4(-1)` can reap our child — has a second edge nothing addressed until 2026-09-03.
 When somebody else reaps the child, the pid becomes FREE for the host's next `fork`, while
@@ -97,18 +110,18 @@ the cap) and **`RlimitSpec.cpu_seconds` terminating a busy loop** well inside a 
 `runTimeout` safety net (proving the *rlimit*, not the safety net, fired), **`Handle.writeStdin`/
 `closeStdin` round-tripping incremental chunks through `cat`** plus their unavailable/double-close
 error paths, and **`runValidated` rejecting a flag-injection-shaped arg via `argsafe` before
-spawning anything** alongside an accept-and-actually-run case. Run: `zig build test-procrun`.
+spawning anything** alongside an accept-and-actually-run case, and **`Cancel`**: a run stopped
+from another thread returns its partial stdout promptly, a pre-requested token spawns nothing, one
+token stops three concurrent runs (all unregistered after), a grandchild outside the group holding
+stdout cannot hold the return past the grace, and an unrequested token changes nothing. Mutants
+(one schemata build, 2026-09-28): the killer ignoring the token, no late drain deadline, and
+`request` not waking — all three caught. Run: `zig build test-procrun`.
 
 ## Backlog / deferred
 
-- **Cancelling `run`/`runTimeout` from another thread** (2026-09-27, ttydesk). A blocking run
-  offers no handle: a program that fetches data on worker threads cannot stop the children
-  when it quits, so it waits out the slowest one (ttydesk: up to its own 2 s cap, see
-  `ttydesk/src/data.zig` `Service.quiesce`). Other runtimes have it (Go
-  `exec.CommandContext`, Python `Popen.kill`, Rust `Child::kill`). Ideal: a `Cancel` token in
-  `Spec` (or an argument) that another thread sets — `runTimeout` then kills the child (the
-  group with `new_process_group`) and returns `error.Canceled` with what was read; or a
-  `std.Io` cancelation honoured by the blocking wait. Still open.
+- **Graceful cancellation** — `Cancel` sends SIGKILL at once, as the deadline does. A
+  SIGTERM-then-grace-then-SIGKILL policy (Go's `Cmd.Cancel` + `WaitDelay`) would let a child
+  clean up; add it when a consumer needs it. Still open.
 - **Line-delimited / NDJSON stdout mode** — v1 delivers raw pipe chunks only; a framed/line mode
   would spare consumers reassembly. Still open.
 - **Windows reap-race coverage** — the `TerminateProcess`/`create_no_window` branch compiles but is

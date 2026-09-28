@@ -124,6 +124,69 @@ pub const Spec = struct {
     /// caller's program — see `RlimitSpec`. `null` (default) applies no
     /// limits. POSIX-only; `error.OperationUnsupported` on Windows.
     rlimit: ?RlimitSpec = null,
+    /// Stop a blocking `run`/`runTimeout` from another thread: see `Cancel`.
+    /// The token is borrowed and must outlive the call. `null` (default)
+    /// keeps `run` free of the extra thread a cancelable run needs.
+    cancel: ?*Cancel = null,
+};
+
+/// A cancellation token for blocking runs (`Spec.cancel`) — Go's
+/// `exec.CommandContext`, for a caller that runs children from worker
+/// threads and must stop them all when it quits instead of waiting out the
+/// slowest.
+///
+/// `request` is sticky and may be called from any thread, any number of
+/// times. Every run that carries the token then SIGKILLs its child
+/// (TerminateProcess on Windows; the whole group with
+/// `Spec.new_process_group`, as `runTimeout`'s deadline does) and returns
+/// what it captured with `Output.canceled` set — bounded by a short grace
+/// even if a descendant outside the group keeps a pipe open (the same
+/// bound as F1's, see `Output.stdout_deadline_stopped`). A run that starts
+/// with the token already requested spawns nothing and returns
+/// `error.Canceled`. One token may be shared by any number of concurrent
+/// runs; it holds no allocation and needs no deinit.
+pub const Cancel = struct {
+    requested: std.atomic.Value(bool) = .init(false),
+    mutex: std.Io.Mutex = .init,
+    /// Runs in flight that carry this token, woken by `request`.
+    head: ?*Waiter = null,
+
+    const Waiter = struct {
+        prev: ?*Waiter = null,
+        next: ?*Waiter = null,
+        wake: *std.Io.Event,
+    };
+
+    pub fn request(c: *Cancel, io: std.Io) void {
+        // Flag first: a run registering concurrently either is woken below
+        // or finds the flag set when its killer first looks.
+        c.requested.store(true, .release);
+        c.mutex.lockUncancelable(io);
+        defer c.mutex.unlock(io);
+        var w = c.head;
+        while (w) |x| : (w = x.next) x.wake.set(io);
+    }
+
+    pub fn isRequested(c: *const Cancel) bool {
+        return c.requested.load(.acquire);
+    }
+
+    fn add(c: *Cancel, io: std.Io, w: *Waiter) void {
+        c.mutex.lockUncancelable(io);
+        defer c.mutex.unlock(io);
+        w.prev = null;
+        w.next = c.head;
+        if (c.head) |h| h.prev = w;
+        c.head = w;
+    }
+
+    fn remove(c: *Cancel, io: std.Io, w: *Waiter) void {
+        c.mutex.lockUncancelable(io);
+        defer c.mutex.unlock(io);
+        if (w.prev) |p| p.next = w.next else c.head = w.next;
+        if (w.next) |n| n.prev = w.prev;
+        w.* = undefined;
+    }
 };
 
 /// rlimit knobs applied to the child before it execs the real program (see
@@ -183,6 +246,10 @@ pub const Output = struct {
     /// audit record.
     stdout_deadline_stopped: bool = false,
     stderr_deadline_stopped: bool = false,
+    /// `Spec.cancel` was requested while the child ran, and the child was
+    /// sent the kill. `term` still says how it actually ended — a child
+    /// that had just exited on its own keeps its `.exited` code.
+    canceled: bool = false,
 
     pub fn deinit(self: *Output, gpa: std.mem.Allocator) void {
         gpa.free(self.stdout);
@@ -653,18 +720,34 @@ const Drainer = struct {
     deadline_ns: ?u64 = null,
     /// Set (instead of erroring) when `deadline_ns` fired before EOF.
     deadline_hit: *std.atomic.Value(bool),
+    /// A cancelable run's LATE deadline (absolute `monoNowNs()`,
+    /// `no_deadline` until a `Cancel` fires): set by the killer thread after
+    /// it kills the child, honoured like `deadline_ns`. Being set while this
+    /// loop sleeps in `poll`, it caps each sleep at `cancel_poll_slice_ms`.
+    stop_ns: ?*const std.atomic.Value(u64) = null,
 };
+
+const no_deadline = std.math.maxInt(u64);
+
+/// How long one `poll` of a cancelable run's drain may sleep before it
+/// looks at `Drainer.stop_ns` again. Only a run that carries `Spec.cancel`
+/// pays these wakeups, and only while its child is silent; data wakes the
+/// `poll` at once regardless.
+const cancel_poll_slice_ms: i32 = 50;
 
 fn drainLoop(d: Drainer) void {
     defer d.file.close(d.io);
     var rbuf: [8192]u8 = undefined;
     while (true) {
-        if (d.deadline_ns) |dl| {
-            const ms = remainingMs(dl);
+        const late: u64 = if (d.stop_ns) |s| s.load(.acquire) else no_deadline;
+        const deadline: ?u64 = if (d.deadline_ns) |dl| @min(dl, late) else if (d.stop_ns != null) late else null;
+        if (deadline) |dl| {
+            var ms = remainingMs(dl);
             if (ms == 0) {
                 d.deadline_hit.store(true, .release);
                 return;
             }
+            if (d.stop_ns != null) ms = @min(ms, cancel_poll_slice_ms);
             // Not ready within this slice of the deadline: loop back and
             // recompute the remaining budget rather than trusting one
             // `poll` call to cover the whole wait — `remainingMs` is what
@@ -722,6 +805,9 @@ const Pumps = struct {
     trunc_err: std.atomic.Value(bool) = .init(false),
     deadline_hit_out: std.atomic.Value(bool) = .init(false),
     deadline_hit_err: std.atomic.Value(bool) = .init(false),
+    /// See `Drainer.stop_ns`; wired to the drainers only when `cancelable`.
+    stop_ns: std.atomic.Value(u64) = .init(no_deadline),
+    cancelable: bool = false,
     out_err: ?anyerror = null,
     err_err: ?anyerror = null,
     in_err: ?anyerror = null,
@@ -758,6 +844,7 @@ const Pumps = struct {
                 .err = &p.out_err,
                 .deadline_ns = deadline_ns,
                 .deadline_hit = &p.deadline_hit_out,
+                .stop_ns = if (p.cancelable) &p.stop_ns else null,
             }}) catch |e| {
                 f.close(p.io);
                 return e;
@@ -775,6 +862,7 @@ const Pumps = struct {
                 .err = &p.err_err,
                 .deadline_ns = deadline_ns,
                 .deadline_hit = &p.deadline_hit_err,
+                .stop_ns = if (p.cancelable) &p.stop_ns else null,
             }}) catch |e| {
                 f.close(p.io);
                 return e;
@@ -819,6 +907,7 @@ const Pumps = struct {
 /// stdout/stderr up to `spec.max_output_bytes`, and wait reap-race-tolerantly.
 /// Caller owns `Output.stdout`/`Output.stderr` (`Output.deinit`).
 pub fn run(gpa: std.mem.Allocator, io: std.Io, spec: Spec, stdin_body: []const u8) !Output {
+    if (spec.cancel != null) return runKilled(gpa, io, spec, stdin_body, null);
     ensureChildReaping();
     var child = try spawnChild(gpa, io, spec);
     errdefer child.kill(io);
@@ -857,12 +946,25 @@ pub fn runTimeout(
     stdin_body: []const u8,
     timeout_ns: u64,
 ) !Output {
+    return runKilled(gpa, io, spec, stdin_body, timeout_ns);
+}
+
+/// `runTimeout`, and `run` with a `Spec.cancel`: a killer thread ends the
+/// child at the deadline (if any) or on cancellation, whichever comes first.
+fn runKilled(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    spec: Spec,
+    stdin_body: []const u8,
+    timeout_ns: ?u64,
+) !Output {
     const start_ns = monoNowNs();
+    if (spec.cancel) |c| if (c.isRequested()) return error.Canceled;
     ensureChildReaping();
     var child = try spawnChild(gpa, io, spec);
     errdefer child.kill(io);
 
-    var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child };
+    var pumps: Pumps = .{ .io = io, .gpa = gpa, .child = &child, .cancelable = spec.cancel != null };
     errdefer pumps.deinit();
     // The drain deadline sits `pump_grace_ns` AFTER the killer's own
     // deadline, on purpose: `killerLoop` is guaranteed to have already sent
@@ -873,17 +975,32 @@ pub fn runTimeout(
     // `done` right before delivering the signal), and the child would then
     // never be reaped at all: `waitTolerant` blocks until it actually exits.
     const pump_grace_ns: u64 = 250 * std.time.ns_per_ms;
-    const pump_deadline_ns = start_ns +| timeout_ns +| pump_grace_ns;
+    const pump_deadline_ns: ?u64 = if (timeout_ns) |t| start_ns +| t +| pump_grace_ns else null;
     try pumps.start(spec.max_output_bytes, stdin_body, pump_deadline_ns);
 
-    var done: std.Io.Event = .unset;
-    const killer = try std.Thread.spawn(.{}, killerLoop, .{KillJob{
+    var killer_wake: std.Io.Event = .unset;
+    var finished: std.atomic.Value(bool) = .init(false);
+    var canceled: std.atomic.Value(bool) = .init(false);
+    var waiter: Cancel.Waiter = .{ .wake = &killer_wake };
+    if (spec.cancel) |c| c.add(io, &waiter);
+    defer if (spec.cancel) |c| c.remove(io, &waiter);
+    const killer = std.Thread.spawn(.{}, killerLoop, .{KillJob{
         .io = io,
         .child = &child,
         .timeout_ns = timeout_ns,
-        .done = &done,
+        .wake = &killer_wake,
+        .finished = &finished,
+        .cancel = spec.cancel,
+        .canceled = &canceled,
+        .stop_ns = &pumps.stop_ns,
+        .grace_ns = pump_grace_ns,
         .grouped = spec.new_process_group,
-    }});
+    }}) catch |e| {
+        // Without a killer nothing bounds the pumps: end the child first.
+        child.kill(io);
+        pumps.join();
+        return e;
+    };
 
     // Pumps finish when the child exits naturally, when the killer forces
     // it AND the pipe's write end actually closes, or — the case this
@@ -894,12 +1011,15 @@ pub fn runTimeout(
     // `pump_grace_ns` above), so stopping it here is safe. Stop the killer
     // BEFORE reaping so no signal can race a reaped (and possibly reused) pid.
     pumps.join();
-    done.set(io);
+    finished.store(true, .release);
+    killer_wake.set(io);
     killer.join();
 
     if (pumps.firstErr()) |e| return e;
     const term = waitTolerant(io, &child);
-    return finish(&pumps, term);
+    var out = try finish(&pumps, term);
+    out.canceled = canceled.load(.acquire);
+    return out;
 }
 
 fn finish(pumps: *Pumps, term: Term) !Output {
@@ -920,14 +1040,28 @@ fn finish(pumps: *Pumps, term: Term) !Output {
 const KillJob = struct {
     io: std.Io,
     child: *std.process.Child,
-    timeout_ns: u64,
-    /// Woken (via `Event.set`) by `runTimeout` as soon as `pumps.join()`
+    /// `null`: no deadline, only `cancel` ends the child early.
+    timeout_ns: ?u64,
+    /// Woken (via `Event.set`) by `runKilled` as soon as `pumps.join()`
     /// returns — i.e. the moment the child is known to be finished, instead
-    /// of on the next fixed polling tick. See F4's disposition.
-    done: *std.Io.Event,
+    /// of on the next fixed polling tick (see F4's disposition) — with
+    /// `finished` set first; and by `Cancel.request`.
+    wake: *std.Io.Event,
+    finished: *const std.atomic.Value(bool),
+    cancel: ?*Cancel,
+    /// Set when this loop killed the child because of `cancel`.
+    canceled: *std.atomic.Value(bool),
+    /// The drainers' late deadline, set to now + `grace_ns` after a
+    /// cancellation kill (see `Drainer.stop_ns`).
+    stop_ns: *std.atomic.Value(u64),
+    grace_ns: u64,
     /// Kill the child's whole process group instead of just the child
     /// itself — set from `Spec.new_process_group`; see `deliverGroup`.
     grouped: bool = false,
+
+    fn kill(j: KillJob) void {
+        if (j.grouped) deliverGroup(j.child, .kill, 0, true) else deliver(j.child, .kill, 0);
+    }
 };
 
 /// F4, 2026-09-10: this used to poll `j.done` in fixed 5ms steps
@@ -940,20 +1074,29 @@ const KillJob = struct {
 /// instead: `runTimeout` wakes this loop the instant it knows the outcome,
 /// and absent that, this still fires within `timeout_ns` of spawn.
 fn killerLoop(j: KillJob) void {
-    const deadline_ns = monoNowNs() +| j.timeout_ns;
+    const deadline_ns: ?u64 = if (j.timeout_ns) |t| monoNowNs() +| t else null;
     while (true) {
-        const remaining = remainingNs(deadline_ns);
-        if (remaining == 0) break;
-        const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(remaining)), .clock = .awake } };
-        // `error.Timeout` (the deadline elapsed) and a spurious wake both
-        // just loop back to re-check `remaining`/`isSet` below; `Cancelable`
-        // is likewise not actionable from a detached worker thread.
-        j.done.waitTimeout(j.io, timeout) catch {};
+        if (j.finished.load(.acquire)) return;
+        if (j.cancel) |c| if (c.isRequested()) {
+            j.canceled.store(true, .release);
+            j.kill();
+            j.stop_ns.store(monoNowNs() +| j.grace_ns, .release);
+            return;
+        };
+        if (deadline_ns) |dl| {
+            const remaining = remainingNs(dl);
+            if (remaining == 0) break;
+            const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromNanoseconds(@intCast(remaining)), .clock = .awake } };
+            // `error.Timeout` (the deadline elapsed) and a spurious wake both
+            // just loop back to re-check `remaining`/`finished` above;
+            // `Cancelable` is likewise not actionable from a detached worker
+            // thread.
+            j.wake.waitTimeout(j.io, timeout) catch {};
+        } else j.wake.waitUncancelable(j.io);
         if (builtin.is_test) _ = killer_wakeups_for_testing.fetchAdd(1, .monotonic);
-        if (j.done.isSet()) return;
     }
-    if (j.done.isSet()) return;
-    if (j.grouped) deliverGroup(j.child, .kill, 0, true) else deliver(j.child, .kill, 0);
+    if (j.finished.load(.acquire)) return;
+    j.kill();
 }
 
 /// Test-only counter (F4 regression guard): how many times `killerLoop` came
@@ -1544,6 +1687,117 @@ test "F1 positive control: runTimeout does NOT report deadline-stopped for an or
     try testing.expectEqualStrings("hello\n", out.stdout);
     try testing.expect(!out.stdout_deadline_stopped);
     try testing.expect(!out.stderr_deadline_stopped);
+}
+
+fn requestAfter(c: *Cancel, io: std.Io, ms: u64) void {
+    sleepNs(ms * std.time.ns_per_ms);
+    c.request(io);
+}
+
+test "Cancel: run stops a long child from another thread and returns what it read" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    const t = try std.Thread.spawn(.{}, requestAfter, .{ &cancel, io, 200 });
+    defer t.join();
+    const start = monoNowNs();
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "echo started; exec sleep 10" },
+        .cancel = &cancel,
+    }, "");
+    defer out.deinit(testing.allocator);
+    const elapsed = monoNowNs() - start;
+
+    try testing.expect(out.canceled);
+    try testing.expect(out.term == .signal);
+    try testing.expectEqualStrings("started\n", out.stdout);
+    try testing.expect(elapsed < 2 * std.time.ns_per_s);
+}
+
+test "Cancel: a token requested before the run spawns nothing" {
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    cancel.request(io);
+    cancel.request(io); // sticky and idempotent
+    const spec: Spec = .{ .argv = &.{"/nonexistent/would-fail-to-spawn"}, .cancel = &cancel };
+    try testing.expectError(error.Canceled, run(testing.allocator, io, spec, ""));
+    try testing.expectError(error.Canceled, runTimeout(testing.allocator, io, spec, "", std.time.ns_per_s));
+}
+
+fn runSleepCanceled(io: std.Io, c: *Cancel, ok: *std.atomic.Value(u32)) void {
+    var out = runTimeout(testing.allocator, io, .{ .argv = &.{ "sleep", "10" }, .cancel = c }, "", 30 * std.time.ns_per_s) catch return;
+    defer out.deinit(testing.allocator);
+    if (out.canceled and out.term == .signal) _ = ok.fetchAdd(1, .monotonic);
+}
+
+test "Cancel: one token stops every run that carries it" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    var ok: std.atomic.Value(u32) = .init(0);
+    const start = monoNowNs();
+    var workers: [3]std.Thread = undefined;
+    for (&workers) |*w| w.* = try std.Thread.spawn(.{}, runSleepCanceled, .{ io, &cancel, &ok });
+    requestAfter(&cancel, io, 200);
+    for (workers) |w| w.join();
+    try testing.expectEqual(@as(u32, 3), ok.load(.monotonic));
+    try testing.expect(monoNowNs() - start < 3 * std.time.ns_per_s);
+    try testing.expect(cancel.head == null); // every run unregistered
+}
+
+test "Cancel: bounded even when a grandchild outside the group keeps the pipe open" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // No `new_process_group`: the kill reaches the direct child only, and
+    // the backgrounded `sleep 1` holds stdout open — without the late drain
+    // deadline the run would wait for it.
+    var cancel: Cancel = .{};
+    const t = try std.Thread.spawn(.{}, requestAfter, .{ &cancel, io, 200 });
+    defer t.join();
+    const start = monoNowNs();
+    var out = try run(testing.allocator, io, .{
+        .argv = &.{ "sh", "-c", "sleep 1 & exec sleep 10" },
+        .cancel = &cancel,
+    }, "");
+    defer out.deinit(testing.allocator);
+    const elapsed = monoNowNs() - start;
+    // Leave no stray behind: the orphaned `sleep 1` is gone by then.
+    defer sleepNs(1200 * std.time.ns_per_ms);
+    try testing.expect(out.canceled);
+    try testing.expect(out.stdout_deadline_stopped);
+    try testing.expect(elapsed < 900 * std.time.ns_per_ms);
+}
+
+test "Cancel positive control: an unrequested token changes nothing" {
+    if (!std.process.can_spawn) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var cancel: Cancel = .{};
+    var out = try run(testing.allocator, io, .{ .argv = &.{ "/bin/echo", "hello" }, .cancel = &cancel }, "");
+    defer out.deinit(testing.allocator);
+    try testing.expect(!out.canceled);
+    try testing.expect(out.term == .exited);
+    try testing.expectEqualStrings("hello\n", out.stdout);
+    try testing.expect(!out.stdout_deadline_stopped);
+    try testing.expect(cancel.head == null);
 }
 
 test "F4: runTimeout's killer thread is woken by the outcome, not by a fixed polling step" {
